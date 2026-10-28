@@ -188,6 +188,14 @@ public:
         }
     }
 
+    /// #291: the transaction coordinator's node session was Rejected (its login refused / its user revoked there).
+    /// Every transactional producer waiting on the coordinator ends FatalError with `errorCode`.  Duty thread.
+    void onCoordinatorRejected(uint16_t errorCode) noexcept {
+        for (ProducerImpl* impl : active_) {
+            if (impl != nullptr) impl->onCoordinatorRejected(errorCode);
+        }
+    }
+
     /// Client close (after closeAllRings): every producer completes everything
     /// it accepted with `st` exactly once, draining its closed ring to the
     /// frozen tail (bounded by the close-drain unblock rule).

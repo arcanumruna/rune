@@ -24,8 +24,9 @@ inline constexpr int64_t kClientCounterTag = int64_t{1} << 59;   // Client::kCli
 inline constexpr int64_t kTag              = int64_t{1} << 58;
 inline constexpr int64_t kFetchTag         = int64_t{1} << 61;   // GroupConsumerHub::kFetchCorrTag
 inline constexpr int64_t kOffsetFetchTag   = int64_t{1} << 60;   // GroupConsumerHub::kOffsetFetchCorrTag
-static_assert((kTag & (batchcorr::kTag | kFetchTag | kOffsetFetchTag | kClientCounterTag)) == 0,
-              "coordinator ids must not collide with batch / fetch / offset-fetch / Client-counter tags");
+inline constexpr int64_t kGroupCtlTag     = int64_t{1} << 57;   // GroupConsumerHub::kGroupCtlCorrTag
+static_assert((kTag & (batchcorr::kTag | kFetchTag | kOffsetFetchTag | kClientCounterTag | kGroupCtlTag)) == 0,
+              "coordinator ids must not collide with batch / fetch / offset-fetch / Client-counter / group-control tags");
 inline constexpr int64_t kTagMask = int64_t{0x1F} << 58;
 
 [[nodiscard]] constexpr int64_t make(uint32_t ordinal, uint8_t slot, uint32_t seq) noexcept {
@@ -79,9 +80,10 @@ struct CoordinatorSink {
     Offer (*offer)(void* ctx, const uint8_t* buf, std::size_t len) noexcept = nullptr;
     int64_t (*sessionId)(void* ctx) noexcept = nullptr;   // 0 = not connected
     void* ctx = nullptr;
-    /// NotCoordinator was answered: ask for a fresh cluster view (the Client sends a MetadataRequest).  Called by
-    /// the link at most once per coordinator generation (until onCoordinatorMoved), on the duty thread.  May be null.
-    void (*rediscover)(void* ctx) noexcept = nullptr;
+    /// NotCoordinator was answered: ask for a fresh cluster view (the Client sends a MetadataRequest).  Returns true
+    /// when the request was submitted; false (refused: ring full / no Connected session) and the link asks again on its
+    /// next pump.  Called on the duty thread.  May be null (treated as asked).
+    bool (*rediscover)(void* ctx) noexcept = nullptr;
 };
 
 }  // namespace rune::client::producer

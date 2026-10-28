@@ -32,7 +32,13 @@ namespace rune::gateway {
 
 /// `correlationId` = the Connect's: the client matches an AuthServerFinal to its login episode by it, so the auth
 /// deadline's answer (no AuthClientFirst seen yet) must carry it.
-struct AuthAwaitingFirst { int64_t deadlineNs = 0; int64_t correlationId = 0; };
+struct AuthAwaitingFirst {
+    int64_t deadlineNs = 0;
+    int64_t correlationId = 0;
+    /// Issue #240: an accepted SecurityBootstrap restarts the login deadline ONCE per session (its answer follows the
+    /// `__security` commit); a later bootstrap on the same session never extends it again.
+    bool deadlineRestartedByBootstrap = false;
+};
 
 struct AuthAwaitingFinal {
     int64_t deadlineNs = 0;

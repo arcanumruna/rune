@@ -477,6 +477,25 @@ TEST(TlsConnectEdgeRegression, FinalLegHandshakeFailedWhileAuthenticatingFailsTh
     EXPECT_LE(r.gw->connectsSeen - connects, 12) << "a reconnect storm (the doubling Backoff paces the retries)";
 }
 
+// Issue #481: once the app's connect has failed on unproven final legs, a session that does not reconnect forever stops:
+// Disconnected, and the gateway sees no further ConnectRequest.  RED (old): Backoff kept reconnecting in the background.
+TEST(TlsConnectEdgeRegression, ANonForeverSessionEndsDisconnectedAfterUnprovenFinalLegFailuresRegression) {
+    Rig r(/*invokerMode=*/true, /*twoLeg=*/false, /*login=*/true);
+    r.gw->failFinalLeg = true;
+    r.gw->requireAuth  = true;
+    test_support::TestCq cq(*r.client);
+    auto conn = cq.issue([&](Completions& q, Token t) { return r.client->connect(q, t); });
+    ASSERT_TRUE(r.pumpWithin(6s, [&] { return conn.ready(); })) << "the connect hung";
+    ASSERT_TRUE(conn.failed()) << conn.describe();
+    // The machine spends what is left of its connect budget, then stops for good.
+    ASSERT_TRUE(r.pumpWithin(6s, [&] { return r.client->state() == rcs::SessionState::Disconnected; }))
+        << "never settled: state " << static_cast<int>(r.client->state());
+    const int connects = r.gw->connectsSeen;
+    r.pumpFor(2s);   // past several doubling Backoff delays (10 ms .. 1 s): any Backoff would have reconnected
+    EXPECT_EQ(r.gw->connectsSeen, connects) << "background retries after the app was told the connect failed";
+    EXPECT_EQ(r.client->state(), rcs::SessionState::Disconnected);
+}
+
 // A node session (a partition route to another node) fails its final leg: only THAT
 // session is affected - the frame is resolved by (session id, connect corrId); the seed
 // stays Connected and keeps answering; the node session is never Rejected and its

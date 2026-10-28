@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -259,7 +260,8 @@ public:
         pc::SecurityBootstrap m;
         m.sessionId = sid; m.correlationId = cl_.nextCorrelationId(); m.adminName = adminName; m.verifier = v.wire();
         for (std::size_t i = 0; i < m.fakeSaltSeed.size(); ++i) m.fakeSaltSeed[i] = static_cast<uint8_t>(seed + i);
-        rune::crypto::randomBytes(std::span<uint8_t>(m.nonce.data(), m.nonce.size()));
+        if (!rune::crypto::randomBytes(std::span<uint8_t>(m.nonce.data(), m.nonce.size())))
+            throw std::runtime_error("AuthWireClient: no randomness for the client nonce");
         const auto key = rune::crypto::deriveClusterKey(std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(keyFileContents.data()), keyFileContents.size()));
         std::vector<uint8_t> input;
@@ -293,7 +295,8 @@ public:
         pc::SecurityBootstrap m;
         m.sessionId = sid; m.correlationId = cl_.nextCorrelationId(); m.adminName = adminName; m.verifier = v.wire();
         for (std::size_t i = 0; i < m.fakeSaltSeed.size(); ++i) m.fakeSaltSeed[i] = static_cast<uint8_t>(seed + i);
-        rune::crypto::randomBytes(std::span<uint8_t>(m.nonce.data(), m.nonce.size()));
+        if (!rune::crypto::randomBytes(std::span<uint8_t>(m.nonce.data(), m.nonce.size())))
+            throw std::runtime_error("AuthWireClient: no randomness for the client nonce");
         const auto key = rune::crypto::deriveClusterKey(std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(keyFileContents.data()), keyFileContents.size()));
         std::vector<uint8_t> input;

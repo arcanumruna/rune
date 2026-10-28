@@ -258,7 +258,10 @@ TEST(ConnectResponseCodec, TruncationReturnsNullopt) {
         EXPECT_FALSE(rpc::ConnectResponse::decode(buf.data(), avail).has_value())
             << "avail=" << avail;
 
-    // Exact full size must succeed
+    // The legacy frame states blockLength 18: 38 bytes are truncated (#194).
+    EXPECT_FALSE(rpc::ConnectResponse::decode(buf.data(), 38).has_value());
+    // An older broker's frame states blockLength 14: its exact size succeeds.
+    buf[0] = static_cast<uint8_t>(rpc::ConnectResponse::BODY_FIXED_V0);
     EXPECT_TRUE(rpc::ConnectResponse::decode(buf.data(), 38).has_value());
 }
 
@@ -554,10 +557,8 @@ TEST(ConnectRequestCodec, SchemaMismatchExplicitValue) {
 //     header's blockLength field), so a corrupted blockLength does NOT cause
 //     rejection — the decode succeeds.  Document this.
 // ---------------------------------------------------------------------------
-TEST(ConnectResponseCodec, CorruptBlockLengthStillDecodes) {
-    // Current behavior: ConnectResponse::decode uses a hard-coded BODY_FIXED
-    // constant and does NOT re-validate blockLength from the header.
-    // A corrupt blockLength field therefore does not cause rejection.
+TEST(ConnectResponseCodec, CorruptBlockLengthIsRejected) {
+    // #194: the header states the body length; one below the oldest layout is corrupt, not an older frame.
     rpc::ConnectResponse resp;
     resp.code              = 0;
     resp.leaderMemberId    = 7;
@@ -566,17 +567,9 @@ TEST(ConnectResponseCodec, CorruptBlockLengthStillDecodes) {
     std::array<uint8_t, 64> buf{};
     resp.encode(buf.data());
 
-    // Corrupt blockLength (bytes 0-1) to 0 instead of 14.
     buf[0] = 0;
     buf[1] = 0;
-
-    // Expected behavior: decode still succeeds because it reads fixed body at
-    // a compile-time offset, independent of the header's blockLength field.
-    auto decoded = rpc::ConnectResponse::decode(buf.data(), 38u);
-    ASSERT_TRUE(decoded.has_value())
-        << "Documented: corrupt blockLength not detected — fixed-offset read wins";
-    EXPECT_EQ(decoded->leaderMemberId,    7);
-    EXPECT_EQ(decoded->assignedSessionId, 99);
+    EXPECT_FALSE(rpc::ConnectResponse::decode(buf.data(), 38u).has_value());
 }
 
 // ---------------------------------------------------------------------------
@@ -689,7 +682,8 @@ TEST(ConnectResponse, OldDecoderIgnoresNewCryptoField) {
     EXPECT_EQ(full->chosenCipher, 2);
     EXPECT_EQ(full->handshakeBytes, "serverhello");
 
-    // Truncated to the old (V0) size: new fields default, old fields intact.
+    // An older decoder's view: blockLength 18 (no crypto byte), 42 bytes; new fields default, old fields intact.
+    buf[0] = static_cast<uint8_t>(rpc::ConnectResponse::BODY_FIXED);
     auto truncated = rpc::ConnectResponse::decode(buf.data(), rpc::ConnectResponse::ENCODED_SIZE);
     ASSERT_TRUE(truncated.has_value());
     EXPECT_EQ(truncated->chosenCipher, 0);
@@ -804,7 +798,7 @@ TEST(HandshakeContinueResponse, TemplateIdIsEleven) {
 // kProtocolVersion (the MessageHeader wire version) stays at 3.
 // ---------------------------------------------------------------------------
 TEST(VersionGates, ClientBrokerVersionBumpedProtocolVersionUnchanged) {
-    EXPECT_EQ(rpc::kClientVersion, 14);   // v14: namespaces (templates 81-83, codes 51-54); v13: produce ConcurrentTransactions, issue #112; v12: per-receiver c2b keys, issue #116 (v11: subscription filters; v10: TxnOffsetCommit member fence; v9: authentication; v8: catalog history DDL, v7: transient lineage note + claim)
+    EXPECT_EQ(rpc::kClientVersion, 15);   // v15: RecordEgressUnavailable (#450); v14: namespaces (templates 81-83, codes 51-54); v13: produce ConcurrentTransactions, issue #112; v12: per-receiver c2b keys, issue #116 (v11: subscription filters; v10: TxnOffsetCommit member fence; v9: authentication; v8: catalog history DDL, v7: transient lineage note + claim)
     EXPECT_EQ(rpc::kBrokerVersion, 8);   // v8: namespaces; v7: per-receiver c2b keys (#116)
     EXPECT_EQ(rpc::kClientVersionCrypto, 4);
     EXPECT_EQ(rpc::kBrokerVersionCrypto, 4);
@@ -910,4 +904,38 @@ TEST(ConnectResponseRegression, FutureLongerBlockKeepsVarBytesAtBlockLength) {
     ASSERT_TRUE(d);
     EXPECT_EQ(d->authMode, rpc::AuthMode::Required);
     EXPECT_TRUE(d->handshakeBytes.empty());
+}
+
+// Issue #194: the header states the body length; a frame shorter than it is truncated, never an older layout.
+TEST(ConnectResponseDecodeRegression, TruncatedV9FrameIsRejectedAndLegacyFrameIsNotV9Regression) {
+    std::array<uint8_t, 128> buf{};
+    rpc::ConnectResponse v9;
+    v9.v9 = true;
+    v9.authMode = rpc::AuthMode::Required;
+    v9.authState = rpc::AuthState::MustAuthenticate;
+    const std::size_t full = v9.encode(buf.data());
+    ASSERT_EQ(full, rpc::ConnectResponse::ENCODED_SIZE_V9 + 4);
+    for (std::size_t avail = rpc::ConnectResponse::ENCODED_SIZE_V0; avail < full; ++avail)
+        EXPECT_FALSE(rpc::ConnectResponse::decode(buf.data(), avail).has_value()) << "avail " << avail;
+    const auto ok = rpc::ConnectResponse::decode(buf.data(), full);
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_TRUE(ok->v9);
+    EXPECT_EQ(ok->authMode, rpc::AuthMode::Required);
+    EXPECT_EQ(ok->authState, rpc::AuthState::MustAuthenticate);
+
+    rpc::ConnectResponse legacy;
+    legacy.brokerVersion = 7;
+    const std::size_t lw = legacy.encode(buf.data());
+    ASSERT_EQ(lw, rpc::ConnectResponse::ENCODED_SIZE);
+    const auto l = rpc::ConnectResponse::decode(buf.data(), lw);
+    ASSERT_TRUE(l.has_value());
+    EXPECT_FALSE(l->v9);
+    EXPECT_EQ(l->brokerVersion, 7);
+    EXPECT_FALSE(rpc::ConnectResponse::decode(buf.data(), lw - 2).has_value()) << "cut legacy frame";
+    buf[0] = static_cast<uint8_t>(rpc::ConnectResponse::BODY_FIXED_V0);   // an older broker's blockLength
+    buf[1] = 0;
+    const auto old = rpc::ConnectResponse::decode(buf.data(), rpc::ConnectResponse::ENCODED_SIZE_V0);
+    ASSERT_TRUE(old.has_value());
+    EXPECT_FALSE(old->v9);
+    EXPECT_EQ(old->brokerVersion, 0);
 }

@@ -41,9 +41,13 @@ bool isTheFilter(std::span<const uint8_t> got) {
     return std::equal(got.begin(), got.end(), want.begin(), want.end());
 }
 
+// #431: the answers echo the correlationId of the newest JoinGroup / SyncGroup the Sink saw.
+int64_t g_lastJoinCorr = 0;
+int64_t g_lastSyncCorr = 0;
+
 std::vector<uint8_t> joinOk(int32_t gen, const std::string& member) {
     rpc::JoinGroupResponse m;
-    m.sessionId = kSessionId; m.generationId = gen; m.errorCode = 0;
+    m.sessionId = kSessionId; m.correlationId = g_lastJoinCorr; m.generationId = gen; m.errorCode = 0;
     m.memberId = {reinterpret_cast<const uint8_t*>(member.data()), member.size()};
     std::vector<uint8_t> b(m.encodedSize());
     m.encode(b.data());
@@ -52,7 +56,7 @@ std::vector<uint8_t> joinOk(int32_t gen, const std::string& member) {
 
 std::vector<uint8_t> joinErr(int16_t code, const std::string& detail) {
     rpc::JoinGroupResponse m;
-    m.sessionId = kSessionId; m.errorCode = code; m.detail = detail;
+    m.sessionId = kSessionId; m.correlationId = g_lastJoinCorr; m.errorCode = code; m.detail = detail;
     std::vector<uint8_t> b(m.encodedSizeWithDetail());
     m.encodeFor(b.data(), rpc::kClientVersion, b.size());
     return b;
@@ -60,7 +64,7 @@ std::vector<uint8_t> joinErr(int16_t code, const std::string& detail) {
 
 std::vector<uint8_t> syncOk(const std::vector<rpc::TopicPartition32>& asgn) {
     rpc::SyncGroupResponse m;
-    m.sessionId = kSessionId; m.errorCode = 0;
+    m.sessionId = kSessionId; m.correlationId = g_lastSyncCorr; m.errorCode = 0;
     std::vector<uint8_t> b(rpc::SyncGroupResponse::encodedSizeFor(asgn.size()));
     m.encode(b.data(), asgn);
     return b;
@@ -83,6 +87,14 @@ struct Sink {
     SendFn fn() {
         return [this](int32_t, const uint8_t* b, std::size_t n) -> bool {
             if (auto of = rpc::OffsetFetch::decode(b, n)) g_lastOffsetFetchCorr = of->correlationId;
+            if (n >= 4) {
+                const auto tid = static_cast<uint16_t>(b[2] | (b[3] << 8));
+                if (tid == static_cast<uint16_t>(rpc::TemplateId::JoinGroup)) {
+                    if (auto m = rpc::JoinGroup::decode(b, n, rpc::kClientVersion)) g_lastJoinCorr = m->correlationId;
+                } else if (tid == static_cast<uint16_t>(rpc::TemplateId::SyncGroup)) {
+                    if (auto m = rpc::SyncGroup::decode(b, n)) g_lastSyncCorr = m->correlationId;
+                }
+            }
             frames.emplace_back(b, b + n);
             return true;
         };
@@ -141,6 +153,7 @@ struct FakeRouter {
 class GroupFilterHubTest : public ::testing::Test {
 protected:
     void make(bool filtered) {
+        g_lastJoinCorr = g_lastSyncCorr = g_lastOffsetFetchCorr = 0;   // C3 review: never a previous test's corr
         hub_  = std::make_unique<GroupConsumerHub>();
         impl_ = std::make_unique<GroupConsumerImpl>();
         impl_->groupId  = "g";
@@ -195,7 +208,7 @@ TEST_F(GroupFilterHubTest, UnfilteredJoinGroupIsByteIdenticalRegression) {
     const auto joins = sink_.ofTemplate(rpc::TemplateId::JoinGroup);
     ASSERT_EQ(joins.size(), 1u);
     rpc::JoinGroup m;
-    m.sessionId = kSessionId; m.correlationId = 0; m.sessionTimeoutMs = impl_->cfg.sessionTimeoutMs;
+    m.sessionId = kSessionId; m.correlationId = g_lastJoinCorr; m.sessionTimeoutMs = impl_->cfg.sessionTimeoutMs;
     const std::string g = "g";
     m.groupId = {reinterpret_cast<const uint8_t*>(g.data()), g.size()};
     const std::vector<int32_t> topics{kTopicId};

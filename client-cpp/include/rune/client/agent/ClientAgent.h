@@ -40,6 +40,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <span>
@@ -610,6 +611,23 @@ public:
         }
         return mask;
     }
+    /// #514: the leader-node sessions (bit i = session i + 1; the first 64) that are Connected but have heard
+    /// nothing for more than two of their keepalive intervals (a live node answers each Ping).  Duty thread only.
+    [[nodiscard]] uint64_t leaderSessionsSilentMask(int64_t nowNs) const noexcept {
+        uint64_t mask = 0;
+        const std::size_t n = sessions_.size() < 65 ? sessions_.size() : 65;
+        for (std::size_t i = 1; i < n; ++i) {
+            const session::SessionMachine& m = sessions_[i]->machine;
+            if (m.silentLongerThan(nowNs, 2 * m.keepaliveIntervalNs())) mask |= uint64_t{1} << (i - 1);
+        }
+        return mask;
+    }
+    /// #514 (seed): the seed session is Connected but has heard nothing for more than two of its keepalive intervals
+    /// (a live node answers each Ping).  Duty thread only.
+    [[nodiscard]] bool seedSilent(int64_t nowNs) const noexcept {
+        const session::SessionMachine& m = seedSession().machine;
+        return m.silentLongerThan(nowNs, 2 * m.keepaliveIntervalNs());
+    }
     /// T15b: the seed session's machine (read-only; duty thread only).
     [[nodiscard]] const session::SessionMachine& seedMachine() const noexcept { return seedSession().machine; }
     /// A7 park-until-work: the invoker driver's socket-readiness fds (AeronTransport::wakeFds) — the
@@ -1054,8 +1072,11 @@ private:
     // runner shutdown path (Client::close(): stop the runner loop, join it, then
     // stop()) or the command ring (submitClose()).  The thread creation / join
     // edges order every access, so doWork()'s read below is race-free.
-    bool started_ = false;
-    bool stopped_ = false;
+    // #510: a start() that threw is StartFailed (holding the original error) so a
+    // later start() rethrows it instead of reporting success.
+    enum class Lifecycle : uint8_t { Idle, Started, StartFailed, Stopped };
+    Lifecycle          state_ = Lifecycle::Idle;
+    std::exception_ptr startError_;   // cold: set only by a failed start()
     bool failed_    = false;  // T15b failed mode (duty thread only)
     // The duty clock (ClientConfig::nanoClock, or the default clock) of the
     // current / latest doWork pass — the ONE clock every session machine runs

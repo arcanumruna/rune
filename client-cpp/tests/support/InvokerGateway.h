@@ -123,6 +123,7 @@ struct InvokerGateway {
     int connects = 0;
     int metadataRequests = 0;
     std::vector<int> metadataEndpoints;   // the endpoint each MetadataRequest arrived on
+    std::vector<int64_t> metadataSessionIds;   // the session each MetadataRequest came on
     // DR fix round 1: per-endpoint routing image (I4: a lagging node keeps naming the
     // dead leader) and per-endpoint Connect refusal (I2: ConnectResponse{code}).
     std::map<int, std::vector<PartitionAd>> partitionsAt;
@@ -158,6 +159,8 @@ struct InvokerGateway {
     // A nonzero code answers every Subscribe with a SubscribeResponse carrying it (nothing is bound, as the
     // broker does for UnknownTopic / UnknownPartition / InvalidRequest).
     int16_t subscribeErrorCode = 0;
+    int     subscribeErrorFirstN = 0;       // the first N Subscribes -> SubscribeResponse{subscribeErrorFirstCode}, then normal
+    int16_t subscribeErrorFirstCode = 0;
     int32_t subscribeErrorPartition = -1;   // Phase 2c: >= 0 limits subscribeErrorCode to Subscribes for that partition
     // Phase 2c: the refusal text sent with subscribeErrorCode (a session >= kClientVersionFilter gets it as the
     // SubscribeResponse detail trailer; this gateway's sessions always are).
@@ -244,7 +247,6 @@ struct InvokerGateway {
     bool holdAuthFirst = false;
     int  heldAuthFirsts = 0;
     std::set<int> rejectLoginsAt;                        // endpoints whose logins are all refused (44) — a halted node (D28)
-    int  resumedAnswers = 0;                             // ConnectResponse{ResumedAuthenticated} sent
     bool     breakServerSignature  = false;  // a broker that cannot prove the password
     int authFirsts = 0, authFinals = 0, authOk = 0, authFailed = 0;
     int unauthenticatedRequests = 0;         // requests that arrived before the login finished (always refused)
@@ -279,6 +281,15 @@ struct InvokerGateway {
     std::map<int, int32_t> advertisedBrokerVersionAt;  // per endpoint (a rolling upgrade)
     // OffsetFetch answers are held until releaseOffsetFetches().
     bool holdOffsetFetch = false;
+    // #356: SubscribeResponse OKs are held until releaseSubscribeResponses().
+    bool holdSubscribeResponses = false;
+    std::vector<std::pair<int, std::vector<uint8_t>>> heldSubscribeResponses;
+    void releaseSubscribeResponses() {
+        holdSubscribeResponses = false;
+        std::vector<std::pair<int, std::vector<uint8_t>>> h;
+        h.swap(heldSubscribeResponses);
+        for (const auto& [ep, f] : h) send(ep, f.data(), f.size());
+    }
     std::vector<std::vector<uint8_t>> heldOffsetFetches;
     void releaseOffsetFetches() {
         std::vector<std::vector<uint8_t>> h;
@@ -354,11 +365,13 @@ struct InvokerGateway {
         send(0, out.data(), n);
     }
     std::vector<int64_t> pendingJoins;     // sessionIds of held JoinGroups
+    std::vector<int64_t> pendingJoinCorrs; // #431: their correlationIds (an answer echoes the request's)
     /// Answer every held JoinGroup now.
     void releaseJoins() {
-        std::vector<int64_t> p;
+        std::vector<int64_t> p, c;
         p.swap(pendingJoins);
-        for (const int64_t sid : p) answerJoin_(sid);
+        c.swap(pendingJoinCorrs);
+        for (std::size_t i = 0; i < p.size(); ++i) answerJoin_(p[i], c[i]);
     }
     /// The latest subscription for (topicId, partition), or nullptr.
     [[nodiscard]] const Subscribed* latestSubscription(int32_t topicId, int32_t partition) const {
@@ -497,6 +510,8 @@ struct InvokerGateway {
     // T15b fix round 1 (shard lifecycle / gates):
     std::set<int> silentEndpoints;   // ConnectRequests arriving on these endpoints are never answered
     int16_t       connectErrorCode = 0;  // != 0: every ConnectRequest -> ConnectResponse{code}
+    int           connectErrorFirstN = 0;       // the first N ConnectRequests -> ConnectResponse{connectErrorFirstCode}, then normal
+    int16_t       connectErrorFirstCode = 0;
     int           framesReceived   = 0;  // every frame from the client, any template
     bool          uniqueSessionIds = false;  // each fresh connect (sessionId 0) gets its own id
     bool          newIdOnResume    = false;  // F-A C1: a resume (sessionId hint) is answered with a NEW id
@@ -1007,12 +1022,12 @@ private:
         return true;
     }
 
-    void answerJoin_(int64_t sessionId) {
+    void answerJoin_(int64_t sessionId, int64_t correlationId) {
         namespace rp = rune::protocol::client;
         static const std::string kMember = "member-1";
         rp::JoinGroupResponse r;
         r.sessionId     = sessionId;
-        r.correlationId = 0;
+        r.correlationId = correlationId;   // #431
         r.generationId  = groupGeneration;
         r.isLeader      = 0;
         r.errorCode     = joinErrorCode;
@@ -1548,20 +1563,14 @@ private:
             for (const Produced& pr : ackBeforeNextConnect) ack(pr);
             ackBeforeNextConnect.clear();
             int64_t sid = assignedSessionId;
-            if (uniqueSessionIds) sid = (c->sessionId != 0 && !newIdOnResume) ? c->sessionId : nextUniqueSessionId++;
-            // Review B I5 (D11): a resume of a session that IS authenticated on this node keeps its login — the
-            // answer is ResumedAuthenticated and no second login runs.  Anything else logs in afresh.
-            bool resumedAuth = false;
-            if (authMode == rp::AuthMode::Required && connectErrorCode == 0 && c->sessionId != 0) {
-                const auto known = authState_.find(c->sessionId);
-                const auto node  = sessionsAtNode.find(nodeOf(endpoint));
-                if (known != authState_.end() && std::holds_alternative<AuthAuthenticated>(known->second) &&
-                    node != sessionsAtNode.end() && node->second.count(c->sessionId) != 0 && !newIdOnResume) {
-                    resumedAuth = true;
-                    sid         = c->sessionId;
-                }
-            }
-            if (connectErrorCode == 0) sessionsAtNode[nodeOf(endpoint)].insert(sid);   // strict sessions: known here
+            // Issue #478: like ClientGateway::handleConnect (PR #476), a Required-mode broker never resumes a login: a
+            // resume hint gets a NEW session id and a login is due again.
+            if (uniqueSessionIds)
+                sid = (c->sessionId != 0 && !newIdOnResume && authMode != rp::AuthMode::Required) ? c->sessionId
+                                                                                                 : nextUniqueSessionId++;
+            int16_t connectErr = connectErrorCode;
+            if (connectErr == 0 && connectErrorFirstN > 0) { --connectErrorFirstN; connectErr = connectErrorFirstCode; }
+            if (connectErr == 0) sessionsAtNode[nodeOf(endpoint)].insert(sid);   // strict sessions: known here
             clientVersions[sid]      = c->clientVersion;   // D6: the version gate's input
             lastConnectClientVersion = c->clientVersion;
             if (replyOnAnnouncedEgress && sessionPubs.count(sid) == 0) {
@@ -1585,7 +1594,7 @@ private:
             std::vector<uint8_t> outV9;
             const int32_t bv = advertisedBrokerVersionAt.count(endpoint) != 0 ? advertisedBrokerVersionAt[endpoint]
                                                                               : advertisedBrokerVersion;
-            const int16_t okCode = connectErrorCode != 0 ? connectErrorCode : static_cast<int16_t>(rcc::ErrorCode::OK);
+            const int16_t okCode = connectErr != 0 ? connectErr : static_cast<int16_t>(rcc::ErrorCode::OK);
             // TLS: the server's first flight rides the ConnectResponse; the session's keys exist once it completes.
             tlsKeys_.erase(sid);
             tlsPending_.erase(sid);
@@ -1605,12 +1614,10 @@ private:
             std::size_t n;
             const uint8_t* frame = outPlain.data();
             if (authMode != rp::AuthMode::InProcess && clientV9) {
-                // Required: not bootstrapped -> Anonymous (only SecurityBootstrap is accepted, I5); a resumed
-                // authenticated session -> ResumedAuthenticated; else a login is due.
+                // Required: not bootstrapped -> Anonymous (only SecurityBootstrap is accepted, I5); else a login is due.
                 rp::AuthState st = rp::AuthState::Anonymous;
                 if (authMode == rp::AuthMode::Required && okCode == 0) {
-                    if (resumedAuth) { st = rp::AuthState::ResumedAuthenticated; ++resumedAnswers; }
-                    else if (!bootstrapped) { st = rp::AuthState::Anonymous; authState_[sid] = AuthAnonymous{}; }
+                    if (!bootstrapped) { st = rp::AuthState::Anonymous; authState_[sid] = AuthAnonymous{}; }
                     else { st = rp::AuthState::MustAuthenticate; authState_[sid] = AuthAwaitingFirst{}; }
                 }
                 n = rcc::encodeConnectResponseV9(outV9, okCode, 0, sid, c->sessionId, c->correlationId, authMode, st, bv,
@@ -1664,6 +1671,7 @@ private:
             if (!m) return;
             ++metadataRequests;
             metadataCorrIds.push_back(m->correlationId);
+            metadataSessionIds.push_back(m->sessionId);   // #515: the session that asked (to answer it by hand)
             metadataEndpoints.push_back(endpoint);   // DR client bug 1: which node was asked
             if (holdMetadata) return;
             sendMetadata(m->sessionId, m->correlationId, endpoint);
@@ -1758,9 +1766,12 @@ private:
                     return;
                 }
             }
-            if (subscribeErrorCode != 0 && (subscribeErrorPartition < 0 || sv->partition == subscribeErrorPartition)) {
+            int16_t subErr = (subscribeErrorCode != 0 && (subscribeErrorPartition < 0 || sv->partition == subscribeErrorPartition))
+                                 ? subscribeErrorCode : int16_t{0};
+            if (subErr == 0 && subscribeErrorFirstN > 0) { --subscribeErrorFirstN; subErr = subscribeErrorFirstCode; }
+            if (subErr != 0) {
                 rp::SubscribeResponse r;
-                r.sessionId = sv->sessionId; r.correlationId = sv->correlationId; r.errorCode = subscribeErrorCode;
+                r.sessionId = sv->sessionId; r.correlationId = sv->correlationId; r.errorCode = subErr;
                 r.partition = -1; r.subscriptionId = 0; r.detail = subscribeErrorDetail;
                 std::vector<uint8_t> eout(r.encodedSizeWithDetail() + 1);
                 std::size_t en = r.encodeFor(eout.data(), rp::kClientVersion, eout.size());
@@ -1786,6 +1797,10 @@ private:
                 sv->correlationId);
             if (dropSubscribeResponsesNext > 0) {
                 --dropSubscribeResponsesNext;
+                return;
+            }
+            if (holdSubscribeResponses) {   // #356: answered later by releaseSubscribeResponses()
+                heldSubscribeResponses.emplace_back(replyFromArrival ? endpoint : 0, std::vector<uint8_t>(out, out + n));
                 return;
             }
             send(replyFromArrival ? endpoint : 0, out, n);
@@ -2042,9 +2057,10 @@ private:
             rebalancing = false;
             if (holdJoins) {
                 pendingJoins.push_back(j->sessionId);
+                pendingJoinCorrs.push_back(j->correlationId);
                 return;
             }
-            answerJoin_(j->sessionId);
+            answerJoin_(j->sessionId, j->correlationId);
             return;
         }
         case rcc::TemplateId::SyncGroup: {
@@ -2064,7 +2080,7 @@ private:
             }
             rp::SyncGroupResponse r;
             r.sessionId     = sg->sessionId;
-            r.correlationId = 0;
+            r.correlationId = sg->correlationId;   // #431
             r.errorCode     = syncErrorCode;
             if (syncErrorCode != 0) asgn.clear();
             std::vector<uint8_t> out(rp::SyncGroupResponse::encodedSizeFor(asgn.size()));
@@ -2082,7 +2098,7 @@ private:
             if (notCoordinator_(endpoint, hb->sessionId, rp::HeartbeatResponse{}, hb->correlationId)) return;
             rp::HeartbeatResponse r;
             r.sessionId     = hb->sessionId;
-            r.correlationId = 0;
+            r.correlationId = hb->correlationId;   // #431
             r.errorCode     = heartbeatErrorCode != 0 ? heartbeatErrorCode
                             : rebalancing ? static_cast<int16_t>(rp::ErrorCode::RebalanceInProgress) : int16_t{0};
             std::vector<uint8_t> out(rp::HeartbeatResponse::ENCODED_SIZE);

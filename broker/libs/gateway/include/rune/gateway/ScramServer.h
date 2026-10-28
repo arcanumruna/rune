@@ -26,12 +26,6 @@
 
 namespace rune::gateway {
 
-/// AuthClientFirst decoded leniently: the generated decoder refuses an EMPTY username (1..128), but a client without
-/// credentials sends one and the plan requires the answer to be indistinguishable from an unknown user - so the
-/// frame is parsed here with the same layout and an empty username allowed.  nullopt = structurally invalid (or a
-/// username over 128 bytes / a nonce outside 1..128): the gateway answers AuthServerFinal{44} and ends the session.
-[[nodiscard]] std::optional<rune::protocol::client::AuthClientFirst> decodeClientFirst(const uint8_t* buf, std::size_t len) noexcept;
-
 struct ServerFirstPlan {
     AuthAwaitingFinal next;
     std::vector<uint8_t> frame;     ///< the encoded AuthServerFirst; EMPTY = local failure (no randomness): answer 44

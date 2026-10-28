@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <poll.h>
 #include <unistd.h>
 
 // Scribble freed memory (glibc M_PERTURB) so a use-after-free crashes; a no-op where mallopt is unavailable.
@@ -1008,6 +1009,45 @@ TEST(HubCommandClient, TxnNotCoordinatorRediscoversThroughMetadataRegression) {
     EXPECT_EQ(r.cq.timesCompleted(init.token()), 1);
 }
 
+// C2 adversarial review: a coordinator that keeps answering NotCoordinator (the real broker's TransactionCoordination
+// Service does, for every InitProducerId, while its state is not Loaded - ensureLoaded_) must be retried with backoff.
+// On a frozen duty clock no backoff ever elapses, so a paced client sends a bounded number of requests; today every
+// MetadataResponse bumps the link's generation (Client::onMetadata -> producerHub_.onCoordinatorMoved) and the
+// AwaitCoordinator slot re-sends at once: InitProducerId / MetadataRequest ping-pong per round trip, unpaced.
+TEST(HubCommandClient, TxnNotCoordinatorStormIsPacedOnAFrozenClockAdversarialRegression) {
+    HubRig r(4620, 0, &hubNow);
+    auto tp = r.client.producer(txnPcfg("tx-nc-storm"));
+    r.connect();
+    r.settle(200);
+    r.gw.initPidReply = true;
+    for (int i = 0; i < 5000; ++i)
+        r.gw.initPidCodes.push_back(static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator));
+    const int mdBefore = r.gw.metadataRequests;
+    auto init = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+    ASSERT_TRUE(init.accepted());
+    r.settle(2'000);
+    EXPECT_LE(r.gw.initPids, 4) << "NotCoordinator re-sent with no backoff (frozen clock)";
+    EXPECT_LE(r.gw.metadataRequests - mdBefore, 4) << "one MetadataRequest per NotCoordinator, unpaced";
+}
+
+TEST(HubCommandClient, PlainInitProducerIdNotCoordinatorStormIsPacedOnAFrozenClockAdversarialRegression) {
+    HubRig r(4622, 0, &hubNow);
+    r.connect();
+    r.settle(200);
+    r.gw.plainUsesInitPidCodes = true;
+    for (int i = 0; i < 5000; ++i)
+        r.gw.initPidCodes.push_back(static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator));
+    const int mdBefore = r.gw.metadataRequests;
+    rc::ProducerConfig pc; pc.acks = rc::Acks::Leader; pc.lingerUs = 0;
+    rc::Producer p = r.client.producer(pc);
+    auto s = r.cq.send(p, r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kTxnVal));
+    ASSERT_TRUE(s.accepted());
+    p.flush();
+    r.settle(2'000);
+    EXPECT_LE(r.gw.plainInitPids, 4) << "a plain producer's InitProducerId re-sent with no backoff (frozen clock)";
+    EXPECT_LE(r.gw.metadataRequests - mdBefore, 4) << "one MetadataRequest per NotCoordinator, unpaced";
+}
+
 // C10 (found by the dr-e2e tx suite on a 3-node broker whose partition
 // leaders are spread over the nodes): every transactional frame went through
 // the route of topic 0 / partition 0.  Coordinator requests (InitProducerId,
@@ -1565,4 +1605,82 @@ TEST(HubCommandClient, VoidCommitRefusalMatrixThrowsOrNoOpNeverDropsAdversarialR
         EXPECT_TRUE(gc.active());
         client.close();
     }
+}
+
+// #356 F6 (Thread mode): the void group seek() retries a BackPressured command ring instead of dropping the seek or
+// throwing.  The runner is parked in a record handler, so the ring stays full until the test releases it.
+TEST(HubCommandClientRegression, ThreadModeVoidSeekRetriesABackPressuredRingRegression) {
+    rc::ClientConfig c = hubCfg(4920, 4921, rc::RunnerMode::Thread);
+    rc::Client client(c);
+    test_support::InvokerGateway gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId,
+                                    c.egressChannel, c.egressStreamId);
+    auto pump = [&](auto pred, int cap = 2'000'000) {
+        for (int i = 0; i < cap; ++i) {
+            gw.pump();
+            if (pred()) return true;
+            std::this_thread::yield();
+        }
+        return false;
+    };
+    gw.groupProtocol   = true;
+    gw.holdJoins       = true;
+    gw.partitions      = {{1, 0, 0, 1, 4920, ""}};
+    gw.groupAssignment = {{1, 0}};
+    ASSERT_TRUE(pump([&] { return gw.ready(); }));
+    test_support::TestCq cq(client);
+    auto cf = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+    ASSERT_TRUE(pump([&] { return cf.ready(); }));
+
+    // Pipes, not shared atomics: toTest carries "parked" ('P'), "seek started" ('S') and "seek returned" ('R');
+    // toRunner releases the parked runner.  Reads wait with a failure-only deadline.
+    int toTest[2], toRunner[2];
+    ASSERT_EQ(::pipe(toTest), 0);
+    ASSERT_EQ(::pipe(toRunner), 0);
+    auto put = [](int fd, char c) { return ::write(fd, &c, 1) == 1; };
+    auto get = [](int fd, int timeoutMs) -> char {   // 0 = nothing arrived within timeoutMs
+        pollfd p{fd, POLLIN, 0};
+        char c = 0;
+        if (::poll(&p, 1, timeoutMs) == 1 && ::read(fd, &c, 1) == 1) return c;
+        return 0;
+    };
+    bool handled = false;   // runner thread only
+    auto gc = client.subscribeGroup("g", {"t"});
+    gc.onRecords([&](const rc::RecordSet&) {
+        if (handled) return;
+        handled = true;
+        (void)put(toTest[1], 'P');
+        (void)get(toRunner[0], 60'000);
+    });
+    ASSERT_TRUE(pump([&] { return !gw.pendingJoins.empty(); }));
+    gw.releaseJoins();
+    ASSERT_TRUE(pump([&] { return gw.latestSubscription(1, 0) != nullptr; }));
+    const auto first = *gw.latestSubscription(1, 0);
+    gw.pushRecords(first, 0, 1);
+    char parked = 0;
+    ASSERT_TRUE(pump([&] { return (parked = get(toTest[0], 0)) != 0; }));
+    if (parked != 'P') {
+        (void)put(toRunner[1], 'G');
+        FAIL() << "the runner never entered the record handler";
+    }
+    const std::size_t subs = gw.subscribed.size();
+
+    client.testFillCommandRing();
+    bool threw = false;     // read only after join()
+    std::string why;
+    std::thread t([&] {
+        (void)put(toTest[1], 'S');
+        try { gc.seek({1, 0}, 0); } catch (const std::exception& e) { why = e.what(); threw = true; }
+        (void)put(toTest[1], 'R');
+    });
+    ASSERT_EQ(get(toTest[0], 60'000), 'S');
+    // The runner is parked and the ring is full: the seek can only be retrying, it cannot have returned.
+    for (int i = 0; i < 20'000; ++i) { gw.pump(); std::this_thread::yield(); }
+    EXPECT_EQ(get(toTest[0], 0), 0) << "the seek returned although the command ring was full (dropped?)";
+    (void)put(toRunner[1], 'G');   // the runner leaves the handler and drains the ring
+    t.join();
+    EXPECT_FALSE(threw) << "a BackPressured seek must be retried, not thrown: " << why;
+    for (int fd : {toTest[0], toTest[1], toRunner[0], toRunner[1]}) ::close(fd);
+    ASSERT_TRUE(pump([&] { return gw.subscribed.size() > subs; })) << "the seek was dropped: no re-subscription";
+    EXPECT_EQ(gw.latestSubscription(1, 0)->fromOffset, 0);
+    client.close();
 }

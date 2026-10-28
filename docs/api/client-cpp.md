@@ -342,7 +342,6 @@ SubscriptionSet world = client.subscribe(events, AllPartitions{}, o,
 
 ```cpp
 GroupConfig g;
-g.autoOffsetReset = OffsetReset::Earliest;
 g.autoCommit      = false;
 GroupConsumer gc = client.subscribeGroup("matchmaking", {"events"}, g);
 gc.onAssigned([](std::vector<TopicPartition> parts) { /* ... */ });

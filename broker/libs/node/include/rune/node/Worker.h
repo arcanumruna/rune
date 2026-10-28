@@ -797,6 +797,7 @@ public:
     [[nodiscard]] uint64_t intakePausedFramesForTest() const noexcept { return intakePausedFrames_; }
     /// hotpath-A: frames held (ABORT) because their partition's roll was deferred.
     [[nodiscard]] uint64_t intakeRollHoldsForTest() const noexcept { return intakeRollHolds_; }
+    [[nodiscard]] uint64_t intakeKeyHoldsForTest() const noexcept { return intakeKeyHolds_; }
     /// Test-only: per-session crypto entries (encrypted sessions announced here).
     /// Test-only: probe-chain length of the last session-crypto lookup (the slot-indexed regression).
     [[nodiscard]] std::size_t sessionCryptoLastProbesForTest() const noexcept { return sessionCrypto_.lastProbesForTest(); }
@@ -999,6 +1000,10 @@ public:
         /// Issue #116: the session's client (>= 12) binds each c2b frame to one receiver: `recv` is keyed
         /// deriveReceiverKey(c2b, workerId+1) and a frame naming another receiver is dropped before any AEAD.
         bool                                     receiverKeys = false;
+        /// The first (parked) announce wave: the c2b key is still on its way (second wave).  An encrypted produce
+        /// that arrives now is HELD in its image (kIngressHeld), never dropped - the client already holds its
+        /// ConnectResponse and may produce before the second wave lands.  False once any keyed wave is applied.
+        bool                                     recvPending  = false;
     };
 
     /// Test-only: the worker-local subscription table (worker-thread state).
@@ -1391,7 +1396,9 @@ public:
                                                (op.crcValidated ? kOpFlagCrcValidated : 0u) |
                                                (op.freshCursor ? kOpFlagFreshCursor : 0u) |
                                                (op.type == WorkerOp::Type::SessionAnnounce && op.grantAll
-                                                    ? kOpFlagGrantAll : 0u)))
+                                                    ? kOpFlagGrantAll : 0u) |
+                                               (op.type == WorkerOp::Type::SessionAnnounce && op.keyPending
+                                                    ? kOpFlagKeyPending : 0u)))
            .durabilityTier(wireDurabilityTier)
            .enqueuedAtNs(op.enqueuedAtNs)
            .subscriptionId(op.subscriptionId)
@@ -2817,6 +2824,7 @@ private:
             cr->recvSeq    = 0;    // fresh replay window for THIS session on THIS worker (ingress)
             cr->recvWindow = 0;
             cr->recv.reset();      // fail closed by default: no cipher until proven valid below
+            cr->recvPending = (op.deferAck() & kOpFlagKeyPending) != 0;   // first wave: the key follows
             // Issue #116: the session binds c2b frames to one receiver (SessionAnnouncer then shipped THIS worker's
             // own receiver key, deriveReceiverKey(c2b, workerId_+1)).
             cr->receiverKeys = rune::protocol::client::sessionUsesReceiverKeys(
@@ -5535,6 +5543,7 @@ private:
     uint64_t reportedPeerDrops_    = 0;
     uint64_t intakePausedFrames_   = 0;   // fix round 1: per-session G-A6 pause (ABORTs); D8d: + direct budget
     uint64_t intakeRollHolds_      = 0;   // hotpath-A: frames held because their partition's roll is deferred
+    uint64_t intakeKeyHolds_       = 0;   // encrypted produce held until the session's c2b key (second wave) lands
     uint32_t directSessionAckBudget_ = SessionAckSink::kDefaultDirectSessionBudget;   // D8d
     uint64_t ackRoomOpPauses_      = 0;   // fix round 1: op drains skipped, ack queue full
     uint64_t sessionSignalsDeferred_ = 0; // fix round 2 (finding 9)
@@ -8046,6 +8055,16 @@ private:
                                      "len={}); dropping (wrong-receiver drops so far {})",
                                      workerId_, produceSessionIdOf_(data), len, c2bWrongReceiverDrops_);
                     return 0;
+                }
+                // The key is still on its way (first announce wave applied, second not yet): HOLD the frame
+                // (controlled-poll ABORT, redelivered once the lifecycle ring delivers the key) instead of
+                // dropping a produce the client already sent - no seq committed, its admission unit given back.
+                // Bounded: the gateway retries the second wave until it lands, and a closed session's frames
+                // are consumed by admitDirect (kDirectDropClosed) before this point.
+                if (!cr->recv.has_value() && cr->recvPending) [[unlikely]] {
+                    if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
+                    ++intakeKeyHolds_;
+                    return kIngressHeld;
                 }
                 openCtx.recv       = cr->recv.has_value() ? &*cr->recv : nullptr;
                 openCtx.recvSeq    = &cr->recvSeq;

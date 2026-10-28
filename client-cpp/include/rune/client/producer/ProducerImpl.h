@@ -82,6 +82,8 @@ inline constexpr int32_t kMsgFlush       = 2; // flush trigger (producer-ring lo
 inline constexpr int32_t kMsgTier2Batch  = 3; // Tier-2 explicit batch token
 inline constexpr int32_t kMsgClaimBatch  = 4; // Phase 2b B: claimBatch — n records, ONE RecordBatch
 inline constexpr int32_t kMsgTxnControl  = 5; // Phase 2b F: a transaction control op, FIFO with the records before it
+inline constexpr int32_t kMsgTier2Discard  = 6; // #341: a Tier-2 slot whose builder died off the batch thread
+inline constexpr int32_t kMsgClaimCreditLost = 7; // #322: a credit claim aborted off its queue's owner thread
 
 // TXN_CONTROL layout (kMsgTxnControl payload, little endian, Phase 2b F Task 8):
 //   [0]      kind          : u8  (TxnControl::Kind)
@@ -670,9 +672,23 @@ public:
     [[nodiscard]] bool commitClaim(int64_t token) noexcept;
     /// Discard a granted claim (Ring: the slot becomes padding).
     void abortClaim(int64_t token) noexcept;
+    /// False only for a Direct (Invoker) producer off its owner thread: its claim state is owner-thread state.
+    [[nodiscard]] bool maySettleClaim() const noexcept {
+        return mode_ != IngressMode::Direct || std::this_thread::get_id() == dutyThreadId_;
+    }
+    /// #322: abort a claim whose credit cannot be returned on this thread.  Thread mode: published as
+    /// kMsgClaimCreditLost (the duty side counts it, completes nothing).  Direct mode off the owner thread: owner
+    /// state is not touched; logged, and the claim stays held until the producer closes.
+    void abortClaimOffOwner(int64_t token) noexcept;
     /// Phase 2b B (owner thread): Invoker claims abandoned while open - their
     /// partition's builder was failed / the producer closed; commit() returned false.
     [[nodiscard]] uint64_t claimsAbandoned() const noexcept { return claimsAbandoned_; }
+    [[nodiscard]] uint64_t claimCreditLost() const noexcept { return claimCreditLost_; }  // duty thread
+    /// Test: true when [p, p+n) lies inside claimQuarantine_'s live size (owner thread).
+    [[nodiscard]] bool claimQuarantineCovers(const uint8_t* p, std::size_t n) const noexcept {
+        const uint8_t* b = claimQuarantine_.data();
+        return p >= b && p + n <= b + claimQuarantine_.size();
+    }
     /// Client close drain (Direct mode, owner thread): the thread running close()
     /// cannot settle a claim it holds, and the open claim's reserved record would
     /// keep the drain waiting until deliveryTimeoutMs.  Abandons it now (its
@@ -844,18 +860,19 @@ public:
     }
     /// The slot was accepted by submitTier2Batch: it is the duty side's now.
     void tier2Handed() noexcept { --t2Held_; }
+    /// #341: called off the batch thread by a dying BatchBuilder: hands the slot to the duty side through the
+    /// producer ring (Thread mode); Direct mode and a full / closed ring lose it (logged).
+    void tier2DiscardOffThread(uint32_t slot) noexcept;
 
     // ---- Tier-2 issuing thread (single-thread per producer; Phase 2b F Task 3 / FD3) ----
     // The slot pool's app side (free stack + SPSC free-ring consumer) is owned by ONE thread: the
     // thread that created the producer (Invoker mode: the owner thread), or the one that called
     // bindBatchThread().  Every Tier-2 entry compares against it BEFORE touching the pool.
     [[nodiscard]] bool onBatchThread() const noexcept { return std::this_thread::get_id() == t2Thread_; }
-    /// Rebind the issuing thread to the caller.  Call before the first batch() from the new
-    /// thread with no BatchBuilder holding a slot (asserted in debug).
-    void bindBatchThread() noexcept {
-        assert(t2Held_ == 0 && "bindBatchThread with a live BatchBuilder");
-        t2Thread_ = std::this_thread::get_id();
-    }
+    /// Rebind the issuing thread to the caller, before the first batch() from the new thread.  A
+    /// builder still live on the old thread is refused there and hands its slot back through the
+    /// producer ring when it dies (#341), so t2Held_ may count slots in flight: no assert on it.
+    void bindBatchThread() noexcept { t2Thread_ = std::this_thread::get_id(); }
     [[nodiscard]] Tier2Slot& tier2Slot(uint32_t slot) noexcept { return tier2Pool_[slot]; }
     /// Largest RecordBatch (header + records) a slot holds.
     [[nodiscard]] std::size_t tier2SlotBytes() const noexcept { return tier2SlotBytes_; }
@@ -863,6 +880,7 @@ public:
     /// slots, and slots not owned by a builder or the duty side (app-local free +
     /// returned-but-undrained).
     [[nodiscard]] std::size_t tier2SlotCount() const noexcept { return tier2Pool_.size(); }
+    /// BATCH-ISSUING THREAD ONLY: collecting consumes the free ring (0 off that thread).
     [[nodiscard]] std::size_t tier2FreeCount() noexcept;
 
     // ---- F8c C6: ack routing (setup phase; read on the duty thread) ----------
@@ -1303,6 +1321,9 @@ public:
     /// `errorCode`; a transactional producer goes FatalError(BrokerError, errorCode): every pending op completes
     /// with it and no coordinator request is ever sent or re-sent.  Duty thread.
     void onSessionRevoked(uint16_t errorCode) noexcept;
+    /// #291: the transaction coordinator's node session was Rejected: a transactional producer with a coordinator
+    /// request live ends FatalError with `errorCode` (an idle one meets the same refusal on its next request).
+    void onCoordinatorRejected(uint16_t errorCode) noexcept;
     /// beginTransaction() calls the machine refused (outside Ready): counted, no side effect.
     [[nodiscard]] uint64_t txnRefusedBegins() const noexcept { return txnRefusedBegins_; }
     /// FD2 duty re-check (Task 6): void records that reached the duty side while the machine was not InTransaction
@@ -1544,11 +1565,11 @@ private:
         const auto* o = std::get_if<DirectClaimOpen>(&directClaim_);
         return o != nullptr && o->slot == ps.slotIndex;
     }
-    /// The open claim on `ps` (if any) is rolled back to its mark and becomes
-    /// DirectClaimAbandoned; true when it was.  The caller then moves the
-    /// builder's storage to claimQuarantine_ (detachStorage*) - failBuilder_
-    /// and abandonOpenClaimForClose.
-    [[nodiscard]] bool abandonDirectClaimOn_(PartitionState& ps) noexcept;
+    /// The open claim on `ps` (if any) becomes DirectClaimAbandoned; returns its mark (valid until
+    /// the next abandon), or nullptr when there was none.  The builder is NOT rolled back: the
+    /// caller moves its storage, full size, to claimQuarantine_ (detachStorage*) - failBuilder_
+    /// and abandonOpenClaimForClose - so the quarantined vector always covers the span.
+    [[nodiscard]] const ProduceFrameBuilder::Mark* abandonDirectClaimOn_(PartitionState& ps) noexcept;
     /// commit / abort of an abandoned claim `gen`: settled (NoDirectClaim).
     [[gnu::cold, gnu::noinline]] void settleAbandonedClaim_(uint64_t gen) noexcept;
     /// Owner-thread / closed / held / in-duty / deferred-ahead checks of a claim.
@@ -1838,6 +1859,12 @@ private:
     std::array<TxnOp, kMaxTxnFlushes>   txnFlushes_{};
     uint8_t                             txnFlushN_        = 0;
     uint64_t                            txnRefusedBegins_ = 0;
+    /// A terminal failure found where it cannot be entered at once (enterFatal_ / failAllPending are not re-entrant
+    /// while a batch is failed or a hub command runs): #367 a partition leader fenced a transactional batch (17 / 18),
+    /// #291 the coordinator node refused this client's session.  The next duty pass acts on it: txnStepCold_ enters
+    /// FatalError (transactional), identityStepCold_ fails the identity (plain).
+    struct PendingFatal { OpStatus status = OpStatus::BrokerError; uint16_t errorCode = 0; const char* why = ""; };
+    std::optional<PendingFatal>         fatalPending_;
     [[nodiscard]] bool transactional_() const noexcept { return !cfg_.transactionalId.empty(); }
     [[nodiscard]] int64_t txnOpTimeoutNs_() const noexcept {
         return (cfg_.transactionOpTimeoutMs > 0 ? cfg_.transactionOpTimeoutMs : 1) * 1'000'000LL;
@@ -1845,7 +1872,7 @@ private:
     [[nodiscard]] bool txnQuiet_() const noexcept {
         const std::size_t i = txn_.index();
         return txnFlushN_ == 0 && i != kInitializingIdx && i != kCommittingIdx && i != kAbortingIdx &&
-               txnAddQueue_.empty() && offsetsOp_.index() == 0;
+               txnAddQueue_.empty() && offsetsOp_.index() == 0 && !fatalPending_;
     }
     // ---- Phase 2b F Task 7: sendOffsetsToTransaction (ProducerTxn.cpp; duty thread only) ----
     /// The copy of the call's offsets + group id the op runs from (the caller's span / the Thread-mode ring payload
@@ -2056,6 +2083,8 @@ private:
     FrameBytes            claimQuarantine_;
     uint64_t              claimGen_        = 0;
     uint64_t              claimsAbandoned_ = 0;
+    uint64_t              claimCreditLost_ = 0;  ///< #322: credit claims aborted off their queue's owner thread
+    ProduceFrameBuilder::Mark abandonedMark_{};  ///< the mark of the claim abandonDirectClaimOn_ just abandoned
     std::vector<uint32_t> claimOffsets_;  ///< Direct claimBatch value offsets (capacity persists)
 
     // ---- Task 14 fix1 C1: re-entrancy deferral (duty/owner thread only) -------
@@ -2145,7 +2174,10 @@ private:
     }
     /// Give a finished slot back to the app (SPSC free ring; capacity = pool size, so
     /// the write cannot fail while each slot is returned exactly once).
-    void t2Return_(uint32_t slot) noexcept;
+    /// `type` 2 = the slot's builder died off the batch thread (#341): the collect side then drops its held count.
+    void t2Return_(uint32_t slot, int32_t type = 1) noexcept;
+    /// #322: the duty side saw a kMsgClaimCreditLost record: counted, logged rate-limited, nothing completed.
+    void noteClaimCreditLost_() noexcept;
     uint8_t* pushDeferred_(const DeferredHdr& h) noexcept;
     PartitionState* findPartition_(int32_t topicId, int32_t partition) noexcept;
     /// Removes a record's per-partition / unknown accounting.

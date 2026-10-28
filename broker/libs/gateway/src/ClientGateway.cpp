@@ -2177,7 +2177,9 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
         // reaped or closed no longer counts.  A redirect creates no session here and is never refused.
         const bool redirect = !pc_entry.isLeader && !pc_entry.leaderClientEndpoint.empty();
         if (!redirect && unauthSessionsOf_(pc_entry.sourceHost) >= maxUnauthPerHost_) [[unlikely]] {
-            pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed);   // answered, no session
+            // Issue #613: retriable - no credential was checked; the client backs off and reconnects once a slot
+            // frees (44 stays a credential verdict).
+            pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::AuthUnavailable);   // answered, no session
             ++connectsRefusedUnauthCap_;
             if (unauthLog_.due(15)) [[unlikely]]
                 spdlog::warn("auth: connect refused source={} reason=unauthenticated-sessions-per-host cap={} "
@@ -4720,7 +4722,11 @@ void ClientGateway::retireWithoutRecordEgress_(int64_t subId)
         pc::SubscribeResponse resp;
         resp.sessionId      = sub.sessionId;
         resp.correlationId  = sub.subscribeCorrId;
-        resp.errorCode      = static_cast<int16_t>(pc::ErrorCode::RecordEgressUnavailable);
+        // #450: a client below 15 parks an unknown code forever (a group fetch re-subscribes silently): it gets
+        // NotAuthorized, which every older client ends the subscription / group consumer on.
+        resp.errorCode      = pc::clientUnderstandsRecordEgressUnavailable(session->clientVersion)
+                                  ? static_cast<int16_t>(pc::ErrorCode::RecordEgressUnavailable)
+                                  : static_cast<int16_t>(pc::ErrorCode::NotAuthorized);
         resp.partition      = sub.partition;
         resp.subscriptionId = 0;
         sendAnswer_(*session, scratch_.data(), resp.encode(scratch_.data()));
@@ -9111,8 +9117,8 @@ void ClientGateway::handleAuthClientFirst_(const uint8_t* buf, std::size_t len)
         return;
     }
     const int64_t deadline = awaiting->deadlineNs;
-    const auto m = decodeClientFirst(buf, len);
-    if (!m || m->mechanism != pc::kMechanismScramSha512) {
+    const auto m = pc::AuthClientFirst::decode(buf, len);
+    if (!m) {
         ++loginsFailed_;
         if (unauthLog_.due(6)) [[unlikely]]
             spdlog::warn("auth: login failed user=<undecodable> source={} session={} reason=malformed",
@@ -9853,8 +9859,20 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
         sendAnswer_(*session, scratch_.data(), n);
         return;
     }
-    answerAdminSubmit_(buf, len, adminSink_->submitSecurityBootstrap(m, ddlMetaOf_(nullptr, m.sessionId, *session, 0)),
-                       "SecurityBootstrap: admin ring full", "SecurityBootstrap: request larger than the admin ring message");
+    const rune::gateway::AdminSubmit submitted =
+        adminSink_->submitSecurityBootstrap(m, ddlMetaOf_(nullptr, m.sessionId, *session, 0));
+    // Issue #240: the bootstrap is now in flight and the session waits for its answer, which the admin thread sends
+    // only after the `__security` commit.  The login deadline restarts here (as after a TLS handshake), so the auth
+    // reaper never answers 44 to a session whose bootstrap is committing.  Once per session: a repeated bootstrap
+    // frame never keeps an unauthenticated session alive.
+    if (submitted == rune::gateway::AdminSubmit::Accepted)
+        if (auto* first = std::get_if<rune::gateway::AuthAwaitingFirst>(&session->auth);
+            first != nullptr && !first->deadlineRestartedByBootstrap) {
+            first->deadlineNs                   = nowNs_ + authTimeoutNs_;
+            first->deadlineRestartedByBootstrap = true;
+        }
+    answerAdminSubmit_(buf, len, submitted, "SecurityBootstrap: admin ring full",
+                       "SecurityBootstrap: request larger than the admin ring message");
 }
 
 // ---------------------------------------------------------------------------

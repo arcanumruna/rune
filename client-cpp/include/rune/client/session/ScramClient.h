@@ -9,8 +9,8 @@
 //     expensive step of a login; a client holding one session per broker pays it
 //     once per verifier, not once per session (every broker replicates the same
 //     verifier, hence the same (salt, iterations)).  Fixed storage, no heap,
-//     never logged, zeroed on eviction and on destruction.  One cache serves one
-//     password (the Client's): the key is (salt, iterations) only.
+//     never logged, zeroed on eviction and on destruction.  The key is (password tag,
+//     salt, iterations): two passwords never share an entry.
 #pragma once
 
 #include <array>
@@ -54,16 +54,19 @@ public:
     static constexpr std::size_t kCapacity = 8;
     static constexpr std::size_t kMaxSalt  = 64;   // rune::protocol::client::kAuthSaltMax
 
-    ScramCache() noexcept = default;
-    ~ScramCache() { clear(); }
+    /// Draws the cache's random tag key (#239).  If the system RNG refuses, nothing is ever cached (every login
+    /// salts afresh) — the cache never falls back to a guessable tag.
+    ScramCache() noexcept;
+    ~ScramCache();
     ScramCache(const ScramCache&)            = delete;
     ScramCache& operator=(const ScramCache&) = delete;
 
-    /// The cached Hi(password, salt, iterations), or nullptr.
-    [[nodiscard]] const rune::crypto::scram::SaltedPassword* find(std::span<const uint8_t> salt,
+    /// The cached Hi(password, salt, iterations), or nullptr.  The password is part of the key (as a keyed tag).
+    [[nodiscard]] const rune::crypto::scram::SaltedPassword* find(std::string_view password,
+                                                                  std::span<const uint8_t> salt,
                                                                   uint32_t iterations) const noexcept;
     /// Stores one entry (evicting the oldest, zeroed first).  A salt longer than kMaxSalt is not cached.
-    void put(std::span<const uint8_t> salt, uint32_t iterations,
+    void put(std::string_view password, std::span<const uint8_t> salt, uint32_t iterations,
              const rune::crypto::scram::SaltedPassword& sp) noexcept;
 
     /// find(), else PBKDF2 + put().  nullptr = local crypto failure.  The pointer is valid until the next call.
@@ -78,16 +81,31 @@ public:
     [[nodiscard]] uint64_t hits() const noexcept { return hits_; }
     [[nodiscard]] uint64_t pbkdf2Computations() const noexcept { return computations_; }
     [[nodiscard]] std::size_t size() const noexcept;
+    /// The password's tag under THIS cache's key (#239 regression seam: two caches tag one password differently).
+    [[nodiscard]] bool tagForTest(std::string_view password, std::array<uint8_t, 64>& out) const noexcept {
+        return tagOf_(password, out);
+    }
 
 private:
     struct Entry {
         std::array<uint8_t, kMaxSalt>          salt{};
         uint8_t                                saltLen = 0;
         uint32_t                               iterations = 0;     // 0 = empty
+        std::array<uint8_t, 64>                pwTag{};            // HMAC-SHA-512(tagKey_, password) — not the password
         rune::crypto::scram::SaltedPassword    sp{};
     };
+    using Tag = std::array<uint8_t, 64>;
     static void wipe_(Entry& e) noexcept;
+    [[nodiscard]] bool tagOf_(std::string_view password, Tag& out) const noexcept;
+    [[nodiscard]] const rune::crypto::scram::SaltedPassword* find_(const Tag& tag, std::span<const uint8_t> salt,
+                                                                   uint32_t iterations) const noexcept;
+    void put_(const Tag& tag, std::span<const uint8_t> salt, uint32_t iterations,
+              const rune::crypto::scram::SaltedPassword& sp) noexcept;
 
+    /// #239: a per-cache random key, so a tag can be neither precomputed nor matched across processes; the
+    /// password is the HMAC message, not the key.  Wiped by the destructor.
+    std::array<uint8_t, 32>      tagKey_{};
+    bool                         tagKeyed_ = false;   // false = the RNG refused: cache nothing
     std::array<Entry, kCapacity> entries_{};
     Entry                        overflow_{};      // a salt too long to cache: held for the caller
     std::size_t                  next_ = 0;        // round-robin victim

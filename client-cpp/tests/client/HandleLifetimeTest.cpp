@@ -1030,6 +1030,42 @@ TEST(HandleLifetime, BatchBuilderOutlivingItsProducerIsCaughtRegression) {
     ASSERT_TRUE(r.drive([&] { return frees(rcd::HandleKind::Producer) == 1; }));
 }
 
+// #372 (test only): an Invoker owner's blocking send behind a held transactional Tier-2 batch completes once the
+// broker answers AddPartitions.  The send pumps the client duty cycle itself; the answer comes from the gateway
+// thread, as from a real broker.
+TEST(TxnInvokerRegression, BlockingSendBehindAHeldTier2BatchCompletesWhenTheBrokerAnswersRegression) {
+    Rig r(cfgFor(5448));
+    r.connect();
+    r.gw.initPidReply = true;
+    r.gw.replyTxn     = true;
+    r.gw.idempotence  = true;  // the broker model keeps the log
+    auto tp = r.client->producer(txnCfg("tx-372"));
+    TestCq cq(*r.client);
+    auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.initTransactions(q, t); });
+    ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+    ASSERT_TRUE(init.ok()) << init.describe();
+    tp.beginTransaction();
+    const auto topic = r.client->topic("t");
+    {
+        GatewayPump pump(r.gw);
+        auto b = tp.batch(topic, rc::Key(uint64_t{1}));
+        b.add(kVal);
+        ASSERT_EQ(b.send(), OpResult::Accepted);  // held until AddPartitions is answered
+        const auto t0 = std::chrono::steady_clock::now();
+        tp.send(topic, rc::Key(uint64_t{1}), kVal);  // blocking, behind the held batch
+        EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(10));
+        auto commit = cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!commit.ready() && std::chrono::steady_clock::now() < deadline) r.doWork();
+        pump.stop();
+        ASSERT_TRUE(commit.ready()) << "the commit never completed";
+        EXPECT_TRUE(commit.ok()) << commit.describe();
+    }
+    EXPECT_EQ(r.gw.endTxnCommits, (std::vector<uint8_t>{1}));
+    EXPECT_EQ(r.gw.committedValues(0).size(), 2u) << "both records committed";
+    r.client->close();
+}
+
 // ===========================================================================
 // Client close() drains, closeImmediately() / the destructor discard
 // ===========================================================================

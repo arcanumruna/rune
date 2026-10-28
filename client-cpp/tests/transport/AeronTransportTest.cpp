@@ -15,6 +15,7 @@
 //     FragmentAssembler reassembles it back.
 
 #include <filesystem>
+#include <memory>
 #include <rune/client/transport/AeronTransport.h>
 
 #include <gtest/gtest.h>
@@ -98,8 +99,8 @@ static bool boundedOffer(Transport& t, const uint8_t* buf, std::size_t len) {
     return false;
 }
 
-/// Bounded poll until one fragment arrives; copies it into `out`.
-static bool pollOne(Transport& t, std::vector<uint8_t>& out) {
+/// Bounded poll until one frame arrives; copies it into `out`. Returns false on timeout.
+static bool awaitFrame(Transport& t, std::vector<uint8_t>& out) {
     bool fired = false;
     for (int i = 0; i < kPollPumpMax && !fired; ++i) {
         t.poll([&](const uint8_t* buf, std::size_t len) {
@@ -133,7 +134,7 @@ TEST(AeronTransport, IpcLoopbackEcho) {
 
     // Poll until handler fires.
     std::vector<uint8_t> received;
-    const bool fired = pollOne(t, received);
+    const bool fired = awaitFrame(t, received);
 
     ASSERT_TRUE(fired) << "poll() handler never called — echo timed out";
     ASSERT_EQ(received.size(), kPayloadLen);
@@ -157,16 +158,7 @@ TEST(AeronTransport, IpcLoopbackEchoEmpty) {
         << "Empty offer() timed out";
 
     std::vector<uint8_t> received;
-    bool fired = false;
-    for (int i = 0; i < kPollPumpMax && !fired; ++i) {
-        t.poll([&](const uint8_t* buf, std::size_t len) {
-            if (buf && len > 0) {
-                received.assign(buf, buf + len);
-            }
-            fired = true;
-        }, 10);
-        if (!fired) std::this_thread::sleep_for(kPumpSleep);
-    }
+    const bool fired = awaitFrame(t, received);
 
     ASSERT_TRUE(fired) << "Empty-payload echo timed out";
     EXPECT_EQ(received.size(), 0u);
@@ -199,7 +191,7 @@ TEST(AeronTransport, IpcLoopbackMultiFrame) {
 
     // Poll until the FULLY reassembled frame arrives.
     std::vector<uint8_t> received;
-    const bool fired = pollOne(t, received);
+    const bool fired = awaitFrame(t, received);
 
     ASSERT_TRUE(fired)
         << "Multi-frame poll() handler never called — FragmentAssembler did not reassemble";
@@ -323,6 +315,90 @@ TEST(AeronTransportRegression, StartWithAnUnusableIngressChannelThrowsNeverAbort
 }
 
 // ---------------------------------------------------------------------------
+// #510: start() set started_ before the steps that throw, so a second start()
+// after a failed one returned as if the transport were up.  A failed start is
+// now its own state: every later start() rethrows the ORIGINAL error, offer()
+// stays refused, stop() still frees what the failed start created, and a start()
+// after stop() is a logic error (nobody restarts a stopped transport).
+// RED by mutation: restore `if (started_) return; started_ = true;` ordering.
+// ---------------------------------------------------------------------------
+TEST(AeronTransportRegression, ASecondStartAfterAFailedStartRethrowsTheOriginalErrorRegression) {
+    Config cfg = makeLoopbackConfig(1210);
+    cfg.ingressChannel = "127.0.0.1:1";  // not an Aeron channel URI
+    Transport t{cfg};
+
+    std::string firstWhat;
+    try {
+        t.start();
+        ADD_FAILURE() << "start() must reject an unusable ingress channel";
+    } catch (const std::runtime_error& e) {
+        firstWhat = e.what();
+    }
+    ASSERT_FALSE(firstWhat.empty());
+
+    for (int again = 0; again < 3; ++again) {
+        try {
+            t.start();
+            ADD_FAILURE() << "a second start() after a failed one must not report success";
+        } catch (const std::runtime_error& e) {
+            EXPECT_EQ(firstWhat, e.what());
+        }
+    }
+    const uint8_t frame[4] = {1, 2, 3, 4};
+    EXPECT_FALSE(t.offer(frame, sizeof frame));
+    EXPECT_NO_THROW(t.stop());
+    EXPECT_THROW(t.start(), std::logic_error) << "start() after stop() is a logic error";
+}
+
+// ---------------------------------------------------------------------------
+// #510 adversarial (M31+ review): a failed start in either driver mode, failing
+// before the driver exists (validate() -> std::invalid_argument) or after it
+// (an unusable channel -> std::runtime_error).  Every later start() rethrows the
+// original exception with its dynamic type and message, the transport stays
+// refused (offer false, nothing connected, dutyCycle harmless), and the
+// destructor alone (no stop()) tears it down.  RED by mutation: restore
+// `if (started_) return; started_ = true;` in start().
+// ---------------------------------------------------------------------------
+TEST(AeronTransportRegression, AFailedStartRethrowsItsOwnTypeInEitherDriverModeAndTheDtorAloneEndsItAdversarialRegression) {
+    using rune::client::transport::DriverMode;
+    int stream = 1220;
+    for (DriverMode mode : {DriverMode::Invoker, DriverMode::Thread}) {
+        for (bool badMtu : {true, false}) {
+            SCOPED_TRACE(::testing::Message() << "mode=" << static_cast<int>(mode) << " badMtu=" << badMtu);
+            Config cfg = makeLoopbackConfig(stream++);
+            cfg.driverMode = mode;
+            if (badMtu) cfg.mtuLength = 1000;          // not a multiple of 32
+            else        cfg.ingressChannel = "127.0.0.1:1";
+            auto t = std::make_unique<Transport>(cfg);
+            auto kind = [&](std::string& what) -> int {   // 1 invalid_argument, 2 logic_error, 3 runtime_error
+                try { t->start(); }
+                catch (const std::invalid_argument& e) { what = e.what(); return 1; }
+                catch (const std::logic_error& e)      { what = e.what(); return 2; }
+                catch (const std::runtime_error& e)    { what = e.what(); return 3; }
+                return 0;
+            };
+            std::string first;
+            const int firstKind = kind(first);
+            ASSERT_EQ(firstKind, badMtu ? 1 : 3) << first;
+            for (int again = 0; again < 3; ++again) {
+                std::string w;
+                EXPECT_EQ(kind(w), firstKind);
+                EXPECT_EQ(w, first);
+                (void)t->dutyCycle();
+                const uint8_t frame[4] = {1, 2, 3, 4};
+                EXPECT_FALSE(t->offer(frame, sizeof frame));
+                EXPECT_FALSE(t->ingressConnected());
+                EXPECT_FALSE(t->egressConnected());
+            }
+            EXPECT_NO_THROW(t.reset()) << "the destructor alone ends a failed start";
+        }
+    }
+    Transport ok{makeLoopbackConfig(stream)};
+    ASSERT_NO_THROW(ok.start());
+    ok.stop();
+}
+
+// ---------------------------------------------------------------------------
 // #432 adversarial (M4 review of PR 509): the failure branch over the whole
 // matrix — which side is unusable (ingress publication or egress subscription:
 // the OTHER handle is the one that resolved and must be released first) x both
@@ -378,7 +454,7 @@ TEST(AeronTransportRegression, StartFailureEitherSideEitherDriverModeThrowsNever
     const uint8_t frame[4] = {0xDE, 0xAD, 0xBE, 0xEF};
     ASSERT_TRUE(boundedOffer(ok, frame, sizeof frame));
     std::vector<uint8_t> got;
-    (void)pollOne(ok, got);
+    ASSERT_TRUE(awaitFrame(ok, got));
     EXPECT_EQ(got, std::vector<uint8_t>(frame, frame + sizeof frame));
     ok.stop();
 }

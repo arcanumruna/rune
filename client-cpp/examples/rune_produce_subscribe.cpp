@@ -324,7 +324,6 @@ int runWorldServer(ClientConfig& cfg, const std::string& role, int timeoutMs) {
             GroupConfig gcfg;
             gcfg.autoCommit           = true;
             gcfg.autoCommitIntervalMs = 1000;
-            gcfg.autoOffsetReset      = OffsetReset::Earliest;
             gc.emplace(c.subscribeGroup(group, {consumeTopic}, gcfg));
             gc->onAssigned([&](std::vector<TopicPartition>) { assigned.store(true); });
             gc->onRecords([&](const RecordSet& rs) {

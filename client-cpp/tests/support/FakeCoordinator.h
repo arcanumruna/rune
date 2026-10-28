@@ -42,6 +42,8 @@ public:
     CoordinatorSink::Offer    next = CoordinatorSink::Offer::Accepted;
     std::vector<OfferedFrame> offered;           ///< every frame the link offered, in order
     int                       rediscovers = 0;   ///< re-discovery requests (NotCoordinator answered)
+    int                       refuseRediscovers = 0;   ///< #351: the next N asks are refused (return false), not counted
+    int                       refusedRediscovers = 0;  ///< #351: asks that were refused
 
     FakeCoordinator() { offered.reserve(1 << 15); }
 
@@ -129,7 +131,16 @@ private:
         return self->next;
     }
     static int64_t sessionThunk(void* ctx) noexcept { return static_cast<FakeCoordinator*>(ctx)->sid; }
-    static void rediscoverThunk(void* ctx) noexcept { ++static_cast<FakeCoordinator*>(ctx)->rediscovers; }
+    static bool rediscoverThunk(void* ctx) noexcept {
+        auto* self = static_cast<FakeCoordinator*>(ctx);
+        if (self->refuseRediscovers > 0) {
+            --self->refuseRediscovers;
+            ++self->refusedRediscovers;
+            return false;
+        }
+        ++self->rediscovers;
+        return true;
+    }
 };
 
 }  // namespace test_support

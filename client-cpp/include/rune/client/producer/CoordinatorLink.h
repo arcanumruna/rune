@@ -34,7 +34,9 @@ public:
     struct Unsent {};
     struct InFlight { int64_t sessionId = 0; int64_t answerByNs = 0; };
     struct Backoff  { int64_t untilNs = 0; };
-    struct AwaitCoordinator { uint64_t gen = 0; };
+    /// NotCoordinator: re-sent once the coordinator moved (gen) AND its backoff elapsed - a coordinator that keeps
+    /// answering NotCoordinator (not loaded yet, a follower) is retried paced, never once per metadata round trip.
+    struct AwaitCoordinator { uint64_t gen = 0; int64_t notBeforeNs = 0; };
     using SlotState = std::variant<Free, Building, Unsent, InFlight, Backoff, AwaitCoordinator>;
     struct Slot {
         SlotState state = Free{};
@@ -115,6 +117,7 @@ public:
 
 private:
     int offerIfDue_(Slot& s, int64_t nowNs) noexcept;
+    void askRediscover_() noexcept;   // #351: once per generation; a refused ask stays due
     bool offer_(Slot& s) noexcept;
 
     std::array<Slot, kMaxCoordRequests> slots_{};
@@ -123,7 +126,7 @@ private:
     uint32_t        live_ = 0;   // slots not Free (Building included)
     uint64_t        scans_ = 0;
     uint64_t        gen_ = 0;
-    uint64_t        askedGen_ = ~uint64_t{0};   // the generation a re-discovery was last requested for
+    uint64_t        askedGen_ = ~uint64_t{0};   // the generation a re-discovery was last SUBMITTED for (#351)
     CoordinatorSink sink_;
 };
 

@@ -251,6 +251,10 @@ public:
         /// Rejected, else 0 (optional).  A subscription homed there is ended
         /// with that code at once (it could only wait for its deadline).
         int16_t (*rejectCode)(void* ctx, uint32_t session) = nullptr;
+        /// #446: the node session (index >= 1) that is Connected with broker session id `sid`; 0 when none;
+        /// UINT32_MAX when more than one node session has it (optional).  Cold: only a late / stray
+        /// SubscribeResponse OK asks, to release the subscription it bound broker-side.
+        uint32_t (*sessionIndexOf)(void* ctx, int64_t sid) = nullptr;
     };
     void setNodeRouter(const NodeRouter& r) noexcept { router_ = r; }
 
@@ -291,6 +295,9 @@ public:
     /// metadata refresh armed: a leader that crashed under them is only seen
     /// stale after responseTimeoutNs, fresh metadata moves them sooner.
     [[nodiscard]] std::size_t unansweredHomed() const noexcept { return unansweredHomed_; }
+    /// #514: does a pending request (with an active subscription) or a bound active subscription live on node
+    /// session `session` (0 = the seed: a reader homed there)?  False unless routed.  Cold: asked only when that session has gone silent.
+    [[nodiscard]] bool usesSession(uint32_t session) const noexcept;
     /// Duty cycle (while homedCount() != 0): flush held moved Subscribes whose
     /// node session is Connected (re-resolving the leader each attempt); a
     /// moved subscription whose node session was LOST (dropped / reconnected:
@@ -401,6 +408,13 @@ public:
     /// command), so an adoption later in the same poll sees the truth.
     void setSessionConnected(bool connected) noexcept { sessionConnected_ = connected; }
     [[nodiscard]] uint64_t staleResponsesIgnored() const noexcept { return staleResponsesIgnored_; }
+    /// #446: SubscribeResponse OKs that bound nothing here (their Subscribe timed out / was swept, or they came on
+    /// another session than the pending one expects) and were released with a best-effort Unsubscribe on the
+    /// session they came on (Accepted) ...
+    [[nodiscard]] uint64_t lateOksReleased() const noexcept { return lateOksReleased_; }
+    /// ... and those that could not be: no single live session carries that id (dead, or ambiguous), or the one
+    /// attempt was refused.  The broker drops such a subscription with its session.
+    [[nodiscard]] uint64_t lateOksUnreleased() const noexcept { return lateOksUnreleased_; }
     /// fix4 M1: subscriptions failed because their Subscribe frame was Fatal.
     [[nodiscard]] uint64_t subscribesFailed() const noexcept { return subscribesFailed_; }
 
@@ -523,6 +537,11 @@ private:
     bool        sessionConnected_      = true;
     std::size_t unsentSubscribes_      = 0;
     uint64_t    staleResponsesIgnored_ = 0;
+    uint64_t    lateOksReleased_       = 0;  // #446: see lateOksReleased()
+    uint64_t    lateOksUnreleased_     = 0;
+    /// #446: an OK that binds nothing - one best-effort Unsubscribe (`unsubCorrId`) on the live session it came on
+    /// (the seed `seedSid`, or the one node session carrying `rsp.sessionId`).  Cold.
+    void releaseUnboundOk_(const codec::SubscribeResponseView& rsp, int64_t unsubCorrId, int64_t seedSid);
     uint64_t    subscribesFailed_      = 0;  // fix4 M1: Fatal Subscribe offers
     uint64_t    subscriptionsMoved_    = 0;  // E2 Task 13: rearmMovedAway
     uint64_t    catalogReadsEnded_     = 0;  // catalog history Task 13: endCatalogRead

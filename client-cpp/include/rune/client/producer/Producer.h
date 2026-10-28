@@ -175,7 +175,9 @@ struct ProducerConfig {
     /// may be built or queued-unsent at a time (a slot returns to the pool when its batch
     /// is encoded and offered, failed or discarded - not at ack).  Exhausted pool =
     /// BackPressured, never an allocation.  >= 2 x maxInFlight recommended.  Memory:
-    /// tier2Slots x 2 x tier2SlotBytes of address space (touched only as used).
+    /// tier2Slots x 2 x tier2SlotBytes of address space (touched only as used).  The reserve is per
+    /// producer: N per-shard producers reserve N times that, so lower tier2Slots (or tier2SlotBytes)
+    /// when running many producers.
     int32_t tier2Slots     = 64;
     /// Largest Tier-2 batch (RecordBatch header + records) one slot holds; 0 = max(batchBytes,
     /// maxFrameBytes).
@@ -352,6 +354,9 @@ enum class SendResult : uint8_t {
 // belong to any frame; sends resume, and another claim is ClaimHeld until
 // this one is committed (false), aborted or destroyed.
 // A claim carrying Completions credit is settled on that queue's owner thread.
+// Aborting (or destroying) a credit-carrying claim off its queue's owner thread loses that credit: it is counted
+// and logged.  An Invoker claim settled off the owner thread is refused (commit() false, the claim stays open) or,
+// on abort, logged and left held until the producer closes.
 // A claim must not outlive its Producer.  Zero allocation.
 // ---------------------------------------------------------------------------
 namespace detail {
@@ -421,7 +426,8 @@ public:
     /// Discard the record: nothing is sent, nothing completes.  No-op unless open.
     /// Off the owner thread of a carried queue the ring slot is still released
     /// but the credit cannot be returned (it is the owner's plain state): the
-    /// queue loses that credit — settle credit-carrying claims on their owner.
+    /// queue loses that credit (counted and logged) - settle credit-carrying claims on their owner.
+    /// An Invoker claim aborted off the owner thread is logged and stays held until the producer closes.
     void abort() noexcept {
         if (std::holds_alternative<Open>(state_)) [[unlikely]] abortOpen_();
     }
@@ -767,8 +773,10 @@ public:
     BatchBuilder batch(TopicHandle topic, const Key& key);
 
     /// Rebind the Tier-2 batch thread to the CALLING thread.  Call it before the first batch() from
-    /// the new thread, with no BatchBuilder live (asserted in debug builds); the hand-off itself
-    /// (e.g. thread start / join) must order the old thread's last use before this call.
+    /// the new thread; the hand-off itself (e.g. thread start / join) must order the old thread's
+    /// last use before this call.  A BatchBuilder still live on the old thread is refused there
+    /// (send() = WrongThread); destroying it hands its slot back (Thread mode; an Invoker producer
+    /// loses the slot and logs it).
     void bindBatchThread();
 
     // ---- Control -------------------------------------------------------------

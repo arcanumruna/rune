@@ -164,13 +164,38 @@ TEST(ClientAuthErrorsRegression, NoCredentialsFailsConnectWithAuthenticationFail
 }
 
 TEST(ClientAuthErrorsRegression, ARateLimitedLoginReportsRetryAfterOnTheConnectFailure) {
-    Rig r(authCfg(3708, "ws1", "not the password!"));
+    rc::ClientConfig c = authCfg(3708, "ws1", "not the password!");
+    c.connectTimeoutMs = 120'000;   // the whole retry budget (8 x >= 800 ms) fits the connect deadline
+    Rig r(c);
     r.gw.retryAfterMsOnFailure = 800;
     test_support::TestCq cq(r.client);
     auto f = r.connectOp(cq);
-    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    // Issue #519: before Live a rate-limited login is retried (Backoff >= the retry-after) within the retry budget,
+    // then the connect fails with the code and the retry-after; drive the injected clock past the whole budget.
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
     EXPECT_EQ(f.outcome().c.errorCode, 44);
     EXPECT_EQ(f.outcome().c.aux, 800) << "Completion::aux = the broker's retryAfterMs";
+}
+
+// C4 review (#461 / #519): a retry-after that outlives the connect deadline.  The deadline falls inside the paced retry;
+// the connect must fail with the broker's verdict (44) and its retry-after, not a bare Timeout that loses both, and the
+// retry must stop - no login behind a connect that already failed.
+TEST(ClientAuthErrorsRegression, ARetryAfterBeyondTheConnectDeadlineReportsTheVerdictAndStopsRetryingRegression) {
+    rc::ClientConfig c = authCfg(3920, "ws1", "not the password!");
+    c.connectTimeoutMs = 2'000;
+    Rig r(c);
+    r.gw.retryAfterMsOnFailure = 5'000;   // > connectTimeoutMs
+    test_support::TestCq cq(r.client);
+    auto f = r.connectOp(cq);
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::NotConnected) << f.describe();
+    EXPECT_EQ(f.outcome().c.errorCode, 44) << "the broker's verdict, not a bare Timeout";
+    EXPECT_EQ(f.outcome().c.aux, 5'000) << "Completion::aux = the broker's retryAfterMs";
+    EXPECT_EQ(r.gw.authFailed, 1);
+    // Well past the retry-after: the abandoned retry never logs in again.
+    r.passes(200, 100'000'000);
+    EXPECT_EQ(r.gw.authFailed, 1) << "the retry stopped with the failed connect";
+    EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Disconnected);
 }
 
 TEST(ClientAuthErrorsRegression, ABrokerThatCannotProveThePasswordIsRefused) {
@@ -331,6 +356,59 @@ TEST(ClientAuthErrorsRegression, ARevokedLeaderNodeSessionFailsItsRequestsSessio
     p.flush();
     ASSERT_TRUE(r.drive([&] { return viaSeed.ready(); }));
     EXPECT_TRUE(viaSeed.ok()) << viaSeed.describe();
+}
+
+// #291: a TRANSACTIONAL producer whose batches wait on a leader node session that goes Rejected fails them at once
+// (the Review-B path reaches transactional producers too) and its transaction is abortable.
+TEST(ClientAuthErrorsRegression, ATransactionalProducerWithBatchesOnARejectedLeaderNodeSessionFailsAtOnceRegression) {
+    TwoNodeRig r(3858);
+    r.gw.initPidReply = true;
+    r.gw.replyTxn     = true;
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    test_support::TestCq cq(r.client);
+    auto conn = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(r.drive([&] { return conn.ready(); }));
+    ASSERT_TRUE(conn.ok()) << conn.describe();
+    ASSERT_TRUE(r.drive([&] { return r.client.testLeaderFor(1, 0) == 1; })) << "metadata names node 1 as p0's leader";
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::All; pcfg.lingerUs = 60'000'000; pcfg.batchBytes = 64 * 1024;
+    pcfg.maxInFlight = 8; pcfg.produceTimeoutMs = 60'000; pcfg.deliveryTimeoutMs = 120'000;
+    pcfg.transactionalId = "tx-leader-rejected"; pcfg.transactionOpTimeoutMs = 30'000;
+    rc::Producer p = r.client.producer(pcfg);
+    auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return p.initTransactions(q, t); });
+    ASSERT_TRUE(r.drive([&] { return init.ready(); }));
+    ASSERT_TRUE(init.ok()) << init.describe();
+    r.gw.replyAcks = false;                          // node-1 batches stay in flight
+    p.beginTransaction();
+    const auto topic = r.client.topic("t");
+    const std::vector<uint8_t> val(16, 0x5C);
+    std::vector<test_support::PendingOp> sends;
+    for (int i = 0; i < 2; ++i) {
+        sends.push_back(cq.send(p, topic, TwoNodeRig::keyFor(0), val));
+        ASSERT_TRUE(sends.back().accepted()) << "send " << i << " result " << static_cast<int>(sends.back().sendResult());
+        p.flush();
+        r.passes(30);
+    }
+    ASSERT_TRUE(r.drive([&] { return r.gw.produced.size() >= 1; })) << "a txn batch in flight on node 1";
+    for (const auto& pr : r.gw.produced) EXPECT_EQ(pr.endpoint, r.n1);
+    r.gw.subscribeLeader[0] = r.n1;                  // the seed redirects the Subscribe to node 1
+    rc::Subscription sub = r.client.subscribe(topic, 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty() && sub.subscriptionId() != 0; }));
+    ASSERT_EQ(r.gw.subscribed.back().endpoint, r.n1);
+    const int64_t node1Sid = r.gw.subscribed.back().sessionId;
+    ASSERT_NE(node1Sid, r.gw.authSessionIds.front()) << "node 1 has its own session";
+
+    r.gw.revokeSession(node1Sid, r.n1);
+    r.passes(50);
+    for (auto& s : sends) {
+        ASSERT_TRUE(s.ready()) << "a txn batch was held behind a Rejected session";
+        EXPECT_EQ(s.outcome().c.status, rc::OpStatus::BrokerError);
+        EXPECT_EQ(s.outcome().c.errorCode, 46);
+    }
+    EXPECT_EQ(p.state(), rc::TxnState::AbortableError);
+    auto commit = cq.issue([&](rc::Completions& q, rc::Token t) { return p.commitTransaction(q, t); });
+    ASSERT_TRUE(r.drive([&] { return commit.ready(); }));
+    EXPECT_FALSE(commit.ok());
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
 }
 
 TEST(ClientAuthErrorsRegression, ALeaderNodeLoginRefusedFailsItsRequestsAuthenticationFailedButNotTheClientRegression) {
@@ -529,6 +607,44 @@ TEST(ClientAuthErrorsRegression, AMemberWhoseCoordinatorNodeRefusesItsLoginEndsA
     EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
 }
 
+// #291: the transaction COORDINATOR is on a node whose login is refused.  A transactional producer waiting on it
+// ends FatalError at once with the refusal, not at its op deadline.
+TEST(ClientAuthErrorsRegression, ATransactionalProducerWhoseCoordinatorNodeRefusesItsLoginEndsAtOnceAdversarialRegression) {
+    TwoNodeRig r(3860);
+    r.gw.rejectLoginsAt.insert(r.n1);
+    r.gw.coordinatorEndpoint   = r.n1;
+    r.gw.coordinatorRedirectTo = r.node1.substr(r.node1.find("endpoint=") + 9);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::All;
+    pcfg.transactionalId = "tx-coord-rejected"; pcfg.transactionOpTimeoutMs = 30'000;
+    rc::Producer p = r.client.producer(pcfg);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto init = cq.issue([&](rc::Completions& q, rc::Token t) { return p.initTransactions(q, t); });
+    ASSERT_TRUE(r.drive([&] { return init.ready(); })) << "InitProducerId waited on a Rejected coordinator session";
+    EXPECT_EQ(init.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(init.outcome().c.errorCode, 44);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
+    EXPECT_EQ(p.state(), rc::TxnState::FatalError);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+    // A plain producer on the same client: its coordinator is the same refused node (the real gateway answers every
+    // InitProducerId, plain ones too, with NotCoordinator), so its id request can never be answered here.  Its record
+    // ends at once with the refusal - it is never held behind an InitProducerId <-> NotCoordinator loop.
+    rc::ProducerConfig plain; plain.acks = rc::Acks::Leader; plain.lingerUs = 0;
+    plain.deliveryTimeoutMs = 120'000; plain.produceTimeoutMs = 60'000;
+    rc::Producer pp = r.client.producer(plain);
+    const auto topic = r.client.topic("t");
+    const std::vector<uint8_t> val(16, 0x5C);
+    auto held = cq.send(pp, topic, TwoNodeRig::keyFor(1), val);
+    ASSERT_TRUE(held.accepted());
+    pp.flush();
+    ASSERT_TRUE(r.drive([&] { return held.ready(); }))
+        << "a plain producer's record held behind a Rejected coordinator; plainInit " << r.gw.plainInitPids;
+    EXPECT_EQ(held.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(held.outcome().c.errorCode, 44);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
 // Review B I5: against a Required broker with no security admin yet, a credential-less client's session is Anonymous
 // and may carry ONLY the bootstrap: no keepalive, no connect-time metadata request (the strict fake ends a session
 // that sends anything else).  The bootstrap itself — MAC checked, accepted once — creates the admin.
@@ -638,21 +754,40 @@ TEST(ClientAuthErrorsRegression, NoDataFrameLeavesBeforeConnectedRegression) {
     EXPECT_EQ(r.gw.unauthenticatedRequests, 0);
 }
 
-// Review B I5 (d): a resume of a session that IS authenticated keeps its login — no second SCRAM exchange.
-TEST(ClientAuthErrorsRegression, AResumedSessionKeepsItsLoginRegression) {
+// Issue #478: the real gateway never resumes a login (ClientGateway::handleConnect since PR #476): a reconnect gets a NEW
+// session id and MustAuthenticate, and the client logs in again.  The fake now does exactly that; the work that was in
+// flight on the lost session completes on the new one, exactly once.
+TEST(ClientAuthErrorsRegression, AReconnectedSessionLogsInAgainAndItsWorkResumesRegression) {
     Rig r(authCfg(3752, "ws1", kPw));
     r.gw.uniqueSessionIds = true;
+    r.gw.replyAcks = false;                       // the produce stays in flight across the lost session
     r.connectOk();
-    ASSERT_EQ(r.gw.authFirsts, 1);
-    const int64_t sid = r.client.state() == rc::session::SessionState::Connected ? r.gw.authSessionIds.front() : 0;
-    r.client.testForceResume();   // the link drops: Connected -> Resuming -> a resume ConnectRequest with the hint
-    ASSERT_TRUE(r.drive([&] { return r.gw.resumedAnswers == 1; }, 10'000'000));
+    ASSERT_EQ(r.gw.authFirsts, 1) << "the first login";
+    const int64_t firstSid = r.gw.authSessionIds.front();
+    test_support::TestCq cq(r.client);
+    rc::ProducerConfig pcfg; pcfg.acks = rc::Acks::Leader; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
+    rc::Producer p = r.client.producer(pcfg);
+    const std::vector<uint8_t> val(16, 0x3C);
+    auto sent = cq.send(p, r.client.topic("t"), rc::Key(uint64_t{1}), val);
+    ASSERT_TRUE(sent.accepted());
+    p.flush();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.held.empty(); })) << "the produce never reached the broker";
+    const int connectsBefore = r.gw.connects;
+    r.client.testForceResume();                   // the link drops: Connected -> Resuming -> a resume ConnectRequest
     ASSERT_TRUE(r.drive([&] { return r.client.state() == rc::session::SessionState::Connected; }, 10'000'000));
-    EXPECT_EQ(r.gw.authFirsts, 1) << "no second login across the resume";
-    EXPECT_EQ(r.gw.authOk, 1);
-    EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Authenticated) << "an earned resume";
+    EXPECT_EQ(r.gw.connects, connectsBefore + 1) << "the first reconnect attempt is the one that completed";
+    EXPECT_EQ(r.gw.authFirsts, 2) << "the reconnect logged in again (the gateway never resumes a login)";
+    EXPECT_EQ(r.gw.authOk, 2);
+    EXPECT_NE(r.gw.authSessionIds.back(), firstSid) << "a reconnect gets a NEW session id";
+    EXPECT_EQ(r.client.authStatus().kind, rc::AuthStatus::Kind::Authenticated);
     EXPECT_EQ(r.client.authStatus().user, "ws1");
-    EXPECT_NE(sid, 0);
+    r.gw.replyAcks = true;
+    ASSERT_TRUE(r.drive([&] { return r.gw.held.size() >= 2; }, 10'000'000)) << "the batch was not re-offered on the new session";
+    r.gw.ack(r.gw.held.back());
+    ASSERT_TRUE(r.drive([&] { return sent.ready(); }, 10'000'000));
+    EXPECT_TRUE(sent.ok()) << sent.describe();
+    r.passes(50, 10'000'000);                // a duplicate completion would trip the completion queue's exactly-once check
+    EXPECT_EQ(r.gw.unauthenticatedRequests, 0);
 }
 
 // ---- 45 / 47 on an op --------------------------------------------------------------------------------------
@@ -938,6 +1073,48 @@ TEST(ClientAuthErrorsRegression, CredentialsWithoutTlsAreRefusedAtConstructionRe
     EXPECT_NO_THROW(rc::Client{plain(authCfg(3798, "", ""))}) << "no credentials: TLS stays optional";
 }
 
+// Issue #235: the iteration counts are validated at construction, never clamped silently: a cap outside the wire range,
+// or a verifier count above this client's own login cap (it could not log in with a password it set), throws.
+// RED: drop the scramIterations / maxAcceptedScramIterations checks in validatedConfig.
+TEST(ClientAuthErrorsRegression, ScramIterationCountsAreValidatedAtConstructionRegression) {
+    auto with = [](int32_t in, uint32_t iters, uint32_t cap) {
+        rc::ClientConfig c = authCfg(in, "ws1", kPw);
+        c.scramIterations = iters;
+        c.maxAcceptedScramIterations = cap;
+        return c;
+    };
+    EXPECT_THROW(rc::Client{with(3884, 4096, 4095)}, std::invalid_argument) << "cap below the wire minimum";
+    EXPECT_THROW(rc::Client{with(3884, 4096, 1'000'001)}, std::invalid_argument) << "cap above the wire maximum";
+    EXPECT_THROW(rc::Client{with(3884, 4095, 100'000)}, std::invalid_argument) << "verifier count below the minimum";
+    EXPECT_THROW(rc::Client{with(3884, 200'000, 100'000)}, std::invalid_argument)
+        << "a verifier this client could not log in with";
+    EXPECT_NO_THROW(rc::Client{with(3886, 100'000, 100'000)}) << "equal is fine";
+    EXPECT_NO_THROW(rc::Client{with(3888, 4096, 1'000'000)}) << "both wire bounds are inclusive";
+}
+
+// C9 review: a negative timeout or retry budget is refused at construction; a huge one (milliseconds::max()) is
+// accepted (saturated, see ClientViewRowRegression.*MaxRetryBudget*).  RED: drop the >= 0 checks in validatedConfig.
+TEST(ClientConfigRegression, NegativeTimeoutsAndRetryBudgetsAreRefusedAtConstructionRegression) {
+    auto with = [](int32_t in, auto&& set) {
+        rc::ClientConfig c = authCfg(in, "", "");
+        set(c);
+        return c;
+    };
+    using std::chrono::milliseconds;
+    EXPECT_THROW(rc::Client{with(3890, [](auto& c) { c.connectTimeoutMs = -1; })}, std::invalid_argument);
+    EXPECT_THROW(rc::Client{with(3890, [](auto& c) { c.pingTimeoutMs = -1; })}, std::invalid_argument);
+    EXPECT_THROW(rc::Client{with(3890, [](auto& c) { c.ddlTimeoutMs = -1; })}, std::invalid_argument);
+    EXPECT_THROW(rc::Client{with(3890, [](auto& c) { c.ddlRetryBudget = milliseconds{-1}; })}, std::invalid_argument);
+    EXPECT_THROW(rc::Client{with(3890, [](auto& c) { c.viewReadRetryBudget = milliseconds{-1}; })},
+                 std::invalid_argument);
+    EXPECT_NO_THROW(rc::Client{with(3892, [](auto& c) {
+        c.ddlRetryBudget = milliseconds::max();
+        c.viewReadRetryBudget = milliseconds::max();
+        c.ddlTimeoutMs = INT64_MAX;
+        c.pingTimeoutMs = INT64_MAX;
+    })}) << "huge values are saturated, never refused";
+}
+
 // Issue #115: offerCrypto with the system store, no tlsExpectHost and a gateway channel that names no host would check
 // no name at all - any public certificate for any name would pass.  Refused at construction; a host in the channel, an
 // explicit tlsExpectHost or a pinned CA each make it valid.  RED: drop the tlsHostOfChannel check in validatedConfig.
@@ -1111,4 +1288,354 @@ TEST(ClientAuthErrorsRegression, AForgedConnectLegErrorNeverFailsWorkInFlightAdv
         }, 10'000'000)) << int(code);
         EXPECT_EQ(s->outcome().c.status, rc::OpStatus::Ok) << "code " << int(code) << " " << s->describe();
     }
+}
+
+// ---- #515: a subscription is ended with a node session's reject code only while that session is STILL its route --
+namespace {
+/// TwoNodeRig plus a third node (broker node 2) that can take p0 over.
+struct ThreeNodeRig : TwoNodeRig {
+    int n2 = 0;
+    explicit ThreeNodeRig(int32_t in) : TwoNodeRig(in) {
+        const int p2 = freePort();
+        n2 = gw.addEndpoint(udp(p2), in);
+        gw.nodeOfEndpoint[n2] = n2;
+        gw.moreBrokers.push_back({2, "127.0.0.1", p2});
+    }
+    /// Node 1's session is revoked (its per-subscription answers lost) in the SAME client pass in which the
+    /// metadata answer moves p0 to node 2: both frames are queued before the client polls again.
+    [[nodiscard]] bool revokeNode1AndMoveP0ToNode2(int64_t node1Sid) {
+        gw.holdMetadata = true;
+        const std::size_t before = gw.metadataCorrIds.size();
+        client.testRequestMetadataNow();
+        if (!drive([&] { return gw.metadataCorrIds.size() > before; })) return false;   // no metadata request
+        gw.subscribeLeader[0] = n2;
+        gw.partitions = {{1, 0, 2, 2, c.gatewayStreamId, ""}, {1, 1, 0, 1, c.gatewayStreamId, ""}};
+        gw.subscribed.clear();                          // node 1's per-subscription answers are lost
+        gw.revokeSession(node1Sid, n1);                 // node 1's session -> Rejected(46)
+        gw.sendMetadata(gw.metadataSessionIds.back(), gw.metadataCorrIds.back(), gw.metadataEndpoints.back());   // p0 is node 2's now
+        gw.holdMetadata = false;
+        return true;
+    }
+};
+} // namespace
+
+// Bound on node 1; node 1's session is Rejected in the very pass fresh metadata moves p0 to node 2.  RED (before):
+// driveHomed checked the reject code before the route and ended the subscription with 46 though a healthy node
+// leads p0 — the group path refuses only when the CURRENT leader is Rejected.
+TEST(ClientAuthErrorsRegression, ASubscriptionWhoseRejectedHomeMovedFollowsTheRouteRegression) {
+    ThreeNodeRig r(3870);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    r.gw.subscribeLeader[0] = r.n1;
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return subscribedAt(r.gw, r.n1) != nullptr && sub.active(); }));
+    const int64_t node1Sid = subscribedAt(r.gw, r.n1)->sessionId;
+    ASSERT_TRUE(r.revokeNode1AndMoveP0ToNode2(node1Sid)) << "no metadata request";
+    ASSERT_TRUE(r.drive([&] { return sub.finished() || subscribedAt(r.gw, r.n2) != nullptr; }));
+    EXPECT_FALSE(sub.finished()) << "ended with node 1's code " << sub.brokerErrorCode()
+                                 << " though p0 moved to a healthy node";
+    ASSERT_NE(subscribedAt(r.gw, r.n2), nullptr) << "no Subscribe for p0 reached node 2";
+    ASSERT_TRUE(r.drive([&] { return sub.finished() || sub.active(); }));
+    EXPECT_TRUE(sub.active());
+    EXPECT_FALSE(sub.finished());
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// The new home is Rejected too: the NEXT driveHomed pass ends the subscription, with node 2's code (44 = a refused
+// login), not node 1's (46).
+TEST(ClientAuthErrorsRegression, ASubscriptionWhoseRejectedHomeMovedToAnotherRejectedNodeEndsWithItsCodeRegression) {
+    ThreeNodeRig r(3872);
+    r.gw.rejectLoginsAt.insert(r.n2);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    r.gw.subscribeLeader[0] = r.n1;
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return subscribedAt(r.gw, r.n1) != nullptr && sub.active(); }));
+    const int64_t node1Sid = subscribedAt(r.gw, r.n1)->sessionId;
+    ASSERT_TRUE(r.revokeNode1AndMoveP0ToNode2(node1Sid)) << "no metadata request";
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); })) << "the subscription waited on a Rejected session";
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::RejectedByBroker);
+    EXPECT_EQ(sub.brokerErrorCode(), 44) << "node 2's code, not the old home's 46";
+    EXPECT_EQ(subscribedAt(r.gw, r.n2), nullptr) << "nothing was ever sent to the refused node";
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// The pending (not yet answered) twin of the first: the Subscribe reached node 1 but its answer is lost, then node
+// 1's session is Rejected in the pass the metadata moves p0 to node 2.
+TEST(ClientAuthErrorsRegression, APendingSubscribeWhoseRejectedHomeMovedFollowsTheRouteRegression) {
+    ThreeNodeRig r(3874);
+    test_support::TestCq cq(r.client);
+    connectTwoNode(r, cq);
+    r.gw.subscribeLeader[0] = r.n1;
+    r.gw.dropSubscribeResponsesNext = 1;             // the Subscribe is registered at node 1, its answer is lost
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return subscribedAt(r.gw, r.n1) != nullptr; }));
+    ASSERT_EQ(sub.subscriptionId(), 0) << "the answer was meant to be lost";
+    const int64_t node1Sid = subscribedAt(r.gw, r.n1)->sessionId;
+    ASSERT_TRUE(r.revokeNode1AndMoveP0ToNode2(node1Sid)) << "no metadata request";
+    ASSERT_TRUE(r.drive([&] { return sub.finished() || subscribedAt(r.gw, r.n2) != nullptr; }));
+    EXPECT_FALSE(sub.finished()) << "ended with node 1's code " << sub.brokerErrorCode()
+                                 << " though p0 moved to a healthy node";
+    ASSERT_NE(subscribedAt(r.gw, r.n2), nullptr) << "no Subscribe for p0 reached node 2";
+    ASSERT_TRUE(r.drive([&] { return sub.finished() || sub.active(); }));
+    EXPECT_TRUE(sub.active());
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// #515 adversarial (M31+ review): the reject-vs-route ordering from every side.  Node 1's session is Rejected (46)
+// in the very pass fresh metadata names p0's leader as (a) node 1 itself, (b) the seed, then (c) the route follows
+// to node 2 and a later answer flips p0 BACK onto Rejected node 1.  (a) and (c) must end with 46 and send nothing
+// to the Rejected node; (b) must follow to the seed and stay live.  Never a loop of re-sends.
+TEST(ClientAuthErrorsRegression, ARejectedHomeEndsOnlyWhileItIsTheRouteFromEverySideAdversarialRegression) {
+    enum class Cell { StillNode1, ToSeed, ToNode2ThenBack };
+    int32_t port = 3890;
+    for (const Cell cell : {Cell::StillNode1, Cell::ToSeed, Cell::ToNode2ThenBack}) {
+        SCOPED_TRACE(static_cast<int>(cell));
+        ThreeNodeRig r(port);
+        port += 2;
+        test_support::TestCq cq(r.client);
+        connectTwoNode(r, cq);
+        r.gw.subscribeLeader[0] = r.n1;
+        rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+        ASSERT_TRUE(r.drive([&] { return subscribedAt(r.gw, r.n1) != nullptr && sub.active(); }));
+        const int64_t node1Sid = subscribedAt(r.gw, r.n1)->sessionId;
+        // One answer, queued in the same pass as the revocation, names p0's leader.
+        const auto answerWith = [&](int leaderNode, int leaderEp, int32_t epoch, bool revoke) {
+            r.gw.holdMetadata = true;
+            const std::size_t before = r.gw.metadataCorrIds.size();
+            r.client.testRequestMetadataNow();
+            if (!r.drive([&] { return r.gw.metadataCorrIds.size() > before; })) return false;
+            r.gw.subscribeLeader[0] = leaderEp;
+            r.gw.partitions = {{1, 0, leaderNode, epoch, r.c.gatewayStreamId, ""},
+                               {1, 1, 0, 1, r.c.gatewayStreamId, ""}};
+            r.gw.subscribed.clear();
+            if (revoke) r.gw.revokeSession(node1Sid, r.n1);
+            r.gw.sendMetadata(r.gw.metadataSessionIds.back(), r.gw.metadataCorrIds.back(),
+                              r.gw.metadataEndpoints.back());
+            r.gw.holdMetadata = false;
+            return true;
+        };
+        if (cell == Cell::StillNode1) {
+            ASSERT_TRUE(answerWith(1, r.n1, 1, true)) << "no metadata request";
+            ASSERT_TRUE(r.drive([&] { return sub.finished(); })) << "a Rejected home that is still the route hung";
+            EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::SessionRevoked);   // 46
+            EXPECT_EQ(sub.brokerErrorCode(), 46);
+            EXPECT_EQ(subscribedAt(r.gw, r.n2), nullptr);
+            EXPECT_EQ(subscribedAt(r.gw, 0), nullptr) << "a Rejected home that is still the route fell back to the seed";
+        } else if (cell == Cell::ToSeed) {
+            ASSERT_TRUE(answerWith(0, 0, 2, true)) << "no metadata request";
+            ASSERT_TRUE(r.drive([&] { return sub.finished() || subscribedAt(r.gw, 0) != nullptr; }));
+            EXPECT_FALSE(sub.finished()) << "ended with " << sub.brokerErrorCode() << " though p0 moved to the seed";
+            ASSERT_NE(subscribedAt(r.gw, 0), nullptr) << "no Subscribe for p0 reached the seed";
+            ASSERT_TRUE(r.drive([&] { return sub.finished() || sub.active(); }));
+            EXPECT_TRUE(sub.active());
+        } else {
+            ASSERT_TRUE(answerWith(2, r.n2, 2, true)) << "no metadata request";
+            ASSERT_TRUE(r.drive([&] { return sub.finished() || (subscribedAt(r.gw, r.n2) != nullptr && sub.active()); }));
+            ASSERT_FALSE(sub.finished()) << "ended with " << sub.brokerErrorCode() << " though p0 moved to node 2";
+            ASSERT_TRUE(answerWith(1, r.n1, 3, false)) << "no second metadata request";   // flips back onto node 1
+            ASSERT_TRUE(r.drive([&] { return sub.finished(); })) << "a route flipped back onto a Rejected node hung";
+            EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::SessionRevoked);   // 46
+            EXPECT_EQ(sub.brokerErrorCode(), 46) << "the CURRENT route's code";
+            EXPECT_EQ(subscribedAt(r.gw, r.n1), nullptr) << "a Subscribe was sent to the Rejected node";
+        }
+        const std::size_t sent = r.gw.subscribed.size();
+        r.passes(200);
+        EXPECT_EQ(r.gw.subscribed.size(), sent) << "the subscription kept re-sending after it settled";
+        EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+    }
+}
+
+// ---- #446: a Subscribe OK that arrives after the client's subscribe timeout ---------------------------------------
+// The broker registered the Subscribe, the client timed it out (TimedOut) and only then does the OK arrive.  RED
+// (before): the OK was dropped as an unknown correlationId and the broker kept the subscription, pushing records
+// until the session closed; now the client releases it with an Unsubscribe naming the OK's subscription id.
+TEST(ClientAuthErrorsRegression, LateSubscribeOkIsReleasedEndToEndRegression) {
+    rc::ClientConfig c = authCfg(3880, "ws1", kPw);
+    c.subscribeTimeoutMs = 1;       // the Subscribe's deadline is on the real clock; the sweep runs on the duty clock
+    Rig r(c);
+    r.connectOk();
+    r.gw.dropSubscribeResponsesNext = 1;             // registered at the broker, its answer is not sent in time
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty(); }));      // frozen duty clock: no sweep yet
+    const auto registered = r.gw.subscribed.back();
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }, 10'000'000)) << "the Subscribe never timed out";
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::TimedOut);
+    ASSERT_TRUE(r.gw.unsubscribed.empty());
+
+    uint8_t out[64];                                  // the broker's OK, late
+    const std::size_t n = rcc::encodeSubscribeResponse(out, sizeof out, 0, registered.partition,
+                                                       registered.subscriptionId, registered.sessionId,
+                                                       registered.corrId);
+    ASSERT_GT(n, 0u);
+    r.gw.send(0, out, n);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.unsubscribed.empty(); }))
+        << "the broker still holds subscription " << registered.subscriptionId;
+    EXPECT_EQ(r.gw.unsubscribed.back(), registered.subscriptionId);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// ---- #461: a booting broker answers AuthUnavailable (48) to the first Connects ---------------------------------------
+// The security state is still catching up: the first connect() retries it with Backoff and completes Ok once the broker
+// is ready - the caller never sees the transient 48.  RED (before): the pending connect failed NotConnected at the
+// first 48.
+TEST(ClientAuthUnavailableRegression, ConnectSucceedsAfterABootingBrokerAnswersAuthUnavailableRegression) {
+    Rig r(authCfg(3890, "ws1", kPw));
+    r.gw.connectErrorFirstN    = 3;
+    r.gw.connectErrorFirstCode = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+    test_support::TestCq cq(r.client);
+    auto f = r.connectOp(cq);
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 100'000'000)) << "the connect hung";   // >= the sweep cadence
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(r.gw.connectErrorFirstN, 0) << "all three refusals were served";
+    EXPECT_GE(r.gw.connects, 4);
+    EXPECT_EQ(r.client.state(), rc::session::SessionState::Connected);
+}
+
+// ---- #607: grant-checked requests answered AuthUnavailable (48) are retried, not surfaced --------------------------
+namespace {
+constexpr int16_t k48 = static_cast<int16_t>(pc::ErrorCode::AuthUnavailable);
+void answerDdlResponse(Rig& r, int64_t sid, int64_t corr, uint16_t code) {
+    pc::DdlResponse resp; resp.sessionId = sid; resp.correlationId = corr; resp.errorCode = code;
+    resp.objectId = 5; resp.newVersion = 2;
+    r.gw.sendDdlResponse(0, resp);
+}
+}  // namespace
+
+// C1: a Subscribe answered 48 is re-sent (paced by fresh metadata + backoff) and binds; the application sees nothing.
+TEST(SubscribeAuthUnavailableRegression, ASubscribeAnswered48IsRetriedThenBindsRegression) {
+    Rig r(authCfg(3900, "ws1", kPw));
+    r.connectOk();
+    r.gw.subscribeErrorFirstN    = 2;
+    r.gw.subscribeErrorFirstCode = k48;
+    int errors = 0;
+    r.client.onError([&](const std::string&) { ++errors; });
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.subscribed.empty(); }, 50'000'000)) << "the subscription never bound";
+    EXPECT_FALSE(sub.finished());
+    EXPECT_EQ(r.gw.subscribeFrames.size(), 3u) << "two refusals, then the bound Subscribe";
+    EXPECT_EQ(errors, 0) << "a transient 48 reached the application";
+}
+
+TEST(SubscribeAuthUnavailableRegression, ASubscribeAnswered48IsFailedWith48AfterItsBudgetRegression) {
+    Rig r(authCfg(3902, "ws1", kPw));
+    r.connectOk();
+    r.gw.subscribeErrorFirstN    = 1000;
+    r.gw.subscribeErrorFirstCode = k48;
+    int errors = 0;
+    r.client.onError([&](const std::string&) { ++errors; });
+    rc::Subscription sub = r.client.subscribe(r.client.topic("t"), 0, {}, &noopRecords);
+    ASSERT_TRUE(r.drive([&] { return sub.finished(); }, 50'000'000)) << "the budget never ended it";
+    EXPECT_EQ(sub.failReason(), rc::SubscriptionFailReason::RejectedByBroker);
+    EXPECT_EQ(sub.brokerErrorCode(), static_cast<uint16_t>(k48));
+    EXPECT_EQ(errors, 1) << "onError exactly once";
+    EXPECT_EQ(r.gw.subscribeFrames.size(), 1u + 8u) << "the first Subscribe and kMaxAuthUnavailableRetries re-sends";
+}
+
+// C2: a GetViewRow answered ViewRowResponse{status 48} is re-sent like a NotLeader and completes Ok.
+TEST(ViewReadAuthUnavailableRegression, AGetViewRowAnswered48IsRetriedRegression) {
+    Rig r(authCfg(3904, "ws1", kPw));
+    r.connectOk();
+    int seen = 0;
+    const std::vector<uint8_t> row = {1, 2, 3, 4};
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        pc::ViewRowResponse resp;
+        resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.status = ++seen <= 2 ? static_cast<uint16_t>(k48) : uint16_t{0};
+        if (resp.status == 0) { resp.rowLen = 4; resp.rowBytes = row.data(); resp.rowBytesLen = 4; }
+        std::vector<uint8_t> out(resp.encodedSize());
+        const std::size_t n = resp.encode(out.data());
+        r.gw.send(0, out.data(), n);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 50'000'000));
+    EXPECT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(seen, 3);
+}
+
+// C2: a DDL answered 48 (a DefineTopicResponse, a DdlResponse, an ErrorResponse) is re-sent within its budget.
+TEST(DdlAuthUnavailableRegression, ADdlAnswered48IsRetriedWithinItsBudgetRegression) {
+    Rig r(authCfg(3906, "ws1", kPw));
+    r.connectOk();
+    int defines = 0, drops = 0, errs = 0;
+    r.gw.templateHandlers[pc::DefineTopic::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::DefineTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        pc::DefineTopicResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.errorCode = ++defines <= 2 ? static_cast<uint16_t>(k48) : uint16_t{0};
+        resp.topicId = 9; resp.version = 1;
+        std::vector<uint8_t> out(256);
+        const std::size_t n = resp.encode(out.data());
+        r.gw.send(0, out.data(), n);
+    };
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        answerDdlResponse(r, m->sessionId, m->correlationId, ++drops <= 2 ? static_cast<uint16_t>(k48) : uint16_t{0});
+    };
+    r.gw.templateHandlers[pc::DropView::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::DropView::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (++errs <= 2) r.gw.sendError(0, k48, "booting", m->sessionId, m->correlationId);
+        else answerDdlResponse(r, m->sessionId, m->correlationId, 0);
+    };
+    test_support::TestCq cq(r.client);
+    auto a = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.defineTopic("nt", 1, "", false, {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return a.ready(); }, 50'000'000));
+    EXPECT_TRUE(a.ok()) << "DefineTopicResponse: " << a.describe();
+    EXPECT_EQ(defines, 3);
+    auto b = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return b.ready(); }, 50'000'000));
+    EXPECT_TRUE(b.ok()) << "DdlResponse: " << b.describe();
+    EXPECT_EQ(drops, 3);
+    auto c = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropView("v", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return c.ready(); }, 50'000'000));
+    EXPECT_TRUE(c.ok()) << "ErrorResponse: " << c.describe();
+    EXPECT_EQ(errs, 3);
+}
+
+TEST(DdlAuthUnavailableRegression, ADdlAnswered48ForeverFailsWith48WhenItsBudgetEndsRegression) {
+    rc::ClientConfig c = authCfg(3908, "ws1", kPw);
+    c.ddlTimeoutMs = 600'000;   // the retry budget, not the op deadline, ends it
+    Rig r(c);
+    r.connectOk();
+    int drops = 0;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        ++drops;
+        answerDdlResponse(r, m->sessionId, m->correlationId, static_cast<uint16_t>(k48));
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 50'000'000)) << "the budget never ended it";
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(f.outcome().c.errorCode, 48);
+    EXPECT_GT(drops, 1) << "retried before it failed";
+}
+
+// C2 (the CLI half of #461): `rune security bootstrap` is a routed SecurityBootstrap op answered by a DdlResponse.
+TEST(DdlAuthUnavailableRegression, SecurityBootstrapAnswered48IsRetriedRegression) {
+    Rig r(authCfg(3910, "", ""));
+    r.gw.users.clear();
+    r.gw.bootstrapped = false;
+    const std::string keyFile(64, 'k');
+    r.gw.clusterKey.assign(keyFile.begin(), keyFile.end());
+    r.connectOk();
+    int seen = 0;
+    r.gw.templateHandlers[pc::SecurityBootstrap::TEMPLATE_ID] = [&](int, const uint8_t* f, std::size_t len) {
+        const auto m = pc::SecurityBootstrap::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        answerDdlResponse(r, m->sessionId, m->correlationId, ++seen <= 2 ? static_cast<uint16_t>(k48) : uint16_t{0});
+    };
+    const std::vector<uint8_t> key(keyFile.begin(), keyFile.end());
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.bootstrapSecurity("admin", "a one-time password 24", key, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, 50'000'000));
+    EXPECT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(seen, 3);
 }

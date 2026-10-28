@@ -7,6 +7,8 @@
 #include "../support/GroupRig.h"
 
 #include <rune/client/Completions.h>
+#include <rune/client/agent/AgentRingMessages.h>
+#include <rune/client/detail/HubCommand.h>
 
 #include <chrono>
 #include <map>
@@ -359,4 +361,173 @@ TEST(GroupSeekRegression, VoidSeekOnAClosedConsumerThrowsNeverDropsItRegression)
     Fixture f(4323, 4324, {{kTopic, 1}});
     f.gc.close();
     EXPECT_THROW(f.gc.seek({kTopic, 1}, 0), std::runtime_error);
+}
+
+// #378: the blocking rewind ends with a typed GroupOpError: Rejoined (the group is not Stable when applied) and
+// Timeout are told apart by status(), never by text; SessionLostError is a GroupOpError too.
+TEST(GroupSeekRegression, BlockingRewindThrowsATypedGroupOpErrorRegression) {
+    Fixture f(4325, 4326, {{kTopic, 1}}, Fixture::cfgOf(false, 600, 5000));   // a heartbeat every 200 ms
+    f.r.gw.rebalancing = true;   // the next heartbeat answers RebalanceInProgress -> the member rejoins
+    ASSERT_TRUE(f.r.drive([&] { return !f.r.gw.pendingJoins.empty(); })) << "the member never went to rejoin";
+    bool rejoined = false;
+    try {
+        f.gc.seekToCommittedAndWait(std::chrono::seconds(5));
+    } catch (const rc::GroupOpError& e) {
+        rejoined = e.status() == rc::OpStatus::Rejoined;
+    }
+    EXPECT_TRUE(rejoined);
+
+    try {
+        throw rc::SessionLostError("lost");
+    } catch (const rc::GroupOpError& e) {
+        EXPECT_EQ(e.status(), rc::OpStatus::SessionLost);
+    }
+}
+
+// ===========================================================================
+// #356: group seek test gaps
+// ===========================================================================
+
+// F1: a rewind whose fetch never answers completes Timeout exactly once, leaves nothing stuck, and the next rewind
+// is admitted and completes Ok.  Mutation: drop the Timeout branch of advanceRewind_ -> never completes.
+TEST(GroupSeekRegression, RewindTimeoutCompletesOnceAndLeavesNoStuckStateRegression) {
+    rc::GroupConfig cfg = Fixture::cfgOf(false, 30000, 5000);
+    cfg.commitSyncTimeoutMs = 400;   // the rewind's duty-time deadline
+    Fixture f(4910, 4911, {{kTopic, 1}}, cfg);
+    f.r.gw.holdOffsetFetch = true;
+    const rc::Token a = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), a), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, a, 40'000'000)) << "the rewind never timed out";
+    EXPECT_EQ(f.done[a].c.status, rc::OpStatus::Timeout);
+    f.r.gw.holdOffsetFetch = false;
+    f.r.gw.releaseOffsetFetches();   // the answer to the timed-out fetch arrives late
+    const rc::Token b = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), b), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, b, 40'000'000)) << "the second rewind was not admitted";
+    EXPECT_EQ(f.done[b].c.status, rc::OpStatus::Ok);
+    for (int i = 0; i < 500; ++i) { f.r.client.doWork(); f.r.gw.pump(); }
+    collect(f.r, f.done);
+    EXPECT_EQ(f.done[a].times, 1);
+    EXPECT_EQ(f.done[b].times, 1);
+}
+
+// F2: the session goes down mid-rewind: exactly one SessionLost; after the reconnect and Stable, a new rewind is Ok.
+TEST(GroupSeekRegression, RewindSessionLostCompletesOnceAndLeavesNoStuckStateRegression) {
+    Fixture f(4912, 4913, {{kTopic, 1}});
+    f.r.gw.holdOffsetFetch = true;
+    const rc::Token a = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), a), rc::OpResult::Accepted);
+    const int fetches = f.r.gw.offsetFetches;
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.offsetFetches > fetches; })) << "the rewind never reached the OffsetFetch";
+    f.r.gw.holdOffsetFetch = false;
+    f.r.gw.heldOffsetFetches.clear();
+    const int connects = f.r.gw.connectsAt[0];
+    f.r.gw.expireSession(f.r.seedSid);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, a, 40'000'000));
+    EXPECT_EQ(f.done[a].c.status, rc::OpStatus::SessionLost);
+    // The consumer stays Stable across the reconnect; wait for the new session, then rewind again.
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.connectsAt[0] > connects; }, 40'000'000)) << "the seed never reconnected";
+    for (int i = 0; i < 2'000; ++i) { f.r.client.doWork(); f.r.gw.pump(); }
+    const rc::Token b = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), b), rc::OpResult::Accepted);
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, b, 40'000'000));
+    EXPECT_EQ(f.done[b].c.status, rc::OpStatus::Ok);
+    collect(f.r, f.done);
+    EXPECT_EQ(f.done[a].times, 1);
+    EXPECT_EQ(f.done[b].times, 1);
+}
+
+// F3: the ring encoding of a HubCommand carries every field (including the second payload word `e`).
+TEST(HubCommandMsgRegression, EncodeDecodeRoundTripsEveryFieldRegression) {
+    using rune::client::agent::ring_msg::HubCommandMsg;
+    static_assert(HubCommandMsg::ENCODED_SIZE == 80, "the HubCommand frame is 24 header + 56 body bytes");
+    rune::client::detail::HubCommand c;
+    c.op     = rune::client::detail::HubCommand::Op::GroupSeek;
+    c.handle = 0x1122334455667788ULL;
+    c.a      = 0x0102030405060708LL;
+    c.b      = -0x1112131415161718LL;
+    c.c      = 0x2122232425262728LL;
+    c.d      = -0x3132333435363738LL;
+    c.e      = 0x4142434445464748LL;
+    uint8_t buf[HubCommandMsg::ENCODED_SIZE]{};
+    ASSERT_EQ(HubCommandMsg::encode(c, buf), HubCommandMsg::ENCODED_SIZE);
+    const auto d = HubCommandMsg::decode(buf, sizeof buf);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->op, c.op);
+    EXPECT_EQ(d->handle, c.handle);
+    EXPECT_EQ(d->a, c.a);
+    EXPECT_EQ(d->b, c.b);
+    EXPECT_EQ(d->c, c.c);
+    EXPECT_EQ(d->d, c.d);
+    EXPECT_EQ(d->e, c.e);
+    EXPECT_FALSE(HubCommandMsg::decode(buf, sizeof buf - 1).has_value()) << "a truncated frame is refused";
+}
+
+// F4: a rebalance during a rewind completes it Rejoined; driving on through the rejoin to Stable and further
+// cycles never completes it again.
+TEST(GroupSeekRegression, RebalanceDuringARewindCompletesRejoinedExactlyOnceRegression) {
+    Fixture f(4914, 4915, {{kTopic, 1}}, Fixture::cfgOf(false, 600, 5000));   // a heartbeat every 200 ms
+    const auto firstSub = *f.r.gw.latestSubscription(kTopic, 1);
+    f.r.gw.holdOffsetFetch = true;
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    f.r.gw.rebalancing = true;
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t, 40'000'000));
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Rejoined);
+    f.r.gw.rebalancing = false;
+    f.r.gw.holdOffsetFetch = false;
+    f.r.gw.releaseOffsetFetches();   // the old fetch's answer arrives late
+    ASSERT_TRUE(f.r.drive([&] { return !f.r.gw.pendingJoins.empty(); }, 40'000'000));
+    f.r.gw.releaseJoins();
+    ASSERT_TRUE(f.r.drive([&] {
+        const auto* s = f.r.gw.latestSubscription(kTopic, 1);
+        return s != nullptr && s->corrId != firstSub.corrId;
+    }, 40'000'000)) << "the member never reached Stable again";
+    for (int i = 0; i < 2'000; ++i) { f.r.client.doWork(); f.r.gw.pump(); }
+    collect(f.r, f.done);
+    EXPECT_EQ(f.done[t].times, 1) << "the rewind completed again after the rejoin";
+}
+
+// F5: a rewind is not Ok until the new subscription of the rewound partition is answered.
+TEST(GroupSeekRegression, ARewindIsNotOkUntilItsSubscribeIsAnsweredRegression) {
+    Fixture f(4916, 4917, {{kTopic, 1}});
+    f.r.gw.holdSubscribeResponses = true;
+    const std::size_t subs = f.r.gw.subscribed.size();
+    const rc::Token t = f.tok();
+    ASSERT_EQ(f.gc.seekToCommitted(rc::CompletionTarget(f.r.cq), t), rc::OpResult::Accepted);
+    ASSERT_TRUE(f.r.drive([&] { return f.r.gw.subscribed.size() > subs; })) << "the rewound partition was never re-subscribed";
+    for (int i = 0; i < 3'000; ++i) { f.r.client.doWork(); f.r.gw.pump(); }
+    collect(f.r, f.done);
+    EXPECT_EQ(f.done.count(t), 0u) << "completed before the Subscribe was answered";
+    f.r.gw.releaseSubscribeResponses();
+    ASSERT_TRUE(driveUntilDone(f.r, f.done, t, 40'000'000));
+    EXPECT_EQ(f.done[t].c.status, rc::OpStatus::Ok);
+    EXPECT_EQ(f.done[t].times, 1);
+}
+
+// ===========================================================================
+// C3 adversarial review (#378 / #413): the typed error covers EVERY non-Ok exit of a blocking group call.
+// ===========================================================================
+
+// #378: the most common failure of a blocking rewind is the caller's own wait budget running out (the OffsetFetch is
+// never answered).  The header documents "GroupOpError ... on any other non-Ok outcome or wait timeout", so a caller
+// that catches GroupOpError and branches on status() must see Timeout here.  RED today: Client::andWait_ throws a
+// plain std::runtime_error("...: timed out waiting") for Completions::Wait::TimedOut, which escapes the
+// GroupOpError handler.
+TEST(GroupSeekRegression, ABlockingRewindWaitTimeoutIsATypedGroupOpErrorAdversarialRegression) {
+    Fixture f(4996, 4997, {{kTopic, 1}});   // commitSyncTimeoutMs default: far above the 50 ms wait below
+    f.r.gw.holdOffsetFetch = true;            // the rewind's OffsetFetch is never answered
+    bool typed = false, untyped = false;
+    rc::OpStatus st = rc::OpStatus::Ok;
+    try {
+        f.gc.seekToCommittedAndWait(std::chrono::milliseconds(50));
+    } catch (const rc::GroupOpError& e) {
+        typed = true;
+        st    = e.status();
+    } catch (const std::runtime_error&) {
+        untyped = true;
+    }
+    EXPECT_FALSE(untyped) << "the wait timeout escaped as a plain std::runtime_error";
+    EXPECT_TRUE(typed);
+    EXPECT_EQ(st, rc::OpStatus::Timeout);
 }

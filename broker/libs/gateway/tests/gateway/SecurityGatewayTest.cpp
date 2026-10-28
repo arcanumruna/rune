@@ -14,6 +14,7 @@
 #include <rune/security/testing/SecurityGoldenScript.h>
 
 #include <gtest/gtest.h>
+#include <stdexcept>
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
 
@@ -156,7 +157,8 @@ struct BootFrame {
             std::vector<uint8_t> in;
             pc::bootstrapMacInput(m, in);
             rune::crypto::DigestBytes mac;
-            rune::crypto::hmac(rune::crypto::Digest::Sha512, k->master, in, mac);
+            if (!rune::crypto::hmac(rune::crypto::Digest::Sha512, k->master, in, mac))
+                throw std::runtime_error("SecurityGatewayTest: bootstrap proof HMAC failed");
             std::memcpy(m.mac.data(), mac.bytes.data(), 64);
         }
         bytes.resize(m.encodedSize());
@@ -337,6 +339,61 @@ TEST(AuthGateRegression, TheBootstrapWindowAdmitsExactlyBootstrapWithAValidMac) 
     const BootFrame good(rig.sid, 21, kA);
     rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
     EXPECT_EQ(rig.admin.bootstraps, 1);
+}
+
+// Issue #240: the bootstrap answer comes from the admin thread after the `__security` commit.  A bootstrap sent just
+// before the login deadline must not be reaped (and answered 44) while that commit is in flight: an accepted
+// bootstrap restarts the deadline.  A refused one (bad proof) does not.
+TEST(SecurityBootstrapRegression, AnAcceptedBootstrapRestartsTheLoginDeadlineRegression) {
+    constexpr int64_t kTimeout = 1'000'000'000;
+    {
+        Rig rig;
+        auto view = emptyView();
+        rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
+        rig.gw.setClusterKeys(keysFor(kA));
+        rig.gw.setAuthTimeoutNs(kTimeout);
+        rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{kTimeout, 50});
+        rig.gw.setNowForTest(900'000'000);
+        const BootFrame good(rig.sid, 30, kA);
+        rig.gw.applyClientFrameForTest(good.bytes.data(), good.bytes.size());
+        ASSERT_EQ(rig.admin.bootstraps, 1);
+        rig.gw.reapExpiredForTest(1'500'000'000);   // past the first deadline, inside the restarted one
+        EXPECT_TRUE(rig.gw.hasSessionForTest(rig.sid)) << "reaped while its bootstrap was committing";
+        EXPECT_EQ(rig.answerFor(50), nullptr) << "no 44 for an in-flight bootstrap";
+        rig.gw.reapExpiredForTest(900'000'000 + kTimeout + 1);   // the restarted deadline still holds
+        EXPECT_FALSE(rig.gw.hasSessionForTest(rig.sid)) << "the restarted deadline is a deadline too";
+    }
+    {   // once per session: a second accepted bootstrap never extends the deadline again
+        Rig rig;
+        auto view = emptyView();
+        rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
+        rig.gw.setClusterKeys(keysFor(kA));
+        rig.gw.setAuthTimeoutNs(kTimeout);
+        rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{kTimeout, 50});
+        rig.gw.setNowForTest(900'000'000);
+        const BootFrame first(rig.sid, 32, kA);
+        rig.gw.applyClientFrameForTest(first.bytes.data(), first.bytes.size());
+        rig.gw.setNowForTest(1'800'000'000);
+        const BootFrame second(rig.sid, 33, kA);
+        rig.gw.applyClientFrameForTest(second.bytes.data(), second.bytes.size());
+        ASSERT_EQ(rig.admin.bootstraps, 2) << "both forwarded (the admin thread refuses the second)";
+        rig.gw.reapExpiredForTest(900'000'000 + kTimeout + 1);
+        EXPECT_FALSE(rig.gw.hasSessionForTest(rig.sid)) << "a repeated bootstrap kept the session alive";
+    }
+    {
+        Rig rig;
+        auto view = emptyView();
+        rig.gw.setAuthMode(GatewayAuthMode::Required, &view);
+        rig.gw.setClusterKeys(keysFor(kA));
+        rig.gw.setAuthTimeoutNs(kTimeout);
+        rig.gw.setSessionAuthForTest(rig.sid, AuthAwaitingFirst{kTimeout, 50});
+        rig.gw.setNowForTest(900'000'000);
+        const BootFrame bad(rig.sid, 31, kC);
+        rig.gw.applyClientFrameForTest(bad.bytes.data(), bad.bytes.size());
+        ASSERT_EQ(rig.admin.bootstraps, 0);
+        rig.gw.reapExpiredForTest(1'500'000'000);
+        EXPECT_FALSE(rig.gw.hasSessionForTest(rig.sid)) << "a refused bootstrap never extends the login deadline";
+    }
 }
 
 TEST(AuthGateRegression, AfterBootstrapAnonymousSessionsAreRefusedEvenForBootstrap) {

@@ -1905,7 +1905,9 @@ static_assert(rpc::kClientVersionTxnVerify == rpc::kClientVersionReceiverKeys + 
 // Namespaces: client 14 / broker 8 follow.
 static_assert(rpc::kClientVersionNamespaces == rpc::kClientVersionTxnVerify + 1);
 static_assert(rpc::kBrokerVersionNamespaces == rpc::kBrokerVersionReceiverKeys + 1);
-static_assert(rpc::kClientVersion == rpc::kClientVersionNamespaces && rpc::kBrokerVersion == rpc::kBrokerVersionNamespaces);
+// Issue #450: client 15 (SubscribeResponse RecordEgressUnavailable) follows.
+static_assert(rpc::kClientVersionRecordEgressUnavailable == rpc::kClientVersionNamespaces + 1);
+static_assert(rpc::kClientVersion == rpc::kClientVersionRecordEgressUnavailable && rpc::kBrokerVersion == rpc::kBrokerVersionNamespaces);
 static_assert(rpc::sessionUsesReceiverKeys(12, 7) && !rpc::sessionUsesReceiverKeys(11, 7) && !rpc::sessionUsesReceiverKeys(12, 6));
 static_assert(rpc::clientUnderstandsFilters(11) && !rpc::clientUnderstandsFilters(10));
 

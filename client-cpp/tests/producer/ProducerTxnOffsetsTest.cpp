@@ -67,7 +67,10 @@ struct Capture {
     Capture() { frames.reserve(1 << 14); arena.reserve(std::size_t{4} << 20); }
     int                  rediscovers = 0;   ///< re-discovery requests (NotCoordinator answered)
     [[nodiscard]] rp::CoordinatorSink sink() noexcept { return {&offer, &session, this, &rediscover}; }
-    static void rediscover(void* ctx) noexcept { ++static_cast<Capture*>(ctx)->rediscovers; }
+    static bool rediscover(void* ctx) noexcept {
+        ++static_cast<Capture*>(ctx)->rediscovers;
+        return true;
+    }
     static rp::CoordinatorSink::Offer offer(void* ctx, const uint8_t* b, std::size_t n) noexcept {
         auto* self = static_cast<Capture*>(ctx);
         const auto h = rpc::MessageHeader::decode(b, n);

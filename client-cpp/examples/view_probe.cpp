@@ -341,7 +341,9 @@ static rcv::RowLayout userTotalsRowLayout() {
 }
 // Sends one order (acked); false + message on failure.
 static bool sendOrder(Client& c, const TopicHandle& th, int64_t o, int64_t u, int64_t amt, int timeoutMs) {
-    ProducerConfig pcfg; pcfg.acks = Acks::Leader; pcfg.produceTimeoutMs = timeoutMs;
+    // Acks::All: the e2e restarts a broker after this (#51)
+    ProducerConfig pcfg; pcfg.acks = Acks::All;
+    pcfg.produceTimeoutMs = timeoutMs;
     auto p = c.producer(pcfg);
     Completions cq(c); Completion done;
     const auto v = encodeOrder(o, u, amt);
@@ -1003,7 +1005,6 @@ static int groupCommitMode(ClientConfig cfg, int timeoutMs, int boundMs) {
     Client c(cfg);
     GroupConfig g;
     g.autoCommit      = false;
-    g.autoOffsetReset = OffsetReset::Earliest;
     auto gc = c.subscribeGroup(kPresenceGroup, {topic}, g);
     std::atomic<int64_t> next{0};
     gc.onRecords([&next](const RecordSet& rs) {
@@ -1058,7 +1059,6 @@ static int groupRestartMode(ClientConfig cfg, int timeoutMs, int boundMs) {
     Client c(cfg);
     GroupConfig g;
     g.autoCommit      = false;
-    g.autoOffsetReset = OffsetReset::Earliest;
     auto gc = c.subscribeGroup(kPresenceGroup, {topic}, g);
     // Records the restarted ring already holds (RUNE_GROUP_PRE; default 1 —
     // verify_restart's record) + the 2 produced above: offsets 0..kWant-1.
@@ -1242,7 +1242,8 @@ int main(int argc, char** argv) {
             const int64_t hp0   = 100;
             {
                 ProducerConfig pcfg;
-                pcfg.acks             = Acks::Leader;
+                // Acks::All: the e2e restarts a broker after this (#51)
+                pcfg.acks             = Acks::All;
                 pcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
                 auto p = c.producer(pcfg);
                 Completions cq(c);
@@ -1443,7 +1444,8 @@ int main(int argc, char** argv) {
             // ---- (c) re-produce -> BOTH views fold it live after the restart ---
             {
                 ProducerConfig pcfg;
-                pcfg.acks             = Acks::Leader;
+                // Acks::All: the e2e restarts a broker after this (#51)
+                pcfg.acks             = Acks::All;
                 pcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
                 auto p = c.producer(pcfg);
                 Completions cq(c);

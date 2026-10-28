@@ -408,7 +408,6 @@ static int doGroup(Client& client,
     gcfg.autoCommit           = true;
     gcfg.autoCommitIntervalMs = autoCommitMs;
     gcfg.sessionTimeoutMs     = 30000;
-    gcfg.autoOffsetReset      = OffsetReset::Earliest;
 
     // We need the topic name map (topicId → name) for output.
     // The Client::topic() call resolves by name; GroupConsumer only gets topicId
@@ -608,7 +607,6 @@ static int doTxnConsume(Client& c,
     gcfg.autoCommit           = true;
     gcfg.autoCommitIntervalMs = autoCommitMs;
     gcfg.sessionTimeoutMs     = 30000;
-    gcfg.autoOffsetReset      = OffsetReset::Earliest;
     gcfg.isolation            = isolation;
 
     const std::string& primaryTopic = topicNames.empty() ? "unknown" : topicNames[0];

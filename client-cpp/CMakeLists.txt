@@ -1079,6 +1079,7 @@ if(BUILD_TESTING)
     add_executable(rune_schema_codec_smoke_tests
         tests/SchemaCodecSmokeTest.cpp
         tests/client/ViewPlanAuthorTest.cpp
+        tests/client/ViewRowCodecTest.cpp
         tests/client/PlayerEventSchemaTest.cpp   # Phase 2c Task 4
     )
     target_include_directories(rune_schema_codec_smoke_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include "${RUNE_CLAIM_GEN_DIR}/gen")
@@ -1124,6 +1125,7 @@ if(BUILD_TESTING)
     add_executable(rune_session_tests
         tests/session/SessionMachineTest.cpp
         tests/session/SessionMachineAuthTest.cpp   # authentication Task 7: the SCRAM client + Authenticating
+        tests/session/SessionMachineTransientRetryTest.cpp   # C4 review: transient refusals (48 / rate-limited 44)
     )
     # client<->broker TLS/AEAD (Task 5): SessionMachine.h now drives a real
     # TlsSession/AeadCipher directly (header-only) — this target links rune_crypto
@@ -1513,6 +1515,7 @@ if(BUILD_TESTING)
         tests/detail/Crc32cPatchTest.cpp
         tests/detail/Crc32cFastTest.cpp
         tests/producer/ProduceFrameBuilderTest.cpp
+        tests/detail/CoordRouteTest.cpp
     )
     target_include_directories(rune_pure_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include

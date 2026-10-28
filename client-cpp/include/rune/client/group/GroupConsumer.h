@@ -56,18 +56,34 @@
 namespace rune::client {
 
 // ---------------------------------------------------------------------------
+// GroupOpError — #378: a blocking group call (commitSyncAndWait, seekToCommittedAndWait, seekAndWait) ended with a
+// non-Ok outcome.  status() is the typed outcome (Rejoined, Superseded, Timeout, BrokerError, Closed, ...); callers
+// branch on it, never on what().  errorCode() is the broker code for BrokerError, else 0.
+// ---------------------------------------------------------------------------
+class GroupOpError : public std::runtime_error {
+public:
+    GroupOpError(OpStatus status, uint16_t errorCode, const std::string& what)
+        : std::runtime_error(what), status_(status), errorCode_(errorCode) {}
+    [[nodiscard]] OpStatus status() const noexcept { return status_; }
+    [[nodiscard]] uint16_t errorCode() const noexcept { return errorCode_; }
+private:
+    OpStatus status_;
+    uint16_t errorCode_;
+};
+
+// ---------------------------------------------------------------------------
 // SessionLostError — F8a fix4 M6: commitSyncAndWait() failed because the
 // session to the broker was lost (OpStatus::SessionLost: it went down, or a
 // new session / connect episode replaced the one the commit was sent on) or
 // was down when the commitSync was applied.  The commit's fate is UNKNOWN (it
 // may or may not have been applied).  RETRIABLE: wait for the next onAssigned
 // (the consumer rejoins after the reconnect and re-seeds its positions), then
-// commit again.  Every other failure (closed, superseded, rejoin, broker error
-// code, timeout) is a plain std::runtime_error.
+// commit again.  Every other failure is a GroupOpError (std::runtime_error)
+// carrying the OpStatus.
 // ---------------------------------------------------------------------------
-class SessionLostError : public std::runtime_error {
+class SessionLostError : public GroupOpError {
 public:
-    using std::runtime_error::runtime_error;
+    explicit SessionLostError(const std::string& w) : GroupOpError(OpStatus::SessionLost, 0, w) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -103,14 +119,6 @@ struct TopicPartition {
 using RecordSet = codec::RecordsView;
 
 // ---------------------------------------------------------------------------
-// OffsetReset — what to do when no committed offset exists for a partition.
-// ---------------------------------------------------------------------------
-enum class OffsetReset {
-    Earliest,  // start from offset 0
-    Latest,    // start from LEO (only new records)
-};
-
-// ---------------------------------------------------------------------------
 // IsolationLevel — read-isolation level for group consumer.
 //   ReadUncommitted (0): consume all records (including open transactions).
 //   ReadCommitted   (1): consume only records from committed transactions
@@ -122,18 +130,13 @@ enum class IsolationLevel : uint8_t {
 };
 
 // ---------------------------------------------------------------------------
-// GroupConfig — consumer-group options.
+// GroupConfig — consumer-group options.  With no committed offset a member starts at the partition's log start
+// (#170: there is no auto-offset-reset setting; seek() moves it).
 // ---------------------------------------------------------------------------
 struct GroupConfig {
     bool         autoCommit           = true;
     int32_t      autoCommitIntervalMs = 5000;
     int32_t      sessionTimeoutMs     = 30000;
-    /// Not applied today: a partition with no committed offset (including a
-    /// transient partition whose committed offset did not survive a restart,
-    /// answered -1) always starts at its LOG START — the oldest record the
-    /// broker still holds (E2 N6; pinned by GroupRoutingRegression.
-    /// TransientNoCommittedOffsetSeedsTheLogStartNeverLatestRegression).
-    OffsetReset  autoOffsetReset      = OffsetReset::Latest;
     IsolationLevel isolation          = IsolationLevel::ReadUncommitted;  // TX-5: read_committed support
     /// F8c C4 (spec Q6): a commitSync that has not completed this long after
     /// it was applied (duty clock) completes OpStatus::Timeout.
@@ -274,6 +277,7 @@ struct GroupConsumerImpl {
         bool     rewound        = false;  // Task 10: restarted by a seek, not yet re-bound (the pending Rewind waits on it)
         uint8_t  redirects      = 0;      // consecutive Redirects without a bind
         uint8_t  egressRefusals = 0;      // PR #441 F4: RecordEgressUnavailable answers since the last bind
+        uint8_t  authUnavailable = 0;     // C4 review (#607): AuthUnavailable (48) answers since the last bind
     };
     std::map<TopicPartition, FetchSub> fetch;
     // MEDIUM-2: OffsetFetch re-send pacing (duty-clock ns; 0 = due).
@@ -308,6 +312,9 @@ struct GroupConsumerImpl {
     // earliest time the next JoinGroup may go out.
     uint32_t backoffRejoins = 0;
     std::chrono::steady_clock::time_point rejoinNotBefore{};
+    // C4 review (#607): consecutive Heartbeats answered AuthUnavailable (48) in this Stable episode
+    // (cap: GroupConsumerHub::kMaxHeartbeatAuthUnavailable); any other answer resets it.
+    uint32_t hbAuthUnavailable = 0;
 
     // ---- Timers (duty thread) -------------------------------------------------
     std::chrono::steady_clock::time_point nextHeartbeat;
@@ -318,6 +325,12 @@ struct GroupConsumerImpl {
     // session (a resume keeping its id) keeps the in-flight join — re-sending it
     // with an empty memberId would register a ghost member (review MEDIUM-3).
     int64_t joinSessionId = 0;
+    bool    joinDeferredLogged = false;   // #440: the deferral of this episode was logged (cleared when a join is sent)
+    // #431: JoinGroup / SyncGroup / Heartbeat correlation ids (see GroupConsumerHub::kGroupCtlCorrTag).
+    uint32_t ctlId     = 0;   // hub-unique 24-bit id, set by GroupConsumerHub::add
+    uint32_t ctlSeq    = 0;   // last sequence number used by this consumer's control frames
+    int64_t  ctlCorrId = 0;   // correlation id of the Join / Sync in flight
+    uint32_t hbSeqLo   = 0;   // lowest heartbeat seq of the current Stable episode that is still applied
 
     // ---- Send scratch buffers (duty thread, zero-alloc hot path) --------------
     std::vector<uint8_t> sendBuf;
@@ -337,6 +350,9 @@ struct GroupConsumerImpl {
         // sweep on the duty clock), backing off retryBackoffNs.
         int64_t          retryDueNs     = -1;
         int64_t          retryBackoffNs = 0;
+        // C4 review (#607): the code of the last transient answer being waited out (48 / UnstableOffsetCommit; 0 =
+        // none) - a deadline that ends the retry reports it as the Timeout's errorCode, so the caller learns why.
+        uint16_t         lastRetriedCode = 0;
     };
     bool              hasCommitSync {false};
     PendingCommitSync commitSync{};
@@ -498,9 +514,9 @@ public:
 
     /// Cold-path blocking form (spec §2.3): issue + wait (Invoker owner pumps
     /// doWork(); a Thread-mode app thread idle-polls).  Throws
-    /// SessionLostError on SessionLost, std::runtime_error on any other
-    /// non-Ok outcome or wait timeout, std::logic_error from a duty-cycle
-    /// callback.
+    /// SessionLostError on SessionLost, GroupOpError (a std::runtime_error carrying
+    /// the OpStatus) on any other non-Ok outcome or wait timeout, std::logic_error
+    /// from a duty-cycle callback.
     void commitSyncAndWait(std::chrono::nanoseconds timeout = std::chrono::seconds(60));
 
     /// Phase 2b F (Task 10, FD8): rewind every assigned partition to its COMMITTED offset without a
@@ -516,7 +532,7 @@ public:
     /// Records already handed to onRecords before the command applied stay delivered.
     /// Synchronous rejections are those of commitSync.  Callable from inside a callback.
     OpResult seekToCommitted(CompletionTarget target, Token token);
-    /// Cold-path blocking form; throws std::runtime_error on any non-Ok outcome.
+    /// Cold-path blocking form; throws SessionLostError on SessionLost, GroupOpError on any other non-Ok outcome.
     void seekToCommittedAndWait(std::chrono::nanoseconds timeout = std::chrono::seconds(60));
 
     /// Restart ONE assigned partition at `offset` (the others are untouched).  Completion as
@@ -530,7 +546,7 @@ public:
     /// naming the status; offset < 0 throws std::invalid_argument.
     void seek(TopicPartition tp, int64_t offset);
     /// Cold-path blocking form; throws std::invalid_argument for an unassigned partition,
-    /// std::runtime_error on any other non-Ok outcome.
+    /// SessionLostError on SessionLost, GroupOpError on any other non-Ok outcome.
     void seekAndWait(TopicPartition tp, int64_t offset, std::chrono::nanoseconds timeout = std::chrono::seconds(60));
 
     /// Deactivate this consumer: no more dispatch occurs, a pending commitSync

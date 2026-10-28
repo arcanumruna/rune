@@ -56,6 +56,7 @@
 #include <rune/client/TypedTopic.h>
 #include <rune/client/Completion.h>
 #include <rune/client/Completions.h>
+#include <rune/client/detail/CoordRoute.h>
 #include <rune/client/detail/OpTarget.h>
 #include <rune/client/detail/StatusRing.h>
 #include <rune/client/DutyView.h>
@@ -222,9 +223,9 @@ struct ViewRowResult {
     static constexpr uint16_t kNotAuthorized   = 45;  ///< the session may not READ the view (no bytes; never retried)
     /// Client-side only: the view's source-partition leader was not reached within
     /// the retry budget; never sent by a broker.  NB: a GetViewRow's deadline is
-    /// pingTimeoutMs (not ddlTimeoutMs); when that is shorter than ddlRetryBudget
-    /// (the defaults: 5 s < 10 s) a read that is never routed ends as a Timeout
-    /// (the *AndWait form throws), not as kNotLeader.
+    /// pingTimeoutMs (not ddlTimeoutMs) and its retry budget is viewReadRetryBudget;
+    /// with the defaults (5 s each) a read that is never routed ends as kNotLeader or
+    /// as a Timeout (the *AndWait form throws), whichever bound is hit first.
     static constexpr uint16_t kNotLeader       = 8;
 
     uint16_t              status = kUnknownView;
@@ -394,6 +395,11 @@ struct ClientConfig {
     // client's rule (D9).  Not used by the login itself, which follows the broker's salt and count.
     uint32_t minPasswordLength = 12;
     uint32_t scramIterations   = 4096;
+    // maxAcceptedScramIterations (#235): the most PBKDF2 iterations a login runs; a broker asking for more is refused
+    // before any hashing.  Set it to at least the cluster's highest verifier count.  Both counts must lie in
+    // 4096..1'000'000 and scramIterations <= maxAcceptedScramIterations, else construction throws
+    // std::invalid_argument.
+    uint32_t maxAcceptedScramIterations = 100'000;
     // requireCrypto (downgrade safety, spec §11 require_tls's client-side
     // mirror): when true, a session never proceeds without TLS — a ConnectResponse
     // that negotiates NO cipher (a MITM that stripped the crypto offer) fails the
@@ -415,11 +421,16 @@ struct ClientConfig {
     // clientName: carried in every DDL's extension (DdlOptions::clientName
     // overrides it per call); the catalog event's principal records it.
     std::string clientName = "rune-client";
-    // ddlRetryBudget: how long a DDL answered NotLeader (a catalog leader change
+    // ddlRetryBudget: how long a DDL (never a view read) answered NotLeader (a catalog leader change
     // / a catching-up leader) is retried, with a 100 ms backoff doubling to 1 s,
     // before it fails explicitly (BrokerError NotLeader).  Bounded by the DDL's
     // own deadline (ddlTimeoutMs) too.
     std::chrono::milliseconds ddlRetryBudget{10'000};
+    // viewReadRetryBudget: how long a GetViewRow answered NotLeader / Redirect is
+    // re-sent (same 100 ms -> 1 s backoff as a DDL) before it ends as
+    // ViewRowResult::kNotLeader.  Bounded by the read's own deadline
+    // (pingTimeoutMs) too.  Independent of the DDL knobs (#76).
+    std::chrono::milliseconds viewReadRetryBudget{5'000};
     // ddlTimeoutMs: the deadline of EVERY DDL (DefineTopic, AlterTopic,
     // CreateView, DropTopic, DropView, AlterView, AlterTopicConfig) — the whole
     // op, its Redirect hops and NotLeader retries included; no answer by then ->
@@ -672,8 +683,12 @@ public:
     [[nodiscard]] std::size_t testSessionCount() const noexcept { return agent_.sessionCount(); }
     /// D4: the coordinator route (empty = the seed), its session index, and how
     /// many coordinator moves / fallbacks were followed (duty thread / owner).
-    [[nodiscard]] const std::string& testCoordinatorChannel() const noexcept { return coordinatorChannel_; }
-    [[nodiscard]] uint32_t testCoordinatorSessionIndex() const noexcept { return coordIdx_; }
+    [[nodiscard]] const std::string& testCoordinatorChannel() const noexcept {
+        static const std::string kNone;   // the seed (empty, as before)
+        const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
+        return rm != nullptr ? rm->channel : kNone;
+    }
+    [[nodiscard]] uint32_t testCoordinatorSessionIndex() const noexcept { return coordIdx(); }
     [[nodiscard]] uint64_t testCoordinatorRedirects() const noexcept { return coordinatorRedirects_; }
     [[nodiscard]] uint64_t testCoordinatorFallbacks() const noexcept { return coordinatorFallbacks_; }
     /// DR client bug 1 (duty thread / after close): seed failovers started (each a
@@ -940,8 +955,8 @@ public:
                                        uint8_t persistence, std::span<const uint8_t> planBlob,
                                        std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
     /// Routing (Task 22 fix round 1): only the source partition's leader serves a row; a Redirect / NotLeader is followed
-    /// within min(pingTimeoutMs, ddlRetryBudget) and ends as ViewRowResult::kNotLeader, or as a Timeout (throws) when
-    /// pingTimeoutMs is the shorter of the two (the defaults).
+    /// within min(pingTimeoutMs, viewReadRetryBudget) and ends as ViewRowResult::kNotLeader, or as a Timeout (throws) when
+    /// pingTimeoutMs is the shorter of the two (with the defaults, 5 s each, whichever bound is hit first).
     /// Task 21: getViewRow(), blocking. A non-OK ViewRowResponse status (e.g.
     /// AbsentKey, NotReady, NotAuthorized) is returned in the result (not thrown) — only a
     /// transport-level failure (Timeout, NotConnected, SessionLost, Closed)
@@ -1156,7 +1171,7 @@ public:
     /// InvalidArgument, never sends {0,0}).
     void testSkewNextDdlRequestIdAt(uint32_t delta) noexcept { testSkewDdlRequestIdAt_ = delta; }
     /// Task 5 fix round 1: pending DDLs waiting for a resend (pump work); duty thread.
-    [[nodiscard]] int testDdlAwaitingResend() const noexcept { return ddlAwaitingResend_; }
+    [[nodiscard]] int testRoutedCtlAwaitingResend() const noexcept { return routedCtlAwaitingResend_; }
     /// Task 5 fix round 1 (M3): queue releases still deferred behind a ring fence.
     [[nodiscard]] std::size_t testDeferredReleases() const noexcept { return deferredReleases_.size(); }
     /// Test hook (duty thread only): pending control ops (connect included).
@@ -1290,7 +1305,8 @@ private:
     // ---- Catalog history (Task 5): a pending DDL's state — one explicit state
     // per phase, each holding exactly its variables (hard rule 3, F29).
     // `redirects` counts the Redirect hops followed (> kMaxDdlRedirects fails);
-    // budgetEndNs = min(DDL deadline, first NotLeader / session loss + ddlRetryBudget).
+    // budgetEndNs = min(op deadline, first NotLeader / session loss + ddlRetryBudget, or viewReadRetryBudget for a
+    // GetViewRow).
     /// The session an in-flight DDL was offered on (agent session index) and
     /// its connect episode then — a different episode (left Connected, a
     /// reconnect, a new id) = that session was lost under the DDL.
@@ -1304,7 +1320,7 @@ private:
     /// Why a DDL waits for its resend: a NotLeader answer, or its session was
     /// lost before any answer (Task 5 re-review F1: past the budget the first
     /// ends BrokerError NotLeader, the second OpStatus::SessionLost).
-    enum class DdlResendCause : uint8_t { NotLeader, SessionLost };
+    enum class DdlResendCause : uint8_t { NotLeader, SessionLost, AuthUnavailable };   // Issue #607: AuthUnavailable ends with 48
     /// Not in flight: re-sent at resendAtNs (if refused then, every cycle after, until budgetEndNs).
     struct DdlAwaitingResend {
         int redirects; int64_t budgetEndNs; int64_t backoffNs; int64_t resendAtNs;
@@ -1313,9 +1329,10 @@ private:
     /// Redirected (no NotLeader seen) to a node whose session cannot take the
     /// frame yet (still connecting): re-offered every cycle until it does.
     struct DdlHeldForNode    { int redirects; };
+    // Shared by every routed control op (DDLs and GetViewRow), not DDL-only.
     using DdlRetry = std::variant<DdlUnsentOnSeed, DdlSent, DdlNotLeaderSeen, DdlAwaitingResend, DdlHeldForNode>;
-    /// Everything only a DDL has (review M1: one variant on PendingCtl).
-    struct DdlPending {
+    /// Everything only a routed control op (a DDL or a GetViewRow) has (review M1: one variant on PendingCtl).
+    struct RoutedCtlPending {
         std::vector<uint8_t> frame;          // the encoded request, re-sent verbatim (stable requestId)
         std::string          endpoint;       // the node it goes to ("" = the seed); a Redirect moves it
         uint32_t             requestLo = 0;  // the generated requestId's lo (0 = an explicit requestId)
@@ -1353,7 +1370,7 @@ private:
         /// seed was not Connected — its frame waits (on no session) for a Connected seed, inside the op's
         /// own deadline; it never reached a broker.
         struct CtlAwaitingSeed { std::vector<uint8_t> frame; };
-        std::variant<std::monostate, DdlPending, CtlAwaitingSeed> ddl;   // catalog history: a DDL's own state
+        std::variant<std::monostate, RoutedCtlPending, CtlAwaitingSeed> ddl;   // catalog history: a DDL's own state
         detail::SecretString newPassword;   // review B I4: a self SET PASSWORD's plaintext until its answer (wiped always)
     };
 
@@ -1483,6 +1500,10 @@ private:
     /// F8c C4: detail::AndWaitSink — the handles' *AndWait sugar.
     static Completion andWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
                                          detail::AndWaitIssue issue, void* issueCtx, std::string* text);
+    /// #378: the GroupConsumer's AndWaitSink — a wait timeout / client close comes back as Completion status
+    /// Timeout / Closed (the group raises GroupOpError for it) instead of a plain std::runtime_error.
+    static Completion groupAndWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
+                                              detail::AndWaitIssue issue, void* issueCtx, std::string* text);
     /// I3: pin the completion target a command carries (re-encoded counted).
     void pinCommandTarget_(detail::HubCommand& cmd) noexcept;
     /// D4: a follower named the group / txn coordinator (ErrorResponse{
@@ -1497,26 +1518,22 @@ private:
     void syncCoordinatorSession_() noexcept;
     /// D4: the coordinator session's broker id (0 while not connected / known).
     [[nodiscard]] int64_t coordSessionId_() const noexcept {
-        return agent_.sessionMachineAt(coordIdx_).sessionId();
+        return agent_.sessionMachineAt(coordIdx()).sessionId();
     }
     // ---- D4 coordinator route (duty thread only) ----------------------------
     // Kafka's coordinator connection: empty = the seed (byte-identical to the
     // pre-D4 client until a NotCoordinator answer names another node).
-    std::string coordinatorChannel_;
-    uint32_t    coordIdx_ = 0;          // its agent session index (0 = the seed)
-    uint64_t    coordFailBase_ = 0;     // its connectFailures() when it became the coordinator
-    // Phase 2b F Task 11: the duty-clock time the coordinator session (coordIdx_ != 0) was first seen NOT Connected
-    // (0 = it is up / just moved).  A coordinator that stays down past kCoordDownFallbackNs is given up like an
-    // exhausted connect budget (back to the seed, which names the CURRENT coordinator): a crashed coordinator
-    // node's session otherwise retries for minutes and every txn / group op waits on it.
-    int64_t     coordDownSinceNs_ = 0;
+    detail::CoordRoute coordRoute_;   // #362: CoordSeed, or CoordRemote{session index, channel, failBase, downSince}
+    [[nodiscard]] uint32_t coordIdx() const noexcept { return detail::coordIdxOf(coordRoute_); }
+    // A coordinator that stays down past kCoordDownFallbackNs is given up like an exhausted connect budget (back to
+    // the seed, which names the CURRENT coordinator): a crashed coordinator node's session otherwise retries for
+    // minutes and every txn / group op waits on it.
     static constexpr int64_t kCoordDownFallbackNs = 5'000'000'000LL;
     uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
     uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)
     // r2 LOW-3: a coordinator channel whose session was Rejected / Closed, and
     // the metadataResponses_ count then (re-followed only after fresh metadata).
-    std::string coordRejectedChannel_;
-    int         coordRejectedMeta_ = 0;
+    std::optional<detail::RejectedCoord> coordRejected_;
     // The last coordinator-session tuple the group hub was told about.
     uint32_t              lastCoordIdx_     = 0;
     session::SessionState lastCoordState_   = session::SessionState::Disconnected;
@@ -1530,7 +1547,7 @@ private:
                                                                                 std::size_t len) noexcept;
     [[nodiscard]] static int64_t coordSessionIdTrampoline_(void* ctx) noexcept;
     /// F14: NotCoordinator -> send a MetadataRequest (duty thread).
-    static void rediscoverTrampoline_(void* ctx) noexcept;
+    [[nodiscard]] static bool rediscoverTrampoline_(void* ctx) noexcept;
 
     // ---- F8c C3: control ops (duty-thread owned pending table) --------------
     /// `secret` (review B I4): bytes carried to the duty thread AFTER the wire frame in the same record, handed to the
@@ -1554,14 +1571,15 @@ private:
     /// ErrorResponse{Redirect, endpoint} for pendingCtl_[i] (a DDL).
     void onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs);
     /// NotLeader (ErrorResponse or a response's errorCode 2) for pendingCtl_[i] (a DDL).
-    void onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs);
+    void onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs,
+                         uint16_t failCode = static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader));
     /// Offer d.frame to d.endpoint's node (the seed when ""); on Accepted, `on`
     /// names the session it went out on.
-    transport::AeronTransport::OfferResult offerDdl_(DdlPending& d, int64_t nowNs, DdlOfferedOn& on);
-    /// Move d to `next`, keeping ddlAwaitingResend_ exact.
-    void setDdlRetry_(DdlPending& d, DdlRetry next) noexcept;
-    /// ddlPending_ / ddlAwaitingResend_ for an entry entering (+1) / leaving (-1) the table.
-    void countDdl_(const PendingCtl& p, int sign) noexcept;
+    transport::AeronTransport::OfferResult offerDdl_(RoutedCtlPending& d, int64_t nowNs, DdlOfferedOn& on);
+    /// Move d to `next`, keeping routedCtlAwaitingResend_ exact.
+    void setDdlRetry_(RoutedCtlPending& d, DdlRetry next) noexcept;
+    /// routedCtlPending_ / routedCtlAwaitingResend_ for an entry entering (+1) / leaving (-1) the table.
+    void countRoutedCtl_(const PendingCtl& p, int sign) noexcept;
     /// A seed-session loss: every pending NON-DDL control op ends SessionLost (a
     /// DDL follows its own session: the pump re-sends it, same requestId).
     void failControlOnSeedLoss_(uint16_t errorCode, std::span<const uint8_t> text);
@@ -1572,7 +1590,7 @@ private:
     /// inside the NotLeader budget); every DDL whose resend is due (backoff
     /// elapsed, held for a connecting node, unsent on the seed) is re-offered;
     /// one refused past its budget fails explicitly.
-    int driveDdl_(int64_t nowNs);
+    int driveRoutedCtl_(int64_t nowNs);
     void applyControlOpRecord_(const uint8_t* rec, std::size_t len);
     void applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> frame);
     void completeCtl_(PendingCtl& p, OpStatus st, int64_t value = 0, int64_t aux = 0,
@@ -1606,6 +1624,12 @@ private:
     template <class Issue, class OnDone>
     void andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
                   Issue&& issue, OnDone&& onDone);
+    /// How andWaitCore_ ended (andWait_ throws for each; the group's sink maps them to a Completion status).
+    enum class AndWaitEnd : uint8_t { Done, RingTimedOut, WaitTimedOut, Closed, Rejected };
+    /// andWait_ without the throw: `rejected` holds the issue's OpResult when it returns Rejected.
+    template <class Issue, class OnDone>
+    AndWaitEnd andWaitCore_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
+                            Issue& issue, OnDone& onDone, OpResult& rejected);
     void throwForStatus_(const char* what, const Completion& c, std::span<const uint8_t> payload) const;
     /// F8c C3: publish (state, sessionId) to app threads on change (duty).
     void publishSeedStatus_(session::SessionState st, int64_t sid) noexcept;
@@ -1700,10 +1724,13 @@ private:
     static int64_t fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept;
     static uint64_t fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept;
     static void fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept;
+    /// #440: FetchRouter::maxConnectedBrokerVersion.
+    static int32_t maxConnectedBrokerVersionTrampoline_(void* ctx) noexcept;
     static int32_t fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept;
     /// #290: a node session's reject code (46 / 44 ...) while it is Rejected, else 0 (0 for the seed, whose
     /// rejection ends the Client's work on its own path).
     static int16_t nodeRejectCodeTrampoline_(void* ctx, uint32_t session) noexcept;
+    static uint32_t nodeSessionIndexOfTrampoline_(void* ctx, int64_t sid) noexcept;   // #446
     [[nodiscard]] int16_t nodeRejectCode_(uint32_t session) const noexcept;
     static int32_t subscribeBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept;   // Phase 2c: 0 unless Connected
     /// M1 (duty thread, while a group consumer exists): a leader-node session a
@@ -1712,6 +1739,10 @@ private:
     /// re-drive a Disconnected one's connect, re-route.  Event-driven: state
     /// transitions of the agent's sessions, no clock.
     int watchGroupSessions_(int64_t nowNs);
+    /// #514: a leader-node session carrying a homed subscription or a group fetch that has been silent for more
+    /// than two keepalive intervals keeps the backoff-paced metadata refresh armed (a BOUND reader arms nothing
+    /// else): fresh metadata moves it through driveHomed / group reconcileFetch before the session is stale.
+    int watchSilentLeaders_(int64_t nowNs);
     int watchProduceRoutes_(int64_t nowNs) noexcept;
     // ---- DR client bug 1: seed failover (duty thread) -------------------------
     // The seed's broker died: its session went silent (stale loss) or it gave up
@@ -1785,11 +1816,14 @@ private:
     static constexpr int64_t kRedirectedResendInitNs = 100'000'000LL;     // 100 ms
     static constexpr int64_t kRedirectedResendMaxNs  = 2'000'000'000LL;   // 2 s
     static constexpr int kMaxEgressUnavailableRetries = kMaxEgressUnavailableRetriesForTest;
+    static constexpr int kMaxAuthUnavailableRetries = 8;   // Issue #607: re-sends of ONE request answered AuthUnavailable (48)
     int64_t               redirectedResendBackoffNs_ = kRedirectedResendInitNs;
     uint64_t              unreachableRedirects_ = 0;
     uint64_t groupUpMask_   = 0;  // leader sessions (bit i-1 = session i) Connected last pass
     uint64_t groupDiscMask_ = 0;  // ... terminally Disconnected last pass
     uint64_t groupRejMask_  = 0;  // #290: ... Rejected last pass (a login refused there is never "lost")
+    int64_t  nextSilentCheckNs_  = 0;   // #514: watchSilentLeaders_ runs once per silentCheckPeriodNs_ (duty clock)
+    int64_t  silentCheckPeriodNs_ = 0;  // #514: a quarter of the configured keepalive interval (set at construction)
     static detail::SendResult fetchOfferTrampoline_(void* ctx, uint32_t session, const uint8_t* buf,
                                                     std::size_t len) noexcept;
     /// A Redirect / NotLeader answered a group fetch Subscribe (corrId tagged
@@ -1949,6 +1983,7 @@ private:
     //                                 Subscribe / Unsubscribe, txn, OffsetCommit
     //   group OffsetFetch             bit 60 (GroupConsumerHub::kOffsetFetchCorrTag)
     //   group fetch Subscribes        bit 61 (GroupConsumerHub::kFetchCorrTag)
+    //   group Join/Sync/Heartbeat     bit 57 (GroupConsumerHub::kGroupCtlCorrTag)
     //   producer batches              bit 62 (producer::batchcorr::kTag)
     //   producer coordinator requests bit 58 (producer::coordcorr::kTag; bit 59 is the counter above)
     // Task 5 fix round 0 (C): the counter used to start at 1 — the seed's
@@ -1964,8 +1999,8 @@ private:
     static uint64_t         drawClientInstanceId_();   // std::random_device, 2 x 32 bits, redrawn while 0
     const uint64_t          clientInstanceId_ = drawClientInstanceId_();
     uint32_t                requestCounter_ = 0;       // duty thread only: the requestId's lo (32-bit, never 0)
-    int                     ddlPending_ = 0;           // pendingCtl_ entries that are DDLs or routed control ops (GetViewRow)
-    int                     ddlAwaitingResend_ = 0;    // pending DDLs in a ddlWaitsForResend() state
+    int                     routedCtlPending_ = 0;           // pendingCtl_ entries that are routed control ops: DDLs and GetViewRow
+    int                     routedCtlAwaitingResend_ = 0;    // pending routed ops (DDLs and view reads) in a ddlWaitsForResend() state
     std::vector<DdlRetryNote> ddlRetryNotes_;          // duty thread; filled only under cfg_.traceDdlRetries
     std::size_t             ddlRetryNotesDropped_ = 0;
     void noteDdlRetry_(DdlRetryNote note);

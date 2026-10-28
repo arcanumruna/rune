@@ -252,7 +252,8 @@ Send `SIGUSR1` to a running broker to dump a report; `SIGHUP` reloads the TLS ce
 | `password` / `passwordFile` | empty | Password, or a file holding it (read once; trailing newline stripped). Setting both throws. |
 | `allowUnauthenticatedBroker` | `false` | Accept a dev-mode broker even with credentials. |
 | `minPasswordLength` | `12` | Minimum length when this client builds a new verifier. |
-| `scramIterations` | `4096` | Iteration count of a new verifier. |
+| `scramIterations` | `4096` | Iteration count of a new verifier. Must be 4096..`maxAcceptedScramIterations`, else construction throws. |
+| `maxAcceptedScramIterations` | `100000` | Most PBKDF2 iterations a login runs; a broker asking for more is refused before hashing. Set it to at least the cluster's highest verifier count. Range 4096..1000000. |
 | `clientName` | `rune-client` | Recorded as the principal's client name in catalog events. |
 | `traceDdlRetries` | `false` | Record followed redirects and retries (Invoker mode only). |
 
@@ -264,7 +265,7 @@ producers), `produceTimeoutMs` (`5000`), `transactionOpTimeoutMs` (`60000`), `ma
 `RUNE_BATCH_RECORDS`, `RUNE_MAX_FRAME_BYTES` and `RUNE_DELIVERY_TIMEOUT_MS`.
 
 `GroupConfig` ([GroupConsumer.h](../client-cpp/include/rune/client/group/GroupConsumer.h)): `autoCommit` (`true`),
-`autoCommitIntervalMs` (`5000`), `sessionTimeoutMs` (`30000`), `autoOffsetReset` (`Latest`), `isolation`
+`autoCommitIntervalMs` (`5000`), `sessionTimeoutMs` (`30000`), `isolation`
 (`ReadUncommitted`), `commitSyncTimeoutMs` (`30000`).
 
 Client environment variables that override `ClientConfig`: `RUNE_CLIENT_AERON_MTU`, `RUNE_CLIENT_AERON_UDP_GSO`,

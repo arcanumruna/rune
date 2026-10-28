@@ -255,6 +255,8 @@ struct ConnectResponse {
         const MessageHeader& hdr = *hdrOpt;
         if (hdr.schemaId   != kSchemaId)   return std::nullopt;
         if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+        // #194: the header states the body length - a frame shorter than it is truncated, never a shorter (older) layout.
+        if (hdr.blockLength < BODY_FIXED_V0 || avail < MessageHeader::ENCODED_SIZE + hdr.blockLength) return std::nullopt;
 
         ConnectResponse msg;
         msg.sessionId     = hdr.sessionId;
@@ -265,16 +267,15 @@ struct ConnectResponse {
         msg.leaderMemberId    = detail::getLE32 (buf, fixedBase + 2);
         msg.assignedSessionId = detail::getLE64 (buf, fixedBase + 6);
         // Additive field: present when the sender's body is long enough.
-        msg.brokerVersion = (hdr.blockLength >= BODY_FIXED && avail >= ENCODED_SIZE)
+        msg.brokerVersion = (hdr.blockLength >= BODY_FIXED)
                                 ? static_cast<int32_t>(detail::getLE32(buf, fixedBase + 14))
                                 : 0;
 
         // v4 additive crypto fields — gated on blockLength/avail (mirrors the
         // Produce BODY_FIXED_V0/V1 idiom). Absence ⇒ no crypto chosen.
-        if (hdr.blockLength >= BODY_FIXED_V4 && avail >= ENCODED_SIZE_V4) {
+        if (hdr.blockLength >= BODY_FIXED_V4) {
             msg.chosenCipher = buf[fixedBase + 18];  // @42, AFTER brokerVersion [14..17]
             if (hdr.blockLength >= BODY_FIXED_V9) {
-                if (avail < ENCODED_SIZE_V9) return std::nullopt;
                 const uint8_t mode  = buf[fixedBase + 19];
                 const uint8_t state = buf[fixedBase + 20];
                 if (mode > static_cast<uint8_t>(AuthMode::InProcess) ||

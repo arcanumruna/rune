@@ -24,6 +24,7 @@
 #include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/protocol/client/AuthMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/SchemaMessages.h>
@@ -50,7 +51,20 @@ namespace rune::client {
 
 namespace {
 
+// now + ms, in ns, saturated at INT64_MAX: a huge timeout or retry budget (e.g. milliseconds::max(), "let the
+// deadline end it") never wraps into the past.  ms <= 0 is now (validatedConfig refuses negatives).
+int64_t nsAfter(int64_t nowNs, int64_t ms) noexcept {
+    constexpr int64_t kNsPerMs = 1'000'000;
+    if (ms <= 0) return nowNs;
+    if (ms >= (INT64_MAX - std::max<int64_t>(nowNs, 0)) / kNsPerMs) return INT64_MAX;
+    return nowNs + ms * kNsPerMs;
+}
 ClientConfig validatedConfig(ClientConfig c) {
+    // A negative timeout or retry budget has no meaning (0 = none / at once); refused, never silently clamped.
+    if (c.connectTimeoutMs < 0 || c.pingTimeoutMs < 0 || c.ddlTimeoutMs < 0)
+        throw std::invalid_argument("ClientConfig: connectTimeoutMs / pingTimeoutMs / ddlTimeoutMs must be >= 0");
+    if (c.ddlRetryBudget.count() < 0 || c.viewReadRetryBudget.count() < 0)
+        throw std::invalid_argument("ClientConfig: ddlRetryBudget / viewReadRetryBudget must be >= 0");
     if (c.traceDdlRetries && c.runnerMode != RunnerMode::Invoker)
         throw std::invalid_argument("ClientConfig::traceDdlRetries requires RunnerMode::Invoker "
                                     "(the notes are duty-thread state, read by the Invoker owner)");
@@ -75,6 +89,18 @@ ClientConfig validatedConfig(ClientConfig c) {
                                         "- insecurePlaintextAuth is for tests only");
         c.requireCrypto = true;
     }
+    // Issue #235: the iteration counts are bounded by the wire's range, and a verifier this client builds
+    // (scramIterations) must be one it accepts at login (maxAcceptedScramIterations) - never silently clamped.
+    // The cap must cover the cluster's highest verifier count (a padded slot for an unknown user included).
+    namespace pcl = rune::protocol::client;
+    if (c.maxAcceptedScramIterations < pcl::kAuthIterationsMin || c.maxAcceptedScramIterations > pcl::kAuthIterationsMax)
+        throw std::invalid_argument("ClientConfig::maxAcceptedScramIterations must be in " +
+                                    std::to_string(pcl::kAuthIterationsMin) + ".." +
+                                    std::to_string(pcl::kAuthIterationsMax));
+    if (c.scramIterations < pcl::kAuthIterationsMin || c.scramIterations > c.maxAcceptedScramIterations)
+        throw std::invalid_argument("ClientConfig::scramIterations must be in " +
+                                    std::to_string(pcl::kAuthIterationsMin) + "..maxAcceptedScramIterations (" +
+                                    std::to_string(c.maxAcceptedScramIterations) + ")");
     // Issue #115: the system store with no name check accepts any public certificate for any name.
     if (c.offerCrypto && !c.tlsTrustPem && c.tlsExpectHost.empty() &&
         session::tlsHostOfChannel(c.gatewayChannel).empty())
@@ -147,8 +173,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     // the session transitions to Disconnected and sweep can promptly fail pending
     // produce futures and subscribes.  Map ms → ns; clamp to a 1ms minimum.
     if (c.connectTimeoutMs > 0) {
-        acfg.session.connectTimeoutNs =
-            static_cast<int64_t>(c.connectTimeoutMs) * 1'000'000LL;
+        acfg.session.connectTimeoutNs = nsAfter(0, c.connectTimeoutMs);
     }
 
     // Task 3: explicit Aeron knobs (spec §4.1/§4.3).  Env overrides win.
@@ -176,6 +201,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.session.username      = c.username;   // authentication: SCRAM credentials (never logged)
     acfg.session.password      = c.password;
     acfg.session.allowUnauthenticatedBroker = c.allowUnauthenticatedBroker;
+    acfg.session.maxAcceptedIterations = c.maxAcceptedScramIterations;
     acfg.session.bootstrapOnly = c.securityBootstrapOnly;
     acfg.session.requireCrypto = c.requireCrypto;
     if (c.testAnnounceClientVersion > 0) acfg.session.clientVersion = c.testAnnounceClientVersion;   // test only
@@ -204,6 +230,9 @@ Client::Client(ClientConfig cfg)
     // own copy is not kept.
     if (!cfg_.password.empty()) { detail::secureZero(cfg_.password.data(), cfg_.password.size()); cfg_.password.clear(); }
     if (cfg_.traceDdlRetries) ddlRetryNotes_.reserve(kMaxDdlRetryNotes);   // push_back never reallocates on the duty thread
+    // #514: the silent-leader scan runs four times per keepalive interval.
+    silentCheckPeriodNs_ = (cfg_.keepaliveIntervalNs > 0 ? cfg_.keepaliveIntervalNs
+                                                         : session::SessionConfig{}.keepaliveIntervalNs) / 4;
     // F8c review n1: releaseCq_ is noexcept and may defer a release; the list
     // never holds more than one entry per registry slot, so reserve it once
     // here and the push_back there can never allocate (or throw).
@@ -279,8 +308,8 @@ Client::Client(ClientConfig cfg)
     // path (unchanged) while the coordinator is the seed, else that node's own
     // session (re-stamped with its id; held = refused while it connects).
     coordSendFn_ = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-        if (coordIdx_ == 0) return agent_.submitSend(fb, fl);
-        return agent_.offerToCoordinator(coordIdx_, fb, fl) != transport::AeronTransport::OfferResult::Retry;
+        if (coordIdx() == 0) return agent_.submitSend(fb, fl);
+        return agent_.offerToCoordinator(coordIdx(), fb, fl) != transport::AeronTransport::OfferResult::Retry;
     };
     {
         group::GroupConsumerHub::FetchRouter fr;
@@ -292,6 +321,7 @@ Client::Client(ClientConfig cfg)
         fr.brokerVersion = &Client::fetchBrokerVersionTrampoline_;
         fr.offer         = &Client::fetchOfferTrampoline_;
         fr.rejectCode    = &Client::nodeRejectCodeTrampoline_;
+        fr.maxConnectedBrokerVersion = &Client::maxConnectedBrokerVersionTrampoline_;   // #440
         groupConsumerHub_.setFetchRouter(fr);
         // E2 final fix wave (I2): a moved plain subscription lives on its
         // partition leader's own node session, reached the same way.
@@ -303,6 +333,7 @@ Client::Client(ClientConfig cfg)
         nr.offer         = &Client::fetchOfferTrampoline_;
         nr.nextCorrId    = &Client::nextCorrTrampoline_;
         nr.rejectCode    = &Client::nodeRejectCodeTrampoline_;
+        nr.sessionIndexOf = &Client::nodeSessionIndexOfTrampoline_;
         subscriberHub_.setNodeRouter(nr);
     }
 
@@ -1182,6 +1213,39 @@ Completion Client::andWaitTrampoline_(void* ctx, const char* what, std::chrono::
     return out;
 }
 
+// #378 (C3 review): the GroupConsumer *AndWait sugar.  A wait that ends without a completion (the wait or the
+// command ring timed out, the client closed) is reported as that Completion status, so the group's typed switch
+// raises a GroupOpError for it as for every other non-Ok outcome.  A refused issue (wrong thread, bad argument) is
+// a caller error and still throws as andWait_ does.
+Completion Client::groupAndWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
+                                           detail::AndWaitIssue issue, void* issueCtx, std::string* text) {
+    auto* self = static_cast<Client*>(ctx);
+    Completion out;
+    auto doIssue = [&](Completions& q, Token t) { return issue(issueCtx, CompletionTarget(q), t); };
+    auto onDone  = [&](const Completion& c, std::span<const uint8_t> p) {
+        out = c;
+        if (text != nullptr) text->assign(reinterpret_cast<const char*>(p.data()), p.size());
+    };
+    OpResult rejected = OpResult::Accepted;
+    switch (self->andWaitCore_(what, timeout, 0, doIssue, onDone, rejected)) {
+    case AndWaitEnd::Done:
+        return out;
+    case AndWaitEnd::RingTimedOut:
+    case AndWaitEnd::WaitTimedOut:
+        out        = Completion{};
+        out.status = OpStatus::Timeout;
+        return out;
+    case AndWaitEnd::Closed:
+        out        = Completion{};
+        out.status = OpStatus::Closed;
+        return out;
+    case AndWaitEnd::Rejected:
+        break;
+    }
+    throw std::runtime_error(std::string(what) + ": rejected (OpResult " +
+                             std::to_string(static_cast<int>(rejected)) + ")");
+}
+
 // ---------------------------------------------------------------------------
 // F8c C3: control ops — app-thread issue path
 // ---------------------------------------------------------------------------
@@ -1688,7 +1752,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             completeCtl_(p, OpStatus::Ok, machine.sessionId());
             return;
         }
-        p.deadlineNs = nowNs + cfg_.connectTimeoutMs * 1'000'000LL;
+        p.deadlineNs = nsAfter(nowNs, cfg_.connectTimeoutMs);
         pendingConnect_    = std::move(p);
         hasPendingConnect_ = true;
         machine.connect(nowNs);
@@ -1728,7 +1792,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     p.corrId     = nextCorrId_++;
     // Catalog history (fix round 0, A): a DDL has its own deadline — the whole
     // op, its Redirect hops and its NotLeader budget (budgetEnd <= deadline).
-    p.deadlineNs = nowNs + (isDdlOp(h.op) ? cfg_.ddlTimeoutMs : cfg_.pingTimeoutMs) * 1'000'000LL;
+    p.deadlineNs = nsAfter(nowNs, isDdlOp(h.op) ? cfg_.ddlTimeoutMs : cfg_.pingTimeoutMs);
     if (h.op == OpKind::DefineTopic) {
         if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) p.topicName = std::string(d->topicName);
     }
@@ -1739,7 +1803,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
         // Catalog history (F14): the requestId is stamped HERE, by the duty
         // thread that owns the counter, then kept with the frame — every resend
         // (Redirect / NotLeader / a lost session) re-offers these exact bytes.
-        DdlPending d;
+        RoutedCtlPending d;
         if (h.requestIdAt != 0) {
             if (std::size_t{h.requestIdAt} + 16u > ctlScratch_.size()) [[unlikely]] {
                 // F4: the stamp would not fit (issue-time decode check bypassed):
@@ -1769,7 +1833,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             return;
         }
         p.ddl = std::move(d);
-        countDdl_(p, +1);
+        countRoutedCtl_(p, +1);
         pendingCtl_.push_back(std::move(p));
         return;
     }
@@ -1805,7 +1869,7 @@ void Client::completeCtl_(PendingCtl& p, OpStatus st, int64_t value, int64_t aux
     c.errorCode = errorCode;
     c.reserved0 = reserved0;   // GetTopicSchema: partitionCount (Phase 2b C)
     // Catalog history: a DDL reports its generated requestId's lo (requestIdOf).
-    if (const auto* d = std::get_if<DdlPending>(&p.ddl)) c.reserved0 = d->requestLo;
+    if (const auto* d = std::get_if<RoutedCtlPending>(&p.ddl)) c.reserved0 = d->requestLo;
     deliver_(p.target, c, payload, ov);
 }
 
@@ -1815,7 +1879,7 @@ Client::PendingCtl Client::takeCtl_(std::size_t i) {
     pendingCtl_.erase(pendingCtl_.begin() + static_cast<std::ptrdiff_t>(i));
     if (!p.unsentFrame.empty()) --unsentCtl_;
     if (std::holds_alternative<PendingCtl::CtlAwaitingSeed>(p.ddl)) --ctlAwaitingSeed_;   // I-1
-    countDdl_(p, -1);
+    countRoutedCtl_(p, -1);
     return p;
 }
 
@@ -1890,21 +1954,21 @@ int Client::driveAwaitingSeed_() {
 // resend pump.  Duty thread; cold.  Every path ends in exactly one completion.
 // ---------------------------------------------------------------------------
 
-void Client::setDdlRetry_(DdlPending& d, DdlRetry next) noexcept {
-    ddlAwaitingResend_ += (ddlWaitsForResend(next) ? 1 : 0) - (ddlWaitsForResend(d.retry) ? 1 : 0);
+void Client::setDdlRetry_(RoutedCtlPending& d, DdlRetry next) noexcept {
+    routedCtlAwaitingResend_ += (ddlWaitsForResend(next) ? 1 : 0) - (ddlWaitsForResend(d.retry) ? 1 : 0);
     d.retry = std::move(next);
 }
 
-void Client::countDdl_(const PendingCtl& p, int sign) noexcept {
-    const auto* d = std::get_if<DdlPending>(&p.ddl);
+void Client::countRoutedCtl_(const PendingCtl& p, int sign) noexcept {
+    const auto* d = std::get_if<RoutedCtlPending>(&p.ddl);
     if (d == nullptr) return;
-    ddlPending_ += sign;
-    if (ddlWaitsForResend(d->retry)) ddlAwaitingResend_ += sign;
+    routedCtlPending_ += sign;
+    if (ddlWaitsForResend(d->retry)) routedCtlAwaitingResend_ += sign;
 }
 
 void Client::failControlOnSeedLoss_(uint16_t errorCode, std::span<const uint8_t> text) {
     for (std::size_t i = pendingCtl_.size(); i-- > 0;) {
-        if (std::holds_alternative<DdlPending>(pendingCtl_[i].ddl)) continue;   // follows its own session (I1)
+        if (std::holds_alternative<RoutedCtlPending>(pendingCtl_[i].ddl)) continue;   // follows its own session (I1)
         if (std::holds_alternative<PendingCtl::CtlAwaitingSeed>(pendingCtl_[i].ddl)) continue;   // on no session (I-1)
         if (!pendingCtl_[i].unsentFrame.empty()) {
             // Fix round 2 (I-1): never sent (the transport refused it) — it reached no
@@ -1922,7 +1986,7 @@ void Client::failControlOnSeedLoss_(uint16_t errorCode, std::span<const uint8_t>
     }
 }
 
-transport::AeronTransport::OfferResult Client::offerDdl_(DdlPending& d, int64_t nowNs, DdlOfferedOn& on) {
+transport::AeronTransport::OfferResult Client::offerDdl_(RoutedCtlPending& d, int64_t nowNs, DdlOfferedOn& on) {
     uint32_t idx = 0;
     const auto r = agent_.offerToEndpoint(d.endpoint, d.frame.data(), d.frame.size(), nowNs, idx);
     // #290: the node session is named on a refusal too (its epoch is 0 then) — a Rejected one ends the DDL.
@@ -1950,7 +2014,7 @@ constexpr int64_t kDdlMaxBackoffNs     = 1'000'000'000;   // 1 s
 void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs) {
     using Offer = transport::AeronTransport::OfferResult;
     PendingCtl& p = pendingCtl_[i];
-    DdlPending& d = std::get<DdlPending>(p.ddl);
+    RoutedCtlPending& d = std::get<RoutedCtlPending>(p.ddl);
     if (endpoint.empty()) {   // a Redirect that names no node: nothing to follow — retriable as NotLeader
         onDdlNotLeader_(i, "redirect without a leader endpoint", nowNs);
         return;
@@ -1990,17 +2054,15 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t no
     }
 }
 
-void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs) {
+void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs, uint16_t failCode) {
     PendingCtl& p = pendingCtl_[i];
-    DdlPending& d = std::get<DdlPending>(p.ddl);
+    RoutedCtlPending& d = std::get<RoutedCtlPending>(p.ddl);
     int     redirects   = 0;
     int64_t budgetEndNs = 0;
     int64_t backoffNs   = 0;
     if (const auto* st = std::get_if<DdlSent>(&d.retry)) {
         redirects   = st->redirects;
-        budgetEndNs = std::min(p.deadlineNs, nowNs + static_cast<int64_t>(
-                                                         std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                             cfg_.ddlRetryBudget).count()));
+        budgetEndNs = std::min(p.deadlineNs, nsAfter(nowNs, (isDdlOp(p.op) ? cfg_.ddlRetryBudget : cfg_.viewReadRetryBudget).count()));
         backoffNs   = kDdlInitialBackoffNs;
     } else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&d.retry)) {
         redirects   = n->redirects;
@@ -2011,15 +2073,21 @@ void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t now
     }
     if (nowNs >= budgetEndNs) {   // spec §5.5: retried within the budget, then an explicit failure
         std::string why(detail);
-        why += why.empty() ? "not leader: DDL retry budget exhausted" : " (DDL retry budget exhausted)";
-        failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader), why, ddlNoValue(p.op));
+        // Issue #607: the same retry serves AuthUnavailable (48), reported with its own code and text.
+        const bool authUnavailable = failCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthUnavailable);
+        why += why.empty() ? (authUnavailable ? "AuthUnavailable: retry budget exhausted"
+                                              : "not leader: retry budget exhausted")
+                           : " (retry budget exhausted)";
+        failDdl_(i, failCode, why, ddlNoValue(p.op));
         return;
     }
     // The last resend lands at the budget's end at the latest; its answer decides.
     if (cfg_.traceDdlRetries)
         noteDdlRetry_({DdlRetryNote::Kind::NotLeader, redirects, std::min(backoffNs, budgetEndNs - nowNs) / 1'000'000,
                        std::string(detail)});
-    setDdlRetry_(d, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, std::min(nowNs + backoffNs, budgetEndNs)});
+    setDdlRetry_(d, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, std::min(nowNs + backoffNs, budgetEndNs),
+                                      failCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthUnavailable)
+                                          ? DdlResendCause::AuthUnavailable : DdlResendCause::NotLeader});
 }
 
 void Client::noteDdlRetry_(DdlRetryNote note) {
@@ -2035,12 +2103,12 @@ std::size_t Client::takeDdlRetryNotes(std::vector<DdlRetryNote>& out) {
     return std::exchange(ddlRetryNotesDropped_, 0);
 }
 
-int Client::driveDdl_(int64_t nowNs) {
+int Client::driveRoutedCtl_(int64_t nowNs) {
     using Offer = transport::AeronTransport::OfferResult;
     int work = 0;
     for (std::size_t i = 0; i < pendingCtl_.size();) {
         PendingCtl& p = pendingCtl_[i];
-        auto* d = std::get_if<DdlPending>(&p.ddl);
+        auto* d = std::get_if<RoutedCtlPending>(&p.ddl);
         if (d == nullptr) { ++i; continue; }
         // I1: an in-flight DDL whose session left its connect episode (a
         // session-fatal answer naming it, a stale loss, a transport drop, a
@@ -2054,9 +2122,7 @@ int Client::driveDdl_(int64_t nowNs) {
         if (const auto* st = std::get_if<DdlSent>(&d->retry)) {
             on = &st->on;
             redirects = st->redirects;
-            budgetEndNs = std::min(p.deadlineNs, nowNs + static_cast<int64_t>(
-                                                             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                 cfg_.ddlRetryBudget).count()));
+            budgetEndNs = std::min(p.deadlineNs, nsAfter(nowNs, (isDdlOp(p.op) ? cfg_.ddlRetryBudget : cfg_.viewReadRetryBudget).count()));
         } else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&d->retry)) {
             on = &n->on;
             redirects = n->redirects;
@@ -2108,8 +2174,14 @@ int Client::driveDdl_(int64_t nowNs) {
                                      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()),
                                                               kWhy.size()));
                     } else {
-                        failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
-                                 "not leader: the seed can never reconnect", ddlNoValue(p.op));
+                        // C4 review: the text names the cause the code reports (48 is not "not leader").
+                        const bool authUnavailable = due.cause == DdlResendCause::AuthUnavailable;
+                        failDdl_(i, static_cast<uint16_t>(authUnavailable
+                                                              ? rune::protocol::client::ErrorCode::AuthUnavailable
+                                                              : rune::protocol::client::ErrorCode::NotLeader),
+                                 authUnavailable ? "AuthUnavailable: the seed can never reconnect"
+                                                 : "not leader: the seed can never reconnect",
+                                 ddlNoValue(p.op));
                     }
                     ++work;
                     break;
@@ -2122,15 +2194,19 @@ int Client::driveDdl_(int64_t nowNs) {
                         // F1: the DDL's session was lost and never came back
                         // inside the budget — a session loss, not a NotLeader.
                         constexpr std::string_view kWhy =
-                            "session lost: the DDL's session was not re-established within the DDL retry budget "
+                            "session lost: the request's session was not re-established within its retry budget "
                             "(it may have been applied; a retry with the same requestId is exact)";
                         PendingCtl dead = takeCtl_(i);
                         completeCtl_(dead, OpStatus::SessionLost, ddlNoValue(dead.op), 0, 0,
                                      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()),
                                                               kWhy.size()));
+                    } else if (due.cause == DdlResendCause::AuthUnavailable) {
+                        // Issue #607: the retries were answered AuthUnavailable - that is the code the caller sees.
+                        failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthUnavailable),
+                                 "AuthUnavailable: retry budget exhausted", ddlNoValue(p.op));
                     } else {
                         failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
-                                 "not leader: DDL retry budget exhausted (the node could not be reached)",
+                                 "not leader: retry budget exhausted (the node could not be reached)",
                                  ddlNoValue(p.op));
                     }
                     ++work;
@@ -2259,7 +2335,7 @@ void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
     // M3 (Phase 2c): the hub judges the COORDINATOR's session.  A seed that reconnected onto another (older)
     // node while the coordinator lives on a session of its own must not overwrite the coordinator's version
     // (syncCoordinatorSession_ keeps that one current).
-    if (coordIdx_ == 0) groupConsumerHub_.setBrokerVersion(brokerVersion);
+    if (coordIdx() == 0) groupConsumerHub_.setBrokerVersion(brokerVersion);
 
     // CG-5: Trigger group consumers to send JoinGroup on connect — only
     // when the SEED (the coordinator's session) connected: a leader
@@ -2270,7 +2346,7 @@ void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
     // session of its own joins its members on ITS connect
     // (syncCoordinatorSession_).
     if (!groupConsumerHub_.empty()) {
-        if (coordIdx_ == 0) groupConsumerHub_.onConnected(sessionId, coordSendFn_);
+        if (coordIdx() == 0) groupConsumerHub_.onConnected(sessionId, coordSendFn_);
         // A (leader or seed) session (re)connected: partitions waiting
         // for it — or whose subscription died with its old session —
         // subscribe now.
@@ -2350,9 +2426,12 @@ void Client::sweepControl_(int64_t nowNs) {
     // Backoff — reconnect-forever — keeps trying and stays deadline-bounded.)
     if (hasPendingConnect_ &&
         (agent_.seedMachine().state() == session::SessionState::Disconnected ||
-         // PR #476 review: a machine that is not reconnect-forever enters Backoff only after unproven TLS final-leg
+         // PR #476 review: a machine that is not reconnect-forever enters Backoff after unproven TLS final-leg
          // failures exhausted their retries - the pending connect has failed too.
-         (agent_.seedMachine().state() == session::SessionState::Backoff && !cfg_.reconnectForeverAfterLive))) [[unlikely]] {
+         // Issue #461: but Backoff before Live is also a bounded retry of a transient refusal (48 / rate-limited 44) -
+         // the pending connect waits for it, bounded by its deadline and by maxUnavailableRetries.
+         (agent_.seedMachine().state() == session::SessionState::Backoff && !cfg_.reconnectForeverAfterLive &&
+          !agent_.seedMachine().retryingTransientRefusal()))) [[unlikely]] {
         static constexpr std::string_view kGaveUp =
             "connect() gave up (redirect budget exhausted or connect refused): not connected";
         // Issue #13 / #14: a session that requires TLS and never got it says why (the refusals were unauthenticated,
@@ -2364,13 +2443,32 @@ void Client::sweepControl_(int64_t nowNs) {
         const int16_t last = agent_.seedMachine().lastConnectError();
         const bool noTls = last == static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
         const std::string_view why = noTls ? kNoTls : kGaveUp;
-        completeConnect_(OpStatus::NotConnected, 0, last > 0 ? static_cast<uint16_t>(last) : 0, why);
+        // A rate-limited login that exhausted its retries (Issue #519) still reports the broker's retry-after.
+        const int64_t retryAfterMs =
+            last == static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed))
+                ? static_cast<int64_t>(agent_.seedMachine().authRetryAfterMs()) : 0;
+        completeConnect_(OpStatus::NotConnected, 0, last > 0 ? static_cast<uint16_t>(last) : 0, why, retryAfterMs);
         if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(why)); });
     }
     if (hasPendingConnect_ && nowNs >= pendingConnect_.deadlineNs) {
-        completeConnect_(OpStatus::Timeout, 0, 0, {});
-        if (cbError_) {
-            invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
+        // C4 review (#461 / #519): the deadline fell inside a transient-refusal retry (a 48, or a rate-limited 44 whose
+        // retry-after outlives the deadline).  The connect fails with the broker's verdict and retry-after, not a bare
+        // Timeout, and the retry stops so nothing reconnects behind the failed connect.
+        const int16_t last = agent_.seedMachine().lastConnectError();
+        const uint32_t retryAfter = agent_.seedMachine().authRetryAfterMs();
+        if (agent_.seedSession().machine.abandonTransientRetry()) {
+            static constexpr std::string_view kRefused =
+                "connect() timed out while retrying a transient refusal (AuthUnavailable / rate-limited login)";
+            const bool rateLimited =
+                last == static_cast<int16_t>(static_cast<uint16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed));
+            completeConnect_(OpStatus::NotConnected, 0, static_cast<uint16_t>(last), kRefused,
+                             rateLimited ? static_cast<int64_t>(retryAfter) : 0);
+            if (cbError_) invokeUserCallback_("onError", [&] { cbError_(std::string(kRefused)); });
+        } else {
+            completeConnect_(OpStatus::Timeout, 0, 0, {});
+            if (cbError_) {
+                invokeUserCallback_("onError", [&] { cbError_("connect() timed out"); });
+            }
         }
     }
     for (std::size_t i = 0; i < pendingCtl_.size();) {
@@ -2457,6 +2555,21 @@ void Client::checkBlockingCaller_(const char* what) const {
 template <class Issue, class OnDone>
 void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
                       Issue&& issue, OnDone&& onDone) {
+    OpResult rejected = OpResult::Accepted;
+    switch (andWaitCore_(what, timeout, maxResultBytes, issue, onDone, rejected)) {
+    case AndWaitEnd::Done:         return;
+    case AndWaitEnd::RingTimedOut: throw std::runtime_error(std::string(what) + ": timed out (command ring full)");
+    case AndWaitEnd::WaitTimedOut: throw std::runtime_error(std::string(what) + ": timed out waiting");
+    case AndWaitEnd::Closed:       throw std::runtime_error(std::string(what) + ": client closed");
+    case AndWaitEnd::Rejected:
+        throw std::runtime_error(std::string(what) + ": rejected (OpResult " +
+                                 std::to_string(static_cast<int>(rejected)) + ")");
+    }
+}
+
+template <class Issue, class OnDone>
+Client::AndWaitEnd Client::andWaitCore_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
+                                        Issue& issue, OnDone& onDone, OpResult& rejected) {
     checkBlockingCaller_(what);
     CompletionsConfig qc;
     qc.maxResultBytes = std::max<uint32_t>(maxResultBytes, qc.maxErrorText);
@@ -2478,15 +2591,13 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
         const OpResult r = issue(q, kToken);
         if (r == OpResult::Accepted) break;
         if (r == OpResult::BackPressured) {  // the command ring is full: let the duty thread drain
-            if (std::chrono::steady_clock::now() >= issueDeadline) {
-                throw std::runtime_error(std::string(what) + ": timed out (command ring full)");
-            }
+            if (std::chrono::steady_clock::now() >= issueDeadline) return AndWaitEnd::RingTimedOut;
             if (cfg_.runnerMode == RunnerMode::Invoker) (void)doWork(); else backoff.idle(0);
             continue;
         }
-        if (r == OpResult::Closed) throw std::runtime_error(std::string(what) + ": client closed");
-        throw std::runtime_error(std::string(what) + ": rejected (OpResult " +
-                                 std::to_string(static_cast<int>(r)) + ")");
+        if (r == OpResult::Closed) return AndWaitEnd::Closed;
+        rejected = r;
+        return AndWaitEnd::Rejected;
     }
     bool       ok = false;
     auto done = [&](const Completion& c, std::span<const uint8_t> payload) {
@@ -2502,8 +2613,8 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
     } else {
         w = q.waitFor(kToken, left, done);
     }
-    if (w == Completions::Wait::TimedOut) throw std::runtime_error(std::string(what) + ": timed out waiting");
-    if (!ok) throw std::runtime_error(std::string(what) + ": client closed");
+    if (w == Completions::Wait::TimedOut) return AndWaitEnd::WaitTimedOut;
+    return ok ? AndWaitEnd::Done : AndWaitEnd::Closed;
 }
 
 // ---------------------------------------------------------------------------
@@ -3023,7 +3134,7 @@ int Client::dutyCycle(int64_t nowNs) {
         if (!groupConsumerHub_.empty()) {
             // D4: a coordinator session that gave up falls back to the seed
             // BEFORE the session watch below could revive it.
-            if (coordIdx_ != 0) [[unlikely]] syncCoordinatorSession_();
+            if (coordIdx() != 0) [[unlikely]] syncCoordinatorSession_();
             const int64_t gsid = coordSessionId_();  // the coordinator's session (the seed's by default)
             work += groupConsumerHub_.flushRequestedCommits(gsid);
             if (groupConsumerHub_.pendingLeaves() != 0) work += groupConsumerHub_.retryPendingLeaves(gsid);
@@ -3041,7 +3152,7 @@ int Client::dutyCycle(int64_t nowNs) {
     if (!redirectedSubscribes_.empty()) [[unlikely]] work += retryRedirectedSubscribes_(nowNs);
     // Catalog history (Task 5): pending DDLs — a lost session's DDL re-sent
     // toward the seed, due resends offered (one branch when none).
-    if (ddlPending_ != 0) [[unlikely]] work += driveDdl_(nowNs);
+    if (routedCtlPending_ != 0) [[unlikely]] work += driveRoutedCtl_(nowNs);
     if (!heldRedirectFollows_.empty()) [[unlikely]] work += releaseHeldRedirectFollows_();   // R3
     // E2 final fix wave (I2): moved subscriptions on their leader node's own
     // session — held Subscribes flushed, a lost session's ones re-armed.
@@ -3054,6 +3165,10 @@ int Client::dutyCycle(int64_t nowNs) {
         // the answer re-routes it (driveHomed follows a moved route).
         if (subscriberHub_.unansweredHomed() != 0) [[unlikely]] scheduleMetadataRefresh();
     }
+    // #514: a BOUND reader / group fetch on a leader node that went silent (crashed) arms nothing above; the
+    // check is one compare per cycle, the scan once per quarter keepalive.
+    if (nowNs >= nextSilentCheckNs_ && (subscriberHub_.homedCount() != 0 || !groupConsumerHub_.empty())) [[unlikely]]
+        work += watchSilentLeaders_(nowNs);
 
     // 3b'. F8c C3: control frames the transport refused (Retry), in order.
     if (ctlAwaitingSeed_ != 0) [[unlikely]] work += driveAwaitingSeed_();   // fix round 2 (I-1)
@@ -3517,7 +3632,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // (plaintext under requireCrypto -> Rejected) is failed by enterFailed_.
             if (agent_.lastConnectAccepted())
                 onSeedConnected_(opt->assignedSessionId, opt->brokerVersion);
-        } else {
+        } else if (!agent_.seedMachine().retryingTransientRefusal()) {   // Issue #461: a transient 48 is retried
             // Error response via ConnectResponse — fail the connect and fire onError.
             const std::string msg = "ConnectResponse error code: " +
                                     std::to_string(opt->code);
@@ -3546,7 +3661,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         }
         if (agent_.lastConnectAccepted()) {
             onSeedConnected_(agent_.seedMachine().sessionId(), agent_.sessionBrokerVersion(0));
-        } else if (ec != rpc::ErrorCode::OK) {
+        } else if (ec != rpc::ErrorCode::OK && !agent_.seedMachine().retryingTransientRefusal()) {
             // The broker ended the handshake (HandshakeFailed -> Rejected: enterFailed_
             // fails every op; any other code -> a retriable connect failure).  The
             // pending connect ends now, once — exactly like a ConnectResponse error.
@@ -3576,6 +3691,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
             break;
         }
         if (agent_.seedMachine().state() == session::SessionState::Authenticating) break;   // (cannot happen: awaited)
+        // Issue #461 / #519: a transient refusal (48, rate-limited 44) before Live is a bounded Backoff retry inside
+        // the machine - the pending connect waits for it (it ends with the code once the budget is spent).
+        if (agent_.seedMachine().retryingTransientRefusal()) break;
         // The login was refused (or the broker proved nothing): the pending connect ends now, once, with the
         // broker's code and its retry-after (a rate-limited login).  A Rejected seed also fails every pending
         // op AuthenticationFailed — nothing more can be answered on it.
@@ -3623,6 +3741,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     onDdlRedirect_(i, opt->message, now());
                 } else if (ec == rpc::ErrorCode::NotLeader) {
                     onDdlNotLeader_(i, opt->message, now());
+                } else if (ec == rpc::ErrorCode::AuthUnavailable) {   // Issue #607: retried like NotLeader
+                    onDdlNotLeader_(i, opt->message, now(), static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable));
                 } else {
                     std::string msg(opt->message);
                     if (msg.empty()) msg = "ErrorResponse code: " + std::to_string(opt->code);
@@ -4113,7 +4233,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // No-hang fix round 2: only an answer to THE connect (its correlationId)
         // or a session-fatal one fails a pending connect — an error answering
         // some other request (e.g. an InvalidRequest Ping) no longer does.
-        if (sessionFatal || opt->correlationId == agent_.seedSession().machine.correlationId())
+        if ((sessionFatal || opt->correlationId == agent_.seedSession().machine.correlationId()) &&
+            !agent_.seedMachine().retryingTransientRefusal())   // Issue #461: a transient 48 is retried
             completeConnect_(OpStatus::BrokerError, 0, ecode, msg);
         if (sessionFatal) {
             failControlOnSeedLoss_(ecode, text);   // a DDL follows its own session (I1)
@@ -4167,9 +4288,15 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // PR #441 F4 (issue #118): RecordEgressUnavailable - the broker could not build this session's own record
         // stream.  Retried like a pending NotLeader (paced by fresh metadata + backoff) within a small budget of THIS
         // request, then failed explicitly with the code (onSubscribeResponse below finishes it).
-        if (opt->errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::RecordEgressUnavailable) &&
+        // Issue #607: AuthUnavailable (48) - the broker's security state is catching up, so the grant check cannot
+        // answer yet - is retried the same way, within its own budget.
+        const bool authUnavailable =
+            opt->errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthUnavailable);
+        if ((opt->errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::RecordEgressUnavailable) ||
+             authUnavailable) &&
             subscriberHub_.isPending(opt->correlationId)) {
-            if (subscriberHub_.chargeNotLeaderRetry(opt->correlationId, kMaxEgressUnavailableRetries)) {
+            if (subscriberHub_.chargeNotLeaderRetry(
+                    opt->correlationId, authUnavailable ? kMaxAuthUnavailableRetries : kMaxEgressUnavailableRetries)) {
                 if (std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(), opt->correlationId) ==
                     redirectedSubscribes_.end()) {
                     try {
@@ -4186,7 +4313,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
             }
             if (cbError_)
                 invokeUserCallback_("onError", [&] {
-                    cbError_("Subscribe failed: RecordEgressUnavailable (retry budget exhausted)");
+                    cbError_(authUnavailable ? "Subscribe failed: AuthUnavailable (retry budget exhausted)"
+                                             : "Subscribe failed: RecordEgressUnavailable (retry budget exhausted)");
                 });
         }
         // CB-5 A2: pass a sendFn so SubscriberHub can emit a late Unsubscribe
@@ -4320,6 +4448,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 onDdlNotLeader_(i, {}, now());
                 break;
             }
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607
+                onDdlNotLeader_(i, {}, now(), opt->errorCode);
+                break;
+            }
             PendingCtl p = takeCtl_(i);
             // Task 9 (CLI): on success, register (name, topicId) so listTopics()
             // can enumerate topics that were applied via this client.
@@ -4371,6 +4503,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 onDdlNotLeader_(i, {}, now());
                 break;
             }
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607
+                onDdlNotLeader_(i, {}, now(), opt->errorCode);
+                break;
+            }
             PendingCtl p = takeCtl_(i);
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
                          opt->topicId, opt->newVersion, opt->errorCode);
@@ -4388,6 +4524,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
             i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::CreateView) {
             if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {   // catalog history: retriable
                 onDdlNotLeader_(i, {}, now());
+                break;
+            }
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607
+                onDdlNotLeader_(i, {}, now(), opt->errorCode);
                 break;
             }
             PendingCtl p = takeCtl_(i);
@@ -4412,6 +4552,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
              pendingCtl_[i].op == OpKind::NamespaceDdl)) {
             if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {
                 onDdlNotLeader_(i, opt->detail, now());
+                break;
+            }
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607
+                onDdlNotLeader_(i, opt->detail, now(), opt->errorCode);
                 break;
             }
             PendingCtl p = takeCtl_(i);
@@ -4450,6 +4594,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
         if (const std::size_t i = findCtl_(opt->correlationId);
             i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::GetViewRow) {
+            if (opt->status == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607: retried
+                onDdlNotLeader_(i, {}, now(), static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable));
+                break;
+            }
             PendingCtl p = takeCtl_(i);
             // status is a ViewRowResponse-specific outcome, not a broker
             // ErrorCode — reuse the errorCode field as its carrier (same
@@ -5208,9 +5356,9 @@ detail::SendResult Client::directSendTrampoline_(void* ctx, const uint8_t* buf, 
 
 detail::SendResult Client::coordDirectSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len) {
     auto* self = static_cast<Client*>(ctx);
-    if (self->coordIdx_ == 0) return directSendTrampoline_(ctx, buf, len);  // the seed: unchanged
+    if (self->coordIdx() == 0) return directSendTrampoline_(ctx, buf, len);  // the seed: unchanged
     using R = transport::AeronTransport::OfferResult;
-    switch (self->agent_.offerToCoordinator(self->coordIdx_, buf, len)) {
+    switch (self->agent_.offerToCoordinator(self->coordIdx(), buf, len)) {
     case R::Accepted: return detail::SendResult::Accepted;
     case R::Retry:    return detail::SendResult::Retry;
     case R::Fatal:    break;
@@ -5237,8 +5385,31 @@ int32_t Client::subscribeBrokerVersionTrampoline_(void* ctx, uint32_t session) n
     return agent.connectedEpoch(session) != 0 ? agent.sessionBrokerVersion(session) : 0;
 }
 
+// #440: the highest broker version among the sessions Connected now (cold: only while a group join is deferred, or
+// at a join site that found the coordinator too old).
+int32_t Client::maxConnectedBrokerVersionTrampoline_(void* ctx) noexcept {
+    const auto& agent = static_cast<Client*>(ctx)->agent_;
+    int32_t best = 0;
+    for (uint32_t i = 0, n = static_cast<uint32_t>(agent.sessionCount()); i < n; ++i) {
+        if (agent.connectedEpoch(i) != 0) best = std::max(best, agent.sessionBrokerVersion(i));
+    }
+    return best;
+}
+
 int32_t Client::fetchBrokerVersionTrampoline_(void* ctx, uint32_t session) noexcept {
     return static_cast<Client*>(ctx)->agent_.sessionBrokerVersion(session);
+}
+
+// #446: the node session that is Connected with broker session id `sid` (cold: a late / stray Subscribe OK).
+uint32_t Client::nodeSessionIndexOfTrampoline_(void* ctx, int64_t sid) noexcept {
+    const auto& agent = static_cast<Client*>(ctx)->agent_;
+    uint32_t found = 0;
+    for (uint32_t i = 1; i < agent.sessionCount(); ++i) {
+        if (agent.connectedSessionId(i) != sid) continue;
+        if (found != 0) return UINT32_MAX;   // two node sessions carry it: ambiguous
+        found = i;
+    }
+    return found;
 }
 
 int16_t Client::nodeRejectCodeTrampoline_(void* ctx, uint32_t session) noexcept {
@@ -5526,6 +5697,24 @@ int Client::watchGroupSessions_(int64_t nowNs) {
     return 1;
 }
 
+int Client::watchSilentLeaders_(int64_t nowNs) {
+    nextSilentCheckNs_ = nowNs + silentCheckPeriodNs_;
+    uint64_t silent = agent_.leaderSessionsSilentMask(nowNs);
+    if (agent_.seedSilent(nowNs) && (subscriberHub_.usesSession(0) || groupConsumerHub_.fetchUses(0))) {
+        scheduleMetadataRefresh();   // #514 (seed): idempotent while armed
+        return 1;
+    }
+    if (silent == 0) [[likely]] return 0;
+    for (uint32_t i = 1; i <= 64 && silent != 0; ++i, silent >>= 1) {
+        if ((silent & 1u) == 0) continue;
+        if (subscriberHub_.usesSession(i) || groupConsumerHub_.fetchUses(i)) {
+            scheduleMetadataRefresh();   // idempotent while armed; the answer moves what moved (#365 / reconcile)
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int64_t Client::nextCorrTrampoline_(void* ctx) noexcept {
     return static_cast<Client*>(ctx)->nextCorrId_++;
 }
@@ -5655,7 +5844,7 @@ void Client::applyHubCommand_(const detail::HubCommand& cmd) {
             // MEDIUM-7: adopted after the seed connected — join now (the
             // connect-time onConnected already ran).
             // D4: on the coordinator session (the seed by default).
-            if (agent_.sessionMachineAt(coordIdx_).state() == session::SessionState::Connected) {
+            if (agent_.sessionMachineAt(coordIdx()).state() == session::SessionState::Connected) {
                 groupConsumerHub_.joinIfConnected(coordSessionId_(), coordSendFn_);
             }
         }
@@ -5784,7 +5973,7 @@ GroupConsumer Client::subscribeGroup(std::string              groupId,
     }
 
     return GroupConsumer(impl.release(), &Client::hubCommandTrampoline_, this, handleDutyThread_(),
-                         &Client::targetedOpTrampoline_, &Client::andWaitTrampoline_);
+                         &Client::targetedOpTrampoline_, &Client::groupAndWaitTrampoline_);   // #378
 }
 
 // ---------------------------------------------------------------------------
@@ -6027,26 +6216,25 @@ void Client::onCoordinatorRedirect_(const std::string& endpoint) {
     // MAJOR-1: "the seed" means where the seed PHYSICALLY is (its default
     // publication), not its bootstrap identity — a seed a data-op redirect moved
     // to L that hears NotCoordinator{bootstrap} must route to the bootstrap.
-    const std::string& current = coordIdx_ == 0 ? agent_.seedChannel() : coordinatorChannel_;
+    const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
+    const std::string& current = rm == nullptr ? agent_.seedChannel() : rm->channel;
     if (agent::ClientAgent::sameEndpoint(channel, current)) return;
     // r2 LOW-3: a coordinator whose session was Rejected / Closed is not
     // re-followed until fresh metadata arrives (the member waits its join
     // deadline, the txn op its retry) — never a 100 ms move/fallback loop.
-    if (!coordRejectedChannel_.empty()) {
-        if (metadataResponses_ == coordRejectedMeta_ &&
-            agent::ClientAgent::sameEndpoint(channel, coordRejectedChannel_)) {
+    if (coordRejected_) {
+        if (metadataResponses_ == coordRejected_->meta &&
+            agent::ClientAgent::sameEndpoint(channel, coordRejected_->channel)) {
             scheduleMetadataRefresh();
             return;
         }
-        coordRejectedChannel_.clear();
+        coordRejected_.reset();
     }
     ++coordinatorRedirects_;
     // That node's ONE session (lazily opened / re-driven) — 0 = the seed is there.
-    coordIdx_ = agent_.coordinatorSessionIndex(channel, now());
-    if (coordIdx_ == 0) coordinatorChannel_.clear();
-    else                coordinatorChannel_ = channel;
-    coordFailBase_ = agent_.sessionConnectFailuresAt(coordIdx_);
-    coordDownSinceNs_ = 0;
+    const uint32_t idx = agent_.coordinatorSessionIndex(channel, now());
+    if (idx == 0) coordRoute_ = detail::CoordSeed{};
+    else          coordRoute_ = detail::CoordRemote{idx, channel, agent_.sessionConnectFailuresAt(idx), std::nullopt};
     groupConsumerHub_.onCoordinatorMoved();   // members -> Rejoining (there)
     producerHub_.onCoordinatorMoved();        // Phase 2b F: AwaitCoordinator requests re-send
     syncCoordinatorSession_();                // already connected: they join at once
@@ -6054,9 +6242,9 @@ void Client::onCoordinatorRedirect_(const std::string& endpoint) {
 
 // D4: see syncSeedSession_ / onCoordinatorRedirect_.  Duty thread.
 void Client::syncCoordinatorSession_() noexcept {
-    const session::SessionMachine& m = agent_.sessionMachineAt(coordIdx_);
+    const session::SessionMachine& m = agent_.sessionMachineAt(coordIdx());
     const session::SessionState st  = m.state();
-    if (coordIdx_ != 0) [[unlikely]] {
+    if (auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_)) [[unlikely]] {
         // Fallback: the coordinator session gave up (its connect budget is spent
         // — terminal Disconnected / Rejected / Closed — or a failed attempt sent
         // it to Backoff): back to the seed, whose node answers again with the
@@ -6066,41 +6254,37 @@ void Client::syncCoordinatorSession_() noexcept {
         // minutes before any of the exhausted-budget states above - so a session that stays down for
         // kCoordDownFallbackNs is given up too (level-triggered; the seed names the current coordinator, and
         // each fallback is paced by this grace, never a spin).
-        if (st == session::SessionState::Connected) {
-            coordDownSinceNs_ = 0;
-        } else if (coordDownSinceNs_ == 0) {
-            coordDownSinceNs_ = now();
-        }
-        const bool downTooLong = coordDownSinceNs_ != 0 && now() - coordDownSinceNs_ > kCoordDownFallbackNs;
+        const int64_t nowNs = now();
+        const bool downTooLong =
+            detail::coordDownTooLong(*rm, st == session::SessionState::Connected, nowNs, kCoordDownFallbackNs);
         const bool gaveUp = downTooLong ||
                             st == session::SessionState::Disconnected ||
                             st == session::SessionState::Rejected ||
                             st == session::SessionState::Closed ||
                             (st == session::SessionState::Backoff &&
-                             agent_.sessionConnectFailuresAt(coordIdx_) != coordFailBase_);
+                             agent_.sessionConnectFailuresAt(rm->idx) != rm->failBase);
         if (gaveUp) {
             ++coordinatorFallbacks_;
             if (st == session::SessionState::Rejected || st == session::SessionState::Closed) {
-                coordRejectedChannel_ = coordinatorChannel_;   // r2 LOW-3
-                coordRejectedMeta_    = metadataResponses_;
+                coordRejected_ = detail::RejectedCoord{rm->channel, metadataResponses_};   // r2 LOW-3
             }
             // #290 (PR #513 review): a Rejected coordinator session (its user revoked there, its login
             // refused) never carries a join / commit: the members end now with its code, as a fetch homed on a
             // Rejected node session does — never cycling seed -> NotCoordinator -> that node.
-            if (st == session::SessionState::Rejected && m.rejectCode() != 0) [[unlikely]]
+            if (st == session::SessionState::Rejected && m.rejectCode() != 0) [[unlikely]] {
                 groupConsumerHub_.onCoordinatorRejected(m.rejectCode());
-            coordinatorChannel_.clear();
-            coordIdx_ = 0;
-            coordDownSinceNs_ = 0;
+                producerHub_.onCoordinatorRejected(m.rejectCode());   // #291
+            }
+            coordRoute_ = detail::CoordSeed{};   // rm dangles from here
             groupConsumerHub_.onCoordinatorMoved();
             producerHub_.onCoordinatorMoved();
-            syncCoordinatorSession_();  // once: the seed's tuple (coordIdx_ == 0 now)
+            syncCoordinatorSession_();  // once: the seed's tuple (the seed now)
             return;
         }
     }
     const int64_t sid     = m.sessionId();
     const int64_t episode = m.correlationId();
-    if (coordIdx_ == lastCoordIdx_ && st == lastCoordState_ && sid == lastCoordSid_ &&
+    if (coordIdx() == lastCoordIdx_ && st == lastCoordState_ && sid == lastCoordSid_ &&
         episode == lastCoordEpisode_) [[likely]] {
         return;
     }
@@ -6109,12 +6293,12 @@ void Client::syncCoordinatorSession_() noexcept {
     // Every (re)establishment counts (the episode changes, or the session was not Connected before): a broker
     // that keeps the session id on a resume (auth Required: resumeAuthenticated_) is still a new session for
     // the in-flight requests, which were lost with the old connection.
-    if (connected && sid != 0 && (coordIdx_ != lastCoordIdx_ || sid != lastCoordSid_ || episode != lastCoordEpisode_ ||
+    if (connected && sid != 0 && (coordIdx() != lastCoordIdx_ || sid != lastCoordSid_ || episode != lastCoordEpisode_ ||
                        lastCoordState_ != session::SessionState::Connected)) {
         producerHub_.onCoordinatorSessionChanged();
     }
     groupConsumerHub_.setSessionConnected(connected, sid, episode);
-    lastCoordIdx_     = coordIdx_;
+    lastCoordIdx_     = coordIdx();
     lastCoordState_   = st;
     lastCoordSid_     = sid;
     lastCoordEpisode_ = episode;
@@ -6122,8 +6306,8 @@ void Client::syncCoordinatorSession_() noexcept {
     // once (the seed's own connect does this in the ConnectResponse handler; a
     // TLS session connects on a later handshake leg — this level check sees it).
     // M3: the coordinator's own version, kept current for consumers created later (joinIfConnected) as well.
-    if (connected && sid != 0) groupConsumerHub_.setBrokerVersion(agent_.sessionBrokerVersion(coordIdx_));
-    if (coordIdx_ != 0 && connected && !groupConsumerHub_.empty()) {
+    if (connected && sid != 0) groupConsumerHub_.setBrokerVersion(agent_.sessionBrokerVersion(coordIdx()));
+    if (coordIdx() != 0 && connected && !groupConsumerHub_.empty()) {
         groupConsumerHub_.onConnected(sid, coordSendFn_);
         (void)groupConsumerHub_.reconcileFetch();
     }
@@ -6133,7 +6317,7 @@ producer::CoordinatorSink::Offer Client::coordOfferTrampoline_(void* ctx, const 
                                                                 std::size_t len) noexcept {
     auto* self = static_cast<Client*>(ctx);
     // The coordinator session (the seed until a NotCoordinator names another node), as the producers' coordinator links route.
-    const auto r = self->coordIdx_ != 0 ? self->agent_.offerToCoordinator(self->coordIdx_, buf, len)
+    const auto r = self->coordIdx() != 0 ? self->agent_.offerToCoordinator(self->coordIdx(), buf, len)
                                         : self->agent_.offerDefault(buf, len);
     switch (r) {
     case transport::AeronTransport::OfferResult::Accepted: return producer::CoordinatorSink::Offer::Accepted;
@@ -6147,11 +6331,12 @@ int64_t Client::coordSessionIdTrampoline_(void* ctx) noexcept {
     return static_cast<Client*>(ctx)->coordSessionId_();
 }
 
-void Client::rediscoverTrampoline_(void* ctx) noexcept {
+bool Client::rediscoverTrampoline_(void* ctx) noexcept {
     // F14: NotCoordinator -> re-discover the coordinator (== the consensus leader today, F15 5.1): ask for a fresh
     // cluster view now.  Not connected: the MetadataRequest sent on the next Connected edge answers it instead.
     // DR client bug 1: through any Connected session (the seed may be the dead one).
-    (void)static_cast<Client*>(ctx)->sendMetadataRequestAnywhere_();
+    // Not submitted: the link asks again on its next pump (#351).
+    return static_cast<Client*>(ctx)->sendMetadataRequestAnywhere_();
 }
 
 // ---------------------------------------------------------------------------
@@ -6250,16 +6435,23 @@ bool Client::offerMetadataOnNode_(uint32_t i) noexcept {
 
 bool Client::sendMetadataRequestAnywhere_() noexcept {
     const auto snap = agent_.stateAndSessionId();
+    const auto n    = static_cast<uint32_t>(agent_.sessionCount());
+    // #514 (seed): a silent seed (Connected, nothing heard for 2 keepalives) is asked last - a crashed seed would
+    // swallow the request until responseTimeoutNs.
+    const bool seedFirst = !agent_.seedSilent(now());
     // M2: a refused submit (command ring full) is not "asked".
-    if (snap.state == session::SessionState::Connected && snap.sessionId != 0 && sendMetadataRequest(snap.sessionId))
+    if (seedFirst && snap.state == session::SessionState::Connected && snap.sessionId != 0 &&
+        sendMetadataRequest(snap.sessionId))
         return true;
     // The seed is down: the first Connected node session asks (duty-thread direct
     // send on that node's ingress, stamped with ITS session id, sealed under its
     // crypto state).  The answer is applied like any other (any session's
     // MetadataResponse reaches onMetadataResponse).
-    const auto n = static_cast<uint32_t>(agent_.sessionCount());
     for (uint32_t i = 1; i < n; ++i)
         if (offerMetadataOnNode_(i)) return true;
+    if (!seedFirst && snap.state == session::SessionState::Connected && snap.sessionId != 0 &&
+        sendMetadataRequest(snap.sessionId))
+        return true;
     return false;
 }
 
@@ -6438,7 +6630,7 @@ bool Client::startSeedFailoverAttempt_(SeedFailingOver& f, int64_t nowNs, bool c
                             static_cast<uint64_t>(f.gapNs / 4 + 1);
     f.notBeforeNs = nowNs + f.gapNs + static_cast<int64_t>(jitter);
     f.gapNs       = std::min(f.gapNs * 2, kSeedFailoverMaxGapNs);
-    const int64_t connectNs = cfg_.connectTimeoutMs > 0 ? cfg_.connectTimeoutMs * 1'000'000LL : kSeedFailoverAttemptMaxNs;
+    const int64_t connectNs = cfg_.connectTimeoutMs > 0 ? nsAfter(0, cfg_.connectTimeoutMs) : kSeedFailoverAttemptMaxNs;
     f.attemptDeadlineNs = nowNs + std::min(connectNs, kSeedFailoverAttemptMaxNs);
     if (target.empty() || !agent_.failoverSeedTo(target, nowNs, connectNow)) {
         f.attemptDeadlineNs = f.notBeforeNs;  // did not resolve: the next candidate after the gap

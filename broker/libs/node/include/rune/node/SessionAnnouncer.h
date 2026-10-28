@@ -100,6 +100,7 @@ public:
             op.clientVersion   = clientVersion;
             op.grantAll        = grantAll_;   // authentication Task 13 (D30): authMode != Enabled
             op.sessionEncrypted = sessionEncrypted;
+            op.keyPending       = sessionEncrypted && !keyReady;   // first wave: workers hold early produce
             if (sessionEncrypted && keyReady) {
                 rune::crypto::AeadKey senderKey{};
                 const bool ok = rune::crypto::deriveSenderKey(

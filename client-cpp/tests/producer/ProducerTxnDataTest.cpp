@@ -1053,6 +1053,25 @@ TEST(ProducerTxnDataRegression, RefusalPassStopsAtAMessageItDoesNotOwnRegression
     }
 }
 
+// #322: an off-owner credit abort in the ring of a transactional producer is OWNED by the refusal pass (counted,
+// never left blocking the ring, never counted as a foreign message).
+TEST(ProducerClaimRegression, OffThreadCreditLostMessageIsSkippedByTheTxnRefusalPassRegression) {
+    const std::array<uint8_t, 4> payload{1, 2, 3, 4};
+    Rig r;
+    r.initOk();
+    r.begin();
+    r.impl->testPoison(OpStatus::BrokerError, uec(rpc::ErrorCode::NotAuthorized), rp::AbortKind::Plain);
+    ASSERT_TRUE(r.impl->testWriteRing(rp::kMsgClaimCreditLost, payload));
+    ASSERT_TRUE(r.impl->testWriteRing(rp::kMsgTier2Discard, payload));  // short token: skipped, never blocks
+    for (int i = 0; i < 8 && r.impl->testRingHead() < r.impl->testRingTail(); ++i) r.impl->drainRing(r.now, 16);
+    EXPECT_EQ(r.impl->testRingHead(), r.impl->testRingTail()) << "the ring did not drain";
+    EXPECT_EQ(r.impl->claimCreditLost(), 1u);
+    EXPECT_EQ(r.impl->ringForeignMessages(), 0u);
+    Op abort = r.abort();
+    r.tick();
+    ASSERT_TRUE(abort.ready());
+}
+
 // FD5: more new partitions than one 4096-byte AddPartitionsToTxn holds are split across request slots, in the same
 // pass, each partition named once; every partition's data goes out once all are OK.
 TEST(ProducerTxnData, AddPartitionsSplitAcrossSlotsWhenOneFrameIsFull) {
@@ -1370,6 +1389,38 @@ TEST(ProducerTxnDataRegression, UnknownProducerIdOnTheHeadMakesTheTxnAbortableRe
     EXPECT_EQ(commit.code(), uec(rpc::ErrorCode::UnknownProducerId)) << "D6 review M2: the app-visible code is 28, not 20";
 }
 
+// #367: a partition leader answering 17 to a transactional batch fences the producer (Kafka: fatal), at once - not
+// an abortable error whose abort then runs into the same fence.
+TEST(ProducerTxnDataRegression, PartitionLeaderInvalidProducerEpochIsFatalFencedAtOnceRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    sendBatches(r, 1);
+    answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::InvalidProducerEpoch));
+    r.tick();
+    EXPECT_EQ(r.state(), TxnState::FatalError) << "17 from the partition leader fences the producer";
+    Op commit = r.commit();
+    r.tick();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Fenced);
+    EXPECT_EQ(r.last(rpc::EndTxn::TEMPLATE_ID), nullptr) << "no EndTxn leaves a fenced producer";
+}
+
+// #367: a partition leader answering 18 to a transactional batch fences the producer (Kafka: fatal), at once - not
+// an abortable error whose abort then runs into the same fence.
+TEST(ProducerTxnDataRegression, PartitionLeaderProducerFencedIsFatalFencedAtOnceRegression) {
+    Rig r;
+    r.initOk(77, 0);
+    sendBatches(r, 1);
+    answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::ProducerFenced));
+    r.tick();
+    EXPECT_EQ(r.state(), TxnState::FatalError) << "18 from the partition leader fences the producer";
+    Op commit = r.commit();
+    r.tick();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Fenced);
+    EXPECT_EQ(r.last(rpc::EndTxn::TEMPLATE_ID), nullptr) << "no EndTxn leaves a fenced producer";
+}
+
 // D6 review M2 (KIP-360), CHANGED on the unified producer: UnknownProducerId with lastAckedOffset < logStartOffset
 // (retention removed every record of ours) used to restart the partition's sequences at 0 and KEEP the transaction.
 // A transactional epoch belongs to the coordinator (Task 6), so the sequences cannot restart in place: the
@@ -1645,15 +1696,12 @@ TEST(ProducerTxnDataRegression, FlushFencedWhenTheProducerIsFenced) {
     answerWire(r, 0, static_cast<int16_t>(rpc::ErrorCode::ProducerFenced));
     r.tick();
     ASSERT_TRUE(flush.ready());
-    if (r.state() == TxnState::FatalError) {
-        EXPECT_EQ(flush.status(), OpStatus::Fenced);
-        Op again = r.flush();
-        r.tick();
-        ASSERT_TRUE(again.ready());
-        EXPECT_EQ(again.status(), OpStatus::Fenced);
-    } else {
-        EXPECT_NE(flush.status(), OpStatus::Ok) << "a fenced produce never counts as flushed";
-    }
+    ASSERT_EQ(r.state(), TxnState::FatalError);   // #367: a partition leader's 18 is fatal at once
+    EXPECT_EQ(flush.status(), OpStatus::Fenced);
+    Op again = r.flush();
+    r.tick();
+    ASSERT_TRUE(again.ready());
+    EXPECT_EQ(again.status(), OpStatus::Fenced);
     EXPECT_TRUE(commit.ready());
 }
 

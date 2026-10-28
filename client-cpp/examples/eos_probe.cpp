@@ -73,7 +73,9 @@ constexpr int         kTxnRecords  = 500;
 constexpr int         kAbortEvery  = 7;
 constexpr int         kPaths       = 5;
 constexpr int         kMaxParts    = 64;
-constexpr const char* kRejoinText  = "rebalancing (rejoin)";   // GroupConsumer::seekToCommittedAndWait's Rejoined text
+
+// #378: a Rejoined rewind is benign; the typed status tells it from Timeout / SessionLost / Closed (never the text).
+bool isRejoinError(const GroupOpError& e) noexcept { return e.status() == OpStatus::Rejoined; }
 
 int64_t valueOf(int64_t id) noexcept { return id * 7 + 3; }      // what fill writes
 int64_t transform(int64_t v) noexcept { return v * 2; }          // what the pipeline writes
@@ -221,10 +223,10 @@ int selfcheck() {
         const int64_t e1[1] = {10};
         expect(!allDone(&last, e1, 1, 1000) && allDone(&last, e1, 1, 16000), "in-doubt on the last batch terminates after the idle window");
     }
-    {   // N2: a Rejoined rewind is benign, every other failure is loud
-        expect(std::strstr("seekToCommitted() aborted: the group is rebalancing (rejoin)", kRejoinText) != nullptr, "the Rejoined text is recognised");
-        expect(std::strstr("seekToCommitted() timed out", kRejoinText) == nullptr, "a Timeout is not");
-        expect(std::strstr("seekToCommitted() aborted: the session to the broker was lost", kRejoinText) == nullptr, "SessionLost is not");
+    {   // N2: a Rejoined rewind is benign, every other failure is loud (#378: by the typed status)
+        expect(isRejoinError(GroupOpError(OpStatus::Rejoined, 0, "x")), "Rejoined is recognised");
+        expect(!isRejoinError(GroupOpError(OpStatus::Timeout, 0, "x")), "a Timeout is not");
+        expect(!isRejoinError(SessionLostError("x")), "SessionLost is not");
     }
     for (int p = 0; p < kPaths; ++p) expect(pathName(p) != nullptr, "path names");
     if (bad == 0) std::printf("EOS-SELFCHECK: OK\n");
@@ -492,8 +494,6 @@ private:
         return o;
     }
 
-    static bool isRejoin(const char* what) { return std::strstr(what, kRejoinText) != nullptr; }
-
     void rewindConsumer() {
         // Strict filter first: whatever the old fetches still push is dropped unless it is exactly the next offset.
         for (PartState& p : st_.part) beforeRewind(p);
@@ -501,8 +501,8 @@ private:
         st_.head = 0;
         try {
             gc_.seekToCommittedAndWait();
-        } catch (const std::runtime_error& ex) {
-            if (!isRejoin(ex.what())) throw;   // Timeout / SessionLost / Closed / ...: loud
+        } catch (const GroupOpError& ex) {
+            if (!isRejoinError(ex)) throw;   // Timeout / SessionLost / Closed / ...: loud
             // Rejoined: the rejoin re-seeds every position from the committed offsets itself and the rebalance
             // callbacks mark the partitions handed over for a new baseline: nothing left to do here.
         }
@@ -740,7 +740,6 @@ int main() {
             GroupConfig gcfg;
             gcfg.autoCommit       = false;            // the offsets travel in the transaction
             gcfg.sessionTimeoutMs = 10000;
-            gcfg.autoOffsetReset  = OffsetReset::Earliest;
             GroupConsumer gc = c.subscribeGroup(groupId, {"eos_in"}, gcfg);
             const auto reset = [&st](std::vector<TopicPartition> parts) { st.rebalance(parts); };
             gc.onAssigned(reset);

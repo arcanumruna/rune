@@ -866,7 +866,7 @@ TEST(ClientDdlRedirectRegression, GetViewRowNotLeaderIsRetriedInsideTheBudgetThe
 
 TEST(ClientDdlRedirectRegression, GetViewRowNotLeaderPastTheBudgetIsKNotLeaderNeverNotReadyRegression) {
     rc::ClientConfig cfg = invokerCfg(4454, 4455);
-    cfg.ddlRetryBudget = std::chrono::milliseconds(400);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(400);
     Rig r(cfg);
     r.connect();
     r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
@@ -882,4 +882,223 @@ TEST(ClientDdlRedirectRegression, GetViewRowNotLeaderPastTheBudgetIsKNotLeaderNe
     EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kNotLeader)
         << "the routing failure is the client-side kNotLeader (8), not NotReady (2) / SchemaMismatch (3)";
     EXPECT_LE(g_now - t0, int64_t{400'000'000} + int64_t{200'000'000}) << "within the budget + 200 ms";
+}
+
+TEST(ClientViewRowRegression, GetViewRowRetryBudgetIsNotTheDdlBudgetRegression) {
+    rc::ClientConfig cfg = invokerCfg(4812, 4813);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(50);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(1000);
+    Rig r(cfg);
+    r.connect();
+    int n = 0;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        if (n++ < 2) { r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId); return; }
+        answerViewRow(r, ep, *m, pc::ViewRowResponse::kAbsentKey, {});
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000));
+    EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kAbsentKey)
+        << "a read is retried for viewReadRetryBudget, not the (shorter) DDL budget";
+    EXPECT_EQ(n, 3);
+}
+
+TEST(ClientViewRowRegression, GetViewRowDeadlineIsNotTheDdlDeadlineRegression) {
+    rc::ClientConfig cfg = invokerCfg(4814, 4815);
+    cfg.ddlTimeoutMs = 100;
+    cfg.pingTimeoutMs = 2000;
+    Rig r(cfg);
+    r.connect();
+    int seenEp = -1;
+    std::optional<pc::GetViewRow> seen;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        seenEp = ep;
+        seen = *m;
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return g_now - t0 >= 500'000'000; }, /*stepNs=*/20'000'000));
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_FALSE(f.ready()) << "a read is not bounded by the DDL deadline";
+    answerViewRow(r, seenEp, *seen, pc::ViewRowResponse::kAbsentKey, {});
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000));
+    EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kAbsentKey);
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError) << "the OpStatus a non-OK view status carries (as in the kNotLeader test)";
+}
+
+// ---- Adversarial review of batch C9 (#76): a view read and a DDL each run on their own budget / deadline. ----
+
+// Both directions at once: a DDL and a GetViewRow refused NotLeader forever, in flight together.  The read ends on
+// the (short) viewReadRetryBudget while the DDL is still retrying; the DDL ends on its own (long) ddlRetryBudget.
+TEST(ClientViewRowRegression, GetViewRowAndADdlInFlightTogetherEachEndOnItsOwnBudgetAdversarialRegression) {
+    rc::ClientConfig cfg = invokerCfg(4870, 4871);
+    cfg.ddlRetryBudget      = std::chrono::milliseconds(1500);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(200);
+    Rig r(cfg);
+    r.connect();
+    int views = 0, ddls = 0;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        ++views;
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+    };
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        ++ddls;
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto d = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    auto v = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(d.accepted());
+    ASSERT_TRUE(v.accepted());
+    ASSERT_TRUE(r.drive([&] { return v.ready(); }, /*stepNs=*/10'000'000));
+    const int64_t viewEnd = g_now - t0;
+    EXPECT_EQ(v.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(v.getViewRowResult().status, rc::ViewRowResult::kNotLeader);
+    EXPECT_GE(viewEnd, int64_t{200'000'000}) << "not before the view-read budget";
+    EXPECT_LE(viewEnd, int64_t{200'000'000} + int64_t{150'000'000}) << "on the view-read budget, not the DDL one";
+    EXPECT_FALSE(d.ready()) << "the DDL is still inside its own 1500 ms budget: " << d.describe();
+    ASSERT_TRUE(r.drive([&] { return d.ready(); }, /*stepNs=*/10'000'000));
+    const int64_t ddlEnd = g_now - t0;
+    EXPECT_EQ(d.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(d.outcome().c.errorCode, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_GE(ddlEnd, int64_t{1'500'000'000}) << "the DDL is not cut short by the view-read budget";
+    EXPECT_LE(ddlEnd, int64_t{1'500'000'000} + int64_t{1'100'000'000});
+    EXPECT_GE(views, 2);
+    EXPECT_GT(ddls, views) << "the DDL kept retrying after the read ended";
+}
+
+// Bound 0: a zero view-read budget ends the read on its first NotLeader (one send), whatever the DDL budget is.
+TEST(ClientViewRowRegression, GetViewRowZeroRetryBudgetEndsOnTheFirstNotLeaderAdversarialRegression) {
+    rc::ClientConfig cfg = invokerCfg(4872, 4873);
+    cfg.ddlRetryBudget      = std::chrono::milliseconds(10'000);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(0);
+    Rig r(cfg);
+    r.connect();
+    int n = 0;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        ++n;
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000));
+    EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kNotLeader);
+    EXPECT_EQ(n, 1) << "no resend past a zero budget";
+}
+
+// Deadline, the reverse of GetViewRowDeadlineIsNotTheDdlDeadlineRegression: a read never answered ends at
+// pingTimeoutMs even when the DDL deadline is far longer.
+TEST(ClientViewRowRegression, GetViewRowNeverAnsweredEndsAtItsOwnDeadlineNotTheLongerDdlOneAdversarialRegression) {
+    rc::ClientConfig cfg = invokerCfg(4874, 4875);
+    cfg.ddlTimeoutMs  = 10'000;
+    cfg.pingTimeoutMs = 300;
+    Rig r(cfg);
+    r.connect();
+    int n = 0;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int, const uint8_t*, std::size_t) { ++n; };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::Timeout);
+    EXPECT_LE(g_now - t0, int64_t{300'000'000} + int64_t{100'000'000});
+    EXPECT_EQ(n, 1);
+}
+
+// Session loss (the resend pump's DdlSent branch, the second site of the fix): a read redirected to node A whose
+// session then dies unanswered is re-sent toward the seed; the seed now answers NotLeader forever.  The budget that
+// starts at the loss is viewReadRetryBudget (300 ms), not ddlRetryBudget (4 s).
+TEST(ClientViewRowRegression, GetViewRowSessionLostThenNotLeaderEndsOnTheViewReadBudgetAdversarialRegression) {
+    rc::ClientConfig cfg = invokerCfg(4876, 4877);
+    cfg.ddlRetryBudget      = std::chrono::milliseconds(4000);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(300);
+    cfg.pingTimeoutMs       = 8000;
+    Rig r(cfg);
+    r.gw.uniqueSessionIds = true;
+    const std::string aCh = udp(freePort());
+    const int a = r.gw.addNode(aCh, 4876);
+    r.connect();
+    struct Seen { int ep; int64_t sid; };
+    std::vector<Seen> at;
+    bool redirect = true;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        at.push_back(Seen{ep, m->sessionId});
+        if (ep == 0 && redirect) { r.answerError(ep, pc::ErrorCode::Redirect, aCh, m->sessionId, m->correlationId); return; }
+        if (ep == 0) r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+        // A never answers.
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(r.drive([&] { return at.size() == 2; }, /*stepNs=*/10'000'000));
+    ASSERT_EQ(at[1].ep, a);
+    redirect = false;
+    const int64_t lostAt = g_now;
+    r.gw.expireSession(at[1].sid);   // A's session dies with the read unanswered
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000));
+    const int64_t took = g_now - lostAt;
+    EXPECT_EQ(f.getViewRowResult().status, rc::ViewRowResult::kNotLeader) << f.describe();
+    EXPECT_LE(took, int64_t{300'000'000} + int64_t{1'200'000'000})
+        << "ended on the 300 ms view-read budget started at the loss, not the 4 s DDL budget";
+    EXPECT_GE(at.size(), 3u) << "re-sent toward the seed after the loss";
+}
+
+// Input bound: viewReadRetryBudget = max ("unbounded; let the deadline end it") must leave the read bounded by its
+// own deadline (Timeout at pingTimeoutMs), never overflow the ms -> ns conversion into an immediate failure.
+TEST(ClientViewRowRegression, GetViewRowMaxRetryBudgetIsBoundedByTheReadDeadlineAdversarialRegression) {
+    rc::ClientConfig cfg = invokerCfg(4878, 4879);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds::max();
+    cfg.pingTimeoutMs       = 500;
+    Rig r(cfg);
+    r.connect();
+    int n = 0;
+    r.gw.templateHandlers[pc::GetViewRow::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::GetViewRow::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        ++n;
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getViewRow(0x40000007, 101, 0, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000));
+    EXPECT_GE(n, 2) << "retried: a max budget is not an exhausted one";
+    EXPECT_GE(g_now - t0, int64_t{400'000'000}) << "ran to the read's own deadline: " << f.describe();
+}
+
+// The DDL sibling of the bound above (same conversion, same overflow).
+TEST(ClientViewRowRegression, DdlMaxRetryBudgetIsBoundedByTheDdlDeadlineAdversarialRegression) {
+    rc::ClientConfig cfg = invokerCfg(4880, 4881);
+    cfg.ddlRetryBudget = std::chrono::milliseconds::max();
+    cfg.ddlTimeoutMs   = 500;
+    Rig r(cfg);
+    r.connect();
+    int n = 0;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        ++n;
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000));
+    EXPECT_GE(n, 2) << "retried: a max budget is not an exhausted one";
+    EXPECT_GE(g_now - t0, int64_t{400'000'000}) << "ran to the DDL's own deadline: " << f.describe();
 }

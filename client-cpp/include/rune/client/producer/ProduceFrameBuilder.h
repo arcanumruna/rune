@@ -190,13 +190,15 @@ public:
         recordCount_  = 0;
         maxTimestamp_ = baseTimestamp_;
     }
-    /// detachStorageKeepingRecords: the builder keeps its records (copied into
-    /// fresh storage first: a cold close path, it allocates).  May throw
-    /// bad_alloc; then nothing changed.
-    void detachStorageKeepingRecords(FrameBytes& quarantine) {
-        FrameBytes kept(frame_.begin(), frame_.end());
-        frame_.swap(quarantine);  // quarantine: the caller's storage
-        frame_.swap(kept);        // the builder: its records, in fresh storage
+    /// detachStorageKeepingRecords: the builder keeps the records before the claim (copied into
+    /// fresh storage first: a cold close path, it allocates).  `keep` is the claim's mark.  May
+    /// throw bad_alloc; then nothing changed.
+    void detachStorageKeepingRecords(FrameBytes& quarantine, const Mark& keep) {
+        FrameBytes kept(frame_.begin(), frame_.begin() + static_cast<std::ptrdiff_t>(keep.size));
+        frame_.swap(quarantine);  // quarantine: the caller's storage, full size (covers the claimed span)
+        frame_.swap(kept);        // the builder: the records before the claim, in fresh storage
+        recordCount_  = keep.recordCount;
+        maxTimestamp_ = keep.maxTimestamp;
     }
 
 private:

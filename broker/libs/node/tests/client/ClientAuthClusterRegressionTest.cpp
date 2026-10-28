@@ -413,7 +413,6 @@ TEST(ClientAuthClusterRegression, EosPipelineSurvivesTheCoordinatorCrashOnAnAuth
     ASSERT_TRUE(cl);
     rc::GroupConfig gcfg;
     gcfg.autoCommit       = false;
-    gcfg.autoOffsetReset  = rc::OffsetReset::Earliest;
     gcfg.isolation        = rc::IsolationLevel::ReadCommitted;
     gcfg.sessionTimeoutMs = 10'000;   // eos_probe's
     rc::GroupConsumer gc = cl->subscribeGroup("eos-auth-g", {"eos.in"}, gcfg);

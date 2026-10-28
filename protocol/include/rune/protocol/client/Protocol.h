@@ -356,7 +356,11 @@ inline constexpr int32_t kClientVersionTxnVerify                  = 13;  // prod
 //   NamespaceLimitExceeded, Throttled, ViewPaused).  A session below 14 is answered InvalidRequest (39) for 81-83 and
 //   never sent 51-54.  Broker 8 announces it.
 inline constexpr int32_t kClientVersionNamespaces                 = 14;
-inline constexpr int32_t kClientVersion                           = 14;  // what this protocol's client announces
+// 15 — issue #450: a SubscribeResponse may carry RecordEgressUnavailable (49); the client retries it within a small
+// budget, then ends the subscription / group consumer explicitly.  A broker answers a session below 15 NotAuthorized
+// instead: every older client ends a subscription or group fetch on it (never parks it).
+inline constexpr int32_t kClientVersionRecordEgressUnavailable      = 15;  // understands SubscribeResponse 49 (#450)
+inline constexpr int32_t kClientVersion                           = 15;  // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -450,6 +454,13 @@ inline constexpr int32_t kBrokerVersion                           = 8;   // what
 /// (version 9): templates 12-15, 79, 80 and codes 44-47.
 [[nodiscard]] constexpr bool clientUnderstandsAuth(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionAuth;
+}
+
+/// True when a session that connected with `clientVersion` may be answered RecordEgressUnavailable (49) on a
+/// SubscribeResponse (issue #450, see version 14); below it the broker answers NotAuthorized.  A negative version
+/// (unknown: rigs) is treated as current.
+[[nodiscard]] constexpr bool clientUnderstandsRecordEgressUnavailable(int32_t clientVersion) noexcept {
+    return clientVersion < 0 || clientVersion >= kClientVersionRecordEgressUnavailable;
 }
 
 /// True when a session that connected with `clientVersion` may be answered UnstableOffsetCommit (50) (version 10);

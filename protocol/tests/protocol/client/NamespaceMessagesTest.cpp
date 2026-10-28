@@ -218,7 +218,7 @@ TEST(NamespaceMessagesRegression, TemplateDispatchRegression) {
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::ListNamespaces), 82);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::ListNamespacesResponse), 83);
     EXPECT_EQ(pc::kProtocolVersion, 3);
-    EXPECT_EQ(pc::kClientVersion, 14);
+    EXPECT_EQ(pc::kClientVersion, 15);   // v15: RecordEgressUnavailable (#450)
     EXPECT_EQ(pc::kClientVersionNamespaces, 14);
     EXPECT_EQ(pc::kBrokerVersion, 8);
 }

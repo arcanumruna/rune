@@ -9,6 +9,8 @@
 
 #include <rune/client/group/GroupConsumer.h>
 
+#include <concurrent/BackOffIdleStrategy.h>
+
 #include <algorithm>
 
 #include <cassert>
@@ -183,7 +185,7 @@ OpResult GroupConsumer::issueCommitSync_(void* self, const CompletionTarget& tar
 
 void GroupConsumer::commitSyncAndWait(std::chrono::nanoseconds timeout) {
     if (!impl_ || waitSink_ == nullptr || impl_->status.closed() || (!onDutyThread_() && closed_)) {
-        throw std::runtime_error("commitSync(): GroupConsumer closed");
+        throw GroupOpError(OpStatus::Closed, 0, "commitSync(): GroupConsumer closed");
     }
     std::string text;
     const Completion c = waitSink_(sinkCtx_, "commitSync()", timeout, &GroupConsumer::issueCommitSync_, this, &text);
@@ -193,19 +195,21 @@ void GroupConsumer::commitSyncAndWait(std::chrono::nanoseconds timeout) {
     case OpStatus::SessionLost:
         throw SessionLostError("commitSync() aborted: the session to the broker was lost");
     case OpStatus::BrokerError:
-        throw std::runtime_error("commitSync() failed: OffsetCommit errorCode " + std::to_string(c.errorCode));
+        throw GroupOpError(OpStatus::BrokerError, c.errorCode,
+                           "commitSync() failed: OffsetCommit errorCode " + std::to_string(c.errorCode));
     case OpStatus::Superseded:
-        throw std::runtime_error("commitSync() superseded by a newer call");
+        throw GroupOpError(OpStatus::Superseded, 0, "commitSync() superseded by a newer call");
     case OpStatus::Rejoined:
-        throw std::runtime_error("commitSync() aborted: the group is rebalancing (rejoin)");
+        throw GroupOpError(OpStatus::Rejoined, 0, "commitSync() aborted: the group is rebalancing (rejoin)");
     case OpStatus::Timeout:
-        throw std::runtime_error("commitSync() timed out");
+        throw GroupOpError(OpStatus::Timeout, 0, "commitSync() timed out");
     case OpStatus::NotConnected:
-        throw std::runtime_error("commitSync() failed: the OffsetCommit frame can never be sent");
+        throw GroupOpError(OpStatus::NotConnected, 0, "commitSync() failed: the OffsetCommit frame can never be sent");
     case OpStatus::Closed:
-        throw std::runtime_error("commitSync(): GroupConsumer closed");
+        throw GroupOpError(OpStatus::Closed, 0, "commitSync(): GroupConsumer closed");
     default:
-        throw std::runtime_error("commitSync() failed (status " + std::to_string(static_cast<int>(c.status)) + ")");
+        throw GroupOpError(c.status, c.status == OpStatus::BrokerError ? c.errorCode : uint16_t{0},
+                           "commitSync() failed (status " + std::to_string(static_cast<int>(c.status)) + ")");
     }
 }
 
@@ -234,25 +238,25 @@ namespace {
     case OpStatus::InvalidArgument:
         throw std::invalid_argument(std::string(what) + " failed: " + text);
     case OpStatus::Superseded:
-        throw std::runtime_error(std::string(what) + " superseded by a newer rewind");
+        throw GroupOpError(OpStatus::Superseded, 0, std::string(what) + " superseded by a newer rewind");
     case OpStatus::Rejoined:
-        throw std::runtime_error(std::string(what) + " aborted: the group is rebalancing (rejoin)");
+        throw GroupOpError(OpStatus::Rejoined, 0, std::string(what) + " aborted: the group is rebalancing (rejoin)");
     case OpStatus::SessionLost:
         throw SessionLostError(std::string(what) + " aborted: the session to the broker was lost");
     case OpStatus::Timeout:
-        throw std::runtime_error(std::string(what) + " timed out");
+        throw GroupOpError(OpStatus::Timeout, 0, std::string(what) + " timed out");
     case OpStatus::Closed:
-        throw std::runtime_error(std::string(what) + ": GroupConsumer closed");
+        throw GroupOpError(OpStatus::Closed, 0, std::string(what) + ": GroupConsumer closed");
     default:
-        throw std::runtime_error(std::string(what) + " failed (status " +
-                                 std::to_string(static_cast<int>(c.status)) + ")");
+        throw GroupOpError(c.status, c.status == OpStatus::BrokerError ? c.errorCode : uint16_t{0},
+                           std::string(what) + " failed (status " + std::to_string(static_cast<int>(c.status)) + ")");
     }
 }
 } // namespace
 
 void GroupConsumer::seekToCommittedAndWait(std::chrono::nanoseconds timeout) {
     if (!impl_ || waitSink_ == nullptr || impl_->status.closed() || (!onDutyThread_() && closed_)) {
-        throw std::runtime_error("seekToCommitted(): GroupConsumer closed");
+        throw GroupOpError(OpStatus::Closed, 0, "seekToCommitted(): GroupConsumer closed");
     }
     std::string text;
     const Completion c = waitSink_(sinkCtx_, "seekToCommitted()", timeout, &GroupConsumer::issueSeekToCommitted_,
@@ -289,6 +293,9 @@ void GroupConsumer::seek(TopicPartition tp, int64_t offset) {
     static constexpr CompletionHandler kDrop{
         [](void*, const Completion&, std::span<const uint8_t>) noexcept {}, nullptr};
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    // C3 review: wait for the duty thread to drain the ring under a back-off (as andWait_ does), never a bare spin.
+    aeron::concurrent::BackoffIdleStrategy backoff(
+        10, 20, std::chrono::duration<long, std::nano>(1'000), std::chrono::duration<long, std::nano>(100'000));
     for (;;) {
         switch (seek(tp, offset, CompletionTarget(kDrop), Token{0})) {
         case OpResult::Accepted:
@@ -297,7 +304,7 @@ void GroupConsumer::seek(TopicPartition tp, int64_t offset) {
             if (std::chrono::steady_clock::now() >= deadline) {
                 throw std::runtime_error("seek(): not delivered, the command ring stayed full (BackPressured)");
             }
-            std::this_thread::yield();   // the duty thread drains the ring
+            backoff.idle(0);   // the duty thread drains the ring
             continue;
         case OpResult::Closed:
             throw std::runtime_error("seek(): GroupConsumer closed (Closed)");
@@ -312,7 +319,7 @@ void GroupConsumer::seek(TopicPartition tp, int64_t offset) {
 
 void GroupConsumer::seekAndWait(TopicPartition tp, int64_t offset, std::chrono::nanoseconds timeout) {
     if (!impl_ || waitSink_ == nullptr || impl_->status.closed() || (!onDutyThread_() && closed_)) {
-        throw std::runtime_error("seek(): GroupConsumer closed");
+        throw GroupOpError(OpStatus::Closed, 0, "seek(): GroupConsumer closed");
     }
     SeekIssue si{this, tp, offset};
     std::string text;

@@ -130,6 +130,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationOnSyncGroupResponse)
     impl->generationId = 1;
     impl->state     = GroupConsumerState::Syncing; // ready to receive SyncGroupResponse
     impl->active = true;
+    impl->ctlCorrId = GroupConsumerHub::kGroupCtlCorrTag | 1;   // #431: the SyncGroup this answers
     impl->joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
     hub.add(impl.get());
@@ -144,7 +145,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationOnSyncGroupResponse)
     // Build a SyncGroupResponse assigning partition (topicId=42, partition=0).
     rpc::SyncGroupResponse syncResp;
     syncResp.sessionId     = kSessionId;
-    syncResp.correlationId = 0;
+    syncResp.correlationId = impl->ctlCorrId;
     syncResp.errorCode     = 0; // OK
 
     rpc::TopicPartition32 asgn;
@@ -215,6 +216,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
     impl->generationId = 1;
     impl->state      = GroupConsumerState::Syncing;
     impl->active = true;
+    impl->ctlCorrId = GroupConsumerHub::kGroupCtlCorrTag | 1;   // #431: the SyncGroup this answers
     impl->joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
     hub.add(impl.get());
@@ -227,7 +229,7 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
 
     rpc::SyncGroupResponse syncResp;
     syncResp.sessionId     = kSessionId;
-    syncResp.correlationId = 0;
+    syncResp.correlationId = impl->ctlCorrId;
     syncResp.errorCode     = 0;
 
     rpc::TopicPartition32 asgn;

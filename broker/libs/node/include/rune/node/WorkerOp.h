@@ -307,6 +307,11 @@ struct WorkerOp {
     bool    c2bKeyValid       = false;
     uint8_t c2bKeyPrefix[4]   = {};     ///< 4-byte AEAD nonce prefix (the session's c2bPrefix)
     uint8_t c2bKey[32]        = {};     ///< the session's c2b ingress key (raw: legacy; per-worker: issue #116)
+    // The FIRST (parked) wave of an encrypted session: the real keys follow in a second wave.  A worker HOLDS
+    // (controlled-poll ABORT, redelivered) an encrypted produce that arrives before them instead of dropping it -
+    // a derivation failure on the second wave is not pending and still drops.  Wire: bit kOpFlagKeyPending of the
+    // `deferAck` flag byte (SessionAnnounce only).
+    bool    keyPending        = false;
 
     // SetOwnership: the ReplicaRegistry generation this owned set reflects
     // (acked back as WorkerReturn::OwnershipAck).  Task 10 fix 3.
@@ -672,6 +677,7 @@ inline constexpr uint8_t kOpFlagDeferAck     = 0x01;   ///< WorkerOp::deferAck (
 inline constexpr uint8_t kOpFlagCrcValidated = 0x02;   ///< WorkerOp::crcValidated (Produce only)
 inline constexpr uint8_t kOpFlagGrantAll     = 0x08;   ///< WorkerOp::grantAll (SessionAnnounce only; authentication Task 13)
 inline constexpr uint8_t kOpFlagFreshCursor  = 0x04;   ///< WorkerOp::freshCursor (PushRead only; E2 M2)
+inline constexpr uint8_t kOpFlagKeyPending   = 0x10;   ///< WorkerOp::keyPending (SessionAnnounce only)
 
 // ---------------------------------------------------------------------------
 // workerOpFrameBytes — the encoded size of one WorkerOp ring frame carrying a

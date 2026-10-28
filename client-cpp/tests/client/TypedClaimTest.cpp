@@ -233,6 +233,70 @@ TEST(TypedClaimRegression, OverlongStringKeyThrowsAndClaimsNothingRegression) {
     EXPECT_EQ(back.v, 5);
 }
 
+// #330: for N > Key::kMaxInline the field is zero-padded, so "abc" and "abc\0" write the same field and must
+// carry the same record key and route the same.
+TEST(TypedClaimRegression, TrailingNulKeyRoutesLikeTheUnpaddedKeyRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+    TypedTopic<LongKey> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+    for (const std::string_view k : {std::string_view("abc"), std::string_view("abc\0", 4)}) {
+        auto w = topic.claim(k);
+        ASSERT_TRUE(w);
+        w.v(7);
+        ASSERT_TRUE(w.commit());
+    }
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    ASSERT_EQ(cap.recs.size(), 2u);
+    EXPECT_EQ(cap.recs[0].key, "abc");
+    EXPECT_EQ(cap.recs[1].key, cap.recs[0].key) << "trailing NULs are not part of the record key";
+    EXPECT_EQ(cap.recs[1].partition, cap.recs[0].partition);
+}
+
+// C1 adversarial review (#330): the NUL-strip edges for N > 16 - an all-NUL key is the empty key, a 16-byte
+// key ending in NUL loses only the trailing NUL, an embedded NUL is kept, and N <= 16 is untouched.
+TEST(TypedClaimRegression, NulStripEdgesForLongStringKeysAdversarialRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+    TypedTopic<LongKey> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+    const std::string k16nul = std::string(15, 'q') + std::string(1, '\0');
+    const std::vector<std::string_view> keys = {
+        std::string_view("\0\0\0", 3), std::string_view(""), std::string_view(k16nul),
+        std::string_view("a\0b", 3), std::string_view("a\0b\0\0", 5)};
+    for (const std::string_view k : keys) {
+        auto w = topic.claim(k);
+        ASSERT_TRUE(w);
+        w.v(1);
+        ASSERT_TRUE(w.commit());
+    }
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    ASSERT_EQ(cap.recs.size(), keys.size());
+    EXPECT_EQ(cap.recs[0].key, "") << "an all-NUL key is the empty key";
+    EXPECT_EQ(cap.recs[1].key, cap.recs[0].key);
+    EXPECT_EQ(cap.recs[1].partition, cap.recs[0].partition);
+    EXPECT_EQ(cap.recs[2].key, std::string(15, 'q')) << "only the trailing NUL goes";
+    EXPECT_EQ(cap.recs[3].key, std::string("a\0b", 3)) << "an embedded NUL is part of the key";
+    EXPECT_EQ(cap.recs[4].key, cap.recs[3].key);
+    EXPECT_EQ(cap.recs[4].partition, cap.recs[3].partition);
+}
+
+TEST(TypedClaimRegression, ShortStringKeyKeepsItsZeroPaddingAdversarialRegression) {
+    auto* impl = new ProducerImpl(voidCfg(), 1 << 20);
+    TypedTopic<ShortKey> topic{Producer{impl}, TopicHandle{1, 8}, uint16_t{1}};
+    for (const std::string_view k : {std::string_view("ab"), std::string_view("ab\0", 3)}) {
+        auto w = topic.claim(k);
+        ASSERT_TRUE(w);
+        ASSERT_TRUE(w.commit());
+    }
+    FrameCapture cap;
+    pump(*impl, cap.fn());
+    ASSERT_EQ(cap.recs.size(), 2u);
+    ShortKey rec{};
+    std::memcpy(rec.code.data(), "ab", 2);
+    const std::string field(rec.code.data(), rec.code.size());
+    EXPECT_EQ(cap.recs[0].key, field) << "N <= 16: the record key is the whole zero-padded field";
+    EXPECT_EQ(cap.recs[1].key, field);
+}
+
 // string(N <= 16) key: claim(std::string_view) must equal send(rec) byte for byte.
 TEST(TypedClaim, StringKeyClaimMatchesSendForShortKeys) {
     auto* impl = new ProducerImpl(voidCfg(), 1 << 20);

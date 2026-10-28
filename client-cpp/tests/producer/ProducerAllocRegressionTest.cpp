@@ -286,7 +286,7 @@ struct TxnAllocRig {
         return rp::CoordinatorSink::Offer::Accepted;
     }
     static int64_t session(void*) noexcept { return 77; }
-    static void    rediscover(void*) noexcept {}
+    static bool    rediscover(void*) noexcept { return true; }
 
     static int64_t nowNs() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(

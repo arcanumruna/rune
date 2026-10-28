@@ -32,6 +32,8 @@
 //   - send() with 0 records → throws std::invalid_argument ("BatchBuilder: empty batch").
 //   - BatchBuilder destroyed without send() → nothing produced; its pool slot goes back to the
 //     producer (so it must be destroyed on the batch thread, before the Producer).
+//     Thread mode: a builder destroyed elsewhere hands its slot back through the producer ring;
+//     Direct (Invoker) mode loses the slot and logs an error.
 //     (Tier-3 RAII auto-abort of uncommitted txns is Milestone C; Tier-2 has
 //      no transaction, so an unsent builder simply does nothing.)
 //

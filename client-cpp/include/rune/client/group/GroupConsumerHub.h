@@ -53,6 +53,10 @@ public:
     /// #438: a commitSync answered UnstableOffsetCommit is re-sent after this backoff (doubling, capped).
     static constexpr int64_t  kCommitRetryMinNs = 20'000'000;
     static constexpr int64_t  kCommitRetryMaxNs = 1'000'000'000;
+    /// C4 review (#607): consecutive Heartbeats answered AuthUnavailable (48) the member rides out while Stable.
+    /// Heartbeats go every sessionTimeout / 3, so 3 in a row span one session timeout - past that the coordinator
+    /// may have evicted the member, so it rejoins (paced, through rejoinWithBackoff_) instead of consuming on.
+    static constexpr uint32_t kMaxHeartbeatAuthUnavailable = 3;
     GroupConsumerHub() = default;
 
     // Non-copyable / non-movable.
@@ -273,6 +277,9 @@ public:
         /// Rejected, else 0 (optional).  A fetch it would carry can never be
         /// sent: the consumer is refused with that code at once.
         int16_t (*rejectCode)(void* ctx, uint32_t session) = nullptr;
+        /// #440: the highest broker version a session of this client announces while it is Connected NOW (0 = none
+        /// connected).  Optional; nullptr = the hub's setConnectedMaxBrokerVersion value.
+        int32_t (*maxConnectedBrokerVersion)(void* ctx) = nullptr;
     };
     void setFetchRouter(const FetchRouter& r) noexcept { router_ = r; }
 
@@ -283,6 +290,11 @@ public:
     static constexpr int64_t kFetchCorrTag = int64_t{1} << 61;
 
     static constexpr int64_t  kOffsetFetchCorrTag      = int64_t{1} << 60;
+    // #431: JoinGroup / SyncGroup / Heartbeat: bit 57 | ctlId << 32 | per-consumer seq
+    static constexpr int64_t  kGroupCtlCorrTag         = int64_t{1} << 57;
+    [[nodiscard]] static constexpr bool isGroupCtlCorrId(int64_t c) noexcept {
+        return c > 0 && (c & (int64_t{0x3F} << 57)) == kGroupCtlCorrTag;
+    }
     [[nodiscard]] static constexpr bool isFetchCorrId(int64_t c) noexcept {
         return c > 0 && (c & (int64_t{3} << 61)) == kFetchCorrTag;
     }
@@ -293,6 +305,10 @@ public:
     /// stream) this many times since its last bind ends the consumer explicitly (RetryBudgetExhausted).  Only that
     /// cause counts: NotLeader / Redirect (a failover, however long) re-route without a bound, as before.
     static constexpr uint8_t kMaxEgressRefusalsWithoutBind = 8;
+    /// C4 review (#607): a partition fetch answered AuthUnavailable (48: the leader's security state is catching up)
+    /// this many times since its last bind ends the consumer explicitly (RetryBudgetExhausted).  Its own counter -
+    /// never charged to, or reset by, a routing refusal.  Each retry is paced by a metadata refresh.
+    static constexpr uint8_t kMaxFetchAuthUnavailableWithoutBind = 8;
 
     /// Bring every Stable consumer's subscriptions in line with the current
     /// leaders and sessions (cold: group / routing events).  Also re-offers
@@ -342,6 +358,12 @@ public:
     /// otherwise onConnected / joinIfConnected finish it (GroupFailReason::
     /// BrokerTooOld).  Hub-level tests (no broker) keep the default (current).
     void setBrokerVersion(int32_t v) noexcept { brokerVersion_ = v; }
+    /// #440: a coordinator below the version a consumer needs DEFERS its join while some CONNECTED session announces
+    /// enough (a rolling upgrade in flight), and refuses it (BrokerTooOld) once none does — decided by the live
+    /// sessions, re-checked on every connect edge and every duty cycle while a join is deferred (no timer).  The
+    /// Client's router answers it (FetchRouter::maxConnectedBrokerVersion); a hub without one (hub-level tests) uses
+    /// this value: the highest version the connected sessions announce now (not sticky).
+    void setConnectedMaxBrokerVersion(int32_t v) noexcept { connectedMaxBrokerVersion_ = v; }
 
     /// MEDIUM-7: a consumer adopted while the session is already Connected joins
     /// now (onConnected already ran).  No-op otherwise.
@@ -407,6 +429,19 @@ private:
     void*        directSendCtx_ = nullptr;
 
     int32_t brokerVersion_ = rune::protocol::client::kBrokerVersion;
+    int32_t connectedMaxBrokerVersion_ = 0;   // #440: router-less hubs only (see setConnectedMaxBrokerVersion)
+    bool    anyJoinDeferred_ = false;         // #440: some consumer's join is deferred — re-checked every doWork
+    /// #440: the highest version a Connected session announces now (the coordinator's own included).
+    [[nodiscard]] int32_t liveMaxBrokerVersion_() const noexcept;
+    /// #440: every deferred join re-checked against the live sessions: Refuse ends it (BrokerTooOld).
+    void recheckDeferredJoins_();
+    /// #440: what the coordinator's version allows for `impl`: join now, wait for a coordinator move / reconnect, or end.
+    enum class JoinGate : uint8_t { Ok, Defer, Refuse };
+    [[nodiscard]] JoinGate joinGate_(const GroupConsumerImpl& impl) const noexcept;
+    /// Applies joinGate_ (Refuse ends the consumer, Defer logs once per episode); true = may join now.
+    bool gateAllows_(GroupConsumerImpl& impl);
+    /// gateAllows_, then sendJoinGroup.  Returns whether a JoinGroup was sent.
+    bool tryJoin_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn);
     void refuse_(GroupConsumerImpl& impl, GroupFailReason why);
     bool filterNeedsRouting_(GroupConsumerImpl& impl);   // Phase 2c: refuses (FilterMismatch) a filtered group on a non-routed hub
 
@@ -507,6 +542,10 @@ private:
     static constexpr uint32_t kMaxOffsetFetchRejoins   = 8;
     /// I2: OffsetFetch correlationIds (bit 60 tag; disjoint from fetch ids).
     int64_t nextOffsetFetchCorr_ = 1;
+    /// #431: the last hub-unique control id handed to a consumer (24 bits used, never 0).
+    uint32_t nextCtlId_ = 0;
+    /// #431: the next control correlation id of `impl` (bumps its sequence, skipping 0 on wrap).
+    [[nodiscard]] static int64_t nextCtlCorr_(GroupConsumerImpl& impl) noexcept;
     void publishGeneration_(GroupConsumerImpl& impl);
     /// The status snapshot of `impl` (generation, `reserved`, member id: #125).
     static GroupConsumerStatus statusOf_(const GroupConsumerImpl& impl, int32_t reserved) noexcept;
