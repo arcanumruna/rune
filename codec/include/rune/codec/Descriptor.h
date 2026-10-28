@@ -127,6 +127,24 @@ public:
         return *this;
     }
 
+    /// Decode/replay ONLY (deserialize): accepts a width-0 FixedStr from a historical event, which was legal when it
+    /// was written (#667).  Authoring paths use addFixedStr / addFixedStrTagged, which refuse it.
+    DescriptorBuilder& addDecodedFixedStrTagged(std::string name, uint16_t tag, uint16_t len,
+                                                uint16_t sinceVersion, uint16_t untilVersion,
+                                                bool isKey) {
+        FieldDescriptor f;
+        f.name         = std::move(name);
+        f.id           = tag;
+        f.type         = PrimType::FixedStr;
+        f.fixedLen     = len;
+        f.offset       = 0;
+        f.sinceVersion = sinceVersion;
+        f.untilVersion = untilVersion;
+        f.isKey        = isKey;
+        fields_.push_back(std::move(f));
+        return *this;
+    }
+
     Descriptor build() {
         Descriptor d;
         d.name    = name_;
@@ -186,5 +204,14 @@ private:
     uint16_t                  version_;
     std::vector<FieldDescriptor> fields_;
 };
+
+/// The first FixedStr field of width 0, or nullptr.  A width-0 FixedStr is legal on replay (historical events) and
+/// refused at DDL admission (#667): admission paths call this after deserialize.
+[[nodiscard]] inline const FieldDescriptor* zeroWidthFixedStr(const Descriptor& d) noexcept {
+    for (const auto& f : d.fields) {
+        if (f.type == PrimType::FixedStr && f.fixedLen == 0) return &f;
+    }
+    return nullptr;
+}
 
 } // namespace rune::codec

@@ -42,17 +42,16 @@ TEST(ViewRow, VarLenColumnRejected) {
     EXPECT_THROW(buildRowLayout(d), std::invalid_argument);
 }
 
-// #667: a descriptor that bypasses the builder (hand-assembled fields) still never yields a zero-width slot.
-TEST(ViewRowRegression, BuildRowLayoutRefusesAZeroWidthFixedStrRegression) {
+// #667: a view defined before the zero-width refusal holds a width-0 FixedStr output column; its layout is rebuilt
+// on boot/replay (WorkerViewSet), so buildRowLayout accepts it.  New definitions are refused at admission
+// (compileView), not here.
+TEST(ViewRowRegression, AHistoricalZeroWidthViewReplaysOnBootAdversarialRegression) {
     auto d = DescriptorBuilder("v",1).add("id",PrimType::Int64,1,true).addFixedStr("code",4).build();
-    EXPECT_NO_THROW(buildRowLayout(d));
-    d.fields[1].fixedLen = 0;
-    try {
-        buildRowLayout(d);
-        FAIL() << "a zero-width FixedStr produced a layout";
-    } catch (const std::invalid_argument& e) {
-        EXPECT_NE(std::string(e.what()).find("FixedStr column 'code' has width 0"), std::string::npos);
-    }
+    d.fields[1].fixedLen = 0;   // as a pre-fix broker stored it
+    RowLayout l;
+    ASSERT_NO_THROW(l = buildRowLayout(d));
+    EXPECT_EQ(l.slotWidth.size(), 2u);
+    EXPECT_EQ(l.slotWidth[1], 0u);
 }
 
 TEST(ViewRow, SlotValueCodecRoundTripsEveryFixedType) {

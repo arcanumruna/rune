@@ -65,19 +65,16 @@ TEST(DescriptorBuilderRegression, FixedStrOfWidthZeroIsRefusedRegression) {
 // The decoder reports a zero-width FixedStr like every other malformed field (std::runtime_error), never the
 // builder's invalid_argument.  The FixedStr is the LAST field, so its fixedLen (u16 LE) sits just before the
 // trailing untilVersion (u16 LE) of the RCD2 blob.
-TEST(DescriptorBuilderRegression, DecodingAZeroWidthFixedStrFailsCleanlyRegression) {
+TEST(DescriptorBuilderRegression, DecodingAHistoricalZeroWidthFixedStrSucceedsRegression) {
     std::vector<uint8_t> blob = serialize(mk(8));
     ASSERT_GE(blob.size(), 4u);
     ASSERT_EQ(blob[blob.size() - 4], 8u);
     ASSERT_EQ(blob[blob.size() - 3], 0u);
     blob[blob.size() - 4] = 0;
-    EXPECT_THROW(deserialize(blob), std::runtime_error);
-    try {
-        (void)deserialize(blob);
-        FAIL() << "decoded";
-    } catch (const std::invalid_argument&) {
-        FAIL() << "must be the decoder's own runtime_error";
-    } catch (const std::runtime_error& e) {
-        EXPECT_NE(std::string(e.what()).find("zero width"), std::string::npos);
-    }
+    Descriptor d;
+    ASSERT_NO_THROW(d = deserialize(blob));   // legal when written (#667): replay must accept it
+    const FieldDescriptor* zf = zeroWidthFixedStr(d);
+    ASSERT_NE(zf, nullptr);
+    EXPECT_EQ(zf->fixedLen, 0u);
+    EXPECT_EQ(zeroWidthFixedStr(deserialize(serialize(mk(8)))), nullptr);
 }

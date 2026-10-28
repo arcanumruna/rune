@@ -20,10 +20,8 @@ RowLayout buildRowLayout(const Descriptor& outDesc) {
                 "rune::view::buildRowLayout: var-len column '" + f.name +
                 "' not supported in Phase 1 (fixed-width columns only)");
         }
-        if (f.type == PrimType::FixedStr && f.fixedLen == 0) {
-            throw std::invalid_argument(
-                "rune::view::buildRowLayout: FixedStr column '" + f.name + "' has width 0");
-        }
+        // A width-0 FixedStr is accepted here on purpose: a view defined before #667 holds one and must rebuild its
+        // layout on boot/replay.  New definitions are refused at admission (compileView's builder).
     }
 
     RowLayout layout;
