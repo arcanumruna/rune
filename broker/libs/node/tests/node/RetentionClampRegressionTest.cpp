@@ -69,6 +69,7 @@ public:
 
 constexpr uint16_t kSlot = 3;
 constexpr uint32_t kNs   = 77;
+constexpr int64_t  kNowMs = 1'700'000'000'000LL;   // a fixed epoch-ms "now" (2023): the 1970 records are old, deterministically
 constexpr int64_t  kHuge = 10'000'000'000'000LL;   // ~316 years of ms: far beyond "now" for the 1970 records
 
 /// [slot:u16][pad:u16][nsId:u32][maxRetentionMs:u64][maxRetentionBytes:u64] - the kNsLimitMsgType layout.
@@ -121,13 +122,15 @@ struct Rig {
     }
     ~Rig() { std::error_code ec; fs::remove_all(dir, ec); }
 
-    /// Bounded, monotonic clock across calls: the cleaner proposes, the owner (runtime agent) renames *.deleted.
+    /// `n` retention passes at a FIXED epoch-ms "now" (the cleaner's own cadence reads the wall clock, which would make the
+    /// number of passes depend on elapsed real time); the owner (runtime agent) then renames *.deleted.
     void cycles(rune::node::LogCleanerAgent& cleaner, int n) {
         NoConsensus none;
         rune::node::NodeRuntimeAgent duty(none, nullptr, nullptr, nullptr, &reg, nullptr);
         for (int i = 0; i < n; ++i) {
             ++clockMs;
-            cleaner.doWork(clockMs * 1'000'000LL);
+            cleaner.doWork(clockMs * 1'000'000LL);   // the cycle's housekeeping (staging renames, sealed snapshot)
+            cleaner.runRetentionForTest(kNowMs);
             duty.doWork(clockMs * 1'000'000LL);
         }
     }

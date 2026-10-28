@@ -242,6 +242,8 @@ public:
         ++policyUpdates_;
         return true;
     }
+    /// Test seam (cleaner thread): one retention pass at the given epoch-ms, whatever the wall clock and the cadence say.
+    void runRetentionForTest(int64_t nowMs) { runRetention(nowMs); }
     /// Test seam (cleaner thread): the clamp for a Log tagged (nsId, slot) applied to a topic's retention.
     void clampRetentionForTest(int32_t topicId, uint16_t slot, uint32_t nsId, int64_t& ms, int64_t& bytes) const noexcept {
         clampRetention_(topicId, slot, nsId, ms, bytes);
