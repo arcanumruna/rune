@@ -6289,14 +6289,17 @@ private:
     uint64_t             nsSizeRefusals_ = 0;   ///< produces refused for max-message-bytes / max-batch-bytes
     // ---- Task 14 (D28): per-slot rate counters (one add each on the hot path) and the throttle deadlines the aggregator
     // broadcasts (one compare).  One struct per slot = one or two cache lines; arrays sized to the slot table at start.
-    struct NsHot {
+    struct alignas(64) NsHot {
         uint64_t produceBytes = 0, produceRecords = 0, fetchBytes = 0, requestOps = 0, queryCycles = 0;
         int64_t  produceUntil = 0;   ///< max(ProduceBytes, ProduceRecords, RequestOps): the one compare a produce pays
+        uint64_t sizeGate = std::numeric_limits<uint64_t>::max();   ///< min(maxBatchBytes, maxMessageBytes): the ONE size compare a produce pays
         int64_t  fetchUntil   = 0;   ///< max(FetchBytes, RequestOps)
         int64_t  queryUntil   = 0;   ///< max(QueryCycles, RequestOps)
         int64_t  until[kThrottleKinds] = {};
-        uint64_t maxBatchBytes = std::numeric_limits<uint64_t>::max(), maxMessageBytes = std::numeric_limits<uint64_t>::max();   ///< 0 = unlimited
+        uint64_t maxBatchBytes = std::numeric_limits<uint64_t>::max(), maxMessageBytes = std::numeric_limits<uint64_t>::max();   ///< 0 = unlimited; read only past sizeGate
     };
+    static_assert(offsetof(NsHot, requestOps) < 64 && offsetof(NsHot, produceUntil) < 64 && offsetof(NsHot, sizeGate) + sizeof(uint64_t) <= 64,
+                  "the fields a produce touches share the first cache line of NsHot");
     std::vector<NsHot>    nsHot_ = std::vector<NsHot>(NsSlotTable::kDefaultCapacity);
     std::vector<uint64_t> nsLastReport_ = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity * kNsMetrics, 0);
     int64_t               nsReportIntervalNs_ = 5'000'000;
@@ -6373,6 +6376,7 @@ private:
         if (slot < nsHot_.size()) {
             nsHot_[slot].maxBatchBytes   = l.maxBatchBytes   == 0 ? std::numeric_limits<uint64_t>::max() : l.maxBatchBytes;
             nsHot_[slot].maxMessageBytes = l.maxMessageBytes == 0 ? std::numeric_limits<uint64_t>::max() : l.maxMessageBytes;
+            nsHot_[slot].sizeGate        = std::min(nsHot_[slot].maxBatchBytes, nsHot_[slot].maxMessageBytes);
         }
         if (viewSet_ != nullptr) viewSet_->onNsSlotAssign(slot, nsId, l);
     }
@@ -8801,11 +8805,11 @@ private:
                 enqueueReturn_(ret);
                 return 1;
             }
-            // max-batch-bytes / max-message-bytes (0 = unlimited): two compares; the records are walked only when the
-            // whole batch is longer than the per-record limit (a shorter batch cannot hold a longer record).
+            // max-batch-bytes / max-message-bytes (0 = unlimited): ONE compare against min(both); the records are walked
+            // only when the whole batch is longer than the per-record limit (a shorter batch cannot hold a longer record).
             {
                 const uint64_t len = rbSpan.size();
-                if (len > nh.maxMessageBytes || len > nh.maxBatchBytes) [[unlikely]] {
+                if (len > nh.sizeGate) [[unlikely]] {
                     const RecordWalk w = len > nh.maxBatchBytes ? RecordWalk::TooLong : walkRecords_(rbSpan, nh.maxMessageBytes);
                     if (w != RecordWalk::Ok) {
                         // TooLong: 52 (an old client is mapped by produceErrorForClient when the answer is encoded).
