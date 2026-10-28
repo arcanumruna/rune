@@ -6286,6 +6286,7 @@ private:
     std::vector<uint8_t> nsOverDisk_  = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
     int64_t              nextDiskScanNs_ = 0;
     uint64_t             overDiskRefusals_ = 0;
+    uint64_t             nsSizeRefusals_ = 0;   ///< produces refused for max-message-bytes / max-batch-bytes
     // ---- Task 14 (D28): per-slot rate counters (one add each on the hot path) and the throttle deadlines the aggregator
     // broadcasts (one compare).  One struct per slot = one or two cache lines; arrays sized to the slot table at start.
     struct NsHot {
@@ -6294,6 +6295,7 @@ private:
         int64_t  fetchUntil   = 0;   ///< max(FetchBytes, RequestOps)
         int64_t  queryUntil   = 0;   ///< max(QueryCycles, RequestOps)
         int64_t  until[kThrottleKinds] = {};
+        uint64_t maxBatchBytes = std::numeric_limits<uint64_t>::max(), maxMessageBytes = std::numeric_limits<uint64_t>::max();   ///< 0 = unlimited
     };
     std::vector<NsHot>    nsHot_ = std::vector<NsHot>(NsSlotTable::kDefaultCapacity);
     std::vector<uint64_t> nsLastReport_ = std::vector<uint64_t>(NsSlotTable::kDefaultCapacity * kNsMetrics, 0);
@@ -6306,6 +6308,7 @@ public:
     [[nodiscard]] int64_t  nsDiskBytesForTest(uint16_t slot) const noexcept { return slot < nsDiskBytes_.size() ? nsDiskBytes_[slot] : 0; }
     [[nodiscard]] bool     nsOverDiskForTest(uint16_t slot) const noexcept { return slot < nsOverDisk_.size() && nsOverDisk_[slot] != 0; }
     [[nodiscard]] uint64_t overDiskRefusalsForTest() const noexcept { return overDiskRefusals_; }
+    [[nodiscard]] uint64_t nsSizeRefusalsForTest() const noexcept { return nsSizeRefusals_; }
     [[nodiscard]] uint64_t throttledRefusalsForTest() const noexcept { return throttledRefusals_; }
     [[nodiscard]] int64_t  nsThrottleUntilForTest(uint16_t slot, ThrottleKind k) const noexcept {
         return slot < nsHot_.size() ? nsHot_[slot].until[static_cast<std::size_t>(k)] : 0;
@@ -6367,6 +6370,10 @@ private:
             resetNsSlotState_(slot);     // a reused slot starts from zero usage and no throttle (D22)
         }
         nsSlots_.setLimits(slot, l);
+        if (slot < nsHot_.size()) {
+            nsHot_[slot].maxBatchBytes   = l.maxBatchBytes   == 0 ? std::numeric_limits<uint64_t>::max() : l.maxBatchBytes;
+            nsHot_[slot].maxMessageBytes = l.maxMessageBytes == 0 ? std::numeric_limits<uint64_t>::max() : l.maxMessageBytes;
+        }
         if (viewSet_ != nullptr) viewSet_->onNsSlotAssign(slot, nsId, l);
     }
     [[gnu::cold]] bool applyNsSlotRelease_(uint16_t slot, uint32_t nsId) {
@@ -8661,6 +8668,31 @@ private:
         int64_t enqueuedAtNs  = 0;      ///< gateway enqueue time (op path; latency attribution)
     };
 
+    /// Cold: true when a record of the RecordBatch v2 in `batch` has a body longer than `max`.  A malformed batch
+    /// answers false (the existing validation answers it).
+    [[gnu::cold]] [[gnu::noinline]] static bool anyRecordLongerThan_(std::span<const uint8_t> batch, uint64_t max) noexcept {
+        namespace pb = rune::protocol::batch;
+        fprintf(stderr,"WALK size=%zu max=%lu\n", batch.size(), (unsigned long)max);
+        if (batch.size() < static_cast<std::size_t>(pb::kRecordBatchOverhead)) return false;
+        const int32_t count = static_cast<int32_t>(rune::protocol::detail::getLE32(batch.data() + pb::kRecordCountOffset));
+        std::size_t pos = static_cast<std::size_t>(pb::kRecordBatchOverhead);
+        for (int32_t i = 0; i < count; ++i) {
+            uint64_t v = 0; int shift = 0; bool done = false;
+            while (pos < batch.size() && shift < 64) {
+                const uint8_t b = batch[pos++];
+                v |= static_cast<uint64_t>(b & 0x7F) << shift; shift += 7;
+                if ((b & 0x80) == 0) { done = true; break; }
+            }
+            if (!done) return false;
+            const int64_t len = static_cast<int64_t>(v >> 1) ^ -static_cast<int64_t>(v & 1);   // un-zigzag
+            if (len < 0) return false;
+            if (static_cast<uint64_t>(len) > max) return true;
+            if (static_cast<uint64_t>(len) > batch.size() - pos) return false;
+            pos += static_cast<std::size_t>(len);
+        }
+        return false;
+    }
+
     int produceCore_(const ProduceFields& f, rune::storage::Log* log,
                      rune::replication::PartitionReplica* replica,
                      std::span<const uint8_t> rbSpan, int64_t nowNs) {
@@ -8730,6 +8762,19 @@ private:
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded);
                 enqueueReturn_(ret);
                 return 1;
+            }
+            // max-batch-bytes / max-message-bytes (0 = unlimited): two compares; the records are walked only when the
+            // whole batch is longer than the per-record limit (a shorter batch cannot hold a longer record).
+            {
+                const uint64_t len = rbSpan.size();
+                if (len > nh.maxMessageBytes || len > nh.maxBatchBytes) [[unlikely]] {
+                    if (len > nh.maxBatchBytes || anyRecordLongerThan_(rbSpan, nh.maxMessageBytes)) {
+                        ++nsSizeRefusals_;
+                        ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded);
+                        enqueueReturn_(ret);
+                        return 1;
+                    }
+                }
             }
             // ... and one compare.  Throttled (53): the retry-after rides lastOffset (an error answer carries no offset);
             // the gateway puts it on the wire.  Nothing is appended.

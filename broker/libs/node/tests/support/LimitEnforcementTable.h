@@ -26,6 +26,7 @@ enum class LimitArea : uint8_t {
     Disk,         // worker, per node (Task 11)
     ViewMemory,   // worker's view set (Task 12)
     Retention,    // AdminWorker refusal + the cleaner's clamp (Task 13)
+    ProduceSize,  // worker produce intake, per batch / per record
     Rate,         // the limit aggregator's throttle deadline (Task 14, D28); codeAbove 53 = Throttled
 };
 
@@ -68,6 +69,9 @@ inline constexpr std::array kLimitRows = {
     LimitRow{"max-txn-time-ms",          22, LimitArea::Txn,     30000, 52, "InitProducerId(timeout)",     "a timeout == the maximum"},
     // ---- Task 11: disk ---------------------------------------------------------------------------------------
     LimitRow{"max-disk-bytes",            8, LimitArea::Disk, 16384, 52, "leader produce",            "the produce that brings usage to the limit"},
+    // ---- max-message-bytes / max-batch-bytes: the worker's produce intake (Below/At/Above = L-1 / L / L+1 bytes) ----------
+    LimitRow{"max-message-bytes",        11, LimitArea::ProduceSize, 1024, 52, "leader produce (one record of L-1 / L / L+1 bytes)", "a record of exactly the limit is appended"},
+    LimitRow{"max-batch-bytes",          12, LimitArea::ProduceSize, 4096, 52, "leader produce (a batch of L-1 / L / L+1 bytes)", "a batch of exactly the limit is appended"},
     // ---- Task 12: view memory (limit = 2 table chunks; codeAbove 54 = ViewPaused, the read answer of a paused view) ------
     // ---- Task 13: retention maximums (Above = an explicit topic retention over the maximum is refused at DDL; a lowered maximum
     //      clamps the cleaner's effective retention to min(topic, maximum) on its next pass) ---------------------------------
