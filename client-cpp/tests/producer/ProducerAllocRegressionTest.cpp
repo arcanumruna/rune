@@ -245,7 +245,7 @@ ProducerConfig txnAllocCfg() {
 }
 
 struct TxnAllocRig {
-    struct Req { int64_t corrId; uint16_t templateId; };
+    struct Req { int64_t corrId; uint16_t templateId; std::array<rpc::TxnPartitionResult, 8> parts{}; std::size_t nParts = 0; };
     struct Batch { int64_t corrId; int32_t records; };
 
     std::unique_ptr<rc::Client>  client = std::make_unique<rc::Client>(txnAllocClientCfg());
@@ -305,7 +305,19 @@ struct TxnAllocRig {
         auto* self = static_cast<TxnAllocRig*>(ctx);
         if (self->nReqs == self->reqs.size()) return rp::CoordinatorSink::Offer::Retry;
         const auto h = rpc::MessageHeader::decode(b, n);
-        if (h) self->reqs[self->nReqs++] = Req{h->correlationId, h->templateId};
+        if (h) {
+            Req& q = self->reqs[self->nReqs++];
+            q.corrId     = h->correlationId;
+            q.templateId = h->templateId;
+            q.nParts     = 0;
+            if (h->templateId == rpc::AddPartitionsToTxn::TEMPLATE_ID) {   // #698: the answer names every partition asked
+                if (const auto m = rpc::AddPartitionsToTxn::decode(b, n)) {
+                    for (std::size_t i = 0; i < m->partitions.size() && q.nParts < q.parts.size(); ++i) {
+                        q.parts[q.nParts++] = {m->partitions[i].topicId, m->partitions[i].partition, 0};
+                    }
+                }
+            }
+        }
         return rp::CoordinatorSink::Offer::Accepted;
     }
     static int64_t session(void*) noexcept { return 77; }
@@ -348,7 +360,10 @@ struct TxnAllocRig {
             case rpc::EndTxn::TEMPLATE_ID:             kind = rp::ReqKind::EndTxn; break;
             default: break;
             }
-            const auto a = test_support::FakeCoordinator::answer(kind, reqs[i].corrId, 0);
+            const auto a = kind == rp::ReqKind::AddPartitions
+                ? test_support::FakeCoordinator::answerNaming(
+                      reqs[i].corrId, 0, std::span<const rpc::TxnPartitionResult>(reqs[i].parts.data(), reqs[i].nParts))
+                : test_support::FakeCoordinator::answer(kind, reqs[i].corrId, 0);
             (void)hub.onCoordinatorResponse(a.templateId, a.data(), a.len, now);
         }
         nReqs = 0;

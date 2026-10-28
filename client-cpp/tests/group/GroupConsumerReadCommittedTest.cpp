@@ -131,7 +131,8 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationOnSyncGroupResponse)
     impl->state     = GroupConsumerState::Syncing; // ready to receive SyncGroupResponse
     impl->active = true;
     impl->ctlCorrId = GroupConsumerHub::kGroupCtlCorrTag | 1;   // #431: the SyncGroup this answers
-    impl->joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    impl->joinDeadlineNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() + 30'000'000'000LL;   // the hub's default clock
 
     hub.add(impl.get());
 
@@ -217,7 +218,8 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
     impl->state      = GroupConsumerState::Syncing;
     impl->active = true;
     impl->ctlCorrId = GroupConsumerHub::kGroupCtlCorrTag | 1;   // #431: the SyncGroup this answers
-    impl->joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    impl->joinDeadlineNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() + 30'000'000'000LL;   // the hub's default clock
 
     hub.add(impl.get());
 

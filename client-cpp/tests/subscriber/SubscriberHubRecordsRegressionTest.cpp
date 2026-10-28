@@ -55,11 +55,11 @@ struct Bound {
         delivered.reserve(4096);
         auto send = [](int32_t, const uint8_t*, std::size_t) { return true; };
         auto req = SubscriberHub::makeSubscribeRequest(impl.get(), kSession, 1, -2, 0, {},
-                                                       std::chrono::steady_clock::now() + std::chrono::hours(1));
+                                                       3'600'000'000'000LL /*1 h, relative*/);
         rcd::HubCommand c;
         c.op     = rcd::HubCommand::Op::SubscribeAdd;
         c.handle = reinterpret_cast<uint64_t>(req.release());
-        hub.applyCommand(c, 0, kSession, send);
+        hub.applyCommand(c, 0, kSession, send, /*nowNs=*/0);
         rc::codec::SubscribeResponseView r;
         r.sessionId = kSession;
         r.correlationId = corr;
