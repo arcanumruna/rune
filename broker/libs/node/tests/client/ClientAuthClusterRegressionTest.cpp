@@ -222,7 +222,7 @@ TEST(ClientAuthClusterRegression, WorldServerClientProducesAndConsumesThroughEve
         const auto s = t.loginOn(probe, id, "world-server", "world-server-password");
         ASSERT_TRUE(AuthTrio::until(20s, [&] {
             const int64_t corr = probe.raw().nextCorrelationId();
-            probe.raw().produce(t.channel(id), AuthWireClient::kClientStream, s.sid, corr, spec.topicId, 0, 1, makeBatch(1));
+            probe.raw().produce(t.channel(id), AuthWireClient::kClientStream, s.sid, corr, spec.topicId, 0, 1, makeCharBatch(1));
             const auto a = probe.raw().awaitProduceResponseUntil(corr, Clock3::now() + 3s);
             return a && a->errorCode == 45;
         })) << "broker " << id << " must enforce the REVOKE";

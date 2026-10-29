@@ -321,8 +321,8 @@ public:
         const bool writes = op == Op::Produce || op == Op::ProduceRouted || op == Op::TxnProduce;
         const int64_t leoBefore = writes && tid >= 0 ? r_.logEnd(tid) : -1;
         switch (op) {
-            case Op::Produce: a.wantTempl = tmpl(TID::ProduceResponse); a.code = produceVia(r_.broker().workerIngressChannel(), sid, tid, makeBatch(1), a); break;
-            case Op::ProduceRouted: a.wantTempl = tmpl(TID::ProduceResponse); a.code = produceVia(r_.ch(), sid, tid, makeBatch(1), a); break;
+            case Op::Produce: a.wantTempl = tmpl(TID::ProduceResponse); a.code = produceVia(r_.broker().workerIngressChannel(), sid, tid, makeCharBatch(1), a); break;
+            case Op::ProduceRouted: a.wantTempl = tmpl(TID::ProduceResponse); a.code = produceVia(r_.ch(), sid, tid, makeCharBatch(1), a); break;
             case Op::TxnProduce: a.code = txnProduce(sid, tid, txn, a); break;
             case Op::TxnInit: {
                 a.wantTempl = tmpl(TID::InitProducerIdResponse);
@@ -667,7 +667,7 @@ private:
         if (code != 0) return code;
         rune::protocol::RecordBatchBuilder b(0, 1000);
         b.setTransactional(true); b.setProducerId(st.pid); b.setProducerEpoch(st.epoch); b.setBaseSequence(st.seq);
-        b.append("k", "txn", 1000);
+        b.append(charKey(), charValue("txn"), 1000);
         a.wantTempl = tmpl(TID::ProduceResponse);
         a.stage = 2;
         const int pcode = produceVia(r_.broker().workerIngressChannel(), sid, topicId, b.build(), a, &st);

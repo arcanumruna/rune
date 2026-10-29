@@ -244,7 +244,7 @@ TEST(NamespaceLoginRegression, AnonymousOffByDefaultRegression) {
     ASSERT_TRUE(w.lastConnect().has_value());
     EXPECT_EQ(w.lastConnect()->authState, pc::AuthState::MustAuthenticate);
     const int64_t corr = w.raw().nextCorrelationId();
-    ASSERT_TRUE(w.raw().produce(nb.b.channel(), AuthWireClient::kClientStream, sid, corr, /*topicId=*/1, 0, 1, makeBatch(1)));
+    ASSERT_TRUE(w.raw().produce(nb.b.channel(), AuthWireClient::kClientStream, sid, corr, /*topicId=*/1, 0, 1, makeCharBatch(1)));
     const auto r = w.raw().awaitProduceResponse(corr);
     ASSERT_TRUE(r.has_value()) << "answered, never hung";
     EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed));
@@ -294,7 +294,7 @@ TEST(NamespaceLoginRegression, AnonymousOnIsDefaultNsRegression) {
 
     // Anything else: NotAuthorized, and the session stays.
     const int64_t pcorr = w.raw().nextCorrelationId();
-    ASSERT_TRUE(w.raw().produce(nb.b.channel(), AuthWireClient::kClientStream, sid, pcorr, topicId, 0, 1, makeBatch(1)));
+    ASSERT_TRUE(w.raw().produce(nb.b.channel(), AuthWireClient::kClientStream, sid, pcorr, topicId, 0, 1, makeCharBatch(1)));
     const auto pr = w.raw().awaitProduceResponse(pcorr);
     ASSERT_TRUE(pr.has_value());
     EXPECT_EQ(pr->errorCode, static_cast<int16_t>(kNotAuthorized)) << "anonymous read never writes";
@@ -317,7 +317,7 @@ TEST(NamespaceLoginRegression, AnonymousOnIsDefaultNsRegression) {
     const int64_t sid3 = w.connect(nb.b.channel(), pc::kClientVersionNamespaces);
     ASSERT_GT(sid3, 0);
     const int64_t p3 = w.raw().nextCorrelationId();
-    ASSERT_TRUE(w.raw().produce(nb.b.channel(), AuthWireClient::kClientStream, sid3, p3, topicId, 0, 1, makeBatch(1)));
+    ASSERT_TRUE(w.raw().produce(nb.b.channel(), AuthWireClient::kClientStream, sid3, p3, topicId, 0, 1, makeCharBatch(1)));
     const auto pr3 = w.raw().awaitProduceResponse(p3);
     ASSERT_TRUE(pr3.has_value());
     EXPECT_EQ(pr3->errorCode, static_cast<int16_t>(kNotAuthorized)) << "the first request's kind never changes the outcome";

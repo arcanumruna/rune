@@ -157,9 +157,9 @@ bool awaitApplied(BrokerNode& n, const std::string& name, std::chrono::seconds w
     }
     return false;
 }
-std::vector<uint8_t> oneRecordBatch(std::string_view value) {
+std::vector<uint8_t> oneRecordBatch(std::string_view value) {   // typed topics validate: a valid record carrying `value` as its tail
     rune::protocol::RecordBatchBuilder b(0, 0);
-    b.append(std::string_view{}, value, 0);
+    b.append(charKey(), charValue(value), 0);
     return b.build();
 }
 

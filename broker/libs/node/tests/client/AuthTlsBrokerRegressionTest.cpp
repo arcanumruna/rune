@@ -379,7 +379,7 @@ TEST(AuthSessionBindingRegression, APlaintextProduceNamingAnEncryptedSessionIsNe
     ASSERT_GT(sid, 0);
 
     AuthWireClient& attacker = b.wire();
-    const auto batch = makeBatch(1);
+    const auto batch = makeCharBatch(1);
     for (int i = 0; i < 4; ++i) {
         ASSERT_TRUE(attacker.raw().produce(b.workerIngressChannel(), AuthWireClient::kClientStream, sid, 9000 + i,
                                            orders.topicId, 0, 1, batch));

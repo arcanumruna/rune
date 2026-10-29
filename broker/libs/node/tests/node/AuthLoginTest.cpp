@@ -226,7 +226,7 @@ TEST(AuthLoginRegression, RequestBeforeAuthenticationIsAnsweredAuthenticationFai
     EXPECT_EQ(w.lastConnect()->authMode, pc::AuthMode::Required);
     EXPECT_EQ(w.lastConnect()->authState, pc::AuthState::MustAuthenticate);
     const int64_t corr = 4242;
-    ASSERT_TRUE(w.raw().produce(b.channel(), AuthWireClient::kClientStream, sid, corr, /*topicId=*/1, 0, 1, makeBatch(1)));
+    ASSERT_TRUE(w.raw().produce(b.channel(), AuthWireClient::kClientStream, sid, corr, /*topicId=*/1, 0, 1, makeCharBatch(1)));
     const auto r = w.raw().awaitProduceResponse(corr);
     ASSERT_TRUE(r.has_value()) << "answered, never hung";
     EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::AuthenticationFailed)) << "in the request's own response type";

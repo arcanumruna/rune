@@ -202,10 +202,10 @@ public:
 
     // ── one function per request type: the answer code ──────────────────────────────────────────────────────
     int produce(int64_t sid, int32_t topicId, bool untilOk = false) {
-        if (untilOk) return c().produceUntilOk(ch(), stream(), sid, topicId, 0, 1, makeBatch(1)) ? 0 : kNoAnswer;
+        if (untilOk) return c().produceUntilOk(ch(), stream(), sid, topicId, 0, 1, makeCharBatch(1)) ? 0 : kNoAnswer;
         const int64_t corr = c().nextCorrelationId();
         lastCorr_ = corr;
-        if (!c().produce(ch(), stream(), sid, corr, topicId, 0, 1, makeBatch(1))) return kNoAnswer;
+        if (!c().produce(ch(), stream(), sid, corr, topicId, 0, 1, makeCharBatch(1))) return kNoAnswer;
         const auto a = c().awaitProduceResponseUntil(corr, dl());
         return a ? a->errorCode : kNoAnswer;
     }
@@ -473,7 +473,7 @@ public:
                             bool transactional = false, const std::string& value = "v", const std::string* channel = nullptr) {
         rune::protocol::RecordBatchBuilder b(0, 1000);
         b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq); b.setTransactional(transactional);
-        b.append("k", value, 1000);
+        b.append(charKey(), charValue(value), 1000);   // the rig's topics are typed: a valid record carrying `value` as its tail
         const std::vector<uint8_t> batch = b.build();
         ProduceAnswer out;
         for (int attempt = 0; attempt < 200; ++attempt) {

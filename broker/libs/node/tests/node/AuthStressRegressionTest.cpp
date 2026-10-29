@@ -562,7 +562,7 @@ private:
             r.corr = s.c->nextCorrelationId(); r.lo = answeredPrefix_(); r.sentAt = Clock::now(); r.step = step_;
             note_(std::string("produce(") + (r.routed ? "routed" : "shard") + ") " + t + " as " + user_(s.user) + "/" + std::to_string(si));
             const std::string& chan = r.routed ? rig_.ch() : rig_.broker().workerIngressChannel();
-            if (!s.c->produce(chan, AuthRig::stream(), s.sid, r.corr, r.topicId, 0, 1, makeBatch(1))) { failWith_("produce send"); return; }
+            if (!s.c->produce(chan, AuthRig::stream(), s.sid, r.corr, r.topicId, 0, 1, makeCharBatch(1))) { failWith_("produce send"); return; }
             reqs_.push_back(r);
         } else if (roll < 84) {   // subscribe
             const std::string t = ex[static_cast<std::size_t>(pick_(static_cast<int>(ex.size())))];
@@ -747,7 +747,7 @@ private:
                     for (int a = 0; a < 80; ++a) {   // transient answers (NotLeader / UnknownTopic while a topic settles) are retried
                         const int64_t corr = s.c->nextCorrelationId();
                         const std::string& chan = routed ? rig_.ch() : rig_.broker().workerIngressChannel();
-                        if (!s.c->produce(chan, AuthRig::stream(), s.sid, corr, exists_[t], 0, 1, makeBatch(1))) break;
+                        if (!s.c->produce(chan, AuthRig::stream(), s.sid, corr, exists_[t], 0, 1, makeCharBatch(1))) break;
                         const auto ack = s.c->awaitProduceResponseUntil(corr, Clock::now() + 5s);
                         code = ack ? ack->errorCode : kNoAnswer;
                         if (code == 0 || code == 45 || code == kNoAnswer) break;

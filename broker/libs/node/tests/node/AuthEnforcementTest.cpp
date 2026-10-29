@@ -173,7 +173,7 @@ TEST(AuthEnforcementRegression, AClientControlBatchIsRefusedForAnAuthorizedWrite
         const auto a = r.c().awaitProduceResponseUntil(corr, AuthRig::dl());
         return a ? std::pair<int, int64_t>{a->errorCode, a->baseOffset} : std::pair<int, int64_t>{kNoAnswer, -1};
     };
-    const auto first = produceBatch(makeBatch(1));
+    const auto first = produceBatch(makeCharBatch(1));
     ASSERT_EQ(first.first, kOk);
     rune::protocol::RecordBatchBuilder ctl(0, 1000);
     ctl.setControl(true);
@@ -181,7 +181,7 @@ TEST(AuthEnforcementRegression, AClientControlBatchIsRefusedForAnAuthorizedWrite
     ctl.append("", "", 1000);
     EXPECT_EQ(produceBatch(ctl.build()).first, static_cast<int>(pc::ErrorCode::InvalidRequest))
         << "a client never writes a control batch, whatever its grants";
-    const auto next = produceBatch(makeBatch(1));
+    const auto next = produceBatch(makeCharBatch(1));
     ASSERT_EQ(next.first, kOk);
     EXPECT_EQ(next.second, first.second + 1) << "the refused control batch was appended";
 }

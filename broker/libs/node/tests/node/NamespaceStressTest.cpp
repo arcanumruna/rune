@@ -666,9 +666,11 @@ protected:
         rec.ns = n->name;
         rec.topic = it->first;
         for (int i = 0; i < 3; ++i) rec.values.push_back("tx" + std::to_string(seed_) + "_" + std::to_string(step) + "_" + std::to_string(i));
-        for (std::size_t i = 0; i < rec.values.size(); ++i)
+        for (std::size_t i = 0; i < rec.values.size(); ++i) {   // a typed topic validates: the record's key is its id field
+            const std::string value = charValue(rec.values[i], static_cast<int64_t>(i));
             l.producer->send(l.client->topic(it->first), rc::Key(static_cast<int64_t>(i)),
-                             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(rec.values[i].data()), rec.values[i].size()));
+                             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size()));
+        }
         l.producer->flushAndWait(std::chrono::seconds(30));
         txns_.push_back(std::move(rec));
         l.rec = txns_.size() - 1;
@@ -732,7 +734,8 @@ protected:
                 rc::ProducerConfig pcfg;
                 pcfg.acks = rc::Acks::All;
                 rc::Producer plain = root.producer(pcfg);
-                plain.send(th, rc::Key(int64_t{1}), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(sentinel.data()), sentinel.size()));
+                const std::string sentinelValue = charValue(sentinel);
+                plain.send(th, rc::Key(int64_t{1}), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(sentinelValue.data()), sentinelValue.size()));
                 ASSERT_EQ(plain.closeAndWait(std::chrono::seconds(30)), rc::OpStatus::Ok) << "sentinel produce on " << full(*n, t.topic);
             }
             std::mutex mu;
@@ -748,14 +751,14 @@ protected:
             bool seen = false;
             for (int i = 0; i < 20'000 && !seen; ++i) {   // 20 000 x 2 ms: a hard cap that fails
                 const auto s = snap();
-                seen = std::find(s.begin(), s.end(), sentinel) != s.end();
+                seen = std::find(s.begin(), s.end(), charValue(sentinel)) != s.end();
                 if (!seen) std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
             sub.unsubscribe();
             ASSERT_TRUE(seen) << "the sentinel never reached read_committed on " << full(*n, t.topic)
                               << ": a transaction is still holding the last stable offset";
             std::multiset<std::string> got;
-            for (const std::string& v : snap()) if (v.rfind("tx", 0) == 0) got.insert(v);
+            for (const std::string& v : snap()) if (v.size() > kCharValuePrefix && v.compare(kCharValuePrefix, 2, "tx") == 0) got.insert(v.substr(kCharValuePrefix));
             std::multiset<std::string> want;
             for (const TxnRec& u : txns_)
                 if (u.nsId == t.nsId && u.topic == t.topic) {

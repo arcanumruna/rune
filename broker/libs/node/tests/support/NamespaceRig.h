@@ -561,7 +561,7 @@ private:
             case Op::Produce: {
                 for (int attempt = 0; attempt < 40; ++attempt) {
                     const int64_t corr = c.nextCorrelationId();
-                    if (!c.produce(ch, st, sid, corr, n.tid, 0, 1, makeBatch(1))) break;
+                    if (!c.produce(ch, st, sid, corr, n.tid, 0, 1, makeCharBatch(1))) break;
                     const auto ack = c.awaitProduceResponseUntil(corr, AuthRig::dl());
                     a.code = ack ? ack->errorCode : kNoAnswer;
                     frameOf(w, a, corr);

@@ -543,7 +543,7 @@ ProducerResult runProducer(std::stop_token stop, std::array<std::string, 3> chan
         auto& c = w.raw();
         const int64_t corr = c.nextCorrelationId();
         ++out.attempts;
-        if (!c.produce(channels[n], AuthWireClient::kClientStream, sid[n], corr, topic, 0, 1, makeBatch(1))) { sid[n] = 0; ++node; continue; }
+        if (!c.produce(channels[n], AuthWireClient::kClientStream, sid[n], corr, topic, 0, 1, makeCharBatch(1))) { sid[n] = 0; ++node; continue; }
         const int code = ackOrErrorCode(c, corr, 1s);
         if (code == 0) {
             out.acked.push_back(c.ackFor(corr)->baseOffset);
@@ -642,7 +642,7 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
     const int32_t topic = defineTopicAnywhere(t, bs, "rot.t", 1);
     ASSERT_GE(topic, 0);
     ASSERT_TRUE(AuthTrio::until(60s, [&] { const int32_t l = leaderOf(t, bs[0], topic, 0); return l >= 1 && l <= 3; }));
-    const std::size_t batchBytes = makeBatch(1).size();
+    const std::size_t batchBytes = makeCharBatch(1).size();
 
     const std::string k1 = t.keyContentsPath(1);
     const std::string k2 = t.makeKeyFile("k2.key", 'Q');
@@ -846,7 +846,7 @@ int ackOrErrorCode(ShardTestClient& c, int64_t corr, std::chrono::milliseconds w
 int gatewayProduce(AuthTrio& t, UserSessions& u, int node, int32_t topic, int32_t part) {
     auto& c = u.w->raw();
     const int64_t corr = c.nextCorrelationId();
-    if (!c.produce(t.channel(node), AuthWireClient::kClientStream, u.sid[static_cast<std::size_t>(node - 1)], corr, topic, part, 1, makeBatch(1)))
+    if (!c.produce(t.channel(node), AuthWireClient::kClientStream, u.sid[static_cast<std::size_t>(node - 1)], corr, topic, part, 1, makeCharBatch(1)))
         return kNoAnswer;
     return ackOrErrorCode(c, corr, 5s);
 }
@@ -855,7 +855,7 @@ int gatewayProduce(AuthTrio& t, UserSessions& u, int node, int32_t topic, int32_
 int shardProduce(UserSessions& u, int node, const PartitionInfo& pi, int32_t topic) {
     auto& c = u.w->raw();
     const int64_t corr = c.nextCorrelationId();
-    if (!c.produce("aeron:udp?endpoint=" + pi.ingressEndpoint, pi.ingressStreamId, u.sid[static_cast<std::size_t>(node - 1)], corr, topic, pi.partition, 1, makeBatch(1)))
+    if (!c.produce("aeron:udp?endpoint=" + pi.ingressEndpoint, pi.ingressStreamId, u.sid[static_cast<std::size_t>(node - 1)], corr, topic, pi.partition, 1, makeCharBatch(1)))
         return kNoAnswer;
     return ackOrErrorCode(c, corr, 5s);
 }

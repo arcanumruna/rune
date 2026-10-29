@@ -929,19 +929,29 @@ TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklog
     }
     for (auto& f : drainFailureRing(agent)) frames.push_back(std::move(f));
     ASSERT_EQ(agent.catalogBacklogForTest(), 0u);
-    // Namespaces Task 9: the boot posts every namespace (here only `default`) before any object.
-    ASSERT_EQ(frames.size(), 406u) << "the default namespace; one topic: its filter schema (before the topic, and again "
-                                      "after the validators), its 401 versions' validators, one applied";
+    // Namespaces Task 9: the boot posts every namespace (here only `default`) before any object.  A topic's frames: its
+    // filter schema, its validators (every version), its write spec, the topic itself (these four before the topic is
+    // built), then the schema change posts the validators, the write spec and the filter schema again (idempotent on the
+    // workers); then one applied.  (The broker's own boot builds its topics on the startup thread and posts only the
+    // schema-change frames, once.)
+    ASSERT_EQ(frames.size(), 809u);
     EXPECT_EQ(frames[0].type, kA2cNamespaceUpserted);
     EXPECT_EQ(frames[1].type, kA2cFilterSchema);
-    EXPECT_EQ(frames[2].type, kA2cCatalogTopicApplied);
-    EXPECT_EQ(frames[404].type, kA2cFilterSchema);
-    EXPECT_EQ(frames.back().type, kA2cCatalogApplied);
     for (std::size_t i = 0; i < 401; ++i) {
-        ASSERT_EQ(frames[3 + i].type, kA2cSchemaUpdate) << i;
-        EXPECT_EQ(decodeSchemaUpdate(frames[3 + i].bytes.data(), frames[3 + i].bytes.size()).version, i + 1)
+        ASSERT_EQ(frames[2 + i].type, kA2cSchemaUpdate) << i;
+        EXPECT_EQ(decodeSchemaUpdate(frames[2 + i].bytes.data(), frames[2 + i].bytes.size()).version, i + 1)
             << "ascending versions";
     }
+    EXPECT_EQ(frames[403].type, kA2cWriteSpec);
+    EXPECT_EQ(frames[404].type, kA2cCatalogTopicApplied);
+    for (std::size_t i = 0; i < 401; ++i) {
+        ASSERT_EQ(frames[405 + i].type, kA2cSchemaUpdate) << i;
+        EXPECT_EQ(decodeSchemaUpdate(frames[405 + i].bytes.data(), frames[405 + i].bytes.size()).version, i + 1)
+            << "ascending versions";
+    }
+    EXPECT_EQ(frames[806].type, kA2cWriteSpec);
+    EXPECT_EQ(frames[807].type, kA2cFilterSchema);
+    EXPECT_EQ(frames.back().type, kA2cCatalogApplied);
 }
 
 // 5cc480fa made every ALTER re-post the whole history (quadratic).  A LIVE event posts exactly the version it
@@ -1029,7 +1039,9 @@ TEST(CatalogApplierRegression, LeaderDryRunRefusesAFilterSchemaFrameThatCannotBe
         const auto events = wideScript(3000, /*validate=*/false, /*withView=*/false);
         const auto refusal = catalogEventEffectsRefusal(cat::CatalogState{}, events.at(0));
         ASSERT_TRUE(refusal.has_value()) << "the oversize CREATE is refused before it is appended";
-        EXPECT_NE(refusal->find("FilterSchema"), std::string::npos) << *refusal;
+        // Every typed topic now posts its validators too, and with no retired field they are as large as the evolving
+        // descriptor: the refusal names whichever oversize frame is sized first.
+        EXPECT_TRUE(refusal->find("FilterSchema") != std::string::npos || refusal->find("SchemaUpdate") != std::string::npos) << *refusal;
     }
     {   // ALTER growing past the limit: the CREATE fits, the ALTER does not
         gd::ScriptBuilder b;
@@ -1051,7 +1063,7 @@ TEST(CatalogApplierRegression, LeaderDryRunRefusesAFilterSchemaFrameThatCannotBe
         ASSERT_TRUE(cat::apply(s, events.at(0), 0).has_value());
         const auto refusal = catalogEventEffectsRefusal(s, events.at(1));
         ASSERT_TRUE(refusal.has_value()) << "the ALTER that grows the evolving descriptor past the frame is refused";
-        EXPECT_NE(refusal->find("FilterSchema"), std::string::npos) << *refusal;
+        EXPECT_TRUE(refusal->find("FilterSchema") != std::string::npos || refusal->find("SchemaUpdate") != std::string::npos) << *refusal;
         EXPECT_EQ(s.appliedOffset(), 0) << "a dry run: nothing applied";
     }
     // the follower's boot sizing agrees
@@ -1096,13 +1108,18 @@ TEST(CatalogApplierRegression, EffectBacklogGrowsInsteadOfAbortingAndDrainsInOrd
     }
     for (const auto& f : drainFailureRing(agent)) types.push_back(f.type);
     EXPECT_EQ(agent.catalogBacklogForTest(), 0u);
-    ASSERT_EQ(types.size(), 300u);
+    // Per topic: the create's validators, write spec and filter schema go before the topic itself, then the schema change
+    // posts them again (idempotent on the workers), then the applied metric.
+    ASSERT_EQ(types.size(), 480u);
     for (std::size_t i = 0; i < 60; ++i) {
-        EXPECT_EQ(types[5 * i], kA2cFilterSchema);
-        EXPECT_EQ(types[5 * i + 1], kA2cCatalogTopicApplied);
-        EXPECT_EQ(types[5 * i + 2], kA2cSchemaUpdate);
-        EXPECT_EQ(types[5 * i + 3], kA2cFilterSchema);
-        EXPECT_EQ(types[5 * i + 4], kA2cCatalogApplied);
+        EXPECT_EQ(types[8 * i], kA2cFilterSchema);
+        EXPECT_EQ(types[8 * i + 1], kA2cSchemaUpdate);
+        EXPECT_EQ(types[8 * i + 2], kA2cWriteSpec);
+        EXPECT_EQ(types[8 * i + 3], kA2cCatalogTopicApplied);
+        EXPECT_EQ(types[8 * i + 4], kA2cSchemaUpdate);
+        EXPECT_EQ(types[8 * i + 5], kA2cWriteSpec);
+        EXPECT_EQ(types[8 * i + 6], kA2cFilterSchema);
+        EXPECT_EQ(types[8 * i + 7], kA2cCatalogApplied);
     }
 }
 
