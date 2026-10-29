@@ -149,10 +149,16 @@ void subscribeRacingRevokeStaysEnded(bool shard, const char* tag) {
     const int64_t ws = rig.newUser({exact(SO::Write, ST::Topic, "orders")});
     ASSERT_EQ(rig.produce(ws, rig.orders, true), 0);
     int subscribedRounds = 0;
+    std::vector<int64_t> okIds;
     for (int round = 0; round < 15; ++round) {
         std::string reader;
         const int64_t rs = rig.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
         const int64_t corr = c.sendSubscribe(rig.ch(), rig.stream(), rs, rig.orders, 0);
+        // The Subscribe OK waits for the session's record-egress pub (~20 ms to resolve), longer than a revoke round trip:
+        // sweep the revoke across that window, and let every third round wait for the OK so the OK-then-revoked path is
+        // always taken, whatever the timing.
+        if (round % 3 == 2) ASSERT_TRUE(c.pollUntil([&] { return c.subscriptionIdOf(corr).has_value(); }));
+        else c.pollFor(std::chrono::milliseconds(round * 4), [] { return false; });
         pc::SecurityDdl m; m.kind = pc::SecurityOpKind::Revoke; m.name = reader; m.granteeKind = 0;
         m.op = static_cast<uint8_t>(SO::Read); m.resourceType = static_cast<uint8_t>(ST::Topic);
         m.patternKind = static_cast<uint8_t>(SP::Exact); m.pattern = "orders";
@@ -170,6 +176,14 @@ void subscribeRacingRevokeStaysEnded(bool shard, const char* tag) {
         if (*code == 0) ++subscribedRounds;
         EXPECT_EQ(pushes(), atEnd) << "round " << round << ": subscribe answered " << *code << ", the sub (id " << subId
                                    << ") delivered after the revoke ended it and a re-grant";
+        // A Subscribe answered 45/46 has no id, so pushes() cannot see its zombie cursor: every Record must carry an id
+        // some Subscribe OK named.
+        if (subId != 0) okIds.push_back(subId);
+        const auto zombies = std::count_if(c.records().begin(), c.records().end(), [&](const auto& p) {
+            return std::find(okIds.begin(), okIds.end(), p.subscriptionId) == okIds.end();
+        });
+        EXPECT_EQ(zombies, 0) << "round " << round << ": subscribe answered " << *code
+                              << ", a Record carried a subscription id no Subscribe OK named (a zombie cursor)";
     }
     EXPECT_GT(subscribedRounds, 0) << "at least one round took the path under test (Subscribe OK, then revoked)";
 }
