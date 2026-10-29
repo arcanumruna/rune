@@ -169,6 +169,12 @@ public:
         workerPool_ = pool;
     }
 
+    /// Checked writes: a user partition's BecomeLeader waits while hold(ctx, topicId) is true - its typed topic's
+    /// validators and write spec are not on every worker's ring yet (BrokerNode: SchemaFanout::pendingFor).  The held op
+    /// stays queued and is retried every cycle; ops of other replicas pass it.  Duty-cycle thread.
+    using LeaderRoleHold = bool (*)(void* ctx, int32_t topicId) noexcept;
+    void setLeaderRoleHold(LeaderRoleHold fn, void* ctx) noexcept { leaderHold_ = fn; leaderHoldCtx_ = ctx; }
+
     /// Re-review 2026-10-04 MEDIUM-B: the coordinator partitions
     /// (__consumer_offsets -1, __transaction_state -2) are on the controller-
     /// ISR path (MetadataService::decideCoordinatorPartition): when on, they are
@@ -447,6 +453,11 @@ private:
     // handed to NodeRuntimeAgent, which routes it to the halt path (exit 70).
     bool        fatalPending_ = false;
     std::string fatalWhat_;
+    LeaderRoleHold leaderHold_    = nullptr;
+    void*          leaderHoldCtx_ = nullptr;
+    [[nodiscard]] bool leaderHeld_(const WorkerOp& op) const noexcept {
+        return leaderHold_ != nullptr && op.type == WorkerOp::Type::BecomeLeader && leaderHold_(leaderHoldCtx_, op.topicId);
+    }
     void enqueueRoleOp_(WorkerOp op, bool fence) noexcept;
     int  flushPendingRoleOps_() noexcept;
     bool tryRoute_(WorkerOp op) noexcept;

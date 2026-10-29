@@ -2433,6 +2433,8 @@ private:
     void onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView = false);
     void runCatalogCreate_(const TopicSpec& spec);
     int  serviceCreatesAwaitingSpec_();   // control thread: build a parked create once its spec reached every worker
+    void postBootWriteSpecs_();           // startup thread: every booted typed topic's validators + write spec -> schemaFanout_
+    static bool leaderRoleAwaitsSpecThunk_(void* self, int32_t topicId) noexcept;   // ReplicationMetadataBridge hold
     void dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::string& name);
     void onCatalogTopicConfig_(const uint8_t* p, std::size_t n);
     void onViewUninstall_(int32_t viewTopicId);

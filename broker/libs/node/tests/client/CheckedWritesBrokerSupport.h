@@ -50,9 +50,10 @@ inline int32_t catalogTopicId(BrokerNode& n, const std::string& name) {
 
 inline constexpr uint16_t kNotOk = 0xFFFF;   // a completion that is neither Ok nor a broker error
 
-/// One raw produce of `value` (key = `key`) on a fresh client built from `cfg`; the completion's broker error code (0 = Ok).
+/// One raw produce of `value` (key = `key`) on a fresh client built from `cfg`; the completion's broker error code (0 = Ok),
+/// kNotOk when no Ok / broker error arrived within `wait` (a producer retrying NotLeader answers nothing meanwhile).
 inline uint16_t produceRaw(rc::ClientConfig cfg, const std::string& topicName, int32_t topicId, int32_t partitions,
-                           const std::string& value, const rc::Key& key) {
+                           const std::string& value, const rc::Key& key, std::chrono::seconds wait = 30s) {
     cfg.topics.push_back(rc::TopicSpec{topicName, topicId, partitions});
     rc::Client client(cfg);
     client.connectAndWait(30s);
@@ -63,7 +64,7 @@ inline uint16_t produceRaw(rc::ClientConfig cfg, const std::string& topicName, i
     rc::Completions cq(client);
     const rc::TopicHandle topic = client.topic(topicName);
     rc::SendResult r = rc::SendResult::BackPressured;
-    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    const auto deadline = std::chrono::steady_clock::now() + wait;
     while (r == rc::SendResult::BackPressured && std::chrono::steady_clock::now() < deadline) {
         r = prod.trySend(topic, key, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size()), cq, 1);
         if (r == rc::SendResult::BackPressured) std::this_thread::yield();
@@ -79,14 +80,15 @@ inline uint16_t produceRaw(rc::ClientConfig cfg, const std::string& topicName, i
         });
         std::this_thread::yield();
     }
-    prod.close();
+    if (out == kNotOk) prod.closeImmediately();   // a record still retrying (NotLeader) would hold close() to its deadline
+    else prod.close();
     client.close();
     return out;
 }
 
 inline uint16_t produceRaw(OneBroker& b, const std::string& topicName, int32_t topicId, int32_t partitions,
-                           const std::string& value, const rc::Key& key) {
-    return produceRaw(b.clientConfig(), topicName, topicId, partitions, value, key);
+                           const std::string& value, const rc::Key& key, std::chrono::seconds wait = 30s) {
+    return produceRaw(b.clientConfig(), topicName, topicId, partitions, value, key, wait);
 }
 
 }  // namespace rune::node::test::cw_broker

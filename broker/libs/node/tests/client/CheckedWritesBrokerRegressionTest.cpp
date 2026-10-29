@@ -464,8 +464,9 @@ TEST(CheckedWritesBrokerRegression, TransientTypedTopicValidatesRegression) {
 
 // Boot: a restarted broker owns its catalog's typed partitions before any spec reaches a worker, so leadership of a typed
 // topic must wait for the topic's validators and write spec (held here forever by the test knob).  While they are held,
-// an invalid record is answered NotLeader (retriable) and nothing is stored - never OK.  RED (before the boot pre-post and
-// the BecomeLeader hold): the restarted leader serves the partition without a write state and stores the record.
+// an invalid record is answered NotLeader (retriable: the producer keeps retrying, so no answer arrives) and nothing is
+// stored - never OK.  RED (before the boot pre-post and the BecomeLeader hold): the restarted leader serves the partition
+// without a write state, answers OK and stores the record.
 TEST(CheckedWritesBrokerRegression, RestartServesNoTypedPartitionBeforeItsSpecRegression) {
     uint32_t hold = 0;
     OneBroker b("cw-bootgate", OneBroker::Runtime::Shard, [&hold](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = hold; });
@@ -474,10 +475,11 @@ TEST(CheckedWritesBrokerRegression, RestartServesNoTypedPartitionBeforeItsSpecRe
     hold = 4'000'000'000u;   // the restarted broker never delivers a WriteSpecUpdate
     b.restart();
     cw::Parts bad; bad.bio = std::string("\xC0\xAF", 2);
-    for (int i = 0; i < 8; ++i) {   // across the leader-election warm-up: every answer is a refusal
-        const uint16_t code = send(b, "p", t.topicId, 1, cw::encode(bad));
-        EXPECT_TRUE(code == kNotLeader || code == kSchemaValidationFailed) << "attempt " << i << " answered " << code;
-        std::this_thread::sleep_for(400ms);
+    const auto rec = cw::encode(bad);
+    for (int i = 0; i < 3; ++i) {   // 3 x 4 s spans the 2 s leader-election warm-up of the restart
+        const uint16_t code = cwb::produceRaw(b, "p", t.topicId, 1, rec.value, keyOf(rec.key), 4s);
+        EXPECT_TRUE(code == kNotLeader || code == kSchemaValidationFailed || code == cwb::kNotOk)
+            << "attempt " << i << " answered " << code;
     }
     EXPECT_TRUE(storedValues(b.node(), t.topicId, 0).empty()) << "an invalid record was stored before the spec arrived";
 }

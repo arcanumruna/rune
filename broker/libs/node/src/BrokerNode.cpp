@@ -2845,7 +2845,11 @@ void BrokerNode::buildGateway() {
     // confirmed by TSan (bridge control thread ↔ Worker::doWork on worker thread).
     if (replBridge_ && workerPool_) {
         replBridge_->setWorkerPool(workerPool_.get());
+        // Checked writes: a typed partition's leadership waits for its validators and write spec on every worker ring
+        // (the role op then follows them on the owner's FIFO ring), at boot and at runtime alike.
+        replBridge_->setLeaderRoleHold(&BrokerNode::leaderRoleAwaitsSpecThunk_, this);
     }
+    postBootWriteSpecs_();
 
     // -----------------------------------------------------------------------
     // Task 6: Build the __catalog partition + the AdminWorker thread (catalog
@@ -5857,6 +5861,27 @@ void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
         spdlog::error("BrokerNode[{}]: catalog topic '{}' (id={}) — building it failed: {}", config_.nodeId,
                       spec.name, spec.topicId, ex.what());
     }
+}
+
+// The boot builds the catalog's typed topics, and the workers own their partitions, before the admin thread re-posts the
+// topics' validators and write specs.  The startup thread queues them first (the control thread is not running yet), so
+// the leader-role hold has something to wait for.  The admin thread's later posts are idempotent on the workers.
+void BrokerNode::postBootWriteSpecs_() {
+    if (!workerPool_ || !bootApplier_ || !schemaRegistry_) return;
+    for (const rune::catalog::TopicObject* t : bootApplier_->state().topics()) {
+        const auto w = writeSpecWireOf(*t);
+        if (!w) continue;
+        for (uint16_t v = 1; v <= t->schema->schemaVersion; ++v)
+            if (const RegistryEntry* e = schemaRegistry_->byIdVersion(t->topicId, v))
+                schemaFanout_.post(t->topicId, v, rune::codec::serialize(e->descriptor));
+        std::vector<uint8_t> spec(kTopicWriteSpecWireLen);
+        (void)encodeTopicWriteSpec(*w, spec);
+        schemaFanout_.postWriteSpec(t->topicId, std::move(spec));
+    }
+}
+
+bool BrokerNode::leaderRoleAwaitsSpecThunk_(void* self, int32_t topicId) noexcept {
+    return static_cast<BrokerNode*>(self)->schemaFanout_.pendingFor(topicId);
 }
 
 int BrokerNode::serviceCreatesAwaitingSpec_() {

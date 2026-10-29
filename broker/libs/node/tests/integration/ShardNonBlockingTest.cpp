@@ -1779,6 +1779,49 @@ TEST(OwnershipGuardRegression, PendingRoleOpsKeepPerReplicaOrderAndDropRemovedRe
     EXPECT_EQ(r->role(), Role::Leader) << "FIFO: follower then leader";
 }
 
+// Checked writes: a typed topic's BecomeLeader waits while its validators / write spec are not on every worker ring (the
+// BrokerNode hold is SchemaFanout::pendingFor).  It stays queued, is retried every cycle, and does not hold back another
+// replica's role op behind it; once the hold lifts it is delivered.  RED: route or flush the leader op while held.
+TEST(OwnershipGuardRegression, HeldLeaderRoleWaitsForItsSpecAndPassesOtherReplicasRegression) {
+    Reg R;
+    WorkerPool pool(1, rune::metadata::ShardRouter(1), 1 << 12, 1 << 16, 16, 16);
+    pool.assignFromRegistry(R.reg);
+    pool.setRegistry(&R.reg);
+    pool.setRunnersStartedForTest(true);
+    auto* typed = R.add(5, 0);
+    auto* other = R.add(6, 0);
+    pool.reconcile(R.reg);
+    for (int i = 0; i < 16; ++i) pool.worker(0).doWork(1 + i);
+    struct Hold { bool on = true; } hold;
+    ReplicationMetadataBridge bridge(1, {1, 2}, R.reg);
+    bridge.setWorkerPool(&pool);
+    bridge.setLeaderRoleHold([](void* ctx, int32_t topicId) noexcept { return topicId == 5 && static_cast<Hold*>(ctx)->on; }, &hold);
+    bridge.routeBecomeFollowerForTest(typed, 2, 2);          // a follower role is never held
+    for (int i = 0; i < 16 && typed->role() != Role::Follower; ++i) pool.worker(0).doWork(20 + i);
+    ASSERT_EQ(typed->role(), Role::Follower);
+    ASSERT_EQ(bridge.pendingRoleOpsForTest(), 0u);
+    bridge.routeBecomeLeaderForTest(typed, 3, {1});
+    bridge.routeBecomeFollowerForTest(other, 2, 2);          // queued behind the held op
+    ASSERT_EQ(bridge.pendingRoleOpsForTest(), 2u) << "the held leader is not routed, the follower waits behind it";
+    for (int i = 0; i < 16; ++i) {
+        bridge.flushPendingRoleOpsForTest();
+        pool.worker(0).doWork(100 + i);
+        pool.worker(0).drainReturn([](WorkerReturn) {});
+    }
+    EXPECT_EQ(bridge.pendingRoleOpsForTest(), 1u) << "only the held leader op is left";
+    EXPECT_EQ(other->role(), Role::Follower) << "another replica's role passes the held one";
+    EXPECT_EQ(typed->role(), Role::Follower) << "no leadership before the spec";
+    hold.on = false;
+    for (int i = 0; i < 16 && bridge.pendingRoleOpsForTest() > 0; ++i) {
+        bridge.flushPendingRoleOpsForTest();
+        pool.worker(0).doWork(200 + i);
+        pool.worker(0).drainReturn([](WorkerReturn) {});
+    }
+    ASSERT_EQ(bridge.pendingRoleOpsForTest(), 0u);
+    for (int i = 0; i < 16 && typed->role() != Role::Leader; ++i) pool.worker(0).doWork(300 + i);
+    EXPECT_EQ(typed->role(), Role::Leader) << "delivered once the spec is on every ring";
+}
+
 TEST(OwnershipGuardRegression, RefusedMarkerWithUnknownTokenForRegisteredPartitionHalts) {
     // Round 4: a refusal the gateway cannot match to a marker it issued, while
     // the partition is still registered here, is an invariant violation (halt).
