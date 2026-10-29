@@ -193,12 +193,11 @@ inline RecordsSendResult sendRecordsFrame(aeron::ExclusivePublication&          
     pc::detail::putLE32(scratch, static_cast<int>(fixedLen - 4u),
                         static_cast<int32_t>(static_cast<uint32_t>(rec.recordBatch.size())));
 
-    const std::array<aeron::concurrent::AtomicBuffer, 2> parts{
-        aeron::concurrent::AtomicBuffer(scratch, static_cast<aeron::util::index_t>(fixedLen)),
-        aeron::concurrent::AtomicBuffer(const_cast<uint8_t*>(rec.recordBatch.data()),
-                                        static_cast<aeron::util::index_t>(rec.recordBatch.size()))};
-    int64_t pos = pub.offer(parts);
-    if (pos == aeron::ADMIN_ACTION) [[unlikely]] pos = pub.offer(parts);   // A9: term rotated — retry now
+    // The C++ wrapper's vectored offer builds a heap std::vector<aeron_iovec_t> per call; offer the stack iovecs directly.
+    aeron_iovec_t parts[2] = {{scratch, fixedLen}, {const_cast<uint8_t*>(rec.recordBatch.data()), rec.recordBatch.size()}};
+    int64_t pos = aeron_exclusive_publication_offerv(pub.publication(), parts, 2, nullptr, nullptr);
+    if (pos == aeron::ADMIN_ACTION) [[unlikely]]   // A9: term rotated — retry now
+        pos = aeron_exclusive_publication_offerv(pub.publication(), parts, 2, nullptr, nullptr);
     return {pos > 0 ? RecordsSendKind::Sent : RecordsSendKind::Retry, pos};
 }
 
