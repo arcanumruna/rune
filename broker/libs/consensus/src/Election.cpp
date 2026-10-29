@@ -1690,16 +1690,17 @@ void Election::leaveClosedForElection_(Term term, int64_t nowNs, const char* rea
 // ---------------------------------------------------------------------------
 // Private: state transition — Election.java:1385-1438
 // ---------------------------------------------------------------------------
-void Election::state(ElectionState next, int64_t nowNs, const char* /*reason*/)
+void Election::state(ElectionState next, int64_t nowNs, const char* reason)
 {
     if (next == state_) return;
     if (state_ == ElectionState::Nominate) preBallot_ = PreBallot{};   // D29
     if (electLog()) {
         std::fprintf(stderr,
-            "[ELECT node=%d] state %d -> %d term=%lld leader=%d nowNs=%lld\n",
+            "[ELECT node=%d] state %d -> %d term=%lld leader=%d nowNs=%lld cand=%lld (%s)\n",
             (int)thisMemberId_, (int)state_, (int)next,
             (long long)leadershipTermId_,
-            (int)(leaderMember_ ? leaderMember_->id : -1), (long long)nowNs);
+            (int)(leaderMember_ ? leaderMember_->id : -1), (long long)nowNs,
+            (long long)candidateTermId_, reason ? reason : "");
     }
 
     // Election.java:1389-1391: leaving CANVASS clears isExtendedCanvass

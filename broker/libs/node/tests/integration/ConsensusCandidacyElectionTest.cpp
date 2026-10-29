@@ -553,6 +553,8 @@ TEST(StorageGateWiringRegression, JoinerElectionIsHeldFromBootRegression) {
 // leader is agreed.  This test does NOT pin X's own storage hold: with X fenced out, dropping the hold (both
 // setStorageHold sites) stays green here - that hold is pinned by
 // StorageGateWiringRegression.JoinerElectionIsHeldFromBootRegression (PR #574 review).
+// Both non-X members are held before the member that currently leads is resigned (leadership can move L -> Y while X
+// restarts, which made a resign of the stale L a silent no-op).
 TEST(ConsensusCandidacyElectionRegression, WipedMemberNeverConsensusLeader_CommittedMetadataSurvivesRegression) {
     Cluster c(3);
     for (int i = 0; i < 3; ++i) c.start(i);
@@ -569,9 +571,15 @@ TEST(ConsensusCandidacyElectionRegression, WipedMemberNeverConsensusLeader_Commi
         << "a wiped, unconfirmed member is fenced out of the committed metadata ISR";
     EXPECT_TRUE(c.knowledge(L).contains(Y)) << "precondition: L still lists Y in the metadata ISR";
 
+    // Hold both members that can lead (X is fenced out) BEFORE choosing whom to resign: the consensus leader can
+    // move between them while X restarts (under TSan load it did), and once both are held it can no longer move.
     c.node(Y).setTestCandidacyHold(true);
     c.node(L).setTestCandidacyHold(true);
-    c.node(L).resignConsensusForTest();
+    int32_t current = -1;
+    ASSERT_TRUE(until([&] { current = c.agreedLeader({L, Y}); return current >= 0; }, 5s))
+        << "no settled consensus leader among the two held members";
+    ASSERT_TRUE(current == L || current == Y);
+    ASSERT_TRUE(c.node(current).resignConsensusForTest()) << "the current consensus leader " << current << " did not resign";
     // 2 s window: ample to see an unheld X win if it could (it did so within ~0.3 s when it was still in the ISR).
     const auto window = std::chrono::steady_clock::now() + 2s;
     bool xLed = false, agreed = false;

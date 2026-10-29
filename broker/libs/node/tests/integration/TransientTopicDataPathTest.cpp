@@ -1034,7 +1034,10 @@ TEST(TransientLineageClusterRegression, StaggeredFullRestartWithTheOldLeaderLast
     // the last few, served after the hold legitimately decided P, read as "an answer other than NotLeader".
     // The window is now explicit (sampling ends 500 ms before the earliest possible hold end) and 10 s wide
     // so >= 100 answers fit even under load.
-    g.holdMs = 10'000;
+    // TSan (#622): restarting the two nodes alone took ~9.6 s, so a 10 s hold left no window at all (0 answers).
+    // 30 s covers the restart plus >= 100 answers at sanitizer speed; the final settledFetch (>= 30 s of retries)
+    // absorbs whatever hold is left once the old leader returns.
+    g.holdMs = 30'000;
     const auto holdStart = std::chrono::steady_clock::now();
     const auto sampleUntil = holdStart + std::chrono::milliseconds{g.holdMs} - 500ms;
     for (int i = 0; i < 3; ++i) if (i != leader) g.start(i);   // the old partition leader stays down
@@ -1097,6 +1100,7 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
     ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
+    c.keepSessionsAlive(true);   // a real client keeps its sessions alive (1 s keepalive)
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int coord = g.coordinator();
     ASSERT_GE(coord, 0);
@@ -1132,7 +1136,7 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     ASSERT_TRUE(committed) << "the group never committed";
 
     // L crashes; the member re-joins and fetches BEFORE the failure detector ran.
-    g.stop(L);
+    c.whilePumping([&] { g.stop(L); });
     const auto rj = c.joinGroup(gwC, kClientStream, sidC, "lg-rf1", member);
     ASSERT_TRUE(rj.has_value() && rj->errorCode == kOffsetOk) << "the re-join was not answered";
     const int32_t preMintGen = rj->generation;
@@ -1146,7 +1150,8 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     // L restarts: empty ring, a NEW lineage for P.  (Until the mint commits,
     // the old offset may still be answered — the window this test is about;
     // what must hold is everything AFTER the mint.)
-    g.start(L);
+    // the client keeps pumping (keepalives) while the harness restarts L
+    c.whilePumping([&] { g.start(L); });
     bool minted = false;
     for (int k = 0; k < 600 && !minted; ++k) {
         const auto r = c.offsetFetch(gwC, kClientStream, sidC, "lg-rf1", 0, P);
@@ -1303,6 +1308,7 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
     ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
+    c.keepSessionsAlive(true);   // a real client keeps its sessions alive (1 s keepalive)
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int coord = g.coordinator();
     ASSERT_GE(coord, 0);
@@ -1367,8 +1373,9 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     ASSERT_TRUE(probed);
 
     // L crashes and restarts: a new lineage.
-    g.stop(L);
-    g.start(L);
+    // the client keeps pumping (keepalives) while the harness restarts L: sidC must outlive the ~9 s restart
+    c.whilePumping([&] { g.stop(L); });
+    c.whilePumping([&] { g.start(L); });
     bool minted = false;
     for (int k = 0; k < 600 && !minted; ++k) {
         const auto r = c.offsetFetch(gwC, kClientStream, sidC, "lg-probe", 0, P);
@@ -1385,7 +1392,15 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     ASSERT_TRUE(after.has_value());
     EXPECT_EQ(after->first, -1) << "SILENT LOSS: the member would resume at " << after->first;
 
-    // Re-join: a new generation; every post-restart record exactly once from the log start.
+    // The member's pre-mint (member, generation) no longer holds: it must re-join.  Normally the lineage sweep
+    // bumps the generation; if the coordinator role flapped meanwhile, the group was unloaded (#565 / #570) and
+    // the member is unknown.  Either way a heartbeat at the old pair is refused — the generation number itself
+    // is not compared, since a reloaded group starts its count afresh.
+    const auto oldHb = c.heartbeat(gwC, kClientStream, sidC, "lg-nocommit", member, gen);
+    ASSERT_TRUE(oldHb.has_value());
+    EXPECT_NE(*oldHb, kOffsetOk) << "the group was not rebalanced for the new lineage";
+
+    // Re-join: every post-restart record exactly once from the log start.
     std::optional<ShardTestClient::JoinAnswer> j2;
     for (int k = 0; k < 400; ++k) {
         j2 = c.joinGroup(gwC, kClientStream, sidC, "lg-nocommit", member, {0});
@@ -1393,7 +1408,6 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
         std::this_thread::sleep_for(50ms);
     }
     ASSERT_TRUE(j2 && j2->errorCode == kOffsetOk);
-    EXPECT_GT(j2->generation, gen) << "the group was not rebalanced for the new lineage";
     const int64_t sidL2 = c.connect(gatewayChannel(g.ports, L), kClientStream);
     for (int64_t want = 0; want < 6; ++want) {
         const auto ack = c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL2, 0, P, 1, makeBatch(1));

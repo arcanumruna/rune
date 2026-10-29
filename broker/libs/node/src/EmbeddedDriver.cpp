@@ -130,7 +130,7 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     // over a second to zero-fill the command queues.
     {
         std::string lockErr;
-        dirLock_ = DriverDirLock::tryAcquire(cfg_.dir, lockErr);
+        dirLock_ = DriverDirLock::tryLock(cfg_.dir, lockErr);
         if (!dirLock_) {
             releaseGso_();
             throw std::runtime_error(

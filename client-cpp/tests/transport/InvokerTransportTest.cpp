@@ -812,6 +812,7 @@ TEST(InvokerTransportDirLockRegression, ALiveDriverThatHoldsNoLockIsRefusedRegre
     }
     EXPECT_TRUE(std::filesystem::exists(std::filesystem::path{aeronDir} / "cnc.dat")) << "the live driver's dir was wiped";
     aeron_driver_close(raw);
+    aeron_driver_context_close(ctx);   // aeron_driver_close leaves the context to its owner
     std::error_code ec;
     std::filesystem::remove_all(cfg.dataDir, ec);
 }

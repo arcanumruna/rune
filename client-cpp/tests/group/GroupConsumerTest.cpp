@@ -936,7 +936,7 @@ TEST_F(GroupConsumerHubTest, AutocommitTimer_SendsOffsetCommit) {
     impl_->assignment[tp] = 5;
 
     // Set auto-commit timer to be in the past.
-    impl_->nextAutoCommit = std::chrono::steady_clock::now() - 1ms;
+    impl_->nextAutoCommitNs = 0;   // in the past
 
     sink_.clear();
 
@@ -1130,7 +1130,7 @@ TEST_F(GroupConsumerHubTest, IdlePartitionNotCommittedAsSentinel) {
     EXPECT_EQ(impl_->assignment.at(tp), GroupConsumerImpl::kUnseededSentinel);
 
     // Trigger auto-commit immediately.
-    impl_->nextAutoCommit = std::chrono::steady_clock::now() - 1ms;
+    impl_->nextAutoCommitNs = 0;   // in the past
     const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     hub_->doWork(nowNs, kSessionId, sink_.fn());
@@ -3438,7 +3438,7 @@ struct CtlRig {
     void toStable()  { toSyncing(); answerSyncOk(0); answerSyncOk(1); }
     // Both members are due a heartbeat now; one doWork sends one each.
     void beat() {
-        for (auto& m : impl) m.nextHeartbeat = std::chrono::steady_clock::time_point{};
+        for (auto& m : impl) m.nextHeartbeatNs = 0;
         hub.doWork(0, kSessionId, sink.fn());
     }
 };
@@ -3508,7 +3508,7 @@ class GroupAuthUnavailableRegression : public GroupConsumerHubTest {};
 TEST_F(GroupAuthUnavailableRegression, AHeartbeatAnswered48KeepsTheMemberStableRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     sink_.clear();
-    impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+    impl_->nextHeartbeatNs = 0;
     hub_->doWork(0, kSessionId, sink_.fn());
     const int64_t h1 = lastCorr(sink_, rpc::TemplateId::Heartbeat);
     ASSERT_NE(h1, 0);
@@ -3519,7 +3519,7 @@ TEST_F(GroupAuthUnavailableRegression, AHeartbeatAnswered48KeepsTheMemberStableR
     EXPECT_EQ(impl_->backoffRejoins, rejoinsBefore);
     EXPECT_TRUE(impl_->active);
     sink_.clear();
-    impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+    impl_->nextHeartbeatNs = 0;
     hub_->doWork(0, kSessionId, sink_.fn());
     EXPECT_EQ(lastCorr(sink_, rpc::TemplateId::JoinGroup), 0) << "no JoinGroup after the 48";
     EXPECT_NE(lastCorr(sink_, rpc::TemplateId::Heartbeat), 0) << "the next heartbeat is the retry";
@@ -3537,7 +3537,7 @@ TEST_F(GroupAuthUnavailableRegression, HeartbeatsAnswered48ForASessionTimeoutRej
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     auto beatAnswered = [&](int16_t code) {
         sink_.clear();
-        impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+        impl_->nextHeartbeatNs = 0;
         hub_->doWork(0, kSessionId, sink_.fn());
         const int64_t h = lastCorr(sink_, rpc::TemplateId::Heartbeat);
         ASSERT_NE(h, 0);
@@ -3629,7 +3629,7 @@ TEST_F(GroupConsumerHubRegression, AStaleJoinAnswerIsDroppedRegression) {
     auto rb = makeJoinGroupResponseError(static_cast<int16_t>(rpc::ErrorCode::RebalanceInProgress), c1);
     hub_->onJoinGroupResponse(rb.data(), rb.size(), kSessionId, sink_.fn());
     ASSERT_EQ(impl_->state, GroupConsumerState::Rejoining);
-    impl_->rejoinNotBefore = std::chrono::steady_clock::time_point{};
+    impl_->rejoinNotBeforeNs = 0;
     sink_.clear();
     hub_->doWork(0, kSessionId, sink_.fn());
     ASSERT_EQ(impl_->state, GroupConsumerState::Joining);
@@ -3651,10 +3651,10 @@ TEST_F(GroupConsumerHubRegression, AStaleJoinAnswerIsDroppedRegression) {
 TEST_F(GroupConsumerHubRegression, ASlowHeartbeatAnswerOfThisGenerationIsStillAppliedRegression) {
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     sink_.clear();
-    impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+    impl_->nextHeartbeatNs = 0;
     hub_->doWork(0, kSessionId, sink_.fn());
     const int64_t h1 = lastCorr(sink_, rpc::TemplateId::Heartbeat);
-    impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+    impl_->nextHeartbeatNs = 0;
     hub_->doWork(0, kSessionId, sink_.fn());
     const int64_t h2 = lastCorr(sink_, rpc::TemplateId::Heartbeat);
     ASSERT_NE(h1, 0);
@@ -3684,7 +3684,7 @@ TEST_F(GroupConsumerHubRegression, GroupControlCorrIdsAreTaggedAndDisjointRegres
 
     bringToStable(*hub_, sink_, kTopicId, kPartition);
     sink_.clear();
-    impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+    impl_->nextHeartbeatNs = 0;
     hub_->doWork(0, kSessionId, sink_.fn());
     for (const auto tid : {rpc::TemplateId::JoinGroup, rpc::TemplateId::SyncGroup, rpc::TemplateId::Heartbeat}) {
         const int64_t c = tid == rpc::TemplateId::JoinGroup ? g_lastJoinCorr
@@ -3793,7 +3793,7 @@ TEST_F(GroupConsumerHubRegression, ARejoiningConsumerDefersOnAnOlderCoordinatorR
     hub_->onConnected(kSessionId, sink_.fn());
     EXPECT_EQ(joinFrames(sink_), 0);
     EXPECT_TRUE(impl_->active);
-    impl_->rejoinNotBefore = std::chrono::steady_clock::time_point{};
+    impl_->rejoinNotBeforeNs = 0;
     tickManyTimes(*hub_, sink_);
     EXPECT_EQ(joinFrames(sink_), 0);
     EXPECT_TRUE(impl_->active);
@@ -3876,7 +3876,7 @@ TEST_F(GroupConsumerHubRegression, HeartbeatWindowHoldsAcrossTheSequenceWrapAdve
     ASSERT_EQ(impl_->hbSeqLo, 0xFFFFFFFEu);
     std::vector<int64_t> hb;
     for (int i = 0; i < 4; ++i) {
-        impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+        impl_->nextHeartbeatNs = 0;
         sink_.clear();
         hub_->doWork(0, kSessionId, sink_.fn());
         hb.push_back(lastCorr(sink_, rpc::TemplateId::Heartbeat));
@@ -3916,7 +3916,7 @@ TEST_F(GroupConsumerHubRegression, DuplicateAndReplayedControlAnswersChangeNothi
     auto sOk1 = makeSyncGroupResponseOK({{kTopicId, kPartition}}, s1);
     hub_->onSyncGroupResponse(sOk1.data(), sOk1.size(), kSessionId, sink_.fn());
     ASSERT_EQ(impl_->state, GroupConsumerState::Stable);
-    impl_->nextHeartbeat = std::chrono::steady_clock::time_point{};
+    impl_->nextHeartbeatNs = 0;
     hub_->doWork(0, kSessionId, sink_.fn());
     const int64_t h1 = lastCorr(sink_, rpc::TemplateId::Heartbeat);
     ASSERT_NE(h1, 0);
@@ -3928,7 +3928,7 @@ TEST_F(GroupConsumerHubRegression, DuplicateAndReplayedControlAnswersChangeNothi
     auto rb = makeHeartbeatResponse(static_cast<int16_t>(rpc::ErrorCode::RebalanceInProgress), h1);
     hub_->onHeartbeatResponse(rb.data(), rb.size(), kSessionId, sink_.fn());
     ASSERT_EQ(impl_->state, GroupConsumerState::Rejoining);
-    impl_->rejoinNotBefore = std::chrono::steady_clock::time_point{};
+    impl_->rejoinNotBeforeNs = 0;
     sink_.clear();
     hub_->doWork(0, kSessionId, sink_.fn());
     ASSERT_EQ(impl_->state, GroupConsumerState::Joining);

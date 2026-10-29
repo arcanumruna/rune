@@ -272,7 +272,7 @@ struct Rig {
         const OfferedFrame* f = pendingAdd();
         ASSERT_NE(f, nullptr) << "no AddPartitionsToTxn for the transaction's records";
         answeredAdds.push_back(f->corrId);
-        answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, f->corrId, 0));
+        answer(fake.answerAdd(f->corrId, 0));
     }
     [[nodiscard]] const OfferedFrame* pendingAdd() const {
         for (const auto& f : fake.offered) {
@@ -1765,6 +1765,50 @@ TEST(ProducerTxnRegression, LinkResentCommitRefusedIsFatalNeverAbortableRegressi
 }
 
 
+// #698: an AddPartitionsToTxn answer that parses but does NOT name a requested partition never said Ok for it: that
+// partition fails (InvalidRequest 39) instead of inheriting the request-level code 0, so nothing is produced to a
+// partition the coordinator may not have added.  The named one (code 0) is Added; the failure poisons Plain (never
+// produced: no gap), which fails every still-unsent record at once (#368): nothing is produced, the commit completes
+// BrokerError(39), the abort Ok.
+// RED (mutation): an unnamed partition takes the request-level code again (both Added, no poison, the txn stays open).
+TEST(ProducerTxnRegression, APartitionOmittedFromTheAddPartitionsAnswerFailsRegression) {
+    rc::ProducerConfig cfg = txnCfg();
+    cfg.lingerUs = 1'000;
+    Rig r(cfg);
+    r.initOk();
+    r.startTxn(rp::TxnStarted::No);
+    ASSERT_TRUE(r.sendRecord(0));
+    ASSERT_TRUE(r.sendRecord(1));
+    for (int i = 0; i < 4 && r.pendingAdd() == nullptr; ++i) r.tick();
+    const OfferedFrame* add = r.pendingAdd();
+    ASSERT_NE(add, nullptr);
+    {
+        const auto m = rpc::AddPartitionsToTxn::decode(add->head.data(), std::min<std::size_t>(add->len, add->head.size()));
+        ASSERT_TRUE(m.has_value());
+        ASSERT_EQ(m->partitions.size(), 2u) << "both partitions are requested in one frame";
+    }
+    // FakeCoordinator::answer names exactly (topic 1, partition 0) with the given code: partition 1 is omitted.
+    r.answeredAdds.push_back(add->corrId);
+    r.answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, add->corrId, 0));
+    r.ticks(4, 2 * kMs);
+    // The named partition is Added, but the poison (#368) fails every record still unsent at once, so its batch never
+    // leaves either; what matters here is that the omitted partition never produces and the transaction is abortable.
+    for (const auto& w : r.wire) EXPECT_EQ(w.partition, 0) << "the omitted partition never produces";
+    EXPECT_TRUE(r.wire.empty());
+    ASSERT_EQ(r.state(), TxnState::AbortableError);
+    Op cm = r.commit();
+    ASSERT_TRUE(cm.ready());
+    EXPECT_EQ(cm.status(), OpStatus::BrokerError) << "the transaction is abortable";
+    EXPECT_EQ(cm.code(), uec(rpc::ErrorCode::InvalidRequest));
+    Op ab = r.abort();
+    r.ticks(3);
+    if (!ab.ready() && r.endTxns() > 0) r.endAnswer();
+    r.ticks(3);
+    ASSERT_TRUE(ab.ready());
+    EXPECT_EQ(ab.status(), OpStatus::Ok);
+    EXPECT_EQ(r.state(), TxnState::Ready);
+}
+
 // ============================================================================================================
 // Batch C15 (#344): op origin, the caps, the claim-abandon allocation
 // ============================================================================================================
@@ -1789,7 +1833,7 @@ TEST(ProducerTxnRegression, CloseDuringAnAbortablyFailingCommitStillAbortsTheTxn
     ASSERT_NE(add, nullptr);
     Op cl = r.close();                 // arrives while the app commit runs
     EXPECT_FALSE(cl.ready());
-    r.answer(FakeCoordinator::answer(rp::ReqKind::AddPartitions, add->corrId, ec(rpc::ErrorCode::InvalidTxnState)));
+    r.answer(r.fake.answerAdd(add->corrId, ec(rpc::ErrorCode::InvalidTxnState)));
     // The commit failed abortably; the close must abort the still-open transaction itself.
     for (int i = 0; i < 4 && r.endTxns() == 0; ++i) r.tick();
     EXPECT_FALSE(cl.ready()) << "close finished without aborting the open transaction (the app op's outcome became its own)";

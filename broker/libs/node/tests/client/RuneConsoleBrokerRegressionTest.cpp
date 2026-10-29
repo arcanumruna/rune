@@ -234,6 +234,30 @@ TEST(RuneConsoleBrokerRegression, ScriptStopsAtTheFirstBrokerErrorWithItsCodeReg
     for (const auto& e : b.catalogEvents()) EXPECT_NE(e.event.objectName, "never") << "nothing after the failure is issued";
 }
 
+// #702: the live test seam runs a `-f` script as `rune console -f` does (it used to pass an empty batch): the script
+// stops at the statement the broker refuses, with its code, and nothing after it is issued.
+TEST(RuneConsoleBrokerRegression, ScriptThroughTheLiveSeamStopsAtTheRefusedStatementRegression) {
+    OneBroker b("console_seam_script");
+    const std::string f = writeFile("seam_script.rql",
+        "topic sv { id int64, a int32 } partitions 1 key id;\n"
+        "alter topic sv set compatibility forward;\n"
+        "alter topic sv drop column a;\n"          // a DROP under FORWARD: SchemaIncompatible
+        "topic never partitions 1;\n");
+    int fds[2]{-1, -1};
+    ASSERT_EQ(::pipe(fds), 0);
+    std::ostringstream out, err;
+    uint64_t pumps = 0;
+    const int rc = rune::cli::console::runLiveOnFdForTest(
+        {"console", "--broker", b.endpoint(), "--tls-ca", AuthBroker::tlsCaFile().string(), "-f", f}, fds[0], out, err,
+        &pumps);
+    ::close(fds[0]);
+    ::close(fds[1]);
+    EXPECT_EQ(rc, static_cast<int>(rune::protocol::client::ErrorCode::SchemaIncompatible)) << err.str();
+    EXPECT_NE(err.str().find(f + ":statement 3: "), std::string::npos) << err.str();
+    EXPECT_NE(err.str().find("SchemaIncompatible (30)"), std::string::npos) << "the broker code is named: " << err.str();
+    for (const auto& e : b.catalogEvents()) EXPECT_NE(e.event.objectName, "never") << "nothing after the failure is issued";
+}
+
 TEST(RuneConsoleBrokerRegression, ValidateAndExpectedVersionReachTheBrokerRegression) {
     OneBroker b("console_flags");
     const std::string f1 = writeFile("flags1.rql", "topic fv { id int64 } partitions 1 key id;\nalter topic fv add column a int32;\n");

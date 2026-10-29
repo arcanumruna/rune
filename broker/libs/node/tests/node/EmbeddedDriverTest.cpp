@@ -255,7 +255,8 @@ TEST(EmbeddedDriverRegression, ALiveDriverThatHoldsNoLockIsRefusedAdversarialReg
     ASSERT_TRUE(aeron_is_driver_active(d.path.c_str(), 10000, [](const char*) {}));
     EXPECT_THROW(EmbeddedDriver b(cfgAt(d.path), DriverMode::Invoker), std::runtime_error)
         << "a second driver started on a live driver's dir (and wiped it)";
-    aeron_driver_close(raw);   // also closes ctx
+    aeron_driver_close(raw);
+    aeron_driver_context_close(ctx);   // aeron_driver_close leaves the context to its owner
 }
 
 // #654 review — FAILING (not committed).  The lock is keyed by the path STRING, not by the dir: "dir/." locks

@@ -264,8 +264,16 @@ struct HubRig {
     rc::ClientConfig             cfg;
     rc::Client                   client;
     test_support::InvokerGateway gw;
-    explicit HubRig(int32_t in, std::size_t termBytes = 0, rc::NanoClock clock = nullptr, int64_t closeTimeoutMs = 1)
-        : cfg(withOpts(hubCfg(in, in + 1, rc::RunnerMode::Invoker), termBytes, clock, closeTimeoutMs)), client(cfg),
+    // subscribeTimeoutMs > 0: a Subscribe's deadline is on the duty clock (#701), so a test that jumps that clock
+    // past the 10 s default sets its own bound.
+    explicit HubRig(int32_t in, std::size_t termBytes = 0, rc::NanoClock clock = nullptr, int64_t closeTimeoutMs = 1,
+                    int64_t subscribeTimeoutMs = 0)
+        : cfg([&] {
+              rc::ClientConfig c = withOpts(hubCfg(in, in + 1, rc::RunnerMode::Invoker), termBytes, clock, closeTimeoutMs);
+              if (subscribeTimeoutMs > 0) c.subscribeTimeoutMs = subscribeTimeoutMs;
+              return c;
+          }()),
+          client(cfg),
           gw(cfg.dataDir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId,
              cfg.egressChannel, cfg.egressStreamId) {}
 
@@ -796,7 +804,7 @@ TEST(HubCommandClient, SubscribeFromOnConnectedCallbackReachesTheBrokerRegressio
 // session) that the push binds.  A is kept pending by losing its first
 // SubscribeResponse.
 TEST(HubCommandClient, SubscribeFromARecordHandlerInTheReconnectPollReachesTheBrokerRegression) {
-    HubRig r(4016, 0, &hubNow);
+    HubRig r(4016, 0, &hubNow, 1, /*subscribeTimeoutMs=*/600'000);   // A must outlive the 11 s duty-clock jump below
     r.connect();
     std::unique_ptr<rc::Subscription> b;
     int got = 0;
@@ -1142,18 +1150,17 @@ TEST(HubCommandClient, TxnNotLeaderReoffersOnTheNewRouteAndCommitsRegression) {
     EXPECT_EQ(r.cq.timesCompleted(commit.token()), 1);
 }
 
-// D6 review M2 end to end (real Invoker Client + Aeron IPC, InvokerGateway
-// broker model): a transactional producer whose every record retention removed
-// before a failover (the rebuilt producer state forgot it) meets
-// UnknownProducerId on its next transaction's first batch (seq 1) with
-// logStartOffset past everything it had acked -> the partition's sequences must
-// restart: the transaction fails abortable (UnknownProducerId), its abort's
-// epoch bump restarts them and the NEXT transaction commits (Phase 2b F: the
-// coordinator owns a transactional epoch, so no local restart keeps the
-// transaction); each record is written once.  Loss instead (acked data at/above
-// the log start forgotten) -> the commit fails with the app-visible code 28.
-TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionAbortsTheTxnAndTheNextCommitsUnderANewEpochRegression) {
+// D6 review M2 / #694 end to end (real Invoker Client + Aeron IPC, InvokerGateway broker model): a transactional
+// producer whose producer state the broker lost (retention removed every record of ours before a failover - or the
+// state was simply forgotten) meets UnknownProducerId on its next transaction's first batch (seq 1).  Nothing of
+// that transaction was acked on the partition, so the partition's sequences restart at 0 under the SAME producer id
+// and epoch (the coordinator's) and the transaction continues and commits - no abort, no epoch bump; each record is
+// written once.  (A transaction whose OWN acked data is gone stays abortable: ProducerTxnDataRegression.
+// UnknownProducerIdWithThisTxnsDataGoneIsAbortableRegression.)
+// RED (mutation): restartInPlace_ unreachable (the commit fails with 28 and the abort bumps the epoch).
+TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionRestartsSequencesAndTheTxnCommitsRegression) {
     for (bool retention : {true, false}) {
+        SCOPED_TRACE(retention ? "retention" : "loss");
         HubRig r(retention ? 4090 : 4092);
         auto tp = r.client.producer(txnPcfg(retention ? "tx-upid-ret" : "tx-upid-loss"));
         r.connect();
@@ -1169,6 +1176,8 @@ TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionAbortsTheTxnAndTheNextC
         ASSERT_TRUE(r.drive([&] { return c1.ready(); })) << c1.describe();
         ASSERT_EQ(c1.status(), rc::OpStatus::Ok) << c1.describe();
         ASSERT_EQ(r.gw.log.size(), 1u);
+        const auto epoch1 = r.gw.log[0].producerEpoch;
+        const auto pid1   = r.gw.log[0].producerId;
 
         if (retention) r.gw.retainAndRebuild(r.gw.nextOffset);   // retention + failover
         else           r.gw.forgetProducers();                   // loss: the acked record is still >= log start
@@ -1181,36 +1190,22 @@ TEST(HubCommandClient, TxnUnknownProducerIdAfterRetentionAbortsTheTxnAndTheNextC
         ASSERT_TRUE(r.drive([&] { return c2.ready(); })) << c2.describe();
         EXPECT_GT(r.gw.unknownPidAnswers, 0) << "precondition: the broker answered UnknownProducerId";
         EXPECT_EQ(r.gw.crcFailures + r.gw.identityMismatches, 0) << "re-stamped frames are valid";
-        if (retention) {
-            // Phase 2b F (Task 6 design, changed assertion): a transactional producer's epoch belongs to its
-            // coordinator, so a sequence restart can no longer keep the transaction - it fails abortable (28) and the
-            // abort's epoch bump restarts the sequences; the next transaction commits.
-            EXPECT_EQ(c2.status(), rc::OpStatus::BrokerError) << c2.describe();
-            EXPECT_EQ(c2.outcome().c.errorCode,
-                      static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownProducerId));
-            EXPECT_EQ(r.gw.log.size(), 0u) << "retention emptied the log; nothing of the failed transaction was written";
-            auto ab = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.abortTransaction(q, t); });
-            ASSERT_TRUE(r.drive([&] { return ab.ready(); })) << ab.describe();
-            ASSERT_EQ(ab.status(), rc::OpStatus::Ok) << ab.describe();
-            tp.beginTransaction();
-            tp.send(r.client.topic("t"), rc::Key(uint64_t{2}), std::span<const uint8_t>(kTxnVal));
-            tp.send(r.client.topic("t"), rc::Key(uint64_t{3}), std::span<const uint8_t>(kTxnVal));
-            auto c3 = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
-            ASSERT_TRUE(r.drive([&] { return c3.ready(); })) << c3.describe();
-            EXPECT_EQ(c3.status(), rc::OpStatus::Ok) << c3.describe();
-            // The unified producer batches the two sends into one produce batch (the old one sent one per send).
-            ASSERT_EQ(r.gw.log.size(), 1u) << "the next transaction's batch written exactly once";
-            EXPECT_EQ(r.gw.log[0].baseSequence, 0) << "sequences restarted at 0 (the abort's epoch bump)";
-            EXPECT_EQ(r.gw.log[0].values.size(), 2u) << "both keys (2 and 3) are in the batch";
-            EXPECT_EQ(r.gw.log[0].producerEpoch, 1) << "under the bumped epoch";
-            EXPECT_EQ(r.gw.endTxnCommits.back(), uint8_t{1});
-        } else {
-            EXPECT_EQ(c2.status(), rc::OpStatus::BrokerError) << c2.describe();
-            EXPECT_EQ(c2.outcome().c.errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownProducerId))
-                << "the app sees 28, not 20";
-            EXPECT_EQ(r.gw.log.size(), 1u) << "only the first (committed) transaction's record: nothing of the failed one";
-        }
+        EXPECT_EQ(c2.status(), rc::OpStatus::Ok) << c2.describe();
+        // The unified producer batches the two sends into one produce batch.
+        ASSERT_EQ(r.gw.log.size(), retention ? 1u : 2u) << "the transaction's batch written exactly once";
+        EXPECT_EQ(r.gw.log.back().baseSequence, 0) << "sequences restarted at 0";
+        EXPECT_EQ(r.gw.log.back().values.size(), 2u) << "both keys (2 and 3) are in the batch";
+        EXPECT_EQ(r.gw.log.back().producerEpoch, epoch1) << "under the SAME epoch: no bump";
+        EXPECT_EQ(r.gw.log.back().producerId, pid1);
+        EXPECT_EQ(r.gw.endTxnCommits.back(), uint8_t{1});
         EXPECT_EQ(r.cq.timesCompleted(c2.token()), 1);
+        // And the producer goes on: the next transaction commits in the continued sequence space.
+        tp.beginTransaction();
+        tp.send(r.client.topic("t"), rc::Key(uint64_t{4}), std::span<const uint8_t>(kTxnVal));
+        auto c3 = r.cq.issue([&](rc::Completions& q, rc::Token t) { return tp.commitTransaction(q, t); });
+        ASSERT_TRUE(r.drive([&] { return c3.ready(); })) << c3.describe();
+        EXPECT_EQ(c3.status(), rc::OpStatus::Ok) << c3.describe();
+        EXPECT_EQ(r.gw.log.back().baseSequence, 2) << "the restarted batch held two records (0, 1)";
     }
 }
 

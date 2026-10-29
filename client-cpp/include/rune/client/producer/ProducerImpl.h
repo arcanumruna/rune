@@ -104,6 +104,13 @@ inline constexpr int32_t kMsgDirectClaimAbort = 8; // #656: an Invoker claim abo
 // kMaxGroupMemberIdBytes) travels as the 48-byte header ONLY: the duty side completes it InvalidArgument without
 // reading any data.
 inline constexpr std::size_t kTxnCtlHeaderBytes = 48;
+/// #345: a transactional producer's sequences continue across transactions under one epoch, so a busy partition would
+/// reach INT32_MAX and lose the transaction that hits it.  After an EndTxn(commit or abort) is answered OK, if ANY partition's
+/// next base sequence is above this threshold (half of the sequence space) the end phase bumps the epoch
+/// (InitProducerId with the current identity) and every partition restarts at 0 before the commit/abort completes.  A
+/// single transaction that writes more than 2^30 records to one partition can still exhaust the space mid-transaction:
+/// that stays AbortableError (no bump is possible while a transaction is open).
+inline constexpr int32_t kTxnSeqBumpAt = 1 << 30;
 
 // CLAIM_BATCH layout (kMsgClaimBatch payload): [0..33] exactly as SEND_RECORD
 // (topicId, partition, keyLen, inline key, flags = 0, ackHandle = 0), then
@@ -1914,6 +1921,9 @@ private:
     void onInitAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s) noexcept;
     void onInitExpired_(CoordinatorLink::Slot& s) noexcept;
     void assignIdentity_(int64_t pid, int16_t epoch) noexcept;
+    /// #694 (rule U3): an UnknownProducerId on a transactional partition none of whose batches this transaction had
+    /// acked: the sequences restart at 0 under the SAME producer id and epoch and every live batch is re-stamped.
+    void restartInPlace_(PartitionState& ps) noexcept;
     void restampInflight_(PartitionState& ps) noexcept;
     void publishStatus_() noexcept;
     void drainStatus_() noexcept { statusRing_.drainLatest(appStatus_); }
@@ -2056,6 +2066,8 @@ private:
     /// EndTxn's final OK (or an unstarted transaction): the epoch bump first when required, else Ready.
     void endDone_(int64_t nowNs) noexcept;
     /// Committing / Aborting -> Ready; the op and its joiners complete Ok.
+    /// #345: does any partition's next base sequence exceed kTxnSeqBumpAt?  (control path: a scan of the partitions)
+    [[nodiscard]] bool seqBumpDue_() const noexcept;
     void finishTxn_() noexcept;
     /// The pending end op's deadline: InDoubt, the op completes Timeout.  `releaseSlot`: false when the link
     /// itself expired the slot (it releases it afterwards).
@@ -2283,7 +2295,6 @@ static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::InTransaction), TxnMachine>, InTransaction>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::CommittingTransaction), TxnMachine>, Committing>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortingTransaction), TxnMachine>, Aborting>);
-static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortableError), TxnMachine>, AbortableError>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::AbortableError), TxnMachine>, AbortableError>);
 static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(TxnState::FatalError), TxnMachine>, FatalError>);
 

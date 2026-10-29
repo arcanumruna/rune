@@ -287,7 +287,11 @@ struct LifeEndingTxn {
 //   are Added for ever: the flush pays one index compare.
 struct NotInTxn  {};
 struct Adding    { CoordinatorLink::Slot* slot = nullptr; };   ///< nullptr: queued for the next AddPartitionsToTxn
-struct Added     {};
+/// ackedBatches: how many of THIS transaction's batches the partition leader acked on this partition (#694).  0 means
+/// the broker may hold no producer state for the transaction here, so an UnknownProducerId restarts the partition's
+/// sequences in place; > 0 means the transaction's own acked data is gone and it can only abort.  Resets with the
+/// membership at every transaction end.  A counter, not a flag (no booleans in a state); saturating.
+struct Added     { uint32_t ackedBatches = 0; };
 struct AddFailed { uint16_t errorCode = 0; };
 using TxnMembership = std::variant<NotInTxn, Adding, Added, AddFailed>;
 inline constexpr std::size_t kAddedIndex = 2;   // index of Added in TxnMembership

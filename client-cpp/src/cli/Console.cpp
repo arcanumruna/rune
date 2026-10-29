@@ -29,6 +29,7 @@
 #include <limits>
 #include <optional>
 #include <ostream>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -646,6 +647,21 @@ int runLive(const ConsoleOptions&, std::istream&, const std::vector<PreparedStat
 
 #endif
 
+/// The `-f` script of a console invocation, read and prepared once (before any broker is needed) - shared by
+/// cmdConsole and the live test seams so the seams run the very batch `rune console -f` would.  `script` and `batch`
+/// are the caller's (it owns their wipe).  nullopt = continue (no script, or `batch` is ready to run); a value = the
+/// exit status to return now (a read / prepare / request-id failure, or an empty script).
+std::optional<int> prepareConsoleScript(const ConsoleOptions& o, std::istream& in, std::string& script,
+                                        std::vector<PreparedStatement>& batch, std::ostream& err) {
+    if (o.scriptPath.empty()) return std::nullopt;
+    if (!engine::readScript(o.scriptPath, in, script, err)) return 1;
+    // Issue #302: the script is parsed and prepared once, before any broker is needed.
+    if (!prepareAll(o.scriptPath, script, o.prep, batch, err)) return 1;
+    if (batch.empty()) return 0;
+    if (!requestIdFits(o.requestIdBase, batch.size(), err)) return 1;   // Issue #303
+    return std::nullopt;
+}
+
 } // namespace
 
 int cmdConsole(const std::vector<std::string>& args, std::istream& in, std::ostream& out, std::ostream& err) {
@@ -655,13 +671,7 @@ int cmdConsole(const std::vector<std::string>& args, std::istream& in, std::ostr
     struct ScriptWipe { std::string& s; ~ScriptWipe() { rune::client::detail::wipeString(s); } } scriptWipe{script};
     std::vector<PreparedStatement> batch;
     BatchWipe batchWipe{batch};
-    if (!o.scriptPath.empty()) {
-        if (!engine::readScript(o.scriptPath, in, script, err)) return 1;
-        // Issue #302: the script is parsed and prepared once, before any broker is needed.
-        if (!prepareAll(o.scriptPath, script, o.prep, batch, err)) return 1;
-        if (batch.empty()) return 0;
-        if (!requestIdFits(o.requestIdBase, batch.size(), err)) return 1;   // Issue #303
-    }
+    if (const std::optional<int> done = prepareConsoleScript(o, in, script, batch, err)) return *done;
     if (o.dryRun) {
         DryRunExecutor exec{out, o.requestIdBase};
         if (!o.scriptPath.empty()) return runBatch(exec, batch, 1);
@@ -685,7 +695,13 @@ int runLiveOnStdinForTest([[maybe_unused]] const std::vector<std::string>& args,
     ConsoleOptions o;
     if (const int rc = parseConsoleOptions(args, o, err); rc != 0) return rc;
     o.live.nanoClock = nanoClock;
-    return runLiveSession(o, {}, LiveInput{&std::cin, -1, true, idlePumps}, out, err);
+    // #702: `-f` runs its prepared batch exactly as `rune console -f` does (`-f -` reads std::cin).
+    std::string script;
+    struct ScriptWipe { std::string& s; ~ScriptWipe() { rune::client::detail::wipeString(s); } } scriptWipe{script};
+    std::vector<PreparedStatement> batch;
+    BatchWipe batchWipe{batch};
+    if (const std::optional<int> done = prepareConsoleScript(o, std::cin, script, batch, err)) return *done;
+    return runLiveSession(o, batch, LiveInput{&std::cin, -1, true, idlePumps}, out, err);
 #else
     err << "rune console: live mode requires RUNE_CLI_LIVE_ENABLED\n";
     return 1;
@@ -697,7 +713,16 @@ int runLiveOnFdForTest([[maybe_unused]] const std::vector<std::string>& args, [[
 #ifdef RUNE_CLI_LIVE_ENABLED
     ConsoleOptions o;
     if (const int rc = parseConsoleOptions(args, o, err); rc != 0) return rc;
-    return runLiveSession(o, {}, LiveInput{nullptr, fd, false, idlePumps}, out, err);
+    // #702: `-f <file>` runs its prepared batch exactly as `rune console -f` does; the fd is the interactive input
+    // only, so there is no stream for `-f -`.
+    if (o.scriptPath == "-") return usage(err, "-f - is not supported by the fd test seam (use -f <file>)");
+    std::string script;
+    struct ScriptWipe { std::string& s; ~ScriptWipe() { rune::client::detail::wipeString(s); } } scriptWipe{script};
+    std::vector<PreparedStatement> batch;
+    BatchWipe batchWipe{batch};
+    std::istringstream noStream;
+    if (const std::optional<int> done = prepareConsoleScript(o, noStream, script, batch, err)) return *done;
+    return runLiveSession(o, batch, LiveInput{nullptr, fd, false, idlePumps}, out, err);
 #else
     err << "rune console: live mode requires RUNE_CLI_LIVE_ENABLED\n";
     return 1;

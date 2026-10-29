@@ -1986,13 +1986,13 @@ public:
     void holdMetadataApplyForTest(bool on) {
         (void)onControlThreadForTest([this, on]() { if (metadataService_) metadataService_->holdMetadataApplyForTest(on); return 0; });
     }
-    /// The consensus leader (this node, if it is) resigns (posted to the control thread).
+    /// The consensus leader (this node, if it is) resigns (posted to the control thread).  Returns whether the resign
+    /// took effect (false: not the leader, or no election).
     template <class = void>
-    void resignConsensusForTest() {
-        (void)onControlThreadForTest([this]() {
-            if (election_) (void)election_->resign(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    bool resignConsensusForTest() {
+        return onControlThreadForTest([this]() -> bool {
+            return election_ && election_->resign(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
-            return 0;
         });
     }
     /// The consensus leader (this node, if it is) stands down for `holdMs` (Election::standDown; posted to the
@@ -2235,6 +2235,12 @@ public:
     void setShardResolveStallForTest(int32_t worker, std::chrono::milliseconds stall) noexcept {
         shardResolveStallWorkerForTest_ = worker;
         shardResolveStallForTest_       = stall;
+    }
+
+    /// Test-only fault: after shard `worker`'s driver is built, block the start thread for `stall` (a slow driver start).
+    void setShardDriverBuildStallForTest(int32_t worker, std::chrono::milliseconds stall) noexcept {
+        shardDriverBuildStallWorkerForTest_ = worker;
+        shardDriverBuildStallForTest_       = stall;
     }
 
     /// Test-only (DR-15 fix round 1): the peer-hostname resolve function of this
@@ -2915,6 +2921,8 @@ private:
     [[nodiscard]] bool ddlTopicServes_(int32_t topicId) const noexcept;
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
+    int32_t                                      shardDriverBuildStallWorkerForTest_ = -1;
+    std::chrono::milliseconds                    shardDriverBuildStallForTest_{0};
     void buildShardRuntimes_();
     void attachShardRuntimes_();
     void teardownShardRuntimes_() noexcept;

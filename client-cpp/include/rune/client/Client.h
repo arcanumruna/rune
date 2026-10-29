@@ -1425,8 +1425,10 @@ private:
         DdlResendCause cause = DdlResendCause::NotLeader;
     };
     /// Redirected (no NotLeader seen) to a node whose session cannot take the
-    /// frame yet (still connecting): re-offered every cycle until it does.
-    struct DdlHeldForNode    { int redirects; };
+    /// frame yet (still connecting): re-offered every cycle until it does, or until budgetEndNs (the retry budget
+    /// started at the Redirect, capped at the op deadline) passes while that node's session is still not up: it
+    /// then ends SessionLost "node unreachable", like the same Redirect after a NotLeader (#97, #687).
+    struct DdlHeldForNode    { int redirects; int64_t budgetEndNs; };
     // Shared by every routed control op (DDLs and GetViewRow), not DDL-only.
     using DdlRetry = std::variant<DdlUnsentOnSeed, DdlSent, DdlNotLeaderSeen, DdlAwaitingResend, DdlHeldForNode>;
     /// Everything only a routed control op (a DDL or a GetViewRow) has (review M1: one variant on PendingCtl).
@@ -1876,7 +1878,8 @@ private:
     uint64_t seedMovesSeen_ = 0;           ///< fix round 1 (C1): agent_.seedMoves() last seen
     uint64_t seedConnectEpochSeen_ = 0;    ///< fix round 2 (C-1): agent_.connectedEpoch(0) last seen
     int64_t  metadataAnswerByNs_ = 0;      ///< fix round 1 (M2): an unanswered MetadataRequest's due time (0 = none)
-    void noteMetadataSent_() noexcept;
+    int64_t  metadataAnswerCorr_ = 0;      ///< #705: first corrId of the newest metadata send round (an answer to any request of it clears the timer)
+    void noteMetadataSent_(int64_t corrId) noexcept;
     bool offerMetadataOnNode_(uint32_t index) noexcept;
     /// Fix round 1 (I4): one MetadataRequest on EVERY Connected session (route
     /// failures); returns how many were sent.
