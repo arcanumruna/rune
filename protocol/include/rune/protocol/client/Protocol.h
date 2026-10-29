@@ -375,8 +375,9 @@ inline constexpr int32_t kClientVersionRecordEgressUnavailable      = 15;  // un
 // declared egressChannel path. A Redirect's message to a session >= 16 may end with `#<gateway response-control
 // port>`; absent = the leader has none (use the declared path).
 inline constexpr int32_t kClientVersionResponseEgress             = 16;
-inline constexpr int32_t kClientVersion                           = 15;  // what this protocol's client announces
-// 16 (response egress) is announced once client-cpp implements it (NAT plan Task 7).
+inline constexpr int32_t kClientVersion                           = kClientVersionResponseEgress;  // what this protocol's client announces
+// client-cpp announces 16 (response egress, NAT plan Task 7); it sends responseCorrelated = 1 only when it has a
+// response publication for the endpoint (a gateway response-control port is configured / learnt).
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h

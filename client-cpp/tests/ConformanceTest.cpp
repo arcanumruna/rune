@@ -593,3 +593,133 @@ TEST(ClientCodecConnectRegression, ConnectRequestCodecV16BufferRegression) {
         EXPECT_EQ(dec->egressChannel, channel);
     }
 }
+
+// ===========================================================================
+// NAT-safe egress (Task 7): the client adapter layer carries responseCorrelated, the v16 bindToken, the Metadata
+// response-control ports and the WorkerBind frame.
+// ===========================================================================
+TEST(ClientCodecResponseEgressRegression, ConnectRequestCarriesResponseCorrelatedBothWays) {
+    const std::string_view channel = "aeron:udp?endpoint=localhost:40200";
+    for (const bool flag : {false, true}) {
+        // plain encoder
+        std::vector<uint8_t> buf(256, 0);
+        const std::size_t n = cc::encodeConnectRequest(buf.data(), buf.size(), channel, 1001, 16, kSessionId,
+                                                       kCorrelationId, flag);
+        ASSERT_GT(n, 0u);
+        const auto view = cc::decodeConnectRequest(buf.data(), n);
+        ASSERT_TRUE(view.has_value());
+        EXPECT_EQ(view->responseCorrelated, flag);
+        EXPECT_EQ(view->clientVersion, 16);
+        // crypto encoder
+        const uint8_t cipher = 2;
+        std::vector<uint8_t> cbuf;
+        const std::size_t cn = cc::encodeConnectRequestCrypto(cbuf, channel, 1001, 16, kSessionId, kCorrelationId,
+                                                              std::span<const uint8_t>(&cipher, 1), "hs", "", flag);
+        const auto cview = cc::decodeConnectRequest(cbuf.data(), cn);
+        ASSERT_TRUE(cview.has_value());
+        EXPECT_EQ(cview->responseCorrelated, flag);
+        EXPECT_EQ(cview->handshakeBytes, "hs");
+    }
+    // Below v16 the flag has no place on the wire: the frame is byte-identical whatever the caller passed.
+    std::vector<uint8_t> a(256, 0), b(256, 0);
+    const std::size_t na = cc::encodeConnectRequest(a.data(), a.size(), channel, 1001, 15, kSessionId, kCorrelationId, false);
+    const std::size_t nb = cc::encodeConnectRequest(b.data(), b.size(), channel, 1001, 15, kSessionId, kCorrelationId, true);
+    ASSERT_EQ(na, nb);
+    EXPECT_EQ(0, std::memcmp(a.data(), b.data(), na));
+    EXPECT_FALSE(cc::decodeConnectRequest(b.data(), nb)->responseCorrelated);
+}
+
+TEST(ClientCodecResponseEgressRegression, ConnectResponseV16TokenDecodesByteExact) {
+    std::array<uint8_t, 16> token{};
+    for (std::size_t i = 0; i < token.size(); ++i) token[i] = static_cast<uint8_t>(0xA0 + i);
+    std::vector<uint8_t> buf;
+    const std::size_t n = cc::encodeConnectResponseV16(buf, 0, 3, 42, kSessionId, kCorrelationId, token);
+    ASSERT_GT(n, 0u);
+    const auto v = cc::decodeConnectResponse(buf.data(), n);
+    ASSERT_TRUE(v.has_value());
+    EXPECT_TRUE(v->v16);
+    EXPECT_EQ(v->bindToken, token);
+    EXPECT_EQ(v->assignedSessionId, 42);
+    EXPECT_EQ(v->correlationId, kCorrelationId);
+    EXPECT_EQ(v->brokerVersion, rune::protocol::client::kBrokerVersion);
+}
+
+TEST(ClientCodecResponseEgressRegression, ConnectResponseWithoutTheTailHasNoToken) {
+    {   // v9-only frame (an authenticating broker below 9)
+        std::vector<uint8_t> buf;
+        const std::size_t n = cc::encodeConnectResponseV9(buf, 0, 3, 42, kSessionId, kCorrelationId,
+                                                          rune::protocol::client::AuthMode::Required,
+                                                          rune::protocol::client::AuthState::MustAuthenticate, 8);
+        const auto v = cc::decodeConnectResponse(buf.data(), n);
+        ASSERT_TRUE(v.has_value());
+        EXPECT_FALSE(v->v16);
+        EXPECT_EQ(v->bindToken, (std::array<uint8_t, 16>{}));
+        EXPECT_EQ(v->brokerVersion, 8);
+    }
+    {   // the plain 42-byte frame and the 38-byte frame of a broker that predates brokerVersion
+        std::vector<uint8_t> buf(128, 0);
+        for (const int32_t bv : {8, -1}) {
+            const std::size_t n = cc::encodeConnectResponse(buf.data(), buf.size(), 0, 3, 42, kSessionId, kCorrelationId, bv);
+            const auto v = cc::decodeConnectResponse(buf.data(), n);
+            ASSERT_TRUE(v.has_value());
+            EXPECT_FALSE(v->v16);
+            EXPECT_EQ(v->bindToken, (std::array<uint8_t, 16>{}));
+        }
+    }
+}
+
+TEST(ClientCodecResponseEgressRegression, MetadataCarriesTheResponseControlPorts) {
+    namespace rp = rune::protocol::client;
+    rp::BrokerEntry b0; b0.nodeId = 0; b0.host = "10.0.0.1"; b0.port = 40100; b0.responseControlPort = 40163;
+    rp::BrokerEntry b1; b1.nodeId = 1; b1.host = "10.0.0.2"; b1.port = 40100; b1.responseControlPort = 0;
+    rp::PartitionEntry p0; p0.topicId = 1; p0.partition = 0; p0.leaderId = 0; p0.leaderEpoch = 1;
+    p0.ingressStreamId = 111; p0.ingressEndpoint = "10.0.0.1:40300"; p0.responseControlPort = 40162;
+    rp::PartitionEntry p1; p1.topicId = 1; p1.partition = 1; p1.leaderId = 1; p1.leaderEpoch = 1;
+    const rp::BrokerEntry    brokers[]    = {b0, b1};
+    const rp::PartitionEntry partitions[] = {p0, p1};
+    rp::MetadataResponse msg;
+    msg.sessionId = kSessionId; msg.correlationId = kCorrelationId;
+    msg.brokers = std::span<const rp::BrokerEntry>(brokers);
+    msg.partitions = std::span<const rp::PartitionEntry>(partitions);
+    msg.clientVersion = rp::kClientVersionResponseEgress;
+    std::vector<uint8_t> buf(msg.encodedSize());
+    const std::size_t n = msg.encode(buf.data());
+    const auto d = cc::decodeMetadataResponse(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    ASSERT_EQ(d->brokers.size(), 2u);
+    EXPECT_EQ(d->brokers[0].responseControlPort, 40163);
+    EXPECT_EQ(d->brokers[1].responseControlPort, 0);
+    ASSERT_EQ(d->partitions.size(), 2u);
+    EXPECT_EQ(d->partitions[0].responseControlPort, 40162);
+    EXPECT_EQ(d->partitions[1].responseControlPort, 0);
+    EXPECT_EQ(d->partitions[0].ingressEndpoint, "10.0.0.1:40300");
+
+    // A session below 16 is sent no trailer: every port reads 0 (the declared path).
+    msg.clientVersion = rp::kClientVersionResponseEgress - 1;
+    std::vector<uint8_t> old(msg.encodedSize());
+    const std::size_t on = msg.encode(old.data());
+    const auto od = cc::decodeMetadataResponse(old.data(), on);
+    ASSERT_TRUE(od.has_value());
+    EXPECT_EQ(od->brokers[0].responseControlPort, 0);
+    EXPECT_EQ(od->partitions[0].responseControlPort, 0);
+}
+
+TEST(ClientCodecResponseEgressRegression, WorkerBindRoundTripsThroughTheProtocolDecoder) {
+    namespace rp = rune::protocol::client;
+    std::array<uint8_t, 16> token{};
+    for (std::size_t i = 0; i < token.size(); ++i) token[i] = static_cast<uint8_t>(0x10 + i);
+    uint8_t buf[64] = {};
+    ASSERT_EQ(cc::encodeWorkerBind(buf, 39, 7, 8, token), 0u) << "too small a buffer writes nothing";
+    const std::size_t n = cc::encodeWorkerBind(buf, sizeof buf, 7, 8, token);
+    ASSERT_EQ(n, 40u);
+    EXPECT_EQ(cc::peekTemplate(buf, n), std::optional<uint16_t>(86));
+    EXPECT_EQ(cc::checkFrame(buf, n).status, cc::FrameStatus::Ok);
+    const auto m = rp::WorkerBind::decode(buf, n);
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(m->sessionId, 7);
+    EXPECT_EQ(m->correlationId, 8);
+    EXPECT_EQ(m->token, token);
+    // sessionId sits where Produce carries it (bytes 8..15), the token right after the 24-byte header.
+    EXPECT_EQ(rp::detail::getLE64(buf, 8), 7u);
+    EXPECT_EQ(0, std::memcmp(buf + 24, token.data(), 16));
+}

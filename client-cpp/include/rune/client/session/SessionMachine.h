@@ -31,6 +31,7 @@
 #include <rune/client/codec/Codec.h>
 #include <rune/client/detail/SecureZero.h>
 #include <rune/client/session/ScramClient.h>
+#include <rune/client/transport/ResponseChannel.h>
 #include <rune/crypto/Kdf.h>
 #include <rune/crypto/Scram.h>
 #include <rune/protocol/client/AuthMessages.h>
@@ -90,6 +91,18 @@ struct SessionIo {
     /// ingress endpoint; the machine still proceeds to resend the
     /// ConnectRequest (a failed retarget does not throw and does not crash).
     virtual bool retarget(const std::string& newIngressChannel) noexcept = 0;
+
+    /// NAT-safe egress: retarget() that also names the new gateway's response-control port (the Redirect `#port`
+    /// suffix; 0 = none / not advertised).  The default ignores the port.  `newIngressChannel` is the bare endpoint.
+    virtual bool retargetWithResponsePort(const std::string& newIngressChannel, int32_t responsePort) noexcept {
+        (void)responsePort;
+        return retarget(newIngressChannel);
+    }
+
+    /// NAT-safe egress: true when this session's request publication is response-correlated, i.e. the broker's
+    /// replies must (and can) ride the Aeron response publication.  Sent as ConnectRequest.responseCorrelated (only
+    /// when the announced version is >= 16).  Cold path (once per ConnectRequest).  Default: false (declared path).
+    [[nodiscard]] virtual bool responseCorrelated() const noexcept { return false; }
 
     /// T15a fix1 I1: point this session back at its configured BOOTSTRAP endpoint
     /// (the gateway it was built with), undoing any redirect / stick-to-leader
@@ -770,8 +783,9 @@ public:
         // FIX F8: retarget is noexcept and returns success; a failed retarget
         // keeps the previous ingress endpoint — we still resend (bounded by the
         // redirect cap) rather than crash.
-        notePreTlsRedirect_(newEndpoint);   // issue #115: unauthenticated - the TLS name does not follow it
-        (void)io_.retarget(std::string(newEndpoint));
+        const auto target = rune::client::transport::splitRedirectTarget(newEndpoint);   // "endpoint[#responsePort]"
+        notePreTlsRedirect_(target.endpoint);   // issue #115: unauthenticated - the TLS name does not follow it
+        (void)io_.retargetWithResponsePort(std::string(target.endpoint), target.responsePort);
         doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);
     }
 
@@ -1066,8 +1080,10 @@ public:
                 // FIX F8: retarget is noexcept; a failed retarget keeps the old
                 // endpoint and we still resend (no throw into noexcept dispatch).
                 if (!message.empty()) {
-                    notePreTlsRedirect_(message);   // issue #115: unauthenticated - the TLS name does not follow it
-                    (void)io_.retarget(std::string(message));
+                    // NAT-safe egress: the message may end with `#<leader gateway response-control port>`.
+                    const auto target = rune::client::transport::splitRedirectTarget(message);
+                    notePreTlsRedirect_(target.endpoint);   // issue #115: unauthenticated - the TLS name does not follow it
+                    (void)io_.retargetWithResponsePort(std::string(target.endpoint), target.responsePort);
                 }
                 // Resend ConnectRequest (retargeted if message was an endpoint).
                 doConnect(nowNs, /*resetSessionId=*/false, /*freshEpisode=*/false);
@@ -1275,7 +1291,8 @@ private:
                 announcedClientVersion_(),
                 sessionId_, correlationId_,
                 std::span<const uint8_t>(&cipherByte, 1),
-                hs, std::string_view{});   // ConnectRequest.authToken: reserved, always empty
+                hs, std::string_view{},   // ConnectRequest.authToken: reserved, always empty
+                io_.responseCorrelated());
             connectSentOk_ = n > 0 && io_.sendFrame(hsFrameBuf_.data(), n);
             return;
         }
@@ -1285,7 +1302,8 @@ private:
             cfg_.egressStreamId,
             cfg_.clientVersion,
             sessionId_,
-            correlationId_);
+            correlationId_,
+            io_.responseCorrelated());
         connectSentOk_ = n > 0 && io_.sendFrame(scratch_.data(), n);
     }
 

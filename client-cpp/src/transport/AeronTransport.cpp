@@ -203,15 +203,49 @@ void AeronTransport::startBody_() {
     // 4-5. Register + resolve the ingress ExclusivePublication and egress
     //      Subscription, pumping THIS transport's driver + conductor (invoker) or
     //      letting the background agents run (thread).  Bounded by kResolveMaxMs.
+    //
+    //      NAT-safe egress: with a response-control port for the (UDP) ingress channel the pairing is the response
+    //      subscription FIRST (Aeron needs its registration id on the request publication), together with the
+    //      declared egress subscription, THEN the publication correlated with it.  A response subscription that does
+    //      not resolve is dropped with a warning and the plain (declared-path) publication is used.
     Resolution<aeron::ExclusivePublication> pubRes{kResolveTimeoutNs, kResolveRetryNs};
     Resolution<aeron::Subscription>         subRes{kResolveTimeoutNs, kResolveRetryNs};
     PubRegistry preg{*aeron_, cfg_.ingressChannel, cfg_.ingressStreamId};
     SubRegistry sreg{*aeron_, cfg_.egressChannel, cfg_.egressStreamId};
+    const std::optional<std::string> respChannel =
+        responseControlChannelFor(cfg_.ingressChannel, cfg_.gatewayResponseControlPort);
+    std::string correlatedChannel;   // the default publication's registered channel when response-correlated
+    if (respChannel) {
+        const int32_t slot = addSubSlot_(*respChannel, cfg_.egressStreamId);
+        if (slot >= 0) {
+            pumpUntil_([&] {
+                if (conductorFault_ != nullptr) return true;
+                const int64_t now = resolveNow_();
+                const bool subOk = subRes.poll(sreg, now) == ResolveStatus::Ready;
+                SubSlot& rs = subSlots_[static_cast<std::size_t>(slot)];
+                const bool respOk = rs.res.ready() != nullptr || resolveSubSlot_(rs) != nullptr;
+                return (subOk && (respOk || rs.res.rejected())) || subRes.rejected();
+            }, kResolveTimeoutNs);
+            SubSlot& rs = subSlots_[static_cast<std::size_t>(slot)];
+            if (rs.res.ready() != nullptr && conductorFault_ == nullptr) {
+                correlatedChannel = withResponseCorrelation(cfg_.ingressChannel, rs.res.ready()->registrationId());
+                respSeedSlot_     = slot;
+            } else if (conductorFault_ == nullptr && subRes.ready() != nullptr) {
+                std::fprintf(stderr,
+                             "rune-client: the response subscription (%s) did not resolve; using the declared egress "
+                             "channel\n", respChannel->c_str());
+                subSlots_.pop_back();   // the slot was appended last; the declared path needs none
+            }
+        }
+    }
+    PubRegistry cpreg{*aeron_, correlatedChannel, cfg_.ingressStreamId};
+    const bool correlated = respSeedSlot_ >= 0;
     pumpUntil_([&] {
         // A faulted conductor is half-updated: never poll (find) against it.
         if (conductorFault_ != nullptr) return true;
         const int64_t now = resolveNow_();
-        const bool pubOk = pubRes.poll(preg, now) == ResolveStatus::Ready;
+        const bool pubOk = correlated ? pubRes.poll(cpreg, now) == ResolveStatus::Ready
+                                      : pubRes.poll(preg, now) == ResolveStatus::Ready;
         const bool subOk = subRes.poll(sreg, now) == ResolveStatus::Ready;
         return (pubOk && subOk) || pubRes.rejected() || subRes.rejected();
     }, kResolveTimeoutNs);
@@ -225,6 +259,8 @@ void AeronTransport::startBody_() {
         // unwinding below it would outlive aeron_.reset() and abort the process.
         pubRes.reset();
         subRes.reset();
+        subSlots_.clear();
+        respSeedSlot_ = -1;
         aeron_.reset();
         stopEmbeddedDriver();
         if (conductorFault_ != nullptr) std::rethrow_exception(conductorFault_);
@@ -240,8 +276,9 @@ void AeronTransport::startBody_() {
                                  " (ingressChannel=" + cfg_.ingressChannel +
                                  " egressChannel=" + cfg_.egressChannel + ")");
     }
-    ingressPub_ = *pubRes.readyShared();
-    egressSub_  = *subRes.readyShared();
+    ingressPub_        = *pubRes.readyShared();
+    ingressPubChannel_ = correlated ? correlatedChannel : cfg_.ingressChannel;
+    egressSub_         = *subRes.readyShared();
 
     // 6. Build the FragmentAssembler (installed fresh each start; owns a lambda
     //    that captures nothing — the handler is passed in at poll() time).
@@ -277,7 +314,9 @@ void AeronTransport::stop() noexcept {
     // read-rework I4: release per-worker egress subscriptions + their assemblers
     // BEFORE closing the aeron client (same recursive_mutex teardown reason as
     // the publication slots below — Subscription dtors deregister via the conductor).
-    subSlots_.clear();                  // assemblers + subscriptions (conductor dereg)
+    subSlots_.clear();                  // assemblers + subscriptions (conductor dereg), the response pairs' too
+    respSeedSlot_ = -1;
+    retiredSubs_  = 0;
 
     // Step 2: Release pub/sub BEFORE closing the aeron client.
     //   Resetting shared_ptrs triggers deregistration commands into the conductor.
@@ -428,9 +467,46 @@ bool AeronTransport::offerOn(PubHandle h, const uint8_t* buf, std::size_t len, F
     PubSlot& s = pubSlots_[static_cast<std::size_t>(h)];
     if (aeron::ExclusivePublication* p = s.res.ready()) return offerToPub(*p, buf, len, crc) == OfferResult::Accepted;
     if (!aeron_) return false;
-    PubRegistry reg{*aeron_, s.channel, s.streamId};
+    // NAT-safe egress phase 1: the response subscription must be Ready before the correlated publication is added
+    // (Aeron names its registration id in the request publication's URI).
+    if (const auto* await = std::get_if<PubSlot::AwaitResponseSub>(&s.mode)) {
+        SubSlot& ss = subSlots_[static_cast<std::size_t>(await->subSlot)];
+        aeron::Subscription* sub = ss.res.ready();
+        if (sub == nullptr) sub = resolveSubSlot_(ss);
+        if (sub == nullptr) return false;
+        try {
+            s.addChannel = withResponseCorrelation(s.channel, sub->registrationId());
+        } catch (...) {
+            return false;
+        }
+        s.mode = PubSlot::Correlated{await->subSlot};
+    }
+    PubRegistry reg{*aeron_, s.addChannel.empty() ? s.channel : s.addChannel, s.streamId};
     if (s.res.poll(reg, resolveNow_()) != ResolveStatus::Ready) return false;
     return offerToPub(*s.res.ready(), buf, len, crc) == OfferResult::Accepted;
+}
+
+AeronTransport::PubHandle AeronTransport::responsePublicationHandle(const std::string& channel,
+                                                                    int32_t streamId,
+                                                                    std::string_view responseControlChannel) {
+    if (responseControlChannel.empty()) return publicationHandle(channel, streamId);
+    for (std::size_t i = 0; i < pubSlots_.size(); ++i) {
+        PubSlot& ps = pubSlots_[i];
+        if (ps.streamId != streamId || ps.channel != channel) continue;
+        if (std::holds_alternative<PubSlot::Plain>(ps.mode) && !warnedPlainResponse_) {
+            warnedPlainResponse_ = true;
+            std::fprintf(stderr,
+                         "rune-client: a plain publication to %s already exists; it is kept (no response "
+                         "correlation)\n", channel.c_str());
+        }
+        return static_cast<PubHandle>(i);   // one slot per key: plain stays plain, correlated stays correlated
+    }
+    const int32_t sub = addSubSlot_(std::string(responseControlChannel), cfg_.egressStreamId);
+    if (sub < 0) return kNoPub;
+    PubSlot ps{channel, streamId, Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs}};
+    ps.mode = PubSlot::AwaitResponseSub{sub};
+    pubSlots_.push_back(std::move(ps));
+    return static_cast<PubHandle>(pubSlots_.size() - 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -524,19 +600,54 @@ aeron::Subscription* AeronTransport::resolveSubSlot_(SubSlot& s) noexcept {
 // read-rework I4: open a per-worker dynamic-MDC egress subscription (idempotent).
 // ---------------------------------------------------------------------------
 
+int32_t AeronTransport::addSubSlot_(const std::string& channel, int32_t streamId) noexcept {
+    for (std::size_t i = 0; i < subSlots_.size(); ++i) {
+        const SubSlot& s = subSlots_[i];
+        if (s.state == SubSlot::State::Live && s.streamId == streamId && s.channel == channel)
+            return static_cast<int32_t>(i);   // idempotent
+    }
+    try {
+        for (std::size_t i = 0; i < subSlots_.size(); ++i) {   // reuse a released slot
+            SubSlot& s = subSlots_[i];
+            if (s.state != SubSlot::State::Free) continue;
+            s.channel  = channel;
+            s.streamId = streamId;
+            s.res      = Resolution<aeron::Subscription>{kResolveTimeoutNs, kResolveRetryNs};
+            s.assembler.reset();
+            s.state    = SubSlot::State::Live;
+            return static_cast<int32_t>(i);
+        }
+        subSlots_.push_back(SubSlot{channel, streamId,
+                                    Resolution<aeron::Subscription>{kResolveTimeoutNs, kResolveRetryNs},
+                                    nullptr});
+        return static_cast<int32_t>(subSlots_.size() - 1);
+    } catch (...) {
+        return -1;
+    }
+}
+
+void AeronTransport::retireSubSlot_(int32_t idx) noexcept {
+    if (idx < 0 || static_cast<std::size_t>(idx) >= subSlots_.size()) return;
+    SubSlot& s = subSlots_[static_cast<std::size_t>(idx)];
+    if (s.state != SubSlot::State::Live) return;
+    s.state = SubSlot::State::Retired;
+    ++retiredSubs_;
+}
+
+void AeronTransport::reapRetiredSubs_() noexcept {
+    for (SubSlot& s : subSlots_) {
+        if (s.state != SubSlot::State::Retired) continue;
+        s.assembler.reset();
+        s.res.reset();   // the subscription deregisters here, outside any poll callback
+        s.state = SubSlot::State::Free;
+    }
+    retiredSubs_ = 0;
+}
+
 void AeronTransport::addEgressSubscription(const std::string& controlChannel,
                                            int32_t streamId) noexcept {
     if (!aeron_ || streamId == 0 || controlChannel.empty()) return;
-    for (const SubSlot& s : subSlots_) {
-        if (s.streamId == streamId && s.channel == controlChannel) return;  // idempotent
-    }
-    try {
-        subSlots_.push_back(SubSlot{controlChannel, streamId,
-                                    Resolution<aeron::Subscription>{kResolveTimeoutNs,
-                                                                    kResolveRetryNs},
-                                    nullptr});
-    } catch (...) {
-    }
+    (void)addSubSlot_(controlChannel, streamId);
 }
 
 // ---------------------------------------------------------------------------
@@ -555,21 +666,45 @@ bool AeronTransport::egressConnected() const noexcept {
 // retarget — release current ingress pub, create new one on newIngressChannel
 // ---------------------------------------------------------------------------
 
-bool AeronTransport::retarget(const std::string& newIngressChannel) noexcept {
+bool AeronTransport::retarget(const std::string& newIngressChannel, int32_t responsePort) noexcept {
     // FIX F8: noexcept + non-throwing.  Any Aeron call below can throw
     // (addExclusivePublication / findExclusivePublication on a closed client);
     // contain it so nothing escapes into the agent's noexcept dispatch path
     // (→ std::terminate).  On ANY failure we leave the OLD ingressPub_ intact.
     try {
         if (!aeron_) return false;  // not started — cannot retarget, old state untouched
+        // NAT-safe egress: the new response subscription FIRST (the publication's URI names its registration id),
+        // then the correlated publication.  Both resolve BEFORE the old pair is released, so a failed retarget
+        // leaves the old pair usable.
+        const std::optional<std::string> respChannel = responseControlChannelFor(newIngressChannel, responsePort);
+        int32_t newRespSlot = -1;
+        std::string pubChannel = newIngressChannel;
+        if (respChannel) {
+            newRespSlot = addSubSlot_(*respChannel, cfg_.egressStreamId);
+            if (newRespSlot < 0) return false;
+            pumpUntil_([&] {
+                SubSlot& rs = subSlots_[static_cast<std::size_t>(newRespSlot)];
+                if (rs.res.ready() != nullptr) return true;
+                return resolveSubSlot_(rs) != nullptr || rs.res.rejected();
+            }, kResolveTimeoutNs);
+            aeron::Subscription* sub = subSlots_[static_cast<std::size_t>(newRespSlot)].res.ready();
+            if (sub == nullptr) {
+                if (newRespSlot != respSeedSlot_) retireSubSlot_(newRespSlot);   // never the old pair's own slot
+                return false;   // old pair intact
+            }
+            pubChannel = withResponseCorrelation(newIngressChannel, sub->registrationId());
+        }
         // Resolve the NEW default publication BEFORE releasing the old one, so a
         // failed resolve leaves the old pub usable (offer() keeps working).
         Resolution<aeron::ExclusivePublication> res{kResolveTimeoutNs, kResolveRetryNs};
-        PubRegistry reg{*aeron_, newIngressChannel, cfg_.ingressStreamId};
+        PubRegistry reg{*aeron_, pubChannel, cfg_.ingressStreamId};
         pumpUntil_([&] {
             return res.poll(reg, resolveNow_()) == ResolveStatus::Ready || res.rejected();
         }, kResolveTimeoutNs);
-        if (res.ready() == nullptr) return false;  // old publication stays intact
+        if (res.ready() == nullptr) {
+            if (newRespSlot >= 0 && newRespSlot != respSeedSlot_) retireSubSlot_(newRespSlot);
+            return false;  // old publication stays intact
+        }
         // Per-stream publications on the OLD default channel are released and
         // lazily re-resolved on the new channel (stream ids preserved).
         // Only Ready slots are released: resetting a Resolving/TimedOut slot would
@@ -580,7 +715,12 @@ bool AeronTransport::retarget(const std::string& newIngressChannel) noexcept {
         }
         streamPub_.clear();
         cfg_.ingressChannel = newIngressChannel;
-        ingressPub_ = *res.readyShared();
+        ingressPub_         = *res.readyShared();
+        ingressPubChannel_  = pubChannel;
+        // The old response subscription may be the one whose poll callback delivered the Redirect that brought us
+        // here: it is retired now and released at the next poll().
+        if (respSeedSlot_ >= 0 && respSeedSlot_ != newRespSlot) retireSubSlot_(respSeedSlot_);
+        respSeedSlot_ = newRespSlot;
         return true;
     } catch (...) {
         // Any Aeron exception → treat as a failed retarget; old pub intact.

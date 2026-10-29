@@ -374,6 +374,8 @@ ClientConfig shardClientConfig(const ShardGroupConfig& g, uint32_t index, uint32
     }
     ClientConfig c                 = g.base;
     c.dataDir                      = g.base.dataDir + "/shard-" + std::to_string(index);
+    // The declared egress port keeps its per-shard offset (an older broker still answers there); the response
+    // subscription (gatewayResponseControlPort, copied unchanged from base) binds an ephemeral local port, so it needs none.
     c.egressChannel                = channelWithPortOffset(g.base.egressChannel, static_cast<int32_t>(index));
     c.runnerMode                   = g.mode == ShardMode::Invoker ? RunnerMode::Invoker : RunnerMode::Thread;
     c.runnerCore                   = g.mode == ShardMode::Agent ? runnerCore : -1;

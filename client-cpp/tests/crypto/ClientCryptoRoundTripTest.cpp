@@ -68,6 +68,8 @@ struct FakeIo final : sm::SessionIo {
         return true;
     }
     bool retarget(const std::string&) noexcept override { return true; }
+    bool respCorrelated = false;   // NAT-safe egress: what the io reports as ConnectRequest.responseCorrelated
+    [[nodiscard]] bool responseCorrelated() const noexcept override { return respCorrelated; }
 
     [[nodiscard]] std::size_t sendCount() const { return sends.size(); }
 
@@ -209,6 +211,30 @@ TEST(ClientCryptoRoundTrip, HandshakeReachesConnectedAndEncrypted) {
         const long m2 = m.cryptoState().recv->open(0, aad, sizeof aad, ct, n, recovered);
         ASSERT_EQ(m2, static_cast<long>(sizeof plain));
         EXPECT_EQ(0, std::memcmp(plain, recovered, sizeof plain));
+    }
+}
+
+// NAT-safe egress (Task 7): a CRYPTO ConnectRequest carries the io's responseCorrelated flag, both ways, at v16.
+TEST(SessionResponseEgressRegression, CryptoConnectRequestCarriesTheResponseCorrelatedFlag) {
+    const std::string caPem = slurp(testdataPath("ca.pem"));
+    ASSERT_FALSE(caPem.empty());
+    for (const bool flag : {false, true}) {
+        FakeIo io;
+        io.respCorrelated = flag;
+        sm::SessionConfig cfg;
+        cfg.egressChannel  = "aeron:udp?endpoint=client:40456";
+        cfg.egressStreamId = 1001;
+        cfg.offerCrypto    = true;
+        cfg.tlsTrustPem    = caPem;
+        cfg.tlsExpectHost  = "localhost";
+        sm::SessionMachine m(io, cfg);
+        m.connect(1'000'000'000LL);
+        ASSERT_EQ(io.sendCount(), 1u);
+        const auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+        ASSERT_TRUE(req.has_value());
+        EXPECT_EQ(req->clientVersion, 16);
+        EXPECT_FALSE(req->handshakeBytes.empty()) << "this is the crypto encoder";
+        EXPECT_EQ(req->responseCorrelated, flag);
     }
 }
 

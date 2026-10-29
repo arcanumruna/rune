@@ -252,6 +252,7 @@ void setLive([[maybe_unused]] ConsoleOptions& o, [[maybe_unused]] std::string_vi
     if (flag == "--verbose") o.live.verbose = true;
     else if (flag == "--broker") o.live.endpoint = v;
     else if (flag == "--cli-egress") o.live.egress = v;
+    else if (flag == "--gateway-response-port") o.live.gatewayResponsePort = v;   // NAT-safe egress (D7)
     else if (flag == "--user") o.live.user = v;
     else if (flag == "--password-file") o.live.passwordFile = v;
     else if (flag == "--tls-ca") o.live.tlsCa = v;              // issue #13
@@ -268,7 +269,8 @@ void setLive([[maybe_unused]] ConsoleOptions& o, [[maybe_unused]] std::string_vi
 int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o, std::ostream& err) {
     static constexpr std::string_view kValue[] = {"-f", "--broker", "--cli-egress", "--expected-version", "--request-id",
                                                   "--user", "--password-file", "--tls-ca", "--tls-host",
-                                                  "--cli-stream-in", "--cli-stream-out", "--cli-data-dir"};   // last 3 hidden
+                                                  "--cli-stream-in", "--cli-stream-out", "--cli-data-dir",
+                                                  "--gateway-response-port"};   // last 4 hidden
     static constexpr std::string_view kBool[]  = {"--dry-run", "--validate", "--verbose", "--insecure-plaintext"};
     auto in = [](std::string_view a, auto& set) {
         for (const auto s : set) if (s == a) return true;
@@ -292,7 +294,8 @@ int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o,
         else if (a == "--expected-version") expected = v;
         else if (a == "--request-id") requestId = v;
         else if (a == "--broker" || a == "--cli-egress" || a == "--user" || a == "--password-file" || a == "--cli-stream-in" ||
-                 a == "--cli-stream-out" || a == "--cli-data-dir" || a == "--tls-ca" || a == "--tls-host") setLive(o, a, v);
+                 a == "--cli-stream-out" || a == "--cli-data-dir" || a == "--tls-ca" || a == "--tls-host" ||
+                 a == "--gateway-response-port") setLive(o, a, v);
     }
     if (!expected.empty()) {
         int value = -1;

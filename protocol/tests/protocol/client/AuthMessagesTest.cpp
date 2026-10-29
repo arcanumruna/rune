@@ -18,7 +18,7 @@ TEST(AuthMessagesRegression, ErrorCodesAndTemplatesArePinned) {
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::AuthServerFinal), 15);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::SecurityDdl), 79);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::SecurityBootstrap), 80);
-    EXPECT_EQ(pc::kClientVersion, pc::kClientVersionRecordEgressUnavailable); EXPECT_EQ(pc::kBrokerVersion, 9); EXPECT_EQ(pc::kSecurityTopicId, -7);
+    EXPECT_EQ(pc::kClientVersion, pc::kClientVersionResponseEgress); EXPECT_EQ(pc::kBrokerVersion, 9); EXPECT_EQ(pc::kSecurityTopicId, -7);
     EXPECT_EQ(pc::kClientVersionAuth, 9); EXPECT_EQ(pc::kBrokerVersionAuth, 5);
     EXPECT_TRUE(pc::clientUnderstandsAuth(9)); EXPECT_FALSE(pc::clientUnderstandsAuth(8));
     EXPECT_EQ(static_cast<int>(pc::AuthMode::Required), 0);

@@ -1907,7 +1907,8 @@ static_assert(rpc::kClientVersionNamespaces == rpc::kClientVersionTxnVerify + 1)
 static_assert(rpc::kBrokerVersionNamespaces == rpc::kBrokerVersionReceiverKeys + 1);
 // Issue #450: client 15 (SubscribeResponse RecordEgressUnavailable) follows.
 static_assert(rpc::kClientVersionRecordEgressUnavailable == rpc::kClientVersionNamespaces + 1);
-static_assert(rpc::kClientVersion == rpc::kClientVersionRecordEgressUnavailable && rpc::kBrokerVersion == rpc::kBrokerVersionResponseEgress);
+static_assert(rpc::kClientVersionResponseEgress == rpc::kClientVersionRecordEgressUnavailable + 1);   // NAT-safe egress: client 16
+static_assert(rpc::kClientVersion == rpc::kClientVersionResponseEgress && rpc::kBrokerVersion == rpc::kBrokerVersionResponseEgress);
 static_assert(rpc::sessionUsesReceiverKeys(12, 7) && !rpc::sessionUsesReceiverKeys(11, 7) && !rpc::sessionUsesReceiverKeys(12, 6));
 static_assert(rpc::clientUnderstandsFilters(11) && !rpc::clientUnderstandsFilters(10));
 

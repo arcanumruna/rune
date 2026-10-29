@@ -122,6 +122,8 @@ void ClientAgent::init() {
     seedCfg.keepaliveCorrelationId = -1;   // A10: sessions_[0]'s keepalive Pong routing
     sessions_.emplace_back(std::make_unique<Session>(
         this, seedCfg, cfg_.transport.ingressChannel));
+    sessions_.back()->responsePort = cfg_.transport.gatewayResponseControlPort;   // NAT-safe egress: the seed's port
+    workerBinds_.reserve(64);   // NAT-safe egress: one entry per worker publication; growth is cold
     sessions_.back()->machine.useScramCache(&scramCache_);   // authentication: one salted-password cache per duty thread
     sessions_.back()->machine.useSharedSecret(&secret_);
 }
@@ -401,6 +403,10 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     for (auto& s : sessions_) {
         s->machine.tick(nowNs);
     }
+
+    // ---- Step 3b: NAT-safe egress — WorkerBind for every worker publication whose session (re)connected ----
+    // One bounded pass over the small bind table; empty (a no-op) unless Metadata advertised response-mode workers.
+    if (!workerBinds_.empty()) totalWork += serviceWorkerBinds_();
 
     // ---- Step 4: CB-2 — Producer duty cycle (drain ring + flush batches) -----
     // Runs on the AGENT thread (single-writer); no lock needed.
@@ -746,10 +752,14 @@ ClientAgent::StateSnapshot ClientAgent::stateAndSessionId() const noexcept {
 // Seed-transport helpers (agent thread only)
 // ---------------------------------------------------------------------------
 
-bool ClientAgent::retarget(const std::string& newIngressChannel) noexcept {
+bool ClientAgent::retarget(const std::string& newIngressChannel, int32_t responsePort) noexcept {
     // FIX F8: forward to the transport's noexcept, non-throwing retarget.
-    const bool moved = transport_.retarget(newIngressChannel);
-    if (moved) invalidateRouteSessions_();  // DR client bug 1: the seed moved
+    if (responsePort == 0) responsePort = knownResponsePort_(newIngressChannel);
+    const bool moved = transport_.retarget(newIngressChannel, responsePort);
+    if (moved) {
+        seedSession().responsePort = responsePort;
+        invalidateRouteSessions_();  // DR client bug 1: the seed moved
+    }
     return moved;
 }
 
@@ -757,10 +767,12 @@ bool ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs, bool
     if (failed_ || channel.empty()) return false;
     try {
         if (transport_.ingressChannel() != channel) {
-            if (!transport_.retarget(channel)) return false;  // old pub intact: the owner tries the next one
+            const int32_t port = knownResponsePort_(channel);
+            if (!transport_.retarget(channel, port)) return false;  // old pub intact: the owner tries the next one
             Session& seed             = seedSession();
             seed.currentLeaderChannel = channel;
             seed.currentLeaderNode    = -1;   // learnt from the next metadata answer
+            seed.responsePort         = port;
             invalidateRouteSessions_();
         }
     } catch (...) {
@@ -946,6 +958,11 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // still pending — it doesn't depend on encryption being established.
         if (awaited && opt->code == 0) {
             s.brokerVersion = opt->brokerVersion;
+            // NAT-safe egress: the worker bind token arrives on this first leg (also under TLS); an older broker has
+            // no tail, so the token stays zero and nothing is bound (acks / Records ride the declared channel).
+            s.bindToken    = opt->v16 ? opt->bindToken : std::array<uint8_t, 16>{};
+            s.bindRequired = false;
+            for (const uint8_t b : s.bindToken) s.bindRequired = s.bindRequired || b != 0;
         }
         if (lastConnectAccepted_) {
             ++s.connectEpoch;                  // MEDIUM-1: a new connect episode
@@ -1201,6 +1218,15 @@ bool SessionEndpointIo::sendFrame(const uint8_t* buf, std::size_t len) {
 }
 
 bool SessionEndpointIo::retarget(const std::string& newIngressChannel) noexcept {
+    return retargetWithResponsePort(newIngressChannel, 0);
+}
+
+bool SessionEndpointIo::responseCorrelated() const noexcept {
+    if (owner == &agent->seedSession()) return agent->transport_.seedResponseCorrelated();   // D4 r2: by identity
+    return agent->transport_.publicationResponseCorrelated(owner->ctlPub);
+}
+
+bool SessionEndpointIo::retargetWithResponsePort(const std::string& newIngressChannel, int32_t responsePort) noexcept {
     // Follower-connect hang fix: the SEED's connect-time Redirect (its
     // SessionMachine, in Connecting, calls this before resending the Connect)
     // moves the seed's control path — the default publication — to the named
@@ -1209,7 +1235,13 @@ bool SessionEndpointIo::retarget(const std::string& newIngressChannel) noexcept 
     // the SessionMachine: nobody followed it, every resend went back to the
     // redirecting broker, the redirect budget ran out and the connect hung to
     // its deadline.  D4 r2: the seed by identity.
-    if (owner == &agent->seedSession()) return agent->retargetSeedOnConnectRedirect_(newIngressChannel);
+    if (owner == &agent->seedSession()) return agent->retargetSeedOnConnectRedirect_(newIngressChannel, responsePort);
+    // NAT-safe egress: the redirect names ANOTHER node; remember its response port for the session opened to it.
+    if (responsePort != 0) {
+        agent->setSessionResponsePort(newIngressChannel.rfind("aeron:", 0) == 0
+                                          ? newIngressChannel : "aeron:udp?endpoint=" + newIngressChannel,
+                                      responsePort);
+    }
     // A leader session: multi-node addresses each leader endpoint explicitly
     // (offerTo), so it never retargets the shared default pub; the Client-level
     // redirect handler re-routes via the metadata cache + routing table.  Report
@@ -1217,15 +1249,17 @@ bool SessionEndpointIo::retarget(const std::string& newIngressChannel) noexcept 
     return true;
 }
 
-bool ClientAgent::retargetSeedOnConnectRedirect_(const std::string& endpoint) noexcept {
+bool ClientAgent::retargetSeedOnConnectRedirect_(const std::string& endpoint, int32_t responsePort) noexcept {
     try {
         // "host:port" or a full Aeron channel (the broker sends the channel).
         const std::string channel = endpoint.rfind("aeron:", 0) == 0 ? endpoint : "aeron:udp?endpoint=" + endpoint;
         if (transport_.ingressChannel() == channel) return true;
-        if (!transport_.retarget(channel)) return false;   // old pub intact; the resend is budget-bounded
+        if (responsePort == 0) responsePort = knownResponsePort_(channel);   // Metadata may know it
+        if (!transport_.retarget(channel, responsePort)) return false;   // old pub intact; the resend is budget-bounded
         Session& seed            = seedSession();
         seed.currentLeaderChannel = channel;
         seed.currentLeaderNode    = -1;   // the node id is learnt from the metadata answer
+        seed.responsePort         = responsePort;
         invalidateRouteSessions_();       // DR client bug 1: the seed moved
         return true;
     } catch (...) {
@@ -1261,10 +1295,13 @@ bool ClientAgent::retargetSeedToBootstrap_() noexcept {
     // from the transport (the real current channel) and copied, since retarget()
     // replaces the transport's channel string.
     const std::string leaving = transport_.ingressChannel();
-    if (!transport_.retarget(bootstrap)) return false;  // old pub intact; next attempt retries
+    const int32_t bootstrapPort = cfg_.transport.gatewayResponseControlPort;
+    if (!transport_.retarget(bootstrap, bootstrapPort)) return false;  // old pub intact; next attempt retries
     Session& seed               = seedSession();
     seed.lastKnownLeaderChannel = leaving;
     seed.lastKnownLeaderNode    = seed.currentLeaderNode;
+    seed.lastKnownLeaderResponsePort = seed.responsePort;
+    seed.responsePort           = bootstrapPort;
     seed.currentLeaderChannel   = bootstrap;
     seed.currentLeaderNode      = -1;  // unknown until the gateway redirects us again
     invalidateRouteSessions_();        // DR client bug 1: the seed moved
@@ -1279,9 +1316,10 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
     // moved it) — never trade it for the stale one.
     if (transport_.ingressChannel() != cfg_.transport.ingressChannel) return true;
     if (transport_.ingressChannel() == seed.lastKnownLeaderChannel) return true;
-    if (!transport_.retarget(seed.lastKnownLeaderChannel)) return false;  // next odd attempt retries
+    if (!transport_.retarget(seed.lastKnownLeaderChannel, seed.lastKnownLeaderResponsePort)) return false;  // next odd attempt retries
     seed.currentLeaderChannel = seed.lastKnownLeaderChannel;
     seed.currentLeaderNode    = seed.lastKnownLeaderNode;
+    seed.responsePort         = seed.lastKnownLeaderResponsePort;
     invalidateRouteSessions_();  // DR client bug 1: the seed moved
     return true;
 }
@@ -1304,6 +1342,8 @@ bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t
     // single-node fast path).  Any other session → its own endpoint over the
     // shared transport (default ingress stream id).
     if (&owner == &seedSession()) return transport_.offer(buf, len);
+    // NAT-safe egress: a session opened with a known response port rides its response-correlated publication.
+    if (owner.ctlPub != transport::AeronTransport::kNoPub) return transport_.offerOn(owner.ctlPub, buf, len);
     return transport_.offerTo(owner.endpoint, cfg_.transport.ingressStreamId, buf, len);
 }
 
@@ -1325,6 +1365,21 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     Session& s = *sessions_.back();
     s.machine.useScramCache(&scramCache_);   // authentication: PBKDF2 once per verifier, not once per session
     s.machine.useSharedSecret(&secret_);
+    // NAT-safe egress: with a known response port the control publication is response-correlated (response
+    // subscription first, in AeronTransport::offerOn).  A session opened before Metadata taught the port stays plain.
+    s.responsePort = knownResponsePort_(endpoint);
+    if (s.responsePort != 0) {
+        try {
+            const auto respCh = transport::responseControlChannelFor(endpoint, s.responsePort);
+            if (respCh) {
+                s.ctlPub = transport_.responsePublicationHandle(endpoint, cfg_.transport.ingressStreamId, *respCh);
+            } else {
+                s.responsePort = 0;   // not a UDP endpoint: nothing to pair
+            }
+        } catch (...) {
+            s.ctlPub = transport::AeronTransport::kNoPub;   // allocation failure (cold): the declared path
+        }
+    }
     // On the duty clock (the clock tick() runs on), never steady_clock: with an
     // injected nanoClock the two are different domains and the connect's
     // fast-retry / timeout would never (or only much later) come due.
@@ -1421,6 +1476,9 @@ void ClientAgent::releaseRoutePub_(transport::AeronTransport::PubHandle h) noexc
     for (const PartitionRoute& r : routes_) {
         if (r.pub == h) return;  // still referenced by another route
     }
+    for (const WorkerBindEntry& b : workerBinds_) {
+        if (b.pub == h) return;  // a worker's bind entry owns its publication for the client's lifetime
+    }
     // Never a session's own control publication or the default channel's: only a
     // route-only (worker data) publication is closed.
     const std::string* ch = transport_.publicationChannel(h);
@@ -1432,7 +1490,8 @@ void ClientAgent::releaseRoutePub_(transport::AeronTransport::PubHandle h) noexc
 }
 
 bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string& sessionEndpoint,
-                           const std::string& dataChannel, uint8_t receiverId) noexcept {
+                           const std::string& dataChannel, uint8_t receiverId, int32_t streamId,
+                           int32_t responsePort) noexcept {
     const int64_t  key  = routeKey(topicId, partition);
     const uint32_t idx  = routeIndex_.find(key);
     // Fix round 1 (C1): where the seed's default publication PHYSICALLY points —
@@ -1454,17 +1513,43 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
     try {
         const std::string& data = dataChannel.empty() ? sessionEndpoint : dataChannel;
         // Issue #116: the route's receiver (cold: once per metadata change; the offer reads two plain fields).
+        // NAT-safe egress: a worker route (data channel is not the node itself) with a response-control port gets a
+        // bind entry — the publication every produce to that worker rides, and the one WorkerBind goes out on.
+        const bool workerRoute = !sameEndpoint(data, sessionEndpoint);
+        const int32_t bindStream = streamId != 0 ? streamId : cfg_.transport.ingressStreamId;
+        const auto bindFor = [&]() -> uint32_t {
+            return (workerRoute && responsePort != 0)
+                       ? workerBindFor_(sessionEndpoint, data, bindStream, responsePort) : kNoBind;
+        };
         const auto fresh = [&] {
             PartitionRoute nr{sessionEndpoint, data};
             nr.receiverId = receiverId;
             nr.dataOnNode = sameEndpoint(data, sessionEndpoint);
+            nr.bindIdx    = bindFor();
+            nr.bindStream = bindStream;
+            nr.bindPort   = responsePort;
+            if (nr.bindIdx != kNoBind) {   // the entry's publication IS the route's (never a separate plain one)
+                nr.pub      = workerBinds_[nr.bindIdx].pub;
+                nr.streamId = streamId;
+            }
             return nr;
         };
         if (idx != detail::FlatIndexMap::kNone) {
             PartitionRoute& r = routes_[idx];
             if (r.sessionEndpoint == sessionEndpoint && r.dataChannel == data) {
-                if (r.receiverId == receiverId) return false;
+                const bool bindChanged = r.bindStream != bindStream || r.bindPort != responsePort;
+                if (r.receiverId == receiverId && !bindChanged) return false;
                 r.receiverId = receiverId;   // same endpoint, another receiver: keep the publication
+                if (bindChanged) {
+                    // The worker's response port / stream moved (restart, rebalance): re-resolve the entry.
+                    r.bindIdx = bindFor();
+                    r.bindStream = bindStream;
+                    r.bindPort = responsePort;
+                    if (r.bindIdx != kNoBind) {
+                        r.pub = workerBinds_[r.bindIdx].pub;
+                        r.streamId = streamId;
+                    }
+                }
                 return true;
             }
             const auto oldPub = r.pub;
@@ -1537,7 +1622,11 @@ transport::AeronTransport::OfferResult ClientAgent::offerOnSession(uint32_t inde
         ++ingressOfferRefused_;
         return R::Retry;  // seal failed — DROP, do not transmit
     }
-    if (transport_.offerTo(sessions_[index]->endpoint, cfg_.transport.ingressStreamId, buf, len)) return R::Accepted;
+    Session& target = *sessions_[index];
+    const bool offered = target.ctlPub != transport::AeronTransport::kNoPub
+        ? transport_.offerOn(target.ctlPub, buf, len)   // NAT-safe egress: the response-correlated publication
+        : transport_.offerTo(target.endpoint, cfg_.transport.ingressStreamId, buf, len);
+    if (offered) return R::Accepted;
     ++ingressOfferRefused_;
     return R::Retry;
 }
@@ -1677,6 +1766,91 @@ bool ClientAgent::sealForDestination_(session::SessionMachine& m,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// NAT-safe egress (spec D2/D6a/D7): response ports, worker bind table, WorkerBind duty
+// ---------------------------------------------------------------------------
+
+int32_t ClientAgent::knownResponsePort_(const std::string& endpoint) const noexcept {
+    for (const auto& [ep, port] : nodeResponsePorts_) {
+        if (sameEndpoint(ep, endpoint)) return port;
+    }
+    // The bootstrap gateway's port is configuration, not Metadata.
+    if (sameEndpoint(endpoint, cfg_.transport.ingressChannel)) return cfg_.transport.gatewayResponseControlPort;
+    return 0;
+}
+
+void ClientAgent::setSessionResponsePort(const std::string& endpoint, int32_t port) noexcept {
+    if (endpoint.empty() || port < 0) return;
+    try {
+        for (auto& [ep, known] : nodeResponsePorts_) {
+            if (sameEndpoint(ep, endpoint)) { known = port; return; }
+        }
+        nodeResponsePorts_.emplace_back(endpoint, port);
+    } catch (...) {
+        // allocation failure (cold): the node stays on the declared path
+    }
+}
+
+uint32_t ClientAgent::findSessionIndex_(const std::string& endpoint) const noexcept {
+    // sessionForEndpoint() without opening a session: the seed is the session of where it physically sits.
+    if (endpoint.empty()) return 0;
+    if (sameEndpoint(endpoint, transport_.ingressChannel())) return 0;
+    for (std::size_t i = 1; i < sessions_.size(); ++i) {
+        if (sameEndpoint(sessions_[i]->endpoint, endpoint)) return static_cast<uint32_t>(i);
+    }
+    return kNoSession;
+}
+
+uint32_t ClientAgent::workerBindFor_(const std::string& sessionEndpoint, const std::string& dataChannel,
+                                     int32_t streamId, int32_t responsePort) noexcept {
+    try {
+        for (std::size_t i = 0; i < workerBinds_.size(); ++i) {
+            WorkerBindEntry& b = workerBinds_[i];
+            if (b.streamId == streamId && b.dataChannel == dataChannel) return static_cast<uint32_t>(i);
+        }
+        const auto respCh = transport::responseControlChannelFor(dataChannel, responsePort);
+        if (!respCh) return kNoBind;   // not a UDP worker endpoint: nothing to pair
+        WorkerBindEntry e;
+        e.sessionEndpoint = sessionEndpoint;
+        e.dataChannel     = dataChannel;
+        e.streamId        = streamId;
+        e.pub             = transport_.responsePublicationHandle(dataChannel, streamId, *respCh);
+        if (e.pub == transport::AeronTransport::kNoPub) return kNoBind;
+        workerBinds_.push_back(std::move(e));
+        return static_cast<uint32_t>(workerBinds_.size() - 1);
+    } catch (...) {
+        return kNoBind;
+    }
+}
+
+int ClientAgent::serviceWorkerBinds_() noexcept {
+    int sent = 0;
+    if (holdWorkerBinds_) [[unlikely]] return 0;
+    for (WorkerBindEntry& e : workerBinds_) {
+        if (e.sessionIndex == kNoSession) {
+            e.sessionIndex = findSessionIndex_(e.sessionEndpoint);
+            if (e.sessionIndex == kNoSession) continue;   // the route's first offer opens it
+        }
+        if (e.sessionIndex >= sessions_.size()) { e.sessionIndex = kNoSession; continue; }
+        const Session& s = *sessions_[e.sessionIndex];
+        if (!s.bindRequired || s.machine.state() != session::SessionState::Connected) continue;
+        const int64_t sid = s.machine.sessionId();
+        if (sid == 0) continue;
+        const auto* bound = std::get_if<WorkerBindEntry::Bound>(&e.state);
+        if (bound != nullptr && bound->sid == sid) continue;
+        // The very first frame on this worker publication for this session: PLAINTEXT, never sealed.
+        uint8_t frame[rune::protocol::client::WorkerBind::ENCODED_SIZE];
+        const std::size_t n = codec::encodeWorkerBind(frame, sizeof frame, sid, ++bindCorrId_, s.bindToken);
+        if (n == 0) continue;
+        if (transport_.offerOn(e.pub, frame, n)) {
+            e.state = WorkerBindEntry::Bound{sid};
+            ++workerBindsSent_;
+            ++sent;
+        }
+    }
+    return sent;
+}
+
 bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
                                         int32_t ingressStreamId,
                                         const uint8_t* buf, std::size_t len,
@@ -1699,13 +1873,30 @@ bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
                 ++heldOffers_;  // DR-7: the owner asks for metadata (the leader may have moved)
                 return false;
             }
+            if (r.bindIdx != kNoBind) {
+                // NAT-safe egress: the worker drops produce from an image it has not bound this session to.  Hold
+                // exactly like the not-Connected branch until the WorkerBind for THIS session id went out (a session
+                // without a token is not response-mode: nothing to bind).  One branch + one compare.
+                const WorkerBindEntry& wb = workerBinds_[r.bindIdx];
+                const auto* bound = std::get_if<WorkerBindEntry::Bound>(&wb.state);
+                if (leader.bindRequired && (bound == nullptr || bound->sid != sid)) {
+                    ++heldOffers_;
+                    return false;
+                }
+            }
             if (r.streamId != ingressStreamId) {  // once per route / stream change
                 const int32_t stream = ingressStreamId != 0 ? ingressStreamId
                                                             : cfg_.transport.ingressStreamId;
-                try {
-                    r.pub = transport_.publicationHandle(r.dataChannel, stream);
-                } catch (...) {
-                    return false;
+                if (r.bindIdx != kNoBind) {
+                    // the entry's publication serves one stream: a produce on another is never sent plain.
+                    if (workerBinds_[r.bindIdx].streamId != stream) { ++heldOffers_; return false; }
+                    r.pub = workerBinds_[r.bindIdx].pub;
+                } else {
+                    try {
+                        r.pub = transport_.publicationHandle(r.dataChannel, stream);
+                    } catch (...) {
+                        return false;
+                    }
                 }
                 r.streamId = ingressStreamId;
             }

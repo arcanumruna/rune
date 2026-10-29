@@ -3,6 +3,7 @@
 // test thread IS the driver.
 #include <filesystem>
 #include <rune/client/transport/AeronTransport.h>
+#include <rune/client/transport/ResponseChannel.h>
 
 #include <Aeron.h>  // aeron::currentTimeMillis — the conductor's own clock (stall test)
 
@@ -847,4 +848,221 @@ TEST(InvokerTransportDirLockRegression, AnotherSpellingOfTheSameDirIsRefusedRegr
     std::filesystem::remove_all(link, ec);
     std::filesystem::remove(link + "/aeron.lock", ec);
     std::filesystem::remove_all(cfg.dataDir, ec);
+}
+
+// ===========================================================================
+// NAT-safe egress (Task 7): Aeron response channels.  The client opens a response subscription
+// (control=<server response-control>|control-mode=response) BEFORE the request publication, which names the
+// subscription's registration id.  A raw Aeron "server" (its own client on the transport's embedded driver)
+// plays the broker: it answers on a response publication correlated with the request IMAGE.
+// ===========================================================================
+namespace {
+
+std::string loopback(uint16_t port) { return "aeron:udp?endpoint=127.0.0.1:" + std::to_string(port); }
+
+Config responseConfig(const std::string& ingress, uint16_t responsePort, int32_t stream) {
+    Config c = invokerConfig(ingress, loopback(rune::client::testing::allocFreeUdpPort()), stream);
+    c.gatewayResponseControlPort = responsePort;
+    return c;
+}
+
+// The raw broker: a subscription on a request endpoint, and a response publication per request image.
+struct RawServer {
+    std::shared_ptr<aeron::Aeron>                aeron;
+    std::shared_ptr<aeron::Subscription>         sub;
+    std::shared_ptr<aeron::ExclusivePublication> resp;
+    int64_t subReg  = -1;
+    int64_t respReg = -1;
+    std::string ctl;       // "127.0.0.1:<response-control port>"
+    int32_t     respStream = 0;
+    std::vector<std::vector<uint8_t>> received;   // frames that reached the request subscription
+
+    RawServer(const std::string& clientDataDir, const std::string& requestChannel, int32_t requestStream,
+              uint16_t responsePort, int32_t respStreamId)
+        : ctl("127.0.0.1:" + std::to_string(responsePort)), respStream(respStreamId) {
+        aeron::Context ctx;
+        ctx.aeronDir(clientDataDir + "/aeron");
+        ctx.useConductorAgentInvoker(true);
+        ctx.errorHandler([](const std::exception&) {});
+        aeron  = aeron::Aeron::connect(ctx);
+        subReg = aeron->addSubscription(requestChannel, requestStream);
+    }
+    ~RawServer() { resp.reset(); sub.reset(); aeron.reset(); }
+
+    // One duty cycle of the server's own client: resolve, read requests, open the response publication on the image.
+    void pump() {
+        aeron->conductorAgentInvoker().invoke();
+        if (!sub) sub = aeron->findSubscription(subReg);
+        if (sub) {
+            sub->poll([this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len,
+                             aeron::Header&) {
+                received.emplace_back(b.buffer() + off, b.buffer() + off + len);
+            }, 16);
+            if (respReg < 0 && sub->imageCount() > 0) {
+                const auto image = sub->imageByIndex(0);
+                respReg = aeron->addExclusivePublication(
+                    "aeron:udp?control=" + ctl + "|control-mode=response|response-correlation-id=" +
+                        std::to_string(image->correlationId()),
+                    respStream);
+            }
+        }
+        if (respReg >= 0 && !resp) resp = aeron->findExclusivePublication(respReg);
+    }
+    bool respond(const std::vector<uint8_t>& f) {
+        if (!resp) return false;
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(f.data()), static_cast<aeron::util::index_t>(f.size()));
+        return resp->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) > 0;
+    }
+};
+
+template <class Pred>
+bool pumpBoth(Transport& t, RawServer& srv, Pred&& pred) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        t.dutyCycle();
+        srv.pump();
+        if (pred()) return true;
+    }
+    return false;
+}
+
+} // namespace
+
+TEST(InvokerTransportResponseRegression, SeedPublicationIsCorrelatedWithItsResponseSubscription) {
+    const uint16_t reqPort = rune::client::testing::allocFreeUdpPort();
+    const uint16_t rPort   = rune::client::testing::allocFreeUdpPort();
+    Transport t{responseConfig(loopback(reqPort), rPort, 3500)};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    const int64_t regId = t.seedResponseSubscriptionIdForTest();
+    ASSERT_NE(regId, 0);
+    // The request publication names exactly the response subscription's registration id, the plain channel stays the identity.
+    EXPECT_EQ(t.seedPublicationChannelForTest(),
+              loopback(reqPort) + "|response-correlation-id=" + std::to_string(regId));
+    EXPECT_EQ(t.ingressChannel(), loopback(reqPort));
+    t.stop();
+}
+
+TEST(InvokerTransportResponseRegression, NoResponseSubscriptionForIpcOrPortZero) {
+    {   // ipc gateway, a port configured: nothing to pair
+        Transport t{responseConfig("aeron:ipc", 40163, 3501)};
+        t.start();
+        EXPECT_FALSE(t.seedResponseCorrelated());
+        EXPECT_EQ(t.seedResponseSubscriptionIdForTest(), 0);
+        EXPECT_EQ(t.seedPublicationChannelForTest(), "aeron:ipc");
+        t.stop();
+    }
+    {   // udp gateway, port 0 = the declared path only
+        const std::string ch = loopback(rune::client::testing::allocFreeUdpPort());
+        Transport t{responseConfig(ch, 0, 3502)};
+        t.start();
+        EXPECT_FALSE(t.seedResponseCorrelated());
+        EXPECT_EQ(t.seedResponseSubscriptionIdForTest(), 0);
+        EXPECT_EQ(t.seedPublicationChannelForTest(), ch);
+        t.stop();
+    }
+}
+
+TEST(InvokerTransportResponseRegression, RealAeronResponseReachesTheClientOverItsOwnFlow) {
+    const uint16_t reqPort = rune::client::testing::allocFreeUdpPort();
+    const uint16_t rPort   = rune::client::testing::allocFreeUdpPort();
+    Config c = responseConfig(loopback(reqPort), rPort, 3510);
+    Transport t{c};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    RawServer srv(c.dataDir, loopback(reqPort), c.ingressStreamId, rPort, c.egressStreamId);
+
+    const uint8_t request[] = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(pumpBoth(t, srv, [&] { return t.offer(request, sizeof request); }));
+    ASSERT_TRUE(pumpBoth(t, srv, [&] { return srv.received.size() == 1; }));
+    EXPECT_EQ(srv.received[0], std::vector<uint8_t>(std::begin(request), std::end(request)));
+
+    // The server answers on a response publication correlated with the request image: the client's poll gets it
+    // byte-equal, although its DECLARED egress (never served here) is not involved.
+    const std::vector<uint8_t> reply = {9, 8, 7, 6, 5, 4, 3, 2, 1};
+    std::vector<uint8_t> got;
+    ASSERT_TRUE(pumpBoth(t, srv, [&] {
+        if (got.empty()) (void)srv.respond(reply);
+        t.poll([&](const uint8_t* b, std::size_t n) { if (got.empty()) got.assign(b, b + n); }, 10);
+        return !got.empty();
+    }));
+    EXPECT_EQ(got, reply);
+    t.stop();
+}
+
+TEST(InvokerTransportResponseRegression, ResponsePublicationHandleIsNotReadyUntilBothResolveThenCarriesBothDirections) {
+    const uint16_t reqPort = rune::client::testing::allocFreeUdpPort();   // the "worker" ingress
+    const uint16_t rPort   = rune::client::testing::allocFreeUdpPort();   // the worker's response-control port
+    Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3520);
+    Transport t{c};
+    t.start();
+    const std::string worker = loopback(reqPort);
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, rPort);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3521, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    EXPECT_EQ(t.responsePublicationHandle(worker, 3521, *respCtl), h) << "one slot per (channel, stream)";
+    EXPECT_FALSE(t.publicationResponseCorrelated(h)) << "phase 1: still awaiting the response subscription";
+    RawServer srv(c.dataDir, worker, 3521, rPort, c.egressStreamId);
+
+    const uint8_t bind[] = {0xB1, 0xD0};
+    EXPECT_FALSE(t.offerOn(h, bind, sizeof bind)) << "never ready on the first call: the response subscription resolves first";
+    EXPECT_FALSE(t.publicationReady(h));
+    bool sent = false;
+    ASSERT_TRUE(pumpBoth(t, srv, [&] {
+        if (!sent) sent = t.offerOn(h, bind, sizeof bind);
+        return sent;
+    }));
+    EXPECT_TRUE(t.publicationResponseCorrelated(h));
+    ASSERT_TRUE(pumpBoth(t, srv, [&] { return srv.received.size() == 1; }));
+    EXPECT_EQ(srv.received[0], std::vector<uint8_t>(std::begin(bind), std::end(bind)));
+
+    const std::vector<uint8_t> ack = {0xAC, 0x4B};
+    std::vector<uint8_t> got;
+    ASSERT_TRUE(pumpBoth(t, srv, [&] {
+        if (got.empty()) (void)srv.respond(ack);
+        t.poll([&](const uint8_t* b, std::size_t n) { if (got.empty()) got.assign(b, b + n); }, 10);
+        return !got.empty();
+    }));
+    EXPECT_EQ(got, ack) << "the worker's reply arrives on the response subscription";
+    t.stop();
+}
+
+TEST(InvokerTransportResponseRegression, ResponseHandleForAnExistingPlainKeyReturnsThePlainSlot) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3530)};
+    t.start();
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const Transport::PubHandle plain = t.publicationHandle(worker, 3531);
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, 40999);
+    ASSERT_TRUE(respCtl.has_value());
+    EXPECT_EQ(t.responsePublicationHandle(worker, 3531, *respCtl), plain) << "never both a plain and a correlated slot";
+    EXPECT_FALSE(t.publicationResponseCorrelated(plain));
+    // An empty response channel is simply the plain handle.
+    EXPECT_EQ(t.responsePublicationHandle(worker, 3532, {}), t.publicationHandle(worker, 3532));
+    t.stop();
+}
+
+TEST(InvokerTransportResponseRegression, RetargetPairsTheNewResponseSubscriptionAndFallsBackToPlain) {
+    const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
+    const uint16_t reqB = rune::client::testing::allocFreeUdpPort(), rB = rune::client::testing::allocFreeUdpPort();
+    Transport t{responseConfig(loopback(reqA), rA, 3540)};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    const int64_t regA = t.seedResponseSubscriptionIdForTest();
+
+    ASSERT_TRUE(t.retarget(loopback(reqB), rB));
+    EXPECT_TRUE(t.seedResponseCorrelated());
+    const int64_t regB = t.seedResponseSubscriptionIdForTest();
+    EXPECT_NE(regB, 0);
+    EXPECT_NE(regB, regA) << "a new response subscription for the new gateway";
+    EXPECT_EQ(t.seedPublicationChannelForTest(), loopback(reqB) + "|response-correlation-id=" + std::to_string(regB));
+    EXPECT_EQ(t.ingressChannel(), loopback(reqB));
+
+    // Port 0 / a redirect without a port: back on the plain (declared) path.
+    ASSERT_TRUE(t.retarget(loopback(reqA)));
+    EXPECT_FALSE(t.seedResponseCorrelated());
+    EXPECT_EQ(t.seedPublicationChannelForTest(), loopback(reqA));
+    // The retired response subscription is released at the next poll (never inside a callback).
+    for (int i = 0; i < 5; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }
+    t.stop();
 }

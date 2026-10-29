@@ -36,6 +36,7 @@ extern "C" {
 #include <rune/client/transport/DriverDirLock.h>
 #include <rune/client/transport/FrameCrc.h>
 #include <rune/client/transport/Resolution.h>
+#include <rune/client/transport/ResponseChannel.h>
 #include <rune/client/transport/TransportConfig.h>
 #include <flight_recorder/FlightRecorder.h>
 
@@ -46,8 +47,10 @@ extern "C" {
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
+#include <variant>
 #include <vector>
 
 namespace rune::client::transport {
@@ -221,6 +224,34 @@ public:
     static constexpr PubHandle kNoPub = -1;
     PubHandle publicationHandle(const std::string& channel, int32_t streamId);
 
+    /// NAT-safe egress: the handle of a REQUEST publication to (channel, streamId) correlated with a response
+    /// subscription on `responseControlChannel` (stream = the session's egressStreamId).  Two phases, both inside
+    /// offerOn() and never blocking: the response subscription first (a Live SubSlot, polled like the MDC ones),
+    /// then — once it is Ready — the publication on `channel|response-correlation-id=<its registration id>`.  offerOn
+    /// returns false until the publication is Ready.  An empty `responseControlChannel` is publicationHandle().
+    /// (channel, streamId) stays the lookup key: a plain and a correlated slot for one key never both exist — asking
+    /// for a correlated one when a plain one exists returns the plain one unchanged (logged once).  Cold path.
+    PubHandle responsePublicationHandle(const std::string& channel, int32_t streamId,
+                                        std::string_view responseControlChannel);
+    /// The publication of `h` is a response-correlated request publication whose response subscription exists
+    /// (Ready or still resolving the publication).  False for a plain / unknown handle or a response subscription
+    /// not yet Ready.  Cold path (session connect, bind duty).
+    [[nodiscard]] bool publicationResponseCorrelated(PubHandle h) const noexcept {
+        if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return false;
+        return std::holds_alternative<PubSlot::Correlated>(pubSlots_[static_cast<std::size_t>(h)].mode);
+    }
+
+    /// True iff the DEFAULT ingress publication is response-correlated (the seed's response pair exists).
+    [[nodiscard]] bool seedResponseCorrelated() const noexcept { return respSeedSlot_ >= 0; }
+    /// TEST SEAMS: the channel string the default ingress publication was actually registered with, and the
+    /// registration id of the seed's response subscription (0 = none).
+    [[nodiscard]] const std::string& seedPublicationChannelForTest() const noexcept { return ingressPubChannel_; }
+    [[nodiscard]] int64_t seedResponseSubscriptionIdForTest() const noexcept {
+        if (respSeedSlot_ < 0) return 0;
+        const aeron::Subscription* sub = subSlots_[static_cast<std::size_t>(respSeedSlot_)].res.ready();
+        return sub != nullptr ? sub->registrationId() : 0;
+    }
+
     /// Hot path: one bounds check + one variant check + tryClaim.  Returns false
     /// while the publication resolves or is back-pressured (retry next cycle).
     bool offerOn(PubHandle h, const uint8_t* buf, std::size_t len, FrameCrc crc = {}) noexcept;
@@ -297,6 +328,7 @@ public:
         // and every per-worker subscription (the caller sizes it to its ack-buffer
         // room).  The starting source rotates each poll so no subscription starves.
         int frags = 0;
+        if (retiredSubs_ != 0) [[unlikely]] reapRetiredSubs_();   // never inside a poll callback: here is safe
         const std::size_t sources = 1 + subSlots_.size();
         const std::size_t start   = pollStart_ < sources ? pollStart_ : 0;
         pollStart_ = (start + 1 == sources) ? 0 : start + 1;
@@ -309,6 +341,7 @@ public:
                 continue;
             }
             SubSlot& s = subSlots_[i - 1];
+            if (s.state != SubSlot::State::Live) continue;   // retired (reaped next poll) or free
             aeron::Subscription* sub = s.res.ready();
             if (sub == nullptr) sub = resolveSubSlot_(s);
             if (sub != nullptr) frags += sub->poll(onFragment(*s.assembler), fragmentLimit - frags);
@@ -396,7 +429,12 @@ public:
     /// working on the previous endpoint.  Returns true on success, false on
     /// failure (transport left consistent, no exception, no std::terminate even
     /// when reached from the agent's noexcept dispatchEgressFrame path).
-    bool retarget(const std::string& newIngressChannel) noexcept;
+    ///
+    /// NAT-safe egress: `responsePort` (the new gateway's response-control port, 0 / a non-UDP channel = none) selects
+    /// the response pairing — a new response subscription FIRST, then the publication correlated with it; the old
+    /// pair (publication, and the old response subscription, retired and released at the next poll) is released only
+    /// after both new ones are Ready.  A failure keeps the old pair.
+    bool retarget(const std::string& newIngressChannel, int32_t responsePort = 0) noexcept;
 
 private:
     // ---- Configuration -------------------------------------------------------
@@ -453,6 +491,11 @@ private:
     // ---- Aeron C++ client + pub/sub -----------------------------------------
     std::shared_ptr<aeron::Aeron>                aeron_;
     std::shared_ptr<aeron::ExclusivePublication> ingressPub_;
+    /// The channel `ingressPub_` was registered with (== cfg_.ingressChannel, plus the response-correlation-id when
+    /// the seed has a response pair).  cfg_.ingressChannel stays the PLAIN identity channel.  Owner thread only.
+    std::string                                  ingressPubChannel_;
+    /// Index into subSlots_ of the seed's response subscription (-1 = none): the seed's rich response state.
+    int32_t                                      respSeedSlot_ = -1;
     std::shared_ptr<aeron::Subscription>         egressSub_;
     std::unique_ptr<aeron::FragmentAssembler>    assembler_;
 
@@ -508,16 +551,36 @@ private:
     // Single-writer (owner thread only).  Cleared in stop() before aeron_ release
     // (their dtors deregister through the client conductor).
     struct PubSlot {
+        /// Response pairing (NAT-safe egress), one explicit state — never scattered flags:
+        ///   Plain                  an ordinary publication on `channel`;
+        ///   AwaitResponseSub{idx}  its response subscription (subSlots_[idx]) is still resolving: no publication yet;
+        ///   Correlated{idx}        the publication is registered (or resolving/ready) on `addChannel`, which names
+        ///                          that subscription's registration id.
+        struct Plain {};
+        struct AwaitResponseSub { int32_t subSlot; };
+        struct Correlated { int32_t subSlot; };
         std::string channel;
         int32_t     streamId;
         Resolution<aeron::ExclusivePublication> res;
+        std::variant<Plain, AwaitResponseSub, Correlated> mode{Plain{}};
+        std::string addChannel;   ///< the registered channel when Correlated (cold: built once)
     };
     struct SubSlot {
+        enum class State : uint8_t { Live, Retired, Free };
         std::string channel;
         int32_t     streamId;
         Resolution<aeron::Subscription> res;
         std::unique_ptr<aeron::FragmentAssembler> assembler;  // built on Ready
+        State       state = State::Live;   ///< Retired: not polled, released by reapRetiredSubs_(); Free: reusable
     };
+    /// Open (idempotently, among Live slots) a subscription slot; its index, or -1 on allocation failure.  Cold.
+    int32_t addSubSlot_(const std::string& channel, int32_t streamId) noexcept;
+    /// A response subscription retired by retarget() may be the one whose poll callback is running: it is only
+    /// marked here and released (with its assembler) at the start of the next poll().
+    void retireSubSlot_(int32_t idx) noexcept;
+    void reapRetiredSubs_() noexcept;
+    uint32_t retiredSubs_ = 0;   // Retired slots awaiting reapRetiredSubs_()
+    bool     warnedPlainResponse_ = false;   // responsePublicationHandle: logged once
     std::vector<PubSlot>  pubSlots_;   // index == PubHandle (stable, never erased)
     detail::FlatIndexMap  streamPub_;  // default-channel streamId -> PubHandle
     std::vector<SubSlot>  subSlots_;   // per-worker dynamic-MDC egress subscriptions

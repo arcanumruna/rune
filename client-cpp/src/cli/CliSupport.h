@@ -50,7 +50,24 @@ struct ParsedArgs {
 // The test-only overrides the schema commands already accept (not advertised).
 inline constexpr std::string_view kHiddenValueFlags[] = {"--cli-stream-in", "--cli-stream-out", "--cli-data-dir",
                                                          "--cli-egress", "--user", "--password-file",   // the global flags too (Task 8)
-                                                         "--tls-ca", "--tls-host"};                     // issue #13
+                                                         "--tls-ca", "--tls-host",                      // issue #13
+                                                         "--gateway-response-port"};                    // NAT-safe egress (D7)
+
+/// NAT-safe egress (spec D7): the seed gateway's response-control port from `--gateway-response-port` (or, absent,
+/// RUNE_GATEWAY_RESPONSE_PORT); absent = 0 (the declared egress path).  A value that is not 1..65535 throws
+/// std::invalid_argument.
+inline int32_t gatewayResponsePortOf(const std::string& flagValue) {
+    std::string v = flagValue;
+    if (v.empty()) {
+        if (const char* env = std::getenv("RUNE_GATEWAY_RESPONSE_PORT"); env != nullptr) v = env;
+    }
+    if (v.empty()) return 0;
+    int port = 0;
+    const auto r = std::from_chars(v.data(), v.data() + v.size(), port);
+    if (r.ec != std::errc{} || r.ptr != v.data() + v.size() || port < 1 || port > 65535)
+        throw std::invalid_argument("--gateway-response-port / RUNE_GATEWAY_RESPONSE_PORT must be a port in 1..65535");
+    return static_cast<int32_t>(port);
+}
 /// Issue #13: the global boolean flags every connecting command accepts.
 inline constexpr std::string_view kGlobalBoolFlags[] = {"--insecure-plaintext"};
 

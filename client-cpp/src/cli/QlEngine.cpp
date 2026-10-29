@@ -561,6 +561,7 @@ LiveOptions liveOptionsOf(const support::ParsedArgs& a, const std::string& endpo
     LiveOptions o;
     o.endpoint     = endpoint;
     o.egress       = a.value("--cli-egress");
+    o.gatewayResponsePort = a.value("--gateway-response-port");
     o.streamIn     = a.value("--cli-stream-in");
     o.streamOut    = a.value("--cli-stream-out");
     o.dataDir      = a.value("--cli-data-dir");
@@ -597,6 +598,12 @@ bool LiveBroker::open(const LiveOptions& o, std::ostream& err, bool withCredenti
         }
     }
     if (!egress.empty()) cfg.egressChannel = egress;
+    try {
+        cfg.gatewayResponseControlPort = gatewayResponsePortOf(o.gatewayResponsePort);   // NAT-safe egress (D7)
+    } catch (const std::exception& e) {
+        err << "rune: " << e.what() << "\n";
+        return false;
+    }
     try {
         if (!o.streamIn.empty()) cfg.gatewayStreamId = std::stoi(o.streamIn);
         if (!o.streamOut.empty()) cfg.egressStreamId = std::stoi(o.streamOut);

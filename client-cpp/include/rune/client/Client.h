@@ -286,6 +286,12 @@ struct ClientConfig {
     int32_t     gatewayStreamId  = 1;
     std::string egressChannel    = "aeron:ipc";
     int32_t     egressStreamId   = 2;
+    /// NAT-safe egress (spec 2026-10-26-rune-nat-egress-design D7): the seed gateway's response-control port, a config
+    /// value like Aeron Archive's response channel (the client needs it before its first connect).  With a UDP
+    /// `gatewayChannel` and a port in 1..65535 the client connects with `responseCorrelated`, and replies return over
+    /// its own flow through NAT.  The leader's port is learnt from the Redirect `#port` suffix, every broker's from
+    /// Metadata.  0 (default) = the declared `egressChannel` path only.
+    int32_t     gatewayResponseControlPort = 0;
     std::string dataDir;
 
     // High-level timeouts (milliseconds).
@@ -703,6 +709,15 @@ public:
         return agent_.testPublicationOpen(channel, streamId);
     }
     [[nodiscard]] std::size_t testSessionCount() const noexcept { return agent_.sessionCount(); }
+    // NAT-safe egress (Task 7) observers / seams.
+    [[nodiscard]] uint64_t    testWorkerBindsSent() const noexcept { return agent_.workerBindsSent(); }
+    [[nodiscard]] std::size_t testWorkerBindCount() const noexcept { return agent_.workerBindCount(); }
+    [[nodiscard]] bool        testSeedResponseCorrelated() const noexcept { return agent_.seedResponseCorrelated(); }
+    [[nodiscard]] uint64_t    testHeldOffers() const noexcept { return agent_.heldOffers(); }
+    void testHoldWorkerBinds(bool hold) noexcept { agent_.testHoldWorkerBinds(hold); }
+    [[nodiscard]] int32_t testKnownResponsePort(const std::string& endpoint) const noexcept {
+        return agent_.knownResponsePortForTest(endpoint);
+    }
     /// D4: the coordinator route (empty = the seed), its session index, and how
     /// many coordinator moves / fallbacks were followed (duty thread / owner).
     [[nodiscard]] const std::string& testCoordinatorChannel() const noexcept {
@@ -1581,7 +1596,7 @@ private:
     /// D4: a follower named the group / txn coordinator (ErrorResponse{
     /// NotCoordinator, endpoint}) — the coordinator route follows it (the seed
     /// session never moves).  No-op when it names the current coordinator.
-    void onCoordinatorRedirect_(const std::string& endpoint);
+    void onCoordinatorRedirect_(const std::string& message);   // "endpoint[#responsePort]"
     /// D4: tell the group hub the COORDINATOR session's (connected, sessionId,
     /// episode) if it changed; a coordinator session that (re)connected joins the
     /// members there; one that gave up falls back to the seed.  Called from
@@ -1641,7 +1656,7 @@ private:
     /// from now on, the salted-password cache is cleared, a one-time session becomes a normal one.
     void installSelfPassword_(std::string_view newPassword) noexcept;
     /// ErrorResponse{Redirect, endpoint} for pendingCtl_[i] (a DDL).
-    void onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs);
+    void onDdlRedirect_(std::size_t i, std::string_view message, int64_t nowNs);   // message: "endpoint[#responsePort]"
     /// NotLeader (ErrorResponse or a response's errorCode 2) for pendingCtl_[i] (a DDL).
     void onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs,
                          uint16_t failCode = static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader));
@@ -1792,7 +1807,7 @@ private:
     /// follows it PER PARTITION — the partition's route moves to `endpoint` and
     /// the re-armed Subscribe goes to that node's own session; the seed is
     /// never retargeted.  False when `corrId` is not a pending moved one.
-    bool followMovedSubscriptionRedirect_(int64_t corrId, std::string_view endpoint) noexcept;
+    bool followMovedSubscriptionRedirect_(int64_t corrId, std::string_view message) noexcept;   // "endpoint[#responsePort]"
     static int64_t fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept;
     static uint64_t fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept;
     static void fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept;
@@ -1872,9 +1887,13 @@ private:
     // E2 residual round 5 (R3): the follow of a NEW plain Subscribe's Redirect.
     enum class RedirectFollow : uint8_t { PerPartition, Hold, BySeed };
     [[nodiscard]] RedirectFollow redirectFollowFor_(const std::string& endpoint) const;
-    void redirectBySeed_(int64_t corrId, const std::string& newEndpoint);
+    void redirectBySeed_(int64_t corrId, const std::string& newEndpoint, int32_t responsePort = 0);
     int  releaseHeldRedirectFollows_();
-    struct HeldRedirect { int64_t corrId; std::string endpoint; int metaSeen; };
+    struct HeldRedirect { int64_t corrId; std::string endpoint; int metaSeen; int32_t responsePort; };
+    /// The Redirect message a held entry came from ("endpoint[#responsePort]").
+    static std::string redirectMessageOf_(const HeldRedirect& h) {
+        return h.responsePort > 0 ? h.endpoint + "#" + std::to_string(h.responsePort) : h.endpoint;
+    }
     std::vector<HeldRedirect> heldRedirectFollows_;   // duty thread; cold
     uint64_t redirectFollowsHeld_ = 0;
     uint64_t staleSubscribeRedirects_ = 0;   // R4: Redirects from a session the Subscribe is not outstanding on
