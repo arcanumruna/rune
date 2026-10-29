@@ -581,8 +581,8 @@ void ProducerImpl::enableDirectIngress(const DirectIngress& d) {
         static_cast<std::size_t>(kRecHeaderSize) + rune::client::Producer::kMaxRecordBytes);
     const std::size_t want = cfg_.directDeferredBytes > 0
                                  ? static_cast<std::size_t>(cfg_.directDeferredBytes) : 0u;
-    // #344: the claim quarantine holds a builder-sized spare, so abandoning an open claim (a commit / abort / close with
-    // a claim open) copies the records before it into the spare and swaps - no allocation.  Control plane, once.
+    // #344/#699: the largest possible claim is one whole builder, so the quarantine reserve is exactly that: an abandon
+    // never allocates (hot path). Memory cost is one builder per Direct producer, deliberate. Control plane, once.
     claimQuarantine_.reserve(builderPrealloc_);
     deferred_.init(std::max(want, 2 * kMaxRec));
     const std::size_t arena = deferred_.capacity();
@@ -2483,6 +2483,15 @@ int ProducerImpl::flushBatches(
 //         provably duplicate-free (no window at all, unlike U1).  The acked-
 //         data case is counted (unknownProducerIdStateLoss: the broker lost
 //         state it should have kept); it is never an app-visible failure.
+//         U3 (transactional, #694 / KIP-360).  A transactional epoch belongs to the coordinator, so U1 / U2's
+//         re-sequencing (a new identity) can only abort the transaction.  But UnknownProducerId means the broker
+//         holds NO producer state for us on this partition, i.e. none of our batches remain there.  If NONE of the
+//         CURRENT transaction's batches was acked on it (Added::ackedBatches == 0), the sequences restart at 0
+//         under the SAME producer id and epoch (restartInPlace_): the broker accepts sequence 0 from an unknown
+//         producer, the epoch is still the coordinator's so EndTxn still ends this data, and the transaction is
+//         kept.  If it already had a batch acked here, that data was lost on the broker: today's behaviour holds
+//         (AbortableError with 28, the abort bumps the epoch).  C3 (a failed predecessor's gap) is unchanged: a
+//         gap still poisons.
 //     lastAckedOffset (per partition) = the max last offset of every OK (B).
 // ---------------------------------------------------------------------------
 
@@ -2530,6 +2539,12 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         completeSlice_(ps, b->ackStart, b->ackCount, off, OpStatus::Ok, 0, b->tier2, b->recordCount);
         if (b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch) {
             ps.lastAckedSeq = std::max(ps.lastAckedSeq, b->baseSequence + b->recordCount - 1);
+            // #694: this transaction now has data on the broker for this partition (an ack of the CURRENT identity).
+            if (txnBatchAttrs_ != 0) [[unlikely]] {
+                if (auto* ad = std::get_if<Added>(&ps.txn); ad != nullptr && ad->ackedBatches != UINT32_MAX) {
+                    ++ad->ackedBatches;
+                }
+            }
         }
         // D6: the max acked LAST offset (a known-old OK -1 carries none).
         if (off >= 0) ps.lastAckedOffset = std::max(ps.lastAckedOffset, off + b->recordCount - 1);
@@ -2627,6 +2642,13 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
                          ps.topicId, ps.partition, static_cast<long long>(ps.lastAckedOffset),
                          static_cast<long long>(logStartOffset));
         }
+        // U3 (transactional, #694): see the rule below.
+        if (txnBatchAttrs_ != 0) [[unlikely]] {
+            if (const auto* ad = std::get_if<Added>(&ps.txn); ad != nullptr && ad->ackedBatches == 0) {
+                restartInPlace_(ps);
+                return;
+            }
+        }
         resequence_(ps, kTxnResetUnknownPid);
         return;
     }
@@ -2693,17 +2715,19 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
     if (ec >= static_cast<int16_t>(rune::protocol::client::ErrorCode::AuthenticationFailed) &&
         ec <= static_cast<int16_t>(rune::protocol::client::ErrorCode::PasswordChangeRequired) &&
         b->attempts == 1) {
-        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
-                      OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
-        txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec), AbortKind::BumpEpoch);
-        completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
-                       static_cast<uint16_t>(ec), b->tier2, b->recordCount);
         // The newest sequences were never used: give them back, so the next batch continues the sequence.
         // Otherwise the later in-flight batches meet the gap (OutOfOrderSequence) and C3 re-sequences them.
-        if (b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch &&
-            b->baseSequence + b->recordCount == ps.nextBaseSequence) {
-            ps.nextBaseSequence = b->baseSequence;
-        }
+        const bool givenBack = b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch &&
+                               b->baseSequence + b->recordCount == ps.nextBaseSequence;
+        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, ec,
+                      OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+        // #700: a batch definitely not appended whose sequence is given back leaves no gap: the transaction can abort
+        // without an epoch bump.  A batch behind a newer one in flight keeps its sequence (a gap): BumpEpoch.
+        txnNoteLoss_(OpStatus::BrokerError, static_cast<uint16_t>(ec),
+                     givenBack ? AbortKind::Plain : AbortKind::BumpEpoch);
+        completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::BrokerError,
+                       static_cast<uint16_t>(ec), b->tier2, b->recordCount);
+        if (givenBack) ps.nextBaseSequence = b->baseSequence;
         releaseResolved_(ps, *b);
         reclaimAckRing_(ps);
         if (isPartitionRefusal_(static_cast<uint16_t>(ec))) {
@@ -2901,6 +2925,18 @@ void ProducerImpl::resequence_(PartitionState& ps, uint16_t cause) noexcept {
     resetPartition_(ps, cause);
     if (ps.producerId < 0) return;   // epoch overflow: the stored batches are re-stamped when the new id arrives
     restampInflight_(ps);
+}
+
+void ProducerImpl::restartInPlace_(PartitionState& ps) noexcept {
+    // #694: the producer id and epoch are kept (the coordinator's); only this partition's sequence space restarts.
+    ps.nextBaseSequence = 0;
+    ps.lastAckedSeq     = -1;
+    ps.unresolved       = false;
+    std::fprintf(stderr,
+                 "ProducerImpl: topic=%d part=%d UnknownProducerId after retention: sequences restart at 0 under the "
+                 "same epoch; the transaction continues\n",
+                 ps.topicId, ps.partition);
+    restampInflight_(ps);   // b and every batch behind it: from 0, the same identity, parked for the re-send
 }
 
 void ProducerImpl::restampInflight_(PartitionState& ps) noexcept {

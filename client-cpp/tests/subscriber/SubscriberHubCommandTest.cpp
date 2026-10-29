@@ -87,7 +87,7 @@ std::unique_ptr<rc::SubscriptionImpl> makeImpl(int64_t corrId, int* delivered = 
 rcd::HubCommand addCmd(rc::SubscriptionImpl* impl) {
     auto req = SubscriberHub::makeSubscribeRequest(
         impl, kSession, /*partitionKnown=*/1, /*fromOffset=*/-2, /*iso=*/0, {},
-        std::chrono::steady_clock::now() + std::chrono::hours(1));
+        3'600'000'000'000LL /*1 h, relative*/);
     rcd::HubCommand c;
     c.op     = rcd::HubCommand::Op::SubscribeAdd;
     c.handle = reinterpret_cast<uint64_t>(req.release());
@@ -129,7 +129,7 @@ TEST(SubscriberHubCommand, SubscribeAddRegistersAndSendsOnDutyThreadRegression) 
     CaptureSend   send;
     auto impl = makeImpl(11);
     EXPECT_EQ(hub.pendingCount(), 0u);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     EXPECT_EQ(hub.pendingCount(), 1u);
     EXPECT_EQ(send.countSubscribe(), 1);
     EXPECT_TRUE(hub.hasPending());
@@ -145,7 +145,7 @@ TEST(SubscriberHubCommand, SubscriptionStatePublishedThroughStatusRingRegression
     auto impl = makeImpl(12, &delivered);
     rc::Subscription sub(impl.get(), &CapturingSink::fn, &sink);
 
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     EXPECT_EQ(sub.subscriptionId(), 0);
     EXPECT_TRUE(sub.active());
 
@@ -169,7 +169,7 @@ TEST(SubscriberHubCommand, UnsubscribeIsACommandNotASharedWriteRegression) {
     CapturingSink sink;
     auto impl = makeImpl(13);
     rc::Subscription sub(impl.get(), &CapturingSink::fn, &sink);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     hub.onSubscribeResponse(bindRsp(13, 88), 0, kSession, send.fn());
     ASSERT_EQ(hub.activeCount(), 1u);
 
@@ -184,7 +184,7 @@ TEST(SubscriberHubCommand, UnsubscribeIsACommandNotASharedWriteRegression) {
     EXPECT_EQ(hub.activeCount(), 1u) << "app thread touched no hub state";
     EXPECT_TRUE(impl->active)        << "app thread touched no duty-owned impl field";
 
-    hub.applyCommand(sink.cmds[0], /*unsubCorrId=*/500, kSession, send.fn());
+    hub.applyCommand(sink.cmds[0], /*unsubCorrId=*/500, kSession, send.fn(), /*nowNs=*/0);
     EXPECT_EQ(hub.activeCount(), 0u);
     EXPECT_FALSE(impl->active);
     EXPECT_TRUE(impl->status.closed());
@@ -202,12 +202,12 @@ TEST(SubscriberHubCommand, UnsubscribeBeforeResponseSendsLateUnsubscribeRegressi
     CaptureSend   send;
     int delivered = 0;
     auto impl = makeImpl(14, &delivered);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
 
     rcd::HubCommand u;
     u.op = rcd::HubCommand::Op::Unsubscribe;
     u.a  = 14;
-    hub.applyCommand(u, 600, kSession, send.fn());
+    hub.applyCommand(u, 600, kSession, send.fn(), /*nowNs=*/0);
     EXPECT_TRUE(impl->status.closed());
 
     hub.onSubscribeResponse(bindRsp(14, 99), /*unsubCorrId=*/601, kSession, send.fn());
@@ -229,7 +229,7 @@ TEST(SubscriberHubCommand, StatusRingNearFullNeverLosesFinalPositionRegression) 
     CapturingSink sink;
     auto impl = makeImpl(15);
     rc::Subscription sub(impl.get(), &CapturingSink::fn, &sink);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     hub.onSubscribeResponse(bindRsp(15, 5), 0, kSession, send.fn());
 
     std::vector<uint8_t> st;
@@ -251,7 +251,7 @@ TEST(SubscriberHubCommand, DirtyStatusRepublishedEveryDutyCycleRegression) {
     CapturingSink sink;
     auto impl = makeImpl(16);
     rc::Subscription sub(impl.get(), &CapturingSink::fn, &sink);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     hub.onSubscribeResponse(bindRsp(16, 6), 0, kSession, send.fn());
 
     std::vector<uint8_t> st;
@@ -280,7 +280,7 @@ TEST(SubscriberHubCommand, FinishedHandleNeverTouchesTheClientRegression) {
     rc::SubscriptionImpl* impl = makeImpl(17).release();
     {
         rc::Subscription sub(impl, &CapturingSink::fn, &sink);
-        hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+        hub.applyCommand(addCmd(impl), 0, kSession, send.fn(), /*nowNs=*/0);
         hub.onSubscribeResponse(bindRsp(17, 8), 0, kSession, send.fn());
         hub.deactivateAll();
         hub.handBackAll([](rc::SubscriptionImpl* s) noexcept {
@@ -305,9 +305,9 @@ TEST(SubscriberHubCommand, TimedOutSubscribeFinishesHandleRegression) {
     auto impl = makeImpl(18);
     rc::Subscription sub(impl.get(), &CapturingSink::fn, &sink);
     auto req = SubscriberHub::makeSubscribeRequest(
-        impl.get(), kSession, 1, -2, 0, {}, std::chrono::steady_clock::now());
+        impl.get(), kSession, 1, -2, 0, {}, /*timeoutNs=*/0);
     hub.adoptSubscribe(std::move(req), send.fn());
-    hub.sweepTimedOut(std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    hub.sweepTimedOut(1'000'000'000LL);   // duty-clock ns
     EXPECT_EQ(hub.pendingCount(), 0u);
     EXPECT_FALSE(sub.active());
 }
@@ -329,7 +329,7 @@ struct DirectSubSink {
         // F8c C7: a handle's release carries its destructor semantics
         // (unsubscribe), as the Client applies it.
         if (cmd.op == rcd::HubCommand::Op::HandleRelease) cmd.op = rcd::HubCommand::Op::Unsubscribe;
-        self->hub->applyCommand(cmd, 700 + self->calls, kSession, self->send->fn());
+        self->hub->applyCommand(cmd, 700 + self->calls, kSession, self->send->fn(), /*nowNs=*/0);
         return rcd::HubSubmit::Accepted;
     }
 };
@@ -350,7 +350,7 @@ TEST(SubscriberHubCommand, UnsubscribeInsideHandlerStopsTheBatchAndDefersFinishR
         sub.unsubscribe();
         finishedInsideHandler = sub.finished();
     };
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     hub.onSubscribeResponse(bindRsp(30, 40), 0, kSession, send.fn());
 
     std::vector<uint8_t> st;
@@ -388,7 +388,7 @@ TEST(SubscriberHubCommand, DestroyHandleInsideHandlerKeepsImplAliveUntilDispatch
         freesInHandler    = g_subFrees;
         releasedInHandler = hub.release(impl);  // the duty side may not forget it yet
     };
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl), 0, kSession, send.fn(), /*nowNs=*/0);
     hub.onSubscribeResponse(bindRsp(31, 41), 0, kSession, send.fn());
 
     std::vector<uint8_t> st;
@@ -463,7 +463,7 @@ TEST(SubscriberHubCommand, AppAndDutyThreadsShareOnlyRingsRegression) {
         bool bound = false;
         int  next  = 0;
         while (!appDone.load(std::memory_order_acquire)) {
-            ch.drain([&](const rcd::HubCommand& c) { hub.applyCommand(c, 900, kSession, send.fn()); });
+            ch.drain([&](const rcd::HubCommand& c) { hub.applyCommand(c, 900, kSession, send.fn(), /*nowNs=*/0); });
             if (!bound && hub.pendingCount() == 1) {
                 hub.onSubscribeResponse(bindRsp(21, 31), 0, kSession, send.fn());
                 bound = true;
@@ -475,7 +475,7 @@ TEST(SubscriberHubCommand, AppAndDutyThreadsShareOnlyRingsRegression) {
                     ++deliveredAfterFinish;
                 }
             }
-            hub.sweepTimedOut(std::chrono::steady_clock::now());
+            hub.sweepTimedOut(0);   // duty-clock ns: nothing is due
         }
     });
 
@@ -539,14 +539,14 @@ TEST(SubscriberHubCommand, RefusedUnsubscribeRetriedNextDutyCycleRegression) {
     RefusingTransport tx;
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     auto impl = makeImpl(50);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     hub.onSubscribeResponse(bindRsp(50, 60), 0, kSession, send.fn());
 
     tx.refuseNext = 2;
     rcd::HubCommand u;
     u.op = rcd::HubCommand::Op::Unsubscribe;
     u.a  = 50;
-    hub.applyCommand(u, 900, kSession, send.fn());
+    hub.applyCommand(u, 900, kSession, send.fn(), /*nowNs=*/0);
     EXPECT_TRUE(impl->status.closed()) << "dispatch stops independent of the wire";
     EXPECT_EQ(hub.pendingUnsubscribes(), 1u);
     EXPECT_EQ(send.countUnsubscribe(60), 0) << "never via the command ring";
@@ -570,13 +570,13 @@ TEST(SubscriberHubCommand, PendingUnsubscribeDroppedWhenTheSessionChangesRegress
     RefusingTransport tx;
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     auto impl = makeImpl(51);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     hub.onSubscribeResponse(bindRsp(51, 61), 0, kSession, send.fn());
     tx.refuseNext = 1;
     rcd::HubCommand u;
     u.op = rcd::HubCommand::Op::Unsubscribe;
     u.a  = 51;
-    hub.applyCommand(u, 901, kSession, send.fn());
+    hub.applyCommand(u, 901, kSession, send.fn(), /*nowNs=*/0);
     ASSERT_EQ(hub.pendingUnsubscribes(), 1u);
     hub.retryPendingUnsubscribes(kSession + 1);  // a new session: the old one is gone
     EXPECT_EQ(hub.pendingUnsubscribes(), 0u);
@@ -592,11 +592,11 @@ TEST(SubscriberHubCommand, LateResponseUnsubscribeRetriedWhenRefusedRegression) 
     RefusingTransport tx;
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     auto impl = makeImpl(52);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     rcd::HubCommand u;
     u.op = rcd::HubCommand::Op::Unsubscribe;
     u.a  = 52;
-    hub.applyCommand(u, 902, kSession, send.fn());  // still pending: no frame yet
+    hub.applyCommand(u, 902, kSession, send.fn(), /*nowNs=*/0);  // still pending: no frame yet
     tx.refuseNext = 1;
     hub.onSubscribeResponse(bindRsp(52, 62), 903, kSession, send.fn());
     EXPECT_EQ(hub.pendingUnsubscribes(), 1u);
@@ -611,7 +611,7 @@ TEST(SubscriberHubCommand, ResponseOfAnOldSessionNeverBindsRegression) {
     SubscriberHub hub;
     CaptureSend   send;
     auto impl = makeImpl(70);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     auto old = bindRsp(70, 80);
     old.sessionId = kSession - 1;
     hub.onSubscribeResponse(old, 0, kSession, send.fn());
@@ -633,7 +633,7 @@ TEST(SubscriberHubCommand, SubscribeAdoptedWhileSessionDownIsKeptUnsentRegressio
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     hub.setSessionConnected(false);
     auto impl = makeImpl(90);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     EXPECT_EQ(tx.subscribes(), 0);
     EXPECT_EQ(hub.unsentSubscribes(), 1u) << "dropped without a retry";
     EXPECT_EQ(hub.retryUnsentSubscribes(), 0) << "never offered while down";
@@ -655,7 +655,7 @@ TEST(SubscriberHubCommand, FatalSubscribeOfferFailsTheSubscriptionRegression) {
     // At adoption.
     auto a = makeImpl(91);
     tx.fatalNext = 1;
-    hub.applyCommand(addCmd(a.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(a.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     EXPECT_FALSE(a->active);
     EXPECT_TRUE(a->status.closed()) << "the handle learns it failed";
     EXPECT_EQ(hub.pendingCount(), 0u);
@@ -664,7 +664,7 @@ TEST(SubscriberHubCommand, FatalSubscribeOfferFailsTheSubscriptionRegression) {
     // On the per-cycle retry of a refused one.
     auto b = makeImpl(92);
     tx.refuseNext = 1;
-    hub.applyCommand(addCmd(b.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(b.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     ASSERT_EQ(hub.unsentSubscribes(), 1u);
     tx.fatalNext = 1;
     EXPECT_EQ(hub.retryUnsentSubscribes(), 0);
@@ -676,8 +676,8 @@ TEST(SubscriberHubCommand, FatalSubscribeOfferFailsTheSubscriptionRegression) {
     // On a reconnect resend (c fails, d still goes out).
     auto c = makeImpl(93);
     auto d = makeImpl(94);
-    hub.applyCommand(addCmd(c.get()), 0, kSession, send.fn());
-    hub.applyCommand(addCmd(d.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(c.get()), 0, kSession, send.fn(), /*nowNs=*/0);
+    hub.applyCommand(addCmd(d.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     ASSERT_EQ(tx.subscribes(), 2);
     tx.fatalNext = 1;
     EXPECT_EQ(hub.resendPending(kSession + 1, send.fn()), 1);
@@ -700,22 +700,22 @@ TEST(SubscriberHubCommand, FatalUnsubscribeFinishesLocallyRegression) {
     hub.setDirectSend(&RefusingTransport::fn, &tx);
 
     auto a = makeImpl(95);
-    hub.applyCommand(addCmd(a.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(a.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     hub.onSubscribeResponse(bindRsp(95, 65), 0, kSession, send.fn());
     ASSERT_EQ(hub.activeCount(), 1u);
     tx.fatalNext = 1;
     rcd::HubCommand u;
     u.op = rcd::HubCommand::Op::Unsubscribe;
     u.a  = 95;
-    hub.applyCommand(u, 905, kSession, send.fn());
+    hub.applyCommand(u, 905, kSession, send.fn(), /*nowNs=*/0);
     EXPECT_TRUE(a->status.closed());
     EXPECT_EQ(hub.pendingUnsubscribes(), 0u) << "a Fatal Unsubscribe is never retried";
     EXPECT_EQ(hub.activeCount(), 0u);
 
     auto b = makeImpl(96);
-    hub.applyCommand(addCmd(b.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(b.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     u.a = 96;
-    hub.applyCommand(u, 906, kSession, send.fn());  // still pending: late Unsubscribe
+    hub.applyCommand(u, 906, kSession, send.fn(), /*nowNs=*/0);  // still pending: late Unsubscribe
     tx.fatalNext = 1;
     hub.onSubscribeResponse(bindRsp(96, 66), 907, kSession, send.fn());
     EXPECT_EQ(hub.pendingUnsubscribes(), 0u);
@@ -736,7 +736,7 @@ TEST(SubscriberHubCommand, PushNeverBindsAPendingSubscriptionWithoutASessionRegr
     CaptureSend   send;
     int delivered = 0;
     auto impl = makeImpl(7, &delivered);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     std::vector<uint8_t> st;
     auto foreign = records(st, /*subId=*/9001, 0, 2);
     foreign.correlationId = 7;           // another client's Subscribe, same small id
@@ -762,7 +762,7 @@ TEST(SubscriberHubCommand, AnUnknownSubscribeRefusalCodeFinishesThePendingSubscr
         SubscriberHub hub;
         CaptureSend   send;
         auto impl = makeImpl(40 + code);
-        hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+        hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
         ASSERT_EQ(hub.pendingCount(), 1u);
         auto rsp = bindRsp(40 + code, 0);
         rsp.errorCode = code;
@@ -816,9 +816,9 @@ std::vector<rc::codec::UnsubscribeView> unsubscribesOf(const RefusingTransport& 
 
 /// Subscribe `corr`, then let the client's subscribe timeout sweep it.
 void subscribeAndTimeOut(SubscriberHub& hub, CaptureSend& send, rc::SubscriptionImpl* impl) {
-    hub.applyCommand(addCmd(impl), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl), 0, kSession, send.fn(), /*nowNs=*/0);
     ASSERT_EQ(hub.pendingCount(), 1u);
-    hub.sweepTimedOut(std::chrono::steady_clock::now() + std::chrono::hours(2));
+    hub.sweepTimedOut(2 * 3'600'000'000'000LL);   // duty-clock ns, past the 1 h deadline
     ASSERT_EQ(hub.pendingCount(), 0u);
 }
 } // namespace
@@ -850,7 +850,7 @@ TEST(SubscriberHubRegression, ALateOkForAnIdAlreadyBoundByRecordsIsNotUnsubscrib
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     int delivered = 0;
     auto impl = makeImpl(81, &delivered);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     std::vector<uint8_t> st;
     auto rv = records(st, /*subId=*/4712, 0, 2);
     rv.correlationId = 81;
@@ -919,7 +919,7 @@ TEST(SubscriberHubRegression, AnOkOnAnotherLiveSessionThanThePendingOneIsUnsubsc
     hub.setDirectSend(&RefusingTransport::fn, &tx);
     hub.setNodeRouter(nodes.router());
     auto impl = makeImpl(84);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     auto rsp = bindRsp(84, 4715);
     rsp.sessionId = 56;                               // not the pending one's (seed 7)
     hub.onSubscribeResponse(rsp, 781, kSession, send.fn());
@@ -1014,7 +1014,7 @@ TEST(SubscriberHubRegression, ABindingOkReplayedNeverReleasesTheBoundSubscriptio
     hub.setNodeRouter(nodes.router());
     int delivered = 0;
     auto impl = makeImpl(120, &delivered);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
     hub.onSubscribeResponse(bindRsp(120, 4800), 900, kSession, send.fn());
     ASSERT_EQ(hub.activeCount(), 1u);
     for (int replay = 0; replay < 3; ++replay)
@@ -1045,7 +1045,7 @@ TEST(SubscriberHubRegression, ACorrelationAnsweredOnTwoSessionsBindsOnlyItsOwnAn
     hub.setNodeRouter(nodes.router());
     int delivered = 0;
     auto impl = makeImpl(121, &delivered);
-    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+    hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
 
     std::vector<uint8_t> st;
     auto x = records(st, /*subId=*/4810, 0, 2);
@@ -1101,7 +1101,7 @@ TEST(SubscriberHubRegression, LateOkReleaseUnderSeededRandomInterleavingsAdversa
         hub.setNodeRouter(nodes.router());
         int delivered = 0;
         auto impl = makeImpl(130, &delivered);
-        hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn());
+        hub.applyCommand(addCmd(impl.get()), 0, kSession, send.fn(), /*nowNs=*/0);
         bool bound = false;
         int expected = 0;
         int64_t strayId = 5000, unsubCorr = 2000;

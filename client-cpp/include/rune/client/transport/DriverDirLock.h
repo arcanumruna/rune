@@ -50,7 +50,7 @@ public:
     }
 
     /// nullopt + `err` when the dir is held by a live owner ("in use") or the lock file cannot be taken.
-    [[nodiscard]] static std::optional<DriverDirLock> tryAcquire(const std::string& dir, std::string& err) {
+    [[nodiscard]] static std::optional<DriverDirLock> tryLock(const std::string& dir, std::string& err) {
         std::error_code ec;
         std::filesystem::path canon = std::filesystem::weakly_canonical(std::filesystem::path(dir), ec);
         if (ec) {

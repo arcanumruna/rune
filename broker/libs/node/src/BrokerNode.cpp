@@ -6353,6 +6353,23 @@ void BrokerNode::buildShardRuntimes_() {
     }
     shardDrivers_.reserve(static_cast<std::size_t>(wc));
     shardClients_.reserve(static_cast<std::size_t>(wc));
+    // Two phases.  A driver constructor blocks this thread (slow under sanitizers), and an Aeron client is
+    // closed when it goes unserviced past the liveness timeout.  So phase 1 builds every driver while no
+    // client exists, and phase 2 connects the clients back to back.  Client liveness is then independent
+    // of the worker count and of the driver start time.  Fused worker 0 rides the node driver (pumped by
+    // another thread), so it is never pumped here.
+    const auto pumpOwnDrivers = [this] {
+        for (auto& d : shardDrivers_)
+            if (d) (void)d->pumpWith(nullptr).pump();   // driver only: keeps its CnC heartbeat fresh
+    };
+    const auto pumpOwnPairs = [this] {
+        for (std::size_t i = 0; i < shardClients_.size(); ++i)
+            if (shardDrivers_[i]) (void)shardDrivers_[i]->pumpWith(shardClients_[i].get()).pump();
+    };
+    const auto shardDir = [this](int32_t w) {
+        return (fs::path{config_.effectiveAeronDir()} / ("w" + std::to_string(w))).string();
+    };
+    // Phase 1: drivers only.
     for (int32_t w = 0; w < wc; ++w) {
         // A4: fused placement — the runtime (control plane) already runs on worker
         // 0's thread; worker 0 rides the node driver + runtime client instead of
@@ -6360,10 +6377,9 @@ void BrokerNode::buildShardRuntimes_() {
         // runtime driver duty-cycled on the same pass).
         if (config_.fused() && w == 0) {
             shardDrivers_.push_back(nullptr);
-            shardClients_.push_back(aeron_);
             continue;
         }
-        const std::string dir = (fs::path{config_.effectiveAeronDir()} / ("w" + std::to_string(w))).string();
+        const std::string dir = shardDir(w);
         auto dcfg = EmbeddedDriverConfig::fromNode(config_, dir);
         if (resolverHub_) dcfg.peerResolution = resolverHub_->subscribeDriver();   // DR-15 fix round 1
         // D2: the backoff default is for the NODE driver's idle loop; a worker's invoker driver is pumped by
@@ -6371,8 +6387,19 @@ void BrokerNode::buildShardRuntimes_() {
         dcfg.idleStrategy = config_.driverIdleStrategy.empty() ? std::string("sleep-ns") : config_.driverIdleStrategy;
         dcfg.clientLivenessTimeoutNs = config_.shardClientLivenessTimeoutNs;
         shardDrivers_.push_back(std::make_unique<EmbeddedDriver>(std::move(dcfg), DriverMode::Invoker));
+        if (w == shardDriverBuildStallWorkerForTest_) [[unlikely]]
+            std::this_thread::sleep_for(shardDriverBuildStallForTest_);
+        pumpOwnDrivers();
+    }
+    // Phase 2: clients.
+    for (int32_t w = 0; w < wc; ++w) {
+        if (config_.fused() && w == 0) {
+            shardClients_.push_back(aeron_);
+            continue;
+        }
+        pumpOwnDrivers();
         aeron::Context ctx;
-        ctx.aeronDir(dir);
+        ctx.aeronDir(shardDir(w));
         ctx.mediaDriverTimeout(config_.inProcessDriverTimeoutMs());
         ctx.useConductorAgentInvoker(true);
         auto client = aeron::Aeron::connect(ctx);
@@ -6380,6 +6407,7 @@ void BrokerNode::buildShardRuntimes_() {
             throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: shard " +
                                      std::to_string(w) + " Aeron client connect failed");
         shardClients_.push_back(std::move(client));
+        pumpOwnPairs();
     }
     spdlog::info("BrokerNode[{}]: {} shard runtime(s) (invoker driver + invoker client) under {}/w*",
                  config_.nodeId, wc, config_.effectiveAeronDir());

@@ -843,11 +843,12 @@ public:
     // OpResult::InvalidArgument (no completion) and every *AndWait /
     // beginTransaction() throws std::logic_error("<op>: producer has no transactionalId").
     // UnknownProducerId (28) inside a transaction (the broker forgot the producer id: retention removed every
-    // record of ours, then a failover) ABORTS the transaction: the commit completes BrokerError(28) and the app aborts
-    // and redoes it.  A transactional epoch belongs to the coordinator, so the sequences are never restarted
-    // client-side; the abort bumps the epoch (InitProducerId) and the NEXT transaction runs under epoch+1 from
-    // sequence 0.  (KIP-360 - the coordinator bumping the epoch while KEEPING the transaction - needs broker work and
-    // stays an open enhancement.)
+    // record of ours, then a failover): while this transaction has not yet written to that partition (no batch of it
+    // acked there), the producer restarts that partition's sequences at 0 under the SAME producer id and epoch (a
+    // transactional epoch belongs to the coordinator) and the transaction continues.  When this transaction's own
+    // acked data on that partition is gone, the transaction ABORTS: the commit completes BrokerError(28), the app
+    // aborts and redoes it, and the abort bumps the epoch (InitProducerId) so the NEXT transaction runs under
+    // epoch+1 from sequence 0.
     // A transactional producer outside a transaction refuses every produce path
     // with SendResult::NotInTransaction (send / sendTo / blocking claim helpers
     // throw std::logic_error("produce outside a transaction")).

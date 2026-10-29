@@ -160,8 +160,9 @@ TEST(AuthMatrixRigRegression, CellBaselineIsTheRigTallyNotARacyReadRegression) {
 }
 
 namespace {
-// Allocated bytes (st_blocks * 512) under `dir`; symlinks are not followed.
-uint64_t allocatedBytes(const std::filesystem::path& dir) {
+// Allocated bytes (st_blocks * 512) under `dir`; symlinks are not followed.  With `skipAeron`, subdirectories named
+// "aeron" (embedded media-driver dirs) are not counted.
+uint64_t allocatedBytes(const std::filesystem::path& dir, bool skipAeron = false) {
     uint64_t sum = 0;
     struct stat st{};
     if (::lstat(dir.c_str(), &st) != 0) return 0;
@@ -171,7 +172,24 @@ uint64_t allocatedBytes(const std::filesystem::path& dir) {
     for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         struct stat cs{};
         if (::lstat(it->path().c_str(), &cs) != 0 || S_ISLNK(cs.st_mode)) continue;
-        sum += S_ISDIR(cs.st_mode) ? allocatedBytes(it->path()) : static_cast<uint64_t>(cs.st_blocks) * 512;
+        if (S_ISDIR(cs.st_mode)) {
+            if (skipAeron && it->path().filename() == "aeron") continue;
+            sum += allocatedBytes(it->path(), skipAeron);
+        } else {
+            sum += static_cast<uint64_t>(cs.st_blocks) * 512;
+        }
+    }
+    return sum;
+}
+
+// Log data under the rig root: everything except Aeron media-driver dirs (`aeron` anywhere, and the root's `client*`
+// children, which are the test clients' embedded drivers).
+uint64_t logDataBytes(const std::filesystem::path& root) {
+    uint64_t sum = 0;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->path().filename().string().rfind("client", 0) == 0) continue;
+        sum += allocatedBytes(it->path(), true);
     }
     return sum;
 }
@@ -182,6 +200,10 @@ uint64_t allocatedBytes(const std::filesystem::path& dir) {
 // one shard (65 executed cells): before 3.69 GB allocated at peak (~57 MB per cell); after 449 MB for 64 cells (6 fixed internal topics x 67 MB
 // = ~400 MB of that is the product default, plus ~71 MB of rig topics, ~1.1 MB each).  The budget is
 // min(512 MiB, 4 x 449 MB) = 512 MiB over the first 64 applicable cells; 64 MiB rig topics would exceed 4 GB.
+// That 449 MB counted the Aeron media-driver dirs too, so the internal-topic share above is not log data.
+// The measure covers log data only: it excludes the Aeron media-driver dirs (broker/aeron and the client* dirs), because a
+// closed session's receive images linger ~10 s by Aeron's liveness rule (~500 MB of 3 MB logbuffers in client1/images
+// over this test's ~10 s) and are not log data.  Measured log data for 64 cells: 76 MB; the budget is 256 MiB (3x).
 // Mutation: kRigSegmentRollBytes = 64 MiB turns this red.
 TEST(AuthMatrixDiskRegression, TheMatrixRigStaysUnderADiskBudgetRegression) {
     AuthMatrixRig rig;
@@ -192,10 +214,10 @@ TEST(AuthMatrixDiskRegression, TheMatrixRigStaysUnderADiskBudgetRegression) {
         runCell(rig, c);
         ASSERT_FALSE(::testing::Test::HasFatalFailure());
     }
-    const uint64_t bytes = allocatedBytes(rig.rig().broker().dir());
-    GTEST_LOG_(INFO) << "allocated bytes after " << (ran > 64 ? 64 : ran) << " cells: " << bytes;
-    constexpr uint64_t kBudget = 512ull << 20;
-    EXPECT_LT(bytes, kBudget) << "the rig's data dir holds " << bytes << " allocated bytes after 64 cells";
+    const uint64_t bytes = logDataBytes(rig.rig().broker().dir());
+    GTEST_LOG_(INFO) << "log data bytes after " << (ran > 64 ? 64 : ran) << " cells: " << bytes;
+    constexpr uint64_t kBudget = 256ull << 20;
+    EXPECT_LT(bytes, kBudget) << "the rig's log data holds " << bytes << " allocated bytes after 64 cells";
 }
 
 // ── PR #574 adversarial review: attacks on the #4 baseline and the #571 rig topic size ─────────────────────────────

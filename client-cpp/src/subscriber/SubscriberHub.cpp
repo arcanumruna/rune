@@ -107,7 +107,7 @@ std::unique_ptr<SubscribeRequest> SubscriberHub::makeSubscribeRequest(
         int64_t                               fromOffset,
         uint8_t                               isolation,
         std::span<const uint8_t>              keyBytes,
-        std::chrono::steady_clock::time_point deadline)
+        int64_t                               timeoutNs)
 {
     // Max frame size: header(24) + fixed(~30) + key(≤16) + the optional filter trailer.
     uint8_t frameBuf[codec::kMaxSubscribeFrameBytes];
@@ -125,7 +125,7 @@ std::unique_ptr<SubscribeRequest> SubscriberHub::makeSubscribeRequest(
 
     auto req = std::make_unique<SubscribeRequest>();
     req->impl     = impl;
-    req->deadline = deadline;
+    req->timeoutNs = timeoutNs;   // the duty thread stamps deadlineNs at adoption
     if (frameLen > 0) req->subscribeFrame.assign(frameBuf, frameBuf + frameLen);
     return req;
 }
@@ -137,7 +137,8 @@ std::unique_ptr<SubscribeRequest> SubscriberHub::makeSubscribeRequest(
 void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
                                  int64_t                   unsubCorrId,
                                  int64_t                   sessionId,
-                                 const SendFn&             submitFn)
+                                 const SendFn&             submitFn,
+                                 int64_t                   nowNs)
 {
     switch (cmd.op) {
     case detail::HubCommand::Op::SubscribeAdd: {
@@ -152,6 +153,11 @@ void SubscriberHub::applyCommand(const detail::HubCommand& cmd,
             const auto u = static_cast<uint64_t>(sessionId);
             for (int i = 0; i < 8; ++i)
                 req->subscribeFrame[8 + i] = static_cast<uint8_t>(u >> (i * 8));
+        }
+        if (req) {   // #701: the duty clock stamps the deadline (saturating: a huge timeout is "never")
+            req->deadlineNs = req->timeoutNs > std::numeric_limits<int64_t>::max() - std::max<int64_t>(nowNs, 0)
+                                  ? std::numeric_limits<int64_t>::max()
+                                  : nowNs + req->timeoutNs;
         }
         adoptSubscribe(std::move(req), submitFn);
         break;
@@ -784,7 +790,7 @@ bool SubscriberHub::isPending(int64_t correlationId) const
 }
 
 bool SubscriberHub::resendOne(int64_t correlationId, int64_t sessionId, const SendFn& submitFn,
-                              std::chrono::steady_clock::time_point newDeadline)
+                              int64_t newDeadlineNs)
 {
     constexpr std::size_t kHeaderSessionIdOff = 8;
     auto it = pendingByCorrelation_.find(correlationId);
@@ -793,7 +799,7 @@ bool SubscriberHub::resendOne(int64_t correlationId, int64_t sessionId, const Se
     if (!req || !req->impl || !req->impl->active) return false;
     auto& frame = req->subscribeFrame;
     if (frame.size() < kHeaderSessionIdOff + 8) return false;
-    req->deadline = newDeadline;
+    req->deadlineNs = newDeadlineNs;
     if (req->impl->moved && routed_()) {
         // I2: a moved subscription goes wherever its partition leader is now
         // (its node's own session, or the seed) — never by moving the seed.
@@ -818,7 +824,7 @@ bool SubscriberHub::resendOne(int64_t correlationId, int64_t sessionId, const Se
 
 bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int64_t unsubCorrId,
                                    int64_t answerSid, int64_t seedSid,
-                                   std::chrono::steady_clock::time_point deadline)
+                                   int64_t deadlineNs)
 {
     if (correlationId == 0 || newCorrId == 0) return false;
     for (auto it = activeById_.begin(); it != activeById_.end(); ++it) {
@@ -847,7 +853,7 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
         if (frameLen == 0) return false;
         auto req = std::make_unique<SubscribeRequest>();   // cold: once per leadership move
         req->impl     = &impl;
-        req->deadline = deadline;
+        req->deadlineNs = deadlineNs;
         req->subscribeFrame.assign(frameBuf, frameBuf + frameLen);
         // Belt and braces: release the old instance on this session too.  The
         // node that answered NotLeader already dropped it (an Unsubscribe of an
@@ -915,7 +921,7 @@ bool SubscriberHub::movedPendingPartition(int64_t correlationId, int32_t& topicI
 }
 
 bool SubscriberHub::restartFromLogStart(int64_t correlationId, int64_t seedSid,
-                                        std::chrono::steady_clock::time_point deadline)
+                                        int64_t deadlineNs)
 {
     const auto it = pendingByCorrelation_.find(correlationId);
     if (it == pendingByCorrelation_.end() || !it->second || it->second->impl == nullptr) return false;
@@ -944,7 +950,7 @@ bool SubscriberHub::restartFromLogStart(int64_t correlationId, int64_t seedSid,
     impl.resumeHint  = -1;
     impl.fromWire    = kFromEarliest;
     publishStatus_(impl);
-    return resendOne(correlationId, seedSid, SendFn{}, deadline);
+    return resendOne(correlationId, seedSid, SendFn{}, deadlineNs);
 }
 
 bool SubscriberHub::answeredOnItsSession(int64_t correlationId, int64_t answerSid, int64_t seedSid) const
@@ -1042,7 +1048,7 @@ bool SubscriberHub::movedRoutesToANode(int64_t correlationId)
     return router_.leaderSession(router_.ctx, t, p) != 0;
 }
 
-bool SubscriberHub::holdMovedForRetry(int64_t correlationId, std::chrono::steady_clock::time_point notBefore)
+bool SubscriberHub::holdMovedForRetry(int64_t correlationId, int64_t notBeforeNs)
 {
     if (!routed_()) return false;
     const auto it = pendingByCorrelation_.find(correlationId);
@@ -1054,9 +1060,9 @@ bool SubscriberHub::holdMovedForRetry(int64_t correlationId, std::chrono::steady
     if (session == 0) return false;   // the seed's node leads: the seed's own retry path
     clearUnsent_(*it->second);
     impl.homeSession       = session;
-    impl.homeSid           = 0;   // held: driveHomed re-offers it after notBefore
+    impl.homeSid           = 0;   // held: driveHomed re-offers it after notBeforeNs
     impl.homeEpoch         = 0;
-    it->second->notBefore  = notBefore;
+    it->second->notBeforeNs = notBeforeNs;
     ++homedCount_;
     return true;
 }
@@ -1078,8 +1084,7 @@ void SubscriberHub::endRejected_(SubscriptionImpl& impl, int16_t code)
     finish_(impl);
 }
 
-int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_point deadline,
-                              std::chrono::steady_clock::time_point now)
+int SubscriberHub::driveHomed(int64_t seedSid, int64_t deadlineNs, int64_t now)
 {
     if (!routed_()) { homedCount_ = 0; unansweredHomed_ = 0; return 0; }
     int work = 0;
@@ -1109,7 +1114,7 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
                 continue;
             }
             const bool lost = !held && router_.epoch(router_.ctx, impl.homeSession) != impl.homeEpoch;
-            const bool due  = !held || now >= req->notBefore;   // a NotLeader backoff (holdMovedForRetry)
+            const bool due  = !held || now >= req->notBeforeNs;   // a NotLeader backoff (holdMovedForRetry)
             // #365: fresh metadata moved the partition off its home session (a
             // crashed leader's session is not yet seen lost): follow the route.
             const bool moved = (!held || code != 0) && routeNow != impl.homeSession;
@@ -1187,7 +1192,7 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
             continue;   // the next pass retries
         }
         req->impl     = &impl;
-        req->deadline = deadline;
+        req->deadlineNs = deadlineNs;
         const bool wasSeed = impl.homeSession == 0;   // #514 (seed): before homeSession is reset below
         const bool homeUp  = wasSeed ? router_.epoch(router_.ctx, 0) != 0
                                      : router_.epoch(router_.ctx, impl.homeSession) == impl.homeEpoch;
@@ -1392,13 +1397,13 @@ int SubscriberHub::endSeedBound()
 // M2 FIX: sweepTimedOut — timeout pending subscribes that got no response
 // ---------------------------------------------------------------------------
 
-int SubscriberHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now)
+int SubscriberHub::sweepTimedOut(int64_t now)
 {
     int timedOut = 0;
     for (auto it = pendingByCorrelation_.begin();
          it != pendingByCorrelation_.end(); )
     {
-        if (now >= it->second->deadline) {
+        if (now >= it->second->deadlineNs) {
             if (SubscriptionImpl* impl = it->second->impl) {
                 // An app-unsubscribed (inactive) one times out quietly; an active
                 // one is an explicit TimedOut failure the app must see.

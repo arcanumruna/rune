@@ -116,15 +116,21 @@ std::vector<int64_t> committedOf(const test_support::InvokerGateway& gw, int32_t
     return v;
 }
 
-// True after the loop ran `ms` of wall time without `pred` ever holding (a bounded quiet wait).
+// True after the injected duty clock advanced `window` (1 ms per pass, one pump per step) without `pred` ever
+// holding.  The rig must run on manualClockOptions(); the step count is the hard cap, no wall time is read.
 template <class P>
-bool staysFalseFor(GroupRig& r, P&& pred, std::chrono::milliseconds ms) {
-    const auto start = std::chrono::steady_clock::now();
-    bool fired = false;
+bool staysFalseFor(GroupRig& r, P&& pred, std::chrono::milliseconds window) {
+    constexpr int64_t kStepNs = 1'000'000;
+    const int steps           = static_cast<int>(window.count());
+    const int64_t savedStep   = r.opt.stepNs;
+    r.opt.stepNs              = kStepNs;
+    int  passes  = 0;
+    bool fired   = false;
     (void)r.drive([&] {
         if (pred()) { fired = true; return true; }
-        return std::chrono::steady_clock::now() - start > ms;
-    }, 80'000'000);
+        return ++passes >= steps;
+    }, steps);
+    r.opt.stepNs = savedStep;
     return !fired;
 }
 
@@ -230,7 +236,7 @@ TEST(GroupSeekRegression, SeekOnAnUnassignedPartitionIsInvalidArgumentRegression
 // An auto-commit tick between the command and the OffsetFetch answer must not commit a stale
 // position: the rewound partitions are unseeded until the answer.
 TEST(GroupSeekRegression, AutoCommitNeverCommitsAStalePositionDuringARewindRegression) {
-    Fixture f(4307, 4308, {{kTopic, 1}}, Fixture::cfgOf(true, 30000, 40));
+    Fixture f(4307, 4308, {{kTopic, 1}}, Fixture::cfgOf(true, 30000, 40), {}, manualClockOptions());
     const auto s = *f.r.gw.latestSubscription(kTopic, 1);
     f.r.gw.pushRecords(s, 0, 100);
     ASSERT_TRUE(f.consumed(1, 100));
@@ -266,7 +272,7 @@ TEST(GroupSeek, RebalanceDuringARewindCompletesRejoined) {
 }
 
 TEST(GroupSeek, PushesOfTheOldSubscriptionAreIgnoredAfterTheSeek) {
-    Fixture f(4311, 4312, {{kTopic, 1}});
+    Fixture f(4311, 4312, {{kTopic, 1}}, Fixture::cfgOf(false, 30000, 5000), {}, manualClockOptions());
     const auto old = *f.r.gw.latestSubscription(kTopic, 1);
     f.r.gw.pushRecords(old, 0, 5);
     ASSERT_TRUE(f.consumed(1, 5));
