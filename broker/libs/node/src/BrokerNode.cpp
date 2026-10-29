@@ -2228,7 +2228,8 @@ void BrokerNode::buildGateway() {
             std::vector<rune::gateway::ClientGateway::NodeResponseControl> rc;
             rc.reserve(config_.peers.size());
             for (const auto& peer : config_.peers)
-                rc.push_back({static_cast<int32_t>(peer.id), static_cast<int32_t>(peer.gatewayResponseControlPort)});
+                rc.push_back({static_cast<int32_t>(peer.id), static_cast<int32_t>(peer.gatewayResponseControlPort),
+                              static_cast<int32_t>(peer.responseControlBasePort)});
             gateway_->setResponseControl(std::move(selfEndpoint), std::move(rc));
         }
         spdlog::info("BrokerNode[{}]: workerIngressBaseStreamId set to {}",
@@ -6516,6 +6517,10 @@ void BrokerNode::attachShardRuntimes_() {
         // Task 13 (spec §3.4): produce acks on this worker's OWN publications to
         // each announced session, created on its own invoker client.
         wk.setShardClient(shardClients_[idx].get(), config_.aeronControlTermBufferBytes);
+        // NAT-safe egress (Task 6): this worker's response-control endpoint (empty base = response mode off here).
+        if (config_.responseControlBasePort && *config_.responseControlBasePort > 0)
+            wk.setResponseControl(config_.effectiveResponseControlHost() + ":" +
+                                  std::to_string(static_cast<int64_t>(*config_.responseControlBasePort) + w));
         workerIngresses_.push_back(std::move(ing));
         workerEgresses_.push_back(std::move(eg));
         shardAgents_.push_back(std::make_unique<ShardAgent>(wk, shardDriver_(idx), *shardClients_[idx], clock_));

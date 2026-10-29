@@ -858,7 +858,7 @@ public:
         shardIngressEndpoints_ = std::move(eps);
     }
 
-    struct NodeResponseControl { int32_t nodeId = -1; int32_t gatewayPort = 0; };
+    struct NodeResponseControl { int32_t nodeId = -1; int32_t gatewayPort = 0; int32_t workerBase = 0; };
     /// NAT-safe egress (spec D3): this gateway's response-control endpoint "host:port" (empty = none: every client
     /// uses the declared path) and every node's gateway response-control port (for redirects and Metadata).
     /// Set before doWork() runs.
@@ -1817,6 +1817,10 @@ private:
         bool        responseEgress = false;///< NAT-safe egress: answered on a response publication (no declared channel)
         std::string replyChannel;          ///< the channel the per-session egress publication uses
         int32_t     leaderNodeId   = -1;   ///< captured with leaderClientEndpoint (redirect response-port suffix)
+        /// NAT-safe egress (Task 6): response mode in SHARD mode — the workers answer on response publications too.
+        /// bindToken is the WorkerBind secret (drawn at Connect; all-zero = none).  No declared channel is announced.
+        bool                    workerResponse = false;
+        std::array<uint8_t, 16> bindToken{};
 
         // Task 13 (spec §3.4): every worker has this session's reply destination
         // queued (announce-before-accept) — set once, so a ConnectResponse retry
@@ -1959,8 +1963,11 @@ private:
     /// `filter` is the subscription's filter bytes, supplied by the caller (never looked up here): the direct path passes the
     /// live record's, the queued retry passes the copy captured when the Subscribe was queued (the gateway may have erased
     /// the record since). The returned op views `filter`.
-    rune::node::WorkerOp buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub, std::span<const uint8_t> filter) const;
-    void enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub);
+    /// `sessionEgress` (NAT-safe egress, Task 6): the worker pushes this subscription's Records on the session's own
+    /// response publication; egressPub is null and the worker never falls back to the shared egress.
+    rune::node::WorkerOp buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub, std::span<const uint8_t> filter,
+                                           bool sessionEgress = false) const;
+    void enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub, bool sessionEgress = false);
     void parkAwaitingEgress_(const BufferedSubscribe& s);
     /// A buffered Subscribe leaves the waiter list for the worker, unless its subscription ended while it waited.
     void releaseAwaiting_(const BufferedSubscribe& s, void* egressPub);
@@ -2812,6 +2819,11 @@ private:
     std::vector<int64_t> pendingCryptoAnnounces_;
     std::string                       responseControlEndpoint_;   // NAT-safe egress: "host:port", empty = none
     std::vector<NodeResponseControl>  nodeResponseControl_;       // NAT-safe egress: per-node gateway response port
+    /// NAT-safe egress (Task 6): the response-control base port of node `nodeId`'s workers (0 = none).
+    int32_t workerResponseBaseOf_(int32_t nodeId) const noexcept {
+        for (const auto& n : nodeResponseControl_) if (n.nodeId == nodeId) return n.workerBase;
+        return 0;
+    }
     int32_t gatewayResponsePortOf_(int32_t nodeId) const noexcept {
         for (const auto& n : nodeResponseControl_) if (n.nodeId == nodeId) return n.gatewayPort;
         return 0;
@@ -3205,7 +3217,7 @@ private:
     // its session's egress publication at retry time (never a dangling pointer;
     // a session gone meanwhile drops it).
     // Phase 2c (fix-on-sight): the op kind is a variant, not a pair of booleans.
-    enum class EgressRoute : uint8_t { Unicast, Mdc };   // Mdc: forwarded with the MDC pub (no unicast)
+    enum class EgressRoute : uint8_t { Unicast, Mdc, Session };   // Mdc: forwarded with the MDC pub (no unicast); Session: the worker's per-session response pub (Task 6)
     // `filter`: the filter bytes captured when the Subscribe was queued - the queued op is self-contained, so a gateway
     // erase of the subscription (Unsubscribe, #109 revoke, topic drop) before the pump cannot turn it into an unfiltered bind.
     struct SubOpSubscribe    { BufferedSubscribe sub; EgressRoute route = EgressRoute::Unicast; std::vector<uint8_t> filter; };

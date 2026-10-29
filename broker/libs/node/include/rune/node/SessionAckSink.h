@@ -173,6 +173,9 @@ public:
     /// gateway path's UnknownSession drop — so a client that resends after
     /// SessionExpired cannot duplicate its buffered backlog.
     static constexpr uint8_t     kDirectDropClosed = 3;
+    /// Task 6: the frame came from an image other than the response-mode session's bound one (or the session awaits
+    /// its bind): CONSUME without append or answer.  Never counted against any budget.
+    static constexpr uint8_t     kDirectDropSpoofed = 4;
     /// Review MEDIUM-2: recently closed session ids remembered (FIFO ring +
     /// open-addressing set: O(1) per frame of an unknown session).  Lows batch C
     /// (was 1024): kMaxSessions — a mass close of EVERY session this worker can
@@ -308,7 +311,7 @@ public:
         } else {
             addNow_(st, responseChannel, streamId);
         }
-        boundImage_[idx] = imageSessionId;
+        boundImage_[idx] = imageKey_(imageSessionId);
         if (!std::holds_alternative<PubFailed>(st)) unresolved_[unresolvedCount_++] = sessionId;
         return BindResult::Bound;
     }
@@ -317,16 +320,25 @@ public:
     [[nodiscard]] std::optional<int32_t> boundImage(int64_t sessionId) const noexcept {
         const std::size_t idx = find_(sessionId);
         if (idx == kNone || boundImage_[idx] == 0) return std::nullopt;
-        return boundImage_[idx];
+        return static_cast<int32_t>(static_cast<uint32_t>(boundImage_[idx]));
     }
 
     /// The session's Ready publication (null otherwise).  Zero allocation; the pointer is valid until the next call
     /// that can release the publication (close, unbindImage, announce) — callers look it up per pass.
-    [[nodiscard]] typename PubHandle::element_type* readyPub(int64_t sessionId) noexcept {
+    [[nodiscard]] typename PubHandle::element_type* readyPub(int64_t sessionId) const noexcept {
         const std::size_t idx = find_(sessionId);
         if (idx == kNone) return nullptr;
         auto* r = std::get_if<PubReady>(&states_[idx]);
         return r ? r->pub.get() : nullptr;
+    }
+
+    /// Cold: `f(int32_t imageSessionId)` for every session bound to an ingress image (Worker: the unavailable-image
+    /// ring overflowed, so the images that still exist are re-derived from the sink).
+    template <class F>
+    void forEachBoundImage(F&& f) const {
+        for (std::size_t i = 0; i < kMaxSessions; ++i)
+            if (keys_[i] != 0 && boundImage_[i] != 0 && !std::holds_alternative<PubFailed>(states_[i]))
+                f(static_cast<int32_t>(static_cast<uint32_t>(boundImage_[i])));
     }
 
     /// The client ingress image `imageSessionId` went away (Aeron unavailable-image): every session bound to it can
@@ -334,7 +346,7 @@ public:
     int unbindImage(int32_t imageSessionId) noexcept {
         int n = 0;
         for (std::size_t i = 0; i < kMaxSessions; ++i) {
-            if (keys_[i] == 0 || boundImage_[i] != imageSessionId) continue;
+            if (keys_[i] == 0 || boundImage_[i] != imageKey_(imageSessionId)) continue;
             PubState& st = states_[i];
             if (std::holds_alternative<PubFailed>(st)) continue;                       // already gone
             fail_(st);
@@ -644,10 +656,31 @@ public:
     /// Admit one direct produce frame of `sessionId` (the worker's controlled
     /// poll, per frame — one hash probe): kDirectRefused = ABORT it; otherwise it
     /// is counted (AckEntry::direct = the result) until its ack leaves the queue.
-    [[nodiscard]] uint8_t admitDirect(int64_t sessionId) noexcept {
+    [[nodiscard]] uint8_t admitDirect(int64_t sessionId) noexcept { return admitDirect_<false>(sessionId, 0); }
+    /// NAT-safe egress (Task 6): the same single probe also checks WHERE the frame came from.  `imageSessionId` is
+    /// the Aeron session id of the image the frame arrived on.  A response-mode session accepts produce only from
+    /// the image it is bound to: a frame from another image, or for a session still awaiting its bind, is
+    /// kDirectDropSpoofed (CONSUME it: no append, no reply — the sender may be an attacker; session ids are
+    /// sequential).  A session that is not response-mode takes today's path (one extra load + compare).
+    [[nodiscard]] uint8_t admitDirect(int64_t sessionId, int32_t imageSessionId) noexcept {
+        return admitDirect_<true>(sessionId, imageSessionId);
+    }
+    /// Frames consumed by the image check (test seam).
+    [[nodiscard]] uint64_t directDroppedSpoofedForTest() const noexcept { return directDroppedSpoofed_; }
+private:
+    template <bool kCheckImage>
+    [[nodiscard]] uint8_t admitDirect_(int64_t sessionId, int32_t imageSessionId) noexcept {
         const std::size_t idx = find_(sessionId);
         uint32_t mine = 0;
         if (idx != kNone) [[likely]] {
+            if constexpr (kCheckImage) {
+                const int64_t bound = boundImage_[idx];
+                if (bound != 0 ? bound != imageKey_(imageSessionId)
+                               : std::holds_alternative<PubAwaitingBind>(states_[idx])) [[unlikely]] {
+                    ++directDroppedSpoofed_;
+                    return kDirectDropSpoofed;
+                }
+            }
             if (heldAfterFlush_ != 0 && heldPass_[idx] == pass_) [[unlikely]] {   // G-A6: it holds acks
                 ++directRefusedHeld_;
                 return kDirectRefused;
@@ -679,6 +712,7 @@ public:
         ++edges_[idx].direct;
         return kDirectCounted;
     }
+public:
     /// Give back an admitted direct frame that produced no answer (undecodable).
     void releaseDirect(int64_t sessionId, uint8_t tag) noexcept {
         if (tag == kDirectRefused) return;
@@ -814,6 +848,10 @@ private:
     static_assert(std::has_single_bit(kMaxSessions), "kMaxSessions must be a power of two");
     static_assert(kMaxChannelSlots <= 65536, "channel slot index is uint16");
 
+    /// A bound image as a non-zero key (Aeron session ids are any int32, 0 included): bit 32 marks "bound".
+    static constexpr int64_t imageKey_(int32_t imageSessionId) noexcept {
+        return (int64_t{1} << 32) | static_cast<int64_t>(static_cast<uint32_t>(imageSessionId));
+    }
     static std::size_t hash_(int64_t sid) noexcept {
         return static_cast<std::size_t>((static_cast<uint64_t>(sid) * 0x9E3779B97F4A7C15ULL) >> (64 - kBits));
     }
@@ -1206,7 +1244,7 @@ private:
     static constexpr int         kTombBits  = std::countr_zero(kTombSlots);
     std::array<Edges, kMaxSessions>                                  edges_{};
     std::array<int32_t, kMaxSessions>                                clientVersion_{}; // D6: per session
-    std::array<int32_t, kMaxSessions>                                boundImage_{};    // Task 6: ingress image of a bound response-mode session (0 = none); moved like clientVersion_
+    std::array<int64_t, kMaxSessions>                                boundImage_{};    // Task 6: imageKey_ of a bound response-mode session's ingress image (0 = none); moved like clientVersion_
     std::array<WriteGrantSlot, kMaxSessions>                         grants_{};        // authentication Task 13: moved with its key like clientVersion_
     std::unique_ptr<WritePermTable[]> permTables_ = std::make_unique<WritePermTable[]>(kMaxWritePermTables);   // #259: stable addresses
     std::array<int64_t, kMaxSessions>                                dirty_{};         // edges to report
@@ -1261,6 +1299,7 @@ private:
     uint64_t directRefusedHeld_ = 0, directRefusedBudget_ = 0, directRefusedBand_ = 0, directRefusedFull_ = 0;
     uint64_t                                                         directUnderflows_ = 0;
     uint64_t                                                         directDroppedClosed_ = 0;
+    uint64_t                                                         directDroppedSpoofed_ = 0;
     uint64_t                                                         directExpiryCancels_ = 0;
     std::array<int64_t, kClosedTombstones>                           closed_{};        // MEDIUM-2 tombstones (FIFO)
     std::size_t                                                      tombHead_ = 0, tombCount_ = 0;

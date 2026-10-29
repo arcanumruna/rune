@@ -1555,10 +1555,13 @@ int ClientGateway::retryPendingCryptoAnnounces_()
             pendingCryptoAnnounces_.pop_back();
             continue;
         }
-        if (sessionAnnouncer_.announce(*workerPool_, sid, s->egressChannel, s->egressStreamId,
+        if (sessionAnnouncer_.announce(*workerPool_, sid,
+                                        s->hasBindToken() ? std::string_view{} : std::string_view(s->egressChannel),
+                                        s->egressStreamId,
                                         s->clientVersion, /*sessionEncrypted=*/true, /*keyReady=*/true,
                                         s->crypto.b2c, s->crypto.b2cPrefix, s->crypto.cipher,
-                                        s->crypto.c2b, s->crypto.c2bPrefix)) {
+                                        s->crypto.c2b, s->crypto.c2bPrefix,
+                                        s->hasBindToken() ? &s->bindToken : nullptr)) {
             ++work;
             pendingCryptoAnnounces_[i] = pendingCryptoAnnounces_.back();
             pendingCryptoAnnounces_.pop_back();
@@ -2208,7 +2211,19 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
                                ? sub_->imageBySessionId(currentImageSessionId_) : nullptr;
         if (image) pc_entry.sourceIdentity = image->sourceIdentity();
         const bool wantsResponse = req.clientVersion >= pc::kClientVersionResponseEgress && req.responseCorrelated;
-        pc_entry.responseEgress = wantsResponse && !responseControlEndpoint_.empty() && image != nullptr;
+        // Shard mode (Task 6): the workers answer on response publications of their own, so response mode also needs
+        // this node's worker response-control base; without it the whole session stays on the declared path.
+        const bool workersReady = !shardMode_ || workerResponseBaseOf_(thisNodeId_) > 0;
+        pc_entry.responseEgress = wantsResponse && !responseControlEndpoint_.empty() && image != nullptr && workersReady;
+        if (pc_entry.responseEgress && shardMode_) {
+            pc_entry.workerResponse = true;
+            if (!rune::crypto::randomBytes(std::span<uint8_t>(pc_entry.bindToken))) [[unlikely]] {
+                pc_entry.bindToken = {};
+                pc_entry.workerResponse = false;
+                pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::Internal);
+                spdlog::critical("ClientGateway: randomBytes failed drawing a worker bind token; Connect refused (Internal)");
+            }
+        }
         if (pc_entry.responseEgress) {
             pc_entry.replyChannel = "aeron:udp?control=" + responseControlEndpoint_ +
                                     "|control-mode=response|response-correlation-id=" +
@@ -2216,16 +2231,17 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
         } else {
             pc_entry.replyChannel = pc_entry.egressChannel;
             if (wantsResponse) {
-                const bool noPort = responseControlEndpoint_.empty();
+                const bool noPort = responseControlEndpoint_.empty() || !workersReady;
                 if (unauthLog_.due(noPort ? 16 : 17)) [[unlikely]]
                     spdlog::warn("ClientGateway: response egress unavailable ({}); answering on the declared channel",
-                                 noPort ? "no gateway response-control port configured" : "no request image");
+                                 noPort ? "no gateway / worker response-control port configured" : "no request image");
             }
         }
     }
     pc_entry.clientVersion         = req.clientVersion;   // D6
     pc_entry.sourceHost            = std::move(connectHost);   // every entry: the eviction's fairness key
-    if (channelTooLongForShard) [[unlikely]]
+    // A worker-response session ships no channel to the workers: the declared one's length is moot.
+    if (channelTooLongForShard && !pc_entry.workerResponse) [[unlikely]]
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
     if (refusedForVersion) [[unlikely]]
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::ProtocolVersion);   // wins over any other refusal
@@ -2645,10 +2661,12 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                 // retry (see pending.tls.has_value() below: true only for a
                 // connect still attempting crypto — see shouldEngageCrypto).
                 if (!sessionAnnouncer_.announce(*workerPool_, pending.sessionId,
-                                                pending.egressChannel, pending.egressStreamId,
+                                                pending.workerResponse ? std::string_view{} : std::string_view(pending.egressChannel),
+                                                pending.egressStreamId,
                                                 pending.clientVersion,
                                                 /*sessionEncrypted=*/pending.tls.has_value(),
-                                                /*keyReady=*/false)) {
+                                                /*keyReady=*/false, {}, nullptr, rune::crypto::Cipher::None, {}, nullptr,
+                                                pending.workerResponse ? &pending.bindToken : nullptr)) {
                     ++it;
                     continue;   // a worker ring is full — retry next cycle
                 }
@@ -2675,6 +2693,10 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                 resp.authMode = authMode_ == rune::gateway::GatewayAuthMode::Required ? pc::AuthMode::Required
                                                                                        : pc::AuthMode::DevDisabled;
                 resp.authState = connectAuthState_();
+            }
+            if (pending.workerResponse) {
+                resp.v16       = true;   // NAT-safe egress (Task 6): the token the client's WorkerBind must prove
+                resp.bindToken = pending.bindToken;
             }
             if (pending.tls) {
                 // client<->broker TLS/AEAD (Task 7): offer the chosen cipher +
@@ -2733,6 +2755,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             Session* added = sessions_.find(pending.sessionId);
             added->sourceHost     = std::move(pending.sourceHost);
             added->sourceIdentity = std::move(pending.sourceIdentity);
+            added->bindToken      = pending.bindToken;   // Task 6: all-zero unless a worker-response session
         }
 
         it = pendingConnects_.erase(it);
@@ -2882,6 +2905,7 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
                                       pending.clientVersion);
     session.sourceHost     = std::move(pending.sourceHost);
     session.sourceIdentity = std::move(pending.sourceIdentity);
+    session.bindToken      = pending.bindToken;   // Task 6: all-zero unless a worker-response session
     // The TLS handshake took time: the login deadline runs from the moment the session exists.
     if (auto* first = std::get_if<rune::gateway::AuthAwaitingFirst>(&session.auth)) first->deadlineNs = nowNs + authTimeoutNs_;
     session.crypto.cipher = keys.cipher;
@@ -2914,11 +2938,13 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     // Retried from doWork() (retryPendingCryptoAnnounces_) until complete —
     // a liveness concern only, never a safety one, by the above invariant.
     if (shardMode_ && workerPool_ &&
-        !sessionAnnouncer_.announce(*workerPool_, pending.sessionId, pending.egressChannel,
+        !sessionAnnouncer_.announce(*workerPool_, pending.sessionId,
+                                     pending.workerResponse ? std::string_view{} : std::string_view(pending.egressChannel),
                                      pending.egressStreamId, pending.clientVersion,
                                      /*sessionEncrypted=*/true, /*keyReady=*/true,
                                      session.crypto.b2c, session.crypto.b2cPrefix, session.crypto.cipher,
-                                     session.crypto.c2b, session.crypto.c2bPrefix)) {
+                                     session.crypto.c2b, session.crypto.c2bPrefix,
+                                     pending.workerResponse ? &pending.bindToken : nullptr)) {
         pendingCryptoAnnounces_.push_back(pending.sessionId);
     }
 
@@ -4496,7 +4522,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 // it, so neither can drop a field (the retry used to omit the Subscribe's
 // correlationId — every push then carried 0 — and the replica).
 rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub,
-                                                      std::span<const uint8_t> filter) const
+                                                      std::span<const uint8_t> filter, bool sessionEgress) const
 {
     rune::storage::Log* log = topicRegistry_ ? topicRegistry_->log(s.topicId, s.partition) : nullptr;
     const rune::replication::PartitionReplica* rep =
@@ -4516,6 +4542,7 @@ rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s
     op.logPtr               = log;
     op.replica              = const_cast<rune::replication::PartitionReplica*>(rep);
     op.egressPub            = egressPub;
+    op.sessionEgress        = sessionEgress;   // NAT-safe egress (Task 6): Records ride the session's response publication
     // Phase 2c: the filter rides the op's tail (a view valid for the synchronous enqueue - the caller's bytes outlive it).
     op.filterBytes          = filter;
     return op;
@@ -4537,13 +4564,13 @@ void ClientGateway::releaseAwaiting_(const BufferedSubscribe& s, void* egressPub
     enqueueSubscribeOp_(s, egressPub);
 }
 
-void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub)
+void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub, bool sessionEgress)
 {
     // Issue #118 (X020, M10): the ONE place a Subscribe without its own record egress would reach a worker - which then
     // pushes on its shared dynamic-MDC publication, received by every party joined to the worker's advertised control
     // port.  Under authentication that is a disclosure to principals without READ: the subscription is retired
     // retriably instead (never a fallback).
-    if (egressPub == nullptr && authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
+    if (egressPub == nullptr && !sessionEgress && authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
         retireWithoutRecordEgress_(s.subId);
         return;
     }
@@ -4554,14 +4581,15 @@ void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egress
     // The live record's filter (this enqueue is synchronous); a queued retry carries its own copy, taken below.
     std::span<const uint8_t> filter;
     if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) filter = std::span<const uint8_t>(it->second.filter);
-    rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub, filter);
+    rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub, filter, sessionEgress);
 
     // M5: never dropped — a refused Subscribe (or one behind a queued lifecycle
     // op for the same worker) is queued and retried every doWork, in order.
     const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(s.topicId, s.partition));
     const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
     if (behind || !workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op))) {
-        queueSubOp_(w, SubOpSubscribe{s, egressPub == nullptr ? EgressRoute::Mdc : EgressRoute::Unicast,
+        queueSubOp_(w, SubOpSubscribe{s, sessionEgress ? EgressRoute::Session
+                                       : egressPub == nullptr ? EgressRoute::Mdc : EgressRoute::Unicast,
                                       std::vector<uint8_t>(filter.begin(), filter.end())});
     }
 }
@@ -4596,6 +4624,12 @@ bool ClientGateway::trySubOp_(std::size_t w, const PendingSubOp& p)
             const auto& s = sp.sub;
             // Re-resolve the egress publication NOW (never a pointer held across cycles).
             void* egressPub = nullptr;
+            if (sp.route == EgressRoute::Session) {
+                // NAT-safe egress (Task 6): no pointer at all - the worker looks the session's response publication up.
+                if (!g.sessions_.find(s.sessionId)) return true;   // session gone: moot
+                rune::node::WorkerOp op = g.buildSubscribeOp_(s, nullptr, sp.filter, /*sessionEgress=*/true);
+                return g.workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op));
+            }
             if (sp.route == EgressRoute::Mdc && g.authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
                 // Issue #118: never queued under authentication (enqueueSubscribeOp_ retires it); defensive - nothing is sent.
                 g.retireWithoutRecordEgress_(s.subId);
@@ -4670,6 +4704,12 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
     //     control thread.
     if (!sess || !workerPool_) {
         enqueueSubscribeOp_(s, nullptr);   // under authentication: retired (issue #118)
+        return;
+    }
+    // NAT-safe egress (Task 6): a response-mode session's Records ride ITS worker response publication - no record
+    // egress to resolve, no shared-egress fallback ever.  The worker holds the subscription until the client binds.
+    if (sess->hasBindToken()) [[unlikely]] {
+        enqueueSubscribeOp_(s, nullptr, /*sessionEgress=*/true);
         return;
     }
     const bool authRequired = authMode_ == rune::gateway::GatewayAuthMode::Required;
@@ -5462,7 +5502,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     if (workerPushed && authMode_ == rune::gateway::GatewayAuthMode::Required) {
         const int32_t wid = workerPool_->ownerWorkerId(msg.topicId, partition);
         const auto eg = session->recordEgressByWorker.find(wid);
-        sub.okOwed        = eg == session->recordEgressByWorker.end() || !eg->second;
+        sub.okOwed        = !session->hasBindToken() && (eg == session->recordEgressByWorker.end() || !eg->second);
         sub.okOwedLineage = sub.okOwed && served.kind == ServedPartition::Kind::Transient;
     }
     const bool okOwed = sub.okOwed;
@@ -11115,6 +11155,12 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             // sessions >= 12 (MetadataResponse::clientVersion below).
             if (workerPool_ && (!p.ingressEndpoint.empty() || (!shardMode_ && perWorkerIngressActive_)))
                 p.ingressReceiverId = static_cast<uint8_t>(workerPool_->ownerWorkerId(srcTopicId, partition) + 1);
+            // NAT-safe egress (Task 6): the LEADER's owning-worker response-control port (its base + the owning worker),
+            // where a v16 client opens the response subscription its WorkerBind correlates with.  0 = none (legacy
+            // mode / base unset: the encoder then drops the trailer's port).
+            if (shardMode_ && workerPool_)
+                if (const int32_t rbase = workerResponseBaseOf_(entry.leaderNodeId); rbase > 0)
+                    p.responseControlPort = rbase + workerPool_->ownerWorkerId(srcTopicId, partition);
             parts.push_back(p);
             }   // alias
         }

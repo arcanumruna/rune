@@ -120,6 +120,14 @@ struct Session {
     std::string                                    sourceHost;
     // The Connect image's "host:port" (Aeron sourceIdentity; the DDL principal's source address, #227). "" in unit tests.
     std::string                                    sourceIdentity;
+    // NAT-safe egress (Task 6): the 16 B secret of a response-mode SHARD session's WorkerBind (all-zero = the session
+    // is not response-mode / has no worker response publication).  Returned to the client in its ConnectResponse.
+    std::array<uint8_t, 16>                        bindToken{};
+    [[nodiscard]] bool hasBindToken() const noexcept {
+        uint8_t any = 0;
+        for (const uint8_t b : bindToken) any = static_cast<uint8_t>(any | b);
+        return any != 0;
+    }
     // D8b round 2: bit w set = worker w reports this session's ack publication
     // Lost (NOT_CONNECTED); lostSinceNs = when the mask last became non-zero, restarted by a Found
     // from one worker while another is still Lost (D8b-L: a successful claim is proof of life).

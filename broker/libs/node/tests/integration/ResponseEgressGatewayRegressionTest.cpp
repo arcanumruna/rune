@@ -57,13 +57,14 @@ struct TmpDir {
 };
 
 struct Ports {
-    uint16_t cons, client, repl, ib, rb, eg, gwResp;
+    uint16_t cons, client, repl, ib, rb, eg, gwResp, wResp;
     static Ports discover() {
         namespace t = rune::aeronutil::testing;
         Ports p{};
         p.ib = t::allocFreeUdpPortRange(1); p.rb = t::allocFreeUdpPortRange(1); p.eg = t::allocFreeUdpPortRange(1);
         p.cons = t::allocFreeUdpPort(); p.client = t::allocFreeUdpPort(); p.repl = t::allocFreeUdpPort();
         p.gwResp = t::allocFreeUdpPort();
+        p.wResp = t::allocFreeUdpPortRange(1);
         return p;
     }
 };
@@ -97,6 +98,9 @@ NodeConfig makeConfig(const fs::path& dir, const Ports& p, bool withResponsePort
     if (withResponsePort) {
         cfg.gatewayResponseControlPort = p.gwResp;
         peer.gatewayResponseControlPort = p.gwResp;
+        // Task 6: in shard mode response mode also needs the workers' response-control base.
+        cfg.responseControlBasePort = p.wResp;
+        peer.responseControlBasePort = p.wResp;
     }
     cfg.peers.push_back(peer);
     cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p.client);

@@ -11,7 +11,7 @@ namespace rune::node {
 class UnauthLogLimiter {
 public:
     static constexpr uint64_t kEvery = 1024;
-    static constexpr std::size_t kKinds = 18;   // 16: response egress unavailable (no port), 17: (no request image)
+    static constexpr std::size_t kKinds = 21;   // 16: response egress unavailable (no port), 17: (no request image), 18-20: worker bind (Task 6)
     /// true = log this occurrence of `kind` (< kKinds); false = suppressed (counted).
     [[nodiscard]] bool due(std::size_t kind) noexcept {
         if (seen_[kind % kKinds]++ % kEvery == 0) return true;

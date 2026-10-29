@@ -122,7 +122,8 @@ Cell expected(St st, Act a) {
         return {BR::NotAwaiting, plain, img};
     case Act::AnnounceAgain: return {N, Kind::Annc, N};
     case Act::Close:         return {N, Kind::None, N};
-    case Act::Enqueue:       return {N, st == St::Annc || st == St::BoundAnnc ? Kind::Resv : plain, img};
+    // the fake policy resolves at once: Announced -> Resolving (pass 1) -> Ready (pass 2, the ack leaves in that pass)
+    case Act::Enqueue:       return {N, st == St::Annc || st == St::BoundAnnc ? Kind::Ready : plain, img};
     case Act::UnbindMatch:
         if (bound) return {N, Kind::Failed, kImage, 1};
         return {N, plain, img};
@@ -159,10 +160,10 @@ TEST(SessionAckSinkResponseBindRegression, InteractionMatrixEveryStateEveryActio
             if (want.br) EXPECT_EQ(*got, *want.br);
             EXPECT_EQ(kindOf(r.s, kSid), want.kind);
             EXPECT_EQ(r.s.boundImage(kSid), want.image);
-            EXPECT_EQ(r.s.unreportedFailures(), want.unreported + (state == St::Failed ? 1u : 0u));
+            EXPECT_EQ(r.s.unreportedFailures(), want.kind == Kind::Failed ? 1u : 0u) << "every Failed state here is unreported";
             if (act == Act::Enqueue) {
                 // Ready (plain or bound): the ack left; Unknown/Closed/Failed: dropped; every other state: HELD.
-                const bool ready = state == St::Ready || state == St::BoundReady;
+                const bool ready = state == St::Ready || state == St::BoundReady || state == St::Annc || state == St::BoundAnnc;
                 const bool dropped = state == St::Unknown || state == St::Closed || state == St::Failed;
                 EXPECT_EQ(r.st->sent.size(), ready ? 1u : 0u);
                 EXPECT_EQ(r.s.heldAcks(), (ready || dropped) ? 0u : 1u);
@@ -192,10 +193,11 @@ TEST(SessionAckSinkResponseBindRegression, AcksEnqueuedWhileAwaitingBindAreHeldT
     EXPECT_TRUE(r.s.holding(kSid)) << "the worker pauses this session's intake while it awaits the bind";
     EXPECT_EQ(r.s.readyPub(kSid), nullptr);
     ASSERT_EQ(r.s.bind(kSid, tok(), kImage, kRespChan), BR::Bound);
+    pass(r.s);                                                   // Announced -> Resolving: the publication is added now
     ASSERT_EQ(r.st->added.size(), 1u);
     EXPECT_EQ(r.st->added.begin()->second.first, kRespChan);
     EXPECT_EQ(r.st->added.begin()->second.second, kStream) << "the announced egress stream id";
-    pass(r.s); pass(r.s);
+    pass(r.s);
     ASSERT_EQ(r.st->sent.size(), 5u);
     for (std::size_t i = 0; i < 5; ++i) {
         const auto d = rune::protocol::client::ProduceResponse::decode(r.st->sent[i].second.data(), r.st->sent[i].second.size());
