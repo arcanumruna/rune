@@ -4,6 +4,8 @@
 #include <rune_protocol_internal_sbe/OpType.h>
 #include <rune_protocol_internal_sbe/TailKind.h>
 
+#include <rune/node/WorkerOp.h>
+
 #include <gtest/gtest.h>
 
 namespace sbe = rune::protocol::internal::sbe;
@@ -15,4 +17,10 @@ TEST(WorkerOpWireRegression, FilterOpAndTailValuesAreAppendedRegression) {
     EXPECT_EQ(static_cast<int>(sbe::OpType::Value::PEER_LINK_KEYS), 22);
     EXPECT_EQ(static_cast<int>(sbe::OpType::Value::READ_LEASE), 24);
     EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::PEER_KEYS), 9);
+}
+
+TEST(WorkerOpWireRegression, ClusterFeatureLevelRoundTripsRegression) {
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::CLUSTER_FEATURE_LEVEL), 31);
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::ClusterFeatureLevel), 31);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::NS_VIEW_MEM_OVER), 30);
 }

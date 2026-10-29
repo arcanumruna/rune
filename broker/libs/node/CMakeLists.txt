@@ -800,6 +800,23 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Checked writes Part 02: typed topics always validate (feature level, write spec, matrices, DDL rules).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_checked_writes_tests
+        tests/node/CheckedWritesFeatureLevelTest.cpp)
+    target_include_directories(rune_checked_writes_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_checked_writes_tests PRIVATE
+        rune_node
+        rune_view
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_checked_writes_tests
+        PROPERTIES TIMEOUT 120)
+
+    # ---------------------------------------------------------------------------
     # MD1 Task 4: MetadataService / MetadataStateMachine replication integration
     # tests — 5 test cases:
     #   1. SingleNode: HW-gated visibility.

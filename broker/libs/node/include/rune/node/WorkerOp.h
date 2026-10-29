@@ -163,6 +163,9 @@ struct WorkerOp {
         // field use.  Never ownership-gated.
         NsThrottle                = 29, ///< control → worker: nsSlot's throttle deadline of one kind changed
         NsViewMemOver             = 30, ///< control → worker: nsSlot's views are over (or back under) the memory limit
+        // Checked writes Part 02: control → EVERY worker on its OP ring (cold: on a change only): the committed cluster
+        // metadata feature level in nextOffset.  The worker keeps the maximum.  Never ownership-gated.
+        ClusterFeatureLevel       = 31, ///< control → worker: the committed metadata feature level
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the

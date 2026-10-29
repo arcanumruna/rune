@@ -3623,6 +3623,17 @@ int BrokerNode::servicePeerLinks_(int64_t nowNs) {
     return work;
 }
 
+int BrokerNode::serviceClusterFeatureLevel_() {
+    if (metadataService_) {
+        const int16_t level = metadataService_->featureLevel();
+        if (level != postedClusterLevel_) {
+            clusterLevelFanout_.post(level);
+            postedClusterLevel_ = level;
+        }
+    }
+    return clusterLevelFanout_.pump(workerPool_.get(), adminWorkerAgent_ ? &adminWorkerAgent_->controlToAdminRing() : nullptr);
+}
+
 void BrokerNode::publishPeerLinkMetrics_() noexcept {
     if (!metricsReady_ || !peerLinkAgent_) return;
     controlSet_(RuneMetric::PeerFrameDrops, static_cast<std::int64_t>(peerFrameDropsTotal_()));
@@ -4947,6 +4958,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     work += serviceAuthMode_(nowNs);   // Authentication Task 9: the dev-mode warning timer + the auth-mode counter
     work += stepSecurityServing_(nowNs);   // issues #15 / #111: serving only while provably current
     work += servicePeerLinks_(nowNs);  // Authentication Task 15: the peer link handshakes + key distribution
+    work += serviceClusterFeatureLevel_();   // checked writes: the committed metadata feature level -> every worker + the admin thread
 
     auto* agent = adminWorkerAgent_.get();
     if (!agent) return work;

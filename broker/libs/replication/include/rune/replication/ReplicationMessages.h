@@ -473,8 +473,11 @@ inline constexpr int16_t kBoundProducerIds = 3;
 /// coordinator (VerifyTxnPartition, templates 13 / 14).  An older coordinator drops the ask, so a leader forwards
 /// it only once every member supports this level (below it a remote-coordinated batch is admitted as before).
 inline constexpr int16_t kTxnPartitionVerify = 4;
+/// Checked writes: typed topics validate every write (a known schema version, UTF-8 strings, wire key = key field);
+/// gates the database-feature DDL and write kinds.  Topics created before it validate fully only from this level on.
+inline constexpr int16_t kCheckedWrites = 5;
 /// The level this binary supports.
-inline constexpr int16_t kLatest = kTxnPartitionVerify;
+inline constexpr int16_t kLatest = kCheckedWrites;
 } // namespace MetadataFeature
 
 struct AlterIsrMsg {

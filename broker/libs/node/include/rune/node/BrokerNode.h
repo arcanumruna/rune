@@ -80,6 +80,7 @@
 #include <rune/node/NsSlotFanout.h>
 #include <rune/node/NsSlotTable.h>
 #include <rune/node/PeerLinkAgent.h>
+#include <rune/node/ClusterFeatureLevelFanout.h>
 #include <rune/node/PeerLinkFanout.h>
 #include <rune/peerlink/ClusterKeys.h>
 #include <rune/peerlink/PeerFrameCrypto.h>
@@ -541,6 +542,13 @@ public:
                 if (decodePlacementView(p, n, v)) worker_.onPlacementView(v);
                 else if (badControlFrames_++ % 1024 == 0)
                     spdlog::error("AdminWorkerAgent: malformed kMsgPlacementView (len={}) refused", n);
+                return;
+            }
+            if (tid == kMsgClusterFeatureLevel) {   // checked writes Part 02
+                int16_t level = 0;
+                if (decodeClusterFeatureLevel(p, n, level)) worker_.setClusterFeatureLevel(level);
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgClusterFeatureLevel (len={}) refused", n);
                 return;
             }
             if (tid == kMsgCatalogReadPaused) {   // Task 12 fix round 0
@@ -2361,6 +2369,7 @@ private:
     // duty cycle) drives it, distributes newly established keys and publishes counters 233 / 234.
     void buildPeerLinks_();
     int  servicePeerLinks_(int64_t nowNs);
+    int  serviceClusterFeatureLevel_();   // control thread, every duty cycle: post a changed metadata feature level, pump the fanout
     void publishPeerLinkMetrics_() noexcept;
     static void onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
     void onPeerLinkEstablished_(int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
@@ -2649,6 +2658,8 @@ private:
     DevModeWarnTimer                 devModeWarn_;                 // control thread
     std::unique_ptr<PeerLinkAgent>   peerLinkAgent_;               // control thread (null: no peer links)
     PeerLinkFanout                   peerLinkFanout_;              // control thread: keys -> workers + admin, over rings
+    ClusterFeatureLevelFanout        clusterLevelFanout_;          // control thread: the metadata feature level -> workers + admin
+    int16_t                          postedClusterLevel_ = -1;     // control thread: the last level handed to clusterLevelFanout_
     // Task 16 (D34): the inter-broker frame crypto of a transport this broker builds - PeerSealed for Enabled with more
     // than one peer (sender id: consensus 0, legacy replication 1, admin plane 2, worker w -> 3 + w), else PeerPlain.
     [[nodiscard]] bool sealsPeerFrames_() const noexcept {

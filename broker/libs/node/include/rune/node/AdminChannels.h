@@ -93,6 +93,8 @@ enum : int32_t {
     // Namespaces Phase 2 Task 7 - control -> admin on controlToAdminRing: the result of one namespace-reaper control
     // operation, [correlation:u64][status:u8] (ReapStatus below).
     kMsgNsReapResult             = 36,
+    // Checked writes Part 02 - control -> admin on controlToAdminRing: the committed metadata feature level, [level:i16].
+    kMsgClusterFeatureLevel      = 37,
 };
 
 /// kMsgPlacementView: [placeable:i32][haltedCount:u16][halted ids: i32 * haltedCount].
@@ -219,6 +221,15 @@ inline void putU32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
 inline uint32_t getU32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 
 } // namespace admin_wire
+
+/// kMsgClusterFeatureLevel: [level:i16].
+inline constexpr std::size_t kClusterFeatureLevelWireLen = 2;
+inline void writeClusterFeatureLevel(uint8_t* p, int16_t level) noexcept { admin_wire::putU16(p, static_cast<uint16_t>(level)); }
+[[nodiscard]] inline bool decodeClusterFeatureLevel(const uint8_t* p, std::size_t n, int16_t& level) noexcept {
+    if (n != kClusterFeatureLevelWireLen) return false;
+    level = static_cast<int16_t>(admin_wire::getU16(p));
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Catalog history Task 9: what every DDL carries besides its operation (spec §4

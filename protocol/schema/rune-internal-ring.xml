@@ -126,6 +126,9 @@
            topicId = nsSlot, nextOffset = nsId, partition = 0 / 1.  Never ownership-gated. -->
       <validValue name="NS_THROTTLE">29</validValue>
       <validValue name="NS_VIEW_MEM_OVER">30</validValue>
+      <!-- Checked writes Part 02: control -> EVERY worker on its op ring (cold: on a change only): the committed cluster
+           metadata feature level in nextOffset.  The worker keeps the maximum.  Never ownership-gated. -->
+      <validValue name="CLUSTER_FEATURE_LEVEL">31</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica

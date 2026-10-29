@@ -99,3 +99,15 @@ TEST(AdminChannelsRegression, FilterSchemaMessageRoundTripsRegression) {
     EXPECT_NE(kA2cFilterSchema, kA2cSchemaUpdate);
     EXPECT_EQ(kA2cFilterSchema, 25);
 }
+
+TEST(AdminChannelsRegression, ClusterFeatureLevelMessageRoundTripsRegression) {
+    uint8_t wire[kClusterFeatureLevelWireLen];
+    writeClusterFeatureLevel(wire, 5);
+    int16_t level = 0;
+    ASSERT_TRUE(decodeClusterFeatureLevel(wire, sizeof wire, level));
+    EXPECT_EQ(level, 5);
+    EXPECT_EQ(kClusterFeatureLevelWireLen, 2u);
+    EXPECT_FALSE(decodeClusterFeatureLevel(wire, 1, level)) << "a 1-byte frame is refused";
+    EXPECT_FALSE(decodeClusterFeatureLevel(wire, 3, level));
+    EXPECT_EQ(kMsgClusterFeatureLevel, 37);
+}

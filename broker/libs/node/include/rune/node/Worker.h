@@ -100,6 +100,7 @@
 #include <rune/node/RecordsOpen.h>
 #include <rune/crypto/Aead.h>
 #include <rune/crypto/Cipher.h>
+#include <rune/replication/ReplicationMessages.h>
 #include <rune/replication/ReplicationFrameLimits.h>   // F18 frame limits (maxAcceptableBatchBytes)
 #include <rune/node/WorkerReplicationTransport.h>
 #include <rune/node/IoBackend.h>
@@ -586,6 +587,7 @@ public:
     [[nodiscard]] int64_t viewLeaseEndNsForTest() const noexcept { return viewLeaseEndNs_; }
     [[nodiscard]] uint64_t viewReadsWithoutLeaseForTest() const noexcept { return viewReadsWithoutLease_; }
     [[nodiscard]] uint64_t readLeasesSeenForTest() const noexcept { return readLeasesSeen_; }
+    [[nodiscard]] int16_t clusterFeatureLevelForTest() const noexcept { return clusterFeatureLevel_; }
     [[nodiscard]] uint64_t viewReadsHeldForTest() const noexcept { return viewReadsHeld_; }
     [[nodiscard]] uint64_t viewReadsHeldExpiredForTest() const noexcept { return viewReadsHeldExpired_; }
     [[nodiscard]] std::size_t heldViewReadsForTest() const noexcept { return heldViewReads_.size(); }
@@ -2767,6 +2769,9 @@ private:
         case WorkerOp::Type::ReadLease:      // issue #82: a view read lease (FIFO behind the role ops it covers)
             ++readLeasesSeen_;
             if (op.nextOffset() > viewLeaseEndNs_) viewLeaseEndNs_ = op.nextOffset();
+            break;
+        case WorkerOp::Type::ClusterFeatureLevel:   // checked writes: the committed metadata feature level (only ever rises)
+            if (op.nextOffset() > clusterFeatureLevel_) clusterFeatureLevel_ = static_cast<int16_t>(op.nextOffset());
             break;
         }
     }
@@ -6073,6 +6078,8 @@ private:
     const int64_t* leaseNowOverride_      = nullptr;
     uint64_t       viewReadsWithoutLease_ = 0;
     uint64_t       readLeasesSeen_        = 0;
+    // Checked writes: the committed cluster metadata feature level (ClusterFeatureLevel ops; monotone).  Worker-thread owned.
+    int16_t        clusterFeatureLevel_   = rune::replication::MetadataFeature::kBase;
     [[nodiscard]] int64_t leaseNow_() const noexcept {
         return leaseNowOverride_ == nullptr ? rune::consensus::leaseClockNowNs() : *leaseNowOverride_;
     }
