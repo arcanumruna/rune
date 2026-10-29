@@ -461,3 +461,23 @@ TEST(CheckedWritesBrokerRegression, TransientTypedTopicValidatesRegression) {
     EXPECT_EQ(send(b, "p", t.topicId, 1, cw::validRecord(1)), kOk);
     EXPECT_EQ(cwb::produceRaw(b, "p", t.topicId, 1, "", rc::Key(uint32_t{1})), kSchemaValidationFailed) << "a wrong-width tombstone";
 }
+
+// Boot: a restarted broker owns its catalog's typed partitions before any spec reaches a worker, so leadership of a typed
+// topic must wait for the topic's validators and write spec (held here forever by the test knob).  While they are held,
+// an invalid record is answered NotLeader (retriable) and nothing is stored - never OK.  RED (before the boot pre-post and
+// the BecomeLeader hold): the restarted leader serves the partition without a write state and stores the record.
+TEST(CheckedWritesBrokerRegression, RestartServesNoTypedPartitionBeforeItsSpecRegression) {
+    uint32_t hold = 0;
+    OneBroker b("cw-bootgate", OneBroker::Runtime::Shard, [&hold](NodeConfig& cfg) { cfg.testHoldWriteSpecPasses = hold; });
+    const auto t = cwb::defineTyped(*b.connectClient(), "p", 1);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    hold = 4'000'000'000u;   // the restarted broker never delivers a WriteSpecUpdate
+    b.restart();
+    cw::Parts bad; bad.bio = std::string("\xC0\xAF", 2);
+    for (int i = 0; i < 8; ++i) {   // across the leader-election warm-up: every answer is a refusal
+        const uint16_t code = send(b, "p", t.topicId, 1, cw::encode(bad));
+        EXPECT_TRUE(code == kNotLeader || code == kSchemaValidationFailed) << "attempt " << i << " answered " << code;
+        std::this_thread::sleep_for(400ms);
+    }
+    EXPECT_TRUE(storedValues(b.node(), t.topicId, 0).empty()) << "an invalid record was stored before the spec arrived";
+}
