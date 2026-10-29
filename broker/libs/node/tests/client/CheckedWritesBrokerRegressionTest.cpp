@@ -48,6 +48,10 @@ TEST(CheckedWritesBrokerRegression, DroppedWhileAwaitingSpecNeverBuildsRegressio
     const auto dropped = c2.dropTopicAndWait("chars", {}, 20s);
     EXPECT_EQ(dropped.errorCode, 0) << dropped.detail;
     definer.join();
+    // The create committed, then the drop: the define is answered OK at once.  A parked create that outlived the drop
+    // (whose held spec the drop forgot) would be built afterwards - replicas of a dropped topic - and the define held
+    // until it answers in doubt.  RED: keep the parked create in dropRuntimeTopic_ (code 6 after 5 s).
+    EXPECT_EQ(topicId.load(), id);
     EXPECT_FALSE(b.node().catalogTopicServesForTest(id));
     for (int32_t p = 0; p < 2; ++p) EXPECT_FALSE(cwb::hasWriteState(b.node(), id, p));
     EXPECT_FALSE(cwb::anyWorkerHasValidator(b.node(), id));
