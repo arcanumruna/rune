@@ -254,8 +254,9 @@ static void Teardown(const benchmark::State&) {
 // The produce loop every full-path benchmark below runs: tryEnqueueOp → doWork → drainReturn of one single-record batch.
 // ---------------------------------------------------------------------------
 static void produceLoop(benchmark::State& state) {
-    int64_t nowNs = 2;
-    int64_t corr  = 0;
+    int64_t  nowNs   = 2;
+    int64_t  corr    = 0;
+    uint64_t refused = 0;   // a refused produce never appends: the loop would time the reject path instead
 
     for (auto _ : state) {
         WorkerOp op;
@@ -280,12 +281,13 @@ static void produceLoop(benchmark::State& state) {
         bool acked = false;
         for (int i = 0; i < 10'000 && !acked; ++i) {
             g_fix->worker->doWork(nowNs++);
-            g_fix->worker->drainReturn([&](WorkerReturn&&) { acked = true; });
+            g_fix->worker->drainReturn([&](WorkerReturn&& r) { acked = true; refused += r.errorCode != 0 ? 1u : 0u; });
         }
         benchmark::DoNotOptimize(acked);
     }
 
     state.SetItemsProcessed(state.iterations());
+    rune::bench::gateCheck(state, refused == 0, "a produce was refused: the setup must make the timed batch valid");
 }
 
 // BM_ProduceValidate_Off — no write state (an untyped topic).
