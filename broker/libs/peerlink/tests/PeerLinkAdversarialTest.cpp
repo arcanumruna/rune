@@ -44,7 +44,7 @@ struct Sim {
     std::deque<Bytes> hsTo[2];       // [0] -> a, [1] -> b
     struct Data { int to; Bytes bytes; int64_t sentNs; };
     std::vector<Data> data;
-    int64_t now = 0, lastRekeyNs = -1'000'000'000'000;
+    int64_t now = 0, lastRekeyNs = -1'000'000'000'000, lastHeardByANs = 0, outageUntilNs = 0;
     uint64_t opened = 0, rekeys = 0;
     std::string failure;
 
@@ -93,6 +93,7 @@ struct Sim {
         Data d = std::move(data[idx]);
         data.erase(data.begin() + static_cast<std::ptrdiff_t>(idx));
         End& e = at(d.to);
+        if (d.to == 0 && now < outageUntilNs) return;   // b -> a is down: the frame is lost
         uint8_t out[16]; std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
         const auto r = e.crypto.open(d.bytes.data(), d.bytes.size(), out, sizeof out, outLen, from, epoch);
         if (r != OR::Ok) {
@@ -102,6 +103,7 @@ struct Sim {
             return;
         }
         ++opened;
+        if (d.to == 0) lastHeardByANs = now;
         e.hs.onAuthenticated(now);
         int32_t peer = -1; uint32_t used = 0;   // BrokerNode::servicePeerLinks_ polls the latch every duty cycle
         if (e.crypto.takePeerUsedEpoch(peer, used)) absorb(d.to, e.hs.onPeerUsedEpoch(used, now));
@@ -134,10 +136,12 @@ struct Sim {
             open(std::uniform_int_distribution<std::size_t>(0, data.size() - 1)(rng));
         } else if (k <= 8) {
             now += std::uniform_int_distribution<int64_t>(0, 60)(rng) * kMs;
+            if (now >= outageUntilNs && chance(0.05)) outageUntilNs = now + 1'100 * kMs;
             data.erase(std::remove_if(data.begin(), data.end(), [&](const Data& d) { return now - d.sentNs > maxDataAgeNs; }),
                        data.end());
             tick();
-        } else if (now - lastRekeyNs >= pl::PeerHandshake::kRetryNs) {   // a same-incarnation re-handshake (the gate's rate)
+        } else if (now - lastRekeyNs >= pl::PeerHandshake::kRetryNs &&
+                   now - lastHeardByANs >= pl::PeerHandshake::kSilenceNs) {   // a same-incarnation re-handshake (the gate: a silent peer)
             auto o = a.hs.rekeyForTest(now);
             if (o.frame) { lastRekeyNs = now; ++rekeys; }
             absorb(0, std::move(o));
@@ -166,7 +170,8 @@ struct Sim {
 } // namespace
 
 // ---- Data integrity / Network: a seeded model check of the receive-first re-handshake (issue #241). ----
-// Both ends seal continuously; same-incarnation re-handshakes start at the hint gate's rate; handshake frames are lost
+// Both ends seal continuously; same-incarnation re-handshakes start only through the hint gate (the initiator heard
+// nothing for kSilenceNs: b -> a goes down for 1.1 s at random, never a live peer); handshake frames are lost
 // at random; data frames are reordered against them (other streams) and live at most 150 ms.  EVERY data frame that is
 // delivered must open (no UnknownEpoch, no BadTag), and the link must converge to one send epoch once the loss stops.
 // Mutation: the responder installing SendAndReceive at the Proof (receiveFirst = false) turns this red.
