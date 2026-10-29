@@ -6465,9 +6465,14 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     for (const auto& p : resp.partitions) {
         if (p.egressControlPort == 0 || p.egressStreamId == 0) continue;
         std::string_view host;
+        bool leaderResponseMode = false;
         for (const auto& b : resp.brokers) {
-            if (b.nodeId == p.leaderId) { host = b.host; break; }
+            if (b.nodeId == p.leaderId) { host = b.host; leaderResponseMode = b.responseControlPort != 0; break; }
         }
+        // I7: a leader that advertises a response-control port serves this client over the response path (the
+        // port is only ever sent to a v16 client): the declared MDC subscription is not added, so the NAT path is
+        // the only way records can arrive.  Old brokers (port 0) keep it.
+        if (leaderResponseMode) continue;
         std::string ctrlHost = host.empty() ? fallbackHost : std::string(host);
         if (ctrlHost.empty()) continue;
         std::string ctrl = "aeron:udp?control-mode=dynamic|control=" +

@@ -406,6 +406,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
 
     // ---- Step 3b: NAT-safe egress — WorkerBind for every worker publication whose session (re)connected ----
     // One bounded pass over the small bind table; empty (a no-op) unless Metadata advertised response-mode workers.
+    if (pendingResponseUpgrades_ != 0) [[unlikely]] totalWork += serviceResponseUpgrades_();   // I6 (before the binds)
     if (!workerBinds_.empty()) totalWork += serviceWorkerBinds_();
 
     // ---- Step 4: CB-2 — Producer duty cycle (drain ring + flush batches) -----
@@ -1347,6 +1348,25 @@ bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t
     return transport_.offerTo(owner.endpoint, cfg_.transport.ingressStreamId, buf, len);
 }
 
+void ClientAgent::attachResponsePub_(Session& s, int32_t port, bool upgradePlain) noexcept {
+    // The ONE place a leader session's control publication is built (openSession_, and the upgrade of a session that
+    // was opened plain before Metadata / a Redirect taught the port).  port 0 = the declared path.
+    s.responsePort = port;
+    if (port == 0) return;
+    try {
+        const auto respCh = transport::responseControlChannelFor(s.endpoint, port);
+        if (respCh) {
+            s.ctlPub = upgradePlain
+                ? transport_.upgradeToResponsePublication(s.endpoint, cfg_.transport.ingressStreamId, *respCh)
+                : transport_.responsePublicationHandle(s.endpoint, cfg_.transport.ingressStreamId, *respCh);
+        } else {
+            s.responsePort = 0;   // not a UDP endpoint: nothing to pair
+        }
+    } catch (...) {
+        s.ctlPub = transport::AeronTransport::kNoPub;   // allocation failure (cold): the declared path
+    }
+}
+
 Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     // Lazily open a NEW session to this endpoint over the SHARED transport.  Its
     // SessionMachine gets its own IO adapter (offerTo(endpoint,...)) → its own
@@ -1367,19 +1387,7 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     s.machine.useSharedSecret(&secret_);
     // NAT-safe egress: with a known response port the control publication is response-correlated (response
     // subscription first, in AeronTransport::offerOn).  A session opened before Metadata taught the port stays plain.
-    s.responsePort = knownResponsePort_(endpoint);
-    if (s.responsePort != 0) {
-        try {
-            const auto respCh = transport::responseControlChannelFor(endpoint, s.responsePort);
-            if (respCh) {
-                s.ctlPub = transport_.responsePublicationHandle(endpoint, cfg_.transport.ingressStreamId, *respCh);
-            } else {
-                s.responsePort = 0;   // not a UDP endpoint: nothing to pair
-            }
-        } catch (...) {
-            s.ctlPub = transport::AeronTransport::kNoPub;   // allocation failure (cold): the declared path
-        }
-    }
+    attachResponsePub_(s, knownResponsePort_(endpoint));
     // On the duty clock (the clock tick() runs on), never steady_clock: with an
     // injected nanoClock the two are different domains and the connect's
     // fast-retry / timeout would never (or only much later) come due.
@@ -1393,21 +1401,29 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     return s;
 }
 
-Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
-    // Empty endpoint → the seed.  The seed still on its bootstrap (it never
-    // moved): its endpoint → the seed (single-node hot path, no scan).
-    if (endpoint.empty()) return seedSession();
+uint32_t ClientAgent::resolveSessionIndex_(const std::string& endpoint) const noexcept {
+    // THE one routing order (sessionForEndpoint opens on kNoSession; findSessionIndex_ reports it): the session
+    // that carries a frame for `endpoint` and the session a WorkerBind rides must be the same, so they share this.
+    // Empty endpoint → the seed.  The seed still on its bootstrap (it never moved): its endpoint → the seed
+    // (single-node hot path, no scan).
+    if (endpoint.empty()) return 0;
     const std::string& physical = transport_.ingressChannel();
     const bool seedHome = physical == cfg_.transport.ingressChannel;
-    if (seedHome && sameEndpoint(endpoint, seedSession().endpoint)) return seedSession();
+    if (seedHome && sameEndpoint(endpoint, sessions_[0]->endpoint)) return 0;
     for (std::size_t i = 1; i < sessions_.size(); ++i) {
-        if (sameEndpoint(sessions_[i]->endpoint, endpoint)) return *sessions_[i];  // M6: one session per node
+        if (sameEndpoint(sessions_[i]->endpoint, endpoint)) return static_cast<uint32_t>(i);  // M6: one session per node
     }
     // DR client bug 1: the seed is the session of the node it PHYSICALLY sits on
     // (its default publication) — never of the bootstrap node it left (a failover
     // / redirect moved it): a route to that node gets that node's own session,
     // so no frame stamped with the seed's new session id reaches the old node.
-    if (sameEndpoint(endpoint, physical)) return seedSession();
+    if (sameEndpoint(endpoint, physical)) return 0;
+    return kNoSession;
+}
+
+Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
+    const uint32_t idx = resolveSessionIndex_(endpoint);
+    if (idx != kNoSession) return *sessions_[idx];
     return openSession_(endpoint);
 }
 
@@ -1782,23 +1798,49 @@ int32_t ClientAgent::knownResponsePort_(const std::string& endpoint) const noexc
 void ClientAgent::setSessionResponsePort(const std::string& endpoint, int32_t port) noexcept {
     if (endpoint.empty() || port < 0) return;
     try {
+        bool found = false;
         for (auto& [ep, known] : nodeResponsePorts_) {
-            if (sameEndpoint(ep, endpoint)) { known = port; return; }
+            if (sameEndpoint(ep, endpoint)) { known = port; found = true; break; }
         }
-        nodeResponsePorts_.emplace_back(endpoint, port);
+        if (!found) nodeResponsePorts_.emplace_back(endpoint, port);
     } catch (...) {
-        // allocation failure (cold): the node stays on the declared path
+        return;   // allocation failure (cold): the node stays on the declared path
+    }
+    // I6: a leader session opened PLAIN before the port was learnt is upgraded (next duty pass: never re-entrantly
+    // from inside a machine call that may be this very session's redirect handler).
+    if (port == 0) return;
+    for (std::size_t i = 1; i < sessions_.size(); ++i) {
+        Session& s = *sessions_[i];
+        if (s.responsePort == 0 && s.ctlPub == transport::AeronTransport::kNoPub && !s.upgradeToResponse &&
+            sameEndpoint(s.endpoint, endpoint)) {
+            s.upgradeToResponse = true;
+            ++pendingResponseUpgrades_;
+        }
     }
 }
 
-uint32_t ClientAgent::findSessionIndex_(const std::string& endpoint) const noexcept {
-    // sessionForEndpoint() without opening a session: the seed is the session of where it physically sits.
-    if (endpoint.empty()) return 0;
-    if (sameEndpoint(endpoint, transport_.ingressChannel())) return 0;
+int ClientAgent::serviceResponseUpgrades_() noexcept {
+    int done = 0;
     for (std::size_t i = 1; i < sessions_.size(); ++i) {
-        if (sameEndpoint(sessions_[i]->endpoint, endpoint)) return static_cast<uint32_t>(i);
+        Session& s = *sessions_[i];
+        if (!s.upgradeToResponse) continue;
+        s.upgradeToResponse = false;
+        --pendingResponseUpgrades_;
+        if (s.responsePort != 0 || s.ctlPub != transport::AeronTransport::kNoPub) continue;   // upgraded meanwhile
+        attachResponsePub_(s, knownResponsePort_(s.endpoint), /*upgradePlain=*/true);
+        if (s.responsePort == 0) continue;
+        // The response path needs a fresh connect: the gateway announces the response publication (and the
+        // bind token) on the ConnectResponse of a response-correlated request.
+        s.machine.forceReconnect(dutyNowNs_);
+        s.connectSubmitted = true;
+        ++done;
     }
-    return kNoSession;
+    return done;
+}
+
+uint32_t ClientAgent::findSessionIndex_(const std::string& endpoint) const noexcept {
+    // sessionForEndpoint() without opening a session: the SAME resolution order (C1).
+    return resolveSessionIndex_(endpoint);
 }
 
 uint32_t ClientAgent::workerBindFor_(const std::string& sessionEndpoint, const std::string& dataChannel,

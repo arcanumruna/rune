@@ -3621,6 +3621,7 @@ private:
             (void)sendPushTooLarge_(s, pub, sealPtr, baseOffset);
             return filter::SendOutcome::TooLarge;
         }
+        if (sent.position > 0 && s.sessionEgress) [[unlikely]] ++responseEgressFrames_;   // I7
         return sent.position > 0 ? filter::SendOutcome::Sent : filter::SendOutcome::Retry;
     }
 
@@ -3998,6 +3999,7 @@ private:
                 }
                 const int64_t r = sent.position;
                 if (r > 0) {
+                    if (s.sessionEgress) [[unlikely]] ++responseEgressFrames_;   // I7: delivered on the response pub
                     s.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
                     pos += batchSize;
                     ++pushed;
@@ -8317,7 +8319,13 @@ public:
     [[nodiscard]] uint64_t workerBindsAcceptedForTest() const noexcept { return workerBindsAccepted_; }
     [[nodiscard]] uint64_t workerBindsRefusedForTest() const noexcept { return workerBindsRefused_; }
     [[nodiscard]] uint64_t imageUnbindsForTest() const noexcept { return imageUnbinds_; }
+    /// I4 seam: WorkerBinds that passed the token check and went on to the image lookup / channel build.
+    [[nodiscard]] uint64_t workerBindImageLookupsForTest() const noexcept { return workerBindImageLookups_; }
+    /// I7 seam: Records frames delivered on a response publication (session-egress subscriptions); sum over workers.
+    [[nodiscard]] uint64_t responseEgressFramesForTest() const noexcept { return responseEgressFrames_; }
 private:
+    uint64_t workerBindImageLookups_ = 0;
+    uint64_t responseEgressFrames_   = 0;   // I7: Records frames claimed on a session-egress subscription's response pub
     std::string responseControlEndpoint_;
     uint64_t spoofedIngressDropped_ = 0;
     uint64_t workerBindsAccepted_   = 0;
@@ -8359,6 +8367,17 @@ private:
                                                   !msg ? "undecodable" : "response mode off", image);
             return;
         }
+        // I4: authorize BEFORE any work.  A WorkerBind is unauthenticated until its token checks out, and any sender
+        // can aim one at a worker: an unknown session / wrong token / already-bound session costs one probe and a
+        // constant-time compare - no image lookup, no channel string.
+        if (const auto chk = ackSink_->checkBind(msg->sessionId, msg->token); chk != SessionAckSink::BindResult::Bound) {
+            ++workerBindsRefused_;
+            if (unauthLog_.due(19))
+                spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused (result {}; refused so far {})",
+                             workerId_, msg->sessionId, image, static_cast<int>(chk), workerBindsRefused_);
+            return;
+        }
+        ++workerBindImageLookups_;
         const int64_t corr = workerIngress_ ? workerIngress_->imageCorrelationIdOf(image) : -1;
         if (corr < 0) {
             ++workerBindsRefused_;

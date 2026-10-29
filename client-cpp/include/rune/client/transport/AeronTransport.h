@@ -231,6 +231,10 @@ public:
     /// returns false until the publication is Ready.  An empty `responseControlChannel` is publicationHandle().
     /// (channel, streamId) stays the lookup key: a plain and a correlated slot for one key never both exist — asking
     /// for a correlated one when a plain one exists returns the plain one unchanged (logged once).  Cold path.
+    /// I6: like responsePublicationHandle, but a PLAIN publication already on the key is converted to a
+    /// response-correlated one (released and re-registered once its response subscription is Ready).  Cold.
+    PubHandle upgradeToResponsePublication(const std::string& channel, int32_t streamId,
+                                           std::string_view responseControlChannel);
     PubHandle responsePublicationHandle(const std::string& channel, int32_t streamId,
                                         std::string_view responseControlChannel);
     /// The publication of `h` is a response-correlated request publication whose response subscription exists
@@ -243,8 +247,25 @@ public:
 
     /// True iff the DEFAULT ingress publication is response-correlated (the seed's response pair exists).
     [[nodiscard]] bool seedResponseCorrelated() const noexcept { return respSeedSlot_ >= 0; }
+    /// TEST SEAM (owner thread, no I/O): move the seed's PHYSICAL ingress identity, as a completed retarget does.
+    void setIngressChannelForTest(const std::string& channel) { cfg_.ingressChannel = channel; }
+    [[nodiscard]] bool publicationIsResponsePairedForTest(PubHandle h) const noexcept {   // awaiting or correlated
+        if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return false;
+        return !std::holds_alternative<PubSlot::Plain>(pubSlots_[static_cast<std::size_t>(h)].mode);
+    }
     /// TEST SEAMS: the channel string the default ingress publication was actually registered with, and the
     /// registration id of the seed's response subscription (0 = none).
+    /// TEST SEAMS (owner thread; cold): the response subscription slot of the seed pair, its Live state and owner
+    /// count (-1 / false / 0 when none).
+    [[nodiscard]] int32_t seedResponseSlotForTest() const noexcept { return respSeedSlot_; }
+    [[nodiscard]] bool subSlotLiveForTest(int32_t slot) const noexcept {
+        return slot >= 0 && static_cast<std::size_t>(slot) < subSlots_.size() &&
+               subSlots_[static_cast<std::size_t>(slot)].state == SubSlot::State::Live;
+    }
+    [[nodiscard]] uint32_t subSlotOwnersForTest(int32_t slot) const noexcept {
+        return slot >= 0 && static_cast<std::size_t>(slot) < subSlots_.size()
+                   ? subSlots_[static_cast<std::size_t>(slot)].owners : 0;
+    }
     [[nodiscard]] const std::string& seedPublicationChannelForTest() const noexcept { return ingressPubChannel_; }
     [[nodiscard]] int64_t seedResponseSubscriptionIdForTest() const noexcept {
         if (respSeedSlot_ < 0) return 0;
@@ -571,9 +592,11 @@ private:
         int32_t     streamId;
         Resolution<aeron::Subscription> res;
         std::unique_ptr<aeron::FragmentAssembler> assembler;  // built on Ready
+        uint32_t    owners = 1;   ///< I1: acquirers of this Live slot (addSubSlot_ ++; retireSubSlot_ -- , Retired at 0)
         State       state = State::Live;   ///< Retired: not polled, released by reapRetiredSubs_(); Free: reusable
     };
     /// Open (idempotently, among Live slots) a subscription slot; its index, or -1 on allocation failure.  Cold.
+    /// I1: every successful call is one OWNER of the slot and must be matched by one retireSubSlot_ on its release path.
     int32_t addSubSlot_(const std::string& channel, int32_t streamId) noexcept;
     /// A response subscription retired by retarget() may be the one whose poll callback is running: it is only
     /// marked here and released (with its assembler) at the start of the next poll().

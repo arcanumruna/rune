@@ -2787,6 +2787,14 @@ private:
     /// partition: ErrorResponse{Redirect, endpoint}, or the bare NotLeader when the
     /// endpoint is empty or too long for the frame.  Queued (sendAnswer_), never dropped.
     void sendRouteRefusal_(Session& s, int64_t sessionId, int64_t corr, std::string_view endpoint);
+    /// NAT-safe egress (spec D3, I6): the ONE place a Redirect / NotCoordinator endpoint gets its "#<port>" suffix.
+    /// Returns `endpoint` unchanged for a client older than kClientVersionResponseEgress, when no node owns the
+    /// endpoint, when that node has no gateway response port, or when it does not fit `buf`; otherwise
+    /// "endpoint#port" formatted into the caller's stack buffer (no heap).  `nodeId` < 0: find the node whose
+    /// nodeEndpointMap_ value equals the endpoint (cold linear scan).  Redirects are cold.
+    static constexpr std::size_t kRedirectTargetCap = 384;
+    [[nodiscard]] std::string_view redirectTarget_(int32_t clientVersion, std::string_view endpoint, int32_t nodeId,
+                                                   char* buf, std::size_t cap) const noexcept;
     /// C1: true iff the routing image names a leader of (the view's source, partition)
     /// other than this node, or none at all; `endpoint` is then that leader's client
     /// endpoint (empty when leaderless / unknown).  False: this node leads it, the

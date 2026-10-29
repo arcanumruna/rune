@@ -332,6 +332,11 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_transient_matrix_tests DISCOVERY_TIMEOUT 120 PROPERTIES LABELS small)
     rune_regression_batches(rune_gateway_transient_matrix_tests 1)
 
+    # NAT-safe egress I6: every Redirect / NotCoordinator site carries the response port — no Aeron.
+    add_executable(rune_gateway_redirect_port_tests tests/gateway/GatewayRedirectResponsePortRegressionTest.cpp)
+    target_link_libraries(rune_gateway_redirect_port_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_redirect_port_tests)
+
     # D4: a follower redirects group / txn coordinator requests to the leader — no Aeron.
     add_executable(rune_gateway_coordinator_redirect_tests tests/gateway/CoordinatorRedirectTest.cpp)
     target_link_libraries(rune_gateway_coordinator_redirect_tests PRIVATE rune_gateway spdlog::spdlog GTest::gtest_main)

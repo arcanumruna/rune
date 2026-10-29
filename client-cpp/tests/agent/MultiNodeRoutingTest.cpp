@@ -253,3 +253,69 @@ TEST(MultiNodeRouting, MnDebugIsReadOnceAtConstructionRegression) {
     ::unsetenv("RUNE_MN_DEBUG");
     EXPECT_EQ(err.find("MNDBG"), std::string::npos);
 }
+
+// ===========================================================================
+// C1 (fix round 1a): the session a produce rides and the session its WorkerBind rides are ONE resolution.
+// ===========================================================================
+
+TEST(ClientAgentRegression, SeedFailedOverOntoNodeWithLeaderSessionBindsTheProducingSessionRegression) {
+    const std::string kSeed = "aeron:udp?endpoint=seed:1";
+    const std::string kB    = "aeron:udp?endpoint=hostB:9001";
+    rca::ClientAgent agent(makeAgentConfig(kSeed));
+
+    // A leader session for B (index 1), then the seed fails over ONTO B (its physical ingress is now B).
+    const uint32_t bIdx = agent.sessionIndexForTest(kB);
+    ASSERT_EQ(bIdx, 1u);
+    agent.setSeedPhysicalIngressForTest(kB);
+
+    // The produce path (sessionIndexFor_) and the bind path (findSessionIndex_) must agree: B's own session.
+    EXPECT_EQ(agent.sessionIndexForTest(kB), bIdx);
+    EXPECT_EQ(agent.findSessionIndexForTest(kB), agent.sessionIndexForTest(kB));
+    EXPECT_EQ(agent.sessionCount(), 2u);   // nothing new opened
+
+    // The bind entry for B's worker resolves to that same session.
+    agent.addWorkerBindEntryForTest(kB);
+    EXPECT_EQ(agent.workerBindSessionIndexForTest(0), bIdx);
+
+    // The seed's old bootstrap node (no session of its own, seed not home): both paths say "none yet / open".
+    EXPECT_EQ(agent.findSessionIndexForTest(kSeed), 0xFFFFFFFFu);
+    // A node nobody has a session for, and the empty endpoint.
+    EXPECT_EQ(agent.findSessionIndexForTest("aeron:udp?endpoint=hostZ:9"), 0xFFFFFFFFu);
+    EXPECT_EQ(agent.findSessionIndexForTest(""), 0u);
+}
+
+// ===========================================================================
+// I6 (fix round 1a): a session opened PLAIN (port unknown) is upgraded when the port is learnt later.
+// ===========================================================================
+
+TEST(ClientAgentRegression, LearntPortUpgradesAPlainNodeSessionRegression) {
+    const std::string kB = "aeron:udp?endpoint=hostB:9001";
+    rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
+
+    const uint32_t bIdx = agent.sessionIndexForTest(kB);   // opened before any port is known: plain
+    ASSERT_EQ(bIdx, 1u);
+    EXPECT_EQ(agent.sessionObjForTest(bIdx).responsePort, 0);
+    EXPECT_EQ(agent.sessionObjForTest(bIdx).ctlPub, rune::client::transport::AeronTransport::kNoPub);
+    // The plain control publication exists already (the session's first connect offer opened it).
+    ASSERT_FALSE(agent.publicationResponsePairedForTest(agent.sessionObjForTest(bIdx).ctlPub));
+    const int64_t corrBefore = agent.sessionMachineForTest(bIdx).correlationId();
+
+    agent.setSessionResponsePort(kB, 41001);
+    // Applied on the next duty pass (never re-entrantly), exactly once.
+    EXPECT_EQ(agent.serviceResponseUpgradesForTest(1'000'000), 1);
+    EXPECT_EQ(agent.serviceResponseUpgradesForTest(2'000'000), 0);
+
+    EXPECT_EQ(agent.sessionObjForTest(bIdx).responsePort, 41001);
+    EXPECT_NE(agent.sessionObjForTest(bIdx).ctlPub, rune::client::transport::AeronTransport::kNoPub)
+        << "the control publication is now response-correlated";
+    EXPECT_TRUE(agent.publicationResponsePairedForTest(agent.sessionObjForTest(bIdx).ctlPub))
+        << "the already-open PLAIN publication is converted, not kept";
+    EXPECT_NE(agent.sessionMachineForTest(bIdx).correlationId(), corrBefore) << "a fresh connect episode";
+    EXPECT_EQ(agent.sessionMachineForTest(bIdx).state(), rune::client::session::SessionState::Connecting);
+
+    // A session that already has a port, the seed and unknown endpoints are untouched.
+    agent.setSessionResponsePort(kB, 41001);
+    EXPECT_EQ(agent.serviceResponseUpgradesForTest(3'000'000), 0);
+    agent.setSessionResponsePort("aeron:udp?endpoint=seed:1", 41002);
+    EXPECT_EQ(agent.serviceResponseUpgradesForTest(4'000'000), 0);
+}

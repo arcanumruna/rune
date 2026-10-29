@@ -509,6 +509,26 @@ AeronTransport::PubHandle AeronTransport::responsePublicationHandle(const std::s
     return static_cast<PubHandle>(pubSlots_.size() - 1);
 }
 
+AeronTransport::PubHandle AeronTransport::upgradeToResponsePublication(const std::string& channel, int32_t streamId,
+                                                                       std::string_view responseControlChannel) {
+    // I6: a node's control publication that was opened PLAIN (its response port was not known yet) becomes
+    // response-correlated.  Any other state (none yet / already await / correlated) is exactly responsePublicationHandle.
+    for (std::size_t i = 0; i < pubSlots_.size(); ++i) {
+        PubSlot& ps = pubSlots_[i];
+        if (ps.streamId != streamId || ps.channel != channel) continue;
+        if (!std::holds_alternative<PubSlot::Plain>(ps.mode) || responseControlChannel.empty())
+            return static_cast<PubHandle>(i);
+        const int32_t sub = addSubSlot_(std::string(responseControlChannel), cfg_.egressStreamId);
+        if (sub < 0) return static_cast<PubHandle>(i);   // stays plain (the declared path)
+        ps.res.reset();   // the plain publication deregisters; the correlated one is added once the sub is Ready
+        ps.res  = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
+        ps.addChannel.clear();
+        ps.mode = PubSlot::AwaitResponseSub{sub};
+        return static_cast<PubHandle>(i);
+    }
+    return responsePublicationHandle(channel, streamId, responseControlChannel);
+}
+
 // ---------------------------------------------------------------------------
 // client<->broker TLS/AEAD (Task 6) — reusable seal scratch
 // ---------------------------------------------------------------------------
@@ -603,8 +623,10 @@ aeron::Subscription* AeronTransport::resolveSubSlot_(SubSlot& s) noexcept {
 int32_t AeronTransport::addSubSlot_(const std::string& channel, int32_t streamId) noexcept {
     for (std::size_t i = 0; i < subSlots_.size(); ++i) {
         const SubSlot& s = subSlots_[i];
-        if (s.state == SubSlot::State::Live && s.streamId == streamId && s.channel == channel)
+        if (s.state == SubSlot::State::Live && s.streamId == streamId && s.channel == channel) {
+            ++subSlots_[i].owners;             // I1: shared; one more owner to release it
             return static_cast<int32_t>(i);   // idempotent
+        }
     }
     try {
         for (std::size_t i = 0; i < subSlots_.size(); ++i) {   // reuse a released slot
@@ -614,6 +636,7 @@ int32_t AeronTransport::addSubSlot_(const std::string& channel, int32_t streamId
             s.streamId = streamId;
             s.res      = Resolution<aeron::Subscription>{kResolveTimeoutNs, kResolveRetryNs};
             s.assembler.reset();
+            s.owners   = 1;
             s.state    = SubSlot::State::Live;
             return static_cast<int32_t>(i);
         }
@@ -630,6 +653,8 @@ void AeronTransport::retireSubSlot_(int32_t idx) noexcept {
     if (idx < 0 || static_cast<std::size_t>(idx) >= subSlots_.size()) return;
     SubSlot& s = subSlots_[static_cast<std::size_t>(idx)];
     if (s.state != SubSlot::State::Live) return;
+    if (s.owners > 1) { --s.owners; return; }   // I1: another owner (a correlated publication, a session) still uses it
+    s.owners = 0;
     s.state = SubSlot::State::Retired;
     ++retiredSubs_;
 }
@@ -682,6 +707,9 @@ bool AeronTransport::retarget(const std::string& newIngressChannel, int32_t resp
         if (respChannel) {
             newRespSlot = addSubSlot_(*respChannel, cfg_.egressStreamId);
             if (newRespSlot < 0) return false;
+            // I1: the seed pair already owns its own slot (a retarget to the same endpoint): no second owner.
+            if (newRespSlot == respSeedSlot_ && subSlots_[static_cast<std::size_t>(newRespSlot)].owners > 1)
+                --subSlots_[static_cast<std::size_t>(newRespSlot)].owners;
             pumpUntil_([&] {
                 SubSlot& rs = subSlots_[static_cast<std::size_t>(newRespSlot)];
                 if (rs.res.ready() != nullptr) return true;

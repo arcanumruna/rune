@@ -2590,11 +2590,9 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             err.correlationId = pending.correlationId;
             err.code          = static_cast<int16_t>(pc::ErrorCode::Redirect);
             // NAT-safe egress (spec D3): a session >= 16 learns the leader's gateway response-control port.
-            std::string redirectMessage = pending.leaderClientEndpoint;   // cold (one per redirect)
-            if (pending.clientVersion >= pc::kClientVersionResponseEgress) {
-                if (const int32_t port = gatewayResponsePortOf_(pending.leaderNodeId); port > 0)
-                    redirectMessage += "#" + std::to_string(port);
-            }
+            char targetBuf[kRedirectTargetCap];
+            const std::string_view redirectMessage = redirectTarget_(pending.clientVersion, pending.leaderClientEndpoint,
+                                                                     pending.leaderNodeId, targetBuf, sizeof targetBuf);
             err.message = redirectMessage;
 
             // Guard: message must fit in scratch (encode would overflow otherwise).
@@ -3610,17 +3608,20 @@ bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& s
     // position.  Group-member partition subscriptions (bit-61 correlation ids)
     // ride per-leader sessions and keep the NotLeader their re-route handles.
     constexpr int64_t kGroupFetchCorrTag = int64_t{1} << 61;   // rune-client GroupConsumerHub
+    char movedTargetBuf[kRedirectTargetCap];   // I6: the "#<port>" suffixed target lives in this frame
     if (pc::clientUnderstandsMovedPositionNote(session->clientVersion) &&
         (sub.subscribeCorrId & kGroupFetchCorrTag) == 0 && routingImage_) {
         const auto& entry = routingImage_->lookup(rune::metadata::gpidOf(sub.topicId, sub.partition));
         if (entry.leaderNodeId != rune::metadata::RoutingImage::NO_LEADER_NODE_ID &&
             entry.leaderNodeId != thisNodeId_) {
             if (const auto ep = nodeEndpointMap_.find(entry.leaderNodeId);
-                ep != nodeEndpointMap_.end() && !ep->second.empty() &&
-                pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + ep->second.size() <=
-                    scratch_.size()) {
-                err.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-                err.message = ep->second;
+                ep != nodeEndpointMap_.end() && !ep->second.empty()) {
+                const std::string_view target =
+                    redirectTarget_(session->clientVersion, ep->second, entry.leaderNodeId, movedTargetBuf, sizeof movedTargetBuf);
+                if (pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + target.size() <= scratch_.size()) {
+                    err.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
+                    err.message = target;
+                }
             }
         }
     }
@@ -3754,11 +3755,12 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         pc::ErrorResponse errResp;
         errResp.sessionId     = msg.sessionId;
         errResp.correlationId = corrId;
+        char targetBuf[kRedirectTargetCap];
         if (!endpoint.empty()) {
             errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-            errResp.message = endpoint;
+            errResp.message = redirectTarget_(session->clientVersion, endpoint, -1, targetBuf, sizeof targetBuf);
             spdlog::debug("ClientGateway: Produce per-partition redirect sessionId={} → {}",
-                          msg.sessionId, endpoint);
+                          msg.sessionId, errResp.message);
         } else {
             errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             spdlog::debug("ClientGateway: Produce per-partition NotLeader (endpoint unknown) sessionId={}",
@@ -5811,6 +5813,23 @@ ClientGateway::CatalogRoom ClientGateway::catalogEgressRoom(int64_t sessionId)
     return w >= need ? CatalogRoom::Ready : CatalogRoom::NotYet;
 }
 
+std::string_view ClientGateway::redirectTarget_(int32_t clientVersion, std::string_view endpoint, int32_t nodeId,
+                                                char* buf, std::size_t cap) const noexcept
+{
+    if (clientVersion < pc::kClientVersionResponseEgress || endpoint.empty()) return endpoint;
+    if (nodeId < 0) {
+        for (const auto& [id, ep] : nodeEndpointMap_) {
+            if (ep == endpoint) { nodeId = id; break; }
+        }
+        if (nodeId < 0) return endpoint;
+    }
+    const int32_t port = gatewayResponsePortOf_(nodeId);
+    if (port <= 0) return endpoint;
+    const int n = std::snprintf(buf, cap, "%.*s#%d", static_cast<int>(endpoint.size()), endpoint.data(), port);
+    if (n <= 0 || static_cast<std::size_t>(n) >= cap) return endpoint;   // does not fit: the bare endpoint
+    return std::string_view(buf, static_cast<std::size_t>(n));
+}
+
 // Task 22 fix round 1 (C1): the shared Redirect / NotLeader refusal (the body of
 // handleSubscribe's former sendSubRedirect lambda, DRY with GetViewRow).
 void ClientGateway::sendRouteRefusal_(Session& s, int64_t sessionId, int64_t corr, std::string_view endpoint)
@@ -5818,10 +5837,11 @@ void ClientGateway::sendRouteRefusal_(Session& s, int64_t sessionId, int64_t cor
     pc::ErrorResponse errResp;
     errResp.sessionId     = sessionId;
     errResp.correlationId = corr;
+    char targetBuf[kRedirectTargetCap];
     if (!endpoint.empty()) {
         errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-        errResp.message = endpoint;
-        spdlog::debug("ClientGateway: per-partition redirect sessionId={} → {}", sessionId, endpoint);
+        errResp.message = redirectTarget_(s.clientVersion, endpoint, -1, targetBuf, sizeof targetBuf);
+        spdlog::debug("ClientGateway: per-partition redirect sessionId={} → {}", sessionId, errResp.message);
     } else {
         errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
         spdlog::debug("ClientGateway: per-partition NotLeader (endpoint unknown) sessionId={}", sessionId);
@@ -8078,7 +8098,9 @@ bool ClientGateway::redirectToCoordinator_(Session& session, int64_t correlation
     errResp.sessionId     = session.sessionId;
     errResp.correlationId = correlationId;
     errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
-    errResp.message       = lv.leaderClientEndpoint;
+    char targetBuf[kRedirectTargetCap];
+    errResp.message       = redirectTarget_(session.clientVersion, lv.leaderClientEndpoint, lv.leaderNodeId,
+                                            targetBuf, sizeof targetBuf);
     const std::size_t needed = pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 +
                                errResp.message.size();
     if (needed > scratch_.size()) return false;
@@ -8271,6 +8293,7 @@ bool ClientGateway::ddlRouted_(const uint8_t* buf, std::size_t len, const rune::
     err.sessionId     = hdr->sessionId;
     err.correlationId = hdr->correlationId;
     char haltedText[64];
+    char targetBuf[kRedirectTargetCap];
     if (halted != nullptr) {
         // Spec §9: never a redirect — the leader may be healthy, THIS broker is not.
         const int n = std::snprintf(haltedText, sizeof haltedText, "%s apply halted at offset %lld",
@@ -8279,7 +8302,7 @@ bool ClientGateway::ddlRouted_(const uint8_t* buf, std::size_t len, const rune::
         err.message = std::string_view(haltedText, n > 0 ? static_cast<std::size_t>(n) : 0u);
     } else if (remote != nullptr && !remote->leaderClientEndpoint.empty()) {
         err.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-        err.message = remote->leaderClientEndpoint;
+        err.message = redirectTarget_(session->clientVersion, remote->leaderClientEndpoint, -1, targetBuf, sizeof targetBuf);
     } else {
         err.code = static_cast<int16_t>(pc::ErrorCode::NotLeader);   // retriable: no leader known yet
     }

@@ -379,6 +379,7 @@ struct Env {
     uint64_t spoofed() { return node->onWorkerThreadForTest(0, [](Worker& w) { return w.spoofedIngressDroppedForTest(); }); }
     uint64_t bindsAccepted() { return node->onWorkerThreadForTest(0, [](Worker& w) { return w.workerBindsAcceptedForTest(); }); }
     uint64_t bindsRefused() { return node->onWorkerThreadForTest(0, [](Worker& w) { return w.workerBindsRefusedForTest(); }); }
+    uint64_t bindImageLookups() { return node->onWorkerThreadForTest(0, [](Worker& w) { return w.workerBindImageLookupsForTest(); }); }
     uint64_t imageUnbinds() { return node->onWorkerThreadForTest(0, [](Worker& w) { return w.imageUnbindsForTest(); }); }
     bool pubReady(int64_t sid) {
         return node->onWorkerThreadForTest(0, [sid](Worker& w) { return w.responsePubReadyForTest(sid); });
@@ -556,9 +557,16 @@ TEST(ResponseEgressWorkerRegression, WrongTokenNeverBindsRegression) {
     ASSERT_TRUE(attacker.sendWorkerBind(sid, 9, wrong));
     ASSERT_TRUE(e.awaitCounter([&] { return e.bindsRefused() >= 1; })) << "the wrong token was never refused";
     EXPECT_EQ(e.bindsAccepted(), 0u);
+    // I4: the refusal happened BEFORE the image lookup / channel build (no work for an unauthenticated sender).
+    EXPECT_EQ(e.bindImageLookups(), 0u);
+    // ... and so does a bind for a session id nobody holds.
+    ASSERT_TRUE(attacker.sendWorkerBind(sid + 1000, 10, r->bindToken));
+    ASSERT_TRUE(e.awaitCounter([&] { return e.bindsRefused() >= 2; })) << "the unknown session was never refused";
+    EXPECT_EQ(e.bindImageLookups(), 0u);
     ASSERT_TRUE(victim.sendWorkerBind(sid, 2, r->bindToken));
     ASSERT_EQ(produceAndAwaitAcks(victim, sid, e.topic, 100, 5, "w"), 5);
     EXPECT_EQ(e.bindsAccepted(), 1u);
+    EXPECT_EQ(e.bindImageLookups(), 1u) << "only the authorized bind does the lookup";
     attacker.drainFor(300ms);
     EXPECT_TRUE(attacker.wk().empty() && attacker.gw().empty()) << "the attacker's response subscription received frames";
 }

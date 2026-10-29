@@ -196,6 +196,9 @@ struct Session {
     std::array<uint8_t, 16> bindToken{};
     /// bindToken is non-zero: this session's produce to a worker must be preceded by a WorkerBind.
     bool        bindRequired         = false;
+    /// I6: opened plain, then the node's response port was learnt: the next duty pass builds the correlated control
+    /// publication and reconnects on it.
+    bool        upgradeToResponse    = false;
 
     Session(ClientAgent* agent, session::SessionConfig cfg,
             std::string sessionEndpoint)
@@ -404,8 +407,11 @@ public:
     /// AGENT-THREAD ONLY — call from onMetadataResponse (which runs on the agent
     /// thread during egress poll dispatch).  Forwards to the transport.
     void addEgressSubscription(const std::string& controlChannel, int32_t streamId) noexcept {
+        ++mdcEgressSubscriptionsAdded_;
         transport_.addEgressSubscription(controlChannel, streamId);
     }
+    /// I7 observer: declared-path (MDC) egress subscriptions requested; a response-path client requests none.
+    [[nodiscard]] uint64_t mdcEgressSubscriptionsAdded() const noexcept { return mdcEgressSubscriptionsAdded_; }
 
     // -------------------------------------------------------------------------
     // Task 1.3: multi-node session registry + partition routing table
@@ -449,6 +455,9 @@ public:
         return knownResponsePort_(endpoint);
     }
     [[nodiscard]] std::size_t workerBindCount() const noexcept { return workerBinds_.size(); }
+    [[nodiscard]] bool publicationResponsePairedForTest(transport::AeronTransport::PubHandle h) const noexcept {
+        return transport_.publicationIsResponsePairedForTest(h);
+    }
     [[nodiscard]] bool seedResponseCorrelated() const noexcept { return transport_.seedResponseCorrelated(); }
     [[nodiscard]] uint64_t workerBindsSent() const noexcept { return workerBindsSent_; }
 
@@ -934,6 +943,32 @@ public:
     session::SessionMachine& sessionForEndpointForTest(const std::string& endpoint) noexcept {
         return sessionForEndpoint(endpoint).machine;
     }
+    [[nodiscard]] int serviceResponseUpgradesForTest(int64_t nowNs) noexcept {
+        dutyNowNs_ = nowNs;
+        return serviceResponseUpgrades_();
+    }
+    [[nodiscard]] Session& sessionObjForTest(std::size_t i) noexcept { return *sessions_[i]; }
+    // C1 seams: the seed's physical ingress moves (a completed failover), and the two resolvers' indices.
+    void setSeedPhysicalIngressForTest(const std::string& channel) {
+        transport_.setIngressChannelForTest(channel);
+        invalidateRouteSessions_();
+    }
+    [[nodiscard]] uint32_t findSessionIndexForTest(const std::string& endpoint) const noexcept {
+        return findSessionIndex_(endpoint);
+    }
+    [[nodiscard]] uint32_t sessionIndexForTest(const std::string& endpoint) noexcept {
+        return sessionIndexFor_(endpoint);
+    }
+    void addWorkerBindEntryForTest(const std::string& sessionEndpoint) {
+        WorkerBindEntry e;
+        e.sessionEndpoint = sessionEndpoint;
+        workerBinds_.push_back(std::move(e));
+    }
+    /// Resolve every bind entry's session (the duty pass's first step) and report entry `i`'s index.
+    [[nodiscard]] uint32_t workerBindSessionIndexForTest(std::size_t i) noexcept {
+        (void)serviceWorkerBinds_();
+        return i < workerBinds_.size() ? workerBinds_[i].sessionIndex : kNoSession;
+    }
 
 private:
     void init();   // the constructors' common body (the seed session)
@@ -1059,6 +1094,12 @@ private:
     /// One cold pass per doWork over the (small) table: offer the WorkerBind for every entry whose session is
     /// Connected with a token and whose bound sid is not the session's current one.  Returns binds sent.
     int serviceWorkerBinds_() noexcept;
+    /// The ONE builder of a leader session's (response-correlated) control publication.
+    void attachResponsePub_(Session& s, int32_t port, bool upgradePlain = false) noexcept;
+    /// I6: upgrade every session flagged by setSessionResponsePort.  Returns upgrades done.  Cold.
+    int serviceResponseUpgrades_() noexcept;
+    uint32_t pendingResponseUpgrades_ = 0;
+    uint64_t mdcEgressSubscriptionsAdded_ = 0;   // duty thread only (I7 observer)
     bool holdWorkerBinds_ = false;   // TEST SEAM (duty thread): serviceWorkerBinds_ sends nothing while set
 public:
     void testHoldWorkerBinds(bool hold) noexcept { holdWorkerBinds_ = hold; }
@@ -1068,6 +1109,9 @@ private:
                             int32_t responsePort) noexcept;
     /// The index of the session for `endpoint` WITHOUT opening one (kNoSession when none exists).  Cold.
     uint32_t findSessionIndex_(const std::string& endpoint) const noexcept;
+    /// The ONE endpoint → session-index order shared by sessionForEndpoint (opens on kNoSession) and
+    /// findSessionIndex_ (C1: the produce session and the WorkerBind session must never drift apart).
+    [[nodiscard]] uint32_t resolveSessionIndex_(const std::string& endpoint) const noexcept;
     /// Response ports learnt per node endpoint (Metadata / Redirect); cold table.
     std::vector<std::pair<std::string, int32_t>> nodeResponsePorts_;
     [[nodiscard]] int32_t knownResponsePort_(const std::string& endpoint) const noexcept;

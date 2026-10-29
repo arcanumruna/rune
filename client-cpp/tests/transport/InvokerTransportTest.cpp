@@ -1042,6 +1042,53 @@ TEST(InvokerTransportResponseRegression, ResponseHandleForAnExistingPlainKeyRetu
     t.stop();
 }
 
+// I1 (fix round 1a): the response subscription of a gateway is SHARED by the seed pair and by a correlated
+// publication to the same endpoint; retargeting the seed away releases only the seed's share.
+TEST(AeronTransportRegression, SharedResponseSubscriptionSurvivesSeedRetargetRegression) {
+    const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
+    const uint16_t reqB = rune::client::testing::allocFreeUdpPort(), rB = rune::client::testing::allocFreeUdpPort();
+    Config c = responseConfig(loopback(reqA), rA, 3550);
+    Transport t{c};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    const int32_t slot = t.seedResponseSlotForTest();
+    ASSERT_GE(slot, 0);
+    EXPECT_EQ(t.subSlotOwnersForTest(slot), 1u);
+
+    // A second owner: a leader session's correlated control publication to the SAME gateway.
+    const std::string gwA = loopback(reqA);
+    const auto respCtl = rune::client::transport::responseControlChannelFor(gwA, rA);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(gwA, 3551, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    EXPECT_EQ(t.subSlotOwnersForTest(slot), 2u) << "the same Live slot is shared, counted";
+
+    // The seed fails over to B: only the seed's share is released.
+    ASSERT_TRUE(t.retarget(loopback(reqB), rB));
+    for (int i = 0; i < 5; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }   // reap pass
+    EXPECT_TRUE(t.subSlotLiveForTest(slot)) << "the second owner's subscription must not be closed";
+    EXPECT_EQ(t.subSlotOwnersForTest(slot), 1u);
+
+    // ... and the second owner's publication still offers and its reply still arrives.
+    RawServer srv(c.dataDir, gwA, 3551, rA, c.egressStreamId);
+    const uint8_t frame[] = {0xC1, 0x01};
+    bool sent = false;
+    ASSERT_TRUE(pumpBoth(t, srv, [&] {
+        if (!sent) sent = t.offerOn(h, frame, sizeof frame);
+        return sent;
+    }));
+    ASSERT_TRUE(pumpBoth(t, srv, [&] { return srv.received.size() == 1; }));
+    const std::vector<uint8_t> reply = {0xAC, 0x01};
+    std::vector<uint8_t> got;
+    ASSERT_TRUE(pumpBoth(t, srv, [&] {
+        if (got.empty()) (void)srv.respond(reply);
+        t.poll([&](const uint8_t* b, std::size_t n) { if (got.empty()) got.assign(b, b + n); }, 10);
+        return !got.empty();
+    }));
+    EXPECT_EQ(got, reply);
+    t.stop();
+}
+
 TEST(InvokerTransportResponseRegression, RetargetPairsTheNewResponseSubscriptionAndFallsBackToPlain) {
     const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
     const uint16_t reqB = rune::client::testing::allocFreeUdpPort(), rB = rune::client::testing::allocFreeUdpPort();

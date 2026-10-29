@@ -100,6 +100,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <limits>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -217,6 +218,11 @@ public:
     struct PubAwaitingBind { std::array<uint8_t, 16> token{}; int32_t streamId = 0; };
     using PubState = std::variant<PubAnnounced, PubResolving, PubReady, PubFailed, PubAwaitingBind>;
     enum class BindResult : uint8_t { Bound, UnknownSession, BadToken, NotAwaiting };
+    /// I5: boundImage_ is ONE word per session: 0 = not response-mode, kAwaitingBind = response-mode awaiting its
+    /// bind, otherwise imageKey_(image) (bit 32 set — never equal to kAwaitingBind, asserted below).  The produce
+    /// admission reads this single word; states_ stays authoritative.
+    static constexpr int64_t kAwaitingBind = std::numeric_limits<int64_t>::min();
+    [[nodiscard]] static constexpr bool isBound_(int64_t v) noexcept { return v != 0 && v != kAwaitingBind; }
 
     explicit SessionAckSinkT(PubPolicy policy) noexcept : policy_(std::move(policy)) {
         for (std::size_t i = 0; i < kMaxChannelSlots; ++i) freeChan_[i] = static_cast<uint16_t>(i);
@@ -279,13 +285,27 @@ public:
         PubState& st = states_[idx];
         if (!fresh) {
             if (auto* w = std::get_if<PubAwaitingBind>(&st)) { w->token = token; w->streamId = streamId; return true; }
-            if (boundImage_[idx] != 0 && !std::holds_alternative<PubFailed>(st)) return true;   // bound: keep it
+            if (isBound_(boundImage_[idx]) && !std::holds_alternative<PubFailed>(st)) return true;   // bound: keep it
         }
         if (edges_[idx].lost) { edges_[idx].lost = 0; markDirty_(idx); }
         leaveState_(st);
-        boundImage_[idx] = 0;
+        boundImage_[idx] = kAwaitingBind;
         st = PubAwaitingBind{token, streamId};
         return true;
+    }
+
+    /// I4: the bind's authorization half, with NO allocation and no side effect: Bound = the session awaits its bind
+    /// and the token matches (constant-time), i.e. bind() would be admitted.  The worker calls it FIRST so an
+    /// unauthenticated WorkerBind (any sender can aim one at a worker) costs one probe and one compare — never an
+    /// image lookup or a channel string.
+    [[nodiscard]] BindResult checkBind(int64_t sessionId, const std::array<uint8_t, 16>& token) const noexcept {
+        const std::size_t idx = find_(sessionId);
+        if (idx == kNone) return BindResult::UnknownSession;
+        const auto* w = std::get_if<PubAwaitingBind>(&states_[idx]);
+        if (!w) return BindResult::NotAwaiting;
+        uint8_t diff = 0;                                            // constant-time: fold every byte
+        for (std::size_t i = 0; i < token.size(); ++i) diff = static_cast<uint8_t>(diff | (w->token[i] ^ token[i]));
+        return diff != 0 ? BindResult::BadToken : BindResult::Bound;
     }
 
     /// NAT-safe egress (Task 6, cold): the client's WorkerBind named `imageSessionId` (the Aeron session id of ITS
@@ -294,14 +314,11 @@ public:
     /// even with the right token — never rebinds (a changed NAT mapping ends the session, spec D2).
     BindResult bind(int64_t sessionId, const std::array<uint8_t, 16>& token, int32_t imageSessionId,
                     std::string_view responseChannel) noexcept {
+        const BindResult chk = checkBind(sessionId, token);   // defence: the worker already checked, never trust it
+        if (chk != BindResult::Bound) return chk;
         const std::size_t idx = find_(sessionId);
-        if (idx == kNone) return BindResult::UnknownSession;
         PubState& st = states_[idx];
         auto* w = std::get_if<PubAwaitingBind>(&st);
-        if (!w) return BindResult::NotAwaiting;
-        uint8_t diff = 0;                                            // constant-time: fold every byte
-        for (std::size_t i = 0; i < token.size(); ++i) diff = static_cast<uint8_t>(diff | (w->token[i] ^ token[i]));
-        if (diff != 0) return BindResult::BadToken;
         if (responseChannel.size() > kMaxChannelBytes) return BindResult::BadToken;   // unreachable: the worker builds it
         const int32_t streamId = w->streamId;
         if (freeChanCount_ > 0) [[likely]] {
@@ -319,13 +336,15 @@ public:
     /// The Aeron session id of the ingress image `sessionId` is bound to (nullopt: not response-mode / not bound).
     [[nodiscard]] std::optional<int32_t> boundImage(int64_t sessionId) const noexcept {
         const std::size_t idx = find_(sessionId);
-        if (idx == kNone || boundImage_[idx] == 0) return std::nullopt;
+        if (idx == kNone || !isBound_(boundImage_[idx])) return std::nullopt;
         return static_cast<int32_t>(static_cast<uint32_t>(boundImage_[idx]));
     }
 
     /// The session's Ready publication (null otherwise).  Zero allocation; the pointer is valid until the next call
     /// that can release the publication (close, unbindImage, announce) — callers look it up per pass.
-    [[nodiscard]] typename PubHandle::element_type* readyPub(int64_t sessionId) const noexcept {
+    template <class H = PubHandle>
+    [[nodiscard]] typename H::element_type* readyPub(int64_t sessionId) const noexcept {   // dependent: only publication types with element_type
+        // (the real policies) instantiate it; a bench's bump policy need not provide one
         const std::size_t idx = find_(sessionId);
         if (idx == kNone) return nullptr;
         auto* r = std::get_if<PubReady>(&states_[idx]);
@@ -337,7 +356,7 @@ public:
     template <class F>
     void forEachBoundImage(F&& f) const {
         for (std::size_t i = 0; i < kMaxSessions; ++i)
-            if (keys_[i] != 0 && boundImage_[i] != 0 && !std::holds_alternative<PubFailed>(states_[i]))
+            if (keys_[i] != 0 && isBound_(boundImage_[i]) && !std::holds_alternative<PubFailed>(states_[i]))
                 f(static_cast<int32_t>(static_cast<uint32_t>(boundImage_[i])));
     }
 
@@ -674,9 +693,10 @@ private:
         uint32_t mine = 0;
         if (idx != kNone) [[likely]] {
             if constexpr (kCheckImage) {
+                // I5: ONE load + compare.  0 = plain (admit); kAwaitingBind = awaiting its bind (never equals an
+                // image key: dropped); else the bound image's key.
                 const int64_t bound = boundImage_[idx];
-                if (bound != 0 ? bound != imageKey_(imageSessionId)
-                               : std::holds_alternative<PubAwaitingBind>(states_[idx])) [[unlikely]] {
+                if (bound != 0 && bound != imageKey_(imageSessionId)) [[unlikely]] {
                     ++directDroppedSpoofed_;
                     return kDirectDropSpoofed;
                 }
@@ -852,6 +872,8 @@ private:
     static constexpr int64_t imageKey_(int32_t imageSessionId) noexcept {
         return (int64_t{1} << 32) | static_cast<int64_t>(static_cast<uint32_t>(imageSessionId));
     }
+    static_assert(kAwaitingBind != 0 && imageKey_(0) > 0 && imageKey_(-1) > 0 && imageKey_(INT32_MIN) > 0,
+                  "an image key (bit 32 set, bits 33+ clear) is positive: never 0 and never kAwaitingBind");
     static std::size_t hash_(int64_t sid) noexcept {
         return static_cast<std::size_t>((static_cast<uint64_t>(sid) * 0x9E3779B97F4A7C15ULL) >> (64 - kBits));
     }

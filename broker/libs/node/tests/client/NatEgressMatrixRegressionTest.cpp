@@ -286,6 +286,13 @@ uint64_t bindsAccepted(BrokerNode& n) {
 uint64_t spoofed(BrokerNode& n) {
     return n.onWorkerThreadForTest(0, [](Worker& w) { return w.spoofedIngressDroppedForTest(); });
 }
+// I7: Records frames this node's workers delivered on a response publication (session-egress subscriptions).
+uint64_t responseEgressFrames(BrokerNode& n) {
+    uint64_t sum = 0;
+    for (int32_t w = 0; w < n.workerCountForTest(); ++w)
+        sum += n.onWorkerThreadForTest(w, [](Worker& wk) { return wk.responseEgressFramesForTest(); });
+    return sum;
+}
 bool responsePubReady(BrokerNode& n, int64_t sid) {
     return n.onWorkerThreadForTest(0, [sid](Worker& w) { return w.responsePubReadyForTest(sid); });
 }
@@ -430,12 +437,17 @@ TEST(NatEgressMatrixRegression, NewClientEveryOperationOverResponsePathOneNodeRe
     cfg.pingTimeoutMs    = 30'000;
     std::unique_ptr<rc::Client> client;
     everyOperation(client, cfg, spec, "scratch", "n1", [](rc::Client& cl, rc::Client& gcl) {
+        // I7: a response-path client never adds the declared MDC egress subscription, so the broker cannot deliver
+        // to it that way (this is what makes the NAT test mean something).
+        EXPECT_EQ(cl.testMdcEgressSubscriptions(), 0u) << "a response-path client added an MDC egress subscription";
+        EXPECT_EQ(gcl.testMdcEgressSubscriptions(), 0u);
         EXPECT_TRUE(cl.testSeedResponseCorrelated()) << "the seed session is response-correlated";
         EXPECT_TRUE(gcl.testSeedResponseCorrelated()) << "the group client's seed session is response-correlated";
     });
     ASSERT_NE(client, nullptr);
     EXPECT_GE(bindsAccepted(b.node()), 1u) << "the worker accepted the client's WorkerBind";
     EXPECT_EQ(spoofed(b.node()), 0u);
+    EXPECT_GT(responseEgressFrames(b.node()), 0u) << "Records reached the client on the worker's RESPONSE publication";
 }
 
 // =================================================================================================================
@@ -454,6 +466,8 @@ TEST(NatEgressMatrixRegression, NewClientEveryOperationOverResponsePathThreeNode
 
     std::unique_ptr<rc::Client> client;
     everyOperation(client, natClient(c, 1, r), spec, "scratch", "n3", [&](rc::Client& cl, rc::Client& gcl) {
+        EXPECT_EQ(cl.testMdcEgressSubscriptions(), 0u) << "I7: no declared MDC egress subscription on the response path";
+        EXPECT_EQ(gcl.testMdcEgressSubscriptions(), 0u);
         EXPECT_TRUE(cl.testSeedResponseCorrelated());
         EXPECT_TRUE(gcl.testSeedResponseCorrelated());
         // The gateway response port of every node was learnt (Metadata brokers entries / the seed's own config).
@@ -468,6 +482,9 @@ TEST(NatEgressMatrixRegression, NewClientEveryOperationOverResponsePathThreeNode
     for (int id : std::set<int32_t>(leaders.begin(), leaders.end()))
         EXPECT_GE(bindsAccepted(c.node(id)), 1u) << "leader " << id << "'s worker never accepted a bind";
     for (int id = 1; id <= 3; ++id) EXPECT_EQ(spoofed(c.node(id)), 0u);
+    uint64_t respFrames = 0;
+    for (int id = 1; id <= 3; ++id) respFrames += responseEgressFrames(c.node(id));
+    EXPECT_GT(respFrames, 0u) << "I7: Records reached the client on the workers' RESPONSE publications";
 }
 
 // =================================================================================================================

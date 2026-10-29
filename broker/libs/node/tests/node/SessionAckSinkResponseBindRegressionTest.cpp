@@ -286,3 +286,84 @@ TEST(SessionAckSinkResponseBindRegression, PoolExhaustedBindStillRegistersThePub
     for (int i = 0; i < 4; ++i) pass(r.s);
     for (int64_t sid = 1; sid <= kN; ++sid) EXPECT_NE(r.s.readyPub(sid), nullptr) << sid;
 }
+
+// ---- fix round 1a: I4 / I5 ----------------------------------------------------------------------------------
+
+namespace {
+constexpr int64_t kPlain = 50;
+}
+
+// I4: the bind's authorization half is allocation-free and side-effect-free; a refused bind leaves everything as it was.
+TEST(SessionAckSinkRegression, BadTokenBindDoesNoWorkRegression) {
+    Rig r;
+    ASSERT_TRUE(r.s.announceResponse(kSid, tok(), kStream));
+    ASSERT_TRUE(r.s.announce(kPlain, "aeron:udp?endpoint=127.0.0.1:1", 7));
+    const std::size_t freeBefore = r.s.freeChannelSlotsForTest();
+
+    EXPECT_EQ(r.s.checkBind(kSid, tokLastByteOff()), BR::BadToken);
+    EXPECT_EQ(r.s.checkBind(kSid, tokFirstByteOff()), BR::BadToken);
+    EXPECT_EQ(r.s.checkBind(kSid, std::array<uint8_t, 16>{}), BR::BadToken);
+    EXPECT_EQ(r.s.checkBind(kSid + 1, tok()), BR::UnknownSession);
+    EXPECT_EQ(r.s.checkBind(kPlain, tok()), BR::NotAwaiting) << "a plain (non response-mode) session cannot bind";
+    // No side effect: still awaiting, no channel slot taken, no publication added, not bound.
+    EXPECT_EQ(kindOf(r.s, kSid), Kind::Await);
+    EXPECT_EQ(r.s.freeChannelSlotsForTest(), freeBefore);
+    pass(r.s);
+    EXPECT_TRUE(r.st->added.size() <= 1u) << "only the plain session's own publication";
+    EXPECT_FALSE(r.s.boundImage(kSid).has_value());
+
+    // The eligible check agrees with bind() and itself changes nothing.
+    EXPECT_EQ(r.s.checkBind(kSid, tok()), BR::Bound);
+    EXPECT_EQ(kindOf(r.s, kSid), Kind::Await);
+    EXPECT_EQ(r.s.bind(kSid, tokLastByteOff(), kImage, kRespChan), BR::BadToken) << "bind() still re-checks (defence)";
+    EXPECT_EQ(r.s.bind(kSid, tok(), kImage, kRespChan), BR::Bound);
+    EXPECT_EQ(r.s.checkBind(kSid, tok()), BR::NotAwaiting) << "a bound session never binds again";
+}
+
+// I5: ONE word decides admission: awaiting -> every image dropped; bound -> only its image; plain -> admitted.
+TEST(SessionAckSinkRegression, AwaitingBindDropsEveryImageWithOneLoadRegression) {
+    Rig r;
+    ASSERT_TRUE(r.s.announceResponse(kSid, tok(), kStream));
+    for (int32_t img : {0, kImage, kOther, -1, INT32_MIN, INT32_MAX}) {
+        const auto tag = r.s.admitDirect(kSid, img);
+        EXPECT_EQ(tag, Sink::kDirectDropSpoofed) << "awaiting its bind: image " << img;
+    }
+    EXPECT_EQ(r.s.directDroppedSpoofedForTest(), 6u);
+    EXPECT_FALSE(r.s.boundImage(kSid).has_value()) << "awaiting is NOT bound";
+    std::vector<int32_t> seen;
+    r.s.forEachBoundImage([&](int32_t i) { seen.push_back(i); });
+    EXPECT_TRUE(seen.empty()) << "forEachBoundImage skips an awaiting session";
+    EXPECT_EQ(r.s.unbindImage(0), 0) << "no image can unbind an awaiting session";
+
+    ASSERT_EQ(r.s.bind(kSid, tok(), kImage, kRespChan), BR::Bound);
+    EXPECT_EQ(r.s.admitDirect(kSid, kOther), Sink::kDirectDropSpoofed);
+    EXPECT_EQ(r.s.admitDirect(kSid, 0), Sink::kDirectDropSpoofed);
+    const auto ok = r.s.admitDirect(kSid, kImage);
+    EXPECT_TRUE(ok == Sink::kDirectCounted || ok == Sink::kDirectTotalOnly) << static_cast<int>(ok);
+    EXPECT_EQ(r.s.boundImage(kSid), kImage);
+
+    // A bound image that happens to be 0 / negative is still a real image key (never the awaiting marker).
+    for (int32_t img : {0, -1, INT32_MIN}) {
+        Rig q;
+        ASSERT_TRUE(q.s.announceResponse(kSid, tok(), kStream));
+        ASSERT_EQ(q.s.bind(kSid, tok(), img, kRespChan), BR::Bound);
+        EXPECT_EQ(q.s.boundImage(kSid), img);
+        EXPECT_NE(q.s.admitDirect(kSid, img), Sink::kDirectDropSpoofed) << img;
+        EXPECT_EQ(q.s.admitDirect(kSid, img + 1), Sink::kDirectDropSpoofed) << img;
+    }
+
+    // Plain sessions are admitted from any image (a legacy client's frames carry no image meaning).
+    ASSERT_TRUE(r.s.announce(kPlain, "aeron:udp?endpoint=127.0.0.1:1", 7));
+    for (int32_t img : {0, kImage, kOther, INT32_MIN}) {
+        const auto tag = r.s.admitDirect(kPlain, img);
+        EXPECT_NE(tag, Sink::kDirectDropSpoofed) << img;
+        EXPECT_NE(tag, Sink::kDirectRefused) << img;
+    }
+    // A re-announce as plain / response resets and restores the right word.
+    ASSERT_TRUE(r.s.announce(kSid, "aeron:udp?endpoint=127.0.0.1:1", 7));
+    EXPECT_NE(r.s.admitDirect(kSid, kOther), Sink::kDirectDropSpoofed) << "plain again";
+    ASSERT_TRUE(r.s.announce(kSid + 2, "aeron:udp?endpoint=127.0.0.1:1", 7));
+    r.s.close(kSid + 2);
+    ASSERT_TRUE(r.s.announceResponse(kSid + 2, tok(), kStream));
+    EXPECT_EQ(r.s.admitDirect(kSid + 2, kImage), Sink::kDirectDropSpoofed) << "reused slot: awaiting again";
+}

@@ -716,6 +716,7 @@ public:
     // NAT-safe egress (Task 7) observers / seams.
     [[nodiscard]] uint64_t    testWorkerBindsSent() const noexcept { return agent_.workerBindsSent(); }
     [[nodiscard]] std::size_t testWorkerBindCount() const noexcept { return agent_.workerBindCount(); }
+    [[nodiscard]] uint64_t    testMdcEgressSubscriptions() const noexcept { return agent_.mdcEgressSubscriptionsAdded(); }
     [[nodiscard]] bool        testSeedResponseCorrelated() const noexcept { return agent_.seedResponseCorrelated(); }
     [[nodiscard]] uint64_t    testHeldOffers() const noexcept { return agent_.heldOffers(); }
     void testHoldWorkerBinds(bool hold) noexcept { agent_.testHoldWorkerBinds(hold); }
