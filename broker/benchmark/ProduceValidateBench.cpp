@@ -20,6 +20,9 @@
 // The cited code path: Worker::executeProduceWire_ (Worker.h) — the
 // `auto it = validators_.find(topicId)` branch added by Task 7.
 //
+// Checked writes Part 02 adds BM_CheckedWriteHook/*: the typed-batch check alone (the <= 1 us p50 budget gate) and the
+// whole produce path for an untyped topic, a typed topic below the feature level and a typed topic at it.
+//
 // Uses a disk-backed Log + PartitionReplica (same pattern as
 // WorkerProduceLatencyBench.cpp / AsyncDurabilityTest.cpp).
 // No Aeron media driver needed.
@@ -29,6 +32,8 @@
 
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/WriteState.h>
+#include "BenchGate.h"
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
@@ -36,7 +41,9 @@
 #include <rune/codec/Serialize.h>
 #include <rune/codec/Validator.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -215,7 +222,27 @@ static void SetupOn(const benchmark::State&) {
     schemaOp.clientVersion    = 1;
     schemaOp.schemaUpdateBlob = makeCharactersBlob();
     g_fix->worker->tryEnqueueOp(std::move(schemaOp));
+    // Checked writes: the topic's write spec makes the partition validate (a keyless, legacy-validating topic).
+    rune::node::TopicWriteSpecWire spec;
+    spec.topicId = kTopicId;
+    spec.legacyValidate = true;
+    WorkerOp specOp;
+    specOp.type = WorkerOp::Type::WriteSpecUpdate;
+    specOp.topicId = kTopicId;
+    specOp.schemaUpdateBlob.resize(rune::node::kTopicWriteSpecWireLen);
+    rune::node::encodeTopicWriteSpec(spec, specOp.schemaUpdateBlob);
+    g_fix->worker->tryEnqueueOp(std::move(specOp));
     // Drive doWork to apply the SchemaUpdate before the timed loop.
+    g_fix->worker->doWork(1);
+}
+
+// The same, at the checked feature level: every typed topic validates fully.
+static void SetupChecked(const benchmark::State& s) {
+    SetupOn(s);
+    WorkerOp lvl;
+    lvl.type = WorkerOp::Type::ClusterFeatureLevel;
+    lvl.nextOffset = rune::replication::MetadataFeature::kCheckedWrites;
+    g_fix->worker->tryEnqueueOp(std::move(lvl));
     g_fix->worker->doWork(1);
 }
 
@@ -224,17 +251,13 @@ static void Teardown(const benchmark::State&) {
 }
 
 // ---------------------------------------------------------------------------
-// BM_ProduceValidate_Off — validate OFF (no validator, fast-path single branch).
-// Cited code path: Worker::executeProduceWire_ (Worker.h) — the
-//   `auto it = validators_.find(topicId)` branch added by Task 7.
+// The produce loop every full-path benchmark below runs: tryEnqueueOp → doWork → drainReturn of one single-record batch.
 // ---------------------------------------------------------------------------
-static void BM_ProduceValidate_Off(benchmark::State& state) {
+static void produceLoop(benchmark::State& state) {
     int64_t nowNs = 2;
     int64_t corr  = 0;
 
     for (auto _ : state) {
-        // Prepare the op (outside the timed section conceptually, but we include
-        // the enqueue to measure the full tryEnqueueOp → doWork → drain path).
         WorkerOp op;
         op.type             = WorkerOp::Type::Produce;
         op.topicId          = kTopicId;
@@ -265,45 +288,83 @@ static void BM_ProduceValidate_Off(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
 }
 
+// BM_ProduceValidate_Off — no write state (an untyped topic).
+static void BM_ProduceValidate_Off(benchmark::State& state) { produceLoop(state); }
+
+// BM_ProduceValidate_On — a validated topic: checkTypedBatch walks the batch (Worker::produceCore_).
+static void BM_ProduceValidate_On(benchmark::State& state) { produceLoop(state); }
+
 // ---------------------------------------------------------------------------
-// BM_ProduceValidate_On — validate ON (Validator installed for kTopicId).
-// Cited code path: Worker::executeProduceWire_ — validators_.find() hits the
-//   Validator, calls v.validate(span<const uint8_t>(val.data(), val.size())),
-//   then falls through to appendNoSyncRestamp on success.
+// BM_CheckedWriteHook — checked writes Part 02.
+//   CheckOnly1Record / CheckOnly64Records: checkTypedBatch alone on a valid keyed batch at the checked level.  The
+//     one-record p50 is a hard budget gate (spec §14: new typed-topic validation <= 1 us per one-record batch).
+//   UntypedPath / TypedLegacyPath / TypedCheckedPath: the whole produce path; their deltas are the cost of the write
+//     state's branch and of full validation.
 // ---------------------------------------------------------------------------
-static void BM_ProduceValidate_On(benchmark::State& state) {
-    int64_t nowNs = 2;
-    int64_t corr  = 0;
-
-    for (auto _ : state) {
-        WorkerOp op;
-        op.type             = WorkerOp::Type::Produce;
-        op.topicId          = kTopicId;
-        op.partition        = kPartition;
-        op.replica          = g_fix->replica.get();
-        op.logPtr           = nullptr; // disk-backed replica: getLogFromWire_ uses replica->log()
-        op.sessionId        = 1;
-        op.correlationId    = ++corr;
-        op.lastOffsetDelta  = 0;
-        op.recordCount      = 1;
-        op.durabilityTier   = 0;
-        op.recordBatchView  = std::span<const uint8_t>(g_fix->batchBytes.data(),
-                                                        g_fix->batchBytes.size());
-
-        while (!g_fix->worker->tryEnqueueOp(op)) {
-            g_fix->worker->doWork(nowNs++);
-        }
-
-        bool acked = false;
-        for (int i = 0; i < 10'000 && !acked; ++i) {
-            g_fix->worker->doWork(nowNs++);
-            g_fix->worker->drainReturn([&](WorkerReturn&&) { acked = true; });
-        }
-        benchmark::DoNotOptimize(acked);
-    }
-
-    state.SetItemsProcessed(state.iterations());
+static rune::node::TopicWriteSpec makeCheckSpec() {
+    rune::node::TopicWriteSpec spec;
+    const auto desc = DescriptorBuilder("characters")
+        .add("id",   PrimType::Int64)
+        .add("type", PrimType::Enum, 1, false, {0, 1, 2})
+        .add("name", PrimType::String)
+        .build();
+    spec.installVersion(1, desc);
+    rune::node::TopicWriteSpecWire facts;
+    facts.topicId = kTopicId;
+    facts.keyFieldId = desc.find("id")->id;
+    facts.keyType = PrimType::Int64;
+    facts.keyWidth = 8;
+    facts.legacyValidate = true;
+    spec.setFacts(facts);
+    return spec;
 }
+
+static std::vector<uint8_t> makeKeyedBatch(int records) {
+    const auto value = makeValidValue();   // id = 1
+    const char key[8] = {1, 0, 0, 0, 0, 0, 0, 0};   // the key field's bytes
+    RecordBatchBuilder b(0, 1000);
+    for (int i = 0; i < records; ++i)
+        b.append(std::string_view(key, 8), std::string_view(reinterpret_cast<const char*>(value.data()), value.size()), 1000);
+    return b.build();
+}
+
+static void BM_CheckedWriteHook_CheckOnly1Record(benchmark::State& state) {
+    const auto spec  = makeCheckSpec();
+    const auto batch = makeKeyedBatch(1);
+    constexpr int kCalls = 1000;
+    std::vector<double> ns(kCalls);
+    for (auto _ : state) {
+        for (int i = 0; i < kCalls; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto verdict = rune::node::checkTypedBatch(spec, batch, rune::replication::MetadataFeature::kCheckedWrites);
+            const auto t1 = std::chrono::steady_clock::now();
+            benchmark::DoNotOptimize(verdict);
+            ns[static_cast<std::size_t>(i)] = std::chrono::duration<double, std::nano>(t1 - t0).count();
+        }
+    }
+    std::sort(ns.begin(), ns.end());
+    const double p50 = ns[kCalls / 2], p99 = ns[kCalls * 99 / 100];
+    state.counters["p50_ns"] = p50;
+    state.counters["p99_ns"] = p99;
+    rune::bench::gateCheck(state, p50 <= 1000.0, "p50_ns > 1000 (spec 14: new validation <= 1 us p50 per one-record batch)");
+    state.SetItemsProcessed(state.iterations() * kCalls);
+}
+
+static void BM_CheckedWriteHook_CheckOnly64Records(benchmark::State& state) {
+    const auto spec  = makeCheckSpec();
+    const auto batch = makeKeyedBatch(64);
+    for (auto _ : state) {
+        const auto verdict = rune::node::checkTypedBatch(spec, batch, rune::replication::MetadataFeature::kCheckedWrites);
+        benchmark::DoNotOptimize(verdict);
+    }
+    state.counters["ns_per_record"] = benchmark::Counter(static_cast<double>(state.iterations()) * 64.0,
+                                                         benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
+    state.SetItemsProcessed(state.iterations() * 64);
+}
+
+static void BM_CheckedWriteHook_UntypedPath(benchmark::State& state) { produceLoop(state); }
+static void BM_CheckedWriteHook_TypedLegacyPath(benchmark::State& state) { produceLoop(state); }
+static void BM_CheckedWriteHook_TypedCheckedPath(benchmark::State& state) { produceLoop(state); }
 
 // ---------------------------------------------------------------------------
 // Sequential A/B registration (n=15 repetitions each).
@@ -328,5 +389,22 @@ BENCHMARK(BM_ProduceValidate_On)
     ->Repetitions(15)
     ->ReportAggregatesOnly(false)
     ->Unit(benchmark::kNanosecond);
+
+BENCHMARK(BM_CheckedWriteHook_CheckOnly1Record)
+    ->Name("BM_CheckedWriteHook/CheckOnly1Record")
+    ->Repetitions(15)
+    ->Unit(benchmark::kNanosecond);
+BENCHMARK(BM_CheckedWriteHook_CheckOnly64Records)
+    ->Name("BM_CheckedWriteHook/CheckOnly64Records")
+    ->Unit(benchmark::kNanosecond);
+BENCHMARK(BM_CheckedWriteHook_UntypedPath)
+    ->Name("BM_CheckedWriteHook/UntypedPath")
+    ->Setup(SetupOff)->Teardown(Teardown)->Repetitions(15)->ReportAggregatesOnly(false)->Unit(benchmark::kNanosecond);
+BENCHMARK(BM_CheckedWriteHook_TypedLegacyPath)
+    ->Name("BM_CheckedWriteHook/TypedLegacyPath")
+    ->Setup(SetupOn)->Teardown(Teardown)->Repetitions(15)->ReportAggregatesOnly(false)->Unit(benchmark::kNanosecond);
+BENCHMARK(BM_CheckedWriteHook_TypedCheckedPath)
+    ->Name("BM_CheckedWriteHook/TypedCheckedPath")
+    ->Setup(SetupChecked)->Teardown(Teardown)->Repetitions(15)->ReportAggregatesOnly(false)->Unit(benchmark::kNanosecond);
 
 } // namespace
