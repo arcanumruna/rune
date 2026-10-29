@@ -102,8 +102,10 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 
 namespace rune::node {
@@ -206,7 +208,12 @@ public:
     struct PubReady     { PubHandle pub{}; uint64_t blockedPass = 0; };
     /// reported == false: the runtime has not yet been told (reportFailures).
     struct PubFailed    { bool reported = true; };
-    using PubState = std::variant<PubAnnounced, PubResolving, PubReady, PubFailed>;
+    /// NAT-safe egress (Task 6): a response-mode session waits here for its client's WorkerBind.  No channel yet:
+    /// the response publication is added once the bind names the client's ingress image.  Acks are HELD like a
+    /// Resolving session's.  `token` is the gateway-issued 16 B secret (constant-time compare in bind()).
+    struct PubAwaitingBind { std::array<uint8_t, 16> token{}; int32_t streamId = 0; };
+    using PubState = std::variant<PubAnnounced, PubResolving, PubReady, PubFailed, PubAwaitingBind>;
+    enum class BindResult : uint8_t { Bound, UnknownSession, BadToken, NotAwaiting };
 
     explicit SessionAckSinkT(PubPolicy policy) noexcept : policy_(std::move(policy)) {
         for (std::size_t i = 0; i < kMaxChannelSlots; ++i) freeChan_[i] = static_cast<uint16_t>(i);
@@ -234,6 +241,7 @@ public:
         if (idx == kNone) return false;                                   // table full
         if (fresh) grants_[idx].table = grantAll ? allowAllWriteTable() : denyWriteTable();
         clientVersion_[idx] = clientVersion;
+        boundImage_[idx] = 0;                                              // Task 6: a plain announce is never response-mode
         PubState& st = states_[idx];
         if (edges_[idx].lost) { edges_[idx].lost = 0; markDirty_(idx); }   // a fresh publication: not lost (yet)
         // m3: an Announced / Resolving session is already in unresolved_.
@@ -250,6 +258,89 @@ public:
         }
         if (!listed && !std::holds_alternative<PubFailed>(st)) unresolved_[unresolvedCount_++] = sessionId;
         return true;
+    }
+
+    /// NAT-safe egress (Task 6, cold): announce a RESPONSE-MODE session.  Like announce(), but no channel and no
+    /// channel slot: the session enters PubAwaitingBind and is NOT listed in unresolved_ (nothing to add yet).
+    /// Idempotent for the second (crypto-key) announce wave: a session already awaiting its bind keeps its state
+    /// (token refreshed), and one already BOUND keeps its publication and image — a late wave must never undo a bind.
+    bool announceResponse(int64_t sessionId, const std::array<uint8_t, 16>& token, int32_t streamId,
+                          int32_t clientVersion = 0, bool grantAll = false) noexcept {
+        if (sessionId <= 0) return false;
+        std::size_t idx = find_(sessionId);
+        const bool fresh = (idx == kNone);
+        if (fresh) idx = insert_(sessionId);
+        if (idx == kNone) return false;                                   // table full
+        if (fresh) grants_[idx].table = grantAll ? allowAllWriteTable() : denyWriteTable();
+        clientVersion_[idx] = clientVersion;
+        PubState& st = states_[idx];
+        if (!fresh) {
+            if (auto* w = std::get_if<PubAwaitingBind>(&st)) { w->token = token; w->streamId = streamId; return true; }
+            if (boundImage_[idx] != 0 && !std::holds_alternative<PubFailed>(st)) return true;   // bound: keep it
+        }
+        if (edges_[idx].lost) { edges_[idx].lost = 0; markDirty_(idx); }
+        leaveState_(st);
+        boundImage_[idx] = 0;
+        st = PubAwaitingBind{token, streamId};
+        return true;
+    }
+
+    /// NAT-safe egress (Task 6, cold): the client's WorkerBind named `imageSessionId` (the Aeron session id of ITS
+    /// ingress image) and proved the token.  Bound: the response publication is added on `responseChannel` (copied,
+    /// exactly like announce) and the session is pinned to that image.  Only PubAwaitingBind can bind: a second bind —
+    /// even with the right token — never rebinds (a changed NAT mapping ends the session, spec D2).
+    BindResult bind(int64_t sessionId, const std::array<uint8_t, 16>& token, int32_t imageSessionId,
+                    std::string_view responseChannel) noexcept {
+        const std::size_t idx = find_(sessionId);
+        if (idx == kNone) return BindResult::UnknownSession;
+        PubState& st = states_[idx];
+        auto* w = std::get_if<PubAwaitingBind>(&st);
+        if (!w) return BindResult::NotAwaiting;
+        uint8_t diff = 0;                                            // constant-time: fold every byte
+        for (std::size_t i = 0; i < token.size(); ++i) diff = static_cast<uint8_t>(diff | (w->token[i] ^ token[i]));
+        if (diff != 0) return BindResult::BadToken;
+        if (responseChannel.size() > kMaxChannelBytes) return BindResult::BadToken;   // unreachable: the worker builds it
+        const int32_t streamId = w->streamId;
+        if (freeChanCount_ > 0) [[likely]] {
+            const uint16_t c = freeChan_[--freeChanCount_];
+            std::memcpy(chanPool_[c].data(), responseChannel.data(), responseChannel.size());
+            st = PubAnnounced{c, static_cast<uint16_t>(responseChannel.size()), streamId};
+        } else {
+            addNow_(st, responseChannel, streamId);
+        }
+        boundImage_[idx] = imageSessionId;
+        if (!std::holds_alternative<PubFailed>(st)) unresolved_[unresolvedCount_++] = sessionId;
+        return BindResult::Bound;
+    }
+
+    /// The Aeron session id of the ingress image `sessionId` is bound to (nullopt: not response-mode / not bound).
+    [[nodiscard]] std::optional<int32_t> boundImage(int64_t sessionId) const noexcept {
+        const std::size_t idx = find_(sessionId);
+        if (idx == kNone || boundImage_[idx] == 0) return std::nullopt;
+        return boundImage_[idx];
+    }
+
+    /// The session's Ready publication (null otherwise).  Zero allocation; the pointer is valid until the next call
+    /// that can release the publication (close, unbindImage, announce) — callers look it up per pass.
+    [[nodiscard]] typename PubHandle::element_type* readyPub(int64_t sessionId) noexcept {
+        const std::size_t idx = find_(sessionId);
+        if (idx == kNone) return nullptr;
+        auto* r = std::get_if<PubReady>(&states_[idx]);
+        return r ? r->pub.get() : nullptr;
+    }
+
+    /// The client ingress image `imageSessionId` went away (Aeron unavailable-image): every session bound to it can
+    /// never be answered again -> Failed(reported = false), so the runtime closes it (cold, linear scan).
+    int unbindImage(int32_t imageSessionId) noexcept {
+        int n = 0;
+        for (std::size_t i = 0; i < kMaxSessions; ++i) {
+            if (keys_[i] == 0 || boundImage_[i] != imageSessionId) continue;
+            PubState& st = states_[i];
+            if (std::holds_alternative<PubFailed>(st)) continue;                       // already gone
+            fail_(st);
+            ++n;
+        }
+        return n;
     }
 
     /// Runtime close (Disconnect / reap / connect timeout / SessionFailed):
@@ -415,6 +506,8 @@ private:
                 ++dropped_;                                          // reported → the runtime closes it
                 continue;
             }
+            // Announced / Resolving / AwaitingBind (Task 6: awaiting the client's WorkerBind) and a Ready
+            // publication that refused the claim: the ack is HELD, in order.
             if (heldPass_[idx] != pass_) {                           // first held ack of this session
                 heldPass_[idx] = pass_;
                 heldNow_[heldNowCount_++] = a.sessionId;
@@ -739,7 +832,7 @@ private:
         while (keys_[i] != 0) i = (i + 1) & kMask;
         keys_[i] = sid;
         states_[i] = PubFailed{};                                    // neutral (reported) placeholder
-        heldPass_[i] = 0; edges_[i] = Edges{}; clientVersion_[i] = 0;
+        heldPass_[i] = 0; edges_[i] = Edges{}; clientVersion_[i] = 0; boundImage_[i] = 0;
         resetGrants_(grants_[i]);
         ++count_;
         return i;
@@ -752,7 +845,7 @@ private:
         }
         keys_[i] = 0;
         states_[i] = PubFailed{};                                    // releases a Ready publication
-        heldPass_[i] = 0; edges_[i] = Edges{}; clientVersion_[i] = 0;
+        heldPass_[i] = 0; edges_[i] = Edges{}; clientVersion_[i] = 0; boundImage_[i] = 0;
         resetGrants_(grants_[i]);
         --count_;
         std::size_t j = i;
@@ -767,10 +860,11 @@ private:
             heldPass_[i] = heldPass_[j];
             edges_[i] = edges_[j];
             clientVersion_[i] = clientVersion_[j];
+            boundImage_[i] = boundImage_[j];
             std::swap(grants_[i], grants_[j]);                       // the buffer travels with its key; j's old one is reset below
             keys_[j] = 0;
             states_[j] = PubFailed{};
-            heldPass_[j] = 0; edges_[j] = Edges{}; clientVersion_[j] = 0;
+            heldPass_[j] = 0; edges_[j] = Edges{}; clientVersion_[j] = 0; boundImage_[j] = 0;
             resetGrants_(grants_[j]);
             i = j;
         }
@@ -782,6 +876,7 @@ private:
             freeChan_[freeChanCount_++] = a->chan;
         else if (const auto* f = std::get_if<PubFailed>(&st); f && !f->reported)
             --unreported_;
+        else if (std::holds_alternative<PubAwaitingBind>(st)) { /* Task 6: no channel slot, not listed, nothing registered */ }
         else if (const auto* r = std::get_if<PubResolving>(&st)) {
             freeChanSlot_(r->chan);                                  // A10: the slot it kept for a re-add
             if (r->regId < 0) return;                                // a re-add was pending: nothing registered
@@ -1111,6 +1206,7 @@ private:
     static constexpr int         kTombBits  = std::countr_zero(kTombSlots);
     std::array<Edges, kMaxSessions>                                  edges_{};
     std::array<int32_t, kMaxSessions>                                clientVersion_{}; // D6: per session
+    std::array<int32_t, kMaxSessions>                                boundImage_{};    // Task 6: ingress image of a bound response-mode session (0 = none); moved like clientVersion_
     std::array<WriteGrantSlot, kMaxSessions>                         grants_{};        // authentication Task 13: moved with its key like clientVersion_
     std::unique_ptr<WritePermTable[]> permTables_ = std::make_unique<WritePermTable[]>(kMaxWritePermTables);   // #259: stable addresses
     std::array<int64_t, kMaxSessions>                                dirty_{};         // edges to report

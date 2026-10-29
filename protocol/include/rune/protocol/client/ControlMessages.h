@@ -1,5 +1,7 @@
 #pragma once
+#include <array>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -172,6 +174,55 @@ struct ConnectRequest {
 };
 
 // ---------------------------------------------------------------------------
+// WorkerBind  (templateId 86) — NAT-safe egress (client version 16), the FIRST frame (plaintext) a response-mode
+// client sends on its ingress publication to a shard worker.
+//
+//   [0..23]   MessageHeader (24 bytes)   blockLength = 16, templateId = 86,
+//                                        sessionId (bytes 8..15, where Produce carries it) = the connect's session,
+//                                        correlationId = the client's bind correlation
+//   [24..39]  token : 16 B               the bindToken of the ConnectResponse
+//
+// Total = 40 bytes.  The worker pins the session to the Aeron image the frame arrived on and answers on a response
+// publication correlated with it.  A wrong token, a repeated bind and an unknown session are dropped without a reply.
+// ---------------------------------------------------------------------------
+struct WorkerBind {
+    int64_t                 sessionId     = 0;
+    int64_t                 correlationId = 0;
+    std::array<uint8_t, 16> token{};
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::WorkerBind);   // 86
+    static constexpr uint16_t BODY_FIXED  = 16;
+    static constexpr std::size_t ENCODED_SIZE = MessageHeader::ENCODED_SIZE + BODY_FIXED;    // 40
+
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+        std::memcpy(buf + MessageHeader::ENCODED_SIZE, token.data(), token.size());
+        return ENCODED_SIZE;
+    }
+
+    static std::optional<WorkerBind> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        if (avail < ENCODED_SIZE) return std::nullopt;
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId != kSchemaId || hdr.templateId != TEMPLATE_ID) return std::nullopt;
+        if (hdr.blockLength < BODY_FIXED) return std::nullopt;
+        WorkerBind m;
+        m.sessionId     = hdr.sessionId;
+        m.correlationId = hdr.correlationId;
+        std::memcpy(m.token.data(), buf + MessageHeader::ENCODED_SIZE, m.token.size());
+        return m;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // ConnectResponse  (templateId 2)
 //
 // Frame layout (all little-endian):
@@ -207,6 +258,9 @@ struct ConnectRequest {
 //   [44]      authState    : uint8   (AuthState)
 //   [45..48]  handshakeBytes length : uint32 (ALWAYS present in a v9 frame, possibly 0)
 //   [49..]    handshakeBytes bytes
+// NAT-safe egress (client version 16) — BODY_FIXED_V16 = 37, written iff `v16` is set (implies the v9 fields):
+//   [45..60]  bindToken : 16 B  (all-zero = none).  A response-mode shard session's secret for its WorkerBind.
+// The handshake var bytes still sit at fixedBase + blockLength, so a pre-v16 decoder skips the token.
 // decode(): blockLength >= 21 reads authMode/authState; the handshake var bytes
 // always sit at fixedBase + blockLength.  A pre-v9 frame decodes as
 // authMode = InProcess, authState = Anonymous: a pre-v9 broker has no authentication.
@@ -228,16 +282,22 @@ struct ConnectResponse {
     AuthMode  authMode  = AuthMode::InProcess;
     AuthState authState = AuthState::Anonymous;
 
+    // v16 additive NAT-safe egress field (implies v9): the worker bind token of a response-mode shard session.
+    bool                    v16       = false;
+    std::array<uint8_t, 16> bindToken{};
+
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ConnectResponse); // 2
     static constexpr uint16_t BODY_FIXED    = 18;  // incl. brokerVersion (main)
     static constexpr uint16_t BODY_FIXED_V0 = 14;  // an older broker's body (no brokerVersion)
     static constexpr uint16_t BODY_FIXED_V4 = 19;  // + chosenCipher byte, AFTER brokerVersion
     static constexpr uint16_t BODY_FIXED_V9 = 21;  // + authMode, authState bytes, AFTER chosenCipher
+    static constexpr uint16_t BODY_FIXED_V16 = 37; // + 16 B bindToken, AFTER authState
 
     static constexpr std::size_t ENCODED_SIZE    = MessageHeader::ENCODED_SIZE + BODY_FIXED;     // 42
     static constexpr std::size_t ENCODED_SIZE_V0 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V0;  // 38
     static constexpr std::size_t ENCODED_SIZE_V4 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V4;  // 43
     static constexpr std::size_t ENCODED_SIZE_V9 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V9;  // 45
+    static constexpr std::size_t ENCODED_SIZE_V16 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V16; // 61
 
     /// Encode the full frame into buf. Returns ENCODED_SIZE (42) when no
     /// crypto was chosen — byte-identical to main's brokerVersion frame — or
@@ -245,9 +305,10 @@ struct ConnectResponse {
     /// cipher and/or has handshake bytes to send.
     std::size_t encode(uint8_t* buf) const noexcept {
         const bool chosenCrypto = (chosenCipher != 0) || !handshakeBytes.empty();
+        const bool withV9 = v9 || v16;
 
         MessageHeader hdr;
-        hdr.blockLength   = v9 ? BODY_FIXED_V9 : (chosenCrypto ? BODY_FIXED_V4 : BODY_FIXED);
+        hdr.blockLength   = v16 ? BODY_FIXED_V16 : (withV9 ? BODY_FIXED_V9 : (chosenCrypto ? BODY_FIXED_V4 : BODY_FIXED));
         hdr.templateId    = TEMPLATE_ID;
         hdr.schemaId      = kSchemaId;
         hdr.version       = kProtocolVersion;
@@ -261,14 +322,16 @@ struct ConnectResponse {
         detail::putLE64 (buf, fixedBase + 6, assignedSessionId);
         detail::putLE32 (buf, fixedBase + 14, brokerVersion);
 
-        if (!v9 && !chosenCrypto) return ENCODED_SIZE;
+        if (!withV9 && !chosenCrypto) return ENCODED_SIZE;
 
         buf[fixedBase + 18] = chosenCipher;  // @42, AFTER brokerVersion [14..17]
-        if (v9) {
+        if (withV9) {
             buf[fixedBase + 19] = static_cast<uint8_t>(authMode);
             buf[fixedBase + 20] = static_cast<uint8_t>(authState);
         }
-        std::size_t pos = static_cast<std::size_t>(fixedBase) + (v9 ? BODY_FIXED_V9 : BODY_FIXED_V4);
+        if (v16) std::memcpy(buf + fixedBase + 21, bindToken.data(), bindToken.size());
+        std::size_t pos = static_cast<std::size_t>(fixedBase) +
+                          (v16 ? BODY_FIXED_V16 : (withV9 ? BODY_FIXED_V9 : BODY_FIXED_V4));
         pos += putVarBytes32(buf + pos,
                              reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
                              static_cast<uint32_t>(handshakeBytes.size()));
@@ -313,6 +376,10 @@ struct ConnectResponse {
                 msg.v9        = true;
                 msg.authMode  = static_cast<AuthMode>(mode);
                 msg.authState = static_cast<AuthState>(state);
+                if (hdr.blockLength >= BODY_FIXED_V16) {
+                    msg.v16 = true;
+                    std::memcpy(msg.bindToken.data(), buf + fixedBase + 21, msg.bindToken.size());
+                }
             }
             std::size_t pos = static_cast<std::size_t>(fixedBase) + hdr.blockLength;
             const uint8_t* hbData = nullptr;

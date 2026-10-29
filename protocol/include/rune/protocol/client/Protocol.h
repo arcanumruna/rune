@@ -106,6 +106,8 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     ListNamespacesResponse  = 83,
     NamespaceUsage          = 84,
     NamespaceUsageResponse  = 85,
+    // NAT-safe egress (client version 16): the first frame of a response-mode client on a worker ingress publication
+    WorkerBind              = 86,
 };
 
 enum class ErrorCode : uint16_t {

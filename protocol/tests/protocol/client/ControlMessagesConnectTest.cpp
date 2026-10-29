@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/Dispatch.h>
 #include <array>
 #include <cstdint>
 #include <climits>
@@ -1094,4 +1095,116 @@ TEST(ConnectRequestResponseEgressRegression, EncodedSizeMatchesEncodeRegression)
                 for (std::size_t i = sz; i < sz + 16; ++i)
                     ASSERT_EQ(buf[i], 0xAB) << "guard overwritten v" << version << " crypto=" << crypto;
             }
+}
+
+// ---------------------------------------------------------------------------
+// NAT-safe egress Task 6 — ConnectResponse v16 tail (bindToken) and WorkerBind (86)
+// ---------------------------------------------------------------------------
+namespace {
+std::array<uint8_t, 16> tokenOf(uint8_t seed) {
+    std::array<uint8_t, 16> t{};
+    for (std::size_t i = 0; i < t.size(); ++i) t[i] = static_cast<uint8_t>(seed + i * 7);
+    return t;
+}
+}
+
+TEST(ConnectResponseBindTokenRegression, V16RoundTripCarriesTokenAndV9Fields) {
+    for (const bool crypto : {false, true}) {
+        rpc::ConnectResponse r;
+        r.sessionId = 5; r.correlationId = 6; r.assignedSessionId = 77; r.leaderMemberId = 2;
+        r.v9 = true; r.v16 = true;
+        r.authMode = rpc::AuthMode::Required; r.authState = rpc::AuthState::ResumedAuthenticated;
+        r.bindToken = tokenOf(3);
+        if (crypto) { r.chosenCipher = 1; r.handshakeBytes = "server-hello"; }
+        std::vector<uint8_t> buf(256, 0xCD);
+        const std::size_t n = r.encode(buf.data());
+        EXPECT_EQ(n, rpc::ConnectResponse::ENCODED_SIZE_V16 + 4u + (crypto ? 12u : 0u));
+        const auto d = rpc::ConnectResponse::decode(buf.data(), n);
+        ASSERT_TRUE(d.has_value());
+        EXPECT_TRUE(d->v16); EXPECT_TRUE(d->v9);
+        EXPECT_EQ(d->bindToken, tokenOf(3));
+        EXPECT_EQ(d->assignedSessionId, 77);
+        EXPECT_EQ(d->authMode, rpc::AuthMode::Required);
+        EXPECT_EQ(d->authState, rpc::AuthState::ResumedAuthenticated);
+        EXPECT_EQ(d->handshakeBytes, crypto ? std::string_view("server-hello") : std::string_view());
+        EXPECT_EQ(d->chosenCipher, crypto ? 1 : 0);
+    }
+}
+
+TEST(ConnectResponseBindTokenRegression, V16ImpliesV9AndPreV16FramesHaveNoToken) {
+    rpc::ConnectResponse r;
+    r.v16 = true;                      // v9 left false: the encoder still writes the v9 fields
+    r.bindToken = tokenOf(9);
+    std::vector<uint8_t> buf(128);
+    const std::size_t n = r.encode(buf.data());
+    const auto d = rpc::ConnectResponse::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_TRUE(d->v9);
+    EXPECT_TRUE(d->v16);
+    rpc::ConnectResponse old;
+    old.v9 = true;
+    const std::size_t m = old.encode(buf.data());
+    const auto o = rpc::ConnectResponse::decode(buf.data(), m);
+    ASSERT_TRUE(o.has_value());
+    EXPECT_FALSE(o->v16);
+    EXPECT_EQ(o->bindToken, (std::array<uint8_t, 16>{}));
+}
+
+TEST(ConnectResponseBindTokenRegression, PreV16RuleSkipsTheTokenByBlockLength) {
+    // A pre-v16 decoder reads the v9 fields, then the var data at fixedBase + blockLength: replay that rule by hand.
+    rpc::ConnectResponse r;
+    r.v9 = true; r.v16 = true; r.chosenCipher = 1; r.handshakeBytes = "hs-bytes";
+    r.authMode = rpc::AuthMode::Required; r.authState = rpc::AuthState::Anonymous;
+    r.bindToken = tokenOf(1);
+    std::vector<uint8_t> buf(128);
+    const std::size_t n = r.encode(buf.data());
+    const auto hdr = rpc::MessageHeader::decode(buf.data(), n);
+    ASSERT_TRUE(hdr.has_value());
+    EXPECT_EQ(hdr->blockLength, rpc::ConnectResponse::BODY_FIXED_V16);
+    std::size_t pos = rpc::MessageHeader::ENCODED_SIZE + hdr->blockLength;
+    const uint8_t* hb = nullptr; uint32_t hbLen = 0;
+    ASSERT_TRUE(rpc::getVarBytes32(buf.data(), n, pos, hb, hbLen));
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(hb), hbLen), "hs-bytes");
+    EXPECT_EQ(pos, n);
+}
+
+TEST(ConnectResponseBindTokenRegression, TruncatedV16FrameIsRejected) {
+    rpc::ConnectResponse r;
+    r.v9 = true; r.v16 = true; r.bindToken = tokenOf(2);
+    std::vector<uint8_t> buf(128);
+    const std::size_t n = r.encode(buf.data());
+    for (std::size_t cut = 0; cut < n; ++cut)
+        EXPECT_FALSE(rpc::ConnectResponse::decode(buf.data(), cut).has_value()) << "cut=" << cut;
+    EXPECT_TRUE(rpc::ConnectResponse::decode(buf.data(), n).has_value());
+}
+
+TEST(WorkerBindRegression, RoundTripAndEveryTruncationIsRefused) {
+    rpc::WorkerBind b;
+    b.sessionId = 0x1122334455667788; b.correlationId = 42; b.token = tokenOf(5);
+    std::array<uint8_t, 64> buf{};
+    const std::size_t n = b.encode(buf.data());
+    ASSERT_EQ(n, 40u);
+    EXPECT_EQ(rpc::WorkerBind::ENCODED_SIZE, 40u);
+    EXPECT_EQ(leU16(buf.data(), 2), 86u);
+    EXPECT_EQ(leS64(buf.data(), 8), b.sessionId) << "the session id sits where Produce carries it";
+    const auto d = rpc::WorkerBind::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->sessionId, b.sessionId);
+    EXPECT_EQ(d->correlationId, 42);
+    EXPECT_EQ(d->token, tokenOf(5));
+    for (std::size_t cut = 0; cut < 40; ++cut)
+        EXPECT_FALSE(rpc::WorkerBind::decode(buf.data(), cut).has_value()) << "cut=" << cut;
+    EXPECT_TRUE(rpc::isKnownTemplate(86));  // Dispatch.h
+}
+
+TEST(WorkerBindRegression, WrongTemplateOrSchemaOrShortBlockIsRefused) {
+    rpc::WorkerBind b; b.sessionId = 1; b.token = tokenOf(1);
+    std::array<uint8_t, 40> buf{};
+    b.encode(buf.data());
+    auto bad = buf; bad[2] = 87;          // template 87
+    EXPECT_FALSE(rpc::WorkerBind::decode(bad.data(), bad.size()).has_value());
+    bad = buf; bad[4] ^= 0x01;            // schema id
+    EXPECT_FALSE(rpc::WorkerBind::decode(bad.data(), bad.size()).has_value());
+    bad = buf; bad[0] = 8; bad[1] = 0;    // blockLength < 16
+    EXPECT_FALSE(rpc::WorkerBind::decode(bad.data(), bad.size()).has_value());
 }

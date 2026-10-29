@@ -29,7 +29,7 @@ TEST(AuthMessagesRegression, ErrorCodesAndTemplatesArePinned) {
     EXPECT_EQ(static_cast<int>(pc::AuthState::Anonymous), 2);
     for (uint16_t t : {12, 13, 14, 15, 79, 80}) EXPECT_TRUE(pc::isKnownTemplate(t)) << t;
     for (uint16_t t : {81, 82, 83}) EXPECT_TRUE(pc::isKnownTemplate(t)) << t;   // namespaces (client v14)
-    EXPECT_FALSE(pc::isKnownTemplate(86));
+    EXPECT_FALSE(pc::isKnownTemplate(87));
 }
 
 TEST(AuthMessagesRegression, EveryAuthFrameRoundTrips) {

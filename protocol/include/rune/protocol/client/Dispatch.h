@@ -114,6 +114,8 @@ struct FrameCheck {
         tid <= static_cast<uint16_t>(TemplateId::NamespaceUsageResponse)) {
         return true;
     }
+    // NAT-safe egress (client version 16): WorkerBind = 86 (87-95 gap -> UnknownTemplate)
+    if (tid == static_cast<uint16_t>(TemplateId::WorkerBind)) return true;
     return false;
 }
 

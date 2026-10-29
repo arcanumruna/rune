@@ -212,7 +212,7 @@ TEST(NamespaceMessagesRegression, TemplateDispatchRegression) {
         EXPECT_EQ(fc.status, pc::FrameStatus::Ok) << tid;
         EXPECT_EQ(fc.templateId, tid);
     }
-    for (const uint16_t tid : {uint16_t{86}, uint16_t{95}}) {
+    for (const uint16_t tid : {uint16_t{87}, uint16_t{95}}) {
         auto b = header(tid, 1, 2, 0);
         EXPECT_EQ(pc::checkFrame(b.data(), b.size()).status, pc::FrameStatus::UnknownTemplate) << tid;
     }
@@ -363,6 +363,6 @@ TEST(ThrottledRegression, RetryAfterRoundTripRegression) {
 TEST(DispatchRegression, Templates84And85RoutedRegression) {
     EXPECT_TRUE(pc::isKnownTemplate(84));
     EXPECT_TRUE(pc::isKnownTemplate(85));
-    EXPECT_FALSE(pc::isKnownTemplate(86));
+    EXPECT_FALSE(pc::isKnownTemplate(87));
     EXPECT_FALSE(pc::isKnownTemplate(95));
 }

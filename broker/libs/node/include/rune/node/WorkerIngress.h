@@ -40,6 +40,7 @@
 #include <concurrent/AtomicBuffer.h>
 #include <util/Index.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -79,7 +80,12 @@ public:
         // this ctor is noexcept, so it becomes a logged resolve failure.
         bool failed = false;
         try {
-            const int64_t regId = aeron_->addSubscription(channel_, streamId_);
+            // NAT-safe egress (Task 6): note every image that goes away.  The handler runs inside the conductor
+            // invoker -> on this worker's thread (shard clients use the invoker), so the ring below has ONE writer
+            // and ONE reader and needs no synchronisation.  Cold (an image ends), no allocation: a fixed ring.
+            const int64_t regId = aeron_->addSubscription(
+                channel_, streamId_, aeron::defaultOnAvailableImageHandler,
+                [this](aeron::Image& image) { noteUnavailable_(image.sessionId()); });
             sub_ = pump.resolve([&]() -> std::shared_ptr<aeron::Subscription> {
                 try {
                     return aeron_->findSubscription(regId);
@@ -177,7 +183,47 @@ public:
         return n;
     }
 
+    // -----------------------------------------------------------------------
+    // NAT-safe egress (Task 6) — image identity, cold.
+    // -----------------------------------------------------------------------
+    /// The Aeron correlation id of the live image with `aeronSessionId` (the id a response publication correlates
+    /// with: `response-correlation-id`); -1 when this subscription has no such image.
+    [[nodiscard]] int64_t imageCorrelationIdOf(int32_t aeronSessionId) const noexcept {
+        if (!sub_) return -1;
+        try {
+            const auto image = sub_->imageBySessionId(aeronSessionId);
+            return image ? image->correlationId() : -1;
+        } catch (...) { return -1; }
+    }
+    /// Hand every image that became unavailable since the last drain to `f(int32_t aeronSessionId)`.  On ring overflow
+    /// `f` is called for every id in `candidates` whose image no longer exists instead (the caller passes its bound
+    /// images), so a lost notification can never leave a session bound to a dead image.
+    /// Returns how many ids were handed out.  Zero cost when nothing happened (one compare).
+    template <class F, class Candidates>
+    int drainUnavailable(F&& f, Candidates&& candidates) {
+        if (unavailHead_ == unavailTail_ && !unavailOverflowed_) [[likely]] return 0;
+        int n = 0;
+        if (unavailOverflowed_) {
+            unavailOverflowed_ = false;
+            unavailHead_ = unavailTail_;                       // the ring is superseded by the scan below
+            candidates([&](int32_t id) { if (imageCorrelationIdOf(id) < 0) { f(id); ++n; } });
+            return n;
+        }
+        while (unavailHead_ != unavailTail_) {
+            f(unavailRing_[unavailHead_ % unavailRing_.size()]);
+            ++unavailHead_;
+            ++n;
+        }
+        return n;
+    }
+    [[nodiscard]] bool unavailableOverflowedForTest() const noexcept { return unavailOverflowed_; }
+
 private:
+    void noteUnavailable_(int32_t aeronSessionId) noexcept {
+        if (unavailTail_ - unavailHead_ == unavailRing_.size()) { unavailOverflowed_ = true; return; }
+        unavailRing_[unavailTail_ % unavailRing_.size()] = aeronSessionId;
+        ++unavailTail_;
+    }
     // Mirror the exact constants from ClientGateway.cpp:49-50.
 
     std::shared_ptr<aeron::Aeron>          aeron_;
@@ -189,6 +235,10 @@ private:
     rune::aeronutil::ImageLossWatch        imageWatch_;
     rune::aeronutil::ControlledFragmentAssembler controlledAssembler_;   // controlledPoll only
     rune::aeronutil::ImageLossWatch              controlledImageWatch_;
+
+    std::array<int32_t, 64>                unavailRing_{};      ///< Task 6: unavailable image session ids (single owner)
+    uint64_t                               unavailHead_ = 0, unavailTail_ = 0;
+    bool                                   unavailOverflowed_ = false;
 };
 
 } // namespace rune::node

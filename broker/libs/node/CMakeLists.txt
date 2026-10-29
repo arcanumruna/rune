@@ -138,7 +138,8 @@ if(BUILD_TESTING)
         "${RUNE_BROKER_DIR}/cmake/tsan-aeron.supp")
 
     # Task 13 (spec §3.4): worker-side ack sink + announce-before-accept (no driver).
-    add_executable(rune_session_ack_sink_tests tests/node/SessionAckSinkTest.cpp)
+    add_executable(rune_session_ack_sink_tests tests/node/SessionAckSinkTest.cpp
+                   tests/node/SessionAckSinkResponseBindRegressionTest.cpp)
     target_link_libraries(rune_session_ack_sink_tests PRIVATE rune_node GTest::gtest_main)
     gtest_discover_tests(rune_session_ack_sink_tests)
     add_executable(rune_session_announcer_tests tests/node/SessionAnnouncerTest.cpp tests/node/PeerLinkFanoutTest.cpp)
