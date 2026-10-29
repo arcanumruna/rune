@@ -23,6 +23,10 @@
 #include <iterator>
 #include <fcntl.h>
 #include <aeronmd/aeronmd.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <sys/param.h>
+#endif
 
 using namespace rune::node;
 namespace fs = std::filesystem;
@@ -99,9 +103,18 @@ TEST(EmbeddedDriver, InvokerModeRoundTripOnOneThreadOnly) {
 // the process thread count unchanged.
 TEST(EmbeddedDriverRegression, InvokerDriverStartsNoThreadRegression) {
     const auto threads = [] {
+#ifdef __APPLE__
+        thread_act_array_t list;
+        mach_msg_type_number_t n = 0;
+        EXPECT_EQ(task_threads(mach_task_self(), &list, &n), KERN_SUCCESS);
+        for (mach_msg_type_number_t i = 0; i < n; ++i) mach_port_deallocate(mach_task_self(), list[i]);
+        vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(list), n * sizeof(thread_t));
+        return static_cast<int>(n);
+#else
         int n = 0;
         for ([[maybe_unused]] const auto& e : fs::directory_iterator("/proc/self/task")) ++n;
         return n;
+#endif
     };
     TmpDir d;
     const int before = threads();
@@ -185,15 +198,22 @@ TEST(EmbeddedDriverRegression, ADirIsReusableAfterItsHolderIsDestroyedRegression
 
 // ---- #654 adversarial review: the dir lock's fd, its throw paths and its spellings ----
 namespace {
-/// The fds of this process open on `path` (via /proc/self/fd).
+/// The fds of this process open on `path`: /proc/self/fd on Linux, fcntl(F_GETPATH) over the fd table on macOS.
 std::vector<int> fdsOpenOn(const std::string& path) {
     std::vector<int> out;
     std::error_code ec;
+    const fs::path want = fs::weakly_canonical(path, ec);   // /var -> /private/var on macOS
+#ifdef __APPLE__
+    char buf[MAXPATHLEN];
+    for (int fd = 0, n = ::getdtablesize(); fd < n; ++fd)
+        if (::fcntl(fd, F_GETPATH, buf) == 0 && fs::path(buf) == want) out.push_back(fd);
+#else
     for (const auto& e : fs::directory_iterator("/proc/self/fd", ec)) {
         std::error_code lec;
         const fs::path target = fs::read_symlink(e.path(), lec);
-        if (!lec && target == fs::path(path)) out.push_back(std::stoi(e.path().filename().string()));
+        if (!lec && target == want) out.push_back(std::stoi(e.path().filename().string()));
     }
+#endif
     return out;
 }
 } // namespace
