@@ -481,6 +481,13 @@ uint32_t TransactionCoordinationService::abortAllForSession(int64_t sessionId, i
     return coordinator_.abortAllForSession(sessionId, nowNs);
 }
 
+ReapStatus TransactionCoordinationService::abortNamespaceTxns(uint32_t nsId, int64_t nowNs)
+{
+    if (loadState_ != LoadState::Loaded) return ReapStatus::Done;
+    (void)coordinator_.abortAllForNamespace(nsId, nowNs);   // idempotent
+    return coordinator_.anyUnsettledForNamespace(nsId) ? ReapStatus::More : ReapStatus::Done;
+}
+
 ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs)
 {
     if (txnState_ == nullptr) return ReapStatus::Done;   // no transaction-state store (a rig): nothing to remove

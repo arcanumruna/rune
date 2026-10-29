@@ -204,6 +204,10 @@ public:
     void setNamespaceTxnLimits(uint32_t nsId, uint64_t maxOpenTxns, uint64_t maxTxnTimeMs) override {
         coordinator_.setNamespaceTxnLimits(nsId, maxOpenTxns, maxTxnTimeMs);
     }
+    /// Namespaces Phase 2 Task 7 (the reaper, via the control thread): aborts every Ongoing transaction of namespace `nsId`
+    /// and answers More until none is open or ending (the ABORT markers are in the topics' logs), Done after.  Done at once
+    /// when this node is not the loaded coordinator.  The topics are dropped only after this, so the markers never race the drop.
+    ReapStatus abortNamespaceTxns(uint32_t nsId, int64_t nowNs);
     /// Namespaces Phase 2 Task 7 (the reaper, via the control thread): one batch of tombstones of namespace `nsId`'s
     /// transaction state.  Refused while this node is not the loaded coordinator, or a transaction of the namespace is
     /// still open or ending (its completion would persist a record after the tombstone).  More = a batch was written, or
