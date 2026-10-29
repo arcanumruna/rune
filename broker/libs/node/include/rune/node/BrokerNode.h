@@ -91,7 +91,9 @@
 #include <metrics/MetricsFile.h>
 #include <metrics/MetricsWriter.h>
 #include <rune/node/RuneMetricSlot.h>
+#if defined(__linux__)   // samples /proc/self
 #include <metrics/SystemMetrics.h>
+#endif
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/replication/AeronPartitionTransport.h>
@@ -3021,7 +3023,9 @@ private:
     std::array<std::uint8_t, kNodeMetricCount>            metricWrittenBy_{};   // debug owner-tag record (D58)
     struct ObserverSlots { RuneMetricSlot role, term, outOfSync; };
     ObserverSlots                                         observerSlots_{};     // observer thread only (publishRole)
+#if defined(__linux__)
     std::optional<metrics::SystemMetrics>                 systemMetrics_;      // control thread (D62)
+#endif
     bool                                                  metricsReady_ = false;   // set by start(), before agents
     std::string                                           metricsPath_;
     void createMetrics_();   // startup thread: steps 1-4 of the plan's start order
