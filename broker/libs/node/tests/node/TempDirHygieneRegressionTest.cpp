@@ -414,8 +414,8 @@ TEST(TempDirHygieneRegression, SweepNameAndTypeBoundsAdversarialRegression) {
     const fs::path d = root / "hyg_bounds";
     fs::remove_all(d);
     fs::create_directories(d);
-    const pid_t dead1 = deadPid(), dead2 = deadPid(), dead3 = deadPid();
-    ASSERT_GT(dead1, 0); ASSERT_GT(dead2, 0); ASSERT_GT(dead3, 0);
+    const pid_t dead1 = deadPid(), dead2 = deadPid(), dead3 = deadPid(), dead4 = deadPid();
+    ASSERT_GT(dead1, 0); ASSERT_GT(dead2, 0); ASSERT_GT(dead3, 0); ASSERT_GT(dead4, 0);
     const auto name = [](long pid) { return "rune_t" + std::to_string(pid); };
 
     fs::create_directories(d / name(dead1) / "a" / "b");
@@ -427,9 +427,10 @@ TEST(TempDirHygieneRegression, SweepNameAndTypeBoundsAdversarialRegression) {
     { std::ofstream{victim / "precious"} << "must survive"; }
     fs::create_directory_symlink(victim, d / name(dead3));
 
+    // The case variant uses its own dead pid: on a case-insensitive filesystem it would alias the swept root of dead1.
     const std::vector<std::string> kept = {
         "rune_t", "rune_t0", "rune_t00", "rune_t-" + std::to_string(dead1), name(dead1) + "x", "x" + name(dead1),
-        "rune_T" + std::to_string(dead1), "rune_t99999999999999999999999", "rune_t" + std::string(4096 / 64, '9'),
+        "rune_T" + std::to_string(dead4), "rune_t99999999999999999999999", "rune_t" + std::string(4096 / 64, '9'),
         name(1), name(::getpid())};
     for (const auto& k : kept) fs::create_directories(d / k / "keep");
 
