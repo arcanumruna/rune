@@ -31,7 +31,7 @@
 
 ## Rebase to `main` 750c836b (binding; overrides every number, name and line below)
 
-The plans were written against `caf285c4`. Main has since taken many of the numbers they claim, and #589 shipped Part 01 in a different form. This section is the single source of truth for both. Where any plan text, contract (C1–C18), the registry or the file map disagrees with it, this section wins. Each part's implementer brief restates the rows it uses; line numbers in every plan are stale and are found again by the quoted text, symbol or sentinel.
+The plans were written against `3c1ad01d` (the merge-base of the plan branch; client 11, broker 6), so the drift to check is `3c1ad01d..origin/main`: namespaces (#642, #741), #112, #116, #450, #589 and #770. Main has since taken many of the numbers they claim, and #589 shipped Part 01 in a different form. This section is the single source of truth for both. Where any plan text, contract (C1–C18), the registry or the file map disagrees with it, this section wins. Each part's implementer brief restates the rows it uses; line numbers in every plan are stale and are found again by the quoted text, symbol or sentinel.
 
 ### RB1 — Scope
 
@@ -52,9 +52,9 @@ The plans were written against `caf285c4`. Main has since taken many of the numb
 | `WorkerReturn::Type` / SBE `ReturnType` (8 is `TXN_VERIFY_REQUEST`) | 9 `ViewScanResult`, 10 `StatsResult` | unchanged (9, 10). Next free 11 | 07, 08 |
 | SBE `TailKind` | 12 `WRITE_SPEC`, 13 `VIEW_READ` | unchanged | 02, 07 |
 | Client `TemplateId` (81–87 are namespaces and `WorkerBind`; the view range ends at 95) | 81 `GetViewRowK`, 82 `ScanViewRows`, 83 `ScanViewRowsResponse`, 84 `GetStats`, 85 `StatsResponse` | **88**, **89**, **90** (07); **91**, **92** (08). Next free 93 | 07, 08 |
-| Control → admin message (`AdminChannels.h`; the `kMsg` ids are one space shared by several rings, 36 is the highest) | `kMsgClusterFeatureLevel = 26` | **37**. Next free 38 | 02 |
+| Control → admin message (`AdminChannels.h`; the `kMsg` ids are one space shared by several rings, 36 is the highest) | `kMsgClusterFeatureLevel = 26` | **37** (26 is in fact free; 37 is kept). Next free 38 | 02 |
 | Admin → control message (26–28 are namespace messages) | `kA2cWriteSpec = 26` | **29**. Next free 30 | 02 |
-| `SecurityOperation` (7 is `Truncate`) | `Import = 7` | **`Import = 8`**; `validSecurityOperation` checks `<= Import`. Bits 0–7 of the `uint8_t` op mask are all used, so `rune::security::opsOn` and `clusterOps` (`Permissions.h`) return `uint16_t`, root (ADMIN ON CLUSTER) is `0x1FF` instead of `0xFF`, and every holder of an op mask widens with them (Part 06 lists them with `grep -rn 'opsOn\|clusterOps\|0xFF'`); `Import` is bit 8. The masks are computed in memory (`PermissionTable` caches them per object), never persisted or sent, so no format changes; `opBit` widens too | 06 |
+| `SecurityOperation` (7 is `Truncate`) | `Import = 7`, `opBit(Import) == 0x80` | **`Import = 8`**; `validSecurityOperation` checks `<= Import`. **No mask widening:** `opsOn`, `clusterOps`, `PermissionTable` and every other op mask stay `uint8_t` over ops 0–7 (0x80 is `opBit(Truncate)`), and root stays `0xFF`. IMPORT lives only in Part 06's separate `importBits_` table, compiled from grants whose `op == Import`, so root and ADMIN never imply it (P6-14, `NothingImpliesImport`). Part 06's `0x80` literals for IMPORT (`opsOn needs no change…`, `…BitSeven…`, `& 0x80`, `allows(topicId, 0x80)`, `allows(3, 0x80)`) test `importBits_` instead; "op 7 round-trips, op 8 → BadEnum" becomes op 8 / op 9, and `NamespaceMessagesTest.cpp`'s out-of-range op moves to 9. Also touched: `opBit` (`SecurityEvent.h`), `validGrant` (`SecurityState.cpp`), `SecurityEvent.cpp`'s op range, `ql/src/Redact.cpp` op names, `ql/src/Parser.cpp` `parseOperation`. The op value is persisted in `__security` events, so a grant of IMPORT is refused below level 5 | 06 |
 | SESSION_PERMISSIONS import marker (all eight `kPermFlag*` bits of the `isolation` byte are used; 0x80 is `kPermFlagSecurityBehind`) | `kPermFlagImport = 0x80` | **no new flag.** An import Table or Patch item sets the op's `topicId` (unused by SESSION_PERMISSIONS) to `kPermBitmapImport = 1` (`WorkerWriteGrants.h`; 0 = the write bitmap). The stager and the patch path route on it | 06 |
 | Produce op flag (`deferAck` byte; 0x10 is `kOpFlagKeyPending`) | `kOpFlagImportGranted = 0x10` | **0x80** (the last free bit) | 06 |
 | Control record types, batch attribute bits, record attribute bits, client ring flags, `SendResult` 12–13, `OpStatus` 12–14, view-read status 8, `StatId`, key-feature flags, `TopicWriteSpecWire` flags, checkpoint v3 magic `0x564B4333` and table ids 0–7, `view_probe` 180–189 | as planned | unchanged | — |
@@ -74,14 +74,73 @@ So **R01 and SD15 are replaced by R01r**: there are no marked magics (`0x534B433
 
 What each later part does instead:
 
-- **Part 04 creates `FoldSkip`.** `broker/libs/view/include/rune/view/FoldSkip.h`: `struct FoldSkip { AbortedTxnFilter aborted{}; const rune::storage::RejectedOffsetIndex* rejected = nullptr; };`, `inline constexpr FoldSkip kNoSkip{};`, `isAbortedBatch(const FoldSkip&, const RecordBatchReader&, int16_t attrs)` (= `skip.aborted.skips(r, attrs)`) and `isRejectedRecord`. In the same task it replaces the `const AbortedTxnFilter&` parameter with `const FoldSkip&` on every fold path above (one parameter, same position), and `Worker::driveViews_` builds `FoldSkip{.aborted = rcAbortedFilter_(*rcState), .rejected = …}`. Its preconditions grep `struct AbortedTxnFilter` in `ViewFold.h` instead of `FoldSkip.h`, and not `kResetMsgType`.
-- **Part 04 also owns the checkpoint reset** it needs for P4-4 (a checkpoint ahead of the local markers is discarded): 01's AD6 and AD7 move into 04 unchanged — `ViewSnapshotChannel::kResetMsgType = 4` (1–3 are taken; 4 is free), `enum class CheckpointStream : uint8_t { Live, ResetOwed }` on `ViewInstance`, and the IO agent's truncate on reset. `verdictCheckpointsDiscarded` is 04's own counter.
+- **Part 04 creates `FoldSkip`.** `broker/libs/view/include/rune/view/FoldSkip.h` (file map: `C`, not `M`) is header-only, because `rune_view` links only `rune_codec`. It takes over `AbortedTxnFilter` and `kNoAbortedTxns` from `ViewFold.h`, which with `AggFold.h` now includes it, and adds `struct FoldSkip { AbortedTxnFilter aborted{}; const rune::storage::RejectedOffsetIndex* rejected = nullptr; };`, `inline constexpr FoldSkip kNoSkip{};`, `isAbortedBatch(const FoldSkip&, const RecordBatchReader&, int16_t attrs)` (= `skip.aborted.skips(r, attrs)`) and `isRejectedRecord`. `RejectedOffsetIndex` is header-only too. In the same task `const AbortedTxnFilter&` becomes `const FoldSkip&` (same position) on `foldBatch`, both `foldAggregateBatch` overloads, `WorkerViewSet::driveFolds` / `driveRebuild` / `driveView_` and `Worker::driveViewsOf_`; `Worker::driveViews_` builds `FoldSkip{.aborted = rcAbortedFilter_(*rcState), .rejected = …}` and passes it to `driveViewsOf_`; every test and bench caller (`grep -rl kNoAbortedTxns broker`, about 15 files, e.g. `WorkerViewSetTest`, `ViewFoldTest`, `ViewRecoveryRegressionTest`, `AggFoldTest`, `ViewFoldBench`, `NamespaceHotPathBench`) switches to `kNoSkip`. 04's two `FoldSkip.h` preconditions are deleted; its preconditions grep `struct AbortedTxnFilter` in `ViewFold.h` and `kInstallMsgType   = 3` with no `kResetMsgType` in `ViewSnapshotChannel.h`.
+- **Part 04 also owns the checkpoint reset** it needs for P4-4 (a checkpoint ahead of the local markers is discarded): 01's AD6 and AD7 move into 04 unchanged — `ViewSnapshotChannel::kResetMsgType = 4` (1–3 are taken; 4 is free), `enum class CheckpointStream : uint8_t { Live, ResetOwed }` on `ViewInstance`, and a reset branch in the IO agent (`ViewSnapshotIoAgent.cpp` drops every non-delta type today) that truncates the `.committed.delta` file (`viewCheckpointFilePath`). `verdictCheckpointsDiscarded` is 04's own counter.
 - **Parts 05, 07 and 09** use `FoldSkip` / `kNoSkip` as written, since they run after 04.
 - **Part 07** keeps v3 magic `0x564B4333` and the v1/v2 decoders. It drops every `CheckpointMark` use, and the test `V3IsNeverDiscardedByTheAbortedRuleRegression` is not built (nothing discards on aborted ranges any more). Its precondition on `kViewCheckpointMagicV2Marked` becomes `grep -n "kViewCheckpointMagicV2 = 0x564B4332u" broker/libs/view/include/rune/view/ViewCheckpoint.h`.
-- **Part 10** may merge before 04. It adds `[[nodiscard]] int64_t WorkerViewSet::foldCursorForTest(int32_t viewTopicId, int32_t partition) const noexcept` (−1 when absent) itself. Where it writes `FoldSkip{.aborted = &idx}` or `kNoSkip`, it uses whichever type is on main when its branch is cut (`AbortedTxnFilter` / `kNoAbortedTxns` before 04). Its precondition on `enum class CheckpointMark` becomes `grep -n "committed.delta" broker/libs/node/include/rune/node/ViewSnapshotChannel.h`. Its AD5a reasoning reduces to: a persisted-over-transient checkpoint always replays, and Task 2 pins that.
+- **Part 10** may merge before 04. It adds `[[nodiscard]] int64_t WorkerViewSet::foldCursorForTest(int32_t viewTopicId, int32_t partition) const noexcept` (−1 when absent) itself, so its precondition on it expects 0 hits. Main's signatures are positional: `driveRebuild` / `driveFolds(src, p, readRange, bound, aborted, nowNs, transientSrc, leaderGen, hwConfirmed, NsTag ns = {})`; there is no `sourceLogStart`, and `installViewForRecovery` takes no filter. The rig's `restart(...)` passes the filter positionally to `driveRebuild` / `driveFolds` only. Before 04 the filter is `AbortedTxnFilter{.fn = <thunk>, .ctx = &idx}`, the thunk copied from `Worker::rcAbortedFilter_`; after 04 it is `FoldSkip{.aborted = AbortedTxnFilter{…}}`. The `checkpointsDiscarded == 0` asserts become `skippedAborted == <aborted batches>` plus rows equal to the pre-restart table. Its precondition on `enum class CheckpointMark` becomes `grep -n "committed.delta" broker/libs/node/include/rune/node/ViewSnapshotChannel.h`. Its AD5a reasoning reduces to: a persisted-over-transient checkpoint always replays, and Task 2 pins that.
 - **Part 01's test cells** that #589 did not cover (the plan's capped-pass `skippedAborted` counting, AD2, and the fold model check) go to one follow-up issue, not a PR.
 
-### RB4 — Releases and builds
+### RB4 — Catalog format 3
+
+Catalog `formatVer 2` is namespaces (`kFormatV2`, `kCurrentFormatVer`, `ApplyV2`, `golden/v2/namespaces.rcat`, the frozen `kNamespacesV2Digests`). Every plan mention of checked-writes "formatVer 2" means **3**:
+
+- `kFormatV3 = 3` = v2 plus `TopicKeyFeatures` (and Part 06's autoincrement state). `checkFormatVer` / `apply` accept 3.
+- `codec/src/catalog/ApplyV3.{h,cpp}`: `ApplyV3` runs `ApplyV2::run`, then the checked-writes rules.
+- A v3 fingerprint layered over `objectFingerprintV2`; the v2 goldens do not change.
+- `EncodeError::NeedsFormatV3`, `goldenScriptV3()`, a `v3` mode in `make_catalog_golden`, `golden/v3/{basic,autoinc}.rcat`, `kBasicV3Digests` / `kAutoIncV3Digests`, `CheckedWritesCatalogV3Test.cpp`.
+- The AdminWorker writes v3 at level ≥ 5 and **v2 below it, never v1** (v1 drops `nsId`).
+- The "unsupported format" test (`CatalogApplyV1Test` uses 3 today) moves to `formatVer = 4`.
+- Part 05's precondition greps `kFormatV2 = 2` and no `kFormatV3`; Part 06's greps `kFormatV3`.
+
+### RB5 — Updates from main, by part
+
+**All parts.** Levels: "level 3" / L3 means 4 (`kTxnPartitionVerify`), "level 4" / L4 means 5, and "3 → 4" means 4 → 5. Keeping 3 in a test would also turn off #112's partition verification. Version bands: broker "1–6" means 1–9, client "1 to 6" means 1–9, "versions 1, 2 and 11" means 1, 2 and 16 plus one of 12–15. Rig defaults: client 17, broker 10. Conformance vectors are named by client version: `_v12` / `V12` become `_v17` / `V17` (`produce_response_v17*.bin`, `define_topic_v17_key_index.bin`, `topic_schema_response_v17_key_index.bin`); the existing DefineTopic vector is `define_topic_v8.bin`. Literal codes in test data move with RB2: 51→55, 52→56, 53→57. Plans 08, 09 and 10 say catalog formatVer 3 (RB4).
+
+**Shared tables.**
+- `isKnownTemplate` (`Dispatch.h`): a separate clause for 88–92; 87 (`WorkerBindAck`) stays unknown at ingress. Tests: 07's "(84) false" becomes `(91)`; 08's becomes `(91)`/`(92)` true and `(93)`/`(87)` false.
+- `NamespaceSuspendTable.h` `kDispatchedTemplates`: Parts 07 and 08 add 88, 89 and 91 (size 39, default read row `{Allow, Refuse}`); 90 and 92 go in the test's `kResponses`. On main the test already fails on 86; Part 07 adds 86 to `kResponses` too.
+- `lineageErrorName` (`client-cpp/src/Client.cpp`) and `authErrorName` (`Completion.h`) extend through 61 with `errorCodeName`.
+
+**Part 02.** Preconditions grep `kLatest = kTxnPartitionVerify;`. The static_assert is `kCheckedWrites == 5 && kLatest == kCheckedWrites && kTxnPartitionVerify == 4`. The kind probe passes the namespace: `reg_.byName(msg.nsId, msg.name)` and `topicByName(msg.nsId, msg.name)`. When `kNsFeatureViews` is off in the namespace, `NamespaceLimitCheck`'s view refusal wins over P6's `featureRefusal`; add one non-default-namespace cell.
+
+**Part 03.** Preconditions grep `kCheckedWrites = 5` and `kClientVersion = kClientVersionResponseEgress;`. SD12 adds `nsAcksAllowed`: `l.lowestAcks < 2 || acksAll(wireAcks)` (plus its comments), so wire 2 (Leader|View) cannot pass a namespace that requires All. The rule-7 refusal and the P3-2 View clear run as a frame check before `txnAdmissionRefuses_` (#112), so a refused transactional batch never starts a verify round trip.
+
+**Part 04.**
+- Its new `PartitionWriteState*` parameter goes after `NsTag ns = {}` and passes through `driveViewsOf_`.
+- P4-16 uses `replica->lastCleanOffset()`.
+- Type 19 (`kTxnJudge`) stays reserved: recognised, skipped and always kept by the cleaner. `Part::P11` and `TxnAllOrNothingAndAtomicPerPartition` go, and `TxnTooLarge` leaves the copied constraints.
+- Namespace memory: the judge's members and Part 05's `keyIndexes_` are adopted and charged to their namespace (`adoptNs_` / `chargeMem_`). A member paused by `nsViewGate_` stalls the judge for that source, so delivery and `View` acks wait until it resumes.
+- The control term floor rises with verdict sources: a 32,824 B `View` ack needs `RUNE_AERON_CONTROL_TERM_BYTES` ≥ 512 KiB, so the broker raises the floor to 512 KiB when any verdict source exists.
+
+**Part 05.** RB4. The test target is `rune_gateway_catalog_tests`. `AbortedFoldLog.h` / `AbortedFoldRig.h` do not exist: use `ViewAbortedTxnRegression`'s rig.
+
+**Part 06.** RB2's IMPORT row. `CatalogTopicAppliedMsg`: the two feature bytes go after `nsId` (length `… + 4 + 2`), and `postCatalogTopicApplied_` keeps its `nsId` parameter.
+
+**Part 07.**
+- `RowStatus { Ok, NotFound, NotReady, Paused, BadKey }`.
+- `OpKind` values append after `NamespaceUsage`.
+- The precondition greps `ViewUniqueInvalid = 61`.
+- `getRowK` and `scanPage` take the same gates as `GetViewRow`: the namespace query throttle (53) and the view-paused check (54) on the worker, and the client-version re-encode on the gateway.
+- Line 753: `FoldSkip` and `CheckpointStream` come from Part 04; `sourceLogStart` is gone.
+
+**Ctest filters** (04, 07, 10): `CheckedWritesAbortedFold` means `ViewAbortedTxnRegression` (target `rune_view_aborted_txn_tests`).
+
+**Part 08.**
+- Its preconditions grep `GET_VIEW_ROW_K">33`, `SCAN_VIEW_ROWS">34` and `VIEW_SCAN_RESULT">9`. The TXN_VOTE clause is deleted.
+- P8-9 reads: 26–30 are main's (TxnVerifyResult, NsSlotAssign, NsSlotRelease, NsThrottle, NsViewMemOver), 31/32 are 02's, 33/34 are 07's and 35 is GetStats; return 8 is main's, 9 is 07's and 10 is StatsResult.
+- GetStats is routed and gated like `GetViewRow`. It counts against the namespace query throttle, and `StatsResponse` gains status 53 (`Throttled`), version-gated like `ViewRowResponse`.
+- QM2 adds a cell where the source is in another namespace; it answers 33 (`ViewSourceNotFound`).
+- `partitionLedElsewhere_` is created by extracting it from `viewSourceLedElsewhere_`.
+- The follower-redirect test (08:707) does not pin the endpoint text, because v16+ redirects carry the response-control port.
+
+**Part 09.** `ThreeNodes::startWith(tag, tweak)` replaces `start(tag, tweak)`. A restart is `stop(id)` or `crash(id)` followed by `startNode(id)`; there is no `restart` / `restartAll`.
+
+**Part 10.** Views over a transient source get the source topic's `NsTag` once 37 is lifted, so they are charged and paused (`NsViewMemOver`) and read-throttled like any view. Add one namespace cell.
+
+**Aeron 1.51.** Aeron no longer ships `concurrent/ringbuffer/RecordDescriptor.h`; any plan code needing it includes `rune/protocol/ring/RecordDescriptor.h`.
+
+### RB6 — Releases and builds
 
 - The release constants in "Sequencing and merge rules" and owner decision 13 read `kClientVersion = 17`, `kBrokerVersion = 10`, `kCheckedWrites = 5`, after Part 09.
 - Builds and unit or integration tests run on the developer Mac (`build/root`, `-j18`). Docker e2e, dr-e2e, the Linux-only stage and benches stay on the shared VM under its lock.
