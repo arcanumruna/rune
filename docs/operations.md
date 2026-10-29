@@ -77,8 +77,10 @@ Client side: set `gatewayResponseControlPort` (`--gateway-response-port`, `RUNE_
 broker's gateway response port. The other brokers' ports come from Metadata. A client that leaves it at `0`, and every
 older client, keeps the declared-address path unchanged.
 
-The worker bind token travels in plaintext: `WorkerBind` is always unencrypted, so an on-path observer of a session can see
-it (TLS protects the `ConnectResponse`, not `WorkerBind`).
+A plaintext session's worker bind token travels in plaintext (`ConnectResponse` and `WorkerBind`). On a TLS session the
+token never crosses the wire: the `ConnectResponse` carries an all-zero token and both ends derive it from the TLS keys
+(HKDF over the client-to-broker key and the session id). `WorkerBind` and the worker's `WorkerBindAck` are plaintext frames;
+the client resends an unacknowledged bind every 250 ms and reconnects after four attempts.
 
 End-to-end proof: `bash broker/docker/nat-e2e.sh` (clients behind a masquerading router container, default config, 3 nodes).
 

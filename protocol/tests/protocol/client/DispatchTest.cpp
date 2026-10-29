@@ -787,7 +787,7 @@ TEST(DispatchCheckFrame, KnownTemplatesEightyOneToEightyThree) {
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateEightySeven) {
-    // 86 = WorkerBind (NAT-safe egress); 87 = first unassigned id after it
+    // 86 = WorkerBind (NAT-safe egress); 87 = WorkerBindAck, broker -> client only: unknown on every ingress
     auto buf = makeValidHeaderBuf(87);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);

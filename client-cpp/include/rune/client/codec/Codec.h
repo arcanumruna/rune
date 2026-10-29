@@ -310,6 +310,11 @@ inline std::size_t encodeWorkerBind(uint8_t* buf, std::size_t cap, int64_t sessi
     return msg.encode(buf);
 }
 
+/// NAT-safe egress (I2): decode a WorkerBindAck (24 bytes, templateId 87); nullopt on any malformed frame.
+[[nodiscard]] inline std::optional<rpc::WorkerBindAck> decodeWorkerBindAck(const uint8_t* buf, std::size_t len) noexcept {
+    return rpc::WorkerBindAck::decode(buf, len);
+}
+
 // ---------------------------------------------------------------------------
 // KeepaliveView — decoded Keepalive fields
 // ---------------------------------------------------------------------------

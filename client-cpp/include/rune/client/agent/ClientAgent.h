@@ -199,6 +199,10 @@ struct Session {
     /// I6: opened plain, then the node's response port was learnt: the next duty pass builds the correlated control
     /// publication and reconnects on it.
     bool        upgradeToResponse    = false;
+    /// A response subscription is one-shot (Aeron pins it to the first response publication session): once a
+    /// ConnectResponse arrived on this session's pair the pair is spent, and the NEXT ConnectRequest (a reconnect after
+    /// SessionExpired / a forced reconnect / a keepalive loss) first builds a fresh pair (offerControlTo).
+    bool        pairPinned           = false;
 
     Session(ClientAgent* agent, session::SessionConfig cfg,
             std::string sessionEndpoint)
@@ -460,6 +464,9 @@ public:
     }
     [[nodiscard]] bool seedResponseCorrelated() const noexcept { return transport_.seedResponseCorrelated(); }
     [[nodiscard]] uint64_t workerBindsSent() const noexcept { return workerBindsSent_; }
+    [[nodiscard]] uint64_t workerBindFailures() const noexcept { return workerBindFailures_; }
+    [[nodiscard]] uint64_t workerBindAcksAccepted() const noexcept { return workerBindAcksAccepted_; }
+    [[nodiscard]] uint64_t workerBindAcksIgnored() const noexcept { return workerBindAcksIgnored_; }
 
     /// Task 1.3: number of currently open sessions (test/observer helper).
     [[nodiscard]] std::size_t sessionCount() const noexcept { return sessions_.size(); }
@@ -1080,17 +1087,34 @@ private:
     // entry; the entry's `pub` is the route's publication — a separate plain pub for the same key never exists.
     struct WorkerBindEntry {
         struct Unbound {};
-        struct Bound { int64_t sid; };   ///< the session id the worker accepted the bind for
+        /// I2: the bind went out and the worker has not acknowledged it yet: `corr` is the WorkerBind's correlation id
+        /// (the ack echoes it), `attempts` the sends so far, `nextRetryNs` the duty-clock deadline of the next resend.
+        struct Sent { int64_t sid; int64_t corr; uint8_t attempts; int64_t nextRetryNs; };
+        struct Bound { int64_t sid; };   ///< the session id the worker ACKNOWLEDGED the bind for (WorkerBindAck)
         std::string sessionEndpoint;     ///< the node session this worker's binds ride (its token / sid)
         std::string dataChannel;
         int32_t     streamId = 0;
         transport::AeronTransport::PubHandle pub = transport::AeronTransport::kNoPub;
         uint32_t    sessionIndex = kNoSession;   ///< resolved (never opened) by the duty pass
-        std::variant<Unbound, Bound> state{Unbound{}};
+        std::variant<Unbound, Sent, Bound> state{Unbound{}};
+        /// The first WorkerBind of a session went out on this entry's pair (request publication + response subscription):
+        /// the worker's response publication for it pins the subscription, so the NEXT session's bind needs a fresh pair.
+        bool pairUsed = false;
     };
     std::vector<WorkerBindEntry> workerBinds_;   // grows on the cold path only; reserved in the ctor
     int64_t                      bindCorrId_ = 0;
     uint64_t                     workerBindsSent_ = 0;
+    uint64_t                     workerBindFailures_ = 0;       ///< binds given up after kBindMaxAttempts (session reconnected)
+    uint64_t                     workerBindAcksAccepted_ = 0;
+    uint64_t                     workerBindAcksIgnored_ = 0;    ///< late / stale / unmatched WorkerBindAcks
+    /// Lost-datagram retry of an unacknowledged WorkerBind (NOT a convergence timer: the outcome after the last
+    /// attempt is a fresh connect, which converges for any timing).
+    static constexpr int64_t kBindRetryNs     = 250'000'000;
+    static constexpr uint8_t kBindMaxAttempts = 4;
+    /// A WorkerBindAck (templateId 87, plaintext): Sent{sid, corr} -> Bound{sid}; anything else is ignored + counted.
+    void onWorkerBindAck_(const uint8_t* buf, std::size_t len) noexcept;
+    /// Replace `s`'s spent response pair (request publication + response subscription) with a fresh one.  Cold.
+    void rePairSessionResponse_(Session& s) noexcept;
     /// One cold pass per doWork over the (small) table: offer the WorkerBind for every entry whose session is
     /// Connected with a token and whose bound sid is not the session's current one.  Returns binds sent.
     int serviceWorkerBinds_() noexcept;

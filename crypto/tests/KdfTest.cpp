@@ -133,3 +133,27 @@ TEST(KdfRegression, Base64MatchesRfc4648AndRefusesMisplacedPadding) {
     EXPECT_FALSE(rc::base64Decode("Z===").has_value());
     EXPECT_FALSE(rc::base64Decode("Zg==Zg==").has_value());
 }
+
+TEST(WorkerBindTokenRegression, DerivationIsStableKeyedAndPerSession) {
+    std::array<uint8_t, 32> key{};
+    for (std::size_t i = 0; i < key.size(); ++i) key[i] = static_cast<uint8_t>(i);
+    const auto a = rc::deriveWorkerBindToken(key, 7);
+    // Pinned vector (RFC 5869 HKDF-SHA256, cross-checked with an independent HMAC computation):
+    // ikm = 00..1f, salt = 07 00 00 00 00 00 00 00, info = "rune-worker-bind-v1", first 16 bytes.
+    const std::array<uint8_t, 16> pinned = {0x9e, 0xf9, 0xe6, 0xdc, 0x16, 0x05, 0xd1, 0xf4,
+                                            0x83, 0x8f, 0x59, 0xd8, 0xcc, 0x07, 0x53, 0x06};
+    EXPECT_EQ(a, pinned) << "the derivation changed: every deployed client and broker must agree";
+    EXPECT_EQ(rc::deriveWorkerBindToken(key, 7), a) << "deterministic";
+    EXPECT_NE(a, (std::array<uint8_t, 16>{})) << "never the all-zero 'none'";
+    EXPECT_NE(rc::deriveWorkerBindToken(key, 8), a) << "another session id, another token";
+    EXPECT_NE(rc::deriveWorkerBindToken(key, -7), a);
+    auto key2 = key; key2[31] ^= 1;
+    EXPECT_NE(rc::deriveWorkerBindToken(key2, 7), a) << "another key, another token";
+    EXPECT_EQ(rc::deriveWorkerBindToken(std::span<const uint8_t>(key.data(), 31), 7), (std::array<uint8_t, 16>{})) << "wrong key size fails closed";
+    // independent recomputation through the primitive
+    std::array<uint8_t, 16> ref{};
+    const uint8_t salt[8] = {7, 0, 0, 0, 0, 0, 0, 0};
+    const std::string_view info = "rune-worker-bind-v1";
+    ASSERT_TRUE(rc::hkdf(rc::Digest::Sha256, key, salt, {reinterpret_cast<const uint8_t*>(info.data()), info.size()}, ref));
+    EXPECT_EQ(a, ref);
+}

@@ -656,6 +656,8 @@ public:
         sessions_.forEach([&](const Session& s) { ids.push_back(s.sessionId); });
         return ids;
     }
+    /// I2 test seam (control thread): the broker ends session `sid` and tells the client it expired (a reconnect follows).
+    bool expireSessionForTest(int64_t sid) { return closeSession_(sid, /*notifyExpired=*/true); }
     /// NAT egress Task 8 seam: the Connect image's "host:port" of a session ("" = unknown session / unit test).
     [[nodiscard]] std::string sessionSourceIdentityForTest(int64_t sid) {
         const Session* s = sessions_.find(sid);

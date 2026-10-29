@@ -292,12 +292,34 @@ struct InvokerGateway {
     std::set<int>              bindGate;            ///< endpoints that refuse produce before a valid WorkerBind
     bool                       issueBindToken = false;   ///< response-mode Connects get a v16 bindToken
     std::map<int, std::string> connectRedirect;     ///< endpoint -> Redirect message answered to every Connect there
-    std::map<int64_t, std::array<uint8_t, 16>> bindTokens;   ///< session -> issued token
+    std::map<int64_t, std::array<uint8_t, 16>> bindTokens;   ///< session -> issued token (TLS: derived at handshake completion)
+    std::vector<std::array<uint8_t, 16>> connectWireTokens;  ///< the v16 tail token of every first-leg ConnectResponse
     struct BindRecord {
         int endpoint = 0; int32_t imageSid = 0; int64_t sessionId = 0; std::array<uint8_t, 16> token{};
         bool firstOnImage = false; bool accepted = false;
     };
     std::vector<BindRecord> binds;
+    // I2: the worker acknowledges every accepted (or repeated) WorkerBind with a plaintext WorkerBindAck.
+    int bindAcksToDrop = 0;       ///< test seam: swallow this many acks (a lost datagram)
+    int bindAcksSent = 0, bindAcksDropped = 0;
+    bool noBindAcks = false;      ///< test seam: never acknowledge (an old/refusing worker)
+    void ackBind_(int endpoint, const rune::protocol::client::WorkerBind& b) {
+        if (noBindAcks) return;
+        if (bindAcksToDrop > 0) { --bindAcksToDrop; ++bindAcksDropped; return; }
+        sendBindAck(endpoint, b.sessionId, b.correlationId);
+    }
+    /// A WorkerBindAck for (sid, corr) to the response publication of `endpoint` / the session's route (test seam:
+    /// also used to forge stale / foreign acks).  PLAINTEXT even on an encrypted session (never sealed).
+    void sendBindAck(int endpoint, int64_t sid, int64_t corr) {
+        rune::protocol::client::WorkerBindAck ack;
+        ack.sessionId = sid; ack.correlationId = corr;
+        uint8_t f[rune::protocol::client::WorkerBindAck::ENCODED_SIZE];
+        const std::size_t n = ack.encode(f);
+        std::vector<uint8_t> frame(f, f + n);
+        if (!offerNow(endpoint, frame)) outbox.emplace_back(endpoint, std::move(frame));
+        ++bindAcksSent;
+    }
+
     int bindsRefused = 0;
     int producesBeforeBind = 0;                      ///< produce frames dropped by the bind gate
     std::map<std::pair<int, int32_t>, std::vector<uint16_t>> framesOnImage;   ///< (endpoint, image) -> templates in order
@@ -1318,11 +1340,16 @@ private:
         const auto sit = b ? sessionsAtNode.find(nodeOf(endpoint)) : sessionsAtNode.end();
         const bool known = b && sit != sessionsAtNode.end() && sit->second.count(b->sessionId) != 0;
         const bool fresh = b && respRoute_.find({endpoint, b->sessionId}) == respRoute_.end();
-        if (b && known && fresh && responseCtl.count(endpoint) != 0 && currentImage_.first == endpoint &&
-            tk != bindTokens.end() && tk->second == b->token) {
+        const bool valid = b && known && responseCtl.count(endpoint) != 0 && currentImage_.first == endpoint &&
+                           tk != bindTokens.end() && tk->second == b->token;
+        if (valid && fresh) {
             respRoute_[{endpoint, b->sessionId}] = currentImage_.second;
             (void)ensureRespPub_(endpoint, currentImage_.second);
             rec.accepted = true;
+            ackBind_(endpoint, *b);
+        } else if (valid && respRoute_[{endpoint, b->sessionId}] == currentImage_.second) {
+            rec.accepted = true;   // I2: the repeat of an accepted bind (same image, same token): answered again
+            ackBind_(endpoint, *b);
         } else {
             ++bindsRefused;
         }
@@ -1335,11 +1362,21 @@ private:
         namespace rp = rune::protocol::client;
         if (responseCtl.count(endpoint) == 0 || f.size() < rp::MessageHeader::ENCODED_SIZE) return false;
         const int64_t sid = static_cast<int64_t>(rp::detail::getLE64(f.data(), 8));
+        const uint16_t tid = static_cast<uint16_t>(f[2] | (f[3] << 8));
+        // A ConnectResponse answers a CONNECT: its header carries the client's resume hint (the OLD session id), so it
+        // rides the image the Connect arrived on (like the real gateway's pending connect), never the old session's route.
+        if (tid == static_cast<uint16_t>(rp::TemplateId::ConnectResponse) ||
+            tid == static_cast<uint16_t>(rp::TemplateId::HandshakeContinueResponse)) {
+            const int64_t corr = static_cast<int64_t>(rp::detail::getLE64(f.data(), 16));
+            if (const auto it = respConnectRoute_.find({endpoint, corr}); it != respConnectRoute_.end()) {
+                image = it->second;
+                return true;
+            }
+        }
         if (const auto it = respRoute_.find({endpoint, sid}); it != respRoute_.end() && sid != 0) {
             image = it->second;
             return true;
         }
-        const uint16_t tid = static_cast<uint16_t>(f[2] | (f[3] << 8));
         if (tid == static_cast<uint16_t>(rp::TemplateId::ConnectResponse) ||
             tid == static_cast<uint16_t>(rp::TemplateId::ErrorResponse) ||
             tid == static_cast<uint16_t>(rp::TemplateId::HandshakeContinueResponse)) {
@@ -1830,7 +1867,10 @@ private:
                 }
                 token[0] |= 0x80;   // never all-zero
                 bindTokens[sid] = token;
-                n = rcc::encodeConnectResponseV16(outV16, okCode, 0, sid, c->sessionId, c->correlationId, token, bv,
+                // I3: a TLS session's token is derived from its keys at handshake completion; the first leg carries zeros.
+                const std::array<uint8_t, 16> wireToken = cipher != 0 ? std::array<uint8_t, 16>{} : token;
+                connectWireTokens.push_back(wireToken);
+                n = rcc::encodeConnectResponseV16(outV16, okCode, 0, sid, c->sessionId, c->correlationId, wireToken, bv,
                                                   authMode, rp::AuthState::Anonymous, cipher, flight);
                 frame = outV16.data();
             } else if (authMode != rp::AuthMode::InProcess && clientV9) {
@@ -1881,6 +1921,8 @@ private:
                 k.cipher    = keys.cipher;
                 k.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);
                 k.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);
+                if (bindTokens.count(hc->sessionId) != 0)   // I3: the derived token (the random placeholder never leaves)
+                    bindTokens[hc->sessionId] = rune::crypto::deriveWorkerBindToken(keys, hc->sessionId);
                 tlsPending_.erase(it);
                 ++tlsSessions;
             }

@@ -48,7 +48,19 @@ std::string testPem(const char* name) {
     return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
+// I2: an injected duty clock (the Client's ClientConfig::nanoClock); the test advances it to each bind deadline.
+// The clock follows real time until the test freezes it (a connect needs real time: lost-datagram retries); a frozen
+// clock only moves when the test advances g_fakeNowNs.
+int64_t g_fakeNowNs = 0;
+bool    g_clockFrozen = false;
+int64_t steadyNs() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+int64_t g_clockOffsetNs = 0;   // an unfrozen clock continues from the frozen value (monotonic)
+int64_t fakeNow() noexcept { return g_clockFrozen ? g_fakeNowNs : steadyNs() + g_clockOffsetNs; }
+
 struct Options {
+    bool fakeClock         = false;   ///< duty clock = g_fakeNowNs (advanced by the test)
     bool tls               = false;   ///< sessions are TLS: the fake serves the test certificate
     int  partitions        = 1;
     bool declaredReachable = false;   ///< the fake's declared egress publication reaches the client (an older broker)
@@ -92,6 +104,7 @@ struct Rig {
         c.dataDir = std::filesystem::temp_directory_path().string() + "/resp_egress_" + std::to_string(::getpid()) + "_" +
                     std::to_string(g_ctr++);
         c.runnerMode = rc::RunnerMode::Invoker;
+        if (o.fakeClock) { g_clockFrozen = false; c.nanoClock = &fakeNow; g_clockOffsetNs = 0; }
         if (o.tls) {
             c.offerCrypto = true;
             c.tlsTrustPem = testPem("ca.pem");
@@ -247,16 +260,20 @@ TEST(ClientResponseEgressRegression, WorkerBindIsTheFirstFrameOnEveryWorker) {
 
 // A produce offered before the bind went out is HELD (the worker would drop it from an unbound image): with the
 // bind blocked no produce frame reaches the worker; once it goes out, the produces follow it, in order.
-// Under TLS the bindToken still rides the FIRST ConnectResponse leg (with the server's handshake flight), and the
+// Under TLS the bindToken never rides the wire (I3: derived from the exported keys on both ends), and the
 // WorkerBind is PLAINTEXT even on an encrypted session: the worker has no key for the image before it is bound.
-TEST(ClientResponseEgressRegression, WorkerBindIsPlaintextUnderTlsAndTheTokenRidesTheFirstLeg) {
+TEST(ClientResponseEgressRegression, WorkerBindIsPlaintextUnderTlsAndTheTokenIsDerivedNotSentRegression) {
     Options o;
     o.tls = true;
     Rig r(4180, 4181, o);
     const auto w = r.addWorker(0, 4182);
     ASSERT_TRUE(r.connect());
     ASSERT_TRUE(r.drive([&] { return r.gw.tlsSessions == 1; })) << "the session is encrypted";
-    ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 1; })) << "no WorkerBind: the token did not arrive on the first leg";
+    ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 1; })) << "no WorkerBind: the client did not derive its token";
+    // I3: the first-leg ConnectResponse carried NO token (all-zero); the bind used the key-derived one.
+    ASSERT_FALSE(r.gw.connectWireTokens.empty());
+    for (const auto& wt : r.gw.connectWireTokens) EXPECT_EQ(wt, (std::array<uint8_t, 16>{})) << "a TLS first leg must carry no bind token";
+    EXPECT_NE(r.gw.binds[0].token, (std::array<uint8_t, 16>{}));
     EXPECT_TRUE(r.gw.binds[0].accepted) << "a sealed bind would not carry the token in clear";
     EXPECT_TRUE(r.gw.binds[0].firstOnImage);
     ASSERT_EQ(r.gw.workerBindFrames.size(), 1u);
@@ -322,12 +339,16 @@ TEST(ClientResponseEgressRegression, ReconnectRebindsWithTheNewToken) {
     EXPECT_EQ(nb.token, r.gw.bindTokens[nb.sessionId]);
     EXPECT_TRUE(nb.accepted);
     ASSERT_EQ(r.sendAcked(p, 0, 1), 1);
-    const auto frames = r.framesAt(w.endpoint);
-    ASSERT_EQ(frames.size(), 4u);
-    EXPECT_EQ(frames[0], kBindTemplate);
-    EXPECT_EQ(frames[1], kProduceTemplate);
-    EXPECT_EQ(frames[2], kBindTemplate) << "the new bind precedes the next produce";
-    EXPECT_EQ(frames[3], kProduceTemplate);
+    // The reconnect builds a FRESH pair (a spent response subscription never connects again): the old session's
+    // [bind, produce] sit on the first worker image, the new session's [bind, produce] on a second one.
+    std::vector<std::vector<uint16_t>> perImage;
+    for (const auto& [key, fr] : r.gw.framesOnImage) if (key.first == w.endpoint) perImage.push_back(fr);
+    ASSERT_EQ(perImage.size(), 2u);
+    for (const auto& frames : perImage) {
+        ASSERT_EQ(frames.size(), 2u);
+        EXPECT_EQ(frames[0], kBindTemplate) << "the bind is the first frame on its image";
+        EXPECT_EQ(frames[1], kProduceTemplate);
+    }
     EXPECT_EQ(r.gw.producesBeforeBind, 0);
 }
 
@@ -406,4 +427,180 @@ TEST(ClientResponseEgressRegression, DataOpRedirectWithPortStillRoutes) {
     EXPECT_GE(r.producesAt(b), 1) << "routed to the bare endpoint";
     EXPECT_GE(r.gw.responseConnects, 2) << "node 1's session rode a response publication (port from the Redirect)";
     EXPECT_TRUE(r.gw.connectFlags.back());
+}
+
+// ---- I2: the worker acknowledges the bind; the client holds produce until the ack, resends, then reconnects ----------
+
+namespace {
+// Offer one acked send of a key on partition 0 without waiting (the produce is held until the bind is acknowledged).
+// Connect with the binds held, then freeze the duty clock at "now" and release them: the first WorkerBind is sent at
+// exactly g_fakeNowNs, so every later deadline is g_fakeNowNs + k * 250 ms.
+void connectThenFreeze(Rig& r) {
+    r.client.testHoldWorkerBinds(true);
+    ASSERT_TRUE(r.connect());
+    g_fakeNowNs   = steadyNs() + g_clockOffsetNs;
+    g_clockFrozen = true;
+    r.client.testHoldWorkerBinds(false);
+}
+rc::Token sendOne(Rig& r, rc::Producer& p) {
+    const rc::Token t = r.nextToken++;
+    EXPECT_EQ(p.trySend(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(kVal), r.cq, t), rc::SendResult::Ok);
+    return t;
+}
+bool completedOk(Rig& r, rc::Token t) {
+    bool done = false;
+    (void)r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cm, std::span<const uint8_t>) { if (cm.token == t && cm.status == rc::OpStatus::Ok) done = true; });
+        return done;
+    });
+    return done;
+}
+} // namespace
+
+// No ack ever: exactly kBindMaxAttempts (4) sends at 250 ms duty-clock steps (nothing earlier), then the session
+// reconnects (a fresh token / sid) and the bind starts over; the produce is held throughout and then completes.
+TEST(ClientAgentRegression, WorkerBindUnackedRetriesThenReconnectsRegression) {
+    Options o; o.fakeClock = true;
+    Rig r(4200, 4201, o);
+    const auto w = r.addWorker(0, 4202);
+    r.gw.noBindAcks = true;
+    connectThenFreeze(r);
+    if (::testing::Test::HasFatalFailure()) return;
+    auto p = r.client.producer(noLinger());
+    const rc::Token t = sendOne(r, p);
+    ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 1; })) << "the first WorkerBind never went out";
+    const int64_t firstSid = r.gw.binds[0].sessionId;
+    const int connectsBefore = r.gw.connectsArrived;
+    for (std::size_t k = 1; k <= 3; ++k) {
+        g_fakeNowNs += 249'000'000LL;   // short of the deadline: nothing is resent
+        (void)r.drive([] { return false; }, 300);
+        ASSERT_EQ(r.gw.binds.size(), k) << "resent before kBindRetryNs elapsed";
+        g_fakeNowNs += 1'000'000LL;     // exactly at the deadline
+        ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == k + 1; })) << "attempt " << (k + 1) << " never went out";
+        EXPECT_EQ(r.gw.binds.back().sessionId, firstSid);
+    }
+    EXPECT_EQ(r.client.testWorkerBindFailures(), 0u);
+    EXPECT_EQ(r.gw.connectsArrived, connectsBefore) << "no reconnect while attempts remain";
+    EXPECT_TRUE(r.gw.produced.empty()) << "the produce must stay held while the bind is unacknowledged";
+    EXPECT_EQ(r.producesAt(w.endpoint), 0);
+
+    g_fakeNowNs += 250'000'000LL;       // the 4th attempt's deadline: give up -> reconnect
+    r.gw.noBindAcks = false;            // the new bind (fresh token) is acknowledged
+    ASSERT_TRUE(r.drive([&] { return r.client.testWorkerBindFailures() == 1u; }));
+    g_clockOffsetNs = g_fakeNowNs - steadyNs();   // the reconnect (a fresh Connect / handshake) runs on real time again
+    g_clockFrozen = false;
+    ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 5; })) << "no bind on the reconnected session";
+    EXPECT_GT(r.gw.connectsArrived, connectsBefore) << "the session must reconnect";
+    EXPECT_NE(r.gw.binds[4].sessionId, firstSid) << "a fresh session id";
+    EXPECT_NE(r.gw.binds[4].token, r.gw.binds[0].token) << "a fresh token";
+    EXPECT_EQ(r.gw.binds.size(), 5u) << "exactly 4 sends on the first session";
+    EXPECT_TRUE(completedOk(r, t)) << "the held produce must complete after the rebind";
+    EXPECT_EQ(r.gw.producesBeforeBind, 0);
+    EXPECT_EQ(r.client.testWorkerBindAcksAccepted(), 1u);
+}
+
+// The ack arrives -> the held produce is offered at once, with no resend.
+TEST(ClientAgentRegression, WorkerBindAckReleasesHeldProduceRegression) {
+    Options o; o.fakeClock = true;
+    Rig r(4210, 4211, o);
+    const auto w = r.addWorker(0, 4212);
+    r.gw.noBindAcks = true;
+    connectThenFreeze(r);
+    if (::testing::Test::HasFatalFailure()) return;
+    auto p = r.client.producer(noLinger());
+    const rc::Token t = sendOne(r, p);
+    ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 1 && r.client.testHeldOffers() > 0; }));
+    (void)r.drive([] { return false; }, 500);
+    EXPECT_TRUE(r.gw.produced.empty()) << "held while unacknowledged";
+    EXPECT_EQ(r.producesAt(w.endpoint), 0);
+    // The worker's answer arrives now (a forged-in-place copy of what the real worker sends).
+    const auto b = rp::WorkerBind::decode(r.gw.workerBindFrames[0].data(), r.gw.workerBindFrames[0].size());
+    ASSERT_TRUE(b.has_value());
+    r.gw.sendBindAck(w.endpoint, b->sessionId, b->correlationId);
+    EXPECT_TRUE(completedOk(r, t));
+    EXPECT_EQ(r.gw.binds.size(), 1u) << "no resend: the ack bound it";
+    EXPECT_EQ(r.client.testWorkerBindAcksAccepted(), 1u);
+    EXPECT_EQ(r.producesAt(w.endpoint), 1);
+    EXPECT_EQ(r.gw.producesBeforeBind, 0);
+}
+
+// An ack with an old / foreign correlation id never binds (the fake routes replies by session, so a foreign sid cannot
+// be forged here); the exact (sid, corr) does.
+TEST(ClientAgentRegression, StaleWorkerBindAckIgnoredRegression) {
+    Options o; o.fakeClock = true;
+    Rig r(4220, 4221, o);
+    const auto w = r.addWorker(0, 4222);
+    r.gw.noBindAcks = true;
+    connectThenFreeze(r);
+    if (::testing::Test::HasFatalFailure()) return;
+    auto p = r.client.producer(noLinger());
+    const rc::Token t = sendOne(r, p);
+    ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 1; }));
+    const auto b = rp::WorkerBind::decode(r.gw.workerBindFrames[0].data(), r.gw.workerBindFrames[0].size());
+    ASSERT_TRUE(b.has_value());
+    r.gw.sendBindAck(w.endpoint, b->sessionId, b->correlationId + 1000);   // an old / foreign correlation
+    r.gw.sendBindAck(w.endpoint, b->sessionId, b->correlationId - 1);      // an older bind's correlation
+    ASSERT_TRUE(r.drive([&] { return r.client.testWorkerBindAcksIgnored() == 2u; })) << "the stale acks were not even seen";
+    (void)r.drive([] { return false; }, 500);
+    EXPECT_EQ(r.client.testWorkerBindAcksAccepted(), 0u);
+    EXPECT_TRUE(r.gw.produced.empty()) << "a stale ack must not release the produce";
+    r.gw.sendBindAck(w.endpoint, b->sessionId, b->correlationId);
+    EXPECT_TRUE(completedOk(r, t));
+    EXPECT_EQ(r.client.testWorkerBindAcksAccepted(), 1u);
+    // a late duplicate of the accepted ack changes nothing
+    r.gw.sendBindAck(w.endpoint, b->sessionId, b->correlationId);
+    ASSERT_TRUE(r.drive([&] { return r.client.testWorkerBindAcksIgnored() == 3u; }));
+}
+
+// A lost FIRST ack (datagram) is recovered by the resend: the worker answers a repeated bind again.
+TEST(ClientAgentRegression, LostWorkerBindAckIsRecoveredByResendRegression) {
+    Options o; o.fakeClock = true;
+    Rig r(4230, 4231, o);
+    (void)r.addWorker(0, 4232);
+    r.gw.bindAcksToDrop = 1;
+    connectThenFreeze(r);
+    if (::testing::Test::HasFatalFailure()) return;
+    auto p = r.client.producer(noLinger());
+    const rc::Token t = sendOne(r, p);
+    ASSERT_TRUE(r.drive([&] { return r.gw.bindAcksDropped == 1; }));
+    g_fakeNowNs += 250'000'000LL;
+    ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 2; }));
+    EXPECT_TRUE(completedOk(r, t));
+    EXPECT_EQ(r.client.testWorkerBindFailures(), 0u);
+}
+
+// Aeron pins a response subscription to the FIRST response publication session that reaches it, so a second response
+// publication to the same request image never connects: every new connect episode and every session bind needs a FRESH
+// pair (new response subscription + new request publication = a new image).  The fake answers per image, so the
+// observable is the image: the reconnect's Connect and the rebind's WorkerBind arrive on images the first session never used.
+TEST(ClientResponseEgressRegression, ReconnectBuildsAFreshResponsePairRegression) {
+    Rig r(4250, 4251);
+    const auto w = r.addWorker(0, 4252);
+    ASSERT_TRUE(r.connect());
+    auto p = r.client.producer(noLinger());
+    ASSERT_EQ(r.sendAcked(p, 0, 2), 2);
+    auto imagesAt = [&](int endpoint) {
+        std::vector<int32_t> out;
+        for (const auto& [key, frames] : r.gw.framesOnImage) if (key.first == endpoint) out.push_back(key.second);
+        return out;
+    };
+    ASSERT_EQ(r.gw.binds.size(), 1u);
+    const int64_t oldSid = r.gw.binds[0].sessionId;
+    const auto gwImages1 = imagesAt(0), wkImages1 = imagesAt(w.endpoint);
+    ASSERT_EQ(gwImages1.size(), 1u);
+    ASSERT_EQ(wkImages1.size(), 1u);
+
+    r.gw.expireSession(oldSid);   // the broker ends the session: the client reconnects and the worker is rebound
+    ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 2 && r.client.testWorkerBindAcksAccepted() == 2u; }))
+        << "no rebind after the reconnect: binds=" << r.gw.binds.size() << " connects=" << r.gw.connectsArrived
+        << " acks=" << r.client.testWorkerBindAcksAccepted();
+    EXPECT_NE(r.gw.binds[1].sessionId, oldSid);
+    const auto gwImages2 = imagesAt(0), wkImages2 = imagesAt(w.endpoint);
+    EXPECT_EQ(gwImages2.size(), 2u) << "the reconnect's Connect must ride a fresh request image (a spent response pair never connects again)";
+    EXPECT_EQ(wkImages2.size(), 2u) << "the new session's WorkerBind must ride a fresh worker image";
+    EXPECT_EQ(r.gw.binds[1].imageSid, [&] { for (int32_t i : wkImages2) if (i != wkImages1[0]) return i; return 0; }())
+        << "the second bind arrived on the new worker image";
+    EXPECT_NE(r.gw.binds[1].imageSid, r.gw.binds[0].imageSid);
+    EXPECT_TRUE(r.gw.binds[1].firstOnImage);
+    ASSERT_EQ(r.sendAcked(p, 0, 2), 2) << "produce completes on the fresh pair";
 }

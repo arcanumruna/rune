@@ -223,6 +223,49 @@ struct WorkerBind {
 };
 
 // ---------------------------------------------------------------------------
+// WorkerBindAck  (templateId 87) — broker -> client only.  The worker's acknowledgement of a WorkerBind, sent
+// PLAINTEXT on the session's response publication (a TLS client accepts exactly this template unsealed: it carries no
+// secret, only the session id and the bind's correlation id).
+//
+//   [0..23]   MessageHeader (24 bytes)   blockLength = 0, templateId = 87,
+//                                        sessionId (bytes 8..15) = the bound session,
+//                                        correlationId (bytes 16..23) = the WorkerBind's correlationId
+//
+// Total = 24 bytes, no body.  Until the client sees it the bind is not established: it resends the WorkerBind.
+// ---------------------------------------------------------------------------
+struct WorkerBindAck {
+    int64_t sessionId     = 0;
+    int64_t correlationId = 0;
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::WorkerBindAck);   // 87
+    static constexpr std::size_t ENCODED_SIZE = MessageHeader::ENCODED_SIZE;                    // 24
+
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = 0;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+        return ENCODED_SIZE;
+    }
+
+    static std::optional<WorkerBindAck> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        if (avail < ENCODED_SIZE) return std::nullopt;
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId != kSchemaId || hdr.templateId != TEMPLATE_ID) return std::nullopt;
+        WorkerBindAck m;
+        m.sessionId     = hdr.sessionId;
+        m.correlationId = hdr.correlationId;
+        return m;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // ConnectResponse  (templateId 2)
 //
 // Frame layout (all little-endian):

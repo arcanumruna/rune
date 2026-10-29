@@ -111,6 +111,7 @@ Cell expected(St st, Act a) {
     case Act::BindRight:
         if (st == St::Unknown || st == St::Closed) return {BR::UnknownSession, Kind::None, N};
         if (st == St::Await) return {BR::Bound, Kind::Annc, kImage};
+        if (bound) return {BR::AlreadyBound, plain, img};   // I2: the repeat of a bind (same image, same token) is a no-op
         return {BR::NotAwaiting, plain, img};
     case Act::BindWrong:
         if (st == St::Unknown || st == St::Closed) return {BR::UnknownSession, Kind::None, N};
@@ -317,7 +318,8 @@ TEST(SessionAckSinkRegression, BadTokenBindDoesNoWorkRegression) {
     EXPECT_EQ(kindOf(r.s, kSid), Kind::Await);
     EXPECT_EQ(r.s.bind(kSid, tokLastByteOff(), kImage, kRespChan), BR::BadToken) << "bind() still re-checks (defence)";
     EXPECT_EQ(r.s.bind(kSid, tok(), kImage, kRespChan), BR::Bound);
-    EXPECT_EQ(r.s.checkBind(kSid, tok()), BR::NotAwaiting) << "a bound session never binds again";
+    EXPECT_EQ(r.s.checkBind(kSid, tok()), BR::AlreadyBound) << "a bound session never binds again (same token = the repeat)";
+    EXPECT_EQ(r.s.checkBind(kSid, tokLastByteOff()), BR::NotAwaiting) << "... and any other token is refused";
 }
 
 // I5: ONE word decides admission: awaiting -> every image dropped; bound -> only its image; plain -> admitted.
@@ -366,4 +368,38 @@ TEST(SessionAckSinkRegression, AwaitingBindDropsEveryImageWithOneLoadRegression)
     r.s.close(kSid + 2);
     ASSERT_TRUE(r.s.announceResponse(kSid + 2, tok(), kStream));
     EXPECT_EQ(r.s.admitDirect(kSid + 2, kImage), Sink::kDirectDropSpoofed) << "reused slot: awaiting again";
+}
+
+TEST(SessionAckSinkResponseBindRegression, RepeatedBindSameImageSameTokenIsAlreadyBoundNoStateChangeRegression) {
+    Rig r;
+    ASSERT_TRUE(r.s.announceResponse(kSid, tok(), kStream));
+    ASSERT_EQ(r.s.bind(kSid, tok(), kImage, kRespChan), BR::Bound);
+    pass(r.s); pass(r.s);
+    ASSERT_NE(r.s.readyPub(kSid), nullptr);
+    const std::size_t added = r.st->added.size();
+    EXPECT_EQ(r.s.checkBind(kSid, tok()), BR::AlreadyBound);
+    EXPECT_EQ(r.s.bind(kSid, tok(), kImage, kRespChan), BR::AlreadyBound);
+    EXPECT_EQ(r.s.bind(kSid, tok(), kOther, kRespChan), BR::NotAwaiting) << "another image never rebinds";
+    EXPECT_EQ(r.s.bind(kSid, tokLastByteOff(), kImage, kRespChan), BR::NotAwaiting) << "a wrong token never reaches AlreadyBound";
+    EXPECT_EQ(r.s.checkBind(kSid, tokFirstByteOff()), BR::NotAwaiting);
+    EXPECT_EQ(kindOf(r.s, kSid), Kind::Ready);
+    EXPECT_EQ(r.s.boundImage(kSid), kImage);
+    EXPECT_EQ(r.st->added.size(), added) << "no second publication";
+}
+
+TEST(SessionAckSinkResponseBindRegression, AnnounceResponseKeepsAnUnreportedFailureRegression) {
+    Rig r;
+    ASSERT_TRUE(r.s.announceResponse(kSid, tok(), kStream));
+    ASSERT_EQ(r.s.bind(kSid, tok(), kImage, kRespChan), BR::Bound);
+    ASSERT_EQ(r.s.unbindImage(kImage), 1);                     // Failed{reported = false}
+    ASSERT_EQ(r.s.unreportedFailures(), 1u);
+    EXPECT_EQ(r.s.checkBind(kSid, tok()), BR::NotAwaiting) << "a failed session is never AlreadyBound";
+    ASSERT_TRUE(r.s.announceResponse(kSid, tok(), kStream));   // the keyReady wave arriving after the failure
+    EXPECT_EQ(kindOf(r.s, kSid), Kind::Failed) << "the failure must still be reported, not turned into AwaitingBind";
+    EXPECT_EQ(r.s.unreportedFailures(), 1u);
+    std::vector<int64_t> reported;
+    r.s.reportFailures([&](int64_t sid) { reported.push_back(sid); return true; });
+    EXPECT_EQ(reported, std::vector<int64_t>{kSid});
+    ASSERT_TRUE(r.s.announceResponse(kSid, tok(), kStream));   // a re-announce after the REPORT starts afresh
+    EXPECT_EQ(kindOf(r.s, kSid), Kind::Await);
 }

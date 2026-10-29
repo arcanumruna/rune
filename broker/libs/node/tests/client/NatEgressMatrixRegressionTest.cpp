@@ -14,6 +14,7 @@
 #include "client/ClusterClient.h"
 #include "client/OneBroker.h"
 #include "support/AuthBroker.h"
+#include "support/AuthTrio.h"
 
 #include <rune/aeronutil/testing/FreePort.h>
 #include <rune/cli/Cli.h>
@@ -280,11 +281,26 @@ std::set<int64_t> minus(const std::set<int64_t>& a, const std::set<int64_t>& b) 
 std::string sourceIdentityOf(BrokerNode& n, int64_t sid) {
     return n.onControlThreadForTest([&n, sid] { return n.gatewayForTest()->sessionSourceIdentityForTest(sid); });
 }
-uint64_t bindsAccepted(BrokerNode& n) {
-    return n.onWorkerThreadForTest(0, [](Worker& w) { return w.workerBindsAcceptedForTest(); });
+/// Sum of `f(worker)` over EVERY worker of the node (a session binds to whichever worker owns its partition).
+template <class F>
+uint64_t sumWorkers(BrokerNode& n, F f) {
+    uint64_t sum = 0;
+    for (int32_t w = 0; w < n.workerCountForTest(); ++w)
+        sum += n.onWorkerThreadForTest(w, [&f](Worker& wk) -> uint64_t { return static_cast<uint64_t>(f(wk)); });
+    return sum;
 }
-uint64_t spoofed(BrokerNode& n) {
-    return n.onWorkerThreadForTest(0, [](Worker& w) { return w.spoofedIngressDroppedForTest(); });
+uint64_t bindsAccepted(BrokerNode& n) { return sumWorkers(n, [](Worker& w) { return w.workerBindsAcceptedForTest(); }); }
+uint64_t spoofed(BrokerNode& n) { return sumWorkers(n, [](Worker& w) { return w.spoofedIngressDroppedForTest(); }); }
+// I2: WorkerBindAcks the node's workers offered on a response publication.
+uint64_t bindAcksSent(BrokerNode& n) { return sumWorkers(n, [](Worker& w) { return w.workerBindAcksSentForTest(); }); }
+// I2 seams on EVERY worker: refuse the next `n` binds / swallow the next `n` acks.
+void dropNextBinds(BrokerNode& n, uint32_t count) {
+    for (int32_t w = 0; w < n.workerCountForTest(); ++w)
+        n.onWorkerThreadForTest(w, [count](Worker& wk) { wk.dropNextWorkerBindsForTest(count); return 0; });
+}
+void swallowNextBindAcks(BrokerNode& n, uint32_t count) {
+    for (int32_t w = 0; w < n.workerCountForTest(); ++w)
+        n.onWorkerThreadForTest(w, [count](Worker& wk) { wk.swallowNextWorkerBindAcksForTest(count); return 0; });
 }
 // I7: Records frames this node's workers delivered on a response publication (session-egress subscriptions).
 uint64_t responseEgressFrames(BrokerNode& n) {
@@ -294,7 +310,7 @@ uint64_t responseEgressFrames(BrokerNode& n) {
     return sum;
 }
 bool responsePubReady(BrokerNode& n, int64_t sid) {
-    return n.onWorkerThreadForTest(0, [sid](Worker& w) { return w.responsePubReadyForTest(sid); });
+    return sumWorkers(n, [sid](Worker& w) { return w.responsePubReadyForTest(sid); }) != 0;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -533,24 +549,25 @@ TEST(NatEgressMatrixRegression, MixedOldAndNewClientsShareATopicThreeNodesRegres
 }
 
 // =================================================================================================================
-// 4. Two NAT'd clients on one "host" (same declared channel): neither sees the other's replies.
+// 4. Two NAT'd clients on one "host" (same declared channel) produce AND subscribe on the SAME topic: each gets
+//    exactly its own acks, each subscription gets exactly the union (records are per subscription, replies per session).
 // =================================================================================================================
 TEST(NatEgressMatrixRegression, TwoNatClientsOneHostNeverSeeEachOthersRepliesRegression) {
     const RespPorts r = RespPorts::discover(3);
     ThreeNodes c = ThreeNodes::startWith("nat2c", withResponsePorts(r));
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     auto admin = connectClient(c, 1);
-    const rc::TopicSpec specA = defineTopic(*admin, "topic-a", 3, 3);
-    const rc::TopicSpec specB = defineTopic(*admin, "topic-b", 3, 3);
+    const rc::TopicSpec spec = defineTopic(*admin, "topic-shared", 3, 3);
     admin->close();
-    std::vector<int32_t> la, lb;
-    ASSERT_TRUE(awaitLeaders(c, specA.topicId, 3, la, 30s));
-    ASSERT_TRUE(awaitLeaders(c, specB.topicId, 3, lb, 30s));
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, spec.topicId, 3, leaders, 30s));
 
     const std::set<int64_t> before = sessionIds(c.node(2));
     auto cfgA = natClient(c, 2, r);
     auto cfgB = natClient(c, 2, r);
     ASSERT_EQ(cfgA.declaredEgressChannelForTest, cfgB.declaredEgressChannelForTest) << "both declare the same address";
+    cfgA.topics = {spec};
+    cfgB.topics = {spec};
     auto a = connectOrFail(cfgA);
     ASSERT_NE(a, nullptr);
     const std::set<int64_t> afterA = sessionIds(c.node(2));
@@ -562,28 +579,50 @@ TEST(NatEgressMatrixRegression, TwoNatClientsOneHostNeverSeeEachOthersRepliesReg
     EXPECT_FALSE(sidsB.empty());
     for (int64_t s : sidsA) EXPECT_EQ(sidsB.count(s), 0u) << "session id " << s << " belongs to both clients";
 
-    Sent sa, sb;
-    std::thread tb([&] { sb = produceN(*b, handleOf(specB), "bee", 0, 200, rc::Acks::All); });
-    sa = produceN(*a, handleOf(specA), "aye", 0, 200, rc::Acks::All);
-    tb.join();
-    EXPECT_EQ(sa.ok, 200) << sa.firstBad << " undone " << sa.undone;
-    EXPECT_EQ(sb.ok, 200) << sb.firstBad << " undone " << sb.undone;
-    const std::set<std::string> wantA = asSet(sa.okValues), wantB = asSet(sb.okValues);
+    // Both subscribe to the same topic BEFORE producing; both then produce concurrently to it.
     Collector ca, cb;
-    auto subsA = subscribeAll(*a, specA, ca);
-    auto subsB = subscribeAll(*b, specB, cb);
-    EXPECT_TRUE(waitUntil([&] { return ca.count(wantA) == 200; }, 60s)) << "A: " << ca.count(wantA) << "/200";
-    EXPECT_TRUE(waitUntil([&] { return cb.count(wantB) == 200; }, 60s)) << "B: " << cb.count(wantB) << "/200";
-    EXPECT_EQ(ca.strays(wantA), 0u);
-    EXPECT_EQ(cb.strays(wantB), 0u);
-    EXPECT_EQ(ca.withPrefix("bee-"), 0u) << "A saw B's values";
-    EXPECT_EQ(cb.withPrefix("aye-"), 0u) << "B saw A's values";
+    auto subsA = subscribeAll(*a, spec, ca);
+    auto subsB = subscribeAll(*b, spec, cb);
+    constexpr int kN = 200;
+    Sent sa, sb;
+    std::thread tb([&] { sb = produceN(*b, handleOf(spec), "bee", 0, kN, rc::Acks::All); });
+    sa = produceN(*a, handleOf(spec), "aye", 0, kN, rc::Acks::All);
+    tb.join();
+    // Replies are per session: each client got exactly one ok completion per send of ITS OWN (none lost, none foreign).
+    EXPECT_EQ(sa.ok, kN) << sa.firstBad << " undone " << sa.undone;
+    EXPECT_EQ(sb.ok, kN) << sb.firstBad << " undone " << sb.undone;
+    EXPECT_EQ(sa.bad + sa.undone, 0);
+    EXPECT_EQ(sb.bad + sb.undone, 0);
+    EXPECT_EQ(asSet(sa.okValues).size(), static_cast<std::size_t>(kN)) << "A's acks name exactly A's sends";
+    EXPECT_EQ(asSet(sb.okValues).size(), static_cast<std::size_t>(kN)) << "B's acks name exactly B's sends";
+    for (const auto& v : sa.okValues) EXPECT_EQ(v.rfind("aye-", 0), 0u) << "A completed a foreign value " << v;
+    for (const auto& v : sb.okValues) EXPECT_EQ(v.rfind("bee-", 0), 0u) << "B completed a foreign value " << v;
+    // Records are per subscription: both subscriptions deliver the UNION, every value exactly once.
+    std::set<std::string> uni = asSet(sa.okValues);
+    for (const auto& v : sb.okValues) uni.insert(v);
+    ASSERT_EQ(uni.size(), static_cast<std::size_t>(2 * kN));
+    EXPECT_TRUE(waitUntil([&] { return ca.count(uni) == uni.size(); }, 60s)) << "A: " << ca.count(uni) << "/" << uni.size();
+    EXPECT_TRUE(waitUntil([&] { return cb.count(uni) == uni.size(); }, 60s)) << "B: " << cb.count(uni) << "/" << uni.size();
+    EXPECT_EQ(ca.strays(uni), 0u) << "A's subscription saw a value twice or one nobody sent";
+    EXPECT_EQ(cb.strays(uni), 0u) << "B's subscription saw a value twice or one nobody sent";
+    EXPECT_EQ(ca.total, uni.size());
+    EXPECT_EQ(cb.total, uni.size());
     for (auto& s : subsA) s.unsubscribe();
     for (auto& s : subsB) s.unsubscribe();
     EXPECT_TRUE(a->testSeedResponseCorrelated());
     EXPECT_TRUE(b->testSeedResponseCorrelated());
     a->close();
     b->close();
+    // each client bound separately (I2: and was acknowledged), none gave up
+    EXPECT_GE(a->testWorkerBindAcksAccepted(), 1u);
+    EXPECT_GE(b->testWorkerBindAcksAccepted(), 1u);
+    EXPECT_EQ(a->testWorkerBindFailures() + b->testWorkerBindFailures(), 0u);
+    uint64_t accepted = 0;
+    for (int id = 1; id <= 3; ++id) {
+        accepted += bindsAccepted(c.node(id));
+        EXPECT_EQ(spoofed(c.node(id)), 0u);
+    }
+    EXPECT_GE(accepted, 2u);
 }
 
 // =================================================================================================================
@@ -713,6 +752,62 @@ void tlsLeg(bool nat, const char* tag) {
 
 }  // namespace
 
+/// TLS WITHOUT authentication (the dev mode): the broker serves the test certificate, no user exists; a NAT'd client
+/// that offers TLS gets an encrypted session AND the response path (the bind token is key-derived, I3).
+static void tlsAuthOffLeg(bool nat, const char* tag) {
+    const RespPorts r = RespPorts::discover(1);
+    AuthBroker::Options o;
+    o.mode    = AuthMode::DevDisabled;
+    o.shard   = true;
+    o.tlsOnly = true;
+    o.configure = [&r](NodeConfig& cfg) {
+        cfg.gatewayResponseControlPort = r.gw[0];
+        cfg.responseControlBasePort    = r.w[0];
+        cfg.peers[0].gatewayResponseControlPort = r.gw[0];
+        cfg.peers[0].responseControlBasePort    = r.w[0];
+    };
+    AuthBroker b(tag, o);
+    rc::TopicSpec spec;
+    {
+        auto acfg = tlsConfig(b, "", "");
+        acfg.allowUnauthenticatedBroker = true;
+        rc::Client admin(acfg);
+        ASSERT_NO_THROW(admin.connectAndWait(30s));
+        const auto def = admin.defineTopicAndWait("orders", 1, "", false, {}, 30s);
+        ASSERT_EQ(def.errorCode, 0) << def.detail;
+        spec = rc::TopicSpec{"orders", def.topicId, 1};
+        admin.closeImmediately();
+    }
+    auto cfg = tlsConfig(b, "", "");
+    cfg.allowUnauthenticatedBroker = true;
+    if (nat) {
+        cfg.gatewayResponseControlPort   = r.gw[0];
+        cfg.declaredEgressChannelForTest = kUnroutable;
+    }
+    auto client = connectOrFail(cfg);
+    ASSERT_NE(client, nullptr) << "TLS connect with authentication off";
+    const Sent sent = produceN(*client, handleOf(spec), "tlsoff", 0, 100, rc::Acks::All);
+    EXPECT_EQ(sent.ok, 100) << sent.firstBad << " undone " << sent.undone;
+    Collector col;
+    auto subs = subscribeAll(*client, spec, col);
+    const auto want = asSet(sent.okValues);
+    EXPECT_TRUE(waitUntil([&] { return col.count(want) == want.size(); }, 60s)) << col.count(want) << "/100";
+    EXPECT_EQ(col.strays(want), 0u);
+    for (auto& sub : subs) sub.unsubscribe();
+    EXPECT_EQ(client->testSeedResponseCorrelated(), nat);
+    client->close();
+    if (nat) {
+        EXPECT_GE(bindsAccepted(b.node()), 1u) << "the worker accepted the TLS client's key-derived bind";
+        EXPECT_GE(client->testWorkerBindAcksAccepted(), 1u);
+        EXPECT_EQ(client->testWorkerBindFailures(), 0u);
+        EXPECT_EQ(spoofed(b.node()), 0u);
+    } else {
+        EXPECT_EQ(bindsAccepted(b.node()), 0u) << "an old client never binds";
+    }
+}
+
+TEST(NatEgressMatrixRegression, TlsAuthOffNewClientRegression) { tlsAuthOffLeg(/*nat=*/true, "natoffnew"); }
+
 TEST(NatEgressMatrixRegression, TlsAuthNewClientOverResponsePathRegression) { tlsLeg(/*nat=*/true, "natauthnew"); }
 
 TEST(NatEgressMatrixRegression, TlsAuthOldClientDeclaredPathRegression) { tlsLeg(/*nat=*/false, "natauthold"); }
@@ -751,7 +846,6 @@ TEST(NatEgressMatrixRegression, ConnectRacingALeaderChangeConvergesRegression) {
     }
     killer.join();
     ASSERT_TRUE(connected);
-
     std::vector<int32_t> survivors;
     ASSERT_TRUE(awaitLeaders(c, spec.topicId, 3, survivors, 60s)) << "every partition re-led on the two survivors";
     const Sent sent = produceN(client, handleOf(spec), "race", 0, 200, rc::Acks::All);
@@ -763,7 +857,22 @@ TEST(NatEgressMatrixRegression, ConnectRacingALeaderChangeConvergesRegression) {
     EXPECT_EQ(col.strays(want), 0u);
     for (auto& s : subs) s.unsubscribe();
     EXPECT_TRUE(client.testSeedResponseCorrelated());
+    // A BrokerNode gateway admits sessions on every broker (no connect-time redirect); the post-stop data ops are
+    // redirected / re-routed to the survivors, and the response port ("#port" on a Redirect, or Metadata) of every
+    // running node the client talks to was learnt - the sessions to the survivors are response-mode.
+    {
+        int learnt = 0;
+        for (int k : c.runningNodes())
+            if (k != seed && client.testKnownResponsePort(c.clientChannel(k)) == r.gw[static_cast<std::size_t>(k - 1)]) ++learnt;
+        EXPECT_GE(learnt, 1) << "no response port learnt for a node besides the seed";
+    }
     client.close();
+    // The session to the leader is response-mode: it WorkerBound (a bind is only demanded of a response-mode session)
+    // and the worker acknowledged it; nothing was dropped as spoofed.
+    EXPECT_GE(client.testWorkerBindsSent(), 1u) << "the redirected session never bound its worker: not response-mode";
+    EXPECT_GE(client.testWorkerBindAcksAccepted(), 1u);
+    EXPECT_EQ(client.testWorkerBindFailures(), 0u);
+    for (int id : c.runningNodes()) EXPECT_EQ(spoofed(c.node(id)), 0u);
 }
 
 // =================================================================================================================
@@ -807,6 +916,11 @@ TEST(NatEgressMatrixRegression, SourcePortChangeEndsTheOldSessionAndNothingReuse
         << "the gateway forgot A's session within 30 s";
     EXPECT_TRUE(waitUntil([&] { return !responsePubReady(b.node(), sidA); }, 30s))
         << "the worker dropped A's response publication within 30 s";
+    // The old session is gone for good and nothing is ever answered to it afterwards (the worker may already have
+    // dropped the session before it notices the image, so imageUnbinds is not a reliable witness).
+    EXPECT_EQ(sessionIds(b.node()).count(sidA), 0u) << "the old session id must be gone on the broker";
+    EXPECT_FALSE(responsePubReady(b.node(), sidA)) << "the old image must never get a reply after the change";
+    const uint64_t acksAtChange = bindAcksSent(b.node());
 
     const uint64_t bindsBefore = bindsAccepted(b.node());
     const std::set<int64_t> s1 = sessionIds(b.node());
@@ -824,8 +938,123 @@ TEST(NatEgressMatrixRegression, SourcePortChangeEndsTheOldSessionAndNothingReuse
     EXPECT_TRUE(waitUntil([&] { return cb.count(both) == both.size(); }, 60s)) << cb.count(both) << "/100";
     EXPECT_EQ(cb.strays(both), 0u);
     EXPECT_EQ(bindsAccepted(b.node()), bindsBefore + 1) << "exactly B's bind";
+    EXPECT_GT(bindAcksSent(b.node()), acksAtChange) << "B's bind was acknowledged";
+    EXPECT_EQ(spoofed(b.node()), 0u);
+    EXPECT_FALSE(responsePubReady(b.node(), sidA)) << "still no publication for the old session";
     for (auto& s : subsB) s.unsubscribe();
     nb->close();
+}
+
+// =================================================================================================================
+// 9b. The SAME client reconnects (the broker ends its session): a new session id, the worker rebinds, produce completes.
+// =================================================================================================================
+TEST(NatEgressMatrixRegression, SameClientReconnectRebindsAndProduceCompletesRegression) {
+    const RespPorts r = RespPorts::discover(1);
+    OneBroker b("natrecon", OneBroker::Runtime::Shard, withResponsePorts(r));
+    rc::Client* admin = b.connectClient();
+    const rc::TopicSpec spec = defineTopic(*admin, "recon", 1, 1);
+    auto cfg = b.clientConfig();
+    cfg.gatewayResponseControlPort   = r.gw[0];
+    cfg.declaredEgressChannelForTest = kUnroutable;
+    cfg.connectTimeoutMs = 30'000;
+    cfg.pingTimeoutMs    = 30'000;
+    cfg.topics           = {spec};
+
+    const std::set<int64_t> s0 = sessionIds(b.node());
+    auto cl = connectOrFail(cfg);
+    ASSERT_NE(cl, nullptr);
+    const std::set<int64_t> sidsA = minus(sessionIds(b.node()), s0);
+    ASSERT_EQ(sidsA.size(), 1u);
+    const int64_t sidA = *sidsA.begin();
+    const Sent first = produceN(*cl, handleOf(spec), "r1", 0, 30, rc::Acks::All);
+    EXPECT_EQ(first.ok, 30) << first.firstBad << " undone " << first.undone;
+    const uint64_t acceptedBefore = bindsAccepted(b.node());
+
+    // The broker ends the session (SessionExpired): the same Client reconnects with a NEW session id.
+    BrokerNode& node = b.node();
+    ASSERT_TRUE(node.onControlThreadForTest([&node, sidA] { return node.gatewayForTest()->expireSessionForTest(sidA); }));
+    std::set<int64_t> now;
+    EXPECT_TRUE(waitUntil([&] { now = minus(sessionIds(b.node()), s0); return now.size() == 1 && now.count(sidA) == 0; }, 60s))
+        << "the client never reconnected with a new session";
+    EXPECT_EQ(sessionIds(b.node()).count(sidA), 0u) << "the old session id is gone on the broker";
+    EXPECT_TRUE(waitUntil([&] { return bindsAccepted(b.node()) == acceptedBefore + 1; }, 60s)) << "the worker never rebound the new session";
+    const Sent second = produceN(*cl, handleOf(spec), "r2", 0, 30, rc::Acks::All);
+    EXPECT_EQ(second.ok, 30) << second.firstBad << " undone " << second.undone;
+    Collector col;
+    auto subs = subscribeAll(*cl, spec, col);
+    std::set<std::string> both = asSet(first.okValues);
+    for (const auto& v : second.okValues) both.insert(v);
+    EXPECT_TRUE(waitUntil([&] { return col.count(both) == both.size(); }, 60s)) << col.count(both) << "/60";
+    EXPECT_EQ(col.strays(both), 0u);
+    EXPECT_FALSE(responsePubReady(b.node(), sidA)) << "nothing answers the old session";
+    EXPECT_EQ(spoofed(b.node()), 0u);
+    for (auto& sub : subs) sub.unsubscribe();
+    cl->close();
+    EXPECT_EQ(cl->testWorkerBindFailures(), 0u);
+}
+
+// =================================================================================================================
+// 9c. I2: a refused bind (the worker drops the first four) converges: the client gives up after four attempts,
+//     reconnects (a fresh token) and the produce completes; the worker acknowledged the rebind.
+// =================================================================================================================
+TEST(NatEgressMatrixRegression, BindRefusedConvergesByReconnectRegression) {
+    const RespPorts r = RespPorts::discover(1);
+    OneBroker b("natrefuse", OneBroker::Runtime::Shard, withResponsePorts(r));
+    rc::Client* admin = b.connectClient();
+    const rc::TopicSpec spec = defineTopic(*admin, "refused", 1, 1);
+    dropNextBinds(b.node(), 4);   // the first four WorkerBinds (the whole first attempt series) are refused
+    auto cfg = b.clientConfig();
+    cfg.gatewayResponseControlPort   = r.gw[0];
+    cfg.declaredEgressChannelForTest = kUnroutable;
+    cfg.connectTimeoutMs = 30'000;
+    cfg.pingTimeoutMs    = 30'000;
+    cfg.topics           = {spec};
+    const std::set<int64_t> s0 = sessionIds(b.node());
+    auto cl = connectOrFail(cfg);
+    ASSERT_NE(cl, nullptr);
+    const Sent sent = produceN(*cl, handleOf(spec), "rf", 0, 40, rc::Acks::All);   // bounded: the sendN deadline fails it
+    EXPECT_EQ(sent.ok, 40) << sent.firstBad << " undone " << sent.undone;
+    Collector col;
+    auto subs = subscribeAll(*cl, spec, col);
+    const auto want = asSet(sent.okValues);
+    EXPECT_TRUE(waitUntil([&] { return col.count(want) == want.size(); }, 60s)) << col.count(want) << "/40";
+    EXPECT_EQ(col.strays(want), 0u);
+    for (auto& sub : subs) sub.unsubscribe();
+    cl->close();
+    EXPECT_GE(cl->testWorkerBindFailures(), 1u) << "the unacknowledged bind never made the client reconnect";
+    EXPECT_GE(cl->testWorkerBindAcksAccepted(), 1u);
+    EXPECT_GT(bindAcksSent(b.node()), 0u) << "the worker never acknowledged a bind";
+    EXPECT_EQ(bindsAccepted(b.node()), 1u) << "exactly the reconnected session's bind was accepted";
+    EXPECT_EQ(spoofed(b.node()), 0u) << "produce was held, never sent unbound";
+    EXPECT_GE(minus(sessionIds(b.node()), s0).size(), 1u);
+}
+
+// =================================================================================================================
+// 9d. I2: a LOST ack is recovered by the resend: the worker answers the repeated bind again (AlreadyBound), the
+//     client never reconnects.
+// =================================================================================================================
+TEST(NatEgressMatrixRegression, LostBindAckRecoveredByAlreadyBoundResendRegression) {
+    const RespPorts r = RespPorts::discover(1);
+    OneBroker b("natlostack", OneBroker::Runtime::Shard, withResponsePorts(r));
+    rc::Client* admin = b.connectClient();
+    const rc::TopicSpec spec = defineTopic(*admin, "lostack", 1, 1);
+    swallowNextBindAcks(b.node(), 1);   // the worker "sends" its first ack into the void
+    auto cfg = b.clientConfig();
+    cfg.gatewayResponseControlPort   = r.gw[0];
+    cfg.declaredEgressChannelForTest = kUnroutable;
+    cfg.connectTimeoutMs = 30'000;
+    cfg.pingTimeoutMs    = 30'000;
+    cfg.topics           = {spec};
+    auto cl = connectOrFail(cfg);
+    ASSERT_NE(cl, nullptr);
+    const Sent sent = produceN(*cl, handleOf(spec), "la", 0, 40, rc::Acks::All);
+    EXPECT_EQ(sent.ok, 40) << sent.firstBad << " undone " << sent.undone;
+    cl->close();
+    EXPECT_EQ(cl->testWorkerBindFailures(), 0u) << "a single lost ack must be recovered by the resend, not by a reconnect";
+    EXPECT_GE(cl->testWorkerBindsSent(), 2u) << "the client resent the unacknowledged bind";
+    EXPECT_EQ(cl->testWorkerBindAcksAccepted(), 1u);
+    EXPECT_EQ(bindsAccepted(b.node()), 1u) << "the repeat is not a second bind";
+    EXPECT_GE(bindAcksSent(b.node()), 1u);
 }
 
 // =================================================================================================================
@@ -894,4 +1123,167 @@ TEST(NatEgressMatrixRegression, DerivedDefaultPortsCarryTheResponsePathRegressio
     EXPECT_GE(bindsAccepted(node), 1u);
     std::error_code ec;
     fs::remove_all(dir, ec);
+}
+
+// =================================================================================================================
+// 11. TLS + authentication on THREE nodes: a NAT'd credentialed client over the response path (key-derived bind
+//     tokens on every node it binds to).
+// =================================================================================================================
+TEST(NatEgressMatrixRegression, TlsAuthThreeNodesNewClientRegression) {
+    const RespPorts r = RespPorts::discover(3);
+    AuthTrio t("natauth3");
+    {
+        auto base = t.cluster().configTweak;
+        const auto ports = withResponsePorts(r);
+        t.cluster().configTweak = [base, ports](NodeConfig& cfg) { base(cfg); ports(cfg); };
+    }
+    t.start();
+    ASSERT_NO_THROW(t.bootstrapAdmin());
+    const std::string ca = AuthBroker::tlsCaFile().string();
+    const std::string pw = writeTemp("trio-admin.pw", std::string(AuthTrio::kAdminPassword) + "\n");
+    const std::string file = writeTemp("trio-script.rql", std::string("create user ws1 with password '") + kUserPw + "';\n"
+                        "grant create on topic prefix '' to user admin;\n"
+                        "grant write on topic 'orders' to user ws1;\n"
+                        "grant read on topic 'orders' to user ws1;\n"
+                        "grant describe on cluster to user ws1;\n");
+    std::string err;
+    const std::string ep1 = "127.0.0.1:" + std::to_string(t.cluster().ports.client[0]);
+    ASSERT_EQ(runCli({"ql", "--broker", ep1, "--user", "admin", "--password-file", pw, "-f", file, "--tls-ca", ca}, &err), 0) << err;
+
+    auto tlsCfg = [&](int node, const std::string& user, const std::string& password) {
+        rc::ClientConfig c;
+        c.gatewayChannel  = t.channel(node);
+        c.gatewayStreamId = 1;
+        c.egressChannel   = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+        c.egressStreamId  = 2;
+        c.dataDir         = (t.cluster().clientsDir->path / ("tls" + user + std::to_string(node))).string();
+        c.username        = user;
+        c.password        = password;
+        c.offerCrypto     = true;
+        c.tlsTrustPem     = AuthTrio::tlsCaPem();
+        c.connectTimeoutMs = 30'000;
+        c.pingTimeoutMs    = 30'000;
+        return c;
+    };
+    rc::TopicSpec spec;
+    {
+        rc::Client admin(tlsCfg(1, "admin", AuthTrio::kAdminPassword));
+        ASSERT_NO_THROW(admin.connectAndWait(60s));
+        const auto def = admin.defineTopicAndWait("orders", 3, "", false, {}, 60s);
+        ASSERT_EQ(def.errorCode, 0) << def.detail;
+        spec = rc::TopicSpec{"orders", def.topicId, 3};
+        admin.closeImmediately();
+    }
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(t.cluster(), spec.topicId, 3, leaders, 30s));
+
+    auto cfg = tlsCfg(2, "ws1", kUserPw);
+    cfg.gatewayResponseControlPort   = r.gw[1];
+    cfg.declaredEgressChannelForTest = kUnroutable;
+    cfg.topics = {spec};
+    auto client = connectOrFail(cfg);
+    ASSERT_NE(client, nullptr) << "login over TLS on the three-node cluster";
+    EXPECT_EQ(client->authStatus().kind, rc::AuthStatus::Kind::Authenticated);
+    const Sent sent = produceN(*client, handleOf(spec), "tls3", 0, 150, rc::Acks::All);
+    EXPECT_EQ(sent.ok, 150) << sent.firstBad << " undone " << sent.undone;
+    Collector col;
+    auto subs = subscribeAll(*client, spec, col);
+    const auto want = asSet(sent.okValues);
+    EXPECT_TRUE(waitUntil([&] { return col.count(want) == want.size(); }, 60s)) << col.count(want) << "/150";
+    EXPECT_EQ(col.strays(want), 0u);
+    for (auto& sub : subs) sub.unsubscribe();
+    EXPECT_TRUE(client->testSeedResponseCorrelated());
+    client->close();
+    EXPECT_EQ(client->testWorkerBindFailures(), 0u);
+    EXPECT_GE(client->testWorkerBindAcksAccepted(), 1u) << "key-derived bind tokens were accepted and acknowledged";
+    uint64_t accepted = 0;
+    for (int id = 1; id <= 3; ++id) {
+        accepted += bindsAccepted(t.node(id));
+        EXPECT_EQ(spoofed(t.node(id)), 0u);
+    }
+    EXPECT_GE(accepted, 1u);
+}
+
+// =================================================================================================================
+// 12. The seed node dies after the client holds sessions on every partition leader: the seed session fails over
+//     ONTO a node that already has a leader session (one resolution order, round-1a C1), and produce converges.
+// =================================================================================================================
+static void seedFailoverLeg(bool nat, const char* tag) {
+    const RespPorts r = RespPorts::discover(3);
+    ThreeNodes c = ThreeNodes::startWith(tag, withResponsePorts(r));
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    auto admin = connectClient(c, 1);
+    const rc::TopicSpec spec = defineTopic(*admin, "seeded", 3, 3);
+    admin->close();
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, spec.topicId, 3, leaders, 30s));
+
+    const int seed = 1;
+    auto cfg = nat ? natClient(c, seed, r) : oldClient(c, seed);
+    cfg.topics = {spec};
+    auto client = connectOrFail(cfg);
+    ASSERT_NE(client, nullptr);
+    Collector col;
+    auto subs = subscribeAll(*client, spec, col);
+    // Every partition leader now has a session (and a bind) from this client.
+    const Sent before = produceN(*client, handleOf(spec), "seedA", 0, 150, rc::Acks::All);
+    EXPECT_EQ(before.ok, 150) << before.firstBad << " undone " << before.undone;
+
+    c.stop(seed);
+    std::vector<int32_t> survivors;
+    ASSERT_TRUE(awaitLeaders(c, spec.topicId, 3, survivors, 60s)) << "every partition re-led on the survivors";
+    const Sent after = produceN(*client, handleOf(spec), "seedB", 0, 150, rc::Acks::All);
+    EXPECT_EQ(after.ok, 150) << after.firstBad << " undone " << after.undone;
+    std::set<std::string> both = asSet(before.okValues);
+    for (const auto& v : after.okValues) both.insert(v);
+    EXPECT_TRUE(waitUntil([&] { return col.count(both) == both.size(); }, 90s)) << col.count(both) << "/" << both.size();
+    for (auto& sub : subs) sub.unsubscribe();
+    // (the control client has no seed response port, but the cluster's Metadata teaches it the survivors' ports, so
+    // after the failover its seed pair is response-correlated too: only the NAT leg asserts the mode)
+    if (nat) EXPECT_TRUE(client->testSeedResponseCorrelated());
+    client->close();
+    EXPECT_GE(client->testSeedFailovers(), 1u) << "the seed never failed over";
+    for (int id : c.runningNodes()) EXPECT_EQ(spoofed(c.node(id)), 0u);
+    if (nat) EXPECT_GE(client->testWorkerBindAcksAccepted(), 1u);
+}
+
+TEST(NatEgressMatrixRegression, SeedFailoverOntoLeaderSessionNodeThenProduceRegression) { seedFailoverLeg(/*nat=*/true, "natseed"); }
+
+TEST(NatEgressMatrixRegression, SeedFailoverOldClientControlRegression) { seedFailoverLeg(/*nat=*/false, "natseedold"); }
+
+
+// =================================================================================================================
+// 13. The broker (every worker) restarts under a connected NAT'd client: the client reconnects, the new workers bind
+//     the new session (acknowledged), produce completes.
+// =================================================================================================================
+TEST(NatEgressMatrixRegression, WorkerRestartRebindsRegression) {
+    const RespPorts r = RespPorts::discover(1);
+    OneBroker b("natwrestart", OneBroker::Runtime::Shard, withResponsePorts(r));
+    rc::TopicSpec spec;
+    {
+        rc::Client* admin = b.connectClient();
+        spec = defineTopic(*admin, "restarted", 1, 1);
+    }
+    auto cfg = b.clientConfig();
+    cfg.gatewayResponseControlPort   = r.gw[0];
+    cfg.declaredEgressChannelForTest = kUnroutable;
+    cfg.connectTimeoutMs = 30'000;
+    cfg.pingTimeoutMs    = 30'000;
+    cfg.topics           = {spec};
+    auto cl = connectOrFail(cfg);
+    ASSERT_NE(cl, nullptr);
+    const Sent first = produceN(*cl, handleOf(spec), "w1", 0, 30, rc::Acks::All);
+    EXPECT_EQ(first.ok, 30) << first.firstBad << " undone " << first.undone;
+    EXPECT_GE(bindsAccepted(b.node()), 1u);
+
+    b.restart();   // every worker of the node is rebuilt; the old client session is gone
+    EXPECT_EQ(bindsAccepted(b.node()), 0u) << "fresh workers start with fresh counters";
+    // The client reconnects by itself (SessionExpired / UnknownSession) and the NEW workers bind the new session.
+    const Sent second = produceN(*cl, handleOf(spec), "w2", 0, 30, rc::Acks::All);
+    EXPECT_EQ(second.ok, 30) << second.firstBad << " undone " << second.undone;
+    EXPECT_GE(bindsAccepted(b.node()), 1u) << "the restarted worker never bound the reconnected session";
+    EXPECT_GT(bindAcksSent(b.node()), 0u) << "the restarted worker never acknowledged the bind";
+    EXPECT_EQ(spoofed(b.node()), 0u);
+    cl->close();
+    EXPECT_GE(cl->testWorkerBindAcksAccepted(), 2u) << "one acknowledged bind per worker incarnation";
 }

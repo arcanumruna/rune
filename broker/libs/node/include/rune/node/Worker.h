@@ -718,6 +718,8 @@ public:
     // -----------------------------------------------------------------------
     void setShardClient(aeron::Aeron* client, int32_t controlTermBytes = 0) {
         ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client, controlTermBytes}) : nullptr;
+        bindAcksOwed_.assign(SessionAckSink::kMaxSessions, OwedBindAck{});   // I2: preallocated once (cold), never grows
+        bindAcksOwedCount_ = 0;
         if (ackSink_) ackSink_->setDirectBudgets(directSessionAckBudget_, static_cast<uint32_t>(kDirectAckBudget));
         // A worker with its own sink has always enforced WRITE on its direct ingress: it becomes Enforcing.
         if (ackSink_) enforcement_ = Enforcing{ackSink_.get()};
@@ -2107,6 +2109,7 @@ private:
                     return &ackSealCtx_;
                 });
             work += reportSessionSignals_();
+            if (bindAcksOwedCount_ != 0) [[unlikely]] work += serviceBindAcks_();
         }
         if (work == 0) work += prepareIdle_();   // A9: only a pass that may park pays for it
         return work;
@@ -8319,12 +8322,63 @@ public:
     [[nodiscard]] uint64_t workerBindsAcceptedForTest() const noexcept { return workerBindsAccepted_; }
     [[nodiscard]] uint64_t workerBindsRefusedForTest() const noexcept { return workerBindsRefused_; }
     [[nodiscard]] uint64_t imageUnbindsForTest() const noexcept { return imageUnbinds_; }
+    /// I2 seams: WorkerBindAcks offered on a response publication / dropped because the owed list was full.
+    [[nodiscard]] uint64_t workerBindAcksSentForTest() const noexcept { return workerBindAcksSent_; }
+    [[nodiscard]] uint64_t workerBindAcksDroppedForTest() const noexcept { return workerBindAcksDropped_; }
+    [[nodiscard]] std::size_t workerBindAcksOwedForTest() const noexcept { return bindAcksOwedCount_; }
+    /// I2 test seams (worker thread, via onWorkerThreadForTest): refuse the next `n` WorkerBinds without looking at
+    /// them (a lost / refused bind), and swallow the next `n` WorkerBindAcks instead of offering them (a lost ack).
+    void dropNextWorkerBindsForTest(uint32_t n) noexcept { dropBindsForTest_ = n; }
+    void swallowNextWorkerBindAcksForTest(uint32_t n) noexcept { swallowBindAcksForTest_ = n; }
     /// I4 seam: WorkerBinds that passed the token check and went on to the image lookup / channel build.
     [[nodiscard]] uint64_t workerBindImageLookupsForTest() const noexcept { return workerBindImageLookups_; }
     /// I7 seam: Records frames delivered on a response publication (session-egress subscriptions); sum over workers.
     [[nodiscard]] uint64_t responseEgressFramesForTest() const noexcept { return responseEgressFrames_; }
 private:
     uint64_t workerBindImageLookups_ = 0;
+    // I2: a WorkerBind (first or repeated) is acknowledged with a plaintext WorkerBindAck on the session's response
+    // publication, once that publication is Ready.  A fixed-capacity list (kMaxSessions, preallocated in
+    // setShardClient): one entry per session, the latest bind's correlation id.  Full = dropped + counted (the client
+    // resends and AlreadyBound re-queues).  Worker thread only.
+    struct OwedBindAck { int64_t sid = 0; int64_t corr = 0; };
+    std::vector<OwedBindAck> bindAcksOwed_;
+    std::size_t              bindAcksOwedCount_ = 0;
+    uint64_t                 workerBindAcksSent_ = 0;
+    uint64_t                 workerBindAcksDropped_ = 0;
+    uint32_t                 dropBindsForTest_ = 0;         // TEST SEAM (worker thread)
+    uint32_t                 swallowBindAcksForTest_ = 0;   // TEST SEAM (worker thread)
+
+    /// Cold: owe `sid` a WorkerBindAck for bind correlation `corr` (dedupe by session: the latest corr wins).
+    [[gnu::cold]] [[gnu::noinline]] void oweBindAck_(int64_t sid, int64_t corr) {
+        for (std::size_t i = 0; i < bindAcksOwedCount_; ++i)
+            if (bindAcksOwed_[i].sid == sid) { bindAcksOwed_[i].corr = corr; return; }
+        if (bindAcksOwedCount_ == bindAcksOwed_.size()) { ++workerBindAcksDropped_; return; }
+        bindAcksOwed_[bindAcksOwedCount_++] = OwedBindAck{sid, corr};
+    }
+
+    /// Cold (only while the list is non-empty): offer every owed ack whose response publication is Ready.  A session
+    /// that is gone or Failed will never be answered: its entry is dropped.  Back-pressure keeps the entry.
+    [[gnu::cold]] [[gnu::noinline]] int serviceBindAcks_() {
+        int sent = 0;
+        std::size_t i = 0;
+        while (i < bindAcksOwedCount_) {
+            const OwedBindAck e = bindAcksOwed_[i];
+            bool remove = false;
+            if (aeron::ExclusivePublication* pub = ackSink_->readyPub(e.sid)) {
+                uint8_t frame[rune::protocol::client::WorkerBindAck::ENCODED_SIZE];
+                rune::protocol::client::WorkerBindAck ack;
+                ack.sessionId = e.sid; ack.correlationId = e.corr;
+                const std::size_t n = ack.encode(frame);
+                if (swallowBindAcksForTest_ > 0) [[unlikely]] { --swallowBindAcksForTest_; remove = true; }   // test seam: a lost ack
+                else if (sendEncodedToPub_(pub, frame, n) > 0) { ++workerBindAcksSent_; ++sent; remove = true; }
+            } else if (ackSink_->pubGoneOrFailed(e.sid)) {
+                remove = true;
+            }
+            if (remove) bindAcksOwed_[i] = bindAcksOwed_[--bindAcksOwedCount_];   // order is irrelevant
+            else ++i;
+        }
+        return sent;
+    }
     uint64_t responseEgressFrames_   = 0;   // I7: Records frames claimed on a session-egress subscription's response pub
     std::string responseControlEndpoint_;
     uint64_t spoofedIngressDropped_ = 0;
@@ -8360,6 +8414,7 @@ private:
     /// worker's response channel; let the sink check the token and bind.
     [[gnu::cold]] [[gnu::noinline]] void handleWorkerBind_(const uint8_t* data, std::size_t len, int32_t image) {
         namespace pc = rune::protocol::client;
+        if (dropBindsForTest_ > 0) [[unlikely]] { --dropBindsForTest_; ++workerBindsRefused_; return; }   // test seam
         const auto msg = pc::WorkerBind::decode(data, len);
         if (!msg || !ackSink_ || responseControlEndpoint_.empty()) {
             ++workerBindsRefused_;
@@ -8370,7 +8425,14 @@ private:
         // I4: authorize BEFORE any work.  A WorkerBind is unauthenticated until its token checks out, and any sender
         // can aim one at a worker: an unknown session / wrong token / already-bound session costs one probe and a
         // constant-time compare - no image lookup, no channel string.
-        if (const auto chk = ackSink_->checkBind(msg->sessionId, msg->token); chk != SessionAckSink::BindResult::Bound) {
+        const auto chk = ackSink_->checkBind(msg->sessionId, msg->token);
+        if (chk == SessionAckSink::BindResult::AlreadyBound) {
+            // I2: a repeat of the accepted bind (the client has not seen the ack): same image -> owe the ack again.
+            if (ackSink_->boundImage(msg->sessionId) == image) { oweBindAck_(msg->sessionId, msg->correlationId); return; }
+            ++workerBindsRefused_;
+            return;
+        }
+        if (chk != SessionAckSink::BindResult::Bound) {
             ++workerBindsRefused_;
             if (unauthLog_.due(19))
                 spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused (result {}; refused so far {})",
@@ -8388,7 +8450,7 @@ private:
         const std::string channel = "aeron:udp?control=" + responseControlEndpoint_ +
                                     "|control-mode=response|response-correlation-id=" + std::to_string(corr);
         const auto r = ackSink_->bind(msg->sessionId, msg->token, image, channel);
-        if (r == SessionAckSink::BindResult::Bound) { ++workerBindsAccepted_; return; }
+        if (r == SessionAckSink::BindResult::Bound) { ++workerBindsAccepted_; oweBindAck_(msg->sessionId, msg->correlationId); return; }
         ++workerBindsRefused_;
         if (unauthLog_.due(19))
             spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused (result {}; refused so far {})",

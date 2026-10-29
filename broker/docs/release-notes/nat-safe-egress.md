@@ -10,7 +10,7 @@ the flow the client opened.
 - The gateway and every worker have a response-control port (see [nat-egress.md](nat-egress.md) for the derived layout).
 - The client sets the seed's gateway response port: `ClientConfig::gatewayResponseControlPort`,
   `--gateway-response-port`, `RUNE_GATEWAY_RESPONSE_PORT`. Other brokers' ports come from Metadata.
-- Each worker session is bound by a 16-byte token (`WorkerBind`). The token travels in plaintext, also on a TLS session.
+- Each worker session is bound by a 16-byte token (`WorkerBind`), and the worker answers with a `WorkerBindAck`. A TLS session's token is derived from its TLS keys and never sent; a plaintext session's token rides the `ConnectResponse`.
 - The session's source address in principals and logs is the observed one, not the declared one (fixes #227).
 
 ## Compatibility

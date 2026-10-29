@@ -44,4 +44,10 @@ void secureZero(std::span<uint8_t> buf) noexcept;
 struct ClusterKeyMaterial { std::array<uint8_t, 64> master{}; uint64_t keyId = 0; };
 [[nodiscard]] std::optional<ClusterKeyMaterial> deriveClusterKey(std::span<const uint8_t> fileContents) noexcept;
 
+/// I3 — the ONE derivation of a TLS session's worker-bind token (broker gateway and client): HKDF-SHA256(ikm = the
+/// session's client->broker key (32 B), salt = sessionId little-endian (8 B), info = "rune-worker-bind-v1"), 16 B.  The
+/// token never crosses the wire: both ends derive it from the TLS-exported keys.  All-zero on any failure (a zero
+/// token is "none": never sent, never accepted).
+[[nodiscard]] std::array<uint8_t, 16> deriveWorkerBindToken(std::span<const uint8_t> c2bKey, int64_t sessionId) noexcept;
+
 } // namespace rune::crypto

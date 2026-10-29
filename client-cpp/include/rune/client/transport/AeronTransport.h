@@ -456,6 +456,15 @@ public:
     /// pair (publication, and the old response subscription, retired and released at the next poll) is released only
     /// after both new ones are Ready.  A failure keeps the old pair.
     bool retarget(const std::string& newIngressChannel, int32_t responsePort = 0) noexcept;
+    /// A response subscription is ONE-SHOT: Aeron pins it to the first response publication session that reaches it, so
+    /// a second response publication to the same request image (a reconnect, a rebind of a new session) or to ANOTHER
+    /// request publication correlated with the same subscription can never connect.  Every response pair therefore owns
+    /// its subscription (never shared, never deduplicated), and every new connect episode / session bind builds a FRESH
+    /// pair (new response subscription + new request publication, hence a new image).  rePairSeedResponse: the seed's
+    /// pair; rePairResponsePublication: the pair of the handle `h` (the handle stays valid and offerOn re-resolves it).
+    /// Both cold; false = not response-paired / failed (the old pair is intact).
+    bool rePairSeedResponse(int32_t responsePort) noexcept { return retarget(cfg_.ingressChannel, responsePort); }
+    bool rePairResponsePublication(PubHandle h) noexcept;
 
 private:
     // ---- Configuration -------------------------------------------------------
@@ -597,7 +606,7 @@ private:
     };
     /// Open (idempotently, among Live slots) a subscription slot; its index, or -1 on allocation failure.  Cold.
     /// I1: every successful call is one OWNER of the slot and must be matched by one retireSubSlot_ on its release path.
-    int32_t addSubSlot_(const std::string& channel, int32_t streamId) noexcept;
+    int32_t addSubSlot_(const std::string& channel, int32_t streamId, bool fresh = false) noexcept;
     /// A response subscription retired by retarget() may be the one whose poll callback is running: it is only
     /// marked here and released (with its assembler) at the start of the next poll().
     void retireSubSlot_(int32_t idx) noexcept;

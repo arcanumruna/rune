@@ -15,8 +15,10 @@
 #include <rune/client/agent/AgentRingMessages.h>
 #include <rune/client/codec/CryptoFrame.h>  // Task 6: data-plane seal/open
 #include <rune/client/codec/DataCodec.h>
+#include <rune/crypto/Kdf.h>  // I3: deriveWorkerBindToken
 #include <rune/protocol/client/MessageHeader.h>  // Task 1.3: re-stamp sessionId (offset 8)
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>     // Task 1.3: nowNs for lazy session connect
 #include <cstdlib>    // aligned_alloc / free
@@ -759,6 +761,7 @@ bool ClientAgent::retarget(const std::string& newIngressChannel, int32_t respons
     const bool moved = transport_.retarget(newIngressChannel, responsePort);
     if (moved) {
         seedSession().responsePort = responsePort;
+        seedSession().pairPinned   = false;   // the retarget built a fresh pair
         invalidateRouteSessions_();  // DR client bug 1: the seed moved
     }
     return moved;
@@ -774,6 +777,7 @@ bool ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs, bool
             seed.currentLeaderChannel = channel;
             seed.currentLeaderNode    = -1;   // learnt from the next metadata answer
             seed.responsePort         = port;
+            seed.pairPinned           = false;   // fresh pair
             invalidateRouteSessions_();
         }
     } catch (...) {
@@ -828,6 +832,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     // Retired-episode rule (#426): a session id whose keys were discarded is remembered by its machine
     // (namesRetiredSealedSession); a frame naming it that no live key opens is dropped, except a clear ErrorResponse
     // answering the new episode's in-flight ConnectRequest.
+    // I2: a WorkerBindAck (87) is plaintext BY CONTRACT even on an encrypted session (it carries only the session id and
+    // the bind's correlation id, no secret) and is not an ingress template (checkFrame refuses it): handled here, before
+    // the sealed-session filter, and only an exact (sid, corr) match of a Sent bind changes anything.
+    if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE &&
+        rune::protocol::client::detail::getLE16(buf, 2) == rune::protocol::client::WorkerBindAck::TEMPLATE_ID) {
+        onWorkerBindAck_(buf, len);
+        return;
+    }
     if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE) {
         const auto peekedTid = static_cast<codec::TemplateId>(
             rune::protocol::client::detail::getLE16(buf, 2));
@@ -925,6 +937,8 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // new connect episode; a stale / duplicate / ignored one changes nothing.
         const bool awaited = s.machine.state() == session::SessionState::Connecting &&
                              s.machine.correlationId() == opt->correlationId;
+        // A ConnectResponse that came back on the response pair spent it (see Session::pairPinned).
+        if (awaited && s.responsePort != 0) s.pairPinned = true;
         s.machine.onConnectResponse(
             opt->code,
             opt->leaderMemberId,
@@ -964,6 +978,9 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             s.bindToken    = opt->v16 ? opt->bindToken : std::array<uint8_t, 16>{};
             s.bindRequired = false;
             for (const uint8_t b : s.bindToken) s.bindRequired = s.bindRequired || b != 0;
+            // I3: a TLS session's token never rides the wire (the v16 tail is all-zero): it is derived from the session
+            // keys once the handshake completes (serviceWorkerBinds_), so a v16 TLS answer still requires a bind.
+            if (opt->v16 && opt->chosenCipher != 0) s.bindRequired = true;
         }
         if (lastConnectAccepted_) {
             ++s.connectEpoch;                  // MEDIUM-1: a new connect episode
@@ -1261,6 +1278,7 @@ bool ClientAgent::retargetSeedOnConnectRedirect_(const std::string& endpoint, in
         seed.currentLeaderChannel = channel;
         seed.currentLeaderNode    = -1;   // the node id is learnt from the metadata answer
         seed.responsePort         = responsePort;
+        seed.pairPinned           = false;   // the retarget built a fresh pair
         invalidateRouteSessions_();       // DR client bug 1: the seed moved
         return true;
     } catch (...) {
@@ -1303,6 +1321,7 @@ bool ClientAgent::retargetSeedToBootstrap_() noexcept {
     seed.lastKnownLeaderNode    = seed.currentLeaderNode;
     seed.lastKnownLeaderResponsePort = seed.responsePort;
     seed.responsePort           = bootstrapPort;
+    seed.pairPinned             = false;   // fresh pair
     seed.currentLeaderChannel   = bootstrap;
     seed.currentLeaderNode      = -1;  // unknown until the gateway redirects us again
     invalidateRouteSessions_();        // DR client bug 1: the seed moved
@@ -1321,6 +1340,7 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
     seed.currentLeaderChannel = seed.lastKnownLeaderChannel;
     seed.currentLeaderNode    = seed.lastKnownLeaderNode;
     seed.responsePort         = seed.lastKnownLeaderResponsePort;
+    seed.pairPinned           = false;   // fresh pair
     invalidateRouteSessions_();  // DR client bug 1: the seed moved
     return true;
 }
@@ -1342,13 +1362,29 @@ bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t
     // The seed → the default publication (wherever it points: byte-identical
     // single-node fast path).  Any other session → its own endpoint over the
     // shared transport (default ingress stream id).
+    // I2/reconnect: a new connect episode on a spent response pair first builds a fresh pair (the offer below then
+    // waits for it: the machine's connect retry re-sends).
+    if (owner.pairPinned && len >= 4 &&
+        rune::protocol::client::detail::getLE16(buf, 2) == static_cast<uint16_t>(codec::TemplateId::Connect)) [[unlikely]] {
+        rePairSessionResponse_(owner);
+    }
     if (&owner == &seedSession()) return transport_.offer(buf, len);
     // NAT-safe egress: a session opened with a known response port rides its response-correlated publication.
     if (owner.ctlPub != transport::AeronTransport::kNoPub) return transport_.offerOn(owner.ctlPub, buf, len);
     return transport_.offerTo(owner.endpoint, cfg_.transport.ingressStreamId, buf, len);
 }
 
+void ClientAgent::rePairSessionResponse_(Session& s) noexcept {
+    // The pair is spent only while a response port is in force; a failed re-pair keeps the flag (the next Connect send
+    // tries again) and the old pair.
+    if (s.responsePort == 0) { s.pairPinned = false; return; }
+    const bool ok = (&s == &seedSession()) ? transport_.rePairSeedResponse(s.responsePort)
+                                           : transport_.rePairResponsePublication(s.ctlPub);
+    if (ok) s.pairPinned = false;
+}
+
 void ClientAgent::attachResponsePub_(Session& s, int32_t port, bool upgradePlain) noexcept {
+    s.pairPinned = false;   // a freshly built pair is unused
     // The ONE place a leader session's control publication is built (openSession_, and the upgrade of a session that
     // was opened plain before Metadata / a Redirect taught the port).  port 0 = the declared path.
     s.responsePort = port;
@@ -1874,23 +1910,78 @@ int ClientAgent::serviceWorkerBinds_() noexcept {
             if (e.sessionIndex == kNoSession) continue;   // the route's first offer opens it
         }
         if (e.sessionIndex >= sessions_.size()) { e.sessionIndex = kNoSession; continue; }
-        const Session& s = *sessions_[e.sessionIndex];
+        Session& s = *sessions_[e.sessionIndex];
         if (!s.bindRequired || s.machine.state() != session::SessionState::Connected) continue;
         const int64_t sid = s.machine.sessionId();
         if (sid == 0) continue;
-        const auto* bound = std::get_if<WorkerBindEntry::Bound>(&e.state);
-        if (bound != nullptr && bound->sid == sid) continue;
-        // The very first frame on this worker publication for this session: PLAINTEXT, never sealed.
+        if (const auto* bound = std::get_if<WorkerBindEntry::Bound>(&e.state); bound != nullptr && bound->sid == sid) continue;
+        // I3: the TLS-derived token (same derivation as the gateway's), computed once per connect episode (the
+        // ConnectResponse resets the token); never a WorkerBind with a zero token.
+        if (s.machine.cryptoState().encrypted && std::all_of(s.bindToken.begin(), s.bindToken.end(), [](uint8_t b) { return b == 0; })) {
+            const auto& c2b = s.machine.cryptoState().c2bKey;
+            const auto tok = rune::crypto::deriveWorkerBindToken(std::span<const uint8_t>(c2b.bytes, sizeof c2b.bytes), sid);
+            s.bindToken = tok;
+        }
+        {
+            bool nonZero = false;
+            for (const uint8_t b : s.bindToken) nonZero = nonZero || b != 0;
+            if (!nonZero) continue;
+        }
+        // I2: an unacknowledged bind is resent at kBindRetryNs steps; after kBindMaxAttempts the session reconnects
+        // (a fresh connect issues a fresh token and announce, the bind starts over).
+        auto* pending = std::get_if<WorkerBindEntry::Sent>(&e.state);
+        if (pending != nullptr && pending->sid == sid) {
+            if (dutyNowNs_ < pending->nextRetryNs) continue;
+            if (pending->attempts >= kBindMaxAttempts) {
+                if ((workerBindFailures_++ & 1023u) == 0)
+                    std::fprintf(stderr, "rune-client: WorkerBind for session %lld unacknowledged after %u attempts "
+                                 "(%llu failures so far); reconnecting\n", static_cast<long long>(sid),
+                                 static_cast<unsigned>(pending->attempts), static_cast<unsigned long long>(workerBindFailures_));
+                e.state = WorkerBindEntry::Unbound{};
+                s.machine.forceReconnect(dutyNowNs_);
+                s.connectSubmitted = true;
+                ++sent;
+                continue;
+            }
+        }
+        // The first bind of a NEW session on a spent pair: the old session's worker response publication pinned the
+        // response subscription, so this session's bind rides a fresh pair (new request publication = new image).  The
+        // offer below fails until the pair is Ready; the next pass sends.
+        if ((pending == nullptr || pending->sid != sid) && e.pairUsed) {
+            if (transport_.rePairResponsePublication(e.pub)) { e.pairUsed = false; e.state = WorkerBindEntry::Unbound{}; }
+            else continue;   // could not re-pair now (cold failure): try again next pass
+            pending = nullptr;
+        }
+        // The frame is PLAINTEXT, never sealed (the first frame on a worker publication for this session).
         uint8_t frame[rune::protocol::client::WorkerBind::ENCODED_SIZE];
-        const std::size_t n = codec::encodeWorkerBind(frame, sizeof frame, sid, ++bindCorrId_, s.bindToken);
+        const int64_t corr = bindCorrId_ + 1;
+        const std::size_t n = codec::encodeWorkerBind(frame, sizeof frame, sid, corr, s.bindToken);
         if (n == 0) continue;
         if (transport_.offerOn(e.pub, frame, n)) {
-            e.state = WorkerBindEntry::Bound{sid};
+            bindCorrId_ = corr;
+            e.pairUsed = true;
+            const uint8_t attempts = (pending != nullptr && pending->sid == sid) ? static_cast<uint8_t>(pending->attempts + 1) : uint8_t{1};
+            e.state = WorkerBindEntry::Sent{sid, corr, attempts, dutyNowNs_ + kBindRetryNs};
             ++workerBindsSent_;
             ++sent;
         }
     }
     return sent;
+}
+
+void ClientAgent::onWorkerBindAck_(const uint8_t* buf, std::size_t len) noexcept {
+    const auto ack = codec::decodeWorkerBindAck(buf, len);
+    if (ack) {
+        for (WorkerBindEntry& e : workerBinds_) {
+            const auto* sent = std::get_if<WorkerBindEntry::Sent>(&e.state);
+            if (sent != nullptr && sent->sid == ack->sessionId && sent->corr == ack->correlationId) {
+                e.state = WorkerBindEntry::Bound{ack->sessionId};
+                ++workerBindAcksAccepted_;
+                return;
+            }
+        }
+    }
+    ++workerBindAcksIgnored_;   // malformed, late (already Bound), stale sid / corr, or for no entry
 }
 
 bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,

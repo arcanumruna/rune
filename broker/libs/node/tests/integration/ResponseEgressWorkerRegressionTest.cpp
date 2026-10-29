@@ -8,6 +8,7 @@
 // clients written here (own embedded driver per client, so each has its own source port).  Waits are bounded by an
 // iteration cap AND a steady_clock deadline; the only real-time waits are on the real driver / broker.
 #include <rune/aeronutil/testing/FreePort.h>
+#include <rune/crypto/TlsSession.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeConfig.h>
@@ -30,6 +31,8 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -128,6 +131,8 @@ constexpr uint16_t kRecords     = static_cast<uint16_t>(pc::TemplateId::Records)
 constexpr uint16_t kSubResp     = static_cast<uint16_t>(pc::TemplateId::SubscribeResponse);
 constexpr uint16_t kDefineResp  = static_cast<uint16_t>(pc::TemplateId::DefineTopicResponse);
 constexpr uint16_t kConnectResp = static_cast<uint16_t>(pc::TemplateId::ConnectResponse);
+constexpr uint16_t kBindAck     = static_cast<uint16_t>(pc::TemplateId::WorkerBindAck);
+constexpr uint16_t kHsContResp  = static_cast<uint16_t>(pc::TemplateId::HandshakeContinueResponse);
 
 /// Resolve an async registration exactly once (Aeron 1.51: a second find with the same id throws).
 template <class Add, class Find> auto resolveOnce(Add&& add, Find&& find) {
@@ -209,6 +214,25 @@ public:
         if (!waitGw([&] { return findGw(kConnectResp, corr) != nullptr; })) return std::nullopt;
         const Frame* f = findGw(kConnectResp, corr);
         return pc::ConnectResponse::decode(f->bytes.data(), f->bytes.size());
+    }
+    /// I3: a TLS connect (cipher offer + the client's opening handshake bytes), response-correlated.
+    std::optional<pc::ConnectResponse> connectTls(int64_t corr, uint8_t cipher, const std::string& hello) {
+        pc::ConnectRequest req;
+        req.correlationId = corr; req.egressStreamId = respStream_; req.clientVersion = pc::kClientVersionResponseEgress;
+        req.egressChannel = kUnroutable; req.responseCorrelated = true;
+        const uint8_t ciphers[1] = {cipher};
+        req.cipherList = std::span<const uint8_t>(ciphers, 1);
+        req.handshakeBytes = hello;
+        std::vector<uint8_t> buf(req.encodedSize());
+        if (!offerGw(buf.data(), req.encode(buf.data()))) return std::nullopt;
+        if (!waitGw([&] { return findGw(kConnectResp, corr) != nullptr; })) return std::nullopt;
+        const Frame* f = findGw(kConnectResp, corr);
+        return pc::ConnectResponse::decode(f->bytes.data(), f->bytes.size());
+    }
+    bool sendHandshakeContinue(int64_t sid, int64_t corr, const std::string& bytes) {
+        pc::HandshakeContinue hc; hc.sessionId = sid; hc.correlationId = corr; hc.handshakeBytes = bytes;
+        std::vector<uint8_t> buf(hc.encodedSize());
+        return offerGw(buf.data(), hc.encode(buf.data()));
     }
     bool sendWorkerBind(int64_t sid, int64_t corr, const std::array<uint8_t, 16>& token) {
         pc::WorkerBind b; b.sessionId = sid; b.correlationId = corr; b.token = token;
@@ -344,8 +368,15 @@ struct Env {
     int64_t setupSid = 0;
     std::string nodeTag;
 
-    Env() {
-        node = std::make_unique<BrokerNode>(makeConfig(dir.path, p));
+    explicit Env(bool tls = false) {
+        NodeConfig cfg = makeConfig(dir.path, p);
+        if (tls) {   // I3: the gateway serves TLS (the rune-crypto test certificate); plaintext sessions stay allowed
+            const fs::path td = RUNE_CRYPTO_TESTDATA_DIR;
+            cfg.tlsCertFile = (td / "server.pem").string();
+            cfg.tlsKeyFile  = (td / "server.key").string();
+            cfg.clientTransport = ClientTransport::PlaintextForTest;
+        }
+        node = std::make_unique<BrokerNode>(cfg);
         node->start();
     }
     ~Env() { setup.reset(); if (node) node->stop(); }
@@ -712,10 +743,12 @@ TEST(ResponseEgressWorkerRegression, TwoClientsOneHostSeeOnlyTheirOwnRegression)
     a.drainFor(300ms); b.drainFor(300ms);
     for (const auto& f : a.wk()) {
         EXPECT_EQ(f.sessionId, ra->assignedSessionId);
+        if (f.templateId == kBindAck) { EXPECT_EQ(f.correlationId, 2) << "A's bind ack echoes A's bind"; continue; }
         EXPECT_GE(f.correlationId, 1000); EXPECT_LT(f.correlationId, 1000 + kN);
     }
     for (const auto& f : b.wk()) {
         EXPECT_EQ(f.sessionId, rb->assignedSessionId);
+        if (f.templateId == kBindAck) { EXPECT_EQ(f.correlationId, 2) << "B's bind ack echoes B's bind"; continue; }
         EXPECT_GE(f.correlationId, 2000); EXPECT_LT(f.correlationId, 2000 + kN);
     }
     ASSERT_TRUE(a.sendSubscribe(ra->assignedSessionId, 500, e.topic, 0));
@@ -728,4 +761,104 @@ TEST(ResponseEgressWorkerRegression, TwoClientsOneHostSeeOnlyTheirOwnRegression)
     EXPECT_EQ(recordValues(b.wk(), rb->assignedSessionId, &bOk).size(), 2u * kN);
     EXPECT_TRUE(aOk) << "client A saw a Records frame of another session";
     EXPECT_TRUE(bOk) << "client B saw a Records frame of another session";
+}
+
+// ---- I2: the worker acknowledges the bind --------------------------------------------------------------------------
+
+namespace {
+int ackCount(const WClient& c, int64_t sid, int64_t corr) {
+    int n = 0;
+    for (const auto& f : c.wk()) n += (f.templateId == kBindAck && f.sessionId == sid && f.correlationId == corr) ? 1 : 0;
+    return n;
+}
+std::string readFile(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+}  // namespace
+
+// The accepted bind is answered with a plaintext WorkerBindAck (sid, corr) on the worker response publication; a
+// repeated bind (same image, same token) is answered again and changes nothing; refused binds are never answered.
+TEST(ResponseEgressWorkerRegression, WorkerBindIsAcknowledgedAndARepeatIsAnsweredAgainRegression) {
+    Env e; ASSERT_TRUE(e.awaitLeader());
+    TmpDir vdir{"v7"}, adir{"a7"};
+    WClient victim(vdir.path, e.p, WClient::Mode::Response);
+    WClient attacker(adir.path, e.p, WClient::Mode::WorkerOnly);
+    const auto r = victim.connect(1, pc::kClientVersionResponseEgress, true, kUnroutable);
+    ASSERT_TRUE(r.has_value());
+    const int64_t sid = r->assignedSessionId;
+    // refused first: a wrong token and an unknown session get no ack (and the attacker has no publication anyway)
+    std::array<uint8_t, 16> wrong = r->bindToken; wrong[0] ^= 0x80;
+    ASSERT_TRUE(victim.sendWorkerBind(sid, 5, wrong));
+    ASSERT_TRUE(e.awaitCounter([&] { return e.bindsRefused() >= 1; }));
+    victim.drainFor(200ms);
+    EXPECT_EQ(victim.count(victim.wk(), kBindAck), 0) << "a refused bind must not be acknowledged";
+    // accepted
+    ASSERT_TRUE(victim.sendWorkerBind(sid, 6, r->bindToken));
+    ASSERT_TRUE(victim.waitWk([&] { return ackCount(victim, sid, 6) == 1; })) << "no WorkerBindAck for the accepted bind";
+    EXPECT_EQ(e.bindsAccepted(), 1u);
+    // the repeat (the client has not seen the ack): answered again, no second bind
+    ASSERT_TRUE(victim.sendWorkerBind(sid, 7, r->bindToken));
+    ASSERT_TRUE(victim.waitWk([&] { return ackCount(victim, sid, 7) == 1; })) << "a repeated bind must be answered again";
+    EXPECT_EQ(e.bindsAccepted(), 1u) << "the repeat is not a second bind";
+    EXPECT_EQ(e.node->onWorkerThreadForTest(0, [](Worker& w) { return w.workerBindAcksSentForTest(); }), 2u);
+    // another image with the stolen token: refused, no ack on the victim's publication for it
+    ASSERT_TRUE(attacker.openWorker());
+    ASSERT_TRUE(attacker.sendWorkerBind(sid, 8, r->bindToken));
+    ASSERT_TRUE(e.awaitCounter([&] { return e.bindsRefused() >= 2; }));
+    victim.drainFor(300ms);
+    EXPECT_EQ(ackCount(victim, sid, 8), 0) << "a bind from another image must not be acknowledged";
+    EXPECT_TRUE(attacker.wk().empty());
+    // the acks left in plaintext with exactly the 24-byte layout
+    for (const auto& f : victim.wk()) if (f.templateId == kBindAck) EXPECT_EQ(f.bytes.size(), 24u);
+}
+
+// I3: a TLS session's ConnectResponse carries an ALL-ZERO bind token; the token is derived from the TLS keys on both
+// ends.  A bind with the zero token (what the first leg disclosed) is refused; the derived token binds and is acked.
+TEST(ResponseEgressWorkerRegression, TlsConnectResponseCarriesNoBindTokenRegression) {
+    Env e(/*tls=*/true); ASSERT_TRUE(e.awaitLeader());
+    TmpDir cdir{"tls1"};
+    WClient c(cdir.path, e.p, WClient::Mode::Response);
+    ASSERT_TRUE(c.ready());
+    const std::string ca = readFile(fs::path(RUNE_CRYPTO_TESTDATA_DIR) / "ca.pem");
+    auto tls = rune::crypto::TlsSession::makeClient(ca.c_str(), "127.0.0.1");
+    ASSERT_TRUE(tls.valid());
+    uint8_t hello[16384];
+    (void)tls.readInbound(nullptr, 0);   // kick off the ClientHello
+    const std::size_t hn = tls.writeOutbound(hello, sizeof hello);
+    ASSERT_GT(hn, 0u);
+    const auto cipher = rune::crypto::bestLocalCipher();
+    const auto r = c.connectTls(1, static_cast<uint8_t>(cipher), std::string(reinterpret_cast<const char*>(hello), hn));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->code, 0);
+    ASSERT_NE(r->chosenCipher, 0) << "the broker did not offer TLS";
+    ASSERT_TRUE(r->v16) << "a response-mode shard session still gets the v16 tail";
+    EXPECT_EQ(r->bindToken, (std::array<uint8_t, 16>{})) << "the TLS first leg must not disclose a bind token";
+    const int64_t sid = r->assignedSessionId;
+
+    // finish the handshake (server flight -> client Finished -> broker installs the keys and re-announces the token)
+    (void)tls.readInbound(reinterpret_cast<const uint8_t*>(r->handshakeBytes.data()), r->handshakeBytes.size());
+    uint8_t fin[16384];
+    const std::size_t fn = tls.writeOutbound(fin, sizeof fin);
+    ASSERT_TRUE(tls.done()) << "the client side of the handshake did not complete";
+    ASSERT_GT(fn, 0u);
+    ASSERT_TRUE(c.sendHandshakeContinue(sid, 2, std::string(reinterpret_cast<const char*>(fin), fn)));
+    const auto keys = tls.exportKeys(static_cast<rune::crypto::Cipher>(r->chosenCipher), sid);
+    ASSERT_NE(keys.cipher, rune::crypto::Cipher::None);
+    const auto derived = rune::crypto::deriveWorkerBindToken(keys, sid);
+    ASSERT_NE(derived, (std::array<uint8_t, 16>{}));
+
+    // The zero token (all the first leg disclosed) never binds.
+    ASSERT_TRUE(c.sendWorkerBind(sid, 10, std::array<uint8_t, 16>{}));
+    ASSERT_TRUE(e.awaitCounter([&] { return e.bindsRefused() >= 1; })) << "the all-zero token was not refused";
+    EXPECT_EQ(e.bindsAccepted(), 0u);
+    // The derived token binds (retried: the broker's keyReady announce may land after the first attempt, exactly as the
+    // client's resend covers) and is acknowledged in plaintext.
+    bool acked = false;
+    for (int64_t corr = 20; corr < 60 && !acked; ++corr) {
+        ASSERT_TRUE(c.sendWorkerBind(sid, corr, derived));
+        acked = c.waitWk([&] { return c.count(c.wk(), kBindAck) >= 1; }, 250ms);
+    }
+    ASSERT_TRUE(acked) << "the derived token was never accepted";
+    EXPECT_EQ(e.bindsAccepted(), 1u);
 }

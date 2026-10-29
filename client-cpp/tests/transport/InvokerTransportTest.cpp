@@ -1042,9 +1042,10 @@ TEST(InvokerTransportResponseRegression, ResponseHandleForAnExistingPlainKeyRetu
     t.stop();
 }
 
-// I1 (fix round 1a): the response subscription of a gateway is SHARED by the seed pair and by a correlated
-// publication to the same endpoint; retargeting the seed away releases only the seed's share.
-TEST(AeronTransportRegression, SharedResponseSubscriptionSurvivesSeedRetargetRegression) {
+// I1 (fix round 1a) revisited (1b): Aeron pins a response subscription to the FIRST response publication session that
+// reaches it, so two request publications can never share one: the seed pair and a correlated publication to the SAME
+// endpoint each own their response subscription; retargeting the seed away releases only the seed's.
+TEST(AeronTransportRegression, SeedAndLeaderPairsOwnTheirOwnResponseSubscriptionRegression) {
     const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
     const uint16_t reqB = rune::client::testing::allocFreeUdpPort(), rB = rune::client::testing::allocFreeUdpPort();
     Config c = responseConfig(loopback(reqA), rA, 3550);
@@ -1061,13 +1062,12 @@ TEST(AeronTransportRegression, SharedResponseSubscriptionSurvivesSeedRetargetReg
     ASSERT_TRUE(respCtl.has_value());
     const Transport::PubHandle h = t.responsePublicationHandle(gwA, 3551, *respCtl);
     ASSERT_NE(h, Transport::kNoPub);
-    EXPECT_EQ(t.subSlotOwnersForTest(slot), 2u) << "the same Live slot is shared, counted";
+    EXPECT_EQ(t.subSlotOwnersForTest(slot), 1u) << "the seed's response subscription is never shared (one-shot per pair)";
 
     // The seed fails over to B: only the seed's share is released.
     ASSERT_TRUE(t.retarget(loopback(reqB), rB));
     for (int i = 0; i < 5; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }   // reap pass
-    EXPECT_TRUE(t.subSlotLiveForTest(slot)) << "the second owner's subscription must not be closed";
-    EXPECT_EQ(t.subSlotOwnersForTest(slot), 1u);
+    EXPECT_FALSE(t.subSlotLiveForTest(slot)) << "the seed's own subscription is released with its pair";
 
     // ... and the second owner's publication still offers and its reply still arrives.
     RawServer srv(c.dataDir, gwA, 3551, rA, c.egressStreamId);

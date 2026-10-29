@@ -2694,7 +2694,10 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             }
             if (pending.workerResponse) {
                 resp.v16       = true;   // NAT-safe egress (Task 6): the token the client's WorkerBind must prove
-                resp.bindToken = pending.bindToken;
+                // I3: a TLS session's token never crosses the wire - both ends derive it from the TLS-exported keys
+                // (rune::crypto::deriveWorkerBindToken); the first leg carries the all-zero "derive it" marker.  The
+                // random first-wave token (announced to the workers) is never disclosed.
+                resp.bindToken = pending.tls ? std::array<uint8_t, 16>{} : pending.bindToken;
             }
             if (pending.tls) {
                 // client<->broker TLS/AEAD (Task 7): offer the chosen cipher +
@@ -2903,6 +2906,9 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
                                       pending.clientVersion);
     session.sourceHost     = std::move(pending.sourceHost);
     session.sourceIdentity = std::move(pending.sourceIdentity);
+    // I3: a worker-response TLS session binds with the token derived from its keys (see the first-leg ConnectResponse);
+    // the keyReady announce below replaces the random first-wave token the workers hold while awaiting the bind.
+    if (pending.workerResponse) pending.bindToken = rune::crypto::deriveWorkerBindToken(keys, pending.sessionId);
     session.bindToken      = pending.bindToken;   // Task 6: all-zero unless a worker-response session
     // The TLS handshake took time: the login deadline runs from the moment the session exists.
     if (auto* first = std::get_if<rune::gateway::AuthAwaitingFirst>(&session.auth)) first->deadlineNs = nowNs + authTimeoutNs_;

@@ -139,4 +139,14 @@ std::optional<ClusterKeyMaterial> deriveClusterKey(std::span<const uint8_t> cont
     return m;
 }
 
+std::array<uint8_t, 16> deriveWorkerBindToken(std::span<const uint8_t> c2bKey, int64_t sessionId) noexcept {
+    std::array<uint8_t, 16> out{};
+    uint8_t salt[8];
+    const auto u = static_cast<uint64_t>(sessionId);
+    for (int i = 0; i < 8; ++i) salt[i] = static_cast<uint8_t>(u >> (8 * i));
+    if (c2bKey.size() != 32 || !hkdf(Digest::Sha256, c2bKey, std::span<const uint8_t>(salt, 8), sv("rune-worker-bind-v1"), out))
+        return std::array<uint8_t, 16>{};
+    return out;
+}
+
 } // namespace rune::crypto

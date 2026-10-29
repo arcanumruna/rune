@@ -1208,3 +1208,27 @@ TEST(WorkerBindRegression, WrongTemplateOrSchemaOrShortBlockIsRefused) {
     bad = buf; bad[0] = 8; bad[1] = 0;    // blockLength < 16
     EXPECT_FALSE(rpc::WorkerBind::decode(bad.data(), bad.size()).has_value());
 }
+
+TEST(WorkerBindAckRegression, RoundTripAndEveryTruncationIsRefused) {
+    rpc::WorkerBindAck a;
+    a.sessionId = 0x1122334455667788; a.correlationId = 77;
+    std::array<uint8_t, 32> buf{};
+    const std::size_t n = a.encode(buf.data());
+    ASSERT_EQ(n, 24u);
+    EXPECT_EQ(rpc::WorkerBindAck::ENCODED_SIZE, 24u);
+    EXPECT_EQ(leU16(buf.data(), 2), 87u);
+    EXPECT_EQ(leS64(buf.data(), 8), a.sessionId);
+    EXPECT_EQ(leS64(buf.data(), 16), 77);
+    const auto d = rpc::WorkerBindAck::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->sessionId, a.sessionId);
+    EXPECT_EQ(d->correlationId, 77);
+    for (std::size_t cut = 0; cut < 24; ++cut)
+        EXPECT_FALSE(rpc::WorkerBindAck::decode(buf.data(), cut).has_value()) << "cut=" << cut;
+    // broker -> client only: an ingress never accepts it
+    EXPECT_FALSE(rpc::isKnownTemplate(87));
+    auto bad = buf; bad[2] = 86;
+    EXPECT_FALSE(rpc::WorkerBindAck::decode(bad.data(), n).has_value());
+    bad = buf; bad[4] ^= 0x01;
+    EXPECT_FALSE(rpc::WorkerBindAck::decode(bad.data(), n).has_value());
+}
