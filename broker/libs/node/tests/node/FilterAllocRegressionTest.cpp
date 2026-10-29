@@ -87,6 +87,7 @@ TEST(FilterAllocRegression, SteadyStateFilteredPushAllocatesNothingRegression) {
     EmbeddedDriverConfig dc;
     dc.dir = (root / "aeron").string();
     dc.termBufferBytes = 16 * 1024 * 1024;
+    dc.mtuBytes = 4096;   // the 32-row control batches exceed it on every host: the vectored (zero-copy) offer is what is gated
     auto driver = std::make_unique<EmbeddedDriver>(dc, DriverMode::Threaded);
     aeron::Context ctx;
     ctx.aeronDir(dc.dir);

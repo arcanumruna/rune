@@ -2,21 +2,21 @@
 // handler a buffer over the payload with offset 0, so reassembly must judge contiguity by header.termOffset().
 // An embedded C media driver carries a 60 000 B message over a 4 KiB MTU (many fragments) and a 10 B message.
 #include <rune/aeronutil/FragmentAssembler.h>
+#include <rune/node/EmbeddedDriver.h>
 
 #include <Aeron.h>
 #include <Context.h>
 #include <Publication.h>
 #include <Subscription.h>
-#include <aeronmd.h>
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace aeron::concurrent;
@@ -38,23 +38,16 @@ std::string pattern(std::size_t n) {
 class FragmentAssemblerAeronRegression : public ::testing::Test {
 protected:
     void SetUp() override {
-        char tmpl[] = "/tmp/rune-fragasm-XXXXXX";
-        ASSERT_NE(mkdtemp(tmpl), nullptr);
-        root_ = tmpl;
-        const std::string dir = (fs::path(root_) / "aeron").string();
-        ASSERT_EQ(aeron_driver_context_init(&ctx_), 0);
-        aeron_driver_context_set_dir(ctx_, dir.c_str());
-        aeron_driver_context_set_threading_mode(ctx_, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(ctx_, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(ctx_, true);
-        aeron_driver_context_set_shared_idle_strategy(ctx_, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(ctx_, true);
-        ASSERT_EQ(aeron_driver_init(&driver_, ctx_), 0) << aeron_errmsg();
-        ASSERT_EQ(aeron_driver_start(driver_, true), 0) << aeron_errmsg();
-        running_.store(true);
-        thread_ = std::thread([this] {
-            while (running_.load()) aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
-        });
+        root_ = fs::temp_directory_path() / ("rune-fragasm-" + std::to_string(::getpid()));
+        fs::create_directories(root_);
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir              = (root_ / "aeron").string();
+        cfg.termBufferBytes  = 1 << 20;
+        cfg.termBufferSparse = true;
+        cfg.udpGso           = false;
+        cfg.epollPoll        = false;
+        driver_ = std::make_unique<rune::node::EmbeddedDriver>(std::move(cfg), rune::node::DriverMode::Threaded);
+        const std::string dir = driver_->dir();
         aeron::Context c;
         c.aeronDir(dir);
         aeron_ = aeron::Aeron::connect(c);
@@ -74,12 +67,9 @@ protected:
 
     void TearDown() override {
         pub_.reset(); sub_.reset(); aeron_.reset();
-        running_.store(false);
-        if (thread_.joinable()) thread_.join();
-        if (driver_) { aeron_driver_close(driver_); driver_ = nullptr; }
-        if (ctx_) { aeron_driver_context_close(ctx_); ctx_ = nullptr; }
+        driver_.reset();
         std::error_code ec;
-        if (!root_.empty()) fs::remove_all(root_, ec);
+        fs::remove_all(root_, ec);
     }
 
     void offerBoth(const std::string& big, const std::string& small) {
@@ -94,11 +84,8 @@ protected:
         }
     }
 
-    std::string root_;
-    aeron_driver_context_t* ctx_ = nullptr;
-    aeron_driver_t* driver_ = nullptr;
-    std::atomic<bool> running_{false};
-    std::thread thread_;
+    fs::path root_;
+    std::unique_ptr<rune::node::EmbeddedDriver> driver_;
     std::shared_ptr<aeron::Aeron> aeron_;
     std::shared_ptr<aeron::Publication> pub_;
     std::shared_ptr<aeron::Subscription> sub_;

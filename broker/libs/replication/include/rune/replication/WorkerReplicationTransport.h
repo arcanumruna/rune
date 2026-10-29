@@ -28,7 +28,7 @@
 //   stack); the records body is a zero-copy log view handed to sendGatherToPeer,
 //   which copies it ONCE, log → term buffer:
 //     - len <= pub.maxPayloadLength(): tryClaim + two memcpys + commit
-//     - larger: 2-buffer gather pub.offer() (Aeron fragments it) — no scratch copy
+//     - larger: 2-iovec gather offerv (Aeron fragments it) — no scratch copy
 //
 // ## Routing
 //   sendFetchResponse(toFollower, ...)  → single peer pub (by NodeId)
@@ -369,7 +369,7 @@ public:
     // -----------------------------------------------------------------------
     // sendGatherToPeer — zero-copy send of [prefix | body]: body bytes are
     // copied exactly once, from the log view into the term buffer.  tryClaim
-    // for <= maxPayloadLength, else a 2-buffer gather offer() (Aeron fragments
+    // for <= maxPayloadLength, else a 2-iovec gather offerv (Aeron fragments
     // it) — no intermediate scratch copy.
     // -----------------------------------------------------------------------
     int64_t sendGatherToPeer(rune::replication::NodeId peer,
@@ -405,13 +405,11 @@ public:
             }
             return pos;
         }
-        const std::array<aeron::concurrent::AtomicBuffer, 2> parts{
-            aeron::concurrent::AtomicBuffer(const_cast<uint8_t*>(prefix),
-                                            static_cast<aeron::util::index_t>(prefixLen)),
-            aeron::concurrent::AtomicBuffer(const_cast<uint8_t*>(body.data()),
-                                            static_cast<aeron::util::index_t>(body.size()))};
-        const int64_t r = pub->offer(parts);
-        const int64_t pos = r == aeron::ADMIN_ACTION ? pub->offer(parts) : r;   // A9: term rotated — retry now
+        // The C offerv over stack iovecs: the C++ wrapper's vectored offer() builds a std::vector per call (rule 4).
+        aeron_iovec_t parts[2] = {{const_cast<uint8_t*>(prefix), prefixLen}, {const_cast<uint8_t*>(body.data()), body.size()}};
+        const int64_t r = aeron_exclusive_publication_offerv(pub->publication(), parts, 2, nullptr, nullptr);
+        const int64_t pos = r == aeron::ADMIN_ACTION   // A9: term rotated — retry now
+            ? aeron_exclusive_publication_offerv(pub->publication(), parts, 2, nullptr, nullptr) : r;
         if (pos <= 0) [[unlikely]] noteRefused_(peer, pos);
         return pos;
     }

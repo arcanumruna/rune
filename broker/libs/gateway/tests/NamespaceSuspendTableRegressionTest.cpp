@@ -16,7 +16,9 @@ using rune::gateway::SuspendAction;
 
 // The broker->client response ids (not dispatched by the gateway).
 const std::set<uint16_t> kResponses = {2, 5, 7, 9, 11, 13, 15, 17, 19, 20, 33, 35, 37, 39, 41, 43, 44, 46, 48,
-                                       50, 52, 54, 65, 67, 69, 71, 73, 78, 83, 85};
+                                       50, 52, 54, 65, 67, 69, 71, 73, 78, 83, 85, 87};
+// Client->broker but consumed by the worker ingress (Worker.h handleWorkerBind_), never dispatched by the gateway: WorkerBind.
+const std::set<uint16_t> kWorkerConsumed = {86};
 // D21: refused while ReadOnly.
 const std::set<uint16_t> kReadOnlyRefuses = {16, 40, 45, 47, 49, 51, 53, 64, 68, 70, 74, 75, 76, 77, 79, 80};
 // D30: still allowed while RejectAll (session control), plus NamespaceDdl (81): cluster-scoped and cluster-admin only,
@@ -40,7 +42,7 @@ SuspendAction effective(SuspendAction a, Who who) { return who == Who::ClusterAd
 TEST(NamespaceSuspendTableRegression, CoversEveryDispatchedTemplate)
 {
     for (uint16_t tid = 0; tid < rune::gateway::kSuspendTableSpan; ++tid) {
-        if (!pc::isKnownTemplate(tid)) continue;
+        if (!pc::isKnownTemplate(tid) || kWorkerConsumed.count(tid)) continue;
         const bool dispatched = std::find(rune::gateway::kDispatchedTemplates.begin(),
                                           rune::gateway::kDispatchedTemplates.end(), tid) !=
                                 rune::gateway::kDispatchedTemplates.end();

@@ -3329,6 +3329,7 @@ void BrokerNode::createMetrics_() {
     serviceAuthMode_(clock_.nowNs());
     controlSet_(RuneMetric::AuthMode, config_.authMode == AuthMode::DevDisabled ? 1 : 0);
 
+#if defined(__linux__)   // process metrics read /proc/self; other hosts have none
     systemMetrics_.emplace();
     const metrics::SystemMetricsParams sp{config_.metricsSystemIntervalMs * 1'000'000LL, "/proc/self"};
     if (const auto ss = systemMetrics_->init(metricsWriter_, sp, key); ss != metrics::SystemMetrics::Status::Ok) {
@@ -3338,6 +3339,7 @@ void BrokerNode::createMetrics_() {
         systemMetrics_.reset();
         throw std::runtime_error(msg);
     }
+#endif
     metricsReady_ = true;
 }
 
@@ -4813,7 +4815,9 @@ void BrokerNode::stop() {
     if (mtuProbeFd_ >= 0) { ::close(mtuProbeFd_); mtuProbeFd_ = -1; }   // re-check I1
     // arcanum-metrics Task 8: the metrics file stays mapped (and its values readable) until the node is destroyed;
     // the system metrics close their /proc fds here.
+#if defined(__linux__)
     systemMetrics_.reset();
+#endif
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
     //    After aeron_.reset() all "remove publication / subscription / close client"
@@ -4999,7 +5003,9 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     work += reportUnbuildableReplicas_();
     work += checkLinkMtu_(nowNs, /*force=*/false);   // re-check I1: the runtime's clock, no per-pass clock read
     work += publishStorageMetrics_();                // ISR v3 §3.10
+#if defined(__linux__)
     if (systemMetrics_) work += systemMetrics_->doWork(nowNs);   // arcanum-metrics D62: process metrics, own interval
+#endif
     if (consensusUnmarked_ && nowNs - lastConsensusMarkCheckNs_ >= 1'000'000'000LL) {   // ISR v3 Step 6 (cold: until marked)
         lastConsensusMarkCheckNs_ = nowNs;
         markConsensusWhenPresent_();
