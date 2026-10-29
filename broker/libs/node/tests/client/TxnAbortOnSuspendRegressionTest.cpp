@@ -29,6 +29,7 @@
 #include <rune/client/producer/Producer.h>
 #include <rune/client/subscriber/Subscription.h>
 #include <rune/coordination/NsScopedId.h>
+#include <rune/node/NamespaceReaper.h>
 #include <rune/transaction/TransactionCoordinator.h>
 
 #include <gtest/gtest.h>
@@ -41,6 +42,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 
 using namespace rune::node;
@@ -312,9 +314,20 @@ TEST(TxnAbortOnSuspendRegression, SuspendRejectAllAbortsRegression) {
 
 TEST(TxnAbortOnSuspendRegression, DeleteAbortsRegression) {
     Scenario s("txnabort_del");
+    // Hold the reaper's catalog events: its AbortTxns step still runs (it needs none), but a/t is not dropped.  A drop ends
+    // the subscription (UnknownTopic) with whatever it had not delivered yet, so with the reaper free the sentinel races
+    // the drop even though the ABORT marker is in the log first (under load: landed 3 ms before the drop, never delivered).
+    BrokerNode& node = s.f.b.node();
+    node.onAdminThreadForTest([&] { node.adminWorkerAgentForTest()->worker().reaperForTest().setIssueBudgetForTest(0); return 0; });
     const auto del = s.f.admin->deleteNamespace("a");
     ASSERT_TRUE(del.has_value()) << del.error().errorCode << " " << del.error().detail;
     s.expectAborted();
+    const auto pastAbortTxns = [&] {   // the step answered Done: the reaper records TxnsAborted next
+        return node.onAdminThreadForTest([&] {
+            return std::holds_alternative<ReapRecordingStep>(node.adminWorkerAgentForTest()->worker().reaperForTest().state()) ? 1 : 0;
+        }) == 1;
+    };
+    EXPECT_TRUE(waitFor(pastAbortTxns)) << "the reaper never passed AbortTxns";
     EXPECT_FALSE(s.txn->commitError().empty()) << "the session is closed: the producer's next call fails";
 }
 

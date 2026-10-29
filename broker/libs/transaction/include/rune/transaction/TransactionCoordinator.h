@@ -538,15 +538,16 @@ public:
     /// opened (noteSession).  Returns the count.  No allocation.  The gateway calls it on every session revoke.
     uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs);
 
-    /// Namespaces Phase 2 Task 7: true while any transaction of namespace `nsId` is not at rest - Ongoing, or Prepare*
-    /// (its completion would still persist a record under its key).  Cold scan.
-    [[nodiscard]] bool anyUnsettledForNamespace(uint32_t nsId) const noexcept {
+    /// Namespaces Phase 2 Task 7: how many transactions of namespace `nsId` are not at rest - Ongoing, or Prepare*
+    /// (their completion would still persist a record under their key).  Cold scan.
+    [[nodiscard]] std::size_t unsettledOfNamespace(uint32_t nsId) const noexcept {
+        std::size_t n = 0;
         for (const auto& [id, meta] : txnMap_) {
             if (meta.state == TxnState::Empty || meta.state == TxnState::CompleteCommit ||
                 meta.state == TxnState::CompleteAbort || meta.state == TxnState::Dead) continue;
-            if (rune::coordination::parseScopedId(id).nsId == nsId) return true;
+            if (rune::coordination::parseScopedId(id).nsId == nsId) ++n;
         }
-        return false;
+        return n;
     }
 
     /// Records the session that drives `txnId` (the service calls it after a successful AddPartitions / AddOffsets /

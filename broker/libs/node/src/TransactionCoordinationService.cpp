@@ -483,9 +483,19 @@ uint32_t TransactionCoordinationService::abortAllForSession(int64_t sessionId, i
 
 ReapStatus TransactionCoordinationService::abortNamespaceTxns(uint32_t nsId, int64_t nowNs)
 {
-    if (loadState_ != LoadState::Loaded) return ReapStatus::Done;
+    if (loadState_ != LoadState::Loaded) return ReapStatus::Refused;   // the coordinator may hold them elsewhere
     (void)coordinator_.abortAllForNamespace(nsId, nowNs);   // idempotent
-    return coordinator_.anyUnsettledForNamespace(nsId) ? ReapStatus::More : ReapStatus::Done;
+    const std::size_t unsettled = coordinator_.unsettledOfNamespace(nsId);
+    if (unsettled == 0) return ReapStatus::Done;
+    // Wait for every marker's first answer, not for a refused one to land: its partition may be one of the namespace's,
+    // which only the drop removes (the retry then drops the marker and the transaction settles).
+    std::size_t answered = 0;
+    for (const auto& [pid, a] : awaiting_) {
+        if (rune::coordination::parseScopedId(a.txnId).nsId != nsId) continue;
+        if (static_cast<std::size_t>(std::max(0, a.outstanding)) > a.retries.size()) return ReapStatus::More;
+        ++answered;
+    }
+    return answered < unsettled ? ReapStatus::More : ReapStatus::Done;   // a Prepare* one not dispatched yet
 }
 
 ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs)
@@ -493,7 +503,7 @@ ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uin
     if (txnState_ == nullptr) return ReapStatus::Done;   // no transaction-state store (a rig): nothing to remove
     if (loadState_ != LoadState::Loaded) return ReapStatus::Refused;
     (void)coordinator_.abortAllForNamespace(nsId, nowNs);   // idempotent: anything still open ends now
-    if (coordinator_.anyUnsettledForNamespace(nsId)) return ReapStatus::Refused;
+    if (coordinator_.unsettledOfNamespace(nsId) != 0) return ReapStatus::Refused;
     rune::replication::PartitionReplica* r = txnState_->replica();
     const rune::replication::Offset leo0 = r->logEndOffset();
     const bool none = txnState_->tombstoneNamespace(nsId, batch, nowNs);
