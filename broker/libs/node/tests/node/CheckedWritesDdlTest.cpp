@@ -19,7 +19,7 @@ namespace rp = rune::protocol;
 
 namespace {
 
-constexpr uint16_t kOk = 0, kUnknownTopic = 7, kInvalidSchema = 23, kViewSourceNotFound = 33, kViewKeyInvalid = 35, kLimit = 52;
+constexpr uint16_t kOk = 0, kUnknownTopic = 7, kInvalidSchema = 23, kTopicExists = 25, kViewSourceNotFound = 33, kViewKeyInvalid = 35, kLimit = 52;
 
 // ---- M3: featureRefusal, 5 features x 6 shapes ------------------------------------------------------------------
 
@@ -126,6 +126,19 @@ TEST(CheckedWritesDdlRegression, AdoptionAppliesTheKeyRuleRegression) {
     EXPECT_EQ(probe.version, 0) << "the topic stays untyped";
     EXPECT_TRUE(probe.blob.empty());
     EXPECT_EQ(defineWith(rig, "a", keyDescriptor(PrimType::UInt64, 0), "k").code, kOk) << "a topic key adopts";
+}
+
+// P4 keeps existing topics working: re-running the DDL of a typed topic answers TopicExists with its id (the idempotent
+// "already there" an application's startup relies on), whatever key its re-define names - the topic key rule judges
+// only a new definition (a create or an adoption).  RED: run the key rule before the existing-topic answer - 23.
+TEST(CheckedWritesDdlRegression, RedefineOfATypedTopicAnswersTopicExistsBeforeTheKeyRuleRegression) {
+    CatalogDdlRig rig("cwredefine");
+    rig.becomeServingLeader();
+    const auto created = defineWith(rig, "p", keyDescriptor(PrimType::UInt64, 0), "k");
+    ASSERT_EQ(created.code, kOk);
+    const auto again = defineWith(rig, "p", keyDescriptor(PrimType::String, 0), "k");
+    EXPECT_EQ(again.code, kTopicExists);
+    EXPECT_EQ(again.topicId, created.topicId);
 }
 
 TEST(CheckedWritesDdl, ViewSourceKinds) {

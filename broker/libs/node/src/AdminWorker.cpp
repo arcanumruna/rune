@@ -1392,6 +1392,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
 
     // A non-empty descriptor must be well-formed; nextTag starts past every tag.
     uint16_t nextTag = 0;
+    std::optional<DdlRejection> keyRefusal;   // P4: judges a new definition only, after the existing-name answers below
     if (!m.blob.empty()) {
         try {
             const rune::codec::Descriptor d =
@@ -1400,13 +1401,13 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
             if (const auto* zf = rune::codec::zeroWidthFixedStr(d))
                 return Rejected(reject(kInvalidSchema, "FixedStr column '" + zf->name + "' needs a width of at least 1"));
             // Checked writes (P4): a topic key is an integer or string(N) with N <= 16.  A leader build rule, never an
-            // apply rule, so a catalog that already holds such a topic replays unchanged.  A key field that does not
-            // exist stays the applier's precondition.
+            // apply rule, so a catalog that already holds such a topic replays unchanged, and a re-define of it still
+            // answers TopicExists.  A key field that does not exist stays the applier's precondition.
             if (!m.keyField.empty())
                 if (const rune::codec::FieldDescriptor* k = d.find(m.keyField);
                     k != nullptr && !rune::codec::isTopicKeyType(k->type, rune::codec::fieldWidth(*k)))
-                    return Rejected(reject(kInvalidSchema, "key field '" + m.keyField + "' is " + keyTypeSpelling(*k) +
-                                                               ": a topic key is an integer or string(N) with N <= 16"));
+                    keyRefusal = reject(kInvalidSchema, "key field '" + m.keyField + "' is " + keyTypeSpelling(*k) +
+                                                            ": a topic key is an integer or string(N) with N <= 16");
             uint32_t past = static_cast<uint32_t>(d.fields.size());
             for (const auto& f : d.fields) past = std::max<uint32_t>(past, uint32_t{f.id} + 1);
             if (past > 0xFFFF) return Rejected(reject(kInvalidSchema));
@@ -1422,6 +1423,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     if (const cat::TopicObject* t = s.topicByName(m.nsId, m.name)) {
         if (t->schema) return Rejected(reject(kTopicExists, {}, t->topicId, t->schema->schemaVersion));
         if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
+        if (keyRefusal) return Rejected(std::move(*keyRefusal));
         // Issue #129: adopting a schema is a new version of a LIVE topic (every other producer's records are then
         // validated against it), so it needs ALTER on the topic - the gateway's verdict - not CREATE alone.
         if (!m.adoptDenial.empty()) return Rejected(reject(kNotAuthorized, m.adoptDenial));
@@ -1442,6 +1444,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
     }
     if (auto fold = foldCollision(s, m.nsId, m.name)) return Rejected(std::move(*fold));
+    if (keyRefusal) return Rejected(std::move(*keyRefusal));
 
     // Spec §8: the replication factor is bounded by the brokers and the minIsr.
     const int32_t rf = m.replicationFactor;
