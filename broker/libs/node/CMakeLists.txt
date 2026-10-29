@@ -809,7 +809,8 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesWriteStateTest.cpp
         tests/node/CheckedWritesValidationMatrixTest.cpp
         tests/node/CheckedWritesWorkerTest.cpp
-        tests/node/CheckedWritesSpecFanoutTest.cpp)
+        tests/node/CheckedWritesSpecFanoutTest.cpp
+        tests/node/CheckedWritesDdlTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)

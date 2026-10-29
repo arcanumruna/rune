@@ -304,9 +304,11 @@ public:
         uint16_t code = 0; int32_t topicId = -1; uint16_t version = 0; int32_t partitionCount = 0;
         std::vector<uint8_t> blob;
     };
-    SchemaAnswer getSchema(const std::string& name, uint64_t fingerprint = 0) {
+    SchemaAnswer getSchema(const std::string& name, uint64_t fingerprint = 0, uint32_t nsId = 0) {
         const int64_t corr = ++corr_;
-        admin_->submitGetSchema(GetSchemaMsg{kSession, corr, name, fingerprint});
+        GetSchemaMsg msg{kSession, corr, name, fingerprint};
+        msg.nsId = nsId;
+        admin_->submitGetSchema(msg);
         const auto it = gets_.find(corr);
         if (it == gets_.end()) throw std::logic_error("CatalogDdlRig: GetSchema was not answered at once");
         return it->second;
