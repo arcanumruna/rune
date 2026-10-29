@@ -206,3 +206,40 @@ TEST(ParserRegression, UnknownStatementMentionsTransient) {
     ASSERT_FALSE(r.has_value());
     EXPECT_NE(r.error().message.find("'transient'"), std::string::npos) << r.error().message;
 }
+
+// Checked writes Part 02: `partitions` is optional and defaults to 1.
+static const TopicDef& topicOf(const std::expected<Statement, ParseError>& r) {
+    return std::get<TopicDef>(*r);
+}
+
+TEST(CheckedWritesQl, PartitionsDefaultToOne) {
+    auto r = parse("topic events;");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(topicOf(r).partitions, 1u);
+    EXPECT_TRUE(topicOf(r).fields.empty());
+
+    r = parse("topic p { id uint64 } key id;");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(topicOf(r).partitions, 1u);
+
+    r = parse("topic p { id uint64 } partitions 4 key id;");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(topicOf(r).partitions, 4u);
+
+    r = parse("topic p partitions 0;");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("partitions must be >= 1"), std::string::npos);
+
+    r = parse("transient topic t;");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(topicOf(r).partitions, 1u);
+    EXPECT_EQ(topicOf(r).persistence, Persistence::Transient);
+}
+
+TEST(CheckedWritesQl, ReplicasAndWithWorkWithoutPartitions) {
+    auto r = parse("topic e replicas 3 with (tier = leader);");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(topicOf(r).partitions, 1u);
+    EXPECT_EQ(topicOf(r).replicas, 3);
+    EXPECT_EQ(topicOf(r).with.size(), 1u);
+}

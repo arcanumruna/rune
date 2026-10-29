@@ -1,7 +1,7 @@
 // src/cli/Console.cpp — Phase 2b Part D: `rune console`.
 //
 //   rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run]
-//                [--validate] [--expected-version N] [--request-id <32 hex>] [--verbose]
+//                [--expected-version N] [--request-id <32 hex>] [--verbose]
 //                [--user <u>] [--password-file <p>]
 //
 // Interactive: "rune> " / "   ...> " until the buffered text ends with a ';' outside
@@ -223,7 +223,7 @@ namespace {
 struct ConsoleOptions {
     std::string scriptPath;               // -f; "" = interactive
     bool dryRun = false;
-    engine::PrepareOptions prep;          // --validate, --expected-version
+    engine::PrepareOptions prep;          // --expected-version
     std::optional<rune::catalog::RequestId> requestIdBase;   // --request-id (-f only)
 #ifdef RUNE_CLI_LIVE_ENABLED
     engine::LiveOptions live;             // --broker / --cli-egress / credentials / hidden flags
@@ -235,7 +235,7 @@ constexpr std::string_view kContinuationPrompt = "   ...> ";
 
 void printConsoleUsage(std::ostream& err) {
     err << "Usage: rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run]\n"
-           "                    [--validate] [--expected-version N] [--request-id <32 hex>] [--verbose]\n"
+           "                    [--expected-version N] [--request-id <32 hex>] [--verbose]\n"
            "                    [--user <u>] [--password-file <p>] [--tls-ca <pem>] [--tls-host <name>]\n"
            "                    [--insecure-plaintext]\n"
            "exit status: 0 ok, 1 error, 2 usage, 3 diff, 4..124 the broker error code, 125 any other broker error\n";
@@ -272,7 +272,7 @@ int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o,
                                                   "--user", "--password-file", "--tls-ca", "--tls-host",
                                                   "--cli-stream-in", "--cli-stream-out", "--cli-data-dir",
                                                   "--gateway-response-port"};   // last 4 hidden
-    static constexpr std::string_view kBool[]  = {"--dry-run", "--validate", "--verbose", "--insecure-plaintext"};
+    static constexpr std::string_view kBool[]  = {"--dry-run", "--verbose", "--insecure-plaintext"};
     auto in = [](std::string_view a, auto& set) {
         for (const auto s : set) if (s == a) return true;
         return false;
@@ -282,7 +282,6 @@ int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o,
         const std::string& a = args[i];
         if (in(a, kBool)) {
             if (a == "--dry-run") o.dryRun = true;
-            else if (a == "--validate") o.prep.validate = true;
             else setLive(o, a, "");   // --verbose / --insecure-plaintext
             continue;
         }

@@ -411,21 +411,17 @@ TEST(RuneConsoleOfflineRegression, ScriptFromStdinRegression) {
     EXPECT_NE(bad.err.find("-:statement 1: 1:13: "), std::string::npos) << "stdin is named '-': " << bad.err;
 }
 
-TEST(RuneConsoleOfflineRegression, ValidateIsPlannedOnADryRunAndNeedsABrokerOtherwiseRegression) {
+TEST(RuneConsoleOfflineRegression, TheDryRunPlanHasNoValidateAndNeedsABrokerOtherwiseRegression) {
     const fs::path f = writeScript("validate.rql", "topic v { id int64 } partitions 1 key id;\nalter topic v add column a int32;\n");
     const auto plain = console({"-f", f.string(), "--dry-run"});
     ASSERT_EQ(plain.rc, 0) << plain.err;
     EXPECT_NE(plain.out.find("topic v partitions 1 replicas 0 persistence disk key id\n"), std::string::npos)
-        << "without --validate the define line ends at the key: " << plain.out;
-    const auto v = console({"-f", f.string(), "--dry-run", "--validate"});
-    ASSERT_EQ(v.rc, 0) << v.err;
-    EXPECT_NE(v.out.find("topic v partitions 1 replicas 0 persistence disk key id validate\n"), std::string::npos)
-        << "--validate marks the define in the plan: " << v.out;
-    EXPECT_EQ(count(v.out, " validate"), 1u) << "only the define carries it, not the alter: " << v.out;
+        << "the define line ends at the key: " << plain.out;
+    EXPECT_EQ(count(plain.out, "validate"), 0u) << plain.out;
 
     // No --dry-run and no broker: a usage error (2), nothing runs.
     EnvCleared env{"RUNE_BROKER"};
-    const auto live = console({"-f", f.string(), "--validate"});
+    const auto live = console({"-f", f.string()});
 #ifdef RUNE_CLI_LIVE_ENABLED
     EXPECT_EQ(live.rc, 2) << live.err;
     EXPECT_NE(live.err.find("--broker host:port is required (or --dry-run)"), std::string::npos) << live.err;
@@ -534,7 +530,7 @@ TEST(RuneConsoleOfflineRegression, SplitterAndParserAgreeOnTrickyInputsRegressio
 TEST(RuneConsoleOfflineRegression, UsageNamesEveryAcceptedConsoleFlagRegression) {
     // The top-level usage (`rune` with no arguments) lists every console flag the parser accepts (#314); the
     // console's own usage (a bad flag) agrees.
-    static const char* const kFlags[] = {"--broker", "--cli-egress", "-f", "--dry-run", "--validate", "--expected-version",
+    static const char* const kFlags[] = {"--broker", "--cli-egress", "-f", "--dry-run", "--expected-version",
                                          "--request-id", "--verbose", "--user", "--password-file", "--tls-ca",
                                          "--tls-host", "--insecure-plaintext"};
     std::ostringstream out, err;
@@ -552,7 +548,7 @@ TEST(RuneConsoleOfflineRegression, UsageNamesEveryAcceptedConsoleFlagRegression)
         EXPECT_NE(own.err.find(f), std::string::npos) << f << " missing from the console's own usage:\n" << own.err;
     }
     // And each listed flag really is accepted by the parser (never "unknown option").
-    for (const char* f : {"--dry-run", "--validate", "--verbose", "--insecure-plaintext"}) {
+    for (const char* f : {"--dry-run", "--verbose", "--insecure-plaintext"}) {
         const auto r = console({"--dry-run", f}, "");
         EXPECT_EQ(r.err.find("unknown option"), std::string::npos) << f << ": " << r.err;
     }

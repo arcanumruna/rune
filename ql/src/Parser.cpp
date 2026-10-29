@@ -3,10 +3,10 @@
 //   statement   := topicStmt | transientStmt | alterStmt | dropStmt | showStmt | diffStmt
 //                | createStmt | grantStmt | revokeStmt                       (authentication: users / roles / grants)
 //   transientStmt := "transient" topicStmt                 (Phase 2b E: persistence = Transient)
-//   topicStmt   := "topic" IDENT [ "{" field ("," field)* ","? "}" ] "partitions" INT [ "replicas" INT ] [ "key" IDENT ]
+//   topicStmt   := "topic" IDENT [ "{" field ("," field)* ","? "}" ] [ "partitions" INT ] [ "replicas" INT ] [ "key" IDENT ]
 //                  [ "with" "(" createSetting ("," createSetting)* ")" ] ";"
 //                  (an untyped topic has no "{…}" and no "key"; a typed topic requires both;
-//                   replicas is 0..32767, 0 = the broker's default)
+//                   partitions defaults to 1; replicas is 0..32767, 0 = the broker's default)
 //   createSetting := setting
 //                  | "cleanup.policy" "=" ("delete" | "compact" | "compact_delete")
 //                  | ("segment.bytes" | "retention.check.ms" | "file.delete.delay.ms") "=" SIGNED_INT
@@ -608,23 +608,22 @@ struct Parser {
             if (!rb) return std::unexpected(std::move(rb.error()));
         }
 
-        if (!isKw("partitions")) {
-            return std::unexpected(err("expected 'partitions', got " + got()));
-        }
-        advance();
+        if (isKw("partitions")) {
+            advance();
 
-        Token partTok = cur;  // save location before parseInt advances past it
-        auto partVal = parseInt();
-        if (!partVal) return std::unexpected(std::move(partVal.error()));
-        if (*partVal < 1) {
-            return std::unexpected(ParseError{partTok.line, partTok.col,
-                "partitions must be >= 1"});
+            Token partTok = cur;  // save location before parseInt advances past it
+            auto partVal = parseInt();
+            if (!partVal) return std::unexpected(std::move(partVal.error()));
+            if (*partVal < 1) {
+                return std::unexpected(ParseError{partTok.line, partTok.col,
+                    "partitions must be >= 1"});
+            }
+            if (*partVal > 0xFFFFFFFFu) {
+                return std::unexpected(ParseError{partTok.line, partTok.col,
+                    "partitions must be <= 4294967295"});
+            }
+            td.partitions = static_cast<uint32_t>(*partVal);
         }
-        if (*partVal > 0xFFFFFFFFu) {
-            return std::unexpected(ParseError{partTok.line, partTok.col,
-                "partitions must be <= 4294967295"});
-        }
-        td.partitions = static_cast<uint32_t>(*partVal);
 
         if (isKw("replicas")) {
             advance();

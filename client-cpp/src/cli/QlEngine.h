@@ -52,7 +52,7 @@ inline constexpr std::size_t kHistoryColumns = 8;
 // Preparing statements
 // ═══════════════════════════════════════════════════════════════════════════
 /// A statement ready to run: every refusal that needs no broker happened while preparing it.
-struct PDefine      { rune::ql::DefineTopicPlan plan; bool validate = false; };
+struct PDefine      { rune::ql::DefineTopicPlan plan; };
 struct PAlter       { rune::ql::AlterTopicPlan plan; };
 struct PAlterConfig { rune::ql::AlterTopicConfigPlan plan; };
 struct PDropTopic   { std::string name; };
@@ -95,7 +95,6 @@ struct IdSeq {
 
 struct PrepareOptions {
     uint16_t expectedVersion = 0;       // every `alter topic … <ops>` asserts it (0 = no check)
-    bool     validate        = false;   // every `topic …` is defined with validate = true
 };
 
 /// Parse-and-plan one statement.  nullopt + `why` when it is refused (versions beyond u16, a bad

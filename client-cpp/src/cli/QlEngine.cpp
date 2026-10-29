@@ -1,5 +1,5 @@
 // src/cli/QlEngine.cpp — the `rune ql` engine (see QlEngine.h): moved out of CatalogCommands.cpp unchanged, plus
-// PrepareOptions (--validate / --expected-version), LiveOptions and QlRun::lastErrorCode / OutputStyle.
+// PrepareOptions (--expected-version), LiveOptions and QlRun::lastErrorCode / OutputStyle.
 #include "QlEngine.h"
 
 #include "rune/cli/CatalogCommands.h"
@@ -258,7 +258,7 @@ std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& o
             [&](const auto& s) -> std::optional<Prepared> {
                 using T = std::decay_t<decltype(s)>;
                 if constexpr (std::is_same_v<T, ql::TopicDef>) {
-                    return Prepared{PDefine{ql::applyPlan(s), opts.validate}};
+                    return Prepared{PDefine{ql::applyPlan(s)}};
                 } else if constexpr (std::is_same_v<T, ql::AlterTopicDef>) {
                     return Prepared{PAlter{ql::applyAlterPlan(s, opts.expectedVersion)}};
                 } else if constexpr (std::is_same_v<T, ql::AlterTopicConfigDef>) {
@@ -359,10 +359,8 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
                 out << "topic " << d.name << " partitions " << d.partitions << " replicas " << d.replicas << " persistence "
                     << (d.persistence == ql::Persistence::Transient ? "transient" : "disk");
                 if (!d.keyField.empty()) out << " key " << d.keyField;
-                if (s.validate) out << " validate";
-                out << "\n";
-                if (d.descriptorBlob.empty()) out << "  (untyped)\n";
-                else out << descriptorText(d.descriptorBlob);
+                if (d.descriptorBlob.empty()) out << " raw\n";
+                else out << "\n" << descriptorText(d.descriptorBlob);
             } else if constexpr (std::is_same_v<T, PAlter>) {
                 out << "alter topic " << s.plan.name << " (" << s.plan.opsBlob.size() << " byte op list)\n";
                 try {
@@ -726,7 +724,7 @@ bool QlRun::run(const PDefine& s, const rc::DdlOptions& ddl) {
     topic.config = d.config;   // F32: the whole struct, never field by field
     const auto r = broker.client().defineTopicAndWait(
         d.name, d.partitions, d.keyField, std::span<const uint8_t>(d.descriptorBlob.data(), d.descriptorBlob.size()),
-        s.validate, d.persistence == ql::Persistence::Transient ? rc::Persistence::Transient : rc::Persistence::Disk, topic,
+        !d.descriptorBlob.empty(), d.persistence == ql::Persistence::Transient ? rc::Persistence::Transient : rc::Persistence::Disk, topic,
         ddl, broker.ddlTimeout());
     broker.flushVerbose(err);
     if (r.errorCode != 0) return failBroker(r.errorCode, r.detail);

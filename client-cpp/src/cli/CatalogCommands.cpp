@@ -144,7 +144,6 @@ std::string formatSchemaDefinition(const cat::TopicObject& t) {
     o << "schema " << t.name << " version " << s.schemaVersion << "\n"
       << "  compatibility " << compatName(s.compat) << "\n"
       << "  keyField " << (s.keyField.empty() ? "-" : s.keyField) << "\n"
-      << "  validate " << (s.validate ? "yes" : "no") << "\n"
       << descriptorText(s.evolvingBlob);
     return o.str();
 }
@@ -156,6 +155,7 @@ std::string formatTopicDefinition(const cat::TopicObject& t) {
       << "  partitions " << t.partitions << "\n"
       << "  replicationFactor " << t.replicationFactor << (t.replicationFactor == 0 ? " (every broker)" : "") << "\n"
       << "  persistence " << persistenceName(t.persistence) << "\n"
+      << "  kind " << (t.schema ? "typed" : "raw") << "\n"
       << "  config.cleanupPolicy " << int{c.cleanupPolicy} << "\n"
       << "  config.retentionMs " << c.retentionMs << "\n"
       << "  config.retentionBytes " << c.retentionBytes << "\n"
@@ -171,7 +171,6 @@ std::string formatTopicDefinition(const cat::TopicObject& t) {
       << "  config.coPartitionGroup " << orDash(c.coPartitionGroup) << "\n"
       << "  config.partitionKey " << orDash(c.partitionKey) << "\n";
     if (t.schema) o << formatSchemaDefinition(t);
-    else o << "  (untyped: no schema)\n";
     return o.str();
 }
 
@@ -202,7 +201,7 @@ std::string formatDiffEntry(const cat::DiffEntry& d) {
 
 void printCatalogUsage(std::ostream& err) {
     err << "  rune ql (-e \"<statement>\" | -f <file|->) [--dry-run] [--verbose] [--request-id <32 hex digits>]\n"
-          "          [--validate] [--expected-version N]\n"
+          "          [--expected-version N]\n"
         << "          --broker host:port\n"
         << "      Execute DDL (the statement text is recorded in the catalog) and reads (SHOW HISTORY,\n"
         << "      SHOW ... AS OF, DIFF). --dry-run parses and prints the plan without a broker.\n"
@@ -239,7 +238,7 @@ rc::Persistence clientPersistence(cat::Persistence p) noexcept {
 
 int cmdQl(const std::vector<std::string>& args, std::istream& in, std::ostream& out, std::ostream& err) {
     ParsedArgs a;
-    if (!parseArgs("ql", args, {"-e", "-f", "--request-id", "--broker", "--expected-version"}, {"--dry-run", "--verbose", "--validate"}, a, err)) {
+    if (!parseArgs("ql", args, {"-e", "-f", "--request-id", "--broker", "--expected-version"}, {"--dry-run", "--verbose"}, a, err)) {
         printCatalogUsage(err);
         return 2;
     }
@@ -247,7 +246,6 @@ int cmdQl(const std::vector<std::string>& args, std::istream& in, std::ostream& 
     const bool dryRun = a.has("--dry-run");
 
     PrepareOptions popts;
-    popts.validate = a.has("--validate");
     if (a.has("--expected-version")) {
         const std::string v = a.value("--expected-version");
         uint32_t n = 0;

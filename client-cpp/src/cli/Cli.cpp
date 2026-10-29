@@ -90,7 +90,7 @@ bool hasFlag(const std::vector<std::string>& args, std::string_view flag) {
 
 void printUsage(std::ostream& err) {
     err << "Usage:\n"
-        << "  rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run] [--validate]\n"
+        << "  rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run]\n"
         << "               [--expected-version N] [--request-id <32 hex>] [--verbose] [--user <u>] [--password-file <p>]\n"
         << "               [--tls-ca <pem>] [--tls-host <name>] [--insecure-plaintext]\n"
         << "      Run Rune QL statements interactively (prompt `rune> `) or from a script (-f; stops at\n"
