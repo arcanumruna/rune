@@ -1097,6 +1097,7 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
     ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
+    c.keepSessionsAlive(true);   // a real client keeps its sessions alive (1 s keepalive)
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int coord = g.coordinator();
     ASSERT_GE(coord, 0);
@@ -1132,7 +1133,7 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     ASSERT_TRUE(committed) << "the group never committed";
 
     // L crashes; the member re-joins and fetches BEFORE the failure detector ran.
-    g.stop(L);
+    c.whilePumping([&] { g.stop(L); });
     const auto rj = c.joinGroup(gwC, kClientStream, sidC, "lg-rf1", member);
     ASSERT_TRUE(rj.has_value() && rj->errorCode == kOffsetOk) << "the re-join was not answered";
     const int32_t preMintGen = rj->generation;
@@ -1146,7 +1147,8 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     // L restarts: empty ring, a NEW lineage for P.  (Until the mint commits,
     // the old offset may still be answered — the window this test is about;
     // what must hold is everything AFTER the mint.)
-    g.start(L);
+    // the client keeps pumping (keepalives) while the harness restarts L
+    c.whilePumping([&] { g.start(L); });
     bool minted = false;
     for (int k = 0; k < 600 && !minted; ++k) {
         const auto r = c.offsetFetch(gwC, kClientStream, sidC, "lg-rf1", 0, P);
@@ -1303,6 +1305,7 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
     ASSERT_EQ(g.defineTopic(), 0);
     ShardTestClient c(g.cdir.path);
+    c.keepSessionsAlive(true);   // a real client keeps its sessions alive (1 s keepalive)
     c.setClientVersion(rune::protocol::client::kClientVersion);
     const int coord = g.coordinator();
     ASSERT_GE(coord, 0);
@@ -1367,8 +1370,9 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     ASSERT_TRUE(probed);
 
     // L crashes and restarts: a new lineage.
-    g.stop(L);
-    g.start(L);
+    // the client keeps pumping (keepalives) while the harness restarts L: sidC must outlive the ~9 s restart
+    c.whilePumping([&] { g.stop(L); });
+    c.whilePumping([&] { g.start(L); });
     bool minted = false;
     for (int k = 0; k < 600 && !minted; ++k) {
         const auto r = c.offsetFetch(gwC, kClientStream, sidC, "lg-probe", 0, P);
