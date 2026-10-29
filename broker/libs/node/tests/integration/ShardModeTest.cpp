@@ -395,10 +395,17 @@ void runCatalogRestart(bool wipePlacementLog) {
         return converged;
     };
     const auto convergeDeadline = std::chrono::steady_clock::now() + 60s;   // a condition poll; 20 s was outlasted on a loaded host (ctest -j)
-    while (!check(nullptr) && std::chrono::steady_clock::now() < convergeDeadline)
-        std::this_thread::sleep_for(50ms);
+    // Report the diagnosis of the same evaluation that ended the wait: a second, separate check could land on a
+    // leader change still applying and flag a cluster that just converged.
     std::vector<std::string> diag;
-    if (!check(&diag)) for (const auto& m : diag) ADD_FAILURE() << m;
+    bool converged = false;
+    for (;;) {
+        diag.clear();
+        if ((converged = check(&diag))) break;
+        if (std::chrono::steady_clock::now() >= convergeDeadline) break;
+        std::this_thread::sleep_for(50ms);
+    }
+    if (!converged) for (const auto& m : diag) ADD_FAILURE() << m;
 
     // every topic serves on every node (applied AND placed AND routed), then data flows
     if (awaitAllServe(nodes, ids, "incarnation 2")) {
