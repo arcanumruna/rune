@@ -34,9 +34,12 @@ rune ql --user admin --password-file admin.pw -f topics.rql --broker rune-1:4020
 
 Container requirements: `--shm-size=256m` (the default 64 MB is too small), the data directory on a volume, `--network host` (the
 low-latency mode: the Docker bridge adds about 35 µs at p50, and published ports make p99 about 10x worse; Linux only in
-practice; on a bridge, publish the client port and the node's shard block `8200 + 192n` to `8200 + 192n + 191`), and a
+practice; on a bridge, publish the client port and the node's shard block `8200 + 192n` to `8200 + 192n + 191`; the derived response-control ports sit inside that block), and a
 file-descriptor hard limit that covers the partitions (the broker raises its soft limit to the hard limit and refuses to start when the hard
 limit is below the estimated need; see SELF-HOSTING, "Open-file limit").
+
+Firewall: allow inbound UDP on the client port, each worker's ingress port and the response-control ports (gateway and
+workers) from clients. The per-worker egress control ports are needed only when authentication is off.
 
 Run an **odd** number of nodes: one for development, three or more for availability. A two-node cluster tolerates no
 failure. Membership is static: the peer list is fixed at boot.
@@ -44,6 +47,42 @@ failure. Membership is static: the peer list is fixed at boot.
 OS settings that matter for UDP throughput (`net.core.rmem_max` and `wmem_max` cap `RUNE_AERON_SOCKET_BUFFER_BYTES`; the
 Aeron receive window must not exceed the socket buffer or half a term) are covered in
 [configuration.md](configuration.md#aeron-transport).
+
+### NAT-safe client egress
+
+A client behind NAT (home router, cloud NAT gateway, most Kubernetes pods) needs no inbound rule: every reply returns over
+the flow the client itself opened (Aeron response channels). The address a client declares is not used for a client that
+sets the gateway response port.
+
+| Port | Who binds it | Open inbound UDP from clients |
+|---|---|---|
+| client port (`RUNE_CLIENT_ENDPOINT`, 40200) | gateway | yes |
+| worker ingress ports | each worker | yes |
+| gateway response-control port | gateway | yes |
+| per-worker response-control ports | each worker | yes |
+| per-worker egress control ports | each worker | only with authentication off |
+
+Derived defaults (shard mode, no explicit ports), for node id `n` and `W` workers:
+
+| Port | Value |
+|---|---|
+| egress control base | `8200 + 192 n + 128` |
+| gateway response | egress base `+ 63` |
+| worker `w` response | egress base `+ 63 - W + w` |
+
+Derived response ports need `W <= 31`; see [configuration](configuration.md#derived-ports) for the rule and the explicit
+settings. Firewall: inbound UDP on the ports above only.
+
+Client side: set `gatewayResponseControlPort` (`--gateway-response-port`, `RUNE_GATEWAY_RESPONSE_PORT`) to the **seed**
+broker's gateway response port. The other brokers' ports come from Metadata. A client that leaves it at `0`, and every
+older client, keeps the declared-address path unchanged.
+
+A plaintext session's worker bind token travels in plaintext (`ConnectResponse` and `WorkerBind`). On a TLS session the
+token never crosses the wire: the `ConnectResponse` carries an all-zero token and both ends derive it from the TLS keys
+(HKDF over the client-to-broker key and the session id). `WorkerBind` and the worker's `WorkerBindAck` are plaintext frames;
+the client resends an unacknowledged bind every 250 ms and reconnects after four attempts.
+
+End-to-end proof: `bash broker/docker/nat-e2e.sh` (clients behind a masquerading router container, default config, 3 nodes).
 
 ### Formatting a data directory
 

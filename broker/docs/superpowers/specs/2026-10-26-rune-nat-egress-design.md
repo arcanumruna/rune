@@ -51,13 +51,16 @@ Decisions:
   - Aeron's heartbeats and status messages keep the NAT mapping open. No extra keepalive is needed; the client
     liveness timeout stays below typical NAT UDP timeouts (about 30 s).
 - **D3.** **Response-control endpoints.** Each publisher thread has one response-control port: the gateway, and each
-  worker. They are derived like the shard ports today (`deriveShardBasePorts` gains a fourth base). They are
-  advertised in Metadata next to `egressControlPort`, and added to `nodeBoundPorts`, the MTU host list and
-  `docs/operations.md`. Task 2 decides whether several response publications can share one control port; if not,
-  the design stops and comes back here.
+  worker. They sit in the unused top of the node's egress-control block (decided 2026-10-28): gateway =
+  `egressBase + 63`, worker `w` = `egressBase + 63 - W + w` (the dynamic-MDC egress uses `egressBase + w`), valid for
+  W <= 31 so the two sets never overlap. Every node derives a node's ports by one rule: when that node's RUNE_PEERS 6th segment is absent or equals its derived egress base, from the derived block; otherwise none, and a warning (`RUNE_RESPONSE_CONTROL_BASE_PORT`, `RUNE_GATEWAY_RESPONSE_CONTROL_PORT` then set them; an unadvertised env value that differs from what peers compute refuses to start). A node with none serves new clients on the declared path. Peers advertise them as `RUNE_PEERS` segments 7 and 8. Segments 7 and 8 are added only after every node runs this version: older nodes refuse entries with more than 6 segments.
+  They are advertised in Metadata next to `egressControlPort`, and added to `nodeBoundPorts`, the MTU host list and
+  `docs/operations.md`. Task 2 confirmed on Aeron 1.51.0 that several exclusive response publications share one
+  control port, each reaching only its correlated client (`ResponseEgressSpikeRegression.*`).
 - **D4.** **Wire.** A new `kClientVersionResponseEgress`:
-  - **New clients** send an empty `egressChannel` and a `responseCorrelated` flag. The broker answers only on the
-    response publication.
+  - **New clients** send their declared `egressChannel` AND `responseCorrelated = 1` (an older broker ignores the
+    flag and answers on the declared channel; a broker >= 9 ignores the declared channel when the flag is set and
+    answers only on the response publication).
   - **Older clients** keep the declared-channel path unchanged, so mixed versions keep working.
   - The gateway records the session's source address from the image's `sourceIdentity`, never from the declared
     channel. This fixes #227 for both paths.
@@ -67,6 +70,10 @@ Decisions:
   `sessionId` on that worker's ingress) instead of a channel string. The worker creates the response publication
   itself on its own thread, so it stays single-writer, and resolves it with the same bounded resolve as
   `WorkerEgress`.
+- **D6a.** **Worker binding is token-proven** (decided 2026-10-28). The gateway returns a 16-byte random bind token in
+  the v16 ConnectResponse; the client sends it in `WorkerBind` as the first frame on each worker ingress; the worker binds
+  that image once and refuses produce for the session from any other image. Without it a guessed session id would
+  redirect another client's Records.
 - **D7.** **Client.**
   - The `AeronTransport` creates one response subscription per broker endpoint before the request publication.
   - `ClientConfig::egressChannel` stays for older brokers (a broker below the version answers with the declared

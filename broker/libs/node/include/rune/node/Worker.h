@@ -718,6 +718,8 @@ public:
     // -----------------------------------------------------------------------
     void setShardClient(aeron::Aeron* client, int32_t controlTermBytes = 0) {
         ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client, controlTermBytes}) : nullptr;
+        bindAcksOwed_.assign(SessionAckSink::kMaxSessions, OwedBindAck{});   // I2: preallocated once (cold), never grows
+        bindAcksOwedCount_ = 0;
         if (ackSink_) ackSink_->setDirectBudgets(directSessionAckBudget_, static_cast<uint32_t>(kDirectAckBudget));
         // A worker with its own sink has always enforced WRITE on its direct ingress: it becomes Enforcing.
         if (ackSink_) enforcement_ = Enforcing{ackSink_.get()};
@@ -826,6 +828,8 @@ public:
     }
     [[nodiscard]] uint64_t intakeGrantHoldsForTest() const noexcept { return intakeGrantHolds_; }
     [[nodiscard]] const SessionAckSink* ackSinkForTest() const noexcept { return ackSink_.get(); }
+    /// NAT-safe egress (Task 6): the session's response publication is Ready (worker thread / quiescent only).
+    [[nodiscard]] bool responsePubReadyForTest(int64_t sessionId) const noexcept { return ackSink_ && ackSink_->readyPub(sessionId) != nullptr; }
     [[nodiscard]] std::size_t sessionCryptoEntriesForTest() const noexcept { return sessionCrypto_.size(); }
     [[nodiscard]] uint64_t ackRoomOpPausesForTest() const noexcept { return ackRoomOpPauses_; }
     /// Fix round 2 (finding 9): session signals (Failed / Held / Released) the
@@ -934,6 +938,10 @@ public:
         // shared-nothing).  nullptr → fall back to the shared MDC pub
         // (workerEgress_) for broadcast/replication.
         aeron::ExclusivePublication* egressPub = nullptr;
+        /// NAT-safe egress (Task 6): the Records of this subscription ride the session's own RESPONSE publication,
+        /// looked up in the ack sink per pass (the sink may release it on close / image loss, so it is never cached
+        /// here).  egressPub stays null and the shared egress is NEVER a fallback (egressPubOf_).
+        bool sessionEgress = false;
         /// F19 push state.  Live: pushing.  ErrorOwed: the next batch's Records
         /// frame exceeds the egress maxMessageLength — the cursor is parked AT
         /// it and one ErrorResponse{MessageTooLarge, correlationId 0, message
@@ -1290,7 +1298,28 @@ public:
             break;
         case WorkerOp::Type::SessionAnnounce:
             tailKind = sbe::TailKind::Value::EGRESS_CHANNEL;
-            if (op.sessionEncrypted) [[unlikely]] {
+            if (op.responseBind) [[unlikely]] {
+                // NAT-safe egress (Task 6): [token:16][crypto header if encrypted][channel (empty)] — cold, once per
+                // (session, worker), into this worker's own reused scratch.
+                static_assert(kSessionAnnounceTailScratchBytes >= 16 + kSessionAnnounceCryptoHeaderBytes);
+                std::memcpy(sessionAnnounceTailScratch_.data(), op.bindToken.data(), op.bindToken.size());
+                std::size_t n = op.bindToken.size();
+                if (op.sessionEncrypted) {
+                    const std::size_t c = encodeSessionAnnounceCryptoTail(
+                        sessionAnnounceTailScratch_.data() + n, sessionAnnounceTailScratch_.size() - n,
+                        op.senderCipher, op.senderKeyPrefix, op.senderKey, op.c2bKeyPrefix, op.c2bKey,
+                        op.egressChannel.data(), op.egressChannel.size());
+                    if (c == 0) [[unlikely]]
+                        haltInvariant_("SessionAnnounce crypto tail too large for scratch",
+                                       "NAT-safe egress Task 6: channel exceeded kMaxChannelBytes", 0);
+                    n += c;
+                } else if (!op.egressChannel.empty()) {
+                    std::memcpy(sessionAnnounceTailScratch_.data() + n, op.egressChannel.data(), op.egressChannel.size());
+                    n += op.egressChannel.size();
+                }
+                tailSrc = sessionAnnounceTailScratch_.data();
+                tailLen = n;
+            } else if (op.sessionEncrypted) [[unlikely]] {
                 // Task 19: cold, once per (session, worker) — stamp the
                 // [cipher|prefix|key] crypto header ahead of the channel
                 // bytes into this worker's own reused scratch (zero heap
@@ -1407,7 +1436,11 @@ public:
                                                (op.type == WorkerOp::Type::SessionAnnounce && op.grantAll
                                                     ? kOpFlagGrantAll : 0u) |
                                                (op.type == WorkerOp::Type::SessionAnnounce && op.keyPending
-                                                    ? kOpFlagKeyPending : 0u)))
+                                                    ? kOpFlagKeyPending : 0u) |
+                                               (op.type == WorkerOp::Type::SessionAnnounce && op.responseBind
+                                                    ? kOpFlagResponseBind : 0u) |
+                                               (op.type == WorkerOp::Type::Subscribe && op.sessionEgress
+                                                    ? kOpFlagSessionEgress : 0u)))
            .durabilityTier(wireDurabilityTier)
            .enqueuedAtNs(op.enqueuedAtNs)
            .subscriptionId(op.subscriptionId)
@@ -2076,6 +2109,7 @@ private:
                     return &ackSealCtx_;
                 });
             work += reportSessionSignals_();
+            if (bindAcksOwedCount_ != 0) [[unlikely]] work += serviceBindAcks_();
         }
         if (work == 0) work += prepareIdle_();   // A9: only a pass that may park pays for it
         return work;
@@ -2722,6 +2756,7 @@ private:
             ++sessionClosesSeen_;
             if (ackSink_) ackSink_->close(op.sessionId());
             eraseSessionCrypto_(op.sessionId());   // Task 19: no-op if the session was never encrypted
+            eraseSessionEgressSubs_(op.sessionId());   // Task 6: their publication died with the session
             break;
         case WorkerOp::Type::SessionPermissions:
             executeSessionPermissionsWire_(op);
@@ -2837,8 +2872,20 @@ private:
         const int32_t stream    = op.egressStreamId();
         const int32_t version   = op.clientVersion();   // D6: gates UnknownProducerId acks
         lastAnnouncedClientVersion_ = version;
-        const std::uint32_t len = op.tailLength();
-        const char* p           = op.tail();
+        std::uint32_t len = op.tailLength();
+        const char* p     = op.tail();
+
+        // NAT-safe egress (Task 6): a response-mode announce ships [token:16] ahead of the rest of the tail and NO
+        // channel; strip the token first, the remainder decodes exactly as before.
+        const bool responseBind = (op.deferAck() & kOpFlagResponseBind) != 0;
+        std::array<uint8_t, 16> bindToken{};
+        if (responseBind) [[unlikely]] {
+            if (len < bindToken.size()) [[unlikely]]
+                haltInvariant_("response-bind SessionAnnounce without its token", "NAT-safe egress Task 6", 0);
+            std::memcpy(bindToken.data(), p, bindToken.size());
+            p += bindToken.size();
+            len -= static_cast<std::uint32_t>(bindToken.size());
+        }
 
         // Task 19: see WorkerOp::sessionEncrypted's doc comment for the wire
         // reuse (isolation/durabilityTier bytes + the tail's crypto prefix).
@@ -2924,7 +2971,10 @@ private:
         // closes not yet queued everywhere) against kMaxSessions − 1, and
         // refuses longer channels at Connect.  A refusal would leave an
         // accepted session that is never acked: halt, never a silent drop.
-        if (!ackSink_->announce(sid, channel, stream, version, (op.deferAck() & kOpFlagGrantAll) != 0)) [[unlikely]] {
+        const bool announced = responseBind
+            ? ackSink_->announceResponse(sid, bindToken, stream, version, (op.deferAck() & kOpFlagGrantAll) != 0)
+            : ackSink_->announce(sid, channel, stream, version, (op.deferAck() & kOpFlagGrantAll) != 0);
+        if (!announced) [[unlikely]] {
             spdlog::critical("Worker {}: session {} announcement refused (sessions {}, channel {} B, max {})",
                              workerId_, sid, ackSink_->sessionCount(), channel.size(), SessionAckSink::kMaxChannelBytes);
             haltInvariant_("session announcement refused", "Task 13 I2: runtime session cap violated", 0);
@@ -2962,7 +3012,8 @@ private:
             const std::uint32_t n = op.tailLength();
             filterTail = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(op.tail()), n);
         }
-        if (perSessionEgressRequired_ && op.egressPub() == 0) [[unlikely]] {
+        const bool sessionEgress = (op.deferAck() & kOpFlagSessionEgress) != 0;   // NAT-safe egress (Task 6)
+        if (perSessionEgressRequired_ && op.egressPub() == 0 && !sessionEgress) [[unlikely]] {
             // Issue #118: never a cursor on the shared egress under authentication; an existing entry of the id is
             // dropped too (fail closed: its records must not move to the shared publication).
             for (std::size_t i = 0; i < subs_.size(); ++i)
@@ -2991,6 +3042,7 @@ private:
                 s.isGroup              = op.isGroup() != 0;
                 s.groupCarrierReceived = op.groupCarrierReceived() != 0;
                 s.egressPub            = reinterpret_cast<aeron::ExclusivePublication*>(op.egressPub());
+                s.sessionEgress        = sessionEgress;
                 s.registryId           = op.targetReplicaId();
                 s.incarnation          = op.incarnation();
                 s.active               = true;   // re-subscribe (passed the guard) re-activates
@@ -3013,6 +3065,7 @@ private:
         s.isGroup              = op.isGroup() != 0;
         s.groupCarrierReceived = op.groupCarrierReceived() != 0;
         s.egressPub            = reinterpret_cast<aeron::ExclusivePublication*>(op.egressPub());
+        s.sessionEgress        = sessionEgress;
         s.registryId           = op.targetReplicaId();
         s.incarnation          = op.incarnation();
         s.rc                   = rcOf_(subReplica_(s));
@@ -3118,6 +3171,14 @@ private:
     // EgressReleased (never dropped: enqueueSignal_) — only then does the
     // runtime destroy the publication.  Cold (session-close rate).
     // -------------------------------------------------------------------
+    /// NAT-safe egress (Task 6, cold): a closed session's session-egress subscriptions have no egress publication to
+    /// release (the sink owned it), so the close itself drops them.
+    [[gnu::cold]] [[gnu::noinline]] void eraseSessionEgressSubs_(int64_t sessionId) {
+        for (std::size_t i = 0; i < subs_.size(); ) {
+            if (subs_[i].sessionEgress && subs_[i].sessionId == sessionId) eraseSub_(i);
+            else ++i;
+        }
+    }
     [[gnu::cold]] [[gnu::noinline]] void executeEgressReleaseWire_(sbe::WorkerOp& op) {
         const auto pub = static_cast<std::uintptr_t>(op.egressPub());
         bool endsOwed = false;
@@ -3360,13 +3421,22 @@ private:
         (void)trySendFilterBindError_(s);
     }
 
+    /// The publication this subscription's frames leave on, looked up per use.  A session-egress subscription (NAT-safe
+    /// egress, Task 6) uses ONLY its session's response publication from the ack sink — null while the client has not
+    /// bound (the subscription waits, cursor unchanged) and NEVER the shared egress; every other subscription uses its
+    /// own egress publication, then the shared one (unchanged).  One find_ for a session-egress subscription, none else.
+    [[nodiscard]] aeron::ExclusivePublication* egressPubOf_(const WorkerSubscription& s) noexcept {
+        if (s.sessionEgress) [[unlikely]] return ackSink_ ? ackSink_->readyPub(s.sessionId) : nullptr;
+        if (s.egressPub) return s.egressPub;
+        return workerEgress_ ? workerEgress_->pub() : nullptr;
+    }
+
     /// Cold: send the owed bind error.  true = sent (the subscription is then Failed and the debt is cleared); false =
     /// not sent (no egress, back-pressure, or the seal failed closed): still owed.
     [[gnu::cold]] [[gnu::noinline]] bool trySendFilterBindError_(WorkerSubscription& s) {
         const auto it = filterBindErrors_.find(s.subscriptionId);
         if (it == filterBindErrors_.end()) return false;
-        aeron::ExclusivePublication* pub = s.egressPub;
-        if (pub == nullptr && workerEgress_ != nullptr) pub = workerEgress_->pub();
+        aeron::ExclusivePublication* pub = egressPubOf_(s);
         if (pub == nullptr) return false;
         static_assert(rune::protocol::client::MessageHeader::ENCODED_SIZE + rune::protocol::client::ErrorResponse::BODY_FIXED + 2u + 256u <= kEgressScratchSize);
         char msg[256];
@@ -3510,7 +3580,7 @@ private:
         [[nodiscard]] bool deliverable(uint32_t sub) noexcept {
             const WorkerSubscription& s = w_.subs_[sub];
             if (!s.active || s.pushState != WorkerSubscription::PushState::Live) return false;
-            if (s.egressPub == nullptr && (w_.workerEgress_ == nullptr || w_.workerEgress_->pub() == nullptr)) return false;
+            if (w_.egressPubOf_(s) == nullptr) return false;
             // R-2: a group subscription whose isolation carrier has not arrived guessed read_committed; the filtered
             // pass skips aborted batches for good, so it waits for the true isolation instead of risking a loss.
             return !(s.isGroup && !s.groupCarrierReceived && s.isolation == kIsolationReadCommitted);
@@ -3524,8 +3594,7 @@ private:
     /// (ErrorOwed -> the owed error); the group then treats it like a refused send (the member falls behind, parked).
     filter::SendOutcome filterSend_(WorkerSubscription& s, std::span<const uint8_t> batch, bool isNote, int64_t noteCursor) {
         namespace pc = rune::protocol::client;
-        aeron::ExclusivePublication* pub = s.egressPub;
-        if (pub == nullptr && workerEgress_ != nullptr) pub = workerEgress_->pub();
+        aeron::ExclusivePublication* pub = egressPubOf_(s);
         if (pub == nullptr) return filter::SendOutcome::Retry;
         RecordsSealCtx seal;
         const RecordsSealCtx* sealPtr = sealCtxFor_(s.sessionId, seal);
@@ -3555,6 +3624,7 @@ private:
             (void)sendPushTooLarge_(s, pub, sealPtr, baseOffset);
             return filter::SendOutcome::TooLarge;
         }
+        if (sent.position > 0 && s.sessionEgress) [[unlikely]] ++responseEgressFrames_;   // I7
         return sent.position > 0 ? filter::SendOutcome::Sent : filter::SendOutcome::Retry;
     }
 
@@ -3738,8 +3808,7 @@ private:
 
             // Hybrid egress: prefer this consumer's UNICAST pub (independent
             // per-consumer offsets); fall back to the shared MDC pub (broadcast).
-            aeron::ExclusivePublication* egressPub = s.egressPub;
-            if (!egressPub && workerEgress_) egressPub = workerEgress_->pub();
+            aeron::ExclusivePublication* egressPub = egressPubOf_(s);   // per pass: a session-egress pub may be released
             if (!egressPub) {  // nowhere to send yet
                 if (s.pushState == WorkerSubscription::PushState::EndOwed) [[unlikely]] {   // #109: nobody to tell
                     eraseEndOwed_(s.subscriptionId);
@@ -3933,6 +4002,7 @@ private:
                 }
                 const int64_t r = sent.position;
                 if (r > 0) {
+                    if (s.sessionEgress) [[unlikely]] ++responseEgressFrames_;   // I7: delivered on the response pub
                     s.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
                     pos += batchSize;
                     ++pushed;
@@ -5853,8 +5923,9 @@ private:
     // runtime will ever announce (SessionAckSink::kMaxChannelBytes). A
     // worker-owned member (not a per-call stack buffer) so enqueueOp's hot
     // Produce/PushRead/etc. callers never pay for it on their stack frame.
-    std::array<uint8_t, kSessionAnnounceCryptoHeaderBytes + SessionAckSink::kMaxChannelBytes>
-        sessionAnnounceTailScratch_{};
+    static constexpr std::size_t kSessionAnnounceTailScratchBytes =
+        16 + kSessionAnnounceCryptoHeaderBytes + SessionAckSink::kMaxChannelBytes;   // + the 16 B bind token (Task 6)
+    std::array<uint8_t, kSessionAnnounceTailScratchBytes> sessionAnnounceTailScratch_{};
 
     // read-rework T3/T4 (I3): per-worker encode scratch for the in-worker push
     // loop.  Holds one encoded single-fragment Records frame (tryClaim fast
@@ -8157,6 +8228,12 @@ private:
 
     int pollWorkerIngress_(int64_t nowNs) {
         if (!workerIngress_ || !workerIngress_->resolved()) return 0;
+        // NAT-safe egress (Task 6): a client ingress image went away -> its bound sessions can never be answered
+        // again.  One compare when nothing happened.
+        if (ackSink_) [[likely]]
+            workerIngress_->drainUnavailable(
+                [this](int32_t image) { unbindImage_(image); },
+                [this](auto&& each) { ackSink_->forEachBoundImage(each); });
 
         const int32_t K = static_cast<int32_t>(ingressPollBudget_());
         if (K <= 0) [[unlikely]] {   // no room — skip poll (G-A6 preserved)
@@ -8180,10 +8257,13 @@ private:
             workerIngress_->controlledPoll(
                 K,
                 [this, nowNs, &polled]
-                (const uint8_t* data, std::size_t len, aeron::Header& /*hdr*/) {
+                (const uint8_t* data, std::size_t len, aeron::Header& hdr) {
                     uint8_t direct = SessionAckSink::kDirectRefused;   // < 16 B: undecodable, never answered
                     if (len >= kProduceSessionIdEnd) [[likely]] {
-                        direct = ackSink_->admitDirect(produceSessionIdOf_(data));
+                        // NAT-safe egress (Task 6): a WorkerBind is control-plane — consumed here, cold, never admitted.
+                        if (isWorkerBind_(data)) [[unlikely]] { handleWorkerBind_(data, len, hdr.sessionId()); return aeron::ControlledPollAction::CONTINUE; }
+                        // One probe: admission AND the image check of a response-mode session (see admitDirect).
+                        direct = ackSink_->admitDirect(produceSessionIdOf_(data), hdr.sessionId());
                         if (direct == SessionAckSink::kDirectRefused) [[unlikely]] {
                             ++intakePausedFrames_;
                             FLIGHT_RECORDER_THROTTLED_PRODUCE(frIntakePaused_, flight_recorder::Site::ShIntakePaused,
@@ -8194,6 +8274,11 @@ private:
                         // never appended (the gateway's UnknownSession drop).
                         if (direct == SessionAckSink::kDirectDropClosed) [[unlikely]]
                             return aeron::ControlledPollAction::CONTINUE;
+                        // Task 6: another image than the bound one (or not bound yet): consumed, never answered.
+                        if (direct == SessionAckSink::kDirectDropSpoofed) [[unlikely]] {
+                            noteSpoofedIngress_(produceSessionIdOf_(data), hdr.sessionId());
+                            return aeron::ControlledPollAction::CONTINUE;
+                        }
                     }
                     const int r = handleWorkerIngressFrame_(data, len, nowNs, direct);
                     // hotpath-A F2/F3: the partition's roll is deferred (no ready
@@ -8225,6 +8310,163 @@ private:
     /// no pre-provisioned segment is ready or the async seal queue is full.
     /// Nothing was decoded into state, answered or appended.  Never blocks.
     static constexpr int kIngressHeld = -1;
+
+    // -----------------------------------------------------------------------
+    // NAT-safe egress (Task 6) — response-mode sessions in shard mode.
+    // -----------------------------------------------------------------------
+    /// "host:port" of THIS worker's response-control endpoint (BrokerNode, setResponseControl); empty = response mode
+    /// is off on this worker (no session is announced in response mode then).
+public:
+    void setResponseControl(std::string endpoint) { responseControlEndpoint_ = std::move(endpoint); }
+    [[nodiscard]] uint64_t spoofedIngressDroppedForTest() const noexcept { return spoofedIngressDropped_; }
+    [[nodiscard]] uint64_t workerBindsAcceptedForTest() const noexcept { return workerBindsAccepted_; }
+    [[nodiscard]] uint64_t workerBindsRefusedForTest() const noexcept { return workerBindsRefused_; }
+    [[nodiscard]] uint64_t imageUnbindsForTest() const noexcept { return imageUnbinds_; }
+    /// TEST SEAM (worker thread): is the client ingress image `aeronSessionId` still in the worker subscription's list.
+    [[nodiscard]] bool ingressImageAliveForTest(int32_t aeronSessionId) const noexcept {
+        return workerIngress_ != nullptr && workerIngress_->imageCorrelationIdOf(aeronSessionId) >= 0;
+    }
+    /// I2 seams: WorkerBindAcks offered on a response publication / dropped because the owed list was full.
+    [[nodiscard]] uint64_t workerBindAcksSentForTest() const noexcept { return workerBindAcksSent_; }
+    [[nodiscard]] uint64_t workerBindAcksDroppedForTest() const noexcept { return workerBindAcksDropped_; }
+    [[nodiscard]] std::size_t workerBindAcksOwedForTest() const noexcept { return bindAcksOwedCount_; }
+    /// I2 test seams (worker thread, via onWorkerThreadForTest): refuse the next `n` WorkerBinds without looking at
+    /// them (a lost / refused bind), and swallow the next `n` WorkerBindAcks instead of offering them (a lost ack).
+    void dropNextWorkerBindsForTest(uint32_t n) noexcept { dropBindsForTest_ = n; }
+    void swallowNextWorkerBindAcksForTest(uint32_t n) noexcept { swallowBindAcksForTest_ = n; }
+    /// I4 seam: WorkerBinds that passed the token check and went on to the image lookup / channel build.
+    [[nodiscard]] uint64_t workerBindImageLookupsForTest() const noexcept { return workerBindImageLookups_; }
+    /// I7 seam: Records frames delivered on a response publication (session-egress subscriptions); sum over workers.
+    [[nodiscard]] uint64_t responseEgressFramesForTest() const noexcept { return responseEgressFrames_; }
+private:
+    uint64_t workerBindImageLookups_ = 0;
+    // I2: a WorkerBind (first or repeated) is acknowledged with a plaintext WorkerBindAck on the session's response
+    // publication, once that publication is Ready.  A fixed-capacity list (kMaxSessions, preallocated in
+    // setShardClient): one entry per session, the latest bind's correlation id.  Full = dropped + counted (the client
+    // resends and AlreadyBound re-queues).  Worker thread only.
+    struct OwedBindAck { int64_t sid = 0; int64_t corr = 0; };
+    std::vector<OwedBindAck> bindAcksOwed_;
+    std::size_t              bindAcksOwedCount_ = 0;
+    uint64_t                 workerBindAcksSent_ = 0;
+    uint64_t                 workerBindAcksDropped_ = 0;
+    uint32_t                 dropBindsForTest_ = 0;         // TEST SEAM (worker thread)
+    uint32_t                 swallowBindAcksForTest_ = 0;   // TEST SEAM (worker thread)
+
+    /// Cold: owe `sid` a WorkerBindAck for bind correlation `corr` (dedupe by session: the latest corr wins).
+    [[gnu::cold]] [[gnu::noinline]] void oweBindAck_(int64_t sid, int64_t corr) {
+        for (std::size_t i = 0; i < bindAcksOwedCount_; ++i)
+            if (bindAcksOwed_[i].sid == sid) { bindAcksOwed_[i].corr = corr; return; }
+        if (bindAcksOwedCount_ == bindAcksOwed_.size()) { ++workerBindAcksDropped_; return; }
+        bindAcksOwed_[bindAcksOwedCount_++] = OwedBindAck{sid, corr};
+    }
+
+    /// Cold (only while the list is non-empty): offer every owed ack whose response publication is Ready.  A session
+    /// that is gone or Failed will never be answered: its entry is dropped.  Back-pressure keeps the entry.
+    [[gnu::cold]] [[gnu::noinline]] int serviceBindAcks_() {
+        int sent = 0;
+        std::size_t i = 0;
+        while (i < bindAcksOwedCount_) {
+            const OwedBindAck e = bindAcksOwed_[i];
+            bool remove = false;
+            if (aeron::ExclusivePublication* pub = ackSink_->readyPub(e.sid)) {
+                uint8_t frame[rune::protocol::client::WorkerBindAck::ENCODED_SIZE];
+                rune::protocol::client::WorkerBindAck ack;
+                ack.sessionId = e.sid; ack.correlationId = e.corr;
+                const std::size_t n = ack.encode(frame);
+                if (swallowBindAcksForTest_ > 0) [[unlikely]] { --swallowBindAcksForTest_; remove = true; }   // test seam: a lost ack
+                else if (sendEncodedToPub_(pub, frame, n) > 0) { ++workerBindAcksSent_; ++sent; remove = true; }
+            } else if (ackSink_->pubGoneOrFailed(e.sid)) {
+                remove = true;
+            }
+            if (remove) bindAcksOwed_[i] = bindAcksOwed_[--bindAcksOwedCount_];   // order is irrelevant
+            else ++i;
+        }
+        return sent;
+    }
+    uint64_t responseEgressFrames_   = 0;   // I7: Records frames claimed on a session-egress subscription's response pub
+    std::string responseControlEndpoint_;
+    uint64_t spoofedIngressDropped_ = 0;
+    uint64_t workerBindsAccepted_   = 0;
+    uint64_t workerBindsRefused_    = 0;
+    uint64_t imageUnbinds_          = 0;
+
+    /// templateId (LE16 at byte 2 of the MessageHeader) == WorkerBind.  Caller guarantees len >= 16.
+    [[nodiscard]] static bool isWorkerBind_(const uint8_t* data) noexcept {
+        return data[2] == static_cast<uint8_t>(rune::protocol::client::WorkerBind::TEMPLATE_ID & 0xFF) &&
+               data[3] == static_cast<uint8_t>(rune::protocol::client::WorkerBind::TEMPLATE_ID >> 8);
+    }
+
+    /// Cold: a frame of a response-mode session arrived on the wrong image (an attacker naming a sequential session
+    /// id) or before the bind.  Consumed without append or reply; counted; logged first + every 1024th.
+    [[gnu::cold]] [[gnu::noinline]] void noteSpoofedIngress_(int64_t sessionId, int32_t image) {
+        ++spoofedIngressDropped_;
+        if (unauthLog_.due(18)) [[unlikely]]
+            spdlog::warn("Worker {}: produce for response-mode session {} from image {} dropped (not its bound image, or "
+                         "not bound yet; total {})", workerId_, sessionId, image, spoofedIngressDropped_);
+    }
+
+    /// Cold: the Aeron image `image` is gone — fail every session bound to it (the runtime then closes them).
+    [[gnu::cold]] [[gnu::noinline]] void unbindImage_(int32_t image) {
+        const int n = ackSink_->unbindImage(image);
+        imageUnbinds_ += static_cast<uint64_t>(n);
+        if (n != 0)
+            spdlog::info("Worker {}: client ingress image {} ended; {} response-mode session(s) unbound", workerId_, image, n);
+    }
+
+    /// Cold: a WorkerBind frame.  Never answered (a refused sender has no publication to be answered on; the bound
+    /// one is answered by its acks).  Decode; resolve the correlation id of the image it arrived on; build this
+    /// worker's response channel; let the sink check the token and bind.
+    [[gnu::cold]] [[gnu::noinline]] void handleWorkerBind_(const uint8_t* data, std::size_t len, int32_t image) {
+        namespace pc = rune::protocol::client;
+        if (dropBindsForTest_ > 0) [[unlikely]] { --dropBindsForTest_; ++workerBindsRefused_; return; }   // test seam
+        const auto msg = pc::WorkerBind::decode(data, len);
+        if (!msg || !ackSink_ || responseControlEndpoint_.empty()) {
+            ++workerBindsRefused_;
+            if (unauthLog_.due(19)) spdlog::warn("Worker {}: WorkerBind refused ({}) from image {}", workerId_,
+                                                  !msg ? "undecodable" : "response mode off", image);
+            return;
+        }
+        // I4: authorize BEFORE any work.  A WorkerBind is unauthenticated until its token checks out, and any sender
+        // can aim one at a worker: an unknown session / wrong token / already-bound session costs one probe and a
+        // constant-time compare - no image lookup, no channel string.
+        const auto chk = ackSink_->checkBind(msg->sessionId, msg->token);
+        if (chk == SessionAckSink::BindResult::AlreadyBound) {
+            // I2: a repeat of the accepted bind (the client has not seen the ack): same image -> owe the ack again.
+            if (ackSink_->boundImage(msg->sessionId) == image) { oweBindAck_(msg->sessionId, msg->correlationId);
+            return;
+        }
+            ++workerBindsRefused_;
+            return;
+        }
+        if (chk != SessionAckSink::BindResult::Bound) {
+            ++workerBindsRefused_;
+            if (unauthLog_.due(19))
+                spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused (result {}; refused so far {})",
+                             workerId_, msg->sessionId, image, static_cast<int>(chk), workerBindsRefused_);
+            return;
+        }
+        ++workerBindImageLookups_;
+        const int64_t corr = workerIngress_ ? workerIngress_->imageCorrelationIdOf(image) : -1;
+        if (corr < 0) {
+            ++workerBindsRefused_;
+            if (unauthLog_.due(20)) spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused: no such image",
+                                                  workerId_, msg->sessionId, image);
+            return;
+        }
+        const std::string channel = "aeron:udp?control=" + responseControlEndpoint_ +
+                                    "|control-mode=response|response-correlation-id=" + std::to_string(corr);
+        const auto r = ackSink_->bind(msg->sessionId, msg->token, image, channel);
+        if (r == SessionAckSink::BindResult::Bound) {
+            ++workerBindsAccepted_;
+            workerIngress_->requestImageRescan();   // a reconnect may have masked a lost image (count unchanged)
+            oweBindAck_(msg->sessionId, msg->correlationId);
+            return;
+        }
+        ++workerBindsRefused_;
+        if (unauthLog_.due(19))
+            spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused (result {}; refused so far {})",
+                         workerId_, msg->sessionId, image, static_cast<int>(r), workerBindsRefused_);
+    }
 
     // Client MessageHeader: sessionId is LE64 at byte 8 (blockLength, templateId,
     // schemaId, version: 4 × u16) — read without decoding the whole frame.

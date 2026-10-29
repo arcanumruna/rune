@@ -61,6 +61,7 @@ struct PartitionEntry {
     int32_t ingressStreamId = 0;  ///< E5.1: per-worker Aeron ingress stream id (0 = legacy/unknown)
     std::string ingressEndpoint;  ///< Task 16: "host:port" of the owning worker's ingress ("" = node)
     uint8_t ingressReceiverId = 0; ///< issue #116: receiver id of the advertised worker route (0 = the gateway)
+    int32_t responseControlPort = 0; ///< v16 (NAT-safe egress): the owning worker's response-control port (0 = none)
 };
 
 // ---------------------------------------------------------------------------
@@ -70,6 +71,7 @@ struct BrokerEntry {
     int32_t     nodeId = -1;
     int32_t     port   = 0;
     std::string host;          // owned copy
+    int32_t     responseControlPort = 0; ///< v16 (NAT-safe egress): this node's gateway response-control port (0 = none)
 };
 
 // ---------------------------------------------------------------------------

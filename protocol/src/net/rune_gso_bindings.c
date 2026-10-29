@@ -1,6 +1,6 @@
 /* rune_gso_bindings.c — see rune/protocol/net/rune_gso_bindings.h.
  *
- * Threading (verified in Aeron's C driver, 1.4x):
+ * Threading (verified in Aeron's C driver, 1.51.0):
  *  - init_func runs ONLY on the conductor (send endpoint / receive destination create).
  *  - send/recvmmsg run on the sender/receiver agent that owns the transport.
  *  - close_func runs on the conductor (endpoint delete) OR on the RECEIVER agent (multi-destination subscription
@@ -131,11 +131,7 @@ static int rune_gso_init(
     struct sockaddr_storage *bind_addr,
     struct sockaddr_storage *multicast_if_addr,
     struct sockaddr_storage *connect_addr,
-    unsigned int multicast_if_index,
-    uint8_t ttl,
-    size_t socket_rcvbuf,
-    size_t socket_sndbuf,
-    bool is_media_timestamping,
+    aeron_udp_channel_transport_params_t *params,
     aeron_driver_context_t *context,
     aeron_udp_channel_transport_affinity_t affinity)
 {
@@ -152,8 +148,7 @@ static int rune_gso_init(
         }
     }
     if (owner->defaults.init_func(
-        transport, bind_addr, multicast_if_addr, connect_addr, multicast_if_index, ttl, socket_rcvbuf, socket_sndbuf,
-        is_media_timestamping, context, affinity) < 0)
+        transport, bind_addr, multicast_if_addr, connect_addr, params, context, affinity) < 0)
     {
         return -1;
     }
@@ -450,7 +445,10 @@ static int rune_gso_send(
                 st->t.gso_path_mtu_fallbacks++;
                 if (NULL != st->owner->path_mtu_counter)
                 {
-                    aeron_counter_ordered_increment(st->owner->path_mtu_counter, 1);
+                    /* One counter for every transport: the sender agent and (status / NAK sends) the receiver
+                     * agent can both reach it, so an atomic add, as Aeron's own errors counter.  Rare (a path-MTU
+                     * refusal), never on the steady-state send path. */
+                    aeron_counter_increment(st->owner->path_mtu_counter);
                 }
                 if (0 == now)
                 {

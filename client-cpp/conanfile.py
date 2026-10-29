@@ -58,7 +58,7 @@ class RuneClientCppConan(ConanFile):
             cmake_layout(self, src_folder="client-cpp")
 
     def _skip_aeron(self):
-        # The aeron/1.41.4 ConanCenter recipe raises ConanInvalidConfiguration on
+        # The aeron ConanCenter recipe raises ConanInvalidConfiguration on
         # macOS/armv8 (Apple Silicon), breaking `conan install` and the CMake
         # configure in CLion on a Mac.  The client is built/run on Linux; on macOS
         # the project is loaded for editing/indexing only, so skip aeron there

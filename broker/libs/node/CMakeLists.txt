@@ -138,7 +138,8 @@ if(BUILD_TESTING)
         "${RUNE_BROKER_DIR}/cmake/tsan-aeron.supp")
 
     # Task 13 (spec §3.4): worker-side ack sink + announce-before-accept (no driver).
-    add_executable(rune_session_ack_sink_tests tests/node/SessionAckSinkTest.cpp)
+    add_executable(rune_session_ack_sink_tests tests/node/SessionAckSinkTest.cpp
+                   tests/node/SessionAckSinkResponseBindRegressionTest.cpp)
     target_link_libraries(rune_session_ack_sink_tests PRIVATE rune_node GTest::gtest_main)
     gtest_discover_tests(rune_session_ack_sink_tests)
     add_executable(rune_session_announcer_tests tests/node/SessionAnnouncerTest.cpp tests/node/PeerLinkFanoutTest.cpp)
@@ -1253,8 +1254,13 @@ if(BUILD_TESTING)
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).
-            add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp)
+            add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp tests/node/DriverWakePollProbe.c)
             target_link_libraries(rune_embedded_driver_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            # DriverWakePollProbe.c includes Aeron's internal driver headers, as rune_driver_wake.c does.
+            foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
+                target_include_directories(rune_embedded_driver_tests PRIVATE
+                    "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
+            endforeach()
             gtest_discover_tests(rune_embedded_driver_tests
                 PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
@@ -1262,6 +1268,23 @@ if(BUILD_TESTING)
                 tests/node/UnresolvedPeerRegressionTest.cpp)
             target_link_libraries(rune_aeron_pump_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_aeron_pump_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            add_executable(rune_response_egress_spike_tests tests/integration/ResponseEgressSpikeRegressionTest.cpp)
+            target_link_libraries(rune_response_egress_spike_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_response_egress_spike_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # NAT-safe egress Task 5: the gateway answers a v16 client on a response publication (real BrokerNode).
+            add_executable(rune_response_egress_gateway_tests tests/integration/ResponseEgressGatewayRegressionTest.cpp)
+            target_include_directories(rune_response_egress_gateway_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_response_egress_gateway_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_response_egress_gateway_tests PROPERTIES TIMEOUT 360 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # NAT-safe egress Task 6: worker acks and Records ride a per-(session, worker) response publication (real BrokerNode).
+            add_executable(rune_response_egress_worker_tests tests/integration/ResponseEgressWorkerRegressionTest.cpp)
+            target_include_directories(rune_response_egress_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_response_egress_worker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                                  aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_response_egress_worker_tests PROPERTIES TIMEOUT 600 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # A9: worker ring doorbells (op / session / ret_ space wait), parked shard runner wake,
             # ADMIN_ACTION retry on worker claims — REAL invoker driver.
@@ -2009,6 +2032,18 @@ if(BUILD_TESTING)
         target_link_libraries(rune_client_failover_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_client_failover_broker_tests PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+
+        # NAT-safe egress Task 8: the REAL client behind a simulated NAT (declared egress unroutable) against real
+        # in-process brokers: every operation must ride the response path (1 / 3 nodes, TLS+auth, mixed old/new,
+        # leader change mid-connect, source-port change, derived default ports).
+        add_executable(rune_nat_egress_matrix_tests tests/client/NatEgressMatrixRegressionTest.cpp)
+        add_dependencies(rune_nat_egress_matrix_tests generate_claim_schema_headers)
+        target_include_directories(rune_nat_egress_matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                                   ${RUNE_CLIENT_ROOT}/tests ${CMAKE_BINARY_DIR}/rune-client/claim-gen
+                                   ${CMAKE_BINARY_DIR}/rune-client/claim-gen/gen ${RUNE_CLIENT_ROOT}/examples)
+        target_link_libraries(rune_nat_egress_matrix_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_nat_egress_matrix_tests PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
         # Catalog history Task 11: the DDL route (Redirect / NotLeader / Internal when
         # halted) and the halted controller's resignation, 3 brokers over real Aeron.

@@ -17,6 +17,8 @@
 //     RUNE_EGRESS          this client's own egress channel (required)
 //                            e.g. "aeron:udp?endpoint=dr-client-0:40400"
 //     RUNE_EGRESS_STREAM   int, default 2
+//     RUNE_GATEWAY_RESPONSE_PORT   the seed gateway's response-control port (NAT-safe egress; default 0 = the
+//                            declared RUNE_EGRESS path only)
 //     RUNE_DATA_DIR        Aeron driver dir (required)
 //     RUNE_CLIENT_TOPIC_TABLE          "name:id:partitions,..." default "events:0:1"
 //     RUNE_TIMEOUT_MS      per-op timeout ms, default 10000
@@ -786,6 +788,7 @@ int main() {
     cfg.gatewayStreamId  = targetStream;
     cfg.egressChannel    = egress;
     cfg.egressStreamId   = egressStream;
+    cfg.gatewayResponseControlPort = getEnvInt("RUNE_GATEWAY_RESPONSE_PORT", 0);   // NAT-safe egress (D7)
     cfg.dataDir          = dataDir;
     rune::examples::applyEnvCredentials(cfg);   // RUNE_USER / RUNE_PASSWORD_FILE
     cfg.connectTimeoutMs = static_cast<int64_t>(timeoutMs);

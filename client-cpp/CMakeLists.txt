@@ -128,7 +128,7 @@ option(ENABLE_FLIGHT_RECORDER "Compile in flight-recorder instrumentation" ON)
 set(FLIGHT_RECORDER_DIR "" CACHE PATH "Local flight-recorder checkout; empty = fetch it")
 set(FLIGHT_RECORDER_GIT_REPOSITORY "git@github.com:arcanumruna/flight-recorder.git" CACHE STRING
     "flight-recorder git URL used when FLIGHT_RECORDER_DIR is unset")
-set(FLIGHT_RECORDER_GIT_TAG "0c78e1a4d51d7cf3ddaa8d3fb3dc378e6c4dacea" CACHE STRING
+set(FLIGHT_RECORDER_GIT_TAG "55b729e449fe76ad863c99752006fc2981d3e14d" CACHE STRING
     "pinned flight-recorder commit")
 if(NOT FLIGHT_RECORDER_DIR)
     include(FetchContent)
@@ -1524,6 +1524,7 @@ if(BUILD_TESTING)
     add_executable(rune_pure_tests
         tests/transport/TransportConfigTest.cpp
         tests/transport/ResolutionTest.cpp
+        tests/transport/ResponseChannelTest.cpp   # NAT egress Task 7
         tests/detail/FlatIndexMapTest.cpp
         tests/producer/InFlightRingTest.cpp
         tests/shard/ShardMapTest.cpp
@@ -1572,6 +1573,7 @@ if(BUILD_TESTING)
             tests/client/ClaimClientTest.cpp
             tests/client/TypedClaimTest.cpp
             tests/client/IngressEndpointRoutingTest.cpp
+            tests/client/ClientResponseEgressRegressionTest.cpp   # NAT egress Task 7
             tests/producer/ProducerRouteParkTest.cpp
             tests/shard/ShardConfigTest.cpp
             tests/shard/ClientShardTest.cpp
@@ -1588,6 +1590,7 @@ if(BUILD_TESTING)
             tests/support/AllocCounter.cpp
         )
         target_include_directories(rune_invoker_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+        target_compile_definitions(rune_invoker_tests PRIVATE RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_TESTDATA_GEN}")   # NAT egress Task 7: the TLS bind test
         if(TARGET generate_claim_schema_headers)   # #377: guarded like the generator itself
             target_include_directories(rune_invoker_tests PRIVATE ${RUNE_CLAIM_GEN_DIR} "${RUNE_CLAIM_GEN_DIR}/gen")   # player_event.gen.h
             add_dependencies(rune_invoker_tests generate_claim_schema_headers)

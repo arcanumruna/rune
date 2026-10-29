@@ -1,7 +1,7 @@
 # Union of the dependencies of every subproject (broker, client-cpp, protocol, codec, crypto, ql).
 # Each subproject's own conanfile still works for building it on its own from its subdir.
 [requires]
-aeron/1.41.4
+aeron/1.51.0
 spdlog/1.14.0
 gtest/1.16.0
 benchmark/1.8.2

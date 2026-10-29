@@ -182,6 +182,7 @@ std::vector<std::string> nodeEndpointHosts(const NodeConfig& cfg) {
     // bind therefore adds nothing (k3s regression: 0.0.0.0 + 127.0.0.1 peers
     // derived the NIC's 1472 → 14-18k rec/s instead of 136k at 65504).  A
     // concrete non-wildcard bind host is where this node receives: included.
+    // The response-control ports bind on the egress control host (effectiveResponseControlHost()): no new host.
     // Review B-I3: the per-worker egress control host when it is a concrete address (it receives there).
     if (cfg.shardMode() || cfg.perWorkerEgressEnabled) {
         const std::string eg = cfg.effectiveWorkerEgressControlHost();
@@ -212,6 +213,14 @@ std::optional<ShardBasePorts> deriveShardBasePorts(int32_t nodeId, int32_t worke
     return ShardBasePorts{b, b + NodeConfig::kMaxShardWorkers, b + 2 * NodeConfig::kMaxShardWorkers};
 }
 
+std::optional<ResponseControlPorts> deriveResponseControlPorts(int32_t egressControlBase, int32_t workers) noexcept {
+    if (workers < 1 || workers > kMaxDerivedResponseWorkers || egressControlBase < 1 ||
+        static_cast<int64_t>(egressControlBase) + (NodeConfig::kMaxShardWorkers - 1) > 65535)
+        return std::nullopt;
+    const int32_t top = egressControlBase + (NodeConfig::kMaxShardWorkers - 1);
+    return ResponseControlPorts{top, top - workers};
+}
+
 namespace {
 /// The port of an "aeron:udp?endpoint=<host>:<port>[|...]" channel; 0 when absent / malformed.
 int32_t channelPort(std::string_view ch) noexcept {
@@ -240,12 +249,14 @@ std::vector<int32_t> nodeBoundPorts(const NodeConfig& cfg) {
         add(p.replicationPort);
     }
     add(channelPort(cfg.clientEndpoint.channel));
+    if (cfg.gatewayResponseControlPort) add(*cfg.gatewayResponseControlPort);
     if (cfg.shardMode()) {
         const int32_t W = cfg.workerCount >= 1 ? cfg.workerCount : 1;
         for (int32_t w = 0; w < W; ++w) {
             if (cfg.workerIngressBasePort) add(static_cast<int64_t>(*cfg.workerIngressBasePort) + w);
             if (cfg.workerReplBasePort)    add(static_cast<int64_t>(*cfg.workerReplBasePort) + w);
             if (const int32_t e = cfg.effectiveWorkerEgressControlBasePort(); e > 0) add(static_cast<int64_t>(e) + w);
+            if (cfg.responseControlBasePort) add(static_cast<int64_t>(*cfg.responseControlBasePort) + w);
         }
     } else if (cfg.perWorkerEgressEnabled) {
         // Review A-I5 / B-M1: legacy mode's per-worker egress control ports (BrokerNode binds them exactly when
@@ -384,6 +395,11 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
         const auto selfDerived = deriveShardBasePorts(cfg.nodeId, W);
         const PeerConfig* me = nullptr;
         for (const auto& p : cfg.peers) if (p.id == cfg.nodeId) me = &p;
+        // What RUNE_PEERS advertises for self, captured BEFORE the loop below overwrites the self egress base from
+        // the env: the response-control ports follow the rule every peer applies to this node.
+        const uint16_t selfAdvertisedEgress = me ? me->egressControlBasePort : 0;
+        const uint16_t selfAdvertisedRespBase = me ? me->responseControlBasePort : 0;
+        const uint16_t selfAdvertisedGwResp   = me ? me->gatewayResponseControlPort : 0;
         // Self: an explicit RUNE_WORKER_*_BASE_PORT wins; else the base RUNE_PEERS
         // advertises for self; else the derived one.
         if (!cfg.workerIngressBasePort) {
@@ -418,6 +434,30 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
                            std::to_string(*cfg.workerEgressControlBasePort) + " is not advertised in RUNE_PEERS "
                            "(6th segment): other nodes advertise the derived base for this node to clients");
         }
+        // Response-control ports (NAT-safe egress; spec D3): derived ONLY from the DERIVED egress block.  Self:
+        // explicit env wins, then the self RUNE_PEERS segments 7 / 8, then the derivation.
+        {
+            std::optional<ResponseControlPorts> rc;
+            if (selfDerived && (selfAdvertisedEgress == 0 || selfAdvertisedEgress == selfDerived->egressControl))
+                rc = deriveResponseControlPorts(selfDerived->egressControl, W);
+            bool derivedAny = false;
+            if (!cfg.responseControlBasePort) {
+                if (me && me->responseControlBasePort) cfg.responseControlBasePort = me->responseControlBasePort;
+                else if (rc) { cfg.responseControlBasePort = rc->workerBase; derivedAny = true; }
+            }
+            if (!cfg.gatewayResponseControlPort) {
+                if (me && me->gatewayResponseControlPort) cfg.gatewayResponseControlPort = me->gatewayResponseControlPort;
+                else if (rc) { cfg.gatewayResponseControlPort = rc->gateway; derivedAny = true; }
+            }
+            if (derivedAny) mark("responsePorts");
+            if (!cfg.responseControlBasePort || !cfg.gatewayResponseControlPort)
+                appendWarn(out.warnings, "no response-control ports for this node: this node's RUNE_PEERS 6th segment "
+                           "advertises a non-derived egress-control base, RUNE_WORKERS > 31, or node id outside "
+                           "[0, 126] — set RUNE_RESPONSE_CONTROL_BASE_PORT and RUNE_GATEWAY_RESPONSE_CONTROL_PORT and "
+                           "advertise them as RUNE_PEERS segments 7 and 8 — add those segments only after every node "
+                           "runs this version (older nodes refuse entries with more than 6 segments); until then new "
+                           "clients use the declared egress path");
+        }
         for (auto& p : cfg.peers) {
             const auto d = deriveShardBasePorts(p.id, W);
             if (!d && (p.ingressBasePort == 0 || p.replBasePort == 0 || p.egressControlBasePort == 0))
@@ -428,7 +468,29 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
             if (p.egressControlBasePort == 0 && d) { p.egressControlBasePort = static_cast<uint16_t>(d->egressControl); portsDerived = true; }
             if (p.id == cfg.nodeId && p.workerCount == 0) p.workerCount = W;
         }
+        // Peers' response-control ports (after their egress bases are resolved above).
+        for (auto& p : cfg.peers) {
+            if (p.id == cfg.nodeId) {
+                // Unadvertised: exactly what the peers compute for this node (validateShardConfig refuses an env
+                // value that differs).  Advertised segments are kept as they are.
+                std::optional<ResponseControlPorts> rc;
+                if (selfDerived && (selfAdvertisedEgress == 0 || selfAdvertisedEgress == selfDerived->egressControl))
+                    rc = deriveResponseControlPorts(selfDerived->egressControl, W);
+                if (selfAdvertisedRespBase == 0) p.responseControlBasePort = rc ? static_cast<uint16_t>(rc->workerBase) : 0;
+                if (selfAdvertisedGwResp == 0)   p.gatewayResponseControlPort = rc ? static_cast<uint16_t>(rc->gateway) : 0;
+                continue;
+            }
+            if (p.responseControlBasePort != 0 && p.gatewayResponseControlPort != 0) continue;
+            const auto pd = deriveShardBasePorts(p.id, W);
+            if (!pd || p.egressControlBasePort != pd->egressControl) continue;
+            if (const auto prc = deriveResponseControlPorts(pd->egressControl, W)) {
+                if (p.responseControlBasePort == 0)    p.responseControlBasePort = static_cast<uint16_t>(prc->workerBase);
+                if (p.gatewayResponseControlPort == 0) p.gatewayResponseControlPort = static_cast<uint16_t>(prc->gateway);
+            }
+        }
         if (portsDerived) mark("shardPorts");
+    } else if (cfg.responseControlBasePort) {
+        appendWarn(out.warnings, "RUNE_RESPONSE_CONTROL_BASE_PORT is used in shard mode only; ignored");
     }
 
     // DR-BUG-RESTART-BIND: a port this node binds inside the kernel's ephemeral range can be taken by any socket

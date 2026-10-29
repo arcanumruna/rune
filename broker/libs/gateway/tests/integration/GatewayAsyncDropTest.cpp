@@ -450,7 +450,10 @@ TEST_F(GatewayAsyncDropFixture, ResolveAfterCycles_SessionCreated_PendingClears)
         kEgressBase + 200);
     offerBounded(*ingressPub, sc, reqLen, "Connect-good");
 
-    // Pump with the wall clock until ConnectResponse arrives.
+    // Pump with a FROZEN gateway clock until ConnectResponse arrives: the
+    // 10 ms connect timeout must never race the client conductor's own
+    // resolution latency (wall-clock pumping made this test timing-dependent).
+    // The wall deadline below only bounds the loop.
     std::optional<pc::ConnectResponse> resp;
     aeron::FragmentAssembler respAsm(
         [&](aeron::concurrent::AtomicBuffer& buf,
@@ -466,7 +469,7 @@ TEST_F(GatewayAsyncDropFixture, ResolveAfterCycles_SessionCreated_PendingClears)
     using clock = std::chrono::steady_clock;
     const auto deadline = clock::now() + std::chrono::seconds{10};
     for (int i = 0; i < kPumpIter && clock::now() < deadline; ++i) {
-        gw_->doWork(wallNowNs());
+        gw_->doWork(tBase);
         egressSub->poll(respAsm.handler(), 10);
         if (resp.has_value()) break;
         std::this_thread::sleep_for(std::chrono::microseconds{200});
@@ -545,6 +548,9 @@ TEST_F(GatewayAsyncDropFixture, BackPressure_SendFails_NoOrphanSession) {
         std::this_thread::sleep_for(std::chrono::microseconds{200});
     }
 
+    EXPECT_EQ(gw_->pendingConnectCount(), 1u)
+        << "entry must be kept (stash-and-retry) until the timeout, not dropped by a re-find throw";
+
     // Phase 3: advance past timeout — entry must be dropped cleanly.
     const int64_t tTimeout = tBase + kConnectTimeoutNs + 1;
     pumpNs([&]() { return gw_->pendingConnectCount() == 0; },
@@ -557,6 +563,63 @@ TEST_F(GatewayAsyncDropFixture, BackPressure_SendFails_NoOrphanSession) {
     // No orphan: session count must still be zero.
     EXPECT_EQ(gw_->sessionCount(), 0u)
         << "No session must be created when ConnectResponse send never succeeded (FIX A)";
+}
+
+// Regression: Aeron 1.51 findExclusivePublication erases the registration after
+// the first non-null return; re-finding a stashed pub threw "Unknown registration
+// id" and dropped the Connect.  A late egress subscriber must still get its
+// ConnectResponse.
+TEST_F(GatewayAsyncDropFixture, LateEgressSubscriberStillGetsConnectResponseRegression) {
+    auto ingressPub = makeIngressPub();
+    constexpr int32_t kLateStream = kEgressBase + 400;
+    const int64_t tBase = 5'000'000'000LL;
+
+    uint8_t sc[256] = {};
+    const std::size_t reqLen = encodeConnect(sc, sizeof(sc), /*correlationId=*/5001,
+                                             "aeron:ipc", kLateStream);
+    offerBounded(*ingressPub, sc, reqLen, "Connect-late-subscriber");
+
+    pumpNs([&]() { return gw_->pendingConnectCount() > 0; },
+           tBase, kPumpIter, "pendingCount > 0");
+    for (int i = 0; i < 200; ++i) {
+        gw_->doWork(tBase);
+        std::this_thread::sleep_for(std::chrono::microseconds{200});
+    }
+    ASSERT_EQ(gw_->pendingConnectCount(), 1u)
+        << "entry must be kept (stash-and-retry), not dropped by a re-find throw";
+    ASSERT_EQ(gw_->sessionCount(), 0u);
+
+    // Create the subscription WITHOUT pumping the gateway (makeEgressSub pumps at the wall clock,
+    // which would time the frozen-clock pending entry out).
+    const int64_t subReg = aeron_->addSubscription("aeron:ipc", kLateStream);
+    std::shared_ptr<aeron::Subscription> egressSub;
+    for (int i = 0; i < kPumpIter && !egressSub; ++i) {
+        egressSub = aeron_->findSubscription(subReg);
+        if (!egressSub) std::this_thread::sleep_for(std::chrono::microseconds{200});
+    }
+    ASSERT_NE(egressSub, nullptr) << "late egress subscription did not resolve";
+    std::optional<pc::ConnectResponse> resp;
+    aeron::FragmentAssembler respAsm(
+        [&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
+            aeron::util::index_t len, aeron::Header&) {
+            auto dec = pc::ConnectResponse::decode(
+                reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+                static_cast<std::size_t>(len));
+            if (dec) resp = *dec;
+        });
+    using clock = std::chrono::steady_clock;
+    const auto deadline = clock::now() + std::chrono::seconds{10};
+    for (int i = 0; i < kPumpIter && clock::now() < deadline; ++i) {
+        gw_->doWork(tBase);
+        egressSub->poll(respAsm.handler(), 10);
+        if (resp.has_value()) break;
+        std::this_thread::sleep_for(std::chrono::microseconds{200});
+    }
+    ASSERT_TRUE(resp.has_value()) << "ConnectResponse not received after late subscriber";
+    EXPECT_EQ(resp->code, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(resp->correlationId, 5001LL);
+    EXPECT_EQ(gw_->pendingConnectCount(), 0u);
+    EXPECT_EQ(gw_->sessionCount(), 1u);
 }
 
 } // namespace

@@ -13,12 +13,15 @@
 // Reassembly logic is Aeron's, line for line:
 //   - UNFRAGMENTED (BEGIN|END)   → deliver in place (zero copy);
 //   - BEGIN_FRAG                 → reset this session's builder, append, record
-//                                  nextTermOffset = align(offset + length + HDR, 32);
-//   - middle / END               → only if offset == nextTermOffset (contiguous),
+//                                  nextTermOffset = align(frameTermOffset + HDR + length, 32);
+//   - middle / END               → only if header.termOffset() == nextTermOffset (contiguous),
 //                                  else RESET (gap → drop the partial message);
 //                                  on END deliver [HDR, limit) and reset;
 //   - Controlled: ABORT on the reassembled message restores the builder limit
 //     (the END fragment is re-delivered by the image), else reset.
+// Positions come from header.termOffset(), never from the handler's `offset`: Aeron 1.51's C++ wrapper hands the
+// handler a buffer over the payload with offset 0 (1.41 passed the term buffer and the payload's term offset).  The
+// handler's buffer/offset are used only to copy payload bytes.
 // Per-session state: aeron::BufferBuilder keyed by sessionId.  Aeron uses an
 // unordered_map; here a small flat vector (linear scan — a node sees a handful
 // of publisher sessions per subscription), allocation only on a NEW session.
@@ -94,9 +97,11 @@ private:
     std::vector<Slot> slots_;
 };
 
-inline aeron::util::index_t nextTermOffsetAfter(aeron::util::index_t offset, aeron::util::index_t length) noexcept {
+/// Term offset of the frame that follows the frame at `frameTermOffset` (from header.termOffset(), the FRAME's
+/// position in the term — not the handler's payload offset) carrying `length` payload bytes.
+inline aeron::util::index_t nextTermOffsetAfter(aeron::util::index_t frameTermOffset, aeron::util::index_t length) noexcept {
     using namespace aeron::concurrent::logbuffer;
-    return aeron::util::BitUtil::align(offset + length + DataFrameHeader::LENGTH, FrameDescriptor::FRAME_ALIGNMENT);
+    return aeron::util::BitUtil::align(frameTermOffset + DataFrameHeader::LENGTH + length, FrameDescriptor::FRAME_ALIGNMENT);
 }
 
 } // namespace detail
@@ -119,17 +124,19 @@ public:
         } else if ((flags & FrameDescriptor::BEGIN_FRAG) == FrameDescriptor::BEGIN_FRAG) {
             aeron::BufferBuilder& builder = builders_.get(header.sessionId());
             builder.reset().append(buffer, offset, length, header)
-                   .nextTermOffset(detail::nextTermOffsetAfter(offset, length));
+                   .nextTermOffset(detail::nextTermOffsetAfter(header.termOffset(), length));
         } else if (aeron::BufferBuilder* builder = builders_.find(header.sessionId())) {
-            if (offset == builder->nextTermOffset()) {
+            if (header.termOffset() == builder->nextTermOffset()) {
                 builder->append(buffer, offset, length, header);
                 if ((flags & FrameDescriptor::END_FRAG) == FrameDescriptor::END_FRAG) {
-                    const auto msgLength = static_cast<aeron::util::index_t>(builder->limit()) - DataFrameHeader::LENGTH;
+                    // The message is builder[0, limit): Aeron 1.51's BufferBuilder starts empty (1.41.4's reserved a
+                    // 32-byte frame header at the front).
+                    const auto msgLength = static_cast<aeron::util::index_t>(builder->limit());
                     aeron::concurrent::AtomicBuffer msgBuffer(builder->buffer(), builder->limit());
-                    delegate(msgBuffer, DataFrameHeader::LENGTH, msgLength, header);
+                    delegate(msgBuffer, 0, msgLength, header);
                     builder->reset();
                 } else {
-                    builder->nextTermOffset(detail::nextTermOffsetAfter(offset, length));
+                    builder->nextTermOffset(detail::nextTermOffsetAfter(header.termOffset(), length));
                 }
             } else {
                 builder->reset();   // gap: drop the partial message
@@ -166,19 +173,19 @@ public:
         } else if ((flags & FrameDescriptor::BEGIN_FRAG) == FrameDescriptor::BEGIN_FRAG) {
             aeron::BufferBuilder& builder = builders_.get(header.sessionId());
             builder.reset().append(buffer, offset, length, header)
-                   .nextTermOffset(detail::nextTermOffsetAfter(offset, length));
+                   .nextTermOffset(detail::nextTermOffsetAfter(header.termOffset(), length));
         } else if (aeron::BufferBuilder* builder = builders_.find(header.sessionId())) {
             const std::uint32_t limit = builder->limit();
-            if (offset == builder->nextTermOffset()) {
+            if (header.termOffset() == builder->nextTermOffset()) {
                 builder->append(buffer, offset, length, header);
                 if ((flags & FrameDescriptor::END_FRAG) == FrameDescriptor::END_FRAG) {
-                    const auto msgLength = static_cast<aeron::util::index_t>(builder->limit()) - DataFrameHeader::LENGTH;
+                    const auto msgLength = static_cast<aeron::util::index_t>(builder->limit());   // see above
                     aeron::concurrent::AtomicBuffer msgBuffer(builder->buffer(), builder->limit());
-                    action = delegate(msgBuffer, DataFrameHeader::LENGTH, msgLength, header);
+                    action = delegate(msgBuffer, 0, msgLength, header);
                     if (action == aeron::ControlledPollAction::ABORT) builder->limit(limit);   // END re-delivered
                     else builder->reset();
                 } else {
-                    builder->nextTermOffset(detail::nextTermOffsetAfter(offset, length));
+                    builder->nextTermOffset(detail::nextTermOffsetAfter(header.termOffset(), length));
                 }
             } else {
                 builder->reset();   // gap: drop the partial message

@@ -1,5 +1,5 @@
 requirements:
-  - "aeron/1.41.4"
+  - "aeron/1.51.0"
 test_requirements:
   - "gtest/1.16.0"
 benchmark_requirements:

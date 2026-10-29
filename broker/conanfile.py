@@ -18,7 +18,7 @@ class RuneBrokerConan(ConanFile):
         tc = CMakeToolchain(self); tc.user_presets_path = False; tc.generate()
 
     def requirements(self):
-        # The aeron/1.41.4 ConanCenter recipe raises ConanInvalidConfiguration on
+        # The aeron ConanCenter recipe raises ConanInvalidConfiguration on
         # macOS/armv8 (Apple Silicon), which breaks `conan install` and thus the
         # CMake configure in CLion on a Mac.  Rune only builds/runs the broker on
         # Linux; on macOS the project is loaded for editing/indexing only.  So skip

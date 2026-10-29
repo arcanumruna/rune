@@ -179,6 +179,12 @@ struct PeerConfig {
     // peer LEADS.  6th RUNE_PEERS segment; 0 = not advertised (derived at start
     // in shard mode, HostDefaults.h).
     uint16_t egressControlBasePort = 0;
+    // NAT-safe egress (spec 2026-10-26-rune-nat-egress-design.md D3): the response-control UDP ports
+    // the per-session reply publications' `control=` endpoints use.  7th and 8th RUNE_PEERS segments;
+    // absent = derived (shard mode, from the DERIVED egress block, HostDefaults.h); 0 is refused by the parser.
+    // responseControlBasePort: worker w binds base + w; gatewayResponseControlPort: the gateway's.
+    uint16_t responseControlBasePort    = 0;
+    uint16_t gatewayResponseControlPort = 0;
 
     /// "aeron:udp?endpoint=<host>:<consensusPort>"
     std::string consensusChannel() const;
@@ -734,6 +740,16 @@ struct NodeConfig {
     [[nodiscard]] std::string effectiveWorkerEgressControlHost() const;
     static constexpr int32_t kDefaultWorkerEgressControlBasePort = 40300;
     std::optional<int32_t> workerEgressControlBasePort;
+    /// Response-control ports (NAT-safe egress; every per-session reply rides an Aeron response publication
+    /// whose `control=` endpoint is one of these).  Bound on effectiveResponseControlHost().  0 / nullopt =
+    /// not available: clients then use the declared egress path.  In shard mode they are derived from the
+    /// DERIVED egress block (HostDefaults.h deriveResponseControlPorts) when this node advertises no, or the derived, egress base.
+    ///   - responseControlBasePort: worker w binds base + w (shard mode).  RUNE_RESPONSE_CONTROL_BASE_PORT.
+    ///   - gatewayResponseControlPort: the gateway's.  RUNE_GATEWAY_RESPONSE_CONTROL_PORT.
+    std::optional<int32_t> responseControlBasePort;
+    std::optional<int32_t> gatewayResponseControlPort;
+    /// The host the response-control ports bind: the egress control host (one accessor for later code).
+    [[nodiscard]] std::string effectiveResponseControlHost() const { return effectiveWorkerEgressControlHost(); }
     /// The egress-control base port actually bound: the configured value, else the
     /// legacy default.  The ONLY way readers obtain the port.
     [[nodiscard]] int32_t effectiveWorkerEgressControlBasePort() const noexcept {

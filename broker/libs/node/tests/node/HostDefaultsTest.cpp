@@ -834,7 +834,7 @@ TEST(HostDefaults, InvalidMtuIsRefusedAndGarbageCoreBaseDisables) {
     auto r = parse({{"RUNE_PEERS", "0@127.0.0.1:40110:40200:40220:40600:40500:40400"}});
     ASSERT_TRUE(r.config.has_value()) << r.error;
     EXPECT_EQ(r.config->peers[0].egressControlBasePort, 40400);
-    EXPECT_FALSE(parse({{"RUNE_PEERS", "0@127.0.0.1:1:2:3:4:5:6:7"}}).config.has_value()) << "max 6 segments";
+    EXPECT_FALSE(parse({{"RUNE_PEERS", "0@127.0.0.1:1:2:3:4:5:6:7:8:9"}}).config.has_value()) << "max 8 segments";
 }
 
 // REGRESSION (k3s, broker 7ad0b2a): cluster.sh-style config — client bind
@@ -1117,8 +1117,11 @@ TEST(HostDefaultsRegression, NodeBoundPortsListsEveryPortTheNodeBindsRegression)
     ASSERT_TRUE(d);
     std::vector<int32_t> want = {40112, 40202, 40222, d->ingress, d->ingress + 1, d->repl, d->repl + 1,
                                  d->egressControl, d->egressControl + 1};
+    const auto rc = deriveResponseControlPorts(d->egressControl, 2);
+    ASSERT_TRUE(rc);
+    for (const int32_t p : {rc->gateway, rc->workerBase, rc->workerBase + 1}) want.push_back(p);
     std::sort(want.begin(), want.end());
-    EXPECT_EQ(nodeBoundPorts(c), want) << "consensus, client, replication + every worker's three shard ports";
+    EXPECT_EQ(nodeBoundPorts(c), want) << "consensus, client, replication + every worker's three shard ports + the response-control ports";
 }
 
 TEST(HostDefaultsRegression, BoundPortInsideTheEphemeralRangeWarnsUnlessReservedRegression) {
@@ -1241,3 +1244,238 @@ TEST(HostDefaultsRegression, MtuProbeTargetResolvesOnceAndReadsByIoctlRegression
     ::close(fd);
     EXPECT_FALSE(resolveMtuProbeTarget("no-such-host.invalid").valid);
 }
+
+// --- NAT-safe egress: response-control ports (spec 2026-10-26 D3) ---
+namespace {
+NodeConfig shardNode(int32_t self, int32_t workers) {
+    NodeConfig c = threeNodeDefault(self);
+    c.workerCount = workers;
+    return c;
+}
+bool overlaps(int32_t aLo, int32_t aHi, int32_t bLo, int32_t bHi) { return aLo <= bHi && bLo <= aHi; }
+} // namespace
+
+TEST(ResponseControlPortsRegression, DerivedLayoutSitsInTheTopOfTheEgressBlockRegression) {
+    for (const int32_t id : {0, 1, 126}) {
+        for (int32_t W = 1; W <= kMaxDerivedResponseWorkers; ++W) {
+            const auto sb = deriveShardBasePorts(id, W);
+            ASSERT_TRUE(sb.has_value());
+            const auto rc = deriveResponseControlPorts(sb->egressControl, W);
+            ASSERT_TRUE(rc.has_value()) << "id " << id << " W " << W;
+            const int32_t e = sb->egressControl;
+            EXPECT_EQ(rc->gateway, e + 63);
+            EXPECT_EQ(rc->workerBase, e + 63 - W);
+            const int32_t wLo = rc->workerBase, wHi = rc->workerBase + W - 1;
+            EXPECT_EQ(wHi, e + 62);
+            EXPECT_FALSE(overlaps(wLo, wHi, e, e + W - 1)) << "MDC overlap id " << id << " W " << W;
+            EXPECT_FALSE(overlaps(rc->gateway, rc->gateway, e, e + W - 1));
+            EXPECT_FALSE(overlaps(wLo, rc->gateway, sb->ingress, sb->ingress + 63));
+            EXPECT_FALSE(overlaps(wLo, rc->gateway, sb->repl, sb->repl + 63));
+            EXPECT_LT(rc->gateway, kLowestDefaultEphemeralPort);
+        }
+    }
+}
+
+TEST(ResponseControlPortsRegression, MoreThan31WorkersDerivesNothingRegression) {
+    const auto sb = deriveShardBasePorts(0, 1);
+    for (const int32_t W : {32, 64}) {
+        EXPECT_FALSE(deriveResponseControlPorts(sb->egressControl, W).has_value());
+        NodeConfig c = shardNode(0, W);
+        const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+        EXPECT_FALSE(c.responseControlBasePort.has_value());
+        EXPECT_FALSE(c.gatewayResponseControlPort.has_value());
+        EXPECT_NE(hd.warnings.find("RUNE_RESPONSE_CONTROL_BASE_PORT"), std::string::npos) << hd.warnings;
+    }
+    EXPECT_FALSE(deriveResponseControlPorts(sb->egressControl, 0).has_value());
+    EXPECT_FALSE(deriveResponseControlPorts(0, 1).has_value());
+    EXPECT_FALSE(deriveResponseControlPorts(65535 - 62, 1).has_value());
+    EXPECT_TRUE(deriveResponseControlPorts(65535 - 63, 1).has_value());
+}
+
+TEST(ResponseControlPortsRegression, ShardModeDerivesSelfAndPeersRegression) {
+    for (const int32_t W : {1, 4, 31}) {
+        NodeConfig c = shardNode(1, W);
+        const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+        EXPECT_EQ(hd.warnings.find("response-control"), std::string::npos) << hd.warnings;
+        for (const auto& p : c.peers) {
+            const auto rc = deriveResponseControlPorts(deriveShardBasePorts(p.id, W)->egressControl, W);
+            EXPECT_EQ(p.gatewayResponseControlPort, rc->gateway) << "peer " << p.id;
+            EXPECT_EQ(p.responseControlBasePort, rc->workerBase) << "peer " << p.id;
+        }
+        const auto self = deriveResponseControlPorts(deriveShardBasePorts(1, W)->egressControl, W);
+        EXPECT_EQ(c.gatewayResponseControlPort, self->gateway);
+        EXPECT_EQ(c.responseControlBasePort, self->workerBase);
+        const auto bound = nodeBoundPorts(c);
+        EXPECT_TRUE(std::binary_search(bound.begin(), bound.end(), self->gateway));
+        for (int32_t w = 0; w < W; ++w)
+            EXPECT_TRUE(std::binary_search(bound.begin(), bound.end(), self->workerBase + w)) << w;
+        EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();
+    }
+}
+
+TEST(ResponseControlPortsRegression, ExplicitEgressBaseDerivesNoneAndWarnsRegression) {
+    NodeConfig c = shardNode(0, 2);
+    c.peers[0].egressControlBasePort = 41000;   // ADVERTISED non-derived base: peers derive nothing for this node
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_FALSE(c.responseControlBasePort.has_value());
+    EXPECT_FALSE(c.gatewayResponseControlPort.has_value());
+    EXPECT_NE(hd.warnings.find("RUNE_RESPONSE_CONTROL_BASE_PORT"), std::string::npos) << hd.warnings;
+    EXPECT_NE(hd.warnings.find("RUNE_GATEWAY_RESPONSE_CONTROL_PORT"), std::string::npos) << hd.warnings;
+    // Self's own entry advertises nothing; a peer on the derived block still derives.
+    EXPECT_EQ(c.peers[0].responseControlBasePort, 0);
+    EXPECT_NE(c.peers[1].responseControlBasePort, 0);
+    EXPECT_FALSE(c.validateShardConfig().has_value()) << *c.validateShardConfig();   // no new refusal
+}
+
+TEST(ResponseControlPortsRegression, AdvertisedPeerPortsWinRegression) {
+    NodeConfig c = shardNode(0, 2);
+    c.peers[1].responseControlBasePort    = 41000;
+    c.peers[1].gatewayResponseControlPort = 41010;
+    c.peers[2].responseControlBasePort    = 41100;   // only the base advertised: gateway still derived
+    (void)applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_EQ(c.peers[1].responseControlBasePort, 41000);
+    EXPECT_EQ(c.peers[1].gatewayResponseControlPort, 41010);
+    EXPECT_EQ(c.peers[2].responseControlBasePort, 41100);
+    EXPECT_EQ(c.peers[2].gatewayResponseControlPort,
+              deriveResponseControlPorts(deriveShardBasePorts(2, 2)->egressControl, 2)->gateway);
+    // Self advertises its own: it is kept for self.
+    NodeConfig s = shardNode(0, 2);
+    s.peers[0].responseControlBasePort    = 42000;
+    s.peers[0].gatewayResponseControlPort = 42010;
+    (void)applyHostDerivedDefaults(s, k3sFacts());
+    EXPECT_EQ(s.responseControlBasePort, std::optional<int32_t>{42000});
+    EXPECT_EQ(s.gatewayResponseControlPort, std::optional<int32_t>{42010});
+}
+
+TEST(ResponseControlPortsRegression, LegacyModeDerivesNothingRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    c.workerMode = NodeConfig::WorkerMode::Legacy;
+    (void)applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_FALSE(c.responseControlBasePort.has_value());
+    EXPECT_FALSE(c.gatewayResponseControlPort.has_value());
+    const auto before = nodeBoundPorts(c);
+    c.gatewayResponseControlPort = 40777;
+    const auto after = nodeBoundPorts(c);
+    EXPECT_TRUE(std::binary_search(after.begin(), after.end(), 40777));
+    EXPECT_EQ(after.size(), before.size() + 1);
+}
+
+// --- every node computes the SAME response-control ports for node X, X included ---
+namespace {
+struct RcCase {
+    const char* name;
+    std::optional<int32_t> envEgress0;       // node 0 only: RUNE_WORKER_EGRESS_CONTROL_BASE_PORT
+    uint16_t seg6 = 0, seg7 = 0, seg8 = 0;   // node 0's RUNE_PEERS segments (same on every node)
+    bool expectNone = false;
+};
+NodeConfig rcNode(int32_t self, const RcCase& k) {
+    NodeConfig c = shardNode(self, 2);
+    c.peers[0].egressControlBasePort       = k.seg6;
+    c.peers[0].responseControlBasePort     = k.seg7;
+    c.peers[0].gatewayResponseControlPort  = k.seg8;
+    if (self == 0 && k.envEgress0) c.workerEgressControlBasePort = k.envEgress0;
+    return c;
+}
+} // namespace
+
+TEST(ResponseControlConfigRegression, SelfAndPeersAgreeOnEveryNodeRegression) {
+    const uint16_t derived0 = static_cast<uint16_t>(deriveShardBasePorts(0, 2)->egressControl);
+    const auto rc0 = deriveResponseControlPorts(derived0, 2);
+    const std::vector<RcCase> cases = {
+        {"allDerived", std::nullopt},
+        {"envEgressNoSegment", 40300},
+        {"segmentEqualsDerived", std::nullopt, derived0},
+        {"explicitSegment", std::nullopt, 41000, 0, 0, true},
+        {"seventhOnly", std::nullopt, 0, 42000, 0},
+    };
+    for (const auto& k : cases) {
+        std::array<NodeConfig, 3> cfg{rcNode(0, k), rcNode(1, k), rcNode(2, k)};
+        for (auto& c : cfg) (void)applyHostDerivedDefaults(c, k3sFacts());
+        for (int a = 0; a < 3; ++a) {
+            const uint16_t selfBase = static_cast<uint16_t>(cfg[a].responseControlBasePort.value_or(0));
+            const uint16_t selfGw   = static_cast<uint16_t>(cfg[a].gatewayResponseControlPort.value_or(0));
+            for (int b = 0; b < 3; ++b) {
+                const auto& pe = cfg[b].peers[a];
+                EXPECT_EQ(pe.responseControlBasePort, selfBase) << k.name << " viewer " << b << " of " << a;
+                EXPECT_EQ(pe.gatewayResponseControlPort, selfGw) << k.name << " viewer " << b << " of " << a;
+            }
+            EXPECT_FALSE(cfg[a].validateShardConfig().has_value()) << k.name << " node " << a;
+        }
+        if (k.expectNone) {
+            EXPECT_EQ(cfg[0].responseControlBasePort.value_or(0), 0) << k.name;
+            EXPECT_EQ(cfg[0].gatewayResponseControlPort.value_or(0), 0) << k.name;
+        } else {
+            EXPECT_EQ(cfg[0].gatewayResponseControlPort.value_or(0), rc0->gateway) << k.name;
+            EXPECT_EQ(cfg[0].responseControlBasePort.value_or(0), k.seg7 ? k.seg7 : rc0->workerBase) << k.name;
+        }
+    }
+}
+
+TEST(ResponseControlConfigRegression, UnadvertisedEnvResponsePortRefusedRegression) {
+    {
+        NodeConfig c = shardNode(0, 2);
+        c.responseControlBasePort = 9000;
+        (void)applyHostDerivedDefaults(c, k3sFacts());
+        const auto e = c.validateShardConfig();
+        ASSERT_TRUE(e.has_value());
+        EXPECT_NE(e->find("RUNE_RESPONSE_CONTROL_BASE_PORT"), std::string::npos) << *e;
+        EXPECT_NE(e->find("disagrees"), std::string::npos) << *e;   // self entry = what peers compute
+    }
+    {
+        NodeConfig c = shardNode(0, 2);
+        c.gatewayResponseControlPort = 9000;
+        (void)applyHostDerivedDefaults(c, k3sFacts());
+        const auto e = c.validateShardConfig();
+        ASSERT_TRUE(e.has_value());
+        EXPECT_NE(e->find("RUNE_GATEWAY_RESPONSE_CONTROL_PORT"), std::string::npos) << *e;
+    }
+    {   // explicit advertised egress base: peers compute none, so an unadvertised env value is refused too
+        NodeConfig c = shardNode(0, 2);
+        c.peers[0].egressControlBasePort = 41000;
+        c.responseControlBasePort = 9000;
+        c.gatewayResponseControlPort = 9010;
+        (void)applyHostDerivedDefaults(c, k3sFacts());
+        const auto e = c.validateShardConfig();
+        ASSERT_TRUE(e.has_value());
+        EXPECT_NE(e->find("RUNE_RESPONSE_CONTROL_BASE_PORT"), std::string::npos) << *e;
+        EXPECT_NE(e->find("not advertised"), std::string::npos) << *e;   // peers compute none
+    }
+    {   // advertised: accepted
+        NodeConfig c = shardNode(0, 2);
+        c.peers[0].responseControlBasePort = 9000;
+        c.peers[0].gatewayResponseControlPort = 9010;
+        c.responseControlBasePort = 9000;
+        c.gatewayResponseControlPort = 9010;
+        (void)applyHostDerivedDefaults(c, k3sFacts());
+        EXPECT_FALSE(c.validateShardConfig().has_value());
+    }
+}
+
+TEST(ResponseControlConfigRegression, PeerExplicitEgressDerivesNoResponsePortsRegression) {
+    NodeConfig c = shardNode(0, 2);
+    c.peers[1].egressControlBasePort = 41000;
+    (void)applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_EQ(c.peers[1].responseControlBasePort, 0);
+    EXPECT_EQ(c.peers[1].gatewayResponseControlPort, 0);
+    EXPECT_NE(c.peers[2].responseControlBasePort, 0);   // control: a derived peer still derives
+}
+
+TEST(ResponseControlConfigRegression, NoPortsWhenNothingDerivableStillStartsRegression) {
+    NodeConfig c = shardNode(0, 2);
+    c.peers[0].egressControlBasePort = 41000;
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_FALSE(c.responseControlBasePort.has_value());
+    EXPECT_FALSE(c.gatewayResponseControlPort.has_value());
+    EXPECT_NE(hd.warnings.find("older nodes refuse"), std::string::npos) << hd.warnings;
+    EXPECT_FALSE(c.validateShardConfig().has_value());
+}
+
+TEST(ResponseControlConfigRegression, LegacyBaseIsIgnoredWithWarningRegression) {
+    NodeConfig c = threeNodeDefault(0);
+    c.workerMode = NodeConfig::WorkerMode::Legacy;
+    c.responseControlBasePort = 40777;
+    const auto hd = applyHostDerivedDefaults(c, k3sFacts());
+    EXPECT_NE(hd.warnings.find("RUNE_RESPONSE_CONTROL_BASE_PORT is used in shard mode only"), std::string::npos)
+        << hd.warnings;
+}
+

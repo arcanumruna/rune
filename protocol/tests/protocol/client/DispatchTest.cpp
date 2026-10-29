@@ -786,12 +786,12 @@ TEST(DispatchCheckFrame, KnownTemplatesEightyOneToEightyThree) {
     }
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateEightySix) {
-    // 86 = first unassigned id in schema/view range after NamespaceUsageResponse=85
-    auto buf = makeValidHeaderBuf(86);
+TEST(DispatchCheckFrame, UnknownTemplateEightySeven) {
+    // 86 = WorkerBind (NAT-safe egress); 87 = WorkerBindAck, broker -> client only: unknown on every ingress
+    auto buf = makeValidHeaderBuf(87);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
-    EXPECT_EQ(fc.templateId, 86u);
+    EXPECT_EQ(fc.templateId, 87u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateNinetyNine) {
@@ -976,7 +976,8 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
     EXPECT_TRUE(rpc::isKnownTemplate(83));
-    EXPECT_FALSE(rpc::isKnownTemplate(86));
+    EXPECT_TRUE(rpc::isKnownTemplate(86));    // WorkerBind
+    EXPECT_FALSE(rpc::isKnownTemplate(87));
     EXPECT_FALSE(rpc::isKnownTemplate(95));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }

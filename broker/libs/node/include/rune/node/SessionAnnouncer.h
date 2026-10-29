@@ -27,6 +27,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <string_view>
@@ -71,6 +72,10 @@ public:
     /// gateway or for another worker never opens at worker w; `c2bKeyValid` is false when that derivation fails.  A
     /// legacy session (< 12) keeps the behaviour below.
     ///
+    /// NAT-safe egress (Task 6): `bindToken` non-null = a RESPONSE-MODE session — workers get the 16 B token and
+    /// answer on the response publication their client's WorkerBind creates (`channel` must be empty).  Every wave of
+    /// the session passes the same token.
+    ///
     /// Task 22 (shard worker decrypts produce / per-worker ingress): `c2b`/
     /// `c2bPrefix` are the session's RAW client->broker key/prefix — UNLIKE
     /// `b2c` above, this is NOT derived per worker (ingress has a SINGLE
@@ -86,7 +91,8 @@ public:
                   int32_t clientVersion = 0, bool sessionEncrypted = false, bool keyReady = false,
                   const rune::crypto::AeadKey& b2c = {}, const uint8_t* b2cPrefix = nullptr,
                   rune::crypto::Cipher cipher = rune::crypto::Cipher::None,
-                  const rune::crypto::AeadKey& c2b = {}, const uint8_t* c2bPrefix = nullptr) {
+                  const rune::crypto::AeadKey& c2b = {}, const uint8_t* c2bPrefix = nullptr,
+                  const std::array<uint8_t, 16>* bindToken = nullptr) {
         Announcing* a = findAnnouncing_(sessionId);
         if (!a) { announcing_.push_back({sessionId, allMask_(pool)}); a = &announcing_.back(); }
         for (int32_t w = 0; w < pool.workerCount(); ++w) {
@@ -101,6 +107,10 @@ public:
             op.grantAll        = grantAll_;   // authentication Task 13 (D30): authMode != Enabled
             op.sessionEncrypted = sessionEncrypted;
             op.keyPending       = sessionEncrypted && !keyReady;   // first wave: workers hold early produce
+            if (bindToken != nullptr) {   // NAT-safe egress (Task 6): response mode - the token, no channel
+                op.responseBind = true;
+                op.bindToken    = *bindToken;
+            }
             if (sessionEncrypted && keyReady) {
                 rune::crypto::AeadKey senderKey{};
                 const bool ok = rune::crypto::deriveSenderKey(

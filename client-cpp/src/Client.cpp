@@ -18,6 +18,7 @@
 //     Completions back (producer-close).
 
 #include <rune/client/Client.h>
+#include <rune/client/transport/ResponseChannel.h>
 #include <rune/client/agent/AgentProduceSink.h>
 #include <rune/client/detail/CpuAffinity.h>
 #include <rune/client/detail/PasswordFile.h>
@@ -175,11 +176,12 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.transport.ingressStreamId = c.gatewayStreamId;
     acfg.transport.egressChannel   = c.egressChannel;
     acfg.transport.egressStreamId  = c.egressStreamId;
+    acfg.transport.gatewayResponseControlPort = c.gatewayResponseControlPort;
     acfg.transport.dataDir         = c.dataDir;
     acfg.transport.termBufferLength = c.termBufferBytes;
 
     // Session egress config (for ConnectRequest body).
-    acfg.session.egressChannel  = c.egressChannel;
+    acfg.session.egressChannel  = c.declaredEgressChannelForTest.empty() ? c.egressChannel : c.declaredEgressChannelForTest;
     acfg.session.egressStreamId = c.egressStreamId;
 
     // Pass through keepalive interval if the caller overrides it.
@@ -2069,10 +2071,13 @@ constexpr std::string_view kDdlNodeUnreachable =
     "budget (it may have been applied; a retry with the same requestId is exact)";
 } // namespace
 
-void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs) {
+void Client::onDdlRedirect_(std::size_t i, std::string_view message, int64_t nowNs) {
     using Offer = transport::AeronTransport::OfferResult;
     PendingCtl& p = pendingCtl_[i];
     RoutedCtlPending& d = std::get<RoutedCtlPending>(p.ddl);
+    // NAT-safe egress: the message may end with `#<leader gateway response-control port>`; the node is the bare text.
+    const auto redirect = transport::splitRedirectTarget(message);
+    const std::string_view endpoint = redirect.endpoint;
     if (endpoint.empty()) {   // a Redirect that names no node: nothing to follow — retriable as NotLeader
         onDdlNotLeader_(i, "redirect without a leader endpoint", nowNs);
         return;
@@ -2092,6 +2097,7 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t no
     // The leader's own session (the seed never moves for a DDL: it carries the
     // data ops / subscriptions); the same frame, so the same requestId.
     d.endpoint = toChannel(std::string(endpoint));
+    if (redirect.responsePort != 0) agent_.setSessionResponsePort(d.endpoint, redirect.responsePort);
     DdlOfferedOn on;
     switch (offerDdl_(d, nowNs, on)) {
     case Offer::Accepted:
@@ -3594,6 +3600,26 @@ void Client::publishShardClosed() noexcept {
     shardDuty_ = c;
 }
 
+void Client::rememberSkippedMdc_(const std::string& leaderChannel, const std::string& ctrl, int32_t streamId) {
+    for (const SkippedMdc& e : skippedMdc_)
+        if (e.streamId == streamId && e.ctrl == ctrl) return;   // deduped by (ctrl, stream)
+    skippedMdc_.push_back(SkippedMdc{leaderChannel, ctrl, streamId});
+}
+
+void Client::revisitSkippedMdc_() noexcept {
+    // Cold: runs on a ConnectResponse / handshake leg only while a skip is remembered.  A node whose session now sits
+    // on the declared path (Connected, no worker response) gets the subscription its records will arrive on.
+    for (std::size_t i = 0; i < skippedMdc_.size();) {
+        if (agent_.nodePath(skippedMdc_[i].leaderChannel) == agent::ClientAgent::NodePath::Declared) {
+            agent_.addEgressSubscription(skippedMdc_[i].ctrl, skippedMdc_[i].streamId);
+            skippedMdc_[i] = std::move(skippedMdc_.back());
+            skippedMdc_.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
 void Client::syncSeedSession_() noexcept {
     const auto& m = agent_.seedSession().machine;
     const session::SessionState st  = m.state();
@@ -3879,6 +3905,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // resends / onConnected callback / later frames of this same poll (a
         // record handler subscribing) — never only at the end of the cycle.
         syncSeedSession_();
+        if (!skippedMdc_.empty()) [[unlikely]] revisitSkippedMdc_();   // I-D: a session may have fallen to the declared path
         auto opt = codec::decodeConnectResponse(buf, len);
         if (!opt) break;
 
@@ -3929,6 +3956,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // A later leg of a seed / node TLS handshake.  The agent already drove the
         // session's machine; this leg's verdict is in lastConnect*().
         syncSeedSession_();
+        if (!skippedMdc_.empty()) [[unlikely]] revisitSkippedMdc_();
         auto opt = codec::decodeHandshakeContinueResponse(buf, len);
         if (!opt) break;
         if (!agent_.lastConnectAwaited()) break;   // stale / duplicate / after the handshake
@@ -4160,7 +4188,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
             if (coordRouted) {
                 const auto* rm = std::get_if<detail::CoordRemote>(&coordRoute_);
                 const std::string& current = rm == nullptr ? agent_.seedChannel() : rm->channel;
-                if (agent::ClientAgent::sameEndpoint(toChannel(std::string(opt->message)), current)) {
+                if (agent::ClientAgent::sameEndpoint(
+                        toChannel(std::string(transport::splitRedirectTarget(opt->message).endpoint)), current)) {
                     scheduleMetadataRefresh();
                 }
             }
@@ -4212,7 +4241,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 break;
             }
 
-            const std::string newEndpoint(opt->message);
+            // NAT-safe egress: the message may end with `#<leader gateway response-control port>`.
+            const auto redirectTarget = transport::splitRedirectTarget(opt->message);
+            const std::string newEndpoint(redirectTarget.endpoint);
+            const int32_t newResponsePort = redirectTarget.responsePort;
 
             // MD1 IMPORTANT-1: zero-RTT metadata cache update from the REAL
             // redirect frame — no full MetadataRequest round-trip needed to
@@ -4283,6 +4315,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
             if (havePart && rTopicId >= 0 && rPartition >= 0 &&
                 (agent_.multiNodeRouting() || groupActive) && !newEndpoint.empty()) {
                 const std::string leaderChannel = toChannel(newEndpoint);  // N2
+                if (newResponsePort != 0) agent_.setSessionResponsePort(leaderChannel, newResponsePort);
                 // R2-2: a changed route is a new lane even if the redirected batch
                 // is not re-offered below (superseded / budget / unknown) — older
                 // attempts must not count as the current lane (NEW-4(b)).
@@ -4321,7 +4354,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     // the next answer decides it; the subscribe deadline still
                     // bounds it (explicit failure, never a hang).
                     try {
-                        heldRedirectFollows_.push_back(HeldRedirect{opt->correlationId, newEndpoint, metadataResponses_});
+                        heldRedirectFollows_.push_back(
+                            HeldRedirect{opt->correlationId, newEndpoint, metadataResponses_, newResponsePort});
                         ++redirectFollowsHeld_;
                         requestMetadataNow_();
                         handled = true;
@@ -4360,7 +4394,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 break;
             }
 
-            redirectBySeed_(opt->correlationId, newEndpoint);
+            redirectBySeed_(opt->correlationId, newEndpoint, newResponsePort);
             break; // Redirect is handled; don't fall through to the error path.
         }
 
@@ -5853,13 +5887,14 @@ int Client::releaseHeldRedirectFollows_() {
         ++work;
         switch (redirectFollowFor_(h.endpoint)) {
         case RedirectFollow::PerPartition:
-            if (subscriberHub_.adoptRedirectedSubscribe(h.corrId) && followMovedSubscriptionRedirect_(h.corrId, h.endpoint))
+            if (subscriberHub_.adoptRedirectedSubscribe(h.corrId) &&
+                followMovedSubscriptionRedirect_(h.corrId, redirectMessageOf_(h)))
                 break;
-            redirectBySeed_(h.corrId, h.endpoint);
+            redirectBySeed_(h.corrId, h.endpoint, h.responsePort);
             break;
         case RedirectFollow::Hold:   // still no answer applied (cannot happen: metaSeen moved)
         case RedirectFollow::BySeed:
-            redirectBySeed_(h.corrId, h.endpoint);
+            redirectBySeed_(h.corrId, h.endpoint, h.responsePort);
             break;
         }
     }
@@ -5867,7 +5902,7 @@ int Client::releaseHeldRedirectFollows_() {
     return work;
 }
 
-void Client::redirectBySeed_(int64_t corrId, const std::string& newEndpoint) {
+void Client::redirectBySeed_(int64_t corrId, const std::string& newEndpoint, int32_t responsePort) {
     // Retarget transport to the leader's client endpoint.
     // If the endpoint is already a full Aeron channel URI (starts with
     // "aeron:"), use it as-is (test / ipc scenarios).  Otherwise treat
@@ -5876,7 +5911,7 @@ void Client::redirectBySeed_(int64_t corrId, const std::string& newEndpoint) {
     const std::string newChannel = toChannel(newEndpoint);  // N2
 
     // Retarget is noexcept; if it fails the old publication is kept.
-    const bool retargeted = agent_.retarget(newChannel);
+    const bool retargeted = agent_.retarget(newChannel, responsePort);
 
     if (retargeted) {
         // MD1 IMPORTANT-2: record the connection's new leader channel so
@@ -6030,11 +6065,12 @@ int64_t Client::nextCorrTrampoline_(void* ctx) noexcept {
     return static_cast<Client*>(ctx)->nextCorrId_++;
 }
 
-bool Client::followMovedSubscriptionRedirect_(int64_t corrId, std::string_view endpoint) noexcept {
+bool Client::followMovedSubscriptionRedirect_(int64_t corrId, std::string_view message) noexcept {
     int32_t topicId = -1, partition = -1;
     if (!subscriberHub_.movedPendingPartition(corrId, topicId, partition)) return false;
     try {
-        const std::string newEndpoint(endpoint);
+        const auto redirect = transport::splitRedirectTarget(message);   // "endpoint[#responsePort]"
+        const std::string newEndpoint(redirect.endpoint);
         // As a produce / group fetch Redirect: the cache learns the leader
         // provisionally (a lagging answer cannot undo it) and the partition's
         // route follows it — only this partition, never the seed session.
@@ -6047,6 +6083,7 @@ bool Client::followMovedSubscriptionRedirect_(int64_t corrId, std::string_view e
                                                             nextCorrId_);
         }
         const std::string ch = toChannel(newEndpoint);
+        if (redirect.responsePort != 0) agent_.setSessionResponsePort(ch, redirect.responsePort);
         if (agent_.setRoute(topicId, partition, ch, ch)) producerHub_.noteRouteChanged(topicId, partition);
     } catch (...) {
         // Allocation failure on this cold path: routed by the current route;
@@ -6057,7 +6094,9 @@ bool Client::followMovedSubscriptionRedirect_(int64_t corrId, std::string_view e
     return true;
 }
 
-void Client::onGroupFetchRefused_(int64_t corrId, bool redirect, std::string_view endpoint) noexcept {
+void Client::onGroupFetchRefused_(int64_t corrId, bool redirect, std::string_view message) noexcept {
+    const auto target = transport::splitRedirectTarget(message);   // NAT-safe egress: "endpoint[#responsePort]"
+    const std::string_view endpoint = redirect ? target.endpoint : message;
     int32_t topicId = -1, partition = -1;
     // A bare NotLeader parks the partition until fresh metadata names the
     // leader (asked for below); a Redirect follows its endpoint at once.
@@ -6081,6 +6120,7 @@ void Client::onGroupFetchRefused_(int64_t corrId, bool redirect, std::string_vie
                                                                 nextCorrId_);
             }
             const std::string ch = toChannel(newEndpoint);
+            if (target.responsePort != 0) agent_.setSessionResponsePort(ch, target.responsePort);
             if (agent_.setRoute(topicId, partition, ch, ch)) producerHub_.noteRouteChanged(topicId, partition);
         } catch (...) {
             // Allocation failure on this cold path: the metadata refresh below re-routes.
@@ -6329,6 +6369,7 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         e.nodeId = b.nodeId;
         e.port   = b.port;
         e.host   = std::string(b.host);
+        e.responseControlPort = b.responseControlPort;   // v16 (NAT-safe egress)
         brokers.push_back(std::move(e));
     }
 
@@ -6342,6 +6383,7 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         e.ingressStreamId = p.ingressStreamId;  // E5.1: per-worker ingress stream
         e.ingressEndpoint = p.ingressEndpoint;  // Task 16: owning worker's ingress ("" = node)
         e.ingressReceiverId = p.ingressReceiverId;  // issue #116: who a produce on that route is sealed for
+        e.responseControlPort = p.responseControlPort;   // v16: the owning worker's response-control port
         partitions.push_back(std::move(e));
     }
 
@@ -6353,6 +6395,13 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     if (resp.correlationId >= metadataAnswerCorr_) {
         metadataAnswerByNs_   = 0;
         metadataAnswerCorr_   = 0;
+    }
+
+    // NAT-safe egress (spec D7): every broker's gateway response-control port, learnt BEFORE the route loop opens
+    // sessions / worker publications to those nodes (0 = none: that node is served on the declared path).
+    for (const auto& b : brokers) {
+        const std::string& hostPort = metadataCache_.endpointFor(b.nodeId);
+        if (!hostPort.empty()) agent_.setSessionResponsePort(toChannel(hostPort), b.responseControlPort);
     }
 
     // Task 1.3: (re)build the agent-owned partition routing table IN PLACE.  For
@@ -6424,7 +6473,8 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         } else {
             continue;
         }
-        const bool changed = agent_.setRoute(p.topicId, p.partition, session, data, receiverId);
+        const bool changed = agent_.setRoute(p.topicId, p.partition, session, data, receiverId, p.ingressStreamId,
+                                             p.ingressEndpoint.empty() ? 0 : p.responseControlPort);
         // NEW-4(b): any route change is a new lane for the partition's later
         // offers (even when nothing is re-offered now — a first worker install).
         if (changed) producerHub_.noteRouteChanged(p.topicId, p.partition);
@@ -6472,14 +6522,28 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     for (const auto& p : resp.partitions) {
         if (p.egressControlPort == 0 || p.egressStreamId == 0) continue;
         std::string_view host;
+        bool leaderResponseMode = false;
         for (const auto& b : resp.brokers) {
-            if (b.nodeId == p.leaderId) { host = b.host; break; }
+            if (b.nodeId == p.leaderId) { host = b.host; leaderResponseMode = b.responseControlPort != 0; break; }
         }
         std::string ctrlHost = host.empty() ? fallbackHost : std::string(host);
         if (ctrlHost.empty()) continue;
         std::string ctrl = "aeron:udp?control-mode=dynamic|control=" +
                            ctrlHost + ":" +
                            std::to_string(p.egressControlPort) + "|fc=min";
+        // I7 / I-D: the declared MDC subscription is skipped ONLY when this client's session to that leader is KNOWN to
+        // be on the response path (Connected and bound to the worker response publications): the NAT path is then the
+        // only way records can arrive.  Any other state (declared path, not connected yet, no session yet, an old
+        // broker) adds it - an unused MDC subscription is harmless, a missing one silently loses records.  A skip is
+        // remembered and revisited when that session (re)connects on the declared path.
+        if (leaderResponseMode) {
+            const std::string& hostPort = metadataCache_.endpointFor(p.leaderId);
+            const std::string leaderChannel = hostPort.empty() ? std::string() : toChannel(hostPort);
+            if (!leaderChannel.empty() && agent_.nodePath(leaderChannel) == agent::ClientAgent::NodePath::Response) {
+                rememberSkippedMdc_(leaderChannel, ctrl, p.egressStreamId);
+                continue;
+            }
+        }
         agent_.addEgressSubscription(ctrl, p.egressStreamId);
     }
 
@@ -6528,8 +6592,10 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
 }
 
 // D4: see the ErrorResponse handler.  Agent / duty thread.
-void Client::onCoordinatorRedirect_(const std::string& endpoint) {
-    const std::string channel = toChannel(endpoint);  // LOW-1 (N2)
+void Client::onCoordinatorRedirect_(const std::string& message) {
+    const auto redirect = transport::splitRedirectTarget(message);   // NAT-safe egress: "endpoint[#responsePort]"
+    const std::string channel = toChannel(std::string(redirect.endpoint));  // LOW-1 (N2)
+    if (redirect.responsePort != 0) agent_.setSessionResponsePort(channel, redirect.responsePort);
     // Review MEDIUM-1: an answer naming the coordinator already in use (a late
     // answer to a frame sent before the move) changes nothing at all.  r2
     // MAJOR-1: "the seed" means where the seed PHYSICALLY is (its default

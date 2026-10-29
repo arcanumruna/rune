@@ -286,6 +286,16 @@ struct ClientConfig {
     int32_t     gatewayStreamId  = 1;
     std::string egressChannel    = "aeron:ipc";
     int32_t     egressStreamId   = 2;
+    /// NAT-safe egress (spec 2026-10-26-rune-nat-egress-design D7): the seed gateway's response-control port, a config
+    /// value like Aeron Archive's response channel (the client needs it before its first connect).  With a UDP
+    /// `gatewayChannel` and a port in 1..65535 the client connects with `responseCorrelated`, and replies return over
+    /// its own flow through NAT.  The leader's port is learnt from the Redirect `#port` suffix, every broker's from
+    /// Metadata.  0 (default) = the declared `egressChannel` path only.
+    int32_t     gatewayResponseControlPort = 0;
+    /// Test seam (NAT egress Task 8): when non-empty, the ConnectRequest DECLARES this egress channel while the
+    /// transport still subscribes on `egressChannel` (models a client behind NAT whose declared address is
+    /// unreachable).  Empty (default) = declare `egressChannel`.
+    std::string declaredEgressChannelForTest;
     std::string dataDir;
 
     // High-level timeouts (milliseconds).
@@ -703,6 +713,21 @@ public:
         return agent_.testPublicationOpen(channel, streamId);
     }
     [[nodiscard]] std::size_t testSessionCount() const noexcept { return agent_.sessionCount(); }
+    // NAT-safe egress (Task 7) observers / seams.
+    [[nodiscard]] uint64_t    testWorkerBindsSent() const noexcept { return agent_.workerBindsSent(); }
+    [[nodiscard]] std::size_t testWorkerBindCount() const noexcept { return agent_.workerBindCount(); }
+    [[nodiscard]] uint64_t    testWorkerBindResends() const noexcept { return agent_.workerBindResends(); }
+    [[nodiscard]] uint64_t    testBindTokenDeriveFailures() const noexcept { return agent_.bindTokenDeriveFailures(); }
+    void testForceBindDeriveFailure(bool on) noexcept { agent_.testForceBindDeriveFailure(on); }
+    [[nodiscard]] uint64_t    testWorkerBindAcksAccepted() const noexcept { return agent_.workerBindAcksAccepted(); }
+    [[nodiscard]] uint64_t    testWorkerBindAcksIgnored() const noexcept { return agent_.workerBindAcksIgnored(); }
+    [[nodiscard]] uint64_t    testMdcEgressSubscriptions() const noexcept { return agent_.mdcEgressSubscriptionsAdded(); }
+    [[nodiscard]] bool        testSeedResponseCorrelated() const noexcept { return agent_.seedResponseCorrelated(); }
+    [[nodiscard]] uint64_t    testHeldOffers() const noexcept { return agent_.heldOffers(); }
+    void testHoldWorkerBinds(bool hold) noexcept { agent_.testHoldWorkerBinds(hold); }
+    [[nodiscard]] int32_t testKnownResponsePort(const std::string& endpoint) const noexcept {
+        return agent_.knownResponsePortForTest(endpoint);
+    }
     /// D4: the coordinator route (empty = the seed), its session index, and how
     /// many coordinator moves / fallbacks were followed (duty thread / owner).
     [[nodiscard]] const std::string& testCoordinatorChannel() const noexcept {
@@ -729,6 +754,9 @@ public:
     void testRequestMetadataNow() noexcept { lastUrgentMetadataNs_ = INT64_MIN; requestMetadataNow_(); }
     /// Test hook (duty-cycle thread only): agent session `i`'s state.
     [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
+    /// Test hook (duty-cycle thread only / after quiescence): the endpoint channel of agent session `i`.
+    [[nodiscard]] const std::string& testSessionChannelAt(uint32_t i) const noexcept { return agent_.sessionChannelAt(i); }
+
     /// Review B I5 test seam (Invoker owner only): the seed's link dropped — Connected -> Resuming -> a resume ConnectRequest.
     void testForceResume() { agent_.seedSession().machine.onTransportDisconnected(now()); }
     [[nodiscard]] uint64_t testSessionConnectFailuresAt(uint32_t i) const noexcept { return agent_.sessionConnectFailuresAt(i); }
@@ -1583,7 +1611,7 @@ private:
     /// D4: a follower named the group / txn coordinator (ErrorResponse{
     /// NotCoordinator, endpoint}) — the coordinator route follows it (the seed
     /// session never moves).  No-op when it names the current coordinator.
-    void onCoordinatorRedirect_(const std::string& endpoint);
+    void onCoordinatorRedirect_(const std::string& message);   // "endpoint[#responsePort]"
     /// D4: tell the group hub the COORDINATOR session's (connected, sessionId,
     /// episode) if it changed; a coordinator session that (re)connected joins the
     /// members there; one that gave up falls back to the seed.  Called from
@@ -1643,7 +1671,7 @@ private:
     /// from now on, the salted-password cache is cleared, a one-time session becomes a normal one.
     void installSelfPassword_(std::string_view newPassword) noexcept;
     /// ErrorResponse{Redirect, endpoint} for pendingCtl_[i] (a DDL).
-    void onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs);
+    void onDdlRedirect_(std::size_t i, std::string_view message, int64_t nowNs);   // message: "endpoint[#responsePort]"
     /// NotLeader (ErrorResponse or a response's errorCode 2) for pendingCtl_[i] (a DDL).
     void onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs,
                          uint16_t failCode = static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader));
@@ -1794,7 +1822,7 @@ private:
     /// follows it PER PARTITION — the partition's route moves to `endpoint` and
     /// the re-armed Subscribe goes to that node's own session; the seed is
     /// never retargeted.  False when `corrId` is not a pending moved one.
-    bool followMovedSubscriptionRedirect_(int64_t corrId, std::string_view endpoint) noexcept;
+    bool followMovedSubscriptionRedirect_(int64_t corrId, std::string_view message) noexcept;   // "endpoint[#responsePort]"
     static int64_t fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept;
     static uint64_t fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept;
     static void fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept;
@@ -1875,9 +1903,13 @@ private:
     // E2 residual round 5 (R3): the follow of a NEW plain Subscribe's Redirect.
     enum class RedirectFollow : uint8_t { PerPartition, Hold, BySeed };
     [[nodiscard]] RedirectFollow redirectFollowFor_(const std::string& endpoint) const;
-    void redirectBySeed_(int64_t corrId, const std::string& newEndpoint);
+    void redirectBySeed_(int64_t corrId, const std::string& newEndpoint, int32_t responsePort = 0);
     int  releaseHeldRedirectFollows_();
-    struct HeldRedirect { int64_t corrId; std::string endpoint; int metaSeen; };
+    struct HeldRedirect { int64_t corrId; std::string endpoint; int metaSeen; int32_t responsePort; };
+    /// The Redirect message a held entry came from ("endpoint[#responsePort]").
+    static std::string redirectMessageOf_(const HeldRedirect& h) {
+        return h.responsePort > 0 ? h.endpoint + "#" + std::to_string(h.responsePort) : h.endpoint;
+    }
     std::vector<HeldRedirect> heldRedirectFollows_;   // duty thread; cold
     uint64_t redirectFollowsHeld_ = 0;
     uint64_t staleSubscribeRedirects_ = 0;   // R4: Redirects from a session the Subscribe is not outstanding on
@@ -1941,6 +1973,12 @@ private:
     /// any resend or callback of that poll), before applying any hub command,
     /// and once per duty cycle (step 3c).  Duty thread only; O(1) when unchanged.
     void syncSeedSession_() noexcept;
+    /// I-D: the declared per-worker MDC subscriptions skipped because the leader's session was KNOWN to be on the
+    /// response path (see onMetadataResponse); revisited when a session (re)connects.  Cold, deduped by (ctrl, stream).
+    struct SkippedMdc { std::string leaderChannel; std::string ctrl; int32_t streamId = 0; };
+    std::vector<SkippedMdc> skippedMdc_;
+    void rememberSkippedMdc_(const std::string& leaderChannel, const std::string& ctrl, int32_t streamId);
+    void revisitSkippedMdc_() noexcept;
     /// F8a: apply one hub command on the duty thread (ring drain, close drain,
     /// or directly when a handle is used on the duty thread).
     void applyHubCommand_(const detail::HubCommand& cmd);

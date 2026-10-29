@@ -121,10 +121,12 @@ struct TwoLegTlsGateway {
         aeron::Context ctx;
         ctx.errorHandler(test_support::countAeronError);
         ctx.aeronDir(aeronDir);
+        ctx.useConductorAgentInvoker(true);   // simulated-time test: the conductor runs only when pumped, never on wall time
         gwAeron = aeron::Aeron::connect(ctx);
         const int64_t subId = gwAeron->addSubscription("aeron:ipc", in);
         const int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", eg);
         for (int i = 0; i < kPumpMax * 10; ++i) {   // hard iteration cap: a failing setup ends, never hangs
+            invokeConductor();
             if (!gwSub) gwSub = gwAeron->findSubscription(subId);
             if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
             if (gwSub && gwPub) break;
@@ -142,8 +144,10 @@ struct TwoLegTlsGateway {
         auto it = conns.find(seedSid);
         return it != conns.end() && it->second.keys.encrypted;
     }
+    int invokeConductor() { return gwAeron ? gwAeron->conductorAgentInvoker().invoke() : 0; }
     int poll(int limit = 16) {
-        int w = gwSub && gwAsm ? gwSub->poll(gwAsm->handler(), limit) : 0;
+        int w = invokeConductor();
+        w += gwSub && gwAsm ? gwSub->poll(gwAsm->handler(), limit) : 0;
         if (secondLegPending && release) {
             secondLegPending = false;
             std::vector<uint8_t> resp;
@@ -171,7 +175,10 @@ struct TwoLegTlsGateway {
     void sendRaw(const uint8_t* b, std::size_t n) {
         aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(b), static_cast<aeron::util::index_t>(n));
         for (int i = 0; i < 5'000 && gwPub->offer(ab, 0, static_cast<aeron::util::index_t>(n)) <= 0; ++i)
+        {
+            invokeConductor();
             if (idle_) idle_();   // back-pressured: let the client drain its egress (no sleeping)
+        }
     }
     void onFrame(const uint8_t* buf, std::size_t len) {
         const auto tid = rcc::peekTemplate(buf, len);

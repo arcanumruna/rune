@@ -39,6 +39,7 @@
 #include <rune/client/detail/SecureZero.h>
 #include <rune/client/detail/M2ORingBuffer.h> // internal MPSC ring (templated read, no std::function)
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -49,6 +50,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -101,6 +103,11 @@ class ClientAgent;
 // ---------------------------------------------------------------------------
 struct Session;
 
+/// A response pair (request publication + response subscription) is ONE-SHOT: Aeron pins the subscription to the first
+/// gateway response publication session that reaches it.  Fresh = no Connect / bind was accepted on it yet; Spent = one
+/// was, so the NEXT Connect (or the next session's bind) builds a new pair first.
+enum class ResponsePair : uint8_t { Fresh, Spent };
+
 struct SessionEndpointIo : session::SessionIo {
     ClientAgent* agent   = nullptr;    // owner (shared transport lives here)
     std::string  endpoint;             // this session's ingress channel
@@ -115,6 +122,10 @@ struct SessionEndpointIo : session::SessionIo {
 
     bool sendFrame(const uint8_t* buf, std::size_t len) override;
     bool retarget(const std::string& newIngressChannel) noexcept override;
+    /// NAT-safe egress: the Redirect's `#port` names the target gateway's response-control port.
+    bool retargetWithResponsePort(const std::string& newIngressChannel, int32_t responsePort) noexcept override;
+    /// NAT-safe egress: the seed's default publication / a leader session's control publication is response-correlated.
+    [[nodiscard]] bool responseCorrelated() const noexcept override;
     /// T15a fix1 I1: the seed's bootstrap fallback (leader sessions: no-op).
     bool retargetToBootstrap() noexcept override;
     /// T15a fix2 A-B1: the seed's return to the last-known leader (leader sessions: no-op).
@@ -175,6 +186,29 @@ struct Session {
     /// The node's ConnectResponse.brokerVersion of the latest accepted connect
     /// (A-MEDIUM-3: every node a group partition is read from must be >= 3).
     int32_t     brokerVersion        = 0;
+
+    // ---- NAT-safe egress (spec D2/D7) ----------------------------------------
+    /// The gateway response-control port of the node this session targets (0 = none: the declared path).  The seed's
+    /// is that of its CURRENT default-publication endpoint; a leader session's was learnt (Metadata / Redirect) when
+    /// it was opened and stays for its lifetime.
+    int32_t     responsePort         = 0;
+    /// The seed's last-known leader's response port (parallel to lastKnownLeaderChannel).
+    int32_t     lastKnownLeaderResponsePort = 0;
+    /// A leader session's control publication (response-correlated when responsePort != 0); kNoPub for the seed
+    /// (its control path is the transport's default publication) and for a plain session.
+    transport::AeronTransport::PubHandle ctlPub = transport::AeronTransport::kNoPub;
+    /// ConnectResponse v16 bindToken of the latest accepted connect (all-zero = none: no WorkerBind needed).
+    std::array<uint8_t, 16> bindToken{};
+    /// bindToken is non-zero: this session's produce to a worker must be preceded by a WorkerBind.
+    bool        bindRequired         = false;
+    /// I6: opened plain, then the node's response port was learnt: the next duty pass builds the correlated control
+    /// publication and reconnects on it.
+    bool        upgradeToResponse    = false;
+    /// The session's response pair (see ResponsePair): Spent as soon as a ConnectRequest was ACCEPTED by its request
+    /// publication (the gateway opens a response publication per Connect, and the first one to set up pins the
+    /// subscription - whichever Connect it answers), and the NEXT ConnectRequest first builds a fresh pair
+    /// (offerControlTo).  A Connect the transport refused reached nobody: the pair stays Fresh.
+    ResponsePair pair                = ResponsePair::Fresh;
 
     Session(ClientAgent* agent, session::SessionConfig cfg,
             std::string sessionEndpoint)
@@ -382,9 +416,23 @@ public:
     /// subscription so the client receives Records pushed by the owning worker.
     /// AGENT-THREAD ONLY — call from onMetadataResponse (which runs on the agent
     /// thread during egress poll dispatch).  Forwards to the transport.
+    /// I-D: which path the session that carries `endpointChannel` (a node's channel) is on: Response = Connected and
+    /// bound to worker response publications; Declared = Connected on the declared egress path; Unknown = no session /
+    /// not Connected yet.  Cold.
+    enum class NodePath : uint8_t { Unknown, Response, Declared };
+    [[nodiscard]] NodePath nodePath(const std::string& endpointChannel) const noexcept {
+        const uint32_t idx = findSessionIndex_(endpointChannel);
+        if (idx == kNoSession || idx >= sessions_.size()) return NodePath::Unknown;
+        const Session& s = *sessions_[idx];
+        if (s.machine.state() != session::SessionState::Connected) return NodePath::Unknown;
+        return s.bindRequired ? NodePath::Response : NodePath::Declared;
+    }
     void addEgressSubscription(const std::string& controlChannel, int32_t streamId) noexcept {
+        ++mdcEgressSubscriptionsAdded_;
         transport_.addEgressSubscription(controlChannel, streamId);
     }
+    /// I7 observer: declared-path (MDC) egress subscriptions requested; a response-path client requests none.
+    [[nodiscard]] uint64_t mdcEgressSubscriptionsAdded() const noexcept { return mdcEgressSubscriptionsAdded_; }
 
     // -------------------------------------------------------------------------
     // Task 1.3: multi-node session registry + partition routing table
@@ -412,8 +460,33 @@ public:
     /// Issue #116: `receiverId` = the receiver a produce sent on `dataChannel` is sealed for on a receiver-key session
     /// (MetadataResponse ingressReceiverId: worker w = w+1; 0 = the gateway).  A produce that goes to the node on the
     /// default ingress stream is always sealed for the gateway (0), whatever the route says.
+    ///
+    /// NAT-safe egress: `streamId` (the partition's ingress stream; 0 = the default) and `responsePort` (the owning
+    /// worker's response-control port from Metadata; 0 = none) open the worker's bind entry (see workerBinds_).
     bool setRoute(int32_t topicId, int32_t partition, const std::string& sessionEndpoint,
-                  const std::string& dataChannel, uint8_t receiverId = 0) noexcept;
+                  const std::string& dataChannel, uint8_t receiverId = 0, int32_t streamId = 0,
+                  int32_t responsePort = 0) noexcept;
+
+    /// NAT-safe egress: record the gateway response-control port of the node at `endpoint` (Metadata brokers, a
+    /// Redirect `#port`; 0 = none).  A session opened for that endpoint afterwards pairs a response subscription with
+    /// its request publication; an existing session keeps what it has.  Cold; agent thread only.
+    void setSessionResponsePort(const std::string& endpoint, int32_t port) noexcept;
+    /// TEST SEAMS (agent thread): the response port a new session to `endpoint` would use, and the bind entry count.
+    [[nodiscard]] int32_t knownResponsePortForTest(const std::string& endpoint) const noexcept {
+        return knownResponsePort_(endpoint);
+    }
+    [[nodiscard]] std::size_t workerBindCount() const noexcept { return workerBinds_.size(); }
+    [[nodiscard]] bool publicationResponsePairedForTest(transport::AeronTransport::PubHandle h) const noexcept {
+        return transport_.publicationIsResponsePairedForTest(h);
+    }
+    [[nodiscard]] bool seedResponseCorrelated() const noexcept { return transport_.seedResponseCorrelated(); }
+    [[nodiscard]] uint64_t workerBindsSent() const noexcept { return workerBindsSent_; }
+    [[nodiscard]] uint64_t workerBindResends() const noexcept { return workerBindResends_; }
+    /// I-C: TLS-derived bind tokens that could not be derived (failure or all-zero): the session was reconnected.
+    [[nodiscard]] uint64_t bindTokenDeriveFailures() const noexcept { return bindTokenDeriveFailures_; }
+    void testForceBindDeriveFailure(bool on) noexcept { forceBindDeriveFailure_ = on; }
+    [[nodiscard]] uint64_t workerBindAcksAccepted() const noexcept { return workerBindAcksAccepted_; }
+    [[nodiscard]] uint64_t workerBindAcksIgnored() const noexcept { return workerBindAcksIgnored_; }
 
     /// Task 1.3: number of currently open sessions (test/observer helper).
     [[nodiscard]] std::size_t sessionCount() const noexcept { return sessions_.size(); }
@@ -657,7 +730,9 @@ public:
     [[nodiscard]] const transport::AeronTransport& testTransport() const noexcept { return transport_; }
     /// Test hook (T15a fix1): retarget the seed's default ingress publication, as
     /// the Client's stick-to-leader redirect path does.  Agent thread only.
-    bool testRetargetSeed(const std::string& channel) noexcept { return retarget(channel); }
+    bool testRetargetSeed(const std::string& channel, int32_t responsePort = 0) noexcept {
+        return retarget(channel, responsePort);
+    }
     /// Test hooks (T15a r2-m1): the seed's two Backoff fallbacks, and where the
     /// seed's default publication points now.  Agent thread only.
     bool testRetargetSeedToBootstrap() noexcept { return retargetSeedToBootstrap_(); }
@@ -895,6 +970,32 @@ public:
     session::SessionMachine& sessionForEndpointForTest(const std::string& endpoint) noexcept {
         return sessionForEndpoint(endpoint).machine;
     }
+    [[nodiscard]] int serviceResponseUpgradesForTest(int64_t nowNs) noexcept {
+        dutyNowNs_ = nowNs;
+        return serviceResponseUpgrades_();
+    }
+    [[nodiscard]] Session& sessionObjForTest(std::size_t i) noexcept { return *sessions_[i]; }
+    // C1 seams: the seed's physical ingress moves (a completed failover), and the two resolvers' indices.
+    void setSeedPhysicalIngressForTest(const std::string& channel) {
+        transport_.setIngressChannelForTest(channel);
+        invalidateRouteSessions_();
+    }
+    [[nodiscard]] uint32_t findSessionIndexForTest(const std::string& endpoint) const noexcept {
+        return findSessionIndex_(endpoint);
+    }
+    [[nodiscard]] uint32_t sessionIndexForTest(const std::string& endpoint) noexcept {
+        return sessionIndexFor_(endpoint);
+    }
+    void addWorkerBindEntryForTest(const std::string& sessionEndpoint) {
+        WorkerBindEntry e;
+        e.sessionEndpoint = sessionEndpoint;
+        workerBinds_.push_back(std::move(e));
+    }
+    /// Resolve every bind entry's session (the duty pass's first step) and report entry `i`'s index.
+    [[nodiscard]] uint32_t workerBindSessionIndexForTest(std::size_t i) noexcept {
+        (void)serviceWorkerBinds_();
+        return i < workerBinds_.size() ? workerBinds_[i].sessionIndex : kNoSession;
+    }
 
 private:
     void init();   // the constructors' common body (the seed session)
@@ -902,7 +1003,7 @@ private:
     // Seed-transport helpers (agent thread only).  ClientAgent is NOT a SessionIo (issue #178): the only session
     // send path is SessionEndpointIo::sendFrame, which seals per destination.
     // -------------------------------------------------------------------------
-    bool retarget(const std::string& newIngressChannel) noexcept;
+    bool retarget(const std::string& newIngressChannel, int32_t responsePort = 0) noexcept;
     [[nodiscard]] std::string ingressChannel() const { return transport_.ingressChannel(); }   // issue #115
 
     // -------------------------------------------------------------------------
@@ -985,15 +1086,83 @@ private:
     static constexpr uint32_t kNoSession = 0xFFFFFFFFu;
     // One slot per routed partition: strings are cold (setRoute / first offer);
     // the hot path touches only sessionIndex / streamId / pub.
+    static constexpr uint32_t kNoBind = 0xFFFFFFFFu;
     struct PartitionRoute {
         std::string sessionEndpoint;
         std::string dataChannel;
+        uint32_t    bindIdx      = kNoBind;     // NAT-safe egress: this route's worker bind entry (workerBinds_)
+        int32_t     bindStream   = 0;           // the stream/port the entry was made for (setRoute change detection)
+        int32_t     bindPort     = 0;
         uint32_t    sessionIndex = kNoSession;  // resolved on first offer
         int32_t     streamId     = -1;          // stream `pub` was built for
         transport::AeronTransport::PubHandle pub = transport::AeronTransport::kNoPub;
         uint8_t     receiverId   = 0;      // issue #116: who a produce on dataChannel is sealed for (0 = gateway)
         bool        dataOnNode   = true;   // dataChannel == sessionEndpoint (the node, not a worker's own ingress)
     };
+    // ---- NAT-safe egress: per-worker bind table (agent-owned plain data) --------
+    // A response-mode worker pins a session to the Aeron image its FIRST frame (WorkerBind, plaintext) arrives on, and
+    // drops produce from any other image.  So binding is per worker PUBLICATION, not per route: one entry per
+    // (dataChannel, streamId), created cold in setRoute for every worker Metadata advertises with a response-control
+    // port (produce OR consume: the worker's Records only reach the client through that pair).  Routes point at their
+    // entry; the entry's `pub` is the route's publication — a separate plain pub for the same key never exists.
+    struct WorkerBindEntry {
+        struct Unbound {};
+        /// I2: the bind went out and the worker has not acknowledged it yet: `corr` is the WorkerBind's correlation id
+        /// (the ack echoes it), `attempts` the sends so far, `nextRetryNs` the duty-clock deadline of the next resend.
+        struct Sent { int64_t sid; int64_t corr; uint8_t attempts; int64_t nextRetryNs; };
+        struct Bound { int64_t sid; };   ///< the session id the worker ACKNOWLEDGED the bind for (WorkerBindAck)
+        std::string sessionEndpoint;     ///< the node session this worker's binds ride (its token / sid)
+        std::string dataChannel;
+        int32_t     streamId = 0;
+        transport::AeronTransport::PubHandle pub = transport::AeronTransport::kNoPub;
+        uint32_t    sessionIndex = kNoSession;   ///< resolved (never opened) by the duty pass
+        std::variant<Unbound, Sent, Bound> state{Unbound{}};
+        /// The first WorkerBind of a session was accepted on this entry's pair (request publication + response
+        /// subscription): the worker's response publication for it pins the subscription, so the NEXT session's bind
+        /// needs a fresh pair.
+        ResponsePair pair = ResponsePair::Fresh;
+    };
+    std::vector<WorkerBindEntry> workerBinds_;   // grows on the cold path only; reserved in the ctor
+    int64_t                      bindCorrId_ = 0;
+    uint64_t                     workerBindsSent_ = 0;
+    uint64_t                     bindTokenDeriveFailures_ = 0;   ///< I-C: a derived bind token was zero / failed: reconnect
+    bool                         forceBindDeriveFailure_ = false;   ///< test seam: the derivation yields all-zero
+    uint64_t                     workerBindResends_ = 0;        ///< unacknowledged WorkerBinds resent (lost-datagram retry)
+    uint64_t                     workerBindAcksAccepted_ = 0;
+    uint64_t                     workerBindAcksIgnored_ = 0;    ///< late / stale / unmatched WorkerBindAcks
+    /// Lost-datagram resend of an unacknowledged WorkerBind: capped exponential backoff, no attempt cap and no give-up
+    /// (the worker re-acks a repeat; the session's own liveness ends a bind that can never succeed).
+    static constexpr int64_t kBindRetryNs    = 250'000'000;
+    static constexpr int64_t kBindRetryMaxNs = 4'000'000'000;
+    /// A WorkerBindAck (templateId 87, plaintext): Sent{sid, corr} -> Bound{sid}; anything else is ignored + counted.
+    void onWorkerBindAck_(const uint8_t* buf, std::size_t len) noexcept;
+    /// Replace `s`'s spent response pair (request publication + response subscription) with a fresh one.  Cold.
+    void rePairSessionResponse_(Session& s) noexcept;
+    /// One cold pass per doWork over the (small) table: offer the WorkerBind for every entry whose session is
+    /// Connected with a token and whose bound sid is not the session's current one.  Returns binds sent.
+    int serviceWorkerBinds_() noexcept;
+    /// The ONE builder of a leader session's (response-correlated) control publication.
+    void attachResponsePub_(Session& s, int32_t port, bool upgradePlain = false) noexcept;
+    /// I6: upgrade every session flagged by setSessionResponsePort.  Returns upgrades done.  Cold.
+    int serviceResponseUpgrades_() noexcept;
+    uint32_t pendingResponseUpgrades_ = 0;
+    uint64_t mdcEgressSubscriptionsAdded_ = 0;   // duty thread only (I7 observer)
+    bool holdWorkerBinds_ = false;   // TEST SEAM (duty thread): serviceWorkerBinds_ sends nothing while set
+public:
+    void testHoldWorkerBinds(bool hold) noexcept { holdWorkerBinds_ = hold; }
+private:
+    /// The entry for (dataChannel, streamId), created when missing; kNoBind on failure.  Cold.
+    uint32_t workerBindFor_(const std::string& sessionEndpoint, const std::string& dataChannel, int32_t streamId,
+                            int32_t responsePort) noexcept;
+    /// The index of the session for `endpoint` WITHOUT opening one (kNoSession when none exists).  Cold.
+    uint32_t findSessionIndex_(const std::string& endpoint) const noexcept;
+    /// The ONE endpoint → session-index order shared by sessionForEndpoint (opens on kNoSession) and
+    /// findSessionIndex_ (C1: the produce session and the WorkerBind session must never drift apart).
+    [[nodiscard]] uint32_t resolveSessionIndex_(const std::string& endpoint) const noexcept;
+    /// Response ports learnt per node endpoint (Metadata / Redirect); cold table.
+    std::vector<std::pair<std::string, int32_t>> nodeResponsePorts_;
+    [[nodiscard]] int32_t knownResponsePort_(const std::string& endpoint) const noexcept;
+
     detail::FlatIndexMap        routeIndex_;   // routeKey(t,p) -> routes_ index
     uint64_t                    heldOffers_ = 0;  // DR-7: see heldOffers()
     uint32_t                    rejectedSessions_ = 0;   // issue #60: leader sessions in Rejected (edge-counted)
@@ -1023,6 +1192,7 @@ private:
     /// the seed LEFT must not ride the seed's new session).  Cold.
     void invalidateRouteSessions_() noexcept {
         for (PartitionRoute& r : routes_) r.sessionIndex = kNoSession;
+        for (WorkerBindEntry& b : workerBinds_) b.sessionIndex = kNoSession;
         ++seedMoves_;   // fix round 1 (C1): the owner re-asks metadata (the no-route set changed meaning)
         // Fix round 3 (N-I1): a resume is valid only on the broker holding the session —
         // a seed that is not Connected connects FRESH (fresh TLS) at its new broker.
@@ -1063,7 +1233,7 @@ private:
     /// SessionMachine's resent ConnectRequest reaches it.  False = the new
     /// publication did not resolve (the old one stays; the resend is bounded by
     /// the redirect budget).  Agent thread only (cold path).
-    bool retargetSeedOnConnectRedirect_(const std::string& endpoint) noexcept;
+    bool retargetSeedOnConnectRedirect_(const std::string& endpoint, int32_t responsePort = 0) noexcept;
 
     // ---- Task 1.4: shared produce→leader routing (drain path + redirect resend) --
     // Probe the route slot, resolve its session / pub once, hold if the session is not

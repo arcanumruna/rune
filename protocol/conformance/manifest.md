@@ -75,6 +75,49 @@ Offset  Hex                                        Notes
 
 ---
 
+## 2b. `connect_request_v16_response.bin` — 77 bytes
+
+**Message:** `ConnectRequest` (templateId = 1), NAT-safe egress form (clientVersion 16)
+
+| Field              | Value (decimal)          | Value (hex)                     |
+|--------------------|--------------------------|---------------------------------|
+| blockLength        | 8                        | 0x0008                          |
+| templateId         | 1                        | 0x0001                          |
+| schemaId           | 120                      | 0x0078                          |
+| version            | 3                        | 0x0003                          |
+| sessionId          | 1234605616436508552      | 0x1122334455667788              |
+| correlationId      | 723685415333974033       | 0x0A0B0C0D0E0F1011              |
+| egressStreamId     | 1001                     | 0x000003E9                      |
+| clientVersion      | 16                       | 0x00000010                      |
+| egressChannel      | "aeron:udp?endpoint=localhost:40200" | len=34 (0x0022) |
+| cipherList         | empty                    | len=0 (uint16)                  |
+| handshakeBytes     | empty                    | len=0 (uint32)                  |
+| authToken          | ""                       | len=0 (uint16)                  |
+| responseCorrelated | true                     | 0x01                            |
+
+At clientVersion >= 16 the crypto block is always written (empty here), then the 1-byte flag.
+
+**Byte layout:**
+```
+Offset  Hex                                        Notes
+00      08 00                                      blockLength = 8 (LE)
+02      01 00                                      templateId = 1 (LE)
+04      78 00                                      schemaId = 120 (LE)
+06      03 00                                      version = 3 (LE)
+08      88 77 66 55 44 33 22 11                    sessionId (LE)
+16      11 10 0F 0E 0D 0C 0B 0A                    correlationId (LE)
+24      E9 03 00 00                                egressStreamId = 1001 (LE)
+28      10 00 00 00                                clientVersion = 16 (LE)
+32      22 00                                      egressChannel var-len = 34 (LE)
+34      61 65 72 6F 6E 3A 75 64 ...   egressChannel bytes "aeron:udp?endpoint=localhost:40200"
+68      00 00                                      cipherList var-len = 0 (LE)
+70      00 00 00 00                                handshakeBytes var-len = 0 (uint32 LE)
+74      00 00                                      authToken var-len = 0 (LE)
+76      01                                         responseCorrelated = 1
+```
+
+---
+
 ## 3. `connect_response.bin` — 38 bytes
 
 > **v0 form.** Since client/broker version 3 a broker sends the 42-byte form:

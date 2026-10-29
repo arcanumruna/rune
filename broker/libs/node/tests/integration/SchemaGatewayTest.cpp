@@ -1609,7 +1609,7 @@ TEST(SchemaGatewayRegression, CatalogDdlOpsRouteThroughTheGatewayAndAnswerDdlRes
 // session id + egress channel reach the event's principal (ruling 13).
 TEST(SchemaGatewayRegression, DdlExtensionReachesTheEventPrincipalRegression) {
     SgHarness h;
-    const int64_t sid = h.gw.injectTestSessionOnChannel("aeron:udp?endpoint=client-host:40999");
+    const int64_t sid = h.gw.injectTestSessionOnChannel("aeron:udp?endpoint=client-host:40999", 0, "127.0.0.1:51234");
     pc::DefineTopic m;
     m.sessionId = sid; m.correlationId = 600; m.topicName = "p"; m.partitionCount = 1;
     m.hasExt = true; m.replicationFactor = 0;
@@ -1634,8 +1634,9 @@ TEST(SchemaGatewayRegression, DdlExtensionReachesTheEventPrincipalRegression) {
     EXPECT_EQ(ev->principal.clientName, "sg-client");
     EXPECT_EQ(ev->principal.requestId, (rune::protocol::RequestId{0xBEEF, 77}));
     EXPECT_EQ(ev->principal.sessionId, sid) << "the gateway's session id";
-    EXPECT_EQ(ev->principal.sourceAddress, "aeron:udp?endpoint=client-host:40999")
-        << "the session's egress channel (gateway-supplied, ruling 13)";
+    EXPECT_TRUE(ev->principal.sourceAddress.starts_with("127.0.0.1:"))
+        << "the Connect image's source identity (gateway-supplied, ruling 13, #227): " << ev->principal.sourceAddress;
+    EXPECT_NE(ev->principal.sourceAddress, "aeron:udp?endpoint=client-host:40999") << "never the declared channel";
 }
 
 // An undecodable catalog DDL body is answered InvalidRequest in a DdlResponse;

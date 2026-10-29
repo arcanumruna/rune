@@ -143,6 +143,7 @@ class TopicRegistry;
 struct LeaderView {
     bool        isLeader             = true;   // true if this node is the current leader
     std::string leaderClientEndpoint;           // leader's client-facing channel; empty if unknown
+    int32_t     leaderNodeId = -1;              // the leader's node id (-1 = unknown); NAT-safe egress redirect suffix
 };
 
 /// Shard mode (spec §3.3): a node's explicitly configured per-worker ingress base.
@@ -447,7 +448,10 @@ public:
     [[nodiscard]] uint64_t loginsOk() const noexcept { return loginsOk_; }
     [[nodiscard]] uint64_t loginsFailed() const noexcept { return loginsFailed_; }
     [[nodiscard]] uint64_t loginsRateLimited() const noexcept { return loginsRateLimited_; }
-    [[nodiscard]] uint64_t loginsAbandoned() const noexcept { return loginsAbandoned_; }   ///< #132: first legs never finished
+    [[nodiscard]] uint64_t loginsAbandoned() const noexcept { return loginsAbandoned_; }
+    [[nodiscard]] uint64_t bindTokenDeriveFailures() const noexcept { return bindTokenDeriveFailures_; }
+    [[nodiscard]] uint64_t cryptoKeyAnnounces() const noexcept { return cryptoKeyAnnounces_; }
+    void forceZeroDerivedBindTokenForTest(bool on) noexcept { forceZeroDerivedBindTokenForTest_ = on; }   ///< #132: first legs never finished
     /// The SecurityView applied the event at `offset` (BrokerNode calls this right after the view did) - authentication
     /// Task 14, D25: Refresh -> every affected user's authenticated session recompiles its permission table, ends what
     /// lost READ (explicitly, NotAuthorized), ships its WRITE bits and a lifted must-change-password session becomes
@@ -649,6 +653,19 @@ public:
     /// Test seam: the gateway clock the auth handlers (throttle, deadline) read (doWork sets it each cycle).
     void setNowNsForTest(int64_t ns) noexcept { nowNs_ = ns; }
     [[nodiscard]] bool hasSessionForTest(int64_t sid) { return sessions_.find(sid) != nullptr; }
+    /// NAT egress Task 8 seam (cold, control thread): every live session id.
+    [[nodiscard]] std::vector<int64_t> sessionIdsForTest() {
+        std::vector<int64_t> ids;
+        sessions_.forEach([&](const Session& s) { ids.push_back(s.sessionId); });
+        return ids;
+    }
+    /// I2 test seam (control thread): the broker ends session `sid` and tells the client it expired (a reconnect follows).
+    bool expireSessionForTest(int64_t sid) { return closeSession_(sid, /*notifyExpired=*/true); }
+    /// NAT egress Task 8 seam: the Connect image's "host:port" of a session ("" = unknown session / unit test).
+    [[nodiscard]] std::string sessionSourceIdentityForTest(int64_t sid) {
+        const Session* s = sessions_.find(sid);
+        return s ? s->sourceIdentity : std::string{};
+    }
     [[nodiscard]] uint64_t securitySubscribesForwarded() const noexcept { return securitySubscribesForwarded_; }
     /// DDLs answered by the route without reaching the admin ring (Redirect /
     /// NotLeader / Internal / pre-v8 InvalidRequest).
@@ -855,6 +872,15 @@ public:
     // (legacy default) → no endpoint, no trailer.  Set before doWork() runs.
     void setShardIngressEndpoints(std::vector<ShardIngressEndpoint> eps) noexcept {
         shardIngressEndpoints_ = std::move(eps);
+    }
+
+    struct NodeResponseControl { int32_t nodeId = -1; int32_t gatewayPort = 0; int32_t workerBase = 0; };
+    /// NAT-safe egress (spec D3): this gateway's response-control endpoint "host:port" (empty = none: every client
+    /// uses the declared path) and every node's gateway response-control port (for redirects and Metadata).
+    /// Set before doWork() runs.
+    void setResponseControl(std::string selfEndpoint, std::vector<NodeResponseControl> nodes) noexcept {
+        responseControlEndpoint_ = std::move(selfEndpoint);
+        nodeResponseControl_     = std::move(nodes);
     }
 
     // read-rework T3/T4 (I3b): setPerWorkerEgressActive — when active, the gateway
@@ -1324,12 +1350,14 @@ public:
         sessions_.add(sid, /*egress=*/nullptr, rune::gateway::AuthAnonymous{}, nowNs, {}, 0, clientVersion);
         return sid;
     }
-    /// Catalog history Task 9: a test session whose egress CHANNEL is known (the
-    /// DDL principal's source address is the session's egress channel).
-    int64_t injectTestSessionOnChannel(std::string egressChannel, int64_t nowNs = 0) {
+    /// Catalog history Task 9: a test session whose egress CHANNEL is known.  The DDL principal's source address
+    /// is the Connect image's source identity (#227), given here as `sourceIdentity` (a real Connect reads it off
+    /// the Aeron image).
+    int64_t injectTestSessionOnChannel(std::string egressChannel, int64_t nowNs = 0, std::string sourceIdentity = {}) {
         const int64_t sid = sessions_.nextSessionId();
-        sessions_.add(sid, /*egress=*/nullptr, rune::gateway::AuthAnonymous{}, nowNs, std::move(egressChannel), 0,
-                      rune::protocol::client::kClientVersion);
+        Session& s = sessions_.add(sid, /*egress=*/nullptr, rune::gateway::AuthAnonymous{}, nowNs,
+                                   std::move(egressChannel), 0, rune::protocol::client::kClientVersion);
+        s.sourceIdentity = std::move(sourceIdentity);
         return sid;
     }
 
@@ -1801,6 +1829,14 @@ private:
         int32_t     clientVersion  = 0;   ///< D6: ConnectRequest.clientVersion
         rune::gateway::SessionAuth auth;   ///< decided when the ConnectResponse is built (what the client was told)
         std::string sourceHost;            ///< D14: the Connect image's source host (throttle key)
+        std::string sourceIdentity;        ///< the Connect image's "host:port" (the session's source address, #227)
+        bool        responseEgress = false;///< NAT-safe egress: answered on a response publication (no declared channel)
+        std::string replyChannel;          ///< the channel the per-session egress publication uses
+        int32_t     leaderNodeId   = -1;   ///< captured with leaderClientEndpoint (redirect response-port suffix)
+        /// NAT-safe egress (Task 6): response mode in SHARD mode — the workers answer on response publications too.
+        /// bindToken is the WorkerBind secret (drawn at Connect; all-zero = none).  No declared channel is announced.
+        bool                    workerResponse = false;
+        std::array<uint8_t, 16> bindToken{};
 
         // Task 13 (spec §3.4): every worker has this session's reply destination
         // queued (announce-before-accept) — set once, so a ConnectResponse retry
@@ -1943,8 +1979,11 @@ private:
     /// `filter` is the subscription's filter bytes, supplied by the caller (never looked up here): the direct path passes the
     /// live record's, the queued retry passes the copy captured when the Subscribe was queued (the gateway may have erased
     /// the record since). The returned op views `filter`.
-    rune::node::WorkerOp buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub, std::span<const uint8_t> filter) const;
-    void enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub);
+    /// `sessionEgress` (NAT-safe egress, Task 6): the worker pushes this subscription's Records on the session's own
+    /// response publication; egressPub is null and the worker never falls back to the shared egress.
+    rune::node::WorkerOp buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub, std::span<const uint8_t> filter,
+                                           bool sessionEgress = false) const;
+    void enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub, bool sessionEgress = false);
     void parkAwaitingEgress_(const BufferedSubscribe& s);
     /// A buffered Subscribe leaves the waiter list for the worker, unless its subscription ended while it waited.
     void releaseAwaiting_(const BufferedSubscribe& s, void* egressPub);
@@ -2273,9 +2312,9 @@ private:
     // drainPendingReleases — called in pollPendingConnects; for each
     // registration in drainingRegistrations_, attempt findExclusivePublication.
     // On resolve (shared_ptr non-null): let it drop immediately — destructor
-    // calls ClientConductor::releaseExclusivePublication(registrationId)
-    // (Aeron C++ 1.41.4: ExclusivePublication::~ExclusivePublication() calls
-    // m_conductor.releaseExclusivePublication(m_registrationId)).
+    // closes the publication
+    // (Aeron 1.51.0 C++ wrapper: ExclusivePublication::~ExclusivePublication() calls
+    // aeron_exclusive_publication_close).
     // On error (throws): conductor already removed the entry — no leak.
     // On still-AWAITING (nullptr): keep polling until it resolves.
     // Never blocks.
@@ -2385,6 +2424,7 @@ private:
     // subscriber), and drainPendingReleases() clears each entry the cycle it
     // resolves, so the table stays small (≈ pending drop rate × resolve latency).
     std::vector<int64_t>                 drainingRegistrations_;
+    bool                                 drainWarned_ = false;   // drain-table growth warning latch (per gateway)
 
     // Scratch buffer for reap ID collection (avoids heap allocation per frame).
     // Populated and drained entirely within reapExpired() — single-writer, safe.
@@ -2697,6 +2737,10 @@ private:
     std::size_t maxUnauthPerHost_ = kDefaultMaxUnauthSessionsPerHost;   ///< issue #236
     uint64_t connectsRefusedUnauthCap_ = 0;                              ///< issue #236
     uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0, loginsAbandoned_ = 0;
+    /// I-C: worker bind tokens that could not be derived (failure / all-zero): the connect was failed, nothing announced.
+    uint64_t bindTokenDeriveFailures_ = 0;
+    uint64_t cryptoKeyAnnounces_      = 0;   ///< keyReady (second-wave) announces that landed on every worker
+    bool     forceZeroDerivedBindTokenForTest_ = false;
     // ── authentication Task 14: live security changes ──
     uint64_t sessionsRevoked_ = 0;
     int64_t  securityEnforcedOffset_ = -1;       ///< every event <= this is enforced here (see securityEnforcedOffset())
@@ -2752,6 +2796,14 @@ private:
     /// partition: ErrorResponse{Redirect, endpoint}, or the bare NotLeader when the
     /// endpoint is empty or too long for the frame.  Queued (sendAnswer_), never dropped.
     void sendRouteRefusal_(Session& s, int64_t sessionId, int64_t corr, std::string_view endpoint);
+    /// NAT-safe egress (spec D3, I6): the ONE place a Redirect / NotCoordinator endpoint gets its "#<port>" suffix.
+    /// Returns `endpoint` unchanged for a client older than kClientVersionResponseEgress, when no node owns the
+    /// endpoint, when that node has no gateway response port, or when it does not fit `buf`; otherwise
+    /// "endpoint#port" formatted into the caller's stack buffer (no heap).  `nodeId` < 0: find the node whose
+    /// nodeEndpointMap_ value equals the endpoint (cold linear scan).  Redirects are cold.
+    static constexpr std::size_t kRedirectTargetCap = 384;
+    [[nodiscard]] std::string_view redirectTarget_(int32_t clientVersion, std::string_view endpoint, int32_t nodeId,
+                                                   char* buf, std::size_t cap) const noexcept;
     /// C1: true iff the routing image names a leader of (the view's source, partition)
     /// other than this node, or none at all; `endpoint` is then that leader's client
     /// endpoint (empty when leaderless / unknown).  False: this node leads it, the
@@ -2793,6 +2845,17 @@ private:
     // connect-time only); empty in legacy mode and for every plaintext
     // session.
     std::vector<int64_t> pendingCryptoAnnounces_;
+    std::string                       responseControlEndpoint_;   // NAT-safe egress: "host:port", empty = none
+    std::vector<NodeResponseControl>  nodeResponseControl_;       // NAT-safe egress: per-node gateway response port
+    /// NAT-safe egress (Task 6): the response-control base port of node `nodeId`'s workers (0 = none).
+    int32_t workerResponseBaseOf_(int32_t nodeId) const noexcept {
+        for (const auto& n : nodeResponseControl_) if (n.nodeId == nodeId) return n.workerBase;
+        return 0;
+    }
+    int32_t gatewayResponsePortOf_(int32_t nodeId) const noexcept {
+        for (const auto& n : nodeResponseControl_) if (n.nodeId == nodeId) return n.gatewayPort;
+        return 0;
+    }
     std::vector<ShardIngressEndpoint> shardIngressEndpoints_;  // spec §3.3; empty = legacy
 
     // read-rework T3/T4 (I3b): when true, Subscribe/Unsubscribe for user partitions
@@ -3182,7 +3245,7 @@ private:
     // its session's egress publication at retry time (never a dangling pointer;
     // a session gone meanwhile drops it).
     // Phase 2c (fix-on-sight): the op kind is a variant, not a pair of booleans.
-    enum class EgressRoute : uint8_t { Unicast, Mdc };   // Mdc: forwarded with the MDC pub (no unicast)
+    enum class EgressRoute : uint8_t { Unicast, Mdc, Session };   // Mdc: forwarded with the MDC pub (no unicast); Session: the worker's per-session response pub (Task 6)
     // `filter`: the filter bytes captured when the Subscribe was queued - the queued op is self-contained, so a gateway
     // erase of the subscription (Unsubscribe, #109 revoke, topic drop) before the pump cannot turn it into an unfiltered bind.
     struct SubOpSubscribe    { BufferedSubscribe sub; EgressRoute route = EgressRoute::Unicast; std::vector<uint8_t> filter; };

@@ -129,6 +129,7 @@ void printPlan(const Prepared& p, const std::optional<rune::catalog::RequestId>&
 struct LiveOptions {
     std::string endpoint;            // host:port or an aeron: channel
     std::string egress;              // "" = RUNE_EGRESS, else derived for UDP (localEgressFor)
+    std::string gatewayResponsePort; // --gateway-response-port ("" = RUNE_GATEWAY_RESPONSE_PORT, else 0: declared egress)
     std::string streamIn, streamOut, dataDir;   // hidden test overrides ("" = default; an empty dataDir = a private scratch dir)
     bool        verbose = false;
     std::string user, passwordFile;  // credentials ("" = RUNE_USER / RUNE_PASSWORD_FILE)

@@ -76,6 +76,21 @@ int main(int argc, char** argv) {
     }
 
     // -----------------------------------------------------------------------
+    // connect_request_v16_response.bin (NAT-safe egress)
+    // -----------------------------------------------------------------------
+    {
+        rpc::ConnectRequest msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.egressStreamId = 1001;
+        msg.clientVersion  = 16;
+        msg.egressChannel  = "aeron:udp?endpoint=localhost:40200";
+        msg.responseCorrelated = true;
+        n = msg.encode(buf);
+        write_vec(dir, "connect_request_v16_response.bin", buf, n);
+    }
+
+    // -----------------------------------------------------------------------
     // 3. connect_response.bin
     // -----------------------------------------------------------------------
     {

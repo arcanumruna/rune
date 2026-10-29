@@ -60,6 +60,11 @@ struct TransportConfig {
     int32_t     ingressStreamId = 0;   ///< Stream id for the default ingress publication
     std::string egressChannel;         ///< Channel the client subscribes on (← gateway)
     int32_t     egressStreamId  = 0;   ///< Stream id for the egress subscription
+    /// NAT-safe egress: the seed gateway's response-control port (0 = declared egress path only).  With a UDP
+    /// `ingressChannel` and a port in 1..65535 the transport opens a response subscription
+    /// (`control=<gateway host>:<port>|control-mode=response`, stream `egressStreamId`) and correlates the default
+    /// ingress publication with it, so replies return over the client's own flow.
+    int32_t     gatewayResponseControlPort = 0;
     std::string dataDir;               ///< Root dir; the driver lives at dataDir/aeron
     /// Term buffer length of every log buffer on this driver: power of two in
     /// [64 KiB, 1 GiB].  Default 4 MiB.

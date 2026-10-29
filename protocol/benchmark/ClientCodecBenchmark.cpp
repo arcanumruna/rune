@@ -75,7 +75,7 @@ rpc::ConnectRequest makeRequest() {
     req.sessionId      = 0x0102030405060708LL;
     req.correlationId  = 0x0A0B0C0D0E0F1011LL;
     req.egressStreamId = 7;
-    req.clientVersion  = 42;
+    req.clientVersion  = 15;   // pinned: the v15 72-byte frame, comparable with the old baseline (v16 adds a crypto block + flag)
     req.egressChannel  = kChannel;
     return req;
 }

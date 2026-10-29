@@ -3,6 +3,7 @@
 #include <cstdint>
 #include "rune/crypto/Aead.h"
 #include "rune/crypto/Cipher.h"
+#include "rune/crypto/Kdf.h"
 
 typedef struct ssl_st SSL;
 typedef struct ssl_ctx_st SSL_CTX;
@@ -19,6 +20,11 @@ struct SessionKeys {
   uint8_t c2bPrefix[4];
   uint8_t b2cPrefix[4];
 };
+
+/// I3: the worker-bind token of the session these keys belong to (see Kdf.h).
+[[nodiscard]] inline std::array<uint8_t, 16> deriveWorkerBindToken(const SessionKeys& k, int64_t sessionId) noexcept {
+  return deriveWorkerBindToken(std::span<const uint8_t>(k.c2b.bytes, sizeof k.c2b.bytes), sessionId);
+}
 
 // TLS 1.3 handshake run over in-memory BIOs (never a real socket) — handshake bytes get
 // carried inside Rune's own Connect/ConnectResponse frames by the caller. One TlsSession

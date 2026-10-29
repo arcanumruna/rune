@@ -114,6 +114,9 @@ struct FrameCheck {
         tid <= static_cast<uint16_t>(TemplateId::NamespaceUsageResponse)) {
         return true;
     }
+    // NAT-safe egress (client version 16): WorkerBind = 86 (88-95 gap -> UnknownTemplate).
+    // WorkerBindAck = 87 is broker -> client only: it stays UNKNOWN here (ingress), the client recognizes it by id.
+    if (tid == static_cast<uint16_t>(TemplateId::WorkerBind)) return true;
     return false;
 }
 

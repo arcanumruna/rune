@@ -22,7 +22,7 @@ value as false). *ring/size* values must be powers of two; any other value keeps
 | Variable | Default | Meaning |
 |---|---|---|
 | `RUNE_NODE_ID` | required | This node's integer id. It must appear in `RUNE_PEERS`. |
-| `RUNE_PEERS` | required | Comma-separated `id@host:consensusPort[:clientPort[:replicationPort[:replBasePort[:ingressBasePort[:egressControlBasePort]]]]]` for every node including this one. Ids are unique; whitespace is trimmed; an empty or trailing entry is refused. Ports are 1 to 65535; more than six port segments are refused. A single node needs only the consensus port (`0@127.0.0.1:40111`). **A multi-node cluster needs the first three ports** (`id@host:40111:40200:40222`: consensus, client, replication): peers replicate partitions and the `__catalog` over the replication port, and followers redirect clients to the client port. The shipped compose files use exactly that. In shard mode (the default) the per-worker ports are derived from the node id when the later optional segments are absent (see [derived ports](#derived-ports)). `host` is the **advertised** name peers dial. With authentication on: at most 16 peers and node ids up to 65535. |
+| `RUNE_PEERS` | required | Comma-separated `id@host:consensusPort[:clientPort[:replicationPort[:replBasePort[:ingressBasePort[:egressControlBasePort[:responseControlBasePort[:gatewayResponseControlPort]]]]]]]` for every node including this one. Ids are unique; whitespace is trimmed; an empty or trailing entry is refused. Ports are 1 to 65535; more than eight port segments are refused. The 7th and 8th segments advertise the [response-control ports](#derived-ports) (absent = derived in shard mode; `0` is refused; add them only after every node runs this version, older nodes refuse entries with more than six segments). A single node needs only the consensus port (`0@127.0.0.1:40111`). **A multi-node cluster needs the first three ports** (`id@host:40111:40200:40222`: consensus, client, replication): peers replicate partitions and the `__catalog` over the replication port, and followers redirect clients to the client port. The shipped compose files use exactly that. In shard mode (the default) the per-worker ports are derived from the node id when the later optional segments are absent (see [derived ports](#derived-ports)). `host` is the **advertised** name peers dial. With authentication on: at most 16 peers and node ids up to 65535. |
 | `RUNE_CLIENT_ENDPOINT` | required | `host:port` the client gateway listens on (the broker prepends `aeron:udp?endpoint=`). A value that already starts with `aeron:` is used as given, so both forms work. Use `0.0.0.0:40200` to bind every interface. |
 | `RUNE_DATA_DIR` | required | Writable directory for node state, the term log, the catalog and security logs, and partition logs. The image entrypoint defaults it to `/var/lib/rune`. |
 | `RUNE_CLUSTER_KEY_FILE` | required unless `RUNE_AUTH=disabled` | Shared cluster key file: at least 32 bytes after trailing whitespace is trimmed, not readable by group or others. See [operations](operations.md#the-cluster-key). |
@@ -53,6 +53,8 @@ value as false). *ring/size* values must be powers of two; any other value keeps
 | `RUNE_WORKER_INGRESS_BASE_PORT` | derived per node id | Base UDP port of the per-worker ingress endpoints (1 to 65535). |
 | `RUNE_WORKER_REPL_BASE_PORT` | derived per node id | Base UDP port of the per-worker replication endpoints (1 to 65535). |
 | `RUNE_WORKER_EGRESS_CONTROL_BASE_PORT` | none (legacy mode binds `40300`; shard mode derives it) | Base UDP control port of the per-worker dynamic-MDC egress. |
+| `RUNE_RESPONSE_CONTROL_BASE_PORT` | derived (see below) | Base UDP port of the per-worker response-control endpoints (worker `w` binds base + `w`); 7th `RUNE_PEERS` segment. Shard mode only (ignored with a warning in legacy mode). Absent = derived; `0` is refused. Unset and not derivable = new clients use the declared egress path. An env value that peers do not compute for this node and that the 7th segment does not advertise refuses to start. |
+| `RUNE_GATEWAY_RESPONSE_CONTROL_PORT` | derived (see below) | UDP port of the gateway's response-control endpoint; 8th `RUNE_PEERS` segment. Applies in shard and legacy mode. Absent = derived (shard mode); `0` is refused. In shard mode an env value that peers do not compute for this node and that the 8th segment does not advertise refuses to start. |
 | `RUNE_WORKER_EGRESS_CONTROL_HOST` | derived | Host bound for the egress control port. An explicit loopback host on a node advertised at a non-loopback host refuses to start. |
 | `RUNE_PEER_BIND_HOST` | derived | Address the node binds its peer-facing sockets on. Default: the advertised host when it is numeric, else `0.0.0.0`. |
 
@@ -65,6 +67,13 @@ collide). This works for node ids 0 to 126 and at most 64 workers; beyond that, 
 `RUNE_WORKER_INGRESS_BASE_PORT`, `RUNE_WORKER_REPL_BASE_PORT` and `RUNE_WORKER_EGRESS_CONTROL_BASE_PORT`. The ports fall below
 every default ephemeral range, so an auto-bound socket cannot take them. Publish them with the container (all UDP) when
 clients or peers reach the node through Docker port mappings.
+
+The response-control ports (one for the gateway, one per worker) sit in the unused top of the node's egress-control block,
+so there is no extra range: the gateway binds `egress + 63` and worker `w` binds `egress + 63 - W + w` (`egress` = the block's
+egress control base, `W` = `RUNE_WORKERS`). Every node derives a node's ports by one rule: for 1 to 31 workers, when that node's `RUNE_PEERS` 6th segment is
+absent or equals its derived egress base. When it advertises another egress base (or there are more than 31 workers) none are
+derived and the node logs a warning: set `RUNE_RESPONSE_CONTROL_BASE_PORT` and `RUNE_GATEWAY_RESPONSE_CONTROL_PORT` and advertise
+them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this version). They bind on the egress control host.
 
 ## Storage
 
@@ -233,6 +242,7 @@ Send `SIGUSR1` to a running broker to dump a report; `SIGHUP` reloads the TLS ce
 | `gatewayStreamId` | `1` | Broker's client stream id (`RUNE_CLIENT_STREAM_ID`). |
 | `egressChannel` | `aeron:ipc` | Where replies arrive, e.g. `aeron:udp?endpoint=me:40400`. |
 | `egressStreamId` | `2` | Stream id of the reply channel. |
+| `gatewayResponseControlPort` | `0` | NAT-safe egress: the seed broker's gateway response-control port (`--gateway-response-port`, `RUNE_GATEWAY_RESPONSE_PORT` in the CLI and `dr_client`). With a UDP `gatewayChannel` and a port in 1..65535 the client asks for replies over its own flow; other brokers' ports come from Metadata. `0` = the declared `egressChannel` path. Against a broker below version 9 the declared path is used. |
 | `dataDir` | empty | Directory of the embedded driver. |
 | `connectTimeoutMs` / `pingTimeoutMs` / `produceTimeoutMs` | `5000` | Deadlines of connect, ping (also `getViewRow`) and a produce ack. |
 | `subscribeTimeoutMs` | `10000` | Wait for a `SubscribeResponse`. |
@@ -283,5 +293,6 @@ Client environment variables that override `ClientConfig`: `RUNE_CLIENT_AERON_MT
 | `RUNE_PASSWORD_FILE` | Default for `--password-file`. |
 | `RUNE_CLUSTER_KEY_FILE` | Default for `rune security bootstrap --cluster-key-file`. |
 | `RUNE_EGRESS` | Egress channel when `--cli-egress` is not given. |
+| `RUNE_GATEWAY_RESPONSE_PORT` | Default for `--gateway-response-port` (1..65535; anything else is refused). |
 
 A password is never read from the command line or the environment: `--password` and `RUNE_PASSWORD` are refused.

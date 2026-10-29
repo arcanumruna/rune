@@ -320,6 +320,17 @@ struct WorkerOp {
     // a derivation failure on the second wave is not pending and still drops.  Wire: bit kOpFlagKeyPending of the
     // `deferAck` flag byte (SessionAnnounce only).
     bool    keyPending        = false;
+    // NAT-safe egress (Task 6): SessionAnnounce of a RESPONSE-MODE session (shard mode).  No egress channel is shipped
+    // (egressChannel stays empty): the worker answers on a response publication it adds when the client's WorkerBind
+    // names the ingress image, and the 16 B `bindToken` (random, drawn by the gateway) is the secret that bind must
+    // prove.  Wire: bit kOpFlagResponseBind of the `deferAck` flag byte; the token is the FIRST 16 bytes of the tail
+    // ([token][crypto header if encrypted][channel]).
+    bool                    responseBind = false;
+    std::array<uint8_t, 16> bindToken{};
+    // Subscribe (Task 6): this subscription's Records ride the session's own response publication (the worker looks
+    // it up per pass); egressPub stays null and there is NEVER a fall back to the shared MDC egress.  Wire: bit
+    // kOpFlagSessionEgress of the `deferAck` flag byte.
+    bool                    sessionEgress = false;
 
     // SetOwnership: the ReplicaRegistry generation this owned set reflects
     // (acked back as WorkerReturn::OwnershipAck).  Task 10 fix 3.
@@ -686,6 +697,8 @@ inline constexpr uint8_t kOpFlagCrcValidated = 0x02;   ///< WorkerOp::crcValidat
 inline constexpr uint8_t kOpFlagGrantAll     = 0x08;   ///< WorkerOp::grantAll (SessionAnnounce only; authentication Task 13)
 inline constexpr uint8_t kOpFlagFreshCursor  = 0x04;   ///< WorkerOp::freshCursor (PushRead only; E2 M2)
 inline constexpr uint8_t kOpFlagKeyPending   = 0x10;   ///< WorkerOp::keyPending (SessionAnnounce only)
+inline constexpr uint8_t kOpFlagResponseBind = 0x20;   ///< WorkerOp::responseBind (SessionAnnounce only; NAT-safe egress)
+inline constexpr uint8_t kOpFlagSessionEgress = 0x40;  ///< WorkerOp::sessionEgress (Subscribe only; NAT-safe egress)
 
 // ---------------------------------------------------------------------------
 // workerOpFrameBytes — the encoded size of one WorkerOp ring frame carrying a

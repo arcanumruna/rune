@@ -812,6 +812,29 @@ TEST(TransientGatewayRegression, MovedSubscriptionIsRedirectedToTheKnownNewLeade
     EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 2u);
 }
 
+// NAT-safe egress (fix round 1a, I6): the moved-subscription Redirect names the leader's gateway response-control
+// port ("endpoint#port") to a client >= 16, the bare endpoint to an older one.
+TEST(GatewayRedirectResponsePortRegression, MovedSubscriptionRedirectCarriesThePortRegression) {
+    for (const int32_t ver : {pc::kClientVersionResponseEgress - 1, pc::kClientVersionResponseEgress}) {
+        SCOPED_TRACE("client " + std::to_string(ver));
+        Rig r;
+        r.gw.setNodeIdForTest(1);
+        const std::string kLeaderEndpoint = "aeron:udp?endpoint=rune-3:40200";
+        r.gw.setNodeEndpointMap({{1, "aeron:udp?endpoint=rune-2:40200"}, {2, kLeaderEndpoint}});
+        r.gw.setResponseControl("", {{2, 8455}, {1, 8400}});
+        const int64_t sid = r.gw.injectTestSession(0, ver);
+        r.subscribe(sid, -2, 201, /*read_committed=*/1);
+        ASSERT_TRUE(r.subscribed.count(201));
+        r.gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build({{rune::metadata::gpidOf(0, 0), 2, 2}}));
+        const auto h = r.reg.lookupHandle(0, 0);
+        r.reg.setIntendedRole(0, 0, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+        r.gw.pushSubscriptionsForTest();
+        ASSERT_TRUE(r.errors.count(201)) << "the moved subscription was never answered";
+        EXPECT_EQ(r.errors[201], static_cast<int16_t>(pc::ErrorCode::Redirect));
+        EXPECT_EQ(r.errorMessages[201], ver >= pc::kClientVersionResponseEgress ? kLeaderEndpoint + "#8455" : kLeaderEndpoint);
+    }
+}
+
 // ... and with no known other leader (NO_LEADER, or this node itself in a stale
 // image, or no endpoint for it) the v6 answer stays the bare NotLeader.
 TEST(TransientGatewayRegression, MovedSubscriptionWithNoKnownOtherLeaderStaysNotLeaderRegression) {

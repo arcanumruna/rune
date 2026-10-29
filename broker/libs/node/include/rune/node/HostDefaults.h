@@ -144,7 +144,9 @@ struct AeronTransportDerived {
 /// Per-node shard base ports when the deployment sets none (shard mode is the
 /// default): node n gets the block [8200 + 192n, 8200 + 192n + 191] —
 /// ingress = base, repl = base + 64, egress control = base + 128 (64 =
-/// NodeConfig::kMaxShardWorkers, so co-located nodes never collide).  nullopt when
+/// NodeConfig::kMaxShardWorkers, so co-located nodes never collide).  The
+/// response-control ports (deriveResponseControlPorts) sit in the UNUSED TOP of
+/// the egress-control block — no extra range.  nullopt when
 /// the node id is outside [0, 126] or workers > 64 (explicit ports required).
 struct ShardBasePorts { int32_t ingress = 0; int32_t repl = 0; int32_t egressControl = 0; };
 inline constexpr int32_t kDerivedShardPortBase   = 8200;
@@ -159,9 +161,27 @@ static_assert(kDerivedShardPortBase + (kMaxDerivedShardNodeId + 1) * kDerivedSha
               "every derived shard port must lie below every default ephemeral port range");
 [[nodiscard]] std::optional<ShardBasePorts> deriveShardBasePorts(int32_t nodeId, int32_t workers) noexcept;
 
+/// Response-control ports (NAT-safe egress, spec D3): the gateway's and the worker base
+/// (worker w binds workerBase + w).  0 = not available.
+struct ResponseControlPorts { int32_t gateway = 0; int32_t workerBase = 0; };
+/// Valid worker counts for derived response ports: they must not overlap the dynamic-MDC egress
+/// ports [egressBase, egressBase + W - 1] inside the 64-port egress-control block.
+inline constexpr int32_t kMaxDerivedResponseWorkers = (NodeConfig::kMaxShardWorkers - 1) / 2;
+static_assert(2 * kMaxDerivedResponseWorkers + 1 <= NodeConfig::kMaxShardWorkers,
+              "W MDC ports + W worker response ports + 1 gateway port must fit in the egress-control block");
+/// Layout inside the egress-control block (egressBase = deriveShardBasePorts(...)->egressControl):
+///   MDC egress          [egressBase, egressBase + W - 1]
+///   worker responses    [egressBase + 63 - W, egressBase + 62]   (workerBase = egressBase + 63 - W)
+///   gateway response    egressBase + 63
+/// nullopt when W is outside [1, 31] or the block leaves the port range.  Callers apply it ONLY to the
+/// DERIVED egress base: an explicit egress base derives none (an upgrade never turns a valid config into a
+/// collision).  PURE.
+[[nodiscard]] std::optional<ResponseControlPorts> deriveResponseControlPorts(int32_t egressControlBase,
+                                                                              int32_t workers) noexcept;
+
 /// Every UDP port this node BINDS (sorted, unique): its consensus, client and
-/// replication ports, and every shard worker's ingress / replication / egress
-/// control port.  PURE; call after applyHostDerivedDefaults (shard bases set).
+/// replication ports, the gateway response-control port, and every shard worker's ingress / replication /
+/// egress control / response-control port.  PURE; call after applyHostDerivedDefaults (shard bases set).
 [[nodiscard]] std::vector<int32_t> nodeBoundPorts(const NodeConfig& cfg);
 
 /// The ports of `bound` an ephemeral (auto-bound) socket could take before this

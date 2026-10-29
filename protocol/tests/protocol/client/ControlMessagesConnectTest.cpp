@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/Dispatch.h>
 #include <array>
 #include <cstdint>
 #include <climits>
@@ -46,8 +47,9 @@ TEST(ConnectRequestCodec, RoundTripRealistic) {
     req.clientVersion  = 42;
     req.egressChannel  = channel;
 
-    // Total: 24 (header) + 8 (fixed) + 2 (var len) + channel.size()
-    const std::size_t expectedTotal = 24 + 8 + 2 + channel.size();
+    // Total: 24 (header) + 8 (fixed) + 2 (var len) + channel.size(); clientVersion 42 >= 16 adds the always-present
+    // empty crypto block (2+4+2) and the responseCorrelated byte (1).
+    const std::size_t expectedTotal = 24 + 8 + 2 + channel.size() + 9;
 
     std::array<uint8_t, 256> buf{};
     const std::size_t written = req.encode(buf.data());
@@ -359,6 +361,27 @@ TEST(VarFieldHelper, GetVarBytesLengthPrefixTruncated) {
 // 1. Max-length egressChannel = u16 max (65535 bytes)
 //    encode→decode round-trips exactly; total size == 34 + 65535 == 65569.
 // ---------------------------------------------------------------------------
+TEST(ConnectRequestCodec, MaxU16EgressChannelRoundTripV16) {
+    const std::string bigChannel(65535u, 'A');
+    rpc::ConnectRequest req;
+    req.sessionId      = 0xDEADBEEFCAFEBABELL;
+    req.correlationId  = 0x0102030405060708LL;
+    req.egressStreamId = 12345;
+    req.clientVersion  = rpc::kClientVersionResponseEgress;
+    req.egressChannel  = bigChannel;
+    req.responseCorrelated = true;
+    std::vector<uint8_t> buf(req.encodedSize(), 0u);
+    ASSERT_EQ(buf.size(), 65569u + 2u + 4u + 2u + 1u);
+    const std::size_t written = req.encode(buf.data());
+    EXPECT_EQ(written, buf.size());
+    auto decoded = rpc::ConnectRequest::decode(buf.data(), written);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->egressChannel, std::string_view(bigChannel));
+    EXPECT_EQ(decoded->clientVersion, req.clientVersion);
+    EXPECT_EQ(decoded->egressStreamId, req.egressStreamId);
+    EXPECT_TRUE(decoded->responseCorrelated);
+}
+
 TEST(ConnectRequestCodec, MaxU16EgressChannelRoundTrip) {
     // 65535 bytes — the maximum a uint16 length prefix can encode.
     const std::size_t kMaxLen = 65535u;
@@ -371,7 +394,7 @@ TEST(ConnectRequestCodec, MaxU16EgressChannelRoundTrip) {
     req.sessionId      = 0xDEADBEEFCAFEBABELL;
     req.correlationId  = 0x0102030405060708LL;
     req.egressStreamId = 12345;
-    req.clientVersion  = 99;
+    req.clientVersion  = 15;   // below v16: no crypto block, no flag (65569 bytes)
     req.egressChannel  = bigChannel;
 
     // Total: header(24) + fixed(8) + var-prefix(2) + data(65535) = 65569
@@ -497,7 +520,8 @@ TEST(ConnectRequestCodec, IntBoundaryValuesFixedFields) {
         req.clientVersion  = tc.clientVersion;
         req.egressChannel  = "x";   // 1-byte channel so we have a var field
 
-        constexpr std::size_t kExpected = 24u + 8u + 2u + 1u;
+        // A session >= 16 adds the empty crypto block (8 bytes) and the responseCorrelated byte.
+        const std::size_t kExpected = 24u + 8u + 2u + 1u + (tc.clientVersion >= rpc::kClientVersionResponseEgress ? 9u : 0u);
         std::array<uint8_t, 64> buf{};
         const std::size_t written = req.encode(buf.data());
         ASSERT_EQ(written, kExpected);
@@ -798,8 +822,8 @@ TEST(HandshakeContinueResponse, TemplateIdIsEleven) {
 // kProtocolVersion (the MessageHeader wire version) stays at 3.
 // ---------------------------------------------------------------------------
 TEST(VersionGates, ClientBrokerVersionBumpedProtocolVersionUnchanged) {
-    EXPECT_EQ(rpc::kClientVersion, 15);   // v15: RecordEgressUnavailable (#450); v14: namespaces (templates 81-83, codes 51-54); v13: produce ConcurrentTransactions, issue #112; v12: per-receiver c2b keys, issue #116 (v11: subscription filters; v10: TxnOffsetCommit member fence; v9: authentication; v8: catalog history DDL, v7: transient lineage note + claim)
-    EXPECT_EQ(rpc::kBrokerVersion, 8);   // v8: namespaces; v7: per-receiver c2b keys (#116)
+    EXPECT_EQ(rpc::kClientVersion, 16);   // v16: NAT-safe response egress; v15: RecordEgressUnavailable (#450); v14: namespaces (templates 81-83, codes 51-54); v13: produce ConcurrentTransactions, issue #112; v12: per-receiver c2b keys, issue #116 (v11: subscription filters; v10: TxnOffsetCommit member fence; v9: authentication; v8: catalog history DDL, v7: transient lineage note + claim)
+    EXPECT_EQ(rpc::kBrokerVersion, 9);   // v9: NAT-safe response egress (client 16); v8: namespaces; v7: per-receiver c2b keys (#116)
     EXPECT_EQ(rpc::kClientVersionCrypto, 4);
     EXPECT_EQ(rpc::kBrokerVersionCrypto, 4);
     EXPECT_EQ(rpc::kProtocolVersion, 3);
@@ -938,4 +962,273 @@ TEST(ConnectResponseDecodeRegression, TruncatedV9FrameIsRejectedAndLegacyFrameIs
     ASSERT_TRUE(old.has_value());
     EXPECT_FALSE(old->v9);
     EXPECT_EQ(old->brokerVersion, 0);
+}
+
+// ===========================================================================
+// v16 NAT-safe egress: ConnectRequest.responseCorrelated trailing byte
+// ===========================================================================
+namespace {
+std::vector<uint8_t> encodeConnect(const rpc::ConnectRequest& req) {
+    std::vector<uint8_t> buf(512);
+    buf.resize(req.encode(buf.data()));
+    return buf;
+}
+rpc::ConnectRequest v16Request(std::string_view channel, bool flag) {
+    rpc::ConnectRequest req;
+    req.sessionId = 11;
+    req.correlationId = 22;
+    req.egressStreamId = 1001;
+    req.clientVersion = rpc::kClientVersionResponseEgress;
+    req.egressChannel = channel;
+    req.responseCorrelated = flag;
+    return req;
+}
+} // namespace
+
+TEST(ConnectRequestResponseEgressRegression, RoundTripsTheFlagRegression) {
+    for (const bool flag : {true, false}) {
+        const auto buf = encodeConnect(v16Request("", flag));
+        const auto out = rpc::ConnectRequest::decode(buf.data(), buf.size());
+        ASSERT_TRUE(out.has_value());
+        EXPECT_EQ(out->responseCorrelated, flag);
+        EXPECT_TRUE(out->egressChannel.empty());
+        EXPECT_TRUE(out->cipherList.empty());
+        EXPECT_TRUE(out->handshakeBytes.empty());
+        EXPECT_TRUE(out->authToken.empty());
+        EXPECT_EQ(out->clientVersion, 16);
+        EXPECT_EQ(out->egressStreamId, 1001);
+        EXPECT_EQ(buf.size(), 34u + 2u + 4u + 2u + 1u);
+    }
+}
+
+TEST(ConnectRequestResponseEgressRegression, RoundTripsWithCryptoRegression) {
+    const std::array<uint8_t, 3> ciphers{1, 2, 3};
+    auto req = v16Request("aeron:udp?endpoint=h:1", true);
+    req.cipherList = std::span<const uint8_t>(ciphers);
+    req.handshakeBytes = "hello-handshake";
+    req.authToken = "tok";
+    const auto buf = encodeConnect(req);
+    const auto out = rpc::ConnectRequest::decode(buf.data(), buf.size());
+    ASSERT_TRUE(out.has_value());
+    EXPECT_TRUE(out->responseCorrelated);
+    EXPECT_EQ(out->egressChannel, "aeron:udp?endpoint=h:1");
+    ASSERT_EQ(out->cipherList.size(), 3u);
+    EXPECT_EQ(out->cipherList[2], 3);
+    EXPECT_EQ(out->handshakeBytes, "hello-handshake");
+    EXPECT_EQ(out->authToken, "tok");
+}
+
+TEST(ConnectRequestResponseEgressRegression, BelowV16IsByteIdenticalRegression) {
+    auto req = v16Request("abc", true);
+    req.clientVersion = 15;
+    const auto buf = encodeConnect(req);
+    EXPECT_EQ(buf.size(), 34u + 3u);
+    const auto out = rpc::ConnectRequest::decode(buf.data(), buf.size());
+    ASSERT_TRUE(out.has_value());
+    EXPECT_FALSE(out->responseCorrelated);
+}
+
+TEST(ConnectRequestResponseEgressRegression, OldBrokerIgnoresTheFlagRegression) {
+    auto buf = encodeConnect(v16Request("aeron:ipc", true));
+    buf[28] = 15; buf[29] = 0; buf[30] = 0; buf[31] = 0;   // a v15 decoder sees clientVersion 15
+    const auto out = rpc::ConnectRequest::decode(buf.data(), buf.size());
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->egressChannel, "aeron:ipc");
+    EXPECT_EQ(out->egressStreamId, 1001);
+    EXPECT_FALSE(out->responseCorrelated);
+}
+
+TEST(ConnectRequestResponseEgressRegression, TruncationNeverMisparsesRegression) {
+    const std::array<uint8_t, 2> ciphers{7, 8};
+    auto req = v16Request("aeron:ipc", true);
+    req.cipherList = std::span<const uint8_t>(ciphers);
+    req.handshakeBytes = "hs";
+    req.authToken = "t";
+    const auto buf = encodeConnect(req);
+    const std::size_t full = buf.size();
+    // At v16 the crypto block and the flag byte are mandatory: every truncation rejects.
+    for (std::size_t cut = 0; cut < full; ++cut)
+        EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), cut).has_value()) << "cut=" << cut;
+    const auto whole = rpc::ConnectRequest::decode(buf.data(), full);
+    ASSERT_TRUE(whole.has_value());
+    EXPECT_TRUE(whole->responseCorrelated);
+}
+
+TEST(ConnectRequestResponseEgressRegression, FlagAboveOneIsRejectedRegression) {
+    auto buf = encodeConnect(v16Request("", true));
+    buf.back() = 2;
+    EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), buf.size()).has_value());
+}
+
+TEST(ConnectRequestResponseEgressRegression, V16MissingFlagRejectedRegression) {
+    const auto buf = encodeConnect(v16Request("aeron:ipc", true));
+    // the flag byte missing (crypto block complete)
+    EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), buf.size() - 1).has_value());
+    // no crypto block and no flag (a v4-style body under a v16 version)
+    EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), 34 + 9).has_value());
+    EXPECT_TRUE(rpc::ConnectRequest::decode(buf.data(), buf.size()).has_value());
+    // below v16 the crypto block stays optional
+    auto v15 = v16Request("aeron:ipc", false);
+    v15.clientVersion = rpc::kClientVersionCrypto;
+    const auto b15 = encodeConnect(v15);
+    EXPECT_TRUE(rpc::ConnectRequest::decode(b15.data(), 34 + 9).has_value());
+}
+
+TEST(ConnectRequestResponseEgressRegression, EncodedSizeMatchesEncodeRegression) {
+    const std::string big(65535, 'c');
+    const std::array<uint8_t, 3> ciphers{1, 2, 3};
+    const std::string_view channels[] = {"", "aeron:udp?endpoint=localhost:40200", big};
+    for (const int32_t version : {3, 15, 16, 17})
+        for (const bool crypto : {false, true})
+            for (const std::string_view ch : channels) {
+                rpc::ConnectRequest req = v16Request(ch, true);
+                req.clientVersion = version;
+                if (crypto) {
+                    req.cipherList = std::span<const uint8_t>(ciphers);
+                    req.handshakeBytes = "hello-handshake";
+                    req.authToken = "tok";
+                }
+                const std::size_t sz = req.encodedSize();
+                std::vector<uint8_t> buf(sz + 16, 0xAB);
+                const std::size_t n = req.encode(buf.data());
+                EXPECT_EQ(n, sz) << "v" << version << " crypto=" << crypto << " ch=" << ch.size();
+                for (std::size_t i = sz; i < sz + 16; ++i)
+                    ASSERT_EQ(buf[i], 0xAB) << "guard overwritten v" << version << " crypto=" << crypto;
+            }
+}
+
+// ---------------------------------------------------------------------------
+// NAT-safe egress Task 6 — ConnectResponse v16 tail (bindToken) and WorkerBind (86)
+// ---------------------------------------------------------------------------
+namespace {
+std::array<uint8_t, 16> tokenOf(uint8_t seed) {
+    std::array<uint8_t, 16> t{};
+    for (std::size_t i = 0; i < t.size(); ++i) t[i] = static_cast<uint8_t>(seed + i * 7);
+    return t;
+}
+}
+
+TEST(ConnectResponseBindTokenRegression, V16RoundTripCarriesTokenAndV9Fields) {
+    for (const bool crypto : {false, true}) {
+        rpc::ConnectResponse r;
+        r.sessionId = 5; r.correlationId = 6; r.assignedSessionId = 77; r.leaderMemberId = 2;
+        r.v9 = true; r.v16 = true;
+        r.authMode = rpc::AuthMode::Required; r.authState = rpc::AuthState::ResumedAuthenticated;
+        r.bindToken = tokenOf(3);
+        if (crypto) { r.chosenCipher = 1; r.handshakeBytes = "server-hello"; }
+        std::vector<uint8_t> buf(256, 0xCD);
+        const std::size_t n = r.encode(buf.data());
+        EXPECT_EQ(n, rpc::ConnectResponse::ENCODED_SIZE_V16 + 4u + (crypto ? 12u : 0u));
+        const auto d = rpc::ConnectResponse::decode(buf.data(), n);
+        ASSERT_TRUE(d.has_value());
+        EXPECT_TRUE(d->v16); EXPECT_TRUE(d->v9);
+        EXPECT_EQ(d->bindToken, tokenOf(3));
+        EXPECT_EQ(d->assignedSessionId, 77);
+        EXPECT_EQ(d->authMode, rpc::AuthMode::Required);
+        EXPECT_EQ(d->authState, rpc::AuthState::ResumedAuthenticated);
+        EXPECT_EQ(d->handshakeBytes, crypto ? std::string_view("server-hello") : std::string_view());
+        EXPECT_EQ(d->chosenCipher, crypto ? 1 : 0);
+    }
+}
+
+TEST(ConnectResponseBindTokenRegression, V16ImpliesV9AndPreV16FramesHaveNoToken) {
+    rpc::ConnectResponse r;
+    r.v16 = true;                      // v9 left false: the encoder still writes the v9 fields
+    r.bindToken = tokenOf(9);
+    std::vector<uint8_t> buf(128);
+    const std::size_t n = r.encode(buf.data());
+    const auto d = rpc::ConnectResponse::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_TRUE(d->v9);
+    EXPECT_TRUE(d->v16);
+    rpc::ConnectResponse old;
+    old.v9 = true;
+    const std::size_t m = old.encode(buf.data());
+    const auto o = rpc::ConnectResponse::decode(buf.data(), m);
+    ASSERT_TRUE(o.has_value());
+    EXPECT_FALSE(o->v16);
+    EXPECT_EQ(o->bindToken, (std::array<uint8_t, 16>{}));
+}
+
+TEST(ConnectResponseBindTokenRegression, PreV16RuleSkipsTheTokenByBlockLength) {
+    // A pre-v16 decoder reads the v9 fields, then the var data at fixedBase + blockLength: replay that rule by hand.
+    rpc::ConnectResponse r;
+    r.v9 = true; r.v16 = true; r.chosenCipher = 1; r.handshakeBytes = "hs-bytes";
+    r.authMode = rpc::AuthMode::Required; r.authState = rpc::AuthState::Anonymous;
+    r.bindToken = tokenOf(1);
+    std::vector<uint8_t> buf(128);
+    const std::size_t n = r.encode(buf.data());
+    const auto hdr = rpc::MessageHeader::decode(buf.data(), n);
+    ASSERT_TRUE(hdr.has_value());
+    EXPECT_EQ(hdr->blockLength, rpc::ConnectResponse::BODY_FIXED_V16);
+    std::size_t pos = rpc::MessageHeader::ENCODED_SIZE + hdr->blockLength;
+    const uint8_t* hb = nullptr; uint32_t hbLen = 0;
+    ASSERT_TRUE(rpc::getVarBytes32(buf.data(), n, pos, hb, hbLen));
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(hb), hbLen), "hs-bytes");
+    EXPECT_EQ(pos, n);
+}
+
+TEST(ConnectResponseBindTokenRegression, TruncatedV16FrameIsRejected) {
+    rpc::ConnectResponse r;
+    r.v9 = true; r.v16 = true; r.bindToken = tokenOf(2);
+    std::vector<uint8_t> buf(128);
+    const std::size_t n = r.encode(buf.data());
+    for (std::size_t cut = 0; cut < n; ++cut)
+        EXPECT_FALSE(rpc::ConnectResponse::decode(buf.data(), cut).has_value()) << "cut=" << cut;
+    EXPECT_TRUE(rpc::ConnectResponse::decode(buf.data(), n).has_value());
+}
+
+TEST(WorkerBindRegression, RoundTripAndEveryTruncationIsRefused) {
+    rpc::WorkerBind b;
+    b.sessionId = 0x1122334455667788; b.correlationId = 42; b.token = tokenOf(5);
+    std::array<uint8_t, 64> buf{};
+    const std::size_t n = b.encode(buf.data());
+    ASSERT_EQ(n, 40u);
+    EXPECT_EQ(rpc::WorkerBind::ENCODED_SIZE, 40u);
+    EXPECT_EQ(leU16(buf.data(), 2), 86u);
+    EXPECT_EQ(leS64(buf.data(), 8), b.sessionId) << "the session id sits where Produce carries it";
+    const auto d = rpc::WorkerBind::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->sessionId, b.sessionId);
+    EXPECT_EQ(d->correlationId, 42);
+    EXPECT_EQ(d->token, tokenOf(5));
+    for (std::size_t cut = 0; cut < 40; ++cut)
+        EXPECT_FALSE(rpc::WorkerBind::decode(buf.data(), cut).has_value()) << "cut=" << cut;
+    EXPECT_TRUE(rpc::isKnownTemplate(86));  // Dispatch.h
+}
+
+TEST(WorkerBindRegression, WrongTemplateOrSchemaOrShortBlockIsRefused) {
+    rpc::WorkerBind b; b.sessionId = 1; b.token = tokenOf(1);
+    std::array<uint8_t, 40> buf{};
+    b.encode(buf.data());
+    auto bad = buf; bad[2] = 87;          // template 87
+    EXPECT_FALSE(rpc::WorkerBind::decode(bad.data(), bad.size()).has_value());
+    bad = buf; bad[4] ^= 0x01;            // schema id
+    EXPECT_FALSE(rpc::WorkerBind::decode(bad.data(), bad.size()).has_value());
+    bad = buf; bad[0] = 8; bad[1] = 0;    // blockLength < 16
+    EXPECT_FALSE(rpc::WorkerBind::decode(bad.data(), bad.size()).has_value());
+}
+
+TEST(WorkerBindAckRegression, RoundTripAndEveryTruncationIsRefused) {
+    rpc::WorkerBindAck a;
+    a.sessionId = 0x1122334455667788; a.correlationId = 77;
+    std::array<uint8_t, 32> buf{};
+    const std::size_t n = a.encode(buf.data());
+    ASSERT_EQ(n, 24u);
+    EXPECT_EQ(rpc::WorkerBindAck::ENCODED_SIZE, 24u);
+    EXPECT_EQ(leU16(buf.data(), 2), 87u);
+    EXPECT_EQ(leS64(buf.data(), 8), a.sessionId);
+    EXPECT_EQ(leS64(buf.data(), 16), 77);
+    const auto d = rpc::WorkerBindAck::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->sessionId, a.sessionId);
+    EXPECT_EQ(d->correlationId, 77);
+    for (std::size_t cut = 0; cut < 24; ++cut)
+        EXPECT_FALSE(rpc::WorkerBindAck::decode(buf.data(), cut).has_value()) << "cut=" << cut;
+    // broker -> client only: an ingress never accepts it
+    EXPECT_FALSE(rpc::isKnownTemplate(87));
+    auto bad = buf; bad[2] = 86;
+    EXPECT_FALSE(rpc::WorkerBindAck::decode(bad.data(), n).has_value());
+    bad = buf; bad[4] ^= 0x01;
+    EXPECT_FALSE(rpc::WorkerBindAck::decode(bad.data(), n).has_value());
 }

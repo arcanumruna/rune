@@ -106,6 +106,10 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     ListNamespacesResponse  = 83,
     NamespaceUsage          = 84,
     NamespaceUsageResponse  = 85,
+    // NAT-safe egress (client version 16): the first frame of a response-mode client on a worker ingress publication
+    WorkerBind              = 86,
+    // broker -> client only: the worker's acknowledgement of a WorkerBind (never accepted on an ingress)
+    WorkerBindAck           = 87,
 };
 
 enum class ErrorCode : uint16_t {
@@ -365,7 +369,17 @@ inline constexpr int32_t kClientVersionNamespaces                 = 14;
 // budget, then ends the subscription / group consumer explicitly.  A broker answers a session below 15 NotAuthorized
 // instead: every older client ends a subscription or group fetch on it (never parks it).
 inline constexpr int32_t kClientVersionRecordEgressUnavailable      = 15;  // understands SubscribeResponse 49 (#450)
-inline constexpr int32_t kClientVersion                           = 15;  // what this protocol's client announces
+// 16 — NAT-safe egress (spec broker/docs/superpowers/specs/2026-10-26-rune-nat-egress-design.md D4): ConnectRequest
+// carries a trailing responseCorrelated byte. A v16 client ALWAYS sends its declared egressChannel together with
+// responseCorrelated = 1 (an older broker ignores the flag and answers on the declared channel); a broker >= 9
+// ignores the declared channel whenever the flag is 1 and answers only on an Aeron response publication correlated
+// with the request image, and its Metadata carries the response-control ports. A session below 16 keeps the
+// declared egressChannel path. A Redirect's message to a session >= 16 may end with `#<gateway response-control
+// port>`; absent = the leader has none (use the declared path).
+inline constexpr int32_t kClientVersionResponseEgress             = 16;
+inline constexpr int32_t kClientVersion                           = kClientVersionResponseEgress;  // what this protocol's client announces
+// client-cpp announces 16 (response egress, NAT plan Task 7); it sends responseCorrelated = 1 only when it has a
+// response publication for the endpoint (a gateway response-control port is configured / learnt).
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -397,13 +411,16 @@ enum class AuthState : uint8_t { MustAuthenticate = 0, ResumedAuthenticated = 1,
 //   7 — issue #116: opens client->broker frames per receiver (the gateway with the raw c2b key, shard worker w with
 //       deriveReceiverKey(c2b, w+1)) for sessions >= 12, drops a frame naming another receiver, and advertises each
 //       partition's ingressReceiverId to sessions >= 12 (see client version 12).
+//   9 — NAT-safe egress: answers a session >= 16 that sets responseCorrelated on a response publication and advertises
+//       response-control ports in Metadata (see client version 16).
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kBrokerVersionExplicitGroupSubscriptions = 3;
 inline constexpr int32_t kBrokerVersionAuth                       = 5;   // authentication (ConnectResponse v9 fields)
 inline constexpr int32_t kBrokerVersionFilter                     = 6;   // subscription filters (Phase 2c)
 inline constexpr int32_t kBrokerVersionReceiverKeys               = 7;   // per-receiver c2b keys (issue #116)
 inline constexpr int32_t kBrokerVersionNamespaces                 = 8;   // namespaces (client version 14)
-inline constexpr int32_t kBrokerVersion                           = 8;   // what this protocol's broker announces
+inline constexpr int32_t kBrokerVersionResponseEgress             = 9;   // NAT-safe egress (client version 16)
+inline constexpr int32_t kBrokerVersion                           = kBrokerVersionResponseEgress;   // what this protocol's broker announces
 
 /// Issue #116: true when a session whose client announced `clientVersion` and whose broker announced
 /// `brokerVersion` binds each encrypted client->broker frame to one receiver (see client version 12).

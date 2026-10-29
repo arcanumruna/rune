@@ -3,7 +3,7 @@ requirements:
   # reintroduce as a conan `requires` once CI publishes it.
   # NOTE: the `common` package (Agrona buffers) was scaffolded from the world-server template
   # but is unused — Rune uses Aeron's own ring buffers / IdleStrategy (see CLAUDE.md). Removed.
-  - "aeron/1.41.4"
+  - "aeron/1.51.0"
   - "spdlog/1.14.0"
   - "gtest/1.16.0"
   - "benchmark/1.8.2"

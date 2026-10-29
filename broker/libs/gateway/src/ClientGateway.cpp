@@ -1555,10 +1555,25 @@ int ClientGateway::retryPendingCryptoAnnounces_()
             pendingCryptoAnnounces_.pop_back();
             continue;
         }
-        if (sessionAnnouncer_.announce(*workerPool_, sid, s->egressChannel, s->egressStreamId,
+        // I-C: the branch is the SESSION's mode (workerResponse), never "has a non-zero token": a worker-response
+        // session without a token is never announced plain (that would admit produce from any image and answer to the
+        // client-declared address).  Unreachable (a zero derivation fails the connect), so end the session if it happens.
+        if (s->workerResponse && !s->hasBindToken()) [[unlikely]] {
+            pendingCryptoAnnounces_[i] = pendingCryptoAnnounces_.back();
+            pendingCryptoAnnounces_.pop_back();
+            ++bindTokenDeriveFailures_;
+            (void)closeSession_(sid, /*notifyExpired=*/true);
+            ++work;
+            continue;
+        }
+        if (sessionAnnouncer_.announce(*workerPool_, sid,
+                                        s->workerResponse ? std::string_view{} : std::string_view(s->egressChannel),
+                                        s->egressStreamId,
                                         s->clientVersion, /*sessionEncrypted=*/true, /*keyReady=*/true,
                                         s->crypto.b2c, s->crypto.b2cPrefix, s->crypto.cipher,
-                                        s->crypto.c2b, s->crypto.c2bPrefix)) {
+                                        s->crypto.c2b, s->crypto.c2bPrefix,
+                                        s->workerResponse ? &s->bindToken : nullptr)) {
+            ++cryptoKeyAnnounces_;
             ++work;
             pendingCryptoAnnounces_[i] = pendingCryptoAnnounces_.back();
             pendingCryptoAnnounces_.pop_back();
@@ -2127,12 +2142,14 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // none without one), so every follower Redirected every Connect.
     bool capturedIsLeader = true;
     std::string capturedLeaderEndpoint;
+    int32_t     capturedLeaderNodeId = -1;
     if (leaderView_ && sessionAdmission_ == SessionAdmission::ClusterLeaderOnly && !routingImage_) {
         // No per-partition routing image yet: use the Raft-leader gate (Path B /
         // pre-MD1 bootstrap).  Raft followers redirect sessions to the Raft leader.
         const LeaderView lv = leaderView_();
         capturedIsLeader        = lv.isLeader;
         capturedLeaderEndpoint  = lv.leaderClientEndpoint;
+        capturedLeaderNodeId    = lv.leaderNodeId;
 
         // NOTE: the REDIRECT case (!isLeader && !leaderClientEndpoint.empty()) is
         // handled by the SAME async pending-connect machinery as the leader-accept
@@ -2196,11 +2213,48 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     pc_entry.requestedAtNs         = nowNs;
     pc_entry.isLeader              = capturedIsLeader;
     pc_entry.leaderClientEndpoint  = std::move(capturedLeaderEndpoint);
+    pc_entry.leaderNodeId          = capturedLeaderNodeId;
     pc_entry.egressChannel         = std::string(req.egressChannel);
     pc_entry.egressStreamId        = req.egressStreamId;
+    // NAT-safe egress (spec D2): a v16 client that sets responseCorrelated is answered on an Aeron response
+    // publication correlated with THIS request image - never on the declared channel.
+    {
+        const auto image = (sub_ != nullptr && currentImageSessionId_ != 0)
+                               ? sub_->imageBySessionId(currentImageSessionId_) : nullptr;
+        if (image) pc_entry.sourceIdentity = image->sourceIdentity();
+        const bool wantsResponse = req.clientVersion >= pc::kClientVersionResponseEgress && req.responseCorrelated;
+        // Shard mode (Task 6): the workers answer on response publications of their own, so response mode also needs
+        // this node's worker response-control base; without it the whole session stays on the declared path.
+        const bool workersReady = !shardMode_ || workerResponseBaseOf_(thisNodeId_) > 0;
+        pc_entry.responseEgress = wantsResponse && !responseControlEndpoint_.empty() && image != nullptr && workersReady;
+        if (pc_entry.responseEgress && shardMode_) {
+            pc_entry.workerResponse = true;
+            if (!rune::crypto::randomBytes(std::span<uint8_t>(pc_entry.bindToken)) ||
+                std::all_of(pc_entry.bindToken.begin(), pc_entry.bindToken.end(), [](uint8_t b) { return b == 0; })) [[unlikely]] {
+                pc_entry.bindToken = {};
+                pc_entry.workerResponse = false;
+                pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::Internal);
+                spdlog::critical("ClientGateway: randomBytes failed drawing a worker bind token; Connect refused (Internal)");
+            }
+        }
+        if (pc_entry.responseEgress) {
+            pc_entry.replyChannel = "aeron:udp?control=" + responseControlEndpoint_ +
+                                    "|control-mode=response|response-correlation-id=" +
+                                    std::to_string(image->correlationId());
+        } else {
+            pc_entry.replyChannel = pc_entry.egressChannel;
+            if (wantsResponse) {
+                const bool noPort = responseControlEndpoint_.empty() || !workersReady;
+                if (unauthLog_.due(noPort ? 16 : 17)) [[unlikely]]
+                    spdlog::warn("ClientGateway: response egress unavailable ({}); answering on the declared channel",
+                                 noPort ? "no gateway / worker response-control port configured" : "no request image");
+            }
+        }
+    }
     pc_entry.clientVersion         = req.clientVersion;   // D6
     pc_entry.sourceHost            = std::move(connectHost);   // every entry: the eviction's fairness key
-    if (channelTooLongForShard) [[unlikely]]
+    // A worker-response session ships no channel to the workers: the declared one's length is moot.
+    if (channelTooLongForShard && !pc_entry.workerResponse) [[unlikely]]
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
     if (refusedForVersion) [[unlikely]]
         pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::ProtocolVersion);   // wins over any other refusal
@@ -2291,7 +2345,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // cold resolver (never by a driver conductor on a duty thread); the session
     // stays pending — bounded by the connect timeout — until the hub answers.
     const std::string_view replyHost = rune::consensus::PeerHostTable::endpointHost(pc_entry.egressChannel);
-    if (hostResolver_.valid() && !replyHost.empty() &&
+    if (!pc_entry.responseEgress && hostResolver_.valid() && !replyHost.empty() &&
         !rune::consensus::PeerHostTable::isNumericHost(replyHost)) [[unlikely]] {
         pc_entry.awaitingResolve = true;
         // Fix round 3 (concern 2): a momentarily full resolve ring no longer
@@ -2355,7 +2409,7 @@ bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
         // A10: sparse terms — the gateway runs on a worker thread in fused placement, where a non-sparse
         // term's tmpfs fallocate fails with EINTR while io_uring completions are pending (withSparseTerms).
         pending.registrationId = aeron_->addExclusivePublication(
-            rune::node::withSparseTerms(pending.egressChannel), pending.egressStreamId);
+            rune::node::withSparseTerms(pending.replyChannel), pending.egressStreamId);
     } catch (...) {
         // Bad channel — drop (never crash).
         spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel {}; dropping Connect",
@@ -2400,6 +2454,7 @@ int ClientGateway::pollHostResolutions_()
             char buf[INET_ADDRSTRLEN] = {};
             ::inet_ntop(AF_INET, &a, buf, sizeof buf);
             it->egressChannel   = rune::consensus::PeerHostTable::withEndpointHost(it->egressChannel, buf);
+            it->replyChannel    = it->egressChannel;   // only a declared-path entry ever awaits a resolve
             it->awaitingResolve = false;
             if ((shardMode_ && it->egressChannel.size() > rune::node::SessionAckSink::kMaxChannelBytes) ||
                 !registerConnectEgress_(*it)) {
@@ -2486,13 +2541,19 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         // Try to find the publication (non-blocking).
         std::shared_ptr<aeron::ExclusivePublication> pub;
         try {
-            if (aeron_) pub = aeron_->findExclusivePublication(pending.registrationId);   // test gateway: stashed pub
-        } catch (...) {
+            if (aeron_ && !pending.resolvedPub) pub = aeron_->findExclusivePublication(pending.registrationId);   // test gateway: stashed pub
+        } catch (const std::exception& e) {
             // ERRORED_MEDIA_DRIVER: conductor signalled an error (bad channel, etc.).
             // The conductor erased its own entry when throwing — no registration leak.
+            spdlog::warn("ClientGateway: findExclusivePublication threw for session={}: {}; dropped",
+                         pending.sessionId, e.what());
+            closeDroppedPendingConnect_(pending);   // fix round 1 (I2): every drop site
+            it = pendingConnects_.erase(it);
+            continue;
+        } catch (...) {
             spdlog::warn("ClientGateway: findExclusivePublication threw for session={}; dropped",
                          pending.sessionId);
-            closeDroppedPendingConnect_(pending);   // fix round 1 (I2): every drop site
+            closeDroppedPendingConnect_(pending);
             it = pendingConnects_.erase(it);
             continue;
         }
@@ -2541,12 +2602,16 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             err.sessionId     = 0;
             err.correlationId = pending.correlationId;
             err.code          = static_cast<int16_t>(pc::ErrorCode::Redirect);
-            err.message       = pending.leaderClientEndpoint;
+            // NAT-safe egress (spec D3): a session >= 16 learns the leader's gateway response-control port.
+            char targetBuf[kRedirectTargetCap];
+            const std::string_view redirectMessage = redirectTarget_(pending.clientVersion, pending.leaderClientEndpoint,
+                                                                     pending.leaderNodeId, targetBuf, sizeof targetBuf);
+            err.message = redirectMessage;
 
             // Guard: message must fit in scratch (encode would overflow otherwise).
             const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
                                        pc::ErrorResponse::BODY_FIXED + 2 +
-                                       pending.leaderClientEndpoint.size();
+                                       redirectMessage.size();
             if (needed > scratch_.size()) {
                 // Fix round 2: a pathological endpoint length is never a silent
                 // drop — the client gets the bare NotLeader (no endpoint).
@@ -2607,10 +2672,12 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                 // retry (see pending.tls.has_value() below: true only for a
                 // connect still attempting crypto — see shouldEngageCrypto).
                 if (!sessionAnnouncer_.announce(*workerPool_, pending.sessionId,
-                                                pending.egressChannel, pending.egressStreamId,
+                                                pending.workerResponse ? std::string_view{} : std::string_view(pending.egressChannel),
+                                                pending.egressStreamId,
                                                 pending.clientVersion,
                                                 /*sessionEncrypted=*/pending.tls.has_value(),
-                                                /*keyReady=*/false)) {
+                                                /*keyReady=*/false, {}, nullptr, rune::crypto::Cipher::None, {}, nullptr,
+                                                pending.workerResponse ? &pending.bindToken : nullptr)) {
                     ++it;
                     continue;   // a worker ring is full — retry next cycle
                 }
@@ -2637,6 +2704,13 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                 resp.authMode = authMode_ == rune::gateway::GatewayAuthMode::Required ? pc::AuthMode::Required
                                                                                        : pc::AuthMode::DevDisabled;
                 resp.authState = connectAuthState_();
+            }
+            if (pending.workerResponse) {
+                resp.v16       = true;   // NAT-safe egress (Task 6): the token the client's WorkerBind must prove
+                // I3: a TLS session's token never crosses the wire - both ends derive it from the TLS-exported keys
+                // (rune::crypto::deriveWorkerBindToken); the first leg carries the all-zero "derive it" marker.  The
+                // random first-wave token (announced to the workers) is never disclosed.
+                resp.bindToken = pending.tls ? std::array<uint8_t, 16>{} : pending.bindToken;
             }
             if (pending.tls) {
                 // client<->broker TLS/AEAD (Task 7): offer the chosen cipher +
@@ -2693,7 +2767,10 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                       pending.clientVersion);
         {
             Session* added = sessions_.find(pending.sessionId);
-            added->sourceHost = std::move(pending.sourceHost);
+            added->sourceHost     = std::move(pending.sourceHost);
+            added->sourceIdentity = std::move(pending.sourceIdentity);
+            added->bindToken      = pending.bindToken;   // Task 6: all-zero unless a worker-response session
+            added->workerResponse = pending.workerResponse;
         }
 
         it = pendingConnects_.erase(it);
@@ -2819,7 +2896,24 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     // sentinel — Cipher::None means "do not trust these keys", never install
     // an all-zero AeadCipher.
     const rune::crypto::SessionKeys keys = pending.tls->exportKeys(pending.chosenCipher, pending.sessionId);
-    if (keys.cipher == rune::crypto::Cipher::None) {
+    // I-C: a worker-response TLS session binds with the token derived from its keys.  A derivation that fails (HKDF) or
+    // yields all-zero must never be announced: an all-zero token is the one the first leg "disclosed", so it would let
+    // anyone who guesses the sequential session id bind the session's worker image.  The connect fails like a failed
+    // handshake (the client reconnects, evidence-based).
+    std::array<uint8_t, 16> derivedBindToken{};
+    bool bindDeriveFailed = false;
+    if (keys.cipher != rune::crypto::Cipher::None && pending.workerResponse) {
+        derivedBindToken = forceZeroDerivedBindTokenForTest_ ? std::array<uint8_t, 16>{}
+                                                             : rune::crypto::deriveWorkerBindToken(keys, pending.sessionId);
+        bindDeriveFailed = std::all_of(derivedBindToken.begin(), derivedBindToken.end(), [](uint8_t b) { return b == 0; });
+        if (bindDeriveFailed) {
+            ++bindTokenDeriveFailures_;
+            if (unauthLog_.due(21)) [[unlikely]]
+                spdlog::error("ClientGateway: the worker bind token of session {} could not be derived; the connect fails",
+                              pending.sessionId);
+        }
+    }
+    if (keys.cipher == rune::crypto::Cipher::None || bindDeriveFailed) {
         pc::HandshakeContinueResponse fail;
         fail.sessionId     = pending.sessionId;
         fail.correlationId = hc.correlationId;
@@ -2841,7 +2935,13 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     Session& session = sessions_.add(pending.sessionId, std::move(pending.resolvedPub), std::move(pending.auth), nowNs,
                                       pending.egressChannel, pending.egressStreamId,
                                       pending.clientVersion);
-    session.sourceHost = std::move(pending.sourceHost);
+    session.sourceHost     = std::move(pending.sourceHost);
+    session.sourceIdentity = std::move(pending.sourceIdentity);
+    // I3: a worker-response TLS session binds with the token derived from its keys (see the first-leg ConnectResponse);
+    // the keyReady announce below replaces the random first-wave token the workers hold while awaiting the bind.
+    if (pending.workerResponse) pending.bindToken = derivedBindToken;
+    session.bindToken      = pending.bindToken;   // Task 6: all-zero unless a worker-response session
+    session.workerResponse = pending.workerResponse;
     // The TLS handshake took time: the login deadline runs from the moment the session exists.
     if (auto* first = std::get_if<rune::gateway::AuthAwaitingFirst>(&session.auth)) first->deadlineNs = nowNs + authTimeoutNs_;
     session.crypto.cipher = keys.cipher;
@@ -2874,12 +2974,16 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     // Retried from doWork() (retryPendingCryptoAnnounces_) until complete —
     // a liveness concern only, never a safety one, by the above invariant.
     if (shardMode_ && workerPool_ &&
-        !sessionAnnouncer_.announce(*workerPool_, pending.sessionId, pending.egressChannel,
+        !sessionAnnouncer_.announce(*workerPool_, pending.sessionId,
+                                     pending.workerResponse ? std::string_view{} : std::string_view(pending.egressChannel),
                                      pending.egressStreamId, pending.clientVersion,
                                      /*sessionEncrypted=*/true, /*keyReady=*/true,
                                      session.crypto.b2c, session.crypto.b2cPrefix, session.crypto.cipher,
-                                     session.crypto.c2b, session.crypto.c2bPrefix)) {
+                                     session.crypto.c2b, session.crypto.c2bPrefix,
+                                     pending.workerResponse ? &pending.bindToken : nullptr)) {
         pendingCryptoAnnounces_.push_back(pending.sessionId);
+    } else if (shardMode_ && workerPool_) {
+        ++cryptoKeyAnnounces_;
     }
 
     pendingConnects_.erase(it);
@@ -2902,8 +3006,8 @@ void ClientGateway::abandonRegistration_(int64_t regId) noexcept
 // drainPendingReleases — poll registrations that were logically dropped before
 // their ExclusivePublication resolved, to complete the release.
 //
-// Release mechanism (Aeron C++ 1.41.4, ExclusivePublication.cpp line 62-65):
-//   ~ExclusivePublication() { m_conductor.releaseExclusivePublication(m_registrationId); }
+// Release mechanism (Aeron 1.51.0 C++ wrapper, ExclusivePublication.h):
+//   ~ExclusivePublication() { aeron_exclusive_publication_close(m_publication, nullptr, nullptr); }
 // So: obtaining a shared_ptr via findExclusivePublication and letting it drop
 // is the ONLY correct release path for a registration that is still in
 // AWAITING_MEDIA_DRIVER state.  Once the conductor transitions it to
@@ -2922,15 +3026,14 @@ void ClientGateway::drainPendingReleases()
     // an unresolved entry re-introduces the registration leak this table prevents).
     {
         static constexpr std::size_t kDrainWarnThreshold = 4 * kMaxPendingConnects;
-        static bool sWarned = false;
         const std::size_t drainSz = drainingRegistrations_.size();
-        if (drainSz > kDrainWarnThreshold && !sWarned) {
+        if (drainSz > kDrainWarnThreshold && !drainWarned_) {
             spdlog::warn("ClientGateway: drainingRegistrations_ size {} exceeds {}×kMaxPendingConnects={}; "
                          "possible stuck driver entry — investigate Aeron media driver state",
                          drainSz, 4u, kMaxPendingConnects);
-            sWarned = true;
+            drainWarned_ = true;
         } else if (drainSz <= kDrainWarnThreshold) {
-            sWarned = false; // reset so the warning fires again if it grows again
+            drainWarned_ = false; // reset so the warning fires again if it grows again
         }
     }
 
@@ -3545,17 +3648,20 @@ bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& s
     // position.  Group-member partition subscriptions (bit-61 correlation ids)
     // ride per-leader sessions and keep the NotLeader their re-route handles.
     constexpr int64_t kGroupFetchCorrTag = int64_t{1} << 61;   // rune-client GroupConsumerHub
+    char movedTargetBuf[kRedirectTargetCap];   // I6: the "#<port>" suffixed target lives in this frame
     if (pc::clientUnderstandsMovedPositionNote(session->clientVersion) &&
         (sub.subscribeCorrId & kGroupFetchCorrTag) == 0 && routingImage_) {
         const auto& entry = routingImage_->lookup(rune::metadata::gpidOf(sub.topicId, sub.partition));
         if (entry.leaderNodeId != rune::metadata::RoutingImage::NO_LEADER_NODE_ID &&
             entry.leaderNodeId != thisNodeId_) {
             if (const auto ep = nodeEndpointMap_.find(entry.leaderNodeId);
-                ep != nodeEndpointMap_.end() && !ep->second.empty() &&
-                pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + ep->second.size() <=
-                    scratch_.size()) {
-                err.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-                err.message = ep->second;
+                ep != nodeEndpointMap_.end() && !ep->second.empty()) {
+                const std::string_view target =
+                    redirectTarget_(session->clientVersion, ep->second, entry.leaderNodeId, movedTargetBuf, sizeof movedTargetBuf);
+                if (pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + target.size() <= scratch_.size()) {
+                    err.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
+                    err.message = target;
+                }
             }
         }
     }
@@ -3689,11 +3795,12 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         pc::ErrorResponse errResp;
         errResp.sessionId     = msg.sessionId;
         errResp.correlationId = corrId;
+        char targetBuf[kRedirectTargetCap];
         if (!endpoint.empty()) {
             errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-            errResp.message = endpoint;
+            errResp.message = redirectTarget_(session->clientVersion, endpoint, -1, targetBuf, sizeof targetBuf);
             spdlog::debug("ClientGateway: Produce per-partition redirect sessionId={} → {}",
-                          msg.sessionId, endpoint);
+                          msg.sessionId, errResp.message);
         } else {
             errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             spdlog::debug("ClientGateway: Produce per-partition NotLeader (endpoint unknown) sessionId={}",
@@ -4457,7 +4564,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 // it, so neither can drop a field (the retry used to omit the Subscribe's
 // correlationId — every push then carried 0 — and the replica).
 rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub,
-                                                      std::span<const uint8_t> filter) const
+                                                      std::span<const uint8_t> filter, bool sessionEgress) const
 {
     rune::storage::Log* log = topicRegistry_ ? topicRegistry_->log(s.topicId, s.partition) : nullptr;
     const rune::replication::PartitionReplica* rep =
@@ -4477,6 +4584,7 @@ rune::node::WorkerOp ClientGateway::buildSubscribeOp_(const BufferedSubscribe& s
     op.logPtr               = log;
     op.replica              = const_cast<rune::replication::PartitionReplica*>(rep);
     op.egressPub            = egressPub;
+    op.sessionEgress        = sessionEgress;   // NAT-safe egress (Task 6): Records ride the session's response publication
     // Phase 2c: the filter rides the op's tail (a view valid for the synchronous enqueue - the caller's bytes outlive it).
     op.filterBytes          = filter;
     return op;
@@ -4498,13 +4606,13 @@ void ClientGateway::releaseAwaiting_(const BufferedSubscribe& s, void* egressPub
     enqueueSubscribeOp_(s, egressPub);
 }
 
-void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub)
+void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub, bool sessionEgress)
 {
     // Issue #118 (X020, M10): the ONE place a Subscribe without its own record egress would reach a worker - which then
     // pushes on its shared dynamic-MDC publication, received by every party joined to the worker's advertised control
     // port.  Under authentication that is a disclosure to principals without READ: the subscription is retired
     // retriably instead (never a fallback).
-    if (egressPub == nullptr && authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
+    if (egressPub == nullptr && !sessionEgress && authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
         retireWithoutRecordEgress_(s.subId);
         return;
     }
@@ -4515,14 +4623,15 @@ void ClientGateway::enqueueSubscribeOp_(const BufferedSubscribe& s, void* egress
     // The live record's filter (this enqueue is synchronous); a queued retry carries its own copy, taken below.
     std::span<const uint8_t> filter;
     if (const auto it = subscriptions_.find(s.subId); it != subscriptions_.end()) filter = std::span<const uint8_t>(it->second.filter);
-    rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub, filter);
+    rune::node::WorkerOp op = buildSubscribeOp_(s, egressPub, filter, sessionEgress);
 
     // M5: never dropped — a refused Subscribe (or one behind a queued lifecycle
     // op for the same worker) is queued and retried every doWork, in order.
     const auto w = static_cast<std::size_t>(workerPool_->ownerWorkerId(s.topicId, s.partition));
     const bool behind = w < pendingSubOps_.size() && !pendingSubOps_[w].empty();
     if (behind || !workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op))) {
-        queueSubOp_(w, SubOpSubscribe{s, egressPub == nullptr ? EgressRoute::Mdc : EgressRoute::Unicast,
+        queueSubOp_(w, SubOpSubscribe{s, sessionEgress ? EgressRoute::Session
+                                       : egressPub == nullptr ? EgressRoute::Mdc : EgressRoute::Unicast,
                                       std::vector<uint8_t>(filter.begin(), filter.end())});
     }
 }
@@ -4557,6 +4666,12 @@ bool ClientGateway::trySubOp_(std::size_t w, const PendingSubOp& p)
             const auto& s = sp.sub;
             // Re-resolve the egress publication NOW (never a pointer held across cycles).
             void* egressPub = nullptr;
+            if (sp.route == EgressRoute::Session) {
+                // NAT-safe egress (Task 6): no pointer at all - the worker looks the session's response publication up.
+                if (!g.sessions_.find(s.sessionId)) return true;   // session gone: moot
+                rune::node::WorkerOp op = g.buildSubscribeOp_(s, nullptr, sp.filter, /*sessionEgress=*/true);
+                return g.workerPool_->tryEnqueueOp(s.topicId, s.partition, std::move(op));
+            }
             if (sp.route == EgressRoute::Mdc && g.authMode_ == rune::gateway::GatewayAuthMode::Required) [[unlikely]] {
                 // Issue #118: never queued under authentication (enqueueSubscribeOp_ retires it); defensive - nothing is sent.
                 g.retireWithoutRecordEgress_(s.subId);
@@ -4631,6 +4746,12 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
     //     control thread.
     if (!sess || !workerPool_) {
         enqueueSubscribeOp_(s, nullptr);   // under authentication: retired (issue #118)
+        return;
+    }
+    // NAT-safe egress (Task 6): a response-mode session's Records ride ITS worker response publication - no record
+    // egress to resolve, no shared-egress fallback ever.  The worker holds the subscription until the client binds.
+    if (sess->workerResponse) [[unlikely]] {
+        enqueueSubscribeOp_(s, nullptr, /*sessionEgress=*/true);
         return;
     }
     const bool authRequired = authMode_ == rune::gateway::GatewayAuthMode::Required;
@@ -5423,7 +5544,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     if (workerPushed && authMode_ == rune::gateway::GatewayAuthMode::Required) {
         const int32_t wid = workerPool_->ownerWorkerId(msg.topicId, partition);
         const auto eg = session->recordEgressByWorker.find(wid);
-        sub.okOwed        = eg == session->recordEgressByWorker.end() || !eg->second;
+        sub.okOwed        = !session->workerResponse && (eg == session->recordEgressByWorker.end() || !eg->second);
         sub.okOwedLineage = sub.okOwed && served.kind == ServedPartition::Kind::Transient;
     }
     const bool okOwed = sub.okOwed;
@@ -5732,6 +5853,23 @@ ClientGateway::CatalogRoom ClientGateway::catalogEgressRoom(int64_t sessionId)
     return w >= need ? CatalogRoom::Ready : CatalogRoom::NotYet;
 }
 
+std::string_view ClientGateway::redirectTarget_(int32_t clientVersion, std::string_view endpoint, int32_t nodeId,
+                                                char* buf, std::size_t cap) const noexcept
+{
+    if (clientVersion < pc::kClientVersionResponseEgress || endpoint.empty()) return endpoint;
+    if (nodeId < 0) {
+        for (const auto& [id, ep] : nodeEndpointMap_) {
+            if (ep == endpoint) { nodeId = id; break; }
+        }
+        if (nodeId < 0) return endpoint;
+    }
+    const int32_t port = gatewayResponsePortOf_(nodeId);
+    if (port <= 0) return endpoint;
+    const int n = std::snprintf(buf, cap, "%.*s#%d", static_cast<int>(endpoint.size()), endpoint.data(), port);
+    if (n <= 0 || static_cast<std::size_t>(n) >= cap) return endpoint;   // does not fit: the bare endpoint
+    return std::string_view(buf, static_cast<std::size_t>(n));
+}
+
 // Task 22 fix round 1 (C1): the shared Redirect / NotLeader refusal (the body of
 // handleSubscribe's former sendSubRedirect lambda, DRY with GetViewRow).
 void ClientGateway::sendRouteRefusal_(Session& s, int64_t sessionId, int64_t corr, std::string_view endpoint)
@@ -5739,10 +5877,11 @@ void ClientGateway::sendRouteRefusal_(Session& s, int64_t sessionId, int64_t cor
     pc::ErrorResponse errResp;
     errResp.sessionId     = sessionId;
     errResp.correlationId = corr;
+    char targetBuf[kRedirectTargetCap];
     if (!endpoint.empty()) {
         errResp.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-        errResp.message = endpoint;
-        spdlog::debug("ClientGateway: per-partition redirect sessionId={} → {}", sessionId, endpoint);
+        errResp.message = redirectTarget_(s.clientVersion, endpoint, -1, targetBuf, sizeof targetBuf);
+        spdlog::debug("ClientGateway: per-partition redirect sessionId={} → {}", sessionId, errResp.message);
     } else {
         errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
         spdlog::debug("ClientGateway: per-partition NotLeader (endpoint unknown) sessionId={}", sessionId);
@@ -7999,7 +8138,9 @@ bool ClientGateway::redirectToCoordinator_(Session& session, int64_t correlation
     errResp.sessionId     = session.sessionId;
     errResp.correlationId = correlationId;
     errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
-    errResp.message       = lv.leaderClientEndpoint;
+    char targetBuf[kRedirectTargetCap];
+    errResp.message       = redirectTarget_(session.clientVersion, lv.leaderClientEndpoint, lv.leaderNodeId,
+                                            targetBuf, sizeof targetBuf);
     const std::size_t needed = pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 +
                                errResp.message.size();
     if (needed > scratch_.size()) return false;
@@ -8113,7 +8254,7 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
     rune::gateway::DdlMetaView m;
     m.targetNsId    = targetNsId;   // namespaces Task 10: the object's resolved namespace (kHiddenNsId = answered missing)
     m.sessionId     = sessionId;
-    m.sourceAddress = session.egressChannel;
+    m.sourceAddress = session.sourceIdentity;   // the Connect image's source, never the declared channel (#227)
     // The authenticated user (Task 11; Task 12 makes the catalog principal carry it too): a view into the session's
     // auth state, copied by the admin ring submit before this frame's handler returns.
     if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) m.authenticated = a->user;
@@ -8192,6 +8333,7 @@ bool ClientGateway::ddlRouted_(const uint8_t* buf, std::size_t len, const rune::
     err.sessionId     = hdr->sessionId;
     err.correlationId = hdr->correlationId;
     char haltedText[64];
+    char targetBuf[kRedirectTargetCap];
     if (halted != nullptr) {
         // Spec §9: never a redirect — the leader may be healthy, THIS broker is not.
         const int n = std::snprintf(haltedText, sizeof haltedText, "%s apply halted at offset %lld",
@@ -8200,7 +8342,7 @@ bool ClientGateway::ddlRouted_(const uint8_t* buf, std::size_t len, const rune::
         err.message = std::string_view(haltedText, n > 0 ? static_cast<std::size_t>(n) : 0u);
     } else if (remote != nullptr && !remote->leaderClientEndpoint.empty()) {
         err.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
-        err.message = remote->leaderClientEndpoint;
+        err.message = redirectTarget_(session->clientVersion, remote->leaderClientEndpoint, -1, targetBuf, sizeof targetBuf);
     } else {
         err.code = static_cast<int16_t>(pc::ErrorCode::NotLeader);   // retriable: no leader known yet
     }
@@ -10212,7 +10354,7 @@ void ClientGateway::handleSecurityBootstrap(const uint8_t* buf, std::size_t len)
     if (proof != BootstrapProof::Ok) {
         ++bootstrapsRefused_;
         if (unauthLog_.due(3)) [[unlikely]]   // X103: an unauthenticated session drives this
-            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", LogSafeName{session->egressChannel},
+            spdlog::warn("security: bootstrap refused from {}: bad cluster-key proof{}", LogSafeName{session->sourceIdentity},
                          proof == BootstrapProof::NoKey ? " (this broker holds no cluster key: authentication is not enabled)" : "");
         pc::DdlResponse r;
         r.sessionId     = m.sessionId;
@@ -10889,6 +11031,7 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     for (const auto& [nodeId, channel] : nodeEndpointMap_) {
         pc::BrokerEntry b;
         b.nodeId = nodeId;
+        b.responseControlPort = gatewayResponsePortOf_(nodeId);   // NAT-safe egress (0 = none)
 
         // Parse "aeron:udp?endpoint=host:port" → host, port.
         // We look for "endpoint=" and then split on the last ':'.
@@ -11075,6 +11218,12 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             // sessions >= 12 (MetadataResponse::clientVersion below).
             if (workerPool_ && (!p.ingressEndpoint.empty() || (!shardMode_ && perWorkerIngressActive_)))
                 p.ingressReceiverId = static_cast<uint8_t>(workerPool_->ownerWorkerId(srcTopicId, partition) + 1);
+            // NAT-safe egress (Task 6): the LEADER's owning-worker response-control port (its base + the owning worker),
+            // where a v16 client opens the response subscription its WorkerBind correlates with.  0 = none (legacy
+            // mode / base unset: the encoder then drops the trailer's port).
+            if (shardMode_ && workerPool_)
+                if (const int32_t rbase = workerResponseBaseOf_(entry.leaderNodeId); rbase > 0)
+                    p.responseControlPort = rbase + workerPool_->ownerWorkerId(srcTopicId, partition);
             parts.push_back(p);
             }   // alias
         }

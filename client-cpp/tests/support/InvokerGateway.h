@@ -34,6 +34,7 @@
 #include <Subscription.h>
 
 #include <cstdint>
+#include <array>
 #include <chrono>
 #include <deque>
 #include <functional>
@@ -58,6 +59,7 @@ struct InvokerGateway {
         int32_t     leaderEpoch     = 1;
         int32_t     ingressStreamId = 0;
         std::string ingressEndpoint;  // "host:port" of the owning worker; "" = node (Task 16)
+        int32_t     responseControlPort = 0; // NAT-safe egress: the owning worker's response-control port (0 = none)
     };
     struct Produced {
         int32_t topicId;
@@ -90,7 +92,8 @@ struct InvokerGateway {
     // Re-review 1 (NEW-1): more advertised brokers (nodeId, host, port) besides node 0;
     // holdMetadata: MetadataRequests are counted (corrIds kept), never answered —
     // the test sends each MetadataResponse itself (sendMetadata), in any order.
-    struct BrokerAd { int32_t nodeId = 1; std::string host; int32_t port = 0; };
+    struct BrokerAd { int32_t nodeId = 1; std::string host; int32_t port = 0; int32_t responseControlPort = 0; };
+    int32_t brokerResponsePort = 0;   // NAT-safe egress: node 0's gateway response-control port in Metadata (0 = none)
     std::vector<BrokerAd> moreBrokers;
     bool                  holdMetadata = false;
     std::vector<int64_t>  metadataCorrIds;  // correlationIds of the MetadataRequests received
@@ -278,6 +281,70 @@ struct InvokerGateway {
         for (auto& [node, set] : sessionsAtNode) set.erase(sid);
         authState_.erase(sid);
     }
+    // ---- NAT-safe egress (Task 7): Aeron response channels, as the broker serves them ---------------------------
+    // responseCtl[endpoint] = "host:port" of that endpoint's response-control port (empty map = the historical fake,
+    // everything below inert).  A v16 Connect with responseCorrelated = 1 at such an endpoint (and an advertised
+    // broker version >= 9) is answered ONLY on a response publication correlated with the request image; replies to
+    // that session from that endpoint follow its route.  A worker endpoint (bindGate) additionally mirrors the
+    // broker's WorkerBind rule: produce for a response-mode session is dropped unless the SAME image first sent a
+    // valid WorkerBind (sid + the token the Connect issued), which is accepted once per session.
+    std::map<int, std::string> responseCtl;
+    std::set<int>              bindGate;            ///< endpoints that refuse produce before a valid WorkerBind
+    bool                       issueBindToken = false;   ///< response-mode Connects get a v16 bindToken
+    std::map<int, std::string> connectRedirect;     ///< endpoint -> Redirect message answered to every Connect there
+    std::map<int64_t, std::array<uint8_t, 16>> bindTokens;   ///< session -> issued token (TLS: derived at handshake completion)
+    std::vector<std::array<uint8_t, 16>> connectWireTokens;  ///< the v16 tail token of every first-leg ConnectResponse
+    struct BindRecord {
+        int endpoint = 0; int32_t imageSid = 0; int64_t sessionId = 0; std::array<uint8_t, 16> token{};
+        bool firstOnImage = false; bool accepted = false;
+    };
+    std::vector<BindRecord> binds;
+    // I2: the worker acknowledges every accepted (or repeated) WorkerBind with a plaintext WorkerBindAck.
+    int bindAcksToDrop = 0;       ///< test seam: swallow this many acks (a lost datagram)
+    int bindAcksSent = 0, bindAcksDropped = 0;
+    bool noBindAcks = false;      ///< test seam: never acknowledge (an old/refusing worker)
+    void ackBind_(int endpoint, const rune::protocol::client::WorkerBind& b) {
+        if (noBindAcks) return;
+        if (bindAcksToDrop > 0) { --bindAcksToDrop; ++bindAcksDropped; return; }
+        sendBindAck(endpoint, b.sessionId, b.correlationId);
+    }
+    /// A WorkerBindAck for (sid, corr) to the response publication of `endpoint` / the session's route (test seam:
+    /// also used to forge stale / foreign acks).  PLAINTEXT even on an encrypted session (never sealed).
+    void sendBindAck(int endpoint, int64_t sid, int64_t corr) {
+        rune::protocol::client::WorkerBindAck ack;
+        ack.sessionId = sid; ack.correlationId = corr;
+        uint8_t f[rune::protocol::client::WorkerBindAck::ENCODED_SIZE];
+        const std::size_t n = ack.encode(f);
+        std::vector<uint8_t> frame(f, f + n);
+        if (!offerNow(endpoint, frame)) outbox.emplace_back(endpoint, std::move(frame));
+        ++bindAcksSent;
+    }
+
+    int bindsRefused = 0;
+    int producesBeforeBind = 0;                      ///< produce frames dropped by the bind gate
+    std::map<std::pair<int, int32_t>, std::vector<uint16_t>> framesOnImage;   ///< (endpoint, image) -> templates in order
+    std::vector<bool> connectFlags;                  ///< ConnectRequest.responseCorrelated of every Connect
+    int responseConnects = 0;                        ///< Connects answered on a response publication
+    std::vector<std::vector<uint8_t>> workerBindFrames;   ///< every WorkerBind frame as it arrived (plaintext check)
+    struct RespPub { int64_t reg = -1; std::shared_ptr<aeron::ExclusivePublication> pub; };
+    /// (endpoint, request image | generation << 32) -> response publication.  A real gateway opens a NEW response
+    /// publication per ConnectRequest (PendingConnect), so a second Connect on the same request image gets a second
+    /// publication: Aeron pins the client's response subscription to the first one that connects.
+    std::map<std::pair<int, int64_t>, RespPub> respPubs_;
+    std::map<std::pair<int, int32_t>, int> respGen_;               ///< (endpoint, image) -> current publication generation
+    std::map<std::pair<int, int64_t>, int> respConnectGen_;        ///< (endpoint, connect corr) -> the generation it opened
+    int holdConnectAnswers = 0;                                    ///< test knob: the next N Connect answers are held
+    std::vector<std::pair<int, std::vector<uint8_t>>> heldConnectAnswers;   ///< (endpoint, frame) held by the knob
+    /// Releases every held Connect answer (it leaves on the publication its Connect opened).
+    void releaseHeldConnectAnswers() {
+        auto held = std::move(heldConnectAnswers);
+        heldConnectAnswers.clear();
+        for (auto& [ep, f] : held) send(ep, f.data(), f.size());
+    }
+    std::map<std::pair<int, int64_t>, int32_t> respRoute_;         ///< (endpoint, session) -> request image
+    std::map<std::pair<int, int64_t>, int32_t> respConnectRoute_;  ///< (endpoint, connect correlation id) -> request image
+    std::pair<int, int32_t> currentImage_{-1, 0};                  ///< (endpoint, image) of the frame being handled
+    int64_t bindTokenCounter_ = 0;
     // ConnectResponse.brokerVersion advertised (-1 = an older broker's 38-byte frame).
     int32_t advertisedBrokerVersion = rune::protocol::client::kBrokerVersion;
     std::map<int, int32_t> advertisedBrokerVersionAt;  // per endpoint (a rolling upgrade)
@@ -733,6 +800,7 @@ struct InvokerGateway {
     }
 
     ~InvokerGateway() {
+        respPubs_.clear();   // response publications before their Aeron client
         endpoints.clear();
         sessionPubs.clear();  // publications before their Aeron client
         aeron.reset();
@@ -754,9 +822,11 @@ struct InvokerGateway {
         const int index = static_cast<int>(endpoints.size());
         ep->assembler = std::make_unique<aeron::FragmentAssembler>(
             [this, index](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
-                          aeron::util::index_t len, aeron::Header&) {
+                          aeron::util::index_t len, aeron::Header& header) {
+                currentImage_ = {index, header.sessionId()};   // the request image (response channels)
                 onFrame(index, reinterpret_cast<const uint8_t*>(b.buffer() + off),
                         static_cast<std::size_t>(len));
+                currentImage_ = {-1, 0};
             });
         endpoints.push_back(std::move(ep));
         return index;
@@ -799,6 +869,9 @@ struct InvokerGateway {
         }
         for (auto& [sid, sp] : sessionPubs) {
             if (!sp.pub) sp.pub = aeron->findExclusivePublication(sp.reg);
+        }
+        for (auto& [key, rp] : respPubs_) {
+            if (!rp.pub && rp.reg >= 0) rp.pub = aeron->findExclusivePublication(rp.reg);
         }
         for (std::size_t i = 0; i < delayedConnects.size();) {
             if (std::chrono::steady_clock::now() >= delayedConnects[i].at) {
@@ -870,6 +943,7 @@ struct InvokerGateway {
             b.nodeId = 0;
             b.host   = brokerHost;  // view into a member: valid through encode()
             b.port   = brokerPort;
+            b.responseControlPort = brokerResponsePort;
             brokers.push_back(b);
         }
         for (const BrokerAd& ad : moreBrokers) {
@@ -877,6 +951,7 @@ struct InvokerGateway {
             b.nodeId = ad.nodeId;
             b.host   = ad.host;
             b.port   = ad.port;
+            b.responseControlPort = ad.responseControlPort;
             brokers.push_back(b);
         }
         std::vector<rp::PartitionEntry> parts;
@@ -889,6 +964,7 @@ struct InvokerGateway {
             p.leaderEpoch     = ad.leaderEpoch;
             p.ingressStreamId = ad.ingressStreamId;
             p.ingressEndpoint = ad.ingressEndpoint;  // view/copy of a member: valid through encode()
+            p.responseControlPort = ad.responseControlPort;
             parts.push_back(p);
         }
         rp::MetadataResponse msg;
@@ -896,6 +972,8 @@ struct InvokerGateway {
         msg.correlationId = correlationId;
         msg.brokers       = std::span<const rp::BrokerEntry>(brokers);
         msg.partitions    = std::span<const rp::PartitionEntry>(parts);
+        if (const auto cv = clientVersions.find(sessionId); cv != clientVersions.end())
+            msg.clientVersion = cv->second;   // the v16 response-port trailer is for sessions >= 16 only
         std::vector<uint8_t> buf(msg.encodedSize());
         const std::size_t n = msg.encode(buf.data());
         sendToSession(sessionId, buf.data(), n);
@@ -1267,7 +1345,107 @@ private:
         return sp.pub->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) > 0;
     }
 
+    /// The broker's Worker::onWorkerBind rule: the session must be known at this node, the token must be the one its
+    /// Connect issued, and a session binds ONE image once; the answer path (acks, Records) is then that image's
+    /// response publication.  Anything else is dropped without a reply.
+    void onWorkerBind_(int endpoint, const uint8_t* buf, std::size_t len) {
+        namespace rp = rune::protocol::client;
+        BindRecord rec;
+        rec.endpoint = endpoint;
+        if (currentImage_.first == endpoint) {
+            rec.imageSid     = currentImage_.second;
+            const auto fi    = framesOnImage.find(currentImage_);
+            rec.firstOnImage = fi != framesOnImage.end() && fi->second.size() == 1;
+        }
+        workerBindFrames.emplace_back(buf, buf + len);
+        const auto b = rp::WorkerBind::decode(buf, len);
+        if (b) {
+            rec.sessionId = b->sessionId;
+            rec.token     = b->token;
+        }
+        const auto tk = b ? bindTokens.find(b->sessionId) : bindTokens.end();
+        const auto sit = b ? sessionsAtNode.find(nodeOf(endpoint)) : sessionsAtNode.end();
+        const bool known = b && sit != sessionsAtNode.end() && sit->second.count(b->sessionId) != 0;
+        const bool fresh = b && respRoute_.find({endpoint, b->sessionId}) == respRoute_.end();
+        const bool valid = b && known && responseCtl.count(endpoint) != 0 && currentImage_.first == endpoint &&
+                           tk != bindTokens.end() && tk->second == b->token;
+        if (valid && fresh) {
+            respRoute_[{endpoint, b->sessionId}] = currentImage_.second;
+            (void)ensureRespPub_(endpoint, currentImage_.second);
+            rec.accepted = true;
+            ackBind_(endpoint, *b);
+        } else if (valid && respRoute_[{endpoint, b->sessionId}] == currentImage_.second) {
+            rec.accepted = true;   // I2: the repeat of an accepted bind (same image, same token): answered again
+            ackBind_(endpoint, *b);
+        } else {
+            ++bindsRefused;
+        }
+        binds.push_back(rec);
+    }
+
+    /// Response channels: the request image a reply from `endpoint` must ride back on, or false (declared path).
+    /// Keyed by the frame's session; a ConnectResponse / ErrorResponse answering a Connect by its correlation id.
+    bool responseImageFor_(int endpoint, const std::vector<uint8_t>& f, int32_t& image, int& gen) const {
+        gen = -1;   // the image's current publication
+        namespace rp = rune::protocol::client;
+        if (responseCtl.count(endpoint) == 0 || f.size() < rp::MessageHeader::ENCODED_SIZE) return false;
+        const int64_t sid = static_cast<int64_t>(rp::detail::getLE64(f.data(), 8));
+        const uint16_t tid = static_cast<uint16_t>(f[2] | (f[3] << 8));
+        // A ConnectResponse answers a CONNECT: its header carries the client's resume hint (the OLD session id), so it
+        // rides the image the Connect arrived on (like the real gateway's pending connect), never the old session's route.
+        if (tid == static_cast<uint16_t>(rp::TemplateId::ConnectResponse) ||
+            tid == static_cast<uint16_t>(rp::TemplateId::HandshakeContinueResponse)) {
+            const int64_t corr = static_cast<int64_t>(rp::detail::getLE64(f.data(), 16));
+            if (const auto it = respConnectRoute_.find({endpoint, corr}); it != respConnectRoute_.end()) {
+                image = it->second;
+                if (const auto g = respConnectGen_.find({endpoint, corr}); g != respConnectGen_.end()) gen = g->second;
+                return true;
+            }
+        }
+        if (const auto it = respRoute_.find({endpoint, sid}); it != respRoute_.end() && sid != 0) {
+            image = it->second;
+            return true;
+        }
+        if (tid == static_cast<uint16_t>(rp::TemplateId::ConnectResponse) ||
+            tid == static_cast<uint16_t>(rp::TemplateId::ErrorResponse) ||
+            tid == static_cast<uint16_t>(rp::TemplateId::HandshakeContinueResponse)) {
+            const int64_t corr = static_cast<int64_t>(rp::detail::getLE64(f.data(), 16));
+            if (const auto it = respConnectRoute_.find({endpoint, corr}); it != respConnectRoute_.end()) {
+                image = it->second;
+                if (const auto g = respConnectGen_.find({endpoint, corr}); g != respConnectGen_.end()) gen = g->second;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// The response publication for (endpoint, request image), registered on first use.
+    RespPub& ensureRespPub_(int endpoint, int32_t image, int gen = -1) {
+        if (gen < 0) gen = respGen_[{endpoint, image}];
+        RespPub& rp = respPubs_[{endpoint, static_cast<int64_t>(image) | (static_cast<int64_t>(gen) << 32)}];
+        if (rp.reg < 0) {
+            const auto img = endpoints[static_cast<std::size_t>(endpoint)]->sub
+                                 ? endpoints[static_cast<std::size_t>(endpoint)]->sub->imageBySessionId(image) : nullptr;
+            if (img) {
+                rp.reg = aeron->addExclusivePublication(
+                    "aeron:udp?control=" + responseCtl[endpoint] + "|control-mode=response|response-correlation-id=" +
+                        std::to_string(img->correlationId()),
+                    egressStreamId);
+            }
+        }
+        return rp;
+    }
+
     bool offerNow(int endpoint, const std::vector<uint8_t>& f) {
+        if (int32_t image = 0; !responseCtl.empty()) {
+          int gen = -1;
+          if (responseImageFor_(endpoint, f, image, gen)) {
+            RespPub& rp = ensureRespPub_(endpoint, image, gen);
+            if (!rp.pub) return false;   // still registering (retried from the outbox): never the declared path
+            aeron::concurrent::AtomicBuffer rab(const_cast<uint8_t*>(f.data()), static_cast<aeron::util::index_t>(f.size()));
+            return rp.pub->offer(rab, 0, static_cast<aeron::util::index_t>(f.size())) > 0;
+          }
+        }
         auto& ep = endpoints[static_cast<std::size_t>(endpoint)];
         if (!ep->pub) return false;
         aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(f.data()),
@@ -1493,11 +1671,14 @@ private:
         namespace rp  = rune::protocol::client;
         const auto tid = rcc::peekTemplate(buf, len);
         if (!tid) return;
+        if (!responseCtl.empty() && currentImage_.first == endpoint)   // NAT egress: the order of frames per request image
+            framesOnImage[currentImage_].push_back(*tid);
         if (static_cast<rcc::TemplateId>(*tid) == rcc::TemplateId::Connect) ++connectsArrived;   // dead or not
         // TLS: a frame naming an encrypted session must open under its keys (the header stays clear), else dropped.
         std::vector<uint8_t> opened;
         if (!tlsKeys_.empty() && len >= rp::MessageHeader::ENCODED_SIZE &&
             static_cast<rcc::TemplateId>(*tid) != rcc::TemplateId::Connect &&
+            static_cast<rcc::TemplateId>(*tid) != rcc::TemplateId::WorkerBind &&   // plaintext by contract
             static_cast<rcc::TemplateId>(*tid) != rcc::TemplateId::HandshakeContinue) {
             if (const auto k = tlsKeys_.find(static_cast<int64_t>(rp::detail::getLE64(buf, 8))); k != tlsKeys_.end()) {
                 opened.resize(len);
@@ -1508,6 +1689,10 @@ private:
             }
         }
         if (deadEndpoints.count(endpoint) != 0) return;  // a dead node hears nothing
+        if (static_cast<rcc::TemplateId>(*tid) == rcc::TemplateId::WorkerBind) {   // NAT-safe egress (Task 6/7)
+            onWorkerBind_(endpoint, buf, len);
+            return;
+        }
         // Fix round 2 (test vacuity): STRICT sessions, as the real ClientGateway — every frame but
         // Connect / Disconnect must carry a session id this NODE assigned and has not expired; any
         // other frame is dropped UNANSWERED ("<op> for unknown session", ClientGateway.cpp
@@ -1520,6 +1705,18 @@ private:
                 if (it == sessionsAtNode.end() || it->second.count(sid) == 0) {
                     ++droppedUnknownSession;
                     if (t == rcc::TemplateId::Produce) ++droppedUnknownSessionProduce;
+                    return;
+                }
+            }
+        }
+        // NAT-safe egress: the worker drops produce for a response-mode session from any image that did not bind it.
+        if (!bindGate.empty() && bindGate.count(endpoint) != 0 && len >= 16 &&
+            static_cast<rcc::TemplateId>(*tid) == rcc::TemplateId::Produce) {
+            const int64_t psid = static_cast<int64_t>(rp::detail::getLE64(buf, 8));
+            if (bindTokens.count(psid) != 0) {
+                const auto br = respRoute_.find({endpoint, psid});
+                if (br == respRoute_.end() || currentImage_.first != endpoint || br->second != currentImage_.second) {
+                    ++producesBeforeBind;
                     return;
                 }
             }
@@ -1628,7 +1825,28 @@ private:
             ++connectsAt[endpoint];
             connectCorrIds.push_back(c->correlationId);
             connectAuthTokens.emplace_back(c->authToken);
+            connectFlags.push_back(c->responseCorrelated);
+            // NAT-safe egress: a v16 flag at a response-capable endpoint of a broker >= 9 is answered ONLY on a
+            // response publication correlated with this request image; an older broker ignores the flag.
+            const int32_t bvArrive = advertisedBrokerVersionAt.count(endpoint) != 0 ? advertisedBrokerVersionAt[endpoint]
+                                                                                    : advertisedBrokerVersion;
+            const bool respMode = c->responseCorrelated && c->clientVersion >= rp::kClientVersionResponseEgress &&
+                                  responseCtl.count(endpoint) != 0 && bvArrive >= rp::kBrokerVersionResponseEgress &&
+                                  currentImage_.first == endpoint;
+            if (respMode) {
+                respConnectRoute_[{endpoint, c->correlationId}] = currentImage_.second;
+                // A new publication per Connect (as the gateway's PendingConnect), unless this image has none yet.
+                if (const auto g = respGen_.find({endpoint, currentImage_.second}); g != respGen_.end()) ++g->second;
+                else respGen_[{endpoint, currentImage_.second}] = 0;
+                respConnectGen_[{endpoint, c->correlationId}] = respGen_[{endpoint, currentImage_.second}];
+                (void)ensureRespPub_(endpoint, currentImage_.second);
+            }
             if (!replyConnects || silentEndpoints.count(endpoint) != 0) return;
+            if (const auto cr = connectRedirect.find(endpoint); cr != connectRedirect.end()) {
+                sendError(endpoint, static_cast<int16_t>(rp::ErrorCode::Redirect), cr->second, c->sessionId,
+                          c->correlationId);
+                return;
+            }
             if (const auto rf = refuseConnectsWith.find(endpoint); rf != refuseConnectsWith.end()) {
                 // DR fix round 1 (I2): this node refuses every Connect with a code.
                 uint8_t ro[64];
@@ -1648,6 +1866,10 @@ private:
             int16_t connectErr = connectErrorCode;
             if (connectErr == 0 && connectErrorFirstN > 0) { --connectErrorFirstN; connectErr = connectErrorFirstCode; }
             if (connectErr == 0) sessionsAtNode[nodeOf(endpoint)].insert(sid);   // strict sessions: known here
+            if (respMode && connectErr == 0) {
+                respRoute_[{endpoint, sid}] = currentImage_.second;   // this session's replies from here ride that image
+                ++responseConnects;
+            }
             clientVersions[sid]      = c->clientVersion;   // D6: the version gate's input
             lastConnectClientVersion = c->clientVersion;
             if (replyOnAnnouncedEgress && sessionPubs.count(sid) == 0) {
@@ -1690,7 +1912,24 @@ private:
             }
             std::size_t n;
             const uint8_t* frame = outPlain.data();
-            if (authMode != rp::AuthMode::InProcess && clientV9) {
+            std::vector<uint8_t> outV16;
+            if (respMode && issueBindToken && okCode == 0 && authMode == rp::AuthMode::InProcess) {
+                // The v16 tail: a fresh random-looking token per connect (session id + a counter), first leg (TLS too).
+                std::array<uint8_t, 16> token{};
+                const int64_t ctr = ++bindTokenCounter_;
+                for (int i = 0; i < 8; ++i) {
+                    token[static_cast<std::size_t>(i)]     = static_cast<uint8_t>((sid >> (8 * i)) & 0xFF);
+                    token[static_cast<std::size_t>(8 + i)] = static_cast<uint8_t>(((ctr * 0x9E3779B97F4A7C15LL) >> (8 * i)) & 0xFF);
+                }
+                token[0] |= 0x80;   // never all-zero
+                bindTokens[sid] = token;
+                // I3: a TLS session's token is derived from its keys at handshake completion; the first leg carries zeros.
+                const std::array<uint8_t, 16> wireToken = cipher != 0 ? std::array<uint8_t, 16>{} : token;
+                connectWireTokens.push_back(wireToken);
+                n = rcc::encodeConnectResponseV16(outV16, okCode, 0, sid, c->sessionId, c->correlationId, wireToken, bv,
+                                                  authMode, rp::AuthState::Anonymous, cipher, flight);
+                frame = outV16.data();
+            } else if (authMode != rp::AuthMode::InProcess && clientV9) {
                 // Required: not bootstrapped -> Anonymous (only SecurityBootstrap is accepted, I5); else a login is due.
                 rp::AuthState st = rp::AuthState::Anonymous;
                 if (authMode == rp::AuthMode::Required && okCode == 0) {
@@ -1703,6 +1942,11 @@ private:
             } else {
                 n = rcc::encodeConnectResponse(outPlain.data(), outPlain.size(), okCode, 0, sid, c->sessionId,
                                                c->correlationId, bv, cipher, flight);
+            }
+            if (holdConnectAnswers > 0) {
+                --holdConnectAnswers;
+                heldConnectAnswers.emplace_back(endpoint, std::vector<uint8_t>(frame, frame + n));
+                return;
             }
             if (replyFromArrival && !replyOnAnnouncedEgress) {
                 send(endpoint, frame, n);
@@ -1738,6 +1982,8 @@ private:
                 k.cipher    = keys.cipher;
                 k.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);
                 k.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);
+                if (bindTokens.count(hc->sessionId) != 0)   // I3: the derived token (the random placeholder never leaves)
+                    bindTokens[hc->sessionId] = rune::crypto::deriveWorkerBindToken(keys, hc->sessionId);
                 tlsPending_.erase(it);
                 ++tlsSessions;
             }

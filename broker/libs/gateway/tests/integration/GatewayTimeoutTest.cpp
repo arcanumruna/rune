@@ -613,9 +613,9 @@ TEST_F(GatewayTimeoutFixture, Reap_Bounded_ManySessionsAllReaped) {
     }
     ASSERT_EQ(gw_->sessionCount(), 2u);
 
-    const int64_t tB = wallNowNs();
-    ASSERT_LT(tB - tA, kTimeoutNs / 2)
-        << "Sanity: A and B connects must be within timeout/2 of each other";
+    // Injected clock, not wall time: group B connects a quarter timeout after
+    // group A, so the threshold below separates the groups for any host speed.
+    const int64_t tB = tA + kTimeoutNs / 4;
 
     for (int i = 0; i < 2; ++i) {
         auto r = doConnect(groupB[i], /*corrId=*/82 + i, tB);

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -91,6 +92,9 @@ struct ConnectRequestView {
     std::span<const uint8_t> cipherList;
     std::string_view         handshakeBytes;
     std::string_view         authToken;
+
+    // v16 NAT-safe egress: replies ride an Aeron response publication (false on a pre-v16 frame).
+    bool responseCorrelated = false;
 };
 
 /// Encode a ConnectRequest frame into buf[0..cap-1].
@@ -101,20 +105,16 @@ inline std::size_t encodeConnectRequest(uint8_t*         buf,
                                         int32_t          egressStreamId,
                                         int32_t          clientVersion,
                                         int64_t          sessionId,
-                                        int64_t          correlationId) noexcept {
-    // Minimum bytes needed: header(24) + fixed(8) + varLen(2) + channel bytes
-    const std::size_t needed = rpc::MessageHeader::ENCODED_SIZE
-                             + rpc::ConnectRequest::BODY_FIXED
-                             + 2u
-                             + egressChannel.size();
-    if (cap < needed) return 0u;
-
+                                        int64_t          correlationId,
+                                        bool             responseCorrelated = false) noexcept {
     rpc::ConnectRequest msg;
     msg.sessionId      = sessionId;
     msg.correlationId  = correlationId;
     msg.egressStreamId = egressStreamId;
     msg.clientVersion  = clientVersion;
     msg.egressChannel  = egressChannel;
+    msg.responseCorrelated = responseCorrelated;   // written only when clientVersion >= 16 (the protocol encoder)
+    if (cap < msg.encodedSize()) return 0u;
     return msg.encode(buf);
 }
 
@@ -133,6 +133,7 @@ inline std::optional<ConnectRequestView> decodeConnectRequest(const uint8_t* buf
     v.cipherList     = opt->cipherList;
     v.handshakeBytes = opt->handshakeBytes;
     v.authToken      = opt->authToken;
+    v.responseCorrelated = opt->responseCorrelated;
     return v;
 }
 
@@ -151,7 +152,8 @@ inline std::size_t encodeConnectRequestCrypto(std::vector<uint8_t>&     buf,
                                                int64_t                  correlationId,
                                                std::span<const uint8_t> cipherList,
                                                std::string_view         handshakeBytes,
-                                               std::string_view         authToken) noexcept {
+                                               std::string_view         authToken,
+                                               bool                     responseCorrelated = false) noexcept {
     rpc::ConnectRequest msg;
     msg.sessionId      = sessionId;
     msg.correlationId  = correlationId;
@@ -161,14 +163,9 @@ inline std::size_t encodeConnectRequestCrypto(std::vector<uint8_t>&     buf,
     msg.cipherList     = cipherList;
     msg.handshakeBytes = handshakeBytes;
     msg.authToken      = authToken;
+    msg.responseCorrelated = responseCorrelated;
 
-    const std::size_t needed = rpc::MessageHeader::ENCODED_SIZE
-                              + rpc::ConnectRequest::BODY_FIXED
-                              + 2u + egressChannel.size()
-                              + 2u + cipherList.size()
-                              + 4u + handshakeBytes.size()
-                              + 2u + authToken.size();
-    buf.resize(needed);
+    buf.resize(msg.encodedSize());
     return msg.encode(buf.data());
 }
 
@@ -191,6 +188,11 @@ struct ConnectResponseView {
     // authentication, so the session is Connected at once (the pre-v9 behaviour).
     rpc::AuthMode  authMode  = rpc::AuthMode::InProcess;
     rpc::AuthState authState = rpc::AuthState::Anonymous;
+
+    // v16 NAT-safe egress: the worker bind token of a response-mode shard session (all-zero = none).  `v16` is false
+    // for a frame without the tail (an older broker): bindToken then stays zero.
+    bool                    v16 = false;
+    std::array<uint8_t, 16> bindToken{};
 };
 
 /// Authentication (Task 7): encode a v9 ConnectResponse (test / fake-broker use).  Returns bytes written, or 0.
@@ -262,7 +264,55 @@ inline std::optional<ConnectResponseView> decodeConnectResponse(const uint8_t* b
     v.handshakeBytes    = opt->handshakeBytes;
     v.authMode          = opt->authMode;
     v.authState         = opt->authState;
+    v.v16               = opt->v16;
+    if (opt->v16) v.bindToken = opt->bindToken;
     return v;
+}
+
+/// NAT-safe egress (test / fake-broker use): a v16 ConnectResponse carrying `bindToken` (and, under TLS, the first
+/// handshake flight on this same leg).  Returns bytes written.
+inline std::size_t encodeConnectResponseV16(std::vector<uint8_t>& buf,
+                                            int16_t code, int32_t leaderMemberId, int64_t assignedSessionId,
+                                            int64_t sessionId, int64_t correlationId,
+                                            const std::array<uint8_t, 16>& bindToken,
+                                            int32_t brokerVersion = rpc::kBrokerVersion,
+                                            rpc::AuthMode authMode = rpc::AuthMode::InProcess,
+                                            rpc::AuthState authState = rpc::AuthState::Anonymous,
+                                            uint8_t chosenCipher = 0, std::string_view handshakeBytes = {}) noexcept {
+    rpc::ConnectResponse msg;
+    msg.sessionId         = sessionId;
+    msg.correlationId     = correlationId;
+    msg.code              = code;
+    msg.leaderMemberId    = leaderMemberId;
+    msg.assignedSessionId = assignedSessionId;
+    msg.brokerVersion     = brokerVersion;
+    msg.chosenCipher      = chosenCipher;
+    msg.handshakeBytes    = handshakeBytes;
+    msg.v9                = true;
+    msg.authMode          = authMode;
+    msg.authState         = authState;
+    msg.v16               = true;
+    msg.bindToken         = bindToken;
+    buf.resize(rpc::ConnectResponse::ENCODED_SIZE_V16 + 4u + handshakeBytes.size());
+    return msg.encode(buf.data());
+}
+
+/// NAT-safe egress: encode a WorkerBind (40 bytes, templateId 86) into `buf` (cap >= WorkerBind::ENCODED_SIZE).  The
+/// frame is PLAINTEXT by contract: it is the first frame on a worker ingress publication and is never sealed.
+/// Returns bytes written, or 0 if cap is too small.
+inline std::size_t encodeWorkerBind(uint8_t* buf, std::size_t cap, int64_t sessionId, int64_t correlationId,
+                                    const std::array<uint8_t, 16>& token) noexcept {
+    if (cap < rpc::WorkerBind::ENCODED_SIZE) return 0u;
+    rpc::WorkerBind msg;
+    msg.sessionId     = sessionId;
+    msg.correlationId = correlationId;
+    msg.token         = token;
+    return msg.encode(buf);
+}
+
+/// NAT-safe egress (I2): decode a WorkerBindAck (24 bytes, templateId 87); nullopt on any malformed frame.
+[[nodiscard]] inline std::optional<rpc::WorkerBindAck> decodeWorkerBindAck(const uint8_t* buf, std::size_t len) noexcept {
+    return rpc::WorkerBindAck::decode(buf, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +510,7 @@ struct BrokerEntryView {
     int32_t          nodeId = -1;
     int32_t          port   = 0;
     std::string_view host;    // view into the original buffer
+    int32_t          responseControlPort = 0;  ///< v16: this node's gateway response-control port (0 = none)
 };
 
 // ---------------------------------------------------------------------------
@@ -478,6 +529,8 @@ struct PartitionEntryView {
     std::string ingressEndpoint;
     /// Issue #116: the receiver a produce on this partition's advertised worker route is sealed for (0 = gateway).
     uint8_t ingressReceiverId = 0;
+    /// v16: the owning worker's response-control port (the gateway's when the partition has no worker route; 0 = none).
+    int32_t responseControlPort = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -531,6 +584,7 @@ inline std::optional<MetadataResponseDecoded> decodeMetadataResponse(
         bv.nodeId = b.nodeId;
         bv.port   = b.port;
         bv.host   = b.host;
+        bv.responseControlPort = b.responseControlPort;
         result.brokers.push_back(bv);
     }
 
@@ -546,6 +600,7 @@ inline std::optional<MetadataResponseDecoded> decodeMetadataResponse(
         pv.egressStreamId  = p.egressStreamId;
         pv.ingressEndpoint = std::string(p.ingressEndpoint);  // Task 16 (shard brokers)
         pv.ingressReceiverId = p.ingressReceiverId;            // issue #116
+        pv.responseControlPort = p.responseControlPort;        // v16 (NAT-safe egress)
         result.partitions.push_back(std::move(pv));
     }
 

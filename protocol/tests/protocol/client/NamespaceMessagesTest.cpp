@@ -212,7 +212,7 @@ TEST(NamespaceMessagesRegression, TemplateDispatchRegression) {
         EXPECT_EQ(fc.status, pc::FrameStatus::Ok) << tid;
         EXPECT_EQ(fc.templateId, tid);
     }
-    for (const uint16_t tid : {uint16_t{86}, uint16_t{95}}) {
+    for (const uint16_t tid : {uint16_t{87}, uint16_t{95}}) {
         auto b = header(tid, 1, 2, 0);
         EXPECT_EQ(pc::checkFrame(b.data(), b.size()).status, pc::FrameStatus::UnknownTemplate) << tid;
     }
@@ -220,9 +220,9 @@ TEST(NamespaceMessagesRegression, TemplateDispatchRegression) {
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::ListNamespaces), 82);
     EXPECT_EQ(static_cast<uint16_t>(pc::TemplateId::ListNamespacesResponse), 83);
     EXPECT_EQ(pc::kProtocolVersion, 3);
-    EXPECT_EQ(pc::kClientVersion, 15);   // v15: RecordEgressUnavailable (#450)
+    EXPECT_EQ(pc::kClientVersion, 16);   // v16: NAT-safe response egress; v15: RecordEgressUnavailable (#450)
     EXPECT_EQ(pc::kClientVersionNamespaces, 14);
-    EXPECT_EQ(pc::kBrokerVersion, 8);
+    EXPECT_EQ(pc::kBrokerVersion, 9);
 }
 
 TEST(NamespaceMessagesRegression, ErrorCodeValuesRegression) {
@@ -363,6 +363,6 @@ TEST(ThrottledRegression, RetryAfterRoundTripRegression) {
 TEST(DispatchRegression, Templates84And85RoutedRegression) {
     EXPECT_TRUE(pc::isKnownTemplate(84));
     EXPECT_TRUE(pc::isKnownTemplate(85));
-    EXPECT_FALSE(pc::isKnownTemplate(86));
+    EXPECT_FALSE(pc::isKnownTemplate(87));
     EXPECT_FALSE(pc::isKnownTemplate(95));
 }

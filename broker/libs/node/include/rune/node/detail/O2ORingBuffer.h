@@ -35,7 +35,7 @@
 #include <string>
 
 #include <concurrent/AtomicBuffer.h>
-#include <concurrent/ringbuffer/RecordDescriptor.h>
+#include "rune/protocol/ring/RecordDescriptor.h"
 #include <util/BitUtil.h>
 #include <util/Index.h>
 #include <util/Exceptions.h>
@@ -91,7 +91,7 @@ public:
     /// to write into (relative to base()), or a NEGATIVE value on insufficient
     /// capacity (back-pressure — the caller must retry later).
     aeron::util::index_t tryClaim(std::int32_t msgTypeId, std::size_t length) {
-        namespace RD = aeron::concurrent::ringbuffer;
+        namespace RD = rune::protocol::ring;
         RD::RecordDescriptor::checkMsgTypeId(msgTypeId);
         checkMsgLength(static_cast<aeron::util::index_t>(length));
 
@@ -125,7 +125,7 @@ public:
     /// commit()'s publish step alone (tests interleave a parking consumer between publish and notify;
     /// production always calls commit()).
     void commitWithoutNotifyForTest(aeron::util::index_t index) {
-        namespace RD = aeron::concurrent::ringbuffer;
+        namespace RD = rune::protocol::ring;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
         RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
@@ -165,7 +165,7 @@ public:
 
     /// Discard a message previously reserved with tryClaim() (becomes padding).
     void abort(aeron::util::index_t index) {
-        namespace RD = aeron::concurrent::ringbuffer;
+        namespace RD = rune::protocol::ring;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
         RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
@@ -194,7 +194,7 @@ public:
     /// (msgTypeId, AtomicBuffer&, encodedOffset, length).  Returns messages read.
     template <typename Handler>
     int read(Handler&& handler, int messageCountLimit) {
-        namespace RD = aeron::concurrent::ringbuffer;
+        namespace RD = rune::protocol::ring;
         int messagesRead = 0;
 
         const aeron::util::index_t headPositionIndex = m_headPositionIndex;
@@ -241,7 +241,7 @@ public:
     /// message (and remainder) unconsumed for a later cycle (in-order back-pressure).
     template <typename Handler>
     int controlledRead(Handler&& handler, int messageCountLimit = INT_MAX) {
-        namespace RD = aeron::concurrent::ringbuffer;
+        namespace RD = rune::protocol::ring;
         int messagesRead = 0;
 
         const aeron::util::index_t headPositionIndex = m_headPositionIndex;
@@ -357,7 +357,7 @@ private:
     }
 
     [[nodiscard]] aeron::util::index_t computeRecordIndex(aeron::util::index_t index) const {
-        namespace RD = aeron::concurrent::ringbuffer;
+        namespace RD = rune::protocol::ring;
         const aeron::util::index_t recordIndex = index - RD::RecordDescriptor::HEADER_LENGTH;
         if (recordIndex < 0 ||
             recordIndex > (m_capacity - RD::RecordDescriptor::HEADER_LENGTH)) {
@@ -368,7 +368,7 @@ private:
     }
 
     [[nodiscard]] std::int32_t verifyClaimedSpaceNotReleased(aeron::util::index_t recordIndex) const {
-        namespace RD = aeron::concurrent::ringbuffer;
+        namespace RD = rune::protocol::ring;
         const std::int32_t recordLength =
             m_buffer.getInt32(RD::RecordDescriptor::lengthOffset(recordIndex));
         if (recordLength < 0) return recordLength;
@@ -378,7 +378,7 @@ private:
     // Single-producer claim (no CAS — the producer owns the tail).  Ported from
     // common's O2ORingBuffer::claimCapacity, retargeted to Aeron's AtomicBuffer.
     aeron::util::index_t claimCapacity(aeron::util::index_t recordLength) {
-        namespace RD = aeron::concurrent::ringbuffer;
+        namespace RD = rune::protocol::ring;
         const aeron::util::index_t alignedRecordLength =
             aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
         const aeron::util::index_t requiredCapacity =

@@ -75,9 +75,19 @@ struct FakeIo final : sm::SessionIo {
         return retargetSucceeds;
     }
 
+    // NAT-safe egress (Task 7): the response pairing the io reports, and the Redirect `#port` it was handed.
+    bool respCorrelated = false;
+    std::vector<int32_t> retargetPorts;   // one per retargetWithResponsePort call, in order
+    [[nodiscard]] bool responseCorrelated() const noexcept override { return respCorrelated; }
+    bool retargetWithResponsePort(const std::string& newChannel, int32_t responsePort) noexcept override {
+        retargetPorts.push_back(responsePort);
+        return retarget(newChannel);
+    }
+
     void reset() {
         sends.clear();
         retargets.clear();
+        retargetPorts.clear();
     }
 
     std::size_t sendCount() const { return sends.size(); }
@@ -2379,4 +2389,78 @@ TEST(SessionMachineRegression, ConnectedResumesOnAFatalNoticeNamingNoSessionRegr
     m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), 2, 9LL, m.correlationId(), T0);
     m.onErrorResponse(static_cast<int16_t>(rpc::ErrorCode::SessionExpired), "", 0LL, T0, /*noticeSessionId=*/0);
     EXPECT_EQ(m.state(), sm::SessionState::Resuming);
+}
+
+// ===========================================================================
+// NAT-safe egress (Task 7): ConnectRequest.responseCorrelated and the Redirect `#port` suffix.
+// ===========================================================================
+TEST(SessionResponseEgressRegression, ConnectRequestCarriesTheIoFlagAtVersion16) {
+    for (const bool flag : {false, true}) {
+        FakeIo io;
+        io.respCorrelated = flag;
+        auto cfg = testConfig();
+        cfg.clientVersion = rpc::kClientVersionResponseEgress;
+        sm::SessionMachine m(io, cfg);
+        m.connect(T0);
+        ASSERT_EQ(io.sendCount(), 1u);
+        const auto req = io.lastConnectRequest();
+        ASSERT_TRUE(req.has_value());
+        EXPECT_EQ(req->clientVersion, 16);
+        EXPECT_EQ(req->responseCorrelated, flag);
+    }
+}
+
+TEST(SessionResponseEgressRegression, DefaultSessionConfigAnnouncesVersion16) {
+    EXPECT_EQ(sm::SessionConfig{}.clientVersion, 16);
+    EXPECT_EQ(rpc::kClientVersion, 16);
+}
+
+TEST(SessionResponseEgressRegression, FlagIsNotSentBelowVersion16) {
+    FakeIo io;
+    io.respCorrelated = true;
+    auto cfg = testConfig();
+    cfg.clientVersion = 15;
+    sm::SessionMachine m(io, cfg);
+    m.connect(T0);
+    const auto req = io.lastConnectRequest();
+    ASSERT_TRUE(req.has_value());
+    EXPECT_FALSE(req->responseCorrelated) << "a pre-v16 frame has no flag";
+}
+
+TEST(SessionResponseEgressRegression, RedirectPortSuffixReachesRetargetAsPortAndBareEndpoint) {
+    struct Case { const char* message; const char* endpoint; int32_t port; };
+    const Case cases[] = {
+        {"leader:40200", "leader:40200", 0},
+        {"leader:40200#40263", "leader:40200", 40263},
+        {"aeron:udp?endpoint=leader:40200#7", "aeron:udp?endpoint=leader:40200", 7},
+        {"leader:40200#bad", "leader:40200", 0},
+        {"leader:40200#65536", "leader:40200", 0},
+    };
+    for (const auto& c : cases) {
+        FakeIo io;
+        auto cfg = testConfig();
+        cfg.maxRedirects = 3;
+        sm::SessionMachine m(io, cfg);
+        m.connect(T0);
+        const int64_t corrId = m.correlationId();
+        io.reset();
+        m.onErrorResponse(static_cast<int16_t>(rpc::ErrorCode::Redirect), c.message, corrId, T0 + 1);
+        ASSERT_EQ(io.retargetCount(), 1u) << c.message;
+        EXPECT_EQ(io.retargets[0], c.endpoint) << c.message;
+        ASSERT_EQ(io.retargetPorts.size(), 1u) << c.message;
+        EXPECT_EQ(io.retargetPorts[0], c.port) << c.message;
+        EXPECT_EQ(io.sendCount(), 1u) << "the ConnectRequest is re-sent";
+    }
+}
+
+TEST(SessionResponseEgressRegression, ConnectResponseRedirectOverloadSplitsThePortToo) {
+    FakeIo io;
+    sm::SessionMachine m(io, testConfig());
+    m.connect(T0);
+    io.reset();
+    m.onConnectResponseRedirect("leader:40200#40263", m.correlationId(), T0 + 1);
+    ASSERT_EQ(io.retargetCount(), 1u);
+    EXPECT_EQ(io.retargets[0], "leader:40200");
+    ASSERT_EQ(io.retargetPorts.size(), 1u);
+    EXPECT_EQ(io.retargetPorts[0], 40263);
 }

@@ -43,6 +43,7 @@ extern "C" {
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <new>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -371,6 +372,108 @@ TEST_F(WorkerIngressFixture, StreamIsolation) {
     }
     EXPECT_EQ(extraOnIngress1, 0) << "ingress1 received extra frames (cross-talk?)";
     EXPECT_EQ(extraOnIngress2, 0) << "ingress2 received extra frames (cross-talk?)";
+}
+
+// ===========================================================================
+// Regression: Aeron owns the unavailable-image handler until the subscription CLOSE completes, which is after
+// ~WorkerIngress.  A destroyed ingress must never be called back (it used to write the session id into freed memory).
+// ===========================================================================
+TEST_F(WorkerIngressFixture, DestroyedIngressIsNeverCalledBackRegression) {
+    constexpr int32_t stream = 300;
+    const std::string channel = "aeron:ipc";
+
+    alignas(WorkerIngress) unsigned char buf[sizeof(WorkerIngress)];
+    auto* ingress = new (buf) WorkerIngress(aeron_, channel, stream);
+    ASSERT_TRUE(ingress->resolved());
+    auto pub = makeExclusivePub(channel, stream);
+    ASSERT_TRUE(pub != nullptr);
+    {
+        using clk = std::chrono::steady_clock;
+        const auto deadline = clk::now() + std::chrono::seconds{10};
+        while (clk::now() < deadline && !pub->isConnected()) {
+            ingress->poll(10, [](const uint8_t*, std::size_t, aeron::Header&) {});
+            std::this_thread::sleep_for(1ms);
+        }
+        ASSERT_TRUE(pub->isConnected()) << "Publication never connected";
+    }
+    ingress->~WorkerIngress();
+    std::memset(buf, 0xAB, sizeof buf);
+    pub.reset();
+    aeron_.reset();   // synchronous client close: runs the queued subscription close and its image teardown
+    for (std::size_t i = 0; i < sizeof buf; ++i)
+        ASSERT_EQ(buf[i], 0xAB) << "byte " << i << " of the destroyed ingress was written by an Aeron callback";
+}
+
+// ===========================================================================
+// Regression: a lost image is found on the POLLING thread (image count change + candidate rescan), no callback.
+// ===========================================================================
+TEST_F(WorkerIngressFixture, LostImageIsReportedOnThePollingThreadRegression) {
+    constexpr int32_t stream = 301;
+    const std::string channel = "aeron:ipc";
+    WorkerIngress ingress(aeron_, channel, stream);
+    ASSERT_TRUE(ingress.resolved());
+    auto pub = makeExclusivePub(channel, stream);
+    ASSERT_TRUE(pub != nullptr);
+    const int32_t sid = pub->sessionId();
+    auto noop = [](const uint8_t*, std::size_t, aeron::Header&) {};
+    {
+        using clk = std::chrono::steady_clock;
+        const auto deadline = clk::now() + std::chrono::seconds{10};
+        while (clk::now() < deadline && ingress.imageCorrelationIdOf(sid) < 0) {
+            ingress.poll(10, noop);
+            std::this_thread::sleep_for(1ms);
+        }
+        ASSERT_GE(ingress.imageCorrelationIdOf(sid), 0) << "image never appeared";
+    }
+    std::vector<int32_t> got;
+    std::vector<std::thread::id> threads;
+    auto f = [&](int32_t id) { got.push_back(id); threads.push_back(std::this_thread::get_id()); };
+    auto cand = [&](auto&& each) { each(sid); };
+    // First drain scans (count starts at -1) and reports nothing: the image exists.
+    EXPECT_EQ(ingress.drainUnavailable(f, cand), 0);
+    EXPECT_EQ(ingress.drainUnavailable(f, cand), 0);
+    EXPECT_TRUE(got.empty());
+
+    pub.reset();
+    {
+        using clk = std::chrono::steady_clock;
+        const auto deadline = clk::now() + std::chrono::seconds{10};
+        for (int i = 0; i < kPollIterMax && clk::now() < deadline && got.empty(); ++i) {
+            ingress.poll(10, noop);
+            ingress.drainUnavailable(f, cand);
+            std::this_thread::sleep_for(1ms);
+        }
+    }
+    ASSERT_EQ(got.size(), 1u) << "the lost image was not reported";
+    EXPECT_EQ(got[0], sid);
+    EXPECT_EQ(threads[0], std::this_thread::get_id());
+    for (int i = 0; i < 50; ++i) {
+        ingress.poll(10, noop);
+        EXPECT_EQ(ingress.drainUnavailable(f, cand), 0);
+    }
+    EXPECT_EQ(got.size(), 1u);
+}
+
+// ===========================================================================
+// Regression: an unchanged image count is not rescanned; requestImageRescan() (a new bind) forces one, so a loss masked
+// by a simultaneous arrival is still found.
+// ===========================================================================
+TEST_F(WorkerIngressFixture, RescanAfterBindCatchesAMaskedLossRegression) {
+    WorkerIngress ingress(aeron_, "aeron:ipc", 302);
+    ASSERT_TRUE(ingress.resolved());
+    int calls = 0;
+    int32_t last = 0;
+    auto f = [&](int32_t id) { ++calls; last = id; };
+    auto cand = [](auto&& each) { each(0x7fff1234); };   // no such image
+    EXPECT_EQ(ingress.drainUnavailable(f, cand), 1);     // first drain scans
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(last, 0x7fff1234);
+    EXPECT_EQ(ingress.drainUnavailable(f, cand), 0);     // count unchanged: no rescan
+    EXPECT_EQ(calls, 1);
+    ingress.requestImageRescan();
+    EXPECT_EQ(ingress.drainUnavailable(f, cand), 1);
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(ingress.drainUnavailable(f, cand), 0);
 }
 
 } // namespace

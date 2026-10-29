@@ -78,3 +78,31 @@ static void BM_SessionAckSinkLookupAtScale(benchmark::State& state) {
     }
 }
 BENCHMARK(BM_SessionAckSinkLookupAtScale)->Arg(1)->Arg(64)->Arg(1024)->Arg(4000)->Unit(benchmark::kNanosecond);
+
+// I5 (fix round 1a): per-frame direct-produce admission = ONE find + ONE boundImage_ word.
+//   range(0): 0 = plain session (admit + give back), 1 = response-mode bound, frame from its image (admit + give
+//   back), 2 = response-mode bound, frame from another image (spoofed drop), 3 = response-mode awaiting its bind.
+static void BM_SessionAckSinkAdmitDirect(benchmark::State& state) {
+    auto buf = std::make_unique<std::array<uint8_t, 1 << 16>>();
+    std::size_t off = 0;
+    BumpPolicy p; p.buf = buf.get(); p.off = &off;
+    auto s = std::make_unique<Sink>(p);
+    constexpr int32_t kImage = 77;
+    const std::array<uint8_t, 16> tok{1};
+    const int mode = static_cast<int>(state.range(0));
+    for (int64_t sid = 1; sid <= 1024; ++sid) {
+        if (mode == 0) { s->announce(sid, "aeron:udp?endpoint=10.0.0.1:40123", 1001); continue; }
+        s->announceResponse(sid, tok, 1001);
+        if (mode != 3) s->bind(sid, tok, kImage, "aeron:udp?control=10.0.0.1:41000|control-mode=response|response-correlation-id=5");
+    }
+    for (int i = 0; i < 4; ++i) s->flush(0, 0);
+    int64_t sid = 0;
+    const int32_t img = mode == 2 ? kImage + 1 : kImage;
+    for (auto _ : state) {
+        sid = (sid & 1023) + 1;
+        uint8_t tag = s->admitDirect(sid, img);
+        if (tag == Sink::kDirectCounted || tag == Sink::kDirectTotalOnly) s->releaseDirect(sid, tag);
+        benchmark::DoNotOptimize(tag);
+    }
+}
+BENCHMARK(BM_SessionAckSinkAdmitDirect)->Arg(0)->Arg(1)->Arg(2)->Arg(3)->Unit(benchmark::kNanosecond);

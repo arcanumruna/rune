@@ -79,6 +79,10 @@ public:
         // this ctor is noexcept, so it becomes a logged resolve failure.
         bool failed = false;
         try {
+            // No unavailable-image handler (NAT-safe egress, Task 6): Aeron owns a registered handler until the
+            // subscription CLOSE completes (after ~WorkerIngress) and runs it on the client's conductor thread, which
+            // is neither this object's lifetime nor this worker's thread.  A lost image is found on the polling
+            // thread instead: see drainUnavailable().
             const int64_t regId = aeron_->addSubscription(channel_, streamId_);
             sub_ = pump.resolve([&]() -> std::shared_ptr<aeron::Subscription> {
                 try {
@@ -177,6 +181,38 @@ public:
         return n;
     }
 
+    // -----------------------------------------------------------------------
+    // NAT-safe egress (Task 6) — image identity, cold.
+    // -----------------------------------------------------------------------
+    /// The Aeron correlation id of the live image with `aeronSessionId` (the id a response publication correlates
+    /// with: `response-correlation-id`); -1 when this subscription has no such image.
+    [[nodiscard]] int64_t imageCorrelationIdOf(int32_t aeronSessionId) const noexcept {
+        if (!sub_) return -1;
+        try {
+            const auto image = sub_->imageBySessionId(aeronSessionId);
+            return image ? image->correlationId() : -1;
+        } catch (...) { return -1; }
+    }
+    /// Hand `f(int32_t aeronSessionId)` every id in `candidates` (the caller passes its bound images) whose image no
+    /// longer exists.  Runs on the polling thread ONLY and registers no Aeron callback.  A loss is seen at the first
+    /// drain after the subscription's image count changes (one acquire load otherwise, zero cost).  A loss masked by a
+    /// simultaneous arrival (count unchanged) is caught by the rescan requested on the next successful bind
+    /// (requestImageRescan) or the next count change; the gateway's session reaping is the backstop.  Unbinding is
+    /// cleanup (the session can never be answered again and the client reconnects with a new session), never a hang.
+    /// `candidates` may yield one id more than once; `f` must be idempotent.  Returns how many ids were handed out.
+    template <class F, class Candidates>
+    int drainUnavailable(F&& f, Candidates&& candidates) {
+        if (!sub_) return 0;
+        const int images = sub_->imageCount();                 // one acquire load, the list Aeron's poll reads
+        if (images == lastDrainImages_) [[likely]] return 0;
+        lastDrainImages_ = images;
+        int n = 0;
+        candidates([&](int32_t id) { if (imageCorrelationIdOf(id) < 0) { f(id); ++n; } });
+        return n;
+    }
+    /// Make the next drainUnavailable() rescan every candidate (a new bind may have masked a loss).
+    void requestImageRescan() noexcept { lastDrainImages_ = -1; }
+
 private:
     // Mirror the exact constants from ClientGateway.cpp:49-50.
 
@@ -189,6 +225,8 @@ private:
     rune::aeronutil::ImageLossWatch        imageWatch_;
     rune::aeronutil::ControlledFragmentAssembler controlledAssembler_;   // controlledPoll only
     rune::aeronutil::ImageLossWatch              controlledImageWatch_;
+
+    int                                    lastDrainImages_ = -1;   ///< image count at the last drain; -1 = rescan next
 };
 
 } // namespace rune::node

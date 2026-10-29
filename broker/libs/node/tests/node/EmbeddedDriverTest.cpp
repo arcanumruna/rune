@@ -3,6 +3,7 @@
 #include <rune/aeronutil/testing/FreePort.h>
 #include <sys/stat.h>
 #include <rune/node/EmbeddedDriver.h>
+#include "DriverWakePollProbe.h"
 
 #include <Aeron.h>
 #include <gtest/gtest.h>
@@ -91,6 +92,22 @@ TEST(EmbeddedDriver, InvokerModeRoundTripOnOneThreadOnly) {
     EXPECT_EQ(got, 1);
     EXPECT_EQ(drv.foreignPumpAttempts(), 0u);
     sub.reset(); pub.reset(); a.reset();
+}
+
+// Aeron 1.51 starts an "aeron-executor" thread per driver by default (name resolution, async channel
+// parsing).  An invoker driver runs on its owner's thread only, so starting it and pumping it must leave
+// the process thread count unchanged.
+TEST(EmbeddedDriverRegression, InvokerDriverStartsNoThreadRegression) {
+    const auto threads = [] {
+        int n = 0;
+        for ([[maybe_unused]] const auto& e : fs::directory_iterator("/proc/self/task")) ++n;
+        return n;
+    };
+    TmpDir d;
+    const int before = threads();
+    EmbeddedDriver drv(cfgAt(d.path), DriverMode::Invoker);
+    for (int i = 0; i < 100; ++i) drv.doWork();
+    EXPECT_EQ(threads(), before) << "an invoker driver must not spawn a thread (Aeron async executor)";
 }
 
 TEST(EmbeddedDriverRegression, InvokerForeignThreadPumpIsRefused) {
@@ -963,5 +980,24 @@ TEST(EmbeddedDriverWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdlePas
     p1.reset();
     p2.reset();
     a.reset();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Aeron 1.51 upgrade: Aeron's transport poller no longer ends a pass on one socket's recvmmsg failure.  It logs the
+// error to the driver's distinct error log and errors counter and goes on with the remaining sockets.  The
+// epoll-first poller mirrors that: under 1.41.4's rule (return -1 at the first failing socket) the other ready
+// socket's work was dropped from the pass and the error never reached the error log.
+// ---------------------------------------------------------------------------
+TEST(EmbeddedDriverWakeRegression, EpollFirstPollLogsAFailingSocketAndPollsTheRestRegression) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "epoll-first polling is Linux-only";
+#else
+    rune_poll_probe_result_t r{};
+    ASSERT_EQ(rune_probe_epoll_poll_one_failing_socket(&r), 0) << "probe setup failed";
+    ASSERT_EQ(r.installed, 1) << "the epoll-first poller must install on a stock driver context";
+    EXPECT_EQ(r.work, 1) << "the healthy socket's work counts; the failing socket does not end the pass";
+    EXPECT_EQ(r.errors_counter, 1) << "the failure is counted on the driver's errors counter";
+    EXPECT_EQ(r.observations, 1) << "the failure is recorded in the driver's distinct error log";
 #endif
 }

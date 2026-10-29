@@ -152,6 +152,9 @@ rune::client::ClientConfig buildClientConfig(const std::vector<std::string>& arg
     }
     if (!egress.empty()) cfg.egressChannel = egress;
 
+    // NAT-safe egress: the seed gateway's response-control port (--gateway-response-port / RUNE_GATEWAY_RESPONSE_PORT).
+    cfg.gatewayResponseControlPort = rune::cli::support::gatewayResponsePortOf(flagValue(args, "--gateway-response-port"));
+
     // Stream IDs: hidden test overrides.
     const std::string sIn  = flagValue(args, "--cli-stream-in");
     const std::string sOut = flagValue(args, "--cli-stream-out");

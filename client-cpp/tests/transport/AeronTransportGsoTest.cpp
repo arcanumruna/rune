@@ -20,6 +20,17 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <aeronmd.h>
+
+// Aeron's own default (2 up to 1.41, 4 from 1.51), read from a fresh context rather than hard-coded.
+inline uint32_t aeronDefaultMsgsPerSend() {
+    aeron_driver_context_t* c = nullptr;
+    if (aeron_driver_context_init(&c) < 0) return 0;
+    const uint32_t v = aeron_driver_context_get_network_publication_max_messages_per_send(c);
+    aeron_driver_context_close(c);
+    return v;
+}
+
 
 namespace {
 using Transport = rune::client::transport::AeronTransport;
@@ -154,6 +165,6 @@ TEST(AeronTransportGso, JumboMtuKeepsAeronDefaultMsgsPerSendRegression) {
     Transport t{cfg};
     t.start();
     EXPECT_TRUE(t.udpGsoActive());
-    EXPECT_EQ(t.maxMessagesPerSend(), 2u);
+    EXPECT_EQ(t.maxMessagesPerSend(), aeronDefaultMsgsPerSend());
     t.stop();
 }

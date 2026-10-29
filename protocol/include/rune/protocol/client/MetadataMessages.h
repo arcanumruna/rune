@@ -50,6 +50,12 @@
 //               some id is non-zero; whenever it is sent the endpoint trailer is sent too (empty strings when no
 //               partition has an endpoint), so a decoder that reads only the endpoint trailer ignores it.  Absent =
 //               every ingressReceiverId 0.
+//   [after the receiver trailer] optional response-port trailer (v16, NAT-safe egress): uint16 brokerCount (== the
+//               brokers[] count) + count × int32 LE BrokerEntry.responseControlPort, then uint16 partitionCount (== the
+//               partitions[] count) + count × int32 LE PartitionEntry.responseControlPort.  Sent only to sessions >=
+//               kClientVersionResponseEgress and only when some port is non-zero; whenever it is sent the endpoint and
+//               receiver trailers are sent too (empty strings / zero ids allowed), so older decoders stop before it.
+//               Absent = every responseControlPort 0.
 // ---------------------------------------------------------------------------
 
 #include <cstddef>
@@ -170,6 +176,7 @@ struct BrokerEntry {
     int32_t      nodeId = 0;
     int32_t      port   = 0;
     std::string_view host;  // zero-copy into source buffer
+    int32_t      responseControlPort = 0;  ///< v16: this broker's gateway response-control port (0 = none). Response-port trailer.
 };
 
 /// One partition entry as decoded from the response (fixed 28 bytes).
@@ -197,6 +204,10 @@ struct PartitionEntry {
     /// partition's ADVERTISED worker route (the ingressEndpoint, or the per-worker ingressStreamId on the node): the
     /// owning worker w's id w+1.  0 = the gateway (no worker route advertised).  Carried in the receiver trailer.
     uint8_t ingressReceiverId = 0;
+
+    /// v16: the owning worker's response-control port on the leader (the gateway's when no worker route).
+    /// Response-port trailer.
+    int32_t responseControlPort = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -231,6 +242,14 @@ struct MetadataResponse {
     [[nodiscard]] bool emitsReceiverIds() const noexcept {
         if (clientVersion < kClientVersionReceiverKeys) return false;
         for (const auto& p : partitions) if (p.ingressReceiverId != 0) return true;
+        return false;
+    }
+
+    /// v16: true when the response-port trailer is written (a session >= 16 and some port non-zero).
+    [[nodiscard]] bool emitsResponsePorts() const noexcept {
+        if (clientVersion < kClientVersionResponseEgress) return false;
+        for (const auto& b : brokers) if (b.responseControlPort != 0) return true;
+        for (const auto& p : partitions) if (p.responseControlPort != 0) return true;
         return false;
     }
 
@@ -293,7 +312,8 @@ struct MetadataResponse {
 
         // Additive trailer: uint16 count (== partitions.size()) + var-str per entry.
         // Written only when some endpoint is non-empty → default frames unchanged.
-        const bool receiverIds = emitsReceiverIds();
+        const bool responsePorts = emitsResponsePorts();
+        const bool receiverIds = emitsReceiverIds() || responsePorts;   // trailers are positional
         if (receiverIds || hasIngressEndpoints()) {
             detail::putLE16(buf, static_cast<int>(pos), static_cast<uint16_t>(partitions.size()));
             pos += 2;
@@ -304,6 +324,15 @@ struct MetadataResponse {
             detail::putLE16(buf, static_cast<int>(pos), static_cast<uint16_t>(partitions.size()));
             pos += 2;
             for (const auto& p : partitions) buf[pos++] = p.ingressReceiverId;
+        }
+        // v16: the response-port trailer, after the receiver trailer.
+        if (responsePorts) {
+            detail::putLE16(buf, static_cast<int>(pos), static_cast<uint16_t>(brokers.size()));
+            pos += 2;
+            for (const auto& b : brokers) { detail::putLE32(buf, static_cast<int>(pos), b.responseControlPort); pos += 4; }
+            detail::putLE16(buf, static_cast<int>(pos), static_cast<uint16_t>(partitions.size()));
+            pos += 2;
+            for (const auto& p : partitions) { detail::putLE32(buf, static_cast<int>(pos), p.responseControlPort); pos += 4; }
         }
         return pos;
     }
@@ -317,12 +346,14 @@ struct MetadataResponse {
         }
         sz += 2u;              // partitionCount
         sz += partitions.size() * 28u;  // read-rework: 28 bytes/entry (E5.1 was 20)
-        const bool receiverIds = emitsReceiverIds();
+        const bool responsePorts = emitsResponsePorts();
+        const bool receiverIds = emitsReceiverIds() || responsePorts;
         if (receiverIds || hasIngressEndpoints()) {
             sz += 2u;
             for (const auto& p : partitions) sz += 2u + p.ingressEndpoint.size();
         }
         if (receiverIds) sz += 2u + partitions.size();   // issue #116: count + one byte per partition
+        if (responsePorts) sz += 2u + brokers.size() * 4u + 2u + partitions.size() * 4u;   // v16
         return sz;
     }
 
@@ -407,6 +438,30 @@ struct MetadataResponse {
         if (idCount != partCount) return std::nullopt;   // must parallel partitions[]
         if (pos + idCount > avail) return std::nullopt;  // torn ids
         for (uint16_t i = 0; i < idCount; ++i) result.partitions[i].ingressReceiverId = buf[pos++];
+        // v16: optional response-port trailer (absent = every responseControlPort 0).
+        if (pos == avail) return result;
+        if (pos + 2u > avail) return std::nullopt;       // torn trailer header
+        const uint16_t brokerCount2 = detail::getLE16(buf, static_cast<int>(pos));
+        pos += 2;
+        if (brokerCount2 != brokerCount) return std::nullopt;   // must parallel brokers[]
+        if (pos + static_cast<std::size_t>(brokerCount2) * 4u > avail) return std::nullopt;
+        for (uint16_t i = 0; i < brokerCount2; ++i) {
+            const int32_t port = detail::getLE32(buf, static_cast<int>(pos));
+            if (port < 0 || port > 65535) return std::nullopt;   // not a port
+            result.brokers[i].responseControlPort = port;
+            pos += 4;
+        }
+        if (pos + 2u > avail) return std::nullopt;
+        const uint16_t partCount2 = detail::getLE16(buf, static_cast<int>(pos));
+        pos += 2;
+        if (partCount2 != partCount) return std::nullopt;       // must parallel partitions[]
+        if (pos + static_cast<std::size_t>(partCount2) * 4u > avail) return std::nullopt;
+        for (uint16_t i = 0; i < partCount2; ++i) {
+            const int32_t port = detail::getLE32(buf, static_cast<int>(pos));
+            if (port < 0 || port > 65535) return std::nullopt;   // not a port
+            result.partitions[i].responseControlPort = port;
+            pos += 4;
+        }
         return result;   // later additive trailers (none today) are ignored
     }
 };
