@@ -149,6 +149,7 @@ void subscribeRacingRevokeStaysEnded(bool shard, const char* tag) {
     const int64_t ws = rig.newUser({exact(SO::Write, ST::Topic, "orders")});
     ASSERT_EQ(rig.produce(ws, rig.orders, true), 0);
     int subscribedRounds = 0;
+    std::vector<int64_t> okIds;
     for (int round = 0; round < 15; ++round) {
         std::string reader;
         const int64_t rs = rig.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
@@ -175,6 +176,14 @@ void subscribeRacingRevokeStaysEnded(bool shard, const char* tag) {
         if (*code == 0) ++subscribedRounds;
         EXPECT_EQ(pushes(), atEnd) << "round " << round << ": subscribe answered " << *code << ", the sub (id " << subId
                                    << ") delivered after the revoke ended it and a re-grant";
+        // A Subscribe answered 45/46 has no id, so pushes() cannot see its zombie cursor: every Record must carry an id
+        // some Subscribe OK named.
+        if (subId != 0) okIds.push_back(subId);
+        const auto zombies = std::count_if(c.records().begin(), c.records().end(), [&](const auto& p) {
+            return std::find(okIds.begin(), okIds.end(), p.subscriptionId) == okIds.end();
+        });
+        EXPECT_EQ(zombies, 0) << "round " << round << ": subscribe answered " << *code
+                              << ", a Record carried a subscription id no Subscribe OK named (a zombie cursor)";
     }
     EXPECT_GT(subscribedRounds, 0) << "at least one round took the path under test (Subscribe OK, then revoked)";
 }
