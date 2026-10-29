@@ -1389,7 +1389,15 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     ASSERT_TRUE(after.has_value());
     EXPECT_EQ(after->first, -1) << "SILENT LOSS: the member would resume at " << after->first;
 
-    // Re-join: a new generation; every post-restart record exactly once from the log start.
+    // The member's pre-mint (member, generation) no longer holds: it must re-join.  Normally the lineage sweep
+    // bumps the generation; if the coordinator role flapped meanwhile, the group was unloaded (#565 / #570) and
+    // the member is unknown.  Either way a heartbeat at the old pair is refused — the generation number itself
+    // is not compared, since a reloaded group starts its count afresh.
+    const auto oldHb = c.heartbeat(gwC, kClientStream, sidC, "lg-nocommit", member, gen);
+    ASSERT_TRUE(oldHb.has_value());
+    EXPECT_NE(*oldHb, kOffsetOk) << "the group was not rebalanced for the new lineage";
+
+    // Re-join: every post-restart record exactly once from the log start.
     std::optional<ShardTestClient::JoinAnswer> j2;
     for (int k = 0; k < 400; ++k) {
         j2 = c.joinGroup(gwC, kClientStream, sidC, "lg-nocommit", member, {0});
@@ -1397,7 +1405,6 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
         std::this_thread::sleep_for(50ms);
     }
     ASSERT_TRUE(j2 && j2->errorCode == kOffsetOk);
-    EXPECT_GT(j2->generation, gen) << "the group was not rebalanced for the new lineage";
     const int64_t sidL2 = c.connect(gatewayChannel(g.ports, L), kClientStream);
     for (int64_t want = 0; want < 6; ++want) {
         const auto ack = c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL2, 0, P, 1, makeBatch(1));
