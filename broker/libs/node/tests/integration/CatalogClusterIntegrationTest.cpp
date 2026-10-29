@@ -1255,16 +1255,23 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
                             if (kind == cm::Kind::CreateTopic) {
                                 for (int p = 0; p < info->partitions; ++p) probes += rig.expectRetriableRefusal(n, info->id, p, what);
                             } else {
+                                // A bare NotLeader is the retriable refusal of a leader demoted / fenced in the window: evidence like the
+                                // R7 window's, excused only by a stall (the injected one, or the watchdog's) in the verdict below.
+                                const auto notLeader = [&](const Rig::ViewRead& v) {
+                                    const bool nl = v.answered && v.finalIsError && v.finalCode == cNotLeader;
+                                    if (nl) { pert.earlyNotLeader = true; pert.stampHarness(); }
+                                    return nl;
+                                };
                                 const auto r = rig.viewRowFollowing(n, info->id, static_cast<uint64_t>(kRacesViewSentinelKey));
                                 ++probes;
-                                EXPECT_TRUE(viewLegitimate(r))
+                                EXPECT_TRUE(notLeader(r) || viewLegitimate(r))
                                     << what << ": GetViewRow(sentinel) through node " << n << " answered " << viewAnswerText(r)
                                     << " (want the sentinel row or NotReady: never AbsentKey / UnknownView / a wrong row once applied)";
                                 // A key the source does not hold yet: AbsentKey (served) or NotReady, never a row / UnknownView.
                                 const auto a = rig.viewRowFollowing(n, info->id, 101);
                                 ++probes;
-                                EXPECT_TRUE(a.answered && !a.finalIsError &&
-                                            (a.finalCode == pc::ViewRowResponse::kAbsentKey || a.finalCode == pc::ViewRowResponse::kNotReady))
+                                EXPECT_TRUE(notLeader(a) || (a.answered && !a.finalIsError &&
+                                            (a.finalCode == pc::ViewRowResponse::kAbsentKey || a.finalCode == pc::ViewRowResponse::kNotReady)))
                                     << what << ": GetViewRow(101, not in the source yet) through node " << n << " answered "
                                     << viewAnswerText(a) << " (want AbsentKey or NotReady)";
                             }
