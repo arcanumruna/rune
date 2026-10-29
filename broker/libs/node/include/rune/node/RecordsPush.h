@@ -43,8 +43,9 @@
 // ADMIN_ACTION, ...) keeps the caller's retry-from-the-same-cursor semantics.
 //
 // No allocation, no locks/atomics, no virtual calls on the PLAINTEXT path:
-// the vectored offer goes through the C++ client's templated iterator
-// overload over a std::array. The ENCRYPTED path's two scratch buffers are
+// the vectored offer is aeron_exclusive_publication_offerv over two stack
+// iovecs (the C++ wrapper's vectored offer() builds a std::vector per call).
+// The ENCRYPTED path's two scratch buffers are
 // grow-once (never shrink; resize() only grows capacity, and only up to
 // maxMessageLength-ish frame sizes ever seen) and caller-owned (shared-
 // nothing — each thread that calls sendRecordsFrame owns its own
@@ -193,7 +194,6 @@ inline RecordsSendResult sendRecordsFrame(aeron::ExclusivePublication&          
     pc::detail::putLE32(scratch, static_cast<int>(fixedLen - 4u),
                         static_cast<int32_t>(static_cast<uint32_t>(rec.recordBatch.size())));
 
-    // The C++ wrapper's vectored offer builds a heap std::vector<aeron_iovec_t> per call; offer the stack iovecs directly.
     aeron_iovec_t parts[2] = {{scratch, fixedLen}, {const_cast<uint8_t*>(rec.recordBatch.data()), rec.recordBatch.size()}};
     int64_t pos = aeron_exclusive_publication_offerv(pub.publication(), parts, 2, nullptr, nullptr);
     if (pos == aeron::ADMIN_ACTION) [[unlikely]]   // A9: term rotated — retry now
