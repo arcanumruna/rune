@@ -808,7 +808,8 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesFeatureLevelTest.cpp
         tests/node/CheckedWritesWriteStateTest.cpp
         tests/node/CheckedWritesValidationMatrixTest.cpp
-        tests/node/CheckedWritesWorkerTest.cpp)
+        tests/node/CheckedWritesWorkerTest.cpp
+        tests/node/CheckedWritesSpecFanoutTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -1838,7 +1839,8 @@ if(BUILD_TESTING)
                        tests/client/ClientAuthClusterRegressionTest.cpp
                        tests/client/RuneConsoleBrokerRegressionTest.cpp
                        tests/client/ClaimBrokerRegressionTest.cpp
-                       tests/client/ProducerIdBrokerRegressionTest.cpp)
+                       tests/client/ProducerIdBrokerRegressionTest.cpp
+                       tests/client/CheckedWritesBrokerRegressionTest.cpp)
         # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed
         # `position.gen.h` (rune_gen_claim_schemas); the embedded client builds it under its own binary dir.
         add_dependencies(rune_client_broker_tests generate_claim_schema_headers)

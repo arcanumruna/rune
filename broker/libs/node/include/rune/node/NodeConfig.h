@@ -359,6 +359,9 @@ struct NodeConfig {
     // TEST-ONLY (ISR v3 Step 10): the metadata feature level this controller supports (0 = kBase: no storage tracking,
     // no NodeStorageRecord - the old-cluster path).  -1 (default): the binary's own level.
     int16_t testSupportedFeatureLevel = -1;
+    // TEST-ONLY (checked writes Part 02): SchemaFanout keeps every WriteSpecUpdate undelivered for this many control passes
+    // after it is posted, to prove a typed topic is not built before its spec reaches every worker.  0 = off.
+    uint32_t testHoldWriteSpecPasses = 0;
     // TEST-ONLY (ISR v3 Step 9, B-I8): every replica of this node emits no follower fetch for this long after
     // start (PartitionReplica::holdFetchesUntilForTest) - a wiped member that cannot catch up yet.  0 = off.
     int64_t testHoldFollowerFetchesMs = 0;

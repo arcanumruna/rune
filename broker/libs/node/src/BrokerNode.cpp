@@ -1618,6 +1618,7 @@ void BrokerNode::buildWorkerPool() {
         static_cast<std::size_t>(config_.ioSubmitRingDepth),       // E3 Task 7: io-ring depths
         static_cast<std::size_t>(config_.ioCompletionRingDepth),   // E3 Task 7
         config_.workerCoreBase);                                    // E4: CPU affinity base core
+    schemaFanout_.setHoldWriteSpecPassesForTest(config_.testHoldWriteSpecPasses);
 
     if (replicaRegistry_) {
         // Ordinal-invariant assert: routing uses partitionId() as the partition
@@ -5147,6 +5148,13 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                     spdlog::error("BrokerNode[{}]: malformed kA2cNsReapRequest (len={}) skipped", config_.nodeId, n);
                 return;
             }
+            if (tid == kA2cWriteSpec) {   // checked writes: a typed topic's write spec -> every worker, behind its schema versions
+                if (const auto w = decodeTopicWriteSpec(std::span<const uint8_t>(p, n)))
+                    schemaFanout_.postWriteSpec(w->topicId, std::vector<uint8_t>(p, p + n));
+                else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cWriteSpec (len={}) skipped", config_.nodeId, n);
+                return;
+            }
             if (tid == kA2cViewUninstall) {
                 const int32_t viewTopicId = decodeViewUninstall(p, n);
                 if (viewTopicId >= 0) onViewUninstall_(viewTopicId);
@@ -5172,6 +5180,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     if (metricsReady_) publishLoginTallies_();
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
+    work += serviceCreatesAwaitingSpec_();
     if (workerPool_) work += topicDroppedFanout_.pump(*workerPool_);   // R-M1
     if (workerPool_ && nsAggregator_.slotCapacity() != 0) {            // Namespaces Phase 2 Task 14 (D28): one tick per period
         if (nsAggregator_.doWork(nowNs) > 0)
@@ -5820,6 +5829,15 @@ void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool is
 
 void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
     if (!topicRegistry_) return;
+    // A typed topic is built only once its validators and write spec are on every worker's ring: otherwise a full ring
+    // could let the topic's partitions be owned (and served unvalidated) before its spec arrives.
+    if (workerPool_ && schemaFanout_.pendingFor(spec.topicId)) {
+        for (const auto& parked : pendingCreatesAwaitingSpec_)
+            if (parked.topicId == spec.topicId) return;   // the same effect again
+        (void)topicRegistry_->reserveTopicAt(spec.topicId, spec.name);   // seen: never a Gap a later create could tombstone
+        pendingCreatesAwaitingSpec_.push_back(spec);
+        return;
+    }
     try {
         if (commitReplicaFault_ && *commitReplicaFault_ == spec.name) [[unlikely]]
             throw std::runtime_error("injected replica-build fault (test)");
@@ -5841,10 +5859,32 @@ void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
     }
 }
 
+int BrokerNode::serviceCreatesAwaitingSpec_() {
+    if (pendingCreatesAwaitingSpec_.empty()) return 0;
+    int work = 0;
+    std::vector<TopicSpec> parked;
+    parked.swap(pendingCreatesAwaitingSpec_);
+    for (auto& spec : parked) {
+        if (schemaFanout_.pendingFor(spec.topicId)) { pendingCreatesAwaitingSpec_.push_back(std::move(spec)); continue; }
+        runCatalogCreate_(spec);
+        ++work;
+    }
+    return work;
+}
+
 void BrokerNode::dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::string& name) {
     // R-M1: every worker answers UnknownTopic (not the retriable NotLeader) for this id once the op runs —
     // posted on every path below (pending create, gap id, live topic): the id is dropped on this broker.
     if (workerPool_) topicDroppedFanout_.post(topicId);
+    schemaFanout_.forgetTopic(topicId);
+    // A typed create still waiting for its spec never ran: forget it, like one waiting behind a drop (below).
+    const auto awaitingSpec = pendingCreatesAwaitingSpec_.size();
+    std::erase_if(pendingCreatesAwaitingSpec_, [topicId](const TopicSpec& s) { return s.topicId == topicId; });
+    if (pendingCreatesAwaitingSpec_.size() != awaitingSpec) {
+        if (metadataService_) metadataService_->removeRuntimeTopic(topicId);   // idempotent
+        if (topicRegistry_) (void)topicRegistry_->dropTopic(topicId);
+        return;
+    }
     // A create of this id still waiting behind an older drop never ran: forget
     // it — its Pending slot becomes Dropped (it was seen: created, then dropped).
     const auto before = pendingCreatesBehindDrop_.size();

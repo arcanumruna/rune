@@ -4,6 +4,7 @@
 
 #include <rune/node/AdminChannels.h>
 #include <rune/node/OneToOneByteRing.h>
+#include <rune/node/WriteState.h>
 
 #include <gtest/gtest.h>
 
@@ -110,4 +111,16 @@ TEST(AdminChannelsRegression, ClusterFeatureLevelMessageRoundTripsRegression) {
     EXPECT_FALSE(decodeClusterFeatureLevel(wire, 1, level)) << "a 1-byte frame is refused";
     EXPECT_FALSE(decodeClusterFeatureLevel(wire, 3, level));
     EXPECT_EQ(kMsgClusterFeatureLevel, 37);
+}
+
+TEST(CheckedWritesSpecFanoutRegression, SpecFrameRoundTripsRegression) {
+    TopicWriteSpecWire w;
+    w.topicId = 44; w.keyFieldId = 2; w.keyType = rune::codec::PrimType::FixedStr; w.keyWidth = 12; w.legacyValidate = true;
+    uint8_t wire[kTopicWriteSpecWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(w, wire), kTopicWriteSpecWireLen);
+    const auto back = decodeTopicWriteSpec(std::span<const uint8_t>(wire, sizeof wire));
+    ASSERT_TRUE(back);
+    EXPECT_EQ(*back, w);
+    EXPECT_FALSE(decodeTopicWriteSpec(std::span<const uint8_t>(wire, 8))) << "an 8-byte frame is refused";
+    EXPECT_EQ(kA2cWriteSpec, 29);
 }

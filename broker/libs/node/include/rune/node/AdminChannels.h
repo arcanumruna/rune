@@ -191,6 +191,9 @@ enum : int32_t {
     // the offset / transaction-state stores and the transaction coordinator, to do one idempotent step of a namespace
     // delete: [correlation:u64][op:u8][nsId:u32][batch:u32] (ReapOp below).  The answer is kMsgNsReapResult.
     kA2cNsReapRequest       = 28,
+    // Checked writes Part 02: a typed topic's write spec, the encodeTopicWriteSpec bytes (WriteState.h).  Posted after the
+    // topic's kA2cSchemaUpdate frames and before its kA2cCatalogTopicApplied; the control thread fans it out behind them.
+    kA2cWriteSpec           = 29,
 };
 
 // ---------------------------------------------------------------------------
