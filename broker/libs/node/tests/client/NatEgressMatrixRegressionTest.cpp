@@ -306,8 +306,15 @@ struct GroupTap {
 /// closed (its duty thread gone), so its duty-owned observers can be read race-free.
 void everyOperation(std::unique_ptr<rc::Client>& out, rc::ClientConfig cfg, const rc::TopicSpec& spec,
                     const std::string& scratch, const std::string& tag,
-                    const std::function<void(rc::Client&)>& beforeClose) {
-    cfg.topics = {spec};
+                    const std::function<void(rc::Client&, rc::Client&)>& beforeClose) {
+    // The GROUP leg runs on a second NAT client (same declared address, own data dir): while a group is active on a
+    // Client a plain subscribe() to a partition another node leads is failed by design (documented contract of
+    // Client::subscribe(), LeaderElsewhereWhileGroupActive; issue #749).
+    rc::ClientConfig gcfgClient = cfg;
+    gcfgClient.dataDir = cfg.dataDir + "_g";
+    gcfgClient.egressChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());   // its own local subscription
+    gcfgClient.topics  = {spec};
+    auto groupClient = std::make_unique<rc::Client>(gcfgClient);
     out = std::make_unique<rc::Client>(cfg);
     rc::Client& cl = *out;
     GroupTap tap;
@@ -315,7 +322,7 @@ void everyOperation(std::unique_ptr<rc::Client>& out, rc::ClientConfig cfg, cons
     gcfg.autoCommit          = false;
     gcfg.sessionTimeoutMs    = 30'000;
     gcfg.commitSyncTimeoutMs = 30'000;
-    auto gc = cl.subscribeGroup("g-" + tag, {spec.name}, gcfg);
+    auto gc = groupClient->subscribeGroup("g-" + tag, {spec.name}, gcfg);
     gc.onAssigned([&tap](std::vector<rc::TopicPartition> tps) {
         std::lock_guard lk(tap.mu);
         for (const auto& tp : tps) tap.partitions.insert(tp.partition);
@@ -328,6 +335,7 @@ void everyOperation(std::unique_ptr<rc::Client>& out, rc::ClientConfig cfg, cons
         });
     });
     ASSERT_NO_THROW(cl.connectAndWait(60s)) << "connect over the response path";
+    ASSERT_NO_THROW(groupClient->connectAndWait(60s)) << "group client connect over the response path";
 
     // The group joins and is assigned every partition before the data is produced.
     ASSERT_TRUE(waitUntil([&] { std::lock_guard lk(tap.mu); return tap.partitions.size() == static_cast<std::size_t>(spec.partitionCount); }, 60s))
@@ -396,9 +404,10 @@ void everyOperation(std::unique_ptr<rc::Client>& out, rc::ClientConfig cfg, cons
     }
 
     // Duty-owned observers are read here, with every operation finished (close() resets the transport's pairing).
-    beforeClose(cl);
+    beforeClose(cl, *groupClient);
     for (auto& s : subs) s.unsubscribe();
     gc.close();
+    groupClient->close();
     cl.close();
 }
 
@@ -420,8 +429,9 @@ TEST(NatEgressMatrixRegression, NewClientEveryOperationOverResponsePathOneNodeRe
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     std::unique_ptr<rc::Client> client;
-    everyOperation(client, cfg, spec, "scratch", "n1", [](rc::Client& cl) {
+    everyOperation(client, cfg, spec, "scratch", "n1", [](rc::Client& cl, rc::Client& gcl) {
         EXPECT_TRUE(cl.testSeedResponseCorrelated()) << "the seed session is response-correlated";
+        EXPECT_TRUE(gcl.testSeedResponseCorrelated()) << "the group client's seed session is response-correlated";
     });
     ASSERT_NE(client, nullptr);
     EXPECT_GE(bindsAccepted(b.node()), 1u) << "the worker accepted the client's WorkerBind";
@@ -443,8 +453,9 @@ TEST(NatEgressMatrixRegression, NewClientEveryOperationOverResponsePathThreeNode
     ASSERT_TRUE(awaitLeaders(c, spec.topicId, 3, leaders, 30s));
 
     std::unique_ptr<rc::Client> client;
-    everyOperation(client, natClient(c, 1, r), spec, "scratch", "n3", [&](rc::Client& cl) {
+    everyOperation(client, natClient(c, 1, r), spec, "scratch", "n3", [&](rc::Client& cl, rc::Client& gcl) {
         EXPECT_TRUE(cl.testSeedResponseCorrelated());
+        EXPECT_TRUE(gcl.testSeedResponseCorrelated());
         // The gateway response port of every node was learnt (Metadata brokers entries / the seed's own config).
         for (int k = 1; k <= 3; ++k)
             EXPECT_EQ(cl.testKnownResponsePort(c.clientChannel(k)), r.gw[static_cast<std::size_t>(k - 1)])
