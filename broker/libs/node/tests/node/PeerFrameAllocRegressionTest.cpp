@@ -255,6 +255,43 @@ TEST(PeerFrameAllocRegression, SteadySealedReplicationAllocatesNothing) {
     EXPECT_EQ(a.peerFrameDrops() + b.peerFrameDrops(), 0u);
 }
 
+// The PLAINTEXT plane: a response above one MTU takes sendGatherToPeer's 2-buffer offer ([prefix | records]).
+// Mutation: offering it through the Aeron C++ wrapper's vectored offer() (a std::vector per call) turns this red.
+TEST(PeerFrameAllocRegression, SteadyPlainGatherReplicationAllocatesNothingRegression) {
+    MediaDriver driver;
+    aeron::Context ctx; ctx.aeronDir(driver.dir());
+    auto aeron = aeron::Aeron::connect(ctx);
+    constexpr int32_t kStreamA = 703, kStreamB = 704;
+    rr::WorkerReplicationTransport a(aeron, 0, "aeron:ipc", kStreamA, {{2, "aeron:ipc"}}, kStreamB);
+    rr::WorkerReplicationTransport b(aeron, 0, "aeron:ipc", kStreamB, {{1, "aeron:ipc"}}, kStreamA);
+    ASSERT_TRUE(a.resolved() && b.resolved());
+    for (int i = 0; i < 5000 && !(a.allPeersResolved() && b.allPeersResolved()); ++i) { (void)a.drivePeerResolve(); (void)b.drivePeerResolve(); std::this_thread::sleep_for(1ms); }
+    std::this_thread::sleep_for(100ms);
+
+    const std::vector<uint8_t> large(6000, 0x33);
+    uint64_t gotResp = 0, gotBytes = 0;
+    auto onA = [&](int32_t, int32_t, uint16_t tid, const uint8_t*, std::size_t len) {
+        if (tid == rr::FetchResponseMsg::TEMPLATE_ID) { ++gotResp; gotBytes += len; }
+    };
+    auto round = [&] {
+        rr::FetchResponseMsg resp{};
+        resp.leaderEpoch = 3; resp.partition = 7; resp.highWatermark = 99; resp.topicId = 5;
+        resp.records = std::span<const uint8_t>(large);
+        (void)b.sendFetchResponse(1, resp);
+        for (int i = 0; i < 4; ++i) (void)a.poll(8, onA);
+    };
+    for (int i = 0; i < 200; ++i) { round(); std::this_thread::sleep_for(200us); }   // warm-up: the assembler's per-image buffer
+    ASSERT_GT(gotResp, 0u);
+    ASSERT_GT(gotBytes / gotResp, large.size()) << "each response carried the 6000 B records (> the 1408 B ipc MTU: the gather path)";
+    const uint64_t resp0 = gotResp;
+    {
+        Armed armed;
+        for (int i = 0; i < 2000; ++i) round();
+    }
+    EXPECT_EQ(gAllocs.load(), 0u) << "plaintext gather replication allocated on the transport's thread in steady state";
+    EXPECT_GT(gotResp, resp0) << "frames really flowed during the armed window";
+}
+
 // Review of PR #551 (issue #17), hot path: the sealed idle keepalive runs on the control thread every duty cycle.  In
 // steady state, sendIdleKeepalives (the idle check AND the seal + send of a due keepalive) and the receive side (the
 // consensus ingress opening it, the ring, the adapter consuming it) allocate nothing on that thread.
