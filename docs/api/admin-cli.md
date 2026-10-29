@@ -31,7 +31,7 @@ Exit codes: `0` success, `1` error, `2` usage error, and `3` for `rune catalog d
 
 ```text
 rune ql (-e "<statement>" | -f <file|->) [--dry-run] [--verbose] [--request-id <32 hex digits>]
-        [--validate] [--expected-version N] --broker host:port
+        [--expected-version N] --broker host:port
 ```
 
 Executes Rune QL: DDL (topics, drops, security) and reads (`SHOW HISTORY`, `SHOW ... AS OF`, `DIFF`, `SHOW USERS`, ...).
@@ -44,7 +44,6 @@ The statement text is recorded in the catalog. The grammar and examples are in [
 | `--dry-run` | Parse and print the plan. No broker needed. |
 | `--verbose` | Print every followed redirect and NotLeader retry to stderr. |
 | `--request-id <32 hex>` | Fix the DDL's request id (not all zero). With `-f`, statement `N` uses the id plus `N - 1`. A re-run returns the original results. |
-| `--validate` | Make the broker validate every produced record against the schema of each `topic` the input defines. |
 | `--expected-version N` | The optimistic-concurrency gate for `alter topic` (0..65535, default 0 = none). A stale value is `SchemaConflict`. |
 
 `rune ql` exits `1` on any failure; it does not map a broker refusal to its wire code (`rune console -f` does).
@@ -56,7 +55,7 @@ The interactive Rune QL shell, and the way to run a `.rql` script (topic DDL inc
 
 ```text
 rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run]
-             [--validate] [--expected-version N] [--request-id <32 hex>] [--verbose]
+             [--expected-version N] [--request-id <32 hex>] [--verbose]
              [--user <u>] [--password-file <p>] [--tls-ca <pem>] [--tls-host <name>] [--insecure-plaintext]
 ```
 
@@ -64,7 +63,6 @@ rune console [--broker <ep>] [--cli-egress <ch>] [-f <script.rql|->] [--dry-run]
 |---|---|
 | `-f <file\|->` | Run a script (`-` is stdin) instead of the interactive shell. |
 | `--dry-run` | Parse and print the plan. No broker needed. |
-| `--validate` | Make the broker validate every produced record against the schema of each `topic` the input defines. |
 | `--expected-version N` | The optimistic-concurrency gate for `alter topic` (0..65535, default 0 = none). A stale value is `SchemaConflict`. |
 | `--request-id <32 hex>` | Fix the DDL's request id (not all zero). With `-f`, statement `N` uses the id plus `N - 1`. A re-run returns the original results; without it, defining a topic that exists is `TopicExists`. |
 | `--verbose` | Print every followed redirect and NotLeader retry to stderr. |

@@ -128,7 +128,7 @@ retry returns the original result.
 TopicOptions opts;                    // replicationFactor 0 = every broker
 opts.replicationFactor = 3;
 DdlOptions ddl;                       // statement text, client name, request id
-auto untyped = client.defineTopicAndWait("events", 3, /*keyField=*/"", {}, /*validate=*/false,
+auto untyped = client.defineTopicAndWait("events", 3, /*keyField=*/"", {},
                                           Persistence::Disk, opts, ddl, 15s);
 if (untyped.errorCode != 0) std::cerr << "defineTopic: " << untyped.errorCode << " " << untyped.detail << "\n";
 
@@ -137,7 +137,7 @@ auto d = rune::codec::DescriptorBuilder("player", 1)
              .addFixedStr("name", 32)
              .add("score", rune::codec::PrimType::Int64)
              .build();
-auto typed = client.defineTopicAndWait("player", 4, "userId", rune::codec::serialize(d), /*validate=*/true,
+auto typed = client.defineTopicAndWait("player", 4, "userId", rune::codec::serialize(d),
                                         Persistence::Disk, TopicOptions{}, DdlOptions{}, 15s);
 DdlResult dropped = client.dropTopicAndWait("events", DdlOptions{}, 15s);
 ```
@@ -158,6 +158,13 @@ is replicated in memory and never written to disk. The usual way to create topic
 
 `DefineTopicResult::topicId` plus the partition count you passed make the `TopicHandle{topicId, partitionCount}` that a
 producer needs. `Client::topic(name)` finds a handle only in the static `ClientConfig::topics` list.
+
+### Raw and typed handles
+
+A typed topic validates every write; an untyped one is a raw log. A handle binds only to its own kind:
+`openTopicAndWait<T>` refuses an untyped topic ("is an untyped (raw) topic") and `rawTopicAndWait(name)` refuses a typed
+one ("is a typed topic"), as it does an unknown name. A raw `send` to a typed topic must use the key field's exact bytes
+(`Key(uint32_t{7})` for a `uint32` key).
 
 ## Produce
 
@@ -185,7 +192,9 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
 
   Use `Acks::All` whenever a record must not be lost.
 - **`Key`**: up to 16 inline bytes, built from a `uint64_t`/`int64_t`, a trivially-copyable value or a byte span. The key
-  picks the partition (`Key::partition(n)`, FNV-1a 64) and is stored with the record.
+  picks the partition (`Key::partition(n)`, FNV-1a 64) and is stored with the record. A key is never truncated: a span of
+  more than 16 bytes is an over-long key (`Key::tooLong()`), `trySend` returns `SendResult::KeyTooLong` and `send` throws
+  `std::invalid_argument`; a trivially-copyable value wider than 16 bytes does not compile.
 - **Record size**: key plus value at most `Producer::kMaxRecordBytes` = 16 KiB. A larger one is rejected at append:
   `trySend` returns `SendResult::MessageTooLarge`; `send` throws `std::length_error`.
 - **Batching**: sends within `lingerUs` (default 5 ms) are batched per partition up to `batchBytes` (64 KiB). `lingerUs`

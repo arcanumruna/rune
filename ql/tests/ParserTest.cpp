@@ -243,3 +243,15 @@ TEST(CheckedWritesQl, ReplicasAndWithWorkWithoutPartitions) {
     EXPECT_EQ(topicOf(r).replicas, 3);
     EXPECT_EQ(topicOf(r).with.size(), 1u);
 }
+
+TEST(CheckedWritesQl, DocExamplesParse) {
+    for (const char* stmt : {"topic events;",
+                             "topic logs partitions 3 replicas 3;",
+                             "transient topic presence;",
+                             "topic player { userId uint64, name string(32), score int64 } partitions 4 key userId;",
+                             "topic orders partitions 4 replicas 3 with (tier = leader, durability = all-in-sync);",
+                             "topic audit partitions 1 with (cleanup.policy = compact, segment.bytes = 1048576);"}) {
+        const auto r = parse(stmt);
+        EXPECT_TRUE(r.has_value()) << stmt << ": " << (r ? "" : r.error().message);
+    }
+}
