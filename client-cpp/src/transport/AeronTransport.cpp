@@ -601,7 +601,7 @@ void AeronTransport::startEmbeddedDriver() {
     // and a holder killed without a clean shutdown releases the lock with its process.
     {
         std::string lockErr;
-        dirLock_ = DriverDirLock::tryAcquire(aeronDir, lockErr);
+        dirLock_ = DriverDirLock::tryLock(aeronDir, lockErr);
         if (!dirLock_) {
             throw std::runtime_error(
                 "AeronTransport: aeron dir '" + aeronDir + "' is already in use by a live media "
