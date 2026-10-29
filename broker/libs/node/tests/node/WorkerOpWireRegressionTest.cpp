@@ -24,3 +24,10 @@ TEST(WorkerOpWireRegression, ClusterFeatureLevelRoundTripsRegression) {
     EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::ClusterFeatureLevel), 31);
     EXPECT_EQ(static_cast<int>(sbe::OpType::Value::NS_VIEW_MEM_OVER), 30);
 }
+
+TEST(WorkerOpWireRegression, WriteSpecUpdateRoundTripsRegression) {
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::WRITE_SPEC_UPDATE), 32);
+    EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::WRITE_SPEC), 12);
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::WriteSpecUpdate), 32);
+    EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::FILTER), 11);
+}

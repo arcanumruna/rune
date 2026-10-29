@@ -788,9 +788,11 @@ if(BUILD_TESTING)
     # Uses InMemoryLog + Worker directly (no Aeron required).
     # ---------------------------------------------------------------------------
     add_executable(rune_produce_validation_tests
-        tests/integration/ProduceValidationTest.cpp)
+        tests/integration/ProduceValidationTest.cpp
+        tests/support/AllocWindow.cpp)
     target_include_directories(rune_produce_validation_tests PRIVATE
-        ${RUNE_PROTOCOL_INCLUDE})
+        ${RUNE_PROTOCOL_INCLUDE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_produce_validation_tests PRIVATE
         rune_node
         rune_replication
@@ -805,7 +807,8 @@ if(BUILD_TESTING)
     add_executable(rune_checked_writes_tests
         tests/node/CheckedWritesFeatureLevelTest.cpp
         tests/node/CheckedWritesWriteStateTest.cpp
-        tests/node/CheckedWritesValidationMatrixTest.cpp)
+        tests/node/CheckedWritesValidationMatrixTest.cpp
+        tests/node/CheckedWritesWorkerTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
