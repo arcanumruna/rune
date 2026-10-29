@@ -1043,6 +1043,97 @@ TEST(MarkerRetryRegression, EndTxnAbortWhosePrepareAppendIsRefusedIsAnsweredRetr
 }
 
 // ============================================================================
+// Namespace delete, reaper step AbortTxns (abortNamespaceTxns): More until every marker of the namespace's open / ending
+// transactions had its first answer, so the topics are dropped only after a landing marker is in the log; a refused
+// marker (its partition may be the namespace's own, which only the drop removes) never holds the delete.  The rig's
+// topic is in nsId 0, so the namespace is 0 here (the reaper never deletes `default`; the method does not care).
+//
+// Interaction matrix (transaction at the delete x marker x namespace asked):
+//   | txn at the delete      | marker           | namespace | expected                                          | test
+//   |------------------------|------------------|-----------|---------------------------------------------------|-----
+//   | Ongoing                | lands            | its own   | More until the ABORT marker is in the log, Done   | ...WaitsForTheMarker
+//   | PrepareCommit (EndTxn) | lands            | its own   | More until the COMMIT marker is in the log, Done  | ...WaitsForTheMarker
+//   | PrepareAbort (EndTxn)  | lands            | its own   | More until the ABORT marker is in the log, Done   | ...WaitsForTheMarker
+//   | each of the three      | refused (minIsr) | its own   | Done once refused; the drop settles the txn       | ...NeverWaitsOnARefused
+//   | each of the six above  | -                | another   | Done at once, the transaction untouched           | both
+//   | coordinator not loaded | -                | its own   | Refused (the reaper asks again)                   | ...NotLoaded
+// ============================================================================
+namespace {
+
+enum class AtDelete { Ongoing, PrepareCommit, PrepareAbort };
+
+const char* nameOf(AtDelete at) {
+    return at == AtDelete::Ongoing ? "Ongoing" : at == AtDelete::PrepareCommit ? "PrepareCommit" : "PrepareAbort";
+}
+
+/// One transaction of 1 record on t/0, in state `at`; the marker of partition 0 is refused while `refused` (minIsr 2).
+void nsAbortCell(AtDelete at, bool refused) {
+    SCOPED_TRACE(std::string(nameOf(at)) + (refused ? ", marker refused" : ", marker lands"));
+    TxnRig T(/*minIsr=*/refused ? 2 : 1);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_EQ(T.m.r->log()->logEndOffset(), 1);
+    if (at != AtDelete::Ongoing) ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/at == AtDelete::PrepareCommit));
+    const tx::TxnState prepared = at == AtDelete::PrepareCommit ? tx::TxnState::PrepareCommit : tx::TxnState::PrepareAbort;
+    const tx::TxnState complete = at == AtDelete::PrepareCommit ? tx::TxnState::CompleteCommit : tx::TxnState::CompleteAbort;
+
+    int64_t now = 10;
+    EXPECT_EQ(T.tcs->abortNamespaceTxns(7, now), ReapStatus::Done) << "another namespace's delete";
+    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, now), ReapStatus::More) << "the marker has not been answered yet";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), prepared);
+    ReapStatus st = ReapStatus::More;
+    for (int i = 0; i < 64 && st == ReapStatus::More; ++i) {   // the coordinator and the worker, 1 ms apart
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+        now += 1'000'000;
+        st = T.tcs->abortNamespaceTxns(0, now);
+    }
+    ASSERT_EQ(st, ReapStatus::Done) << "the namespace delete never passed AbortTxns";
+    EXPECT_EQ(T.tcs->abortNamespaceTxns(7, now), ReapStatus::Done);
+    if (!refused) {
+        EXPECT_EQ(T.m.r->log()->logEndOffset(), 2) << "Done before the marker was in the log: the drop races it";
+        EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), complete);
+        return;
+    }
+    EXPECT_GE(T.tcs->controlMarkersRefusedForTest(), 1u) << "precondition: the marker was refused";
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 1) << "no marker in the log";
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), prepared) << "still ending: only the drop settles it";
+    // The reaper drops the topic: the marker's retry finds no partition, and the transaction settles.
+    T.tcs->onControlMarkerRefused(0, 0, T.pid, static_cast<int16_t>(pc::ErrorCode::UnknownPartition),
+                                  rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), complete);
+    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, now), ReapStatus::Done);
+}
+
+}  // namespace
+
+// RED (before 60c39b52, Done at once): the Ongoing cell's first More, and its LEO 2 once Done.
+TEST(NamespaceTxnAbortRegression, AbortNamespaceTxnsWaitsForTheMarkerRegression) {
+    for (const AtDelete at : {AtDelete::Ongoing, AtDelete::PrepareCommit, AtDelete::PrepareAbort}) nsAbortCell(at, false);
+}
+
+// RED (60c39b52 alone, More until no transaction is ending): "the namespace delete never passed AbortTxns" - the marker
+// waits for the partition the delete would drop, the drop for the marker.
+TEST(NamespaceTxnAbortRegression, AbortNamespaceTxnsNeverWaitsOnARefusedMarkerRegression) {
+    for (const AtDelete at : {AtDelete::Ongoing, AtDelete::PrepareCommit, AtDelete::PrepareAbort}) nsAbortCell(at, true);
+}
+
+// RED (Done when not loaded): the catalog leader that is not the coordinator would let the topics go before the
+// coordinator elsewhere wrote its markers.
+TEST(NamespaceTxnAbortRegression, AbortNamespaceTxnsNotLoadedIsRefusedRegression) {
+    TxnRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, 10), ReapStatus::More);
+    T.leader = false;
+    (void)T.tcs->doWork(20);
+    ASSERT_FALSE(T.tcs->isLoaded());
+    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, 30), ReapStatus::Refused);
+}
+
+// ============================================================================
 // I4 (+m3, m4) — coordinator failover, durable completion, EndTxn table.
 // ============================================================================
 

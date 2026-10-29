@@ -5991,10 +5991,10 @@ void BrokerNode::onNsReapRequest_(const ReapRequestMsg& m) {
     ReapStatus st = ReapStatus::Done;
     switch (m.op) {
     case ReapOp::AbortTxns:
-        // Only the loaded coordinator holds transactions (the others return 0): the gateway's apply of the namespace state
-        // change already aborted them on that node; this re-issue covers a coordinator that loaded since.
-        if (txnCoordService_) (void)txnCoordService_->abortAllForNamespace(m.nsId, nowNs);
-        st = ReapStatus::Done;
+        // Only the loaded coordinator holds transactions: the gateway's apply of the namespace state change already aborted
+        // them on that node; this re-issue covers a coordinator that loaded since.  More until the markers had their first
+        // answer: the topics must still exist for them.
+        if (txnCoordService_) st = txnCoordService_->abortNamespaceTxns(m.nsId, nowNs);
         break;
     case ReapOp::TombstoneGroups:
         if (groupCoordService_) st = groupCoordService_->tombstoneNamespace(m.nsId, m.batch, nowNs);
