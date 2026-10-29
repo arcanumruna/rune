@@ -8428,7 +8428,9 @@ private:
         const auto chk = ackSink_->checkBind(msg->sessionId, msg->token);
         if (chk == SessionAckSink::BindResult::AlreadyBound) {
             // I2: a repeat of the accepted bind (the client has not seen the ack): same image -> owe the ack again.
-            if (ackSink_->boundImage(msg->sessionId) == image) { oweBindAck_(msg->sessionId, msg->correlationId); return; }
+            if (ackSink_->boundImage(msg->sessionId) == image) { oweBindAck_(msg->sessionId, msg->correlationId);
+            return;
+        }
             ++workerBindsRefused_;
             return;
         }
@@ -8450,7 +8452,12 @@ private:
         const std::string channel = "aeron:udp?control=" + responseControlEndpoint_ +
                                     "|control-mode=response|response-correlation-id=" + std::to_string(corr);
         const auto r = ackSink_->bind(msg->sessionId, msg->token, image, channel);
-        if (r == SessionAckSink::BindResult::Bound) { ++workerBindsAccepted_; oweBindAck_(msg->sessionId, msg->correlationId); return; }
+        if (r == SessionAckSink::BindResult::Bound) {
+            ++workerBindsAccepted_;
+            workerIngress_->requestImageRescan();   // a reconnect may have masked a lost image (count unchanged)
+            oweBindAck_(msg->sessionId, msg->correlationId);
+            return;
+        }
         ++workerBindsRefused_;
         if (unauthLog_.due(19))
             spdlog::warn("Worker {}: WorkerBind for session {} from image {} refused (result {}; refused so far {})",

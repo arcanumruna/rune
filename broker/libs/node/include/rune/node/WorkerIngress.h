@@ -40,7 +40,6 @@
 #include <concurrent/AtomicBuffer.h>
 #include <util/Index.h>
 
-#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -80,12 +79,11 @@ public:
         // this ctor is noexcept, so it becomes a logged resolve failure.
         bool failed = false;
         try {
-            // NAT-safe egress (Task 6): note every image that goes away.  The handler runs inside the conductor
-            // invoker -> on this worker's thread (shard clients use the invoker), so the ring below has ONE writer
-            // and ONE reader and needs no synchronisation.  Cold (an image ends), no allocation: a fixed ring.
-            const int64_t regId = aeron_->addSubscription(
-                channel_, streamId_, aeron::defaultOnAvailableImageHandler,
-                [this](aeron::Image& image) { noteUnavailable_(image.sessionId()); });
+            // No unavailable-image handler (NAT-safe egress, Task 6): Aeron owns a registered handler until the
+            // subscription CLOSE completes (after ~WorkerIngress) and runs it on the client's conductor thread, which
+            // is neither this object's lifetime nor this worker's thread.  A lost image is found on the polling
+            // thread instead: see drainUnavailable().
+            const int64_t regId = aeron_->addSubscription(channel_, streamId_);
             sub_ = pump.resolve([&]() -> std::shared_ptr<aeron::Subscription> {
                 try {
                     return aeron_->findSubscription(regId);
@@ -195,35 +193,27 @@ public:
             return image ? image->correlationId() : -1;
         } catch (...) { return -1; }
     }
-    /// Hand every image that became unavailable since the last drain to `f(int32_t aeronSessionId)`.  On ring overflow
-    /// `f` is called for every id in `candidates` whose image no longer exists instead (the caller passes its bound
-    /// images), so a lost notification can never leave a session bound to a dead image.
-    /// Returns how many ids were handed out.  Zero cost when nothing happened (one compare).
+    /// Hand `f(int32_t aeronSessionId)` every id in `candidates` (the caller passes its bound images) whose image no
+    /// longer exists.  Runs on the polling thread ONLY and registers no Aeron callback.  A loss is seen at the first
+    /// drain after the subscription's image count changes (one acquire load otherwise, zero cost).  A loss masked by a
+    /// simultaneous arrival (count unchanged) is caught by the rescan requested on the next successful bind
+    /// (requestImageRescan) or the next count change; the gateway's session reaping is the backstop.  Unbinding is
+    /// cleanup (the session can never be answered again and the client reconnects with a new session), never a hang.
+    /// `candidates` may yield one id more than once; `f` must be idempotent.  Returns how many ids were handed out.
     template <class F, class Candidates>
     int drainUnavailable(F&& f, Candidates&& candidates) {
-        if (unavailHead_ == unavailTail_ && !unavailOverflowed_) [[likely]] return 0;
+        if (!sub_) return 0;
+        const int images = sub_->imageCount();                 // one acquire load, the list Aeron's poll reads
+        if (images == lastDrainImages_) [[likely]] return 0;
+        lastDrainImages_ = images;
         int n = 0;
-        if (unavailOverflowed_) {
-            unavailOverflowed_ = false;
-            unavailHead_ = unavailTail_;                       // the ring is superseded by the scan below
-            candidates([&](int32_t id) { if (imageCorrelationIdOf(id) < 0) { f(id); ++n; } });
-            return n;
-        }
-        while (unavailHead_ != unavailTail_) {
-            f(unavailRing_[unavailHead_ % unavailRing_.size()]);
-            ++unavailHead_;
-            ++n;
-        }
+        candidates([&](int32_t id) { if (imageCorrelationIdOf(id) < 0) { f(id); ++n; } });
         return n;
     }
-    [[nodiscard]] bool unavailableOverflowedForTest() const noexcept { return unavailOverflowed_; }
+    /// Make the next drainUnavailable() rescan every candidate (a new bind may have masked a loss).
+    void requestImageRescan() noexcept { lastDrainImages_ = -1; }
 
 private:
-    void noteUnavailable_(int32_t aeronSessionId) noexcept {
-        if (unavailTail_ - unavailHead_ == unavailRing_.size()) { unavailOverflowed_ = true; return; }
-        unavailRing_[unavailTail_ % unavailRing_.size()] = aeronSessionId;
-        ++unavailTail_;
-    }
     // Mirror the exact constants from ClientGateway.cpp:49-50.
 
     std::shared_ptr<aeron::Aeron>          aeron_;
@@ -236,9 +226,7 @@ private:
     rune::aeronutil::ControlledFragmentAssembler controlledAssembler_;   // controlledPoll only
     rune::aeronutil::ImageLossWatch              controlledImageWatch_;
 
-    std::array<int32_t, 64>                unavailRing_{};      ///< Task 6: unavailable image session ids (single owner)
-    uint64_t                               unavailHead_ = 0, unavailTail_ = 0;
-    bool                                   unavailOverflowed_ = false;
+    int                                    lastDrainImages_ = -1;   ///< image count at the last drain; -1 = rescan next
 };
 
 } // namespace rune::node
