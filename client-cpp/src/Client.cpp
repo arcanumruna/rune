@@ -181,7 +181,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.transport.termBufferLength = c.termBufferBytes;
 
     // Session egress config (for ConnectRequest body).
-    acfg.session.egressChannel  = c.egressChannel;
+    acfg.session.egressChannel  = c.declaredEgressChannelForTest.empty() ? c.egressChannel : c.declaredEgressChannelForTest;
     acfg.session.egressStreamId = c.egressStreamId;
 
     // Pass through keepalive interval if the caller overrides it.

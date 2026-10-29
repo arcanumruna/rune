@@ -2033,6 +2033,18 @@ if(BUILD_TESTING)
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_client_failover_broker_tests PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 
+        # NAT-safe egress Task 8: the REAL client behind a simulated NAT (declared egress unroutable) against real
+        # in-process brokers: every operation must ride the response path (1 / 3 nodes, TLS+auth, mixed old/new,
+        # leader change mid-connect, source-port change, derived default ports).
+        add_executable(rune_nat_egress_matrix_tests tests/client/NatEgressMatrixRegressionTest.cpp)
+        add_dependencies(rune_nat_egress_matrix_tests generate_claim_schema_headers)
+        target_include_directories(rune_nat_egress_matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                                   ${RUNE_CLIENT_ROOT}/tests ${CMAKE_BINARY_DIR}/rune-client/claim-gen
+                                   ${CMAKE_BINARY_DIR}/rune-client/claim-gen/gen ${RUNE_CLIENT_ROOT}/examples)
+        target_link_libraries(rune_nat_egress_matrix_tests PRIVATE rune_node rune_view rune_codec rune_catalog
+                              rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_nat_egress_matrix_tests PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+
         # Catalog history Task 11: the DDL route (Redirect / NotLeader / Internal when
         # halted) and the halted controller's resignation, 3 brokers over real Aeron.
         add_executable(rune_catalog_leadership_broker_tests tests/integration/CatalogLeadershipBrokerTest.cpp)

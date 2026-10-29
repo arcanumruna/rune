@@ -650,6 +650,17 @@ public:
     /// Test seam: the gateway clock the auth handlers (throttle, deadline) read (doWork sets it each cycle).
     void setNowNsForTest(int64_t ns) noexcept { nowNs_ = ns; }
     [[nodiscard]] bool hasSessionForTest(int64_t sid) { return sessions_.find(sid) != nullptr; }
+    /// NAT egress Task 8 seam (cold, control thread): every live session id.
+    [[nodiscard]] std::vector<int64_t> sessionIdsForTest() {
+        std::vector<int64_t> ids;
+        sessions_.forEach([&](const Session& s) { ids.push_back(s.sessionId); });
+        return ids;
+    }
+    /// NAT egress Task 8 seam: the Connect image's "host:port" of a session ("" = unknown session / unit test).
+    [[nodiscard]] std::string sessionSourceIdentityForTest(int64_t sid) {
+        const Session* s = sessions_.find(sid);
+        return s ? s->sourceIdentity : std::string{};
+    }
     [[nodiscard]] uint64_t securitySubscribesForwarded() const noexcept { return securitySubscribesForwarded_; }
     /// DDLs answered by the route without reaching the admin ring (Redirect /
     /// NotLeader / Internal / pre-v8 InvalidRequest).

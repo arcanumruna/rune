@@ -292,6 +292,10 @@ struct ClientConfig {
     /// its own flow through NAT.  The leader's port is learnt from the Redirect `#port` suffix, every broker's from
     /// Metadata.  0 (default) = the declared `egressChannel` path only.
     int32_t     gatewayResponseControlPort = 0;
+    /// Test seam (NAT egress Task 8): when non-empty, the ConnectRequest DECLARES this egress channel while the
+    /// transport still subscribes on `egressChannel` (models a client behind NAT whose declared address is
+    /// unreachable).  Empty (default) = declare `egressChannel`.
+    std::string declaredEgressChannelForTest;
     std::string dataDir;
 
     // High-level timeouts (milliseconds).
