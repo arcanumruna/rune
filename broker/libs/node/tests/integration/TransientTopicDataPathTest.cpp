@@ -1034,7 +1034,10 @@ TEST(TransientLineageClusterRegression, StaggeredFullRestartWithTheOldLeaderLast
     // the last few, served after the hold legitimately decided P, read as "an answer other than NotLeader".
     // The window is now explicit (sampling ends 500 ms before the earliest possible hold end) and 10 s wide
     // so >= 100 answers fit even under load.
-    g.holdMs = 10'000;
+    // TSan (#622): restarting the two nodes alone took ~9.6 s, so a 10 s hold left no window at all (0 answers).
+    // 30 s covers the restart plus >= 100 answers at sanitizer speed; the final settledFetch (>= 30 s of retries)
+    // absorbs whatever hold is left once the old leader returns.
+    g.holdMs = 30'000;
     const auto holdStart = std::chrono::steady_clock::now();
     const auto sampleUntil = holdStart + std::chrono::milliseconds{g.holdMs} - 500ms;
     for (int i = 0; i < 3; ++i) if (i != leader) g.start(i);   // the old partition leader stays down
