@@ -153,6 +153,11 @@ void subscribeRacingRevokeStaysEnded(bool shard, const char* tag) {
         std::string reader;
         const int64_t rs = rig.newUser({exact(SO::Read, ST::Topic, "orders")}, &reader);
         const int64_t corr = c.sendSubscribe(rig.ch(), rig.stream(), rs, rig.orders, 0);
+        // The Subscribe OK waits for the session's record-egress pub (~20 ms to resolve), longer than a revoke round trip:
+        // sweep the revoke across that window, and let every third round wait for the OK so the OK-then-revoked path is
+        // always taken, whatever the timing.
+        if (round % 3 == 2) ASSERT_TRUE(c.pollUntil([&] { return c.subscriptionIdOf(corr).has_value(); }));
+        else c.pollFor(std::chrono::milliseconds(round * 4), [] { return false; });
         pc::SecurityDdl m; m.kind = pc::SecurityOpKind::Revoke; m.name = reader; m.granteeKind = 0;
         m.op = static_cast<uint8_t>(SO::Read); m.resourceType = static_cast<uint8_t>(ST::Topic);
         m.patternKind = static_cast<uint8_t>(SP::Exact); m.pattern = "orders";
