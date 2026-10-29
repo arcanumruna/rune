@@ -448,3 +448,16 @@ TEST(CheckedWritesBrokerRegression, ThreeNodesNewLeaderValidatesRegression) {
     EXPECT_EQ(produce(cw::encode(bad)), kSchemaValidationFailed);
     EXPECT_EQ(produce(cw::validRecord(1)), kOk);
 }
+
+// A typed TRANSIENT topic validates like a disk one: its partitions append to an InMemoryLog through the same
+// produceCore_, and their RcSlot carries the write state.  (TransientTopicDataPathTest now runs on an untyped topic.)
+TEST(CheckedWritesBrokerRegression, TransientTypedTopicValidatesRegression) {
+    OneBroker b("cw-transient", OneBroker::Runtime::Shard);
+    const auto t = b.connectClient()->defineTopicAndWait("p", 1, "id", rune::codec::serialize(cw::matrixDescriptor()),
+                                                        rc::Persistence::Transient, {}, {}, 60s);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    cw::Parts bad; bad.bio = std::string("\xC0\xAF", 2);
+    EXPECT_EQ(send(b, "p", t.topicId, 1, cw::encode(bad)), kSchemaValidationFailed);
+    EXPECT_EQ(send(b, "p", t.topicId, 1, cw::validRecord(1)), kOk);
+    EXPECT_EQ(cwb::produceRaw(b, "p", t.topicId, 1, "", rc::Key(uint32_t{1})), kSchemaValidationFailed) << "a wrong-width tombstone";
+}
