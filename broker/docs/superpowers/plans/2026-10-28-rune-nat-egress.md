@@ -170,3 +170,11 @@ See spec §5.
   - produce, consume, group and transaction, DDL, and two clients behind the same NAT.
 - **ABAB bench** before and after on the default config; record the baseline in BENCHMARKING.md.
 - Update the docs: `docs/operations.md` (ports, NAT), `docs/configuration.md`, and the release notes.
+
+## Recorded choices
+- `ShardConfig` keeps the declared egress port offset: the declared subscription still binds a port.
+- Every worker in Metadata is bound eagerly by the client.
+- The CLI and `dr_client` take `--gateway-response-port` / `RUNE_GATEWAY_RESPONSE_PORT` (a deviation from spec D7's "no change").
+- Metadata, not Redirect, is the authoritative response-port source.
+- The Task 8 group leg uses a separate client (#749).
+- Task 9: the NAT e2e builds `dr_client` inside the `rune-ql-probe` image's retained build tree (that image does not ship it).

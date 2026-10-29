@@ -1,0 +1,4 @@
+# Dockerfile.nat-router — the masquerading router of docker/nat-e2e.sh (docker-compose.nat.yml, service nat-router).
+# The MASQUERADE rule is added by the script once the cluster is up (it needs the router's public interface name).
+FROM alpine:3.20
+RUN apk add --no-cache iptables iproute2

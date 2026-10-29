@@ -48,6 +48,40 @@ OS settings that matter for UDP throughput (`net.core.rmem_max` and `wmem_max` c
 Aeron receive window must not exceed the socket buffer or half a term) are covered in
 [configuration.md](configuration.md#aeron-transport).
 
+### NAT-safe client egress
+
+A client behind NAT (home router, cloud NAT gateway, most Kubernetes pods) needs no inbound rule: every reply returns over
+the flow the client itself opened (Aeron response channels). The address a client declares is not used for a client that
+sets the gateway response port.
+
+| Port | Who binds it | Open inbound UDP from clients |
+|---|---|---|
+| client port (`RUNE_CLIENT_ENDPOINT`, 40200) | gateway | yes |
+| worker ingress ports | each worker | yes |
+| gateway response-control port | gateway | yes |
+| per-worker response-control ports | each worker | yes |
+| per-worker egress control ports | each worker | only with authentication off |
+
+Derived defaults (shard mode, no explicit ports), for node id `n` and `W` workers:
+
+| Port | Value |
+|---|---|
+| egress control base | `8200 + 192 n + 128` |
+| gateway response | egress base `+ 63` |
+| worker `w` response | egress base `+ 63 - W + w` |
+
+Derived response ports need `W <= 31`; see [configuration](configuration.md#derived-ports) for the rule and the explicit
+settings. Firewall: inbound UDP on the ports above only.
+
+Client side: set `gatewayResponseControlPort` (`--gateway-response-port`, `RUNE_GATEWAY_RESPONSE_PORT`) to the **seed**
+broker's gateway response port. The other brokers' ports come from Metadata. A client that leaves it at `0`, and every
+older client, keeps the declared-address path unchanged.
+
+The worker bind token travels in plaintext: `WorkerBind` is always unencrypted, so an on-path observer of a session can see
+it (TLS protects the `ConnectResponse`, not `WorkerBind`).
+
+End-to-end proof: `bash broker/docker/nat-e2e.sh` (clients behind a masquerading router container, default config, 3 nodes).
+
 ### Formatting a data directory
 
 A broker **never formats an empty data directory on its own**. It refuses to start (exit 78) and prints the command:

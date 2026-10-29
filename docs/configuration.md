@@ -242,6 +242,7 @@ Send `SIGUSR1` to a running broker to dump a report; `SIGHUP` reloads the TLS ce
 | `gatewayStreamId` | `1` | Broker's client stream id (`RUNE_CLIENT_STREAM_ID`). |
 | `egressChannel` | `aeron:ipc` | Where replies arrive, e.g. `aeron:udp?endpoint=me:40400`. |
 | `egressStreamId` | `2` | Stream id of the reply channel. |
+| `gatewayResponseControlPort` | `0` | NAT-safe egress: the seed broker's gateway response-control port (`--gateway-response-port`, `RUNE_GATEWAY_RESPONSE_PORT` in the CLI and `dr_client`). With a UDP `gatewayChannel` and a port in 1..65535 the client asks for replies over its own flow; other brokers' ports come from Metadata. `0` = the declared `egressChannel` path. Against a broker below version 9 the declared path is used. |
 | `dataDir` | empty | Directory of the embedded driver. |
 | `connectTimeoutMs` / `pingTimeoutMs` / `produceTimeoutMs` | `5000` | Deadlines of connect, ping (also `getViewRow`) and a produce ack. |
 | `subscribeTimeoutMs` | `10000` | Wait for a `SubscribeResponse`. |
@@ -292,5 +293,6 @@ Client environment variables that override `ClientConfig`: `RUNE_CLIENT_AERON_MT
 | `RUNE_PASSWORD_FILE` | Default for `--password-file`. |
 | `RUNE_CLUSTER_KEY_FILE` | Default for `rune security bootstrap --cluster-key-file`. |
 | `RUNE_EGRESS` | Egress channel when `--cli-egress` is not given. |
+| `RUNE_GATEWAY_RESPONSE_PORT` | Default for `--gateway-response-port` (1..65535; anything else is refused). |
 
 A password is never read from the command line or the environment: `--password` and `RUNE_PASSWORD` are refused.

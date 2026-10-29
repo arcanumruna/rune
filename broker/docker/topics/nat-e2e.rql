@@ -1,0 +1,5 @@
+-- docker/topics/nat-e2e.rql: the topics of docker/nat-e2e.sh (run as the e2e user from a client behind the NAT).
+-- Ids in creation order on a fresh cluster: nat_a = 0, nat_b = 1, nat_tx_in = 2.  6 partitions, rf 3, plain.
+topic nat_a partitions 6 replicas 3;
+topic nat_b partitions 6 replicas 3;
+topic nat_tx_in partitions 6 replicas 3;
