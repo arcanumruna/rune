@@ -8322,6 +8322,10 @@ public:
     [[nodiscard]] uint64_t workerBindsAcceptedForTest() const noexcept { return workerBindsAccepted_; }
     [[nodiscard]] uint64_t workerBindsRefusedForTest() const noexcept { return workerBindsRefused_; }
     [[nodiscard]] uint64_t imageUnbindsForTest() const noexcept { return imageUnbinds_; }
+    /// TEST SEAM (worker thread): is the client ingress image `aeronSessionId` still in the worker subscription's list.
+    [[nodiscard]] bool ingressImageAliveForTest(int32_t aeronSessionId) const noexcept {
+        return workerIngress_ != nullptr && workerIngress_->imageCorrelationIdOf(aeronSessionId) >= 0;
+    }
     /// I2 seams: WorkerBindAcks offered on a response publication / dropped because the owed list was full.
     [[nodiscard]] uint64_t workerBindAcksSentForTest() const noexcept { return workerBindAcksSent_; }
     [[nodiscard]] uint64_t workerBindAcksDroppedForTest() const noexcept { return workerBindAcksDropped_; }

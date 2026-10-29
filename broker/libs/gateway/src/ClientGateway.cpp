@@ -1555,13 +1555,25 @@ int ClientGateway::retryPendingCryptoAnnounces_()
             pendingCryptoAnnounces_.pop_back();
             continue;
         }
+        // I-C: the branch is the SESSION's mode (workerResponse), never "has a non-zero token": a worker-response
+        // session without a token is never announced plain (that would admit produce from any image and answer to the
+        // client-declared address).  Unreachable (a zero derivation fails the connect), so end the session if it happens.
+        if (s->workerResponse && !s->hasBindToken()) [[unlikely]] {
+            pendingCryptoAnnounces_[i] = pendingCryptoAnnounces_.back();
+            pendingCryptoAnnounces_.pop_back();
+            ++bindTokenDeriveFailures_;
+            (void)closeSession_(sid, /*notifyExpired=*/true);
+            ++work;
+            continue;
+        }
         if (sessionAnnouncer_.announce(*workerPool_, sid,
-                                        s->hasBindToken() ? std::string_view{} : std::string_view(s->egressChannel),
+                                        s->workerResponse ? std::string_view{} : std::string_view(s->egressChannel),
                                         s->egressStreamId,
                                         s->clientVersion, /*sessionEncrypted=*/true, /*keyReady=*/true,
                                         s->crypto.b2c, s->crypto.b2cPrefix, s->crypto.cipher,
                                         s->crypto.c2b, s->crypto.c2bPrefix,
-                                        s->hasBindToken() ? &s->bindToken : nullptr)) {
+                                        s->workerResponse ? &s->bindToken : nullptr)) {
+            ++cryptoKeyAnnounces_;
             ++work;
             pendingCryptoAnnounces_[i] = pendingCryptoAnnounces_.back();
             pendingCryptoAnnounces_.pop_back();
@@ -2217,7 +2229,8 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
         pc_entry.responseEgress = wantsResponse && !responseControlEndpoint_.empty() && image != nullptr && workersReady;
         if (pc_entry.responseEgress && shardMode_) {
             pc_entry.workerResponse = true;
-            if (!rune::crypto::randomBytes(std::span<uint8_t>(pc_entry.bindToken))) [[unlikely]] {
+            if (!rune::crypto::randomBytes(std::span<uint8_t>(pc_entry.bindToken)) ||
+                std::all_of(pc_entry.bindToken.begin(), pc_entry.bindToken.end(), [](uint8_t b) { return b == 0; })) [[unlikely]] {
                 pc_entry.bindToken = {};
                 pc_entry.workerResponse = false;
                 pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::Internal);
@@ -2757,6 +2770,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             added->sourceHost     = std::move(pending.sourceHost);
             added->sourceIdentity = std::move(pending.sourceIdentity);
             added->bindToken      = pending.bindToken;   // Task 6: all-zero unless a worker-response session
+            added->workerResponse = pending.workerResponse;
         }
 
         it = pendingConnects_.erase(it);
@@ -2882,7 +2896,24 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     // sentinel — Cipher::None means "do not trust these keys", never install
     // an all-zero AeadCipher.
     const rune::crypto::SessionKeys keys = pending.tls->exportKeys(pending.chosenCipher, pending.sessionId);
-    if (keys.cipher == rune::crypto::Cipher::None) {
+    // I-C: a worker-response TLS session binds with the token derived from its keys.  A derivation that fails (HKDF) or
+    // yields all-zero must never be announced: an all-zero token is the one the first leg "disclosed", so it would let
+    // anyone who guesses the sequential session id bind the session's worker image.  The connect fails like a failed
+    // handshake (the client reconnects, evidence-based).
+    std::array<uint8_t, 16> derivedBindToken{};
+    bool bindDeriveFailed = false;
+    if (keys.cipher != rune::crypto::Cipher::None && pending.workerResponse) {
+        derivedBindToken = forceZeroDerivedBindTokenForTest_ ? std::array<uint8_t, 16>{}
+                                                             : rune::crypto::deriveWorkerBindToken(keys, pending.sessionId);
+        bindDeriveFailed = std::all_of(derivedBindToken.begin(), derivedBindToken.end(), [](uint8_t b) { return b == 0; });
+        if (bindDeriveFailed) {
+            ++bindTokenDeriveFailures_;
+            if (unauthLog_.due(21)) [[unlikely]]
+                spdlog::error("ClientGateway: the worker bind token of session {} could not be derived; the connect fails",
+                              pending.sessionId);
+        }
+    }
+    if (keys.cipher == rune::crypto::Cipher::None || bindDeriveFailed) {
         pc::HandshakeContinueResponse fail;
         fail.sessionId     = pending.sessionId;
         fail.correlationId = hc.correlationId;
@@ -2908,8 +2939,9 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     session.sourceIdentity = std::move(pending.sourceIdentity);
     // I3: a worker-response TLS session binds with the token derived from its keys (see the first-leg ConnectResponse);
     // the keyReady announce below replaces the random first-wave token the workers hold while awaiting the bind.
-    if (pending.workerResponse) pending.bindToken = rune::crypto::deriveWorkerBindToken(keys, pending.sessionId);
+    if (pending.workerResponse) pending.bindToken = derivedBindToken;
     session.bindToken      = pending.bindToken;   // Task 6: all-zero unless a worker-response session
+    session.workerResponse = pending.workerResponse;
     // The TLS handshake took time: the login deadline runs from the moment the session exists.
     if (auto* first = std::get_if<rune::gateway::AuthAwaitingFirst>(&session.auth)) first->deadlineNs = nowNs + authTimeoutNs_;
     session.crypto.cipher = keys.cipher;
@@ -2950,6 +2982,8 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
                                      session.crypto.c2b, session.crypto.c2bPrefix,
                                      pending.workerResponse ? &pending.bindToken : nullptr)) {
         pendingCryptoAnnounces_.push_back(pending.sessionId);
+    } else if (shardMode_ && workerPool_) {
+        ++cryptoKeyAnnounces_;
     }
 
     pendingConnects_.erase(it);
@@ -4716,7 +4750,7 @@ void ClientGateway::forwardSubscribeToWorker_(int64_t subId, int64_t sessionId,
     }
     // NAT-safe egress (Task 6): a response-mode session's Records ride ITS worker response publication - no record
     // egress to resolve, no shared-egress fallback ever.  The worker holds the subscription until the client binds.
-    if (sess->hasBindToken()) [[unlikely]] {
+    if (sess->workerResponse) [[unlikely]] {
         enqueueSubscribeOp_(s, nullptr, /*sessionEgress=*/true);
         return;
     }
@@ -5510,7 +5544,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     if (workerPushed && authMode_ == rune::gateway::GatewayAuthMode::Required) {
         const int32_t wid = workerPool_->ownerWorkerId(msg.topicId, partition);
         const auto eg = session->recordEgressByWorker.find(wid);
-        sub.okOwed        = !session->hasBindToken() && (eg == session->recordEgressByWorker.end() || !eg->second);
+        sub.okOwed        = !session->workerResponse && (eg == session->recordEgressByWorker.end() || !eg->second);
         sub.okOwedLineage = sub.okOwed && served.kind == ServedPartition::Kind::Transient;
     }
     const bool okOwed = sub.okOwed;

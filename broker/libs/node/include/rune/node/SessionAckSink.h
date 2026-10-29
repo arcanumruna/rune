@@ -278,7 +278,7 @@ public:
     /// (token refreshed), and one already BOUND keeps its publication and image — a late wave must never undo a bind.
     bool announceResponse(int64_t sessionId, const std::array<uint8_t, 16>& token, int32_t streamId,
                           int32_t clientVersion = 0, bool grantAll = false) noexcept {
-        if (sessionId <= 0) return false;
+        if (sessionId <= 0 || isZeroToken_(token)) return false;          // a zero token authorizes nothing: refused, no state
         std::size_t idx = find_(sessionId);
         const bool fresh = (idx == kNone);
         if (fresh) idx = insert_(sessionId);
@@ -300,6 +300,13 @@ public:
         return true;
     }
 
+    /// An all-zero token is the "no token" marker (and what a failed key derivation yields): it must never authorize a
+    /// bind, so every entry point refuses it before any compare.
+    [[nodiscard]] static bool isZeroToken_(const std::array<uint8_t, 16>& t) noexcept {
+        uint8_t any = 0;
+        for (const uint8_t b : t) any = static_cast<uint8_t>(any | b);
+        return any == 0;
+    }
     /// Constant-time token compare: 0 = equal.
     [[nodiscard]] static uint8_t tokenDiff_(const std::array<uint8_t, 16>& a, const std::array<uint8_t, 16>& b) noexcept {
         uint8_t diff = 0;                                            // constant-time: fold every byte
@@ -311,6 +318,7 @@ public:
     /// unauthenticated WorkerBind (any sender can aim one at a worker) costs one probe and one compare — never an
     /// image lookup or a channel string.
     [[nodiscard]] BindResult checkBind(int64_t sessionId, const std::array<uint8_t, 16>& token) const noexcept {
+        if (isZeroToken_(token)) return BindResult::BadToken;   // before any lookup or compare
         const std::size_t idx = find_(sessionId);
         if (idx == kNone) return BindResult::UnknownSession;
         const auto* w = std::get_if<PubAwaitingBind>(&states_[idx]);

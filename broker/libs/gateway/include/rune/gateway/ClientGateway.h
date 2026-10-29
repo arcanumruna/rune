@@ -448,7 +448,10 @@ public:
     [[nodiscard]] uint64_t loginsOk() const noexcept { return loginsOk_; }
     [[nodiscard]] uint64_t loginsFailed() const noexcept { return loginsFailed_; }
     [[nodiscard]] uint64_t loginsRateLimited() const noexcept { return loginsRateLimited_; }
-    [[nodiscard]] uint64_t loginsAbandoned() const noexcept { return loginsAbandoned_; }   ///< #132: first legs never finished
+    [[nodiscard]] uint64_t loginsAbandoned() const noexcept { return loginsAbandoned_; }
+    [[nodiscard]] uint64_t bindTokenDeriveFailures() const noexcept { return bindTokenDeriveFailures_; }
+    [[nodiscard]] uint64_t cryptoKeyAnnounces() const noexcept { return cryptoKeyAnnounces_; }
+    void forceZeroDerivedBindTokenForTest(bool on) noexcept { forceZeroDerivedBindTokenForTest_ = on; }   ///< #132: first legs never finished
     /// The SecurityView applied the event at `offset` (BrokerNode calls this right after the view did) - authentication
     /// Task 14, D25: Refresh -> every affected user's authenticated session recompiles its permission table, ends what
     /// lost READ (explicitly, NotAuthorized), ships its WRITE bits and a lifted must-change-password session becomes
@@ -2734,6 +2737,10 @@ private:
     std::size_t maxUnauthPerHost_ = kDefaultMaxUnauthSessionsPerHost;   ///< issue #236
     uint64_t connectsRefusedUnauthCap_ = 0;                              ///< issue #236
     uint64_t loginsOk_ = 0, loginsFailed_ = 0, loginsRateLimited_ = 0, loginsAbandoned_ = 0;
+    /// I-C: worker bind tokens that could not be derived (failure / all-zero): the connect was failed, nothing announced.
+    uint64_t bindTokenDeriveFailures_ = 0;
+    uint64_t cryptoKeyAnnounces_      = 0;   ///< keyReady (second-wave) announces that landed on every worker
+    bool     forceZeroDerivedBindTokenForTest_ = false;
     // ── authentication Task 14: live security changes ──
     uint64_t sessionsRevoked_ = 0;
     int64_t  securityEnforcedOffset_ = -1;       ///< every event <= this is enforced here (see securityEnforcedOffset())

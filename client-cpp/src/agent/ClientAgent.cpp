@@ -761,7 +761,7 @@ bool ClientAgent::retarget(const std::string& newIngressChannel, int32_t respons
     const bool moved = transport_.retarget(newIngressChannel, responsePort);
     if (moved) {
         seedSession().responsePort = responsePort;
-        seedSession().pairPinned   = false;   // the retarget built a fresh pair
+        seedSession().pair         = ResponsePair::Fresh;   // the retarget built a fresh pair
         invalidateRouteSessions_();  // DR client bug 1: the seed moved
     }
     return moved;
@@ -777,7 +777,7 @@ bool ClientAgent::failoverSeedTo(const std::string& channel, int64_t nowNs, bool
             seed.currentLeaderChannel = channel;
             seed.currentLeaderNode    = -1;   // learnt from the next metadata answer
             seed.responsePort         = port;
-            seed.pairPinned           = false;   // fresh pair
+            seed.pair                 = ResponsePair::Fresh;   // fresh pair
             invalidateRouteSessions_();
         }
     } catch (...) {
@@ -937,8 +937,6 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // new connect episode; a stale / duplicate / ignored one changes nothing.
         const bool awaited = s.machine.state() == session::SessionState::Connecting &&
                              s.machine.correlationId() == opt->correlationId;
-        // A ConnectResponse that came back on the response pair spent it (see Session::pairPinned).
-        if (awaited && s.responsePort != 0) s.pairPinned = true;
         s.machine.onConnectResponse(
             opt->code,
             opt->leaderMemberId,
@@ -1278,7 +1276,7 @@ bool ClientAgent::retargetSeedOnConnectRedirect_(const std::string& endpoint, in
         seed.currentLeaderChannel = channel;
         seed.currentLeaderNode    = -1;   // the node id is learnt from the metadata answer
         seed.responsePort         = responsePort;
-        seed.pairPinned           = false;   // the retarget built a fresh pair
+        seed.pair                 = ResponsePair::Fresh;   // the retarget built a fresh pair
         invalidateRouteSessions_();       // DR client bug 1: the seed moved
         return true;
     } catch (...) {
@@ -1321,7 +1319,7 @@ bool ClientAgent::retargetSeedToBootstrap_() noexcept {
     seed.lastKnownLeaderNode    = seed.currentLeaderNode;
     seed.lastKnownLeaderResponsePort = seed.responsePort;
     seed.responsePort           = bootstrapPort;
-    seed.pairPinned             = false;   // fresh pair
+    seed.pair                   = ResponsePair::Fresh;   // fresh pair
     seed.currentLeaderChannel   = bootstrap;
     seed.currentLeaderNode      = -1;  // unknown until the gateway redirects us again
     invalidateRouteSessions_();        // DR client bug 1: the seed moved
@@ -1340,7 +1338,7 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
     seed.currentLeaderChannel = seed.lastKnownLeaderChannel;
     seed.currentLeaderNode    = seed.lastKnownLeaderNode;
     seed.responsePort         = seed.lastKnownLeaderResponsePort;
-    seed.pairPinned           = false;   // fresh pair
+    seed.pair                 = ResponsePair::Fresh;   // fresh pair
     invalidateRouteSessions_();  // DR client bug 1: the seed moved
     return true;
 }
@@ -1362,29 +1360,37 @@ bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t
     // The seed → the default publication (wherever it points: byte-identical
     // single-node fast path).  Any other session → its own endpoint over the
     // shared transport (default ingress stream id).
-    // I2/reconnect: a new connect episode on a spent response pair first builds a fresh pair (the offer below then
-    // waits for it: the machine's connect retry re-sends).
-    if (owner.pairPinned && len >= 4 &&
-        rune::protocol::client::detail::getLE16(buf, 2) == static_cast<uint16_t>(codec::TemplateId::Connect)) [[unlikely]] {
-        rePairSessionResponse_(owner);
+    // A response pair is one-shot (ResponsePair): a Connect on a Spent pair first builds a fresh one (the offer below
+    // may wait for it: a refused Connect leaves the pair Fresh, so the machine's fast resend reuses it).
+    const bool isConnect = len >= 4 && rune::protocol::client::detail::getLE16(buf, 2) ==
+                                           static_cast<uint16_t>(codec::TemplateId::Connect);
+    if (isConnect && owner.pair == ResponsePair::Spent) [[unlikely]] rePairSessionResponse_(owner);
+    bool accepted;
+    if (&owner == &seedSession()) {
+        accepted = transport_.offer(buf, len);
+    } else if (owner.ctlPub != transport::AeronTransport::kNoPub) {
+        // NAT-safe egress: a session opened with a known response port rides its response-correlated publication.
+        accepted = transport_.offerOn(owner.ctlPub, buf, len);
+    } else {
+        accepted = transport_.offerTo(owner.endpoint, cfg_.transport.ingressStreamId, buf, len);
     }
-    if (&owner == &seedSession()) return transport_.offer(buf, len);
-    // NAT-safe egress: a session opened with a known response port rides its response-correlated publication.
-    if (owner.ctlPub != transport::AeronTransport::kNoPub) return transport_.offerOn(owner.ctlPub, buf, len);
-    return transport_.offerTo(owner.endpoint, cfg_.transport.ingressStreamId, buf, len);
+    // The gateway answers an ACCEPTED Connect on a response publication of its own, whichever Connect it answers and
+    // whatever it answers (ConnectResponse, ErrorResponse, a late answer to an older Connect): the pair is spent.
+    if (isConnect && accepted && owner.responsePort != 0) [[unlikely]] owner.pair = ResponsePair::Spent;
+    return accepted;
 }
 
 void ClientAgent::rePairSessionResponse_(Session& s) noexcept {
-    // The pair is spent only while a response port is in force; a failed re-pair keeps the flag (the next Connect send
+    // The pair is spent only while a response port is in force; a failed re-pair keeps it Spent (the next Connect send
     // tries again) and the old pair.
-    if (s.responsePort == 0) { s.pairPinned = false; return; }
+    if (s.responsePort == 0) { s.pair = ResponsePair::Fresh; return; }
     const bool ok = (&s == &seedSession()) ? transport_.rePairSeedResponse(s.responsePort)
                                            : transport_.rePairResponsePublication(s.ctlPub);
-    if (ok) s.pairPinned = false;
+    if (ok) s.pair = ResponsePair::Fresh;
 }
 
 void ClientAgent::attachResponsePub_(Session& s, int32_t port, bool upgradePlain) noexcept {
-    s.pairPinned = false;   // a freshly built pair is unused
+    s.pair = ResponsePair::Fresh;   // a freshly built pair is unused
     // The ONE place a leader session's control publication is built (openSession_, and the upgrade of a session that
     // was opened plain before Metadata / a Redirect taught the port).  port 0 = the declared path.
     s.responsePort = port;
@@ -1919,24 +1925,20 @@ int ClientAgent::serviceWorkerBinds_() noexcept {
         // ConnectResponse resets the token); never a WorkerBind with a zero token.
         if (s.machine.cryptoState().encrypted && std::all_of(s.bindToken.begin(), s.bindToken.end(), [](uint8_t b) { return b == 0; })) {
             const auto& c2b = s.machine.cryptoState().c2bKey;
-            const auto tok = rune::crypto::deriveWorkerBindToken(std::span<const uint8_t>(c2b.bytes, sizeof c2b.bytes), sid);
-            s.bindToken = tok;
+            s.bindToken = forceBindDeriveFailure_
+                ? std::array<uint8_t, 16>{}
+                : rune::crypto::deriveWorkerBindToken(std::span<const uint8_t>(c2b.bytes, sizeof c2b.bytes), sid);
         }
         {
             bool nonZero = false;
             for (const uint8_t b : s.bindToken) nonZero = nonZero || b != 0;
-            if (!nonZero) continue;
-        }
-        // I2: an unacknowledged bind is resent at kBindRetryNs steps; after kBindMaxAttempts the session reconnects
-        // (a fresh connect issues a fresh token and announce, the bind starts over).
-        auto* pending = std::get_if<WorkerBindEntry::Sent>(&e.state);
-        if (pending != nullptr && pending->sid == sid) {
-            if (dutyNowNs_ < pending->nextRetryNs) continue;
-            if (pending->attempts >= kBindMaxAttempts) {
-                if ((workerBindFailures_++ & 1023u) == 0)
-                    std::fprintf(stderr, "rune-client: WorkerBind for session %lld unacknowledged after %u attempts "
-                                 "(%llu failures so far); reconnecting\n", static_cast<long long>(sid),
-                                 static_cast<unsigned>(pending->attempts), static_cast<unsigned long long>(workerBindFailures_));
+            if (!nonZero) {
+                // I-C: a failed / all-zero derivation can never authorize anything: end the session on the evidence
+                // (the gateway failed the same way for its side); the reconnect derives afresh.
+                if ((bindTokenDeriveFailures_++ & 1023u) == 0)
+                    std::fprintf(stderr, "rune-client: the WorkerBind token for session %lld could not be derived "
+                                 "(%llu so far); reconnecting\n", static_cast<long long>(sid),
+                                 static_cast<unsigned long long>(bindTokenDeriveFailures_));
                 e.state = WorkerBindEntry::Unbound{};
                 s.machine.forceReconnect(dutyNowNs_);
                 s.connectSubmitted = true;
@@ -1944,11 +1946,17 @@ int ClientAgent::serviceWorkerBinds_() noexcept {
                 continue;
             }
         }
+        // I2: an unacknowledged bind is RESENT (a lost datagram: the worker re-acks a repeated bind with AlreadyBound, so
+        // a lost bind or ack converges) with capped exponential backoff and no attempt cap, for as long as the session
+        // stays Connected on this sid.  A bind that can never succeed is ended by the session's own liveness (gateway
+        // reaping / reconnect), never by a timer here.
+        auto* pending = std::get_if<WorkerBindEntry::Sent>(&e.state);
+        if (pending != nullptr && pending->sid == sid && dutyNowNs_ < pending->nextRetryNs) continue;
         // The first bind of a NEW session on a spent pair: the old session's worker response publication pinned the
         // response subscription, so this session's bind rides a fresh pair (new request publication = new image).  The
         // offer below fails until the pair is Ready; the next pass sends.
-        if ((pending == nullptr || pending->sid != sid) && e.pairUsed) {
-            if (transport_.rePairResponsePublication(e.pub)) { e.pairUsed = false; e.state = WorkerBindEntry::Unbound{}; }
+        if ((pending == nullptr || pending->sid != sid) && e.pair == ResponsePair::Spent) {
+            if (transport_.rePairResponsePublication(e.pub)) { e.pair = ResponsePair::Fresh; e.state = WorkerBindEntry::Unbound{}; }
             else continue;   // could not re-pair now (cold failure): try again next pass
             pending = nullptr;
         }
@@ -1959,9 +1967,19 @@ int ClientAgent::serviceWorkerBinds_() noexcept {
         if (n == 0) continue;
         if (transport_.offerOn(e.pub, frame, n)) {
             bindCorrId_ = corr;
-            e.pairUsed = true;
-            const uint8_t attempts = (pending != nullptr && pending->sid == sid) ? static_cast<uint8_t>(pending->attempts + 1) : uint8_t{1};
-            e.state = WorkerBindEntry::Sent{sid, corr, attempts, dutyNowNs_ + kBindRetryNs};
+            e.pair = ResponsePair::Spent;
+            const bool resend = pending != nullptr && pending->sid == sid;
+            // attempts saturates (never wraps); the gap after send k is min(250 ms << min(k - 1, 4), 4 s).
+            const uint8_t attempts = resend ? (pending->attempts < 255 ? static_cast<uint8_t>(pending->attempts + 1) : uint8_t{255})
+                                            : uint8_t{1};
+            if (resend) {
+                ++workerBindResends_;
+                if ((attempts & 15u) == 0)
+                    std::fprintf(stderr, "rune-client: WorkerBind for session %lld unacknowledged after %u sends; resending\n",
+                                 static_cast<long long>(sid), static_cast<unsigned>(attempts));
+            }
+            const int64_t gapNs = std::min<int64_t>(kBindRetryNs << std::min<unsigned>(attempts - 1u, 4u), kBindRetryMaxNs);
+            e.state = WorkerBindEntry::Sent{sid, corr, attempts, dutyNowNs_ + gapNs};
             ++workerBindsSent_;
             ++sent;
         }

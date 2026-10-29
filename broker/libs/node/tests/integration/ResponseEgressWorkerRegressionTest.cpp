@@ -862,3 +862,52 @@ TEST(ResponseEgressWorkerRegression, TlsConnectResponseCarriesNoBindTokenRegress
     ASSERT_TRUE(acked) << "the derived token was never accepted";
     EXPECT_EQ(e.bindsAccepted(), 1u);
 }
+
+// I-C: a TLS session whose worker bind token cannot be derived (HKDF failure -> all-zero) is FAILED at the handshake's
+// completion: no session, no keyReady announce to the workers, a HandshakeFailed answer; the all-zero token (what the
+// first leg "disclosed") never binds the worker image the first announce wave created.
+TEST(ResponseEgressWorkerRegression, ZeroDerivedTokenFailsTheSessionRegression) {
+    Env e(/*tls=*/true); ASSERT_TRUE(e.awaitLeader());
+    e.node->forceZeroDerivedBindTokenForTest(true);
+    TmpDir cdir{"tlsz"};
+    WClient c(cdir.path, e.p, WClient::Mode::Response);
+    ASSERT_TRUE(c.ready());
+    const std::string ca = readFile(fs::path(RUNE_CRYPTO_TESTDATA_DIR) / "ca.pem");
+    auto tls = rune::crypto::TlsSession::makeClient(ca.c_str(), "127.0.0.1");
+    ASSERT_TRUE(tls.valid());
+    uint8_t hello[16384];
+    (void)tls.readInbound(nullptr, 0);
+    const std::size_t hn = tls.writeOutbound(hello, sizeof hello);
+    ASSERT_GT(hn, 0u);
+    const auto r = c.connectTls(1, static_cast<uint8_t>(rune::crypto::bestLocalCipher()), std::string(reinterpret_cast<const char*>(hello), hn));
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->code, 0);
+    ASSERT_NE(r->chosenCipher, 0);
+    const int64_t sid = r->assignedSessionId;
+    const uint64_t announcesBefore = e.node->gatewayCryptoKeyAnnouncesForTest();
+    (void)tls.readInbound(reinterpret_cast<const uint8_t*>(r->handshakeBytes.data()), r->handshakeBytes.size());
+    uint8_t fin[16384];
+    const std::size_t fn = tls.writeOutbound(fin, sizeof fin);
+    ASSERT_TRUE(tls.done());
+    ASSERT_GT(fn, 0u);
+    ASSERT_TRUE(c.sendHandshakeContinue(sid, 2, std::string(reinterpret_cast<const char*>(fin), fn)));
+
+    // The gateway answers the final leg with HandshakeFailed and creates nothing.
+    // (A normal server flight may precede it with the same correlation id: scan for the failure.)
+    const auto failedFlight = [&]() -> const Frame* {
+        for (const auto& fr : c.gw()) {
+            if (fr.templateId != kHsContResp || fr.correlationId != 2) continue;
+            const auto d = pc::HandshakeContinueResponse::decode(fr.bytes.data(), fr.bytes.size());
+            if (d && d->code == static_cast<int16_t>(pc::ErrorCode::HandshakeFailed)) return &fr;
+        }
+        return nullptr;
+    };
+    EXPECT_TRUE(c.waitGw([&] { return failedFlight() != nullptr; })) << "no HandshakeFailed answer to the final handshake leg";
+    EXPECT_EQ(e.node->gatewayBindTokenDeriveFailuresForTest(), 1u);
+    EXPECT_EQ(e.node->gatewayCryptoKeyAnnouncesForTest(), announcesBefore) << "nothing may be announced to the workers";
+    EXPECT_FALSE(e.node->gatewayHasSessionForTest(sid)) << "the session must not exist";
+    // The zero token binds nothing.
+    ASSERT_TRUE(c.sendWorkerBind(sid, 10, std::array<uint8_t, 16>{}));
+    ASSERT_TRUE(e.awaitCounter([&] { return e.bindsRefused() >= 1; })) << "the all-zero token was not refused";
+    EXPECT_EQ(e.bindsAccepted(), 0u);
+}

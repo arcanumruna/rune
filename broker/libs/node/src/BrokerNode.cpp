@@ -3744,6 +3744,15 @@ std::size_t BrokerNode::workerDirectAcksInFlightForTest(int32_t w) {
 bool BrokerNode::gatewayHasSessionForTest(int64_t sessionId) {
     return onControlThreadForTest([this, sessionId]() { return gateway_ != nullptr && gateway_->hasSessionForTest(sessionId); });
 }
+void BrokerNode::forceZeroDerivedBindTokenForTest(bool on) {
+    onControlThreadForTest([this, on]() { if (gateway_) gateway_->forceZeroDerivedBindTokenForTest(on); return 0; });
+}
+uint64_t BrokerNode::gatewayBindTokenDeriveFailuresForTest() {
+    return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->bindTokenDeriveFailures() : 0; });
+}
+uint64_t BrokerNode::gatewayCryptoKeyAnnouncesForTest() {
+    return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->cryptoKeyAnnounces() : 0; });
+}
 uint64_t BrokerNode::gatewayNotAuthorizedForTest() {
     return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->notAuthorizedAnswers() : 0; });
 }

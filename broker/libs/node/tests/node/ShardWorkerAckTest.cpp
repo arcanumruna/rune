@@ -7,6 +7,7 @@
 // an answer) — WorkerReturn PRODUCE_NOTIFY(2) was retired by F15 §7 (RESERVED_2).
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
+#include <rune/aeronutil/testing/FreePort.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/Worker.h>
@@ -1223,4 +1224,65 @@ TEST(ShardWorkerAckRegression, MalformedFramesAndPurgedParkedDirectAcksReturnThe
     for (int i = 0; i < 4; ++i) f.step();
     EXPECT_EQ(f.worker->directAcksInFlightForTest(), 0u) << "purged parked answers return their units";
     EXPECT_EQ(f.worker->directUnderflowsForTest(), 0u);
+}
+
+// Coverage of the Worker's rescan request on a successful bind (commit 92cf150f).  Session A is bound on ingress image 1.
+// Image 1 goes away and image 2 (session B's) arrives while the worker does NOT run a duty pass, so the subscription's
+// image count is the SAME (1 -> 1) at the worker's next drain: drainUnavailable sees no change.  Only B's WorkerBind,
+// handled on the first poll after that, can reveal A's lost image - handleWorkerBind_ requests the rescan on Bound.
+// The invoker driver + client conductor are pumped by the test only, so the swap is atomic w.r.t. the drain.
+TEST(ShardWorkerAckRegression, RebindAfterMaskedImageLossUnbindsTheDeadImageRegression) {
+    Fixture f({1}, 1);
+    f.worker->setResponseControl("127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort()));
+    const std::array<uint8_t, 16> tokA = [] { std::array<uint8_t, 16> t{}; t.fill(0xA1); return t; }();
+    const std::array<uint8_t, 16> tokB = [] { std::array<uint8_t, 16> t{}; t.fill(0xB2); return t; }();
+    auto announceResponse = [&](int64_t sid, const std::array<uint8_t, 16>& tok) {
+        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = sid;
+        a.egressStreamId = kEgress; a.responseBind = true; a.bindToken = tok;
+        ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(a)));
+    };
+    auto bindFrame = [](int64_t sid, int64_t corr, const std::array<uint8_t, 16>& tok) {
+        pc::WorkerBind b; b.sessionId = sid; b.correlationId = corr; b.token = tok;
+        std::vector<uint8_t> frame(pc::WorkerBind::ENCODED_SIZE);
+        frame.resize(b.encode(frame.data()));
+        return frame;
+    };
+    announceResponse(11, tokA);
+    announceResponse(12, tokB);
+    for (int i = 0; i < 20; ++i) f.step();
+
+    // A binds on image 1 (the fixture's first publication).
+    const int32_t imageA = f.producePub->sessionId();
+    auto bindA = bindFrame(11, 2, tokA);
+    ASSERT_TRUE(Fixture::offerOnce(*f.producePub, bindA));
+    for (int i = 0; i < kCap && f.worker->workerBindsAcceptedForTest() < 1; ++i) f.step();
+    ASSERT_EQ(f.worker->workerBindsAcceptedForTest(), 1u) << "session A never bound";
+    for (int i = 0; i < 50; ++i) f.step();                 // several drains: the worker has settled its image count (1)
+    ASSERT_TRUE(f.worker->ingressImageAliveForTest(imageA));
+    ASSERT_EQ(f.worker->imageUnbindsForTest(), 0u);
+
+    // The swap, with NO worker duty pass in between: image 1 goes away, image 2 arrives.
+    f.producePub.reset();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (int i = 0; i < 100'000'000 && f.worker->ingressImageAliveForTest(imageA) && std::chrono::steady_clock::now() < deadline; ++i)
+        f.pump();   // real driver time (the publication linger), bounded by the wall deadline
+    ASSERT_FALSE(f.worker->ingressImageAliveForTest(imageA)) << "image A never went away";
+    f.connectSecondClient();
+    ASSERT_NE(f.pub2, nullptr);
+    const int32_t imageB = f.pub2->sessionId();
+    for (int i = 0; i < 100'000'000 && !f.worker->ingressImageAliveForTest(imageB) && std::chrono::steady_clock::now() < deadline; ++i)
+        f.pump();
+    ASSERT_TRUE(f.worker->ingressImageAliveForTest(imageB));
+    // The subscription holds exactly one image before and after the swap (A, then B): the count did not change.
+    EXPECT_FALSE(f.worker->ingressImageAliveForTest(imageA));
+    EXPECT_NE(imageA, imageB);
+    auto bindB = bindFrame(12, 2, tokB);
+    ASSERT_TRUE(Fixture::offerOnce(*f.pub2, bindB));
+
+    // The worker resumes: B binds; A's dead image is found only through the rescan that bind requested.
+    for (int i = 0; i < kCap && f.worker->workerBindsAcceptedForTest() < 2; ++i) f.step();
+    ASSERT_EQ(f.worker->workerBindsAcceptedForTest(), 2u) << "session B never bound";
+    EXPECT_EQ(f.worker->imageUnbindsForTest(), 0u) << "precondition: the masked loss was NOT noticed by the count compare";
+    for (int i = 0; i < 200 && f.worker->imageUnbindsForTest() < 1; ++i) f.step();
+    EXPECT_GE(f.worker->imageUnbindsForTest(), 1u) << "A's dead image was never unbound: the rescan on a successful bind is missing";
 }

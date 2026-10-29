@@ -403,3 +403,25 @@ TEST(SessionAckSinkResponseBindRegression, AnnounceResponseKeepsAnUnreportedFail
     ASSERT_TRUE(r.s.announceResponse(kSid, tok(), kStream));   // a re-announce after the REPORT starts afresh
     EXPECT_EQ(kindOf(r.s, kSid), Kind::Await);
 }
+
+// I-C: an all-zero token (the "no token" marker, and what a failed key derivation yields) authorizes nothing: it is
+// refused at the announce, can never overwrite a real token, and never binds.
+TEST(SessionAckSinkResponseBindRegression, ZeroTokenNeverBindsRegression) {
+    const std::array<uint8_t, 16> zero{};
+    Rig r;
+    // A fresh session announced with a zero token: refused, no state, nothing to bind.
+    EXPECT_FALSE(r.s.announceResponse(kSid + 1, zero, kStream));
+    EXPECT_EQ(kindOf(r.s, kSid + 1), Kind::None);
+    EXPECT_EQ(r.s.checkBind(kSid + 1, zero), BR::BadToken) << "a zero-token bind never reaches the lookup";
+
+    // A real announce, then a zero re-announce (the keyReady wave of a failed derivation): refused, the real token stays.
+    ASSERT_TRUE(r.s.announceResponse(kSid, tok(), kStream));
+    EXPECT_FALSE(r.s.announceResponse(kSid, zero, kStream));
+    EXPECT_EQ(kindOf(r.s, kSid), Kind::Await);
+    EXPECT_EQ(r.s.checkBind(kSid, zero), BR::BadToken);
+    EXPECT_EQ(r.s.bind(kSid, zero, kImage, kRespChan), BR::BadToken);
+    EXPECT_EQ(kindOf(r.s, kSid), Kind::Await) << "a refused bind changes nothing";
+    EXPECT_EQ(r.s.checkBind(kSid, tok()), BR::Bound) << "the real token is untouched by the refused zero announce";
+    ASSERT_EQ(r.s.bind(kSid, tok(), kImage, kRespChan), BR::Bound);
+    EXPECT_EQ(r.s.checkBind(kSid, zero), BR::BadToken);
+}

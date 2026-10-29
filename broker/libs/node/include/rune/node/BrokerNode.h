@@ -1676,6 +1676,11 @@ public:
     [[nodiscard]] bool gatewayHasSessionForTest(int64_t sessionId);
     [[nodiscard]] uint64_t authGateRefusalsForTest();
     /// Test-only (Task 19): requests the gateway answered NotAuthorized (45) since start (control thread, read-only).
+    /// I-C test seams (control thread): force the gateway's TLS-derived worker bind token to all-zero; the connects that
+    /// failed on it; the keyReady announce waves that landed.
+    void forceZeroDerivedBindTokenForTest(bool on);
+    [[nodiscard]] uint64_t gatewayBindTokenDeriveFailuresForTest();
+    [[nodiscard]] uint64_t gatewayCryptoKeyAnnouncesForTest();
     [[nodiscard]] uint64_t gatewayNotAuthorizedForTest();
     /// Test-only (Task 19): the object id of user `name` in this broker's SecurityView (0 = none); control thread, read-only.
     [[nodiscard]] uint64_t securityUserIdForTest(const std::string& name);

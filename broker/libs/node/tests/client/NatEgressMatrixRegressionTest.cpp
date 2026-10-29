@@ -482,8 +482,10 @@ TEST(NatEgressMatrixRegression, NewClientEveryOperationOverResponsePathThreeNode
 
     std::unique_ptr<rc::Client> client;
     everyOperation(client, natClient(c, 1, r), spec, "scratch", "n3", [&](rc::Client& cl, rc::Client& gcl) {
-        EXPECT_EQ(cl.testMdcEgressSubscriptions(), 0u) << "I7: no declared MDC egress subscription on the response path";
-        EXPECT_EQ(gcl.testMdcEgressSubscriptions(), 0u);
+        // I-D: the declared MDC subscription is skipped only for a leader whose session is KNOWN to be on the response
+        // path when Metadata arrives (the seed's node: asserted by the one-node cell).  A leader session that is not
+        // connected yet is subscribed at once (an unused subscription is harmless; a missing one loses records), so the
+        // count here is not zero by design.
         EXPECT_TRUE(cl.testSeedResponseCorrelated());
         EXPECT_TRUE(gcl.testSeedResponseCorrelated());
         // The gateway response port of every node was learnt (Metadata brokers entries / the seed's own config).
@@ -616,7 +618,6 @@ TEST(NatEgressMatrixRegression, TwoNatClientsOneHostNeverSeeEachOthersRepliesReg
     // each client bound separately (I2: and was acknowledged), none gave up
     EXPECT_GE(a->testWorkerBindAcksAccepted(), 1u);
     EXPECT_GE(b->testWorkerBindAcksAccepted(), 1u);
-    EXPECT_EQ(a->testWorkerBindFailures() + b->testWorkerBindFailures(), 0u);
     uint64_t accepted = 0;
     for (int id = 1; id <= 3; ++id) {
         accepted += bindsAccepted(c.node(id));
@@ -799,7 +800,6 @@ static void tlsAuthOffLeg(bool nat, const char* tag) {
     if (nat) {
         EXPECT_GE(bindsAccepted(b.node()), 1u) << "the worker accepted the TLS client's key-derived bind";
         EXPECT_GE(client->testWorkerBindAcksAccepted(), 1u);
-        EXPECT_EQ(client->testWorkerBindFailures(), 0u);
         EXPECT_EQ(spoofed(b.node()), 0u);
     } else {
         EXPECT_EQ(bindsAccepted(b.node()), 0u) << "an old client never binds";
@@ -871,7 +871,6 @@ TEST(NatEgressMatrixRegression, ConnectRacingALeaderChangeConvergesRegression) {
     // and the worker acknowledged it; nothing was dropped as spoofed.
     EXPECT_GE(client.testWorkerBindsSent(), 1u) << "the redirected session never bound its worker: not response-mode";
     EXPECT_GE(client.testWorkerBindAcksAccepted(), 1u);
-    EXPECT_EQ(client.testWorkerBindFailures(), 0u);
     for (int id : c.runningNodes()) EXPECT_EQ(spoofed(c.node(id)), 0u);
 }
 
@@ -990,19 +989,18 @@ TEST(NatEgressMatrixRegression, SameClientReconnectRebindsAndProduceCompletesReg
     EXPECT_EQ(spoofed(b.node()), 0u);
     for (auto& sub : subs) sub.unsubscribe();
     cl->close();
-    EXPECT_EQ(cl->testWorkerBindFailures(), 0u);
 }
 
 // =================================================================================================================
-// 9c. I2: a refused bind (the worker drops the first four) converges: the client gives up after four attempts,
-//     reconnects (a fresh token) and the produce completes; the worker acknowledged the rebind.
+// 9c. I-B: WorkerBinds lost at the worker (more than the old four-attempt cap) converge by RESEND: the client never
+//     gives up and never reconnects (same session id), the produce completes, the worker acknowledged the bind.
 // =================================================================================================================
-TEST(NatEgressMatrixRegression, BindRefusedConvergesByReconnectRegression) {
+TEST(NatEgressMatrixRegression, BindLostRepeatedlyConvergesByResendRegression) {
     const RespPorts r = RespPorts::discover(1);
     OneBroker b("natrefuse", OneBroker::Runtime::Shard, withResponsePorts(r));
     rc::Client* admin = b.connectClient();
     const rc::TopicSpec spec = defineTopic(*admin, "refused", 1, 1);
-    dropNextBinds(b.node(), 4);   // the first four WorkerBinds (the whole first attempt series) are refused
+    dropNextBinds(b.node(), 6);   // the first six WorkerBinds (more than the old attempt cap) are lost at the worker
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
     cfg.declaredEgressChannelForTest = kUnroutable;
@@ -1012,6 +1010,8 @@ TEST(NatEgressMatrixRegression, BindRefusedConvergesByReconnectRegression) {
     const std::set<int64_t> s0 = sessionIds(b.node());
     auto cl = connectOrFail(cfg);
     ASSERT_NE(cl, nullptr);
+    const int64_t sidAtConnect = cl->testSeedSessionId();
+    ASSERT_NE(sidAtConnect, 0);
     const Sent sent = produceN(*cl, handleOf(spec), "rf", 0, 40, rc::Acks::All);   // bounded: the sendN deadline fails it
     EXPECT_EQ(sent.ok, 40) << sent.firstBad << " undone " << sent.undone;
     Collector col;
@@ -1019,14 +1019,15 @@ TEST(NatEgressMatrixRegression, BindRefusedConvergesByReconnectRegression) {
     const auto want = asSet(sent.okValues);
     EXPECT_TRUE(waitUntil([&] { return col.count(want) == want.size(); }, 60s)) << col.count(want) << "/40";
     EXPECT_EQ(col.strays(want), 0u);
+    EXPECT_EQ(cl->testSeedSessionId(), sidAtConnect) << "the bind must converge by resend, never by a reconnect";
     for (auto& sub : subs) sub.unsubscribe();
     cl->close();
-    EXPECT_GE(cl->testWorkerBindFailures(), 1u) << "the unacknowledged bind never made the client reconnect";
+    EXPECT_GE(cl->testWorkerBindResends(), 6u) << "the lost binds were resent";
     EXPECT_GE(cl->testWorkerBindAcksAccepted(), 1u);
     EXPECT_GT(bindAcksSent(b.node()), 0u) << "the worker never acknowledged a bind";
-    EXPECT_EQ(bindsAccepted(b.node()), 1u) << "exactly the reconnected session's bind was accepted";
+    EXPECT_EQ(bindsAccepted(b.node()), 1u) << "exactly one bind was accepted: the session's";
     EXPECT_EQ(spoofed(b.node()), 0u) << "produce was held, never sent unbound";
-    EXPECT_GE(minus(sessionIds(b.node()), s0).size(), 1u);
+    EXPECT_EQ(minus(sessionIds(b.node()), s0).size(), 1u) << "one session throughout";
 }
 
 // =================================================================================================================
@@ -1039,6 +1040,7 @@ TEST(NatEgressMatrixRegression, LostBindAckRecoveredByAlreadyBoundResendRegressi
     rc::Client* admin = b.connectClient();
     const rc::TopicSpec spec = defineTopic(*admin, "lostack", 1, 1);
     swallowNextBindAcks(b.node(), 1);   // the worker "sends" its first ack into the void
+    const std::set<int64_t> s0 = sessionIds(b.node());
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
     cfg.declaredEgressChannelForTest = kUnroutable;
@@ -1050,7 +1052,7 @@ TEST(NatEgressMatrixRegression, LostBindAckRecoveredByAlreadyBoundResendRegressi
     const Sent sent = produceN(*cl, handleOf(spec), "la", 0, 40, rc::Acks::All);
     EXPECT_EQ(sent.ok, 40) << sent.firstBad << " undone " << sent.undone;
     cl->close();
-    EXPECT_EQ(cl->testWorkerBindFailures(), 0u) << "a single lost ack must be recovered by the resend, not by a reconnect";
+    EXPECT_EQ(minus(sessionIds(b.node()), s0).size(), 1u) << "a single lost ack must be recovered by the resend, not by a reconnect";
     EXPECT_GE(cl->testWorkerBindsSent(), 2u) << "the client resent the unacknowledged bind";
     EXPECT_EQ(cl->testWorkerBindAcksAccepted(), 1u);
     EXPECT_EQ(bindsAccepted(b.node()), 1u) << "the repeat is not a second bind";
@@ -1194,7 +1196,6 @@ TEST(NatEgressMatrixRegression, TlsAuthThreeNodesNewClientRegression) {
     for (auto& sub : subs) sub.unsubscribe();
     EXPECT_TRUE(client->testSeedResponseCorrelated());
     client->close();
-    EXPECT_EQ(client->testWorkerBindFailures(), 0u);
     EXPECT_GE(client->testWorkerBindAcksAccepted(), 1u) << "key-derived bind tokens were accepted and acknowledged";
     uint64_t accepted = 0;
     for (int id = 1; id <= 3; ++id) {
@@ -1229,7 +1230,21 @@ static void seedFailoverLeg(bool nat, const char* tag) {
     const Sent before = produceN(*client, handleOf(spec), "seedA", 0, 150, rc::Acks::All);
     EXPECT_EQ(before.ok, 150) << before.firstBad << " undone " << before.undone;
 
+    // Topology (C1), asserted BEFORE acting: the client holds Connected leader sessions on nodes other than the seed.
+    // The seed's first failover attempt prefers a broker a node session is Connected to, so it lands ON one of them.
+    std::vector<std::string> leaderSessionChannels;
+    for (uint32_t i = 1; i < client->testSessionCount(); ++i)
+        if (client->testSessionStateAt(i) == rune::client::session::SessionState::Connected)
+            leaderSessionChannels.push_back(client->testSessionChannelAt(i));
+    ASSERT_FALSE(leaderSessionChannels.empty()) << "no leader session besides the seed's: the topology C1 needs is not there";
+    for (const auto& ch : leaderSessionChannels)
+        ASSERT_NE(ch, client->testSeedChannel()) << "a leader session on the seed's own node is not the failover topology";
+
     c.stop(seed);
+    ASSERT_TRUE(waitUntil([&] { return client->testSeedFailovers() >= 1; }, 60s)) << "the seed never failed over";
+    EXPECT_NE(std::find(leaderSessionChannels.begin(), leaderSessionChannels.end(), client->testSeedChannel()),
+              leaderSessionChannels.end())
+        << "the seed must have failed over ONTO a node that holds a leader session (" << client->testSeedChannel() << ")";
     std::vector<int32_t> survivors;
     ASSERT_TRUE(awaitLeaders(c, spec.topicId, 3, survivors, 60s)) << "every partition re-led on the survivors";
     const Sent after = produceN(*client, handleOf(spec), "seedB", 0, 150, rc::Acks::All);
@@ -1286,4 +1301,36 @@ TEST(NatEgressMatrixRegression, WorkerRestartRebindsRegression) {
     EXPECT_EQ(spoofed(b.node()), 0u);
     cl->close();
     EXPECT_GE(cl->testWorkerBindAcksAccepted(), 2u) << "one acknowledged bind per worker incarnation";
+}
+
+
+// =================================================================================================================
+// 14. I-D: a v16 client whose session sits on the DECLARED path although the broker advertises a response port (here:
+//     it configured no gateway response-control port, so its seed Connect is answered on the declared channel without a
+//     bind token) must still add the declared MDC egress subscription - its Records arrive on it.
+// =================================================================================================================
+TEST(MdcSubscriptionRegression, DeclaredPathSessionStillGetsRecordsRegression) {
+    const RespPorts r = RespPorts::discover(1);
+    OneBroker b("natmdc", OneBroker::Runtime::Shard, withResponsePorts(r));
+    rc::Client* admin = b.connectClient();
+    const rc::TopicSpec spec = defineTopic(*admin, "mdc", 1, 1);
+    auto cfg = b.clientConfig();   // gatewayResponseControlPort stays 0: the declared path (a reachable declared channel)
+    cfg.connectTimeoutMs = 30'000;
+    cfg.pingTimeoutMs    = 30'000;
+    cfg.topics           = {spec};
+    auto cl = connectOrFail(cfg);
+    ASSERT_NE(cl, nullptr);
+    const Sent sent = produceN(*cl, handleOf(spec), "mdc", 0, 40, rc::Acks::All);
+    EXPECT_EQ(sent.ok, 40) << sent.firstBad << " undone " << sent.undone;
+    Collector col;
+    auto subs = subscribeAll(*cl, spec, col);
+    const auto want = asSet(sent.okValues);
+    EXPECT_TRUE(waitUntil([&] { return col.count(want) == want.size(); }, 60s))
+        << "a declared-path session received " << col.count(want) << "/40 Records: its MDC egress subscription is missing";
+    EXPECT_EQ(col.strays(want), 0u);
+    for (auto& sub : subs) sub.unsubscribe();
+    EXPECT_FALSE(cl->testSeedResponseCorrelated()) << "this session is on the declared path";
+    cl->close();
+    EXPECT_GE(cl->testMdcEgressSubscriptions(), 1u) << "the declared MDC egress subscription was added";
+    EXPECT_EQ(bindsAccepted(b.node()), 0u) << "a declared-path session never binds";
 }

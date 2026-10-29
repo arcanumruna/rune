@@ -3564,6 +3564,26 @@ void Client::publishShardClosed() noexcept {
     shardDuty_ = c;
 }
 
+void Client::rememberSkippedMdc_(const std::string& leaderChannel, const std::string& ctrl, int32_t streamId) {
+    for (const SkippedMdc& e : skippedMdc_)
+        if (e.streamId == streamId && e.ctrl == ctrl) return;   // deduped by (ctrl, stream)
+    skippedMdc_.push_back(SkippedMdc{leaderChannel, ctrl, streamId});
+}
+
+void Client::revisitSkippedMdc_() noexcept {
+    // Cold: runs on a ConnectResponse / handshake leg only while a skip is remembered.  A node whose session now sits
+    // on the declared path (Connected, no worker response) gets the subscription its records will arrive on.
+    for (std::size_t i = 0; i < skippedMdc_.size();) {
+        if (agent_.nodePath(skippedMdc_[i].leaderChannel) == agent::ClientAgent::NodePath::Declared) {
+            agent_.addEgressSubscription(skippedMdc_[i].ctrl, skippedMdc_[i].streamId);
+            skippedMdc_[i] = std::move(skippedMdc_.back());
+            skippedMdc_.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
 void Client::syncSeedSession_() noexcept {
     const auto& m = agent_.seedSession().machine;
     const session::SessionState st  = m.state();
@@ -3856,6 +3876,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // resends / onConnected callback / later frames of this same poll (a
         // record handler subscribing) — never only at the end of the cycle.
         syncSeedSession_();
+        if (!skippedMdc_.empty()) [[unlikely]] revisitSkippedMdc_();   // I-D: a session may have fallen to the declared path
         auto opt = codec::decodeConnectResponse(buf, len);
         if (!opt) break;
 
@@ -3906,6 +3927,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // A later leg of a seed / node TLS handshake.  The agent already drove the
         // session's machine; this leg's verdict is in lastConnect*().
         syncSeedSession_();
+        if (!skippedMdc_.empty()) [[unlikely]] revisitSkippedMdc_();
         auto opt = codec::decodeHandshakeContinueResponse(buf, len);
         if (!opt) break;
         if (!agent_.lastConnectAwaited()) break;   // stale / duplicate / after the handshake
@@ -6469,15 +6491,24 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
         for (const auto& b : resp.brokers) {
             if (b.nodeId == p.leaderId) { host = b.host; leaderResponseMode = b.responseControlPort != 0; break; }
         }
-        // I7: a leader that advertises a response-control port serves this client over the response path (the
-        // port is only ever sent to a v16 client): the declared MDC subscription is not added, so the NAT path is
-        // the only way records can arrive.  Old brokers (port 0) keep it.
-        if (leaderResponseMode) continue;
         std::string ctrlHost = host.empty() ? fallbackHost : std::string(host);
         if (ctrlHost.empty()) continue;
         std::string ctrl = "aeron:udp?control-mode=dynamic|control=" +
                            ctrlHost + ":" +
                            std::to_string(p.egressControlPort) + "|fc=min";
+        // I7 / I-D: the declared MDC subscription is skipped ONLY when this client's session to that leader is KNOWN to
+        // be on the response path (Connected and bound to the worker response publications): the NAT path is then the
+        // only way records can arrive.  Any other state (declared path, not connected yet, no session yet, an old
+        // broker) adds it - an unused MDC subscription is harmless, a missing one silently loses records.  A skip is
+        // remembered and revisited when that session (re)connects on the declared path.
+        if (leaderResponseMode) {
+            const std::string& hostPort = metadataCache_.endpointFor(p.leaderId);
+            const std::string leaderChannel = hostPort.empty() ? std::string() : toChannel(hostPort);
+            if (!leaderChannel.empty() && agent_.nodePath(leaderChannel) == agent::ClientAgent::NodePath::Response) {
+                rememberSkippedMdc_(leaderChannel, ctrl, p.egressStreamId);
+                continue;
+            }
+        }
         agent_.addEgressSubscription(ctrl, p.egressStreamId);
     }
 

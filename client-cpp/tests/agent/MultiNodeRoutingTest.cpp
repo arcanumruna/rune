@@ -296,8 +296,10 @@ TEST(ClientAgentRegression, LearntPortUpgradesAPlainNodeSessionRegression) {
     ASSERT_EQ(bIdx, 1u);
     EXPECT_EQ(agent.sessionObjForTest(bIdx).responsePort, 0);
     EXPECT_EQ(agent.sessionObjForTest(bIdx).ctlPub, rune::client::transport::AeronTransport::kNoPub);
-    // The plain control publication exists already (the session's first connect offer opened it).
-    ASSERT_FALSE(agent.publicationResponsePairedForTest(agent.sessionObjForTest(bIdx).ctlPub));
+    // The session's first connect offer opened its PLAIN publication slot: it exists and is not response-paired.
+    const auto plain = agent.testTransport().findPublicationForTest(kB, 1);
+    ASSERT_NE(plain, rune::client::transport::AeronTransport::kNoPub) << "no plain publication slot yet: the test would be vacuous";
+    ASSERT_FALSE(agent.publicationResponsePairedForTest(plain));
     const int64_t corrBefore = agent.sessionMachineForTest(bIdx).correlationId();
 
     agent.setSessionResponsePort(kB, 41001);
@@ -310,6 +312,7 @@ TEST(ClientAgentRegression, LearntPortUpgradesAPlainNodeSessionRegression) {
         << "the control publication is now response-correlated";
     EXPECT_TRUE(agent.publicationResponsePairedForTest(agent.sessionObjForTest(bIdx).ctlPub))
         << "the already-open PLAIN publication is converted, not kept";
+    EXPECT_EQ(agent.sessionObjForTest(bIdx).ctlPub, plain) << "the same slot was converted in place";
     EXPECT_NE(agent.sessionMachineForTest(bIdx).correlationId(), corrBefore) << "a fresh connect episode";
     EXPECT_EQ(agent.sessionMachineForTest(bIdx).state(), rune::client::session::SessionState::Connecting);
 

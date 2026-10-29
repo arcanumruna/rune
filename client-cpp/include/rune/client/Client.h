@@ -716,7 +716,9 @@ public:
     // NAT-safe egress (Task 7) observers / seams.
     [[nodiscard]] uint64_t    testWorkerBindsSent() const noexcept { return agent_.workerBindsSent(); }
     [[nodiscard]] std::size_t testWorkerBindCount() const noexcept { return agent_.workerBindCount(); }
-    [[nodiscard]] uint64_t    testWorkerBindFailures() const noexcept { return agent_.workerBindFailures(); }
+    [[nodiscard]] uint64_t    testWorkerBindResends() const noexcept { return agent_.workerBindResends(); }
+    [[nodiscard]] uint64_t    testBindTokenDeriveFailures() const noexcept { return agent_.bindTokenDeriveFailures(); }
+    void testForceBindDeriveFailure(bool on) noexcept { agent_.testForceBindDeriveFailure(on); }
     [[nodiscard]] uint64_t    testWorkerBindAcksAccepted() const noexcept { return agent_.workerBindAcksAccepted(); }
     [[nodiscard]] uint64_t    testWorkerBindAcksIgnored() const noexcept { return agent_.workerBindAcksIgnored(); }
     [[nodiscard]] uint64_t    testMdcEgressSubscriptions() const noexcept { return agent_.mdcEgressSubscriptionsAdded(); }
@@ -752,6 +754,9 @@ public:
     void testRequestMetadataNow() noexcept { lastUrgentMetadataNs_ = INT64_MIN; requestMetadataNow_(); }
     /// Test hook (duty-cycle thread only): agent session `i`'s state.
     [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
+    /// Test hook (duty-cycle thread only / after quiescence): the endpoint channel of agent session `i`.
+    [[nodiscard]] const std::string& testSessionChannelAt(uint32_t i) const noexcept { return agent_.sessionChannelAt(i); }
+
     /// Review B I5 test seam (Invoker owner only): the seed's link dropped — Connected -> Resuming -> a resume ConnectRequest.
     void testForceResume() { agent_.seedSession().machine.onTransportDisconnected(now()); }
     [[nodiscard]] uint64_t testSessionConnectFailuresAt(uint32_t i) const noexcept { return agent_.sessionConnectFailuresAt(i); }
@@ -1965,6 +1970,12 @@ private:
     /// any resend or callback of that poll), before applying any hub command,
     /// and once per duty cycle (step 3c).  Duty thread only; O(1) when unchanged.
     void syncSeedSession_() noexcept;
+    /// I-D: the declared per-worker MDC subscriptions skipped because the leader's session was KNOWN to be on the
+    /// response path (see onMetadataResponse); revisited when a session (re)connects.  Cold, deduped by (ctrl, stream).
+    struct SkippedMdc { std::string leaderChannel; std::string ctrl; int32_t streamId = 0; };
+    std::vector<SkippedMdc> skippedMdc_;
+    void rememberSkippedMdc_(const std::string& leaderChannel, const std::string& ctrl, int32_t streamId);
+    void revisitSkippedMdc_() noexcept;
     /// F8a: apply one hub command on the duty thread (ring drain, close drain,
     /// or directly when a handle is used on the duty thread).
     void applyHubCommand_(const detail::HubCommand& cmd);

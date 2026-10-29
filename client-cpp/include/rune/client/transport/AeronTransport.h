@@ -267,6 +267,20 @@ public:
                    ? subSlots_[static_cast<std::size_t>(slot)].owners : 0;
     }
     [[nodiscard]] const std::string& seedPublicationChannelForTest() const noexcept { return ingressPubChannel_; }
+    /// TEST SEAMS (cold): fresh response subscriptions registered since start (a re-pair adds one), and the identity of
+    /// the publication a handle currently holds (null = none Ready), to prove a slot was left alone.
+    [[nodiscard]] uint64_t responseSubsAddedForTest() const noexcept { return freshSubsAdded_; }
+    [[nodiscard]] const void* publicationIdentityForTest(PubHandle h) const noexcept {
+        if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return nullptr;
+        return pubSlots_[static_cast<std::size_t>(h)].res.ready();
+    }
+    [[nodiscard]] bool seedRePairingForTest() const noexcept { return std::holds_alternative<SeedRePairing>(seedPair_); }
+    /// TEST SEAM: the existing slot for (channel, stream) or kNoPub - never creates one.
+    [[nodiscard]] PubHandle findPublicationForTest(const std::string& channel, int32_t streamId) const noexcept {
+        for (std::size_t i = 0; i < pubSlots_.size(); ++i)
+            if (pubSlots_[i].streamId == streamId && pubSlots_[i].channel == channel) return static_cast<PubHandle>(i);
+        return kNoPub;
+    }
     [[nodiscard]] int64_t seedResponseSubscriptionIdForTest() const noexcept {
         if (respSeedSlot_ < 0) return 0;
         const aeron::Subscription* sub = subSlots_[static_cast<std::size_t>(respSeedSlot_)].res.ready();
@@ -463,7 +477,10 @@ public:
     /// pair (new response subscription + new request publication, hence a new image).  rePairSeedResponse: the seed's
     /// pair; rePairResponsePublication: the pair of the handle `h` (the handle stays valid and offerOn re-resolves it).
     /// Both cold; false = not response-paired / failed (the old pair is intact).
-    bool rePairSeedResponse(int32_t responsePort) noexcept { return retarget(cfg_.ingressChannel, responsePort); }
+    /// Asynchronous and cold: only registers the new response subscription (never pumps, never sleeps, never touches
+    /// another publication); the following offer() calls build the new request publication once it is Ready and swap
+    /// the pair (see SeedRePairing).  True = a re-pair is in flight (or already was); false = nothing to pair.
+    bool rePairSeedResponse(int32_t responsePort) noexcept;
     bool rePairResponsePublication(PubHandle h) noexcept;
 
 private:
@@ -526,6 +543,21 @@ private:
     std::string                                  ingressPubChannel_;
     /// Index into subSlots_ of the seed's response subscription (-1 = none): the seed's rich response state.
     int32_t                                      respSeedSlot_ = -1;
+    /// The seed pair's re-pair state, one explicit state (mirrors PubSlot::AwaitResponseSub -> Correlated):
+    ///   SeedSteady     the pair in force (ingressPub_ + respSeedSlot_) is the only one;
+    ///   SeedRePairing  a fresh response subscription (subSlots_[subSlot]) is resolving, then the request publication
+    ///                  correlated with it on `addChannel`; offer() advances it and swaps when both are Ready.
+    struct SeedSteady {};
+    struct SeedRePairing {
+        int32_t     subSlot;
+        std::string addChannel;
+        Resolution<aeron::ExclusivePublication> res;
+    };
+    std::variant<SeedSteady, SeedRePairing> seedPair_{SeedSteady{}};
+    /// Advance a pending seed re-pair; true = swapped (the new pair is in force), false = still pending or abandoned.
+    bool advanceSeedRePair_(SeedRePairing& rp) noexcept;
+    /// Drop a pending seed re-pair: its subscription slot is retired, the old pair stays in force.
+    void abandonSeedRePair_() noexcept;
     std::shared_ptr<aeron::Subscription>         egressSub_;
     std::unique_ptr<aeron::FragmentAssembler>    assembler_;
 
@@ -612,6 +644,7 @@ private:
     void retireSubSlot_(int32_t idx) noexcept;
     void reapRetiredSubs_() noexcept;
     uint32_t retiredSubs_ = 0;   // Retired slots awaiting reapRetiredSubs_()
+    uint64_t freshSubsAdded_ = 0;   // fresh (response-pair) subscription slots added; test seam
     bool     warnedPlainResponse_ = false;   // responsePublicationHandle: logged once
     std::vector<PubSlot>  pubSlots_;   // index == PubHandle (stable, never erased)
     detail::FlatIndexMap  streamPub_;  // default-channel streamId -> PubHandle

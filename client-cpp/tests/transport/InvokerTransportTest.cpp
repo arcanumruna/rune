@@ -1113,3 +1113,80 @@ TEST(InvokerTransportResponseRegression, RetargetPairsTheNewResponseSubscription
     for (int i = 0; i < 5; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }
     t.stop();
 }
+
+// ---- I-A: the seed re-pair is asynchronous and touches only the seed pair -------------------------------------------
+
+// rePairSeedResponse only registers the new response subscription: it never pumps the conductor, never sleeps.  The new
+// pair is built by the following offer()/duty cycles; the swap retires the old subscription.
+TEST(SeedRePairRegression, RePairNeverPumpsRegression) {
+    const uint16_t reqPort = rune::client::testing::allocFreeUdpPort();
+    const uint16_t rPort   = rune::client::testing::allocFreeUdpPort();
+    Config c = responseConfig(loopback(reqPort), rPort, 3560);
+    Transport t{c};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    RawServer srv(c.dataDir, loopback(reqPort), c.ingressStreamId, rPort, c.egressStreamId);
+    const uint8_t frame[] = {1, 2, 3, 4};
+    ASSERT_TRUE(pumpBoth(t, srv, [&] { return t.offer(frame, sizeof frame); })) << "the first pair never connected";
+    const int64_t oldReg  = t.seedResponseSubscriptionIdForTest();
+    const int32_t oldSlot = t.seedResponseSlotForTest();
+    ASSERT_NE(oldReg, 0);
+
+    ASSERT_TRUE(t.rePairSeedResponse(rPort));
+    // Returned at once: the conductor was not pumped, so nothing has resolved and the OLD pair is still in force.
+    EXPECT_TRUE(t.seedRePairingForTest());
+    EXPECT_EQ(t.seedResponseSubscriptionIdForTest(), oldReg) << "the call must not complete the re-pair itself";
+    EXPECT_EQ(t.seedResponseSlotForTest(), oldSlot);
+    EXPECT_TRUE(t.rePairSeedResponse(rPort)) << "one re-pair in flight: a second call is a no-op";
+
+    bool sent = false;
+    for (int i = 0; i < 200000 && !sent; ++i) {   // hard cap
+        t.dutyCycle();
+        srv.pump();
+        sent = t.offer(frame, sizeof frame) && t.seedResponseSubscriptionIdForTest() != oldReg;
+    }
+    ASSERT_TRUE(sent) << "the asynchronous re-pair never completed";
+    EXPECT_FALSE(t.seedRePairingForTest());
+    EXPECT_NE(t.seedResponseSubscriptionIdForTest(), oldReg);
+    for (int i = 0; i < 5; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }   // reap pass
+    EXPECT_FALSE(t.subSlotLiveForTest(oldSlot) && t.seedResponseSlotForTest() == oldSlot)
+        << "the spent subscription is retired";
+    t.stop();
+}
+
+// A correlated publication to the SAME channel as the seed is not the seed's business: the seed re-pair leaves it
+// (same publication object, still Ready).
+TEST(SeedRePairRegression, RePairLeavesOtherPublicationsAloneRegression) {
+    const uint16_t reqPort = rune::client::testing::allocFreeUdpPort();
+    const uint16_t rPort   = rune::client::testing::allocFreeUdpPort();
+    Config c = responseConfig(loopback(reqPort), rPort, 3570);
+    Transport t{c};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    const std::string gw = loopback(reqPort);
+    const auto respCtl = rune::client::transport::responseControlChannelFor(gw, rPort);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(gw, 3571, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    RawServer srv(c.dataDir, gw, 3571, rPort, c.egressStreamId);
+    const uint8_t frame[] = {0xC1, 0x02};
+    bool sent = false;
+    ASSERT_TRUE(pumpBoth(t, srv, [&] { if (!sent) sent = t.offerOn(h, frame, sizeof frame); return sent; }));
+    ASSERT_TRUE(t.publicationReady(h));
+    const void* const before = t.publicationIdentityForTest(h);
+    ASSERT_NE(before, nullptr);
+    const int64_t oldReg = t.seedResponseSubscriptionIdForTest();
+
+    ASSERT_TRUE(t.rePairSeedResponse(rPort));
+    bool swapped = false;
+    for (int i = 0; i < 200000 && !swapped; ++i) {   // hard cap; the seed's request side has no server, so only offer() advances it
+        t.dutyCycle();
+        srv.pump();
+        (void)t.offer(frame, sizeof frame);
+        swapped = t.seedResponseSubscriptionIdForTest() != oldReg;
+    }
+    ASSERT_TRUE(swapped) << "the seed re-pair never completed";
+    EXPECT_EQ(t.publicationIdentityForTest(h), before) << "the seed re-pair reset another publication on the same channel";
+    EXPECT_TRUE(t.publicationReady(h));
+    t.stop();
+}

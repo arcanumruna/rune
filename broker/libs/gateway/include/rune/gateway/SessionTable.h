@@ -123,6 +123,10 @@ struct Session {
     // NAT-safe egress (Task 6): the 16 B secret of a response-mode SHARD session's WorkerBind (all-zero = the session
     // is not response-mode / has no worker response publication).  Returned to the client in its ConnectResponse.
     std::array<uint8_t, 16>                        bindToken{};
+    /// The session answers through the WORKERS' response publications (a worker-response session): its announces to the
+    /// workers carry the bind token and no channel.  Set at creation; never derived from bindToken (a zero token must
+    /// never turn a worker-response session into a plain one).
+    bool                                           workerResponse = false;
     [[nodiscard]] bool hasBindToken() const noexcept {
         uint8_t any = 0;
         for (const uint8_t b : bindToken) any = static_cast<uint8_t>(any | b);

@@ -103,6 +103,11 @@ class ClientAgent;
 // ---------------------------------------------------------------------------
 struct Session;
 
+/// A response pair (request publication + response subscription) is ONE-SHOT: Aeron pins the subscription to the first
+/// gateway response publication session that reaches it.  Fresh = no Connect / bind was accepted on it yet; Spent = one
+/// was, so the NEXT Connect (or the next session's bind) builds a new pair first.
+enum class ResponsePair : uint8_t { Fresh, Spent };
+
 struct SessionEndpointIo : session::SessionIo {
     ClientAgent* agent   = nullptr;    // owner (shared transport lives here)
     std::string  endpoint;             // this session's ingress channel
@@ -199,10 +204,11 @@ struct Session {
     /// I6: opened plain, then the node's response port was learnt: the next duty pass builds the correlated control
     /// publication and reconnects on it.
     bool        upgradeToResponse    = false;
-    /// A response subscription is one-shot (Aeron pins it to the first response publication session): once a
-    /// ConnectResponse arrived on this session's pair the pair is spent, and the NEXT ConnectRequest (a reconnect after
-    /// SessionExpired / a forced reconnect / a keepalive loss) first builds a fresh pair (offerControlTo).
-    bool        pairPinned           = false;
+    /// The session's response pair (see ResponsePair): Spent as soon as a ConnectRequest was ACCEPTED by its request
+    /// publication (the gateway opens a response publication per Connect, and the first one to set up pins the
+    /// subscription - whichever Connect it answers), and the NEXT ConnectRequest first builds a fresh pair
+    /// (offerControlTo).  A Connect the transport refused reached nobody: the pair stays Fresh.
+    ResponsePair pair                = ResponsePair::Fresh;
 
     Session(ClientAgent* agent, session::SessionConfig cfg,
             std::string sessionEndpoint)
@@ -410,6 +416,17 @@ public:
     /// subscription so the client receives Records pushed by the owning worker.
     /// AGENT-THREAD ONLY — call from onMetadataResponse (which runs on the agent
     /// thread during egress poll dispatch).  Forwards to the transport.
+    /// I-D: which path the session that carries `endpointChannel` (a node's channel) is on: Response = Connected and
+    /// bound to worker response publications; Declared = Connected on the declared egress path; Unknown = no session /
+    /// not Connected yet.  Cold.
+    enum class NodePath : uint8_t { Unknown, Response, Declared };
+    [[nodiscard]] NodePath nodePath(const std::string& endpointChannel) const noexcept {
+        const uint32_t idx = findSessionIndex_(endpointChannel);
+        if (idx == kNoSession || idx >= sessions_.size()) return NodePath::Unknown;
+        const Session& s = *sessions_[idx];
+        if (s.machine.state() != session::SessionState::Connected) return NodePath::Unknown;
+        return s.bindRequired ? NodePath::Response : NodePath::Declared;
+    }
     void addEgressSubscription(const std::string& controlChannel, int32_t streamId) noexcept {
         ++mdcEgressSubscriptionsAdded_;
         transport_.addEgressSubscription(controlChannel, streamId);
@@ -464,7 +481,10 @@ public:
     }
     [[nodiscard]] bool seedResponseCorrelated() const noexcept { return transport_.seedResponseCorrelated(); }
     [[nodiscard]] uint64_t workerBindsSent() const noexcept { return workerBindsSent_; }
-    [[nodiscard]] uint64_t workerBindFailures() const noexcept { return workerBindFailures_; }
+    [[nodiscard]] uint64_t workerBindResends() const noexcept { return workerBindResends_; }
+    /// I-C: TLS-derived bind tokens that could not be derived (failure or all-zero): the session was reconnected.
+    [[nodiscard]] uint64_t bindTokenDeriveFailures() const noexcept { return bindTokenDeriveFailures_; }
+    void testForceBindDeriveFailure(bool on) noexcept { forceBindDeriveFailure_ = on; }
     [[nodiscard]] uint64_t workerBindAcksAccepted() const noexcept { return workerBindAcksAccepted_; }
     [[nodiscard]] uint64_t workerBindAcksIgnored() const noexcept { return workerBindAcksIgnored_; }
 
@@ -1097,20 +1117,23 @@ private:
         transport::AeronTransport::PubHandle pub = transport::AeronTransport::kNoPub;
         uint32_t    sessionIndex = kNoSession;   ///< resolved (never opened) by the duty pass
         std::variant<Unbound, Sent, Bound> state{Unbound{}};
-        /// The first WorkerBind of a session went out on this entry's pair (request publication + response subscription):
-        /// the worker's response publication for it pins the subscription, so the NEXT session's bind needs a fresh pair.
-        bool pairUsed = false;
+        /// The first WorkerBind of a session was accepted on this entry's pair (request publication + response
+        /// subscription): the worker's response publication for it pins the subscription, so the NEXT session's bind
+        /// needs a fresh pair.
+        ResponsePair pair = ResponsePair::Fresh;
     };
     std::vector<WorkerBindEntry> workerBinds_;   // grows on the cold path only; reserved in the ctor
     int64_t                      bindCorrId_ = 0;
     uint64_t                     workerBindsSent_ = 0;
-    uint64_t                     workerBindFailures_ = 0;       ///< binds given up after kBindMaxAttempts (session reconnected)
+    uint64_t                     bindTokenDeriveFailures_ = 0;   ///< I-C: a derived bind token was zero / failed: reconnect
+    bool                         forceBindDeriveFailure_ = false;   ///< test seam: the derivation yields all-zero
+    uint64_t                     workerBindResends_ = 0;        ///< unacknowledged WorkerBinds resent (lost-datagram retry)
     uint64_t                     workerBindAcksAccepted_ = 0;
     uint64_t                     workerBindAcksIgnored_ = 0;    ///< late / stale / unmatched WorkerBindAcks
-    /// Lost-datagram retry of an unacknowledged WorkerBind (NOT a convergence timer: the outcome after the last
-    /// attempt is a fresh connect, which converges for any timing).
-    static constexpr int64_t kBindRetryNs     = 250'000'000;
-    static constexpr uint8_t kBindMaxAttempts = 4;
+    /// Lost-datagram resend of an unacknowledged WorkerBind: capped exponential backoff, no attempt cap and no give-up
+    /// (the worker re-acks a repeat; the session's own liveness ends a bind that can never succeed).
+    static constexpr int64_t kBindRetryNs    = 250'000'000;
+    static constexpr int64_t kBindRetryMaxNs = 4'000'000'000;
     /// A WorkerBindAck (templateId 87, plaintext): Sent{sid, corr} -> Bound{sid}; anything else is ignored + counted.
     void onWorkerBindAck_(const uint8_t* buf, std::size_t len) noexcept;
     /// Replace `s`'s spent response pair (request publication + response subscription) with a fresh one.  Cold.

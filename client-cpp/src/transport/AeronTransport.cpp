@@ -314,6 +314,7 @@ void AeronTransport::stop() noexcept {
     // read-rework I4: release per-worker egress subscriptions + their assemblers
     // BEFORE closing the aeron client (same recursive_mutex teardown reason as
     // the publication slots below — Subscription dtors deregister via the conductor).
+    seedPair_ = SeedSteady{};           // a pending re-pair's publication resolution, before its Aeron client
     subSlots_.clear();                  // assemblers + subscriptions (conductor dereg), the response pairs' too
     respSeedSlot_ = -1;
     retiredSubs_  = 0;
@@ -430,6 +431,9 @@ std::int64_t AeronTransport::sealInTerm_(aeron::concurrent::AtomicBuffer& term,
 // ---------------------------------------------------------------------------
 
 bool AeronTransport::offer(const uint8_t* buf, std::size_t len, FrameCrc crc) noexcept {
+    if (auto* rp = std::get_if<SeedRePairing>(&seedPair_)) [[unlikely]] {
+        if (!advanceSeedRePair_(*rp)) return false;   // the new pair is not ready: Retry
+    }
     if (!ingressPub_) return false;
 
     // This method is noexcept but the Aeron publication calls below can throw
@@ -441,6 +445,9 @@ bool AeronTransport::offer(const uint8_t* buf, std::size_t len, FrameCrc crc) no
 }
 
 AeronTransport::OfferResult AeronTransport::offerResult(const uint8_t* buf, std::size_t len) noexcept {
+    if (auto* rp = std::get_if<SeedRePairing>(&seedPair_)) [[unlikely]] {
+        if (!advanceSeedRePair_(*rp)) return OfferResult::Retry;   // the new pair is not ready
+    }
     if (!ingressPub_) return OfferResult::Retry;  // not resolved yet
     return offerToPub(*ingressPub_, buf, len);
 }
@@ -527,6 +534,61 @@ bool AeronTransport::rePairResponsePublication(PubHandle h) noexcept {
         retireSubSlot_(oldSub);   // the pinned subscription; released at the next poll()
         return true;
     } catch (...) {
+        return false;
+    }
+}
+
+bool AeronTransport::rePairSeedResponse(int32_t responsePort) noexcept {
+    try {
+        if (!aeron_) return false;
+        const std::optional<std::string> respChannel = responseControlChannelFor(cfg_.ingressChannel, responsePort);
+        if (!respChannel) return false;                                  // ipc / port 0: nothing to pair
+        if (std::holds_alternative<SeedRePairing>(seedPair_)) return true;   // one in flight
+        const int32_t sub = addSubSlot_(*respChannel, cfg_.egressStreamId, /*fresh=*/true);
+        if (sub < 0) return false;
+        seedPair_ = SeedRePairing{sub, {}, Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs}};
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void AeronTransport::abandonSeedRePair_() noexcept {
+    if (const auto* rp = std::get_if<SeedRePairing>(&seedPair_)) {
+        const int32_t sub = rp->subSlot;
+        retireSubSlot_(sub);   // released at the next poll(); the old pair stays in force
+    }
+    seedPair_ = SeedSteady{};
+}
+
+bool AeronTransport::advanceSeedRePair_(SeedRePairing& rp) noexcept {
+    try {
+        if (!aeron_) return false;
+        SubSlot& ss = subSlots_[static_cast<std::size_t>(rp.subSlot)];
+        aeron::Subscription* sub = ss.res.ready();
+        if (sub == nullptr) sub = resolveSubSlot_(ss);
+        if (sub == nullptr) {
+            if (ss.res.rejected()) abandonSeedRePair_();   // the next Connect re-pairs again
+            return false;
+        }
+        if (rp.addChannel.empty()) rp.addChannel = withResponseCorrelation(cfg_.ingressChannel, sub->registrationId());
+        PubRegistry reg{*aeron_, rp.addChannel, cfg_.ingressStreamId};
+        if (rp.res.poll(reg, resolveNow_()) != ResolveStatus::Ready) {
+            if (rp.res.rejected()) abandonSeedRePair_();
+            return false;
+        }
+        // Both Ready: swap.  The old request publication deregisters here; the spent response subscription is retired
+        // (released at the next poll(), never inside a callback).
+        const int32_t newSlot = rp.subSlot;
+        ingressPub_        = *rp.res.readyShared();
+        ingressPubChannel_ = rp.addChannel;
+        const int32_t oldSlot = respSeedSlot_;
+        respSeedSlot_ = newSlot;
+        if (oldSlot >= 0 && oldSlot != newSlot) retireSubSlot_(oldSlot);
+        seedPair_ = SeedSteady{};   // invalidates rp
+        return true;
+    } catch (...) {
+        abandonSeedRePair_();
         return false;
     }
 }
@@ -650,6 +712,7 @@ int32_t AeronTransport::addSubSlot_(const std::string& channel, int32_t streamId
             return static_cast<int32_t>(i);   // idempotent
         }
     }
+    if (fresh) ++freshSubsAdded_;
     try {
         for (std::size_t i = 0; i < subSlots_.size(); ++i) {   // reuse a released slot
             SubSlot& s = subSlots_[i];
@@ -720,6 +783,8 @@ bool AeronTransport::retarget(const std::string& newIngressChannel, int32_t resp
     // (→ std::terminate).  On ANY failure we leave the OLD ingressPub_ intact.
     try {
         if (!aeron_) return false;  // not started — cannot retarget, old state untouched
+        // A real channel change supersedes a pending seed re-pair (its subscription names the old gateway).
+        if (std::holds_alternative<SeedRePairing>(seedPair_)) abandonSeedRePair_();
         // NAT-safe egress: the new response subscription FIRST (the publication's URI names its registration id),
         // then the correlated publication.  Both resolve BEFORE the old pair is released, so a failed retarget
         // leaves the old pair usable.

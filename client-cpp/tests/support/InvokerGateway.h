@@ -327,7 +327,20 @@ struct InvokerGateway {
     int responseConnects = 0;                        ///< Connects answered on a response publication
     std::vector<std::vector<uint8_t>> workerBindFrames;   ///< every WorkerBind frame as it arrived (plaintext check)
     struct RespPub { int64_t reg = -1; std::shared_ptr<aeron::ExclusivePublication> pub; };
-    std::map<std::pair<int, int32_t>, RespPub> respPubs_;          ///< (endpoint, request image) -> response publication
+    /// (endpoint, request image | generation << 32) -> response publication.  A real gateway opens a NEW response
+    /// publication per ConnectRequest (PendingConnect), so a second Connect on the same request image gets a second
+    /// publication: Aeron pins the client's response subscription to the first one that connects.
+    std::map<std::pair<int, int64_t>, RespPub> respPubs_;
+    std::map<std::pair<int, int32_t>, int> respGen_;               ///< (endpoint, image) -> current publication generation
+    std::map<std::pair<int, int64_t>, int> respConnectGen_;        ///< (endpoint, connect corr) -> the generation it opened
+    int holdConnectAnswers = 0;                                    ///< test knob: the next N Connect answers are held
+    std::vector<std::pair<int, std::vector<uint8_t>>> heldConnectAnswers;   ///< (endpoint, frame) held by the knob
+    /// Releases every held Connect answer (it leaves on the publication its Connect opened).
+    void releaseHeldConnectAnswers() {
+        auto held = std::move(heldConnectAnswers);
+        heldConnectAnswers.clear();
+        for (auto& [ep, f] : held) send(ep, f.data(), f.size());
+    }
     std::map<std::pair<int, int64_t>, int32_t> respRoute_;         ///< (endpoint, session) -> request image
     std::map<std::pair<int, int64_t>, int32_t> respConnectRoute_;  ///< (endpoint, connect correlation id) -> request image
     std::pair<int, int32_t> currentImage_{-1, 0};                  ///< (endpoint, image) of the frame being handled
@@ -1358,7 +1371,8 @@ private:
 
     /// Response channels: the request image a reply from `endpoint` must ride back on, or false (declared path).
     /// Keyed by the frame's session; a ConnectResponse / ErrorResponse answering a Connect by its correlation id.
-    bool responseImageFor_(int endpoint, const std::vector<uint8_t>& f, int32_t& image) const {
+    bool responseImageFor_(int endpoint, const std::vector<uint8_t>& f, int32_t& image, int& gen) const {
+        gen = -1;   // the image's current publication
         namespace rp = rune::protocol::client;
         if (responseCtl.count(endpoint) == 0 || f.size() < rp::MessageHeader::ENCODED_SIZE) return false;
         const int64_t sid = static_cast<int64_t>(rp::detail::getLE64(f.data(), 8));
@@ -1370,6 +1384,7 @@ private:
             const int64_t corr = static_cast<int64_t>(rp::detail::getLE64(f.data(), 16));
             if (const auto it = respConnectRoute_.find({endpoint, corr}); it != respConnectRoute_.end()) {
                 image = it->second;
+                if (const auto g = respConnectGen_.find({endpoint, corr}); g != respConnectGen_.end()) gen = g->second;
                 return true;
             }
         }
@@ -1383,6 +1398,7 @@ private:
             const int64_t corr = static_cast<int64_t>(rp::detail::getLE64(f.data(), 16));
             if (const auto it = respConnectRoute_.find({endpoint, corr}); it != respConnectRoute_.end()) {
                 image = it->second;
+                if (const auto g = respConnectGen_.find({endpoint, corr}); g != respConnectGen_.end()) gen = g->second;
                 return true;
             }
         }
@@ -1390,8 +1406,9 @@ private:
     }
 
     /// The response publication for (endpoint, request image), registered on first use.
-    RespPub& ensureRespPub_(int endpoint, int32_t image) {
-        RespPub& rp = respPubs_[{endpoint, image}];
+    RespPub& ensureRespPub_(int endpoint, int32_t image, int gen = -1) {
+        if (gen < 0) gen = respGen_[{endpoint, image}];
+        RespPub& rp = respPubs_[{endpoint, static_cast<int64_t>(image) | (static_cast<int64_t>(gen) << 32)}];
         if (rp.reg < 0) {
             const auto img = endpoints[static_cast<std::size_t>(endpoint)]->sub
                                  ? endpoints[static_cast<std::size_t>(endpoint)]->sub->imageBySessionId(image) : nullptr;
@@ -1406,11 +1423,14 @@ private:
     }
 
     bool offerNow(int endpoint, const std::vector<uint8_t>& f) {
-        if (int32_t image = 0; !responseCtl.empty() && responseImageFor_(endpoint, f, image)) {
-            RespPub& rp = ensureRespPub_(endpoint, image);
+        if (int32_t image = 0; !responseCtl.empty()) {
+          int gen = -1;
+          if (responseImageFor_(endpoint, f, image, gen)) {
+            RespPub& rp = ensureRespPub_(endpoint, image, gen);
             if (!rp.pub) return false;   // still registering (retried from the outbox): never the declared path
             aeron::concurrent::AtomicBuffer rab(const_cast<uint8_t*>(f.data()), static_cast<aeron::util::index_t>(f.size()));
             return rp.pub->offer(rab, 0, static_cast<aeron::util::index_t>(f.size())) > 0;
+          }
         }
         auto& ep = endpoints[static_cast<std::size_t>(endpoint)];
         if (!ep->pub) return false;
@@ -1783,6 +1803,10 @@ private:
                                   currentImage_.first == endpoint;
             if (respMode) {
                 respConnectRoute_[{endpoint, c->correlationId}] = currentImage_.second;
+                // A new publication per Connect (as the gateway's PendingConnect), unless this image has none yet.
+                if (const auto g = respGen_.find({endpoint, currentImage_.second}); g != respGen_.end()) ++g->second;
+                else respGen_[{endpoint, currentImage_.second}] = 0;
+                respConnectGen_[{endpoint, c->correlationId}] = respGen_[{endpoint, currentImage_.second}];
                 (void)ensureRespPub_(endpoint, currentImage_.second);
             }
             if (!replyConnects || silentEndpoints.count(endpoint) != 0) return;
@@ -1886,6 +1910,11 @@ private:
             } else {
                 n = rcc::encodeConnectResponse(outPlain.data(), outPlain.size(), okCode, 0, sid, c->sessionId,
                                                c->correlationId, bv, cipher, flight);
+            }
+            if (holdConnectAnswers > 0) {
+                --holdConnectAnswers;
+                heldConnectAnswers.emplace_back(endpoint, std::vector<uint8_t>(frame, frame + n));
+                return;
             }
             if (replyFromArrival && !replyOnAnnouncedEgress) {
                 send(endpoint, frame, n);
