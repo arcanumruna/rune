@@ -29,6 +29,63 @@
 - **Docker e2e, dr-e2e and VM benches** run only on the shared Linux VM (`$RUNE_VM_HOST`, under its lock file), never on local Mac docker. Prepare the clean box once for benches and restore it afterwards (`broker/bench/BENCHMARKING.md`).
 - **Commits.** Use `git add <paths>`, never `.superpowers/` or build logs. Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Never run `conan create/export/upload`.
 
+## Rebase to `main` 750c836b (binding; overrides every number, name and line below)
+
+The plans were written against `caf285c4`. Main has since taken many of the numbers they claim, and #589 shipped Part 01 in a different form. This section is the single source of truth for both. Where any plan text, contract (C1–C18), the registry or the file map disagrees with it, this section wins. Each part's implementer brief restates the rows it uses; line numbers in every plan are stale and are found again by the quoted text, symbol or sentinel.
+
+### RB1 — Scope
+
+- **Part 11 is dropped.** No part builds the transaction vote. Everything owned by 11 (C18, `TxnConflict`, `TxnTooLarge`, the cluster templates, `TxnVote` ops and return types, `kAttrAtomic`, stats 11–20, R11a–R11d, the §16.12 cross-check) is out. Part 03's refusal of a transactional batch to a constrained source (03 rule 7) is permanent until a follow-up issue reopens §9b. R03c stays: the client never sets `View` on a transactional send.
+- **Part 01 is done by #589 (merge `f71596cc`).** It has no branch and no PR. RB3 says what later parts use instead.
+- **R-ORD becomes:** 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09, with 10 after 03 (beside 04–08), and 09 after 10. Autoincrement is usable after 06; `unique` and `check` after 09.
+
+### RB2 — Numbers (old → new)
+
+| Space | Plan value | Value on main | Owner |
+|---|---|---|---|
+| `ErrorCode` (51–54 are `NamespaceSuspended`, `NamespaceLimitExceeded`, `Throttled`, `ViewPaused`) | 51 `ConstraintViolation`, 52 `KeyExists`, 53 `KeyNotFound`, 54 `AutoIncrementExhausted`, 55 `TxnTooLarge`, 56 `ViewKeyExpressionInvalid`, 57 `ViewConstraintInvalid`, 58 `ViewUniqueInvalid`, 59 `TxnConflict` | **55** `ConstraintViolation`, **56** `KeyExists`, **57** `KeyNotFound`, **58** `AutoIncrementExhausted`, **59** `ViewKeyExpressionInvalid`, **60** `ViewConstraintInvalid`, **61** `ViewUniqueInvalid`; `TxnTooLarge` and `TxnConflict` are not added. Next free 62 | 03 |
+| `errorCodeName` (`QlEngine.cpp`), `produceErrorForClient` | names 48–58, map 51–58 below v12 | names through 61, `static_assert` on `ViewUniqueInvalid`; map 55–61 to `InvalidRequest` below `kClientVersionCheckedWrites` | 03 |
+| Client version | `kClientVersionCheckedWrites = kClientVersion = 12`; "v11 client" | **17**; "v11" means 16 | 03 |
+| Broker version | `kBrokerVersionCheckedWrites = kBrokerVersion = 7`; "v6 broker" | **10**; "v6" means 9 | 03 |
+| Cluster feature level | `MetadataFeature::kCheckedWrites = 4` (4 is `kTxnPartitionVerify`); "below level 4" | **5**, `kLatest = kCheckedWrites`; "below level 4" means below 5 | 02 |
+| `WorkerOp::Type` / SBE `OpType` (26–30 are taken) | 26 `ClusterFeatureLevel`, 27 `WriteSpecUpdate`, 29 `GetViewRowK`, 30 `ScanViewRows`, 31 `GetStats` | **31** `ClusterFeatureLevel`, **32** `WriteSpecUpdate` (02); **33** `GetViewRowK`, **34** `ScanViewRows` (07); **35** `GetStats` (08). Next free 36 | 02, 07, 08 |
+| `WorkerReturn::Type` / SBE `ReturnType` (8 is `TXN_VERIFY_REQUEST`) | 9 `ViewScanResult`, 10 `StatsResult` | unchanged (9, 10). Next free 11 | 07, 08 |
+| SBE `TailKind` | 12 `WRITE_SPEC`, 13 `VIEW_READ` | unchanged | 02, 07 |
+| Client `TemplateId` (81–87 are namespaces and `WorkerBind`; the view range ends at 95) | 81 `GetViewRowK`, 82 `ScanViewRows`, 83 `ScanViewRowsResponse`, 84 `GetStats`, 85 `StatsResponse` | **88**, **89**, **90** (07); **91**, **92** (08). Next free 93 | 07, 08 |
+| Control → admin message (`AdminChannels.h`; the `kMsg` ids are one space shared by several rings, 36 is the highest) | `kMsgClusterFeatureLevel = 26` | **37**. Next free 38 | 02 |
+| Admin → control message (26–28 are namespace messages) | `kA2cWriteSpec = 26` | **29**. Next free 30 | 02 |
+| `SecurityOperation` (7 is `Truncate`) | `Import = 7` | **`Import = 8`**; `validSecurityOperation` checks `<= Import`. Bits 0–7 of the `uint8_t` op mask are all used, so `rune::security::opsOn` and `clusterOps` (`Permissions.h`) return `uint16_t`, root (ADMIN ON CLUSTER) is `0x1FF` instead of `0xFF`, and every holder of an op mask widens with them (Part 06 lists them with `grep -rn 'opsOn\|clusterOps\|0xFF'`); `Import` is bit 8. The masks are computed in memory (`PermissionTable` caches them per object), never persisted or sent, so no format changes; `opBit` widens too | 06 |
+| SESSION_PERMISSIONS import marker (all eight `kPermFlag*` bits of the `isolation` byte are used; 0x80 is `kPermFlagSecurityBehind`) | `kPermFlagImport = 0x80` | **no new flag.** An import Table or Patch item sets the op's `topicId` (unused by SESSION_PERMISSIONS) to `kPermBitmapImport = 1` (`WorkerWriteGrants.h`; 0 = the write bitmap). The stager and the patch path route on it | 06 |
+| Produce op flag (`deferAck` byte; 0x10 is `kOpFlagKeyPending`) | `kOpFlagImportGranted = 0x10` | **0x80** (the last free bit) | 06 |
+| Control record types, batch attribute bits, record attribute bits, client ring flags, `SendResult` 12–13, `OpStatus` 12–14, view-read status 8, `StatId`, key-feature flags, `TopicWriteSpecWire` flags, checkpoint v3 magic `0x564B4333` and table ids 0–7, `view_probe` 180–189 | as planned | unchanged | — |
+
+Every plan sentence that names a code, version or level by its old number ("52/53", "answers 56", "a v12 session", "v7 broker", "level 4", "op 31") means the new value from this table. Test names that embed an old number (for example `…BeforePart09…` tests asserting 58 and 57) assert the new values.
+
+### RB3 — Part 01 as shipped, and what later parts use
+
+#589 built the aborted-transaction skip without the plan's marker design:
+
+- `rune::view::AbortedTxnFilter {fn, ctx}` with `skips(reader, attrs)` and `kNoAbortedTxns` (`ViewFold.h`); `foldBatch` / `foldAggregateBatch` and `WorkerViewSet::driveFolds` / `driveRebuild` / `driveView_` take `const AbortedTxnFilter&`; `Worker::rcAbortedFilter_(const RcState&)` builds it.
+- `FoldStats::skippedAborted` and `ViewFoldCounters::skippedAborted`.
+- Checkpoints live in `view-<id>-p<n>.committed.delta` (`viewCheckpointFilePath`, `ViewSnapshotChannel.h`). A pre-fix `view-<id>-p<n>.delta` (`legacyViewCheckpointFilePath`) is never loaded: recovery removes it and the view refolds cold from the log.
+- The docker leg over a committed and an aborted transaction is in `view-engine-e2e.sh`.
+
+So **R01 and SD15 are replaced by R01r**: there are no marked magics (`0x534B433x`), no `CheckpointMark` / `checkpointMarkOf` / `AppliedDelta::mark`, no `sourceLogStart` parameter, no `checkpointsDiscarded` / `checkpointsKeptUnverifiable` counters and no `view_probe` codes 170–179. Every checkpoint in a `.committed.delta` file was written by a fold that skips aborted batches.
+
+What each later part does instead:
+
+- **Part 04 creates `FoldSkip`.** `broker/libs/view/include/rune/view/FoldSkip.h`: `struct FoldSkip { AbortedTxnFilter aborted{}; const rune::storage::RejectedOffsetIndex* rejected = nullptr; };`, `inline constexpr FoldSkip kNoSkip{};`, `isAbortedBatch(const FoldSkip&, const RecordBatchReader&, int16_t attrs)` (= `skip.aborted.skips(r, attrs)`) and `isRejectedRecord`. In the same task it replaces the `const AbortedTxnFilter&` parameter with `const FoldSkip&` on every fold path above (one parameter, same position), and `Worker::driveViews_` builds `FoldSkip{.aborted = rcAbortedFilter_(*rcState), .rejected = …}`. Its preconditions grep `struct AbortedTxnFilter` in `ViewFold.h` instead of `FoldSkip.h`, and not `kResetMsgType`.
+- **Part 04 also owns the checkpoint reset** it needs for P4-4 (a checkpoint ahead of the local markers is discarded): 01's AD6 and AD7 move into 04 unchanged — `ViewSnapshotChannel::kResetMsgType = 4` (1–3 are taken; 4 is free), `enum class CheckpointStream : uint8_t { Live, ResetOwed }` on `ViewInstance`, and the IO agent's truncate on reset. `verdictCheckpointsDiscarded` is 04's own counter.
+- **Parts 05, 07 and 09** use `FoldSkip` / `kNoSkip` as written, since they run after 04.
+- **Part 07** keeps v3 magic `0x564B4333` and the v1/v2 decoders. It drops every `CheckpointMark` use, and the test `V3IsNeverDiscardedByTheAbortedRuleRegression` is not built (nothing discards on aborted ranges any more). Its precondition on `kViewCheckpointMagicV2Marked` becomes `grep -n "kViewCheckpointMagicV2 = 0x564B4332u" broker/libs/view/include/rune/view/ViewCheckpoint.h`.
+- **Part 10** may merge before 04. It adds `[[nodiscard]] int64_t WorkerViewSet::foldCursorForTest(int32_t viewTopicId, int32_t partition) const noexcept` (−1 when absent) itself. Where it writes `FoldSkip{.aborted = &idx}` or `kNoSkip`, it uses whichever type is on main when its branch is cut (`AbortedTxnFilter` / `kNoAbortedTxns` before 04). Its precondition on `enum class CheckpointMark` becomes `grep -n "committed.delta" broker/libs/node/include/rune/node/ViewSnapshotChannel.h`. Its AD5a reasoning reduces to: a persisted-over-transient checkpoint always replays, and Task 2 pins that.
+- **Part 01's test cells** that #589 did not cover (the plan's capped-pass `skippedAborted` counting, AD2, and the fold model check) go to one follow-up issue, not a PR.
+
+### RB4 — Releases and builds
+
+- The release constants in "Sequencing and merge rules" and owner decision 13 read `kClientVersion = 17`, `kBrokerVersion = 10`, `kCheckedWrites = 5`, after Part 09.
+- Builds and unit or integration tests run on the developer Mac (`build/root`, `-j18`). Docker e2e, dr-e2e, the Linux-only stage and benches stay on the shared VM under its lock.
+
 ## Global Constraints
 
 Each line is verbatim from the spec or the repo rules. Every task of every part implicitly includes this section.
@@ -625,6 +682,8 @@ Each item names the owning part. Other parts use the name exactly as given.
 
 
 ### Code and number registry (every number the program takes)
+
+> Superseded where it differs by **RB2** (Rebase to `main` 750c836b). Part 11 rows are dropped (RB1).
 
 Each row gives the number, its name and its owning part. A part takes a new number only from the next free value of its row and adds it here first.
 

@@ -1,5 +1,7 @@
 # Checked Writes Part 01 — Views Skip Aborted Transactions (#537) Implementation Plan
 
+> **Status: shipped by #589 (`f71596cc`) in a different form; not executed.** See Plan 00, "Rebase to `main` 750c836b", RB3, for what replaced each name below.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Materialized views fold only committed data: every projection, aggregate, restart-rebuild and transient fold skips the data batches of aborted transactions, and a persisted view checkpoint written before the fix is refolded once, and only when the retained log proves it may hold aborted rows (#537, spec §8.8 last bullet, ruling R01, which replaces SD15 for all parts).

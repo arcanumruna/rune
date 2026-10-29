@@ -1,5 +1,7 @@
 # Checked Writes — Part 11: the Transaction Vote — Implementation Plan
 
+> **Status: dropped from the program; not executed.** See Plan 00, "Rebase to `main` 750c836b", RB1.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Transactions and explicit atomic batches work on every verdict source. A transaction gets atomic verdicts across topics and views: every verdict partition it touches votes before the commit is decided, any rejection aborts the whole transaction, and `commitTransaction()` returns the code and the constraint id. No read or consumer ever sees part of a transaction on one partition (level 3a). This part also lifts every pre-G refusal and closes the program with the §16.12 docs cross-check.
