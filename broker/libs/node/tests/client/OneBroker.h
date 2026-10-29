@@ -83,6 +83,7 @@ public:
             cfg.workerCount = 1;
         }
         if (tweak) tweak(cfg);
+        tweak_   = std::move(tweak);
         cfg_     = cfg;
         channel_ = cfg.clientEndpoint.channel;
         startNode_();
@@ -293,6 +294,7 @@ public:
 
 private:
     void startNode_() {
+        if (tweak_) tweak_(cfg_);   // re-read on every start: a test that changes what the tweak captures restarts with it
         node_ = std::make_unique<BrokerNode>(cfg_);
         node_->start();
         if (!node_->awaitLeader(std::chrono::seconds(30)))
@@ -308,6 +310,7 @@ private:
     int32_t                                            clientStream_ = 1;
     int                                                ownClients_ = 0;
     NodeConfig                                         cfg_;
+    std::function<void(NodeConfig&)>                   tweak_;
     std::unique_ptr<BrokerNode>                        node_;
     std::vector<std::unique_ptr<rune::client::Client>> clients_;
 };

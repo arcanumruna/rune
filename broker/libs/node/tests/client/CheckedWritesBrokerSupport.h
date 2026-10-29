@@ -50,11 +50,9 @@ inline int32_t catalogTopicId(BrokerNode& n, const std::string& name) {
 
 inline constexpr uint16_t kNotOk = 0xFFFF;   // a completion that is neither Ok nor a broker error
 
-/// One raw produce of `value` (key = `key`) to partition-hashed `topicId` on a fresh client; the completion's broker
-/// error code (0 = Ok).
-inline uint16_t produceRaw(OneBroker& b, const std::string& topicName, int32_t topicId, int32_t partitions,
+/// One raw produce of `value` (key = `key`) on a fresh client built from `cfg`; the completion's broker error code (0 = Ok).
+inline uint16_t produceRaw(rc::ClientConfig cfg, const std::string& topicName, int32_t topicId, int32_t partitions,
                            const std::string& value, const rc::Key& key) {
-    rc::ClientConfig cfg = b.clientConfig();
     cfg.topics.push_back(rc::TopicSpec{topicName, topicId, partitions});
     rc::Client client(cfg);
     client.connectAndWait(30s);
@@ -84,6 +82,11 @@ inline uint16_t produceRaw(OneBroker& b, const std::string& topicName, int32_t t
     prod.close();
     client.close();
     return out;
+}
+
+inline uint16_t produceRaw(OneBroker& b, const std::string& topicName, int32_t topicId, int32_t partitions,
+                           const std::string& value, const rc::Key& key) {
+    return produceRaw(b.clientConfig(), topicName, topicId, partitions, value, key);
 }
 
 }  // namespace rune::node::test::cw_broker
