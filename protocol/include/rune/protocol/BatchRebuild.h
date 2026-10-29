@@ -17,6 +17,7 @@ namespace rune::protocol {
 struct RecordSpan {
     std::size_t      pos       = 0;      ///< first byte of the record (its length varint) inside the batch
     std::size_t      len       = 0;      ///< the whole record, length varint included
+    std::string_view key;                ///< key bytes; empty when null or empty
     std::string_view value;              ///< value bytes; empty when null or empty
     bool             nullValue = false;  ///< valueLen == -1 (a tombstone)
     int64_t          offset    = 0;      ///< baseOffset + offsetDelta
@@ -60,9 +61,15 @@ bool forEachRecordSpan(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept 
         if (!detail::readVarintBounded(batch, recEnd, pos, offDelta)) return false;
         if (offDelta < 0 || offDelta > r.lastOffsetDelta()) return false;
         if (!detail::readVarintBounded(batch, recEnd, pos, klen)) return false;
-        if (klen > 0) { if (static_cast<uint64_t>(klen) > recEnd - pos) return false; pos += static_cast<std::size_t>(klen); }
+        std::string_view key;
+        if (klen > 0) {
+            if (static_cast<uint64_t>(klen) > recEnd - pos) return false;
+            key = std::string_view(reinterpret_cast<const char*>(batch + pos), static_cast<std::size_t>(klen));
+            pos += static_cast<std::size_t>(klen);
+        }
         if (!detail::readVarintBounded(batch, recEnd, pos, vlen)) return false;
         RecordSpan s;
+        s.key = key;
         s.pos = start; s.len = recEnd - start; s.offset = base + offDelta; s.nullValue = vlen < 0;
         if (vlen > 0) {
             if (static_cast<uint64_t>(vlen) > recEnd - pos) return false;

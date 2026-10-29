@@ -803,7 +803,9 @@ if(BUILD_TESTING)
     # Checked writes Part 02: typed topics always validate (feature level, write spec, matrices, DDL rules).
     # ---------------------------------------------------------------------------
     add_executable(rune_checked_writes_tests
-        tests/node/CheckedWritesFeatureLevelTest.cpp)
+        tests/node/CheckedWritesFeatureLevelTest.cpp
+        tests/node/CheckedWritesWriteStateTest.cpp
+        tests/node/CheckedWritesValidationMatrixTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
