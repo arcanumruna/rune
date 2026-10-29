@@ -207,6 +207,7 @@ add_executable(rune_codec_tests
     tests/ToTextTest.cpp
     tests/RecordReaderTest.cpp
     tests/ValidatorTest.cpp
+    tests/Utf8Test.cpp
     tests/GeneratorTest.cpp
     tests/GeneratedRoundTripTest.cpp
     tests/FixedStrLayoutTest.cpp
