@@ -188,13 +188,14 @@ public:
               aeron::Subscription*       clientSub = nullptr,
               aeron::FragmentAssembler*  clientAsm = nullptr,
               int                        maxIter   = kPumpIter,
-              std::string_view           label     = "pump") {
+              std::string_view           label     = "pump",
+              int64_t                    nowNs     = 0) {
         using clock = std::chrono::steady_clock;
         const auto deadline = clock::now() + std::chrono::seconds{10};
 
         for (int i = 0; i < maxIter && clock::now() < deadline; ++i) {
             invokeConductor();
-            if (gw_) gw_->doWork(wallNowNs());
+            if (gw_) gw_->doWork(nowNs == 0 ? wallNowNs() : nowNs);
             if (clientSub && clientAsm)
                 clientSub->poll(clientAsm->handler(), 10);
             if (done()) return;
@@ -223,8 +224,10 @@ public:
         uint8_t sc[512] = {};
         const std::size_t len = req.encode(sc);
 
+        // Injected clock here too: a wall-clock doWork would reap the sessions
+        // connected earlier (their lastSeenNs is the injected connectNs).
         pump([&]() { return client.ingressPub->isConnected(); },
-             nullptr, nullptr, kPumpIter, "waitPubConnected");
+             nullptr, nullptr, kPumpIter, "waitPubConnected", connectNs);
 
         offerBounded(*client.ingressPub, sc, len, "ConnectRequest");
 
