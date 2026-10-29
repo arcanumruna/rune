@@ -1854,14 +1854,14 @@ TEST(LegacyAcksAllRegression, HeldWhileIsrBelowMinIsrAtFire) {
 // temporary facts-only return and the gateway mirrors are deleted).
 // ============================================================================
 namespace {
-std::vector<uint8_t> idemBatch(int64_t pid, int16_t epoch, int32_t seq, bool txn = false) {
+std::vector<uint8_t> idemBatch(int64_t pid, int16_t epoch, int32_t seq, bool txn = false, std::string_view value = "idem") {
     rune::protocol::RecordBatchBuilder b(0, 1000);
     b.setTransactional(txn); b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq);
-    b.append("k", "idem", 1000);
+    b.append("k", value, 1000);
     return b.build();
 }
-void produceIdem(LegacyAcksRig& R, int64_t corr, int64_t pid, int32_t seq, bool txn = false) {
-    const auto f = produceFrame(R.sid, corr, idemBatch(pid, 0, seq, txn), /*acks=all*/1, 0, 0, pid, 0, seq);
+void produceIdem(LegacyAcksRig& R, int64_t corr, int64_t pid, int32_t seq, bool txn = false, std::string_view value = "idem") {
+    const auto f = produceFrame(R.sid, corr, idemBatch(pid, 0, seq, txn, value), /*acks=all*/1, 0, 0, pid, 0, seq);
     R.gw.applyProduceForTest(f.data(), f.size());
 }
 } // namespace
@@ -2041,20 +2041,29 @@ TEST(LegacyAcksAllRegression, SchemaRejectIsAnsweredAndNeverRecorded) {
     // rejected again — not a duplicate-OK), txn never registered.
     LegacyAcksRig R({1, 2});
     WorkerOp su;
-    su.type = WorkerOp::Type::SchemaUpdate; su.topicId = 0;
+    su.type = WorkerOp::Type::SchemaUpdate; su.topicId = 0; su.clientVersion = 1;
     su.schemaUpdateBlob = rune::codec::serialize(rune::codec::DescriptorBuilder("s")
         .add("id", rune::codec::PrimType::Int64).build());
     ASSERT_TRUE(R.w().tryEnqueueOp(std::move(su)));
+    TopicWriteSpecWire spec;   // a typed partition validates once its write spec is installed
+    spec.topicId = 0;
+    spec.legacyValidate = true;
+    WorkerOp ws;
+    ws.type = WorkerOp::Type::WriteSpecUpdate; ws.topicId = 0;
+    ws.schemaUpdateBlob.resize(kTopicWriteSpecWireLen);
+    ASSERT_EQ(encodeTopicWriteSpec(spec, ws.schemaUpdateBlob), kTopicWriteSpecWireLen);
+    ASSERT_TRUE(R.w().tryEnqueueOp(std::move(ws)));
     R.runWorker();
     ASSERT_TRUE(R.w().hasValidatorForTest(0));
     constexpr int16_t kSchemaFailed = static_cast<int16_t>(pc::ErrorCode::SchemaValidationFailed);
-    produceIdem(R, 1, 7, 0, /*txn=*/true);                    // value "idem" is not a valid record
+    const std::string_view notARecord("\x63\x00\x01\x00", 4);   // version 1, blockLength 99: not a record of the schema
+    produceIdem(R, 1, 7, 0, /*txn=*/true, notARecord);
     for (int i = 0; i < 4; ++i) R.runWorker();
     EXPECT_EQ(R.r->log()->logEndOffset(), 0);
     ASSERT_EQ(R.answers.size(), 1u) << "the schema reject was never answered";
     EXPECT_EQ(R.answers[0].code, kSchemaFailed);
     EXPECT_EQ(R.w().rcOpenTxnsForTest(0, 0), 0u) << "a rejected txn batch was registered as open (LSO pinned)";
-    produceIdem(R, 2, 7, 0, /*txn=*/true);                    // retry
+    produceIdem(R, 2, 7, 0, /*txn=*/true, notARecord);        // retry
     for (int i = 0; i < 4; ++i) R.runWorker();
     ASSERT_EQ(R.answers.size(), 2u);
     EXPECT_EQ(R.answers[1].code, kSchemaFailed) << "the retry was answered from a PSM entry for a rejected batch";

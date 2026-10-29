@@ -498,20 +498,22 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
     rig.appendEvents(0, 11);   // through AlterView top_players
     ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), 11);
     const auto frames = drainFailureRing(agent);
-    // 0 CreateTopic players (typed, validate) → filter schema + applied + validator + filter schema (Phase 2c: a
-    // typed topic's FilterSchema goes before TopicApplied and again after the validator; idempotent);
-    // 1, 2 CreateTopic untyped; 3 CreateSchema events (validate false) → no validator, but a filter schema;
-    // 4, 5 AlterSchema players → validator + filter schema; 6 SetCompatibility players → likewise;
+    // 0 CreateTopic players (typed) → filter schema + validator + write spec + applied, then the schema change again
+    // (validator + write spec + filter schema; idempotent) - the validators and the spec go BEFORE the topic;
+    // 1, 2 CreateTopic untyped; 3 CreateSchema events (validate false) → validator + write spec + filter schema (every
+    // typed topic validates);
+    // 4, 5 AlterSchema players → validator + write spec + filter schema; 6 SetCompatibility players → likewise;
     // 7, 8 AlterTopicConfig events; 9 CreateView;
     // 10 AlterView: new sink, new plan, old plan out, old sink dropped.
     const std::vector<int32_t> expect{
-        kA2cFilterSchema, kA2cCatalogTopicApplied, kA2cSchemaUpdate, kA2cFilterSchema, kA2cCatalogApplied,   // 0
+        kA2cFilterSchema, kA2cSchemaUpdate, kA2cWriteSpec, kA2cCatalogTopicApplied,
+        kA2cSchemaUpdate, kA2cWriteSpec, kA2cFilterSchema, kA2cCatalogApplied,   // 0
         kA2cCatalogTopicApplied, kA2cCatalogApplied,                      // 1
         kA2cCatalogTopicApplied, kA2cCatalogApplied,                      // 2
-        kA2cFilterSchema, kA2cCatalogApplied,                             // 3
-        kA2cSchemaUpdate, kA2cFilterSchema, kA2cCatalogApplied,           // 4
-        kA2cSchemaUpdate, kA2cFilterSchema, kA2cCatalogApplied,           // 5
-        kA2cSchemaUpdate, kA2cFilterSchema, kA2cCatalogApplied,           // 6
+        kA2cSchemaUpdate, kA2cWriteSpec, kA2cFilterSchema, kA2cCatalogApplied,   // 3
+        kA2cSchemaUpdate, kA2cWriteSpec, kA2cFilterSchema, kA2cCatalogApplied,   // 4
+        kA2cSchemaUpdate, kA2cWriteSpec, kA2cFilterSchema, kA2cCatalogApplied,   // 5
+        kA2cSchemaUpdate, kA2cWriteSpec, kA2cFilterSchema, kA2cCatalogApplied,   // 6
         kA2cCatalogTopicConfig, kA2cCatalogApplied,                       // 7
         kA2cCatalogTopicConfig, kA2cCatalogApplied,                       // 8
         kA2cCatalogSinkApplied, kA2cViewPlanUpdate, kA2cCatalogApplied,   // 9 (Task 12: a sink's own type)
@@ -526,7 +528,7 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
     EXPECT_EQ(playersFilter.topicId, 0);
     EXPECT_EQ(playersFilter.version, 1);
     EXPECT_FALSE(playersFilter.blob.empty()) << "the evolving descriptor";
-    ASSERT_TRUE(decodeCatalogTopicApplied(frames[1].bytes.data(), frames[1].bytes.size(), players));
+    ASSERT_TRUE(decodeCatalogTopicApplied(frames[3].bytes.data(), frames[3].bytes.size(), players));
     EXPECT_EQ(players.topicId, 0);
     EXPECT_EQ(players.name, "players");
     EXPECT_EQ(players.partitions, 8);
@@ -534,13 +536,13 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
     EXPECT_EQ(players.config, std::get<cat::CreateTopicOps>(rig.golden()[0].ops).config) << "the exact TopicConfig";
 
     CatalogTopicConfigMsg cfg;
-    ASSERT_TRUE(decodeCatalogTopicConfig(frames[20].bytes.data(), frames[20].bytes.size(), cfg));
+    ASSERT_TRUE(decodeCatalogTopicConfig(frames[28].bytes.data(), frames[28].bytes.size(), cfg));
     EXPECT_EQ(cfg.topicId, 1);
     ASSERT_EQ(cfg.count, 1);
     EXPECT_EQ(cfg.entries[0], (CatalogConfigEntry{static_cast<uint8_t>(cat::ConfigKey::RetentionMs), 60'000}));
 
     CatalogTopicAppliedMsg sink;
-    ASSERT_TRUE(decodeCatalogTopicApplied(frames[24].bytes.data(), frames[24].bytes.size(), sink));
+    ASSERT_TRUE(decodeCatalogTopicApplied(frames[32].bytes.data(), frames[32].bytes.size(), sink));
     EXPECT_EQ(sink.topicId, 3);
     EXPECT_EQ(sink.name, "top_players");
     EXPECT_EQ(sink.partitions, 8) << "#143: the sink mirrors players' 8 partitions";
@@ -548,13 +550,13 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
     EXPECT_EQ(sink.config.cleanupPolicy, 1) << "a view sink is a keyed, compacted table";
     EXPECT_EQ(sink.config.partitionKey, "id");
 
-    const ViewPlanUpdateMsg plan = decodeViewPlanUpdate(frames[25].bytes.data(), frames[25].bytes.size());
+    const ViewPlanUpdateMsg plan = decodeViewPlanUpdate(frames[33].bytes.data(), frames[33].bytes.size());
     EXPECT_EQ(plan.viewTopicId, 3);
     EXPECT_FALSE(plan.recovery) << "the LIVE sink posts commit installs";
     EXPECT_FALSE(plan.srcDescBlob.empty()) << "the source (players) descriptor travels with the plan";
-    EXPECT_EQ(decodeViewUninstall(frames[29].bytes.data(), frames[29].bytes.size()), 3);
+    EXPECT_EQ(decodeViewUninstall(frames[37].bytes.data(), frames[37].bytes.size()), 3);
     CatalogTopicDroppedMsg dropped;
-    ASSERT_TRUE(decodeCatalogTopicDropped(frames[30].bytes.data(), frames[30].bytes.size(), dropped));
+    ASSERT_TRUE(decodeCatalogTopicDropped(frames[38].bytes.data(), frames[38].bytes.size(), dropped));
     EXPECT_EQ(dropped.topicId, 3);
     EXPECT_EQ(dropped.name, "top_players");
     int64_t off = -1;
@@ -605,8 +607,8 @@ TEST(CatalogApplierRegression, ProductionSinkHaltAndRingFullAreNeverDroppedRegre
     }
     for (const auto& f : drainFailureRing(agent)) types.push_back(f.type);
     EXPECT_EQ(agent.catalogBacklogForTest(), 0u);
-    const std::vector<int32_t> expect{kA2cFilterSchema, kA2cCatalogTopicApplied, kA2cSchemaUpdate, kA2cFilterSchema,
-                                      kA2cCatalogApplied,
+    const std::vector<int32_t> expect{kA2cFilterSchema, kA2cSchemaUpdate, kA2cWriteSpec, kA2cCatalogTopicApplied,
+                                      kA2cSchemaUpdate, kA2cWriteSpec, kA2cFilterSchema, kA2cCatalogApplied,
                                       kA2cCatalogTopicApplied, kA2cCatalogApplied,
                                       kA2cCatalogTopicApplied, kA2cCatalogApplied,
                                       kA2cCatalogHalted};
@@ -979,7 +981,8 @@ TEST(CatalogApplierRegression, LiveAlterPostsOnlyTheNewVersionsValidatorRegressi
     std::vector<uint16_t> live;
     for (const auto& f : drainFailureRing(agent))
         if (f.type == kA2cSchemaUpdate) live.push_back(decodeSchemaUpdate(f.bytes.data(), f.bytes.size()).version);
-    EXPECT_EQ(live, (std::vector<uint16_t>{1, 2, 3, 4})) << "exactly one validator per event, each its own version";
+    EXPECT_EQ(live, (std::vector<uint16_t>{1, 1, 2, 3, 4}))
+        << "the create posts v1 before the topic and again with the schema change (idempotent); then one validator per event";
 
     rig.restart();
     AdminWorkerAgent agent2(rig.schemas, 1, AdminDeps{});
@@ -987,7 +990,7 @@ TEST(CatalogApplierRegression, LiveAlterPostsOnlyTheNewVersionsValidatorRegressi
     std::vector<uint16_t> boot;
     for (const auto& f : drainFailureRing(agent2))
         if (f.type == kA2cSchemaUpdate) boot.push_back(decodeSchemaUpdate(f.bytes.data(), f.bytes.size()).version);
-    EXPECT_EQ(boot, (std::vector<uint16_t>{1, 2, 3, 4})) << "boot posts every registered version";
+    EXPECT_EQ(boot, (std::vector<uint16_t>{1, 2, 3, 4, 1, 2, 3, 4})) << "boot posts every registered version, before the topic and again with the schema change";
 }
 
 // Boot posts every version, so it sizes every version: an OLDER version can be larger than the current one (a

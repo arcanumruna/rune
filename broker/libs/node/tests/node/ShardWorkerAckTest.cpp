@@ -661,9 +661,16 @@ TEST(ShardWorkerAckRegression, ShardIngressEnforcesTopicSchema) {
                           .add("type", rune::codec::PrimType::Enum, 1, false, {0, 1, 2})
                           .add("name", rune::codec::PrimType::String)
                           .build();
-    WorkerOp su; su.type = WorkerOp::Type::SchemaUpdate; su.topicId = 1;
+    WorkerOp su; su.type = WorkerOp::Type::SchemaUpdate; su.topicId = 1; su.clientVersion = 1;
     su.schemaUpdateBlob = rune::codec::serialize(desc);
     ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(su)));
+    TopicWriteSpecWire spec;   // a typed partition validates once its write spec is installed
+    spec.topicId = 1;
+    spec.legacyValidate = true;
+    WorkerOp ws; ws.type = WorkerOp::Type::WriteSpecUpdate; ws.topicId = 1;
+    ws.schemaUpdateBlob.resize(kTopicWriteSpecWireLen);
+    ASSERT_EQ(encodeTopicWriteSpec(spec, ws.schemaUpdateBlob), kTopicWriteSpecWireLen);
+    ASSERT_TRUE(f.worker->tryEnqueueOp(std::move(ws)));
     for (int i = 0; i < 4; ++i) f.step();
     auto bad = Fixture::produceFrame(5, 31, 0, /*topicId=*/1, /*value=*/"v");   // not a 'characters' record
     ASSERT_TRUE(Fixture::offerOnce(*f.producePub, bad));
