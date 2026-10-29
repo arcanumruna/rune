@@ -538,3 +538,30 @@ TEST(ProducerSend, Tier2BatchBuilderRejectsARecordOver16KiB) {
     EXPECT_THROW(bb.add(std::span<const uint8_t>(v), "abc"), std::length_error);
     EXPECT_NO_THROW(bb.add(std::span<const uint8_t>(v), "ab"));
 }
+
+// Checked writes Part 02: a Key longer than Key::kMaxInline is refused at every producer entry, never truncated.
+TEST(CheckedWritesKey, OverLongKeyIsRefusedEverywhere) {
+    auto* impl = new ProducerImpl(voidCfg());
+    Producer p(impl);
+    const std::vector<uint8_t> longKey(17, 0x33);
+    const Key tooLong{std::span<const uint8_t>(longKey)};
+    ASSERT_TRUE(tooLong.tooLong());
+    EXPECT_EQ(p.trySend(kTopic, tooLong, kVal), SendResult::KeyTooLong);
+    try {
+        p.send(kTopic, tooLong, kVal);
+        FAIL() << "send accepted an over-long key";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find("key is longer than 16 bytes"), std::string::npos) << e.what();
+    }
+    auto claim = p.tryClaim(kTopic, tooLong, 8);
+    EXPECT_FALSE(claim);
+    EXPECT_EQ(claim.result(), SendResult::KeyTooLong);
+    uint64_t frames = 0, bytes = 0;
+    const CountingSink sink{&frames, &bytes};
+    EXPECT_EQ(impl->drainRing(1), 0) << "nothing was queued";
+    impl->flushBatches(1, 42, sink);
+    EXPECT_EQ(impl->recordsSent(), 0u);
+    // A 16-byte key is still accepted.
+    const Key full{std::span<const uint8_t>(longKey.data(), 16)};
+    EXPECT_EQ(p.trySend(kTopic, full, kVal), SendResult::Ok);
+}

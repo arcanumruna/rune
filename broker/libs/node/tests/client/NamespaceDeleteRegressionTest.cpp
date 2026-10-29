@@ -124,7 +124,7 @@ struct Fix {
     }
     rc::TopicSpec defineT(const std::string& user) {
         auto c = connected(b, user);
-        const auto r = c->defineTopicAndWait("t", 1, "", false, {}, 20s);
+        const auto r = c->defineTopicAndWait("t", 1, "", {}, 20s);
         if (r.errorCode != 0) throw std::runtime_error("define t: " + r.detail);
         c->close();
         return rc::TopicSpec{"t", r.topicId, 1};
@@ -191,7 +191,7 @@ TEST(NamespaceDeleteRegression, RecreateSeesNothingOld) {
     f.b.createUser("a/ua", kUserPw, userGrants());   // same name, new namespace id: allowed
     auto ua = connected(f.b, "a/ua");
     EXPECT_TRUE(ua->listTopics().empty()) << "the re-created namespace lists a topic of the old one";
-    const auto nt = ua->defineTopicAndWait("t", 1, "", false, {}, 20s);
+    const auto nt = ua->defineTopicAndWait("t", 1, "", {}, 20s);
     ASSERT_EQ(nt.errorCode, 0) << nt.detail;
     rc::TopicSpec newT{"t", nt.topicId, 1};
     ua->close();

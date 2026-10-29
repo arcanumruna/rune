@@ -450,7 +450,7 @@ struct Fix {
     }
     rc::TopicSpec defineT(const std::string& user) {
         auto c = newClient(b, user);
-        const auto r = c->defineTopicAndWait("t", 1, "", false, {}, 20s);
+        const auto r = c->defineTopicAndWait("t", 1, "", {}, 20s);
         if (r.errorCode != 0) throw std::runtime_error("define t: " + r.detail);
         c->close();
         return rc::TopicSpec{"t", r.topicId, 1};

@@ -142,7 +142,7 @@ TEST(ClientConnectRoleRegression, AFollowerHostedSessionRunsDdlThroughTheRedirec
     std::unique_ptr<rune::client::Client> client;
     expectHostedHere(c, f, "follower", "ddl", &client);
     ASSERT_TRUE(client);
-    const auto r = client->defineTopicAndWait("from_follower", 1, "", {}, false, rune::client::Persistence::Disk,
+    const auto r = client->defineTopicAndWait("from_follower", 1, "", {}, rune::client::Persistence::Disk,
                                               {}, {}, 20s);
     EXPECT_EQ(r.errorCode, 0) << r.detail;
 }

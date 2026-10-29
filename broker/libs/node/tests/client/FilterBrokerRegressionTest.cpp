@@ -372,8 +372,7 @@ struct Cluster {
         admin->connectAndWait(30s);
         rc::TopicOptions to;
         to.replicationFactor = one ? 1 : 3;
-        const auto def = admin->defineTopicAndWait(name, static_cast<uint32_t>(parts), keyField, blob,
-                                                   /*validate=*/false, persistence, to, {}, 60s);
+        const auto def = admin->defineTopicAndWait(name, static_cast<uint32_t>(parts), keyField, blob, persistence, to, {}, 60s);
         if (def.errorCode != 0) throw std::runtime_error("define " + name + ": " + def.detail);
         admin->close();
         if (trio) {

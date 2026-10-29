@@ -581,7 +581,7 @@ TEST(CliLive, SchemaListLive) {
 
     // DefineTopic.
     auto defFut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
-        return client.defineTopic(plan.name, plan.partitions, plan.keyField, false,
+        return client.defineTopic(plan.name, plan.partitions, plan.keyField,
         std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()), q, t);
     });
 
@@ -660,7 +660,7 @@ TEST(CliLive, SchemaListVerbose) {
 
     // Define.
     auto defFut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
-        return client.defineTopic(plan.name, plan.partitions, plan.keyField, false,
+        return client.defineTopic(plan.name, plan.partitions, plan.keyField,
         std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()), q, t);
     });
 
@@ -788,7 +788,7 @@ TEST(CliLiveRegression, ListLive_TopicPresent) {
 
     // Define.
     auto defFut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
-        return client.defineTopic(plan.name, plan.partitions, plan.keyField, false,
+        return client.defineTopic(plan.name, plan.partitions, plan.keyField,
         std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()), q, t);
     });
 

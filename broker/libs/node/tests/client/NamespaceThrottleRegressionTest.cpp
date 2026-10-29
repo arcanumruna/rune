@@ -70,7 +70,7 @@ rc::NamespaceLimitsPatch patchOf(const char* field, uint64_t v) {
 
 rc::TopicHandle defineTopic(AuthBroker& b, const std::string& user) {
     auto c = connected(b, user);
-    const auto r = c->defineTopicAndWait("t", 1, "", false, {}, 20s);
+    const auto r = c->defineTopicAndWait("t", 1, "", {}, 20s);
     if (r.errorCode != 0) throw std::runtime_error("define: " + r.detail);
     c->close();
     return rc::TopicHandle{r.topicId, 1};

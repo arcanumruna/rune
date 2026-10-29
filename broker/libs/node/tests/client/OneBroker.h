@@ -177,7 +177,7 @@ public:
     /// COMPATIBILITY FORWARD.  Throws on any refusal (a test precondition).
     void runSchemaLifecycle(rune::client::Client& client, const std::string& name) {
         using namespace std::chrono_literals;
-        const auto created = client.defineTopicAndWait(name, 1, "id", idDescriptor(name), false,
+        const auto created = client.defineTopicAndWait(name, 1, "id", idDescriptor(name),
                                                        rune::client::Persistence::Disk, {}, {}, 10s);
         if (created.errorCode != 0) throw std::runtime_error("runSchemaLifecycle: define: " + created.detail);
         rune::codec::AlterOp rename{};
@@ -208,14 +208,14 @@ public:
         };
         rune::client::DdlOptions ddl;
         ddl.statement = "topic players { id int64, hp int64 } partitions 1 key id;";
-        auto r1 = c.defineTopicAndWait("players", 1, "id", idDescriptor("players"), false, rune::client::Persistence::Disk,
+        auto r1 = c.defineTopicAndWait("players", 1, "id", idDescriptor("players"), rune::client::Persistence::Disk,
                                        {}, ddl, 10s);
         check(r1.errorCode, r1.detail, "CreateTopic players");
         ddl.statement = "topic events partitions 1;";
-        auto r2 = c.defineTopicAndWait("events", 1, "", {}, false, rune::client::Persistence::Disk, {}, ddl, 10s);
+        auto r2 = c.defineTopicAndWait("events", 1, "", {}, rune::client::Persistence::Disk, {}, ddl, 10s);
         check(r2.errorCode, r2.detail, "CreateTopic events");
         ddl.statement = {};
-        auto r3 = c.defineTopicAndWait("events", 1, "id", idDescriptor("events"), false, rune::client::Persistence::Disk,
+        auto r3 = c.defineTopicAndWait("events", 1, "id", idDescriptor("events"), rune::client::Persistence::Disk,
                                        {}, ddl, 10s);
         check(r3.errorCode, r3.detail, "CreateSchema events");
         auto r4 = c.alterTopicAndWait("events", 0, addColumnOps("mana"), ddl, 10s);

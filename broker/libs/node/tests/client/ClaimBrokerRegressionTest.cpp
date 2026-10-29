@@ -155,7 +155,7 @@ struct ClaimRig {
     /// Define a topic as "writer" (Thread-mode client, closed again); returns its id.
     int32_t define(const std::string& name, const std::string& keyField, std::vector<uint8_t> blob, bool validate) {
         auto cl = connect("writer", rc::RunnerMode::Thread);
-        const auto r = cl->defineTopicAndWait(name, kParts, keyField, blob, validate, rc::Persistence::Disk, {}, {}, 30s);
+        const auto r = cl->defineTopicAndWait(name, kParts, keyField, blob, rc::Persistence::Disk, {}, {}, 30s);
         EXPECT_EQ(r.errorCode, 0) << r.detail;
         cl->close();
         return r.topicId;

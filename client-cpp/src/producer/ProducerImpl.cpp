@@ -434,6 +434,7 @@ int64_t ProducerImpl::steadyNowNs_() noexcept {
 SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key& key,
                                    std::span<const uint8_t> value, int64_t ackHandle,
                                    RejectReason* why) noexcept {
+    if (key.tooLong()) [[unlikely]] return SendResult::KeyTooLong;
     // Phase 2b F: the one extra branch on the hot path (a byte load + compare).  Direct mode decides
     // WrongThread FIRST (the gate is owner-written), so its gate check lives in tryAppendDirect_.
     if (mode_ != IngressMode::Direct && txnGate_ == TxnGate::Closed) [[unlikely]] {
@@ -1072,6 +1073,8 @@ void ProducerImpl::throwForSendResult(SendResult r) {
         throw std::logic_error("produce outside a transaction");
     case SendResult::InvalidArgument:
         throw std::invalid_argument("Producer::send: invalid token or completion queue");
+    case SendResult::KeyTooLong:
+        throw std::invalid_argument("Producer::send: key is longer than 16 bytes (Key::kMaxInline); a key is never truncated");
     }
 }
 
@@ -3820,6 +3823,11 @@ aeron::util::index_t ProducerImpl::testClaimSendRecord(int32_t topicId, int32_t 
 
 ProducerImpl::ClaimGrant ProducerImpl::claimRecord(int32_t topicId, int32_t partition, const Key& key,
                                                    uint32_t valueLen, uint64_t ackHandle) noexcept {
+    if (key.tooLong()) [[unlikely]] {
+        ClaimGrant refused;
+        refused.result = SendResult::KeyTooLong;
+        return refused;
+    }
     if (mode_ != IngressMode::Direct && txnGate_ == TxnGate::Closed) [[unlikely]] {
         ClaimGrant refused;
         refused.result = SendResult::NotInTransaction;
@@ -3874,6 +3882,11 @@ SendResult ProducerImpl::checkBatchClaim_(const Key& key, uint32_t n, uint32_t r
 
 ProducerImpl::ClaimGrant ProducerImpl::claimBatch(int32_t topicId, int32_t partition, const Key& key, uint32_t n,
                                                   uint32_t recLen, uint64_t ackHandle) noexcept {
+    if (key.tooLong()) [[unlikely]] {
+        ClaimGrant refused;
+        refused.result = SendResult::KeyTooLong;
+        return refused;
+    }
     if (mode_ != IngressMode::Direct && txnGate_ == TxnGate::Closed) [[unlikely]] {
         ClaimGrant refused;
         refused.result = SendResult::NotInTransaction;

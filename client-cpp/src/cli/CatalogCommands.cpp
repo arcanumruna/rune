@@ -577,7 +577,7 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                 const auto r = c.defineTopicAndWait(e.objectName, static_cast<uint32_t>(o.partitions),
                                                     o.schema ? o.schema->keyField : std::string(),
                                                     std::span<const uint8_t>(blob.data(), blob.size()),
-                                                    o.schema ? o.schema->validate : false, clientPersistence(o.persistence),
+                                                    clientPersistence(o.persistence),
                                                     topic, ddl, t);
                 return failureOf(r.errorCode, r.detail);
             } else if constexpr (std::is_same_v<T, cat::CreateSchemaOps>) {
@@ -586,7 +586,7 @@ std::optional<std::string> issueEvent(rc::Client& c, const cat::CatalogState& st
                 const auto r = c.defineTopicAndWait(
                     e.objectName, static_cast<uint32_t>(top->partitions), o.schema.keyField,
                     std::span<const uint8_t>(o.schema.descriptorBlob.data(), o.schema.descriptorBlob.size()),
-                    o.schema.validate, clientPersistence(top->persistence), {}, ddl, t);
+                    clientPersistence(top->persistence), {}, ddl, t);
                 return failureOf(r.errorCode, r.detail);
             } else if constexpr (std::is_same_v<T, cat::AlterSchemaOps>) {
                 const cat::TopicObject* top = st.topicByName(e.nsId, e.objectName);

@@ -110,7 +110,7 @@ struct Env {
         auto admin = connectClient(c, ctl);
         rc::TopicOptions to;
         to.replicationFactor = 3;
-        const auto def = admin->defineTopicAndWait(name, parts, keyField, blob, validate, kDisk, to, {}, 60s);
+        const auto def = admin->defineTopicAndWait(name, parts, keyField, blob, kDisk, to, {}, 60s);
         admin->close();
         if (def.errorCode != 0) throw std::runtime_error("define " + name + ": " + def.detail);
         std::vector<int32_t> leaders;

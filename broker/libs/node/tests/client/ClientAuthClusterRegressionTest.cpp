@@ -127,7 +127,7 @@ TEST(ClientAuthClusterRegression, WorldServerClientProducesAndConsumesThroughEve
         to.replicationFactor = 3;
         rc::DefineTopicResult def{};
         ASSERT_TRUE(AuthTrio::until(60s, [&] {
-            def = admin->defineTopicAndWait("world.zone", kParts, "worldId", rune::codec::serialize(desc), /*validate=*/true,
+            def = admin->defineTopicAndWait("world.zone", kParts, "worldId", rune::codec::serialize(desc),
                                             rc::Persistence::Disk, to, {}, 60s);
             return def.errorCode == 0;
         })) << def.detail;
@@ -386,8 +386,8 @@ TEST(ClientAuthClusterRegression, EosPipelineSurvivesTheCoordinatorCrashOnAnAuth
         rc::TopicOptions to;
         to.replicationFactor = 3;
         rc::DefineTopicResult a{}, b{};   // the grants reach the broker asynchronously: retry
-        ASSERT_TRUE(AuthTrio::until(60s, [&] { a = admin->defineTopicAndWait("eos.in", kParts, "", {}, false, rc::Persistence::Disk, to, {}, 60s); return a.errorCode == 0; })) << a.detail;
-        ASSERT_TRUE(AuthTrio::until(60s, [&] { b = admin->defineTopicAndWait("eos.out", kParts, "", {}, false, rc::Persistence::Disk, to, {}, 60s); return b.errorCode == 0; })) << b.detail;
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { a = admin->defineTopicAndWait("eos.in", kParts, "", {}, rc::Persistence::Disk, to, {}, 60s); return a.errorCode == 0; })) << a.detail;
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { b = admin->defineTopicAndWait("eos.out", kParts, "", {}, rc::Persistence::Disk, to, {}, 60s); return b.errorCode == 0; })) << b.detail;
         in = rc::TopicSpec{"eos.in", a.topicId, kParts};
         out = rc::TopicSpec{"eos.out", b.topicId, kParts};
         admin->close();

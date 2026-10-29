@@ -522,7 +522,7 @@ void txnOpen(const TCell& p) {
     rc::TopicSpec spec;
     {
         auto c = newClient(b, "a/ua");
-        const auto r = c->defineTopicAndWait("t", 1, "", false, {}, 20s);
+        const auto r = c->defineTopicAndWait("t", 1, "", {}, 20s);
         ASSERT_EQ(r.errorCode, 0) << r.detail;
         spec = rc::TopicSpec{"t", r.topicId, 1};
         c->close();

@@ -154,7 +154,7 @@ TEST(RuneCliBrokerRegression, ReplayReissuesEveryKindAndVerifiesFingerprints) {
 TEST(RuneCliBrokerRegression, ReplayAbortsLoudlyAtTheFirstFailingEvent) {
     OneBroker src("cli_src2"), dst("cli_dst2");
     src.runEveryKind();
-    ASSERT_EQ(dst.connectClient()->defineTopicAndWait(src.catalogEvents()[1].event.objectName, 1, "", {}, false,
+    ASSERT_EQ(dst.connectClient()->defineTopicAndWait(src.catalogEvents()[1].event.objectName, 1, "", {},
                                                      rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
     const std::size_t before = dst.catalogEvents().size();
     std::stringstream out, err;
@@ -230,7 +230,7 @@ TEST(RuneCliBrokerRegression, ReplayRemapsViewSourcesOntoTheTargetsOwnTopicIds) 
     OneBroker src("cli_src7"), dst("cli_dst7");
     src.runEveryKind();
     // The target already holds another topic, so every topic id there is shifted against the source's.
-    ASSERT_EQ(dst.connectClient()->defineTopicAndWait("zzz", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s)
+    ASSERT_EQ(dst.connectClient()->defineTopicAndWait("zzz", 1, "", {}, rune::client::Persistence::Disk, {}, {}, 10s)
                   .errorCode, 0);
     std::string out, err;
     ASSERT_EQ(runCli({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint()}, &out, &err), 0) << err;
@@ -486,8 +486,8 @@ TEST(RuneCliBrokerRegression, DiffOfTwoBrokersReportsDifferencesWithExit3) {
 TEST(RuneCliBrokerRegression, DiffClusterVsClusterAndFileVsClusterPrintEveryDifference) {
     OneBroker a("cli_dc"), b("cli_dd");
     a.runEveryKind();
-    ASSERT_EQ(b.connectClient()->defineTopicAndWait("events", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
-    ASSERT_EQ(b.connectClient()->defineTopicAndWait("only_b", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
+    ASSERT_EQ(b.connectClient()->defineTopicAndWait("events", 1, "", {}, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
+    ASSERT_EQ(b.connectClient()->defineTopicAndWait("only_b", 1, "", {}, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
     std::string out, err;
     // cluster vs cluster: a has {events (typed)}, b has {events (untyped), only_b}
     ASSERT_EQ(runCli({"catalog", "diff", "--from", a.endpoint(), "--to", b.endpoint()}, &out, &err), 3) << err;
@@ -621,7 +621,7 @@ TEST(RuneCliBrokerRegression, SchemaGenerateEmbedsTheLineageOfEveryVersionRegres
                                                  .add("age", rune::codec::PrimType::Int32)
                                                  .add("score", rune::codec::PrimType::Int32)
                                                  .build());
-    ASSERT_EQ(c.defineTopicAndWait("evo", 1, "id", blob, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
+    ASSERT_EQ(c.defineTopicAndWait("evo", 1, "id", blob, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
     rune::codec::AlterOp drop{}; drop.type = rune::codec::AlterOpType::Drop; drop.name = "age";
     const auto altered = c.alterTopicAndWait("evo", 0, rune::codec::encodeAlterOps({drop}), {}, 10s);
     ASSERT_EQ(altered.errorCode, 0) << altered.detail;

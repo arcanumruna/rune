@@ -116,7 +116,7 @@ FailoverRun produceThroughLeaderCrash(ThreeNodes& c, Victim which, int total, in
     auto admin = connectClient(c, c.runningNodes().front());
     rc::TopicOptions to;
     to.replicationFactor = 3;
-    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, false, kDisk, to, {}, 60s);
+    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, kDisk, to, {}, 60s);
     EXPECT_EQ(def.errorCode, 0) << def.detail;
     admin->close();
     run.spec = rc::TopicSpec{"events", def.topicId, kPartitions};
@@ -408,7 +408,7 @@ TEST(ClientFailoverBrokerRegression, MultiClientProduceSubscribeCloseIsBoundedRe
         for (rune::node::BrokerNode* n : c.live()) if (n->isLeader()) leader = n->nodeIdForTest();
     ASSERT_GT(leader, 0);
     auto admin = connectClient(c, leader);
-    const auto def = admin->defineTopicAndWait("multi", kPartitions, "", {}, false, kDisk, {}, {}, 60s);
+    const auto def = admin->defineTopicAndWait("multi", kPartitions, "", {}, kDisk, {}, {}, 60s);
     ASSERT_EQ(def.errorCode, 0) << def.detail;
     admin->close();
     const rc::TopicSpec spec{"multi", def.topicId, kPartitions};
@@ -467,7 +467,7 @@ TEST(ClientFailoverBrokerRegression, SeedCrashedSubscribeAndControlPlaneFailOver
     auto admin = connectClient(c, c.runningNodes().front());
     rc::TopicOptions to;
     to.replicationFactor = 3;
-    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, false, kDisk, to, {}, 60s);
+    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, kDisk, to, {}, 60s);
     ASSERT_EQ(def.errorCode, 0) << def.detail;
     admin->close();
     const rc::TopicSpec spec{"events", def.topicId, kPartitions};
@@ -556,7 +556,7 @@ TEST(ClientFailoverBrokerRegression, SeedCrashedSubscribeAndControlPlaneFailOver
     // 3. The control plane rides the seed: a DDL and a schema read succeed within the bound.
     const auto tDdl = Clock::now();
     rc::DefineTopicResult d2;
-    EXPECT_NO_THROW(d2 = sub->defineTopicAndWait("after", 1, "", {}, false, kDisk, {}, {}, 25s));
+    EXPECT_NO_THROW(d2 = sub->defineTopicAndWait("after", 1, "", {}, kDisk, {}, {}, 25s));
     EXPECT_EQ(d2.errorCode, 0) << d2.detail;
     EXPECT_LT(Clock::now() - tDdl, 25s);
     // A catalog read (Subscribe on __catalog through the seed): both DDLs, committed.
@@ -629,7 +629,7 @@ TEST(ClientFailoverBrokerRegression, SeedCoordinatorCrashedGroupMemberKeepsConsu
     auto admin = connectClient(c, ctl);
     rc::TopicOptions to;
     to.replicationFactor = 3;
-    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, false, kDisk, to, {}, 60s);
+    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, kDisk, to, {}, 60s);
     ASSERT_EQ(def.errorCode, 0) << def.detail;
     admin->close();
     const rc::TopicSpec spec{"events", def.topicId, kPartitions};
@@ -738,7 +738,7 @@ TEST(ClientFailoverBrokerRegression, SeedCoordinatorCrashedMidTransactionEndsCom
     auto admin = connectClient(c, ctl);
     rc::TopicOptions to;
     to.replicationFactor = 3;
-    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, false, kDisk, to, {}, 60s);
+    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, kDisk, to, {}, 60s);
     ASSERT_EQ(def.errorCode, 0) << def.detail;
     admin->close();
     const rc::TopicSpec spec{"events", def.topicId, kPartitions};
@@ -847,7 +847,7 @@ TEST(ClientFailoverBrokerRegression, SeedCrashedGetViewRowFollowsTheNewSeedRegre
     auto admin = connectClient(c, ctl);
     rc::TopicOptions to;
     to.replicationFactor = 3;
-    const auto src = admin->defineTopicAndWait("src", 1, "id", rune::node::test::charBlob(), false, kDisk, to, {}, 60s);
+    const auto src = admin->defineTopicAndWait("src", 1, "id", rune::node::test::charBlob(), kDisk, to, {}, 60s);
     ASSERT_EQ(src.errorCode, 0) << src.detail;
     const auto view = admin->createViewAndWait("v", "id", 0, rune::node::test::viewPlanBlob("v", src.topicId, 0), {}, 60s);
     ASSERT_EQ(view.errorCode, 0) << view.detail;
@@ -952,7 +952,7 @@ void tlsFailover(const char* tag, bool shard, bool require) {
     auto admin = connectClient(c, acfg);
     rc::TopicOptions to;
     to.replicationFactor = 3;
-    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, false, kDisk, to, {}, 60s);
+    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, kDisk, to, {}, 60s);
     ASSERT_EQ(def.errorCode, 0) << def.detail;
     admin->close();
     const rc::TopicSpec spec{"events", def.topicId, kPartitions};
@@ -1008,7 +1008,7 @@ void tlsFailover(const char* tag, bool shard, bool require) {
     // The SEED's own session (the failed-over one) carries the control plane: a DDL through it succeeds.
     // (Records may ride node sessions that never failed over; this pins the seed's fresh TLS episode.)
     rc::DefineTopicResult d2;
-    EXPECT_NO_THROW(d2 = client->defineTopicAndWait("after", 1, "", {}, false, kDisk, {}, {}, 30s));
+    EXPECT_NO_THROW(d2 = client->defineTopicAndWait("after", 1, "", {}, kDisk, {}, {}, 30s));
     EXPECT_EQ(d2.errorCode, 0) << d2.detail;
     std::fprintf(stderr, "[tls-failover %s %s] acked %d/%d after %lld ms\n", shard ? "shard" : "plain",
                  require ? "require" : "offered", ok, kAfter,
@@ -1060,7 +1060,7 @@ bool tlsTopic(ThreeNodes& c, TlsCluster& t, bool require) {
     auto admin = connectClient(c, tlsClientConfig(c, c.runningNodes().front(), t.ca, require));
     rc::TopicOptions to;
     to.replicationFactor = 3;
-    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, false, kDisk, to, {}, 60s);
+    const auto def = admin->defineTopicAndWait("events", kPartitions, "", {}, kDisk, to, {}, 60s);
     admin->close();
     if (def.errorCode != 0) return false;
     t.spec = rc::TopicSpec{"events", def.topicId, kPartitions};
@@ -1145,7 +1145,7 @@ void tlsShardStallPastTheLease(const char* tag, bool require) {
     EXPECT_EQ(ok, kAfter) << "records produced after the stall, acked on the fresh TLS session";
     // The SEED's own (re-established) session carries the control plane.
     rc::DefineTopicResult d2;
-    EXPECT_NO_THROW(d2 = client->defineTopicAndWait("after", 1, "", {}, false, kDisk, {}, {}, 30s));
+    EXPECT_NO_THROW(d2 = client->defineTopicAndWait("after", 1, "", {}, kDisk, {}, {}, 30s));
     EXPECT_EQ(d2.errorCode, 0) << d2.detail;
     std::fprintf(stderr, "[tls-stall %s] acked %d/%d after %lld ms\n", require ? "require" : "offered", ok, kAfter,
                  static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - tWake).count()));

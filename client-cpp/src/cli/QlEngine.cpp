@@ -724,7 +724,7 @@ bool QlRun::run(const PDefine& s, const rc::DdlOptions& ddl) {
     topic.config = d.config;   // F32: the whole struct, never field by field
     const auto r = broker.client().defineTopicAndWait(
         d.name, d.partitions, d.keyField, std::span<const uint8_t>(d.descriptorBlob.data(), d.descriptorBlob.size()),
-        !d.descriptorBlob.empty(), d.persistence == ql::Persistence::Transient ? rc::Persistence::Transient : rc::Persistence::Disk, topic,
+        d.persistence == ql::Persistence::Transient ? rc::Persistence::Transient : rc::Persistence::Disk, topic,
         ddl, broker.ddlTimeout());
     broker.flushVerbose(err);
     if (r.errorCode != 0) return failBroker(r.errorCode, r.detail);

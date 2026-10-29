@@ -22,7 +22,7 @@ TEST(ClientCatalogReadBrokerRegression, HistoryAsOfAndDiffMatchTheLibraryOverThe
     OneBroker b("cr_all");
     auto client = b.connectClient();
     b.runSchemaLifecycle(*client, "players");   // define typed, alter add, alter rename, set compat (via *AndWait)
-    ASSERT_EQ(client->defineTopicAndWait("events", 2, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s)
+    ASSERT_EQ(client->defineTopicAndWait("events", 2, "", {}, rune::client::Persistence::Disk, {}, {}, 10s)
                   .errorCode,
               0);
     const auto log = b.catalogEvents();   // RecordedEvents decoded from the node's __catalog
@@ -65,10 +65,10 @@ TEST(ClientCatalogReadBrokerRegression, HistoryAsOfAndDiffMatchTheLibraryOverThe
 TEST(ClientCatalogReadBrokerRegression, ASecondReadSeesNewDdlFromTheCachedPrefix) {
     OneBroker b("cr_tail");
     auto client = b.connectClient();
-    ASSERT_EQ(client->defineTopicAndWait("a", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode,
+    ASSERT_EQ(client->defineTopicAndWait("a", 1, "", {}, rune::client::Persistence::Disk, {}, {}, 10s).errorCode,
               0);
     ASSERT_EQ(client->catalogHistory({}, 10s)->size(), 1u);
-    ASSERT_EQ(client->defineTopicAndWait("b", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode,
+    ASSERT_EQ(client->defineTopicAndWait("b", 1, "", {}, rune::client::Persistence::Disk, {}, {}, 10s).errorCode,
               0);
     ASSERT_EQ(client->catalogHistory({}, 10s)->size(), 2u);
     EXPECT_EQ(b.catalogSubscribeFromOffsets(), (std::vector<int64_t>{0, 1}))
@@ -90,7 +90,7 @@ TEST(ClientCatalogReadBrokerRegression, ASecondReadSeesNewDdlFromTheCachedPrefix
 TEST(ClientCatalogReadBrokerRegression, AnAsOfPastTheLogIsAnExplicitErrorNotAHang) {
     OneBroker b("cr_err");
     auto client = b.connectClient();
-    ASSERT_EQ(client->defineTopicAndWait("a", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode,
+    ASSERT_EQ(client->defineTopicAndWait("a", 1, "", {}, rune::client::Persistence::Disk, {}, {}, 10s).errorCode,
               0);
     auto s = client->catalogAsOf({.by = rcat::AsOf::By::Version, .value = 9, .type = rcat::ObjectType::Topic,
                                   .name = "a"},

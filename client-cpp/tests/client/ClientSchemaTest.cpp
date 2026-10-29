@@ -442,14 +442,14 @@ struct SchemaHarness {
                                           std::string_view keyField, bool validate,
                                           std::span<const uint8_t> blob) {
         return cq->issue([&](Completions& q, Token t) {
-            return client->defineTopic(name, partitions, keyField, validate, blob, q, t);
+            return client->defineTopic(name, partitions, keyField, blob, q, t);
         });
     }
     test_support::PendingOp defineTopicOp(std::string_view name, uint32_t partitions,
                                           std::string_view keyField, bool validate,
                                           std::span<const uint8_t> blob, Persistence persistence) {
         return cq->issue([&](Completions& q, Token t) {
-            return client->defineTopic(name, partitions, keyField, validate, blob, persistence, q, t);
+            return client->defineTopic(name, partitions, keyField, blob, persistence, q, t);
         });
     }
     test_support::PendingOp getTopicSchemaOp(std::string_view name) {

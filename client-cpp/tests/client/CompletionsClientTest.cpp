@@ -387,7 +387,7 @@ TEST(CompletionsClient, ControlOpTimeoutCompletesTimeoutRegression) {
     std::vector<uint8_t> blob{1, 2, 3};
     auto p = pingOn(cq, r.client, {7});  // the gateway never answers pings / DDL here
     auto d = cq.issue([&](rc::Completions& q, rc::Token t) {
-        return r.client.defineTopic("x", 1, "", false, blob, q, t);
+        return r.client.defineTopic("x", 1, "", blob, q, t);
     });
     auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getTopicSchema("x", q, t); });
     r.settle(5'000);  // frozen clock: nothing may time out
@@ -436,7 +436,7 @@ TEST(CompletionsClient, SessionFatalErrorCompletesAllPendingSessionLostRegressio
     auto p1 = pingOn(cq, r.client, {1});
     auto p2 = pingOn(cq, r.client, {2});
     auto d  = cq.issue([&](rc::Completions& q, rc::Token t) {
-        return r.client.defineTopic("y", 1, "", false, blob, q, t);
+        return r.client.defineTopic("y", 1, "", blob, q, t);
     });
     auto g  = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getTopicSchema("y", q, t); });
     ASSERT_TRUE(r.drive([&] { return r.gw.pings == 2 && r.gw.defines == 1 && r.gw.schemaGets == 1; }));
@@ -469,7 +469,7 @@ TEST(CompletionsClient, PingInvalidRequestErrorCompletesThatPingRegression) {
     r.connect(cq);
     std::vector<uint8_t> blob{9};
     auto d = cq.issue([&](rc::Completions& q, rc::Token t) {
-        return r.client.defineTopic("z", 1, "", false, blob, q, t);
+        return r.client.defineTopic("z", 1, "", blob, q, t);
     });
     ASSERT_TRUE(r.drive([&] { return r.gw.defines == 1; }));
     r.gw.pingErrorCode = static_cast<int16_t>(rune::client::codec::ErrorCode::InvalidRequest);
@@ -536,7 +536,7 @@ TEST(CompletionsClient, CloseCompletesEveryControlTokenClosedRegression) {
         std::vector<uint8_t> blob{4};
         auto p = pingOn(cq, r.client, {1});
         auto d = cq.issue([&](rc::Completions& q, rc::Token t) {
-            return r.client.defineTopic("z", 1, "", false, blob, q, t);
+            return r.client.defineTopic("z", 1, "", blob, q, t);
         });
         HandlerLog log;
         ASSERT_EQ(r.client.ping(std::vector<uint8_t>{2}, log.handler(), 77), rc::OpResult::Accepted);
@@ -1294,7 +1294,7 @@ TEST(CompletionsClient, UnsolicitedSessionExpiredCompletesEveryPendingOpSessionL
     r.connect(cq);
     std::vector<uint8_t> blob{9};
     auto d = cq.issue([&](rc::Completions& q, rc::Token t) {
-        return r.client.defineTopic("x", 1, "", false, blob, q, t);
+        return r.client.defineTopic("x", 1, "", blob, q, t);
     });
     auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getTopicSchema("x", q, t); });
     ASSERT_TRUE(r.drive([&] { return r.gw.defines == 1 && r.gw.schemaGets == 1; }));
@@ -1330,7 +1330,7 @@ TEST(CompletionsClient, OwnResponseTimeoutCompletesInFlightOpsSessionLostRegress
     r.connect(cq);
     std::vector<uint8_t> blob{9};
     auto d = cq.issue([&](rc::Completions& q, rc::Token t) {
-        return r.client.defineTopic("x", 1, "", false, blob, q, t);
+        return r.client.defineTopic("x", 1, "", blob, q, t);
     });
     auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getTopicSchema("x", q, t); });
     ASSERT_TRUE(r.drive([&] { return r.gw.defines == 1 && r.gw.schemaGets == 1; }));
@@ -1369,7 +1369,7 @@ TEST(CompletionsClient, SessionExpiredWithTheSeedsRealSessionIdCompletesPendingO
     ASSERT_NE(seedSid, 0);
     std::vector<uint8_t> blob{9};
     auto d = cq.issue([&](rc::Completions& q, rc::Token t) {
-        return r.client.defineTopic("x", 1, "", false, blob, q, t);
+        return r.client.defineTopic("x", 1, "", blob, q, t);
     });
     auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getTopicSchema("x", q, t); });
     ASSERT_TRUE(r.drive([&] { return r.gw.defines == 1 && r.gw.schemaGets == 1; }));

@@ -78,6 +78,7 @@ struct GateGateway {
     bool replyConnectOK      = true;
     bool replyGetTopicSchema = true;
     int  getTopicSchemaSeen  = 0;   // GetTopicSchema requests that reached the gateway (a skipped probe sends none)
+    std::vector<bool> defineValidate;   // the validate byte of every DefineTopic that reached the gateway
 
     int32_t              getTopicId   = 0x40000001;
     uint16_t             getVersion   = 1;
@@ -191,7 +192,11 @@ struct GateGateway {
             resp.sessionId      = opt->sessionId;
             resp.correlationId  = opt->correlationId;
 
-            if (opt->requestedFingerprint != 0) {
+            // The kind probe (checked writes) is answered like "latest" unless a test overrides it.
+            const bool plain = opt->requestedFingerprint == 0 ||
+                               (opt->requestedFingerprint == rpc::kSchemaKindFingerprint &&
+                                fingerprintOverrides.find(rpc::kSchemaKindFingerprint) == fingerprintOverrides.end());
+            if (!plain) {
                 auto it = fingerprintOverrides.find(opt->requestedFingerprint);
                 if (it != fingerprintOverrides.end()) {
                     resp.topicId        = it->second.topicId;
@@ -220,6 +225,11 @@ struct GateGateway {
             const std::size_t n = resp.encode(scratch.data());
             // A pre-2b broker's frame stops after the descriptor blob.
             if (n > 0) sendFrame(scratch.data(), omitPartitionCount ? n - 4u : n);
+            break;
+        }
+
+        case rcc::TemplateId::DefineTopic: {   // checked writes: the validate byte of each DefineTopic that arrives
+            if (auto opt = rpc::DefineTopic::decode(buf, len)) defineValidate.push_back(opt->validate);
             break;
         }
 
@@ -1328,4 +1338,102 @@ TEST(OpenTopicGateRegression, NegativeReportedPartitionCountFallsBackToOnePartit
     TypedTopic<StubT_Match> tt2 =
         TypedTopic<StubT_Match>::fromSchema(*h.client, fut.outcome().c, fut.outcome().payload);
     EXPECT_EQ(tt2.handle().partitionCount, 1) << "fromSchema: negative reported count -> 1";
+}
+
+// ===========================================================================
+// Checked writes Part 02: typed and raw handles bind only to their own kind.  The kind probe (GetTopicSchema with
+// kSchemaKindFingerprint) answers a typed topic like "latest", an untyped one OK with no blob.
+// ===========================================================================
+namespace {
+void expectOpenMessage(Client& c, std::string_view name, const char* needle) {
+    try {
+        (void)c.openTopicAndWait<StubT_Match>(name);
+        ADD_FAILURE() << "openTopicAndWait must throw";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find(needle), std::string::npos) << e.what();
+    }
+}
+}  // namespace
+
+TEST(CheckedWritesBind, TypedOpenOfAnUntypedTopicNamesTheRawTopic) {
+    GateHarness h(1400, 1401);
+    h.build();
+    h.connectAndWait();
+    h.gw->unknownFingerprintErrorCode = 7;
+    h.gw->fingerprintOverrides[rpc::kSchemaKindFingerprint] = {0x40000009, 0, {}, 3};
+    GateGatewayPump pump(*h.gw);
+    expectOpenMessage(*h.client, "characters", "is an untyped (raw) topic");
+}
+
+TEST(CheckedWritesBind, TypedOpenOfAMissingTopicSaysSo) {
+    GateHarness h(1402, 1403);
+    h.build();
+    h.connectAndWait();
+    h.gw->getErrorCode                = 7;
+    h.gw->unknownFingerprintErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    expectOpenMessage(*h.client, "characters", "topic 'characters' does not exist");
+}
+
+TEST(CheckedWritesBind, TypedOpenFingerprintMismatchKeepsTheStaleMessage) {
+    GateHarness h(1404, 1405);
+    h.build();
+    h.connectAndWait();
+    h.gw->getTopicId                  = 0x40000002;
+    h.gw->getVersion                  = 2;
+    h.gw->getBlob                     = serialize(makeCharsV2Descriptor());
+    h.gw->unknownFingerprintErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    expectOpenMessage(*h.client, "characters", "generated type is stale");
+}
+
+TEST(CheckedWritesBind, RawOpenOfATypedTopicIsRefused) {
+    GateHarness h(1406, 1407);
+    h.build();
+    h.connectAndWait();
+    h.gw->getBlob = serialize(makeCharsV2Descriptor());
+    GateGatewayPump pump(*h.gw);
+    try {
+        (void)h.client->rawTopicAndWait("characters");
+        ADD_FAILURE() << "rawTopicAndWait must refuse a typed topic";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("is a typed topic"), std::string::npos) << e.what();
+    }
+}
+
+TEST(CheckedWritesBind, RawOpenOfAnUntypedTopicReturnsItsHandle) {
+    GateHarness h(1408, 1409);
+    h.build();
+    h.connectAndWait();
+    h.gw->fingerprintOverrides[rpc::kSchemaKindFingerprint] = {42, 0, {}, 3};
+    GateGatewayPump pump(*h.gw);
+    const TopicHandle t = h.client->rawTopicAndWait("raw");
+    EXPECT_EQ(t.topicId, 42);
+    EXPECT_EQ(t.partitionCount, 3);
+}
+
+TEST(CheckedWritesBind, RawOpenOfAMissingTopicIsRefused) {
+    GateHarness h(1410, 1411);
+    h.build();
+    h.connectAndWait();
+    h.gw->getErrorCode = 7;
+    GateGatewayPump pump(*h.gw);
+    EXPECT_THROW((void)h.client->rawTopicAndWait("nope"), std::runtime_error);
+}
+
+TEST(CheckedWritesBind, DefineSendsValidateForTypedTopics) {
+    GateHarness h(1412, 1413);
+    h.build();
+    h.connectAndWait();
+    test_support::TestCq cq(*h.client);
+    const std::vector<uint8_t> blob = serialize(makeCharsDescriptor());
+    (void)cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return h.client->defineTopic("typed", 1, "userId", std::span<const uint8_t>(blob), q, t);
+    });
+    (void)cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return h.client->defineTopic("raw", 1, "", std::span<const uint8_t>{}, q, t);
+    });
+    ASSERT_TRUE(h.pumpUntil([&] { return h.gw->defineValidate.size() >= 2; }));
+    EXPECT_TRUE(h.gw->defineValidate[0]) << "a typed define always asks for validation";
+    EXPECT_FALSE(h.gw->defineValidate[1]) << "an untyped one has nothing to validate";
 }

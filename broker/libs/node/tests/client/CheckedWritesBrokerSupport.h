@@ -25,7 +25,7 @@ namespace rc = rune::client;
 /// A typed topic {id uint64 key, name string(16), bio string, blob bytes, kind enum} with `partitions` partitions.
 inline rc::DefineTopicResult defineTyped(rc::Client& c, const std::string& name, uint32_t partitions) {
     const auto blob = rune::codec::serialize(rune::node::cw::matrixDescriptor());
-    return c.defineTopicAndWait(name, partitions, "id", blob, false, rc::Persistence::Disk, {}, {}, 60s);
+    return c.defineTopicAndWait(name, partitions, "id", blob, rc::Persistence::Disk, {}, {}, 60s);
 }
 
 /// Worker state of a partition, read on the worker's own thread (the topic need not be built).

@@ -97,10 +97,10 @@ TEST(NamespaceUsageRegression, ValuesMatchCountsRegression) {
     ASSERT_TRUE(admin->createNamespace("u", patchOf("max-topics", 50)).has_value());
     b.createUser("u/w", kUserPw, builderGrants("u", false));
     auto w = connected(b, "u/w");
-    const auto t1 = w->defineTopicAndWait("t1", 2, "id", rune::node::test::charBlob(), false, rc::Persistence::Disk, {}, {}, 60s);
+    const auto t1 = w->defineTopicAndWait("t1", 2, "id", rune::node::test::charBlob(), rc::Persistence::Disk, {}, {}, 60s);
     ASSERT_EQ(t1.errorCode, 0) << t1.detail;
-    ASSERT_EQ(w->defineTopicAndWait("t2", 2, "", false, {}, 60s).errorCode, 0);
-    ASSERT_EQ(w->defineTopicAndWait("t3", 3, "", false, {}, 60s).errorCode, 0);
+    ASSERT_EQ(w->defineTopicAndWait("t2", 2, "", {}, 60s).errorCode, 0);
+    ASSERT_EQ(w->defineTopicAndWait("t3", 3, "", {}, 60s).errorCode, 0);
     const auto v1 = w->createViewAndWait("v1", "id", 0, rune::node::test::viewPlanBlob("v1", t1.topicId, 0), {}, 60s);
     ASSERT_EQ(v1.errorCode, 0) << v1.detail;
     const auto v2 = w->createViewAndWait("v2", "id", 0, rune::node::test::viewPlanBlob("v2", t1.topicId, 0), {}, 60s);
@@ -150,7 +150,7 @@ TEST(NamespaceUsageRegression, NamespaceUserWithDescribeRegression) {
     ASSERT_TRUE(admin->createNamespace("u").has_value());
     b.createUser("u/w", kUserPw, builderGrants("u", true));
     auto w = connected(b, "u/w");
-    ASSERT_EQ(w->defineTopicAndWait("t1", 4, "", false, {}, 60s).errorCode, 0);
+    ASSERT_EQ(w->defineTopicAndWait("t1", 4, "", {}, 60s).errorCode, 0);
     ASSERT_TRUE(until([&] { const auto r = w->namespaceUsage("u", 20s); return r && r->usage[kTopics] == 1 && r->usage[kPartTotal] == 4; }));
 }
 

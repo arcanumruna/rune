@@ -424,8 +424,7 @@ static int typedRoutingLeg(Client& c, std::chrono::milliseconds wait, int boundM
     constexpr int     kRecords = 64;
 
     const auto blob = rune::codec::serialize(rune::gen::Characters::descriptor());
-    DefineTopicResult def = c.defineTopicAndWait("typed_route", kParts, /*keyField=*/"userId",
-                                                 /*validate=*/false, std::span<const uint8_t>(blob), wait);
+    DefineTopicResult def = c.defineTopicAndWait("typed_route", kParts, /*keyField=*/"userId", std::span<const uint8_t>(blob), wait);
     if (def.errorCode != 0) {
         std::cerr << "PROBE: FAIL defineTopic(typed_route) errorCode=" << def.errorCode << "\n";
         return 50;
@@ -550,7 +549,7 @@ static int ddlRaceMode(Client& c, const std::string& role, std::chrono::millisec
 
     const auto blob = rune::codec::serialize(characterDescriptor());
     const DefineTopicResult t = c.defineTopicAndWait(
-        "race_topic", 1, "id", false, std::span<const uint8_t>(blob),
+        "race_topic", 1, "id", std::span<const uint8_t>(blob),
         role == "a" ? Persistence::Disk : Persistence::Transient, wait);
     std::cout << "DDL_RACE leg=topic role=" << role << " code=" << t.errorCode << "\n";
 
@@ -560,7 +559,7 @@ static int ddlRaceMode(Client& c, const std::string& role, std::chrono::millisec
 
     uint16_t mixed = 0;
     if (role == "a") {
-        mixed = c.defineTopicAndWait("race_mixed", 1, "id", false, std::span<const uint8_t>(blob), wait).errorCode;
+        mixed = c.defineTopicAndWait("race_mixed", 1, "id", std::span<const uint8_t>(blob), wait).errorCode;
     } else {
         const auto mplan = rcv::serializeAuthored(charHpPlan("race_mixed", src.topicId, 0));
         mixed = c.createViewAndWait("race_mixed", "id", 0, std::span<const uint8_t>(mplan), wait).errorCode;
@@ -1190,7 +1189,7 @@ int main(int argc, char** argv) {
             // ---- 1. defineTopic "character" ------------------------------
             const auto blob = rune::codec::serialize(characterDescriptor());
             DefineTopicResult def = c.defineTopicAndWait(
-                "character", /*partitions=*/1, /*keyField=*/"id", /*validate=*/false,
+                "character", /*partitions=*/1, /*keyField=*/"id",
                 std::span<const uint8_t>(blob), wait);
             if (def.errorCode != 0) {
                 std::cerr << "PROBE: FAIL defineTopic errorCode=" << def.errorCode << "\n";
@@ -1273,8 +1272,7 @@ int main(int argc, char** argv) {
 
             // ---- 5. Phase 2a: aggregate view user_totals over 'order' -------
             const auto oblob = rune::codec::serialize(orderDescriptor());
-            DefineTopicResult ord = c.defineTopicAndWait("order", /*partitions=*/1, /*keyField=*/"orderId",
-                                                         /*validate=*/false, std::span<const uint8_t>(oblob), wait);
+            DefineTopicResult ord = c.defineTopicAndWait("order", /*partitions=*/1, /*keyField=*/"orderId", std::span<const uint8_t>(oblob), wait);
             if (ord.errorCode != 0) { std::cerr << "PROBE: FAIL defineTopic(order) errorCode=" << ord.errorCode << "\n"; return 30; }
             const auto aggBlob = rcv::serializeAuthored(userTotalsPlan(ord.topicId));
             CreateViewResult viewA = c.createViewAndWait("user_totals", "userId", /*persistence=*/0,
@@ -1300,7 +1298,7 @@ int main(int argc, char** argv) {
             //         Exit codes 130..142, one per check (50..56 are typedRoutingLeg's,
             //         60 ALTER's). ----
             DefineTopicResult tt = c.defineTopicAndWait(
-                "presence_t", /*partitions=*/1, /*keyField=*/"id", /*validate=*/false,
+                "presence_t", /*partitions=*/1, /*keyField=*/"id",
                 std::span<const uint8_t>(blob), Persistence::Transient, wait);
             if (tt.errorCode != 0) { std::cerr << "PROBE: FAIL defineTopic(presence_t transient) errorCode=" << tt.errorCode << "\n"; return 130; }
             {
@@ -1492,7 +1490,7 @@ int main(int argc, char** argv) {
                 // Metadata survived: re-defining answers TopicExists with the SAME id.
                 const auto ttBlob = rune::codec::serialize(characterDescriptor());
                 DefineTopicResult again = c.defineTopicAndWait(
-                    "presence_t", 1, "id", false, std::span<const uint8_t>(ttBlob),
+                    "presence_t", 1, "id", std::span<const uint8_t>(ttBlob),
                     Persistence::Transient, wait);
                 if (again.errorCode != 25 || again.topicId != ttTopic) {
                     std::cerr << "PROBE: FAIL presence_t after restart errorCode=" << again.errorCode

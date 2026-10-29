@@ -99,7 +99,7 @@ TEST(ClientLoginBrokerRegression, NoCredentialsFailsAuthenticationFailed) {
     // gate (AuthenticationFailed, in the request's own response type) - never silently served.
     try {
         client.connectAndWait(20s);
-        const auto r = client.defineTopicAndWait("t", 1, "", false, {}, 20s);
+        const auto r = client.defineTopicAndWait("t", 1, "", {}, 20s);
         EXPECT_EQ(r.errorCode, static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed));
     } catch (const std::runtime_error& e) {
         EXPECT_NE(std::string(e.what()).find("AuthenticationFailed"), std::string::npos) << e.what();

@@ -126,7 +126,7 @@ returns the original result.
 rune::client::TopicOptions topic;               // replicationFactor 0 = every broker
 topic.replicationFactor = 3;
 rune::client::DdlOptions ddl;                   // statement text, client name, request id
-auto r = client.defineTopicAndWait("events", 3, "", {}, false, Persistence::Disk, topic, ddl, 15s);
+auto r = client.defineTopicAndWait("events", 3, "", {}, Persistence::Disk, topic, ddl, 15s);
 auto d = client.dropTopicAndWait("events", ddl, 15s);
 // also: dropViewAndWait, alterViewAndWait, alterTopicConfigAndWait, createViewAndWait, alterTopicAndWait
 

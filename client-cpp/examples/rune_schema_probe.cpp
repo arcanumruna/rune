@@ -170,8 +170,7 @@ int main() {
 
         // ---- 2. defineTopic (validate = ON) ----------------------------------
         std::cerr << "PROBE: defineTopic(\"characters\", 1, \"userId\", validate=true, blob)\n";
-        DefineTopicResult def = c.defineTopicAndWait("characters", /*partitions=*/1, /*keyField=*/"userId",
-                                                     /*validate=*/true, std::span<const uint8_t>(blob));
+        DefineTopicResult def = c.defineTopicAndWait("characters", /*partitions=*/1, /*keyField=*/"userId", std::span<const uint8_t>(blob));
         if (def.errorCode != 0) {
             std::cerr << "PROBE: FAIL defineTopic errorCode=" << def.errorCode << "\n";
             c.close();

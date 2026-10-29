@@ -92,7 +92,7 @@ TEST(ProducerIdBrokerRegression, TwoPlainProducersGetDistinctBrokerIdsRegression
         rc::Client* admin = broker.connectClient();
         for (int i = 0; i < 2; ++i) {
             sides[i].name = "pid.t" + std::to_string(i);
-            const auto r  = admin->defineTopicAndWait(sides[i].name, kParts, "", {}, false, rc::Persistence::Disk, {}, {}, 30s);
+            const auto r  = admin->defineTopicAndWait(sides[i].name, kParts, "", {}, rc::Persistence::Disk, {}, {}, 30s);
             ASSERT_EQ(r.errorCode, 0) << r.detail;
             sides[i].topicId = r.topicId;
         }

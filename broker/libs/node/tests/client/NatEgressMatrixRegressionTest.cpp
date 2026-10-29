@@ -121,7 +121,7 @@ bool waitUntil(Pred&& pred, std::chrono::milliseconds within) {
 rc::TopicSpec defineTopic(rc::Client& admin, const std::string& name, uint32_t parts, int16_t rf) {
     rc::TopicOptions to;
     to.replicationFactor = rf;
-    const auto def = admin.defineTopicAndWait(name, parts, "", {}, false, rc::Persistence::Disk, to, {}, 60s);
+    const auto def = admin.defineTopicAndWait(name, parts, "", {}, rc::Persistence::Disk, to, {}, 60s);
     EXPECT_EQ(def.errorCode, 0) << name << ": " << def.detail;
     return rc::TopicSpec{name, def.topicId, static_cast<int32_t>(parts)};
 }
@@ -420,7 +420,7 @@ void everyOperation(std::unique_ptr<rc::Client>& out, rc::ClientConfig cfg, cons
 
     // DDL over the response path: define a topic, drop the scratch one.
     {
-        const auto def = cl.defineTopicAndWait(tag + "-ddl", 1, "", false, {}, 30s);
+        const auto def = cl.defineTopicAndWait(tag + "-ddl", 1, "", {}, 30s);
         EXPECT_EQ(def.errorCode, 0) << def.detail;
         const auto drop = cl.dropTopicAndWait(scratch, {}, 30s);
         EXPECT_EQ(drop.errorCode, 0) << drop.detail;
@@ -711,7 +711,7 @@ void tlsLeg(bool nat, const char* tag) {
     {
         rc::Client admin(tlsConfig(b, "admin", kAdminPw));
         ASSERT_NO_THROW(admin.connectAndWait(30s));
-        const auto def = admin.defineTopicAndWait("orders", 1, "", false, {}, 30s);
+        const auto def = admin.defineTopicAndWait("orders", 1, "", {}, 30s);
         ASSERT_EQ(def.errorCode, 0) << def.detail;
         spec = rc::TopicSpec{"orders", def.topicId, 1};
         admin.closeImmediately();
@@ -774,7 +774,7 @@ static void tlsAuthOffLeg(bool nat, const char* tag) {
         acfg.allowUnauthenticatedBroker = true;
         rc::Client admin(acfg);
         ASSERT_NO_THROW(admin.connectAndWait(30s));
-        const auto def = admin.defineTopicAndWait("orders", 1, "", false, {}, 30s);
+        const auto def = admin.defineTopicAndWait("orders", 1, "", {}, 30s);
         ASSERT_EQ(def.errorCode, 0) << def.detail;
         spec = rc::TopicSpec{"orders", def.topicId, 1};
         admin.closeImmediately();
@@ -1108,7 +1108,7 @@ TEST(NatEgressMatrixRegression, DerivedDefaultPortsCarryTheResponsePathRegressio
     ASSERT_NE(client, nullptr) << "connect over the derived response ports";
     rc::TopicSpec spec;
     {
-        const auto def = client->defineTopicAndWait("derived", 1, "", false, {}, 60s);
+        const auto def = client->defineTopicAndWait("derived", 1, "", {}, 60s);
         ASSERT_EQ(def.errorCode, 0) << def.detail;
         spec = rc::TopicSpec{"derived", def.topicId, 1};
     }
@@ -1171,7 +1171,7 @@ TEST(NatEgressMatrixRegression, TlsAuthThreeNodesNewClientRegression) {
     {
         rc::Client admin(tlsCfg(1, "admin", AuthTrio::kAdminPassword));
         ASSERT_NO_THROW(admin.connectAndWait(60s));
-        const auto def = admin.defineTopicAndWait("orders", 3, "", false, {}, 60s);
+        const auto def = admin.defineTopicAndWait("orders", 3, "", {}, 60s);
         ASSERT_EQ(def.errorCode, 0) << def.detail;
         spec = rc::TopicSpec{"orders", def.topicId, 3};
         admin.closeImmediately();
