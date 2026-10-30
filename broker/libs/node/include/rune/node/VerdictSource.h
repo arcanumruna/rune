@@ -108,6 +108,7 @@ private:
     void   discardCheckpointAhead_(Member& m);
     enum class StallReason : uint8_t { None, Full, OutOfOrder, Capacity };
     void   stall_(StallReason reason) noexcept;
+    void   waitForInstall_() noexcept;
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
@@ -187,7 +188,7 @@ template <class ReadRangeFn>
 bool VerdictSource::switchSet_(int64_t A, ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted, int& work) {
     const ConstraintSet& next = *state_->constraintSets.setAt(A + 1);
     if (!resolveSet_(next, scratchIdx_)) {
-        if (!waitingForInstall_) { waitingForInstall_ = true; ++stats_.judgeWaitsForInstall; }
+        waitForInstall_();
         return false;
     }
     waitingForInstall_ = false;
@@ -232,7 +233,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     for (const std::size_t i : active_) behind = behind || members_[i].inst->foldCursor < judgeCursor_;
     const bool ready = activeSet_.count == active_.size() || reindex_();
     if (!ready) {
-        if (!waitingForInstall_) { waitingForInstall_ = true; ++stats_.judgeWaitsForInstall; }
+        waitForInstall_();
     } else if (!behind) {
         const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX ? INT64_MAX : emitFrom_ + checkpointCap_);
         while (!stalled_) {

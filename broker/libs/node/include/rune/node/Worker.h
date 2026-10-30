@@ -7167,8 +7167,12 @@ private:
     // Part 04: the markers below the HW are committed (W follows them), and the index forgets what retention deleted.
     void verdictHousekeeping_(RcSlot& sl) noexcept {
         verdictOnHw(*sl.write, sl.replica->highWatermark());
-        if (!sl.replica->isDiskBacked()) return;
         PartitionWriteState& w = *sl.write;
+        if (const uint64_t mismatches = w.rejected.mismatches(); mismatches != w.mismatchesLogged) [[unlikely]] {
+            spdlog::error("rejected index disagrees with the log: {} mismatches (topic {} partition {})", mismatches, sl.replica->topicId(), sl.replica->partitionId());
+            w.mismatchesLogged = mismatches;
+        }
+        if (!sl.replica->isDiskBacked()) return;
         rune::storage::Log& log = *sl.replica->log();
         w.rejected.dropBelow(log.logStartOffset());
         // The latest committed set change outlives retention: a restart without it finds no verdict source.  When it sits in

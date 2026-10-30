@@ -22,6 +22,9 @@
 #include <rune/view/AggFold.h>
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewFold.h>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
+#include <sstream>
 
 using namespace rune::node;
 namespace cr = rune::storage::control_record;
@@ -324,6 +327,10 @@ TEST(CheckedWritesVerdictSource, LeavingMemberJudgesUntilItsLeaveOffset) {
 }
 
 TEST(CheckedWritesVerdictSourceRegression, MissingMemberWaitsNeverGuessesRegression) {
+    std::ostringstream out;
+    const auto saved = spdlog::default_logger();
+    spdlog::set_default_logger(std::make_shared<spdlog::logger>("cw-wait", std::make_shared<spdlog::sinks::ostream_sink_mt>(out)));
+    struct Restore { std::shared_ptr<spdlog::logger> l; ~Restore() { spdlog::set_default_logger(l); } } restore{saved};
     Rig r;
     auto& x = r.install(9, tagEquals(9));
     r.st.constraintSets.onChange(0, setOf(1, {{9, x.rule.fingerprint() + 1}}));   // no such (id, fingerprint)
@@ -336,6 +343,9 @@ TEST(CheckedWritesVerdictSourceRegression, MissingMemberWaitsNeverGuessesRegress
     EXPECT_EQ(r.vs.stats().judgeWaitsForInstall, 1u);
     r.drive();
     EXPECT_EQ(r.vs.stats().judgeWaitsForInstall, 1u);   // logged once per wait
+    const std::string logged = out.str();
+    EXPECT_NE(logged.find("waits for a view install"), std::string::npos);
+    EXPECT_EQ(logged.find("waits for a view install"), logged.rfind("waits for a view install")) << "one line for the whole wait";
     EXPECT_TRUE(r.st.rejected.size() == 0);
     r.vs.addVerdictView(x.inst.get(), VerdictViewKind::TestReject, 9, x.rule.fingerprint() + 1);
     r.drive();

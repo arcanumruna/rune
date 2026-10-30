@@ -152,6 +152,7 @@ struct PartitionWriteState {
     MarkerLedger                       markers;
     VerdictSource*                     verdicts = nullptr;   ///< the judge, once this worker leads and hosts verdict views
     int64_t                            judgedThrough = 0;    ///< the judge's cursor, published at the end of each of its passes
+    uint64_t                           mismatchesLogged = 0; ///< rejected-index determinism alarms already reported
     bool                               growOwed = false;     ///< the judge saw the rejected index cross 75 %: the worker's cold maintenance grows it
 
     /// A judge is attached or the latest logged set is non-empty.

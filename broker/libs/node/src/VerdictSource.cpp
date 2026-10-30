@@ -155,6 +155,13 @@ void VerdictSource::stall_(StallReason reason) noexcept {
                   reason == StallReason::Full ? "rejected index full" : reason == StallReason::OutOfOrder ? "rejection out of order" : "view capacity exhausted");
 }
 
+void VerdictSource::waitForInstall_() noexcept {
+    if (waitingForInstall_) return;
+    waitingForInstall_ = true;
+    ++stats_.judgeWaitsForInstall;
+    spdlog::info("verdict judge waits for a view install: topic {} partition {}", srcTopicId_, partition_);
+}
+
 rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept {
     ViewInstance& i = *m.inst;
     if (i.agg) {
