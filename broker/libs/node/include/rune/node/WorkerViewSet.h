@@ -104,7 +104,7 @@ struct ViewPaused { ViewPauseReason reason = ViewPauseReason::OverLimit; int64_t
 using ViewPauseState = std::variant<ViewRunning, ViewPaused>;
 
 // The namespace a source partition (hence its views) lives in, as the owning worker's log tag.  Default = untagged
-// (kNoNsSlot): the instance is not charged to any namespace (unit tests, transient sources, which carry no tag).
+// (kNoNsSlot): the instance is not charged to any namespace (unit tests).
 struct NsTag { uint16_t slot = kNoNsSlot; uint32_t nsId = 0; };
 
 // Task 19b: split an on-disk view checkpoint file into its individual Task-12

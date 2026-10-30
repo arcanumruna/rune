@@ -4205,7 +4205,7 @@ private:
     }
 
     /// Task 14 (D28): the cycles one view read costs are charged to its namespace's queryCycles (two counter reads and
-    /// one add).  The read's slot is the source log's; a transient source is untagged and not charged.
+    /// one add).  The read's slot is the namespace tag of the source's ring or log.
     ViewServe serveViewRead_(ViewReadReq& r) {
         lastViewReadSlot_ = kNoNsSlot;
         const uint64_t t0 = readCycleCounter_();
