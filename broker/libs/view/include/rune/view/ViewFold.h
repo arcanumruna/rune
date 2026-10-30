@@ -83,6 +83,9 @@ struct ProjectionFold {
     rune::codec::PrimType    keyType;
 };
 
+// The view key column's type, for building a ProjectionFold / AggregateFold.
+[[nodiscard]] rune::codec::PrimType viewKeyType(const CompiledViewPlan& plan) noexcept;
+
 // Computes the record's prospective row into `p` without touching the table.
 [[nodiscard]] PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept;
 // Commits a prepared record.

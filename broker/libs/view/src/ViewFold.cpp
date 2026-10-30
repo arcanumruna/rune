@@ -130,6 +130,8 @@ inline void writeProjectionRow(const CompiledViewPlan& plan, const RowLayout& la
 
 } // namespace
 
+PrimType viewKeyType(const CompiledViewPlan& plan) noexcept { return resolveKeyType(plan); }
+
 PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept {
     p.clear();
     uint64_t k = 0;

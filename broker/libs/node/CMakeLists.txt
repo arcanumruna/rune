@@ -28,6 +28,7 @@ add_library(rune_node
     src/ViewSnapshotIoAgent.cpp
     src/WorkerViewSet.cpp
     src/CheckedWriteHook.cpp
+    src/VerdictSource.cpp
     src/TopicDirReconcile.cpp)
 
 # The worker's io backends, as their own leaf library: Worker.h's header-inline
@@ -814,7 +815,9 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesValidationMatrixTest.cpp
         tests/node/CheckedWritesWorkerTest.cpp
         tests/node/CheckedWritesSpecFanoutTest.cpp
-        tests/node/CheckedWritesDdlTest.cpp)
+        tests/node/CheckedWritesDdlTest.cpp
+        tests/node/CheckedWritesTimelineTest.cpp
+        tests/node/CheckedWritesVerdictSourceTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)

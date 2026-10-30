@@ -1,0 +1,398 @@
+#include <rune/node/VerdictSource.h>
+
+#include <rune/codec/Record.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/Protocol.h>
+
+#include <algorithm>
+#include <cstring>
+
+namespace rune::node {
+
+namespace cr = rune::storage::control_record;
+using rune::view::Verdict;
+
+namespace {
+
+constexpr std::size_t kIndexReserve = 65536;
+
+uint16_t writerVersionOf(std::string_view value, uint16_t fallback) noexcept {
+    return value.size() >= 4 ? static_cast<uint16_t>(static_cast<uint8_t>(value[2]) | (static_cast<uint8_t>(value[3]) << 8)) : fallback;
+}
+
+}  // namespace
+
+bool PartitionWriteState::isVerdictSource() const noexcept { return verdicts != nullptr || !constraintSets.latest().empty(); }
+
+bool PartitionWriteState::isConstrainedSource() const noexcept {
+    const ConstraintSet& s = constraintSets.latest();
+    for (uint8_t i = 0; i < s.count; ++i) {
+        const auto k = s.members[i].kind;
+        if (k == rune::view::VerdictViewKind::Unique || k == rune::view::VerdictViewKind::Check || k == rune::view::VerdictViewKind::TestReject) return true;
+    }
+    return false;
+}
+
+int64_t PartitionWriteState::verdictKnownThrough() const noexcept {
+    if (constraintSets.size() == 0) return INT64_MAX;
+    if (verdicts != nullptr) return verdicts->judgedThrough();
+    const int64_t k = rejected.coveredThrough();
+    return constraintSets.latest().empty() && k > constraintSets.lastChangeOffset() ? INT64_MAX : k;
+}
+
+VerdictSource::VerdictSource(int32_t srcTopicId, int32_t partition) : srcTopicId_(srcTopicId), partition_(partition) {
+    members_.reserve(kMaxVerdictViewsPerSource);
+    active_.reserve(kMaxVerdictViewsPerSource);
+    scratchIdx_.reserve(kMaxVerdictViewsPerSource);
+    scratch_.resize(cr::markerBatchBytes(cr::kMaxMarkerEntries));
+    entryScratch_.reserve(cr::kMaxMarkerEntries);
+}
+
+void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint) {
+    Member m;
+    m.inst = inst;
+    m.kind = kind;
+    m.objectId = viewObjectId;
+    m.fingerprint = planFingerprint;
+    m.prospect.reserve(inst->layout, inst->agg ? &inst->agg->layout : nullptr);
+    auto at = std::lower_bound(members_.begin(), members_.end(), viewObjectId, [](const Member& x, uint64_t id) { return x.objectId < id; });
+    members_.insert(at, std::move(m));
+    reindex_();
+    recomputeCap_();
+}
+
+void VerdictSource::removeVerdictView(uint64_t viewObjectId, uint64_t planFingerprint) {
+    std::erase_if(members_, [&](const Member& m) { return m.objectId == viewObjectId && m.fingerprint == planFingerprint; });
+    reindex_();
+    recomputeCap_();
+}
+
+void VerdictSource::installTestVerdictViewForTest(ViewInstance* inst, uint64_t viewObjectId, TestRejectRule rule) {
+    addVerdictView(inst, rune::view::VerdictViewKind::TestReject, viewObjectId, rule.fingerprint());
+    for (Member& m : members_)
+        if (m.objectId == viewObjectId) m.rule = rule;
+}
+
+bool VerdictSource::retiringForTest(uint64_t viewObjectId) const noexcept {
+    return std::any_of(members_.begin(), members_.end(), [&](const Member& m) { return m.objectId == viewObjectId && m.retiring; });
+}
+
+bool VerdictSource::resolveSet_(const ConstraintSet& set, std::vector<std::size_t>& out) const {
+    out.clear();
+    for (uint8_t i = 0; i < set.count; ++i) {
+        const ConstraintSetMember& want = set.members[i];
+        const auto it = std::find_if(members_.begin(), members_.end(), [&](const Member& m) {
+            return !m.retiring && m.objectId == want.viewObjectId && m.fingerprint == want.planFingerprint;
+        });
+        if (it == members_.end()) return false;
+        out.push_back(static_cast<std::size_t>(it - members_.begin()));
+    }
+    return true;
+}
+
+bool VerdictSource::reindex_() {
+    if (!resolveSet_(activeSet_, active_)) {
+        active_.clear();
+        return false;
+    }
+    waitingForInstall_ = false;
+    return true;
+}
+
+void VerdictSource::recomputeCap_() noexcept {
+    checkpointCap_ = INT64_MAX;
+    for (const Member& m : members_)
+        if (m.inst->persisted && m.inst->maxRecordsPerPass > 0) checkpointCap_ = std::min(checkpointCap_, m.inst->maxRecordsPerPass);
+}
+
+void VerdictSource::bindLeader(rune::replication::PartitionReplica* replica, uint64_t leadershipGeneration, int64_t logStart) noexcept {
+    replica_  = replica;
+    logStart_ = logStart;
+    if (leadershipGeneration == generation_) return;
+    generation_      = leadershipGeneration;
+    needsActivation_ = true;
+    stalled_         = false;
+}
+
+int64_t VerdictSource::extendOverEmptySets_(int64_t offset) const noexcept {
+    while (state_->constraintSets.setAt(offset)->empty()) {
+        const int64_t a = state_->constraintSets.nextChangeAtOrAfter(offset);
+        if (a == INT64_MAX) break;
+        offset = a + 1;
+    }
+    return offset;
+}
+
+void VerdictSource::activate_(PartitionWriteState& state) {
+    state_ = &state;
+    needsActivation_ = false;
+    if (state.rejected.capacity() == 0) state.rejected.reserve(kIndexReserve);
+    judgeCursor_ = std::max(extendOverEmptySets_(state.rejected.coveredThrough()), logStart_);
+    emitFrom_    = std::max(extendOverEmptySets_(state.markers.committedThrough()), logStart_);
+    state.rejected.noteCovered(judgeCursor_);
+    activeSet_ = *state.constraintSets.setAt(judgeCursor_);
+    setFrom_   = judgeCursor_;
+    sawEmptyChange_ = false;
+    reindex_();
+    recomputeCap_();
+}
+
+void VerdictSource::stall_() noexcept {
+    if (!stalled_) ++stats_.verdictStalls;
+    stalled_ = true;
+}
+
+rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept {
+    ViewInstance& i = *m.inst;
+    if (i.agg) {
+        rune::view::AggregateFold f{i.plan, i.layout, i.agg->layout, i.vdc, i.table, i.agg->contributors, i.agg->groups, i.agg->blocksOrNull()};
+        return rune::view::prepareAggregate(f, rec, m.prospect);
+    }
+    rune::view::ProjectionFold f{i.plan, i.layout, i.vdc, i.table, rune::view::viewKeyType(i.plan)};
+    return rune::view::prepareProjection(f, rec, m.prospect);
+}
+
+void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexcept {
+    ViewInstance& i = *m.inst;
+    if (i.agg) {
+        rune::view::AggregateFold f{i.plan, i.layout, i.agg->layout, i.vdc, i.table, i.agg->contributors, i.agg->groups, i.agg->blocksOrNull()};
+        rune::view::applyAggregate(f, rec, m.prospect);
+    } else {
+        rune::view::ProjectionFold f{i.plan, i.layout, i.vdc, i.table, rune::view::viewKeyType(i.plan)};
+        rune::view::applyProjection(f, rec, m.prospect);
+    }
+    const rune::view::FoldStats& st = m.prospect.stats;
+    i.counters.skippedMalformed += st.skippedMalformed;
+    i.counters.skippedNoGroup   += st.skippedNoGroup;
+    i.counters.aggOverflow      += st.aggOverflow;
+    i.counters.aggNonFinite     += st.aggNonFinite;
+    i.counters.aggInconsistent  += st.aggInconsistent;
+    i.counters.aggRescans       += st.aggRescans;
+}
+
+bool VerdictSource::rejects_(const Member& m, const rune::view::SourceRecord& rec) const noexcept {
+    if (m.kind != rune::view::VerdictViewKind::TestReject || rec.value.empty()) return false;   // tombstones are never rejected
+    switch (m.rule.mode) {
+    case TestRejectRule::Mode::TagEquals: {
+        if (rec.writer == nullptr) return false;
+        for (const auto& f : rec.writer->fields) {
+            if (f.name != "tag") continue;
+            const auto v = rune::codec::readField(*rec.writer, {reinterpret_cast<const uint8_t*>(rec.value.data()), rec.value.size()}, f.id);
+            return v.present && (v.i == m.rule.tag || v.u == m.rule.tag);
+        }
+        return false;
+    }
+    case TestRejectRule::Mode::OffsetSet:
+        return std::find(m.rule.offsets.begin(), m.rule.offsets.begin() + m.rule.offsetCount, rec.offset) != m.rule.offsets.begin() + m.rule.offsetCount;
+    case TestRejectRule::Mode::CapLiveKeys:
+        return m.prospect.op == rune::view::ProspectOp::Upsert && !m.prospect.rows[0].existed && m.inst->table.size() >= m.rule.cap;
+    }
+    return false;
+}
+
+Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
+    ++judgeCalls_;
+    for (const std::size_t i : active_) {
+        if (prepare_(members_[i], rec) == rune::view::PrepareStatus::CapacityExhausted) {
+            stall_();
+            return {};
+        }
+    }
+    for (const std::size_t i : active_) {
+        if (!rejects_(members_[i], rec)) continue;
+        const Verdict v{static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation),
+                        rune::view::constraintIdOf(members_[i].objectId, 1)};
+        if (!state_->rejected.add(rec.offset, v.code, v.constraintId)) {
+            stall_();
+            return {};
+        }
+        ++stats_.rejectionsConstraint;
+        ++rejectedThisPass_;
+        auto* pc = std::find_if(stats_.perConstraint.begin(), stats_.perConstraint.begin() + stats_.perConstraintCount,
+                                [&](const auto& c) { return c.constraintId == v.constraintId; });
+        if (pc == stats_.perConstraint.begin() + stats_.perConstraintCount && stats_.perConstraintCount < stats_.perConstraint.size())
+            *pc = {v.constraintId, 0}, ++stats_.perConstraintCount;
+        if (pc != stats_.perConstraint.begin() + stats_.perConstraintCount) ++pc->rejections;
+        return v;
+    }
+    for (const std::size_t i : active_) apply_(members_[i], rec);
+    return {};
+}
+
+int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted) {
+    ViewInstance& inst = *m.inst;
+    const rune::view::FoldSkip skip{.aborted = aborted, .rejected = &state_->rejected};
+    int64_t cursor = inst.foldCursor;
+    const int64_t bound = inst.maxRecordsPerPass > 0 ? std::min(upTo, cursor + inst.maxRecordsPerPass) : upTo;
+    const rune::view::FoldStats st =
+        inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout, inst.vdc, inst.table, inst.agg->contributors,
+                                                  inst.agg->groups, inst.agg->blocksOrNull(), view, bound, cursor, skip)
+                 : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view, bound, cursor, skip);
+    inst.foldCursor = cursor;
+    inst.counters.skippedAborted   += st.skippedAborted;
+    inst.counters.skippedMalformed += st.skippedMalformed;
+    inst.counters.skippedNoGroup   += st.skippedNoGroup;
+    inst.counters.aggOverflow      += st.aggOverflow;
+    inst.counters.aggNonFinite     += st.aggNonFinite;
+    inst.counters.aggInconsistent  += st.aggInconsistent;
+    inst.counters.aggRescans       += st.aggRescans;
+    return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedNoGroup + st.skippedRejected);
+}
+
+int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t limit, const rune::view::AbortedTxnFilter& aborted) {
+    namespace proto = rune::protocol;
+    int work = 0;
+    ViewInstance& first = *members_[active_.front()].inst;
+    std::size_t pos = 0;
+    while (pos < view.len && !stalled_ && judgeCursor_ < limit) {
+        proto::RecordBatchReader r(view.data + pos, view.len - pos);
+        if (!r.ensureValid()) break;
+        const int16_t attrs = r.attributes();
+        const int64_t last = r.baseOffset() + r.lastOffsetDelta();
+        if (r.baseOffset() >= limit) break;
+        if (last < judgeCursor_) {
+            pos += static_cast<std::size_t>(r.totalLength());
+            continue;
+        }
+        const bool skipBatch = (attrs & proto::batch::kAttrControl) != 0 || aborted.skips(r, attrs);
+        if (skipBatch) {
+            if (last >= limit) break;
+            judgeCursor_ = last + 1;
+            pos += static_cast<std::size_t>(r.totalLength());
+            ++work;
+            continue;
+        }
+        judgeCursor_ = std::max(judgeCursor_, r.baseOffset());
+        bool halt = false;
+        r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t) {
+            if (halt || stalled_) return;
+            if (offset >= limit) { halt = true; return; }
+            if (offset < judgeCursor_) return;
+            rune::view::SourceRecord rec{key, value, offset, 0, nullptr};
+            if (!value.empty()) rec.writer = &first.vdc.materializedFor(writerVersionOf(value, first.vdc.defaultVersion()));
+            (void)judge(rec);
+            if (stalled_) return;
+            judgeCursor_ = offset + 1;
+            ++work;
+        });
+        if (stalled_) break;
+        judgeCursor_ = halt ? limit : std::max(judgeCursor_, last + 1);
+        pos += static_cast<std::size_t>(r.totalLength());
+    }
+    for (const std::size_t i : active_) members_[i].inst->foldCursor = judgeCursor_;
+    return work;
+}
+
+int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
+    if (generation_ == 0 || judgeCursor_ <= emitFrom_) return 0;
+    const bool due = rejectedThisPass_ > 0 || sawEmptyChange_ || nowNs - lastMarkerNs_ >= intervalNs_ ||
+                     (checkpointCap_ != INT64_MAX && judgeCursor_ - emitFrom_ >= checkpointCap_);
+    if (!due) return 0;
+    int work = 0;
+    while (emitFrom_ < judgeCursor_ && !state.markers.full()) {
+        const int64_t from = emitFrom_;
+        int64_t finalThrough = judgeCursor_;
+        entryScratch_.clear();
+        for (int64_t pos = from;;) {
+            const int64_t off = state.rejected.nextRejectedAtOrAfter(pos);
+            if (off >= judgeCursor_) break;
+            if (entryScratch_.size() == cr::kMaxMarkerEntries) { finalThrough = off; break; }
+            const auto* e = state.rejected.find(off);
+            entryScratch_.push_back(cr::MarkerEntry{static_cast<uint32_t>(off - from), e->code, e->constraintId});
+            pos = off + 1;
+        }
+        const cr::MarkerHeader h{from, finalThrough, state.constraintSets.setAt(finalThrough)->id, static_cast<uint32_t>(entryScratch_.size())};
+        const std::size_t n = cr::buildVerdictMarker(scratch_, h, entryScratch_);
+        const std::span<const uint8_t> batch(scratch_.data(), n);
+        int64_t base;
+        if (replica_ != nullptr) {
+            base = replica_->appendControlBatch(batch, false);
+        } else {
+            base = std::max(testNextOffset_, judgeCursor_);
+            testNextOffset_ = base + 1;
+            appended_.emplace_back(batch.begin(), batch.end());
+        }
+        if (base == rune::replication::PartitionReplica::kAppendNotLeader) break;
+        if (base < 0) { ++stats_.markerAppendRetries; break; }
+        (void)state.markers.onMarker(base, finalThrough);
+        state.rejected.noteCovered(finalThrough);
+        ++stats_.markersWritten;
+        emitFrom_     = finalThrough;
+        lastMarkerNs_ = nowNs;
+        ++work;
+    }
+    if (emitFrom_ >= judgeCursor_) sawEmptyChange_ = false;
+    return work;
+}
+
+int VerdictSource::dropRetired_(PartitionWriteState& state) {
+    const std::size_t before = members_.size();
+    std::erase_if(members_, [&](const Member& m) { return m.retiring && state.markers.committedThrough() > m.leaveOffset; });
+    if (members_.size() == before) return 0;
+    reindex_();
+    recomputeCap_();
+    return static_cast<int>(before - members_.size());
+}
+
+int VerdictSource::requestChange(const ConstraintSet& next) {
+    if (state_ == nullptr || generation_ == 0 || needsActivation_) return kChangeDeferred;
+    if (next.sameMembers(state_->constraintSets.latest())) return kChangeUnchanged;
+    ConstraintSet logged = next;
+    logged.id = state_->constraintSets.latest().id + 1;
+    std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
+    for (uint8_t i = 0; i < logged.count; ++i)
+        wire[i] = cr::ChangeMember{logged.members[i].viewObjectId, static_cast<uint8_t>(logged.members[i].kind), logged.members[i].planFingerprint};
+    const std::size_t n = cr::buildConstraintSetChange(scratch_, logged.id, std::span<const cr::ChangeMember>(wire.data(), logged.count));
+    const std::span<const uint8_t> batch(scratch_.data(), n);
+    int64_t base;
+    if (replica_ != nullptr) {
+        base = replica_->appendControlBatch(batch, false);
+    } else {
+        base = std::max(testNextOffset_, judgeCursor_);
+        testNextOffset_ = base + 1;
+        appended_.emplace_back(batch.begin(), batch.end());
+    }
+    if (base < 0) return kChangeDeferred;
+    state_->constraintSets.onChange(base, logged);
+    return static_cast<int>(base);
+}
+
+void verdictFeedBegin(void* state, int64_t, int64_t target) noexcept {
+    auto& s = *static_cast<PartitionWriteState*>(state);
+    s.constraintSets.truncateFrom(target);
+    s.markers.truncateFrom(target);
+    s.rejected.truncateFrom(target);
+}
+
+void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int64_t base) noexcept {
+    auto& s = *static_cast<PartitionWriteState*>(state);
+    const int type = cr::recordType(b, len);
+    if (type == cr::kVerdictMarker) {
+        const auto h = cr::parseMarkerHeader(b, len);
+        if (!h) return;
+        if (s.rejected.capacity() == 0) s.rejected.reserve(kIndexReserve);
+        std::vector<rune::storage::RejectedOffsetIndex::Entry> entries;
+        entries.reserve(h->count);
+        (void)cr::forEachMarkerEntry(b, len, [&](int64_t off, uint16_t code, uint32_t cid) { entries.push_back({off, code, cid}); });
+        s.rejected.onMarker(h->fromOffset, h->finalThrough, entries);
+        (void)s.markers.onMarker(base, h->finalThrough);
+    } else if (type == cr::kConstraintSetChange) {
+        std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
+        uint32_t id = 0;
+        uint16_t count = 0;
+        if (!cr::parseConstraintSetChange(b, len, id, wire, count)) return;
+        ConstraintSet set;
+        set.id = id;
+        set.count = static_cast<uint8_t>(count);
+        for (uint16_t i = 0; i < count; ++i)
+            set.members[i] = ConstraintSetMember{wire[i].viewObjectId, static_cast<rune::view::VerdictViewKind>(wire[i].kind), wire[i].planFingerprint};
+        s.constraintSets.onChange(base, set);
+    }
+}
+
+void verdictOnHw(PartitionWriteState& state, int64_t hw) noexcept {
+    state.markers.onHw(hw);
+    state.rejected.setWatermark(state.markers.committedThrough());
+}
+
+}  // namespace rune::node
