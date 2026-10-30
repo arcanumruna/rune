@@ -175,6 +175,19 @@ TEST(CheckedWritesVerdictWorkerRegression, RetentionNeverDeletesTheLatestSetChan
     EXPECT_TRUE(sawAccepted);
 }
 
+TEST(CheckedWritesVerdictWorkerRegression, CleanerVerdictBoundStartsClosedRegression) {
+    VerdictRig r;
+    EXPECT_EQ(r.replica->cleanerVerdictBound(), 0) << "a user partition is cleaned nothing until its worker says so";
+    r.typed();
+    r.passes(50);
+    EXPECT_EQ(r.replica->cleanerVerdictBound(), rune::replication::PartitionReplica::kNoCleanerLso) << "a Ready partition with no constraint set is uncapped";
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 9}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    EXPECT_NE(r.replica->cleanerVerdictBound(), rune::replication::PartitionReplica::kNoCleanerLso);
+}
+
 TEST(CheckedWritesVerdictWorker, DemotePromoteKeepsOwnVerdicts) {
     VerdictRig r;
     r.typed();

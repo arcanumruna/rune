@@ -186,6 +186,7 @@ TEST(CompactionCleanerAgent, CompactionRunsOffDutyThread) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
 
     for (int v = 0; v < 200; ++v) {
@@ -273,6 +274,7 @@ TEST(CompactionCleanerAgent, ConvergesToOnePerKeyAtDefaultDirtyRatio) {
         cfg, Role::Leader, /*epoch=*/1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
 
     const int kKeys = 4, kRecords = 200;
@@ -359,6 +361,7 @@ TEST(CompactionCleanerAgent, ConvergesUnderInterleavedProduceAndClean) {
         cfg, Role::Leader, /*epoch=*/1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
 
     rune::node::ReplicaRegistry registry;
@@ -493,18 +496,21 @@ TEST(CompactionCleanerAgent, FilthiestLogSelectedFirst) {
     auto repA = std::make_unique<PartitionReplica>(
         cfgA, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &logA, &transport);
     repA->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    repA->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     repA->becomeLeader(1, {1});
     repA->onLeaderLogAppended();
 
     auto repB = std::make_unique<PartitionReplica>(
         cfgB, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &logB, &transport);
     repB->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    repB->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     repB->becomeLeader(1, {1});
     repB->onLeaderLogAppended();
 
     auto repC = std::make_unique<PartitionReplica>(
         cfgC, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &logC, &transport);
     repC->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    repC->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     repC->becomeLeader(1, {1});
     repC->onLeaderLogAppended();
 
@@ -657,6 +663,7 @@ TEST(CompactionCleanerAgent, PerCycleBudgetBoundsWork) {
                 std::vector<NodeId>{1}, std::vector<NodeId>{1},
                 &log, &transport);
             replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+            replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
             replica->becomeLeader(1, {1});
             replica->onLeaderLogAppended();
 
@@ -753,6 +760,7 @@ TEST(CompactionCleanerAgent, AppendP99UnperturbedByCompaction) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
 
     // Fill log with many dirty segments for the cleaner to work on.
@@ -827,6 +835,7 @@ TEST(CompactionCleanerAgent, SwapSafeUnderRoleChangeAndTruncation) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
 
     // Write records to create multiple sealed segments.
@@ -1006,6 +1015,7 @@ TEST(CompactionCleanerAgent, FollowerProducesZeroCompaction) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
 
     // Write enough records to create multiple sealed segments.
@@ -1143,6 +1153,7 @@ TEST(CompactionCleanerAgent, SwapRingFullDoesNotLoseCompaction) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
 
     for (int v = 0; v < 200; ++v) {
@@ -1260,6 +1271,7 @@ TEST(CompactionCleanerAgent, CheckpointResumesAcrossAgentRestart) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
 
     // DISTINCT keys (one per record): this test targets WATERMARK/CHECKPOINT
@@ -1480,6 +1492,7 @@ TEST(CompactionCleanerAgent, BoundedRangePerPassIncremental) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
     replica->onLeaderLogAppended();
 
@@ -1632,6 +1645,7 @@ TEST(CompactionCleanerAgent, DedupeMapBoundedByBudgetEndToEnd) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
     replica->onLeaderLogAppended();
 
@@ -1878,6 +1892,7 @@ TEST(CompactionCleanerAgent, CoalescingEndToEndFewSegments) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
     replica->onLeaderLogAppended();
     ASSERT_GT(replica->highWatermark(), 0);
@@ -2288,6 +2303,7 @@ TEST(CompactionCleanerAgent, MinCompactionLagHoldsRecentSegments) {
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             &log, &transport);
         replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+        replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
         replica->becomeLeader(1, {1});
         replica->onLeaderLogAppended();
 
@@ -2335,6 +2351,7 @@ TEST(CompactionCleanerAgent, MinCompactionLagHoldsRecentSegments) {
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             &log, &transport);
         replica2->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+        replica2->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
         replica2->becomeLeader(1, {1});
         replica2->onLeaderLogAppended();
 
@@ -2394,6 +2411,7 @@ TEST(CompactionCleanerAgent, MaxCompactionLagForcesLowDirtyLog) {
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             &log, &transport);
         replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+        replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
         replica->becomeLeader(1, {1});
         replica->onLeaderLogAppended();
         replica->setLastCleanOffset(co);
@@ -2436,6 +2454,7 @@ TEST(CompactionCleanerAgent, MaxCompactionLagForcesLowDirtyLog) {
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             &log, &transport);
         replica2->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+        replica2->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
         replica2->becomeLeader(1, {1});
         replica2->onLeaderLogAppended();
         replica2->setLastCleanOffset(co2);
@@ -2536,6 +2555,7 @@ TEST(CompactionCleanerAgent, CompactionConvergesWithSingleSegmentGroups) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
     replica->onLeaderLogAppended();
     ASSERT_GT(replica->highWatermark(), 0);
@@ -2643,6 +2663,7 @@ TEST(LogCleanerAgentLsoRegression, CleanableRangeCappedAtPublishedLso) {
         cfg, Role::Leader, /*epoch=*/1,
         std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
     replicaOwned->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replicaOwned->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replicaOwned->becomeLeader(1, {1});
     constexpr int kRecords = 200;
     constexpr int64_t kLso = 50;
@@ -2652,6 +2673,7 @@ TEST(LogCleanerAgentLsoRegression, CleanableRangeCappedAtPublishedLso) {
     ASSERT_GE(log.segmentBaseOffsets().size(), 4u) << "precondition: several sealed segments";
     PartitionReplica* replica = replicaOwned.get();
     replica->publishCleanerLso(kLso);   // an open txn starts at 50 (published by its worker)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
 
     rune::node::ReplicaRegistry registry;
     registry.add(690, 0, std::move(replicaOwned));
@@ -2681,6 +2703,7 @@ TEST(LogCleanerAgentLsoRegression, CleanableRangeCappedAtPublishedLso) {
 
     // The transaction resolves: the LSO lifts → the cleaner converges past it.
     replica->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     // Fix round 3: the owner installs ONE compaction output per duty pass (O(1)
     // each), so a pass with many single-segment outputs takes many duty passes
     // — drive until the range above the LSO is cleaned (bounded, no sleeps).
@@ -2740,6 +2763,7 @@ TEST(LogCleanerAgentMarkerRemovalRegression, MarkerKeptWhileAnAssignedReplicaLag
     auto owned = std::make_unique<PartitionReplica>(
         cfg, Role::Leader, /*epoch=*/1, std::vector<NodeId>{1, 2}, std::vector<NodeId>{1}, &log, &transport);
     owned->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    owned->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     owned->becomeLeader(1, {1});
     PartitionReplica* replica = owned.get();
     constexpr int64_t P = 9;
@@ -2751,6 +2775,7 @@ TEST(LogCleanerAgentMarkerRemovalRegression, MarkerKeptWhileAnAssignedReplicaLag
     for (; next < 8; ++next) log.append(cp6Batch(next, "pad", "p"), next);
     replica->onLeaderLogAppended();
     replica->publishCleanerLso(PartitionReplica::kNoCleanerLso);   // no worker in this rig: no open txn
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     // Replica 2 (assigned, NOT in the ISR) fetched up to 1: it has @0, not the marker @1.
     (void)replica->onFetchRequest(rune::replication::FetchRequestMsg{1, 0, 2, 1, 1 << 20, 691}, 1'000'000);
 
@@ -3002,6 +3027,7 @@ TEST(LogCleanerAgentMarkerRemovalRegression, ProbeFromDivergentReplicaNeverRelea
     for (; next < 8; ++next) log.append(cp6Batch(next, "pad", "p"), next);
     replica->onLeaderLogAppended();
     replica->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     rune::node::ReplicaRegistry registry;
     registry.add(697, 0, std::move(owned));
     Cp6MinimalConsensusAgent dummy;
@@ -3047,6 +3073,7 @@ TEST(CompactionCleanerAgentRegression, NeverCompactsAboveRecoveryPoint) {
     auto replica = std::make_unique<PartitionReplica>(
         cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // F22: no Worker RcState in this rig (D3b LSO cap)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica->becomeLeader(1, {1});
     int64_t off = 0;
     while (log.segmentBaseOffsets().size() < 4) {
@@ -3135,6 +3162,7 @@ TEST(CompactionCleanerAgentRegression, StaleSwapAfterTruncateBelowHwLeavesOrigin
             makeCompactConfig(780), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1},
             &log, &transport);
         owned->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+        owned->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
         owned->becomeLeader(1, {1});
         owned->onLeaderLogAppended();
         PartitionReplica* replica = owned.get();
@@ -3235,6 +3263,7 @@ static void passAfterOwnerAcceptBeforeRenames(bool injectFailure) {
     auto owned = std::make_unique<PartitionReplica>(
         makeCompactConfig(782), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
     owned->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    owned->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     owned->becomeLeader(1, {1});
     owned->onLeaderLogAppended();
     PartitionReplica* replica = owned.get();
@@ -3405,6 +3434,7 @@ TEST(CompactionCleanerAgentRegression, TruncateOfOtherLogCompletesDuringThrottle
     auto ownedA = std::make_unique<PartitionReplica>(
         makeCompactConfig(784), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &logA, &transport);
     ownedA->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    ownedA->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     ownedA->becomeLeader(1, {1});
     ownedA->onLeaderLogAppended();
     // Log B: a follower whose divergence truncation is pending on posted renames.

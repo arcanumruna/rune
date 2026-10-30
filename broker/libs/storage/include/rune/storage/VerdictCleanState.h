@@ -47,10 +47,11 @@ public:
     /// fetch position over every assigned replica).
     void finish(int64_t toOffset, int64_t publishedBound, int64_t markerRemovalBound) {
         (void)toOffset;
-        bool everNonEmpty = false, active = false;
+        bool everNonEmpty = false, active = false, sawChange = false, sawMarker = false;
         int64_t lastEmptyAt = -1, cover = 0;
         for (const Event& e : events_) {
             if (!e.marker) {
+                sawChange = true;
                 const bool nonEmpty = e.a != 0;
                 if (nonEmpty && !active) {
                     if (!everNonEmpty || cover > lastEmptyAt) cover = std::max(cover, e.at + 1);
@@ -61,10 +62,12 @@ public:
                     lastEmptyAt = e.at;
                 }
             } else {
+                sawMarker = true;
                 cover = std::max(cover, e.b);
             }
         }
-        const int64_t own = !everNonEmpty ? kNone : (!active && cover > lastEmptyAt) ? kNone : cover;
+        // Markers without a change record: the change was lost, so the verdicts owed are unknown - cap at what the markers cover.
+        const int64_t own = !sawChange && sawMarker ? cover : !everNonEmpty ? kNone : (!active && cover > lastEmptyAt) ? kNone : cover;
         cleanLimit_ = std::min(own, publishedBound);
         for (std::size_t i = 0; i + 1 < markers_.size(); ++i) {
             const Marker& m = markers_[i];

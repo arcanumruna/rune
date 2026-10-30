@@ -7179,13 +7179,15 @@ private:
     void publishVerdictCleanerBounds_() noexcept {
         for (auto& sl : rcSlots_) {
             if (sl.write && sl.write->growOwed) [[unlikely]] growVerdictIndex_(*sl.write);
-            if (!sl.write || sl.write->constraintSets.size() == 0 || !sl.replica->isDiskBacked()) continue;
-            const PartitionWriteState& w = *sl.write;
-            if (sl.replica->role() != rune::replication::Role::Leader || !sl.rc->ready()) continue;
-            const int64_t W = w.markers.committedThrough();
-            const int64_t bound = w.constraintSets.latest().empty() && W > w.constraintSets.lastChangeOffset()
-                                      ? rune::replication::PartitionReplica::kNoCleanerLso : W;
-            const int64_t end = w.markers.committedMarkerEnd();
+            if (!sl.replica->isDiskBacked() || !sl.rc->ready()) continue;
+            int64_t bound = rune::replication::PartitionReplica::kNoCleanerLso, end = std::max<int64_t>(sl.verdictEndPublished, 0);
+            if (sl.write && sl.write->constraintSets.size() != 0 && sl.replica->role() == rune::replication::Role::Leader) {
+                const PartitionWriteState& w = *sl.write;
+                const int64_t W = w.markers.committedThrough();
+                bound = w.constraintSets.latest().empty() && W > w.constraintSets.lastChangeOffset()
+                            ? rune::replication::PartitionReplica::kNoCleanerLso : W;
+                end = w.markers.committedMarkerEnd();
+            }
             if (bound == sl.verdictBoundPublished && end == sl.verdictEndPublished) continue;
             sl.replica->publishCleanerVerdictMarkerEnd(end);
             sl.replica->publishCleanerVerdictBound(bound);

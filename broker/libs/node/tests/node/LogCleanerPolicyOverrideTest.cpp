@@ -223,6 +223,7 @@ TEST(LogCleanerPolicyOverrideRegression, DroppedLogsCheckpointIsForgottenOnTheVi
     cfg.deleteRetentionMs = 86'400'000LL;
     PartitionReplica replica(cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
     replica.publishCleanerLso(PartitionReplica::kNoCleanerLso);
+    replica.publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     replica.becomeLeader(1, {1});
     for (int v = 0; v < 200; ++v) {
         rune::protocol::RecordBatchBuilder b(v, 1000);

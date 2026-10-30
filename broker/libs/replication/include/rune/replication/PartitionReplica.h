@@ -886,7 +886,8 @@ public:
     // Checked writes Part 04: W, the committed verdict watermark of a verdict source, and the end of the committed marker that
     // carries it.  The cleaner never cleans at or above W (it cannot yet drop a record whose verdict is not durable).  The marker end
     // is stored first (release) and read after the bound (acquire), so a reader that sees a bound sees a marker end at least as new.
-    // kNoCleanerLso = not a verdict source (no cap).
+    // A partition with read_committed state (topicId >= 0) starts at 0 = clean nothing, like the LSO: the worker publishes
+    // kNoCleanerLso once its state is Ready and the partition is not a verdict source (no cap).
     void publishCleanerVerdictMarkerEnd(Offset end) noexcept { publishedVerdictMarkerEnd_.store(end, std::memory_order_release); }
     void publishCleanerVerdictBound(Offset bound) noexcept { publishedVerdictBound_.store(bound, std::memory_order_release); }
     [[nodiscard]] Offset cleanerVerdictBound() const noexcept { return publishedVerdictBound_.load(std::memory_order_acquire); }
@@ -2115,7 +2116,7 @@ private:
     std::atomic<int>    publishedIsrSizeForGateway_{0};
     // D3b: first unstable offset (LSO) for the cleaner — see publishCleanerLso().
     std::atomic<Offset> publishedLsoForCleaner_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
-    std::atomic<Offset> publishedVerdictBound_{kNoCleanerLso};
+    std::atomic<Offset> publishedVerdictBound_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
     Offset retentionHold_ = std::numeric_limits<Offset>::max();   // owner thread only
     std::atomic<Offset> publishedVerdictMarkerEnd_{0};
     // D3b fix round 1: min fetch position over every assigned replica — see

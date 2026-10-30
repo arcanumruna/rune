@@ -125,6 +125,23 @@ TEST(CheckedWritesVerdictCleaner, CoverageRules) {
     s.onConstraintSetChange(40, false);
     s.finish(100, kMax, kMax);
     EXPECT_EQ(s.cleanLimit(), kMax) << "an emptied set whose cover reached past the change: no verdict owed";
+    s.clear();
+    s.onConstraintSetChange(4, true);
+    s.onVerdictMarker(10, 5, 41, {});
+    s.onConstraintSetChange(40, false);
+    s.onConstraintSetChange(50, true);
+    s.finish(100, kMax, kMax);
+    EXPECT_EQ(s.cleanLimit(), 51) << "re-activated at 50: the verdicts owed start again, cover just past the new change";
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, MissingChangeRecordNeverUncapsRegression) {
+    VerdictCleanState s;
+    s.onVerdictMarker(10, 5, 30, {});
+    s.finish(100, kMax, kMax);
+    EXPECT_EQ(s.cleanLimit(), 30) << "markers without any change record: capped at what they cover, never uncapped";
+    s.clear();
+    s.finish(100, kMax, kMax);
+    EXPECT_EQ(s.cleanLimit(), kMax) << "neither a change nor a marker: not a verdict source";
 }
 
 TEST(CheckedWritesVerdictCleaner, StaleBoundOnlyCleansLess) {
@@ -217,6 +234,8 @@ TEST(CheckedWritesVerdictCleaner, MarkerAboveToOffsetIsReadUpToMarkerEnd) {
             SkimpyOffsetMap map(1024);
             cleaner.buildOffsetMapFromBases(log.dir(), bases, 0, /*toOffset=*/10, map);   // the map filled below the marker
             EXPECT_EQ(map.verdictState().isRejected(7), markerEnd == 16) << "markerEnd " << markerEnd;
+            if (markerEnd == 10) EXPECT_LT(map.verdictState().cleanLimit(), 8) << "the marker was not read: offset 7 has no verdict yet";
+            else EXPECT_GE(map.verdictState().cleanLimit(), 8) << "the marker covers offset 7";
         }
     }
     std::filesystem::remove_all(dir);
