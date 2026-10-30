@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <thread>
 
 using namespace std::chrono_literals;
@@ -523,8 +525,8 @@ struct Sender {
     }
 
     /// The token of the queued send of record `id`.
-    uint64_t send(uint64_t id) {
-        const std::string v = idValue(id);
+    uint64_t send(uint64_t id) { return sendValue(id, idValue(id)); }
+    uint64_t sendValue(uint64_t id, const std::string& v) {
         const uint64_t tok  = next++;
         rc::SendResult r = rc::SendResult::BackPressured;
         while (r == rc::SendResult::BackPressured)
@@ -838,4 +840,309 @@ TEST(CheckedWritesBrokerRegression, PlainWritersOnAVerdictSourceKeepTodaysAcksSh
             EXPECT_TRUE(isOk(s.await(tok, 15s))) << "acks " << static_cast<int>(acks) << " record " << id << ": no verdict reaches a writer that did not ask";
         }
     }
+}
+
+// ===========================================================================================================
+// Part 04: verdict sources on three real brokers.  TestReject (tag 9, object 7) is installed on every node's worker.
+// ===========================================================================================================
+namespace {
+
+/// The {id, v, tag} projection `vt_v` over the verdict source.
+std::vector<uint8_t> vtViewPlan(int32_t srcTopicId) {
+    namespace rv = rune::view;
+    rv::ViewPlan p;
+    p.viewName = "vt_v";
+    p.key      = "id";
+    p.sources.push_back(rv::SourceSpec{srcTopicId, "id"});
+    p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::UInt64, 0, "id", rv::MergeRule::Replace});
+    p.output.push_back(rv::AuthoredField{"v", rune::codec::PrimType::Int64, 0, "v", rv::MergeRule::Replace});
+    p.output.push_back(rv::AuthoredField{"tag", rune::codec::PrimType::UInt16, 0, "tag", rv::MergeRule::Replace});
+    return rv::serializeAuthored(p);
+}
+
+/// TagEquals{9} (object 7) on the worker that serves the partition of `node`, once it serves it.
+void installTagReject(BrokerNode& node, int32_t topicId) {
+    const int32_t w = rune::metadata::ShardRouter(node.workerCountForTest()).workerForPartition(topicId, 0);
+    bool serves = false;
+    for (int i = 0; i < 1200 && !serves; ++i) {
+        serves = node.onWorkerThreadForTest(w, [topicId](Worker& wk) {
+            return wk.clusterFeatureLevelForTest() >= rune::replication::MetadataFeature::kCheckedWrites && wk.writeStateForTest(topicId, 0) != nullptr;
+        });
+        if (!serves) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(serves) << "the node never served the source";
+    node.onWorkerThreadForTest(w, [topicId](Worker& wk) {
+        const auto desc = cw::verdictSourceDescriptor();
+        rune::view::ViewPlan v;
+        v.viewName = "vt_rej"; v.key = "id"; v.sources = {{topicId, "id"}};
+        v.output = {{"id", rune::codec::PrimType::UInt64, 0, "id", rune::view::MergeRule::Replace}};
+        v.persistence = 1;
+        const rune::codec::Descriptor* srcs[] = {&desc};
+        auto comp = rune::view::compileView(v, srcs, 0x40000701);
+        EXPECT_TRUE(comp.has_value());
+        TestRejectRule rule;
+        rule.mode = TestRejectRule::Mode::TagEquals;
+        rule.tag = 9;
+        wk.viewSet()->installTestVerdictViewForTest(comp->plan, comp->rowLayout, desc, false, 7, rule);
+        return 0;
+    });
+}
+
+/// The leader's judge has logged the constraint set: records written from now on are judged.
+void awaitSetLogged(BrokerNode& node, int32_t topicId) {
+    const int32_t w = rune::metadata::ShardRouter(node.workerCountForTest()).workerForPartition(topicId, 0);
+    bool logged = false;
+    for (int i = 0; i < 1200 && !logged; ++i) {
+        logged = node.onWorkerThreadForTest(w, [topicId](Worker& wk) {
+            const PartitionWriteState* ws = wk.writeStateForTest(topicId, 0);
+            return ws != nullptr && ws->constraintSets.latest().count != 0;
+        });
+        if (!logged) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(logged) << "the TestReject set change was never logged";
+}
+
+struct NodeVerdicts {
+    std::set<int64_t> indexed, rejectedInLog;
+    int64_t covered = 0, dataEnd = 0;
+    uint64_t mismatches = 0;
+};
+/// What node `node` holds: its index (worker thread) and the tag-9 records of its committed log (owner thread).
+NodeVerdicts verdictsOf(BrokerNode& node, int32_t topicId) {
+    NodeVerdicts out;
+    const int32_t w = rune::metadata::ShardRouter(node.workerCountForTest()).workerForPartition(topicId, 0);
+    node.onOwnerThreadForTest(topicId, 0, [&out](rune::replication::PartitionReplica& r) {
+        const auto log = cw::readLogOf(*r.log(), r.highWatermark());
+        for (const auto& d : log.data) {
+            out.dataEnd = std::max(out.dataEnd, d.offset + 1);
+            if (!d.del && d.tag == 9) out.rejectedInLog.insert(d.offset);
+        }
+        return 0;
+    });
+    node.onWorkerThreadForTest(w, [&out, topicId](Worker& wk) {
+        if (const PartitionWriteState* ws = wk.writeStateForTest(topicId, 0)) {
+            ws->rejected.forEachIn(0, INT64_MAX, [&](const rune::storage::RejectedOffsetIndex::Entry& e) { out.indexed.insert(e.offset); });
+            out.covered = ws->rejected.coveredThrough();
+            out.mismatches = ws->rejected.mismatches();
+        }
+        return 0;
+    });
+    return out;
+}
+
+/// The leader's index, once it covers the whole committed log.
+NodeVerdicts awaitIndex(BrokerNode& node, int32_t topicId) {
+    NodeVerdicts v;
+    for (int i = 0; i < 1200; ++i) {
+        v = verdictsOf(node, topicId);
+        if (v.dataEnd != 0 && v.covered >= v.dataEnd) break;
+        std::this_thread::sleep_for(50ms);
+    }
+    return v;
+}
+
+/// The view row of `id` as (v, tag); nullopt = absent.  Retries only what a moving leader or a building view answers.
+std::optional<std::pair<int64_t, uint16_t>> vtRow(rc::Client& reader, int32_t viewTopicId, uint64_t id, bool* answered) {
+    rc::ViewRowResult row;
+    *answered = false;
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(100ms)) {
+        try { row = reader.getViewRowAndWait(viewTopicId, id, 0, 10s); } catch (const std::exception&) { continue; }
+        if (row.status == rc::ViewRowResult::kOk || row.status == rc::ViewRowResult::kAbsentKey) { *answered = true; break; }
+    }
+    if (row.status != rc::ViewRowResult::kOk) return std::nullopt;
+    int64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<int64_t>(row.rowBytes[9 + static_cast<std::size_t>(i)]) << (8 * i);   // [bitmap][id][v][tag]
+    return std::make_pair(v, static_cast<uint16_t>(row.rowBytes[17] | (row.rowBytes[18] << 8)));
+}
+
+/// Offsets a subscription from 0 delivers: until `atLeast` arrived, plus 500 ms for a rejected record that would follow.
+std::set<int64_t> deliveredFromZero(rc::ClientConfig cfg, int32_t topicId, std::size_t atLeast) {
+    cfg.topics.push_back(rc::TopicSpec{"vt", topicId, 1});
+    rc::Client client(cfg);
+    client.connectAndWait(30s);
+    std::mutex mu;
+    std::set<int64_t> got;
+    rc::SubscribeOptions o;
+    o.from = rc::From::earliest();
+    rc::Subscription sub = client.subscribe(client.topic("vt"), 0, o, [&](const rc::Record& r) {
+        std::lock_guard<std::mutex> g(mu);
+        got.insert(r.offset);
+    });
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(50ms)) {
+        std::lock_guard<std::mutex> g(mu);
+        if (got.size() >= atLeast) break;
+    }
+    std::this_thread::sleep_for(500ms);
+    sub.unsubscribe();
+    std::set<int64_t> out;
+    {
+        std::lock_guard<std::mutex> g(mu);
+        out = got;
+    }
+    client.close();
+    return out;
+}
+
+constexpr uint16_t kConstraintViolation = static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation);
+
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    ThreeNodes c = ThreeNodes::start("cw04");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t ctl = awaitController(c);
+    ASSERT_GT(ctl, 0);
+    auto admin = connectClient(c, ctl);
+    rc::TopicOptions to;
+    to.replicationFactor = 3;
+    const auto src = admin->defineTopicAndWait("vt", 1, "id", rune::codec::serialize(cw::verdictSourceDescriptor()), rc::Persistence::Disk, to, {}, 60s);
+    ASSERT_EQ(src.errorCode, 0) << src.detail;
+    const auto view = admin->createViewAndWait("vt_v", "id", 0, vtViewPlan(src.topicId), {}, 60s);
+    ASSERT_EQ(view.errorCode, 0) << view.detail;
+    admin->close();
+    admin.reset();
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 30s));
+    const int32_t victim = leaders[0];
+    for (const int id : c.runningNodes()) {
+        installTagReject(c.node(id), src.topicId);
+        ASSERT_FALSE(HasFatalFailure());
+    }
+    awaitSetLogged(c.node(victim), src.topicId);
+    ASSERT_FALSE(HasFatalFailure());
+    int32_t seed = 0;
+    for (int id : c.runningNodes()) if (id != victim) { seed = id; break; }
+
+    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    cfg.connectTimeoutMs = 30'000;
+    cfg.pingTimeoutMs    = 30'000;
+    Sender s(cfg, "vt", src.topicId, 1, kAllView);
+    constexpr int kTotal = 200;
+    const auto tagOf = [](int i) -> uint16_t { return i % 10 == 9 ? 9 : 1; };
+    std::vector<uint64_t> tokens;
+    std::thread killer;
+    for (int i = 0; i < kTotal; ++i) {
+        if (i == kTotal / 2) killer = std::thread([&c, victim] { c.crash(victim); });
+        tokens.push_back(s.sendValue(static_cast<uint64_t>(i), verdictValue(static_cast<uint64_t>(i), i, tagOf(i))));
+    }
+    killer.join();
+    for (int i = 0; i < kTotal; ++i) {
+        const auto d = s.await(tokens[static_cast<std::size_t>(i)], 60s);
+        ASSERT_TRUE(d.has_value()) << "record " << i << " never completed";
+        if (tagOf(i) == 9) {
+            EXPECT_EQ(d->status, rc::OpStatus::BrokerError) << "record " << i;
+            EXPECT_EQ(d->errorCode, kConstraintViolation) << "record " << i;
+            EXPECT_EQ(rc::constraintIdOf(*d), rune::view::constraintIdOf(7, 1)) << "record " << i;
+        } else {
+            EXPECT_EQ(d->status, rc::OpStatus::Ok) << "record " << i;
+        }
+    }
+
+    // Every node that takes the lead holds the same verdicts: the victim comes back and the leader is crashed in turn.
+    for (int round = 0; round < 2; ++round) {
+        ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 60s));
+        const int32_t leader = leaders[0];
+        const NodeVerdicts v = awaitIndex(c.node(leader), src.topicId);
+        EXPECT_FALSE(v.rejectedInLog.empty());
+        EXPECT_EQ(v.indexed, v.rejectedInLog) << "round " << round << ": node " << leader << " leads with another set of rejected offsets";
+        EXPECT_EQ(v.mismatches, 0u);
+        if (round == 0) {
+            c.startNode(victim);
+            installTagReject(c.node(victim), src.topicId);
+            ASSERT_FALSE(HasFatalFailure());
+            c.crash(leader);
+        }
+    }
+
+    // vt_v on the final leader is the accepted set: every id with tag 1 is a row, every tag-9 id is absent.
+    ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 60s));
+    rc::ClientConfig rcfg = clientConfigFor(c, leaders[0]);
+    rcfg.connectTimeoutMs = 30'000;
+    rcfg.pingTimeoutMs    = 30'000;
+    auto reader = connectClient(c, rcfg);
+    for (int i = 0; i < kTotal; ++i) {
+        bool answered = false;
+        const auto row = vtRow(*reader, view.viewTopicId, static_cast<uint64_t>(i), &answered);
+        ASSERT_TRUE(answered) << "row " << i;
+        if (tagOf(i) == 9) EXPECT_FALSE(row.has_value()) << "id " << i << " was rejected";
+        else EXPECT_TRUE(row.has_value() && row->first == i && row->second == 1) << "id " << i;
+    }
+    reader->close();
+}
+
+TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    ThreeNodes c = ThreeNodes::start("cw04r");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t ctl = awaitController(c);
+    ASSERT_GT(ctl, 0);
+    auto admin = connectClient(c, ctl);
+    rc::TopicOptions to;
+    to.replicationFactor = 3;
+    const auto src = admin->defineTopicAndWait("vt", 1, "id", rune::codec::serialize(cw::verdictSourceDescriptor()), rc::Persistence::Disk, to, {}, 60s);
+    ASSERT_EQ(src.errorCode, 0) << src.detail;
+    const auto view = admin->createViewAndWait("vt_v", "id", 0, vtViewPlan(src.topicId), {}, 60s);
+    ASSERT_EQ(view.errorCode, 0) << view.detail;
+    admin->close();
+    admin.reset();
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 30s));
+    for (const int id : c.runningNodes()) {
+        installTagReject(c.node(id), src.topicId);
+        ASSERT_FALSE(HasFatalFailure());
+    }
+    awaitSetLogged(c.node(leaders[0]), src.topicId);
+    ASSERT_FALSE(HasFatalFailure());
+
+    constexpr int kTotal = 60;
+    const auto tagOf = [](int i) -> uint16_t { return i % 10 == 9 ? 9 : 1; };
+    {
+        rc::ClientConfig cfg = clientConfigFor(c, 1);
+        cfg.connectTimeoutMs = 30'000;
+        cfg.pingTimeoutMs    = 30'000;
+        Sender s(cfg, "vt", src.topicId, 1, kAllView);
+        std::vector<uint64_t> tokens;
+        for (int i = 0; i < kTotal; ++i) tokens.push_back(s.sendValue(static_cast<uint64_t>(i), verdictValue(static_cast<uint64_t>(i), i, tagOf(i))));
+        for (int i = 0; i < kTotal; ++i) {
+            const auto d = s.await(tokens[static_cast<std::size_t>(i)], 60s);
+            ASSERT_TRUE(d.has_value()) << "record " << i;
+            EXPECT_EQ(d->status == rc::OpStatus::Ok, tagOf(i) != 9) << "record " << i;
+        }
+    }
+    ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 30s));
+    const NodeVerdicts before = awaitIndex(c.node(leaders[0]), src.topicId);
+    ASSERT_FALSE(before.rejectedInLog.empty());
+    ASSERT_EQ(before.indexed, before.rejectedInLog);
+
+    // Every node restarts; TestReject (a test-installed member) goes back on each.
+    for (int id = 3; id >= 1; --id) c.stop(id);
+    for (int id = 1; id <= 3; ++id) c.startNode(id);
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 60s));
+    for (const int id : c.runningNodes()) {
+        installTagReject(c.node(id), src.topicId);
+        ASSERT_FALSE(HasFatalFailure());
+    }
+    ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 60s));
+    const NodeVerdicts after = awaitIndex(c.node(leaders[0]), src.topicId);
+    EXPECT_EQ(after.indexed, before.rejectedInLog) << "the same offsets are rejected after the restart";
+    EXPECT_EQ(after.mismatches, 0u);
+
+    rc::ClientConfig rcfg = clientConfigFor(c, leaders[0]);
+    rcfg.connectTimeoutMs = 30'000;
+    rcfg.pingTimeoutMs    = 30'000;
+    const std::set<int64_t> delivered = deliveredFromZero(rcfg, src.topicId, static_cast<std::size_t>(kTotal) - before.rejectedInLog.size());
+    for (const int64_t off : before.rejectedInLog) EXPECT_EQ(delivered.count(off), 0u) << "rejected offset " << off << " reappeared for a consumer";
+    EXPECT_EQ(delivered.size(), static_cast<std::size_t>(kTotal) - before.rejectedInLog.size()) << "exactly the accepted records are delivered";
+
+    auto reader = connectClient(c, rcfg);
+    for (int i = 0; i < kTotal; ++i) {
+        bool answered = false;
+        const auto row = vtRow(*reader, view.viewTopicId, static_cast<uint64_t>(i), &answered);
+        ASSERT_TRUE(answered) << "row " << i;
+        if (tagOf(i) == 9) EXPECT_FALSE(row.has_value()) << "id " << i << " was rejected";
+        else EXPECT_TRUE(row.has_value() && row->first == i && row->second == 1) << "id " << i;
+    }
+    reader->close();
 }
