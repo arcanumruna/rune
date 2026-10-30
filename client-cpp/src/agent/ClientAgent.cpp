@@ -115,6 +115,7 @@ ClientAgent::ClientAgent(AgentConfig cfg)
 void ClientAgent::init() {
     mnDebug_ = std::getenv("RUNE_MN_DEBUG") != nullptr;
     produceAcks_.reserve(static_cast<std::size_t>(cfg_.egressPollLimit) * 4);
+    verdictBytes_.reserve(65536 * 8);
     // Seed the endpoint-keyed session collection with the seed session
     // (sessions_[0]).  Its IO adapter targets the transport default ingress
     // channel, so its control frames fast-path back to the default offer (the

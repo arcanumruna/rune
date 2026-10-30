@@ -155,25 +155,18 @@ TEST(ProducerVerdicts, VerdictArenaGrowsOnceAndIsCounted) {
         a.dispatchEgressFrameForTest(kNow, f.data(), f.size());
     };
     EXPECT_EQ(a.verdictArenaGrowths(), 0u);
-    deliver(1, 100);                       // the first trailer allocates
+    deliver(1, 100);                       // the arena is reserved for 65,536 verdicts: nothing allocates
     ASSERT_EQ(a.produceAcks().size(), 1u);
     EXPECT_EQ(a.verdictBytes(a.produceAcks()[0]).size(), 800u);
+    a.clearProduceAcks();
+    for (int64_t c = 2; c < 18; ++c) deliver(c, 4096);
+    ASSERT_EQ(a.produceAcks().size(), 16u);
+    EXPECT_EQ(a.verdictArenaGrowths(), 0u) << "a cycle of exactly the reserve";
+    deliver(18, 1);
+    EXPECT_EQ(a.verdictArenaGrowths(), 1u) << "only a cycle above the reserve grows it";
+    a.clearProduceAcks();
+    deliver(19, 1);
     EXPECT_EQ(a.verdictArenaGrowths(), 1u);
-    a.clearProduceAcks();
-    deliver(2, 60);                        // a cycle of the same total reuses the capacity
-    deliver(3, 40);
-    EXPECT_EQ(a.produceAcks().size(), 2u);
-    EXPECT_EQ(a.verdictArenaGrowths(), 1u);
-    a.clearProduceAcks();
-    deliver(4, 400);                       // only a larger cycle grows it again
-    EXPECT_EQ(a.verdictArenaGrowths(), 2u);
-    a.clearProduceAcks();
-    deliver(5, 400);
-    deliver(6, 1);
-    EXPECT_EQ(a.verdictArenaGrowths(), 3u) << "a cycle above the largest so far";
-    a.clearProduceAcks();
-    deliver(7, 401);
-    EXPECT_EQ(a.verdictArenaGrowths(), 3u);
 }
 
 TEST(ProducerVerdicts, ReplayedVerdictsCompleteEachRecordAsTheOriginal) {
