@@ -436,9 +436,14 @@ struct ModelRun {
     TransientViewModel model;
     uint64_t resets = 0, evicted = 0;       // what the model expects the instances to have counted, summed over their lives
     uint64_t gotResets = 0, gotEvicted = 0; // what the dead instances counted
+    uint64_t multiCutPasses = 0;   // passes that found more than one cut: coverage of what the skipped settles open up
     uint32_t incarnation = 1;
     uint64_t gen = 1;
-    bool live = false;   // the instances exist and track the ring: true after the first pass
+    // What the next pass will find, since the last one: the instances are new (no pass yet, or a restart), the ring was
+    // recreated, how many cuts it took and where the last one was.  `cursor` is the fold end of the last pass.
+    bool fresh = true, recreated = false;
+    int cuts = 0;
+    int64_t lastCut = 0, cursor = 0;
     std::vector<std::string> steps;
 
     /// A restart reconciles (and counts) once per view that recovered a checkpoint cursor.
@@ -458,10 +463,37 @@ struct ModelRun {
             gotEvicted += rig.counters(k).transientRecordsEvicted;
         }
     }
+    /// One pass over everything that happened since the last one: the model replays the ring from where the views re-fold
+    /// (the ring start after a restart or a recreation, or when more than one cut moved the generation), then the views run.
     void settle() {
+        const int64_t start = rig.logStart();
+        int64_t from = cursor;
+        if (fresh) {
+            resets += recoveringViews();
+            from = start;
+        } else if (recreated) {
+            resets += 3;
+            from = start;
+        } else {
+            if (cuts > 0) {
+                const int64_t cut = cuts == 1 ? lastCut : start;
+                if (cursor > cut) {
+                    resets += 3;
+                    from = std::max(cut, start);
+                    multiCutPasses += cuts > 1;
+                }
+            }
+            if (from < start) {
+                evicted += 3 * static_cast<uint64_t>(start - from);
+                from = start;
+            }
+        }
+        model.replay(rig.ringRecs(from));
+        cursor = rig.logEnd();
+        fresh = recreated = false;
+        cuts = 0;
         gen += 2;
         ASSERT_TRUE(rig.driveUntilCaughtUp(gen));
-        live = true;
     }
 };
 
@@ -483,6 +515,7 @@ void expectAllViewsEqualModel(const ModelRun& r) {
 
 // (e): the checkpoint of what is folded now is the whole table - a full restart with an empty ring changes nothing.
 void expectDurable(ModelRun& r) {
+    ASSERT_NO_FATAL_FAILURE(r.settle());
     std::array<std::vector<std::vector<uint8_t>>, 3> image;
     const std::array<Kind, 3> kinds{Kind::Replace, Kind::CountByGrp, Kind::MinByGrp};
     for (std::size_t i = 0; i < kinds.size(); ++i) image[i] = r.rig.tableImage(kinds[i]);
@@ -504,14 +537,15 @@ void expectDurable(ModelRun& r) {
     r.gen += 2;
     ASSERT_TRUE(r.rig.driveUntilCaughtUp(r.gen));
     r.resets += recovering;
-    r.live = true;
     r.model.replay(ring);
+    r.cursor = r.rig.logEnd();
     ASSERT_NO_FATAL_FAILURE(expectAllViewsEqualModel(r));
 }
 
 }  // namespace
 
 TEST(CheckedWritesTransientViewModelRegression, RandomHistoriesMatchThePerKeyModel) {
+    uint64_t multiCutPasses = 0, restartThenRecreate = 0;
     for (uint64_t seed = 1; seed <= 200; ++seed) {
         SCOPED_TRACE("seed " + std::to_string(seed));
         std::mt19937_64 rng(seed);
@@ -523,30 +557,24 @@ TEST(CheckedWritesTransientViewModelRegression, RandomHistoriesMatchThePerKeyMod
                 const std::vector<Rec> recs = randomRecs(rng, 1 + rng() % 3);
                 r.steps.push_back("write " + std::to_string(recs.size()));
                 r.rig.append(recs);
-                r.model.replay(recs);
-                ASSERT_NO_FATAL_FAILURE(r.settle());
             } else if (what == 4) {                             // full restart: a fresh ring, 0-2 records in it
                 const std::vector<Rec> fresh = randomRecs(rng, rng() % 3);
                 r.steps.push_back("full restart " + std::to_string(fresh.size()));
                 r.harvest();
-                r.resets += r.recoveringViews();
                 r.rig.newRing(0, ++r.incarnation);
                 r.rig.append(fresh);
                 r.rig.restart();
-                r.model.replay(fresh);
-                ASSERT_NO_FATAL_FAILURE(r.settle());
+                r.fresh = true;
             } else if (what == 5) {                             // node restart: the same lineage, 0-3 oldest evicted
                 const std::vector<Rec> ring = r.rig.ringRecs();
                 const std::size_t drop = std::min<std::size_t>(rng() % 4, ring.size());
                 r.steps.push_back("node restart evicting " + std::to_string(drop));
                 const int64_t start = r.rig.logStart() + static_cast<int64_t>(drop);
                 r.harvest();
-                r.resets += r.recoveringViews();
                 r.rig.newRing(start, ++r.incarnation);
                 r.rig.append(std::span<const Rec>(ring).subspan(drop));
                 r.rig.restart();
-                r.model.replay(std::span<const Rec>(ring).subspan(drop));
-                ASSERT_NO_FATAL_FAILURE(r.settle());
+                r.fresh = true;
             } else if (what == 6) {                             // failover: records written elsewhere, 0-3 of them evicted
                 const std::vector<Rec> gap = randomRecs(rng, rng() % 4);
                 const std::size_t drop = rng() % (gap.size() + 1);
@@ -554,30 +582,33 @@ TEST(CheckedWritesTransientViewModelRegression, RandomHistoriesMatchThePerKeyMod
                 const int64_t end = r.rig.logEnd();
                 r.rig.append(gap);
                 r.rig.evictTo(end + static_cast<int64_t>(drop));
-                r.model.replay(std::span<const Rec>(gap).subspan(drop));
-                if (r.live) r.evicted += 3 * drop;
-                ASSERT_NO_FATAL_FAILURE(r.settle());
             } else if (what == 7) {                             // the ring is recreated under the live views
                 const std::vector<Rec> fresh = randomRecs(rng, rng() % 3);
                 r.steps.push_back("ring recreated " + std::to_string(fresh.size()));
+                restartThenRecreate += r.fresh && r.recoveringViews() > 0;
                 r.rig.newRing(0, ++r.incarnation);
                 r.rig.append(fresh);
-                r.model.replay(fresh);
-                if (r.live) r.resets += 3;
-                ASSERT_NO_FATAL_FAILURE(r.settle());
+                r.recreated = true;
+                r.cuts = 0;
             } else if (what == 8) {                             // the ring is cut below the cursor (generation + 1)
                 const int64_t start = r.rig.logStart(), end = r.rig.logEnd();
                 const int64_t cut = start + static_cast<int64_t>(rng() % static_cast<uint64_t>(end - start + 1));
                 const std::vector<Rec> replacement = randomRecs(rng, rng() % 3);
                 r.steps.push_back("cut at " + std::to_string(cut) + " with " + std::to_string(replacement.size()));
                 r.rig.cutAt(cut, replacement);
-                r.model.replay(replacement);
-                if (r.live && cut < end) r.resets += 3;
-                ASSERT_NO_FATAL_FAILURE(r.settle());
+                ++r.cuts;
+                r.lastCut = cut;
             } else {
                 r.steps.push_back("durability probe");
                 ASSERT_NO_FATAL_FAILURE(expectDurable(r));
             }
+            // A step may leave the views unsettled: the next step then adds to what the one pass finds.  The views are
+            // compared with the model, and the counters checked, only after a pass.
+            if (what != 9 && step + 1 < 40 && rng() % 3 == 0) {
+                r.steps.back() += " (unsettled)";
+                continue;
+            }
+            ASSERT_NO_FATAL_FAILURE(r.settle());
             ASSERT_NO_FATAL_FAILURE(expectAllViewsEqualModel(r)) << "step " << step << ": " << r.steps.back();
             EXPECT_EQ(r.countedResets(), r.resets) << "step " << step << ": " << r.steps.back();
             if (::testing::Test::HasFailure()) {
@@ -589,11 +620,14 @@ TEST(CheckedWritesTransientViewModelRegression, RandomHistoriesMatchThePerKeyMod
         r.harvest();
         EXPECT_EQ(r.gotResets, r.resets) << "transientSourceResets summed over every instance";
         EXPECT_EQ(r.gotEvicted, r.evicted) << "transientRecordsEvicted summed over every instance";
+        multiCutPasses += r.multiCutPasses;
         if (::testing::Test::HasFailure()) {
             for (const std::string& s : r.steps) ADD_FAILURE() << s;
             return;
         }
     }
+    EXPECT_GT(multiCutPasses, 0u) << "no history moved the generation by more than one between two passes";
+    EXPECT_GT(restartThenRecreate, 0u) << "no history recreated the ring between a restart and its first pass";
 }
 
 // ---------------------------------------------------------------------------

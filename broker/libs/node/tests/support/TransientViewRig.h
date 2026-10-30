@@ -222,10 +222,10 @@ public:
         return it != image_.end() && !it->second.empty();
     }
 
-    /// The data records the ring holds, in offset order.
-    [[nodiscard]] std::vector<Rec> ringRecs() const {
+    /// The data records the ring holds at or above `from`, in offset order.
+    [[nodiscard]] std::vector<Rec> ringRecs(int64_t from = 0) const {
         std::vector<Rec> out;
-        for (const Batch& b : ring_) if (b.data) out.push_back(b.rec);
+        for (const Batch& b : ring_) if (b.data && b.offset >= from) out.push_back(b.rec);
         return out;
     }
     [[nodiscard]] int64_t logStart() const noexcept { return logStart_; }
