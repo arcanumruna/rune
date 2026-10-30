@@ -849,7 +849,7 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
             if (tpl.retiring) {
                 const bool inLogged = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
                 const bool wasLogged = std::any_of(logged.members.begin(), logged.members.begin() + logged.count, [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
-                if (!inLogged && !wasLogged && !judge.hasMember(tpl.verdictObjectId, tpl.verdictFingerprint)) retiredQueue_.emplace_back(tpl.verdictObjectId, tpl.verdictFingerprint);   // never joined a set
+                if (!inLogged && !wasLogged && !judge.hasMember(tpl.verdictObjectId, tpl.verdictFingerprint)) retiredQueue_.push_back({tpl.verdictObjectId, tpl.verdictFingerprint, judge.partition()});   // never joined a set
                 continue;
             }
             const bool present = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
@@ -889,18 +889,30 @@ int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, in
 int WorkerViewSet::finishRetired_() {
     if (retiredQueue_.empty()) return 0;
     int work = 0;
-    std::vector<std::pair<uint64_t, uint64_t>> queue;
+    std::vector<Retired> queue;
     queue.swap(retiredQueue_);
-    for (const auto& [objectId, fingerprint] : queue) {
+    for (const Retired& r : queue) {
         for (const auto& kv : templates_) {
             const ViewTemplate& tpl = kv.second;
-            if (!tpl.isVerdict || !tpl.retiring || tpl.verdictObjectId != objectId || tpl.verdictFingerprint != fingerprint) continue;
-            (void)eraseView_(kv.first);
+            if (!tpl.isVerdict || !tpl.retiring || tpl.verdictObjectId != r.objectId || tpl.verdictFingerprint != r.fingerprint) continue;
+            const int32_t viewTopicId = kv.first;
+            eraseInstance_(viewTopicId, r.partition);
+            const bool judged = std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& s) {
+                return s.second->hasMember(r.objectId, r.fingerprint);
+            });
+            if (!judged) (void)eraseView_(viewTopicId);   // another partition's judge may still judge with it
             ++work;
             break;
         }
     }
     return work;
+}
+
+void WorkerViewSet::eraseInstance_(int32_t viewTopicId, int32_t partition) {
+    if (const auto it = views_.find(instKey(viewTopicId, partition)); it != views_.end()) {
+        releaseMem_(it->second);
+        views_.erase(it);
+    }
 }
 
 int WorkerViewSet::pushVerdictCheckpoint_(ViewInstance& inst) {

@@ -8,7 +8,9 @@
 #include <unistd.h>
 
 #include <rune/codec/Descriptor.h>
+#include <rune/node/AdminChannels.h>
 #include <rune/node/VerdictSource.h>
+#include <rune/node/WorkerViewSet.h>
 #include <rune/node/RcState.h>
 #include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/RecordBatch.h>
@@ -565,4 +567,51 @@ TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To19Regress
             EXPECT_EQ(cleanedKeys(true), cleanedKeys(false));
         }
     }
+}
+
+// The drop of one verdict view retires it per (template, partition): partition 0 finishing its drop must not take the member from
+// partition 1's judge, which is still judging records below its own drop.
+TEST(CheckedWritesVerdictSourceRegression, RetireIsPerPartitionRegression) {
+    ViewSnapshotChannel channel;
+    const std::string dir = (std::filesystem::temp_directory_path() / ("rune-cw-retire-" + std::to_string(::getpid()))).string();
+    struct Cleanup { std::string d; ~Cleanup() { std::error_code ec; std::filesystem::remove_all(d, ec); } } cleanup{dir};
+    WorkerViewSet vs(channel, dir);
+    const rune::codec::Descriptor src = tagSource();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    const TestRejectRule rule = tagEquals(9);
+    constexpr int32_t kViewTopic = 0x40000001;
+    constexpr uint64_t kObject = 7;
+    auto comp = rune::view::compileView(tagView(), srcs, kViewTopic).value();
+    vs.installTestVerdictViewForTest(comp.plan, comp.rowLayout, src, false, kObject, rule);
+
+    Log log[2];
+    PartitionWriteState st[2];
+    for (int p = 0; p < 2; ++p) {
+        log[p].control();                                                             // 0: the set
+        std::vector<Rec> a, b;
+        for (int i = 1; i <= 9; ++i) a.push_back({i, i == 3 ? 9 : 1});
+        log[p].data(a);                                                               // 1..9
+        log[p].control();                                                             // 10: the drop
+        for (int i = 11; i <= 15; ++i) b.push_back({i, 1});
+        log[p].data(b);                                                               // 11..15
+        st[p].constraintSets.onChange(0, setOf(1, {{kObject, rule.fingerprint()}}));
+        st[p].constraintSets.onChange(10, setOf(2, {}));
+    }
+    const auto drive = [&](int p) {
+        auto readRange = [&](int64_t from, int64_t) { return log[p].read(from); };
+        vs.driveFolds(5, p, readRange, log[p].next, rune::view::kNoSkip, 200'000'000, nullptr, 1, true, {}, &st[p]);
+        verdictOnHw(st[p], 1'000'000);
+    };
+    for (int p = 0; p < 2; ++p) vs.ensureVerdictSource(5, p, st[p])->bindLeader(nullptr, 1, 0);
+    vs.verdictSource(5, 1)->holdJudgeForTest(true);
+    ASSERT_TRUE(vs.uninstallView(kViewTopic));   // judged by both: it retires
+    for (int i = 0; i < 4; ++i) drive(0);
+    EXPECT_EQ(vs.verdictSource(5, 0) == nullptr ? 0u : vs.verdictSource(5, 0)->memberCountForTest(), 0u);
+    ASSERT_NE(vs.verdictSource(5, 1), nullptr);
+    EXPECT_EQ(vs.verdictSource(5, 1)->memberCountForTest(), 1u) << "partition 0 finishing its drop leaves partition 1's member alone";
+    vs.verdictSource(5, 1)->holdJudgeForTest(false);
+    for (int i = 0; i < 4; ++i) drive(1);
+    EXPECT_TRUE(st[1].rejected.isRejected(3)) << "partition 1 judged below its drop with the member";
+    EXPECT_GE(st[1].markers.committedThrough(), 11);
+    EXPECT_TRUE(vs.verdictSource(5, 1) == nullptr || vs.verdictSource(5, 1)->judgedThrough() >= log[1].next);
 }

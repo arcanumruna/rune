@@ -25,8 +25,8 @@ struct VerdictViewHooks {
     int (*checkpoint)(void* ctx, ViewInstance&) = nullptr;
     /// A checkpoint that outran the markers (P4-4): empty the member's tables and owe its file a reset.
     void (*discard)(void* ctx, ViewInstance&) = nullptr;
-    /// A retiring member left the set for good (W passed its drop): the owner may erase its plan and instance.
-    void (*retired)(void* ctx, uint64_t viewObjectId, uint64_t planFingerprint) = nullptr;
+    /// A retiring member left this partition's set for good (W passed its drop): the owner may erase the partition's instance.
+    void (*retired)(void* ctx, uint64_t viewObjectId, uint64_t planFingerprint, int32_t partition) = nullptr;
 };
 
 class VerdictSource {
@@ -49,6 +49,7 @@ public:
                    const rune::view::AbortedTxnFilter& aborted = {});
 
     [[nodiscard]] int64_t judgedThrough() const noexcept { return judgeCursor_; }
+    [[nodiscard]] int32_t partition() const noexcept { return partition_; }
     [[nodiscard]] bool stalled() const noexcept { return stalled_; }
     /// Cold, the owner after growing the index: resumes a judge that stalled on a full index.  The other stalls stay.
     void unstall() noexcept {

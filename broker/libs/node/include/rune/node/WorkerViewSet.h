@@ -528,14 +528,16 @@ private:
     int pushVerdictCheckpoint_(ViewInstance& inst);
     void discardVerdictInstance_(ViewInstance& inst);
     bool eraseView_(int32_t viewTopicId);
+    void eraseInstance_(int32_t viewTopicId, int32_t partition);
     static int  checkpointHook_(void* ctx, ViewInstance& inst) { return static_cast<WorkerViewSet*>(ctx)->pushVerdictCheckpoint_(inst); }
     static void discardHook_(void* ctx, ViewInstance& inst) { static_cast<WorkerViewSet*>(ctx)->discardVerdictInstance_(inst); }
-    static void retiredHook_(void* ctx, uint64_t objectId, uint64_t fingerprint) {
-        static_cast<WorkerViewSet*>(ctx)->retiredQueue_.emplace_back(objectId, fingerprint);
+    static void retiredHook_(void* ctx, uint64_t objectId, uint64_t fingerprint, int32_t partition) {
+        static_cast<WorkerViewSet*>(ctx)->retiredQueue_.push_back({objectId, fingerprint, partition});
     }
 
     std::unordered_map<uint64_t, std::unique_ptr<VerdictSource>> verdictSources_;   // (srcTopicId, partition) -> judge
-    std::vector<std::pair<uint64_t, uint64_t>> retiredQueue_;   // (objectId, fingerprint) of members the judges dropped
+    struct Retired { uint64_t objectId, fingerprint; int32_t partition; };
+    std::vector<Retired> retiredQueue_;   // the members the judges dropped, per partition
     std::vector<ConstraintSetMember> constraintWant_;   // syncConstraintSet_ scratch: grows once, never per pass
     int64_t verdictIntervalNs_ = 100'000'000;
 

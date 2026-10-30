@@ -365,7 +365,7 @@ int VerdictSource::dropRetired_(PartitionWriteState& state) {
     });
     if (members_.size() == before) return 0;
     if (hooks_.retired != nullptr)
-        for (std::size_t i = 0; i < n; ++i) hooks_.retired(hooks_.ctx, gone[i].first, gone[i].second);
+        for (std::size_t i = 0; i < n; ++i) hooks_.retired(hooks_.ctx, gone[i].first, gone[i].second, partition_);
     reindex_();
     recomputeCap_();
     return static_cast<int>(before - members_.size());
