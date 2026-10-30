@@ -4111,8 +4111,9 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //
     //   The log is untouched (no append, no LEO advance) for the retriable-error
     //   path, preserving the "NEVER falsely ack" invariant.
-    // View acks need the worker-side ack path (checked writes, SD10): a gateway without shard mode refuses them.
-    if (pc::acksView(msg.acks) && !shardMode_) [[unlikely]] {
+    // View acks need the worker-side ack path (checked writes, SD10): a gateway without shard mode refuses them, and so
+    // does its inline path (a gateway-owned partition), which would otherwise answer acks=2 at once as acks=Leader.
+    if (pc::acksView(msg.acks) && (!shardMode_ || !routesToWorker_(msg.topicId))) [[unlikely]] {
         ++viewAcksRefusedLegacy_;
         sendResp(pc::ErrorCode::InvalidRequest, partition, 0);
         return true;
