@@ -222,6 +222,7 @@ public:
         if (it == subscriptionIndex_.end()) return INT64_MAX;
         int64_t min = INT64_MAX;
         for (const int32_t viewTopicId : it->second) {
+            if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.retiring) continue;   // a dropped verdict view is judged to its drop, never waited for
             const auto vit = views_.find(instKey(viewTopicId, partition));
             const int64_t cursor = vit == views_.end() || (leadership != 0 && vit->second.foldLeadership != leadership) ? 0 : vit->second.foldCursor;
             if (cursor < min) min = cursor;

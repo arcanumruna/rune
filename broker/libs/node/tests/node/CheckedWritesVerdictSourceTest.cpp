@@ -615,3 +615,24 @@ TEST(CheckedWritesVerdictSourceRegression, RetireIsPerPartitionRegression) {
     EXPECT_GE(st[1].markers.committedThrough(), 11);
     EXPECT_TRUE(vs.verdictSource(5, 1) == nullptr || vs.verdictSource(5, 1)->judgedThrough() >= log[1].next);
 }
+
+// A View ack waits for the views of the source to fold past it; a verdict view that was dropped and is only judged up to its
+// drop is not one of them.
+TEST(CheckedWritesVerdictSourceRegression, RetiringMemberDoesNotHoldViewAcksRegression) {
+    ViewSnapshotChannel channel;
+    const std::string dir = (std::filesystem::temp_directory_path() / ("rune-cw-retire-ack-" + std::to_string(::getpid()))).string();
+    struct Cleanup { std::string d; ~Cleanup() { std::error_code ec; std::filesystem::remove_all(d, ec); } } cleanup{dir};
+    WorkerViewSet vs(channel, dir);
+    const rune::codec::Descriptor src = tagSource();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    const TestRejectRule rule = tagEquals(9);
+    constexpr int32_t kViewTopic = 0x40000001;
+    auto comp = rune::view::compileView(tagView(), srcs, kViewTopic).value();
+    vs.installTestVerdictViewForTest(comp.plan, comp.rowLayout, src, false, 7, rule);
+    PartitionWriteState st;
+    st.constraintSets.onChange(0, setOf(1, {{7, rule.fingerprint()}}));
+    vs.ensureVerdictSource(5, 0, st)->bindLeader(nullptr, 1, 0);
+    ASSERT_EQ(vs.minFoldCursor(5, 0), 0) << "the verdict view has not folded";
+    ASSERT_TRUE(vs.uninstallView(kViewTopic));
+    EXPECT_EQ(vs.minFoldCursor(5, 0), INT64_MAX) << "dropped: the ack no longer waits for it";
+}
