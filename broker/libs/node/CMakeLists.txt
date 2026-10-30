@@ -810,6 +810,7 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesFeatureLevelTest.cpp
         tests/node/CheckedWritesWriteStateTest.cpp
         tests/node/CheckedWritesHookTest.cpp
+        tests/node/CheckedWritesMinFoldCursorTest.cpp
         tests/node/CheckedWritesValidationMatrixTest.cpp
         tests/node/CheckedWritesWorkerTest.cpp
         tests/node/CheckedWritesSpecFanoutTest.cpp

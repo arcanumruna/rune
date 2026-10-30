@@ -430,6 +430,21 @@ public:
         return subscriptionIndex_.find(srcTopicId) != subscriptionIndex_.end();
     }
 
+    // The slowest foldCursor over the views interested in (srcTopicId, partition): a View ack may fire once this passes
+    // its last offset.  INT64_MAX when no view is interested.  An instance that was never created counts 0, and with
+    // `leadership != 0` so does one folded under another leadership (its table says nothing about this one).
+    [[nodiscard]] int64_t minFoldCursor(int32_t srcTopicId, int32_t partition, uint64_t leadership = 0) const noexcept {
+        const auto it = subscriptionIndex_.find(srcTopicId);
+        if (it == subscriptionIndex_.end()) return INT64_MAX;
+        int64_t min = INT64_MAX;
+        for (const int32_t viewTopicId : it->second) {
+            const auto vit = views_.find(instKey(viewTopicId, partition));
+            const int64_t cursor = vit == views_.end() || (leadership != 0 && vit->second.foldLeadership != leadership) ? 0 : vit->second.foldCursor;
+            if (cursor < min) min = cursor;
+        }
+        return min;
+    }
+
     // Drive every view interested in (srcTopicId, partition) over the committed
     // range [foldCursor, bound) of THAT partition.  `readRange(from, to) ->
     // LogReadView` reads the committed bytes (the worker passes a readNoFault_
