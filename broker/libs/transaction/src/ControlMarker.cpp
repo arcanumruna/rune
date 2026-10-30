@@ -271,6 +271,7 @@ bool ControlMarker::extract(const uint8_t*       buf,
     // Read batch header fields — LITTLE-ENDIAN.
     out.producerId    = read_le64(p + 43);
     out.producerEpoch = read_le16(p + 51);
+    if (out.producerId < 0) return false;   // a producerId -1 control batch is a checked-writes record (types 16-19), never a txn marker
 
     // Decode the record starting at [BATCH_HEADER_SIZE = 61].
     std::size_t rpos = BATCH_HEADER_SIZE;
@@ -290,6 +291,7 @@ bool ControlMarker::extract(const uint8_t*       buf,
         if (rpos + 2 > end) return false;
         // key = controlType as int16 LE
         int16_t ct = read_le16(p + rpos);
+        if (ct != 0 && ct != 1) return false;   // COMMIT / ABORT only
         out.controlType = static_cast<ControlType>(ct);
         rpos += 2;
     } else {
