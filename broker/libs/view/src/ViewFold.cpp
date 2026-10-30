@@ -144,6 +144,8 @@ PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Pros
     p.rowCount = 1;
     const uint8_t* cur = f.table.get(k);
     r.existed = cur != nullptr;
+    r.removed = false;
+    r.image   = nullptr;
     if (rec.value.empty()) {
         p.op      = ProspectOp::Erase;
         r.removed = true;

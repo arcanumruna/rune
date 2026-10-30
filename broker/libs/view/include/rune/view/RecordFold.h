@@ -111,7 +111,6 @@ struct Prospect {
     void clear() noexcept {
         op       = ProspectOp::None;
         rowCount = 0;
-        rows     = {};
         stats    = {};
         overlay.clear();
     }
