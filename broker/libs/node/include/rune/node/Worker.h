@@ -7043,10 +7043,9 @@ private:
                       uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, rune::replication::PartitionReplica* replica) {
         int work = 0;
         PartitionWriteState* write = writeOf_(replica);
-        if (write != nullptr) {
-            if (VerdictSource* judge = viewSet_->ensureVerdictSource(topicId, partition, *write))
-                judge->bindLeader(replica, leaderGen, replica->isDiskBacked() ? replica->log()->logStartOffset() : replica->memoryLog()->logStartOffset());
-        }
+        VerdictSource* judge = write != nullptr ? viewSet_->ensureVerdictSource(topicId, partition, *write) : nullptr;
+        if (judge != nullptr)
+            judge->bindLeader(replica, leaderGen, replica->isDiskBacked() ? replica->log()->logStartOffset() : replica->memoryLog()->logStartOffset());
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
         if (transientRep != nullptr) {
@@ -7064,7 +7063,7 @@ private:
                                            leaderHwConfirmed, ns, write);
         }
         work += viewSet_->driveFolds(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
-                                     leaderHwConfirmed, ns, write);
+                                     leaderHwConfirmed, ns, write, judge);
         return work;
     }
 

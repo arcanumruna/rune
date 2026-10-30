@@ -33,6 +33,10 @@ class VerdictSource {
 public:
     static constexpr int kChangeDeferred = -1, kChangeUnchanged = -2;
 
+    /// What WorkerViewSet::syncConstraintSet_ last reconciled this judge against: the template epoch and the latest logged change.
+    uint64_t constraintSyncEpoch = UINT64_MAX;
+    int64_t  constraintSyncChange = -2;
+
     VerdictSource(int32_t srcTopicId, int32_t partition);
 
     /// The partition state judge() records rejections in and driveJudge() reads the timeline from.

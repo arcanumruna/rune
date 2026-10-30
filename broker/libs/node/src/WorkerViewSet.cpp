@@ -276,6 +276,7 @@ bool WorkerViewSet::uninstallView(int32_t viewTopicId) {
         });
         if (judged) {
             tpl.retiring = true;
+            ++verdictEpoch_;
             return true;
         }
     }
@@ -283,6 +284,7 @@ bool WorkerViewSet::uninstallView(int32_t viewTopicId) {
 }
 
 bool WorkerViewSet::eraseView_(int32_t viewTopicId) {
+    ++verdictEpoch_;
     if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.isVerdict)
         for (auto& kv : verdictSources_) kv.second->removeVerdictView(tit->second.verdictObjectId, tit->second.verdictFingerprint);
     bool had = templates_.erase(viewTopicId) != 0;
@@ -780,6 +782,7 @@ void WorkerViewSet::installTestVerdictViewForTest(rune::view::CompiledViewPlan p
     const int32_t viewTopicId = plan.viewTopicId;
     installView(std::move(plan), std::move(layout), std::move(src), persisted, underRecovery);
     ViewTemplate& tpl = templates_.at(viewTopicId);
+    ++verdictEpoch_;
     tpl.isVerdict = true;
     tpl.verdictKind = rune::view::VerdictViewKind::TestReject;
     tpl.verdictObjectId = viewObjectId;
@@ -823,6 +826,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
 }
 
 int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write) {
+    if (judge.constraintSyncEpoch == verdictEpoch_ && judge.constraintSyncChange == write.constraintSets.lastChangeOffset()) return 0;
     const ConstraintSet& logged = write.constraintSets.latest();
     const auto sit = subscriptionIndex_.find(srcTopicId);
     std::vector<ConstraintSetMember>& want = constraintWant_;
@@ -860,8 +864,15 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     ConstraintSet desired;
     desired.count = static_cast<uint8_t>(std::min(want.size(), desired.members.size()));
     std::copy_n(want.begin(), desired.count, desired.members.begin());
-    if (desired.sameMembers(logged)) return 0;
-    return judge.requestChange(desired) >= 0 ? 1 : 0;
+    int work = 0;
+    if (!desired.sameMembers(logged)) {
+        const int r = judge.requestChange(desired);
+        if (r == VerdictSource::kChangeDeferred) return 0;   // not yet bound or activated: ask again next pass
+        work = r >= 0 ? 1 : 0;
+    }
+    judge.constraintSyncEpoch = verdictEpoch_;
+    judge.constraintSyncChange = write.constraintSets.lastChangeOffset();
+    return work;
 }
 
 int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {

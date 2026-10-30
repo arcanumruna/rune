@@ -241,9 +241,8 @@ public:
     int driveFolds(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
                    int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                    const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
-                     bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr) {
+                     bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr, VerdictSource* judge = nullptr) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
-        VerdictSource* judge = write != nullptr ? ensureVerdictSource(srcTopicId, partition, *write) : nullptr;
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end() && judge == nullptr) return 0;
         static const std::vector<int32_t> kNoViews;
@@ -538,6 +537,7 @@ private:
 
     std::unordered_map<uint64_t, std::unique_ptr<VerdictSource>> verdictSources_;   // (srcTopicId, partition) -> judge
     struct Retired { uint64_t objectId, fingerprint; int32_t partition; };
+    uint64_t verdictEpoch_ = 0;   // bumped by every verdict template install, retire and erase; syncConstraintSet_ reruns on a change
     std::vector<Retired> retiredQueue_;   // the members the judges dropped, per partition
     std::vector<ConstraintSetMember> constraintWant_;   // syncConstraintSet_ scratch: grows once, never per pass
     int64_t verdictIntervalNs_ = 100'000'000;

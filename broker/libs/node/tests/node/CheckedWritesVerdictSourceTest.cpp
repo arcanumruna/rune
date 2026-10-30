@@ -564,7 +564,8 @@ TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To19Regress
                 }
                 return keys;
             };
-            EXPECT_EQ(cleanedKeys(true), cleanedKeys(false));
+            // A marker with no set change before it is held by the cleaner (fail closed): only the other types compact like no record.
+            if (type != cr::kVerdictMarker) EXPECT_EQ(cleanedKeys(true), cleanedKeys(false));
         }
     }
 }
@@ -599,7 +600,7 @@ TEST(CheckedWritesVerdictSourceRegression, RetireIsPerPartitionRegression) {
     }
     const auto drive = [&](int p) {
         auto readRange = [&](int64_t from, int64_t) { return log[p].read(from); };
-        vs.driveFolds(5, p, readRange, log[p].next, rune::view::kNoSkip, 200'000'000, nullptr, 1, true, {}, &st[p]);
+        vs.driveFolds(5, p, readRange, log[p].next, rune::view::kNoSkip, 200'000'000, nullptr, 1, true, {}, &st[p], vs.ensureVerdictSource(5, p, st[p]));
         verdictOnHw(st[p], 1'000'000);
     };
     for (int p = 0; p < 2; ++p) vs.ensureVerdictSource(5, p, st[p])->bindLeader(nullptr, 1, 0);
@@ -635,4 +636,36 @@ TEST(CheckedWritesVerdictSourceRegression, RetiringMemberDoesNotHoldViewAcksRegr
     ASSERT_EQ(vs.minFoldCursor(5, 0), 0) << "the verdict view has not folded";
     ASSERT_TRUE(vs.uninstallView(kViewTopic));
     EXPECT_EQ(vs.minFoldCursor(5, 0), INT64_MAX) << "dropped: the ack no longer waits for it";
+}
+
+// The constraint set is reconciled with the templates only when a template was installed, retired or erased, or the logged set
+// changed: a steady pass skips it.
+TEST(CheckedWritesVerdictSourceRegression, ConstraintSetIsReconciledOnlyOnAChangeRegression) {
+    ViewSnapshotChannel channel;
+    const std::string dir = (std::filesystem::temp_directory_path() / ("rune-cw-sync-" + std::to_string(::getpid()))).string();
+    struct Cleanup { std::string d; ~Cleanup() { std::error_code ec; std::filesystem::remove_all(d, ec); } } cleanup{dir};
+    WorkerViewSet vs(channel, dir);
+    const rune::codec::Descriptor src = tagSource();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    constexpr int32_t kViewTopic = 0x40000001;
+    auto comp = rune::view::compileView(tagView(), srcs, kViewTopic).value();
+    vs.installTestVerdictViewForTest(comp.plan, comp.rowLayout, src, false, 7, tagEquals(9));
+    Log log;
+    PartitionWriteState st;
+    const auto drive = [&] {
+        auto readRange = [&](int64_t from, int64_t) { return log.read(from); };
+        vs.driveFolds(5, 0, readRange, log.next, rune::view::kNoSkip, 200'000'000, nullptr, 1, true, {}, &st, vs.ensureVerdictSource(5, 0, st));
+    };
+    vs.ensureVerdictSource(5, 0, st)->bindLeader(nullptr, 1, 0);
+    drive();
+    drive();
+    VerdictSource* judge = vs.verdictSource(5, 0);
+    ASSERT_NE(judge, nullptr);
+    const uint64_t synced = judge->constraintSyncEpoch;
+    ASSERT_NE(synced, UINT64_MAX);
+    drive();
+    EXPECT_EQ(judge->constraintSyncEpoch, synced) << "a steady pass does not reconcile";
+    ASSERT_TRUE(vs.uninstallView(kViewTopic));
+    drive();
+    EXPECT_NE(vs.verdictSource(5, 0) == nullptr ? UINT64_MAX : vs.verdictSource(5, 0)->constraintSyncEpoch, synced) << "a retired template does";
 }
