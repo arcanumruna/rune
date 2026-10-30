@@ -384,13 +384,12 @@ int WorkerViewSet::reconcileTransient_(ViewInstance& inst, const TransientBounds
         inst.foldCursor = tb.logStart;
         return 1;
     }
-    if (std::holds_alternative<CursorRecoveredUnreconciled>(inst.transientCursor)) {   // older incarnation
-        spdlog::warn("WorkerViewSet: view {} partition {}: recovered checkpoint cursor {} refers to "
-                     "an earlier incarnation of its transient source (now [{}, {})) -- invariant "
-                     "breach (a view over a transient source must be transient); keeping the rows, "
-                     "re-folding from offset {}",
-                     viewTopicId, inst.partition, inst.foldCursor, tb.logStart, tb.logEnd,
-                     tb.logStart);
+    if (std::holds_alternative<CursorRecoveredUnreconciled>(inst.transientCursor)) {   // older life of the source
+        ++inst.counters.transientSourceResets;
+        spdlog::info("WorkerViewSet: view {} partition {}: recovered checkpoint cursor {} is from an earlier life of its "
+                     "transient source (now [{}, {})); keeping the checkpoint rows, re-folding from offset {} (resets={})",
+                     viewTopicId, inst.partition, inst.foldCursor, tb.logStart, tb.logEnd, tb.logStart,
+                     inst.counters.transientSourceResets);
         inst.transientCursor = CursorLive{tb.incarnation, tb.logGeneration};
         inst.foldCursor      = tb.logStart;
         return 1;
@@ -435,11 +434,12 @@ int WorkerViewSet::reconcileTransient_(ViewInstance& inst, const TransientBounds
             moved = 1;
         }
     }
-    if (inst.foldCursor > tb.logEnd) {                                          // INVARIANT BREACH
-        spdlog::warn("WorkerViewSet: view {} partition {}: cursor {} is above its transient "
-                     "source end {} -- invariant breach (a view over a transient source must "
-                     "be transient); keeping the rows, re-folding from offset {}",
-                     viewTopicId, inst.partition, inst.foldCursor, tb.logEnd, tb.logStart);
+    if (inst.foldCursor > tb.logEnd) {                                          // SOURCE RESTARTED
+        ++inst.counters.transientSourceResets;
+        spdlog::info("WorkerViewSet: view {} partition {}: cursor {} is above its transient source end {} (the source "
+                     "restarted under it); keeping the rows, re-folding from offset {} (resets={})",
+                     viewTopicId, inst.partition, inst.foldCursor, tb.logEnd, tb.logStart,
+                     inst.counters.transientSourceResets);
         inst.foldCursor = tb.logStart;
         return 1;
     }

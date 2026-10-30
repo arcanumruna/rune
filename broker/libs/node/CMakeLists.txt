@@ -706,6 +706,14 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_create_view_tests
         PROPERTIES TIMEOUT 60)
 
+    # Checked writes Part 10 (spec 9a): persisted views over transient sources - view-set timings, matrix, model.
+    add_executable(rune_checked_writes_transient_view_tests tests/integration/PersistedOverTransientViewTest.cpp)
+    target_include_directories(rune_checked_writes_transient_view_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_checked_writes_transient_view_tests PRIVATE rune_node rune_view rune_codec
+                          rune_transaction GTest::gtest_main)
+    gtest_discover_tests(rune_checked_writes_transient_view_tests PROPERTIES TIMEOUT 300 LABELS small)
+
     # ---------------------------------------------------------------------------
     # DDL conformance plan: DdlHarness suites — fix regressions (B1-B4, KL2), the
     # Occupant x Op matrix and the pair x timing matrix.  On-host (no Aeron),
