@@ -243,6 +243,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
         }
         state.rejected.noteCovered(judgeCursor_);
     }
+    state.judgedThrough = judgeCursor_;
     work += emitMarkers_(state, nowNs);
     work += pushCheckpoints_(state);
     work += dropRetired_(state);

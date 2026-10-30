@@ -21,6 +21,7 @@
 #include <rune/codec/FilterWire.h>
 #include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/RejectedOffsetIndex.h>
 
 #include <spdlog/spdlog.h>
 
@@ -98,6 +99,7 @@ concept FilterSource = requires(S& s, int64_t from, std::size_t cap, int64_t pid
     { s.read(from, cap) } -> std::same_as<std::span<const uint8_t>>; // whole batches from the batch holding `from`; at least one if any
     { s.readCommitted() } -> std::same_as<bool>;
     { s.isAborted(pid, base) } -> std::same_as<bool>;
+    { s.rejected() } -> std::same_as<const rune::storage::RejectedOffsetIndex*>;   // the verdict source's rejected offsets; nullptr = none
     { s.skipEvicted(from) } -> std::same_as<int64_t>;                // transient: the ring start when `from` was evicted
 };
 template <class K>
@@ -117,6 +119,7 @@ struct FilterScratch {
     std::vector<uint32_t> counts, starts, order, touched, keep;
     std::vector<uint8_t>  rebuild;      // grow-once, never shrinks
     std::size_t           matchCap = 0; // matches never grows past this: a full list is the overflow signal
+    uint32_t              droppedRejected = 0;   // records of the last collected batch the verdict index removed
 
     void reserve(const FilterConfig& cfg, std::size_t maxRecordsPerRead) {
         records.reserve(maxRecordsPerRead);
@@ -448,6 +451,12 @@ private:
             const int64_t pid = rune::protocol::RecordBatchReader(h.p, h.size).producerId();
             if (cx.src.isAborted(pid, h.base)) return true;
         }
+        const rune::storage::RejectedOffsetIndex* rej = cx.src.rejected();
+        if (rej != nullptr && rej->size() != 0 && rej->nextRejectedAtOrAfter(h.base) <= h.lastOffset) [[unlikely]] {   // every record rejected
+            int32_t n = 0;
+            for (int64_t o = rej->nextRejectedAtOrAfter(h.base); o <= h.lastOffset; o = rej->nextRejectedAtOrAfter(o + 1)) ++n;
+            return n == h.count;
+        }
         return false;
     }
     /// F5: never past the budget, except the first batch of a fresh pass (progress).  Charges the read.
@@ -461,10 +470,13 @@ private:
     static void charge_(std::size_t& budget, std::size_t n) noexcept { budget -= std::min(budget, n); }
 
     static bool collect_(FilterScratch& sc, std::span<const uint8_t> bytes, const rune::codec::FilterSchema& schema,
-                         const VersionSet& expired, uint16_t& unknownVer, bool& hasUnknown) {
+                         const VersionSet& expired, uint16_t& unknownVer, bool& hasUnknown, const rune::storage::RejectedOffsetIndex* rej) {
         sc.records.clear();
+        sc.droppedRejected = 0;
+        if (rej != nullptr && rej->size() == 0) rej = nullptr;
         hasUnknown = false;
         return rune::protocol::forEachRecordSpan(bytes.data(), bytes.size(), [&](const rune::protocol::RecordSpan& r) {
+            if (rej != nullptr && rej->find(r.offset) != nullptr) [[unlikely]] { ++sc.droppedRejected; return; }
             if (!r.nullValue && r.value.size() >= 4) {
                 const uint16_t v = rune::codec::recordVersion(reinterpret_cast<const uint8_t*>(r.value.data()));
                 if (!hasUnknown && !schema.knowsVersion(v) && !expired.has(v)) { hasUnknown = true; unknownVer = v; }
@@ -484,7 +496,7 @@ private:
         SendOutcome out;
         std::size_t frameBytes;
         bool whole;
-        if (keep.size() == sc.records.size()) {
+        if (keep.size() == sc.records.size() && sc.droppedRejected == 0) {
             out = cx.sink.sendBatch(m.sub, h.base, bytes);
             frameBytes = bytes.size();
             whole = true;
@@ -647,7 +659,7 @@ private:
                 if (!admit_(cx, h.size)) return work;
                 uint16_t uver = 0;
                 bool unknown = false;
-                if (!collect_(sc, bytes, cx.schema, m.expired, uver, unknown)) {   // a batch the codec cannot walk: skip it, counted
+                if (!collect_(sc, bytes, cx.schema, m.expired, uver, unknown, cx.src.rejected())) {   // a batch the codec cannot walk: skip it, counted
                     ++m.counters.malformed;
                     noteSkipped_(id, h.count);
                 } else {
@@ -755,7 +767,7 @@ private:
         stalled = false;
         uint16_t uver = 0;
         bool unknown = false;
-        if (!collect_(sc, bytes, cx.schema, expiredGroup_, uver, unknown)) {   // a batch the codec cannot walk: skip it, counted
+        if (!collect_(sc, bytes, cx.schema, expiredGroup_, uver, unknown, cx.src.rejected())) {   // a batch the codec cannot walk: skip it, counted
             ++group_.malformed;
             advanceScanned_(static_cast<uint64_t>(h.count));
             scan_ = Scanning{h.end};

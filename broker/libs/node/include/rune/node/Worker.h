@@ -632,6 +632,8 @@ public:
         subs_.reserve(kSubsReserve);
         writeSpecs_.reserve(kWriteSpecsReserve);
         egressScratch_.resize(kEgressScratchSize);
+        verdictSpans_.reserve(4096);
+        verdictKeep_.reserve(4096);
         maxIntakeBatchBytes_ = ringBatchFit_();   // BrokerNode narrows it: setMaxBatchBytes
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
     }
@@ -704,6 +706,8 @@ public:
         const VerdictSource* v = viewSet_ != nullptr ? viewSet_->verdictSource(topicId, partition) : nullptr;
         return v != nullptr ? &v->stats() : nullptr;
     }
+    [[nodiscard]] uint64_t verdictCutsForTest() const noexcept { return verdictCuts_; }
+    [[nodiscard]] uint64_t verdictScratchGrowthsForTest() const noexcept { return verdictScratchGrowths_; }
     [[nodiscard]] WorkerViewSet* viewSet() const noexcept { return viewSet_; }
 
     // Task 16: this worker's view restart-readiness, for the GetViewRow serve
@@ -3606,6 +3610,35 @@ private:
         subs_.pop_back();
     }
 
+    // ---- Part 04 (8.6): consumers of a verdict source ----
+    /// Nothing is delivered past what the judge has decided; an untyped partition pays one null check.
+    [[nodiscard]] static int64_t verdictBound_(const PartitionWriteState* ws, int64_t bound) noexcept {
+        return ws == nullptr ? bound : std::min(bound, ws->verdictKnownThrough());
+    }
+    enum class Cut : uint8_t { Whole, Rebuilt, Empty, Full };
+    /// One data batch for a consumer: the records the verdict index rejected are removed.  Whole: send `bp` as it is.
+    /// Rebuilt: `n` bytes were written to verdictRebuildScratch_ at `used`.  Empty: every record was rejected.
+    /// Full: it does not fit behind `used` bytes of earlier rebuilds (the caller ends its chunk).
+    [[nodiscard]] Cut cutRejected_(const PartitionWriteState* ws, const uint8_t* bp, std::size_t size, int64_t base, int64_t last,
+                                   std::size_t used, std::size_t& n) {
+        if (ws == nullptr || ws->rejected.size() == 0 || ws->rejected.nextRejectedAtOrAfter(base) > last) [[likely]] return Cut::Whole;
+        ++verdictCuts_;
+        verdictSpans_.clear();
+        verdictKeep_.clear();
+        (void)rune::protocol::forEachRecordSpan(bp, size, [&](const rune::protocol::RecordSpan& r) {
+            if (ws->rejected.find(r.offset) == nullptr) verdictKeep_.push_back(r.index);
+            verdictSpans_.push_back(r);
+        });
+        if (verdictKeep_.empty()) return Cut::Empty;
+        if (used + size > verdictRebuildScratch_.size()) {
+            if (used != 0) return Cut::Full;
+            verdictRebuildScratch_.resize(size);
+            ++verdictScratchGrowths_;
+        }
+        n = rune::protocol::rebuildBatch({bp, size}, verdictSpans_, verdictKeep_, std::span<uint8_t>(verdictRebuildScratch_.data() + used, size));
+        return Cut::Rebuilt;
+    }
+
     // ---- the FilterGroup's view of the worker: a source (reads), a sink (egress) ----
     class FilterSourceImpl {
     public:
@@ -3625,8 +3658,11 @@ private:
                 if (rc_ == nullptr) return -1;    // not Ready
                 bound_ = rc_->lso(bound_);
             }
+            ws_ = w_.writeOf_(rep_);
+            bound_ = verdictBound_(ws_, bound_);
             return bound_;
         }
+        [[nodiscard]] const rune::storage::RejectedOffsetIndex* rejected() const noexcept { return ws_ != nullptr ? &ws_->rejected : nullptr; }
         /// Whole batches from the batch holding `from`: at least that one, even when it is larger than `cap`.
         [[nodiscard]] std::span<const uint8_t> read(int64_t from, std::size_t cap) noexcept {
             const std::size_t c = std::min<std::size_t>(static_cast<std::size_t>(kPushMaxChunkBytes), cap);
@@ -3649,6 +3685,7 @@ private:
         rune::replication::PartitionReplica* rep_ = nullptr;
         rune::storage::InMemoryLog* mem_ = nullptr;
         const RcState* rc_ = nullptr;
+        const PartitionWriteState* ws_ = nullptr;
         int64_t bound_ = 0;
     };
 
@@ -3976,6 +4013,8 @@ private:
                 if (rc == nullptr) continue;
                 bound = rc->lso(bound);
             }
+            const PartitionWriteState* const ws = writeOf_(rep);
+            bound = verdictBound_(ws, bound);
             if (s.nextOffset >= bound) continue;
 
             const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
@@ -4053,6 +4092,18 @@ private:
                     }
                 }
 
+                std::span<const uint8_t> out(bp, batchSize);
+                std::size_t cutBytes = 0;
+                switch (cutRejected_(ws, bp, batchSize, baseOffset, baseOffset + lastDelta, 0, cutBytes)) {
+                case Cut::Whole: break;
+                case Cut::Rebuilt: out = std::span<const uint8_t>(verdictRebuildScratch_.data(), cutBytes); break;
+                case Cut::Empty:
+                case Cut::Full:   // used == 0: a batch always fits
+                    pos += batchSize;
+                    s.nextOffset = baseOffset + static_cast<int64_t>(lastDelta) + 1;
+                    continue;
+                }
+
                 pc::Records rec;
                 rec.sessionId      = s.sessionId;
                 rec.correlationId  = s.subscribeCorrId;  // the client's Subscribe: exact instance identity
@@ -4060,7 +4111,7 @@ private:
                 rec.topicId        = s.topicId;
                 rec.partition      = s.partition;
                 rec.baseOffset     = baseOffset;
-                rec.recordBatch    = std::span<const uint8_t>(bp, batchSize);
+                rec.recordBatch    = out;
 
                 // F19: any frame up to the egress maxMessageLength is delivered
                 // (tryClaim fast path / vectored [fixed | batch] offer — zero
@@ -4546,6 +4597,7 @@ private:
                 }
                 bound = std::min(bound, rc->lso(liveHw));
             }
+            bound = verdictBound_(writeOf_(replica), bound);
         } else if (a.isolation == kIsolationReadCommitted && topicId >= 0) [[unlikely]] {
             ret.setPushEffectiveBound(nextOffset);
             enqueueReturn_(std::move(ret));
@@ -4621,7 +4673,8 @@ private:
                            : mem->readView(a.nextOffset, static_cast<int32_t>(cap));
         if (v.empty()) return PushChunk::Empty;
         const bool preCarrier = a.isGroup && !a.carrier;
-        std::size_t rd = 0, nRuns = 0, total = 0;
+        std::size_t rd = 0, nRuns = 0, total = 0, rebuilt = 0;
+        const PartitionWriteState* const ws = writeOf_(a.replica);
         int64_t next = ret.newNextOffset;
         int64_t cutBound = -1;
         while (rd + static_cast<std::size_t>(b::kRecordBatchOverhead) <= v.len) {
@@ -4648,13 +4701,28 @@ private:
                 if (total == 0) return PushChunk::TooLarge;                // only ever the view's first batch
                 break;
             }
-            if (nRuns != 0 && pushRuns_[nRuns - 1].data + pushRuns_[nRuns - 1].len == v.data + rd) {
-                pushRuns_[nRuns - 1].len += static_cast<uint32_t>(sz);    // contiguous: extend the run
+            const uint8_t* src = v.data + rd;
+            std::size_t len = sz;
+            std::size_t cutBytes = 0;
+            const Cut cut = cutRejected_(ws, src, sz, base, last, rebuilt, cutBytes);
+            if (cut == Cut::Empty) {                                       // every record rejected: skipped like a marker
+                rd += sz;
+                next = last + 1;
+                continue;
+            }
+            if (cut == Cut::Full) break;                                   // the rest in the next read
+            if (cut == Cut::Rebuilt) {
+                src = verdictRebuildScratch_.data() + rebuilt;
+                len = cutBytes;
+                rebuilt += cutBytes;
+            }
+            if (nRuns != 0 && pushRuns_[nRuns - 1].data + pushRuns_[nRuns - 1].len == src) {
+                pushRuns_[nRuns - 1].len += static_cast<uint32_t>(len);   // contiguous: extend the run
             } else {
                 if (nRuns == kMaxPushRuns) break;                          // cut here (the rest next read)
-                pushRuns_[nRuns++] = ChunkRun{v.data + rd, static_cast<uint32_t>(sz)};
+                pushRuns_[nRuns++] = ChunkRun{src, static_cast<uint32_t>(len)};
             }
-            total += sz;
+            total += len;
             rd += sz;
             next = last + 1;
         }
@@ -6006,6 +6074,10 @@ public:
 private:
     std::size_t                           pushBudgetLeft_ = kPushPassBudgetBytes;
     std::array<ChunkRun, kMaxPushRuns>    pushRuns_{};
+    std::vector<uint8_t>                  verdictRebuildScratch_ = std::vector<uint8_t>(static_cast<std::size_t>(kPushMaxChunkBytes));   // grow-once (counted)
+    std::vector<rune::protocol::RecordSpan> verdictSpans_;
+    std::vector<uint32_t>                 verdictKeep_;
+    uint64_t                              verdictCuts_ = 0, verdictScratchGrowths_ = 0;
     /// #65: push-read pread target (allocated once, at construction): one
     /// pass's push budget + the sparse-index skip slack + room for a first
     /// batch past the budget (a fresh pass always takes one).  Larger first

@@ -151,13 +151,19 @@ struct PartitionWriteState {
     ConstraintSetTimeline              constraintSets;
     MarkerLedger                       markers;
     VerdictSource*                     verdicts = nullptr;   ///< the judge, once this worker leads and hosts verdict views
+    int64_t                            judgedThrough = 0;    ///< the judge's cursor, published at the end of each of its passes
 
     /// A judge is attached or the latest logged set is non-empty.
     [[nodiscard]] bool isVerdictSource() const noexcept;
     /// The latest logged set has a member that can reject (Unique, Check or TestReject).
     [[nodiscard]] bool isConstrainedSource() const noexcept;
     /// Every offset below it has a verdict this node knows; INT64_MAX when no offset needs one.
-    [[nodiscard]] int64_t verdictKnownThrough() const noexcept;
+    [[nodiscard]] int64_t verdictKnownThrough() const noexcept {
+        if (constraintSets.size() == 0) return INT64_MAX;
+        if (verdicts != nullptr) return judgedThrough;
+        const int64_t k = rejected.coveredThrough();
+        return constraintSets.latest().empty() && k > constraintSets.lastChangeOffset() ? INT64_MAX : k;
+    }
 };
 
 enum class TypedCheck : uint8_t { Accept, Reject, VersionAhead };

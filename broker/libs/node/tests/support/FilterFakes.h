@@ -167,6 +167,7 @@ public:
     [[nodiscard]] int64_t bound() const noexcept { return bound_; }
     [[nodiscard]] bool readCommitted() const noexcept { return rc_; }
     [[nodiscard]] bool isAborted(int64_t pid, int64_t base) const { return aborted_.count({pid, base}) != 0; }
+    [[nodiscard]] const rune::storage::RejectedOffsetIndex* rejected() const noexcept { return nullptr; }
     [[nodiscard]] int64_t skipEvicted(int64_t from) noexcept { ++skipEvictedCalls; return from < ringStart_ ? ringStart_ : from; }
     /// Whole batches from the batch holding `from`, up to `cap` bytes, but always at least that one batch.
     [[nodiscard]] std::span<const uint8_t> read(int64_t from, std::size_t cap) noexcept {

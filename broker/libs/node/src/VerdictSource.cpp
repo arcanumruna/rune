@@ -32,13 +32,6 @@ bool PartitionWriteState::isConstrainedSource() const noexcept {
     return false;
 }
 
-int64_t PartitionWriteState::verdictKnownThrough() const noexcept {
-    if (constraintSets.size() == 0) return INT64_MAX;
-    if (verdicts != nullptr) return verdicts->judgedThrough();
-    const int64_t k = rejected.coveredThrough();
-    return constraintSets.latest().empty() && k > constraintSets.lastChangeOffset() ? INT64_MAX : k;
-}
-
 VerdictSource::VerdictSource(int32_t srcTopicId, int32_t partition) : srcTopicId_(srcTopicId), partition_(partition) {
     members_.reserve(kMaxVerdictViewsPerSource);
     active_.reserve(kMaxVerdictViewsPerSource);
