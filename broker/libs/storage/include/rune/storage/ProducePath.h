@@ -65,6 +65,7 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/storage/ProducerStateManager.h>
+#include <rune/storage/WriteHookPolicy.h>
 #include <rune/protocol/client/Protocol.h>
 
 #include <cstddef>
@@ -119,6 +120,8 @@ struct ProduceOutcome {
     /// full of uncommitted data) or MessageTooLarge (larger than the ring).
     /// Nothing was appended.  Never set for a disk Log.
     bool     logFull = false;
+    /// The active write hook's assigned key for a key-0 create (0 = none).
+    uint64_t assignedBase = 0;
 
     [[nodiscard]] bool isOK() const noexcept {
         return error == rune::protocol::client::ErrorCode::OK;
@@ -168,7 +171,7 @@ using rune::protocol::client::produceErrorForClient;
 // Phase 2b E2: templated over the concrete log type — rune::storage::Log (disk)
 // or rune::storage::InMemoryLog (a TRANSIENT partition's ring).  No virtual
 // dispatch; the two instantiations live in ProducePath.cpp.
-template <class LogT>
+template <class LogT, class HookT>
 ProduceOutcome handleProduceBatch(
     const uint8_t*                    batch,
     std::size_t                       batchLen,
@@ -183,14 +186,39 @@ ProduceOutcome handleProduceBatch(
     int                               isrSize,
     int                               minIsr,
     uint8_t                           durabilityTier,
-    bool                              crcPreverified = false) noexcept;
+    bool                              crcPreverified,
+    HookT&                            hook) noexcept;
 
-extern template ProduceOutcome handleProduceBatch<Log>(
+// Hook-less callers: the same call as before the hook seam existed.
+template <class LogT>
+inline ProduceOutcome handleProduceBatch(
+    const uint8_t*                    batch,
+    std::size_t                       batchLen,
+    int32_t                           topicId,
+    int32_t                           partition,
+    int64_t                           producerId,
+    int16_t                           producerEpoch,
+    int32_t                           baseSequence,
+    LogT&                             log,
+    rune::storage::ProducerStateManager& producerState,
+    bool                              acksAll,
+    int                               isrSize,
+    int                               minIsr,
+    uint8_t                           durabilityTier,
+    bool                              crcPreverified = false) noexcept
+{
+    NoWriteHook hook;
+    return handleProduceBatch<LogT, NoWriteHook>(batch, batchLen, topicId, partition, producerId, producerEpoch,
+                                                 baseSequence, log, producerState, acksAll, isrSize, minIsr,
+                                                 durabilityTier, crcPreverified, hook);
+}
+
+extern template ProduceOutcome handleProduceBatch<Log, NoWriteHook>(
     const uint8_t*, std::size_t, int32_t, int32_t, int64_t, int16_t, int32_t, Log&,
-    ProducerStateManager&, bool, int, int, uint8_t, bool) noexcept;
-extern template ProduceOutcome handleProduceBatch<InMemoryLog>(
+    ProducerStateManager&, bool, int, int, uint8_t, bool, NoWriteHook&) noexcept;
+extern template ProduceOutcome handleProduceBatch<InMemoryLog, NoWriteHook>(
     const uint8_t*, std::size_t, int32_t, int32_t, int64_t, int16_t, int32_t, InMemoryLog&,
-    ProducerStateManager&, bool, int, int, uint8_t, bool) noexcept;
+    ProducerStateManager&, bool, int, int, uint8_t, bool, NoWriteHook&) noexcept;
 
 } // namespace rune::storage
 

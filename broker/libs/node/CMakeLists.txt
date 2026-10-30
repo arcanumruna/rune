@@ -364,7 +364,8 @@ if(BUILD_TESTING)
     # a real Log + ProducerStateManager.  No Aeron required.
     # ---------------------------------------------------------------------------
     add_executable(rune_produce_path_tests
-        tests/node/ProducePathTest.cpp)
+        tests/node/ProducePathTest.cpp
+        tests/node/CheckedWritesProducePathHookTest.cpp)
     target_include_directories(rune_produce_path_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_produce_path_tests PRIVATE
