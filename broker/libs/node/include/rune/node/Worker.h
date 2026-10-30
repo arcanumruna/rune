@@ -4576,6 +4576,7 @@ private:
         // read_committed fails CLOSED (review m5) — nothing, answered at the cursor.
         auto* replica = a.replica;
         int64_t bound = hwBound;
+        bool judgeHeld = false;
         const RcState* rc = nullptr;
         if (replica != nullptr) {
             const int64_t liveHw = replica->highWatermark();
@@ -4598,13 +4599,17 @@ private:
                 }
                 bound = std::min(bound, rc->lso(liveHw));
             }
+            const int64_t beforeJudge = bound;
             bound = verdictBound_(writeOf_(replica), bound);
+            judgeHeld = bound < beforeJudge;
         } else if (a.isolation == kIsolationReadCommitted && topicId >= 0) [[unlikely]] {
             ret.setPushEffectiveBound(nextOffset);
             enqueueReturn_(std::move(ret));
             return;
         }
-        ret.setPushEffectiveBound(bound);
+        // The judge, not the HW, holds the bound: the HW will not move to wake a subscription parked on it, so answer
+        // "unanswered" (-1) and let the gateway re-issue on its next push cycle.
+        ret.setPushEffectiveBound(judgeHeld ? -1 : bound);
 
         // Only read if there are records available (within the bound).
         // F5 (hot-path B) + #65: zero allocation — the chunk is pread into the

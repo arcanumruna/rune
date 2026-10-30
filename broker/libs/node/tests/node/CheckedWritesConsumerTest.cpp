@@ -75,6 +75,37 @@ TEST_P(CheckedWritesConsumer, NothingBeyondJudgedThroughIsDelivered) {
     EXPECT_TRUE(std::none_of(box.records.begin(), box.records.end(), [](const Delivered& d) { return d.id == 3; }));
 }
 
+// A PushRead answered at the judge's cursor is not parked on the HW (the HW will not move again): its effective bound is -1.
+TEST(CheckedWritesConsumerRegression, PushReadHeldByTheJudgeIsNotParkedOnTheHwRegression) {
+    TypedRig s;
+    ASSERT_EQ(s.r.produce({{1, 10, 1}}), 0);
+    s.r.passes(300);
+    VerdictSource* judge = s.r.vs->verdictSource(VerdictRig::kSrc, 0);
+    ASSERT_NE(judge, nullptr);
+    judge->holdJudgeForTest(true);
+    ASSERT_EQ(s.r.produce({{2, 20, 1}}), 0);
+    s.r.passes(100);
+    const auto pushBound = [&](int64_t from) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::PushRead;
+        op.subscriptionId = 1; op.sessionId = 4201; op.topicId = VerdictRig::kSrc; op.partition = 0;
+        op.nextOffset = from; op.hwBound = s.r.leo();
+        op.replica = s.r.replica.get(); op.logPtr = s.r.log.get();
+        EXPECT_TRUE(s.r.worker->tryEnqueueOp(std::move(op)));
+        int64_t bound = -2;
+        s.r.now += 1'000'000;
+        s.r.worker->doWork(s.r.now);
+        s.r.worker->drainReturn([&](WorkerReturn r) {
+            if (r.type == WorkerReturn::Type::PushReadResult) bound = r.pushEffectiveBound();
+        }, [](const TxnReturn&) {});
+        return bound;
+    };
+    EXPECT_EQ(pushBound(judge->judgedThrough()), -1) << "at the judge's cursor: unanswered, the gateway re-issues";
+    judge->holdJudgeForTest(false);
+    s.r.passes(300);
+    EXPECT_GE(pushBound(0), s.r.replica->highWatermark()) << "the HW holds the bound again: parkable";
+}
+
 TEST_P(CheckedWritesConsumer, ReplayFromStartSkipsRejected) {
     TypedRig s;
     int rejected = 0;
