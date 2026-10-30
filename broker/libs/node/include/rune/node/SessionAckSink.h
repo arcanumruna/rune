@@ -1516,7 +1516,7 @@ struct AeronSessionPubPolicy {
         if (pos == aeron::PUBLICATION_CLOSED || pos == aeron::MAX_POSITION_EXCEEDED) return -4;
         return pos;
     }
-    std::array<uint8_t, rune::protocol::client::ProduceResponse::kMaxEncodedSize> large_{};
+    std::array<uint8_t, rune::protocol::client::ProduceResponse::kMaxEncodedSize + rune::protocol::client::kCryptoOverhead> large_{};
     uint64_t offered_ = 0;
 };
 static_assert(SessionAckSinkT<AeronSessionPubPolicy>::kClaimFatal == -4);

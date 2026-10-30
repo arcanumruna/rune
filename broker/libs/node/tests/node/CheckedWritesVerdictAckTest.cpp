@@ -114,6 +114,24 @@ TEST_F(CheckedWritesVerdictAckRegression, FourThousandRejectionsAckIsOfferedRegr
     EXPECT_EQ(r.sinkForTest()->claimFramesForTest(), claimsBefore) << "the big ack did not go through tryClaim";
 }
 
+TEST(CheckedWritesVerdictAckRigRegression, FourThousandRejectionsEncryptedAckIsOfferedRegression) {
+    VerdictRig o;
+    o.typed();
+    o.installRejectView(kRej, kObj, tagRule(9));
+    o.enableAcks(17, 0, /*encrypted=*/true);
+    o.passes(60);
+    std::vector<Rec> recs;
+    for (uint64_t i = 0; i < 4096; ++i) recs.push_back({i + 1, 1, 9});
+    const uint64_t claimsBefore = o.sinkForTest()->claimFramesForTest();
+    const int64_t c = o.produceFrame(recs, kAcksView);
+    const auto a = o.ack(c, 3000);
+    ASSERT_TRUE(a) << "the sealed ack is above kMaxEncodedSize: it was refused as fatal";
+    EXPECT_EQ(a->frameLen, 32'824u);
+    ASSERT_EQ(a->verdicts.size(), 4096u);
+    EXPECT_EQ(o.sinkForTest()->offerFramesForTest(), 1u);
+    EXPECT_EQ(o.sinkForTest()->claimFramesForTest(), claimsBefore);
+}
+
 TEST_F(CheckedWritesVerdictAckRegression, OneRecordAckIsClaimedNotOffered) {
     const int64_t c = r.produceFrame({{1, 1, 9}}, kAcksView);
     ASSERT_TRUE(r.ack(c));

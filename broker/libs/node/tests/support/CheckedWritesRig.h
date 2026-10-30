@@ -3,6 +3,8 @@
 // source {id uint64 key, v int64, tag uint8}, TestReject views and a projection, driven pass by pass without a driver.
 #include <rune/aeronutil/testing/FreePort.h>
 #include <rune/codec/Filter.h>
+#include <rune/crypto/Aead.h>
+#include <rune/protocol/client/CryptoEnvelope.h>
 #include <rune/codec/FilterPredicate.h>
 #include <rune/codec/Serialize.h>
 #include <rune/node/EmbeddedDriver.h>
@@ -398,8 +400,17 @@ public:
     static constexpr int64_t kAckSession = 5;
 
     /// Answers ride the worker's ack sink to a session announced at `clientVersion`.  `arenaEntries` != 0 shrinks the sink's verdict arena.
-    void enableAcks(int32_t clientVersion = 17, uint32_t arenaEntries = 0) {
+    void enableAcks(int32_t clientVersion = 17, uint32_t arenaEntries = 0, bool encrypted = false) {
         ensureDriver_();
+        ackEncrypted_ = encrypted;
+        if (encrypted) {
+            rune::crypto::AeadKey c2b{}, b2c{};
+            for (std::size_t i = 0; i < sizeof(c2b.bytes); ++i) { c2b.bytes[i] = static_cast<uint8_t>(i * 5 + 1); b2c.bytes[i] = static_cast<uint8_t>(i * 7 + 3); }
+            std::memcpy(c2bKey_, c2b.bytes, sizeof(c2bKey_));
+            std::memcpy(b2cKey_, b2c.bytes, sizeof(b2cKey_));
+            c2bSeal_ = std::make_unique<rune::crypto::AeadCipher>(rune::crypto::Cipher::Aes256Gcm, c2b, kC2bPrefix);
+            b2cOpen_ = std::make_unique<rune::crypto::AeadCipher>(rune::crypto::Cipher::Aes256Gcm, b2c, kB2cPrefix);
+        }
         ackVersion_ = clientVersion;
         arenaEntries_ = arenaEntries;
         if (!ackIngress_) {
@@ -424,6 +435,7 @@ public:
         m.acks = acks; m.producerId = pid; m.producerEpoch = 0; m.baseSequence = seq;
         m.recordBatch = std::span<const uint8_t>(bytes);
         std::vector<uint8_t> f(m.encodedSize()); m.encode(f.data());
+        if (ackEncrypted_) f = sealC2b_(f);
         aeron::concurrent::AtomicBuffer ab(f.data(), static_cast<aeron::util::index_t>(f.size()));
         for (int i = 0; i < 5000 && ackPub_->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) <= 0; ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -612,15 +624,51 @@ private:
         if (arenaEntries_ != 0) worker->setVerdictAckArenaEntriesForTest(arenaEntries_);
         WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = kAckSession;
         a.egressStreamId = kAckStream; a.egressChannel = "aeron:ipc?term-length=65536"; a.clientVersion = ackVersion_;
+        if (ackEncrypted_) {
+            a.sessionEncrypted = true; a.senderKeyValid = true; a.c2bKeyValid = true;
+            a.senderCipher = static_cast<uint8_t>(rune::crypto::Cipher::Aes256Gcm);
+            std::memcpy(a.senderKey, b2cKey_, sizeof(a.senderKey)); std::memcpy(a.senderKeyPrefix, kB2cPrefix, sizeof(a.senderKeyPrefix));
+            std::memcpy(a.c2bKey, c2bKey_, sizeof(a.c2bKey)); std::memcpy(a.c2bKeyPrefix, kC2bPrefix, sizeof(a.c2bKeyPrefix));
+        }
         EXPECT_TRUE(worker->tryEnqueueOp(std::move(a)));
+    }
+    std::vector<uint8_t> sealC2b_(const std::vector<uint8_t>& plain) {
+        namespace pc = rune::protocol::client;
+        const uint64_t sq = ++c2bSeq_;
+        std::vector<uint8_t> out(plain.size() + pc::kCryptoOverhead);
+        std::memcpy(out.data(), plain.data(), pc::MessageHeader::ENCODED_SIZE);
+        pc::CryptoSubHeader sub;
+        sub.version = 1;
+        sub.senderId = 1;   // the receiver: worker 0
+        sub.seq = sq;
+        sub.encode(out.data() + pc::MessageHeader::ENCODED_SIZE);
+        const std::size_t n = c2bSeal_->seal(sq, out.data(), pc::kCryptoHeaderBytes, plain.data() + pc::MessageHeader::ENCODED_SIZE,
+                                             plain.size() - pc::MessageHeader::ENCODED_SIZE, out.data() + pc::kCryptoHeaderBytes);
+        out.resize(pc::kCryptoHeaderBytes + n);
+        return out;
     }
     void pollAcks_() {
         if (!ackSub_) return;
         ackSub_->poll(aeron::FragmentAssembler([&](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l, aeron::Header&) {
-            const auto r = rune::protocol::client::ProduceResponse::decode(reinterpret_cast<const uint8_t*>(b.buffer() + o), static_cast<std::size_t>(l));
+            const uint8_t* wire = reinterpret_cast<const uint8_t*>(b.buffer() + o);
+            std::size_t wireLen = static_cast<std::size_t>(l);
+            std::vector<uint8_t> plain;
+            if (ackEncrypted_) {
+                namespace pc = rune::protocol::client;
+                const auto sub = pc::CryptoSubHeader::decode(wire + pc::MessageHeader::ENCODED_SIZE, wireLen - pc::MessageHeader::ENCODED_SIZE);
+                if (!sub) return;
+                plain.resize(wireLen);
+                const long n = b2cOpen_->open(sub->seq, wire, pc::kCryptoHeaderBytes, wire + pc::kCryptoHeaderBytes, wireLen - pc::kCryptoHeaderBytes, plain.data() + pc::MessageHeader::ENCODED_SIZE);
+                if (n < 0) return;
+                std::memcpy(plain.data(), wire, pc::MessageHeader::ENCODED_SIZE);
+                plain.resize(pc::MessageHeader::ENCODED_SIZE + static_cast<std::size_t>(n));
+                wire = plain.data();
+                wireLen = plain.size();
+            }
+            const auto r = rune::protocol::client::ProduceResponse::decode(wire, wireLen);
             if (!r) return;
             Ack a;
-            a.code = r->errorCode; a.baseOffset = r->baseOffset; a.hasVerdicts = r->hasVerdicts; a.frameLen = static_cast<std::size_t>(l); a.step = passNo_;
+            a.code = r->errorCode; a.baseOffset = r->baseOffset; a.hasVerdicts = r->hasVerdicts; a.frameLen = static_cast<std::size_t>(l) - (ackEncrypted_ ? rune::protocol::client::kCryptoOverhead : 0); a.step = passNo_;
             r->forEachVerdict([&](uint16_t i, uint16_t code, uint32_t cid) { a.verdicts.emplace_back(i, code, cid); });
             if (acksSeen_.emplace(r->correlationId, std::move(a)).second) ackOrder_.push_back(r->correlationId);
         }).handler(), 64);
@@ -630,6 +678,11 @@ private:
     std::shared_ptr<aeron::ExclusivePublication> ackPub_;
     std::map<int64_t, Ack> acksSeen_;
     std::vector<int64_t> ackOrder_;
+    static constexpr uint8_t kC2bPrefix[4] = {9, 8, 7, 6}, kB2cPrefix[4] = {1, 2, 3, 4};
+    bool ackEncrypted_ = false;
+    uint8_t c2bKey_[32] = {}, b2cKey_[32] = {};
+    uint64_t c2bSeq_ = 0;
+    std::unique_ptr<rune::crypto::AeadCipher> c2bSeal_, b2cOpen_;
     int32_t ackVersion_ = 17;
     uint32_t arenaEntries_ = 0;
     int64_t passNo_ = 0;
