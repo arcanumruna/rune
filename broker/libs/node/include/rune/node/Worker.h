@@ -7163,7 +7163,17 @@ private:
     // Part 04: the markers below the HW are committed (W follows them), and the index forgets what retention deleted.
     void verdictHousekeeping_(RcSlot& sl) noexcept {
         verdictOnHw(*sl.write, sl.replica->highWatermark());
-        if (sl.replica->isDiskBacked()) sl.write->rejected.dropBelow(sl.replica->log()->logStartOffset());
+        if (!sl.replica->isDiskBacked()) return;
+        PartitionWriteState& w = *sl.write;
+        rune::storage::Log& log = *sl.replica->log();
+        w.rejected.dropBelow(log.logStartOffset());
+        // The latest committed set change outlives retention: a restart without it finds no verdict source.  When it sits in
+        // the oldest segment the leader logs it again; retention takes that segment once the new one is committed.
+        const int64_t change = w.constraintSets.lastChangeBelow(sl.replica->highWatermark());
+        sl.replica->holdRetentionAt(change < 0 ? std::numeric_limits<int64_t>::max() : change);
+        if (w.verdicts == nullptr || w.constraintSets.latest().empty()) return;
+        const int64_t nextBase = log.nextSegmentBaseAfter(log.logStartOffset());
+        if (nextBase >= 0 && w.constraintSets.lastChangeOffset() < nextBase) (void)w.verdicts->requestChange(w.constraintSets.latest(), true);
     }
     // Part 04 (P4-14): tell the cleaner how far the verdicts are durable.  The marker end is published before the bound.
     void publishVerdictCleanerBounds_() noexcept {

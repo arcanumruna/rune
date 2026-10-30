@@ -143,6 +143,38 @@ TEST(CheckedWritesVerdictWorkerRegression, FullIndexGrowsAndResumesRegression) {
     EXPECT_GT(r.writeState()->rejected.capacity(), 8u);
 }
 
+TEST(CheckedWritesVerdictWorkerRegression, RetentionNeverDeletesTheLatestSetChangeRegression) {
+    VerdictRig r(false, /*rollBytes=*/1);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    for (uint64_t i = 1; i <= 6; ++i) ASSERT_EQ(r.produce({{i, int64_t(i), 0}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    const int64_t firstChange = r.readLog().changes.front().offset;
+    // The cleaner proposes every sealed segment each cycle; the owner takes what the hold lets go.
+    for (int i = 0; i < 300; ++i) {
+        if (const auto snap = r.log->cleanerSnapshot()) {
+            for (const auto& si : *snap) (void)r.log->enqueueDeletedSegment(si.baseOffset, si.lineage);
+        }
+        r.pass();
+    }
+    EXPECT_GT(r.log->logStartOffset(), firstChange) << "the first change record's segment went once a newer change was committed";
+    EXPECT_FALSE(r.readLog().changes.empty());
+    r.restart();
+    r.passes(100);
+    ASSERT_FALSE(r.writeState()->constraintSets.latest().empty()) << "after the restart the topic is still a verdict source";
+    ASSERT_EQ(r.produce({{7, 7, 9}, {8, 8, 0}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    EXPECT_EQ(r.stats()->rejectionsConstraint, 1u);
+    const int64_t sub = r.subscribe(SubKind::Raw, r.log->logStartOffset());
+    bool sawAccepted = false;
+    for (const auto& d : r.collect(sub).records) {
+        EXPECT_NE(d.id, 7u) << "a rejected record was delivered";
+        sawAccepted = sawAccepted || d.id == 8;
+    }
+    EXPECT_TRUE(sawAccepted);
+}
+
 TEST(CheckedWritesVerdictWorker, DemotePromoteKeepsOwnVerdicts) {
     VerdictRig r;
     r.typed();

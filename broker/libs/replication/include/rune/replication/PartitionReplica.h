@@ -938,8 +938,11 @@ public:
     /// cleaner; the owner validates (identity, not active, segment end <= HW)
     /// and only then renames the files away.  Disk-backed only.
     int drainRetentionDeletesOnOwner() {
-        return log()->drainRetentionDeletes(highWatermark());
+        return log()->drainRetentionDeletes(std::min(highWatermark(), retentionHold_));
     }
+    /// Owner thread: retention keeps the segment holding `offset` and everything above it (the latest committed
+    /// constraint-set change must outlive retention until a newer one is committed).  INT64_MAX = no hold.
+    void holdRetentionAt(Offset offset) noexcept { retentionHold_ = offset; }
 
     // ---- Fix round 3 (N-MEDIUM-1): clean-watermark rewind channel ----------
     // lastCleanOffset_ is written by the cleaner only.  The owner, on rejecting
@@ -2113,6 +2116,7 @@ private:
     // D3b: first unstable offset (LSO) for the cleaner — see publishCleanerLso().
     std::atomic<Offset> publishedLsoForCleaner_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
     std::atomic<Offset> publishedVerdictBound_{kNoCleanerLso};
+    Offset retentionHold_ = std::numeric_limits<Offset>::max();   // owner thread only
     std::atomic<Offset> publishedVerdictMarkerEnd_{0};
     // D3b fix round 1: min fetch position over every assigned replica — see
     // cleanerMarkerRemovalBound().  0 until the first leader publication.

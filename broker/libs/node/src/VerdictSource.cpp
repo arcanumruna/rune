@@ -371,9 +371,9 @@ int VerdictSource::dropRetired_(PartitionWriteState& state) {
     return static_cast<int>(before - members_.size());
 }
 
-int VerdictSource::requestChange(const ConstraintSet& next) {
+int VerdictSource::requestChange(const ConstraintSet& next, bool refresh) {
     if (state_ == nullptr || generation_ == kUnbound || needsActivation_) return kChangeDeferred;
-    if (next.sameMembers(state_->constraintSets.latest())) return kChangeUnchanged;
+    if (!refresh && next.sameMembers(state_->constraintSets.latest())) return kChangeUnchanged;
     ConstraintSet logged = next;
     logged.id = state_->constraintSets.latest().id + 1;
     std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};

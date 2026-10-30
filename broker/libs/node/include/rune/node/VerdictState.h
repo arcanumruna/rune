@@ -53,6 +53,11 @@ public:
         return it == changes_.end() ? INT64_MAX : it->offset;
     }
     [[nodiscard]] int64_t lastChangeOffset() const noexcept { return changes_.empty() ? -1 : changes_.back().offset; }
+    /// The offset of the latest change below `offset` (-1 = none): with `offset` the HW, the latest committed change.
+    [[nodiscard]] int64_t lastChangeBelow(int64_t offset) const noexcept {
+        auto it = std::lower_bound(changes_.begin(), changes_.end(), offset, [](const Change& c, int64_t o) { return c.offset < o; });
+        return it == changes_.begin() ? -1 : std::prev(it)->offset;
+    }
     void truncateFrom(int64_t offset) noexcept {
         while (!changes_.empty() && changes_.back().offset >= offset) changes_.pop_back();
     }

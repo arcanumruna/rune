@@ -60,7 +60,8 @@ public:
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);
     void removeVerdictView(uint64_t viewObjectId, uint64_t planFingerprint);
     /// Appends a constraint-set change at the LEO.  Returns the activation offset, kChangeDeferred or kChangeUnchanged.
-    int requestChange(const ConstraintSet& next);
+    /// `refresh`: append even when the members are those of the latest change (retention is about to delete its segment).
+    int requestChange(const ConstraintSet& next, bool refresh = false);
     void installTestVerdictViewForTest(ViewInstance*, uint64_t viewObjectId, TestRejectRule);
 
     /// Cold: the replica to append through and the leadership this judge serves.  A new generation re-activates.
@@ -189,6 +190,7 @@ bool VerdictSource::switchSet_(int64_t A, ReadRangeFn& readRange, const rune::vi
     for (const std::size_t i : scratchIdx_) {
         if (std::find(active_.begin(), active_.end(), i) != active_.end()) continue;   // staying
         Member& m = members_[i];
+        m.inst->foldCursor = std::max(m.inst->foldCursor, logStart_);   // retention deleted what a member that was never folded would read
         if (m.inst->foldCursor < A + 1) {
             const rune::storage::LogReadView v = readRange(m.inst->foldCursor, A + 1);
             if (!v.empty()) work += replay_(m, v, A + 1, aborted);
@@ -217,6 +219,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     rejectedThisPass_ = 0;
     for (const std::size_t i : active_) {
         Member& m = members_[i];
+        m.inst->foldCursor = std::max(m.inst->foldCursor, logStart_);
         if (m.inst->foldCursor >= judgeCursor_) continue;
         const rune::storage::LogReadView v = readRange(m.inst->foldCursor, judgeCursor_);
         if (!v.empty()) work += replay_(m, v, judgeCursor_, aborted);
