@@ -28,6 +28,8 @@
 #     7. Phase 2b E/E2: transient topic presence_t defined at runtime; produce
 #        acks None/Leader/All; subscribe earliest/offset/latest; read_committed
 #        over a committed + an aborted transaction.
+#     7b. Checked writes Part 10: a PERSISTED view presence_totals (GROUP BY hp: Count(*), Min(id)) over the
+#        TRANSIENT topic presence_pv; a view over a keyless transient topic answers 35.
 #     Prints VIEW_* KEY=VALUE handoff lines + "VIEW-PROBE-SETUP: OK".
 #
 #   RESTART: `docker compose restart rune-1` (same named volume — the
@@ -56,6 +58,8 @@
 #   the refilled ring, exactly once — never resuming at the old position).
 #     (e) presence_t exists after the restart (TopicExists, same id) and is
 #         empty (first produce at offset 0; subscribe + read_committed see 1).
+#     (f) presence_totals keeps its checkpoint rows across the restart (the transient ring comes back empty) and
+#         folds the new ring on top (PERSISTED-OVER-TRANSIENT-RESTART: OK).
 #     Prints "VIEW-ENGINE-E2E: OK" on success.
 #
 #   DDL conformance legs: setup also asserts ALTER on a view answers 38
@@ -336,10 +340,15 @@ VIEW_TOPIC_ID_AGG="$(extract VIEW_TOPIC_ID_AGG)"
 VIEW_FP_AGG="$(extract VIEW_FP_AGG)"
 VIEW_TT_TOPIC_ID="$(extract VIEW_TT_TOPIC_ID)"
 VIEW_TT_END="$(extract VIEW_TT_END)"
+VIEW_PRESENCE_PV_SRC_ID="$(extract VIEW_PRESENCE_PV_SRC_ID)"
+VIEW_PRESENCE_PV_TOPIC_ID="$(extract VIEW_PRESENCE_PV_TOPIC_ID)"
+VIEW_PRESENCE_PV_FP="$(extract VIEW_PRESENCE_PV_FP)"
+VIEW_PRESENCE_PV_N="$(extract VIEW_PRESENCE_PV_N)"
 
 for v in VIEW_SRC_TOPIC_ID VIEW_TOPIC_ID_PERSISTED VIEW_FP_PERSISTED \
          VIEW_TOPIC_ID_TRANSIENT VIEW_FP_TRANSIENT VIEW_KEY_ID VIEW_HP_INITIAL \
-         VIEW_ORDER_TOPIC_ID VIEW_TOPIC_ID_AGG VIEW_FP_AGG VIEW_TT_TOPIC_ID VIEW_TT_END; do
+         VIEW_ORDER_TOPIC_ID VIEW_TOPIC_ID_AGG VIEW_FP_AGG VIEW_TT_TOPIC_ID VIEW_TT_END \
+         VIEW_PRESENCE_PV_SRC_ID VIEW_PRESENCE_PV_TOPIC_ID VIEW_PRESENCE_PV_FP VIEW_PRESENCE_PV_N; do
     [ -n "${!v:-}" ] || fail "setup output did not carry ${v}= (handoff parse failed)"
 done
 log "Setup OK: srcTopicId=${VIEW_SRC_TOPIC_ID}" \
@@ -348,6 +357,11 @@ log "Setup OK: srcTopicId=${VIEW_SRC_TOPIC_ID}" \
     "key=${VIEW_KEY_ID} hp0=${VIEW_HP_INITIAL}" \
     "orderTopicId=${VIEW_ORDER_TOPIC_ID} viewAgg={id=${VIEW_TOPIC_ID_AGG},fp=${VIEW_FP_AGG}}" \
     "transientTopicId=${VIEW_TT_TOPIC_ID}"
+
+# Checked writes Part 10: a persisted view over a transient topic folds and a keyless transient source is refused (35).
+echo "${setup_out}" | grep -q "^PERSISTED-OVER-TRANSIENT: OK" \
+    || fail "setup client did not print 'PERSISTED-OVER-TRANSIENT: OK' (a persisted view over a transient topic must fold)"
+log "Persisted view over a transient topic OK: presence_totals (view ${VIEW_PRESENCE_PV_TOPIC_ID}) over presence_pv (${VIEW_PRESENCE_PV_SRC_ID})"
 
 # Phase 2b Part C: typed_route (8 partitions) — typed records routed by key.
 echo "${setup_out}" | grep -q "^TYPED-ROUTING: OK" \
@@ -447,7 +461,7 @@ check_race_leg view 32
 check_race_leg mixed 25
 docker rm -f "${RACE_A}" "${RACE_B}" >/dev/null 2>&1 || true
 
-CATALOG_NAMES="character,char_persisted,char_transient,order,user_totals,typed_route,race_topic,race_view,race_mixed,presence_t"
+CATALOG_NAMES="character,char_persisted,char_transient,order,user_totals,typed_route,race_topic,race_view,race_mixed,presence_t,presence_pv,presence_totals"
 dump_catalog() {
     local out
     out="$(run_client catalog_dump -e RUNE_CATALOG_NAMES="${CATALOG_NAMES}" 2>/dev/null)" || return 1
@@ -474,6 +488,21 @@ fi
 catalog_before="$(dump_catalog)" || fail "catalog dump (pre-restart) failed"
 echo "${catalog_before}" | grep -q " code=[1-9]" && fail "a pre-restart catalog entry did not resolve: ${catalog_before}"
 log "Catalog before restart:"; echo "${catalog_before}" >&2
+
+# ---------------------------------------------------------------------------
+# Step 4e (Part 10): the checkpoint of presence_totals must be on disk before the restart, or the post-restart ring has
+# nothing to keep the rows from.  Bounded poll (40 x 250 ms): the file exists, is non-empty and stopped growing.
+# ---------------------------------------------------------------------------
+PV_CKPT="/var/lib/rune/__view_snapshots/view-${VIEW_PRESENCE_PV_TOPIC_ID}-p0.committed.delta"
+pv_prev=-1; pv_ok=0
+for _ in $(seq 1 40); do
+    pv_size="$(docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" exec -T rune-1 stat -c %s "${PV_CKPT}" 2>/dev/null || echo 0)"
+    if [ "${pv_size}" -gt 0 ] && [ "${pv_size}" = "${pv_prev}" ]; then pv_ok=1; break; fi
+    pv_prev="${pv_size}"
+    sleep 0.25
+done
+[ "${pv_ok}" = "1" ] || fail "no stable checkpoint file for presence_totals (${PV_CKPT}) before the restart"
+log "presence_totals checkpoint on disk (${pv_size} bytes)"
 
 # ---------------------------------------------------------------------------
 # Step 5: Restart the broker (same named volume — persisted state survives).
@@ -505,6 +534,10 @@ restart_out=$(run_client verify_restart \
     -e RUNE_VIEW_TOPIC_ID_AGG="${VIEW_TOPIC_ID_AGG}" \
     -e RUNE_VIEW_FP_AGG="${VIEW_FP_AGG}" \
     -e RUNE_VIEW_TT_TOPIC_ID="${VIEW_TT_TOPIC_ID}" \
+    -e RUNE_VIEW_PRESENCE_PV_SRC_ID="${VIEW_PRESENCE_PV_SRC_ID}" \
+    -e RUNE_VIEW_PRESENCE_PV_TOPIC_ID="${VIEW_PRESENCE_PV_TOPIC_ID}" \
+    -e RUNE_VIEW_PRESENCE_PV_FP="${VIEW_PRESENCE_PV_FP}" \
+    -e RUNE_VIEW_PRESENCE_PV_N="${VIEW_PRESENCE_PV_N}" \
     2>&1)
 restart_rc=$?
 set -e
@@ -522,6 +555,9 @@ fi
 if ! echo "${restart_out}" | grep -q "VIEW-ENGINE-E2E: OK"; then
     fail "verify_restart client did not print the final 'VIEW-ENGINE-E2E: OK' sentinel"
 fi
+
+echo "${restart_out}" | grep -q "PERSISTED-OVER-TRANSIENT-RESTART: OK" \
+    || fail "verify_restart client did not print 'PERSISTED-OVER-TRANSIENT-RESTART: OK' (presence_totals lost its rows or did not fold the new ring)"
 
 # ---------------------------------------------------------------------------
 # Step 7a (E2 final fix wave C1) — GroupConsume x Restart, part 2: the ring
