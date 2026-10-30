@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -149,8 +150,9 @@ public:
     /// Route a ProduceResponse to the ONE producer named by the batch id's
     /// ordinal (O(1)); non-batch ids (transactional / control) are ignored.
     /// D6: logStartOffset = ProduceResponse.logStartOffset (-1 = not carried).
+    /// Client 17: `hasVerdicts` + the trailer entries of a View ack of a verdict source.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
-                           int64_t logStartOffset = -1);
+                           int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {});
 
     // ---- Phase 2b F Task 2: coordinator answers, routed by producer ordinal ----
 

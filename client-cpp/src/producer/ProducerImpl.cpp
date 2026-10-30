@@ -1340,7 +1340,7 @@ void ProducerImpl::setBatchAckCq(Completions* cq, CqRef ref) {
 }
 
 void ProducerImpl::completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t aux, OpStatus st,
-                                   uint16_t errorCode) noexcept {
+                                   uint16_t errorCode, uint32_t constraintId) noexcept {
     if (h == 0) return;
     const Token t = ackhandle::token(h);
     if (ackhandle::isCq(h)) {
@@ -1353,6 +1353,7 @@ void ProducerImpl::completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t
         c.status        = st;
         c.errorCode     = errorCode;
         c.reservedBytes = kAckRecordBytes;
+        c.reserved0     = constraintId;
         hooks_.cqDeliver(hooks_.ctx, ackhandle::cqRef(h), c);
         return;
     }
@@ -2527,7 +2528,7 @@ constexpr bool isPartitionRefusal_(uint16_t code) noexcept {
 }  // namespace
 
 void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
-                                     int64_t logStartOffset)
+                                     int64_t logStartOffset, bool hasVerdicts, std::span<const uint8_t> verdicts)
 {
     const DutyScope duty(*this);  // fix1 C1
     if (!batchcorr::isBatch(correlationId) || batchcorr::ordinal(correlationId) != ordinal_) return;
@@ -2554,7 +2555,12 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         const int64_t off = baseOffset < 0 ? -1 : baseOffset;
         emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, 0,
                       OpStatus::Ok, units, b->producerEpoch, b->producerId);
-        completeSlice_(ps, b->ackStart, b->ackCount, off, OpStatus::Ok, 0, b->tier2, b->recordCount);
+        if (hasVerdicts && !verdicts.empty())
+            completeVerdictSlice_(ps, b->ackStart, b->ackCount, off, b->tier2, b->recordCount, verdicts);
+        else if (dupSeq && viewAcks())   // stored, but this retry's verdicts are gone: never per-record errors
+            completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::VerdictUnknown, static_cast<uint16_t>(errorCode), b->tier2, b->recordCount);
+        else
+            completeSlice_(ps, b->ackStart, b->ackCount, off, OpStatus::Ok, 0, b->tier2, b->recordCount);
         if (b->baseSequence >= 0 && b->producerId == ps.producerId && b->producerEpoch == ps.epoch) {
             ps.lastAckedSeq = std::max(ps.lastAckedSeq, b->baseSequence + b->recordCount - 1);
             // #694: this transaction now has data on the broker for this partition (an ack of the CURRENT identity).
@@ -3049,6 +3055,36 @@ void ProducerImpl::completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t
                                  static_cast<double>(value));
         completeHandle_(h, tier2 ? OpKind::Tier2Batch : OpKind::Send, value, tier2 ? recordCount : 0,
                         st, errorCode);
+    }
+}
+
+void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset, bool tier2,
+                                         int32_t recordCount, std::span<const uint8_t> verdicts) noexcept {
+    const auto le16 = [](const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); };
+    const auto le32 = [](const uint8_t* p) {
+        return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+    };
+    const std::size_t n = verdicts.size() / 8;
+    std::size_t next = 0;   // entries are in ascending record order
+    for (int32_t i = 0; i < ackCount; ++i) {
+        uint64_t& slot = ps.ackRing[(ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
+        const uint64_t h = slot;
+        slot = 0;
+        if (h == 0) continue;
+        if (tier2) {
+            if (n != 0)
+                completeHandle_(h, OpKind::Tier2Batch, -1, recordCount, OpStatus::BrokerError, le16(verdicts.data() + 2), le32(verdicts.data() + 4));
+            else
+                completeHandle_(h, OpKind::Tier2Batch, baseOffset >= 0 ? baseOffset : -1, recordCount, OpStatus::Ok, 0);
+            continue;
+        }
+        if (next < n && le16(verdicts.data() + next * 8) == i) {
+            const uint8_t* e = verdicts.data() + next * 8;
+            ++next;
+            completeHandle_(h, OpKind::Send, -1, 0, OpStatus::BrokerError, le16(e + 2), le32(e + 4));
+        } else {
+            completeHandle_(h, OpKind::Send, baseOffset >= 0 ? baseOffset + i : -1, 0, OpStatus::Ok, 0);
+        }
     }
 }
 

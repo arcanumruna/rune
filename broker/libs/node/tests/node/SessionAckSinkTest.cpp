@@ -1236,3 +1236,65 @@ TEST(CheckedWritesAckSinkRegression, SealedV17AckFitsTheScratchRegression) {
     ASSERT_EQ(st->sent.size(), 1u);
     EXPECT_EQ(st->sent[0].second.size(), 56u + pc::kCryptoOverhead);
 }
+
+namespace {
+AckEntry withRun(Sink& s, int64_t sid, int64_t corr, uint16_t n) {
+    AckEntry a = v17Ack(sid, corr, 0, true);
+    a.verdictCount = n;
+    EXPECT_TRUE(s.reserveVerdicts(n, a.verdictRun));
+    auto e = s.verdictEntries(a.verdictRun);
+    for (std::size_t i = 0; i < e.size(); ++i) e[i] = static_cast<uint8_t>(i + 1);
+    return a;
+}
+}  // namespace
+
+TEST(CheckedWritesAckSink, TrailerBytesComeFromTheArena) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c7", 1, pc::kClientVersionCheckedWrites));
+    pass(s); pass(s);
+    ASSERT_TRUE(s.enqueue(withRun(s, 7, 1, 2)));
+    pass(s);
+    ASSERT_EQ(st->sent.size(), 1u);
+    ASSERT_EQ(st->sent[0].second.size(), 54u + 2 + 16);
+    auto r = pc::ProduceResponse::decode(st->sent[0].second.data(), st->sent[0].second.size());
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->verdictCount, 2);
+    for (uint32_t i = 0; i < 16; ++i) EXPECT_EQ(st->sent[0].second[54 + 2 + i], static_cast<uint8_t>(i + 1));
+}
+
+TEST(CheckedWritesAckSink, ArenaRunsAreFreedOnClaimDropAndFail) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7); ready(s, 8); ready(s, 9);
+    s.announce(7, "c7", 1, pc::kClientVersionCheckedWrites);
+    s.announce(8, "c8", 1, pc::kClientVersionCheckedWrites);
+    s.announce(9, "c9", 1, pc::kClientVersionCheckedWrites);
+    pass(s); pass(s);
+    st->closed.insert(2);                                   // session 8's publication fails on its claim
+    ASSERT_TRUE(s.enqueue(withRun(s, 7, 1, 3)));            // claimed
+    ASSERT_TRUE(s.enqueue(withRun(s, 8, 2, 4)));            // fatal claim: dropped
+    ASSERT_TRUE(s.enqueue(withRun(s, 5, 3, 5)));            // unknown session: orphaned
+    EXPECT_EQ(s.verdictsUsedForTest(), 12u);
+    s.flush(0, 0);
+    s.flush(1, 1);
+    EXPECT_EQ(s.verdictsUsedForTest(), 0u);
+}
+
+TEST(CheckedWritesAckSink, ArenaReusesTheFreedRegionAndRefusesWhenFull) {
+    VerdictAckArena a(16, 4);
+    uint32_t r1, r2, r3;
+    ASSERT_TRUE(a.reserveVerdicts(10, r1));
+    EXPECT_FALSE(a.reserveVerdicts(10, r2)) << "no room before the end and none at the start";
+    ASSERT_TRUE(a.reserveVerdicts(6, r2));
+    a.free(r1);
+    ASSERT_TRUE(a.reserveVerdicts(10, r3)) << "wraps to 0 once the head advanced";
+    EXPECT_EQ(a.used(), 16u);
+    a.free(r2); a.free(r3);
+    EXPECT_EQ(a.used(), 0u);
+}
+
+TEST(CheckedWritesAckSink, AckTermIsNeverBelowTheFloor) {
+    EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1", 65536), "aeron:udp?endpoint=h:1|term-length=524288");
+    EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1|term-length=64k", 0), "aeron:udp?endpoint=h:1|term-length=524288");
+    EXPECT_EQ(withAckTermLength("aeron:udp?term-length=1048576", 65536), "aeron:udp?term-length=1048576");
+    EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1", 0), "aeron:udp?endpoint=h:1");
+}

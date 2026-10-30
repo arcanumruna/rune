@@ -108,7 +108,9 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <span>
 #include <variant>
+#include <vector>
 
 namespace rune::node {
 
@@ -140,6 +142,68 @@ struct AckEntry {
     uint32_t verdictRun    = kNoVerdictRun;
     uint16_t verdictCount  = 0;
     uint8_t  hasVerdicts   = 0;
+};
+
+inline constexpr uint32_t kVerdictAckArenaEntries = 65536;
+
+/// The verdict trailers of the acks queued in a sink: 8-byte entries {recordIndex u16, code u16, constraintId u32} in a ring,
+/// plus a ring of run records.  A run never wraps (one that does not fit before the end starts at 0 when the head allows) and
+/// is freed when its ack is claimed, dropped or failed; the head advances over freed runs, so the arena frees in allocation
+/// order.  Both tables are allocated once, at construction.
+class VerdictAckArena {
+public:
+    explicit VerdictAckArena(uint32_t entries = kVerdictAckArenaEntries, uint32_t maxRuns = 32768)
+        : bytes_(std::size_t{entries} * 8), runs_(maxRuns), capacity_(entries) {}
+
+    /// False = full: the caller defers the release.
+    [[nodiscard]] bool reserveVerdicts(uint16_t n, uint32_t& run) noexcept {
+        if (runCount_ == runs_.size() || n > capacity_) return false;
+        uint32_t start;
+        if (runCount_ == 0) {
+            head_ = tail_ = start = 0;
+            wrapped_ = false;
+        } else if (!wrapped_) {
+            if (tail_ + n <= capacity_) start = tail_;
+            else if (n <= head_) { start = 0; wrapped_ = true; }
+            else return false;
+        } else {
+            if (tail_ + n > head_) return false;
+            start = tail_;
+        }
+        const uint32_t slot = (runHead_ + runCount_) % static_cast<uint32_t>(runs_.size());
+        runs_[slot] = Run{start, n, false};
+        ++runCount_;
+        tail_ = start + n;
+        used_ += n;
+        run = slot;
+        return true;
+    }
+    [[nodiscard]] std::span<uint8_t> entries(uint32_t run) noexcept {
+        return {bytes_.data() + std::size_t{runs_[run].start} * 8, std::size_t{runs_[run].count} * 8};
+    }
+    void free(uint32_t run) noexcept {
+        Run& r = runs_[run];
+        if (r.freed) return;
+        r.freed = true;
+        used_ -= r.count;
+        while (runCount_ != 0 && runs_[runHead_].freed) {
+            runHead_ = (runHead_ + 1) % static_cast<uint32_t>(runs_.size());
+            --runCount_;
+        }
+        if (runCount_ == 0) { head_ = tail_ = 0; wrapped_ = false; return; }
+        const uint32_t h = runs_[runHead_].start;
+        if (h < head_) wrapped_ = false;
+        head_ = h;
+    }
+    [[nodiscard]] std::size_t used() const noexcept { return used_; }
+
+private:
+    struct Run { uint32_t start, count; bool freed; };
+    std::vector<uint8_t> bytes_;
+    std::vector<Run>     runs_;
+    uint32_t capacity_;
+    uint32_t head_ = 0, tail_ = 0, runHead_ = 0, runCount_ = 0, used_ = 0;
+    bool     wrapped_ = false;
 };
 
 enum class PubFind : uint8_t { Pending, Ready, Error };
@@ -425,6 +489,18 @@ public:
         tombstone_(sessionId);                                       // MEDIUM-2 (evicts the oldest when full)
     }
 
+    /// Part 04: the verdict trailer of a View ack lives in the sink until the ack is claimed, dropped or failed.
+    [[nodiscard]] bool reserveVerdicts(uint16_t n, uint32_t& run) noexcept { return verdicts_.reserveVerdicts(n, run); }
+    [[nodiscard]] std::span<uint8_t> verdictEntries(uint32_t run) noexcept { return verdicts_.entries(run); }
+    [[nodiscard]] std::size_t verdictsUsedForTest() const noexcept { return verdicts_.used(); }
+    void resizeVerdictArenaForTest(uint32_t entries) { verdicts_ = VerdictAckArena(entries); }
+    /// Acks claimed whole / offered because they exceed one claim (test visibility).
+    [[nodiscard]] uint64_t claimFramesForTest() const noexcept { return claimedFrames_ - offerFramesForTest(); }
+    [[nodiscard]] uint64_t offerFramesForTest() const noexcept {
+        if constexpr (requires { policy_.offered(); }) return policy_.offered();
+        else return 0;
+    }
+
     /// Queue one ack for this pass's flush.  False only when the queue is full
     /// (the worker's intake gate makes that an invariant violation).
     bool enqueue(const AckEntry& a) noexcept {
@@ -496,6 +572,7 @@ private:
                 if (a.sessionPos < 0) a.sessionPos = ringProducerPos;
                 if (ringConsumerPos >= a.sessionPos) {
                     if (a.direct) directDone_(a.direct, kNone, false);
+                    freeVerdicts_(a);
                     ++dropped_;
                     continue;
                 }
@@ -549,6 +626,8 @@ private:
                         if (const Edges& e = edges_[idx];
                             ((e.lost | e.reportedHeld) != 0) | ((e.dflags & (kDfDelivered | kDfExpiring)) != kDfDelivered))
                             [[unlikely]] claimedWatched_(idx);
+                        freeVerdicts_(a);
+                        ++claimedFrames_;
                         if (a.credit) noteCredit_(idx);              // D8c: gateway-routed — return its credit
                         else if (a.direct) directDone_(a.direct, idx, true);   // D8d: its direct share
                         // Hop chain: the ack left on the client's session publication.
@@ -566,6 +645,7 @@ private:
                     if (pos == kClaimFatal) [[unlikely]] {           // can never deliver: CLOSED / MAX_POSITION
                         fail_(st);
                         if (a.direct) directDone_(a.direct, idx, false);
+                        freeVerdicts_(a);
                         ++dropped_;
                         ++work;
                         continue;
@@ -575,6 +655,7 @@ private:
                 }
             } else if (std::holds_alternative<PubFailed>(st)) {
                 if (a.direct) directDone_(a.direct, idx, false);
+                freeVerdicts_(a);
                 ++dropped_;                                          // reported → the runtime closes it
                 continue;
             }
@@ -1262,7 +1343,7 @@ private:
         unresolvedCount_ = keep;
         return work;
     }
-    static void encode_(const AckEntry& a, int32_t clientVersion, uint8_t* dst) noexcept {
+    void encode_(const AckEntry& a, int32_t clientVersion, uint8_t* dst) noexcept {
         rune::protocol::client::ProduceResponse r;
         r.sessionId      = a.sessionId;
         r.correlationId  = a.correlationId;
@@ -1270,11 +1351,11 @@ private:
         r.partition      = a.partition;
         r.baseOffset     = a.baseOffset;
         r.logStartOffset = a.logStartOffset;
-        // Client 17: encodeFor writes these only for a session at 17 or later.  The verdict arena is Part 04's.
-        assert(a.verdictCount == 0);
+        // Client 17: encodeFor writes these only for a session at 17 or later.
         r.assignedBase   = a.assignedBase;
         r.hasVerdicts    = a.hasVerdicts != 0;
         r.verdictCount   = a.verdictCount;
+        if (a.verdictCount != 0) r.verdictBytes = verdicts_.entries(a.verdictRun);
         // Task 14 (D28): a Throttled retry-after only to a v14+ client (encodeFor answers it InvalidRequest), as the
         // gateway path does.
         if (a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled) &&
@@ -1285,7 +1366,13 @@ private:
         r.encodeFor(dst, clientVersion);
     }
 
+    void freeVerdicts_(const AckEntry& a) noexcept {
+        if (a.verdictCount != 0) [[unlikely]] verdicts_.free(a.verdictRun);
+    }
+
     PubPolicy                                                        policy_;
+    VerdictAckArena                                                  verdicts_;
+    uint64_t                                                         claimedFrames_ = 0;
     std::array<int64_t, kMaxSessions>                                keys_{};      // 0 = empty
     std::array<PubState, kMaxSessions>                               states_{};
     std::array<uint64_t, kMaxSessions>                               heldPass_{};  // pass that last held acks
@@ -1381,12 +1468,13 @@ struct AeronSessionPubPolicy {
     using PubHandle = std::shared_ptr<aeron::ExclusivePublication>;
     aeron::Aeron* client = nullptr;
     int32_t controlTermBytes = 0;   ///< per-publication term for the ack stream (0 = driver default)
+    int32_t minTermBytes = kMinAckTermBytes;   ///< a smaller term (this or the channel's own) is raised to it: a big ack is offered
 
     int64_t add(std::string_view channel, int32_t streamId) noexcept {
         // A10: sparse terms — created on a worker thread with io_uring work pending (see withSparseTerms).
         try {
             return client->addExclusivePublication(
-                rune::node::withSparseTerms(rune::node::withTermLength(channel, controlTermBytes)), streamId);
+                rune::node::withSparseTerms(rune::node::withAckTermLength(channel, controlTermBytes, minTermBytes)), streamId);
         }
         catch (...) { return -1; }
     }
@@ -1400,6 +1488,7 @@ struct AeronSessionPubPolicy {
     }
     template <class Encode>
     int64_t claim(PubHandle& pub, std::size_t len, Encode&& encode) noexcept {
+        if (len > static_cast<std::size_t>(pub->maxPayloadLength())) [[unlikely]] return offerLarge(pub, len, encode);
         aeron::concurrent::logbuffer::BufferClaim c;
         int64_t pos = pub->tryClaim(static_cast<aeron::util::index_t>(len), c);
         if (pos == aeron::ADMIN_ACTION) [[unlikely]]   // A9: term rotated — retry now (Aeron contract)
@@ -1412,6 +1501,23 @@ struct AeronSessionPubPolicy {
         if (pos == aeron::PUBLICATION_CLOSED || pos == aeron::MAX_POSITION_EXCEEDED) return -4;
         return pos;                                                  // NOT_CONNECTED / BACK_PRESSURED / ADMIN_ACTION
     }
+    [[nodiscard]] uint64_t offered() const noexcept { return offered_; }
+
+    /// An ack above one claim (a View ack with thousands of verdicts): encoded into the policy's own buffer and offered —
+    /// the same return codes as claim.  Never allocates; a frame no message of the publication can carry is fatal.
+    template <class Encode>
+    [[gnu::cold]] [[gnu::noinline]] int64_t offerLarge(PubHandle& pub, std::size_t len, Encode& encode) noexcept {
+        if (len > static_cast<std::size_t>(pub->maxMessageLength()) || len > large_.size()) return -4;
+        encode(large_.data());
+        aeron::concurrent::AtomicBuffer buf(large_.data(), static_cast<aeron::util::index_t>(len));
+        int64_t pos = pub->offer(buf, 0, static_cast<aeron::util::index_t>(len));
+        if (pos == aeron::ADMIN_ACTION) pos = pub->offer(buf, 0, static_cast<aeron::util::index_t>(len));
+        if (pos > 0) { ++offered_; return pos; }
+        if (pos == aeron::PUBLICATION_CLOSED || pos == aeron::MAX_POSITION_EXCEEDED) return -4;
+        return pos;
+    }
+    std::array<uint8_t, rune::protocol::client::ProduceResponse::kMaxEncodedSize> large_{};
+    uint64_t offered_ = 0;
 };
 static_assert(SessionAckSinkT<AeronSessionPubPolicy>::kClaimFatal == -4);
 static_assert(SessionAckSinkT<AeronSessionPubPolicy>::kClaimNotConnected == aeron::NOT_CONNECTED,

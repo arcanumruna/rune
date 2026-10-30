@@ -1,5 +1,6 @@
 #pragma once
 // Aeron channel URI helpers shared by the gateway and the shard workers.
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -16,6 +17,27 @@ namespace rune::node {
     ch += (ch.find('?') == std::string::npos) ? '?' : '|';
     ch += "term-length=";
     ch += std::to_string(termBytes);
+    return ch;
+}
+
+/// Smallest term of an ack publication: a 4096-verdict ack (32,824 B) is offered, and Aeron caps one message at term / 8.
+inline constexpr int32_t kMinAckTermBytes = 512 * 1024;
+
+/// withTermLength for an ack channel: a `term-length` below kMinAckTermBytes (the channel's own or termBytes) is raised to it.
+/// termBytes <= 0 with no explicit value stays the driver default.  Cold path (publication setup).
+[[nodiscard]] inline std::string withAckTermLength(std::string_view channel, int32_t termBytes, int32_t floor = kMinAckTermBytes) {
+    constexpr std::string_view key = "term-length=";
+    std::string ch(channel);
+    const std::size_t at = ch.find(key);
+    if (at == std::string::npos) return withTermLength(ch, termBytes > 0 ? std::max(termBytes, floor) : 0);
+    const std::size_t from = at + key.size();
+    std::size_t end = from;
+    while (end < ch.size() && ch[end] != '|' && ch[end] != '&') ++end;
+    int64_t v = 0;
+    std::size_t i = from;
+    for (; i < end && ch[i] >= '0' && ch[i] <= '9'; ++i) v = v * 10 + (ch[i] - '0');
+    if (i < end) v *= (ch[i] == 'k' || ch[i] == 'K') ? 1024 : (ch[i] == 'm' || ch[i] == 'M') ? 1024 * 1024 : (ch[i] == 'g' || ch[i] == 'G') ? 1024LL * 1024 * 1024 : 1;
+    if (v < floor) ch.replace(from, end - from, std::to_string(floor));
     return ch;
 }
 

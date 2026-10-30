@@ -702,6 +702,7 @@ public:
         verdictIntervalNs_ = ns;
         if (viewSet_ != nullptr) viewSet_->setVerdictIntervalNs(ns);
     }
+    void setVerdictAckArenaEntriesForTest(uint32_t entries) { ackSink_->resizeVerdictArenaForTest(entries); }
     [[nodiscard]] const VerdictSourceStats* verdictStatsForTest(int32_t topicId, int32_t partition) const noexcept {
         const VerdictSource* v = viewSet_ != nullptr ? viewSet_->verdictSource(topicId, partition) : nullptr;
         return v != nullptr ? &v->stats() : nullptr;
@@ -735,8 +736,8 @@ public:
     // through the client's conductor).  The sink is heap-allocated once (cold):
     // ~0.9 MiB of fixed tables must not live on a thread stack.
     // -----------------------------------------------------------------------
-    void setShardClient(aeron::Aeron* client, int32_t controlTermBytes = 0) {
-        ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client, controlTermBytes}) : nullptr;
+    void setShardClient(aeron::Aeron* client, int32_t controlTermBytes = 0, int32_t minAckTermBytes = kMinAckTermBytes) {
+        ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client, controlTermBytes, minAckTermBytes}) : nullptr;
         bindAcksOwed_.assign(SessionAckSink::kMaxSessions, OwedBindAck{});   // I2: preallocated once (cold), never grows
         bindAcksOwedCount_ = 0;
         if (ackSink_) ackSink_->setDirectBudgets(directSessionAckBudget_, static_cast<uint32_t>(kDirectAckBudget));
@@ -5737,6 +5738,7 @@ private:
         uint64_t                logGen     = 0;
         int32_t                 minIsr     = 1;       ///< DR-BUG-3 (thenAwaitHw only)
         uint8_t                 thenAwaitAcks = 0;    ///< the wire acks byte: a View entry moves to pendingAcksView_ (thenAwaitHw only)
+        uint8_t                 replay     = 0;       ///< PendingAcksView::replay of the entry it becomes
     };
     // F15 S5 fix round 1 (I-1): park-ordered, O(1) front fire (OrderedWaitQueue.h).
     OrderedWaitQueue<DurablePending> durablePending_;
@@ -6147,6 +6149,7 @@ private:
         int32_t                              minIsr     = 1;
         WorkerReturn                         ret;
         uint8_t                              acks       = 0;   ///< the Produce.acks wire byte
+        uint8_t                              replay     = 0;   ///< a duplicate: 1 = in the dedupe window (its verdicts are replayed once W passes it), 2 = known-old (no verdicts to replay)
     };
     OrderedWaitQueue<PendingAcksView> pendingAcksView_;
     int64_t  verdictIntervalNs_ = 100'000'000;
@@ -8029,6 +8032,7 @@ private:
                 pending.logGen     = entry.logGen;
                 pending.minIsr     = entry.minIsr;
                 pending.acks       = entry.thenAwaitAcks;
+                pending.replay     = entry.replay;
                 pending.ret        = std::move(entry.ret);
                 pendingAcksView_.push_back(std::move(pending));
             } else {
@@ -8255,16 +8259,27 @@ private:
     // -----------------------------------------------------------------------
     int flushOwedAcksView_(int64_t nowNs) {
         if (pendingAcksView_.empty()) return 0;
+        struct Deferred { int32_t topicId, partition; };
+        std::array<Deferred, 16> deferred;   // P4-10: partitions whose verdict run did not fit, in this sweep
+        std::size_t deferredCount = 0;
+        bool deferAll = false;
         return static_cast<int>(pendingAcksView_.sweep([&](PendingAcksView& entry) {
+            if (deferAll) return false;
+            for (std::size_t i = 0; i < deferredCount; ++i)
+                if (deferred[i].topicId == entry.ret.topicId && deferred[i].partition == entry.ret.partition) return false;
             auto* rep = waiterReplica_(entry.replica, entry.ret.targetReplicaId, entry.ret.incarnation,
                                        entry.lastOffset, entry.logGen);
+            const PartitionWriteState* ws = rep != nullptr ? writeOf_(rep) : nullptr;
+            const bool source = ws != nullptr && ws->isVerdictSource();
             int16_t code = 0;
             if (rep == nullptr) [[unlikely]] {
                 code = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
             } else if (rep->highWatermark() > entry.lastOffset &&
                        (!rune::protocol::client::acksAll(entry.acks) || static_cast<int>(rep->isr().size()) >= entry.minIsr) &&
                        (viewSet_ == nullptr ||
-                        viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration()) > entry.lastOffset)) {
+                        viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration()) > entry.lastOffset) &&
+                       (!source || (ws->verdictKnownThrough() > entry.lastOffset &&
+                                    (entry.replay == 0 || ws->markers.committedThrough() > entry.lastOffset)))) {
                 code = 0;
             } else if (nowNs >= entry.deadlineNs) {
                 spdlog::warn("Worker {}: View ack timeout for partition={} lastOffset={}; acking Internal error",
@@ -8273,12 +8288,52 @@ private:
             } else {
                 return false;
             }
+            if (code == 0 && source) {
+                if (entry.replay == 2) {   // outside the dedupe window: stored, its verdicts are gone
+                    code = static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
+                    if (ws->verdicts != nullptr) ++ws->verdicts->statsMut().verdictUnknownDuplicates;
+                } else if (ackSink_ == nullptr) [[unlikely]] {   // the return ring carries no trailer: never ack a verdict source without one
+                    code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+                } else if (!fillVerdicts_(entry, *ws)) {
+                    if (nowNs < entry.deadlineNs) {
+                        if (deferredCount == deferred.size()) deferAll = true;
+                        else deferred[deferredCount++] = Deferred{entry.ret.topicId, entry.ret.partition};
+                        return false;
+                    }
+                    code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+                }
+            }
             entry.ret.errorCode = code;
             FLIGHT_RECORDER_MARK_VAL_REPLICATION(flight_recorder::Site::ShWaiterFire, flight_recorder::foldCorr(entry.ret.correlationId),
                                          static_cast<double>(code));
             enqueueReturn_(entry.ret);
             return true;
         }));
+    }
+
+    // The trailer of a View ack of a verdict source: the rejections in [baseOffset, lastOffset] as {offset - baseOffset, code,
+    // constraintId}.  False = the sink's arena is full (the caller defers; nothing was reserved).
+    [[nodiscard]] bool fillVerdicts_(PendingAcksView& entry, const PartitionWriteState& ws) {
+        const int64_t base = entry.ret.baseOffset;
+        uint16_t n = 0;
+        ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry&) { ++n; });
+        uint32_t run = kNoVerdictRun;
+        if (n != 0) {
+            if (!ackSink_->reserveVerdicts(n, run)) return false;
+            uint8_t* out = ackSink_->verdictEntries(run).data();
+            ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry& e) {
+                const uint16_t idx = static_cast<uint16_t>(e.offset - base);
+                out[0] = static_cast<uint8_t>(idx); out[1] = static_cast<uint8_t>(idx >> 8);
+                out[2] = static_cast<uint8_t>(e.code); out[3] = static_cast<uint8_t>(e.code >> 8);
+                for (int i = 0; i < 4; ++i) out[4 + i] = static_cast<uint8_t>(e.constraintId >> (8 * i));
+                out += 8;
+            });
+        }
+        if (entry.replay == 1 && ws.verdicts != nullptr) ++ws.verdicts->statsMut().verdictReplays;
+        entry.ret.hasVerdicts = 1;
+        entry.ret.verdictCount = n;
+        entry.ret.verdictRun = run;
+        return true;
     }
 
     // -----------------------------------------------------------------------
@@ -9570,6 +9625,7 @@ private:
         // once" for data that is not durable / not on the ISR yet.  (Kafka
         // DelayedProduce waits on the duplicate's original offsets too.)
         const int64_t lastOff = ret.lastOffset;
+        const uint8_t replay = !outcome.isDuplicate ? 0 : outcome.baseOffset < 0 ? 2 : 1;
 
         if (asyncStrict) {
             // Park on the coalesced fsync (submitRound_ stamps the token
@@ -9584,6 +9640,7 @@ private:
             dp.ret         = std::move(ret);
             dp.thenAwaitHw = (acksAll || pc::acksView(acks)) ? replica : nullptr;
             dp.thenAwaitAcks = acks;
+            dp.replay      = replay;
             dp.deadlineNs  = nowNs + ackTimeoutNs_;
             dp.replica     = replica;
             dp.logGen      = replica ? replica->logGeneration() : 0;
@@ -9603,6 +9660,7 @@ private:
             pending.logGen     = replica->logGeneration();
             pending.minIsr     = minIsr;
             pending.acks       = acks;
+            pending.replay     = replay;
             pending.ret        = std::move(ret);
             pendingAcksView_.push_back(std::move(pending));
             return 1;

@@ -6,6 +6,7 @@
 #include <rune/codec/FilterPredicate.h>
 #include <rune/codec/Serialize.h>
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/node/WorkerIngress.h>
 #include <rune/node/Worker.h>
 #include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/node/WorkerOp.h>
@@ -30,7 +31,9 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <thread>
+#include <tuple>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -177,8 +180,9 @@ private:
 
 public:
 
-    static std::vector<uint8_t> batch(const std::vector<Rec>& recs) {
+    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1) {
         rune::protocol::RecordBatchBuilder b(0, 1000);
+        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
         for (const auto& r : recs) {
             std::vector<uint8_t> key(8), val;
             for (int i = 0; i < 8; ++i) key[static_cast<std::size_t>(i)] = static_cast<uint8_t>(r.id >> (8 * i));
@@ -194,7 +198,9 @@ public:
 
     void pass() {
         now += 1'000'000;
+        ++passNo_;
         worker->doWork(now);
+        pollAcks_();
         worker->drainReturn([&](WorkerReturn r) {
             if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
         }, [](const TxnReturn&) {});
@@ -234,14 +240,18 @@ public:
     struct Frame { int64_t base; int32_t count; int64_t lastOffsetDelta; };
     struct Inbox { std::vector<Delivered> records; std::vector<Frame> frames; };
 
-    void enableEgress() {
-        if (egress_) return;
+    void ensureDriver_() {
+        if (driver_) return;
         rune::node::EmbeddedDriverConfig dc;
-        dc.dir = (std::filesystem::temp_directory_path() / ("rune_cwv_aeron_" + std::to_string(::getpid()) + "_" + std::to_string(rigSeq()))).string();
+        dc.dir = (std::filesystem::temp_directory_path() / ("rune_cwv_aeron_" + std::to_string(::getpid()) + "_" + std::to_string(rigSeq()++))).string();
         dc.termBufferBytes = 64 * 1024;
         driver_ = std::make_unique<rune::node::EmbeddedDriver>(dc, rune::node::DriverMode::Threaded);
         aeron::Context ctx; ctx.aeronDir(dc.dir);
         aeron_ = aeron::Aeron::connect(ctx);
+    }
+    void enableEgress() {
+        if (egress_) return;
+        ensureDriver_();
         const std::string control = "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
         const std::string local   = "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
         egress_ = std::make_unique<WorkerEgress>(aeron_, control.c_str(), 3001);
@@ -320,6 +330,68 @@ public:
         return box;
     }
 
+
+    // ---- produce acks through the worker's ack sink ----
+    struct Ack {
+        int16_t code = 0;
+        int64_t baseOffset = 0;
+        bool    hasVerdicts = false;
+        std::vector<std::tuple<uint16_t, uint16_t, uint32_t>> verdicts;
+        std::size_t frameLen = 0;
+        int64_t step = 0;
+    };
+    static constexpr int32_t kIngressStream = 7601, kAckStream = 7602;
+    static constexpr int64_t kAckSession = 5;
+
+    /// Answers ride the worker's ack sink to a session announced at `clientVersion`.  `arenaEntries` != 0 shrinks the sink's verdict arena.
+    void enableAcks(int32_t clientVersion = 17, uint32_t arenaEntries = 0) {
+        ensureDriver_();
+        ackVersion_ = clientVersion;
+        arenaEntries_ = arenaEntries;
+        if (!ackIngress_) {
+            ackIngress_ = std::make_unique<WorkerIngress>(aeron_, "aeron:ipc", kIngressStream);
+            const int64_t sreg = aeron_->addSubscription("aeron:ipc", kAckStream);
+            const int64_t preg = aeron_->addExclusivePublication("aeron:ipc", kIngressStream);
+            for (int i = 0; i < 5000 && !(ackSub_ && ackPub_ && ackPub_->isConnected()); ++i) {
+                if (!ackSub_) ackSub_ = aeron_->findSubscription(sreg);
+                if (!ackPub_) ackPub_ = aeron_->findExclusivePublication(preg);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            ASSERT_TRUE(ackSub_ && ackPub_ && ackPub_->isConnected());
+        }
+        wireAcks_();
+    }
+    /// A Produce frame on the worker's ingress; returns its correlation id.  `recs` is one batch.
+    int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1) {
+        const auto bytes = batch(recs, pid, seq);
+        const int64_t c = ++corr;
+        rune::protocol::client::Produce m;
+        m.sessionId = kAckSession; m.correlationId = c; m.topicId = kSrc; m.partition = 0; m.partitionKnown = 1;
+        m.acks = acks; m.producerId = pid; m.producerEpoch = 0; m.baseSequence = seq;
+        m.recordBatch = std::span<const uint8_t>(bytes);
+        std::vector<uint8_t> f(m.encodedSize()); m.encode(f.data());
+        aeron::concurrent::AtomicBuffer ab(f.data(), static_cast<aeron::util::index_t>(f.size()));
+        for (int i = 0; i < 5000 && ackPub_->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) <= 0; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return c;
+    }
+    /// Drives until the ack of `corr` arrived (or `maxPasses`).
+    std::optional<Ack> ack(int64_t c, int maxPasses = 600) {
+        for (int i = 0; i < maxPasses; ++i) {
+            if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
+            pass();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
+        return std::nullopt;
+    }
+    /// Passes with no waiting for a particular ack (a delay check).
+    void settle(int n = 40) { for (int i = 0; i < n; ++i) { pass(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); } }
+    [[nodiscard]] bool acked(int64_t c) const { return acksSeen_.count(c) != 0; }
+    [[nodiscard]] const std::vector<int64_t>& ackOrder() const { return ackOrder_; }
+    [[nodiscard]] int64_t passNo() const { return passNo_; }
+    [[nodiscard]] const SessionAckSink* sinkForTest() const { return worker->ackSinkForTest(); }
+
     static int& rigSeq() { static int n = 0; return n; }
 
     /// The checked-writes control record types (16-19) in the log, in offset order.
@@ -367,6 +439,35 @@ private:
             pos += static_cast<std::size_t>(total);
         }
     }
+    void wireAcks_() {
+        if (!ackIngress_) return;
+        worker->setWorkerIngress(ackIngress_.get(), true);
+        worker->setShardMode(true);
+        worker->setShardClient(aeron_.get());
+        if (arenaEntries_ != 0) worker->setVerdictAckArenaEntriesForTest(arenaEntries_);
+        WorkerOp a; a.type = WorkerOp::Type::SessionAnnounce; a.grantAll = true; a.sessionId = kAckSession;
+        a.egressStreamId = kAckStream; a.egressChannel = "aeron:ipc?term-length=65536"; a.clientVersion = ackVersion_;
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(a)));
+    }
+    void pollAcks_() {
+        if (!ackSub_) return;
+        ackSub_->poll(aeron::FragmentAssembler([&](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l, aeron::Header&) {
+            const auto r = rune::protocol::client::ProduceResponse::decode(reinterpret_cast<const uint8_t*>(b.buffer() + o), static_cast<std::size_t>(l));
+            if (!r) return;
+            Ack a;
+            a.code = r->errorCode; a.baseOffset = r->baseOffset; a.hasVerdicts = r->hasVerdicts; a.frameLen = static_cast<std::size_t>(l); a.step = passNo_;
+            r->forEachVerdict([&](uint16_t i, uint16_t code, uint32_t cid) { a.verdicts.emplace_back(i, code, cid); });
+            if (acksSeen_.emplace(r->correlationId, std::move(a)).second) ackOrder_.push_back(r->correlationId);
+        }).handler(), 64);
+    }
+    std::unique_ptr<WorkerIngress> ackIngress_;
+    std::shared_ptr<aeron::Subscription> ackSub_;
+    std::shared_ptr<aeron::ExclusivePublication> ackPub_;
+    std::map<int64_t, Ack> acksSeen_;
+    std::vector<int64_t> ackOrder_;
+    int32_t ackVersion_ = 17;
+    uint32_t arenaEntries_ = 0;
+    int64_t passNo_ = 0;
     std::unique_ptr<rune::node::EmbeddedDriver> driver_;
     std::shared_ptr<aeron::Aeron> aeron_;
     std::unique_ptr<WorkerEgress> egress_;
@@ -391,6 +492,7 @@ private:
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
         worker->setViewSet(vs.get());
         if (egress_) worker->setWorkerEgress(egress_.get());
+        wireAcks_();
     }
 
     std::vector<rune::replication::NodeId> isr_;

@@ -72,6 +72,8 @@ enum class OpStatus : uint8_t {
     InvalidArgument, ///< the duty thread refused the op as malformed before sending it (payload = why)
     BrokerTooOld,    ///< checked writes: the seed broker is below kBrokerVersionCheckedWrites, so a View send was
                      ///< failed locally (nothing was sent)
+    StoredIdUnknown, ///< 13: reserved for key-0 creates (Part 06 documents and first returns it); keeps the enum without a hole
+    VerdictUnknown,  ///< 14: stored, but its verdicts are unknown (a View retry fell outside the broker's dedupe window)
 };
 
 /// Authentication (codes 44..48, client version 9): the name of an auth-related Completion::errorCode when

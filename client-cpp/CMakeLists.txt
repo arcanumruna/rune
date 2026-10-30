@@ -1551,6 +1551,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerAllocRegressionTest.cpp
             tests/producer/ProducerAckPathTest.cpp
             tests/producer/ProducerAcksFlagsTest.cpp
+            tests/producer/ProducerVerdictsTest.cpp
             tests/producer/ProducerTier2PoolTest.cpp
             tests/producer/ProducerSendTest.cpp
             tests/producer/DirectIngressTest.cpp
