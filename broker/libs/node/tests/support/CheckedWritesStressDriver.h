@@ -4,6 +4,7 @@
 // (object 7 TagEquals{9}, object 8 CapLiveKeys{8}) installed on every node, and an ordinary projection view.  step() draws one
 // seeded action; quiesce() brings the cluster to rest and checkAll() judges the committed history with the independent
 // CheckedWritesModel and checks the named invariants against every node.  Every wait is a bounded poll: the deadline is the failure.
+#include "CheckedWritesChecks.h"
 #include "CheckedWritesModel.h"
 #include "client/ClusterClient.h"
 
@@ -508,10 +509,11 @@ private:
                         if (present.count(off) != 0 && s.index.count(off) == 0) { *why = at + "rejected offset " + std::to_string(off) + " is in the log but not in the index"; return false; }
                     }
                 }
-                int64_t prev = -1;
+                if (!s.log.markers.empty() && !s.log.changes.empty()) {
+                    const std::string problem = markerUnionProblem(s.log.markers, s.log.changes.front().offset);
+                    if (!problem.empty()) { *why = at + problem; return false; }
+                }
                 for (const auto& m : s.log.markers) {
-                    if (prev >= 0 && m.header.fromOffset != prev) { *why = at + "markers do not tile at " + std::to_string(m.header.fromOffset); return false; }
-                    prev = m.header.finalThrough;
                     for (const auto& [off, code, cid] : m.entries) {
                         const auto it = d.model_.verdicts().find(off);
                         if (it == d.model_.verdicts().end() || !(it->second == ModelVerdict{code, cid})) { *why = at + "a marker entry " + std::to_string(off) + " is not the model's verdict"; return false; }

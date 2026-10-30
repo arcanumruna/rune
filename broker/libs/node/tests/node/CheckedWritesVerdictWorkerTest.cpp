@@ -188,6 +188,34 @@ TEST(CheckedWritesVerdictWorkerRegression, CleanerVerdictBoundStartsClosedRegres
     EXPECT_NE(r.replica->cleanerVerdictBound(), rune::replication::PartitionReplica::kNoCleanerLso);
 }
 
+TEST(CheckedWritesVerdictWorkerRegression, ActivationWithAnUncommittedMarkerRemarksFromWRegression) {
+    VerdictRig r(/*follower=*/true);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(20);
+    r.followerFetch();
+    r.passes(20);
+    r.demotePromote();   // the judge activates with the set change in the timeline
+    r.followerFetch();
+    ASSERT_EQ(r.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    r.followerFetch();   // the records are committed: the judge marks them; no further fetch, so the marker stays above the HW
+    while (r.readLog().markers.empty() || r.readLog().markers.back().offset < r.replica->highWatermark()) r.pass();
+    const auto first = r.readLog().markers.back();
+    ASSERT_EQ(first.entries.size(), 1u);
+    r.demotePromote();
+    ASSERT_EQ(r.produce({{3, 30, 9}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    const auto log = r.readLog();
+    ASSERT_GE(log.markers.size(), 2u);
+    const auto& second = log.markers[1];
+    EXPECT_EQ(second.header.fromOffset, first.header.fromOffset) << "the new activation marks again from W, the committed watermark";
+    EXPECT_GE(second.header.finalThrough, first.header.finalThrough);
+    for (const auto& e : second.entries)
+        if (std::get<0>(e) < first.header.finalThrough) EXPECT_NE(std::find(first.entries.begin(), first.entries.end(), e), first.entries.end()) << "entry at " << std::get<0>(e);
+    for (const auto& e : first.entries) EXPECT_NE(std::find(second.entries.begin(), second.entries.end(), e), second.entries.end()) << "entry at " << std::get<0>(e);
+    EXPECT_EQ(r.writeState()->rejected.mismatches(), 0u);
+}
+
 TEST(CheckedWritesVerdictWorker, DemotePromoteKeepsOwnVerdicts) {
     VerdictRig r;
     r.typed();

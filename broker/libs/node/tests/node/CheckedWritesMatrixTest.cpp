@@ -1,6 +1,7 @@
 // Checked writes Part 04 Task 10: the shared interaction matrix (5 ops x 8 entities x 15 timings) on a real Worker, judged against
 // the independent reference model, plus the pins of both parts' cell counts.
 #include "CheckedWritesMatrixExpectations.h"
+#include "CheckedWritesChecks.h"
 #include "CheckedWritesModel.h"
 
 #include <rune/view/Verdict.h>
@@ -261,18 +262,18 @@ private:
 
     void checkMarkers_(const CheckedWritesModel& model, const VerdictRig::RigLog& log) {
         ASSERT_FALSE(log.markers.empty());
+        ASSERT_FALSE(log.changes.empty());
+        int64_t reach = 0;
+        EXPECT_EQ(markerUnionProblem(log.markers, log.changes.front().offset, &reach), "") << "(b) markers cover the log without a gap and agree where they overlap";
         std::map<int64_t, ModelVerdict> union_;
-        int64_t prevThrough = -1;
         for (const auto& m : log.markers) {
-            if (prevThrough >= 0) EXPECT_EQ(m.header.fromOffset, prevThrough) << "(b) markers tile the log without a gap";
-            prevThrough = m.header.finalThrough;
             for (const auto& [o, code, cid] : m.entries) {
                 EXPECT_GE(o, m.header.fromOffset);
                 EXPECT_LT(o, m.header.finalThrough);
                 union_[o] = {code, cid};
             }
         }
-        EXPECT_GE(prevThrough, target_);
+        EXPECT_GE(reach, target_);
         EXPECT_EQ(union_, model.verdicts()) << "(b) the markers carry every verdict";
     }
 
