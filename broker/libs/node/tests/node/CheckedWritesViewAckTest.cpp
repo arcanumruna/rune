@@ -207,3 +207,19 @@ TEST(CheckedWritesViewAck, DuplicateBeforeAndAfterTheFoldIsAnsweredOnceEach) {
     EXPECT_EQ(r.leo(), 1);
     for (int64_t c : {1, 2, 3}) EXPECT_EQ(r.ackCount[c], 1) << c;
 }
+
+// Review Focus 2 / P3-2, at the level: a transactional batch with the View bit is acked as All once the HW passes it,
+// while its own open transaction still holds the LSO and so the fold.  Parked as a View waiter it would wait for the
+// LSO, which waits for EndTxn, which waits for this ack.  RED: drop the View clear for transactional batches in
+// produceCore_ - the ack never comes before the deadline (Internal).
+TEST(CheckedWritesViewAckRegression, TransactionalViewBatchIsAckedAtTheHwWhileItsTransactionHoldsTheFoldRegression) {
+    AckRig r(twoNodes());
+    r.typed(); r.setLevel(kLevel); r.installView(kView);
+    r.produce(write(1, kAllView, 77, 0, /*txn=*/true));
+    r.steps(50);
+    r.followerFetch();
+    ASSERT_EQ(r.answer(1), kOk);
+    EXPECT_LT(r.ackNow[1], r.appendedAtNs + 50'000'000) << "before the deadline";
+    EXPECT_EQ(r.foldCursor(kView), 0) << "the open transaction still holds the fold at the ack";
+    EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::LevelTooLow), 0u);
+}
