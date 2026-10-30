@@ -412,6 +412,8 @@ TEST(CheckedWritesVerdictCleanerRegression, RemovedMarkerNeverStallsCoverageRegr
     ASSERT_TRUE(r.driveUntilJudged());
     ASSERT_EQ(r.readLog().markers.size(), 2u);
     const int64_t secondTo = r.readLog().markers.back().header.finalThrough;
+    int64_t rejectedOffset = -1;
+    for (const auto& d : r.readLog().data) if (d.id == 4) rejectedOffset = d.offset;
     (void)r.compact(1'000'000);   // the first marker's records are gone: it is stamped
     (void)r.compact(1'005'000);   // past the delete horizon: dropped
     const auto log = r.readLog();
@@ -428,7 +430,7 @@ TEST(CheckedWritesVerdictCleanerRegression, RemovedMarkerNeverStallsCoverageRegr
     ASSERT_NE(r.stats(), nullptr);
     EXPECT_EQ(r.stats()->rejectionsConstraint, 0u) << "nothing below the second marker is judged again";
     EXPECT_EQ(r.stats()->markersWritten, 0u);
-    EXPECT_NE(r.writeState()->rejected.find(5), nullptr);
+    EXPECT_NE(r.writeState()->rejected.find(rejectedOffset), nullptr);
     std::vector<uint64_t> ids;
     for (const auto& d : r.collect(sub).records) ids.push_back(d.id);
     EXPECT_EQ(ids, (std::vector<uint64_t>{1, 3}));
