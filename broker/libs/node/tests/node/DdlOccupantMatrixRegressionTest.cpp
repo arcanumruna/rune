@@ -626,10 +626,23 @@ TEST_P(CheckedWritesTransientViewDdlRegression, Cell) {
         ASSERT_TRUE(h.response(pc).has_value());
         ASSERT_EQ(h.response(pc)->err, kOk) << "setup view after the restart";
     }
+    const Catalog beforeAgain = h.catalog();
+    const uint64_t eventsAgain = h.eventsAppended();
     const int64_t again = run(second, tvAlter(c.op));
     h.settle();
     ASSERT_TRUE(h.response(again).has_value());
     EXPECT_EQ(h.response(again)->err, tvExpected(c)) << "after restart";
+    EXPECT_NE(h.response(again)->err, kViewSourceTransient) << "37 is never sent";
+    if (tvExpected(c) == kOk) {
+        EXPECT_EQ(h.eventsAppended() - eventsAgain, 1u);
+        const ViewRecord* v = h.views().byName(second);
+        ASSERT_NE(v, nullptr);
+        EXPECT_EQ(v->persistence, target);
+    } else {
+        EXPECT_EQ(h.response(again)->detail, "view source needs a key");
+        EXPECT_EQ(h.eventsAppended(), eventsAgain) << "a refusal appends no event";
+        EXPECT_EQ(h.catalog(), beforeAgain);
+    }
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
