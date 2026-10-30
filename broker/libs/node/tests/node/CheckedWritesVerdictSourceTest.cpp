@@ -1,13 +1,25 @@
 // Part 04 Task 5: the judge of one source partition (unit level: no worker, no replica).
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <memory>
 #include <vector>
 
+#include <unistd.h>
+
 #include <rune/codec/Descriptor.h>
 #include <rune/node/VerdictSource.h>
+#include <rune/node/RcState.h>
+#include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/Log.h>
+#include <rune/storage/LogCleaner.h>
+#include <rune/storage/ProducerStateManager.h>
+#include <rune/transaction/ControlMarker.h>
+#include <rune/transaction/ReadCommittedView.h>
+#include <rune/view/AggFold.h>
 #include <rune/view/PlanCompiler.h>
+#include <rune/view/ViewFold.h>
 
 using namespace rune::node;
 namespace cr = rune::storage::control_record;
@@ -35,7 +47,7 @@ void le32(std::vector<uint8_t>& b, uint32_t v) { for (int i = 0; i < 4; ++i) b.p
 void le64(std::vector<uint8_t>& b, uint64_t v) { for (int i = 0; i < 8; ++i) b.push_back(uint8_t(v >> (8 * i))); }
 std::string_view sv(const std::vector<uint8_t>& b) { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
 
-struct Rec { int64_t id; int32_t tag; bool tombstone = false; };
+struct Rec { int64_t id; int32_t tag; bool tombstone = false; uint8_t intent = 0; };
 
 // A committed log of whole batches; `read(from)` starts at the batch holding `from`.
 struct Log {
@@ -51,7 +63,7 @@ struct Log {
             std::vector<uint8_t> k, v;
             le64(k, uint64_t(r.id));
             if (!r.tombstone) { le16(v, 12); le16(v, 1); le64(v, uint64_t(r.id)); le32(v, uint32_t(r.tag)); }
-            b.append(sv(k), sv(v), 0);
+            b.append(sv(k), sv(v), 0, r.intent);
         }
         push(b.build(), int64_t(recs.size()));
     }
@@ -370,4 +382,187 @@ TEST(CheckedWritesVerdictSource, KnownThroughFailsClosedWithoutAJudge) {
     EXPECT_TRUE(st.isVerdictSource());
     EXPECT_TRUE(st.isConstrainedSource());
     EXPECT_EQ(st.verdictKnownThrough(), 15);
+}
+
+TEST(CheckedWritesVerdictSource, JudgeSeesTheRecordIntent) {
+    Rig r;
+    auto& m = r.install(7, tagEquals(9));
+    r.st.constraintSets.onChange(0, setOf(1, {m.ident()}));
+    r.log.control();
+    r.log.data({{1, 1, false, 1}});   // Intent::Insert
+    r.start();
+    r.drive();
+    EXPECT_EQ(r.vs.lastIntentForTest(), 1);
+}
+
+// ---- the readers sweep (Review Focus 2): no log reader mistakes a checked-writes record for a txn marker ---------
+
+namespace {
+
+// Types 16 and 19 have no builder yet: a value of exactly six bytes ([version][5 bytes]) is what the old txn-marker
+// reader accepted, so a reader without the hardening mistakes it for a marker.
+std::vector<uint8_t> controlOfType(int16_t type, int64_t base) {
+    std::vector<uint8_t> b;
+    if (type == cr::kVerdictMarker) {
+        b.resize(cr::markerBatchBytes(0));
+        (void)cr::buildVerdictMarker(b, cr::MarkerHeader{0, 0, 0, 0}, {});
+    } else if (type == cr::kConstraintSetChange) {
+        b.resize(cr::changeBatchBytes(0));
+        (void)cr::buildConstraintSetChange(b, 1, {});
+    } else {
+        b.resize(cr::detail::batchBytes(6));
+        std::size_t p = cr::detail::beginBatch(b.data(), type, 6);
+        b[p++] = cr::kPayloadVersion;
+        for (int i = 0; i < 5; ++i) b[p++] = 0;
+        cr::detail::sealBatch(b.data(), p);
+    }
+    for (int i = 0; i < 8; ++i) b[std::size_t(i)] = uint8_t(uint64_t(base) >> (8 * i));
+    return b;
+}
+
+// A batch in the txn marker's own framing (no record-length varint) with a chosen producer id and key type, CRC resealed:
+// what a txn-marker reader without the producerId >= 0 and type 0/1 checks would take for a marker.
+std::vector<uint8_t> txnFramedLookalike(int64_t pid, int16_t type) {
+    auto b = rune::transaction::ControlMarker::build(0, 0, rune::transaction::ControlType::Commit, 0);
+    for (int i = 0; i < 8; ++i) b[43 + std::size_t(i)] = uint8_t(uint64_t(pid) >> (8 * i));
+    b[65] = uint8_t(type);
+    b[66] = uint8_t(uint16_t(type) >> 8);
+    const uint32_t crc = rune::protocol::crc32c(b.data() + 21, b.size() - 21);
+    for (int i = 0; i < 4; ++i) b[17 + std::size_t(i)] = uint8_t(crc >> (8 * i));
+    return b;
+}
+
+std::vector<uint8_t> txnData(int64_t base, int64_t pid) {
+    rune::protocol::RecordBatchBuilder b(base, 0);
+    b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(0);
+    b.setTransactional(true);
+    b.append("k", "v", 0);
+    return b.build();
+}
+std::vector<uint8_t> commitMarker(int64_t base, int64_t pid) {
+    auto b = rune::transaction::ControlMarker::build(pid, 0, rune::transaction::ControlType::Commit, 0);
+    for (int i = 0; i < 8; ++i) b[std::size_t(i)] = uint8_t(uint64_t(base) >> (8 * i));
+    return b;
+}
+std::vector<uint8_t> plainData(int64_t base, std::string_view key) {
+    rune::protocol::RecordBatchBuilder b(base, 0);
+    b.append(key, "v", 0);
+    return b.build();
+}
+
+struct TmpDir {
+    std::filesystem::path path;
+    explicit TmpDir(const char* name) : path(std::filesystem::temp_directory_path() / (std::string(name) + "-" + std::to_string(::getpid()))) {
+        std::filesystem::remove_all(path);
+        std::filesystem::create_directories(path);
+    }
+    ~TmpDir() { std::error_code ec; std::filesystem::remove_all(path, ec); }
+};
+
+}  // namespace
+
+TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To19Regression) {
+    namespace tx = rune::transaction;
+    for (const auto& lookalike : {txnFramedLookalike(-1, 0), txnFramedLookalike(5, cr::kVerdictMarker), txnFramedLookalike(-1, cr::kTxnJudge)}) {
+        tx::LsoTracker tracker(8);
+        tx::AbortedTxnIndex aborted;
+        tx::RcBuilder builder(&tracker, &aborted);
+        EXPECT_EQ(builder.step(lookalike.data(), lookalike.size()).outcome, tx::RcBuilder::Outcome::Ignored);
+        tx::ControlMarkerPayload payload{};
+        EXPECT_FALSE(tx::ControlMarker::extract(lookalike.data(), 0, payload, lookalike.size()));
+    }
+    for (const int16_t type : {cr::kReservation, cr::kVerdictMarker, cr::kConstraintSetChange, cr::kTxnJudge}) {
+        SCOPED_TRACE("control record type " + std::to_string(type));
+        const std::vector<uint8_t> ctl = controlOfType(type, 0);
+
+        {   // (1) RcBuilder::step
+            tx::LsoTracker tracker(8);
+            tx::AbortedTxnIndex aborted;
+            tx::RcBuilder builder(&tracker, &aborted);
+            const auto res = builder.step(ctl.data(), ctl.size());
+            EXPECT_EQ(res.outcome, tx::RcBuilder::Outcome::Ignored);
+            EXPECT_EQ(tracker.lso(100), 100);
+            EXPECT_TRUE(aborted.ranges().empty());
+        }
+        {   // (2) ControlMarker::extract
+            tx::ControlMarkerPayload payload{};
+            EXPECT_FALSE(tx::ControlMarker::extract(ctl.data(), 0, payload, ctl.size()));
+        }
+        {   // (7) forEachRecordSpan parses it as one record
+            int n = 0;
+            EXPECT_TRUE(rune::protocol::forEachRecordSpan(ctl.data(), ctl.size(), [&](const rune::protocol::RecordSpan& s) {
+                ++n;
+                EXPECT_EQ(s.key.size(), 2u);
+            }));
+            EXPECT_EQ(n, 1);
+        }
+        {   // (5) both folds count it as control and touch no table
+            const rune::storage::LogReadView lv{ctl.data(), ctl.size(), 0, 1};
+            Member m(7, tagEquals(9));
+            int64_t cursor = 0;
+            const auto st = rune::view::foldBatch(m.inst->plan, m.inst->layout, m.inst->vdc, m.inst->table, lv, 1, cursor, rune::view::kNoSkip);
+            EXPECT_EQ(st.skippedControl, 1u);
+            EXPECT_EQ(m.inst->table.size(), 0u);
+
+            const rune::codec::Descriptor src = rune::codec::DescriptorBuilder("order", 1).add("orderId", P::Int64, 1, true).add("userId", P::Int64, 1).add("amount", P::Int64, 1).build();
+            rune::view::ViewPlan plan;
+            plan.viewName = "totals"; plan.key = "userId"; plan.sources = {{5, "userId"}};
+            plan.output = {{"userId", P::Int64, 0, "userId", rune::view::MergeRule::Replace}, {"total", P::Int64, 0, "amount", rune::view::MergeRule::Sum}};
+            const rune::codec::Descriptor* srcs[] = {&src};
+            const auto comp = rune::view::compileView(plan, srcs, 9).value();
+            const auto agg = rune::view::buildAggLayout(comp.plan, src).value();
+            rune::view::VersionDescriptorCache vdc{src};
+            rune::view::ViewTable view(comp.rowLayout, 256, 1u << 16), contributors(agg.contributorRow, 256, 1u << 16), groups(agg.groupRow, 256, 1u << 16);
+            cursor = 0;
+            const auto sa = rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors, groups, lv, 1, cursor, rune::view::kNoSkip);
+            EXPECT_EQ(sa.skippedControl, 1u);
+            EXPECT_EQ(view.size() + contributors.size() + groups.size(), 0u);
+        }
+        {   // (4) + (9): RcState over a log with a committed txn around it builds Ready, with no open txn, no aborted
+            //     range, and a producer-state manager that learned only the real producer.
+            TmpDir dir("cwsweep-rc");
+            rune::storage::Log log(dir.path.string());
+            log.recover();
+            log.append(txnData(0, 77), 0);
+            log.append(commitMarker(1, 77), 1);
+            log.append(controlOfType(type, 2), 2);
+            log.append(plainData(3, "after"), 3);
+            rune::storage::ProducerStateManager psm;
+            rune::node::RcState rc;
+            rc.reserve(8);
+            rc.bindProducerState(&psm, 5, 0);
+            const rune::node::RcFacts facts{.leader = true, .logGeneration = 1, .leadershipGeneration = 1, .epoch = 1};
+            for (int i = 0; i < 64 && !rc.ready(); ++i) (void)rc.advance(facts, &log, 1 << 20);
+            ASSERT_TRUE(rc.ready());
+            EXPECT_EQ(rc.lso(4), 4);
+            EXPECT_TRUE(rc.aborted().ranges().empty());
+            EXPECT_EQ(psm.size(), 1u);
+        }
+        {   // (3) the cleaner's pre-pass: a log with the record compacts exactly like the log without it
+            const auto cleanedKeys = [&](bool withControl) {
+                TmpDir dir("cwsweep-clean");
+                rune::storage::Log log(dir.path.string(), /*segmentBytes=*/1);
+                log.recover();
+                int64_t off = 0;
+                log.append(plainData(off, "k"), off); ++off;
+                if (withControl) { log.append(controlOfType(type, off), off); ++off; }
+                log.append(plainData(off, "k"), off); ++off;
+                log.append(plainData(off, "pad"), off); ++off;
+                log.append(plainData(off, "pad2"), off); ++off;
+                rune::storage::LogCleaner cleaner;
+                cleaner.clean(log, 0, log.segmentBaseOffsets().back(), 0, 1'000'000);
+                log.reloadSegments();
+                std::vector<std::string> keys;
+                for (int64_t o = 0; o < off; ++o) {
+                    const auto bytes = log.read(o, 1 << 20);
+                    if (bytes.empty()) continue;
+                    rune::protocol::RecordBatchReader r(bytes.data(), bytes.size());
+                    if (r.baseOffset() != o || !r.ensureValid() || r.isControl()) continue;
+                    r.forEachRecord([&](std::string_view k, std::string_view, int64_t, int64_t) { keys.emplace_back(k); });
+                }
+                return keys;
+            };
+            EXPECT_EQ(cleanedKeys(true), cleanedKeys(false));
+        }
+    }
 }

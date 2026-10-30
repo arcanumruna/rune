@@ -56,6 +56,7 @@ public:
     [[nodiscard]] std::span<const std::vector<uint8_t>> appendedForTest() const noexcept { return appended_; }
     [[nodiscard]] uint64_t judgeCallsForTest() const noexcept { return judgeCalls_; }
     void holdJudgeForTest(bool hold) noexcept { held_ = hold; }
+    [[nodiscard]] uint8_t lastIntentForTest() const noexcept { return lastIntent_; }
     [[nodiscard]] bool retiringForTest(uint64_t viewObjectId) const noexcept;
     [[nodiscard]] std::size_t memberCountForTest() const noexcept { return members_.size(); }
 
@@ -103,6 +104,7 @@ private:
     int64_t                     intervalNs_ = 100'000'000, lastMarkerNs_ = 0;
     uint64_t                    rejectedThisPass_ = 0, judgeCalls_ = 0;
     bool                        sawEmptyChange_ = false;
+    uint8_t                     lastIntent_ = 0;
     int64_t                     testNextOffset_ = 0;
     VerdictSourceStats          stats_;
     std::vector<uint8_t>        scratch_;

@@ -44,8 +44,10 @@ public:
     /// Replica apply and recovery: merges a marker covering [fromOffset, finalThrough).  Cold; idempotent.  An entry
     /// the index holds with another verdict, and an index entry inside the range that the marker lacks, count a
     /// mismatch (a determinism alarm).
-    void onMarker(int64_t fromOffset, int64_t finalThrough, std::span<const Entry> entries) {
-        for (const Entry& e : entries) {
+    template <class EntryAt>
+    void onMarker(int64_t fromOffset, int64_t finalThrough, std::size_t count, EntryAt&& at) {
+        for (std::size_t i = 0; i < count; ++i) {
+            const Entry e = at(i);
             auto it = lowerBound(e.offset);
             if (it != entries_.end() && it->offset == e.offset) {
                 if (it->code != e.code || it->constraintId != e.constraintId) ++mismatches_;
@@ -55,10 +57,17 @@ public:
             entries_.insert(it, e);
         }
         for (auto it = lowerBound(fromOffset); it != entries_.end() && it->offset < finalThrough; ++it) {
-            const bool listed = std::any_of(entries.begin(), entries.end(), [&](const Entry& e) { return e.offset == it->offset; });
-            if (!listed) ++mismatches_;
+            std::size_t lo = 0, hi = count;   // the marker's entries ascend by offset
+            while (lo < hi) {
+                const std::size_t mid = lo + (hi - lo) / 2;
+                if (at(mid).offset < it->offset) lo = mid + 1; else hi = mid;
+            }
+            if (lo == count || at(lo).offset != it->offset) ++mismatches_;
         }
         covered_ = std::max(covered_, finalThrough);
+    }
+    void onMarker(int64_t fromOffset, int64_t finalThrough, std::span<const Entry> entries) {
+        onMarker(fromOffset, finalThrough, entries.size(), [&](std::size_t i) { return entries[i]; });
     }
 
     [[nodiscard]] bool isRejected(int64_t offset) const noexcept { return find(offset) != nullptr; }

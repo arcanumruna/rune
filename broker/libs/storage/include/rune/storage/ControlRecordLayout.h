@@ -197,6 +197,22 @@ inline std::size_t buildConstraintSetChange(std::span<uint8_t> out, uint32_t con
     return h;
 }
 
+/// A parsed marker: the header and a random-access view of its entries (absolute offsets), without copying.
+struct MarkerView {
+    MarkerHeader   header;
+    const uint8_t* entries;
+    [[nodiscard]] int64_t  offsetAt(uint32_t i) const noexcept { return header.fromOffset + static_cast<int64_t>(detail::get<uint32_t>(entries + i * kMarkerEntryBytes)); }
+    [[nodiscard]] uint16_t codeAt(uint32_t i) const noexcept { return detail::get<uint16_t>(entries + i * kMarkerEntryBytes + 4); }
+    [[nodiscard]] uint32_t constraintIdAt(uint32_t i) const noexcept { return detail::get<uint32_t>(entries + i * kMarkerEntryBytes + 6); }
+};
+
+[[nodiscard]] inline std::optional<MarkerView> parseMarker(const uint8_t* batch, std::size_t len) noexcept {
+    const auto h = parseMarkerHeader(batch, len);
+    if (!h) return std::nullopt;
+    int16_t type = 0;
+    return MarkerView{*h, detail::valueOf(batch, len, type)->data() + kMarkerFixedBytes};
+}
+
 /// fn(int64_t offset, uint16_t code, uint32_t constraintId) per entry; false when `batch` is not a marker.
 template <class Fn>
 bool forEachMarkerEntry(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept {

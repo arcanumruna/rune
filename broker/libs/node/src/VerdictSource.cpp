@@ -1,6 +1,7 @@
 #include <rune/node/VerdictSource.h>
 
 #include <rune/codec/Record.h>
+#include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 
@@ -264,17 +265,19 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
         }
         judgeCursor_ = std::max(judgeCursor_, r.baseOffset());
         bool halt = false;
-        r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t) {
+        const bool walked = rune::protocol::forEachRecordSpan(view.data + pos, view.len - pos, [&](const rune::protocol::RecordSpan& span) {
             if (halt || stalled_) return;
-            if (offset >= limit) { halt = true; return; }
-            if (offset < judgeCursor_) return;
-            rune::view::SourceRecord rec{key, value, offset, 0, nullptr};
-            if (!value.empty()) rec.writer = &first.vdc.materializedFor(writerVersionOf(value, first.vdc.defaultVersion()));
+            if (span.offset >= limit) { halt = true; return; }
+            if (span.offset < judgeCursor_) return;
+            rune::view::SourceRecord rec{span.key, span.value, span.offset, rune::protocol::record::intentOf(span.attributes), nullptr};
+            if (!span.value.empty()) rec.writer = &first.vdc.materializedFor(writerVersionOf(span.value, first.vdc.defaultVersion()));
+            lastIntent_ = rec.intent;
             (void)judge(rec);
             if (stalled_) return;
-            judgeCursor_ = offset + 1;
+            judgeCursor_ = span.offset + 1;
             ++work;
         });
+        if (!walked && !halt && !stalled_) break;   // a record that does not fit its batch: stop, never advance past it
         if (stalled_) break;
         judgeCursor_ = halt ? limit : std::max(judgeCursor_, last + 1);
         pos += static_cast<std::size_t>(r.totalLength());
@@ -368,14 +371,13 @@ void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int64_t ba
     auto& s = *static_cast<PartitionWriteState*>(state);
     const int type = cr::recordType(b, len);
     if (type == cr::kVerdictMarker) {
-        const auto h = cr::parseMarkerHeader(b, len);
-        if (!h) return;
+        const auto m = cr::parseMarker(b, len);
+        if (!m) return;
         if (s.rejected.capacity() == 0) s.rejected.reserve(kIndexReserve);
-        std::vector<rune::storage::RejectedOffsetIndex::Entry> entries;
-        entries.reserve(h->count);
-        (void)cr::forEachMarkerEntry(b, len, [&](int64_t off, uint16_t code, uint32_t cid) { entries.push_back({off, code, cid}); });
-        s.rejected.onMarker(h->fromOffset, h->finalThrough, entries);
-        (void)s.markers.onMarker(base, h->finalThrough);
+        s.rejected.onMarker(m->header.fromOffset, m->header.finalThrough, m->header.count, [&](std::size_t i) {
+            return rune::storage::RejectedOffsetIndex::Entry{m->offsetAt(static_cast<uint32_t>(i)), m->codeAt(static_cast<uint32_t>(i)), m->constraintIdAt(static_cast<uint32_t>(i))};
+        });
+        (void)s.markers.onMarker(base, m->header.finalThrough);
     } else if (type == cr::kConstraintSetChange) {
         std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
         uint32_t id = 0;
