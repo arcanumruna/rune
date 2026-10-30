@@ -263,7 +263,7 @@ senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 | 34 | `ViewFieldUnresolved` | A plan names a field the source does not have. |  |
 | 35 | `ViewKeyInvalid` | `keyU64` does not resolve under the view's key type. |  |
 | 36 | `ViewNotCoPartitioned` | An aggregate view over a source with more than one partition. |  |
-| 37 | `ViewSourceTransient` | A persisted view over a transient source. |  |
+| 37 | `ViewSourceTransient` | Reserved; no longer sent. A persisted view may read a transient source. |  |
 | 38 | `ViewNotAlterable` | `alter topic` on a view's output topic. |  |
 | 39 | `InvalidRequest` | The body did not decode, or a DDL argument is out of range (the detail names it). | not retried |
 | 40 | `InvalidTopicName` | Empty, over 249 bytes, `.` or `..`, a byte outside `[A-Za-z0-9._-]`, or the `__` prefix. |  |

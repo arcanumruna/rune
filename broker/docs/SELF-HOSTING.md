@@ -334,10 +334,12 @@ before a produce is acknowledged but is **never written to disk**.
 - Persistence is fixed at definition: `alter topic` cannot change it.
 - An explicit `transient topic X` over an existing disk topic `X` answers
   `TopicExists` (error 25); the topic stays a disk topic.
-- A view that reads from a transient topic must itself be transient. `Client::createView(...,
-  persistence)` (the `CreateView` persistence byte) with a persisted view over a transient source is
-  rejected with error 37 (`ViewSourceTransient`); use a transient view. Rune QL `create view`
-  arrives later.
+- A view may read a transient topic, persisted or transient. A persisted view keeps the rows of its
+  last checkpoint across a restart; the source ring comes back empty, so the view re-folds the new
+  ring from offset 0 on top of those rows (counted as `transientSourceResets`, logged at INFO). The
+  view lives in the source topic's namespace and counts against its memory limit. A source with no
+  key is refused with error 35 (`ViewKeyInvalid`). Error 37 (`ViewSourceTransient`) is reserved and
+  never sent.
 - `alter topic` naming a view is rejected with error 38 (`ViewNotAlterable`).
 - A view cannot read another view's output yet: `Client::createView(...)` over a view is rejected
   with error 41 (`ViewSourceIsView`). Before this release such a view was accepted but stayed
@@ -414,7 +416,7 @@ before a produce is acknowledged but is **never written to disk**.
 - The ring size is set per node, so keep it the same on every node. A follower whose ring is smaller
   than a batch it must replicate stops at that batch (logged as `follower WEDGED`) and leaves the ISR;
   it does not skip the batch.
-- A transient view over a transient topic re-folds when the topic's ring changes under it (counted as
+- A view over a transient topic re-folds when the topic's ring changes under it (counted as
   `transientSourceResets`): from the point where the ring's content changed, when it changed once since
   the view last folded; from the oldest held record when the ring was recreated or changed more than
   once. Records evicted before the view folded them are counted as `transientRecordsEvicted`.

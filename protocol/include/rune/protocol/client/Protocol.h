@@ -172,8 +172,7 @@ enum class ErrorCode : uint16_t {
                                   // (Phase 2a: contributors are partitioned by wire key, which the
                                   // broker does not tie to the group-by field, so any aggregate over
                                   // a multi-partition source is rejected)
-    ViewSourceTransient    = 37,  // CreateView: a persisted view over a transient source topic
-                                  // (a view that reads a transient topic must itself be transient)
+    ViewSourceTransient    = 37,  // reserved, never sent (checked writes Part 10): a persisted view may read a transient source
     ViewNotAlterable       = 38,  // AlterTopic on a VIEW's output topic (a view's schema is derived
                                   // from its plan and is never altered directly)
     InvalidRequest         = 39,  // the request's MessageHeader decoded but its body did not
