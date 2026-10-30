@@ -273,9 +273,12 @@ TEST_P(CheckedWritesViewAckStressRegression, SeededWaitersMatchTheModel) {
     for (int64_t pid : openTxns) r.marker(pid, true);
     for (int i = 0; i < 6; ++i) { r.followerFetch(); r.steps(300); }
     checkAnswers(kSteps);
+    r.now += kTimeoutNs;   // past every deadline: whatever still waits must time out now
+    r.steps(10);
+    checkAnswers(kSteps + 1);
     for (const auto& t : all) {
         if (!t.done) {
-            EXPECT_TRUE(t.demotedSince || r.now >= t.parkNow + kTimeoutNs) << "corr " << t.corr << " never answered: " << fail(kSteps);
+            ADD_FAILURE() << "corr " << t.corr << " acks " << int(t.acks) << " never answered (a hang): " << fail(kSteps);
             continue;
         }
         const int16_t code = r.acks[t.corr].errorCode;
