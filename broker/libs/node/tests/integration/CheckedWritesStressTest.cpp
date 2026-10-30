@@ -26,7 +26,7 @@ class CheckedWritesStressRegression : public ::testing::TestWithParam<int> {};
 
 TEST_P(CheckedWritesStressRegression, SeededClusterHoldsTheInvariants) {
     const int seed = GetParam();
-    ThreeNodes cluster = ThreeNodes::start("cw04_" + std::to_string(seed));
+    ThreeNodes cluster = ThreeNodes::startWith("cw04_" + std::to_string(seed), [](rune::node::NodeConfig& cfg) { cfg.verdictIntervalMs = 20; });
     CheckedWritesStressDriver d(cluster, static_cast<uint64_t>(seed));
     d.setUp();
     ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
@@ -39,6 +39,7 @@ TEST_P(CheckedWritesStressRegression, SeededClusterHoldsTheInvariants) {
     ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
     std::string failed;
     EXPECT_TRUE(d.checkAll(&failed)) << failed;
+    EXPECT_GT(d.compactedAway(), 0u) << "seed " << seed << ": the cleaner never removed a committed record";
     RecordProperty("compactedAway", static_cast<int>(d.compactedAway()));
     const auto f = d.faults();
     std::printf("seed %d: %zu sends, %d leader crashes, %d restarts (%d cut short), %zu committed records the most compacted log lost\n", seed, d.sent().size(), f[0], f[1], f[2], d.compactedAway());

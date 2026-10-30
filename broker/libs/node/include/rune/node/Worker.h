@@ -2085,6 +2085,8 @@ private:
             work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
         }
         work += flushOwedAcksView_(nowNs);       // a worker without views still releases and times out View waiters
+        publishVerdictCleanerBounds_();
+        if ((++verdictPasses_ & 1023) == 0) [[unlikely]] maintainVerdictIndexes_();
         if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
         work += serveHeldPushReads_();
         // 4b. background disk work → io backend, never an inline fsync

@@ -1,8 +1,8 @@
 #pragma once
 // CheckedWritesStressDriver.h - the seeded cluster stress of the checked-writes verdict pipeline (plan 04 Task 11, matrix D).
 // Three real brokers (ThreeNodes), three real clients writing All|View to one typed, compacted source with two TestReject members
-// (object 7 TagEquals{9}, object 8 CapLiveKeys{8}) installed on every node, and an ordinary projection view.  step() draws one
-// seeded action; quiesce() brings the cluster to rest and checkAll() judges the committed history with the independent
+// (object 7 TagEquals{9}, object 8 CapLiveKeys{n}, replaced, dropped and installed again by the run) installed on every node, and
+// an ordinary projection view.  A raw and a group consumer read the source from offset 0.  step() draws one seeded action; quiesce() brings the cluster to rest and checkAll() judges the committed history with the independent
 // CheckedWritesModel and checks the named invariants against every node.  Every wait is a bounded poll: the deadline is the failure.
 #include "CheckedWritesChecks.h"
 #include "CheckedWritesModel.h"
@@ -11,6 +11,7 @@
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/Key.h>
+#include <rune/client/group/GroupConsumer.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/subscriber/Subscription.h>
 #include <rune/metadata/ShardRouter.h>
@@ -62,6 +63,7 @@ public:
         registerDefaults_();
     }
     ~CheckedWritesStressDriver() {
+        group_.reset();
         sub_.reset();
         reader_.reset();
         writers_.clear();
@@ -77,10 +79,10 @@ public:
         rune::client::TopicOptions to;
         to.replicationFactor = 3;
         to.config.cleanupPolicy = 1;
-        to.config.segmentRollBytes = 4096;
-        to.config.minCompactionLagMs = 10'000;
+        to.config.segmentRollBytes = 64 * 1024;
+        to.config.minCompactionLagMs = 100;
         to.config.minCleanableDirtyRatioPpm = 1;
-        to.config.fileDeleteDelayMs = 100;
+        to.config.fileDeleteDelayMs = 50;
         const auto src = admin->defineTopicAndWait("vt", 1, "id", rune::codec::serialize(verdictSourceDescriptor()), rune::client::Persistence::Disk, to, {}, 60s);
         ASSERT_EQ(src.errorCode, 0) << src.detail;
         topicId_ = src.topicId;
@@ -100,21 +102,23 @@ public:
     void step() {
         const unsigned r = static_cast<unsigned>(rng_() % 100);
         const int down = downNode_();
-        if (r < 60) {
+        if (r < 55) {
             note_(1);
             sendBurst_(-1);
-        } else if (r < 70 && down == 0) {
+        } else if (r < 65 && down == 0) {
             note_(2);
             crashLeaderDuringSends_();
-        } else if (r < 85) {
+        } else if (r < 80) {
             note_(3);
             if (down != 0) restartNode_(down, false);
             else restartFollower_();
-        } else {
+        } else if (r < 92) {
             note_(4);
+            changeConstraintSet_();
+        } else {
+            note_(5);
             std::this_thread::sleep_for(std::chrono::milliseconds(50 + static_cast<int>(rng_() % 150)));
         }
-        if (!::testing::Test::HasFatalFailure()) recordHistory_();
     }
 
     /// Every node back, one leader, every replica caught up and the judge past every record.
@@ -138,6 +142,13 @@ public:
                 return;
             }
             last = lead == nullptr ? "no leader" : "leo " + std::to_string(lead->leo) + " hw " + std::to_string(lead->hw) + " committed " + std::to_string(lead->committedThrough) + " end " + std::to_string(end);
+            for (const int id : c_.runningNodes()) {
+                const int32_t t = topicId_;
+                last += " | j" + std::to_string(id) + "=" + std::to_string(c_.node(id).onWorkerThreadForTest(worker_(id), [t](Worker& wk) {
+                    const VerdictSource* j = wk.viewSet()->verdictSource(t, 0);
+                    return j == nullptr ? 0 : 1 + (j->waitingForInstall() ? 2 : 0) + (j->stalled() ? 4 : 0);
+                })) + " ";
+            }
             for (const NodeSnap& s : snaps) last += " | n" + std::to_string(s.id) + " leo " + std::to_string(s.leo) + " hw " + std::to_string(s.hw) + " cov " + std::to_string(s.covered) + " com " + std::to_string(s.committedThrough);
             std::this_thread::sleep_for(100ms);
         }
@@ -153,7 +164,7 @@ public:
         awaitCompaction_();
         model_ = CheckedWritesModel();
         model_.declareRule(kObjTag, tagRule_().fingerprint(), CheckedWritesModel::tagEquals(9));
-        model_.declareRule(kObjCap, capRule_().fingerprint(), CheckedWritesModel::capLiveKeys(8));
+        for (const uint32_t cap : caps_) model_.declareRule(kObjCap, capRule_(cap).fingerprint(), CheckedWritesModel::capLiveKeys(cap));
         model_.reset(history_());
         for (const auto& [name, fn] : invariants_) {
             std::string why;
@@ -235,7 +246,8 @@ private:
         return rv::serializeAuthored(p);
     }
     static TestRejectRule tagRule_() { TestRejectRule r; r.mode = TestRejectRule::Mode::TagEquals; r.tag = 9; return r; }
-    static TestRejectRule capRule_() { TestRejectRule r; r.mode = TestRejectRule::Mode::CapLiveKeys; r.cap = 8; return r; }
+    static TestRejectRule capRule_(uint32_t cap) { TestRejectRule r; r.mode = TestRejectRule::Mode::CapLiveKeys; r.cap = cap; return r; }
+    static constexpr int32_t kTagTopic = 0x40000701, kCapTopicBase = 0x40000710;
 
     // ---- nodes ----
     int32_t worker_(int id) { return rune::metadata::ShardRouter(c_.node(id).workerCountForTest()).workerForPartition(topicId_, 0); }
@@ -251,22 +263,68 @@ private:
             });
         ASSERT_TRUE(ready) << "node " << id << " never served the source";
         const int32_t src = topicId_;
-        n.onWorkerThreadForTest(w, [src](Worker& wk) {
-            const auto desc = verdictSourceDescriptor();
-            const auto install = [&](const char* name, int32_t viewTopic, uint64_t object, TestRejectRule rule) {
-                rune::view::ViewPlan v;
-                v.viewName = name; v.key = "id"; v.sources = {{src, "id"}};
-                v.output = {{"id", rune::codec::PrimType::UInt64, 0, "id", rune::view::MergeRule::Replace}};
-                v.persistence = 1;
-                const rune::codec::Descriptor* srcs[] = {&desc};
-                auto comp = rune::view::compileView(v, srcs, viewTopic);
-                EXPECT_TRUE(comp.has_value());
-                wk.viewSet()->installTestVerdictViewForTest(comp->plan, comp->rowLayout, desc, false, object, rule);
-            };
-            install("vt_rej7", 0x40000701, kObjTag, tagRule_());
-            install("vt_rej8", 0x40000702, kObjCap, capRule_());
+        const int32_t capTopic = capTopic_;
+        const TestRejectRule capRule = capRule_(capValue_);
+        n.onWorkerThreadForTest(w, [src, capTopic, capRule](Worker& wk) {
+            installReject_(wk, src, "vt_rej7", kTagTopic, kObjTag, tagRule_());
+            if (capTopic != 0) installReject_(wk, src, "vt_rej8", capTopic, kObjCap, capRule);
             return 0;
         });
+    }
+    static void installReject_(Worker& wk, int32_t src, const char* name, int32_t viewTopic, uint64_t object, TestRejectRule rule) {
+        const auto desc = verdictSourceDescriptor();
+        rune::view::ViewPlan v;
+        v.viewName = name; v.key = "id"; v.sources = {{src, "id"}};
+        v.output = {{"id", rune::codec::PrimType::UInt64, 0, "id", rune::view::MergeRule::Replace}};
+        v.persistence = 1;
+        const rune::codec::Descriptor* srcs[] = {&desc};
+        auto comp = rune::view::compileView(v, srcs, viewTopic);
+        EXPECT_TRUE(comp.has_value());
+        wk.viewSet()->installTestVerdictViewForTest(comp->plan, comp->rowLayout, desc, false, object, rule);
+    }
+
+    /// The CapLiveKeys member is dropped, or installed again with another cap, on every running node.  A restart or failover
+    /// before the judge crossed the change would wait for a plan that is gone, so the change is settled (a write acked and
+    /// marked past it) before the next fault.
+    void changeConstraintSet_() {
+        settle_();
+        const int32_t oldTopic = capTopic_;
+        if (oldTopic != 0) {
+            capTopic_ = 0;
+        } else {
+            capValue_ = 5 + static_cast<uint32_t>(rng_() % 7);
+            capTopic_ = kCapTopicBase + (++capSeq_);
+            caps_.insert(capValue_);
+        }
+        const int32_t newTopic = capTopic_;
+        const TestRejectRule rule = capRule_(capValue_);
+        const int32_t src = topicId_;
+        for (const int id : c_.runningNodes()) {
+            c_.node(id).onWorkerThreadForTest(worker_(id), [=](Worker& wk) {
+                if (oldTopic != 0) wk.viewSet()->uninstallView(oldTopic);
+                if (newTopic != 0) installReject_(wk, src, "vt_rej8", newTopic, kObjCap, rule);
+                return 0;
+            });
+        }
+        settle_();
+    }
+    /// Writes until one is acked, then waits for the leader's judge and committed markers to cover everything written.
+    void settle_() {
+        if (::testing::Test::HasFatalFailure()) return;
+        bool acked = false;
+        for (int i = 0; i < 20 && !acked; ++i) {
+            const std::size_t before = sent_.size();
+            sendBurst_(-1);
+            for (std::size_t k = before; k < sent_.size(); ++k) acked = acked || sent_[k].result != Sent::Result::Unknown;
+        }
+        ASSERT_TRUE(acked) << "seed " << seed_ << ": no write was answered after a constraint-set change";
+        for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(50ms)) {
+            std::vector<NodeSnap> snaps;
+            for (const int id : c_.runningNodes()) snaps.push_back(snapNode_(id));
+            const NodeSnap* lead = leaderOf_(snaps);
+            if (lead != nullptr && lead->committedThrough >= dataEnd_(lead->log) && lead->hw == lead->leo) return;
+        }
+        ADD_FAILURE() << "seed " << seed_ << ": the judge did not cover the writes after a constraint-set change";
     }
 
     int downNode_() const {
@@ -286,6 +344,7 @@ private:
         writersStale_ = true;
         std::vector<int32_t> leaders;
         ASSERT_TRUE(rune::node::test::catalog_cluster::awaitLeaders(c_, topicId_, 1, leaders, 60s));
+        recordHistory_();
     }
     int32_t partitionLeader_() {
         std::vector<int32_t> leaders;
@@ -317,7 +376,7 @@ private:
     void sendBurst_(int victim) {
         if (writersStale_ || victim > 0) rebuildWriters_(victim);
         Writer& w = *writers_[rng_() % writers_.size()];
-        const int n = 1 + static_cast<int>(rng_() % 6);
+        const int n = 1 + static_cast<int>(rng_() % 80);
         std::vector<std::pair<uint64_t, std::size_t>> toks;
         std::thread killer;
         for (int i = 0; i < n; ++i) {
@@ -336,6 +395,7 @@ private:
             else if (d && d->status == rune::client::OpStatus::BrokerError && d->errorCode == static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation))
                 sent_[idx].result = Sent::Result::Violation;
         }
+        recordHistory_();
     }
     void crashLeaderDuringSends_() {
         const int32_t victim = partitionLeader_();
@@ -378,12 +438,8 @@ private:
         for (const NodeSnap& s : snaps) if (best == nullptr || s.hw > best->hw) best = &s;
         return best;
     }
-    static int64_t dataEnd_(const VerdictRig::RigLog& l) {
-        int64_t end = 0;
-        if (!l.data.empty()) end = std::max(end, l.data.back().offset + 1);
-        if (!l.changes.empty()) end = std::max(end, l.changes.back().offset + 1);
-        return end;
-    }
+    /// One past the last data record: what the judge and the committed markers must cover (a trailing change record needs no marker).
+    static int64_t dataEnd_(const VerdictRig::RigLog& l) { return l.data.empty() ? 0 : l.data.back().offset + 1; }
 
     /// The committed records ever seen: a compaction may remove them from every log later, the model still judges them.
     void recordHistory_(const std::vector<NodeSnap>* given = nullptr) {
@@ -408,19 +464,21 @@ private:
         snaps_.clear();
         for (const int id : c_.runningNodes()) snaps_.push_back(snapNode_(id));
     }
-    /// Gives the cleaner time to remove superseded records (the history is already recorded): up to the lag plus a pass.
+    /// Waits for the cleaner to remove a superseded record from a node's log (the history is already recorded).
     void awaitCompaction_() {
-        for (const auto deadline = Clock::now() + 40s; Clock::now() < deadline; std::this_thread::sleep_for(500ms)) {
+        for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(200ms)) {
             snapAll_();
             for (const NodeSnap& s : snaps_) if (s.log.data.size() < data_.size()) return;
         }
+        ADD_FAILURE() << "seed " << seed_ << ": no node's log lost a superseded record in 60 s (" << data_.size() << " committed records)";
     }
 
     void note_(unsigned code) { trace_ = (trace_ ^ code) * 1099511628211ull; }
 
     // ---- invariants ----
-    /// The raw subscription's delivered offsets from 0, once the leader's accepted records have all arrived.
-    std::set<int64_t> delivered_(const std::set<int64_t>& want) {
+    /// The offsets the raw subscription and the group consumer delivered from 0, once the leader's accepted records have all arrived
+    /// at both.
+    std::pair<std::set<int64_t>, std::set<int64_t>> delivered_(const std::set<int64_t>& want) {
         if (!sub_) {
             const NodeSnap* lead = leaderOf_(snaps_);
             rune::client::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c_, lead->id);
@@ -435,16 +493,38 @@ private:
                 std::lock_guard<std::mutex> g(deliveredMu_);
                 deliveredOffsets_.insert(r.offset);
             }));
+            rune::client::GroupConfig gcfg;
+            gcfg.autoCommit = false;
+            group_ = std::make_unique<rune::client::GroupConsumer>(reader_->subscribeGroup("cw-group", {"vt"}, gcfg));
+            group_->onRecords([this](const rune::client::RecordSet& rs) {
+                std::lock_guard<std::mutex> g(deliveredMu_);
+                rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { groupOffsets_.insert(off); });
+            });
         }
+        const auto holds = [&](const std::set<int64_t>& got) { return std::includes(got.begin(), got.end(), want.begin(), want.end()); };
         for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(50ms)) {
             std::lock_guard<std::mutex> g(deliveredMu_);
-            if (std::includes(deliveredOffsets_.begin(), deliveredOffsets_.end(), want.begin(), want.end())) break;
+            if (holds(deliveredOffsets_) && holds(groupOffsets_)) break;
         }
         std::this_thread::sleep_for(500ms);   // a rejected record would arrive with its neighbours
         std::lock_guard<std::mutex> g(deliveredMu_);
-        return deliveredOffsets_;
+        return {deliveredOffsets_, groupOffsets_};
     }
 
+    /// The leader's view instance folded every committed data record.
+    bool awaitViewFolded_() {
+        const NodeSnap* lead = leaderOf_(snaps_);
+        if (lead == nullptr) return false;
+        const int64_t end = dataEnd_(lead->log);
+        const int32_t viewTopic = viewTopicId_;
+        for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(50ms)) {
+            const int64_t folded = c_.node(lead->id).onWorkerThreadForTest(worker_(lead->id), [viewTopic](Worker& wk) {
+                return wk.viewSet()->instanceServeState(viewTopic, 0).foldCursor;
+            });
+            if (folded >= end) return true;
+        }
+        return false;
+    }
     bool viewRow_(uint64_t id, std::pair<int64_t, uint16_t>* out) {
         rune::client::ViewRowResult row;
         for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(100ms)) {
@@ -484,11 +564,13 @@ private:
             for (const auto& rec : lead->log.data) present.insert(rec.offset);
             for (const auto& rec : d.model_.acceptedRecords()) if (present.count(rec.offset) != 0) want.insert(rec.offset);
             for (const auto& kv : d.model_.verdicts()) rejected.insert(kv.first);
-            const std::set<int64_t> got = d.delivered_(want);
-            for (const int64_t off : rejected)
-                if (got.count(off) != 0) { *why = "rejected offset " + std::to_string(off) + " was delivered"; return false; }
-            for (const int64_t off : want)
-                if (got.count(off) == 0) { *why = "accepted offset " + std::to_string(off) + " was not delivered"; return false; }
+            const auto [raw, group] = d.delivered_(want);
+            for (const auto& [who, got] : {std::pair<const char*, const std::set<int64_t>&>{"raw", raw}, {"group", group}}) {
+                for (const int64_t off : rejected)
+                    if (got.count(off) != 0) { *why = std::string(who) + ": rejected offset " + std::to_string(off) + " was delivered"; return false; }
+                for (const int64_t off : want)
+                    if (got.count(off) == 0) { *why = std::string(who) + ": accepted offset " + std::to_string(off) + " was not delivered"; return false; }
+            }
             return true;
         });
         registerInvariant("SameVerdictEveryLeaderAndRefold", [](CheckedWritesStressDriver& d, std::string* why) {
@@ -505,7 +587,6 @@ private:
                         if (it == d.model_.verdicts().end() || !(it->second == verdict)) { *why = at + "index entry " + std::to_string(off) + " is not the model's verdict"; return false; }
                     }
                     for (const auto& [off, verdict] : d.model_.verdicts()) {
-                        (void)verdict;
                         if (present.count(off) != 0 && s.index.count(off) == 0) { *why = at + "rejected offset " + std::to_string(off) + " is in the log but not in the index"; return false; }
                     }
                 }
@@ -530,6 +611,7 @@ private:
         });
         registerInvariant("ViewEqualsFreshRefold", [](CheckedWritesStressDriver& d, std::string* why) {
             if (!d.reader_) (void)d.delivered_({});
+            if (!d.awaitViewFolded_()) { *why = "the view never folded the leader's committed records"; return false; }
             const auto proj = d.model_.projection();
             for (uint64_t id = 1; id <= kKeys; ++id) {
                 const auto it = proj.find(id);
@@ -566,6 +648,9 @@ private:
     uint64_t seed_;
     uint64_t trace_ = 1469598103934665603ull;
     int32_t topicId_ = -1, viewTopicId_ = -1;
+    int32_t capTopic_ = kCapTopicBase, capSeq_ = 0;   // the installed CapLiveKeys view's topic (0 = dropped)
+    uint32_t capValue_ = 8;
+    std::set<uint32_t> caps_{8};
     int64_t vSeq_ = 0;
     int crashes_ = 0, restarts_ = 0, bounces_ = 0;
     bool writersStale_ = false;
@@ -578,6 +663,8 @@ private:
     std::vector<std::pair<std::string, Invariant>> invariants_;
     std::unique_ptr<rune::client::Client> reader_;
     std::unique_ptr<rune::client::Subscription> sub_;
+    std::unique_ptr<rune::client::GroupConsumer> group_;
+    std::set<int64_t> groupOffsets_;
     std::mutex deliveredMu_;
     std::set<int64_t> deliveredOffsets_;
     std::size_t compactedAway_ = 0;
