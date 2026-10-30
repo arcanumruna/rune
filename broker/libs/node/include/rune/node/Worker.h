@@ -8292,8 +8292,6 @@ private:
                 if (entry.replay == 2) {   // outside the dedupe window: stored, its verdicts are gone
                     code = static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
                     if (ws->verdicts != nullptr) ++ws->verdicts->statsMut().verdictUnknownDuplicates;
-                } else if (ackSink_ == nullptr) [[unlikely]] {   // the return ring carries no trailer: never ack a verdict source without one
-                    code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
                 } else if (!fillVerdicts_(entry, *ws)) {
                     if (nowNs < entry.deadlineNs) {
                         if (deferredCount == deferred.size()) deferAll = true;
