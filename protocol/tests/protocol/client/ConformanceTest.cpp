@@ -622,6 +622,70 @@ TEST(ConformanceGolden, ProduceResponse) {
 }
 
 // ===========================================================================
+// 13c. produce_response_v17.bin — 54 bytes (client version 17: + assignedBase)
+// ===========================================================================
+TEST(ConformanceGolden, ProduceResponseV17) {
+    const auto golden = readVector("produce_response_v17.bin");
+    ASSERT_EQ(golden.size(), 54u);
+    assertHeader(golden, rpc::ProduceResponse::TEMPLATE_ID, rpc::ProduceResponse::BODY_FIXED_V17);
+
+    auto msgOpt = rpc::ProduceResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->baseOffset, 123456LL);
+    EXPECT_EQ(msgOpt->logStartOffset, -1);
+    EXPECT_EQ(msgOpt->assignedBase, 1001u);
+    EXPECT_FALSE(msgOpt->hasVerdicts);
+
+    rpc::ProduceResponse msg;
+    msg.sessionId = kSessionId; msg.correlationId = kCorrelationId;
+    msg.partition = 7; msg.baseOffset = 123456LL; msg.assignedBase = 1001;
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encodeFor(enc.data(), rpc::kClientVersionCheckedWrites);
+    ASSERT_EQ(n, golden.size());
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0);
+}
+
+// 13d. produce_response_v17_verdicts.bin — 64 bytes
+TEST(ConformanceGolden, ProduceResponseV17Verdicts) {
+    const auto golden = readVector("produce_response_v17_verdicts.bin");
+    ASSERT_EQ(golden.size(), 64u);
+    auto msgOpt = rpc::ProduceResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->assignedBase, 0u);
+    ASSERT_TRUE(msgOpt->hasVerdicts);
+    ASSERT_EQ(msgOpt->verdictCount, 1u);
+    int seen = 0;
+    msgOpt->forEachVerdict([&](uint16_t idx, uint16_t code, uint32_t cid) {
+        ++seen;
+        EXPECT_EQ(idx, 1u);
+        EXPECT_EQ(code, static_cast<uint16_t>(rpc::ErrorCode::ConstraintViolation));
+        EXPECT_EQ(cid, 0x0005'0000u);
+    });
+    EXPECT_EQ(seen, 1);
+
+    rpc::ProduceResponse msg;
+    msg.sessionId = kSessionId; msg.correlationId = kCorrelationId;
+    msg.partition = 7; msg.baseOffset = 123456LL;
+    msg.hasVerdicts = true; msg.verdictCount = 1; msg.verdictBytes = msgOpt->verdictBytes;
+    std::array<uint8_t, 96> enc{};
+    const std::size_t n = msg.encodeFor(enc.data(), rpc::kClientVersionCheckedWrites);
+    ASSERT_EQ(n, golden.size());
+    EXPECT_EQ(std::memcmp(enc.data(), golden.data(), n), 0);
+}
+
+// 13e. produce_acks_all_view.bin — Produce with acks = 3
+TEST(ConformanceGolden, ProduceAcksAllView) {
+    const auto golden = readVector("produce_acks_all_view.bin");
+    const auto base   = readVector("produce_explicit_partition.bin");
+    ASSERT_EQ(golden.size(), base.size());
+    auto msgOpt = rpc::Produce::decode(golden.data(), golden.size());
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->acks, 3);
+    for (std::size_t i = 0; i < golden.size(); ++i)
+        if (i == 33) EXPECT_NE(golden[i], base[i]); else EXPECT_EQ(golden[i], base[i]) << i;
+}
+
+// ===========================================================================
 // 13a. produce_response_v0.bin — 38 bytes, the PRE-D6 frame (blockLength 14)
 //      an old broker sends.  D6 compat: still decodes; logStartOffset = -1.
 // ===========================================================================

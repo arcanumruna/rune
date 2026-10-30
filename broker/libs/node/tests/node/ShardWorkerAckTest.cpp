@@ -807,7 +807,7 @@ TEST(ShardWorkerAckUnknownProducerIdRegression, ShardChainAnswersUnknownProducer
         << "a clientVersion-2 session must see 28 in shard mode (the announce carries the version to the sink)";
     EXPECT_EQ(f.acks[61].logStartOffset, logStart)
         << "the shard ack must carry the log start (else the client always takes U2)";
-    EXPECT_EQ(f.ackBytes[61], pc::ProduceResponse::ENCODED_SIZE);
+    EXPECT_EQ(f.ackBytes[61], pc::ProduceResponse::encodedSizeFor(pc::kClientVersion));
 
     f.produce(/*corr=*/62, /*acks=*/0, /*pid=*/7, /*seq=*/6, /*sid=*/6, f.pub2.get());
     ASSERT_TRUE(f.awaitAck(62));

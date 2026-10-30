@@ -599,8 +599,8 @@ bool ClientGateway::sendRespReliable_(Session&          session,
                                       int64_t           correlationId,
                                       int64_t           logStartOffset)
 {
-    static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
-                  "ProduceResponse::ENCODED_SIZE exceeds kScratchSize");
+    static_assert(pc::ProduceResponse::kMaxEncodedSize <= kScratchSize,
+                  "ProduceResponse::kMaxEncodedSize exceeds kScratchSize");
 
     pc::ProduceResponse resp;
     resp.sessionId     = session.sessionId;
@@ -7446,7 +7446,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 // client below v14 is answered InvalidRequest by encodeFor and gets no retry-after.
                 if (ec == pc::ErrorCode::Throttled && session->clientVersion >= pc::kClientVersionNamespaces)
                     resp.logStartOffset = ret.lastOffset;
-                static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
+                static_assert(pc::ProduceResponse::kMaxEncodedSize <= kScratchSize,
                               "scratch too small for ProduceResponse");
                 // D6 review M4: the pre-D6 38 B frame below clientVersion 2.
                 const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);
@@ -7832,7 +7832,7 @@ void ClientGateway::drainPendingAcks()
                 resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::OK);
                 resp.partition     = entry.partition;
                 resp.baseOffset    = entry.baseOffset;
-                static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
+                static_assert(pc::ProduceResponse::kMaxEncodedSize <= kScratchSize,
                               "scratch too small for ProduceResponse");
                 const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 // G0.1: reliable delivery (retry on back-pressure) — this is the

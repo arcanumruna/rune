@@ -490,7 +490,7 @@ TEST(SessionAckSinkUnknownProducerIdRegression, OldSessionsGetTheStrictPreD6Fram
             EXPECT_EQ(ec, corr == sid ? 0 : static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence)) << sid;
             if (corr == sid) EXPECT_EQ(pc::detail::getLE64(f.data(), 30), 40 + sid);
         } else {
-            ASSERT_EQ(f.size(), pc::ProduceResponse::ENCODED_SIZE) << sid;
+            ASSERT_EQ(f.size(), pc::ProduceResponse::encodedSizeFor(pc::kClientVersion)) << sid;
         }
         ++seen;
     }

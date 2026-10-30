@@ -1837,7 +1837,9 @@ TEST(DataMessagesRegression, ProduceUnknownAcksByteIsRejectedRegression) {
     std::vector<uint8_t> buf(p.encodedSize());
     const std::size_t n = p.encode(buf.data());
     ASSERT_TRUE(rpc::Produce::decode(buf.data(), n).has_value());
-    buf[rpc::MessageHeader::ENCODED_SIZE + 9] = 2;   // acks byte
+    buf[rpc::MessageHeader::ENCODED_SIZE + 9] = 4;   // acks byte: bit 2 is unknown (bit 1 is View since client 17)
+    EXPECT_FALSE(rpc::Produce::decode(buf.data(), n).has_value());
+    buf[rpc::MessageHeader::ENCODED_SIZE + 9] = 0x81;
     EXPECT_FALSE(rpc::Produce::decode(buf.data(), n).has_value());
     buf[rpc::MessageHeader::ENCODED_SIZE + 9] = 0;
     EXPECT_TRUE(rpc::Produce::decode(buf.data(), n).has_value());
@@ -2217,4 +2219,141 @@ TEST(CheckedWritesProtocolRegression, OldSessionsNeverSeeCheckedWriteCodesRegres
     EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::TransientLogFull, 5), rpc::ErrorCode::NotLeader);
     EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::SchemaValidationFailed, 11), rpc::ErrorCode::SchemaValidationFailed);
     EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::ViewPaused, 14), rpc::ErrorCode::ViewPaused);
+}
+
+// ── Checked writes Part 03: the acks bits and ProduceResponse client 17 ──
+namespace {
+std::array<uint8_t, 16> kTwoVerdicts() {
+    return {0x00, 0x00, 0x37, 0x00, 0x00, 0x00, 0x07, 0x00,    // {0, 55, 0x00070000}
+            0x03, 0x00, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00};   // {3, 56, 0}
+}
+rpc::ProduceResponse respV17() {
+    rpc::ProduceResponse r;
+    r.sessionId = 7; r.correlationId = 9; r.errorCode = 0; r.partition = 7; r.baseOffset = 123456; r.assignedBase = 42;
+    return r;
+}
+}  // namespace
+
+TEST(CheckedWritesWire, AcksByteHelpers) {
+    EXPECT_TRUE(rpc::acksAll(1)); EXPECT_TRUE(rpc::acksAll(3)); EXPECT_FALSE(rpc::acksAll(0)); EXPECT_FALSE(rpc::acksAll(2));
+    EXPECT_TRUE(rpc::acksView(2)); EXPECT_TRUE(rpc::acksView(3)); EXPECT_FALSE(rpc::acksView(1)); EXPECT_FALSE(rpc::acksView(0));
+}
+
+TEST(CheckedWritesWireRegression, ProduceDecodeAcceptsOnlyKnownAcksBitsRegression) {
+    static constexpr uint8_t kBatch[] = {1, 2, 3};
+    for (int b = 0; b < 256; ++b) {
+        rpc::Produce m;
+        m.sessionId = 1; m.correlationId = 2; m.topicId = 3; m.acks = static_cast<uint8_t>(b);
+        m.recordBatch = std::span<const uint8_t>(kBatch, sizeof(kBatch));
+        std::vector<uint8_t> buf(m.encodedSize());
+        m.encode(buf.data());
+        const auto d = rpc::Produce::decode(buf.data(), buf.size());
+        EXPECT_EQ(d.has_value(), (b & ~0x03) == 0) << b;
+        if (d) EXPECT_EQ(d->acks, b);
+    }
+}
+
+TEST(CheckedWritesWire, ProduceResponseV17RoundTrip) {
+    const auto resp = respV17();
+    std::array<uint8_t, 64> buf{};
+    const std::size_t n = resp.encodeFor(buf.data(), rpc::kClientVersionCheckedWrites);
+    EXPECT_EQ(n, 54u);
+    EXPECT_EQ(n, rpc::ProduceResponse::encodedSizeFor(rpc::kClientVersionCheckedWrites, false, 0));
+    EXPECT_EQ(n, resp.encodedSize(rpc::kClientVersionCheckedWrites));
+    EXPECT_EQ(buf[0] | (buf[1] << 8), 30);
+    EXPECT_EQ(buf[46], 42);
+    const auto d = rpc::ProduceResponse::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->assignedBase, 42u);
+    EXPECT_FALSE(d->hasVerdicts);
+    EXPECT_EQ(d->verdictCount, 0u);
+}
+
+TEST(CheckedWritesWireRegression, EncodeForBelowSeventeenIsByteIdenticalRegression) {
+    rpc::ProduceResponse plain;
+    plain.sessionId = 7; plain.correlationId = 9; plain.partition = 7; plain.baseOffset = 123456;
+    auto loaded = plain;
+    const auto bytes = kTwoVerdicts();
+    loaded.assignedBase = 42; loaded.hasVerdicts = true; loaded.verdictCount = 2; loaded.verdictBytes = std::span<const uint8_t>(bytes.data(), 16);
+    for (int v : {0, 1, 2, 5, 11, 16}) {
+        std::array<uint8_t, 96> a{}, b{};
+        const std::size_t na = plain.encodeFor(a.data(), v);
+        const std::size_t nb = loaded.encodeFor(b.data(), v);
+        EXPECT_EQ(na, v >= 2 ? 46u : 38u) << v;
+        ASSERT_EQ(na, nb) << v;
+        EXPECT_EQ(std::memcmp(a.data(), b.data(), na), 0) << v;
+        EXPECT_EQ(loaded.encodedSize(v), na) << v;
+    }
+}
+
+TEST(CheckedWritesWire, VerdictTrailerRoundTrip) {
+    const auto bytes = kTwoVerdicts();
+    auto resp = respV17();
+    resp.assignedBase = 0; resp.hasVerdicts = true; resp.verdictCount = 2; resp.verdictBytes = std::span<const uint8_t>(bytes.data(), 16);
+    std::array<uint8_t, 96> buf{};
+    const std::size_t n = resp.encodeFor(buf.data(), rpc::kClientVersionCheckedWrites);
+    EXPECT_EQ(n, 72u);
+    EXPECT_EQ(n, rpc::ProduceResponse::encodedSizeFor(rpc::kClientVersionCheckedWrites, true, 2));
+    const auto d = rpc::ProduceResponse::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    ASSERT_TRUE(d->hasVerdicts);
+    ASSERT_EQ(d->verdictCount, 2u);
+    std::vector<std::array<uint32_t, 3>> seen;
+    d->forEachVerdict([&](uint16_t i, uint16_t c, uint32_t id) { seen.push_back({i, c, id}); });
+    ASSERT_EQ(seen.size(), 2u);
+    EXPECT_EQ(seen[0], (std::array<uint32_t, 3>{0, 55, 0x0007'0000u}));
+    EXPECT_EQ(seen[1], (std::array<uint32_t, 3>{3, 56, 0}));
+
+    resp.verdictCount = 0; resp.verdictBytes = {};
+    const std::size_t n0 = resp.encodeFor(buf.data(), rpc::kClientVersionCheckedWrites);
+    EXPECT_EQ(n0, 56u);
+    const auto d0 = rpc::ProduceResponse::decode(buf.data(), n0);
+    ASSERT_TRUE(d0.has_value());
+    EXPECT_TRUE(d0->hasVerdicts);
+    EXPECT_EQ(d0->verdictCount, 0u);
+}
+
+TEST(CheckedWritesWireRegression, TruncatedOrOversizedTrailerIsUndecodableRegression) {
+    const auto bytes = kTwoVerdicts();
+    auto resp = respV17();
+    resp.hasVerdicts = true; resp.verdictCount = 2; resp.verdictBytes = std::span<const uint8_t>(bytes.data(), 16);
+    std::vector<uint8_t> buf(rpc::ProduceResponse::kMaxEncodedSize + 64, 0);
+    const std::size_t n = resp.encodeFor(buf.data(), rpc::kClientVersionCheckedWrites);
+    ASSERT_EQ(n, 72u);
+    EXPECT_FALSE(rpc::ProduceResponse::decode(buf.data(), 71).has_value());            // cut
+    EXPECT_FALSE(rpc::ProduceResponse::decode(buf.data(), 70).has_value());
+    std::vector<uint8_t> shortBody(buf.begin(), buf.begin() + 64);                    // count 2, 8 entry bytes
+    EXPECT_FALSE(rpc::ProduceResponse::decode(shortBody.data(), shortBody.size()).has_value());
+    std::vector<uint8_t> big(54 + 2 + 8 * 4097, 0);                                   // count 4097
+    std::memcpy(big.data(), buf.data(), 54);
+    big[54] = 0x01; big[55] = 0x10;
+    EXPECT_FALSE(rpc::ProduceResponse::decode(big.data(), big.size()).has_value());
+    std::vector<uint8_t> stray(buf.begin(), buf.begin() + 55);                        // one stray byte after the block
+    stray[0] = 30;
+    EXPECT_FALSE(rpc::ProduceResponse::decode(stray.data(), stray.size()).has_value());
+}
+
+TEST(CheckedWritesWire, MaxEncodedSizeIs32824) {
+    static_assert(rpc::ProduceResponse::kMaxEncodedSize == 32824);
+    static_assert(rpc::kMaxJudgedBatchRecords == rpc::ProduceResponse::kMaxVerdictEntries);
+    EXPECT_EQ(rpc::ProduceResponse::encodedSizeFor(rpc::kClientVersionCheckedWrites, true, 4096), 32824u);
+}
+
+TEST(CheckedWritesWire, MatrixEncodeForByVersion) {
+    for (int v : {0, 1, 2, 5, 11, 17})
+        for (uint64_t ab : {uint64_t{0}, uint64_t{42}})
+            for (bool hv : {false, true})
+                for (uint16_t vc : {uint16_t{0}, uint16_t{2}}) {
+                    const auto bytes = kTwoVerdicts();
+                    auto r = respV17();
+                    r.assignedBase = ab; r.hasVerdicts = hv; r.verdictCount = vc;
+                    r.verdictBytes = std::span<const uint8_t>(bytes.data(), 8 * std::size_t{vc});
+                    std::array<uint8_t, 96> buf{};
+                    const std::size_t n = r.encodeFor(buf.data(), v);
+                    EXPECT_EQ(n, r.encodedSize(v)) << v << ab << hv << vc;
+                    const auto d = rpc::ProduceResponse::decode(buf.data(), n);
+                    ASSERT_TRUE(d.has_value()) << v << ab << hv << vc;
+                    EXPECT_EQ(d->assignedBase, v >= 17 ? ab : 0u);
+                    EXPECT_EQ(d->hasVerdicts, v >= 17 && hv);
+                }
 }

@@ -1325,14 +1325,14 @@ private:
     // Task 23: fixed scratch for the ENCRYPTED ack-seal path (flushAcks_'s
     // seal branch). Unlike Records (RecordsSealScratch, a GROW-ONCE vector —
     // batches are unbounded), a ProduceResponse has a compile-time-bounded
-    // max size (ENCODED_SIZE, 46 B — no record batch), so a fixed
+    // max size (kMaxEncodedSize: the 54 B client-17 frame plus a 4096-entry verdict trailer), so a fixed
     // std::array is strictly simpler than grow-once here and still Rule-4
     // zero-allocation (no vector, no resize, ever). One instance per sink
     // (one per worker — shared-nothing); reused for every sealed ack, one at
     // a time (the seal result is consumed synchronously before the next ack
     // is processed, never held across iterations).
-    std::array<uint8_t, rune::protocol::client::ProduceResponse::ENCODED_SIZE>                     ackPlainScratch_{};
-    std::array<uint8_t, rune::protocol::client::ProduceResponse::ENCODED_SIZE +
+    std::array<uint8_t, rune::protocol::client::ProduceResponse::kMaxEncodedSize>                  ackPlainScratch_{};
+    std::array<uint8_t, rune::protocol::client::ProduceResponse::kMaxEncodedSize +
                              rune::protocol::client::kCryptoOverhead>                               ackSealedScratch_{};
     std::size_t                                                      heldAfterFlush_ = 0;
     std::size_t                                                      unreported_ = 0;

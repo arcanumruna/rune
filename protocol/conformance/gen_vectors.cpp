@@ -311,6 +311,67 @@ int main(int argc, char** argv) {
     }
 
     // -----------------------------------------------------------------------
+    // 13c. produce_response_v17.bin (client version 17, checked writes)
+    //
+    // ProduceResponse{ errorCode=0, partition=7, baseOffset=123456, logStartOffset=-1, assignedBase=1001 }
+    // blockLength 30, no trailer.  Total = 24 + 30 = 54 bytes
+    // -----------------------------------------------------------------------
+    {
+        rpc::ProduceResponse msg;
+        msg.sessionId     = kSessionId;
+        msg.correlationId = kCorrelationId;
+        msg.errorCode     = 0;
+        msg.partition     = 7;
+        msg.baseOffset    = 123456LL;
+        msg.assignedBase  = 1001;
+        n = msg.encodeFor(buf, rpc::kClientVersionCheckedWrites);
+        write_vec(dir, "produce_response_v17.bin", buf, n);
+    }
+
+    // -----------------------------------------------------------------------
+    // 13d. produce_response_v17_verdicts.bin
+    //
+    // As 13c with assignedBase=0 and a verdict trailer: count=1, {recordIndex=1, code=55 (ConstraintViolation),
+    // constraintId=0x00050000}.  Total = 54 + 2 + 8 = 64 bytes
+    // -----------------------------------------------------------------------
+    {
+        static constexpr uint8_t kEntry[8] = {0x01, 0x00, 0x37, 0x00, 0x00, 0x00, 0x05, 0x00};
+        rpc::ProduceResponse msg;
+        msg.sessionId     = kSessionId;
+        msg.correlationId = kCorrelationId;
+        msg.errorCode     = 0;
+        msg.partition     = 7;
+        msg.baseOffset    = 123456LL;
+        msg.hasVerdicts   = true;
+        msg.verdictCount  = 1;
+        msg.verdictBytes  = std::span<const uint8_t>(kEntry, sizeof(kEntry));
+        n = msg.encodeFor(buf, rpc::kClientVersionCheckedWrites);
+        write_vec(dir, "produce_response_v17_verdicts.bin", buf, n);
+    }
+
+    // -----------------------------------------------------------------------
+    // 13e. produce_acks_all_view.bin
+    //
+    // 11's Produce with acks=3 (All | View).  Total = 60 bytes; differs from 11 at byte 33 only.
+    // -----------------------------------------------------------------------
+    {
+        static constexpr uint8_t kBatch[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF, 0x01, 0x02};
+        rpc::Produce msg;
+        msg.sessionId      = kSessionId;
+        msg.correlationId  = kCorrelationId;
+        msg.topicId        = 1001;
+        msg.partition      = 7;
+        msg.partitionKnown = 1;
+        msg.acks           = rpc::kAcksWireAll | rpc::kAcksWireView;
+        msg.key            = std::span<const uint8_t>{};
+        msg.recordBatch    = std::span<const uint8_t>(kBatch, sizeof(kBatch));
+
+        std::vector<uint8_t> vbuf(msg.encodedSize());
+        n = msg.encode(vbuf.data());
+        write_vec(dir, "produce_acks_all_view.bin", vbuf.data(), n);
+    }
+
+    // -----------------------------------------------------------------------
     // 14. subscribe_explicit.bin
     //
     // Subscribe{ topicId=3001, partition=5, partitionKnown=1, fromOffset=9999,

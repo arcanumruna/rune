@@ -487,3 +487,24 @@ TEST(DataCodecSessionFlow, ProduceSubscribeRoundTrip) {
             << " (" << kFlow[i].filename << ")";
     }
 }
+
+// Checked writes (client version 17): the 54-byte ProduceResponse and the verdict trailer.
+TEST(CheckedWritesClientConformance, DecodesV17ProduceResponse) {
+    const auto a = readVector("produce_response_v17.bin");
+    ASSERT_EQ(a.size(), 54u);
+    auto va = cc::decodeProduceResponse(a.data(), a.size());
+    ASSERT_TRUE(va.has_value());
+    EXPECT_EQ(va->baseOffset, 123456LL);
+    EXPECT_EQ(va->assignedBase, 1001u);
+    EXPECT_FALSE(va->hasVerdicts);
+    EXPECT_EQ(va->verdictCount, 0u);
+
+    const auto b = readVector("produce_response_v17_verdicts.bin");
+    ASSERT_EQ(b.size(), 64u);
+    auto vb = cc::decodeProduceResponse(b.data(), b.size());
+    ASSERT_TRUE(vb.has_value());
+    EXPECT_EQ(vb->assignedBase, 0u);
+    EXPECT_TRUE(vb->hasVerdicts);
+    ASSERT_EQ(vb->verdictCount, 1u);
+    EXPECT_EQ(vb->verdictBytes.size(), 8u);
+}

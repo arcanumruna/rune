@@ -506,6 +506,40 @@ Offset  Hex                                        Notes
 
 ---
 
+### 13c. `produce_response_v17.bin` — 54 bytes (client version 17, checked writes)
+
+Client version 17 raises blockLength to 30 and appends `assignedBase : uint64` (0 = none) at offset 46. Vector fields:
+errorCode 0, partition 7, baseOffset 123456, logStartOffset -1, assignedBase 1001 (0x03E9). No trailer.
+
+```
+Offset  Hex                                        Notes
+00      1E 00                                      blockLength = 30 (LE)
+02      11 00                                      templateId = 17 (LE)
+24      00 00                                      errorCode = 0
+26      07 00 00 00                                partition = 7
+30      40 E2 01 00 00 00 00 00                    baseOffset = 123456
+38      FF FF FF FF FF FF FF FF                    logStartOffset = -1
+46      E9 03 00 00 00 00 00 00                    assignedBase = 1001
+```
+
+### 13d. `produce_response_v17_verdicts.bin` — 64 bytes
+
+As 13c with assignedBase 0 and the verdict trailer after the block: `count : uint16`, then `count` entries of
+`{recordIndex : uint16, code : uint16, constraintId : uint32}`. Present only on a `View` ack of a verdict source; count 0
+means every record was accepted. Here count = 1, entry `{1, 55 (ConstraintViolation), 0x00050000}`.
+
+```
+Offset  Hex                                        Notes
+54      01 00                                      count = 1
+56      01 00 37 00 00 00 05 00                    recordIndex 1, code 55, constraintId 0x00050000
+```
+
+### 13e. `produce_acks_all_view.bin` — 60 bytes
+
+`produce_explicit_partition.bin` (section 11) with `acks = 3` (bit 0 All, bit 1 View) at offset 33. No other byte differs.
+
+---
+
 ## 14. `subscribe_explicit.bin` — 44 bytes
 
 **Message:** `Subscribe` (templateId = 18)

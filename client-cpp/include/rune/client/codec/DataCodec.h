@@ -112,6 +112,10 @@ struct ProduceResponseView {
     int32_t partition      = 0;
     int64_t baseOffset     = 0;
     int64_t logStartOffset = -1; // D6: the partition's log start (-1 = not carried / old broker)
+    uint64_t assignedBase  = 0;  // client 17: the first broker-assigned id of the batch (0 = none)
+    bool     hasVerdicts   = false;
+    uint16_t verdictCount  = 0;
+    std::span<const uint8_t> verdictBytes;   // verdictCount x {recordIndex u16, code u16, constraintId u32}
 };
 
 /// Encode a ProduceResponse frame (rpc::ProduceResponse::ENCODED_SIZE = 46
@@ -148,6 +152,10 @@ inline std::optional<ProduceResponseView> decodeProduceResponse(const uint8_t* b
     v.partition      = opt->partition;
     v.baseOffset     = opt->baseOffset;
     v.logStartOffset = opt->logStartOffset;
+    v.assignedBase   = opt->assignedBase;
+    v.hasVerdicts    = opt->hasVerdicts;
+    v.verdictCount   = opt->verdictCount;
+    v.verdictBytes   = opt->verdictBytes;
     return v;
 }
 
