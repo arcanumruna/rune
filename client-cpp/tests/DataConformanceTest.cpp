@@ -22,6 +22,7 @@
 
 // Client data adapter layer — the adapters under test.
 #include <rune/client/codec/DataCodec.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <array>
 #include <cstdint>
@@ -507,4 +508,28 @@ TEST(CheckedWritesClientConformance, DecodesV17ProduceResponse) {
     EXPECT_TRUE(vb->hasVerdicts);
     ASSERT_EQ(vb->verdictCount, 1u);
     EXPECT_EQ(vb->verdictBytes.size(), 8u);
+}
+
+// Checked writes Part 04: the broker never pushes control records 16 to 19 (producer id -1), but a reader that meets one
+// consumes its offset and never visits it.
+TEST(DataCodecConformance, ControlBatchBetweenDataBatchesIsNeverVisited) {
+    std::vector<uint8_t> frames;
+    const auto add = [&](int64_t base, bool control, const char* key) {
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        if (control) { b.setProducerId(-1); b.setControl(true); }
+        b.append(key, "v", 1000);
+        const auto bytes = b.build();
+        frames.insert(frames.end(), bytes.begin(), bytes.end());
+    };
+    add(10, false, "a");
+    add(11, true, "marker");
+    add(12, false, "b");
+    std::vector<uint8_t> buf(frames.size() + 128);
+    const std::size_t n = cc::encodeRecords(buf.data(), buf.size(), 1, 1, 0, 10, std::span<const uint8_t>(frames), 1, 1);
+    ASSERT_GT(n, 0u);
+    auto v = cc::decodeRecords(buf.data(), n);
+    ASSERT_TRUE(v.has_value());
+    std::vector<int64_t> seen;
+    v->forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { seen.push_back(off); });
+    EXPECT_EQ(seen, (std::vector<int64_t>{10, 12}));
 }
