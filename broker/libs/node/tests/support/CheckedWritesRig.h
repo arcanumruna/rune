@@ -709,11 +709,15 @@ private:
         worker->setFilterConfig(filter::FilterConfig{});
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
         worker->setViewSet(vs.get());
+        if (rcScanBytesPerPass != 0) worker->setRcScanBytesPerPass(rcScanBytesPerPass);
         if (egress_) worker->setWorkerEgress(egress_.get());
         wireAcks_();
     }
 
     std::vector<rune::replication::NodeId> isr_;
+ public:
+    int32_t rcScanBytesPerPass = 0;   ///< the leadership scan budget of a (re)started worker; 0 = the default
+ private:
     int64_t rollBytes_;
     uint64_t cleanedSeq_ = 0;
     std::vector<std::function<void()>> installs_;

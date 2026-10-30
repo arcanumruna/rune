@@ -8308,13 +8308,18 @@ private:
                 if (entry.replay == 2) {   // outside the dedupe window: stored, its verdicts are gone
                     code = static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
                     if (ws->verdicts != nullptr) ++ws->verdicts->statsMut().verdictUnknownDuplicates;
-                } else if (!fillVerdicts_(entry, *ws)) {
-                    if (nowNs < entry.deadlineNs) {
-                        if (deferredCount == deferred.size()) deferAll = true;
-                        else deferred[deferredCount++] = Deferred{entry.ret.topicId, entry.ret.partition};
-                        return false;
+                } else {
+                    const VerdictFill fill = fillVerdicts_(entry, *ws);
+                    if (fill == VerdictFill::TooMany) {
+                        code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+                    } else if (fill == VerdictFill::Deferred) {
+                        if (nowNs < entry.deadlineNs) {
+                            if (deferredCount == deferred.size()) deferAll = true;
+                            else deferred[deferredCount++] = Deferred{entry.ret.topicId, entry.ret.partition};
+                            return false;
+                        }
+                        code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
                     }
-                    code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
                 }
             }
             entry.ret.errorCode = code;
@@ -8326,14 +8331,18 @@ private:
     }
 
     // The trailer of a View ack of a verdict source: the rejections in [baseOffset, lastOffset] as {offset - baseOffset, code,
-    // constraintId}.  False = the sink's arena is full (the caller defers; nothing was reserved).
-    [[nodiscard]] bool fillVerdicts_(PendingAcksView& entry, const PartitionWriteState& ws) {
+    // constraintId}.  Deferred = the sink's arena is full (the caller retries; nothing was reserved).  TooMany = more than a
+    // trailer carries (a batch the hook let through before the limit applied): the ack is Internal, the write itself stands.
+    enum class VerdictFill : uint8_t { Done, Deferred, TooMany };
+    [[nodiscard]] VerdictFill fillVerdicts_(PendingAcksView& entry, const PartitionWriteState& ws) {
         const int64_t base = entry.ret.baseOffset;
-        uint16_t n = 0;
-        ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry&) { ++n; });
+        std::size_t count = 0;
+        ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry&) { ++count; });
+        if (count > static_cast<std::size_t>(kMaxJudgedBatchRecords)) [[unlikely]] return VerdictFill::TooMany;
+        const uint16_t n = static_cast<uint16_t>(count);
         uint32_t run = kNoVerdictRun;
         if (n != 0) {
-            if (!ackSink_->reserveVerdicts(n, run)) return false;
+            if (!ackSink_->reserveVerdicts(n, run)) return VerdictFill::Deferred;
             uint8_t* out = ackSink_->verdictEntries(run).data();
             ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry& e) {
                 const uint16_t idx = static_cast<uint16_t>(e.offset - base);
@@ -8347,7 +8356,7 @@ private:
         entry.ret.hasVerdicts = 1;
         entry.ret.verdictCount = n;
         entry.ret.verdictRun = run;
-        return true;
+        return VerdictFill::Done;
     }
 
     // -----------------------------------------------------------------------
@@ -9471,6 +9480,14 @@ private:
         if (frameRefusal != HookRefusal::None) [[unlikely]] {
             noteHookRefusal_(frameRefusal, f);
             ret.errorCode = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        // A View write on a typed partition is judged against the timeline the leadership scan builds: until the scan is
+        // Ready it would pass the hook on a partial timeline.
+        if (ws != nullptr && rc == nullptr && pc::acksView(acks) && rcGate_(replica) == nullptr) [[unlikely]] {
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             enqueueReturn_(ret);
             return 1;
         }

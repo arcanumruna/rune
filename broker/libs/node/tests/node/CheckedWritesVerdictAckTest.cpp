@@ -132,6 +132,40 @@ TEST(CheckedWritesVerdictAckRigRegression, FourThousandRejectionsEncryptedAckIsO
     EXPECT_EQ(o.sinkForTest()->claimFramesForTest(), claimsBefore);
 }
 
+TEST(CheckedWritesVerdictAckRigRegression, ViewProduceBeforeTheLeadershipScanIsReadyIsNotLeaderRegression) {
+    VerdictRig o;
+    o.typed();
+    o.installRejectView(kRej, kObj, tagRule(9));
+    o.enableAcks();
+    o.passes(60);
+    for (uint64_t i = 1; i <= 40; ++i) ASSERT_TRUE(o.ack(o.produceFrame({{i, 1, 1}}, kAcksView)));
+    o.rcScanBytesPerPass = 256;   // the restarted worker scans a few batches per pass
+    o.restart();
+    const int64_t c = o.produceFrame({{100, 1, 9}}, kAcksView);
+    const auto a = o.ack(c);
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader)) << "the timeline is still being built";
+    int64_t retry = 0;
+    std::optional<VerdictRig::Ack> done;
+    do { retry = o.produceFrame({{100, 1, 9}}, kAcksView); done = o.ack(retry); ASSERT_TRUE(done); } while (done->code != 0);
+    EXPECT_EQ(done->verdicts, (V{{0, kCode, kCid}})) << "once Ready the write is judged";
+}
+
+TEST_F(CheckedWritesVerdictAckRegression, ReplayOfAnOverlongTrailerIsInternalNotAHaltRegression) {
+    std::vector<Rec> recs;
+    for (uint64_t i = 0; i < 5000; ++i) recs.push_back({i + 1, 1, 9});
+    const auto plain = r.ack(r.produceFrame(recs, rune::protocol::client::kAcksWireAll, /*pid=*/500, /*seq=*/0), 3000);
+    ASSERT_TRUE(plain);
+    ASSERT_EQ(plain->code, 0);
+    const auto replay = r.ack(r.produceFrame(recs, kAcksView, 500, 0), 3000);
+    ASSERT_TRUE(replay);
+    EXPECT_EQ(replay->code, static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal));
+    EXPECT_FALSE(replay->hasVerdicts);
+    const auto next = r.ack(r.produceFrame({{9001, 1, 9}}, kAcksView), 3000);
+    ASSERT_TRUE(next) << "the worker keeps answering";
+    EXPECT_EQ(next->code, 0);
+}
+
 TEST_F(CheckedWritesVerdictAckRegression, OneRecordAckIsClaimedNotOffered) {
     const int64_t c = r.produceFrame({{1, 1, 9}}, kAcksView);
     ASSERT_TRUE(r.ack(c));
