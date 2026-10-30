@@ -4283,10 +4283,13 @@ private:
                 enqueueReturn_(std::move(ret));
                 return ViewServe::Answered;
             }
-            if (rune::storage::Log* const sl = srcRep->isDiskBacked() ? srcRep->log() : nullptr; sl != nullptr && src >= 0) {   // Task 14: count + pace (one add, one compare); a transient source has no Log and no namespace tag
-                NsHot& nh = nsHot_[sl->nsSlot()];
+            uint16_t srcSlot = kNoNsSlot;
+            if (srcRep->isDiskBacked()) { if (const rune::storage::Log* l = srcRep->log()) srcSlot = l->nsSlot(); }
+            else if (const rune::storage::InMemoryLog* m = srcRep->memoryLog()) srcSlot = m->nsSlot();
+            if (srcSlot != kNoNsSlot && src >= 0) {   // Task 14: count + pace (one add, one compare), whatever the source's persistence
+                NsHot& nh = nsHot_[srcSlot];
                 ++nh.requestOps;
-                lastViewReadSlot_ = sl->nsSlot();
+                lastViewReadSlot_ = srcSlot;
                 if (passNowNs_ < nh.queryUntil) [[unlikely]] {
                     ++throttledRefusals_;
                     ret.errorCode  = static_cast<int16_t>(RS::kThrottled);
@@ -6903,7 +6906,7 @@ private:
                     return mem->readView(from, kPushMaxChunkBytes);
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, aborted, nowNs, replica,
-                                      replica->leadershipGeneration(), hwConfirmed);
+                                      replica->leadershipGeneration(), hwConfirmed, NsTag{mem->nsSlot(), mem->nsId()});
             }
         }
         return work;

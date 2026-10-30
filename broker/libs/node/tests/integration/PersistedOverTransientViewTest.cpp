@@ -4,6 +4,13 @@
 // (TransientViewRig.h).  A restart replays the rig's checkpoint file image.  No Aeron, no sleeps, every drive loop capped.
 #include <support/TransientViewRig.h>
 
+#include <rune/node/NsLimitAggregator.h>
+#include <rune/node/Worker.h>
+#include <rune/node/WorkerOp.h>
+#include <rune/protocol/NamespaceLimits.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <rune/replication/PartitionReplica.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/transaction/ReadCommittedView.h>
 
 #include <gtest/gtest.h>
@@ -587,4 +594,84 @@ TEST(CheckedWritesTransientViewModelRegression, RandomHistoriesMatchThePerKeyMod
             return;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Namespace cell: a view over a transient source belongs to the source topic's namespace, like any view.  A real Worker
+// drives the view set over a real transient replica whose ring carries the namespace tag.
+// ---------------------------------------------------------------------------
+TEST(CheckedWritesTransientViewNamespaceRegression, ViewOverATransientSourceIsChargedPausedAndThrottledWithItsNamespaceRegression) {
+    using namespace rune::node;
+    namespace pc = rune::protocol::client;
+    constexpr uint16_t kSlot = 3;
+    constexpr uint32_t kNs   = 21;
+    constexpr int32_t  kView = 0x40000B00;
+
+    rune::storage::InMemoryLog ring{1 << 20, 1000};
+    ring.setNsTag(kNs, kSlot);
+    rune::replication::InMemoryTransport transport;
+    rune::replication::PartitionConfig cfg{};
+    cfg.topicId = kSrcTopic; cfg.partitionId = 0; cfg.selfId = 1; cfg.minIsr = 1;
+    cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
+    cfg.fetchIntervalNs = 1'000'000LL; cfg.isrCheckIntervalNs = 1'000'000LL; cfg.maxFetchBytes = 1 << 20;
+    cfg.pushOnAppend = false;
+    rune::replication::PartitionReplica replica(cfg, rune::replication::Role::Follower, 0,
+                                                std::vector<rune::replication::NodeId>{1},
+                                                std::vector<rune::replication::NodeId>{1}, &ring, &transport);
+    replica.becomeLeader(1, {1});
+
+    const rune::codec::Descriptor src = transient_view_rig::detail::source();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(transient_view_rig::detail::plan(Kind::Replace, /*persisted*/ 0), srcs, kView).value();
+    ViewSnapshotChannel channel;
+    WorkerViewSet vs(channel, (std::filesystem::temp_directory_path() / ("rune-tv-ns-" + std::to_string(::getpid()))).string());
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    rune::protocol::NamespaceLimits limits;
+    vs.onNsSlotAssign(kSlot, kNs, limits);
+
+    Worker w(0);
+    w.setOwnedDirect(Worker::OwnedSet{&replica});
+    w.setViewSet(&vs);
+    w.applyNsSlotAssignDirect(kSlot, kNs, limits);
+    int64_t now = 0;
+    auto passes = [&](int n) { for (int i = 0; i < n; ++i) w.doWork(now += 1'000'000LL); };
+    auto put = [&](int64_t key, int64_t hp) {
+        const std::string k = transient_view_rig::detail::keyBytes(key), v = transient_view_rig::detail::value(Rec{key, 10, hp});
+        ASSERT_GE(replica.appendKeyed(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(k.data()), k.size()),
+                                      std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()),
+                                      /*acksAll=*/false), 0);
+    };
+    auto read = [&](int64_t key) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::GetViewRow;
+        op.topicId = kView; op.partition = 0; op.sessionId = 1; op.correlationId = 42;
+        op.nextOffset = key; op.hwBound = 0;
+        EXPECT_TRUE(w.tryEnqueueOp(std::move(op)));
+        passes(1);
+        WorkerReturn got{};
+        int n = 0;
+        w.drainReturn([&](WorkerReturn r) { if (r.type == WorkerReturn::Type::ViewRowResult) { got = std::move(r); ++n; } });
+        EXPECT_EQ(n, 1);
+        return got;
+    };
+
+    put(7, 55);
+    passes(200);   // bounded: the replication state and the read-committed state build, then the fold
+    const rune::view::RowLayout* L = nullptr;
+    ASSERT_NE(vs.getRow(kView, 0, 7, L), nullptr) << "the worker folds a persisted view over a transient source";
+    EXPECT_GT(vs.nsViewMemBytes(kSlot), 0u) << "its table is charged to the source topic's namespace";
+    EXPECT_EQ(read(7).errorCode, 0);
+
+    w.applyNsViewMemOverDirect(kSlot, kNs, true);
+    put(8, 66);
+    passes(20);
+    EXPECT_TRUE(vs.instanceServeState(kView, 0).paused) << "over the namespace's view memory: paused";
+    EXPECT_EQ(read(7).errorCode, static_cast<int16_t>(pc::ViewRowResponse::kViewPaused));
+    w.applyNsViewMemOverDirect(kSlot, kNs, false);
+    passes(20);
+    EXPECT_FALSE(vs.instanceServeState(kView, 0).paused);
+    EXPECT_NE(vs.getRow(kView, 0, 8, L), nullptr) << "resumed from the paused offset: the record appended while paused folds";
+
+    w.applyNsThrottleDirect(kSlot, kNs, ThrottleKind::QueryCycles, now + 50'000'000LL);
+    EXPECT_EQ(read(7).errorCode, static_cast<int16_t>(pc::ViewRowResponse::kThrottled)) << "read-throttled like any view";
 }
