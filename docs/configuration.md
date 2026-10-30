@@ -35,6 +35,7 @@ value as false). *ring/size* values must be powers of two; any other value keeps
 | Variable | Default | Meaning |
 |---|---|---|
 | `RUNE_ELECTION_TIMEOUT_MS` | `150` | Maximum wait per election round (positive ms). Raise it for slow or cross-datacenter links. |
+| `RUNE_VERDICT_INTERVAL_MS` | `100` | How often a verdict source's leader writes a verdict marker when nothing was rejected (positive ms). A rejection writes one at once. |
 | `RUNE_ELECTION_STATUS_INTERVAL_MS` | `20` | Canvass and heartbeat cadence (positive ms). The leader-heartbeat timeout is `max(election timeout, 3 x this)`. |
 | `RUNE_STARTUP_CANVASS_TIMEOUT_MS` | `100` | Extended canvass window on first boot, for peer discovery (positive ms). |
 | `RUNE_CONTROLLED_SHUTDOWN_MS` | `5000` | Budget for handing partition leadership to in-sync peers on SIGTERM. `0` = no hand-off. |

@@ -760,6 +760,20 @@ std::string verdictValue(uint64_t id, int64_t v, uint16_t tag) {
     return val;
 }
 
+/// The leader's judge has logged the constraint set: records written from now on are judged.
+void awaitSetLogged(BrokerNode& node, int32_t topicId) {
+    const int32_t w = rune::metadata::ShardRouter(node.workerCountForTest()).workerForPartition(topicId, 0);
+    bool logged = false;
+    for (int i = 0; i < 1200 && !logged; ++i) {
+        logged = node.onWorkerThreadForTest(w, [topicId](Worker& wk) {
+            const PartitionWriteState* ws = wk.writeStateForTest(topicId, 0);
+            return ws != nullptr && ws->constraintSets.latest().count != 0;
+        });
+        if (!logged) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(logged) << "the TestReject set change was never logged";
+}
+
 /// A typed {id, v, tag} topic `vt` (one partition) with TagEquals{9} (object 7) installed on the worker that serves it.
 int32_t defineVerdictSource(OneBroker& b) {
     rc::Client& c = *b.connectClient();
@@ -783,6 +797,7 @@ int32_t defineVerdictSource(OneBroker& b) {
         wk.viewSet()->installTestVerdictViewForTest(comp->plan, comp->rowLayout, desc, false, 7, rule);
         return 0;
     });
+    awaitSetLogged(b.node(), src);   // the set change is logged before the records it is to judge
     return src;
 }
 
@@ -791,7 +806,6 @@ int32_t defineVerdictSource(OneBroker& b) {
 TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegression) {
     OneBroker b("cw-verdict", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
-    std::this_thread::sleep_for(500ms);   // the set change is logged before the records it is to judge
     Sender s(b.clientConfig(), "vt", src, 1, kAllView);
     std::vector<uint64_t> toks;
     for (uint64_t id = 1; id <= 8; ++id) {
@@ -827,7 +841,6 @@ TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegre
 TEST(CheckedWritesBrokerRegression, PlainWritersOnAVerdictSourceKeepTodaysAcksShardRegression) {
     OneBroker b("cw-verdict-old", OneBroker::Runtime::Shard);
     const int32_t src = defineVerdictSource(b);
-    std::this_thread::sleep_for(500ms);
     for (const rc::Acks acks : {rc::Acks::Leader, rc::Acks::All}) {
         Sender s(b.clientConfig(), "vt", src, 1, acks);
         for (uint64_t id = 1; id <= 4; ++id) {
@@ -886,20 +899,6 @@ void installTagReject(BrokerNode& node, int32_t topicId) {
         wk.viewSet()->installTestVerdictViewForTest(comp->plan, comp->rowLayout, desc, false, 7, rule);
         return 0;
     });
-}
-
-/// The leader's judge has logged the constraint set: records written from now on are judged.
-void awaitSetLogged(BrokerNode& node, int32_t topicId) {
-    const int32_t w = rune::metadata::ShardRouter(node.workerCountForTest()).workerForPartition(topicId, 0);
-    bool logged = false;
-    for (int i = 0; i < 1200 && !logged; ++i) {
-        logged = node.onWorkerThreadForTest(w, [topicId](Worker& wk) {
-            const PartitionWriteState* ws = wk.writeStateForTest(topicId, 0);
-            return ws != nullptr && ws->constraintSets.latest().count != 0;
-        });
-        if (!logged) std::this_thread::sleep_for(50ms);
-    }
-    ASSERT_TRUE(logged) << "the TestReject set change was never logged";
 }
 
 struct NodeVerdicts {
