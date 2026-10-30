@@ -491,7 +491,8 @@ log "Catalog before restart:"; echo "${catalog_before}" >&2
 
 # ---------------------------------------------------------------------------
 # Step 4e (Part 10): the checkpoint of presence_totals must be on disk before the restart, or the post-restart ring has
-# nothing to keep the rows from.  Bounded poll (40 x 250 ms): the file exists, is non-empty and stopped growing.
+# nothing to keep the rows from.  Bounded poll (40 x 250 ms): the file exists, is non-empty and stopped growing (a liveness
+# wait only; Step 8 proves the recovery from the broker log).
 # ---------------------------------------------------------------------------
 PV_CKPT="/var/lib/rune/__view_snapshots/view-${VIEW_PRESENCE_PV_TOPIC_ID}-p0.committed.delta"
 pv_prev=-1; pv_ok=0
@@ -604,6 +605,15 @@ echo "----------------------------------------" >&2
 echo "${recovered_lines}" | grep -qE " O=[1-9][0-9]* records=[1-9][0-9]* format=v2$" \
     || fail "user_totals VIEW-RECOVERED line lacks format=v2 with O>0: ${recovered_lines}"
 log "user_totals recovered from a v2 checkpoint: $(echo "${recovered_lines}" | tail -1)"
+
+# Part 10: presence_totals (a persisted view over a transient topic) recovered its 3 checkpoint rows, and its cursor 3 was
+# recognised as an earlier life of the (now empty) ring: one reset, counted and logged at INFO.
+pv_logs="$(docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" logs --no-log-prefix rune-1 2>/dev/null)"
+echo "${pv_logs}" | grep -aqE "VIEW-RECOVERED view=${VIEW_PRESENCE_PV_TOPIC_ID} partition=0 O=3 records=[1-9]" \
+    || fail "no VIEW-RECOVERED line with O=3 for presence_totals (view=${VIEW_PRESENCE_PV_TOPIC_ID}) — rows not restored from the checkpoint"
+echo "${pv_logs}" | grep -a "view ${VIEW_PRESENCE_PV_TOPIC_ID} partition 0" | grep -aq "is from an earlier life of its transient source.*resets=1" \
+    || fail "no transient-source reset (resets=1) logged for presence_totals (view ${VIEW_PRESENCE_PV_TOPIC_ID})"
+log "presence_totals recovered its checkpoint rows and counted one transient-source reset"
 
 log ""
 log "========================================"
