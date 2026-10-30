@@ -7182,6 +7182,9 @@ private:
         const int64_t change = w.constraintSets.lastChangeBelow(sl.replica->highWatermark());
         sl.replica->holdRetentionAt(change < 0 ? std::numeric_limits<int64_t>::max() : change);
         if (w.verdicts == nullptr || w.constraintSets.latest().empty()) return;
+        // Only a leader whose scan has fed every logged change: before that, latest() can be an older set, and logging it
+        // again would undo the changes the scan has not reached yet.
+        if (sl.replica->role() != rune::replication::Role::Leader || !sl.rc->ready()) return;
         const int64_t nextBase = log.nextSegmentBaseAfter(log.logStartOffset());
         if (nextBase >= 0 && w.constraintSets.lastChangeOffset() < nextBase) (void)w.verdicts->requestChange(w.constraintSets.latest(), true);
     }

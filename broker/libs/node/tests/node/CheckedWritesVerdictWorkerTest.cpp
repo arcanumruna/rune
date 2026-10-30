@@ -175,6 +175,43 @@ TEST(CheckedWritesVerdictWorkerRegression, RetentionNeverDeletesTheLatestSetChan
     EXPECT_TRUE(sawAccepted);
 }
 
+TEST(CheckedWritesVerdictWorkerRegression, RetentionRefreshWaitsForTheLeadershipScanRegression) {
+    // The first change sits in the oldest segment.  While this node follows, the other leader logs a second change deep enough
+    // in the log that the leadership scan reaches it only after several passes.  A refresh of the half-scanned timeline on the
+    // promotion would log the first set again and drop the second member.
+    constexpr int32_t kRej2 = 0x40000603;
+    VerdictRig r(false, /*rollBytes=*/16 * 1024);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    ASSERT_EQ(r.readLog().changes.front().offset, 0);
+    ASSERT_EQ(r.produce({{1, 1, 0}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.demote();
+    r.installRejectView(kRej2, kObj + 1, tagRule(8), "rej2");
+    const auto data = [&r](uint64_t from) {   // one fetch per batch: the follower's log rolls its segments
+        for (uint64_t b = 0; b < 40; ++b) {
+            std::vector<Rec> recs;
+            for (uint64_t i = 0; i < 200; ++i) recs.push_back({from + b * 200 + i, int64_t(i), 0});
+            r.replicate({VerdictRig::batch(recs)});
+        }
+    };
+    data(2);
+    r.replicate({VerdictRig::changeBatch(r.writeState()->constraintSets.latest().id + 1,
+                                         {{kObj, static_cast<uint8_t>(rune::view::VerdictViewKind::TestReject), tagRule(9).fingerprint()},
+                                          {kObj + 1, static_cast<uint8_t>(rune::view::VerdictViewKind::TestReject), tagRule(8).fingerprint()}})});
+    data(10000);
+    const auto before = r.readLog().changes;
+    ASSERT_EQ(before.back().members.size(), 2u);
+    r.promote();
+    r.passes(200);
+    const auto after = r.readLog().changes;
+    for (const auto& c : after) EXPECT_FALSE(c.offset > before.back().offset && c.members.size() != 2) << "a change at " << c.offset << " dropped a member";
+    ASSERT_EQ(r.produce({{20000, 1, 8}, {20001, 2, 0}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    EXPECT_EQ(r.stats()->rejectionsConstraint, 1u) << "the second member still judges";
+}
+
 TEST(CheckedWritesVerdictWorkerRegression, CleanerVerdictBoundStartsClosedRegression) {
     VerdictRig r;
     EXPECT_EQ(r.replica->cleanerVerdictBound(), 0) << "a user partition is cleaned nothing until its worker says so";

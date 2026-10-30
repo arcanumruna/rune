@@ -176,6 +176,34 @@ public:
         replica->becomeLeader(++epoch_, isr_);
         passes(3);
     }
+    void promote() {
+        replica->becomeLeader(++epoch_, isr_);
+        passes(3);
+    }
+    /// As a follower: the leader (node 2) replicates `batches` at the LEO, committed.
+    void replicate(std::vector<std::vector<uint8_t>> batches) {
+        std::vector<uint8_t> bytes;
+        int64_t base = leo();
+        for (auto& b : batches) {
+            const int64_t count = 1 + rune::protocol::RecordBatchReader(b.data(), b.size()).lastOffsetDelta();
+            for (int i = 0; i < 8; ++i) b[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(base) >> (8 * i));
+            rune::protocol::RecordBatchReader::stampLeaderEpoch(b.data(), static_cast<int32_t>(epoch_));
+            bytes.insert(bytes.end(), b.begin(), b.end());
+            base += count;
+        }
+        rune::replication::FetchResponseMsg resp{};
+        resp.leaderEpoch = static_cast<rune::replication::Epoch>(epoch_);
+        resp.partition = 0; resp.topicId = kSrc; resp.highWatermark = base; resp.logStartOffset = log->logStartOffset();
+        resp.records = std::span<const uint8_t>(bytes.data(), bytes.size());
+        replica->applyReplicated(resp);
+        passes(3);
+    }
+    /// A constraint-set change batch (base offset 0, stamped by replicate()).
+    static std::vector<uint8_t> changeBatch(uint32_t setId, std::vector<rune::storage::control_record::ChangeMember> members) {
+        std::vector<uint8_t> b(rune::storage::control_record::changeBatchBytes(static_cast<uint16_t>(members.size())));
+        EXPECT_EQ(rune::storage::control_record::buildConstraintSetChange(b, setId, members), b.size());
+        return b;
+    }
 
 private:
     void installRejectViewNow_(int32_t viewTopicId, uint64_t objectId, TestRejectRule rule, const char* name, bool persisted) {
