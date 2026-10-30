@@ -6,7 +6,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <memory>
+#include <optional>
 #include <thread>
 
 using namespace std::chrono_literals;
@@ -482,4 +485,255 @@ TEST(CheckedWritesBrokerRegression, RestartServesNoTypedPartitionBeforeItsSpecRe
             << "attempt " << i << " answered " << code;
     }
     EXPECT_TRUE(storedValues(b.node(), t.topicId, 0).empty()) << "an invalid record was stored before the spec arrived";
+}
+
+// ===========================================================================================================
+// Part 03: View acks end to end on real brokers on the default (shard) runtime.
+// ===========================================================================================================
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+/// The {id, hp} record of OneBroker::idDescriptor / charBlob (block 16): key = id as 8 little-endian bytes.
+std::string idValue(uint64_t id) { return le(16, 2) + le(1, 2) + le(id, 8) + le(id * 10, 8); }
+
+/// One client + producer over one topic; every send carries its own token and is awaited by it.
+struct Sender {
+    std::unique_ptr<rc::Client>      client;
+    std::optional<rc::Producer>      prod;
+    std::unique_ptr<rc::Completions> cq;
+    std::optional<rc::TopicHandle>   topic;
+    uint64_t                         next = 1;
+
+    Sender(rc::ClientConfig cfg, const std::string& name, int32_t topicId, int32_t parts, rc::Acks acks, const std::string& txnId = {}) {
+        cfg.topics.push_back(rc::TopicSpec{name, topicId, parts});
+        client = std::make_unique<rc::Client>(cfg);
+        rc::ProducerConfig pc;
+        pc.acks            = acks;
+        pc.lingerUs        = 1;
+        pc.transactionalId = txnId;
+        prod.emplace(client->producer(pc));
+        client->connectAndWait(30s);
+        cq = std::make_unique<rc::Completions>(*client);
+        topic.emplace(client->topic(name));
+    }
+    ~Sender() {
+        if (prod) prod->closeImmediately();
+        if (client) client->close();
+    }
+
+    /// The token of the queued send of record `id`.
+    uint64_t send(uint64_t id) {
+        const std::string v = idValue(id);
+        const uint64_t tok  = next++;
+        rc::SendResult r = rc::SendResult::BackPressured;
+        while (r == rc::SendResult::BackPressured)
+            r = prod->trySend(*topic, rc::Key(id), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()), *cq, tok);
+        EXPECT_EQ(r, rc::SendResult::Ok);
+        prod->flush();
+        return tok;
+    }
+    /// The completion of `tok` within `within`; nullopt when none arrived.
+    std::optional<rc::Completion> await(uint64_t tok, std::chrono::nanoseconds within) {
+        std::optional<rc::Completion> out;
+        (void)cq->waitFor(tok, within, [&](const rc::Completion& d, std::span<const uint8_t>) { out = d; });
+        return out;
+    }
+};
+
+bool isOk(const std::optional<rc::Completion>& c) { return c && c->status == rc::OpStatus::Ok; }
+
+void awaitLevel(BrokerNode& n) {
+    bool raised = false;
+    for (int i = 0; i < 800 && !raised; ++i) {
+        raised = n.onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) >= rune::replication::MetadataFeature::kCheckedWrites;
+        if (!raised) std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(raised) << "the cluster feature level reaches kCheckedWrites";
+}
+
+/// A typed {id, hp} topic `acct` with the view `acct_v` over it, on a broker whose level allows View acks.
+struct AcctFixture {
+    int32_t topicId     = -1;
+    int32_t viewTopicId = -1;
+};
+/// The {id, hp} Replace view over `srcTopicId` (OneBroker::viewPlanOver needs a node to look the id up).
+std::vector<uint8_t> acctViewPlan(int32_t srcTopicId) {
+    namespace rv = rune::view;
+    rv::ViewPlan p;
+    p.viewName = "acct_v";
+    p.key      = "id";
+    p.sources.push_back(rv::SourceSpec{srcTopicId, "id"});
+    p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
+    p.output.push_back(rv::AuthoredField{"hp", rune::codec::PrimType::Int64, 0, "hp", rv::MergeRule::Replace});
+    return rv::serializeAuthored(p);
+}
+
+AcctFixture defineAcct(OneBroker& b, bool withView = true) {
+    AcctFixture f;
+    rc::Client& c = *b.connectClient();
+    const auto t  = c.defineTopicAndWait("acct", 1, "id", OneBroker::idDescriptor("acct"), rc::Persistence::Disk, {}, {}, 60s);
+    EXPECT_EQ(t.errorCode, 0) << t.detail;
+    f.topicId = t.topicId;
+    if (withView) {
+        const auto v = c.createViewAndWait("acct_v", "id", 0, b.viewPlanOver("acct"), {}, 60s);
+        EXPECT_EQ(v.errorCode, 0) << v.detail;
+        f.viewTopicId = v.viewTopicId;
+    }
+    awaitLevel(b.node());
+    return f;
+}
+
+constexpr rc::Acks kAllView    = rc::Acks::All | rc::Acks::View;
+constexpr rc::Acks kLeaderView = rc::Acks::Leader | rc::Acks::View;
+
+/// A View send parked behind an open transaction completes only after the commit.
+void expectViewSendWaitsForTheTransaction(const char* tag, rc::Acks viewAcks) {
+    OneBroker b(tag, OneBroker::Runtime::Shard);
+    const AcctFixture f = defineAcct(b);
+    Sender tx(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All, "tx-cw");
+    tx.prod->initTransactionsAndWait(30s);
+    tx.prod->beginTransaction();
+    (void)tx.send(1);
+    std::this_thread::sleep_for(300ms);
+
+    Sender plain(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All);
+    EXPECT_TRUE(isOk(plain.await(plain.send(2), 2s))) << "a plain All send does not wait for the open transaction";
+
+    Sender view(b.clientConfig(), "acct", f.topicId, 1, viewAcks);
+    const uint64_t tok = view.send(3);
+    EXPECT_FALSE(view.await(tok, 1s).has_value()) << "the view has not folded past the open transaction";
+
+    tx.prod->commitTransactionAndWait(30s);
+    EXPECT_TRUE(isOk(view.await(tok, 5s)));
+
+    rc::Client& reader = *b.connectClient();
+    rc::ViewRowResult row;
+    for (const auto deadline = Clock::now() + 10s; Clock::now() < deadline;) {
+        row = reader.getViewRowAndWait(f.viewTopicId, 3, 0, 10s);
+        if (row.status == rc::ViewRowResult::kOk) break;
+        std::this_thread::sleep_for(50ms);
+    }
+    EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "the acked record is already in the view";
+}
+
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, AllViewAckWaitsBehindAnOpenTransactionShardRegression) {
+    expectViewSendWaitsForTheTransaction("cw-viewtxn", kAllView);
+}
+
+TEST(CheckedWritesBrokerRegression, LeaderViewBehavesLikeAllViewShardRegression) {
+    expectViewSendWaitsForTheTransaction("cw-lviewtxn", kLeaderView);
+}
+
+TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShardRegression) {
+    OneBroker b("cw-noview", OneBroker::Runtime::Shard);
+    const AcctFixture f = defineAcct(b, /*withView=*/false);
+    const auto p50 = [&](rc::Acks acks, uint64_t firstId) {
+        Sender s(b.clientConfig(), "acct", f.topicId, 1, acks);
+        std::vector<std::chrono::nanoseconds> lat;
+        for (uint64_t i = 0; i < 100; ++i) {
+            const auto t0 = Clock::now();
+            EXPECT_TRUE(isOk(s.await(s.send(firstId + i), 10s)));
+            lat.push_back(Clock::now() - t0);
+        }
+        std::sort(lat.begin(), lat.end());
+        return lat[lat.size() / 2];
+    };
+    const auto plain = p50(rc::Acks::All, 1000);
+    const auto view  = p50(kAllView, 2000);
+    EXPECT_LE(view, 2 * plain) << "no view folds this partition, so View adds no wait (All p50 " << plain.count() / 1000 << " us, All|View p50 "
+                               << view.count() / 1000 << " us)";
+}
+
+TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesTheViewBitRegression) {
+    OneBroker b("cw-legacyview", OneBroker::Runtime::Legacy);
+    const AcctFixture f = defineAcct(b, /*withView=*/false);
+    Sender view(b.clientConfig(), "acct", f.topicId, 1, kAllView);
+    const auto refused = view.await(view.send(1), 10s);
+    ASSERT_TRUE(refused.has_value());
+    EXPECT_EQ(refused->status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(refused->errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::InvalidRequest));
+    Sender plain(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All);
+    EXPECT_TRUE(isOk(plain.await(plain.send(2), 10s)));
+}
+
+TEST(CheckedWritesBrokerRegression, V12ClientAgainstV7BrokerKeepsEveryOldAckBehaviourShardRegression) {
+    OneBroker b("cw-oldacks", OneBroker::Runtime::Shard);
+    const AcctFixture f = defineAcct(b);
+    uint64_t id = 1;
+    for (const rc::Acks acks : {rc::Acks::Leader, rc::Acks::All}) {
+        Sender s(b.clientConfig(), "acct", f.topicId, 1, acks);
+        for (int i = 0; i < 100; ++i) EXPECT_TRUE(isOk(s.await(s.send(id++), 10s))) << "acks " << static_cast<int>(acks) << " record " << i;
+    }
+    {
+        Sender s(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::None);
+        for (int i = 0; i < 100; ++i) (void)s.send(id++);
+    }
+    std::size_t stored = 0;
+    for (int i = 0; i < 200 && stored < 300; ++i) {
+        stored = storedValues(b.node(), f.topicId, 0).size();
+        if (stored < 300) std::this_thread::sleep_for(25ms);
+    }
+    EXPECT_EQ(stored, 300u) << "None, Leader and All records all landed";
+}
+
+TEST(CheckedWritesBrokerRegression, AllViewProduceAcrossALeaderCrashThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    ThreeNodes c = ThreeNodes::start("cw03");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t ctl = awaitController(c);
+    ASSERT_GT(ctl, 0);
+    auto admin = connectClient(c, ctl);
+    rc::TopicOptions to;
+    to.replicationFactor = 3;
+    const auto src = admin->defineTopicAndWait("acct", 1, "id", OneBroker::idDescriptor("acct"), rc::Persistence::Disk, to, {}, 60s);
+    ASSERT_EQ(src.errorCode, 0) << src.detail;
+    const auto view = admin->createViewAndWait("acct_v", "id", 0, acctViewPlan(src.topicId), {}, 60s);
+    ASSERT_EQ(view.errorCode, 0) << view.detail;
+    admin->close();
+    admin.reset();
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 30s));
+    const int32_t victim = leaders[0];
+    int32_t seed = 0;
+    for (int id : c.runningNodes()) if (id != victim) { seed = id; break; }
+    ASSERT_GT(seed, 0);
+    for (int id : c.runningNodes()) awaitLevel(c.node(id));
+
+    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    cfg.connectTimeoutMs = 30'000;
+    cfg.pingTimeoutMs    = 30'000;
+    Sender s(cfg, "acct", src.topicId, 1, kAllView);
+    constexpr int kTotal = 200;
+    std::vector<uint64_t> tokens;
+    std::thread killer;
+    for (int i = 0; i < kTotal; ++i) {
+        if (i == kTotal / 2) killer = std::thread([&c, victim] { c.crash(victim); });
+        tokens.push_back(s.send(static_cast<uint64_t>(i)));
+    }
+    killer.join();
+    int ok = 0;
+    for (const uint64_t tok : tokens) {
+        const auto d = s.await(tok, 60s);
+        if (isOk(d)) ++ok;
+        else ADD_FAILURE() << "token " << tok << (d ? " status " + std::to_string(static_cast<int>(d->status)) + " code " + std::to_string(d->errorCode) : std::string(" no completion"));
+    }
+    EXPECT_EQ(ok, kTotal);
+
+    rc::ClientConfig rcfg = clientConfigFor(c, seed);
+    rcfg.connectTimeoutMs = 30'000;
+    rcfg.pingTimeoutMs    = 30'000;
+    auto reader = connectClient(c, rcfg);
+    for (const uint64_t id : {uint64_t{0}, uint64_t{kTotal / 2}, uint64_t{kTotal - 1}}) {
+        rc::ViewRowResult row;
+        for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline;) {
+            try { row = reader->getViewRowAndWait(view.viewTopicId, id, 0, 10s); } catch (const std::exception&) {}
+            if (row.status == rc::ViewRowResult::kOk) break;
+            std::this_thread::sleep_for(100ms);
+        }
+        EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "row " << id;
+    }
+    reader->close();
 }
