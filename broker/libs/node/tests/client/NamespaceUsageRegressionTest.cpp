@@ -188,14 +188,16 @@ TEST(NamespaceUsageRegression, OldClientRefusedRegression) {
     EXPECT_EQ(refusalOf(*old, "default"), 39) << "InvalidRequest below client version 14";
 }
 
-// Checked writes Part 10: a persisted view over a TRANSIENT topic is charged to the source topic's namespace.  The ring's
-// namespace tag (BrokerNode setNsTag, at boot and at runtime) is what the view's slot is read from.
-// Mutation: delete either setNsTag call in BrokerNode.cpp -> this test fails (the charge lands on slot 0).
-TEST(TransientViewNamespaceBrokerRegression, ViewOverATransientTopicIsChargedToItsNamespaceAcrossRestartRegression) {
+// Checked writes Part 10: a persisted view over a TRANSIENT or a DISK topic is charged to the source topic's namespace.
+// The ring's namespace tag (BrokerNode setNsTag, at boot and at runtime) and the replay of the boot slots into the view
+// set (Worker::setViewSet) are what the view's slot is read from.
+// Mutation: delete either setNsTag call in BrokerNode.cpp, or drop the replay loop in Worker::setViewSet -> these tests
+// fail (the charge lands on slot 0).
+static void viewIsChargedToItsNamespaceAcrossRestart(const char* brokerName, rc::Persistence sourcePersistence) {
     namespace tv = rune::node::test::transient_view_broker;
     AuthBroker::Options o;
     o.shard = true;
-    AuthBroker b("nsusage_tv", std::move(o));
+    AuthBroker b(brokerName, std::move(o));
     b.bootstrapAdmin(kAdminPw);
     auto admin = connected(b, "admin");
     const auto ns = admin->createNamespace("u");
@@ -206,7 +208,7 @@ TEST(TransientViewNamespaceBrokerRegression, ViewOverATransientTopicIsChargedToI
     b.createUser("u/w", kUserPw, grants);
 
     auto w = connected(b, "u/w");
-    const auto src = w->defineTopicAndWait("presence", 1, "id", rune::node::test::charBlob(), rc::Persistence::Transient, {}, {}, 60s);
+    const auto src = w->defineTopicAndWait("presence", 1, "id", rune::node::test::charBlob(), sourcePersistence, {}, {}, 60s);
     ASSERT_EQ(src.errorCode, 0) << src.detail;
     const auto view = w->createViewAndWait("pv", "id", 0, rune::node::test::viewPlanBlob("pv", src.topicId, 0), {}, 60s);
     ASSERT_EQ(view.errorCode, 0) << view.detail;
@@ -246,4 +248,12 @@ TEST(TransientViewNamespaceBrokerRegression, ViewOverATransientTopicIsChargedToI
     ASSERT_TRUE(admin->setNamespaceLimits("u", l).has_value());
     EXPECT_TRUE(until([&] { return w->getViewRowAndWait(view.viewTopicId, 3, 0, 10s).status == rc::ViewRowResult::kViewPaused; }))
         << "the view is paused by the source topic's namespace";
+}
+
+TEST(TransientViewNamespaceBrokerRegression, ViewOverATransientTopicIsChargedToItsNamespaceAcrossRestartRegression) {
+    viewIsChargedToItsNamespaceAcrossRestart("nsusage_tv", rc::Persistence::Transient);
+}
+
+TEST(TransientViewNamespaceBrokerRegression, ViewOverADiskTopicIsChargedToItsNamespaceAcrossRestartRegression) {
+    viewIsChargedToItsNamespaceAcrossRestart("nsusage_tv_disk", rc::Persistence::Disk);
 }
