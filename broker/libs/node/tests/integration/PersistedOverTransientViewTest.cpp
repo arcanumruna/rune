@@ -419,6 +419,8 @@ static void runMatrixCell(const TvFoldCell& c, uint32_t capacity) {
     ASSERT_TRUE(rig.driveUntilCaughtUp(7));
     EXPECT_EQ(rig.tableImage(kind), image);
     expectViewEqualsModel(rig, kind, model);
+    // The grouped views hold three rows, which fit the small index.
+    if (capacity == 4 && kind == Kind::Replace) EXPECT_GT(rig.indexSlots(kind), 4u) << "the small table's index must have grown";
 }
 
 TEST_P(CheckedWritesTransientViewMatrixRegression, ViewEqualsThePerKeyModel) { runMatrixCell(GetParam(), 256); }

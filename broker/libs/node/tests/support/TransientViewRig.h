@@ -201,6 +201,7 @@ public:
         const rune::node::ViewFoldCounters* c = views_->foldCounters(viewId(kind), 0);
         return c != nullptr ? *c : kNone;
     }
+    [[nodiscard]] std::size_t indexSlots(Kind kind) const { return views_->indexSlotsForTest(viewId(kind), 0); }
     /// Every row of the view, key first, in key order (probed over the rig's key domain).
     [[nodiscard]] std::vector<std::vector<uint8_t>> tableImage(Kind kind) const {
         std::vector<std::vector<uint8_t>> out;
