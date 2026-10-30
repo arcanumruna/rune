@@ -162,17 +162,23 @@ TEST(CheckedWritesVerdictCleaner, MarkerRemovalNeedsASupersedingMarkerAndTheBoun
     s.onVerdictMarker(10, 0, 10, std::vector<Entry>{{7, 55, 1}});
     s.onVerdictMarker(20, 10, 20, {});
     s.finish(100, kMax, /*markerRemovalBound=*/10);
-    EXPECT_FALSE(s.markerRemovable(10, 100)) << "a replica has not fetched it";
+    s.markRemovalsBelow(100);
+    EXPECT_FALSE(s.markerRemovable(10)) << "a replica has not fetched it";
     s.clear();
     s.onVerdictMarker(10, 0, 10, std::vector<Entry>{{7, 55, 1}});
     s.onVerdictMarker(20, 10, 20, {});
     s.finish(100, kMax, /*markerRemovalBound=*/11);
-    EXPECT_FALSE(s.markerRemovable(10, 7)) << "the rejected record is not below the pass boundary yet";
-    EXPECT_TRUE(s.markerRemovable(10, 8));
-    EXPECT_FALSE(s.markerRemovable(20, 100)) << "the last marker is the coverage";
-    EXPECT_FALSE(s.keepsControlRecord(10, cr::kVerdictMarker, 8));
-    EXPECT_TRUE(s.keepsControlRecord(10, cr::kConstraintSetChange, 8));
-    EXPECT_TRUE(s.keepsControlRecord(10, cr::kTxnJudge, 8));
+    EXPECT_FALSE(s.markerRemovable(10)) << "no pass boundary marked yet";
+    s.markRemovalsBelow(7);
+    EXPECT_FALSE(s.markerRemovable(10)) << "the rejected record is not below the pass boundary yet";
+    s.markRemovalsBelow(8);
+    EXPECT_TRUE(s.markerRemovable(10));
+    s.markRemovalsBelow(100);
+    EXPECT_FALSE(s.markerRemovable(20)) << "the last marker is the coverage";
+    s.markRemovalsBelow(8);
+    EXPECT_FALSE(s.keepsControlRecord(10, cr::kVerdictMarker));
+    EXPECT_TRUE(s.keepsControlRecord(10, cr::kConstraintSetChange));
+    EXPECT_TRUE(s.keepsControlRecord(10, cr::kTxnJudge));
 }
 
 // ---- the cleaner on a Log ---------------------------------------------------------------------------------

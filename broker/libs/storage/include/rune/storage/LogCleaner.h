@@ -388,7 +388,7 @@ private:
                             int64_t nowMs = -1, bool* changed = nullptr,
                             const ProducerTails* tails = nullptr,
                             const TxnCleanState* txn = nullptr,
-                            const VerdictCleanState* verdicts = nullptr);
+                            VerdictCleanState* verdicts = nullptr);
 
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones

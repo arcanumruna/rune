@@ -292,7 +292,7 @@ MarkerAction markerAction(const rune::protocol::RecordBatchReader& r, const uint
     if (r.producerId() < 0) {   // a checked-writes control record (16-19): its own rules
         const int type = rune::storage::control_record::recordType(batch, len);
         if (type == rune::storage::control_record::kUnparseable || verdicts == nullptr ||
-            verdicts->keepsControlRecord(r.baseOffset(), static_cast<int16_t>(type), cleanBoundaryOffset))
+            verdicts->keepsControlRecord(r.baseOffset(), static_cast<int16_t>(type)))
             return MarkerAction::Keep;
     } else if (txn == nullptr || !txn->markerRemovable(r.baseOffset())) {
         return MarkerAction::Keep;
@@ -477,11 +477,14 @@ bool LogCleaner::rewriteSegmentImpl(
     const std::function<std::optional<Offset>(std::string_view)>& getLatest,
     Offset fromOffset, Offset cleanBoundaryOffset,
     int64_t nowNs, int64_t deleteRetentionMs,
-    int64_t nowMs, bool* changed, const ProducerTails* tails, const TxnCleanState* txn, const VerdictCleanState* verdicts)
+    int64_t nowMs, bool* changed, const ProducerTails* tails, const TxnCleanState* txn, VerdictCleanState* verdicts)
 {
     // D3b: never clean at/after the pass's first unresolved transaction (LSO).
     if (txn != nullptr) cleanBoundaryOffset = std::min(cleanBoundaryOffset, txn->cleanLimit());
-    if (verdicts != nullptr) cleanBoundaryOffset = std::min(cleanBoundaryOffset, verdicts->cleanLimit());
+    if (verdicts != nullptr) {
+        cleanBoundaryOffset = std::min(cleanBoundaryOffset, verdicts->cleanLimit());
+        verdicts->markRemovalsBelow(cleanBoundaryOffset);
+    }
     std::string logPath   = segmentLogPath(dir, segBase);
     std::string newPath   = logPath + ".new";
     std::string idxPath   = segmentIndexPath(dir, segBase);
@@ -1439,8 +1442,9 @@ void LogCleaner::mergeGroupWithMap(
     if (groupInPass.empty()) return;
     // D3b: never at/after the first unresolved transaction (LSO).
     const TxnCleanState* txn = &map.txnState();
-    const VerdictCleanState* verdicts = &map.verdictState();
+    VerdictCleanState* verdicts = &map.verdictState();
     passEnd = std::min({passEnd, txn->cleanLimit(), verdicts->cleanLimit()});
+    verdicts->markRemovalsBelow(passEnd);
 
     const int64_t outBase = groupInPass.front();
     const std::string outLogPath = segmentLogPath(dir, outBase);

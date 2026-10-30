@@ -30,6 +30,7 @@ public:
         removable_.clear();
         events_.clear();
         cleanLimit_ = kNone;
+        removalsBelow_ = std::numeric_limits<int64_t>::min();
     }
 
     // ---- pre-pass feed (offset order) -------------------------------------
@@ -83,19 +84,20 @@ public:
     /// Exclusive upper bound of what this pass may clean (kNone: not a verdict source).
     [[nodiscard]] int64_t cleanLimit() const noexcept { return cleanLimit_; }
     /// The pass cleans [.., cleanBoundary): a marker is removable once every record it lists is below it.
-    [[nodiscard]] bool markerRemovable(int64_t markerOffset, int64_t cleanBoundary) const noexcept {
+    void markRemovalsBelow(int64_t cleanBoundary) noexcept { removalsBelow_ = cleanBoundary; }
+    [[nodiscard]] bool markerRemovable(int64_t markerOffset) const noexcept {
         for (const std::size_t i : removable_)
-            if (markers_[i].offset == markerOffset) return markers_[i].lastListed < cleanBoundary;
+            if (markers_[i].offset == markerOffset) return markers_[i].lastListed < removalsBelow_;
         return false;
     }
     /// A rewrite has work even when no key was indexed: a rejected record to drop or a superseded marker to remove.
     [[nodiscard]] bool hasWork() const noexcept { return !rejected_.empty() || !removable_.empty(); }
     [[nodiscard]] bool keepsReservation(int64_t) const noexcept { return true; }
     /// Type 18 and 19 are always kept; 16 follows keepsReservation; a verdict marker (17) only goes through markerRemovable.
-    [[nodiscard]] bool keepsControlRecord(int64_t offset, int16_t type, int64_t cleanBoundary) const noexcept {
+    [[nodiscard]] bool keepsControlRecord(int64_t offset, int16_t type) const noexcept {
         namespace cr = control_record;
         if (type == cr::kReservation) return keepsReservation(offset);
-        if (type == cr::kVerdictMarker) return !markerRemovable(offset, cleanBoundary);
+        if (type == cr::kVerdictMarker) return !markerRemovable(offset);
         return true;
     }
 
@@ -107,6 +109,7 @@ private:
     std::vector<std::size_t> removable_;
     std::vector<Event> events_;
     int64_t cleanLimit_ = kNone;
+    int64_t removalsBelow_ = std::numeric_limits<int64_t>::min();
 };
 
 }  // namespace rune::storage
