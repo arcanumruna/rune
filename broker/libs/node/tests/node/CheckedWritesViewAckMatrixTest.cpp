@@ -1,6 +1,7 @@
 // CheckedWritesViewAckMatrixTest.cpp - checked writes Part 03 Task 9: the View ack matrix (2 ops x 4 entities x 10 timings)
 // and the seeded stress of the waiter state.
 #include "support/CheckedWritesAckRig.h"
+#include "support/CheckedWritesMatrixExpectations.h"
 
 #include <gtest/gtest.h>
 
@@ -9,6 +10,7 @@
 
 using namespace rune::node;
 using namespace rune::node::cw;
+using namespace rune::node::cw::mx;
 using rune::protocol::client::ErrorCode;
 
 namespace {
@@ -20,15 +22,6 @@ constexpr int32_t kView1 = 0x40000001, kView2 = 0x40000002;
 constexpr int64_t kTimeoutNs = 50'000'000;
 constexpr uint8_t kAll = 1;
 
-enum class MOp : int { LV, AV };
-enum class MEntity : int { NoViews, OneView, TwoViewsLate, TransientSource };
-enum class MTiming : int { Single, Pipelined8, DupBeforeFold, DupAfterFold, TxnCommit, TxnAbort, LeaderLoss, Deadline, Strict, Routed };
-constexpr const char* kOpNames[] = {"LV", "AV"};
-constexpr const char* kEntityNames[] = {"NoViews", "OneView", "TwoViewsLate", "TransientSource"};
-constexpr const char* kTimingNames[] = {"Single", "Pipelined8", "DupBeforeFold", "DupAfterFold", "TxnCommit", "TxnAbort", "LeaderLoss", "Deadline", "Strict", "Routed"};
-
-bool notApplicable(MEntity e, MTiming t) { return e == MEntity::TransientSource && t == MTiming::Strict; }
-
 AckRig::Write write(int64_t corr, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool txn = false) {
     AckRig::Write w;
     w.corr = corr; w.acks = acks; w.pid = pid; w.seq = seq; w.txn = txn;
@@ -37,42 +30,44 @@ AckRig::Write write(int64_t corr, uint8_t acks, int64_t pid = -1, int32_t seq = 
 
 }  // namespace
 
-class CheckedWritesViewAckMatrix : public ::testing::TestWithParam<std::tuple<int, int, int>> {};
+class CheckedWritesViewAckMatrix : public ::testing::TestWithParam<Cell> {};
 
 TEST_P(CheckedWritesViewAckMatrix, Cell) {
-    const auto op = static_cast<MOp>(std::get<0>(GetParam()));
-    const auto entity = static_cast<MEntity>(std::get<1>(GetParam()));
-    const auto timing = static_cast<MTiming>(std::get<2>(GetParam()));
-    if (notApplicable(entity, timing)) GTEST_SKIP() << "a transient ring has no fd: Strict acks as Majority there, the cell equals Single";
+    const Cell cell = GetParam();
+    const Expected ex = expect(cell);
+    if (!ex.applicable) GTEST_SKIP() << ex.naReason;
+    const bool lv = cell.op == Op::ViewAckLV;
+    const mx::Entity entity = cell.entity;
+    const Timing timing = cell.timing;
 
-    const uint8_t acks = op == MOp::LV ? 2 : 3;
+    const uint8_t acks = lv ? 2 : 3;
     AckRig::Options o;
     o.replicas = {1, 2};
-    o.minIsr = timing == MTiming::Deadline ? 2 : 1;
-    o.transient = entity == MEntity::TransientSource;
-    o.durabilityTier = timing == MTiming::Strict ? 2 : 1;
+    o.minIsr = timing == Timing::AckDeadline ? 2 : 1;
+    o.transient = entity == mx::Entity::AckTransientSource;
+    o.durabilityTier = timing == Timing::StrictTier ? 2 : 1;
     o.ringBytes = 1 << 18;
     AckRig r(o);
     r.typed(); r.setLevel(5);
-    const bool views = entity != MEntity::NoViews;
+    const bool views = entity != mx::Entity::AckNoViews;
     if (views) r.installView(kView1);
 
-    const bool routed = timing == MTiming::Routed;
+    const bool routed = timing == Timing::GatewayRouted;
     const auto send = [&](const AckRig::Write& w) { if (routed) r.send_routed(w); else r.produce(w); };
 
     std::vector<int64_t> ours;
     std::vector<int64_t> viewIds;
     int64_t allCorr = 0;
     switch (timing) {
-    case MTiming::Pipelined8:
+    case Timing::BackToBack:
         for (int64_t c = 1; c <= 8; ++c) { send(write(c, acks)); ours.push_back(c); }
         break;
-    case MTiming::DupBeforeFold:
-    case MTiming::DupAfterFold:
+    case Timing::RetryBeforeJudge:
+    case Timing::RetryAfterJudge:
         send(write(1, acks, 11, 0)); ours.push_back(1);
         break;
-    case MTiming::TxnCommit:
-    case MTiming::TxnAbort:
+    case Timing::TxnCommitBehind:
+    case Timing::TxnAbortBehind:
         send(write(100, kAll, 77, 0, /*txn=*/true));
         r.steps(50);
         send(write(1, acks)); ours.push_back(1);
@@ -84,17 +79,17 @@ TEST_P(CheckedWritesViewAckMatrix, Cell) {
         break;
     }
     r.steps(60);
-    if (entity == MEntity::TwoViewsLate) r.installView(kView2, "v2");   // after the append, before the HW passes
-    if (timing == MTiming::DupBeforeFold) { send(write(2, acks, 11, 0)); ours.push_back(2); r.steps(60); }
+    if (entity == mx::Entity::AckTwoViewsLate) r.installView(kView2, "v2");   // after the append, before the HW passes
+    if (timing == Timing::RetryBeforeJudge) { send(write(2, acks, 11, 0)); ours.push_back(2); r.steps(60); }
 
     const auto answered = [&](int64_t c) { return r.acks.count(c) != 0; };
-    if (timing == MTiming::Deadline) {
+    if (timing == Timing::AckDeadline) {
         r.steps(10);
         ASSERT_EQ(r.answer(ours[0]), kInternal);
         const int64_t deadline = r.appendedAtNs + kTimeoutNs;
         EXPECT_GE(r.ackNow[ours[0]], deadline) << "never earlier than the deadline";
         EXPECT_LE(r.ackNow[ours[0]], deadline + 30'000);
-    } else if (timing == MTiming::LeaderLoss) {
+    } else if (timing == Timing::LeaderLossParked) {
         for (int64_t c : ours) ASSERT_FALSE(answered(c)) << "parked until the HW moves";
         r.demote();
         for (int64_t c : ours) {
@@ -103,7 +98,7 @@ TEST_P(CheckedWritesViewAckMatrix, Cell) {
         }
     } else {
         for (int64_t c : ours) ASSERT_FALSE(answered(c)) << "parked until the HW moves";
-        if (timing == MTiming::TxnCommit || timing == MTiming::TxnAbort) {
+        if (timing == Timing::TxnCommitBehind || timing == Timing::TxnAbortBehind) {
             r.followerFetch();
             r.steps(300);
             if (views) {
@@ -115,32 +110,32 @@ TEST_P(CheckedWritesViewAckMatrix, Cell) {
                 ASSERT_EQ(r.answer(1), kOk);
                 EXPECT_LE(r.ackStep[1], r.ackStep[allCorr] + 1) << "no views: the pass an All ack fires in";
             }
-            r.marker(77, timing == MTiming::TxnCommit);
+            r.marker(77, timing == Timing::TxnCommitBehind);
         }
         r.followerFetch();
         for (int64_t c : ours) ASSERT_EQ(r.answer(c), kOk) << "corr " << c;
-        if (timing == MTiming::TxnCommit || timing == MTiming::TxnAbort) {
+        if (timing == Timing::TxnCommitBehind || timing == Timing::TxnAbortBehind) {
             if (views) EXPECT_LT(r.ackStep[allCorr], r.ackStep[1]) << "an All ack is answered before the View ack behind the transaction (SD16)";
         }
-        if (timing == MTiming::DupBeforeFold) EXPECT_EQ(r.acks[2].baseOffset, r.acks[1].baseOffset);
-        if (timing == MTiming::DupAfterFold) {
+        if (timing == Timing::RetryBeforeJudge) EXPECT_EQ(r.acks[2].baseOffset, r.acks[1].baseOffset);
+        if (timing == Timing::RetryAfterJudge) {
             send(write(2, acks, 11, 0)); ours.push_back(2);
             ASSERT_EQ(r.answer(2), kOk);
             EXPECT_EQ(r.acks[2].baseOffset, r.acks[1].baseOffset);
             EXPECT_EQ(r.leo(), 1);
         }
-        if (timing == MTiming::Pipelined8)
+        if (timing == Timing::BackToBack)
             for (int64_t c = 2; c <= 8; ++c) EXPECT_GE(r.ackStep[c], r.ackStep[c - 1]) << "answers leave in append order";
 
         for (int64_t c : ours) {
             const auto& a = r.acks[c];
             EXPECT_GT(r.replica->highWatermark(), a.baseOffset) << "HW at the answer, corr " << c;
-            if (op == MOp::AV) EXPECT_GE(static_cast<int>(r.replica->isr().size()), o.minIsr);
+            if (!lv) EXPECT_GE(static_cast<int>(r.replica->isr().size()), o.minIsr);
             if (views) {
                 EXPECT_GT(r.foldCursor(kView1), a.baseOffset);
                 EXPECT_EQ(r.foldLeadership(kView1), r.replica->leadershipGeneration());
             }
-            if (entity == MEntity::TwoViewsLate) {
+            if (entity == mx::Entity::AckTwoViewsLate) {
                 EXPECT_GT(r.foldCursor(kView2), a.baseOffset);
                 EXPECT_EQ(r.foldLeadership(kView2), r.replica->leadershipGeneration());
             }
@@ -155,20 +150,10 @@ TEST_P(CheckedWritesViewAckMatrix, Cell) {
     }
 }
 
-INSTANTIATE_TEST_SUITE_P(Cells, CheckedWritesViewAckMatrix,
-    ::testing::Combine(::testing::Range(0, 2), ::testing::Range(0, 4), ::testing::Range(0, 10)),
-    [](const ::testing::TestParamInfo<std::tuple<int, int, int>>& i) {
-        return std::string(kOpNames[std::get<0>(i.param)]) + "_" + kEntityNames[std::get<1>(i.param)] + "_" + kTimingNames[std::get<2>(i.param)];
+INSTANTIATE_TEST_SUITE_P(Cells, CheckedWritesViewAckMatrix, ::testing::ValuesIn(cellsFor(Part::P03)),
+    [](const ::testing::TestParamInfo<Cell>& i) {
+        return std::string(nameOf(i.param.op)) + "_" + nameOf(i.param.entity) + "_" + nameOf(i.param.timing);
     });
-
-TEST(CheckedWritesViewAckMatrixCountRegression, CellCountsArePinned) {
-    int applicable = 0, skipped = 0;
-    for (int op = 0; op < 2; ++op)
-        for (int e = 0; e < 4; ++e)
-            for (int t = 0; t < 10; ++t) (notApplicable(static_cast<MEntity>(e), static_cast<MTiming>(t)) ? skipped : applicable)++;
-    EXPECT_EQ(applicable, 78);
-    EXPECT_EQ(skipped, 2);
-}
 
 // ---------------------------------------------------------------------------------------------------------------
 // Seeded stress: one action per step; every answer is checked against what the model allows at that step.

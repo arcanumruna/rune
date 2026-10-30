@@ -71,7 +71,7 @@ void VerdictSource::removeVerdictView(uint64_t viewObjectId, uint64_t planFinger
 void VerdictSource::installTestVerdictViewForTest(ViewInstance* inst, uint64_t viewObjectId, TestRejectRule rule) {
     addVerdictView(inst, rune::view::VerdictViewKind::TestReject, viewObjectId, rule.fingerprint());
     for (Member& m : members_)
-        if (m.objectId == viewObjectId) m.rule = rule;
+        if (m.objectId == viewObjectId && m.fingerprint == rule.fingerprint()) m.rule = rule;
 }
 
 bool VerdictSource::retiringForTest(uint64_t viewObjectId) const noexcept {

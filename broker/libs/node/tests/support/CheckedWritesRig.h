@@ -148,6 +148,7 @@ public:
         replica.reset();
         if (cutTo >= 0) log->truncateTo(cutTo);
         log.reset();
+        epoch_ = 1;   // the new replica starts at epoch 1
         vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
         open();
         typed();

@@ -1345,6 +1345,12 @@ if(BUILD_TESTING)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # Checked writes Part 04: the shared interaction matrix (04 cells; the reference model).
+            add_executable(rune_checked_writes_matrix_tests tests/node/CheckedWritesMatrixTest.cpp)
+            target_include_directories(rune_checked_writes_matrix_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
+            target_link_libraries(rune_checked_writes_matrix_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_checked_writes_matrix_tests PROPERTIES TIMEOUT 900 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # Checked writes Part 03 (hard rule): the write hook and the View acks allocate nothing.  Replaces the global
             # operator new (binary-wide) - its own binary; later checked-writes parts extend it.
             add_executable(rune_checked_writes_alloc_regression_tests tests/node/CheckedWritesAllocRegressionTest.cpp tests/support/AllocWindow.cpp)
