@@ -64,10 +64,15 @@ void VerdictSource::discardCheckpointAhead_(Member& m) {
     ++stats_.verdictCheckpointsDiscarded;
 }
 
-void VerdictSource::removeVerdictView(uint64_t viewObjectId, uint64_t planFingerprint) {
-    std::erase_if(members_, [&](const Member& m) { return m.objectId == viewObjectId && m.fingerprint == planFingerprint; });
+void VerdictSource::removeVerdictView(int32_t viewTopicId) {
+    std::erase_if(members_, [&](const Member& m) { return m.inst->plan.viewTopicId == viewTopicId; });
     reindex_();
     recomputeCap_();
+}
+
+void VerdictSource::markLeaving(int32_t viewTopicId) noexcept {
+    for (Member& m : members_)
+        if (m.inst->plan.viewTopicId == viewTopicId) m.leaving = true;
 }
 
 void VerdictSource::installTestVerdictViewForTest(ViewInstance* inst, uint64_t viewObjectId, TestRejectRule rule) {
@@ -84,9 +89,9 @@ bool VerdictSource::resolveSet_(const ConstraintSet& set, std::vector<std::size_
     out.clear();
     for (uint8_t i = 0; i < set.count; ++i) {
         const ConstraintSetMember& want = set.members[i];
-        const auto it = std::find_if(members_.begin(), members_.end(), [&](const Member& m) {
-            return !m.retiring && m.objectId == want.viewObjectId && m.fingerprint == want.planFingerprint;
-        });
+        const auto match = [&](const Member& m) { return !m.retiring && m.objectId == want.viewObjectId && m.fingerprint == want.planFingerprint; };
+        auto it = std::find_if(members_.begin(), members_.end(), [&](const Member& m) { return match(m) && !m.leaving; });
+        if (it == members_.end()) it = std::find_if(members_.begin(), members_.end(), match);   // a dropped view judges until its drop
         if (it == members_.end()) return false;
         out.push_back(static_cast<std::size_t>(it - members_.begin()));
     }
@@ -99,11 +104,26 @@ bool VerdictSource::reindex_() {
         return false;
     }
     waitingForInstall_ = false;
+    // A dropped view whose plan was installed again (#786): the new member took its place here and it retires, released once a
+    // committed marker covers what it judged.
+    for (std::size_t i = 0; i < members_.size(); ++i) {
+        Member& m = members_[i];
+        if (!m.leaving || m.retiring || std::find(active_.begin(), active_.end(), i) != active_.end()) continue;
+        if (std::any_of(activeSet_.members.begin(), activeSet_.members.begin() + activeSet_.count,
+                        [&](const ConstraintSetMember& w) { return w.viewObjectId == m.objectId && w.planFingerprint == m.fingerprint; })) {
+            m.retiring = true;
+            m.leaveOffset = judgeCursor_ - 1;
+        }
+    }
     return true;
 }
 
 bool VerdictSource::hasMember(uint64_t viewObjectId, uint64_t planFingerprint) const noexcept {
     return std::any_of(members_.begin(), members_.end(), [&](const Member& m) { return m.objectId == viewObjectId && m.fingerprint == planFingerprint; });
+}
+
+bool VerdictSource::hasView(int32_t viewTopicId) const noexcept {
+    return std::any_of(members_.begin(), members_.end(), [&](const Member& m) { return m.inst->plan.viewTopicId == viewTopicId; });
 }
 
 void VerdictSource::recomputeCap_() noexcept {
@@ -363,16 +383,16 @@ int VerdictSource::pushCheckpoints_(PartitionWriteState& state) {
 
 int VerdictSource::dropRetired_(PartitionWriteState& state) {
     const std::size_t before = members_.size();
-    std::array<std::pair<uint64_t, uint64_t>, kMaxVerdictViewsPerSource> gone{};
+    std::array<int32_t, kMaxVerdictViewsPerSource> gone{};
     std::size_t n = 0;
     std::erase_if(members_, [&](const Member& m) {
         if (!m.retiring || state.markers.committedThrough() <= m.leaveOffset) return false;
-        if (n < gone.size()) gone[n++] = {m.objectId, m.fingerprint};
+        if (n < gone.size()) gone[n++] = m.inst->plan.viewTopicId;
         return true;
     });
     if (members_.size() == before) return 0;
     if (hooks_.retired != nullptr)
-        for (std::size_t i = 0; i < n; ++i) hooks_.retired(hooks_.ctx, gone[i].first, gone[i].second, partition_);
+        for (std::size_t i = 0; i < n; ++i) hooks_.retired(hooks_.ctx, gone[i], partition_);
     reindex_();
     recomputeCap_();
     return static_cast<int>(before - members_.size());

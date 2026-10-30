@@ -270,12 +270,12 @@ bool WorkerViewSet::uninstallView(int32_t viewTopicId) {
     // A verdict view that a judge has taken in stays (Retiring) until a committed marker passes its drop: records up to the
     // drop are still judged with it, on every replica (P4-6).
     if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.isVerdict) {
-        ViewTemplate& tpl = tit->second;
         const bool judged = std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& kv) {
-            return kv.second->hasMember(tpl.verdictObjectId, tpl.verdictFingerprint);
+            return kv.second->hasView(viewTopicId);
         });
         if (judged) {
-            tpl.retiring = true;
+            for (auto& kv : verdictSources_) kv.second->markLeaving(viewTopicId);
+            tit->second.retiring = true;
             ++verdictEpoch_;
             return true;
         }
@@ -286,7 +286,7 @@ bool WorkerViewSet::uninstallView(int32_t viewTopicId) {
 bool WorkerViewSet::eraseView_(int32_t viewTopicId) {
     ++verdictEpoch_;
     if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.isVerdict)
-        for (auto& kv : verdictSources_) kv.second->removeVerdictView(tit->second.verdictObjectId, tit->second.verdictFingerprint);
+        for (auto& kv : verdictSources_) kv.second->removeVerdictView(viewTopicId);
     bool had = templates_.erase(viewTopicId) != 0;
     for (auto it = views_.begin(); it != views_.end();) {
         if (static_cast<int32_t>(static_cast<uint32_t>(it->first >> 32)) == viewTopicId) {
@@ -817,7 +817,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     if (sit == subscriptionIndex_.end()) return judge;
     for (const int32_t id : sit->second) {
         const ViewTemplate& tpl = templates_.at(id);
-        if (!tpl.isVerdict || tpl.retiring || judge->hasMember(tpl.verdictObjectId, tpl.verdictFingerprint)) continue;
+        if (!tpl.isVerdict || tpl.retiring || judge->hasView(id)) continue;
         ViewInstance* inst = getOrCreate_(id, partition, INT64_MAX);
         if (inst == nullptr) continue;
         judge->installTestVerdictViewForTest(inst, tpl.verdictObjectId, tpl.testRule);
@@ -835,16 +835,16 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     // (the judge waits for it, it is never dropped by a guess).
     for (uint8_t i = 0; i < logged.count; ++i) {
         const ConstraintSetMember& m = logged.members[i];
-        bool keep = true;
+        bool live = false, gone = false;
         if (sit != subscriptionIndex_.end()) {
             for (const int32_t id : sit->second) {
                 const ViewTemplate& tpl = templates_.at(id);
                 if (!tpl.isVerdict || tpl.verdictObjectId != m.viewObjectId) continue;
-                if (tpl.verdictFingerprint == m.planFingerprint) keep = !tpl.retiring;
-                else if (!tpl.retiring) keep = false;   // replaced by a plan with another fingerprint
+                if (tpl.verdictFingerprint == m.planFingerprint) (tpl.retiring ? gone : live) = true;
+                else if (!tpl.retiring) gone = true;   // replaced by a plan with another fingerprint
             }
         }
-        if (keep) want.push_back(m);
+        if (live || !gone) want.push_back(m);   // a retiring view's plan installed again stays (#786)
     }
     if (sit != subscriptionIndex_.end()) {
         for (const int32_t id : sit->second) {
@@ -853,7 +853,7 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
             if (tpl.retiring) {
                 const bool inLogged = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
                 const bool wasLogged = std::any_of(logged.members.begin(), logged.members.begin() + logged.count, [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
-                if (!inLogged && !wasLogged && !judge.hasMember(tpl.verdictObjectId, tpl.verdictFingerprint)) retiredQueue_.push_back({tpl.verdictObjectId, tpl.verdictFingerprint, judge.partition()});   // never joined a set
+                if (!inLogged && !wasLogged && !judge.hasView(id)) retiredQueue_.push_back({id, judge.partition()});   // never joined a set
                 continue;
             }
             const bool present = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
@@ -903,18 +903,14 @@ int WorkerViewSet::finishRetired_() {
     std::vector<Retired> queue;
     queue.swap(retiredQueue_);
     for (const Retired& r : queue) {
-        for (const auto& kv : templates_) {
-            const ViewTemplate& tpl = kv.second;
-            if (!tpl.isVerdict || !tpl.retiring || tpl.verdictObjectId != r.objectId || tpl.verdictFingerprint != r.fingerprint) continue;
-            const int32_t viewTopicId = kv.first;
-            eraseInstance_(viewTopicId, r.partition);
-            const bool judged = std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& s) {
-                return s.second->hasMember(r.objectId, r.fingerprint);
-            });
-            if (!judged) (void)eraseView_(viewTopicId);   // another partition's judge may still judge with it
-            ++work;
-            break;
-        }
+        const auto tit = templates_.find(r.viewTopicId);
+        if (tit == templates_.end() || !tit->second.isVerdict || !tit->second.retiring) continue;
+        eraseInstance_(r.viewTopicId, r.partition);
+        const bool judged = std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& s) {
+            return s.second->hasView(r.viewTopicId);
+        });
+        if (!judged) (void)eraseView_(r.viewTopicId);   // another partition's judge may still judge with it
+        ++work;
     }
     return work;
 }

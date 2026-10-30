@@ -285,3 +285,44 @@ TEST_F(CheckedWritesVerdictAck, DeadlineIsInternal) {
     EXPECT_EQ(a->code, static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal));
     EXPECT_FALSE(a->hasVerdicts);
 }
+
+TEST_F(CheckedWritesVerdictAckRegression, ReplacingAViewWithTheSamePlanKeepsViewAcksRegression) {
+    // #786: the new view carries the old one's object and plan, so the logged set does not change and the old member never
+    // retires.  The new view must still fold, or no View ack passes it.
+    constexpr int32_t kRej2 = 0x40000602;
+    ASSERT_TRUE(r.ack(r.produceFrame({{1, 1, 1}}, kAcksView)));
+    r.replaceRejectView(kRej, kRej2, kObj, tagRule(9));
+    r.passes(60);
+    const auto a = r.ack(r.produceFrame({{2, 2, 9}, {3, 3, 1}}, kAcksView));
+    ASSERT_TRUE(a) << "the new view never folded";
+    EXPECT_EQ(a->code, 0);
+    EXPECT_EQ(a->verdicts, (V{{0, kCode, kCid}}));
+    r.passes(60);
+    EXPECT_FALSE(r.vs->isViewSink(kRej)) << "the old view is released";
+}
+
+TEST_F(CheckedWritesVerdictAckRegression, ReinstallingADroppedPlanWhileItRetiresKeepsViewAcksRegression) {
+    // #786: the drop is logged and the old member retires; the same plan installed again before the drop commits joins anew.
+    constexpr int32_t kRej2 = 0x40000602;
+    VerdictRig o(/*follower=*/true);
+    o.typed();
+    o.installRejectView(kRej, kObj, tagRule(9));
+    o.enableAcks();
+    o.passes(60);
+    ASSERT_TRUE(o.ackFetching(o.produceFrame({{1, 1, 1}}, kAcksView)));
+    o.dropRejectView(kRej);
+    o.passes(60);
+    o.followerFetch(o.writeState()->constraintSets.lastChangeOffset() + 1);   // the drop commits, the marker after it does not
+    o.passes(10);
+    ASSERT_TRUE(o.vs->verdictSource(VerdictRig::kSrc, 0)->retiringForTest(kObj));
+    o.installRejectView(kRej2, kObj, tagRule(9), "rej2");
+    o.passes(60);
+    EXPECT_TRUE(o.vs->verdictSource(VerdictRig::kSrc, 0)->hasView(kRej2)) << "joins while the old member still retires";
+    const auto a = o.ackFetching(o.produceFrame({{2, 2, 9}, {3, 3, 1}}, kAcksView));
+    ASSERT_TRUE(a) << "the judge never resolved the re-added plan";
+    EXPECT_EQ(a->code, 0);
+    EXPECT_EQ(a->verdicts, (V{{0, kCode, kCid}}));
+    for (int i = 0; i < 20; ++i) { o.followerFetch(); o.passes(5); }
+    EXPECT_FALSE(o.vs->isViewSink(kRej)) << "the old view is released";
+    EXPECT_TRUE(o.vs->isViewSink(kRej2));
+}

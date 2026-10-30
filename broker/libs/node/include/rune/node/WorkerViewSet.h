@@ -531,12 +531,12 @@ private:
     void eraseInstance_(int32_t viewTopicId, int32_t partition);
     static int  checkpointHook_(void* ctx, ViewInstance& inst) { return static_cast<WorkerViewSet*>(ctx)->pushVerdictCheckpoint_(inst); }
     static void discardHook_(void* ctx, ViewInstance& inst) { static_cast<WorkerViewSet*>(ctx)->discardVerdictInstance_(inst); }
-    static void retiredHook_(void* ctx, uint64_t objectId, uint64_t fingerprint, int32_t partition) {
-        static_cast<WorkerViewSet*>(ctx)->retiredQueue_.push_back({objectId, fingerprint, partition});
+    static void retiredHook_(void* ctx, int32_t viewTopicId, int32_t partition) {
+        static_cast<WorkerViewSet*>(ctx)->retiredQueue_.push_back({viewTopicId, partition});
     }
 
     std::unordered_map<uint64_t, std::unique_ptr<VerdictSource>> verdictSources_;   // (srcTopicId, partition) -> judge
-    struct Retired { uint64_t objectId, fingerprint; int32_t partition; };
+    struct Retired { int32_t viewTopicId, partition; };
     uint64_t verdictEpoch_ = 0;   // bumped by every verdict template install, retire and erase; syncConstraintSet_ reruns on a change
     std::vector<Retired> retiredQueue_;   // the members the judges dropped, per partition
     std::vector<ConstraintSetMember> constraintWant_;   // syncConstraintSet_ scratch: grows once, never per pass

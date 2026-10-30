@@ -26,7 +26,7 @@ struct VerdictViewHooks {
     /// A checkpoint that outran the markers (P4-4): empty the member's tables and owe its file a reset.
     void (*discard)(void* ctx, ViewInstance&) = nullptr;
     /// A retiring member left this partition's set for good (W passed its drop): the owner may erase the partition's instance.
-    void (*retired)(void* ctx, uint64_t viewObjectId, uint64_t planFingerprint, int32_t partition) = nullptr;
+    void (*retired)(void* ctx, int32_t viewTopicId, int32_t partition) = nullptr;
 };
 
 class VerdictSource {
@@ -62,7 +62,9 @@ public:
     [[nodiscard]] bool waitingForInstall() const noexcept { return waitingForInstall_; }
 
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);
-    void removeVerdictView(uint64_t viewObjectId, uint64_t planFingerprint);
+    void removeVerdictView(int32_t viewTopicId);
+    /// The view was dropped: a member with the same plan installed since judges in its place (#786).
+    void markLeaving(int32_t viewTopicId) noexcept;
     /// Appends a constraint-set change at the LEO.  Returns the activation offset, kChangeDeferred or kChangeUnchanged.
     /// `refresh`: append even when the members are those of the latest change (retention is about to delete its segment).
     int requestChange(const ConstraintSet& next, bool refresh = false);
@@ -73,6 +75,7 @@ public:
     void setVerdictIntervalNs(int64_t ns) noexcept { intervalNs_ = ns; }
     void setViewHooks(const VerdictViewHooks& h) noexcept { hooks_ = h; }
     [[nodiscard]] bool hasMember(uint64_t viewObjectId, uint64_t planFingerprint) const noexcept;
+    [[nodiscard]] bool hasView(int32_t viewTopicId) const noexcept;
     [[nodiscard]] bool hasMembers() const noexcept { return !members_.empty(); }
     [[nodiscard]] VerdictSourceStats& statsMut() noexcept { return stats_; }
     [[nodiscard]] const VerdictSourceStats& stats() const noexcept { return stats_; }
@@ -94,7 +97,7 @@ private:
         uint64_t                    objectId = 0, fingerprint = 0;
         TestRejectRule              rule;
         rune::view::Prospect        prospect;
-        bool                        retiring = false;
+        bool                        retiring = false, leaving = false;
         int64_t                     leaveOffset = -1;
     };
 

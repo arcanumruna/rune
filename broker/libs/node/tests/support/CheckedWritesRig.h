@@ -157,9 +157,9 @@ public:
         if (reinstall) reinstallAll();
         passes(3);
     }
-    /// The follower (node 2) fetches everything: the HW moves to the log end.
-    void followerFetch() {
-        rune::replication::FetchRequestMsg fr{epoch_, 0, 2, leo(), 1 << 20, kSrc};
+    /// The follower (node 2) fetches everything, or up to `to`: the HW moves there.
+    void followerFetch(int64_t to = -1) {
+        rune::replication::FetchRequestMsg fr{epoch_, 0, 2, to < 0 ? leo() : to, 1 << 20, kSrc};
         (void)replica->onFetchRequest(fr, now);
         passes(2);
     }
