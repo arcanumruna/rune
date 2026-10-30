@@ -69,12 +69,12 @@ inline rune::codec::Descriptor source() {
         .add("hp", P::Int64)
         .build();
 }
-inline rune::view::ViewPlan plan(Kind k, uint8_t persistence) {
+inline rune::view::ViewPlan plan(Kind k, uint8_t persistence, uint32_t capacity = 256) {
     using P = rune::codec::PrimType; using R = rune::view::MergeRule;
     rune::view::ViewPlan v;
     v.persistence = persistence;
     v.sizing.chunkBytes = 64u << 10;   // small tables: the matrices build thousands of instances
-    v.sizing.capacity   = 256;
+    v.sizing.capacity   = capacity;
     switch (k) {
         case Kind::Replace:
             v.viewName = "tv_rows"; v.key = "characterId"; v.sources = {{kSrcTopic, "characterId"}};
@@ -109,9 +109,9 @@ public:
     ViewSetRig(const ViewSetRig&)            = delete;
     ViewSetRig& operator=(const ViewSetRig&) = delete;
 
-    void install(Kind kind, bool persisted = true) {
+    void install(Kind kind, bool persisted = true, uint32_t capacity = 256) {
         const rune::codec::Descriptor* srcs[] = {&src_};
-        auto comp = rune::view::compileView(detail::plan(kind, persisted ? 0 : 1), srcs, viewId(kind)).value();
+        auto comp = rune::view::compileView(detail::plan(kind, persisted ? 0 : 1, capacity), srcs, viewId(kind)).value();
         installed_.push_back(Installed{kind, persisted, comp.plan, comp.rowLayout});
         views_->installView(comp.plan, comp.rowLayout, src_, persisted);
     }

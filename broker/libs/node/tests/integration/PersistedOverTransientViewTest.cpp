@@ -326,11 +326,11 @@ class CheckedWritesTransientViewMatrixRegression : public ::testing::TestWithPar
 
 TEST(CheckedWritesTransientViewMatrixCountRegression, CellCountIsPinned) { EXPECT_EQ(cells().size(), 108u); }
 
-TEST_P(CheckedWritesTransientViewMatrixRegression, ViewEqualsThePerKeyModel) {
-    const TvFoldCell c = GetParam();
+// capacity: the view's initial index slots.  The small one makes the index grow while the checkpoint replays and the ring re-folds.
+static void runMatrixCell(const TvFoldCell& c, uint32_t capacity) {
     const Kind kind = kindOf(c.entity);
     ViewSetRig rig("cell");
-    rig.install(kind);
+    rig.install(kind, /*persisted=*/true, capacity);
     TransientViewModel model;
 
     rig.append(kMatrixH1);
@@ -421,10 +421,17 @@ TEST_P(CheckedWritesTransientViewMatrixRegression, ViewEqualsThePerKeyModel) {
     expectViewEqualsModel(rig, kind, model);
 }
 
-INSTANTIATE_TEST_SUITE_P(Cell, CheckedWritesTransientViewMatrixRegression, ::testing::ValuesIn(cells()),
-    [](const ::testing::TestParamInfo<TvFoldCell>& i) {
-        return std::string(name(i.param.entity)) + "_" + name(i.param.op) + "_" + name(i.param.timing);
-    });
+TEST_P(CheckedWritesTransientViewMatrixRegression, ViewEqualsThePerKeyModel) { runMatrixCell(GetParam(), 256); }
+
+class CheckedWritesTransientViewSmallTableMatrixRegression : public ::testing::TestWithParam<TvFoldCell> {};
+
+TEST_P(CheckedWritesTransientViewSmallTableMatrixRegression, ViewEqualsThePerKeyModel) { runMatrixCell(GetParam(), 4); }
+
+auto cellName = [](const ::testing::TestParamInfo<TvFoldCell>& i) {
+    return std::string(name(i.param.entity)) + "_" + name(i.param.op) + "_" + name(i.param.timing);
+};
+INSTANTIATE_TEST_SUITE_P(Cell, CheckedWritesTransientViewMatrixRegression, ::testing::ValuesIn(cells()), cellName);
+INSTANTIATE_TEST_SUITE_P(Cell, CheckedWritesTransientViewSmallTableMatrixRegression, ::testing::ValuesIn(cells()), cellName);
 
 // ---------------------------------------------------------------------------
 // Model check: seeded random histories over all three views.
