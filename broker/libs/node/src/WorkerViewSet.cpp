@@ -825,7 +825,8 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
 int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write) {
     const ConstraintSet& logged = write.constraintSets.latest();
     const auto sit = subscriptionIndex_.find(srcTopicId);
-    std::vector<ConstraintSetMember> want;
+    std::vector<ConstraintSetMember>& want = constraintWant_;
+    want.clear();
     // A logged member keeps its place unless its template retired or was replaced; one whose plan is not installed here is kept
     // (the judge waits for it, it is never dropped by a guess).
     for (uint8_t i = 0; i < logged.count; ++i) {

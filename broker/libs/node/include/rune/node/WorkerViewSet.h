@@ -536,6 +536,7 @@ private:
 
     std::unordered_map<uint64_t, std::unique_ptr<VerdictSource>> verdictSources_;   // (srcTopicId, partition) -> judge
     std::vector<std::pair<uint64_t, uint64_t>> retiredQueue_;   // (objectId, fingerprint) of members the judges dropped
+    std::vector<ConstraintSetMember> constraintWant_;   // syncConstraintSet_ scratch: grows once, never per pass
     int64_t verdictIntervalNs_ = 100'000'000;
 
     // (viewTopicId, partition) -> dense composite map key.

@@ -3,6 +3,7 @@
 // the global operator new (binary-wide) through AllocWindow.cpp, so it lives in its own binary.
 #include "support/AllocWindow.h"
 #include "support/CheckedWritesAckRig.h"
+#include "support/CheckedWritesRig.h"
 
 #include <gtest/gtest.h>
 
@@ -92,4 +93,53 @@ TEST(CheckedWritesAllocRegression, SteadyStateHookAndViewAcksAllocateNothingRegr
     }
     EXPECT_EQ(allocs, 0u);
     EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::NoKeyIndex), 100u);
+}
+
+// Part 04: judging, marker emission and the ordinary fold allocate nothing in steady state.  The window brackets one
+// worker pass (op enqueue + doWork + drainReturn) per batch; the batch bytes and the view channel drain are the rig's.
+TEST(CheckedWritesAllocRegression, SteadyStateJudgingAndMarkersAllocateNothingRegression) {
+    VerdictRig r;
+    r.typed();
+    TestRejectRule rule;
+    rule.mode = TestRejectRule::Mode::TagEquals;
+    rule.tag = 9;
+    r.installRejectView(0x40000601, 7, rule);
+    r.installProjection(0x40000602);
+    r.passes(60);
+
+    int64_t corr = 1000;
+    const auto batchOf = [&](int records, int round) {
+        std::vector<Rec> recs;
+        for (int i = 0; i < records; ++i) recs.push_back({static_cast<uint64_t>(i % 16 + 1), round, static_cast<uint8_t>((round + i) % 10 == 0 ? 9 : 1)});
+        return VerdictRig::batch(recs);
+    };
+    const auto drive = [&](const std::vector<uint8_t>& bytes) -> uint64_t {
+        uint64_t allocs = 0;
+        {
+            rune::testing::AllocWindow win;
+            WorkerOp op;
+            op.type = WorkerOp::Type::Produce; op.topicId = VerdictRig::kSrc; op.partition = 0;
+            op.replica = r.replica.get(); op.logPtr = r.log.get(); op.sessionId = 1;
+            op.correlationId = ++corr; op.durabilityTier = 1;
+            op.recordBatchView = std::span<const uint8_t>(bytes);
+            if (!r.worker->tryEnqueueOp(std::move(op))) ADD_FAILURE() << "op ring full";
+            r.now += 1'000'000;
+            r.worker->doWork(r.now);
+            r.worker->drainReturn([](WorkerReturn) {}, [](const TxnReturn&) {});
+            allocs = win.count();
+        }
+        r.passes(1);   // the view agent drain is the rig's
+        return allocs;
+    };
+    for (int i = 0; i < 300; ++i) (void)drive(batchOf(i % 2 == 0 ? 1 : 16, i));
+    r.passes(300);   // markers are emitted on the interval
+    uint64_t worst = 0, total = 0;
+    for (int i = 0; i < 3000; ++i) {
+        const uint64_t a = drive(batchOf(i % 2 == 0 ? 1 : 16, i));
+        total += a;
+        worst = std::max(worst, a);
+    }
+    EXPECT_GT(r.stats()->markersWritten, 5u) << "markers were emitted in the window";
+    EXPECT_GT(r.stats()->rejectionsConstraint, 100u);
+    EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
 }
