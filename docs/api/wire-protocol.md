@@ -205,6 +205,14 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   so the frame is 54 bytes; an optional trailer follows, `[count u16][count x {recordIndex u16, code u16, constraintId u32}]`,
   present only on a `View` ack of a verdict source (`count` 0 = every record accepted). A session below 17 is sent the
   exact 46-byte frame and never the trailer.
+- **Verdict trailer entries**: `recordIndex` is the record's `offsetDelta` (the ordinal for Rune clients); `code` is 55 to 57
+  (`ConstraintViolation` is 55). The ack is sent once the judge has passed the batch, without waiting for the verdict marker.
+  A `View` retry of the same batch (same producer id, epoch, sequence) inside the broker's dedupe window is answered with
+  the original `baseOffset` and the original verdicts once the committed watermark W has passed the batch; a retry outside
+  the window on a verdict source is answered `DuplicateSequence` (21) with no trailer. An ack with more than one claim
+  (thousands of rejections, up to 32,824 bytes) is offered rather than claimed; ack publications have a term of at least 512 KiB.
+- **Control records 16 to 19** are control batches with producer id -1 in the log: 16 reservation, 17 verdict marker,
+  18 constraint-set change, 19 transaction judge. Consumers never receive them and the transaction readers ignore them.
 - **Limits and refusals**: the client sends at most 4096 records in a `View` batch (a verdict source refuses more). A `View` produce is answered `InvalidRequest` on the
   legacy gateway stream, while the cluster feature level is below checked writes, or without a replica to fold from. A
   `View` bit on a transactional batch is ignored. Error codes 55 to 61 are sent only to sessions at 17 or above.

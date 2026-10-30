@@ -354,6 +354,18 @@ partition logs under `topics/`, `__catalog/` and `__security/` (the replicated e
 - **Proof.** The DR suite ([testing.md](testing.md#disaster-recovery-suite-dr-e2e)) kills, pauses, restarts and
   partitions nodes under load and asserts no loss, per-key ordering, exactly-once and a single leader.
 
+## Verdict sources
+
+- A partition whose latest constraint set is non-empty is a verdict source. Its leader judges every record once, in offset
+  order, and writes a **verdict marker** (control record 17) after a rejection and otherwise at most every
+  `RUNE_VERDICT_INTERVAL_MS` (100). **W** is the end of the committed markers; the cleaner never cleans at or above W and
+  removes a marker only after a later marker supersedes it and every replica fetched it.
+- **Verdict lag** (judgedThrough behind the log end) delays delivery and `View` acks, not `acks=all` for writers that did not
+  ask for a verdict. Delivery stops at judgedThrough while a constraint view builds. A judge waits (`judgeWaitsForInstall`)
+  while a member of the logged set is not installed on its worker.
+- After a crash that lost the marker tail a verdict view discards a checkpoint ahead of its local markers and refolds
+  (`verdictCheckpointsDiscarded`). When the rejected-offset index is full the judge stalls and raises `verdictStalls`.
+
 ## Upgrades
 
 - Upgrade **brokers before clients**: a new client defining a transient topic against an older broker silently gets a
