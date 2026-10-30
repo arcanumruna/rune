@@ -15,6 +15,7 @@
 // Mutation: report the limits instead of the usage (handleNamespaceUsage fills `usage` from `limits`) -> ValuesMatchCountsRegression fails.
 #include "support/AuthRig.h"
 #include "support/DdlHarness.h"
+#include "client/TransientViewBrokerSupport.h"
 
 #include <rune/client/Client.h>
 #include <rune/client/NamespaceLimitFields.h>
@@ -40,7 +41,7 @@ namespace {
 constexpr const char* kAdminPw = "namespace-admin-password-1";
 constexpr const char* kUserPw  = "namespace-user-password-12";
 
-std::unique_ptr<rc::Client> connected(AuthBroker& b, const std::string& user, int32_t announceVersion = 0) {
+rc::ClientConfig configFor(AuthBroker& b, const std::string& user, int32_t announceVersion = 0) {
     rc::ClientConfig c;
     c.gatewayChannel  = b.channel();
     c.gatewayStreamId = 1;
@@ -52,7 +53,11 @@ std::unique_ptr<rc::Client> connected(AuthBroker& b, const std::string& user, in
     c.offerCrypto     = true;
     c.tlsTrustPem     = AuthBroker::tlsCaPem();
     c.testAnnounceClientVersion = announceVersion;
-    auto cl = std::make_unique<rc::Client>(c);
+    return c;
+}
+
+std::unique_ptr<rc::Client> connected(AuthBroker& b, const std::string& user, int32_t announceVersion = 0) {
+    auto cl = std::make_unique<rc::Client>(configFor(b, user, announceVersion));
     cl->connectAndWait(20s);
     return cl;
 }
@@ -181,4 +186,64 @@ TEST(NamespaceUsageRegression, OldClientRefusedRegression) {
     b.bootstrapAdmin(kAdminPw);
     auto old = connected(b, "admin", /*announce*/ 13);
     EXPECT_EQ(refusalOf(*old, "default"), 39) << "InvalidRequest below client version 14";
+}
+
+// Checked writes Part 10: a persisted view over a TRANSIENT topic is charged to the source topic's namespace.  The ring's
+// namespace tag (BrokerNode setNsTag, at boot and at runtime) is what the view's slot is read from.
+// Mutation: delete either setNsTag call in BrokerNode.cpp -> this test fails (the charge lands on slot 0).
+TEST(TransientViewNamespaceBrokerRegression, ViewOverATransientTopicIsChargedToItsNamespaceAcrossRestartRegression) {
+    namespace tv = rune::node::test::transient_view_broker;
+    AuthBroker::Options o;
+    o.shard = true;
+    AuthBroker b("nsusage_tv", std::move(o));
+    b.bootstrapAdmin(kAdminPw);
+    auto admin = connected(b, "admin");
+    const auto ns = admin->createNamespace("u");
+    ASSERT_TRUE(ns.has_value());
+    auto grants = builderGrants("u", false);
+    grants.push_back(prefix(SO::Write, ST::Topic, ""));
+    grants.push_back(prefix(SO::Read, ST::View, ""));
+    b.createUser("u/w", kUserPw, grants);
+
+    auto w = connected(b, "u/w");
+    const auto src = w->defineTopicAndWait("presence", 1, "id", rune::node::test::charBlob(), rc::Persistence::Transient, {}, {}, 60s);
+    ASSERT_EQ(src.errorCode, 0) << src.detail;
+    const auto view = w->createViewAndWait("pv", "id", 0, rune::node::test::viewPlanBlob("pv", src.topicId, 0), {}, 60s);
+    ASSERT_EQ(view.errorCode, 0) << view.detail;
+    {
+        tv::Prod prod(configFor(b, "u/w"), "presence", src.topicId, rc::Acks::All);
+        for (uint64_t id = 1; id <= 3; ++id) ASSERT_TRUE(prod.put(id, id * 10));
+    }
+    ASSERT_TRUE(tv::awaitRow(*w, view.viewTopicId, 3, {3, 30}));
+
+    // Sum over the workers of the view-memory gauge of namespace slot `slot`.
+    auto viewMem = [&](uint16_t slot) {
+        uint64_t sum = 0;
+        for (int32_t k = 0; k < b.node().workerCountForTest(); ++k)
+            sum += b.node().onWorkerThreadForTest(k, [slot](Worker& wk) { return wk.nsCounterForTest(slot, NsMetric::ViewMemBytes); });
+        return sum;
+    };
+    auto expectCharged = [&](const char* when) {
+        const uint16_t slot = b.node().nsSlotOfForTest(*ns);
+        ASSERT_NE(slot, kNoNsSlot) << when;
+        ASSERT_NE(slot, 0) << when;
+        EXPECT_TRUE(until([&] { return viewMem(slot) > 0; })) << when << ": the table is charged to the source topic's namespace";
+        EXPECT_EQ(viewMem(0), 0u) << when << ": nothing lands on the default namespace";
+    };
+    expectCharged("after the view folded");
+
+    b.restart(false);
+    w = connected(b, "u/w");
+    ASSERT_TRUE(tv::awaitRow(*w, view.viewTopicId, 3, {3, 30})) << "the checkpoint rows are served after the restart";
+    expectCharged("after the restart");
+
+    admin = connected(b, "admin");
+    auto list = admin->listNamespaces();
+    ASSERT_TRUE(list.has_value());
+    rune::protocol::NamespaceLimits l;
+    for (const auto& n : *list) if (n.name == "u") l = n.limits;
+    l.maxViewMemoryBytes = 1;
+    ASSERT_TRUE(admin->setNamespaceLimits("u", l).has_value());
+    EXPECT_TRUE(until([&] { return w->getViewRowAndWait(view.viewTopicId, 3, 0, 10s).status == rc::ViewRowResult::kViewPaused; }))
+        << "the view is paused by the source topic's namespace";
 }
