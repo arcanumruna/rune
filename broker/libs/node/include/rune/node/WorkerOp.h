@@ -220,7 +220,7 @@ struct WorkerOp {
     int64_t correlationId = 0;
 
     // Produce flags / producer-state fields
-    int16_t acks          = 0;    ///< 0=none, 1=all (same as msg.acks)
+    int16_t acks          = 0;    ///< the Produce.acks wire byte: bit 0 All, bit 1 View (same as msg.acks)
     int64_t producerId    = -1;   ///< -1 = legacy (no idempotent tracking)
     int16_t producerEpoch = 0;
     int32_t baseSequence  = 0;

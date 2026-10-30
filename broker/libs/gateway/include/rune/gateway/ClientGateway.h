@@ -505,6 +505,7 @@ public:
     }
     /// Issues #109 / #196 probes: fences issued / the newest acked per worker and ring (0 = op ring, 1 = lifecycle).
     [[nodiscard]] uint64_t enforceFencesIssuedForTest() const noexcept { return enforceFenceSeq_; }
+    [[nodiscard]] uint64_t viewAcksRefusedLegacyForTest() const noexcept { return viewAcksRefusedLegacy_; }
     [[nodiscard]] uint64_t enforceFenceAckedForTest(int32_t worker, int ring) const noexcept {
         if (worker < 0 || worker >= kMaxFenceWorkers) return 0;
         return (ring == 0 ? opFenceAcked_ : lifeFenceAcked_)[static_cast<std::size_t>(worker)];
@@ -2562,6 +2563,7 @@ private:
     static_assert(8 + static_cast<std::size_t>(rune::gateway::LoginFailure::SecurityHalted) < 15 &&
                   15 < rune::node::UnauthLogLimiter::kKinds, "issue #236: limiter kind 15 is free");
     [[nodiscard]] std::size_t unauthSessionsOf_(std::string_view host);   ///< issue #236 (cold: one Connect)
+    uint64_t viewAcksRefusedLegacy_ = 0;   ///< Produce frames with the View bit refused by a gateway without shard mode
     uint64_t controlBatchRefusals_ = 0;   ///< X036: Produce frames refused for carrying a client control batch (rate-limited log)
     static void noteReadCorr_(std::vector<int64_t>& corrs, int64_t corr);
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;

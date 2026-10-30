@@ -4111,7 +4111,13 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //
     //   The log is untouched (no append, no LEO advance) for the retriable-error
     //   path, preserving the "NEVER falsely ack" invariant.
-    const bool acksAll = (msg.acks == 1);
+    // View acks need the worker-side ack path (checked writes, SD10): a gateway without shard mode refuses them.
+    if (pc::acksView(msg.acks) && !shardMode_) [[unlikely]] {
+        ++viewAcksRefusedLegacy_;
+        sendResp(pc::ErrorCode::InvalidRequest, partition, 0);
+        return true;
+    }
+    const bool acksAll = pc::acksAll(msg.acks);
     if (acksAll && !committedMetadataReady_) {
         // Bootstrap window: acks=All cannot be served with majority durability yet.
         // Return NotLeader (retriable) so the client retries after bootstrap.

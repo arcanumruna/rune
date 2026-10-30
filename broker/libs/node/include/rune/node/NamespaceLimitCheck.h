@@ -13,6 +13,7 @@
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogState.h>
 #include <rune/protocol/NamespaceLimits.h>
+#include <rune/protocol/client/DataMessages.h>
 
 #include <cstdint>
 #include <optional>
@@ -65,9 +66,9 @@ struct NsObjectCounts {
     return std::string("namespace limit exceeded: views are not enabled for this namespace");
 }
 
-/// A produce's wire acks byte (0 = Leader/None, 1 = All) against `lowestAcks` (0 none, 1 leader, >= 2 all).
+/// A produce's wire acks byte (bit 0 = All, bit 1 = View) against `lowestAcks` (0 none, 1 leader, >= 2 all).
 [[nodiscard]] constexpr bool nsAcksAllowed(const rune::protocol::NamespaceLimits& l, uint8_t wireAcks) noexcept {
-    return l.lowestAcks < 2 || wireAcks >= 1;
+    return l.lowestAcks < 2 || rune::protocol::client::acksAll(wireAcks);
 }
 
 namespace detail {

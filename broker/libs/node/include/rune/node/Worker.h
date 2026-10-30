@@ -100,6 +100,7 @@
 #include <rune/node/RecordsOpen.h>
 #include <rune/crypto/Aead.h>
 #include <rune/crypto/Cipher.h>
+#include <rune/node/CheckedWriteHook.h>
 #include <rune/node/WriteState.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/replication/ReplicationFrameLimits.h>   // F18 frame limits (maxAcceptableBatchBytes)
@@ -1780,6 +1781,8 @@ public:
     }
     [[nodiscard]] uint64_t typedRejectsForTest() const noexcept { return typedRejects_; }
     [[nodiscard]] uint64_t typedVersionAheadForTest() const noexcept { return typedVersionAhead_; }
+    [[nodiscard]] uint64_t hookChecksForTest() const noexcept { return hookChecks_; }
+    [[nodiscard]] uint64_t hookRefusalsForTest(HookRefusal why) const noexcept { return hookRefusals_[std::to_underlying(why)]; }
 
     // -----------------------------------------------------------------------
     // rune::consensus::Agent interface
@@ -4103,7 +4106,8 @@ private:
         f.minIsr         = op.minIsr();
         f.producerEpoch  = op.producerEpoch();
         auto* rep        = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
-        f.acksAll        = (op.deferAck() & kOpFlagDeferAck) != 0 && rep != nullptr;
+        f.acks           = static_cast<uint8_t>((static_cast<uint8_t>(op.acks()) & rune::protocol::client::kAcksWireView) |
+                                                (((op.deferAck() & kOpFlagDeferAck) != 0 && rep != nullptr) ? rune::protocol::client::kAcksWireAll : 0));
         f.crcValidated   = (op.deferAck() & kOpFlagCrcValidated) != 0;
         f.durabilityTier = op.durabilityTier();
         f.enqueuedAtNs   = op.enqueuedAtNs();
@@ -6111,6 +6115,8 @@ private:
     std::unordered_map<int32_t, std::unique_ptr<TopicWriteSpec>> writeSpecs_;
     uint64_t typedRejects_      = 0;   // batches refused SchemaValidationFailed by checkTypedBatch
     uint64_t typedVersionAhead_ = 0;   // batches answered NotLeader: a record's version has not been installed here yet
+    uint64_t hookChecks_        = 0;   // CheckedWriteHook::check ran
+    std::array<uint64_t, std::to_underlying(HookRefusal::Count_)> hookRefusals_{};   // by reason
 
     // Phase 2c: filtered subscriptions (worker thread only).  filterSchemas_ is never erased (topic ids are never
     // reused; the cost is bounded by the typed topics), so pointers into it are stable.  A group is identified by
@@ -8489,10 +8495,9 @@ private:
     //
     // E5.1.3 review fixes applied here:
     //   #2: All error-code literals replaced with pc::ErrorCode enum values.
-    //   #3: acksAll derivation.  The Produce wire acks byte is two-valued:
-    //       0 = Leader/None (immediate ack), 1 = All (deferred until the ISR HW);
-    //       Produce::decode rejects any other value (no-hang wave), so acks != 0
-    //       and the gateway's acks == 1 agree.
+    //   #3: acks derivation.  The Produce wire acks byte is bit 0 = All (deferred
+    //       until the ISR HW), bit 1 = View; Produce::decode rejects any other bit
+    //       (no-hang wave), and the gateway reads the same bits (pc::acksAll).
     // -----------------------------------------------------------------------
     // `directAck` (D8d): the admission (SessionAckSink::admitDirect) of this
     // frame — carried by its answer (exactly one: produceCore_ answers every
@@ -8746,9 +8751,6 @@ private:
         }
         if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed from here on
 
-        // E5.1.3 review fix #3: acksAll = (acks != 0).
-        // The Produce wire acks byte is 0 (Leader/None) or 1 (All); decode
-        // rejects anything else (answered InvalidRequest above).
         ProduceFields f;
         f.sessionId     = msg.sessionId;
         f.correlationId = msg.correlationId;
@@ -8758,7 +8760,7 @@ private:
         f.baseSequence  = msg.baseSequence;
         f.producerEpoch = msg.producerEpoch;
         f.durabilityTier = replica ? replica->durabilityTier() : uint8_t{1};
-        f.acksAll       = (msg.acks != 0);
+        f.acks          = msg.acks;
         f.fromOp        = false;   // the poll budget (ingressPollBudget_) reserved its answer
         f.directAck     = directAck;
         return produceCore_(f, log, replica, msg.recordBatch, nowNs);
@@ -8914,11 +8916,13 @@ private:
         int32_t minIsr        = 0;      ///< admission policy override (0 = the replica's)
         int16_t producerEpoch = 0;
         uint8_t durabilityTier = 1;     ///< 2 = Strict (ack after fsync)
-        bool    acksAll       = false;
+        uint8_t acks          = 0;      ///< the Produce.acks wire byte: bit 0 All, bit 1 View
         bool    fromOp        = false;  ///< op-ring produce: reserve a parked answer here
         bool    crcValidated  = false;  ///< the op producer validated this batch's CRC (M-3)
         uint8_t directAck     = 0;      ///< D8d: direct-budget admission (worker ingress only)
         int64_t enqueuedAtNs  = 0;      ///< gateway enqueue time (op path; latency attribution)
+        [[nodiscard]] bool acksAll() const noexcept { return rune::protocol::client::acksAll(acks); }
+        [[nodiscard]] bool acksView() const noexcept { return rune::protocol::client::acksView(acks); }
     };
 
     enum class RecordWalk : uint8_t { Ok, TooLong, Malformed };
@@ -8982,6 +8986,17 @@ private:
         }
         if (pos != end) return RecordWalk::Malformed;
         return tooLong ? RecordWalk::TooLong : RecordWalk::Ok;
+    }
+
+    [[nodiscard]] bool checkedWritesEnabled_() const noexcept { return clusterFeatureLevel_ >= rune::replication::MetadataFeature::kCheckedWrites; }
+
+    /// Counts a write refused by the checked-writes frame checks or the hook (first, then every 1024th is logged).
+    [[gnu::cold]] [[gnu::noinline]] void noteHookRefusal_(HookRefusal why, const ProduceFields& f) {
+        if (why == HookRefusal::ValidationFailed) ++typedRejects_;
+        else if (why == HookRefusal::VersionAhead) ++typedVersionAhead_;
+        if (hookRefusals_[std::to_underlying(why)]++ % 1024 == 0)
+            spdlog::warn("Worker {}: produce refused (reason {}) topicId={} partition={}, total {}", workerId_, std::to_underlying(why),
+                         f.topicId, f.partition, hookRefusals_[std::to_underlying(why)]);
     }
 
     int produceCore_(const ProduceFields& f, rune::storage::Log* log,
@@ -9150,22 +9165,29 @@ private:
             return 1;
         }
 
-        // Checked writes: every typed partition validates every batch (an untyped one has no write state).  A record
-        // whose schema version has not reached this worker yet is retriable (NotLeader), anything else is final.
-        if (const PartitionWriteState* ws = writeOf_(replica); ws != nullptr) [[unlikely]] {
-            const TypedCheck verdict = checkTypedBatch(*ws->spec, rbSpan, clusterFeatureLevel_);
-            if (verdict != TypedCheck::Accept) {
-                const bool ahead = verdict == TypedCheck::VersionAhead;
-                ++(ahead ? typedVersionAhead_ : typedRejects_);
-                spdlog::debug("Worker {}: typed batch refused for topicId={} partition={} ({})", workerId_, f.topicId, f.partition,
-                              ahead ? "schema version not installed yet" : "validation failed");
-                ret.errorCode = static_cast<int16_t>(ahead ? pc::ErrorCode::NotLeader : pc::ErrorCode::SchemaValidationFailed);
-                enqueueReturn_(ret);
-                return 1;
-            }
+        // Checked writes frame checks, before any append and for every topic, typed or not.  A transactional batch
+        // ignores the View bit (its verdicts come with the commit vote); View needs worker-side acks, the feature level
+        // and a replica to fold from.
+        const bool txn = rbSpan.size() >= static_cast<std::size_t>(rune::protocol::batch::kAttributesOffset) + 2 &&
+                         (rune::protocol::detail::getLE16(rbSpan.data() + rune::protocol::batch::kAttributesOffset) & kTxnAttrBit) != 0;
+        const uint8_t acks = txn ? static_cast<uint8_t>(f.acks & ~pc::kAcksWireView) : f.acks;
+        PartitionWriteState* const ws = writeOf_(replica);
+        HookRefusal frameRefusal = HookRefusal::None;
+        if (pc::acksView(acks)) [[unlikely]] {
+            if (!workerSideAcks()) frameRefusal = HookRefusal::LegacyMode;
+            else if (!checkedWritesEnabled_()) frameRefusal = HookRefusal::LevelTooLow;
+            else if (replica == nullptr) frameRefusal = HookRefusal::ViewWithoutReplica;
+        }
+        if (frameRefusal == HookRefusal::None && txn && ws != nullptr && topicHookFactsOf(*ws).constrainedSource) [[unlikely]]
+            frameRefusal = HookRefusal::TxnOnConstrainedSource;
+        if (frameRefusal != HookRefusal::None) [[unlikely]] {
+            noteHookRefusal_(frameRefusal, f);
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+            enqueueReturn_(ret);
+            return 1;
         }
 
-        const bool acksAll = f.acksAll;
+        const bool acksAll = pc::acksAll(acks);
 
         // ISR size for the min-ISR gate.
         const int isrSize = replica ? static_cast<int>(replica->isr().size()) : 0;
@@ -9190,7 +9212,7 @@ private:
         // Op-ring produce (gateway-received, Task 13): its parked answer was not
         // covered by a poll budget — reserve it here BEFORE the append (G-A6, the
         // F15 S2 R-4c rule); no slot → retriable NotLeader, log untouched.
-        if (f.fromOp && (acksAll || asyncStrict) && !ackReservationAvailable_()) [[unlikely]] {
+        if (f.fromOp && (acksAll || pc::acksView(acks) || asyncStrict) && !ackReservationAvailable_()) [[unlikely]] {
             ++acksAllRefusedNoReservation_;
             if (!owedCapAllows_()) noteOwedCapThrottle_("gateway-routed produce", 2);
             if (acksAllRefusedNoReservation_ == 1 || (acksAllRefusedNoReservation_ & 1023u) == 0)
@@ -9222,7 +9244,26 @@ private:
         // validated these exact bytes (the gateway, right after ensureValid).
         const bool crcPreverified = f.fromOp && f.crcValidated;
         rune::storage::ProduceOutcome outcome;
-        if (log != nullptr) {
+        if (ws != nullptr) [[unlikely]] {
+            const WriteFacts facts{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = false,
+                                   .importGranted = false, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_()};
+            CheckedWriteHook hook(*ws, facts, {});
+            if (log != nullptr) {
+                outcome = rune::storage::handleProduceBatch(
+                    rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
+                    f.producerId, f.producerEpoch, f.baseSequence,
+                    *log, psm_, acksAll, isrSize, minIsr, helperTier, crcPreverified, hook);
+            } else {
+                replica->prepareTransientAppend();
+                outcome = rune::storage::handleProduceBatch(
+                    rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
+                    f.producerId, f.producerEpoch, f.baseSequence,
+                    *mem, psm_, acksAll, isrSize, minIsr, helperTier, crcPreverified, hook);
+                if (outcome.logFull) [[unlikely]] noteTransientFull_(f.topicId, f.partition, outcome.error);
+            }
+            if (hook.checked()) ++hookChecks_;
+            if (hook.refusal() != HookRefusal::None) [[unlikely]] noteHookRefusal_(hook.refusal(), f);
+        } else if (log != nullptr) {
             outcome = rune::storage::handleProduceBatch(
                 rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
                 f.producerId, f.producerEpoch, f.baseSequence,

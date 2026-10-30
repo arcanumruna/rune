@@ -1329,6 +1329,12 @@ if(BUILD_TESTING)
             target_link_libraries(rune_shard_worker_ack_tests PRIVATE rune_node rune_replication rune_codec aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_shard_worker_ack_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # Checked writes Part 03: the write hook and the View acks on a real Worker over an IPC driver.
+            add_executable(rune_checked_writes_ack_tests tests/node/CheckedWritesWorkerHookTest.cpp)
+            target_include_directories(rune_checked_writes_ack_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_checked_writes_ack_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_checked_writes_ack_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # Authentication Task 13 (spec §6, D30): the shard worker's WRITE grants, a REAL invoker driver over aeron:ipc.
             add_executable(rune_worker_write_grants_tests tests/node/WorkerWriteGrantsTest.cpp)
             target_link_libraries(rune_worker_write_grants_tests PRIVATE rune_node rune_replication rune_codec aeron::aeron GTest::gtest_main)
