@@ -737,3 +737,105 @@ TEST(CheckedWritesBrokerRegression, AllViewProduceAcrossALeaderCrashThreeNodesRe
     }
     reader->close();
 }
+
+// ===========================================================================================================
+// Part 04: a verdict source on a real broker.  TestReject (tag 9) is installed on the partition's worker.
+// ===========================================================================================================
+#include "support/CheckedWritesRig.h"
+
+#include <rune/view/PlanCompiler.h>
+#include <rune/view/Verdict.h>
+
+namespace {
+
+std::string verdictValue(uint64_t id, int64_t v, uint16_t tag) {
+    std::string val;
+    const auto le16 = [&](uint16_t x) { val.push_back(static_cast<char>(x)); val.push_back(static_cast<char>(x >> 8)); };
+    le16(18); le16(1);
+    for (int i = 0; i < 8; ++i) val.push_back(static_cast<char>(id >> (8 * i)));
+    for (int i = 0; i < 8; ++i) val.push_back(static_cast<char>(static_cast<uint64_t>(v) >> (8 * i)));
+    le16(tag);
+    return val;
+}
+
+/// A typed {id, v, tag} topic `vt` (one partition) with TagEquals{9} (object 7) installed on the worker that serves it.
+int32_t defineVerdictSource(OneBroker& b) {
+    rc::Client& c = *b.connectClient();
+    const auto t  = c.defineTopicAndWait("vt", 1, "id", rune::codec::serialize(cw::verdictSourceDescriptor()), rc::Persistence::Disk, {}, {}, 60s);
+    EXPECT_EQ(t.errorCode, 0) << t.detail;
+    awaitLevel(b.node());
+    const int32_t w = rune::metadata::ShardRouter(b.node().workerCountForTest()).workerForPartition(t.topicId, 0);
+    const int32_t src = t.topicId;
+    b.node().onWorkerThreadForTest(w, [src](Worker& wk) {
+        const auto desc = cw::verdictSourceDescriptor();
+        rune::view::ViewPlan v;
+        v.viewName = "vt_rej"; v.key = "id"; v.sources = {{src, "id"}};
+        v.output = {{"id", rune::codec::PrimType::UInt64, 0, "id", rune::view::MergeRule::Replace}};
+        v.persistence = 1;
+        const rune::codec::Descriptor* srcs[] = {&desc};
+        auto comp = rune::view::compileView(v, srcs, 0x40000701);
+        EXPECT_TRUE(comp.has_value());
+        TestRejectRule rule;
+        rule.mode = TestRejectRule::Mode::TagEquals;
+        rule.tag = 9;
+        wk.viewSet()->installTestVerdictViewForTest(comp->plan, comp->rowLayout, desc, false, 7, rule);
+        return 0;
+    });
+    return src;
+}
+
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegression) {
+    OneBroker b("cw-verdict", OneBroker::Runtime::Shard);
+    const int32_t src = defineVerdictSource(b);
+    std::this_thread::sleep_for(500ms);   // the set change is logged before the records it is to judge
+    Sender s(b.clientConfig(), "vt", src, 1, kAllView);
+    std::vector<uint64_t> toks;
+    for (uint64_t id = 1; id <= 8; ++id) {
+        const std::string v = verdictValue(id, 1, id == 3 ? 9 : 1);
+        rc::SendResult r = rc::SendResult::BackPressured;
+        const uint64_t tok = s.next++;
+        while (r == rc::SendResult::BackPressured)
+            r = s.prod->trySend(*s.topic, rc::Key(id), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()), *s.cq, tok);
+        ASSERT_EQ(r, rc::SendResult::Ok);
+        toks.push_back(tok);
+    }
+    s.prod->flush();
+    for (std::size_t i = 0; i < toks.size(); ++i) {
+        const auto c = s.await(toks[i], 15s);
+        ASSERT_TRUE(c) << "record " << i + 1;
+        if (i == 2) {
+            EXPECT_EQ(c->status, rc::OpStatus::BrokerError);
+            EXPECT_EQ(c->errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation));
+            EXPECT_EQ(rc::constraintIdOf(*c), rune::view::constraintIdOf(7, 1));
+        } else {
+            EXPECT_EQ(c->status, rc::OpStatus::Ok) << "record " << i + 1;
+        }
+    }
+    const std::string v9 = verdictValue(100, 1, 1);
+    rc::SendResult r = rc::SendResult::BackPressured;
+    const uint64_t tok = s.next++;
+    while (r == rc::SendResult::BackPressured)
+        r = s.prod->trySend(*s.topic, rc::Key(uint64_t{100}), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v9.data()), v9.size()), *s.cq, tok);
+    s.prod->flush();
+    EXPECT_TRUE(isOk(s.await(tok, 15s))) << "the next batch is acked normally";
+}
+
+TEST(CheckedWritesBrokerRegression, PlainWritersOnAVerdictSourceKeepTodaysAcksShardRegression) {
+    OneBroker b("cw-verdict-old", OneBroker::Runtime::Shard);
+    const int32_t src = defineVerdictSource(b);
+    std::this_thread::sleep_for(500ms);
+    for (const rc::Acks acks : {rc::Acks::Leader, rc::Acks::All}) {
+        Sender s(b.clientConfig(), "vt", src, 1, acks);
+        for (uint64_t id = 1; id <= 4; ++id) {
+            const std::string v = verdictValue(id, 1, id % 2 == 0 ? 9 : 1);
+            rc::SendResult r = rc::SendResult::BackPressured;
+            const uint64_t tok = s.next++;
+            while (r == rc::SendResult::BackPressured)
+                r = s.prod->trySend(*s.topic, rc::Key(id), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()), *s.cq, tok);
+            s.prod->flush();
+            EXPECT_TRUE(isOk(s.await(tok, 15s))) << "acks " << static_cast<int>(acks) << " record " << id << ": no verdict reaches a writer that did not ask";
+        }
+    }
+}
