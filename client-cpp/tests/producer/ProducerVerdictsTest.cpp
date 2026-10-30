@@ -2,14 +2,17 @@
 // as it was judged; a retry outside the broker's window is VerdictUnknown for the whole batch.  Bare ProducerImpl: frames
 // are captured from the sink and the broker's answers are injected.
 #include <rune/client/Client.h>
+#include <rune/client/agent/ClientAgent.h>
 #include <rune/client/Key.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <vector>
@@ -106,6 +109,71 @@ TEST(ProducerVerdicts, CoalescedBatchWithOneBadRecord) {
         }
     }
     EXPECT_FALSE(r.impl.hasInFlight());
+}
+
+TEST(ProducerVerdicts, Tier2BatchCarriesTheFirstRejection) {
+    Rig r;
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    for (int i = 0; i < 5; ++i) b.append(std::string_view("k"), std::string_view("v"), 1000);
+    const auto bytes = b.build();
+    ASSERT_EQ(r.impl.submitTier2Bytes(1, 0, ackhandle::forCq(0, rc::Token(1)), 5, bytes), rc::producer::RejectReason::None);
+    for (int i = 0; i < 1000 && r.corrs.empty(); ++i) {
+        while (r.impl.drainRing(kNow) != 0) {}
+        (void)r.impl.flushBatches(kNow, 42, r.sink);
+    }
+    ASSERT_EQ(r.corrs.size(), 1u);
+    const auto t = Rig::trailer({2, 4});   // two rejected records: the batch reports the first
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);
+    ASSERT_EQ(r.cq.times[1], 1) << "one completion for the whole batch";
+    const auto& c = r.cq.done[1];
+    EXPECT_EQ(c.op, rc::OpKind::Tier2Batch);
+    EXPECT_EQ(c.aux, 5);
+    EXPECT_EQ(c.status, OpStatus::BrokerError);
+    EXPECT_EQ(c.errorCode, kViolation);
+    EXPECT_EQ(rc::constraintIdOf(c), kCid);
+    EXPECT_FALSE(r.impl.hasInFlight());
+}
+
+TEST(ProducerVerdicts, VerdictArenaGrowsOnceAndIsCounted) {
+    namespace rca = rune::client::agent;
+    rca::AgentConfig cfg;
+    cfg.transport.ingressChannel = "aeron:udp?endpoint=127.0.0.1:1";
+    cfg.transport.ingressStreamId = 1;
+    cfg.transport.egressChannel = "aeron:udp?endpoint=127.0.0.1:2";
+    cfg.transport.egressStreamId = 2;
+    cfg.session.egressChannel = cfg.transport.egressChannel;
+    cfg.session.egressStreamId = 2;
+    rca::ClientAgent a(cfg);
+    const auto deliver = [&](int64_t corr, uint16_t n) {
+        std::vector<uint8_t> entries(8u * n, 0);
+        for (uint16_t i = 0; i < n; ++i) { entries[8u * i] = uint8_t(i); entries[8u * i + 1] = uint8_t(i >> 8); entries[8u * i + 2] = uint8_t(kViolation); }
+        rpc::ProduceResponse m;
+        m.sessionId = 1; m.correlationId = corr; m.baseOffset = 5; m.hasVerdicts = true; m.verdictCount = n;
+        m.verdictBytes = entries;
+        std::vector<uint8_t> f(m.encodedSize(rpc::kClientVersionCheckedWrites));
+        EXPECT_EQ(m.encodeFor(f.data(), rpc::kClientVersionCheckedWrites), f.size());
+        a.dispatchEgressFrameForTest(kNow, f.data(), f.size());
+    };
+    EXPECT_EQ(a.verdictArenaGrowths(), 0u);
+    deliver(1, 100);                       // the first trailer allocates
+    ASSERT_EQ(a.produceAcks().size(), 1u);
+    EXPECT_EQ(a.verdictBytes(a.produceAcks()[0]).size(), 800u);
+    EXPECT_EQ(a.verdictArenaGrowths(), 1u);
+    a.clearProduceAcks();
+    deliver(2, 60);                        // a cycle of the same total reuses the capacity
+    deliver(3, 40);
+    EXPECT_EQ(a.produceAcks().size(), 2u);
+    EXPECT_EQ(a.verdictArenaGrowths(), 1u);
+    a.clearProduceAcks();
+    deliver(4, 400);                       // only a larger cycle grows it again
+    EXPECT_EQ(a.verdictArenaGrowths(), 2u);
+    a.clearProduceAcks();
+    deliver(5, 400);
+    deliver(6, 1);
+    EXPECT_EQ(a.verdictArenaGrowths(), 3u) << "a cycle above the largest so far";
+    a.clearProduceAcks();
+    deliver(7, 401);
+    EXPECT_EQ(a.verdictArenaGrowths(), 3u);
 }
 
 TEST(ProducerVerdicts, ReplayedVerdictsCompleteEachRecordAsTheOriginal) {
