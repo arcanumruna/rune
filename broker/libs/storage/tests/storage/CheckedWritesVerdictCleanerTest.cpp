@@ -206,6 +206,43 @@ TEST(CheckedWritesVerdictCleaner, RejectedLatestValueNeverWins) {
     }
 }
 
+// The two single-pass rewrite engines (one segment, one merged group) drop a rejected record as the range engine does.
+TEST(CheckedWritesVerdictCleaner, RejectedRecordsAreDroppedInBothRewriteEngines) {
+    for (const bool group : {false, true}) {
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            change(log, 0, true);
+            for (int64_t o = 1; o < 3; ++o) data(log, o, "pad" + std::to_string(o), "p");
+            data(log, 3, "5", "accepted");
+            for (int64_t o = 4; o < 7; ++o) data(log, o, "pad" + std::to_string(o), "p");
+            data(log, 7, "5", "rejected");
+            data(log, 8, "pad8", "p");
+            marker(log, 9, 1, 9, {7});
+            for (int64_t o = 10; o < 13; ++o) data(log, o, "tail" + std::to_string(o), "t");
+            auto bases = log.segmentBaseOffsets();
+            const int64_t active = bases.back();
+            bases.pop_back();
+            LogCleaner cleaner;
+            cleaner.setVerdictBounds(10, 10);
+            if (group) {
+                rune::storage::SegmentGroup g;
+                g.bases = {7, 8};
+                g.combinedBytes = 1 << 20;
+                (void)cleaner.produceCleanedGroupBounded(log.dir(), bases, g, active, 0, 0, 1000, 1 << 20, nullptr, 1'000'000);
+            } else {
+                (void)cleaner.produceCleanedFileBounded(log.dir(), bases, /*segBase=*/7, active, 0, 0, 1000, 1 << 20, nullptr, 1'000'000);
+            }
+            log.reloadSegments();
+            const auto offs = dataOffsets(log);
+            EXPECT_TRUE(offs.count(3)) << (group ? "group" : "file") << ": the accepted value stays";
+            EXPECT_FALSE(offs.count(7)) << (group ? "group" : "file") << ": the rejected one is dropped";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
 TEST(CheckedWritesVerdictCleanerRegression, NeverCleansAtOrAboveWRegression) {
     const auto dir = tempDir();
     {

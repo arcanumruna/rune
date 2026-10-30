@@ -38,6 +38,7 @@
 #include <vector>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <rune/storage/RejectedOffsetIndex.h>
 
 using namespace rune::storage;
 using namespace rune::protocol;
@@ -1261,4 +1262,15 @@ TEST(SegmentLifecycleHotpathRegression, LazilyMappedSealedSegmentsAreCappedRegre
     ASSERT_FALSE(log.readView(last, 4096).empty());
     EXPECT_EQ(log.sealedLazyRemapsForTest(), remaps) << "a still-mapped sealed segment was remapped";
     fs::remove_all(d);
+}
+
+// The rejected-offset index is filled on the owner thread: ascending adds into a reserved index allocate nothing.
+TEST(CheckedWritesRejectedIndex, SteadyAddAllocatesNothing) {
+    RejectedOffsetIndex idx;
+    idx.reserve(1024);
+    tAllocs = 0;
+    tCount = true;
+    for (int64_t o = 0; o < 1000; ++o) EXPECT_TRUE(idx.add(o * 3, 55, 1));
+    tCount = false;
+    EXPECT_EQ(tAllocs, 0u);
 }
