@@ -126,6 +126,23 @@ TEST(CheckedWritesVerdictWorkerRegression, LeaderWithoutTheInstallWaitsRegressio
     EXPECT_FALSE(r.hasRow(kProj, 3));
 }
 
+TEST(CheckedWritesVerdictWorkerRegression, FullIndexGrowsAndResumesRegression) {
+    VerdictRig r;
+    r.typed();
+    r.passes(20);
+    const_cast<PartitionWriteState*>(r.writeState())->rejected.reserve(8);
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    std::vector<Rec> recs;
+    for (uint64_t i = 1; i <= 14; ++i) recs.push_back({i, int64_t(i), 9});
+    ASSERT_EQ(r.produce(recs), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    EXPECT_GE(r.vs->verdictSource(VerdictRig::kSrc, 0)->judgedThrough(), r.dataEnd());
+    EXPECT_EQ(r.stats()->verdictStalls, 1u) << "the index filled once, grew once and the judge resumed";
+    EXPECT_EQ(r.writeState()->rejected.size(), 14u);
+    EXPECT_GT(r.writeState()->rejected.capacity(), 8u);
+}
+
 TEST(CheckedWritesVerdictWorker, DemotePromoteKeepsOwnVerdicts) {
     VerdictRig r;
     r.typed();

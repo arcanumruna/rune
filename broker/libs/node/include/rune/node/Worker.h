@@ -7168,6 +7168,7 @@ private:
     // Part 04 (P4-14): tell the cleaner how far the verdicts are durable.  The marker end is published before the bound.
     void publishVerdictCleanerBounds_() noexcept {
         for (auto& sl : rcSlots_) {
+            if (sl.write && sl.write->growOwed) [[unlikely]] growVerdictIndex_(*sl.write);
             if (!sl.write || sl.write->constraintSets.size() == 0 || !sl.replica->isDiskBacked()) continue;
             const PartitionWriteState& w = *sl.write;
             if (sl.replica->role() != rune::replication::Role::Leader || !sl.rc->ready()) continue;
@@ -7182,14 +7183,17 @@ private:
             sl.verdictEndPublished = end;
         }
     }
-    // Part 04 (P4-11): a verdict index that crosses 75 % doubles, up to 2^24 entries; cold, every 1,024 passes.
+    // Part 04 (P4-11): a verdict index that crosses 75 % doubles, up to 2^24 entries; cold.  A judge stalled on a full index resumes.
+    static void growVerdictIndex_(PartitionWriteState& w) {
+        auto& idx = w.rejected;
+        w.growOwed = false;
+        if (idx.capacity() != 0 && idx.size() * 4 >= idx.capacity() * 3 && idx.capacity() < (std::size_t{1} << 24))
+            idx.grow(std::min<std::size_t>(idx.capacity() * 2, std::size_t{1} << 24));
+        if (w.verdicts != nullptr) w.verdicts->unstall();
+    }
     void maintainVerdictIndexes_() {
-        for (auto& sl : rcSlots_) {
-            if (!sl.write) continue;
-            auto& idx = sl.write->rejected;
-            if (idx.capacity() != 0 && idx.size() * 4 >= idx.capacity() * 3 && idx.capacity() < (std::size_t{1} << 24))
-                idx.grow(std::min<std::size_t>(idx.capacity() * 2, std::size_t{1} << 24));
-        }
+        for (auto& sl : rcSlots_)
+            if (sl.write) growVerdictIndex_(*sl.write);
     }
     // D3b: publish the partition's first unstable offset to the cleaner (only on
     // change).  Called on every RC transition: the per-pass driver (Ready / reset)

@@ -5,6 +5,8 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cstring>
 
@@ -117,6 +119,7 @@ void VerdictSource::bindLeader(rune::replication::PartitionReplica* replica, uin
     generation_      = leadershipGeneration;
     needsActivation_ = true;
     stalled_         = false;
+    stallReason_     = StallReason::None;
 }
 
 int64_t VerdictSource::extendOverEmptySets_(int64_t offset) const noexcept {
@@ -143,9 +146,13 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     recomputeCap_();
 }
 
-void VerdictSource::stall_() noexcept {
-    if (!stalled_) ++stats_.verdictStalls;
-    stalled_ = true;
+void VerdictSource::stall_(StallReason reason) noexcept {
+    if (stalled_) return;
+    ++stats_.verdictStalls;
+    stalled_     = true;
+    stallReason_ = reason;
+    spdlog::error("verdict judge stalled: topic {} partition {}: {}", srcTopicId_, partition_,
+                  reason == StallReason::Full ? "rejected index full" : reason == StallReason::OutOfOrder ? "rejection out of order" : "view capacity exhausted");
 }
 
 rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept {
@@ -200,7 +207,7 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
     ++judgeCalls_;
     for (const std::size_t i : active_) {
         if (prepare_(members_[i], rec) == rune::view::PrepareStatus::CapacityExhausted) {
-            stall_();
+            stall_(StallReason::Capacity);
             return {};
         }
     }
@@ -209,9 +216,10 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
         const Verdict v{static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation),
                         rune::view::constraintIdOf(members_[i].objectId, 1)};
         if (!state_->rejected.add(rec.offset, v.code, v.constraintId)) {
-            stall_();
+            stall_(state_->rejected.size() >= state_->rejected.capacity() ? StallReason::Full : StallReason::OutOfOrder);
             return {};
         }
+        if (state_->rejected.size() * 4 >= state_->rejected.capacity() * 3) state_->growOwed = true;
         ++stats_.rejectionsConstraint;
         ++rejectedThisPass_;
         auto* pc = std::find_if(stats_.perConstraint.begin(), stats_.perConstraint.begin() + stats_.perConstraintCount,

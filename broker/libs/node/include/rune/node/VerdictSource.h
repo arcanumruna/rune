@@ -50,6 +50,10 @@ public:
 
     [[nodiscard]] int64_t judgedThrough() const noexcept { return judgeCursor_; }
     [[nodiscard]] bool stalled() const noexcept { return stalled_; }
+    /// Cold, the owner after growing the index: resumes a judge that stalled on a full index.  The other stalls stay.
+    void unstall() noexcept {
+        if (stallReason_ == StallReason::Full && state_ != nullptr && state_->rejected.size() < state_->rejected.capacity()) stalled_ = false;
+    }
     [[nodiscard]] bool waitingForInstall() const noexcept { return waitingForInstall_; }
 
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);
@@ -96,7 +100,8 @@ private:
     bool   reindex_();
     void   recomputeCap_() noexcept;
     void   discardCheckpointAhead_(Member& m);
-    void   stall_() noexcept;
+    enum class StallReason : uint8_t { None, Full, OutOfOrder, Capacity };
+    void   stall_(StallReason reason) noexcept;
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
@@ -117,6 +122,7 @@ private:
     int64_t                     logStart_ = 0;
     bool                        needsActivation_ = false;
     bool                        stalled_ = false, waitingForInstall_ = false, held_ = false;
+    StallReason                 stallReason_ = StallReason::None;
     int64_t                     judgeCursor_ = 0, emitFrom_ = 0, setFrom_ = 0;
     int64_t                     checkpointCap_ = INT64_MAX;
     int64_t                     intervalNs_ = 100'000'000, lastMarkerNs_ = 0;
