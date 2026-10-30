@@ -620,6 +620,13 @@ struct WorkerReturn {
     // Worker-local only: NOT encoded, like gatewayCredit.
     uint8_t directAck     = 0;
 
+    // Checked writes (client 17 acks): the key a key-0 create was assigned (0 = none) and the verdict trailer of a View ack
+    // (hasVerdicts with verdictCount entries at verdictRun in the worker's arena).  Worker-local only: NOT encoded.
+    uint64_t assignedBase  = 0;
+    uint32_t verdictRun    = 0;
+    uint16_t verdictCount  = 0;
+    uint8_t  hasVerdicts   = 0;
+
     // Non-owning pointer to the replica.  Task 10 round 4: the runtime never
     // dereferences it — it refers to the replica by (targetReplicaId,
     // incarnation), echoed from the op, and resolves through the registry.

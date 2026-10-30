@@ -98,6 +98,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <bit>
 #include <cstdint>
 #include <limits>
@@ -110,6 +111,8 @@
 #include <variant>
 
 namespace rune::node {
+
+inline constexpr uint32_t kNoVerdictRun = 0xFFFF'FFFFu;
 
 struct AckEntry {
     int64_t sessionId     = 0;
@@ -131,6 +134,12 @@ struct AckEntry {
     /// D6: with errorCode == UnknownProducerId, the partition's log start
     /// (ProduceResponse.logStartOffset); -1 = not carried.
     int64_t logStartOffset = -1;
+    /// Client 17 (checked writes): the key a key-0 create was assigned (0 = none), and the verdict trailer of a View ack
+    /// (verdictCount entries at verdictRun in the worker's arena; kNoVerdictRun = none).  A session below 17 never sees them.
+    uint64_t assignedBase  = 0;
+    uint32_t verdictRun    = kNoVerdictRun;
+    uint16_t verdictCount  = 0;
+    uint8_t  hasVerdicts   = 0;
 };
 
 enum class PubFind : uint8_t { Pending, Ready, Error };
@@ -511,7 +520,7 @@ private:
                         // 19/23) — ++*sendSeq happens inside sealRecordsFrame,
                         // so acks and Records draw from one monotonic
                         // sequence under the one b2c key, never two.
-                        const std::size_t plainLen = rune::protocol::client::ProduceResponse::encodedSizeFor(ver);
+                        const std::size_t plainLen = rune::protocol::client::ProduceResponse::encodedSizeFor(ver, a.hasVerdicts != 0, a.verdictCount);
                         encode_(a, ver, ackPlainScratch_.data());
                         const std::size_t n = sealRecordsFrame(*sealCtx, ackPlainScratch_.data(), plainLen,
                                                                ackSealedScratch_.data(), ackSealedScratch_.size());
@@ -533,7 +542,7 @@ private:
                         pos = policy_.claim(r->pub, n,
                                             [&](uint8_t* dst) { std::memcpy(dst, ackSealedScratch_.data(), n); });
                     } else {
-                        pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver),
+                        pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver, a.hasVerdicts != 0, a.verdictCount),
                                             [&](uint8_t* dst) { encode_(a, ver, dst); });
                     }
                     if (pos > 0) [[likely]] {
@@ -1261,6 +1270,11 @@ private:
         r.partition      = a.partition;
         r.baseOffset     = a.baseOffset;
         r.logStartOffset = a.logStartOffset;
+        // Client 17: encodeFor writes these only for a session at 17 or later.  The verdict arena is Part 04's.
+        assert(a.verdictCount == 0);
+        r.assignedBase   = a.assignedBase;
+        r.hasVerdicts    = a.hasVerdicts != 0;
+        r.verdictCount   = a.verdictCount;
         // Task 14 (D28): a Throttled retry-after only to a v14+ client (encodeFor answers it InvalidRequest), as the
         // gateway path does.
         if (a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled) &&

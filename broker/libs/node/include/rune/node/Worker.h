@@ -420,6 +420,7 @@ public:
                                         std::to_string(kMaxOwedReturnsCeiling) + "]");
         maxOwedReturns_ = n;
         pendingAcksAll_.reserve(maxOwedReturns_);
+        pendingAcksView_.reserve(maxOwedReturns_);
         durablePending_.reserve(maxOwedReturns_);
     }
     [[nodiscard]] std::size_t maxOwedReturns() const noexcept { return maxOwedReturns_; }
@@ -627,6 +628,7 @@ public:
         dirtyThisCycle_.reserve(kDirtySetReserve);
         roundMembers_.reserve(pow2AtLeast_(ioSubmitDepth < 2 ? 2 : ioSubmitDepth));   // A10: members <= io depth
         pendingAcksAll_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
+        pendingAcksView_.reserve(kMaxOwedReturns);
         subs_.reserve(kSubsReserve);
         writeSpecs_.reserve(kWriteSpecsReserve);
         egressScratch_.resize(kEgressScratchSize);
@@ -1930,6 +1932,7 @@ public:
                 work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
                 work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
             }
+            work += flushOwedAcksView_(nowNs);   // a worker without views still releases and times out View waiters
             if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
             work += serveHeldPushReads_();
         }
@@ -2064,6 +2067,7 @@ private:
             work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
             work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
         }
+        work += flushOwedAcksView_(nowNs);       // a worker without views still releases and times out View waiters
         if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
         work += serveHeldPushReads_();
         // 4b. background disk work → io backend, never an inline fsync
@@ -2229,6 +2233,10 @@ private:
         // the gateway path; the sink drops it for a client below v14.
         else if (ret.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled))
             a.logStartOffset = ret.lastOffset;
+        a.assignedBase = ret.assignedBase;
+        a.hasVerdicts  = ret.hasVerdicts;
+        a.verdictCount = ret.verdictCount;
+        a.verdictRun   = ret.hasVerdicts != 0 ? ret.verdictRun : kNoVerdictRun;
         if (!ackSink_->enqueue(a)) [[unlikely]]
             haltInvariant_("session ack queue full (beyond its static bound)", "Task 13 G-A6 bound exceeded", 0);
         WorkerReturn n = ret;
@@ -5645,6 +5653,7 @@ private:
         rune::replication::PartitionReplica* replica = nullptr;
         uint64_t                logGen     = 0;
         int32_t                 minIsr     = 1;       ///< DR-BUG-3 (thenAwaitHw only)
+        uint8_t                 thenAwaitAcks = 0;    ///< the wire acks byte: a View entry moves to pendingAcksView_ (thenAwaitHw only)
     };
     // F15 S5 fix round 1 (I-1): park-ordered, O(1) front fire (OrderedWaitQueue.h).
     OrderedWaitQueue<DurablePending> durablePending_;
@@ -6039,6 +6048,20 @@ private:
     };
     // F15 S5 fix round 1 (I-1): park-ordered, O(1) front fire (OrderedWaitQueue.h).
     OrderedWaitQueue<PendingAcksAll> pendingAcksAll_;
+
+    // Checked writes: a produce acked with View waits here, in its own queue, so an All ack never queues behind the fold
+    // (an open transaction holds the fold, not the HW).  Fires when the HW passed it, the ISR still holds (All only) and
+    // every view over the partition folded past it under the current leadership.
+    struct PendingAcksView {
+        rune::replication::PartitionReplica* replica    = nullptr;
+        int64_t                              lastOffset = 0;
+        int64_t                              deadlineNs = 0;
+        uint64_t                             logGen     = 0;
+        int32_t                              minIsr     = 1;
+        WorkerReturn                         ret;
+        uint8_t                              acks       = 0;   ///< the Produce.acks wire byte
+    };
+    OrderedWaitQueue<PendingAcksView> pendingAcksView_;
 
     // F15 S3 (§6): the ONE local return FIFO in front of ret_, every mode.
     // Pre-allocated fixed-capacity ring of tagged entries (WorkerReturn |
@@ -7257,6 +7280,12 @@ private:
             enqueueReturn_(e.ret);
             return true;
         });
+        (void)pendingAcksView_.sweep([&](PendingAcksView& e) {
+            if (e.ret.incarnation != 0 ? ownsIncarnation_(e.ret.targetReplicaId, e.ret.incarnation) : isOwned(e.replica)) return false;
+            e.ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+            enqueueReturn_(e.ret);
+            return true;
+        });
         // Push subscriptions: parked / re-activated by id + incarnation in
         // rebuildOwnedIndex_ above — never overwritten by a pointer compare here.
         // C-1 / M2: logs this worker no longer owns.  Their still-pending durable
@@ -7855,14 +7884,26 @@ private:
             // single-ISR Strict log, HW / consumer visibility can precede the
             // fsync — Kafka semantics; the PRODUCER ack never does.)
             entry.ret.errorCode = 0;
-            PendingAcksAll pending;
-            pending.replica    = entry.thenAwaitHw;
-            pending.lastOffset = entry.lastOffset;
-            pending.deadlineNs = entry.deadlineNs;
-            pending.logGen     = entry.logGen;
-            pending.minIsr     = entry.minIsr;
-            pending.ret        = std::move(entry.ret);
-            pendingAcksAll_.push_back(std::move(pending));
+            if (rune::protocol::client::acksView(entry.thenAwaitAcks)) {
+                PendingAcksView pending;
+                pending.replica    = entry.thenAwaitHw;
+                pending.lastOffset = entry.lastOffset;
+                pending.deadlineNs = entry.deadlineNs;
+                pending.logGen     = entry.logGen;
+                pending.minIsr     = entry.minIsr;
+                pending.acks       = entry.thenAwaitAcks;
+                pending.ret        = std::move(entry.ret);
+                pendingAcksView_.push_back(std::move(pending));
+            } else {
+                PendingAcksAll pending;
+                pending.replica    = entry.thenAwaitHw;
+                pending.lastOffset = entry.lastOffset;
+                pending.deadlineNs = entry.deadlineNs;
+                pending.logGen     = entry.logGen;
+                pending.minIsr     = entry.minIsr;
+                pending.ret        = std::move(entry.ret);
+                pendingAcksAll_.push_back(std::move(pending));
+            }
         } else {
             entry.ret.errorCode = 0; // OK
             enqueueReturn_(entry.ret);
@@ -7906,6 +7947,13 @@ private:
         (void)pendingAcksAll_.sweep([&](PendingAcksAll& e) {
             auto* r = e.replica;
             if (!(r && r->isDiskBacked() && r->log() == log)) return false;   // log() is immutable: safe to read
+            e.ret.errorCode = code;
+            enqueueReturn_(e.ret);
+            return true;
+        });
+        (void)pendingAcksView_.sweep([&](PendingAcksView& e) {
+            auto* r = e.replica;
+            if (!(r && r->isDiskBacked() && r->log() == log)) return false;
             e.ret.errorCode = code;
             enqueueReturn_(e.ret);
             return true;
@@ -8064,6 +8112,39 @@ private:
     }
 
     // -----------------------------------------------------------------------
+    // flushOwedAcksView_ - fire View acks: the HW passed the batch, (for All) the ISR still holds, and every view of the
+    // source folded past it under THIS leadership (WorkerViewSet::minFoldCursor); no views means nothing to wait for.
+    // Same re-validation, ordering and deadline as flushOwedAcksAll_.
+    // -----------------------------------------------------------------------
+    int flushOwedAcksView_(int64_t nowNs) {
+        if (pendingAcksView_.empty()) return 0;
+        return static_cast<int>(pendingAcksView_.sweep([&](PendingAcksView& entry) {
+            auto* rep = waiterReplica_(entry.replica, entry.ret.targetReplicaId, entry.ret.incarnation,
+                                       entry.lastOffset, entry.logGen);
+            int16_t code = 0;
+            if (rep == nullptr) [[unlikely]] {
+                code = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+            } else if (rep->highWatermark() > entry.lastOffset &&
+                       (!rune::protocol::client::acksAll(entry.acks) || static_cast<int>(rep->isr().size()) >= entry.minIsr) &&
+                       (viewSet_ == nullptr ||
+                        viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration()) > entry.lastOffset)) {
+                code = 0;
+            } else if (nowNs >= entry.deadlineNs) {
+                spdlog::warn("Worker {}: View ack timeout for partition={} lastOffset={}; acking Internal error",
+                             workerId_, entry.ret.partition, entry.lastOffset);
+                code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+            } else {
+                return false;
+            }
+            entry.ret.errorCode = code;
+            FLIGHT_RECORDER_MARK_VAL_REPLICATION(flight_recorder::Site::ShWaiterFire, flight_recorder::foldCorr(entry.ret.correlationId),
+                                         static_cast<double>(code));
+            enqueueReturn_(entry.ret);
+            return true;
+        }));
+    }
+
+    // -----------------------------------------------------------------------
     // waiterReplica_ — F15 §3.2: may a parked waiter (acks=all on the HW, a
     // Strict ack on its fsync) still fire OK?  Evaluated on THIS worker every
     // pass, state-driven (no role-change hooks):
@@ -8200,6 +8281,7 @@ private:
     // gateway-routed acks=all / Strict produces park on this worker too.
     [[nodiscard]] int64_t reservedAckSlots_() const noexcept {
         return static_cast<int64_t>(pendingAcksAll_.size()) +
+               static_cast<int64_t>(pendingAcksView_.size()) +
                static_cast<int64_t>(durablePending_.size()) +
                static_cast<int64_t>(heldPushReads_.size()) +   // F15 S4 I-2: held PushReads owe a return
                static_cast<int64_t>(heldViewReads_.size()) +   // issue #82: so do GetViewRows the fold barrier holds
@@ -9288,6 +9370,7 @@ private:
         ret.lastOffset  = outcome.lastOffset;
         ret.recordCount = outcome.recordCount;
         ret.batchAttrs  = outcome.batchAttrs;
+        ret.assignedBase = outcome.assignedBase;
 
         if (outcome.identityMismatch) [[unlikely]] {
             // EOS-DUP defense: frame identity != CRC-covered batch header.
@@ -9362,7 +9445,8 @@ private:
             dp.lastOffset  = lastOff;
             dp.logPtr      = log;
             dp.ret         = std::move(ret);
-            dp.thenAwaitHw = acksAll ? replica : nullptr;
+            dp.thenAwaitHw = (acksAll || pc::acksView(acks)) ? replica : nullptr;
+            dp.thenAwaitAcks = acks;
             dp.deadlineNs  = nowNs + ackTimeoutNs_;
             dp.replica     = replica;
             dp.logGen      = replica ? replica->logGeneration() : 0;
@@ -9370,6 +9454,20 @@ private:
             durablePending_.push_back(std::move(dp));
             if (std::find(dirtyThisCycle_.begin(), dirtyThisCycle_.end(), log) == dirtyThisCycle_.end())
                 dirtyThisCycle_.push_back(log);
+            return 1;
+        }
+
+        if (pc::acksView(acks)) {
+            // View (checked writes): the HW (+ ISR for All) and the views' fold gate this ack.
+            PendingAcksView pending;
+            pending.replica    = replica;
+            pending.lastOffset = lastOff;
+            pending.deadlineNs = nowNs + ackTimeoutNs_;
+            pending.logGen     = replica->logGeneration();
+            pending.minIsr     = minIsr;
+            pending.acks       = acks;
+            pending.ret        = std::move(ret);
+            pendingAcksView_.push_back(std::move(pending));
             return 1;
         }
 
