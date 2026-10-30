@@ -692,7 +692,12 @@ public:
     void setViewSet(WorkerViewSet* vs) noexcept {
         viewSet_ = vs;
         // Task 12: the view set's per-slot arrays follow this worker's slot table size.
-        if (vs != nullptr && vs->nsSlotCapacity() != nsSlots_.capacity()) vs->configureNsSlots(nsSlots_.capacity());
+        if (vs == nullptr) return;
+        if (vs->nsSlotCapacity() != nsSlots_.capacity()) vs->configureNsSlots(nsSlots_.capacity());
+        // The boot slots were applied to this worker before its view set existed.
+        for (uint32_t s = 0; s < nsSlots_.capacity(); ++s)
+            if (nsSlots_.nsIdAt(static_cast<uint16_t>(s)) != NsSlotTable::kFreeSlot)
+                vs->onNsSlotAssign(static_cast<uint16_t>(s), nsSlots_.nsIdAt(static_cast<uint16_t>(s)), nsSlots_.limits(static_cast<uint16_t>(s)));
     }
     [[nodiscard]] WorkerViewSet* viewSet() const noexcept { return viewSet_; }
 
