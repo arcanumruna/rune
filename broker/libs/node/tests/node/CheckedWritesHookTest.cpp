@@ -1,6 +1,7 @@
 // CheckedWritesHookTest.cpp - checked writes Part 03 Task 6: the section 11.2 requirement table (pinned rows and the
 // sweep invariants) and CheckedWriteHook::check on real record bytes.
 #include <rune/node/CheckedWriteHook.h>
+#include <rune/node/NamespaceLimitCheck.h>
 
 #include "support/CheckedWritesBatches.h"
 
@@ -338,4 +339,19 @@ TEST(CheckedWritesHook, StageIsIdentityAndAssignedBaseIsZero) {
     EXPECT_EQ(s.len, sizeof bytes);
     EXPECT_EQ(hook.assignedBase(), 0u);
     EXPECT_FALSE(hook.checked());
+}
+
+// RB5 (SD12): a namespace whose lowest acks is All admits only frames with the All bit.  Wire 2 (Leader | View) waits for
+// the commit but is not All, so it must not pass; 3 (All | View) does.  RED: `wireAcks >= 1` (the pre-checked-writes
+// test) lets wire 2 through.
+TEST(CheckedWritesNamespaceRegression, LeaderViewNeverPassesANamespaceThatRequiresAllRegression) {
+    rune::protocol::NamespaceLimits all;
+    all.lowestAcks = 2;
+    EXPECT_FALSE(nsAcksAllowed(all, 0));
+    EXPECT_TRUE(nsAcksAllowed(all, 1));
+    EXPECT_FALSE(nsAcksAllowed(all, 2)) << "Leader | View is not All";
+    EXPECT_TRUE(nsAcksAllowed(all, 3));
+    rune::protocol::NamespaceLimits leader;
+    leader.lowestAcks = 1;
+    for (const uint8_t wire : {uint8_t{0}, uint8_t{1}, uint8_t{2}, uint8_t{3}}) EXPECT_TRUE(nsAcksAllowed(leader, wire)) << int(wire);
 }
