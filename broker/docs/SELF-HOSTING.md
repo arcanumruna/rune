@@ -335,9 +335,15 @@ before a produce is acknowledged but is **never written to disk**.
 - An explicit `transient topic X` over an existing disk topic `X` answers
   `TopicExists` (error 25); the topic stays a disk topic.
 - A view may read a transient topic, persisted or transient. A persisted view keeps the rows of its
-  last checkpoint across a restart; the source ring comes back empty, so the view re-folds the new
-  ring from offset 0 on top of those rows (counted as `transientSourceResets`, logged at INFO). The
-  view lives in the source topic's namespace and counts against its memory limit. A source with no
+  last checkpoint across a restart; the source ring comes back empty, so after a full restart the
+  view re-folds the new ring from offset 0 on top of those rows (counted as `transientSourceResets`,
+  logged at INFO). After a single-node restart the re-replicated ring starts at the leader's ring
+  start. Rows folded after the last checkpoint are lost on a full restart. After a failover the rows
+  come from the new leader's checkpoint plus its ring; a node that never led starts from the ring
+  alone. A stale row (including a deleted key) can reappear until the key is written again. Reads
+  answer `NotReady` while the ring is re-folded. The `View` ack means the record is folded, not
+  checkpointed. The view lives in the source topic's namespace: its memory counts against the
+  namespace's view-memory limit and its reads against the namespace's read throttle. A source with no
   key is refused with error 35 (`ViewKeyInvalid`). Error 37 (`ViewSourceTransient`) is reserved and
   never sent.
 - `alter topic` naming a view is rejected with error 38 (`ViewNotAlterable`).
@@ -420,6 +426,7 @@ before a produce is acknowledged but is **never written to disk**.
   `transientSourceResets`): from the point where the ring's content changed, when it changed once since
   the view last folded; from the oldest held record when the ring was recreated or changed more than
   once. Records evicted before the view folded them are counted as `transientRecordsEvicted`.
+  A restarted view counts one `transientSourceResets` instead.
 - **Upgrade brokers before clients.** A new client defining a transient topic against an older
   broker silently gets a disk topic, because the older broker ignores the persistence byte.
 
