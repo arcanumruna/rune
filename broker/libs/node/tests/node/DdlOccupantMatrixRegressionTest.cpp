@@ -116,6 +116,17 @@ void createUntyped(DdlHarness& h, const std::string& name, uint8_t persistence) 
     ASSERT_EQ(h.schemas().byName(name), nullptr) << "an untyped topic has no schema";
 }
 
+/// A typed topic without a key (the keyless-source rows).
+void createKeyless(DdlHarness& h, const std::string& name, uint8_t persistence) {
+    DefineTopicMsg m;
+    m.name = name; m.partitionCount = 1; m.persistence = persistence; m.validate = false;
+    m.keyField = ""; m.blob = charBlob();
+    const int64_t c = h.submitRawDefine(std::move(m));
+    h.settle();
+    ASSERT_TRUE(h.response(c).has_value());
+    ASSERT_EQ(h.response(c)->err, kOk) << "setup keyless '" << name << "'";
+}
+
 /// `op`'s append is refused (the ISR is below minIsr): NotLeader, nothing appended.
 void makeUncommitted(DdlHarness& h, Op op, const std::string& name) {
     const int64_t end = h.catalogLogEnd();
@@ -451,14 +462,19 @@ TEST_F(DdlMalformedRequestRegression, MalformedCatalogOpFrameIsInvalidRequestWit
 }
 
 // ── View source cells: source kind x view persistence ─────────────────────────────
-struct SourceCase { const char* label; const char* source; Op view; uint16_t want; };
+struct SourceCase { const char* label; const char* source; Op view; uint16_t want; const char* detail = nullptr; };
 void PrintTo(const SourceCase& c, std::ostream* os) { *os << c.label; }
 
 const SourceCase kSourceCases[] = {
     {"DiskSource_PersistedView",          "src",    Op::ViewPersisted, kOk},
     {"DiskSource_TransientView",          "src",    Op::ViewTransient, kOk},
-    {"TransientSource_PersistedView",     "tsrc",   Op::ViewPersisted, kViewSourceTransient},
+    {"TransientSource_PersistedView",     "tsrc",   Op::ViewPersisted, kOk},
     {"TransientSource_TransientView",     "tsrc",   Op::ViewTransient, kOk},
+    // Checked writes: every view over a keyless typed topic is refused by the keyless rule (35), never 37.
+    {"KeylessTransientSource_PersistedView", "ktsrc", Op::ViewPersisted, kViewKeyInvalid, "view source needs a key"},
+    {"KeylessTransientSource_TransientView", "ktsrc", Op::ViewTransient, kViewKeyInvalid, "view source needs a key"},
+    {"KeylessDiskSource_PersistedView",      "kdsrc", Op::ViewPersisted, kViewKeyInvalid, "view source needs a key"},
+    {"KeylessDiskSource_TransientView",      "kdsrc", Op::ViewTransient, kViewKeyInvalid, "view source needs a key"},
     {"SchemaLessSource_PersistedView",    "ssrc",   Op::ViewPersisted, kViewSourceNotFound},
     {"SchemaLessSource_TransientView",    "ssrc",   Op::ViewTransient, kViewSourceNotFound},
     {"MissingSource_PersistedView",       "nosuch", Op::ViewPersisted, kViewSourceNotFound},
@@ -477,6 +493,8 @@ TEST_P(DdlViewSourceRegression, ViewOverSource) {
     DdlHarness h;
     createUntyped(h, "ssrc", 0);                 // was a static topic
     create(h, Op::DefineTransient, "tsrc");
+    createKeyless(h, "ktsrc", 1);
+    createKeyless(h, "kdsrc", 0);
     create(h, Op::ViewPersisted, "vsrc");    // over "src"
     create(h, Op::ViewTransient, "tvsrc");   // over "src"
     if (HasFatalFailure()) return;
@@ -486,19 +504,109 @@ TEST_P(DdlViewSourceRegression, ViewOverSource) {
     h.settle();
     ASSERT_TRUE(h.response(corr).has_value());
     EXPECT_EQ(h.response(corr)->err, c.want);
+    EXPECT_NE(h.response(corr)->err, kViewSourceTransient) << "37 is never sent";
+    if (c.detail) EXPECT_EQ(h.response(corr)->detail, c.detail);
     EXPECT_EQ(h.eventsAppended() - events, c.want == kOk ? 1u : 0u) << "a rejected view appends nothing";
     if (c.want != kOk) EXPECT_EQ(h.catalog(), before);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
-    if (c.want == kViewSourceIsView) {   // the rule holds after a restart (the boot replay rebuilds the views)
+    if (c.want == kViewSourceIsView || c.want == kViewKeyInvalid) {   // the rule holds after a restart (the boot replay rebuilds the views)
         h.restart();
         const int64_t again = h.submit(c.view, "vw", c.source);
         h.settle();
         ASSERT_TRUE(h.response(again).has_value());
-        EXPECT_EQ(h.response(again)->err, kViewSourceIsView) << "after restart";
+        EXPECT_EQ(h.response(again)->err, c.want) << "after restart";
     }
 }
 
 INSTANTIATE_TEST_SUITE_P(Ddl, DdlViewSourceRegression, ::testing::ValuesIn(kSourceCases),
     [](const ::testing::TestParamInfo<SourceCase>& i) { return std::string(i.param.label); });
+
+// ── Checked writes Part 10: source kind x op (a persisted view may read a keyed transient topic) ──
+enum class TvSource : uint8_t { TransientKeyed, TransientKeyless, DiskKeyed, DiskKeyless };
+enum class TvOp : uint8_t { CreatePersisted, CreateTransient, AlterTransientToPersisted, AlterPersistedToTransient };
+struct TvCell { TvSource source; TvOp op; };
+
+bool tvKeyless(TvSource s) { return s == TvSource::TransientKeyless || s == TvSource::DiskKeyless; }
+bool tvAlter(TvOp o) { return o == TvOp::AlterTransientToPersisted || o == TvOp::AlterPersistedToTransient; }
+
+// 4 x 4 minus the four Alter* cells over a keyless source: no view over a keyless topic can be created to alter.
+std::vector<TvCell> tvCells() {
+    std::vector<TvCell> out;
+    for (const TvSource s : {TvSource::TransientKeyed, TvSource::TransientKeyless, TvSource::DiskKeyed, TvSource::DiskKeyless})
+        for (const TvOp o : {TvOp::CreatePersisted, TvOp::CreateTransient, TvOp::AlterTransientToPersisted, TvOp::AlterPersistedToTransient})
+            if (!(tvKeyless(s) && tvAlter(o))) out.push_back({s, o});
+    return out;
+}
+uint16_t tvExpected(const TvCell& c) { return tvKeyless(c.source) ? kViewKeyInvalid : kOk; }
+void PrintTo(const TvCell& c, std::ostream* os) { *os << static_cast<int>(c.source) << "_" << static_cast<int>(c.op); }
+
+TEST(CheckedWritesTransientViewDdlCountRegression, CellCountIsPinned) { EXPECT_EQ(tvCells().size(), 12u); }
+
+class CheckedWritesTransientViewDdlRegression : public ::testing::TestWithParam<TvCell> {};
+
+TEST_P(CheckedWritesTransientViewDdlRegression, Cell) {
+    const TvCell c = GetParam();
+    DdlHarness h;
+    const bool transientSrc = c.source == TvSource::TransientKeyed || c.source == TvSource::TransientKeyless;
+    DefineTopicMsg d;
+    d.name = "tvsrc"; d.partitionCount = 1; d.persistence = transientSrc ? 1 : 0; d.validate = false;
+    d.keyField = tvKeyless(c.source) ? "" : "id"; d.blob = charBlob();
+    const int64_t dc = h.submitRawDefine(std::move(d));
+    h.settle();
+    ASSERT_TRUE(h.response(dc).has_value());
+    ASSERT_EQ(h.response(dc)->err, kOk);
+
+    // An Alter* op first creates the view with the other persistence.
+    const uint8_t target = (c.op == TvOp::CreatePersisted || c.op == TvOp::AlterTransientToPersisted) ? 0 : 1;
+    const std::string name = "tvv";
+    if (tvAlter(c.op)) {
+        const int64_t pc = h.submitView(target == 0 ? Op::ViewTransient : Op::ViewPersisted, name, {"tvsrc"});
+        h.settle();
+        ASSERT_TRUE(h.response(pc).has_value());
+        ASSERT_EQ(h.response(pc)->err, kOk) << "setup view";
+    }
+    auto run = [&](const std::string& viewName, bool alter) {
+        const RegistryEntry* e = h.schemas().byName("tvsrc");
+        const int32_t src = e ? e->topicId : -1;
+        if (alter) {
+            AlterViewMsg m;
+            m.name = viewName; m.keyField = "id"; m.persistence = target; m.expectedVersion = 1;
+            m.planBlob = viewPlanBlob(viewName, std::vector<int32_t>{src}, target, /*extraColumn=*/true);
+            return h.submitRawAlterView(std::move(m));
+        }
+        CreateViewMsg m;
+        m.persistence = target; m.viewName = viewName; m.keyField = "id";
+        m.planBlob = viewPlanBlob(viewName, std::vector<int32_t>{src}, target);
+        return h.submitRawView(std::move(m));
+    };
+
+    const Catalog before = h.catalog();
+    const uint64_t events = h.eventsAppended();
+    const int64_t corr = run(name, tvAlter(c.op));
+    h.settle();
+    ASSERT_TRUE(h.response(corr).has_value());
+    EXPECT_EQ(h.response(corr)->err, tvExpected(c));
+    EXPECT_NE(h.response(corr)->err, kViewSourceTransient) << "37 is never sent";
+    if (tvExpected(c) == kOk) {
+        EXPECT_EQ(h.eventsAppended() - events, 1u);
+        const ViewRecord* v = h.views().byName(name);
+        ASSERT_NE(v, nullptr);
+        EXPECT_EQ(v->persistence, target);
+    } else {
+        EXPECT_EQ(h.response(corr)->detail, "view source needs a key");
+        EXPECT_EQ(h.eventsAppended(), events) << "a refusal appends no event";
+        EXPECT_EQ(h.catalog(), before);
+    }
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+
+    h.restart();
+    const int64_t again = run(name + "_2", false);
+    h.settle();
+    ASSERT_TRUE(h.response(again).has_value());
+    EXPECT_EQ(h.response(again)->err, tvExpected(c)) << "after restart";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+INSTANTIATE_TEST_SUITE_P(Cell, CheckedWritesTransientViewDdlRegression, ::testing::ValuesIn(tvCells()));
 
 } // namespace

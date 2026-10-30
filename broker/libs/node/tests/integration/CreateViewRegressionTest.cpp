@@ -490,10 +490,9 @@ TEST_F(CreateViewRegression, ViewSinkResolvesByViewNameAcrossRestartRegression) 
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2b E — a view over a TRANSIENT source must itself be transient.
-// A persisted view would checkpoint rows whose source data is gone after a
-// restart.  Rejected at CREATE VIEW time with ViewSourceTransient (37), before
-// any sink topic or __views record exists.
+// Checked writes Part 10 (spec 9a) — a persisted view may read a keyed TRANSIENT source: it checkpoints to its own
+// file and folds whatever the ring still holds after a restart.  37 (ViewSourceTransient) is reserved and never sent;
+// a keyless source is still refused by Part 02's rule (35), never 37.
 // ---------------------------------------------------------------------------
 namespace {
 std::vector<uint8_t> charHpPlanBlobP(int32_t srcTopicId, uint8_t persistence) {
@@ -506,7 +505,9 @@ std::vector<uint8_t> charHpPlanBlobP(int32_t srcTopicId, uint8_t persistence) {
 }
 } // namespace
 
-TEST_F(CreateViewRegression, PersistedViewOverTransientSourceIsRejectedRegression) {
+class CheckedWritesTransientViewCreateRegression : public CreateViewRegression {};
+
+TEST_F(CheckedWritesTransientViewCreateRegression, PersistedViewOverTransientSourceIsAcceptedRegression) {
     DefineTopicMsg d = defineCharacter();
     d.persistence = 1;   // transient
     driveDefine(d);
@@ -521,12 +522,57 @@ TEST_F(CreateViewRegression, PersistedViewOverTransientSourceIsRejectedRegressio
     const uint64_t eventsBefore = events();
     driveCreateView(cv);
 
-    EXPECT_EQ(lastViewError_, 37u);
+    EXPECT_EQ(lastViewError_, 0u);
+    EXPECT_GE(lastViewTopicId_, 0);
+    const ViewRecord* rec = viewRegistry_->byName("char_hp");
+    ASSERT_NE(rec, nullptr);
+    EXPECT_EQ(rec->persistence, 0u);
+    EXPECT_EQ(lastSinkCleanupPolicy_, 1u) << "a compacted sink";
+    EXPECT_EQ(events() - eventsBefore, 1u);
+    EXPECT_EQ(viewSet_.drainInstalls(), 1);
+
+    restartAdmin_();
+    const ViewRecord* again = viewRegistry_->byName("char_hp");
+    ASSERT_NE(again, nullptr) << "the view survives a restart";
+    EXPECT_EQ(again->persistence, 0u) << "and is still persisted";
+}
+
+TEST_F(CheckedWritesTransientViewCreateRegression, PersistedViewOverKeylessTransientSourceIsStill35Regression) {
+    DefineTopicMsg d = defineCharacter();
+    d.name = "events_t"; d.persistence = 1; d.keyField = "";
+    driveDefine(d);
+    ASSERT_EQ(lastDefineError_, 0u);
+    const int32_t src = lastDefineTopicId_;
+
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 71; cv.persistence = 0;
+    cv.viewName = "ev_view"; cv.keyField = "id"; cv.planBlob = charHpPlanBlobP(src, 0);
+    const uint64_t eventsBefore = events();
+    driveCreateView(cv);
+
+    EXPECT_EQ(lastViewError_, 35u) << "Part 02's keyless rule (R10b), never 37";
     EXPECT_EQ(lastViewTopicId_, -1);
-    EXPECT_EQ(viewRegistry_->byName("char_hp"), nullptr) << "no __views record";
-    EXPECT_EQ(schemaRegistry_->byName("char_hp"), nullptr) << "no sink topic schema";
-    EXPECT_EQ(events(), eventsBefore) << "no event (no sink) was written";
-    EXPECT_TRUE(lastSinkKeyField_.empty()) << "no sink topic was built";
+    EXPECT_EQ(viewRegistry_->byName("ev_view"), nullptr);
+    EXPECT_EQ(events(), eventsBefore) << "a refused view appends nothing";
+    EXPECT_EQ(viewSet_.drainInstalls(), 0);
+}
+
+TEST_F(CheckedWritesTransientViewCreateRegression, TransientViewOverKeylessTransientSourceIsStill35Regression) {
+    DefineTopicMsg d = defineCharacter();
+    d.name = "events_t"; d.persistence = 1; d.keyField = "";
+    driveDefine(d);
+    ASSERT_EQ(lastDefineError_, 0u);
+    const int32_t src = lastDefineTopicId_;
+
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 72; cv.persistence = 1;
+    cv.viewName = "ev_view"; cv.keyField = "id"; cv.planBlob = charHpPlanBlobP(src, 1);
+    const uint64_t eventsBefore = events();
+    driveCreateView(cv);
+
+    EXPECT_EQ(lastViewError_, 35u);
+    EXPECT_EQ(lastViewTopicId_, -1);
+    EXPECT_EQ(events(), eventsBefore);
     EXPECT_EQ(viewSet_.drainInstalls(), 0);
 }
 
