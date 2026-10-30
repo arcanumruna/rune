@@ -228,7 +228,8 @@ private:
             sendAll();
             r_.passes(5);
             r_.followerFetch();
-            for (int i = 0; i < 600 && r_.leo() <= r_.replica->highWatermark(); ++i) r_.pass();
+            while (r_.leo() <= r_.replica->highWatermark()) r_.pass();   // the marker sits above the HW
+            ASSERT_GT(r_.leo(), r_.replica->highWatermark());
             r_.failover();
             return;
         case Timing::TruncateTail:
@@ -310,7 +311,6 @@ private:
     void checkAcks_(const Expected& ex, const CheckedWritesModel& model) {
         if (c_.entity == Entity::OldWriters) {
             for (const Sent& s : sent_) {
-                if (isFaulty(c_.timing) && c_.timing != Timing::FailoverAppendHw && !r_.acked(s.corr)) continue;   // a fault ate the ack
                 const auto a = r_.ackFetching(s.corr);
                 ASSERT_TRUE(a);
                 EXPECT_EQ(a->code, 0);
@@ -323,7 +323,6 @@ private:
         if (ex.check == Check::NotLeaderFirst) EXPECT_EQ(firstAckCode_, kNotLeader);
         std::map<int64_t, VerdictRig::Ack> okAcks;
         for (const Sent& s : sent_) {
-            if (isFaulty(c_.timing) && c_.timing != Timing::FailoverAppendHw && !r_.acked(s.corr)) continue;   // a fault ate the ack: the writer re-sends
             const auto a = r_.ackFetching(s.corr);
             ASSERT_TRUE(a) << "corr " << s.corr;
             okAcks[s.corr] = *a;

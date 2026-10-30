@@ -236,16 +236,20 @@ public:
         return b.build();
     }
 
-    void pass() {
+    /// One worker pass; the driver and the client conductor run in it too (Invoker), so the rig is single-threaded.
+    int pass() {
         now += 1'000'000;
         ++passNo_;
-        worker->doWork(now);
+        pumpAeron_();
+        const int work = worker->doWork(now);
+        pumpAeron_();
         pollAcks_();
         worker->drainReturn([&](WorkerReturn r) {
             if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
         }, [](const TxnReturn&) {});
         if (agent) (void)agent->doWork(now);
         else channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, OneToOneByteRing::index_t, OneToOneByteRing::index_t) {});
+        return work;
     }
     void passes(int n) { for (int i = 0; i < n; ++i) pass(); }
 
@@ -301,8 +305,8 @@ public:
         rune::node::EmbeddedDriverConfig dc;
         dc.dir = (std::filesystem::temp_directory_path() / ("rune_cwv_aeron_" + std::to_string(::getpid()) + "_" + std::to_string(rigSeq()++))).string();
         dc.termBufferBytes = 64 * 1024;
-        driver_ = std::make_unique<rune::node::EmbeddedDriver>(dc, rune::node::DriverMode::Threaded);
-        aeron::Context ctx; ctx.aeronDir(dc.dir);
+        driver_ = std::make_unique<rune::node::EmbeddedDriver>(dc, rune::node::DriverMode::Invoker);
+        aeron::Context ctx; ctx.aeronDir(dc.dir); ctx.useConductorAgentInvoker(true);
         aeron_ = aeron::Aeron::connect(ctx);
     }
     void enableEgress() {
@@ -310,13 +314,13 @@ public:
         ensureDriver_();
         const std::string control = "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
         const std::string local   = "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
-        egress_ = std::make_unique<WorkerEgress>(aeron_, control.c_str(), 3001);
+        egress_ = std::make_unique<WorkerEgress>(aeron_, control.c_str(), 3001, driver_->pumpWith(aeron_.get()));
         const int64_t reg = aeron_->addSubscription("aeron:udp?control=" + control + "|control-mode=dynamic|endpoint=" + local, 3001);
-        for (int i = 0; i < 5000 && !(sub_ && sub_->isConnected() && egress_->isConnected()); ++i) {
+        ASSERT_TRUE(egress_->resolved());
+        while (!(sub_ && sub_->isConnected() && egress_->isConnected())) {
             if (!sub_) sub_ = aeron_->findSubscription(reg);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            pass();
         }
-        ASSERT_TRUE(sub_ && sub_->isConnected() && egress_->isConnected());
         worker->setWorkerEgress(egress_.get());
     }
 
@@ -350,7 +354,7 @@ public:
     const Inbox& collect(int64_t subId) {
         Inbox& box = inboxes_[subId];
         if (kinds_.at(subId) == SubKind::PushRead) {
-            for (int guard = 0; guard < 400; ++guard) {
+            for (;;) {
                 WorkerOp op;
                 op.type = WorkerOp::Type::PushRead;
                 op.subscriptionId = subId; op.sessionId = 4200 + subId; op.topicId = kSrc; op.partition = 0;
@@ -372,16 +376,16 @@ public:
             }
             return box;
         }
-        int quiet = 0;
-        while (quiet < 40) {
-            pass();
-            std::size_t before = box.frames.size();
+        // The subscription cursor reached what the HW and the judge allow, the worker is idle, the image has read everything the egress
+        // published and nothing new was polled.
+        for (;;) {
+            const int work = pass();
+            const std::size_t before = box.frames.size();
             sub_->poll(aeron::FragmentAssembler([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
                 const auto dec = rune::protocol::client::Records::decode(reinterpret_cast<const uint8_t*>(buf.buffer() + off), static_cast<std::size_t>(len));
                 if (dec && dec->subscriptionId == subId) absorb_(box, dec->recordBatch.data(), dec->recordBatch.size());
             }).handler(), 64);
-            quiet = box.frames.size() == before ? quiet + 1 : 0;
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (work == 0 && box.frames.size() == before && worker->subscriptionPositionForTest(subId) >= deliverable_() && delivered_()) break;
         }
         return box;
     }
@@ -414,15 +418,15 @@ public:
         ackVersion_ = clientVersion;
         arenaEntries_ = arenaEntries;
         if (!ackIngress_) {
-            ackIngress_ = std::make_unique<WorkerIngress>(aeron_, "aeron:ipc", kIngressStream);
+            ackIngress_ = std::make_unique<WorkerIngress>(aeron_, "aeron:ipc", kIngressStream, driver_->pumpWith(aeron_.get()));
+            ASSERT_TRUE(ackIngress_->resolved());
             const int64_t sreg = aeron_->addSubscription("aeron:ipc", kAckStream);
             const int64_t preg = aeron_->addExclusivePublication("aeron:ipc", kIngressStream);
-            for (int i = 0; i < 5000 && !(ackSub_ && ackPub_ && ackPub_->isConnected()); ++i) {
+            while (!(ackSub_ && ackPub_ && ackPub_->isConnected())) {
                 if (!ackSub_) ackSub_ = aeron_->findSubscription(sreg);
                 if (!ackPub_) ackPub_ = aeron_->findExclusivePublication(preg);
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                pass();
             }
-            ASSERT_TRUE(ackSub_ && ackPub_ && ackPub_->isConnected());
         }
         wireAcks_();
     }
@@ -437,8 +441,9 @@ public:
         std::vector<uint8_t> f(m.encodedSize()); m.encode(f.data());
         if (ackEncrypted_) f = sealC2b_(f);
         aeron::concurrent::AtomicBuffer ab(f.data(), static_cast<aeron::util::index_t>(f.size()));
-        for (int i = 0; i < 5000 && ackPub_->offer(ab, 0, static_cast<aeron::util::index_t>(f.size())) <= 0; ++i)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        int64_t pos;
+        while ((pos = ackPub_->offer(ab, 0, static_cast<aeron::util::index_t>(f.size()))) < 0 && pos >= aeron::ADMIN_ACTION) pass();   // back-pressure / admin: let the worker drain
+        EXPECT_GT(pos, 0) << "the produce frame was refused: " << pos;
         return c;
     }
     /// Drives until the ack of `corr` arrived (or `maxPasses`).
@@ -446,7 +451,6 @@ public:
         for (int i = 0; i < maxPasses; ++i) {
             if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
             pass();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
         return std::nullopt;
@@ -457,13 +461,12 @@ public:
             if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
             if (isr_.size() > 1 && i % 8 == 0) followerFetch();
             pass();
-            std::this_thread::sleep_for(std::chrono::microseconds(500));
         }
         if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
         return std::nullopt;
     }
     /// Passes with no waiting for a particular ack (a delay check).
-    void settle(int n = 40) { for (int i = 0; i < n; ++i) { pass(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); } }
+    void settle(int n = 40) { for (int i = 0; i < n; ++i) pass(); }
     [[nodiscard]] bool acked(int64_t c) const { return acksSeen_.count(c) != 0; }
     [[nodiscard]] const std::vector<int64_t>& ackOrder() const { return ackOrder_; }
     [[nodiscard]] int64_t passNo() const { return passNo_; }
@@ -596,6 +599,22 @@ public:
     std::vector<int16_t> produceAnswers;
 
 private:
+    void pumpAeron_() {
+        if (!driver_) return;
+        driver_->doWork();
+        aeron_->conductorAgentInvoker().invoke();
+    }
+    /// The offset below which a consumer may be handed records: the HW, and for a verdict source the judge's cursor.
+    [[nodiscard]] int64_t deliverable_() const {
+        const PartitionWriteState* w = writeState();
+        return std::min({leo(), replica->highWatermark(), w != nullptr ? w->verdictKnownThrough() : INT64_MAX});
+    }
+    /// Every egress frame the worker published has been read off the image.
+    [[nodiscard]] bool delivered_() const {
+        if (!sub_ || !egress_ || egress_->pub() == nullptr) return true;
+        const auto image = sub_->imageBySessionId(egress_->pub()->sessionId());
+        return image != nullptr && image->position() == egress_->pub()->position();
+    }
     void absorb_(Inbox& box, const uint8_t* data, std::size_t len) {
         for (std::size_t pos = 0; pos + 12 <= len;) {
             rune::protocol::RecordBatchReader r(data + pos, len - pos);
