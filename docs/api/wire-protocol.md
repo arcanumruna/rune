@@ -63,8 +63,8 @@ security 64 to 95.
 | 13 | `AuthServerFirst` | B→C | `combinedNonce`, `count` |
 | 14 | `AuthClientFinal` | C→B | `count` |
 | 15 | `AuthServerFinal` | B→C | `errorCode`, `flags`, `retryAfterMs`, `serverSignature`, `detail` |
-| 16 | `Produce` | C→B | `topicId`, `partition`, `partitionKnown`, `acks`, `producerId`, `producerEpoch`, `baseSequence`, `key`, `recordBatch` |
-| 17 | `ProduceResponse` | B→C | `errorCode`, `partition`, `baseOffset`, `logStartOffset` |
+| 16 | `Produce` | C→B | `topicId`, `partition`, `partitionKnown`, `acks` (bit 0 All, bit 1 View, v17), `producerId, `producerEpoch`, `baseSequence`, `key`, `recordBatch` |
+| 17 | `ProduceResponse` | B→C | `errorCode`, `partition`, `baseOffset`, `logStartOffset`, `assignedBase` (v17), `verdicts` (v17, optional trailer) |
 | 18 | `Subscribe` | C→B | `topicId`, `partition`, `partitionKnown`, `fromOffset`, `isolation`, `key`, `filter` (v11, optional trailer) |
 | 19 | `SubscribeResponse` | B→C | `errorCode`, `partition`, `subscriptionId`, `detail` (v11, optional trailer) |
 | 20 | `Records` | B→C | `subscriptionId`, `topicId`, `partition`, `baseOffset`, `recordBatch` |
@@ -125,7 +125,7 @@ Notes:
   `NotLeader` (2); both are retriable.
 - **Internal logs** are read by subscribing to a negative topic id: `__catalog` is `-6` (`kCatalogTopicId`), `__security`
   is `-7` (`kSecurityTopicId`, security admins and brokers only). A stream ends with an 8-byte caught-up marker batch.
-- `Produce.acks`: `0` leader or none (immediate ack), `1` all (deferred until the in-sync replicas hold it).
+- `Produce.acks`: bit 0 set = all (deferred until the in-sync replicas hold it), clear = leader or none (immediate ack); bit 1 = `View` (client version 17, see Checked writes).
   `producerId = -1` with `baseSequence = -1` is a non-idempotent produce.
 - `Subscribe.fromOffset`: `-2` earliest, `-1` latest, otherwise an absolute offset. `isolation`: `0` read uncommitted,
   `1` read committed.
@@ -194,6 +194,21 @@ canonical format in [`FilterWire.h`](../../codec/include/rune/codec/FilterWire.h
   filter only to a session whose `ConnectResponse.brokerVersion` is at least 6.
 
 On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25) and `TailKind::FILTER` (11).
+
+## Checked writes (client version 17)
+
+- **`Produce.acks`** is a bit set: bit 0 `All`, bit 1 `View`. Bits above 1 are rejected as a malformed frame. `View` makes the
+  ack wait until the batch is committed (high watermark, and for `All` the in-sync replica count) and every view of the
+  partition has folded it under the current leadership. An ack that cannot be given in time is `Internal`; a leader
+  that lost the partition answers `NotLeader`.
+- **`ProduceResponse` (client version 17)**: the body block is 30 bytes (`assignedBase` u64 at body offset 22, `0` = none),
+  so the frame is 54 bytes; an optional trailer follows, `[count u16][count x {recordIndex u16, code u16, constraintId u32}]`,
+  present only on a `View` ack of a verdict source (`count` 0 = every record accepted). A session below 17 is sent the
+  exact 46-byte frame and never the trailer.
+- **Limits and refusals**: the client sends at most 4096 records in a `View` batch (a verdict source refuses more). A `View` produce is answered `InvalidRequest` on the
+  legacy gateway stream, while the cluster feature level is below checked writes, or without a replica to fold from. A
+  `View` bit on a transactional batch is ignored. Error codes 55 to 61 are sent only to sessions at 17 or above.
+- On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
 
 ## Encrypted frames (TLS 1.3 / AEAD)
 

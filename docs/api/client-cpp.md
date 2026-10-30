@@ -195,7 +195,7 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
   folded into the views and carries the per-record write verdicts. It needs a broker that supports checked writes; against
   an older broker every send completes locally with `OpStatus::BrokerTooOld`. `View` batches hold at most 4096 records
   (`claimBatch` with more returns `SendResult::MessageTooLarge`, `BatchBuilder` throws `std::length_error`). A transactional
-  producer never sends the `View` bit. `SendResult::WriteNotAllowed` reports a write the broker refuses for the topic.
+  producer never sends the `View` bit. `SendResult::WriteNotAllowed` reports a write the broker refuses for the topic. On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
 - **`Key`**: up to 16 inline bytes, built from a `uint64_t`/`int64_t`, a trivially-copyable value or a byte span. The key
   picks the partition (`Key::partition(n)`, FNV-1a 64) and is stored with the record. A key is never truncated: a span of
   more than 16 bytes is an over-long key (`Key::tooLong()`), `trySend` returns `SendResult::KeyTooLong` and `send` throws
