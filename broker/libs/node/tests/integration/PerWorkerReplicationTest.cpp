@@ -1429,7 +1429,7 @@ void runExactEffectiveMaxReplicates(bool perWorker) {
     }
 
     const std::size_t effMax = rune::node::effectiveMaxProduceBatchBytes(cfgs[0]);
-    ASSERT_EQ(effMax, 524194u) << "4 MiB multi-node derivation (see BrokerNodeRegression)";
+    ASSERT_EQ(effMax, 524186u) << "4 MiB multi-node derivation (see BrokerNodeRegression)";
 
     std::array<std::unique_ptr<rune::node::BrokerNode>, 3> nodes;
     for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<rune::node::BrokerNode>(cfgs[i]);

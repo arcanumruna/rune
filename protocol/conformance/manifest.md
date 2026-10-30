@@ -1159,3 +1159,22 @@ Verifier fixtures: salt `"0123456789abcdef"` (16), iterations 4096, storedKey 64
 | `security_bootstrap.bin` | 293 | SecurityBootstrap (80) | 0 | adminName `admin`, verifier, fakeSaltSeed 0x40..0x5F (32), nonce 0x10..0x1F, mac 0x80..0xBF |
 | `connect_response_v9.bin` | 49 | ConnectResponse (2) v9 | 21 | code 0, leader 2, assignedSessionId 0xDEADBEEF, brokerVersion 5, chosenCipher 0, authMode 0 (Required), authState 0 (MustAuthenticate), handshakeBytes `""` |
 | `connect_response_v9_crypto.bin` | 60 | ConnectResponse (2) v9 | 21 | as above with chosenCipher 2, authState 1 (ResumedAuthenticated), handshakeBytes `"serverhello"` |
+
+## Replication schema 112 — v4 / v5 FetchResponse vectors (#789)
+
+Decoded by `tests/protocol/ReplicationSchemaV5Test.cpp`. v5 appends `fromOffset:i64` (the offset the leader read
+`records` from) after `topicId`; a v4 frame reads it as SBE null.
+
+### `repl_fetch_response_v4.bin` (49 bytes) / `repl_fetch_response_v5.bin` (57 bytes) — FetchResponse (template 2)
+
+| Field | Value |
+|-------|-------|
+| blockLength / version | v4: 34 / 4; v5: 42 / 5 |
+| leaderEpoch | 5 |
+| partition | 1 |
+| highWatermark | 200 |
+| logStartOffset | 0 |
+| errorCode | 0 |
+| topicId | 7 |
+| fromOffset (v5) | 1047 |
+| records | 3 bytes `01 02 03` |

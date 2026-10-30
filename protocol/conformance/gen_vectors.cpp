@@ -506,7 +506,26 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // Replication schema 112 v5 (#789): FetchResponse appends fromOffset after topicId.
+    // ReplicationSchemaV5Test.cpp decodes these. Records: 3 bytes {01 02 03}.
+    {
+        struct Le {
+            std::vector<uint8_t> b;
+            void u16(uint16_t v) { for (int i = 0; i < 2; ++i) b.push_back(uint8_t(v >> (8 * i))); }
+            void i32(int32_t v)  { const uint32_t u = uint32_t(v); for (int i = 0; i < 4; ++i) b.push_back(uint8_t(u >> (8 * i))); }
+            void i64(int64_t v)  { const uint64_t u = uint64_t(v); for (int i = 0; i < 8; ++i) b.push_back(uint8_t(u >> (8 * i))); }
+            void hdr(uint16_t block, uint16_t tmpl, uint16_t ver) { u16(block); u16(tmpl); u16(112); u16(ver); }
+        };
+        for (const bool v5 : {false, true}) {
+            // repl_fetch_response_v4.bin / _v5.bin (template 2)
+            Le w; w.hdr(v5 ? 42 : 34, 2, v5 ? 5 : 4);
+            w.i64(5); w.i32(1); w.i64(200); w.i64(0); w.u16(0); w.i32(7);
+            if (v5) w.i64(1047);
+            w.i32(3); w.b.push_back(1); w.b.push_back(2); w.b.push_back(3);
+            write_vec(dir, v5 ? "repl_fetch_response_v5.bin" : "repl_fetch_response_v4.bin", w.b.data(), w.b.size());
+        }
+    }
 
-    std::printf("Done. 31 vectors written to %s/\n", dir);
+    std::printf("Done. 33 vectors written to %s/\n", dir);
     return 0;
 }

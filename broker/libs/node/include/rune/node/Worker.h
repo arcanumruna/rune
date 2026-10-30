@@ -4829,8 +4829,10 @@ private:
 
         // F18 (B-1): the transport could not hand us the batch at op.nextOffset()
         // (too large for this ring on its own) — the replica decides whether that
-        // is the batch at its LEO (wedge) or not (ignore).
-        if (op.replErrorCode() == rune::replication::kErrRecordTooLarge) [[unlikely]] {
+        // is the batch at its LEO (wedge) or not (ignore).  A kErrRecordTooLarge
+        // the leader answered carries no read origin (nextOffset -1) and goes to
+        // applyReplicated, which wedges at our LEO.
+        if (op.replErrorCode() == rune::replication::kErrRecordTooLarge && op.nextOffset() >= 0) [[unlikely]] {
             replica->onUnapplicableBatch(op.nextOffset(), op.replLeaderEpoch());
             return;
         }
@@ -4845,6 +4847,7 @@ private:
         msg.logStartOffset = op.replLogStartOffset();
         msg.errorCode      = op.replErrorCode();
         msg.topicId        = op.replTopicId();
+        msg.fromOffset     = op.nextOffset();   // #789: the leader's read origin (transport-stamped)
         // Zero-copy span: records view into the ring frame.
         // Valid only inside this callback — applyReplicated copies before we return.
         msg.records = std::span<const uint8_t>(

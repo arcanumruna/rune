@@ -52,6 +52,7 @@ if(BUILD_TESTING)
             tests/protocol/client/SecurityMessagesTest.cpp
             tests/protocol/client/NamespaceMessagesTest.cpp
             tests/protocol/ReplicationSchemaV4Test.cpp
+            tests/protocol/ReplicationSchemaV5Test.cpp
             tests/protocol/internal/RingSbeTest.cpp
             tests/protocol/net/UdpGsoPlanTest.cpp)
     target_include_directories(rune_protocol_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
