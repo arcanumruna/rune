@@ -30,16 +30,37 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # flight-recorder is its own repo: check out the commit the broker pins (FLIGHT_RECORDER_GIT_TAG), never its
+      # default-branch HEAD, which may need a newer aeron than the one the image builds against. The image also
+      # compiles the client, so the client's pin must be the same commit. arcanum-metrics (header-only) is read at
+      # the pin in broker/cmake/ArcanumMetrics.cmake.
+      - name: Read the sibling pins
+        id: pin
+        run: |
+          FR=$(sed -nE 's/^set\(FLIGHT_RECORDER_GIT_TAG "([0-9a-f]{40})".*/\1/p' broker/CMakeLists.txt)
+          FR_CLIENT=$(sed -nE 's/^set\(FLIGHT_RECORDER_GIT_TAG "([0-9a-f]{40})".*/\1/p' client-cpp/CMakeLists.txt)
+          AM=$(sed -nE 's/^set\(ARCANUM_METRICS_GIT_TAG "([0-9a-f]{40})".*/\1/p' broker/cmake/ArcanumMetrics.cmake)
+          if [[ -z $FR || -z $AM ]]; then
+            echo "::error::FLIGHT_RECORDER_GIT_TAG or ARCANUM_METRICS_GIT_TAG pin not found"
+            exit 1
+          fi
+          if [[ $FR != "$FR_CLIENT" ]]; then
+            echo "::error::flight-recorder pins differ: broker $FR, client-cpp ${FR_CLIENT:-<none>}"
+            exit 1
+          fi
+          echo "fr=$FR" >> "$GITHUB_OUTPUT"
+          echo "am=$AM" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v7
         with:
           repository: ${{ github.repository_owner }}/flight-recorder
+          ref: ${{ steps.pin.outputs.fr }}
           path: flight-recorder
 
-      # arcanum-metrics (header-only) at the sha pinned in broker/cmake/ArcanumMetrics.cmake.
       - uses: actions/checkout@v7
         with:
           repository: ${{ github.repository_owner }}/arcanum-metrics
-          ref: 991ecc56ce2f7a02c6dd9f613cb2514e7849206e
+          ref: ${{ steps.pin.outputs.am }}
           path: arcanum-metrics
 
       - name: Check tag matches VERSION.txt

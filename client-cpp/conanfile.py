@@ -105,16 +105,24 @@ class RuneClientCppConan(ConanFile):
         CMake(self).install()
 
     def package_info(self):
+        # find_package(rune-client-cpp) -> target rune::client
+        self.cpp_info.set_property("cmake_file_name", "rune-client-cpp")
+        self.cpp_info.set_property("cmake_target_name", "rune::client")
         # Link order matters for static archives: dependents before their dependencies.
-        self.cpp_info.libs = [
+        client = self.cpp_info.components["client"]
+        client.libs = [
             "rune_client_api", "rune_client_producer", "rune_client_subscriber", "rune_client_group",
             "rune_client_agent", "rune_client_transport", "rune_gso", "rune_client_driver_wake",
             "rune_ql", "rune_security", "rune_catalog", "rune_codec",
             "rune_client_scram", "rune_crypto", "flight_recorder",
         ]
-        self.cpp_info.defines = ["FLIGHT_RECORDER=1"]
+        client.defines = ["FLIGHT_RECORDER=1"]
+        client.requires = [f"{dep.ref.name}::{dep.ref.name}"
+                           for dep in self.dependencies.filter({"direct": True, "build": False, "test": False}).values()]
+        # CMakeDeps puts a component's system libs BEFORE the dependencies it requires, so the system libs live in
+        # a component of their own, required last: -luuid then follows aeron's driver archive, which needs it
+        # (the aeron recipe does not declare uuid).
+        system = self.cpp_info.components["system"]
         if self.settings.os in ("Linux", "FreeBSD"):
-            self.cpp_info.system_libs = ["uuid", "pthread", "dl", "m"]
-        # find_package(rune-client-cpp) -> target rune::client
-        self.cpp_info.set_property("cmake_file_name", "rune-client-cpp")
-        self.cpp_info.set_property("cmake_target_name", "rune::client")
+            system.system_libs = ["uuid", "pthread", "dl", "m"]
+        client.requires.append("system")
