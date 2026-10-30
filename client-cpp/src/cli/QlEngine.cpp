@@ -161,9 +161,11 @@ std::string_view errorCodeName(uint16_t code) noexcept {
         "ViewSourceTransient", "ViewNotAlterable", "InvalidRequest", "InvalidTopicName", "ViewSourceIsView",
         "TransientLogFull", "PartitionDataReset", "AuthenticationFailed", "NotAuthorized", "SessionRevoked",
         "PasswordChangeRequired", "AuthUnavailable", "RecordEgressUnavailable", "UnstableOffsetCommit",
-        "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused"};
+        "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
+        "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
+        "ViewConstraintInvalid", "ViewUniqueInvalid"};
 #ifdef RUNE_CLI_LIVE_ENABLED
-    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::ViewPaused) + 1,
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::ViewUniqueInvalid) + 1,
                   "errorCodeName: one name per rune::protocol::client::ErrorCode");
     static_assert(static_cast<uint16_t>(rune::protocol::client::ErrorCode::TopicExists) == 25,
                   "errorCodeName: the table is indexed by the enum's values");

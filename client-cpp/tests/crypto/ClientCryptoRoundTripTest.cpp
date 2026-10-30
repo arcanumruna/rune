@@ -232,7 +232,7 @@ TEST(SessionResponseEgressRegression, CryptoConnectRequestCarriesTheResponseCorr
         ASSERT_EQ(io.sendCount(), 1u);
         const auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
         ASSERT_TRUE(req.has_value());
-        EXPECT_EQ(req->clientVersion, 16);
+        EXPECT_EQ(req->clientVersion, rune::protocol::client::kClientVersion);
         EXPECT_FALSE(req->handshakeBytes.empty()) << "this is the crypto encoder";
         EXPECT_EQ(req->responseCorrelated, flag);
     }

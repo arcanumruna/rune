@@ -1908,7 +1908,7 @@ static_assert(rpc::kBrokerVersionNamespaces == rpc::kBrokerVersionReceiverKeys +
 // Issue #450: client 15 (SubscribeResponse RecordEgressUnavailable) follows.
 static_assert(rpc::kClientVersionRecordEgressUnavailable == rpc::kClientVersionNamespaces + 1);
 static_assert(rpc::kClientVersionResponseEgress == rpc::kClientVersionRecordEgressUnavailable + 1);   // NAT-safe egress: client 16
-static_assert(rpc::kClientVersion == rpc::kClientVersionResponseEgress && rpc::kBrokerVersion == rpc::kBrokerVersionResponseEgress);
+static_assert(rpc::kClientVersion == rpc::kClientVersionCheckedWrites && rpc::kBrokerVersion == rpc::kBrokerVersionCheckedWrites);
 static_assert(rpc::sessionUsesReceiverKeys(12, 7) && !rpc::sessionUsesReceiverKeys(11, 7) && !rpc::sessionUsesReceiverKeys(12, 6));
 static_assert(rpc::clientUnderstandsFilters(11) && !rpc::clientUnderstandsFilters(10));
 
@@ -2184,4 +2184,37 @@ TEST(SubscribeFilterRegression, OversizeFilterIsRefusedNotWrappedRegression) {
     auto d = rpc::Subscribe::decode(buf.data(), buf.size(), rpc::kClientVersion);
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->filter.size(), 65535u);
+}
+
+// ── Checked writes Part 03: codes 55-61, client version 17 / broker version 10 ──
+TEST(CheckedWritesProtocol, ErrorCodesAreAppendedAfterViewPaused) {
+    static_assert(static_cast<int>(rpc::ErrorCode::ViewPaused) == 54);
+    static_assert(static_cast<int>(rpc::ErrorCode::ConstraintViolation) == 55);
+    static_assert(static_cast<int>(rpc::ErrorCode::KeyExists) == 56);
+    static_assert(static_cast<int>(rpc::ErrorCode::KeyNotFound) == 57);
+    static_assert(static_cast<int>(rpc::ErrorCode::AutoIncrementExhausted) == 58);
+    static_assert(static_cast<int>(rpc::ErrorCode::ViewKeyExpressionInvalid) == 59);
+    static_assert(static_cast<int>(rpc::ErrorCode::ViewConstraintInvalid) == 60);
+    static_assert(static_cast<int>(rpc::ErrorCode::ViewUniqueInvalid) == 61);
+}
+
+TEST(CheckedWritesProtocol, VersionsAreSeventeenAndTen) {
+    static_assert(rpc::kClientVersionCheckedWrites == rpc::kClientVersionResponseEgress + 1 && rpc::kClientVersionCheckedWrites == 17 &&
+                  rpc::kClientVersion == 17);
+    static_assert(rpc::kBrokerVersionCheckedWrites == rpc::kBrokerVersionResponseEgress + 1 && rpc::kBrokerVersion == 10);
+    EXPECT_FALSE(rpc::clientUnderstandsCheckedWrites(16));
+    EXPECT_TRUE(rpc::clientUnderstandsCheckedWrites(17));
+}
+
+TEST(CheckedWritesProtocolRegression, OldSessionsNeverSeeCheckedWriteCodesRegression) {
+    for (int c = 55; c <= 61; ++c)
+        for (int v : {0, 2, 6, 11, 16}) {
+            SCOPED_TRACE(c * 100 + v);
+            EXPECT_EQ(rpc::produceErrorForClient(static_cast<rpc::ErrorCode>(c), v), rpc::ErrorCode::InvalidRequest);
+        }
+    for (int c = 55; c <= 61; ++c) EXPECT_EQ(rpc::produceErrorForClient(static_cast<rpc::ErrorCode>(c), 17), static_cast<rpc::ErrorCode>(c));
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::UnknownProducerId, 1), rpc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::TransientLogFull, 5), rpc::ErrorCode::NotLeader);
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::SchemaValidationFailed, 11), rpc::ErrorCode::SchemaValidationFailed);
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::ViewPaused, 14), rpc::ErrorCode::ViewPaused);
 }

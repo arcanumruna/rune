@@ -19,7 +19,7 @@ body; all integers are little-endian. The source of truth is the headers:
 Variable-length fields (strings, byte blobs) follow the fixed part, each with a length prefix.
 
 Capability is negotiated with two numbers in `Connect`/`ConnectResponse`: `clientVersion` (this protocol's client
-announces `11`, `kClientVersion`) and `brokerVersion` (`6`, `kBrokerVersion`). A broker answers a client below a
+announces `17`, `kClientVersion`) and `brokerVersion` (`10`, `kBrokerVersion`). A broker answers a client below a
 feature's version in the older way; an authentication-enabled broker answers a `Connect` below 9
 `ConnectResponse{ProtocolVersion}`.
 
@@ -35,6 +35,7 @@ feature's version in the older way; an authentication-enabled broker answers a `
 | 9 | Authentication: frames 12 to 15, 79 and 80, error codes 44 to 47. |
 | 10 | `TxnOffsetCommit` member block (`generationId`, `memberId` after the entries; KIP-447); `UnstableOffsetCommit` (50). An older broker ignores the block; a broker answers a session below 10 `NotCoordinator` instead of 50. |
 | 11 | Subscription filters: the optional filter trailer on `Subscribe` and `JoinGroup`, the refusal `detail` trailer on their responses (broker version 6). |
+| 17 | Checked writes (broker version 10): the `Produce` `acks` byte carries bit 1 (`View`), `ProduceResponse` carries `assignedBase` and an optional verdict trailer, and error codes 55 to 61 exist. A session below 17 is never sent 55 to 61 (it is answered `InvalidRequest`) and keeps the 46-byte `ProduceResponse`. |
 
 ## Frame catalogue
 
@@ -261,6 +262,13 @@ senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 | 48 | `AuthUnavailable` | The broker's `__security` state is not current (catching up after a start, or stale: cut off its leader or the consensus): no login, `__security` read or security DDL is served. As the session-level `ErrorResponse` (correlation id 0): the broker stayed stale too long and ended the session. Sent to every client version. | retried: back off and reconnect fresh, rotating brokers; never terminal |
 | 49 | `RecordEgressUnavailable` | Authenticating broker only: the session's own record stream for the partition's worker could not be built (there is no shared-stream fallback). Sent in `SubscribeResponse.errorCode` on the pending Subscribe. | retried a few times (a bind resets the count), then fails the subscription or the group consumer with an error |
 | 50 | `UnstableOffsetCommit` | Client 10: `OffsetFetch` / `OffsetCommit` of a partition an unfinished transaction holds a pending offset on (until its completion is durable), or while the transaction coordinator is not loaded. Nothing is appended. | retried after a backoff, never surfaced |
+| 55 | `ConstraintViolation` | Client 17: the record broke a view rule when it was folded; the constraint id is `viewObjectId << 16 \| ordinal` (ordinal 0 = `unique`). Never visible. | per-record verdict of a `View` ack |
+| 56 | `KeyExists` | Client 17: `insert` on a key that exists. Never visible. | per-record verdict of a `View` ack |
+| 57 | `KeyNotFound` | Client 17: `update` or delete-existing on a key that is absent. Never visible. | per-record verdict of a `View` ack |
+| 58 | `AutoIncrementExhausted` | Client 17: the counter reached `autoincrement.max`. The batch is not stored. | not retried |
+| 59 | `ViewKeyExpressionInvalid` | Client 17: a view key expression does not compile. | DDL compile error |
+| 60 | `ViewConstraintInvalid` | Client 17: a `unique` or `check` constraint does not compile. | DDL compile error |
+| 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. | DDL compile error |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,

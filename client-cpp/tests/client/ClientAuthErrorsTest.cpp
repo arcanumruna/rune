@@ -2621,5 +2621,7 @@ TEST(ClientAuthErrorsRegression, AuthErrorNamesCoverNamespaceCodesRegression) {
     EXPECT_STREQ(rc::authErrorName(52), "NamespaceLimitExceeded");
     EXPECT_STREQ(rc::authErrorName(53), "Throttled");
     EXPECT_STREQ(rc::authErrorName(54), "ViewPaused");
-    EXPECT_EQ(rc::authErrorName(55), nullptr);
+    EXPECT_STREQ(rc::authErrorName(55), "ConstraintViolation");
+    EXPECT_STREQ(rc::authErrorName(61), "ViewUniqueInvalid");
+    EXPECT_EQ(rc::authErrorName(62), nullptr);
 }

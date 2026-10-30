@@ -219,7 +219,7 @@ TEST(ClientResponseEgressRegression, SeedConnectRidesTheResponsePublication) {
     EXPECT_EQ(r.gw.responseConnects, 1);
     EXPECT_NE(r.client.testTransport().seedPublicationChannelForTest().find("|response-correlation-id="),
               std::string::npos);
-    EXPECT_EQ(r.gw.lastConnectClientVersion, 16);
+    EXPECT_EQ(r.gw.lastConnectClientVersion, rune::protocol::client::kClientVersion);
 }
 
 TEST(ClientResponseEgressRegression, WorkerBindIsTheFirstFrameOnEveryWorker) {

@@ -87,6 +87,13 @@ enum class OpStatus : uint8_t {
     case 52: return "NamespaceLimitExceeded";
     case 53: return "Throttled";
     case 54: return "ViewPaused";
+    case 55: return "ConstraintViolation";
+    case 56: return "KeyExists";
+    case 57: return "KeyNotFound";
+    case 58: return "AutoIncrementExhausted";
+    case 59: return "ViewKeyExpressionInvalid";
+    case 60: return "ViewConstraintInvalid";
+    case 61: return "ViewUniqueInvalid";
     default: return nullptr;
     }
 }
