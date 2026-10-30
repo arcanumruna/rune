@@ -8310,6 +8310,11 @@ private:
                              workerId_, entry.ret.partition, entry.lastOffset);
                 code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
             } else {
+                // A replay waiting for its marker must not be passed by a later ack of the partition.
+                if (entry.replay == 1) {
+                    if (deferredCount == deferred.size()) deferAll = true;
+                    else deferred[deferredCount++] = Deferred{entry.ret.topicId, entry.ret.partition};
+                }
                 return false;
             }
             if (code == 0 && source) {

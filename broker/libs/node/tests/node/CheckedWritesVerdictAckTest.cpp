@@ -227,3 +227,22 @@ TEST_F(CheckedWritesVerdictAckRegression, ViewRetryOutsideTheWindowIsDuplicateSe
     EXPECT_EQ(r.stats()->verdictUnknownDuplicates, unknownBefore + 1);
     EXPECT_EQ(r.leo(), leoBefore);
 }
+
+// A replay waits for the marker that commits its verdicts; an ack of the same partition behind it waits too, so the acks of a
+// connection leave in the order the batches were written.
+TEST(CheckedWritesVerdictAckRigRegression, ReplayNotYetCommittedKeepsTheAcksBehindItInOrderRegression) {
+    VerdictRig o(/*follower=*/true);
+    o.typed();
+    o.installRejectView(kRej, kObj, tagRule(9));
+    o.enableAcks();
+    o.passes(60);
+    const int64_t first = o.produceFrame({{1, 1, 1}, {2, 2, 9}}, kAcksView, 500, 0);
+    ASSERT_TRUE(o.ackFetching(first));
+    const int64_t replay = o.produceFrame({{1, 1, 1}, {2, 2, 9}}, kAcksView, 500, 0);
+    const int64_t fresh = o.produceFrame({{3, 3, 1}}, kAcksView);
+    ASSERT_TRUE(o.ackFetching(replay));
+    ASSERT_TRUE(o.ackFetching(fresh));
+    const auto& order = o.ackOrder();
+    const auto at = [&](int64_t c) { return std::find(order.begin(), order.end(), c) - order.begin(); };
+    EXPECT_LT(at(replay), at(fresh));
+}
