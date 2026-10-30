@@ -114,14 +114,14 @@ public:
         model.declareRule(kObj2, tagRule(8).fingerprint(), modelRule(tagRule(8)));
         model.reset(log);
 
-        checkIndex_(model, log);
-        checkMarkers_(model, log);
-        checkViews_(model, log);
-        if (sub != 0) checkDelivered_(model, sub);
+        checkIndex(r_, model);
+        checkMarkers(model, log, target_);
+        checkViews(r_, model, log, kProj, kCnt);
+        if (sub != 0) checkDelivered(r_, model, sub, c_.entity == Entity::FilteredSubscription);
         checkAcks_(ex, model);
         if (isRetry(c_.timing)) EXPECT_EQ(log.data.size(), uniqueRecs_) << "a retry is stored once";
         EXPECT_EQ(r_.writeState()->rejected.mismatches(), 0u);
-        checkCompaction_(model, log);
+        checkCompaction(r_, model, log);
     }
 
 private:
@@ -254,61 +254,6 @@ private:
         }
     }
 
-    void checkIndex_(const CheckedWritesModel& model, const VerdictRig::RigLog&) {
-        std::map<int64_t, ModelVerdict> got;
-        r_.writeState()->rejected.forEachIn(0, INT64_MAX, [&](const rune::storage::RejectedOffsetIndex::Entry& e) { got[e.offset] = {e.code, e.constraintId}; });
-        EXPECT_EQ(got, model.verdicts()) << "(a) the rejected offsets";
-    }
-
-    void checkMarkers_(const CheckedWritesModel& model, const VerdictRig::RigLog& log) {
-        ASSERT_FALSE(log.markers.empty());
-        ASSERT_FALSE(log.changes.empty());
-        int64_t reach = 0;
-        EXPECT_EQ(markerUnionProblem(log.markers, log.changes.front().offset, &reach), "") << "(b) markers cover the log without a gap and agree where they overlap";
-        std::map<int64_t, ModelVerdict> union_;
-        for (const auto& m : log.markers) {
-            for (const auto& [o, code, cid] : m.entries) {
-                EXPECT_GE(o, m.header.fromOffset);
-                EXPECT_LT(o, m.header.finalThrough);
-                union_[o] = {code, cid};
-            }
-        }
-        EXPECT_GE(reach, target_);
-        EXPECT_EQ(union_, model.verdicts()) << "(b) the markers carry every verdict";
-    }
-
-    void checkViews_(const CheckedWritesModel& model, const VerdictRig::RigLog& log) {
-        std::set<uint64_t> ids;
-        for (const auto& d : log.data) ids.insert(d.id);
-        const auto proj = model.projection();
-        for (const uint64_t id : ids) {
-            const auto row = r_.idRow(kProj, id);
-            const auto it = proj.find(id);
-            if (it == proj.end()) { EXPECT_FALSE(row) << "(c)(d) key " << id << " is not live"; continue; }
-            ASSERT_TRUE(row) << "(d) key " << id;
-            EXPECT_EQ(row->first, it->second.first) << "key " << id;
-            EXPECT_EQ(row->second, it->second.second) << "key " << id;
-        }
-        const auto counts = model.countById();
-        for (const uint64_t id : ids) {
-            const auto it = counts.find(id);
-            const int64_t want = it == counts.end() ? 0 : it->second, got = r_.countRow(kCnt, id).value_or(0);
-            EXPECT_EQ(got, want) << "count of key " << id;
-        }
-    }
-
-    void checkDelivered_(const CheckedWritesModel& model, int64_t sub) {
-        const auto& box = r_.collect(sub);
-        std::vector<std::tuple<int64_t, uint64_t, uint16_t>> got, want;
-        for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.tag);
-        const bool filtered = c_.entity == Entity::FilteredSubscription;
-        for (const auto& a : model.acceptedRecords()) {
-            if (filtered && (a.del || a.tag != 1)) continue;
-            want.emplace_back(a.offset, a.id, a.del ? kTombstoneTag : a.tag);
-        }
-        EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones";
-    }
-
     void checkAcks_(const Expected& ex, const CheckedWritesModel& model) {
         if (c_.entity == Entity::OldWriters) {
             for (const Sent& s : sent_) {
@@ -352,19 +297,6 @@ private:
                 EXPECT_EQ(d.baseOffset, o.baseOffset);
                 EXPECT_EQ(d.verdicts, o.verdicts) << "a retry in the window replays the original verdicts";
             }
-        }
-    }
-
-    void checkCompaction_(const CheckedWritesModel& model, const VerdictRig::RigLog& before) {
-        const auto cp = r_.compact();
-        const auto after = r_.readLog();
-        std::set<int64_t> kept;
-        for (const auto& d : after.data) kept.insert(d.offset);
-        for (const auto& d : before.data)
-            if (d.offset >= cp.bound) EXPECT_TRUE(kept.count(d.offset)) << "(g) offset " << d.offset << " is at or above the verdict bound " << cp.bound;
-        for (const auto& [id, latest] : model.latestAcceptedByKey()) {
-            if (latest.del) continue;
-            EXPECT_TRUE(kept.count(latest.offset)) << "(e) key " << id << " lost its latest accepted record";
         }
     }
 

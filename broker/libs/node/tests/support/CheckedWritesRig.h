@@ -120,27 +120,26 @@ public:
     /// A TestReject view (and the verdict template behind it) over the source.
     void installRejectView(int32_t viewTopicId, uint64_t objectId, TestRejectRule rule, const char* name = "rej", bool persisted = false) {
         if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0);
-        installs_.push_back([=, this] { installRejectViewNow_(viewTopicId, objectId, rule, name, persisted); });
-        installs_.back()();
+        installs_.emplace_back(viewTopicId, [=, this] { installRejectViewNow_(viewTopicId, objectId, rule, name, persisted); });
+        installs_.back().second();
     }
     void installProjection(int32_t viewTopicId, const char* name = "proj") {
-        installs_.push_back([=, this] { installProjectionNow_(viewTopicId, name); });
-        installs_.back()();
+        installs_.emplace_back(viewTopicId, [=, this] { installProjectionNow_(viewTopicId, name); });
+        installs_.back().second();
     }
     /// count(*) of the records folded per id (a view key is an 8-byte field: the tag cannot group).
     void installCountById(int32_t viewTopicId, const char* name = "cnt") {
-        installs_.push_back([=, this] { installCountNow_(viewTopicId, name); });
-        installs_.back()();
+        installs_.emplace_back(viewTopicId, [=, this] { installCountNow_(viewTopicId, name); });
+        installs_.back().second();
     }
-    /// The first installed verdict view goes away (its object leaves the constraint set).
+    /// The verdict view goes away (its object leaves the constraint set).
     void dropRejectView(int32_t viewTopic) {
         vs->uninstallView(viewTopic);
-        installs_.erase(installs_.begin());
+        std::erase_if(installs_, [&](const auto& i) { return i.first == viewTopic; });
     }
     /// The reject view `oldTopic` is replaced by `newTopic` (same object, another rule): the old one retires.
     void replaceRejectView(int32_t oldTopic, int32_t newTopic, uint64_t objectId, TestRejectRule rule) {
-        vs->uninstallView(oldTopic);
-        installs_.erase(installs_.begin());
+        dropRejectView(oldTopic);
         installRejectView(newTopic, objectId, rule, "rej2");
     }
     /// A new Worker, view set and replica over the same log: a restart.  The views are re-installed unless `reinstall` is false.
@@ -167,7 +166,7 @@ public:
     void truncateTo(int64_t offset) { log->truncateTo(offset); passes(5); }
     /// Another replica takes over: this node's tail above the HW is gone and no memory survives.
     void failover(bool reinstall = true) { restart(reinstall, replica->highWatermark()); }
-    void reinstallAll() { for (auto& f : installs_) f(); }
+    void reinstallAll() { for (auto& i : installs_) i.second(); }
     void demote() {
         replica->becomeFollower(++epoch_, 2);
         passes(3);
@@ -739,7 +738,7 @@ private:
  private:
     int64_t rollBytes_;
     uint64_t cleanedSeq_ = 0;
-    std::vector<std::function<void()>> installs_;
+    std::vector<std::pair<int32_t, std::function<void()>>> installs_;   ///< (view topic, install): replayed by a restart
     int64_t epoch_ = 1;
     bool recovering_ = false;   ///< the views of a restarted node load their checkpoints
     std::filesystem::path viewDir_, logDir_;
