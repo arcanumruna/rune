@@ -838,23 +838,6 @@ TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegre
     EXPECT_TRUE(isOk(s.await(tok, 15s))) << "the next batch is acked normally";
 }
 
-TEST(CheckedWritesBrokerRegression, PlainWritersOnAVerdictSourceKeepTodaysAcksShardRegression) {
-    OneBroker b("cw-verdict-old", OneBroker::Runtime::Shard);
-    const int32_t src = defineVerdictSource(b);
-    for (const rc::Acks acks : {rc::Acks::Leader, rc::Acks::All}) {
-        Sender s(b.clientConfig(), "vt", src, 1, acks);
-        for (uint64_t id = 1; id <= 4; ++id) {
-            const std::string v = verdictValue(id, 1, id % 2 == 0 ? 9 : 1);
-            rc::SendResult r = rc::SendResult::BackPressured;
-            const uint64_t tok = s.next++;
-            while (r == rc::SendResult::BackPressured)
-                r = s.prod->trySend(*s.topic, rc::Key(id), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()), *s.cq, tok);
-            s.prod->flush();
-            EXPECT_TRUE(isOk(s.await(tok, 15s))) << "acks " << static_cast<int>(acks) << " record " << id << ": no verdict reaches a writer that did not ask";
-        }
-    }
-}
-
 // ===========================================================================================================
 // Part 04: verdict sources on three real brokers.  TestReject (tag 9, object 7) is installed on every node's worker.
 // ===========================================================================================================
@@ -904,7 +887,7 @@ void installTagReject(BrokerNode& node, int32_t topicId) {
 struct NodeVerdicts {
     std::set<int64_t> indexed, rejectedInLog;
     int64_t covered = 0, dataEnd = 0;
-    uint64_t mismatches = 0;
+    uint64_t mismatches = 0, rejectionsConstraint = 0;
 };
 /// What node `node` holds: its index (worker thread) and the tag-9 records of its committed log (owner thread).
 NodeVerdicts verdictsOf(BrokerNode& node, int32_t topicId) {
@@ -924,6 +907,7 @@ NodeVerdicts verdictsOf(BrokerNode& node, int32_t topicId) {
             out.covered = ws->rejected.coveredThrough();
             out.mismatches = ws->rejected.mismatches();
         }
+        if (const VerdictSourceStats* st = wk.verdictStatsForTest(topicId, 0)) out.rejectionsConstraint = st->rejectionsConstraint;
         return 0;
     });
     return out;
@@ -985,6 +969,92 @@ std::set<int64_t> deliveredFromZero(rc::ClientConfig cfg, int32_t topicId, std::
 constexpr uint16_t kConstraintViolation = static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation);
 
 }  // namespace
+
+namespace {
+/// `vt_v` over the one-node verdict source.
+int32_t createVtView(OneBroker& b, int32_t srcTopicId) {
+    const auto view = b.connectClient()->createViewAndWait("vt_v", "id", 0, vtViewPlan(srcTopicId), {}, 60s);
+    EXPECT_EQ(view.errorCode, 0) << view.detail;
+    return view.viewTopicId;
+}
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, CoalescedBatchWithOneBadRecordShardRegression) {
+    OneBroker b("cw-verdict-coalesced", OneBroker::Runtime::Shard);
+    const int32_t src = defineVerdictSource(b);
+    const int32_t viewTopic = createVtView(b, src);
+    ASSERT_FALSE(HasFatalFailure());
+    Sender s(b.clientConfig(), "vt", src, 1, kAllView);
+    const auto sendBatch = [&](uint64_t firstId, int bad) {
+        std::vector<uint64_t> toks;
+        for (uint64_t k = 0; k < 8; ++k) {
+            const std::string v = verdictValue(firstId + k, 1, static_cast<int>(k) + 1 == bad ? 9 : 1);
+            rc::SendResult r = rc::SendResult::BackPressured;
+            const uint64_t tok = s.next++;
+            while (r == rc::SendResult::BackPressured)
+                r = s.prod->trySend(*s.topic, rc::Key(firstId + k), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()), *s.cq, tok);
+            EXPECT_EQ(r, rc::SendResult::Ok);
+            toks.push_back(tok);
+        }
+        s.prod->flush();
+        return toks;
+    };
+    const auto first = sendBatch(1, 3);
+    for (std::size_t i = 0; i < first.size(); ++i) {
+        const auto c = s.await(first[i], 15s);
+        ASSERT_TRUE(c) << "record " << i + 1;
+        if (i == 2) {
+            EXPECT_EQ(c->status, rc::OpStatus::BrokerError);
+            EXPECT_EQ(c->errorCode, kConstraintViolation);
+            EXPECT_EQ(rc::constraintIdOf(*c), rune::view::constraintIdOf(7, 1));
+        } else {
+            EXPECT_EQ(c->status, rc::OpStatus::Ok) << "record " << i + 1;
+        }
+    }
+    for (const uint64_t tok : sendBatch(101, 0)) EXPECT_TRUE(isOk(s.await(tok, 15s))) << "the next batch is acked normally";
+    auto reader = b.connectClient();
+    bool answered = false;
+    EXPECT_FALSE(vtRow(*reader, viewTopic, 3, &answered).has_value());
+    EXPECT_TRUE(answered) << "id 3 is absent from the view";
+    EXPECT_TRUE(vtRow(*reader, viewTopic, 4, &answered).has_value());
+    EXPECT_EQ(deliveredFromZero(b.clientConfig(), src, 15).count(3), 0u) << "a consumer from 0 never sees the rejected record (id 3, after the set change at offset 0)";
+}
+
+TEST(CheckedWritesBrokerRegression, OldWritersOnAVerdictSourceNeverSeeRejectedRecordsShardRegression) {
+    OneBroker b("cw-verdict-old", OneBroker::Runtime::Shard);
+    const int32_t src = defineVerdictSource(b);
+    const int32_t viewTopic = createVtView(b, src);
+    ASSERT_FALSE(HasFatalFailure());
+    // Every writer that does not ask for a verdict writes a tag-1 record (odd id) and a tag-9 record (even id).
+    struct Writer { rc::Acks acks; int32_t announce; };
+    uint64_t id = 1;
+    std::vector<std::unique_ptr<Sender>> senders;
+    for (const Writer w : {Writer{rc::Acks::Leader, 0}, Writer{rc::Acks::All, 0}, Writer{rc::Acks::None, 0}, Writer{rc::Acks::All, 11}}) {
+        rc::ClientConfig cfg = b.clientConfig();
+        cfg.testAnnounceClientVersion = w.announce;
+        senders.push_back(std::make_unique<Sender>(cfg, "vt", src, 1, w.acks));
+        Sender& s = *senders.back();
+        for (const uint16_t tag : {uint16_t{1}, uint16_t{9}}) {
+            const uint64_t tok = s.sendValue(id, verdictValue(id, 1, tag));
+            if (w.acks != rc::Acks::None) EXPECT_TRUE(isOk(s.await(tok, 15s))) << "acks " << static_cast<int>(w.acks) << " announce " << w.announce << " id " << id << ": no verdict reaches a writer that did not ask";
+            ++id;
+        }
+    }
+    std::size_t stored = 0;
+    for (int i = 0; i < 400 && stored < 8; ++i) {
+        stored = storedValues(b.node(), src, 0).size();
+        if (stored < 8) std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_EQ(stored, 8u) << "every record was written";
+    auto reader = b.connectClient();
+    for (uint64_t k = 1; k < id; ++k) {
+        bool answered = false;
+        const auto row = vtRow(*reader, viewTopic, k, &answered);
+        ASSERT_TRUE(answered) << "row " << k;
+        EXPECT_EQ(row.has_value(), k % 2 == 1) << "id " << k << (k % 2 == 1 ? " was accepted" : " was rejected");
+    }
+    EXPECT_EQ(deliveredFromZero(b.clientConfig(), src, 4).size(), 4u) << "a consumer sees exactly the tag-1 records";
+}
 
 TEST(CheckedWritesBrokerRegression, RejectedRecordAcrossALeaderCrashThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
@@ -1119,6 +1189,10 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
     for (int id = 1; id <= 3; ++id) c.startNode(id);
     ASSERT_TRUE(c.awaitCatalogLeader(60s));
     ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 60s));
+    // The leadership scan alone rebuilds the index from the committed markers, before TestReject is back.
+    const NodeVerdicts scanned = awaitIndex(c.node(leaders[0]), src.topicId);
+    EXPECT_EQ(scanned.indexed, before.rejectedInLog) << "the markers alone restore the index";
+    EXPECT_GE(scanned.covered, scanned.dataEnd);
     for (const int id : c.runningNodes()) {
         installTagReject(c.node(id), src.topicId);
         ASSERT_FALSE(HasFatalFailure());
@@ -1127,6 +1201,7 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
     const NodeVerdicts after = awaitIndex(c.node(leaders[0]), src.topicId);
     EXPECT_EQ(after.indexed, before.rejectedInLog) << "the same offsets are rejected after the restart";
     EXPECT_EQ(after.mismatches, 0u);
+    EXPECT_EQ(after.rejectionsConstraint, 0u) << "nothing was judged again: the verdicts came from the markers";
 
     rc::ClientConfig rcfg = clientConfigFor(c, leaders[0]);
     rcfg.connectTimeoutMs = 30'000;

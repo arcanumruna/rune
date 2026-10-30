@@ -144,7 +144,12 @@ TEST_P(CheckedWritesConsumerRegression, FailsClosedBeforeTheVerdictSourceExistsR
     s.r.restart(/*reinstall=*/false);   // no judge, no install: the set is only known from the log
     const auto sub = s.r.subscribe(GetParam());
     const int64_t w = s.r.worker->writeStateForTest(VerdictRig::kSrc, 0)->verdictKnownThrough();
-    for (const auto& d : s.r.collect(sub).records) EXPECT_LT(d.offset, w);
+    std::vector<uint64_t> ids;
+    for (const auto& d : s.r.collect(sub).records) {
+        EXPECT_LT(d.offset, w);
+        ids.push_back(d.id);
+    }
+    EXPECT_EQ(ids, (std::vector<uint64_t>{1})) << "the accepted record below the known verdicts is delivered, the rejected one is not";
 }
 
 TEST(CheckedWritesConsumer, UntypedTopicPaysOneBranch) {
