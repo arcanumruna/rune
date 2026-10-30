@@ -695,9 +695,11 @@ public:
         if (vs == nullptr) return;
         if (vs->nsSlotCapacity() != nsSlots_.capacity()) vs->configureNsSlots(nsSlots_.capacity());
         // The boot slots were applied to this worker before its view set existed.
-        for (uint32_t s = 0; s < nsSlots_.capacity(); ++s)
-            if (nsSlots_.nsIdAt(static_cast<uint16_t>(s)) != NsSlotTable::kFreeSlot)
-                vs->onNsSlotAssign(static_cast<uint16_t>(s), nsSlots_.nsIdAt(static_cast<uint16_t>(s)), nsSlots_.limits(static_cast<uint16_t>(s)));
+        for (uint32_t s = 0; s < nsSlots_.capacity(); ++s) {
+            const uint16_t sl = static_cast<uint16_t>(s);
+            const uint32_t id = nsSlots_.nsIdAt(sl);
+            if (id != NsSlotTable::kFreeSlot) vs->onNsSlotAssign(sl, id, nsSlots_.limits(sl));
+        }
     }
     [[nodiscard]] WorkerViewSet* viewSet() const noexcept { return viewSet_; }
 
