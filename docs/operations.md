@@ -358,7 +358,7 @@ partition logs under `topics/`, `__catalog/` and `__security/` (the replicated e
 
 - A partition whose latest constraint set is non-empty is a verdict source. Its leader judges every record once, in offset
   order, and writes a **verdict marker** (control record 17) after a rejection and otherwise at most every
-  `RUNE_VERDICT_INTERVAL_MS` (100). **W** is the end of the committed markers; the cleaner never cleans at or above W and
+  100 ms (fixed; there is no environment variable for it). **W** is the end of the committed markers; the cleaner never cleans at or above W and
   removes a marker only after a later marker supersedes it and every replica fetched it.
 - **Verdict lag** (judgedThrough behind the log end) delays delivery and `View` acks, not `acks=all` for writers that did not
   ask for a verdict. Delivery stops at judgedThrough while a constraint view builds. A judge waits (`judgeWaitsForInstall`)
