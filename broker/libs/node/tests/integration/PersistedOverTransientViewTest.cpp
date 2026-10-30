@@ -10,7 +10,10 @@
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
+#include <ostream>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -222,4 +225,366 @@ TEST(CheckedWritesTransientViewRegression, FullRestartLosesOnlyTheUncheckpointed
 
     EXPECT_EQ(rig.hp(6), std::nullopt) << "the tail that never reached the disk is lost (spec 9a)";
     EXPECT_EQ(rig.hp(1), 6) << "the rest is kept";
+}
+
+// ---------------------------------------------------------------------------
+// The recovery matrix: entity x history op x timing = 108 cells.
+// ---------------------------------------------------------------------------
+namespace {
+
+enum class TvEntity : uint8_t { Replace, CountByGrp, MinByGrp };
+enum class TvHistoryOp : uint8_t { Upserts, Overwrites, Tombstones, GroupMoves };
+enum class TvTiming : uint8_t {
+    FullRestartEmptyRing, FullRestartRingBelowOldCursor, FullRestartRingPastOldCursor, NodeRestartReReplicatedRing,
+    NodeRestartRingStartAboveCheckpoint, FailoverLiveCursorRetained, FailoverLiveCursorEvicted, RingRecreatedLive,
+    SecondFullRestart,
+};
+struct TvFoldCell { TvEntity entity; TvHistoryOp op; TvTiming timing; };
+
+constexpr std::array<TvEntity, 3>    kEntities{TvEntity::Replace, TvEntity::CountByGrp, TvEntity::MinByGrp};
+constexpr std::array<TvHistoryOp, 4> kOps{TvHistoryOp::Upserts, TvHistoryOp::Overwrites, TvHistoryOp::Tombstones, TvHistoryOp::GroupMoves};
+constexpr std::array<TvTiming, 9>    kTimings{TvTiming::FullRestartEmptyRing, TvTiming::FullRestartRingBelowOldCursor,
+                                              TvTiming::FullRestartRingPastOldCursor, TvTiming::NodeRestartReReplicatedRing,
+                                              TvTiming::NodeRestartRingStartAboveCheckpoint, TvTiming::FailoverLiveCursorRetained,
+                                              TvTiming::FailoverLiveCursorEvicted, TvTiming::RingRecreatedLive,
+                                              TvTiming::SecondFullRestart};
+
+std::vector<TvFoldCell> cells() {
+    std::vector<TvFoldCell> out;
+    for (const TvEntity e : kEntities)
+        for (const TvHistoryOp o : kOps)
+            for (const TvTiming t : kTimings) out.push_back({e, o, t});
+    return out;
+}
+
+const char* name(TvEntity e) { return e == TvEntity::Replace ? "Replace" : e == TvEntity::CountByGrp ? "CountByGrp" : "MinByGrp"; }
+const char* name(TvHistoryOp o) {
+    switch (o) {
+        case TvHistoryOp::Upserts: return "Upserts";
+        case TvHistoryOp::Overwrites: return "Overwrites";
+        case TvHistoryOp::Tombstones: return "Tombstones";
+        case TvHistoryOp::GroupMoves: return "GroupMoves";
+    }
+    return "";
+}
+const char* name(TvTiming t) {
+    switch (t) {
+        case TvTiming::FullRestartEmptyRing: return "FullRestartEmptyRing";
+        case TvTiming::FullRestartRingBelowOldCursor: return "FullRestartRingBelowOldCursor";
+        case TvTiming::FullRestartRingPastOldCursor: return "FullRestartRingPastOldCursor";
+        case TvTiming::NodeRestartReReplicatedRing: return "NodeRestartReReplicatedRing";
+        case TvTiming::NodeRestartRingStartAboveCheckpoint: return "NodeRestartRingStartAboveCheckpoint";
+        case TvTiming::FailoverLiveCursorRetained: return "FailoverLiveCursorRetained";
+        case TvTiming::FailoverLiveCursorEvicted: return "FailoverLiveCursorEvicted";
+        case TvTiming::RingRecreatedLive: return "RingRecreatedLive";
+        case TvTiming::SecondFullRestart: return "SecondFullRestart";
+    }
+    return "";
+}
+void PrintTo(const TvFoldCell& c, std::ostream* os) { *os << name(c.entity) << "_" << name(c.op) << "_" << name(c.timing); }
+
+Kind kindOf(TvEntity e) { return e == TvEntity::Replace ? Kind::Replace : e == TvEntity::CountByGrp ? Kind::CountByGrp : Kind::MinByGrp; }
+
+// H1: six records over keys 1-4 and groups 10, 20, 30, with one overwrite (key 1) and one group move (key 3).
+// Final per key: 1 -> (10, 6), 2 -> (10, 7), 3 -> (30, 4), 4 -> (30, 9).
+constexpr std::array<Rec, 6> kMatrixH1{Rec{1, 10, 5}, Rec{2, 10, 7}, Rec{3, 20, 4}, Rec{4, 30, 9}, Rec{1, 10, 6}, Rec{3, 30, 4}};
+
+std::vector<Rec> h2(TvHistoryOp op) {
+    switch (op) {
+        case TvHistoryOp::Upserts:    return {Rec{5, 10, 3}, Rec{6, 20, 2}, Rec{7, 30, 8}};
+        case TvHistoryOp::Overwrites: return {Rec{1, 10, 60}, Rec{2, 10, 70}, Rec{3, 30, 40}};
+        case TvHistoryOp::Tombstones: return {Rec{1, 0, 0, true}, Rec{2, 0, 0, true}, Rec{4, 0, 0, true}};
+        case TvHistoryOp::GroupMoves: return {Rec{1, 20, 6}, Rec{2, 30, 7}, Rec{4, 10, 9}};
+    }
+    return {};
+}
+
+// What the instance wrote to the table must be exactly the model's, for every key (Replace) or group (aggregates).
+void expectViewEqualsModel(const ViewSetRig& rig, Kind kind, const TransientViewModel& m) {
+    for (int64_t k = 0; k < kKeyDomain; ++k) {
+        switch (kind) {
+            case Kind::Replace:
+                ASSERT_EQ(rig.hp(k), m.hp(k)) << "key " << k;
+                ASSERT_EQ(rig.grp(k), m.rows.count(k) ? std::optional<int64_t>(m.rows.at(k).grp) : std::nullopt) << "key " << k;
+                break;
+            case Kind::CountByGrp: ASSERT_EQ(rig.count(k), m.count(k)) << "group " << k; break;
+            case Kind::MinByGrp:   ASSERT_EQ(rig.minHp(k), m.minHp(k)) << "group " << k; break;
+        }
+    }
+}
+
+}  // namespace
+
+class CheckedWritesTransientViewMatrixRegression : public ::testing::TestWithParam<TvFoldCell> {};
+
+TEST(CheckedWritesTransientViewMatrixCountRegression, CellCountIsPinned) { EXPECT_EQ(cells().size(), 108u); }
+
+TEST_P(CheckedWritesTransientViewMatrixRegression, ViewEqualsThePerKeyModel) {
+    const TvFoldCell c = GetParam();
+    const Kind kind = kindOf(c.entity);
+    ViewSetRig rig("cell");
+    rig.install(kind);
+    TransientViewModel model;
+
+    rig.append(kMatrixH1);
+    ASSERT_TRUE(rig.driveUntilCaughtUp(1));
+    model.replay(kMatrixH1);
+
+    uint64_t wantResets = 1, wantEvicted = 0;
+    const std::array<Rec, 2> fresh2{Rec{31, 30, 3}, Rec{32, 10, 8}};
+    // Three records written while another node leads (nothing folds here): an overwrite and a delete of H1 keys, a new key.
+    const std::array<Rec, 3> gap{Rec{2, 10, 70}, Rec{4, 0, 0, true}, Rec{43, 20, 3}};
+    switch (c.timing) {
+        case TvTiming::FullRestartEmptyRing:
+        case TvTiming::SecondFullRestart:
+            rig.newRing(0, 2);
+            rig.restart();
+            break;
+        case TvTiming::FullRestartRingBelowOldCursor:   // new ring [0, 2), old cursor 6
+            rig.newRing(0, 2);
+            rig.append(fresh2);
+            rig.restart();
+            model.replay(fresh2);
+            break;
+        case TvTiming::FullRestartRingPastOldCursor: {  // new ring [0, 9)
+            std::vector<Rec> nine;
+            for (int64_t k = 0; k < 9; ++k) nine.push_back(Rec{40 + k, 10 * (1 + k % 3), k + 1});
+            rig.newRing(0, 2);
+            rig.append(nine);
+            rig.restart();
+            model.replay(nine);
+            break;
+        }
+        case TvTiming::NodeRestartReReplicatedRing:     // the same lineage: the ring is re-replicated from 0
+            rig.newRing(0, 1);
+            rig.append(kMatrixH1);
+            rig.restart();
+            model.replay(kMatrixH1);
+            break;
+        case TvTiming::NodeRestartRingStartAboveCheckpoint:   // offsets 6-7 were never checkpointed here; the ring starts at 8
+            rig.newRing(8, 1);
+            rig.restart();
+            break;
+        case TvTiming::FailoverLiveCursorRetained:
+            rig.append(gap);
+            model.replay(gap);
+            wantResets = 0;
+            break;
+        case TvTiming::FailoverLiveCursorEvicted:
+            rig.append(gap);
+            rig.evictTo(rig.logEnd() - 1);   // the cursor (6) + 2: the first two never fold
+            model.replay(std::span<const Rec>(gap).subspan(2));
+            wantResets = 0;
+            wantEvicted = 2;
+            break;
+        case TvTiming::RingRecreatedLive:               // incarnation 1 -> 2, new content from offset 0
+            rig.newRing(0, 2);
+            rig.append(fresh2);
+            model.replay(fresh2);
+            break;
+    }
+
+    const std::vector<Rec> second = h2(c.op);
+    rig.append(second);
+    model.replay(second);
+    const int64_t probe = kind == Kind::Replace ? 1 : 10;
+    (void)rig.pass(3, /*maxRecordsPerRead=*/1);
+    EXPECT_EQ(rig.status(kind, probe), RowStatus::NotReady) << "(d) a re-fold in progress is never served";
+    ASSERT_TRUE(rig.driveUntilCaughtUp(3));
+    EXPECT_TRUE(rig.status(kind, probe) == RowStatus::Ok || rig.status(kind, probe) == RowStatus::NotFound);
+
+    if (c.timing == TvTiming::SecondFullRestart) {      // H2 is folded and checkpointed; a second restart, then H3
+        rig.newRing(0, 3);
+        rig.restart();
+        const std::array<Rec, 1> h3{Rec{8, 20, 4}};
+        rig.append(h3);
+        model.replay(h3);
+        ASSERT_TRUE(rig.driveUntilCaughtUp(5));
+    }
+
+    expectViewEqualsModel(rig, kind, model);   // (a) rows, (c) no double count
+    EXPECT_EQ(rig.counters(kind).transientSourceResets, wantResets) << "(b)";
+    EXPECT_EQ(rig.counters(kind).transientRecordsEvicted, wantEvicted) << "(b)";
+
+    const auto image = rig.tableImage(kind);   // (e) what was folded after the event is durable
+    rig.newRing(0, 9);
+    rig.restart();
+    ASSERT_TRUE(rig.driveUntilCaughtUp(7));
+    EXPECT_EQ(rig.tableImage(kind), image);
+    expectViewEqualsModel(rig, kind, model);
+}
+
+INSTANTIATE_TEST_SUITE_P(Cell, CheckedWritesTransientViewMatrixRegression, ::testing::ValuesIn(cells()),
+    [](const ::testing::TestParamInfo<TvFoldCell>& i) {
+        return std::string(name(i.param.entity)) + "_" + name(i.param.op) + "_" + name(i.param.timing);
+    });
+
+// ---------------------------------------------------------------------------
+// Model check: seeded random histories over all three views.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct ModelRun {
+    ViewSetRig rig{"model"};
+    TransientViewModel model;
+    uint64_t resets = 0, evicted = 0;       // what the model expects the instances to have counted, summed over their lives
+    uint64_t gotResets = 0, gotEvicted = 0; // what the dead instances counted
+    uint32_t incarnation = 1;
+    uint64_t gen = 1;
+    bool live = false;   // the instances exist and track the ring: true after the first pass
+    std::vector<std::string> steps;
+
+    /// A restart reconciles (and counts) once per view that recovered a checkpoint cursor.
+    [[nodiscard]] uint64_t recoveringViews() const {
+        uint64_t n = 0;
+        for (const Kind k : {Kind::Replace, Kind::CountByGrp, Kind::MinByGrp}) n += rig.hasCheckpoint(k);
+        return n;
+    }
+    [[nodiscard]] uint64_t countedResets() const {
+        uint64_t n = gotResets;
+        for (const Kind k : {Kind::Replace, Kind::CountByGrp, Kind::MinByGrp}) n += rig.counters(k).transientSourceResets;
+        return n;
+    }
+    void harvest() {
+        for (const Kind k : {Kind::Replace, Kind::CountByGrp, Kind::MinByGrp}) {
+            gotResets += rig.counters(k).transientSourceResets;
+            gotEvicted += rig.counters(k).transientRecordsEvicted;
+        }
+    }
+    void settle() {
+        gen += 2;
+        ASSERT_TRUE(rig.driveUntilCaughtUp(gen));
+        live = true;
+    }
+};
+
+Rec randomRec(std::mt19937_64& rng) {
+    static constexpr std::array<int64_t, 3> kGroups{10, 20, 30};
+    const int64_t key = 1 + static_cast<int64_t>(rng() % 8);
+    if (rng() % 4 == 0) return Rec{key, 0, 0, true};
+    return Rec{key, kGroups[rng() % 3], 1 + static_cast<int64_t>(rng() % 50)};
+}
+std::vector<Rec> randomRecs(std::mt19937_64& rng, std::size_t n) {
+    std::vector<Rec> out;
+    for (std::size_t i = 0; i < n; ++i) out.push_back(randomRec(rng));
+    return out;
+}
+
+void expectAllViewsEqualModel(const ModelRun& r) {
+    for (const Kind k : {Kind::Replace, Kind::CountByGrp, Kind::MinByGrp}) expectViewEqualsModel(r.rig, k, r.model);
+}
+
+// (e): the checkpoint of what is folded now is the whole table - a full restart with an empty ring changes nothing.
+void expectDurable(ModelRun& r) {
+    std::array<std::vector<std::vector<uint8_t>>, 3> image;
+    const std::array<Kind, 3> kinds{Kind::Replace, Kind::CountByGrp, Kind::MinByGrp};
+    for (std::size_t i = 0; i < kinds.size(); ++i) image[i] = r.rig.tableImage(kinds[i]);
+    const std::vector<Rec> ring = r.rig.ringRecs();
+    const int64_t start = r.rig.logStart();
+    r.harvest();
+    const uint64_t recovering = r.recoveringViews();
+    r.rig.newRing(0, ++r.incarnation);
+    r.rig.restart();
+    r.gen += 2;
+    ASSERT_TRUE(r.rig.driveUntilCaughtUp(r.gen));
+    for (std::size_t i = 0; i < kinds.size(); ++i) ASSERT_EQ(r.rig.tableImage(kinds[i]), image[i]) << "(e) view " << i;
+    r.resets += recovering;
+    // Put the ring back: the same records at the same offsets, as a restarted node would hold them.
+    r.harvest();
+    r.rig.newRing(start, ++r.incarnation);
+    r.rig.append(ring);
+    r.rig.restart();
+    r.gen += 2;
+    ASSERT_TRUE(r.rig.driveUntilCaughtUp(r.gen));
+    r.resets += recovering;
+    r.live = true;
+    r.model.replay(ring);
+    ASSERT_NO_FATAL_FAILURE(expectAllViewsEqualModel(r));
+}
+
+}  // namespace
+
+TEST(CheckedWritesTransientViewModelRegression, RandomHistoriesMatchThePerKeyModel) {
+    for (uint64_t seed = 1; seed <= 200; ++seed) {
+        SCOPED_TRACE("seed " + std::to_string(seed));
+        std::mt19937_64 rng(seed);
+        ModelRun r;
+        for (const Kind k : {Kind::Replace, Kind::CountByGrp, Kind::MinByGrp}) r.rig.install(k);
+        for (int step = 0; step < 40; ++step) {
+            const unsigned what = static_cast<unsigned>(rng() % 10);
+            if (what < 4) {                                     // write a batch of 1-3 records
+                const std::vector<Rec> recs = randomRecs(rng, 1 + rng() % 3);
+                r.steps.push_back("write " + std::to_string(recs.size()));
+                r.rig.append(recs);
+                r.model.replay(recs);
+                ASSERT_NO_FATAL_FAILURE(r.settle());
+            } else if (what == 4) {                             // full restart: a fresh ring, 0-2 records in it
+                const std::vector<Rec> fresh = randomRecs(rng, rng() % 3);
+                r.steps.push_back("full restart " + std::to_string(fresh.size()));
+                r.harvest();
+                r.resets += r.recoveringViews();
+                r.rig.newRing(0, ++r.incarnation);
+                r.rig.append(fresh);
+                r.rig.restart();
+                r.model.replay(fresh);
+                ASSERT_NO_FATAL_FAILURE(r.settle());
+            } else if (what == 5) {                             // node restart: the same lineage, 0-3 oldest evicted
+                const std::vector<Rec> ring = r.rig.ringRecs();
+                const std::size_t drop = std::min<std::size_t>(rng() % 4, ring.size());
+                r.steps.push_back("node restart evicting " + std::to_string(drop));
+                const int64_t start = r.rig.logStart() + static_cast<int64_t>(drop);
+                r.harvest();
+                r.resets += r.recoveringViews();
+                r.rig.newRing(start, ++r.incarnation);
+                r.rig.append(std::span<const Rec>(ring).subspan(drop));
+                r.rig.restart();
+                r.model.replay(std::span<const Rec>(ring).subspan(drop));
+                ASSERT_NO_FATAL_FAILURE(r.settle());
+            } else if (what == 6) {                             // failover: records written elsewhere, 0-3 of them evicted
+                const std::vector<Rec> gap = randomRecs(rng, rng() % 4);
+                const std::size_t drop = rng() % (gap.size() + 1);
+                r.steps.push_back("failover gap " + std::to_string(gap.size()) + " evicting " + std::to_string(drop));
+                const int64_t end = r.rig.logEnd();
+                r.rig.append(gap);
+                r.rig.evictTo(end + static_cast<int64_t>(drop));
+                r.model.replay(std::span<const Rec>(gap).subspan(drop));
+                if (r.live) r.evicted += 3 * drop;
+                ASSERT_NO_FATAL_FAILURE(r.settle());
+            } else if (what == 7) {                             // the ring is recreated under the live views
+                const std::vector<Rec> fresh = randomRecs(rng, rng() % 3);
+                r.steps.push_back("ring recreated " + std::to_string(fresh.size()));
+                r.rig.newRing(0, ++r.incarnation);
+                r.rig.append(fresh);
+                r.model.replay(fresh);
+                if (r.live) r.resets += 3;
+                ASSERT_NO_FATAL_FAILURE(r.settle());
+            } else if (what == 8) {                             // the ring is cut below the cursor (generation + 1)
+                const int64_t start = r.rig.logStart(), end = r.rig.logEnd();
+                const int64_t cut = start + static_cast<int64_t>(rng() % static_cast<uint64_t>(end - start + 1));
+                const std::vector<Rec> replacement = randomRecs(rng, rng() % 3);
+                r.steps.push_back("cut at " + std::to_string(cut) + " with " + std::to_string(replacement.size()));
+                r.rig.cutAt(cut, replacement);
+                r.model.replay(replacement);
+                if (r.live && cut < end) r.resets += 3;
+                ASSERT_NO_FATAL_FAILURE(r.settle());
+            } else {
+                r.steps.push_back("durability probe");
+                ASSERT_NO_FATAL_FAILURE(expectDurable(r));
+            }
+            ASSERT_NO_FATAL_FAILURE(expectAllViewsEqualModel(r)) << "step " << step << ": " << r.steps.back();
+            EXPECT_EQ(r.countedResets(), r.resets) << "step " << step << ": " << r.steps.back();
+            if (::testing::Test::HasFailure()) {
+                for (const std::string& s : r.steps) ADD_FAILURE() << s;
+                return;
+            }
+        }
+        ASSERT_NO_FATAL_FAILURE(expectDurable(r));
+        r.harvest();
+        EXPECT_EQ(r.gotResets, r.resets) << "transientSourceResets summed over every instance";
+        EXPECT_EQ(r.gotEvicted, r.evicted) << "transientRecordsEvicted summed over every instance";
+        if (::testing::Test::HasFailure()) {
+            for (const std::string& s : r.steps) ADD_FAILURE() << s;
+            return;
+        }
+    }
 }

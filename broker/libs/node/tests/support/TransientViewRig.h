@@ -73,6 +73,8 @@ inline rune::view::ViewPlan plan(Kind k, uint8_t persistence) {
     using P = rune::codec::PrimType; using R = rune::view::MergeRule;
     rune::view::ViewPlan v;
     v.persistence = persistence;
+    v.sizing.chunkBytes = 64u << 10;   // small tables: the matrices build thousands of instances
+    v.sizing.capacity   = 256;
     switch (k) {
         case Kind::Replace:
             v.viewName = "tv_rows"; v.key = "characterId"; v.sources = {{kSrcTopic, "characterId"}};
@@ -184,6 +186,7 @@ public:
         }
     }
 
+    [[nodiscard]] std::optional<int64_t> grp(int64_t key) const { return slot_(Kind::Replace, key, 1); }
     [[nodiscard]] std::optional<int64_t> hp(int64_t key) const { return slot_(Kind::Replace, key, 2); }
     [[nodiscard]] std::optional<int64_t> count(int64_t grp) const { return slot_(Kind::CountByGrp, grp, 1); }
     [[nodiscard]] std::optional<int64_t> minHp(int64_t grp) const { return slot_(Kind::MinByGrp, grp, 1); }
@@ -211,6 +214,12 @@ public:
             out.push_back(std::move(img));
         }
         return out;
+    }
+
+    /// True once the view pushed a checkpoint delta: a restart then recovers a cursor, not an empty file.
+    [[nodiscard]] bool hasCheckpoint(Kind kind) const {
+        const auto it = image_.find(viewId(kind));
+        return it != image_.end() && !it->second.empty();
     }
 
     /// The data records the ring holds, in offset order.
