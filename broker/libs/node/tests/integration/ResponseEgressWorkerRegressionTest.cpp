@@ -263,7 +263,7 @@ public:
         return offerGw(buf.data(), s.encode(buf.data()));
     }
     bool sendDefineTopic(int64_t sid, int64_t corr, std::string_view name, rune::protocol::RequestId rid) {
-        const auto descriptor = charBlob();
+        const std::vector<uint8_t> descriptor;   // untyped: the test sends opaque bytes (a typed topic validates every write)
         pc::DefineTopic m;
         m.sessionId = sid; m.correlationId = corr; m.topicName = name; m.partitionCount = 1;
         m.keyField = "id"; m.validate = false; m.persistence = 0;
@@ -425,9 +425,10 @@ struct Env {
     }
 };
 
+/// One record carrying `value` as the tail of a valid character record (the AuthRig topics are typed and validate every write).
 std::vector<uint8_t> batchOf(const std::string& value) {
     rune::protocol::RecordBatchBuilder b(0, 1000);
-    b.append("k", value, 1000);
+    b.append(charKey(), charValue(value), 1000);
     return b.build();
 }
 
@@ -441,7 +442,9 @@ std::vector<std::string> recordValues(const std::vector<Frame>& frames, int64_t 
         if (!rec) continue;
         rune::protocol::RecordBatchReader reader(rec->recordBatch.data(), rec->recordBatch.size());
         if (!reader.ensureValid()) continue;
-        reader.forEachRecord([&](std::string_view, std::string_view val, int64_t, int64_t) { out.emplace_back(val); });
+        reader.forEachRecord([&](std::string_view, std::string_view val, int64_t, int64_t) {
+            out.emplace_back(val.size() >= kCharValuePrefix ? val.substr(kCharValuePrefix) : val);   // the tag batchOf appended
+        });
     }
     return out;
 }

@@ -164,7 +164,7 @@ TEST(AuthSessionBindingRegression, AFrameNamingAnotherSessionsIdNeverOpensRegres
     std::this_thread::sleep_for(200ms);   // let the gateway poll everything the attacker sent
     EXPECT_TRUE(b.node().gatewayHasSessionForTest(sid)) << "a plaintext Disconnect never ends an encrypted session";
     // The admin's own session still works, and the topic the attacker named was never created by its request.
-    const auto made = admin->defineTopicAndWait("hijacked", 1, "", false, {}, 20s);
+    const auto made = admin->defineTopicAndWait("hijacked", 1, "", {}, 20s);
     EXPECT_EQ(made.errorCode, 0) << made.detail << " - the attacker's DefineTopic must not have created it";
     EXPECT_EQ(admin->testSeedSessionId(), sid) << "the same session, never replaced";
     admin->closeImmediately();
@@ -198,8 +198,8 @@ TEST(AuthTlsRegression, ShardProduceDecryptsThenChecksWriteRegression) {
                         "grant describe on cluster to user ws1;\n");
     auto admin = tlsClient(b, "admin", kAdminPw);
     ASSERT_EQ(connectError(*admin), "");
-    const auto orders = admin->defineTopicAndWait("orders", 1, "", false, {}, 20s);
-    const auto secret = admin->defineTopicAndWait("secret", 1, "", false, {}, 20s);
+    const auto orders = admin->defineTopicAndWait("orders", 1, "", {}, 20s);
+    const auto secret = admin->defineTopicAndWait("secret", 1, "", {}, 20s);
     ASSERT_EQ(orders.errorCode, 0) << orders.detail;
     ASSERT_EQ(secret.errorCode, 0) << secret.detail;
     admin->closeImmediately();
@@ -260,7 +260,7 @@ TEST(AuthTlsRegression, AWorkerRouteWithoutAReceiverIdFromAnOldBrokerStillProduc
                         "grant describe on cluster to user ws1;\n");
     auto admin = tlsClient(b, "admin", kAdminPw);
     ASSERT_EQ(connectError(*admin), "");
-    const auto orders = admin->defineTopicAndWait("orders", 1, "", false, {}, 20s);
+    const auto orders = admin->defineTopicAndWait("orders", 1, "", {}, 20s);
     ASSERT_EQ(orders.errorCode, 0) << orders.detail;
     admin->closeImmediately();
 
@@ -369,7 +369,7 @@ TEST(AuthSessionBindingRegression, APlaintextProduceNamingAnEncryptedSessionIsNe
                         "grant describe on cluster to user ws1;\n");
     auto admin = tlsClient(b, "admin", kAdminPw);
     ASSERT_EQ(connectError(*admin), "");
-    const auto orders = admin->defineTopicAndWait("orders", 1, "", false, {}, 20s);
+    const auto orders = admin->defineTopicAndWait("orders", 1, "", {}, 20s);
     ASSERT_EQ(orders.errorCode, 0) << orders.detail;
     admin->closeImmediately();
 
@@ -379,7 +379,7 @@ TEST(AuthSessionBindingRegression, APlaintextProduceNamingAnEncryptedSessionIsNe
     ASSERT_GT(sid, 0);
 
     AuthWireClient& attacker = b.wire();
-    const auto batch = makeBatch(1);
+    const auto batch = makeCharBatch(1);
     for (int i = 0; i < 4; ++i) {
         ASSERT_TRUE(attacker.raw().produce(b.workerIngressChannel(), AuthWireClient::kClientStream, sid, 9000 + i,
                                            orders.topicId, 0, 1, batch));

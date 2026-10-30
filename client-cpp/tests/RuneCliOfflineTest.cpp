@@ -28,8 +28,8 @@ TEST(RuneCliOffline, UsageListsConsoleAndReadOnlySchema) {
     EXPECT_EQ(u.find("schema alter"), std::string::npos) << u;
 }
 
-TEST(RuneQlCliRegression, UsageListsValidateAndExpectedVersionRegression) {
-    // #304: `rune ql`'s usage names --validate and --expected-version (the flags it parses), on a bad flag and in the
+TEST(RuneQlCliRegression, UsageListsTheParsedFlagsRegression) {
+    // #304: `rune ql`'s usage names --expected-version (the flags it parses), on a bad flag and in the
     // top-level usage.
     std::ostringstream out, err;
     ASSERT_EQ(rune::cli::run({"ql", "--no-such-flag"}, out, err), 2);
@@ -42,7 +42,7 @@ TEST(RuneQlCliRegression, UsageListsValidateAndExpectedVersionRegression) {
     ASSERT_NE(from, std::string::npos) << all;
     ASSERT_NE(to, std::string::npos) << all;
     const std::string top = all.substr(from, to - from);
-    for (const char* f : {"-e", "-f", "--dry-run", "--verbose", "--request-id", "--validate", "--expected-version", "--broker"}) {
+    for (const char* f : {"-e", "-f", "--dry-run", "--verbose", "--request-id", "--expected-version", "--broker"}) {
         EXPECT_NE(own.find(f), std::string::npos) << f << " missing from `rune ql`'s own usage:\n" << own;
         EXPECT_NE(top.find(f), std::string::npos) << f << " missing from the top-level `rune ql` usage:\n" << top;
     }
@@ -56,4 +56,25 @@ TEST(RuneCliOfflineRegression, QlScriptFromDashReadsTheInjectedStreamRegression)
     const int rc = rune::cli::run({"ql", "-f", "-", "--dry-run"}, in, out, err);
     ASSERT_EQ(rc, 0) << err.str();
     EXPECT_NE(out.str().find("topic injected_t"), std::string::npos) << out.str();
+}
+
+// Checked writes Part 02: typed topics always validate, so the flag is gone.
+TEST(CheckedWritesCli, ValidateFlagIsGoneRegression) {
+    std::ostringstream out, err;
+    EXPECT_EQ(rune::cli::run({"ql", "--validate", "-e", "topic e;"}, out, err), 2);
+    EXPECT_NE(err.str().find("--validate"), std::string::npos) << err.str();
+    std::ostringstream out2, err2;
+    EXPECT_EQ(rune::cli::run({"console", "--validate"}, out2, err2), 2);
+    EXPECT_NE(err2.str().find("--validate"), std::string::npos) << err2.str();
+}
+
+TEST(CheckedWritesCli, PlanMarksRawTopics) {
+    std::ostringstream out, err;
+    ASSERT_EQ(rune::cli::run({"ql", "--dry-run", "-e", "topic e;"}, out, err), 0) << err.str();
+    EXPECT_EQ(out.str(), "topic e partitions 1 replicas 0 persistence disk raw\n");
+    std::ostringstream out2, err2;
+    ASSERT_EQ(rune::cli::run({"ql", "--dry-run", "-e", "topic p { id int64 } key id;"}, out2, err2), 0) << err2.str();
+    EXPECT_EQ(out2.str().find(" raw"), std::string::npos) << out2.str();
+    EXPECT_EQ(out2.str().find("validate"), std::string::npos) << out2.str();
+    EXPECT_NE(out2.str().find("topic p partitions 1 replicas 0 persistence disk key id\n"), std::string::npos) << out2.str();
 }

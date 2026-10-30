@@ -1,6 +1,7 @@
 // src/Validator.cpp
 #include <rune/codec/Validator.h>
 #include <rune/codec/Evolve.h>
+#include <rune/codec/Utf8.h>
 #include <algorithm>
 #include <cstring>
 
@@ -41,7 +42,7 @@ void Validator::build_(const Descriptor& d) {
 // ---------------------------------------------------------------------------
 // validate — allocation-free, noexcept
 // ---------------------------------------------------------------------------
-ValResult Validator::validate(std::span<const uint8_t> rec) const noexcept {
+ValResult Validator::validate(std::span<const uint8_t> rec, StringCheck check) const noexcept {
     // ----------------------------------------------------------------
     // 1. Header must be present (blockLength:u16 + version:u16 = 4 bytes)
     // ----------------------------------------------------------------
@@ -79,6 +80,17 @@ ValResult Validator::validate(std::span<const uint8_t> rec) const noexcept {
 
         if (end > fixedEnd)
             return {false, e.id, "fixed field extends past blockLength"};
+
+        if (e.type == PrimType::FixedStr && check == StringCheck::Utf8) {
+            const uint8_t* p = rec.data() + off;
+            const auto* nul = static_cast<const uint8_t*>(std::memchr(p, 0, e.size));
+            const size_t content = nul ? size_t(nul - p) : e.size;
+            for (size_t k = content; k < e.size; ++k)
+                if (p[k] != 0)
+                    return {false, e.id, "string(N) padding is not zero"};
+            if (!validateUtf8({p, content}).ok())
+                return {false, e.id, "string is not valid UTF-8"};
+        }
 
         // Enum whitelist check (interpret as signed int32_t per spec)
         if (e.type == PrimType::Enum && !e.enumValues.empty()) {
@@ -125,6 +137,9 @@ ValResult Validator::validate(std::span<const uint8_t> rec) const noexcept {
 
         if (pos + len > rec.size())
             return {false, e.id, "var field data truncated"};
+
+        if (e.type == PrimType::String && check == StringCheck::Utf8 && !validateUtf8({rec.data() + pos, len}).ok())
+            return {false, e.id, "string is not valid UTF-8"};
 
         pos += len;
     }

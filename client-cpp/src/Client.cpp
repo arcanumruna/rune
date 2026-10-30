@@ -29,6 +29,7 @@
 #include <rune/protocol/client/AuthMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
+#include <rune/codec/PrimType.h>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/NamespaceMessages.h>
 
@@ -50,6 +51,8 @@
 #include <unordered_map>
 
 namespace rune::client {
+
+static_assert(Key::kMaxInline == rune::codec::kMaxTopicKeyBytes, "a topic key field is at most as wide as a Key");
 static_assert(kMaxPasswordBytes == detail::FixedSecret::kCapacity);
 
 namespace {
@@ -1376,21 +1379,19 @@ OpResult Client::ping(std::span<const uint8_t> payload, CompletionTarget target,
 }
 
 OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
-                             bool validate, std::span<const uint8_t> descriptorBlob,
+                             std::span<const uint8_t> descriptorBlob, CompletionTarget target, Token token) {
+    return defineTopic(name, partitions, keyField, descriptorBlob, Persistence::Disk, target, token);
+}
+
+OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
+                             std::span<const uint8_t> descriptorBlob, Persistence persistence,
                              CompletionTarget target, Token token) {
-    return defineTopic(name, partitions, keyField, validate, descriptorBlob,
-                       Persistence::Disk, target, token);
+    return defineTopic(name, partitions, keyField, descriptorBlob, persistence, TopicOptions{}, DdlOptions{},
+                       target, token);
 }
 
 OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
-                             bool validate, std::span<const uint8_t> descriptorBlob,
-                             Persistence persistence, CompletionTarget target, Token token) {
-    return defineTopic(name, partitions, keyField, descriptorBlob, validate, persistence, TopicOptions{},
-                       DdlOptions{}, target, token);
-}
-
-OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
-                             std::span<const uint8_t> descriptorBlob, bool validate, Persistence persistence,
+                             std::span<const uint8_t> descriptorBlob, Persistence persistence,
                              const TopicOptions& topic, const DdlOptions& ddl, CompletionTarget target,
                              Token token) {
     namespace rpc = rune::protocol::client;
@@ -1402,7 +1403,7 @@ OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::st
     msg.topicName         = name;
     msg.partitionCount    = partitions;
     msg.keyField          = keyField;
-    msg.validate          = validate;
+    msg.validate          = !descriptorBlob.empty();   // a typed topic always validates: the byte stays on the wire
     msg.descriptorBlob    = descriptorBlob.data();
     msg.descriptorLen     = static_cast<uint32_t>(descriptorBlob.size());   // 0 = an untyped topic
     msg.persistence       = static_cast<uint8_t>(persistence);
@@ -2836,23 +2837,21 @@ Bytes Client::pingAndWait(std::span<const uint8_t> payload, std::chrono::nanosec
 }
 
 DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t partitions,
-                                             std::string_view keyField, bool validate,
+                                             std::string_view keyField,
                                              std::span<const uint8_t> descriptorBlob,
                                              std::chrono::nanoseconds timeout) {
-    return defineTopicAndWait(name, partitions, keyField, validate, descriptorBlob,
-                              Persistence::Disk, timeout);
+    return defineTopicAndWait(name, partitions, keyField, descriptorBlob, Persistence::Disk, timeout);
 }
 
 DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t partitions,
-                                             std::string_view keyField, bool validate,
+                                             std::string_view keyField,
                                              std::span<const uint8_t> descriptorBlob,
                                              Persistence persistence,
                                              std::chrono::nanoseconds timeout) {
     DefineTopicResult result;
     andWait_("defineTopic()", timeout, 0,
              [&](Completions& q, Token t) {
-                 return defineTopic(name, partitions, keyField, validate, descriptorBlob,
-                                    persistence, q, t);
+                 return defineTopic(name, partitions, keyField, descriptorBlob, persistence, q, t);
              },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError) throwForStatus_("defineTopic()", c, p);
@@ -2866,14 +2865,13 @@ DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t par
 }
 
 DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t partitions, std::string_view keyField,
-                                             std::span<const uint8_t> descriptorBlob, bool validate,
+                                             std::span<const uint8_t> descriptorBlob,
                                              Persistence persistence, const TopicOptions& topic,
                                              const DdlOptions& ddl, std::chrono::milliseconds timeout) {
     DefineTopicResult result;
     andWait_("defineTopic()", timeout, 0,
              [&](Completions& q, Token t) {
-                 return defineTopic(name, partitions, keyField, descriptorBlob, validate, persistence, topic, ddl,
-                                    q, t);
+                 return defineTopic(name, partitions, keyField, descriptorBlob, persistence, topic, ddl, q, t);
              },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError) throwForStatus_("defineTopic()", c, p);
@@ -2936,6 +2934,15 @@ std::string Client::lineageFailure(std::string_view topic, uint16_t code, std::c
     return plain(probe.errorCode);
 }
 
+TopicHandle Client::rawTopicAndWait(std::string_view name, std::chrono::nanoseconds timeout) {
+    const TopicSchemaResult r = getTopicSchemaAndWait(name, rune::protocol::client::kSchemaKindFingerprint, timeout);
+    if (r.errorCode != 0) throw std::runtime_error("rawTopic: no topic '" + std::string(name) + "'");
+    if (!r.descriptorBlob.empty())
+        throw std::runtime_error("rawTopic: '" + std::string(name) + "' is a typed topic; open it with openTopicAndWait<T> "
+                                 "(the raw send path is for untyped topics only)");
+    return TopicHandle{r.topicId, r.partitionCount > 0 ? r.partitionCount : 1};
+}
+
 void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining) {
     constexpr auto kUnknownTopic = static_cast<uint16_t>(rune::protocol::client::ErrorCode::UnknownTopic);
     const auto refused = [&](uint16_t c) {
@@ -2945,20 +2952,24 @@ void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::ch
         return msg + ")";
     };
     if (code == kUnknownTopic && remaining > std::chrono::nanoseconds::zero()) {
-        // The broker answers UnknownTopic for a missing topic AND for an unknown fingerprint: ask for the latest.
-        TopicSchemaResult latest;
+        // The broker answers UnknownTopic for a missing topic AND for an unknown fingerprint: ask what the topic is
+        // (the kind probe: a typed topic answers like the latest schema, an untyped one OK with no blob).
+        TopicSchemaResult kind;
         bool probed = true;
         try {
-            latest = getTopicSchemaAndWait(name, uint64_t{0}, remaining);
+            kind = getTopicSchemaAndWait(name, rune::protocol::client::kSchemaKindFingerprint, remaining);
         } catch (const std::exception&) {
             probed = false;   // a probe that timed out proves nothing: name the original code
         }
         if (probed) {
-            if (latest.errorCode == kUnknownTopic)
+            if (kind.errorCode == kUnknownTopic)
                 throw std::runtime_error("openTopic: topic '" + std::string(name) + "' does not exist");
-            if (latest.errorCode == 0)
+            if (kind.errorCode == 0 && kind.descriptorBlob.empty())
+                throw std::runtime_error("openTopic: '" + std::string(name) + "' is an untyped (raw) topic; a TypedTopic "
+                                         "binds only to a typed topic (use rawTopicAndWait)");
+            if (kind.errorCode == 0)
                 throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
-            code = latest.errorCode;
+            code = kind.errorCode;
         }
     }
     throw std::runtime_error(refused(code));
@@ -4797,7 +4808,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (const std::size_t i = findCtl_(opt->correlationId);
             i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::GetTopicSchema) {
             PendingCtl p = takeCtl_(i);
-            if (opt->errorCode == 0) {
+            if (opt->errorCode == 0 && opt->version != 0) {   // version 0: an untyped topic's kind probe - nothing to cache
                 // Task 11 / F8c C3: the per-topic schema cache is written HERE,
                 // on the duty thread (was an app-thread write under mtx_).
                 topicSchemaCache_.put(opt->topicId,

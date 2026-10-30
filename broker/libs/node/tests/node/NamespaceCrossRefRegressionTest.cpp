@@ -27,7 +27,7 @@ int txnProduce(LcRig& rig, int32_t topicId, int64_t pid, int16_t epoch) {
     AuthRig& a = rig.auth();
     rune::protocol::RecordBatchBuilder bb(0, 1000);
     bb.setProducerId(pid); bb.setProducerEpoch(epoch); bb.setBaseSequence(0); bb.setTransactional(true);
-    bb.append("k", "v", 1000);
+    bb.append(charKey(), charValue(), 1000);
     const std::vector<uint8_t> batch = bb.build();
     int code = kNoAnswer;
     rig.until([&] {

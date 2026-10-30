@@ -15,6 +15,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <type_traits>
 
 namespace rc = rune::client;
 
@@ -42,4 +43,29 @@ TEST(KeyRoutingRegression, ClientKeyPartitionMatchesProtocolForAllKeys) {
     // The int64 constructor (8 LE bytes) too.
     const rc::Key k64(int64_t{100});
     EXPECT_EQ(k64.partition(8), rune::protocol::partitionForKey(k64.bytes(), 8));
+}
+
+// Checked writes Part 02: a Key is never truncated.
+TEST(CheckedWritesKeyRegression, SpanKeyIsNeverTruncatedRegression) {
+    std::array<uint8_t, 17> buf{};
+    for (std::size_t i = 0; i < buf.size(); ++i) buf[i] = static_cast<uint8_t>(0x41 + i);
+    const rc::Key full(std::span<const uint8_t>(buf.data(), 16));
+    EXPECT_EQ(full.size(), 16u);
+    EXPECT_FALSE(full.tooLong());
+    const rc::Key tooLong(std::span<const uint8_t>(buf.data(), 17));
+    EXPECT_TRUE(tooLong.tooLong());
+    EXPECT_TRUE(tooLong.bytes().empty());
+    EXPECT_EQ(tooLong.size(), 0u);
+    EXPECT_EQ(tooLong.partition(8), 0);
+}
+
+TEST(CheckedWritesKey, PodKeyWiderThanSixteenDoesNotCompile) {
+    struct Wide { uint8_t b[17]; };
+    struct Exact { uint8_t b[16]; };
+    static_assert(!std::is_constructible_v<rc::Key, Wide>);
+    static_assert(std::is_constructible_v<rc::Key, Exact>);
+    static_assert(std::is_constructible_v<rc::Key, std::array<uint8_t, 16>>);
+    const rc::Key k(Exact{});
+    EXPECT_EQ(k.size(), 16u);
+    EXPECT_EQ(rc::Key(uint32_t{7}).size(), 4u);
 }

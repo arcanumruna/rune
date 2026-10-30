@@ -377,9 +377,17 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     }
     EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::NS_THROTTLE), "NS_THROTTLE");
     EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::NS_VIEW_MEM_OVER), "NS_VIEW_MEM_OVER");
-    EXPECT_THROW((void)sbe::OpType::get(31), std::runtime_error);
+    // Checked writes Part 02: the metadata feature level and a typed topic's write spec (with its tail), appended.
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::CLUSTER_FEATURE_LEVEL), 31);
+    EXPECT_EQ(static_cast<int>(sbe::OpType::Value::WRITE_SPEC_UPDATE), 32);
+    EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::WRITE_SPEC), 12);
+    EXPECT_EQ(sbe::OpType::get(31), sbe::OpType::Value::CLUSTER_FEATURE_LEVEL);
+    EXPECT_EQ(sbe::OpType::get(32), sbe::OpType::Value::WRITE_SPEC_UPDATE);
+    EXPECT_EQ(sbe::TailKind::get(12), sbe::TailKind::Value::WRITE_SPEC);
+    EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::WRITE_SPEC_UPDATE), "WRITE_SPEC_UPDATE");
+    EXPECT_THROW((void)sbe::OpType::get(33), std::runtime_error);
     EXPECT_THROW((void)sbe::ReturnType::get(9), std::runtime_error);
-    EXPECT_THROW((void)sbe::TailKind::get(12), std::runtime_error);
+    EXPECT_THROW((void)sbe::TailKind::get(13), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------

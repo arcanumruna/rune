@@ -788,9 +788,11 @@ if(BUILD_TESTING)
     # Uses InMemoryLog + Worker directly (no Aeron required).
     # ---------------------------------------------------------------------------
     add_executable(rune_produce_validation_tests
-        tests/integration/ProduceValidationTest.cpp)
+        tests/integration/ProduceValidationTest.cpp
+        tests/support/AllocWindow.cpp)
     target_include_directories(rune_produce_validation_tests PRIVATE
-        ${RUNE_PROTOCOL_INCLUDE})
+        ${RUNE_PROTOCOL_INCLUDE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_produce_validation_tests PRIVATE
         rune_node
         rune_replication
@@ -798,6 +800,28 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_produce_validation_tests
         PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # Checked writes Part 02: typed topics always validate (feature level, write spec, matrices, DDL rules).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_checked_writes_tests
+        tests/node/CheckedWritesFeatureLevelTest.cpp
+        tests/node/CheckedWritesWriteStateTest.cpp
+        tests/node/CheckedWritesValidationMatrixTest.cpp
+        tests/node/CheckedWritesWorkerTest.cpp
+        tests/node/CheckedWritesSpecFanoutTest.cpp
+        tests/node/CheckedWritesDdlTest.cpp)
+    target_include_directories(rune_checked_writes_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_checked_writes_tests PRIVATE
+        rune_node
+        rune_view
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_checked_writes_tests
+        PROPERTIES TIMEOUT 120)
 
     # ---------------------------------------------------------------------------
     # MD1 Task 4: MetadataService / MetadataStateMachine replication integration
@@ -1816,7 +1840,8 @@ if(BUILD_TESTING)
                        tests/client/ClientAuthClusterRegressionTest.cpp
                        tests/client/RuneConsoleBrokerRegressionTest.cpp
                        tests/client/ClaimBrokerRegressionTest.cpp
-                       tests/client/ProducerIdBrokerRegressionTest.cpp)
+                       tests/client/ProducerIdBrokerRegressionTest.cpp
+                       tests/client/CheckedWritesBrokerRegressionTest.cpp)
         # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed
         # `position.gen.h` (rune_gen_claim_schemas); the embedded client builds it under its own binary dir.
         add_dependencies(rune_client_broker_tests generate_claim_schema_headers)

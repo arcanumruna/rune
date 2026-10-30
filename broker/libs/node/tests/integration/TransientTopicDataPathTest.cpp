@@ -138,21 +138,14 @@ std::size_t pushedAt(const ShardTestClient& c, int64_t base) {
     for (const auto& r : c.records()) n += r.baseOffset == base ? 1u : 0u;
     return n;
 }
-/// A DefineTopic descriptor: {id Int64 (key), hp Int64} (validate=false: records are not checked).
-std::vector<uint8_t> ttBlob() {
-    return rune::codec::serialize(rune::codec::DescriptorBuilder("presence", 1)
-        .add("id", rune::codec::PrimType::Int64, 1, /*isKey=*/true)
-        .add("hp", rune::codec::PrimType::Int64)
-        .build());
-}
-/// DefineTopic(name, 1 partition, persistence=transient) over the wire; retries
+/// DefineTopic(name, 1 partition, persistence=transient, untyped: the records are opaque bytes) over the wire; retries
 /// Internal while the admin thread does not yet lead __topic_schemas (the
 /// documented DDL settle — bounded, not a correctness gate).  Returns the
 /// topic id, or -1.
 int32_t defineTransient(ShardTestClient& c, const std::string& gw, int64_t sid, const std::string& name) {
     const auto deadline = std::chrono::steady_clock::now() + 20s;
     while (std::chrono::steady_clock::now() < deadline) {
-        const auto r = c.awaitDefine(c.sendDefineTopic(gw, kClientStream, sid, name, 1, ttBlob(), /*persistence=*/1),
+        const auto r = c.awaitDefine(c.sendDefineTopic(gw, kClientStream, sid, name, 1, {}, /*persistence=*/1),
                                      std::chrono::steady_clock::now() + 10s);
         if (r && r->errorCode == 0) return r->topicId;
         if (r && r->errorCode != static_cast<uint16_t>(rune::protocol::client::ErrorCode::Internal)) return -1;

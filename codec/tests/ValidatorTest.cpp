@@ -324,3 +324,83 @@ TEST(ValidatorAdversarial, RandomEvolutionsAgreeWithTheMaterializedValidatorAtEv
     }
     EXPECT_GT(seedsWithRetired, 200) << "the random evolutions must retire fields in most seeds (not vacuous)";
 }
+
+// --- Checked writes: UTF-8 string check, P3 padding, topic key types ---------
+static Descriptor Utf8D() {
+    return DescriptorBuilder("u")
+        .addFixedStr("name", 8)
+        .add("bio", PrimType::String)
+        .add("blob", PrimType::Bytes)
+        .build();
+}
+
+static std::vector<uint8_t> frameUtf8(std::vector<uint8_t> name8, std::vector<uint8_t> bio, std::vector<uint8_t> blob = {}) {
+    name8.resize(8, 0);
+    std::vector<uint8_t> b = {8, 0, 1, 0};
+    b.insert(b.end(), name8.begin(), name8.end());
+    for (const auto* v : {&bio, &blob}) {
+        const uint32_t n = uint32_t(v->size());
+        for (int i = 0; i < 4; ++i) b.push_back(uint8_t(n >> (8 * i)));
+        b.insert(b.end(), v->begin(), v->end());
+    }
+    return b;
+}
+
+TEST(CheckedWritesValidator, Utf8CheckRejectsBadString) {
+    const Descriptor d = Utf8D();
+    Validator v(d);
+    const auto rec = frameUtf8({'a'}, {0x61, 0x80});
+    const ValResult r = v.validate(rec, StringCheck::Utf8);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.fieldId, d.fields[1].id);
+    EXPECT_STREQ(r.reason, "string is not valid UTF-8");
+    EXPECT_TRUE(v.validate(rec, StringCheck::None).ok);
+}
+
+TEST(CheckedWritesValidator, Utf8CheckRejectsBadFixedStr) {
+    Validator v(Utf8D());
+    const ValResult r = v.validate(frameUtf8({0x80}, {}), StringCheck::Utf8);
+    EXPECT_FALSE(r.ok);
+    EXPECT_STREQ(r.reason, "string is not valid UTF-8");
+}
+
+TEST(CheckedWritesValidator, FixedStrPaddingMustBeZero) {
+    Validator v(Utf8D());
+    const ValResult dirty = v.validate(frameUtf8({'a', 0, 'b'}, {}), StringCheck::Utf8);
+    EXPECT_FALSE(dirty.ok);
+    EXPECT_STREQ(dirty.reason, "string(N) padding is not zero");
+    EXPECT_TRUE(v.validate(frameUtf8({'a', 'b'}, {}), StringCheck::Utf8).ok);
+    EXPECT_TRUE(v.validate(frameUtf8({}, {}), StringCheck::Utf8).ok);
+    EXPECT_TRUE(v.validate(frameUtf8({'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'}, {}), StringCheck::Utf8).ok);
+}
+
+TEST(CheckedWritesValidator, BytesFieldIsNeverChecked) {
+    Validator v(Utf8D());
+    EXPECT_TRUE(v.validate(frameUtf8({'a'}, {}, {0xFF, 0xFE, 0x80}), StringCheck::Utf8).ok);
+}
+
+TEST(CheckedWritesValidator, OneArgValidateIsUnchanged) {
+    for (const auto& rec : {frame(1, 1, "ok"), frame(1, 9, "x"), std::vector<uint8_t>{12, 0, 1, 0}}) {
+        Validator v(D());
+        const ValResult a = v.validate(rec), b = v.validate(rec, StringCheck::None);
+        EXPECT_EQ(a.ok, b.ok);
+        EXPECT_EQ(a.fieldId, b.fieldId);
+        EXPECT_EQ(a.reason, b.reason);
+    }
+}
+
+TEST(CheckedWritesValidator, TopicKeyTypes) {
+    EXPECT_TRUE(isTopicKeyType(PrimType::UInt16, 2));
+    EXPECT_TRUE(isTopicKeyType(PrimType::Int32, 4));
+    EXPECT_TRUE(isTopicKeyType(PrimType::UInt32, 4));
+    EXPECT_TRUE(isTopicKeyType(PrimType::Int64, 8));
+    EXPECT_TRUE(isTopicKeyType(PrimType::UInt64, 8));
+    EXPECT_TRUE(isTopicKeyType(PrimType::FixedStr, 1));
+    EXPECT_TRUE(isTopicKeyType(PrimType::FixedStr, 16));
+    EXPECT_FALSE(isTopicKeyType(PrimType::FixedStr, 17));
+    EXPECT_FALSE(isTopicKeyType(PrimType::String, 0));
+    EXPECT_FALSE(isTopicKeyType(PrimType::Bytes, 0));
+    EXPECT_FALSE(isTopicKeyType(PrimType::Float64, 8));
+    EXPECT_FALSE(isTopicKeyType(PrimType::Bool, 1));
+    EXPECT_FALSE(isTopicKeyType(PrimType::Enum, 4));
+}

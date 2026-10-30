@@ -204,7 +204,7 @@ TEST(NsSlotRegression, EveryWorkerSeesAssignBeforeFirstRequestRegression) {
     b.createUser("a/ua", kUserPw, userGrants());
     // No wait between the create and the first request: define a topic and produce at once.
     auto ua = connected(b, "a/ua");
-    const auto def = ua->defineTopicAndWait("t", 1, "", false, {}, 20s);
+    const auto def = ua->defineTopicAndWait("t", 1, "", {}, 20s);
     ASSERT_EQ(def.errorCode, 0) << def.detail;
     ua->close();
     auto up = connected(b, "a/ua", {rc::TopicSpec{"t", def.topicId, 1}});

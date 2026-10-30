@@ -172,7 +172,7 @@ void unauthenticatedWorkerIngressRow(AuthRig& r) {
     ASSERT_GT(anon, 0);
     const int64_t leo = r.logEnd(r.orders);
     const int64_t corr = r.c().nextCorrelationId();
-    ASSERT_TRUE(r.c().produce(worker, r.stream(), anon, corr, r.orders, 0, 1, makeBatch(1)));
+    ASSERT_TRUE(r.c().produce(worker, r.stream(), anon, corr, r.orders, 0, 1, makeCharBatch(1)));
     const auto ack = r.c().awaitProduceResponseUntil(corr, AuthRig::dl());
     ASSERT_TRUE(ack.has_value()) << "the unauthenticated produce was not answered";
     EXPECT_EQ(ack->errorCode, kNotAuthorized) << "a worker-ingress produce of an unauthenticated session";

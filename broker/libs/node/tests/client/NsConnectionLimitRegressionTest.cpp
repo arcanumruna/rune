@@ -228,7 +228,7 @@ TEST(LimitEnforcementTableRegression, OpenTxnsBrokerRegression) {
     ASSERT_TRUE(admin->createNamespace("t", patchOf({{"max-open-txns", 1}})).has_value());
     b.createUser("t/u", kUserPw, userGrants());
     auto u = connected(b, "t/u");
-    const auto def = u->defineTopicAndWait("t", 1, "", false, {}, 20s);
+    const auto def = u->defineTopicAndWait("t", 1, "", {}, 20s);
     ASSERT_EQ(def.errorCode, 0) << def.detail;
     const rc::TopicHandle th{def.topicId, 1};
     auto openTxn = [&](const std::string& id, rc::Producer& p) {

@@ -16,7 +16,7 @@ int shardProduce(AuthRig& rig, int64_t sid, int32_t topicId, int attempts = 200)
     int code = kNoAnswer;
     for (int a = 0; a < attempts; ++a) {
         const int64_t corr = rig.c().nextCorrelationId();
-        if (!rig.c().produce(rig.broker().workerIngressChannel(), AuthRig::stream(), sid, corr, topicId, 0, 1, makeBatch(1)))
+        if (!rig.c().produce(rig.broker().workerIngressChannel(), AuthRig::stream(), sid, corr, topicId, 0, 1, makeCharBatch(1)))
             return kNoAnswer;
         const auto ack = rig.c().awaitProduceResponseUntil(corr, AuthRig::dl(10));
         code = ack ? ack->errorCode : kNoAnswer;
@@ -78,7 +78,7 @@ TEST(ShardAuthProduceRegression, NoProduceCanPrecedeTheLoginsPermissions) {
         // The instant AuthServerFinal{OK} arrives: produce.  The grants were enqueued on every worker's lifecycle
         // ring BEFORE the OK was sent, so this is always accepted - never a stale NotAuthorized.
         const int64_t corr = rig.c().nextCorrelationId();
-        ASSERT_TRUE(rig.c().produce(rig.broker().workerIngressChannel(), AuthRig::stream(), sid, corr, rig.orders, 0, 1, makeBatch(1)));
+        ASSERT_TRUE(rig.c().produce(rig.broker().workerIngressChannel(), AuthRig::stream(), sid, corr, rig.orders, 0, 1, makeCharBatch(1)));
         const auto ack = rig.c().awaitProduceResponseUntil(corr, AuthRig::dl(10));
         ASSERT_TRUE(ack.has_value()) << "iteration " << i;
         EXPECT_EQ(ack->errorCode, 0) << "iteration " << i;
@@ -106,7 +106,7 @@ DefineThenProduce defineThenProduce(AuthRig& rig, int64_t sid, const std::string
     const int32_t id = a->topicId;
     for (int attempt = 0; attempt < 200; ++attempt) {
         const int64_t pc2 = rig.c().nextCorrelationId();
-        if (!rig.c().produce(rig.broker().workerIngressChannel(), AuthRig::stream(), sid, pc2, id, 0, 1, makeBatch(1))) break;
+        if (!rig.c().produce(rig.broker().workerIngressChannel(), AuthRig::stream(), sid, pc2, id, 0, 1, makeCharBatch(1))) break;
         const auto ack = rig.c().awaitProduceResponseUntil(pc2, AuthRig::dl(10));
         out.produce = ack ? ack->errorCode : kNoAnswer;
         // Only the leadership / assignment settling is retried - NEVER 45 (the answer under test).

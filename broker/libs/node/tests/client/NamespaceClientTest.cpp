@@ -373,7 +373,7 @@ TEST(NamespaceCliRegression, UsageTableRegression) {
     b.createUser("u/w", "namespace-user-password-12",
                  {grants::prefix(grants::SO::Create, grants::ST::Topic, ""), grants::prefix(grants::SO::Describe, grants::ST::Topic, "")});
     auto w = makeClient(b, "u/w", "namespace-user-password-12");
-    ASSERT_EQ(w->defineTopicAndWait("t", 2, "", false, {}, 60s).errorCode, 0);
+    ASSERT_EQ(w->defineTopicAndWait("t", 2, "", {}, 60s).errorCode, 0);
 
     // The table: header, state line, `limit  value  usage` rows; the topic count is next to its limit.
     bool seen = false;

@@ -160,7 +160,7 @@ TEST(LimitEnforcementTableRegression, AcksFloorPerProduceRegression) {
     b.createUser("free/ub", kUserPw, userGrants());
     auto define = [&](const std::string& user) {
         auto c = connected(b, user);
-        const auto r = c->defineTopicAndWait("t", 1, "", false, {}, 20s);
+        const auto r = c->defineTopicAndWait("t", 1, "", {}, 20s);
         if (r.errorCode != 0) throw std::runtime_error("define: " + r.detail);
         c->close();
         return rc::TopicHandle{r.topicId, 1};
@@ -249,7 +249,7 @@ TEST(LimitEnforcementTableRegression, ProduceSizeRegression) {
     b.createUser("b/u", kUserPw, userGrants());
     auto define = [&](const std::string& user) {
         auto c = connected(b, user);
-        const auto r = c->defineTopicAndWait("t", 1, "", false, {}, 20s);
+        const auto r = c->defineTopicAndWait("t", 1, "", {}, 20s);
         if (r.errorCode != 0) throw std::runtime_error("define: " + r.detail);
         c->close();
         return rc::TopicHandle{r.topicId, 1};

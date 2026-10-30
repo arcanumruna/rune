@@ -127,7 +127,7 @@ TEST(ClientAuthClusterRegression, WorldServerClientProducesAndConsumesThroughEve
         to.replicationFactor = 3;
         rc::DefineTopicResult def{};
         ASSERT_TRUE(AuthTrio::until(60s, [&] {
-            def = admin->defineTopicAndWait("world.zone", kParts, "worldId", rune::codec::serialize(desc), /*validate=*/true,
+            def = admin->defineTopicAndWait("world.zone", kParts, "worldId", rune::codec::serialize(desc),
                                             rc::Persistence::Disk, to, {}, 60s);
             return def.errorCode == 0;
         })) << def.detail;
@@ -222,7 +222,7 @@ TEST(ClientAuthClusterRegression, WorldServerClientProducesAndConsumesThroughEve
         const auto s = t.loginOn(probe, id, "world-server", "world-server-password");
         ASSERT_TRUE(AuthTrio::until(20s, [&] {
             const int64_t corr = probe.raw().nextCorrelationId();
-            probe.raw().produce(t.channel(id), AuthWireClient::kClientStream, s.sid, corr, spec.topicId, 0, 1, makeBatch(1));
+            probe.raw().produce(t.channel(id), AuthWireClient::kClientStream, s.sid, corr, spec.topicId, 0, 1, makeCharBatch(1));
             const auto a = probe.raw().awaitProduceResponseUntil(corr, Clock3::now() + 3s);
             return a && a->errorCode == 45;
         })) << "broker " << id << " must enforce the REVOKE";
@@ -386,8 +386,8 @@ TEST(ClientAuthClusterRegression, EosPipelineSurvivesTheCoordinatorCrashOnAnAuth
         rc::TopicOptions to;
         to.replicationFactor = 3;
         rc::DefineTopicResult a{}, b{};   // the grants reach the broker asynchronously: retry
-        ASSERT_TRUE(AuthTrio::until(60s, [&] { a = admin->defineTopicAndWait("eos.in", kParts, "", {}, false, rc::Persistence::Disk, to, {}, 60s); return a.errorCode == 0; })) << a.detail;
-        ASSERT_TRUE(AuthTrio::until(60s, [&] { b = admin->defineTopicAndWait("eos.out", kParts, "", {}, false, rc::Persistence::Disk, to, {}, 60s); return b.errorCode == 0; })) << b.detail;
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { a = admin->defineTopicAndWait("eos.in", kParts, "", {}, rc::Persistence::Disk, to, {}, 60s); return a.errorCode == 0; })) << a.detail;
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { b = admin->defineTopicAndWait("eos.out", kParts, "", {}, rc::Persistence::Disk, to, {}, 60s); return b.errorCode == 0; })) << b.detail;
         in = rc::TopicSpec{"eos.in", a.topicId, kParts};
         out = rc::TopicSpec{"eos.out", b.topicId, kParts};
         admin->close();

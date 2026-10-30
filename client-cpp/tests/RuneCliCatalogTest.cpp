@@ -661,9 +661,20 @@ TEST(RuneCliCatalogRegression, QlExpectedVersionIsValidatedAndShownInTheDryRunPl
     EXPECT_NE(o3.str().find("expected version 5"), std::string::npos) << o3.str();
 }
 
-TEST(RuneCliCatalogRegression, QlValidateIsShownInTheDryRunPlanRegression) {
-    std::stringstream out, err;
-    ASSERT_EQ(rune::cli::run({"ql", "-e", "topic t { id int64 } partitions 1 key id;", "--validate", "--dry-run"}, out, err), 0)
-        << err.str();
-    EXPECT_NE(out.str().find("validate"), std::string::npos) << out.str();
+TEST(CheckedWritesCli, CatalogShowsKind) {
+    cat::CatalogReplayer r;
+    int64_t off = 0;
+    for (const auto& e : cat::testing::goldenScriptV1()) ASSERT_TRUE(r.feedDecoded(off++, e));
+    const auto* events = r.state().topicByName(rune::catalog::kDefaultNsId, "events");   // untyped, then given a schema
+    const auto* players = r.state().topicByName(rune::catalog::kDefaultNsId, "players");  // re-created untyped
+    ASSERT_NE(events, nullptr);
+    ASSERT_NE(players, nullptr);
+    ASSERT_TRUE(events->schema.has_value());
+    ASSERT_FALSE(players->schema.has_value());
+    const std::string typed = rune::cli::formatTopicDefinition(*events);
+    EXPECT_NE(typed.find("  kind typed\n"), std::string::npos) << typed;
+    EXPECT_EQ(rune::cli::formatSchemaDefinition(*events).find("  validate "), std::string::npos);
+    const std::string untyped = rune::cli::formatTopicDefinition(*players);
+    EXPECT_NE(untyped.find("  kind raw\n"), std::string::npos) << untyped;
+    EXPECT_EQ(untyped.find("(untyped"), std::string::npos) << untyped;
 }

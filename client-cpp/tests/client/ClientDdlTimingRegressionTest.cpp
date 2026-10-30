@@ -141,7 +141,7 @@ rc::OpResult issue(rc::Client& c, DdlOp o, rc::Completions& q, rc::Token t) {
     const std::span<const uint8_t> blob(kBlob, sizeof kBlob);
     static const pc::ConfigChangeWire kChange{1, 60'000};
     switch (o) {
-    case DdlOp::DefineTopic: return c.defineTopic("t", 1, "", {}, false, rc::Persistence::Disk, {}, {}, q, t);
+    case DdlOp::DefineTopic: return c.defineTopic("t", 1, "", {}, rc::Persistence::Disk, {}, {}, q, t);
     case DdlOp::AlterTopic: return c.alterTopic("t", 1, blob, {}, q, t);
     case DdlOp::CreateView: return c.createView("v", "k", 0, blob, {}, q, t);
     case DdlOp::DropTopic: return c.dropTopic("t", {}, q, t);

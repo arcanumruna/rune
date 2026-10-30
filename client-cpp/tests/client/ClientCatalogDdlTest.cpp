@@ -110,7 +110,7 @@ TEST_F(ClientCatalogDdl, DefineTopicSendsReplicationFactorConfigAndExtension) {
     rc::DdlOptions ddl;
     ddl.statement = "CREATE TOPIC t PARTITIONS 4";
     r.run([&](rc::Completions& q, rc::Token t) {
-        return r.client.defineTopic("t", 4, "player", {}, true, rc::Persistence::Transient, topic, ddl, q, t);
+        return r.client.defineTopic("t", 4, "player", {}, rc::Persistence::Transient, topic, ddl, q, t);
     });
     ASSERT_EQ(frames.size(), 1u);
     const auto m = pc::DefineTopic::decode(frames[0].data(), frames[0].size());
@@ -202,7 +202,7 @@ TEST_F(ClientCatalogDdl, EveryDdlOpCarriesADistinctRequestIdUnderOneInstanceId) 
     auto& alterV = r.capture(pc::AlterView::TEMPLATE_ID);
     auto& alterC = r.capture(pc::AlterTopicConfig::TEMPLATE_ID);
     // The pre-catalog overloads (no DdlOptions) carry the extension too.
-    r.run([&](rc::Completions& q, rc::Token t) { return r.client.defineTopic("t", 1, "", false, {}, q, t); });
+    r.run([&](rc::Completions& q, rc::Token t) { return r.client.defineTopic("t", 1, "", {}, q, t); });
     r.run([&](rc::Completions& q, rc::Token t) { return r.client.alterTopic("t", 1, blob, q, t); });
     r.run([&](rc::Completions& q, rc::Token t) { return r.client.createView("v", "k", 0, blob, q, t); });
     r.run([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });

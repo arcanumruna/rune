@@ -308,6 +308,12 @@ struct DefineTopicResponse {
 // UnknownTopic.)
 inline constexpr uint64_t kSchemaLineageFingerprint = ~uint64_t{0};
 
+// Checked writes Part 02: requestedFingerprint = kSchemaKindFingerprint is a kind probe.  A typed topic answers as for
+// fingerprint 0; an untyped topic answers OK with an empty blob, version 0 and its partition count; an unknown name is
+// UnknownTopic.  Typed and raw handles bind only to their own kind with it.  (An older broker answers UnknownTopic for
+// every name.)
+inline constexpr uint64_t kSchemaKindFingerprint = ~uint64_t{0} - 1;
+
 struct GetTopicSchema {
     int64_t sessionId = 0, correlationId = 0;
     std::string_view topicName;

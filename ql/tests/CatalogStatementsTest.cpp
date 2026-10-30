@@ -261,7 +261,7 @@ TEST(QlCatalogStatementsRegression, TypedNeedsBothBracesAndKey) {
     EXPECT_TRUE(ql::parse("transient topic t partitions 1;").has_value());
     EXPECT_TRUE(ql::parse("topic t { id int64 } partitions 2 replicas 3 key id with (retention.ms = 5);").has_value());
     EXPECT_FALSE(ql::parse("topic t partitions 0;").has_value());
-    EXPECT_FALSE(ql::parse("topic t;").has_value());
+    EXPECT_TRUE(ql::parse("topic t;").has_value()) << "checked writes: partitions is optional (default 1)";
 }
 
 // 8. error paths of each new statement

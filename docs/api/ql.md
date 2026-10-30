@@ -21,14 +21,20 @@ keys (`key (a, b)`, `partition by`). Views are created from code (`Client::creat
 ## Topics
 
 ```sql
-topic <name> [ { <field> <type>, ... } ] partitions <n> [ replicas <r> ] [ key <field> ]
+topic <name> [ { <field> <type>, ... } ] [ partitions <n> ] [ replicas <r> ] [ key <field> ]
       [ with ( <setting> = <value>, ... ) ] ;
 transient topic ... ;
 ```
 
-- An **untyped** topic has no field list and no `key`: records are opaque bytes.
+- `partitions` defaults to 1.
+- An **untyped** (raw) topic has no field list and no `key`: records are opaque bytes. It has no database features
+  (views, filters, key index, intents, `autoincrement`, constraints); those need a typed topic.
 - A **typed** topic needs both the field list and `key <field>`; the schema goes to the registry and C++ types are
-  generated from it (`rune schema generate`).
+  generated from it (`rune schema generate`). A typed topic validates every write: each record decodes against a schema
+  version the topic knows, every `string` and `string(N)` holds valid UTF-8 (`string(N)` is `N` bytes, zero-padded), and
+  the record key equals the key field's bytes. A batch with any invalid record is refused with `SchemaValidationFailed` (24).
+- A key field is an integer type or `string(N)` with `N` at most 16; any other key field type is refused with
+  `InvalidSchema` (23).
 - `transient topic` replicates in memory and never writes to disk. Persistence is fixed at creation.
 - `replicas` is the replication factor, `0` to `32767`; `0` or omitted means every broker. It must be at most the
   broker count and at least `RUNE_MIN_ISR`.
@@ -39,8 +45,9 @@ Field types: `int32`, `int64`, `uint16`, `uint32`, `uint64`, `float64`, `bool`, 
 (a fixed-width string of `N` bytes).
 
 ```sql
-topic events partitions 3 replicas 3;
-transient topic presence partitions 1;
+topic events;
+topic logs partitions 3 replicas 3;
+transient topic presence;
 topic player { userId uint64, name string(32), score int64 } partitions 4 key userId;
 topic orders partitions 4 replicas 3 with (tier = leader, durability = all-in-sync);
 topic audit partitions 1 with (cleanup.policy = compact, segment.bytes = 1048576);

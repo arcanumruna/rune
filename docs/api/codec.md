@@ -68,13 +68,15 @@ fingerprint it was generated from.
 
 Validator v(d);
 ValResult r = v.validate(recordBytes);      // r.ok, r.fieldId, r.reason ("blockLength mismatch", ...)
+ValResult s = v.validate(recordBytes, StringCheck::Utf8);   // also: valid UTF-8 and zero padding in every string
 FieldValue f = readField(d, recordBytes, /*fieldId=*/2);   // zero-copy; f.present, f.i / f.u / f.f / f.b / f.bytes
 ```
 
-`validate()` is the gate for untrusted input: it checks the header, `blockLength`, field bounds and enum whitelists.
-`readField()` is the zero-copy hot path and trusts a pre-validated record, though every access is bounds-checked, so a
-hostile record can only yield an absent field. A topic defined with `validate` on makes the broker run the validator on
-every produced record and answer `SchemaValidationFailed` (24) on a bad one.
+`validate()` is the gate for untrusted input: it checks the header, `blockLength`, field bounds and enum whitelists;
+with `StringCheck::Utf8` it also requires every `string` and `string(N)` to be well-formed UTF-8 and the bytes of a
+`string(N)` after its first NUL to be NUL. `readField()` is the zero-copy hot path and trusts a pre-validated record, though every access is bounds-checked, so a
+hostile record can only yield an absent field. The broker runs the validator on every record produced to a typed topic
+and answers `SchemaValidationFailed` (24) on a bad one.
 
 ## Schema evolution
 

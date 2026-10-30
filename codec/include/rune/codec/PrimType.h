@@ -15,4 +15,14 @@ constexpr uint32_t fixedSize(PrimType t) {
   }
   return 0;
 }
+
+/// A topic key is an integer or string(N) with N <= kMaxTopicKeyBytes (Key::kMaxInline).
+inline constexpr uint32_t kMaxTopicKeyBytes = 16;
+constexpr bool isTopicKeyType(PrimType t, uint32_t width) noexcept {
+  switch (t) {
+    case PrimType::Int32: case PrimType::UInt16: case PrimType::UInt32: case PrimType::Int64: case PrimType::UInt64: return true;
+    case PrimType::FixedStr: return width >= 1 && width <= kMaxTopicKeyBytes;
+    default: return false;
+  }
+}
 } // namespace rune::codec

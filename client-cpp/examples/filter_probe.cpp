@@ -508,12 +508,12 @@ int runSetup(const Env& env) {
     TopicOptions to;
     to.replicationFactor = 3;
     const auto blob = rune::codec::serialize(rune::examples::playerEventDescriptor());
-    const auto def = c.defineTopicAndWait(kTopicName, kParts, "playerId", blob, /*validate=*/false, Persistence::Disk, to, {},
+    const auto def = c.defineTopicAndWait(kTopicName, kParts, "playerId", blob, Persistence::Disk, to, {},
                                           std::chrono::seconds(60));
     if (def.errorCode != 0) { fail("FILTER-PROBE-SETUP", std::string("define player_event: ") + def.detail); return 1; }
     TopicOptions uo;
     uo.replicationFactor = 3;
-    const auto und = c.defineTopicAndWait(kUntypedName, 1, "", std::span<const uint8_t>{}, /*validate=*/false, Persistence::Disk, uo,
+    const auto und = c.defineTopicAndWait(kUntypedName, 1, "", std::span<const uint8_t>{}, Persistence::Disk, uo,
                                           {}, std::chrono::seconds(60));
     if (und.errorCode != 0) { fail("FILTER-PROBE-SETUP", std::string("define untyped_t: ") + und.detail); return 1; }
     std::printf("FILTER_TOPIC_ID=%d\nFILTER_UNTYPED_ID=%d\n", def.topicId, und.topicId);

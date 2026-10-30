@@ -1947,7 +1947,7 @@ TEST(GroupRoutingRegression, SessionExpiredForTheCoordinatorSessionNeverHitsTheS
     // does not reply to DefineTopic) must survive the coordinator's expiry.
     const std::vector<uint8_t> blob{9};
     const rc::Token defTok = r.nextToken++;
-    ASSERT_EQ(r.client.defineTopic("x", 1, "", false, blob, r.cq, defTok), rc::OpResult::Accepted);
+    ASSERT_EQ(r.client.defineTopic("x", 1, "", blob, r.cq, defTok), rc::OpResult::Accepted);
     ASSERT_TRUE(r.drive([&] { return r.client.testPendingControlOps() == 1; }, 400'000));
     r.gw.sendError(n1, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", coordSid, 0);
     ASSERT_TRUE(r.drive([&] { return r.gw.connectsAt[n1] >= 2 || r.gw.connectsAt[0] >= 2; }, 4'000'000))

@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "rune/node/AdminChannels.h"
+#include <rune/replication/ReplicationMessages.h>   // MetadataFeature
 #include "rune/node/CatalogApplier.h"
 #include "rune/node/CatalogPartition.h"
 #include "rune/node/CatalogReadServer.h"
@@ -327,6 +328,9 @@ public:
     /// InvalidRequest naming the shortfall and the halted brokers.  Until the
     /// first view arrives every configured broker is placeable.
     void onPlacementView(const PlacementViewMsg& v) noexcept { placement_ = v; placementKnown_ = true; }
+    /// control → admin (checked writes): the committed metadata feature level; keeps the maximum.
+    void setClusterFeatureLevel(int16_t level) noexcept { if (level > clusterFeatureLevel_) clusterFeatureLevel_ = level; }
+    [[nodiscard]] int16_t clusterFeatureLevel() const noexcept { return clusterFeatureLevel_; }
     [[nodiscard]] int32_t placeableBrokers() const noexcept {
         return placementKnown_ ? placement_.placeable : deps_.brokerCount;
     }
@@ -606,6 +610,7 @@ private:
     [[nodiscard]] bool bootReconcileReady_() const noexcept;
     int stepBootReconcile_();
     uint64_t                         peerLinkKeysSeen_ = 0;
+    int16_t clusterFeatureLevel_ = rune::replication::MetadataFeature::kBase;   // setClusterFeatureLevel
     PlacementViewMsg placement_{};         // the control thread's placement view (onPlacementView)
     bool             placementKnown_ = false;
 

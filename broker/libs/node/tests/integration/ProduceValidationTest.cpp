@@ -58,6 +58,7 @@
 #include <rune/codec/Evolve.h>
 #include <rune/codec/Serialize.h>
 #include <rune/codec/Validator.h>
+#include "support/AllocWindow.h"
 
 #include <atomic>
 #include <cstdint>
@@ -286,6 +287,20 @@ struct WorkerHarness {
             << "SchemaUpdate enqueue failed (ring full)";
     }
 
+    /// Enqueue the topic's WriteSpecUpdate (the key facts) after its schema versions: `legacyValidate` = the old
+    /// `validate = true`.  Keyless unless `keyFieldId` names a key field.
+    void enqueueWriteSpec(int32_t topicId, bool legacyValidate = true, uint16_t keyFieldId = kNoKeyField,
+                          PrimType keyType = PrimType::Int32, uint8_t keyWidth = 0) {
+        TopicWriteSpecWire w;
+        w.topicId = topicId; w.keyFieldId = keyFieldId; w.keyType = keyType; w.keyWidth = keyWidth; w.legacyValidate = legacyValidate;
+        WorkerOp op;
+        op.type             = WorkerOp::Type::WriteSpecUpdate;
+        op.topicId          = topicId;
+        op.schemaUpdateBlob.resize(kTopicWriteSpecWireLen);
+        ASSERT_EQ(encodeTopicWriteSpec(w, op.schemaUpdateBlob), kTopicWriteSpecWireLen);
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(op))) << "WriteSpecUpdate enqueue failed (ring full)";
+    }
+
     /// Enqueue a Produce op carrying `batch` for (topicId, partition).
     void enqueueProduceBatch(int32_t topicId, int32_t partition,
                              std::vector<uint8_t> batch,
@@ -345,6 +360,7 @@ TEST(ProduceValidation, SchemaUpdate_Regression_ValidatorInstalledOnWorkerThread
     ASSERT_FALSE(h.worker->hasValidatorForTest(topicId));
 
     h.enqueueSchemaUpdate(topicId, blob);
+    h.enqueueWriteSpec(topicId);
     h.tick();  // worker drains ingress → executeSchemaUpdateWire_
 
     // Postcondition: validator installed.
@@ -361,6 +377,7 @@ TEST(ProduceValidation, SchemaUpdate_Regression_WellFormedRecord_AppendProceeds)
     const std::vector<uint8_t> blob =
         rune::codec::serialize(makeCharactersDescriptor());
     h.enqueueSchemaUpdate(topicId, blob);
+    h.enqueueWriteSpec(topicId);
     h.tick();
     ASSERT_TRUE(h.worker->hasValidatorForTest(topicId));
 
@@ -387,6 +404,7 @@ TEST(ProduceValidation, SchemaUpdate_Regression_MalformedRecord_ValidationFailed
     const std::vector<uint8_t> blob =
         rune::codec::serialize(makeCharactersDescriptor());
     h.enqueueSchemaUpdate(topicId, blob);
+    h.enqueueWriteSpec(topicId);
     h.tick();
     ASSERT_TRUE(h.worker->hasValidatorForTest(topicId));
 
@@ -414,6 +432,7 @@ TEST(ProduceValidation, SchemaUpdate_Regression_BadEnumRecord_ValidationFailed) 
     const std::vector<uint8_t> blob =
         rune::codec::serialize(makeCharactersDescriptor());
     h.enqueueSchemaUpdate(topicId, blob);
+    h.enqueueWriteSpec(topicId);
     h.tick();
     ASSERT_TRUE(h.worker->hasValidatorForTest(topicId));
 
@@ -476,6 +495,7 @@ TEST(WorkerValidator, ValidatesRecordAgainstItsOwnSchemaVersion) {
 
     h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v1), /*version=*/1);
     h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v2), /*version=*/2);
+    h.enqueueWriteSpec(topicId);
     h.tick();
     ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, /*version=*/1));
     ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, /*version=*/2));
@@ -533,6 +553,7 @@ TEST(ProduceValidationRegression, UnknownSchemaVersionRejectedRegression) {
     // Only v1 is installed.
     h.enqueueSchemaUpdate(topicId, rune::codec::serialize(makeCharactersDescriptor()),
                          /*version=*/1);
+    h.enqueueWriteSpec(topicId);
     h.tick();
     ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, /*version=*/1));
     ASSERT_FALSE(h.worker->hasValidatorForTest(topicId, /*version=*/2));
@@ -546,12 +567,31 @@ TEST(ProduceValidationRegression, UnknownSchemaVersionRejectedRegression) {
     h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
     h.tick();
 
-    static constexpr int16_t kSchemaValidationFailed = 24;
-    EXPECT_EQ(h.lastErrorCode, kSchemaValidationFailed)
-        << "an unknown schema version must be rejected, never validated against "
+    // Checked writes (P2): a version ABOVE the highest installed one is retriable (its SchemaUpdate may still be on
+    // the way); it is never validated against another version.
+    static constexpr int16_t kNotLeader = 2;
+    EXPECT_EQ(h.lastErrorCode, kNotLeader)
+        << "a version above the installed ones is retriable, never validated against "
            "whichever other version happens to be installed";
     EXPECT_EQ(h.log->logEndOffset(), leoBefore)
         << "no append for an unknown schema version";
+}
+
+// A version BELOW the highest installed one that has no entry stays a definite rejection.
+TEST(ProduceValidationRegression, UnknownLowerSchemaVersionIsDefiniteRegression) {
+    WorkerHarness h;
+    const int32_t topicId = 1;
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(makeCharactersDescriptor()), /*version=*/2);
+    h.enqueueWriteSpec(topicId);
+    h.tick();
+    ASSERT_FALSE(h.worker->hasValidatorForTest(topicId, /*version=*/1));
+
+    auto batch = makeBatchWithValue(makeValidRecordValue(/*id=*/1, /*type=*/1, "Eve"));   // stamped version 1
+    h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+    h.tick();
+
+    static constexpr int16_t kSchemaValidationFailed = 24;
+    EXPECT_EQ(h.lastErrorCode, kSchemaValidationFailed);
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +611,7 @@ TEST(ProduceValidation, MixedVersionBatch_Regression_EachRecordValidatesAgainstI
     const Descriptor v2 = rune::codec::materializeAsOf(evolving, 2);   // {id, score}
     h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v1), /*version=*/1);
     h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v2), /*version=*/2);
+    h.enqueueWriteSpec(topicId);
     h.tick();
     ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, 1));
     ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, 2));
@@ -633,6 +674,7 @@ TEST(ProduceValidationRegression, ForwardReadRecordNewerThanInstalledValidatorRe
     // Only v1 is installed -- the worker has not received v2's (id+score)
     // validator fan-out yet.
     h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v1), /*version=*/1);
+    h.enqueueWriteSpec(topicId);
     h.tick();
     ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, 1));
     ASSERT_FALSE(h.worker->hasValidatorForTest(topicId, 2));
@@ -647,13 +689,60 @@ TEST(ProduceValidationRegression, ForwardReadRecordNewerThanInstalledValidatorRe
     h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
     h.tick();
 
-    static constexpr int16_t kSchemaValidationFailed = 24;
-    EXPECT_EQ(h.lastErrorCode, kSchemaValidationFailed)
+    static constexpr int16_t kNotLeader = 2;   // checked writes (P2): retriable until the v2 SchemaUpdate lands
+    EXPECT_EQ(h.lastErrorCode, kNotLeader)
         << "forward-read: a well-formed v2 record at a worker with only the v1 validator "
-           "installed must be rejected as an unknown schema version, never accepted or "
-           "mis-validated against the v1 validator";
+           "installed is retriable, never accepted or mis-validated against the v1 validator";
     EXPECT_EQ(h.log->logEndOffset(), leoBefore)
         << "no append for a record whose stamped version has no installed validator";
+}
+
+// Checked writes: a typed partition's validation allocates nothing, accepted or refused (valid, invalid UTF-8,
+// version-ahead), at the checked level.
+TEST(CheckedWritesValidationRegression, TypedProduceAllocatesNothingRegression) {
+    WorkerHarness h;
+    const int32_t topicId = 1;
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(makeCharactersDescriptor()));
+    h.enqueueWriteSpec(topicId);
+    WorkerOp lvl;
+    lvl.type = WorkerOp::Type::ClusterFeatureLevel;
+    lvl.nextOffset = rune::replication::MetadataFeature::kCheckedWrites;
+    ASSERT_TRUE(h.worker->tryEnqueueOp(std::move(lvl)));
+    h.tick();
+    ASSERT_NE(h.worker->writeStateForTest(topicId, 0), nullptr);
+
+    const auto valid = makeValidRecordValue(1, 1, "Alice");
+    auto badUtf8 = makeValidRecordValue(1, 1, "Alice");
+    badUtf8[badUtf8.size() - 1] = 0xFF;                        // an invalid UTF-8 byte in the string
+    auto ahead = makeValidRecordValue(1, 1, "Alice");
+    ahead[2] = 9; ahead[3] = 0;                                // a version no SchemaUpdate has installed
+    const std::vector<uint8_t>* kinds[] = {&valid, &badUtf8, &ahead};
+
+    constexpr int kWarm = 200, kMeasured = 1000;
+    std::vector<WorkerOp> ops;
+    ops.reserve(kWarm + kMeasured);
+    const auto makeOp = [&](int i) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::Produce; op.topicId = topicId; op.partition = 0; op.replica = h.replica.get();
+        op.sessionId = 1; op.correlationId = i + 1; op.durabilityTier = 0;
+        op.recordBatchBytes = makeBatchWithValue(*kinds[i % 3]);
+        return op;
+    };
+    for (int i = 0; i < kWarm + kMeasured; ++i) ops.push_back(makeOp(i));
+    int64_t nowNs = 1;
+    const auto run = [&](int from, int to) {
+        for (int i = from; i < to; ++i) {
+            ASSERT_TRUE(h.worker->tryEnqueueOp(std::move(ops[static_cast<std::size_t>(i)])));
+            h.worker->doWork(nowNs += 1'000'000LL);
+            h.worker->drainReturn([&](WorkerReturn) {});
+        }
+    };
+    run(0, kWarm);
+    rune::testing::AllocWindow window;
+    run(kWarm, kWarm + kMeasured);
+    EXPECT_EQ(window.count(), 0u);
+    EXPECT_GT(h.worker->typedRejectsForTest(), 0u);
+    EXPECT_GT(h.worker->typedVersionAheadForTest(), 0u);
 }
 
 } // namespace

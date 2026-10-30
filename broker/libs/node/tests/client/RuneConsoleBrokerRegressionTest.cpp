@@ -258,21 +258,18 @@ TEST(RuneConsoleBrokerRegression, ScriptThroughTheLiveSeamStopsAtTheRefusedState
     for (const auto& e : b.catalogEvents()) EXPECT_NE(e.event.objectName, "never") << "nothing after the failure is issued";
 }
 
-TEST(RuneConsoleBrokerRegression, ValidateAndExpectedVersionReachTheBrokerRegression) {
+TEST(RuneConsoleBrokerRegression, ExpectedVersionReachesTheBrokerRegression) {
     OneBroker b("console_flags");
     const std::string f1 = writeFile("flags1.rql", "topic fv { id int64 } partitions 1 key id;\nalter topic fv add column a int32;\n");
-    ASSERT_EQ(consoleLive(b, {"-f", f1, "--validate", "--expected-version", "1"}, "").rc, 0);
-    {   // --validate reached the broker: the CreateTopic carries validate = true (and a plain run does not)
-        const std::string f3 = writeFile("flags3.rql", "topic plain { id int64 } partitions 1 key id;\n");
-        ASSERT_EQ(consoleLive(b, {"-f", f3}, "").rc, 0);
-        bool sawFv = false, sawPlain = false;
+    ASSERT_EQ(consoleLive(b, {"-f", f1, "--expected-version", "1"}, "").rc, 0);
+    {   // there is no --validate any more: a typed topic is always defined with validate = true
+        bool sawFv = false;
         for (const auto& e : b.catalogEvents()) {
             const auto* c = std::get_if<rune::catalog::CreateTopicOps>(&e.event.ops);
             if (c == nullptr || !c->schema) continue;
             if (e.event.objectName == "fv") { sawFv = true; EXPECT_TRUE(c->schema->validate); }
-            if (e.event.objectName == "plain") { sawPlain = true; EXPECT_FALSE(c->schema->validate); }
         }
-        EXPECT_TRUE(sawFv && sawPlain);
+        EXPECT_TRUE(sawFv);
     }
     const std::string f2 = writeFile("flags2.rql", "alter topic fv add column b int32;\n");
     const auto r = consoleLive(b, {"-f", f2, "--expected-version", "1"}, "");   // the topic is at v2 now

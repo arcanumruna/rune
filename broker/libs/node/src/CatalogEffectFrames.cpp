@@ -1,5 +1,6 @@
 // CatalogEffectFrames.cpp — catalog history Task 7 fix round 1 (C1).
 #include <rune/node/CatalogEffectFrames.h>
+#include <rune/node/WriteState.h>
 
 #include <rune/node/AdminChannels.h>
 
@@ -52,7 +53,7 @@ std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std
                                                   uint16_t fromVersion) {
     if (auto e = tooLarge("the TopicApplied effect", t.name, catalogTopicAppliedWireLen(t.name, t.config), maxFrame))
         return e;
-    if (t.schema && t.schema->validate) {
+    if (t.schema) {
         try {
             for (uint16_t v = fromVersion; v <= t.schema->schemaVersion; ++v) {
                 const std::size_t n = schemaUpdateWireLen(materializedDescriptorOf(t, v).size());
@@ -61,6 +62,7 @@ std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std
         } catch (const std::exception& ex) {
             return "the schema of '" + t.name + "' does not materialize: " + ex.what();
         }
+        if (auto e = tooLarge("the WriteSpec effect", t.name, kTopicWriteSpecWireLen, maxFrame)) return e;
     }
     // Phase 2c: every typed topic also posts its FilterSchema (the EVOLVING descriptor: retired fields stay, so it can
     // outgrow the materialized one) - validate or not.  Unsized, a frame the ring cannot take is refused on every broker

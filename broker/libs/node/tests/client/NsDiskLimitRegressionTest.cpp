@@ -117,7 +117,7 @@ TEST(LimitEnforcementTableRegression, DiskBrokerRegression) {
     b.createUser("free/f", kUserPw, userGrants());
     auto define = [&](const std::string& user) {
         auto c = connected(b, user);
-        const auto r = c->defineTopicAndWait("t", 1, "", false, {}, 20s);
+        const auto r = c->defineTopicAndWait("t", 1, "", {}, 20s);
         if (r.errorCode != 0) throw std::runtime_error("define: " + r.detail);
         c->close();
         return rc::TopicHandle{r.topicId, 1};
@@ -202,7 +202,7 @@ TEST(OverDiskRegression, FollowerApplyNeverRefusedBrokerRegression) {
     to.replicationFactor = 3;
     rc::DefineTopicResult def{};
     ASSERT_TRUE(AuthTrio::until(60s, [&] {
-        def = u->defineTopicAndWait("t", 1, "", {}, false, rc::Persistence::Disk, to, {}, 60s);
+        def = u->defineTopicAndWait("t", 1, "", {}, rc::Persistence::Disk, to, {}, 60s);
         return def.errorCode == 0;
     })) << def.detail;
     const rc::TopicHandle th{def.topicId, 1};

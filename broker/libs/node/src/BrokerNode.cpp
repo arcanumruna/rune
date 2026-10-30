@@ -1618,6 +1618,7 @@ void BrokerNode::buildWorkerPool() {
         static_cast<std::size_t>(config_.ioSubmitRingDepth),       // E3 Task 7: io-ring depths
         static_cast<std::size_t>(config_.ioCompletionRingDepth),   // E3 Task 7
         config_.workerCoreBase);                                    // E4: CPU affinity base core
+    schemaFanout_.setHoldWriteSpecPassesForTest(config_.testHoldWriteSpecPasses);
 
     if (replicaRegistry_) {
         // Ordinal-invariant assert: routing uses partitionId() as the partition
@@ -2844,7 +2845,11 @@ void BrokerNode::buildGateway() {
     // confirmed by TSan (bridge control thread ↔ Worker::doWork on worker thread).
     if (replBridge_ && workerPool_) {
         replBridge_->setWorkerPool(workerPool_.get());
+        // Checked writes: a typed partition's leadership waits for its validators and write spec on every worker ring
+        // (the role op then follows them on the owner's FIFO ring), at boot and at runtime alike.
+        replBridge_->setLeaderRoleHold(&BrokerNode::leaderRoleAwaitsSpecThunk_, this);
     }
+    postBootWriteSpecs_();
 
     // -----------------------------------------------------------------------
     // Task 6: Build the __catalog partition + the AdminWorker thread (catalog
@@ -3621,6 +3626,17 @@ int BrokerNode::servicePeerLinks_(int64_t nowNs) {
     work += peerLinkFanout_.pump(workerPool_.get(), adminWorkerAgent_ ? &adminWorkerAgent_->controlToAdminRing() : nullptr);
     publishPeerLinkMetrics_();
     return work;
+}
+
+int BrokerNode::serviceClusterFeatureLevel_() {
+    if (metadataService_) {
+        const int16_t level = metadataService_->featureLevel();
+        if (level != postedClusterLevel_) {
+            clusterLevelFanout_.post(level);
+            postedClusterLevel_ = level;
+        }
+    }
+    return clusterLevelFanout_.pump(workerPool_.get(), adminWorkerAgent_ ? &adminWorkerAgent_->controlToAdminRing() : nullptr);
 }
 
 void BrokerNode::publishPeerLinkMetrics_() noexcept {
@@ -4947,6 +4963,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     work += serviceAuthMode_(nowNs);   // Authentication Task 9: the dev-mode warning timer + the auth-mode counter
     work += stepSecurityServing_(nowNs);   // issues #15 / #111: serving only while provably current
     work += servicePeerLinks_(nowNs);  // Authentication Task 15: the peer link handshakes + key distribution
+    work += serviceClusterFeatureLevel_();   // checked writes: the committed metadata feature level -> every worker + the admin thread
 
     auto* agent = adminWorkerAgent_.get();
     if (!agent) return work;
@@ -5135,6 +5152,13 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                     spdlog::error("BrokerNode[{}]: malformed kA2cNsReapRequest (len={}) skipped", config_.nodeId, n);
                 return;
             }
+            if (tid == kA2cWriteSpec) {   // checked writes: a typed topic's write spec -> every worker, behind its schema versions
+                if (const auto w = decodeTopicWriteSpec(std::span<const uint8_t>(p, n)))
+                    schemaFanout_.postWriteSpec(w->topicId, std::vector<uint8_t>(p, p + n));
+                else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
+                    spdlog::error("BrokerNode[{}]: malformed kA2cWriteSpec (len={}) skipped", config_.nodeId, n);
+                return;
+            }
             if (tid == kA2cViewUninstall) {
                 const int32_t viewTopicId = decodeViewUninstall(p, n);
                 if (viewTopicId >= 0) onViewUninstall_(viewTopicId);
@@ -5160,6 +5184,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     if (metricsReady_) publishLoginTallies_();
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
+    work += serviceCreatesAwaitingSpec_();
     if (workerPool_) work += topicDroppedFanout_.pump(*workerPool_);   // R-M1
     if (workerPool_ && nsAggregator_.slotCapacity() != 0) {            // Namespaces Phase 2 Task 14 (D28): one tick per period
         if (nsAggregator_.doWork(nowNs) > 0)
@@ -5808,6 +5833,15 @@ void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool is
 
 void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
     if (!topicRegistry_) return;
+    // A typed topic is built only once its validators and write spec are on every worker's ring: otherwise a full ring
+    // could let the topic's partitions be owned (and served unvalidated) before its spec arrives.
+    if (workerPool_ && schemaFanout_.pendingFor(spec.topicId)) {
+        for (const auto& parked : pendingCreatesAwaitingSpec_)
+            if (parked.topicId == spec.topicId) return;   // the same effect again
+        (void)topicRegistry_->reserveTopicAt(spec.topicId, spec.name);   // seen: never a Gap a later create could tombstone
+        pendingCreatesAwaitingSpec_.push_back(spec);
+        return;
+    }
     try {
         if (commitReplicaFault_ && *commitReplicaFault_ == spec.name) [[unlikely]]
             throw std::runtime_error("injected replica-build fault (test)");
@@ -5829,10 +5863,53 @@ void BrokerNode::runCatalogCreate_(const TopicSpec& spec) {
     }
 }
 
+// The boot builds the catalog's typed topics, and the workers own their partitions, before the admin thread re-posts the
+// topics' validators and write specs.  The startup thread queues them first (the control thread is not running yet), so
+// the leader-role hold has something to wait for.  The admin thread's later posts are idempotent on the workers.
+void BrokerNode::postBootWriteSpecs_() {
+    if (!workerPool_ || !bootApplier_ || !schemaRegistry_) return;
+    for (const rune::catalog::TopicObject* t : bootApplier_->state().topics()) {
+        const auto w = writeSpecWireOf(*t);
+        if (!w) continue;
+        for (uint16_t v = 1; v <= t->schema->schemaVersion; ++v)
+            if (const RegistryEntry* e = schemaRegistry_->byIdVersion(t->topicId, v))
+                schemaFanout_.post(t->topicId, v, rune::codec::serialize(e->descriptor));
+        std::vector<uint8_t> spec(kTopicWriteSpecWireLen);
+        (void)encodeTopicWriteSpec(*w, spec);
+        schemaFanout_.postWriteSpec(t->topicId, std::move(spec));
+    }
+}
+
+bool BrokerNode::leaderRoleAwaitsSpecThunk_(void* self, int32_t topicId) noexcept {
+    return static_cast<BrokerNode*>(self)->schemaFanout_.pendingFor(topicId);
+}
+
+int BrokerNode::serviceCreatesAwaitingSpec_() {
+    if (pendingCreatesAwaitingSpec_.empty()) return 0;
+    int work = 0;
+    std::vector<TopicSpec> parked;
+    parked.swap(pendingCreatesAwaitingSpec_);
+    for (auto& spec : parked) {
+        if (schemaFanout_.pendingFor(spec.topicId)) { pendingCreatesAwaitingSpec_.push_back(std::move(spec)); continue; }
+        runCatalogCreate_(spec);
+        ++work;
+    }
+    return work;
+}
+
 void BrokerNode::dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::string& name) {
     // R-M1: every worker answers UnknownTopic (not the retriable NotLeader) for this id once the op runs —
     // posted on every path below (pending create, gap id, live topic): the id is dropped on this broker.
     if (workerPool_) topicDroppedFanout_.post(topicId);
+    schemaFanout_.forgetTopic(topicId);
+    // A typed create still waiting for its spec never ran: forget it, like one waiting behind a drop (below).
+    const auto awaitingSpec = pendingCreatesAwaitingSpec_.size();
+    std::erase_if(pendingCreatesAwaitingSpec_, [topicId](const TopicSpec& s) { return s.topicId == topicId; });
+    if (pendingCreatesAwaitingSpec_.size() != awaitingSpec) {
+        if (metadataService_) metadataService_->removeRuntimeTopic(topicId);   // idempotent
+        if (topicRegistry_) (void)topicRegistry_->dropTopic(topicId);
+        return;
+    }
     // A create of this id still waiting behind an older drop never ran: forget
     // it — its Pending slot becomes Dropped (it was seen: created, then dropped).
     const auto before = pendingCreatesBehindDrop_.size();

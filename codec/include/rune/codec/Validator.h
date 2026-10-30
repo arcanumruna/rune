@@ -13,13 +13,17 @@ struct ValResult {
     const char* reason  = nullptr;
 };
 
+/// Utf8: every String / FixedStr field must hold well-formed UTF-8 and a FixedStr's bytes after its first NUL must be NUL.
+enum class StringCheck : uint8_t { None, Utf8 };
+
 class Validator {
 public:
     /// `d` may be a per-version (materialized) descriptor or the cumulative "evolving" one that still
     /// carries retired fields (untilVersion != 0xFFFF, issue #149): the latter is validated as
     /// materializeAsOf(d, d.version), so retired fields never shift the fixed offsets or the var walk.
     explicit Validator(const Descriptor& d);
-    ValResult validate(std::span<const uint8_t> record) const noexcept;
+    ValResult validate(std::span<const uint8_t> record) const noexcept { return validate(record, StringCheck::None); }
+    ValResult validate(std::span<const uint8_t> record, StringCheck check) const noexcept;
 
 private:
     void build_(const Descriptor& d);   // fills the tables from a descriptor with no retired field

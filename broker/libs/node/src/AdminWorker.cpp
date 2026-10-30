@@ -3,6 +3,7 @@
 #include "rune/node/AdminWorker.h"
 
 #include <rune/node/NamespaceLimitCheck.h>
+#include <rune/node/TopicFeatureRules.h>
 #include <rune/node/CatalogEffectFrames.h>
 #include <rune/node/FdBudget.h>
 #include <rune/node/PersistenceMode.h>
@@ -182,6 +183,25 @@ struct Fnv {
     void b(const std::vector<uint8_t>& v) noexcept { h = cat::detail::fnvBytes(h, v.data(), v.size()); }
 };
 void h_bytes(Fnv& f, const uint8_t* p, std::size_t n) noexcept { f.h = cat::detail::fnvBytes(f.h, p, n); }
+
+// The QL spelling of a field's type, for the topic-key refusal.
+std::string keyTypeSpelling(const rune::codec::FieldDescriptor& f) {
+    using rune::codec::PrimType;
+    switch (f.type) {
+    case PrimType::Int32:    return "int32";
+    case PrimType::Int64:    return "int64";
+    case PrimType::UInt16:   return "uint16";
+    case PrimType::UInt32:   return "uint32";
+    case PrimType::UInt64:   return "uint64";
+    case PrimType::Float64:  return "float64";
+    case PrimType::Bool:     return "bool";
+    case PrimType::Enum:     return "enum";
+    case PrimType::String:   return "string";
+    case PrimType::Bytes:    return "bytes";
+    case PrimType::FixedStr: return "string(" + std::to_string(f.fixedLen) + ")";
+    }
+    return "unknown";
+}
 
 } // namespace
 
@@ -623,6 +643,13 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // A pure read of the projected registry.  `requestedFingerprint` 0 = latest;
     // non-zero = the exact historical version with that per-version fingerprint.
     const auto* named = reg_.byName(msg.nsId, msg.name);   // namespaces Task 7: scoped to the request's namespace
+    if (!named && msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint) {
+        // Checked writes kind probe: an untyped topic is OK with no blob (a raw handle binds to it).
+        if (const cat::TopicObject* t = applier_.state().topicByName(msg.nsId, msg.name)) {
+            deps_.respondGet(msg.session, msg.corr, t->topicId, 0, t->partitions, {}, kOK);
+            return;
+        }
+    }
     if (!named) {
         deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
         return;
@@ -634,7 +661,7 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
                          named->descriptorBlob, kOK);
         return;
     }
-    const RegistryEntry* e = (msg.requestedFingerprint == 0)
+    const RegistryEntry* e = (msg.requestedFingerprint == 0 || msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint)
                                  ? named
                                  : reg_.byFingerprint(named->topicId, msg.requestedFingerprint);
     if (!e) {
@@ -1254,8 +1281,11 @@ void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
         return;
     }
     // A detail rides an ErrorResponse for the pre-v8 response types (their own
-    // frames have no detail field) — InvalidRequest only (spec §9).
-    const bool viaError = r.code == kInvalidRequest && !r.detail.empty() && deps_.respondError;
+    // frames have no detail field) — InvalidRequest (spec §9), and (checked writes) the schema and view-source
+    // refusals whose reason names what to change.
+    const bool viaError = !r.detail.empty() && deps_.respondError &&
+                          (r.code == kInvalidRequest || r.code == kInvalidSchema || r.code == kViewSourceNotFound ||
+                           r.code == kViewKeyInvalid);
     auto byTemplate = [&](uint16_t tid, int64_t session, int64_t corr) {
         switch (tid) {
         case kTidDefineTopic:
@@ -1362,6 +1392,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
 
     // A non-empty descriptor must be well-formed; nextTag starts past every tag.
     uint16_t nextTag = 0;
+    std::optional<DdlRejection> keyRefusal;   // P4: judges a new definition only, after the existing-name answers below
     if (!m.blob.empty()) {
         try {
             const rune::codec::Descriptor d =
@@ -1369,6 +1400,14 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
             // #667: a NEW definition may not carry a width-0 FixedStr (replay of historical events still accepts it).
             if (const auto* zf = rune::codec::zeroWidthFixedStr(d))
                 return Rejected(reject(kInvalidSchema, "FixedStr column '" + zf->name + "' needs a width of at least 1"));
+            // Checked writes (P4): a topic key is an integer or string(N) with N <= 16.  A leader build rule, never an
+            // apply rule, so a catalog that already holds such a topic replays unchanged, and a re-define of it still
+            // answers TopicExists.  A key field that does not exist stays the applier's precondition.
+            if (!m.keyField.empty())
+                if (const rune::codec::FieldDescriptor* k = d.find(m.keyField);
+                    k != nullptr && !rune::codec::isTopicKeyType(k->type, rune::codec::fieldWidth(*k)))
+                    keyRefusal = reject(kInvalidSchema, "key field '" + m.keyField + "' is " + keyTypeSpelling(*k) +
+                                                            ": a topic key is an integer or string(N) with N <= 16");
             uint32_t past = static_cast<uint32_t>(d.fields.size());
             for (const auto& f : d.fields) past = std::max<uint32_t>(past, uint32_t{f.id} + 1);
             if (past > 0xFFFF) return Rejected(reject(kInvalidSchema));
@@ -1384,6 +1423,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     if (const cat::TopicObject* t = s.topicByName(m.nsId, m.name)) {
         if (t->schema) return Rejected(reject(kTopicExists, {}, t->topicId, t->schema->schemaVersion));
         if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
+        if (keyRefusal) return Rejected(std::move(*keyRefusal));
         // Issue #129: adopting a schema is a new version of a LIVE topic (every other producer's records are then
         // validated against it), so it needs ALTER on the topic - the gateway's verdict - not CREATE alone.
         if (!m.adoptDenial.empty()) return Rejected(reject(kNotAuthorized, m.adoptDenial));
@@ -1404,6 +1444,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
     }
     if (auto fold = foldCollision(s, m.nsId, m.name)) return Rejected(std::move(*fold));
+    if (keyRefusal) return Rejected(std::move(*keyRefusal));
 
     // Spec §8: the replication factor is bounded by the brokers and the minIsr.
     const int32_t rf = m.replicationFactor;
@@ -1505,7 +1546,16 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
         // ids a client picks freely, so naming the topic would enumerate another namespace's topics.  The ApplyV2
         // preview (buildEvent_) is the backstop for anything this misses.
         if (t != nullptr && t->nsId != nsId) return Rejected(reject(kViewSourceNotFound));
-        const RegistryEntry* e = t != nullptr && t->schema ? reg_.byId(src.topicId) : nullptr;
+        // Checked writes: a view needs a typed, keyed source.  An untyped one keeps ViewSourceNotFound, a keyless one is
+        // ViewKeyInvalid, both with the rule table's message - unless the namespace does not allow views at all, which
+        // is the answer the limit check would give.
+        if (t != nullptr)
+            if (const auto why = featureRefusal(DbFeature::View, topicShapeOf(*t))) {
+                if (const cat::NamespaceRecord* nsr = s.namespaces().byId(nsId))
+                    if (auto limit = viewsRefusal(nsr->limits)) return Rejected(reject(kNamespaceLimitExceeded, std::move(*limit)));
+                return Rejected(reject(t->schema ? kViewKeyInvalid : kViewSourceNotFound, std::string(*why)));
+            }
+        const RegistryEntry* e = t != nullptr ? reg_.byId(src.topicId) : nullptr;
         if (e == nullptr) return Rejected(reject(kViewSourceNotFound));
         // Phase 2b E: a view that reads a transient topic must itself be transient.
         if (t->persistence == cat::Persistence::Transient && persistence == 0)

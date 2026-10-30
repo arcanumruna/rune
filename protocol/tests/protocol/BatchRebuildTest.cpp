@@ -30,6 +30,7 @@ TEST(BatchRebuild, SpansCoverEveryRecordInOrder) {
     ASSERT_EQ(s.size(), 5u);
     for (std::size_t i = 0; i < 5; ++i) {
         EXPECT_EQ(s[i].offset, 100 + static_cast<int64_t>(i));
+        EXPECT_EQ(s[i].key, "k" + std::to_string(i));
         EXPECT_EQ(s[i].value, "v" + std::to_string(i));
         EXPECT_FALSE(s[i].nullValue);
         if (i > 0) EXPECT_EQ(s[i].pos, s[i - 1].pos + s[i - 1].len);

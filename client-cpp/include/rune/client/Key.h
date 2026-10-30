@@ -3,7 +3,10 @@
 // CB-2 — Binary Key for the Producer hot path.
 //
 // Design:
-//   - Holds up to 16 bytes inline (no heap alloc for small keys).
+//   - Holds up to 16 bytes inline (no heap alloc for small keys).  A key is NEVER truncated:
+//     a span longer than kMaxInline makes an over-long key (tooLong(), no bytes) that every
+//     producer entry refuses with SendResult::KeyTooLong; a POD wider than kMaxInline does
+//     not compile.
 //   - Accepts:  uint64_t / int64_t (stored as little-endian bytes),
 //               std::span<const uint8_t> (arbitrary byte slice),
 //               any trivially-copyable POD via hashing its raw bytes.
@@ -49,40 +52,44 @@ public:
     /// Construct from a signed 64-bit integer (same bit pattern as uint64_t).
     explicit Key(int64_t v) noexcept : Key(static_cast<uint64_t>(v)) {}
 
-    /// Construct from a byte span.  Truncates silently to kMaxInline bytes
-    /// (caller must ensure the key is not longer than the limit; the partition
-    /// hash remains stable on the bytes actually stored).
+    /// Construct from a byte span.  Longer than kMaxInline bytes is an over-long key (tooLong(), no
+    /// bytes): never truncated, so the producer refuses it instead of routing and keying a prefix.
     explicit Key(std::span<const uint8_t> bytes) noexcept {
         buf_.fill(0);
-        len_ = static_cast<uint8_t>(
-            bytes.size() < kMaxInline ? bytes.size() : kMaxInline);
+        if (bytes.size() > kMaxInline) {
+            len_ = kTooLongLen;
+            return;
+        }
+        len_ = static_cast<uint8_t>(bytes.size());
         std::memcpy(buf_.data(), bytes.data(), len_);
     }
 
     /// Construct from a trivially-copyable POD by treating its raw bytes as the
     /// key.  Enables Key(MyPodStruct{...}) — the struct's byte layout is the key.
-    /// Truncates to kMaxInline bytes.
+    /// A POD wider than kMaxInline does not compile.
     template <typename T,
-              typename = std::enable_if_t<std::is_trivially_copyable_v<T> &&
+              typename = std::enable_if_t<std::is_trivially_copyable_v<T> && (sizeof(T) <= kMaxInline) &&
                                           !std::is_same_v<T, uint64_t> &&
                                           !std::is_same_v<T, int64_t>>>
     explicit Key(const T& pod) noexcept {
         buf_.fill(0);
-        const auto sz = sizeof(T) < kMaxInline ? sizeof(T) : kMaxInline;
-        len_ = static_cast<uint8_t>(sz);
-        std::memcpy(buf_.data(), &pod, sz);
+        len_ = static_cast<uint8_t>(sizeof(T));
+        std::memcpy(buf_.data(), &pod, sizeof(T));
     }
 
     // ---- Accessors ----------------------------------------------------------
 
     /// Return a span over the raw key bytes.
     [[nodiscard]] std::span<const uint8_t> bytes() const noexcept {
-        return { buf_.data(), static_cast<std::size_t>(len_) };
+        return { buf_.data(), size() };
     }
 
     [[nodiscard]] std::size_t size() const noexcept {
-        return static_cast<std::size_t>(len_);
+        return len_ == kTooLongLen ? std::size_t{0} : static_cast<std::size_t>(len_);
     }
+
+    /// True for a key built from more than kMaxInline bytes (bytes() is empty): producers refuse it.
+    [[nodiscard]] bool tooLong() const noexcept { return len_ == kTooLongLen; }
 
     [[nodiscard]] bool empty() const noexcept { return len_ == 0; }
 
@@ -100,6 +107,7 @@ public:
     }
 
 private:
+    static constexpr uint8_t kTooLongLen = 0xFF;
     std::array<uint8_t, kMaxInline> buf_{};
     uint8_t                         len_ = 0;
 };

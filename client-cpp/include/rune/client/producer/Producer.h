@@ -329,6 +329,9 @@ enum class SendResult : uint8_t {
     NotInTransaction,///< Phase 2b F: a transactional producer outside a transaction (before
                     ///< beginTransaction() / after commit or abort was issued).  Nothing was
                     ///< written, no credit is kept; the blocking send() throws std::logic_error.
+    KeyTooLong,     ///< checked writes: the Key is wider than Key::kMaxInline (16 B).  A key is never
+                    ///< truncated, so nothing was written and no credit is kept; the blocking send() throws
+                    ///< std::invalid_argument.  (A TypedTopic always sends its key field's width.)
 };
 
 // ---------------------------------------------------------------------------

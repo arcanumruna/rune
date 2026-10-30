@@ -42,6 +42,11 @@ Kinds 32 to 63 are reserved for later features; `formatVer` 1 refuses them.
 A drop is an event. A dropped name can be created again, and the new object gets a new `objectId`,
 so history never mixes the two.
 
+**Typed and raw topics.** A topic with a schema is typed: the broker validates every write to it. An untyped topic is a
+raw log and shows as `kind raw` in `rune catalog show`. `SchemaDef::validate` is still recorded and fingerprinted as
+before, but it only decides whether a topic validates below metadata feature level 5 (`kCheckedWrites`); from that level
+every typed topic validates fully and the flag is ignored.
+
 **`formatVer` rules.** The apply rules of a `formatVer` are frozen and never edited. A rule change
 ships under a new `formatVer`, and old events keep replaying under their own rules. A reader that
 meets a `formatVer` it has no rules for stops with an `UnsupportedFormat` error. Every replay, in

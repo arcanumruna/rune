@@ -78,6 +78,28 @@ inline std::vector<uint8_t> makeBatch(int records) {
     return b.build();
 }
 
+/// The rigs' typed topics (authRigCharBlob(): {id int64 key, hp int64}, key field "id") validate every write: a record is
+/// the id's 8 key bytes and a version-1 value, which may carry extra trailing bytes (`tag`) that the validator ignores.
+/// An untyped topic takes the same bytes, so a fixture that does not care about types can always use these.
+inline std::string charKey(int64_t id = 1) {
+    std::string k(8, '\0');
+    for (int i = 0; i < 8; ++i) k[static_cast<std::size_t>(i)] = static_cast<char>((static_cast<uint64_t>(id) >> (8 * i)) & 0xFF);
+    return k;
+}
+inline constexpr std::size_t kCharValuePrefix = 20;   // blockLength 16, version 1, id, hp
+inline std::string charValue(std::string_view tag = {}, int64_t id = 1) {
+    std::string v("\x10\0\x01\0", 4);
+    v += charKey(id);
+    v.append(8, '\0');   // hp
+    v.append(tag);
+    return v;
+}
+inline std::vector<uint8_t> makeCharBatch(int records) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    for (int i = 0; i < records; ++i) b.append(charKey(), charValue(), 1000 + i);
+    return b.build();
+}
+
 class ShardTestClient {
 public:
     static constexpr int32_t kEgressStream = 4242;

@@ -25,13 +25,13 @@ TEST(ClientDdlBrokerRegression, EveryDdlAndWaitRoundTripsThroughARealBroker) {
     OneBroker b("cb_all");
     auto client = b.connectClient();
     rune::client::DdlOptions o; o.statement = "topic u partitions 1;";
-    const auto created = client->defineTopicAndWait("u", 1, "", {}, false, rune::client::Persistence::Disk, {}, o, 10s);
+    const auto created = client->defineTopicAndWait("u", 1, "", {}, rune::client::Persistence::Disk, {}, o, 10s);
     ASSERT_EQ(created.errorCode, 0) << created.detail;
     EXPECT_FALSE(created.requestId.none()) << "the result names its requestId";
     const rune::protocol::client::ConfigChangeWire ch{1, 60'000};
     const auto cfg = client->alterTopicConfigAndWait("u", 0, std::span(&ch, 1), {}, 10s);
     EXPECT_EQ(cfg.errorCode, 0) << cfg.detail;
-    const auto schema = client->defineTopicAndWait("u", 1, "id", b.idDescriptor(), false,
+    const auto schema = client->defineTopicAndWait("u", 1, "id", b.idDescriptor(),
                                                    rune::client::Persistence::Disk, {}, {}, 10s);
     EXPECT_EQ(schema.errorCode, 0) << "CreateSchema on the untyped topic: " << schema.detail;
     const auto altered = client->alterTopicAndWait("u", 0, b.addColumnOps("mana"), {}, 10s);
@@ -64,7 +64,7 @@ TEST(ClientDdlBrokerRegression, InvalidRequestDetailFromTheBrokerReachesTheCalle
     OneBroker b("cb_rf");
     auto client = b.connectClient();
     rune::client::TopicOptions topic; topic.replicationFactor = 5;
-    const auto r = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, topic, {}, 10s);
+    const auto r = client->defineTopicAndWait("t", 1, "", {}, rune::client::Persistence::Disk, topic, {}, 10s);
     EXPECT_EQ(r.errorCode, 39);
     EXPECT_EQ(r.detail, "replicationFactor 5 > broker count 1");
     EXPECT_FALSE(r.requestId.none());
@@ -75,8 +75,8 @@ TEST(ClientDdlBrokerRegression, ARetriedRequestIdGetsTheOriginalResultFromTheBro
     OneBroker b("cb_dedupe");
     auto client = b.connectClient();
     rune::client::DdlOptions o; o.requestId = {.hi = 0xC11E, .lo = 42};
-    const auto first  = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, {}, o, 10s);
-    const auto second = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, {}, o, 10s);
+    const auto first  = client->defineTopicAndWait("t", 1, "", {}, rune::client::Persistence::Disk, {}, o, 10s);
+    const auto second = client->defineTopicAndWait("t", 1, "", {}, rune::client::Persistence::Disk, {}, o, 10s);
     EXPECT_EQ(first.errorCode, 0);
     EXPECT_EQ(second.errorCode, 0) << "not TopicExists";
     EXPECT_EQ(second.topicId, first.topicId);
@@ -84,7 +84,7 @@ TEST(ClientDdlBrokerRegression, ARetriedRequestIdGetsTheOriginalResultFromTheBro
     EXPECT_EQ(second.requestId, o.requestId);
     EXPECT_EQ(b.catalogEvents().size(), 1u);
     // A different requestId for the same name is a new DDL: TopicExists.
-    const auto third = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s);
+    const auto third = client->defineTopicAndWait("t", 1, "", {}, rune::client::Persistence::Disk, {}, {}, 10s);
     EXPECT_EQ(third.errorCode, 25);
     EXPECT_NE(third.requestId, o.requestId);
 }
@@ -150,14 +150,14 @@ TEST(ClientDdlBrokerRegression, BelowMinIsrTheClientFailsExplicitlyAtItsBudgetAn
     cfg.ddlRetryBudget  = std::chrono::milliseconds(4'000);
     rune::client::Client client(cfg);
     client.connectAndWait(20s);
-    ASSERT_EQ(client.defineTopicAndWait("data", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 20s).errorCode, 0);
+    ASSERT_EQ(client.defineTopicAndWait("data", 1, "", {}, rune::client::Persistence::Disk, {}, {}, 20s).errorCode, 0);
 
     for (int id = 1; id <= 3; ++id) if (id != leader) c.stop(id);
     rune::client::DdlOptions o; o.requestId = {.hi = 0xC11E, .lo = 77};
     const auto t0 = std::chrono::steady_clock::now();
     bool explicitFailure = false;
     try {
-        const auto r = client.defineTopicAndWait("more", 1, "", {}, false, rune::client::Persistence::Disk, {}, o, 30s);
+        const auto r = client.defineTopicAndWait("more", 1, "", {}, rune::client::Persistence::Disk, {}, o, 30s);
         // Review M5: exactly the retriable NotLeader past the budget — never another code.
         EXPECT_EQ(r.errorCode, 2) << "below minIsr: NotLeader until the budget ends (" << r.detail << ")";
         explicitFailure = r.errorCode == 2;
@@ -175,7 +175,7 @@ TEST(ClientDdlBrokerRegression, BelowMinIsrTheClientFailsExplicitlyAtItsBudgetAn
     rune::client::DefineTopicResult retry;
     for (const auto deadline = std::chrono::steady_clock::now() + 90s; std::chrono::steady_clock::now() < deadline;) {
         try {
-            retry = client.defineTopicAndWait("more", 1, "", {}, false, rune::client::Persistence::Disk, {}, o, 30s);
+            retry = client.defineTopicAndWait("more", 1, "", {}, rune::client::Persistence::Disk, {}, o, 30s);
             if (retry.errorCode == 0) break;
         } catch (const std::exception&) {
             retry.errorCode = 0xFFFF;

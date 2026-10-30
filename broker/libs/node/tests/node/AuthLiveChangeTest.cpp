@@ -143,7 +143,7 @@ TEST(AuthLiveChangeRegression, RevokedWriteFailsTheNextShardProduceRegression) {
         int code = kNoAnswer;
         for (int a = 0; a < attempts; ++a) {
             const int64_t corr = t.r.c().nextCorrelationId();
-            if (!t.r.c().produce(t.b().workerIngressChannel(), AuthRig::stream(), ws, corr, t.r.orders, 0, 1, makeBatch(1)))
+            if (!t.r.c().produce(t.b().workerIngressChannel(), AuthRig::stream(), ws, corr, t.r.orders, 0, 1, makeCharBatch(1)))
                 return kNoAnswer;
             const auto ack = t.r.c().awaitProduceResponseUntil(corr, AuthRig::dl(10));
             code = ack ? ack->errorCode : kNoAnswer;
@@ -446,7 +446,7 @@ int shardProduceCode(Live& t, int64_t sid, int32_t topic, int attempts = 1) {
     int code = kNoAnswer;
     for (int a = 0; a < attempts; ++a) {
         const int64_t corr = t.r.c().nextCorrelationId();
-        if (!t.r.c().produce(t.b().workerIngressChannel(), AuthRig::stream(), sid, corr, topic, 0, 1, makeBatch(1)))
+        if (!t.r.c().produce(t.b().workerIngressChannel(), AuthRig::stream(), sid, corr, topic, 0, 1, makeCharBatch(1)))
             return kNoAnswer;
         const auto ack = t.r.c().awaitProduceResponseUntil(corr, AuthRig::dl(10));
         code = ack ? ack->errorCode : kNoAnswer;
@@ -604,7 +604,7 @@ int64_t leoOf(Live& t, int32_t topic) {
 /// One worker-ingress produce, waiting at most `seconds` for its answer (kNoAnswer: none).
 int shardProduceOnce(Live& t, int64_t sid, int32_t topic, int seconds = 3) {
     const int64_t corr = t.r.c().nextCorrelationId();
-    if (!t.r.c().produce(t.b().workerIngressChannel(), AuthRig::stream(), sid, corr, topic, 0, 1, makeBatch(1)))
+    if (!t.r.c().produce(t.b().workerIngressChannel(), AuthRig::stream(), sid, corr, topic, 0, 1, makeCharBatch(1)))
         return kNoAnswer;
     const auto ack = t.r.c().awaitProduceResponseUntil(corr, AuthRig::dl(seconds));
     return ack ? ack->errorCode : kNoAnswer;
@@ -716,7 +716,7 @@ namespace {
 void backlog(Live& t, int64_t ws, int32_t topic, int batches, int perBatch) {
     for (int i = 0; i < batches; ++i) {
         const int64_t corr = t.r.c().nextCorrelationId();
-        ASSERT_TRUE(t.r.c().produce(t.ch(), AuthRig::stream(), ws, corr, topic, 0, 1, makeBatch(perBatch)));
+        ASSERT_TRUE(t.r.c().produce(t.ch(), AuthRig::stream(), ws, corr, topic, 0, 1, makeCharBatch(perBatch)));
         const auto a = t.r.c().awaitProduceResponseUntil(corr, AuthRig::dl());
         ASSERT_TRUE(a.has_value() && a->errorCode == 0) << "backlog batch " << i;
     }
@@ -944,7 +944,7 @@ TEST(AuthLiveChangeAdversarialRegression, EverySessionEndingChangeRemovesExactly
         EXPECT_TRUE(t.b().node().gatewayHasSessionForTest(bystander)) << "another user's session is untouched";
         // A produce on the ended id, then an allowed one on the same stream (ordered after it): exactly one record.
         const int64_t before = t.r.logEnd(t.r.orders);
-        ASSERT_TRUE(t.r.c().produce(t.ch(), t.r.stream(), s1, t.r.c().nextCorrelationId(), t.r.orders, 0, 1, makeBatch(1)));
+        ASSERT_TRUE(t.r.c().produce(t.ch(), t.r.stream(), s1, t.r.c().nextCorrelationId(), t.r.orders, 0, 1, makeCharBatch(1)));
         ASSERT_EQ(t.r.produce(bystander, t.r.orders), 0);
         EXPECT_EQ(t.r.logEnd(t.r.orders), before + 1) << "the ended session's produce appended nothing";
     }

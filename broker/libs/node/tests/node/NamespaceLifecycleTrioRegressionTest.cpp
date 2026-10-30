@@ -77,7 +77,7 @@ std::vector<AuthGrant> dataGrants() {
 
 std::vector<uint8_t> bigBatch(std::size_t valueBytes) {
     rune::protocol::RecordBatchBuilder b(0, 1000);
-    b.append("k", std::string(valueBytes, 'v'), 1000);
+    b.append(charKey(), charValue(std::string(valueBytes > 20 ? valueBytes - 20 : 0, 'v')), 1000);   // a valid record of valueBytes
     return b.build();
 }
 
@@ -474,12 +474,17 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     int acked = 0;   // every burst's acked records, not only the last burst's
     auto burst = [&](int n) {
         Tally tl;
-        const std::vector<uint8_t> v(64, 9);
         int sent = 0, done = 0;
         const auto deadline = Clock3::now() + 60s;
         while (done < n && Clock3::now() < deadline) {
-            if (sent < n && p.trySend(th, rc::Key(++key), std::span<const uint8_t>(v.data(), v.size()), cq, key) == rc::SendResult::Ok) ++sent;
-            else if (sent < n) --key;
+            if (sent < n) {   // the topic is typed: the record's key is its id field
+                const uint64_t id = key + 1;
+                const std::string v = charValue(std::string(44, '9'), static_cast<int64_t>(id));
+                if (p.trySend(th, rc::Key(id), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()), cq, id) == rc::SendResult::Ok) {
+                    ++sent;
+                    key = id;
+                }
+            }
             p.flush();
             (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) {
                 ++done;

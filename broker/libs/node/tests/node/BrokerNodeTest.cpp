@@ -1491,7 +1491,7 @@ std::vector<uint8_t> charactersBatch(bool conforming) {
 }
 } // namespace
 
-TEST(BrokerNodeRegression, DefineTopicValidatorReachesEveryWorkerEndToEndRegression) {
+static void validatorReachesEveryWorkerEndToEnd(bool validate) {
     const fs::path dir = makeTempDataDir("schema_e2e_");
     NodeConfig cfg = makeSingleNodeConfig(dir);
     cfg.workerCount = 2;
@@ -1531,7 +1531,7 @@ TEST(BrokerNodeRegression, DefineTopicValidatorReachesEveryWorkerEndToEndRegress
     bool    sawInternal = false;
     while (topicId < 0) {
         ASSERT_GT(remaining().count(), 0) << "DefineTopic did not commit within the test deadline";
-        auto def = client.defineTopicUntil(gw, stream, sid, "characters", kParts, /*validate=*/true,
+        auto def = client.defineTopicUntil(gw, stream, sid, "characters", kParts, validate,
                                            blob, std::min(testDeadline, Clock::now() + 5s));
         ASSERT_TRUE(def.has_value()) << "no DefineTopicResponse — gateway/admin path did not answer";
         if (def->errorCode == 0) { topicId = def->topicId; break; }
@@ -1568,8 +1568,10 @@ TEST(BrokerNodeRegression, DefineTopicValidatorReachesEveryWorkerEndToEndRegress
                 if (installed[w]) continue;
                 if (!rune::node::test::hasReplica(node, topicId, p)) return false;
                 installed[w] = node.onOwnerThreadForTest(topicId, p,
-                    [&node, w = w, topicId](rune::replication::PartitionReplica&) {
-                        return node.workerForTest(w)->hasValidatorForTest(topicId);
+                    [&node, w = w, topicId, p = p](rune::replication::PartitionReplica&) {
+                        return node.workerForTest(w)->hasValidatorForTest(topicId) &&
+                               node.workerForTest(w)->writeStateForTest(topicId, p) != nullptr &&   // typed: validators AND a write state
+                               node.workerForTest(w)->clusterFeatureLevelForTest() >= rune::replication::MetadataFeature::kCheckedWrites;
                     });
                 if (!installed[w]) return false;
             }
@@ -1620,6 +1622,16 @@ TEST(BrokerNodeRegression, DefineTopicValidatorReachesEveryWorkerEndToEndRegress
 
     node.stop();
     std::error_code ec; fs::remove_all(dir, ec);
+}
+
+TEST(BrokerNodeRegression, DefineTopicValidatorReachesEveryWorkerEndToEndRegression) {
+    validatorReachesEveryWorkerEndToEnd(/*validate=*/true);
+}
+
+// Checked writes: a typed topic created WITHOUT validate gets its validators and write state on every worker too, and
+// validates from the moment the cluster feature level is raised (a single node starts at the latest level).
+TEST(CheckedWritesSpecFanoutRegression, EveryTypedTopicGetsValidatorsRegression) {
+    validatorReachesEveryWorkerEndToEnd(/*validate=*/false);
 }
 
 TEST(BrokerNodeRegression, StartNeverPumpsNodeDriverFromCallerThread) {

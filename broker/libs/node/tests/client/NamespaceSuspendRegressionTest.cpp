@@ -134,7 +134,7 @@ struct Fix {
     }
     rc::TopicHandle defineT(const std::string& user) {
         auto c = connected(b, user, kUserPw);
-        const auto r = c->defineTopicAndWait("t", 1, "", false, {}, 20s);
+        const auto r = c->defineTopicAndWait("t", 1, "", {}, 20s);
         if (r.errorCode != 0) throw std::runtime_error("define t: " + r.detail);
         c->close();
         return rc::TopicHandle{r.topicId, 1};
@@ -159,7 +159,7 @@ TEST(NamespaceSuspendRegression, ReadOnlyRefusesProduceAllowsFetchRegression) {
     EXPECT_NE(refused.status, rc::OpStatus::Ok);
     EXPECT_EQ(refused.code, kSuspended) << "status " << static_cast<int>(refused.status);
     EXPECT_EQ(fetchCount(*ua, f.tA, 3), 3u) << "reads are still served";
-    const auto def = ua->defineTopicAndWait("t2", 1, "", false, {}, 20s);
+    const auto def = ua->defineTopicAndWait("t2", 1, "", {}, 20s);
     EXPECT_EQ(def.errorCode, kSuspended) << "DDL is refused";
     EXPECT_EQ(produceOne(*ub, f.tB, 1).status, rc::OpStatus::Ok) << "another namespace is unaffected";
 }
@@ -290,13 +290,13 @@ TEST(NamespaceSuspendRegression, ResumeRestoresServiceRegression) {
 // requests through (the catalog itself still refuses a CreateTopic in a non-ACTIVE namespace: 39, not 51).
 TEST(NamespaceSuspendRegression, ClusterAdminExemptRegression) {
     Fix f("nssusp_admin");
-    const auto r = f.admin->defineTopicAndWait("dt", 1, "", false, {}, 20s);
+    const auto r = f.admin->defineTopicAndWait("dt", 1, "", {}, 20s);
     ASSERT_EQ(r.errorCode, 0) << r.detail;
     const rc::TopicHandle th{r.topicId, 1};
     ASSERT_TRUE(f.admin->suspendNamespace("default", pc::NsSuspendMode::ReadOnly).has_value());
     EXPECT_EQ(produceOne(*f.admin, th, 1).status, rc::OpStatus::Ok) << "the admin still produces";
     EXPECT_EQ(fetchCount(*f.admin, th, 1), 1u);
-    const auto ddl = f.admin->defineTopicAndWait("dt2", 1, "", false, {}, 20s);
+    const auto ddl = f.admin->defineTopicAndWait("dt2", 1, "", {}, 20s);
     EXPECT_EQ(ddl.errorCode, 0) << ddl.detail << " (the cluster admin's DDL applies in a suspended namespace)";
     ASSERT_TRUE(f.admin->resumeNamespace("default").has_value());
 }
@@ -308,7 +308,7 @@ TEST(NamespaceSuspendRegression, OldClientGetsInvalidRequestRegression) {
                    {prefix(SO::Create, ST::Topic, "old."), prefix(SO::Describe, ST::Topic, "old."),
                     prefix(SO::Write, ST::Topic, "old.")});
     auto old = connected(f.b, "olduser", kUserPw, 13);
-    const auto d = old->defineTopicAndWait("old.t", 1, "", false, {}, 20s);
+    const auto d = old->defineTopicAndWait("old.t", 1, "", {}, 20s);
     ASSERT_EQ(d.errorCode, 0) << d.detail;
     const rc::TopicHandle th{d.topicId, 1};
     ASSERT_EQ(produceOne(*old, th, 1).status, rc::OpStatus::Ok);

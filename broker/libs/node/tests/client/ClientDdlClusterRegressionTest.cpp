@@ -41,7 +41,7 @@ TEST(ClientDdlClusterRegression, AndWaitThroughAFollowerFollowsTheRedirect) {
     const int32_t follower = aFollowerOfTheCatalog(c);
     ASSERT_GT(follower, 0);
     auto client = connectClient(c, follower);
-    const auto r = client->defineTopicAndWait("t", 1, "", {}, false, kDisk, {}, {}, 20s);
+    const auto r = client->defineTopicAndWait("t", 1, "", {}, kDisk, {}, {}, 20s);
     EXPECT_EQ(r.errorCode, 0) << r.detail;
     EXPECT_FALSE(r.requestId.none());
     std::string why;
@@ -65,11 +65,11 @@ TEST(ClientDdlClusterRegression, LeaderKilledMidDdlTheRetryGetsTheOriginalResult
     cfg.ddlTimeoutMs   = 90'000;
     cfg.ddlRetryBudget = 80s;
     auto client = connectClient(c, cfg);
-    ASSERT_EQ(client->defineTopicAndWait("warm", 1, "", {}, false, kDisk, {}, {}, 60s).errorCode, 0);
+    ASSERT_EQ(client->defineTopicAndWait("warm", 1, "", {}, kDisk, {}, {}, 60s).errorCode, 0);
 
     rune::client::DdlOptions o; o.requestId = {.hi = 0xC11E, .lo = 77};
     c.killCatalogLeaderAfterNextAppend();                         // test seam: crash the leader after its committed append
-    const auto r = client->defineTopicAndWait("t", 1, "", {}, false, kDisk, {}, o, 90s);
+    const auto r = client->defineTopicAndWait("t", 1, "", {}, kDisk, {}, o, 90s);
     const int32_t killed = c.reapKilledLeader();
     ASSERT_GT(killed, 0) << "the leader was crashed after the DDL's append";
     EXPECT_EQ(r.errorCode, 0) << "NotLeader/in-doubt retried within the budget, deduplicated on the new leader: " << r.detail;
@@ -105,7 +105,7 @@ TEST(ClientDdlClusterRegression, BelowMinIsrAndWaitFailsExplicitlyWithNotLeader)
     }
     ASSERT_GT(leader, 0) << "the controller leads the catalog";
     auto warm = connectClient(c, leader);
-    ASSERT_EQ(warm->defineTopicAndWait("warm", 1, "", {}, false, kDisk, {}, {}, 60s).errorCode, 0);
+    ASSERT_EQ(warm->defineTopicAndWait("warm", 1, "", {}, kDisk, {}, {}, 60s).errorCode, 0);
     auto cfg = clientConfigFor(c, leader);
     cfg.ddlTimeoutMs   = 20'000;
     cfg.ddlRetryBudget = 1500ms;
@@ -114,7 +114,7 @@ TEST(ClientDdlClusterRegression, BelowMinIsrAndWaitFailsExplicitlyWithNotLeader)
 
     const auto t0 = std::chrono::steady_clock::now();
     rune::client::DefineTopicResult r;
-    EXPECT_NO_THROW(r = client->defineTopicAndWait("t", 1, "", {}, false, kDisk, {}, {}, 30s));
+    EXPECT_NO_THROW(r = client->defineTopicAndWait("t", 1, "", {}, kDisk, {}, {}, 30s));
     const auto took = std::chrono::steady_clock::now() - t0;
     EXPECT_EQ(r.errorCode, 2) << "an explicit NotLeader failure once the budget is spent (spec §5.5): " << r.detail;
     EXPECT_NE(r.detail.find("budget exhausted"), std::string::npos) << r.detail;
@@ -137,7 +137,7 @@ TEST(ClientDdlClusterRegression, SeedLeaderCrashedMidDdlFailsExplicitlyAndTheRet
     cfg.ddlRetryBudget = 3s;
     cfg.ddlTimeoutMs   = 40'000;
     auto a = connectClient(c, cfg);
-    ASSERT_EQ(a->defineTopicAndWait("warm", 1, "", {}, false, kDisk, {}, {}, 60s).errorCode, 0);
+    ASSERT_EQ(a->defineTopicAndWait("warm", 1, "", {}, kDisk, {}, {}, 60s).errorCode, 0);
 
     rune::client::DdlOptions o; o.requestId = {.hi = 0xC11E, .lo = 91};
     c.node(leader).holdCatalogAnswersForTest(true);          // the leader commits the DDL and never answers it
@@ -149,7 +149,7 @@ TEST(ClientDdlClusterRegression, SeedLeaderCrashedMidDdlFailsExplicitlyAndTheRet
     rune::protocol::RequestId rid{};
     int32_t topicId = -1;
     try {
-        const auto r = a->defineTopicAndWait("t", 1, "", {}, false, kDisk, {}, o, 30s);
+        const auto r = a->defineTopicAndWait("t", 1, "", {}, kDisk, {}, o, 30s);
         code = r.errorCode; detail = r.detail; rid = r.requestId; topicId = r.topicId;
     } catch (const std::exception& e) {
         threw = true; detail = e.what();
@@ -180,7 +180,7 @@ TEST(ClientDdlClusterRegression, SeedLeaderCrashedMidDdlFailsExplicitlyAndTheRet
     auto bcfg = clientConfigFor(c, survivor);
     bcfg.ddlTimeoutMs = 90'000; bcfg.ddlRetryBudget = 80s;
     auto b = connectClient(c, bcfg);
-    const auto rb = b->defineTopicAndWait("t", 1, "", {}, false, kDisk, {}, o, 90s);
+    const auto rb = b->defineTopicAndWait("t", 1, "", {}, kDisk, {}, o, 90s);
     EXPECT_EQ(rb.errorCode, 0) << "the same requestId through a survivor gets the original result, not TopicExists: " << rb.detail;
     EXPECT_EQ(rb.requestId, o.requestId);
     std::string why;
@@ -244,7 +244,7 @@ TEST(ClientDdlClusterRegression, GetViewRowThroughEveryBrokerFollowsTheRedirectR
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t leader = c.settledLeader();
     auto admin = connectClient(c, leader);
-    const auto src = admin->defineTopicAndWait("src", 1, "id", rune::node::test::charBlob(), false, kDisk, {}, {}, 60s);
+    const auto src = admin->defineTopicAndWait("src", 1, "id", rune::node::test::charBlob(), kDisk, {}, {}, 60s);
     ASSERT_EQ(src.errorCode, 0) << src.detail;
     const auto view = admin->createViewAndWait("v", "id", 0, rune::node::test::viewPlanBlob("v", src.topicId, 0), {}, 60s);
     ASSERT_EQ(view.errorCode, 0) << view.detail;
@@ -295,8 +295,8 @@ TEST(ClientDdlClusterRegression, CatalogHistoryTruncatedMidReadIsReReadNotServed
     auto writerCfg = clientConfigFor(c, F);
     writerCfg.ddlTimeoutMs = 90'000; writerCfg.ddlRetryBudget = 80s;
     auto writer = connectClient(c, writerCfg);
-    ASSERT_EQ(writer->defineTopicAndWait("t1", 1, "", {}, false, kDisk, {}, {}, 60s).errorCode, 0);
-    ASSERT_EQ(writer->defineTopicAndWait("t2", 1, "", {}, false, kDisk, {}, {}, 60s).errorCode, 0);
+    ASSERT_EQ(writer->defineTopicAndWait("t1", 1, "", {}, kDisk, {}, {}, 60s).errorCode, 0);
+    ASSERT_EQ(writer->defineTopicAndWait("t2", 1, "", {}, kDisk, {}, {}, 60s).errorCode, 0);
 
     auto readerCfg = clientConfigFor(c, F);
     readerCfg.reconnectForeverAfterLive = true;
@@ -312,7 +312,7 @@ TEST(ClientDdlClusterRegression, CatalogHistoryTruncatedMidReadIsReReadNotServed
     // 2. the leader crashed mid-DDL; the read continues the cache under the same epoch.
     rune::client::DdlOptions o; o.requestId = {.hi = 0xB2, .lo = 1};
     c.killCatalogLeaderAfterNextAppend();
-    const auto t3 = writer->defineTopicAndWait("t3", 1, "", {}, false, kDisk, {}, o, 90s);
+    const auto t3 = writer->defineTopicAndWait("t3", 1, "", {}, kDisk, {}, o, 90s);
     const int32_t killed = c.reapKilledLeader();
     ASSERT_GT(killed, 0);
     ASSERT_EQ(t3.errorCode, 0) << t3.detail;

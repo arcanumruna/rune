@@ -64,6 +64,8 @@ public:
         NS_SLOT_RELEASE = static_cast<std::uint8_t>(28),
         NS_THROTTLE = static_cast<std::uint8_t>(29),
         NS_VIEW_MEM_OVER = static_cast<std::uint8_t>(30),
+        CLUSTER_FEATURE_LEVEL = static_cast<std::uint8_t>(31),
+        WRITE_SPEC_UPDATE = static_cast<std::uint8_t>(32),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -103,6 +105,8 @@ public:
             case static_cast<std::uint8_t>(28): return NS_SLOT_RELEASE;
             case static_cast<std::uint8_t>(29): return NS_THROTTLE;
             case static_cast<std::uint8_t>(30): return NS_VIEW_MEM_OVER;
+            case static_cast<std::uint8_t>(31): return CLUSTER_FEATURE_LEVEL;
+            case static_cast<std::uint8_t>(32): return WRITE_SPEC_UPDATE;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -145,6 +149,8 @@ public:
             case NS_SLOT_RELEASE: return "NS_SLOT_RELEASE";
             case NS_THROTTLE: return "NS_THROTTLE";
             case NS_VIEW_MEM_OVER: return "NS_VIEW_MEM_OVER";
+            case CLUSTER_FEATURE_LEVEL: return "CLUSTER_FEATURE_LEVEL";
+            case WRITE_SPEC_UPDATE: return "WRITE_SPEC_UPDATE";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

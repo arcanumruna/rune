@@ -59,6 +59,12 @@ struct NsObjectCounts {
     return l.featureBits == 0 || (l.featureBits & featureBit) != 0;
 }
 
+/// The refusal of a view in a namespace that does not allow views.
+[[nodiscard]] inline std::optional<std::string> viewsRefusal(const rune::protocol::NamespaceLimits& l) {
+    if (nsFeatureAllowed(l, rune::protocol::kNsFeatureViews)) return std::nullopt;
+    return std::string("namespace limit exceeded: views are not enabled for this namespace");
+}
+
 /// A produce's wire acks byte (0 = Leader/None, 1 = All) against `lowestAcks` (0 none, 1 leader, >= 2 all).
 [[nodiscard]] constexpr bool nsAcksAllowed(const rune::protocol::NamespaceLimits& l, uint8_t wireAcks) noexcept {
     return l.lowestAcks < 2 || wireAcks >= 1;
@@ -137,7 +143,7 @@ nsLimitRefusal(const rune::protocol::NamespaceLimits& L, const rune::catalog::Ca
         return std::nullopt;
     }
     if (std::holds_alternative<cat::CreateViewOps>(e.ops)) {
-        if (!nsFeatureAllowed(L, kNsFeatureViews)) return std::string("namespace limit exceeded: views are not enabled for this namespace");
+        if (auto why = viewsRefusal(L)) return why;
         const NsObjectCounts c = countNsObjects(s, e.nsId);
         if (L.maxViews != 0 && c.views >= L.maxViews) return detail::over("views", c.views, L.maxViews);
         return std::nullopt;

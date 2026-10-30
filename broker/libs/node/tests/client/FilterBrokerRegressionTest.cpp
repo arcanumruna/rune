@@ -118,11 +118,12 @@ struct Ev {
     bool     visible  = true;   // false: the record sits in an aborted transaction
 };
 
-/// [blockLength u16][version u16][fixed block at the materialized offsets of `version`]; fields absent there
-/// (guild in v1, channel in v3) are skipped.  No variable-length section (name stays empty).
+/// [blockLength u16][version u16][fixed block at the materialized offsets of `version`][name: u32 length 0]; fields absent
+/// there (guild in v1, channel in v3) are skipped.  The topic is typed and validates every write, so the one
+/// variable-length field (name, empty) carries its length prefix.
 std::vector<uint8_t> encodeEv(const Ev& e) {
     const rune::codec::Descriptor& m = schema().materialized[e.version];
-    std::vector<uint8_t> out(4 + m.blockLength, 0);
+    std::vector<uint8_t> out(4 + m.blockLength + 4, 0);
     fly::store<uint16_t>(out.data(), static_cast<uint16_t>(m.blockLength));
     fly::store<uint16_t>(out.data() + 2, e.version);
     uint8_t* blk = out.data() + 4;
@@ -372,8 +373,7 @@ struct Cluster {
         admin->connectAndWait(30s);
         rc::TopicOptions to;
         to.replicationFactor = one ? 1 : 3;
-        const auto def = admin->defineTopicAndWait(name, static_cast<uint32_t>(parts), keyField, blob,
-                                                   /*validate=*/false, persistence, to, {}, 60s);
+        const auto def = admin->defineTopicAndWait(name, static_cast<uint32_t>(parts), keyField, blob, persistence, to, {}, 60s);
         if (def.errorCode != 0) throw std::runtime_error("define " + name + ": " + def.detail);
         admin->close();
         if (trio) {
@@ -602,6 +602,7 @@ struct Feeder {
     const std::vector<Ev>&  model;
     bool                    transactional;
     std::size_t             sent = 0, acked = 0, failed = 0;
+    uint16_t                lastError = 0;   // the broker code of the last failed record
     Clients                 others;   // Invoker clients that must keep being pumped while this producer waits
 
     Feeder(rc::Client& c, rc::TopicHandle t, const std::vector<Ev>& m, std::string txnId = {})
@@ -621,10 +622,10 @@ struct Feeder {
         cfg.transactionalId        = std::move(txnId);
         return cfg;
     }
-    static void onAck(void* ctx, rc::Token, int64_t, rc::OpStatus s, uint16_t) noexcept {
+    static void onAck(void* ctx, rc::Token, int64_t, rc::OpStatus s, uint16_t errorCode) noexcept {
         auto* self = static_cast<Feeder*>(ctx);
         ++self->acked;
-        if (s != rc::OpStatus::Ok) ++self->failed;
+        if (s != rc::OpStatus::Ok) { ++self->failed; self->lastError = errorCode; }
     }
     void send(int from, int to) {
         for (int i = from; i < to; ++i) {
@@ -640,7 +641,7 @@ struct Feeder {
         Clients cs{&client};
         cs.insert(cs.end(), others.begin(), others.end());
         EXPECT_TRUE(pumpUntil(cs, [&] { return acked == sent; }, 90s)) << "acked " << acked << " of " << sent;
-        EXPECT_EQ(failed, 0u);
+        EXPECT_EQ(failed, 0u) << "the last failed record's broker code: " << lastError;
     }
     void feed(int from, int to) { send(from, to); flush(); }
 };

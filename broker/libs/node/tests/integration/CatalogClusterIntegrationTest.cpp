@@ -120,11 +120,16 @@ inline constexpr int64_t kRacesViewSentinelHp  = 4242;
 }
 
 /// The batch of one record: a typed topic's carries the 8-byte LE key; an untyped one a text key.
+/// A typed topic validates: `value` is used as is when it is already a v1 character record, else it rides as the tail of one.
+[[nodiscard]] std::string typedValueFor(int64_t id, const std::string& value) {
+    if (value.size() >= 20 && value[0] == 16 && value[1] == 0 && value[2] == 1 && value[3] == 0) return value;
+    return asString(characterValue(id, 0)) + value;
+}
 [[nodiscard]] std::vector<uint8_t> batchFor(bool typed, int64_t id, const std::string& value) {
     rune::protocol::RecordBatchBuilder b(0, 0);
     if (typed) {
         const auto k = keyBytes(id);
-        b.append(std::string_view(reinterpret_cast<const char*>(k.data()), k.size()), value, 0);
+        b.append(std::string_view(reinterpret_cast<const char*>(k.data()), k.size()), typedValueFor(id, value), 0);
     } else {
         b.append("k" + std::to_string(id), value, 0);
     }
@@ -147,7 +152,7 @@ inline int64_t gNextTestPid = 7'000'000;
     b.setBaseSequence(ident.seq);
     if (typed) {
         const auto k = keyBytes(id);
-        b.append(std::string_view(reinterpret_cast<const char*>(k.data()), k.size()), value, 0);
+        b.append(std::string_view(reinterpret_cast<const char*>(k.data()), k.size()), typedValueFor(id, value), 0);
     } else {
         b.append("k" + std::to_string(id), value, 0);
     }

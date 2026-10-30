@@ -579,7 +579,7 @@ TEST(DdlConformanceBrokerRegression, HaltedBootReplayMovesNoTopicDirAndLosesNoCo
         ASSERT_EQ(w.define(sid, "later"), kOk);
         laterId = w.schema(sid, "later")->topicId;
         rune::protocol::RecordBatchBuilder b(0, 0);
-        b.append(std::string_view{}, std::string_view{"committed"}, 0);
+        b.append(charKey(), charValue("committed"), 0);
         const std::vector<uint8_t> batch = b.build();
         for (int i = 0; i < kRecords; ++i)
             ASSERT_TRUE(client.produceUntilOk(w.gw, w.stream, sid, laterId, 0, /*acks=*/1, batch).has_value());
@@ -670,9 +670,9 @@ TEST(DdlConformanceBrokerRegression, T7_RestartPreservesTheCatalogAndTheCollisio
 // ── Final review C1 / M7 / concern 4 (final fix wave) ───────────────────────────
 namespace {
 
-std::vector<uint8_t> oneRecord(std::string_view value) {
+std::vector<uint8_t> oneRecord(std::string_view value) {   // typed topics validate: a valid record carrying `value` as its tail
     rune::protocol::RecordBatchBuilder b(0, 0);
-    b.append(std::string_view{}, value, 0);
+    b.append(charKey(), charValue(value), 0);
     return b.build();
 }
 

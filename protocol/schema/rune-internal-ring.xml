@@ -126,6 +126,13 @@
            topicId = nsSlot, nextOffset = nsId, partition = 0 / 1.  Never ownership-gated. -->
       <validValue name="NS_THROTTLE">29</validValue>
       <validValue name="NS_VIEW_MEM_OVER">30</validValue>
+      <!-- Checked writes Part 02: control -> EVERY worker on its op ring (cold: on a change only): the committed cluster
+           metadata feature level in nextOffset.  The worker keeps the maximum.  Never ownership-gated. -->
+      <validValue name="CLUSTER_FEATURE_LEVEL">31</validValue>
+      <!-- Checked writes Part 02: control -> EVERY worker on its op ring (cold: DDL rate): a typed topic's write spec
+           (the key facts).  topicId = the topic, tail (TailKind = WRITE_SPEC) = the encoded TopicWriteSpecWire.  Follows
+           the topic's SCHEMA_UPDATE ops on the same ring.  Never ownership-gated. -->
+      <validValue name="WRITE_SPEC_UPDATE">32</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -155,6 +162,8 @@
       <!-- Phase 2c: the Subscribe op's filter bytes (rune/codec/FilterWire.h canonical format).
            (FILTER_SCHEMA's tail is DESCRIPTOR_BLOB, not FILTER.) -->
       <validValue name="FILTER">11</validValue>
+      <!-- Checked writes Part 02: a WRITE_SPEC_UPDATE op's encoded TopicWriteSpecWire. -->
+      <validValue name="WRITE_SPEC">12</validValue>
     </enum>
 
     <!-- WorkerReturn::Type -->

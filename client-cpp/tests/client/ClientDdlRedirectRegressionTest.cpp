@@ -114,7 +114,7 @@ TEST(ClientDdlRedirectRegression, NotLeaderPastTheBudgetIsAnExplicitFailureNotAH
     test_support::TestCq cq(r.client);
     const int64_t t0 = g_now;
     auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
-        return r.client.defineTopic("t", 1, "", {}, false, rc::Persistence::Disk, {}, {}, q, t);
+        return r.client.defineTopic("t", 1, "", {}, rc::Persistence::Disk, {}, {}, q, t);
     });
     ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000));
     ASSERT_TRUE(f.failed());
@@ -179,7 +179,7 @@ TEST(ClientDdlRedirectRegression, InvalidRequestDetailReachesTheCaller) {
     rc::TopicOptions topic; topic.replicationFactor = 5;
     test_support::TestCq cq(r.client);
     auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
-        return r.client.defineTopic("t", 1, "", {}, false, rc::Persistence::Disk, topic, {}, q, t);
+        return r.client.defineTopic("t", 1, "", {}, rc::Persistence::Disk, topic, {}, q, t);
     });
     ASSERT_TRUE(r.drive([&] { return f.ready(); }));
     EXPECT_EQ(f.outcome().c.errorCode, 39);
@@ -272,7 +272,7 @@ rc::OpResult issue(rc::Client& c, DdlOp o, rc::Completions& q, rc::Token t) {
     const std::span<const uint8_t> blob(kBlob, sizeof kBlob);
     static const pc::ConfigChangeWire kChange{1, 60'000};
     switch (o) {
-    case DdlOp::DefineTopic: return c.defineTopic("t", 1, "", {}, false, rc::Persistence::Disk, {}, {}, q, t);
+    case DdlOp::DefineTopic: return c.defineTopic("t", 1, "", {}, rc::Persistence::Disk, {}, {}, q, t);
     case DdlOp::AlterTopic: return c.alterTopic("t", 1, blob, {}, q, t);
     case DdlOp::CreateView: return c.createView("v", "k", 0, blob, {}, q, t);
     case DdlOp::DropTopic: return c.dropTopic("t", {}, q, t);
@@ -527,7 +527,7 @@ TEST(ClientDdlRedirectRegression, DdlAnsweredAfterSixSecondsSucceedsRegression) 
     test_support::TestCq cq(r.client);
     const int64_t t0 = g_now;
     auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
-        return r.client.defineTopic("t", 1, "", {}, false, rc::Persistence::Disk, {}, {}, q, t);
+        return r.client.defineTopic("t", 1, "", {}, rc::Persistence::Disk, {}, {}, q, t);
     });
     ASSERT_TRUE(f.accepted());
     ASSERT_FALSE(r.drive([&] { return f.ready() || g_now - t0 >= 6'000'000'000; }, /*stepNs=*/10'000'000) &&

@@ -76,10 +76,12 @@
 #include <rune/node/SecurityAnswerGate.h>
 #include <rune/node/SecurityServing.h>
 #include <rune/node/SchemaFanout.h>
+#include <rune/node/WriteState.h>
 #include <rune/node/TopicDroppedFanout.h>
 #include <rune/node/NsSlotFanout.h>
 #include <rune/node/NsSlotTable.h>
 #include <rune/node/PeerLinkAgent.h>
+#include <rune/node/ClusterFeatureLevelFanout.h>
 #include <rune/node/PeerLinkFanout.h>
 #include <rune/peerlink/ClusterKeys.h>
 #include <rune/peerlink/PeerFrameCrypto.h>
@@ -541,6 +543,13 @@ public:
                 if (decodePlacementView(p, n, v)) worker_.onPlacementView(v);
                 else if (badControlFrames_++ % 1024 == 0)
                     spdlog::error("AdminWorkerAgent: malformed kMsgPlacementView (len={}) refused", n);
+                return;
+            }
+            if (tid == kMsgClusterFeatureLevel) {   // checked writes Part 02
+                int16_t level = 0;
+                if (decodeClusterFeatureLevel(p, n, level)) worker_.setClusterFeatureLevel(level);
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgClusterFeatureLevel (len={}) refused", n);
                 return;
             }
             if (tid == kMsgCatalogReadPaused) {   // Task 12 fix round 0
@@ -1180,7 +1189,7 @@ private:
     /// passes 1 (workers start empty and the ALTER history is never replayed).  Idempotent per worker
     /// (insert_or_assign); cold path (DDL / boot only).
     void postCatalogValidator_(const rune::catalog::TopicObject& t, uint16_t fromVersion) {
-        if (!t.schema || !t.schema->validate) return;
+        if (!t.schema) return;
         for (uint16_t v = fromVersion; v <= t.schema->schemaVersion; ++v) {
             const RegistryEntry* e = catalogSchemas_->byIdVersion(t.topicId, v);
             if (e == nullptr) [[unlikely]] {
@@ -1193,6 +1202,15 @@ private:
                 writeSchemaUpdate(p, t.topicId, e->version, blob);
             });
         }
+    }
+
+    /// Checked writes: a typed topic's write spec (the key facts), after its validators.  No-op for an untyped topic.
+    void postCatalogWriteSpec_(const rune::catalog::TopicObject& t) {
+        const auto w = writeSpecWireOf(t);
+        if (!w) return;
+        postCatalog_(kA2cWriteSpec, kTopicWriteSpecWireLen, [&](uint8_t* p) {
+            (void)encodeTopicWriteSpec(*w, std::span<uint8_t>(p, kTopicWriteSpecWireLen));
+        });
     }
 
     /// Phase 2c: a typed topic's EVOLVING descriptor at its current version, for the gateway's filter validation and
@@ -1209,9 +1227,12 @@ private:
         CatalogEffects fx;
         fx.maxFrameBytes = catalogMaxFrame_();   // C1: the applier sizes every frame against it
         fx.topicApplied = [this](const rune::catalog::TopicObject& t) {
-            // A typed topic's validator follows as schemaChanged (the applier posts both).  Its filter schema goes
-            // FIRST: the gateway then validates (and the workers bind) a filter from the moment the topic serves.
+            // A typed topic's validators and write spec go BEFORE the topic itself (the failure ring is FIFO), so the
+            // control thread has queued them on every worker before it builds the topic.  Its filter schema goes
+            // first: the gateway then validates (and the workers bind) a filter from the moment the topic serves.
             postCatalogFilterSchema_(t);
+            postCatalogValidator_(t, 1);
+            postCatalogWriteSpec_(t);
             postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config, t.nsId);
         };
         fx.sinkApplied = [this](const SinkSpec& s) {
@@ -1244,6 +1265,7 @@ private:
         };
         fx.schemaChanged = [this](const rune::catalog::TopicObject& t, uint16_t fromVersion) {
             postCatalogValidator_(t, fromVersion);
+            postCatalogWriteSpec_(t);
             postCatalogFilterSchema_(t);
         };
         fx.viewInstalled = [this, viewInstallRecovery](const rune::catalog::ViewObject& v) {
@@ -2361,6 +2383,7 @@ private:
     // duty cycle) drives it, distributes newly established keys and publishes counters 233 / 234.
     void buildPeerLinks_();
     int  servicePeerLinks_(int64_t nowNs);
+    int  serviceClusterFeatureLevel_();   // control thread, every duty cycle: post a changed metadata feature level, pump the fanout
     void publishPeerLinkMetrics_() noexcept;
     static void onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
     void onPeerLinkEstablished_(int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
@@ -2409,6 +2432,9 @@ private:
     // -----------------------------------------------------------------------
     void onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView = false);
     void runCatalogCreate_(const TopicSpec& spec);
+    int  serviceCreatesAwaitingSpec_();   // control thread: build a parked create once its spec reached every worker
+    void postBootWriteSpecs_();           // startup thread: every booted typed topic's validators + write spec -> schemaFanout_
+    static bool leaderRoleAwaitsSpecThunk_(void* self, int32_t topicId) noexcept;   // ReplicationMetadataBridge hold
     void dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::string& name);
     void onCatalogTopicConfig_(const uint8_t* p, std::size_t n);
     void onViewUninstall_(int32_t viewTopicId);
@@ -2649,6 +2675,8 @@ private:
     DevModeWarnTimer                 devModeWarn_;                 // control thread
     std::unique_ptr<PeerLinkAgent>   peerLinkAgent_;               // control thread (null: no peer links)
     PeerLinkFanout                   peerLinkFanout_;              // control thread: keys -> workers + admin, over rings
+    ClusterFeatureLevelFanout        clusterLevelFanout_;          // control thread: the metadata feature level -> workers + admin
+    int16_t                          postedClusterLevel_ = -1;     // control thread: the last level handed to clusterLevelFanout_
     // Task 16 (D34): the inter-broker frame crypto of a transport this broker builds - PeerSealed for Enabled with more
     // than one peer (sender id: consensus 0, legacy replication 1, admin plane 2, worker w -> 3 + w), else PeerPlain.
     [[nodiscard]] bool sealsPeerFrames_() const noexcept {
@@ -2815,6 +2843,7 @@ private:
     std::vector<DroppedTopic>                             droppedAwaitingRetire_;
     struct PendingCreateBehindDrop { TopicSpec spec; };
     std::vector<PendingCreateBehindDrop>                  pendingCreatesBehindDrop_;   // FIFO (per name)
+    std::vector<TopicSpec>                                pendingCreatesAwaitingSpec_; // typed creates waiting for schemaFanout_ to drain
     std::vector<std::string>                              purgeOutbox_;        // kMsgPurgeDroppedDir ring-full retry
     std::vector<std::vector<uint8_t>>                     cleanerPolicyOutbox_;  // kPolicyMsgType ring-full retry
     std::vector<std::array<uint8_t, CleanerViewChannel::kNsLimitBytes>> cleanerNsLimitOutbox_;   // kNsLimitMsgType ring-full retry (Task 13)

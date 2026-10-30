@@ -109,9 +109,9 @@ bool awaitTrue(Pred p, std::chrono::milliseconds timeout) {
     return p();
 }
 
-std::vector<uint8_t> oneRecord(const std::string& value) {
+std::vector<uint8_t> oneRecord(const std::string& value) {   // typed topics validate: a valid record carrying `value` as its tail
     rune::protocol::RecordBatchBuilder b(0, 0);
-    b.append(std::string_view{}, value, 0);
+    b.append(charKey(), charValue(value), 0);
     return b.build();
 }
 

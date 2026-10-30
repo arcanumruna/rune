@@ -4,6 +4,7 @@
 
 #include <rune/node/AdminChannels.h>
 #include <rune/node/OneToOneByteRing.h>
+#include <rune/node/WriteState.h>
 
 #include <gtest/gtest.h>
 
@@ -98,4 +99,28 @@ TEST(AdminChannelsRegression, FilterSchemaMessageRoundTripsRegression) {
     EXPECT_FALSE(decodeFilterSchema(wire.data(), 5, bad)) << "shorter than the 6-byte header";
     EXPECT_NE(kA2cFilterSchema, kA2cSchemaUpdate);
     EXPECT_EQ(kA2cFilterSchema, 25);
+}
+
+TEST(AdminChannelsRegression, ClusterFeatureLevelMessageRoundTripsRegression) {
+    uint8_t wire[kClusterFeatureLevelWireLen];
+    writeClusterFeatureLevel(wire, 5);
+    int16_t level = 0;
+    ASSERT_TRUE(decodeClusterFeatureLevel(wire, sizeof wire, level));
+    EXPECT_EQ(level, 5);
+    EXPECT_EQ(kClusterFeatureLevelWireLen, 2u);
+    EXPECT_FALSE(decodeClusterFeatureLevel(wire, 1, level)) << "a 1-byte frame is refused";
+    EXPECT_FALSE(decodeClusterFeatureLevel(wire, 3, level));
+    EXPECT_EQ(kMsgClusterFeatureLevel, 37);
+}
+
+TEST(CheckedWritesSpecFanoutRegression, SpecFrameRoundTripsRegression) {
+    TopicWriteSpecWire w;
+    w.topicId = 44; w.keyFieldId = 2; w.keyType = rune::codec::PrimType::FixedStr; w.keyWidth = 12; w.legacyValidate = true;
+    uint8_t wire[kTopicWriteSpecWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(w, wire), kTopicWriteSpecWireLen);
+    const auto back = decodeTopicWriteSpec(std::span<const uint8_t>(wire, sizeof wire));
+    ASSERT_TRUE(back);
+    EXPECT_EQ(*back, w);
+    EXPECT_FALSE(decodeTopicWriteSpec(std::span<const uint8_t>(wire, 8))) << "an 8-byte frame is refused";
+    EXPECT_EQ(kA2cWriteSpec, 29);
 }

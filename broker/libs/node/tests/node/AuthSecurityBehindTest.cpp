@@ -54,7 +54,7 @@ struct Behind {
     /// One worker-ingress produce (kNoAnswer: none within `seconds`).
     int shardProduce(int64_t sid, int32_t topic, int seconds = 3) {
         const int64_t corr = r.c().nextCorrelationId();
-        if (!r.c().produce(b().workerIngressChannel(), AuthRig::stream(), sid, corr, topic, 0, 1, makeBatch(1)))
+        if (!r.c().produce(b().workerIngressChannel(), AuthRig::stream(), sid, corr, topic, 0, 1, makeCharBatch(1)))
             return kNoAnswer;
         const auto ack = r.c().awaitProduceResponseUntil(corr, AuthRig::dl(seconds));
         return ack ? ack->errorCode : kNoAnswer;
@@ -203,7 +203,7 @@ TEST(AuthSecurityBehindRegression, ARevokeLandingMidStreamForAnActiveProducerNev
     ASSERT_GT(psid, 0);
     ASSERT_TRUE(pw.login(t.ch(), psid, writer, {AuthRig::kPw, AuthRig::kPw}).ok());
     pw.raw().keepSessionsAlive(true);
-    ASSERT_TRUE(pw.raw().produceUntilOk(t.ch(), AuthRig::stream(), psid, t.r.orders, 0, 1, makeBatch(1)));
+    ASSERT_TRUE(pw.raw().produceUntilOk(t.ch(), AuthRig::stream(), psid, t.r.orders, 0, 1, makeCharBatch(1)));
     for (int round = 0; round < 3; ++round) {
         SCOPED_TRACE("round " + std::to_string(round));
         std::vector<int> answers;
@@ -215,7 +215,7 @@ TEST(AuthSecurityBehindRegression, ARevokeLandingMidStreamForAnActiveProducerNev
             for (int i = 0; i < 20'000 && revokedInARow < 3; ++i) {
                 const int64_t corr = c.nextCorrelationId();
                 const std::string& via = (i & 1) ? t.b().workerIngressChannel() : t.ch();
-                if (!c.produce(via, AuthRig::stream(), psid, corr, t.r.orders, 0, 1, makeBatch(1))) continue;
+                if (!c.produce(via, AuthRig::stream(), psid, corr, t.r.orders, 0, 1, makeCharBatch(1))) continue;
                 const auto a = c.awaitProduceResponseUntil(corr, AuthRig::dl(3));
                 answers.push_back(a ? a->errorCode : kNoAnswer);
                 if (answers.back() == 0) oks.fetch_add(1);
@@ -248,7 +248,7 @@ TEST(AuthSecurityBehindRegression, ARevokeLandingMidStreamForAnActiveProducerNev
         ASSERT_GE(leoAtFirstRefusal, 0);
         EXPECT_EQ(t.r.logEnd(t.r.orders), leoAtFirstRefusal) << "nothing appended after the first refusal";
         ASSERT_EQ(t.b().admin().grant(t.ch(), t.b().adminSession(), writer, false, SO::Write, ST::Topic, SP::Exact, "orders").errorCode, 0);
-        ASSERT_TRUE(pw.raw().produceUntilOk(t.ch(), AuthRig::stream(), psid, t.r.orders, 0, 1, makeBatch(1)));
+        ASSERT_TRUE(pw.raw().produceUntilOk(t.ch(), AuthRig::stream(), psid, t.r.orders, 0, 1, makeCharBatch(1)));
     }
 }
 

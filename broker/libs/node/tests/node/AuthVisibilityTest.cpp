@@ -44,7 +44,7 @@ TEST(AuthVisibilityRegression, MissingAndHiddenObjectsAnswerIdenticallyRegressio
     // Produce by id.
     {
         pc::Produce m1, m2;
-        const auto batch = makeBatch(1);
+        const auto batch = makeCharBatch(1);
         for (auto* m : {&m1, &m2}) {
             m->sessionId = u; m->partition = 0; m->partitionKnown = 1; m->acks = 1; m->producerId = -1; m->baseSequence = -1;
             m->recordBatch = std::span<const uint8_t>(batch.data(), batch.size());

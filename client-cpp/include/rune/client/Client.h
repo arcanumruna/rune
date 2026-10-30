@@ -854,13 +854,12 @@ public:
     OpResult connect(CompletionTarget target, Token token);
     OpResult ping(std::span<const uint8_t> payload, CompletionTarget target, Token token);
     OpResult defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
-                         bool validate, std::span<const uint8_t> descriptorBlob,
-                         CompletionTarget target, Token token);
+                         std::span<const uint8_t> descriptorBlob, CompletionTarget target, Token token);
     /// Phase 2b E: as above, with an explicit Persistence (Transient = a
     /// transient topic).  The overload without it is Persistence::Disk.
     OpResult defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
-                         bool validate, std::span<const uint8_t> descriptorBlob,
-                         Persistence persistence, CompletionTarget target, Token token);
+                         std::span<const uint8_t> descriptorBlob, Persistence persistence, CompletionTarget target,
+                         Token token);
     OpResult getTopicSchema(std::string_view name, CompletionTarget target, Token token);
     /// As above, selecting a specific schema fingerprint (0 = latest; same as
     /// the 3-arg overload).  Task 18.
@@ -952,7 +951,7 @@ public:
     /// DefineTopic with the catalog-history fields: an empty descriptorBlob is an
     /// UNTYPED topic; TopicOptions carries replicationFactor + the topic config.
     OpResult defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
-                         std::span<const uint8_t> descriptorBlob, bool validate, Persistence persistence,
+                         std::span<const uint8_t> descriptorBlob, Persistence persistence,
                          const TopicOptions& topic, const DdlOptions& ddl, CompletionTarget target, Token token);
     OpResult alterTopic(std::string_view name, uint16_t expectedVersion, std::span<const uint8_t> opsBlob,
                         const DdlOptions& ddl, CompletionTarget target, Token token);
@@ -978,12 +977,12 @@ public:
                       std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
     /// A broker errorCode is returned in the result (not thrown), as before.
     DefineTopicResult defineTopicAndWait(std::string_view name, uint32_t partitions,
-                                         std::string_view keyField, bool validate,
+                                         std::string_view keyField,
                                          std::span<const uint8_t> descriptorBlob,
                                          std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
     /// Phase 2b E: defineTopic(..., persistence), blocking.  Same result contract.
     DefineTopicResult defineTopicAndWait(std::string_view name, uint32_t partitions,
-                                         std::string_view keyField, bool validate,
+                                         std::string_view keyField,
                                          std::span<const uint8_t> descriptorBlob,
                                          Persistence persistence,
                                          std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
@@ -1022,7 +1021,7 @@ public:
     // returned in the result with its detail; Timeout / NotConnected /
     // SessionLost / Closed throw (as every *AndWait).
     DefineTopicResult defineTopicAndWait(std::string_view name, uint32_t partitions, std::string_view keyField,
-                                         std::span<const uint8_t> descriptorBlob, bool validate,
+                                         std::span<const uint8_t> descriptorBlob,
                                          Persistence persistence, const TopicOptions& topic,
                                          const DdlOptions& ddl, std::chrono::milliseconds timeout);
     AlterTopicResult alterTopicAndWait(std::string_view name, uint16_t expectedVersion,
@@ -1191,6 +1190,12 @@ public:
         // a pre-2b broker reports 0 -> 1, the pre-2b partition-0 behaviour).
         return TypedTopic<T>(producer(), TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)}, r.version);
     }
+
+    /// The handle of an UNTYPED (raw) topic, for Producer::send with a hand-built Key.  Checked writes: a raw handle
+    /// binds only to an untyped topic - a typed topic throws std::runtime_error (open it with openTopicAndWait<T>; a
+    /// raw send to a typed topic would have to carry the key field's exact bytes), an unknown name throws too.
+    [[nodiscard]] TopicHandle rawTopicAndWait(std::string_view name,
+                                              std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
 
     /// #418: the run-time lineage of the generated type T for topic `name` (T::Lineage), built from the topic's
     /// evolving descriptor (GetTopicSchema with kSchemaLineageFingerprint).  A T decodes records of versions

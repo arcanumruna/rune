@@ -100,6 +100,8 @@
 #include <rune/node/RecordsOpen.h>
 #include <rune/crypto/Aead.h>
 #include <rune/crypto/Cipher.h>
+#include <rune/node/WriteState.h>
+#include <rune/replication/ReplicationMessages.h>
 #include <rune/replication/ReplicationFrameLimits.h>   // F18 frame limits (maxAcceptableBatchBytes)
 #include <rune/node/WorkerReplicationTransport.h>
 #include <rune/node/IoBackend.h>
@@ -586,6 +588,7 @@ public:
     [[nodiscard]] int64_t viewLeaseEndNsForTest() const noexcept { return viewLeaseEndNs_; }
     [[nodiscard]] uint64_t viewReadsWithoutLeaseForTest() const noexcept { return viewReadsWithoutLease_; }
     [[nodiscard]] uint64_t readLeasesSeenForTest() const noexcept { return readLeasesSeen_; }
+    [[nodiscard]] int16_t clusterFeatureLevelForTest() const noexcept { return clusterFeatureLevel_; }
     [[nodiscard]] uint64_t viewReadsHeldForTest() const noexcept { return viewReadsHeld_; }
     [[nodiscard]] uint64_t viewReadsHeldExpiredForTest() const noexcept { return viewReadsHeldExpired_; }
     [[nodiscard]] std::size_t heldViewReadsForTest() const noexcept { return heldViewReads_.size(); }
@@ -624,8 +627,7 @@ public:
         roundMembers_.reserve(pow2AtLeast_(ioSubmitDepth < 2 ? 2 : ioSubmitDepth));   // A10: members <= io depth
         pendingAcksAll_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
         subs_.reserve(kSubsReserve);
-        validators_.reserve(kValidatorsReserve);
-        validatedTopics_.reserve(kValidatorsReserve);
+        writeSpecs_.reserve(kWriteSpecsReserve);
         egressScratch_.resize(kEgressScratchSize);
         maxIntakeBatchBytes_ = ringBatchFit_();   // BrokerNode narrows it: setMaxBatchBytes
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
@@ -1296,6 +1298,11 @@ public:
             tailSrc  = op.schemaUpdateBlob.data();
             tailLen  = op.schemaUpdateBlob.size();
             break;
+        case WorkerOp::Type::WriteSpecUpdate:   // checked writes: the encodeTopicWriteSpec bytes
+            tailKind = sbe::TailKind::Value::WRITE_SPEC;
+            tailSrc  = op.schemaUpdateBlob.data();
+            tailLen  = op.schemaUpdateBlob.size();
+            break;
         case WorkerOp::Type::SessionAnnounce:
             tailKind = sbe::TailKind::Value::EGRESS_CHANNEL;
             if (op.responseBind) [[unlikely]] {
@@ -1762,9 +1769,17 @@ public:
     // this topic" (the original Task 7 semantics); version >= 0 = exactly
     // that (topicId, version) pair.  Worker-thread only; single-threaded tests.
     [[nodiscard]] bool hasValidatorForTest(int32_t topicId, int32_t version = -1) const noexcept {
-        if (version < 0) return validatedTopics_.count(topicId) > 0;
-        return validators_.count(packValidatorKey_(topicId, static_cast<uint16_t>(version))) > 0;
+        const auto it = writeSpecs_.find(topicId);
+        if (it == writeSpecs_.end()) return false;
+        if (version < 0) return it->second->maxVersion() > 0;
+        return it->second->versionFor(static_cast<uint16_t>(version)) != nullptr;
     }
+    /// Checked writes: the write state of an owned typed partition (nullptr: untyped or not owned).
+    [[nodiscard]] const PartitionWriteState* writeStateForTest(int32_t topicId, int32_t partition) const noexcept {
+        return writeOf_(findOwnedReplica_(topicId, partition));
+    }
+    [[nodiscard]] uint64_t typedRejectsForTest() const noexcept { return typedRejects_; }
+    [[nodiscard]] uint64_t typedVersionAheadForTest() const noexcept { return typedVersionAhead_; }
 
     // -----------------------------------------------------------------------
     // rune::consensus::Agent interface
@@ -2721,6 +2736,10 @@ private:
         case WorkerOp::Type::SchemaUpdate:
             executeSchemaUpdateWire_(op);
             break;
+        // Checked writes: control -> every worker, cold: a typed topic's write spec (key facts), after its schema versions.
+        case WorkerOp::Type::WriteSpecUpdate:
+            executeWriteSpecUpdateWire_(op);
+            break;
         // Phase 2c: control -> every worker, cold: a typed topic's filter schema (shared-nothing, like SchemaUpdate).
         case WorkerOp::Type::FilterSchema:
             executeFilterSchemaWire_(op);
@@ -2735,6 +2754,7 @@ private:
             break;
         case WorkerOp::Type::TopicDropped:
             markTopicDropped_(op.topicId());
+            dropWriteSpec_(op.topicId());
             break;
         case WorkerOp::Type::NsSlotAssign:
             executeNsSlotAssignWire_(op);
@@ -2767,6 +2787,9 @@ private:
         case WorkerOp::Type::ReadLease:      // issue #82: a view read lease (FIFO behind the role ops it covers)
             ++readLeasesSeen_;
             if (op.nextOffset() > viewLeaseEndNs_) viewLeaseEndNs_ = op.nextOffset();
+            break;
+        case WorkerOp::Type::ClusterFeatureLevel:   // checked writes: the committed metadata feature level (only ever rises)
+            if (op.nextOffset() > clusterFeatureLevel_) clusterFeatureLevel_ = static_cast<int16_t>(op.nextOffset());
             break;
         }
     }
@@ -3243,24 +3266,23 @@ private:
 
     // -------------------------------------------------------------------
     // Task 7 / Task 12: executeSchemaUpdateWire_ — install a per-(topic,version)
-    // Validator on this worker's own thread (shared-nothing).
+    // Validator and Descriptor in the topic's TopicWriteSpec on this worker's own thread (shared-nothing).
     //
     // The descriptor blob arrives in the ring tail (TailKind = DESCRIPTOR_BLOB)
     // as the MATERIALIZED-as-of-version descriptor (the fan-out source sends
     // RegistryEntry.descriptor, already materializeAsOf(evolving, version) —
     // never the raw evolving blob).  The version itself rides the wire's
     // clientVersion field (reused by SchemaUpdate; see WorkerOp.h).  We
-    // deserialize it here (off-hot-path, admin/control-plane) and store the
-    // resulting Validator in validators_ keyed by (topicId, version).  The hot
-    // path (schemaRejects_) does a single-branch lookup; if the topic has no
-    // validated version installed at all it falls through with zero overhead.
+    // deserialize it here (off-hot-path, admin/control-plane) and install it in
+    // writeSpecs_.  The hot path (produceCore_) reaches the spec through the
+    // partition's PartitionWriteState; an untyped partition has none.
     //
-    // Shared-nothing: validators_ is a plain member touched ONLY by this worker
+    // Shared-nothing: writeSpecs_ is a plain member touched ONLY by this worker
     // thread — no lock, no atomic, no cross-thread mutation.  The blob is copied
     // from the ring tail into the validator at construction; the ring frame is
     // released immediately after this call returns.
     //
-    // Off-hot-path allocation: the Validator constructor and the map insert/assign
+    // Off-hot-path allocation: the Validator constructor and the spec growth
     // allocate on the WORKER thread (not in the produce path) — HARD RULE 4 is met.
     // -------------------------------------------------------------------
     void executeSchemaUpdateWire_(sbe::WorkerOp& op) {
@@ -3278,9 +3300,7 @@ private:
         try {
             rune::codec::Descriptor desc =
                 rune::codec::deserialize(std::span<const uint8_t>(tail, tailLen));
-            validators_.insert_or_assign(packValidatorKey_(topicId, version),
-                                         rune::codec::Validator(desc));
-            validatedTopics_.insert(topicId);
+            writeSpecOf_(topicId).installVersion(version, std::move(desc));
             spdlog::debug("Worker {}: SchemaUpdate installed validator for topicId={} version={}",
                           workerId_, topicId, version);
         } catch (const std::exception& ex) {
@@ -3290,6 +3310,45 @@ private:
             spdlog::error("Worker {}: executeSchemaUpdateWire_ — unknown exception "
                           "for topicId={} version={}", workerId_, topicId, version);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Checked writes: executeWriteSpecUpdateWire_ — a typed topic's key facts (TailKind = WRITE_SPEC), posted after
+    // its SchemaUpdates.  Every owned partition of the topic gets its PartitionWriteState here (ownership may have
+    // arrived first: a schema adopted on a live topic); a partition owned later gets it in rebuildRcSlots_.
+    // -------------------------------------------------------------------
+    [[gnu::cold]] [[gnu::noinline]] void executeWriteSpecUpdateWire_(sbe::WorkerOp& op) {
+        const uint32_t tailLen = op.tailLength();   // SBE var data: the length FIRST, then tail() advances past it
+        const auto w = decodeTopicWriteSpec(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(op.tail()), tailLen));
+        if (!w || w->topicId != op.topicId()) {
+            spdlog::error("Worker {}: executeWriteSpecUpdateWire_ — malformed write spec for topicId={}", workerId_, op.topicId());
+            return;
+        }
+        TopicWriteSpec& spec = writeSpecOf_(w->topicId);
+        spec.setFacts(*w);
+        if (w->keyFieldId != kNoKeyField && w->keyWidth == 0)
+            spdlog::warn("Worker {}: topic {} key field cannot be a topic key; wire-key check skipped (pre-existing topic)",
+                         workerId_, w->topicId);
+        for (auto& sl : rcSlots_)
+            if (!sl.write && sl.replica->topicId() == w->topicId) sl.write = std::make_unique<PartitionWriteState>(PartitionWriteState{&spec});
+        rebuildWriteById_();
+    }
+
+    [[nodiscard]] TopicWriteSpec& writeSpecOf_(int32_t topicId) {
+        auto& slot = writeSpecs_[topicId];
+        if (!slot) {
+            slot = std::make_unique<TopicWriteSpec>();
+            slot->topicId = topicId;
+        }
+        return *slot;
+    }
+
+    // The topic was dropped: states first (no dangling spec pointer), then the spec.
+    [[gnu::cold]] void dropWriteSpec_(int32_t topicId) {
+        for (auto& sl : rcSlots_)
+            if (sl.write && sl.replica->topicId() == topicId) sl.write.reset();
+        rebuildWriteById_();
+        writeSpecs_.erase(topicId);
     }
 
     // ===================================================================
@@ -4016,61 +4075,6 @@ private:
         if (endedSubsPending_) [[unlikely]] sweepEndedSubs_();   // issue #109: ended subscriptions leave after the walk
         if (!deferredReleases_.empty()) [[unlikely]] work += serviceDeferredReleases_();   // F3: after the end frames
         return work;
-    }
-
-    // -------------------------------------------------------------------
-    // Task 7 / Task 12 per-worker schema validation (shared by both produce
-    // paths).
-    // HARD RULE 4 (zero hot-path alloc): validators_/validatedTopics_ were
-    // built off-hot-path by executeSchemaUpdateWire_; validate() runs on a
-    // zero-copy span; the per-record version-keyed lookup is a single
-    // unordered_map::find on a precomputed uint64_t key — no allocation.
-    // I1 fast-out: no validator ever installed for this topic → one load +
-    // one predicted branch (validatedTopics_ empty/miss), same cost as before.
-    // HARD RULE 5: concrete calls; HARD RULE 1: validators_ is worker-owned.
-    // True = reject the batch (SchemaValidationFailed, never appended).
-    //
-    // Task 12: each record carries its OWN writer version (wire bytes [2..3]
-    // of the record value, per rune::codec's [blockLength:u16][version:u16]
-    // record header).  The validator is selected by the EXACT (topicId,
-    // recVersion) pair; an installed-but-different-version validator is NEVER
-    // substituted — an unknown version is a hard reject ("unknown schema
-    // version"), not a fall-through to a wrong-version validator.
-    // -------------------------------------------------------------------
-    [[nodiscard]] bool schemaRejects_(int32_t topicId, const uint8_t* tail, std::size_t tailLen) const {
-        if (validatedTopics_.empty()) [[likely]] return false;
-        if (validatedTopics_.find(topicId) == validatedTopics_.end()) return false;
-        if (tailLen < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
-            return true;   // batch too short to parse header — malformed
-        bool validationFailed = false;
-        rune::protocol::RecordBatchReader rdr(tail, tailLen);
-        // Task 11 fix 3 (B4, HARD RULE #4): templated record visitor — inlined,
-        // no std::function per record.  The NoTypeErasure capture makes the
-        // visitor move-only, so a regression to the type-erased forEach() fails
-        // to COMPILE.
-        rdr.forEachRecord([&, guard = detail::NoTypeErasure{}](std::string_view /*key*/,
-                                                              std::string_view val,
-                                                              int64_t /*offset*/,
-                                                              int64_t /*ts*/) {
-            if (validationFailed) return;
-            // Record header: [blockLength:u16 LE][version:u16 LE][fixed block][var data].
-            if (val.size() < 4) { validationFailed = true; return; }   // too short to carry a version
-            const auto* vb = reinterpret_cast<const uint8_t*>(val.data());
-            const uint16_t recVersion = static_cast<uint16_t>(vb[2]) |
-                                       (static_cast<uint16_t>(vb[3]) << 8);
-            auto it = validators_.find(packValidatorKey_(topicId, recVersion));
-            if (it == validators_.end()) {
-                validationFailed = true;   // unknown schema version — never guess
-                return;
-            }
-            const rune::codec::ValResult res = it->second.validate(
-                std::span<const uint8_t>(vb, val.size()));
-            if (!res.ok) validationFailed = true;
-        });
-        if (validationFailed)
-            spdlog::debug("Worker {}: schema validation FAILED for topicId={}; rejecting produce",
-                          workerId_, topicId);
-        return validationFailed;
     }
 
     // -------------------------------------------------------------------
@@ -6073,6 +6077,8 @@ private:
     const int64_t* leaseNowOverride_      = nullptr;
     uint64_t       viewReadsWithoutLease_ = 0;
     uint64_t       readLeasesSeen_        = 0;
+    // Checked writes: the committed cluster metadata feature level (ClusterFeatureLevel ops; monotone).  Worker-thread owned.
+    int16_t        clusterFeatureLevel_   = rune::replication::MetadataFeature::kBase;
     [[nodiscard]] int64_t leaseNow_() const noexcept {
         return leaseNowOverride_ == nullptr ? rune::consensus::leaseClockNowNs() : *leaseNowOverride_;
     }
@@ -6096,42 +6102,15 @@ private:
     // Per-log LEO at its last successful sync lives in LogFlushSlot::lastSyncedLeo
     // (Task 10 fix 1 / I3: fixed per-owned-log slots, no hot-path map insert).
 
-    // Task 7 / Task 12: per-worker (topic, version) → Validator map.
-    //
-    // Populated via SchemaUpdate ring ops (executeSchemaUpdateWire_), which
-    // arrive from the admin thread as ring messages and are applied on THIS
-    // worker's own thread (shared-nothing — no lock, no atomic).
-    //
-    // Looked up in schemaRejects_ BEFORE appendNoSyncRestamp, once per record
-    // (keyed by that record's OWN writer version — Task 12).  The lookup is a
-    // single unordered_map::find (O(1) expected) on a packed uint64_t key (no
-    // allocation, no pair hashing) with a single conditional branch when no
-    // version of the topic is validated (most topics have no schema validator
-    // installed at all — see validatedTopics_).
-    //
-    // HARD RULE 1 (shared-nothing): validators_ is ONLY ever touched by the
-    // worker thread — the admin thread copies the blob into the ring, the worker
-    // builds the Validator from the ring view on ITS OWN thread.
-    // HARD RULE 4 (zero hot-path alloc): the map is built off the hot path
-    // (in executeSchemaUpdateWire_).  The hot path only does a map::find + span
-    // validate (no allocation).
-    //
-    // Reserved capacity is intentionally small (16): most deployments have
-    // O(10s) of (topic, version) pairs per worker; the map is rarely rebuilt.
-    // TODO(T9): benchmark flat vs unordered_map for typical topic counts.
-    static constexpr std::size_t kValidatorsReserve = 16;
-    [[nodiscard]] static constexpr uint64_t packValidatorKey_(int32_t topicId, uint16_t version) noexcept {
-        return (static_cast<uint64_t>(static_cast<uint32_t>(topicId)) << 16) |
-               static_cast<uint64_t>(version);
-    }
-    std::unordered_map<uint64_t, rune::codec::Validator> validators_;
-    // Task 12: fast "does this topic have ANY validated version installed"
-    // pre-check — independent of which exact version — so a topic that never
-    // had validate=true (no entries in validators_ for any version) is never
-    // mistaken for one whose exact record version is simply unknown (which
-    // IS a hard reject; see schemaRejects_).  Grows only (versions are never
-    // un-validated), so a topicId inserted once stays a cheap O(1) hit.
-    std::unordered_set<int32_t> validatedTopics_;
+    // Checked writes: per-worker typed-topic write specs.  A spec holds the topic's key facts and one Validator +
+    // Descriptor per schema version, installed by SchemaUpdate / WriteSpecUpdate ops (cold) on THIS worker's own
+    // thread (shared-nothing).  Each owned typed partition reaches its spec through its PartitionWriteState (RcSlot::write,
+    // writeById_), so the produce path pays one indexed load and a predicted branch for an untyped partition.
+    // Heap-held so a PartitionWriteState's pointer stays valid while the map grows.
+    static constexpr std::size_t kWriteSpecsReserve = 16;
+    std::unordered_map<int32_t, std::unique_ptr<TopicWriteSpec>> writeSpecs_;
+    uint64_t typedRejects_      = 0;   // batches refused SchemaValidationFailed by checkTypedBatch
+    uint64_t typedVersionAhead_ = 0;   // batches answered NotLeader: a record's version has not been installed here yet
 
     // Phase 2c: filtered subscriptions (worker thread only).  filterSchemas_ is never erased (topic ids are never
     // reused; the cost is bounded by the typed topics), so pointers into it are stable.  A group is identified by
@@ -6623,6 +6602,7 @@ private:
         uint32_t                             inc     = 0;
         std::unique_ptr<RcState>             rc;
         std::unique_ptr<RcHintCtx>           hint;
+        std::unique_ptr<PartitionWriteState> write;   // checked writes: a typed partition's write state (null: untyped)
     };
     // The default read-ahead issuer: an async IORING_OP_FADVISE(WILLNEED) on the
     // segment fd where the worker's io backend is io_uring AND the kernel
@@ -6741,6 +6721,7 @@ private:
         return n;
     }
     std::vector<RcState*> rcById_;
+    std::vector<PartitionWriteState*> writeById_;   // dense by registry id, beside rcById_
     int32_t     rcScanBytesPerPass_ = RcState::kDefaultScanBytesPerPass;
     std::size_t rcOpenTxnCapacity_  = rune::transaction::LsoTracker::kDefaultOpenTxnCapacity;
     uint64_t         rcHintsSubmitted_ = 0;   // async IORING_OP_FADVISE hints submitted
@@ -6771,6 +6752,20 @@ private:
         for (const auto& sl : rcSlots_) if (sl.replica == r) return sl.rc.get();
         return nullptr;
     }
+    [[nodiscard]] PartitionWriteState* writeOf_(const rune::replication::PartitionReplica* r) const noexcept {
+        if (r == nullptr) return nullptr;
+        if (r->incarnation() != 0) {
+            const uint32_t id = r->registryId();
+            return (id < writeById_.size() && ownsIncarnation_(id, r->incarnation())) ? writeById_[id] : nullptr;
+        }
+        for (const auto& sl : rcSlots_) if (sl.replica == r) return sl.write.get();
+        return nullptr;
+    }
+    void rebuildWriteById_() {
+        writeById_.assign(ownedInc_.size(), nullptr);
+        for (auto& sl : rcSlots_)
+            if (sl.inc != 0 && sl.replica->registryId() < writeById_.size()) writeById_[sl.replica->registryId()] = sl.write.get();
+    }
     [[nodiscard]] const RcState* rcFor_(int32_t topicId, int32_t partition) const noexcept {
         return rcOf_(findOwnedReplica_(topicId, partition));
     }
@@ -6791,6 +6786,7 @@ private:
                 if (old.replica == r && old.inc == slot.inc && old.rc) {
                     slot.rc = std::move(old.rc);
                     slot.hint = std::move(old.hint);
+                    slot.write = std::move(old.write);
                     break;
                 }
             }
@@ -6803,6 +6799,9 @@ private:
                 slot.rc->bindProducerState(&psm_, r->topicId(), static_cast<int32_t>(r->partitionId()));
             }
             installReadAhead_(slot);
+            if (!slot.write)
+                if (const auto it = writeSpecs_.find(r->topicId()); it != writeSpecs_.end() && it->second->hasFacts())
+                    slot.write = std::make_unique<PartitionWriteState>(PartitionWriteState{it->second.get()});
             next.push_back(std::move(slot));
         }
         rcSlots_ = std::move(next);
@@ -6811,6 +6810,7 @@ private:
         rcById_.assign(ownedInc_.size(), nullptr);
         for (auto& sl : rcSlots_)
             if (sl.inc != 0 && sl.replica->registryId() < rcById_.size()) rcById_[sl.replica->registryId()] = sl.rc.get();
+        rebuildWriteById_();
         for (auto& sub : subs_) sub.rc = rcOf_(subReplica_(sub));
     }
     [[nodiscard]] static RcFacts rcFacts_(const rune::replication::PartitionReplica* r) noexcept {
@@ -9150,13 +9150,19 @@ private:
             return 1;
         }
 
-        // Task 7 schema validation — the SAME hook as executeProduceWire_ (fix on
-        // sight, Task 13: the worker-ingress path skipped it, so a schema'd topic
-        // accepted invalid records over shard ingress).
-        if (schemaRejects_(f.topicId, rbSpan.data(), rbSpan.size())) [[unlikely]] {
-            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::SchemaValidationFailed);
-            enqueueReturn_(ret);
-            return 1;
+        // Checked writes: every typed partition validates every batch (an untyped one has no write state).  A record
+        // whose schema version has not reached this worker yet is retriable (NotLeader), anything else is final.
+        if (const PartitionWriteState* ws = writeOf_(replica); ws != nullptr) [[unlikely]] {
+            const TypedCheck verdict = checkTypedBatch(*ws->spec, rbSpan, clusterFeatureLevel_);
+            if (verdict != TypedCheck::Accept) {
+                const bool ahead = verdict == TypedCheck::VersionAhead;
+                ++(ahead ? typedVersionAhead_ : typedRejects_);
+                spdlog::debug("Worker {}: typed batch refused for topicId={} partition={} ({})", workerId_, f.topicId, f.partition,
+                              ahead ? "schema version not installed yet" : "validation failed");
+                ret.errorCode = static_cast<int16_t>(ahead ? pc::ErrorCode::NotLeader : pc::ErrorCode::SchemaValidationFailed);
+                enqueueReturn_(ret);
+                return 1;
+            }
         }
 
         const bool acksAll = f.acksAll;

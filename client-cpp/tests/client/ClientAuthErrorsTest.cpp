@@ -2559,7 +2559,7 @@ TEST(DdlAuthUnavailableRegression, ADdlAnswered48IsRetriedWithinItsBudgetRegress
         else answerDdlResponse(r, m->sessionId, m->correlationId, 0);
     };
     test_support::TestCq cq(r.client);
-    auto a = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.defineTopic("nt", 1, "", false, {}, q, t); });
+    auto a = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.defineTopic("nt", 1, "", {}, q, t); });
     ASSERT_TRUE(r.drive([&] { return a.ready(); }, 50'000'000));
     EXPECT_TRUE(a.ok()) << "DefineTopicResponse: " << a.describe();
     EXPECT_EQ(defines, 3);

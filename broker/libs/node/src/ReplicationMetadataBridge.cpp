@@ -138,7 +138,7 @@ void ReplicationMetadataBridge::enqueueRoleOp_(WorkerOp op, bool fence) noexcept
             return;
         }
     }
-    if (q.empty()) {
+    if (q.empty() && !leaderHeld_(op)) {
         WorkerOp attempt = op;   // copy: tryEnqueueOp consumes it
         if (tryRoute_(std::move(attempt))) return;
     }
@@ -178,17 +178,20 @@ int ReplicationMetadataBridge::flushPendingRoleOps_() noexcept
     if (pendingRoleOpsTotal_ == 0 || !workerPool_) return 0;
     int delivered = 0;
     for (auto& q : pendingRoleOps_) {
-        while (!q.empty()) {
-            PendingRoleOp& p = q.front();
+        for (auto it = q.begin(); it != q.end();) {
+            PendingRoleOp& p = *it;
             if (registry_.resolve(p.op.topicId, p.op.partition, p.incarnation) == nullptr) {
                 if (p.fence) ++fencesMoot_; else ++staleRoleOpsDropped_;
-                q.pop_front();
+                it = q.erase(it);
                 --pendingRoleOpsTotal_;
                 continue;
             }
+            // Checked writes: a leader role waits for its typed topic's spec.  One entry per replica (coalesced), so the
+            // entries behind it - other replicas - keep their own order.
+            if (leaderHeld_(p.op)) { ++it; continue; }
             WorkerOp attempt = p.op;
             if (!tryRoute_(std::move(attempt))) break;   // this worker's ring is full; others proceed
-            q.pop_front();
+            it = q.erase(it);
             --pendingRoleOpsTotal_;
             ++delivered;
         }
