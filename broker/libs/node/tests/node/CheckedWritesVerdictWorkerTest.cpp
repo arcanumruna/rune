@@ -2,6 +2,8 @@
 #include "CheckedWritesRig.h"
 
 #include <algorithm>
+#include <map>
+#include <random>
 
 using namespace rune::node;
 using namespace rune::node::cw;
@@ -305,4 +307,93 @@ TEST(CheckedWritesVerdictWorkerRegression, RefoldBelowWIgnoresALaterRuleRegressi
     r.passes(300);
     EXPECT_FALSE(r.hasRow(kRej2, 3)) << "tag 1 is rejected after the replace";
     EXPECT_TRUE(r.hasRow(kRej2, 4));
+}
+
+// ---- Task 8 on the rig: the cleaner against a real Worker, replica and published bounds ----
+
+TEST(CheckedWritesVerdictCleanerRegression, SwapAboveTheVerdictBoundIsNeverInstalledRegression) {
+    VerdictRig r(/*follower=*/false, /*rollBytes=*/1);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    for (int64_t v = 1; v <= 6; ++v) ASSERT_EQ(r.produce({{5, v, 0}}), 0);   // six copies of key 5
+    ASSERT_TRUE(r.driveUntilJudged());
+    const int64_t dataEnd = r.dataEnd();
+    ASSERT_EQ(r.readLog().data.size(), 6u);
+    const auto first = r.compact(1'000'000, /*seal=*/true, /*drain=*/false);   // produced and queued for the owner
+    ASSERT_GT(first.bound, 1);
+    // A leader change cut the markers the cleaner read: the bound the owner sees is below every member's base.
+    r.replica->publishCleanerVerdictBound(1);
+    (void)r.drainSwaps();
+    EXPECT_EQ(r.readLog().data.size(), 6u) << "an output above the owner's verdict bound was installed";
+    r.replica->publishCleanerVerdictBound(first.bound);
+    EXPECT_GE(first.bound, dataEnd);
+    (void)r.compact();
+    const auto data = r.readLog().data;
+    ASSERT_EQ(data.size(), 1u) << "once the bound passed the bases the next pass installs";
+    EXPECT_EQ(data[0].v, 6);
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, RemovedMarkerNeverStallsCoverageRegression) {
+    VerdictRig r(false, 1);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_EQ(r.produce({{3, 30, 0}, {4, 40, 9}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_EQ(r.readLog().markers.size(), 2u);
+    const int64_t secondTo = r.readLog().markers.back().header.finalThrough;
+    (void)r.compact(1'000'000);   // the first marker's records are gone: it is stamped
+    (void)r.compact(1'005'000);   // past the delete horizon: dropped
+    const auto log = r.readLog();
+    ASSERT_EQ(log.markers.size(), 1u) << "the first marker was removed";
+    EXPECT_EQ(log.markers[0].header.finalThrough, secondTo);
+    for (const auto& d : log.data) EXPECT_NE(d.tag, 9) << "the compaction drops every rejected record";
+
+    r.failover();
+    const int64_t sub = r.subscribe(SubKind::PushRead, 0);
+    r.passes(500);
+    const VerdictSource* judge = r.vs->verdictSource(VerdictRig::kSrc, 0);
+    ASSERT_NE(judge, nullptr);
+    EXPECT_GE(judge->judgedThrough(), secondTo) << "the coverage comes from the second marker";
+    ASSERT_NE(r.stats(), nullptr);
+    EXPECT_EQ(r.stats()->rejectionsConstraint, 0u) << "nothing below the second marker is judged again";
+    EXPECT_EQ(r.stats()->markersWritten, 0u);
+    EXPECT_NE(r.writeState()->rejected.find(5), nullptr);
+    std::vector<uint64_t> ids;
+    for (const auto& d : r.collect(sub).records) ids.push_back(d.id);
+    EXPECT_EQ(ids, (std::vector<uint64_t>{1, 3}));
+}
+
+TEST(CheckedWritesVerdictCleaner, RigCompactionKeepsTheAcceptedLatest) {
+    VerdictRig r(false, 1);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    std::mt19937_64 rng(2026);
+    std::map<uint64_t, std::pair<int64_t, bool>> latest;   // id -> (v, deleted) of the latest accepted record
+    int64_t v = 0;
+    for (int i = 0; i < 200; ++i) {
+        std::vector<Rec> recs;
+        for (int n = 1 + static_cast<int>(rng() % 3); n > 0; --n) {
+            Rec rec{1 + rng() % 8, ++v, static_cast<uint8_t>(rng() % 10 == 0 ? 9 : rng() % 3), rng() % 12 == 0};
+            recs.push_back(rec);
+            if (rec.tag != 9 || rec.del) latest[rec.id] = {rec.v, rec.del};   // tombstones are never rejected
+        }
+        ASSERT_EQ(r.produce(recs), 0);
+    }
+    ASSERT_TRUE(r.driveUntilJudged());
+    (void)r.compact();
+    std::map<uint64_t, std::pair<int64_t, bool>> inLog;
+    for (const auto& d : r.readLog().data) {
+        EXPECT_FALSE(!d.del && d.tag == 9) << "rejected record at " << d.offset << " survived";
+        inLog[d.id] = {d.v, d.del};
+    }
+    for (const auto& [id, want] : latest) {
+        const auto it = inLog.find(id);
+        ASSERT_NE(it, inLog.end()) << "key " << id << " lost";
+        EXPECT_EQ(it->second, want) << "key " << id;
+    }
 }

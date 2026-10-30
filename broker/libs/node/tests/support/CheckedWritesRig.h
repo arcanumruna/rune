@@ -17,6 +17,8 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/LogCleaner.h>
+#include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/view/PlanCompiler.h>
 
 #include <Aeron.h>
@@ -24,6 +26,8 @@
 #include <Subscription.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -54,7 +58,7 @@ inline rune::codec::Descriptor verdictSourceDescriptor() {
     return rune::codec::DescriptorBuilder("t", 1).add("id", PrimType::UInt64, 1, true).add("v", PrimType::Int64).add("tag", PrimType::UInt16).build();
 }
 
-struct Rec { uint64_t id; int64_t v; uint8_t tag = 0; };
+struct Rec { uint64_t id; int64_t v; uint8_t tag = 0; bool del = false; };   ///< del: a tombstone of `id` (empty value)
 
 /// What a consumer received: one record of a delivered batch.
 struct Delivered { int64_t offset; uint64_t id; uint16_t tag; };
@@ -72,8 +76,10 @@ public:
     static constexpr int kMaxPass = 4000;
 
     /// `follower`: node 2 is in the ISR, so the HW only moves when followerFetch() is called.
-    explicit VerdictRig(bool follower = false) : isr_(follower ? std::vector<rune::replication::NodeId>{1, 2} : std::vector<rune::replication::NodeId>{1}),
-                                                 viewDir_(rigTmpPath("views")), logDir_(rigTmpPath("log")) {
+    /// `rollBytes`: the log's segment size; compact() needs small segments (1 = one batch per segment).
+    explicit VerdictRig(bool follower = false, int64_t rollBytes = 64LL * 1024 * 1024)
+        : isr_(follower ? std::vector<rune::replication::NodeId>{1, 2} : std::vector<rune::replication::NodeId>{1}),
+          rollBytes_(rollBytes), viewDir_(rigTmpPath("views")), logDir_(rigTmpPath("log")) {
         vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
         open();
     }
@@ -125,10 +131,11 @@ public:
         installRejectView(newTopic, objectId, rule, "rej2");
     }
     /// A new Worker, view set and replica over the same log: a restart.  The views are re-installed unless `reinstall` is false.
-    void restart(bool reinstall = true) {
+    void restart(bool reinstall = true, int64_t cutTo = -1) {
         worker.reset();
         vs.reset();
         replica.reset();
+        if (cutTo >= 0) log->truncateTo(cutTo);
         log.reset();
         vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
         open();
@@ -144,6 +151,8 @@ public:
         passes(2);
     }
     void truncateTo(int64_t offset) { log->truncateTo(offset); passes(5); }
+    /// Another replica takes over: this node's tail above the HW is gone and no memory survives.
+    void failover(bool reinstall = true) { restart(reinstall, replica->highWatermark()); }
     void reinstallAll() { for (auto& f : installs_) f(); }
     void demotePromote() {
         replica->becomeFollower(++epoch_, 2);
@@ -186,6 +195,7 @@ public:
         for (const auto& r : recs) {
             std::vector<uint8_t> key(8), val;
             for (int i = 0; i < 8; ++i) key[static_cast<std::size_t>(i)] = static_cast<uint8_t>(r.id >> (8 * i));
+            if (r.del) { b.append({reinterpret_cast<const char*>(key.data()), key.size()}, {}, 1000); continue; }
             const auto le16 = [&](uint16_t x) { val.push_back(uint8_t(x)); val.push_back(uint8_t(x >> 8)); };
             le16(18); le16(1);
             for (int i = 0; i < 8; ++i) val.push_back(static_cast<uint8_t>(r.id >> (8 * i)));
@@ -414,6 +424,148 @@ public:
         return out;
     }
 
+    // ---- the log, read back ----
+    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; };
+    struct RigChange { int64_t offset; std::vector<rune::storage::control_record::ChangeMember> members; };
+    struct RigMarker { int64_t offset; rune::storage::control_record::MarkerHeader header; std::vector<std::tuple<int64_t, uint16_t, uint32_t>> entries; bool horizon = false; };
+    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; };
+
+    /// Every data record, change record and marker below `through`, in offset order, straight from the segments.
+    [[nodiscard]] RigLog readLog(int64_t through = INT64_MAX) const {
+        namespace crl = rune::storage::control_record;
+        RigLog out;
+        for (int64_t off = log->logStartOffset(); off < std::min<int64_t>(leo(), through);) {
+            const auto v = log->readView(off, 1 << 20);
+            if (v.empty()) {   // a compacted gap: continue at the next segment
+                const auto bases = log->segmentBaseOffsets();
+                const auto next = std::upper_bound(bases.begin(), bases.end(), off);
+                if (next == bases.end()) break;
+                off = *next;
+                continue;
+            }
+            for (std::size_t p = 0; p + 12 <= v.len;) {
+                int32_t blen = 0;
+                std::memcpy(&blen, v.data + p + 8, 4);
+                const std::size_t total = 12 + static_cast<std::size_t>(blen);
+                if (p + total > v.len) break;
+                const uint8_t* b = v.data + p;
+                rune::protocol::RecordBatchReader r(b, total);
+                if ((r.attributes() & rune::protocol::batch::kAttrControl) == 0) {
+                    (void)rune::protocol::forEachRecordSpan(b, total, [&](const rune::protocol::RecordSpan& rs) {
+                        if (rs.offset >= through) return;
+                        uint64_t id = 0;
+                        for (int i = 0; i < 8; ++i) id |= uint64_t(uint8_t(rs.key[static_cast<std::size_t>(i)])) << (8 * i);
+                        if (rs.value.empty()) { out.data.push_back({rs.offset, id, 0, 0, true}); return; }
+                        const auto* val = reinterpret_cast<const uint8_t*>(rs.value.data());
+                        uint64_t x = 0;
+                        for (int i = 0; i < 8; ++i) x |= uint64_t(val[12 + i]) << (8 * i);
+                        out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[20]), false});
+                    });
+                } else if (r.baseOffset() < through) {
+                    const int t = crl::recordType(b, total);
+                    if (t == crl::kConstraintSetChange) {
+                        std::array<crl::ChangeMember, 32> ms{};
+                        uint32_t setId = 0; uint16_t n = 0;
+                        if (crl::parseConstraintSetChange(b, total, setId, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n)});
+                    } else if (t == crl::kVerdictMarker) {
+                        RigMarker m{r.baseOffset(), *crl::parseMarkerHeader(b, total), {}, r.hasDeleteHorizon()};
+                        (void)crl::forEachMarkerEntry(b, total, [&](int64_t o, uint16_t c, uint32_t cid) { m.entries.emplace_back(o, c, cid); });
+                        out.markers.push_back(std::move(m));
+                    }
+                }
+                p += total;
+            }
+            off = v.nextOffset;
+        }
+        return out;
+    }
+
+    [[nodiscard]] const PartitionWriteState* writeState() const { return worker->writeStateForTest(kSrc, 0); }
+
+    /// One past the last data record or change record: what the judge and the markers must cover.
+    [[nodiscard]] int64_t dataEnd() const {
+        const auto l = readLog();
+        int64_t end = 0;
+        if (!l.data.empty()) end = std::max(end, l.data.back().offset + 1);
+        if (!l.changes.empty()) end = std::max(end, l.changes.back().offset + 1);
+        return end;
+    }
+
+    /// Passes (with follower fetches when the rig has a follower) until the judge reached `target` and the markers covering it are
+    /// committed.  false = it did not within kMaxPass passes.
+    bool driveUntilJudged(int64_t target = -1) {
+        if (target < 0) target = dataEnd();
+        for (int i = 0; i < kMaxPass; ++i) {
+            const VerdictSource* judge = vs->verdictSource(kSrc, 0);
+            const PartitionWriteState* w = writeState();
+            if (judge != nullptr && w != nullptr && judge->judgedThrough() >= target && w->markers.committedThrough() >= target) return true;
+            if (isr_.size() > 1 && i % 8 == 0) followerFetch();
+            pass();
+        }
+        const VerdictSource* judge = vs->verdictSource(kSrc, 0);
+        const PartitionWriteState* w = writeState();
+        ADD_FAILURE() << "judgedThrough " << (judge ? judge->judgedThrough() : -9) << " committed " << (w ? w->markers.committedThrough() : -9) << " target " << target << " leo " << leo();
+        return false;
+    }
+
+    // ---- compaction ----
+    struct Compacted { int64_t bound = 0; int64_t passEnd = 0; int installed = 0; };
+    /// Seals the active segment (a reservation record rolls it), then one cleaner pass over [0, firstUncleanable) with the replica's
+    /// published bounds - what LogCleanerAgent does for one log - and the owner's swap drain (`drain` false leaves the outputs queued,
+    /// see drainSwaps).  `nowMs` is the cleaner's clock (delete horizons).  Needs a small `rollBytes`.
+    Compacted compact(int64_t nowMs = 1'000'000, bool seal = true, bool drain = true) {
+        namespace crl = rune::storage::control_record;
+        if (seal) {
+            std::vector<uint8_t> f(crl::detail::batchBytes(1));
+            std::size_t pos = crl::detail::beginBatch(f.data(), crl::kReservation, 1);
+            f[pos++] = crl::kPayloadVersion;
+            crl::detail::sealBatch(f.data(), pos);
+            EXPECT_GE(replica->appendControlBatch(f, false), 0);
+            passes(4);
+        }
+        Compacted out;
+        for (int i = 0; i < 16 && (log->runCleanerFileOps(nowMs, replica->fileDeleteDelayMs()), log->cleanerFileOpsPending()); ++i) passes(1);   // the posted renames of the last install
+        out.bound = replica->cleanerVerdictBound();
+        const int64_t markerEnd = replica->cleanerVerdictMarkerEnd();
+        const auto snap = log->cleanerSnapshot();
+        if (!snap || snap->size() < 1) return out;
+        std::vector<int64_t> bases, sizes;
+        for (const auto& si : *snap) { bases.push_back(si.baseOffset); sizes.push_back(si.sizeBytes); }
+        int64_t uncleanable = std::min({snap->back().endOffset, replica->cleanerHighWatermark(), replica->cleanerLastStableOffset(), out.bound});
+        for (const auto& si : *snap) {
+            if (log->cleanerCompactionAllowedThrough(si.endOffset)) continue;
+            uncleanable = std::min(uncleanable, si.baseOffset);
+            break;
+        }
+        rune::storage::LogCleaner cleaner;
+        cleaner.setMarkerRemovalBound(replica->cleanerMarkerRemovalBound());
+        cleaner.setVerdictBounds(out.bound, markerEnd);
+        cleaner.setDeferredInstall(&cleanedSeq_);
+        rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::maxSlotsFromBudget(1 << 22));
+        auto res = cleaner.produceCleanedRangeBounded(log->dir(), bases, sizes, uncleanable, 0, nowMs * 1'000'000, 1000, map, false, 1 << 20, nullptr, nowMs);
+        out.passEnd = res.passEnd;
+        for (const auto& g : res.groups) {
+            std::vector<rune::storage::Log::CleanedMember> members;
+            for (const int64_t gb : g.bases) {
+                uint64_t lineage = rune::storage::Log::kAnyLineage;
+                for (const auto& si : *snap) if (si.baseOffset == gb) lineage = si.lineage;
+                members.push_back({gb, lineage});
+            }
+            auto prebuilt = g.hasOutput ? log->openCleanedOutput(g.bases.front(), g.seq, g.nextOffset) : nullptr;
+            EXPECT_TRUE(log->enqueueCleanedGroup(members.data(), members.size(), g.seq, g.hasOutput, g.nextOffset, prebuilt.get()));
+            (void)prebuilt.release();   // the owner owns it now
+        }
+        if (drain) out.installed = drainSwaps();
+        return out;
+    }
+    /// The owner's drain of the queued compaction outputs; the count of installs (and rejections) it did.
+    int drainSwaps() {
+        int n = 0;
+        for (int i = 0; i < kMaxPass && log->cleanerSwapsPending(); ++i) n += replica->drainCleanerSwapsOnOwner();   // one group per call
+        passes(2);
+        return n;
+    }
+
     std::unique_ptr<rune::storage::Log> log;
     std::unique_ptr<rune::replication::PartitionReplica> replica;
     ViewSnapshotChannel channel;
@@ -479,7 +631,7 @@ private:
     int64_t subSeq_ = 0;
 
     void open() {
-        log = std::make_unique<rune::storage::Log>(logDir_.string(), 64LL * 1024 * 1024);
+        log = std::make_unique<rune::storage::Log>(logDir_.string(), rollBytes_);
         log->recover();
         rune::replication::PartitionConfig c{};
         c.topicId = kSrc; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
@@ -496,6 +648,8 @@ private:
     }
 
     std::vector<rune::replication::NodeId> isr_;
+    int64_t rollBytes_;
+    uint64_t cleanedSeq_ = 0;
     std::vector<std::function<void()>> installs_;
     int64_t epoch_ = 1;
     bool recovering_ = false;   ///< the views of a restarted node load their checkpoints
