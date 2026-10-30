@@ -167,7 +167,8 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         t = {};
         t.keyIndex = m & 256; t.autoIncrement = m & 512; t.constrainedSource = m & 1024; t.verdictSource = m & 2048;
     };
-    const Shape shapes[] = {Plain, Reserved, InsertExplicit, Update, RemoveExisting, KeyZero, KeyZeroMixed, ManyPlain, ManyPlainOver};
+    // Matrix B: every intent shape x reserved bits on / off x records {1, 4096, 4097} x the 12 facts (import included).
+    const Shape shapes[] = {Plain, InsertExplicit, Update, RemoveExisting, KeyZero, KeyZeroMixed};
     const auto flip = [](uint32_t m, int fact) {
         switch (fact) {
         case 0: return m ^ 1u;
@@ -184,8 +185,12 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         }
     };
     int cells = 0;
-    for (Shape s : shapes) {
-        const BatchIntents b = intentsOf(s);
+    for (Shape s : shapes)
+    for (const bool reserved : {false, true})
+    for (const int32_t records : {1, 4096, 4097}) {
+        BatchIntents b = intentsOf(s);
+        b.reservedBits = reserved;
+        b.records = records;
         for (uint32_t m = 0; m < 4096; ++m) {
             WriteFacts f; TopicHookFacts t;
             build(m, f, t);
@@ -193,7 +198,7 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
             ++cells;
             const bool view = f.acks & 2;
             if (!b.anyIntent && !b.reservedBits && !view && !((f.transactional || f.atomicBatch) && t.constrainedSource)) {
-                ASSERT_EQ(v.code, OK) << "(i) shape " << s << " m " << m;
+                ASSERT_EQ(v.code, OK) << "(i) shape " << s << " records " << records << " m " << m;
             }
             if (b.reservedBits) ASSERT_EQ(v.why, H::ReservedBits) << "(ii)";
             if (!b.reservedBits && f.legacyMode && (b.anyIntent || view)) ASSERT_EQ(v.why, H::LegacyMode) << "(iii)";
@@ -202,11 +207,11 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
                 WriteFacts f2; TopicHookFacts t2;
                 build(flip(m, fact), f2, t2);
                 const auto w = evaluateRequirements(b, f2, t2);
-                if (w.why != v.why) ASSERT_TRUE(feeds(fact, v.why) || feeds(fact, w.why)) << "(v) fact " << fact << " shape " << s << " m " << m;
+                if (w.why != v.why) ASSERT_TRUE(feeds(fact, v.why) || feeds(fact, w.why)) << "(v) fact " << fact << " shape " << s << " reserved " << reserved << " records " << records << " m " << m;
             }
         }
     }
-    EXPECT_EQ(cells, 9 * 4096);
+    EXPECT_EQ(cells, 6 * 2 * 3 * 4096);
 }
 
 namespace {
