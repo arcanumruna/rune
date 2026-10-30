@@ -99,6 +99,8 @@
 // never measured.
 #include <benchmark/benchmark.h>
 #include <rune/codec/Descriptor.h>
+#include <rune/node/VerdictSource.h>
+#include <rune/node/WriteState.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/LogReadView.h>
 #include <rune/view/PlanCompiler.h>
@@ -113,6 +115,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <optional>
@@ -579,6 +582,102 @@ BENCHMARK(BM_ViewFoldReplace)
     ->Unit(benchmark::kMicrosecond)
     ->Iterations(1)
     ->UseRealTime();
+
+// Verdict judging (checked writes Part 04): the BM_ViewFoldReplace churn through a VerdictSource, one driveJudge per
+// committed batch.  Arg 0 = test_reject_cap (two CapLiveKeys members that never trip, so every record is accepted and
+// applied to both tables); Arg 1 = rejecting_1pct (TagEquals: every 100th key is rejected, on every touch).  The
+// source is {id Int64 key, tag Int32}, wire-identical to the character source.
+namespace {
+rune::codec::Descriptor tagSourceV1() {
+    return rune::codec::DescriptorBuilder("character", 1)
+        .add("id", PrimType::Int64, 1, /*isKey*/ true)
+        .add("tag", PrimType::Int32)
+        .build();
+}
+rune::view::ViewPlan tagProjectionView() {
+    rune::view::ViewPlan v;
+    v.viewName = "char_tag";
+    v.key      = "id";
+    v.sources  = {{5, "id"}};
+    v.output   = {{"id", PrimType::Int64, 0, "id", rune::view::MergeRule::Replace},
+                  {"tag", PrimType::Int32, 0, "tag", rune::view::MergeRule::Replace}};
+    return v;
+}
+struct VerdictBenchMember {
+    rune::codec::Descriptor src = tagSourceV1();
+    rune::view::CompileResult comp;
+    std::unique_ptr<rune::node::ViewInstance> inst;
+    VerdictBenchMember(uint32_t id) {
+        const rune::codec::Descriptor* s[] = {&src};
+        comp = compileView(tagProjectionView(), s, id).value();
+        inst = std::make_unique<rune::node::ViewInstance>(comp.plan, comp.rowLayout, src, false, 0, 1u << 21, 1u << 20);
+    }
+};
+} // namespace
+
+static void BM_ViewFoldVerdict(benchmark::State& st) {
+    const bool rejecting = st.range(0) == 1;
+    for (auto _ : st) {
+        const auto ops = generateChurnOps(kTotalOps);
+        const auto stream = buildStream(
+            ops, kBatchSizes, std::size(kBatchSizes),
+            [&](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
+                const auto kb = keyBytes(static_cast<int64_t>(op.key));
+                if (op.tombstone) {
+                    bb.append(asSv(kb), std::string_view{}, 0);
+                } else {
+                    const auto val = encodeCharacter(static_cast<int64_t>(op.key), op.key % 100 == 0 ? 9 : 1, 1);
+                    bb.append(asSv(kb), asSv(val), 0);
+                }
+            });
+
+        rune::node::TestRejectRule ruleA, ruleB;
+        if (rejecting) {
+            ruleA.mode = rune::node::TestRejectRule::Mode::TagEquals; ruleA.tag = 9;
+            ruleB.mode = rune::node::TestRejectRule::Mode::TagEquals; ruleB.tag = 200;
+        } else {
+            ruleA.mode = rune::node::TestRejectRule::Mode::CapLiveKeys; ruleA.cap = 1u << 20;
+            ruleB.mode = rune::node::TestRejectRule::Mode::CapLiveKeys; ruleB.cap = 1u << 21;
+        }
+        VerdictBenchMember a(7), b(8);
+        rune::node::PartitionWriteState write;
+        rune::node::VerdictSource vs{5, 0};
+        vs.installTestVerdictViewForTest(a.inst.get(), 7, ruleA);
+        vs.installTestVerdictViewForTest(b.inst.get(), 8, ruleB);
+        rune::node::ConstraintSet set;
+        set.id = 1;
+        set.members[set.count++] = {7, rune::view::VerdictViewKind::TestReject, ruleA.fingerprint()};
+        set.members[set.count++] = {8, rune::view::VerdictViewKind::TestReject, ruleB.fingerprint()};
+        write.constraintSets.onChange(0, set);
+        vs.bindState(&write);
+        vs.bindLeader(nullptr, 1, 0);
+
+        const int64_t end = stream.bound(stream.size() - 1);
+        auto readRange = [&](int64_t from, int64_t) {
+            const size_t j = static_cast<size_t>(std::upper_bound(stream.baseOffset.begin(), stream.baseOffset.end(), from) - stream.baseOffset.begin()) - 1;
+            return rune::storage::LogReadView{stream.bytes.data() + stream.byteOffset[j], stream.bytes.size() - stream.byteOffset[j], stream.baseOffset[j], end};
+        };
+        auto foldOne = [&](size_t i) {
+            vs.driveJudge(readRange, stream.bound(i), 0, write);
+            return FoldStats{};
+        };
+        auto drainAll = [&] {
+            auto nop = [](uint32_t, const uint8_t*, bool, uint64_t) {};
+            a.inst->table.drainDirty(nop);
+            b.inst->table.drainDirty(nop);
+        };
+
+        auto r = runPhases(stream, foldOne, drainAll, /*drainEvery*/ 1000);
+        if (vs.judgedThrough() != stream.bound(stream.size() - 1) && vs.judgedThrough() < stream.bound(stream.size() - 1) - 8)
+            st.SkipWithError("the judge did not reach the end of the stream");
+        st.counters["verdict_record_p50_ns"] = percentileUs(r.trueRecordLatNs, 0.50) * 1000.0;
+        st.counters["verdict_record_p99_ns"] = percentileUs(r.trueRecordLatNs, 0.99) * 1000.0;
+        st.counters["steady_alloc"]          = static_cast<double>(r.steadyAlloc);
+        st.counters["rejected_total"]        = static_cast<double>(write.rejected.size());
+        st.counters["judged_through"]        = static_cast<double>(vs.judgedThrough());
+    }
+}
+BENCHMARK(BM_ViewFoldVerdict)->Arg(0)->Arg(1)->ArgName("rejecting_1pct")->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime();
 
 // Aggregate fold gate (Phase 2a): user_totals grouped by userId over
 // 1,000,000 contributors / 10,000 groups. What is warm before timing:

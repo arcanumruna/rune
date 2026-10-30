@@ -27,6 +27,11 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/codec/Serialize.h>
+#include <rune/node/ViewSnapshotChannel.h>
+#include <rune/node/WorkerViewSet.h>
+#include <rune/node/WriteState.h>
+#include <rune/view/PlanCompiler.h>
 
 #include "BenchGate.h"
 #include <benchmark/benchmark.h>
@@ -331,6 +336,116 @@ static void BM_WorkerProduceToPushRead_Transient_1KiB(benchmark::State& s) {
     TransientWorkerFixture f; runProduceToPushRead(s, f, nullptr, 1024);
 }
 
+
+// Produce -> subscribe latency of a VERDICT SOURCE partition: the Disk_256B workload with a TestReject member (it never
+// rejects), so every produced record is judged before the PushRead can deliver it.  verdict_lag_p50_ns is the time from
+// the produce ack to the judge passing the record.
+static void BM_WorkerProduceToPushRead_VerdictSource_256B(benchmark::State& state) {
+    constexpr int32_t kSrc = 1;   // the fixture replica's topic
+    RealWorkerFixture f;
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, f.dir);
+    f.worker->setViewSet(&vs);
+    f.worker->setFilterConfig(rune::node::filter::FilterConfig{});
+    vs.setVerdictIntervalNs(0);   // markers every pass: the bench times judging, not the marker interval
+    int64_t nowNs = 1, corr = 0, sub = 0;
+    auto pump = [&] {
+        f.worker->doWork(nowNs += 1'000'000);
+        channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, rune::node::OneToOneByteRing::index_t, rune::node::OneToOneByteRing::index_t) {});
+        f.worker->drainReturn([](WorkerReturn&&) {});
+    };
+    auto send = [&](WorkerOp op) { while (!f.worker->tryEnqueueOp(op)) pump(); for (int i = 0; i < 3; ++i) pump(); };
+
+    const auto src = rune::codec::DescriptorBuilder("t", 1).add("id", rune::codec::PrimType::UInt64, 1, true)
+                         .add("v", rune::codec::PrimType::Int64).add("tag", rune::codec::PrimType::UInt16).build();
+    WorkerOp lvl; lvl.type = WorkerOp::Type::ClusterFeatureLevel; lvl.nextOffset = 5; send(lvl);
+    WorkerOp sch; sch.type = WorkerOp::Type::SchemaUpdate; sch.topicId = kSrc; sch.clientVersion = 1;
+    sch.schemaUpdateBlob = rune::codec::serialize(src); send(sch);
+    WorkerOp flt; flt.type = WorkerOp::Type::FilterSchema; flt.topicId = kSrc; flt.clientVersion = 1;
+    flt.schemaUpdateBlob = rune::codec::serialize(src); send(flt);
+    rune::node::TopicWriteSpecWire w;
+    w.topicId = kSrc; w.keyFieldId = 0; w.keyType = rune::codec::PrimType::UInt64; w.keyWidth = 8; w.legacyValidate = false;
+    WorkerOp spec; spec.type = WorkerOp::Type::WriteSpecUpdate; spec.topicId = kSrc;
+    spec.schemaUpdateBlob.resize(rune::node::kTopicWriteSpecWireLen);
+    (void)rune::node::encodeTopicWriteSpec(w, spec.schemaUpdateBlob); send(spec);
+
+    rune::view::ViewPlan plan;
+    plan.viewName = "rej"; plan.key = "id"; plan.sources = {{kSrc, "id"}};
+    plan.output = {{"id", rune::codec::PrimType::UInt64, 0, "id", rune::view::MergeRule::Replace},
+                   {"v", rune::codec::PrimType::Int64, 0, "v", rune::view::MergeRule::Replace}};
+    plan.persistence = 1;
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(plan, srcs, 0x51000001).value();
+    rune::node::TestRejectRule rule;
+    rule.mode = rune::node::TestRejectRule::Mode::TagEquals; rule.tag = 200;
+    vs.installTestVerdictViewForTest(comp.plan, comp.rowLayout, src, false, 7, rule);
+    for (int i = 0; i < 50; ++i) pump();
+
+    std::vector<int64_t> samples, lag;
+    samples.reserve(1 << 16); lag.reserve(1 << 16);
+    uint64_t id = 0;
+    for (auto _ : state) {
+        rune::protocol::RecordBatchBuilder b(0, 0);
+        std::vector<uint8_t> key(8), val;
+        ++id;
+        for (int i = 0; i < 8; ++i) key[std::size_t(i)] = uint8_t(id >> (8 * i));
+        val.push_back(18); val.push_back(0); val.push_back(1); val.push_back(0);
+        for (int i = 0; i < 8; ++i) val.push_back(uint8_t(id >> (8 * i)));
+        for (int i = 0; i < 8; ++i) val.push_back(uint8_t(id >> (8 * i)));
+        val.push_back(1); val.push_back(0);
+        b.append({reinterpret_cast<const char*>(key.data()), key.size()}, {reinterpret_cast<const char*>(val.data()), val.size()}, 0);
+        WorkerOp prod;
+        prod.type = WorkerOp::Type::Produce;
+        prod.topicId = kSrc; prod.partition = 0;
+        prod.replica = f.replica.get(); prod.logPtr = f.log.get();
+        prod.sessionId = 1; prod.correlationId = ++corr;
+        prod.lastOffsetDelta = 0; prod.recordCount = 1; prod.durabilityTier = 1;
+        prod.recordBatchBytes = b.build();
+        WorkerOp read;
+        read.type = WorkerOp::Type::PushRead;
+        read.topicId = kSrc; read.partition = 0;
+        read.replica = f.replica.get(); read.logPtr = f.log.get();
+        read.subscriptionId = ++sub; read.sessionId = 1;
+        read.hwBound = INT64_MAX; read.isolation = 0;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!f.worker->tryEnqueueOp(prod)) pump();
+        int64_t base = -1;
+        for (int i = 0; i < 5'000'000 && base < 0; ++i) {
+            f.worker->doWork(nowNs += 1'000'000);
+            f.worker->drainReturn([&](WorkerReturn&& r) {
+                if (r.type == WorkerReturn::Type::ProduceResult && r.errorCode == 0) base = r.baseOffset;
+            });
+        }
+        const auto tAck = std::chrono::steady_clock::now();
+        const rune::node::VerdictSource* judge = vs.verdictSource(kSrc, 0);
+        for (int i = 0; i < 5'000'000 && (judge == nullptr || judge->judgedThrough() <= base); ++i) {
+            pump();
+            judge = vs.verdictSource(kSrc, 0);
+        }
+        const auto tJudged = std::chrono::steady_clock::now();
+        read.nextOffset = base;
+        while (!f.worker->tryEnqueueOp(read)) pump();
+        bool delivered = false;
+        for (int i = 0; i < 5'000'000 && !delivered; ++i) {
+            f.worker->doWork(nowNs += 1'000'000);
+            f.worker->drainReturn([&](WorkerReturn&& r) {
+                if (r.type == WorkerReturn::Type::PushReadResult && !r.chunk.empty()) delivered = true;
+            });
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        if (!delivered) { state.SkipWithError("the produced record never reached the PushRead"); break; }
+        samples.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        lag.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(tJudged - tAck).count());
+    }
+    state.SetItemsProcessed(state.iterations());
+    reportPercentiles(state, samples);
+    if (!lag.empty()) {
+        std::sort(lag.begin(), lag.end());
+        state.counters["verdict_lag_p50_ns"] = static_cast<double>(lag[lag.size() / 2]);
+    }
+}
+
 } // namespace
 
 BENCHMARK(BM_WorkerRoleGate)->Arg(1)->Arg(64)->Arg(1024)->Unit(benchmark::kNanosecond);
@@ -382,6 +497,7 @@ BENCHMARK(BM_WorkerProduce_Majority_256B)->Unit(benchmark::kNanosecond)->MinTime
 BENCHMARK(BM_WorkerProduce_Strict_1KiB)->Unit(benchmark::kNanosecond)->MinTime(0.2);
 BENCHMARK(BM_WorkerProduce_Strict_256B)->Unit(benchmark::kNanosecond)->MinTime(0.2);
 BENCHMARK(BM_WorkerProduceToPushRead_Disk_256B)->Unit(benchmark::kNanosecond)->MinTime(0.2);
+BENCHMARK(BM_WorkerProduceToPushRead_VerdictSource_256B)->Unit(benchmark::kNanosecond)->MinTime(0.2);
 BENCHMARK(BM_WorkerProduceToPushRead_Transient_256B)->Unit(benchmark::kNanosecond)->MinTime(0.2);
 BENCHMARK(BM_WorkerProduceToPushRead_Disk_1KiB)->Unit(benchmark::kNanosecond)->MinTime(0.2);
 BENCHMARK(BM_WorkerProduceToPushRead_Transient_1KiB)->Unit(benchmark::kNanosecond)->MinTime(0.2);
