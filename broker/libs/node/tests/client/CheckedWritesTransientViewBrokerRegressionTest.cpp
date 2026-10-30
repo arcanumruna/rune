@@ -37,6 +37,17 @@ Views createViews(rc::Client& c, int32_t src) {
     return v;
 }
 
+/// transientSourceResets of (view, partition 0), summed over the workers.
+uint64_t sourceResets(BrokerNode& n, int32_t viewTopicId) {
+    uint64_t sum = 0;
+    for (int32_t w = 0; w < n.workerCountForTest(); ++w)
+        sum += n.onWorkerThreadForTest(w, [viewTopicId](Worker& wk) -> uint64_t {
+            const ViewFoldCounters* c = wk.viewSet()->foldCounters(viewTopicId, 0);
+            return c != nullptr ? c->transientSourceResets : 0;
+        });
+    return sum;
+}
+
 void awaitLevel(BrokerNode& n) {
     bool raised = false;
     for (int i = 0; i < 800 && !raised; ++i) {
@@ -108,6 +119,8 @@ TEST(CheckedWritesTransientViewBrokerRegression, FullRestartKeepsTheCheckpointRo
     EXPECT_TRUE(tv::awaitRow(c, v.rows, 1, {1, 7}));
     EXPECT_TRUE(tv::awaitRow(c, v.totals, 5, {5, 2, 2})) << "keys 2 and 4: key 1 moved out, nothing counted twice";
     EXPECT_TRUE(tv::awaitRow(c, v.totals, 7, {7, 2, 1})) << "keys 1 and 3";
+    EXPECT_EQ(sourceResets(b.node(), v.rows), 1u) << "one reset: the checkpoint cursor was from the earlier ring";
+    EXPECT_EQ(sourceResets(b.node(), v.totals), 1u);
 }
 
 TEST(CheckedWritesTransientViewBrokerRegression, ViewsOverAKeylessTransientTopicAreRefusedRegression) {
@@ -148,5 +161,8 @@ TEST(CheckedWritesTransientViewBrokerRegression, ViewAckOnAPersistedViewOverATra
             std::this_thread::sleep_for(50ms);
         }
         EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "acks " << static_cast<int>(acks) << ": the acked record is already in the view";
+        const auto layout = rc::view::buildRowLayout(std::vector<rune::codec::PrimType>(2, rune::codec::PrimType::Int64));
+        const auto hp     = rc::view::readSlot(row.rowBytes, layout, 1);
+        EXPECT_TRUE(hp.present && hp.i == static_cast<int64_t>(id * 10)) << "acks " << static_cast<int>(acks) << ": hp is the acked value";
     }
 }

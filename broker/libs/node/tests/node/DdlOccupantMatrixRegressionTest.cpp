@@ -538,7 +538,25 @@ std::vector<TvCell> tvCells() {
     return out;
 }
 uint16_t tvExpected(const TvCell& c) { return tvKeyless(c.source) ? kViewKeyInvalid : kOk; }
-void PrintTo(const TvCell& c, std::ostream* os) { *os << static_cast<int>(c.source) << "_" << static_cast<int>(c.op); }
+const char* tvSourceName(TvSource s) {
+    switch (s) {
+        case TvSource::TransientKeyed:   return "TransientKeyed";
+        case TvSource::TransientKeyless: return "TransientKeyless";
+        case TvSource::DiskKeyed:        return "DiskKeyed";
+        case TvSource::DiskKeyless:      return "DiskKeyless";
+    }
+    return "?";
+}
+const char* tvOpName(TvOp o) {
+    switch (o) {
+        case TvOp::CreatePersisted:             return "CreatePersisted";
+        case TvOp::CreateTransient:             return "CreateTransient";
+        case TvOp::AlterTransientToPersisted:   return "AlterTransientToPersisted";
+        case TvOp::AlterPersistedToTransient:   return "AlterPersistedToTransient";
+    }
+    return "?";
+}
+void PrintTo(const TvCell& c, std::ostream* os) { *os << tvSourceName(c.source) << "_" << tvOpName(c.op); }
 
 TEST(CheckedWritesTransientViewDdlCountRegression, CellCountIsPinned) { EXPECT_EQ(tvCells().size(), 12u); }
 
@@ -599,14 +617,23 @@ TEST_P(CheckedWritesTransientViewDdlRegression, Cell) {
     }
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 
+    // After the restart the same op runs again, on a fresh view (an Alter re-runs Alter over a view made after the restart).
     h.restart();
-    const int64_t again = run(name + "_2", false);
+    const std::string second = name + "_2";
+    if (tvAlter(c.op)) {
+        const int64_t pc = h.submitView(target == 0 ? Op::ViewTransient : Op::ViewPersisted, second, {"tvsrc"});
+        h.settle();
+        ASSERT_TRUE(h.response(pc).has_value());
+        ASSERT_EQ(h.response(pc)->err, kOk) << "setup view after the restart";
+    }
+    const int64_t again = run(second, tvAlter(c.op));
     h.settle();
     ASSERT_TRUE(h.response(again).has_value());
     EXPECT_EQ(h.response(again)->err, tvExpected(c)) << "after restart";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-INSTANTIATE_TEST_SUITE_P(Cell, CheckedWritesTransientViewDdlRegression, ::testing::ValuesIn(tvCells()));
+INSTANTIATE_TEST_SUITE_P(Cell, CheckedWritesTransientViewDdlRegression, ::testing::ValuesIn(tvCells()),
+    [](const ::testing::TestParamInfo<TvCell>& i) { return std::string(tvSourceName(i.param.source)) + "_" + tvOpName(i.param.op); });
 
 } // namespace
