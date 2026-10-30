@@ -1586,7 +1586,7 @@ private:
     // log) is handed to sendGatherToPeer, which copies it ONCE into the term
     // buffer.  No scratch buffer, no allocation.
     // -----------------------------------------------------------------------
-    static constexpr std::size_t kFetchResponsePrefixMax = 64;   // encodedSize(0) == 46
+    static constexpr std::size_t kFetchResponsePrefixMax = 64;   // encodedSize(0) == 54
 
     bool sendFetchResponseImpl_(rune::replication::NodeId peer,
                                 const rune::replication::FetchResponseMsg& resp,
@@ -1602,7 +1602,7 @@ private:
                                      resp.highWatermark, resp.logStartOffset,
                                      resp.errorCode,
                                      std::span<const uint8_t>(&kNoRecords, 0),
-                                     resp.topicId);
+                                     resp.topicId, resp.fromOffset);
         rr::detail::write_le<uint32_t>(prefix + prefixLen - rr::FetchResponseMsg::VAR_HEADER_SIZE,
                                        static_cast<uint32_t>(resp.records.size()));
         if (reconcile) rr::stampTemplateId(prefix, 0, rr::kReconcileFetchRespTemplateId);

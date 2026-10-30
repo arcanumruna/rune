@@ -1516,3 +1516,56 @@ TEST(HotPathBRegression, PushOnlyLogNeverProvisionsReadMapsRegression) {
         EXPECT_FALSE(rig.log->segmentForTest(bases[i])->hasReadMapForTest())
             << "segment " << bases[i] << " was provisioned with a read map nobody reads";
 }
+
+// #789: the worker hop carries the leader's read origin (FetchResponse.fromOffset,
+// routed in WorkerOp::nextOffset) to applyReplicated — a frame read from our LEO
+// crosses a compaction gap; one without a read origin does not.
+TEST(HotPathBRegression, WorkerApplyCarriesTheReadOriginAcrossACompactionGapRegression) {
+    Rig rig(false, 4096);
+    rig.roleOp(false, 3, 2);
+    rig.pass();
+    applyStamped(rig, 3, 3, 2);
+    const int64_t leo = rig.log->logEndOffset();
+    rune::protocol::RecordBatchBuilder b(leo + 5, 1000);   // [leo, leo + 5) compacted away
+    for (int k = 0; k < 2; ++k) b.append("k", std::string(100, 'x'), 1000 + k);
+    auto v = b.build();
+    rune::protocol::RecordBatchReader::stampLeaderEpoch(v.data(), 3);
+    auto apply = [&](int64_t fromOffset) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::ApplyReplicated; op.topicId = 1; op.partition = 0;
+        op.nextOffset = fromOffset;
+        op.replicatedPayload.leaderEpoch = 3; op.replicatedPayload.partition = 0; op.replicatedPayload.topicId = 1;
+        op.replicatedPayload.highWatermark = leo;
+        op.replicatedPayload.records.assign(v.begin(), v.end());
+        ASSERT_TRUE(rig.pool.tryEnqueueOp(1, 0, std::move(op)));
+        rig.pass();
+    };
+    apply(-1);
+    EXPECT_EQ(rig.log->logEndOffset(), leo) << "no read origin: the gap is refused";
+    apply(leo);
+    EXPECT_EQ(rig.log->logEndOffset(), leo + 7) << "read from our LEO: the gap is compacted";
+}
+
+// #789 review: a kErrRecordTooLarge the leader answered reaches the worker with no
+// read origin (nextOffset -1).  It must wedge the follower at its LEO, as
+// applyReplicated does on the per-worker plane — not take the transport's
+// unapplicable-batch branch, which compared nextOffset (formerly a default 0)
+// against the LEO and so wedged only a follower at LEO 0.
+TEST(HotPathBRegression, WorkerWedgesOnTheLeadersRecordTooLargeAboveLeoZeroRegression) {
+    Rig rig(false, 4096);
+    rig.roleOp(false, 3, 2);
+    rig.pass();
+    applyStamped(rig, 3, 3, 2);
+    const int64_t leo = rig.log->logEndOffset();
+    ASSERT_GT(leo, 0);
+    WorkerOp op;
+    op.type = WorkerOp::Type::ApplyReplicated; op.topicId = 1; op.partition = 0;
+    op.nextOffset = -1;
+    op.replicatedPayload.leaderEpoch = 3; op.replicatedPayload.partition = 0; op.replicatedPayload.topicId = 1;
+    op.replicatedPayload.highWatermark = leo;
+    op.replicatedPayload.errorCode = rune::replication::kErrRecordTooLarge;
+    ASSERT_TRUE(rig.pool.tryEnqueueOp(1, 0, std::move(op)));
+    rig.pass();
+    EXPECT_EQ(rig.rep->wedgedAtOffset(), leo) << "the follower must wedge at its LEO";
+    EXPECT_EQ(rig.rep->wedgedRefusals(), 1u);
+}

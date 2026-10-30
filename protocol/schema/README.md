@@ -24,6 +24,13 @@ JAVA=/Applications/CLion.app/Contents/jbr/Contents/Home/bin/java   # or any JDK 
 The `sbe-all` fat jar (real-logic Simple Binary Encoding, `uk.co.real-logic:sbe-all`,
 now the aeron-io project) is vendored under `tools/` for reproducible, offline codegen.
 
+## `rune-replication.xml` (schemaId 112) - version 5
+
+Version 5 is additive: `FetchResponse` (block 34 -> 42) appends `fromOffset int64`, the offset the leader read
+`records` from (-1 = an error / HW-only answer). A follower whose log end offset is at or above it appends across
+offsets missing between batches: they were compacted away on the leader (#789). A v4 frame decodes it as -1 and gets
+the old contiguous-only apply. The wire minimum stays 3.
+
 ## `rune-replication.xml` (schemaId 112) - version 4 (ISR protocol v3)
 
 Version 4 is additive: every new field is `sinceVersion="4"`, an old decoder reads the fields it knows, and a new decoder

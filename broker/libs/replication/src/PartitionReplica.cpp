@@ -1110,7 +1110,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // the follower's *committed view* (followerHw_) is held at the min-ISR-gated floor
     // until the ISR heals.
     const Offset advertiseHw = highWatermark();
-    auto resp = makeFetchResponse(advertiseHw, kErrNone, records);
+    auto resp = makeFetchResponse(advertiseHw, kErrNone, records, req.fetchOffset);
     if (sendFetchAnswer_(slot, req.followerId, resp, req.fetchOffset, req.maxBytes,
                          /*data=*/!records.empty(), records.empty() ? -1 : servedEnd) &&
         !records.empty())
@@ -1191,7 +1191,7 @@ int PartitionReplica::retryOwedFetchAnswers_() noexcept
             records = std::span<const uint8_t>(view.data, s.owed.builtBytes);
             dataEnd = s.owed.builtEnd;
         }
-        auto resp = makeFetchResponse(highWatermark(), owed.errorCode, records);
+        auto resp = makeFetchResponse(highWatermark(), owed.errorCode, records, owed.fetchOffset);
         const bool ok = onTransport([&](auto& t) { return t.sendFetchResponse(s.id, resp); });
         if (ok) {
             s.owed = FollowerSlot::OwedAnswer{};
@@ -1434,9 +1434,15 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             // only append the strictly-new tail whose baseOffset >= currentLeo.
             // If the first new batch starts exactly at currentLeo the log stays
             // contiguous.  Any batch that starts ABOVE currentLeo (a gap) is also
-            // skipped to preserve contiguity invariants.
+            // skipped to preserve contiguity invariants — unless the gap is
+            // compacted (#789): the leader read these batches from
+            // resp.fromOffset <= our LEO, so the offsets it skipped are absent from
+            // its log (Kafka: a follower appends across compaction gaps).  Not
+            // when a held batch straddles our LEO (its tail is not ours to
+            // drop), nor for a transient ring (contiguous by construction).
 
             Offset currentLeo = logEndOffset_();
+            bool compactedGaps = !memoryBacked_ && resp.fromOffset >= 0 && resp.fromOffset <= currentLeo;
             std::size_t newStart = resp.records.size(); // byte-offset of first new batch
             std::size_t newEnd   = newStart;            // one past the last new batch applied
             // Phase 2b E2: a transient follower applies at most one ring's worth of
@@ -1458,14 +1464,15 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
                 int64_t batchBase = r.baseOffset();
                 if (batchBase < currentLeo) {
                     // Already held — skip this batch.
+                    if (batchBase + r.lastOffsetDelta() >= currentLeo) compactedGaps = false;
                     pos += static_cast<std::size_t>(total);
                     continue;
                 }
-                if (batchBase > currentLeo) {
+                if (batchBase > currentLeo && !compactedGaps) {
                     // Gap — would break contiguity; stop.
                     break;
                 }
-                // batchBase == currentLeo: this is where new data starts.
+                // batchBase == currentLeo (or past a compacted gap): new data starts here.
                 if (newStart != resp.records.size() &&
                     pos + static_cast<std::size_t>(total) - newStart > spanCap) [[unlikely]]
                     break;   // E2: the next batch would not fit this node's ring with the span
@@ -4038,7 +4045,7 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
             if (from == floor) unsendablePush_.fromOffset = -1;   // a sendable head disarms the memo
             // DR-BUG-3: advertise the min-ISR-gated HW (see onFetchRequest).
             resp = makeFetchResponse(highWatermark(), kErrNone,
-                                     std::span<const uint8_t>(v.data, pre.bytes));
+                                     std::span<const uint8_t>(v.data, pre.bytes), from);
             builtOk = true;
         }
         if (!builtOk) continue;

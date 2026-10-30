@@ -1463,8 +1463,10 @@ private:
     /// returning.  Replaces the old encode-into-encodeScratch_ → decode →
     /// re-encode round-trip (one full record-bytes copy + a decode parse per
     /// replication frame).
+    /// `fromOffset`: the offset `records` was read from (#789; -1 = no read).
     FetchResponseMsg makeFetchResponse(Offset highWatermark, int16_t errorCode,
-                                       std::span<const uint8_t> records) const noexcept {
+                                       std::span<const uint8_t> records,
+                                       Offset fromOffset = -1) const noexcept {
         FetchResponseMsg r{};
         r.leaderEpoch    = epoch_;
         r.partition      = cfg_.partitionId;
@@ -1475,6 +1477,7 @@ private:
         r.errorCode      = errorCode;
         r.topicId        = cfg_.topicId;
         r.records        = records;
+        r.fromOffset     = records.empty() ? -1 : fromOffset;
         return r;
     }
 
