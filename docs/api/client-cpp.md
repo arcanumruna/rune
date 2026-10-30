@@ -191,6 +191,11 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
     `RUNE_MIN_ISR=1`) an ISR shrunk to the leader alone still acknowledges, so one broker failure can lose it.
 
   Use `Acks::All` whenever a record must not be lost.
+- **`Acks::View`** is a flag that combines with the above (`Acks::All | Acks::View`): the ack waits until the batch is
+  folded into the views and carries the per-record write verdicts. It needs a broker that supports checked writes; against
+  an older broker every send completes locally with `OpStatus::BrokerTooOld`. `View` batches hold at most 4096 records
+  (`claimBatch` with more returns `SendResult::MessageTooLarge`, `BatchBuilder` throws `std::length_error`). A transactional
+  producer never sends the `View` bit. `SendResult::WriteNotAllowed` reports a write the broker refuses for the topic.
 - **`Key`**: up to 16 inline bytes, built from a `uint64_t`/`int64_t`, a trivially-copyable value or a byte span. The key
   picks the partition (`Key::partition(n)`, FNV-1a 64) and is stored with the record. A key is never truncated: a span of
   more than 16 bytes is an over-long key (`Key::tooLong()`), `trySend` returns `SendResult::KeyTooLong` and `send` throws

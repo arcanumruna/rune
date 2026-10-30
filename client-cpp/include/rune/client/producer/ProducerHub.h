@@ -70,6 +70,12 @@ public:
 
     void add(ProducerImpl* impl);
 
+    /// SD11: the seed broker's version, forwarded to every producer held and to every later one.
+    void setBrokerVersion(int32_t v) noexcept {
+        brokerVersion_ = v;
+        forEach([v](ProducerImpl& p) { p.setBrokerVersion(v); });
+    }
+
     /// F8c C7: forget a released, quiescent producer (its slot becomes a
     /// tombstone; the ordinal is reused only once every fresh one is taken,
     /// oldest first).  The caller detaches the duty share.
@@ -320,6 +326,7 @@ private:
     std::vector<uint32_t> freeOrdinals_;  // F8c C7: released ordinals, FIFO (reused once fresh run out)
     std::size_t freeHead_ = 0;            // next freeOrdinals_ entry to reuse
     std::vector<uint32_t> nextCoordSeq_;  // per ordinal: the next incarnation's coordinator request sequence
+    int32_t brokerVersion_ = 0;           // SD11: the seed broker's version (0 = unknown)
     std::vector<uint64_t> nextBase_;      // per ordinal: the next incarnation's sequence base (F2)
 };
 

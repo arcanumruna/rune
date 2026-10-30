@@ -125,6 +125,7 @@ struct WireBatch {
     bool                     acked     = false;
     uint32_t                 crcStored = 0;   ///< the CRC-32C field as sent
     uint32_t                 crcActual = 0;   ///< CRC-32C computed over the bytes as sent (attributes .. end)
+    uint8_t                  acks      = 0;   ///< the Produce frame's acks byte
 };
 
 enum class Mode : uint8_t { Ring, Direct };
@@ -172,6 +173,7 @@ struct Rig {
                 w.crcActual = rune::protocol::crc32c(rb + rune::protocol::batch::kAttributesOffset,
                                                      rn - static_cast<std::size_t>(rune::protocol::batch::kAttributesOffset));
             }
+            w.acks = v->acks;
             wire.push_back(std::move(w));
             return true;
         };
@@ -567,6 +569,30 @@ TEST(ProducerTxnData, EveryTransactionalBatchHasTheTransactionalBitAndPlainNever
             EXPECT_TRUE(w.crcOk);
         }
     }
+}
+
+// Checked writes Part 03 (Review Focus 2): a transactional producer configured All | View sends acks = All on every
+// path.  A View ack of a transactional send would wait for the LSO, the LSO for the commit, and the commit for the
+// send's ack.
+TEST(CheckedWritesAcksRegression, TransactionalProducerNeverSendsTheViewBitRegression) {
+    rc::ProducerConfig c = txnCfg();
+    c.acks = Acks::All | Acks::View;
+    Rig r(Mode::Ring, c);
+    r.initOk();
+    r.begin();
+    for (int i = 0; i < 10; ++i) ASSERT_EQ(r.send(0, static_cast<uint8_t>(i)), SendResult::Ok);
+    ASSERT_EQ(r.batch(0, 20, 3, 0), rp::RejectReason::None);
+    r.tick();
+    r.answerAdd(0);
+    r.ticks(3);
+    ASSERT_GE(r.wire.size(), 2u);
+    for (const auto& w : r.wire) EXPECT_EQ(w.acks, 1) << "All, and never the View bit";
+    r.ackAll();
+    Op commit = r.commit();
+    r.tick();
+    r.endAnswer();
+    ASSERT_TRUE(commit.ready());
+    EXPECT_EQ(commit.status(), OpStatus::Ok);
 }
 
 // ============================================================================================================

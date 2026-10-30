@@ -348,6 +348,11 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     // outstanding than the broker's dedup window (the shared protocol constant):
     // a retransmit older than the window could otherwise not be recognised as a
     // duplicate (Kafka caps max.in.flight at 5 for the same reason).
+    cfg_.acks = normalized(cfg_.acks);
+    if (has(cfg_.acks, Acks::View)) {   // a View batch holds at most kMaxJudgedBatchRecords records
+        cfg_.batchRecords = cfg_.batchRecords > 0 ? std::min(cfg_.batchRecords, rune::protocol::client::kMaxJudgedBatchRecords)
+                                                  : rune::protocol::client::kMaxJudgedBatchRecords;
+    }
     constexpr int32_t kWindow = rune::protocol::client::kIdempotentMaxInFlightBatches;
     // N-2: the in-flight ring rounds its capacity up to a power of two and
     // full() bounds the span INCLUDING holes by it — only a power-of-two window
@@ -1075,6 +1080,8 @@ void ProducerImpl::throwForSendResult(SendResult r) {
         throw std::invalid_argument("Producer::send: invalid token or completion queue");
     case SendResult::KeyTooLong:
         throw std::invalid_argument("Producer::send: key is longer than 16 bytes (Key::kMaxInline); a key is never truncated");
+    case SendResult::WriteNotAllowed:
+        throw std::invalid_argument("Producer::send: the write is not allowed on this topic");
     }
 }
 
@@ -1862,7 +1869,7 @@ bool ProducerImpl::encodeAndSend(
     msg.topicId        = ps.topicId;
     msg.partition      = ps.partition;
     msg.partitionKnown = 1;
-    msg.acks           = (cfg_.acks == Acks::All) ? uint8_t{1} : uint8_t{0};  // B2: wire 1=All, 0=Leader/None
+    msg.acks           = ackWireByte_();
     // EOS-DUP: the broker dedups on the FRAME's identity, not the batch header's
     // — carry exactly what was stamped into the header above (acks=None keeps the
     // -1 sentinels: non-idempotent).  Retransmits re-send this frame verbatim.
@@ -2035,7 +2042,7 @@ bool ProducerImpl::encodeAndSendTier2(
     msg.topicId        = entry.topicId;
     msg.partition      = entry.partition;
     msg.partitionKnown = 1;
-    msg.acks           = (cfg_.acks == Acks::All) ? uint8_t{1} : uint8_t{0};  // B2: wire 1=All, 0=Leader/None
+    msg.acks           = ackWireByte_();
     // EOS-DUP: the frame carries the identity patched into the header above.
     if (idempotent) {
         msg.producerId    = ps.producerId;
@@ -2289,6 +2296,14 @@ int ProducerImpl::flushBatches(
                 ps.dirty          = false;
                 ps.flushRequested = false;
             }
+            continue;
+        }
+        // ---- SD11: a View send to a seed broker below kBrokerVersionCheckedWrites is failed locally, nothing is offered.
+        if (viewRefused_()) [[unlikely]] {
+            if (ps.builder && ps.builder->recordCount() > 0) failBuilder_(ps, OpStatus::BrokerTooOld);
+            failQueuedTier2_(ps, OpStatus::BrokerTooOld, 0);
+            ps.dirty          = false;
+            ps.flushRequested = false;
             continue;
         }
         // ---- Tier-1: flush pending auto-batch if triggered -------------------
@@ -3866,6 +3881,8 @@ SendResult ProducerImpl::checkBatchClaim_(const Key& key, uint32_t n, uint32_t r
     if (n > static_cast<uint32_t>(INT32_MAX) || key.size() + recLen > rune::client::Producer::kMaxRecordBytes) {
         return SendResult::MessageTooLarge;
     }
+    if (has(cfg_.acks, Acks::View) && n > static_cast<uint32_t>(rune::protocol::client::kMaxJudgedBatchRecords))
+        return SendResult::MessageTooLarge;
     // A claimBatch is ONE frame: it must fit the hard per-frame wire cap.  With
     // no frame cap (maxFrameBytes == 0) the ring's maxMsgLength still bounds the
     // wire size, so n x (tiny recLen) can never make the duty thread reserve an

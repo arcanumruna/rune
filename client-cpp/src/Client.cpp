@@ -2436,6 +2436,7 @@ void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
     // node while the coordinator lives on a session of its own must not overwrite the coordinator's version
     // (syncCoordinatorSession_ keeps that one current).
     if (coordIdx() == 0) groupConsumerHub_.setBrokerVersion(brokerVersion);
+    producerHub_.setBrokerVersion(brokerVersion);   // SD11: the seed's version gates the View bit
 
     // CG-5: Trigger group consumers to send JoinGroup on connect — only
     // when the SEED (the coordinator's session) connected: a leader
@@ -5004,6 +5005,7 @@ Producer Client::testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap) {
 }
 
 Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool direct) {
+    if (!acksValid(cfg.acks)) throw std::invalid_argument("ProducerConfig: acks View needs Leader or All, and no unknown bits");
     // Phase 2b F: creation validation of a transactional producer.
     if (!cfg.transactionalId.empty()) {
         if (cfg.acks == Acks::None) {

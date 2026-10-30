@@ -47,6 +47,7 @@ void ProducerHub::add(ProducerImpl* impl)
     }
     if (nextBase_.size() <= ord) nextBase_.resize(ord + 1, 0);
     impl->setOrdinal(ord, nextBase_[ord]);  // F2: past every sequence a previous incarnation used
+    impl->setBrokerVersion(brokerVersion_);
     if (nextCoordSeq_.size() <= ord) nextCoordSeq_.resize(ord + 1, 0);
     if (coordSink_.offer != nullptr) {   // Phase 2b F: after the ordinal
         const bool coordinated = impl->enableCoordinator(coordSink_, nextCoordSeq_[ord]);

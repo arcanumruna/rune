@@ -70,6 +70,8 @@ enum class OpStatus : uint8_t {
     DeliveryFailed,  ///< producer: delivery timeout / redirect budget / deferred-buffer full
     ResultTooLarge,  ///< polled form only: variable result > the reservation (value = real size)
     InvalidArgument, ///< the duty thread refused the op as malformed before sending it (payload = why)
+    BrokerTooOld,    ///< checked writes: the seed broker is below kBrokerVersionCheckedWrites, so a View send was
+                     ///< failed locally (nothing was sent)
 };
 
 /// Authentication (codes 44..48, client version 9): the name of an auth-related Completion::errorCode when
@@ -123,6 +125,11 @@ struct Completion {
                                  ///< Client::requestIdOf)
 };
 static_assert(sizeof(Completion) == 40);
+
+/// Checked writes: the constraint id of a rejected Send (reserved0), 0 otherwise.
+[[nodiscard]] constexpr uint32_t constraintIdOf(const Completion& c) noexcept { return c.reserved0; }
+/// Checked writes: the broker-assigned id of a Send (aux), 0 = none.
+[[nodiscard]] constexpr uint64_t assignedKeyOf(const Completion& c) noexcept { return static_cast<uint64_t>(c.aux); }
 
 /// Issue #226: the broker's login retry hint (ms) of a Connect refused AuthenticationFailed (a rate-limited login:
 /// BrokerError, or NotConnected when the hint outlived the connect deadline), else 0.  The typed way to read it:

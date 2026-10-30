@@ -300,6 +300,7 @@ void validateShardGroupConfig(const ShardGroupConfig& g, uint32_t count) {
     if (!g.producer.transactionalId.empty()) {  // Phase 2b F (FD3): same refusal as shardProducerConfig()
         throw std::invalid_argument("ShardGroupConfig: a ClientShard producer cannot have a transactionalId");
     }
+    if (!acksValid(g.producer.acks)) throw std::invalid_argument("ShardGroupConfig: producer acks View needs Leader or All, and no unknown bits");
 
     // Egress: shard i listens on base port + i.  Every port must fit, and none may
     // be the gateway's own endpoint on the same host.
@@ -408,6 +409,7 @@ ProducerConfig shardProducerConfig(const ShardGroupConfig& g) {
     if (!g.producer.transactionalId.empty()) {
         throw std::invalid_argument("ShardGroupConfig: a ClientShard producer cannot have a transactionalId");
     }
+    if (!acksValid(g.producer.acks)) throw std::invalid_argument("ShardGroupConfig: producer acks View needs Leader or All, and no unknown bits");
     ProducerConfig p = g.producer;
     if (g.mode == ShardMode::Invoker) p.lingerUs = g.invokerLingerUs;
     return p;

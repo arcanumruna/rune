@@ -909,6 +909,9 @@ public:
     // The slot pool's app side (free stack + SPSC free-ring consumer) is owned by ONE thread: the
     // thread that created the producer (Invoker mode: the owner thread), or the one that called
     // bindBatchThread().  Every Tier-2 entry compares against it BEFORE touching the pool.
+    /// SD11: the seed broker's version (0 = unknown: sends).  Set from the duty thread on every seed connect.
+    void setBrokerVersion(int32_t v) noexcept { brokerVersion_ = v; }
+    [[nodiscard]] bool viewAcks() const noexcept { return has(cfg_.acks, Acks::View); }
     [[nodiscard]] bool onBatchThread() const noexcept { return std::this_thread::get_id() == t2Thread_; }
     /// Rebind the issuing thread to the caller, before the first batch() from the new thread.  A
     /// builder still live on the old thread is refused there and hands its slot back through the
@@ -1809,6 +1812,18 @@ private:
     void failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode = 0);
     /// #689: fail (never send) every Tier-2 batch queued on ps.
     void failQueuedTier2_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept;
+    /// The Produce `acks` wire byte: bit 0 All, bit 1 View.  A transactional producer never sends View: its sends are
+    /// judged by the commit, and a View ack would wait for the LSO that waits for this very send's ack.
+    [[nodiscard]] uint8_t ackWireByte_() const noexcept {
+        return static_cast<uint8_t>((has(cfg_.acks, Acks::All) ? rune::protocol::client::kAcksWireAll : 0) |
+                                    (viewSent_() ? rune::protocol::client::kAcksWireView : 0));
+    }
+    [[nodiscard]] bool viewSent_() const noexcept { return has(cfg_.acks, Acks::View) && cfg_.transactionalId.empty(); }
+    /// SD11: a known seed broker below the checked-writes version cannot decode the View bit.
+    [[nodiscard]] bool viewRefused_() const noexcept {
+        return viewSent_() && brokerVersion_ >= 1 && brokerVersion_ < rune::protocol::client::kBrokerVersionCheckedWrites;
+    }
+    int32_t brokerVersion_ = 0;
     /// Draining: every accepted record completed and the ring consumed to the
     /// closed tail.
     [[nodiscard]] bool fullyDrained_() const noexcept;
