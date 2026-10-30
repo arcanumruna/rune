@@ -356,8 +356,12 @@ static void BM_WorkerProduceToPushRead_VerdictSource_256B(benchmark::State& stat
     };
     auto send = [&](WorkerOp op) { while (!f.worker->tryEnqueueOp(op)) pump(); for (int i = 0; i < 3; ++i) pump(); };
 
-    const auto src = rune::codec::DescriptorBuilder("t", 1).add("id", rune::codec::PrimType::UInt64, 1, true)
-                         .add("v", rune::codec::PrimType::Int64).add("tag", rune::codec::PrimType::UInt16).build();
+    // 256 B values: the 22 B of id, v, tag, then 29 UInt64 and one UInt16 of padding.
+    rune::codec::DescriptorBuilder srcBuilder("t", 1);
+    srcBuilder.add("id", rune::codec::PrimType::UInt64, 1, true).add("v", rune::codec::PrimType::Int64).add("tag", rune::codec::PrimType::UInt16);
+    for (int i = 0; i < 29; ++i) srcBuilder.add("pad" + std::to_string(i), rune::codec::PrimType::UInt64);
+    srcBuilder.add("padEnd", rune::codec::PrimType::UInt16);
+    const auto src = srcBuilder.build();
     WorkerOp lvl; lvl.type = WorkerOp::Type::ClusterFeatureLevel; lvl.nextOffset = 5; send(lvl);
     WorkerOp sch; sch.type = WorkerOp::Type::SchemaUpdate; sch.topicId = kSrc; sch.clientVersion = 1;
     sch.schemaUpdateBlob = rune::codec::serialize(src); send(sch);
@@ -389,10 +393,11 @@ static void BM_WorkerProduceToPushRead_VerdictSource_256B(benchmark::State& stat
         std::vector<uint8_t> key(8), val;
         ++id;
         for (int i = 0; i < 8; ++i) key[std::size_t(i)] = uint8_t(id >> (8 * i));
-        val.push_back(18); val.push_back(0); val.push_back(1); val.push_back(0);
+        val.push_back(252); val.push_back(0); val.push_back(1); val.push_back(0);   // fixed length 252, version 1
         for (int i = 0; i < 8; ++i) val.push_back(uint8_t(id >> (8 * i)));
         for (int i = 0; i < 8; ++i) val.push_back(uint8_t(id >> (8 * i)));
         val.push_back(1); val.push_back(0);
+        val.resize(256, 0);
         b.append({reinterpret_cast<const char*>(key.data()), key.size()}, {reinterpret_cast<const char*>(val.data()), val.size()}, 0);
         WorkerOp prod;
         prod.type = WorkerOp::Type::Produce;

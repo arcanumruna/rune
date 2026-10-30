@@ -334,7 +334,7 @@ int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
         } else {
             base = std::max(testNextOffset_, judgeCursor_);
             testNextOffset_ = base + 1;
-            appended_.emplace_back(batch.begin(), batch.end());
+            if (captureAppended_) appended_.emplace_back(batch.begin(), batch.end());
         }
         if (base == rune::replication::PartitionReplica::kAppendNotLeader) break;
         if (base < 0) { ++stats_.markerAppendRetries; break; }
@@ -394,7 +394,7 @@ int VerdictSource::requestChange(const ConstraintSet& next, bool refresh) {
     } else {
         base = std::max(testNextOffset_, judgeCursor_);
         testNextOffset_ = base + 1;
-        appended_.emplace_back(batch.begin(), batch.end());
+        if (captureAppended_) appended_.emplace_back(batch.begin(), batch.end());
     }
     if (base < 0) return kChangeDeferred;
     state_->constraintSets.onChange(base, logged);

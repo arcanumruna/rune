@@ -79,6 +79,8 @@ public:
 
     /// With bindLeader(nullptr, ...) appends are captured here instead of reaching a replica.
     [[nodiscard]] std::span<const std::vector<uint8_t>> appendedForTest() const noexcept { return appended_; }
+    /// Without a replica the appended batches are kept for the tests; a bench turns that (an allocation per batch) off.
+    void captureAppendedForTest(bool on) noexcept { captureAppended_ = on; }
     [[nodiscard]] uint64_t judgeCallsForTest() const noexcept { return judgeCalls_; }
     void holdJudgeForTest(bool hold) noexcept { held_ = hold; }
     [[nodiscard]] uint8_t lastIntentForTest() const noexcept { return lastIntent_; }
@@ -138,6 +140,7 @@ private:
     bool                        judgedRecord_ = false;   // a data record is judged and not yet covered by a marker
     uint8_t                     lastIntent_ = 0;
     int64_t                     testNextOffset_ = 0;
+    bool                        captureAppended_ = true;
     VerdictViewHooks            hooks_;
     VerdictSourceStats          stats_;
     std::vector<uint8_t>        scratch_;

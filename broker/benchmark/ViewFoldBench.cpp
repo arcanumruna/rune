@@ -610,7 +610,7 @@ struct VerdictBenchMember {
     VerdictBenchMember(uint32_t id) {
         const rune::codec::Descriptor* s[] = {&src};
         comp = compileView(tagProjectionView(), s, id).value();
-        inst = std::make_unique<rune::node::ViewInstance>(comp.plan, comp.rowLayout, src, false, 0, 1u << 21, 1u << 20);
+        inst = std::make_unique<rune::node::ViewInstance>(comp.plan, comp.rowLayout, src, false, 0, 1u << 21, 32u << 20);
     }
 };
 } // namespace
@@ -651,6 +651,8 @@ static void BM_ViewFoldVerdict(benchmark::State& st) {
         write.constraintSets.onChange(0, set);
         vs.bindState(&write);
         vs.bindLeader(nullptr, 1, 0);
+        vs.captureAppendedForTest(false);
+        int64_t nowNs = 0;
 
         const int64_t end = stream.bound(stream.size() - 1);
         auto readRange = [&](int64_t from, int64_t) {
@@ -658,7 +660,8 @@ static void BM_ViewFoldVerdict(benchmark::State& st) {
             return rune::storage::LogReadView{stream.bytes.data() + stream.byteOffset[j], stream.bytes.size() - stream.byteOffset[j], stream.baseOffset[j], end};
         };
         auto foldOne = [&](size_t i) {
-            vs.driveJudge(readRange, stream.bound(i), 0, write);
+            vs.driveJudge(readRange, stream.bound(i), nowNs += 1'000'000, write);
+            rune::node::verdictOnHw(write, stream.bound(i));
             return FoldStats{};
         };
         auto drainAll = [&] {
