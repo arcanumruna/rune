@@ -1296,5 +1296,5 @@ TEST(CheckedWritesAckSink, AckTermIsNeverBelowTheFloor) {
     EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1", 65536), "aeron:udp?endpoint=h:1|term-length=524288");
     EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1|term-length=64k", 0), "aeron:udp?endpoint=h:1|term-length=524288");
     EXPECT_EQ(withAckTermLength("aeron:udp?term-length=1048576", 65536), "aeron:udp?term-length=1048576");
-    EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1", 0), "aeron:udp?endpoint=h:1");
+    EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1", 0), "aeron:udp?endpoint=h:1|term-length=524288");
 }

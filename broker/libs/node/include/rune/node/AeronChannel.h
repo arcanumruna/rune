@@ -24,12 +24,12 @@ namespace rune::node {
 inline constexpr int32_t kMinAckTermBytes = 512 * 1024;
 
 /// withTermLength for an ack channel: a `term-length` below kMinAckTermBytes (the channel's own or termBytes) is raised to it.
-/// termBytes <= 0 with no explicit value stays the driver default.  Cold path (publication setup).
+/// termBytes <= 0 with no explicit value gets the floor.  Cold path (publication setup).
 [[nodiscard]] inline std::string withAckTermLength(std::string_view channel, int32_t termBytes, int32_t floor = kMinAckTermBytes) {
     constexpr std::string_view key = "term-length=";
     std::string ch(channel);
     const std::size_t at = ch.find(key);
-    if (at == std::string::npos) return withTermLength(ch, termBytes > 0 ? std::max(termBytes, floor) : 0);
+    if (at == std::string::npos) return withTermLength(ch, std::max(termBytes, floor));
     const std::size_t from = at + key.size();
     std::size_t end = from;
     while (end < ch.size() && ch[end] != '|' && ch[end] != '&') ++end;
