@@ -309,6 +309,24 @@ TEST(CheckedWritesVerdictWorkerRegression, RefoldBelowWIgnoresALaterRuleRegressi
     EXPECT_TRUE(r.hasRow(kRej2, 4));
 }
 
+TEST(CheckedWritesVerdictWorkerRegression, DroppedMemberStaysUntilTheJudgeIsPastTheDropRegression) {
+    VerdictRig r(/*follower=*/true);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.installProjection(kProj);
+    r.passes(50);
+    r.followerFetch();
+    ASSERT_EQ(r.produce({{1, 10, 1}, {2, 20, 9}}), 0);   // not replicated yet: the HW lags the drop below
+    r.dropRejectView(kRej);
+    r.passes(20);
+    const int64_t dropAt = r.leo();
+    ASSERT_TRUE(r.driveUntilJudged(dropAt)) << "the judge needs the dropped member to read the records before the drop";
+    const VerdictSource* judge = r.vs->verdictSource(VerdictRig::kSrc, 0);
+    EXPECT_TRUE(judge == nullptr || !judge->hasMember(kObj, tagRule(9).fingerprint())) << "left once a committed marker passed the drop";
+    EXPECT_TRUE(r.hasRow(kProj, 1));
+    EXPECT_FALSE(r.hasRow(kProj, 2)) << "judged with the dropped member";
+}
+
 // ---- Task 8 on the rig: the cleaner against a real Worker, replica and published bounds ----
 
 TEST(CheckedWritesVerdictCleanerRegression, SwapAboveTheVerdictBoundIsNeverInstalledRegression) {

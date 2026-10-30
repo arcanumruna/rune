@@ -61,6 +61,7 @@ inline rune::codec::Descriptor verdictSourceDescriptor() {
 struct Rec { uint64_t id; int64_t v; uint8_t tag = 0; bool del = false; };   ///< del: a tombstone of `id` (empty value)
 
 /// What a consumer received: one record of a delivered batch.
+inline constexpr uint16_t kTombstoneTag = 0xFFFF;   ///< Delivered::tag of a tombstone
 struct Delivered { int64_t offset; uint64_t id; uint16_t tag; };
 enum class SubKind : uint8_t { Raw, Filtered, PushRead };   ///< Filtered: tag == 1
 
@@ -124,6 +125,16 @@ public:
         installs_.push_back([=, this] { installProjectionNow_(viewTopicId, name); });
         installs_.back()();
     }
+    /// count(*) of the records folded per id (a view key is an 8-byte field: the tag cannot group).
+    void installCountById(int32_t viewTopicId, const char* name = "cnt") {
+        installs_.push_back([=, this] { installCountNow_(viewTopicId, name); });
+        installs_.back()();
+    }
+    /// The first installed verdict view goes away (its object leaves the constraint set).
+    void dropRejectView(int32_t viewTopic) {
+        vs->uninstallView(viewTopic);
+        installs_.erase(installs_.begin());
+    }
     /// The reject view `oldTopic` is replaced by `newTopic` (same object, another rule): the old one retires.
     void replaceRejectView(int32_t oldTopic, int32_t newTopic, uint64_t objectId, TestRejectRule rule) {
         vs->uninstallView(oldTopic);
@@ -154,9 +165,12 @@ public:
     /// Another replica takes over: this node's tail above the HW is gone and no memory survives.
     void failover(bool reinstall = true) { restart(reinstall, replica->highWatermark()); }
     void reinstallAll() { for (auto& f : installs_) f(); }
-    void demotePromote() {
+    void demote() {
         replica->becomeFollower(++epoch_, 2);
         passes(3);
+    }
+    void demotePromote() {
+        demote();
         replica->becomeLeader(++epoch_, isr_);
         passes(3);
     }
@@ -174,12 +188,25 @@ private:
         ASSERT_TRUE(comp.has_value());
         vs->installTestVerdictViewForTest(comp->plan, comp->rowLayout, src, persisted, objectId, rule, recovering_);
     }
+    void installCountNow_(int32_t viewTopicId, const char* name) {
+        const auto src = verdictSourceDescriptor();
+        rune::view::ViewPlan v;
+        v.viewName = name; v.key = "id"; v.sources = {{kSrc, "id"}};
+        v.output = {{"id", rune::codec::PrimType::UInt64, 0, "id", rune::view::MergeRule::Replace},
+                    {"n", rune::codec::PrimType::Int64, 0, "", rune::view::MergeRule::CountAll}};
+        v.persistence = 1;
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto comp = rune::view::compileView(v, srcs, viewTopicId);
+        ASSERT_TRUE(comp.has_value());
+        vs->installView(comp->plan, comp->rowLayout, src, /*persisted=*/false);
+    }
     void installProjectionNow_(int32_t viewTopicId, const char* name) {
         const auto src = verdictSourceDescriptor();
         rune::view::ViewPlan v;
         v.viewName = name; v.key = "id"; v.sources = {{kSrc, "id"}};
         v.output = {{"id", rune::codec::PrimType::UInt64, 0, "id", rune::view::MergeRule::Replace},
-                    {"v", rune::codec::PrimType::Int64, 0, "v", rune::view::MergeRule::Replace}};
+                    {"v", rune::codec::PrimType::Int64, 0, "v", rune::view::MergeRule::Replace},
+                    {"tag", rune::codec::PrimType::UInt16, 0, "tag", rune::view::MergeRule::Replace}};
         v.persistence = 1;
         const rune::codec::Descriptor* srcs[] = {&src};
         auto comp = rune::view::compileView(v, srcs, viewTopicId);
@@ -241,6 +268,22 @@ public:
         return vs->getRow(viewTopicId, 0, key, L);
     }
     [[nodiscard]] bool hasRow(int32_t viewTopicId, uint64_t key) const { return row(viewTopicId, key) != nullptr; }
+    /// A row of the projection / verdict view: (v, tag); the verdict views have no tag column (tag = 0).  nullopt = absent.
+    [[nodiscard]] std::optional<std::pair<int64_t, uint16_t>> idRow(int32_t viewTopicId, uint64_t key) const {
+        const rune::view::RowLayout* L = nullptr;
+        const uint8_t* r = vs->getRow(viewTopicId, 0, key, L);
+        if (r == nullptr) return std::nullopt;
+        const auto v = rune::view::readSlot(r, *L, 1);
+        const uint16_t tag = L->slotOffset.size() > 2 ? static_cast<uint16_t>(rune::view::readSlot(r, *L, 2).u) : uint16_t{0};
+        return std::make_pair(v.i, tag);
+    }
+    /// The count(*) view's n for an id; nullopt = no row.
+    [[nodiscard]] std::optional<int64_t> countRow(int32_t viewTopicId, uint64_t id) const {
+        const rune::view::RowLayout* L = nullptr;
+        const uint8_t* r = vs->getRow(viewTopicId, 0, id, L);
+        if (r == nullptr) return std::nullopt;
+        return rune::view::readSlot(r, *L, 1).i;
+    }
     [[nodiscard]] const VerdictSourceStats* stats() const { return worker->verdictStatsForTest(kSrc, 0); }
     [[nodiscard]] int64_t leo() const { return replica->logEndOffset(); }
 
@@ -395,6 +438,17 @@ public:
         if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
         return std::nullopt;
     }
+    /// Like ack(), but the follower fetches along the way (a rig with a follower holds the HW otherwise).
+    std::optional<Ack> ackFetching(int64_t c, int maxPasses = 3000) {
+        for (int i = 0; i < maxPasses; ++i) {
+            if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
+            if (isr_.size() > 1 && i % 8 == 0) followerFetch();
+            pass();
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+        if (const auto it = acksSeen_.find(c); it != acksSeen_.end()) return it->second;
+        return std::nullopt;
+    }
     /// Passes with no waiting for a particular ack (a delay check).
     void settle(int n = 40) { for (int i = 0; i < n; ++i) { pass(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); } }
     [[nodiscard]] bool acked(int64_t c) const { return acksSeen_.count(c) != 0; }
@@ -498,13 +552,13 @@ public:
         for (int i = 0; i < kMaxPass; ++i) {
             const VerdictSource* judge = vs->verdictSource(kSrc, 0);
             const PartitionWriteState* w = writeState();
-            if (judge != nullptr && w != nullptr && judge->judgedThrough() >= target && w->markers.committedThrough() >= target) return true;
+            if ((judge == nullptr || judge->judgedThrough() >= target) && w != nullptr && w->markers.committedThrough() >= target) return true;   // no judge: the last member left
             if (isr_.size() > 1 && i % 8 == 0) followerFetch();
             pass();
         }
         const VerdictSource* judge = vs->verdictSource(kSrc, 0);
         const PartitionWriteState* w = writeState();
-        ADD_FAILURE() << "judgedThrough " << (judge ? judge->judgedThrough() : -9) << " committed " << (w ? w->markers.committedThrough() : -9) << " target " << target << " leo " << leo();
+        ADD_FAILURE() << "judgedThrough " << (judge ? judge->judgedThrough() : -9) << " committed " << (w ? w->markers.committedThrough() : -9) << " target " << target << " leo " << leo() << " hw " << replica->highWatermark() << " stalls " << (stats() ? stats()->verdictStalls : 0) << " waitsInstall " << (stats() ? stats()->judgeWaitsForInstall : 0) << " markers " << (w ? w->markers.appendedThrough() : -9);
         return false;
     }
 
@@ -583,8 +637,13 @@ private:
             if (total <= 0 || pos + static_cast<std::size_t>(total) > len) break;
             box.frames.push_back(Frame{r.baseOffset(), r.recordCount(), r.lastOffsetDelta()});
             (void)rune::protocol::forEachRecordSpan(data + pos, static_cast<std::size_t>(total), [&](const rune::protocol::RecordSpan& rs) {
-                const auto* v = reinterpret_cast<const uint8_t*>(rs.value.data());
                 uint64_t id = 0;
+                if (rs.value.empty()) {   // a tombstone: the key carries the id
+                    for (int i = 0; i < 8; ++i) id |= uint64_t(uint8_t(rs.key[static_cast<std::size_t>(i)])) << (8 * i);
+                    box.records.push_back(Delivered{rs.offset, id, kTombstoneTag});
+                    return;
+                }
+                const auto* v = reinterpret_cast<const uint8_t*>(rs.value.data());
                 for (int i = 0; i < 8; ++i) id |= uint64_t(v[4 + i]) << (8 * i);
                 box.records.push_back(Delivered{rs.offset, id, static_cast<uint16_t>(v[20] | (v[21] << 8))});
             });

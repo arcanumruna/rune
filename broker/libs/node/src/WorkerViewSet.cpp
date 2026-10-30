@@ -849,7 +849,7 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
             if (tpl.retiring) {
                 const bool inLogged = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
                 const bool wasLogged = std::any_of(logged.members.begin(), logged.members.begin() + logged.count, [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
-                if (!inLogged && !wasLogged) retiredQueue_.emplace_back(tpl.verdictObjectId, tpl.verdictFingerprint);   // never joined a set
+                if (!inLogged && !wasLogged && !judge.hasMember(tpl.verdictObjectId, tpl.verdictFingerprint)) retiredQueue_.emplace_back(tpl.verdictObjectId, tpl.verdictFingerprint);   // never joined a set
                 continue;
             }
             const bool present = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
