@@ -246,3 +246,42 @@ TEST(CheckedWritesVerdictAckRigRegression, ReplayNotYetCommittedKeepsTheAcksBehi
     const auto at = [&](int64_t c) { return std::find(order.begin(), order.end(), c) - order.begin(); };
     EXPECT_LT(at(replay), at(fresh));
 }
+
+TEST_F(CheckedWritesVerdictAckRegression, LeaderWithoutTheInstallParksTheViewAckRegression) {
+    r.restart(/*reinstall=*/false);
+    const int64_t c = r.produceFrame({{1, 1, 1}, {2, 2, 9}}, kAcksView);
+    r.settle(300);
+    EXPECT_FALSE(r.acked(c)) << "no ack while the judge waits for the install";
+    const VerdictSource* judge = r.vs->verdictSource(VerdictRig::kSrc, 0);
+    ASSERT_NE(judge, nullptr);
+    EXPECT_TRUE(judge->waitingForInstall());
+    r.reinstallAll();
+    const auto a = r.ack(c, 3000);
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    EXPECT_EQ(a->verdicts, (V{{1, kCode, kCid}}));
+}
+
+TEST_F(CheckedWritesVerdictAck, LeaderLossWhileParkedIsNotLeader) {
+    r.vs->verdictSource(VerdictRig::kSrc, 0)->holdJudgeForTest(true);
+    const int64_t c = r.produceFrame({{1, 1, 1}}, kAcksView);
+    r.settle(200);
+    ASSERT_FALSE(r.acked(c));
+    r.demote();
+    const auto a = r.ack(c);
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader));
+    EXPECT_FALSE(a->hasVerdicts);
+}
+
+TEST_F(CheckedWritesVerdictAck, DeadlineIsInternal) {
+    r.worker->setAckTimeoutNs(50 * kMs);
+    r.vs->verdictSource(VerdictRig::kSrc, 0)->holdJudgeForTest(true);
+    const int64_t c = r.produceFrame({{1, 1, 1}}, kAcksView);
+    r.settle(30);
+    EXPECT_FALSE(r.acked(c)) << "before the deadline";
+    const auto a = r.ack(c);
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal));
+    EXPECT_FALSE(a->hasVerdicts);
+}
