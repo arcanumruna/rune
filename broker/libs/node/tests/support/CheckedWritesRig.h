@@ -486,54 +486,7 @@ public:
     struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; };
 
     /// Every data record, change record and marker below `through`, in offset order, straight from the segments.
-    [[nodiscard]] RigLog readLog(int64_t through = INT64_MAX) const {
-        namespace crl = rune::storage::control_record;
-        RigLog out;
-        for (int64_t off = log->logStartOffset(); off < std::min<int64_t>(leo(), through);) {
-            const auto v = log->readView(off, 1 << 20);
-            if (v.empty()) {   // a compacted gap: continue at the next segment
-                const auto bases = log->segmentBaseOffsets();
-                const auto next = std::upper_bound(bases.begin(), bases.end(), off);
-                if (next == bases.end()) break;
-                off = *next;
-                continue;
-            }
-            for (std::size_t p = 0; p + 12 <= v.len;) {
-                int32_t blen = 0;
-                std::memcpy(&blen, v.data + p + 8, 4);
-                const std::size_t total = 12 + static_cast<std::size_t>(blen);
-                if (p + total > v.len) break;
-                const uint8_t* b = v.data + p;
-                rune::protocol::RecordBatchReader r(b, total);
-                if ((r.attributes() & rune::protocol::batch::kAttrControl) == 0) {
-                    (void)rune::protocol::forEachRecordSpan(b, total, [&](const rune::protocol::RecordSpan& rs) {
-                        if (rs.offset >= through) return;
-                        uint64_t id = 0;
-                        for (int i = 0; i < 8; ++i) id |= uint64_t(uint8_t(rs.key[static_cast<std::size_t>(i)])) << (8 * i);
-                        if (rs.value.empty()) { out.data.push_back({rs.offset, id, 0, 0, true}); return; }
-                        const auto* val = reinterpret_cast<const uint8_t*>(rs.value.data());
-                        uint64_t x = 0;
-                        for (int i = 0; i < 8; ++i) x |= uint64_t(val[12 + i]) << (8 * i);
-                        out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[20]), false});
-                    });
-                } else if (r.baseOffset() < through) {
-                    const int t = crl::recordType(b, total);
-                    if (t == crl::kConstraintSetChange) {
-                        std::array<crl::ChangeMember, 32> ms{};
-                        uint32_t setId = 0; uint16_t n = 0;
-                        if (crl::parseConstraintSetChange(b, total, setId, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n)});
-                    } else if (t == crl::kVerdictMarker) {
-                        RigMarker m{r.baseOffset(), *crl::parseMarkerHeader(b, total), {}, r.hasDeleteHorizon()};
-                        (void)crl::forEachMarkerEntry(b, total, [&](int64_t o, uint16_t c, uint32_t cid) { m.entries.emplace_back(o, c, cid); });
-                        out.markers.push_back(std::move(m));
-                    }
-                }
-                p += total;
-            }
-            off = v.nextOffset;
-        }
-        return out;
-    }
+    [[nodiscard]] RigLog readLog(int64_t through = INT64_MAX) const;
 
     [[nodiscard]] const PartitionWriteState* writeState() const { return worker->writeStateForTest(kSrc, 0); }
 
@@ -716,5 +669,58 @@ private:
     std::filesystem::path viewDir_, logDir_;
     NullPartitionTransport transport_;
 };
+
+/// Every data record, change record and marker of `log` below `through`, in offset order (the log's own thread reads it).
+inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = INT64_MAX) {
+    const int64_t leo = log.logEndOffset();
+    namespace crl = rune::storage::control_record;
+    VerdictRig::RigLog out;
+    for (int64_t off = log.logStartOffset(); off < std::min<int64_t>(leo, through);) {
+        const auto v = log.readView(off, 1 << 20);
+        if (v.empty()) {   // a compacted gap: continue at the next segment
+            const auto bases = log.segmentBaseOffsets();
+            const auto next = std::upper_bound(bases.begin(), bases.end(), off);
+            if (next == bases.end()) break;
+            off = *next;
+            continue;
+        }
+        for (std::size_t p = 0; p + 12 <= v.len;) {
+            int32_t blen = 0;
+            std::memcpy(&blen, v.data + p + 8, 4);
+            const std::size_t total = 12 + static_cast<std::size_t>(blen);
+            if (p + total > v.len) break;
+            const uint8_t* b = v.data + p;
+            rune::protocol::RecordBatchReader r(b, total);
+            if ((r.attributes() & rune::protocol::batch::kAttrControl) == 0) {
+                (void)rune::protocol::forEachRecordSpan(b, total, [&](const rune::protocol::RecordSpan& rs) {
+                    if (rs.offset >= through) return;
+                    uint64_t id = 0;
+                    for (int i = 0; i < 8; ++i) id |= uint64_t(uint8_t(rs.key[static_cast<std::size_t>(i)])) << (8 * i);
+                    if (rs.value.empty()) { out.data.push_back({rs.offset, id, 0, 0, true}); return; }
+                    const auto* val = reinterpret_cast<const uint8_t*>(rs.value.data());
+                    uint64_t x = 0;
+                    for (int i = 0; i < 8; ++i) x |= uint64_t(val[12 + i]) << (8 * i);
+                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[20]), false});
+                });
+            } else if (r.baseOffset() < through) {
+                const int t = crl::recordType(b, total);
+                if (t == crl::kConstraintSetChange) {
+                    std::array<crl::ChangeMember, 32> ms{};
+                    uint32_t setId = 0; uint16_t n = 0;
+                    if (crl::parseConstraintSetChange(b, total, setId, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n)});
+                } else if (t == crl::kVerdictMarker) {
+                    VerdictRig::RigMarker m{r.baseOffset(), *crl::parseMarkerHeader(b, total), {}, r.hasDeleteHorizon()};
+                    (void)crl::forEachMarkerEntry(b, total, [&](int64_t o, uint16_t c, uint32_t cid) { m.entries.emplace_back(o, c, cid); });
+                    out.markers.push_back(std::move(m));
+                }
+            }
+            p += total;
+        }
+        off = v.nextOffset;
+    }
+    return out;
+}
+
+inline VerdictRig::RigLog VerdictRig::readLog(int64_t through) const { return readLogOf(*log, through); }
 
 }  // namespace rune::node::cw

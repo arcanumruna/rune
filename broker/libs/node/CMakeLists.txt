@@ -1891,6 +1891,13 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_client_broker_tests TEST_FILTER "-${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
                              PROPERTIES TIMEOUT 600)
 
+        # Checked writes Part 04 Task 11: the seeded verdict stress on three real brokers (each seed is one ctest case).
+        add_executable(rune_checked_writes_stress_tests tests/integration/CheckedWritesStressTest.cpp)
+        target_include_directories(rune_checked_writes_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_checked_writes_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_checked_writes_stress_tests PROPERTIES TIMEOUT 1800)
+
         # Namespaces Task 11: the REAL client namespace API and the REAL `rune namespace` / `rune ql` CLI against ONE
         # real authenticating BrokerNode.
         add_executable(rune_namespace_client_tests tests/client/NamespaceClientTest.cpp)
