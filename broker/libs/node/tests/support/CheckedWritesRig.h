@@ -526,8 +526,17 @@ public:
         }
         const VerdictSource* judge = vs->verdictSource(kSrc, 0);
         const PartitionWriteState* w = writeState();
-        ADD_FAILURE() << "judgedThrough " << (judge ? judge->judgedThrough() : -9) << " committed " << (w ? w->markers.committedThrough() : -9) << " target " << target << " leo " << leo() << " hw " << replica->highWatermark() << " stalls " << (stats() ? stats()->verdictStalls : 0) << " waitsInstall " << (stats() ? stats()->judgeWaitsForInstall : 0) << " markers " << (w ? w->markers.appendedThrough() : -9);
+        ADD_FAILURE() << "judgedThrough " << (judge ? judge->judgedThrough() : -9) << " committed " << (w ? w->markers.committedThrough() : -9) << " target " << target << " leo " << leo() << " hw " << replica->highWatermark() << " waiting " << (judge ? judge->waitingForInstall() : -1) << " stalled " << (judge ? judge->stalled() : -1) << " stalls " << (stats() ? stats()->verdictStalls : 0) << " waitsInstall " << (stats() ? stats()->judgeWaitsForInstall : 0) << " markers " << (w ? w->markers.appendedThrough() : -9);
         return false;
+    }
+
+    /// Drives until the view's instance folded through `target` (and serves).
+    void driveUntilFolded(int32_t viewTopicId, int64_t target) {
+        for (;;) {
+            const auto st = vs->instanceServeState(viewTopicId, 0);
+            if (st.hosted && st.ready && st.foldCursor >= target) return;
+            pass();
+        }
     }
 
     // ---- compaction ----
