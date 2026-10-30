@@ -607,14 +607,16 @@ void expectViewSendWaitsForTheTransaction(const char* tag, rc::Acks viewAcks) {
     tx.prod->commitTransactionAndWait(30s);
     EXPECT_TRUE(isOk(view.await(tok, 5s)));
 
-    rc::Client& reader = *b.connectClient();
+    // Read-your-writes is the point of View: the first read the broker serves after the ack sees the row.  Only a read
+    // that never reached the leader (client-side kNotLeader) is retried; NotReady or AbsentKey fail.
     rc::ViewRowResult row;
-    for (const auto deadline = Clock::now() + 10s; Clock::now() < deadline;) {
-        row = reader.getViewRowAndWait(f.viewTopicId, 3, 0, 10s);
-        if (row.status == rc::ViewRowResult::kOk) break;
+    for (int i = 0; i < 20; ++i) {
+        row = view.client->getViewRowAndWait(f.viewTopicId, 3, 0, 10s);
+        if (row.status != rc::ViewRowResult::kNotLeader) break;
         std::this_thread::sleep_for(50ms);
     }
     EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "the acked record is already in the view";
+    EXPECT_FALSE(row.rowBytes.empty());
 }
 
 }  // namespace
