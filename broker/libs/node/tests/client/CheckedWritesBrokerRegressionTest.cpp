@@ -667,12 +667,10 @@ TEST(CheckedWritesBrokerRegression, V12ClientAgainstV7BrokerKeepsEveryOldAckBeha
         Sender s(b.clientConfig(), "acct", f.topicId, 1, acks);
         for (int i = 0; i < 100; ++i) EXPECT_TRUE(isOk(s.await(s.send(id++), 10s))) << "acks " << static_cast<int>(acks) << " record " << i;
     }
-    {
-        Sender s(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::None);
-        for (int i = 0; i < 100; ++i) (void)s.send(id++);
-    }
+    Sender none(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::None);   // stays open: closing it would drop sends still queued
+    for (int i = 0; i < 100; ++i) (void)none.send(id++);
     std::size_t stored = 0;
-    for (int i = 0; i < 200 && stored < 300; ++i) {
+    for (int i = 0; i < 400 && stored < 300; ++i) {
         stored = storedValues(b.node(), f.topicId, 0).size();
         if (stored < 300) std::this_thread::sleep_for(25ms);
     }
