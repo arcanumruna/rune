@@ -24,7 +24,9 @@ if(BUILD_TESTING)
         tests/view/AggStateTest.cpp
         tests/view/AggFoldTest.cpp
         tests/view/AggRetractableTest.cpp
-        tests/view/PlanSourcesTest.cpp)
+        tests/view/PlanSourcesTest.cpp
+        tests/view/LegacyFoldReference.cpp
+        tests/view/CheckedWritesPrepareApplyTest.cpp)
     target_link_libraries(rune_view_tests PRIVATE rune_view rune_codec GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_view_tests)

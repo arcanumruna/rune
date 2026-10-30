@@ -135,7 +135,7 @@ struct ViewRig {
         rig.worker().setViewSet(&vs);
         auto rd = [&](int64_t f, int64_t t) { return log.read(f, t); };
         for (int i = 0; i < 2; ++i)
-            (void)vs.driveFolds(1, 0, rd, log.end, rv::kNoAbortedTxns, 0, nullptr, rig.rep->leadershipGeneration(), true,
+            (void)vs.driveFolds(1, 0, rd, log.end, rv::kNoSkip, 0, nullptr, rig.rep->leadershipGeneration(), true,
                                 rune::node::NsTag{kSlot, kNs});
     }
     void enqueueRead(int i) {

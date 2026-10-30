@@ -394,7 +394,7 @@ public:
     // the loop is driven under a hard cap by the caller, never `while(!ready)`.
     template <class ReadRangeFn>
     int driveRebuild(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
-                     int64_t committedTail, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
+                     int64_t committedTail, const rune::view::FoldSkip& skip, int64_t nowNs,
                      const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
                      bool leaderHwConfirmed = true, NsTag ns = {}) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
@@ -407,7 +407,7 @@ public:
             ViewInstance& inst = vit->second;
             adoptNs_(inst, ns);
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
-            work += driveView_(inst, readRange, committedTail, aborted, transientSrc, leaderGen, leaderHwConfirmed);
+            work += driveView_(inst, readRange, committedTail, skip, transientSrc, leaderGen, leaderHwConfirmed);
             if (inst.foldCursor >= committedTail) {
                 // N-C1: Ready only once the leader's HW reached its leadership start offset; else CatchingUp
                 // (never left RebuildingViews: that state gates elections).
@@ -454,7 +454,7 @@ public:
     // pushed/held this pass (0 == genuinely no work).
     template <class ReadRangeFn>
     int driveFolds(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
-                   int64_t bound, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
+                   int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                    const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
                      bool leaderHwConfirmed = true, NsTag ns = {}) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
@@ -468,7 +468,7 @@ public:
             ViewInstance* inst = getOrCreate_(viewTopicId, partition, bound);
             if (inst == nullptr) continue;  // defensive: template must exist
             adoptNs_(*inst, ns);
-            work += driveView_(*inst, readRange, bound, aborted, transientSrc, leaderGen, leaderHwConfirmed);
+            work += driveView_(*inst, readRange, bound, skip, transientSrc, leaderGen, leaderHwConfirmed);
         }
         return work;
     }
@@ -733,7 +733,7 @@ private:
     // progress count for the instance.
     template <class ReadRangeFn>
     int driveView_(ViewInstance& inst, ReadRangeFn&& readRange, int64_t bound,
-                   const rune::view::AbortedTxnFilter& aborted,
+                   const rune::view::FoldSkip& skip,
                    const TransientBounds* transientSrc, uint64_t leaderGen, bool leaderHwConfirmed) {
         int work = 0;
         // 00. Task 12 (D26): the namespace is over its view-memory limit -> pause at foldCursor (reads answer
@@ -804,9 +804,9 @@ private:
             inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout,
                                                       inst.vdc, inst.table, inst.agg->contributors,
                                                       inst.agg->groups, inst.agg->blocksOrNull(), view,
-                                                      passBound, cursor, aborted)
+                                                      passBound, cursor, skip)
                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view,
-                                             passBound, cursor, aborted);
+                                             passBound, cursor, skip);
         inst.foldCursor = cursor;
         chargeMem_(inst);   // Task 12: the pass may have appended chunks
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted +

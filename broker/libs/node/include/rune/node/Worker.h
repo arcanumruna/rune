@@ -6880,7 +6880,7 @@ private:
             // batches of the aborted ones by this partition's aborted index (the
             // read_committed fetch's own predicate) on every path — steady folds,
             // restart rebuilds, transient sources, capped passes.
-            const rune::view::AbortedTxnFilter aborted = rcAbortedFilter_(*rcState);
+            const rune::view::FoldSkip skip{.aborted = rcAbortedFilter_(*rcState)};
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
             // N-C1: right after an election the HW floor can lag what the old leader had committed; a table is
             // Ready under this leadership only once HW has reached the leadership's start offset.
@@ -6891,7 +6891,7 @@ private:
                 auto readRange = [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 };
-                work += driveViewsOf_(topicId, partition, readRange, bound, aborted, nowNs, nullptr,
+                work += driveViewsOf_(topicId, partition, readRange, bound, skip, nowNs, nullptr,
                                       replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()});
             } else {
                 // Phase 2b E: a TRANSIENT source — zero-copy view into the
@@ -6902,7 +6902,7 @@ private:
                 auto readRange = [mem](int64_t from, int64_t /*to*/) -> rune::storage::LogReadView {
                     return mem->readView(from, kPushMaxChunkBytes);
                 };
-                work += driveViewsOf_(topicId, partition, readRange, bound, aborted, nowNs, replica,
+                work += driveViewsOf_(topicId, partition, readRange, bound, skip, nowNs, replica,
                                       replica->leadershipGeneration(), hwConfirmed);
             }
         }
@@ -6930,7 +6930,7 @@ private:
     // are gated on hasRecovery() — a broker with no durable views runs neither.
     template <class ReadRangeFn>
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
-                      int64_t bound, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
+                      int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                       const rune::replication::PartitionReplica* transientRep,
                       uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns = {}) {
         int work = 0;
@@ -6947,10 +6947,10 @@ private:
         }
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
-            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, aborted, nowNs, tbp, leaderGen,
+            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
                                            leaderHwConfirmed, ns);
         }
-        work += viewSet_->driveFolds(topicId, partition, readRange, bound, aborted, nowNs, tbp, leaderGen,
+        work += viewSet_->driveFolds(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
                                      leaderHwConfirmed, ns);
         return work;
     }

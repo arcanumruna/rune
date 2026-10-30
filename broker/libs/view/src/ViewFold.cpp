@@ -109,18 +109,71 @@ bool decodeWireKey(std::string_view key, PrimType keyType, uint64_t& outKey) noe
     }
 }
 
+// Resolves the writer version of `value` and returns its materialized descriptor.
+inline const Descriptor& writerOf(VersionDescriptorCache& vdc, std::string_view value) {
+    const uint16_t writerVersion =
+        value.size() >= 4
+            ? static_cast<uint16_t>(static_cast<uint8_t>(value[2]) | (static_cast<uint8_t>(value[3]) << 8))
+            : vdc.defaultVersion();
+    return vdc.materializedFor(writerVersion);
+}
+
+// The key's own output column is decoded from the value and written like any other field -- it is a
+// display/projection column, not the merge identity.
+inline void writeProjectionRow(const CompiledViewPlan& plan, const RowLayout& layout, const Descriptor& d,
+                               std::string_view value, uint8_t* row) noexcept {
+    for (const auto& f : plan.output) {
+        const FieldValue in = readField(d, asBytes(value), f.srcFieldId);
+        writeSlot(row, layout, f.outSlot, in);
+    }
+}
+
 } // namespace
+
+PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept {
+    p.clear();
+    uint64_t k = 0;
+    if (!decodeWireKey(rec.key, f.keyType, k)) {
+        p.stats.skippedMalformed = 1;
+        return PrepareStatus::Malformed;
+    }
+    ProspectRow& r = p.rows[0];
+    r.key     = ViewKey::fromU64(k);
+    p.rowCount = 1;
+    const uint8_t* cur = f.table.get(k);
+    r.existed = cur != nullptr;
+    if (rec.value.empty()) {
+        p.op      = ProspectOp::Erase;
+        r.removed = true;
+        p.stats.deleted = 1;
+        return PrepareStatus::Ok;
+    }
+    p.op    = ProspectOp::Upsert;
+    p.stats.applied = 1;
+    r.image = p.scratch.data();
+    if (cur != nullptr) std::memcpy(r.image, cur, p.rowLen); else std::memset(r.image, 0, p.rowLen);
+    const Descriptor& d = rec.writer != nullptr ? *rec.writer : writerOf(f.vdc, rec.value);
+    writeProjectionRow(f.plan, f.layout, d, rec.value, r.image);
+    return PrepareStatus::Ok;
+}
+
+void applyProjection(ProjectionFold& f, const SourceRecord&, const Prospect& p) noexcept {
+    if (p.op == ProspectOp::None) return;
+    const uint64_t k = p.rows[0].key.asU64();
+    if (p.op == ProspectOp::Erase) f.table.erase(k);
+    else std::memcpy(f.table.put(k), p.rows[0].image, p.rowLen);
+}
 
 FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                      VersionDescriptorCache& vdc, ViewTable& table,
                      const rune::storage::LogReadView& view, int64_t bound,
-                     int64_t& cursor, const AbortedTxnFilter& aborted) {
+                     int64_t& cursor, const FoldSkip& skip) {
     FoldStats stats{};
     const PrimType keyType = resolveKeyType(plan);
     // Resume point: a LogReadView is WHOLE batches, so when the caller's cursor
     // sits mid-batch (a capped pass stopped there) the batch's records below it
     // were already folded and must not be re-applied.
-    const AbortedTxnFilter abortedTxns = aborted;   // #537: by value (see AbortedTxnFilter::skips)
+    const FoldSkip foldSkip = skip;   // #537: by value (see AbortedTxnFilter::skips)
     const int64_t from = cursor;
     bool stopped = false;
     bool corrupt = false;
@@ -146,7 +199,7 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
             walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
             continue;
         }
-        if (abortedTxns.skips(r, attrs)) [[unlikely]] {
+        if (isAbortedBatch(foldSkip, r, attrs)) [[unlikely]] {
             // #537: an aborted transaction's batch is never applied.  Below the
             // bound it is consumed whole, like a control batch; a batch the
             // bound cuts (a capped pass) stops the walk exactly as a record
@@ -170,6 +223,10 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
             if (offset < from) {
                 return; // already folded by a previous (mid-batch-stopped) pass
             }
+            if (isRejectedRecord(foldSkip, offset)) [[unlikely]] {
+                ++stats.skippedRejected;   // the judge rejected it: no view ever applies it
+                return;
+            }
 
             uint64_t k = 0;
             if (!decodeWireKey(key, keyType, k)) {
@@ -184,21 +241,8 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                 return;
             }
 
-            const uint16_t writerVersion =
-                value.size() >= 4
-                    ? static_cast<uint16_t>(static_cast<uint8_t>(value[2]) |
-                                             (static_cast<uint8_t>(value[3]) << 8))
-                    : vdc.defaultVersion();
-            const Descriptor& d = vdc.materializedFor(writerVersion);
-
-            uint8_t* row = table.put(k);
-            for (const auto& f : plan.output) {
-                // The key's own output column is still decoded from the
-                // value and written here like any other field -- it is a
-                // display/projection column, not the merge identity.
-                const FieldValue in = readField(d, asBytes(value), f.srcFieldId);
-                writeSlot(row, layout, f.outSlot, in);
-            }
+            const Descriptor& d = writerOf(vdc, value);
+            writeProjectionRow(plan, layout, d, value, table.put(k));
             ++stats.applied;
         });
 

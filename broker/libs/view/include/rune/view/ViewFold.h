@@ -9,6 +9,9 @@
 #include <rune/codec/Evolve.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/LogReadView.h>
+#include <rune/view/FoldSkip.h>
+#include <rune/view/FoldStats.h>
+#include <rune/view/RecordFold.h>
 #include <rune/view/ViewPlan.h>
 #include <rune/view/ViewRow.h>
 #include <rune/view/ViewTable.h>
@@ -48,62 +51,10 @@ private:
     std::unordered_map<uint16_t, rune::codec::Descriptor> cache_;
 };
 
-// Issue #537: the source partition's aborted-transaction predicate, handed to
-// every fold.  A view folds only COMMITTED data: the caller's `bound` (the
-// partition's LSO) keeps every open transaction out, and this predicate keeps
-// out every batch of an ABORTED one — the same rule the read_committed fetch
-// and the log cleaner apply (AbortedTxnIndex::isAborted(producerId, baseOffset)
-// over the owning worker's RcState).  A plain function pointer + context (no
-// std::function, no virtual): called once per TRANSACTIONAL batch only — a
-// non-transactional batch costs one attribute-bit test.  `fn == nullptr` means
-// the source holds no aborted transaction (kNoAbortedTxns: plain-data unit
-// tests and benches; the worker always passes its partition's index).
-struct AbortedTxnFilter {
-    using Fn = bool (*)(const void* ctx, int64_t producerId, int64_t baseOffset) noexcept;
-    Fn          fn  = nullptr;
-    const void* ctx = nullptr;
-
-    // True when `r` (attributes `attrs`, already read by the caller) is a data
-    // batch of an aborted transaction.  Callers copy the filter by value into
-    // the walk (two words): no reload through a reference the table writes may alias.
-    [[nodiscard]] bool skips(const rune::protocol::RecordBatchReader& r, int16_t attrs) const noexcept {
-        if ((attrs & rune::protocol::batch::kAttrTransactional) == 0 || fn == nullptr) [[likely]] return false;
-        const int64_t pid = r.producerId();
-        return pid >= 0 && fn(ctx, pid, r.baseOffset());
-    }
-};
-inline constexpr AbortedTxnFilter kNoAbortedTxns{};
-
-struct FoldStats {
-    uint64_t applied          = 0;
-    uint64_t deleted          = 0;
-    uint64_t skippedControl   = 0;
-    // #537: data batches of aborted transactions skipped whole (never applied).
-    uint64_t skippedAborted   = 0;
-    // A record whose WIRE key is not exactly the view key column's byte
-    // width (e.g. a truncated/corrupt producer-side key). Never silently
-    // zero-padded -- counted and skipped instead, so a malformed key is
-    // observable rather than silently mis-keying a row.
-    uint64_t skippedMalformed = 0;
-    // Phase 2a aggregate views: a live record whose group-by value is absent
-    // (its old contribution, if any, is retracted; nothing is added).
-    uint64_t skippedNoGroup   = 0;
-    // Output values written NULL because a Sum did not fit its type (never
-    // wrapped). Counted per emit, not per overflow event.
-    uint64_t aggOverflow      = 0;
-    uint64_t aggNonFinite     = 0;  // a NaN/+-Inf Float aggregate input was treated as NULL (counted per Float input)
-    // A retraction found missing/zero state (group row absent or a count already
-    // 0): counted and skipped with no mutation, never masked.
-    uint64_t aggInconsistent  = 0;
-    // Phase 2b: Min/Max caches rebuilt by one scan of the group's value block
-    // (the cached extreme was retracted) -- the known O(group size) path.
-    uint64_t aggRescans       = 0;
-};
-
 // Folds every COMMITTED record (offset < bound) in `view` -- a LogReadView
 // over whole batches -- into `table`, per `plan`/`layout`. Control batches
 // are skipped (counted in skippedControl), and so is every data batch of an
-// aborted transaction (`aborted`, #537; counted in skippedAborted). Merge-key model: the row's
+// aborted transaction (`skip.aborted`, #537; counted in skippedAborted). Merge-key model: the row's
 // identity (table `put`/`erase` key) is the record's WIRE/compaction key --
 // the same bytes the log's own compaction (OffsetMap) already keys "one
 // current row per key" on -- NEVER the value's key-field. The value's
@@ -121,6 +72,20 @@ struct FoldStats {
 FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                      VersionDescriptorCache& vdc, ViewTable& table,
                      const rune::storage::LogReadView& view, int64_t bound,
-                     int64_t& cursor, const AbortedTxnFilter& aborted);
+                     int64_t& cursor, const FoldSkip& skip);
+
+// A projection view's fold inputs, built once per ViewInstance.
+struct ProjectionFold {
+    const CompiledViewPlan&  plan;
+    const RowLayout&         layout;
+    VersionDescriptorCache&  vdc;
+    ViewTable&               table;
+    rune::codec::PrimType    keyType;
+};
+
+// Computes the record's prospective row into `p` without touching the table.
+[[nodiscard]] PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept;
+// Commits a prepared record.
+void applyProjection(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept;
 
 } // namespace rune::view

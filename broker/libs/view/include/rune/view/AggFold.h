@@ -23,13 +23,30 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layo
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
                              ViewTable* blocks, const rune::storage::LogReadView& lv,
-                             int64_t bound, int64_t& cursor, const AbortedTxnFilter& aborted);
+                             int64_t bound, int64_t& cursor, const FoldSkip& skip);
 
 // 2a and Last-only layouts (no value block): blocks = nullptr.
 FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
                              const rune::storage::LogReadView& lv, int64_t bound,
-                             int64_t& cursor, const AbortedTxnFilter& aborted);
+                             int64_t& cursor, const FoldSkip& skip);
+
+// An aggregate view's fold inputs, built once per ViewInstance.  `blocks` is nullptr iff agg.numBlockCols == 0.
+struct AggregateFold {
+    const CompiledViewPlan&  plan;
+    const RowLayout&         layout;
+    const AggLayout&         agg;
+    VersionDescriptorCache&  vdc;
+    ViewTable&               view;
+    ViewTable&               contributors;
+    ViewTable&               groups;
+    ViewTable*               blocks;
+};
+
+// Computes the record's prospective group rows into `p` (rows[0] the new group, rows[1] the old group of a Move)
+// without touching a table; CapacityExhausted when the overlay's fixed slots run out.
+[[nodiscard]] PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospect& p) noexcept;
+void applyAggregate(AggregateFold& f, const SourceRecord& rec, const Prospect& p) noexcept;
 
 } // namespace rune::view
