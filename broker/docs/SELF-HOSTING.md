@@ -426,7 +426,7 @@ before a produce is acknowledged but is **never written to disk**.
   `transientSourceResets`): from the point where the ring's content changed, when it changed once since
   the view last folded; from the oldest held record when the ring was recreated or changed more than
   once. Records evicted before the view folded them are counted as `transientRecordsEvicted`.
-  A restarted view counts one `transientSourceResets` instead.
+  A persisted view restarted from a checkpoint counts one `transientSourceResets`, not `transientRecordsEvicted`.
 - **Upgrade brokers before clients.** A new client defining a transient topic against an older
   broker silently gets a disk topic, because the older broker ignores the persistence byte.
 
