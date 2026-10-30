@@ -27,6 +27,7 @@ add_library(rune_node
     src/CatalogEffectFrames.cpp
     src/ViewSnapshotIoAgent.cpp
     src/WorkerViewSet.cpp
+    src/CheckedWriteHook.cpp
     src/TopicDirReconcile.cpp)
 
 # The worker's io backends, as their own leaf library: Worker.h's header-inline
@@ -808,6 +809,7 @@ if(BUILD_TESTING)
     add_executable(rune_checked_writes_tests
         tests/node/CheckedWritesFeatureLevelTest.cpp
         tests/node/CheckedWritesWriteStateTest.cpp
+        tests/node/CheckedWritesHookTest.cpp
         tests/node/CheckedWritesValidationMatrixTest.cpp
         tests/node/CheckedWritesWorkerTest.cpp
         tests/node/CheckedWritesSpecFanoutTest.cpp
