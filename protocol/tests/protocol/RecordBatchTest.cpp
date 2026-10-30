@@ -1078,3 +1078,24 @@ TEST(RecordBatchAdversarialRegression, LegitimateShapesStayValidRegression) {
         EXPECT_TRUE(rune::protocol::RecordBatchReader(two.data(), two.size()).ensureValid());
     }
 }
+
+// ── Checked writes Part 03: record intent bits ──
+namespace rr = rune::protocol::record;
+
+TEST(CheckedWritesRecordAttributes, IntentOfMasksBitsZeroAndOne) {
+    EXPECT_EQ(rr::intentOf(0), 0);
+    EXPECT_EQ(rr::intentOf(1), 1);
+    EXPECT_EQ(rr::intentOf(2), 2);
+    EXPECT_EQ(rr::intentOf(3), 3);
+    EXPECT_EQ(rr::intentOf(0xFD), 1);
+    static_assert((rr::kAttrIntentMask | rr::kAttrReservedMask) == 0xFF && (rr::kAttrIntentMask & rr::kAttrReservedMask) == 0);
+    static_assert(static_cast<uint8_t>(rr::Intent::Upsert) == 0 && static_cast<uint8_t>(rr::Intent::Insert) == 1 &&
+                  static_cast<uint8_t>(rr::Intent::Existing) == 2);
+}
+
+TEST(CheckedWritesRecordAttributesRegression, DefaultAppendIsByteIdenticalRegression) {
+    rune::protocol::RecordBatchBuilder a(0, 1000), c(0, 1000);
+    a.append("k", "v", 1000);
+    c.append("k", "v", 1000, 0);
+    EXPECT_EQ(a.build(), c.build());
+}

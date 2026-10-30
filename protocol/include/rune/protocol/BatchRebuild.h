@@ -21,6 +21,8 @@ struct RecordSpan {
     std::string_view value;              ///< value bytes; empty when null or empty
     bool             nullValue = false;  ///< valueLen == -1 (a tombstone)
     int64_t          offset    = 0;      ///< baseOffset + offsetDelta
+    uint8_t          attributes = 0;     ///< the record's attributes byte (bits 0-1: write intent)
+    uint32_t         index     = 0;      ///< the record's ordinal in the batch
 };
 
 namespace detail {
@@ -56,7 +58,7 @@ bool forEachRecordSpan(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept 
         if (static_cast<uint64_t>(bodyLen) > end - pos) return false;
         const std::size_t recEnd = pos + static_cast<std::size_t>(bodyLen);
         if (pos >= recEnd) return false;
-        ++pos;                                                               // attributes
+        const uint8_t attributes = batch[pos++];
         if (!detail::readVarintBounded(batch, recEnd, pos, tsDelta)) return false;
         if (!detail::readVarintBounded(batch, recEnd, pos, offDelta)) return false;
         if (offDelta < 0 || offDelta > r.lastOffsetDelta()) return false;
@@ -70,6 +72,7 @@ bool forEachRecordSpan(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept 
         if (!detail::readVarintBounded(batch, recEnd, pos, vlen)) return false;
         RecordSpan s;
         s.key = key;
+        s.attributes = attributes; s.index = static_cast<uint32_t>(i);
         s.pos = start; s.len = recEnd - start; s.offset = base + offDelta; s.nullValue = vlen < 0;
         if (vlen > 0) {
             if (static_cast<uint64_t>(vlen) > recEnd - pos) return false;
