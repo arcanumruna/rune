@@ -3,13 +3,22 @@
 
 #include <gtest/gtest.h>
 
+#include <charconv>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+
 using namespace rune::node::cw;
 using rune::node::test::catalog_cluster::ThreeNodes;
 
 namespace {
 int stepsPerSeed() {
     const char* s = std::getenv("RUNE_CW_STRESS_STEPS");
-    return s != nullptr ? std::atoi(s) : 40;
+    if (s == nullptr) return 40;
+    int steps = 0;
+    const auto [end, ec] = std::from_chars(s, s + std::strlen(s), steps);
+    if (ec != std::errc{} || *end != '\0' || steps <= 0) throw std::invalid_argument(std::string("RUNE_CW_STRESS_STEPS is not a positive integer: ") + s);
+    return steps;
 }
 }  // namespace
 
