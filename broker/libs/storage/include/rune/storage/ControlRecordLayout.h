@@ -111,7 +111,7 @@ inline std::optional<std::span<const uint8_t>> valueOf(const uint8_t* batch, std
     if (batch == nullptr || len < static_cast<std::size_t>(b::kRecordBatchOverhead) + 8) return std::nullopt;
     if (get<int32_t>(batch + b::kLengthOffset) != static_cast<int32_t>(len) - 12) return std::nullopt;
     if (batch[16] != static_cast<uint8_t>(b::kMagicValue)) return std::nullopt;
-    if (get<int16_t>(batch + b::kAttributesOffset) != b::kAttrControl) return std::nullopt;
+    if ((get<int16_t>(batch + b::kAttributesOffset) & ~b::kAttrDeleteHorizon) != b::kAttrControl) return std::nullopt;   // the cleaner may stamp a delete horizon
     if (get<int32_t>(batch + 23) != 0 || get<int64_t>(batch + 43) != -1 || get<int16_t>(batch + 51) != -1 ||
         get<int32_t>(batch + 53) != -1 || get<int32_t>(batch + b::kRecordCountOffset) != 1)
         return std::nullopt;

@@ -920,7 +920,7 @@ public:
         // demotion is rejected (bound below every base), never installed on a
         // follower.
         if (role_ != Role::Leader) return std::numeric_limits<Offset>::min();
-        return std::min<Offset>(highWatermark(), cleanerLastStableOffset());
+        return std::min<Offset>({highWatermark(), cleanerLastStableOffset(), cleanerVerdictBound()});
     }
     /// Fix round 2: drain the cleaner's swap ring on the OWNER thread (validate +
     /// install deferred compaction outputs), then rewind the clean watermark to

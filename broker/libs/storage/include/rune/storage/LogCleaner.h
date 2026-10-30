@@ -4,6 +4,7 @@
 #include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/storage/Throttler.h>
 #include <cstdint>
+#include <limits>
 #include <functional>
 #include <vector>
 
@@ -98,6 +99,9 @@ public:
     /// no replica knowledge keeps them all — correctness over growth).
     void setMarkerRemovalBound(Offset bound) noexcept { markerRemovalBound_ = bound; }
     [[nodiscard]] Offset markerRemovalBound() const noexcept { return markerRemovalBound_; }
+    /// Part 04: a verdict source's committed watermark W (nothing at or above it is cleaned) and the end of the markers
+    /// below it (the pre-pass reads that far for markers).  Defaults: not a verdict source.
+    void setVerdictBounds(Offset bound, Offset markerEnd) noexcept { verdictBound_ = bound; verdictMarkerEnd_ = markerEnd; }
     /// Segment files the rewrite phase of the last pass read (test/accounting).
     [[nodiscard]] int64_t lastRewriteSegmentsRead() const noexcept { return rewriteSegmentsRead_; }
 
@@ -383,7 +387,8 @@ private:
                             int64_t nowNs, int64_t deleteRetentionMs,
                             int64_t nowMs = -1, bool* changed = nullptr,
                             const ProducerTails* tails = nullptr,
-                            const TxnCleanState* txn = nullptr);
+                            const TxnCleanState* txn = nullptr,
+                            const VerdictCleanState* verdicts = nullptr);
 
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones
@@ -418,6 +423,8 @@ private:
     int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
     int64_t prefixBytesRead_        = 0;
     Offset  markerRemovalBound_     = 0;
+    Offset  verdictBound_           = std::numeric_limits<Offset>::max();
+    Offset  verdictMarkerEnd_       = 0;
     int64_t rewriteSegmentsRead_    = 0;
     uint64_t* deferredSeq_          = nullptr;   ///< non-null = deferred-install mode
     BoundaryHook hook_{};

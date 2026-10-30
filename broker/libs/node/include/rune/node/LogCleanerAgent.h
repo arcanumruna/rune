@@ -473,6 +473,7 @@ public:
             // read_committed state (cleaner-visible snapshot, like the HW);
             // LogCleaner's own unresolved-txn scan is the backstop.
             firstUncleanable = std::min(firstUncleanable, replica->cleanerLastStableOffset());
+            firstUncleanable = std::min(firstUncleanable, replica->cleanerVerdictBound());   // Part 04: W of a verdict source
             if (firstUncleanable < 0) firstUncleanable = 0;
             // E1d invariant 3: never compact a segment ending above the
             // PERSISTED recovery point — restart recovery chain-validates those
@@ -684,6 +685,8 @@ public:
         // D3b fix round 1: a txn marker is removed only below the minimum fetch
         // position of EVERY assigned replica (a lagging replica must still get it).
         cleaner.setMarkerRemovalBound(best.replica->cleanerMarkerRemovalBound());
+        const int64_t verdictBound = best.replica->cleanerVerdictBound();   // the bound first, then the marker end that carries it
+        cleaner.setVerdictBounds(verdictBound, best.replica->cleanerVerdictMarkerEnd());
         // Fix round 2 (Kafka-style): the cleaner NEVER replaces / deletes a
         // segment file — outputs go to unique .cleaned files the owner thread
         // validates and installs (Log::drainCleanerSwaps).

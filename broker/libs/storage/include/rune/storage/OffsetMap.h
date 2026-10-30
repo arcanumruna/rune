@@ -7,6 +7,7 @@
 
 #include <rune/storage/ProducerTails.h>
 #include <rune/storage/TxnCleanState.h>
+#include <rune/storage/VerdictCleanState.h>
 
 namespace rune::storage {
 
@@ -38,7 +39,7 @@ public:
     std::size_t size() const noexcept { return map_.size(); }
 
     /// Clear all entries.
-    void clear() noexcept { map_.clear(); tails_.clear(); txn_.clear(); }
+    void clear() noexcept { map_.clear(); tails_.clear(); txn_.clear(); verdict_.clear(); }
 
     /// The last data batch of every producer in the scanned range (retained by
     /// compaction — see ProducerTails.h).  Filled by buildOffsetMapFromBases.
@@ -48,11 +49,15 @@ public:
     /// markers — see TxnCleanState.h).  Filled by buildOffsetMapFromBases.
     TxnCleanState&       txnState() noexcept { return txn_; }
     const TxnCleanState& txnState() const noexcept { return txn_; }
+    /// Part 04: the rejected records, coverage and removable verdict markers of a verdict source.  Filled by the pre-pass.
+    VerdictCleanState&       verdictState() noexcept { return verdict_; }
+    const VerdictCleanState& verdictState() const noexcept { return verdict_; }
 
 private:
     std::unordered_map<std::string, Offset> map_;
     ProducerTails tails_;
     TxnCleanState txn_;
+    VerdictCleanState verdict_;
 };
 
 } // namespace rune::storage
