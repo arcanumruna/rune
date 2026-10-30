@@ -693,6 +693,16 @@ public:
         viewSet_ = vs;
         // Task 12: the view set's per-slot arrays follow this worker's slot table size.
         if (vs != nullptr && vs->nsSlotCapacity() != nsSlots_.capacity()) vs->configureNsSlots(nsSlots_.capacity());
+        if (vs != nullptr) vs->setVerdictIntervalNs(verdictIntervalNs_);
+    }
+    /// Part 04 (SD14): how often a verdict source writes a marker for accepted-only progress.
+    void setVerdictIntervalNs(int64_t ns) noexcept {
+        verdictIntervalNs_ = ns;
+        if (viewSet_ != nullptr) viewSet_->setVerdictIntervalNs(ns);
+    }
+    [[nodiscard]] const VerdictSourceStats* verdictStatsForTest(int32_t topicId, int32_t partition) const noexcept {
+        const VerdictSource* v = viewSet_ != nullptr ? viewSet_->verdictSource(topicId, partition) : nullptr;
+        return v != nullptr ? &v->stats() : nullptr;
     }
     [[nodiscard]] WorkerViewSet* viewSet() const noexcept { return viewSet_; }
 
@@ -1933,6 +1943,8 @@ public:
                 work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
             }
             work += flushOwedAcksView_(nowNs);   // a worker without views still releases and times out View waiters
+            publishVerdictCleanerBounds_();
+            if ((++verdictPasses_ & 1023) == 0) [[unlikely]] maintainVerdictIndexes_();
             if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
             work += serveHeldPushReads_();
         }
@@ -3341,7 +3353,10 @@ private:
             spdlog::warn("Worker {}: topic {} key field cannot be a topic key; wire-key check skipped (pre-existing topic)",
                          workerId_, w->topicId);
         for (auto& sl : rcSlots_)
-            if (!sl.write && sl.replica->topicId() == w->topicId) sl.write = std::make_unique<PartitionWriteState>(PartitionWriteState{&spec});
+            if (!sl.write && sl.replica->topicId() == w->topicId) {
+                sl.write = std::make_unique<PartitionWriteState>(PartitionWriteState{&spec});
+                bindVerdictHooks_(sl);
+            }
         rebuildWriteById_();
     }
 
@@ -6062,6 +6077,8 @@ private:
         uint8_t                              acks       = 0;   ///< the Produce.acks wire byte
     };
     OrderedWaitQueue<PendingAcksView> pendingAcksView_;
+    int64_t  verdictIntervalNs_ = 100'000'000;
+    uint64_t verdictPasses_ = 0;
 
     // F15 S3 (§6): the ONE local return FIFO in front of ret_, every mode.
     // Pre-allocated fixed-capacity ring of tagged entries (WorkerReturn |
@@ -6632,6 +6649,7 @@ private:
         std::unique_ptr<RcState>             rc;
         std::unique_ptr<RcHintCtx>           hint;
         std::unique_ptr<PartitionWriteState> write;   // checked writes: a typed partition's write state (null: untyped)
+        int64_t verdictBoundPublished = -2, verdictEndPublished = -2;   // Part 04: what the cleaner was last told (publish on change only)
     };
     // The default read-ahead issuer: an async IORING_OP_FADVISE(WILLNEED) on the
     // segment fd where the worker's io backend is io_uring AND the kernel
@@ -6798,6 +6816,12 @@ private:
     [[nodiscard]] const RcState* rcFor_(int32_t topicId, int32_t partition) const noexcept {
         return rcOf_(findOwnedReplica_(topicId, partition));
     }
+    // Part 04 (P4-1): the leadership scan of a disk partition with a write state feeds its verdict markers and constraint-set
+    // changes into that state.
+    static void bindVerdictHooks_(RcSlot& slot) noexcept {
+        if (slot.write && slot.rc && slot.replica->isDiskBacked())
+            slot.rc->setVerdictHooks(RcVerdictHooks{&verdictFeedBegin, &verdictFeedBatch, slot.write.get()});
+    }
     // Cold (ownership apply): carry still-owned states, create + reserve new
     // ones, drop the rest; re-resolve every subscription's cached pointer.
     void rebuildRcSlots_() {
@@ -6831,6 +6855,7 @@ private:
             if (!slot.write)
                 if (const auto it = writeSpecs_.find(r->topicId()); it != writeSpecs_.end() && it->second->hasFacts())
                     slot.write = std::make_unique<PartitionWriteState>(PartitionWriteState{it->second.get()});
+            bindVerdictHooks_(slot);
             next.push_back(std::move(slot));
         }
         rcSlots_ = std::move(next);
@@ -6870,7 +6895,10 @@ private:
             const int32_t topicId = replica->topicId();
             // Short-circuit: skip the rc/bound computation for an owned
             // partition no installed view is interested in.
-            if (!viewSet_->interestedIn(topicId)) continue;
+            if (!viewSet_->interestedIn(topicId)) {
+                const PartitionWriteState* w = writeOf_(replica);
+                if (w == nullptr || w->constraintSets.latest().empty()) continue;   // a verdict source without its views still judges nothing, but is driven (it waits)
+            }
             if (replica->role() != rune::replication::Role::Leader) continue;
             const RcState* rcState = rcServe_(replica, rcOf_(replica));
             if (rcState == nullptr) continue;         // RC not Ready: fail closed, no bound
@@ -6892,7 +6920,7 @@ private:
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, skip, nowNs, nullptr,
-                                      replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()});
+                                      replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()}, replica);
             } else {
                 // Phase 2b E: a TRANSIENT source — zero-copy view into the
                 // replica's own ring (same thread).  The fold itself stops at its
@@ -6903,7 +6931,7 @@ private:
                     return mem->readView(from, kPushMaxChunkBytes);
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, skip, nowNs, replica,
-                                      replica->leadershipGeneration(), hwConfirmed);
+                                      replica->leadershipGeneration(), hwConfirmed, NsTag{}, replica);
             }
         }
         return work;
@@ -6932,8 +6960,13 @@ private:
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
                       int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                       const rune::replication::PartitionReplica* transientRep,
-                      uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns = {}) {
+                      uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, rune::replication::PartitionReplica* replica) {
         int work = 0;
+        PartitionWriteState* write = writeOf_(replica);
+        if (write != nullptr) {
+            if (VerdictSource* judge = viewSet_->ensureVerdictSource(topicId, partition, *write))
+                judge->bindLeader(replica, leaderGen, replica->isDiskBacked() ? replica->log()->logStartOffset() : replica->memoryLog()->logStartOffset());
+        }
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
         if (transientRep != nullptr) {
@@ -6948,10 +6981,10 @@ private:
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
             work += viewSet_->driveRebuild(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
-                                           leaderHwConfirmed, ns);
+                                           leaderHwConfirmed, ns, write);
         }
         work += viewSet_->driveFolds(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
-                                     leaderHwConfirmed, ns);
+                                     leaderHwConfirmed, ns, write);
         return work;
     }
 
@@ -7034,6 +7067,7 @@ private:
             RcSlot& sl = rcSlots_[i];
             if (!ringWork_(sl.replica, *sl.rc))
                 work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;   // publishes the cleaner LSO (D3b)
+            if (sl.write && sl.write->constraintSets.size() != 0) [[unlikely]] verdictHousekeeping_(sl);
             if (++i == n) i = 0;
         }
         if (++rcWalkStart_ == n) rcWalkStart_ = 0;
@@ -7050,6 +7084,37 @@ private:
             i = next;
         }
         return work;
+    }
+    // Part 04: the markers below the HW are committed (W follows them), and the index forgets what retention deleted.
+    void verdictHousekeeping_(RcSlot& sl) noexcept {
+        verdictOnHw(*sl.write, sl.replica->highWatermark());
+        if (sl.replica->isDiskBacked()) sl.write->rejected.dropBelow(sl.replica->log()->logStartOffset());
+    }
+    // Part 04 (P4-14): tell the cleaner how far the verdicts are durable.  The marker end is published before the bound.
+    void publishVerdictCleanerBounds_() noexcept {
+        for (auto& sl : rcSlots_) {
+            if (!sl.write || sl.write->constraintSets.size() == 0 || !sl.replica->isDiskBacked()) continue;
+            const PartitionWriteState& w = *sl.write;
+            if (sl.replica->role() != rune::replication::Role::Leader || !sl.rc->ready()) continue;
+            const int64_t W = w.markers.committedThrough();
+            const int64_t bound = w.constraintSets.latest().empty() && W > w.constraintSets.lastChangeOffset()
+                                      ? rune::replication::PartitionReplica::kNoCleanerLso : W;
+            const int64_t end = w.markers.committedMarkerEnd();
+            if (bound == sl.verdictBoundPublished && end == sl.verdictEndPublished) continue;
+            sl.replica->publishCleanerVerdictMarkerEnd(end);
+            sl.replica->publishCleanerVerdictBound(bound);
+            sl.verdictBoundPublished = bound;
+            sl.verdictEndPublished = end;
+        }
+    }
+    // Part 04 (P4-11): a verdict index that crosses 75 % doubles, up to 2^24 entries; cold, every 1,024 passes.
+    void maintainVerdictIndexes_() {
+        for (auto& sl : rcSlots_) {
+            if (!sl.write) continue;
+            auto& idx = sl.write->rejected;
+            if (idx.capacity() != 0 && idx.size() * 4 >= idx.capacity() * 3 && idx.capacity() < (std::size_t{1} << 24))
+                idx.grow(std::min<std::size_t>(idx.capacity() * 2, std::size_t{1} << 24));
+        }
     }
     // D3b: publish the partition's first unstable offset to the cleaner (only on
     // change).  Called on every RC transition: the per-pass driver (Ready / reset)

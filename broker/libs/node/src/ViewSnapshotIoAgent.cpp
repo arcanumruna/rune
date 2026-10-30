@@ -158,6 +158,22 @@ ViewSnapshotIoAgent::FileState* ViewSnapshotIoAgent::fileFor_(const Key& key) {
     return &ins->second;
 }
 
+void ViewSnapshotIoAgent::handleResetFrame_(const uint8_t* p, std::size_t len, int channelIdx) {
+    if (len < ViewSnapshotChannel::kDeltaHeaderBytes) return;
+    const Key key{static_cast<int32_t>(readLE32(p)), static_cast<int32_t>(readLE32(p + 4))};
+    FileState* fs = fileFor_(key);
+    if (fs == nullptr) return;
+    fs->channelIdx = channelIdx;
+    if (::ftruncate(fs->fd, 0) != 0) {
+        fs->errored = true;
+        spdlog::error("ViewSnapshotIoAgent: FATAL truncate failure for viewTopicId={} partition={}: {}", key.viewTopicId, key.partition,
+                      std::strerror(errno));
+        return;
+    }
+    fs->pendingO = fs->lastDurableO = -1;
+    fs->dirtySinceSync = false;
+}
+
 void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx) {
     if (len < ViewSnapshotChannel::kDeltaHeaderBytes) return; // malformed frame -- drop
 
@@ -283,6 +299,10 @@ int ViewSnapshotIoAgent::doWork(int64_t nowNs) {
         drained += ch->deltas.drain(
             [this, ci](int32_t type, aeron::concurrent::AtomicBuffer& buf,
                        aeron::util::index_t off, aeron::util::index_t len) {
+                if (type == ViewSnapshotChannel::kResetMsgType) {
+                    handleResetFrame_(reinterpret_cast<const uint8_t*>(buf.buffer() + off), static_cast<std::size_t>(len), ci);
+                    return;
+                }
                 if (type != ViewSnapshotChannel::kDeltaMsgType) return;
                 handleDeltaFrame_(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
                                   static_cast<std::size_t>(len), ci);

@@ -10,12 +10,10 @@
 
 namespace rune::node {
 
-namespace cr = rune::storage::control_record;
 using rune::view::Verdict;
 
 namespace {
 
-constexpr std::size_t kIndexReserve = 65536;
 
 uint16_t writerVersionOf(std::string_view value, uint16_t fallback) noexcept {
     return value.size() >= 4 ? static_cast<uint16_t>(static_cast<uint8_t>(value[2]) | (static_cast<uint8_t>(value[3]) << 8)) : fallback;
@@ -57,9 +55,18 @@ void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKi
     m.fingerprint = planFingerprint;
     m.prospect.reserve(inst->layout, inst->agg ? &inst->agg->layout : nullptr);
     auto at = std::lower_bound(members_.begin(), members_.end(), viewObjectId, [](const Member& x, uint64_t id) { return x.objectId < id; });
-    members_.insert(at, std::move(m));
+    at = members_.insert(at, std::move(m));
+    if (!needsActivation_) discardCheckpointAhead_(*at);
     reindex_();
     recomputeCap_();
+}
+
+// P4-4: a checkpoint that outran every marker this node holds (a crash lost the log tail carrying them) cannot be trusted.
+void VerdictSource::discardCheckpointAhead_(Member& m) {
+    if (!m.inst->persisted || m.inst->foldCursor <= judgeCursor_ || hooks_.discard == nullptr) return;
+    hooks_.discard(hooks_.ctx, *m.inst);
+    m.inst->foldCursor = logStart_;
+    ++stats_.verdictCheckpointsDiscarded;
 }
 
 void VerdictSource::removeVerdictView(uint64_t viewObjectId, uint64_t planFingerprint) {
@@ -100,6 +107,10 @@ bool VerdictSource::reindex_() {
     return true;
 }
 
+bool VerdictSource::hasMember(uint64_t viewObjectId, uint64_t planFingerprint) const noexcept {
+    return std::any_of(members_.begin(), members_.end(), [&](const Member& m) { return m.objectId == viewObjectId && m.fingerprint == planFingerprint; });
+}
+
 void VerdictSource::recomputeCap_() noexcept {
     checkpointCap_ = INT64_MAX;
     for (const Member& m : members_)
@@ -131,9 +142,10 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     judgeCursor_ = std::max(extendOverEmptySets_(state.rejected.coveredThrough()), logStart_);
     emitFrom_    = std::max(extendOverEmptySets_(state.markers.committedThrough()), logStart_);
     state.rejected.noteCovered(judgeCursor_);
+    for (Member& m : members_) discardCheckpointAhead_(m);
     activeSet_ = *state.constraintSets.setAt(judgeCursor_);
     setFrom_   = judgeCursor_;
-    sawEmptyChange_ = false;
+    sawEmptyChange_ = judgedRecord_ = false;
     reindex_();
     recomputeCap_();
 }
@@ -275,6 +287,7 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
             (void)judge(rec);
             if (stalled_) return;
             judgeCursor_ = span.offset + 1;
+            judgedRecord_ = true;
             ++work;
         });
         if (!walked && !halt && !stalled_) break;   // a record that does not fit its batch: stop, never advance past it
@@ -287,7 +300,7 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
 }
 
 int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
-    if (generation_ == 0 || judgeCursor_ <= emitFrom_) return 0;
+    if (generation_ == kUnbound || judgeCursor_ <= emitFrom_ || !(judgedRecord_ || sawEmptyChange_)) return 0;
     const bool due = rejectedThisPass_ > 0 || sawEmptyChange_ || nowNs - lastMarkerNs_ >= intervalNs_ ||
                      (checkpointCap_ != INT64_MAX && judgeCursor_ - emitFrom_ >= checkpointCap_);
     if (!due) return 0;
@@ -324,21 +337,41 @@ int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
         lastMarkerNs_ = nowNs;
         ++work;
     }
-    if (emitFrom_ >= judgeCursor_) sawEmptyChange_ = false;
+    if (emitFrom_ >= judgeCursor_) sawEmptyChange_ = judgedRecord_ = false;
+    return work;
+}
+
+int VerdictSource::pushCheckpoints_(PartitionWriteState& state) {
+    if (hooks_.checkpoint == nullptr) return 0;
+    int work = 0;
+    for (Member& m : members_) {
+        ViewInstance& inst = *m.inst;
+        // P4-4: a persisted member's delta leaves only once a marker in the local log covers the cursor it is stamped with.
+        if (inst.persisted && state.markers.appendedThrough() < inst.foldCursor && !inst.pendingValid && !inst.resetOwed) continue;
+        work += hooks_.checkpoint(hooks_.ctx, inst);
+    }
     return work;
 }
 
 int VerdictSource::dropRetired_(PartitionWriteState& state) {
     const std::size_t before = members_.size();
-    std::erase_if(members_, [&](const Member& m) { return m.retiring && state.markers.committedThrough() > m.leaveOffset; });
+    std::array<std::pair<uint64_t, uint64_t>, kMaxVerdictViewsPerSource> gone{};
+    std::size_t n = 0;
+    std::erase_if(members_, [&](const Member& m) {
+        if (!m.retiring || state.markers.committedThrough() <= m.leaveOffset) return false;
+        if (n < gone.size()) gone[n++] = {m.objectId, m.fingerprint};
+        return true;
+    });
     if (members_.size() == before) return 0;
+    if (hooks_.retired != nullptr)
+        for (std::size_t i = 0; i < n; ++i) hooks_.retired(hooks_.ctx, gone[i].first, gone[i].second);
     reindex_();
     recomputeCap_();
     return static_cast<int>(before - members_.size());
 }
 
 int VerdictSource::requestChange(const ConstraintSet& next) {
-    if (state_ == nullptr || generation_ == 0 || needsActivation_) return kChangeDeferred;
+    if (state_ == nullptr || generation_ == kUnbound || needsActivation_) return kChangeDeferred;
     if (next.sameMembers(state_->constraintSets.latest())) return kChangeUnchanged;
     ConstraintSet logged = next;
     logged.id = state_->constraintSets.latest().id + 1;
@@ -358,38 +391,6 @@ int VerdictSource::requestChange(const ConstraintSet& next) {
     if (base < 0) return kChangeDeferred;
     state_->constraintSets.onChange(base, logged);
     return static_cast<int>(base);
-}
-
-void verdictFeedBegin(void* state, int64_t, int64_t target) noexcept {
-    auto& s = *static_cast<PartitionWriteState*>(state);
-    s.constraintSets.truncateFrom(target);
-    s.markers.truncateFrom(target);
-    s.rejected.truncateFrom(target);
-}
-
-void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int64_t base) noexcept {
-    auto& s = *static_cast<PartitionWriteState*>(state);
-    const int type = cr::recordType(b, len);
-    if (type == cr::kVerdictMarker) {
-        const auto m = cr::parseMarker(b, len);
-        if (!m) return;
-        if (s.rejected.capacity() == 0) s.rejected.reserve(kIndexReserve);
-        s.rejected.onMarker(m->header.fromOffset, m->header.finalThrough, m->header.count, [&](std::size_t i) {
-            return rune::storage::RejectedOffsetIndex::Entry{m->offsetAt(static_cast<uint32_t>(i)), m->codeAt(static_cast<uint32_t>(i)), m->constraintIdAt(static_cast<uint32_t>(i))};
-        });
-        (void)s.markers.onMarker(base, m->header.finalThrough);
-    } else if (type == cr::kConstraintSetChange) {
-        std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
-        uint32_t id = 0;
-        uint16_t count = 0;
-        if (!cr::parseConstraintSetChange(b, len, id, wire, count)) return;
-        ConstraintSet set;
-        set.id = id;
-        set.count = static_cast<uint8_t>(count);
-        for (uint16_t i = 0; i < count; ++i)
-            set.members[i] = ConstraintSetMember{wire[i].viewObjectId, static_cast<rune::view::VerdictViewKind>(wire[i].kind), wire[i].planFingerprint};
-        s.constraintSets.onChange(base, set);
-    }
 }
 
 void verdictOnHw(PartitionWriteState& state, int64_t hw) noexcept {

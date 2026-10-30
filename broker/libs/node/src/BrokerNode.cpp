@@ -1693,6 +1693,7 @@ void BrokerNode::buildWorkerPool() {
     for (int32_t i = 0; i < wc; ++i) {
         workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
+        workerPool_->worker(i).setVerdictIntervalNs(config_.verdictIntervalMs * 1'000'000);
         workerPool_->worker(i).setBackgroundSyncIntervalNs(config_.workerSyncIntervalMs * 1'000'000LL);
         if (!config_.ioWorkerCpus.empty()) workerPool_->worker(i).setIoWorkerCpus(config_.ioWorkerCpus);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);

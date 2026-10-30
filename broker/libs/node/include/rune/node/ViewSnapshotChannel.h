@@ -61,6 +61,9 @@ struct ViewSnapshotChannel {
     // in its own doWork (WorkerViewSet::drainInstalls) and calls installView on
     // ITS OWN thread — shared-nothing (installView is never called cross-thread).
     static constexpr int32_t     kInstallMsgType   = 3;
+    // worker -> IO on `deltas`: [viewTopicId i32][partition i32].  The checkpoint file of that (view, partition) is truncated to
+    // empty: the worker discarded a checkpoint that outran the verdict markers of its source (Part 04, P4-4) and refolds it.
+    static constexpr int32_t     kResetMsgType     = 4;
     static constexpr std::size_t kDeltaHeaderBytes = 8;  // viewTopicId i32 + partition i32
     static constexpr std::size_t kDoneMsgBytes      = 16; // viewTopicId i32 + partition i32 + O i64
 

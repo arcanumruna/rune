@@ -5,7 +5,7 @@
 // evaluates them in set order, and applies all or none; a rejection goes into PartitionWriteState::rejected.  driveJudge
 // walks the committed log, follows the logged constraint-set changes and emits durable verdict markers.
 #include <rune/node/VerdictState.h>
-#include <rune/node/WorkerViewSet.h>
+#include <rune/node/ViewInstance.h>
 #include <rune/node/WriteState.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/ControlRecordLayout.h>
@@ -17,6 +17,17 @@
 #include <vector>
 
 namespace rune::node {
+
+/// What the owning WorkerViewSet does for a judge's members (fn-pointer + ctx, no std::function).
+struct VerdictViewHooks {
+    void* ctx = nullptr;
+    /// Push the member's dirty rows as one checkpoint delta (or drop them for a transient member).
+    int (*checkpoint)(void* ctx, ViewInstance&) = nullptr;
+    /// A checkpoint that outran the markers (P4-4): empty the member's tables and owe its file a reset.
+    void (*discard)(void* ctx, ViewInstance&) = nullptr;
+    /// A retiring member left the set for good (W passed its drop): the owner may erase its plan and instance.
+    void (*retired)(void* ctx, uint64_t viewObjectId, uint64_t planFingerprint) = nullptr;
+};
 
 class VerdictSource {
 public:
@@ -50,6 +61,10 @@ public:
     /// Cold: the replica to append through and the leadership this judge serves.  A new generation re-activates.
     void bindLeader(rune::replication::PartitionReplica* replica, uint64_t leadershipGeneration, int64_t logStart) noexcept;
     void setVerdictIntervalNs(int64_t ns) noexcept { intervalNs_ = ns; }
+    void setViewHooks(const VerdictViewHooks& h) noexcept { hooks_ = h; }
+    [[nodiscard]] bool hasMember(uint64_t viewObjectId, uint64_t planFingerprint) const noexcept;
+    [[nodiscard]] bool hasMembers() const noexcept { return !members_.empty(); }
+    [[nodiscard]] VerdictSourceStats& statsMut() noexcept { return stats_; }
     [[nodiscard]] const VerdictSourceStats& stats() const noexcept { return stats_; }
 
     /// With bindLeader(nullptr, ...) appends are captured here instead of reaching a replica.
@@ -75,10 +90,12 @@ private:
     int    replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted);
     int    judgeBatches_(const rune::storage::LogReadView& view, int64_t limit, const rune::view::AbortedTxnFilter& aborted);
     int    emitMarkers_(PartitionWriteState& state, int64_t nowNs);
+    int    pushCheckpoints_(PartitionWriteState& state);
     int    dropRetired_(PartitionWriteState& state);
     bool   resolveSet_(const ConstraintSet& set, std::vector<std::size_t>& out) const;
     bool   reindex_();
     void   recomputeCap_() noexcept;
+    void   discardCheckpointAhead_(Member& m);
     void   stall_() noexcept;
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
@@ -95,7 +112,8 @@ private:
     std::vector<std::size_t>    active_;
     std::vector<std::size_t>    scratchIdx_;
     rune::replication::PartitionReplica* replica_ = nullptr;
-    uint64_t                    generation_ = 0;
+    static constexpr uint64_t   kUnbound = ~0ull;
+    uint64_t                    generation_ = kUnbound;   // the leadership generation bound; a replica built as leader serves generation 0
     int64_t                     logStart_ = 0;
     bool                        needsActivation_ = false;
     bool                        stalled_ = false, waitingForInstall_ = false, held_ = false;
@@ -104,8 +122,10 @@ private:
     int64_t                     intervalNs_ = 100'000'000, lastMarkerNs_ = 0;
     uint64_t                    rejectedThisPass_ = 0, judgeCalls_ = 0;
     bool                        sawEmptyChange_ = false;
+    bool                        judgedRecord_ = false;   // a data record is judged and not yet covered by a marker
     uint8_t                     lastIntent_ = 0;
     int64_t                     testNextOffset_ = 0;
+    VerdictViewHooks            hooks_;
     VerdictSourceStats          stats_;
     std::vector<uint8_t>        scratch_;
     std::vector<std::vector<uint8_t>> appended_;
@@ -113,8 +133,41 @@ private:
 };
 
 /// The leadership scan feed (RcVerdictHooks): `state` is a PartitionWriteState*.
-void verdictFeedBegin(void* state, int64_t logStart, int64_t target) noexcept;
-void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int64_t base) noexcept;
+namespace cr = rune::storage::control_record;
+
+inline constexpr std::size_t kIndexReserve = 65536;
+
+inline void verdictFeedBegin(void* state, int64_t, int64_t target) noexcept {
+    auto& s = *static_cast<PartitionWriteState*>(state);
+    s.constraintSets.truncateFrom(target);
+    s.markers.truncateFrom(target);
+    s.rejected.truncateFrom(target);
+}
+
+inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int64_t base) noexcept {
+    auto& s = *static_cast<PartitionWriteState*>(state);
+    const int type = cr::recordType(b, len);
+    if (type == cr::kVerdictMarker) {
+        const auto m = cr::parseMarker(b, len);
+        if (!m) return;
+        if (s.rejected.capacity() == 0) s.rejected.reserve(kIndexReserve);
+        s.rejected.onMarker(m->header.fromOffset, m->header.finalThrough, m->header.count, [&](std::size_t i) {
+            return rune::storage::RejectedOffsetIndex::Entry{m->offsetAt(static_cast<uint32_t>(i)), m->codeAt(static_cast<uint32_t>(i)), m->constraintIdAt(static_cast<uint32_t>(i))};
+        });
+        (void)s.markers.onMarker(base, m->header.finalThrough);
+    } else if (type == cr::kConstraintSetChange) {
+        std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
+        uint32_t id = 0;
+        uint16_t count = 0;
+        if (!cr::parseConstraintSetChange(b, len, id, wire, count)) return;
+        ConstraintSet set;
+        set.id = id;
+        set.count = static_cast<uint8_t>(count);
+        for (uint16_t i = 0; i < count; ++i)
+            set.members[i] = ConstraintSetMember{wire[i].viewObjectId, static_cast<rune::view::VerdictViewKind>(wire[i].kind), wire[i].planFingerprint};
+        s.constraintSets.onChange(base, set);
+    }
+}
 /// The HW moved: markers below it are committed, and the committed coverage W follows.
 void verdictOnHw(PartitionWriteState& state, int64_t hw) noexcept;
 
@@ -141,6 +194,7 @@ bool VerdictSource::switchSet_(int64_t A, ReadRangeFn& readRange, const rune::vi
         members_[i].leaveOffset = A;
     }
     active_.swap(scratchIdx_);
+    activeSet_ = next;
     setFrom_ = A + 1;
     if (next.empty()) sawEmptyChange_ = true;
     return true;
@@ -167,13 +221,14 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
         if (!waitingForInstall_) { waitingForInstall_ = true; ++stats_.judgeWaitsForInstall; }
     } else if (!behind) {
         const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX ? INT64_MAX : emitFrom_ + checkpointCap_);
-        while (judgeCursor_ < passBound && !stalled_) {
+        while (!stalled_) {
             const int64_t A = state.constraintSets.nextChangeAtOrAfter(setFrom_);
             if (A != INT64_MAX && judgeCursor_ > A) {
                 if (!switchSet_(A, readRange, aborted, work)) break;
                 ++work;
                 continue;
             }
+            if (judgeCursor_ >= passBound) break;
             const int64_t limit = A == INT64_MAX ? passBound : std::min(passBound, A + 1);
             if (active_.empty()) {
                 judgeCursor_ = limit;
@@ -189,6 +244,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
         state.rejected.noteCovered(judgeCursor_);
     }
     work += emitMarkers_(state, nowNs);
+    work += pushCheckpoints_(state);
     work += dropRetired_(state);
     return work;
 }

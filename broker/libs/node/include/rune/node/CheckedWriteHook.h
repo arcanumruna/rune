@@ -39,7 +39,12 @@ struct TopicHookFacts {
     bool constrainedSource = false;
     bool verdictSource     = false;
 };
-[[nodiscard]] inline TopicHookFacts topicHookFactsOf(const PartitionWriteState&) noexcept { return {}; }
+[[nodiscard]] inline TopicHookFacts topicHookFactsOf(const PartitionWriteState& state) noexcept {
+    TopicHookFacts f;
+    f.verdictSource     = state.isVerdictSource();
+    f.constrainedSource = state.isConstrainedSource();
+    return f;
+}
 
 /// What the record walk found.
 struct BatchIntents {
