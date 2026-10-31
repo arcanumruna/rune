@@ -251,6 +251,7 @@ void runQuietRun(Rig& r, Entity e) {
         scanDone = nowNs();
         return true;
     }));
+    r.resetStepGap();
     ASSERT_TRUE(r.converge(mb));
     r.settle(60ms);
     for (const auto& m : mb) {
@@ -263,8 +264,10 @@ void runQuietRun(Rig& r, Entity e) {
         std::size_t k = 0;   // the first note that carries the log end
         while (k < v.notes.size() && v.notes[k] != r.logEnd()) ++k;
         ASSERT_LT(k, v.notes.size());
-        EXPECT_LE(v.noteAtNs[k] - scanDone, 60'000'000) << "the time-trigger note arrived "
-            << (v.noteAtNs[k] - scanDone) / 1'000'000 << " ms after the scan finished (bound 60 ms)";
+        // #782: a host stall of this thread (it drives the worker) delays the note by as much - added to the bound.
+        EXPECT_LE(v.noteAtNs[k] - scanDone, 60'000'000 + r.maxStepGapNs()) << "the time-trigger note arrived "
+            << (v.noteAtNs[k] - scanDone) / 1'000'000 << " ms after the scan finished (bound 60 ms + the longest step gap "
+            << r.maxStepGapNs() / 1'000'000 << " ms)";
     }
     r.verifyCounters(wb, mb, 0, 0, "leg B");
     r.verifyNoAllocation("quiet run");
