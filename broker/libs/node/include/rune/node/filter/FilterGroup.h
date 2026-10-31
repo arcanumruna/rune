@@ -303,8 +303,9 @@ public:
             catchSpent = b0 - catchBudget;
         }
         budget = entry - std::min(entry, scanSpent + catchSpent);
-        // 3. Position notes: a sweep at most every noteIntervalNs / 5, or as soon as noteRecords were scanned.
-        if (nowNs - lastSweepNs_ >= cfg_.noteIntervalNs / 5 || scanned_ - scannedAtSweep_ >= cfg_.noteRecords)
+        // 3. Position notes: a sweep at most every noteIntervalNs / 5, or as soon as noteRecords were scanned, or again
+        //    on the next pass when the egress refused a due note (#782: else it waited for another noteRecords).
+        if (noteRetry_ || nowNs - lastSweepNs_ >= cfg_.noteIntervalNs / 5 || scanned_ - scannedAtSweep_ >= cfg_.noteRecords)
             work += notes_(sink, nowNs);
         return work;
     }
@@ -890,6 +891,7 @@ private:
     int notes_(Snk& sink, int64_t nowNs) {
         lastSweepNs_ = nowNs;
         scannedAtSweep_ = scanned_;
+        noteRetry_ = false;
         int work = 0;
         for (uint32_t n = nodes_[kPending].noteLink.next; n != kPending;) {
             const uint32_t nxt = nodes_[n].noteLink.next;
@@ -905,15 +907,18 @@ private:
             } else {
                 const int64_t last = m.lastFrameNs == kNoTime ? nowNs : m.lastFrameNs;
                 const bool due = static_cast<uint64_t>(skipped) >= cfg_.noteRecords || nowNs - last >= cfg_.noteIntervalNs;
-                if (due && sink.deliverable(m.sub) &&
-                    sink.sendNote(m.sub, cursorOf(id, sink.cursor(m.sub))) == SendOutcome::Sent) {
-                    if (sync) m.coveredAt = static_cast<int64_t>(scanned_); else m.pendingSkipped = 0;
-                    m.lastFrameNs = nowNs;
-                    ++m.counters.notes;
-                    ++group_.notes;
-                    unlink_<&Member::noteLink>(n);
-                    if (sync) pushBack_<&Member::noteLink>(kDormant, n);
-                    ++work;
+                if (due && sink.deliverable(m.sub)) {
+                    const SendOutcome out = sink.sendNote(m.sub, cursorOf(id, sink.cursor(m.sub)));
+                    if (out == SendOutcome::Retry) noteRetry_ = true;
+                    if (out == SendOutcome::Sent) {
+                        if (sync) m.coveredAt = static_cast<int64_t>(scanned_); else m.pendingSkipped = 0;
+                        m.lastFrameNs = nowNs;
+                        ++m.counters.notes;
+                        ++group_.notes;
+                        unlink_<&Member::noteLink>(n);
+                        if (sync) pushBack_<&Member::noteLink>(kDormant, n);
+                        ++work;
+                    }
                 }
             }
             n = nxt;
@@ -933,6 +938,7 @@ private:
     ScanState scan_ = ScanIdle{};
     uint64_t scanned_ = 0, scannedAtSweep_ = 0;
     int64_t  lastSweepNs_ = 0;
+    bool     noteRetry_ = false;   // a due note met back-pressure: sweep again on the next pass
     VersionSet loggedUnknownGroup_, expiredGroup_;
     FilterCounters group_;
     uint64_t slotsTouched_ = 0;
