@@ -1443,6 +1443,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
 
             Offset currentLeo = logEndOffset_();
             bool compactedGaps = !memoryBacked_ && resp.fromOffset >= 0 && resp.fromOffset <= currentLeo;
+            bool crossedGap    = false;
             std::size_t newStart = resp.records.size(); // byte-offset of first new batch
             std::size_t newEnd   = newStart;            // one past the last new batch applied
             // Phase 2b E2: a transient follower applies at most one ring's worth of
@@ -1479,6 +1480,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
                 if (newStart == resp.records.size()) {
                     newStart = pos; // mark the byte offset of the first new batch
                 }
+                if (batchBase > currentLeo) crossedGap = true;
                 lastOff = batchBase + r.lastOffsetDelta();
                 currentLeo = lastOff + 1; // advance the expected-next offset
                 pos += static_cast<std::size_t>(total);
@@ -1509,6 +1511,10 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
                     onTransientApplyRefused_(rc, newLen);
                 } else {
                     followerApplyDirty_ = true;
+                    // CP3 I2: past a compaction gap the first surviving batch of an
+                    // epoch is not its first record - the starts assigned here are
+                    // never compared (heldEpochStart_).
+                    if (crossedGap) rederivedStartsBelow_ = std::max(rederivedStartsBelow_, lastOff + 1);
                     // Kafka LeaderEpochFileCache.assign on append: the cache is built
                     // from the epochs the leader STAMPED on the batches.
                     if (assignEpochsFromBatches_(newData, newLen) &&
