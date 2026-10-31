@@ -40,11 +40,11 @@ TEST(ReplicationMessages, SchemaIdIs112) {
     EXPECT_EQ(kSchemaId, 112);
 }
 
-TEST(ReplicationMessages, SchemaVersionIs4) {
+TEST(ReplicationMessages, SchemaVersionIs5) {
     // DR-BUG-5: 1→2 (topicId); KIP-320/595: 2→3 (FetchRequest.lastFetchedEpoch,
     // FetchResponse.divergingEpoch / divergingEndOffset); ISR protocol: 3→4 (storage id,
     // correlated AlterIsr answers).  A v3 leader's FetchResponse is still applied.
-    EXPECT_EQ(kSchemaVersion, 4);
+    EXPECT_EQ(kSchemaVersion, 5);
     EXPECT_EQ(kMinReplicationVersion, 3);
 }
 
@@ -67,8 +67,39 @@ TEST(ReplicationMessages, FetchResponseBlockLengthFixed) {
     // SBE tight-packs the block (no alignment pad): int64+int32+int64+int64+int16+int32
     // = 8+4+8+8+2+4 = 34.  (The pre-SBE hand-rolled layout inserted a 2-byte pad after
     // errorCode → 36; SBE owns sizing now, and both nodes run the same generated codec.)
-    // Unchanged in v3 (the DivergingEpoch answer rides in an error frame's payload).
-    EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 34u);
+    // Unchanged in v3 (the DivergingEpoch answer rides in an error frame's payload);
+    // v5 appends fromOffset (int64) → 42.
+    EXPECT_EQ(FetchResponseMsg::BLOCK_LENGTH_FIXED, 42u);
+}
+
+// #789: v5 carries the leader's read origin; a v4 sender's 34-byte block decodes as -1.
+TEST(ReplicationMessages, FetchResponseFromOffsetV5RoundTripAndV4Absent) {
+    uint8_t buf[256]{};
+    const uint8_t rec[3] = {1, 2, 3};
+    const std::size_t n = FetchResponseMsg::encode(buf, 0, 4, 1, 10, 0, 0,
+                                                   std::span<const uint8_t>(rec, 3), 9, /*fromOffset=*/1047);
+    ASSERT_EQ(n, 54u + 3u);
+    FetchResponseMsg m = FetchResponseMsg::decode(buf, 0, n);
+    EXPECT_EQ(m.fromOffset, 1047);
+    EXPECT_EQ(m.topicId, 9);
+    ASSERT_EQ(m.records.size(), 3u);
+    EXPECT_EQ(m.records[2], 3);
+    // A v4 sender: 34-byte block, the records length prefix right after topicId.
+    uint8_t v4[256]{};
+    std::memcpy(v4, buf, 8 + 34);
+    v4[0] = 34; v4[1] = 0;                            // header blockLength = 34
+    v4[6] = 4;  v4[7] = 0;                            // header version = 4
+    detail::write_le<uint32_t>(v4 + 8 + 34, 3u);
+    std::memcpy(v4 + 8 + 34 + 4, rec, 3);
+    m = FetchResponseMsg::decode(v4, 0, 8 + 34 + 4 + 3);
+    EXPECT_EQ(m.fromOffset, -1) << "a v4 frame never claims a read origin";
+    EXPECT_EQ(m.errorCode, 0);
+    ASSERT_EQ(m.records.size(), 3u);
+    EXPECT_EQ(m.records[0], 1);
+    // A v5 header over a truncated (34-byte) block: no read origin either.
+    v4[6] = 5;
+    m = FetchResponseMsg::decode(v4, 0, 8 + 34 + 4 + 3);
+    EXPECT_EQ(m.fromOffset, -1);
 }
 
 TEST(ReplicationMessages, FetchRequestTotalSize) {
@@ -99,12 +130,12 @@ TEST(ReplicationMessages, FetchRequestLastFetchedEpochV3RoundTripAndV2Absent) {
     EXPECT_EQ(m.lastFetchedEpoch, kLastFetchedEpochV2Frame) << "a v2 frame is marked (fail closed)";
 }
 
-// KIP-320/595 (fix round 1): data frames keep their 46-byte framing; the
+// KIP-320/595 (fix round 1): data frames keep their framing (54 B since v5); the
 // DivergingEpoch / OffsetOutOfRange answer is a 12-byte payload of a record-less
 // error frame.  A v2 frame is refused (fail closed): decoded as
 // kErrUnsupportedWireVersion with no records.
 TEST(ReplicationMessages, FetchResponseErrorPayloadV3AndV2FailClosed) {
-    EXPECT_EQ(FetchResponseMsg::encodedSize(0), 46u) << "data-frame framing must stay 46 B";
+    EXPECT_EQ(FetchResponseMsg::encodedSize(0), 54u) << "data-frame framing: 8 + 42 + 4";
     uint8_t buf[256]{};
     ErrorPayloadBuf epb;
     const std::size_t n = FetchResponseMsg::encode(buf, 0, 4, 1, 10, 0, static_cast<int16_t>(-7),
@@ -325,8 +356,8 @@ TEST(FetchResponse, RoundTripEmptyRecords) {
 
     std::size_t written = FetchResponseMsg::encode(buf, 0,
         epoch, part, hw, logSt, err, empty);
-    // SBE: header(8) + block(34) + len_prefix(4) + 0 records = 46
-    EXPECT_EQ(written, 46u);
+    // SBE: header(8) + block(42) + len_prefix(4) + 0 records = 54
+    EXPECT_EQ(written, 54u);
 
     FetchResponseMsg m = FetchResponseMsg::decode(buf, 0);
     EXPECT_EQ(m.leaderEpoch,    epoch);

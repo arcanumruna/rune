@@ -119,8 +119,8 @@ public:
     static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(96);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(9);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(112);
-    static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(4);
-    static constexpr const char* SBE_SEMANTIC_VERSION = "1.2";
+    static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(5);
+    static constexpr const char* SBE_SEMANTIC_VERSION = "1.3";
 
     enum MetaAttribute
     {
@@ -194,12 +194,12 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeSchemaVersion() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(4);
+        return static_cast<std::uint16_t>(5);
     }
 
     SBE_NODISCARD static const char *sbeSemanticVersion() SBE_NOEXCEPT
     {
-        return "1.2";
+        return "1.3";
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR const char *sbeSemanticType() SBE_NOEXCEPT
