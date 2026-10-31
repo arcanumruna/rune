@@ -162,6 +162,14 @@ public:
         snapAll_();
         recordHistory_(&snaps_);
         awaitCompaction_();
+        compactedAway_ = 0;   // measured before the invariants: the first failure ends checkAll
+        for (const NodeSnap& s : snaps_) {
+            std::set<int64_t> present;
+            for (const auto& rec : s.log.data) present.insert(rec.offset);
+            std::size_t away = 0;
+            for (const auto& kv : data_) away += present.count(kv.first) == 0 ? 1 : 0;
+            compactedAway_ = std::max(compactedAway_, away);
+        }
         model_ = CheckedWritesModel();
         model_.declareRule(kObjTag, tagRule_().fingerprint(), CheckedWritesModel::tagEquals(9));
         for (const uint32_t cap : caps_) model_.declareRule(kObjCap, capRule_(cap).fingerprint(), CheckedWritesModel::capLiveKeys(cap));
@@ -626,9 +634,6 @@ private:
             return true;
         });
         registerInvariant("CompactionKeepsAcceptedValue", [](CheckedWritesStressDriver& d, std::string* why) {
-            std::set<int64_t> inHistory;
-            for (const auto& kv : d.data_) inHistory.insert(kv.first);
-            std::size_t away = 0;
             for (const NodeSnap& s : d.snaps_) {
                 std::set<int64_t> present;
                 for (const auto& rec : s.log.data) present.insert(rec.offset);
@@ -636,9 +641,7 @@ private:
                     if (latest.del) continue;
                     if (present.count(latest.offset) == 0) { *why = "node " + std::to_string(s.id) + " lost the latest accepted record of key " + std::to_string(id) + " at " + std::to_string(latest.offset); return false; }
                 }
-                away = std::max(away, inHistory.size() - present.size());
             }
-            d.compactedAway_ = away;
             return true;
         });
     }
