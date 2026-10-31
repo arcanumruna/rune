@@ -176,6 +176,19 @@ TEST_F(CompactionGapCatchUpRegression, BatchStraddlingTheLeoBlocksTheGapRegressi
     EXPECT_EQ(follower->logEndOffset(), 3);
 }
 
+// The cleaner removed epoch 1's first batch: the first surviving one is not the
+// epoch's start, so it is never compared (R16) - a leader that assigned the
+// start live would read a different history and the follower would refuse.
+TEST_F(CompactionGapCatchUpRegression, EpochStartAcrossAGapIsNeverComparedRegression) {
+    follower = followerAtLeo3();
+    follower->becomeFollower(1, kLeaderId);
+    std::vector<uint8_t> e1 = batch(5, 2);
+    rune::protocol::RecordBatchReader::stampLeaderEpoch(e1.data(), 1);
+    follower->applyReplicated(dataFrame(e1, 3));
+    ASSERT_EQ(follower->logEndOffset(), 7);
+    EXPECT_EQ(follower->heldEpochStartForTest(1), -1) << "5 is where epoch 1 survives, not where it starts";
+}
+
 // Contiguous frames apply exactly as before, with or without a read origin.
 TEST_F(CompactionGapCatchUpRegression, ContiguousApplyUnchangedRegression) {
     follower = followerAtLeo3();
