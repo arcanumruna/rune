@@ -152,6 +152,32 @@ TEST_P(CheckedWritesConsumerRegression, FailsClosedBeforeTheVerdictSourceExistsR
     EXPECT_EQ(ids, (std::vector<uint64_t>{1})) << "the accepted record below the known verdicts is delivered, the rejected one is not";
 }
 
+// A restarted leader has no timeline until the leadership scan is Ready: nothing is known, so nothing is delivered.
+TEST_P(CheckedWritesConsumerRegression, RejectedNeverDeliveredWhileTheLeadershipScanRunsRegression) {
+    TypedRig s;
+    int accepted = 0;
+    for (uint64_t b = 0; b < 40; ++b) {
+        std::vector<Rec> recs = {{b * 10 + 1, 1, 1}, {b * 10 + 2, 2, 1}};
+        accepted += 2;
+        if (b % 4 == 0) recs.push_back({b * 10 + 3, 3, 9});
+        ASSERT_EQ(s.r.produce(recs), 0);
+    }
+    s.r.passes(600);
+    s.r.enableEgress();   // connecting takes passes: it must not run under the scan
+    s.r.rcScanBytesPerPass = 256;   // the restarted worker scans a few batches per pass
+    s.r.restart();
+    ASSERT_NE(s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady) << "the scan is still running";
+    const auto sub = s.r.subscribe(GetParam());
+    if (GetParam() == SubKind::PushRead)   // one pass per call: the others drive passes until idle, which finishes the scan
+        for (int i = 0; i < 4 && s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i)
+            EXPECT_TRUE(s.r.collect(sub).records.empty()) << "nothing is delivered before the scan is Ready";
+    while (s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady) s.r.pass();
+    s.r.passes(300);
+    const auto& box = s.r.collect(sub);
+    for (const auto& d : box.records) EXPECT_NE(d.id % 10, 3u) << "rejected record " << d.id;
+    EXPECT_EQ(static_cast<int>(box.records.size()), accepted) << "the accepted records are delivered once the scan is Ready";
+}
+
 TEST(CheckedWritesConsumer, UntypedTopicPaysOneBranch) {
     VerdictRig r;
     ASSERT_EQ(r.produce({{1, 10, 1}, {2, 20, 9}}), 0);   // never typed: no write state
