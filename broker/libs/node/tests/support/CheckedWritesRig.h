@@ -164,6 +164,8 @@ public:
         passes(2);
     }
     void truncateTo(int64_t offset) { log->truncateTo(offset); passes(5); }
+    /// The replica cuts its log (a follower meeting a new leader's history): the log generation moves.
+    void truncateReplicaTo(int64_t offset) { replica->truncateLogForTest(offset); passes(5); }
     /// Another replica takes over: this node's tail above the HW is gone and no memory survives.
     void failover(bool reinstall = true) { restart(reinstall, replica->highWatermark()); }
     void reinstallAll() { for (auto& i : installs_) i.second(); }
