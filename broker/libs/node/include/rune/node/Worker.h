@@ -3615,8 +3615,11 @@ private:
 
     // ---- Part 04 (8.6): consumers of a verdict source ----
     /// Nothing is delivered past what the judge has decided; an untyped partition pays one null check.
-    [[nodiscard]] static int64_t verdictBound_(const PartitionWriteState* ws, int64_t bound) noexcept {
-        return ws == nullptr ? bound : std::min(bound, ws->verdictKnownThrough());
+    /// Until the leadership scan has rebuilt the timeline (RC not Ready) nothing is known: fail closed.
+    [[nodiscard]] int64_t verdictBound_(rune::replication::PartitionReplica* rep, const PartitionWriteState* ws, int64_t bound) noexcept {
+        if (ws == nullptr) return bound;
+        if (rcServe_(rep, rcOf_(rep)) == nullptr) return -1;
+        return std::min(bound, ws->verdictKnownThrough());
     }
     enum class Cut : uint8_t { Whole, Rebuilt, Empty, Full };
     /// One data batch for a consumer: the records the verdict index rejected are removed.  Whole: send `bp` as it is.
@@ -3662,7 +3665,7 @@ private:
                 bound_ = rc_->lso(bound_);
             }
             ws_ = w_.writeOf_(rep_);
-            bound_ = verdictBound_(ws_, bound_);
+            bound_ = w_.verdictBound_(rep_, ws_, bound_);
             return bound_;
         }
         [[nodiscard]] const rune::storage::RejectedOffsetIndex* rejected() const noexcept { return ws_ != nullptr ? &ws_->rejected : nullptr; }
@@ -4017,7 +4020,7 @@ private:
                 bound = rc->lso(bound);
             }
             const PartitionWriteState* const ws = writeOf_(rep);
-            bound = verdictBound_(ws, bound);
+            bound = verdictBound_(rep, ws, bound);
             if (s.nextOffset >= bound) continue;
 
             const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
@@ -4602,7 +4605,7 @@ private:
                 bound = std::min(bound, rc->lso(liveHw));
             }
             const int64_t beforeJudge = bound;
-            bound = verdictBound_(writeOf_(replica), bound);
+            bound = verdictBound_(replica, writeOf_(replica), bound);
             judgeHeld = bound < beforeJudge;
         } else if (a.isolation == kIsolationReadCommitted && topicId >= 0) [[unlikely]] {
             ret.setPushEffectiveBound(nextOffset);
@@ -8310,7 +8313,7 @@ private:
                        (!rune::protocol::client::acksAll(entry.acks) || static_cast<int>(rep->isr().size()) >= entry.minIsr) &&
                        (viewSet_ == nullptr ||
                         viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration()) > entry.lastOffset) &&
-                       (!source || (ws->verdictKnownThrough() > entry.lastOffset &&
+                       (!source || (verdictBound_(rep, ws, INT64_MAX) > entry.lastOffset &&
                                     (entry.replay == 0 || ws->markers.committedThrough() > entry.lastOffset)))) {
                 code = 0;
             } else if (nowNs >= entry.deadlineNs) {
