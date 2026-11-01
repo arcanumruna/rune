@@ -338,6 +338,50 @@ TEST(CheckedWritesVerdictWorker, TruncationOfAnUncommittedTailChangesNoVerdict) 
     EXPECT_EQ(w->rejected.find(cut - 1), nullptr);
 }
 
+TEST(CheckedWritesVerdictWorkerRegression, TruncatedOwnChangeAndMarkerLeaveTheTimelineRegression) {
+    // This node logs a marker and a second set change that never replicate; another leader takes over, writes data where they
+    // were and logs its own change later.  Once this node follows, truncates and re-leads, neither the cut change nor the cut
+    // marker may count.
+    constexpr int32_t kRej2 = 0x40000603;
+    VerdictRig r(/*follower=*/true);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.installProjection(kProj);
+    r.passes(20);
+    r.followerFetch();
+    r.passes(20);
+    ASSERT_EQ(r.produce({{1, 1, 0}, {2, 2, 0}, {3, 3, 9}}), 0);
+    const int64_t dataEnd = r.leo();
+    r.followerFetch(dataEnd);
+    r.passes(300);
+    const int64_t cut = dataEnd;   // the marker of the rejection sits here, uncommitted
+    ASSERT_EQ(r.leo(), cut + 1);
+    ASSERT_EQ(r.replica->highWatermark(), cut);
+    r.installRejectView(kRej2, kObj + 1, tagRule(8), "rej2");
+    r.passes(20);
+    ASSERT_EQ(r.readLog().changes.size(), 2u);
+    const PartitionWriteState* w = r.worker->writeStateForTest(VerdictRig::kSrc, 0);
+    ASSERT_NE(w, nullptr);
+    r.demote();
+    r.truncateReplicaTo(cut);
+    ASSERT_EQ(r.leo(), cut);
+    const std::vector<rune::storage::control_record::ChangeMember> both{
+        {kObj, static_cast<uint8_t>(rune::view::VerdictViewKind::TestReject), tagRule(9).fingerprint()},
+        {kObj + 1, static_cast<uint8_t>(rune::view::VerdictViewKind::TestReject), tagRule(8).fingerprint()}};
+    r.replicate({VerdictRig::batch({{10, 1, 0}, {11, 1, 0}, {12, 1, 8}}), VerdictRig::changeBatch(7, both), VerdictRig::batch({{13, 1, 8}, {14, 1, 0}})});
+    r.passes(50);
+    int64_t lastMarkerThrough = 0;
+    for (const auto& m : r.readLog().markers) lastMarkerThrough = std::max<int64_t>(lastMarkerThrough, m.header.finalThrough);
+    EXPECT_LE(w->markers.committedThrough(), lastMarkerThrough) << "W passed a marker the log no longer holds";
+    r.promote();
+    r.passes(500);
+    EXPECT_TRUE(r.hasRow(kProj, 10));
+    EXPECT_TRUE(r.hasRow(kProj, 11));
+    EXPECT_TRUE(r.hasRow(kProj, 12)) << "below the surviving change the record is judged under the old set";
+    EXPECT_FALSE(r.hasRow(kProj, 13));
+    EXPECT_TRUE(r.hasRow(kProj, 14));
+}
+
 TEST(CheckedWritesVerdictWorkerRegression, FailoverRightAfterAChangeRecordJudgesWithTheSameSetRegression) {
     VerdictRig r;
     r.typed();

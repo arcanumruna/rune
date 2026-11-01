@@ -7172,6 +7172,7 @@ private:
         int work = 0;
         for (std::size_t k = 0, i = rcWalkStart_; k < n; ++k) {
             RcSlot& sl = rcSlots_[i];
+            if (sl.write) [[unlikely]] verdictOnLogCut_(sl);
             if (!ringWork_(sl.replica, *sl.rc))
                 work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;   // publishes the cleaner LSO (D3b)
             if (sl.write && sl.write->constraintSets.size() != 0) [[unlikely]] verdictHousekeeping_(sl);
@@ -7191,6 +7192,20 @@ private:
             i = next;
         }
         return work;
+    }
+    // Part 04: a log truncation cut the changes and markers this node appended itself (a leader never truncates, so only a
+    // follower sees one).  Before the scan of the next leadership feeds the timeline again, and before the HW commits a slot
+    // whose marker is gone.  `rejected` stays: its entries belong to committed markers.
+    static void verdictOnLogCut_(RcSlot& sl) noexcept {
+        PartitionWriteState& w = *sl.write;
+        const uint64_t gen = sl.replica->logGeneration();
+        if (gen == w.seenLogGeneration) [[likely]] return;
+        if (w.seenLogGeneration != UINT64_MAX) {
+            const int64_t cut = sl.replica->lastTruncationOffset();
+            w.constraintSets.truncateFrom(cut);
+            w.markers.truncateFrom(cut);
+        }
+        w.seenLogGeneration = gen;
     }
     // Part 04: the markers below the HW are committed (W follows them), and the index forgets what retention deleted.
     void verdictHousekeeping_(RcSlot& sl) noexcept {
