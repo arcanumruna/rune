@@ -173,7 +173,10 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
         s.rejected.onMarker(m->header.fromOffset, m->header.finalThrough, m->header.count, [&](std::size_t i) {
             return rune::storage::RejectedOffsetIndex::Entry{m->offsetAt(static_cast<uint32_t>(i)), m->codeAt(static_cast<uint32_t>(i)), m->constraintIdAt(static_cast<uint32_t>(i))};
         });
-        (void)s.markers.onMarker(base, m->header.finalThrough);
+        if (!s.markers.onMarker(base, m->header.finalThrough)) {   // full: the slots below the HW are committed (the scan read them in order)
+            s.markers.onHw(std::min(base, s.scanHw));
+            (void)s.markers.onMarker(base, m->header.finalThrough);   // still full: 1024 uncommitted markers above the HW, the leader re-marks
+        }
     } else if (type == cr::kConstraintSetChange) {
         std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
         uint32_t id = 0;
