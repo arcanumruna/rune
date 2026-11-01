@@ -176,6 +176,8 @@ public:
         replica->becomeLeader(++epoch_, isr_);
         passes(3);
     }
+    /// Leader again without a pass: the state has not seen the leadership yet.
+    void promoteWithoutPass() { replica->becomeLeader(++epoch_, isr_); }
     void promote() {
         replica->becomeLeader(++epoch_, isr_);
         passes(3);

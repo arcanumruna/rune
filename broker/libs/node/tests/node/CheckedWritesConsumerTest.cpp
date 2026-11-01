@@ -178,6 +178,45 @@ TEST_P(CheckedWritesConsumerRegression, RejectedNeverDeliveredWhileTheLeadership
     EXPECT_EQ(static_cast<int>(box.records.size()), accepted) << "the accepted records are delivered once the scan is Ready";
 }
 
+// Part 04: dropping the topic frees its write state while the partition stays owned: the scan feed and the judge must go with it.
+TEST(CheckedWritesConsumerRegression, DropMidScanClearsTheVerdictHooksRegression) {
+    TypedRig s;
+    for (uint64_t b = 0; b < 40; ++b) ASSERT_EQ(s.r.produce({{b * 10 + 1, 1, 1}, {b * 10 + 2, 2, 9}}), 0);
+    s.r.passes(600);
+    ASSERT_NE(s.r.vs->verdictSource(VerdictRig::kSrc, 0), nullptr);
+    s.r.worker->setRcScanBytesPerPass(256);
+    s.r.demotePromote();
+    ASSERT_EQ(s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcScanning) << "the scan is still running";
+    ASSERT_NE(s.r.worker->rcVerdictHooksCtxForTest(VerdictRig::kSrc, 0), nullptr);
+    ASSERT_NE(s.r.vs->verdictSource(VerdictRig::kSrc, 0), nullptr);
+    WorkerOp d;
+    d.type = WorkerOp::Type::TopicDropped; d.topicId = VerdictRig::kSrc;
+    s.r.send(std::move(d));
+    EXPECT_EQ(s.r.worker->rcVerdictHooksCtxForTest(VerdictRig::kSrc, 0), nullptr) << "the scan no longer feeds the freed state";
+    EXPECT_EQ(s.r.vs->verdictSource(VerdictRig::kSrc, 0), nullptr) << "the judge no longer points at the freed state";
+    for (int i = 0; i < VerdictRig::kMaxPass && s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) s.r.pass();
+    EXPECT_EQ(s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
+    EXPECT_EQ(s.r.worker->rcVerdictHooksCtxForTest(VerdictRig::kSrc, 0), nullptr);
+}
+
+TEST(CheckedWritesConsumerRegression, DropWhileUnbuiltClearsTheVerdictHooksRegression) {
+    TypedRig s;
+    ASSERT_EQ(s.r.produce({{1, 10, 1}, {2, 20, 9}}), 0);
+    s.r.passes(300);
+    s.r.demote();
+    s.r.promoteWithoutPass();
+    ASSERT_EQ(s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcUnbuilt);
+    ASSERT_NE(s.r.worker->rcVerdictHooksCtxForTest(VerdictRig::kSrc, 0), nullptr);
+    WorkerOp d;
+    d.type = WorkerOp::Type::TopicDropped; d.topicId = VerdictRig::kSrc;
+    ASSERT_TRUE(s.r.worker->tryEnqueueOp(std::move(d)));
+    s.r.pass();
+    EXPECT_EQ(s.r.worker->rcVerdictHooksCtxForTest(VerdictRig::kSrc, 0), nullptr);
+    EXPECT_EQ(s.r.vs->verdictSource(VerdictRig::kSrc, 0), nullptr);
+    for (int i = 0; i < VerdictRig::kMaxPass && s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) s.r.pass();
+    EXPECT_EQ(s.r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
+}
+
 TEST(CheckedWritesConsumer, UntypedTopicPaysOneBranch) {
     VerdictRig r;
     ASSERT_EQ(r.produce({{1, 10, 1}, {2, 20, 9}}), 0);   // never typed: no write state

@@ -495,6 +495,10 @@ public:
         const RcState* rc = rcFor_(topicId, partition);
         return rc ? rc->statusCode() : kRcNone;
     }
+    [[nodiscard]] const void* rcVerdictHooksCtxForTest(int32_t topicId, int32_t partition) const {
+        const RcState* rc = rcFor_(topicId, partition);
+        return rc ? rc->verdictHooksCtxForTest() : nullptr;
+    }
     [[nodiscard]] uint64_t rcScanPassesForTest(int32_t topicId, int32_t partition) const {
         const RcState* rc = rcFor_(topicId, partition);
         return rc ? rc->scanSteps() : 0;
@@ -3379,7 +3383,12 @@ private:
     // The topic was dropped: states first (no dangling spec pointer), then the spec.
     [[gnu::cold]] void dropWriteSpec_(int32_t topicId) {
         for (auto& sl : rcSlots_)
-            if (sl.write && sl.replica->topicId() == topicId) sl.write.reset();
+            if (sl.write && sl.replica->topicId() == topicId) {
+                // Part 04: the scan feed and the judge point at the state
+                if (sl.rc) sl.rc->setVerdictHooks(RcVerdictHooks{});
+                if (viewSet_ != nullptr) viewSet_->dropVerdictSource(topicId, static_cast<int32_t>(sl.replica->partitionId()));
+                sl.write.reset();
+            }
         rebuildWriteById_();
         writeSpecs_.erase(topicId);
     }
@@ -6909,6 +6918,8 @@ private:
     static void bindVerdictHooks_(RcSlot& slot) noexcept {
         if (slot.write && slot.rc && slot.replica->isDiskBacked())
             slot.rc->setVerdictHooks(RcVerdictHooks{&verdictFeedBegin, &verdictFeedBatch, slot.write.get()});
+        else if (slot.rc)
+            slot.rc->setVerdictHooks(RcVerdictHooks{});
     }
     // Cold (ownership apply): carry still-owned states, create + reserve new
     // ones, drop the rest; re-resolve every subscription's cached pointer.
