@@ -7172,7 +7172,10 @@ private:
         int work = 0;
         for (std::size_t k = 0, i = rcWalkStart_; k < n; ++k) {
             RcSlot& sl = rcSlots_[i];
-            if (sl.write) [[unlikely]] verdictOnLogCut_(sl);
+            if (sl.write) [[unlikely]] {
+                verdictOnLogCut_(sl);
+                sl.write->scanHw = sl.replica->highWatermark();
+            }
             if (!ringWork_(sl.replica, *sl.rc))
                 work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;   // publishes the cleaner LSO (D3b)
             if (sl.write && sl.write->constraintSets.size() != 0) [[unlikely]] verdictHousekeeping_(sl);

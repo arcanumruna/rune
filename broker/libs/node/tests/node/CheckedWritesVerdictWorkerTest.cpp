@@ -417,6 +417,30 @@ TEST(CheckedWritesVerdictWorkerRegression, TruncatedOwnChangeAndMarkerLeaveTheTi
     EXPECT_TRUE(r.hasRow(kProj, 14));
 }
 
+TEST(CheckedWritesVerdictWorkerRegression, LeadershipScanPastTheLedgerCapacityKeepsWRegression) {
+    // More markers in the log than the ledger holds.  The leadership scan feeds them in order without an HW in between, so the
+    // ring filled and every later marker was dropped: W stayed at the 1024th until the leader re-marked the range.
+    VerdictRig r;
+    r.worker->setVerdictIntervalNs(kMs);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    const std::size_t want = MarkerLedger::kCapacity + 76;
+    for (uint64_t i = 1; r.readLog().markers.size() < want; ++i) {
+        ASSERT_EQ(r.produce({{i, int64_t(i), 9}}), 0);
+        r.passes(4);
+        ASSERT_LT(i, 3 * want);
+    }
+    r.passes(20);
+    int64_t lastMarkerThrough = 0;
+    for (const auto& m : r.readLog().markers) lastMarkerThrough = std::max<int64_t>(lastMarkerThrough, m.header.finalThrough);
+    ASSERT_GT(r.readLog().markers.size(), MarkerLedger::kCapacity);
+    r.rcScanBytesPerPass = 1 << 24;   // the whole log in one scan step
+    r.restart(/*reinstall=*/false);
+    r.passes(50);
+    EXPECT_EQ(r.writeState()->markers.committedThrough(), lastMarkerThrough) << "the scan dropped the markers past the ledger capacity";
+}
+
 TEST(CheckedWritesVerdictWorkerRegression, FailoverRightAfterAChangeRecordJudgesWithTheSameSetRegression) {
     VerdictRig r;
     r.typed();
