@@ -30,6 +30,7 @@ public:
         removable_.clear();
         events_.clear();
         cleanLimit_ = kNone;
+        rejectedInPass_ = false;
         removalsBelow_ = std::numeric_limits<int64_t>::min();
     }
 
@@ -44,10 +45,9 @@ public:
     void onConstraintSetChange(int64_t offset, bool nonEmpty) { events_.push_back(Event{offset, nonEmpty ? 1 : 0, 0, false}); }
     void onReservation(int64_t) noexcept {}   // part 06 gives it meaning
 
-    /// End of the pre-pass: the coverage, and the markers a pass may remove (only below `markerRemovalBound`, the minimum
-    /// fetch position over every assigned replica).
-    void finish(int64_t toOffset, int64_t publishedBound, int64_t markerRemovalBound) {
-        (void)toOffset;
+    /// End of the pre-pass: the coverage, whether a rejected record lies in the pass [dirtyStart, cleanLimit), and the
+    /// markers a pass may remove (only below `markerRemovalBound`, the minimum fetch position over every assigned replica).
+    void finish(int64_t dirtyStart, int64_t publishedBound, int64_t markerRemovalBound) {
         bool everNonEmpty = false, active = false, sawChange = false, sawMarker = false;
         int64_t lastEmptyAt = -1, cover = 0;
         for (const Event& e : events_) {
@@ -70,6 +70,7 @@ public:
         // Markers without a change record: the change was lost, so the verdicts owed are unknown - cap at what the markers cover.
         const int64_t own = !sawChange && sawMarker ? cover : !everNonEmpty ? kNone : (!active && cover > lastEmptyAt) ? kNone : cover;
         cleanLimit_ = std::min(own, publishedBound);
+        rejectedInPass_ = std::lower_bound(rejected_.begin(), rejected_.end(), dirtyStart) != std::lower_bound(rejected_.begin(), rejected_.end(), cleanLimit_);
         for (std::size_t i = 0; i + 1 < markers_.size(); ++i) {
             const Marker& m = markers_[i];
             if (m.offset >= markerRemovalBound) continue;                  // a replica has not fetched it
@@ -90,8 +91,9 @@ public:
             if (markers_[i].offset == markerOffset) return markers_[i].lastListed < removalsBelow_;
         return false;
     }
-    /// A rewrite has work even when no key was indexed: a rejected record to drop or a superseded marker to remove.
-    [[nodiscard]] bool hasWork() const noexcept { return !rejected_.empty() || !removable_.empty(); }
+    /// A rewrite has work even when no key was indexed: a rejected record in the pass to drop or a superseded marker to remove.
+    /// Rejections below the dirty start were compacted by an earlier pass and are not work.
+    [[nodiscard]] bool hasWork() const noexcept { return rejectedInPass_ || !removable_.empty(); }
     [[nodiscard]] bool keepsReservation(int64_t) const noexcept { return true; }
     /// Type 18 and 19 are always kept; 16 follows keepsReservation; a verdict marker (17) only goes through markerRemovable.
     [[nodiscard]] bool keepsControlRecord(int64_t offset, int16_t type) const noexcept {
@@ -109,6 +111,7 @@ private:
     std::vector<std::size_t> removable_;
     std::vector<Event> events_;
     int64_t cleanLimit_ = kNone;
+    bool rejectedInPass_ = false;
     int64_t removalsBelow_ = std::numeric_limits<int64_t>::min();
 };
 
