@@ -2553,8 +2553,16 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         // wrote it earlier; Kafka DUPLICATE_SEQUENCE parity): success, offset
         // unknown — every record completes Ok with -1, exactly once.
         const int64_t off = baseOffset < 0 ? -1 : baseOffset;
-        emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, 0,
-                      OpStatus::Ok, units, b->producerEpoch, b->producerId);
+        if (hasVerdicts && !verdicts.empty())   // the batch ack carries the first rejection
+            emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1,
+                          static_cast<int16_t>(verdicts[2] | (verdicts[3] << 8)),
+                          OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+        else if (dupSeq && viewSent_())
+            emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, errorCode,
+                          OpStatus::VerdictUnknown, units, b->producerEpoch, b->producerId);
+        else
+            emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, 0,
+                          OpStatus::Ok, units, b->producerEpoch, b->producerId);
         if (hasVerdicts && !verdicts.empty())
             completeVerdictSlice_(ps, b->ackStart, b->ackCount, off, b->tier2, b->recordCount, verdicts);
         else if (dupSeq && viewAcks())   // stored, but this retry's verdicts are gone: never per-record errors

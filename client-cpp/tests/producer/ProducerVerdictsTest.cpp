@@ -68,6 +68,10 @@ struct Rig {
         impl.setHooks(h);
         (void)tier2;
     }
+    std::vector<rc::BatchAck> batchAcks;
+    void captureBatchAcks() {
+        impl.setOnBatchAck([](void* ctx, const rc::BatchAck& a) noexcept { static_cast<Rig*>(ctx)->batchAcks.push_back(a); }, this);
+    }
     void send(int n, bool hold = true, int unhandled = -1) {
         for (int i = 0; i < n; ++i)   // record `unhandled` is sent without an ack handle
             EXPECT_TRUE(impl.submitSendRecord(1, 0, rc::Key(uint64_t(i + 1)), kVal, i != unhandled, ackhandle::forCq(0, rc::Token(i + 1))));
@@ -238,5 +242,29 @@ TEST(ProducerVerdictsRegression, UnhandledRejectedRecordDoesNotHideALaterRejecti
             EXPECT_EQ(c.status, OpStatus::Ok) << k;
         }
     }
+}
+
+TEST(ProducerVerdictsRegression, BatchAckCarriesTheFirstRejectionRegression) {
+    Rig r;
+    r.captureBatchAcks();
+    r.send(8);
+    ASSERT_EQ(r.corrs.size(), 1u);
+    const auto t = Rig::trailer({3, 5});
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);
+    ASSERT_EQ(r.batchAcks.size(), 1u);
+    EXPECT_EQ(r.batchAcks[0].errorCode, static_cast<int16_t>(kViolation));
+    EXPECT_EQ(r.batchAcks[0].baseOffset, -1);
+    EXPECT_EQ(r.batchAcks[0].recordCount, 8);
+}
+
+TEST(ProducerVerdictsRegression, BatchAckOnAViewDuplicateIsVerdictUnknownRegression) {
+    Rig r;
+    r.captureBatchAcks();
+    r.send(8);
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.impl.onProduceResponse(r.corrs[0], -1, static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence));
+    ASSERT_EQ(r.batchAcks.size(), 1u);
+    EXPECT_EQ(r.batchAcks[0].errorCode, static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence));
+    EXPECT_EQ(r.batchAcks[0].baseOffset, -1);
 }
 
