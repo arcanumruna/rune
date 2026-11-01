@@ -246,6 +246,21 @@ TEST(CheckedWritesConsumer, OversizedRebuildGrowsOnceAndIsCounted) {
     EXPECT_EQ(s.r.worker->verdictScratchGrowthsForTest(), growths) << "a second identical batch does not grow again";
 }
 
+TEST(CheckedWritesConsumerRegression, CutOfABatchAboveTheSpanReserveGrowsOnceAndIsCountedRegression) {
+    TypedRig s;
+    std::vector<Rec> big;
+    for (uint64_t i = 1; i <= 5000; ++i) big.push_back({i, int64_t(i), i == 5 ? uint8_t(9) : uint8_t(1)});
+    ASSERT_EQ(s.r.produce(big), 0);
+    s.r.passes(600);
+    const auto pr = s.r.subscribe(SubKind::PushRead);
+    EXPECT_EQ(s.r.collect(pr).records.size(), 4999u) << "the rejected record is dropped, the rest delivered";
+    EXPECT_EQ(s.r.worker->verdictSpanGrowthsForTest(), 1u);
+    ASSERT_EQ(s.r.produce(big), 0);
+    s.r.passes(600);
+    EXPECT_EQ(s.r.collect(pr).records.size(), 9998u);
+    EXPECT_EQ(s.r.worker->verdictSpanGrowthsForTest(), 1u) << "a second batch of the same size does not grow again";
+}
+
 TEST_P(CheckedWritesConsumer, ControlRecordsSixteenToNineteenAreNeverPushed) {
     TypedRig s;
     ASSERT_EQ(s.r.produce({{1, 10, 1}}), 0);

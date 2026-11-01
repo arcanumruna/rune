@@ -713,6 +713,7 @@ public:
     }
     [[nodiscard]] uint64_t verdictCutsForTest() const noexcept { return verdictCuts_; }
     [[nodiscard]] uint64_t verdictScratchGrowthsForTest() const noexcept { return verdictScratchGrowths_; }
+    [[nodiscard]] uint64_t verdictSpanGrowthsForTest() const noexcept { return verdictSpanGrowths_; }
     [[nodiscard]] WorkerViewSet* viewSet() const noexcept { return viewSet_; }
 
     // Task 16: this worker's view restart-readiness, for the GetViewRow serve
@@ -3640,6 +3641,14 @@ private:
         ++verdictCuts_;
         verdictSpans_.clear();
         verdictKeep_.clear();
+        if (size >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
+            const auto records = static_cast<std::size_t>(std::max<int32_t>(rune::protocol::RecordBatchReader(bp, size).recordCount(), 0));
+            if (records > verdictSpans_.capacity()) {   // cold: a batch above the 4096 reserve (non-View producer, replicated batch)
+                verdictSpans_.reserve(records);
+                verdictKeep_.reserve(records);
+                ++verdictSpanGrowths_;
+            }
+        }
         (void)rune::protocol::forEachRecordSpan(bp, size, [&](const rune::protocol::RecordSpan& r) {
             if (ws->rejected.find(r.offset) == nullptr) verdictKeep_.push_back(r.index);
             verdictSpans_.push_back(r);
@@ -6101,7 +6110,7 @@ private:
     std::vector<uint8_t>                  verdictRebuildScratch_ = std::vector<uint8_t>(static_cast<std::size_t>(kPushMaxChunkBytes));   // grow-once (counted)
     std::vector<rune::protocol::RecordSpan> verdictSpans_;
     std::vector<uint32_t>                 verdictKeep_;
-    uint64_t                              verdictCuts_ = 0, verdictScratchGrowths_ = 0;
+    uint64_t                              verdictCuts_ = 0, verdictScratchGrowths_ = 0, verdictSpanGrowths_ = 0;
     /// #65: push-read pread target (allocated once, at construction): one
     /// pass's push budget + the sparse-index skip slack + room for a first
     /// batch past the budget (a fresh pass always takes one).  Larger first
