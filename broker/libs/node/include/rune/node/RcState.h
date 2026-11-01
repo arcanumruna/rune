@@ -407,6 +407,7 @@ public:
         verdict_ = h;
         if (late) reset_();
     }
+    [[nodiscard]] const void* verdictHooksCtxForTest() const noexcept { return verdict_.ctx; }
     /// The read-ahead issuer (nullptr = synchronous MADV_WILLNEED).
     void setReadAhead(RcReadAhead fn, void* ctx) noexcept { readAheadFn_ = fn; readAheadCtx_ = ctx; }
     /// The async hint issued for this partition completed (its CQE was reaped).

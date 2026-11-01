@@ -283,6 +283,8 @@ public:
     /// Creates or erases the judge of (src, partition) as its verdict templates and logged timeline require, and registers its
     /// members.  nullptr when the partition is not a verdict source.  Cheap when nothing changed.
     VerdictSource* ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write);
+    /// The partition's write state is gone: its judge goes with it.
+    void dropVerdictSource(int32_t srcTopicId, int32_t partition) { verdictSources_.erase(instKey(srcTopicId, partition)); }
     [[nodiscard]] std::vector<uint64_t> verdictSourceKeysForTest() const {
         std::vector<uint64_t> keys;
         for (const auto& kv : verdictSources_) keys.push_back(kv.first);
