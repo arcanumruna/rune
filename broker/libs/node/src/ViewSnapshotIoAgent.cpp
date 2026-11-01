@@ -170,6 +170,12 @@ void ViewSnapshotIoAgent::handleResetFrame_(const uint8_t* p, std::size_t len, i
                       std::strerror(errno));
         return;
     }
+    // The reset starts a fresh stream, so an earlier write error no longer applies.
+    fs->errored = false;
+    if (rune::node::detail::platformFdatasync(fs->fd) != 0) {
+        spdlog::warn("ViewSnapshotIoAgent: fdatasync failed after reset for viewTopicId={} partition={}: {}",
+                     key.viewTopicId, key.partition, std::strerror(errno));
+    }
     fs->pendingO = fs->lastDurableO = -1;
     fs->dirtySinceSync = false;
 }
@@ -335,6 +341,10 @@ void ViewSnapshotIoAgent::forceWriteFailureForTest(int32_t viewTopicId, int32_t 
     // portable, deterministic stand-in for a real short/failed write (no
     // reliance on an OS-specific partial-write race window).
     fs->fd = ::open(deltaFilePath_(key).c_str(), O_RDONLY);
+}
+
+void ViewSnapshotIoAgent::forceErroredForTest(int32_t viewTopicId, int32_t partition) {
+    if (FileState* fs = fileFor_(Key{viewTopicId, partition})) fs->errored = true;
 }
 
 } // namespace rune::node
