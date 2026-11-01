@@ -679,3 +679,31 @@ TEST(CheckedWritesVerdictSourceRegression, ConstraintSetIsReconciledOnlyOnAChang
     drive();
     EXPECT_NE(vs.verdictSource(5, 0) == nullptr ? UINT64_MAX : vs.verdictSource(5, 0)->constraintSyncEpoch, synced) << "a retired template does";
 }
+
+// A view added before the first bindLeader has no judge cursor to compare its checkpoint with: it waits for the bind.
+TEST(CheckedWritesVerdictSourceRegression, AddVerdictViewBeforeBindDoesNotDiscardCheckpointRegression) {
+    struct Discards {
+        int n = 0;
+        static void count(void* ctx, ViewInstance&) { ++static_cast<Discards*>(ctx)->n; }
+    } discards;
+    Rig r;
+    r.vs.setViewHooks({&discards, nullptr, &Discards::count, nullptr});
+    const TestRejectRule rule = tagEquals(9);
+    r.members.push_back(std::make_unique<Member>(7, rule));
+    ViewInstance& inst = *r.members.back()->inst;
+    inst.persisted  = true;
+    inst.foldCursor = 5;
+    r.st.constraintSets.onChange(0, setOf(1, {r.members.back()->ident()}));
+    r.st.rejected.noteCovered(10);
+    r.log.control();
+    std::vector<Rec> recs;
+    for (int i = 1; i <= 9; ++i) recs.push_back({i, 1});
+    r.log.data(recs);
+    r.vs.installTestVerdictViewForTest(&inst, 7, rule);   // before any bindLeader
+    EXPECT_EQ(discards.n, 0);
+    EXPECT_EQ(inst.foldCursor, 5);
+    r.start();
+    r.drive();
+    EXPECT_EQ(discards.n, 0) << "the checkpoint is behind the markers this node holds";
+    EXPECT_EQ(r.vs.stats().verdictCheckpointsDiscarded, 0u);
+}

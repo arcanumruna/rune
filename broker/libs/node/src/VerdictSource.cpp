@@ -51,7 +51,7 @@ void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKi
     m.prospect.reserve(inst->layout, inst->agg ? &inst->agg->layout : nullptr);
     auto at = std::lower_bound(members_.begin(), members_.end(), viewObjectId, [](const Member& x, uint64_t id) { return x.objectId < id; });
     at = members_.insert(at, std::move(m));
-    if (!needsActivation_) discardCheckpointAhead_(*at);
+    if (!needsActivation_ && generation_ != kUnbound) discardCheckpointAhead_(*at);
     reindex_();
     recomputeCap_();
 }
