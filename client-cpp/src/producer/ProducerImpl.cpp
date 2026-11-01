@@ -2565,7 +2565,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
                           OpStatus::Ok, units, b->producerEpoch, b->producerId);
         if (hasVerdicts && !verdicts.empty())
             completeVerdictSlice_(ps, b->ackStart, b->ackCount, off, b->tier2, b->recordCount, verdicts);
-        else if (dupSeq && viewAcks())   // stored, but this retry's verdicts are gone: never per-record errors
+        else if (dupSeq && viewSent_())   // stored, but this retry's verdicts are gone: never per-record errors
             completeSlice_(ps, b->ackStart, b->ackCount, -1, OpStatus::VerdictUnknown, static_cast<uint16_t>(errorCode), b->tier2, b->recordCount);
         else
             completeSlice_(ps, b->ackStart, b->ackCount, off, OpStatus::Ok, 0, b->tier2, b->recordCount);

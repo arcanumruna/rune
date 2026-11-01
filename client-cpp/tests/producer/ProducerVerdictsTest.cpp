@@ -1,11 +1,15 @@
 // tests/producer/ProducerVerdictsTest.cpp - checked writes Part 04: a View ack's verdict trailer completes each record
 // as it was judged; a retry outside the broker's window is VerdictUnknown for the whole batch.  Bare ProducerImpl: frames
 // are captured from the sink and the broker's answers are injected.
+#include "../support/FakeCoordinator.h"
+
 #include <rune/client/Client.h>
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/Key.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/client/producer/ProducerHub.h>
 #include <rune/client/producer/ProducerImpl.h>
+#include <rune/protocol/client/TxnMessages.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -61,12 +65,12 @@ struct Rig {
         c.deliveryTimeoutMs = 120'000;
         return c;
     }
-    explicit Rig(Acks acks = Acks::All | Acks::View, bool tier2 = false) : impl(cfg(acks), 1 << 16) {
+    explicit Rig(Acks acks = Acks::All | Acks::View, bool tier2 = false) : Rig(cfg(acks)) { (void)tier2; }
+    explicit Rig(const rc::ProducerConfig& c) : impl(c, 1 << 16) {
         ProducerImpl::Hooks h;
         h.ctx = &cq;
         h.cqDeliver = &CqCapture::deliver;
         impl.setHooks(h);
-        (void)tier2;
     }
     std::vector<rc::BatchAck> batchAcks;
     void captureBatchAcks() {
@@ -268,3 +272,70 @@ TEST(ProducerVerdictsRegression, BatchAckOnAViewDuplicateIsVerdictUnknownRegress
     EXPECT_EQ(r.batchAcks[0].baseOffset, -1);
 }
 
+TEST(ProducerVerdictsRegression, TransactionalViewProducerDuplicateIsOkRegression) {
+    // A transactional producer never sends the View flag, so its verdicts cannot be lost: a duplicate is plain Ok.
+    auto c = Rig::cfg(Acks::All | Acks::View);
+    c.transactionalId = "txn-1";
+    c.transactionOpTimeoutMs = 1'000;
+    c.transactionTimeoutMs = 30'000;
+    Rig r(c);
+    test_support::FakeCoordinator fake;
+    rune::client::producer::ProducerHub hub;
+    hub.setCoordinatorSink(fake.sink());
+    hub.add(&r.impl);
+    int64_t now = kNow;
+    const ProducerImpl::SendFn sink = [&r](int32_t, int32_t, int32_t, const uint8_t* b, std::size_t n) {
+        const auto v = rc::codec::decodeProduce(b, n);
+        if (!v) return false;
+        const auto h = rpc::MessageHeader::decode(b, n);
+        r.corrs.push_back(h ? h->correlationId : 0);
+        return true;
+    };
+    const auto lastOffered = [&fake](uint16_t tid) -> const test_support::OfferedFrame* {
+        for (std::size_t i = fake.offered.size(); i-- > 0;)
+            if (fake.offered[i].templateId == tid) return &fake.offered[i];
+        return nullptr;
+    };
+    rune::client::producer::TxnControl init;
+    init.kind = rune::client::producer::TxnControl::Kind::Init;
+    init.target.handler = rc::CompletionHandler{[](void*, const rc::Completion&, std::span<const uint8_t>) noexcept {}, nullptr};
+    init.token = 1;
+    r.impl.applyTxnControl(init, now);
+    hub.drainAndFlush(now, 42, sink);
+    const auto* ip = lastOffered(rpc::InitProducerId::TEMPLATE_ID);
+    ASSERT_NE(ip, nullptr);
+    rpc::InitProducerIdResponse ir;
+    ir.correlationId = ip->corrId;
+    ir.producerId = 42;
+    ir.producerEpoch = 0;
+    ir.errorCode = 0;
+    test_support::AnswerFrame ia;
+    ia.len = ir.encode(ia.buf.data());
+    ia.templateId = rpc::InitProducerIdResponse::TEMPLATE_ID;
+    ASSERT_TRUE(hub.onCoordinatorResponse(ia.templateId, ia.data(), ia.len, now));
+    rune::client::producer::TxnControl begin;
+    begin.kind = rune::client::producer::TxnControl::Kind::Begin;
+    r.impl.applyTxnControl(begin, now);
+    r.impl.testMarkStarted(rune::client::producer::TxnStarted::Yes);
+    r.impl.setTxnGate(ProducerImpl::TxnGate::Open);
+    for (int i = 0; i < 4; ++i)
+        ASSERT_TRUE(r.impl.submitSendRecord(1, 0, rc::Key(uint64_t(i + 1)), kVal, true, ackhandle::forCq(0, rc::Token(i + 1))));
+    while (r.impl.drainRing(now, 16) != 0) {}
+    const test_support::OfferedFrame* add = nullptr;
+    for (int i = 0; i < 4 && add == nullptr; ++i) {
+        hub.drainAndFlush(now, 42, sink);
+        add = lastOffered(rpc::AddPartitionsToTxn::TEMPLATE_ID);
+    }
+    ASSERT_NE(add, nullptr);
+    const auto ans = fake.answerAdd(add->corrId, 0);
+    ASSERT_TRUE(hub.onCoordinatorResponse(ans.templateId, ans.data(), ans.len, now));
+    for (int i = 0; i < 4 && r.corrs.empty(); ++i) hub.drainAndFlush(now, 42, sink);
+    ASSERT_EQ(r.corrs.size(), 1u);
+    hub.onProduceResponse(r.corrs[0], -1, static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence));
+    for (rc::Token k = 1; k <= 4; ++k) {
+        ASSERT_EQ(r.cq.times[k], 1) << k;
+        EXPECT_EQ(r.cq.done[k].status, OpStatus::Ok);
+        EXPECT_EQ(r.cq.done[k].value, -1);
+    }
+    hub.remove(&r.impl);
+}
