@@ -462,10 +462,16 @@ public:
     // ---- pumping ----
     /// One pass of every worker, one poll of the subscriber, the model client applies what arrived.
     void step() {
+        const int64_t now = nowNs();
+        if (lastStepNs_ != 0) maxStepGapNs_ = std::max(maxStepGapNs_, now - lastStepNs_);
+        lastStepNs_ = now;
         for (std::size_t i = 0; i < workers_.size(); ++i) stepWorker_(i);
         sub_->poll(coll_.fa.handler(), 64);
         applyFrames_();
     }
+    /// #782: the longest the host left this thread (it drives the workers too) between two steps since the last reset.
+    [[nodiscard]] int64_t maxStepGapNs() const noexcept { return maxStepGapNs_; }
+    void resetStepGap() noexcept { maxStepGapNs_ = 0; lastStepNs_ = 0; }
     /// A pass of every worker WITHOUT polling the subscriber (egress back-pressure).
     void stepUnpolled() { for (std::size_t i = 0; i < workers_.size(); ++i) stepWorker_(i); }
     template <typename Pred>
@@ -677,6 +683,7 @@ private:
     std::vector<std::unique_ptr<FilterBuf>> filters_;
     Collector coll_;
     std::size_t consumed_ = 0;
+    int64_t lastStepNs_ = 0, maxStepGapNs_ = 0;
     std::map<int64_t, MemberView> client_;
     std::vector<Rec> recs_;
     std::vector<BatchRec> batches_;
