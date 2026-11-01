@@ -221,7 +221,9 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
     namespace cr = rune::storage::control_record;
     int64_t bytes = 0;
     std::vector<RejectedOffsetIndex::Entry> verdictEntries;
-    const Offset scanEnd = std::max(toOffset, verdictMarkerEnd);   // verdict markers above toOffset are read too
+    // Markers above toOffset are read too, but only in `bases` (sealed segments): the marker carrying W in the active
+    // segment is never read, so cleanLimit trails W by up to the active segment (cleans less, never more).
+    const Offset scanEnd = std::max(toOffset, verdictMarkerEnd);
     for (int64_t segBase : bases) {
         if (segBase >= scanEnd) break;
         hook();   // fix round 6: segment boundary
