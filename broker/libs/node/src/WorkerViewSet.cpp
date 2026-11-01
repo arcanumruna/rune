@@ -866,7 +866,7 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     std::copy_n(want.begin(), desired.count, desired.members.begin());
     int work = 0;
     if (!desired.sameMembers(logged)) {
-        const int r = judge.requestChange(desired);
+        const int64_t r = judge.requestChange(desired);
         if (r == VerdictSource::kChangeDeferred) return 0;   // not yet bound or activated: ask again next pass
         work = r >= 0 ? 1 : 0;
     }
