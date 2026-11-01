@@ -107,40 +107,40 @@ bool hasBatchAt(Log& log, int64_t off) {
 
 TEST(CheckedWritesVerdictCleaner, CoverageRules) {
     VerdictCleanState s;
-    s.finish(100, kMax, kMax);
+    s.finish(0, kMax, kMax);
     EXPECT_EQ(s.cleanLimit(), kMax) << "never a change: not a verdict source";
     s.clear();
     s.onConstraintSetChange(4, true);
-    s.finish(100, kMax, kMax);
+    s.finish(0, kMax, kMax);
     EXPECT_EQ(s.cleanLimit(), 5) << "a change and no marker: cover just past it";
     s.clear();
     s.onConstraintSetChange(4, true);
     s.onVerdictMarker(10, 5, 30, {});
-    s.finish(100, kMax, kMax);
+    s.finish(0, kMax, kMax);
     EXPECT_EQ(s.cleanLimit(), 30);
     s.onConstraintSetChange(40, false);
     s.clear();
     s.onConstraintSetChange(4, true);
     s.onVerdictMarker(10, 5, 41, {});
     s.onConstraintSetChange(40, false);
-    s.finish(100, kMax, kMax);
+    s.finish(0, kMax, kMax);
     EXPECT_EQ(s.cleanLimit(), kMax) << "an emptied set whose cover reached past the change: no verdict owed";
     s.clear();
     s.onConstraintSetChange(4, true);
     s.onVerdictMarker(10, 5, 41, {});
     s.onConstraintSetChange(40, false);
     s.onConstraintSetChange(50, true);
-    s.finish(100, kMax, kMax);
+    s.finish(0, kMax, kMax);
     EXPECT_EQ(s.cleanLimit(), 51) << "re-activated at 50: the verdicts owed start again, cover just past the new change";
 }
 
 TEST(CheckedWritesVerdictCleanerRegression, MissingChangeRecordNeverUncapsRegression) {
     VerdictCleanState s;
     s.onVerdictMarker(10, 5, 30, {});
-    s.finish(100, kMax, kMax);
+    s.finish(0, kMax, kMax);
     EXPECT_EQ(s.cleanLimit(), 30) << "markers without any change record: capped at what they cover, never uncapped";
     s.clear();
-    s.finish(100, kMax, kMax);
+    s.finish(0, kMax, kMax);
     EXPECT_EQ(s.cleanLimit(), kMax) << "neither a change nor a marker: not a verdict source";
 }
 
@@ -148,12 +148,12 @@ TEST(CheckedWritesVerdictCleaner, StaleBoundOnlyCleansLess) {
     VerdictCleanState s;
     s.onConstraintSetChange(0, true);
     s.onVerdictMarker(31, 1, 30, {});
-    s.finish(100, /*publishedBound=*/50, kMax);
+    s.finish(0, /*publishedBound=*/50, kMax);
     EXPECT_EQ(s.cleanLimit(), 30);
     s.clear();
     s.onConstraintSetChange(0, true);
     s.onVerdictMarker(31, 1, 30, {});
-    s.finish(100, /*publishedBound=*/20, kMax);
+    s.finish(0, /*publishedBound=*/20, kMax);
     EXPECT_EQ(s.cleanLimit(), 20);
 }
 
@@ -161,13 +161,13 @@ TEST(CheckedWritesVerdictCleaner, MarkerRemovalNeedsASupersedingMarkerAndTheBoun
     VerdictCleanState s;
     s.onVerdictMarker(10, 0, 10, std::vector<Entry>{{7, 55, 1}});
     s.onVerdictMarker(20, 10, 20, {});
-    s.finish(100, kMax, /*markerRemovalBound=*/10);
+    s.finish(0, kMax, /*markerRemovalBound=*/10);
     s.markRemovalsBelow(100);
     EXPECT_FALSE(s.markerRemovable(10)) << "a replica has not fetched it";
     s.clear();
     s.onVerdictMarker(10, 0, 10, std::vector<Entry>{{7, 55, 1}});
     s.onVerdictMarker(20, 10, 20, {});
-    s.finish(100, kMax, /*markerRemovalBound=*/11);
+    s.finish(0, kMax, /*markerRemovalBound=*/11);
     EXPECT_FALSE(s.markerRemovable(10)) << "no pass boundary marked yet";
     s.markRemovalsBelow(7);
     EXPECT_FALSE(s.markerRemovable(10)) << "the rejected record is not below the pass boundary yet";
@@ -179,6 +179,29 @@ TEST(CheckedWritesVerdictCleaner, MarkerRemovalNeedsASupersedingMarkerAndTheBoun
     EXPECT_FALSE(s.keepsControlRecord(10, cr::kVerdictMarker));
     EXPECT_TRUE(s.keepsControlRecord(10, cr::kConstraintSetChange));
     EXPECT_TRUE(s.keepsControlRecord(10, cr::kTxnJudge));
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, RejectionsBelowTheDirtyStartAreNoWorkRegression) {
+    VerdictCleanState s;
+    s.onConstraintSetChange(0, true);
+    s.onVerdictMarker(31, 1, 30, std::vector<Entry>{{7, 55, 1}});
+    s.finish(/*dirtyStart=*/8, kMax, kMax);
+    EXPECT_FALSE(s.hasWork()) << "the only rejected offset was compacted by an earlier pass";
+    s.clear();
+    s.onConstraintSetChange(0, true);
+    s.onVerdictMarker(31, 1, 30, std::vector<Entry>{{7, 55, 1}});
+    s.finish(/*dirtyStart=*/7, kMax, kMax);
+    EXPECT_TRUE(s.hasWork()) << "a rejected offset inside [dirtyStart, cleanLimit)";
+    s.clear();
+    s.onConstraintSetChange(0, true);
+    s.onVerdictMarker(31, 1, 30, std::vector<Entry>{{7, 55, 1}});
+    s.finish(/*dirtyStart=*/0, /*publishedBound=*/7, kMax);
+    EXPECT_FALSE(s.hasWork()) << "a rejected offset at or above the clean limit is not this pass's work";
+    s.clear();
+    s.onVerdictMarker(10, 0, 10, std::vector<Entry>{{7, 55, 1}});
+    s.onVerdictMarker(20, 10, 20, {});
+    s.finish(/*dirtyStart=*/8, kMax, /*markerRemovalBound=*/11);
+    EXPECT_TRUE(s.hasWork()) << "a superseded marker is removable work";
 }
 
 // ---- the cleaner on a Log ---------------------------------------------------------------------------------

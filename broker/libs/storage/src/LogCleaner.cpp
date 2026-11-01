@@ -215,7 +215,7 @@ int markerControlType(const uint8_t* batch, std::size_t len, const rune::protoco
 // Markers at/after toOffset (<= the committed HW) are not trusted: a txn whose
 // marker was not seen stays unresolved and caps the pass (txn.cleanLimit()).
 // Returns the bytes read (throttled by the caller like the M3 prefix reads).
-int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, Offset toOffset,
+int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, Offset fromOffset, Offset toOffset,
                      Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails,
                      const BoundaryHook& hook, VerdictCleanState& verdicts, Offset verdictBound, Offset verdictMarkerEnd) {
     namespace cr = rune::storage::control_record;
@@ -277,7 +277,7 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
         }
     }
     txn.finish(toOffset, markerRemovalBound);
-    verdicts.finish(toOffset, verdictBound, markerRemovalBound);
+    verdicts.finish(fromOffset, verdictBound, markerRemovalBound);
     return bytes;
 }
 
@@ -359,7 +359,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // aborted txn data.  M3: these reads are throttled by the caller.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
-    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_);
+    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_);
     toOffset = std::min(txn.cleanLimit(), verdicts.cleanLimit());
 
     for (size_t i = 0; i < bases.size(); ++i) {
@@ -417,7 +417,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // D3b: transaction pre-pass (+ producer tails) — see the bounded overload.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
-    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_);
+    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_);
     toOffset = std::min(txn.cleanLimit(), verdicts.cleanLimit());
 
     // Walk segments that overlap [fromOffset, toOffset).  `bases` and `dir` are
