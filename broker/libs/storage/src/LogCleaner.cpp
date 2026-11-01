@@ -616,7 +616,7 @@ bool LogCleaner::rewriteSegmentImpl(
         // A2: After building, patch in the original producer fields and
         // recompute CRC to preserve idempotent-producer identity.
         r.forEachRecord([&](std::string_view key, std::string_view val,
-                      int64_t offset, int64_t timestamp) {
+                      int64_t offset, int64_t timestamp, uint8_t attributes) {
             // Helper: emit this record as its own single-record batch,
             // preserving the original batch's producer identity (A2).
             // @param horizonMs  If >= 0, stamp this as a delete-horizon batch.
@@ -628,7 +628,7 @@ bool LogCleaner::rewriteSegmentImpl(
                     // This sets kAttrDeleteHorizon and puts horizonMs into baseTimestamp.
                     b.setDeleteHorizonMs(horizonMs);
                 }
-                b.append(key, val, timestamp);
+                b.append(key, val, timestamp, attributes);
                 // CP-10 ULL: use buildInto(tmpBatch) — reuses capacity, avoids per-record alloc.
                 b.buildInto(tmpBatch);
                 auto& batch = tmpBatch;
@@ -1528,12 +1528,12 @@ void LogCleaner::mergeGroupWithMap(
             bool lastKept = false;
 
             r.forEachRecord([&](std::string_view key, std::string_view val,
-                          int64_t offset, int64_t timestamp) {
+                          int64_t offset, int64_t timestamp, uint8_t attributes) {
                 auto keepWithHorizon2 = [&](int64_t horizonMs2) {
                     rune::protocol::RecordBatchBuilder b2(offset, timestamp);
                     b2.setTransactional(batchIsTxn);
                     if (horizonMs2 >= 0) b2.setDeleteHorizonMs(horizonMs2);
-                    b2.append(key, val, timestamp);
+                    b2.append(key, val, timestamp, attributes);
                     b2.buildInto(tmpBatch);
                     auto& batch = tmpBatch;
                     // Kafka parity: keep the source batch's partitionLeaderEpoch.

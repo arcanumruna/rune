@@ -5,6 +5,7 @@
 #include <string_view>
 #include <cstring>
 #include <functional>
+#include <type_traits>
 #include "Crc32c.h"
 #include "Varint.h"
 
@@ -399,7 +400,8 @@ public:
         forEachRecord(fn);
     }
 
-    /// Visit every record: fn(key, value, offset, timestamp).  TEMPLATED — the
+    /// Visit every record: fn(key, value, offset, timestamp), or fn(key, value, offset, timestamp, attributes) when the
+    /// visitor takes the record's attributes byte (bits 0-1: write intent).  TEMPLATED — the
     /// visitor inlines; no std::function per record (broker hot paths: schema-
     /// validated produce on every worker shard pass).
     template <class Fn>
@@ -427,7 +429,7 @@ public:
 
         for (int32_t i = 0; i < recordCount(); ++i) {
             (void)readVarint(d_, pos);            // record length
-            ++pos;                                // attributes
+            const uint8_t attributes = d_[pos++];
             int64_t tsDelta  = readVarlong(d_, pos);
             int32_t offDelta = readVarint(d_, pos);
             int32_t klen     = readVarint(d_, pos);
@@ -441,7 +443,10 @@ public:
             // For normal batches, batchTs == baseTimestamp() and tsDelta restores the
             // original per-record timestamp.
             const int64_t recordTs = horizonStamped ? batchTs : (batchTs + tsDelta);
-            fn(key, val, base + offDelta, recordTs);
+            if constexpr (std::is_invocable_v<Fn&, std::string_view, std::string_view, int64_t, int64_t, uint8_t>)
+                fn(key, val, base + offDelta, recordTs, attributes);
+            else
+                fn(key, val, base + offDelta, recordTs);
         }
     }
 
