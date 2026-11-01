@@ -2071,7 +2071,12 @@ if(BUILD_TESTING)
         target_include_directories(rune_auth_cluster_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_auth_cluster_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
                               GTest::gtest_main)
-        gtest_discover_tests(rune_auth_cluster_tests PROPERTIES TIMEOUT 900)
+        # #454: the 100 ms revoke gate is wall-clock - a latency gate (RUN_SERIAL + LABELS latency, stage b, idle host).
+        set(RUNE_AUTH_CLUSTER_LATENCY_TESTS "AuthClusterRegression.RevokeEndsSubscriptionsOnEveryBrokerWithin100msRegression")
+        gtest_discover_tests(rune_auth_cluster_tests TEST_FILTER "${RUNE_AUTH_CLUSTER_LATENCY_TESTS}"
+                             PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE LABELS latency)
+        gtest_discover_tests(rune_auth_cluster_tests TEST_FILTER "-${RUNE_AUTH_CLUSTER_LATENCY_TESTS}"
+                             PROPERTIES TIMEOUT 900)
 
         # Authentication Task 18: seeded, model-checked stress - racing security DDL vs produce / subscribe / create against
         # an independent permission model (support/PermissionModel.h).

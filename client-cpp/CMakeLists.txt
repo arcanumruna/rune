@@ -124,7 +124,7 @@ option(ENABLE_FLIGHT_RECORDER "Compile in flight-recorder instrumentation" ON)
 # flight-recorder lives in its own repo (github.com/arcanumruna/flight-recorder).
 # -DFLIGHT_RECORDER_DIR=<checkout with src/ + include/> overrides (local development,
 # docker builds); otherwise FetchContent clones it at the pinned commit (clone only: we
-# compile its sources ourselves).  Keep the pin in sync with client-cpp/CMakeLists.txt.
+# compile its sources ourselves).  Keep the pin in sync with broker/CMakeLists.txt.
 set(FLIGHT_RECORDER_DIR "" CACHE PATH "Local flight-recorder checkout; empty = fetch it")
 set(FLIGHT_RECORDER_GIT_REPOSITORY "git@github.com:arcanumruna/flight-recorder.git" CACHE STRING
     "flight-recorder git URL used when FLIGHT_RECORDER_DIR is unset")
