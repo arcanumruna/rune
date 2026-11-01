@@ -161,7 +161,8 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     for (Member& m : members_) discardCheckpointAhead_(m);
     activeSet_ = *state.constraintSets.setAt(judgeCursor_);
     setFrom_   = judgeCursor_;
-    sawEmptyChange_ = judgedRecord_ = false;
+    sawEmptyChange_ = false;
+    judgedRecord_   = judgeCursor_ > std::max(emitFrom_, state.markers.committedMarkerEnd());   // the committed marker itself is no record to cover
     reindex_();
     recomputeCap_();
 }

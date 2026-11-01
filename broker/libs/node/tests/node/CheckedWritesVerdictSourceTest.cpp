@@ -707,3 +707,24 @@ TEST(CheckedWritesVerdictSourceRegression, AddVerdictViewBeforeBindDoesNotDiscar
     EXPECT_EQ(discards.n, 0) << "the checkpoint is behind the markers this node holds";
     EXPECT_EQ(r.vs.stats().verdictCheckpointsDiscarded, 0u);
 }
+
+// A leader cut that loses the uncommitted marker leaves judged records without cover; an idle partition still covers them.
+TEST(CheckedWritesVerdictSourceRegression, LeaderCutLosingMarkerStillCoversJudgedRecordsRegression) {
+    Rig r;
+    auto& m = r.install(7, tagEquals(9));
+    r.st.constraintSets.onChange(0, setOf(1, {m.ident()}));
+    r.log.control();
+    r.log.data({{1, 1}, {2, 1}});
+    r.start();
+    r.drive(100'000'000);
+    ASSERT_EQ(r.vs.appendedForTest().size(), 1u);
+    ASSERT_EQ(r.vs.judgedThrough(), 3);
+    r.st.markers.truncateFrom(0);   // the marker never committed
+    r.vs.bindLeader(nullptr, 2, 0);
+    for (int i = 1; i <= 4; ++i) {
+        r.drive(100'000'000 + i * 100'000'000);
+        verdictOnHw(r.st, 1'000'000);
+    }
+    EXPECT_EQ(r.st.markers.committedThrough(), 3);
+    EXPECT_EQ(r.vs.appendedForTest().size(), 2u);
+}
