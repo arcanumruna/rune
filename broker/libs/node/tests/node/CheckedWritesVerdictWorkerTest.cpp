@@ -175,6 +175,41 @@ TEST(CheckedWritesVerdictWorkerRegression, RetentionNeverDeletesTheLatestSetChan
     EXPECT_TRUE(sawAccepted);
 }
 
+TEST(CheckedWritesVerdictWorkerRegression, RetentionKeepsTheChangeGoverningWRegression) {
+    // The judge is held back (the install is missing), so no marker covers the records after the first change.  The leader logs
+    // the set again at the log end; once that commits, retention must still keep the first change: it governs the records
+    // between W and the second one, which the next leader has to judge.
+    VerdictRig r(false, /*rollBytes=*/1);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.installProjection(kProj);
+    r.passes(50);
+    ASSERT_EQ(r.readLog().changes.front().offset, 0);
+    r.restart(/*reinstall=*/false);
+    r.installProjection(kProj, "proj2");
+    ASSERT_EQ(r.produce({{1, 10, 9}}), 0);
+    ASSERT_EQ(r.produce({{2, 20, 0}}), 0);
+    for (int i = 0; i < 300; ++i) {
+        if (const auto snap = r.log->cleanerSnapshot()) {
+            for (const auto& si : *snap) (void)r.log->enqueueDeletedSegment(si.baseOffset, si.lineage);
+        }
+        r.pass();
+    }
+    ASSERT_FALSE(r.readLog().changes.empty());
+    ASSERT_GE(r.readLog().changes.back().offset, 2) << "the set was logged again";
+    ASSERT_TRUE(r.vs->verdictSource(VerdictRig::kSrc, 0)->waitingForInstall());
+    ASSERT_EQ(r.writeState()->markers.committedThrough(), 0);
+    EXPECT_EQ(r.log->logStartOffset(), 0) << "the change governing W went with its segment";
+    r.restart(/*reinstall=*/false);
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.installProjection(kProj, "proj3");
+    r.passes(500);
+    EXPECT_FALSE(r.hasRow(kProj, 1)) << "the record W did not cover is judged by the next leader";
+    EXPECT_TRUE(r.hasRow(kProj, 2));
+    const int64_t sub = r.subscribe(SubKind::Raw, r.log->logStartOffset());
+    for (const auto& d : r.collect(sub).records) EXPECT_NE(d.id, 1u) << "a rejected record was delivered";
+}
+
 TEST(CheckedWritesVerdictWorkerRegression, RetentionRefreshWaitsForTheLeadershipScanRegression) {
     // The first change sits in the oldest segment.  While this node follows, the other leader logs a second change deep enough
     // in the log that the leadership scan reaches it only after several passes.  A refresh of the half-scanned timeline on the

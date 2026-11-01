@@ -7218,10 +7218,14 @@ private:
         if (!sl.replica->isDiskBacked()) return;
         rune::storage::Log& log = *sl.replica->log();
         w.rejected.dropBelow(log.logStartOffset());
-        // The latest committed set change outlives retention: a restart without it finds no verdict source.  When it sits in
-        // the oldest segment the leader logs it again; retention takes that segment once the new one is committed.
+        // The latest committed set change outlives retention: a restart without it finds no verdict source.  So does the change
+        // governing W, the first offset no committed marker covers: the next leader judges from there.  When one sits in the
+        // oldest segment the leader logs the set again; retention takes that segment once the new one is committed and W is past.
+        const int64_t W = w.markers.committedThrough();
+        int64_t governing = w.constraintSets.lastChangeBelow(W);
+        if (governing < 0) governing = w.constraintSets.nextChangeAtOrAfter(W);
         const int64_t change = w.constraintSets.lastChangeBelow(sl.replica->highWatermark());
-        sl.replica->holdRetentionAt(change < 0 ? std::numeric_limits<int64_t>::max() : change);
+        sl.replica->holdRetentionAt(std::min(change < 0 ? std::numeric_limits<int64_t>::max() : change, governing));
         if (w.verdicts == nullptr || w.constraintSets.latest().empty()) return;
         // Only a leader whose scan has fed every logged change: before that, latest() can be an older set, and logging it
         // again would undo the changes the scan has not reached yet.
