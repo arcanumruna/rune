@@ -63,7 +63,7 @@ security 64 to 95.
 | 13 | `AuthServerFirst` | B→C | `combinedNonce`, `count` |
 | 14 | `AuthClientFinal` | C→B | `count` |
 | 15 | `AuthServerFinal` | B→C | `errorCode`, `flags`, `retryAfterMs`, `serverSignature`, `detail` |
-| 16 | `Produce` | C→B | `topicId`, `partition`, `partitionKnown`, `acks` (bit 0 All, bit 1 View, v17), `producerId, `producerEpoch`, `baseSequence`, `key`, `recordBatch` |
+| 16 | `Produce` | C→B | `topicId`, `partition`, `partitionKnown`, `acks` (bit 0 All, bit 1 View, v17), `producerId`, `producerEpoch`, `baseSequence`, `key`, `recordBatch` |
 | 17 | `ProduceResponse` | B→C | `errorCode`, `partition`, `baseOffset`, `logStartOffset`, `assignedBase` (v17), `verdicts` (v17, optional trailer) |
 | 18 | `Subscribe` | C→B | `topicId`, `partition`, `partitionKnown`, `fromOffset`, `isolation`, `key`, `filter` (v11, optional trailer) |
 | 19 | `SubscribeResponse` | B→C | `errorCode`, `partition`, `subscriptionId`, `detail` (v11, optional trailer) |

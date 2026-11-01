@@ -3746,7 +3746,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return true;
     }
     // Namespaces Phase 2 Task 9 (D23): the acks floor of the session's namespace, per produce (a client picks acks per
-    // request): one slot-array load and a compare.  wire acks 0 = Leader, 1 = All; lowestAcks >= 2 requires All.
+    // request): one slot-array load and a compare.  the wire acks byte is a bit set (bit 0 = All, bit 1 = View); lowestAcks >= 2 requires the All bit.
     if (!rune::node::nsAcksAllowed(nsSlots_.limits(session->nsSlot), msg.acks)) [[unlikely]] {
         if (!answerRejection_(*session, *pc::MessageHeader::decode(buf, len), nsLimitCode_(*session),
                               "namespace limit exceeded: acks below the namespace's lowest acks", buf, len))

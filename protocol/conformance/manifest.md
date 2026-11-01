@@ -375,7 +375,7 @@ Offset  Hex                                        Notes
 
 ---
 
-## 11. `produce_explicit_partition.bin` — 60 bytes
+## 11. `produce_explicit_partition.bin` — 62 bytes
 
 **Message:** `Produce` (templateId = 16)
 
@@ -534,7 +534,7 @@ Offset  Hex                                        Notes
 56      01 00 37 00 00 00 05 00                    recordIndex 1, code 55, constraintId 0x00050000
 ```
 
-### 13e. `produce_acks_all_view.bin` — 60 bytes
+### 13e. `produce_acks_all_view.bin` — 62 bytes
 
 `produce_explicit_partition.bin` (section 11) with `acks = 3` (bit 0 All, bit 1 View) at offset 33. No other byte differs.
 
