@@ -31,7 +31,7 @@ struct VerdictViewHooks {
 
 class VerdictSource {
 public:
-    static constexpr int kChangeDeferred = -1, kChangeUnchanged = -2;
+    static constexpr int64_t kChangeDeferred = -1, kChangeUnchanged = -2;
 
     /// What WorkerViewSet::syncConstraintSet_ last reconciled this judge against: the template epoch and the latest logged change.
     uint64_t constraintSyncEpoch = UINT64_MAX;
@@ -67,7 +67,7 @@ public:
     void markLeaving(int32_t viewTopicId) noexcept;
     /// Appends a constraint-set change at the LEO.  Returns the activation offset, kChangeDeferred or kChangeUnchanged.
     /// `refresh`: append even when the members are those of the latest change (retention is about to delete its segment).
-    int requestChange(const ConstraintSet& next, bool refresh = false);
+    int64_t requestChange(const ConstraintSet& next, bool refresh = false);
     void installTestVerdictViewForTest(ViewInstance*, uint64_t viewObjectId, TestRejectRule);
 
     /// Cold: the replica to append through and the leadership this judge serves.  A new generation re-activates.

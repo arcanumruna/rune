@@ -728,3 +728,18 @@ TEST(CheckedWritesVerdictSourceRegression, LeaderCutLosingMarkerStillCoversJudge
     EXPECT_EQ(r.st.markers.committedThrough(), 3);
     EXPECT_EQ(r.vs.appendedForTest().size(), 2u);
 }
+
+TEST(CheckedWritesVerdictSourceRegression, RequestChangeAboveTwoToTheThirtyOneReturnsTheOffsetRegression) {
+    constexpr int64_t kOffset = (int64_t{1} << 31) + 5;
+    Rig r;
+    auto& m = r.install(7, tagEquals(9));
+    r.log.next = kOffset - 1;
+    r.log.control();
+    r.st.constraintSets.onChange(kOffset - 1, setOf(1, {}));
+    r.start();
+    r.drive();
+    ASSERT_EQ(r.vs.judgedThrough(), kOffset);
+    const int64_t at = r.vs.requestChange(setOf(2, {m.ident()}));
+    EXPECT_EQ(at, kOffset);
+    EXPECT_EQ(r.st.constraintSets.lastChangeOffset(), kOffset);
+}

@@ -399,7 +399,7 @@ int VerdictSource::dropRetired_(PartitionWriteState& state) {
     return static_cast<int>(before - members_.size());
 }
 
-int VerdictSource::requestChange(const ConstraintSet& next, bool refresh) {
+int64_t VerdictSource::requestChange(const ConstraintSet& next, bool refresh) {
     if (state_ == nullptr || generation_ == kUnbound || needsActivation_) return kChangeDeferred;
     if (!refresh && next.sameMembers(state_->constraintSets.latest())) return kChangeUnchanged;
     ConstraintSet logged = next;
@@ -419,7 +419,7 @@ int VerdictSource::requestChange(const ConstraintSet& next, bool refresh) {
     }
     if (base < 0) return kChangeDeferred;
     state_->constraintSets.onChange(base, logged);
-    return static_cast<int>(base);
+    return base;
 }
 
 void verdictOnHw(PartitionWriteState& state, int64_t hw) noexcept {
