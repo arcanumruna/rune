@@ -166,7 +166,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
   - **Overflow.** An overlay overflow returns `PrepareStatus::CapacityExhausted`, and the judge stalls.
   - **Proof.** A three-way identity test (legacy frozen copy, direct fold, prepare+apply loop) pins "the same code".
 - **P4-14 — The cleaner (§8.5).**
-  - **State.** `VerdictCleanState` is fed by `scanTxnState` (`LogCleaner.cpp:216-251`) from control batches with `pid < 0`. The scan now runs to `max(toOffset, verdictMarkerEnd)` for those batches only. `verdictMarkerEnd` is the published end of the committed marker that carries W.
+  - **State.** `VerdictCleanState` is fed by `scanTxnState` (`LogCleaner.cpp:216-251`) from control batches with `pid < 0`. The scan bound is `max(toOffset, verdictMarkerEnd)`, but it walks only the sealed bases the caller passes, so it never reads the marker carrying W in the active segment: `cleanLimit` stops at the last marker in a sealed segment and the cleaner trails W by up to the active segment (it cleans less, never more). `verdictMarkerEnd` is the published end of the committed marker that carries W.
   - **Limit.** `cleanLimit = min(published W bound, the coverage it saw itself)`, so a stale publish can only make it clean less.
   - **Rules.**
     - Rejected records never enter the offset map and are dropped by both rewrite engines (`rewriteSegmentImpl`, `LogCleaner.cpp:435`, `mergeGroupWithMap`, `:1386`).
@@ -1051,7 +1051,7 @@ A failure prints `seed=<n> step=<k> action=<name>`.
     - `CheckedWritesVerdictCleaner.RigCompactionKeepsTheAcceptedLatest`: cell-(e) assertion on 200 random writes.
 - [ ] **Step 2: Run to verify they fail.** `cmake --build build/root -j14 --target rune_storage_tests rune_checked_writes_verdict_tests && ctest --test-dir build/root -R CheckedWritesVerdictCleaner --output-on-failure`. Expected: FAIL (a rejected latest value wins).
 - [ ] **Step 3: Implement** as specified.
-  - `scanTxnState` walks segments up to `max(toOffset, verdictMarkerEnd)`. Above `toOffset` it feeds only `pid < 0` control batches (data is not indexed there).
+  - `scanTxnState` walks the sealed bases up to `max(toOffset, verdictMarkerEnd)` (never the active segment, so the cleaner trails W by up to one segment). Above `toOffset` it feeds only `pid < 0` control batches (data is not indexed there).
   - The map builds skip `verdicts.isRejected(offset)` per record.
   - Both rewrite engines drop such records.
   - `markerAction` consults `VerdictCleanState` for `pid < 0` control batches by `control_record::recordType`.
