@@ -3070,15 +3070,21 @@ void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, 
         uint64_t& slot = ps.ackRing[(ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
         const uint64_t h = slot;
         slot = 0;
-        if (h == 0) continue;
         if (tier2) {
+            if (h == 0) continue;
             if (n != 0)
                 completeHandle_(h, OpKind::Tier2Batch, -1, recordCount, OpStatus::BrokerError, le16(verdicts.data() + 2), le32(verdicts.data() + 4));
             else
                 completeHandle_(h, OpKind::Tier2Batch, baseOffset >= 0 ? baseOffset : -1, recordCount, OpStatus::Ok, 0);
             continue;
         }
-        if (next < n && le16(verdicts.data() + next * 8) == i) {
+        while (next < n && le16(verdicts.data() + next * 8) < static_cast<uint16_t>(i)) ++next;
+        const bool rej = next < n && le16(verdicts.data() + next * 8) == static_cast<uint16_t>(i);
+        if (h == 0) {   // no handle (back-filled), but a rejection of it still consumes its entry
+            if (rej) ++next;
+            continue;
+        }
+        if (rej) {
             const uint8_t* e = verdicts.data() + next * 8;
             ++next;
             completeHandle_(h, OpKind::Send, -1, 0, OpStatus::BrokerError, le16(e + 2), le32(e + 4));

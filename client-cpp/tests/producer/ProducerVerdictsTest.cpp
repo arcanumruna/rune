@@ -68,9 +68,9 @@ struct Rig {
         impl.setHooks(h);
         (void)tier2;
     }
-    void send(int n, bool hold = true) {
-        for (int i = 0; i < n; ++i)
-            EXPECT_TRUE(impl.submitSendRecord(1, 0, rc::Key(uint64_t(i + 1)), kVal, true, ackhandle::forCq(0, rc::Token(i + 1))));
+    void send(int n, bool hold = true, int unhandled = -1) {
+        for (int i = 0; i < n; ++i)   // record `unhandled` is sent without an ack handle
+            EXPECT_TRUE(impl.submitSendRecord(1, 0, rc::Key(uint64_t(i + 1)), kVal, i != unhandled, ackhandle::forCq(0, rc::Token(i + 1))));
         (void)hold;
         for (int i = 0; i < 1000 && corrs.empty(); ++i) {
             while (impl.drainRing(kNow) != 0) {}
@@ -217,3 +217,26 @@ TEST(ProducerVerdicts, OpStatusThirteenIsReservedAndVerdictUnknownIsFourteen) {
     EXPECT_EQ(static_cast<int>(OpStatus::StoredIdUnknown), 13);
     EXPECT_EQ(static_cast<int>(OpStatus::VerdictUnknown), 14);
 }
+
+TEST(ProducerVerdictsRegression, UnhandledRejectedRecordDoesNotHideALaterRejectionRegression) {
+    Rig r;
+    r.send(8, true, 2);
+    ASSERT_EQ(r.corrs.size(), 1u);
+    const auto t = Rig::trailer({2, 5});   // record 2 has no completion handle
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);
+    EXPECT_EQ(r.cq.times[3], 0) << "the unhandled record completes nothing";
+    for (rc::Token k = 1; k <= 8; ++k) {
+        if (k == 3) continue;
+        ASSERT_EQ(r.cq.times[k], 1) << k;
+        const auto& c = r.cq.done[k];
+        if (k == 6) {   // record index 5
+            EXPECT_EQ(c.status, OpStatus::BrokerError);
+            EXPECT_EQ(c.errorCode, kViolation);
+            EXPECT_EQ(rc::constraintIdOf(c), kCid);
+            EXPECT_EQ(c.value, -1);
+        } else {
+            EXPECT_EQ(c.status, OpStatus::Ok) << k;
+        }
+    }
+}
+
