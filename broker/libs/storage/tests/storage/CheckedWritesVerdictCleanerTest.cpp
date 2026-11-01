@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/Log.h>
@@ -92,6 +93,29 @@ std::set<int64_t> dataOffsets(Log& log) {
         if ((r.attributes() & rune::protocol::batch::kAttrControl) == 0)
             r.forEachRecord([&](std::string_view, std::string_view, int64_t o, int64_t) { out.insert(o); });
         cur = std::max(cur + 1, r.baseOffset() + r.lastOffsetDelta() + 1);
+    }
+    return out;
+}
+// offset -> attributes byte of every data record in the log
+std::map<int64_t, uint8_t> recordAttributes(Log& log) {
+    std::map<int64_t, uint8_t> out;
+    for (int64_t cur = log.logStartOffset(); cur < log.logEndOffset();) {
+        auto bytes = log.read(cur, 1 << 20);
+        if (bytes.empty()) {
+            const auto bases = log.segmentBaseOffsets();
+            const auto next = std::upper_bound(bases.begin(), bases.end(), cur);
+            if (next == bases.end()) break;
+            cur = *next;
+            continue;
+        }
+        for (std::size_t pos = 0; pos < bytes.size();) {
+            rune::protocol::RecordBatchReader r(bytes.data() + pos, bytes.size() - pos);
+            if (!r.ensureValid()) return out;
+            if ((r.attributes() & rune::protocol::batch::kAttrControl) == 0)
+                (void)rune::protocol::forEachRecordSpan(bytes.data() + pos, bytes.size() - pos, [&](const rune::protocol::RecordSpan& rec) { out[rec.offset] = rec.attributes; });
+            cur = std::max(cur + 1, r.baseOffset() + r.lastOffsetDelta() + 1);
+            pos += static_cast<std::size_t>(r.totalLength());
+        }
     }
     return out;
 }
@@ -261,6 +285,34 @@ TEST(CheckedWritesVerdictCleaner, RejectedRecordsAreDroppedInBothRewriteEngines)
             const auto offs = dataOffsets(log);
             EXPECT_TRUE(offs.count(3)) << (group ? "group" : "file") << ": the accepted value stays";
             EXPECT_FALSE(offs.count(7)) << (group ? "group" : "file") << ": the rejected one is dropped";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+TEST(CheckedWritesVerdictCleanerRegression, RebuildKeepsRecordAttributesRegression) {
+    for (const Path path : {Path::Range, Path::RangeCoalesce}) {
+        SCOPED_TRACE(path == Path::Range ? "range" : "coalesce");
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            rune::protocol::RecordBatchBuilder a(0, 2000);   // offset 0 is superseded: the batch is rebuilt without it
+            a.append("k1", "old", 2000, 0);
+            a.append("k2", "kept", 2001, 2);
+            log.append(a.build(), 0);
+            rune::protocol::RecordBatchBuilder b(2, 2002);
+            b.append("k1", "new", 2002, 1);
+            b.append("k3", "also", 2003, 3);
+            log.append(b.build(), 2);
+            data(log, 4, "tail", "t");
+            clean(log, path, /*verdictBound=*/kMax, /*markerEnd=*/kMax);
+            const auto attrs = recordAttributes(log);
+            EXPECT_EQ(attrs.count(0), 0u) << "the superseded record is gone";
+            ASSERT_EQ(attrs.count(1), 1u);
+            EXPECT_EQ(attrs.at(1), 2) << "kept record's intent bits survive the rebuild";
+            EXPECT_EQ(attrs.at(2), 1);
+            EXPECT_EQ(attrs.at(3), 3);
         }
         std::filesystem::remove_all(dir);
     }
