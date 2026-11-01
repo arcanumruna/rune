@@ -24,6 +24,7 @@
 //
 // Election timing (all optional; defaults are fast-but-safe for co-located clusters):
 //   RUNE_ELECTION_TIMEOUT_MS        — int64 ms, default 150. Max wait per election round.
+//   RUNE_VERDICT_INTERVAL_MS        — int64 ms, default 100. How often a verdict source writes a marker for accepted-only progress.
 //   RUNE_ELECTION_STATUS_INTERVAL_MS — int64 ms, default 20. Canvass/heartbeat cadence.
 //   RUNE_STARTUP_CANVASS_TIMEOUT_MS — int64 ms, default 100. Extended canvass on first boot.
 //   RUNE_MIN_ISR                    — int32, minimum ISR size for acks=All gate. Default:
@@ -321,6 +322,7 @@ struct NodeConfig {
     // Defaults are fast-but-safe for co-located / test clusters.
     // Increase for cross-datacenter deployments.
     int64_t electionTimeoutMs        = 150;  // default 150 ms
+    int64_t verdictIntervalMs        = 100;  // RUNE_VERDICT_INTERVAL_MS (checked writes SD14)
     int64_t electionStatusIntervalMs =  20;  // default  20 ms
     int64_t startupCanvassTimeoutMs  = 100;  // default 100 ms
 

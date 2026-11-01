@@ -670,11 +670,20 @@ public:
         int64_t baseOffset;  ///< meaningful when errorCode == 0 (-1: offset unknown)
         int16_t errorCode;   ///< rune::protocol::client::ErrorCode (0 = OK)
         int64_t logStartOffset = -1;  ///< D6: the partition's log start (with UnknownProducerId)
+        bool     hasVerdicts   = false;   ///< client 17: a View ack's trailer follows (verdictCount entries at verdictOffset)
+        uint16_t verdictCount  = 0;
+        uint32_t verdictOffset = 0;       ///< into the agent's verdict bytes (verdictBytes())
     };
     [[nodiscard]] std::span<const ProduceAck> produceAcks() const noexcept {
         return {produceAcks_.data(), produceAcks_.size()};
     }
-    void clearProduceAcks() noexcept { produceAcks_.clear(); }
+    /// The 8-byte trailer entries of `a` {recordIndex u16, code u16, constraintId u32}; valid until clearProduceAcks().
+    [[nodiscard]] std::span<const uint8_t> verdictBytes(const ProduceAck& a) const noexcept {
+        return {verdictBytes_.data() + a.verdictOffset, std::size_t{a.verdictCount} * 8};
+    }
+    void clearProduceAcks() noexcept { produceAcks_.clear(); verdictBytes_.clear(); }
+    /// Times the trailer bytes had to grow (a duty cycle with more verdicts than ever before).
+    [[nodiscard]] uint64_t verdictArenaGrowths() const noexcept { return verdictArenaGrowths_; }
 
     /// The Aeron client closed itself — or the T15b test fault was applied.
     [[nodiscard]] bool transportClosed() const noexcept { return testFault_ || transport_.closed(); }
@@ -1171,6 +1180,8 @@ private:
     std::vector<PartitionRoute> routes_;
     std::vector<uint32_t>       freeRoutes_;
     std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears
+    std::vector<uint8_t>        verdictBytes_; // the trailers of produceAcks_, cleared with them; grows only for a larger duty cycle
+    uint64_t                    verdictArenaGrowths_ = 0;
     bool                        mnDebug_ = false;  // RUNE_MN_DEBUG, read ONCE
     uint64_t                    handshakeFinalLegFailures_ = 0;   // fix round 5 (N4-I1), duty thread
 

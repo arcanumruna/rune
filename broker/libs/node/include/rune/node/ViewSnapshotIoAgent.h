@@ -143,6 +143,7 @@ private:
     };
 
     void handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx);
+    void handleResetFrame_(const uint8_t* p, std::size_t len, int channelIdx);
     // Returns nullptr on an ::open() failure -- NOT cached in files_, so the
     // next call for the same key retries open() (review-round-1 fix: a
     // transient failure must never permanently blackhole a key).

@@ -119,6 +119,15 @@ struct RcFacts {
     int32_t  epoch                = 0;
 };
 
+/// The leadership scan's feed for checked-writes control records (producerId < 0, types 16-19).  `begin` runs on the
+/// Unbuilt -> Scanning edge of a disk scan (`target` = the LEO at entry); `batch` for every such control batch the scan
+/// walks.  fn-pointer + ctx, no std::function.
+struct RcVerdictHooks {
+    void (*begin)(void* ctx, int64_t logStart, int64_t target) noexcept = nullptr;
+    void (*batch)(void* ctx, const uint8_t* batch, std::size_t len, int64_t baseOffset) noexcept = nullptr;
+    void* ctx = nullptr;
+};
+
 /// A fixed-capacity open-addressing set of producer ids (>= 0): linear probing at
 /// load <= 1/2, O(1) membership, no allocation after reserve() and never past its
 /// capacity — an insert into a full set is refused (the caller decides the policy).
@@ -392,6 +401,12 @@ public:
     void bindProducerState(rune::storage::ProducerStateManager* psm, int32_t topicId, int32_t partition) noexcept {
         psm_ = psm; psmTopic_ = topicId; psmPartition_ = partition;
     }
+    /// The feed only sees a scan that runs after it is bound: a state already built without it scans again.
+    void setVerdictHooks(const RcVerdictHooks& h) noexcept {
+        const bool late = verdict_.ctx != h.ctx && !std::holds_alternative<Unbuilt>(st_);
+        verdict_ = h;
+        if (late) reset_();
+    }
     /// The read-ahead issuer (nullptr = synchronous MADV_WILLNEED).
     void setReadAhead(RcReadAhead fn, void* ctx) noexcept { readAheadFn_ = fn; readAheadCtx_ = ctx; }
     /// The async hint issued for this partition completed (its CQE was reaped).
@@ -595,6 +610,7 @@ public:
                 Scanning sc;
                 sc.cursor = sc.segBase = log->logStartOffset();
                 sc.target = log->logEndOffset();
+                if (verdict_.begin != nullptr) verdict_.begin(verdict_.ctx, sc.cursor, sc.target);
                 sc.epoch = f.epoch; sc.logGen = f.logGeneration; sc.leadGen = f.leadershipGeneration;
                 st_ = sc;
             }
@@ -846,6 +862,9 @@ private:
                 if (out.outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
                     haltInvariant_("RcBuilder refused a whole batch inside the log's written bytes");
                 if (psm_ != nullptr) feedProducerState_(r, out.outcome, p + pos, len);
+                if (verdict_.batch != nullptr && out.outcome == rune::transaction::RcBuilder::Outcome::Ignored &&
+                    (r.attributes() & rune::protocol::batch::kAttrControl) != 0 && r.producerId() < 0) [[unlikely]]
+                    verdict_.batch(verdict_.ctx, p + pos, len, base);
                 s.cursor = last + 1;
             }
             pos += len;
@@ -1013,6 +1032,7 @@ private:
     void*            readAheadCtx_ = nullptr;
     bool             hintInFlight_ = false;   ///< survives reset_(): the kernel still owns the hint
     StepProfile*     profile_      = nullptr;
+    RcVerdictHooks verdict_;
     rune::storage::ProducerStateManager* psm_ = nullptr;   ///< F15 S5: the worker's psm_ (not owned)
     int32_t          psmTopic_     = 0;
     int32_t          psmPartition_ = 0;

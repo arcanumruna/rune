@@ -229,6 +229,15 @@ enum class ErrorCode : uint16_t {
     NamespaceLimitExceeded = 52,  // a namespace limit (or the cluster's maxNamespaces at CreateNamespace) is reached
     Throttled              = 53,  // a namespace rate limit shed the request; carries a retry-after
     ViewPaused             = 54,  // the view is paused by its namespace's state
+    // Checked writes (client version 17, kClientVersionCheckedWrites): each is sent ONLY to a session >= 17; an older
+    // client is answered InvalidRequest (39).
+    ConstraintViolation      = 55,  // the record broke a view rule when it was folded; constraint id = viewObjectId << 16 | ordinal (0 = unique).  Fold, per record, definite
+    KeyExists                = 56,  // insert on a key that exists.  Fold, per record, definite
+    KeyNotFound              = 57,  // update or delete-existing on a key that is absent.  Fold, per record, definite
+    AutoIncrementExhausted   = 58,  // the counter reached autoincrement.max; the batch is not stored.  Write, definite
+    ViewKeyExpressionInvalid = 59,  // DDL compile error: a view key expression
+    ViewConstraintInvalid    = 60,  // DDL compile error: a unique / check constraint
+    ViewUniqueInvalid        = 61,  // DDL compile error: a unique clause
 };
 
 // ---------------------------------------------------------------------------
@@ -377,9 +386,16 @@ inline constexpr int32_t kClientVersionRecordEgressUnavailable      = 15;  // un
 // declared egressChannel path. A Redirect's message to a session >= 16 may end with `#<gateway response-control
 // port>`; absent = the leader has none (use the declared path).
 inline constexpr int32_t kClientVersionResponseEgress             = 16;
-inline constexpr int32_t kClientVersion                           = kClientVersionResponseEgress;  // what this protocol's client announces
 // client-cpp announces 16 (response egress, NAT plan Task 7); it sends responseCorrelated = 1 only when it has a
 // response publication for the endpoint (a gateway response-control port is configured / learnt).
+// 17 — checked writes: the Produce `acks` byte carries bit 1 (View: the ack waits until every view of the partition has
+//   folded the batch), ProduceResponse carries a 30-byte block (assignedBase) and an optional verdict trailer, and the
+//   error codes 55-61 exist.  A broker >= 10 serves them; a client sends the View bit only to a session whose
+//   `ConnectResponse.brokerVersion >= kBrokerVersionCheckedWrites`.  A session below 17 is never sent 55-61
+//   (produceErrorForClient answers InvalidRequest) and keeps the exact 46 / 38 byte ProduceResponse.
+//   GetViewRowK / ScanViewRows / GetStats are gated on the same constants.
+inline constexpr int32_t kClientVersionCheckedWrites              = 17;
+inline constexpr int32_t kClientVersion                           = kClientVersionCheckedWrites;  // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -413,6 +429,8 @@ enum class AuthState : uint8_t { MustAuthenticate = 0, ResumedAuthenticated = 1,
 //       partition's ingressReceiverId to sessions >= 12 (see client version 12).
 //   9 — NAT-safe egress: answers a session >= 16 that sets responseCorrelated on a response publication and advertises
 //       response-control ports in Metadata (see client version 16).
+//  10 — checked writes: decodes the `acks` View bit, answers sessions >= 17 the 54-byte ProduceResponse and codes 55-61
+//       (see client version 17).
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kBrokerVersionExplicitGroupSubscriptions = 3;
 inline constexpr int32_t kBrokerVersionAuth                       = 5;   // authentication (ConnectResponse v9 fields)
@@ -420,7 +438,8 @@ inline constexpr int32_t kBrokerVersionFilter                     = 6;   // subs
 inline constexpr int32_t kBrokerVersionReceiverKeys               = 7;   // per-receiver c2b keys (issue #116)
 inline constexpr int32_t kBrokerVersionNamespaces                 = 8;   // namespaces (client version 14)
 inline constexpr int32_t kBrokerVersionResponseEgress             = 9;   // NAT-safe egress (client version 16)
-inline constexpr int32_t kBrokerVersion                           = kBrokerVersionResponseEgress;   // what this protocol's broker announces
+inline constexpr int32_t kBrokerVersionCheckedWrites              = 10;  // checked writes (client version 17)
+inline constexpr int32_t kBrokerVersion                           = kBrokerVersionCheckedWrites;   // what this protocol's broker announces
 
 /// Issue #116: true when a session whose client announced `clientVersion` and whose broker announced
 /// `brokerVersion` binds each encrypted client->broker frame to one receiver (see client version 12).
@@ -498,6 +517,12 @@ inline constexpr int32_t kBrokerVersion                           = kBrokerVersi
     return clientVersion >= kClientVersionFilter;
 }
 
+/// True when a session that connected with `clientVersion` may be answered the checked-writes codes 55-61 and the
+/// 54-byte ProduceResponse (version 17).
+[[nodiscard]] constexpr bool clientUnderstandsCheckedWrites(int32_t clientVersion) noexcept {
+    return clientVersion >= kClientVersionCheckedWrites;
+}
+
 /// The produce error code a session that connected with `clientVersion` is
 /// answered: UnknownProducerId becomes OutOfOrderSequence (the pre-D6 answer)
 /// for clients below kClientVersionUnknownProducerId, TransientLogFull becomes
@@ -513,6 +538,8 @@ inline constexpr int32_t kBrokerVersion                           = kBrokerVersi
         return ErrorCode::NotLeader;   // issue #112: a pre-v13 client's retriable code
     if ((ec == ErrorCode::NamespaceSuspended || ec == ErrorCode::NamespaceLimitExceeded || ec == ErrorCode::Throttled) && clientVersion < kClientVersionNamespaces) [[unlikely]]
         return ErrorCode::InvalidRequest;   // namespaces Phase 2 Task 11: the namespace codes (51-53) exist only for a v14+ client
+    if (ec >= ErrorCode::ConstraintViolation && ec <= ErrorCode::ViewUniqueInvalid && !clientUnderstandsCheckedWrites(clientVersion)) [[unlikely]]
+        return ErrorCode::InvalidRequest;   // checked writes: 55-61 exist only for a v17+ client
     return ec;
 }
 

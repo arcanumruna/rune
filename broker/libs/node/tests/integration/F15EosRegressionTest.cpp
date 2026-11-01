@@ -6278,7 +6278,7 @@ TEST(UnknownProducerIdRegression, OldSessionsGetTheStrictPreD6FrameAtEveryAnswer
                                        << " B frame: a strict pre-D6 decoder drops it";
             oldCodes.push_back(d->err);
         } else {
-            ASSERT_EQ(f.size(), pc::ProduceResponse::ENCODED_SIZE) << "a clientVersion-2 session gets the 46 B frame";
+            ASSERT_EQ(f.size(), pc::ProduceResponse::encodedSizeFor(pc::kClientVersion)) << "a current-version session gets the full frame";
             newCodes.push_back(pc::ProduceResponse::decode(f.data(), f.size())->errorCode);
         }
     }

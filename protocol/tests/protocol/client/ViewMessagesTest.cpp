@@ -235,7 +235,7 @@ TEST(ViewMessagesRegression, ViewSourceIsViewCodeIsPinned) {
 TEST(ViewMessagesRegression, RowTooLargeStatusAndInvalidRequestClientGateArePinnedRegression) {
     EXPECT_EQ(static_cast<uint16_t>(ViewRowResponse::kRowTooLarge), 7u);
     EXPECT_EQ(kClientVersionInvalidRequest, 5);
-    EXPECT_EQ(kClientVersion, 16);   // v16: NAT-safe response egress (client-cpp announces it); v15: RecordEgressUnavailable (#450); v14: namespaces (templates 81-83, codes 51-54); v13: produce ConcurrentTransactions (#112); v12: per-receiver c2b keys (#116; v11: filters; v10: TxnOffsetCommit member fence + UnstableOffsetCommit; v9: authentication; v8: catalog history DDL, v7: the transient lineage note)
+    EXPECT_EQ(kClientVersion, 17);   // v17: checked writes; v16: NAT-safe response egress (client-cpp announces it); v15: RecordEgressUnavailable (#450); v14: namespaces (templates 81-83, codes 51-54); v13: produce ConcurrentTransactions (#112); v12: per-receiver c2b keys (#116; v11: filters; v10: TxnOffsetCommit member fence + UnstableOffsetCommit; v9: authentication; v8: catalog history DDL, v7: the transient lineage note)
     EXPECT_FALSE(clientUnderstandsInvalidRequest(4));
     EXPECT_TRUE(clientUnderstandsInvalidRequest(5));
 }

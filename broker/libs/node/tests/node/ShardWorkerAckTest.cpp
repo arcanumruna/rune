@@ -123,7 +123,7 @@ struct Fixture {
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
         worker->setWorkerIngress(ing.get(), true);
         worker->setShardMode(true);
-        worker->setShardClient(client.get());
+        worker->setShardClient(client.get(), 0, /*minAckTermBytes=*/0);   // these tests stall a 64 KiB window
         const int64_t sreg = client->addSubscription("aeron:ipc", kEgress);
         const int64_t preg = client->addExclusivePublication("aeron:ipc", kIngress);
         for (int i = 0; i < kCap && !(egress && producePub && producePub->isConnected()); ++i) {
@@ -807,7 +807,7 @@ TEST(ShardWorkerAckUnknownProducerIdRegression, ShardChainAnswersUnknownProducer
         << "a clientVersion-2 session must see 28 in shard mode (the announce carries the version to the sink)";
     EXPECT_EQ(f.acks[61].logStartOffset, logStart)
         << "the shard ack must carry the log start (else the client always takes U2)";
-    EXPECT_EQ(f.ackBytes[61], pc::ProduceResponse::ENCODED_SIZE);
+    EXPECT_EQ(f.ackBytes[61], pc::ProduceResponse::encodedSizeFor(pc::kClientVersion));
 
     f.produce(/*corr=*/62, /*acks=*/0, /*pid=*/7, /*seq=*/6, /*sid=*/6, f.pub2.get());
     ASSERT_TRUE(f.awaitAck(62));

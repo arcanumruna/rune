@@ -909,6 +909,9 @@ public:
     // The slot pool's app side (free stack + SPSC free-ring consumer) is owned by ONE thread: the
     // thread that created the producer (Invoker mode: the owner thread), or the one that called
     // bindBatchThread().  Every Tier-2 entry compares against it BEFORE touching the pool.
+    /// SD11: the seed broker's version (0 = unknown: sends).  Set from the duty thread on every seed connect.
+    void setBrokerVersion(int32_t v) noexcept { brokerVersion_ = v; }
+    [[nodiscard]] bool viewAcks() const noexcept { return has(cfg_.acks, Acks::View); }
     [[nodiscard]] bool onBatchThread() const noexcept { return std::this_thread::get_id() == t2Thread_; }
     /// Rebind the issuing thread to the caller, before the first batch() from the new thread.  A
     /// builder still live on the old thread is refused there and hands its slot back through the
@@ -1102,7 +1105,7 @@ public:
     /// the partition's log start carried with UnknownProducerId (-1 = not
     /// carried) — rule U decides retention (re-sequence) from loss (unknown).
     void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
-                           int64_t logStartOffset = -1);
+                           int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {});
 
     /// Called on redirect-reconnect failure (SessionLost) and by the close paths
     /// (duty-cycle thread, or after it stopped): fails AND drops every accepted
@@ -1722,7 +1725,11 @@ private:
     /// the onAck handler, or the Client's CQ registry.  Duty thread; never
     /// allocates, never throws.
     void completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t aux, OpStatus st,
-                         uint16_t errorCode) noexcept;
+                         uint16_t errorCode, uint32_t constraintId = 0) noexcept;
+    /// completeSlice_ for an Ok batch whose View ack carried a verdict trailer: a rejected record completes BrokerError
+    /// (code, constraintId); a Tier-2 batch completes once, with its first rejection.
+    void completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset, bool tier2,
+                               int32_t recordCount, std::span<const uint8_t> verdicts) noexcept;
     /// Completes the handles of slice [ackStart, ackStart+ackCount): record i ->
     /// baseOffset + i (Ok), or -1 with `st` / `errorCode`.  `tier2`: the slice
     /// is one Tier-2 batch (op Tier2Batch, aux = recordCount).  Zeroes each
@@ -1809,6 +1816,18 @@ private:
     void failBuilder_(PartitionState& ps, OpStatus st, uint16_t errorCode = 0);
     /// #689: fail (never send) every Tier-2 batch queued on ps.
     void failQueuedTier2_(PartitionState& ps, OpStatus st, uint16_t errorCode) noexcept;
+    /// The Produce `acks` wire byte: bit 0 All, bit 1 View.  A transactional producer never sends View: its sends are
+    /// judged by the commit, and a View ack would wait for the LSO that waits for this very send's ack.
+    [[nodiscard]] uint8_t ackWireByte_() const noexcept {
+        return static_cast<uint8_t>((has(cfg_.acks, Acks::All) ? rune::protocol::client::kAcksWireAll : 0) |
+                                    (viewSent_() ? rune::protocol::client::kAcksWireView : 0));
+    }
+    [[nodiscard]] bool viewSent_() const noexcept { return has(cfg_.acks, Acks::View) && cfg_.transactionalId.empty(); }
+    /// SD11: a known seed broker below the checked-writes version cannot decode the View bit.
+    [[nodiscard]] bool viewRefused_() const noexcept {
+        return viewSent_() && brokerVersion_ >= 1 && brokerVersion_ < rune::protocol::client::kBrokerVersionCheckedWrites;
+    }
+    int32_t brokerVersion_ = 0;
     /// Draining: every accepted record completed and the ring consumed to the
     /// closed tail.
     [[nodiscard]] bool fullyDrained_() const noexcept;

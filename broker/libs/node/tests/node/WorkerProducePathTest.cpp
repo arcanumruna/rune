@@ -754,7 +754,7 @@ TEST(WorkerProduceRegression, UndecodableIngressProduceIsAnsweredInvalidRequestR
     worker.setOwnedDirect({replica.get()});
 
     auto frame = encodeProduceFrameIdem(4242, makeBatchOfExactSize(128), -1);
-    frame[pc::MessageHeader::ENCODED_SIZE + 9] = 2;   // unknown acks byte → Produce::decode rejects
+    frame[pc::MessageHeader::ENCODED_SIZE + 9] = 4;   // unknown acks bit → Produce::decode rejects
     ASSERT_FALSE(pc::Produce::decode(frame.data(), frame.size()).has_value());
     int n = 0;
     WorkerReturn got;
@@ -1086,7 +1086,7 @@ TEST(WorkerProduceRegression, WorkerLogsItsNoHangCountersPeriodicallyOnChangeReg
     EXPECT_FALSE(worker.maybeLogNoHangStatsForTest(1)) << "nothing changed: no line";
     EXPECT_EQ(worker.nextNoHangStatsLogNsForTest(), 1 + Worker::kNoHangStatsLogNs);
     auto frame = encodeProduceFrameIdem(4244, makeBatchOfExactSize(128), -1);
-    frame[pc::MessageHeader::ENCODED_SIZE + 9] = 2;   // undecodable body → answered InvalidRequest
+    frame[pc::MessageHeader::ENCODED_SIZE + 9] = 4;   // undecodable body → answered InvalidRequest
     (void)worker.handleIngressFrameForTest(frame.data(), frame.size(), /*nowNs=*/2);
     worker.drainReturn([](const WorkerReturn&) {});
     ASSERT_EQ(worker.undecodableProduceAnswersForTest(), 1u);

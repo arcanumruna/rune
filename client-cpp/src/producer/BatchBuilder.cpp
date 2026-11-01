@@ -119,6 +119,9 @@ BatchBuilder& BatchBuilder::add(std::span<const uint8_t> value,
         throw std::length_error("BatchBuilder::add: MessageTooLarge: the batch would exceed "
                                 "ProducerConfig::tier2SlotBytes");
     }
+    if (impl_->viewAcks() && t.builder.recordCount() >= rune::protocol::client::kMaxJudgedBatchRecords) {
+        throw std::length_error("BatchBuilder::add: MessageTooLarge: a View batch holds at most 4096 records");
+    }
     // Reset (keeping capacity) on the first record: the batch timestamp base is taken here.
     if (t.builder.recordCount() == 0) t.builder.reset(0, wallMs());
 

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -20,7 +21,7 @@ namespace rune::protocol::client {
 //   [24..27]  topicId         : int32
 //   [28..31]  partition       : int32   (used when partitionKnown==1; else ignore)
 //   [32]      partitionKnown  : uint8   (1 => use partition; 0 => broker resolves from key)
-//   [33]      acks            : uint8   (0 = Leader/None, 1 = All — GR-5)
+//   [33]      acks            : uint8   (bit 0 = All, bit 1 = View; 0 = Leader/None, 1 = All — GR-5)
 //   [34..41]  producerId      : int64   (-1 = non-idempotent legacy produce)
 //   [42..43]  producerEpoch   : int16
 //   [44..47]  baseSequence    : int32   (-1 = non-idempotent)
@@ -44,13 +45,22 @@ namespace rune::protocol::client {
 // Total = 24 + 24 + 2 + key.size() + 2 + recordBatch.size()
 //       = 52 + key.size() + recordBatch.size()
 // ---------------------------------------------------------------------------
+/// The Produce `acks` byte (client version 17): bit 0 = All, bit 1 = View.  Other bits are refused.
+inline constexpr uint8_t kAcksWireAll = 0x01, kAcksWireView = 0x02, kAcksWireKnown = 0x03;
+[[nodiscard]] constexpr bool acksAll(uint8_t acks) noexcept  { return (acks & kAcksWireAll) != 0; }
+[[nodiscard]] constexpr bool acksView(uint8_t acks) noexcept { return (acks & kAcksWireView) != 0; }
+
+/// A batch written with `View` to a verdict source holds at most this many records, so a ProduceResponse is at most
+/// ProduceResponse::kMaxEncodedSize bytes.
+inline constexpr int32_t kMaxJudgedBatchRecords = 4096;
+
 struct Produce {
     int64_t  sessionId      = 0;
     int64_t  correlationId  = 0;
     int32_t  topicId        = 0;
     int32_t  partition      = 0;
     uint8_t  partitionKnown = 0;    // 1 => explicit partition; 0 => resolve from key
-    uint8_t  acks           = 0;    // 0 = Leader/None (immediate ack), 1 = All (deferred until ISR HW)
+    uint8_t  acks           = 0;    // bit 0 = All (deferred until ISR HW), bit 1 = View (deferred until the views folded it)
     int64_t  producerId     = -1;   // -1 = non-idempotent legacy produce (TX-1 sentinel)
     int16_t  producerEpoch  = 0;
     int32_t  baseSequence   = -1;   // -1 = non-idempotent
@@ -135,10 +145,9 @@ struct Produce {
         msg.partitionKnown = buf[fixedBase + 8];
         // acks field only present in v1+ (declaredFixed >= 10)
         msg.acks = (declaredFixed >= BODY_FIXED_V1) ? buf[fixedBase + 9] : uint8_t{0};
-        // No-hang wave: an unknown acks byte is rejected, never read as one of
-        // the two modes (the gateway tested == 1, the worker != 0 — a 2 was a
-        // silent durability downgrade on one path).  Answered InvalidRequest.
-        if (msg.acks > 1) return std::nullopt;
+        // No-hang wave: an unknown acks bit is rejected, never read as one of
+        // the modes.  Answered InvalidRequest.
+        if ((msg.acks & ~kAcksWireKnown) != 0) return std::nullopt;
         // idempotent fields only present in v2 (declaredFixed >= 24)
         if (declaredFixed >= BODY_FIXED) {
             msg.producerId    = detail::getLE64(buf, static_cast<int>(fixedBase) + 10);
@@ -189,6 +198,10 @@ struct Produce {
 //   A longer future block is skipped via blockLength (forward-compat).
 //
 // Total = 24 + 22 = 46 bytes (no var fields)
+//
+// Client version 17 (checked writes): blockLength 30, `assignedBase` u64 at body offset 22 (0 = none), then an
+// optional trailer [count u16][count x {recordIndex u16, code u16, constraintId u32}]: present only on a View ack of a
+// verdict source; count 0 = every record was accepted.  A session below 17 is sent the exact 46 / 38 byte frames.
 // ---------------------------------------------------------------------------
 struct ProduceResponse {
     int64_t sessionId      = 0;
@@ -197,13 +210,21 @@ struct ProduceResponse {
     int32_t partition      = 0;
     int64_t baseOffset     = 0;   // meaningful only when errorCode == 0
     int64_t logStartOffset = -1;  // D6: -1 = not carried (old broker / not set)
+    uint64_t assignedBase  = 0;   // client 17: 0 = none (id 0 is never assigned)
+    bool     hasVerdicts   = false;   // client 17: the verdict trailer is present (a View ack of a verdict source)
+    uint16_t verdictCount  = 0;
+    std::span<const uint8_t> verdictBytes;   // verdictCount x 8 encoded entries; zero-copy on decode
 
     static constexpr uint16_t TEMPLATE_ID   = static_cast<uint16_t>(TemplateId::ProduceResponse); // 17
     static constexpr uint16_t BODY_FIXED    = 22;  // errorCode(2) + partition(4) + baseOffset(8) + logStartOffset(8)
     static constexpr uint16_t BODY_FIXED_V0 = 14;  // pre-D6: errorCode(2) + partition(4) + baseOffset(8)
+    static constexpr uint16_t BODY_FIXED_V17 = 30; // client 17: + assignedBase(8)
+    static constexpr uint16_t kMaxVerdictEntries = 4096;
 
     static constexpr std::size_t ENCODED_SIZE    = MessageHeader::ENCODED_SIZE + BODY_FIXED;    // 46
     static constexpr std::size_t ENCODED_SIZE_V0 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V0; // 38
+    static constexpr std::size_t ENCODED_SIZE_V17 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V17; // 54
+    static constexpr std::size_t kMaxEncodedSize = ENCODED_SIZE_V17 + 2 + 8 * std::size_t{kMaxVerdictEntries};   // 32,824
 
     /// Encode the full frame (46 bytes) into buf.  Returns 46.
     std::size_t encode(uint8_t* buf) const noexcept {
@@ -229,7 +250,28 @@ struct ProduceResponse {
     /// `clientVersion` is sent — the pre-D6 38 B frame (blockLength 14) below
     /// kClientVersionUnknownProducerId, the 46 B frame from it on.
     [[nodiscard]] static constexpr std::size_t encodedSizeFor(int32_t clientVersion) noexcept {
+        if (clientUnderstandsCheckedWrites(clientVersion)) return ENCODED_SIZE_V17;
         return clientUnderstandsUnknownProducerId(clientVersion) ? ENCODED_SIZE : ENCODED_SIZE_V0;
+    }
+
+    /// The frame size with the optional verdict trailer (client 17 only; older sessions never get one).
+    [[nodiscard]] static constexpr std::size_t encodedSizeFor(int32_t clientVersion, bool withVerdicts, uint16_t count) noexcept {
+        const std::size_t n = encodedSizeFor(clientVersion);
+        return (withVerdicts && clientUnderstandsCheckedWrites(clientVersion)) ? n + 2 + 8 * std::size_t{count} : n;
+    }
+    [[nodiscard]] std::size_t encodedSize(int32_t clientVersion) const noexcept {
+        return encodedSizeFor(clientVersion, hasVerdicts, verdictCount);
+    }
+
+    /// Visit the verdict entries: fn(recordIndex, code, constraintId).
+    template <class Fn>
+    void forEachVerdict(Fn&& fn) const noexcept {
+        for (uint32_t i = 0; i < verdictCount; ++i) {
+            const uint8_t* e = verdictBytes.data() + 8 * i;
+            fn(static_cast<uint16_t>(e[0] | (e[1] << 8)), static_cast<uint16_t>(e[2] | (e[3] << 8)),
+               static_cast<uint32_t>(e[4]) | (static_cast<uint32_t>(e[5]) << 8) | (static_cast<uint32_t>(e[6]) << 16) |
+                   (static_cast<uint32_t>(e[7]) << 24));
+        }
     }
 
     /// D6 review M4: encode the frame for a session that connected with
@@ -238,12 +280,14 @@ struct ProduceResponse {
     /// (38 B, blockLength 14, no logStartOffset) and UnknownProducerId is
     /// answered OutOfOrderSequence (produceErrorForClient), so even a strict
     /// pre-D6 decoder (exact length / exact blockLength) reads it.  From that
-    /// version on it is the 46 B frame.  buf must hold encodedSizeFor(version).
-    /// Returns the bytes written.
+    /// version on it is the 46 B frame; from kClientVersionCheckedWrites on it is the 54 B frame with assignedBase and,
+    /// when hasVerdicts, the trailer (verdictBytes holds 8 x verdictCount bytes).  buf must hold
+    /// encodedSize(clientVersion).  Returns the bytes written.
     std::size_t encodeFor(uint8_t* buf, int32_t clientVersion) const noexcept {
         const bool full = clientUnderstandsUnknownProducerId(clientVersion);
+        const bool v17  = clientUnderstandsCheckedWrites(clientVersion);
         MessageHeader hdr;
-        hdr.blockLength   = full ? BODY_FIXED : BODY_FIXED_V0;
+        hdr.blockLength   = v17 ? BODY_FIXED_V17 : full ? BODY_FIXED : BODY_FIXED_V0;
         hdr.templateId    = TEMPLATE_ID;
         hdr.schemaId      = kSchemaId;
         hdr.version       = kProtocolVersion;
@@ -259,7 +303,12 @@ struct ProduceResponse {
         detail::putLE64 (buf, fixedBase + 6, baseOffset);
         if (!full) return ENCODED_SIZE_V0;
         detail::putLE64 (buf, fixedBase + 14, logStartOffset);
-        return ENCODED_SIZE;
+        if (!v17) return ENCODED_SIZE;
+        detail::putLE64 (buf, fixedBase + 22, assignedBase);
+        if (!hasVerdicts) return ENCODED_SIZE_V17;
+        detail::putLE16 (buf, static_cast<int>(ENCODED_SIZE_V17), verdictCount);
+        if (verdictCount != 0) std::memcpy(buf + ENCODED_SIZE_V17 + 2, verdictBytes.data(), 8 * std::size_t{verdictCount});
+        return ENCODED_SIZE_V17 + 2 + 8 * std::size_t{verdictCount};
     }
 
     /// Decode a full frame from buf[0..avail-1].
@@ -286,10 +335,22 @@ struct ProduceResponse {
         msg.baseOffset = detail::getLE64 (buf, fixedBase + 6);
         if (hdr.blockLength >= BODY_FIXED)
             msg.logStartOffset = detail::getLE64(buf, fixedBase + 14);
-
+        if (hdr.blockLength < BODY_FIXED_V17) return msg;
+        msg.assignedBase = detail::getLE64(buf, fixedBase + 22);
+        const std::size_t blockEnd = MessageHeader::ENCODED_SIZE + hdr.blockLength;
+        if (avail == blockEnd) return msg;
+        // The verdict trailer: exactly [count u16] + count x 8 bytes after the block.
+        if (avail < blockEnd + 2) return std::nullopt;
+        const uint16_t count = detail::getLE16(buf, static_cast<int>(blockEnd));
+        if (count > kMaxVerdictEntries || avail != blockEnd + 2 + 8 * std::size_t{count}) return std::nullopt;
+        msg.hasVerdicts  = true;
+        msg.verdictCount = count;
+        msg.verdictBytes = std::span<const uint8_t>(buf + blockEnd + 2, 8 * std::size_t{count});
         return msg;
     }
 };
+
+static_assert(kMaxJudgedBatchRecords == ProduceResponse::kMaxVerdictEntries);
 
 // ---------------------------------------------------------------------------
 // Subscribe  (templateId 18)  client→broker

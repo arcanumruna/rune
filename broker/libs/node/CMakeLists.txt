@@ -27,6 +27,8 @@ add_library(rune_node
     src/CatalogEffectFrames.cpp
     src/ViewSnapshotIoAgent.cpp
     src/WorkerViewSet.cpp
+    src/CheckedWriteHook.cpp
+    src/VerdictSource.cpp
     src/TopicDirReconcile.cpp)
 
 # The worker's io backends, as their own leaf library: Worker.h's header-inline
@@ -364,7 +366,8 @@ if(BUILD_TESTING)
     # a real Log + ProducerStateManager.  No Aeron required.
     # ---------------------------------------------------------------------------
     add_executable(rune_produce_path_tests
-        tests/node/ProducePathTest.cpp)
+        tests/node/ProducePathTest.cpp
+        tests/node/CheckedWritesProducePathHookTest.cpp)
     target_include_directories(rune_produce_path_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_produce_path_tests PRIVATE
@@ -807,10 +810,14 @@ if(BUILD_TESTING)
     add_executable(rune_checked_writes_tests
         tests/node/CheckedWritesFeatureLevelTest.cpp
         tests/node/CheckedWritesWriteStateTest.cpp
+        tests/node/CheckedWritesHookTest.cpp
+        tests/node/CheckedWritesMinFoldCursorTest.cpp
         tests/node/CheckedWritesValidationMatrixTest.cpp
         tests/node/CheckedWritesWorkerTest.cpp
         tests/node/CheckedWritesSpecFanoutTest.cpp
-        tests/node/CheckedWritesDdlTest.cpp)
+        tests/node/CheckedWritesDdlTest.cpp
+        tests/node/CheckedWritesTimelineTest.cpp
+        tests/node/CheckedWritesVerdictSourceTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -1325,6 +1332,31 @@ if(BUILD_TESTING)
             add_executable(rune_shard_worker_ack_tests tests/node/ShardWorkerAckTest.cpp)
             target_link_libraries(rune_shard_worker_ack_tests PRIVATE rune_node rune_replication rune_codec aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_shard_worker_ack_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Checked writes Part 03: the write hook and the View acks on a real Worker over an IPC driver.
+            add_executable(rune_checked_writes_ack_tests tests/node/CheckedWritesWorkerHookTest.cpp tests/node/CheckedWritesViewAckTest.cpp tests/node/CheckedWritesViewAckMatrixTest.cpp)
+            target_include_directories(rune_checked_writes_ack_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_checked_writes_ack_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_checked_writes_ack_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Checked writes Part 04: the verdict pipeline on a real Worker.
+            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp)
+            target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
+            target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Checked writes Part 04: the shared interaction matrix (04 cells; the reference model).
+            add_executable(rune_checked_writes_matrix_tests tests/node/CheckedWritesMatrixTest.cpp)
+            target_include_directories(rune_checked_writes_matrix_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
+            target_link_libraries(rune_checked_writes_matrix_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_checked_writes_matrix_tests PROPERTIES TIMEOUT 900 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Checked writes Part 03 (hard rule): the write hook and the View acks allocate nothing.  Replaces the global
+            # operator new (binary-wide) - its own binary; later checked-writes parts extend it.
+            add_executable(rune_checked_writes_alloc_regression_tests tests/node/CheckedWritesAllocRegressionTest.cpp tests/support/AllocWindow.cpp)
+            target_include_directories(rune_checked_writes_alloc_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_checked_writes_alloc_regression_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_checked_writes_alloc_regression_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Authentication Task 13 (spec §6, D30): the shard worker's WRITE grants, a REAL invoker driver over aeron:ipc.
             add_executable(rune_worker_write_grants_tests tests/node/WorkerWriteGrantsTest.cpp)
@@ -1858,6 +1890,14 @@ if(BUILD_TESTING)
                              PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE LABELS latency)
         gtest_discover_tests(rune_client_broker_tests TEST_FILTER "-${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
                              PROPERTIES TIMEOUT 600)
+
+        # Checked writes Part 04 Task 11: the seeded verdict stress on three real brokers (each seed is one ctest case).
+        # Labelled stress and kept out of the regular slice (-LE stress) until every seed passes.
+        add_executable(rune_checked_writes_stress_tests tests/integration/CheckedWritesStressTest.cpp)
+        target_include_directories(rune_checked_writes_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_checked_writes_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_checked_writes_stress_tests PROPERTIES TIMEOUT 1800 LABELS stress)
 
         # Namespaces Task 11: the REAL client namespace API and the REAL `rune namespace` / `rune ql` CLI against ONE
         # real authenticating BrokerNode.

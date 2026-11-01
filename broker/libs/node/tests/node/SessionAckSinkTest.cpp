@@ -1,6 +1,8 @@
 // SessionAckSinkTest.cpp — worker-side ack publication table + per-session hold
 // state machines (spec §3.4, G-A6).  Fake publication policy; NO clock: the sink
 // is time-independent (fix round 1, C1/C2) — acks drop only on state events.
+#include <rune/crypto/Aead.h>
+#include <rune/node/RecordsSeal.h>
 #include <rune/node/SessionAckSink.h>
 #include <rune/protocol/client/DataMessages.h>
 
@@ -490,7 +492,7 @@ TEST(SessionAckSinkUnknownProducerIdRegression, OldSessionsGetTheStrictPreD6Fram
             EXPECT_EQ(ec, corr == sid ? 0 : static_cast<int16_t>(pc::ErrorCode::OutOfOrderSequence)) << sid;
             if (corr == sid) EXPECT_EQ(pc::detail::getLE64(f.data(), 30), 40 + sid);
         } else {
-            ASSERT_EQ(f.size(), pc::ProduceResponse::ENCODED_SIZE) << sid;
+            ASSERT_EQ(f.size(), pc::ProduceResponse::encodedSizeFor(pc::kClientVersion)) << sid;
         }
         ++seen;
     }
@@ -1155,4 +1157,144 @@ TEST(SessionAckSinkRegression, MassCloseOfEverySessionKeepsEveryTombstoneRegress
     EXPECT_EQ(s.admitDirect(1), Sink::kDirectTotalOnly) << "the oldest tombstone is evicted first";
     EXPECT_EQ(s.admitDirect(2), Sink::kDirectDropClosed);
     EXPECT_EQ(s.admitDirect(kN + 50), Sink::kDirectDropClosed);
+}
+
+// ===========================================================================
+// Checked writes (client 17): the ack frame carries assignedBase and an optional verdict trailer; a session below 17
+// gets the frame it always got, whatever the entry carries.
+// ===========================================================================
+namespace {
+AckEntry v17Ack(int64_t sid, int64_t corr, uint64_t assignedBase, bool trailer) {
+    AckEntry a{sid, corr, 5, 2, 0};
+    a.assignedBase = assignedBase;
+    a.hasVerdicts  = trailer ? 1 : 0;
+    return a;
+}
+}  // namespace
+
+TEST(CheckedWritesAckSink, V17SessionGets54ByteFrameWithAssignedBase) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c7", 1, pc::kClientVersionCheckedWrites));
+    pass(s); pass(s);
+    s.enqueue(v17Ack(7, 1, 42, false));
+    pass(s);
+    ASSERT_EQ(st->sent.size(), 1u);
+    EXPECT_EQ(st->sent[0].second.size(), 54u);
+    auto r = pc::ProduceResponse::decode(st->sent[0].second.data(), st->sent[0].second.size());
+    ASSERT_TRUE(r);
+    EXPECT_EQ(r->assignedBase, 42u);
+    EXPECT_FALSE(r->hasVerdicts);
+}
+
+TEST(CheckedWritesAckSink, EmptyVerdictTrailerIs56Bytes) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c7", 1, pc::kClientVersionCheckedWrites));
+    pass(s); pass(s);
+    s.enqueue(v17Ack(7, 1, 0, true));
+    pass(s);
+    ASSERT_EQ(st->sent.size(), 1u);
+    EXPECT_EQ(st->sent[0].second.size(), 56u);
+    auto r = pc::ProduceResponse::decode(st->sent[0].second.data(), st->sent[0].second.size());
+    ASSERT_TRUE(r);
+    EXPECT_TRUE(r->hasVerdicts);
+    EXPECT_EQ(r->verdictCount, 0);
+}
+
+TEST(CheckedWritesAckSinkRegression, OldSessionGetsTheOldFrameWhateverTheEntryCarriesRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    constexpr int32_t kVersions[] = {1, 2, 16};
+    constexpr std::size_t kSizes[] = {38, 46, 46};
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(s.announce(10 + i, "c", 1, kVersions[i]));
+    pass(s); pass(s);
+    for (int i = 0; i < 3; ++i) s.enqueue(v17Ack(10 + i, 100 + i, 42, true));
+    pass(s);
+    ASSERT_EQ(st->sent.size(), 3u);
+    for (int i = 0; i < 3; ++i) {
+        const auto& frame = st->sent[static_cast<std::size_t>(i)].second;
+        ASSERT_EQ(frame.size(), kSizes[i]) << "version " << kVersions[i];
+        pc::ProduceResponse plain;
+        plain.sessionId = 10 + i; plain.correlationId = 100 + i; plain.errorCode = 0; plain.partition = 2; plain.baseOffset = 5;
+        std::vector<uint8_t> want(plain.encodedSize(kVersions[i]));
+        plain.encodeFor(want.data(), kVersions[i]);
+        EXPECT_EQ(frame, want) << "version " << kVersions[i];
+    }
+}
+
+TEST(CheckedWritesAckSinkRegression, SealedV17AckFitsTheScratchRegression) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c7", 1, pc::kClientVersionCheckedWrites));
+    pass(s); pass(s);
+    rune::crypto::AeadKey key{};
+    for (std::size_t i = 0; i < sizeof(key.bytes); ++i) key.bytes[i] = static_cast<uint8_t>(i + 3);
+    const uint8_t prefix[4] = {1, 2, 3, 4};
+    rune::crypto::AeadCipher cipher(rune::crypto::Cipher::Aes256Gcm, key, prefix);
+    uint64_t seq = 0;
+    RecordsSealCtx ctx;
+    ctx.send = &cipher; ctx.sendSeq = &seq; ctx.cipher = static_cast<uint8_t>(rune::crypto::Cipher::Aes256Gcm);
+    s.enqueue(v17Ack(7, 1, 42, true));
+    s.flush(0, 0, [&](int64_t) { return &ctx; });
+    ASSERT_EQ(st->sent.size(), 1u);
+    EXPECT_EQ(st->sent[0].second.size(), 56u + pc::kCryptoOverhead);
+}
+
+namespace {
+AckEntry withRun(Sink& s, int64_t sid, int64_t corr, uint16_t n) {
+    AckEntry a = v17Ack(sid, corr, 0, true);
+    a.verdictCount = n;
+    EXPECT_TRUE(s.reserveVerdicts(n, a.verdictRun));
+    auto e = s.verdictEntries(a.verdictRun);
+    for (std::size_t i = 0; i < e.size(); ++i) e[i] = static_cast<uint8_t>(i + 1);
+    return a;
+}
+}  // namespace
+
+TEST(CheckedWritesAckSink, TrailerBytesComeFromTheArena) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ASSERT_TRUE(s.announce(7, "c7", 1, pc::kClientVersionCheckedWrites));
+    pass(s); pass(s);
+    ASSERT_TRUE(s.enqueue(withRun(s, 7, 1, 2)));
+    pass(s);
+    ASSERT_EQ(st->sent.size(), 1u);
+    ASSERT_EQ(st->sent[0].second.size(), 54u + 2 + 16);
+    auto r = pc::ProduceResponse::decode(st->sent[0].second.data(), st->sent[0].second.size());
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->verdictCount, 2);
+    for (uint32_t i = 0; i < 16; ++i) EXPECT_EQ(st->sent[0].second[54 + 2 + i], static_cast<uint8_t>(i + 1));
+}
+
+TEST(CheckedWritesAckSink, ArenaRunsAreFreedOnClaimDropAndFail) {
+    FakePolicy pol; auto st = pol.s; Sink s(pol);
+    ready(s, 7); ready(s, 8); ready(s, 9);
+    s.announce(7, "c7", 1, pc::kClientVersionCheckedWrites);
+    s.announce(8, "c8", 1, pc::kClientVersionCheckedWrites);
+    s.announce(9, "c9", 1, pc::kClientVersionCheckedWrites);
+    pass(s); pass(s);
+    st->closed.insert(2);                                   // session 8's publication fails on its claim
+    ASSERT_TRUE(s.enqueue(withRun(s, 7, 1, 3)));            // claimed
+    ASSERT_TRUE(s.enqueue(withRun(s, 8, 2, 4)));            // fatal claim: dropped
+    ASSERT_TRUE(s.enqueue(withRun(s, 5, 3, 5)));            // unknown session: orphaned
+    EXPECT_EQ(s.verdictsUsedForTest(), 12u);
+    s.flush(0, 0);
+    s.flush(1, 1);
+    EXPECT_EQ(s.verdictsUsedForTest(), 0u);
+}
+
+TEST(CheckedWritesAckSink, ArenaReusesTheFreedRegionAndRefusesWhenFull) {
+    VerdictAckArena a(16, 4);
+    uint32_t r1, r2, r3;
+    ASSERT_TRUE(a.reserveVerdicts(10, r1));
+    EXPECT_FALSE(a.reserveVerdicts(10, r2)) << "no room before the end and none at the start";
+    ASSERT_TRUE(a.reserveVerdicts(6, r2));
+    a.free(r1);
+    ASSERT_TRUE(a.reserveVerdicts(10, r3)) << "wraps to 0 once the head advanced";
+    EXPECT_EQ(a.used(), 16u);
+    a.free(r2); a.free(r3);
+    EXPECT_EQ(a.used(), 0u);
+}
+
+TEST(CheckedWritesAckSink, AckTermIsNeverBelowTheFloor) {
+    EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1", 65536), "aeron:udp?endpoint=h:1|term-length=524288");
+    EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1|term-length=64k", 0), "aeron:udp?endpoint=h:1|term-length=524288");
+    EXPECT_EQ(withAckTermLength("aeron:udp?term-length=1048576", 65536), "aeron:udp?term-length=1048576");
+    EXPECT_EQ(withAckTermLength("aeron:udp?endpoint=h:1", 0), "aeron:udp?endpoint=h:1|term-length=524288");
 }

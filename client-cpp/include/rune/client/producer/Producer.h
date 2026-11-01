@@ -76,16 +76,41 @@ class Client;
 struct CompletionTarget;
 
 // ---------------------------------------------------------------------------
-// Acks — acknowledgement policy for produced batches.
+// Acks — acknowledgement policy for produced batches, a flag set.
 // Leader (like Kafka acks=1): a leader restart or loss before the followers replicate can lose ACKED records.
 // All: with the broker's minIsr >= 2 (the multi-node default), acked records survive any single broker failure;
 // use it for durability (#41).
+// View (checked writes, broker >= 10): combined with Leader or All, the ack is also held until every view of the
+// partition has folded the batch, so a read right after the ack sees it.  `Leader | View` waits for commit like
+// `All | View` (the fold never passes the high watermark).  View alone is refused, and a transactional producer's
+// View is ignored on sends.  Leader | All is normalized to All.
 // ---------------------------------------------------------------------------
 enum class Acks : uint8_t {
     None   = 0,  // send without waiting for a response (fully fire-and-forget)
     Leader = 1,  // wait for ProduceResponse from the leader (default)
     All    = 2,  // wait until the batch is committed by the in-sync replica majority
+    View   = 4,  // flag, with Leader or All: also wait until every view of the partition folded the batch
 };
+
+[[nodiscard]] constexpr Acks operator|(Acks a, Acks b) noexcept {
+    return static_cast<Acks>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
+}
+[[nodiscard]] constexpr Acks operator&(Acks a, Acks b) noexcept {
+    return static_cast<Acks>(static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
+}
+/// True when `set` contains `flag` (a non-None flag).
+[[nodiscard]] constexpr bool has(Acks set, Acks flag) noexcept {
+    return flag != Acks::None && (set & flag) == flag;
+}
+/// Leader | All is All.
+[[nodiscard]] constexpr Acks normalized(Acks a) noexcept {
+    return has(a, Acks::All) ? static_cast<Acks>(static_cast<uint8_t>(a) & ~static_cast<uint8_t>(Acks::Leader)) : a;
+}
+/// No bit outside Leader / All / View, and View needs Leader or All.
+[[nodiscard]] constexpr bool acksValid(Acks a) noexcept {
+    const uint8_t v = static_cast<uint8_t>(a);
+    return (v & ~uint8_t{7}) == 0 && (!has(a, Acks::View) || (v & 3) != 0);
+}
 
 // ---------------------------------------------------------------------------
 // TopicPartitionKey - (topicId, partition) pair.
@@ -332,6 +357,8 @@ enum class SendResult : uint8_t {
     KeyTooLong,     ///< checked writes: the Key is wider than Key::kMaxInline (16 B).  A key is never
                     ///< truncated, so nothing was written and no credit is kept; the blocking send() throws
                     ///< std::invalid_argument.  (A TypedTopic always sends its key field's width.)
+    WriteNotAllowed,///< checked writes: a requirement the client checks locally (an intent, a key-0 create or
+                    ///< View on a raw handle).  Nothing was written, no credit is kept.
 };
 
 // ---------------------------------------------------------------------------

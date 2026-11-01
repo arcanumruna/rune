@@ -221,7 +221,7 @@ struct WorkerOp {
     int64_t correlationId = 0;
 
     // Produce flags / producer-state fields
-    int16_t acks          = 0;    ///< 0=none, 1=all (same as msg.acks)
+    int16_t acks          = 0;    ///< the Produce.acks wire byte: bit 0 All, bit 1 View (same as msg.acks)
     int64_t producerId    = -1;   ///< -1 = legacy (no idempotent tracking)
     int16_t producerEpoch = 0;
     int32_t baseSequence  = 0;
@@ -620,6 +620,13 @@ struct WorkerReturn {
     // copied to AckEntry::direct; returned when the ack leaves the sink).
     // Worker-local only: NOT encoded, like gatewayCredit.
     uint8_t directAck     = 0;
+
+    // Checked writes (client 17 acks): the key a key-0 create was assigned (0 = none) and the verdict trailer of a View ack
+    // (hasVerdicts with verdictCount entries at verdictRun in the worker's arena).  Worker-local only: NOT encoded.
+    uint64_t assignedBase  = 0;
+    uint32_t verdictRun    = 0;
+    uint16_t verdictCount  = 0;
+    uint8_t  hasVerdicts   = 0;
 
     // Non-owning pointer to the replica.  Task 10 round 4: the runtime never
     // dereferences it — it refers to the replica by (targetReplicaId,

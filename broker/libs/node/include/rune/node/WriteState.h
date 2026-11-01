@@ -12,7 +12,9 @@
 #include <rune/codec/Serialize.h>
 #include <rune/codec/Validator.h>
 #include <rune/protocol/BatchRebuild.h>
+#include <rune/node/VerdictState.h>
 #include <rune/replication/ReplicationMessages.h>
+#include <rune/storage/RejectedOffsetIndex.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -141,8 +143,29 @@ private:
 };
 
 /// One owned typed partition's write state, next to RcSlot.  Later parts append their per-partition members here.
+class VerdictSource;
+
 struct PartitionWriteState {
-    const TopicWriteSpec* spec = nullptr;
+    const TopicWriteSpec*              spec = nullptr;
+    rune::storage::RejectedOffsetIndex rejected;       ///< reserved when the partition becomes a verdict source (VerdictSource.cpp)
+    ConstraintSetTimeline              constraintSets;
+    MarkerLedger                       markers;
+    VerdictSource*                     verdicts = nullptr;   ///< the judge, once this worker leads and hosts verdict views
+    int64_t                            judgedThrough = 0;    ///< the judge's cursor, published at the end of each of its passes
+    uint64_t                           mismatchesLogged = 0; ///< rejected-index determinism alarms already reported
+    bool                               growOwed = false;     ///< the judge saw the rejected index cross 75 %: the worker's cold maintenance grows it
+
+    /// A judge is attached or the latest logged set is non-empty.
+    [[nodiscard]] bool isVerdictSource() const noexcept;
+    /// The latest logged set has a member that can reject (Unique, Check or TestReject).
+    [[nodiscard]] bool isConstrainedSource() const noexcept;
+    /// Every offset below it has a verdict this node knows; INT64_MAX when no offset needs one.
+    [[nodiscard]] int64_t verdictKnownThrough() const noexcept {
+        if (constraintSets.size() == 0) return INT64_MAX;
+        if (verdicts != nullptr) return judgedThrough;
+        const int64_t k = rejected.coveredThrough();
+        return constraintSets.latest().empty() && k > constraintSets.lastChangeOffset() ? INT64_MAX : k;
+    }
 };
 
 enum class TypedCheck : uint8_t { Accept, Reject, VersionAhead };

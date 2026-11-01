@@ -36,6 +36,14 @@ inline constexpr int16_t kAttrTransactional  = 0x0010; // bit 4: isTransactional
 inline constexpr int16_t kAttrDeleteHorizon  = 0x0040; // bit 6: delete-horizon in baseTimestamp
 } // namespace rune::protocol::batch
 
+namespace rune::protocol::record {
+// Record attributes (int8): bits 0-1 are the write intent, the other bits are reserved and refused on a typed topic.
+inline constexpr uint8_t kAttrIntentMask   = 0x03;
+inline constexpr uint8_t kAttrReservedMask = 0xFC;
+enum class Intent : uint8_t { Upsert = 0, Insert = 1, Existing = 2 };   // 3 is reserved and refused
+[[nodiscard]] constexpr uint8_t intentOf(uint8_t attributes) noexcept { return attributes & kAttrIntentMask; }
+} // namespace rune::protocol::record
+
 namespace rune::protocol {
 
 // ---------------------------------------------------------------------------
@@ -127,7 +135,7 @@ public:
     // a normal baseTimestamp (backward-compatible).
     void setDeleteHorizonMs(int64_t horizonMs) noexcept { deleteHorizonMs_ = horizonMs; }
 
-    void append(std::string_view key, std::string_view value, int64_t timestamp) {
+    void append(std::string_view key, std::string_view value, int64_t timestamp, uint8_t attributes = 0) {
         // Kafka v2 record: length(varint) attributes(int8) tsDelta(varlong)
         //   offsetDelta(varint) keyLen(varint) key valueLen(varint) value headerCount(varint=0)
         //
@@ -147,7 +155,7 @@ public:
             records_.insert(records_.end(), tmp, tmp+n);
         };
 
-        records_.push_back(0); // attributes
+        records_.push_back(attributes);
         appendVarlong(timestamp - baseTimestamp_);          // tsDelta
         appendVarint(recordCount_);                         // offsetDelta
         appendVarint(static_cast<int32_t>(key.size()));    // keyLen

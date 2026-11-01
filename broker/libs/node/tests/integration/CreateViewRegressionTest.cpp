@@ -742,7 +742,7 @@ TEST_F(CreateViewRegression, TransientViewOverTransientSourceIsAcceptedAndFoldsR
     auto rr = [&](int64_t, int64_t) {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
     };
-    viewSet_.driveFolds(src, 0, rr, 1, rune::view::kNoAbortedTxns, 0);
+    viewSet_.driveFolds(src, 0, rr, 1, rune::view::kNoSkip, 0);
     const rv::RowLayout* L = nullptr;
     const uint8_t* row = viewSet_.getRow(lastViewTopicId_, 0, 7, L);
     ASSERT_NE(row, nullptr);

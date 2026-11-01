@@ -236,7 +236,7 @@ TEST(UnknownProducerIdWireCompatRegression, EncodeForNewClientIsFullFrameRegress
     std::array<uint8_t, 64> buf{};
     const std::size_t n = msg.encodeFor(buf.data(), rpc::kClientVersionUnknownProducerId);
     ASSERT_EQ(n, rpc::ProduceResponse::ENCODED_SIZE);
-    ASSERT_EQ(n, rpc::ProduceResponse::encodedSizeFor(rpc::kClientVersion));
+    ASSERT_EQ(n, rpc::ProduceResponse::encodedSizeFor(rpc::kClientVersionUnknownProducerId));
     EXPECT_FALSE(strictOldDecode(buf.data(), n).has_value());   // a v2 frame by design
     auto d = rpc::ProduceResponse::decode(buf.data(), n);
     ASSERT_TRUE(d.has_value());

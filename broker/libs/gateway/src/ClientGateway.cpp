@@ -599,8 +599,8 @@ bool ClientGateway::sendRespReliable_(Session&          session,
                                       int64_t           correlationId,
                                       int64_t           logStartOffset)
 {
-    static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
-                  "ProduceResponse::ENCODED_SIZE exceeds kScratchSize");
+    static_assert(pc::ProduceResponse::kMaxEncodedSize <= kScratchSize,
+                  "ProduceResponse::kMaxEncodedSize exceeds kScratchSize");
 
     pc::ProduceResponse resp;
     resp.sessionId     = session.sessionId;
@@ -4111,7 +4111,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     //
     //   The log is untouched (no append, no LEO advance) for the retriable-error
     //   path, preserving the "NEVER falsely ack" invariant.
-    const bool acksAll = (msg.acks == 1);
+    // View acks need the worker-side ack path (checked writes, SD10): a gateway without shard mode refuses them, and so
+    // does its inline path (a gateway-owned partition), which would otherwise answer acks=2 at once as acks=Leader.
+    if (pc::acksView(msg.acks) && (!shardMode_ || !routesToWorker_(msg.topicId))) [[unlikely]] {
+        ++viewAcksRefusedLegacy_;
+        sendResp(pc::ErrorCode::InvalidRequest, partition, 0);
+        return true;
+    }
+    const bool acksAll = pc::acksAll(msg.acks);
     if (acksAll && !committedMetadataReady_) {
         // Bootstrap window: acks=All cannot be served with majority durability yet.
         // Return NotLeader (retriable) so the client retries after bootstrap.
@@ -7446,7 +7453,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 // client below v14 is answered InvalidRequest by encodeFor and gets no retry-after.
                 if (ec == pc::ErrorCode::Throttled && session->clientVersion >= pc::kClientVersionNamespaces)
                     resp.logStartOffset = ret.lastOffset;
-                static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
+                static_assert(pc::ProduceResponse::kMaxEncodedSize <= kScratchSize,
                               "scratch too small for ProduceResponse");
                 // D6 review M4: the pre-D6 38 B frame below clientVersion 2.
                 const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);
@@ -7832,7 +7839,7 @@ void ClientGateway::drainPendingAcks()
                 resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::OK);
                 resp.partition     = entry.partition;
                 resp.baseOffset    = entry.baseOffset;
-                static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
+                static_assert(pc::ProduceResponse::kMaxEncodedSize <= kScratchSize,
                               "scratch too small for ProduceResponse");
                 const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 // G0.1: reliable delivery (retry on back-pressure) — this is the

@@ -294,7 +294,7 @@ TEST(ResponseEgressGatewayRegression, UnroutableDeclaredChannelStillConnectsRegr
         const auto r = c.connect(1, pc::kClientVersionResponseEgress, true, kUnroutable);
         ASSERT_TRUE(r.has_value()) << "no ConnectResponse on the response subscription";
         EXPECT_EQ(r->code, 0);
-        EXPECT_EQ(r->brokerVersion, 9);
+        EXPECT_EQ(r->brokerVersion, rune::protocol::client::kBrokerVersion);
         ASSERT_GT(r->assignedSessionId, 0);
         ASSERT_TRUE(c.sendPing(r->assignedSessionId, 2, "hello"));
         ASSERT_TRUE(c.waitFor([&] { return c.find(kPong, 2) != nullptr; })) << "no Pong on the response subscription";
@@ -459,7 +459,7 @@ TEST(ResponseEgressGatewayRegression, ResponseUnavailableFallsBackToDeclaredRegr
         const auto r = c.connect(1, pc::kClientVersionResponseEgress, true, c.localChannel());
         ASSERT_TRUE(r.has_value()) << "no ConnectResponse on the declared channel";
         EXPECT_EQ(r->code, 0);
-        EXPECT_EQ(r->brokerVersion, 9);
+        EXPECT_EQ(r->brokerVersion, rune::protocol::client::kBrokerVersion);
         ASSERT_TRUE(c.sendPing(r->assignedSessionId, 2, "fb"));
         ASSERT_TRUE(c.waitFor([&] { return c.find(kPong, 2) != nullptr; })) << "no Pong on the declared channel";
     }

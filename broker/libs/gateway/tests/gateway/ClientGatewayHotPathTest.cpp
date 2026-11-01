@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -574,6 +575,60 @@ TEST(ProduceValidationRegression, ASingleBatchRuleIsEnforcedOnGatewayRegression)
         if (c.refused) EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << c.name;
         else           EXPECT_NE(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << c.name;
     }
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+// Checked writes Part 03 (SD10): a shard-mode gateway serves a partition it owns (an internal topic; here a rig with no
+// worker pool) on its inline path, which has no View waiter.  It must refuse the View bit there as it does in legacy
+// mode, never answer `Leader | View` at once as plain `Leader` (a silent downgrade: nothing waited for the commit).
+// RED: drop the `!routesToWorker_` half of the gateway's View refusal - the acks=2 frame is answered OK and appended.
+TEST(CheckedWritesGatewayRegression, InlinePathRefusesTheViewBitInShardModeRegression)
+{
+    const fs::path dir = makeTempDir();
+    std::vector<rune::node::TopicSpec> specs;
+    {
+        rune::node::TopicSpec ts;
+        ts.name = "events"; ts.partitionCount = 1; ts.topicId = 0;
+        specs.push_back(ts);
+    }
+    rune::gateway::TopicRegistry registry(specs, dir.string());
+    std::vector<uint8_t> captured;
+    ClientGateway gw = ClientGateway::makeForTest(
+        [&captured](const uint8_t* buf, std::size_t len) -> int64_t { captured.assign(buf, buf + len); return 1; },
+        /*currentProduceSessionId=*/1);
+    gw.setTopicRegistry(&registry);
+    gw.setShardMode(true);
+    const int64_t sid = gw.injectTestSession(/*nowNs=*/0);
+
+    const auto answer = [&](int64_t corr, uint8_t acks) -> std::optional<pc::ProduceResponse> {
+        captured.clear();
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", "v", 1000);
+        const auto batch = b.build();
+        pc::Produce prod;
+        prod.sessionId = sid; prod.correlationId = corr; prod.topicId = 0; prod.partition = 0; prod.partitionKnown = 1;
+        prod.acks = acks; prod.producerId = -1; prod.baseSequence = -1;
+        prod.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+        std::vector<uint8_t> frame(prod.encodedSize() + 8);
+        frame.resize(prod.encode(frame.data()));
+        gw.applyProduceForTest(frame.data(), frame.size());
+        if (captured.empty()) return std::nullopt;
+        return pc::ProduceResponse::decode(captured.data(), captured.size());
+    };
+
+    for (const uint8_t acks : {uint8_t{2}, uint8_t{3}}) {
+        const auto r = answer(10 + acks, acks);
+        ASSERT_TRUE(r.has_value()) << "acks " << int(acks);
+        EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << "acks " << int(acks);
+    }
+    EXPECT_EQ(registry.log(0, 0)->logEndOffset(), 0) << "a refused View produce appends nothing";
+    EXPECT_EQ(gw.viewAcksRefusedLegacyForTest(), 2u);
+
+    const auto plain = answer(20, 0);   // control: the same frame without View is served inline
+    ASSERT_TRUE(plain.has_value());
+    EXPECT_EQ(plain->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(registry.log(0, 0)->logEndOffset(), 1);
     std::error_code ec;
     fs::remove_all(dir, ec);
 }

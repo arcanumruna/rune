@@ -45,6 +45,7 @@
 #include <vector>
 #include <rune/storage/ProducerTails.h>
 #include <rune/storage/TxnCleanState.h>
+#include <rune/storage/VerdictCleanState.h>
 
 namespace rune::storage {
 
@@ -239,6 +240,7 @@ public:
         latestOffset_  = -1;
         tails_.clear();
         txn_.clear();
+        verdict_.clear();
     }
 
     /// The last data batch of every producer in the scanned range (retained by
@@ -249,6 +251,8 @@ public:
     /// markers — see TxnCleanState.h).  Filled by buildOffsetMapFromBases.
     TxnCleanState&       txnState() noexcept { return txn_; }
     const TxnCleanState& txnState() const noexcept { return txn_; }
+    VerdictCleanState&       verdictState() noexcept { return verdict_; }
+    const VerdictCleanState& verdictState() const noexcept { return verdict_; }
 
     // --- Budget helper (static, no instance) --------------------------------
     /// Compute maxSlots from a byte budget and per-entry size.
@@ -293,6 +297,7 @@ private:
     std::unique_ptr<Entry[]> table_;
     ProducerTails        tails_;
     TxnCleanState        txn_;
+    VerdictCleanState    verdict_;
 };
 
 } // namespace rune::storage

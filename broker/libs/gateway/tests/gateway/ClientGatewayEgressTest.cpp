@@ -403,7 +403,7 @@ TEST(ClientGatewayEgressRegression, MalformedProduceIsAnsweredInvalidRequestRegr
     EXPECT_EQ(gw.unanswerableFramesForTest(), 0u);
 }
 
-// acks is a two-valued wire byte: 2 is rejected by decode and answered (it
+// acks is a two-bit wire byte (All, View): an unknown bit is rejected by decode and answered (it
 // used to read as acks=Leader on the gateway and acks=All on a worker).
 TEST(ClientGatewayEgressRegression, ProduceUnknownAcksByteIsAnsweredInvalidRequestRegression)
 {
@@ -417,7 +417,7 @@ TEST(ClientGatewayEgressRegression, ProduceUnknownAcksByteIsAnsweredInvalidReque
     prod.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
     std::vector<uint8_t> frame(64 * 1024, 0);
     const std::size_t n = prod.encode(frame.data());
-    frame[pc::MessageHeader::ENCODED_SIZE + 9] = 2;   // the acks byte
+    frame[pc::MessageHeader::ENCODED_SIZE + 9] = 4;   // the acks byte: an unknown bit
     gw.applyProduceForTest(frame.data(), n);
     const auto r = cap.last<pc::ProduceResponse>();
     ASSERT_TRUE(r.has_value());

@@ -445,6 +445,7 @@ TEST(CompactionStress, ManyPartitions_LatestPerKey_Stress) {
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             entry->log.get(), &transport);
         replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+        replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
         replica->becomeLeader(1, {1});
         replica->onLeaderLogAppended();
 
@@ -498,6 +499,7 @@ TEST(CompactionStress, ManyPartitions_LatestPerKey_Stress) {
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             entry->log.get(), &transport);
         replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+        replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
         replica->becomeLeader(1, {1});
         replica->onLeaderLogAppended();
         registry.add(topicId, 0, std::move(replica));
@@ -548,6 +550,7 @@ TEST(CompactionStress, ManyPartitions_LatestPerKey_Stress) {
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             entry->log.get(), &transport);
         replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+        replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
         replica->becomeLeader(1, {1});
         replica->onLeaderLogAppended();
         registry.add(topicId, 0, std::move(replica));
@@ -901,6 +904,7 @@ TEST(CompactionStress, ConcurrentCleaner_TSan_Stress) {
             std::vector<NodeId>{1}, std::vector<NodeId>{1},
             log.get(), &transport);
         replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+        replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
         replica->becomeLeader(1, {1});
         replica->onLeaderLogAppended();
 
@@ -1140,6 +1144,7 @@ TEST(CompactionStress, CheckpointCoalescing_Bounded_Stress) {
         std::vector<NodeId>{1}, std::vector<NodeId>{1},
         log.get(), &transport);
     replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig (D3b)
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
     PartitionReplica* raw = replica.get();
     replica->becomeLeader(1, {1});
     replica->onLeaderLogAppended();

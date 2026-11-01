@@ -20,7 +20,7 @@
 // The cited code path: Worker::executeProduceWire_ (Worker.h) — the
 // `auto it = validators_.find(topicId)` branch added by Task 7.
 //
-// Checked writes Part 02 adds BM_CheckedWriteHook/*: the typed-batch check alone (the <= 1 us p50 budget gate) and the
+// Checked writes Part 02 adds BM_CheckedWriteHook/*: the write hook's check alone (the <= 1 us p50 budget gate) and the
 // whole produce path for an untyped topic, a typed topic below the feature level and a typed topic at it.
 //
 // Uses a disk-backed Log + PartitionReplica (same pattern as
@@ -32,6 +32,7 @@
 
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/CheckedWriteHook.h>
 #include <rune/node/WriteState.h>
 #include "BenchGate.h"
 #include <rune/replication/PartitionReplica.h>
@@ -298,9 +299,9 @@ static void BM_ProduceValidate_On(benchmark::State& state) { produceLoop(state);
 
 // ---------------------------------------------------------------------------
 // BM_CheckedWriteHook — checked writes Part 02.
-//   CheckOnly1Record / CheckOnly64Records: checkTypedBatch alone on a valid keyed batch at the checked level.  The
+//   hook_check/1 / hook_check/64: CheckedWriteHook::check alone on a valid keyed batch at the checked level.  The
 //     one-record p50 is a hard budget gate (spec §14: new typed-topic validation <= 1 us per one-record batch).
-//   UntypedPath / TypedLegacyPath / TypedCheckedPath: the whole produce path; their deltas are the cost of the write
+//   UntypedPath / TypedLegacyPath / typed_produce/1: the whole produce path; their deltas are the cost of the write
 //     state's branch and of full validation.
 // ---------------------------------------------------------------------------
 static rune::node::TopicWriteSpec makeCheckSpec() {
@@ -330,15 +331,26 @@ static std::vector<uint8_t> makeKeyedBatch(int records) {
     return b.build();
 }
 
-static void BM_CheckedWriteHook_CheckOnly1Record(benchmark::State& state) {
+static rune::node::WriteFacts checkedFacts() {
+    rune::node::WriteFacts facts;
+    facts.levelCheckedWrites = true;
+    facts.acks               = 1;
+    return facts;
+}
+
+static void BM_CheckedWriteHook_HookCheck1(benchmark::State& state) {
     const auto spec  = makeCheckSpec();
     const auto batch = makeKeyedBatch(1);
+    rune::node::PartitionWriteState ws;
+    ws.spec = &spec;
+    const auto facts = checkedFacts();
     constexpr int kCalls = 1000;
     std::vector<double> ns(kCalls);
     for (auto _ : state) {
         for (int i = 0; i < kCalls; ++i) {
+            rune::node::CheckedWriteHook hook(ws, facts, {});
             const auto t0 = std::chrono::steady_clock::now();
-            const auto verdict = rune::node::checkTypedBatch(spec, batch, rune::replication::MetadataFeature::kCheckedWrites);
+            const auto verdict = hook.check(batch.data(), batch.size(), 1);
             const auto t1 = std::chrono::steady_clock::now();
             benchmark::DoNotOptimize(verdict);
             ns[static_cast<std::size_t>(i)] = std::chrono::duration<double, std::nano>(t1 - t0).count();
@@ -352,21 +364,24 @@ static void BM_CheckedWriteHook_CheckOnly1Record(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * kCalls);
 }
 
-static void BM_CheckedWriteHook_CheckOnly64Records(benchmark::State& state) {
+static void BM_CheckedWriteHook_HookCheck64(benchmark::State& state) {
     const auto spec  = makeCheckSpec();
     const auto batch = makeKeyedBatch(64);
+    rune::node::PartitionWriteState ws;
+    ws.spec = &spec;
+    const auto facts = checkedFacts();
     for (auto _ : state) {
-        const auto verdict = rune::node::checkTypedBatch(spec, batch, rune::replication::MetadataFeature::kCheckedWrites);
+        rune::node::CheckedWriteHook hook(ws, facts, {});
+        const auto verdict = hook.check(batch.data(), batch.size(), 64);
         benchmark::DoNotOptimize(verdict);
     }
-    state.counters["ns_per_record"] = benchmark::Counter(static_cast<double>(state.iterations()) * 64.0,
-                                                         benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
+    state.counters["ns_per_batch"] = benchmark::Counter(static_cast<double>(state.iterations()), benchmark::Counter::kIsRate | benchmark::Counter::kInvert);
     state.SetItemsProcessed(state.iterations() * 64);
 }
 
 static void BM_CheckedWriteHook_UntypedPath(benchmark::State& state) { produceLoop(state); }
 static void BM_CheckedWriteHook_TypedLegacyPath(benchmark::State& state) { produceLoop(state); }
-static void BM_CheckedWriteHook_TypedCheckedPath(benchmark::State& state) { produceLoop(state); }
+static void BM_CheckedWriteHook_TypedProduce1(benchmark::State& state) { produceLoop(state); }
 
 // ---------------------------------------------------------------------------
 // Sequential A/B registration (n=15 repetitions each).
@@ -392,12 +407,12 @@ BENCHMARK(BM_ProduceValidate_On)
     ->ReportAggregatesOnly(false)
     ->Unit(benchmark::kNanosecond);
 
-BENCHMARK(BM_CheckedWriteHook_CheckOnly1Record)
-    ->Name("BM_CheckedWriteHook/CheckOnly1Record")
+BENCHMARK(BM_CheckedWriteHook_HookCheck1)
+    ->Name("BM_CheckedWriteHook/hook_check/1")
     ->Repetitions(15)
     ->Unit(benchmark::kNanosecond);
-BENCHMARK(BM_CheckedWriteHook_CheckOnly64Records)
-    ->Name("BM_CheckedWriteHook/CheckOnly64Records")
+BENCHMARK(BM_CheckedWriteHook_HookCheck64)
+    ->Name("BM_CheckedWriteHook/hook_check/64")
     ->Unit(benchmark::kNanosecond);
 BENCHMARK(BM_CheckedWriteHook_UntypedPath)
     ->Name("BM_CheckedWriteHook/UntypedPath")
@@ -405,8 +420,8 @@ BENCHMARK(BM_CheckedWriteHook_UntypedPath)
 BENCHMARK(BM_CheckedWriteHook_TypedLegacyPath)
     ->Name("BM_CheckedWriteHook/TypedLegacyPath")
     ->Setup(SetupOn)->Teardown(Teardown)->Repetitions(15)->ReportAggregatesOnly(false)->Unit(benchmark::kNanosecond);
-BENCHMARK(BM_CheckedWriteHook_TypedCheckedPath)
-    ->Name("BM_CheckedWriteHook/TypedCheckedPath")
+BENCHMARK(BM_CheckedWriteHook_TypedProduce1)
+    ->Name("BM_CheckedWriteHook/typed_produce/1")
     ->Setup(SetupChecked)->Teardown(Teardown)->Repetitions(15)->ReportAggregatesOnly(false)->Unit(benchmark::kNanosecond);
 
 } // namespace

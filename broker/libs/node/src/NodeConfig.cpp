@@ -895,6 +895,9 @@ ConfigResult parseNodeConfig(
                                    cfg.electionTimeoutMs);
         if (!err.empty()) return {{}, err};
 
+        err = parseOptionalInt64Ms(getenv_fn, "RUNE_VERDICT_INTERVAL_MS", cfg.verdictIntervalMs);
+        if (!err.empty()) return {{}, err};
+
         err = parseOptionalInt64Ms(getenv_fn, "RUNE_ELECTION_STATUS_INTERVAL_MS",
                                    cfg.electionStatusIntervalMs);
         if (!err.empty()) return {{}, err};

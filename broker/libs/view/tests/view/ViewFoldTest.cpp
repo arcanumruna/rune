@@ -118,7 +118,7 @@ TEST(ViewFold, UpsertAndTombstone) {
     const auto b0 = makeBatch(0, asSv(kb), asSv(val0), /*tomb*/ false);
     rune::storage::LogReadView v0{b0.data(), b0.size(), 0, 1};
     int64_t cur = 0;
-    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v0, /*bound*/ 1, cur, rune::view::kNoAbortedTxns);
+    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v0, /*bound*/ 1, cur, rune::view::kNoSkip);
     EXPECT_EQ(s0.applied, 1u);
     ASSERT_NE(t.get(1001), nullptr);
     EXPECT_EQ(rune::view::readSlot(t.get(1001), comp.rowLayout, 1).i, 50);
@@ -127,7 +127,7 @@ TEST(ViewFold, UpsertAndTombstone) {
     // record 1: tombstone for id=1001
     const auto b1 = makeBatch(1, asSv(kb), std::string_view{}, /*tomb*/ true);
     rune::storage::LogReadView v1{b1.data(), b1.size(), 1, 2};
-    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v1, 2, cur, rune::view::kNoAbortedTxns);
+    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v1, 2, cur, rune::view::kNoSkip);
     EXPECT_EQ(s1.deleted, 1u);
     EXPECT_EQ(t.get(1001), nullptr);
     EXPECT_EQ(cur, 2);
@@ -149,7 +149,7 @@ TEST(ViewFoldDroppedFieldRegression, FoldDroppedSourceFieldGoesNull) {
     const auto b = makeBatch(0, asSv(kb), asSv(val), /*tomb*/ false);
     rune::storage::LogReadView v{b.data(), b.size(), 0, 1};
     int64_t cur = 0;
-    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 1, cur, rune::view::kNoAbortedTxns);
+    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 1, cur, rune::view::kNoSkip);
 
     EXPECT_EQ(stats.applied, 1u);
     ASSERT_NE(t.get(1001), nullptr);
@@ -183,7 +183,7 @@ TEST(ViewFold, DeterministicAcrossBatchBoundaries) {
     rune::view::ViewTable tableA(comp.rowLayout);
     rune::view::VersionDescriptorCache vdcA(src);
     int64_t curA = 0;
-    auto statsA = rune::view::foldBatch(comp.plan, comp.rowLayout, vdcA, tableA, vA, 3, curA, rune::view::kNoAbortedTxns);
+    auto statsA = rune::view::foldBatch(comp.plan, comp.rowLayout, vdcA, tableA, vA, 3, curA, rune::view::kNoSkip);
 
     // Case B: 3 separate single-record batches, concatenated into one view.
     std::vector<uint8_t> dataB;
@@ -199,7 +199,7 @@ TEST(ViewFold, DeterministicAcrossBatchBoundaries) {
     rune::view::ViewTable tableB(comp.rowLayout);
     rune::view::VersionDescriptorCache vdcB(src);
     int64_t curB = 0;
-    auto statsB = rune::view::foldBatch(comp.plan, comp.rowLayout, vdcB, tableB, vB, 3, curB, rune::view::kNoAbortedTxns);
+    auto statsB = rune::view::foldBatch(comp.plan, comp.rowLayout, vdcB, tableB, vB, 3, curB, rune::view::kNoSkip);
 
     EXPECT_EQ(statsA.applied, statsB.applied);
     EXPECT_EQ(curA, curB);
@@ -237,7 +237,7 @@ TEST(ViewFoldKeyUnificationRegression, TombstoneErasesByWireKeyEvenWhenValueKeyF
     const auto b0 = makeBatch(0, asSv(wireKey), asSv(val), /*tomb*/ false);
     rune::storage::LogReadView v0{b0.data(), b0.size(), 0, 1};
     int64_t cur = 0;
-    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v0, 1, cur, rune::view::kNoAbortedTxns);
+    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v0, 1, cur, rune::view::kNoSkip);
     EXPECT_EQ(s0.applied, 1u);
 
     // The row must be addressable by the WIRE key -- not by the value's
@@ -252,7 +252,7 @@ TEST(ViewFoldKeyUnificationRegression, TombstoneErasesByWireKeyEvenWhenValueKeyF
     // A tombstone keyed by the SAME wire key must erase exactly that row.
     const auto b1 = makeBatch(1, asSv(wireKey), std::string_view{}, /*tomb*/ true);
     rune::storage::LogReadView v1{b1.data(), b1.size(), 1, 2};
-    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v1, 2, cur, rune::view::kNoAbortedTxns);
+    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v1, 2, cur, rune::view::kNoSkip);
     EXPECT_EQ(s1.deleted, 1u);
     EXPECT_EQ(t.get(2002), nullptr) << "tombstone keyed by the wire key must erase the row it keys";
     EXPECT_EQ(t.get(9999), nullptr);
@@ -276,7 +276,7 @@ TEST(ViewFoldMalformedKeyRegression, WrongWidthWireKeySkippedNotZeroPadded) {
                               asSv(val), /*tomb*/ false);
     rune::storage::LogReadView v{b.data(), b.size(), 0, 1};
     int64_t cur = 0;
-    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 1, cur, rune::view::kNoAbortedTxns);
+    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 1, cur, rune::view::kNoSkip);
 
     EXPECT_EQ(stats.skippedMalformed, 1u);
     EXPECT_EQ(stats.applied, 0u);
@@ -318,7 +318,7 @@ TEST(ViewFoldCorruptBreakRegression, CursorNeverAdvancesPastAnUnfoldedCorruptBat
     // this guards against is trusting that claim and skipping straight to it.
     rune::storage::LogReadView v{data.data(), data.size(), 0, 5};
     int64_t cur = 0;
-    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound*/ 5, cur, rune::view::kNoAbortedTxns);
+    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound*/ 5, cur, rune::view::kNoSkip);
 
     EXPECT_EQ(stats.applied, 1u);     // only batch 0's record folded
     ASSERT_NE(t.get(1001), nullptr);
@@ -348,12 +348,12 @@ TEST(ViewFoldResumeRegression, MidBatchCursorSkipsAlreadyFoldedRecords) {
     const rune::storage::LogReadView lv{batch.data(), batch.size(), 0, 2};
 
     int64_t cur = 0;
-    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, lv, /*bound*/ 1, cur, rune::view::kNoAbortedTxns);
+    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, lv, /*bound*/ 1, cur, rune::view::kNoSkip);
     EXPECT_EQ(s0.applied, 1u);
     EXPECT_EQ(cur, 1);
     t.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {});
 
-    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, lv, /*bound*/ 2, cur, rune::view::kNoAbortedTxns);
+    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, lv, /*bound*/ 2, cur, rune::view::kNoSkip);
     EXPECT_EQ(s1.applied, 1u) << "record 0 (below the cursor) must not be re-folded";
     EXPECT_EQ(cur, 2);
     int dirty = 0;
@@ -412,7 +412,7 @@ TEST(ViewFoldRegression, AbortedTxnBatchesAreSkippedCommittedOnesFoldRegression)
     const OneAbortedRange ab{5, 0, 4};
     const rune::storage::LogReadView v{bytes.data(), bytes.size(), 0, 5};
     int64_t cur = 0;
-    const auto st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 5, cur, ab.filter());
+    const auto st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 5, cur, rune::view::FoldSkip{.aborted = ab.filter()});
     EXPECT_EQ(cur, 5);
     EXPECT_EQ(st.applied, 2u);
     EXPECT_EQ(st.skippedAborted, 2u);
@@ -436,11 +436,11 @@ TEST(ViewFoldRegression, BoundCuttingAnAbortedBatchAppliesNoneOfItRegression) {
     const OneAbortedRange ab{5, 0, 3};
     const rune::storage::LogReadView v{bytes.data(), bytes.size(), 0, 4};
     int64_t cur = 0;
-    auto st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound=*/2, cur, ab.filter());
+    auto st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound=*/2, cur, rune::view::FoldSkip{.aborted = ab.filter()});
     EXPECT_EQ(cur, 2);
     EXPECT_EQ(st.applied, 0u);
     EXPECT_EQ(t.size(), 0u);
-    st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound=*/4, cur, ab.filter());
+    st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound=*/4, cur, rune::view::FoldSkip{.aborted = ab.filter()});
     EXPECT_EQ(cur, 4);
     EXPECT_EQ(st.applied, 1u);
     EXPECT_EQ(st.skippedAborted, 1u);

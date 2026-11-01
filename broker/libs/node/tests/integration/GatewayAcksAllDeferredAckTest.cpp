@@ -1336,3 +1336,72 @@ TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
         if (*ownerPtr) (*ownerPtr)->stop();
     }
 }
+
+// ===========================================================================
+// Checked writes Part 03: a gateway that is not in shard mode cannot fold a View ack, so it refuses the View bit
+// (InvalidRequest, nothing appended or routed); the same connection's acks=All produce is answered as before.
+// ===========================================================================
+TEST(CheckedWritesGatewayRegression, LegacyGatewayRefusesTheViewBitRegression) {
+    Gr5TempDir dir0{"cwg0_"}, dir1{"cwg1_"}, dir2{"cwg2_"};
+    Gr5TempDir clientDir{"client_cwg_"};
+    const auto cPorts = gr5DiscoverFreePorts(3);
+    const auto kPorts = gr5DiscoverFreePorts(3);
+    const auto rPorts = gr5DiscoverFreePorts(3);
+    rune::node::BrokerNode node0{makeGr5Config(0, dir0.path, cPorts, kPorts, rPorts)};
+    rune::node::BrokerNode node1{makeGr5Config(1, dir1.path, cPorts, kPorts, rPorts)};
+    rune::node::BrokerNode node2{makeGr5Config(2, dir2.path, cPorts, kPorts, rPorts)};
+    node0.start(); node1.start(); node2.start();
+    ASSERT_TRUE(node0.awaitLeader(8s));
+    ASSERT_TRUE(node1.awaitLeader(8s));
+    ASSERT_TRUE(node2.awaitLeader(8s));
+    ASSERT_EQ(rune::node::test::TestCluster({&node0, &node1, &node2}).defineTopic(gr5Topic()), 0);
+    std::array<rune::node::BrokerNode*, 3> allNodes{&node0, &node1, &node2};
+    const int lid = settledPartitionLeader(allNodes);
+    ASSERT_GE(lid, 0);
+    rune::node::BrokerNode* leaderNode = allNodes[static_cast<std::size_t>(lid)];
+    leaderNode->setGatewayMinIsr(2);
+
+    Gr5ClientDriver clientDrv(clientDir.path / "aeron");
+    ASSERT_NE(clientDrv.aeron, nullptr);
+    ClientConn conn = ClientConn::connect(clientDrv, "aeron:udp?endpoint=127.0.0.1:" + std::to_string(kPorts[static_cast<std::size_t>(lid)]), 50);
+    ASSERT_GT(conn.assignedSessionId, 0);
+
+    const auto send = [&](int64_t corr, uint8_t acks) -> std::optional<pc::ProduceResponse> {
+        auto batch = gr5MakeBatch(1);
+        pc::Produce prod;
+        prod.sessionId = conn.assignedSessionId; prod.correlationId = corr; prod.topicId = 0; prod.partition = 0;
+        prod.partitionKnown = 1; prod.acks = acks;
+        prod.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+        std::vector<uint8_t> scratch(68 * 1024, 0);
+        const std::size_t len = prod.encode(scratch.data());
+        if (!gr5OfferBounded(*conn.ingressPub, scratch.data(), len)) return std::nullopt;
+        std::optional<pc::ProduceResponse> resp;
+        aeron::FragmentAssembler as([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t o, aeron::util::index_t l, aeron::Header&) {
+            if (auto dec = pc::ProduceResponse::decode(reinterpret_cast<const uint8_t*>(buf.buffer() + o), static_cast<std::size_t>(l)))
+                if (dec->correlationId == corr) resp = *dec;
+        });
+        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        while (std::chrono::steady_clock::now() < deadline && !resp) {
+            conn.egressSub->poll(as.handler(), 10);
+            std::this_thread::sleep_for(1ms);
+        }
+        return resp;
+    };
+
+    const auto view = send(300, 3);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_EQ(view->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    const auto leaderView = send(301, 2);
+    ASSERT_TRUE(leaderView.has_value());
+    EXPECT_EQ(leaderView->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(leoOnOwner(*leaderNode), static_cast<Offset>(0)) << "nothing was appended";
+
+    const auto all = send(302, 1);
+    ASSERT_TRUE(all.has_value());
+    EXPECT_EQ(all->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(all->baseOffset, 0);
+
+    conn.ingressPub.reset();
+    conn.egressSub.reset();
+    node0.stop(); node1.stop(); node2.stop();
+}

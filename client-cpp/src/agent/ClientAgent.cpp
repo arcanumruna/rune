@@ -115,6 +115,7 @@ ClientAgent::ClientAgent(AgentConfig cfg)
 void ClientAgent::init() {
     mnDebug_ = std::getenv("RUNE_MN_DEBUG") != nullptr;
     produceAcks_.reserve(static_cast<std::size_t>(cfg_.egressPollLimit) * 4);
+    verdictBytes_.reserve(65536 * 8);
     // Seed the endpoint-keyed session collection with the seed session
     // (sessions_[0]).  Its IO adapter targets the transport default ingress
     // channel, so its control frames fast-path back to the default offer (the
@@ -1206,7 +1207,16 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             if (produceResponseFn_) {
                 produceResponseFn_(opt->correlationId, off, opt->errorCode);  // test-harness hook
             } else {
-                produceAcks_.push_back(ProduceAck{opt->correlationId, off, opt->errorCode, opt->logStartOffset});
+                ProduceAck ack{opt->correlationId, off, opt->errorCode, opt->logStartOffset};
+                if (opt->hasVerdicts) {
+                    ack.hasVerdicts   = true;
+                    ack.verdictCount  = opt->verdictCount;
+                    ack.verdictOffset = static_cast<uint32_t>(verdictBytes_.size());
+                    const std::size_t cap = verdictBytes_.capacity();
+                    verdictBytes_.insert(verdictBytes_.end(), opt->verdictBytes.begin(), opt->verdictBytes.end());
+                    if (verdictBytes_.capacity() != cap) ++verdictArenaGrowths_;
+                }
+                produceAcks_.push_back(ack);
             }
         }
         break;

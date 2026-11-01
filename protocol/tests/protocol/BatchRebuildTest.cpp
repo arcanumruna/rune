@@ -105,3 +105,49 @@ TEST(BatchRebuild, AnOffsetDeltaPastLastOffsetDeltaStopsTheWalkRegression) {
     EXPECT_FALSE(forEachRecordSpan(b.data(), b.size(), [&](const RecordSpan&) { ++seen; }));
     EXPECT_EQ(seen, 2);
 }
+
+namespace {
+std::vector<uint8_t> intentBatch() {
+    RecordBatchBuilder b(0, 1'000'000);
+    b.append("a", "1", 1'000'000, 0);
+    b.append("bb", "", 1'000'000, 1);
+    b.append("ccc", "3", 1'000'000, 2);
+    return b.build();
+}
+}  // namespace
+
+TEST(CheckedWritesRecordSpan, CarriesAttributesKeyAndIndex) {
+    const auto b = intentBatch();
+    const auto s = spans(b);
+    ASSERT_EQ(s.size(), 3u);
+    const uint8_t attrs[] = {0, 1, 2};
+    const char* keys[] = {"a", "bb", "ccc"};
+    for (uint32_t i = 0; i < 3; ++i) {
+        EXPECT_EQ(s[i].attributes, attrs[i]);
+        EXPECT_EQ(s[i].index, i);
+        EXPECT_EQ(s[i].key, keys[i]);
+        EXPECT_GE(reinterpret_cast<const uint8_t*>(s[i].key.data()), b.data());
+        EXPECT_LE(reinterpret_cast<const uint8_t*>(s[i].key.data()) + s[i].key.size(), b.data() + b.size());
+    }
+    EXPECT_TRUE(s[1].value.empty());
+    EXPECT_FALSE(s[1].nullValue);
+    RecordBatchReader r(b.data(), b.size());
+    EXPECT_TRUE(r.ensureValid());
+}
+
+TEST(CheckedWritesRecordSpanRegression, RebuildKeepsAttributesVerbatimRegression) {
+    const auto b = intentBatch();
+    const auto s = spans(b);
+    const std::array<uint32_t, 2> keep{0, 2};
+    std::vector<uint8_t> out(b.size());
+    const std::size_t n = rebuildBatch(b, s, keep, out);
+    ASSERT_GT(n, 0u);
+    out.resize(n);
+    const auto rs = spans(out);
+    ASSERT_EQ(rs.size(), 2u);
+    EXPECT_EQ(rs[0].attributes, 0);
+    EXPECT_EQ(rs[1].attributes, 2);
+    EXPECT_EQ(rs[1].index, 1u);
+    RecordBatchReader r(out.data(), out.size());
+    EXPECT_TRUE(r.ensureValid());
+}

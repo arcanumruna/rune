@@ -2436,6 +2436,7 @@ void Client::onSeedConnected_(int64_t sessionId, int32_t brokerVersion) {
     // node while the coordinator lives on a session of its own must not overwrite the coordinator's version
     // (syncCoordinatorSession_ keeps that one current).
     if (coordIdx() == 0) groupConsumerHub_.setBrokerVersion(brokerVersion);
+    producerHub_.setBrokerVersion(brokerVersion);   // SD11: the seed's version gates the View bit
 
     // CG-5: Trigger group consumers to send JoinGroup on connect — only
     // when the SEED (the coordinator's session) connected: a leader
@@ -2902,8 +2903,10 @@ std::string_view lineageErrorName(uint16_t code) noexcept {
         "ViewExists", "ViewSourceNotFound", "ViewFieldUnresolved", "ViewKeyInvalid", "ViewNotCoPartitioned",
         "ViewSourceTransient", "ViewNotAlterable", "InvalidRequest", "InvalidTopicName", "ViewSourceIsView",
         "TransientLogFull", "PartitionDataReset", "", "", "", "", "" /* 44..48: authErrorName (#225) */, "RecordEgressUnavailable", "UnstableOffsetCommit",
-        "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused"};
-    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::ViewPaused) + 1,
+        "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
+        "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
+        "ViewConstraintInvalid", "ViewUniqueInvalid"};
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::ViewUniqueInvalid) + 1,
                   "lineageErrorName: one name per rune::protocol::client::ErrorCode");
     if (const char* auth = authErrorName(code)) return auth;   // #225: the one source of the 44..48 names
     return code < std::size(kNames) ? kNames[code] : std::string_view("UnknownErrorCode");
@@ -3688,7 +3691,8 @@ int Client::routeBufferedAcks_() {
     const int n = static_cast<int>(acks.size());
     bool notLeader = false;
     for (const auto& a : acks) {
-        producerHub_.onProduceResponse(a.correlationId, a.baseOffset, a.errorCode, a.logStartOffset);
+        producerHub_.onProduceResponse(a.correlationId, a.baseOffset, a.errorCode, a.logStartOffset, a.hasVerdicts,
+                                       agent_.verdictBytes(a));
         notLeader |= a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
     }
     agent_.clearProduceAcks();
@@ -5002,6 +5006,7 @@ Producer Client::testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap) {
 }
 
 Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool direct) {
+    if (!acksValid(cfg.acks)) throw std::invalid_argument("ProducerConfig: acks View needs Leader or All, and no unknown bits");
     // Phase 2b F: creation validation of a transactional producer.
     if (!cfg.transactionalId.empty()) {
         if (cfg.acks == Acks::None) {

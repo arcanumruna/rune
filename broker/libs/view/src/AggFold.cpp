@@ -76,13 +76,57 @@ constexpr uint32_t kRescanBatch = 8;
 //                  is at least as extreme skips the rescan.
 enum class RetractMode : uint8_t { Delete, Move, InPlaceLinked };
 
+// The tables as the step sees them.  DirectTable writes the ViewTable, so an ordinary view folds exactly as it
+// always did; OverlayTable reads overlay-first and writes into the fixed slots of a Prospect.
+struct DirectTable {
+    ViewTable& t;
+    [[nodiscard]] const uint8_t* get(uint64_t k) const noexcept { return t.get(k); }
+    uint8_t* put(uint64_t k) { return t.put(k); }
+    bool erase(uint64_t k) noexcept { return t.erase(k); }
+};
+
+struct OverlayTable {
+    RowOverlay&        ov;
+    RowOverlay::Table  which;
+    const ViewTable&   base;
+
+    [[nodiscard]] const uint8_t* get(uint64_t k) noexcept {
+        if (RowOverlay::Slot* s = ov.find(which, k)) return s->erased ? nullptr : ov.imageOf(which, s);
+        return base.get(k);
+    }
+    uint8_t* put(uint64_t k) noexcept {
+        if (RowOverlay::Slot* s = ov.find(which, k)) {
+            uint8_t* img = ov.imageOf(which, s);
+            if (s->erased) { std::memset(img, 0, ov.rowLen(which)); s->erased = false; }
+            return img;
+        }
+        uint8_t* img = nullptr;
+        ov.add(which, k, img);
+        if (const uint8_t* cur = base.get(k)) std::memcpy(img, cur, ov.rowLen(which));
+        else std::memset(img, 0, ov.rowLen(which));
+        return img;
+    }
+    bool erase(uint64_t k) noexcept {
+        if (RowOverlay::Slot* s = ov.find(which, k)) {
+            const bool was = !s->erased;
+            s->erased = true;
+            return was;
+        }
+        if (base.get(k) == nullptr) return false;
+        uint8_t* img = nullptr;
+        ov.add(which, k, img)->erased = true;
+        return true;
+    }
+};
+
+template <class T>
 struct Ctx {
     const RowLayout& layout;
     const AggLayout& agg;
-    ViewTable& view;
-    ViewTable& contributors;
-    ViewTable& groups;
-    ViewTable* blocks;   // Min/Max value blocks; nullptr iff agg.numBlockCols == 0
+    T  view;
+    T  contributors;
+    T  groups;
+    T* blocks;   // Min/Max value blocks; nullptr iff agg.numBlockCols == 0
     FoldStats& stats;
 
     uint8_t* acc(uint8_t* g, size_t i) const noexcept { return g + agg.groupAccOff + 16 * i; }
@@ -545,16 +589,110 @@ struct Ctx {
     }
 };
 
+enum class StepKind : uint8_t { None, Malformed, Erased, Upserted, Moved };
+struct StepOut {
+    StepKind kind = StepKind::None;
+    uint64_t group = 0;      // Upserted / Moved: the record's new group
+    uint64_t oldGroup = 0;   // Erased / Moved: the group the contributor left
+};
+
+inline const rune::codec::Descriptor& writerOf(VersionDescriptorCache& vdc, std::string_view value) {
+    const uint16_t writerVersion =
+        value.size() >= 4
+            ? static_cast<uint16_t>(static_cast<uint8_t>(value[2]) | (static_cast<uint8_t>(value[3]) << 8))
+            : vdc.defaultVersion();
+    return vdc.materializedFor(writerVersion);
+}
+
+// One record against the aggregate tables -- the single body behind the direct fold and the prepare.
+template <class T>
+StepOut aggStep(Ctx<T>& cx, VersionDescriptorCache& vdc, const rune::codec::Descriptor* writer,
+                std::string_view key, std::string_view value) noexcept {
+    if (key.size() != 8) { ++cx.stats.skippedMalformed; return {StepKind::Malformed}; }
+    uint64_t c = 0;
+    std::memcpy(&c, key.data(), 8);   // little-endian identity bytes
+    // A linked view's lists end in kNoContributor: that key cannot be linked.
+    if (cx.agg.linked && c == kNoContributor) { ++cx.stats.skippedMalformed; return {StepKind::Malformed}; }
+
+    const uint8_t* old = cx.contributors.get(c);
+    uint64_t oldGroup = 0;
+    if (value.empty()) {               // tombstone: retract a known contributor
+        if (old != nullptr) {
+            oldGroup = cx.retract(c, old, RetractMode::Delete);
+            cx.contributors.erase(c);
+        }
+        ++cx.stats.deleted;
+        return old != nullptr ? StepOut{StepKind::Erased, 0, oldGroup} : StepOut{};
+    }
+
+    const rune::codec::Descriptor& d = writer != nullptr ? *writer : writerOf(vdc, value);
+    const FieldValue gk = rune::codec::readField(d, asBytes(value), cx.agg.keySrcFieldId);
+    if (!gk.present) {
+        if (old != nullptr) {
+            oldGroup = cx.retract(c, old, RetractMode::Delete);
+            cx.contributors.erase(c);
+        }
+        ++cx.stats.skippedNoGroup;
+        return old != nullptr ? StepOut{StepKind::Erased, 0, oldGroup} : StepOut{};
+    }
+    uint64_t g = 0;
+    if (cx.agg.keyType == PrimType::Int64) std::memcpy(&g, &gk.i, 8); else g = gk.u;
+
+    bool hadOld = false;
+    if (old != nullptr) {
+        hadOld = true;
+        const bool sameGroup = loadU64(old) == g;
+        oldGroup = cx.retract(c, old, cx.agg.linked && sameGroup ? RetractMode::InPlaceLinked
+                                                               : RetractMode::Move);
+    }
+
+    uint8_t* cr = cx.contributors.put(c);   // same row when it already existed
+    storeU64(cr, g);
+    for (const AggField& f : cx.agg.fields) {
+        if (f.input == kNoSourceField) continue;
+        FieldValue in = rune::codec::readField(d, asBytes(value), f.srcFieldId);
+        if (in.present && f.kind == AccKind::Float && !std::isfinite(in.f)) {
+            in.present = false;   // NaN/Inf is treated as NULL (Sum/Avg/Min/Max)
+            ++cx.stats.aggNonFinite;
+        }
+        setNullBit(cr, cx.agg.contribNullOff, f.input, !in.present);
+        uint8_t* dst = cr + cx.agg.inputOff[f.input];
+        const uint16_t w = cx.agg.inputWidth[f.input];
+        if (!in.present)                       { std::memset(dst, 0, w); }
+        else if (f.rule == MergeRule::Last || f.rule == MergeRule::LastNonNull)
+                                               { encodeSlotValue(dst, f.srcType, w, in); }
+        else if (f.kind == AccKind::Signed)    { std::memcpy(dst, &in.i, 8); }
+        else if (f.kind == AccKind::Unsigned)  { storeU64(dst, in.u); }
+        else if (f.kind == AccKind::Float)     { storeF64(dst, in.f); }
+        else                                   { storeU64(dst, 0); }   // Count(col)
+    }
+    uint8_t* gr = cx.applyContribution(cr, +1);
+    if (cx.agg.linked) cx.linkAtHead(c, cr, gr);
+    if (cx.agg.numBlockCols > 0) {          // implies linked: same group == InPlaceLinked
+        if (hadOld && oldGroup == g) cx.blockWrite(c, cr, gr);
+        else cx.blockAppend(c, cr, g, gr);
+    }
+    cx.emit(g, gr);                      // a rescan here sees the block's new state
+    if (hadOld && oldGroup != g) {
+        const uint8_t* og = cx.groups.get(oldGroup);
+        if (og != nullptr && loadU64(og) == 0) cx.dropGroup(oldGroup);
+    }
+    ++cx.stats.applied;
+    return {hadOld && oldGroup != g ? StepKind::Moved : StepKind::Upserted, g, oldGroup};
+}
+
 } // namespace
 
 FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& layout,
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
                              ViewTable* blocks, const rune::storage::LogReadView& lv,
-                             int64_t bound, int64_t& cursor, const AbortedTxnFilter& aborted) {
+                             int64_t bound, int64_t& cursor, const FoldSkip& skip) {
     FoldStats stats{};
-    Ctx cx{layout, agg, view, contributors, groups, blocks, stats};
-    const AbortedTxnFilter abortedTxns = aborted;   // #537: by value (see AbortedTxnFilter::skips)
+    DirectTable dBlocks{blocks != nullptr ? *blocks : view};   // unused when blocks == nullptr
+    Ctx<DirectTable> cx{layout, agg, DirectTable{view}, DirectTable{contributors}, DirectTable{groups},
+                        blocks != nullptr ? &dBlocks : nullptr, stats};
+    const FoldSkip foldSkip = skip;   // #537: by value (see AbortedTxnFilter::skips)
     const int64_t from = cursor;   // records below it were folded by a prior (mid-batch) pass
     bool stopped = false;
     bool corrupt = false;
@@ -571,7 +709,7 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
             walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
             continue;
         }
-        if (abortedTxns.skips(r, attrs)) [[unlikely]] {   // #537: never applied (see foldBatch)
+        if (isAbortedBatch(foldSkip, r, attrs)) [[unlikely]] {   // #537: never applied (see foldBatch)
             if (r.baseOffset() + r.lastOffsetDelta() >= bound) { stopped = true; break; }
             ++stats.skippedAborted;
             pos += static_cast<size_t>(r.totalLength());
@@ -583,81 +721,8 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
             if (stopped) return;
             if (offset >= bound) { stopped = true; return; }
             if (offset < from) return;         // already folded (resume mid-batch)
-            if (key.size() != 8) { ++stats.skippedMalformed; return; }
-            uint64_t c = 0;
-            std::memcpy(&c, key.data(), 8);   // little-endian identity bytes
-            // A linked view's lists end in kNoContributor: that key cannot be linked.
-            if (agg.linked && c == kNoContributor) { ++stats.skippedMalformed; return; }
-
-            const uint8_t* old = contributors.get(c);
-            if (value.empty()) {               // tombstone: retract a known contributor
-                if (old != nullptr) {
-                    (void)cx.retract(c, old, RetractMode::Delete);
-                    contributors.erase(c);
-                }
-                ++stats.deleted;
-                return;
-            }
-
-            const uint16_t writerVersion =
-                value.size() >= 4
-                    ? static_cast<uint16_t>(static_cast<uint8_t>(value[2]) |
-                                            (static_cast<uint8_t>(value[3]) << 8))
-                    : vdc.defaultVersion();
-            const rune::codec::Descriptor& d = vdc.materializedFor(writerVersion);
-            const FieldValue gk = rune::codec::readField(d, asBytes(value), agg.keySrcFieldId);
-            if (!gk.present) {
-                if (old != nullptr) {
-                    (void)cx.retract(c, old, RetractMode::Delete);
-                    contributors.erase(c);
-                }
-                ++stats.skippedNoGroup;
-                return;
-            }
-            uint64_t g = 0;
-            if (agg.keyType == PrimType::Int64) std::memcpy(&g, &gk.i, 8); else g = gk.u;
-
-            bool hadOld = false;
-            uint64_t oldGroup = 0;
-            if (old != nullptr) {
-                hadOld = true;
-                const bool sameGroup = loadU64(old) == g;
-                oldGroup = cx.retract(c, old, agg.linked && sameGroup ? RetractMode::InPlaceLinked
-                                                                       : RetractMode::Move);
-            }
-
-            uint8_t* cr = contributors.put(c);   // same row when it already existed
-            storeU64(cr, g);
-            for (const AggField& f : agg.fields) {
-                if (f.input == kNoSourceField) continue;
-                FieldValue in = rune::codec::readField(d, asBytes(value), f.srcFieldId);
-                if (in.present && f.kind == AccKind::Float && !std::isfinite(in.f)) {
-                    in.present = false;   // NaN/Inf is treated as NULL (Sum/Avg/Min/Max)
-                    ++stats.aggNonFinite;
-                }
-                setNullBit(cr, agg.contribNullOff, f.input, !in.present);
-                uint8_t* dst = cr + agg.inputOff[f.input];
-                const uint16_t w = agg.inputWidth[f.input];
-                if (!in.present)                       { std::memset(dst, 0, w); }
-                else if (f.rule == MergeRule::Last || f.rule == MergeRule::LastNonNull)
-                                                       { encodeSlotValue(dst, f.srcType, w, in); }
-                else if (f.kind == AccKind::Signed)    { std::memcpy(dst, &in.i, 8); }
-                else if (f.kind == AccKind::Unsigned)  { storeU64(dst, in.u); }
-                else if (f.kind == AccKind::Float)     { storeF64(dst, in.f); }
-                else                                   { storeU64(dst, 0); }   // Count(col)
-            }
-            uint8_t* gr = cx.applyContribution(cr, +1);
-            if (agg.linked) cx.linkAtHead(c, cr, gr);
-            if (agg.numBlockCols > 0) {          // implies linked: same group == InPlaceLinked
-                if (hadOld && oldGroup == g) cx.blockWrite(c, cr, gr);
-                else cx.blockAppend(c, cr, g, gr);
-            }
-            cx.emit(g, gr);                      // a rescan here sees the block's new state
-            if (hadOld && oldGroup != g) {
-                const uint8_t* og = groups.get(oldGroup);
-                if (og != nullptr && loadU64(og) == 0) cx.dropGroup(oldGroup);
-            }
-            ++stats.applied;
+            if (isRejectedRecord(foldSkip, offset)) [[unlikely]] { ++stats.skippedRejected; return; }
+            (void)aggStep(cx, vdc, nullptr, key, value);
         });
         if (stopped) break;
         pos += static_cast<size_t>(r.totalLength());
@@ -672,9 +737,55 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layo
                              const AggLayout& agg, VersionDescriptorCache& vdc,
                              ViewTable& view, ViewTable& contributors, ViewTable& groups,
                              const rune::storage::LogReadView& lv, int64_t bound,
-                             int64_t& cursor, const AbortedTxnFilter& aborted) {
+                             int64_t& cursor, const FoldSkip& skip) {
     return foldAggregateBatch(plan, layout, agg, vdc, view, contributors, groups, nullptr, lv,
-                              bound, cursor, aborted);
+                              bound, cursor, skip);
+}
+
+PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospect& p) noexcept {
+    p.clear();
+    RowOverlay& ov = p.overlay;
+    using T = RowOverlay::Table;
+    OverlayTable blocks{ov, T::Blocks, f.blocks != nullptr ? *f.blocks : f.view};
+    Ctx<OverlayTable> cx{f.layout, f.agg, OverlayTable{ov, T::View, f.view}, OverlayTable{ov, T::Contributors, f.contributors},
+                         OverlayTable{ov, T::Groups, f.groups}, f.blocks != nullptr ? &blocks : nullptr, p.stats};
+    const StepOut o = aggStep(cx, f.vdc, rec.writer, rec.key, rec.value);
+    if (ov.full()) return PrepareStatus::CapacityExhausted;
+    if (o.kind == StepKind::Malformed) return PrepareStatus::Malformed;
+    if (o.kind == StepKind::None) return PrepareStatus::Ok;
+    const auto viewRow = [&](ProspectRow& row, uint64_t g) {
+        row.key     = ViewKey::fromU64(g);
+        row.existed = f.view.get(g) != nullptr;
+        const RowOverlay::Slot* s = ov.find(T::View, g);
+        row.removed = s == nullptr || s->erased;
+        row.image   = row.removed ? nullptr : ov.imageOf(T::View, s);
+    };
+    switch (o.kind) {
+        case StepKind::Erased:   p.op = ProspectOp::Erase;  viewRow(p.rows[0], o.oldGroup); p.rowCount = 1; break;
+        case StepKind::Upserted: p.op = ProspectOp::Upsert; viewRow(p.rows[0], o.group);    p.rowCount = 1; break;
+        default:
+            p.op = ProspectOp::Move;
+            viewRow(p.rows[0], o.group);
+            viewRow(p.rows[1], o.oldGroup);
+            p.rowCount = 2;
+            break;
+    }
+    return PrepareStatus::Ok;
+}
+
+void applyAggregate(AggregateFold& f, const SourceRecord&, const Prospect& p) noexcept {
+    using T = RowOverlay::Table;
+    ViewTable* const tables[RowOverlay::kTables] = {&f.view, &f.contributors, &f.groups, f.blocks};
+    // The order the direct step writes: contributors, groups, blocks, then the view.
+    for (const T t : {T::Contributors, T::Groups, T::Blocks, T::View}) {
+        ViewTable* tbl = tables[static_cast<std::size_t>(t)];
+        if (tbl == nullptr) continue;
+        for (std::size_t i = 0; i < p.overlay.used(t); ++i) {
+            const RowOverlay::Slot& s = p.overlay.slot(t, i);
+            if (s.erased) tbl->erase(s.key);
+            else std::memcpy(tbl->put(s.key), p.overlay.image(t, i), p.overlay.rowLen(t));
+        }
+    }
 }
 
 } // namespace rune::view

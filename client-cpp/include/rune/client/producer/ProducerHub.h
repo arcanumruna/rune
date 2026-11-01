@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -69,6 +70,12 @@ public:
     // Throws std::length_error past batchcorr::kMaxOrdinal + 1 producers.
 
     void add(ProducerImpl* impl);
+
+    /// SD11: the seed broker's version, forwarded to every producer held and to every later one.
+    void setBrokerVersion(int32_t v) noexcept {
+        brokerVersion_ = v;
+        forEach([v](ProducerImpl& p) { p.setBrokerVersion(v); });
+    }
 
     /// F8c C7: forget a released, quiescent producer (its slot becomes a
     /// tombstone; the ordinal is reused only once every fresh one is taken,
@@ -143,8 +150,9 @@ public:
     /// Route a ProduceResponse to the ONE producer named by the batch id's
     /// ordinal (O(1)); non-batch ids (transactional / control) are ignored.
     /// D6: logStartOffset = ProduceResponse.logStartOffset (-1 = not carried).
+    /// Client 17: `hasVerdicts` + the trailer entries of a View ack of a verdict source.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
-                           int64_t logStartOffset = -1);
+                           int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {});
 
     // ---- Phase 2b F Task 2: coordinator answers, routed by producer ordinal ----
 
@@ -320,6 +328,7 @@ private:
     std::vector<uint32_t> freeOrdinals_;  // F8c C7: released ordinals, FIFO (reused once fresh run out)
     std::size_t freeHead_ = 0;            // next freeOrdinals_ entry to reuse
     std::vector<uint32_t> nextCoordSeq_;  // per ordinal: the next incarnation's coordinator request sequence
+    int32_t brokerVersion_ = 0;           // SD11: the seed broker's version (0 = unknown)
     std::vector<uint64_t> nextBase_;      // per ordinal: the next incarnation's sequence base (F2)
 };
 

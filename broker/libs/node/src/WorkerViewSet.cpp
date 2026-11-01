@@ -267,6 +267,26 @@ void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
 }
 
 bool WorkerViewSet::uninstallView(int32_t viewTopicId) {
+    // A verdict view that a judge has taken in stays (Retiring) until a committed marker passes its drop: records up to the
+    // drop are still judged with it, on every replica (P4-6).
+    if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.isVerdict) {
+        const bool judged = std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& kv) {
+            return kv.second->hasView(viewTopicId);
+        });
+        if (judged) {
+            for (auto& kv : verdictSources_) kv.second->markLeaving(viewTopicId);
+            tit->second.retiring = true;
+            ++verdictEpoch_;
+            return true;
+        }
+    }
+    return eraseView_(viewTopicId);
+}
+
+bool WorkerViewSet::eraseView_(int32_t viewTopicId) {
+    ++verdictEpoch_;
+    if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.isVerdict)
+        for (auto& kv : verdictSources_) kv.second->removeVerdictView(viewTopicId);
     bool had = templates_.erase(viewTopicId) != 0;
     for (auto it = views_.begin(); it != views_.end();) {
         if (static_cast<int32_t>(static_cast<uint32_t>(it->first >> 32)) == viewTopicId) {
@@ -755,6 +775,187 @@ bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
 
     inst.pendingValid = false;
     return true;
+}
+
+void WorkerViewSet::installTestVerdictViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout,
+                                                  rune::codec::Descriptor src, bool persisted, uint64_t viewObjectId, TestRejectRule rule, bool underRecovery) {
+    const int32_t viewTopicId = plan.viewTopicId;
+    installView(std::move(plan), std::move(layout), std::move(src), persisted, underRecovery);
+    ViewTemplate& tpl = templates_.at(viewTopicId);
+    ++verdictEpoch_;
+    tpl.isVerdict = true;
+    tpl.verdictKind = rune::view::VerdictViewKind::TestReject;
+    tpl.verdictObjectId = viewObjectId;
+    tpl.verdictFingerprint = rule.fingerprint();
+    tpl.testRule = rule;
+}
+
+VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write) {
+    const auto sit = subscriptionIndex_.find(srcTopicId);
+    bool anyTemplate = false;
+    if (sit != subscriptionIndex_.end())
+        for (const int32_t id : sit->second) anyTemplate = anyTemplate || isVerdictTemplate_(id);
+    const uint64_t key = instKey(srcTopicId, partition);
+    auto vit = verdictSources_.find(key);
+    if (!anyTemplate && write.constraintSets.latest().empty()) {
+        if (vit == verdictSources_.end()) return nullptr;
+        // The set was dropped: the judge stays until it has passed the drop and holds no member.
+        if (vit->second->hasMembers() || vit->second->judgedThrough() <= write.constraintSets.lastChangeOffset()) return vit->second.get();
+        write.verdicts = nullptr;
+        verdictSources_.erase(vit);
+        return nullptr;
+    }
+    if (vit == verdictSources_.end()) {
+        auto v = std::make_unique<VerdictSource>(srcTopicId, partition);
+        v->setViewHooks(VerdictViewHooks{this, &checkpointHook_, &discardHook_, &retiredHook_});
+        v->setVerdictIntervalNs(verdictIntervalNs_);
+        vit = verdictSources_.emplace(key, std::move(v)).first;
+    }
+    VerdictSource* judge = vit->second.get();
+    judge->bindState(&write);
+    write.verdicts = judge;
+    if (sit == subscriptionIndex_.end()) return judge;
+    for (const int32_t id : sit->second) {
+        const ViewTemplate& tpl = templates_.at(id);
+        if (!tpl.isVerdict || tpl.retiring || judge->hasView(id)) continue;
+        ViewInstance* inst = getOrCreate_(id, partition, INT64_MAX);
+        if (inst == nullptr) continue;
+        judge->installTestVerdictViewForTest(inst, tpl.verdictObjectId, tpl.testRule);
+    }
+    return judge;
+}
+
+int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write) {
+    if (judge.constraintSyncEpoch == verdictEpoch_ && judge.constraintSyncChange == write.constraintSets.lastChangeOffset()) return 0;
+    const ConstraintSet& logged = write.constraintSets.latest();
+    const auto sit = subscriptionIndex_.find(srcTopicId);
+    std::vector<ConstraintSetMember>& want = constraintWant_;
+    want.clear();
+    // A logged member keeps its place unless its template retired or was replaced; one whose plan is not installed here is kept
+    // (the judge waits for it, it is never dropped by a guess).
+    for (uint8_t i = 0; i < logged.count; ++i) {
+        const ConstraintSetMember& m = logged.members[i];
+        bool live = false, gone = false;
+        if (sit != subscriptionIndex_.end()) {
+            for (const int32_t id : sit->second) {
+                const ViewTemplate& tpl = templates_.at(id);
+                if (!tpl.isVerdict || tpl.verdictObjectId != m.viewObjectId) continue;
+                if (tpl.verdictFingerprint == m.planFingerprint) (tpl.retiring ? gone : live) = true;
+                else if (!tpl.retiring) gone = true;   // replaced by a plan with another fingerprint
+            }
+        }
+        if (live || !gone) want.push_back(m);   // a retiring view's plan installed again stays (#786)
+    }
+    if (sit != subscriptionIndex_.end()) {
+        for (const int32_t id : sit->second) {
+            const ViewTemplate& tpl = templates_.at(id);
+            if (!tpl.isVerdict) continue;
+            if (tpl.retiring) {
+                const bool inLogged = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
+                const bool wasLogged = std::any_of(logged.members.begin(), logged.members.begin() + logged.count, [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
+                if (!inLogged && !wasLogged && !judge.hasView(id)) retiredQueue_.push_back({id, judge.partition()});   // never joined a set
+                continue;
+            }
+            const bool present = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
+            if (!present) want.push_back(ConstraintSetMember{tpl.verdictObjectId, tpl.verdictKind, tpl.verdictFingerprint});
+        }
+    }
+    std::sort(want.begin(), want.end(), [](const ConstraintSetMember& a, const ConstraintSetMember& b) { return a.viewObjectId < b.viewObjectId; });
+    ConstraintSet desired;
+    desired.count = static_cast<uint8_t>(std::min(want.size(), desired.members.size()));
+    std::copy_n(want.begin(), desired.count, desired.members.begin());
+    int work = 0;
+    if (!desired.sameMembers(logged)) {
+        const int r = judge.requestChange(desired);
+        if (r == VerdictSource::kChangeDeferred) return 0;   // not yet bound or activated: ask again next pass
+        work = r >= 0 ? 1 : 0;
+    }
+    judge.constraintSyncEpoch = verdictEpoch_;
+    judge.constraintSyncChange = write.constraintSets.lastChangeOffset();
+    return work;
+}
+
+int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {
+    const auto sit = subscriptionIndex_.find(srcTopicId);
+    if (sit == subscriptionIndex_.end()) return 0;
+    for (const int32_t id : sit->second) {
+        if (!isVerdictTemplate_(id)) continue;
+        const auto vit = views_.find(instKey(id, partition));
+        if (vit == views_.end()) continue;
+        ViewInstance& inst = vit->second;
+        adoptNs_(inst, ns);
+        chargeMem_(inst);
+        if (inst.foldLeadership != leaderGen) {
+            inst.foldLeadership = leaderGen;
+            if (inst.readiness == ViewReadiness::Ready) inst.readiness = ViewReadiness::CatchingUp;
+        }
+        if (inst.readiness != ViewReadiness::Ready && inst.foldCursor >= bound) {
+            inst.readiness = leaderHwConfirmed ? ViewReadiness::Ready : ViewReadiness::CatchingUp;
+            pruneRecoveryIfAllReady_(id);
+        }
+    }
+    return 0;
+}
+
+int WorkerViewSet::finishRetired_() {
+    if (retiredQueue_.empty()) return 0;
+    int work = 0;
+    std::vector<Retired> queue;
+    queue.swap(retiredQueue_);
+    for (const Retired& r : queue) {
+        const auto tit = templates_.find(r.viewTopicId);
+        if (tit == templates_.end() || !tit->second.isVerdict || !tit->second.retiring) continue;
+        eraseInstance_(r.viewTopicId, r.partition);
+        const bool judged = std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& s) {
+            return s.second->hasView(r.viewTopicId);
+        });
+        if (!judged) (void)eraseView_(r.viewTopicId);   // another partition's judge may still judge with it
+        ++work;
+    }
+    return work;
+}
+
+void WorkerViewSet::eraseInstance_(int32_t viewTopicId, int32_t partition) {
+    if (const auto it = views_.find(instKey(viewTopicId, partition)); it != views_.end()) {
+        releaseMem_(it->second);
+        views_.erase(it);
+    }
+}
+
+int WorkerViewSet::pushVerdictCheckpoint_(ViewInstance& inst) {
+    int work = 0;
+    if (inst.resetOwed) {
+        const auto claim = channel_.deltas.tryClaim(ViewSnapshotChannel::kResetMsgType, ViewSnapshotChannel::kDeltaHeaderBytes);
+        if (claim < 0) return 1;   // ring full: retried next pass, no delta may precede the reset
+        uint8_t* dst = channel_.deltas.base() + claim;
+        writeI32LE(dst, inst.plan.viewTopicId);
+        writeI32LE(dst + 4, inst.partition);
+        channel_.deltas.commit(claim);
+        inst.resetOwed = false;
+        ++work;
+    }
+    if (inst.pendingValid) {
+        ++work;
+        if (!tryPushDelta_(inst)) return work;
+    }
+    if (!inst.persisted) {
+        discardDirty_(inst);
+        return work;
+    }
+    return work + buildAndPushCheckpoint_(inst);
+}
+
+void WorkerViewSet::discardVerdictInstance_(ViewInstance& inst) {
+    const std::size_t indexSlots = inst.plan.sizing.capacity != 0 ? ceilPow2(inst.plan.sizing.capacity) : std::size_t{4096};
+    const std::size_t chunkBytes = inst.plan.sizing.chunkBytes != 0 ? static_cast<std::size_t>(inst.plan.sizing.chunkBytes) : (std::size_t{32} << 20);
+    inst.table = rune::view::ViewTable(inst.layout, indexSlots, chunkBytes);
+    if (inst.agg) inst.agg.emplace(rune::view::buildAggLayout(inst.plan, inst.evolvingSrc).value(), indexSlots, chunkBytes);
+    inst.pendingDelta.clear();
+    inst.pendingValid = false;
+    inst.lastEncodedO = -1;
+    inst.resetOwed = true;
+    inst.readiness = ViewReadiness::RebuildingViews;
+    chargeMem_(inst);
 }
 
 } // namespace rune::node

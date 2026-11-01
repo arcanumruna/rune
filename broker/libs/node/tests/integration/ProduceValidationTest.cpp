@@ -305,7 +305,9 @@ struct WorkerHarness {
     void enqueueProduceBatch(int32_t topicId, int32_t partition,
                              std::vector<uint8_t> batch,
                              int64_t correlationId = 1,
-                             int64_t sessionId = 1) {
+                             int64_t sessionId = 1,
+                             int64_t producerId = -1,
+                             int32_t baseSequence = -1) {
         // Compute lastOffsetDelta from the batch header.
         int32_t lastOffsetDelta = 0;
         if (batch.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordCountOffset + 4)) {
@@ -322,6 +324,8 @@ struct WorkerHarness {
         op.logPtr           = nullptr; // disk-backed replica: getLogFromWire_ uses replica->log()
         op.sessionId        = sessionId;
         op.correlationId    = correlationId;
+        op.producerId       = producerId;
+        op.baseSequence     = baseSequence;
         op.lastOffsetDelta  = lastOffsetDelta;
         op.recordCount      = lastOffsetDelta + 1;
         op.durabilityTier   = 0; // Leader tier (ack immediately)
@@ -743,6 +747,67 @@ TEST(CheckedWritesValidationRegression, TypedProduceAllocatesNothingRegression) 
     EXPECT_EQ(window.count(), 0u);
     EXPECT_GT(h.worker->typedRejectsForTest(), 0u);
     EXPECT_GT(h.worker->typedVersionAheadForTest(), 0u);
+}
+
+// Validation runs after dedupe (SD2): a sequence problem is answered before the batch is judged, a refused batch does not
+// consume its sequence, and a duplicate retry never reaches the hook.
+namespace {
+std::vector<uint8_t> idempotentBatch(const std::vector<uint8_t>& recValue, int64_t pid, int32_t seq) {
+    RecordBatchBuilder b(0, 1000);
+    b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq);
+    b.append(std::string_view{}, std::string_view(reinterpret_cast<const char*>(recValue.data()), recValue.size()), 1000);
+    return b.build();
+}
+struct TypedHarness : WorkerHarness {
+    TypedHarness() {
+        enqueueSchemaUpdate(1, rune::codec::serialize(makeCharactersDescriptor()));
+        enqueueWriteSpec(1);
+        WorkerOp lvl;
+        lvl.type = WorkerOp::Type::ClusterFeatureLevel;
+        lvl.nextOffset = rune::replication::MetadataFeature::kCheckedWrites;
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(lvl)));
+        tick();
+    }
+    int16_t send(std::vector<uint8_t> batch, int64_t corr, int64_t pid, int32_t seq) {
+        enqueueProduceBatch(1, 0, std::move(batch), corr, 1, pid, seq);
+        tick();
+        return lastErrorCode;
+    }
+};
+}  // namespace
+
+TEST(CheckedWritesValidationRegression, ValidationRunsAfterDedupeRegression) {
+    TypedHarness h;
+    auto invalid = makeValidRecordValue(1, 1, "Alice");
+    invalid[invalid.size() - 1] = 0xFF;
+    const auto valid = makeValidRecordValue(1, 1, "Alice");
+    EXPECT_EQ(h.send(idempotentBatch(invalid, 11, 5), 1, 11, 5), static_cast<int16_t>(rune::protocol::client::ErrorCode::UnknownProducerId))
+        << "a new producer that does not start at 0 is answered before the batch is judged";
+    EXPECT_EQ(h.send(idempotentBatch(invalid, 11, 0), 2, 11, 0), static_cast<int16_t>(rune::protocol::client::ErrorCode::SchemaValidationFailed));
+    EXPECT_EQ(h.log->logEndOffset(), 0);
+    EXPECT_EQ(h.send(idempotentBatch(valid, 11, 0), 3, 11, 0), 0) << "the refusal did not consume the sequence";
+    EXPECT_EQ(h.log->logEndOffset(), 1);
+    EXPECT_EQ(h.send(idempotentBatch(invalid, 11, 5), 4, 11, 5), static_cast<int16_t>(rune::protocol::client::ErrorCode::OutOfOrderSequence))
+        << "a gap after an accepted batch is out of order, whatever the bytes say";
+}
+
+TEST(CheckedWritesValidationRegression, DuplicateRetryNeverRunsTheHookRegression) {
+    TypedHarness h;
+    const auto valid = makeValidRecordValue(1, 1, "Alice");
+    EXPECT_EQ(h.send(idempotentBatch(valid, 11, 0), 1, 11, 0), 0);
+    EXPECT_EQ(h.send(idempotentBatch(valid, 11, 0), 2, 11, 0), 0);
+    EXPECT_EQ(h.worker->hookChecksForTest(), 1u);
+    EXPECT_EQ(h.log->logEndOffset(), 1);
+}
+
+TEST(CheckedWritesValidation, UntypedTopicNeverBuildsAHook) {
+    WorkerHarness h;
+    for (int i = 0; i < 100; ++i) {
+        h.enqueueProduceBatch(1, 0, makeBatchWithValue(makeValidRecordValue(1, 1, "Alice")), i + 1);
+        h.tick();
+    }
+    EXPECT_EQ(h.log->logEndOffset(), 100);
+    EXPECT_EQ(h.worker->hookChecksForTest(), 0u);
 }
 
 } // namespace

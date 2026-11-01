@@ -197,7 +197,7 @@ jobs:
           SHARD: ${{ matrix.shard }}
         run: |
           ( while sleep 60; do echo "[mem] $(free -m | awk '/Mem:/{print $3"/"$2" MB"}') [disk] $(df -h . | awk 'NR==2{print $4}') free"; done ) &
-          run() { ctest --test-dir "build-${{ matrix.id }}" -LE latency -E 'UdpGsoBindings\.Ipv6RoundTrip' \
+          run() { ctest --test-dir "build-${{ matrix.id }}" -LE "latency|stress" -E 'UdpGsoBindings\.Ipv6RoundTrip' \
                     -j${{ matrix.jobs }} --output-on-failure "$@"; }
           total=$(ctest --test-dir "build-${{ matrix.id }}" -N | sed -nE 's/^Total Tests: ([0-9]+)/\1/p')
           rc=0

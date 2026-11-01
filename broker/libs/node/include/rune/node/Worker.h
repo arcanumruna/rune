@@ -100,6 +100,7 @@
 #include <rune/node/RecordsOpen.h>
 #include <rune/crypto/Aead.h>
 #include <rune/crypto/Cipher.h>
+#include <rune/node/CheckedWriteHook.h>
 #include <rune/node/WriteState.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/replication/ReplicationFrameLimits.h>   // F18 frame limits (maxAcceptableBatchBytes)
@@ -419,6 +420,7 @@ public:
                                         std::to_string(kMaxOwedReturnsCeiling) + "]");
         maxOwedReturns_ = n;
         pendingAcksAll_.reserve(maxOwedReturns_);
+        pendingAcksView_.reserve(maxOwedReturns_);
         durablePending_.reserve(maxOwedReturns_);
     }
     [[nodiscard]] std::size_t maxOwedReturns() const noexcept { return maxOwedReturns_; }
@@ -626,9 +628,12 @@ public:
         dirtyThisCycle_.reserve(kDirtySetReserve);
         roundMembers_.reserve(pow2AtLeast_(ioSubmitDepth < 2 ? 2 : ioSubmitDepth));   // A10: members <= io depth
         pendingAcksAll_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
+        pendingAcksView_.reserve(kMaxOwedReturns);
         subs_.reserve(kSubsReserve);
         writeSpecs_.reserve(kWriteSpecsReserve);
         egressScratch_.resize(kEgressScratchSize);
+        verdictSpans_.reserve(4096);
+        verdictKeep_.reserve(4096);
         maxIntakeBatchBytes_ = ringBatchFit_();   // BrokerNode narrows it: setMaxBatchBytes
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
     }
@@ -690,7 +695,20 @@ public:
         viewSet_ = vs;
         // Task 12: the view set's per-slot arrays follow this worker's slot table size.
         if (vs != nullptr && vs->nsSlotCapacity() != nsSlots_.capacity()) vs->configureNsSlots(nsSlots_.capacity());
+        if (vs != nullptr) vs->setVerdictIntervalNs(verdictIntervalNs_);
     }
+    /// Part 04 (SD14): how often a verdict source writes a marker for accepted-only progress.
+    void setVerdictIntervalNs(int64_t ns) noexcept {
+        verdictIntervalNs_ = ns;
+        if (viewSet_ != nullptr) viewSet_->setVerdictIntervalNs(ns);
+    }
+    void setVerdictAckArenaEntriesForTest(uint32_t entries) { ackSink_->resizeVerdictArenaForTest(entries); }
+    [[nodiscard]] const VerdictSourceStats* verdictStatsForTest(int32_t topicId, int32_t partition) const noexcept {
+        const VerdictSource* v = viewSet_ != nullptr ? viewSet_->verdictSource(topicId, partition) : nullptr;
+        return v != nullptr ? &v->stats() : nullptr;
+    }
+    [[nodiscard]] uint64_t verdictCutsForTest() const noexcept { return verdictCuts_; }
+    [[nodiscard]] uint64_t verdictScratchGrowthsForTest() const noexcept { return verdictScratchGrowths_; }
     [[nodiscard]] WorkerViewSet* viewSet() const noexcept { return viewSet_; }
 
     // Task 16: this worker's view restart-readiness, for the GetViewRow serve
@@ -718,8 +736,8 @@ public:
     // through the client's conductor).  The sink is heap-allocated once (cold):
     // ~0.9 MiB of fixed tables must not live on a thread stack.
     // -----------------------------------------------------------------------
-    void setShardClient(aeron::Aeron* client, int32_t controlTermBytes = 0) {
-        ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client, controlTermBytes}) : nullptr;
+    void setShardClient(aeron::Aeron* client, int32_t controlTermBytes = 0, int32_t minAckTermBytes = kMinAckTermBytes) {
+        ackSink_ = client ? std::make_unique<SessionAckSink>(AeronSessionPubPolicy{client, controlTermBytes, minAckTermBytes}) : nullptr;
         bindAcksOwed_.assign(SessionAckSink::kMaxSessions, OwedBindAck{});   // I2: preallocated once (cold), never grows
         bindAcksOwedCount_ = 0;
         if (ackSink_) ackSink_->setDirectBudgets(directSessionAckBudget_, static_cast<uint32_t>(kDirectAckBudget));
@@ -1780,6 +1798,8 @@ public:
     }
     [[nodiscard]] uint64_t typedRejectsForTest() const noexcept { return typedRejects_; }
     [[nodiscard]] uint64_t typedVersionAheadForTest() const noexcept { return typedVersionAhead_; }
+    [[nodiscard]] uint64_t hookChecksForTest() const noexcept { return hookChecks_; }
+    [[nodiscard]] uint64_t hookRefusalsForTest(HookRefusal why) const noexcept { return hookRefusals_[std::to_underlying(why)]; }
 
     // -----------------------------------------------------------------------
     // rune::consensus::Agent interface
@@ -1927,6 +1947,9 @@ public:
                 work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
                 work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
             }
+            work += flushOwedAcksView_(nowNs);   // a worker without views still releases and times out View waiters
+            publishVerdictCleanerBounds_();
+            if ((++verdictPasses_ & 1023) == 0) [[unlikely]] maintainVerdictIndexes_();
             if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
             work += serveHeldPushReads_();
         }
@@ -2061,6 +2084,9 @@ private:
             work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
             work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
         }
+        work += flushOwedAcksView_(nowNs);       // a worker without views still releases and times out View waiters
+        publishVerdictCleanerBounds_();
+        if ((++verdictPasses_ & 1023) == 0) [[unlikely]] maintainVerdictIndexes_();
         if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
         work += serveHeldPushReads_();
         // 4b. background disk work → io backend, never an inline fsync
@@ -2226,6 +2252,10 @@ private:
         // the gateway path; the sink drops it for a client below v14.
         else if (ret.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled))
             a.logStartOffset = ret.lastOffset;
+        a.assignedBase = ret.assignedBase;
+        a.hasVerdicts  = ret.hasVerdicts;
+        a.verdictCount = ret.verdictCount;
+        a.verdictRun   = ret.hasVerdicts != 0 ? ret.verdictRun : kNoVerdictRun;
         if (!ackSink_->enqueue(a)) [[unlikely]]
             haltInvariant_("session ack queue full (beyond its static bound)", "Task 13 G-A6 bound exceeded", 0);
         WorkerReturn n = ret;
@@ -3330,7 +3360,10 @@ private:
             spdlog::warn("Worker {}: topic {} key field cannot be a topic key; wire-key check skipped (pre-existing topic)",
                          workerId_, w->topicId);
         for (auto& sl : rcSlots_)
-            if (!sl.write && sl.replica->topicId() == w->topicId) sl.write = std::make_unique<PartitionWriteState>(PartitionWriteState{&spec});
+            if (!sl.write && sl.replica->topicId() == w->topicId) {
+                sl.write = std::make_unique<PartitionWriteState>(PartitionWriteState{&spec});
+                bindVerdictHooks_(sl);
+            }
         rebuildWriteById_();
     }
 
@@ -3580,6 +3613,35 @@ private:
         subs_.pop_back();
     }
 
+    // ---- Part 04 (8.6): consumers of a verdict source ----
+    /// Nothing is delivered past what the judge has decided; an untyped partition pays one null check.
+    [[nodiscard]] static int64_t verdictBound_(const PartitionWriteState* ws, int64_t bound) noexcept {
+        return ws == nullptr ? bound : std::min(bound, ws->verdictKnownThrough());
+    }
+    enum class Cut : uint8_t { Whole, Rebuilt, Empty, Full };
+    /// One data batch for a consumer: the records the verdict index rejected are removed.  Whole: send `bp` as it is.
+    /// Rebuilt: `n` bytes were written to verdictRebuildScratch_ at `used`.  Empty: every record was rejected.
+    /// Full: it does not fit behind `used` bytes of earlier rebuilds (the caller ends its chunk).
+    [[nodiscard]] Cut cutRejected_(const PartitionWriteState* ws, const uint8_t* bp, std::size_t size, int64_t base, int64_t last,
+                                   std::size_t used, std::size_t& n) {
+        if (ws == nullptr || ws->rejected.size() == 0 || ws->rejected.nextRejectedAtOrAfter(base) > last) [[likely]] return Cut::Whole;
+        ++verdictCuts_;
+        verdictSpans_.clear();
+        verdictKeep_.clear();
+        (void)rune::protocol::forEachRecordSpan(bp, size, [&](const rune::protocol::RecordSpan& r) {
+            if (ws->rejected.find(r.offset) == nullptr) verdictKeep_.push_back(r.index);
+            verdictSpans_.push_back(r);
+        });
+        if (verdictKeep_.empty()) return Cut::Empty;
+        if (used + size > verdictRebuildScratch_.size()) {
+            if (used != 0) return Cut::Full;
+            verdictRebuildScratch_.resize(size);
+            ++verdictScratchGrowths_;
+        }
+        n = rune::protocol::rebuildBatch({bp, size}, verdictSpans_, verdictKeep_, std::span<uint8_t>(verdictRebuildScratch_.data() + used, size));
+        return Cut::Rebuilt;
+    }
+
     // ---- the FilterGroup's view of the worker: a source (reads), a sink (egress) ----
     class FilterSourceImpl {
     public:
@@ -3599,8 +3661,11 @@ private:
                 if (rc_ == nullptr) return -1;    // not Ready
                 bound_ = rc_->lso(bound_);
             }
+            ws_ = w_.writeOf_(rep_);
+            bound_ = verdictBound_(ws_, bound_);
             return bound_;
         }
+        [[nodiscard]] const rune::storage::RejectedOffsetIndex* rejected() const noexcept { return ws_ != nullptr ? &ws_->rejected : nullptr; }
         /// Whole batches from the batch holding `from`: at least that one, even when it is larger than `cap`.
         [[nodiscard]] std::span<const uint8_t> read(int64_t from, std::size_t cap) noexcept {
             const std::size_t c = std::min<std::size_t>(static_cast<std::size_t>(kPushMaxChunkBytes), cap);
@@ -3623,6 +3688,7 @@ private:
         rune::replication::PartitionReplica* rep_ = nullptr;
         rune::storage::InMemoryLog* mem_ = nullptr;
         const RcState* rc_ = nullptr;
+        const PartitionWriteState* ws_ = nullptr;
         int64_t bound_ = 0;
     };
 
@@ -3950,6 +4016,8 @@ private:
                 if (rc == nullptr) continue;
                 bound = rc->lso(bound);
             }
+            const PartitionWriteState* const ws = writeOf_(rep);
+            bound = verdictBound_(ws, bound);
             if (s.nextOffset >= bound) continue;
 
             const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
@@ -4027,6 +4095,18 @@ private:
                     }
                 }
 
+                std::span<const uint8_t> out(bp, batchSize);
+                std::size_t cutBytes = 0;
+                switch (cutRejected_(ws, bp, batchSize, baseOffset, baseOffset + lastDelta, 0, cutBytes)) {
+                case Cut::Whole: break;
+                case Cut::Rebuilt: out = std::span<const uint8_t>(verdictRebuildScratch_.data(), cutBytes); break;
+                case Cut::Empty:
+                case Cut::Full:   // used == 0: a batch always fits
+                    pos += batchSize;
+                    s.nextOffset = baseOffset + static_cast<int64_t>(lastDelta) + 1;
+                    continue;
+                }
+
                 pc::Records rec;
                 rec.sessionId      = s.sessionId;
                 rec.correlationId  = s.subscribeCorrId;  // the client's Subscribe: exact instance identity
@@ -4034,7 +4114,7 @@ private:
                 rec.topicId        = s.topicId;
                 rec.partition      = s.partition;
                 rec.baseOffset     = baseOffset;
-                rec.recordBatch    = std::span<const uint8_t>(bp, batchSize);
+                rec.recordBatch    = out;
 
                 // F19: any frame up to the egress maxMessageLength is delivered
                 // (tryClaim fast path / vectored [fixed | batch] offer — zero
@@ -4103,7 +4183,8 @@ private:
         f.minIsr         = op.minIsr();
         f.producerEpoch  = op.producerEpoch();
         auto* rep        = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
-        f.acksAll        = (op.deferAck() & kOpFlagDeferAck) != 0 && rep != nullptr;
+        f.acks           = static_cast<uint8_t>((static_cast<uint8_t>(op.acks()) & rune::protocol::client::kAcksWireView) |
+                                                (((op.deferAck() & kOpFlagDeferAck) != 0 && rep != nullptr) ? rune::protocol::client::kAcksWireAll : 0));
         f.crcValidated   = (op.deferAck() & kOpFlagCrcValidated) != 0;
         f.durabilityTier = op.durabilityTier();
         f.enqueuedAtNs   = op.enqueuedAtNs();
@@ -4497,6 +4578,7 @@ private:
         // read_committed fails CLOSED (review m5) — nothing, answered at the cursor.
         auto* replica = a.replica;
         int64_t bound = hwBound;
+        bool judgeHeld = false;
         const RcState* rc = nullptr;
         if (replica != nullptr) {
             const int64_t liveHw = replica->highWatermark();
@@ -4519,12 +4601,17 @@ private:
                 }
                 bound = std::min(bound, rc->lso(liveHw));
             }
+            const int64_t beforeJudge = bound;
+            bound = verdictBound_(writeOf_(replica), bound);
+            judgeHeld = bound < beforeJudge;
         } else if (a.isolation == kIsolationReadCommitted && topicId >= 0) [[unlikely]] {
             ret.setPushEffectiveBound(nextOffset);
             enqueueReturn_(std::move(ret));
             return;
         }
-        ret.setPushEffectiveBound(bound);
+        // The judge, not the HW, holds the bound: the HW will not move to wake a subscription parked on it, so answer
+        // "unanswered" (-1) and let the gateway re-issue on its next push cycle.
+        ret.setPushEffectiveBound(judgeHeld ? -1 : bound);
 
         // Only read if there are records available (within the bound).
         // F5 (hot-path B) + #65: zero allocation — the chunk is pread into the
@@ -4594,7 +4681,8 @@ private:
                            : mem->readView(a.nextOffset, static_cast<int32_t>(cap));
         if (v.empty()) return PushChunk::Empty;
         const bool preCarrier = a.isGroup && !a.carrier;
-        std::size_t rd = 0, nRuns = 0, total = 0;
+        std::size_t rd = 0, nRuns = 0, total = 0, rebuilt = 0;
+        const PartitionWriteState* const ws = writeOf_(a.replica);
         int64_t next = ret.newNextOffset;
         int64_t cutBound = -1;
         while (rd + static_cast<std::size_t>(b::kRecordBatchOverhead) <= v.len) {
@@ -4621,13 +4709,28 @@ private:
                 if (total == 0) return PushChunk::TooLarge;                // only ever the view's first batch
                 break;
             }
-            if (nRuns != 0 && pushRuns_[nRuns - 1].data + pushRuns_[nRuns - 1].len == v.data + rd) {
-                pushRuns_[nRuns - 1].len += static_cast<uint32_t>(sz);    // contiguous: extend the run
+            const uint8_t* src = v.data + rd;
+            std::size_t len = sz;
+            std::size_t cutBytes = 0;
+            const Cut cut = cutRejected_(ws, src, sz, base, last, rebuilt, cutBytes);
+            if (cut == Cut::Empty) {                                       // every record rejected: skipped like a marker
+                rd += sz;
+                next = last + 1;
+                continue;
+            }
+            if (cut == Cut::Full) break;                                   // the rest in the next read
+            if (cut == Cut::Rebuilt) {
+                src = verdictRebuildScratch_.data() + rebuilt;
+                len = cutBytes;
+                rebuilt += cutBytes;
+            }
+            if (nRuns != 0 && pushRuns_[nRuns - 1].data + pushRuns_[nRuns - 1].len == src) {
+                pushRuns_[nRuns - 1].len += static_cast<uint32_t>(len);   // contiguous: extend the run
             } else {
                 if (nRuns == kMaxPushRuns) break;                          // cut here (the rest next read)
-                pushRuns_[nRuns++] = ChunkRun{v.data + rd, static_cast<uint32_t>(sz)};
+                pushRuns_[nRuns++] = ChunkRun{src, static_cast<uint32_t>(len)};
             }
-            total += sz;
+            total += len;
             rd += sz;
             next = last + 1;
         }
@@ -5644,6 +5747,8 @@ private:
         rune::replication::PartitionReplica* replica = nullptr;
         uint64_t                logGen     = 0;
         int32_t                 minIsr     = 1;       ///< DR-BUG-3 (thenAwaitHw only)
+        uint8_t                 thenAwaitAcks = 0;    ///< the wire acks byte: a View entry moves to pendingAcksView_ (thenAwaitHw only)
+        uint8_t                 replay     = 0;       ///< PendingAcksView::replay of the entry it becomes
     };
     // F15 S5 fix round 1 (I-1): park-ordered, O(1) front fire (OrderedWaitQueue.h).
     OrderedWaitQueue<DurablePending> durablePending_;
@@ -5981,6 +6086,10 @@ public:
 private:
     std::size_t                           pushBudgetLeft_ = kPushPassBudgetBytes;
     std::array<ChunkRun, kMaxPushRuns>    pushRuns_{};
+    std::vector<uint8_t>                  verdictRebuildScratch_ = std::vector<uint8_t>(static_cast<std::size_t>(kPushMaxChunkBytes));   // grow-once (counted)
+    std::vector<rune::protocol::RecordSpan> verdictSpans_;
+    std::vector<uint32_t>                 verdictKeep_;
+    uint64_t                              verdictCuts_ = 0, verdictScratchGrowths_ = 0;
     /// #65: push-read pread target (allocated once, at construction): one
     /// pass's push budget + the sparse-index skip slack + room for a first
     /// batch past the budget (a fresh pass always takes one).  Larger first
@@ -6038,6 +6147,23 @@ private:
     };
     // F15 S5 fix round 1 (I-1): park-ordered, O(1) front fire (OrderedWaitQueue.h).
     OrderedWaitQueue<PendingAcksAll> pendingAcksAll_;
+
+    // Checked writes: a produce acked with View waits here, in its own queue, so an All ack never queues behind the fold
+    // (an open transaction holds the fold, not the HW).  Fires when the HW passed it, the ISR still holds (All only) and
+    // every view over the partition folded past it under the current leadership.
+    struct PendingAcksView {
+        rune::replication::PartitionReplica* replica    = nullptr;
+        int64_t                              lastOffset = 0;
+        int64_t                              deadlineNs = 0;
+        uint64_t                             logGen     = 0;
+        int32_t                              minIsr     = 1;
+        WorkerReturn                         ret;
+        uint8_t                              acks       = 0;   ///< the Produce.acks wire byte
+        uint8_t                              replay     = 0;   ///< a duplicate: 1 = in the dedupe window (its verdicts are replayed once W passes it), 2 = known-old (no verdicts to replay)
+    };
+    OrderedWaitQueue<PendingAcksView> pendingAcksView_;
+    int64_t  verdictIntervalNs_ = 100'000'000;
+    uint64_t verdictPasses_ = 0;
 
     // F15 S3 (§6): the ONE local return FIFO in front of ret_, every mode.
     // Pre-allocated fixed-capacity ring of tagged entries (WorkerReturn |
@@ -6114,6 +6240,8 @@ private:
     std::unordered_map<int32_t, std::unique_ptr<TopicWriteSpec>> writeSpecs_;
     uint64_t typedRejects_      = 0;   // batches refused SchemaValidationFailed by checkTypedBatch
     uint64_t typedVersionAhead_ = 0;   // batches answered NotLeader: a record's version has not been installed here yet
+    uint64_t hookChecks_        = 0;   // CheckedWriteHook::check ran
+    std::array<uint64_t, std::to_underlying(HookRefusal::Count_)> hookRefusals_{};   // by reason
 
     // Phase 2c: filtered subscriptions (worker thread only).  filterSchemas_ is never erased (topic ids are never
     // reused; the cost is bounded by the typed topics), so pointers into it are stable.  A group is identified by
@@ -6606,6 +6734,7 @@ private:
         std::unique_ptr<RcState>             rc;
         std::unique_ptr<RcHintCtx>           hint;
         std::unique_ptr<PartitionWriteState> write;   // checked writes: a typed partition's write state (null: untyped)
+        int64_t verdictBoundPublished = -2, verdictEndPublished = -2;   // Part 04: what the cleaner was last told (publish on change only)
     };
     // The default read-ahead issuer: an async IORING_OP_FADVISE(WILLNEED) on the
     // segment fd where the worker's io backend is io_uring AND the kernel
@@ -6772,6 +6901,12 @@ private:
     [[nodiscard]] const RcState* rcFor_(int32_t topicId, int32_t partition) const noexcept {
         return rcOf_(findOwnedReplica_(topicId, partition));
     }
+    // Part 04 (P4-1): the leadership scan of a disk partition with a write state feeds its verdict markers and constraint-set
+    // changes into that state.
+    static void bindVerdictHooks_(RcSlot& slot) noexcept {
+        if (slot.write && slot.rc && slot.replica->isDiskBacked())
+            slot.rc->setVerdictHooks(RcVerdictHooks{&verdictFeedBegin, &verdictFeedBatch, slot.write.get()});
+    }
     // Cold (ownership apply): carry still-owned states, create + reserve new
     // ones, drop the rest; re-resolve every subscription's cached pointer.
     void rebuildRcSlots_() {
@@ -6805,6 +6940,7 @@ private:
             if (!slot.write)
                 if (const auto it = writeSpecs_.find(r->topicId()); it != writeSpecs_.end() && it->second->hasFacts())
                     slot.write = std::make_unique<PartitionWriteState>(PartitionWriteState{it->second.get()});
+            bindVerdictHooks_(slot);
             next.push_back(std::move(slot));
         }
         rcSlots_ = std::move(next);
@@ -6844,7 +6980,10 @@ private:
             const int32_t topicId = replica->topicId();
             // Short-circuit: skip the rc/bound computation for an owned
             // partition no installed view is interested in.
-            if (!viewSet_->interestedIn(topicId)) continue;
+            if (!viewSet_->interestedIn(topicId)) {
+                const PartitionWriteState* w = writeOf_(replica);
+                if (w == nullptr || w->constraintSets.latest().empty()) continue;   // a verdict source without its views still judges nothing, but is driven (it waits)
+            }
             if (replica->role() != rune::replication::Role::Leader) continue;
             const RcState* rcState = rcServe_(replica, rcOf_(replica));
             if (rcState == nullptr) continue;         // RC not Ready: fail closed, no bound
@@ -6854,7 +6993,7 @@ private:
             // batches of the aborted ones by this partition's aborted index (the
             // read_committed fetch's own predicate) on every path — steady folds,
             // restart rebuilds, transient sources, capped passes.
-            const rune::view::AbortedTxnFilter aborted = rcAbortedFilter_(*rcState);
+            const rune::view::FoldSkip skip{.aborted = rcAbortedFilter_(*rcState)};
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
             // N-C1: right after an election the HW floor can lag what the old leader had committed; a table is
             // Ready under this leadership only once HW has reached the leadership's start offset.
@@ -6865,8 +7004,8 @@ private:
                 auto readRange = [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 };
-                work += driveViewsOf_(topicId, partition, readRange, bound, aborted, nowNs, nullptr,
-                                      replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()});
+                work += driveViewsOf_(topicId, partition, readRange, bound, skip, nowNs, nullptr,
+                                      replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()}, replica);
             } else {
                 // Phase 2b E: a TRANSIENT source — zero-copy view into the
                 // replica's own ring (same thread).  The fold itself stops at its
@@ -6876,8 +7015,8 @@ private:
                 auto readRange = [mem](int64_t from, int64_t /*to*/) -> rune::storage::LogReadView {
                     return mem->readView(from, kPushMaxChunkBytes);
                 };
-                work += driveViewsOf_(topicId, partition, readRange, bound, aborted, nowNs, replica,
-                                      replica->leadershipGeneration(), hwConfirmed);
+                work += driveViewsOf_(topicId, partition, readRange, bound, skip, nowNs, replica,
+                                      replica->leadershipGeneration(), hwConfirmed, NsTag{}, replica);
             }
         }
         return work;
@@ -6904,10 +7043,14 @@ private:
     // are gated on hasRecovery() — a broker with no durable views runs neither.
     template <class ReadRangeFn>
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
-                      int64_t bound, const rune::view::AbortedTxnFilter& aborted, int64_t nowNs,
+                      int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                       const rune::replication::PartitionReplica* transientRep,
-                      uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns = {}) {
+                      uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, rune::replication::PartitionReplica* replica) {
         int work = 0;
+        PartitionWriteState* write = writeOf_(replica);
+        VerdictSource* judge = write != nullptr ? viewSet_->ensureVerdictSource(topicId, partition, *write) : nullptr;
+        if (judge != nullptr)
+            judge->bindLeader(replica, leaderGen, replica->isDiskBacked() ? replica->log()->logStartOffset() : replica->memoryLog()->logStartOffset());
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
         if (transientRep != nullptr) {
@@ -6921,11 +7064,11 @@ private:
         }
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
-            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, aborted, nowNs, tbp, leaderGen,
-                                           leaderHwConfirmed, ns);
+            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
+                                           leaderHwConfirmed, ns, write);
         }
-        work += viewSet_->driveFolds(topicId, partition, readRange, bound, aborted, nowNs, tbp, leaderGen,
-                                     leaderHwConfirmed, ns);
+        work += viewSet_->driveFolds(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
+                                     leaderHwConfirmed, ns, write, judge);
         return work;
     }
 
@@ -7008,6 +7151,7 @@ private:
             RcSlot& sl = rcSlots_[i];
             if (!ringWork_(sl.replica, *sl.rc))
                 work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;   // publishes the cleaner LSO (D3b)
+            if (sl.write && sl.write->constraintSets.size() != 0) [[unlikely]] verdictHousekeeping_(sl);
             if (++i == n) i = 0;
         }
         if (++rcWalkStart_ == n) rcWalkStart_ = 0;
@@ -7024,6 +7168,60 @@ private:
             i = next;
         }
         return work;
+    }
+    // Part 04: the markers below the HW are committed (W follows them), and the index forgets what retention deleted.
+    void verdictHousekeeping_(RcSlot& sl) noexcept {
+        verdictOnHw(*sl.write, sl.replica->highWatermark());
+        PartitionWriteState& w = *sl.write;
+        if (const uint64_t mismatches = w.rejected.mismatches(); mismatches != w.mismatchesLogged) [[unlikely]] {
+            spdlog::error("rejected index disagrees with the log: {} mismatches (topic {} partition {})", mismatches, sl.replica->topicId(), sl.replica->partitionId());
+            w.mismatchesLogged = mismatches;
+        }
+        if (!sl.replica->isDiskBacked()) return;
+        rune::storage::Log& log = *sl.replica->log();
+        w.rejected.dropBelow(log.logStartOffset());
+        // The latest committed set change outlives retention: a restart without it finds no verdict source.  When it sits in
+        // the oldest segment the leader logs it again; retention takes that segment once the new one is committed.
+        const int64_t change = w.constraintSets.lastChangeBelow(sl.replica->highWatermark());
+        sl.replica->holdRetentionAt(change < 0 ? std::numeric_limits<int64_t>::max() : change);
+        if (w.verdicts == nullptr || w.constraintSets.latest().empty()) return;
+        // Only a leader whose scan has fed every logged change: before that, latest() can be an older set, and logging it
+        // again would undo the changes the scan has not reached yet.
+        if (sl.replica->role() != rune::replication::Role::Leader || !sl.rc->ready()) return;
+        const int64_t nextBase = log.nextSegmentBaseAfter(log.logStartOffset());
+        if (nextBase >= 0 && w.constraintSets.lastChangeOffset() < nextBase) (void)w.verdicts->requestChange(w.constraintSets.latest(), true);
+    }
+    // Part 04 (P4-14): tell the cleaner how far the verdicts are durable.  The marker end is published before the bound.
+    void publishVerdictCleanerBounds_() noexcept {
+        for (auto& sl : rcSlots_) {
+            if (sl.write && sl.write->growOwed) [[unlikely]] growVerdictIndex_(*sl.write);
+            if (!sl.replica->isDiskBacked() || !sl.rc->ready()) continue;
+            int64_t bound = rune::replication::PartitionReplica::kNoCleanerLso, end = std::max<int64_t>(sl.verdictEndPublished, 0);
+            if (sl.write && sl.write->constraintSets.size() != 0 && sl.replica->role() == rune::replication::Role::Leader) {
+                const PartitionWriteState& w = *sl.write;
+                const int64_t W = w.markers.committedThrough();
+                bound = w.constraintSets.latest().empty() && W > w.constraintSets.lastChangeOffset()
+                            ? rune::replication::PartitionReplica::kNoCleanerLso : W;
+                end = w.markers.committedMarkerEnd();
+            }
+            if (bound == sl.verdictBoundPublished && end == sl.verdictEndPublished) continue;
+            sl.replica->publishCleanerVerdictMarkerEnd(end);
+            sl.replica->publishCleanerVerdictBound(bound);
+            sl.verdictBoundPublished = bound;
+            sl.verdictEndPublished = end;
+        }
+    }
+    // Part 04 (P4-11): a verdict index that crosses 75 % doubles, up to 2^24 entries; cold.  A judge stalled on a full index resumes.
+    static void growVerdictIndex_(PartitionWriteState& w) {
+        auto& idx = w.rejected;
+        w.growOwed = false;
+        if (idx.capacity() != 0 && idx.size() * 4 >= idx.capacity() * 3 && idx.capacity() < (std::size_t{1} << 24))
+            idx.grow(std::min<std::size_t>(idx.capacity() * 2, std::size_t{1} << 24));
+        if (w.verdicts != nullptr) w.verdicts->unstall();
+    }
+    void maintainVerdictIndexes_() {
+        for (auto& sl : rcSlots_)
+            if (sl.write) growVerdictIndex_(*sl.write);
     }
     // D3b: publish the partition's first unstable offset to the cleaner (only on
     // change).  Called on every RC transition: the per-pass driver (Ready / reset)
@@ -7250,6 +7448,12 @@ private:
         };
         (void)pendingAcksAll_.sweep([&](PendingAcksAll& e) {
             if (stillOwned(e)) return false;
+            e.ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+            enqueueReturn_(e.ret);
+            return true;
+        });
+        (void)pendingAcksView_.sweep([&](PendingAcksView& e) {
+            if (e.ret.incarnation != 0 ? ownsIncarnation_(e.ret.targetReplicaId, e.ret.incarnation) : isOwned(e.replica)) return false;
             e.ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
             enqueueReturn_(e.ret);
             return true;
@@ -7852,14 +8056,27 @@ private:
             // single-ISR Strict log, HW / consumer visibility can precede the
             // fsync — Kafka semantics; the PRODUCER ack never does.)
             entry.ret.errorCode = 0;
-            PendingAcksAll pending;
-            pending.replica    = entry.thenAwaitHw;
-            pending.lastOffset = entry.lastOffset;
-            pending.deadlineNs = entry.deadlineNs;
-            pending.logGen     = entry.logGen;
-            pending.minIsr     = entry.minIsr;
-            pending.ret        = std::move(entry.ret);
-            pendingAcksAll_.push_back(std::move(pending));
+            if (rune::protocol::client::acksView(entry.thenAwaitAcks)) {
+                PendingAcksView pending;
+                pending.replica    = entry.thenAwaitHw;
+                pending.lastOffset = entry.lastOffset;
+                pending.deadlineNs = entry.deadlineNs;
+                pending.logGen     = entry.logGen;
+                pending.minIsr     = entry.minIsr;
+                pending.acks       = entry.thenAwaitAcks;
+                pending.replay     = entry.replay;
+                pending.ret        = std::move(entry.ret);
+                pendingAcksView_.push_back(std::move(pending));
+            } else {
+                PendingAcksAll pending;
+                pending.replica    = entry.thenAwaitHw;
+                pending.lastOffset = entry.lastOffset;
+                pending.deadlineNs = entry.deadlineNs;
+                pending.logGen     = entry.logGen;
+                pending.minIsr     = entry.minIsr;
+                pending.ret        = std::move(entry.ret);
+                pendingAcksAll_.push_back(std::move(pending));
+            }
         } else {
             entry.ret.errorCode = 0; // OK
             enqueueReturn_(entry.ret);
@@ -7903,6 +8120,13 @@ private:
         (void)pendingAcksAll_.sweep([&](PendingAcksAll& e) {
             auto* r = e.replica;
             if (!(r && r->isDiskBacked() && r->log() == log)) return false;   // log() is immutable: safe to read
+            e.ret.errorCode = code;
+            enqueueReturn_(e.ret);
+            return true;
+        });
+        (void)pendingAcksView_.sweep([&](PendingAcksView& e) {
+            auto* r = e.replica;
+            if (!(r && r->isDiskBacked() && r->log() == log)) return false;
             e.ret.errorCode = code;
             enqueueReturn_(e.ret);
             return true;
@@ -8061,6 +8285,102 @@ private:
     }
 
     // -----------------------------------------------------------------------
+    // flushOwedAcksView_ - fire View acks: the HW passed the batch, (for All) the ISR still holds, and every view of the
+    // source folded past it under THIS leadership (WorkerViewSet::minFoldCursor); no views means nothing to wait for.
+    // Same re-validation, ordering and deadline as flushOwedAcksAll_.
+    // -----------------------------------------------------------------------
+    int flushOwedAcksView_(int64_t nowNs) {
+        if (pendingAcksView_.empty()) return 0;
+        struct Deferred { int32_t topicId, partition; };
+        std::array<Deferred, 16> deferred;   // P4-10: partitions whose verdict run did not fit, in this sweep
+        std::size_t deferredCount = 0;
+        bool deferAll = false;
+        return static_cast<int>(pendingAcksView_.sweep([&](PendingAcksView& entry) {
+            if (deferAll) return false;
+            for (std::size_t i = 0; i < deferredCount; ++i)
+                if (deferred[i].topicId == entry.ret.topicId && deferred[i].partition == entry.ret.partition) return false;
+            auto* rep = waiterReplica_(entry.replica, entry.ret.targetReplicaId, entry.ret.incarnation,
+                                       entry.lastOffset, entry.logGen);
+            const PartitionWriteState* ws = rep != nullptr ? writeOf_(rep) : nullptr;
+            const bool source = ws != nullptr && ws->isVerdictSource();
+            int16_t code = 0;
+            if (rep == nullptr) [[unlikely]] {
+                code = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+            } else if (rep->highWatermark() > entry.lastOffset &&
+                       (!rune::protocol::client::acksAll(entry.acks) || static_cast<int>(rep->isr().size()) >= entry.minIsr) &&
+                       (viewSet_ == nullptr ||
+                        viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration()) > entry.lastOffset) &&
+                       (!source || (ws->verdictKnownThrough() > entry.lastOffset &&
+                                    (entry.replay == 0 || ws->markers.committedThrough() > entry.lastOffset)))) {
+                code = 0;
+            } else if (nowNs >= entry.deadlineNs) {
+                spdlog::warn("Worker {}: View ack timeout for partition={} lastOffset={}; acking Internal error",
+                             workerId_, entry.ret.partition, entry.lastOffset);
+                code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+            } else {
+                // A replay waiting for its marker must not be passed by a later ack of the partition.
+                if (entry.replay == 1) {
+                    if (deferredCount == deferred.size()) deferAll = true;
+                    else deferred[deferredCount++] = Deferred{entry.ret.topicId, entry.ret.partition};
+                }
+                return false;
+            }
+            if (code == 0 && source) {
+                if (entry.replay == 2) {   // outside the dedupe window: stored, its verdicts are gone
+                    code = static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
+                    if (ws->verdicts != nullptr) ++ws->verdicts->statsMut().verdictUnknownDuplicates;
+                } else {
+                    const VerdictFill fill = fillVerdicts_(entry, *ws);
+                    if (fill == VerdictFill::TooMany) {
+                        code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+                    } else if (fill == VerdictFill::Deferred) {
+                        if (nowNs < entry.deadlineNs) {
+                            if (deferredCount == deferred.size()) deferAll = true;
+                            else deferred[deferredCount++] = Deferred{entry.ret.topicId, entry.ret.partition};
+                            return false;
+                        }
+                        code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+                    }
+                }
+            }
+            entry.ret.errorCode = code;
+            FLIGHT_RECORDER_MARK_VAL_REPLICATION(flight_recorder::Site::ShWaiterFire, flight_recorder::foldCorr(entry.ret.correlationId),
+                                         static_cast<double>(code));
+            enqueueReturn_(entry.ret);
+            return true;
+        }));
+    }
+
+    // The trailer of a View ack of a verdict source: the rejections in [baseOffset, lastOffset] as {offset - baseOffset, code,
+    // constraintId}.  Deferred = the sink's arena is full (the caller retries; nothing was reserved).  TooMany = more than a
+    // trailer carries (a batch the hook let through before the limit applied): the ack is Internal, the write itself stands.
+    enum class VerdictFill : uint8_t { Done, Deferred, TooMany };
+    [[nodiscard]] VerdictFill fillVerdicts_(PendingAcksView& entry, const PartitionWriteState& ws) {
+        const int64_t base = entry.ret.baseOffset;
+        std::size_t count = 0;
+        ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry&) { ++count; });
+        if (count > static_cast<std::size_t>(kMaxJudgedBatchRecords)) [[unlikely]] return VerdictFill::TooMany;
+        const uint16_t n = static_cast<uint16_t>(count);
+        uint32_t run = kNoVerdictRun;
+        if (n != 0) {
+            if (!ackSink_->reserveVerdicts(n, run)) return VerdictFill::Deferred;
+            uint8_t* out = ackSink_->verdictEntries(run).data();
+            ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry& e) {
+                const uint16_t idx = static_cast<uint16_t>(e.offset - base);
+                out[0] = static_cast<uint8_t>(idx); out[1] = static_cast<uint8_t>(idx >> 8);
+                out[2] = static_cast<uint8_t>(e.code); out[3] = static_cast<uint8_t>(e.code >> 8);
+                for (int i = 0; i < 4; ++i) out[4 + i] = static_cast<uint8_t>(e.constraintId >> (8 * i));
+                out += 8;
+            });
+        }
+        if (entry.replay == 1 && ws.verdicts != nullptr) ++ws.verdicts->statsMut().verdictReplays;
+        entry.ret.hasVerdicts = 1;
+        entry.ret.verdictCount = n;
+        entry.ret.verdictRun = run;
+        return VerdictFill::Done;
+    }
+
+    // -----------------------------------------------------------------------
     // waiterReplica_ — F15 §3.2: may a parked waiter (acks=all on the HW, a
     // Strict ack on its fsync) still fire OK?  Evaluated on THIS worker every
     // pass, state-driven (no role-change hooks):
@@ -8197,6 +8517,7 @@ private:
     // gateway-routed acks=all / Strict produces park on this worker too.
     [[nodiscard]] int64_t reservedAckSlots_() const noexcept {
         return static_cast<int64_t>(pendingAcksAll_.size()) +
+               static_cast<int64_t>(pendingAcksView_.size()) +
                static_cast<int64_t>(durablePending_.size()) +
                static_cast<int64_t>(heldPushReads_.size()) +   // F15 S4 I-2: held PushReads owe a return
                static_cast<int64_t>(heldViewReads_.size()) +   // issue #82: so do GetViewRows the fold barrier holds
@@ -8492,10 +8813,9 @@ private:
     //
     // E5.1.3 review fixes applied here:
     //   #2: All error-code literals replaced with pc::ErrorCode enum values.
-    //   #3: acksAll derivation.  The Produce wire acks byte is two-valued:
-    //       0 = Leader/None (immediate ack), 1 = All (deferred until the ISR HW);
-    //       Produce::decode rejects any other value (no-hang wave), so acks != 0
-    //       and the gateway's acks == 1 agree.
+    //   #3: acks derivation.  The Produce wire acks byte is bit 0 = All (deferred
+    //       until the ISR HW), bit 1 = View; Produce::decode rejects any other bit
+    //       (no-hang wave), and the gateway reads the same bits (pc::acksAll).
     // -----------------------------------------------------------------------
     // `directAck` (D8d): the admission (SessionAckSink::admitDirect) of this
     // frame — carried by its answer (exactly one: produceCore_ answers every
@@ -8749,9 +9069,6 @@ private:
         }
         if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed from here on
 
-        // E5.1.3 review fix #3: acksAll = (acks != 0).
-        // The Produce wire acks byte is 0 (Leader/None) or 1 (All); decode
-        // rejects anything else (answered InvalidRequest above).
         ProduceFields f;
         f.sessionId     = msg.sessionId;
         f.correlationId = msg.correlationId;
@@ -8761,7 +9078,7 @@ private:
         f.baseSequence  = msg.baseSequence;
         f.producerEpoch = msg.producerEpoch;
         f.durabilityTier = replica ? replica->durabilityTier() : uint8_t{1};
-        f.acksAll       = (msg.acks != 0);
+        f.acks          = msg.acks;
         f.fromOp        = false;   // the poll budget (ingressPollBudget_) reserved its answer
         f.directAck     = directAck;
         return produceCore_(f, log, replica, msg.recordBatch, nowNs);
@@ -8917,11 +9234,13 @@ private:
         int32_t minIsr        = 0;      ///< admission policy override (0 = the replica's)
         int16_t producerEpoch = 0;
         uint8_t durabilityTier = 1;     ///< 2 = Strict (ack after fsync)
-        bool    acksAll       = false;
+        uint8_t acks          = 0;      ///< the Produce.acks wire byte: bit 0 All, bit 1 View
         bool    fromOp        = false;  ///< op-ring produce: reserve a parked answer here
         bool    crcValidated  = false;  ///< the op producer validated this batch's CRC (M-3)
         uint8_t directAck     = 0;      ///< D8d: direct-budget admission (worker ingress only)
         int64_t enqueuedAtNs  = 0;      ///< gateway enqueue time (op path; latency attribution)
+        [[nodiscard]] bool acksAll() const noexcept { return rune::protocol::client::acksAll(acks); }
+        [[nodiscard]] bool acksView() const noexcept { return rune::protocol::client::acksView(acks); }
     };
 
     enum class RecordWalk : uint8_t { Ok, TooLong, Malformed };
@@ -8985,6 +9304,17 @@ private:
         }
         if (pos != end) return RecordWalk::Malformed;
         return tooLong ? RecordWalk::TooLong : RecordWalk::Ok;
+    }
+
+    [[nodiscard]] bool checkedWritesEnabled_() const noexcept { return clusterFeatureLevel_ >= rune::replication::MetadataFeature::kCheckedWrites; }
+
+    /// Counts a write refused by the checked-writes frame checks or the hook (first, then every 1024th is logged).
+    [[gnu::cold]] [[gnu::noinline]] void noteHookRefusal_(HookRefusal why, const ProduceFields& f) {
+        if (why == HookRefusal::ValidationFailed) ++typedRejects_;
+        else if (why == HookRefusal::VersionAhead) ++typedVersionAhead_;
+        if (hookRefusals_[std::to_underlying(why)]++ % 1024 == 0)
+            spdlog::warn("Worker {}: produce refused (reason {}) topicId={} partition={}, total {}", workerId_, std::to_underlying(why),
+                         f.topicId, f.partition, hookRefusals_[std::to_underlying(why)]);
     }
 
     int produceCore_(const ProduceFields& f, rune::storage::Log* log,
@@ -9153,22 +9483,37 @@ private:
             return 1;
         }
 
-        // Checked writes: every typed partition validates every batch (an untyped one has no write state).  A record
-        // whose schema version has not reached this worker yet is retriable (NotLeader), anything else is final.
-        if (const PartitionWriteState* ws = writeOf_(replica); ws != nullptr) [[unlikely]] {
-            const TypedCheck verdict = checkTypedBatch(*ws->spec, rbSpan, clusterFeatureLevel_);
-            if (verdict != TypedCheck::Accept) {
-                const bool ahead = verdict == TypedCheck::VersionAhead;
-                ++(ahead ? typedVersionAhead_ : typedRejects_);
-                spdlog::debug("Worker {}: typed batch refused for topicId={} partition={} ({})", workerId_, f.topicId, f.partition,
-                              ahead ? "schema version not installed yet" : "validation failed");
-                ret.errorCode = static_cast<int16_t>(ahead ? pc::ErrorCode::NotLeader : pc::ErrorCode::SchemaValidationFailed);
-                enqueueReturn_(ret);
-                return 1;
-            }
+        // Checked writes frame checks, before any append and for every topic, typed or not.  A transactional batch
+        // ignores the View bit (its verdicts come with the commit vote); View needs worker-side acks, the feature level
+        // and a replica to fold from.
+        const bool txn = rbSpan.size() >= static_cast<std::size_t>(rune::protocol::batch::kAttributesOffset) + 2 &&
+                         (rune::protocol::detail::getLE16(rbSpan.data() + rune::protocol::batch::kAttributesOffset) & kTxnAttrBit) != 0;
+        const uint8_t acks = txn ? static_cast<uint8_t>(f.acks & ~pc::kAcksWireView) : f.acks;
+        PartitionWriteState* const ws = writeOf_(replica);
+        HookRefusal frameRefusal = HookRefusal::None;
+        if (pc::acksView(acks)) [[unlikely]] {
+            if (!workerSideAcks()) frameRefusal = HookRefusal::LegacyMode;
+            else if (!checkedWritesEnabled_()) frameRefusal = HookRefusal::LevelTooLow;
+            else if (replica == nullptr) frameRefusal = HookRefusal::ViewWithoutReplica;
+        }
+        if (frameRefusal == HookRefusal::None && txn && ws != nullptr && topicHookFactsOf(*ws).constrainedSource) [[unlikely]]
+            frameRefusal = HookRefusal::TxnOnConstrainedSource;
+        if (frameRefusal != HookRefusal::None) [[unlikely]] {
+            noteHookRefusal_(frameRefusal, f);
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+            enqueueReturn_(ret);
+            return 1;
         }
 
-        const bool acksAll = f.acksAll;
+        // A View write on a typed partition is judged against the timeline the leadership scan builds: until the scan is
+        // Ready it would pass the hook on a partial timeline.
+        if (ws != nullptr && rc == nullptr && pc::acksView(acks) && rcGate_(replica) == nullptr) [[unlikely]] {
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            enqueueReturn_(ret);
+            return 1;
+        }
+
+        const bool acksAll = pc::acksAll(acks);
 
         // ISR size for the min-ISR gate.
         const int isrSize = replica ? static_cast<int>(replica->isr().size()) : 0;
@@ -9193,7 +9538,7 @@ private:
         // Op-ring produce (gateway-received, Task 13): its parked answer was not
         // covered by a poll budget — reserve it here BEFORE the append (G-A6, the
         // F15 S2 R-4c rule); no slot → retriable NotLeader, log untouched.
-        if (f.fromOp && (acksAll || asyncStrict) && !ackReservationAvailable_()) [[unlikely]] {
+        if (f.fromOp && (acksAll || pc::acksView(acks) || asyncStrict) && !ackReservationAvailable_()) [[unlikely]] {
             ++acksAllRefusedNoReservation_;
             if (!owedCapAllows_()) noteOwedCapThrottle_("gateway-routed produce", 2);
             if (acksAllRefusedNoReservation_ == 1 || (acksAllRefusedNoReservation_ & 1023u) == 0)
@@ -9225,7 +9570,26 @@ private:
         // validated these exact bytes (the gateway, right after ensureValid).
         const bool crcPreverified = f.fromOp && f.crcValidated;
         rune::storage::ProduceOutcome outcome;
-        if (log != nullptr) {
+        if (ws != nullptr) [[unlikely]] {
+            const WriteFacts facts{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = false,
+                                   .importGranted = false, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_()};
+            CheckedWriteHook hook(*ws, facts, {});
+            if (log != nullptr) {
+                outcome = rune::storage::handleProduceBatch(
+                    rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
+                    f.producerId, f.producerEpoch, f.baseSequence,
+                    *log, psm_, acksAll, isrSize, minIsr, helperTier, crcPreverified, hook);
+            } else {
+                replica->prepareTransientAppend();
+                outcome = rune::storage::handleProduceBatch(
+                    rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
+                    f.producerId, f.producerEpoch, f.baseSequence,
+                    *mem, psm_, acksAll, isrSize, minIsr, helperTier, crcPreverified, hook);
+                if (outcome.logFull) [[unlikely]] noteTransientFull_(f.topicId, f.partition, outcome.error);
+            }
+            if (hook.checked()) ++hookChecks_;
+            if (hook.refusal() != HookRefusal::None) [[unlikely]] noteHookRefusal_(hook.refusal(), f);
+        } else if (log != nullptr) {
             outcome = rune::storage::handleProduceBatch(
                 rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
                 f.producerId, f.producerEpoch, f.baseSequence,
@@ -9250,6 +9614,7 @@ private:
         ret.lastOffset  = outcome.lastOffset;
         ret.recordCount = outcome.recordCount;
         ret.batchAttrs  = outcome.batchAttrs;
+        ret.assignedBase = outcome.assignedBase;
 
         if (outcome.identityMismatch) [[unlikely]] {
             // EOS-DUP defense: frame identity != CRC-covered batch header.
@@ -9312,6 +9677,7 @@ private:
         // once" for data that is not durable / not on the ISR yet.  (Kafka
         // DelayedProduce waits on the duplicate's original offsets too.)
         const int64_t lastOff = ret.lastOffset;
+        const uint8_t replay = !outcome.isDuplicate ? 0 : outcome.baseOffset < 0 ? 2 : 1;
 
         if (asyncStrict) {
             // Park on the coalesced fsync (submitRound_ stamps the token
@@ -9324,7 +9690,9 @@ private:
             dp.lastOffset  = lastOff;
             dp.logPtr      = log;
             dp.ret         = std::move(ret);
-            dp.thenAwaitHw = acksAll ? replica : nullptr;
+            dp.thenAwaitHw = (acksAll || pc::acksView(acks)) ? replica : nullptr;
+            dp.thenAwaitAcks = acks;
+            dp.replay      = replay;
             dp.deadlineNs  = nowNs + ackTimeoutNs_;
             dp.replica     = replica;
             dp.logGen      = replica ? replica->logGeneration() : 0;
@@ -9332,6 +9700,21 @@ private:
             durablePending_.push_back(std::move(dp));
             if (std::find(dirtyThisCycle_.begin(), dirtyThisCycle_.end(), log) == dirtyThisCycle_.end())
                 dirtyThisCycle_.push_back(log);
+            return 1;
+        }
+
+        if (pc::acksView(acks)) {
+            // View (checked writes): the HW (+ ISR for All) and the views' fold gate this ack.
+            PendingAcksView pending;
+            pending.replica    = replica;
+            pending.lastOffset = lastOff;
+            pending.deadlineNs = nowNs + ackTimeoutNs_;
+            pending.logGen     = replica->logGeneration();
+            pending.minIsr     = minIsr;
+            pending.acks       = acks;
+            pending.replay     = replay;
+            pending.ret        = std::move(ret);
+            pendingAcksView_.push_back(std::move(pending));
             return 1;
         }
 

@@ -160,7 +160,7 @@ TEST(WorkerViewSet, FoldsCommittedRangeAndServesRow) {
     auto readRange = [&](int64_t /*from*/, int64_t /*to*/) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2};
     };
-    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*bound*/ 2, rune::view::kNoAbortedTxns, /*nowNs*/ 0);
+    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*bound*/ 2, rune::view::kNoSkip, /*nowNs*/ 0);
 
     const rune::view::RowLayout* L = nullptr;
     const uint8_t* row = vs.getRow(0x40000007, /*partition*/ 0, 7, L);
@@ -184,7 +184,7 @@ TEST(WorkerViewSet, PersistedViewPushesCheckpointDelta) {
     auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2};
     };
-    vs.driveFolds(5, 0, readRange, 2, rune::view::kNoAbortedTxns, 0);
+    vs.driveFolds(5, 0, readRange, 2, rune::view::kNoSkip, 0);
 
     int frames = 0;
     int32_t gotView = 0, gotPart = -1;
@@ -218,7 +218,7 @@ TEST(WorkerViewSet, TransientViewSkipsCheckpoint) {
     auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2};
     };
-    vs.driveFolds(5, 0, readRange, 2, rune::view::kNoAbortedTxns, 0);
+    vs.driveFolds(5, 0, readRange, 2, rune::view::kNoSkip, 0);
 
     const rune::view::RowLayout* L = nullptr;
     const uint8_t* row = vs.getRow(0x40000007, /*partition*/ 0, 7, L);
@@ -242,7 +242,7 @@ TEST(WorkerViewSet, UninterestedSourceIsNoOp) {
         called = true;
         return rune::storage::LogReadView{};
     };
-    vs.driveFolds(/*srcTopicId*/ 99, /*partition*/ 0, readRange, /*bound*/ 5, rune::view::kNoAbortedTxns, /*nowNs*/ 0);
+    vs.driveFolds(/*srcTopicId*/ 99, /*partition*/ 0, readRange, /*bound*/ 5, rune::view::kNoSkip, /*nowNs*/ 0);
     EXPECT_FALSE(called);
 }
 
@@ -273,8 +273,8 @@ TEST(WorkerViewSetRegression, PerPartitionFoldCursorsAreIndependent) {
     auto readP1 = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{p1.data(), p1.size(), 0, 1};
     };
-    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readP0, /*bound*/ 1, rune::view::kNoAbortedTxns, 0);
-    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 1, readP1, /*bound*/ 1, rune::view::kNoAbortedTxns, 0);
+    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readP0, /*bound*/ 1, rune::view::kNoSkip, 0);
+    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 1, readP1, /*bound*/ 1, rune::view::kNoSkip, 0);
 
     EXPECT_EQ(vs.instanceCount(), 2u);  // one ViewInstance per (view, partition)
 
@@ -428,7 +428,7 @@ TEST(WorkerViewSet, AggregateViewFoldsAndServesGroupRow) {
 
     const auto batch = orderBatch(0, {{1, 100, 10}, {2, 100, 30}, {3, 200, 5}});
     auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 3}; };
-    vs.driveFolds(6, 0, rr, 3, rune::view::kNoAbortedTxns, 0);
+    vs.driveFolds(6, 0, rr, 3, rune::view::kNoSkip, 0);
 
     const rune::view::RowLayout* L = nullptr;
     const uint8_t* row = vs.getRow(0x40000009, 0, 100, L);
@@ -451,7 +451,7 @@ TEST(WorkerViewSetRegression, AggregateRecoveryRestoresContributorMap) {
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     const auto b1 = orderBatch(0, {{1, 100, 10}, {2, 100, 30}});
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 2}; };
-    vs1.driveFolds(6, 0, rr1, 2, rune::view::kNoAbortedTxns, 0);
+    vs1.driveFolds(6, 0, rr1, 2, rune::view::kNoSkip, 0);
 
     const auto deltas = drainDeltas(ch1);
     ASSERT_EQ(deltas.size(), 1u);
@@ -473,7 +473,7 @@ TEST(WorkerViewSetRegression, AggregateRecoveryRestoresContributorMap) {
     //    A lost contributor map would give n 3, total 65.
     const auto b2 = orderBatch(2, {{1, 100, 25}});
     auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b2.data(), b2.size(), 2, 3}; };
-    vs2.driveFolds(6, 0, rr2, 3, rune::view::kNoAbortedTxns, 0);
+    vs2.driveFolds(6, 0, rr2, 3, rune::view::kNoSkip, 0);
     row = vs2.getRow(0x40000009, 0, 100, L);
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 2);
@@ -494,7 +494,7 @@ TEST(WorkerViewSetRegression, AggregateLazyRecoveryLoadsV2CheckpointFile) {
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     const auto b1 = orderBatch(0, {{1, 100, 10}, {2, 100, 30}});
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 2}; };
-    vs1.driveFolds(6, 0, rr1, 2, rune::view::kNoAbortedTxns, 0);
+    vs1.driveFolds(6, 0, rr1, 2, rune::view::kNoSkip, 0);
     const auto deltas = drainDeltas(ch1);
     ASSERT_EQ(deltas.size(), 1u);
     {   // Exactly what the snapshot IO agent appends (same file name scheme).
@@ -510,7 +510,7 @@ TEST(WorkerViewSetRegression, AggregateLazyRecoveryLoadsV2CheckpointFile) {
     vs2.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true, /*underRecovery*/ true);
     const auto b2 = orderBatch(2, {{1, 100, 25}});
     auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b2.data(), b2.size(), 2, 3}; };
-    vs2.driveFolds(6, 0, rr2, 3, rune::view::kNoAbortedTxns, 0);
+    vs2.driveFolds(6, 0, rr2, 3, rune::view::kNoSkip, 0);
 
     const rune::view::RowLayout* L = nullptr;
     const uint8_t* row = vs2.getRow(0x40000009, 0, 100, L);
@@ -532,7 +532,7 @@ TEST(WorkerViewSet, TransientAggregateRefoldsFromEmptyOnRestart) {
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false, /*underRecovery*/ true);
     const auto b = orderBatch(0, {{1, 100, 10}, {2, 100, 30}, {1, 100, 25}});
     auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{b.data(), b.size(), 0, 3}; };
-    vs.driveFolds(6, 0, rr, 3, rune::view::kNoAbortedTxns, 0);
+    vs.driveFolds(6, 0, rr, 3, rune::view::kNoSkip, 0);
 
     const rune::view::RowLayout* L = nullptr;
     const uint8_t* row = vs.getRow(0x40000009, 0, 100, L);
@@ -552,7 +552,7 @@ TEST(WorkerViewSet, ReplaceViewStillWritesV1Checkpoint) {
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     const auto batch = twoUpsertsKey7();
     auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2}; };
-    vs.driveFolds(5, 0, rr, 2, rune::view::kNoAbortedTxns, 0);
+    vs.driveFolds(5, 0, rr, 2, rune::view::kNoSkip, 0);
     const auto deltas = drainDeltas(ch);
     ASSERT_EQ(deltas.size(), 1u);
     uint32_t magic; std::memcpy(&magic, deltas[0].data(), 4);
@@ -575,7 +575,7 @@ TEST(WorkerViewSetRegression, TransientViewDiscardsDirtyStateEachPass) {
         vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
         const auto batch = twoUpsertsKey7();
         auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2}; };
-        vs.driveFolds(5, 0, rr, 2, rune::view::kNoAbortedTxns, 0);
+        vs.driveFolds(5, 0, rr, 2, rune::view::kNoSkip, 0);
         EXPECT_EQ(vs.dirtyBacklog(0x40000007, 0), 0u);
         // Tombstone then re-upsert of key 7, one record per pass: each erase
         // appends to the table's pending-delete list, which only a drain clears.
@@ -586,7 +586,7 @@ TEST(WorkerViewSetRegression, TransientViewDiscardsDirtyStateEachPass) {
             bb.append(asSv(k), (off % 2) ? asSv(v) : std::string_view{}, 0);
             const auto b = bb.build();
             auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b.data(), b.size(), off, off + 1}; };
-            vs.driveFolds(5, 0, rr2, off + 1, rune::view::kNoAbortedTxns, 0);
+            vs.driveFolds(5, 0, rr2, off + 1, rune::view::kNoSkip, 0);
             ASSERT_EQ(vs.dirtyBacklog(0x40000007, 0), 0u) << "pass " << off;
         }
     }
@@ -601,7 +601,7 @@ TEST(WorkerViewSetRegression, TransientViewDiscardsDirtyStateEachPass) {
         for (int64_t off = 0; off < 64; ++off) {
             const auto b = orderBatch(off, {{1, (off % 2) ? 200 : 100, 10}});
             auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{b.data(), b.size(), off, off + 1}; };
-            vs.driveFolds(6, 0, rr, off + 1, rune::view::kNoAbortedTxns, 0);
+            vs.driveFolds(6, 0, rr, off + 1, rune::view::kNoSkip, 0);
             ASSERT_EQ(vs.dirtyBacklog(0x40000009, 0), 0u) << "pass " << off;
         }
         const rune::view::RowLayout* L = nullptr;
@@ -619,7 +619,7 @@ template <class RR>
 void driveToEnd(rune::node::WorkerViewSet& vs, rune::node::ViewSnapshotChannel& ch, int32_t src,
                 RR& rr, int64_t bound, std::vector<std::vector<uint8_t>>& out) {
     for (int pass = 0; pass < 10000; ++pass) {
-        const int w = vs.driveFolds(src, 0, rr, bound, rune::view::kNoAbortedTxns, 0);
+        const int w = vs.driveFolds(src, 0, rr, bound, rune::view::kNoSkip, 0);
         for (;;) {
             auto d = drainDeltas(ch);
             if (d.empty()) break;
@@ -696,7 +696,7 @@ TEST(WorkerViewSetRegression, AggregateRecoveryOfLargeCheckpointDoesNotResendRow
     // One post-recovery pass: contributor 1 (group 1, amount 1) -> amount 1001.
     const auto b2 = orderBatch(kN, {{1, 1, 1001}});
     auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b2.data(), b2.size(), kN, kN + 1}; };
-    ASSERT_NO_THROW(vs2.driveFolds(6, 0, rr2, kN + 1, rune::view::kNoAbortedTxns, 0));
+    ASSERT_NO_THROW(vs2.driveFolds(6, 0, rr2, kN + 1, rune::view::kNoSkip, 0));
     const auto post = drainDeltas(ch2);
     ASSERT_EQ(post.size(), 1u);
     EXPECT_LT(post[0].size(), 512u) << "first post-recovery delta must carry only this pass's rows";
@@ -783,7 +783,7 @@ TEST(WorkerViewSetRegression, RecoveryLogsViewRecoveredLineRegression) {
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     const auto b1 = orderBatch(0, {{1, 100, 10}, {2, 100, 30}});
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 2}; };
-    vs1.driveFolds(6, 0, rr1, 2, rune::view::kNoAbortedTxns, 0);
+    vs1.driveFolds(6, 0, rr1, 2, rune::view::kNoSkip, 0);
     const auto deltas = drainDeltas(ch1);
     ASSERT_EQ(deltas.size(), 1u);
 
@@ -811,7 +811,7 @@ TEST(WorkerViewSetRegression, RecoveryLogsViewRecoveredLineRegression) {
         rune::node::ViewSnapshotChannel ch3;
         rune::node::WorkerViewSet vs3(ch3, dir);
         vs3.installView(comp.plan, comp.rowLayout, src, true, /*underRecovery*/ true);
-        vs3.driveFolds(6, 0, rr1, 2, rune::view::kNoAbortedTxns, 0);
+        vs3.driveFolds(6, 0, rr1, 2, rune::view::kNoSkip, 0);
         const auto hits = cap.grep("VIEW-RECOVERED ");
         ASSERT_EQ(hits.size(), 1u);
         EXPECT_NE(hits[0].find("O=2 records=1 format=v2"), std::string::npos) << hits[0];
@@ -832,7 +832,7 @@ TEST(WorkerViewSetRegression, RecoveryLogsViewRecoveredLineRegression) {
         vs5.installView(rcomp.plan, rcomp.rowLayout, csrc, true);
         const auto b = oneUpsert(7, 10);
         auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{b.data(), b.size(), 0, 1}; };
-        vs5.driveFolds(5, 0, rr, 1, rune::view::kNoAbortedTxns, 0);
+        vs5.driveFolds(5, 0, rr, 1, rune::view::kNoSkip, 0);
         const auto d = drainDeltas(ch5);
         ASSERT_EQ(d.size(), 1u);
         LogCapture cap;
@@ -903,7 +903,7 @@ TEST(WorkerViewSetRegression, FoldCountersAccumulatePerInstanceRegression) {
     bb.append(asSv(shortKey), asSv(vals[2]), 0);
     const auto batch = bb.build();
     auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 4}; };
-    vs.driveFolds(8, 0, rr, 4, rune::view::kNoAbortedTxns, 0);
+    vs.driveFolds(8, 0, rr, 4, rune::view::kNoSkip, 0);
 
     const rune::node::ViewFoldCounters* c = vs.foldCounters(0x4000000B, 0);
     ASSERT_NE(c, nullptr);
@@ -922,7 +922,7 @@ TEST(WorkerViewSetRegression, FoldCountersAccumulatePerInstanceRegression) {
         return b.build();
     }();
     auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b2.data(), b2.size(), 4, 5}; };
-    vs.driveFolds(8, 0, rr2, 5, rune::view::kNoAbortedTxns, 0);
+    vs.driveFolds(8, 0, rr2, 5, rune::view::kNoSkip, 0);
     c = vs.foldCounters(0x4000000B, 0);
     ASSERT_NE(c, nullptr);
     EXPECT_EQ(c->aggNonFinite, 2u);
@@ -1022,7 +1022,7 @@ TEST(WorkerViewSetRegression, TransientSourceCursorAboveLogEndIsInvariantBreachR
     const auto before = twoUpsertsKey7();                                    // offsets [0,2)
     auto rr0 = [&](int64_t, int64_t) { return rune::storage::LogReadView{before.data(), before.size(), 0, 2}; };
     const rune::node::TransientBounds tb0{0, 2};
-    vs.driveFolds(5, 0, rr0, 2, rune::view::kNoAbortedTxns, 0, &tb0);
+    vs.driveFolds(5, 0, rr0, 2, rune::view::kNoSkip, 0, &tb0);
     const rune::view::RowLayout* L = nullptr;
     ASSERT_NE(vs.getRow(0x40000031, 0, 7, L), nullptr);
 
@@ -1030,9 +1030,9 @@ TEST(WorkerViewSetRegression, TransientSourceCursorAboveLogEndIsInvariantBreachR
     const auto after = upsertAt(0, 9, 77);                                   // reused offset 0
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{after.data(), after.size(), 0, 1}; };
     const rune::node::TransientBounds tb1{0, 0};
-    vs.driveFolds(5, 0, rr1, 0, rune::view::kNoAbortedTxns, 0, &tb1);                                    // breach: cursor -> 0
+    vs.driveFolds(5, 0, rr1, 0, rune::view::kNoSkip, 0, &tb1);                                    // breach: cursor -> 0
     const rune::node::TransientBounds tb2{0, 1};
-    vs.driveFolds(5, 0, rr1, 1, rune::view::kNoAbortedTxns, 0, &tb2);
+    vs.driveFolds(5, 0, rr1, 1, rune::view::kNoSkip, 0, &tb2);
     const uint8_t* row9 = vs.getRow(0x40000031, 0, 9, L);
     ASSERT_NE(row9, nullptr) << "a post-restart record at a reused offset must fold";
     EXPECT_EQ(rune::view::readSlot(row9, *L, 1).i, 77);
@@ -1052,7 +1052,7 @@ TEST(WorkerViewSetRegression, TransientSourceEvictionAheadOfCursorSkipsAndCounts
 
     auto empty = [](int64_t, int64_t) { return rune::storage::LogReadView{}; };
     const rune::node::TransientBounds tb0{0, 0};
-    vs.driveFolds(5, 0, empty, 0, rune::view::kNoAbortedTxns, 0, &tb0);                 // instance exists, Live at cursor 0
+    vs.driveFolds(5, 0, empty, 0, rune::view::kNoSkip, 0, &tb0);                 // instance exists, Live at cursor 0
     ASSERT_NE(vs.foldCounters(0x40000032, 0), nullptr);
 
     const auto b = upsertAt(3, 11, 5);                      // the surviving record at offset 3
@@ -1061,7 +1061,7 @@ TEST(WorkerViewSetRegression, TransientSourceEvictionAheadOfCursorSkipsAndCounts
         return rune::storage::LogReadView{b.data(), b.size(), 3, 4};
     };
     const rune::node::TransientBounds tb1{3, 4};
-    vs.driveFolds(5, 0, rr, 4, rune::view::kNoAbortedTxns, 0, &tb1);
+    vs.driveFolds(5, 0, rr, 4, rune::view::kNoSkip, 0, &tb1);
     EXPECT_EQ(vs.foldCounters(0x40000032, 0)->transientRecordsEvicted, 3u);
     const rune::view::RowLayout* L = nullptr;
     ASSERT_NE(vs.getRow(0x40000032, 0, 11, L), nullptr);
@@ -1084,7 +1084,7 @@ TEST(WorkerViewSetRegression, TransientFreshInstanceStartsAtLogStartWithoutCount
         return rune::storage::LogReadView{b.data(), b.size(), 5, 6};
     };
     const rune::node::TransientBounds tb{5, 6};
-    EXPECT_GT(vs.driveFolds(5, 0, rr, 6, rune::view::kNoAbortedTxns, 0, &tb), 0);
+    EXPECT_GT(vs.driveFolds(5, 0, rr, 6, rune::view::kNoSkip, 0, &tb), 0);
     const rune::view::RowLayout* L = nullptr;
     ASSERT_NE(vs.getRow(0x40000034, 0, 12, L), nullptr) << "folded on the creating pass";
     EXPECT_EQ(vs.foldCounters(0x40000034, 0)->transientRecordsEvicted, 0u);
@@ -1104,7 +1104,7 @@ TEST(WorkerViewSetRegression, TransientRecoveredCursorIsReconciledEvenWhenSource
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     const auto b1 = twoUpsertsKey7();                                        // checkpoint O = 2
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 2}; };
-    vs1.driveFolds(5, 0, rr1, 2, rune::view::kNoAbortedTxns, 0);
+    vs1.driveFolds(5, 0, rr1, 2, rune::view::kNoSkip, 0);
     const auto deltas = drainDeltas(ch1);
     ASSERT_EQ(deltas.size(), 1u);
 
@@ -1121,8 +1121,8 @@ TEST(WorkerViewSetRegression, TransientRecoveredCursorIsReconciledEvenWhenSource
         return rune::storage::LogReadView{fresh.data(), fresh.size(), 0, 5};
     };
     const rune::node::TransientBounds tb{0, 5};
-    vs2.driveRebuild(5, 0, rr2, 5, rune::view::kNoAbortedTxns, 0, &tb);
-    vs2.driveFolds(5, 0, rr2, 5, rune::view::kNoAbortedTxns, 0, &tb);
+    vs2.driveRebuild(5, 0, rr2, 5, rune::view::kNoSkip, 0, &tb);
+    vs2.driveFolds(5, 0, rr2, 5, rune::view::kNoSkip, 0, &tb);
     const rune::view::RowLayout* L = nullptr;
     ASSERT_NE(vs2.getRow(0x40000033, 0, 0, L), nullptr) << "offset 0 (< recovered O) must fold";
     ASSERT_NE(vs2.getRow(0x40000033, 0, 1, L), nullptr) << "offset 1 (< recovered O) must fold";
@@ -1167,7 +1167,7 @@ TEST(WorkerViewSetRegression, TransientSourceRecreatedRefoldsFromRingStartRegres
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{inc1.data(), inc1.size(), 0, 2}; };
     rune::node::TransientBounds tb1{0, 2};
     tb1.incarnation = 1;
-    vs.driveFolds(5, 0, rr1, 2, rune::view::kNoAbortedTxns, 0, &tb1);
+    vs.driveFolds(5, 0, rr1, 2, rune::view::kNoSkip, 0, &tb1);
     const rune::view::RowLayout* L = nullptr;
     ASSERT_NE(vs.getRow(0x40000035, 0, 7, L), nullptr);
     ASSERT_EQ(slotOf(vs, 0x40000035, 0, 7, 1).i, 10);
@@ -1176,7 +1176,7 @@ TEST(WorkerViewSetRegression, TransientSourceRecreatedRefoldsFromRingStartRegres
     auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{inc2.data(), inc2.size(), 0, 3}; };
     rune::node::TransientBounds tb2{0, 3};
     tb2.incarnation = 2;
-    vs.driveFolds(5, 0, rr2, 3, rune::view::kNoAbortedTxns, 0, &tb2);
+    vs.driveFolds(5, 0, rr2, 3, rune::view::kNoSkip, 0, &tb2);
     EXPECT_EQ(slotOf(vs, 0x40000035, 0, 7, 1).i, 99) << "a stale row survived";
     EXPECT_EQ(slotOf(vs, 0x40000035, 0, 8, 1).i, 98) << "a stale row survived";
     ASSERT_NE(vs.getRow(0x40000035, 0, 9, L), nullptr);
@@ -1198,7 +1198,7 @@ TEST(WorkerViewSetRegression, TransientSourceCutBelowCursorRefoldsFromTheCutRegr
     const auto gen0 = concatBatches({upsertAt(0, 7, 1), upsertAt(1, 8, 2), upsertAt(2, 9, 3)});
     auto rr0 = [&](int64_t, int64_t) { return rune::storage::LogReadView{gen0.data(), gen0.size(), 0, 3}; };
     rune::node::TransientBounds tb0{0, 3};
-    vs.driveFolds(5, 0, rr0, 3, rune::view::kNoAbortedTxns, 0, &tb0);   // Live, cursor 3, generation 0
+    vs.driveFolds(5, 0, rr0, 3, rune::view::kNoSkip, 0, &tb0);   // Live, cursor 3, generation 0
 
     // Generation 1, cut at 1: offsets >= 1 changed — 8 and 9 now carry new values.
     const auto gen1 = concatBatches({upsertAt(0, 7, 1), upsertAt(1, 8, 22), upsertAt(2, 9, 33)});
@@ -1209,7 +1209,7 @@ TEST(WorkerViewSetRegression, TransientSourceCutBelowCursorRefoldsFromTheCutRegr
     rune::node::TransientBounds tb1{0, 3};
     tb1.logGeneration = 1;
     tb1.cutOffset     = 1;
-    vs.driveFolds(5, 0, rr1, 3, rune::view::kNoAbortedTxns, 0, &tb1);
+    vs.driveFolds(5, 0, rr1, 3, rune::view::kNoSkip, 0, &tb1);
     const rune::view::RowLayout* L = nullptr;
     EXPECT_EQ(slotOf(vs, 0x40000036, 0, 8, 1).i, 22);
     EXPECT_EQ(slotOf(vs, 0x40000036, 0, 9, 1).i, 33);
@@ -1220,7 +1220,7 @@ TEST(WorkerViewSetRegression, TransientSourceCutBelowCursorRefoldsFromTheCutRegr
     rune::node::TransientBounds tb2{0, 3};
     tb2.logGeneration = 2;
     tb2.cutOffset     = 5;
-    vs.driveFolds(5, 0, rrNone, 3, rune::view::kNoAbortedTxns, 0, &tb2);
+    vs.driveFolds(5, 0, rrNone, 3, rune::view::kNoSkip, 0, &tb2);
     EXPECT_EQ(vs.foldCounters(0x40000036, 0)->transientSourceResets, 1u) << "a cut above the cursor is no reset";
 }
 
@@ -1239,7 +1239,7 @@ TEST(WorkerViewSetRegression, TransientSourceRingResetRefoldsFromOldestHeldRecor
     const auto gen0 = concatBatches({upsertAt(0, 7, 1), upsertAt(1, 8, 2)});
     auto rr0 = [&](int64_t, int64_t) { return rune::storage::LogReadView{gen0.data(), gen0.size(), 0, 2}; };
     rune::node::TransientBounds tb0{0, 2};
-    vs.driveFolds(5, 0, rr0, 2, rune::view::kNoAbortedTxns, 0, &tb0);   // Live, cursor 2, generation 0
+    vs.driveFolds(5, 0, rr0, 2, rune::view::kNoSkip, 0, &tb0);   // Live, cursor 2, generation 0
 
     const auto reset = upsertAt(10, 9, 3);  // ring restarted at the leader's start 10
     auto rr1 = [&](int64_t from, int64_t) {
@@ -1249,7 +1249,7 @@ TEST(WorkerViewSetRegression, TransientSourceRingResetRefoldsFromOldestHeldRecor
     rune::node::TransientBounds tb1{10, 11};
     tb1.logGeneration = 1;
     tb1.cutOffset     = 0;                  // cut at the OLD ring start
-    vs.driveFolds(5, 0, rr1, 11, rune::view::kNoAbortedTxns, 0, &tb1);
+    vs.driveFolds(5, 0, rr1, 11, rune::view::kNoSkip, 0, &tb1);
     const rune::view::RowLayout* L = nullptr;
     ASSERT_NE(vs.getRow(0x40000037, 0, 9, L), nullptr);
     EXPECT_NE(vs.getRow(0x40000037, 0, 7, L), nullptr) << "rows are kept";
@@ -1275,7 +1275,7 @@ TEST(WorkerViewSetRegression, TransientSourceGenerationJumpRefoldsFromRingStartR
                                    upsertAt(6, 106, 6), upsertAt(7, 107, 7)});
     auto rrG0 = [&](int64_t, int64_t) { return rune::storage::LogReadView{g0.data(), g0.size(), 0, 8}; };
     rune::node::TransientBounds tb0{0, 8};
-    vs.driveFolds(5, 0, rrG0, 8, rune::view::kNoAbortedTxns, 0, &tb0);   // Live, cursor 8, generation 0
+    vs.driveFolds(5, 0, rrG0, 8, rune::view::kNoSkip, 0, &tb0);   // Live, cursor 8, generation 0
     const rune::view::RowLayout* L = nullptr;
     ASSERT_EQ(slotOf(vs, 0x40000038, 0, 103, 1).i, 3);
 
@@ -1291,7 +1291,7 @@ TEST(WorkerViewSetRegression, TransientSourceGenerationJumpRefoldsFromRingStartR
     rune::node::TransientBounds tb2{0, 8};
     tb2.logGeneration = 2;
     tb2.cutOffset     = 5;
-    vs.driveFolds(5, 0, rrG2, 8, rune::view::kNoAbortedTxns, 0, &tb2);
+    vs.driveFolds(5, 0, rrG2, 8, rune::view::kNoSkip, 0, &tb2);
     for (int64_t k = 102; k <= 107; ++k)
         EXPECT_EQ(slotOf(vs, 0x40000038, 0, static_cast<uint64_t>(k), 1).i, k - 50)
             << "stale row for key " << k;
@@ -1320,8 +1320,8 @@ TEST(WorkerViewSetRegression, UninstallViewStopsFoldingAndFreesItsInstances) {
     auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2};
     };
-    vs.driveFolds(5, 0, readRange, 2, rune::view::kNoAbortedTxns, 0);
-    vs.driveFolds(5, 1, readRange, 2, rune::view::kNoAbortedTxns, 0);
+    vs.driveFolds(5, 0, readRange, 2, rune::view::kNoSkip, 0);
+    vs.driveFolds(5, 1, readRange, 2, rune::view::kNoSkip, 0);
     ASSERT_EQ(vs.viewCount(), 2u);
     ASSERT_EQ(vs.instanceCount(), 4u);
 
@@ -1336,7 +1336,7 @@ TEST(WorkerViewSetRegression, UninstallViewStopsFoldingAndFreesItsInstances) {
     EXPECT_FALSE(vs.viewOutputFingerprint(0x40000007, fp)) << "its plan template is gone";
 
     // Folding the source again creates nothing for the dropped view; the other view still serves.
-    vs.driveFolds(5, 0, readRange, 2, rune::view::kNoAbortedTxns, 0);
+    vs.driveFolds(5, 0, readRange, 2, rune::view::kNoSkip, 0);
     EXPECT_EQ(vs.instanceCount(), 2u) << "a dropped view never folds again (no lazy re-create)";
     EXPECT_NE(vs.getRow(0x40000008, 0, 7, L), nullptr);
     EXPECT_TRUE(vs.interestedIn(5)) << "the other view keeps the source's reactor entry";
@@ -1417,7 +1417,7 @@ TEST(WorkerViewSetRegression, RestartThenRetractingTheMaxIsExactRegression) {
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     const auto b1 = orderBatch(0, {{1, 100, 10}, {2, 100, 50}, {3, 100, 30}});
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 3}; };
-    vs1.driveFolds(6, 0, rr1, 3, rune::view::kNoAbortedTxns, 0);
+    vs1.driveFolds(6, 0, rr1, 3, rune::view::kNoSkip, 0);
     const auto deltas = drainDeltas(ch1);
     ASSERT_EQ(deltas.size(), 1u);
     uint32_t magic; std::memcpy(&magic, deltas[0].data(), 4);
@@ -1438,7 +1438,7 @@ TEST(WorkerViewSetRegression, RestartThenRetractingTheMaxIsExactRegression) {
     // Post-restart: the max holder (contributor 2) drops to 5.
     const auto b2 = orderBatch(3, {{2, 100, 5}});
     auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b2.data(), b2.size(), 3, 4}; };
-    vs2.driveFolds(6, 0, rr2, 4, rune::view::kNoAbortedTxns, 0);
+    vs2.driveFolds(6, 0, rr2, 4, rune::view::kNoSkip, 0);
     row = vs2.getRow(0x4000000A, 0, 100, L);
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 3);

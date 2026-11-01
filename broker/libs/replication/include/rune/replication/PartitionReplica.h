@@ -883,6 +883,15 @@ public:
     void publishCleanerLso(Offset firstUnstableOffset) noexcept {
         publishedLsoForCleaner_.store(firstUnstableOffset, std::memory_order_release);
     }
+    // Checked writes Part 04: W, the committed verdict watermark of a verdict source, and the end of the committed marker that
+    // carries it.  The cleaner never cleans at or above W (it cannot yet drop a record whose verdict is not durable).  The marker end
+    // is stored first (release) and read after the bound (acquire), so a reader that sees a bound sees a marker end at least as new.
+    // A partition with read_committed state (topicId >= 0) starts at 0 = clean nothing, like the LSO: the worker publishes
+    // kNoCleanerLso once its state is Ready and the partition is not a verdict source (no cap).
+    void publishCleanerVerdictMarkerEnd(Offset end) noexcept { publishedVerdictMarkerEnd_.store(end, std::memory_order_release); }
+    void publishCleanerVerdictBound(Offset bound) noexcept { publishedVerdictBound_.store(bound, std::memory_order_release); }
+    [[nodiscard]] Offset cleanerVerdictBound() const noexcept { return publishedVerdictBound_.load(std::memory_order_acquire); }
+    [[nodiscard]] Offset cleanerVerdictMarkerEnd() const noexcept { return publishedVerdictMarkerEnd_.load(std::memory_order_acquire); }
     // D3b fix round 1: the minimum fetch position over EVERY assigned replica (not
     // just the ISR), published by the duty/owning thread in publishCleanerState().
     // A txn marker below it is held by every replica, so the cleaner may remove it;
@@ -912,7 +921,7 @@ public:
         // demotion is rejected (bound below every base), never installed on a
         // follower.
         if (role_ != Role::Leader) return std::numeric_limits<Offset>::min();
-        return std::min<Offset>(highWatermark(), cleanerLastStableOffset());
+        return std::min<Offset>({highWatermark(), cleanerLastStableOffset(), cleanerVerdictBound()});
     }
     /// Fix round 2: drain the cleaner's swap ring on the OWNER thread (validate +
     /// install deferred compaction outputs), then rewind the clean watermark to
@@ -930,8 +939,11 @@ public:
     /// cleaner; the owner validates (identity, not active, segment end <= HW)
     /// and only then renames the files away.  Disk-backed only.
     int drainRetentionDeletesOnOwner() {
-        return log()->drainRetentionDeletes(highWatermark());
+        return log()->drainRetentionDeletes(std::min(highWatermark(), retentionHold_));
     }
+    /// Owner thread: retention keeps the segment holding `offset` and everything above it (the latest committed
+    /// constraint-set change must outlive retention until a newer one is committed).  INT64_MAX = no hold.
+    void holdRetentionAt(Offset offset) noexcept { retentionHold_ = offset; }
 
     // ---- Fix round 3 (N-MEDIUM-1): clean-watermark rewind channel ----------
     // lastCleanOffset_ is written by the cleaner only.  The owner, on rejecting
@@ -2107,6 +2119,9 @@ private:
     std::atomic<int>    publishedIsrSizeForGateway_{0};
     // D3b: first unstable offset (LSO) for the cleaner — see publishCleanerLso().
     std::atomic<Offset> publishedLsoForCleaner_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
+    std::atomic<Offset> publishedVerdictBound_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
+    Offset retentionHold_ = std::numeric_limits<Offset>::max();   // owner thread only
+    std::atomic<Offset> publishedVerdictMarkerEnd_{0};
     // D3b fix round 1: min fetch position over every assigned replica — see
     // cleanerMarkerRemovalBound().  0 until the first leader publication.
     std::atomic<Offset> publishedMarkerBoundForCleaner_{0};
