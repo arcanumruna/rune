@@ -447,9 +447,9 @@ TEST_F(GatewayTimeoutFixture, Reap_KeepaliveRefreshPreventsExpiry) {
 // ===========================================================================
 // BR5T-4: Multiple sessions — only expired ones reaped in a single tick.
 //
-// Strategy: use wall-clock t0 sampled right before connecting A, then connect
-// B with a later wall-clock t1.  Manually call reapExpired with synthetic
-// offsets relative to t0 to test the boundary:
+// Strategy: connect A at t0 and B at the injected t1 = t0 + timeout/10 (a wall-clock
+// t1 let a loaded host reap A inside B's connect pump).  Manually call reapExpired
+// with synthetic offsets relative to t0 to test the boundary:
 //   - reapExpired(t0 + timeout + 1): A reaped (idle = timeout+1), B alive.
 //
 // Both clients are resolved BEFORE any connects so makeClient's wall-clock
@@ -469,26 +469,17 @@ TEST_F(GatewayTimeoutFixture, Reap_MultiSession_OnlyExpiredReaped) {
     ASSERT_GE(resultA.resp.assignedSessionId, 1);
     ASSERT_EQ(gw_->sessionCount(), 1u);
 
-    // Connect B (also wall-clock-based; doConnect uses wallNowNs() when
-    // connectNs==0).  Session B's lastSeen ≈ wallNowNs() >> t0 + timeout in
-    // the reap check below only if we waited >100ms between the two connects,
-    // which we did not.  To be safe, also sample t1 and pass it explicitly.
-    const int64_t t1 = wallNowNs();
+    // Connect B at an injected t1: B's connect pump drives doWork(t1), which
+    // must not reap A, so t1 - t0 stays well under the timeout however long
+    // the host takes between the two connects.
+    const int64_t t1 = t0 + kTimeoutNs / 10;
     auto resultB = doConnect(clientB, /*corrId=*/5, t1);
     ASSERT_GE(resultB.resp.assignedSessionId, 1);
     ASSERT_EQ(gw_->sessionCount(), 2u);
 
-    // Now invoke reapExpired with synthetic large timestamps:
-    //   tReap_A = t0 + timeout + 1: A is expired (idle = timeout+1 > timeout),
-    //             B is NOT (idle = tReap_A - t1 = t0+timeout+1 - t1 ≈ timeout+1 - (t1-t0)).
-    //             Since t1 - t0 ≥ 1 ns, idle_B = timeout+1 - (t1-t0) < timeout. ✓
-    //
-    // If t1-t0 > 1 ns (i.e., any real time elapsed), session B is safe.
-    // We assert the difference is within 50ms (the test runs in well under 1s).
+    // tReap_A = t0 + timeout + 1: A is expired (idle = timeout+1 > timeout),
+    // B is NOT (idle = timeout+1 - timeout/10 < timeout).
     const int64_t tReapA = t0 + kTimeoutNs + 1;
-    ASSERT_LT(t1 - t0, kTimeoutNs / 2)
-        << "Sanity: both connects must complete within timeout/2 of each other";
-
     gw_->reapExpired(tReapA);
 
     EXPECT_EQ(gw_->sessionCount(), 1u)
