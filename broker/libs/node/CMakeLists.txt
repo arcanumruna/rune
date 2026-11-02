@@ -828,7 +828,8 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesDdlTest.cpp
         tests/node/CheckedWritesKeyIndexDdlTest.cpp
         tests/node/CheckedWritesTimelineTest.cpp
-        tests/node/CheckedWritesVerdictSourceTest.cpp)
+        tests/node/CheckedWritesVerdictSourceTest.cpp
+        tests/node/CheckedWritesKeyIndexTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)

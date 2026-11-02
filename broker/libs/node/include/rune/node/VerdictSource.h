@@ -14,9 +14,32 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace rune::node {
+
+// Checked writes Part 05: the key index, a verdict member over a one-byte-row table keyed by the packed wire key.
+inline constexpr uint64_t    kKeyIndexPlanFingerprint      = 0x4B45'5949'4E44'4558ull;   // "KEYINDEX"
+inline constexpr std::size_t kKeyIndexChunkBytes           = 64u << 10;
+inline constexpr int64_t     kKeyIndexReplayRecordsPerPass = 65536;
+
+struct KeyIndexFold {
+    rune::view::ViewTable& table;
+    uint8_t                keyWidth = 0;
+};
+
+/// The wire key's bytes packed little-endian; the caller checked the width (at most 8).
+[[nodiscard]] uint64_t keyIndexWord(std::string_view wireKey) noexcept;
+[[nodiscard]] rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold&, const rune::view::SourceRecord&, rune::view::Prospect&) noexcept;
+/// The intent table (P5-3) over the key state the prospect holds; a Malformed prospect is accepted.
+[[nodiscard]] rune::view::Verdict evaluateIntent(const rune::view::SourceRecord&, const rune::view::Prospect&) noexcept;
+void applyKeyIndex(KeyIndexFold&, const rune::view::SourceRecord&, const rune::view::Prospect&) noexcept;
+/// foldBatch's contract (batch, bound, cursor, corrupt tail) over the accepted records: nothing is judged.
+rune::view::FoldStats foldKeyIndexBatch(KeyIndexFold&, const rune::storage::LogReadView&, int64_t bound, int64_t& cursor,
+                                        const rune::view::FoldSkip&) noexcept;
+[[nodiscard]] rune::view::CompiledViewPlan keyIndexPlan(int32_t srcTopicId, uint16_t keyFieldId);   // cold
+[[nodiscard]] rune::view::RowLayout keyIndexRowLayout();                                           // rowLen 1
 
 /// What the owning WorkerViewSet does for a judge's members (fn-pointer + ctx, no std::function).
 struct VerdictViewHooks {
@@ -97,6 +120,7 @@ private:
         uint64_t                    objectId = 0, fingerprint = 0;
         TestRejectRule              rule;
         rune::view::Prospect        prospect;
+        uint8_t                     keyWidth = 0;   // KeyIndex: the wire key width of the source's key field
         bool                        retiring = false, leaving = false;
         int64_t                     leaveOffset = -1;
     };
@@ -117,7 +141,8 @@ private:
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
-    bool   rejects_(const Member& m, const rune::view::SourceRecord& rec) const noexcept;
+    static void discardDirty_(ViewInstance& inst) noexcept;
+    [[nodiscard]] rune::view::Verdict verdictOf_(const Member& m, const rune::view::SourceRecord& rec) const noexcept;
     template <class ReadRangeFn>
     bool   switchSet_(int64_t changeOffset, ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted, int& work);
 
