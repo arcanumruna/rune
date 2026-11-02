@@ -239,6 +239,29 @@ TEST(FilterGroup, RefusedNoteIsRetriedOnTheNextPassRegression) {
     EXPECT_EQ(r.sink.notesFor(0), (std::vector<int64_t>{150})) << "retried with no further record scanned";
 }
 
+TEST(FilterGroup, RefusedNoteIsCountedPerPassAndSentWhole) {
+    constexpr uint32_t kRefusals = 3;
+    FilterConfig cfg;
+    cfg.noteRecords = 100;
+    cfg.noteIntervalNs = int64_t{1} << 60;   // by count only
+    Rig r(cfg);
+    const uint32_t m = r.add(0, worldEq(r.schema, 7));
+    r.pass();
+    ASSERT_TRUE(r.inSync(m));
+    r.sink.refuse(0, kRefusals);
+    r.publish(makePlayerBatch(0, 3, std::vector<PlayerRow>(150, PlayerRow{.worldId = 1})));
+    for (uint32_t i = 0; i < kRefusals; ++i) {
+        r.pass();
+        EXPECT_TRUE(r.sink.notesFor(0).empty()) << "refused on pass " << i;
+        EXPECT_EQ(r.g.countersOf(m).noteRefused, i + 1);
+    }
+    r.pass();
+    EXPECT_EQ(r.sink.notesFor(0), (std::vector<int64_t>{150})) << "the first accepting pass sends the note";
+    EXPECT_EQ(r.g.countersOf(m).noteRefused, kRefusals);
+    EXPECT_EQ(r.g.groupCounters().noteRefused, kRefusals);
+    EXPECT_EQ(r.g.countersOf(m).notes, 1u);
+}
+
 TEST(FilterGroup, FiveHundredMembersOneMatchEachTouchesOnlyTheMatched) {
     FilterConfig cfg;
     cfg.noteIntervalNs = int64_t{1} << 60;   // no sweep inside this test

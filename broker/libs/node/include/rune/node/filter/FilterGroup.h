@@ -80,6 +80,7 @@ struct FilterCounters {
     uint64_t zeroCopy = 0, rebuilt = 0, notes = 0, absentExcluded = 0, unknownVersionExcluded = 0,
              nullValueExcluded = 0, malformed = 0, overflowBatches = 0, overCap = 0, fellBehind = 0, rejoined = 0;
     uint64_t sourceRefused = 0;   ///< add() refused: the member's scan source is not the group's (release builds)
+    uint64_t noteRefused = 0;     ///< a due note the sink answered Retry to (back-pressure); it is retried next pass
 };
 
 struct Behind {};
@@ -921,7 +922,7 @@ private:
                 const bool due = static_cast<uint64_t>(skipped) >= cfg_.noteRecords || nowNs - last >= cfg_.noteIntervalNs;
                 if (due && sink.deliverable(m.sub)) {
                     const SendOutcome out = sink.sendNote(m.sub, cursorOf(id, sink.cursor(m.sub)));
-                    if (out == SendOutcome::Retry) noteRetry_ = true;
+                    if (out == SendOutcome::Retry) { noteRetry_ = true; ++m.counters.noteRefused; ++group_.noteRefused; }
                     if (out == SendOutcome::Sent) {
                         if (sync) m.coveredAt = static_cast<int64_t>(scanned_); else m.pendingSkipped = 0;
                         m.lastFrameNs = nowNs;

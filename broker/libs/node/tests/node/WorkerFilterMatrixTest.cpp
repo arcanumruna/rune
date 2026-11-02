@@ -205,6 +205,8 @@ void runQuietRun(Rig& r, Entity e) {
     for (int i = 0; i < kBatches; ++i) r.append(quiet);
     const int64_t end = r.logEnd();
     ASSERT_EQ(end, b0 + 1 + static_cast<int64_t>(kBatches) * kRows);
+    std::map<int64_t, uint64_t> refusedBefore;   // notes the egress refused during the scan stretch the gap bound
+    for (const auto& m : ms) if (m.kind != MK::Unfiltered) refusedBefore[m.sub] = r.groupOf(m)->countersOf(static_cast<uint32_t>(m.filterIdx)).noteRefused;
     ASSERT_TRUE(r.pumpUntil([&] {
         for (const auto& m : ms) {
             if (m.kind == MK::Unfiltered) { if (r.view(m.sub).pos < end) return false; }
@@ -213,6 +215,7 @@ void runQuietRun(Rig& r, Entity e) {
         return true;
     }, 60s)) << "the scan never reached the log end";
     r.settle(30ms);
+    ASSERT_TRUE(r.drainEgress());
     const std::size_t bytesPerRec = r.batches().back().bytes.size() / kRows;
     const int64_t slack = static_cast<int64_t>(128 * 1024 / bytesPerRec) + 2 * kRows;   // one pass worth of records
     for (const auto& m : ms) {
@@ -225,14 +228,16 @@ void runQuietRun(Rig& r, Entity e) {
         // The gap rule below allows 65,536 + slack records between notes (a note lands on a scan-pass boundary, and a
         // slow host makes passes coarser): n notes leave n + 1 gaps, so the count it implies is
         // ceil(skipped / (65,536 + slack)) - 1, not a fixed 3 (#623: 2 notes, gaps of ~67k, under TSan).
-        const int64_t gap = 65'536 + slack, skipped = end - (b0 + 1);
-        const auto minNotes = static_cast<std::size_t>((skipped + gap - 1) / gap - 1);
-        ASSERT_GE(v.notes.size(), std::max<std::size_t>(minNotes, 1)) << "notes: " << ns << " end " << end
+        // A refused note (egress back-pressure) is retried a pass later, so each refusal can widen one gap by a pass.
+        const uint64_t R = r.groupOf(m)->countersOf(static_cast<uint32_t>(m.filterIdx)).noteRefused - refusedBefore[m.sub];
+        const int64_t gap = 65'536 + slack * static_cast<int64_t>(1 + R), skipped = end - (b0 + 1);
+        const auto minNotes = R > 0 ? std::size_t{1} : static_cast<std::size_t>(std::max<int64_t>((skipped + gap - 1) / gap - 1, 1));
+        ASSERT_GE(v.notes.size(), minNotes) << "notes: " << ns << " end " << end
             << " skipped records need a count note per 65,536 + " << slack;
         int64_t prev = b0 + 1;   // the position after the match
         for (const int64_t n : v.notes) {
             EXPECT_GT(n, prev - 1) << "note offsets increase";
-            EXPECT_LE(n - prev, 65'536 + slack) << "a note within each 65,536 skipped records";
+            EXPECT_LE(n - prev, gap) << "a note within each 65,536 skipped records";
             prev = n;
         }
         EXPECT_LT(end - prev, 65'536 + slack) << "the tail after the last note stays below the next count";
@@ -252,7 +257,15 @@ void runQuietRun(Rig& r, Entity e) {
         return true;
     }));
     r.resetStepGap();
-    ASSERT_TRUE(r.converge(mb));
+    int64_t lastSentNs = 0;   // the worker's last note, stamped when the count rises (arrival waits on the client poll)
+    uint64_t notesB = r.w(wb).filterCountersForTest().notes;
+    ASSERT_TRUE(r.pumpUntil([&] {
+        const uint64_t n = r.w(wb).filterCountersForTest().notes;
+        if (n > notesB) { notesB = n; lastSentNs = nowNs(); }
+        for (const auto& m : mb) if (r.view(m.sub).pos < r.targetPos(m)) return false;
+        return true;
+    }, 30s));
+    r.settle(40ms);
     r.settle(60ms);
     for (const auto& m : mb) {
         r.verifyMember(m, "leg B");
@@ -265,8 +278,8 @@ void runQuietRun(Rig& r, Entity e) {
         while (k < v.notes.size() && v.notes[k] != r.logEnd()) ++k;
         ASSERT_LT(k, v.notes.size());
         // #782: a host stall of this thread (it drives the worker) delays the note by as much - added to the bound.
-        EXPECT_LE(v.noteAtNs[k] - scanDone, 60'000'000 + r.maxStepGapNs()) << "the time-trigger note arrived "
-            << (v.noteAtNs[k] - scanDone) / 1'000'000 << " ms after the scan finished (bound 60 ms + the longest step gap "
+        EXPECT_LE(lastSentNs - scanDone, 60'000'000 + r.maxStepGapNs()) << "the time-trigger note was sent "
+            << (lastSentNs - scanDone) / 1'000'000 << " ms after the scan finished (bound 60 ms + the longest step gap "
             << r.maxStepGapNs() / 1'000'000 << " ms)";
     }
     r.verifyCounters(wb, mb, 0, 0, "leg B");
@@ -346,11 +359,13 @@ void runOwnershipMove(Rig& r, Entity e) {
     r.disown(0);
     for (const auto& m : ms) r.unsubscribe(m);
     r.settle(40ms);   // drain what was already in the egress
+    ASSERT_TRUE(r.drainEgress());
     std::map<int64_t, std::size_t> seen;
     for (const auto& m : ms) seen[m.sub] = r.view(m.sub).dataFrames.size();
     r.verifyCounters(0, ms, 0, 0, "old owner", nullptr, &oldC);   // the old worker's counters match what it delivered
     for (int i = 0; i < 3; ++i) r.append({rowM(), rowP(), rowN(), rowM()});
     r.settle(40ms);
+    ASSERT_TRUE(r.drainEgress());
     for (const auto& m : ms) EXPECT_EQ(r.view(m.sub).dataFrames.size(), seen[m.sub]) << "the old owner pushed after the move";
     // the rig re-subscribes on a second worker from the model client's position
     const std::size_t w1 = r.addWorker();
@@ -583,6 +598,25 @@ INSTANTIATE_TEST_SUITE_P(FilterMatrixRegression, WorkerFilterMatrixTest, ::testi
                              return std::string(name(std::get<0>(i.param))) + "_" + name(std::get<1>(i.param)) + "_" +
                                     name(std::get<2>(i.param));
                          });
+
+// A worker that keeps passing while the client does not poll has frames in the egress; drainEgress() delivers them.
+TEST(FilterMatrixRigRegression, DrainEgressDeliversFramesOfAnUnpolledOwner) {
+    Rig r(Op::Eq, Entity::DiskRU);
+    const int64_t b0 = start(r);
+    Ms ms = r.subscribeMembers(0, b0);
+    std::vector<PlayerRow> rows;
+    for (int i = 0; i < 60; ++i) rows.push_back(i % 5 == 0 ? rowM() : rowN());
+    for (int i = 0; i < 120; ++i) r.append(rows);
+    for (int i = 0; i < 3; ++i) r.step();
+    const rune::node::filter::FilterCounters oldC = r.w(0).filterCountersForTest();
+    r.disown(0);
+    for (const auto& m : ms) r.unsubscribe(m);
+    for (int i = 0; i < 20; ++i) { r.stepUnpolled(); std::this_thread::sleep_for(200us); }
+    ASSERT_TRUE(r.drainEgress());
+    std::size_t frames = 0;
+    for (const auto& m : ms) frames += r.view(m.sub).dataFrames.size();
+    EXPECT_EQ(frames, oldC.zeroCopy + oldC.rebuilt) << "every frame the old owner offered reached the client";
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 TEST(FilterMatrixCountRegression, CellCountsArePinned) {
