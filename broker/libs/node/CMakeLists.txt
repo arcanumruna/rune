@@ -200,7 +200,6 @@ if(BUILD_TESTING)
         tests/node/CatalogWritePathTest.cpp
         tests/node/CatalogLeadershipTest.cpp
         tests/node/CatalogReadServerTest.cpp
-        tests/node/CatalogGatesRegressionTest.cpp
         tests/node/WorkerOwnedIndexRegressionTest.cpp
         tests/node/WorkerOpWireRegressionTest.cpp
         tests/node/WorkerDroppedTopicRegressionTest.cpp
@@ -215,6 +214,17 @@ if(BUILD_TESTING)
     include(GoogleTest)
     gtest_discover_tests(rune_node_tests PROPERTIES LABELS small)
     rune_regression_batches(rune_node_tests 4)   # defined in the root CMakeLists.txt
+
+    # Catalog history Task 23: the 10k-event boot replay bound is wall-clock - a latency gate (RUN_SERIAL +
+    # LABELS latency, stage b, idle host; under -j16 it took 24 s against 932 ms alone).  Own binary so it
+    # stays out of rune_node_tests' *Regression* batches.
+    add_executable(rune_catalog_gates_tests tests/node/CatalogGatesRegressionTest.cpp)
+    target_include_directories(rune_catalog_gates_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_catalog_gates_tests PRIVATE rune_node rune_codec rune_view GTest::gtest_main)
+    set(RUNE_CATALOG_GATES_LATENCY_TESTS "CatalogGatesRegression.BootReplayOfTenThousandEventsIsUnderOneSecondRegression")
+    gtest_discover_tests(rune_catalog_gates_tests TEST_FILTER "${RUNE_CATALOG_GATES_LATENCY_TESTS}"
+                         PROPERTIES RUN_SERIAL TRUE LABELS latency)
+    gtest_discover_tests(rune_catalog_gates_tests TEST_FILTER "-${RUNE_CATALOG_GATES_LATENCY_TESTS}")
 
     # Catalog history Task 7 (F12): the admin thread's catalog steady state never
     # allocates.  Replaces the global operator new (binary-wide) — own binary, like
