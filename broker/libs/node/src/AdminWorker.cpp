@@ -279,6 +279,7 @@ DdlRejection encodeErrorAnswer(cat::EncodeError e) {
     case cat::EncodeError::TooManyElements:
     case cat::EncodeError::ReservedKind:
     case cat::EncodeError::BadEnum:
+    case cat::EncodeError::NeedsFormatV3:
         break;
     }
     return reject(kInvalidRequest, "the catalog event cannot be encoded: " + std::string{cat::encodeErrorName(e)});
