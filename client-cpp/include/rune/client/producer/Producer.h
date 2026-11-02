@@ -113,6 +113,14 @@ enum class Acks : uint8_t {
 }
 
 // ---------------------------------------------------------------------------
+// WriteIntent — what a send requires of the topic's key index (checked writes, broker >= 10, acks with View).
+// Upsert (the default) is an ordinary write and rides the wire exactly as before.  Insert fails when the key exists;
+// Update fails when it does not.  An empty value with Update deletes an existing record.
+// ---------------------------------------------------------------------------
+enum class WriteIntent : uint8_t { Upsert = 0, Insert = 1, Update = 2 };
+[[nodiscard]] constexpr uint8_t intentBits(WriteIntent i) noexcept { return static_cast<uint8_t>(i); }
+
+// ---------------------------------------------------------------------------
 // TopicPartitionKey - (topicId, partition) pair.
 // ---------------------------------------------------------------------------
 struct TopicPartitionKey {
@@ -635,8 +643,12 @@ public:
     /// in the ring, it only stops draining them) once close() actually runs.
     /// Acks-expecting callers must treat a late close() the same as any other
     /// failure path; the void path has no acknowledgement to lose.
-    [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key,
-                                     std::span<const uint8_t> value) noexcept;
+    /// A non-Upsert `intent` (here and in every send form below) is refused locally, before anything is queued or
+    /// reserved, with SendResult::WriteNotAllowed (the blocking forms throw std::invalid_argument naming the
+    /// rule): on a raw handle, without View in the producer's acks, in a transaction, or Insert with an empty value.
+    /// A View producer also refuses every send on a raw handle.
+    [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+                                     WriteIntent intent = WriteIntent::Upsert) noexcept;
 
     /// Fire-and-forget send that NEVER drops.  On BackPressured it retries:
     /// Invoker mode, called on the owner thread outside a callback, pumps the
@@ -705,7 +717,7 @@ public:
     /// a full builder at maxInFlight); sends keep accumulating in the ring and
     /// back-pressure once it is full.  In Invoker mode only that partition's
     /// sends report BackPressured.
-    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
+    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, WriteIntent intent = WriteIntent::Upsert);
 
     /// Router forms (T15b M3: a ShardGroup / ClientShard hashes the key ONCE to
     /// route and passes the result down): `partition` is the caller's
@@ -714,8 +726,10 @@ public:
     /// otherwise exactly trySend().  sendTo: exactly send() (std::invalid_argument
     /// for a bad partition).
     [[nodiscard]] SendResult trySendTo(TopicHandle topic, int32_t partition, const Key& key,
-                                       std::span<const uint8_t> value) noexcept;
-    void sendTo(TopicHandle topic, int32_t partition, const Key& key, std::span<const uint8_t> value);
+                                       std::span<const uint8_t> value,
+                                       WriteIntent intent = WriteIntent::Upsert) noexcept;
+    void sendTo(TopicHandle topic, int32_t partition, const Key& key, std::span<const uint8_t> value,
+                WriteIntent intent = WriteIntent::Upsert);
 
     // ---- Opt-in ack paths (F8c C6: ZERO per-send allocation) ----------------
 
@@ -728,20 +742,29 @@ public:
     /// owner thread (WrongThread otherwise — checked in every build).  Statuses
     /// as for AckFn.  acks=None: Ok with value -1 when handed to the transport.
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
-                                     Completions& cq, Token token) noexcept;
+                                     Completions& cq, Token token,
+                                     WriteIntent intent = WriteIntent::Upsert) noexcept;
 
     /// Send whose completion goes to the onAck() handler (duty thread).
     /// InvalidArgument for token > kMaxToken.  Without a handler installed the
     /// completion is dropped (the record is still sent and tracked).
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
-                                     AckToken token) noexcept;
+                                     AckToken token, WriteIntent intent = WriteIntent::Upsert) noexcept;
 
     /// Blocking-on-back-pressure forms (the void send() rules: Invoker owner
     /// pumps, other threads back off; QueueFull is NOT retried here — it
     /// throws std::runtime_error, since only the caller can poll its queue).
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, Completions& cq,
-              Token token);
-    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, AckToken token);
+              Token token, WriteIntent intent = WriteIntent::Upsert);
+    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, AckToken token,
+              WriteIntent intent = WriteIntent::Upsert);
+
+    /// Send one record with `intent` and wait for its verdict: the Send completion, unchanged (status Ok with
+    /// value = the record's offset; BrokerError with errorCode 56 / 57 and constraintIdOf() for a refused intent;
+    /// BrokerTooOld).  Flushes at once.  Throws std::invalid_argument for a local refusal (see trySend, KeyTooLong,
+    /// MessageTooLarge) and std::runtime_error when back-pressure outlasts `timeout`.
+    [[nodiscard]] Completion sendAndWait(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+                                         WriteIntent intent, std::chrono::nanoseconds timeout);
 
     // ---- Phase 2b Part B: zero-copy produce (ZERO allocation) -----------------
 
@@ -1044,7 +1067,11 @@ private:
                      int32_t generationId = -1, std::string_view memberId = {});
     /// T15b M3: the one send body; `part` computed once by the caller.
     [[nodiscard]] SendResult trySendPart_(TopicHandle topic, int32_t part, const Key& key,
-                                          std::span<const uint8_t> value) noexcept;
+                                          std::span<const uint8_t> value, WriteIntent intent) noexcept;
+    /// P5-9: the local refusal text for a send, or nullptr when it is allowed.  An Upsert on a non-raw handle of a
+    /// producer without View pays one branch.
+    [[nodiscard]] const char* intentRefusal_(TopicHandle topic, std::span<const uint8_t> value,
+                                             WriteIntent intent) const noexcept;
     /// 2b-B: the one claim body; `part` computed once by the caller, the
     /// per-record ack credit (cq) already reserved by the caller.
     [[nodiscard]] Claim claimPart_(TopicHandle topic, int32_t part, const Key& key, uint32_t valueLen,

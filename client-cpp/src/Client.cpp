@@ -1411,6 +1411,8 @@ OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::st
     msg.config            = rune::protocol::convertTopicConfig<rpc::TopicConfigWire>(topic.config);
     msg.hasExt            = true;   // catalog history: every DDL carries the extension
     msg.ext               = ddlExt_(ddl);
+    msg.hasKeyFeatures    = topic.keyFeatures != rune::protocol::TopicKeyFeatures{};
+    msg.keyFeatures       = topic.keyFeatures;
     std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
     if (n == 0) return OpResult::InvalidArgument;   // a field does not fit its wire width
@@ -1838,7 +1840,15 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     // op, its Redirect hops and its NotLeader budget (budgetEnd <= deadline).
     p.deadlineNs = nsAfter(nowNs, isDdlOp(h.op) ? cfg_.ddlTimeoutMs : cfg_.pingTimeoutMs);
     if (h.op == OpKind::DefineTopic) {
-        if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) p.topicName = std::string(d->topicName);
+        if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) {
+            p.topicName = std::string(d->topicName);
+            // SD11: a broker below v10 cannot decode the key-features trailer; the op fails here, nothing is sent.
+            if (const int32_t v = agent_.sessionBrokerVersion(0);
+                d->hasKeyFeatures && v >= 1 && v < rpc::kBrokerVersionCheckedWrites) {
+                completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
+                return;
+            }
+        }
     }
     ctlScratch_.assign(frame.begin(), frame.end());
     rpc::detail::putLE64(ctlScratch_.data(), 8, machine.sessionId());
@@ -2943,7 +2953,7 @@ TopicHandle Client::rawTopicAndWait(std::string_view name, std::chrono::nanoseco
     if (!r.descriptorBlob.empty())
         throw std::runtime_error("rawTopic: '" + std::string(name) + "' is a typed topic; open it with openTopicAndWait<T> "
                                  "(the raw send path is for untyped topics only)");
-    return TopicHandle{r.topicId, r.partitionCount > 0 ? r.partitionCount : 1};
+    return TopicHandle{r.topicId, r.partitionCount > 0 ? r.partitionCount : 1, TopicKind::Raw};
 }
 
 void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining) {

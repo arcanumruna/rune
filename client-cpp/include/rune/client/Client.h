@@ -146,6 +146,8 @@ struct DdlOptions {
 struct TopicOptions {
     int16_t                     replicationFactor = 0;
     rune::protocol::TopicConfig config{};
+    /// Checked writes (broker >= 10): the key index and its options; the default sends nothing.
+    rune::protocol::TopicKeyFeatures keyFeatures{};
 };
 
 /// Result of DropTopic / DropView / AlterView / AlterTopicConfig (DdlResponse 78).

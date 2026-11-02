@@ -1437,6 +1437,7 @@ if(BUILD_TESTING)
             tests/subscriber/SubscriberTest.cpp
             tests/subscriber/SubscriberHubCommandTest.cpp
             tests/subscriber/SubscriberHubRecordsRegressionTest.cpp   # catalog history Task 13 fix round 2
+            tests/subscriber/CheckedWritesRecordOpTest.cpp
             tests/support/AllocCounter.cpp                             # zero-alloc onRecords gate
         )
         target_include_directories(rune_subscriber_tests PRIVATE
@@ -1551,6 +1552,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerAllocRegressionTest.cpp
             tests/producer/ProducerAckPathTest.cpp
             tests/producer/ProducerAcksFlagsTest.cpp
+            tests/producer/CheckedWritesIntentsTest.cpp
             tests/producer/ProducerVerdictsTest.cpp
             tests/producer/ProducerTier2PoolTest.cpp
             tests/producer/ProducerSendTest.cpp

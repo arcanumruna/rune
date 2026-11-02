@@ -57,13 +57,14 @@ ClientShard::ClientShard(Validated, const ShardGroupConfig& g, uint32_t index, u
 
 ClientShard::~ClientShard() { closeImmediately(); }
 
-void ClientShard::send(TopicHandle topic, const Key& key, std::span<const uint8_t> value) {
+void ClientShard::send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, WriteIntent intent) {
     if (!topic.valid()) throw std::invalid_argument("ClientShard::send: invalid topic handle");
-    sendTo(topic, key.partition(topic.partitionCount), key, value);
+    sendTo(topic, key.partition(topic.partitionCount), key, value, intent);
 }
 
-void ClientShard::sendTo(TopicHandle topic, int32_t partition, const Key& key, std::span<const uint8_t> value) {
-    switch (trySendTo(topic, partition, key, value)) {
+void ClientShard::sendTo(TopicHandle topic, int32_t partition, const Key& key, std::span<const uint8_t> value,
+                         WriteIntent intent) {
+    switch (trySendTo(topic, partition, key, value, intent)) {
     case SendResult::Ok:
         return;
     case SendResult::WrongShard:
@@ -81,7 +82,7 @@ void ClientShard::sendTo(TopicHandle topic, int32_t partition, const Key& key, s
         // Review finding 10: the cycles it pumped may have failed the shard —
         // latch it here too (Invoker), whether the send succeeded or threw.
         try {
-            producer_.sendTo(topic, partition, key, value);
+            producer_.sendTo(topic, partition, key, value, intent);
         } catch (...) {
             if (mode_ == ShardMode::Invoker) latchClosed_();
             throw;
