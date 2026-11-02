@@ -1393,12 +1393,11 @@ namespace {
 // field's encoded width (0 = no such field, which stays the applier's precondition).
 std::optional<DdlRejection> keyFeaturesRefusal(const rune::protocol::TopicKeyFeatures& f, const TopicShape& shape,
                                                uint32_t keyWidth, int16_t level) {
-    if (f.keyIndex) {
-        if (level < rune::replication::MetadataFeature::kCheckedWrites)
-            return reject(kInvalidRequest, "key.index needs every broker at feature level 5");
-        if (const auto why = featureRefusal(DbFeature::KeyIndex, shape)) return reject(kInvalidRequest, std::string(*why));
-        if (keyWidth > 8) return reject(kInvalidRequest, "key.index needs a key of at most 8 bytes");
-    }
+    if (f == rune::protocol::TopicKeyFeatures{}) return std::nullopt;
+    if (level < rune::replication::MetadataFeature::kCheckedWrites)
+        return reject(kInvalidRequest, "key.index needs every broker at feature level 5");
+    if (const auto why = featureRefusal(DbFeature::KeyIndex, shape)) return reject(kInvalidRequest, std::string(*why));
+    if (keyWidth > 8) return reject(kInvalidRequest, "key.index needs a key of at most 8 bytes");
     if (f.autoIncrement || f.partitioner != rune::protocol::Partitioner::Fnv1a ||
         f.autoIncrementMax != rune::protocol::kAutoIncrementMaxDefault ||
         f.autoIncrementReserve != rune::protocol::kAutoIncrementReserveDefault)
@@ -1429,11 +1428,12 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
             // apply rule, so a catalog that already holds such a topic replays unchanged, and a re-define of it still
             // answers TopicExists.  A key field that does not exist stays the applier's precondition.
             if (!m.keyField.empty())
-                if (const rune::codec::FieldDescriptor* k = d.find(m.keyField);
-                    k != nullptr && !rune::codec::isTopicKeyType(k->type, rune::codec::fieldWidth(*k)))
-                    keyRefusal = reject(kInvalidSchema, "key field '" + m.keyField + "' is " + keyTypeSpelling(*k) +
-                                                            ": a topic key is an integer or string(N) with N <= 16");
-            if (const rune::codec::FieldDescriptor* k = m.keyField.empty() ? nullptr : d.find(m.keyField)) keyWidth = rune::codec::fieldWidth(*k);
+                if (const rune::codec::FieldDescriptor* k = d.find(m.keyField); k != nullptr) {
+                    keyWidth = rune::codec::fieldWidth(*k);
+                    if (!rune::codec::isTopicKeyType(k->type, keyWidth))
+                        keyRefusal = reject(kInvalidSchema, "key field '" + m.keyField + "' is " + keyTypeSpelling(*k) +
+                                                                ": a topic key is an integer or string(N) with N <= 16");
+                }
             uint32_t past = static_cast<uint32_t>(d.fields.size());
             for (const auto& f : d.fields) past = std::max<uint32_t>(past, uint32_t{f.id} + 1);
             if (past > 0xFFFF) return Rejected(reject(kInvalidSchema));

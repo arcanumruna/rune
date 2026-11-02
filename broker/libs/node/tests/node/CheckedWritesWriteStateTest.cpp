@@ -59,8 +59,22 @@ TEST(CheckedWritesWriteState, KeyIndexFlagRoundTrips) {
     const auto back = decodeTopicWriteSpec(buf);
     ASSERT_TRUE(back);
     EXPECT_EQ(*back, w);
-    buf[8] = 0x04;
-    EXPECT_FALSE(decodeTopicWriteSpec(buf));
+    for (int bit = 2; bit < 8; ++bit) {
+        buf[8] = static_cast<uint8_t>(1 << bit);
+        EXPECT_FALSE(decodeTopicWriteSpec(buf)) << "flag bit " << bit;
+    }
+}
+
+TEST(CheckedWritesWriteState, SetFactsCopiesTheKeyIndex) {
+    TopicWriteSpecWire w;
+    w.topicId = 4; w.keyIndex = true;
+    TopicWriteSpec s;
+    EXPECT_FALSE(s.keyIndex);
+    s.setFacts(w);
+    EXPECT_TRUE(s.keyIndex);
+    w.keyIndex = false;
+    s.setFacts(w);
+    EXPECT_FALSE(s.keyIndex);
 }
 
 TEST(CheckedWritesWriteState, SpecOfACatalogTopic) {

@@ -27,6 +27,7 @@
 // ---------------------------------------------------------------------------
 
 #include <gtest/gtest.h>
+#include <map>
 
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -1256,6 +1257,27 @@ TEST(SchemaGatewayRegression, OversizedTopicSchemaAnswerIsMessageTooLargeRegress
     EXPECT_EQ(got->errorCode, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge));
     EXPECT_EQ(got->descriptorLen, 0u);
     EXPECT_EQ(agent.egressBacklogForTest(), 0u);
+}
+
+// Checked writes Part 05: the broker sets the TopicSchemaResponse key-features block iff the topic's features are non-default.
+TEST(SchemaGatewayRegression, TopicSchemaResponseCarriesKeyFeaturesIffNonDefaultRegression) {
+    SchemaRegistry sreg;
+    rune::node::AdminWorkerAgent agent(sreg, /*selfId=*/1, rune::node::AdminDeps{});
+    rune::protocol::TopicKeyFeatures features;
+    features.keyIndex = true;
+    features.autoIncrementReserve = 7;
+    agent.postTopicSchemaResponse(1, 60, 3, 1, 2, {}, 0, features);
+    agent.postTopicSchemaResponse(1, 61, 3, 1, 2, {}, 0, rune::protocol::TopicKeyFeatures{});
+    std::map<int64_t, pc::TopicSchemaResponse> got;
+    agent.egressRing().drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                                 aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        if (const auto r = pc::TopicSchemaResponse::decode(p + 8, static_cast<std::size_t>(len) - 8)) got[r->correlationId] = *r;
+    }, 16);
+    ASSERT_EQ(got.size(), 2u);
+    EXPECT_TRUE(got.at(60).hasKeyFeatures);
+    EXPECT_EQ(got.at(60).keyFeatures, features);
+    EXPECT_FALSE(got.at(61).hasKeyFeatures);
 }
 
 // ===========================================================================

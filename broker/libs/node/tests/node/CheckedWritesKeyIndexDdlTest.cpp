@@ -39,10 +39,8 @@ CatalogDdlRig::Answer defineKeyed(CatalogDdlRig& rig, const std::string& name, c
     return rig.submitRaw(DdlRequest{std::move(m)});
 }
 
-const cat::TopicObject& topicOf(CatalogDdlRig& rig, const std::string& name) {
-    const cat::TopicObject* t = rig.admin().applier().state().topicByName(0, name);
-    EXPECT_NE(t, nullptr);
-    return *t;
+const cat::TopicObject* topicOf(CatalogDdlRig& rig, const std::string& name) {
+    return rig.admin().applier().state().topicByName(0, name);
 }
 
 cat::CatalogEvent lastEvent(const std::vector<cat::RecordedEvent>& log) { return log.back().event; }
@@ -65,9 +63,10 @@ TEST(CheckedWritesKeyIndexDdl, TypedKeyedDiskTopicGetsAKeyIndex) {
     ASSERT_NE(op, nullptr);
     ASSERT_TRUE(op->schema);
     EXPECT_TRUE(op->schema->keyFeatures.keyIndex);
-    const cat::TopicObject& t = topicOf(rig, "ki");
-    EXPECT_TRUE(t.schema->keyFeatures.keyIndex);
-    const auto w = writeSpecWireOf(t);
+    const cat::TopicObject* t = topicOf(rig, "ki");
+    ASSERT_NE(t, nullptr);
+    EXPECT_TRUE(t->schema->keyFeatures.keyIndex);
+    const auto w = writeSpecWireOf(*t);
     ASSERT_TRUE(w);
     EXPECT_TRUE(w->keyIndex);
 }
@@ -156,7 +155,8 @@ TEST(CheckedWritesKeyIndexDdl, AdoptionCanSetTheKeyIndex) {
     const auto* op = std::get_if<cat::CreateSchemaOps>(&adopted.ops);
     ASSERT_NE(op, nullptr);
     EXPECT_TRUE(op->schema.keyFeatures.keyIndex);
-    EXPECT_TRUE(topicOf(rig, "a").schema->keyFeatures.keyIndex);
+    ASSERT_NE(topicOf(rig, "a"), nullptr);
+    EXPECT_TRUE(topicOf(rig, "a")->schema->keyFeatures.keyIndex);
 
     CatalogDdlRig::DefineArgs transient; transient.name = "tr"; transient.persistence = 1;
     ASSERT_EQ(rig.define(transient).code, kOk);
@@ -181,7 +181,8 @@ TEST(CheckedWritesKeyIndexDdl, BelowCheckedWritesWritesV2AndKeepsTheTopicFingerp
     const cat::CatalogEvent highTopic = lastEvent(high.recordedLog());
     EXPECT_EQ(highTopic.formatVer, cat::kFormatV3);
     EXPECT_EQ(highTopic.fingerprint, lowTopic.fingerprint);
-    EXPECT_FALSE(topicOf(high, "p").schema->keyFeatures.keyIndex);
+    ASSERT_NE(topicOf(high, "p"), nullptr);
+    EXPECT_EQ(topicOf(high, "p")->schema->keyFeatures, rp::TopicKeyFeatures{});
     ASSERT_EQ(high.createNamespace("n").code, kOk);
     EXPECT_EQ(lastEvent(high.recordedLog()).formatVer, cat::kFormatV3);
 }
@@ -202,9 +203,52 @@ TEST(CheckedWritesKeyIndexDdlRegression, AlterKeepsTheKeyIndexRegression) {
     ASSERT_EQ(defineKeyed(rig, "ki", keyedBlob(PrimType::UInt64), keyIndex()).code, kOk);
     const auto a = rig.alterAdd("ki", "extra");
     ASSERT_EQ(a.code, kOk) << a.detail;
-    const cat::TopicObject& t = topicOf(rig, "ki");
-    EXPECT_TRUE(t.schema->keyFeatures.keyIndex);
-    const auto w = writeSpecWireOf(t);
+    const cat::TopicObject* t = topicOf(rig, "ki");
+    ASSERT_NE(t, nullptr);
+    EXPECT_TRUE(t->schema->keyFeatures.keyIndex);
+    const auto w = writeSpecWireOf(*t);
     ASSERT_TRUE(w);
     EXPECT_TRUE(w->keyIndex);
+}
+
+TEST(CheckedWritesKeyIndexDdl, ANonDefaultAutoIncrementMaxIsRefused) {
+    CatalogDdlRig rig("cwkimax");
+    atLevel5(rig);
+    rp::TopicKeyFeatures f = keyIndex();
+    f.autoIncrementMax     = 100;
+    const auto a = defineKeyed(rig, "ki", keyedBlob(PrimType::UInt64), f);
+    EXPECT_EQ(a.code, kInvalidRequest);
+    EXPECT_EQ(a.detail, "autoincrement is not supported by this broker yet");
+}
+
+TEST(CheckedWritesKeyIndexDdl, AutoIncrementBelowCheckedWritesIsRefusedAtDdl) {
+    CatalogDdlRig rig("cwkiautolow");
+    rig.becomeServingLeader();
+    rig.admin().setClusterFeatureLevel(4);
+    rp::TopicKeyFeatures f;
+    f.autoIncrement = true;
+    const auto a = defineKeyed(rig, "ai", keyedBlob(PrimType::UInt64), f);
+    EXPECT_EQ(a.code, kInvalidRequest) << "refused at DDL, never an encode failure";
+    EXPECT_EQ(a.detail, "key.index needs every broker at feature level 5");
+    EXPECT_EQ(topicOf(rig, "ai"), nullptr);
+}
+
+TEST(CheckedWritesKeyIndexDdl, AdoptionRefusals) {
+    CatalogDdlRig::DefineArgs raw; raw.name = "a";
+    CatalogDdlRig low("cwkiadlow");
+    low.becomeServingLeader();
+    low.admin().setClusterFeatureLevel(4);
+    ASSERT_EQ(low.define(raw).code, kOk);
+    auto a = defineKeyed(low, "a", keyedBlob(PrimType::UInt64), keyIndex());
+    EXPECT_EQ(a.code, kInvalidRequest);
+    EXPECT_EQ(a.detail, "key.index needs every broker at feature level 5");
+
+    CatalogDdlRig rig("cwkiadwide");
+    atLevel5(rig);
+    ASSERT_EQ(rig.define(raw).code, kOk);
+    a = defineKeyed(rig, "a", keyedBlob(PrimType::FixedStr, 9), keyIndex());
+    EXPECT_EQ(a.code, kInvalidRequest);
+    EXPECT_EQ(a.detail, "key.index needs a key of at most 8 bytes");
+    ASSERT_NE(topicOf(rig, "a"), nullptr);
+    EXPECT_FALSE(topicOf(rig, "a")->schema) << "the topic stays untyped";
 }
