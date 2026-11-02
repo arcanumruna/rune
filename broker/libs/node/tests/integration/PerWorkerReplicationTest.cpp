@@ -131,6 +131,7 @@ using rune::node::test::hwOnOwner;
 using rune::node::test::roleOnOwner;
 using rune::node::test::gatewayIsrSizeOnOwner;
 using rune::node::test::hasReplica;
+using rune::node::test::settledPartitionLeader;
 using rune::node::test::appendOnOwner;
 using rune::node::test::readLogOnOwner;
 
@@ -1437,22 +1438,12 @@ void runExactEffectiveMaxReplicates(bool perWorker) {
     for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30s));
     ASSERT_EQ(rune::node::test::TestCluster({nodes[0].get(), nodes[1].get(), nodes[2].get()}).defineTopic(pwTopic()), 0);
 
-    // D8: follow the CURRENT leader — under CPU contention leadership can move between the first leaderId()
-    // read and the partition role settling; pinning the first answer waited 30 s on a node that never led.
-    rune::node::BrokerNode* leader = nullptr;
-    {
-        const auto deadline = std::chrono::steady_clock::now() + 30s;
-        while (std::chrono::steady_clock::now() < deadline) {
-            const auto lid = nodes[0]->leaderId();
-            if (lid >= 0 && lid <= 2) {
-                leader = nodes[static_cast<std::size_t>(lid)].get();
-                if (leader->replicationIsLeaderForTest() && hasReplica(*leader) && roleOnOwner(*leader) == Role::Leader)
-                    break;
-            }
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_NE(leader, nullptr);
+    // D11: the partition leader, not the consensus leader (partition 0 is statically placed; under
+    // CPU contention another node can win the consensus election).
+    std::array<rune::node::BrokerNode*, 3> raw{nodes[0].get(), nodes[1].get(), nodes[2].get()};
+    const int lid = settledPartitionLeader(raw);
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
+    rune::node::BrokerNode* leader = raw[static_cast<std::size_t>(lid)];
     ASSERT_EQ(roleOnOwner(*leader), Role::Leader);
     for (auto& n : nodes) {
         ASSERT_EQ(n->gatewayForTest()->maxProduceBatchBytes(), effMax)
