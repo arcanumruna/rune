@@ -35,7 +35,6 @@
 //     void send(TopicHandle, const Key&, std::span<const uint8_t>)
 //   plus, for the checked writes (insert / update / upsert / remove / removeExisting):
 //     void send(TopicHandle, const Key&, std::span<const uint8_t>, Completions&, Token, WriteIntent)
-//     void send(TopicHandle, const Key&, std::span<const uint8_t>, WriteIntent)   // fire and forget
 //     Completion sendAndWait(TopicHandle, const Key&, std::span<const uint8_t>, WriteIntent, std::chrono::nanoseconds)
 //
 //   ProducerRef (FD7) is the production alternative: TypedTopic<T, ProducerRef> borrows a Producer (e.g. one
@@ -280,30 +279,30 @@ public:
 
     /// Fails with KeyExists (56) when the key is already stored.
     void insert(const T& rec, Completions& cq, Token token) {
-        producer_.send(topic_, keyOfRecord_(rec), encode_(rec), cq, token, WriteIntent::Insert);
+        producer_.send(topic_, keyOfRecord_(rec), intentValue_(rec), cq, token, WriteIntent::Insert);
     }
     [[nodiscard]] WriteResult insertAndWait(const T& rec, std::chrono::nanoseconds timeout = kDefaultWriteWait) {
         return WriteResult::fromCompletion(
-            producer_.sendAndWait(topic_, keyOfRecord_(rec), encode_(rec), WriteIntent::Insert, timeout));
+            producer_.sendAndWait(topic_, keyOfRecord_(rec), intentValue_(rec), WriteIntent::Insert, timeout));
     }
 
     /// Fails with KeyNotFound (57) when the key is not stored.
     void update(const T& rec, Completions& cq, Token token) {
-        producer_.send(topic_, keyOfRecord_(rec), encode_(rec), cq, token, WriteIntent::Update);
+        producer_.send(topic_, keyOfRecord_(rec), intentValue_(rec), cq, token, WriteIntent::Update);
     }
     [[nodiscard]] WriteResult updateAndWait(const T& rec, std::chrono::nanoseconds timeout = kDefaultWriteWait) {
         return WriteResult::fromCompletion(
-            producer_.sendAndWait(topic_, keyOfRecord_(rec), encode_(rec), WriteIntent::Update, timeout));
+            producer_.sendAndWait(topic_, keyOfRecord_(rec), intentValue_(rec), WriteIntent::Update, timeout));
     }
 
     /// Same as send(rec).
     void upsert(const T& rec) { send(rec); }
     void upsert(const T& rec, Completions& cq, Token token) {
-        producer_.send(topic_, keyOfRecord_(rec), encode_(rec), cq, token, WriteIntent::Upsert);
+        producer_.send(topic_, keyOfRecord_(rec), intentValue_(rec), cq, token, WriteIntent::Upsert);
     }
     [[nodiscard]] WriteResult upsertAndWait(const T& rec, std::chrono::nanoseconds timeout = kDefaultWriteWait) {
         return WriteResult::fromCompletion(
-            producer_.sendAndWait(topic_, keyOfRecord_(rec), encode_(rec), WriteIntent::Upsert, timeout));
+            producer_.sendAndWait(topic_, keyOfRecord_(rec), intentValue_(rec), WriteIntent::Upsert, timeout));
     }
 
     /// Deletes the key (an empty value); no error when it is not stored.
@@ -471,6 +470,13 @@ private:
             buf_[3] = static_cast<uint8_t>((version_ >> 8) & 0xffu);
         }
         return {buf_.data(), n};
+    }
+
+    /// encode_ for an insert / update / upsert: an empty value would be a delete.
+    [[nodiscard]] std::span<const uint8_t> intentValue_(const T& rec) {
+        const std::span<const uint8_t> value = encode_(rec);
+        if (value.empty()) throw std::invalid_argument("an encoded record must not be empty");
+        return value;
     }
 
     void sendWithKey_(const T& rec, const Key& key) {

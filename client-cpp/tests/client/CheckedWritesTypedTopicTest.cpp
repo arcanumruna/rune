@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
 #include <random>
 #include <span>
@@ -47,10 +46,6 @@ struct StubProducer {
     void send(rc::TopicHandle t, const rc::Key& k, std::span<const uint8_t> v) const {
         record(t, k, v, rc::WriteIntent::Upsert);
     }
-    void send(rc::TopicHandle t, const rc::Key& k, std::span<const uint8_t> v, rc::Completions&, rc::Token,
-              rc::WriteIntent i) const {
-        record(t, k, v, i);
-    }
     rc::Completion sendAndWait(rc::TopicHandle t, const rc::Key& k, std::span<const uint8_t> v, rc::WriteIntent i,
                                std::chrono::nanoseconds) const {
         if (s->refuse) throw std::invalid_argument("refused");
@@ -58,12 +53,6 @@ struct StubProducer {
         return s->answer;
     }
 };
-
-// A queue the stub never touches: a real one needs the client library (Aeron), which this target does not link.
-rc::Completions& unusedQueue() {
-    alignas(std::max_align_t) static unsigned char storage[1];
-    return *reinterpret_cast<rc::Completions*>(storage);
-}
 
 // Follows the generated-struct contract (what `rune schema generate` emits) with a uint16 key.
 struct Narrow {
@@ -88,6 +77,14 @@ struct SpanKeyed {
     }
     [[nodiscard]] std::size_t encodedSize() const noexcept { return 4; }
     std::size_t encode(uint8_t* b) const noexcept { b[0] = 0; b[1] = 0; b[2] = 1; b[3] = 0; return 4; }
+};
+
+// Encodes to nothing: an intent write of it must not turn into a delete.
+struct EmptyEncoding {
+    static constexpr uint64_t         kFingerprint = 0x6666;
+    static constexpr std::string_view kSchemaName  = "empty_encoding";
+    [[nodiscard]] std::size_t encodedSize() const noexcept { return 0; }
+    std::size_t encode(uint8_t*) const noexcept { return 0; }
 };
 
 struct Keyless {
@@ -115,40 +112,20 @@ rune::gen::Position position(int64_t userId) {
 
 }  // namespace
 
-TEST(CheckedWritesTypedTopic, EachOpSendsItsIntentAndValue) {
+TEST(CheckedWritesTypedTopic, FireAndForgetOpsSendUpsertWithTheirValue) {
     Script script;
     PositionTopic topic(StubProducer{&script}, kHandle, 2);
     const auto rec = position(41);
-    rc::Completions& cq = unusedQueue();
 
     topic.send(rec);
-    topic.insert(rec, cq, 1);
-    topic.update(rec, cq, 2);
     topic.upsert(rec);
-    topic.upsert(rec, cq, 3);
     topic.remove(rec.key());
-    topic.remove(rec.key(), cq, 4);
-    topic.removeExisting(rec.key(), cq, 5);
-    ASSERT_EQ(script.sent.size(), 8u);
-
-    const auto& sent = script.sent;
-    EXPECT_EQ(sent[0].intent, rc::WriteIntent::Upsert);
-    ASSERT_FALSE(sent[0].value.empty());
-    EXPECT_EQ(sent[1].intent, rc::WriteIntent::Insert);
-    EXPECT_EQ(sent[1].value, sent[0].value);
-    EXPECT_EQ(sent[2].intent, rc::WriteIntent::Update);
-    EXPECT_EQ(sent[2].value, sent[0].value);
-    EXPECT_EQ(sent[3].intent, rc::WriteIntent::Upsert);
-    EXPECT_EQ(sent[3].value, sent[0].value);
-    EXPECT_EQ(sent[4].intent, rc::WriteIntent::Upsert);
-    EXPECT_EQ(sent[4].value, sent[0].value);
-    EXPECT_EQ(sent[5].intent, rc::WriteIntent::Upsert);
-    EXPECT_TRUE(sent[5].value.empty());
-    EXPECT_EQ(sent[6].intent, rc::WriteIntent::Upsert);
-    EXPECT_TRUE(sent[6].value.empty());
-    EXPECT_EQ(sent[7].intent, rc::WriteIntent::Update);
-    EXPECT_TRUE(sent[7].value.empty());
-    for (const Sent& s : sent) {
+    ASSERT_EQ(script.sent.size(), 3u);
+    ASSERT_FALSE(script.sent[0].value.empty());
+    EXPECT_EQ(script.sent[1].value, script.sent[0].value);
+    EXPECT_TRUE(script.sent[2].value.empty());
+    for (const Sent& s : script.sent) {
+        EXPECT_EQ(s.intent, rc::WriteIntent::Upsert);
         EXPECT_EQ(s.handle.topicId, 7);
         EXPECT_EQ(s.key.bytes().size(), 8u);
     }
@@ -175,7 +152,7 @@ TEST(CheckedWritesTypedTopic, AndWaitFormsSendTheirIntent) {
 
 TEST(CheckedWritesTypedTopicRegression, RemoveBuildsTheSameKeyAsSendRegression) {
     std::mt19937_64 rng(20261102);
-    const auto check = [&](auto makeRec, auto topicTag) {
+    const auto check = [&](auto makeRec) {
         using Rec = decltype(makeRec());
         Script script;
         rc::TypedTopic<Rec, StubProducer> topic(StubProducer{&script}, kHandle, 1);
@@ -189,21 +166,20 @@ TEST(CheckedWritesTypedTopicRegression, RemoveBuildsTheSameKeyAsSendRegression) 
             ASSERT_TRUE(std::equal(removeOp.key.bytes().begin(), removeOp.key.bytes().end(), sendOp.key.bytes().begin()));
             ASSERT_EQ(removeOp.key.partition(8), sendOp.key.partition(8));
         }
-        (void)topicTag;
     };
-    check([&] { return position(static_cast<int64_t>(rng())); }, 0);
+    check([&] { return position(static_cast<int64_t>(rng())); });
     check([&] {
         rune::gen::ShortKey rec;
         for (char& c : rec.code) c = static_cast<char>('a' + rng() % 26);
         return rec;
-    }, 0);
-    check([&] { return Narrow{static_cast<uint16_t>(rng())}; }, 0);
+    });
+    check([&] { return Narrow{static_cast<uint16_t>(rng())}; });
 }
 
 TEST(CheckedWritesTypedTopicRegression, OverlongKeyRefusesLikeSendRegression) {
     Script script;
     rc::TypedTopic<SpanKeyed, StubProducer> topic(StubProducer{&script}, kHandle, 1);
-    const SpanKeyed rec{"seventeen-bytes-xx"};
+    const SpanKeyed rec{"eighteen-bytes-xxx"};
     ASSERT_GT(rec.sku.size(), rc::Key::kMaxInline);
     EXPECT_THROW(topic.send(rec), std::invalid_argument);
     EXPECT_THROW(topic.remove(rec.key()), std::invalid_argument);
@@ -286,9 +262,19 @@ TEST(CheckedWritesTypedTopic, KeylessTopicHasNoRemove) {
     static_assert(!CanRemove<rc::TypedTopic<Keyless, StubProducer>>);
     static_assert(!CanRemoveExistingAndWait<rc::TypedTopic<Keyless, StubProducer>>);
     static_assert(CanRemove<PositionTopic>);
+    static_assert(CanRemoveExistingAndWait<PositionTopic>);
     Script script;
     rc::TypedTopic<Keyless, StubProducer> topic(StubProducer{&script}, kHandle, 1);
     (void)topic.insertAndWait(Keyless{});
     ASSERT_EQ(script.sent.size(), 1u);
     EXPECT_EQ(script.sent[0].key.size(), 0u);
+}
+
+TEST(CheckedWritesTypedTopic, AnEmptyEncodingIsRefusedByTheIntentWrites) {
+    Script script;
+    rc::TypedTopic<EmptyEncoding, StubProducer> topic(StubProducer{&script}, kHandle, 1);
+    EXPECT_THROW((void)topic.insertAndWait(EmptyEncoding{}), std::invalid_argument);
+    EXPECT_THROW((void)topic.updateAndWait(EmptyEncoding{}), std::invalid_argument);
+    EXPECT_THROW((void)topic.upsertAndWait(EmptyEncoding{}), std::invalid_argument);
+    EXPECT_TRUE(script.sent.empty());
 }
