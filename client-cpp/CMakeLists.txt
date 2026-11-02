@@ -1106,11 +1106,16 @@ if(BUILD_TESTING)
         tests/client/OpenTopicTest.cpp
         tests/client/TypedTopicRoutingRegressionTest.cpp   # Phase 2b C
         tests/client/KeyRoutingRegressionTest.cpp          # Phase 2b C: Key == protocol hash
+        tests/client/CheckedWritesTypedTopicTest.cpp       # checked writes: TypedTopic ops + WriteResult
         tests/support/AllocCounter.cpp                     # zero-alloc send check
     )
     add_dependencies(rune_open_topic_tests generate_characters_header)
+    if(TARGET generate_claim_schema_headers)   # #377: guarded like the generator itself
+        add_dependencies(rune_open_topic_tests generate_claim_schema_headers)
+    endif()
     target_include_directories(rune_open_topic_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${RUNE_CLAIM_GEN_DIR}
         ${RUNE_CODEC_ROOT}/include
         ${RUNE_PROTOCOL_INCLUDE}
         "${CMAKE_CURRENT_BINARY_DIR}/gen"                  # characters.gen.h
