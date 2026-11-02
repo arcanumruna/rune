@@ -601,6 +601,8 @@ protected:
         std::unique_ptr<rc::Client> client;
         std::unique_ptr<rc::Producer> producer;
         std::size_t rec = 0;
+        Clk::time_point begunAt{};   // before beginTransaction: never later than the coordinator's own start of the timeout
+        std::chrono::milliseconds timeout{};
     };
     std::unique_ptr<rc::Client> newClient(const std::string& user, const std::string& pw, std::vector<rc::TopicSpec> topics = {}) {
         rc::ClientConfig c;
@@ -658,8 +660,10 @@ protected:
         rc::ProducerConfig cfg;
         cfg.acks = rc::Acks::All;
         cfg.transactionalId = "tx";
+        l.timeout = std::chrono::milliseconds(cfg.transactionTimeoutMs);
         l.producer = std::make_unique<rc::Producer>(l.client->producer(cfg));
         l.producer->initTransactionsAndWait(std::chrono::seconds(30));
+        l.begunAt = Clk::now();
         l.producer->beginTransaction();
         TxnRec rec;
         rec.nsId = n->nsId;
@@ -693,6 +697,11 @@ protected:
             if (commit) it->second.producer->commitTransactionAndWait(bound);
             else it->second.producer->abortTransactionAndWait(bound);
         } catch (const std::exception& e) { err = e.what(); }
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(endStart - it->second.begunAt);
+        // the coordinator aborts a transaction open past its timeout (a slow run keeps one open that long): from then on
+        // it is aborted and its commit is refused InvalidTxnState (19); before it, the end must succeed
+        const bool timedOut = age >= it->second.timeout;
+        trace_ += " [age " + std::to_string(age.count()) + " ms" + (timedOut ? ", past its timeout" : "") + "]";
         trace_ += " [ended after " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clk::now() - endStart).count()) + " ms: " + (err.empty() ? "ok" : err) + "]";
         if (platformAborted) {
             // Review B1: a definite outcome, at once - never a wait to the bound (a timeout used to pass here and hid
@@ -701,6 +710,10 @@ protected:
             EXPECT_LT(Clk::now() - endStart, std::chrono::seconds(3)) << "ending a platform-aborted transaction waited: " << err;
             EXPECT_EQ(err.find("timed out"), std::string::npos) << ns << ": " << err;
             if (commit) EXPECT_FALSE(err.empty()) << "a commit succeeded after the platform aborted the transaction of " << ns;
+        } else if (n != nullptr && n->state == 0 && timedOut) {
+            if (commit && !err.empty()) EXPECT_NE(err.find("broker error code 19"), std::string::npos) << "a commit past the transaction timeout failed otherwise: " << err;
+            EXPECT_EQ(err.find("timed out"), std::string::npos) << "ending a transaction past its timeout got no answer: " << err;
+            rec.st = commit && err.empty() ? TxnRec::St::Committed : TxnRec::St::Aborted;
         } else if (n != nullptr && n->state == 0) {
             EXPECT_TRUE(err.empty()) << "ending a transaction in an ACTIVE namespace failed: " << err;
             rec.st = commit ? TxnRec::St::Committed : TxnRec::St::Aborted;
