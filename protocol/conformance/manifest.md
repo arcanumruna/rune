@@ -1026,7 +1026,7 @@ Trailing block bytes: `01 00 FF FF FF FF FF FF 1F 00 00 10 00 00`.
 
 **Message:** `TopicSchemaResponse` (templateId = 67), client version 17
 
-Body: `topicId:i32, version:u16, errorCode:u16, descriptorBlob(varbytes32), partitionCount:i32`, then the 14-byte TopicKeyFeatures block (section 22b), present iff the topic's features are non-default.  An older decoder stops after `partitionCount` and ignores the block; a 1-13 byte remainder decodes as no block.
+Body: `topicId:i32, version:u16, errorCode:u16, descriptorBlob(varbytes32), partitionCount:i32`, then the 14-byte TopicKeyFeatures block (section 22b), present iff the topic's features are non-default.  An older decoder stops after `partitionCount` and ignores the block; a 1-13 byte remainder decodes as no block, while a remainder of 14 or more bytes whose block has an unknown flag bit or a partitioner above 1 is refused.
 
 | Field | Value |
 |-------|-------|

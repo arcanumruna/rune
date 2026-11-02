@@ -373,7 +373,8 @@ struct TopicSchemaResponse {
     const uint8_t* descriptorBlob = nullptr; uint32_t descriptorLen = 0;
     int32_t partitionCount = 0;  // Phase 2b Part C; 0 = not reported (pre-2b broker)
     // v17: the 14-byte TopicKeyFeatures block after partitionCount; the broker sets it
-    // iff the features are non-default.  A 1-13 byte remainder decodes as no block.
+    // iff the features are non-default.  A 1-13 byte remainder decodes as no block;
+    // a remainder of 14 or more whose block has an unknown flag bit or partitioner is refused.
     bool hasKeyFeatures = false;
     TopicKeyFeatures keyFeatures{};
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::TopicSchemaResponse);
@@ -407,7 +408,10 @@ struct TopicSchemaResponse {
         // Trailing (Phase 2b): absent / cut short on a pre-2b frame -> 0.
         if (avail >= pos + 4) {
             m.partitionCount = detail::getLE32(buf, static_cast<int>(pos)); pos += 4;
-            m.hasKeyFeatures = avail >= pos + kTopicKeyFeaturesWireLen && getTopicKeyFeatures(buf + pos, avail - pos, m.keyFeatures);
+            if (avail >= pos + kTopicKeyFeaturesWireLen) {
+                if (!getTopicKeyFeatures(buf + pos, avail - pos, m.keyFeatures)) return std::nullopt;
+                m.hasKeyFeatures = true;
+            }
         }
         return m;
     }

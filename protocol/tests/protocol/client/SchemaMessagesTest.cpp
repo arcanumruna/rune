@@ -379,3 +379,31 @@ TEST(CheckedWritesSchemaWire, TopicSchemaResponseTrailer) {
         EXPECT_EQ(cut->partitionCount, 8) << extra;
     }
 }
+
+TEST(CheckedWritesSchemaWireRegression, TopicSchemaResponseRefusesAMalformedKeyFeaturesBlock) {
+    TopicSchemaResponse in; in.sessionId = 1; in.correlationId = 2;
+    in.topicId = 5; in.partitionCount = 8;
+    in.hasKeyFeatures = true; in.keyFeatures = keyIndexFeatures();
+    std::vector<uint8_t> buf(in.encodedSize());
+    ASSERT_EQ(in.encode(buf.data()), buf.size());
+    ASSERT_TRUE(TopicSchemaResponse::decode(buf.data(), buf.size()).has_value());
+    const std::size_t block = buf.size() - 14;
+
+    auto badFlags = buf; badFlags[block] = 0x04;
+    EXPECT_FALSE(TopicSchemaResponse::decode(badFlags.data(), badFlags.size()).has_value());
+    auto badPartitioner = buf; badPartitioner[block + 1] = 2;
+    EXPECT_FALSE(TopicSchemaResponse::decode(badPartitioner.data(), badPartitioner.size()).has_value());
+}
+
+TEST(CheckedWritesSchemaWireRegression, DefineTopicRefusesAMalformedKeyFeaturesBlock) {
+    DefineTopic m = defineTopicWithExt();
+    m.hasKeyFeatures = true; m.keyFeatures = keyIndexFeatures();
+    std::vector<uint8_t> buf(m.encodedSize());
+    ASSERT_EQ(m.encode(buf.data()), buf.size());
+    const std::size_t block = buf.size() - 14;
+
+    auto badFlags = buf; badFlags[block] = 0x04;
+    EXPECT_FALSE(DefineTopic::decode(badFlags.data(), badFlags.size()).has_value());
+    auto badPartitioner = buf; badPartitioner[block + 1] = 2;
+    EXPECT_FALSE(DefineTopic::decode(badPartitioner.data(), badPartitioner.size()).has_value());
+}
