@@ -2,6 +2,7 @@
 // CheckedWritesRig.h - checked writes Part 04: one Worker over a leader partition (topic 6, partition 0) with a tag-capable
 // source {id uint64 key, v int64, tag uint8}, TestReject views and a projection, driven pass by pass without a driver.
 #include <rune/aeronutil/testing/FreePort.h>
+#include <rune/codec/Evolve.h>
 #include <rune/codec/Filter.h>
 #include <rune/crypto/Aead.h>
 #include <rune/protocol/client/CryptoEnvelope.h>
@@ -67,6 +68,9 @@ inline rune::codec::Descriptor keyedSourceDescriptor(const KeyShape& s) {
     return b.add("v", PrimType::Int64).add("tag", PrimType::UInt16).build();
 }
 
+/// The wire width of the key: records carry the id as that many little-endian bytes, and the value's id field is as wide.
+inline uint32_t keyWidthOf(const KeyShape& s) { return rune::codec::fieldWidth(keyedSourceDescriptor(s).fields[0]); }
+
 inline rune::codec::Descriptor verdictSourceDescriptor() { return keyedSourceDescriptor(KeyShape{}); }
 
 /// del: a tombstone of `id` (empty value).  intent: the record's attribute bits 0-1 (0 upsert, 1 insert, 2 update / removeExisting).
@@ -118,6 +122,21 @@ public:
         keyIndexOn_ = true;
         send(specOp_(true));
     }
+    /// Schema version 2 drops the source's v field: its SchemaUpdate (materialized as of 2) and its FilterSchema (the evolving blob).  Default key only.
+    void dropValueField() {
+        using rune::codec::PrimType;
+        rune::codec::DescriptorBuilder b("t", 2);
+        b.addTagged("id", 0, PrimType::UInt64, 1, 0xFFFF, true, {}).addTagged("v", 1, PrimType::Int64, 1, 2, false, {}).addTagged("tag", 2, PrimType::UInt16, 1, 0xFFFF, false, {});
+        const rune::codec::Descriptor evolving = b.build();
+        WorkerOp v;
+        v.type = WorkerOp::Type::SchemaUpdate; v.topicId = kSrc; v.clientVersion = 2;
+        v.schemaUpdateBlob = rune::codec::serialize(rune::codec::materializeAsOf(evolving, 2));
+        send(std::move(v));
+        WorkerOp f;
+        f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = 2;
+        f.schemaUpdateBlob = rune::codec::serialize(evolving);
+        send(std::move(f));
+    }
     /// The judges of this rig (created later ones too) do not run: nothing is activated, replayed or judged.
     void holdJudge(bool on) {
         holdJudge_ = on;
@@ -126,10 +145,11 @@ public:
     /// The ids in [0, 4096) the key index holds, as decimal strings; the table's size must be that many.
     std::set<std::string> keyIndexKeys() {
         std::set<std::string> out;
+        const uint32_t kw = keyWidthOf(keyShape_);
+        std::string key(kw, '\0');
         for (uint64_t id = 0; id < 4096; ++id) {
-            char key[8];
-            for (int i = 0; i < 8; ++i) key[i] = static_cast<char>(id >> (8 * i));
-            if (vs->keyIndexContainsForTest(kSrc, 0, std::string_view(key, 8))) out.insert(std::to_string(id));
+            for (uint32_t i = 0; i < kw; ++i) key[i] = i < 8 ? static_cast<char>(id >> (8 * i)) : '\0';
+            if (vs->keyIndexContainsForTest(kSrc, 0, key)) out.insert(std::to_string(id));
         }
         EXPECT_EQ(out.size(), vs->keyIndexSizeForTest(kSrc, 0)) << "a key outside [0, 4096)";
         return out;
@@ -235,8 +255,7 @@ private:
     [[nodiscard]] WorkerOp specOp_(bool keyIndex) const {
         TopicWriteSpecWire w;
         w.topicId = kSrc; w.keyFieldId = 0; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
-        const auto d = keyedSourceDescriptor(keyShape_);
-        w.keyWidth = static_cast<uint8_t>(rune::codec::fieldWidth(d.fields[0]));
+        w.keyWidth = static_cast<uint8_t>(keyWidthOf(keyShape_));
         WorkerOp s;
         s.type = WorkerOp::Type::WriteSpecUpdate; s.topicId = kSrc;
         s.schemaUpdateBlob.resize(kTopicWriteSpecWireLen);
@@ -299,16 +318,19 @@ private:
 
 public:
 
-    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1) {
+    /// `shape`: the source's key; the wire key and the value's id field are that wide (the id's little-endian bytes, zero padded).
+    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1, const KeyShape& shape = {}) {
+        const uint32_t kw = keyWidthOf(shape);
+        const auto idByte = [](uint64_t id, uint32_t i) { return static_cast<uint8_t>(i < 8 ? id >> (8 * i) : 0); };
         rune::protocol::RecordBatchBuilder b(0, 1000);
         if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
         for (const auto& r : recs) {
-            std::vector<uint8_t> key(8), val;
-            for (int i = 0; i < 8; ++i) key[static_cast<std::size_t>(i)] = static_cast<uint8_t>(r.id >> (8 * i));
+            std::vector<uint8_t> key(kw), val;
+            for (uint32_t i = 0; i < kw; ++i) key[i] = idByte(r.id, i);
             if (r.del) { b.append({reinterpret_cast<const char*>(key.data()), key.size()}, {}, 1000, r.intent); continue; }
             const auto le16 = [&](uint16_t x) { val.push_back(uint8_t(x)); val.push_back(uint8_t(x >> 8)); };
-            le16(18); le16(1);
-            for (int i = 0; i < 8; ++i) val.push_back(static_cast<uint8_t>(r.id >> (8 * i)));
+            le16(static_cast<uint16_t>(kw + 10)); le16(1);
+            for (uint32_t i = 0; i < kw; ++i) val.push_back(idByte(r.id, i));
             for (int i = 0; i < 8; ++i) val.push_back(static_cast<uint8_t>(uint64_t(r.v) >> (8 * i)));
             le16(r.tag);
             b.append({reinterpret_cast<const char*>(key.data()), key.size()}, {reinterpret_cast<const char*>(val.data()), val.size()}, 1000, r.intent);
@@ -340,7 +362,7 @@ public:
 
     /// A produce through the worker's op path, re-sent while the partition is still building (NotLeader).
     int16_t produce(const std::vector<Rec>& recs) {
-        const auto bytes = batch(recs);
+        const auto bytes = batch(recs, -1, -1, keyShape_);
         for (int i = 0; i < kMaxPass; ++i) {
             WorkerOp op;
             op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = 0;
@@ -517,7 +539,7 @@ public:
     }
     /// A Produce frame on the worker's ingress; returns its correlation id.  `recs` is one batch.
     int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1) {
-        const auto bytes = batch(recs, pid, seq);
+        const auto bytes = batch(recs, pid, seq, keyShape_);
         const int64_t c = ++corr;
         rune::protocol::client::Produce m;
         m.sessionId = kAckSession; m.correlationId = c; m.topicId = kSrc; m.partition = 0; m.partitionKnown = 1;
@@ -711,6 +733,7 @@ private:
         return image != nullptr && image->position() == egress_->pub()->position();
     }
     void absorb_(Inbox& box, const uint8_t* data, std::size_t len) {
+        const uint32_t kw = keyWidthOf(keyShape_), idBytes = std::min<uint32_t>(kw, 8);
         for (std::size_t pos = 0; pos + 12 <= len;) {
             rune::protocol::RecordBatchReader r(data + pos, len - pos);
             const int32_t total = r.totalLength();
@@ -719,13 +742,13 @@ private:
             (void)rune::protocol::forEachRecordSpan(data + pos, static_cast<std::size_t>(total), [&](const rune::protocol::RecordSpan& rs) {
                 uint64_t id = 0;
                 if (rs.value.empty()) {   // a tombstone: the key carries the id
-                    for (int i = 0; i < 8; ++i) id |= uint64_t(uint8_t(rs.key[static_cast<std::size_t>(i)])) << (8 * i);
+                    for (uint32_t i = 0; i < idBytes; ++i) id |= uint64_t(uint8_t(rs.key[i])) << (8 * i);
                     box.records.push_back(Delivered{rs.offset, id, kTombstoneTag, static_cast<uint8_t>(rs.attributes & 0x03)});
                     return;
                 }
                 const auto* v = reinterpret_cast<const uint8_t*>(rs.value.data());
-                for (int i = 0; i < 8; ++i) id |= uint64_t(v[4 + i]) << (8 * i);
-                box.records.push_back(Delivered{rs.offset, id, static_cast<uint16_t>(v[20] | (v[21] << 8)), static_cast<uint8_t>(rs.attributes & 0x03)});
+                for (uint32_t i = 0; i < idBytes; ++i) id |= uint64_t(v[4 + i]) << (8 * i);
+                box.records.push_back(Delivered{rs.offset, id, static_cast<uint16_t>(v[4 + kw + 8] | (v[4 + kw + 9] << 8)), static_cast<uint8_t>(rs.attributes & 0x03)});
             });
             pos += static_cast<std::size_t>(total);
         }
@@ -869,13 +892,14 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
                 (void)rune::protocol::forEachRecordSpan(b, total, [&](const rune::protocol::RecordSpan& rs) {
                     if (rs.offset >= through) return;
                     uint64_t id = 0;
-                    for (int i = 0; i < 8; ++i) id |= uint64_t(uint8_t(rs.key[static_cast<std::size_t>(i)])) << (8 * i);
+                    const std::size_t kw = rs.key.size();   // the wire key is the id, kw bytes wide
+                    for (std::size_t i = 0; i < std::min<std::size_t>(kw, 8); ++i) id |= uint64_t(uint8_t(rs.key[i])) << (8 * i);
                     const auto intent = static_cast<uint8_t>(rs.attributes & 0x03);
                     if (rs.value.empty()) { out.data.push_back({rs.offset, id, 0, 0, true, intent}); return; }
                     const auto* val = reinterpret_cast<const uint8_t*>(rs.value.data());
                     uint64_t x = 0;
-                    for (int i = 0; i < 8; ++i) x |= uint64_t(val[12 + i]) << (8 * i);
-                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[20]), false, intent});
+                    for (int i = 0; i < 8; ++i) x |= uint64_t(val[4 + kw + i]) << (8 * i);
+                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[4 + kw + 8]), false, intent});
                 });
             } else if (r.baseOffset() < through) {
                 const int t = crl::recordType(b, total);

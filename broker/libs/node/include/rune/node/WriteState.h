@@ -97,6 +97,8 @@ public:
     uint8_t               keyWidth       = 0;
     bool                  legacyValidate = false;
     bool                  keyIndex       = false;
+    /// The topic's evolving descriptor (every field ever declared), from the FilterSchema op; the key index decodes each writer version through it.
+    std::optional<rune::codec::Descriptor> evolving;
 
     [[nodiscard]] const SpecVersion* versionFor(uint16_t version) const noexcept {
         return version < versions_.size() ? versions_[version].get() : nullptr;

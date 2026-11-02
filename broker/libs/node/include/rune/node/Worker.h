@@ -3368,7 +3368,7 @@ private:
                          workerId_, w->topicId);
         for (auto& sl : rcSlots_)
             if (!sl.write && sl.replica->topicId() == w->topicId) {
-                sl.write = std::make_unique<PartitionWriteState>(PartitionWriteState{&spec});
+                sl.write = std::make_unique<PartitionWriteState>(PartitionWriteState{.spec = &spec});
                 bindVerdictHooks_(sl);
             }
         rebuildWriteById_();
@@ -3425,7 +3425,7 @@ private:
         const uint32_t tailLen = op.tailLength();
         const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
         try {
-            const rune::codec::Descriptor desc = rune::codec::deserialize(std::span<const uint8_t>(tail, tailLen));
+            rune::codec::Descriptor desc = rune::codec::deserialize(std::span<const uint8_t>(tail, tailLen));
             rune::codec::FilterSchema built = rune::codec::FilterSchema::build(desc, version);
             auto it = filterSchemas_.find(topicId);
             if (it == filterSchemas_.end()) {
@@ -3437,6 +3437,7 @@ private:
                 ++filterSchemaReplacements_;
                 recompileFilters_(topicId);
             }
+            writeSpecOf_(topicId).evolving = std::move(desc);
             spdlog::debug("Worker {}: FilterSchema installed for topicId={} version={}", workerId_, topicId, version);
         } catch (const std::exception& ex) {
             ++filterSchemaErrors_;
@@ -6964,7 +6965,7 @@ private:
             installReadAhead_(slot);
             if (!slot.write)
                 if (const auto it = writeSpecs_.find(r->topicId()); it != writeSpecs_.end() && it->second->hasFacts())
-                    slot.write = std::make_unique<PartitionWriteState>(PartitionWriteState{it->second.get()});
+                    slot.write = std::make_unique<PartitionWriteState>(PartitionWriteState{.spec = it->second.get()});
             bindVerdictHooks_(slot);
             next.push_back(std::move(slot));
         }

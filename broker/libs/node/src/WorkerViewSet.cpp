@@ -807,19 +807,22 @@ void WorkerViewSet::eraseKeyIndex_(uint64_t key) {
     }
 }
 
-// Cold.  The key index is built over the source's latest schema; nullptr until the schema has landed on this worker, or when the
-// key cannot be indexed (the wire key is packed into 8 bytes).
+// Cold.  The key index is built over the source's evolving schema, as every view is: the judge decodes each writer version through it.
+// nullptr until the schema has landed on this worker, or when the key cannot be indexed (the wire key is packed into 8 bytes).
 static const rune::codec::Descriptor* keyIndexSource(const TopicWriteSpec& spec) {
-    const rune::codec::Descriptor* src = spec.descriptorFor(spec.maxVersion());
-    if (src == nullptr || spec.keyWidth == 0 || spec.keyWidth > 8) return nullptr;
-    const bool hasKey = std::any_of(src->fields.begin(), src->fields.end(), [&](const auto& f) { return f.id == spec.keyFieldId; });
-    return hasKey ? src : nullptr;
+    if (!spec.evolving || spec.keyWidth == 0 || spec.keyWidth > 8) return nullptr;
+    const bool hasKey = std::any_of(spec.evolving->fields.begin(), spec.evolving->fields.end(), [&](const auto& f) { return f.id == spec.keyFieldId; });
+    return hasKey ? &*spec.evolving : nullptr;
 }
+
+// A key index no leadership has activated yet: its first activation keeps it (it holds nothing), a later one rebuilds it.
+static constexpr uint64_t kNeverActivated = UINT64_MAX;
 
 static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src) {
     ViewInstance inst(keyIndexPlan(srcTopicId, spec.keyFieldId), keyIndexRowLayout(), src, /*persist=*/false,
                       partition, /*indexSlots=*/4096, kKeyIndexChunkBytes);
     inst.maxRecordsPerPass = kKeyIndexReplayRecordsPerPass;
+    inst.foldLeadership = kNeverActivated;
     return inst;
 }
 
@@ -827,13 +830,15 @@ static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const T
 void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen) {
     const auto it = keyIndexes_.find(instKey(srcTopicId, partition));
     if (it == keyIndexes_.end() || it->second.foldLeadership == leaderGen) return;   // already fresh for this leadership (the judge may be held)
-    const rune::codec::Descriptor* src = keyIndexSource(spec);
-    if (src == nullptr) return;
-    releaseMem_(it->second);
-    it->second = freshKeyIndex(srcTopicId, partition, spec, *src);
+    if (it->second.foldLeadership != kNeverActivated) {
+        const rune::codec::Descriptor* src = keyIndexSource(spec);
+        if (src == nullptr) return;
+        releaseMem_(it->second);
+        it->second = freshKeyIndex(srcTopicId, partition, spec, *src);
+        ++judge.statsMut().keyIndexRebuilds;
+    }
     it->second.foldCursor = judge.logStart();
     it->second.foldLeadership = leaderGen;
-    ++judge.statsMut().keyIndexRebuilds;
 }
 
 VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write) {

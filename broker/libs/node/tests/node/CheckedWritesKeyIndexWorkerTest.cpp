@@ -3,6 +3,7 @@
 // no intent is applied before the logged constraint set holds it.
 #include "CheckedWritesRig.h"
 
+#include <rune/protocol/NamespaceLimits.h>
 #include <rune/view/Verdict.h>
 
 #include <algorithm>
@@ -17,6 +18,8 @@ constexpr uint8_t kAcksViewAll = rune::protocol::client::kAcksWireView | rune::p
 constexpr uint16_t kKeyExists = 56, kKeyNotFound = 57;
 constexpr int16_t kNotLeader = static_cast<int16_t>(ErrorCode::NotLeader);
 constexpr int16_t kInvalidRequest = static_cast<int16_t>(ErrorCode::InvalidRequest);
+constexpr int32_t kRej = 0x40000601;
+constexpr uint64_t kRejObj = 77;
 constexpr int16_t kDuplicateSequence = static_cast<int16_t>(ErrorCode::DuplicateSequence);
 using V = std::vector<std::tuple<uint16_t, uint16_t, uint32_t>>;
 
@@ -25,6 +28,8 @@ Rec upd(uint64_t id) { return Rec{id, 1, 0, false, 2}; }
 Rec ups(uint64_t id) { return Rec{id, 1, 0, false, 0}; }
 Rec rm(uint64_t id) { return Rec{id, 0, 0, true, 0}; }
 Rec rmEx(uint64_t id) { return Rec{id, 0, 0, true, 2}; }
+
+TestRejectRule tagRule(uint8_t tag) { TestRejectRule r; r.mode = TestRejectRule::Mode::TagEquals; r.tag = tag; return r; }
 
 std::set<std::string> idSet(uint64_t lo, uint64_t hi) {
     std::set<std::string> out;
@@ -141,7 +146,6 @@ TEST(CheckedWritesKeyIndexWorker, PlainWritesFromAnyProducerAreFoldedNeverReject
 TEST(CheckedWritesKeyIndexWorker, ChangeRecordPutsTheKeyIndexFirst) {
     Ready g;
     VerdictRig& r = g.r;
-    Intents& p = g.p;
     const auto log = r.readLog();
     ASSERT_EQ(log.changes.size(), 1u);
     ASSERT_GE(log.changes[0].members.size(), 1u);
@@ -163,16 +167,19 @@ TEST(CheckedWritesKeyIndexWorker, KeyIndexIsNeverCheckpointed) {
     ASSERT_TRUE(r.driveUntilJudged());
     r.passes(40);
     EXPECT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 3u);
-    EXPECT_EQ(std::count(r.deltaViewIds.begin(), r.deltaViewIds.end(), -1), 0) << "a delta frame left for the key index";
-    EXPECT_TRUE(r.deltaViewIds.empty());
+    EXPECT_TRUE(r.deltaViewIds.empty()) << "a delta frame left for the key index";
     EXPECT_EQ(r.vs->instanceCount(), 0u) << "it is no view instance";
 }
 
 TEST(CheckedWritesKeyIndexWorker, KeyIndexOnlyTopicIsDrivenWithoutViews) {
-    Ready g;
-    VerdictRig& r = g.r;
-    Intents& p = g.p;
+    VerdictRig r;
+    r.createKeyIndex();
+    r.enableAcks();
+    ASSERT_EQ(r.vs->viewCount(), 0u);
+    r.passes(60);
     EXPECT_EQ(r.vs->viewCount(), 0u);
+    EXPECT_EQ(r.readLog().changes.size(), 1u) << "the first change record is appended with no view and no earlier set: the key.index flag alone drives the partition";
+    Intents p{r, 42};
     const auto a = p.sendAck({ups(1), ups(2)});
     ASSERT_TRUE(a) << "a View ack is released by the judge alone";
     EXPECT_EQ(a->code, 0);
@@ -467,7 +474,7 @@ TEST(CheckedWritesKeyIndexWorker, FailoverTimingsGiveTheSameVerdicts) {
         p.send(batch);
         r.passes(5);
         r.followerFetch();
-        while (r.leo() <= r.replica->highWatermark()) r.pass();
+        for (int i = 0; i < VerdictRig::kMaxPass && r.leo() <= r.replica->highWatermark(); ++i) r.pass();
         ASSERT_GT(r.leo(), r.replica->highWatermark());
         const int64_t base = r.readLog().data.front().offset;
         r.failover();
@@ -519,4 +526,89 @@ TEST(CheckedWritesKeyIndexWorker, ReplayIsBoundedPerPass) {
     const auto& box = r.collect(sub);
     ASSERT_FALSE(box.records.empty());
     EXPECT_LT(box.records.back().offset, k);
+}
+
+// Review I1: the key index is the judge's first member, so every co-member reads its writer through the key index's descriptor.
+// v1 {id, v, tag}; v2 drops v.  A v1 record must still decode tag at the v1 layout.
+TEST(CheckedWritesKeyIndexRegression, OlderWritersDecodeThroughTheEvolvingSchemaRegression) {
+    VerdictRig r;
+    r.createKeyIndex({}, /*enabled=*/false);
+    r.dropValueField();
+    r.installRejectView(kRej, kRejObj, tagRule(7));
+    r.enableKeyIndex();
+    r.enableAcks();
+    r.passes(60);
+    Intents p{r, 42};
+    const auto bad = p.sendAck({Rec{5, 1000, 7}});
+    ASSERT_TRUE(bad);
+    EXPECT_EQ(bad->code, 0);
+    ASSERT_EQ(bad->verdicts.size(), 1u) << "tag 7 of a v1 record is rejected";
+    EXPECT_EQ(std::get<1>(bad->verdicts[0]), static_cast<uint16_t>(ErrorCode::ConstraintViolation));
+    const auto good = p.sendAck({Rec{6, 1000, 9}});
+    ASSERT_TRUE(good);
+    EXPECT_TRUE(good->verdicts.empty());
+}
+
+// Review M2: a topic that already has a verdict source adopts key.index; its intents are judged, not answered NotLeader for ever.
+TEST(CheckedWritesKeyIndexRegression, AdoptionOntoAnExistingVerdictSourceJudgesIntentsRegression) {
+    VerdictRig r;
+    r.createKeyIndex({}, /*enabled=*/false);
+    r.installRejectView(kRej, kRejObj, tagRule(7));
+    r.enableAcks();
+    r.passes(60);
+    ASSERT_NE(r.vs->verdictSource(VerdictRig::kSrc, 0), nullptr);
+    ASSERT_EQ(r.writeState()->constraintSets.latest().count, 1) << "only the reject view is in the set";
+    r.enableKeyIndex();
+    r.passes(60);
+    const ConstraintSet& latest = r.writeState()->constraintSets.latest();
+    ASSERT_EQ(latest.count, 2);
+    EXPECT_EQ(latest.members[0].kind, rune::view::VerdictViewKind::KeyIndex);
+    Intents p{r, 42};
+    const auto a1 = p.sendAck({ins(5)});
+    ASSERT_TRUE(a1);
+    EXPECT_EQ(a1->code, 0);
+    const auto a2 = p.sendAck({ins(5)});
+    ASSERT_TRUE(a2);
+    EXPECT_EQ(a2->verdicts, (V{{0, kKeyExists, 0}}));
+    EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::KeyIndexActivating), 0u);
+}
+
+// Review M4 (RB5): the key index is charged to its namespace at adoption and released when it is rebuilt, erased or dropped.
+TEST(CheckedWritesKeyIndexRegression, KeyIndexMemoryIsChargedAndReleasedWithItsNamespaceRegression) {
+    constexpr uint16_t kSlot = 3;
+    constexpr uint32_t kNs = 77;
+    VerdictRig r;
+    r.worker->applyNsSlotAssignDirect(kSlot, kNs, rune::protocol::NamespaceLimits{});
+    r.log->setNsTag(kNs, kSlot);
+    r.createKeyIndex();
+    r.enableAcks();
+    r.passes(60);
+    Intents p{r, 42};
+    ASSERT_TRUE(p.sendAck({ins(1), ins(2), ins(3)}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(20);
+    const uint64_t charged = r.vs->nsViewMemBytes(kSlot);
+    EXPECT_GT(charged, 0u) << "charged at adoption";
+    EXPECT_EQ(r.vs->nsSlotMismatchesForTest(), 0u);
+    r.demotePromote();
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(20);
+    EXPECT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 3u);
+    EXPECT_EQ(r.vs->nsViewMemBytes(kSlot), charged) << "the rebuilt instance replaced the old charge, it did not add to it";
+    WorkerOp d;
+    d.type = WorkerOp::Type::TopicDropped;
+    d.topicId = VerdictRig::kSrc;
+    r.send(std::move(d));
+    EXPECT_EQ(r.vs->nsViewMemBytes(kSlot), 0u) << "net zero after the drop";
+}
+
+// Review M8: the first activation uses the instance that was just built; only a later leadership rebuilds.
+TEST(CheckedWritesKeyIndexRegression, FirstActivationIsNotARebuildRegression) {
+    Ready g;
+    VerdictRig& r = g.r;
+    ASSERT_NE(r.stats(), nullptr);
+    EXPECT_EQ(r.stats()->keyIndexRebuilds, 0u);
+    r.demotePromote();
+    r.passes(30);
+    EXPECT_EQ(r.stats()->keyIndexRebuilds, 1u);
 }

@@ -310,7 +310,7 @@ public:
     }
     [[nodiscard]] bool keyIndexContainsForTest(int32_t src, int32_t partition, std::string_view wireKey) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
-        return it != keyIndexes_.end() && it->second.table.get(keyIndexWord(wireKey)) != nullptr;
+        return it != keyIndexes_.end() && it->second.table.get(rune::view::ViewKey::fromU64(keyIndexWord(wireKey)).asU64()) != nullptr;
     }
     [[nodiscard]] std::size_t keyIndexSizeForTest(int32_t src, int32_t partition) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
