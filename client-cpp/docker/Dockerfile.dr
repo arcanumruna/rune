@@ -12,6 +12,7 @@
 #     --build-context rune-codec=../codec \
 #     --build-context rune-ql=../ql \
 #     --build-context rune-crypto=../crypto \
+#     --build-context aeron-recipe=../conan/aeron \
 #     -f docker/Dockerfile.dr \
 #     -t rune-dr-client:$(git rev-parse --short HEAD) .   # always a git-SHA tag, never dev/latest
 #
@@ -40,6 +41,9 @@ RUN case "${TARGETARCH}" in arm64) CMAKE_ARCH=aarch64 ;; *) CMAKE_ARCH=x86_64 ;;
 
 WORKDIR /build
 RUN conan profile detect --force
+# aeron/1.51.0-rune.1: 1.51.0 + the upstream unavailable-image refcount fix (recipe in conan/aeron).
+COPY --from=aeron-recipe . /aeron-recipe
+RUN conan export /aeron-recipe --version=1.51.0-rune.1
 
 # Conan install (cached independently of source edits).
 COPY conanfile.py conandata.yml VERSION.txt ./
@@ -70,7 +74,7 @@ COPY --from=rune-ql include /rune-ql/include
 # client<->broker TLS/AEAD (Task 5): rune-crypto sibling (TlsSession + AeadCipher +
 # CPU cipher selection), compiled into rune_crypto by the client's CMakeLists.
 # Supplied via the BuildKit named build context `rune-crypto`:
-#   docker build --build-context rune-crypto=../crypto ...
+#   docker build --build-context rune-crypto=../crypto --build-context aeron-recipe=../conan/aeron ...
 COPY --from=rune-crypto src     /rune-crypto/src
 COPY --from=rune-crypto include /rune-crypto/include
 

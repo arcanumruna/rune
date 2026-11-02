@@ -49,6 +49,7 @@ services:
         # -DRUNE_CRYPTO_ROOT=/rune-crypto; without this named context the broker
         # image build fails with "COPY --from=rune-crypto: context not found".
         rune-crypto: ../../crypto
+        aeron-recipe: ../../conan/aeron
     image: rune-broker-node:${RUNE_IMAGE_TAG:-single}
     platform: linux/amd64
     hostname: rune-1

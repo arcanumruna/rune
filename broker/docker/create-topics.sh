@@ -77,6 +77,7 @@ ensure_image() {
         --build-context rune-ql="${PROJECTS}/ql" \
         --build-context flight-recorder="${FLIGHT_RECORDER_SRC}" \
         --build-context rune-crypto="${PROJECTS}/crypto" \
+        --build-context aeron-recipe="${PROJECTS}/conan/aeron" \
         -t "${QL_IMAGE}" "${CLIENT_REPO}" 2>&1); rc=$?
     set -e
     [ "${rc}" -eq 0 ] || { echo "${out}" | tail -40 >&2; fail "building ${QL_IMAGE} failed (exit ${rc})"; }

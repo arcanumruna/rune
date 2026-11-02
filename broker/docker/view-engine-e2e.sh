@@ -203,6 +203,7 @@ client_build_out=$(docker build \
     --build-context rune-protocol="${PROJECTS}/protocol" \
     --build-context rune-codec="${PROJECTS}/codec" \
     --build-context rune-crypto="${PROJECTS}/crypto" \
+    --build-context aeron-recipe="${PROJECTS}/conan/aeron" \
     --build-context flight-recorder="${FLIGHT_RECORDER_SRC}" \
     --build-context rune-ql="${PROJECTS}/ql" \
     -t "${CLIENT_IMAGE}" \

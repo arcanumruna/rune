@@ -32,6 +32,8 @@ x-broker-build: &broker-build
     rune-codec: ../../codec
     # rune-crypto (client<->broker TLS/AEAD): the Dockerfile COPYs --from=rune-crypto.
     rune-crypto: ../../crypto
+    # aeron-recipe: local aeron/1.51.0-rune.1 recipe; the Dockerfile COPYs --from=aeron-recipe.
+    aeron-recipe: ../../conan/aeron
 
 x-broker-env: &broker-env
   # GR-9: peer spec includes the replicationPort (4th segment) so the data-plane
@@ -246,6 +248,7 @@ services:
         arcanum-metrics: ${ARCANUM_METRICS_DIR:-../../../arcanum-metrics}
         rune-codec: ../../codec
         rune-crypto: ../../crypto
+        aeron-recipe: ../../conan/aeron
     platform: linux/amd64
     hostname: probe
     shm_size: "256m"
