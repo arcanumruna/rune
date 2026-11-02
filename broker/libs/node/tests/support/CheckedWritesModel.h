@@ -23,7 +23,7 @@ struct ModelVerdict {
 class CheckedWritesModel {
 public:
     using LogRec = VerdictRig::RigLogRec;
-    static constexpr uint16_t kConstraintViolation = 55;   // ErrorCode::ConstraintViolation
+    static constexpr uint16_t kConstraintViolation = 55, kKeyExists = 56, kKeyNotFound = 57;   // ErrorCode
 
     /// The model's own copy of a TestReject rule.
     struct Rule {
@@ -44,6 +44,18 @@ public:
     using RuleFn = std::function<std::optional<ModelVerdict>(const LogRec&, const CheckedWritesModel&)>;
     void addRule(uint64_t viewObjectId, RuleFn fn) { extra_[viewObjectId] = std::move(fn); }
 
+    /// The key index (object id 0): the P5-3 table, from whether the key is live among the accepted records before the judged one.
+    void addKeyIndexRule() {
+        addRule(0, [](const LogRec& rec, const CheckedWritesModel& m) -> std::optional<ModelVerdict> {
+            const bool live = m.isLiveAtJudge(rec.id);
+            if (!rec.del && rec.intent == 1 && live) return ModelVerdict{kKeyExists, 0};
+            if (rec.intent == 2 && !live) return ModelVerdict{kKeyNotFound, 0};
+            return std::nullopt;
+        });
+    }
+    /// The key's state while reset() judges: every accepted record before the judged one has been applied, in offset order.
+    [[nodiscard]] bool isLiveAtJudge(uint64_t id) const { return live_.count(id) != 0; }
+
     [[nodiscard]] static uint32_t constraintIdOf(uint64_t viewObjectId) noexcept { return static_cast<uint32_t>((viewObjectId << 16) | 1u); }
 
     /// Judges `log` (data records and change records, ascending offsets) from scratch.
@@ -59,11 +71,9 @@ public:
                 ++next;
             }
             std::optional<ModelVerdict> verdict;
-            if (!rec.del) {
-                for (const auto& [objectId, fingerprint] : set) {
-                    verdict = judge_(objectId, fingerprint, rec);
-                    if (verdict) break;
-                }
+            for (const auto& [objectId, fingerprint] : set) {
+                verdict = judge_(objectId, fingerprint, rec);
+                if (verdict) break;
             }
             if (verdict) { verdicts_[rec.offset] = *verdict; continue; }
             accepted_.push_back(rec);
@@ -99,7 +109,7 @@ private:
     std::optional<ModelVerdict> judge_(uint64_t objectId, uint64_t fingerprint, const LogRec& rec) const {
         if (const auto x = extra_.find(objectId); x != extra_.end()) return x->second(rec, *this);
         const auto it = rules_.find({objectId, fingerprint});
-        if (it == rules_.end()) return std::nullopt;
+        if (it == rules_.end() || rec.del) return std::nullopt;   // a tombstone is never rejected by a TestReject rule
         const Rule& r = it->second;
         bool reject = false;
         switch (r.mode) {

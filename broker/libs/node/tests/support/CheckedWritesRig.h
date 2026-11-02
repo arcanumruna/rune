@@ -22,6 +22,7 @@
 #include <rune/storage/Log.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/SkimpyOffsetMap.h>
+#include <rune/transaction/ControlMarker.h>
 #include <rune/view/PlanCompiler.h>
 
 #include <Aeron.h>
@@ -87,6 +88,9 @@ public:
     bool sendFetchResponse(rune::replication::NodeId, const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
+/// The replica and worker settings a cell may change: minIsr and durabilityTier (2 = Strict) of the partition, the acks=all commit-wait (0 = the default).
+struct RigTuning { int minIsr = 1; uint8_t durabilityTier = 1; int64_t ackTimeoutNs = 0; };
+
 class VerdictRig {
 public:
     static constexpr int32_t kSrc = 6;
@@ -94,9 +98,9 @@ public:
 
     /// `follower`: node 2 is in the ISR, so the HW only moves when followerFetch() is called.
     /// `rollBytes`: the log's segment size; compact() needs small segments (1 = one batch per segment).
-    explicit VerdictRig(bool follower = false, int64_t rollBytes = 64LL * 1024 * 1024)
+    explicit VerdictRig(bool follower = false, int64_t rollBytes = 64LL * 1024 * 1024, RigTuning tuning = {})
         : isr_(follower ? std::vector<rune::replication::NodeId>{1, 2} : std::vector<rune::replication::NodeId>{1}),
-          rollBytes_(rollBytes), viewDir_(rigTmpPath("views")), logDir_(rigTmpPath("log")) {
+          rollBytes_(rollBytes), tuning_(tuning), viewDir_(rigTmpPath("views")), logDir_(rigTmpPath("log")) {
         vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
         open();
     }
@@ -319,11 +323,12 @@ private:
 public:
 
     /// `shape`: the source's key; the wire key and the value's id field are that wide (the id's little-endian bytes, zero padded).
-    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1, const KeyShape& shape = {}) {
+    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1, const KeyShape& shape = {}, bool txn = false) {
         const uint32_t kw = keyWidthOf(shape);
         const auto idByte = [](uint64_t id, uint32_t i) { return static_cast<uint8_t>(i < 8 ? id >> (8 * i) : 0); };
         rune::protocol::RecordBatchBuilder b(0, 1000);
         if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+        b.setTransactional(txn);
         for (const auto& r : recs) {
             std::vector<uint8_t> key(kw), val;
             for (uint32_t i = 0; i < kw; ++i) key[i] = idByte(r.id, i);
@@ -538,8 +543,8 @@ public:
         wireAcks_();
     }
     /// A Produce frame on the worker's ingress; returns its correlation id.  `recs` is one batch.
-    int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1) {
-        const auto bytes = batch(recs, pid, seq, keyShape_);
+    int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool txn = false) {
+        const auto bytes = batch(recs, pid, seq, keyShape_, txn);
         const int64_t c = ++corr;
         rune::protocol::client::Produce m;
         m.sessionId = kAckSession; m.correlationId = c; m.topicId = kSrc; m.partition = 0; m.partitionKnown = 1;
@@ -552,6 +557,32 @@ public:
         while ((pos = ackPub_->offer(ab, 0, static_cast<aeron::util::index_t>(f.size()))) < 0 && pos >= aeron::ADMIN_ACTION) pass();   // back-pressure / admin: let the worker drain
         EXPECT_GT(pos, 0) << "the produce frame was refused: " << pos;
         return c;
+    }
+    /// The same batch the way a gateway routes it: a Produce op on the op ring, answered through the ack sink.
+    int64_t routedFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1) {
+        const auto bytes = batch(recs, pid, seq, keyShape_);
+        WorkerOp op;
+        op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = 0;
+        op.replica = replica.get(); op.logPtr = log.get();
+        op.sessionId = kAckSession; op.correlationId = ++corr; op.acks = acks;
+        op.producerId = pid; op.producerEpoch = 0; op.baseSequence = seq;
+        op.lastOffsetDelta = static_cast<int32_t>(recs.size()) - 1; op.recordCount = static_cast<int32_t>(recs.size());
+        op.durabilityTier = replica->durabilityTier();
+        op.deferAck = (acks & rune::protocol::client::kAcksWireAll) != 0;
+        op.recordBatchView = std::span<const uint8_t>(bytes);
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+        return corr;
+    }
+    /// A transaction coordinator's COMMIT / ABORT marker for `pid`.
+    void marker(int64_t pid, bool commit) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::AppendControlRecord; op.topicId = kSrc; op.partition = 0; op.replica = replica.get();
+        op.logPtr = log.get(); op.correlationId = 9000 + pid; op.producerId = pid;
+        op.targetReplicaId = replica->registryId(); op.incarnation = replica->incarnation();
+        op.recordBatchBytes = rune::transaction::ControlMarker::build(
+            pid, 0, commit ? rune::transaction::ControlType::Commit : rune::transaction::ControlType::Abort, 0);
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(op)));
+        passes(3);
     }
     /// Drives until the ack of `corr` arrived (or `maxPasses`).
     std::optional<Ack> ack(int64_t c, int maxPasses = 600) {
@@ -622,10 +653,10 @@ public:
     }
 
     /// Passes (with follower fetches when the rig has a follower) until the judge reached `target` and the markers covering it are
-    /// committed.  false = it did not within kMaxPass passes.
-    bool driveUntilJudged(int64_t target = -1) {
+    /// committed.  false = it did not within `maxPasses` passes (a Strict append waits for an fsync that takes wall-clock time).
+    bool driveUntilJudged(int64_t target = -1, int maxPasses = kMaxPass) {
         if (target < 0) target = dataEnd();
-        for (int i = 0; i < kMaxPass; ++i) {
+        for (int i = 0; i < maxPasses; ++i) {
             const VerdictSource* judge = vs->verdictSource(kSrc, 0);
             const PartitionWriteState* w = writeState();
             if ((judge == nullptr || judge->judgedThrough() >= target) && w != nullptr && w->markers.committedThrough() >= target) return true;   // no judge: the last member left
@@ -837,13 +868,14 @@ private:
         log = std::make_unique<rune::storage::Log>(logDir_.string(), rollBytes_);
         log->recover();
         rune::replication::PartitionConfig c{};
-        c.topicId = kSrc; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+        c.topicId = kSrc; c.partitionId = 0; c.selfId = 1; c.minIsr = tuning_.minIsr; c.durabilityTier = tuning_.durabilityTier;
         c.replicaLagMaxMs = 1'000'000; c.replicaLagMaxOffset = 1'000'000;
         c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL;
         c.maxFetchBytes = 1 << 20; c.pushOnAppend = false;
         replica = std::make_unique<rune::replication::PartitionReplica>(c, rune::replication::Role::Leader, 1, isr_, isr_, log.get(), &transport_);
         worker = std::make_unique<Worker>(0);
         worker->setFilterConfig(filter::FilterConfig{});
+        if (tuning_.ackTimeoutNs != 0) worker->setAckTimeoutNs(tuning_.ackTimeoutNs);
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
         worker->setViewSet(vs.get());
         if (rcScanBytesPerPass != 0) worker->setRcScanBytesPerPass(rcScanBytesPerPass);
@@ -856,6 +888,7 @@ private:
     int32_t rcScanBytesPerPass = 0;   ///< the leadership scan budget of a (re)started worker; 0 = the default
  private:
     int64_t rollBytes_;
+    RigTuning tuning_;
     uint64_t cleanedSeq_ = 0;
     std::vector<std::pair<int32_t, std::function<void()>>> installs_;   ///< (view topic, install): replayed by a restart
     int64_t epoch_ = 1;

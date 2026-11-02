@@ -1,6 +1,7 @@
 // CheckedWritesKeyIndexWorkerTest.cpp - checked writes Part 05 Task 7: the key index as a verdict source on a real Worker.
 // Intents are judged at fold (56 KeyExists / 57 KeyNotFound), the index is rebuilt from the local log at every activation, and
 // no intent is applied before the logged constraint set holds it.
+#include "CheckedWritesMatrixExpectations.h"
 #include "CheckedWritesRig.h"
 
 #include <rune/protocol/NamespaceLimits.h>
@@ -612,3 +613,100 @@ TEST(CheckedWritesKeyIndexRegression, FirstActivationIsNotARebuildRegression) {
     r.passes(30);
     EXPECT_EQ(r.stats()->keyIndexRebuilds, 1u);
 }
+
+// ---- the key-width sweep: the key index judges by the exact bytes of the wire key, at every width the DDL allows (SD8) ----
+namespace {
+struct WidthCase { const char* name; KeyShape shape; };
+const WidthCase kWidthCases[] = {
+    {"uint16", {rune::codec::PrimType::UInt16, 0}}, {"int32", {rune::codec::PrimType::Int32, 0}}, {"uint32", {rune::codec::PrimType::UInt32, 0}},
+    {"int64", {rune::codec::PrimType::Int64, 0}}, {"uint64", {rune::codec::PrimType::UInt64, 0}},
+    {"string1", {rune::codec::PrimType::FixedStr, 1}}, {"string8", {rune::codec::PrimType::FixedStr, 8}},
+};
+
+Rec opOf(mx::Op op, uint64_t id) {
+    switch (op) {
+    case mx::Op::Insert: return ins(id);
+    case mx::Op::Update: return upd(id);
+    case mx::Op::Upsert: return ups(id);
+    case mx::Op::Remove: return rm(id);
+    default: return rmEx(id);
+    }
+}
+
+struct WidthRun {
+    VerdictRig r;
+    Intents    p{r, 42};
+    explicit WidthRun(const KeyShape& s) {
+        r.createKeyIndex(s);
+        r.enableAcks();
+        r.passes(60);
+    }
+};
+}  // namespace
+
+class Shape : public ::testing::TestWithParam<WidthCase> {};
+
+// 5 ops x {KeyNew, KeyExisting}, each on a key of its own: the verdicts are the P5-3 table at every width.
+TEST_P(Shape, OpsJudgeByExactKeyBytes) {
+    WidthRun g(GetParam().shape);
+    uint64_t id = 10;
+    for (const mx::Op op : {mx::Op::Insert, mx::Op::Update, mx::Op::Upsert, mx::Op::Remove, mx::Op::RemoveExisting})
+        for (const mx::Entity e : {mx::Entity::KeyNew, mx::Entity::KeyExisting}) {
+            ++id;
+            if (e == mx::Entity::KeyExisting) {
+                const auto seed = g.p.sendAck({ups(id)});
+                ASSERT_TRUE(seed);
+                ASSERT_EQ(seed->code, 0);
+            }
+            const auto a = g.p.sendAck({opOf(op, id)});
+            ASSERT_TRUE(a) << mx::nameOf(op) << " x " << mx::nameOf(e);
+            EXPECT_EQ(a->code, 0);
+            const uint16_t code = mx::keyIndexVerdict05(op, e);
+            V want;
+            if (code != 0) want.emplace_back(0, code, 0);
+            EXPECT_EQ(a->verdicts, want) << mx::nameOf(op) << " x " << mx::nameOf(e);
+        }
+}
+
+// Two keys equal but for the last byte are two keys.
+TEST_P(Shape, KeysDifferingInTheLastByteAreDistinct) {
+    const KeyShape& shape = GetParam().shape;
+    WidthRun g(shape);
+    const uint32_t kw = keyWidthOf(shape);
+    uint64_t a = 0;   // every byte 1, so a string key has no NUL padding
+    for (uint32_t i = 0; i < kw; ++i) a |= uint64_t{1} << (8 * i);
+    const uint64_t b = a + (uint64_t{1} << (8 * (kw - 1)));
+    const auto first = g.p.sendAck({ins(a)});
+    const auto second = g.p.sendAck({ins(b)});
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(first->code, 0);
+    EXPECT_EQ(second->code, 0);
+    EXPECT_TRUE(first->verdicts.empty());
+    EXPECT_TRUE(second->verdicts.empty());
+    const auto again = g.p.sendAck({ins(b)});
+    ASSERT_TRUE(again);
+    EXPECT_EQ(again->verdicts, (V{{0, kKeyExists, 0}}));
+    ASSERT_TRUE(g.r.driveUntilJudged());
+    g.r.passes(40);
+    EXPECT_EQ(g.r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 2u);
+}
+
+// A remove carries the key the way a send does, so it erases exactly what the send put.
+TEST_P(Shape, RemoveErasesWhatSendPut) {
+    WidthRun g(GetParam().shape);
+    ASSERT_TRUE(g.p.sendAck({ups(7)}));
+    ASSERT_TRUE(g.r.driveUntilJudged());
+    g.r.passes(40);
+    ASSERT_EQ(g.r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 1u);
+    ASSERT_TRUE(g.p.sendAck({rm(7)}));
+    ASSERT_TRUE(g.r.driveUntilJudged());
+    g.r.passes(40);
+    EXPECT_EQ(g.r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 0u);
+    const auto reinsert = g.p.sendAck({ins(7)});
+    ASSERT_TRUE(reinsert);
+    EXPECT_TRUE(reinsert->verdicts.empty());
+}
+
+INSTANTIATE_TEST_SUITE_P(CheckedWritesKeyIndexWidths, Shape, ::testing::ValuesIn(kWidthCases),
+    [](const ::testing::TestParamInfo<WidthCase>& i) { return std::string(i.param.name); });
