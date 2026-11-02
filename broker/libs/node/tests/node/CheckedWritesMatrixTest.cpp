@@ -179,7 +179,7 @@ private:
         const auto sendAll = [&] { for (std::size_t k = 0; k < batches_.size(); ++k) send_(batches_[k], k); };
         switch (c_.timing) {
         case Timing::RetryBeforeJudge: case Timing::RetryAfterJudge: case Timing::RetryAfterWindow:
-            ASSERT_TRUE(executeRetry(r_, c_.timing, [&] { send_(batches_[0], 0); }, [&](uint64_t i) { send_({{100 + i, 1, 0}}, 0); }, [&] { resend_(sent_[0]); }));
+            ASSERT_TRUE(executeRetry(r_, c_.timing != Timing::RetryBeforeJudge, c_.timing == Timing::RetryAfterWindow, [&] { send_(batches_[0], 0); }, [&](uint64_t i) { send_({{100 + i, 1, 0}}, 0); }, [&] { resend_(sent_[0]); }));
             return;
         case Timing::CreateOnNonEmpty: case Timing::ReplaceDuringWrites: case Timing::DropDuringWrites:
             send_(batches_[0], 0);
@@ -335,9 +335,13 @@ public:
         }
         if (preIndex_) {
             r_.followerFetch();
-            if (c_.timing == Timing::CreateOnNonEmpty && hasIntent_()) r_.holdJudge(true);   // the op meets the index before its change record is logged
-            r_.enableKeyIndex();
-            if (c_.timing != Timing::CreateOnNonEmpty) ASSERT_TRUE(waitActive_());   // CreateOnNonEmpty sends the op while the index is built
+            if (c_.timing == Timing::CreateOnNonEmpty) {   // the op is sent in the pass that takes the adoption, with the judge held: before the change record
+                r_.holdJudge(true);
+                r_.requestKeyIndex();
+            } else {
+                r_.enableKeyIndex();
+                ASSERT_TRUE(waitActive_());
+            }
         }
         execute_();
         if (::testing::Test::HasFatalFailure()) return;
@@ -420,10 +424,8 @@ private:
     }
     void sendOp_(int64_t pid = kOpPid) { sent_.push_back(send_(pid, opBatch_())); }
 
-    // An intent meets the index before its change record is logged.  With a TestReject member the judge already exists and logs the change on its own.
-    bool hasIntent_() const {
-        return (c_.op == Op::Insert || c_.op == Op::Update || c_.op == Op::RemoveExisting) && c_.entity != Entity::KeyRejectedEarlier;
-    }
+    // The hook answers an intent NotLeader (KeyIndexActivating) until the change record naming the key index is logged; upserts and removes are not gated.
+    bool gatedByActivation_() const { return c_.op == Op::Insert || c_.op == Op::Update || c_.op == Op::RemoveExisting; }
 
     std::vector<Rec> opBatch_() const {
         std::vector<Rec> b;
@@ -460,13 +462,22 @@ private:
     }
 
     // An op sent while the key index is still built is answered NotLeader and sent again (nothing was appended).
+    // A write the hook does not gate is appended before the change record; the held judge is released once it is in the log.
     void sendOpUntilAccepted_() {
         for (int i = 0; i < 100; ++i) {
             const Sent s = send_(kOpPid, opBatch_());
+            if (!gatedByActivation_()) {
+                r_.passes(5);
+                r_.holdJudge(false);
+                sent_.push_back(s);
+                if (!waitActive_()) return;
+                sent_.push_back(send_(kOpPid, {ups(2000, 1)}));   // the op predates the index and is not judged: a record above the change gives the markers something to cover
+                return;
+            }
             const auto a = r_.ackFetching(s.corr, ackPasses_());
             ASSERT_TRUE(a);
             if (a->code == 0) {
-                if (hasIntent_()) EXPECT_GE(r_.worker->hookRefusalsForTest(HookRefusal::KeyIndexActivating), 1u) << "the op was sent while the index was built";
+                EXPECT_GE(r_.worker->hookRefusalsForTest(HookRefusal::KeyIndexActivating), 1u) << "the op was sent while the index was built";
                 sent_.push_back(s);
                 return;
             }
@@ -489,7 +500,7 @@ private:
             sendOp_(kOtherPid);
             return;
         case Timing::RetryBeforeJudge: case Timing::RetryAfterJudge: case Timing::RetryAfterWindow:
-            ASSERT_TRUE(executeRetry(r_, c_.timing, [&] { sendOp_(); }, [&](uint64_t i) { sent_.push_back(send_(kOpPid, {ups(100 + i, 1)})); }, [&] { resend_(sent_[0]); }));
+            ASSERT_TRUE(executeRetry(r_, c_.timing != Timing::RetryBeforeJudge, c_.timing == Timing::RetryAfterWindow, [&] { sendOp_(); }, [&](uint64_t i) { sent_.push_back(send_(kOpPid, {ups(100 + i, 1)})); }, [&] { resend_(sent_[0]); }));
             return;
         case Timing::CreateOnNonEmpty:
             sendOpUntilAccepted_();
@@ -636,6 +647,13 @@ private:
         for (const auto& [orig, dup] : dups_) checkDupAck(r_, acks.at(orig), acks.at(dup), ex.check == Check::RetryOutsideWindow);
         if (ex.check == Check::RetryReplays) EXPECT_EQ(log.data.size(), stored_) << "a retry is stored once";
 
+        if (c_.timing == Timing::CreateOnNonEmpty && !gatedByActivation_()) {   // the op sits below the key index's change record: it met the index while it was built
+            const auto change = std::find_if(log.changes.begin(), log.changes.end(), [](const auto& c) {
+                return !c.members.empty() && c.members[0].kind == static_cast<uint8_t>(rune::view::VerdictViewKind::KeyIndex);
+            });
+            ASSERT_TRUE(change != log.changes.end());
+            EXPECT_LT(acks.at(sent_[0].corr).baseOffset, change->offset);
+        }
         const std::size_t opAt = c_.entity == Entity::KeyEarlierInBatch ? 1 : 0;
         if (ex.check == Check::KeyIndexTable) {
             const uint16_t code = keyIndexVerdict05(c_.op, c_.entity);

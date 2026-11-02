@@ -1,6 +1,5 @@
 #pragma once
 // CheckedWritesChecks.h - the invariants of a verdict source's log, shared by the matrix, the model check and the cluster stress.
-#include "CheckedWritesMatrixExpectations.h"
 #include "CheckedWritesModel.h"
 
 #include <gtest/gtest.h>
@@ -83,20 +82,20 @@ inline void checkDupAck(const VerdictRig& r, const VerdictRig::Ack& orig, const 
     }
 }
 
-/// RetryBeforeJudge / RetryAfterJudge / RetryAfterWindow: `sendOp` sends the batch, `sendFiller(i)` one other write, `resend` the
-/// same batch again.  false = the judge did not catch up.
+/// The retry timings: `sendOp` sends the batch, `sendFiller(i)` one other write, `resend` the same batch again.  `judgeFirst`: the judge
+/// catches up before the re-send (RetryAfterJudge, RetryAfterWindow); `pastWindow`: 33 more writes push the batch out of the producer's
+/// window first (RetryAfterWindow).  false = the judge did not catch up.
 template <class SendOp, class SendFiller, class Resend>
-bool executeRetry(VerdictRig& r, mx::Timing t, SendOp sendOp, SendFiller sendFiller, Resend resend) {
+bool executeRetry(VerdictRig& r, bool judgeFirst, bool pastWindow, SendOp sendOp, SendFiller sendFiller, Resend resend) {
     sendOp();
-    if (t == mx::Timing::RetryBeforeJudge) { resend(); return true; }
-    if (!r.driveUntilJudged()) return false;
-    if (t == mx::Timing::RetryAfterWindow) {   // 33 more writes push the batch out of the producer's window
+    if (judgeFirst && !r.driveUntilJudged()) return false;
+    if (pastWindow) {
         for (uint64_t i = 0; i < 33; ++i) sendFiller(i);
         if (!r.driveUntilJudged()) return false;
         r.settle(150);
     }
     resend();
-    r.settle(150);
+    if (judgeFirst) r.settle(150);
     return true;
 }
 

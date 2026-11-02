@@ -123,8 +123,13 @@ public:
     }
     /// The write spec is sent again with key.index set: an adoption of a live topic.
     void enableKeyIndex() {
+        requestKeyIndex();
+        passes(3);
+    }
+    /// The same, queued only: the next pass takes it, so a frame sent right after it meets the adoption before any change record is logged.
+    void requestKeyIndex() {
         keyIndexOn_ = true;
-        send(specOp_(true));
+        ASSERT_TRUE(worker->tryEnqueueOp(specOp_(true)));
     }
     /// Schema version 2 drops the source's v field: its SchemaUpdate (materialized as of 2) and its FilterSchema (the evolving blob).  Default key only.
     void dropValueField() {
