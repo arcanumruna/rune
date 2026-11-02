@@ -486,6 +486,16 @@ public:
         while (std::chrono::steady_clock::now() < deadline) { step(); std::this_thread::sleep_for(100us); }
         step();
     }
+    /// Pumps until the client has applied every frame already offered to the egress.
+    [[nodiscard]] bool drainEgress(std::chrono::milliseconds timeout = 20s) {
+        aeron::ExclusivePublication* pub = egress_->pub();
+        const int64_t target = pub->position();
+        return pumpUntil([&] {
+            bool caught = false;
+            sub_->forEachImage([&](const auto& im) { if (im->sessionId() == pub->sessionId() && im->position() >= target) caught = true; });
+            return caught;
+        }, timeout);
+    }
     /// Pumps until every member reached its target position, then runs a settle window so a stray frame shows up.
     [[nodiscard]] bool converge(const std::vector<Member>& ms, std::chrono::milliseconds timeout = 30s,
                                 std::chrono::milliseconds quiet = 40ms) {
