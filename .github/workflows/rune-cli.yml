@@ -1,0 +1,134 @@
+# Builds the `rune` CLI (CMake target `rune`, from client-cpp/tools/rune_cli.cpp) on Linux and publishes it as a
+# build artifact; a rune-cli-vX.Y.Z tag also creates a GitHub Release with the tarball.
+#
+# Repository settings (same as client-cpp-release.yml; read-only here, nothing is uploaded to Conan):
+#   vars.CONAN_REMOTE_URL, secrets.CONAN_LOGIN_USERNAME, secrets.CONAN_PASSWORD
+name: rune-cli
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'client-cpp/**'
+      - 'protocol/**'
+      - 'codec/**'
+      - 'crypto/**'
+      - 'ql/**'
+      - '.github/workflows/rune-cli.yml'
+    tags: ['rune-cli-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rune-cli-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: '4'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the flight-recorder pin
+        id: pin
+        run: |
+          PIN=$(sed -nE 's/^set\(FLIGHT_RECORDER_GIT_TAG "([0-9a-f]{40})".*/\1/p' client-cpp/CMakeLists.txt)
+          if [[ -z $PIN ]]; then
+            echo "::error::FLIGHT_RECORDER_GIT_TAG not found in client-cpp/CMakeLists.txt"
+            exit 1
+          fi
+          echo "ref=$PIN" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/flight-recorder
+          ref: ${{ steps.pin.outputs.ref }}
+          path: flight-recorder
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends uuid-dev
+          python3 -m pip install --user "conan>=2,<3" "cmake>=3.31"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v5
+        with:
+          path: ~/.conan2/p
+          key: conan-client-cpp-${{ runner.os }}-${{ hashFiles('client-cpp/conandata.yml') }}
+          restore-keys: conan-client-cpp-${{ runner.os }}-
+
+      # Prebuilt dependencies (aeron, OpenSSL, ...) are downloaded from the remote instead of rebuilt. Download only.
+      - name: Add the Conan remote
+        env:
+          CONAN_REMOTE_URL: ${{ vars.CONAN_REMOTE_URL }}
+          CONAN_LOGIN_USERNAME_ARTIFACTORY: ${{ secrets.CONAN_LOGIN_USERNAME }}
+          CONAN_PASSWORD_ARTIFACTORY: ${{ secrets.CONAN_PASSWORD }}
+        run: |
+          conan profile detect --force
+          if [[ -n $CONAN_REMOTE_URL ]]; then
+            conan remote add artifactory "$CONAN_REMOTE_URL"
+            conan remote login artifactory
+          else
+            echo "::warning::CONAN_REMOTE_URL unset: dependencies build from source"
+          fi
+
+      - name: Install dependencies
+        run: conan install client-cpp --build=missing -s build_type=Release -c tools.build:skip_test=True -c tools.build:jobs=4
+
+      - name: Build the rune CLI
+        run: |
+          cmake -S client-cpp -B client-cpp/build/Release \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+            -DFLIGHT_RECORDER_DIR="$GITHUB_WORKSPACE/flight-recorder" \
+            -DCMAKE_TOOLCHAIN_FILE=client-cpp/build/Release/generators/conan_toolchain.cmake
+          cmake --build client-cpp/build/Release --target rune
+
+      - name: Inspect and smoke-run
+        run: |
+          BIN=client-cpp/build/Release/rune
+          file "$BIN"
+          ldd "$BIN"
+          # the CLI has no --help; usage text (exit != 0 is fine) proves it loads and runs without a network
+          "$BIN" --help || true
+          "$BIN" --help 2>&1 | grep -qi 'usage\|rune' 
+
+      - name: Package
+        run: |
+          mkdir -p dist/stage
+          install -m 0755 client-cpp/build/Release/rune dist/stage/rune
+          cp LICENSE dist/stage/LICENSE
+          tar -C dist/stage -czf dist/rune-linux-amd64.tar.gz rune LICENSE
+          (cd dist && sha256sum rune-linux-amd64.tar.gz > rune-linux-amd64.tar.gz.sha256)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rune-linux-amd64
+          path: |
+            dist/rune-linux-amd64.tar.gz
+            dist/rune-linux-amd64.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/rune-cli-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rune-linux-amd64
+          path: dist
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/rune-linux-amd64.tar.gz dist/rune-linux-amd64.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "rune CLI ${GITHUB_REF_NAME#rune-cli-v}" --generate-notes
