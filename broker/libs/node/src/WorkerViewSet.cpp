@@ -790,6 +790,52 @@ void WorkerViewSet::installTestVerdictViewForTest(rune::view::CompiledViewPlan p
     tpl.testRule = rule;
 }
 
+void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
+    const auto ofTopic = [&](const auto& kv) { return static_cast<int32_t>(kv.first >> 32) == srcTopicId; };
+    std::erase_if(verdictSources_, ofTopic);
+    for (auto it = keyIndexes_.begin(); it != keyIndexes_.end();) {
+        if (!ofTopic(*it)) { ++it; continue; }
+        releaseMem_(it->second);
+        it = keyIndexes_.erase(it);
+    }
+}
+
+void WorkerViewSet::eraseKeyIndex_(uint64_t key) {
+    if (const auto it = keyIndexes_.find(key); it != keyIndexes_.end()) {
+        releaseMem_(it->second);
+        keyIndexes_.erase(it);
+    }
+}
+
+// Cold.  The key index is built over the source's latest schema; nullptr until the schema has landed on this worker, or when the
+// key cannot be indexed (the wire key is packed into 8 bytes).
+static const rune::codec::Descriptor* keyIndexSource(const TopicWriteSpec& spec) {
+    const rune::codec::Descriptor* src = spec.descriptorFor(spec.maxVersion());
+    if (src == nullptr || spec.keyWidth == 0 || spec.keyWidth > 8) return nullptr;
+    const bool hasKey = std::any_of(src->fields.begin(), src->fields.end(), [&](const auto& f) { return f.id == spec.keyFieldId; });
+    return hasKey ? src : nullptr;
+}
+
+static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src) {
+    ViewInstance inst(keyIndexPlan(srcTopicId, spec.keyFieldId), keyIndexRowLayout(), src, /*persist=*/false,
+                      partition, /*indexSlots=*/4096, kKeyIndexChunkBytes);
+    inst.maxRecordsPerPass = kKeyIndexReplayRecordsPerPass;
+    return inst;
+}
+
+// A new leadership starts from the local log: an instance carried over could hold what a follower-time compaction removed.
+void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen) {
+    const auto it = keyIndexes_.find(instKey(srcTopicId, partition));
+    if (it == keyIndexes_.end() || it->second.foldLeadership == leaderGen) return;   // already fresh for this leadership (the judge may be held)
+    const rune::codec::Descriptor* src = keyIndexSource(spec);
+    if (src == nullptr) return;
+    releaseMem_(it->second);
+    it->second = freshKeyIndex(srcTopicId, partition, spec, *src);
+    it->second.foldCursor = judge.logStart();
+    it->second.foldLeadership = leaderGen;
+    ++judge.statsMut().keyIndexRebuilds;
+}
+
 VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write) {
     const auto sit = subscriptionIndex_.find(srcTopicId);
     bool anyTemplate = false;
@@ -797,23 +843,31 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
         for (const int32_t id : sit->second) anyTemplate = anyTemplate || isVerdictTemplate_(id);
     const uint64_t key = instKey(srcTopicId, partition);
     auto vit = verdictSources_.find(key);
-    if (!anyTemplate && write.constraintSets.latest().empty()) {
+    if (!anyTemplate && !write.spec->keyIndex && write.constraintSets.latest().empty()) {
         if (vit == verdictSources_.end()) return nullptr;
         // The set was dropped: the judge stays until it has passed the drop and holds no member.
         if (vit->second->hasMembers() || vit->second->judgedThrough() <= write.constraintSets.lastChangeOffset()) return vit->second.get();
         write.verdicts = nullptr;
         verdictSources_.erase(vit);
+        eraseKeyIndex_(key);
         return nullptr;
     }
     if (vit == verdictSources_.end()) {
         auto v = std::make_unique<VerdictSource>(srcTopicId, partition);
         v->setViewHooks(VerdictViewHooks{this, &checkpointHook_, &discardHook_, &retiredHook_});
         v->setVerdictIntervalNs(verdictIntervalNs_);
+        v->holdJudgeForTest(holdJudges_);
         vit = verdictSources_.emplace(key, std::move(v)).first;
     }
     VerdictSource* judge = vit->second.get();
     judge->bindState(&write);
     write.verdicts = judge;
+    if (write.spec->keyIndex && !judge->hasMember(0, kKeyIndexPlanFingerprint)) {
+        if (const rune::codec::Descriptor* src = keyIndexSource(*write.spec)) {
+            ViewInstance& inst = keyIndexes_.try_emplace(key, freshKeyIndex(srcTopicId, partition, *write.spec, *src)).first->second;
+            judge->addVerdictView(&inst, rune::view::VerdictViewKind::KeyIndex, 0, kKeyIndexPlanFingerprint);
+        }
+    }
     if (sit == subscriptionIndex_.end()) return judge;
     for (const int32_t id : sit->second) {
         const ViewTemplate& tpl = templates_.at(id);
@@ -860,6 +914,8 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
             if (!present) want.push_back(ConstraintSetMember{tpl.verdictObjectId, tpl.verdictKind, tpl.verdictFingerprint});
         }
     }
+    if (write.spec->keyIndex && std::none_of(want.begin(), want.end(), [](const ConstraintSetMember& m) { return m.kind == rune::view::VerdictViewKind::KeyIndex; }))
+        want.push_back(ConstraintSetMember{0, rune::view::VerdictViewKind::KeyIndex, kKeyIndexPlanFingerprint});
     std::sort(want.begin(), want.end(), [](const ConstraintSetMember& a, const ConstraintSetMember& b) { return a.viewObjectId < b.viewObjectId; });
     ConstraintSet desired;
     desired.count = static_cast<uint8_t>(std::min(want.size(), desired.members.size()));
@@ -876,6 +932,10 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
 }
 
 int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {
+    if (const auto kit = keyIndexes_.find(instKey(srcTopicId, partition)); kit != keyIndexes_.end()) {
+        adoptNs_(kit->second, ns);
+        chargeMem_(kit->second);
+    }
     const auto sit = subscriptionIndex_.find(srcTopicId);
     if (sit == subscriptionIndex_.end()) return 0;
     for (const int32_t id : sit->second) {

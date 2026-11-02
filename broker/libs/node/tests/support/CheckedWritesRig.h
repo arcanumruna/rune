@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -55,16 +56,25 @@ inline std::filesystem::path rigTmpPath(const char* what) {
     return p;
 }
 
-inline rune::codec::Descriptor verdictSourceDescriptor() {
+/// The key field of the source topic: an integer type, or (FixedStr) a string of `fixedLen` bytes.
+struct KeyShape { rune::codec::PrimType type = rune::codec::PrimType::UInt64; uint16_t fixedLen = 0; };
+
+inline rune::codec::Descriptor keyedSourceDescriptor(const KeyShape& s) {
     using rune::codec::PrimType;
-    return rune::codec::DescriptorBuilder("t", 1).add("id", PrimType::UInt64, 1, true).add("v", PrimType::Int64).add("tag", PrimType::UInt16).build();
+    rune::codec::DescriptorBuilder b("t", 1);
+    if (s.type == PrimType::FixedStr) b.addFixedStr("id", s.fixedLen, 1, true);
+    else b.add("id", s.type, 1, true);
+    return b.add("v", PrimType::Int64).add("tag", PrimType::UInt16).build();
 }
 
-struct Rec { uint64_t id; int64_t v; uint8_t tag = 0; bool del = false; };   ///< del: a tombstone of `id` (empty value)
+inline rune::codec::Descriptor verdictSourceDescriptor() { return keyedSourceDescriptor(KeyShape{}); }
+
+/// del: a tombstone of `id` (empty value).  intent: the record's attribute bits 0-1 (0 upsert, 1 insert, 2 update / removeExisting).
+struct Rec { uint64_t id; int64_t v; uint8_t tag = 0; bool del = false; uint8_t intent = 0; };
 
 /// What a consumer received: one record of a delivered batch.
 inline constexpr uint16_t kTombstoneTag = 0xFFFF;   ///< Delivered::tag of a tombstone
-struct Delivered { int64_t offset; uint64_t id; uint16_t tag; };
+struct Delivered { int64_t offset; uint64_t id; uint16_t tag; uint8_t intent = 0; };
 enum class SubKind : uint8_t { Raw, Filtered, PushRead };   ///< Filtered: tag == 1
 
 class NullPartitionTransport final : public rune::replication::PartitionTransport {
@@ -96,25 +106,33 @@ public:
 
     void send(WorkerOp op) { ASSERT_TRUE(worker->tryEnqueueOp(std::move(op))); passes(3); }
     /// Types the topic (schema plus key facts) and sets the cluster feature level, so the partition gets a write state.
-    void typed(int16_t level = 5) {
-        WorkerOp l;
-        l.type = WorkerOp::Type::ClusterFeatureLevel; l.nextOffset = level;
-        send(std::move(l));
-        WorkerOp v;
-        v.type = WorkerOp::Type::SchemaUpdate; v.topicId = kSrc; v.clientVersion = 1;
-        v.schemaUpdateBlob = rune::codec::serialize(verdictSourceDescriptor());
-        send(std::move(v));
-        WorkerOp f;
-        f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = 1;
-        f.schemaUpdateBlob = rune::codec::serialize(verdictSourceDescriptor());
-        send(std::move(f));
-        TopicWriteSpecWire w;
-        w.topicId = kSrc; w.keyFieldId = 0; w.keyType = rune::codec::PrimType::UInt64; w.keyWidth = 8; w.legacyValidate = false;
-        WorkerOp s;
-        s.type = WorkerOp::Type::WriteSpecUpdate; s.topicId = kSrc;
-        s.schemaUpdateBlob.resize(kTopicWriteSpecWireLen);
-        ASSERT_EQ(encodeTopicWriteSpec(w, s.schemaUpdateBlob), kTopicWriteSpecWireLen);
-        send(std::move(s));
+    void typed(int16_t level = 5) { typedWith_(level, KeyShape{}, false); }
+    /// typed() for a source whose key is `s`, with the write spec's key.index flag `enabled`.  A restart brings the topic back the same way.
+    void createKeyIndex(KeyShape s = {}, bool enabled = true) {
+        keyShape_ = s;
+        keyIndexOn_ = enabled;
+        typedWith_(5, s, enabled);
+    }
+    /// The write spec is sent again with key.index set: an adoption of a live topic.
+    void enableKeyIndex() {
+        keyIndexOn_ = true;
+        send(specOp_(true));
+    }
+    /// The judges of this rig (created later ones too) do not run: nothing is activated, replayed or judged.
+    void holdJudge(bool on) {
+        holdJudge_ = on;
+        vs->holdJudgesForTest(on);
+    }
+    /// The ids in [0, 4096) the key index holds, as decimal strings; the table's size must be that many.
+    std::set<std::string> keyIndexKeys() {
+        std::set<std::string> out;
+        for (uint64_t id = 0; id < 4096; ++id) {
+            char key[8];
+            for (int i = 0; i < 8; ++i) key[i] = static_cast<char>(id >> (8 * i));
+            if (vs->keyIndexContainsForTest(kSrc, 0, std::string_view(key, 8))) out.insert(std::to_string(id));
+        }
+        EXPECT_EQ(out.size(), vs->keyIndexSizeForTest(kSrc, 0)) << "a key outside [0, 4096)";
+        return out;
     }
 
     /// A TestReject view (and the verdict template behind it) over the source.
@@ -143,7 +161,9 @@ public:
         installRejectView(newTopic, objectId, rule, "rej2");
     }
     /// A new Worker, view set and replica over the same log: a restart.  The views are re-installed unless `reinstall` is false.
-    void restart(bool reinstall = true, int64_t cutTo = -1) {
+    /// `specDelayPasses`: the write spec carrying key.index reaches the worker that many passes after restart() returns; until then the
+    /// topic is typed without it (the leader scan restores the logged set from the log).
+    void restart(bool reinstall = true, int64_t cutTo = -1, int specDelayPasses = 0) {
         worker.reset();
         vs.reset();
         replica.reset();
@@ -151,11 +171,13 @@ public:
         log.reset();
         epoch_ = 1;   // the new replica starts at epoch 1
         vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
+        vs->holdJudgesForTest(holdJudge_);
         open();
-        typed();
+        typedWith_(5, keyShape_, keyIndexOn_ && specDelayPasses == 0);
         recovering_ = true;
         if (reinstall) reinstallAll();
         passes(3);
+        delayedSpecIn_ = keyIndexOn_ ? specDelayPasses : 0;
     }
     /// The follower (node 2) fetches everything, or up to `to`: the HW moves there.
     void followerFetch(int64_t to = -1) {
@@ -210,6 +232,33 @@ public:
     }
 
 private:
+    [[nodiscard]] WorkerOp specOp_(bool keyIndex) const {
+        TopicWriteSpecWire w;
+        w.topicId = kSrc; w.keyFieldId = 0; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
+        const auto d = keyedSourceDescriptor(keyShape_);
+        w.keyWidth = static_cast<uint8_t>(rune::codec::fieldWidth(d.fields[0]));
+        WorkerOp s;
+        s.type = WorkerOp::Type::WriteSpecUpdate; s.topicId = kSrc;
+        s.schemaUpdateBlob.resize(kTopicWriteSpecWireLen);
+        EXPECT_EQ(encodeTopicWriteSpec(w, s.schemaUpdateBlob), kTopicWriteSpecWireLen);
+        return s;
+    }
+    void typedWith_(int16_t level, const KeyShape& shape, bool keyIndex) {
+        keyShape_ = shape;
+        WorkerOp l;
+        l.type = WorkerOp::Type::ClusterFeatureLevel; l.nextOffset = level;
+        send(std::move(l));
+        const auto blob = rune::codec::serialize(keyedSourceDescriptor(shape));
+        WorkerOp v;
+        v.type = WorkerOp::Type::SchemaUpdate; v.topicId = kSrc; v.clientVersion = 1;
+        v.schemaUpdateBlob = blob;
+        send(std::move(v));
+        WorkerOp f;
+        f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = 1;
+        f.schemaUpdateBlob = blob;
+        send(std::move(f));
+        send(specOp_(keyIndex));
+    }
     void installRejectViewNow_(int32_t viewTopicId, uint64_t objectId, TestRejectRule rule, const char* name, bool persisted) {
         const auto src = verdictSourceDescriptor();
         rune::view::ViewPlan v;
@@ -256,13 +305,13 @@ public:
         for (const auto& r : recs) {
             std::vector<uint8_t> key(8), val;
             for (int i = 0; i < 8; ++i) key[static_cast<std::size_t>(i)] = static_cast<uint8_t>(r.id >> (8 * i));
-            if (r.del) { b.append({reinterpret_cast<const char*>(key.data()), key.size()}, {}, 1000); continue; }
+            if (r.del) { b.append({reinterpret_cast<const char*>(key.data()), key.size()}, {}, 1000, r.intent); continue; }
             const auto le16 = [&](uint16_t x) { val.push_back(uint8_t(x)); val.push_back(uint8_t(x >> 8)); };
             le16(18); le16(1);
             for (int i = 0; i < 8; ++i) val.push_back(static_cast<uint8_t>(r.id >> (8 * i)));
             for (int i = 0; i < 8; ++i) val.push_back(static_cast<uint8_t>(uint64_t(r.v) >> (8 * i)));
             le16(r.tag);
-            b.append({reinterpret_cast<const char*>(key.data()), key.size()}, {reinterpret_cast<const char*>(val.data()), val.size()}, 1000);
+            b.append({reinterpret_cast<const char*>(key.data()), key.size()}, {reinterpret_cast<const char*>(val.data()), val.size()}, 1000, r.intent);
         }
         return b.build();
     }
@@ -271,6 +320,7 @@ public:
     int pass() {
         now += 1'000'000;
         ++passNo_;
+        if (delayedSpecIn_ > 0 && --delayedSpecIn_ == 0) EXPECT_TRUE(worker->tryEnqueueOp(specOp_(true)));
         pumpAeron_();
         const int work = worker->doWork(now);
         pumpAeron_();
@@ -279,7 +329,11 @@ public:
             if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
         }, [](const TxnReturn&) {});
         if (agent) (void)agent->doWork(now);
-        else channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, OneToOneByteRing::index_t, OneToOneByteRing::index_t) {});
+        else channel.deltas.drain([this](int32_t, aeron::concurrent::AtomicBuffer& buf, OneToOneByteRing::index_t off, OneToOneByteRing::index_t) {
+            int32_t viewTopicId;
+            std::memcpy(&viewTopicId, buf.buffer() + off, 4);
+            deltaViewIds.push_back(viewTopicId);
+        });
         return work;
     }
     void passes(int n) { for (int i = 0; i < n; ++i) pass(); }
@@ -526,7 +580,7 @@ public:
     }
 
     // ---- the log, read back ----
-    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; };
+    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; };
     struct RigChange { int64_t offset; std::vector<rune::storage::control_record::ChangeMember> members; };
     struct RigMarker { int64_t offset; rune::storage::control_record::MarkerHeader header; std::vector<std::tuple<int64_t, uint16_t, uint32_t>> entries; bool horizon = false; };
     struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; };
@@ -637,6 +691,7 @@ public:
     std::unique_ptr<Worker> worker;
     int64_t now = 0, corr = 0;
     std::vector<int16_t> produceAnswers;
+    std::vector<int32_t> deltaViewIds;   ///< the view topic of every checkpoint frame the worker pushed (only without a persisted view's agent)
 
 private:
     void pumpAeron_() {
@@ -665,12 +720,12 @@ private:
                 uint64_t id = 0;
                 if (rs.value.empty()) {   // a tombstone: the key carries the id
                     for (int i = 0; i < 8; ++i) id |= uint64_t(uint8_t(rs.key[static_cast<std::size_t>(i)])) << (8 * i);
-                    box.records.push_back(Delivered{rs.offset, id, kTombstoneTag});
+                    box.records.push_back(Delivered{rs.offset, id, kTombstoneTag, static_cast<uint8_t>(rs.attributes & 0x03)});
                     return;
                 }
                 const auto* v = reinterpret_cast<const uint8_t*>(rs.value.data());
                 for (int i = 0; i < 8; ++i) id |= uint64_t(v[4 + i]) << (8 * i);
-                box.records.push_back(Delivered{rs.offset, id, static_cast<uint16_t>(v[20] | (v[21] << 8))});
+                box.records.push_back(Delivered{rs.offset, id, static_cast<uint16_t>(v[20] | (v[21] << 8)), static_cast<uint8_t>(rs.attributes & 0x03)});
             });
             pos += static_cast<std::size_t>(total);
         }
@@ -782,6 +837,9 @@ private:
     std::vector<std::pair<int32_t, std::function<void()>>> installs_;   ///< (view topic, install): replayed by a restart
     int64_t epoch_ = 1;
     bool recovering_ = false;   ///< the views of a restarted node load their checkpoints
+    KeyShape keyShape_;
+    bool keyIndexOn_ = false, holdJudge_ = false;
+    int delayedSpecIn_ = 0;
     std::filesystem::path viewDir_, logDir_;
     NullPartitionTransport transport_;
 };
@@ -812,11 +870,12 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
                     if (rs.offset >= through) return;
                     uint64_t id = 0;
                     for (int i = 0; i < 8; ++i) id |= uint64_t(uint8_t(rs.key[static_cast<std::size_t>(i)])) << (8 * i);
-                    if (rs.value.empty()) { out.data.push_back({rs.offset, id, 0, 0, true}); return; }
+                    const auto intent = static_cast<uint8_t>(rs.attributes & 0x03);
+                    if (rs.value.empty()) { out.data.push_back({rs.offset, id, 0, 0, true, intent}); return; }
                     const auto* val = reinterpret_cast<const uint8_t*>(rs.value.data());
                     uint64_t x = 0;
                     for (int i = 0; i < 8; ++i) x |= uint64_t(val[12 + i]) << (8 * i);
-                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[20]), false});
+                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[20]), false, intent});
                 });
             } else if (r.baseOffset() < through) {
                 const int t = crl::recordType(b, total);

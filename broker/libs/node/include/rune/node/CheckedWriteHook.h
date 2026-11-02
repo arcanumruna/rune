@@ -38,11 +38,15 @@ struct TopicHookFacts {
     bool autoIncrement     = false;
     bool constrainedSource = false;
     bool verdictSource     = false;
+    bool keyIndexActive    = false;   ///< the partition's logged constraint set has the key index as member 0 (P5-4)
 };
 [[nodiscard]] inline TopicHookFacts topicHookFactsOf(const PartitionWriteState& state) noexcept {
     TopicHookFacts f;
+    f.keyIndex          = state.spec->keyIndex;
     f.verdictSource     = state.isVerdictSource();
     f.constrainedSource = state.isConstrainedSource();
+    const ConstraintSet& logged = state.constraintSets.latest();
+    f.keyIndexActive    = logged.count > 0 && logged.members[0].kind == rune::view::VerdictViewKind::KeyIndex;
     return f;
 }
 
@@ -60,7 +64,7 @@ enum class HookRefusal : uint8_t {
     None, ReservedBits, ValidationFailed, VersionAhead, LegacyMode, LevelTooLow, NoKeyIndex,
     ExplicitKeyNeedsIdempotentAndView, IntentInTxnOrAtomicBatch, TxnOnConstrainedSource,
     KeyZeroCreateNeedsIdempotentAll, KeyZeroCreateNeedsView, MixedKeyZeroBatch, ViewBatchTooLarge,
-    ViewWithoutReplica, Count_
+    ViewWithoutReplica, KeyIndexActivating, Count_
 };
 
 struct RequirementVerdict {
@@ -88,6 +92,7 @@ struct RequirementVerdict {
         if (t.constrainedSource && !view) return refuse(HookRefusal::KeyZeroCreateNeedsView);
     }
     if (view && b.records > kMaxJudgedBatchRecords && t.verdictSource) return refuse(HookRefusal::ViewBatchTooLarge);
+    if (b.anyIntent && !t.keyIndexActive) return {ErrorCode::NotLeader, HookRefusal::KeyIndexActivating};   // P5-4: never applied unjudged; after every definite refusal
     return {};
 }
 

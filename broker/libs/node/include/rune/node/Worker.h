@@ -2789,6 +2789,7 @@ private:
             break;
         case WorkerOp::Type::TopicDropped:
             markTopicDropped_(op.topicId());
+            if (viewSet_ != nullptr) viewSet_->dropSourceTopic(op.topicId());
             dropWriteSpec_(op.topicId());
             break;
         case WorkerOp::Type::NsSlotAssign:
@@ -3360,6 +3361,7 @@ private:
             return;
         }
         TopicWriteSpec& spec = writeSpecOf_(w->topicId);
+        if (viewSet_ != nullptr && spec.keyIndex != w->keyIndex) viewSet_->noteWriteSpecChange();
         spec.setFacts(*w);
         if (w->keyFieldId != kNoKeyField && w->keyWidth == 0)
             spdlog::warn("Worker {}: topic {} key field cannot be a topic key; wire-key check skipped (pre-existing topic)",
@@ -7005,7 +7007,7 @@ private:
             // partition no installed view is interested in.
             if (!viewSet_->interestedIn(topicId)) {
                 const PartitionWriteState* w = writeOf_(replica);
-                if (w == nullptr || w->constraintSets.latest().empty()) continue;   // a verdict source without its views still judges nothing, but is driven (it waits)
+                if (w == nullptr || (w->constraintSets.latest().empty() && !w->spec->keyIndex)) continue;   // a verdict source without its views still judges nothing, but is driven (it waits); a key index needs no view
             }
             if (replica->role() != rune::replication::Role::Leader) continue;
             const RcState* rcState = rcServe_(replica, rcOf_(replica));

@@ -84,6 +84,7 @@ public:
     }
     [[nodiscard]] bool waitingForInstall() const noexcept { return waitingForInstall_; }
     [[nodiscard]] bool activationPending() const noexcept { return needsActivation_; }
+    [[nodiscard]] int64_t logStart() const noexcept { return logStart_; }
 
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);
     void removeVerdictView(int32_t viewTopicId);

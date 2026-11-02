@@ -596,8 +596,10 @@ TEST(CheckedWritesVerdictSourceRegression, RetireIsPerPartitionRegression) {
     vs.installTestVerdictViewForTest(comp.plan, comp.rowLayout, src, false, kObject, rule);
 
     Log log[2];
+    TopicWriteSpec spec;
     PartitionWriteState st[2];
     for (int p = 0; p < 2; ++p) {
+        st[p].spec = &spec;
         log[p].control();                                                             // 0: the set
         std::vector<Rec> a, b;
         for (int i = 1; i <= 9; ++i) a.push_back({i, i == 3 ? 9 : 1});
@@ -640,7 +642,9 @@ TEST(CheckedWritesVerdictSourceRegression, RetiringMemberDoesNotHoldViewAcksRegr
     constexpr int32_t kViewTopic = 0x40000001;
     auto comp = rune::view::compileView(tagView(), srcs, kViewTopic).value();
     vs.installTestVerdictViewForTest(comp.plan, comp.rowLayout, src, false, 7, rule);
+    TopicWriteSpec spec;
     PartitionWriteState st;
+    st.spec = &spec;
     st.constraintSets.onChange(0, setOf(1, {{7, rule.fingerprint()}}));
     vs.ensureVerdictSource(5, 0, st)->bindLeader(nullptr, 1, 0);
     ASSERT_EQ(vs.minFoldCursor(5, 0), 0) << "the verdict view has not folded";
@@ -661,7 +665,9 @@ TEST(CheckedWritesVerdictSourceRegression, ConstraintSetIsReconciledOnlyOnAChang
     auto comp = rune::view::compileView(tagView(), srcs, kViewTopic).value();
     vs.installTestVerdictViewForTest(comp.plan, comp.rowLayout, src, false, 7, tagEquals(9));
     Log log;
+    TopicWriteSpec spec;
     PartitionWriteState st;
+    st.spec = &spec;
     const auto drive = [&] {
         auto readRange = [&](int64_t from, int64_t) { return log.read(from); };
         vs.driveFolds(5, 0, readRange, log.next, rune::view::kNoSkip, 200'000'000, nullptr, 1, true, {}, &st, vs.ensureVerdictSource(5, 0, st));

@@ -255,6 +255,7 @@ public:
             viewSkip.rejected = &write->rejected;
             if (judge != nullptr) {
                 work += syncConstraintSet_(srcTopicId, *judge, *write);
+                if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
                 work += judge->driveJudge(readRange, bound, nowNs, *write, skip.aborted);
                 viewBound = std::min(bound, judge->judgedThrough());
                 work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns);
@@ -284,7 +285,10 @@ public:
     /// members.  nullptr when the partition is not a verdict source.  Cheap when nothing changed.
     VerdictSource* ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write);
     /// The partition's write state is gone: its judge goes with it.
-    void dropVerdictSource(int32_t srcTopicId, int32_t partition) { verdictSources_.erase(instKey(srcTopicId, partition)); }
+    void dropVerdictSource(int32_t srcTopicId, int32_t partition) {
+        verdictSources_.erase(instKey(srcTopicId, partition));
+        eraseKeyIndex_(instKey(srcTopicId, partition));
+    }
     [[nodiscard]] std::vector<uint64_t> verdictSourceKeysForTest() const {
         std::vector<uint64_t> keys;
         for (const auto& kv : verdictSources_) keys.push_back(kv.first);
@@ -294,6 +298,28 @@ public:
     void setVerdictIntervalNs(int64_t ns) noexcept {
         verdictIntervalNs_ = ns;
         for (auto& kv : verdictSources_) kv.second->setVerdictIntervalNs(ns);
+    }
+    /// Cold: the source topic is gone; its judges and key indexes go with it.
+    void dropSourceTopic(int32_t srcTopicId);
+    /// Cold: a topic's write spec changed key.index, so syncConstraintSet_ must run again.
+    void noteWriteSpecChange() noexcept { ++verdictEpoch_; }
+    /// Test seam: every judge, existing and later created, is held (nothing activates, replays or judges).
+    void holdJudgesForTest(bool hold) noexcept {
+        holdJudges_ = hold;
+        for (auto& kv : verdictSources_) kv.second->holdJudgeForTest(hold);
+    }
+    [[nodiscard]] bool keyIndexContainsForTest(int32_t src, int32_t partition, std::string_view wireKey) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it != keyIndexes_.end() && it->second.table.get(keyIndexWord(wireKey)) != nullptr;
+    }
+    [[nodiscard]] std::size_t keyIndexSizeForTest(int32_t src, int32_t partition) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? 0 : it->second.table.size();
+    }
+    /// -1: the partition has no key index.
+    [[nodiscard]] int64_t keyIndexFoldCursorForTest(int32_t src, int32_t partition) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? -1 : it->second.foldCursor;
     }
     /// Test seam: a TestReject verdict view (viewObjectId, rule) over the source of `plan`.
     void installTestVerdictViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout, rune::codec::Descriptor src,
@@ -526,6 +552,8 @@ private:
     }
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
     int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
+    void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
+    void eraseKeyIndex_(uint64_t key);
     int finishRetired_();
     int pushVerdictCheckpoint_(ViewInstance& inst);
     void discardVerdictInstance_(ViewInstance& inst);
@@ -538,6 +566,10 @@ private:
     }
 
     std::unordered_map<uint64_t, std::unique_ptr<VerdictSource>> verdictSources_;   // (srcTopicId, partition) -> judge
+    // The key index of a key.index partition: a verdict member of its judge that is in neither views_ nor templates_.  Rebuilt from the
+    // local log at every activation; never persisted.  unordered_map keeps the node's address across the move-assign that rebuilds it.
+    std::unordered_map<uint64_t, ViewInstance> keyIndexes_;
+    bool holdJudges_ = false;
     struct Retired { int32_t viewTopicId, partition; };
     uint64_t verdictEpoch_ = 0;   // bumped by every verdict template install, retire and erase; syncConstraintSet_ reruns on a change
     std::vector<Retired> retiredQueue_;   // the members the judges dropped, per partition
