@@ -1520,6 +1520,17 @@ rune::protocol::client::DdlExtension Client::ddlExt_(const DdlOptions& ddl) cons
 }
 
 namespace {
+// SD11: a DefineTopic that carries key features cannot go to a broker below v10 (it could not decode the trailer).
+// `brokerVersion` 0 = unknown: sent.
+bool defineKeyFeaturesTooOld(std::span<const uint8_t> frame, int32_t brokerVersion) {
+    namespace rpc = rune::protocol::client;
+    if (brokerVersion < 1 || brokerVersion >= rpc::kBrokerVersionCheckedWrites) return false;
+    const auto d = rpc::DefineTopic::decode(frame.data(), frame.size());
+    return d && d->hasKeyFeatures;
+}
+}  // namespace
+
+namespace {
 // Review M2: where the requestId of an encoded DDL frame of `op` sits, found by
 // DECODING the frame (the decoded clientName view ends right before it) — the
 // check on the encoder's extOffset() before the duty thread stamps there.
@@ -1842,9 +1853,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     if (h.op == OpKind::DefineTopic) {
         if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) {
             p.topicName = std::string(d->topicName);
-            // SD11: a broker below v10 cannot decode the key-features trailer; the op fails here, nothing is sent.
-            if (const int32_t v = agent_.sessionBrokerVersion(0);
-                d->hasKeyFeatures && v >= 1 && v < rpc::kBrokerVersionCheckedWrites) {
+            if (defineKeyFeaturesTooOld(frame, agent_.sessionBrokerVersion(0))) {
                 completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
                 return;
             }
@@ -1971,6 +1980,13 @@ int Client::driveAwaitingSeed_() {
         if (terminal) {
             PendingCtl dead = takeCtl_(i);
             completeCtl_(dead, OpStatus::NotConnected);
+            ++work;
+            continue;
+        }
+        if (pendingCtl_[i].op == OpKind::DefineTopic &&
+            defineKeyFeaturesTooOld(a->frame, agent_.sessionBrokerVersion(0))) {
+            PendingCtl dead = takeCtl_(i);
+            completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
             ++work;
             continue;
         }
@@ -2325,6 +2341,12 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
             heldRedirects   = hld->redirects;
             heldBudgetEndNs = hld->budgetEndNs;
         } else if (!std::holds_alternative<DdlUnsentOnSeed>(d->retry)) { ++i; continue; }
+        if (p.op == OpKind::DefineTopic && defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0))) {
+            PendingCtl dead = takeCtl_(i);   // queued before the seed connected: the version is known now
+            completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
+            ++work;
+            continue;
+        }
         switch (offerDdl_(*d, nowNs, sentOn)) {
         case Offer::Accepted:
             setDdlRetry_(*d, DdlSent{heldRedirects, sentOn});

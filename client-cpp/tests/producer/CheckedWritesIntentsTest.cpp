@@ -92,22 +92,40 @@ struct Bare {
     }
 };
 
-// The wall-clock fields of a produce frame (batch CRC, base / max timestamp, every record's timestamp delta) are zeroed:
-// two captures of the same sends differ only there.
+// A zigzag varint at f[pos], pos advanced.
+int64_t readZigzag(const std::vector<uint8_t>& f, std::size_t& pos) {
+    uint64_t v = 0;
+    for (int shift = 0;; shift += 7) {
+        const uint8_t b = f[pos++];
+        v |= static_cast<uint64_t>(b & 0x7f) << shift;
+        if ((b & 0x80) == 0) break;
+    }
+    return static_cast<int64_t>(v >> 1) ^ -static_cast<int64_t>(v & 1);
+}
+
+// A produce frame without its wall-clock content, whatever the varint widths: the batch length fields, CRC and
+// base / max timestamps are zeroed, and each record is reduced to attributes + the bytes after its timestamp delta.
 std::vector<uint8_t> withoutClock(std::vector<uint8_t> f) {
     const auto v = rc::codec::decodeProduce(f.data(), f.size());
     EXPECT_TRUE(v.has_value());
     if (!v) return f;
     const std::size_t batch = static_cast<std::size_t>(v->recordBatch.data() - f.data());
-    for (std::size_t i = 17; i < 21; ++i) f[batch + i] = 0;   // crc
-    for (std::size_t i = 27; i < 43; ++i) f[batch + i] = 0;   // base + max timestamp
-    std::size_t pos = batch + 61;                               // the first record
-    for (int32_t i = 0; i < v->recordBatch.size() && pos < f.size() && i < 4; ++i) {
-        const std::size_t len = f[pos] >> 1;                    // zigzag varint, a single byte for these records
-        f[pos + 2] = 0;                                         // attributes at +1, timestamp delta at +2
-        pos += 1 + len;
+    for (std::size_t i = batch - 4; i < batch; ++i) f[i] = 0;        // the batch's length in the produce frame
+    for (std::size_t i = 8; i < 12; ++i) f[batch + i] = 0;           // batchLength
+    for (std::size_t i = 17; i < 21; ++i) f[batch + i] = 0;          // crc
+    for (std::size_t i = 27; i < 43; ++i) f[batch + i] = 0;          // base + max timestamp
+    const int32_t records = static_cast<int32_t>(f[batch + 57]) | (f[batch + 58] << 8) | (f[batch + 59] << 16) | (f[batch + 60] << 24);
+    std::vector<uint8_t> out(f.begin(), f.begin() + static_cast<std::ptrdiff_t>(batch + 61));
+    std::size_t pos = batch + 61;
+    for (int32_t i = 0; i < records; ++i) {
+        const int64_t len = readZigzag(f, pos);
+        const std::size_t end = pos + static_cast<std::size_t>(len);
+        out.push_back(f[pos++]);                                     // attributes
+        (void)readZigzag(f, pos);                                    // timestamp delta
+        out.insert(out.end(), f.begin() + static_cast<std::ptrdiff_t>(pos), f.begin() + static_cast<std::ptrdiff_t>(end));
+        pos = end;
     }
-    return f;
+    return out;
 }
 
 // The first frame of ProducerImpl::submitSendRecord(1, 0, Key(k), kVal ({} for k = 3), false, 0) for k = 1..4 on an
@@ -243,39 +261,50 @@ TEST(CheckedWritesIntents, UpsertFramesAreByteIdenticalRegression) {
     EXPECT_EQ(withoutClock(plain), withoutClock(kGoldenUpsertFrame));
 }
 
+namespace {
+struct RefusalCase {
+    const char* name;
+    Acks        acks;
+    bool        transactional;
+    TopicKind   kind;
+    WriteIntent intent;
+    bool        emptyValue;
+    const char* text;
+};
+const RefusalCase kRefusalCases[] = {
+    {"insert on a raw handle", Acks::All | Acks::View, false, TopicKind::Raw, WriteIntent::Insert, false, "intents need a typed topic"},
+    {"update without View", Acks::All, false, TopicKind::Typed, WriteIntent::Update, false, "intents need acks including View"},
+    {"upsert with View on a raw handle", Acks::All | Acks::View, false, TopicKind::Raw, WriteIntent::Upsert, false, "acks View needs a typed topic"},
+    {"insert in a transaction", Acks::All | Acks::View, true, TopicKind::Typed, WriteIntent::Insert, false, "intents inside a transaction need Part G"},
+    {"insert without a value", Acks::All | Acks::View, false, TopicKind::Typed, WriteIntent::Insert, true, "an insert needs a value"},
+};
+std::span<const uint8_t> valueOf(const RefusalCase& c) {
+    return c.emptyValue ? std::span<const uint8_t>(kNoValue) : std::span<const uint8_t>(kVal);
+}
+template <class Fn>
+void expectRefusal(const RefusalCase& c, Fn&& blockingSend) {
+    try {
+        blockingSend();
+        ADD_FAILURE() << "send did not throw";
+    } catch (const std::invalid_argument& e) {
+        EXPECT_NE(std::string(e.what()).find(c.text), std::string::npos) << e.what();
+    }
+}
+}  // namespace
+
 TEST(CheckedWritesIntents, LocalRefusalsAreWriteNotAllowed) {
-    struct Case {
-        const char* name;
-        Acks        acks;
-        bool        transactional;
-        TopicKind   kind;
-        WriteIntent intent;
-        bool        emptyValue;
-        const char* text;
-    };
-    const Case cases[] = {
-        {"insert on a raw handle", Acks::All | Acks::View, false, TopicKind::Raw, WriteIntent::Insert, false, "intents need a typed topic"},
-        {"update without View", Acks::All, false, TopicKind::Typed, WriteIntent::Update, false, "intents need acks including View"},
-        {"upsert with View on a raw handle", Acks::All | Acks::View, false, TopicKind::Raw, WriteIntent::Upsert, false, "acks View needs a typed topic"},
-        {"insert in a transaction", Acks::All | Acks::View, true, TopicKind::Typed, WriteIntent::Insert, false, "intents inside a transaction need Part G"},
-        {"insert without a value", Acks::All | Acks::View, false, TopicKind::Typed, WriteIntent::Insert, true, "an insert needs a value"},
-    };
-    for (const Case& c : cases) {
+    for (const RefusalCase& c : kRefusalCases) {
         SCOPED_TRACE(c.name);
         Bare b(cfgOf(c.acks, c.transactional));
         const TopicHandle topic{3, 1, c.kind};
-        const std::span<const uint8_t> value = c.emptyValue ? std::span<const uint8_t>(kNoValue) : std::span<const uint8_t>(kVal);
+        const auto value = valueOf(c);
         EXPECT_EQ(b.p.trySend(topic, Key(uint64_t{1}), value, c.intent), SendResult::WriteNotAllowed);
         EXPECT_EQ(b.p.trySendTo(topic, 0, Key(uint64_t{1}), value, c.intent), SendResult::WriteNotAllowed);
         test_support::AckLedger ledger;
         ledger.attach(b.p);
         EXPECT_EQ(b.p.trySend(topic, Key(uint64_t{1}), value, rc::AckToken{1}, c.intent), SendResult::WriteNotAllowed);
-        try {
-            b.p.send(topic, Key(uint64_t{1}), value, c.intent);
-            ADD_FAILURE() << "send did not throw";
-        } catch (const std::invalid_argument& e) {
-            EXPECT_NE(std::string(e.what()).find(c.text), std::string::npos) << e.what();
-        }
+        expectRefusal(c, [&] { b.p.send(topic, Key(uint64_t{1}), value, c.intent); });
+        expectRefusal(c, [&] { b.p.send(topic, Key(uint64_t{1}), value, rc::AckToken{1}, c.intent); });
         b.pump();
         EXPECT_TRUE(b.cap.frames.empty()) << "nothing is queued";
         EXPECT_TRUE(ledger.recs.empty()) << "no completion follows";
@@ -283,17 +312,28 @@ TEST(CheckedWritesIntents, LocalRefusalsAreWriteNotAllowed) {
 }
 
 TEST(CheckedWritesIntents, RefusalsLeaveTheCompletionsQueueAlone) {
-    rc::ClientConfig cc = invokerCfg(4631, 4632);
-    rc::Client       client(cc);
-    rc::Producer     p = client.producer(cfgOf(Acks::All | Acks::View));
-    rc::Completions  cq(client);
-    const TopicHandle raw{3, 1, TopicKind::Raw};
-    EXPECT_EQ(p.trySend(raw, Key(uint64_t{1}), kVal, cq, 1, WriteIntent::Insert), SendResult::WriteNotAllowed);
-    EXPECT_THROW(p.send(raw, Key(uint64_t{1}), kVal, cq, 1, WriteIntent::Insert), std::invalid_argument);
-    for (int i = 0; i < 100; ++i) client.doWork();
-    int polled = 0;
-    cq.poll([&](const rc::Completion&, std::span<const uint8_t>) { ++polled; });
-    EXPECT_EQ(polled, 0);
+    rc::Client client(invokerCfg(4631, 4632));
+    for (const RefusalCase& c : kRefusalCases) {
+        SCOPED_TRACE(c.name);
+        rc::Producer    p = client.producer(cfgOf(c.acks, c.transactional));
+        rc::Completions cq(client);
+        const TopicHandle topic{3, 1, c.kind};
+        const auto value = valueOf(c);
+        EXPECT_EQ(p.trySend(topic, Key(uint64_t{1}), value, cq, 1, c.intent), SendResult::WriteNotAllowed);
+        expectRefusal(c, [&] { p.send(topic, Key(uint64_t{1}), value, cq, 1, c.intent); });
+        expectRefusal(c, [&] { p.send(topic, Key(uint64_t{1}), value, rc::AckToken{1}, c.intent); });
+        for (int i = 0; i < 50; ++i) client.doWork();
+        int polled = 0;
+        cq.poll([&](const rc::Completion&, std::span<const uint8_t>) { ++polled; });
+        EXPECT_EQ(polled, 0);
+    }
+}
+
+TEST(CheckedWritesIntents, ViewUpsertOnAnUnknownHandleIsUnchecked) {
+    Bare b(cfgOf(Acks::All | Acks::View));
+    EXPECT_EQ(b.p.trySend(TopicHandle{3, 1, TopicKind::Unknown}, Key(uint64_t{1}), kVal), SendResult::Ok);
+    b.pump();
+    EXPECT_EQ(b.cap.frames.size(), 1u);
 }
 
 TEST(CheckedWritesIntents, UpsertOnARawHandleIsUnchecked) {
@@ -419,4 +459,25 @@ TEST(CheckedWritesIntents, DefineSendsKeyFeaturesOnlyWhenSet) {
         EXPECT_EQ(defineWith(rpc::kBrokerVersionCheckedWrites - 1, 4639, indexed, &d, &sent), OpStatus::BrokerTooOld);
         EXPECT_EQ(sent, 0u) << "nothing is sent to a broker that cannot decode the trailer";
     }
+}
+
+TEST(CheckedWritesIntents, DefineQueuedBeforeTheSeedConnectsIsBrokerTooOld) {
+    namespace pc = rune::protocol::client;
+    Rig r(invokerCfg(4641, 4642));
+    r.gw.advertisedBrokerVersion = rpc::kBrokerVersionCheckedWrites - 1;
+    int sent = 0;
+    r.gw.templateHandlers[pc::DefineTopic::TEMPLATE_ID] = [&](int, const uint8_t*, std::size_t) { ++sent; };
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    test_support::TestCq cq(*r.client);
+    auto connect = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client->connect(q, t); });
+    rc::TopicOptions indexed;
+    indexed.keyFeatures.keyIndex = true;
+    auto define = cq.issue([&](rc::Completions& q, rc::Token t) {   // issued before the seed answered the connect
+        return r.client->defineTopic("t", 1, "", {}, rc::Persistence::Disk, indexed, {}, q, t);
+    });
+    ASSERT_TRUE(define.accepted());
+    ASSERT_TRUE(r.drive([&] { return define.ready(); }));
+    EXPECT_EQ(define.status(), OpStatus::BrokerTooOld);
+    EXPECT_EQ(sent, 0);
+    ASSERT_TRUE(r.drive([&] { return connect.ready(); }));
 }

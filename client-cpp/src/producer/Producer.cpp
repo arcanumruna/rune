@@ -57,17 +57,18 @@ ProducerConfig ProducerConfig::fromEnv() noexcept {
 }
 
 Producer::Producer(producer::ProducerImpl* impl) noexcept
-    : impl_(impl)
+    : impl_(impl), viewByte_(impl != nullptr && impl->viewAcks())
 {}
 
 Producer::Producer(Producer&& o) noexcept
-    : impl_(std::exchange(o.impl_, nullptr))
+    : impl_(std::exchange(o.impl_, nullptr)), viewByte_(o.viewByte_)
 {}
 
 Producer& Producer::operator=(Producer&& o) noexcept {
     if (this != &o) {
         release_();  // the current producer: closeImmediately + released
         impl_ = std::exchange(o.impl_, nullptr);
+        viewByte_ = o.viewByte_;
     }
     return *this;
 }
@@ -157,7 +158,7 @@ const char* Producer::intentRefusal_(TopicHandle topic, std::span<const uint8_t>
 SendResult Producer::trySendPart_(TopicHandle topic, int32_t part, const Key& key,
                                   std::span<const uint8_t> value, WriteIntent intent) noexcept {
     producer::ProducerImpl* impl = impl_;
-    if (intent != WriteIntent::Upsert || (impl->viewAcks() && topic.kind == TopicKind::Raw)) [[unlikely]] {
+    if (needsIntentCheck_(topic, intent)) [[unlikely]] {
         if (intentRefusal_(topic, value, intent) != nullptr) return SendResult::WriteNotAllowed;
     }
     Completions* bq = impl->batchAckCq();
@@ -211,7 +212,7 @@ void Producer::sendTo(TopicHandle topic, int32_t part, const Key& key, std::span
     if (part < 0 || part >= topic.partitionCount) {
         throw std::invalid_argument("Producer::sendTo: partition out of range");
     }
-    if (intent != WriteIntent::Upsert || (impl_->viewAcks() && topic.kind == TopicKind::Raw)) [[unlikely]] {
+    if (needsIntentCheck_(topic, intent)) [[unlikely]] {
         if (const char* why = intentRefusal_(topic, value, intent)) throw std::invalid_argument(why);
     }
     if (impl_->batchAckCq() != nullptr) [[unlikely]] {
@@ -237,7 +238,7 @@ void Producer::sendTo(TopicHandle topic, int32_t part, const Key& key, std::span
 SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                              Completions& cq, Token token, WriteIntent intent) noexcept {
     if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
-    if (intent != WriteIntent::Upsert || (impl_->viewAcks() && topic.kind == TopicKind::Raw)) [[unlikely]] {
+    if (needsIntentCheck_(topic, intent)) [[unlikely]] {
         if (intentRefusal_(topic, value, intent) != nullptr) return SendResult::WriteNotAllowed;
     }
     if (token > kMaxToken || cq.client_ == nullptr || cq.client_ != impl_->hooks().ctx ||
@@ -275,7 +276,7 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
 SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                              AckToken token, WriteIntent intent) noexcept {
     if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
-    if (intent != WriteIntent::Upsert || (impl_->viewAcks() && topic.kind == TopicKind::Raw)) [[unlikely]] {
+    if (needsIntentCheck_(topic, intent)) [[unlikely]] {
         if (intentRefusal_(topic, value, intent) != nullptr) return SendResult::WriteNotAllowed;
     }
     if (token.token > kMaxToken) return SendResult::InvalidArgument;

@@ -762,7 +762,8 @@ public:
     /// Send one record with `intent` and wait for its verdict: the Send completion, unchanged (status Ok with
     /// value = the record's offset; BrokerError with errorCode 56 / 57 and constraintIdOf() for a refused intent;
     /// BrokerTooOld).  Flushes at once.  Throws std::invalid_argument for a local refusal (see trySend, KeyTooLong,
-    /// MessageTooLarge) and std::runtime_error when back-pressure outlasts `timeout`.
+    /// MessageTooLarge) and std::runtime_error when back-pressure or the wait outlasts `timeout`, or the client
+    /// closed first.
     [[nodiscard]] Completion sendAndWait(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                          WriteIntent intent, std::chrono::nanoseconds timeout);
 
@@ -1072,6 +1073,11 @@ private:
     /// producer without View pays one branch.
     [[nodiscard]] const char* intentRefusal_(TopicHandle topic, std::span<const uint8_t> value,
                                              WriteIntent intent) const noexcept;
+    /// True when a send needs intentRefusal_: a non-Upsert intent, or View acks on a raw handle.  Branchless, so the
+    /// caller's single [[unlikely]] test is the only branch an Upsert pays.
+    [[nodiscard]] bool needsIntentCheck_(TopicHandle topic, WriteIntent intent) const noexcept {
+        return (intentBits(intent) | (viewByte_ & static_cast<uint8_t>(topic.kind == TopicKind::Raw))) != 0;
+    }
     /// 2b-B: the one claim body; `part` computed once by the caller, the
     /// per-record ack credit (cq) already reserved by the caller.
     [[nodiscard]] Claim claimPart_(TopicHandle topic, int32_t part, const Key& key, uint32_t valueLen,
@@ -1084,6 +1090,7 @@ private:
     void release_() noexcept;
 
     producer::ProducerImpl* impl_ = nullptr;  // the handle's share (§3.3): ONE load per send
+    uint8_t viewByte_ = 0;                    // 1 when the acks include View (constant from construction)
 };
 
 } // namespace rune::client

@@ -982,11 +982,14 @@ struct InvokerGateway {
     /// Checked writes: when set, every ProduceResponse carries this verdict trailer (the frame is then the v17 one):
     /// 8-byte entries (recordIndex u16, code u16, constraintId u32), empty = judged, nothing refused.
     std::optional<std::vector<uint8_t>> produceVerdicts;
-    std::size_t encodeProduceResponse_(uint8_t* buf, std::size_t cap, const Produced& pr, int16_t errorCode,
-                                       int64_t baseOffset, int64_t logStart) {
+    std::vector<uint8_t> produceResponseBytes_(const Produced& pr, int16_t errorCode, int64_t baseOffset, int64_t logStart) {
         namespace rcc = rune::client::codec;
-        if (!produceVerdicts) return rcc::encodeProduceResponse(buf, cap, errorCode, pr.partition, baseOffset,
-                                                                pr.sessionId, pr.corrId, logStart);
+        if (!produceVerdicts) {
+            std::vector<uint8_t> out(rune::protocol::client::ProduceResponse::ENCODED_SIZE);
+            out.resize(rcc::encodeProduceResponse(out.data(), out.size(), errorCode, pr.partition, baseOffset,
+                                                  pr.sessionId, pr.corrId, logStart));
+            return out;
+        }
         rune::protocol::client::ProduceResponse msg;
         msg.sessionId      = pr.sessionId;
         msg.correlationId  = pr.corrId;
@@ -997,33 +1000,33 @@ struct InvokerGateway {
         msg.hasVerdicts    = true;
         msg.verdictCount   = static_cast<uint16_t>(produceVerdicts->size() / 8);
         msg.verdictBytes   = *produceVerdicts;
-        return msg.encodeFor(buf, rune::protocol::client::kClientVersionCheckedWrites);
+        std::vector<uint8_t> out(msg.encodedSize(rune::protocol::client::kClientVersionCheckedWrites));
+        out.resize(msg.encodeFor(out.data(), rune::protocol::client::kClientVersionCheckedWrites));
+        return out;
     }
 
     /// ProduceResponse with an explicit baseOffset (idempotence model).
     void ackAt(const Produced& pr, int16_t errorCode, int64_t baseOffset, int64_t logStart = -1) {
-        uint8_t buf[256];
-        const std::size_t n = encodeProduceResponse_(buf, sizeof buf, pr, errorCode, baseOffset, logStart);
+        const std::vector<uint8_t> buf = produceResponseBytes_(pr, errorCode, baseOffset, logStart);
         if (replyOnAnnouncedEgress) {
-            sendToSession(pr.sessionId, buf, n);
+            sendToSession(pr.sessionId, buf.data(), buf.size());
             return;
         }
-        send(pr.endpoint, buf, n);
+        send(pr.endpoint, buf.data(), buf.size());
     }
 
     /// ProduceResponse from the endpoint that received the batch.
     void ack(const Produced& pr, int16_t errorCode = 0) {
-        uint8_t buf[256];
         const int64_t base = nextOffset;
         nextOffset += pr.records;
-        const std::size_t n = encodeProduceResponse_(buf, sizeof buf, pr, errorCode, base, -1);
+        const std::vector<uint8_t> buf = produceResponseBytes_(pr, errorCode, base, -1);
         if (replyOnAnnouncedEgress) {
             const auto it = sessionPubs.find(pr.sessionId);
             if (it != sessionPubs.end()) ++acksPerEgress[it->second.channel];
-            sendToSession(pr.sessionId, buf, n);
+            sendToSession(pr.sessionId, buf.data(), buf.size());
             return;
         }
-        send(pr.endpoint, buf, n);
+        send(pr.endpoint, buf.data(), buf.size());
     }
 
     /// A reply to one session: its announced egress (replyOnAnnouncedEgress),
