@@ -1,5 +1,6 @@
 #pragma once
 // CheckedWritesChecks.h - the invariants of a verdict source's log, shared by the matrix, the model check and the cluster stress.
+#include "CheckedWritesMatrixExpectations.h"
 #include "CheckedWritesModel.h"
 
 #include <gtest/gtest.h>
@@ -46,6 +47,58 @@ inline std::string markerUnionProblem(const std::vector<VerdictRig::RigMarker>& 
 // ---- the invariants of the matrix and the model check, over one rig and the reference model --------------------------------------
 // `present` (where a function takes one): the offsets the log still holds.  A compaction removes superseded and rejected records, so
 // the model, built from the history, may name offsets the log no longer has; with `present` null the log is the whole history.
+
+// ---- the ack checks and the retry timings of the matrix drivers (04 and 05) --------------------------------------------------------
+
+using AckTrailer = std::vector<std::tuple<uint16_t, uint16_t, uint32_t>>;
+
+/// The trailer an ack of `n` records based at a.baseOffset must carry: the model's rejections, as (record index, code, constraint id).
+inline AckTrailer trailerFromModel(const CheckedWritesModel& model, const VerdictRig::Ack& a, std::size_t n) {
+    AckTrailer want;
+    for (std::size_t i = 0; i < n; ++i)
+        if (const auto it = model.verdicts().find(a.baseOffset + static_cast<int64_t>(i)); it != model.verdicts().end())
+            want.emplace_back(static_cast<uint16_t>(i), it->second.code, it->second.constraintId);
+    return want;
+}
+
+/// An Ok View ack of `n` records: the trailer is exactly the model's rejections and the frame has the matching length.
+inline void checkModelTrailer(const CheckedWritesModel& model, const VerdictRig::Ack& a, std::size_t n, int64_t corr) {
+    EXPECT_TRUE(a.hasVerdicts);
+    const AckTrailer want = trailerFromModel(model, a, n);
+    EXPECT_EQ(a.verdicts, want) << "the trailer is the model's rejections, corr " << corr;
+    EXPECT_EQ(a.frameLen, 54u + 2 + 8 * want.size());
+}
+
+/// The ack of a re-sent batch against the original's: outside the window DuplicateSequence with no trailer, else the original's ack.
+inline void checkDupAck(const VerdictRig& r, const VerdictRig::Ack& orig, const VerdictRig::Ack& dup, bool outsideWindow) {
+    if (outsideWindow) {
+        EXPECT_EQ(dup.code, static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence));
+        EXPECT_EQ(dup.frameLen, 54u);
+        EXPECT_FALSE(dup.hasVerdicts);
+        EXPECT_EQ(r.stats()->verdictUnknownDuplicates, 1u);
+    } else {
+        EXPECT_EQ(dup.code, 0);
+        EXPECT_EQ(dup.baseOffset, orig.baseOffset);
+        EXPECT_EQ(dup.verdicts, orig.verdicts) << "a retry in the window replays the original verdicts";
+    }
+}
+
+/// RetryBeforeJudge / RetryAfterJudge / RetryAfterWindow: `sendOp` sends the batch, `sendFiller(i)` one other write, `resend` the
+/// same batch again.  false = the judge did not catch up.
+template <class SendOp, class SendFiller, class Resend>
+bool executeRetry(VerdictRig& r, mx::Timing t, SendOp sendOp, SendFiller sendFiller, Resend resend) {
+    sendOp();
+    if (t == mx::Timing::RetryBeforeJudge) { resend(); return true; }
+    if (!r.driveUntilJudged()) return false;
+    if (t == mx::Timing::RetryAfterWindow) {   // 33 more writes push the batch out of the producer's window
+        for (uint64_t i = 0; i < 33; ++i) sendFiller(i);
+        if (!r.driveUntilJudged()) return false;
+        r.settle(150);
+    }
+    resend();
+    r.settle(150);
+    return true;
+}
 
 /// (a) The worker's rejected-offset index is the model's verdicts.
 inline void checkIndex(VerdictRig& r, const CheckedWritesModel& model, const std::set<int64_t>* present = nullptr) {

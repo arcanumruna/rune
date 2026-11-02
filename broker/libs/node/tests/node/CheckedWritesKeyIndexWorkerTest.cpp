@@ -653,6 +653,7 @@ TEST_P(Shape, OpsJudgeByExactKeyBytes) {
     for (const mx::Op op : {mx::Op::Insert, mx::Op::Update, mx::Op::Upsert, mx::Op::Remove, mx::Op::RemoveExisting})
         for (const mx::Entity e : {mx::Entity::KeyNew, mx::Entity::KeyExisting}) {
             ++id;
+            SCOPED_TRACE(std::string(mx::nameOf(op)) + " x " + mx::nameOf(e));
             if (e == mx::Entity::KeyExisting) {
                 const auto seed = g.p.sendAck({ups(id)});
                 ASSERT_TRUE(seed);

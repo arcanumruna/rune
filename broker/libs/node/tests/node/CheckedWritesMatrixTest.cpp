@@ -178,26 +178,9 @@ private:
     void execute_() {
         const auto sendAll = [&] { for (std::size_t k = 0; k < batches_.size(); ++k) send_(batches_[k], k); };
         switch (c_.timing) {
-        case Timing::RetryBeforeJudge:
-            send_(batches_[0], 0);
-            resend_(sent_[0]);
+        case Timing::RetryBeforeJudge: case Timing::RetryAfterJudge: case Timing::RetryAfterWindow:
+            ASSERT_TRUE(executeRetry(r_, c_.timing, [&] { send_(batches_[0], 0); }, [&](uint64_t i) { send_({{100 + i, 1, 0}}, 0); }, [&] { resend_(sent_[0]); }));
             return;
-        case Timing::RetryAfterJudge:
-            send_(batches_[0], 0);
-            ASSERT_TRUE(r_.driveUntilJudged());
-            resend_(sent_[0]);
-            r_.settle(150);
-            return;
-        case Timing::RetryAfterWindow: {
-            send_(batches_[0], 0);
-            ASSERT_TRUE(r_.driveUntilJudged());
-            for (uint64_t i = 0; i < 33; ++i) send_({{100 + i, 1, 0}}, 0);
-            ASSERT_TRUE(r_.driveUntilJudged());
-            r_.settle(150);
-            resend_(sent_[0]);
-            r_.settle(150);
-            return;
-        }
         case Timing::CreateOnNonEmpty: case Timing::ReplaceDuringWrites: case Timing::DropDuringWrites:
             send_(batches_[0], 0);
             change_();
@@ -276,28 +259,9 @@ private:
                 EXPECT_EQ(c_.timing, Timing::RetryAfterWindow);
                 continue;
             }
-            EXPECT_TRUE(a->hasVerdicts);
-            std::vector<std::tuple<uint16_t, uint16_t, uint32_t>> want;
-            for (std::size_t i = 0; i < s.recs.size(); ++i)
-                if (const auto it = model.verdicts().find(a->baseOffset + static_cast<int64_t>(i)); it != model.verdicts().end())
-                    want.emplace_back(static_cast<uint16_t>(i), it->second.code, it->second.constraintId);
-            EXPECT_EQ(a->verdicts, want) << "the trailer is the model's rejections, corr " << s.corr;
-            EXPECT_EQ(a->frameLen, 54u + 2 + 8 * want.size());
+            checkModelTrailer(model, *a, s.recs.size(), s.corr);
         }
-        for (const auto& [orig, dup] : dups_) {
-            const auto& o = okAcks.at(orig);
-            const auto& d = okAcks.at(dup);
-            if (ex.check == Check::RetryOutsideWindow) {
-                EXPECT_EQ(d.code, static_cast<int16_t>(ErrorCode::DuplicateSequence));
-                EXPECT_EQ(d.frameLen, 54u);
-                EXPECT_FALSE(d.hasVerdicts);
-                EXPECT_EQ(r_.stats()->verdictUnknownDuplicates, 1u);
-            } else {
-                EXPECT_EQ(d.code, 0);
-                EXPECT_EQ(d.baseOffset, o.baseOffset);
-                EXPECT_EQ(d.verdicts, o.verdicts) << "a retry in the window replays the original verdicts";
-            }
-        }
+        for (const auto& [orig, dup] : dups_) checkDupAck(r_, okAcks.at(orig), okAcks.at(dup), ex.check == Check::RetryOutsideWindow);
     }
 
     Cell c_;
@@ -321,10 +285,8 @@ namespace {
 constexpr uint64_t kKey = 5;
 constexpr int64_t kSetupPid = 41, kOpPid = 500, kOtherPid = 501, kTxnPid = 77;
 constexpr int16_t kInternal = static_cast<int16_t>(ErrorCode::Internal);
-constexpr int16_t kDuplicateSequence = static_cast<int16_t>(ErrorCode::DuplicateSequence);
 constexpr int64_t kAckDeadlineNs = 50'000'000;
-constexpr int kStrictPasses = 200'000;
-using Trailer = std::vector<std::tuple<uint16_t, uint16_t, uint32_t>>;
+using Trailer = AckTrailer;
 
 Rec ups(uint64_t id, int64_t v, uint8_t tag = 1) { return Rec{id, v, tag, false, 0}; }
 
@@ -373,6 +335,7 @@ public:
         }
         if (preIndex_) {
             r_.followerFetch();
+            if (c_.timing == Timing::CreateOnNonEmpty && hasIntent_()) r_.holdJudge(true);   // the op meets the index before its change record is logged
             r_.enableKeyIndex();
             if (c_.timing != Timing::CreateOnNonEmpty) ASSERT_TRUE(waitActive_());   // CreateOnNonEmpty sends the op while the index is built
         }
@@ -380,7 +343,7 @@ public:
         if (::testing::Test::HasFatalFailure()) return;
 
         const int64_t target = waitCommitted_();
-        ASSERT_TRUE(r_.driveUntilJudged(target, kStrictPasses));
+        ASSERT_TRUE(r_.driveUntilJudged(target, VerdictRig::kMaxPass * strictFactor_()));
         r_.passes(60);   // the views fold up to the judged cursor
         const auto log = r_.readLog();
         CheckedWritesModel model;
@@ -416,10 +379,14 @@ public:
 private:
     struct Sent { int64_t corr; int64_t pid; int32_t seq; std::vector<Rec> recs; };
 
+    // Only a Strict append waits for an fsync, which takes wall-clock time: its caps are 50 times larger.
+    int strictFactor_() const { return c_.timing == Timing::StrictTier ? 50 : 1; }
+    int ackPasses_() const { return 3000 * strictFactor_(); }
+
     // The HW reaches the log end; a Strict append reaches it only after its fsync completed, which takes wall-clock time.  Returns what the judge must cover.
     int64_t waitCommitted_() {
         r_.passes(10);   // the frames are taken off the ingress
-        for (int i = 0; i < kStrictPasses && r_.replica->highWatermark() < r_.leo(); ++i) {
+        for (int i = 0; i < VerdictRig::kMaxPass * strictFactor_() && r_.replica->highWatermark() < r_.leo(); ++i) {
             if (i % 8 == 0) r_.followerFetch();
             r_.pass();
         }
@@ -453,6 +420,11 @@ private:
     }
     void sendOp_(int64_t pid = kOpPid) { sent_.push_back(send_(pid, opBatch_())); }
 
+    // An intent meets the index before its change record is logged.  With a TestReject member the judge already exists and logs the change on its own.
+    bool hasIntent_() const {
+        return (c_.op == Op::Insert || c_.op == Op::Update || c_.op == Op::RemoveExisting) && c_.entity != Entity::KeyRejectedEarlier;
+    }
+
     std::vector<Rec> opBatch_() const {
         std::vector<Rec> b;
         if (c_.entity == Entity::KeyEarlierInBatch) b.push_back(ups(kKey, 10));
@@ -470,7 +442,7 @@ private:
             return;
         }
         const Sent s = send_(kSetupPid, recs);
-        const auto a = r_.ackFetching(s.corr, kStrictPasses);
+        const auto a = r_.ackFetching(s.corr, ackPasses_());
         ASSERT_TRUE(a);
         EXPECT_EQ(a->code, 0);
         setupTrailer_ = a->verdicts;
@@ -491,10 +463,15 @@ private:
     void sendOpUntilAccepted_() {
         for (int i = 0; i < 100; ++i) {
             const Sent s = send_(kOpPid, opBatch_());
-            const auto a = r_.ackFetching(s.corr, kStrictPasses);
+            const auto a = r_.ackFetching(s.corr, ackPasses_());
             ASSERT_TRUE(a);
-            if (a->code == 0) { sent_.push_back(s); return; }
+            if (a->code == 0) {
+                if (hasIntent_()) EXPECT_GE(r_.worker->hookRefusalsForTest(HookRefusal::KeyIndexActivating), 1u) << "the op was sent while the index was built";
+                sent_.push_back(s);
+                return;
+            }
             ASSERT_EQ(a->code, kNotLeader);
+            r_.holdJudge(false);
             stored_ -= s.recs.size();
             seqs_[kOpPid] -= static_cast<int32_t>(s.recs.size());
             r_.passes(5);
@@ -511,24 +488,8 @@ private:
             sendOp_(kOpPid);
             sendOp_(kOtherPid);
             return;
-        case Timing::RetryBeforeJudge:
-            sendOp_();
-            resend_(sent_[0]);
-            return;
-        case Timing::RetryAfterJudge:
-            sendOp_();
-            ASSERT_TRUE(r_.driveUntilJudged());
-            resend_(sent_[0]);
-            r_.settle(150);
-            return;
-        case Timing::RetryAfterWindow:
-            sendOp_();
-            ASSERT_TRUE(r_.driveUntilJudged());
-            for (uint64_t i = 0; i < 33; ++i) sent_.push_back(send_(kOpPid, {ups(100 + i, 1)}));
-            ASSERT_TRUE(r_.driveUntilJudged());
-            r_.settle(150);
-            resend_(sent_[0]);
-            r_.settle(150);
+        case Timing::RetryBeforeJudge: case Timing::RetryAfterJudge: case Timing::RetryAfterWindow:
+            ASSERT_TRUE(executeRetry(r_, c_.timing, [&] { sendOp_(); }, [&](uint64_t i) { sent_.push_back(send_(kOpPid, {ups(100 + i, 1)})); }, [&] { resend_(sent_[0]); }));
             return;
         case Timing::CreateOnNonEmpty:
             sendOpUntilAccepted_();
@@ -546,7 +507,7 @@ private:
         case Timing::FailoverHwFold:
             sendOp_();
             ASSERT_TRUE(r_.driveUntilJudged());
-            ASSERT_TRUE(r_.ackFetching(sent_[0].corr, kStrictPasses));   // answered before the node is lost
+            ASSERT_TRUE(r_.ackFetching(sent_[0].corr, ackPasses_()));   // answered before the node is lost
             r_.followerFetch();
             r_.failover();
             return;
@@ -561,19 +522,23 @@ private:
         case Timing::RestartDuringRebuild:
             sendOp_();
             ASSERT_TRUE(r_.driveUntilJudged());
-            ASSERT_TRUE(r_.ackFetching(sent_[0].corr, kStrictPasses));
+            ASSERT_TRUE(r_.ackFetching(sent_[0].corr, ackPasses_()));
             r_.restart();
             r_.passes(2);
             r_.restart();
             return;
         case Timing::TxnCommitBehind: case Timing::TxnAbortBehind: {
             const Sent txn = send_(kTxnPid, {ups(kKey, 55)}, kAcksAll, /*txn=*/true);   // a third producer's open transaction on k
-            const auto ta = r_.ackFetching(txn.corr, kStrictPasses);
+            const auto ta = r_.ackFetching(txn.corr, ackPasses_());
             ASSERT_TRUE(ta);
             EXPECT_EQ(ta->code, 0);
             txnOffset_ = ta->baseOffset;
             sendOp_();
-            r_.settle(100);
+            for (int i = 0; i < 300; ++i) {   // the op is below the HW (the follower keeps fetching) while the transaction is open
+                if (i % 8 == 0) r_.followerFetch();
+                r_.pass();
+            }
+            ASSERT_FALSE(r_.acked(sent_[0].corr)) << "behind an open transaction the judge is held";
             r_.marker(kTxnPid, c_.timing == Timing::TxnCommitBehind);
             return;
         }
@@ -587,9 +552,15 @@ private:
             r_.promote();
             return;
         case Timing::AckDeadline:   // the follower does not fetch: the parked View ack times out
+        {
+            const int64_t sentStep = r_.passNo();
             sendOp_();
-            ASSERT_TRUE(r_.ack(sent_[0].corr));
+            const auto a = r_.ack(sent_[0].corr);
+            ASSERT_TRUE(a);
+            EXPECT_GE(a->step - sentStep, kAckDeadlineNs / 1'000'000) << "never earlier than the deadline (a pass is 1 ms)";
+            EXPECT_LE(a->step - sentStep, kAckDeadlineNs / 1'000'000 + 20);
             return;
+        }
         default:   // Single, SelfCollidingBatch, StrictTier, GatewayRouted
             sendOp_();
             return;
@@ -605,9 +576,9 @@ private:
         ASSERT_TRUE(a);
         firstAckCode_ = a->code;
         back();
+        for (const Sent& s : sent_) stored_ -= s.recs.size();   // the cut tail is gone
         sent_.clear();
         seqs_.erase(kOpPid);
-        stored_ = 0;
         ASSERT_TRUE(waitActive_());
         r_.passes(10);
         sendOp_();
@@ -624,12 +595,12 @@ private:
         for (const auto& [off, v] : model.verdicts()) n += v.code == code ? 1 : 0;
         return n;
     }
-    // (g) A node that restarts after the verdicts were committed does not judge those records again: its counters hold only what it judged itself.
+    // (g) A restarted node counts only what it judges itself.  FailoverFoldMarker cuts the op's marker, so it judges the op again; FailoverHwFold
+    // and RestartDuringRebuild restart with every marker committed, so they judge nothing.
     void checkCounts_(const CheckedWritesModel& model) {
-        const bool rejudged = c_.timing != Timing::FailoverHwFold && c_.timing != Timing::FailoverFoldMarker && c_.timing != Timing::RestartDuringRebuild;
-        const auto check = [&](uint64_t got, uint64_t want) { if (rejudged) EXPECT_EQ(got, want); else EXPECT_LE(got, want); };
-        check(r_.stats()->rejectionsKeyExists, count_(model, 56));
-        check(r_.stats()->rejectionsKeyNotFound, count_(model, 57));
+        const bool judgedNothing = c_.timing == Timing::FailoverHwFold || c_.timing == Timing::RestartDuringRebuild;
+        EXPECT_EQ(r_.stats()->rejectionsKeyExists, judgedNothing ? 0u : count_(model, 56));
+        EXPECT_EQ(r_.stats()->rejectionsKeyNotFound, judgedNothing ? 0u : count_(model, 57));
     }
 
     // (c) a raw subscription from 0 receives exactly the accepted records (and the aborted transaction's, which is in the log), each with its intent as op()
@@ -647,19 +618,11 @@ private:
         EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
     }
 
-    static Trailer wantOf_(const CheckedWritesModel& model, const VerdictRig::Ack& a, std::size_t n) {
-        Trailer want;
-        for (std::size_t i = 0; i < n; ++i)
-            if (const auto it = model.verdicts().find(a.baseOffset + static_cast<int64_t>(i)); it != model.verdicts().end())
-                want.emplace_back(static_cast<uint16_t>(i), it->second.code, it->second.constraintId);
-        return want;
-    }
-
     void checkAcks_(const Expected& ex, const CheckedWritesModel& model, const VerdictRig::RigLog& log) {
         if (ex.check == Check::NotLeaderFirst) EXPECT_EQ(firstAckCode_, kNotLeader);
         std::map<int64_t, VerdictRig::Ack> acks;
         for (const Sent& s : sent_) {
-            const auto a = r_.ackFetching(s.corr, kStrictPasses);
+            const auto a = r_.ackFetching(s.corr, ackPasses_());
             ASSERT_TRUE(a) << "corr " << s.corr;
             acks[s.corr] = *a;
             if (ex.check == Check::NotLeaderParked) { EXPECT_EQ(a->code, kNotLeader); EXPECT_EQ(firstAckCode_, kNotLeader); continue; }
@@ -668,26 +631,9 @@ private:
                 EXPECT_EQ(ex.check, Check::RetryOutsideWindow);
                 continue;
             }
-            EXPECT_TRUE(a->hasVerdicts);
-            const Trailer want = wantOf_(model, *a, s.recs.size());
-            EXPECT_EQ(a->verdicts, want) << "the trailer is the model's rejections, corr " << s.corr;
-            EXPECT_EQ(a->frameLen, 54u + 2 + 8 * want.size());
+            checkModelTrailer(model, *a, s.recs.size(), s.corr);
         }
-        for (const auto& [orig, dup] : dups_) {
-            const auto& o = acks.at(orig);
-            const auto& d = acks.at(dup);
-            if (ex.check == Check::RetryOutsideWindow) {
-                EXPECT_EQ(d.code, kDuplicateSequence);
-                EXPECT_EQ(d.frameLen, 54u);
-                EXPECT_FALSE(d.hasVerdicts);
-                EXPECT_EQ(r_.stats()->verdictUnknownDuplicates, 1u);
-            } else {
-                EXPECT_EQ(d.code, 0);
-                EXPECT_EQ(d.baseOffset, o.baseOffset);
-                EXPECT_EQ(d.verdicts, o.verdicts) << "a retry in the window replays the original verdicts";
-                EXPECT_EQ(d.frameLen, o.frameLen);
-            }
-        }
+        for (const auto& [orig, dup] : dups_) checkDupAck(r_, acks.at(orig), acks.at(dup), ex.check == Check::RetryOutsideWindow);
         if (ex.check == Check::RetryReplays) EXPECT_EQ(log.data.size(), stored_) << "a retry is stored once";
 
         const std::size_t opAt = c_.entity == Entity::KeyEarlierInBatch ? 1 : 0;
@@ -763,6 +709,7 @@ TEST(CheckedWritesModel, KeyIndexRuleMatchesTheTable) {
     const uint8_t kind = static_cast<uint8_t>(rune::view::VerdictViewKind::KeyIndex);
     for (const Op op : {Op::Insert, Op::Update, Op::Upsert, Op::Remove, Op::RemoveExisting})
         for (const Entity e : {Entity::KeyNew, Entity::KeyExisting, Entity::KeyEarlierInBatch, Entity::KeyRemovedEarlier, Entity::KeyRejectedEarlier, Entity::KeyBeforeIndex}) {
+            SCOPED_TRACE(std::string(nameOf(op)) + " x " + nameOf(e));
             Log log;
             int64_t off = 0;
             const auto data = [&](const Rec& x) { log.data.push_back(LogRec{off++, x.id, x.v, x.tag, x.del, x.intent}); };
