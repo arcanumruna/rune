@@ -985,6 +985,69 @@ Body: `partitionCount:u32, validate:u8, topicName(varstr), keyField(varstr), des
 
 ---
 
+### 22b. `define_topic_v17_key_index.bin` — 214 bytes
+
+**Message:** `DefineTopic` (templateId = 64), client version 17
+
+Every field of `define_topic_v8.bin` (section 22), then, after the DdlExtension, the 14-byte **TopicKeyFeatures** block: `flags:u8 (bit0 keyIndex, bit1 autoIncrement), partitioner:u8 (0 Fnv1a, 1 Modulo), autoIncrementMax:u64, autoIncrementReserve:u32`.  The block requires the v8 trailer and must end the frame; unknown flag bits and a partitioner above 1 are refused.  A frame without the block is byte-identical to `define_topic_v8.bin`.
+
+| Field | Value |
+|-------|-------|
+| (all fields of `define_topic_v8.bin`) | unchanged |
+| keyFeatures.keyIndex | 1 |
+| keyFeatures.autoIncrement | 0 |
+| keyFeatures.partitioner | 0 (Fnv1a) |
+| keyFeatures.autoIncrementMax | 2^53-1 (0x1FFFFFFFFFFFFF) |
+| keyFeatures.autoIncrementReserve | 4096 |
+
+Trailing block bytes: `01 00 FF FF FF FF FF FF 1F 00 00 10 00 00`.
+
+**Bytes:**
+```
+0000    05 00 40 00 78 00 03 00 88 77 66 55 44 33 22 11
+0016    11 10 0F 0E 0D 0C 0B 0A 04 00 00 00 00 06 00 65
+0032    76 65 6E 74 73 00 00 00 00 00 00 00 03 00 01 60
+0048    EA 00 00 00 00 00 00 FF FF FF FF FF FF FF FF 00
+0064    5C 26 05 00 00 00 00 20 A1 07 00 00 00 00 04 00
+0080    00 00 00 00 00 00 00 00 00 00 00 FF FF FF FF FF
+0096    FF FF FF E0 93 04 00 00 00 00 00 60 EA 00 00 00
+0112    00 00 00 00 01 00 00 01 00 6B 25 00 00 00 74 6F
+0128    70 69 63 20 65 76 65 6E 74 73 20 70 61 72 74 69
+0144    74 69 6F 6E 73 20 34 20 72 65 70 6C 69 63 61 73
+0160    20 33 3B 03 00 63 6C 69 1E C1 00 00 00 00 00 00
+0176    4D 00 00 00 00 00 00 00 01 03 00 73 72 63 05 00
+0192    00 00 00 00 00 00 00 00 01 00 FF FF FF FF FF FF
+0208    1F 00 00 10 00 00
+```
+
+---
+
+### 22c. `topic_schema_response_v17_key_index.bin` — 57 bytes
+
+**Message:** `TopicSchemaResponse` (templateId = 67), client version 17
+
+Body: `topicId:i32, version:u16, errorCode:u16, descriptorBlob(varbytes32), partitionCount:i32`, then the 14-byte TopicKeyFeatures block (section 22b), present iff the topic's features are non-default.  An older decoder stops after `partitionCount` and ignores the block; a 1-13 byte remainder decodes as no block.
+
+| Field | Value |
+|-------|-------|
+| blockLength | 8 |
+| topicId | 0x40000007 |
+| version | 2 |
+| errorCode | 0 |
+| descriptorBlob | DE AD BE |
+| partitionCount | 4 |
+| keyFeatures | keyIndex only, defaults otherwise (as in 22b) |
+
+**Bytes:**
+```
+0000    08 00 43 00 78 00 03 00 88 77 66 55 44 33 22 11
+0016    11 10 0F 0E 0D 0C 0B 0A 07 00 00 40 02 00 00 00
+0032    03 00 00 00 DE AD BE 04 00 00 00 01 00 FF FF FF
+0048    FF FF FF 1F 00 00 10 00 00
+```
+
+---
+
 ### 23. `drop_topic.bin` — 66 bytes
 
 **Message:** `DropTopic` (templateId = 74)

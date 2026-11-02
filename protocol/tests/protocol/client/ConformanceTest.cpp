@@ -25,6 +25,7 @@
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/PingMessages.h>
+#include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/AuthMessages.h>
 #include <rune/protocol/client/SecurityMessages.h>
@@ -1457,4 +1458,65 @@ TEST(ConformanceGolden, ConnectResponseV9) {
     ASSERT_TRUE(c);
     EXPECT_EQ(c->chosenCipher, 2); EXPECT_EQ(c->authState, rpc::AuthState::ResumedAuthenticated);
     EXPECT_EQ(c->handshakeBytes, "serverhello");
+}
+
+namespace {
+rpc::DefineTopic defineTopicV17KeyIndex() {
+    rpc::DefineTopic m;
+    m.sessionId = kSessionId; m.correlationId = kCorrelationId;
+    m.topicName = "events"; m.partitionCount = 4; m.persistence = 0; m.replicationFactor = 3;
+    m.config.retentionMs = 60'000; m.config.cleanupPolicy = 1; m.config.partitionKey = "k";
+    m.hasExt = true; m.ext.statement = "topic events partitions 4 replicas 3;"; m.ext.clientName = "cli";
+    m.ext.requestId = {.hi = 0xC11E, .lo = 77};
+    m.ext.hasReplayedFrom = 1; m.ext.replayedClusterId = "src"; m.ext.replayedOffset = 5;
+    m.hasKeyFeatures = true; m.keyFeatures.keyIndex = true;
+    return m;
+}
+constexpr uint8_t kSchemaBlob[] = {0xDE, 0xAD, 0xBE};
+rpc::TopicSchemaResponse topicSchemaResponseV17KeyIndex() {
+    rpc::TopicSchemaResponse m;
+    m.sessionId = kSessionId; m.correlationId = kCorrelationId;
+    m.topicId = 0x40000007; m.version = 2; m.errorCode = 0;
+    m.descriptorBlob = kSchemaBlob; m.descriptorLen = sizeof(kSchemaBlob);
+    m.partitionCount = 4;
+    m.hasKeyFeatures = true; m.keyFeatures.keyIndex = true;
+    return m;
+}
+}   // namespace
+
+TEST(ConformanceGolden, DefineTopicV17KeyIndex) {
+    const auto golden = readVector("define_topic_v17_key_index.bin");
+    ASSERT_EQ(golden.size(), 214u);   // define_topic_v8.bin (200) + the 14-byte block
+    expectHeader(golden, 64, 5);
+    EXPECT_EQ(encodeVec(defineTopicV17KeyIndex()), golden);
+    const std::vector<uint8_t> block(golden.end() - 14, golden.end());
+    EXPECT_EQ(block, (std::vector<uint8_t>{0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00, 0x10, 0x00, 0x00}));
+    auto d = rpc::DefineTopic::decode(golden.data(), golden.size());
+    ASSERT_TRUE(d);
+    const auto want = defineTopicV17KeyIndex();
+    EXPECT_EQ(d->topicName, want.topicName);
+    EXPECT_EQ(d->partitionCount, want.partitionCount);
+    EXPECT_EQ(d->replicationFactor, want.replicationFactor);
+    EXPECT_EQ(d->config, want.config);
+    EXPECT_TRUE(d->hasExt);
+    EXPECT_EQ(d->ext, want.ext);
+    EXPECT_TRUE(d->hasKeyFeatures);
+    EXPECT_EQ(d->keyFeatures, want.keyFeatures);
+}
+
+TEST(ConformanceGolden, TopicSchemaResponseV17KeyIndex) {
+    const auto golden = readVector("topic_schema_response_v17_key_index.bin");
+    ASSERT_EQ(golden.size(), 24u + 8u + 4u + 3u + 4u + 14u);
+    expectHeader(golden, 67, 8);
+    EXPECT_EQ(encodeVec(topicSchemaResponseV17KeyIndex()), golden);
+    auto d = rpc::TopicSchemaResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(d);
+    const auto want = topicSchemaResponseV17KeyIndex();
+    EXPECT_EQ(d->topicId, want.topicId);
+    EXPECT_EQ(d->version, want.version);
+    ASSERT_EQ(d->descriptorLen, sizeof(kSchemaBlob));
+    EXPECT_EQ(std::memcmp(d->descriptorBlob, kSchemaBlob, sizeof(kSchemaBlob)), 0);
+    EXPECT_EQ(d->partitionCount, 4);
+    EXPECT_TRUE(d->hasKeyFeatures);
+    EXPECT_EQ(d->keyFeatures, want.keyFeatures);
 }

@@ -177,6 +177,8 @@ inline bool getTopicConfig(const uint8_t* buf, std::size_t avail, std::size_t& p
 //   Decode: after the persistence byte, pos == avail => no extension (hasExt
 //   false, replicationFactor 0, default config); otherwise the whole trailer
 //   must decode exactly to the end of the frame (anything else => nullopt).
+//   [v17 trailer] - checked writes: when hasKeyFeatures (requires hasExt), the
+//   14-byte TopicKeyFeatures block follows the DdlExtension; nothing may follow it.
 // encode() returns 0 (explicit failure, never a truncated field) when !fits().
 struct DefineTopic {
     int64_t sessionId = 0, correlationId = 0;
@@ -192,6 +194,9 @@ struct DefineTopic {
     TopicConfigWire config{};
     bool hasExt = false;
     DdlExtension ext{};
+    // v17 (checked writes) — on the wire only when hasKeyFeatures, after the extension.
+    bool hasKeyFeatures = false;
+    TopicKeyFeatures keyFeatures{};
 
     static constexpr uint8_t kPersistenceDisk      = 0;
     static constexpr uint8_t kPersistenceTransient = 1;
@@ -204,7 +209,7 @@ struct DefineTopic {
     [[nodiscard]] bool fits() const noexcept {
         if (!fitsVarLen16(topicName.size()) || !fitsVarLen16(keyField.size())) return false;
         if (persistence > kPersistenceTransient) return false;
-        if (!hasExt) return replicationFactor == 0 && config == TopicConfigWire{};
+        if (!hasExt) return !hasKeyFeatures && replicationFactor == 0 && config == TopicConfigWire{};
         return topicConfigFits(config) && extFits(ext);
     }
     std::size_t encodedSize() const noexcept {
@@ -212,7 +217,7 @@ struct DefineTopic {
              + 2u + topicName.size()
              + 2u + keyField.size()
              + 4u + descriptorLen;
-        if (hasExt) return base + 1u + 2u + topicConfigEncodedSize(config) + extEncodedSize(ext);
+        if (hasExt) return base + 1u + 2u + topicConfigEncodedSize(config) + extEncodedSize(ext) + (hasKeyFeatures ? kTopicKeyFeaturesWireLen : 0u);
         return base + (persistence != kPersistenceDisk ? 1u : 0u);
     }
     /// Where the DdlExtension starts in the encoded frame (meaningful when hasExt).
@@ -236,6 +241,7 @@ struct DefineTopic {
             detail::putLE16s(buf, static_cast<int>(pos), replicationFactor); pos += 2;
             pos += putTopicConfig(buf + pos, config);
             pos += putExt(buf + pos, ext);
+            if (hasKeyFeatures) { putTopicKeyFeatures(buf + pos, keyFeatures); pos += kTopicKeyFeaturesWireLen; }
         } else if (persistence != kPersistenceDisk) {
             buf[pos++] = persistence;
         }
@@ -262,6 +268,11 @@ struct DefineTopic {
         m.replicationFactor = detail::getLE16s(buf, static_cast<int>(pos)); pos += 2;
         if (!getTopicConfig(buf, avail, pos, m.config)) return std::nullopt;
         if (!getExt(buf, avail, pos, m.ext)) return std::nullopt;
+        if (pos < avail) {
+            if (!getTopicKeyFeatures(buf + pos, avail - pos, m.keyFeatures)) return std::nullopt;
+            pos += kTopicKeyFeaturesWireLen;
+            m.hasKeyFeatures = true;
+        }
         if (pos != avail) return std::nullopt;   // the trailer decodes exactly to the end
         m.hasExt = true;
         return m;
@@ -361,10 +372,14 @@ struct TopicSchemaResponse {
     int32_t topicId = -1; uint16_t version = 0; uint16_t errorCode = 0;
     const uint8_t* descriptorBlob = nullptr; uint32_t descriptorLen = 0;
     int32_t partitionCount = 0;  // Phase 2b Part C; 0 = not reported (pre-2b broker)
+    // v17: the 14-byte TopicKeyFeatures block after partitionCount; the broker sets it
+    // iff the features are non-default.  A 1-13 byte remainder decodes as no block.
+    bool hasKeyFeatures = false;
+    TopicKeyFeatures keyFeatures{};
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::TopicSchemaResponse);
     static constexpr uint16_t BODY_FIXED  = 8;
     std::size_t encodedSize() const noexcept {
-        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + descriptorLen + 4u;
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + descriptorLen + 4u + (hasKeyFeatures ? kTopicKeyFeaturesWireLen : 0u);
     }
     std::size_t encode(uint8_t* buf) const noexcept {
         MessageHeader hdr; hdr.blockLength = BODY_FIXED; hdr.templateId = TEMPLATE_ID;
@@ -376,6 +391,7 @@ struct TopicSchemaResponse {
         detail::putLE16(buf, static_cast<int>(pos), errorCode); pos += 2;
         pos += putVarBytes32(buf + pos, descriptorBlob, descriptorLen);
         detail::putLE32(buf, static_cast<int>(pos), partitionCount); pos += 4;
+        if (hasKeyFeatures) { putTopicKeyFeatures(buf + pos, keyFeatures); pos += kTopicKeyFeaturesWireLen; }
         return pos;
     }
     static std::optional<TopicSchemaResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
@@ -391,6 +407,7 @@ struct TopicSchemaResponse {
         // Trailing (Phase 2b): absent / cut short on a pre-2b frame -> 0.
         if (avail >= pos + 4) {
             m.partitionCount = detail::getLE32(buf, static_cast<int>(pos)); pos += 4;
+            m.hasKeyFeatures = avail >= pos + kTopicKeyFeaturesWireLen && getTopicKeyFeatures(buf + pos, avail - pos, m.keyFeatures);
         }
         return m;
     }
