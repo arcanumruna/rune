@@ -88,7 +88,7 @@ jobs:
           cmake -S client-cpp -B client-cpp/build/Release \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
             -DFLIGHT_RECORDER_DIR="$GITHUB_WORKSPACE/flight-recorder" \
-            -DCMAKE_TOOLCHAIN_FILE=client-cpp/build/Release/generators/conan_toolchain.cmake
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/client-cpp/build/Release/generators/conan_toolchain.cmake"
           cmake --build client-cpp/build/Release --target rune
 
       - name: Inspect and smoke-run
