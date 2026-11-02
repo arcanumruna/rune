@@ -15,12 +15,12 @@
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -210,20 +210,27 @@ struct Rig {
     // Runs fn (a blocking call on this thread) while another thread pumps the gateway until the call returned.
     template <class Fn>
     void whilePumping(Fn&& fn) {
-        std::atomic<bool> done{false};
+        int stop[2];
+        ASSERT_EQ(::pipe(stop), 0);
         std::thread t([&] {
+            pollfd pfd{stop[0], POLLIN, 0};
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (!done.load() && std::chrono::steady_clock::now() < deadline) gw.pump();
+            while (::poll(&pfd, 1, 0) == 0 && std::chrono::steady_clock::now() < deadline) gw.pump();
         });
+        const auto release = [&] {
+            const char b = 0;
+            (void)!::write(stop[1], &b, 1);
+            t.join();
+            ::close(stop[0]);
+            ::close(stop[1]);
+        };
         try {
             fn();
         } catch (...) {
-            done = true;
-            t.join();
+            release();
             throw;
         }
-        done = true;
-        t.join();
+        release();
     }
 };
 
