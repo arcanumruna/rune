@@ -955,6 +955,22 @@ TEST(PeerHandshakeRegression, AReplayedProofV2NeverEstablishesASecondEpochRegres
     }
 }
 
+TEST(PeerHandshakeRegression, ARekeyInFlightRefusesASecondAndTheResponderNeverStartsOneRegression) {
+    Pair p(keys('k'), keys('k')); p.run();
+    ASSERT_NE(est(p.a), nullptr);
+    ASSERT_EQ(est(p.a)->keys.epoch, 1u);
+    const int64_t now = 5'000 * kMs;
+    auto o1 = p.a.rekeyForTest(now);
+    ASSERT_TRUE(o1.frame);
+    EXPECT_FALSE(p.a.rekeyForTest(now + kMs).frame) << "a second re-handshake while one is in flight is refused";
+    EXPECT_FALSE(p.b.rekeyForTest(now).frame) << "the responder never starts one";
+    p.absorb(0, std::move(o1));
+    p.run(now);
+    ASSERT_NE(est(p.a), nullptr);
+    ASSERT_EQ(est(p.a)->keys.epoch, 2u);
+    EXPECT_TRUE(p.a.rekeyForTest(now + 1'000 * kMs).frame) << "established again: a new one is allowed";
+}
+
 TEST(PeerHandshakeRegression, AForgedProofV2CostsNoTranscriptMacRegression) {
     pl::PeerHandshake a(1, 2, 10, keys('k')), b(2, 1, 20, keys('k'));
     auto h = a.tick(0); ASSERT_TRUE(h.frame);

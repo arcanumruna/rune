@@ -200,7 +200,6 @@ TEST(PeerSealedClusterRegression, BackToBackRehandshakesUnderLoadConvergeWithNoL
         for (auto [a, b] : pairs) {
             was[{a, b}] = c.node(a).peerLinksForTest().epochOf[b];
             ASSERT_TRUE(c.node(a).forcePeerRekeyForTest(b)) << "round " << round << " " << a << "->" << b;
-            EXPECT_FALSE(c.node(a).forcePeerRekeyForTest(b)) << "a second re-handshake while one is in flight is refused";
             EXPECT_FALSE(c.node(b).forcePeerRekeyForTest(a)) << "the responder never starts one";
         }
         ASSERT_GE(g.appendNext(c, 60s), 0) << "round " << round;
