@@ -266,7 +266,8 @@ public:
                                                  uint8_t persistence, int16_t replicationFactor,
                                                  const rune::protocol::TopicConfigView& config,
                                                  const rune::gateway::DdlMetaView& meta,
-                                                 std::string_view adoptDenial) override {
+                                                 std::string_view adoptDenial,
+                                                 const rune::protocol::TopicKeyFeatures& keyFeatures) override {
         DefineTopicMsg m;
         m.session        = sessionId;
         m.corr           = correlationId;
@@ -281,6 +282,7 @@ public:
         m.meta   = ownMeta_(meta);
         m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         m.adoptDenial.assign(adoptDenial);
+        m.keyFeatures = keyFeatures;
         return submitDdl_(m);
     }
 
@@ -765,7 +767,7 @@ public:
     /// never dropped.
     void postTopicSchemaResponse(int64_t session, int64_t corr, int32_t topicId, uint16_t version,
                                  int32_t partitionCount, const std::vector<uint8_t>& blob,
-                                 uint16_t errorCode) {
+                                 uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures) {
         namespace pc = rune::protocol::client;
         pc::TopicSchemaResponse resp;
         resp.sessionId      = session;
@@ -774,6 +776,8 @@ public:
         resp.version        = version;
         resp.errorCode      = errorCode;
         resp.partitionCount = partitionCount;   // Phase 2b Part C
+        resp.hasKeyFeatures = keyFeatures != rune::protocol::TopicKeyFeatures{};
+        resp.keyFeatures    = keyFeatures;
         resp.descriptorBlob = blob.empty() ? nullptr : blob.data();
         resp.descriptorLen  = static_cast<uint32_t>(blob.size());
         if (resp.encodedSize() > maxEgressFrameBytes()) [[unlikely]] {

@@ -826,6 +826,7 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesWorkerTest.cpp
         tests/node/CheckedWritesSpecFanoutTest.cpp
         tests/node/CheckedWritesDdlTest.cpp
+        tests/node/CheckedWritesKeyIndexDdlTest.cpp
         tests/node/CheckedWritesTimelineTest.cpp
         tests/node/CheckedWritesVerdictSourceTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE

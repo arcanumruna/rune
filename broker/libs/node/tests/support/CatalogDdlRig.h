@@ -94,6 +94,7 @@ public:
         rune::protocol::TopicConfig config{};
         bool                        preV8       = false;   // no DDL extension (requestId {0,0})
         uint32_t                    nsId        = 0;       // namespaces Task 7: the topic's namespace
+        rune::protocol::TopicKeyFeatures keyFeatures{};
     };
 
     /// `fdLimit` / `fdReadySegments` (issue #296): AdminDeps::fdLimit / readySegmentsPerPartition (0 = unknown limit).
@@ -199,6 +200,7 @@ public:
         m.persistence = a.persistence; m.replicationFactor = a.rf; m.config = a.config;
         m.meta = meta_(a.statement, a.clientName, a.requestId, a.preV8);
         m.nsId = a.nsId;
+        m.keyFeatures = a.keyFeatures;
         return submit_(DdlRequest{std::move(m)});
     }
 
@@ -303,6 +305,7 @@ public:
     struct SchemaAnswer {
         uint16_t code = 0; int32_t topicId = -1; uint16_t version = 0; int32_t partitionCount = 0;
         std::vector<uint8_t> blob;
+        rune::protocol::TopicKeyFeatures keyFeatures{};
     };
     SchemaAnswer getSchema(const std::string& name, uint64_t fingerprint = 0, uint32_t nsId = 0) {
         const int64_t corr = ++corr_;
@@ -552,8 +555,9 @@ private:
         deps.maxNamespaces   = maxNamespaces_;
         deps.nsDefaults.limits = nsDefaults_;
         deps.respondGet = [this](int64_t, int64_t corr, int32_t topicId, uint16_t version, int32_t partitions,
-                                 const std::vector<uint8_t>& blob, uint16_t code) {
-            gets_[corr] = SchemaAnswer{code, topicId, version, partitions, blob};
+                                 const std::vector<uint8_t>& blob, uint16_t code,
+                                 const rune::protocol::TopicKeyFeatures& keyFeatures) {
+            gets_[corr] = SchemaAnswer{code, topicId, version, partitions, blob, keyFeatures};
         };
         // Task 23: the catalog read egress (counts only — zero-alloc, so the idle-reader gate
         // measures the admin pass, never the rig).

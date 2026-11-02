@@ -146,7 +146,7 @@ protected:
             lastDefineTopicId_ = topicId; lastDefineError_ = err;
             defineResults_.push_back(err);
         };
-        deps.respondGet   = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t) {};
+        deps.respondGet   = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t, const rune::protocol::TopicKeyFeatures&) {};
         deps.respondAlter = [this](int64_t, int64_t, int32_t topicId, uint16_t version, uint16_t err) {
             alterResults_.push_back(AlterResult{topicId, version, err});
         };

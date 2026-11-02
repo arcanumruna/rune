@@ -50,6 +50,19 @@ TEST(CheckedWritesWriteState, WireRoundTripsAndRefusesShortInput) {
     EXPECT_EQ(encodeTopicWriteSpec(w, std::span<uint8_t>(buf, 8)), 0u);
 }
 
+TEST(CheckedWritesWriteState, KeyIndexFlagRoundTrips) {
+    TopicWriteSpecWire w;
+    w.topicId = 4; w.keyFieldId = 1; w.keyType = PrimType::UInt64; w.keyWidth = 8; w.keyIndex = true;
+    uint8_t buf[kTopicWriteSpecWireLen];
+    ASSERT_EQ(encodeTopicWriteSpec(w, buf), 9u);
+    EXPECT_EQ(buf[8], 2);
+    const auto back = decodeTopicWriteSpec(buf);
+    ASSERT_TRUE(back);
+    EXPECT_EQ(*back, w);
+    buf[8] = 0x04;
+    EXPECT_FALSE(decodeTopicWriteSpec(buf));
+}
+
 TEST(CheckedWritesWriteState, SpecOfACatalogTopic) {
     rune::catalog::TopicObject untyped;
     EXPECT_FALSE(writeSpecWireOf(untyped));
