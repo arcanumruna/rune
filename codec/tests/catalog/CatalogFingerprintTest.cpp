@@ -175,7 +175,7 @@ TEST(CatalogFingerprintRegression, SchemaStateEveryFieldIsCovered) {
         {"schemaVersion", Role::Definition, [](S& s) { s.schemaVersion = 3; }},
         {"nextTag", Role::Definition, [](S& s) { s.nextTag = 6; }},
         {"compat", Role::Definition, [](S& s) { s.compat = cd::CompatMode::Forward; }},
-        {"keyFeatures", Role::Id, [](S& s) { s.keyFeatures.keyIndex = true; }},   // the frozen fingerprint never sees it
+        {"keyFeatures", Role::Id, [](S& s) { s.keyFeatures.keyIndex = true; }},   // Role::Id here means "outside the frozen fingerprint": ApplyV3 layers it on
     };
     const rc::TopicObject base = baseTopic();
     expectEveryField(*base.schema, rows, kSchemaStateFields, [&](const S& s) {

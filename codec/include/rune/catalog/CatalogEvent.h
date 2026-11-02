@@ -9,7 +9,7 @@
 // subject namespace.  A formatVer-1 event decodes with nsId = 0 and cannot carry another.
 //
 // formatVer 3 (checked writes) is formatVer 2 plus a trailing 14-byte TopicKeyFeatures block in every SchemaDef body
-// (CreateTopic with a schema, CreateSchema).  The broker writes kFormatV3 once the cluster feature level allows it,
+// (CreateTopic with a schema, CreateSchema).  The broker writes kFormatV3 once the cluster feature level reaches 5 (kCheckedWrites),
 // else kCurrentFormatVer (formatVer 2); it never writes formatVer 1.
 //
 // formatVer-1 layout (all little-endian, written and read byte-wise — host-endian independent):
@@ -55,7 +55,7 @@ inline constexpr uint16_t kFormatV1          = 1;
 inline constexpr uint16_t kFormatV2          = 2;
 inline constexpr uint16_t kFormatV3          = 3;
 inline constexpr uint16_t kCurrentFormatVer  = kFormatV2;
-/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2 accepts 32..36 and refuses 37..63.
+/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2 and 3 accept 32..36 and refuse 37..63.
 inline constexpr uint16_t kReservedKindFirst = 32;
 inline constexpr uint16_t kReservedKindLast  = 63;
 inline constexpr uint16_t kLastNamespaceKind = 36;
@@ -256,7 +256,7 @@ enum class EncodeError : uint8_t {
     FieldTooLong,      // a string / blob (or the ops blob) exceeds its length prefix's width
     TooManyElements,   // a list exceeds its u16 count
     UnknownFormatVer,  // formatVer not 1, 2 or 3            (decode: UnknownFormatVer)
-    ReservedKind,      // v1: kind in [32, 63]; v2: [36, 63] (decode: ReservedKind)
+    ReservedKind,      // v1: kind in [32, 63]; v2, v3: [37, 63] (decode: ReservedKind)
     UnknownKind,       // kind not 1..9 and not reserved    (decode: UnknownKind)
     KindOpsMismatch,   // kind != kindOf(ops)               (decode: KindOpsMismatch)
     BadEnum,           // an enum field outside its range, or a v1 event with nsId != 0 (decode: BadEnum)

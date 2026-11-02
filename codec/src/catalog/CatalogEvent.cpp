@@ -15,7 +15,7 @@ using wire::Writer;
 static_assert(kMaxStr16Bytes == 0xFFFF && kMaxStr32Bytes == 0xFFFF'FFFF && kMaxListCount == 0xFFFF,
               "formatVer-1 wire widths are frozen: u16 / u32 length prefixes, u16 list counts (formatVer 2 keeps them)");
 
-// ── THE validation (formatVer 1 and 2) ───────────────────────────────────────────
+// ── THE validation (formatVer 1, 2 and 3) ───────────────────────────────────────────
 // One set of value rules, run by BOTH directions: encodeInto refuses exactly what decode
 // refuses, so no event the decoder would reject can ever be appended to __catalog.
 // (Byte-level refusals — Truncated, TrailingBytes, a bool byte other than 0/1 — have no
@@ -58,6 +58,9 @@ std::optional<Violation> checkKind(uint16_t formatVer, uint16_t k) noexcept {
         return Violation::UnknownKind;
     return std::nullopt;
 }
+constexpr bool validKeyFeatures(const rune::protocol::TopicKeyFeatures& f) noexcept {
+    return static_cast<uint8_t>(f.partitioner) <= static_cast<uint8_t>(rune::protocol::Partitioner::Modulo);
+}
 bool defaultKeyFeatures(const Ops& ops) noexcept {
     const rune::protocol::TopicKeyFeatures defaults;
     if (const auto* t = std::get_if<CreateTopicOps>(&ops)) return !t->schema || t->schema->keyFeatures == defaults;
@@ -71,7 +74,7 @@ bool validOps(const Ops& ops) noexcept {
     return std::visit([](const auto& o) -> bool {
         using T = std::decay_t<decltype(o)>;
         if constexpr (std::is_same_v<T, CreateTopicOps>) {
-            return validPersistence(o.persistence) && validConfig(o.config);
+            return validPersistence(o.persistence) && validConfig(o.config) && (!o.schema || validKeyFeatures(o.schema->keyFeatures));
         } else if constexpr (std::is_same_v<T, AlterTopicConfigOps>) {
             for (const auto& c : o.changes) if (!validConfigKey(c.key)) return false;
             return true;
@@ -79,6 +82,8 @@ bool validOps(const Ops& ops) noexcept {
             for (const auto& a : o.ops)
                 if (!validAlterOpType(a.type) || !validPrimType(a.primType) || !validCompatMode(a.mode)) return false;
             return true;
+        } else if constexpr (std::is_same_v<T, CreateSchemaOps>) {
+            return validKeyFeatures(o.schema.keyFeatures);
         } else if constexpr (std::is_same_v<T, SetCompatibilityOps>) {
             return validCompatMode(o.mode);
         } else if constexpr (std::is_same_v<T, CreateViewOps> || std::is_same_v<T, AlterViewOps>) {
@@ -87,7 +92,7 @@ bool validOps(const Ops& ops) noexcept {
             return validNsStateTag(o.to);
         } else if constexpr (std::is_same_v<T, NamespaceDeleteStepOps>) {
             return validDeleteStep(o.step);
-        } else {   // DropTopicOps, CreateSchemaOps, DropViewOps, NamespaceCreated / LimitsSet / Deleted: no enum fields
+        } else {   // DropTopicOps, DropViewOps, NamespaceCreated / LimitsSet / Deleted: no enum fields
             return true;
         }
     }, ops);

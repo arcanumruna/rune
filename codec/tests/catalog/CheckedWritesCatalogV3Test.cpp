@@ -131,6 +131,17 @@ TEST(CheckedWritesCatalogV3, BadFlagBitsAreBadEnum) {
     EXPECT_FALSE(rc::decode(cut).has_value());
 }
 
+TEST(CheckedWritesCatalogV3Regression, EncodeRefusesAPartitionerTheDecoderRefusesRegression) {
+    rp::TopicKeyFeatures f;
+    f.partitioner = static_cast<rp::Partitioner>(2);
+    const auto topic = rc::encode(event(rc::kFormatV3, createOps(0, f), "t", 1, 0));
+    ASSERT_FALSE(topic.has_value());
+    EXPECT_EQ(topic.error(), rc::EncodeError::BadEnum);
+    const auto schema = rc::encode(event(rc::kFormatV3, rc::CreateSchemaOps{schemaDef(f)}, "t", 1, 1));
+    ASSERT_FALSE(schema.has_value());
+    EXPECT_EQ(schema.error(), rc::EncodeError::BadEnum);
+}
+
 TEST(CheckedWritesCatalogV3, V3KeepsNamespaces) {
     const auto t = event(rc::kFormatV3, createOps(0, keyIndexed()), "t", 1, 0, /*nsId=*/7);
     EXPECT_EQ(rc::decode(rc::encode(t).value()).value().nsId, 7u);
@@ -169,10 +180,12 @@ TEST(CheckedWritesCatalogV3, ApplyRefusesKeyIndexWithoutAKeyOrOnTransient) {
     auto a = put(s, event(rc::kFormatV3, noKey, "nk", 1, 0));
     ASSERT_FALSE(a.has_value());
     EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition);
+    EXPECT_NE(a.error().detail.find("key.index"), std::string::npos) << a.error().detail;
 
     auto b = put(s, event(rc::kFormatV3, createOps(0, keyIndexed(), rc::Persistence::Transient), "tr", 1, 0));
     ASSERT_FALSE(b.has_value());
     EXPECT_EQ(b.error().code, rc::ApplyError::Code::Precondition);
+    EXPECT_NE(b.error().detail.find("key.index"), std::string::npos) << b.error().detail;
     EXPECT_EQ(s.topics().size(), 0u) << "a refused event changes nothing";
 }
 
