@@ -2780,7 +2780,10 @@ private:
     void executeLiveActions_(Session& s, const rune::gateway::LiveActions& act);
     void sendErrorOn_(Session& s, int64_t corr, uint16_t code, std::string_view message);
     void noteEnforced_(int64_t offset, uint64_t opWorkers, bool lifecycle);
-    int32_t  currentImageSessionId_ = 0;   ///< the Aeron image (publication) session id of the frame being dispatched
+    /// The Aeron image of the frame being dispatched (Header::context()); valid only inside sub_->poll and cleared
+    /// after it. Never imageBySessionId mid-poll: it proposes the newest image list, which lets a threaded conductor
+    /// free the list and images the poll is still iterating.
+    aeron_image_t* currentImage_ = nullptr;
     std::vector<int64_t> authReapScratch_; ///< reused by reapAuthDeadlines_ (capacity persists)
     uint64_t authGateRefusals_ = 0;
     uint64_t bootstrapsRefused_ = 0;

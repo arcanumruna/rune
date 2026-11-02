@@ -30,6 +30,8 @@
 //       subsequent valid Ping still gets Pong (BR-4 coverage top-up)
 //  15.  correlationId distinctness: two Pings with different correlationIds →
 //       Pongs echo each id correctly (BR-4 coverage top-up)
+//  16.  Ingress image churn: Connects dispatched while images come and go never
+//       touch a freed image list (regression: imageBySessionId mid-poll)
 
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/SessionAckSink.h>
@@ -39,6 +41,7 @@
 #include <rune/protocol/client/MessageHeader.h>
 
 #include <Aeron.h>
+#include <ExclusivePublication.h>
 #include <Publication.h>
 #include <Subscription.h>
 #include <FragmentAssembler.h>
@@ -1192,6 +1195,59 @@ TEST_F(GatewayLoopbackFixture, ShardModeOversizedEgressChannelConnectIsRefusedRe
     EXPECT_EQ(resp.correlationId, 41);
     EXPECT_EQ(resp.code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
     EXPECT_EQ(gw_->sessionCount(), 0u) << "a refused connect created a session";
+}
+
+// ===========================================================================
+// TEST 16: Ingress image churn (regression).
+//
+// The Connect handler once looked its request image up with imageBySessionId inside sub_->poll. That proposes the
+// newest image list, so the (threaded) client conductor freed the list and images the poll was still iterating:
+// aeron_image_poll read a NULL subscriber position and the gateway segfaulted. Every new exclusive publication is a
+// new ingress image, so a churn thread opening/closing them while sending Connects keeps the list changing mid-poll.
+// ===========================================================================
+TEST_F(GatewayLoopbackFixture, IngressImageChurn_ConnectNeverTouchesAFreedImageList) {
+    std::atomic<bool> stop{false};
+    std::atomic<int64_t> sent{0};
+    std::thread churn([&]() {
+        uint8_t buf[512];
+        std::vector<std::shared_ptr<aeron::ExclusivePublication>> open;
+        int64_t correlationId = 1;
+        while (!stop.load(std::memory_order_acquire)) {
+            const int64_t regId = aeron_->addExclusivePublication("aeron:ipc", kIngressStream);
+            std::shared_ptr<aeron::ExclusivePublication> pub;
+            while (!pub && !stop.load(std::memory_order_acquire)) {
+                pub = aeron_->findExclusivePublication(regId);
+                if (!pub) std::this_thread::sleep_for(std::chrono::microseconds{50});
+            }
+            if (!pub) break;
+            open.push_back(std::move(pub));
+            for (int burst = 0; burst < 8; ++burst) for (const auto& p : open) {
+                pc::ConnectRequest req;
+                req.correlationId  = correlationId++;
+                req.egressStreamId = kEgressBase + 16;
+                req.clientVersion  = 1;
+                req.egressChannel  = "aeron:bogus";
+                const std::size_t len = req.encode(buf);
+                aeron::concurrent::AtomicBuffer ab(buf, static_cast<aeron::util::index_t>(len));
+                if (p->offer(ab, 0, static_cast<aeron::util::index_t>(len)) > 0) sent.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (open.size() >= 32) open.erase(open.begin());
+        }
+    });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    while (std::chrono::steady_clock::now() < deadline) gw_->doWork(nowNs());
+    stop.store(true, std::memory_order_release);
+    churn.join();
+    EXPECT_GT(sent.load(), 500) << "the churn sent too few Connects to exercise the race";
+
+    // The gateway survived and still serves (once the refused Connects drain).
+    int quiet = 0;
+    pump([&]() { quiet = gw_->pendingConnectCount() == 0 ? quiet + 1 : 0; return quiet >= 1000; }, nullptr, nullptr, kPumpIter,
+         "drain churn Connects");
+    auto client = makeClient(kEgressBase + 17);
+    auto resp = doConnect(*client.ingressPub, *client.egressSub, client.egressStreamId, client.egressChannel, 7, scratch_);
+    EXPECT_EQ(resp.code, static_cast<int16_t>(pc::ErrorCode::OK));
 }
 
 } // namespace rune::gateway
