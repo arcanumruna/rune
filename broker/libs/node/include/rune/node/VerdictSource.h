@@ -83,6 +83,7 @@ public:
         if (stallReason_ == StallReason::Full && state_ != nullptr && state_->rejected.size() < state_->rejected.capacity()) stalled_ = false;
     }
     [[nodiscard]] bool waitingForInstall() const noexcept { return waitingForInstall_; }
+    [[nodiscard]] bool activationPending() const noexcept { return needsActivation_; }
 
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);
     void removeVerdictView(int32_t viewTopicId);
@@ -141,7 +142,7 @@ private:
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
-    static void discardDirty_(ViewInstance& inst) noexcept;
+    static void discardKeyIndexDirty_(ViewInstance& inst) noexcept;
     [[nodiscard]] rune::view::Verdict verdictOf_(const Member& m, const rune::view::SourceRecord& rec) const noexcept;
     template <class ReadRangeFn>
     bool   switchSet_(int64_t changeOffset, ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted, int& work);

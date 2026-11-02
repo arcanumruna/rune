@@ -147,7 +147,7 @@ public:
         worker.reset();
         vs.reset();
         replica.reset();
-        if (cutTo >= 0) log->truncateTo(cutTo);
+        if (cutTo >= 0) (void)log->truncateTo(cutTo);
         log.reset();
         epoch_ = 1;   // the new replica starts at epoch 1
         vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
@@ -163,7 +163,7 @@ public:
         (void)replica->onFetchRequest(fr, now);
         passes(2);
     }
-    void truncateTo(int64_t offset) { log->truncateTo(offset); passes(5); }
+    void truncateTo(int64_t offset) { (void)log->truncateTo(offset); passes(5); }
     /// The replica cuts its log (a follower meeting a new leader's history): the log generation moves.
     void truncateReplicaTo(int64_t offset) { replica->truncateLogForTest(offset); passes(5); }
     /// Another replica takes over: this node's tail above the HW is gone and no memory survives.

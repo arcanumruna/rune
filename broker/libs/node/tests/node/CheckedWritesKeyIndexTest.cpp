@@ -158,7 +158,7 @@ TEST_P(CheckedWritesKeyIndexIntent, IntentTable) {
     EXPECT_EQ(r.index->table.size(), v.code != 0 ? before : (c.tombstone ? 0u : 1u));
 }
 
-INSTANTIATE_TEST_SUITE_P(Table, CheckedWritesKeyIndexIntent, ::testing::Values(
+INSTANTIATE_TEST_SUITE_P(CheckedWritesKeyIndex, CheckedWritesKeyIndexIntent, ::testing::Values(
     Cell{"UpsertExists", false, kUpsert, true, 0},   Cell{"UpsertAbsent", false, kUpsert, false, 0},
     Cell{"InsertExists", false, kInsert, true, kExists}, Cell{"InsertAbsent", false, kInsert, false, 0},
     Cell{"UpdateExists", false, kExisting, true, 0}, Cell{"UpdateAbsent", false, kExisting, false, kNotFound},
@@ -257,6 +257,72 @@ TEST(CheckedWritesKeyIndex, FoldReplaysUnjudgedAndSkips) {
     }
     EXPECT_EQ(cursor, 12);
     EXPECT_EQ(liveSet(stepped), live);
+
+    // A torn final batch (the one at 8..11): the cursor stops after the last whole batch (offset 8) and nothing of it is applied.
+    rune::view::ViewTable torn(keyIndexRowLayout(), 4096, kKeyIndexChunkBytes);
+    KeyIndexFold tf{torn, 8};
+    int64_t tornCursor = 0;
+    auto view = log.read(0);
+    view.len -= 5;
+    (void)foldKeyIndexBatch(tf, view, 12, tornCursor, skip);
+    EXPECT_EQ(tornCursor, 8);
+    EXPECT_EQ(liveSet(torn), (std::set<int64_t>{1, 2, 3}));
+}
+
+TEST(CheckedWritesKeyIndex, TombstoneIsNeverRejectedByAnOffsetRule) {
+    Rig r(false);
+    TestRejectRule rule;
+    rule.mode = TestRejectRule::Mode::OffsetSet;
+    rule.offsets[0] = 1;
+    rule.offsets[1] = 2;
+    rule.offsetCount = 2;
+    r.withReject(rule);
+    r.log.control();
+    r.log.data({put(1), del(1)});   // 1 (live, listed), 2 (tombstone, listed)
+    r.start();
+    EXPECT_EQ(r.verdictAt(1), V(kViolation, rune::view::constraintIdOf(7, 1)));
+    EXPECT_EQ(r.verdictAt(2), V(0, 0));
+}
+
+TEST(CheckedWritesKeyIndex, ActivationPendingUntilTheFirstDrive) {
+    Rig r;
+    r.st.constraintSets.onChange(0, r.set);
+    r.log.control();
+    r.vs.bindState(&r.st);
+    EXPECT_FALSE(r.vs.activationPending());
+    r.vs.bindLeader(nullptr, 1, 0);
+    EXPECT_TRUE(r.vs.activationPending());
+    r.drive();
+    EXPECT_FALSE(r.vs.activationPending());
+}
+
+TEST(CheckedWritesKeyIndex, AMemberWithoutAFixedKeyOfOneToEightBytesIsRefused) {
+    const auto build = [](rune::codec::Descriptor src, uint16_t keyField) {
+        ViewInstance inst(keyIndexPlan(5, keyField), keyIndexRowLayout(), std::move(src), false, 0, 4096, kKeyIndexChunkBytes);
+        VerdictSource vs(5, 0);
+        vs.addVerdictView(&inst, VerdictViewKind::KeyIndex, 0, kKeyIndexPlanFingerprint);
+    };
+    EXPECT_NO_THROW(build(tagSource(), 0));
+    EXPECT_THROW(build(tagSource(), 99), std::invalid_argument);   // no such field
+    const auto wide = rune::codec::DescriptorBuilder("w", 1).addFixedStr("k", 16, 1, true).build();
+    EXPECT_THROW(build(wide, 0), std::invalid_argument);
+    const auto text = rune::codec::DescriptorBuilder("t", 1).add("k", P::String, 1, true).build();
+    EXPECT_THROW(build(text, 0), std::invalid_argument);
+}
+
+TEST(CheckedWritesKeyIndex, ReplayOfAMalformedRecordDoesNotCountItAgain) {
+    Rig r;
+    Rec bad = put(5);
+    bad.keyBytes = 7;
+    r.log.control();
+    r.log.data({bad, put(6)});
+    r.start();
+    ASSERT_EQ(r.vs.stats().keyIndexSkippedMalformed, 1u);
+    r.index->foldCursor = 0;   // a rebuild: the member replays the log
+    r.drive();
+    EXPECT_EQ(r.index->foldCursor, r.vs.judgedThrough());
+    EXPECT_EQ(r.vs.stats().keyIndexSkippedMalformed, 1u);
+    EXPECT_TRUE(r.contains(6));
 }
 
 TEST(CheckedWritesKeyIndex, WordPacksEveryWidthInjectively) {
@@ -301,6 +367,7 @@ TEST(CheckedWritesKeyIndex, DirtyTrackingNeverGrows) {
         r.log.data(recs);
         r.drive();
         EXPECT_EQ(r.index->table.dirtyRids().size(), 0u) << "pass " << pass;
+        EXPECT_EQ(r.index->table.pendingDeleteCount(), 0u) << "pass " << pass;
     }
     EXPECT_EQ(r.vs.judgedThrough(), r.log.next);
 }

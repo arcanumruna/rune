@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 namespace rune::node {
 
@@ -62,7 +63,8 @@ void applyKeyIndex(KeyIndexFold& f, const rune::view::SourceRecord&, const rune:
 }
 
 rune::view::FoldStats foldKeyIndexBatch(KeyIndexFold& f, const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
-                                        const rune::view::FoldSkip& skip) noexcept {
+                                        const rune::view::FoldSkip& skipRef) noexcept {
+    const rune::view::FoldSkip skip = skipRef;   // #537: by value (see AbortedTxnFilter::skips)
     rune::view::FoldStats stats{};
     rune::view::Prospect  p;
     const int64_t from = cursor;
@@ -155,7 +157,9 @@ void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKi
     if (kind == rune::view::VerdictViewKind::KeyIndex) {
         const uint16_t keyField = inst->plan.keyFieldId[0];
         const auto it = std::find_if(inst->evolvingSrc.fields.begin(), inst->evolvingSrc.fields.end(), [&](const auto& f) { return f.id == keyField; });
-        if (it != inst->evolvingSrc.fields.end()) m.keyWidth = static_cast<uint8_t>(rune::codec::fieldWidth(*it));
+        const uint32_t width = it == inst->evolvingSrc.fields.end() ? 0 : rune::codec::fieldWidth(*it);
+        if (width == 0 || width > 8) throw std::invalid_argument("key index: the source key field must be fixed-width, 1 to 8 bytes");
+        m.keyWidth = static_cast<uint8_t>(width);
     }
     auto at = std::lower_bound(members_.begin(), members_.end(), viewObjectId, [](const Member& x, uint64_t id) { return x.objectId < id; });
     at = members_.insert(at, std::move(m));
@@ -330,7 +334,7 @@ void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexc
 }
 
 // The key index is never checkpointed: nothing will encode its dirty rows, so they are dropped (WorkerViewSet::discardDirty_'s rule).
-void VerdictSource::discardDirty_(ViewInstance& inst) noexcept {
+void VerdictSource::discardKeyIndexDirty_(ViewInstance& inst) noexcept {
     inst.table.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) noexcept {});
 }
 
@@ -377,6 +381,7 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
         else if (v.code == static_cast<uint16_t>(ErrorCode::KeyNotFound)) ++stats_.rejectionsKeyNotFound;
         else ++stats_.rejectionsConstraint;
         ++rejectedThisPass_;
+        // 56 and 57 file under constraintId 0 here; rejectionsKeyExists / rejectionsKeyNotFound tell them apart.
         auto* pc = std::find_if(stats_.perConstraint.begin(), stats_.perConstraint.begin() + stats_.perConstraintCount,
                                 [&](const auto& c) { return c.constraintId == v.constraintId; });
         if (pc == stats_.perConstraint.begin() + stats_.perConstraintCount && stats_.perConstraintCount < stats_.perConstraint.size())
@@ -398,8 +403,7 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
         const rune::view::FoldStats st = foldKeyIndexBatch(f, view, bound, cursor, skip);
         inst.foldCursor = cursor;
         inst.counters.skippedAborted += st.skippedAborted;
-        stats_.keyIndexSkippedMalformed += st.skippedMalformed;
-        discardDirty_(inst);
+        discardKeyIndexDirty_(inst);
         return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedRejected);
     }
     const rune::view::FoldStats st =
@@ -462,7 +466,7 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
     }
     for (const std::size_t i : active_) {
         members_[i].inst->foldCursor = judgeCursor_;
-        if (members_[i].kind == rune::view::VerdictViewKind::KeyIndex) discardDirty_(*members_[i].inst);
+        if (members_[i].kind == rune::view::VerdictViewKind::KeyIndex) discardKeyIndexDirty_(*members_[i].inst);
     }
     return work;
 }
