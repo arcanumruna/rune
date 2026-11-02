@@ -56,10 +56,10 @@ class ClientHangWarning(UserWarning):
 # 3 s: a static backlog streams at millisecond gaps (dr_client prints every record as it lands), so 3 s of silence
 # after every partition delivered is > 1000x the stream's own gap.
 DRAIN_QUIET_MS = int(os.environ.get("DR_DRAIN_QUIET_MS", "3000"))
-# BuildKit named context (as Dockerfile.dr spells it) -> directory name next to client-cpp/ in the monorepo.
+# BuildKit named context (as Dockerfile.dr spells it) -> directory under the monorepo root (next to client-cpp/).
 # flight-recorder lives in its own repository: FLIGHT_RECORDER_DIR, else a checkout next to the monorepo root.
 _DR_BUILD_CONTEXTS = {"rune-protocol": "protocol", "flight-recorder": None, "rune-codec": "codec",
-                      "rune-ql": "ql", "rune-crypto": "crypto"}
+                      "rune-ql": "ql", "rune-crypto": "crypto", "aeron-recipe": "conan/aeron"}
 
 
 def build_context_dir(name: str) -> str:
@@ -75,7 +75,7 @@ def ensure_dr_client_image() -> None:
     """Make sure DR_IMAGE was built from the current client checkout, or raise.
 
     DR_CLIENT_IMAGE set: the image must exist and carry `rune.client.sha == client HEAD`
-    (DR_ALLOW_STALE_CLIENT_IMAGE=1 explicitly accepts a mismatch).  Unset: build it (five sibling build
+    (DR_ALLOW_STALE_CLIENT_IMAGE=1 explicitly accepts a mismatch).  Unset: build it (six build
     contexts; a layer-cache hit when nothing changed); a failed build raises.
     """
     from .images import prepared

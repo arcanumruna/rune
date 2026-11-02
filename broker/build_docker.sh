@@ -45,6 +45,7 @@ docker buildx build \
   --build-context rune-protocol=../protocol \
   --build-context rune-codec=../codec \
   --build-context rune-crypto=../crypto \
+  --build-context aeron-recipe=../conan/aeron \
   --build-context rune-client=../client-cpp \
   --build-context rune-ql=../ql \
   --build-context flight-recorder="$FLIGHT_RECORDER_DIR" \

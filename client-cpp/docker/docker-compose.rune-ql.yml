@@ -40,6 +40,7 @@ services:
         arcanum-metrics: ${ARCANUM_METRICS_DIR:-../../../arcanum-metrics}                  # metrics lib (header-only sibling)
         rune-codec: ../../codec            # sibling checkout (same set as the broker's x-broker-build)
         rune-crypto: ../../crypto
+        aeron-recipe: ../../conan/aeron
     image: rune-broker-0c-node:${RUNE_IMAGE_TAG:-single}
     platform: linux/amd64
     hostname: rune-1

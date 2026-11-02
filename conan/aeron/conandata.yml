@@ -1,0 +1,7 @@
+# Aeron 1.51.0 + upstream 2f9e9e49f1 (aeron-io/aeron#2226): the C++ wrapper's unavailable-image callback dropped the
+# image's list reference, so the conductor freed images a poll was still iterating. Drop this recipe for the first
+# upstream release that carries the fix.
+sources:
+  1.51.0-rune.1:
+    sha256: 22386309bed6f17bd4ca68348299ad19cf5110591bad75e093d1e150683d271c
+    url: https://github.com/arcanumruna/aeron/archive/refs/tags/1.51.0-rune.1.tar.gz

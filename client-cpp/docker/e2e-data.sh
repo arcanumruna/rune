@@ -181,6 +181,7 @@ out=$(docker build \
     --build-context rune-codec="${CLIENT_REPO}/../codec" \
     --build-context rune-ql="${CLIENT_REPO}/../ql" \
     --build-context rune-crypto="${CLIENT_REPO}/../crypto" \
+    --build-context aeron-recipe="${CLIENT_REPO}/../conan/aeron" \
     -f "${CLIENT_REPO}/docker/Dockerfile.data" \
     -t "${DATA_IMAGE}" \
     "${CLIENT_REPO}" 2>&1); rc=$?

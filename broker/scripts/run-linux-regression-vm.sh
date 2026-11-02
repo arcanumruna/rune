@@ -52,9 +52,9 @@ done
 [ -n "$CACHE" ] || { echo "run-linux-regression-vm: no CMakeCache.txt in any of: ${cands[*]} (pass the build dir or set RUNE_BUILD_DIR)" >&2; exit 2; }
 val() { grep -E "^$1:" "$CACHE" | head -1 | cut -d= -f2-; }
 PROTO="$(cd "$(val RUNE_PROTOCOL_INCLUDE)/.." && pwd)"
-declare -a NAMES=(broker protocol client-cpp codec flight-recorder ql crypto arcanum-metrics)
+declare -a NAMES=(broker protocol client-cpp codec flight-recorder ql crypto arcanum-metrics conan/aeron)
 declare -a TREES=("$HERE" "$PROTO" "$(val RUNE_CLIENT_ROOT)" "$(val RUNE_CODEC_ROOT)" "$(val FLIGHT_RECORDER_DIR)" \
-                  "$(val RUNE_QL_ROOT)" "$(val RUNE_CRYPTO_ROOT)" "$(val ARCANUM_METRICS_DIR)")
+                  "$(val RUNE_QL_ROOT)" "$(val RUNE_CRYPTO_ROOT)" "$(val ARCANUM_METRICS_DIR)" "$ROOT/conan/aeron")
 for i in "${!TREES[@]}"; do
     t="${TREES[$i]}"
     [ -d "$t" ] || { echo "run-linux-regression-vm: ${NAMES[$i]} tree '$t' missing" >&2; exit 2; }
@@ -87,6 +87,7 @@ DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -f docker/Dockerfile --tar
     --build-context rune-protocol=../protocol --build-context flight-recorder=../flight-recorder \\
     --build-context arcanum-metrics=../arcanum-metrics \\
     --build-context rune-codec=../codec --build-context rune-crypto=../crypto \\
+    --build-context aeron-recipe=../conan/aeron \\
     --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$J -t "$IMG" . > "$RUN/builder.log" 2>&1 \\
     || { echo "builder stage failed:"; tail -30 "$RUN/builder.log"; exit 2; }
 CFG='cmake -S /src/broker -B /src/_build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/build/conan-release/build/Release/generators/conan_toolchain.cmake \\

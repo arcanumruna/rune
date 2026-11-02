@@ -167,13 +167,13 @@ def test_a_missing_prebuilt_image_is_an_error(drv, monkeypatch):
         d.ensure_dr_client_image()
 
 
-def test_without_an_image_override_the_harness_builds_it_with_all_five_contexts(drv, monkeypatch):
+def test_without_an_image_override_the_harness_builds_it_with_all_six_contexts(drv, monkeypatch):
     d = drv()
     r = _Runs()
     monkeypatch.setattr(d, "run", r)
     d.ensure_dr_client_image()
     (build,) = r.builds()
-    for name in ("rune-protocol", "flight-recorder", "rune-codec", "rune-ql", "rune-crypto"):
+    for name in ("rune-protocol", "flight-recorder", "rune-codec", "rune-ql", "rune-crypto", "aeron-recipe"):
         i = build.index(f"{name}={d.build_context_dir(name)}")
         assert build[i - 1] == "--build-context"
     assert ["--build-arg", f"RUNE_CLIENT_SHA={_SHA}"] == build[build.index("--build-arg"):build.index("--build-arg") + 2]
