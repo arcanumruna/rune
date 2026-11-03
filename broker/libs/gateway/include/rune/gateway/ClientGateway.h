@@ -2054,9 +2054,12 @@ private:
     void handleAlterView       (const uint8_t* buf, std::size_t len);
     template <class Msg, class Submit>
     void handleCatalogDdl_(const uint8_t* buf, std::size_t len, const char* what, Submit&& submit);
-    [[nodiscard]] static rune::gateway::DdlMetaView
+    /// Issue #652: `authenticated` is the QUALIFIED login name (`<ns>/<user>`; the bare user in `default`), built into
+    /// `ddlPrincipalScratch_` (control thread, cold DDL path), so a tenant's audit principal never equals a default user's.
+    [[nodiscard]] rune::gateway::DdlMetaView
         ddlMetaOf_(const rune::protocol::client::DdlExtension* ext, int64_t sessionId, const Session& session,
-                   uint32_t targetNsId) noexcept;
+                   uint32_t targetNsId);
+    std::string ddlPrincipalScratch_;
     void answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune::gateway::AdminSubmit r,
                             const char* ringFull, const char* tooLarge);
     /// Task 11: the DDL route gate — true = answered here (never submitted):

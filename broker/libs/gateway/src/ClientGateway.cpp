@@ -8258,7 +8258,7 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
 // client fields and a {0, 0} request id.  Views into the ingress buffer / session.
 // ---------------------------------------------------------------------------
 rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext, int64_t sessionId,
-                                                     const Session& session, uint32_t targetNsId) noexcept
+                                                     const Session& session, uint32_t targetNsId)
 {
     rune::gateway::DdlMetaView m;
     m.targetNsId    = targetNsId;   // namespaces Task 10: the object's resolved namespace (kHiddenNsId = answered missing)
@@ -8266,9 +8266,22 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
     m.sourceAddress = session.sourceIdentity;   // the Connect image's source, never the declared channel (#227)
     // The authenticated user (Task 11; Task 12 makes the catalog principal carry it too): a view into the session's
     // auth state, copied by the admin ring submit before this frame's handler returns.
-    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) m.authenticated = a->user;
-    else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session.auth)) m.authenticated = p->user;
     m.callerNsId = sessionNsId_(session);   // namespaces Task 9: the login's namespace (0 = `default` / anonymous)
+    const std::string* user = nullptr;
+    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = &a->user;
+    else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session.auth)) user = &p->user;
+    if (user != nullptr) {
+        // Issue #652 (D3): `<ns>/<user>`; `default` stays bare.  A namespace the registry no longer knows (a delete
+        // race) falls back to `#<nsId>/<user>`, which cannot collide with a valid namespace name.
+        ddlPrincipalScratch_.clear();
+        if (m.callerNsId != rune::catalog::kDefaultNsId) {
+            if (const auto* ns = namespaces_.registry().byId(m.callerNsId)) ddlPrincipalScratch_.append(ns->name);
+            else { ddlPrincipalScratch_.push_back('#'); ddlPrincipalScratch_.append(std::to_string(m.callerNsId)); }
+            ddlPrincipalScratch_.push_back('/');
+        }
+        ddlPrincipalScratch_.append(*user);
+        m.authenticated = ddlPrincipalScratch_;
+    }
     if (ext != nullptr) {
         m.statement         = ext->statement;
         m.clientName        = ext->clientName;
