@@ -15,6 +15,7 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -151,6 +152,18 @@ namespace {
 bool isControlBatch(const rune::protocol::RecordBatchReader& r) {
     return (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0;
 }
+// The validity gate of a cleaner walk (#804).  A checked-writes control record (no producer id, control bit) is validated ONCE, by
+// parseControl, whose result `ctl` the caller reuses; every other batch (data, a transaction marker) by ensureValid.  A control
+// batch parseControl refuses (type 20 and above, or a damaged one) falls back to ensureValid: only a CRC-damaged one stops the walk.
+bool validateBatch(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t total,
+                   std::optional<rune::storage::control_record::ControlRecord>& ctl) {
+    ctl.reset();
+    if (r.producerId() < 0 && (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0) {
+        ctl = rune::storage::control_record::parseControl(batch, total);
+        if (ctl) return true;
+    }
+    return r.ensureValid();
+}
 bool isTransactionalBatch(const rune::protocol::RecordBatchReader& r) {
     return (static_cast<uint16_t>(r.attributes()) &
             static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional)) != 0;
@@ -234,12 +247,13 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             const int32_t total = r.totalLength();
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
-            if (!r.ensureValid()) break;
+            std::optional<cr::ControlRecord> ctl;
+            if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;   // a control record: validated once (#804)
             const int64_t base = r.baseOffset();
             if (base >= scanEnd) break;
             const int64_t pid  = r.producerId();
-            if (pid < 0 && isControlBatch(r)) {   // a checked-writes control record (16-19): validated once (#804)
-                if (const auto c = cr::parseControl(buf.data() + pos, static_cast<std::size_t>(total))) {
+            if (pid < 0 && isControlBatch(r)) {   // a checked-writes control record (16-19)
+                if (const auto& c = ctl) {
                     switch (c->type) {
                     case cr::kVerdictMarker:
                         if (const auto m = cr::parseMarker(*c)) {
@@ -290,11 +304,11 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
 // horizon, a pass at/after the horizon drops it).  Without a wall clock (nowMs < 0,
 // the legacy path) a marker is never removed.
 enum class MarkerAction { Keep, Stamp, Drop };
-MarkerAction markerAction(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t batchLastOffset,
-                          Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts, int64_t nowMs) {
+MarkerAction markerAction(const rune::protocol::RecordBatchReader& r, const std::optional<rune::storage::control_record::ControlRecord>& c,
+                          int64_t batchLastOffset, Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts,
+                          int64_t nowMs) {
     if (nowMs < 0 || batchLastOffset >= cleanBoundaryOffset) return MarkerAction::Keep;
     if (r.producerId() < 0) {   // a checked-writes control record (16-19): its own rules
-        const auto c = rune::storage::control_record::parseControl(batch, len);
         const int type = c ? c->type : rune::storage::control_record::kUnparseable;
         if (type == rune::storage::control_record::kUnparseable || verdicts == nullptr ||
             verdicts->keepsControlRecord(r.baseOffset(), static_cast<int16_t>(type)))
@@ -324,10 +338,11 @@ void appendStampedControlBatch(std::vector<uint8_t>& out, const uint8_t* batch, 
 // D3b: the rewrite's handling of one control batch (shared by every path).
 // Returns true iff the segment's content changed.
 bool rewriteControlBatch(std::vector<uint8_t>& out, const uint8_t* batch, std::size_t len,
-                         const rune::protocol::RecordBatchReader& r, int64_t batchLastOffset,
+                         const rune::protocol::RecordBatchReader& r,
+                         const std::optional<rune::storage::control_record::ControlRecord>& ctl, int64_t batchLastOffset,
                          Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts, int64_t nowMs,
                          int64_t deleteRetentionMs) {
-    switch (markerAction(r, batch, len, batchLastOffset, cleanBoundaryOffset, txn, verdicts, nowMs)) {
+    switch (markerAction(r, ctl, batchLastOffset, cleanBoundaryOffset, txn, verdicts, nowMs)) {
         case MarkerAction::Drop:  return true;
         case MarkerAction::Stamp: appendStampedControlBatch(out, batch, len, nowMs + deleteRetentionMs); return true;
         case MarkerAction::Keep:  break;
@@ -531,8 +546,10 @@ bool LogCleaner::rewriteSegmentImpl(
         int32_t total = r.totalLength();
         // A3: bounds check before CRC; a corrupt totalLength must not misparse the walk.
         if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
-        // A3: CRC-gate the walk — stop on the first corrupt batch.
-        if (!r.ensureValid()) break;
+        // A3: CRC-gate the walk — stop on the first corrupt batch.  A checked-writes control record is validated once, by
+        // parseControl (#804); its result goes on to markerAction.
+        std::optional<rune::storage::control_record::ControlRecord> ctl;
+        if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;
 
         // CP-8: KIP-534 delete-horizon gate.
         // CONTRACT: when hasDeleteHorizon() is true, baseTimestamp() IS the horizon
@@ -581,7 +598,7 @@ bool LogCleaner::rewriteSegmentImpl(
             continue;
         }
         if (isControlBatch(r)) {   // D3: markers are never key-compacted; D3b: removed once empty + past horizon
-            if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, batchLastOffset,
+            if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, ctl, batchLastOffset,
                                     cleanBoundaryOffset, txn, verdicts, nowMs, deleteRetentionMs))
                 modified = true;
             pos += static_cast<size_t>(total);
@@ -1479,7 +1496,8 @@ void LogCleaner::mergeGroupWithMap(
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             int32_t total = r.totalLength();
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
-            if (!r.ensureValid()) break;
+            std::optional<rune::storage::control_record::ControlRecord> ctl;   // a control record is validated once (#804)
+            if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;
 
             // CP-8: horizon gate (same logic as rewriteSegmentImpl).
             const bool batchHasHorizon  = r.hasDeleteHorizon();
@@ -1512,7 +1530,7 @@ void LogCleaner::mergeGroupWithMap(
                 continue;
             }
             if (isControlBatch(r)) {   // D3: never key-compacted; D3b: removed once empty + past horizon
-                if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, batchLastOffset,
+                if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, ctl, batchLastOffset,
                                         passEnd, txn, verdicts, nowMs, deleteRetentionMs))
                     modified = true;
                 pos += static_cast<size_t>(total);

@@ -1,7 +1,9 @@
 // Part 04 Task 8: the cleaner on a verdict source - VerdictCleanState, the bound at W, the rewrite rules.
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
+#include <fstream>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -396,6 +398,79 @@ TEST(CheckedWritesVerdictCleanerRegression, MarkerKeptUntilEveryReplicaFetchedIt
         clean(log, Path::Range, kMax, 9, /*markerRemovalBound=*/4, t0 + 5000);
         EXPECT_FALSE(hasBatchAt(log, 3)) << "dropped at the horizon";
         EXPECT_TRUE(hasBatchAt(log, 5)) << "the last marker is the coverage";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+namespace {
+// Flips the last byte of the batch whose base offset is `off`, in whichever segment file holds it (its CRC no longer matches).
+bool flipLastByteOfBatch(const std::string& dir, int64_t off) {
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() != ".log") continue;
+        std::vector<uint8_t> buf(std::filesystem::file_size(e.path()));
+        {
+            std::ifstream in(e.path(), std::ios::binary);
+            in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+        }
+        for (std::size_t pos = 0; pos + rune::protocol::batch::kRecordBatchOverhead <= buf.size();) {
+            rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+            const std::size_t total = static_cast<std::size_t>(r.totalLength());
+            if (total < rune::protocol::batch::kRecordBatchOverhead || pos + total > buf.size()) break;
+            if (r.baseOffset() == off) {
+                std::fstream f(e.path(), std::ios::binary | std::ios::in | std::ios::out);
+                f.seekp(static_cast<std::streamoff>(pos + total - 1));
+                const char flipped = static_cast<char>(buf[pos + total - 1] ^ 0xFF);
+                f.write(&flipped, 1);
+                return true;
+            }
+            pos += total;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+// #804: the cleaner's walks validate a control record once, in parseControl, and a data batch with ensureValid.  Neither may be
+// weakened: a damaged marker is not read, and a damaged data batch stops the walk before the marker behind it.  (There is no CRC
+// counter seam, so the single validation is held by the code shape; this guards the refusals that must survive it.)
+TEST(CheckedWritesVerdictCleanerRegression, CleanerWalkRefusesADamagedMarkerAndADamagedDataBatchRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), /*segmentBytes=*/1 << 20);   // one segment: a damaged batch stops the walk of everything behind it
+        log.recover();
+        change(log, 0, true);
+        for (int64_t o = 1; o < 7; ++o) data(log, o, "pad" + std::to_string(o), "p");
+        data(log, 7, "k", "rejected");
+        for (int64_t o = 8; o < 15; ++o) data(log, o, "pad" + std::to_string(o), "p");
+        marker(log, 15, 1, 15, {7});
+        data(log, 16, "tail", "t");
+        const auto bases = log.segmentBaseOffsets();
+        const auto scan = [&](bool& rejected, int64_t& limit) {
+            LogCleaner cleaner;
+            cleaner.setVerdictBounds(kMax, 16);
+            SkimpyOffsetMap map(1024);
+            cleaner.buildOffsetMapFromBases(log.dir(), bases, 0, /*toOffset=*/10, map);
+            rejected = map.verdictState().isRejected(7);
+            limit    = map.verdictState().cleanLimit();
+        };
+        bool rejected = false;
+        int64_t limit = 0;
+        scan(rejected, limit);
+        ASSERT_TRUE(rejected) << "intact: the marker is read";
+        ASSERT_GE(limit, 8);
+
+        ASSERT_TRUE(flipLastByteOfBatch(log.dir(), 15));   // the marker
+        scan(rejected, limit);
+        EXPECT_FALSE(rejected) << "a damaged marker is refused";
+        EXPECT_LT(limit, 8);
+        ASSERT_TRUE(flipLastByteOfBatch(log.dir(), 15));   // restored
+
+        ASSERT_TRUE(flipLastByteOfBatch(log.dir(), 3));    // a data batch before the marker
+        scan(rejected, limit);
+        EXPECT_FALSE(rejected) << "a damaged data batch stops the walk before the marker behind it";
+        ASSERT_TRUE(flipLastByteOfBatch(log.dir(), 3));
+        scan(rejected, limit);
+        EXPECT_TRUE(rejected) << "restored: read again";
     }
     std::filesystem::remove_all(dir);
 }
