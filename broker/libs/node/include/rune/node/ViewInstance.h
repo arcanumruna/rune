@@ -55,7 +55,8 @@ namespace rune::node {
 // checkpoint + a replay of its own committed source log — no cluster/peer
 // dependency, no cross-thread coordination.  It is bounded by the checkpoint
 // cadence (each rebuild pass folds a bounded committed range), deadlock-free,
-// and monotone (Recovering -> RebuildingViews -> (CatchingUp ->) Ready), except Ready -> CatchingUp on a new source leadership.
+// and monotone (Recovering -> RebuildingViews -> (CatchingUp ->) Ready), except Ready -> CatchingUp on a new source
+// leadership and, from either, back to RebuildingViews when beginDiscard_ throws the rows away.
 enum class ViewReadiness : uint8_t { Recovering, RebuildingViews, CatchingUp, Ready };
 
 // Namespaces Phase 2 Task 12 (D26): a view's run state over its namespace's memory limit.  ORTHOGONAL to ViewReadiness
@@ -204,8 +205,8 @@ struct ViewInstance {
     // path.  The full writer list (state graph: the ViewReadiness comment above):
     //   * defaults to Ready (a plain driveFolds instance);
     //   * set to RebuildingViews (or Ready when already caught up) at restart recovery by installViewForRecovery and
-    //     loadRecoveryCheckpoint_ (foldCursor vs. committedTail), and lowered to RebuildingViews by
-    //     beginDiscard_;
+    //     loadRecoveryCheckpoint_ (foldCursor vs. committedTail);
+    //   * beginDiscard_ is the one writer that lowers Ready or CatchingUp to RebuildingViews (the rows are thrown away);
     //   * lowered Ready -> CatchingUp on a new source leadership (N-C1) by driveView_ step 0b and flipVerdictMembers_;
     //   * raised to CatchingUp / Ready only by driveView_ (step 1b and after the fold), flipVerdictMembers_ and
     //     driveRebuild's caught-up block, all gated on foldCursor >= the bound and on leaderHwConfirmed (Ready only

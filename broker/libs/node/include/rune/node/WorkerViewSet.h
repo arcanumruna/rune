@@ -185,8 +185,8 @@ public:
     // partition) that is still RebuildingViews: fold the committed range
     // [foldCursor, committedTail) through the SAME driveFolds machinery (same
     // readRange idiom), then flip that instance RebuildingViews -> Ready once
-    // foldCursor >= committedTail (CatchingUp instead while the leader's HW has not reached its start offset, N-C1).  committedTail is the source partition's LSO
-    // (passed in by the caller, exactly as driveFolds' `bound`).  Templated so
+    // foldCursor >= committedTail (CatchingUp instead while the leader's HW has not reached its start offset, N-C1).
+    // committedTail is the source partition's LSO (passed in by the caller, exactly as driveFolds' `bound`).  Templated so
     // readRange inlines (no std::function).  Returns the progress count (records
     // folded + deltas handled this pass) so the idle strategy stays hot while a
     // rebuild is pending.  Bounded: each pass folds at most one committed range;
@@ -332,7 +332,7 @@ public:
     // worker-owned state.
     //
     // SERVE-GUARD (Task 16, Review-focus #5): when the hosted instance is NOT
-    // Ready (still RebuildingViews/Recovering after a restart) getRow returns
+    // Ready (RebuildingViews/Recovering after a restart or a discard, or CatchingUp) getRow returns
     // nullptr with `*outStatus = NotReady` — a RETRIABLE not-ready that the
     // GetViewRow serve path surfaces so a probe never sees a half-built row.
     // `outStatus` is optional (nullptr ignores it), keeping every existing

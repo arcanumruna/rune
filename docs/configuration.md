@@ -81,6 +81,8 @@ them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this vers
 | Variable | Default | Meaning |
 |---|---|---|
 | `RUNE_STORAGE_FORMAT` | unset (never format) | `new`, `join` or `auto`. Read only when the data directory is empty and not formatted. Unset: the broker refuses to start (exit 78) and prints the command. `auto` is development only. See [SELF-HOSTING](../broker/docs/SELF-HOSTING.md#formatting-the-data-directory). |
+| `RUNE_VIEW_BACKUP` | `1` | `0`/`1`/`true`/`false`. When on, a view checkpoint file the broker throws away (see [View checkpoint backups](operations.md#view-checkpoint-backups)) is copied to `<data dir>/__view_snapshots/backup/` first. Off: it is deleted. |
+| `RUNE_VIEW_BACKUPS_KEPT` | `3` | 1 to 1000. Backups kept per view partition; the oldest are removed beyond that. |
 | `RUNE_STORAGE_RECOVERY_VOTE` | off | `1`/`true`/`TRUE`. Unsafe, disaster recovery only: lets an unconfirmed (replaced-disk) node vote. Logged at critical level. |
 | `RUNE_AERON_DIR` | `<data dir>/aeron` | Aeron directory (CnC file and mapped term buffers). Put it on tmpfs (`/dev/shm`) for performance. |
 | `RUNE_METRICS_FILE` | `<data dir>/metrics/rune-metrics.dat` | The broker's metrics file (arcanum-metrics format), created afresh at every start; the broker refuses to start if it cannot create it. Read it with `rune_role`. Metrics: [operations](operations.md#metrics). |
