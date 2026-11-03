@@ -88,7 +88,7 @@ ReapStatus GroupCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t 
     if (!none) return r->logEndOffset() > leo0 ? ReapStatus::More : ReapStatus::Refused;
     if (r->highWatermark() < r->logEndOffset()) return ReapStatus::Waiting;   // the commit is awaited (nothing for the reaper to write)
     for (auto it = coordinators_.begin(); it != coordinators_.end();) {   // #663: the deleted namespace's in-memory groups go
-        if (rune::coordination::parseScopedId(it->first).nsId == nsId) it = coordinators_.erase(it);
+        if (nsId != 0 && rune::coordination::parseScopedId(it->first).nsId == nsId) it = coordinators_.erase(it);
         else ++it;
     }
     return ReapStatus::Done;

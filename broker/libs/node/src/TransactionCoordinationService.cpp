@@ -504,7 +504,7 @@ ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uin
     if (loadState_ != LoadState::Loaded) return ReapStatus::Refused;
     (void)coordinator_.abortAllForNamespace(nsId, nowNs);   // idempotent: anything still open ends now
     if (coordinator_.unsettledOfNamespace(nsId) != 0) return ReapStatus::Refused;
-    forgetNamespace_(nsId);   // #663 / #727: before the tombstones, so nothing in memory can write a record back after them
+    if (nsId != 0) forgetNamespace_(nsId);   // `default` is never deleted (the store keeps its records too); #663 / #727: before the tombstones, so nothing in memory can write a record back after them
     rune::replication::PartitionReplica* r = txnState_->replica();
     const rune::replication::Offset leo0 = r->logEndOffset();
     const bool none = txnState_->tombstoneNamespace(nsId, batch, nowNs);
