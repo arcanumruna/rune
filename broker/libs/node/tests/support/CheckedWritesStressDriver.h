@@ -53,6 +53,7 @@ public:
     struct NodeSnap {
         int id = 0, part = 0;
         int64_t leo = 0, hw = 0, logStart = 0;
+        bool leader = false;                                 ///< the replica led when it was read
         VerdictRig::RigLog log;                              ///< below the HW
         std::map<int64_t, ModelVerdict> index;               ///< the node's RejectedOffsetIndex
         uint64_t mismatches = 0, unknownDuplicates = 0, skippedMalformed = 0;
@@ -150,33 +151,12 @@ public:
         ASSERT_TRUE(rune::node::test::catalog_cluster::awaitLeaders(c_, topicId_, parts_, leaders, wait_(60s)));
         const auto deadline = Clock::now() + wait_(90s);
         std::string last;
-        for (int poll = 0; poll < kPollCap && Clock::now() < deadline; ++poll) {
+        for (int poll = 0; poll < kPollCap && Clock::now() < deadline; ++poll, std::this_thread::sleep_for(100ms)) {
             snapAll_();
-            bool ok = snaps_.size() == 3 * static_cast<std::size_t>(parts_);
-            last.clear();
-            for (int p = 0; p < parts_; ++p) {
-                const NodeSnap* lead = leaderOf_(snaps_, p);
-                const int64_t end = lead != nullptr ? dataEnd_(lead->log) : 0;
-                ok = ok && lead != nullptr && lead->hw == lead->leo;
-                for (const NodeSnap& s : snaps_) ok = ok && (s.part != p || lead == nullptr || (s.leo == lead->leo && s.hw == lead->hw));
-                ok = ok && lead != nullptr && lead->committedThrough >= end && lead->covered >= end;
-                last += lead == nullptr ? "no leader" : "p" + std::to_string(p) + " leo " + std::to_string(lead->leo) + " hw " + std::to_string(lead->hw) + " committed " + std::to_string(lead->committedThrough) + " end " + std::to_string(end);
-                last += " ";
-            }
-            if (ok) {
+            if (atRest_(&last)) {
                 recordHistory_(&snaps_);
                 return;
             }
-            for (const int id : c_.runningNodes()) {
-                const int32_t t = topicId_;
-                for (int p = 0; p < parts_; ++p)
-                    last += " | j" + std::to_string(id) + "=" + std::to_string(c_.node(id).onWorkerThreadForTest(worker_(id, p), [t, p](Worker& wk) {
-                        const VerdictSource* j = wk.viewSet()->verdictSource(t, p);
-                        return j == nullptr ? 0 : 1 + (j->waitingForInstall() ? 2 : 0) + (j->stalled() ? 4 : 0);
-                    })) + " ";
-            }
-            for (const NodeSnap& s : snaps_) last += " | n" + std::to_string(s.id) + "p" + std::to_string(s.part) + " leo " + std::to_string(s.leo) + " hw " + std::to_string(s.hw) + " cov " + std::to_string(s.covered) + " com " + std::to_string(s.committedThrough);
-            std::this_thread::sleep_for(100ms);
         }
         ADD_FAILURE() << "seed " << seed_ << ": the cluster did not come to rest (" << last << ")";
     }
@@ -185,8 +165,6 @@ public:
 
     /// Judges the history and runs every invariant; the name of the first that fails (and why) lands in `failed`.
     [[nodiscard]] bool checkAll(std::string* failed) {
-        snapAll_();
-        recordHistory_(&snaps_);
         awaitCompaction_();
         compactedAway_ = 0;   // measured before the invariants: the first failure ends checkAll
         for (const NodeSnap& s : snaps_) {
@@ -614,6 +592,7 @@ private:
             s.leo = r.logEndOffset();
             s.hw = r.highWatermark();
             s.logStart = r.log()->logStartOffset();
+            s.leader = r.role() == rune::replication::Role::Leader;
             s.log = readLogOf(*r.log(), s.hw);
             return 0;
         });
@@ -645,8 +624,10 @@ private:
         for (const int id : c_.runningNodes())
             for (int p = 0; p < parts_; ++p) snaps_.push_back(snapNode_(id, p));
     }
-    /// The partition's leader (its worker holds the judge and the index); a node mid-restart is passed over.
+    /// The partition's leader (its worker holds the judge and the index): the replica that led when it was read, else the metadata's
+    /// leader; a node mid-restart is passed over.
     const NodeSnap* leaderOf_(const std::vector<NodeSnap>& snaps, int part) {
+        for (const NodeSnap& s : snaps) if (s.part == part && s.leader) return &s;
         std::vector<int32_t> leaders;
         const int32_t id = rune::node::test::catalog_cluster::awaitLeaders(c_, topicId_, parts_, leaders, 5s) ? leaders[static_cast<std::size_t>(part)] : -1;
         const NodeSnap* best = nullptr;
@@ -701,16 +682,47 @@ private:
         return out;
     }
 
-    /// Waits for the cleaner to remove a superseded record from a node's log (the history is already recorded).
+    /// Every node read, one leader per partition, every replica caught up and that leader's judge past every record: a leadership
+    /// that moved after quiesce() (a restarted node taking its partition back) is not at rest until its scan has rebuilt the index.
+    bool atRest_(std::string* last) {
+        bool ok = snaps_.size() == 3 * static_cast<std::size_t>(parts_);
+        last->clear();
+        for (int p = 0; p < parts_; ++p) {
+            const NodeSnap* lead = leaderOf_(snaps_, p);
+            const int64_t end = lead != nullptr ? dataEnd_(lead->log) : 0;
+            ok = ok && lead != nullptr && lead->leader && lead->hw == lead->leo;
+            for (const NodeSnap& s : snaps_) ok = ok && (s.part != p || lead == nullptr || (s.leo == lead->leo && s.hw == lead->hw && (&s == lead || !s.leader)));
+            ok = ok && lead != nullptr && lead->committedThrough >= end && lead->covered >= end;
+            *last += lead == nullptr ? "no leader" : "p" + std::to_string(p) + " leo " + std::to_string(lead->leo) + " hw " + std::to_string(lead->hw) + " committed " + std::to_string(lead->committedThrough) + " end " + std::to_string(end);
+            *last += " ";
+        }
+        if (ok) return true;
+        for (const int id : c_.runningNodes()) {
+            const int32_t t = topicId_;
+            for (int p = 0; p < parts_; ++p)
+                *last += " | j" + std::to_string(id) + "=" + std::to_string(c_.node(id).onWorkerThreadForTest(worker_(id, p), [t, p](Worker& wk) {
+                    const VerdictSource* j = wk.viewSet()->verdictSource(t, p);
+                    return j == nullptr ? 0 : 1 + (j->waitingForInstall() ? 2 : 0) + (j->stalled() ? 4 : 0);
+                })) + " ";
+        }
+        for (const NodeSnap& s : snaps_) *last += " | n" + std::to_string(s.id) + "p" + std::to_string(s.part) + (s.leader ? " leader" : "") + " leo " + std::to_string(s.leo) + " hw " + std::to_string(s.hw) + " cov " + std::to_string(s.covered) + " com " + std::to_string(s.committedThrough);
+        return false;
+    }
+
+    /// Waits, at rest, for the cleaner to remove a superseded record from a node's log: the invariants judge that snapshot.
     void awaitCompaction_() {
         const auto deadline = Clock::now() + wait_(60s);
+        std::string last;
         for (int poll = 0; poll < kPollCap && Clock::now() < deadline; ++poll, std::this_thread::sleep_for(200ms)) {
             snapAll_();
+            recordHistory_(&snaps_);
+            if (!atRest_(&last)) continue;
             for (const NodeSnap& s : snaps_) if (s.log.data.size() < data_[static_cast<std::size_t>(s.part)].size()) return;
+            last = "at rest, nothing compacted";
         }
         std::size_t committed = 0;
         for (const auto& d : data_) committed += d.size();
-        ADD_FAILURE() << "seed " << seed_ << ": no node's log lost a superseded record in " << wait_(60s).count() << " s (" << committed << " committed records)";
+        ADD_FAILURE() << "seed " << seed_ << ": no node's log at rest lost a superseded record in " << wait_(60s).count() << " s (" << committed << " committed records; " << last << ")";
     }
 
     /// A key-index poll is a 10 s deadline; 04's keep theirs.
