@@ -727,8 +727,13 @@ public:
                 members.push_back({gb, lineage});
             }
             auto prebuilt = g.hasOutput ? log->openCleanedOutput(g.bases.front(), g.seq, g.nextOffset) : nullptr;
-            EXPECT_TRUE(log->enqueueCleanedGroup(members.data(), members.size(), g.seq, g.hasOutput, g.nextOffset, prebuilt.get()));
-            (void)prebuilt.release();   // the owner owns it now
+            bool queued = false;
+            for (int tries = 0; !queued && tries < kMaxPass; ++tries) {   // a full swap ring (256 slots) is drained by the owner, one group per call
+                queued = log->enqueueCleanedGroup(members.data(), members.size(), g.seq, g.hasOutput, g.nextOffset, prebuilt.get());
+                if (!queued) out.installed += replica->drainCleanerSwapsOnOwner();
+            }
+            EXPECT_TRUE(queued);
+            if (queued) (void)prebuilt.release();   // the owner owns it now
         }
         if (drain) out.installed = drainSwaps();
         return out;

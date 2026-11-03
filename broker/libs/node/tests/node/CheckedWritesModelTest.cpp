@@ -2,14 +2,18 @@
 // write through the ack path (with retries); the leader fails over, the tail is cut, the cleaner runs, and the constraint set
 // gets a member installed, replaced and dropped.  After every step the shared matrix invariants (index, markers, views, delivery)
 // hold against the model, built from every committed record the history ever held.  The cluster stress (ThreeNodes) is in
-// CheckedWritesStressTest.cpp.
+// CheckedWritesStressTest.cpp.  Part 05 adds the same check on a key.index topic (CheckedWritesKeyIndexModelRegression, below).
 #include "CheckedWritesChecks.h"
 #include "CheckedWritesRig.h"
 
+#include <rune/view/Verdict.h>
+
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <random>
 #include <set>
+#include <string>
 
 using namespace rune::node;
 using namespace rune::node::cw;
@@ -210,3 +214,438 @@ TEST_P(CheckedWritesModelRegression, SameSeedSameTrace) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesModelRegression, ::testing::Values(1, 2, 3, 4, 5, 6));
+
+
+// ---- Checked writes Part 05 Task 9: the same check on a key.index topic --------------------------------------------------------
+// Two idempotent All | View producers send the five ops on 8 keys in batches of 1-8 records (so keys repeat within a batch), a
+// non-idempotent acks=leader producer sends plain upserts and removes, a TestReject{TagEquals{9}} member is installed, replaced and
+// dropped, and the leader fails over, is demoted, restarts, loses its tail, compacts and commits or aborts a transaction.  The
+// model is Task 8's: the key index rule answers 56 / 57 from the live keys of the accepted records before the judged one.
+namespace {
+constexpr uint64_t kKiKeys = 8;
+constexpr int kKiSteps = 250;
+constexpr int64_t kKiTxnPidBase = 900;
+constexpr int32_t kKiRejBase = 0x40000700;
+constexpr int16_t kNotLeaderCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+constexpr uint8_t kAcksLeader = 0, kAcksWireAll = rune::protocol::client::kAcksWireAll;
+constexpr uint8_t kAcksViewAll = rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll;
+
+enum class KiAction : uint8_t { Intents, Plain, RetryBeforeJudge, RetryAfterJudge, RejectMember, Failover, DemotePromote, Restart, TruncateTail, Compact, Transaction };
+const char* nameOf(KiAction a) {
+    switch (a) {
+    case KiAction::Intents: return "Intents";
+    case KiAction::Plain: return "Plain";
+    case KiAction::RetryBeforeJudge: return "RetryBeforeJudge";
+    case KiAction::RetryAfterJudge: return "RetryAfterJudge";
+    case KiAction::RejectMember: return "RejectMember";
+    case KiAction::Failover: return "Failover";
+    case KiAction::DemotePromote: return "DemotePromote";
+    case KiAction::Restart: return "Restart";
+    case KiAction::TruncateTail: return "TruncateTail";
+    case KiAction::Compact: return "Compact";
+    default: return "Transaction";
+    }
+}
+
+class KiRun {
+public:
+    explicit KiRun(uint64_t seed) : rng_(seed), rig_(/*follower=*/true, /*rollBytes=*/1) {
+        rig_.createKeyIndex();
+        installTag_();
+        rig_.installProjection(kProj);
+        rig_.installCountById(kCnt);
+        rig_.enableAcks();
+        rig_.passes(60);
+        rig_.followerFetch();
+        rig_.passes(10);
+        waitActive_();
+        for (int p = 0; p < 2; ++p) producers_[p].pid = 500 + p;
+    }
+
+    std::string trace;
+
+    KiAction pick() {
+        const unsigned r = static_cast<unsigned>(rng_() % 100);
+        if (r < 40) return KiAction::Intents;
+        if (r < 50) return KiAction::Plain;
+        if (r < 55) return KiAction::RetryBeforeJudge;
+        if (r < 60) return KiAction::RetryAfterJudge;
+        if (r < 66) return KiAction::RejectMember;
+        if (r < 71) return KiAction::Failover;
+        if (r < 75) return KiAction::DemotePromote;
+        if (r < 79) return KiAction::Restart;
+        if (r < 83) return KiAction::TruncateTail;
+        if (r < 89) return KiAction::Compact;
+        return KiAction::Transaction;
+    }
+
+    void step(KiAction action) {
+        switch (action) {
+        case KiAction::Intents: trace += "i"; intents_(); break;
+        case KiAction::Plain: trace += "P"; plain_(); break;
+        case KiAction::RetryBeforeJudge: trace += "b"; retry_(false); break;
+        case KiAction::RetryAfterJudge: trace += "a"; retry_(true); break;
+        case KiAction::RejectMember: rejectMember_(); break;
+        case KiAction::Failover:
+            trace += "F";
+            settle_();
+            rig_.failover();
+            leadershipBarrier_();
+            break;
+        case KiAction::DemotePromote:
+            trace += "D";
+            settle_();
+            rig_.demotePromote();
+            leadershipBarrier_();
+            break;
+        case KiAction::Restart:
+            trace += "S";
+            settle_();
+            rig_.restart(true);
+            leadershipBarrier_();
+            break;
+        case KiAction::TruncateTail:
+            trace += "T";
+            settle_();
+            ASSERT_EQ(rig_.produce({{1 + rng_() % kKiKeys, 0, 1}}), 0);   // an unacked tail the cut removes
+            rig_.truncateTo(rig_.replica->highWatermark());
+            rig_.demotePromote();
+            leadershipBarrier_();
+            break;
+        case KiAction::Compact: trace += "C"; compact_ = true; break;
+        case KiAction::Transaction: transaction_(); break;
+        }
+
+        if (!::testing::Test::HasFatalFailure()) verify_();
+    }
+
+private:
+    void waitActive_() {
+        for (int i = 0; i < VerdictRig::kMaxPass; ++i) {
+            const PartitionWriteState* w = rig_.writeState();
+            if (w != nullptr && w->constraintSets.latest().count > 0 && w->constraintSets.latest().members[0].kind == rune::view::VerdictViewKind::KeyIndex &&
+                rig_.worker->rcStatusForTest(VerdictRig::kSrc, 0) == Worker::kRcReady) return;
+            if (i % 8 == 0) rig_.followerFetch();
+            rig_.pass();
+        }
+        FAIL() << "the key index was not activated after " << trace;
+    }
+
+    // The key index is rebuilt from the local log by the passes after a leadership (one batch per pass here, a segment per batch), and the
+    // judge takes a new write only once it is rebuilt: a write acked is the barrier.
+    void leadershipBarrier_() {
+        waitActive_();
+        if (::testing::Test::HasFatalFailure()) return;
+        ASSERT_TRUE(sendIdem_(producers_[0], {Rec{1 + rng_() % kKiKeys, ++vSeq_, 1, false, 0}}));
+    }
+
+    void installTag_() {
+        rejTopic_ = kKiRejBase + (++rejSeq_);
+        rig_.installRejectView(rejTopic_, kObjTag, tagRule(9));
+    }
+    // A dropped or replaced member's change must be passed by a marker before the next restart, and before a member of the same object
+    // is installed again: a fresh write is acked and marked past it.
+    void settle_() {
+        if (!setChanged_) return;
+        bool acked = false;
+        for (int i = 0; i < 16 && !acked && !::testing::Test::HasFatalFailure(); ++i) {
+            const auto a = sendIdem_(producers_[0], {Rec{1 + rng_() % kKiKeys, ++vSeq_, 1, false, 0}});
+            acked = a.has_value();
+        }
+        ASSERT_TRUE(acked) << "no write was acked after a constraint-set change";
+        setChanged_ = false;
+        if (judged_()) rig_.passes(4);   // the retired member leaves on the pass after the marker commits
+    }
+    void rejectMember_() {
+        trace += "M";
+        const unsigned r = static_cast<unsigned>(rng_() % 3);
+        if (rejTopic_ == 0) {
+            settle_();
+            installTag_();
+        } else if (r == 0) {
+            rig_.dropRejectView(rejTopic_);
+            rejTopic_ = 0;
+            setChanged_ = true;
+        } else {
+            settle_();
+            const int32_t next = kKiRejBase + (++rejSeq_);
+            rig_.replaceRejectView(rejTopic_, next, kObjTag, tagRule(9));
+            rejTopic_ = next;
+            setChanged_ = true;
+        }
+    }
+
+    // One past the last record that gets a verdict: the judge skips an aborted transaction's records and emits no marker for a
+    // trailing range of them.
+    int64_t judgedEnd_(const VerdictRig::RigLog& log) const {
+        int64_t end = 0;
+        for (const auto& d : log.data)
+            if (aborted_.count(d.offset) == 0) end = d.offset + 1;
+        return end;
+    }
+    bool judged_() { return rig_.driveUntilJudged(judgedEnd_(rig_.readLog())); }
+
+    std::vector<Rec> intentBatch_(uint64_t n) {
+        std::vector<Rec> recs;
+        for (uint64_t i = 0; i < n; ++i) {
+            const uint64_t id = 1 + rng_() % kKiKeys;
+            const uint8_t tag = rng_() % 6 == 0 ? 9 : static_cast<uint8_t>(1 + rng_() % 2);
+            const int64_t v = ++vSeq_;
+            switch (rng_() % 5) {
+            case 0: recs.push_back({id, v, tag, false, 1}); break;      // insert
+            case 1: recs.push_back({id, v, tag, false, 2}); break;      // update
+            case 2: recs.push_back({id, v, tag, false, 0}); break;      // upsert
+            case 3: recs.push_back({id, 0, 0, true, 0}); break;         // remove
+            default: recs.push_back({id, 0, 0, true, 2}); break;        // removeExisting
+            }
+        }
+        return recs;
+    }
+
+    struct Pending { VerdictRig::Ack ack; std::size_t n; int64_t corr; };
+
+    // An intent meets NotLeader until the key index is active; nothing was appended then, so the same sequence is sent again.
+    std::optional<VerdictRig::Ack> sendIdem_(Producer& p, const std::vector<Rec>& recs) {
+        waitActive_();
+        if (::testing::Test::HasFatalFailure()) return std::nullopt;
+        for (int tries = 0; tries < 100; ++tries) {
+            const int64_t c = rig_.produceFrame(recs, kAcksViewAll, p.pid, p.seq);
+            const auto a = rig_.ackFetching(c, 60000);
+            if (!a) { ADD_FAILURE() << "the produce was never answered, corr " << c; return std::nullopt; }
+            if (a->code == kNotLeaderCode) { rig_.passes(5); continue; }
+            if (a->code != 0) { ADD_FAILURE() << "ack code " << a->code << " corr " << c; return std::nullopt; }
+            p.seq += static_cast<int32_t>(recs.size());
+            pending_.push_back({*a, recs.size(), c});
+            return a;
+        }
+        ADD_FAILURE() << "NotLeader for 100 sends in a row";
+        return std::nullopt;
+    }
+
+    void intents_() {
+        const auto recs = intentBatch_(1 + rng_() % 8);
+        trace += std::to_string(recs.size());
+        (void)sendIdem_(producers_[rng_() % 2], recs);
+    }
+    void plain_() {
+        std::vector<Rec> recs;
+        const uint64_t n = 1 + rng_() % 4;
+        for (uint64_t i = 0; i < n; ++i) {
+            const uint64_t id = 1 + rng_() % kKiKeys;
+            if (rng_() % 3 == 0) recs.push_back({id, 0, 0, true, 0});
+            else recs.push_back({id, ++vSeq_, static_cast<uint8_t>(rng_() % 5 == 0 ? 9 : 1 + rng_() % 3), false, 0});
+        }
+        const int64_t c = rig_.produceFrame(recs, kAcksLeader, -1, -1);
+        const auto a = rig_.ackFetching(c, 60000);
+        ASSERT_TRUE(a) << "the produce was never answered";
+        ASSERT_EQ(a->code, 0);
+    }
+    // The same batch is sent twice with one pid and sequence: before the judge caught up, or after.  The answer is the original's.
+    void retry_(bool judgeFirst) {
+        waitActive_();
+        if (::testing::Test::HasFatalFailure()) return;
+        Producer& p = producers_[rng_() % 2];
+        const auto recs = intentBatch_(1 + rng_() % 8);
+        const int32_t seq = p.seq;
+        int64_t origCorr = 0, dupCorr = 0;
+        ASSERT_TRUE(executeRetry(rig_, judgeFirst, false,
+                                 [&] { origCorr = rig_.produceFrame(recs, kAcksViewAll, p.pid, seq); },
+                                 [](uint64_t) {},
+                                 [&] { dupCorr = rig_.produceFrame(recs, kAcksViewAll, p.pid, seq); }));
+        const auto orig = rig_.ackFetching(origCorr, 60000);
+        const auto dup = rig_.ackFetching(dupCorr, 60000);
+        ASSERT_TRUE(orig && dup) << "a send was never answered";
+        ASSERT_EQ(orig->code, 0);
+        p.seq += static_cast<int32_t>(recs.size());
+        checkDupAck(rig_, *orig, *dup, false);
+        pending_.push_back({*orig, recs.size(), origCorr});
+    }
+    // An open transaction of plain upserts, committed or aborted; the judge is held behind it.  A source with a TestReject member refuses
+    // transactions (InvalidRequest), so the member is dropped and its change logged first.
+    void transaction_() {
+        if (rejTopic_ != 0) {
+            rig_.dropRejectView(rejTopic_);
+            rejTopic_ = 0;
+            setChanged_ = true;
+        }
+        settle_();
+        if (::testing::Test::HasFatalFailure()) return;
+        const int64_t pid = kKiTxnPidBase + ++txns_;
+        std::vector<Rec> recs;
+        const uint64_t n = 1 + rng_() % 3;
+        for (uint64_t i = 0; i < n; ++i) recs.push_back({1 + rng_() % kKiKeys, ++vSeq_, static_cast<uint8_t>(1 + rng_() % 2), false, 0});
+        const int64_t c = rig_.produceFrame(recs, kAcksWireAll, pid, 0, /*txn=*/true);
+        const auto a = rig_.ackFetching(c, 60000);
+        ASSERT_TRUE(a) << "the transactional produce was never answered";
+        ASSERT_EQ(a->code, 0);
+        const bool commit = rng_() % 2 == 0;
+        trace += commit ? "X" : "Z";
+        rig_.marker(pid, commit);
+        rig_.followerFetch();   // a failover or a cut must not lose the marker: the transaction would be open again
+        rig_.passes(4);
+        if (!commit)
+            for (uint64_t i = 0; i < n; ++i) aborted_.insert(a->baseOffset + static_cast<int64_t>(i));
+    }
+
+    // What a raw subscription from 0 delivers: the accepted records with their intents, and the aborted transactions' (they are in the log).
+    void checkDelivered_(const CheckedWritesModel& model, const std::set<int64_t>& present) {
+        for (int i = 0; i < VerdictRig::kMaxPass && rig_.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) rig_.pass();
+        ASSERT_EQ(rig_.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
+        const auto& box = rig_.collect(rig_.subscribe(SubKind::Raw, 0));
+        std::vector<std::tuple<int64_t, uint64_t, uint16_t, uint8_t>> got, want;
+        for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.tag, d.intent);
+        const auto addWant = [&](const VerdictRig::RigLogRec& a) {
+            if (present.count(a.offset) != 0) want.emplace_back(a.offset, a.id, a.del ? kTombstoneTag : a.tag, a.intent);
+        };
+        for (const auto& a : model.acceptedRecords()) addWant(a);
+        for (const int64_t off : aborted_)
+            if (const auto it = data_.find(off); it != data_.end()) addWant(it->second);
+        std::sort(want.begin(), want.end());
+        EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
+    }
+
+    // IntentVerdictsExact: every 56 / 57 ever reported (an ack, the index or a marker) is the model's, and a record an ack reported as
+    // accepted never gets a verdict.  KeyIndexEqualsLiveKeys: the key index holds the model's live keys.
+    void checkIntentVerdicts_(const CheckedWritesModel& model, const VerdictRig::RigLog& log, int64_t hw) {
+        const auto note = [&](int64_t off, uint16_t code, uint32_t cid, const char* from) {
+            if (code != CheckedWritesModel::kKeyExists && code != CheckedWritesModel::kKeyNotFound) return;
+            const auto it = reported_.emplace(off, ModelVerdict{code, cid}).first;
+            EXPECT_EQ(it->second, (ModelVerdict{code, cid})) << "IntentVerdictsExact: " << from << " reported another verdict for offset " << off << " than before";
+        };
+        rig_.writeState()->rejected.forEachIn(0, INT64_MAX, [&](const rune::storage::RejectedOffsetIndex::Entry& e) { if (e.offset < hw) note(e.offset, e.code, e.constraintId, "the index"); });
+        for (const auto& m : log.markers)
+            for (const auto& [off, code, cid] : m.entries) note(off, code, cid, "a marker");
+        for (const Pending& p : pending_) {
+            std::set<std::size_t> rejected;
+            for (const auto& [i, code, cid] : p.ack.verdicts) {
+                note(p.ack.baseOffset + i, code, cid, "an ack");
+                rejected.insert(i);
+            }
+            for (std::size_t i = 0; i < p.n; ++i)
+                if (rejected.count(i) == 0) acceptedByAck_.insert(p.ack.baseOffset + static_cast<int64_t>(i));
+        }
+        for (const auto& [off, verdict] : reported_) {
+            const auto it = model.verdicts().find(off);
+            EXPECT_TRUE(it != model.verdicts().end() && it->second == verdict) << "IntentVerdictsExact: the reported " << verdict.code << " at offset " << off << " is not the model's verdict";
+        }
+        for (const int64_t off : acceptedByAck_)
+            EXPECT_EQ(model.verdicts().count(off), 0u) << "IntentVerdictsExact: the record at " << off << " was acked as accepted but the model rejects it";
+        std::set<std::string> live;
+        for (const auto& [id, row] : model.projection()) live.insert(std::to_string(id));
+        EXPECT_EQ(rig_.keyIndexKeys(), live) << "KeyIndexEqualsLiveKeys";
+        EXPECT_EQ(rig_.stats()->keyIndexSkippedMalformed, 0u);
+    }
+
+    void verify_() {
+        ASSERT_TRUE(judged_()) << " after " << trace;
+        const int64_t hw = rig_.replica->highWatermark();
+        const VerdictRig::RigLog log = rig_.readLog(hw);
+        for (const auto& d : log.data) data_[d.offset] = d;
+        for (const auto& ch : log.changes) changes_[ch.offset] = ch;
+        VerdictRig::RigLog all;
+        for (const auto& kv : data_)
+            if (aborted_.count(kv.first) == 0) all.data.push_back(kv.second);
+        for (const auto& kv : changes_) all.changes.push_back(kv.second);
+        CheckedWritesModel model;
+        model.declareRule(kObjTag, tagRule(9).fingerprint(), CheckedWritesModel::tagEquals(9));
+        model.addKeyIndexRule();
+        model.reset(all);
+        std::set<int64_t> present;
+        for (const auto& d : log.data) present.insert(d.offset);
+
+        const int64_t dataEnd = log.data.empty() ? 0 : log.data.back().offset + 1;
+        rig_.driveUntilFolded(kProj, dataEnd);
+        rig_.driveUntilFolded(kCnt, dataEnd);
+        checkIndex(rig_, model, &present);
+        if (!log.data.empty() && !log.markers.empty() && !log.changes.empty()) checkMarkers(model, log, judgedEnd_(log), compacted_);
+        for (const Pending& p : pending_) checkModelTrailer(model, p.ack, p.n, p.corr);
+        checkIntentVerdicts_(model, log, hw);
+        pending_.clear();
+        checkViews(rig_, model, all, kProj, kCnt);
+        checkDelivered_(model, present);
+        if (compact_) {
+            compact_ = false;
+            compacted_ = true;
+            checkCompaction(rig_, model, log);
+        }
+        trace += "[" + std::to_string(model.acceptedRecords().size()) + "/" + std::to_string(model.verdicts().size()) + "]";
+    }
+
+    std::mt19937_64 rng_;
+    VerdictRig rig_;
+    Producer producers_[2];
+    std::vector<Pending> pending_;
+    std::map<int64_t, VerdictRig::RigLogRec> data_;
+    std::map<int64_t, VerdictRig::RigChange> changes_;
+    std::map<int64_t, ModelVerdict> reported_;
+    std::set<int64_t> acceptedByAck_, aborted_;
+    int32_t rejTopic_ = 0, rejSeq_ = 0;
+    int64_t vSeq_ = 0, txns_ = 0;
+    bool compact_ = false, compacted_ = false, setChanged_ = false;
+};
+
+std::string runKiSeed(uint64_t seed) {
+    KiRun run(seed);
+    for (int step = 0; step < kKiSteps && !::testing::Test::HasFatalFailure(); ++step) {
+        const KiAction action = run.pick();
+        SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step) + " action=" + nameOf(action) + " trace=" + run.trace);
+        run.step(action);
+    }
+    return run.trace;
+}
+}  // namespace
+
+class CheckedWritesKeyIndexModelRegression : public ::testing::TestWithParam<uint64_t> {};
+
+TEST_P(CheckedWritesKeyIndexModelRegression, SeededRigMatchesTheModel) {
+    const std::string trace = runKiSeed(GetParam());
+    EXPECT_FALSE(trace.empty());
+}
+
+// The history is a function of the seed: seeds 1-8 run twice make the same choices and the model judges the same verdicts.
+TEST_P(CheckedWritesKeyIndexModelRegression, SameSeedSameTrace) {
+    if (GetParam() > 8) GTEST_SKIP() << "seeds 1-8 only";
+    const std::string first = runKiSeed(GetParam());
+    const std::string second = runKiSeed(GetParam());
+    EXPECT_EQ(std::hash<std::string>{}(first), std::hash<std::string>{}(second));
+    EXPECT_EQ(first, second);
+}
+
+INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesKeyIndexModelRegression, ::testing::Range<uint64_t>(1, 101));
+
+// A tombstone is judged by the key index alone: a TestReject rule that would reject any record (a cap of 0 live keys) lets it through,
+// and the key index answers 57 for removeExisting of an absent key.
+TEST(CheckedWritesModel, TombstonesAreJudgedOnlyByTheKeyIndex) {
+    using CM = CheckedWritesModel;
+    VerdictRig::RigLog log;
+    const TestRejectRule cap0 = capRule(0);
+    const uint8_t kind = static_cast<uint8_t>(rune::view::VerdictViewKind::KeyIndex);
+    log.changes.push_back({0, {{0, kind, kKeyIndexPlanFingerprint}, {kObjCap, 0, cap0.fingerprint()}}});
+    log.data.push_back({1, 5, 0, 0, true, 2});    // removeExisting of an absent key: 57 by the key index
+    log.data.push_back({2, 5, 0, 0, true, 0});    // remove of an absent key: accepted
+    log.data.push_back({3, 5, 10, 1, false, 0});  // an upsert: the cap rule rejects it
+    log.data.push_back({4, 5, 0, 0, true, 2});    // removeExisting of a key whose upsert was rejected: 57 again
+    CM m;
+    m.declareRule(kObjCap, cap0.fingerprint(), CM::capLiveKeys(0));
+    m.addKeyIndexRule();
+    m.reset(log);
+    EXPECT_EQ(m.verdicts(), (std::map<int64_t, ModelVerdict>{{1, {57, 0}}, {3, {55, CM::constraintIdOf(kObjCap)}}, {4, {57, 0}}}));
+    EXPECT_EQ(m.acceptedRecords().size(), 1u);
+    EXPECT_EQ(m.acceptedRecords()[0].offset, 2);
+}
+
+
+// One cleaner pass over more segments than the swap ring has slots (256): the rig drains the ring while it queues.
+TEST(CheckedWritesModel, CompactQueuesMoreSegmentsThanTheSwapRingHoldsRegression) {
+    VerdictRig r(/*follower=*/false, /*rollBytes=*/1);
+    r.typed();
+    r.installRejectView(kRejTag, kObjTag, tagRule(9));
+    r.passes(50);
+    for (int64_t v = 1; v <= 300; ++v) ASSERT_EQ(r.produce({{5, v, 0}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    (void)r.compact();
+    (void)r.compact();
+    const auto data = r.readLog().data;
+    ASSERT_EQ(data.size(), 1u);
+    EXPECT_EQ(data[0].v, 300);
+}

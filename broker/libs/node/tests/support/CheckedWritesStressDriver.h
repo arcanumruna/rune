@@ -7,6 +7,7 @@
 #include "CheckedWritesChecks.h"
 #include "CheckedWritesModel.h"
 #include "client/ClusterClient.h"
+#include "client/support/KeyIndexRecords.h"
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -670,6 +672,426 @@ private:
     std::set<int64_t> groupOffsets_;
     std::mutex deliveredMu_;
     std::set<int64_t> deliveredOffsets_;
+    std::size_t compactedAway_ = 0;
+};
+
+/// Plan 05 Task 9 (matrix D): the seeded stress of the key index on three real brokers.  Three typed clients (All|View) write
+/// insert / update / removeExisting / remove on 64 ids of one compacted `key.index` topic with two partitions, under 04's faults
+/// (a leader crash in the middle of a burst, a node or follower restart, one cut short).  Every ack is kept; quiesce() brings the
+/// cluster to rest, checkAll() judges each partition's committed history with the independent CheckedWritesModel and runs the
+/// registered invariants.  Every wait is a bounded poll.
+class CheckedWritesKeyIndexStressDriver {
+public:
+    using Clock = std::chrono::steady_clock;
+    using Invariant = std::function<bool(CheckedWritesKeyIndexStressDriver&, std::string*)>;
+    static constexpr int kIds = 64, kParts = 2;
+    enum class Op : uint8_t { Insert, Update, RemoveExisting, Remove };
+
+    /// What one node holds of one partition.
+    struct PartSnap {
+        int node = 0, part = 0;
+        int64_t leo = 0, hw = 0;
+        VerdictRig::RigLog log;                       ///< below the HW
+        std::map<int64_t, ModelVerdict> index;        ///< the node's RejectedOffsetIndex
+        uint64_t mismatches = 0, unknownDuplicates = 0, skippedMalformed = 0;
+        int64_t committedThrough = 0, covered = 0;
+        std::set<uint64_t> keys;                      ///< the ids in [1, kIds] its key index holds
+        std::size_t keyCount = 0;
+    };
+    /// One write and what the client was told.  Only an Ok carries the offset; a KeyExists or KeyNotFound is found again by the
+    /// record's token (insert, update) or, for removeExisting, by its id.
+    struct Sent {
+        int part = 0;
+        Op op = Op::Insert;
+        uint64_t id = 0;
+        int64_t offset = -1;
+        int64_t token = 0;                            ///< what readLogOf reads as `v` of the record: the first 8 bytes of its name
+        uint16_t code = 0;
+        bool answered = false;
+    };
+
+    CheckedWritesKeyIndexStressDriver(rune::node::test::catalog_cluster::ThreeNodes& cluster, uint64_t seed) : c_(cluster), rng_(seed), seed_(seed) {
+        registerDefaults_();
+    }
+    ~CheckedWritesKeyIndexStressDriver() { writers_.clear(); }
+
+    /// The key.index topic (two partitions, replicas 3, compacted) and three clients.
+    void setUp() {
+        namespace tcc = rune::node::test::catalog_cluster;
+        ASSERT_TRUE(c_.awaitCatalogLeader(30s));
+        const int32_t ctl = tcc::awaitController(c_);
+        ASSERT_GT(ctl, 0);
+        auto admin = tcc::connectClient(c_, ctl);
+        rune::client::TopicOptions to;
+        to.replicationFactor = 3;
+        to.config.cleanupPolicy = 1;
+        to.config.segmentRollBytes = 64 * 1024;
+        to.config.minCompactionLagMs = 100;
+        to.config.minCleanableDirtyRatioPpm = 1;
+        to.config.fileDeleteDelayMs = 50;
+        to.keyFeatures.keyIndex = true;
+        const auto def = admin->defineTopicAndWait("ki", kParts, "id", rune::codec::serialize(rune::node::test::kiAccountDescriptor()), rune::client::Persistence::Disk, to, {}, 60s);
+        ASSERT_EQ(def.errorCode, 0) << def.detail;
+        topicId_ = def.topicId;
+        admin->close();
+        admin.reset();
+        std::vector<int32_t> leaders;
+        ASSERT_TRUE(tcc::awaitLeaders(c_, topicId_, kParts, leaders, 30s));
+        rebuildWriters_();
+    }
+
+    /// One seeded action.
+    void step() {
+        const unsigned r = static_cast<unsigned>(rng_() % 100);
+        const int down = downNode_();
+        if (r < 78) {
+            note_(1);
+            burst_(0);
+        } else if (r < 83 && down == 0) {
+            note_(2);
+            const int32_t victim = leaderOf_(static_cast<int>(rng_() % kParts));
+            if (victim > 0) { ++crashes_; burst_(victim); writersStale_ = true; }
+        } else if (r < 92) {
+            note_(3);
+            if (down != 0) restartNode_(down, false);
+            else restartFollower_();
+        } else {
+            note_(4);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50 + static_cast<int>(rng_() % 150)));
+        }
+    }
+
+    /// Every node back, one leader per partition, every replica caught up and the judge past every record.
+    void quiesce() {
+        for (int id = 1; id <= 3; ++id)
+            if (!c_.running(id)) restartNode_(id, false);
+        std::vector<int32_t> leaders;
+        ASSERT_TRUE(rune::node::test::catalog_cluster::awaitLeaders(c_, topicId_, kParts, leaders, 60s));
+        const auto deadline = Clock::now() + 90s;
+        std::string last;
+        while (Clock::now() < deadline) {
+            snapAll_();
+            recordHistory_();
+            bool ok = true;
+            for (int p = 0; p < kParts; ++p) {
+                const PartSnap* lead = leaderSnap_(p);
+                ok = ok && lead != nullptr && lead->hw == lead->leo && lead->committedThrough >= dataEnd_(lead->log) && lead->covered >= dataEnd_(lead->log);
+                for (const PartSnap& s : snaps_)
+                    ok = ok && (s.part != p || lead == nullptr || (s.leo == lead->leo && s.hw == lead->hw));
+                if (lead == nullptr) last = "no leader for partition " + std::to_string(p);
+                else if (!ok) last = "partition " + std::to_string(p) + " leo " + std::to_string(lead->leo) + " hw " + std::to_string(lead->hw) + " committed " + std::to_string(lead->committedThrough) + " end " + std::to_string(dataEnd_(lead->log));
+            }
+            if (ok && snaps_.size() == 3 * kParts) return;
+            std::this_thread::sleep_for(100ms);
+        }
+        ADD_FAILURE() << "seed " << seed_ << ": the cluster did not come to rest (" << last << ")";
+    }
+
+    void registerInvariant(std::string name, Invariant fn) { invariants_.emplace_back(std::move(name), std::move(fn)); }
+
+    /// Judges every partition's history and runs every invariant; the first that fails (and why) lands in `failed`.
+    [[nodiscard]] bool checkAll(std::string* failed) {
+        snapAll_();
+        recordHistory_();
+        awaitCompaction_();
+        compactedAway_ = 0;
+        for (const PartSnap& s : snaps_) {
+            std::set<int64_t> present;
+            for (const auto& rec : s.log.data) present.insert(rec.offset);
+            std::size_t away = 0;
+            for (const auto& kv : data_[s.part]) away += present.count(kv.first) == 0 ? 1 : 0;
+            compactedAway_ = std::max(compactedAway_, away);
+        }
+        for (int p = 0; p < kParts; ++p) {
+            models_[p] = CheckedWritesModel();
+            models_[p].addKeyIndexRule();
+            models_[p].reset(history_(p));
+        }
+        for (const auto& [name, fn] : invariants_) {
+            std::string why;
+            if (!fn(*this, &why)) {
+                if (failed != nullptr) *failed = "seed " + std::to_string(seed_) + " " + name + ": " + why;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] uint64_t traceHash() const noexcept { return trace_; }
+    /// How often each fault ran: leader crashes, node restarts, restarts cut short.
+    [[nodiscard]] std::array<int, 3> faults() const noexcept { return {crashes_, restarts_, bounces_}; }
+    [[nodiscard]] std::size_t compactedAway() const { return compactedAway_; }
+    [[nodiscard]] const std::vector<Sent>& sent() const noexcept { return sent_; }
+
+private:
+    using Typed = rune::client::TypedTopic<rune::node::test::KiAccount, rune::client::ProducerRef>;
+    struct Writer {
+        std::unique_ptr<rune::client::Client> client;
+        std::optional<rune::client::Producer> prod;
+        std::optional<Typed> topic;
+
+        explicit Writer(rune::client::ClientConfig cfg) {
+            client = std::make_unique<rune::client::Client>(cfg);
+            rune::client::ProducerConfig pc;
+            pc.acks = rune::client::Acks::All | rune::client::Acks::View;
+            pc.lingerUs = 1;
+            prod.emplace(client->producer(pc));
+            client->connectAndWait(30s);
+            topic.emplace(client->openTopicAndWait<rune::node::test::KiAccount>("ki", *prod, 30s));
+        }
+        ~Writer() {
+            if (prod) prod->closeImmediately();
+            if (client) client->close();
+        }
+    };
+
+    int32_t worker_(int id, int part) { return rune::metadata::ShardRouter(c_.node(id).workerCountForTest()).workerForPartition(topicId_, part); }
+    int downNode_() const {
+        for (int id = 1; id <= 3; ++id) if (!c_.running(id)) return id;
+        return 0;
+    }
+    int32_t leaderOf_(int part) {
+        std::vector<int32_t> leaders;
+        return rune::node::test::catalog_cluster::awaitLeaders(c_, topicId_, kParts, leaders, 60s) ? leaders[static_cast<std::size_t>(part)] : -1;
+    }
+    void restartNode_(int id, bool bounce) {
+        c_.startNode(id);
+        ++restarts_;
+        if (bounce) {
+            ++bounces_;   // a restart in the middle of the rebuild
+            std::this_thread::sleep_for(std::chrono::milliseconds(100 + static_cast<int>(rng_() % 400)));
+            c_.stop(id);
+            c_.startNode(id);
+        }
+        writersStale_ = true;
+        std::vector<int32_t> leaders;
+        ASSERT_TRUE(rune::node::test::catalog_cluster::awaitLeaders(c_, topicId_, kParts, leaders, 60s));
+        recordHistory_();
+    }
+    void restartFollower_() {
+        const int32_t leader = leaderOf_(static_cast<int>(rng_() % kParts));
+        std::vector<int> followers;
+        for (int id = 1; id <= 3; ++id) if (id != leader) followers.push_back(id);
+        const int id = followers[rng_() % followers.size()];
+        c_.stop(id);
+        restartNode_(id, rng_() % 3 == 0);
+    }
+
+    // ---- writes ----
+    void rebuildWriters_() {
+        writers_.clear();
+        const auto running = c_.runningNodes();
+        for (std::size_t i = 0; i < 3; ++i) {
+            rune::client::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c_, running[i % running.size()]);
+            cfg.connectTimeoutMs = 30'000;
+            cfg.pingTimeoutMs = 30'000;
+            writers_.push_back(std::make_unique<Writer>(cfg));
+        }
+        writersStale_ = false;
+    }
+    /// 1 to 6 writes through one client; with a victim the node is crashed in the middle.
+    void burst_(int victim) {
+        if (writersStale_) rebuildWriters_();
+        Writer& w = *writers_[rng_() % writers_.size()];
+        const int n = 1 + static_cast<int>(rng_() % 6);
+        std::thread killer;
+        for (int i = 0; i < n; ++i) {
+            Sent s;
+            s.id = 1 + rng_() % kIds;
+            const unsigned o = static_cast<unsigned>(rng_() % 100);
+            s.op = o < 35 ? Op::Insert : o < 60 ? Op::Update : o < 80 ? Op::RemoveExisting : Op::Remove;
+            s.part = partitionOf_(s.id);
+            if (victim > 0 && i == n / 2) killer = std::thread([this, victim] { c_.crash(victim); });
+            try {
+                rune::node::test::KiAccount rec{s.id, "n" + std::to_string(++nSeq_), nSeq_};
+                std::memcpy(&s.token, rec.name.data(), std::min<std::size_t>(rec.name.size(), sizeof(s.token)));
+                const rune::client::WriteResult r = s.op == Op::Insert ? w.topic->insertAndWait(rec, 10s)
+                                                  : s.op == Op::Update ? w.topic->updateAndWait(rec, 10s)
+                                                  : s.op == Op::RemoveExisting ? w.topic->removeExistingAndWait(s.id, 10s)
+                                                  : w.topic->removeAndWait(s.id, 10s);
+                s.code = r.code();
+                s.offset = r.offset();
+                s.answered = r.ok() || s.code == 56 || s.code == 57;
+            } catch (const std::exception&) {
+                writersStale_ = true;   // no answer: the write may or may not be in the log
+            }
+            sent_.push_back(s);
+        }
+        if (killer.joinable()) killer.join();
+        recordHistory_();
+    }
+    int partitionOf_(uint64_t id) const {
+        return static_cast<int>(rune::client::Key(id).partition(kParts));
+    }
+
+    // ---- reading the cluster ----
+    PartSnap snap_(int id, int part) {
+        PartSnap s;
+        s.node = id;
+        s.part = part;
+        BrokerNode& n = c_.node(id);
+        n.onOwnerThreadForTest(topicId_, part, [&s](rune::replication::PartitionReplica& r) {
+            s.leo = r.logEndOffset();
+            s.hw = r.highWatermark();
+            s.log = readLogOf(*r.log(), s.hw);
+            return 0;
+        });
+        n.onWorkerThreadForTest(worker_(id, part), [&s, this](Worker& wk) {
+            if (const PartitionWriteState* ws = wk.writeStateForTest(topicId_, s.part)) {
+                ws->rejected.forEachIn(0, INT64_MAX, [&](const rune::storage::RejectedOffsetIndex::Entry& e) { s.index[e.offset] = {e.code, e.constraintId}; });
+                s.mismatches = ws->rejected.mismatches();
+                s.committedThrough = ws->markers.committedThrough();
+                s.covered = ws->rejected.coveredThrough();
+            }
+            if (const VerdictSourceStats* st = wk.verdictStatsForTest(topicId_, s.part)) {
+                s.unknownDuplicates = st->verdictUnknownDuplicates;
+                s.skippedMalformed = st->keyIndexSkippedMalformed;
+            }
+            s.keyCount = wk.viewSet()->keyIndexSizeForTest(topicId_, s.part);
+            for (uint64_t k = 1; k <= kIds; ++k) {
+                std::string key(8, '\0');
+                for (int i = 0; i < 8; ++i) key[static_cast<std::size_t>(i)] = static_cast<char>(k >> (8 * i));
+                if (wk.viewSet()->keyIndexContainsForTest(topicId_, s.part, key)) s.keys.insert(k);
+            }
+            return 0;
+        });
+        return s;
+    }
+    void snapAll_() {
+        snaps_.clear();
+        for (const int id : c_.runningNodes())
+            for (int p = 0; p < kParts; ++p) snaps_.push_back(snap_(id, p));
+    }
+    /// The partition's leader (its worker holds the judge and the key index); a node mid-restart is passed over.
+    const PartSnap* leaderSnap_(int part) {
+        std::vector<int32_t> leaders;
+        const int32_t id = rune::node::test::catalog_cluster::awaitLeaders(c_, topicId_, kParts, leaders, 5s) ? leaders[static_cast<std::size_t>(part)] : -1;
+        for (const PartSnap& s : snaps_) if (s.part == part && s.node == id) return &s;
+        return nullptr;
+    }
+    static int64_t dataEnd_(const VerdictRig::RigLog& l) { return l.data.empty() ? 0 : l.data.back().offset + 1; }
+    /// The committed records ever seen: a compaction may remove them from every log later, the model still judges them.
+    void recordHistory_() {
+        snapAll_();
+        for (int p = 0; p < kParts; ++p) {
+            const PartSnap* lead = leaderSnap_(p);
+            if (lead == nullptr) continue;
+            for (const auto& d : lead->log.data) data_[p][d.offset] = d;
+            for (const auto& ch : lead->log.changes) changes_[p][ch.offset] = ch;
+        }
+    }
+    VerdictRig::RigLog history_(int part) const {
+        VerdictRig::RigLog out;
+        for (const auto& kv : data_[part]) out.data.push_back(kv.second);
+        for (const auto& kv : changes_[part]) out.changes.push_back(kv.second);
+        return out;
+    }
+    /// Waits for the cleaner to remove a superseded record from a node's log (the history is already recorded).
+    void awaitCompaction_() {
+        for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(200ms)) {
+            snapAll_();
+            for (const PartSnap& s : snaps_) if (s.log.data.size() < data_[s.part].size()) return;
+        }
+        ADD_FAILURE() << "seed " << seed_ << ": no node's log lost a superseded record in 60 s";
+    }
+    void note_(unsigned code) { trace_ = (trace_ ^ code) * 1099511628211ull; }
+
+    // ---- invariants ----
+    void registerDefaults_() {
+        registerInvariant("IntentVerdictsExact", [](CheckedWritesKeyIndexStressDriver& d, std::string* why) {
+            std::array<std::map<uint64_t, int>, kParts> removeExisting57;   // answered 57s of removeExisting, per id
+            for (const Sent& s : d.sent_) {
+                if (!s.answered) continue;
+                const auto& verdicts = d.models_[s.part].verdicts();
+                const auto& data = d.data_[s.part];
+                if (s.code == 0) {
+                    const auto rec = data.find(s.offset);
+                    if (rec == data.end() || rec->second.id != s.id) { *why = "an Ok write of id " + std::to_string(s.id) + " has no record at offset " + std::to_string(s.offset); return false; }
+                    const auto it = verdicts.find(s.offset);
+                    if (it != verdicts.end()) { *why = "offset " + std::to_string(s.offset) + " was acked Ok but the model rejects it with " + std::to_string(it->second.code); return false; }
+                } else if (s.op == Op::RemoveExisting) {
+                    ++removeExisting57[s.part][s.id];
+                } else {
+                    const auto rec = std::find_if(data.begin(), data.end(), [&](const auto& kv) { return !kv.second.del && kv.second.id == s.id && kv.second.v == s.token; });
+                    if (rec == data.end()) { *why = "the " + std::to_string(s.code) + " of id " + std::to_string(s.id) + " has no record"; return false; }
+                    const auto it = verdicts.find(rec->first);
+                    if (it == verdicts.end() || !(it->second == ModelVerdict{s.code, 0})) { *why = "offset " + std::to_string(rec->first) + " was reported " + std::to_string(s.code) + ", not the model's verdict"; return false; }
+                }
+            }
+            for (int p = 0; p < kParts; ++p) {
+                for (const auto& [id, answered] : removeExisting57[p]) {
+                    int judged = 0;
+                    for (const auto& [off, verdict] : d.models_[p].verdicts()) {
+                        const auto rec = d.data_[p].find(off);
+                        judged += rec != d.data_[p].end() && rec->second.id == id && rec->second.del && rec->second.intent == 2 && verdict == ModelVerdict{57, 0} ? 1 : 0;
+                    }
+                    if (answered > judged) { *why = "partition " + std::to_string(p) + ": " + std::to_string(answered) + " removeExisting of id " + std::to_string(id) + " answered 57, the model rejects " + std::to_string(judged); return false; }
+                }
+            }
+            for (int p = 0; p < kParts; ++p) {
+                const PartSnap* lead = d.leaderSnap_(p);
+                if (lead == nullptr) { *why = "partition " + std::to_string(p) + " has no leader"; return false; }
+                std::set<int64_t> present;
+                for (const auto& rec : lead->log.data) present.insert(rec.offset);
+                for (const auto& [off, verdict] : lead->index) {
+                    const auto it = d.models_[p].verdicts().find(off);
+                    if (it == d.models_[p].verdicts().end() || !(it->second == verdict)) { *why = "partition " + std::to_string(p) + ": index entry " + std::to_string(off) + " is not the model's verdict"; return false; }
+                }
+                for (const auto& [off, verdict] : d.models_[p].verdicts())
+                    if (present.count(off) != 0 && lead->index.count(off) == 0) { *why = "partition " + std::to_string(p) + ": rejected offset " + std::to_string(off) + " is in the log but not in the index"; return false; }
+                for (const auto& m : lead->log.markers)
+                    for (const auto& [off, code, cid] : m.entries) {
+                        const auto it = d.models_[p].verdicts().find(off);
+                        if (it == d.models_[p].verdicts().end() || !(it->second == ModelVerdict{code, cid})) { *why = "partition " + std::to_string(p) + ": a marker entry " + std::to_string(off) + " is not the model's verdict"; return false; }
+                    }
+            }
+            return true;
+        });
+        registerInvariant("KeyIndexEqualsLiveKeys", [](CheckedWritesKeyIndexStressDriver& d, std::string* why) {
+            for (int p = 0; p < kParts; ++p) {
+                const PartSnap* lead = d.leaderSnap_(p);
+                if (lead == nullptr) { *why = "partition " + std::to_string(p) + " has no leader"; return false; }
+                std::set<uint64_t> live;
+                for (uint64_t id = 1; id <= kIds; ++id) if (d.models_[p].isLiveAtJudge(id)) live.insert(id);
+                if (lead->keys != live || lead->keyCount != live.size()) { *why = "partition " + std::to_string(p) + ": the key index holds " + std::to_string(lead->keyCount) + " keys, the model's live set " + std::to_string(live.size()); return false; }
+            }
+            return true;
+        });
+        registerInvariant("NodeCountersClean", [](CheckedWritesKeyIndexStressDriver& d, std::string* why) {
+            for (const PartSnap& s : d.snaps_) {
+                const std::string at = "node " + std::to_string(s.node) + " partition " + std::to_string(s.part) + ": ";
+                if (s.mismatches != 0) { *why = at + "the index counted " + std::to_string(s.mismatches) + " mismatches"; return false; }
+                if (s.unknownDuplicates != 0) { *why = at + "verdictUnknownDuplicates " + std::to_string(s.unknownDuplicates); return false; }
+                if (s.skippedMalformed != 0) { *why = at + "keyIndexSkippedMalformed " + std::to_string(s.skippedMalformed); return false; }
+            }
+            return true;
+        });
+        registerInvariant("CompactionKeepsAcceptedValue", [](CheckedWritesKeyIndexStressDriver& d, std::string* why) {
+            for (const PartSnap& s : d.snaps_) {
+                std::set<int64_t> present;
+                for (const auto& rec : s.log.data) present.insert(rec.offset);
+                for (const auto& [id, latest] : d.models_[s.part].latestAcceptedByKey())
+                    if (!latest.del && present.count(latest.offset) == 0) { *why = "node " + std::to_string(s.node) + " lost the latest accepted record of key " + std::to_string(id) + " at " + std::to_string(latest.offset); return false; }
+            }
+            return true;
+        });
+    }
+
+    rune::node::test::catalog_cluster::ThreeNodes& c_;
+    std::mt19937_64 rng_;
+    uint64_t seed_;
+    uint64_t trace_ = 1469598103934665603ull;
+    int32_t topicId_ = -1;
+    int64_t nSeq_ = 0;
+    int crashes_ = 0, restarts_ = 0, bounces_ = 0;
+    bool writersStale_ = false;
+    std::vector<std::unique_ptr<Writer>> writers_;
+    std::vector<Sent> sent_;
+    std::array<std::map<int64_t, VerdictRig::RigLogRec>, kParts> data_;
+    std::array<std::map<int64_t, VerdictRig::RigChange>, kParts> changes_;
+    std::array<CheckedWritesModel, kParts> models_;
+    std::vector<PartSnap> snaps_;
+    std::vector<std::pair<std::string, Invariant>> invariants_;
     std::size_t compactedAway_ = 0;
 };
 
