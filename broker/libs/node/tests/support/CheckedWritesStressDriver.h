@@ -249,6 +249,20 @@ public:
         });
         return out;
     }
+    [[nodiscard]] int32_t topicId() const noexcept { return topicId_; }
+    /// Holds (or lets go) every leadership scan on node `id`: its RC build sees nothing resident, so a partition it leads stays
+    /// unjudged and its index empty.
+    void holdLeadershipScan(int id, bool hold) {
+        for (int p = 0; p < parts_; ++p)
+            c_.node(id).onWorkerThreadForTest(worker_(id, p), [hold](Worker& wk) {
+                wk.setRcResidencyProbeForTest(hold ? +[](void*, const uint8_t*, std::size_t) -> std::size_t { return 0; } : nullptr, nullptr);
+                return 0;
+            });
+    }
+    [[nodiscard]] int rcStatus(int id, int part) {
+        const int32_t t = topicId_;
+        return c_.node(id).onWorkerThreadForTest(worker_(id, part), [t, part](Worker& wk) { return wk.rcStatusForTest(t, part); });
+    }
 
 private:
     // ---- clients ----

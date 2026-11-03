@@ -102,3 +102,58 @@ TEST(CheckedWritesStressHistory, RejectionTheLeaderCompactedBeforeAnyHistoryRead
     EXPECT_TRUE(d.checkAll(&failed)) << failed;
     std::printf("%s\n", d.keyIndexTally().c_str());
 }
+
+// quiesce() came to rest while a follower led; the node it had just restarted then took its partition back, and checkAll judged that
+// node's index before its leadership scan had rebuilt it (seed 7: "node 1: rejected offset 1185 is in the log but not in the index").
+TEST(CheckedWritesStressHistory, CheckAllWaitsForTheNewLeadersScanRegression) {
+    using Op = CheckedWritesStressDriver::Op;
+    using Result = CheckedWritesStressDriver::Sent::Result;
+    namespace tcc = rune::node::test::catalog_cluster;
+    ThreeNodes cluster = ThreeNodes::startWith("cw05_unscanned_leader", [](rune::node::NodeConfig& cfg) { cfg.verdictIntervalMs = 20; });
+    CheckedWritesStressDriver d(cluster, 1, true);
+    d.setUp();
+    ASSERT_FALSE(HasFatalFailure());
+    const uint64_t a = 1;
+    const int part = static_cast<int>(rune::client::Key(a).partition(CheckedWritesStressDriver::kKiParts));
+    uint64_t b = a + 1;
+    while (static_cast<int>(rune::client::Key(b).partition(CheckedWritesStressDriver::kKiParts)) != part) ++b;
+    ASSERT_EQ(d.kiWrite(Op::Insert, a).result, Result::Ok);
+    ASSERT_EQ(d.kiWrite(Op::Update, b).code, 57);
+    const CheckedWritesStressDriver::Sent dup = d.kiWrite(Op::Insert, a);
+    ASSERT_EQ(dup.result, Result::Violation);
+    // More rejected inserts of `a` roll segments until the leader's cleaner drops the first one: checkAll waits for a compaction.
+    const auto compacted = [&] {
+        const std::set<int64_t> offs = d.leaderOffsets(part);
+        const auto it = offs.lower_bound(dup.hwBefore);
+        return !offs.empty() && (it == offs.end() || *it >= dup.hwAfter);
+    };
+    for (int i = 0; i < 4000 && !compacted(); i += 50)
+        for (int j = 0; j < 50; ++j) ASSERT_EQ(d.kiWrite(Op::Insert, a).result, Result::Violation);
+    for (int poll = 0; poll < 600 && !compacted(); ++poll) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_TRUE(compacted()) << "the leader never compacted the rejected insert (" << dup.hwBefore << ", " << dup.hwAfter << ")";
+    d.quiesce();
+    ASSERT_FALSE(HasFatalFailure());
+
+    const std::size_t at = static_cast<std::size_t>(part);
+    const auto leads = [&](auto pred) {
+        std::vector<int32_t> leaders;
+        for (int poll = 0; poll < 300; ++poll, std::this_thread::sleep_for(std::chrono::milliseconds(100)))
+            if (tcc::awaitLeaders(cluster, d.topicId(), CheckedWritesStressDriver::kKiParts, leaders, std::chrono::seconds(1)) && pred(leaders[at])) return leaders[at];
+        return -1;
+    };
+    const int lead = leads([](int32_t) { return true; });
+    ASSERT_GT(lead, 0);
+    cluster.stop(lead);
+    ASSERT_GT(leads([&](int32_t l) { return l != lead; }), 0) << "no follower took partition " << part;
+    cluster.startNode(lead);
+    d.holdLeadershipScan(lead, true);
+    ASSERT_EQ(leads([&](int32_t l) { return l == lead; }), lead) << "node " << lead << " never took partition " << part << " back";
+    ASSERT_NE(d.rcStatus(lead, part), rune::node::Worker::kRcReady) << "the leadership scan finished before it was held";
+    std::thread release([&] {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        d.holdLeadershipScan(lead, false);
+    });
+    std::string failed;
+    EXPECT_TRUE(d.checkAll(&failed)) << failed;
+    release.join();
+}
