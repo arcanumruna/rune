@@ -9,7 +9,10 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <iomanip>
+#include <iostream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -21,6 +24,7 @@
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/storage/VerdictCleanState.h>
+#include <rune/transaction/ControlMarker.h>
 
 namespace cr = rune::storage::control_record;
 using rune::storage::Log;
@@ -777,4 +781,408 @@ TEST(CheckedWritesVerdictCleanerRegression, ADamagedSegmentMakesTheLogUncleanabl
         EXPECT_EQ(bytes(victim->file), victimBytes);
     }
     std::filesystem::remove_all(dir);
+}
+
+// ===========================================================================
+// Batch 1 fix-round re-attack: the pre-pass (transaction / verdict scan) and the offset-map build stop at a damaged batch
+// and the pass goes on.  A record or marker the cleaner must keep is judged by state those scans build: whatever lies
+// behind the damage (a COMMIT/ABORT marker, a verdict marker, a txn data batch) is missing from it.
+// ===========================================================================
+namespace {
+constexpr int64_t kTxnPid = 4242;
+void txnData(Log& log, int64_t off, const std::string& key, const std::string& val, int32_t seq) {
+    rune::protocol::RecordBatchBuilder b(off, 2000 + off);
+    b.setProducerId(kTxnPid);
+    b.setProducerEpoch(3);
+    b.setBaseSequence(seq);
+    b.setTransactional(true);
+    b.append(key, val, 2000 + off);
+    log.append(b.build(), off);
+}
+void txnMarker(Log& log, int64_t off, bool abort) {
+    auto b = rune::transaction::ControlMarker::build(kTxnPid, 3, abort ? rune::transaction::ControlType::Abort
+                                                                        : rune::transaction::ControlType::Commit, 0);
+    stampBase(b, off);
+    log.append(b, off);
+}
+int64_t baseOf(const std::filesystem::path& f) { return std::stoll(f.stem().string()); }
+
+// What the log holds once the pass's outputs are installed: data record offsets, and control batch offsets with whether
+// they carry a delete horizon.  Deferred-install outputs replace (or, with no output, remove) their members' files.
+struct DiskView {
+    std::set<int64_t> data;
+    std::map<int64_t, bool> control;   // offset -> horizon stamped
+};
+void scanFile(const std::filesystem::path& p, DiskView& v) {
+    std::vector<uint8_t> buf(std::filesystem::file_size(p));
+    {
+        std::ifstream in(p, std::ios::binary);
+        in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+    }
+    for (std::size_t pos = 0; pos + rune::protocol::batch::kRecordBatchOverhead <= buf.size();) {
+        rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+        const std::size_t total = static_cast<std::size_t>(r.totalLength());
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + total > buf.size()) break;
+        if ((r.attributes() & rune::protocol::batch::kAttrControl) != 0) {
+            v.control[r.baseOffset()] = r.hasDeleteHorizon();
+        } else if (r.ensureValid()) {
+            r.forEachRecord([&](std::string_view, std::string_view, int64_t o, int64_t) { v.data.insert(o); });
+        }
+        pos += total;
+    }
+}
+DiskView diskView(const std::string& dir, const std::vector<rune::storage::CleanedGroup>& deferred = {}) {
+    std::map<int64_t, std::filesystem::path> replace;
+    std::set<int64_t> removed;
+    for (const auto& g : deferred) {
+        for (std::size_t i = 0; i < g.bases.size(); ++i) {
+            if (i == 0 && g.hasOutput) replace[g.bases[0]] = Log::cleanedLogPath(dir, g.bases[0], g.seq);
+            else removed.insert(g.bases[i]);
+        }
+    }
+    DiskView v;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() != ".log") continue;
+        const int64_t b = baseOf(e.path());
+        if (removed.count(b)) continue;
+        scanFile(replace.count(b) ? std::filesystem::path(replace[b]) : e.path(), v);
+    }
+    return v;
+}
+
+// Engines: 0 range, 1 range + coalesce (one group per segment), 2 range in deferred-install mode, 3 compact (the sync
+// path), 4 one file (produceCleanedFileBounded at `target`), 5 one group (produceCleanedGroupBounded {target}).
+constexpr int kEngines = 6;
+const char* engineName(int e) {
+    static const char* n[] = {"range", "range+coalesce", "range deferred", "compact", "one file", "one group"};
+    return n[e];
+}
+DiskView runEngine(int engine, Log& log, int64_t target, int64_t nowMs, int64_t verdictBound, int64_t markerEnd) {
+    auto bases = log.segmentBaseOffsets();
+    const int64_t active = bases.back();
+    bases.pop_back();
+    LogCleaner cleaner;
+    cleaner.setMarkerRemovalBound(kMax);
+    cleaner.setVerdictBounds(verdictBound, markerEnd);
+    uint64_t seq = 1;
+    std::vector<rune::storage::CleanedGroup> deferred;
+    if (engine <= 2) {
+        if (engine == 2) cleaner.setDeferredInstall(&seq);
+        std::vector<int64_t> sizes;
+        for (const int64_t b : bases) sizes.push_back(int64_t(std::filesystem::file_size(log.dir() + "/" + [&] {
+            std::ostringstream os; os << std::setw(20) << std::setfill('0') << b << ".log"; return os.str(); }())));
+        SkimpyOffsetMap map(1024);
+        auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1000, map, engine == 1,
+                                                      /*groupRollBytes=*/1, nullptr, nowMs);
+        deferred = std::move(res.groups);
+    } else if (engine == 3) {
+        cleaner.clean(log, 0, active, 0, 1000, nowMs);
+    } else if (engine == 4) {
+        (void)cleaner.produceCleanedFileBounded(log.dir(), bases, target, active, 0, 0, 1000, 1 << 20, nullptr, nowMs);
+    } else {
+        rune::storage::SegmentGroup g;
+        g.bases = {target};
+        g.combinedBytes = 1 << 20;
+        (void)cleaner.produceCleanedGroupBounded(log.dir(), bases, g, active, 0, 0, 1000, 1 << 20, nullptr, nowMs);
+    }
+    return diskView(log.dir(), deferred);
+}
+}  // namespace
+
+// The ABORT marker of a transaction sits behind a damaged batch; the producer later commits another transaction.  The
+// txn pre-pass never sees the ABORT, so it merges both transactions into one COMMITTED one: the aborted value of `k` is
+// indexed as the latest and the committed value of `k` in an earlier, healthy segment is dropped.
+// URGENT break found by the batch 1 fix-round re-attack (silent loss of a committed record): scanTxnState and
+// buildOffsetMapFromBases stop at a damaged batch without refusing the pass.  DISABLED until that fix lands.
+TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedBatchBeforeAnAbortMarkerNeverDropsTheCommittedValueAdversarialRegression) {
+    // Run 0..5: intact (the control: nothing is lost), 6..11: the victim CRC-damaged.
+    for (int run = 0; run < 2 * kEngines; ++run) {
+        const int engine = run % kEngines;
+        const bool damaged = run >= kEngines;
+        SCOPED_TRACE(std::string(engineName(engine)) + (damaged ? " damaged" : " intact"));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/900);
+            log.recover();
+            data(log, 0, "k", "committed");
+            for (int64_t o = 1; o < 13; ++o) data(log, o, "a" + std::to_string(o), "v");
+            txnData(log, 13, "k", "aborted", 0);
+            data(log, 14, "victim", "v");
+            txnMarker(log, 15, /*abort=*/true);
+            for (int64_t o = 16; o < 27; ++o) data(log, o, "b" + std::to_string(o), "v");
+            txnData(log, 27, "q", "committed", 1);
+            txnMarker(log, 28, /*abort=*/false);
+            for (int64_t o = 29; o < 66; ++o) data(log, o, "c" + std::to_string(o), "v");
+            const auto k0 = findBatch(log.dir(), 0), k12 = findBatch(log.dir(), 13), v = findBatch(log.dir(), 14),
+                       ab = findBatch(log.dir(), 15), cm = findBatch(log.dir(), 28);
+            ASSERT_TRUE(k0 && k12 && v && ab && cm);
+            ASSERT_NE(k0->file, k12->file) << "the committed value lives in an earlier segment";
+            ASSERT_EQ(v->file, ab->file) << "the damage and the ABORT share a segment";
+            ASSERT_NE(ab->file, cm->file);
+            ASSERT_LT(baseOf(cm->file), log.segmentBaseOffsets().back()) << "the COMMIT is sealed";
+            if (damaged) xorByteAt(v->file, v->pos + v->total - 1, 0x5A);   // CRC-damage the victim
+            const DiskView after = runEngine(engine, log, baseOf(k0->file), 1'000'000, kMax, kMax);
+            EXPECT_TRUE(after.data.count(0)) << "the committed value of k is gone; only its aborted value remains";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// The same through the verdict pre-pass: the verdict marker that rejects k@13 sits behind a damaged batch, a later marker
+// covers past it.  The scan never learns k@13 is rejected, indexes it as k's latest and drops the accepted k@0.
+// URGENT break found by the batch 1 fix-round re-attack (silent loss of an accepted record), same root cause.  DISABLED until
+// that fix lands.
+TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedBatchBeforeAVerdictMarkerNeverDropsTheAcceptedValueAdversarialRegression) {
+    // Run 0..5: intact (the control: nothing is lost), 6..11: the victim CRC-damaged.
+    for (int run = 0; run < 2 * kEngines; ++run) {
+        const int engine = run % kEngines;
+        const bool damaged = run >= kEngines;
+        SCOPED_TRACE(std::string(engineName(engine)) + (damaged ? " damaged" : " intact"));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/900);
+            log.recover();
+            data(log, 0, "k", "accepted");
+            for (int64_t o = 1; o < 13; ++o) data(log, o, "a" + std::to_string(o), "v");
+            data(log, 13, "k", "rejected");
+            data(log, 14, "victim", "v");
+            marker(log, 15, 0, 16, {13});
+            for (int64_t o = 16; o < 27; ++o) data(log, o, "b" + std::to_string(o), "v");
+            marker(log, 27, 16, 28, {});
+            for (int64_t o = 28; o < 66; ++o) data(log, o, "c" + std::to_string(o), "v");
+            const auto k0 = findBatch(log.dir(), 0), k12 = findBatch(log.dir(), 13), v = findBatch(log.dir(), 14),
+                       m1 = findBatch(log.dir(), 15), m2 = findBatch(log.dir(), 27);
+            ASSERT_TRUE(k0 && k12 && v && m1 && m2);
+            ASSERT_NE(k0->file, k12->file);
+            ASSERT_EQ(v->file, m1->file);
+            ASSERT_NE(m1->file, m2->file);
+            ASSERT_LT(baseOf(m2->file), log.segmentBaseOffsets().back());
+            if (damaged) xorByteAt(v->file, v->pos + v->total - 1, 0x5A);
+            const DiskView after = runEngine(engine, log, baseOf(k0->file), 1'000'000, kMax, kMax);
+            EXPECT_TRUE(after.data.count(0)) << "the accepted value of k is gone; only its rejected value remains";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// A transaction's data batch sits behind a damaged batch; its ABORT marker is in the next segment.  The pre-pass sees a
+// marker with no data and makes it removable: a pass over the marker's segment stamps it, a later one drops it, while the
+// aborted data it judges is still on disk (it then reads as an open, or committed, transaction).
+// The range and compact engines rewrite the damaged segment first and stop there; the one-file / one-group engines
+// target the marker's segment directly.
+// URGENT break found by the batch 1 fix-round re-attack (an aborted txn's marker removed while its data stays), same root
+// cause.  DISABLED until that fix lands.
+TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedTxnDataBeforeItsMarkerNeverRemovesTheMarkerAdversarialRegression) {
+    // Run 0..5: intact (the control: nothing is lost), 6..11: the victim CRC-damaged.
+    for (int run = 0; run < 2 * kEngines; ++run) {
+        const int engine = run % kEngines;
+        const bool damaged = run >= kEngines;
+        if (engine == 3) continue;   // compact reloads the log, whose recovery truncates at the damage
+        SCOPED_TRACE(std::string(engineName(engine)) + (damaged ? " damaged" : " intact"));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/900);
+            log.recover();
+            for (int64_t o = 0; o < 13; ++o) data(log, o, "a" + std::to_string(o), "v");
+            data(log, 13, "victim", "v");
+            txnData(log, 14, "t", "aborted", 0);
+            for (int64_t o = 15; o < 27; ++o) data(log, o, "b" + std::to_string(o), "v");
+            txnMarker(log, 27, /*abort=*/true);
+            for (int64_t o = 28; o < 34; ++o) data(log, o, "c" + std::to_string(o), "v");
+            txnData(log, 34, "q", "committed", 1);
+            txnMarker(log, 35, /*abort=*/false);
+            for (int64_t o = 36; o < 72; ++o) data(log, o, "d" + std::to_string(o), "v");
+            const auto v = findBatch(log.dir(), 13), d = findBatch(log.dir(), 14), ab = findBatch(log.dir(), 27),
+                       cm = findBatch(log.dir(), 35);
+            ASSERT_TRUE(v && d && ab && cm);
+            ASSERT_EQ(v->file, d->file);
+            ASSERT_NE(d->file, ab->file);
+            ASSERT_LT(baseOf(cm->file), log.segmentBaseOffsets().back());
+            if (damaged) xorByteAt(v->file, v->pos + v->total - 1, 0x5A);
+            (void)runEngine(engine, log, baseOf(ab->file), 1'000'000, kMax, kMax);           // pass 1: stamp
+            const DiskView after = runEngine(engine, log, baseOf(ab->file), 1'000'000 + 5000, kMax, kMax);   // pass 2: drop
+            if (damaged) ASSERT_TRUE(after.data.count(14)) << "the damaged segment is never rewritten: the aborted data stays";
+            if (after.data.count(14) != 0) {   // (intact: the cleaner discarded the aborted data, then the marker may go)
+                EXPECT_TRUE(after.control.count(27)) << "the ABORT marker of data still on disk was removed";
+                if (after.control.count(27)) EXPECT_FALSE(after.control.at(27)) << "the ABORT marker of data still on disk was stamped for removal";
+            }
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// A range pass that stops at a damaged segment must not report the range past it as cleaned: the agent advances (and
+// persists) the clean watermark to passEnd, so the dirty records of the damaged segment and of every segment after it
+// would never be indexed again.  The agent builds a fresh LogCleaner every pass (no sticky state reaches it), so passEnd is
+// all it has.  Deferred-install mode, as in production.
+// Non-urgent break (under-cleaning, no loss) found by the batch 1 fix-round re-attack: #840.  DISABLED until #840 is fixed.
+TEST(CheckedWritesVerdictCleanerRegression, DISABLED_ARangePassStoppedByDamageNeverReportsThePassEndPastItAdversarialRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), /*segmentBytes=*/900);
+        log.recover();
+        for (int64_t o = 0; o < 60; ++o) data(log, o, "k" + std::to_string(o % 7), "v" + std::to_string(o));
+        const auto v = findBatch(log.dir(), 20);
+        ASSERT_TRUE(v.has_value());
+        const int64_t damagedBase = baseOf(v->file);
+        ASSERT_GT(damagedBase, 0);
+        xorByteAt(v->file, v->pos + v->total - 1, 0x5A);
+        auto bases = log.segmentBaseOffsets();
+        const int64_t active = bases.back();
+        bases.pop_back();
+        std::vector<int64_t> sizes(bases.size(), 1);
+        for (int pass = 0; pass < 2; ++pass) {   // pass 1 = the next agent cycle: a fresh cleaner again
+            SCOPED_TRACE("pass " + std::to_string(pass));
+            LogCleaner cleaner;
+            uint64_t seq = 1;
+            cleaner.setDeferredInstall(&seq);
+            SkimpyOffsetMap map(1024);
+            const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1000, map, false, 1 << 20, nullptr, 1'000'000);
+            for (const auto& g : res.groups)
+                if (g.hasOutput) std::filesystem::remove(Log::cleanedLogPath(log.dir(), g.bases.front(), g.seq));
+            EXPECT_TRUE(cleaner.uncleanable());
+            EXPECT_LE(res.passEnd, damagedBase) << "the watermark would skip the damaged segment's dirty records";
+        }
+    }
+    std::filesystem::remove_all(dir);
+}
+
+namespace {
+// offset -> key of every intact data record once the deferred outputs are installed.
+std::map<int64_t, std::string> diskKeys(const std::string& dir, const std::vector<rune::storage::CleanedGroup>& deferred = {}) {
+    std::map<int64_t, std::filesystem::path> replace;
+    std::set<int64_t> removed;
+    for (const auto& g : deferred)
+        for (std::size_t i = 0; i < g.bases.size(); ++i) {
+            if (i == 0 && g.hasOutput) replace[g.bases[0]] = Log::cleanedLogPath(dir, g.bases[0], g.seq);
+            else removed.insert(g.bases[i]);
+        }
+    std::map<int64_t, std::string> out;
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.path().extension() != ".log") continue;
+        const int64_t b = baseOf(e.path());
+        if (removed.count(b)) continue;
+        const auto p = replace.count(b) ? std::filesystem::path(replace[b]) : e.path();
+        std::vector<uint8_t> buf(std::filesystem::file_size(p));
+        {
+            std::ifstream in(p, std::ios::binary);
+            in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+        }
+        for (std::size_t pos = 0; pos + rune::protocol::batch::kRecordBatchOverhead <= buf.size();) {
+            rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+            const std::size_t total = static_cast<std::size_t>(r.totalLength());
+            if (total < rune::protocol::batch::kRecordBatchOverhead || pos + total > buf.size()) break;
+            if (r.ensureValid() && (r.attributes() & rune::protocol::batch::kAttrControl) == 0)
+                r.forEachRecord([&](std::string_view k, std::string_view, int64_t o, int64_t) { out[o] = std::string(k); });
+            pos += total;
+        }
+    }
+    return out;
+}
+}  // namespace
+
+// Plain key compaction over a log with one damaged segment: damage in its first, middle or last batch (a CRC flip), or
+// leftover bytes shorter than a batch at its end; the damaged segment first, in the middle or last of the sealed region;
+// every engine, two passes with a fresh cleaner each (the agent; a restart).  Invariant: every record that was on disk is
+// either still there or superseded by a LATER record of its key that is still there (outputs installed before the pass
+// met the damage are consistent with the map), and the damaged segment's file is byte-identical.
+TEST(CheckedWritesVerdictCleanerRegression, DamageAtEveryPlaceKeepsEveryUnsupersededRecordOnEveryEngineAdversarialRegression) {
+    int cases = 0, droppedSomewhere = 0;
+    for (int where = 0; where < 3; ++where) {            // damaged segment: first / middle / last sealed
+        for (int kind = 0; kind < 4; ++kind) {           // 0 first batch, 1 middle batch, 2 last batch, 3 short leftover
+            for (int engine = 0; engine < kEngines; ++engine) {
+                if (engine == 3) continue;               // compact reloads the log: its recovery truncates at the damage
+                SCOPED_TRACE("where " + std::to_string(where) + " kind " + std::to_string(kind) + " " + engineName(engine));
+                const auto dir = tempDir();
+                {
+                    Log log(dir.string(), /*segmentBytes=*/900);
+                    log.recover();
+                    uint32_t rng = 7u + static_cast<uint32_t>(where * 31 + kind * 7 + engine);
+                    for (int64_t o = 0; o < 80; ++o) {
+                        rng = rng * 1664525u + 1013904223u;
+                        data(log, o, "k" + std::to_string((rng >> 8) % 9), "v" + std::to_string(o));
+                    }
+                    auto bases = log.segmentBaseOffsets();
+                    ASSERT_GE(bases.size(), 5u);
+                    const int64_t active = bases.back();
+                    const std::size_t sealed = bases.size() - 1;
+                    const int64_t segBase = bases[where == 0 ? 0 : where == 1 ? sealed / 2 : sealed - 1];
+                    const int64_t segEnd  = *std::upper_bound(bases.begin(), bases.end(), segBase);
+                    const int64_t victim  = kind == 0 ? segBase : kind == 1 ? (segBase + segEnd) / 2 : segEnd - 1;
+                    std::ostringstream os;
+                    os << log.dir() << "/" << std::setw(20) << std::setfill('0') << segBase << ".log";
+                    const std::filesystem::path file = os.str();
+                    if (kind < 3) {
+                        const auto v = findBatch(log.dir(), victim);
+                        ASSERT_TRUE(v.has_value());
+                        ASSERT_EQ(v->file, file);
+                        xorByteAt(v->file, v->pos + v->total - 1, 0x5A);
+                    } else {
+                        std::ofstream app(file, std::ios::binary | std::ios::app);
+                        const char junk[17] = "leftover-bytes!!";
+                        app.write(junk, 17);   // shorter than one batch's overhead
+                    }
+                    auto readAll = [](const std::filesystem::path& f) {
+                        std::ifstream in(f, std::ios::binary);
+                        return std::vector<char>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                    };
+                    const auto damagedBytes = readAll(file);
+                    const auto before = diskKeys(log.dir());
+                    for (int pass = 0; pass < 2; ++pass) {
+                        bases = log.segmentBaseOffsets();
+                        bases.pop_back();
+                        LogCleaner cleaner;
+                        cleaner.setMarkerRemovalBound(kMax);
+                        std::vector<rune::storage::CleanedGroup> deferred;
+                        uint64_t seq = 1 + static_cast<uint64_t>(pass) * 100;
+                        if (engine <= 2) {
+                            if (engine == 2) cleaner.setDeferredInstall(&seq);
+                            std::vector<int64_t> sizes(bases.size(), 1);
+                            SkimpyOffsetMap map(1024);
+                            auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1000, map,
+                                                                          engine == 1, 1 << 20, nullptr, 1'000'000);
+                            deferred = std::move(res.groups);
+                        } else {
+                            for (const int64_t b : bases) {   // every sealed segment, the way a per-segment caller would
+                                LogCleaner c;
+                                c.setMarkerRemovalBound(kMax);
+                                if (engine == 4) {
+                                    (void)c.produceCleanedFileBounded(log.dir(), bases, b, active, 0, 0, 1000, 1 << 20, nullptr, 1'000'000);
+                                } else {
+                                    rune::storage::SegmentGroup g;
+                                    g.bases = {b};
+                                    g.combinedBytes = 1 << 20;
+                                    (void)c.produceCleanedGroupBounded(log.dir(), bases, g, active, 0, 0, 1000, 1 << 20, nullptr, 1'000'000);
+                                }
+                            }
+                        }
+                        const auto after = diskKeys(log.dir(), deferred);
+                        // Install the deferred outputs the way the owner would, so the next pass sees them.
+                        for (const auto& g : deferred) {
+                            for (std::size_t i = 0; i < g.bases.size(); ++i) {
+                                std::ostringstream p;
+                                p << log.dir() << "/" << std::setw(20) << std::setfill('0') << g.bases[i] << ".log";
+                                if (i == 0 && g.hasOutput) std::filesystem::rename(Log::cleanedLogPath(log.dir(), g.bases[0], g.seq), p.str());
+                                else std::filesystem::remove(p.str());
+                            }
+                        }
+                        for (const auto& [o, k] : before) {
+                            if (after.count(o)) continue;
+                            ++droppedSomewhere;
+                            bool superseded = false;
+                            for (const auto& [o2, k2] : after) if (o2 > o && k2 == k) { superseded = true; break; }
+                            EXPECT_TRUE(superseded) << "pass " << pass << ": offset " << o << " (key " << k
+                                                    << ") was dropped with no later record of its key left";
+                        }
+                        EXPECT_EQ(readAll(file), damagedBytes) << "pass " << pass << ": the damaged segment was rewritten";
+                    }
+                    ++cases;
+                }
+                std::filesystem::remove_all(dir);
+                if (::testing::Test::HasFailure()) return;
+            }
+        }
+    }
+    EXPECT_EQ(cases, 3 * 4 * (kEngines - 1));
+    EXPECT_GT(droppedSomewhere, 0) << "the passes must really compact the healthy segments";
 }

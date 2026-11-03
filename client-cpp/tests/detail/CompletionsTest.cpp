@@ -7,6 +7,8 @@
 #include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/producer/ProducerImpl.h>
 
+#include "../support/AllocCounter.h"
+
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -17,6 +19,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -787,6 +790,217 @@ TEST(CompletionsAdversarialRegression, PollHandlerThatThrowsStillReturnsTheCredi
     EXPECT_EQ(seen, k);
     EXPECT_EQ(cq.outstanding(), total - k);
     EXPECT_EQ(cq.reservedBytes(), resv0 - k * 48u);
+    while (cq.poll([](const Completion&, std::span<const uint8_t>) {}) > 0) {}
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+}
+
+// ===========================================================================
+// Batch 1 fix-round re-attack: the deferred credit (Completions::DeferredCredit).
+// ===========================================================================
+namespace {
+bool deliverKind(Completions& cq, Token t, OpKind op, uint32_t r) {
+    Completion c;
+    c.token = t;
+    c.op = op;
+    c.reservedBytes = r;
+    return cq.ring().deliver(c, {}, CompletionRing::Overflow::Truncate);
+}
+}  // namespace
+
+// A BatchAck returns `units` reservations in one record: inside the handler none of them is back yet (the record is still
+// in the ring); after poll() returns, all of them are, and the queue takes exactly that many new ops again.
+TEST(CompletionsAdversarialRegression, BatchAckUnitsReturnAfterTheReadAdversarialRegression) {
+    Completions cq(smallCfg(1024, 88, 64));   // M = 136: 18 outstanding 48-byte reservations fill the credit
+    constexpr uint32_t kUnits = 7;
+    for (uint32_t i = 0; i < kUnits; ++i) ASSERT_EQ(cq.reserve(48), OpResult::Accepted);
+    Token next = 100;
+    while (cq.reserve(48) == OpResult::Accepted) ASSERT_TRUE(deliver(cq, next++, 48, 0));
+    const uint32_t singles = static_cast<uint32_t>(next - 100);
+    ASSERT_EQ(singles + kUnits, 18u);
+    ASSERT_TRUE(deliverKind(cq, 0, OpKind::BatchAck, kUnits * rune::client::kBatchAckUnitBytes));
+    int acks = 0;
+    uint32_t insideOutstanding = 0, insideReserved = 0;
+    const int n = cq.poll([&](const Completion& c, std::span<const uint8_t>) {
+        if (c.op != OpKind::BatchAck) return;
+        ++acks;
+        insideOutstanding = cq.outstanding();
+        insideReserved    = cq.reservedBytes();
+        EXPECT_EQ(cq.reserve(48), OpResult::QueueFull) << "no credit of the read is back while it runs";
+    });
+    EXPECT_EQ(n, static_cast<int>(singles) + 1);
+    EXPECT_EQ(acks, 1);
+    EXPECT_EQ(insideOutstanding, 18u);
+    EXPECT_EQ(insideReserved, 18u * 48u);
+    EXPECT_EQ(cq.outstanding(), 0u) << "the BatchAck returned its " << kUnits << " units, the singles one each";
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    uint32_t again = 0;
+    while (cq.reserve(48) == OpResult::Accepted) ++again;
+    EXPECT_EQ(again, 18u) << "the whole credit is back, no more and no less";
+}
+
+// Stash plus ring in one poll(): the stash entries' credit returns at once (their bytes left the ring when waitFor
+// stashed them), the ring records' only after the read.  A handler that reissues on every completion never loses one,
+// and the totals end at zero.  Seeded mix of waitFor (stashing) and poll.
+TEST(CompletionsAdversarialRegression, StashAndRingMixWithReissuingHandlerAdversarialRegression) {
+    for (uint32_t seed = 1; seed <= 20; ++seed) {
+        SCOPED_TRACE("seed " + std::to_string(seed));
+        Completions cq(smallCfg(1024, 88, 64));
+        uint32_t rng = seed * 2654435761u;
+        auto rnd = [&]() { rng = rng * 1664525u + 1013904223u; return rng >> 8; };
+        constexpr Token kTotal = 400;
+        Token next = 0;
+        std::vector<int> times(kTotal, 0);
+        std::deque<Token> inRing;
+        auto issue = [&]() {
+            if (next >= kTotal) return;
+            if (cq.reserve(48) != OpResult::Accepted) return;
+            ASSERT_TRUE(deliver(cq, next, 48, 0)) << "token " << next << " refused by the ring";
+            inRing.push_back(next++);
+        };
+        auto handler = [&](const Completion& c, std::span<const uint8_t>) {
+            ++times[c.token];
+            if (rnd() % 2) issue();   // reissue from inside the handler (ring or stash delivery)
+        };
+        for (int step = 0; step < 100000 && (next < kTotal || cq.outstanding() != 0); ++step) {
+            const uint32_t k = rnd() % 4;
+            if (k == 0) {
+                for (int i = 0; i < 5; ++i) issue();
+            } else if (k == 1 && !inRing.empty()) {
+                // waitFor a token deep in the ring: everything before it is stashed.
+                const std::size_t at = rnd() % inRing.size();
+                const Token want = inRing[at];
+                inRing.erase(inRing.begin() + static_cast<std::ptrdiff_t>(at));
+                if (times[want] == 0) {
+                    const auto w = cq.waitFor(want, 0ns, handler);
+                    ASSERT_EQ(w, Completions::Wait::Done) << "token " << want;
+                }
+            } else {
+                (void)cq.poll(handler, static_cast<int>(1 + rnd() % 8));
+                inRing.clear();   // tokens may now be in the stash or delivered; waitFor only targets fresh ones
+            }
+        }
+        while (cq.poll(handler) > 0) {}
+        EXPECT_EQ(cq.ring().lostCompletions(), 0u);
+        EXPECT_EQ(next, kTotal);
+        for (Token t = 0; t < next; ++t) ASSERT_EQ(times[t], 1) << "token " << t;
+        EXPECT_EQ(cq.outstanding(), 0u);
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+        EXPECT_EQ(cq.stashed(), 0u);
+    }
+}
+
+// A handler that throws on the LAST record of a read, and one that throws while the read spans a wrap (two Aeron reads in
+// one CompletionRing::read): the credit returned equals exactly the records handed over, and every later token arrives.
+TEST(CompletionsAdversarialRegression, ThrowAcrossAWrapReturnsExactlyTheHandedCreditAdversarialRegression) {
+    for (int throwAt = 1; throwAt <= 18; ++throwAt) {
+        SCOPED_TRACE("throw at " + std::to_string(throwAt));
+        Completions cq(smallCfg(1024, 88, 64));
+        Token next = 0;
+        // Advance the ring so the next batch wraps: 11 records in, 11 out.
+        for (int i = 0; i < 11; ++i) { ASSERT_EQ(cq.reserve(48), OpResult::Accepted); ASSERT_TRUE(deliver(cq, next++, 48, 0)); }
+        while (cq.poll([](const Completion&, std::span<const uint8_t>) {}) > 0) {}
+        ASSERT_EQ(cq.outstanding(), 0u);
+        const Token first = next;
+        while (cq.reserve(48) == OpResult::Accepted) ASSERT_TRUE(deliver(cq, next++, 48, 0));
+        ASSERT_EQ(next - first, 18u);
+        int seen = 0;
+        std::vector<int> times(64, 0);
+        EXPECT_THROW(cq.poll([&](const Completion& c, std::span<const uint8_t>) {
+            ++times[c.token];
+            if (++seen == throwAt) throw std::runtime_error("handler");
+        }), std::runtime_error);
+        EXPECT_EQ(seen, throwAt);
+        EXPECT_EQ(cq.outstanding(), 18u - static_cast<uint32_t>(throwAt));
+        EXPECT_EQ(cq.reservedBytes(), (18u - static_cast<uint32_t>(throwAt)) * 48u);
+        while (cq.poll([&](const Completion& c, std::span<const uint8_t>) { ++times[c.token]; }) > 0) {}
+        for (Token t = first; t < next; ++t) EXPECT_EQ(times[t], 1) << "token " << t;
+        EXPECT_EQ(cq.outstanding(), 0u);
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+    }
+}
+
+// The doc says a handler may issue ops, and reserve() answering QueueFull means "poll() first".  A handler that does exactly
+// that calls poll() (or waitFor()) from inside poll(): the nested ring read starts from the same, not yet moved, head.  Every
+// completion must still be delivered exactly once and the credit must end at zero; at the least the nested call must be
+// refused, never re-deliver records of the outer read.
+// URGENT break found by the batch 1 fix-round re-attack (hang): OneToOneRingBuffer::read is not re-entrant - the nested read
+// re-delivers from the unmoved head, then the outer read's exit moves the head back over memory the nested one zeroed, and
+// the ring is wedged (later completions never arrive, their ops stay outstanding).  Pre-existing; DISABLED until the fix
+// (a re-entrancy guard in Completions::poll / waitFor) lands.
+TEST(CompletionsAdversarialRegression, DISABLED_NestedPollInsideAPollHandlerDeliversEachCompletionOnceAdversarialRegression) {
+    Completions cq(smallCfg(1024, 88, 64));
+    Token next = 0;
+    std::vector<int> times(64, 0);
+    while (cq.reserve(48) == OpResult::Accepted) ASSERT_TRUE(deliver(cq, next++, 48, 0));
+    ASSERT_EQ(next, 18u);
+    int depth = 0;
+    std::function<void(const Completion&, std::span<const uint8_t>)> h = [&](const Completion& c, std::span<const uint8_t>) {
+        ++times[c.token];
+        if (depth == 0 && cq.reserve(48) == OpResult::QueueFull) {   // "poll() first"
+            ++depth;
+            (void)cq.poll(h, 2);
+            --depth;
+        }
+    };
+    for (int i = 0; i < 100 && cq.poll(h) > 0; ++i) {}
+    for (Token t = 0; t < next; ++t) EXPECT_EQ(times[t], 1) << "token " << t;
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    EXPECT_TRUE(cq.ring().empty());
+    // The ring still works afterwards: a fresh op round-trips.
+    ASSERT_EQ(cq.reserve(48), OpResult::Accepted);
+    ASSERT_TRUE(deliver(cq, 40, 48, 0));
+    int got = 0;
+    for (int i = 0; i < 4 && got == 0; ++i) got += cq.poll([&](const Completion& c, std::span<const uint8_t>) { EXPECT_EQ(c.token, 40u); });
+    EXPECT_EQ(got, 1) << "the ring is wedged after a nested read";
+}
+
+// waitFor() inside a poll() handler: issue the next op and wait for it synchronously (a natural request chain).
+// URGENT (same root cause as the nested poll above): DISABLED until the re-entrancy guard lands.
+TEST(CompletionsAdversarialRegression, DISABLED_WaitForInsideAPollHandlerDeliversEachCompletionOnceAdversarialRegression) {
+    Completions cq(smallCfg(1024, 88, 64));
+    std::vector<int> times(64, 0);
+    for (Token t = 0; t < 4; ++t) { ASSERT_EQ(cq.reserve(48), OpResult::Accepted); ASSERT_TRUE(deliver(cq, t, 48, 0)); }
+    Token next = 4;
+    std::function<void(const Completion&, std::span<const uint8_t>)> h = [&](const Completion& c, std::span<const uint8_t>) {
+        ++times[c.token];
+        if (c.token < 4 && next < 8 && cq.reserve(48) == OpResult::Accepted) {
+            const Token t = next++;
+            ASSERT_TRUE(deliver(cq, t, 48, 0));
+            (void)cq.waitFor(t, 0ns, [&](const Completion& d, std::span<const uint8_t>) { ++times[d.token]; });
+        }
+    };
+    for (int i = 0; i < 100 && cq.poll(h) > 0; ++i) {}
+    for (Token t = 0; t < next; ++t) EXPECT_EQ(times[t], 1) << "token " << t;
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    EXPECT_EQ(cq.stashed(), 0u);
+}
+
+// Hot path: poll() and waitFor() with the deferred credit allocate nothing per record or per call (the guard is two
+// counters on the stack), including a handler that reissues, a BatchAck, and waitFor stashing other tokens.
+TEST(CompletionsAdversarialRegression, DeferredCreditPollAndWaitForAllocateNothingAdversarialRegression) {
+    Completions cq(smallCfg(4096, 88, 64));
+    Token next = 0;
+    auto h = [&](const Completion& c, std::span<const uint8_t>) {
+        if (c.op != OpKind::BatchAck && cq.reserve(48) == OpResult::Accepted) (void)deliver(cq, next++, 48, 0);
+    };
+    auto cycle = [&]() {
+        for (int i = 0; i < 8; ++i) if (cq.reserve(48) == OpResult::Accepted) (void)deliver(cq, next++, 48, 0);
+        for (int i = 0; i < 3; ++i) ASSERT_EQ(cq.reserve(48), OpResult::Accepted);
+        ASSERT_TRUE(deliverKind(cq, 0, OpKind::BatchAck, 3 * rune::client::kBatchAckUnitBytes));
+        const Token want = next;
+        ASSERT_EQ(cq.reserve(48), OpResult::Accepted);
+        ASSERT_TRUE(deliver(cq, next++, 48, 0));
+        ASSERT_EQ(cq.waitFor(want, 0ns, h), Completions::Wait::Done);   // stashes the earlier records
+        for (int i = 0; i < 4 && cq.poll(h) > 0; ++i) {}
+    };
+    for (int w = 0; w < 50; ++w) cycle();   // warm-up
+    alloc_counter::startThisThread();
+    for (int r = 0; r < 2000; ++r) cycle();
+    const long allocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(allocs, 0) << "poll/waitFor allocated on the hot path";
     while (cq.poll([](const Completion&, std::span<const uint8_t>) {}) > 0) {}
     EXPECT_EQ(cq.outstanding(), 0u);
     EXPECT_EQ(cq.reservedBytes(), 0u);
