@@ -94,7 +94,7 @@ TEST(CheckedWritesStressHistory, RejectionTheLeaderCompactedBeforeAnyHistoryRead
     };
     for (int i = 0; i < 4000 && !gone(); i += 50)
         for (int j = 0; j < 50; ++j) ASSERT_EQ(d.kiWrite(Op::Insert, a).result, Result::Violation);
-    for (int poll = 0; poll < 600 && !gone(); ++poll) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (int poll = 0; poll < 100 && !gone(); ++poll) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     ASSERT_TRUE(gone()) << "the leader never compacted the rejected update (" << miss.hwBefore << ", " << miss.hwAfter << ")";
     d.quiesce();
     ASSERT_FALSE(HasFatalFailure());

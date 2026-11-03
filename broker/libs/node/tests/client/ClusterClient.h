@@ -55,7 +55,9 @@ inline int32_t leaderOn(BrokerNode& n, int32_t topicId, int32_t partition) {
 inline bool awaitLeaders(ThreeNodes& c, int32_t topicId, int32_t parts, std::vector<int32_t>& leaders,
                          std::chrono::milliseconds within) {
     using Clock = std::chrono::steady_clock;
-    for (const auto deadline = Clock::now() + within; Clock::now() < deadline; std::this_thread::yield()) {
+    constexpr int kMaxPolls = 1'000'000;
+    int polls = 0;
+    for (const auto deadline = Clock::now() + within; polls++ < kMaxPolls && Clock::now() < deadline; std::this_thread::yield()) {
         leaders.assign(static_cast<std::size_t>(parts), -1);
         bool ok = true;
         const auto running = c.runningNodes();

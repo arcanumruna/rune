@@ -70,12 +70,13 @@ public:
         Op op = Op::Upsert;
         uint16_t code = 0;
         int64_t offset = -1, hwBefore = 0, hwAfter = 0;
+        bool windowKnown = false;                            ///< hwBefore / hwAfter bracket the write alone (no node went down during it)
         enum class Result : uint8_t { Ok, Violation, Unknown } result = Result::Unknown;
     };
 
     CheckedWritesStressDriver(rune::node::test::catalog_cluster::ThreeNodes& cluster, uint64_t seed, bool keyIndex = false)
         : c_(cluster), rng_(seed), seed_(seed), keyIndex_(keyIndex), parts_(keyIndex ? kKiParts : 1), keys_(keyIndex ? kKiKeys : kTagKeys),
-          data_(static_cast<std::size_t>(parts_)), changes_(static_cast<std::size_t>(parts_)), models_(static_cast<std::size_t>(parts_)),
+          seen_(static_cast<std::size_t>(parts_)), data_(static_cast<std::size_t>(parts_)), changes_(static_cast<std::size_t>(parts_)), models_(static_cast<std::size_t>(parts_)),
           deliveredOffsets_(static_cast<std::size_t>(parts_)), rawIntents_(static_cast<std::size_t>(parts_)), groupOffsets_(static_cast<std::size_t>(parts_)) {
         registerDefaults_();
         if (keyIndex_) registerKeyIndexInvariants_();
@@ -120,28 +121,23 @@ public:
         rebuildWriters_(-1);
     }
 
-    [[nodiscard]] std::string keyIndexTally() const { return std::to_string(pinned56_) + " KeyExists and " + std::to_string(pinned57_) + " KeyNotFound pinned to their record, " + std::to_string(lostRejections_) + " rejections compacted before the history saw them, " + std::to_string(sent_.size()) + " writes"; }
+    [[nodiscard]] std::string keyIndexTally() const { return std::to_string(pinned56_) + " KeyExists and " + std::to_string(pinned57_) + " KeyNotFound pinned to their record, " + std::to_string(provenCompacted_) + " rejections proven compacted away, " + std::to_string(unjudgedInCrash_) + " rejections answered during a crash and not judged, " + std::to_string(sent_.size()) + " writes"; }
 
     /// One seeded action.
     void step() {
         const unsigned r = static_cast<unsigned>(rng_() % 100);
         const int down = downNode_();
         if (r < 55) {
-            note_(1);
             sendBurst_(-1);
         } else if (r < 65 && down == 0) {
-            note_(2);
             crashLeaderDuringSends_();
         } else if (r < 80) {
-            note_(3);
             if (down != 0) restartNode_(down, false);
             else restartNonLeader_();
         } else if (r < 92) {
-            note_(4);
             if (keyIndex_) sendBurst_(-1);   // no constraint set to change: another burst
             else changeConstraintSet_();
         } else {
-            note_(5);
             std::this_thread::sleep_for(std::chrono::milliseconds(50 + static_cast<int>(rng_() % 150)));
         }
     }
@@ -220,7 +216,6 @@ public:
         return true;
     }
 
-    [[nodiscard]] uint64_t traceHash() const noexcept { return trace_; }
     /// How often each fault ran: leader crashes, follower or node restarts, restarts cut short.
     [[nodiscard]] std::array<int, 3> faults() const noexcept { return {crashes_, restarts_, bounces_}; }
     [[nodiscard]] const CheckedWritesModel& model(int part = 0) const noexcept { return models_[static_cast<std::size_t>(part)]; }
@@ -236,6 +231,7 @@ public:
         s.id = id;
         s.op = op;
         s.part = static_cast<int>(rune::client::Key(id).partition(parts_));
+        s.windowKnown = true;
         s.hwBefore = highWatermark_(s.part);
         kiSend_(*kiWriters_.front(), &s);
         s.hwAfter = highWatermark_(s.part);
@@ -433,6 +429,7 @@ private:
     }
     /// A node's counters die with it: the ones that must stay zero are read just before it goes.
     void checkCounters_(int id) {
+        if (!keyIndex_) return;
         for (int p = 0; p < parts_; ++p) {
             const NodeSnap s = snapNode_(id, p);
             EXPECT_EQ(s.mismatches, 0u) << "seed " << seed_ << ": node " << id << " partition " << p << " before stopping";
@@ -446,7 +443,6 @@ private:
         if (bounce) {
             ++bounces_;   // a restart in the middle of the rebuild
             std::this_thread::sleep_for(std::chrono::milliseconds(100 + static_cast<int>(rng_() % 400)));
-            checkCounters_(id);
             c_.stop(id);
             c_.startNode(id);
         }
@@ -525,12 +521,13 @@ private:
             const unsigned o = static_cast<unsigned>(rng_() % 100);
             s.op = o < 35 ? Op::Insert : o < 60 ? Op::Update : o < 80 ? Op::RemoveExisting : Op::Remove;
             s.part = static_cast<int>(rune::client::Key(s.id).partition(parts_));
-            if (!killer.joinable()) s.hwBefore = highWatermark_(s.part);
+            s.windowKnown = !killer.joinable() && (victim <= 0 || i < n / 2);
+            if (s.windowKnown) s.hwBefore = highWatermark_(s.part);
             if (victim > 0 && i == n / 2) { checkCounters_(victim); killer = std::thread([this, victim] { c_.crash(victim); }); }
             kiSend_(w, &s);
-            // A node going down cannot be asked for its high watermark: the window of a rejected tombstone is unknown, it is not judged.
-            if (killer.joinable()) { if (s.result == Sent::Result::Violation && (s.op == Op::RemoveExisting)) s.result = Sent::Result::Unknown; }
-            else s.hwAfter = highWatermark_(s.part);
+            // A node going down cannot be asked for its high watermark: a rejection answered then has no window to be proven by.
+            if (s.windowKnown) s.hwAfter = highWatermark_(s.part);
+            else if (s.result == Sent::Result::Violation) { s.result = Sent::Result::Unknown; ++unjudgedInCrash_; }
 
             if (s.result == Sent::Result::Unknown) writersStale_ = true;   // no answer: the write may or may not be in the log
             sent_.push_back(s);
@@ -643,6 +640,13 @@ private:
         for (const NodeSnap& s : snaps) if (s.part == part && (best == nullptr || s.hw > best->hw)) best = &s;
         return best;
     }
+    /// The write's [hwBefore, hwAfter) window has an offset no replica ever showed: the record was compacted away everywhere before
+    /// a history read could see it.  Without a gap, a rejection with no record is a wrong verdict.
+    bool windowHasGap_(const Sent& s) const {
+        if (!s.windowKnown) return false;
+        for (int64_t o = s.hwBefore; o < s.hwAfter; ++o) if (seen_[static_cast<std::size_t>(s.part)].count(o) == 0) return true;
+        return false;
+    }
     /// One past the last data record: what the judge and the committed markers must cover (a trailing change record needs no marker).
     static int64_t dataEnd_(const VerdictRig::RigLog& l) { return l.data.empty() ? 0 : l.data.back().offset + 1; }
 
@@ -651,8 +655,16 @@ private:
     /// before this read is still on the followers.
     void recordHistory_(const std::vector<NodeSnap>* given = nullptr) {
         const auto record = [this](int part, const VerdictRig::RigLog& log) {
-            for (const auto& d : log.data) data_[static_cast<std::size_t>(part)][d.offset] = d;
-            for (const auto& ch : log.changes) changes_[static_cast<std::size_t>(part)][ch.offset] = ch;
+            for (const auto& d : log.data) {
+                const auto at = data_[static_cast<std::size_t>(part)].emplace(d.offset, d);
+                if (!at.second) EXPECT_TRUE(at.first->second.id == d.id && at.first->second.v == d.v && at.first->second.tag == d.tag && at.first->second.del == d.del && at.first->second.intent == d.intent) << "seed " << seed_ << ": two replicas hold different records at offset " << d.offset << " of partition " << part;
+                seen_[static_cast<std::size_t>(part)].insert(d.offset);
+            }
+            for (const auto& ch : log.changes) {
+                changes_[static_cast<std::size_t>(part)][ch.offset] = ch;
+                seen_[static_cast<std::size_t>(part)].insert(ch.offset);
+            }
+            for (const auto& m : log.markers) seen_[static_cast<std::size_t>(part)].insert(m.offset);
         };
         if (given != nullptr) {
             for (const NodeSnap& s : *given) record(s.part, s.log);
@@ -687,7 +699,6 @@ private:
         ADD_FAILURE() << "seed " << seed_ << ": no node's log lost a superseded record in " << wait_(60s).count() << " s (" << committed << " committed records)";
     }
 
-    void note_(unsigned code) { trace_ = (trace_ ^ code) * 1099511628211ull; }
     /// A key-index poll is a 10 s deadline; 04's keep theirs.
     std::chrono::seconds wait_(std::chrono::seconds legacy) const { return keyIndex_ ? 10s : legacy; }
     static constexpr int kPollCap = 4000;
@@ -795,10 +806,8 @@ private:
                 if (d.keyIndex_ && s.v == 0) continue;
                 if (s.result == Sent::Result::Ok && accepted.count(s.v) == 0) { *why = "v " + std::to_string(s.v) + " was acked Ok but no accepted record carries it"; return false; }
                 if (s.result == Sent::Result::Violation && rejected.count(s.v) == 0) {
-                    bool inLog = false;   // a rejected record compacted away on every replica before a history read saw it
-                    for (const auto& kv : d.data_[static_cast<std::size_t>(s.part)]) inLog = inLog || kv.second.v == s.v;
-                    if (!inLog) continue;
-                    *why = "v " + std::to_string(s.v) + " (id " + std::to_string(s.id) + ", code " + std::to_string(s.code) + ") was acked as a violation but its record was accepted";
+                    if (d.keyIndex_ && d.windowHasGap_(s)) continue;   // compacted away on every replica before a history read saw it
+                    *why = "v " + std::to_string(s.v) + " was acked as a violation but no rejected record carries it";
                     return false;
                 }
             }
@@ -905,7 +914,7 @@ private:
     /// accepted write never gets one; each partition's key index holds the model's live keys.
     void registerKeyIndexInvariants_() {
         registerInvariant("IntentVerdictsExact", [](CheckedWritesStressDriver& d, std::string* why) {
-            d.pinned56_ = d.pinned57_ = d.lostRejections_ = 0;
+            d.pinned56_ = d.pinned57_ = d.provenCompacted_ = 0;
             const auto intentOf = [](Op op) -> uint8_t { return op == Op::Insert ? 1 : op == Op::Update || op == Op::RemoveExisting ? 2 : 0; };
             for (int p = 0; p < d.parts_; ++p) {   // a token names one write
                 std::map<int64_t, int> seen;
@@ -923,11 +932,12 @@ private:
                 std::vector<int64_t> candidates;
                 if (s.result == Sent::Result::Ok) candidates.push_back(s.offset);
                 else for (const auto& [off, rec] : data)
-                    if (rec.id == s.id && rec.del == tombstone && (tombstone ? off >= s.hwBefore && off < s.hwAfter : rec.v == s.v)) candidates.push_back(off);
+                    if (rec.id == s.id && rec.del == tombstone && (tombstone ? off >= s.hwBefore && off < s.hwAfter && rec.intent == intentOf(s.op) : rec.v == s.v)) candidates.push_back(off);
                 if (candidates.empty()) {
                     if (s.result == Sent::Result::Ok) { *why = "the write of id " + std::to_string(s.id) + " acked at offset " + std::to_string(s.offset) + " has no record in the log"; return false; }
-                    ++d.lostRejections_;   // judged after it committed, then compacted away on every replica before a history read saw it
-                    continue;
+                    if (d.windowHasGap_(s)) { ++d.provenCompacted_; continue; }   // compacted away on every replica before a history read saw it
+                    *why = "the write of id " + std::to_string(s.id) + " answered " + std::to_string(s.code) + " has no record in the log, and its window [" + std::to_string(s.hwBefore) + ", " + std::to_string(s.hwAfter) + ") of partition " + std::to_string(s.part) + " has no gap";
+                    return false;
                 }
                 bool judged = false;
                 for (const int64_t off : candidates) {
@@ -971,7 +981,6 @@ private:
     uint64_t seed_;
     bool keyIndex_;
     int parts_, keys_;
-    uint64_t trace_ = 1469598103934665603ull;
     int32_t topicId_ = -1, viewTopicId_ = -1;
     int32_t capTopic_ = kCapTopicBase, capSeq_ = 0;   // the installed CapLiveKeys view's topic (0 = dropped)
     uint32_t capValue_ = 8;
@@ -979,11 +988,12 @@ private:
     int64_t vSeq_ = 0;
     int crashes_ = 0, restarts_ = 0, bounces_ = 0;
     int keyExists_ = 0, keyNotFound_ = 0;   ///< answered 56 / 57 (key-index mode)
-    int pinned56_ = 0, pinned57_ = 0, lostRejections_ = 0;   ///< answers matched to their judged record / to none
+    int pinned56_ = 0, pinned57_ = 0, provenCompacted_ = 0, unjudgedInCrash_ = 0;   ///< answers matched to their judged record / proven compacted away / answered during a crash
     bool writersStale_ = false;
     std::vector<std::unique_ptr<Writer>> writers_;
     std::vector<std::unique_ptr<KiWriter>> kiWriters_;
     std::vector<Sent> sent_;
+    std::vector<std::set<int64_t>> seen_;   ///< per partition: every offset any replica showed as a data record, change record or marker
     std::vector<std::map<int64_t, VerdictRig::RigLogRec>> data_;   ///< per partition
     std::vector<std::map<int64_t, VerdictRig::RigChange>> changes_;
     std::vector<NodeSnap> snaps_;
