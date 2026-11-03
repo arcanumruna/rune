@@ -216,7 +216,7 @@ void AeronTransport::startBody_() {
         responseControlChannelFor(cfg_.ingressChannel, cfg_.gatewayResponseControlPort);
     std::string correlatedChannel;   // the default publication's registered channel when response-correlated
     if (respChannel) {
-        const int32_t slot = addSubSlot_(*respChannel, cfg_.egressStreamId);
+        const int32_t slot = addSubSlot_(SubSlot::Kind::ResponsePair, *respChannel, cfg_.egressStreamId);
         if (slot >= 0) {
             pumpUntil_([&] {
                 if (conductorFault_ != nullptr) return true;
@@ -508,7 +508,7 @@ AeronTransport::PubHandle AeronTransport::responsePublicationHandle(const std::s
         }
         return static_cast<PubHandle>(i);   // one slot per key: plain stays plain, correlated stays correlated
     }
-    const int32_t sub = addSubSlot_(std::string(responseControlChannel), cfg_.egressStreamId, /*fresh=*/true);
+    const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, std::string(responseControlChannel), cfg_.egressStreamId);
     if (sub < 0) return kNoPub;
     PubSlot ps{channel, streamId, Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs}};
     ps.mode = PubSlot::AwaitResponseSub{sub};
@@ -525,7 +525,7 @@ bool AeronTransport::rePairResponsePublication(PubHandle h) noexcept {
     if (oldSub < 0) return false;   // a plain publication has no response pair
     try {
         const std::string respChannel = subSlots_[static_cast<std::size_t>(oldSub)].channel;
-        const int32_t sub = addSubSlot_(respChannel, cfg_.egressStreamId, /*fresh=*/true);
+        const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, respChannel, cfg_.egressStreamId);
         if (sub < 0) return false;
         ps.res.reset();   // the old request publication deregisters (its image goes away at the broker)
         ps.res = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
@@ -544,7 +544,7 @@ bool AeronTransport::rePairSeedResponse(int32_t responsePort) noexcept {
         const std::optional<std::string> respChannel = responseControlChannelFor(cfg_.ingressChannel, responsePort);
         if (!respChannel) return false;                                  // ipc / port 0: nothing to pair
         if (std::holds_alternative<SeedRePairing>(seedPair_)) return true;   // one in flight
-        const int32_t sub = addSubSlot_(*respChannel, cfg_.egressStreamId, /*fresh=*/true);
+        const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, *respChannel, cfg_.egressStreamId);
         if (sub < 0) return false;
         seedPair_ = SeedRePairing{sub, {}, Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs}};
         return true;
@@ -602,7 +602,7 @@ AeronTransport::PubHandle AeronTransport::upgradeToResponsePublication(const std
         if (ps.streamId != streamId || ps.channel != channel) continue;
         if (!std::holds_alternative<PubSlot::Plain>(ps.mode) || responseControlChannel.empty())
             return static_cast<PubHandle>(i);
-        const int32_t sub = addSubSlot_(std::string(responseControlChannel), cfg_.egressStreamId, /*fresh=*/true);
+        const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, std::string(responseControlChannel), cfg_.egressStreamId);
         if (sub < 0) return static_cast<PubHandle>(i);   // stays plain (the declared path)
         ps.res.reset();   // the plain publication deregisters; the correlated one is added once the sub is Ready
         ps.res  = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
@@ -704,15 +704,20 @@ aeron::Subscription* AeronTransport::resolveSubSlot_(SubSlot& s) noexcept {
 // read-rework I4: open a per-worker dynamic-MDC egress subscription (idempotent).
 // ---------------------------------------------------------------------------
 
-int32_t AeronTransport::addSubSlot_(const std::string& channel, int32_t streamId, bool fresh) noexcept {
-    for (std::size_t i = 0; i < subSlots_.size() && !fresh; ++i) {   // fresh: a response pair never shares a pinned slot
-        const SubSlot& s = subSlots_[i];
-        if (s.state == SubSlot::State::Live && s.streamId == streamId && s.channel == channel) {
-            ++subSlots_[i].owners;             // I1: shared; one more owner to release it
-            return static_cast<int32_t>(i);   // idempotent
+int32_t AeronTransport::addSubSlot_(SubSlot::Kind kind, const std::string& channel, int32_t streamId) noexcept {
+    if (kind == SubSlot::Kind::SharedMdc) {
+        for (std::size_t i = 0; i < subSlots_.size(); ++i) {   // a response pair is never a sharing target
+            SubSlot& s = subSlots_[i];
+            if (s.state == SubSlot::State::Live && s.kind == SubSlot::Kind::SharedMdc && s.streamId == streamId &&
+                s.channel == channel) {
+                ++s.mdcRefs;                      // shared; one more user to release it
+                return static_cast<int32_t>(i);   // idempotent
+            }
         }
+    } else {
+        ++freshSubsAdded_;
     }
-    if (fresh) ++freshSubsAdded_;
+    const uint32_t refs = kind == SubSlot::Kind::SharedMdc ? 1u : 0u;
     try {
         for (std::size_t i = 0; i < subSlots_.size(); ++i) {   // reuse a released slot
             SubSlot& s = subSlots_[i];
@@ -721,13 +726,14 @@ int32_t AeronTransport::addSubSlot_(const std::string& channel, int32_t streamId
             s.streamId = streamId;
             s.res      = Resolution<aeron::Subscription>{kResolveTimeoutNs, kResolveRetryNs};
             s.assembler.reset();
-            s.owners   = 1;
+            s.kind     = kind;
+            s.mdcRefs  = refs;
             s.state    = SubSlot::State::Live;
             return static_cast<int32_t>(i);
         }
         subSlots_.push_back(SubSlot{channel, streamId,
                                     Resolution<aeron::Subscription>{kResolveTimeoutNs, kResolveRetryNs},
-                                    nullptr});
+                                    nullptr, kind, refs, SubSlot::State::Live});
         return static_cast<int32_t>(subSlots_.size() - 1);
     } catch (...) {
         return -1;
@@ -738,8 +744,14 @@ void AeronTransport::retireSubSlot_(int32_t idx) noexcept {
     if (idx < 0 || static_cast<std::size_t>(idx) >= subSlots_.size()) return;
     SubSlot& s = subSlots_[static_cast<std::size_t>(idx)];
     if (s.state != SubSlot::State::Live) return;
-    if (s.owners > 1) { --s.owners; return; }   // I1: another owner (a correlated publication, a session) still uses it
-    s.owners = 0;
+    switch (s.kind) {
+        case SubSlot::Kind::SharedMdc:
+            if (s.mdcRefs > 1) { --s.mdcRefs; return; }   // another user (a session, a route) still uses it
+            s.mdcRefs = 0;
+            break;
+        case SubSlot::Kind::ResponsePair:   // exactly one owner: its release retires the slot
+            break;
+    }
     s.state = SubSlot::State::Retired;
     ++retiredSubs_;
 }
@@ -757,7 +769,7 @@ void AeronTransport::reapRetiredSubs_() noexcept {
 void AeronTransport::addEgressSubscription(const std::string& controlChannel,
                                            int32_t streamId) noexcept {
     if (!aeron_ || streamId == 0 || controlChannel.empty()) return;
-    (void)addSubSlot_(controlChannel, streamId);
+    (void)addSubSlot_(SubSlot::Kind::SharedMdc, controlChannel, streamId);
 }
 
 // ---------------------------------------------------------------------------
@@ -792,7 +804,7 @@ bool AeronTransport::retarget(const std::string& newIngressChannel, int32_t resp
         int32_t newRespSlot = -1;
         std::string pubChannel = newIngressChannel;
         if (respChannel) {
-            newRespSlot = addSubSlot_(*respChannel, cfg_.egressStreamId, /*fresh=*/true);   // a response pair never shares a subscription
+            newRespSlot = addSubSlot_(SubSlot::Kind::ResponsePair, *respChannel, cfg_.egressStreamId);   // a response pair never shares a subscription
             if (newRespSlot < 0) return false;
             pumpUntil_([&] {
                 SubSlot& rs = subSlots_[static_cast<std::size_t>(newRespSlot)];

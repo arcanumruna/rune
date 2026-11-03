@@ -262,10 +262,26 @@ public:
         return slot >= 0 && static_cast<std::size_t>(slot) < subSlots_.size() &&
                subSlots_[static_cast<std::size_t>(slot)].state == SubSlot::State::Live;
     }
-    [[nodiscard]] uint32_t subSlotOwnersForTest(int32_t slot) const noexcept {
+    [[nodiscard]] uint32_t subSlotMdcRefsForTest(int32_t slot) const noexcept {
         return slot >= 0 && static_cast<std::size_t>(slot) < subSlots_.size()
-                   ? subSlots_[static_cast<std::size_t>(slot)].owners : 0;
+                   ? subSlots_[static_cast<std::size_t>(slot)].mdcRefs : 0;
     }
+    /// TEST SEAMS (cold): the Live shared-MDC slot for (channel, stream) or -1; the response subscription slot a
+    /// response-paired publication names (-1 = none); and a release of one owner of a slot (what a user's release does).
+    [[nodiscard]] int32_t mdcSubSlotForTest(const std::string& channel, int32_t streamId) const noexcept {
+        for (std::size_t i = 0; i < subSlots_.size(); ++i)
+            if (subSlots_[i].state == SubSlot::State::Live && subSlots_[i].kind == SubSlot::Kind::SharedMdc &&
+                subSlots_[i].streamId == streamId && subSlots_[i].channel == channel) return static_cast<int32_t>(i);
+        return -1;
+    }
+    [[nodiscard]] int32_t responseSubSlotForTest(PubHandle h) const noexcept {
+        if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return -1;
+        const auto& m = pubSlots_[static_cast<std::size_t>(h)].mode;
+        if (const auto* a = std::get_if<PubSlot::AwaitResponseSub>(&m)) return a->subSlot;
+        if (const auto* c = std::get_if<PubSlot::Correlated>(&m)) return c->subSlot;
+        return -1;
+    }
+    void releaseSubSlotOwnerForTest(int32_t slot) noexcept { retireSubSlot_(slot); }
     [[nodiscard]] const std::string& seedPublicationChannelForTest() const noexcept { return ingressPubChannel_; }
     /// TEST SEAMS (cold): fresh response subscriptions registered since start (a re-pair adds one), and the identity of
     /// the publication a handle currently holds (null = none Ready), to prove a slot was left alone.
@@ -629,16 +645,22 @@ private:
     };
     struct SubSlot {
         enum class State : uint8_t { Live, Retired, Free };
+        /// What the slot is, one explicit state (#764): SharedMdc is deduplicated among Live slots and refcounted
+        /// (`mdcRefs` users); ResponsePair is ONE-SHOT (Aeron pins it to the first response session), never shared,
+        /// has exactly one owner and no count, and retires on its own release.
+        enum class Kind : uint8_t { SharedMdc, ResponsePair };
         std::string channel;
         int32_t     streamId;
         Resolution<aeron::Subscription> res;
         std::unique_ptr<aeron::FragmentAssembler> assembler;  // built on Ready
-        uint32_t    owners = 1;   ///< I1: acquirers of this Live slot (addSubSlot_ ++; retireSubSlot_ -- , Retired at 0)
+        Kind        kind = Kind::SharedMdc;
+        uint32_t    mdcRefs = 0;   ///< SharedMdc only: users of this Live slot (addSubSlot_ ++; retireSubSlot_ --, Retired at 0)
         State       state = State::Live;   ///< Retired: not polled, released by reapRetiredSubs_(); Free: reusable
     };
-    /// Open (idempotently, among Live slots) a subscription slot; its index, or -1 on allocation failure.  Cold.
-    /// I1: every successful call is one OWNER of the slot and must be matched by one retireSubSlot_ on its release path.
-    int32_t addSubSlot_(const std::string& channel, int32_t streamId, bool fresh = false) noexcept;
+    /// Open a subscription slot; its index, or -1 on allocation failure.  Cold.  SharedMdc is idempotent among Live
+    /// SharedMdc slots (one more user); ResponsePair always opens a fresh slot.  Every successful call is one OWNER of
+    /// the slot and must be matched by one retireSubSlot_ on its release path.
+    int32_t addSubSlot_(SubSlot::Kind kind, const std::string& channel, int32_t streamId) noexcept;
     /// A response subscription retired by retarget() may be the one whose poll callback is running: it is only
     /// marked here and released (with its assembler) at the start of the next poll().
     void retireSubSlot_(int32_t idx) noexcept;

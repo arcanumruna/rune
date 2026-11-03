@@ -1055,7 +1055,7 @@ TEST(AeronTransportRegression, SeedAndLeaderPairsOwnTheirOwnResponseSubscription
     ASSERT_TRUE(t.seedResponseCorrelated());
     const int32_t slot = t.seedResponseSlotForTest();
     ASSERT_GE(slot, 0);
-    EXPECT_EQ(t.subSlotOwnersForTest(slot), 1u);
+    const uint64_t pairsBefore = t.responseSubsAddedForTest();
 
     // A second owner: a leader session's correlated control publication to the SAME gateway.
     const std::string gwA = loopback(reqA);
@@ -1063,7 +1063,8 @@ TEST(AeronTransportRegression, SeedAndLeaderPairsOwnTheirOwnResponseSubscription
     ASSERT_TRUE(respCtl.has_value());
     const Transport::PubHandle h = t.responsePublicationHandle(gwA, 3551, *respCtl);
     ASSERT_NE(h, Transport::kNoPub);
-    EXPECT_EQ(t.subSlotOwnersForTest(slot), 1u) << "the seed's response subscription is never shared (one-shot per pair)";
+    EXPECT_EQ(t.responseSubsAddedForTest(), pairsBefore + 1) << "the leader's pair registered its OWN response subscription";
+    EXPECT_NE(t.responseSubSlotForTest(h), slot) << "the seed's response subscription is never shared (one-shot per pair)";
 
     // The seed fails over to B: only the seed's share is released.
     ASSERT_TRUE(t.retarget(loopback(reqB), rB));
@@ -1087,6 +1088,55 @@ TEST(AeronTransportRegression, SeedAndLeaderPairsOwnTheirOwnResponseSubscription
         return !got.empty();
     }));
     EXPECT_EQ(got, reply);
+    t.stop();
+}
+
+// #764: a slot's kind is its own state. A ResponsePair slot has exactly one owner and retires on its own release; only a
+// SharedMdc slot carries a refcount. A shared-MDC user of the SAME (channel, stream) as a response pair never joins the pair.
+TEST(AeronTransportRegression, ResponsePairSlotRetiresOnItsOwnReleaseRegression) {
+    const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
+    Config c = responseConfig(loopback(reqA), rA, 3580);
+    Transport t{c};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    const int32_t seedSlot = t.seedResponseSlotForTest();
+    const auto respCtl = rune::client::transport::responseControlChannelFor(loopback(reqA), rA);
+    ASSERT_TRUE(respCtl.has_value());
+    const auto reap = [&] { for (int i = 0; i < 3; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); } };
+
+    // Cell 1: an MDC user of the seed pair's own (channel, stream) gets its own slot, never the pair's.
+    t.addEgressSubscription(*respCtl, c.egressStreamId);
+    const int32_t sameKey = t.mdcSubSlotForTest(*respCtl, c.egressStreamId);
+    ASSERT_GE(sameKey, 0);
+    EXPECT_NE(sameKey, seedSlot) << "a shared-MDC user joined the response pair's one-shot slot";
+    EXPECT_EQ(t.subSlotMdcRefsForTest(sameKey), 1u);
+
+    // Cell 2: one MDC subscription shared by two users (refs 2) and one response pair.
+    t.addEgressSubscription("aeron:ipc", 3581);
+    t.addEgressSubscription("aeron:ipc", 3581);
+    const int32_t mdc = t.mdcSubSlotForTest("aeron:ipc", 3581);
+    ASSERT_GE(mdc, 0);
+    EXPECT_EQ(t.subSlotMdcRefsForTest(mdc), 2u);
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3582, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    const int32_t pair = t.responseSubSlotForTest(h);
+    ASSERT_GE(pair, 0);
+    EXPECT_TRUE(t.subSlotLiveForTest(pair));
+
+    t.releaseSubSlotOwnerForTest(pair);   // the pair's one owner leaves
+    reap();
+    EXPECT_FALSE(t.subSlotLiveForTest(pair)) << "the pair slot retires at once on its own release";
+    EXPECT_TRUE(t.subSlotLiveForTest(mdc));
+    EXPECT_EQ(t.subSlotMdcRefsForTest(mdc), 2u) << "the pair's release never touches the MDC refcount";
+
+    t.releaseSubSlotOwnerForTest(mdc);    // one MDC user leaves: still Live with refs 1
+    reap();
+    EXPECT_TRUE(t.subSlotLiveForTest(mdc));
+    EXPECT_EQ(t.subSlotMdcRefsForTest(mdc), 1u);
+    t.releaseSubSlotOwnerForTest(mdc);    // the last one leaves: Retired, then reaped
+    reap();
+    EXPECT_FALSE(t.subSlotLiveForTest(mdc));
     t.stop();
 }
 
