@@ -309,7 +309,10 @@ TEST(NamespaceSecurityV2Regression, IsNsAdminMatchesNsAdminOfRegression) {
             for (int i = 0; i < kUsers; ++i) {
                 const rs::UserObject* u = sc.s.userByName(userNs, "u" + std::to_string(i));
                 ASSERT_NE(u, nullptr);
-                const bool expected = std::find(listed.begin(), listed.end(), u->objectId) != listed.end();
+                // Independent of isNsAdmin (nsAdminOf is built on it): enabled, of this namespace, ADMIN on its NAMESPACE.
+                const bool expected = u->enabled && u->nsId == ns && rs::effectivePerms(sc.s, u->objectId, names[ns]).nsAdmin;
+                EXPECT_EQ(std::find(listed.begin(), listed.end(), u->objectId) != listed.end(), expected)
+                    << "nsAdminOf: user " << i << " of ns " << userNs << " asked about ns " << ns;
                 EXPECT_EQ(sc.s.isNsAdmin(u->objectId, ns, names[ns]), expected)
                     << "user " << i << " of ns " << userNs << " asked about ns " << ns;
                 if (userNs == ns) {
