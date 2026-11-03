@@ -109,7 +109,10 @@ TEST(CheckedWritesStressHistory, CheckAllWaitsForTheNewLeadersScanRegression) {
     using Op = CheckedWritesStressDriver::Op;
     using Result = CheckedWritesStressDriver::Sent::Result;
     namespace tcc = rune::node::test::catalog_cluster;
-    ThreeNodes cluster = ThreeNodes::startWith("cw05_unscanned_leader", [](rune::node::NodeConfig& cfg) { cfg.verdictIntervalMs = 20; });
+    ThreeNodes cluster = ThreeNodes::startWith("cw05_unscanned_leader", [](rune::node::NodeConfig& cfg) {
+        cfg.verdictIntervalMs = 20;
+        cfg.testHoldAllControllerDecisionsMs = 60'000;
+    });
     CheckedWritesStressDriver d(cluster, 1, true);
     d.setUp();
     ASSERT_FALSE(HasFatalFailure());
@@ -145,8 +148,12 @@ TEST(CheckedWritesStressHistory, CheckAllWaitsForTheNewLeadersScanRegression) {
     ASSERT_GT(lead, 0);
     cluster.stop(lead);
     ASSERT_GT(leads([&](int32_t l) { return l != lead; }), 0) << "no follower took partition " << part;
+    // The controller decides nothing until the restarted node's scans are held, so it takes its partition back only then.
+    for (const int id : cluster.runningNodes()) cluster.node(id).setControllerDecisionHoldForTest(true);
     cluster.startNode(lead);
+    cluster.node(lead).setControllerDecisionHoldForTest(true);
     d.holdLeadershipScan(lead, true);
+    for (const int id : cluster.runningNodes()) cluster.node(id).setControllerDecisionHoldForTest(false);
     ASSERT_EQ(leads([&](int32_t l) { return l == lead; }), lead) << "node " << lead << " never took partition " << part << " back";
     ASSERT_NE(d.rcStatus(lead, part), rune::node::Worker::kRcReady) << "the leadership scan finished before it was held";
     std::thread release([&] {
