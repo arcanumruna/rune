@@ -120,7 +120,7 @@ public:
         rebuildWriters_(-1);
     }
 
-    [[nodiscard]] std::string keyIndexTally() const { return std::to_string(pinned56_) + " KeyExists and " + std::to_string(pinned57_) + " KeyNotFound pinned to their record, " + std::to_string(lostRejections_) + " rejections lost with a leader's tail, " + std::to_string(sent_.size()) + " writes"; }
+    [[nodiscard]] std::string keyIndexTally() const { return std::to_string(pinned56_) + " KeyExists and " + std::to_string(pinned57_) + " KeyNotFound pinned to their record, " + std::to_string(lostRejections_) + " rejections compacted before the history saw them, " + std::to_string(sent_.size()) + " writes"; }
 
     /// One seeded action.
     void step() {
@@ -646,33 +646,27 @@ private:
     /// One past the last data record: what the judge and the committed markers must cover (a trailing change record needs no marker).
     static int64_t dataEnd_(const VerdictRig::RigLog& l) { return l.data.empty() ? 0 : l.data.back().offset + 1; }
 
-    /// The committed records ever seen: a compaction may remove them from every log later, the model still judges them.  Without
-    /// `given` only each partition's leader is read.
+    /// The committed records ever seen: a compaction may remove them from every log later, the model still judges them.  Every
+    /// running node's log is read below its own high watermark: only a leader compacts, so a committed record its cleaner dropped
+    /// before this read is still on the followers.
     void recordHistory_(const std::vector<NodeSnap>* given = nullptr) {
         const auto record = [this](int part, const VerdictRig::RigLog& log) {
             for (const auto& d : log.data) data_[static_cast<std::size_t>(part)][d.offset] = d;
             for (const auto& ch : log.changes) changes_[static_cast<std::size_t>(part)][ch.offset] = ch;
         };
-        std::vector<int32_t> leaders;
-        if (given == nullptr && rune::node::test::catalog_cluster::awaitLeaders(c_, topicId_, parts_, leaders, 5s)) {
+        if (given != nullptr) {
+            for (const NodeSnap& s : *given) record(s.part, s.log);
+            return;
+        }
+        for (const int id : c_.runningNodes())
             for (int p = 0; p < parts_; ++p) {
                 VerdictRig::RigLog log;
-                c_.node(leaders[static_cast<std::size_t>(p)]).onOwnerThreadForTest(topicId_, p, [&log](rune::replication::PartitionReplica& r) {
+                c_.node(id).onOwnerThreadForTest(topicId_, p, [&log](rune::replication::PartitionReplica& r) {
                     log = readLogOf(*r.log(), r.highWatermark());
                     return 0;
                 });
                 record(p, log);
             }
-            return;
-        }
-        std::vector<NodeSnap> own;
-        if (given == nullptr) {
-            for (const int id : c_.runningNodes())
-                for (int p = 0; p < parts_; ++p) own.push_back(snapNode_(id, p));
-            given = &own;
-        }
-        for (int p = 0; p < parts_; ++p)
-            if (const NodeSnap* lead = leaderOf_(*given, p)) record(p, lead->log);
     }
     VerdictRig::RigLog history_(int part) const {
         VerdictRig::RigLog out;
@@ -801,7 +795,7 @@ private:
                 if (d.keyIndex_ && s.v == 0) continue;
                 if (s.result == Sent::Result::Ok && accepted.count(s.v) == 0) { *why = "v " + std::to_string(s.v) + " was acked Ok but no accepted record carries it"; return false; }
                 if (s.result == Sent::Result::Violation && rejected.count(s.v) == 0) {
-                    bool inLog = false;   // a rejection is answered before it commits: one the leader lost with its tail left no record
+                    bool inLog = false;   // a rejected record compacted away on every replica before a history read saw it
                     for (const auto& kv : d.data_[static_cast<std::size_t>(s.part)]) inLog = inLog || kv.second.v == s.v;
                     if (!inLog) continue;
                     *why = "v " + std::to_string(s.v) + " (id " + std::to_string(s.id) + ", code " + std::to_string(s.code) + ") was acked as a violation but its record was accepted";
@@ -932,7 +926,7 @@ private:
                     if (rec.id == s.id && rec.del == tombstone && (tombstone ? off >= s.hwBefore && off < s.hwAfter : rec.v == s.v)) candidates.push_back(off);
                 if (candidates.empty()) {
                     if (s.result == Sent::Result::Ok) { *why = "the write of id " + std::to_string(s.id) + " acked at offset " + std::to_string(s.offset) + " has no record in the log"; return false; }
-                    ++d.lostRejections_;   // answered before it committed, then lost with the leader's tail
+                    ++d.lostRejections_;   // judged after it committed, then compacted away on every replica before a history read saw it
                     continue;
                 }
                 bool judged = false;
