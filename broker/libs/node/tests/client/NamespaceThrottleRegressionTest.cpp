@@ -137,6 +137,31 @@ TEST(NamespaceThrottleRegression, ProduceThrottledReturnsRetryAfterRegression) {
         << "served again after the retry-after";
 }
 
+// #697: the inline-path throttle is not reachable on a real broker.  workerCount 0 is floored to 1 (BrokerNode::buildWorkerPool),
+// so a namespace produce always routes to a worker and the worker's throttle answers Throttled (53) with a retry-after.
+// Revert that turns it red: BrokerNode.cpp buildWorkerPool `wc` = config_.workerCount (no floor), no pool for 0.
+TEST(NamespaceThrottleRegression, NamespaceProduceRoutesToWorkerEvenWithZeroWorkersRegression) {
+    AuthBroker::Options o;
+    o.configure = [](rune::node::NodeConfig& c) { c.workerCount = 0; };
+    AuthBroker b("thr_zero_workers", o);
+    b.bootstrapAdmin(kAdminPw);
+    auto admin = connected(b, "admin");
+    ASSERT_TRUE(admin->createNamespace("d", patchOf("produce-bytes-per-sec", 1024)).has_value());
+    b.createUser("d/u", kUserPw, userGrants());
+    const rc::TopicHandle t = defineTopic(b, "d/u");
+    Wire w(b, "d/u");
+    std::optional<pc::ProduceResponse> throttled;
+    int served = 0;
+    for (int i = 0; i < 2000 && !throttled; ++i) {   // 1 KiB records against a 1 KiB/s limit: the aggregator tick decides when
+        const auto r = w.produce(b, t.topicId, 1024);
+        ASSERT_TRUE(r.has_value()) << "answered, never hung (produce " << i << ")";
+        if (r->errorCode == 0) ++served; else throttled = r;
+    }
+    ASSERT_TRUE(throttled.has_value()) << "workerCount 0: no Throttled after " << served << " served produces";
+    EXPECT_EQ(throttled->errorCode, 53) << "Throttled";
+    EXPECT_GT(throttled->logStartOffset, 0) << "the retry-after (ns) rides logStartOffset";
+}
+
 TEST(NamespaceThrottleRegression, OtherNamespaceNotThrottledRegression) {
     AuthBroker b("thr_other");
     b.bootstrapAdmin(kAdminPw);
