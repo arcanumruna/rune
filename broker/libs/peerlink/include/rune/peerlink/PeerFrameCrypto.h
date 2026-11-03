@@ -21,7 +21,8 @@
 // that are not ordered against each other, so "a newer epoch was seen" never proves no older frame is in flight.  A
 // slot is evicted only under slot pressure, which the handshake's exchange rate limit makes rare: first the oldest
 // ABANDONED epoch (installed before the send epoch, never the send epoch, never opened a frame - a receive-only epoch
-// whose exchange was superseded, issue #584), else the oldest one that is not the send epoch.  A former send epoch is
+// whose exchange was superseded, issue #584), else the oldest one that is neither the send epoch nor the epoch of the
+// last authenticated frame (the epoch the peer is sealing under, issue #774).  A former send epoch is
 // never treated as abandoned: a lagging peer may still seal under it.
 #include <rune/crypto/Aead.h>
 #include <rune/peerlink/PeerLinkKeys.h>
@@ -138,6 +139,8 @@ private:
         uint8_t                                             sendIdx = kNoSend;   // the send epoch's slot
         uint64_t                                            sendOrder = 0;       // its installOrder (0 = none)
         uint64_t                                            authFrames = 0;
+        uint64_t                                            lastOpenOrder = 0;   // installOrder of the epoch of the last
+                                                                                  // authenticated frame (0 = none; #774)
     };
     struct PeerEpoch { int32_t peer = -1; uint32_t epoch = 0; };
 

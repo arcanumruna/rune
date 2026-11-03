@@ -145,10 +145,18 @@ bool PeerFrameCrypto::installLink(int32_t peer, const LinkKeys& keys, int64_t /*
             if (i != s->sendIdx && !e.used && e.installOrder < s->sendOrder && e.installOrder < oldest) { oldest = e.installOrder; at = i; }
         }
     }
+    // 3. (issue #774) The oldest install that is neither the send epoch nor the epoch of the last authenticated frame:
+    // an initiator that rekeyed without a promotion holds a send epoch that is the newest, so the oldest non-send
+    // slot is the one the peer still seals under.  One slot is the send epoch, one the last-opened, so with three
+    // slots a candidate always exists.  Residual: a plane that never opened a frame keeps the plain oldest rule -
+    // nothing is lost on a plane without inbound traffic.
+    static_assert(kEpochSlots >= 3, "the eviction rule needs a slot besides the send and the last-opened epoch");
     if (at == kEpochSlots) {
         uint64_t oldest = UINT64_MAX;
-        for (std::size_t i = 0; i < kEpochSlots; ++i)
-            if (i != s->sendIdx && s->epochs[i]->installOrder < oldest) { oldest = s->epochs[i]->installOrder; at = i; }
+        for (std::size_t i = 0; i < kEpochSlots; ++i) {
+            const uint64_t order = s->epochs[i]->installOrder;
+            if (i != s->sendIdx && order != s->lastOpenOrder && order < oldest) { oldest = order; at = i; }
+        }
     }
     EpochState fresh;
     fresh.keys = keys;
@@ -241,6 +249,7 @@ PeerFrameCrypto::OpenResult PeerFrameCrypto::open(const uint8_t* frame, std::siz
     if (!replayWindowCheck(r->seq, r->window, seq)) return drop_(OpenResult::Replay);
     if (commitWindow) replayWindowCommit(r->seq, r->window, seq);
     ++s->authFrames;
+    s->lastOpenOrder = e->installOrder;   // issue #774: the epoch the peer seals under is never evicted
     e->used = true;   // issue #584: the peer sealed under it - never an abandoned epoch
     // Issue #241: an authenticated frame under an epoch installed after our send epoch proves the peer holds it.
     if (e->installOrder > s->sendOrder) [[unlikely]] peerUsed_ = PeerEpoch{fromNode, epoch};

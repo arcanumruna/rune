@@ -169,6 +169,35 @@ TEST(PeerFrameAllocRegression, SealAndOpenAllocateNothing) {
     EXPECT_EQ(gAllocs.load(), 0u);
 }
 
+// Issue #774: open() records the epoch of the last authenticated frame (a store in the peer slot); opening under an
+// older retained epoch after three unpromoted rekeys allocates nothing.
+TEST(PeerFrameAllocRegression, OpeningUnderTheLastOpenedEpochAfterRekeysAllocatesNothingRegression) {
+    ASSERT_TRUE(kHooked);
+    pl::PeerFrameCrypto a(1, 3), peer(2, 3);
+    auto keys = [](bool aToB, uint32_t e) {
+        pl::LinkKeys k; k.epoch = e; k.install = pl::LinkInstall::SendAndReceive;
+        const auto base = static_cast<uint8_t>(10 * e);
+        k.sendMaster.fill(aToB ? base : static_cast<uint8_t>(base + 1));
+        k.recvMaster.fill(aToB ? static_cast<uint8_t>(base + 1) : base);
+        return k;
+    };
+    ASSERT_TRUE(peer.installLink(1, keys(false, 1), 0));
+    ASSERT_TRUE(a.installLink(2, keys(true, 1), 0));
+    std::vector<uint8_t> plain(1024, 0x5A), wire(plain.size() + 32), out(plain.size() + 32);
+    std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+    { const auto n = peer.seal(1, plain.data(), plain.size(), wire.data(), wire.size()); ASSERT_EQ(a.open(wire.data(), n, out.data(), out.size(), outLen, from, epoch), pl::PeerFrameCrypto::OpenResult::Ok); }
+    for (uint32_t e = 2; e <= 4; ++e) ASSERT_TRUE(a.installLink(2, keys(true, e), 0));
+    {
+        Armed armed;
+        for (int i = 0; i < 2000; ++i) {
+            const auto n = peer.seal(1, plain.data(), plain.size(), wire.data(), wire.size());
+            if (a.open(wire.data(), n, out.data(), out.size(), outLen, from, epoch) != pl::PeerFrameCrypto::OpenResult::Ok) ADD_FAILURE_AT(__FILE__, __LINE__);
+        }
+    }
+    EXPECT_EQ(epoch, 1u);
+    EXPECT_EQ(gAllocs.load(), 0u);
+}
+
 // Handshake frame processing that needs no crypto - the frames an attacker can send at will - allocates nothing:
 // forged Refuse / unknown-epoch hints / bad-key Hello / idle ticks, and bogus sender ids at the frame layer.
 TEST(PeerFrameAllocRegression, HandshakeFrameProcessingNeverAllocatesRegression) {

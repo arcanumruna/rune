@@ -260,11 +260,12 @@ TEST(PeerFrameCryptoRegression, OlderEpochsStillOpenAfterTwoQuickRehandshakesReg
     EXPECT_EQ(openOne(b, e1a, &ep), OR::Ok) << "E1 is still held 60 s and two epochs later"; EXPECT_EQ(ep, 1u);
     EXPECT_EQ(b.dropsOf(OR::UnknownEpoch), 0u);
 
-    // A 4th epoch needs a slot: the oldest slot that is not the send epoch (E1) is evicted.
+    // A 4th epoch needs a slot: the oldest slot that is neither the send epoch (E3) nor the epoch of the last
+    // authenticated frame (E1: the peer is still sealing under it, issue #774) is evicted: E2.
     now += 10 * kSec; ASSERT_TRUE(b.installLink(1, linkFor(false, 4, 40, kRecvOnly), now));
-    EXPECT_FALSE(b.holdsEpoch(1, 1));
-    EXPECT_TRUE(b.holdsEpoch(1, 2)); EXPECT_TRUE(b.holdsEpoch(1, 3)); EXPECT_TRUE(b.holdsEpoch(1, 4));
-    EXPECT_EQ(openOne(b, e1b, &ep), OR::UnknownEpoch) << "only slot pressure drops an epoch";
+    EXPECT_TRUE(b.holdsEpoch(1, 1));
+    EXPECT_FALSE(b.holdsEpoch(1, 2)); EXPECT_TRUE(b.holdsEpoch(1, 3)); EXPECT_TRUE(b.holdsEpoch(1, 4));
+    EXPECT_EQ(openOne(b, e1b, &ep), OR::Ok) << "the epoch the peer last sealed under survives slot pressure";
     EXPECT_EQ(openOne(b, sealOne(a, 2), &ep), OR::Ok) << "frames under the send epoch still open"; EXPECT_EQ(ep, 3u);
     EXPECT_EQ(b.currentEpoch(1), 3u) << "the send epoch is never evicted";
 }
@@ -367,4 +368,33 @@ TEST(PeerFrameCryptoRegression, EvictionPrefersAnAbandonedReceiveOnlyEpochRegres
         EXPECT_FALSE(b.holdsEpoch(1, 1)) << "the oldest rule: epoch 2 opened a frame, so it is not abandoned";
         EXPECT_TRUE(b.holdsEpoch(1, 2));
     }
+}
+
+// Issue #774: an initiator that rekeyed three times without a promotion (the peer's frames never reach it, so no
+// Confirm and no epoch change on the peer's side) must not evict the epoch its peer still seals under.  Every held
+// epoch was the send epoch once, so none is "abandoned"; the oldest non-send epoch (E1) is exactly the one the peer
+// last sealed under.  Mutation: dropping the lastOpenOrder exclusion in installLink evicts E1 at E4 -> UnknownEpoch.
+TEST(PeerFrameCryptoRegression, AnInitiatorNeverEvictsTheEpochItsPeerLastSealedUnderRegression) {
+    using OR = pl::PeerFrameCrypto::OpenResult;
+    constexpr auto SR = pl::LinkInstall::SendAndReceive;
+    auto baseOf = [](uint32_t e) { return static_cast<uint8_t>(10 * e); };
+    pl::PeerFrameCrypto a(1, 0), peer(2, 0);
+    ASSERT_TRUE(peer.installLink(1, linkFor(false, 1, baseOf(1)), 0));   // the peer keeps sealing under E1
+    ASSERT_TRUE(a.installLink(2, linkFor(true, 1, baseOf(1), SR), 0));
+    std::vector<uint8_t> wire(64), out(64);
+    std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+    auto sealOpen = [&]() {
+        const auto n = peer.seal(1, bytes("data"), 4, wire.data(), wire.size());
+        EXPECT_GT(n, 0u);
+        return a.open(wire.data(), n, out.data(), out.size(), outLen, from, epoch);
+    };
+    ASSERT_EQ(sealOpen(), OR::Ok);
+    ASSERT_EQ(epoch, 1u);
+    for (uint32_t e = 2; e <= 4; ++e) ASSERT_TRUE(a.installLink(2, linkFor(true, e, baseOf(e), SR), 0)) << e;
+    ASSERT_EQ(a.currentEpoch(2), 4u);
+    const uint64_t unknownBefore = a.dropsOf(OR::UnknownEpoch);
+    EXPECT_EQ(sealOpen(), OR::Ok) << "the peer's E1 frame must still open";
+    EXPECT_EQ(epoch, 1u);
+    EXPECT_EQ(a.dropsOf(OR::UnknownEpoch), unknownBefore);
+    EXPECT_TRUE(a.holdsEpoch(2, 1));
 }

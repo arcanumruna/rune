@@ -251,6 +251,49 @@ TEST(PeerLinkAdversarialRegression, AnAbandonedUnconfirmedAcceptStopsBeingResent
     EXPECT_EQ(eb->keys.epoch, s.b.crypto.currentEpoch(1));
 }
 
+// ---- Issue #774: the initiator rekeys three times and no Confirm / authenticated frame ever reaches the responder ----
+// (a->b Confirms and data are lost), so the responder keeps sealing under its old send epoch while the initiator holds
+// E+1..E+3.  The initiator must keep the epoch the responder last sealed under: every frame b seals opens at a.
+// Mutation: dropping the lastOpenOrder exclusion in PeerFrameCrypto::installLink evicts that epoch at the third rekey
+// and b's next frame is an UnknownEpoch drop -> red.
+TEST(PeerLinkAdversarialRegression, ThreeUnpromotedRekeysNeverDropThePeersFramesAdversarialRegression) {
+    Sim s(774);
+    s.link();
+    ASSERT_TRUE(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1));
+    const uint32_t e0 = s.b.crypto.currentEpoch(1);
+    uint64_t sent = 0;
+    auto bSealsAndAOpens = [&]() {
+        s.seal(1);
+        ++sent;
+        ASSERT_EQ(s.data.size(), 1u);
+        s.open(0);
+    };
+    bSealsAndAOpens();
+    ASSERT_TRUE(s.failure.empty()) << s.failure;
+    for (int rekey = 0; rekey < 3; ++rekey) {
+        s.now += pl::PeerHandshake::kAwaitNs;
+        s.absorb(0, s.a.hs.rekeyForTest(s.now));
+        for (int guard = 0; guard < 64 && (!s.hsTo[0].empty() || !s.hsTo[1].empty()); ++guard) {
+            for (int to : {0, 1}) {
+                if (s.hsTo[to].empty()) continue;
+                Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+                if (to == 1 && f[0] == static_cast<uint8_t>(pl::PeerMsg::Confirm)) continue;   // a->b is down
+                s.deliverHs(to, f);
+            }
+        }
+        ASSERT_TRUE(s.hsTo[0].empty() && s.hsTo[1].empty()) << "the exchange did not settle";
+        ASSERT_TRUE(s.failure.empty()) << s.failure;
+        bSealsAndAOpens();
+        ASSERT_TRUE(s.failure.empty()) << s.failure;
+    }
+    EXPECT_EQ(s.b.crypto.currentEpoch(1), e0) << "b never promoted: nothing reached it";
+    EXPECT_EQ(s.a.crypto.currentEpoch(2), e0 + 3);
+    bSealsAndAOpens();
+    EXPECT_TRUE(s.failure.empty()) << s.failure;
+    EXPECT_EQ(s.opened, sent);
+    EXPECT_EQ(s.a.crypto.dropsOf(OR::UnknownEpoch), 0u);
+}
+
 // ---- Input bounds: every new wire message truncated / extended at every length, and each tag under another body. ----
 TEST(PeerLinkAdversarialRegression, NewMessagesTruncatedAtEveryOffsetNeverDecodeAdversarialRegression) {
     uint8_t buf[pl::kMaxPeerLinkFrame + 8]{};
