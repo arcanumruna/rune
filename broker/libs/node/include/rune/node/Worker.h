@@ -7070,9 +7070,10 @@ private:
                       SourceLogBounds bounds = {}) {
         int work = 0;
         PartitionWriteState* write = writeOf_(replica);
-        VerdictSource* judge = write != nullptr ? viewSet_->ensureVerdictSource(topicId, partition, *write) : nullptr;
-        if (judge != nullptr)
-            judge->bindLeader(replica, leaderGen, replica->isDiskBacked() ? replica->log()->logStartOffset() : replica->memoryLog()->logStartOffset());
+        // A judge lives only on a disk-backed replica (#808): SD9 refuses every production constraint on a transient topic, and the
+        // ring has no verdict feed, so a judge there would build its timeline from local requests alone and fail open.
+        VerdictSource* judge = (write != nullptr && replica->isDiskBacked()) ? viewSet_->ensureVerdictSource(topicId, partition, *write) : nullptr;
+        if (judge != nullptr) judge->bindLeader(replica, leaderGen, replica->log()->logStartOffset());
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
         if (transientRep != nullptr) {
@@ -8355,7 +8356,7 @@ private:
             } else if (rep->highWatermark() > entry.lastOffset &&
                        (!rune::protocol::client::acksAll(entry.acks) || static_cast<int>(rep->isr().size()) >= entry.minIsr) &&
                        (viewSet_ == nullptr ||
-                        viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration()) > entry.lastOffset) &&
+                        viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration(), rep->isDiskBacked()) > entry.lastOffset) &&
                        (!source || (verdictBound_(rep, ws, INT64_MAX) > entry.lastOffset &&
                                     (entry.replay == 0 || ws->markers.committedThrough() > entry.lastOffset)))) {
                 code = 0;
