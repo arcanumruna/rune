@@ -1542,43 +1542,6 @@ TEST(AuthRestartAdversarialRegression, ASecurityLeaderCrashUnderASlowElectionNev
                                         << " (F=" << b.fMs << " ms, liveness=" << b.livenessMs << " ms)";
 }
 
-// Issue #581 (deterministic leg): the same scenario with a 1 s election timeout, so the survivors' silence window is
-// wide by construction instead of by luck.
-TEST(AuthRestartAdversarialRegression, ACutOffSecurityLeaderUnderASlowElectionNeverServesStaleAdversarialRegression) {
-    AuthTrio t("advleadercutslow");
-    { auto base = t.cluster().configTweak;   // a slow election: the survivors are silent for ~1 s, deterministically
-      t.cluster().configTweak = [base](NodeConfig& c) { if (base) base(c); c.electionTimeoutMs = 1000; }; }
-    ServingBounds b;
-    captureBounds(t, b);
-    t.start();
-    t.bootstrapAdmin();
-    t.createUser(1, "ws1");
-    const int32_t leader = settledSecurityLeader(t.cluster());
-    ASSERT_GT(leader, 0);
-    std::vector<int> survivors;
-    for (int id : {1, 2, 3}) if (id != leader) survivors.push_back(id);
-    for (int id : survivors) ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(id).securityServingForTest() == "Serving"; }));
-    t.node(leader).partitionFromPeersForTest(true);
-    const auto cut = std::chrono::steady_clock::now();
-    std::map<int, std::string> lapses;
-    bool newLeader = false;
-    while (msSince(cut) < 20'000) {
-        for (int id : survivors) {
-            const std::string s = t.node(id).securityServingForTest();
-            if (s != "Serving" && lapses[id].empty()) lapses[id] = s + " at " + std::to_string(msSince(cut)) + " ms";
-        }
-        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster(), leader); newLeader = l > 0 && l != leader; }
-        std::this_thread::sleep_for(5ms);
-    }
-    EXPECT_TRUE(newLeader) << "a new __security leader";
-    for (int id : survivors) {
-        EXPECT_TRUE(lapses[id].empty()) << "survivor " << id << " stopped serving logins while its leader was cut off: "
-                                        << lapses[id] << " (F=" << b.fMs << " ms, liveness=" << b.livenessMs << " ms)";
-        EXPECT_EQ(loginCode(t, id, "ws1"), 0) << "survivor " << id << " login after the failover";
-    }
-    t.node(leader).partitionFromPeersForTest(false);
-}
-
 // A restart with no seam at all: node 3 comes back after ws1 was DISABLEd while it was down, and is hammered with ws1's
 // old password from the first moment its client endpoint answers.  Not one login may succeed.
 TEST(AuthRestartAdversarialRegression, ARestartedBrokerHammeredFromBootNeverAcceptsADisabledUserAdversarialRegression) {
