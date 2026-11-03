@@ -309,6 +309,14 @@ struct BatchAck {
     /// rotation).  Handler form (onBatchAck) only; -1 in the Completions form
     /// (batchAcksTo / batchAckOf: no room in a Completion) and when not sequenced.
     int64_t producerId = -1;
+    /// Checked writes (View, a batch of >= 2 records): the batch was STORED and judged, and the records listed here were
+    /// rejected; every other record was accepted at baseOffset + its index.  `errorCode != 0` with `rejectedCount > 0` means
+    /// exactly that (baseOffset is the real base, errorCode the FIRST rejection's code).  `rejections` points at
+    /// `rejectedCount` 8-byte LE entries (u16 record index, u16 code, u32 constraintId), ascending index; valid only during the
+    /// call.  Handler form (onBatchAck) only; the Completions form carries the list as the completion's payload (status
+    /// RecordsRejected; a Tier-2 batch's BatchAck holds one credit unit and carries the status with an empty payload).
+    uint32_t       rejectedCount = 0;
+    const uint8_t* rejections    = nullptr;
 };
 
 /// Per-batch handler (Producer::onBatchAck): called on the duty thread, one
@@ -410,6 +418,7 @@ struct ClaimOpen {
     Completions*            cq    = nullptr;  ///< per-record ack credit (tryClaim(.., cq, token)); nullptr: none
     Completions*            bq    = nullptr;  ///< batch-ack credit (batchAcksTo); nullptr: none
     uint32_t                units = 0;        ///< batch-ack units reserved on bq
+    uint32_t                cqBytes = kBatchAckUnitBytes;  ///< bytes reserved on cq for the ONE completion (batchCompletionBytes)
 };
 /// Settles a claim and its Completions credit (a friend of Completions).
 struct ClaimCredit {

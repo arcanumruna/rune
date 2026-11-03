@@ -4,6 +4,7 @@
 #include "../support/FrameCapture.h"
 
 #include <rune/client/Client.h>
+#include <rune/client/Completions.h>
 #include <rune/client/Key.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/BatchBuilder.h>
@@ -239,4 +240,87 @@ TEST(CheckedWritesResults, AppendOnlyValues) {
     c.aux       = 42;
     EXPECT_EQ(rc::constraintIdOf(c), 0x0007'0001u);
     EXPECT_EQ(rc::assignedKeyOf(c), 42u);
+}
+
+// #802: a View batch's ONE completion reserves for its verdict entries up front (reservation = delivery), and a batch whose
+// completion cannot fit one queue record is refused before anything is reserved.
+TEST(CheckedWritesAcksRegression, ViewBatchReservesItsVerdictPayloadRegression) {
+    rc::Client client(offlineCfg());
+    rc::Completions cq(client);
+    constexpr uint32_t R = rc::producer::batchCompletionBytes(true, 8);
+    static_assert(R == 48 + 8 * 8);
+    {
+        auto p = client.producer(cfgOf(Acks::All | Acks::View));
+        auto c = p.claimBatch(rc::TopicHandle{7, 4}, Key(uint64_t{1}), 8, 4, cq, 1);
+        ASSERT_EQ(c.result(), SendResult::Ok);
+        EXPECT_EQ(cq.reservedBytes(), R);
+        c.abort();
+        EXPECT_EQ(cq.reservedBytes(), 0u) << "abort returns exactly what the claim reserved";
+        auto one = p.claimBatch(rc::TopicHandle{7, 4}, Key(uint64_t{1}), 1, 4, cq, 2);
+        ASSERT_EQ(one.result(), SendResult::Ok);
+        EXPECT_EQ(cq.reservedBytes(), rc::producer::kAckRecordBytes) << "a 1-record claim keeps the plain record";
+        one.abort();
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+    }
+    {
+        auto all = client.producer(cfgOf(Acks::All));
+        auto c = all.claimBatch(rc::TopicHandle{7, 4}, Key(uint64_t{1}), 8, 4, cq, 3);
+        ASSERT_EQ(c.result(), SendResult::Ok);
+        EXPECT_EQ(cq.reservedBytes(), rc::producer::kAckRecordBytes) << "an All producer has no verdicts";
+        c.abort();
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+    }
+}
+
+TEST(CheckedWritesAcksRegression, ViewBatchTooBigForTheQueueIsMessageTooLargeRegression) {
+    rc::Client client(offlineCfg());
+    rc::CompletionsConfig cc;
+    cc.capacityBytes = 1024;   // max message 128 B
+    cc.maxResultBytes = 64;
+    cc.maxErrorText = 64;
+    rc::Completions cq(client, cc);
+    auto p = client.producer(cfgOf(Acks::All | Acks::View));
+    auto c = p.claimBatch(rc::TopicHandle{7, 4}, Key(uint64_t{1}), 16, 4, cq, 1);
+    EXPECT_EQ(c.result(), SendResult::MessageTooLarge);
+    EXPECT_EQ(cq.reservedBytes(), 0u) << "nothing reserved";
+    auto ok = p.claimBatch(rc::TopicHandle{7, 4}, Key(uint64_t{1}), 2, 4, cq, 2);   // 2 records: 48 + 16 fits
+    EXPECT_EQ(ok.result(), SendResult::Ok);
+    ok.abort();
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+}
+
+// #802: a View Tier-2 batch of n records reserves its n verdict entries in the SAME completion record it is delivered in
+// (reservation = delivery), checked through the delivery a closeImmediately produces.
+TEST(CheckedWritesAcksRegression, ViewTier2BatchReservesItsVerdictPayloadRegression) {
+    rc::Client client(offlineCfg());
+    rc::Completions cq(client);
+    constexpr uint32_t R = rc::producer::batchCompletionBytes(true, 8);
+    auto p = client.producer(cfgOf(Acks::All | Acks::View));
+    auto b = p.batch(rc::TopicHandle{7, 4}, Key(uint64_t{1}));
+    for (int i = 0; i < 8; ++i) b.add(std::span<const uint8_t>(kVal));
+    ASSERT_EQ(b.send(cq, 1), rc::OpResult::Accepted);
+    EXPECT_EQ(cq.reservedBytes(), R) << "8 records: the plain record plus 8 verdict entries";
+    ASSERT_EQ(p.closeImmediately(), rc::OpResult::Accepted);
+    int seen = 0;
+    cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+        ++seen;
+        EXPECT_EQ(c.op, rc::OpKind::Tier2Batch);
+        EXPECT_EQ(c.reservedBytes, R) << "delivered with exactly the reserved size";
+    });
+    EXPECT_EQ(seen, 1);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+}
+
+TEST(CheckedWritesAcksRegression, ViewTier2BatchTooBigForTheQueueIsRefusedUnreservedRegression) {
+    rc::Client client(offlineCfg());
+    rc::CompletionsConfig cc;
+    cc.capacityBytes = 1024;
+    cc.maxResultBytes = 64;
+    cc.maxErrorText = 64;
+    rc::Completions cq(client, cc);
+    auto p = client.producer(cfgOf(Acks::All | Acks::View));
+    auto b = p.batch(rc::TopicHandle{7, 4}, Key(uint64_t{1}));
+    for (int i = 0; i < 16; ++i) b.add(std::span<const uint8_t>(kVal));
+    EXPECT_NE(b.send(cq, 1), rc::OpResult::Accepted);
+    EXPECT_EQ(cq.reservedBytes(), 0u) << "nothing reserved";
 }

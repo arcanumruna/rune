@@ -838,6 +838,105 @@ TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegre
     EXPECT_TRUE(isOk(s.await(tok, 15s))) << "the next batch is acked normally";
 }
 
+// #802: a claimBatch reports EVERY record's verdict (RecordsRejected + the rejection list), and the Raw subscriber receives
+// exactly the accepted records.  (The Tier-2 leg of this test is added with the Tier-2 change.)
+TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRegression) {
+    OneBroker b("cw-batchverdict", OneBroker::Runtime::Shard);
+    const int32_t src = defineVerdictSource(b);
+    Sender s(b.clientConfig(), "vt", src, 1, kAllView);
+    const std::vector<uint16_t> tags = {1, 9, 1, 1, 9, 9};   // records 1, 4 and 5 are rejected (TagEquals 9)
+    std::vector<std::string> vals;
+    for (std::size_t i = 0; i < tags.size(); ++i) vals.push_back(verdictValue(1, 1, tags[i]));   // the claim has one key: id 1 throughout
+    const uint32_t recLen = static_cast<uint32_t>(vals[0].size());
+
+    std::mutex mu;
+    std::set<int64_t> got;
+    rc::SubscribeOptions o;
+    o.from = rc::From::earliest();
+    rc::Subscription sub = s.client->subscribe(*s.topic, 0, o, [&](const rc::Record& r) {
+        std::lock_guard<std::mutex> g(mu);
+        got.insert(r.offset);
+    });
+
+    // ---- the claim ----
+    const uint64_t tok = s.next++;
+    rc::BatchClaim claim;
+    for (int i = 0; i < 100000; ++i) {
+        claim = s.prod->claimBatch(*s.topic, rc::Key(uint64_t{1}), static_cast<uint32_t>(tags.size()), recLen, *s.cq, tok);
+        if (claim.result() != rc::SendResult::BackPressured) break;
+    }
+    ASSERT_EQ(claim.result(), rc::SendResult::Ok);
+    for (uint32_t i = 0; i < tags.size(); ++i) {
+        const auto dst = claim.record(i);
+        ASSERT_EQ(dst.size(), recLen);
+        std::memcpy(dst.data(), vals[i].data(), recLen);
+    }
+    ASSERT_TRUE(claim.commit());
+    s.prod->flush();
+    std::optional<rc::Completion> c;
+    std::vector<uint8_t> payload;
+    (void)s.cq->waitFor(tok, 15s, [&](const rc::Completion& d, std::span<const uint8_t> p) { c = d; payload.assign(p.begin(), p.end()); });
+    ASSERT_TRUE(c);
+    ASSERT_EQ(c->status, rc::OpStatus::RecordsRejected);
+    EXPECT_EQ(c->errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation));
+    EXPECT_EQ(rc::constraintIdOf(*c), rune::view::constraintIdOf(7, 1));
+    const rc::BatchVerdicts v(*c, payload);
+    ASSERT_EQ(v.rejectedCount(), 3u);
+    EXPECT_EQ(v.rejection(0).index, 1);
+    EXPECT_EQ(v.rejection(1).index, 4);
+    EXPECT_EQ(v.rejection(2).index, 5);
+    const int64_t base = c->value;
+    ASSERT_GE(base, 0);
+    EXPECT_EQ(v.offsetOf(0), base);
+    EXPECT_EQ(v.offsetOf(1), -1);
+    EXPECT_EQ(v.offsetOf(3), base + 3);
+
+    // ---- the Tier-2 batch: the same tags, one completion, the same per-record verdicts ----
+    const uint64_t tok2 = s.next++;
+    rc::BatchBuilder bb = s.prod->batch(*s.topic, rc::Key(uint64_t{1}));
+    const std::string recKey = std::string("\x01\0\0\0\0\0\0\0", 8);   // the typed record key: id 1, 8 bytes LE
+    for (const auto& val : vals) bb.add(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()), recKey);
+    rc::OpResult sr = rc::OpResult::BackPressured;
+    for (int i = 0; i < 100000 && sr == rc::OpResult::BackPressured; ++i) sr = bb.send(*s.cq, tok2);
+    ASSERT_EQ(sr, rc::OpResult::Accepted);
+    s.prod->flush();
+    std::optional<rc::Completion> c2;
+    std::vector<uint8_t> payload2;
+    (void)s.cq->waitFor(tok2, 15s, [&](const rc::Completion& d, std::span<const uint8_t> p) { c2 = d; payload2.assign(p.begin(), p.end()); });
+    ASSERT_TRUE(c2);
+    ASSERT_EQ(c2->op, rc::OpKind::Tier2Batch);
+    ASSERT_EQ(c2->status, rc::OpStatus::RecordsRejected) << "err=" << c2->errorCode;
+    EXPECT_EQ(rc::constraintIdOf(*c2), rune::view::constraintIdOf(7, 1));
+    const rc::BatchVerdicts v2(*c2, payload2);
+    ASSERT_EQ(v2.rejectedCount(), 3u);
+    EXPECT_EQ(v2.rejection(0).index, 1);
+    EXPECT_EQ(v2.rejection(1).index, 4);
+    EXPECT_EQ(v2.rejection(2).index, 5);
+    const int64_t base2 = c2->value;
+    ASSERT_GE(base2, 0);
+    EXPECT_EQ(v2.offsetOf(0), base2);
+    EXPECT_EQ(v2.offsetOf(4), -1);
+
+    // ---- the Raw subscriber gets exactly the accepted records: a capped poll ending on a sentinel accepted send ----
+    const std::string sentinelVal = verdictValue(100, 1, 1);
+    const uint64_t stok = s.sendValue(100, sentinelVal);
+    const auto sc = s.await(stok, 15s);
+    ASSERT_TRUE(isOk(sc));
+    const int64_t sentinelOff = sc->value;
+    bool seen = false;
+    for (int i = 0; i < 1200 && !seen; ++i) {
+        {
+            std::lock_guard<std::mutex> g(mu);
+            seen = got.count(sentinelOff) != 0;
+        }
+        if (!seen) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(seen) << "the sentinel never reached the subscriber";
+    sub.unsubscribe();
+    std::lock_guard<std::mutex> g(mu);
+    EXPECT_EQ(got, (std::set<int64_t>{base + 0, base + 2, base + 3, base2 + 0, base2 + 2, base2 + 3, sentinelOff}));
+}
+
 // ===========================================================================================================
 // Part 04: verdict sources on three real brokers.  TestReject (tag 9, object 7) is installed on every node's worker.
 // ===========================================================================================================

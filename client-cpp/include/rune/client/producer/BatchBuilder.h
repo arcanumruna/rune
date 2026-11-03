@@ -185,6 +185,10 @@ private:
 
     /// Seal (once) and submit with this ack handle (0 = none).
     OpResult submit_(uint64_t ackHandle);
+
+    /// The records the batch holds (Open: the builder's; Built: the sealed batch's), 1 when it holds none (Refused / Starved).
+    /// Sizes the ONE completion's reservation (producer::batchCompletionBytes).
+    [[nodiscard]] uint32_t recordCount_() const noexcept;
 };
 
 } // namespace rune::client

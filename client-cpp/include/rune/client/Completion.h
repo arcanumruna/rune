@@ -13,6 +13,7 @@
 //
 // No std::function, no virtual call, no allocation on any of these types.
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <type_traits>
@@ -74,6 +75,11 @@ enum class OpStatus : uint8_t {
                      ///< failed locally (nothing was sent)
     StoredIdUnknown, ///< 13: reserved for key-0 creates (Part 06 documents and first returns it); keeps the enum without a hole
     VerdictUnknown,  ///< 14: stored, but its verdicts are unknown (a View retry fell outside the broker's dedupe window)
+    RecordsRejected, ///< 15: checked writes: a BATCH (a claimBatch of >= 2 records, a Tier-2 batch of >= 2, or a BatchAck of >= 2)
+                     ///< was stored and judged, and one or more of its records was rejected.  value = the batch's base offset
+                     ///< (record 0), or -1 if unknown; errorCode / constraintIdOf(c) = the FIRST rejection's code / constraint
+                     ///< id; the payload lists every rejection (read it with BatchVerdicts).  All accepted is a plain Ok with an
+                     ///< empty payload.  A 1-record claim / Tier-2 batch keeps single-record semantics (BrokerError, value -1).
 };
 
 /// Authentication (codes 44..48, client version 9): the name of an auth-related Completion::errorCode when
@@ -132,6 +138,51 @@ static_assert(sizeof(Completion) == 40);
 [[nodiscard]] constexpr uint32_t constraintIdOf(const Completion& c) noexcept { return c.reserved0; }
 /// Checked writes: the broker-assigned id of a Send (aux), 0 = none.
 [[nodiscard]] constexpr uint64_t assignedKeyOf(const Completion& c) noexcept { return static_cast<uint64_t>(c.aux); }
+
+/// One rejected record of a judged batch, decoded from its 8-byte wire entry (u16 record index, u16 code, u32 constraintId, LE).
+struct RecordVerdict {
+    uint16_t index;
+    uint16_t errorCode;
+    uint32_t constraintId;
+};
+
+/// A view over the verdicts of one batch completion (status RecordsRejected, or Ok with an empty payload): the payload is the
+/// broker's trailer, one 8-byte entry per REJECTED record in ascending record order.  No copy, no allocation; the payload span
+/// must outlive the view (it is valid only during the completion callback / poll handler).
+///   rejectedCount()  the number of rejected records.
+///   rejection(k)     the k-th rejection (k < rejectedCount()), ascending index.
+///   accepted(i)      true when record i of the batch was NOT rejected (binary search).
+///   offsetOf(i)      value + i when record i was accepted and value >= 0, else -1.
+class BatchVerdicts {
+public:
+    static constexpr std::size_t kEntryBytes = 8;
+    BatchVerdicts(const Completion& c, std::span<const uint8_t> payload) noexcept : base_(c.value), payload_(payload) {}
+
+    [[nodiscard]] uint32_t rejectedCount() const noexcept { return static_cast<uint32_t>(payload_.size() / kEntryBytes); }
+    [[nodiscard]] RecordVerdict rejection(uint32_t k) const noexcept {
+        const uint8_t* e = payload_.data() + static_cast<std::size_t>(k) * kEntryBytes;
+        return RecordVerdict{static_cast<uint16_t>(e[0] | (e[1] << 8)), static_cast<uint16_t>(e[2] | (e[3] << 8)),
+                             static_cast<uint32_t>(e[4]) | (static_cast<uint32_t>(e[5]) << 8) |
+                                 (static_cast<uint32_t>(e[6]) << 16) | (static_cast<uint32_t>(e[7]) << 24)};
+    }
+    [[nodiscard]] bool accepted(uint32_t i) const noexcept {
+        uint32_t lo = 0, hi = rejectedCount();
+        while (lo < hi) {
+            const uint32_t mid = lo + (hi - lo) / 2;
+            const uint32_t idx = rejection(mid).index;
+            if (idx == i) return false;
+            if (idx < i) lo = mid + 1; else hi = mid;
+        }
+        return true;
+    }
+    [[nodiscard]] int64_t offsetOf(uint32_t i) const noexcept {
+        return base_ >= 0 && accepted(i) ? base_ + static_cast<int64_t>(i) : -1;
+    }
+
+private:
+    int64_t base_;
+    std::span<const uint8_t> payload_;
+};
 
 /// Issue #226: the broker's login retry hint (ms) of a Connect refused AuthenticationFailed (a rate-limited login:
 /// BrokerError, or NotConnected when the hint outlived the connect deadline), else 0.  The typed way to read it:

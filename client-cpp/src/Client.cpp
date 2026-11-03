@@ -1053,11 +1053,12 @@ void Client::maybeRecycleCqSlot_(uint32_t idx) noexcept {
     freeCqSlot_(idx);
 }
 
-void Client::producerCqDeliverTrampoline_(void* ctx, CqRef ref, const Completion& c) noexcept {
-    static_cast<Client*>(ctx)->producerCqDeliver_(ref, c);
+void Client::producerCqDeliverTrampoline_(void* ctx, CqRef ref, const Completion& c,
+                                          std::span<const uint8_t> payload) noexcept {
+    static_cast<Client*>(ctx)->producerCqDeliver_(ref, c, payload);
 }
 
-void Client::producerCqDeliver_(CqRef ref, const Completion& c) noexcept {
+void Client::producerCqDeliver_(CqRef ref, const Completion& c, std::span<const uint8_t> payload) noexcept {
     // Duty thread (or the closing thread).  One producer completion: a per-
     // record / Tier-2 ack (one producer op) or a BatchAck (batchAckUnits()
     // credit units, each one producer op).
@@ -1069,7 +1070,9 @@ void Client::producerCqDeliver_(CqRef ref, const Completion& c) noexcept {
     CqSlot& slot = cqSlots_[idx];
     const uint64_t ops = c.op == OpKind::BatchAck ? batchAckUnits(c) : 1u;
     if (slot.ring != nullptr && slot.gen == cqRefGen(ref)) {
-        (void)slot.ring->deliver(c, {});
+        // TooLarge: a verdict list that outgrew its reservation (a contract break) surfaces as ResultTooLarge, never as a
+        // silently truncated list.
+        (void)slot.ring->deliver(c, payload, detail::CompletionRing::Overflow::TooLarge);
         slot.prodDelivered += ops;
         return;
     }

@@ -337,7 +337,7 @@ Claim Producer::claimPart_(TopicHandle topic, int32_t part, const Key& key, uint
         if (cq != nullptr) cq->unreserve(producer::kAckRecordBytes);  // nothing will ever complete
         return Claim(g.result);
     }
-    return Claim(detail::ClaimOpen{impl_, g.token, cq, bq, bq != nullptr ? 1u : 0u}, g.base, valueLen);
+    return Claim(detail::ClaimOpen{impl_, g.token, cq, bq, bq != nullptr ? 1u : 0u, producer::kAckRecordBytes}, g.base, valueLen);
 }
 
 Claim Producer::tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen) noexcept {
@@ -372,14 +372,15 @@ BatchClaim Producer::claimBatchPart_(TopicHandle topic, int32_t part, const Key&
     // The never-retryable size rules come first: an impossible claim is not QueueFull (polling cannot help) and
     // must not walk a reservation loop of n units.
     Completions* bq = impl_->batchAckCq();
+    const uint32_t cqBytes = impl_->batchCompletionBytes(n);   // what claimBatch(.., cq, token) reserved for the ONE completion
     if (bq != nullptr) [[unlikely]] {
         if (const SendResult shape = impl_->claimBatchShape(key, n, recLen); shape != SendResult::Ok) {
-            if (cq != nullptr) cq->unreserve(producer::kAckRecordBytes);
+            if (cq != nullptr) cq->unreserve(cqBytes);
             return BatchClaim(shape);
         }
         SendResult u = impl_->gateRefusesBeforeCredit() ? SendResult::NotInTransaction : reserveBatchUnits(*bq, n);
         if (u != SendResult::Ok) {
-            if (cq != nullptr) cq->unreserve(producer::kAckRecordBytes);
+            if (cq != nullptr) cq->unreserve(cqBytes);
             return BatchClaim(u);
         }
     }
@@ -388,10 +389,10 @@ BatchClaim Producer::claimBatchPart_(TopicHandle topic, int32_t part, const Key&
         if (bq != nullptr) {
             for (uint32_t i = 0; i < n; ++i) bq->unreserve(producer::kAckRecordBytes);
         }
-        if (cq != nullptr) cq->unreserve(producer::kAckRecordBytes);  // nothing will ever complete
+        if (cq != nullptr) cq->unreserve(cqBytes);  // nothing will ever complete
         return BatchClaim(g.result);
     }
-    return BatchClaim(detail::ClaimOpen{impl_, g.token, cq, bq, bq != nullptr ? n : 0u}, g.base, g.offsets, n, recLen);
+    return BatchClaim(detail::ClaimOpen{impl_, g.token, cq, bq, bq != nullptr ? n : 0u, cqBytes}, g.base, g.offsets, n, recLen);
 }
 
 BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen) noexcept {
@@ -407,7 +408,17 @@ BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, u
     }
     if (!cq.onOwnerThread()) return BatchClaim(SendResult::WrongThread);
     if (impl_->gateRefusesBeforeCredit()) [[unlikely]] return BatchClaim(SendResult::NotInTransaction);  // #339
-    const OpResult rr = cq.reserve(producer::kAckRecordBytes);  // ONE completion for the whole batch
+    // ONE completion for the whole batch.  A View batch of n records reserves for its n verdict entries (reservation =
+    // delivery); a batch whose completion cannot fit one queue record is refused up front, nothing reserved.
+    if (impl_->viewAcks()) {
+        if (const SendResult shape = impl_->claimBatchShape(key, n, recLen); shape != SendResult::Ok) return BatchClaim(shape);
+    }
+    const uint32_t cqBytes = impl_->batchCompletionBytes(n);
+    if (cqBytes > cq.maxRecordBytes() ||
+        cqBytes - detail::CompletionRing::kRecordHeaderBytes > cq.config().capacityBytes / 8) {
+        return BatchClaim(SendResult::MessageTooLarge);
+    }
+    const OpResult rr = cq.reserve(cqBytes);
     if (rr != OpResult::Accepted) return BatchClaim(mapReserve(rr));
     return claimBatchPart_(topic, key.partition(topic.partitionCount), key, n, recLen,
                            producer::ackhandle::forCq(cq.cqRef_, token), &cq);
