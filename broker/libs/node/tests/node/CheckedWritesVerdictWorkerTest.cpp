@@ -963,7 +963,14 @@ TEST(CheckedWritesVerdictWorkerRegression, LaggingReplicaLeadsAndDeliversNoRejec
     b.replicate(head);
     b.replicate(tail);
     b.promote();
+    // Node 2 learns the first batch's rejection on taking the lead, from the replicated marker M1 (the kept one): its rejected index
+    // holds exactly that record.  Were M1 dropped, the index would be empty and the record would be delivered.
+    ASSERT_NE(b.writeState(), nullptr);
+    EXPECT_TRUE(b.writeState()->rejected.isRejected(rejectedFirst)) << "learned from M1 when node 2 took the lead";
     for (int i = 0; i < 100; ++i) { b.followerFetch(); b.passes(5); }
+    // The log of node 2 holds exactly the two markers node 1 replicated: M1 (over the first batch, rejecting its second record) and
+    // M2 (over the second batch); node 2's judge adds none, because both batches are already covered.
+    EXPECT_EQ(b.readLog().markers.size(), 2u);
     const int64_t s = b.subscribe(SubKind::Raw, 0);
     std::vector<uint64_t> ids;
     for (const auto& d : b.collect(s).records) ids.push_back(d.id);
