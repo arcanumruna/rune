@@ -15,6 +15,7 @@
 //   | create ns / user / topic               | root                | sequential   | visible on every node, nsId equal            | CreateReplicates / LoginOnAnyNode / DiskLayout
 //   | create ns / user / topic               | root                | follower down| the follower catches up on restart           | FollowerRestartCatchesUp
 //   | metadata                               | a/alice, root       | sequential   | alice: a/t only; root: all                   | MetadataFilteredOnFollower
+#include "support/AuthLogReader.h"
 #include "support/AuthRig.h"
 #include "support/AuthTrio.h"
 #include "support/NamespaceMatrixExpectations.h"
@@ -532,6 +533,19 @@ TEST_P(NamespaceTrioLeaderChangeRegression, LeaderChangeMidCreateConvergesRegres
     EXPECT_EQ(again.code, wantCode) << label << ": the retry [" << again.detail << "]";
     if (ok && committedId != 0 && (p.op == Op::CreateNamespace || p.op == Op::CreateTopic || p.op == Op::CreateView))
         EXPECT_EQ(again.id, committedId) << label << ": the retry is answered with the id of the ONE committed op";
+
+    // #652: the event the ONE committed op wrote (on the old leader) carries the qualified login name, read back on
+    // the new leader, which also answered the retry.
+    if (ok && p.op == Op::CreateTopic) {
+        const std::string wantPrincipal = root ? "admin" : "a/admin";
+        int seen = 0;
+        for (const auto& e : readCatalogEvents(t.node(L2)))
+            if (e.kind == rune::catalog::EventKind::CreateTopic && (e.objectName == "k1" || e.objectName == "a/k1")) {
+                ++seen;
+                EXPECT_EQ(e.principal.authenticated, wantPrincipal) << label << ": the audit principal on the new leader";
+            }
+        EXPECT_EQ(seen, 1) << label << ": exactly one CreateTopic event for k1";
+    }
 
     // f. the effect happened once: the same op under a NEW request id answers the duplicate code
     Req fresh = req;

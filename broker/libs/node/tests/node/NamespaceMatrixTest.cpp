@@ -224,6 +224,15 @@ TEST_P(NamespaceMatrixTimingRegression, TimingCell) {
             auto snap = [&] { return Snap{r.rootListNamespaces(), r.rootMetadata(), r.securityDigest()}; };
             const auto a = r.timed(p.op, p.caller, p.ordinal, {}, lim);
             EXPECT_EQ(a.code, first.code) << label << " [" << a.detail << "]";
+            // #652: the catalog event of a tenant's DDL carries the qualified login name, before and after a restart.
+            const bool principalCell = ok && p.op == Op::CreateTopic;
+            const std::string wantPrincipal = p.caller == Caller::ClusterAdmin ? "admin" : "a/admin";
+            const std::string made = "k" + std::to_string(p.ordinal);
+            if (principalCell) {
+                const auto got = r.createTopicPrincipalForTest(made);
+                ASSERT_TRUE(got.has_value()) << label << ": no CreateTopic event for " << made;
+                EXPECT_EQ(*got, wantPrincipal) << label << ": the audit principal before the restart";
+            }
             const Snap s1 = snap();
             r.restartForTest();
             EXPECT_TRUE(r.awaitRootListed(r.topicIdA(), s1.ids.size())) << label << ": the topics did not come back";
@@ -231,6 +240,11 @@ TEST_P(NamespaceMatrixTimingRegression, TimingCell) {
             EXPECT_EQ(s1.ns.normalized(s2.ns), s2.ns.normalized(s1.ns)) << label << ": ListNamespaces changed";
             EXPECT_EQ(s1.ids, s2.ids) << label << ": the topic listing changed";
             EXPECT_EQ(s1.digest, s2.digest) << label << ": the security view changed";
+            if (principalCell) {
+                const auto got = r.createTopicPrincipalForTest(made);
+                ASSERT_TRUE(got.has_value()) << label << ": the CreateTopic event is gone after the restart";
+                EXPECT_EQ(*got, wantPrincipal) << label << ": the audit principal after the restart";
+            }
             if (ok) {
                 const auto again = r.timed(p.op, p.caller, p.ordinal, {}, lim);
                 EXPECT_EQ(again.code, dup) << label << ": the effect did not survive the restart [" << again.detail << "]";

@@ -9,6 +9,7 @@
 //
 // Every wait is bounded (AuthRig::dl); no sleeps.
 
+#include "support/AuthLogReader.h"
 #include "support/AuthRig.h"
 #include "support/NamespaceMatrixExpectations.h"
 
@@ -180,6 +181,15 @@ public:
         auto ids = main_->r.metadataTopics(rootSession(*main_));
         std::sort(ids.begin(), ids.end());
         return ids;
+    }
+    /// Issue #652 (test-only): the audit principal of the CreateTopic catalog event of topic `local` (any namespace
+    /// spelling "<ns>/<local>" or bare), or nullopt when the catalog log holds none.
+    std::optional<std::string> createTopicPrincipalForTest(const std::string& local) {
+        std::optional<std::string> out;
+        for (const auto& e : readCatalogEvents(main_->r.broker().node()))
+            if (e.kind == rune::catalog::EventKind::CreateTopic && (e.objectName == local || e.objectName == "a/" + local))
+                out = e.principal.authenticated;
+        return out;
     }
     uint64_t securityDigest() { return main_->r.broker().node().securityViewForTest().digest; }
     int32_t topicIdA() { return main_->tid["a"]; }

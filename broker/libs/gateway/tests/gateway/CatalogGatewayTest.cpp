@@ -74,7 +74,11 @@ struct CountingAdminSink final : IAdminRequestSink {
                                  const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
     AdminSubmit submitCreateView(int64_t, int64_t, std::string_view, std::string_view, uint8_t, const uint8_t*,
                                  uint32_t, const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
-    AdminSubmit submitDropTopic(int64_t, int64_t, std::string_view, const DdlMetaView&) override {
+    std::string lastAuthenticated;   // #652: the audit principal of the last DropTopic (copied: the view is transient)
+    uint32_t    lastCallerNsId = 0;
+    AdminSubmit submitDropTopic(int64_t, int64_t, std::string_view, const DdlMetaView& meta) override {
+        lastAuthenticated = std::string(meta.authenticated);
+        lastCallerNsId    = meta.callerNsId;
         ++submits; return AdminSubmit::Accepted;
     }
     AdminSubmit submitAlterTopicConfig(int64_t, int64_t, std::string_view, uint32_t, std::span<const uint8_t>,
@@ -1147,4 +1151,20 @@ TEST(AuthLiveChangeAdversarialRegression, ANewReadNeverOvertakesTheOwedEndOfItsK
     EXPECT_EQ(g.admin.order[1], 'S');
     (void)g.gw.pumpCatalogUnsubscribesForTest();
     EXPECT_EQ(g.admin.catalogUnsubs.size(), 1u) << "the end is sent once (not again by the duty-cycle flush)";
+}
+
+// #652 (D3): a session whose namespace the registry no longer knows (a delete race) records the audit principal as
+// `#<nsId>/<user>`, which cannot collide with a valid namespace name; a known namespace is `<ns>/<user>`, `default` bare.
+TEST(CatalogPrincipalRegression, UnknownNsFallsBackToNumericPrefixRegression) {
+    GatewayRig g;
+    g.gateway().setCatalogRoute(rune::gateway::RouteLocalLeader{});
+    constexpr uint32_t kGone = 7;   // no namespace record has this id
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", PermissionTable::allowAll(), {}, kGone});
+    EXPECT_FALSE(g.sendDdl(pc::TemplateId::DropTopic).answered);
+    ASSERT_EQ(g.adminSubmits(), 1u);
+    EXPECT_EQ(g.admin.lastCallerNsId, kGone);
+    EXPECT_EQ(g.admin.lastAuthenticated, "#7/ops") << "an unknown namespace id is spelled #<nsId>";
+    g.gw.setSessionAuthForTest(g.sid, AuthAuthenticated{1, "ops", PermissionTable::allowAll(), {}, 0});
+    EXPECT_FALSE(g.sendDdl(pc::TemplateId::DropTopic).answered);
+    EXPECT_EQ(g.admin.lastAuthenticated, "ops") << "default stays bare";
 }
