@@ -9255,7 +9255,11 @@ bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint
     const PermissionTable& perms = permsOf_(session);
     if (perms.isAllowAll()) return false;
     const auto group = [&](std::span<const uint8_t> id) {
-        return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read, perms.nsId());
+        // Authorize the name the coordinator will act on (scopeClientIdInto): the scoped local name, never the qualified text.
+        const auto r = resolve_(session, sv(id));
+        return r.r == rune::gateway::Resolved::Found
+            ? authorizeName(perms, rsec::ResourceType::Group, r.local, rsec::Operation::Read, r.nsId)
+            : authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read, perms.nsId());
     };
     const auto topic = [&](int32_t id, int32_t partition) {
         return authorizeTopicIdHere_(perms, id, partition, rsec::Operation::Read);
@@ -9311,10 +9315,18 @@ bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_
     const PermissionTable& perms = permsOf_(session);
     if (perms.isAllowAll()) return false;
     const auto txn = [&](std::span<const uint8_t> id) {
-        return authorizeName(perms, rsec::ResourceType::TransactionalId, sv(id), rsec::Operation::Write, perms.nsId());
+        // Authorize the name the coordinator will act on (scopeClientIdInto): the scoped local name, never the qualified text.
+        const auto r = resolve_(session, sv(id));
+        return r.r == rune::gateway::Resolved::Found
+            ? authorizeName(perms, rsec::ResourceType::TransactionalId, r.local, rsec::Operation::Write, r.nsId)
+            : authorizeName(perms, rsec::ResourceType::TransactionalId, sv(id), rsec::Operation::Write, perms.nsId());
     };
     const auto group = [&](std::span<const uint8_t> id) {
-        return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read, perms.nsId());
+        // Authorize the name the coordinator will act on (scopeClientIdInto): the scoped local name, never the qualified text.
+        const auto r = resolve_(session, sv(id));
+        return r.r == rune::gateway::Resolved::Found
+            ? authorizeName(perms, rsec::ResourceType::Group, r.local, rsec::Operation::Read, r.nsId)
+            : authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read, perms.nsId());
     };
     std::optional<rune::gateway::Denial> d;
     switch (static_cast<pc::TemplateId>(tid)) {

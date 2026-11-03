@@ -481,3 +481,44 @@ TEST(NamespaceGatewayRegression, QualifiedLookingGroupNamesPinnedRegression) {
     EXPECT_EQ(r.committedOffset(g.alice, "alpha/g", g.mine), 11) << "alpha/g is alpha's g";
     EXPECT_NE(r.committedOffset(g.alice, "bravo/g", g.mine), 11) << "a foreign qualifier is a different (literal) group";
 }
+
+// A grant on a group / transactional id is checked against the SCOPED local name the coordinator acts on, never the
+// qualified text: for alpha, `alpha/g` is group `g` in alpha.  A prefix grant "alp" must not admit `alpha/secretgrp`
+// (local "secretgrp"), and an exact grant on "g" must admit `alpha/g`.
+// Mutation: authorize `sv(id)` (the raw text) in the denyGroupRequest_ / denyTxnRequest_ lambdas -> legs 2-4 and 6 red.
+TEST(NamespaceGatewayRegression, OwnQualifierGroupTxnNameAuthorizesLocalNameAdversarialRegression) {
+    NsGw g;
+    AuthRig& r = g.r;
+    const auto joined = r.joinStable(g.root, "alpha/secretgrp", {g.mine});
+    ASSERT_GE(joined.second, 0);
+    ASSERT_EQ(r.commitAs(g.root, "alpha/secretgrp", joined.first, joined.second, g.mine, 11), kOk);
+    ASSERT_EQ(r.committedOffset(g.root, "alpha/secretgrp", g.mine), 11);
+    r.broker().createUser("alpha/eve", AuthRig::kPw,
+                          {prefix(SO::Read, ST::Topic, ""), prefix(SO::Describe, ST::Topic, ""),
+                           prefix(SO::Read, ST::Group, "alp"), prefix(SO::Write, ST::TransactionalId, "alp")});
+    const int64_t eve = r.login("alpha/eve");
+    ASSERT_GT(eve, 0);
+    // 1 control: the bare name is outside the grant
+    EXPECT_NE(r.committedOffset(eve, "secretgrp", g.mine), 11);
+    EXPECT_EQ(r.offsetFetch(eve, "secretgrp", g.mine), kNotAuthorized);
+    // 2 the own-namespace qualifier names the same group: still outside the grant
+    EXPECT_NE(r.committedOffset(eve, "alpha/secretgrp", g.mine), 11) << "a prefix grant read another group's offset";
+    EXPECT_EQ(r.offsetFetch(eve, "alpha/secretgrp", g.mine), kNotAuthorized);
+    // 3 join
+    EXPECT_EQ(r.joinGroup(eve, "alpha/secretgrp", {g.mine}), kNotAuthorized);
+    // 4 transactional id
+    EXPECT_EQ(r.initProducerId(eve, "alpha/tx9"), kNotAuthorized);
+    // 5 control: a literal that matches the prefix
+    EXPECT_EQ(r.joinGroup(eve, "alpine-1", {g.mine}), kOk);
+    // 6 an exact grant on "g" admits `alpha/g`
+    r.broker().createUser("alpha/gus", AuthRig::kPw,
+                          {prefix(SO::Read, ST::Topic, ""), prefix(SO::Describe, ST::Topic, ""),
+                           exact(SO::Read, ST::Group, "g")});
+    const int64_t gus = r.login("alpha/gus");
+    ASSERT_GT(gus, 0);
+    const auto gj = r.joinStable(gus, "alpha/g", {g.mine});
+    ASSERT_GE(gj.second, 0) << "an exact grant on g must admit alpha/g";
+    EXPECT_EQ(r.commitAs(gus, "alpha/g", gj.first, gj.second, g.mine, 7), kOk);
+    EXPECT_EQ(r.committedOffset(gus, "alpha/g", g.mine), 7);
+    EXPECT_EQ(r.committedOffset(gus, "g", g.mine), 7) << "alpha/g and g are one group";
+}
