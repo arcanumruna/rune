@@ -199,6 +199,9 @@ TEST(CheckedWritesKeyIndexWorker, TopicDropReleasesTheKeyIndex) {
     ASSERT_TRUE(r.driveUntilJudged());
     ASSERT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 2u);
     ASSERT_FALSE(r.vs->verdictSourceKeysForTest().empty());
+    ASSERT_NE(r.writeState()->verdicts, nullptr);
+    r.vs->dropSourceTopic(VerdictRig::kSrc);
+    EXPECT_EQ(r.writeState()->verdicts, nullptr) << "the write state outlives its judge until dropWriteSpec_ runs";
     WorkerOp d;
     d.type = WorkerOp::Type::TopicDropped;
     d.topicId = VerdictRig::kSrc;
@@ -612,6 +615,41 @@ TEST(CheckedWritesKeyIndexRegression, FirstActivationIsNotARebuildRegression) {
     r.demotePromote();
     r.passes(30);
     EXPECT_EQ(r.stats()->keyIndexRebuilds, 1u);
+}
+
+// Final review I1: an index adopted while its judge already serves a leadership has folded that leadership's writes, so the next
+// activation rebuilds it; kept, it would still hold a key the follower-time truncation removed.
+TEST(CheckedWritesKeyIndexRegression, AdoptionMidLeadershipRebuildsOnTheNextActivationRegression) {
+    VerdictRig r;
+    r.createKeyIndex({}, /*enabled=*/false);
+    r.installRejectView(kRej, kRejObj, tagRule(7));
+    r.enableAcks();
+    r.passes(60);
+    ASSERT_NE(r.vs->verdictSource(VerdictRig::kSrc, 0), nullptr) << "the constraint-only judge is active";
+    r.enableKeyIndex();
+    r.passes(60);
+    ASSERT_EQ(r.writeState()->constraintSets.latest().count, 2) << "the key index joined the set";
+    const int64_t cut = r.leo();
+    Intents p{r, 42};
+    const auto a1 = p.sendAck({ins(5)});
+    ASSERT_TRUE(a1);
+    ASSERT_TRUE(a1->verdicts.empty());
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_EQ(r.keyIndexKeys(), idSet(5, 5));
+
+    r.demote();
+    r.truncateReplicaTo(cut);
+    ASSERT_EQ(r.leo(), cut) << "the insert of 5 is gone from the local log";
+    r.promote();
+    r.passes(30);
+    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_NE(r.stats(), nullptr);
+    EXPECT_EQ(r.stats()->keyIndexRebuilds, 1u);
+    EXPECT_TRUE(r.keyIndexKeys().empty());
+    Intents q{r, 43};
+    const auto a2 = q.sendAck({ins(5)});
+    ASSERT_TRUE(a2);
+    EXPECT_TRUE(a2->verdicts.empty()) << "5 is not in the log: its insert is accepted";
 }
 
 // ---- the key-width sweep: the key index judges by the exact bytes of the wire key, at every width the DDL allows (SD8) ----

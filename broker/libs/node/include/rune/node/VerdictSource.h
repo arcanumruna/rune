@@ -64,6 +64,7 @@ public:
 
     /// The partition state judge() records rejections in and driveJudge() reads the timeline from.
     void bindState(PartitionWriteState* state) noexcept { state_ = state; }
+    [[nodiscard]] PartitionWriteState* boundState() const noexcept { return state_; }
 
     /// Prepares every member of the active set for `rec`, evaluates them in set order, applies all or none.  A rejection
     /// is added to the index and returned.  A full index or an exhausted prospect sets stalled() and applies nothing.
@@ -84,6 +85,8 @@ public:
     }
     [[nodiscard]] bool waitingForInstall() const noexcept { return waitingForInstall_; }
     [[nodiscard]] bool activationPending() const noexcept { return needsActivation_; }
+    /// A leadership has activated this judge and no new one is pending: what it folds now belongs to that leadership.
+    [[nodiscard]] bool activated() const noexcept { return generation_ != kUnbound && !needsActivation_; }
     [[nodiscard]] int64_t logStart() const noexcept { return logStart_; }
 
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);

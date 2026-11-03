@@ -792,7 +792,11 @@ void WorkerViewSet::installTestVerdictViewForTest(rune::view::CompiledViewPlan p
 
 void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
     const auto ofTopic = [&](const auto& kv) { return static_cast<int32_t>(kv.first >> 32) == srcTopicId; };
-    std::erase_if(verdictSources_, ofTopic);
+    std::erase_if(verdictSources_, [&](const auto& kv) {
+        if (!ofTopic(kv)) return false;
+        if (PartitionWriteState* s = kv.second->boundState()) s->verdicts = nullptr;   // the state may outlive its judge
+        return true;
+    });
     for (auto it = keyIndexes_.begin(); it != keyIndexes_.end();) {
         if (!ofTopic(*it)) { ++it; continue; }
         releaseMem_(it->second);
@@ -817,6 +821,8 @@ static const rune::codec::Descriptor* keyIndexSource(const TopicWriteSpec& spec)
 
 // A key index no leadership has activated yet: its first activation keeps it (it holds nothing), a later one rebuilds it.
 static constexpr uint64_t kNeverActivated = UINT64_MAX;
+// A key index adopted under an active leadership: it folds that leadership's writes, so the next activation rebuilds it.
+static constexpr uint64_t kAdoptedLive = UINT64_MAX - 1;
 
 static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src) {
     ViewInstance inst(keyIndexPlan(srcTopicId, spec.keyFieldId), keyIndexRowLayout(), src, /*persist=*/false,
@@ -832,7 +838,11 @@ void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, Verd
     if (it == keyIndexes_.end() || it->second.foldLeadership == leaderGen) return;   // already fresh for this leadership (the judge may be held)
     if (it->second.foldLeadership != kNeverActivated) {
         const rune::codec::Descriptor* src = keyIndexSource(spec);
-        if (src == nullptr) return;
+        if (src == nullptr) {   // the spec can no longer be indexed: nothing stale stays behind
+            judge.removeVerdictView(it->second.plan.viewTopicId);
+            eraseKeyIndex_(it->first);
+            return;
+        }
         releaseMem_(it->second);
         it->second = freshKeyIndex(srcTopicId, partition, spec, *src);
         ++judge.statsMut().keyIndexRebuilds;
@@ -870,6 +880,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     if (write.spec->keyIndex && !judge->hasMember(0, kKeyIndexPlanFingerprint)) {
         if (const rune::codec::Descriptor* src = keyIndexSource(*write.spec)) {
             ViewInstance& inst = keyIndexes_.try_emplace(key, freshKeyIndex(srcTopicId, partition, *write.spec, *src)).first->second;
+            if (judge->activated()) inst.foldLeadership = kAdoptedLive;
             judge->addVerdictView(&inst, rune::view::VerdictViewKind::KeyIndex, 0, kKeyIndexPlanFingerprint);
         }
     }
