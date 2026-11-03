@@ -1277,3 +1277,82 @@ TEST(ViewBackupRegression, CheckpointOneAboveTheLogEndIsDiscardedRegression) {
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33) << "the rebuild folds [0,4) only";
 }
+
+// ── Batch 1 adversarial pass: backup-then-rebuild, crash at every durable step, with the RUNE_VIEW_BACKUP knob on and off.
+// A checkpoint ahead of a 12-record log (O = 20, it holds key 9 the log never had) is discarded; the node crashes at each
+// durable step of the discard and of the rebuild, and boots again over the same data dir.  Every boot converges to the
+// recompute of the log (key 7 = 41, key 9 absent, cursor 12); with the knob on the old checkpoint survives in backup/ byte for
+// byte, with it off no backup is ever made and a backup left by an earlier run is neither used nor pruned; a boot after the
+// rebuild finished never discards again.
+TEST(ViewBackupRegression, CrashAtEveryDiscardStepConvergesWithTheKnobOnAndOffAdversarialRegression) {
+    // 0: before the discard (only the checkpoint); 1: after the backup link and its dir fsync, before the unlink (both);
+    // 2: after the unlink, before the ack (only the backup); 3: after the whole rebuild, durable at 12 (the refolded checkpoint).
+    for (const bool knob : {true, false}) {
+        for (int point = 0; point < 4; ++point) {
+            SCOPED_TRACE(std::string("knob ") + (knob ? "on" : "off") + " point " + std::to_string(point));
+            const auto dir = (std::filesystem::temp_directory_path() /
+                              ("rune_t_adv_bk-" + std::to_string(::getpid()) + "-" + std::to_string(knob) + std::to_string(point))).string();
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+            std::filesystem::create_directories(dir);
+            const rune::node::ViewBackupPolicy policy{knob, 3};
+            std::string before;
+            std::size_t backupsBefore = 0;
+            {   // boot 1: lay the crash state down
+                DiscardRig r1("unused", 0, policy, &dir);
+                rigOverTwelveRecordLog(r1);
+                r1.writeCheckpoint(twentyRecordsKey7ThenKey9(), 20);
+                before = slurpFile(r1.ckptPath());
+                const std::string bk = dir + "/backup/view-" + std::to_string(kViewId) + "-p0.0000000001.ahead-of-log.delta";
+                if (point == 1 || point == 2) {
+                    std::filesystem::create_directories(dir + "/backup");
+                    std::filesystem::create_hard_link(r1.ckptPath(), bk);
+                    if (point == 2) std::filesystem::remove(r1.ckptPath());
+                } else if (point == 3) {
+                    r1.materialize();
+                    ASSERT_TRUE(r1.pumpUntilReady());
+                    ASSERT_TRUE(pumpUntilDurable(r1, 12));
+                }
+                backupsBefore = rune::node::listViewBackups(dir, kViewId, 0).size();
+            }
+            {   // boot 2 over the same dir
+                DiscardRig r2("unused", 0, policy, &dir);
+                rigOverTwelveRecordLog(r2);
+                r2.materialize();
+                ASSERT_TRUE(r2.pumpUntilReady());
+                r2.pump(4);
+                const rune::view::RowLayout* L = nullptr;
+                EXPECT_EQ(r2.vs->getRow(kViewId, 0, 9, L), nullptr) << "a row only the future checkpoint held is never served";
+                const uint8_t* row = r2.vs->getRow(kViewId, 0, 7, L);
+                ASSERT_NE(row, nullptr);
+                EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 41) << "the recompute of [0,12)";
+                EXPECT_EQ(r2.vs->instanceServeState(kViewId, 0).foldCursor, 12);
+                const auto backups = rune::node::listViewBackups(dir, kViewId, 0);
+                for (const auto& b : backups) EXPECT_EQ(slurpFile(b), before) << b << ": a backup is the old checkpoint, byte for byte";
+                if (knob) {
+                    EXPECT_GE(backups.size(), 1u) << "the old checkpoint survives in backup/";
+                    EXPECT_LE(backups.size(), 2u);   // a replay after a crash between link and unlink links again (#838)
+                    if (point == 3) EXPECT_EQ(backups.size(), backupsBefore) << "a boot after the rebuild never discards again";
+                } else {
+                    EXPECT_EQ(backups.size(), backupsBefore) << "knob off: no backup made, and an earlier one is neither used nor pruned";
+                }
+                EXPECT_EQ(r2.vs->foldCounters(kViewId, 0)->checkpointDiscards, (point == 0 || point == 1) ? 1u : 0u)
+                    << "the boot discards exactly when a checkpoint ahead of the log is still in place";
+                if (point != 3) ASSERT_TRUE(pumpUntilDurable(r2, 12)) << "the refold reaches disk";   // 3: already durable at 12
+            }
+            {   // boot 3: the refolded checkpoint is the truth now; nothing more is discarded
+                DiscardRig r3("unused", 0, policy, &dir);
+                rigOverTwelveRecordLog(r3);
+                r3.materialize();
+                EXPECT_EQ(r3.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+                EXPECT_EQ(r3.vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+                const rune::view::RowLayout* L = nullptr;
+                const uint8_t* row = r3.vs->getRow(kViewId, 0, 7, L);
+                ASSERT_NE(row, nullptr);
+                EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 41);
+                EXPECT_EQ(r3.vs->getRow(kViewId, 0, 9, L), nullptr);
+            }
+            std::filesystem::remove_all(dir, ec);
+        }
+    }
+}

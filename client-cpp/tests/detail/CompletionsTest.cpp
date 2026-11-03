@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <span>
 #include <thread>
@@ -425,4 +426,311 @@ TEST(CompletionsLargeRecordsRegression, CompletionRingLargeRecordsNeverLoseAComp
             EXPECT_EQ(cq.ring().lostCompletions(), 0u);
         }
     }
+}
+
+// ===========================================================================
+// Batch 1 adversarial pass: the completion-ring credit contract.
+// ===========================================================================
+
+namespace {
+
+/// Fills `cq`'s ring with consumed records so that both head and tail sit at byte `pos` (8-aligned, 0 or >= 48): the next
+/// record is written there.  Every record it uses is reserved, delivered and polled, so the credit returns to zero.
+void parkRingAt(Completions& cq, uint32_t pos) {
+    ASSERT_EQ(pos % 8, 0u);
+    ASSERT_TRUE(pos == 0 || pos >= 48);
+    uint32_t at = 0;
+    Token t = 1u << 30;
+    while (at < pos) {
+        int batch = 0;
+        for (;;) {
+            if (at == pos) break;
+            const uint32_t rec = pos - at > 96 ? 48u : pos - at;   // 48-byte steps; the last closes the gap exactly (48..96)
+            if (cq.reserve(rec) != OpResult::Accepted) break;
+            if (rec == 48) {
+                Completion c;
+                c.token = t++;
+                c.reservedBytes = 48;
+                ASSERT_TRUE(cq.ring().deliver(c, {}));
+            } else {
+                ASSERT_TRUE(deliver(cq, t++, rec, rec - 48));
+            }
+            at += rec;
+            ++batch;
+        }
+        int polled = 0;
+        while (polled < batch) {
+            const int got = cq.poll([](const Completion&, std::span<const uint8_t>) {});
+            ASSERT_GT(got, 0);
+            polled += got;
+        }
+    }
+    ASSERT_EQ(cq.reservedBytes(), 0u);
+    ASSERT_EQ(cq.outstanding(), 0u);
+}
+
+}  // namespace
+
+// Input bounds: n = 0 / 1 / 2 / max / max + 1 of a View batch completion, and the reservation at maxReservation and above it.
+// A reservation of exactly maxReservation() is accepted and its largest record (header + maxMsgLength) is delivered whole.
+TEST(CompletionsAdversarialRegression, BatchCompletionBoundsAtZeroOneMaxAndMaxPlusOneAdversarialRegression) {
+    using rune::client::producer::batchCompletionBytes;
+    EXPECT_EQ(batchCompletionBytes(true, 0), 48u) << "n = 0 is refused before it reserves; it never asks for more than one record";
+    EXPECT_EQ(batchCompletionBytes(true, 1), 48u) << "a 1-record batch keeps single-record semantics";
+    EXPECT_EQ(batchCompletionBytes(false, 4096), 48u) << "no View: the plain record";
+    EXPECT_EQ(batchCompletionBytes(true, 2), 2u * CompletionRing::completionRecordBytes(16) - 48u);
+    EXPECT_EQ(batchCompletionBytes(true, 4096), 2u * CompletionRing::completionRecordBytes(8u * 4096u) - 48u);
+
+    Completions cq;   // the default queue: 1 MiB, M = 16432
+    ASSERT_EQ(cq.maxRecordBytes(), 16432u);
+    ASSERT_EQ(cq.maxMsgLength(), (1u << 20) / 8);
+    const uint32_t maxRec = CompletionRing::kRecordHeaderBytes + cq.maxMsgLength();
+    EXPECT_EQ(cq.maxReservation(), 2u * maxRec - 48u);
+    EXPECT_GE(cq.maxReservation(), batchCompletionBytes(true, 4096)) << "4096 records fit a default queue";
+    EXPECT_EQ(cq.reserve(cq.maxReservation() + 8), OpResult::InvalidArgument) << "max + 1 (aligned)";
+    EXPECT_EQ(cq.reserve(cq.maxReservation() + 1), OpResult::InvalidArgument) << "max + 1 (unaligned)";
+    EXPECT_EQ(cq.reserve(47), OpResult::InvalidArgument) << "below one bare completion";
+    EXPECT_EQ(cq.reserve(0), OpResult::InvalidArgument);
+
+    // Park the tail where the largest record cannot fit before the end: it must wrap and leave the largest padding.
+    parkRingAt(cq, (1u << 20) - maxRec + 8);
+    ASSERT_EQ(cq.reserve(cq.maxReservation()), OpResult::Accepted);
+    // Fill the rest of the credit with small records; the big one goes first (it wraps with the largest padding), then
+    // every small one meets the fullest ring.
+    std::vector<Token> small;
+    for (Token t = 100; cq.reserve(48) == OpResult::Accepted; ++t) small.push_back(t);
+    ASSERT_TRUE(deliver(cq, 7, cq.maxReservation(), cq.maxMsgLength() - CompletionRing::kCompletionBytes))
+        << "the largest record of the largest reservation, wrapping with the largest padding";
+    for (const Token t : small) ASSERT_TRUE(deliver(cq, t, 48, 0));
+    EXPECT_EQ(cq.ring().lostCompletions(), 0u);
+    std::size_t bigLen = 0;
+    int got = 0;
+    while (cq.poll([&](const Completion& c, std::span<const uint8_t> p) {
+               ++got;
+               if (c.token == 7) {
+                   bigLen = p.size();
+                   for (std::size_t k = 0; k < p.size(); ++k)
+                       if (p[k] != patternByte(7, k)) { ADD_FAILURE() << "byte " << k; break; }
+               }
+           }) > 0) {}
+    EXPECT_EQ(got, static_cast<int>(small.size()) + 1);
+    EXPECT_EQ(bigLen, cq.maxMsgLength() - CompletionRing::kCompletionBytes) << "nothing truncated: the cap is the largest record";
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    EXPECT_EQ(cq.outstanding(), 0u);
+}
+
+// Wrap at every tail offset: on a 64 KiB queue (M = 2096, maxMsg 8 KiB) park the ring at every 8-aligned byte, hold one large
+// reservation (the largest a View batch can make here) plus small ones up to the credit limit, and deliver the large one first,
+// last, or in the middle.  The large record lands at every position relative to the buffer end; nothing is ever lost.
+TEST(CompletionsAdversarialRegression, LargeAmongSmallAtEveryTailOffsetNeverLosesACompletionAdversarialRegression) {
+    using rune::client::producer::batchCompletionBytes;
+    CompletionsConfig cfg;
+    cfg.capacityBytes  = 64u << 10;
+    cfg.maxResultBytes = 2048;
+    const uint32_t cap = cfg.capacityBytes;
+    uint32_t nMax = 0;
+    {
+        Completions probe(cfg);
+        nMax = (CompletionRing::kRecordHeaderBytes + probe.maxMsgLength() - CompletionRing::completionRecordBytes(0)) / 8;
+        ASSERT_GT(CompletionRing::completionRecordBytes(8 * nMax), probe.maxRecordBytes());
+    }
+    uint64_t positions = 0;
+    for (uint32_t pos = 48; pos < cap; pos += 8) {
+        for (int order = 0; order < 3; ++order) {
+            Completions cq(cfg);
+            parkRingAt(cq, pos);
+            if (::testing::Test::HasFatalFailure()) return;
+            const uint32_t n = nMax - (pos / 8) % 64;   // vary the large record's size too
+            const uint32_t big = batchCompletionBytes(true, n);
+            ASSERT_EQ(cq.reserve(big), OpResult::Accepted) << "pos " << pos;
+            std::vector<Token> small;
+            for (Token t = 100; cq.reserve(48) == OpResult::Accepted; ++t) small.push_back(t);
+            const std::size_t mid = small.size() / 2;
+            auto deliverBig = [&] {
+                ASSERT_TRUE(deliver(cq, 7, big, 8 * n)) << "pos " << pos << " order " << order;
+            };
+            if (order == 0) deliverBig();
+            for (std::size_t i = 0; i < small.size(); ++i) {
+                if (order == 2 && i == mid) deliverBig();
+                ASSERT_TRUE(deliver(cq, small[i], 48, 0)) << "pos " << pos << " order " << order << " small " << i;
+            }
+            if (order == 1) deliverBig();
+            ASSERT_EQ(cq.ring().lostCompletions(), 0u) << "pos " << pos << " order " << order;
+            int got = 0;
+            bool bigOk = false;
+            while (cq.poll([&](const Completion& c, std::span<const uint8_t> p) {
+                       ++got;
+                       if (c.token == 7) bigOk = p.size() == 8u * n && p[0] == patternByte(7, 0) && p.back() == patternByte(7, p.size() - 1);
+                   }) > 0) {}
+            ASSERT_EQ(got, static_cast<int>(small.size()) + 1) << "pos " << pos;
+            ASSERT_TRUE(bigOk) << "pos " << pos;
+            ASSERT_EQ(cq.reservedBytes(), 0u);
+            ++positions;
+        }
+    }
+    EXPECT_EQ(positions, 3u * ((cap - 48) / 8));
+}
+
+// A broker that answers with MORE verdict entries than the batch has (or a reservation smaller than the payload): deliver()
+// caps the record at what the reservation stands for — Truncate keeps the first bytes, TooLarge reports ResultTooLarge with
+// the real size — and a ring kept at its credit limit never loses one, over a seeded mix of small and large reservations.
+TEST(CompletionsAdversarialRegression, OverDeliveryBeyondTheReservationIsCappedNeverLostAdversarialRegression) {
+    using rune::client::producer::batchCompletionBytes;
+    CompletionsConfig cfg;
+    cfg.capacityBytes  = 64u << 10;
+    cfg.maxResultBytes = 2048;
+    for (const uint64_t seed : {7ull, 0xBADC0DEull, 99991ull}) {
+        Completions cq(cfg);
+        const uint32_t maxPayload = cq.maxMsgLength() - CompletionRing::kCompletionBytes;
+        const uint32_t nMax = (maxPayload) / 8;
+        uint64_t rng = seed;
+        auto next = [&] { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+        struct Held { Token t; uint32_t resv; uint32_t standFor; };
+        std::vector<Held> held;
+        std::deque<std::pair<Token, std::size_t>> expect;   // token, expected payload length (TooLarge: SIZE_MAX)
+        Token tok = 1;
+        uint64_t issued = 0, polled = 0;
+        for (int step = 0; step < 60'000; ++step) {
+            const uint64_t a = next() % 10;
+            if (a < 4) {
+                const bool large = next() & 1;
+                const uint32_t n = large ? 2 + static_cast<uint32_t>(next() % (nMax - 1)) : 1 + static_cast<uint32_t>(next() % 8);
+                const uint32_t resv = large ? batchCompletionBytes(true, n) : CompletionRing::completionRecordBytes(8 * n);
+                if (cq.reserve(resv) != OpResult::Accepted) continue;
+                uint32_t standFor = resv;
+                if (resv > cq.maxRecordBytes()) {
+                    standFor = ((resv + 48) / 2) & ~7u;
+                    if (standFor < cq.maxRecordBytes()) standFor = cq.maxRecordBytes();
+                }
+                if (standFor > CompletionRing::kRecordHeaderBytes + cq.maxMsgLength())
+                    standFor = CompletionRing::kRecordHeaderBytes + cq.maxMsgLength();
+                held.push_back({tok++, resv, standFor});
+                ++issued;
+            } else if (a < 7) {
+                if (held.empty()) continue;
+                const std::size_t i = next() % held.size();
+                const Held h = held[i];
+                held[i] = held.back();
+                held.pop_back();
+                const uint32_t room = h.standFor - 48;
+                const uint32_t len = static_cast<uint32_t>(room + 8 + next() % 4096);   // always more than fits
+                const bool tooLarge = next() & 1;
+                ASSERT_TRUE(deliver(cq, h.t, h.resv, len, tooLarge ? CompletionRing::Overflow::TooLarge : CompletionRing::Overflow::Truncate))
+                    << "seed " << seed << " step " << step;
+                expect.emplace_back(h.t, tooLarge ? SIZE_MAX : room);
+            } else {
+                (void)cq.poll([&](const Completion& c, std::span<const uint8_t> p) {
+                    ASSERT_FALSE(expect.empty());
+                    const auto [t, len] = expect.front();
+                    expect.pop_front();
+                    ASSERT_EQ(c.token, t);
+                    if (len == SIZE_MAX) {
+                        EXPECT_EQ(c.status, OpStatus::ResultTooLarge);
+                        EXPECT_EQ(p.size(), 0u);
+                        EXPECT_GT(c.value, 0);
+                    } else {
+                        EXPECT_EQ(p.size(), len) << "truncated to what the reservation stands for";
+                    }
+                    ++polled;
+                }, 1 + static_cast<int>(next() % 6));
+            }
+            ASSERT_EQ(cq.ring().lostCompletions(), 0u) << "seed " << seed << " step " << step;
+        }
+        for (const Held& h : held) { ASSERT_TRUE(deliver(cq, h.t, h.resv, 0)); expect.emplace_back(h.t, 0); }
+        while (cq.poll([&](const Completion&, std::span<const uint8_t>) { expect.pop_front(); ++polled; }) > 0) {}
+        EXPECT_EQ(polled, issued);
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+        EXPECT_EQ(cq.ring().lostCompletions(), 0u);
+    }
+}
+
+// waitFor() stashes large records it reads past; the stash is as large as the ring and holds only credited records, so
+// large and small records stashed out of order, then taken out of order, never overflow it and come back byte-equal.
+TEST(CompletionsAdversarialRegression, WaitForStashesLargeRecordsOutOfOrderAdversarialRegression) {
+    using rune::client::producer::batchCompletionBytes;
+    CompletionsConfig cfg;
+    cfg.capacityBytes  = 64u << 10;
+    cfg.maxResultBytes = 2048;
+    cfg.nanoClock      = &frozenClock;
+    Completions cq(cfg);
+    const uint32_t nMax = (cq.maxMsgLength() - CompletionRing::kCompletionBytes) / 8;
+    uint64_t rng = 0x5EED;
+    auto next = [&] { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+    struct Op { uint32_t n; uint32_t resv; };
+    std::vector<Op> ops(1);   // token 0 unused
+    std::vector<int> done;
+    done.push_back(0);
+    std::vector<Token> undelivered, inFlight;
+    auto check = [&](const Completion& c, std::span<const uint8_t> p) {
+        ASSERT_LT(c.token, ops.size());
+        const Op& o = ops[c.token];
+        ASSERT_EQ(p.size(), o.n > 1 ? 8u * o.n : 0u) << "token " << c.token;
+        if (!p.empty()) { EXPECT_EQ(p[0], patternByte(c.token, 0)); EXPECT_EQ(p.back(), patternByte(c.token, p.size() - 1)); }
+        ++done[c.token];
+    };
+    for (int step = 0; step < 40'000; ++step) {
+        const uint64_t a = next() % 10;
+        if (a < 4) {
+            const uint32_t n = (next() & 3) == 0 ? 2 + static_cast<uint32_t>(next() % (nMax - 1)) : 1;
+            const uint32_t resv = batchCompletionBytes(true, n);
+            if (cq.reserve(resv) != OpResult::Accepted) continue;
+            ops.push_back({n, resv});
+            done.push_back(0);
+            undelivered.push_back(ops.size() - 1);
+        } else if (a < 7) {
+            if (undelivered.empty()) continue;
+            const std::size_t i = next() % undelivered.size();
+            const Token t = undelivered[i];
+            undelivered[i] = undelivered.back();
+            undelivered.pop_back();
+            ASSERT_TRUE(deliver(cq, t, ops[t].resv, ops[t].n > 1 ? 8u * ops[t].n : 0u)) << "step " << step;
+            inFlight.push_back(t);
+        } else if (a < 9) {
+            if (inFlight.empty()) continue;
+            const std::size_t i = next() % inFlight.size();
+            const Token t = inFlight[i];
+            inFlight[i] = inFlight.back();
+            inFlight.pop_back();
+            ASSERT_EQ(cq.waitFor(t, 0ns, check), Completions::Wait::Done) << "step " << step;
+        } else {
+            (void)cq.poll([&](const Completion& c, std::span<const uint8_t> p) {
+                check(c, p);
+                for (std::size_t k = 0; k < inFlight.size(); ++k)
+                    if (inFlight[k] == c.token) { inFlight[k] = inFlight.back(); inFlight.pop_back(); break; }
+            }, 1 + static_cast<int>(next() % 4));
+        }
+        ASSERT_EQ(cq.ring().lostCompletions(), 0u) << "step " << step;
+    }
+    for (const Token t : undelivered) ASSERT_TRUE(deliver(cq, t, ops[t].resv, ops[t].n > 1 ? 8u * ops[t].n : 0u));
+    while (cq.poll(check) > 0) {}
+    for (Token t = 1; t < ops.size(); ++t) ASSERT_EQ(done[t], 1) << "token " << t;
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    EXPECT_EQ(cq.outstanding(), 0u);
+}
+
+// The single-owner contract lets a poll() handler issue the NEXT op (reserve, then hand it to the duty side) — the usual
+// pipelined loop.  The credit of a completion returns the moment its handler runs, but the ring's head only moves when the
+// whole read batch ends, so a duty thread that delivers the new op's completion inside that window meets a ring fuller than
+// the credit says.  Here the "duty side" delivers inside the handler (what a fast duty thread does in Thread mode).
+// URGENT break found by the batch 1 adversarial pass (lost completion -> its op never completes): Completions::poll and
+// waitFor return a record's credit inside the ring read, before OneToOneRingBuffer::read publishes the head.  DISABLED until
+// that fix lands; the fix enables it.
+TEST(CompletionsAdversarialRegression, DISABLED_PollHandlerThatReissuesNeverLosesACompletionAdversarialRegression) {
+    Completions cq(smallCfg(1024, 88, 64));   // M = 136: 18 outstanding 48-byte ops fill the credit
+    Token next = 0;
+    std::vector<int> times(64, 0);
+    while (cq.reserve(48) == OpResult::Accepted) ASSERT_TRUE(deliver(cq, next++, 48, 0));
+    const Token first = next;
+    ASSERT_EQ(first, 18u);
+    std::function<void(const Completion&, std::span<const uint8_t>)> onDone;
+    onDone = [&](const Completion& c, std::span<const uint8_t>) {
+        ++times[c.token];
+        if (next < times.size() && cq.reserve(48) == OpResult::Accepted) {   // reissue: the credit says there is room
+            (void)deliver(cq, next++, 48, 0);
+        }
+    };
+    for (int pass = 0; pass < 100 && !(cq.outstanding() == 0 && next == times.size()); ++pass) cq.poll(onDone);
+    EXPECT_EQ(cq.ring().lostCompletions(), 0u) << "a reserved completion was refused by the ring: it is lost, its op never completes";
+    for (Token t = 0; t < next; ++t) EXPECT_EQ(times[t], 1) << "token " << t;
+    EXPECT_EQ(cq.outstanding(), 0u) << "a lost completion leaves its op outstanding forever";
 }

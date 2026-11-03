@@ -3476,4 +3476,34 @@ TEST(NodeConfigRegression, MsKnobsAboveThirtyDaysAreRefusedRegression) {
     }
 }
 
+// Batch 1 adversarial pass, #803 sibling class: the ms knobs #803 did not route through the 30-day cap.  RUNE_CONTROLLED_SHUTDOWN_MS
+// becomes std::chrono::milliseconds that BrokerNode::controlledShutdown adds to a steady_clock (ns) time point, and
+// RUNE_NS_DEFAULT_MAX_TXN_TIME_MS is multiplied by 1'000'000 in TransactionCoordinator::doWork; above the cap both overflow.
+// Kept out of the suite until the issue is fixed (#837).
+TEST(NodeConfigRegression, DISABLED_UncappedMsKnobsAboveThirtyDaysAreRefusedAdversarialRegression) {
+    constexpr int64_t kCap = NodeConfig::kMaxDurationMs;
+    for (const char* var : {"RUNE_CONTROLLED_SHUTDOWN_MS", "RUNE_NS_DEFAULT_MAX_TXN_TIME_MS"}) {
+        SCOPED_TRACE(var);
+        auto withValue = [&](const std::string& v) {
+            auto env = base3node();
+            env[var] = v;
+            return parseNodeConfig(fakeEnv(env));
+        };
+        const auto ok = withValue(std::to_string(kCap));
+        ASSERT_TRUE(ok.error.empty()) << ok.error;
+        for (const char* bad : {"2592000001", "9223372036854775807"}) {
+            const auto r = withValue(bad);
+            EXPECT_FALSE(r.error.empty()) << bad << " was accepted";
+            EXPECT_NE(r.error.find(var), std::string::npos) << r.error;
+        }
+    }
+    // RUNE_PRODUCER_ID_EXPIRATION_MS is parsed with strtoll and no end check: trailing garbage and ERANGE are accepted silently.
+    for (const char* bad : {"5000abc", "99999999999999999999"}) {
+        auto env = base3node();
+        env["RUNE_PRODUCER_ID_EXPIRATION_MS"] = bad;
+        const auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.error.empty()) << "RUNE_PRODUCER_ID_EXPIRATION_MS=" << bad << " was accepted";
+    }
+}
+
 } // namespace rune::node

@@ -402,3 +402,76 @@ TEST(CheckedWritesVerdictAckRigRegression, ViewAckAfterTheJudgeIsErasedStillCarr
     EXPECT_TRUE(a->hasVerdicts) << "the rejection must not be dropped from the ack";
     EXPECT_EQ(a->verdicts, (V{{1, kCode, kCid}}));
 }
+
+// Batch 1 adversarial pass (judge erasure, fdcc3c26): the public path to an ack whose partition stopped being a verdict source
+// with rejections still in its range.  A View batch is produced and judged (record 1 rejected); then the last verdict view is
+// dropped and the judge erased; then the SAME batch is retried (an idempotent replay inside the dedupe window).  The replay must
+// report the original rejection from the rejected index, never "code 0, no trailer" (a rejected record reported as accepted),
+// and must append nothing.  A second partition-mate batch produced after the drop has no rejections and an empty trailer.
+TEST_F(CheckedWritesVerdictAckRegression, ReplayAfterTheJudgeIsErasedReportsTheOriginalRejectionAdversarialRegression) {
+    const int64_t c1 = r.produceFrame({{1, 1, 1}, {2, 2, 9}, {3, 3, 1}}, kAcksView, /*pid=*/700, /*seq=*/0);
+    const auto first = r.ack(c1);
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->code, 0);
+    ASSERT_EQ(first->verdicts, (V{{1, kCode, kCid}}));
+    r.settle(150);   // the marker committing the verdicts is written
+
+    r.dropRejectView(kRej);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(20);
+    ASSERT_EQ(r.vs->verdictSource(VerdictRig::kSrc, 0), nullptr) << "the judge is erased";
+    ASSERT_NE(r.writeState(), nullptr);
+    ASSERT_FALSE(r.writeState()->isVerdictSource());
+
+    const int64_t leoBefore = r.leo();
+    const int64_t c2 = r.produceFrame({{1, 1, 1}, {2, 2, 9}, {3, 3, 1}}, kAcksView, 700, 0);
+    const auto again = r.ack(c2, 3000);
+    ASSERT_TRUE(again);
+    EXPECT_EQ(again->code, 0);
+    EXPECT_EQ(again->baseOffset, first->baseOffset);
+    EXPECT_TRUE(again->hasVerdicts) << "the replay of a batch with a rejected record must carry its trailer";
+    EXPECT_EQ(again->verdicts, first->verdicts) << "the original rejection, from the rejected index";
+    EXPECT_EQ(r.leo(), leoBefore) << "a replay appends nothing";
+
+    const int64_t c3 = r.produceFrame({{4, 4, 9}}, kAcksView, 701, 0);   // tag 9: no view rejects it any more
+    const auto fresh = r.ack(c3, 3000);
+    ASSERT_TRUE(fresh);
+    EXPECT_EQ(fresh->code, 0);
+    EXPECT_TRUE(fresh->verdicts.empty());
+}
+
+// The same replay across a restart and across a failover (this node's tail above the HW cut): the rejected index is rebuilt from
+// the kept marker, the judge is erased after the reboot, and the retried batch still reports its original rejection.
+TEST(CheckedWritesVerdictAckRigRegression, ReplayAfterRestartAndJudgeErasureReportsTheOriginalRejectionAdversarialRegression) {
+    for (const bool failover : {false, true}) {
+        SCOPED_TRACE(failover ? "failover" : "restart");
+        VerdictRig o;
+        o.typed();
+        o.installRejectView(kRej, kObj, tagRule(9));
+        o.enableAcks();
+        o.passes(60);
+        const int64_t c1 = o.produceFrame({{1, 1, 9}, {2, 2, 1}}, kAcksView, /*pid=*/800, /*seq=*/0);
+        const auto first = o.ack(c1);
+        ASSERT_TRUE(first);
+        ASSERT_EQ(first->verdicts, (V{{0, kCode, kCid}}));
+        o.settle(150);   // the marker is written and committed
+
+        if (failover) o.failover(); else o.restart();
+        o.enableAcks();
+        o.passes(60);
+        o.dropRejectView(kRej);
+        ASSERT_TRUE(o.driveUntilJudged());
+        o.passes(20);
+        ASSERT_EQ(o.vs->verdictSource(VerdictRig::kSrc, 0), nullptr) << "the judge is erased after the reboot";
+
+        const int64_t leoBefore = o.leo();
+        const int64_t c2 = o.produceFrame({{1, 1, 9}, {2, 2, 1}}, kAcksView, 800, 0);
+        const auto again = o.ack(c2, 3000);
+        ASSERT_TRUE(again);
+        EXPECT_EQ(again->code, 0) << "the dedupe state survives the reboot: an in-window replay";
+        EXPECT_EQ(again->baseOffset, first->baseOffset);
+        EXPECT_TRUE(again->hasVerdicts) << "a replay of a batch with a rejected record must carry its trailer";
+        EXPECT_EQ(again->verdicts, first->verdicts);
+        EXPECT_EQ(o.leo(), leoBefore) << "a replay appends nothing";
+    }
+}
