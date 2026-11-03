@@ -848,7 +848,7 @@ rc::ClientConfig sweepCfg(int n) {
     c.gatewayStreamId = 4260;
     c.egressChannel   = "aeron:ipc";
     c.egressStreamId  = 4261;
-    c.dataDir   = "/dev/shm/ctor_oom_" + std::to_string(::getpid()) + "_" + std::to_string(n);
+    c.dataDir   = std::filesystem::temp_directory_path().string() + "/ctor_oom_" + std::to_string(::getpid()) + "_" + std::to_string(n);
     c.runnerMode = rc::RunnerMode::Invoker;
     c.nanoClock  = &sweepNow;
     rc::TopicSpec ts;
