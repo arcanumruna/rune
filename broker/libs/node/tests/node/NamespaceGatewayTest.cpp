@@ -417,3 +417,31 @@ TEST(NamespaceGatewayRegression, OwnPasswordQualifiedNameAdversarialRegression) 
                                pc::UserChangeKind::SetPassword, "alice-new-pass-3");
     EXPECT_NE(foreign.errorCode, kOk) << foreign.detail;
 }
+
+// #639 (won't-fix, lead D2): the requestId dedupe is global across namespaces, but the request fingerprint includes
+// the namespace, so a colliding id from another tenant is refused as "requestId reused" and never answered with the
+// first tenant's result.  Pins the no-leak property.
+TEST(NamespaceGatewayRegression, CrossNamespaceRequestIdReuseNeverLeaksResultRegression) {
+    NsGw g;
+    AuthRig& r = g.r;
+    const std::vector<AuthGrant> mk = {exact(SO::Create, ST::Topic, "t")};
+    r.broker().createUser("alpha/ta", AuthRig::kPw, mk);
+    r.broker().createUser("bravo/tb", AuthRig::kPw, mk);
+    const int64_t sa = r.login("alpha/ta");
+    const int64_t sb = r.login("bravo/tb");
+    const rune::protocol::RequestId rid{0x639, 0x639};
+    const auto send = [&](int64_t sid) {
+        return r.c().awaitAnyDdlAnswer(
+            r.c().sendDefineTopic(r.ch(), r.stream(), sid, "t", 1, authRigCharBlob(), 0, rid, 0, authRigTopicConfig()),
+            AuthRig::dl(20));
+    };
+    const auto a = send(sa);
+    ASSERT_TRUE(a.has_value());
+    ASSERT_EQ(a->code, kOk) << a->message;
+    const auto b = send(sb);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(b->code, 39) << "bravo's colliding requestId must be refused, never answered with alpha's result";
+    EXPECT_NE(b->message.find("requestId reused"), std::string::npos) << b->message;
+    EXPECT_EQ(r.defineTopic(g.root, "alpha/t"), -1) << "alpha's topic exists";
+    EXPECT_GE(r.defineTopic(g.root, "bravo/t"), 0) << "bravo has no topic t (the refused request created nothing)";
+}
