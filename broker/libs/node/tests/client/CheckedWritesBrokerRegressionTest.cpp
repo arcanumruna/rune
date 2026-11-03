@@ -1255,7 +1255,7 @@ KiAccount acct(uint64_t id, std::string name = "alice", int64_t n = 0) { return 
 
 std::vector<uint8_t> encoded(const KiAccount& a) {
     std::vector<uint8_t> out(a.encodedSize());
-    a.encode(out.data());
+    (void)a.encode(out.data());
     return out;
 }
 
@@ -1486,11 +1486,6 @@ struct KeyRec {
         return r;
     }
 };
-
-/// Cleaner cycles done on `n` so far.
-uint64_t cleanerCycles(BrokerNode& n) {
-    return n.onCleanerThreadForTest([&n] { return n.cleanerForTest()->cyclesDoneForTest(); });
-}
 
 template <class K>
 void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& name, bool keyIndex) {
