@@ -576,10 +576,15 @@ bool TransactionCoordinator::nsOpenTxnsAtLimit_(const TransactionalId& txnId) co
     const uint32_t nsId = rune::coordination::parseScopedId(txnId).nsId;
     const auto it = nsTxnLimits_.find(nsId);
     if (it == nsTxnLimits_.end() || it->second.maxOpenTxns == 0) return false;
+    return openTxnsOfNamespace(nsId) >= it->second.maxOpenTxns;
+}
+
+uint64_t TransactionCoordinator::openTxnsOfNamespace(uint32_t nsId) const
+{
     uint64_t open = 0;
     for (const auto& [id, meta] : txnMap_)
         if (meta.state == TxnState::Ongoing && rune::coordination::parseScopedId(id).nsId == nsId) ++open;
-    return open >= it->second.maxOpenTxns;
+    return open;
 }
 
 // The coordinator's own abort of an Ongoing transaction (timeout, namespace suspend / delete): PrepareAbort, the

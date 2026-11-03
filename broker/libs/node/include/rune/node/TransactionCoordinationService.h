@@ -202,6 +202,7 @@ public:
     uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs) override;
     uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs) override;
     void setNamespaceTxnGate(uint32_t nsId, bool blocked) override;   ///< #661
+    [[nodiscard]] uint64_t openTxnsOfNamespace(uint32_t nsId) const override { return coordinator_.openTxnsOfNamespace(nsId); }   ///< #696
     void setNamespaceTxnLimits(uint32_t nsId, uint64_t maxOpenTxns, uint64_t maxTxnTimeMs) override {
         coordinator_.setNamespaceTxnLimits(nsId, maxOpenTxns, maxTxnTimeMs);
     }

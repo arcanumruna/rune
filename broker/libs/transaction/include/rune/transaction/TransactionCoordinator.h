@@ -600,6 +600,10 @@ public:
     /// unsettled).  Cold; no persistence (the caller tombstones the durable records).  Returns the count erased.
     uint32_t eraseNamespace(uint32_t nsId);
 
+    /// #696: the Ongoing transactions of namespace `nsId` (the count nsOpenTxnsAtLimit_ checks maxOpenTxns against).
+    /// Cold scan.
+    [[nodiscard]] uint64_t openTxnsOfNamespace(uint32_t nsId) const;
+
     /// Number of known transactionalIds.
     [[nodiscard]] std::size_t size() const noexcept { return txnMap_.size(); }
 

@@ -10240,8 +10240,9 @@ void ClientGateway::handleListNamespaces(const uint8_t* buf, std::size_t len)
 // gateway's own connection counts, and the live object counts of its ObjectIndex / TopicRegistry (the catalog's effects).
 // Usage is per NODE, like every limit enforcement input (D24).  Authorization: a cluster admin, or a session of the namespace
 // itself holding DESCRIBE (or ADMIN) ON NAMESPACE "<name>"; a foreign / unknown name is NotAuthorized for everyone else (the
-// answer never says whether the namespace exists).  Fields with no usage meaning here (schemas, schema versions, groups, users,
-// message / batch / retention, open transactions, txn time, replication, acks, features) read 0 = n/a.
+// answer never says whether the namespace exists).  Fields with no usage meaning here (message / batch / retention, txn time,
+// replication, acks, features) read 0 = n/a.  Schemas and versions come from the gateway's schema registry, groups, users and
+// open transactions from their owners (the group / transaction coordinator is loaded on one node: 0 elsewhere).
 void ClientGateway::handleNamespaceUsage(const uint8_t* buf, std::size_t len)
 {
     auto msgOpt = pc::NamespaceUsageRequest::decode(buf, len);
@@ -10287,11 +10288,15 @@ void ClientGateway::handleNamespaceUsage(const uint8_t* buf, std::size_t len)
     r.limits        = rec->limits;
     auto& u = r.usage;
     // Catalog counts: the live objects of the namespace on this node's index.
-    uint64_t topics = 0, partitionsTotal = 0, partitionsMax = 0, views = 0;
+    uint64_t topics = 0, partitionsTotal = 0, partitionsMax = 0, views = 0, schemas = 0, schemaVersionMax = 0;
     objectIndex_.forEachInNs(rec->nsId, [&](int32_t id, const rune::gateway::ObjectEntry& e) {
         if (e.type == rune::security::ResourceType::View) { ++views; return; }
         if (e.type != rune::security::ResourceType::Topic) return;
         ++topics;
+        if (const rune::codec::FilterSchema* fs = filterSchemas_.find(id); fs != nullptr) {   // #696: a typed topic is one schema
+            ++schemas;
+            schemaVersionMax = std::max<uint64_t>(schemaVersionMax, fs->maxVersion());
+        }
         if (topicRegistry_ != nullptr)
             if (const rune::node::TopicSpec* t = topicRegistry_->topic(id); t != nullptr && t->partitionCount > 0) {
                 partitionsTotal += static_cast<uint64_t>(t->partitionCount);
@@ -10299,6 +10304,13 @@ void ClientGateway::handleNamespaceUsage(const uint8_t* buf, std::size_t len)
             }
     });
     u[0] = topics; u[1] = partitionsMax; u[2] = partitionsTotal; u[3] = views;
+    u[4] = schemas; u[5] = schemaVersionMax;
+    // #696: groups / users / open transactions come from the owner of the count their limit check reads (per node, D24: the
+    // groups and transactions are non-zero only where the coordinator is).
+    if (groupService_ != nullptr) u[6] = groupService_->groupsOfNamespace(rec->nsId);
+    if (securityView_ != nullptr)
+        for (const auto& [uid, usr] : securityView_->state().users()) if (usr.nsId == rec->nsId) ++u[7];
+    if (txnService_ != nullptr) u[21] = txnService_->openTxnsOfNamespace(rec->nsId);
     // The slot's counters: the aggregator's last totals / rates, and this gateway's connections.
     const uint16_t slot = nsSlots_.slotOf(rec->nsId);
     if (slot != rune::node::kNoNsSlot) {

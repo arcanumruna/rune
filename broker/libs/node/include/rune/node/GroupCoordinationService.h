@@ -283,6 +283,7 @@ public:
     [[nodiscard]] std::optional<std::size_t> liveKeysOfNamespaceForTest(uint32_t nsId) const;   ///< nullopt = unknown (not loaded / not the coordinator)
     /// Issue #212: the session was revoked (terminal) - every member tracked on it leaves its group now (cold).
     void removeSessionMembers(int64_t sessionId, int64_t nowNs) override;
+    [[nodiscard]] uint64_t groupsOfNamespace(uint32_t nsId) const override;   ///< #696
     /// No-hang fix round 5 (N23): only the request's (group, member) on `sessionId`
     /// (memberId empty: this session's members of that group).  Cold.
     void evictMember(std::string_view groupId, std::string_view memberId, int64_t sessionId,

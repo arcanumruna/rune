@@ -202,8 +202,10 @@ enforced, each with one precise code:
   node produces in about one report interval plus one aggregator tick before the throttle arrives; the rate debt carries
   the excess forward and the long-run rate converges on the limit. A rate limit never makes a follower refuse a replicated
   batch, so `acks=all` never stalls on it.
-- `rune namespace usage <name>` prints each limit next to its current usage on the node it asks (counts, disk, view
-  memory, connections and rates; fields with no usage meaning print `-`).
+- `rune namespace usage <name>` prints each limit next to its current usage on the node it asks (counts including
+  schemas, the highest schema version, groups, users and open transactions, disk, view memory, connections and rates;
+  fields with no usage meaning print `-`). Usage is per node: groups and open transactions are non-zero only on the node
+  whose group and transaction coordinator is loaded.
 - Anonymous sessions have their own caps: `RUNE_ANONYMOUS_MAX_CONNECTIONS` (default 16) and
   `RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC` (default 1000).
 

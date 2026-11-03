@@ -721,8 +721,7 @@ size_t GroupCoordinationService::handleJoinGroup(
     if (ctx.reg != nullptr && coordinators_.find(groupIdStr) == coordinators_.end()) {
         const uint32_t gns = rune::coordination::parseScopedId(groupIdStr).nsId;
         if (const auto* nsr = ctx.reg->byId(gns); nsr != nullptr && nsr->limits.maxGroups != 0) {
-            uint64_t have = 0;
-            for (const auto& [id, c] : coordinators_) if (rune::coordination::parseScopedId(id).nsId == gns) ++have;
+            const uint64_t have = groupsOfNamespace(gns);
             if (have >= nsr->limits.maxGroups)
                 return refuseJoin("namespace limit exceeded: groups (" + std::to_string(have) + " of " +
                                   std::to_string(nsr->limits.maxGroups) + ")", true);
@@ -2018,3 +2017,11 @@ rune::protocol::client::ErrorCode GroupCoordinationService::checkTxnOffsetMember
     return generationId == it->second.generationId() ? EC::OK : EC::IllegalGeneration;
 }
 }  // namespace rune::node
+
+// #696: the count the maxGroups check at a group's first join and `NamespaceUsage` both read.
+uint64_t rune::node::GroupCoordinationService::groupsOfNamespace(uint32_t nsId) const
+{
+    uint64_t have = 0;
+    for (const auto& [id, c] : coordinators_) if (rune::coordination::parseScopedId(id).nsId == nsId) ++have;
+    return have;
+}

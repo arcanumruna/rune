@@ -120,6 +120,10 @@ struct ITxnRequestHandler {
     // cold.  Default: ignored.
     virtual void setNamespaceTxnGate(uint32_t /*nsId*/, bool /*blocked*/) {}
 
+    // #696: the Ongoing transactions of namespace `nsId` on this node's coordinator (the count its maxOpenTxns limit checks).
+    // 0 when the coordinator is not loaded here (usage is per node, D24).  Control thread, cold.  Default: 0.
+    [[nodiscard]] virtual uint64_t openTxnsOfNamespace(uint32_t /*nsId*/) const { return 0; }
+
     // F15-FU1 (#112, KIP-890 part 1): may a transactional data batch of (producerId,
     // producerEpoch) open a transaction on (topicId, partition)?  Asked by a partition
     // leader for the first such batch of a producer with no open transaction there.
