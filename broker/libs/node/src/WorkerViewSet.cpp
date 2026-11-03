@@ -916,16 +916,19 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
         const int64_t r = judge.requestChange(desired);
         if (r == VerdictSource::kChangeDeferred) return 0;   // not yet bound or activated: ask again next pass
         work = r >= 0 ? 1 : 0;
-        // #791 diagnostics (cold: only when the logged set differs from what the installed views want).
-        const auto d = judge.diagSnapshot();
-        spdlog::warn("constraint set sync: topic {} partition {}: logged set {} ({} members) -> wanted {} members, change at offset {} (result {}), "
-                     "leader generation {}", srcTopicId, judge.partition(), logged.id, logged.count, desired.count, write.constraintSets.lastChangeOffset(),
-                     r, d.leaderGeneration);
-        for (uint8_t i = 0; i < logged.count; ++i) {
-            static constexpr const char* kWhy[] = {"live", "replaced", "gone", "kept (plan not installed here)"};
-            spdlog::warn("constraint set sync: topic {} partition {}: member object {} fingerprint {}: {}{}", srcTopicId, judge.partition(),
-                         logged.members[i].viewObjectId, logged.members[i].planFingerprint, kWhy[why[i]],
-                         why[i] == 1 ? " by fingerprint " + std::to_string(replacedBy[i]) : std::string());
+        // #791 diagnostics (cold: only when the logged set differs from what the installed views want).  A legitimate change logs
+        // here too, so it is debug detail; the strings are built only when debug is on.
+        if (spdlog::should_log(spdlog::level::debug)) {
+            const auto d = judge.diagSnapshot();
+            spdlog::debug("constraint set sync: topic {} partition {}: logged set {} ({} members) -> wanted {} members, change at offset {} (result {}), "
+                          "leader generation {}", srcTopicId, judge.partition(), logged.id, logged.count, desired.count, write.constraintSets.lastChangeOffset(),
+                          r, d.leaderGeneration);
+            for (uint8_t i = 0; i < logged.count; ++i) {
+                static constexpr const char* kWhy[] = {"live", "replaced", "gone", "kept (plan not installed here)"};
+                spdlog::debug("constraint set sync: topic {} partition {}: member object {} fingerprint {}: {}{}", srcTopicId, judge.partition(),
+                              logged.members[i].viewObjectId, logged.members[i].planFingerprint, kWhy[why[i]],
+                              why[i] == 1 ? " by fingerprint " + std::to_string(replacedBy[i]) : std::string());
+            }
         }
     }
     judge.constraintSyncEpoch = verdictEpoch_;
