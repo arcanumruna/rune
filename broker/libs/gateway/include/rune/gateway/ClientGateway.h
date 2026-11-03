@@ -520,10 +520,10 @@ public:
     }
     /// Issue #189 test seam (control thread): forget every login-throttle entry (no allocation).
     void resetLoginThrottleForTest() noexcept { loginThrottle_.clear(); }
+    void setAdvertisedBrokerVersionForTest(int32_t v) noexcept { advertisedBrokerVersion_ = v; }   ///< 0 = kBrokerVersion
     /// Issues #188 / #5 test seam (control thread): while held, pending record-egress resolves are not polled (a
     /// Subscribe stays AwaitingEgress).  Releasing restarts every pending resolve's timeout clock at now, so a held
     /// resolve never times out to the fallback.
-    void setAdvertisedBrokerVersionForTest(int32_t v) noexcept { advertisedBrokerVersion_ = v; }   ///< 0 = kBrokerVersion
     void holdRecordEgressResolveForTest(bool on) noexcept {
         holdRecordEgressResolve_ = on;
         if (!on) for (auto& [key, pend] : pendingRecordEgress_) pend.requestedAtNs = nowNs_;

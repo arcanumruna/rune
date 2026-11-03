@@ -3,10 +3,13 @@
 // the test thread would race the worker).
 #include "client/OneBroker.h"
 #include "client/CheckedWritesBrokerSupport.h"
+#include "client/support/KeyIndexRecords.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -69,6 +72,7 @@ TEST(CheckedWritesBrokerRegression, DroppedWhileAwaitingSpecNeverBuildsRegressio
 #include "support/ShardTestClient.h"
 
 #include <rune/cli/Cli.h>
+#include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
 
@@ -1224,13 +1228,6 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
 // ===========================================================================================================
 // Part 05: write intents and the key index on real brokers.
 // ===========================================================================================================
-#include "client/support/KeyIndexRecords.h"
-
-#include <rune/protocol/client/SchemaMessages.h>
-
-#include <array>
-#include <cstring>
-
 namespace {
 
 namespace pc = rune::protocol::client;
@@ -1268,10 +1265,10 @@ struct KiWriter {
     rc::TypedTopic<KiAccount, rc::ProducerRef>     topic;
 
     static rc::ProducerConfig config(rc::Acks acks) {
-        rc::ProducerConfig pc;
-        pc.acks     = acks;
-        pc.lingerUs = 1;
-        return pc;
+        rc::ProducerConfig cfg;
+        cfg.acks     = acks;
+        cfg.lingerUs = 1;
+        return cfg;
     }
     KiWriter(rc::Client& c, const std::string& name, rc::Acks acks = kAllView)
         : prod(c.producer(config(acks))), topic(c.openTopicAndWait<KiAccount>(name, prod, 30s)) {}
@@ -1319,6 +1316,18 @@ private:
     std::vector<rc::Subscription> subs_;
 };
 
+/// A scratch directory removed on every exit path.
+struct ScratchDir {
+    std::filesystem::path path;
+    explicit ScratchDir(const std::string& tag) : path(std::filesystem::temp_directory_path() / ("rune_" + tag + "_" + std::to_string(::getpid()))) {
+        std::filesystem::create_directories(path);
+    }
+    ~ScratchDir() {
+        std::error_code ignore;
+        std::filesystem::remove_all(path, ignore);
+    }
+};
+
 /// Everything stored on a topic, over all partitions.
 std::size_t storedTotal(BrokerNode& n, int32_t topicId, int32_t parts) {
     std::size_t total = 0;
@@ -1336,28 +1345,39 @@ TEST(CheckedWritesBrokerRegression, TypedIntentsEndToEndShardRegression) {
     const auto t  = defineKi(c, "ki");
     ASSERT_EQ(t.errorCode, 0) << t.detail;
     KiWriter w(c, "ki");
-    const int32_t part = rc::Key(uint64_t{1}).partition(kKiParts);
     Collector col;
-    col.subscribe(c, rc::TopicHandle{t.topicId, kKiParts}, part);
+    col.subscribeAll(c, rc::TopicHandle{t.topicId, kKiParts});
 
-    const auto first = w.topic.insertAndWait(acct(1, "alice"));
-    EXPECT_TRUE(first.ok());
-    EXPECT_GE(first.offset(), 0);
+    std::set<std::pair<int32_t, int64_t>> accepted;
+    const auto accept = [&](const rc::WriteResult& r, uint64_t id) {
+        EXPECT_TRUE(r.ok());
+        EXPECT_GE(r.offset(), 0);
+        accepted.emplace(rc::Key(id).partition(kKiParts), r.offset());
+    };
+    accept(w.topic.insertAndWait(acct(1, "alice")), 1);
     auto r = w.topic.insertAndWait(acct(1, "alice"));
     EXPECT_EQ(r.status(), rc::OpStatus::BrokerError);
     EXPECT_EQ(r.code(), kKeyExists);
     r = w.topic.updateAndWait(acct(2, "bob"));
     EXPECT_EQ(r.code(), kKeyNotFound);
-    EXPECT_TRUE(w.topic.removeExistingAndWait(uint64_t{1}).ok());
+    accept(w.topic.removeExistingAndWait(uint64_t{1}), 1);
     EXPECT_EQ(w.topic.removeExistingAndWait(uint64_t{1}).code(), kKeyNotFound);
-    EXPECT_TRUE(w.topic.removeAndWait(uint64_t{1}).ok());
-    EXPECT_TRUE(w.topic.insertAndWait(acct(1, "alice2")).ok());
+    accept(w.topic.removeAndWait(uint64_t{1}), 1);
+    accept(w.topic.insertAndWait(acct(1, "alice2")), 1);
+    // Id 2 closes the cell: its accepted insert is delivered after the rejected update of id 2, on the same partition.
+    accept(w.topic.insertAndWait(acct(2, "bob")), 2);
 
-    ASSERT_TRUE(waitFor([&] { return col.count() >= 4; }, 10s)) << "the subscription delivers the accepted records";
+    ASSERT_TRUE(waitFor([&] { return col.count() >= accepted.size(); }, 10s)) << "the subscriptions deliver the accepted records";
     const std::vector<Seen> seen = col.seen();
-    ASSERT_EQ(seen.size(), 4u);
-    const rc::RecordOp want[] = {rc::RecordOp::Insert, rc::RecordOp::Delete, rc::RecordOp::Delete, rc::RecordOp::Insert};
-    for (std::size_t i = 0; i < 4; ++i) EXPECT_EQ(seen[i].op, want[i]) << "record " << i;
+    std::set<std::pair<int32_t, int64_t>> delivered;
+    for (const Seen& s : seen) delivered.emplace(s.partition, s.offset);
+    EXPECT_EQ(seen.size(), accepted.size());
+    EXPECT_TRUE(delivered == accepted) << "exactly the accepted records are delivered, no rejected one";
+    std::vector<rc::RecordOp> ops;
+    for (const Seen& s : seen)
+        if (s.partition == rc::Key(uint64_t{1}).partition(kKiParts) && s.key == le(1, 8)) ops.push_back(s.op);
+    const std::vector<rc::RecordOp> want = {rc::RecordOp::Insert, rc::RecordOp::Delete, rc::RecordOp::Delete, rc::RecordOp::Insert};
+    EXPECT_TRUE(ops == want);
 }
 
 TEST(CheckedWritesBrokerRegression, KeyIndexDdlRefusalsShardRegression) {
@@ -1383,11 +1403,10 @@ TEST(CheckedWritesBrokerRegression, KeyIndexDdlRefusalsShardRegression) {
     expectRefused(c.defineTopicAndWait("autoinc", 1, "id", blob, rc::Persistence::Disk, autoInc, {}, 30s), "autoincrement is not supported by this broker yet");
 
     // A key-feature block with an unknown flag bit does not decode: the gateway rejects the frame as InvalidSchema ("DefineTopic body undecodable" in its log).
-    namespace fs = std::filesystem;
-    const fs::path dir = fs::temp_directory_path() / ("rune_cwkiddl_" + std::to_string(::getpid()));
-    fs::create_directories(dir);
+    // The ErrorResponse carries no message (encodeRejection has none), so only the code is asserted.
+    const ScratchDir dir("cwkiddl");
     {
-        ShardTestClient client(dir / "aeron");
+        ShardTestClient client(dir.path / "aeron");
         const int64_t sid = client.connect(b.clientChannel(), 110);
         ASSERT_GT(sid, 0);
         pc::DefineTopic m;
@@ -1412,8 +1431,6 @@ TEST(CheckedWritesBrokerRegression, KeyIndexDdlRefusalsShardRegression) {
         ASSERT_TRUE(answer.has_value());
         EXPECT_EQ(answer->code, static_cast<int16_t>(pc::ErrorCode::InvalidSchema));
     }
-    std::error_code ignore;
-    fs::remove_all(dir, ignore);
 }
 
 namespace {
@@ -1512,26 +1529,24 @@ void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& na
         if (s.tombstone) got.emplace(s.partition, s.key);
     EXPECT_TRUE(got == tombstones) << "every tombstone sits on the partition of its record with the same key bytes";
 
-    // The cleaner never touches the active segment, and segments roll as the provisioner supplies them: more tombstones
-    // of the same dead keys push the earlier ones into sealed segments, where each drops the value it supersedes.
-    const uint64_t cycles = cleanerCycles(b.node());
-    EXPECT_TRUE(waitFor([&] { return cleanerCycles(b.node()) >= cycles + 3; }, 10s));
+    // The cleaner skips the active segment: one tombstone per partition for a key that was never written (the segment is
+    // past its 256 bytes, so the next append rolls it once the provisioner has a segment ready) seals the real tombstones.
+    std::array<Rec, kKiParts> fillers;
+    for (int32_t p = 0, i = 1000; p < kKiParts; ++i) {
+        const Rec rec = Rec::make(i);
+        if (rec.routeKey().partition(kKiParts) == p) fillers[static_cast<std::size_t>(p++)] = rec;
+    }
     const auto live = [&] {
         std::size_t values = 0;
         for (int32_t p = 0; p < kKiParts; ++p)
             for (const std::string& v : storedValues(b.node(), t.topicId, p)) values += v.empty() ? 0 : 1;
         return values;
     };
-    std::size_t left = live();
-    for (int round = 0; round < 100 && left > 0; ++round) {
-        for (int i = 0; i < kRecords; ++i) {
-            topic.remove(Rec::make(i).key());
-            prod.flush();
-        }
-        std::this_thread::sleep_for(100ms);
-        left = live();
-    }
-    EXPECT_EQ(left, 0u) << "keys are still live after the cleaner pass";
+    ASSERT_TRUE(waitFor([&] {
+        for (const Rec& f : fillers) topic.remove(f.key());
+        prod.flush();
+        return live() == 0;
+    }, 10s)) << live() << " keys are still live after the cleaner pass";
     prod.closeImmediately();
 }
 
@@ -1597,11 +1612,9 @@ TEST(CheckedWritesKeyIndexRegression, RawIntentShapesAreRefusedOrOpaqueRegressio
     EXPECT_EQ(reserved.status, rc::OpStatus::BrokerError);
     EXPECT_EQ(reserved.errorCode, kInvalidRequest) << "attributes 3 is a reserved shape";
     {
-        namespace fs = std::filesystem;
-        const fs::path dir = fs::temp_directory_path() / ("rune_cwkiraw_" + std::to_string(::getpid()));
-        fs::create_directories(dir);
+        const ScratchDir dir("cwkiraw");
         {
-            ShardTestClient client(dir / "aeron");
+            ShardTestClient client(dir.path / "aeron");
             const int64_t sid = client.connect(b.clientChannel(), 110);
             ASSERT_GT(sid, 0);
             // The client refuses an empty insert itself, so the frame is built by hand.
@@ -1614,8 +1627,6 @@ TEST(CheckedWritesKeyIndexRegression, RawIntentShapesAreRefusedOrOpaqueRegressio
             ASSERT_TRUE(ack.has_value());
             EXPECT_EQ(ack->errorCode, static_cast<int16_t>(kInvalidRequest)) << "an insert tombstone is a reserved shape";
         }
-        std::error_code ignore;
-        fs::remove_all(dir, ignore);
     }
     EXPECT_EQ(storedTotal(b.node(), ki.topicId, kKiParts), 0u) << "neither refused record was stored";
 
@@ -1738,7 +1749,8 @@ TEST(CheckedWritesBrokerRegression, LoginRaceOnAKeyIndexThreeNodesRegression) {
     ASSERT_FALSE(HasFatalFailure());
     expectKeyExists(c, alive[0], 1, 400);
 
-    // Leadership moves off every node in turn: each takeover rebuilds the index from the log.
+    // Leadership moves off every node in turn: each takeover rebuilds the index from the log.  The cell does not
+    // assert which node takes each partition over.
     c.startNode(victim);
     for (int id = 1; id <= 3; ++id) {
         ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
