@@ -2148,6 +2148,7 @@ void BrokerNode::buildGateway() {
                 gateway_->onNsSlotAssign(static_cast<uint16_t>(sl), nsSlots_.nsIdAt(static_cast<uint16_t>(sl)),
                                          nsSlots_.limits(static_cast<uint16_t>(sl)));
         if (bootApplier_) gateway_->setBootNamespaces(bootApplier_->state().namespaces());
+        gateway_->setAdvertisedBrokerVersionForTest(config_.testAdvertisedBrokerVersion);
         gateway_->setAnonymousRead(config_.anonymousRead);   // spec §11: RUNE_ANONYMOUS_READ, off by default
         gateway_->setAnonymousCaps(config_.anonymousMaxConnections, config_.anonymousRequestOpsPerSec);   // #236 (Task 10)
         gateway_->setNsLimitAggregator(&nsAggregator_);   // Task 14: worker usage reports -> the aggregator (same thread)

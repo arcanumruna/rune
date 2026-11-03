@@ -2694,6 +2694,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
             resp.leaderMemberId    = thisNodeId_;
             resp.assignedSessionId = pending.sessionId;
+            if (advertisedBrokerVersion_ > 0) resp.brokerVersion = advertisedBrokerVersion_;
             // Authentication Task 10 (D11): a v9 client of an authenticating broker is told how it authenticates and
             // where it stands.  A NEVER-bootstrapped cluster (no `__security` event yet: nobody exists who could log
             // in): Anonymous - it may send ONLY SecurityBootstrap.  Otherwise MustAuthenticate - also while the window

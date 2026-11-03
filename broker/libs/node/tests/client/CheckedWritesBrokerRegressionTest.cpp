@@ -1220,3 +1220,579 @@ TEST(CheckedWritesBrokerRegression, RestartKeepsVerdictsAndViewsThreeNodesRegres
     }
     reader->close();
 }
+
+// ===========================================================================================================
+// Part 05: write intents and the key index on real brokers.
+// ===========================================================================================================
+#include "client/support/KeyIndexRecords.h"
+
+#include <rune/protocol/client/SchemaMessages.h>
+
+#include <array>
+#include <cstring>
+
+namespace {
+
+namespace pc = rune::protocol::client;
+
+constexpr int32_t kKiParts = 4;
+constexpr uint16_t kInvalidRequest = 39, kKeyExists = 56, kKeyNotFound = 57;
+
+/// A bounded poll; no test synchronises on a sleep.
+template <class Pred>
+bool waitFor(Pred&& pred, std::chrono::seconds within) {
+    for (const auto deadline = Clock::now() + within; Clock::now() < deadline; std::this_thread::sleep_for(5ms))
+        if (pred()) return true;
+    return pred();
+}
+
+rc::DefineTopicResult defineKi(rc::Client& c, const std::string& name, int16_t replicas = 0, bool keyIndex = true) {
+    rc::TopicOptions to;
+    to.replicationFactor    = replicas;
+    to.config.cleanupPolicy = 1;   // compact
+    to.keyFeatures.keyIndex = keyIndex;
+    return c.defineTopicAndWait(name, kKiParts, "id", rune::codec::serialize(kiAccountDescriptor()), rc::Persistence::Disk, to, {}, 60s);
+}
+
+KiAccount acct(uint64_t id, std::string name = "alice", int64_t n = 0) { return KiAccount{id, std::move(name), n}; }
+
+std::vector<uint8_t> encoded(const KiAccount& a) {
+    std::vector<uint8_t> out(a.encodedSize());
+    a.encode(out.data());
+    return out;
+}
+
+/// A producer with `acks` and the typed topic `name` written through it.
+struct KiWriter {
+    rc::Producer                                   prod;
+    rc::TypedTopic<KiAccount, rc::ProducerRef>     topic;
+
+    static rc::ProducerConfig config(rc::Acks acks) {
+        rc::ProducerConfig pc;
+        pc.acks     = acks;
+        pc.lingerUs = 1;
+        return pc;
+    }
+    KiWriter(rc::Client& c, const std::string& name, rc::Acks acks = kAllView)
+        : prod(c.producer(config(acks))), topic(c.openTopicAndWait<KiAccount>(name, prod, 30s)) {}
+    ~KiWriter() { prod.closeImmediately(); }
+};
+
+struct Seen {
+    int32_t     partition;
+    int64_t     offset;
+    rc::RecordOp op;
+    uint8_t     attributes;
+    std::string key;
+    bool        tombstone;
+};
+
+/// Subscriptions from offset 0; the handler runs on the client's thread.
+class Collector {
+public:
+    ~Collector() {
+        for (rc::Subscription& s : subs_) s.unsubscribe();
+    }
+    void subscribe(rc::Client& c, rc::TopicHandle topic, int32_t partition) {
+        rc::SubscribeOptions o;
+        o.from = rc::From::earliest();
+        subs_.push_back(c.subscribe(topic, partition, o, [this](const rc::Record& r) {
+            std::lock_guard<std::mutex> g(mu_);
+            seen_.push_back({r.partition, r.offset, r.op(), r.attributes, std::string(reinterpret_cast<const char*>(r.key.data()), r.key.size()), r.value.empty()});
+        }));
+    }
+    void subscribeAll(rc::Client& c, rc::TopicHandle topic) {
+        for (int32_t p = 0; p < topic.partitionCount; ++p) subscribe(c, topic, p);
+    }
+    std::vector<Seen> seen() {
+        std::lock_guard<std::mutex> g(mu_);
+        return seen_;
+    }
+    std::size_t count() {
+        std::lock_guard<std::mutex> g(mu_);
+        return seen_.size();
+    }
+
+private:
+    std::mutex             mu_;
+    std::vector<Seen>      seen_;
+    std::vector<rc::Subscription> subs_;
+};
+
+/// Everything stored on a topic, over all partitions.
+std::size_t storedTotal(BrokerNode& n, int32_t topicId, int32_t parts) {
+    std::size_t total = 0;
+    for (int32_t p = 0; p < parts; ++p) total += storedValues(n, topicId, p).size();
+    return total;
+}
+
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, TypedIntentsEndToEndShardRegression) {
+    OneBroker b("cw-ki-e2e", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineKi(c, "ki");
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    KiWriter w(c, "ki");
+    const int32_t part = rc::Key(uint64_t{1}).partition(kKiParts);
+    Collector col;
+    col.subscribe(c, rc::TopicHandle{t.topicId, kKiParts}, part);
+
+    const auto first = w.topic.insertAndWait(acct(1, "alice"));
+    EXPECT_TRUE(first.ok());
+    EXPECT_GE(first.offset(), 0);
+    auto r = w.topic.insertAndWait(acct(1, "alice"));
+    EXPECT_EQ(r.status(), rc::OpStatus::BrokerError);
+    EXPECT_EQ(r.code(), kKeyExists);
+    r = w.topic.updateAndWait(acct(2, "bob"));
+    EXPECT_EQ(r.code(), kKeyNotFound);
+    EXPECT_TRUE(w.topic.removeExistingAndWait(uint64_t{1}).ok());
+    EXPECT_EQ(w.topic.removeExistingAndWait(uint64_t{1}).code(), kKeyNotFound);
+    EXPECT_TRUE(w.topic.removeAndWait(uint64_t{1}).ok());
+    EXPECT_TRUE(w.topic.insertAndWait(acct(1, "alice2")).ok());
+
+    ASSERT_TRUE(waitFor([&] { return col.count() >= 4; }, 10s)) << "the subscription delivers the accepted records";
+    const std::vector<Seen> seen = col.seen();
+    ASSERT_EQ(seen.size(), 4u);
+    const rc::RecordOp want[] = {rc::RecordOp::Insert, rc::RecordOp::Delete, rc::RecordOp::Delete, rc::RecordOp::Insert};
+    for (std::size_t i = 0; i < 4; ++i) EXPECT_EQ(seen[i].op, want[i]) << "record " << i;
+}
+
+TEST(CheckedWritesBrokerRegression, KeyIndexDdlRefusalsShardRegression) {
+    OneBroker b("cw-ki-ddl", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    rc::TopicOptions keyIndex;
+    keyIndex.keyFeatures.keyIndex = true;
+    const auto blob = rune::codec::serialize(kiAccountDescriptor());
+    const auto expectRefused = [&](const rc::DefineTopicResult& r, const char* detail) {
+        EXPECT_EQ(r.errorCode, kInvalidRequest) << detail;
+        EXPECT_EQ(r.detail, detail);
+    };
+    expectRefused(c.defineTopicAndWait("untyped", 1, "", {}, rc::Persistence::Disk, keyIndex, {}, 30s), "key.index needs a typed topic");
+    expectRefused(c.defineTopicAndWait("keyless", 1, "", blob, rc::Persistence::Disk, keyIndex, {}, 30s), "key.index needs a key");
+    expectRefused(c.defineTopicAndWait("transient", 1, "id", blob, rc::Persistence::Transient, keyIndex, {}, 30s), "key.index needs a persisted topic");
+    const auto wide = rune::codec::DescriptorBuilder("wide", 1).addFixedStr("k", 9, 1, true).add("n", rune::codec::PrimType::Int64).build();
+    expectRefused(c.defineTopicAndWait("wide", 1, "k", rune::codec::serialize(wide), rc::Persistence::Disk, keyIndex, {}, 30s),
+                  "key.index needs a key of at most 8 bytes");
+    rc::TopicOptions autoInc = keyIndex;
+    autoInc.keyFeatures.autoIncrement = true;
+    expectRefused(c.defineTopicAndWait("autoinc", 1, "id", blob, rc::Persistence::Disk, autoInc, {}, 30s), "autoincrement is not supported by this broker yet");
+
+    // A key-feature block with an unknown flag bit does not decode: the gateway rejects the frame as InvalidSchema ("DefineTopic body undecodable" in its log).
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("rune_cwkiddl_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    {
+        ShardTestClient client(dir / "aeron");
+        const int64_t sid = client.connect(b.clientChannel(), 110);
+        ASSERT_GT(sid, 0);
+        pc::DefineTopic m;
+        m.sessionId      = sid;
+        m.correlationId  = client.nextCorrelationId();
+        m.topicName      = "flags";
+        m.partitionCount = 1;
+        m.validate       = true;
+        m.descriptorBlob = blob.data();
+        m.descriptorLen  = static_cast<uint32_t>(blob.size());
+        m.hasExt         = true;
+        m.ext.clientName = "cw-ki";
+        m.ext.requestId  = rune::protocol::RequestId{1, 1};
+        m.hasKeyFeatures = true;
+        m.keyFeatures.keyIndex = true;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        ASSERT_GT(len, rune::protocol::kTopicKeyFeaturesWireLen);
+        buf[len - rune::protocol::kTopicKeyFeaturesWireLen] = 0x04;
+        ASSERT_TRUE(client.send(b.clientChannel(), 110, buf.data(), len));
+        const auto answer = client.awaitAnyDdlAnswer(m.correlationId, Clock::now() + 10s);
+        ASSERT_TRUE(answer.has_value());
+        EXPECT_EQ(answer->code, static_cast<int16_t>(pc::ErrorCode::InvalidSchema));
+    }
+    std::error_code ignore;
+    fs::remove_all(dir, ignore);
+}
+
+namespace {
+
+/// {k, n int64}: one record type per key width.  K is an integer type or std::array<uint8_t, N> for a string(N) key.
+template <class K>
+struct KeyRec {
+    static constexpr bool kIsString = !std::is_arithmetic_v<K>;
+    static rune::codec::Descriptor descriptor() {
+        using rune::codec::PrimType;
+        rune::codec::DescriptorBuilder d("kw", 1);
+        if constexpr (kIsString) d.addFixedStr("k", sizeof(K), 1, true);
+        else if constexpr (std::is_same_v<K, uint16_t>) d.add("k", PrimType::UInt16, 1, true);
+        else if constexpr (std::is_same_v<K, int32_t>) d.add("k", PrimType::Int32, 1, true);
+        else if constexpr (std::is_same_v<K, uint32_t>) d.add("k", PrimType::UInt32, 1, true);
+        else if constexpr (std::is_same_v<K, int64_t>) d.add("k", PrimType::Int64, 1, true);
+        else d.add("k", PrimType::UInt64, 1, true);
+        d.add("n", PrimType::Int64);
+        return d.build();
+    }
+    static inline const uint64_t kFingerprint = rune::codec::fingerprint(descriptor());
+    static constexpr std::string_view kSchemaName = "kw";
+    static constexpr uint16_t kVersion = 1;
+
+    K       k{};
+    int64_t n = 0;
+
+    [[nodiscard]] std::size_t encodedSize() const noexcept { return 4 + sizeof(K) + 8; }
+    [[nodiscard]] std::size_t encode(uint8_t* b) const noexcept {
+        const uint16_t block = static_cast<uint16_t>(sizeof(K) + 8);
+        b[0] = block & 0xff; b[1] = block >> 8; b[2] = kVersion & 0xff; b[3] = kVersion >> 8;
+        std::memcpy(b + 4, &k, sizeof(K));
+        std::memcpy(b + 4 + sizeof(K), &n, 8);
+        return encodedSize();
+    }
+    [[nodiscard]] auto key() const noexcept {
+        if constexpr (kIsString) return std::span<const uint8_t>(k.data(), k.size());
+        else return k;
+    }
+    [[nodiscard]] rc::Key routeKey() const { return rc::Key(key()); }
+    [[nodiscard]] std::string keyBytes() const { return std::string(reinterpret_cast<const char*>(&k), sizeof(K)); }
+
+    static KeyRec make(int i) {
+        KeyRec r;
+        r.n = i;
+        if constexpr (kIsString) {
+            r.k.fill(0);
+            r.k[0] = static_cast<uint8_t>('a' + i % 26);
+            r.k[1] = static_cast<uint8_t>('A' + i / 26);
+        } else {
+            r.k = static_cast<K>(static_cast<uint32_t>(i) * 40503u + 1u);
+        }
+        return r;
+    }
+};
+
+/// Cleaner cycles done on `n` so far.
+uint64_t cleanerCycles(BrokerNode& n) {
+    return n.onCleanerThreadForTest([&n] { return n.cleanerForTest()->cyclesDoneForTest(); });
+}
+
+template <class K>
+void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& name, bool keyIndex) {
+    using Rec = KeyRec<K>;
+    SCOPED_TRACE(name);
+    constexpr int kRecords = 50;
+    rc::TopicOptions to;
+    to.config.cleanupPolicy             = 1;
+    to.config.segmentRollBytes          = 256;
+    to.config.minCleanableDirtyRatioPpm = 1;
+    to.config.fileDeleteDelayMs         = 50;
+    to.keyFeatures.keyIndex             = keyIndex;
+    const auto t = c.defineTopicAndWait(name, kKiParts, "k", rune::codec::serialize(Rec::descriptor()), rc::Persistence::Disk, to, {}, 60s);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+
+    rc::Producer prod = c.producer(KiWriter::config(kAllView));
+    rc::TypedTopic<Rec, rc::ProducerRef> topic = c.openTopicAndWait<Rec>(name, prod, 30s);
+    Collector col;
+    col.subscribeAll(c, topic.handle());
+
+    std::multiset<std::pair<int32_t, std::string>> tombstones;
+    for (int i = 0; i < kRecords; ++i) {
+        const Rec rec = Rec::make(i);
+        tombstones.emplace(rec.routeKey().partition(kKiParts), rec.keyBytes());
+        topic.send(rec);
+        prod.flush();   // a batch per record, so the small segments roll between them
+    }
+    for (int i = 0; i < kRecords; ++i) {
+        topic.remove(Rec::make(i).key());
+        prod.flush();
+    }
+
+    ASSERT_TRUE(waitFor([&] { return col.count() >= 2 * kRecords; }, 10s)) << "delivered " << col.count();
+    std::multiset<std::pair<int32_t, std::string>> got;
+    for (const Seen& s : col.seen())
+        if (s.tombstone) got.emplace(s.partition, s.key);
+    EXPECT_TRUE(got == tombstones) << "every tombstone sits on the partition of its record with the same key bytes";
+
+    // The cleaner never touches the active segment, and segments roll as the provisioner supplies them: more tombstones
+    // of the same dead keys push the earlier ones into sealed segments, where each drops the value it supersedes.
+    const uint64_t cycles = cleanerCycles(b.node());
+    EXPECT_TRUE(waitFor([&] { return cleanerCycles(b.node()) >= cycles + 3; }, 10s));
+    const auto live = [&] {
+        std::size_t values = 0;
+        for (int32_t p = 0; p < kKiParts; ++p)
+            for (const std::string& v : storedValues(b.node(), t.topicId, p)) values += v.empty() ? 0 : 1;
+        return values;
+    };
+    std::size_t left = live();
+    for (int round = 0; round < 100 && left > 0; ++round) {
+        for (int i = 0; i < kRecords; ++i) {
+            topic.remove(Rec::make(i).key());
+            prod.flush();
+        }
+        std::this_thread::sleep_for(100ms);
+        left = live();
+    }
+    EXPECT_EQ(left, 0u) << "keys are still live after the cleaner pass";
+    prod.closeImmediately();
+}
+
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, TypedRemoveRoutesAsSendForEveryKeyWidthShardRegression) {
+    OneBroker b("cw-ki-widths", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    expectRemoveRoutesAsSend<uint16_t>(b, c, "w_u16", true);
+    expectRemoveRoutesAsSend<int32_t>(b, c, "w_i32", true);
+    expectRemoveRoutesAsSend<uint32_t>(b, c, "w_u32", true);
+    expectRemoveRoutesAsSend<int64_t>(b, c, "w_i64", true);
+    expectRemoveRoutesAsSend<uint64_t>(b, c, "w_u64", true);
+    expectRemoveRoutesAsSend<std::array<uint8_t, 4>>(b, c, "w_s4", false);
+    expectRemoveRoutesAsSend<std::array<uint8_t, 16>>(b, c, "w_s16", false);
+}
+
+TEST(CheckedWritesBrokerRegression, IntentsToAnOlderClusterAreRefusedShardRegression) {
+    {
+        OneBroker b("cw-ki-lvl4", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; });
+        rc::Client& c = *b.connectClient();
+        ASSERT_TRUE(waitFor([&] { return b.node().onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) == 4; }, 10s));
+        const auto ddl = defineKi(c, "ki_idx");
+        EXPECT_EQ(ddl.errorCode, kInvalidRequest);
+        EXPECT_EQ(ddl.detail, "key.index needs every broker at feature level 5");
+        const auto t = defineKi(c, "ki", 0, /*keyIndex=*/false);
+        ASSERT_EQ(t.errorCode, 0) << t.detail;
+        KiWriter w(c, "ki");
+        const auto r = w.topic.insertAndWait(acct(1));
+        EXPECT_EQ(r.status(), rc::OpStatus::BrokerError);
+        EXPECT_EQ(r.code(), kInvalidRequest);
+        EXPECT_EQ(storedTotal(b.node(), t.topicId, kKiParts), 0u);
+    }
+    OneBroker old("cw-ki-v9", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testAdvertisedBrokerVersion = 9; });
+    awaitLevel(old.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *old.connectClient();
+    const auto t  = defineKi(c, "ki", 0, /*keyIndex=*/false);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    KiWriter w(c, "ki");
+    EXPECT_EQ(w.topic.insertAndWait(acct(1)).status(), rc::OpStatus::BrokerTooOld);
+    EXPECT_EQ(storedTotal(old.node(), t.topicId, kKiParts), 0u) << "nothing was sent";
+}
+
+TEST(CheckedWritesKeyIndexRegression, RawIntentShapesAreRefusedOrOpaqueRegression) {
+    OneBroker b("cw-ki-raw", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto ki = defineKi(c, "ki");
+    ASSERT_EQ(ki.errorCode, 0) << ki.detail;
+    const auto plain = defineKi(c, "plain", 0, /*keyIndex=*/false);
+    ASSERT_EQ(plain.errorCode, 0) << plain.detail;
+    ASSERT_EQ(c.defineTopicAndWait("raw", 1, "", {}, rc::Persistence::Disk, {}, {}, 30s).errorCode, 0);
+    rc::Producer prod = c.producer(KiWriter::config(kAllView));
+
+    // A handle of kind Unknown carries no local check: the broker judges the hand-built shapes.
+    const rc::TopicHandle kiHandle{ki.topicId, kKiParts};
+    const std::vector<uint8_t> value = encoded(acct(5));
+    const rc::Completion reserved = prod.sendAndWait(kiHandle, rc::Key(uint64_t{5}), value, static_cast<rc::WriteIntent>(3), 10s);
+    EXPECT_EQ(reserved.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(reserved.errorCode, kInvalidRequest) << "attributes 3 is a reserved shape";
+    {
+        namespace fs = std::filesystem;
+        const fs::path dir = fs::temp_directory_path() / ("rune_cwkiraw_" + std::to_string(::getpid()));
+        fs::create_directories(dir);
+        {
+            ShardTestClient client(dir / "aeron");
+            const int64_t sid = client.connect(b.clientChannel(), 110);
+            ASSERT_GT(sid, 0);
+            // The client refuses an empty insert itself, so the frame is built by hand.
+            rune::protocol::RecordBatchBuilder batch(0, 1'000'000);
+            batch.append(le(5, 8), "", 1'000'000, /*attributes=*/1);
+            const int64_t corr = client.nextCorrelationId();
+            ASSERT_TRUE(client.produce(b.clientChannel(), 110, sid, corr, ki.topicId, rc::Key(uint64_t{5}).partition(kKiParts),
+                                       static_cast<uint8_t>(kAllView), batch.build()));
+            const auto ack = client.awaitProduceResponse(corr);
+            ASSERT_TRUE(ack.has_value());
+            EXPECT_EQ(ack->errorCode, static_cast<int16_t>(kInvalidRequest)) << "an insert tombstone is a reserved shape";
+        }
+        std::error_code ignore;
+        fs::remove_all(dir, ignore);
+    }
+    EXPECT_EQ(storedTotal(b.node(), ki.topicId, kKiParts), 0u) << "neither refused record was stored";
+
+    KiWriter noIndex(c, "plain");
+    const auto r = noIndex.topic.insertAndWait(acct(1));
+    EXPECT_EQ(r.status(), rc::OpStatus::BrokerError);
+    EXPECT_EQ(r.code(), kInvalidRequest) << "an intent needs a key index";
+
+    const rc::TopicHandle rawHandle = c.rawTopicAndWait("raw");
+    const std::vector<uint8_t> bytes{1, 2, 3};
+    EXPECT_EQ(prod.trySend(rawHandle, rc::Key(uint64_t{1}), bytes, rc::WriteIntent::Insert), rc::SendResult::WriteNotAllowed);
+    EXPECT_EQ(prod.trySend(rawHandle, rc::Key(uint64_t{1}), bytes), rc::SendResult::WriteNotAllowed) << "View needs a typed topic";
+
+    // R03b: on a topic the client does not know as raw, the bits are opaque.
+    const rc::TopicHandle unknown{rawHandle.topicId, 1};
+    Collector col;
+    col.subscribe(c, unknown, 0);
+    const rc::Completion opaque = prod.sendAndWait(unknown, rc::Key(uint64_t{2}), bytes, rc::WriteIntent::Update, 10s);
+    EXPECT_EQ(opaque.status, rc::OpStatus::Ok);
+    ASSERT_TRUE(waitFor([&] { return col.count() >= 1; }, 10s));
+    const std::vector<Seen> seen = col.seen();
+    EXPECT_EQ(seen[0].attributes, 2);
+    EXPECT_EQ(seen[0].op, rc::RecordOp::Update);
+    EXPECT_EQ(storedValues(b.node(), rawHandle.topicId, 0).size(), 1u);
+    prod.closeImmediately();
+}
+
+namespace {
+
+struct Outcome {
+    bool         ok = false;
+    uint16_t     code = 0;
+    rc::OpStatus status = rc::OpStatus::Ok;
+    std::string  error;
+};
+
+std::vector<Outcome> insertRange(rc::ClientConfig cfg, uint64_t first, uint64_t last) {
+    std::vector<Outcome> out;
+    try {
+        rc::Client client(cfg);
+        client.connectAndWait(30s);
+        KiWriter w(client, "ki");
+        for (uint64_t id = first; id <= last; ++id) {
+            const auto r = w.topic.insertAndWait(acct(id), 60s);
+            out.push_back({r.ok(), r.code(), r.status(), {}});
+        }
+        client.close();
+    } catch (const std::exception& e) {
+        out.push_back({false, 0, rc::OpStatus::Timeout, e.what()});
+    }
+    return out;
+}
+
+/// Two clients race the same ids: each id is accepted once and refused with KeyExists once.
+void raceInserts(rune::node::test::catalog_cluster::ThreeNodes& c, int seedA, int seedB, uint64_t first, uint64_t last) {
+    using namespace rune::node::test::catalog_cluster;
+    rc::ClientConfig a = clientConfigFor(c, seedA), b = clientConfigFor(c, seedB);
+    a.connectTimeoutMs = b.connectTimeoutMs = 30'000;
+    a.pingTimeoutMs = b.pingTimeoutMs = 30'000;
+    std::vector<Outcome> ra, rb;
+    std::thread ta([&] { ra = insertRange(a, first, last); });
+    std::thread tb([&] { rb = insertRange(b, first, last); });
+    ta.join();
+    tb.join();
+    ASSERT_EQ(ra.size(), last - first + 1) << (ra.empty() ? "" : ra.back().error);
+    ASSERT_EQ(rb.size(), last - first + 1) << (rb.empty() ? "" : rb.back().error);
+    for (std::size_t i = 0; i < ra.size(); ++i) {
+        const uint64_t id = first + i;
+        EXPECT_EQ(int{ra[i].ok} + int{rb[i].ok}, 1) << "id " << id << " is accepted exactly once";
+        const Outcome& lost = ra[i].ok ? rb[i] : ra[i];
+        EXPECT_EQ(lost.code, kKeyExists) << "id " << id << " status " << static_cast<int>(lost.status);
+    }
+}
+
+/// Every id in [first, last] answers KeyExists to an insert through a client of node `seed`.
+void expectKeyExists(rune::node::test::catalog_cluster::ThreeNodes& c, int seed, uint64_t first, uint64_t last) {
+    using namespace rune::node::test::catalog_cluster;
+    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
+    const std::vector<Outcome> r = insertRange(cfg, first, last);
+    ASSERT_EQ(r.size(), last - first + 1) << (r.empty() ? "" : r.back().error);
+    for (std::size_t i = 0; i < r.size(); ++i) EXPECT_EQ(r[i].code, kKeyExists) << "id " << first + i << " status " << static_cast<int>(r[i].status);
+}
+
+/// A 3-replica `ki` on a started cluster, the level raised on every node.
+int32_t defineKiOnCluster(rune::node::test::catalog_cluster::ThreeNodes& c) {
+    using namespace rune::node::test::catalog_cluster;
+    if (!c.awaitCatalogLeader(30s)) { ADD_FAILURE() << "no catalog leader"; return -1; }
+    const int32_t ctl = awaitController(c);
+    if (ctl <= 0) { ADD_FAILURE() << "no controller"; return -1; }
+    for (const int id : c.runningNodes()) awaitLevel(c.node(id));
+    if (::testing::Test::HasFatalFailure()) return -1;
+    auto admin = connectClient(c, ctl);
+    const auto t = defineKi(*admin, "ki", 3);
+    admin->close();
+    if (t.errorCode != 0) { ADD_FAILURE() << t.detail; return -1; }
+    std::vector<int32_t> leaders;
+    if (!awaitLeaders(c, t.topicId, kKiParts, leaders, 30s)) { ADD_FAILURE() << "no leaders"; return -1; }
+    return t.topicId;
+}
+
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, LoginRaceOnAKeyIndexThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    ThreeNodes c = ThreeNodes::start("cw05");
+    const int32_t topicId = defineKiOnCluster(c);
+    ASSERT_GE(topicId, 0);
+    raceInserts(c, 1, 2, 1, 200);
+    ASSERT_FALSE(HasFatalFailure());
+
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 30s));
+    const int victim = leaders[0];
+    c.crash(victim);
+    ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "a new leader after the crash";
+    const std::vector<int> alive = c.runningNodes();
+    ASSERT_EQ(alive.size(), 2u);
+    raceInserts(c, alive[0], alive[1], 201, 400);
+    ASSERT_FALSE(HasFatalFailure());
+    expectKeyExists(c, alive[0], 1, 400);
+
+    // Leadership moves off every node in turn: each takeover rebuilds the index from the log.
+    c.startNode(victim);
+    for (int id = 1; id <= 3; ++id) {
+        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
+        c.crash(id);
+        ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s)) << "after crashing node " << id;
+        expectKeyExists(c, c.runningNodes().front(), 1, 400);
+        ASSERT_FALSE(HasFatalFailure());
+        c.startNode(id);
+    }
+}
+
+TEST(CheckedWritesBrokerRegression, RestartRebuildsTheKeyIndexThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    ThreeNodes c = ThreeNodes::start("cw05r");
+    const int32_t topicId = defineKiOnCluster(c);
+    ASSERT_GE(topicId, 0);
+    {
+        rc::ClientConfig cfg = clientConfigFor(c, 1);
+        cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
+        rc::Client client(cfg);
+        client.connectAndWait(30s);
+        {
+            KiWriter w(client, "ki");
+            for (uint64_t id = 1; id <= 300; ++id) ASSERT_TRUE(w.topic.insertAndWait(acct(id), 60s).ok()) << "insert " << id;
+            for (uint64_t id = 1; id <= 100; ++id) ASSERT_TRUE(w.topic.removeExistingAndWait(id, 60s).ok()) << "remove " << id;
+        }
+        client.close();
+    }
+    for (int id = 3; id >= 1; --id) c.stop(id);
+    for (int id = 1; id <= 3; ++id) c.startNode(id);
+    ASSERT_TRUE(c.awaitCatalogLeader(60s));
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, topicId, kKiParts, leaders, 60s));
+
+    expectKeyExists(c, 1, 101, 300);
+    ASSERT_FALSE(HasFatalFailure());
+    rc::ClientConfig cfg = clientConfigFor(c, 1);
+    cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
+    const std::vector<Outcome> reinserted = insertRange(cfg, 1, 100);
+    ASSERT_EQ(reinserted.size(), 100u) << (reinserted.empty() ? "" : reinserted.back().error);
+    for (std::size_t i = 0; i < reinserted.size(); ++i) EXPECT_TRUE(reinserted[i].ok) << "removed id " << i + 1 << " code " << reinserted[i].code;
+}
+
+TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesIntentsRegression) {
+    OneBroker b("cw-ki-legacy", OneBroker::Runtime::Legacy);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineKi(c, "ki");
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    KiWriter w(c, "ki");
+    const auto r = w.topic.insertAndWait(acct(1));
+    EXPECT_EQ(r.status(), rc::OpStatus::BrokerError);
+    EXPECT_EQ(r.code(), kInvalidRequest);
+    KiWriter plain(c, "ki", rc::Acks::All);
+    EXPECT_TRUE(plain.topic.upsertAndWait(acct(1)).ok());
+}
