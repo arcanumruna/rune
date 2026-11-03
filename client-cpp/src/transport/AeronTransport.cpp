@@ -481,16 +481,31 @@ bool AeronTransport::offerOn(PubHandle h, const uint8_t* buf, std::size_t len, F
     // NAT-safe egress phase 1: the response subscription must be Ready before the correlated publication is added
     // (Aeron names its registration id in the request publication's URI).
     if (const auto* await = std::get_if<PubSlot::AwaitResponseSub>(&s.mode)) {
-        SubSlot& ss = subSlots_[static_cast<std::size_t>(await->subSlot)];
+        const int32_t slot = await->subSlot;
+        const int64_t deadlineNs = await->deadlineNs;
+        SubSlot& ss = subSlots_[static_cast<std::size_t>(slot)];
         aeron::Subscription* sub = ss.res.ready();
         if (sub == nullptr) sub = resolveSubSlot_(ss);
-        if (sub == nullptr) return false;
-        try {
-            s.addChannel = withResponseCorrelation(s.channel, sub->registrationId());
-        } catch (...) {
-            return false;
+        if (sub == nullptr) {
+            if (!ss.res.rejected() && resolveNow_() < deadlineNs) return false;
+            // #755: the response subscription was refused or never resolved: give the pair up and use the declared
+            // (plain) path.  The sub is released at the next poll(); this offer proceeds as a plain publication.
+            if (!warnedResponseGiveUp_) {
+                warnedResponseGiveUp_ = true;
+                std::fprintf(stderr, "rune-client: the response subscription for %s did not resolve; using the "
+                                     "declared egress path\n", s.channel.c_str());
+            }
+            retireSubSlot_(slot);
+            s.addChannel.clear();
+            s.mode = PubSlot::Plain{};
+        } else {
+            try {
+                s.addChannel = withResponseCorrelation(s.channel, sub->registrationId());
+            } catch (...) {
+                return false;
+            }
+            s.mode = PubSlot::Correlated{slot};
         }
-        s.mode = PubSlot::Correlated{await->subSlot};
     }
     PubRegistry reg{*aeron_, s.addChannel.empty() ? s.channel : s.addChannel, s.streamId};
     if (s.res.poll(reg, resolveNow_()) != ResolveStatus::Ready) return false;
@@ -515,7 +530,7 @@ AeronTransport::PubHandle AeronTransport::responsePublicationHandle(const std::s
     const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, std::string(responseControlChannel), cfg_.egressStreamId);
     if (sub < 0) return kNoPub;
     PubSlot ps{channel, streamId, Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs}};
-    ps.mode = PubSlot::AwaitResponseSub{sub};
+    ps.mode = PubSlot::AwaitResponseSub{sub, resolveNow_() + kResolveTimeoutNs};
     pubSlots_.push_back(std::move(ps));
     return static_cast<PubHandle>(pubSlots_.size() - 1);
 }
@@ -534,7 +549,7 @@ bool AeronTransport::rePairResponsePublication(PubHandle h) noexcept {
         drainPub_(std::move(ps.res));   // the old request publication deregisters (its image goes away at the broker)
         ps.res = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
         ps.addChannel.clear();
-        ps.mode = PubSlot::AwaitResponseSub{sub};
+        ps.mode = PubSlot::AwaitResponseSub{sub, resolveNow_() + kResolveTimeoutNs};
         retireSubSlot_(oldSub);   // the pinned subscription; released at the next poll()
         return true;
     } catch (...) {
@@ -550,7 +565,8 @@ bool AeronTransport::rePairSeedResponse(int32_t responsePort) noexcept {
         if (std::holds_alternative<SeedRePairing>(seedPair_)) return true;   // one in flight
         const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, *respChannel, cfg_.egressStreamId);
         if (sub < 0) return false;
-        seedPair_ = SeedRePairing{sub, {}, Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs}};
+        seedPair_ = SeedRePairing{sub, {}, Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs},
+                                  resolveNow_() + kResolveTimeoutNs};
         return true;
     } catch (...) {
         return false;
@@ -573,13 +589,13 @@ bool AeronTransport::advanceSeedRePair_(SeedRePairing& rp) noexcept {
         aeron::Subscription* sub = ss.res.ready();
         if (sub == nullptr) sub = resolveSubSlot_(ss);
         if (sub == nullptr) {
-            if (ss.res.rejected()) abandonSeedRePair_();   // the next Connect re-pairs again
+            if (ss.res.rejected() || resolveNow_() >= rp.deadlineNs) abandonSeedRePair_();   // the next Connect re-pairs again
             return false;
         }
         if (rp.addChannel.empty()) rp.addChannel = withResponseCorrelation(cfg_.ingressChannel, sub->registrationId());
         PubRegistry reg{*aeron_, rp.addChannel, cfg_.ingressStreamId};
         if (rp.res.poll(reg, resolveNow_()) != ResolveStatus::Ready) {
-            if (rp.res.rejected()) abandonSeedRePair_();
+            if (rp.res.rejected() || resolveNow_() >= rp.deadlineNs) abandonSeedRePair_();
             return false;
         }
         // Both Ready: swap.  The old request publication deregisters here; the spent response subscription is retired
@@ -612,7 +628,7 @@ AeronTransport::PubHandle AeronTransport::upgradeToResponsePublication(const std
         drainPub_(std::move(ps.res));   // the plain publication deregisters; the correlated one is added once the sub is Ready
         ps.res  = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
         ps.addChannel.clear();
-        ps.mode = PubSlot::AwaitResponseSub{sub};
+        ps.mode = PubSlot::AwaitResponseSub{sub, resolveNow_() + kResolveTimeoutNs};
         return static_cast<PubHandle>(i);
     }
     return responsePublicationHandle(channel, streamId, responseControlChannel);

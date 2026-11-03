@@ -602,6 +602,7 @@ private:
         int32_t     subSlot;
         std::string addChannel;
         Resolution<aeron::ExclusivePublication> res;
+        int64_t     deadlineNs;   // #755: the re-pair is abandoned (old pair kept) at this resolve-clock time
     };
     std::variant<SeedSteady, SeedRePairing> seedPair_{SeedSteady{}};
     /// Advance a pending seed re-pair; true = swapped (the new pair is in force), false = still pending or abandoned.
@@ -669,7 +670,7 @@ private:
         ///   Correlated{idx}        the publication is registered (or resolving/ready) on `addChannel`, which names
         ///                          that subscription's registration id.
         struct Plain {};
-        struct AwaitResponseSub { int32_t subSlot; };
+        struct AwaitResponseSub { int32_t subSlot; int64_t deadlineNs; };   // #755: gives up at deadlineNs (resolve clock)
         struct Correlated { int32_t subSlot; };
         std::string channel;
         int32_t     streamId;
@@ -713,6 +714,7 @@ private:
     uint32_t retiredSubs_ = 0;   // Retired slots awaiting reapRetiredSubs_()
     uint64_t freshSubsAdded_ = 0;   // fresh (response-pair) subscription slots added; test seam
     bool     warnedPlainResponse_ = false;   // responsePublicationHandle: logged once
+    bool     warnedResponseGiveUp_ = false;   // offerOn fell back from a response pair to plain: logged once
     std::vector<PubSlot>  pubSlots_;   // index == PubHandle (stable, never erased)
     detail::FlatIndexMap  streamPub_;  // default-channel streamId -> PubHandle
     std::vector<SubSlot>  subSlots_;   // per-worker dynamic-MDC egress subscriptions

@@ -1292,6 +1292,106 @@ TEST(AeronTransportRegression, ARetiredSubStillResolvingIsNeverResetRegression) 
     t.stop();
 }
 
+// ---- #755: a response pair that cannot form gives up and falls back to the declared (plain) path -----------------------
+
+namespace {
+constexpr int64_t kResolveTimeoutNsForTest = 5'000'000'000LL;   // AeronTransport::kResolveMaxMs
+void pollOnce(Transport& t) { t.poll([](const uint8_t*, std::size_t) {}, 10); }
+} // namespace
+
+TEST(AeronTransportRegression, AResponseSubThatNeverResolvesFallsBackToTheDeclaredPathRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3630)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const uint8_t frame[] = {1};
+    const auto respCtl = [](uint16_t endpointPort, int32_t respPort) {
+        const auto c = rune::client::transport::responseControlChannelFor(loopback(endpointPort), respPort);
+        return c.value();
+    };
+
+    {   // cell 1: offerOn on a response handle; the driver is never pumped, so the sub stays Resolving
+        const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+        const auto h = t.responsePublicationHandle(worker, 3631, respCtl(41100, 1));
+        ASSERT_NE(h, Transport::kNoPub);
+        const int32_t slot = t.responseSubSlotForTest(h);
+        EXPECT_FALSE(t.offerOn(h, frame, sizeof frame));
+        EXPECT_TRUE(t.publicationIsResponsePairedForTest(h)) << "inside the deadline the pair is still awaited";
+        g_nowNs += kResolveTimeoutNsForTest + 1;
+        (void)t.offerOn(h, frame, sizeof frame);   // no dutyCycle
+        EXPECT_FALSE(t.publicationIsResponsePairedForTest(h)) << "past the deadline the handle stays response-paired forever";
+        pollOnce(t);
+        EXPECT_FALSE(t.subSlotLiveForTest(slot)) << "the abandoned response sub is retired";
+        EXPECT_FALSE(t.publicationResponseCorrelated(h));
+    }
+    {   // cell 2: upgrade of a plain handle (the response port was learnt late) that never resolves
+        const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+        const auto h = t.publicationHandle(worker, 3632);
+        ASSERT_EQ(t.upgradeToResponsePublication(worker, 3632, respCtl(41101, 1)), h);
+        const int32_t slot = t.responseSubSlotForTest(h);
+        ASSERT_TRUE(t.publicationIsResponsePairedForTest(h));
+        EXPECT_FALSE(t.offerOn(h, frame, sizeof frame));
+        g_nowNs += kResolveTimeoutNsForTest + 1;
+        (void)t.offerOn(h, frame, sizeof frame);
+        EXPECT_FALSE(t.publicationIsResponsePairedForTest(h));
+        pollOnce(t);
+        EXPECT_FALSE(t.subSlotLiveForTest(slot));
+    }
+    {   // cell 3: rePair of a response handle whose new sub never resolves
+        const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+        const auto h = t.responsePublicationHandle(worker, 3633, respCtl(41102, 1));
+        ASSERT_NE(h, Transport::kNoPub);
+        ASSERT_TRUE(t.rePairResponsePublication(h));
+        const int32_t slot = t.responseSubSlotForTest(h);
+        EXPECT_FALSE(t.offerOn(h, frame, sizeof frame));
+        g_nowNs += kResolveTimeoutNsForTest + 1;
+        (void)t.offerOn(h, frame, sizeof frame);
+        EXPECT_FALSE(t.publicationIsResponsePairedForTest(h));
+        pollOnce(t);
+        EXPECT_FALSE(t.subSlotLiveForTest(slot));
+    }
+    t.stop();
+}
+
+TEST(AeronTransportRegression, ARefusedResponseSubFallsBackToThePlainPathAtOnceRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3640)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto h = t.responsePublicationHandle(worker, 3641, kRefusedResponseChannel);
+    ASSERT_NE(h, Transport::kNoPub);
+    const int32_t slot = t.responseSubSlotForTest(h);
+    const uint8_t frame[] = {1};
+    ASSERT_TRUE(pumpUntil(t, [&] {   // the driver refuses the registration: Rejected, no clock advance
+        (void)t.offerOn(h, frame, sizeof frame);
+        return !t.publicationIsResponsePairedForTest(h);
+    })) << "a Rejected response sub kept the handle response-paired";
+    pollOnce(t);
+    EXPECT_FALSE(t.subSlotLiveForTest(slot));
+    t.stop();
+}
+
+TEST(SeedRePairRegression, ASeedRePairThatNeverResolvesIsAbandonedAtTheDeadlineRegression) {
+    const uint16_t reqPort = rune::client::testing::allocFreeUdpPort();
+    const uint16_t rPort   = rune::client::testing::allocFreeUdpPort();
+    Transport t{responseConfig(loopback(reqPort), rPort, 3650)};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const int64_t oldReg = t.seedResponseSubscriptionIdForTest();
+    const uint8_t frame[] = {1, 2};
+    ASSERT_TRUE(t.rePairSeedResponse(rPort));
+    EXPECT_FALSE(t.offer(frame, sizeof frame)) << "inside the deadline the re-pair is awaited (Retry)";
+    EXPECT_TRUE(t.seedRePairingForTest());
+    g_nowNs += kResolveTimeoutNsForTest + 1;
+    (void)t.offer(frame, sizeof frame);   // no dutyCycle: nothing resolved
+    EXPECT_FALSE(t.seedRePairingForTest()) << "a re-pair that cannot resolve stays in force forever";
+    EXPECT_EQ(t.seedResponseSubscriptionIdForTest(), oldReg) << "the old pair stays in force";
+    t.stop();
+}
+
 TEST(InvokerTransportResponseRegression, RetargetPairsTheNewResponseSubscriptionAndFallsBackToPlain) {
     const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
     const uint16_t reqB = rune::client::testing::allocFreeUdpPort(), rB = rune::client::testing::allocFreeUdpPort();
