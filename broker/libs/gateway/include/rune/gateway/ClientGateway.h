@@ -379,6 +379,7 @@ public:
         if (txnService_ != nullptr)
             namespaces_.registry().forEach([this](const rune::catalog::NamespaceRecord& r) {
                 txnService_->setNamespaceTxnLimits(r.nsId, r.limits.maxOpenTxns, r.limits.maxTxnTimeMs);
+                txnService_->setNamespaceTxnGate(r.nsId, rune::catalog::tagOf(r.state) != rune::catalog::NsStateTag::Active);   // #661
             });
     }
 
@@ -561,7 +562,10 @@ public:
     /// Phase 2 Task 3: a deleted namespace is gone (kA2cNamespaceErased); its sessions were closed at Deleting.
     void onNamespaceErased(uint32_t nsId) {
         (void)namespaces_.erase(nsId);
-        if (txnService_ != nullptr) txnService_->setNamespaceTxnLimits(nsId, 0, 0);   // Task 10
+        if (txnService_ != nullptr) {
+            txnService_->setNamespaceTxnLimits(nsId, 0, 0);   // Task 10
+            txnService_->setNamespaceTxnGate(nsId, false);    // #661
+        }
         if (const uint16_t sl = nsSlots_.slotOf(nsId); sl != rune::node::kNoNsSlot && nsId != 0) onNsSlotFreed(sl, nsId);
     }
     // Namespaces Phase 2 Task 8 (D22): this gateway's OWN copy of the node's slot table, fed by the control thread

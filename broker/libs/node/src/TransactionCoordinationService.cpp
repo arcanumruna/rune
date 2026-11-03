@@ -228,6 +228,10 @@ void TransactionCoordinationService::load_(int64_t nowNs)
         pidCeilingPendingOffset_ = -1;
     }
     loadState_ = LoadState::Loaded;
+    // #661: the suspend / delete apply of a namespace that happened while this coordinator was not loaded aborted nothing
+    // (abortAllForNamespace answers 0 while unloaded): the gate mirror is re-derived at every load.  PrepareAbort goes
+    // through the usual gate and doWork hands the markers out.
+    for (const uint32_t ns : blockedNs_) (void)coordinator_.abortAllForNamespace(ns, nowNs);
     spdlog::info("TCS: coordinator LOADED (coordinatorEpoch={}, {} transactional ids, next pid {})",
                  coordinatorEpoch_, coordinator_.size(), coordinator_.allocator().nextId());
 }
@@ -539,6 +543,14 @@ std::optional<std::size_t> TransactionCoordinationService::liveKeysOfNamespaceFo
 {
     if (txnState_ == nullptr || loadState_ != LoadState::Loaded) return std::nullopt;   // unknown: store not loaded
     return txnState_->liveKeysOfNamespaceForTest(nsId);
+}
+
+void TransactionCoordinationService::setNamespaceTxnGate(uint32_t nsId, bool blocked)
+{
+    const auto it = std::lower_bound(blockedNs_.begin(), blockedNs_.end(), nsId);
+    const bool present = it != blockedNs_.end() && *it == nsId;
+    if (blocked && !present) blockedNs_.insert(it, nsId);
+    else if (!blocked && present) blockedNs_.erase(it);
 }
 
 uint32_t TransactionCoordinationService::abortAllForNamespace(uint32_t nsId, int64_t nowNs)

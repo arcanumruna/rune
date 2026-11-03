@@ -2030,6 +2030,46 @@ TEST_F(TxnNsDeleteRegression, TombstoneErasesInMemoryTxnsRegression) {
     EXPECT_EQ(svc_->txnStateForTest(b_), tx::TxnState::Ongoing);
 }
 
+// #661: a coordinator that loads AFTER a namespace was suspended / deleted aborts that namespace's open transactions at
+// its load (the apply's abortAllForNamespace answered 0 while the coordinator was unloaded).
+TEST_F(TxnNsDeleteRegression, CoordinatorLoadedAfterSuspendAbortsTheNamespacesOpenTxnsRegression) {
+    const std::string x = rune::coordination::scopedId(4, "tx"), y = rune::coordination::scopedId(5, "ty");
+    const rune::coordination::NsRequestContext ctxX{4, false, nullptr}, ctxY{5, false, nullptr};
+    int16_t epX = 0, epY = 0;
+    const int64_t px = initPidIn(ctxX, "tx", epX);
+    const int64_t py = initPidIn(ctxY, "ty", epY);
+    RepTxn r;
+    r.svc = svc_.get();
+    r.answers = &answers_;
+    r.commitAll = [this, &r] { followerFetches(); (void)r.svc->doWork(now_); };
+    r.ctx = ctxX;
+    ASSERT_EQ(r.addOffsets("tx", px, epX, "cgx", now_), 0);
+    r.ctx = ctxY;
+    ASSERT_EQ(r.addOffsets("ty", py, epY, "cgy", now_), 0);
+    ASSERT_EQ(svc_->txnStateForTest(x), tx::TxnState::Ongoing);
+    ASSERT_EQ(svc_->txnStateForTest(y), tx::TxnState::Ongoing);
+
+    isLeader_ = false;                        // the coordinator unloads
+    replica_->becomeFollower(2, 2);
+    (void)svc_->doWork(now_);
+    ASSERT_FALSE(svc_->isLoaded());
+    svc_->setNamespaceTxnGate(4, true);       // ns 4 is suspended / deleted meanwhile: the gateway's apply
+    EXPECT_EQ(svc_->abortAllForNamespace(4, now_), 0u) << "unloaded: the apply aborts nothing";
+
+    isLeader_ = true;                         // ... and the coordinator loads later
+    replica_->becomeLeader(3, {1, 2});
+    followerFetches();
+    for (int i = 0; i < 4; ++i) { (void)svc_->doWork(now_); followerFetches(); }
+    ASSERT_TRUE(svc_->isLoaded());
+    const tx::TxnState sx = svc_->txnStateForTest(x);
+    EXPECT_TRUE(sx == tx::TxnState::PrepareAbort || sx == tx::TxnState::CompleteAbort)
+        << "state " << static_cast<int>(sx) << ": the suspended namespace's open txn survived the load";
+    EXPECT_EQ(svc_->txnStateForTest(y), tx::TxnState::Ongoing) << "another namespace is untouched";
+
+    svc_->setNamespaceTxnGate(4, false);      // the erase: a later load aborts nothing of it
+    svc_->setNamespaceTxnGate(4, false);      // idempotent
+}
+
 // #662 DIAG (2), DISABLED pending the lead: RED (tombstoneNamespace answers Refused for 100 asks). a PrepareCommit stuck on a refused transactional-offset apply (#359) is unsettled, so the txn-state
 // tombstone of its namespace answers Refused for as long as the apply is refused.
 TEST_F(TxnNsDeleteRegression, DISABLED_PrepareCommitStuckOnRefusedOffsetDoesNotBlockDeleteRegression) {

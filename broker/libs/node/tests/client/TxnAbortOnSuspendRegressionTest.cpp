@@ -375,3 +375,24 @@ TEST(TxnAbortOnSuspendRegression, OtherNamespaceUntouchedRegression) {
     EXPECT_EQ(got.size(), 10u);
     for (int i = 0; i < 10; ++i) EXPECT_EQ(got[static_cast<size_t>(i)], "y" + std::to_string(i));
 }
+
+// #661 (real-broker guard): a namespace suspended ReadOnly, then the broker restarts over the same data (the catalog
+// replays into the gateway, the transaction coordinator loads): a's open transaction is aborted, the sentinel appended
+// after its records becomes visible to a read_committed reader, and none of the 10 records does.  Green with or without
+// the load-time re-derive when the suspend's own abort reached the log first; the unit leg
+// (TxnNsDeleteRegression.CoordinatorLoadedAfterSuspendAbortsTheNamespacesOpenTxnsRegression) is the failing-first one.
+TEST(TxnAbortOnSuspendRegression, SuspendThenRestartAbortsRegression) {
+    Scenario s("txnabort_restart");
+    ASSERT_TRUE(s.f.admin->suspendNamespace("a", pc::NsSuspendMode::ReadOnly).has_value());
+    const rc::TopicSpec tA = s.f.tA;
+    s.reader.reset();
+    s.txn.reset();
+    s.ua.reset();
+    s.f.admin.reset();
+    s.f.b.restart(/*reloginAdmin=*/false);   // the fixture bootstraps its own admin password
+    auto admin = newClient(s.f.b, "admin");
+    CommittedReader reader(*admin, Fix::handleOf(tA));
+    ASSERT_TRUE(waitFor([&] { return reader.has("S"); }, 40s))
+        << "the sentinel never became visible: the open transaction survived the suspend + restart";
+    for (const std::string& v : reader.snapshot()) EXPECT_EQ(v, "S") << "an aborted record is visible to read_committed";
+}

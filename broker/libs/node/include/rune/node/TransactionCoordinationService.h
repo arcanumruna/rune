@@ -201,6 +201,7 @@ public:
     /// suspended or deleted namespace.  0 when this node is not the loaded coordinator.
     uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs) override;
     uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs) override;
+    void setNamespaceTxnGate(uint32_t nsId, bool blocked) override;   ///< #661
     void setNamespaceTxnLimits(uint32_t nsId, uint64_t maxOpenTxns, uint64_t maxTxnTimeMs) override {
         coordinator_.setNamespaceTxnLimits(nsId, maxOpenTxns, maxTxnTimeMs);
     }
@@ -506,7 +507,9 @@ private:
     /// last record before it; -3: no store).
     void completeHolds_(const std::string& txnId, int64_t record, int64_t putFloor = -1);
     int  releaseCommittedHolds_();
-    void forgetNamespace_(uint32_t nsId);   ///< #663 / #727: drop a deleted namespace's in-memory entries
+    void forgetNamespace_(uint32_t nsId);
+    /// #661: the namespaces that are not ACTIVE (sorted; control thread, cold).  Re-applied at every load.
+    std::vector<uint32_t> blockedNs_;   ///< #663 / #727: drop a deleted namespace's in-memory entries
     /// True when a key of offsetsScratch_ is held by another transaction (or by this id's completing one).
     [[nodiscard]] bool heldByOther_(const std::string& group, const std::string& txnId) const;
 
