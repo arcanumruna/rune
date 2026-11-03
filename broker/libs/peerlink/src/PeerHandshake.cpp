@@ -493,7 +493,8 @@ PeerHandshake::Out PeerHandshake::onAccept(const PeerAccept& a, int64_t nowNs) {
     if (!initiator() || a.from != peer_ || a.to != self_) return {};
     // Issue #241: the responder re-sent the Accept of the epoch our live link holds (our Confirm was lost): the Confirm
     // again, nothing else changes.  Issue #584: in EVERY state - a HelloSent / ChallengeSent initiator answers from its
-    // `prior` (the responder defers our new exchange until that epoch is confirmed) and stays in its state.  Any other
+    // `prior` and stays in its state (the responder no longer defers our new exchange behind that epoch's Confirm, #545:
+    // it re-sends the Accept a bounded number of times, and the prior Confirm answers each re-send).  Any other
     // Accept while Established is ignored.
     if (const Established* live = liveLink_(); live && live->confirm && a.linkEpoch == live->keys.epoch &&
                                                mac32Eq(a.confirm, live->acceptConfirm))
