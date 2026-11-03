@@ -799,9 +799,10 @@ public:
     /// value = base, no payload.  Otherwise status RecordsRejected, value = base, errorCode / constraintIdOf = the first
     /// rejection's, and the payload lists every rejection (BatchVerdicts: rejectedCount(), rejection(k), accepted(i),
     /// offsetOf(i)); every other record was stored at base + its index.  Reservation = delivery: the claim reserves
-    /// completionRecordBytes(8 x n) on cq up front (a plain 48 bytes without View, or for n == 1), so a verdict list
-    /// never overflows the queue; a claim whose completion cannot fit one queue record (above the queue's maxRecordBytes,
-    /// default maxResultBytes 16 KiB, or an eighth of its capacity) returns MessageTooLarge with nothing reserved.
+    /// 2 x completionRecordBytes(8 x n) - 48 on cq up front (the record plus its own end-of-buffer padding; a plain 48
+    /// bytes without View, or for n == 1), so a verdict list never overflows the queue; a claim whose completion record cannot
+    /// fit one queue record (an eighth of the queue's capacity), or whose reservation exceeds Completions::maxReservation(),
+    /// returns MessageTooLarge with nothing reserved (4096 records fit a default queue).
     /// A claim of ONE record keeps single-record semantics (BrokerError, value -1).
     [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
                                         Completions& cq, Token token) noexcept;

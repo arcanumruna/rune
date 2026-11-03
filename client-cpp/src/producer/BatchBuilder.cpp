@@ -233,6 +233,7 @@ OpResult BatchBuilder::send(Completions& cq, Token token) {
     if (!cq.onOwnerThread()) return OpResult::WrongThread;
     // ONE completion for the whole batch: a View batch of n records reserves for its n verdict entries (reservation = delivery).
     // A batch whose completion cannot fit one queue record is refused here (InvalidArgument), nothing reserved.
+    if (!impl_->batchCompletionFits(cq, recordCount_())) return OpResult::InvalidArgument;
     const uint32_t cqBytes = impl_->batchCompletionBytes(recordCount_());
     const OpResult rr = cq.reserve(cqBytes);
     if (rr != OpResult::Accepted) return rr;

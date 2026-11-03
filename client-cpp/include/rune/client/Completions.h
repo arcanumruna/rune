@@ -88,11 +88,17 @@ public:
     /// Standalone queue (no Client).
     explicit Completions(CompletionsConfig cfg = {})
         : cfg_(validate(cfg))
-        , ring_(new detail::CompletionRing(cfg_.capacityBytes))
-        , stash_(new uint8_t[cfg_.capacityBytes])
         , maxRecordBytes_(detail::CompletionRing::completionRecordBytes(
               cfg_.maxResultBytes > cfg_.maxErrorText ? cfg_.maxResultBytes : cfg_.maxErrorText))
-        , owner_(std::this_thread::get_id()) {}
+        , ring_(new detail::CompletionRing(cfg_.capacityBytes, maxRecordBytes_))
+        , stash_(new uint8_t[cfg_.capacityBytes])
+        , owner_(std::this_thread::get_id()) {
+        // A batch completion above the slack record M reserves 2r - 48 (see reserve()), up to the largest record the ring
+        // takes (header + maxMsgLength).
+        const uint32_t bigRec = 2u * (detail::CompletionRing::kRecordHeaderBytes + ring_->maxMsgLength()) -
+                                detail::CompletionRing::completionRecordBytes(0);
+        maxReservation_ = bigRec > maxRecordBytes_ ? bigRec : maxRecordBytes_;
+    }
 
     /// Registered with `client` (C2).  The constructing thread becomes the
     /// owner: the only thread that may issue ops on, poll, wait on, or destroy
@@ -168,7 +174,12 @@ public:
     /// op may be issued (and must complete exactly once, or be unreserve()d if
     /// it is then rejected).  QueueFull: poll() first.  Closed: the producer
     /// side closed this queue.  InvalidArgument: not an 8-aligned record size
-    /// (use reservationFor()) or larger than one maximal record.  WrongThread
+    /// (use reservationFor()) or larger than maxReservation().
+    ///
+    /// A reservation above maxRecordBytes() (a View batch completion with its verdict list) stands for a record of at most
+    /// (bytes + 48) / 2: the ring enforces that cap in deliver().  A record r above the slack record M can wrap and leave up
+    /// to r bytes of end-of-buffer padding; reserving 2r - 48 pays for the record AND that padding, because 2r - 48 + M >=
+    /// 2r (M >= 48), so reservations + M still bound the ring and deliver() never meets a full ring.  WrongThread
     /// (debug builds): called off the owner thread — the credit counters are
     /// owner-thread state (spec risk 3).
     [[nodiscard]] OpResult reserve(uint32_t bytes) noexcept {
@@ -178,7 +189,7 @@ public:
         if (ring_->producerClosed()) return OpResult::Closed;
         // A reservation is a ring record size: 8-aligned (review m2) — an
         // unaligned one could under-reserve the aligned record by up to 7 bytes.
-        if (bytes < detail::CompletionRing::completionRecordBytes(0) || bytes > maxRecordBytes_ ||
+        if (bytes < detail::CompletionRing::completionRecordBytes(0) || bytes > maxReservation_ ||
             (bytes & 7u) != 0) {
             return OpResult::InvalidArgument;
         }
@@ -295,6 +306,10 @@ public:
     }
     [[nodiscard]] const CompletionsConfig& config() const noexcept { return cfg_; }
     [[nodiscard]] uint32_t maxRecordBytes() const noexcept { return maxRecordBytes_; }
+    /// The largest reservation reserve() accepts (see reserve()).
+    [[nodiscard]] uint32_t maxReservation() const noexcept { return maxReservation_; }
+    /// The ring's largest message (capacity / 8): the largest record is kRecordHeaderBytes + this.
+    [[nodiscard]] uint32_t maxMsgLength() const noexcept { return ring_->maxMsgLength(); }
 
     /// Token of the internal registration record (outside the app's 48-bit space).
     static constexpr Token kRegistrationToken = ~Token{0};
@@ -310,6 +325,7 @@ private:
         ring_           = std::exchange(o.ring_, nullptr);
         stash_          = std::move(o.stash_);
         maxRecordBytes_ = o.maxRecordBytes_;
+        maxReservation_ = o.maxReservation_;
         reservedTotal_  = o.reservedTotal_;
         outstanding_    = o.outstanding_;
         stashHead_      = o.stashHead_;
@@ -413,9 +429,10 @@ private:
     }
 
     CompletionsConfig          cfg_;
+    uint32_t maxRecordBytes_ = 0;  // before ring_: the ring is built with it
+    uint32_t maxReservation_ = 0;
     detail::CompletionRing*    ring_ = nullptr;  // owned per the §3.3 protocol (see the class doc)
     std::unique_ptr<uint8_t[]> stash_;
-    uint32_t maxRecordBytes_ = 0;
     uint32_t reservedTotal_  = 0;  // owner thread only
     uint32_t outstanding_    = 0;  // owner thread only
     uint32_t stashHead_      = 0;  // owner thread only

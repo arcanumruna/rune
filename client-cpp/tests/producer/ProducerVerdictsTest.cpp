@@ -814,3 +814,45 @@ TEST(ProducerVerdictsRegression, OnAckFullHandlerGetsTheTier2VerdictsRegression)
     EXPECT_EQ(v.rejection(0).index, 1);
     EXPECT_EQ(v.rejection(1).index, 3);
 }
+
+// Review fix round: a BatchAck's verdict list rides along only when its record is deliverable on THE queue (fits the
+// reservation, and one ring record).  A 4096-record batch with 2000 rejections is a 16 KB list: on a 64 KiB queue (maxMsg 8 KiB)
+// it goes out as RecordsRejected with an empty list and the base offset, and nothing is lost to the ring.
+TEST(ProducerVerdictsRegression, BatchAckVerdictListTooLargeIsDeliveredEmptyRegression) {
+    rc::CompletionsConfig cc;
+    cc.capacityBytes  = 64u << 10;
+    cc.maxResultBytes = 8192u - 40u;   // a 64 KiB ring's largest message is 8 KiB
+    rc::Completions cq(cc);
+    struct Sink { rc::Completions* cq; std::vector<rc::Completion> acks; } sink{&cq, {}};
+    for (const bool big : {true, false}) {
+        sink.acks.clear();
+        Rig r(Rig::cfg(Acks::All | Acks::View), /*direct=*/false, std::size_t{1} << 22);
+        ProducerImpl::Hooks h;
+        h.ctx = &sink;
+        h.cqDeliver = [](void* ctx, rc::CqRef, const rc::Completion& c, std::span<const uint8_t> p) noexcept {
+            auto* k = static_cast<Sink*>(ctx);
+            if (c.op != rc::OpKind::BatchAck) return;
+            k->acks.push_back(c);
+            (void)k->cq->ring().deliver(c, p, rc::detail::CompletionRing::Overflow::TooLarge);   // as Client::producerCqDeliver_
+        };
+        r.impl.setHooks(h);
+        r.impl.setBatchAckCq(&cq, 7);
+        r.send(4096);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        std::vector<uint16_t> rej;
+        for (uint16_t i = 0; i < (big ? 2000 : 2); ++i) rej.push_back(static_cast<uint16_t>(i * 2));
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer(rej));
+        ASSERT_EQ(sink.acks.size(), 1u);
+        std::vector<rc::Completion> got;
+        std::vector<std::size_t> plen;
+        cq.poll([&](const rc::Completion& c, std::span<const uint8_t> p) {
+            if (c.op == rc::OpKind::BatchAck) { got.push_back(c); plen.push_back(p.size()); }
+        });
+        ASSERT_EQ(got.size(), 1u);
+        EXPECT_EQ(got[0].status, OpStatus::RecordsRejected) << (big ? "big" : "small");
+        EXPECT_EQ(got[0].value, 100);
+        EXPECT_EQ(got[0].errorCode, kViolation);
+        EXPECT_EQ(plen[0], big ? 0u : 16u) << (big ? "an undeliverable list is dropped" : "a list that fits still rides along");
+        EXPECT_EQ(cq.ring().lostCompletions(), 0u);
+    }
+}

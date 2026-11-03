@@ -182,8 +182,20 @@ inline constexpr uint32_t kAckRecordBytes = kBatchAckUnitBytes;  // CompletionRi
 /// Tier-2 batch's.  A View producer's completion may carry one 8-byte verdict entry per record (status RecordsRejected), so it
 /// reserves for them up front: reservation = delivery on every status.  A 1-record batch, and a producer without View, keep
 /// the plain record.  Single sends and tryClaim always use kAckRecordBytes.
+///
+/// The record r = completionRecordBytes(8 n) can exceed the queue's slack record M, and a record above M can wrap and leave up
+/// to r bytes of end-of-buffer padding.  So a batch of n >= 2 reserves 2r - 48: the record AND that padding (the ring's
+/// deliver() never writes a record above (reserved + 48) / 2 for a reservation above M).  Reserve, unreserve and the derive path
+/// all come from this ONE function, so the credit balances.
 [[nodiscard]] constexpr uint32_t batchCompletionBytes(bool viewSent, uint32_t n) noexcept {
-    return viewSent && n > 1 ? detail::CompletionRing::completionRecordBytes(8u * n) : kAckRecordBytes;
+    if (!viewSent || n <= 1) return kAckRecordBytes;
+    const uint32_t r = detail::CompletionRing::completionRecordBytes(8u * n);
+    return 2u * r - detail::CompletionRing::completionRecordBytes(0);
+}
+
+/// The record a batch completion of `n` records delivers at most (the inverse of batchCompletionBytes' doubling).
+[[nodiscard]] constexpr uint32_t batchCompletionRecordBytes(uint32_t n) noexcept {
+    return detail::CompletionRing::completionRecordBytes(8u * n);
 }
 
 // kMsgTier2Batch token: 8 bytes = the pooled Tier2Slot's index (int64 LE, in-process).
@@ -934,6 +946,9 @@ public:
     [[nodiscard]] uint32_t batchCompletionBytes(uint32_t n) const noexcept {
         return producer::batchCompletionBytes(viewSent_(), n);
     }
+    /// True when ONE completion for a batch of `n` records can be reserved on `cq` at all: its record fits one ring record
+    /// (kRecordHeaderBytes + maxMsgLength) and its reservation is within cq.maxReservation().  Never retryable when false.
+    [[nodiscard]] bool batchCompletionFits(const Completions& cq, uint32_t n) const noexcept;
     [[nodiscard]] bool onBatchThread() const noexcept { return std::this_thread::get_id() == t2Thread_; }
     /// Rebind the issuing thread to the caller, before the first batch() from the new thread.  A
     /// builder still live on the old thread is refused there and hands its slot back through the
@@ -2176,6 +2191,10 @@ private:
     BatchAckFn   batchAckFn_    = nullptr;
     void*        batchAckCtx_   = nullptr;
     CqRef        batchAckCqRef_ = kNoCqRef;   // duty side: the BatchAck queue's registry ref
+    // duty side, immutable after setBatchAckCq (copied from the queue at setup, so the duty thread never reads the app-owned
+    // queue): its slack record M and its ring's largest message.  Defaults: a default-config Completions.
+    uint32_t     batchAckMaxRecord_ = detail::CompletionRing::completionRecordBytes(16u << 10);
+    uint32_t     batchAckMaxMsg_    = (1u << 20) / 8;
     // fix2 minor: plain counter (see testCallbackExceptionCount()).
     uint64_t     callbackExceptions_ = 0;
 

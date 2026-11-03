@@ -414,10 +414,7 @@ BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, u
         if (const SendResult shape = impl_->claimBatchShape(key, n, recLen); shape != SendResult::Ok) return BatchClaim(shape);
     }
     const uint32_t cqBytes = impl_->batchCompletionBytes(n);
-    if (cqBytes > cq.maxRecordBytes() ||
-        cqBytes - detail::CompletionRing::kRecordHeaderBytes > cq.config().capacityBytes / 8) {
-        return BatchClaim(SendResult::MessageTooLarge);
-    }
+    if (!impl_->batchCompletionFits(cq, n)) return BatchClaim(SendResult::MessageTooLarge);
     const OpResult rr = cq.reserve(cqBytes);
     if (rr != OpResult::Accepted) return BatchClaim(mapReserve(rr));
     return claimBatchPart_(topic, key.partition(topic.partitionCount), key, n, recLen,

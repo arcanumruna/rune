@@ -48,10 +48,12 @@ public:
         return recordBytes(kCompletionBytes + payloadLen);
     }
 
-    /// `capacityBytes`: the ring's usable capacity (a power of two).
-    explicit CompletionRing(std::uint32_t capacityBytes)
+    /// `capacityBytes`: the ring's usable capacity (a power of two).  `maxRecordBytes`: the owning queue's slack record M
+    /// (Completions::maxRecordBytes()): a reservation above it stands for a record of at most (reserved + 48) / 2 bytes.
+    CompletionRing(std::uint32_t capacityBytes, std::uint32_t maxRecordBytes)
         : storage_(new std::uint8_t[totalBytes(capacityBytes)]())  // zeroed: the ring requires it
-        , ring_(storage_.get(), totalBytes(capacityBytes)) {}
+        , ring_(storage_.get(), totalBytes(capacityBytes))
+        , maxRecord_(maxRecordBytes) {}
 
     CompletionRing(const CompletionRing&)            = delete;
     CompletionRing& operator=(const CompletionRing&) = delete;
@@ -90,6 +92,15 @@ public:
         }
         std::uint32_t room = c.reservedBytes - kRecordHeaderBytes - kCompletionBytes;
         if (room > maxMsgLength() - kCompletionBytes) room = maxMsgLength() - kCompletionBytes;
+        if (c.reservedBytes > maxRecord_) {
+            // A reservation R above the slack record M is 2r - 48 for a record of r bytes: write no record above
+            // (R + 48) / 2 (8-aligned down), whatever the payload, so the padding the record may leave stays paid for.
+            // A record up to M needs no extra (its padding is the queue's slack record), so the cap is never below M.
+            std::uint32_t cap = ((c.reservedBytes + completionRecordBytes(0)) / 2u) & ~7u;
+            if (cap < maxRecord_) cap = maxRecord_;
+            const std::uint32_t capRoom = cap - kRecordHeaderBytes - kCompletionBytes;
+            if (room > capRoom) room = capRoom;
+        }
         std::size_t len = payload.size();
         if (len > room) {
             if (overflow == Overflow::TooLarge) {
@@ -182,6 +193,7 @@ private:
 
     std::unique_ptr<std::uint8_t[]> storage_;
     OneToOneRingBuffer               ring_;
+    std::uint32_t                    maxRecord_ = 0;        // the queue's slack record M (immutable)
     std::uint64_t                    lostCompletions_ = 0;  // producer (duty) side only
 };
 

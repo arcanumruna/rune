@@ -262,7 +262,7 @@ TEST(CheckedWritesAcksRegression, ViewBatchReservesItsVerdictPayloadRegression) 
     rc::Client client(offlineCfg());
     rc::Completions cq(client);
     constexpr uint32_t R = rc::producer::batchCompletionBytes(true, 8);
-    static_assert(R == 48 + 8 * 8);
+    static_assert(R == 2 * (48 + 8 * 8) - 48, "a View batch completion reserves its record plus its own wrap padding");
     {
         auto p = client.producer(cfgOf(Acks::All | Acks::View));
         auto c = p.claimBatch(rc::TopicHandle{7, 4}, Key(uint64_t{1}), 8, 4, cq, 1);
@@ -284,6 +284,43 @@ TEST(CheckedWritesAcksRegression, ViewBatchReservesItsVerdictPayloadRegression) 
         c.abort();
         EXPECT_EQ(cq.reservedBytes(), 0u);
     }
+}
+
+// Review fix round (blocker): a View batch of up to 4096 records must fit a DEFAULT queue (the old bound was one maximal
+// record, so more than 2048 records were refused).  Real default Completions, real claimBatch and send(cq).
+TEST(CheckedWritesAcksRegression, ViewBatchOf4096FitsADefaultQueueRegression) {
+    rc::Client client(offlineCfg());
+    rc::Completions cq(client);   // default config
+    constexpr uint32_t R = rc::producer::batchCompletionBytes(true, 4096);
+    ASSERT_GT(R, cq.maxRecordBytes()) << "the point: a 4096-record completion is above the slack record";
+    auto p = client.producer(cfgOf(Acks::All | Acks::View));
+    {
+        auto c = p.claimBatch(rc::TopicHandle{7, 4}, Key(uint64_t{1}), 4096, 4, cq, 1);
+        ASSERT_EQ(c.result(), SendResult::Ok);
+        EXPECT_EQ(cq.reservedBytes(), R);
+        c.abort();
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+    }
+    {
+        auto c = p.claimBatch(rc::TopicHandle{7, 4}, Key(uint64_t{1}), 2049, 4, cq, 2);
+        ASSERT_EQ(c.result(), SendResult::Ok) << "just above the old 2048 bound";
+        c.abort();
+        EXPECT_EQ(cq.reservedBytes(), 0u);
+    }
+    auto b = p.batch(rc::TopicHandle{7, 4}, Key(uint64_t{1}));
+    const std::vector<uint8_t> v(1, 1);
+    for (int i = 0; i < 4096; ++i) b.add(v);
+    ASSERT_EQ(b.send(cq, 3), rc::OpResult::Accepted);
+    EXPECT_EQ(cq.reservedBytes(), R);
+    ASSERT_EQ(p.closeImmediately(), rc::OpResult::Accepted);
+    int seen = 0;
+    cq.poll([&](const rc::Completion& c, std::span<const uint8_t>) {
+        ++seen;
+        EXPECT_EQ(c.reservedBytes, R);
+    });
+    EXPECT_EQ(seen, 1);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    EXPECT_EQ(cq.ring().lostCompletions(), 0u);
 }
 
 TEST(CheckedWritesAcksRegression, ViewBatchTooBigForTheQueueIsMessageTooLargeRegression) {

@@ -1324,6 +1324,12 @@ void ProducerImpl::setOnBatchAck(BatchAckFn fn, void* ctx) {
     batchAckCtx_ = ctx;
 }
 
+bool ProducerImpl::batchCompletionFits(const Completions& cq, uint32_t n) const noexcept {
+    const uint32_t rec = viewSent_() && n > 1 ? producer::batchCompletionRecordBytes(n) : kAckRecordBytes;
+    return rec <= detail::CompletionRing::kRecordHeaderBytes + cq.maxMsgLength() &&
+           batchCompletionBytes(n) <= cq.maxReservation();
+}
+
 void ProducerImpl::setBatchAckCq(Completions* cq, CqRef ref) {
     if (batchAckCq_ != nullptr) throw std::logic_error("Producer::batchAcksTo: already set");
     if (batchAckFn_ != nullptr) {
@@ -1339,6 +1345,10 @@ void ProducerImpl::setBatchAckCq(Completions* cq, CqRef ref) {
     if (sentBefore) throw std::logic_error("Producer::batchAcksTo: called after a send (setup phase only)");
     batchAckCqRef_ = ref;
     batchAckCq_    = cq;
+    if (cq != nullptr && cq->valid()) {
+        batchAckMaxRecord_ = cq->maxRecordBytes();
+        batchAckMaxMsg_    = cq->maxMsgLength();
+    }
 }
 
 void ProducerImpl::completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t aux, OpStatus st,
@@ -3219,11 +3229,16 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
     c.errorCode     = static_cast<uint16_t>(errorCode);
     c.reservedBytes = units * kAckRecordBytes;  // the credit of every record it covers (batchAckUnits)
     c.reserved0     = static_cast<uint16_t>(producerEpoch);  // batchAckOf() -> BatchAck::producerEpoch
-    // The list rides along when it fits the reservation: a regular batch reserved `recordCount` units of 48 B and
-    // 48 n >= 48 + 8 n for n >= 2; a Tier-2 BatchAck holds one unit, so it carries the status with no list (the Tier-2
-    // batch's own completion has it).
-    const std::span<const uint8_t> list =
-        stored && rune::client::detail::CompletionRing::completionRecordBytes(static_cast<uint32_t>(rejections.size())) <= c.reservedBytes ? rejections : std::span<const uint8_t>{};
+    // The list rides along only when the record it makes, rec = completionRecordBytes(8 count), is deliverable on THIS queue:
+    //  (a) it fits the reservation: rec <= units * 48 when rec <= the queue's slack record M, else 2 rec - 48 <= units * 48
+    //      (the ring's deliver() writes no record above (reserved + 48) / 2 for a reservation above M); and
+    //  (b) it is one ring record: rec <= kRecordHeaderBytes + the ring's maxMsgLength.
+    // Otherwise the status goes out with an empty list (value = the base offset, errorCode = the first rejection), as a Tier-2
+    // BatchAck does (one unit).  With deliver()'s cap a list that passes (a) and (b) cannot lose a completion.
+    const uint32_t rec = detail::CompletionRing::completionRecordBytes(static_cast<uint32_t>(rejections.size()));
+    const uint64_t need = rec <= batchAckMaxRecord_ ? rec : 2ull * rec - kAckRecordBytes;
+    const bool carry = stored && need <= c.reservedBytes && rec <= detail::CompletionRing::kRecordHeaderBytes + batchAckMaxMsg_;
+    const std::span<const uint8_t> list = carry ? rejections : std::span<const uint8_t>{};
     c.payloadLen = static_cast<uint32_t>(list.size());
     hooks_.cqDeliver(hooks_.ctx, batchAckCqRef_, c, list);
 }

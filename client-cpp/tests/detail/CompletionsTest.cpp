@@ -5,6 +5,7 @@
 
 #include <rune/client/Completions.h>
 #include <rune/client/detail/OneToOneRingBuffer.h>
+#include <rune/client/producer/ProducerImpl.h>
 
 #include <gtest/gtest.h>
 
@@ -347,6 +348,81 @@ TEST(Completions, DeliverStaysWithinReservationRegression) {
     EXPECT_EQ(got[1].status, OpStatus::ResultTooLarge);
     EXPECT_EQ(got[1].value, 300);
     EXPECT_EQ(lens[1], 0u);
-    EXPECT_EQ(cq.reserve(cq.maxRecordBytes() + 8), OpResult::InvalidArgument);
+    EXPECT_EQ(cq.reserve(cq.maxReservation() + 8), OpResult::InvalidArgument);
     EXPECT_EQ(cq.reserve(err + 3), OpResult::InvalidArgument) << "an unaligned reservation is refused";
+}
+
+// Review fix round (blocker): a View batch completion above the slack record M reserves 2r - 48 (record + its own wrap
+// padding) and the ring caps what it writes at (R + 48) / 2, so large completions never lose one.  Seeded randomized model on
+// a standalone queue: reserve a batch completion, deliver a record of the FULL size r for a random outstanding reservation,
+// poll; nothing is ever lost, every payload comes back byte-equal, the credit balances to zero.
+TEST(CompletionsLargeRecordsRegression, CompletionRingLargeRecordsNeverLoseACompletionRegression) {
+    struct Case { uint32_t cap; uint32_t maxResult; };
+    // 64 KiB: maxMsg 8 KiB, M = 2096 (a default 16 KiB maxResultBytes does not fit a 64 KiB ring: Completions::validate).
+    // 1 MiB: the default config (M = 16432), maxMsg 128 KiB; View batches stop at 4096 records.
+    for (const Case cs : {Case{64u << 10, 2048u}, Case{1u << 20, 16u << 10}}) {
+        for (const uint64_t seed : {1ull, 0xC0FFEEull, 12345ull}) {
+            CompletionsConfig cfg;
+            cfg.capacityBytes  = cs.cap;
+            cfg.maxResultBytes = cs.maxResult;
+            Completions cq(cfg);
+            const uint32_t maxRec = CompletionRing::kRecordHeaderBytes + cq.maxMsgLength();
+            uint32_t nMax = (maxRec - CompletionRing::completionRecordBytes(0)) / 8;
+            if (nMax > 4096) nMax = 4096;
+            ASSERT_GT(CompletionRing::completionRecordBytes(8 * nMax), cq.maxRecordBytes()) << "the model must reach large records";
+            ASSERT_GE(cq.maxReservation(), rune::client::producer::batchCompletionBytes(true, nMax));
+
+            uint64_t rng = seed * 0x9E3779B97F4A7C15ull + 1;
+            auto next = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+            struct Held { Token t; uint32_t n; uint32_t resv; };
+            std::vector<Held> held;                  // reserved, not yet delivered
+            std::deque<Held> inRing;                 // delivered, not yet polled (FIFO)
+            Token nextTok = 1;
+            uint64_t reserved = 0, polled = 0;
+            auto pollSome = [&](uint32_t limit) {
+                (void)cq.poll([&](const Completion& c, std::span<const uint8_t> p) {
+                    ASSERT_FALSE(inRing.empty());
+                    const Held h = inRing.front();
+                    inRing.pop_front();
+                    EXPECT_EQ(c.token, h.t);
+                    ASSERT_EQ(p.size(), h.n > 1 ? 8u * h.n : 0u);
+                    for (std::size_t k = 0; k < p.size(); ++k) {
+                        if (p[k] != patternByte(h.t, k)) { ADD_FAILURE() << "payload byte " << k << " of token " << h.t; break; }
+                    }
+                    ++polled;
+                }, static_cast<int>(limit));
+            };
+            for (int step = 0; step < 100'000; ++step) {
+                const uint32_t op = static_cast<uint32_t>(next() % 100);
+                if (op < 40) {
+                    const uint32_t n = (next() & 1) ? 1 + static_cast<uint32_t>(next() % nMax) : 1 + static_cast<uint32_t>(next() % 64);
+                    const uint32_t resv = rune::client::producer::batchCompletionBytes(true, n);
+                    const OpResult r = cq.reserve(resv);
+                    ASSERT_TRUE(r == OpResult::Accepted || r == OpResult::QueueFull) << "n=" << n;
+                    if (r == OpResult::Accepted) { held.push_back({nextTok++, n, resv}); ++reserved; }
+                } else if (op < 75) {
+                    if (held.empty()) continue;
+                    const std::size_t i = next() % held.size();
+                    const Held h = held[i];
+                    held[i] = held.back();
+                    held.pop_back();
+                    ASSERT_TRUE(deliver(cq, h.t, h.resv, h.n > 1 ? 8u * h.n : 0u)) << "step " << step << " n=" << h.n;
+                    inRing.push_back(h);
+                } else {
+                    pollSome(1 + static_cast<uint32_t>(next() % 8));
+                }
+                ASSERT_EQ(cq.ring().lostCompletions(), 0u) << "step " << step;
+            }
+            while (!held.empty()) {
+                const Held h = held.back();
+                held.pop_back();
+                ASSERT_TRUE(deliver(cq, h.t, h.resv, h.n > 1 ? 8u * h.n : 0u));
+                inRing.push_back(h);
+            }
+            while (!inRing.empty()) pollSome(64);
+            EXPECT_EQ(polled, reserved) << "cap " << cs.cap << " seed " << seed;
+            EXPECT_EQ(cq.reservedBytes(), 0u) << "the credit balances";
+            EXPECT_EQ(cq.ring().lostCompletions(), 0u);
+        }
+    }
 }
