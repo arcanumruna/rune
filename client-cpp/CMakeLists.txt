@@ -257,12 +257,13 @@ set(RUNE_CLAIM_GEN_HEADERS
     "${RUNE_CLAIM_GEN_DIR}/gen/long_key.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/short_key.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/eos_out.gen.h"
-    "${RUNE_CLAIM_GEN_DIR}/gen/player_event.gen.h")
+    "${RUNE_CLAIM_GEN_DIR}/gen/player_event.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/ki_account.gen.h")
 add_custom_command(
     OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
     COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"
     DEPENDS rune_gen_claim_schemas
-    COMMENT "2b-B: generating position / tick_sample / long_key / short_key / eos_out / player_event .gen.h"
+    COMMENT "2b-B: generating position / tick_sample / long_key / short_key / eos_out / player_event / ki_account .gen.h"
 )
 add_custom_target(generate_claim_schema_headers DEPENDS ${RUNE_CLAIM_GEN_HEADERS})
 endif()
@@ -762,6 +763,28 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
             find_library(UUID_LIB_FILTER_PROBE uuid)
             if(UUID_LIB_FILTER_PROBE)
                 target_link_libraries(filter_probe PRIVATE ${UUID_LIB_FILTER_PROBE})
+            endif()
+        endif()
+    endif()
+
+    # ── Checked writes Part 05 — key index probe (broker/docker/checked-writes-e2e.sh) ──
+    #
+    # checked_writes_probe.cpp includes the build-time generated ki_account.gen.h (tests/support/GenClaimSchemas.cpp),
+    # so the probe image needs tests/ in its context.
+    if(TARGET generate_claim_schema_headers)
+        add_executable(checked_writes_probe examples/checked_writes_probe.cpp)
+        add_dependencies(checked_writes_probe generate_claim_schema_headers)
+        target_include_directories(checked_writes_probe PRIVATE ${RUNE_PROTOCOL_INCLUDE} "${RUNE_CLAIM_GEN_DIR}/gen" "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+        target_link_libraries(checked_writes_probe PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            rune_codec
+        )
+        if(UNIX AND NOT APPLE)
+            find_library(UUID_LIB_CHECKED_WRITES_PROBE uuid)
+            if(UUID_LIB_CHECKED_WRITES_PROBE)
+                target_link_libraries(checked_writes_probe PRIVATE ${UUID_LIB_CHECKED_WRITES_PROBE})
             endif()
         endif()
     endif()
