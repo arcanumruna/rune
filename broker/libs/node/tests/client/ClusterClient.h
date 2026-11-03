@@ -51,13 +51,14 @@ inline int32_t leaderOn(BrokerNode& n, int32_t topicId, int32_t partition) {
     });
 }
 
-/// Every running broker agrees on one live leader for every partition of `topicId` (bounded, no sleep).
+/// Every running broker agrees on one live leader for every partition of `topicId` (bounded).  A poll sleeps 1 ms, so the deadline
+/// passes before the poll cap is reached: the cap is only a backstop.
 inline bool awaitLeaders(ThreeNodes& c, int32_t topicId, int32_t parts, std::vector<int32_t>& leaders,
                          std::chrono::milliseconds within) {
     using Clock = std::chrono::steady_clock;
-    constexpr int kMaxPolls = 1'000'000;
-    int polls = 0;
-    for (const auto deadline = Clock::now() + within; polls++ < kMaxPolls && Clock::now() < deadline; std::this_thread::yield()) {
+    const int64_t maxPolls = within.count() + 1;
+    int64_t polls = 0;
+    for (const auto deadline = Clock::now() + within; polls++ < maxPolls && Clock::now() < deadline; std::this_thread::sleep_for(std::chrono::milliseconds(1))) {
         leaders.assign(static_cast<std::size_t>(parts), -1);
         bool ok = true;
         const auto running = c.runningNodes();
