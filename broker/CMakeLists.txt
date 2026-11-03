@@ -585,6 +585,8 @@ if(BUILD_BENCHMARKS)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_CLIENT_ROOT}/examples)
     # FusedRuntimePassBench drives a real broker with the shard tests' wire client.
     target_include_directories(rune_broker_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/tests/support)
+    # CatalogBootLog.h (support/) includes "support/TestNodeConfig.h".
+    target_include_directories(rune_broker_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/tests)
     target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway rune_node rune_metadata_msm rune_dynamic_balancer rune_view benchmark::benchmark)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_NODE_INCLUDE})
     if(aeron_FOUND)
