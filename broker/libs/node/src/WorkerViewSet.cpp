@@ -353,7 +353,7 @@ void WorkerViewSet::onDiscardDone_(int32_t viewTopicId, int32_t partition, int32
 }
 
 void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t partition,
-                                                    int64_t committedTail) {
+                                                    int64_t committedTail, const SourceLogBounds& b) {
     if (recoveryViews_.empty()) return;  // no recovery view installed — nothing to do
     auto sit = subscriptionIndex_.find(srcTopicId);
     if (sit == subscriptionIndex_.end()) return;
@@ -384,7 +384,7 @@ void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t 
                                std::span<const std::span<const uint8_t>>(records.data(), records.size()),
                                committedTail, &applied);
         if (const auto vit = views_.find(instKey(viewTopicId, partition)); vit != views_.end())
-            applyRecoveredCheckpoint_(vit->second, rc, scan, applied);
+            applyRecoveredCheckpoint_(vit->second, rc, scan, applied, b);
     }
 }
 
@@ -557,10 +557,11 @@ void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopi
     inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
     inst.readiness = (inst.foldCursor >= committedTail) ? ViewReadiness::Ready
                                                         : ViewReadiness::RebuildingViews;
-    applyRecoveredCheckpoint_(inst, rc, scan, applied);
+    applyRecoveredCheckpoint_(inst, rc, scan, applied, SourceLogBounds{});   // bounds unknown here: the first driveView_ pass repeats the check
 }
 
-void WorkerViewSet::applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, const ViewCheckpointScan& scan, std::size_t applied) {
+void WorkerViewSet::applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, const ViewCheckpointScan& scan, std::size_t applied,
+                                              const SourceLogBounds& b) {
     // The committed file's class (C7).  A torn tail is repaired by the IO agent before its first append (the worker never
     // writes the file) and removes nothing recovery could decode; a corrupt file is backed up and rebuilt.
     CheckpointOrigin origin = rc.origin;
@@ -586,7 +587,12 @@ void WorkerViewSet::applyRecoveredCheckpoint_(ViewInstance& inst, const Recovere
             [[fallthrough]];
         case CheckpointOrigin::Committed:
             // Unreadable: a record failed its CRC / framing, or the replay stopped before the last verified record.
-            if (corrupt || applied < scan.records.size()) beginDiscard_(inst, ViewDiscardReason::Unreadable);
+            if (corrupt || applied < scan.records.size()) {
+                beginDiscard_(inst, ViewDiscardReason::Unreadable);
+            } else if (inst.foldCursor > b.logEnd) {   // #159: rows folded from records the source log no longer holds
+                ++inst.counters.checkpointsAheadOfLog;
+                beginDiscard_(inst, ViewDiscardReason::AheadOfLog);
+            }
             return;
     }
 }

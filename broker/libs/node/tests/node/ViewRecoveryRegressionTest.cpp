@@ -519,7 +519,7 @@ struct DiscardRig {
     void writeCheckpoint(const std::vector<uint8_t>& srcBatch, int64_t foldTo) {
         writeFile(ckptPath(), makeBaseCheckpoint(plan, layout, src, srcBatch, foldTo));
     }
-    void materialize() { vs->materializeRecoveryInstancesFor(kSrcId, 0, logTo); }
+    void materialize() { vs->materializeRecoveryInstancesFor(kSrcId, 0, logTo, bounds); }
     auto readLog() {
         return [this](int64_t from, int64_t) -> rune::storage::LogReadView {
             if (from < logFrom) return {};
@@ -1157,4 +1157,97 @@ TEST(ViewCheckpointTailRegression, FieldFileBrokenByTheBugIsBackedUpThenRebuiltR
     const auto scan = rune::node::scanViewCheckpoint({reinterpret_cast<const uint8_t*>(now.data()), now.size()});
     EXPECT_TRUE(std::holds_alternative<rune::node::ViewCheckpointClean>(scan.tail));
     EXPECT_FALSE(scan.records.empty()) << "the new file starts with a valid record";
+}
+
+
+// ── C5 (#159): a checkpoint whose offset is above the source log end is backed up and rebuilt, never served.
+namespace {
+// 20 source records: key 7 at offsets [0,12), key 9 at [12,20).  The log the rig holds is only the first 12 (key 7).
+std::vector<uint8_t> twentyRecordsKey7ThenKey9() {
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    for (int i = 0; i < 20; ++i) {
+        const int64_t key = i < 12 ? 7 : 9;
+        const auto k = keyBytes(key);
+        const auto v = encodeCharacter(key, 30 + i, 1);
+        b.append(asSv(k), asSv(v), 0);
+    }
+    return b.build();
+}
+void rigOverTwelveRecordLog(DiscardRig& r) {
+    r.log = upsertRun(7, 30, 12, 0);
+    r.logFrom = 0; r.logTo = 12;
+    r.bounds = rune::node::SourceLogBounds{0, 12};
+}
+void expectAheadOfLogRecovered(DiscardRig& r, const std::string& before) {
+    ASSERT_TRUE(r.pumpUntilReady());
+    r.pump(4);
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".ahead-of-log.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), before);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointsAheadOfLog, 1u);
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_EQ(r.vs->getRow(kViewId, 0, 9, L), nullptr) << "a row only the future checkpoint held is not served";
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 41);   // the recompute of [0,12): hp 30..41
+    EXPECT_EQ(r.vs->instanceServeState(kViewId, 0).foldCursor, 12);
+}
+}  // namespace
+
+TEST(ViewBackupRegression, CheckpointAheadOfTheLogIsBackedUpThenRebuiltRegression) {
+    DiscardRig r("rune_t_c5_a1-", 0);
+    rigOverTwelveRecordLog(r);
+    r.writeCheckpoint(twentyRecordsKey7ThenKey9(), 20);
+    const std::string before = slurpFile(r.ckptPath());
+    r.materialize();
+    EXPECT_NE(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready) << "never Ready on rows from records the log does not have";
+    expectAheadOfLogRecovered(r, before);
+}
+
+// The same, for an instance created lazily by the first fold pass (recovery ran without bounds): the driveView_ check catches it.
+TEST(ViewBackupRegression, LazilyRecoveredCheckpointAheadOfTheLogIsBackedUpThenRebuiltRegression) {
+    DiscardRig r("rune_t_c5_a1b-", 0);
+    rigOverTwelveRecordLog(r);
+    r.writeCheckpoint(twentyRecordsKey7ThenKey9(), 20);
+    const std::string before = slurpFile(r.ckptPath());
+    r.fold();   // no materialize: getOrCreate_ loads the checkpoint without bounds
+    expectAheadOfLogRecovered(r, before);
+}
+
+// O == logEnd is a caught-up checkpoint: nothing to discard, Ready at once.
+TEST(ViewBackupRegression, CheckpointAtTheLogEndIsKeptRegression) {
+    DiscardRig r("rune_t_c5_a2-", 0);
+    r.writeCheckpoint(upsertRun(7, 30, 4, 0), 4);
+    r.bounds = rune::node::SourceLogBounds{0, 4};
+    r.materialize();
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    r.fold();
+    r.pump(4);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointsAheadOfLog, 0u);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+    EXPECT_TRUE(rune::node::listViewBackups(r.dir, kViewId, 0).empty());
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33);
+}
+
+// O == logEnd + 1 is the boundary: one record the log never held.
+TEST(ViewBackupRegression, CheckpointOneAboveTheLogEndIsDiscardedRegression) {
+    DiscardRig r("rune_t_c5_a3-", 0);
+    r.writeCheckpoint(upsertRun(7, 30, 5, 0), 5);
+    const std::string before = slurpFile(r.ckptPath());
+    r.bounds = rune::node::SourceLogBounds{0, 4};
+    r.materialize();
+    ASSERT_TRUE(r.pumpUntilReady());
+    r.pump(4);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointsAheadOfLog, 1u);
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_EQ(slurpFile(backups[0]), before);
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33) << "the rebuild folds [0,4) only";
 }

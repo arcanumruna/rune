@@ -132,7 +132,7 @@ public:
     // calls this BEFORE driveRebuild/driveFolds so a recovery view never gets a
     // fresh Ready instance that would bypass its checkpoint + serve-guard.
     void materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t partition,
-                                         int64_t committedTail);
+                                         int64_t committedTail, const SourceLogBounds& b = {});
 
     // Task 16: install a view FOR RECOVERY for ONE partition.  Registers the
     // plan template (like installView) AND eagerly creates the (view, partition)
@@ -607,8 +607,10 @@ private:
 
     /// Cold: what to do with the files a recovered instance found (#590).  Legacy only -> back it up and rebuild; a legacy file
     /// next to a committed one -> back the legacy one up, keep the committed rows; a committed file that did not replay cleanly
-    /// (a corrupt scan, or `applied` < the verified records) -> back it up and rebuild; a torn tail is only logged (the IO agent trims it).
-    void applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, const ViewCheckpointScan& scan, std::size_t applied);
+    /// (a corrupt scan, or `applied` < the verified records) -> back it up and rebuild; a torn tail is only logged (the IO agent trims it);
+    /// a clean checkpoint whose offset is above the source log end (`b.logEnd`) -> back it up and rebuild (#159).
+    void applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, const ViewCheckpointScan& scan, std::size_t applied,
+                                   const SourceLogBounds& b);
     /// One kDiscardMsgType{LegacySuperseded} frame (fire and forget: its ack, reason LegacySuperseded, never touches CheckpointState; a failure is only logged and counted).  False = ring full.
     [[nodiscard]] bool tryPushLegacySuperseded_(int32_t viewTopicId, int32_t partition);
     std::vector<uint64_t> legacyOwed_;   ///< instKeys whose superseded-legacy frame awaits ring room (cold path, nearly always empty)
@@ -640,6 +642,14 @@ private:
         //     runs before the namespace pause return: a resumed view sees it on its first pass.
         if (transientSrc == nullptr && inst.foldCursor < b.logStart) [[unlikely]] {
             if (!startAtLogStart_(inst, b.logStart)) return 1;
+        }
+        // 0c'. #159: a persisted instance whose cursor is above the source log end holds rows from records the log no longer has
+        //      (a checkpoint outran a lost or truncated log; a lazily recovered instance, created without bounds, lands here on its
+        //      first pass): back it up and rebuild from the log.
+        if (transientSrc == nullptr && inst.persisted && inst.foldCursor > b.logEnd) [[unlikely]] {
+            ++inst.counters.checkpointsAheadOfLog;
+            beginDiscard_(inst, ViewDiscardReason::AheadOfLog);
+            return 1;
         }
         // 00. Task 12 (D26): the namespace is over its view-memory limit -> pause at foldCursor (reads answer
         //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.

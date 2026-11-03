@@ -7085,7 +7085,7 @@ private:
             tbp              = &tb;
         }
         if (viewSet_->hasRecovery()) [[unlikely]] {
-            viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
+            viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound, bounds);
             work += viewSet_->driveRebuild(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
                                            leaderHwConfirmed, ns, write, bounds);
         }
