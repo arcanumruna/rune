@@ -1287,8 +1287,11 @@ struct Seen {
 /// Subscriptions from offset 0; the handler runs on the client's thread.
 class Collector {
 public:
+    // The handler may still run after unsubscribe() until finished() (Subscription.h), and it writes into this object.
     ~Collector() {
         for (rc::Subscription& s : subs_) s.unsubscribe();
+        EXPECT_TRUE(waitFor([&] { return std::all_of(subs_.begin(), subs_.end(), [](const rc::Subscription& s) { return s.finished(); }); }, 10s))
+            << "every subscription finished before the collector is destroyed";
     }
     void subscribe(rc::Client& c, rc::TopicHandle topic, int32_t partition) {
         rc::SubscribeOptions o;
