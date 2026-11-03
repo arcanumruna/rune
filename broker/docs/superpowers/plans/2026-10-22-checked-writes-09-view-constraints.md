@@ -112,9 +112,35 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 
 ## What batch 1 decides for this part (binding; added 2026-11-03)
 
-Issue batch 1 (`bugfix/issue-batch-1-views`) settles five things this part builds on. **Start Part 09 only after batch 1 is on `main`.** Where batch 1 contradicts a ruling or task below, batch 1 wins and the task is read as amended here.
+Issue batch 1 (`bugfix/issue-batch-1-views`) settles five things this part builds on. Where batch 1 contradicts a ruling or task below, batch 1 wins and the task is read as amended here.
 
-1. **B1-1 — A lagging leader never undoes a newer constraint change (#788; amends P9-5, P9-6 and Task 5).**
+**Part 09 runs in parallel with batch 1 (owner, 2026-11-03).** Batch 1 is not on `main` yet. Part 09's branch merges `origin/bugfix/issue-batch-1-views` in as batch 1 commits land; never rebase onto it or cherry-pick from it. Once batch 1 merges to `main`, merge `main` instead. Status per item, as of 2026-11-03:
+
+| Item | Who builds it | Status | What Part 09 does until it lands |
+|---|---|---|---|
+| B1-1 catalog-ordered set changes (#788) | **Part 09** (batch 1 defers #788 and #785 to this part; no batch 1 code) | not started | Build it here, as Task 5's first step, before P9-5's candidate path. |
+| B1-2 backup: IO agent, `beginDiscard_`, `CheckpointState` (C1, C2, W3) | batch 1 | landed: a17d470b, b42bd9ce, c6b5695f | Use it. |
+| B1-2 log-start rule (#726, C3) | batch 1 | landed: dd542839 | Use it. |
+| B1-2 legacy and unreadable checkpoints (#590, C4) | batch 1 | in progress | Task 2's tables 6/7 recovery calls `applyRecoveredCheckpoint_` (below), so merge C4 before Task 2's recovery step. |
+| B1-2 torn checkpoint tail (C7) | batch 1 | pending, after C4 | Tables 6/7 records go through `scanViewCheckpoint`; merge C7 before Task 2's recovery step. |
+| B1-2 checkpoint ahead of the log (#159, C5) and docs/e2e (C6) | batch 1 | pending | Nothing; Part 09 inherits them. |
+| B1-3 per-record batch verdicts (#802, claimBatch) | batch 1 (wave 1C, steps 8–10) | pending | Task 7 and Task 8's multi-record cells wait for it. Tasks 1–6 do not. |
+| B1-4 verdict-member discard backed up before its refold ("NEW", wave 1A step 4) | batch 1 | pending, after C6 | Task 4 and Task 6 refold through `VerdictViewHooks::discard` from the start; the backup arrives with the merge. |
+| B1-5 concrete `AbortedTxnFilter` (#591) | batch 1 | landed: f8871a67, b439b046 | Use it. |
+
+**Pending batch 1 changes in code this part edits (merge before touching these):**
+- **C4 (#590), `WorkerViewSet.cpp` recovery.** `readCheckpointFile` becomes a pure read returning `RecoveredCheckpoint{bytes, CheckpointOrigin}` (`None | Committed | CommittedAndLegacy | LegacyOnly`). `loadRecoveryCheckpoint_` / `installViewForRecovery` call a new `applyRecoveredCheckpoint_(inst, rc, bounds)`. `replayInstance` returns `ReplayResult{int64_t O; bool clean}`, and an unclean replay is `beginDiscard_(Unreadable)`. Task 2's "tables 6/7 unreadable or inconsistent → discard" goes into that unclean result, not a new branch.
+- **C7, the checkpoint splitter.** `splitViewCheckpointRecords` (`ViewInstance.h`, `WorkerViewSet.cpp`) is replaced by `scanViewCheckpoint`, which classifies a file `Clean | TornTail{cleanLen} | Corrupt{cleanLen}`. The IO agent truncates a `TornTail` on open, with no backup (nothing decodable is removed), and `Corrupt` is `Unreadable`. Any record kind this part adds to the checkpoint (claim tables 6 and 7) must be a CRC-framed record the scan understands. Never add a format the scan would call `Corrupt` when it is torn.
+- **C5 (#159).** `checkpointsAheadOfLog` and `beginDiscard_(AheadOfLog)` in `applyRecoveredCheckpoint_` and the first `driveView_` pass. Constrained views inherit it.
+- **#807, wave 1A (`Worker.h` gate before `driveViewsOf_`, `ensureVerdictSource`'s erase branch).** A source whose last verdict view is dropped erases its judge. Task 6's two-phase drop relies on it: after the last constrained view on a source drops, `write.verdicts` is null and nothing waits on a frozen `judgedThrough`.
+- **#809, wave 1B (`verdictOnLogCut_`).** The verdict timeline is cut at the lowest truncation since the last pass, not the last one. Task 4's timeline work uses that floor.
+- **#808, wave 1B (`driveViewsOf_`).** A judge is created only on a disk-backed replica. Unique and Check members never run on a memory-backed replica (SD9 already refuses them in production).
+- **#804, wave 1C (`ControlRecordLayout.h`).** New `parseControl` → `ControlRecord{type, value}` with one CRC per record. `LogCleaner`, `verdictFeedBatch` and the rig parse through it. Type 18 v2 (B1-1) and type 20 (P9-8) parse through `parseControl`; `parseControl` keeps refusing type 20 until P9-8 switches it on.
+- **#806, wave 1C (`Producer.h`, `ProducerImpl.cpp`).** New `AckCompletionFn(ctx, const Completion&, payload)` and an `onAck` overload: an ack handler sees constraintId, aux, op and the verdict trailer. Task 7's `constraintName` tests cover both the CQ and the handler paths.
+- **#791 instrumentation, wave 1A (cold path).** Warn-level logs in `syncConstraintSet_`, `VerdictSource::waitForInstall_` and the view-ack timeout. B1-1 rewrites `syncConstraintSet_`: keep the logs, and add the gate's decision (`catalogThrough_` vs the change's `catalogThrough`) to them.
+- **#798, #799, #801, wave 1D.** Tests and contract docs only. They touch the overview contracts this part reads; merge before editing those docs.
+
+1. **B1-1 — A lagging leader never undoes a newer constraint change (#788; amends P9-5, P9-6 and Task 5). Decided in batch 1's planning; this part implements it (batch 1 ships no code for it).**
    - **Bug class.** `syncConstraintSet_` (`WorkerViewSet.cpp`) builds the desired set from the templates installed on this worker. Nothing orders that against the logged set. A leader whose catalog has not yet applied a DDL change computes the old set and logs it. For example, a replace is reverted (fp2 → fp1) and the replicas that had already replaced wait forever (#788). P9-5's candidate path has the same hole, and so do a create or drop that the new leader has not applied yet.
    - **Rule.** Every `ConstraintSetChange` (type 18) records the catalog position it was computed at. A leader asks for a change only when its own catalog has applied at least that position. Otherwise it keeps the logged set and asks again once its catalog advances. The catalog (`__catalog`) is one linear log, so a leader at or past that position knows every DDL that produced the logged set: any difference is a newer DDL, never a stale one. Convergence comes from catalog replication, not from a timeout (rule 16).
    - **Wire.** The type-18 payload goes to version 2: `[version u8 = 2][constraintSetId u32][catalogThrough i64][count u16]` followed by count × `[viewObjectId u64][kind u8][planFingerprint u64]`. Members are unchanged. Type 18 has never been released (it is not in `broker-v0.3.0`), so readers accept only version 2. A version-1 type 18 is unparseable, and no compatibility path is kept. Types 17, 19 and 20 keep their own version bytes.
@@ -124,7 +150,7 @@ Issue batch 1 (`bugfix/issue-batch-1-views`) settles five things this part build
      - So a worker sees an event's installs and uninstalls before the mark that covers them.
      - `WorkerViewSet::catalogThrough_` starts at -1 at boot. It holds the latest mark, which never moves back.
    - **Gate.** `syncConstraintSet_` returns 0 without a request while `catalogThrough_ < latestChange.catalogThrough`. `requestChange` stamps `catalogThrough_`. The sync cache (`constraintSyncEpoch`, `constraintSyncChange`) also keys on `catalogThrough_`, so a mark re-runs the sync. The judge's existing wait for an uninstalled member stays as it is.
-   - **Tests this part adds.** Each test fails first. Run each one in the 1-node VerdictRig and with a failover in `ThreeNodes`:
+   - **Tests this part adds.** Each test fails first and is named `…Regression`; closing #788 cites the repro test. Run each one in the 1-node VerdictRig and with a failover in `ThreeNodes`:
      - **The #788 repro.** A follower has T1 (fp1). Replicate a change to {obj, fp2} at a catalog position above its own, then promote it. No change re-adds fp1. After the fp2 install and mark arrive, the judge activates.
      - **The same shape for create and drop.**
      - **The P9-5 candidate path.**
