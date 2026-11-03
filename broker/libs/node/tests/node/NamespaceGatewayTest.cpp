@@ -445,3 +445,39 @@ TEST(NamespaceGatewayRegression, CrossNamespaceRequestIdReuseNeverLeaksResultReg
     EXPECT_EQ(r.defineTopic(g.root, "alpha/t"), -1) << "alpha's topic exists";
     EXPECT_GE(r.defineTopic(g.root, "bravo/t"), 0) << "bravo has no topic t (the refused request created nothing)";
 }
+
+// #637 (lead D5): group names that look qualified.  Groups are scoped into the session's namespace by
+// scopeClientIdInto (resolveName): an own-namespace qualifier names the same group as the bare name, a name the
+// session cannot resolve (foreign or unknown namespace) is an opaque literal in the SESSION's namespace.
+TEST(NamespaceGatewayRegression, QualifiedLookingGroupNamesPinnedRegression) {
+    namespace co = rune::coordination;
+    rune::catalog::NamespaceRegistry boot;
+    rune::catalog::NamespaceMirror m(boot);
+    constexpr uint32_t kAlpha = 1, kBeta = 2;
+    ASSERT_TRUE(m.upsert(rune::catalog::NamespaceRecord{kAlpha, "alpha", {}, rune::catalog::NsActive{}, 1, 11}));
+    ASSERT_TRUE(m.upsert(rune::catalog::NamespaceRecord{kBeta, "beta", {}, rune::catalog::NsActive{}, 1, 22}));
+    const co::NsRequestContext defaultUser{0, false, &m.registry()};
+    const co::NsRequestContext alphaUser{kAlpha, false, &m.registry()};
+
+    // (1) a default user's `alpha/g` is a literal in default
+    EXPECT_EQ(gw::scopeClientId(defaultUser, "alpha/g"), co::scopedId(0, "alpha/g"));
+    // (2) alpha/carol's `g` lives in alpha
+    const std::string plain = gw::scopeClientId(alphaUser, "g");
+    EXPECT_EQ(plain, co::scopedId(kAlpha, "g"));
+    // (3) her `alpha/g` is the SAME group as (2)
+    EXPECT_EQ(gw::scopeClientId(alphaUser, "alpha/g"), plain) << "an own-namespace qualifier names the bare group";
+    // (4) `beta/g` is hidden from her: a literal in alpha, distinct from (2) and from beta's own `g`
+    const std::string foreign = gw::scopeClientId(alphaUser, "beta/g");
+    EXPECT_EQ(foreign, co::scopedId(kAlpha, "beta/g"));
+    EXPECT_NE(foreign, plain);
+    EXPECT_NE(foreign, co::scopedId(kBeta, "g"));
+
+    // end to end on a real broker: alpha/alice commits through `g` and reads the same offset through `alpha/g`
+    NsGw g;
+    AuthRig& r = g.r;
+    const auto joined = r.joinStable(g.alice, "g", {g.mine});
+    ASSERT_GE(joined.second, 0);
+    EXPECT_EQ(r.commitAs(g.alice, "g", joined.first, joined.second, g.mine, 11), kOk);
+    EXPECT_EQ(r.committedOffset(g.alice, "alpha/g", g.mine), 11) << "alpha/g is alpha's g";
+    EXPECT_NE(r.committedOffset(g.alice, "bravo/g", g.mine), 11) << "a foreign qualifier is a different (literal) group";
+}
