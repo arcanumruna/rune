@@ -60,22 +60,20 @@ std::vector<uint8_t> readWholeFile(const std::string& path) {
     return out;
 }
 
-// Task 19b: this (view, partition)'s checkpoint bytes — the very file the IO
-// agent appends to (viewCheckpointFilePath).  Issue #537: a pre-fix checkpoint
-// (legacyViewCheckpointFilePath) may hold aborted-transaction data; it is never
-// replayed — it is removed here, loudly, and the instance cold-starts (foldCursor
-// 0 → RebuildingViews → driveRebuild re-folds the committed log).  Cold: once per
-// instance, on the worker that owns it (the IO agent never touches the legacy name).
-std::vector<uint8_t> readCheckpointFile(const std::string& dir, int32_t viewTopicId, int32_t partition) {
-    const std::string legacy = legacyViewCheckpointFilePath(dir, viewTopicId, partition);
+// Which checkpoint files a (view, partition) had on disk at recovery.  Issue #537: a legacy file
+// (legacyViewCheckpointFilePath) may hold aborted-transaction data and is never replayed.  Issue #590: recovery
+// never deletes anything -- it only reads; the IO agent (the one filesystem toucher) backs files up when told to.
+// Task 19b: this (view, partition)'s checkpoint bytes -- the very file the IO agent appends to (viewCheckpointFilePath).
+// A pure read: cold, once per instance, on the worker that owns it.
+RecoveredCheckpoint readCheckpointFile(const std::string& dir, int32_t viewTopicId, int32_t partition) {
+    RecoveredCheckpoint rc;
+    rc.bytes = readWholeFile(viewCheckpointFilePath(dir, viewTopicId, partition));
     std::error_code ec;
-    if (std::filesystem::exists(legacy, ec)) [[unlikely]] {
-        const bool removed = std::filesystem::remove(legacy, ec);
-        spdlog::warn("WorkerViewSet: view {} partition {}: a checkpoint written before aborted transactions were "
-                     "skipped by the fold ({}) may hold aborted data — {}; re-folding the view from the log",
-                     viewTopicId, partition, legacy, removed ? "removed" : "NOT removed (" + ec.message() + ")");
-    }
-    return readWholeFile(viewCheckpointFilePath(dir, viewTopicId, partition));
+    const bool legacy = std::filesystem::exists(legacyViewCheckpointFilePath(dir, viewTopicId, partition), ec);
+    const bool committed = !rc.bytes.empty();
+    rc.origin = committed ? (legacy ? CheckpointOrigin::CommittedAndLegacy : CheckpointOrigin::Committed)
+                          : (legacy ? CheckpointOrigin::LegacyOnly : CheckpointOrigin::None);
+    return rc;
 }
 
 // Replays checkpoint records into one instance: v1 into the output table for a
@@ -364,6 +362,12 @@ int WorkerViewSet::drainInstalls() {
 }
 
 int WorkerViewSet::drainSnapshotAcks(int limit) {
+    // A legacy-superseded frame the ring had no room for: retried here (cold, empty almost always).
+    while (!legacyOwed_.empty()) {
+        const uint64_t key = legacyOwed_.back();
+        if (!tryPushLegacySuperseded_(static_cast<int32_t>(static_cast<uint32_t>(key >> 32)), static_cast<int32_t>(static_cast<uint32_t>(key)))) break;
+        legacyOwed_.pop_back();
+    }
     return channel_.done.drain(
         [this](int32_t type, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
             if (type != kDiscardDoneMsgType || len < kDiscardDoneMsgBytes) return;   // kDoneMsgType: durable-offset acks, not needed here
@@ -417,16 +421,18 @@ void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t 
         // split it back into Task-12 records.  A missing/empty file is a valid
         // cold start — installViewForRecovery then starts at foldCursor 0 and
         // the committed log is replayed in full by driveRebuild.
-        const std::vector<uint8_t> file =
-            readCheckpointFile(viewDataDir_, viewTopicId, partition);
+        const RecoveredCheckpoint rc = readCheckpointFile(viewDataDir_, viewTopicId, partition);
         const std::vector<std::span<const uint8_t>> records =
-            splitViewCheckpointRecords(std::span<const uint8_t>(file));
+            splitViewCheckpointRecords(std::span<const uint8_t>(rc.bytes));
 
         const ViewTemplate& tpl = tit->second;
+        std::size_t applied = 0;
         installViewForRecovery(tpl.plan, tpl.layout, tpl.evolvingSrc, tpl.persisted, partition,
                                /*base=*/std::span<const uint8_t>{},
                                std::span<const std::span<const uint8_t>>(records.data(), records.size()),
-                               committedTail);
+                               committedTail, &applied);
+        if (const auto vit = views_.find(instKey(viewTopicId, partition)); vit != views_.end())
+            applyRecoveredCheckpoint_(vit->second, rc, records.size(), applied);
     }
 }
 
@@ -584,10 +590,9 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
 
 void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopicId,
                                             int32_t partition, int64_t committedTail) {
-    const std::vector<uint8_t> file =
-        readCheckpointFile(viewDataDir_, viewTopicId, partition);
+    const RecoveredCheckpoint rc = readCheckpointFile(viewDataDir_, viewTopicId, partition);
     const std::vector<std::span<const uint8_t>> records =
-        splitViewCheckpointRecords(std::span<const uint8_t>(file));
+        splitViewCheckpointRecords(std::span<const uint8_t>(rc.bytes));
 
     std::size_t applied = 0;
     const int64_t recoveredO = replayInstance(
@@ -600,13 +605,43 @@ void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopi
     inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
     inst.readiness = (inst.foldCursor >= committedTail) ? ViewReadiness::Ready
                                                         : ViewReadiness::RebuildingViews;
+    applyRecoveredCheckpoint_(inst, rc, records.size(), applied);
+}
+
+void WorkerViewSet::applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, std::size_t records, std::size_t applied) {
+    switch (rc.origin) {
+        case CheckpointOrigin::None: return;
+        case CheckpointOrigin::LegacyOnly:   // the legacy format is never loaded: back it up and rebuild from the log
+            beginDiscard_(inst, ViewDiscardReason::Legacy);
+            return;
+        case CheckpointOrigin::CommittedAndLegacy:   // the committed file is the truth; the superseded legacy one is only backed up
+            if (!tryPushLegacySuperseded_(inst.plan.viewTopicId, inst.partition))
+                legacyOwed_.push_back(instKey(inst.plan.viewTopicId, inst.partition));
+            [[fallthrough]];
+        case CheckpointOrigin::Committed:
+            // Unreadable: the file has bytes but no record applied cleanly, or the replay stopped before the last record.
+            if (applied < records || (records == 0 && !rc.bytes.empty())) beginDiscard_(inst, ViewDiscardReason::Unreadable);
+            return;
+    }
+}
+
+bool WorkerViewSet::tryPushLegacySuperseded_(int32_t viewTopicId, int32_t partition) {
+    const auto claim = channel_.deltas.tryClaim(kDiscardMsgType, static_cast<std::size_t>(kDiscardMsgBytes));
+    if (claim < 0) return false;
+    uint8_t* dst = channel_.deltas.base() + claim;
+    writeI32LE(dst, viewTopicId);
+    writeI32LE(dst + 4, partition);
+    dst[8] = static_cast<uint8_t>(ViewDiscardReason::LegacySuperseded);
+    dst[9] = dst[10] = dst[11] = 0;
+    channel_.deltas.commit(claim);
+    return true;
 }
 
 void WorkerViewSet::installViewForRecovery(
     rune::view::CompiledViewPlan plan, rune::view::RowLayout layout,
     rune::codec::Descriptor evolvingSrc, bool persisted, int32_t partition,
     std::span<const uint8_t> base,
-    std::span<const std::span<const uint8_t>> deltasInOrder, int64_t committedTail) {
+    std::span<const std::span<const uint8_t>> deltasInOrder, int64_t committedTail, std::size_t* appliedOut) {
     const int32_t viewTopicId = plan.viewTopicId;
 
     // Register the plan template + reactor index exactly as the normal path
@@ -646,6 +681,7 @@ void WorkerViewSet::installViewForRecovery(
     // nothing applied (empty/missing checkpoint) -> foldCursor starts at 0.
     std::size_t applied = 0;
     const int64_t recoveredO = replayInstance(*inst, base, deltasInOrder, applied);
+    if (appliedOut != nullptr) *appliedOut = applied;
     logRecovered(*inst, recoveredO, applied);
     discardDirty_(*inst);  // restored rows == the durable checkpoint: nothing to re-send
     inst->foldCursor   = std::max<int64_t>(recoveredO, 0);

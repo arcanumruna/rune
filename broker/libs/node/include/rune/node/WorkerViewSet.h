@@ -45,6 +45,13 @@
 
 namespace rune::node {
 
+enum class CheckpointOrigin : uint8_t { None, Committed, CommittedAndLegacy, LegacyOnly };
+
+struct RecoveredCheckpoint {
+    std::vector<uint8_t> bytes;   // the committed file's bytes (empty for None and LegacyOnly)
+    CheckpointOrigin     origin = CheckpointOrigin::None;
+};
+
 class WorkerViewSet {
 public:
     // `channel` is THIS worker's own ViewSnapshotChannel (per-worker SPSC — the
@@ -148,7 +155,7 @@ public:
                                 rune::codec::Descriptor evolvingSrc, bool persisted,
                                 int32_t partition, std::span<const uint8_t> base,
                                 std::span<const std::span<const uint8_t>> deltasInOrder,
-                                int64_t committedTail);
+                                int64_t committedTail, std::size_t* appliedOut = nullptr);
 
     // Status of a getRow probe — lets the serve path (Task 20) distinguish an
     // absent key (terminal NotFound) from a view still rebuilding (RETRIABLE
@@ -597,6 +604,14 @@ private:
     // instance of a still-underRecovery template.
     void loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopicId, int32_t partition,
                                  int64_t committedTail);
+
+    /// Cold: what to do with the files a recovered instance found (#590).  Legacy only -> back it up and rebuild; a legacy file
+    /// next to a committed one -> back the legacy one up, keep the committed rows; a committed file that did not replay cleanly
+    /// (`applied` < `records`, or bytes with no record) -> back it up and rebuild.
+    void applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, std::size_t records, std::size_t applied);
+    /// One kDiscardMsgType{LegacySuperseded} frame (fire and forget: its ack is ignored).  False = ring full.
+    [[nodiscard]] bool tryPushLegacySuperseded_(int32_t viewTopicId, int32_t partition);
+    std::vector<uint64_t> legacyOwed_;   ///< instKeys whose superseded-legacy frame awaits ring room (cold path, nearly always empty)
 
     // Task 19b: if every hosted (viewTopicId, *) instance is Ready, erase
     // viewTopicId from recoveryViews_ (so hasRecovery() returns to false once a
