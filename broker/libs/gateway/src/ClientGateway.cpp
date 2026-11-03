@@ -5143,6 +5143,12 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         handleSecuritySubscribe_(*session, msg);
         return;
     }
+    // #721: a DELETING namespace is not readable by id, even by a root session (exempt from the Deleting revoke): the
+    // same answer as a topic that does not exist.
+    if (inDeletingNs_(msg.topicId)) [[unlikely]] {
+        sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
+        return;
+    }
 
     // GB-4 / MD1-9: Leadership check — data ops MUST reach the partition leader.
     //
@@ -8760,6 +8766,20 @@ void ClientGateway::onNamespaceUpserted(const rune::catalog::NamespaceRecord& r)
     nsSlots_.setLimits(nsSlots_.slotOf(r.nsId), r.limits);
     if (txnService_ != nullptr) txnService_->setNamespaceTxnLimits(r.nsId, r.limits.maxOpenTxns, r.limits.maxTxnTimeMs);   // Task 10
     const NsStateTag tag = rune::catalog::tagOf(r.state);
+    {   // #721: track DELETING for the read gates (Subscribe / GetViewRow); a root session is exempt from the revoke below
+        const auto it = std::lower_bound(deletingNs_.begin(), deletingNs_.end(), r.nsId);
+        const bool have = it != deletingNs_.end() && *it == r.nsId;
+        if (tag == NsStateTag::Deleting && !have) deletingNs_.insert(it, r.nsId);
+        else if (tag != NsStateTag::Deleting && have) deletingNs_.erase(it);
+    }
+    if (tag == NsStateTag::Deleting) {
+        // #721: end every live subscription on the namespace's topics - the same path as a topic drop (the gateway
+        // sub ends, its in-flight PushRead is forgotten).  A root session keeps its login at Deleting, so without this
+        // it would keep receiving records until the reaper drops the topic.
+        objectIndex_.forEachInNs(r.nsId, [&](int32_t id, const rune::gateway::ObjectEntry& e) {
+            if (e.type == rune::security::ResourceType::Topic) (void)endTopicSubscriptions(id);
+        });
+    }
     // Namespaces Phase 2 Task 4: on every node, at the apply of the state change.  Only the node whose transaction
     // coordinator is loaded holds transactions (others return 0), so this covers the transactions whose sessions live
     // on other gateways or are already gone.  Idempotent.
@@ -10506,6 +10526,12 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
         if (deny_(*session, authorizeTopicIdHere_(perms, m.viewTopicId, 0, rune::security::Operation::Read,
                                                              rune::security::ResourceType::View), buf, len))
             return;
+
+    // #721: a view of a DELETING namespace is gone for readers, a root session included (one compare when none deletes).
+    if (inDeletingNs_(m.viewTopicId)) [[unlikely]] {
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "GetViewRow: namespace is being deleted");
+        return;
+    }
 
     // Resolve the owning partition from the key (canonical 8-byte LE key bytes).
     // partitionForKey needs the view's output topic in the registry; an unknown

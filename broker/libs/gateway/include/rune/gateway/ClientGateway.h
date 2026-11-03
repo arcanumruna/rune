@@ -562,6 +562,8 @@ public:
     /// Phase 2 Task 3: a deleted namespace is gone (kA2cNamespaceErased); its sessions were closed at Deleting.
     void onNamespaceErased(uint32_t nsId) {
         (void)namespaces_.erase(nsId);
+        if (const auto it = std::lower_bound(deletingNs_.begin(), deletingNs_.end(), nsId);
+            it != deletingNs_.end() && *it == nsId) deletingNs_.erase(it);   // #721
         if (txnService_ != nullptr) {
             txnService_->setNamespaceTxnLimits(nsId, 0, 0);   // Task 10
             txnService_->setNamespaceTxnGate(nsId, false);    // #661
@@ -2576,6 +2578,16 @@ private:
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     rune::catalog::NamespaceMirror namespaces_;   ///< namespaces Task 9: control thread's copy (login lookup)
     rune::node::NsSlotTable nsSlots_;             ///< namespaces Phase 2 Task 8: this gateway's own slot table
+    /// #721: the namespaces in the DELETING state (sorted, tiny: a namespace is there only until the reaper erases it).
+    /// Empty in steady state, so the read gates below cost one compare.  Control thread only.
+    std::vector<uint32_t>   deletingNs_;
+    /// #721: true when topic / view `id` belongs to a DELETING namespace.  O(1) when none is deleting, otherwise one
+    /// ObjectIndex array load plus a binary search over a handful of ids; never allocates.
+    [[nodiscard]] bool inDeletingNs_(int32_t id) const noexcept {
+        if (deletingNs_.empty()) [[likely]] return false;
+        const rune::gateway::ObjectEntry* e = objectIndex_.at(id);
+        return e != nullptr && std::binary_search(deletingNs_.begin(), deletingNs_.end(), e->nsId);
+    }
     uint64_t                nsSlotMismatches_ = 0;
     rune::node::NsLimitAggregator* nsAggregator_ = nullptr;   ///< Task 14: not owned; same thread
     std::vector<uint64_t>   workerNsSlotMismatches_;   ///< cumulative, per worker (SessionSignal NsSlotMismatch)

@@ -669,3 +669,73 @@ TEST(NamespaceDeletingProduceRegression, ClusterAdminProduceToDeletingNamespaceI
     ASSERT_TRUE(rig.until([&] { return rig.erased(nsId); }));
     for (const int32_t id : ids) EXPECT_EQ(rig.auth().produce(rig.rootSid(), id), kUnknownTopic) << "erased: topic " << id;
 }
+
+// #721: DELETING gated produce at the worker, but a read of the namespace by id was still served to a root session
+// (exempt from the Deleting revoke): its live subscriptions kept receiving, a new Subscribe was accepted and GetViewRow
+// answered, until the reaper dropped the topic.  Held reaper = the window stays open.
+TEST(NamespaceDeletingProduceRegression, RootReadsOfDeletingNamespaceAreUnknownTopicRegression) {
+    constexpr int kUnknownTopic = static_cast<int>(pc::ErrorCode::UnknownTopic);
+    LcRig rig("nsdelread");   // the reaper is held: a deleted namespace stays DELETING
+    rig.prepare("dr", LcTarget::Active, 0, LcCaller::ClusterAdmin);
+    const std::vector<int32_t> ids = rig.topicIds("dr");
+    ASSERT_EQ(ids.size(), 2u);
+    AuthRig& a = rig.auth();
+    auto& c = a.c();
+    const int64_t sid = rig.rootSid();
+    const int32_t vid = a.createView(sid, "dr/v", ids[0]);
+    ASSERT_GE(vid, 0);
+    for (int i = 0; i < 5; ++i) ASSERT_EQ(a.produce(sid, ids[0], /*untilOk=*/true), 0) << "record " << i;
+
+    const int64_t s1 = c.sendSubscribe(a.ch(), a.stream(), sid, ids[0], 0);
+    const auto s1Code = c.awaitSubscribeCode(s1, AuthRig::dl());
+    ASSERT_TRUE(s1Code.has_value());
+    ASSERT_EQ(*s1Code, 0);
+    const auto s1Id = c.subscriptionIdOf(s1);
+    ASSERT_TRUE(s1Id.has_value());
+    auto framesOf = [&](int64_t subId) {
+        std::size_t n = 0;
+        for (const auto& r : c.records()) if (r.subscriptionId == subId) ++n;
+        return n;
+    };
+    ASSERT_TRUE(c.pollUntil([&] { return framesOf(*s1Id) > 0; })) << "baseline: S1 receives the 5 records";
+    const int64_t rowCorr = c.sendGetViewRow(a.ch(), a.stream(), sid, vid, 1);
+    const auto row = c.awaitViewRowOrError(rowCorr, AuthRig::dl());
+    ASSERT_TRUE(row.has_value());
+    ASSERT_FALSE(row->isError) << "baseline: GetViewRow code " << row->errorCode;
+    ASSERT_LE(row->status, 2u) << "baseline: GetViewRow status";
+
+    const uint32_t nsId = rig.observe("dr").nsId;
+    ASSERT_NE(nsId, 0u);
+    ASSERT_EQ(rig.ns(sid, pc::NamespaceDdlKind::Delete, "dr").code, 0);
+
+    // (1) S1 ends with UnknownTopic at the Deleting apply (same path as a topic drop), not at the reaper's drop.
+    ASSERT_TRUE(c.pollUntil([&] {
+        for (const auto& e : c.errors()) if (e.correlationId == s1) return e.code == kUnknownTopic;
+        return false;
+    })) << "S1 of the DELETING namespace was not ended";
+    const std::size_t framesAtEnd = framesOf(*s1Id);
+    ASSERT_FALSE(rig.erased(nsId)) << "the reaper is held: the namespace is still DELETING";
+
+    // (2) a new root Subscribe by the topic's id answers like a topic that never existed.
+    constexpr int32_t kNeverExisted = 987654;
+    const int64_t nCorr = c.sendSubscribe(a.ch(), a.stream(), sid, kNeverExisted, 0);
+    const auto nCode = c.awaitSubscribeCode(nCorr, AuthRig::dl());
+    ASSERT_TRUE(nCode.has_value());
+    ASSERT_EQ(*nCode, kUnknownTopic) << "baseline: a never-existing id";
+    for (const int32_t id : ids) {
+        const int64_t corr = c.sendSubscribe(a.ch(), a.stream(), sid, id, 0);
+        const auto code = c.awaitSubscribeCode(corr, AuthRig::dl());
+        ASSERT_TRUE(code.has_value()) << "topic " << id;
+        EXPECT_EQ(*code, *nCode) << "a root Subscribe to topic " << id << " of the DELETING namespace";
+        EXPECT_EQ(c.subscriptionIdOf(corr).value_or(0), 0) << "topic " << id << " got a subscription";   // a refusal carries id 0
+    }
+
+    // (3) GetViewRow of the namespace's view: the missing-view answer.
+    const int64_t gCorr = c.sendGetViewRow(a.ch(), a.stream(), sid, vid, 1);
+    const auto g = c.awaitViewRowOrError(gCorr, AuthRig::dl());
+    ASSERT_TRUE(g.has_value());
+    EXPECT_FALSE(g->isError);
+    EXPECT_EQ(g->status, pc::ViewRowResponse::kUnknownView) << "GetViewRow on a view of the DELETING namespace";
+
+    EXPECT_EQ(framesOf(*s1Id), framesAtEnd) << "S1 received a frame after it ended";
+}
