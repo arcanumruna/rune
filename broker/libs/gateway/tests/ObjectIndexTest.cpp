@@ -148,6 +148,16 @@ TEST(ObjectIndexRegression, UnindexNewerSharedNameKeepsOlderRegression) {
 
 // Seeded model check against std::map: create / re-apply / drop in random order across namespaces; deletion must keep
 // every other probe chain reachable (backward-shift), and the table must agree with the model after every step.
+// #625 follow-up: dropping N objects with unique names never runs the older-sharer scan (it was O(N) per drop).
+TEST(ObjectIndexRegression, DropManyUniqueNamesNeverScansRegression) {
+    rg::ObjectIndex idx;
+    constexpr int kN = 5000;
+    for (int i = 0; i < kN; ++i) idx.onTopic(static_cast<uint32_t>(i % 3), i, "u" + std::to_string(i));
+    for (int i = 0; i < kN; ++i) idx.onDropped(i);
+    EXPECT_EQ(idx.scanStepsForTest(), 0u) << "a drop with no older sharer scanned entries_";
+    for (int i = 0; i < kN; ++i) EXPECT_FALSE(idx.byName(static_cast<uint32_t>(i % 3), "u" + std::to_string(i)).has_value());
+}
+
 TEST(ObjectIndexRegression, RandomizedModelRegression) {
     for (uint32_t seed = 1; seed <= 20; ++seed) {
         std::mt19937 rng(seed);
@@ -190,6 +200,11 @@ TEST(ObjectIndexRegression, RandomizedModelRegression) {
                         const auto m = model.find({ns, name});
                         ASSERT_EQ(got.has_value(), m != model.end()) << "seed " << seed << " step " << step;
                         if (got) ASSERT_EQ(*got, m->second) << "seed " << seed << " step " << step;
+                        if (got) {
+                            std::size_t live = 0;
+                            for (const auto& [i, k] : byId) if (k.first == ns && k.second == name) ++live;
+                            ASSERT_EQ(idx.shadowedForTest(ns, name), live - 1) << "seed " << seed << " step " << step;
+                        }
                     }
             }
         }
