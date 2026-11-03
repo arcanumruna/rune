@@ -179,3 +179,20 @@ TEST(CheckedWritesStressHistory, SendThrowingDuringALeaderCrashReachesTheCallerR
     EXPECT_THROW(d.crashLeaderDuringSends(), std::runtime_error);
     EXPECT_EQ(cluster.runningNodes().size(), 2u);
 }
+
+// Final review M5: a view row lookup that never answers is reported as a failed lookup, not as a row that should not be there.
+TEST(CheckedWritesStressHistory, ViewLookupThatNeverAnswersSaysSoRegression) {
+    using Op = CheckedWritesStressDriver::Op;
+    using Result = CheckedWritesStressDriver::Sent::Result;
+    ThreeNodes cluster = ThreeNodes::startWith("cw05_lookup_fails", [](rune::node::NodeConfig& cfg) { cfg.verdictIntervalMs = 20; });
+    CheckedWritesStressDriver d(cluster, 1, true);
+    d.setUp();
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_EQ(d.kiWrite(Op::Insert, 1).result, Result::Ok);
+    d.quiesce();
+    ASSERT_FALSE(HasFatalFailure());
+    d.setViewLookupHookForTest([] { throw std::runtime_error("no answer"); });
+    std::string why;
+    EXPECT_FALSE(d.checkInvariantForTest("ViewEqualsFreshRefold", &why));
+    EXPECT_NE(why.find("key 1: the lookup failed after "), std::string::npos) << why;
+}

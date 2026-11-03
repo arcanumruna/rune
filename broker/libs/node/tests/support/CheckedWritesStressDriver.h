@@ -239,6 +239,15 @@ public:
     [[nodiscard]] int32_t topicId() const noexcept { return topicId_; }
     /// Key-index mode: `fn` sees every write just before it is sent, and may throw in its place.
     void setKiSendHookForTest(std::function<void(const Sent&)> fn) { kiSendHook_ = std::move(fn); }
+    /// `fn` runs before every view row lookup, and may throw in its place.
+    void setViewLookupHookForTest(std::function<void()> fn) { viewLookupHook_ = std::move(fn); }
+    /// Runs the one registered invariant `name` against the history as it stands.
+    [[nodiscard]] bool checkInvariantForTest(const std::string& name, std::string* why) {
+        for (const auto& [n, fn] : invariants_)
+            if (n == name) return fn(*this, why);
+        *why = "no invariant " + name;
+        return false;
+    }
     /// Holds (or lets go) every leadership scan on node `id`: its RC build sees nothing resident, so a partition it leads stays
     /// unjudged and its index empty.
     void holdLeadershipScan(int id, bool hold) {
@@ -808,28 +817,26 @@ private:
         }
         return true;
     }
-    bool viewRow_(uint64_t id, std::pair<int64_t, uint16_t>* out) {
+    /// A view row lookup: the key's row, no row, or no answer from any try (`tries` of them).
+    enum class Lookup { Present, Absent, Failed };
+    Lookup viewRow_(uint64_t id, std::pair<int64_t, uint16_t>* out, int* tries) {
         rune::client::ViewRowResult row;
         const auto deadline = Clock::now() + wait_(60s);
+        *tries = 0;
         for (int poll = 0; poll < kPollCap && Clock::now() < deadline; ++poll, std::this_thread::sleep_for(100ms)) {
-            try { row = reader_->getViewRowAndWait(viewTopicId_, id, 0, 10s); } catch (const std::exception&) { continue; }
-            if (row.status == rune::client::ViewRowResult::kOk || row.status == rune::client::ViewRowResult::kAbsentKey) break;
+            ++*tries;
+            try {
+                if (viewLookupHook_) viewLookupHook_();
+                row = reader_->getViewRowAndWait(viewTopicId_, id, 0, 10s);
+            } catch (const std::exception&) { continue; }
+            if (row.status == rune::client::ViewRowResult::kAbsentKey) return Lookup::Absent;
+            if (row.status != rune::client::ViewRowResult::kOk) continue;
+            int64_t v = 0;
+            for (int i = 0; i < 8; ++i) v |= static_cast<int64_t>(row.rowBytes[9 + static_cast<std::size_t>(i)]) << (8 * i);   // [bitmap][id][v][tag]; the key-index row [bitmap][id][name]
+            *out = {v, static_cast<uint16_t>(row.rowBytes[17] | (row.rowBytes[18] << 8))};
+            return Lookup::Present;
         }
-        if (row.status != rune::client::ViewRowResult::kOk) return false;
-        int64_t v = 0;
-        for (int i = 0; i < 8; ++i) v |= static_cast<int64_t>(row.rowBytes[9 + static_cast<std::size_t>(i)]) << (8 * i);   // [bitmap][id][v][tag]; the key-index row [bitmap][id][name]
-        *out = {v, static_cast<uint16_t>(row.rowBytes[17] | (row.rowBytes[18] << 8))};
-        return true;
-    }
-    bool rowAbsent_(uint64_t id) {
-        const auto deadline = Clock::now() + wait_(60s);
-        for (int poll = 0; poll < kPollCap && Clock::now() < deadline; ++poll, std::this_thread::sleep_for(100ms)) {
-            rune::client::ViewRowResult row;
-            try { row = reader_->getViewRowAndWait(viewTopicId_, id, 0, 10s); } catch (const std::exception&) { continue; }
-            if (row.status == rune::client::ViewRowResult::kAbsentKey) return true;
-            if (row.status == rune::client::ViewRowResult::kOk) return false;
-        }
-        return false;
+        return Lookup::Failed;
     }
 
     void registerDefaults_() {
@@ -928,12 +935,15 @@ private:
             for (int p = 0; p < d.parts_; ++p) proj.merge(d.models_[static_cast<std::size_t>(p)].projection());
             for (uint64_t id = 1; id <= static_cast<uint64_t>(d.keys_); ++id) {
                 const auto it = proj.find(id);
+                std::pair<int64_t, uint16_t> row;
+                int tries = 0;
+                const Lookup got = d.viewRow_(id, &row, &tries);
+                if (got == Lookup::Failed) { *why = "key " + std::to_string(id) + ": the lookup failed after " + std::to_string(tries) + " tries"; return false; }
                 if (it == proj.end()) {
-                    if (!d.rowAbsent_(id)) { *why = "key " + std::to_string(id) + " has a row but no live accepted record"; return false; }
+                    if (got == Lookup::Present) { *why = "key " + std::to_string(id) + " has a row but no live accepted record"; return false; }
                     continue;
                 }
-                std::pair<int64_t, uint16_t> row;
-                if (!d.viewRow_(id, &row)) { *why = "key " + std::to_string(id) + " has no row"; return false; }
+                if (got == Lookup::Absent) { *why = "key " + std::to_string(id) + " has no row"; return false; }
                 if (row.first != it->second.first || row.second != it->second.second) { *why = "key " + std::to_string(id) + " row (" + std::to_string(row.first) + ", " + std::to_string(row.second) + ") != model"; return false; }
             }
             return true;
@@ -1038,6 +1048,7 @@ private:
     std::vector<std::unique_ptr<Writer>> writers_;
     std::vector<std::unique_ptr<KiWriter>> kiWriters_;
     std::function<void(const Sent&)> kiSendHook_;
+    std::function<void()> viewLookupHook_;
     std::vector<Sent> sent_;
     std::vector<std::set<int64_t>> seen_;   ///< per partition: every offset any replica showed as a data record, change record or marker
     std::vector<std::map<int64_t, VerdictRig::RigLogRec>> data_;   ///< per partition
