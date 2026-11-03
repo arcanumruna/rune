@@ -580,6 +580,55 @@ TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To19Regress
     }
 }
 
+// The type-17 marker through the cleaner, in context (the sweep above skips it because a lone marker is held): a log
+// [set change, data, marker A, data, marker B, pads].  The cleaner keeps marker A while the replica bound (C11) has not passed
+// it, and drops it two passes after the bound passes it; the last marker (B) is the coverage and is always kept.
+TEST(CheckedWritesControlRecordRegression, VerdictMarkerInContextFollowsTheReplicaBoundThroughTheCleanerRegression) {
+    const auto markerOf = [](int64_t base, int64_t from, int64_t ft) {
+        std::vector<uint8_t> b(cr::markerBatchBytes(0));
+        (void)cr::buildVerdictMarker(b, cr::MarkerHeader{from, ft, 1, 0}, {});
+        for (int i = 0; i < 8; ++i) b[std::size_t(i)] = uint8_t(uint64_t(base) >> (8 * i));
+        return b;
+    };
+    const auto hasBatchAt = [](rune::storage::Log& log, int64_t off) {
+        const auto bytes = log.read(off, 1 << 20);
+        if (bytes.empty()) return false;
+        rune::protocol::RecordBatchReader r(bytes.data(), bytes.size());
+        return r.baseOffset() == off;
+    };
+    const auto run = [&](int64_t bound, bool& aKept, bool& bKept, bool& changeKept) {
+        TmpDir dir("cwsweep-ctx");
+        rune::storage::Log log(dir.path.string(), /*segmentBytes=*/1);
+        log.recover();
+        log.append(controlOfType(cr::kConstraintSetChange, 0), 0);
+        log.append(plainData(1, "k"), 1);
+        log.append(markerOf(2, 1, 2), 2);
+        log.append(plainData(3, "k"), 3);
+        log.append(markerOf(4, 3, 4), 4);
+        log.append(plainData(5, "pad"), 5);
+        log.append(plainData(6, "pad2"), 6);
+        const int64_t t0 = 1'000'000;
+        for (const int64_t now : {t0, t0 + 5000}) {
+            rune::storage::LogCleaner cleaner;
+            cleaner.setMarkerRemovalBound(bound);
+            cleaner.clean(log, 0, log.segmentBaseOffsets().back(), 0, 1000, now);
+            log.reloadSegments();
+        }
+        aKept = hasBatchAt(log, 2);
+        bKept = hasBatchAt(log, 4);
+        changeKept = hasBatchAt(log, 0);
+    };
+    bool aKept = false, bKept = false, changeKept = false;
+    run(/*bound=*/0, aKept, bKept, changeKept);
+    EXPECT_TRUE(aKept) << "bound 0: no replica has fetched marker A";
+    EXPECT_TRUE(bKept);
+    EXPECT_TRUE(changeKept);
+    run(/*bound=*/5, aKept, bKept, changeKept);
+    EXPECT_FALSE(aKept) << "every replica passed marker A: it is dropped after the horizon";
+    EXPECT_TRUE(bKept) << "the last marker is the coverage";
+    EXPECT_TRUE(changeKept) << "set changes are always kept";
+}
+
 // The drop of one verdict view retires it per (template, partition): partition 0 finishing its drop must not take the member from
 // partition 1's judge, which is still judging records below its own drop.
 TEST(CheckedWritesVerdictSourceRegression, RetireIsPerPartitionRegression) {

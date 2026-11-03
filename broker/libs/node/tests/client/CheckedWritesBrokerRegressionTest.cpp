@@ -937,6 +937,63 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
     EXPECT_EQ(got, (std::set<int64_t>{base + 0, base + 2, base + 3, base2 + 0, base2 + 2, base2 + 3, sentinelOff}));
 }
 
+// A batch whose every record is rejected is skipped by the group fetch path too: the group consumer sees exactly the accepted
+// batches around it, and its position moves past the rejected one.
+TEST(CheckedWritesBrokerRegression, FullyRejectedBatchIsSkippedOnTheGroupPathShardRegression) {
+    OneBroker b("cw-groupskip", OneBroker::Runtime::Shard);
+    const int32_t src = defineVerdictSource(b);
+    Sender s(b.clientConfig(), "vt", src, 1, kAllView);
+    const std::string recKey = std::string("\x01\0\0\0\0\0\0\0", 8);   // the typed record key: id 1
+    const auto sendBatch = [&](uint16_t tag, int n) -> std::pair<rc::Completion, std::vector<uint8_t>> {
+        const uint64_t tok = s.next++;
+        rc::BatchBuilder bb = s.prod->batch(*s.topic, rc::Key(uint64_t{1}));
+        for (int i = 0; i < n; ++i) {
+            const std::string v = verdictValue(1, i, tag);
+            bb.add(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()), recKey);
+        }
+        rc::OpResult sr = rc::OpResult::BackPressured;
+        for (int i = 0; i < 100000 && sr == rc::OpResult::BackPressured; ++i) sr = bb.send(*s.cq, tok);
+        EXPECT_EQ(sr, rc::OpResult::Accepted);
+        s.prod->flush();
+        std::optional<rc::Completion> c;
+        std::vector<uint8_t> payload;
+        (void)s.cq->waitFor(tok, 15s, [&](const rc::Completion& d, std::span<const uint8_t> p) { c = d; payload.assign(p.begin(), p.end()); });
+        EXPECT_TRUE(c.has_value());
+        return {c.value_or(rc::Completion{}), payload};
+    };
+    const auto [ca, pa] = sendBatch(1, 3);   // A: accepted
+    const auto [cb, pb] = sendBatch(9, 3);   // B: every record rejected
+    const auto [cc, pc] = sendBatch(1, 3);   // C: accepted
+    ASSERT_EQ(ca.status, rc::OpStatus::Ok);
+    ASSERT_EQ(cb.status, rc::OpStatus::RecordsRejected);
+    ASSERT_EQ(rc::BatchVerdicts(cb, pb).rejectedCount(), 3u) << "B is fully rejected";
+    ASSERT_EQ(cc.status, rc::OpStatus::Ok);
+    std::set<int64_t> want;
+    for (int i = 0; i < 3; ++i) { want.insert(ca.value + i); want.insert(cc.value + i); }
+
+    std::mutex mu;
+    std::set<int64_t> got;
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit = false;
+    rc::GroupConsumer group = s.client->subscribeGroup("cw-g", {"vt"}, gcfg);
+    group.onRecords([&](const rc::RecordSet& rs) {
+        std::lock_guard<std::mutex> g(mu);
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { got.insert(off); });
+    });
+    const int64_t lastC = cc.value + 2;
+    bool arrived = false;
+    for (int i = 0; i < 1200 && !arrived; ++i) {   // 50 ms each: a 60 s deadline
+        {
+            std::lock_guard<std::mutex> g(mu);
+            arrived = got.count(lastC) != 0;
+        }
+        if (!arrived) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(arrived) << "the group never delivered the last accepted record";
+    std::lock_guard<std::mutex> g(mu);
+    EXPECT_EQ(got, want) << "the group sees A and C, and not one record of the fully rejected B";
+}
+
 // ===========================================================================================================
 // Part 04: verdict sources on three real brokers.  TestReject (tag 9, object 7) is installed on every node's worker.
 // ===========================================================================================================

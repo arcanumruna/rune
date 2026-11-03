@@ -893,3 +893,84 @@ TEST(CheckedWritesVerdictCleaner, RigCompactionKeepsTheAcceptedLatest) {
         EXPECT_EQ(it->second, want) << "key " << id;
     }
 }
+
+// ---- #798: a replica that lags the verdict marker leads after the cleaner ran ----
+namespace {
+/// Every batch of `log` from `from`, as raw bytes, in offset order (the walk controlTypes() does).
+std::vector<std::vector<uint8_t>> rawBatchesOf(rune::storage::Log& log, int64_t from, int64_t through) {
+    std::vector<std::vector<uint8_t>> out;
+    for (int64_t off = from; off < through;) {
+        const auto v = log.readView(off, 1 << 20);
+        if (v.empty()) break;
+        for (std::size_t p = 0; p + 12 <= v.len;) {
+            int32_t blen = 0;
+            std::memcpy(&blen, v.data + p + 8, 4);
+            const std::size_t total = 12 + static_cast<std::size_t>(blen);
+            if (p + total > v.len) break;
+            int64_t base = 0;
+            std::memcpy(&base, v.data + p, 8);
+            if (base >= through) return out;
+            if (base >= from) out.emplace_back(v.data + p, v.data + p + total);
+            p += total;
+        }
+        off = v.nextOffset;
+    }
+    return out;
+}
+}  // namespace
+
+// Node 1 leads and judges two batches (markers M1 over the first, M2 over the second); node 2 fetched only up to M1.  The cleaner
+// runs twice (stamp, then drop) with the replica's published bound: it must keep M1, because node 2 holds the first batch's rejected
+// record but not M1.  Node 2 then leads from its own copy of the pre-compaction head plus what it fetches from node 1 afterwards:
+// it delivers no rejected record and its views hold no row of one.
+TEST(CheckedWritesVerdictWorkerRegression, LaggingReplicaLeadsAndDeliversNoRejectedRecordRegression) {
+    VerdictRig a(/*follower=*/true, /*rollBytes=*/1);
+    a.typed();
+    a.installRejectView(kRej, kObj, tagRule(9));
+    a.passes(50);
+    ASSERT_EQ(a.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    ASSERT_TRUE(a.driveUntilJudged());
+    ASSERT_EQ(a.produce({{3, 30, 0}, {4, 40, 9}}), 0);
+    ASSERT_TRUE(a.driveUntilJudged());
+    const auto before = a.readLog();
+    ASSERT_EQ(before.markers.size(), 2u);
+    const int64_t M1 = before.markers.front().offset;
+    int64_t rejectedFirst = -1, rejectedSecond = -1;
+    for (const auto& d : before.data) {
+        if (d.id == 2) rejectedFirst = d.offset;
+        if (d.id == 4) rejectedSecond = d.offset;
+    }
+    ASSERT_LT(rejectedFirst, M1);
+    ASSERT_GT(rejectedSecond, M1);
+    // Node 2's copy of the head (everything below M1), taken before the cleaner runs.
+    const auto head = rawBatchesOf(*a.log, 0, M1);
+    ASSERT_FALSE(head.empty());
+    a.followerFetch(M1);   // node 2 is behind M1
+    const int64_t t0 = 1'000'000;
+    (void)a.compact(t0);
+    (void)a.compact(t0 + 5000);
+    ASSERT_EQ(a.readLog().markers.size(), 2u) << "M1 is kept: a replica has not fetched it";
+    ASSERT_EQ(a.readLog().markers.front().offset, M1);
+    const auto tail = rawBatchesOf(*a.log, M1, a.leo());   // what node 2 fetches from node 1 afterwards
+    ASSERT_FALSE(tail.empty());
+
+    VerdictRig b(/*follower=*/true, 1);
+    b.demote();   // a follower from the start: its log is only what node 1 replicates (offsets match node 1's)
+    b.typed();
+    b.installRejectView(kRej, kObj, tagRule(9));
+    b.passes(20);
+    ASSERT_EQ(b.leo(), 0);
+    b.replicate(head);
+    b.replicate(tail);
+    b.promote();
+    for (int i = 0; i < 100; ++i) { b.followerFetch(); b.passes(5); }
+    const int64_t s = b.subscribe(SubKind::Raw, 0);
+    std::vector<uint64_t> ids;
+    for (const auto& d : b.collect(s).records) ids.push_back(d.id);
+    std::sort(ids.begin(), ids.end());
+    EXPECT_EQ(ids, (std::vector<uint64_t>{1, 3})) << "no rejected record is delivered";
+    EXPECT_TRUE(b.hasRow(kRej, 1));
+    EXPECT_FALSE(b.hasRow(kRej, 2));
+    EXPECT_TRUE(b.hasRow(kRej, 3));
+    EXPECT_FALSE(b.hasRow(kRej, 4));
+}
