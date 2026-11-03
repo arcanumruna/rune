@@ -11,15 +11,18 @@
 //   | delete then create          | an erased namespace's slot    | after the erase              | the lowest free slot is reused         | ErasedSlotReusedRegression
 //   | metric registration         | every namespace               | create, erase, restart       | owner tag = nsId, slot value           | MetricsRegIdIsNsIdRegression
 #include "MetricsTestReader.h"
+#include "support/AllocWindow.h"
 #include "support/AuthRig.h"
 
 #include <rune/client/Client.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/node/NsSlotFanout.h>
 #include <rune/node/NsSlotTable.h>
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -290,4 +293,130 @@ TEST(NsSlotRegression, MetricsRegIdIsNsIdRegression) {
     const auto ld = readRuneMetricLiveAt(path, typeId, static_cast<int32_t>(*d));
     EXPECT_EQ(ld->ownerTag, static_cast<int64_t>(*d));
     EXPECT_FALSE(readRuneMetricLiveAt(path, typeId, static_cast<int32_t>(*a)).has_value()) << "the old series did not come back";
+}
+
+// ---- #710 / #729: the fan-out of tick-rate throttles is bounded, allocation-free and keeps assign-before-throttle ----
+namespace {
+
+/// A worker whose ring can be made to refuse; applies what it accepts to a slot table like the real worker does.
+struct StubWorker {
+    bool full = false;
+    bool refuseAssign = false;   // the ring has room for a throttle but not for the (much larger) assign
+    NsSlotTable slots{8};
+    uint64_t accepted = 0, throttles = 0, mismatches = 0;
+    std::array<int64_t, 8> lastUntil{};
+    std::array<uint32_t, 8> throttlesOfSlot{};
+    std::vector<WorkerOp::Type> order;   // only filled while `record` (outside any AllocWindow)
+    bool record = false;
+    EnqueueResult enqueueOp(WorkerOp op) {
+        if (full || (refuseAssign && op.type == WorkerOp::Type::NsSlotAssign)) return EnqueueResult::Full;
+        ++accepted;
+        if (record) order.push_back(op.type);
+        const auto slot = static_cast<uint16_t>(op.topicId);
+        const auto nsId = static_cast<uint32_t>(op.nextOffset);
+        switch (op.type) {
+        case WorkerOp::Type::NsSlotAssign:  (void)slots.place(slot, nsId); break;
+        case WorkerOp::Type::NsSlotRelease: (void)slots.release(slot, nsId); break;
+        case WorkerOp::Type::NsThrottle:
+            if (!slots.matches(slot, nsId)) { ++mismatches; break; }
+            ++throttles; ++throttlesOfSlot[slot]; lastUntil[slot] = op.hwBound;
+            break;
+        default: break;
+        }
+        return EnqueueResult::Enqueued;
+    }
+};
+struct StubPool {
+    std::vector<StubWorker> w;
+    explicit StubPool(int n) : w(static_cast<std::size_t>(n)) {}
+    int32_t workerCount() const noexcept { return static_cast<int32_t>(w.size()); }
+    StubWorker& worker(int32_t i) { return w[static_cast<std::size_t>(i)]; }
+};
+constexpr int kPumpCap = 8;   // every drive loop is capped
+
+}  // namespace
+
+TEST(NsSlotRegression, ThrottleFanoutSteadyStateZeroAllocRegression) {
+    NsSlotFanout f;
+    f.configure(64, 2);
+    StubPool pool(2);
+    for (uint16_t s = 1; s <= 4; ++s) f.post(NsSlotAssign{s, 100u + s, rune::protocol::NamespaceLimits{}});
+    for (int i = 0; i < kPumpCap && f.pendingForTest() != 0; ++i) (void)f.pump(pool);
+    ASSERT_EQ(f.pendingForTest(), 0u);
+    ASSERT_EQ(pool.w[0].slots.nsIdAt(4), 104u);   // slot 0 is `default`
+    ASSERT_EQ(pool.w[1].slots.nsIdAt(4), 104u);
+    pool.w[1].full = true;   // worker 1's ring refuses from now on
+    {
+        rune::testing::AllocWindow w;
+        for (int i = 1; i <= 10'000; ++i) {
+            for (uint16_t s = 1; s <= 4; ++s)
+                f.post(Throttle{s, 100u + s, ThrottleKind::ProduceBytes, int64_t{1'000} + i});
+            (void)f.pump(pool);
+        }
+        EXPECT_EQ(w.count(), 0u) << "sustained throttling against a full ring allocates";
+    }
+    EXPECT_EQ(f.pendingForTest(), 0u) << "tick-rate throttles never queue in the ordered FIFO";
+    EXPECT_EQ(f.dirtyForTest(1), 4u) << "one dirty entry per slot, not one per post";
+    EXPECT_EQ(f.dirtyForTest(0), 0u);
+    EXPECT_EQ(pool.w[1].throttles, 0u);
+    pool.w[1].full = false;
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    EXPECT_EQ(pool.w[1].throttles, 4u) << "exactly one throttle per slot is delivered";
+    for (uint16_t s = 1; s <= 4; ++s) {
+        EXPECT_EQ(pool.w[1].throttlesOfSlot[s], 1u) << "slot " << s;
+        EXPECT_EQ(pool.w[1].lastUntil[s], 1'000 + 10'000) << "slot " << s << ": the LAST value wins";
+    }
+    EXPECT_EQ(f.dirtyForTest(1), 0u);
+}
+
+TEST(NsSlotRegression, AssignAlwaysPrecedesThrottleRegression) {
+    NsSlotFanout f;
+    f.configure(8, 2);
+    StubPool pool(2);
+    for (auto& wk : pool.w) { wk.full = true; wk.record = true; }
+    f.post(NsSlotAssign{3, 300u, rune::protocol::NamespaceLimits{}});
+    f.post(Throttle{3, 300u, ThrottleKind::ProduceBytes, 777});
+    f.post(ViewMemOver{3, 300u, true});
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    for (auto& wk : pool.w) wk.full = false;
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    for (int w = 0; w < 2; ++w) {
+        ASSERT_EQ(pool.w[static_cast<std::size_t>(w)].order.size(), 3u) << "worker " << w;
+        EXPECT_EQ(pool.w[static_cast<std::size_t>(w)].order[0], WorkerOp::Type::NsSlotAssign) << "worker " << w << ": assign first";
+        EXPECT_EQ(pool.w[static_cast<std::size_t>(w)].mismatches, 0u);
+        EXPECT_EQ(pool.w[static_cast<std::size_t>(w)].lastUntil[3], 777);
+    }
+    // The slot is released and re-assigned to another namespace while the old namespace's throttle is still owed.
+    for (auto& wk : pool.w) wk.full = true;
+    f.post(NsSlotRelease{3, 300u});
+    f.post(NsSlotAssign{3, 301u, rune::protocol::NamespaceLimits{}});
+    f.post(Throttle{3, 300u, ThrottleKind::FetchBytes, 888});   // the OLD owner's
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    for (auto& wk : pool.w) wk.full = false;
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    for (int w = 0; w < 2; ++w) {
+        StubWorker& wk = pool.w[static_cast<std::size_t>(w)];
+        EXPECT_EQ(wk.slots.nsIdAt(3), 301u) << "worker " << w;
+        EXPECT_EQ(wk.mismatches, 1u) << "worker " << w << ": the stale throttle is dropped by the tag check";
+        EXPECT_NE(wk.lastUntil[3], 888);
+    }
+    EXPECT_EQ(f.pendingForTest(), 0u);
+    EXPECT_EQ(f.orderedOverflowsForTest(), 0u);
+
+    // Worker 1's ring has room for a throttle but not for the assign: its throttle must wait behind the assign.
+    pool.w[1].refuseAssign = true;
+    pool.w[1].order.clear();
+    f.post(NsSlotAssign{5, 500u, rune::protocol::NamespaceLimits{}});
+    f.post(Throttle{5, 500u, ThrottleKind::ProduceBytes, 999});
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    EXPECT_EQ(pool.w[0].slots.nsIdAt(5), 500u);
+    EXPECT_EQ(pool.w[0].lastUntil[5], 999) << "worker 0 is not held up by worker 1";
+    EXPECT_TRUE(pool.w[1].order.empty()) << "a throttle overtook the assign on worker 1";
+    EXPECT_EQ(pool.w[1].mismatches, 1u) << "only the earlier stale throttle (unchanged)";
+    pool.w[1].refuseAssign = false;
+    for (int i = 0; i < kPumpCap; ++i) (void)f.pump(pool);
+    ASSERT_EQ(pool.w[1].order.size(), 2u);
+    EXPECT_EQ(pool.w[1].order[0], WorkerOp::Type::NsSlotAssign);
+    EXPECT_EQ(pool.w[1].order[1], WorkerOp::Type::NsThrottle);
+    EXPECT_EQ(pool.w[1].lastUntil[5], 999);
 }

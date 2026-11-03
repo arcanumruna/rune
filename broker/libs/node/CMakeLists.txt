@@ -1933,7 +1933,7 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_ns_keyed_stores_tests PROPERTIES TIMEOUT 600)
 
         # Namespaces Phase 2 Task 8 (D22): per-node namespace slots, the broadcast to every worker and the gateway.
-        add_executable(rune_ns_slot_tests tests/node/NsSlotRegressionTest.cpp)
+        add_executable(rune_ns_slot_tests tests/node/NsSlotRegressionTest.cpp tests/support/AllocWindow.cpp)
         target_include_directories(rune_ns_slot_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_ns_slot_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)

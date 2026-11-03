@@ -1653,6 +1653,7 @@ void BrokerNode::buildWorkerPool() {
         // reports its per-slot usage to it at the same period.
         nsAggregator_.configure(nsSlots_.capacity(), static_cast<uint32_t>(workerPool_->workerCount()),
                                 static_cast<int64_t>(config_.nsLimitTickUs) * 1000);
+        nsSlotFanout_.configure(nsSlots_.capacity(), workerPool_->workerCount());   // #710 / #729: bounded, preallocated
         for (uint32_t sl = 0; sl < nsSlots_.capacity(); ++sl)
             if (nsSlots_.nsIdAt(static_cast<uint16_t>(sl)) != NsSlotTable::kFreeSlot)
                 nsAggregator_.onSlotAssign(static_cast<uint16_t>(sl), nsSlots_.nsIdAt(static_cast<uint16_t>(sl)),
