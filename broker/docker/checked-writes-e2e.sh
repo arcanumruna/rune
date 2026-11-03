@@ -12,7 +12,7 @@
 #                 re-insert -> ok (every 4th id is then removed again: the removed set of leg 5);
 #   4. VERIFY:    a subscription from 0 on every partition sees exactly the accepted records, each with the op() of the write
 #                 that produced it, and none of the 56 / 57 rejected ones;
-#   5. RESTART:   `docker restart` of all three nodes; re-inserting every live id gives 56, every removed id gives ok; VERIFY
+#   5. RESTART:   rolling restart of all three nodes (`docker restart`); re-inserting every live id gives 56, every removed id gives ok; VERIFY
 #                 again over the grown log (the key index was rebuilt from the log);
 #   6. REFUSALS:  key.index on a transient topic, an untyped topic, a keyless topic and a string(9) key give InvalidRequest with
 #                 the four exact messages;
@@ -62,7 +62,8 @@ LEG_S=600              # lifecycle / verify / restart / refusals
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
 
 log()  { echo "[checked-writes-e2e] $*" >&2; }
-fail() { echo "[checked-writes-e2e] FAIL: $*" >&2; exit 1; }
+LEG="preflight"   # the leg a failure belongs to
+fail() { echo "[checked-writes-e2e] FAIL (${LEG}): $*" >&2; exit 1; }
 
 sha256_stdin() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
 repo_tag() {
@@ -103,6 +104,7 @@ teardown() {
         for n in 1 2 3; do docker logs --timestamps "$(cname "${n}")" > "${E2E_LOG_DIR}/rune-${n}.log" 2>&1 || true; done
         cp -f "${WORK_DIR}"/*.out "${WORK_DIR}"/*.err "${E2E_LOG_DIR}/" 2>/dev/null || true
         cp -f "${SHARED}"/*.txt "${E2E_LOG_DIR}/" 2>/dev/null || true
+        cp -f "${WORK_DIR}"/*-check.txt "${E2E_LOG_DIR}/" 2>/dev/null || true
     fi
     cluster_down
     rm -rf "${WORK_DIR}" 2>/dev/null || true
@@ -233,17 +235,18 @@ bg_rc()    { cat "${WORK_DIR}/$1.rc"; }
 out_of()   { cat "${WORK_DIR}/$1.out" "${WORK_DIR}/$1.err" 2>/dev/null; }
 # out_has <tag> <pattern> : the leg's output holds the pattern (a file grep: `cat | grep -q` fails under pipefail on SIGPIPE)
 out_has()  { grep -q -e "$2" "${WORK_DIR}/$1.out" "${WORK_DIR}/$1.err" 2>/dev/null; }
-# leg <step> <tag> <timeout_s> <ok marker> <mode> [flags...] : one foreground probe leg that must exit 0 and print its marker.
+# leg <tag> <timeout_s> <ok marker> <mode> [flags...] : one foreground probe leg that must exit 0 and print its marker.
 leg() {
-    local step="$1" tag="$2" t="$3" marker="$4"; shift 4
+    local tag="$1" t="$2" marker="$3"; shift 3
     probe_run "${tag}" "${t}" "$@"
-    [ "${PROBE_RC}" -eq 0 ] || { out_of "${tag}" | tail -30 >&2; fail "${step}: ${tag} exited ${PROBE_RC}"; }
-    out_has "${tag}" "${marker}" || { out_of "${tag}" | tail -30 >&2; fail "${step}: no ${marker} from ${tag}"; }
+    [ "${PROBE_RC}" -eq 0 ] || { out_of "${tag}" | tail -30 >&2; fail "${tag} exited ${PROBE_RC}"; }
+    out_has "${tag}" "${marker}" || { out_of "${tag}" | tail -30 >&2; fail "no ${marker} from ${tag}"; }
 }
 race_progress() {
     local s=0 f v
     for f in "${SHARED}"/race-progress-w*; do
         [ -f "${f}" ] || continue
+        case "${f}" in *.tmp) continue ;; esac
         v=$(cat "${f}" 2>/dev/null) || v=0
         s=$(( s + ${v:-0} ))
     done
@@ -254,16 +257,17 @@ progress_at_least() { [ "$(race_progress)" -ge "$1" ]; }
 # ---------------------------------------------------------------------------
 # Leg 1: images, the key, the cluster, bootstrap, ki_account.
 # ---------------------------------------------------------------------------
+LEG="leg 1"
 log "Leg 1a: building the broker image (tag ${RUNE_IMAGE_TAG})..."
 set +e
 out=$(dc build rune-1 2>&1); rc=$?
 set -e
 echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
-[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "leg 1: broker image build failed (exit ${rc})"; }
-docker image inspect "rune-broker-node:${RUNE_IMAGE_TAG}" >/dev/null 2>&1 || fail "leg 1: broker image not built: rune-broker-node:${RUNE_IMAGE_TAG}"
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "broker image build failed (exit ${rc})"; }
+docker image inspect "rune-broker-node:${RUNE_IMAGE_TAG}" >/dev/null 2>&1 || fail "broker image not built: rune-broker-node:${RUNE_IMAGE_TAG}"
 
 log "Leg 1b: building the rune CLI image (${QL_IMAGE})..."
-bash "${SCRIPT_DIR}/create-topics.sh" --build-image || fail "leg 1: could not build the rune CLI image"
+bash "${SCRIPT_DIR}/create-topics.sh" --build-image || fail "could not build the rune CLI image"
 
 log "Leg 1c: building the checked_writes_probe image (${PROBE_IMAGE})..."
 set +e
@@ -273,59 +277,60 @@ out=$(docker build --platform linux/amd64 -f "${CLIENT_REPO}/docker/Dockerfile.c
     --build-context rune-ql="${PROJECTS}/ql" -t "${PROBE_IMAGE}" "${CLIENT_REPO}" 2>&1); rc=$?
 set -e
 echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
-[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "leg 1: checked_writes_probe image build failed (exit ${rc})"; }
-docker image inspect "${PROBE_IMAGE}" >/dev/null 2>&1 || fail "leg 1: checked_writes_probe image not built: ${PROBE_IMAGE}"
+[ "${rc}" -eq 0 ] || { echo "${out}" | tail -60 >&2; fail "checked_writes_probe image build failed (exit ${rc})"; }
+docker image inspect "${PROBE_IMAGE}" >/dev/null 2>&1 || fail "checked_writes_probe image not built: ${PROBE_IMAGE}"
 
 log "Leg 1d: generating the cluster key..."
-rune_gen_cluster_key "${RUNE_SECRETS_DIR}" || fail "leg 1: could not generate the cluster key"
+rune_gen_cluster_key "${RUNE_SECRETS_DIR}" || fail "could not generate the cluster key"
 
 log "Leg 1e: the 3-node cluster up..."
 dc up -d --no-build rune-1 rune-2 rune-3
 log "Leg 1f: waiting for a common consensus leader (up to ${LEADER_WAIT_S}s)..."
 wait_until "${LEADER_WAIT_S}" "a common consensus leader" cluster_has_leader \
-    || { for n in 1 2 3; do docker logs --tail 40 "$(cname "${n}")" >&2 || true; done; fail "leg 1: no common consensus leader within ${LEADER_WAIT_S}s"; }
+    || { for n in 1 2 3; do docker logs --tail 40 "$(cname "${n}")" >&2 || true; done; fail "no common consensus leader within ${LEADER_WAIT_S}s"; }
 log "Leg 1g: bootstrapping the first admin + the e2e user..."
-rune_auth_prepare "${NETWORK}" "rune-1:${BROKER_PORT}" || fail "leg 1: bootstrap / e2e user"
+rune_auth_prepare "${NETWORK}" "rune-1:${BROKER_PORT}" || fail "bootstrap / e2e user"
 
 log "Leg 1h: SETUP: ki_account (${PARTS} partitions, replicas 3, compact, key.index)..."
-leg "leg 1 (setup)" setup 300 "CHECKED-WRITES-SETUP: OK" setup
+leg setup 300 "CHECKED-WRITES-SETUP: OK" setup
 TOPIC_ID=$(grep -oE '^KI_TOPIC_ID=[0-9]+' "${WORK_DIR}/setup.out" | cut -d= -f2) || true
-[ -n "${TOPIC_ID}" ] || fail "leg 1 (setup): setup printed no topic id"
+[ -n "${TOPIC_ID}" ] || fail "setup printed no topic id"
 all_leaders() { local p; for p in $(seq 0 $(( PARTS - 1 ))); do partition_leader "${TOPIC_ID}" "${p}" >/dev/null || return 1; done; }
-wait_until 120 "all partition leaders" all_leaders || fail "leg 1 (setup): not every ki_account partition has a leader"
-LEADER0=$(partition_leader "${TOPIC_ID}" 0) || fail "leg 1 (setup): no leader of partition 0"
+wait_until 120 "all partition leaders" all_leaders || fail "not every ki_account partition has a leader"
+LEADER0=$(partition_leader "${TOPIC_ID}" 0) || fail "no leader of partition 0"
 if [ "${LEADER0}" = "0" ]; then SEED_NODE=2; fi   # the probes never connect through the node the race kills
 log "Leg 1 OK: topic ${TOPIC_ID}; partition 0 led by node ${LEADER0}; probes connect through rune-${SEED_NODE}"
 
 # ---------------------------------------------------------------------------
 # Leg 2: RACE.
 # ---------------------------------------------------------------------------
+LEG="leg 2"
 TOTAL_WRITES=$(( WORKERS * IDS ))
 log "Leg 2: RACE: ${WORKERS} containers insert ids 1-${IDS} (${TOTAL_WRITES} writes, ${THREADS} threads each); the partition-0 leader is killed at ~30 %..."
 RACE_START=$(now_s)
 for i in $(seq 0 $(( WORKERS - 1 ))); do probe_start "race-${i}" "${RACE_S}" race --worker "${i}" --ids "1-${IDS}"; done
 wait_until $(( RACE_S )) "30 % of the race" progress_at_least $(( TOTAL_WRITES * 30 / 100 )) \
-    || { out_of race-0 | tail -20 >&2; fail "leg 2: the race never reached 30 % within ${RACE_S}s (at $(race_progress) of ${TOTAL_WRITES})"; }
-LEADER0=$(partition_leader "${TOPIC_ID}" 0) || fail "leg 2: no leader of partition 0 at the kill"
+    || { out_of race-0 | tail -20 >&2; fail "the race never reached 30 % within ${RACE_S}s (at $(race_progress) of ${TOTAL_WRITES})"; }
+LEADER0=$(partition_leader "${TOPIC_ID}" 0) || fail "no leader of partition 0 at the kill"
 BASE=$(race_progress)
 log "Leg 2: killing node ${LEADER0}, the partition-0 leader, at ${BASE} of ${TOTAL_WRITES} writes"
 kill_node "${LEADER0}"
 RESUME_AT=$(( BASE + RESUME_WRITES ))
 [ "${RESUME_AT}" -le "${TOTAL_WRITES}" ] || RESUME_AT="${TOTAL_WRITES}"
 wait_until "${RESUME_WAIT_S}" "the race resuming" progress_at_least "${RESUME_AT}" \
-    || { out_of race-0 | tail -20 >&2; fail "leg 2: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the kill (at $(race_progress))"; }
+    || { out_of race-0 | tail -20 >&2; fail "no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the kill (at $(race_progress))"; }
 restart_node "${LEADER0}"
 log "Leg 2: node ${LEADER0} restarted; waiting for the racers..."
 for i in $(seq 0 $(( WORKERS - 1 ))); do
     left=$(( RACE_S - ($(now_s) - RACE_START) ))
     [ "${left}" -gt 0 ] || left=1
-    wait_until "${left}" "racer ${i}" bg_done "race-${i}" || fail "leg 2: racer ${i} did not finish within ${RACE_S}s of the race start"
-    [ "$(bg_rc "race-${i}")" = "0" ] || { out_of "race-${i}" | tail -20 >&2; fail "leg 2: racer ${i} exited $(bg_rc "race-${i}")"; }
+    wait_until "${left}" "racer ${i}" bg_done "race-${i}" || fail "racer ${i} did not finish within ${RACE_S}s of the race start"
+    [ "$(bg_rc "race-${i}")" = "0" ] || { out_of "race-${i}" | tail -20 >&2; fail "racer ${i} exited $(bg_rc "race-${i}")"; }
 done
 
 # Every id: written once by every worker; exactly one Ok, every other result 56.
 race_files=("${SHARED}"/race-w*.txt)
-[ "${#race_files[@]}" -eq "${WORKERS}" ] || fail "leg 2: ${#race_files[@]} result files, want ${WORKERS}"
+[ "${#race_files[@]}" -eq "${WORKERS}" ] || fail "${#race_files[@]} result files, want ${WORKERS}"
 awk -v ids="${IDS}" -v workers="${WORKERS}" '
     { n[$1]++; if ($3 == 0) ok[$1]++; else if ($3 == 56) rej[$1]++; else { other[$3]++; if (!(first[$3])) first[$3] = $1 } }
     END {
@@ -340,44 +345,48 @@ awk -v ids="${IDS}" -v workers="${WORKERS}" '
         }
         exit bad
     }' "${race_files[@]}" > "${WORK_DIR}/race-check.txt" \
-    || { cat "${WORK_DIR}/race-check.txt" >&2; fail "leg 2: the race broke 'exactly one Ok, every other 56' (codes 10014 = VerdictUnknown, 10002 = Timeout)"; }
+    || { cat "${WORK_DIR}/race-check.txt" >&2; fail "the race broke 'exactly one Ok, every other 56' (codes 10014 = VerdictUnknown, 10002 = Timeout, 10009 = DeliveryFailed)"; }
 log "Leg 2 OK: every id has exactly one Ok and ${WORKERS} - 1 KeyExists; $(( $(now_s) - RACE_START )) s"
 
 # ---------------------------------------------------------------------------
 # Leg 3: LIFECYCLE.
 # ---------------------------------------------------------------------------
+LEG="leg 3"
 log "Leg 3: LIFECYCLE over ${LIFECYCLE_IDS} ids..."
-leg "leg 3" lifecycle "${LEG_S}" "CHECKED-WRITES-LIFECYCLE: OK" lifecycle
+leg lifecycle "${LEG_S}" "CHECKED-WRITES-LIFECYCLE: OK" lifecycle
 log "Leg 3 OK"
 
 # ---------------------------------------------------------------------------
 # Leg 4: VERIFY.
 # ---------------------------------------------------------------------------
+LEG="leg 4"
 log "Leg 4: VERIFY: a subscription from 0 on every partition against the accepted writes..."
-leg "leg 4" verify "${LEG_S}" "CHECKED-WRITES-VERIFY: OK" verify
+leg verify "${LEG_S}" "CHECKED-WRITES-VERIFY: OK" verify
 log "Leg 4 OK: $(grep -o 'CHECKED-WRITES-VERIFY: OK.*' "${WORK_DIR}/verify.out")"
 
 # ---------------------------------------------------------------------------
 # Leg 5: RESTART.
 # ---------------------------------------------------------------------------
+LEG="leg 5"
 log "Leg 5: RESTART: docker restart of all three nodes..."
 restart_all
 log "Leg 5: re-inserting ids 1-${IDS}: a live id gives 56, a removed id (every 4th of 1-${LIFECYCLE_IDS}) gives ok..."
-leg "leg 5" restart "${RACE_S}" "CHECKED-WRITES-RACE: DONE" race --worker 0 --ids "1-${IDS}" --tag restart
+leg restart "${RACE_S}" "CHECKED-WRITES-RACE: DONE" race --worker 0 --ids "1-${IDS}" --tag restart
 awk -v ids="${IDS}" -v life="${LIFECYCLE_IDS}" '
     { n++; seen[$1]++; want = ($1 <= life && $1 % 4 == 0) ? 0 : 56
       if ($3 != want) { if (shown++ < 10) printf "id %d: code %d, want %d\n", $1, $3, want; bad = 1 } }
     END { if (n != ids) { printf "%d results, want %d\n", n, ids; bad = 1 } exit bad }' "${SHARED}/restart-w0.txt" > "${WORK_DIR}/restart-check.txt" \
-    || { cat "${WORK_DIR}/restart-check.txt" >&2; fail "leg 5: after the restart a live id did not give 56, or a removed id did not give ok"; }
+    || { cat "${WORK_DIR}/restart-check.txt" >&2; fail "after the restart a live id did not give 56, or a removed id did not give ok"; }
 log "Leg 5: VERIFY again over the grown log..."
-leg "leg 5 (verify)" verify2 "${LEG_S}" "CHECKED-WRITES-VERIFY: OK" verify
+leg verify2 "${LEG_S}" "CHECKED-WRITES-VERIFY: OK" verify
 log "Leg 5 OK"
 
 # ---------------------------------------------------------------------------
 # Leg 6: REFUSALS.
 # ---------------------------------------------------------------------------
+LEG="leg 6"
 log "Leg 6: REFUSALS: key.index on a transient, an untyped, a keyless and a string(9)-keyed topic..."
-leg "leg 6" refusals "${LEG_S}" "CHECKED-WRITES-REFUSALS: OK" refusals
+leg refusals "${LEG_S}" "CHECKED-WRITES-REFUSALS: OK" refusals
 log "Leg 6 OK"
 
 echo "CHECKED-WRITES-E2E: OK"

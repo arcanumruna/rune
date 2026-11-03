@@ -41,6 +41,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -116,6 +117,7 @@ ProducerConfig writerConfig() {
     ProducerConfig pc;
     pc.acks     = Acks::All | Acks::View;
     pc.lingerUs = 1;
+    pc.deliveryTimeoutMs = static_cast<int64_t>(kWriteWaitS) * 1000;
     return pc;
 }
 
@@ -303,17 +305,20 @@ int runVerify() {
     std::map<std::pair<uint64_t, std::string>, int> expected;
     int64_t total = 0;
     std::vector<std::string> files;
-    for (const char* tag : {"race", "lifecycle", "restart"}) {
-        for (int w = 0; w < 16; ++w) {
-            const std::string path = shared() + "/" + tag + "-w" + std::to_string(w) + ".txt";
-            std::ifstream f(path);
-            if (!f) continue;
-            files.push_back(path);
-            uint64_t id; std::string op; int code;
-            while (f >> id >> op >> code) {
-                if (code == 0) { ++expected[{id, logOpOf(op)}]; ++total; }
-                else if (code != 56 && code != 57) { fail("CHECKED-WRITES-VERIFY", path + ": " + std::to_string(id) + " " + op + " gave " + std::to_string(code)); return 1; }
-            }
+    std::vector<std::string> paths;
+    for (const auto& e : std::filesystem::directory_iterator(shared())) {
+        const std::string name = e.path().filename().string();
+        for (const char* tag : {"race-w", "lifecycle-w", "restart-w"})
+            if (name.rfind(tag, 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".txt") == 0) paths.push_back(e.path().string());
+    }
+    std::sort(paths.begin(), paths.end());
+    for (const std::string& path : paths) {
+        std::ifstream f(path);
+        files.push_back(path);
+        uint64_t id; std::string op; int code;
+        while (f >> id >> op >> code) {
+            if (code == 0) { ++expected[{id, logOpOf(op)}]; ++total; }
+            else if (code != 56 && code != 57) { fail("CHECKED-WRITES-VERIFY", path + ": " + std::to_string(id) + " " + op + " gave " + std::to_string(code)); return 1; }
         }
     }
     if (total == 0) { fail("CHECKED-WRITES-VERIFY", "no accepted write in the result files"); return 1; }

@@ -263,7 +263,7 @@ add_custom_command(
     OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
     COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"
     DEPENDS rune_gen_claim_schemas
-    COMMENT "2b-B: generating position / tick_sample / long_key / short_key / eos_out / player_event / ki_account .gen.h"
+    COMMENT "generating the claim and probe schema .gen.h headers (tests/support/GenClaimSchemas.cpp)"
 )
 add_custom_target(generate_claim_schema_headers DEPENDS ${RUNE_CLAIM_GEN_HEADERS})
 endif()
