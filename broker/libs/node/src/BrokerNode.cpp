@@ -3699,6 +3699,14 @@ uint64_t BrokerNode::workerPeerUnknownEpochDropsForTest(int32_t w) {
     });
 }
 
+uint64_t BrokerNode::workerPeerAuthFramesForTest(int32_t w, int32_t peer) {
+    return onWorkerThreadForTest(w, [peer](Worker& wk) -> uint64_t {
+        const auto* t = wk.replicationTransport();
+        const auto* c = t != nullptr ? t->peerCrypto() : nullptr;
+        return c != nullptr ? c->authFrames(peer) : 0u;
+    });
+}
+
 uint64_t BrokerNode::adminPeerUnknownEpochDropsForTest() {
     return onAdminThreadForTest([this]() -> uint64_t {
         return adminWorkerAgent_ ? adminWorkerAgent_->worker().peerUnknownEpochDropsForTest() : 0u;

@@ -1688,6 +1688,9 @@ public:
     /// Issue #241: frames worker `w` / the admin plane dropped as UnknownEpoch; read ON that thread.
     [[nodiscard]] uint64_t workerPeerUnknownEpochDropsForTest(int32_t w);
     [[nodiscard]] uint64_t adminPeerUnknownEpochDropsForTest();
+    /// Issue #275: frames worker `w`'s replication plane opened from `peer` (monotonic); read ON that thread.  The
+    /// non-vacuity witness of the rekey-under-traffic test: a rise proves the plane really carried sealed traffic.
+    [[nodiscard]] uint64_t workerPeerAuthFramesForTest(int32_t w, int32_t peer);
     /// Issue #241: this (initiator) node re-handshakes its link to `peer` now, same incarnation (control thread).
     /// False: no peer links, or not an Established initiator for `peer`.
     [[nodiscard]] bool forcePeerRekeyForTest(int32_t peer);
