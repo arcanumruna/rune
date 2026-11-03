@@ -40,6 +40,25 @@ TEST(NamespaceRigRegression, StaleUserSessionReloggedRegression) {
         EXPECT_EQ(got.code, expect(Op(o), Caller::UserUngranted, Target::OwnNs).code) << name(Op(o));
         break;
     }
+
+    // #647 follow-up: root's session and the timing cells' second sessions are replaced after 5 s idle too.
+    const int64_t rootFirst = rig.rootSessionForTest();
+    EXPECT_EQ(rig.rootSessionForTest(), rootFirst) << "a fresh root session is reused";
+    rig.ageRootSessionForTest(std::chrono::seconds(6));
+    const int64_t rootSecond = rig.rootSessionForTest();
+    EXPECT_NE(rootSecond, rootFirst) << "root's session idle past 5 s must be replaced";
+    for (std::size_t o = 0; o < kOps; ++o) {
+        if (naRule(Op(o), Target::OwnNs)) continue;
+        const NamespaceRig::Answer got = rig.run(Op(o), Caller::ClusterAdmin, Target::OwnNs, 0);
+        EXPECT_EQ(got.code, expect(Op(o), Caller::ClusterAdmin, Target::OwnNs).code) << name(Op(o));
+        break;
+    }
+    for (const Caller who : {Caller::ClusterAdmin, Caller::NsAdminSame}) {
+        const int64_t s1 = rig.secondSessionForTest(who);
+        EXPECT_EQ(rig.secondSessionForTest(who), s1) << "a fresh second session is reused";
+        rig.ageSecondSessionForTest(who, std::chrono::seconds(6));
+        EXPECT_NE(rig.secondSessionForTest(who), s1) << "a second session idle past 5 s must be replaced: " << name(who);
+    }
 }
 
 namespace {
