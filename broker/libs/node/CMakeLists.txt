@@ -26,6 +26,7 @@ add_library(rune_node
     src/CatalogReadServer.cpp
     src/CatalogEffectFrames.cpp
     src/ViewSnapshotIoAgent.cpp
+    src/ViewCheckpointScan.cpp
     src/WorkerViewSet.cpp
     src/CheckedWriteHook.cpp
     src/VerdictSource.cpp

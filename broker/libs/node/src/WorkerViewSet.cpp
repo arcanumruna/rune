@@ -178,64 +178,6 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// splitViewCheckpointRecords — see the header for the contract + wire format.
-// ---------------------------------------------------------------------------
-std::vector<std::span<const uint8_t>>
-splitViewCheckpointRecords(std::span<const uint8_t> bytes) {
-    static constexpr std::size_t kEntryHdr = 4 + 1 + 8;  // rid u32 + flags u8 + key u64
-    static constexpr std::size_t kCrc      = 4;
-    const std::size_t total = bytes.size();
-
-    // Walks `count` entries of `rowLen` from `p`; 0 on truncation, else the end.
-    auto walkEntries = [&](std::size_t p, uint32_t count, uint32_t rowLen) -> std::size_t {
-        for (uint32_t i = 0; i < count; ++i) {
-            if (p + kEntryHdr > total) return 0;
-            const uint8_t flags = bytes[p + 4];
-            p += kEntryHdr;
-            if (flags == 0) {  // upsert carries rowLen payload bytes; a delete does not
-                if (p + rowLen > total) return 0;
-                p += rowLen;
-            }
-        }
-        return p;
-    };
-    // v1: [magic][O i64][rowLen u32][count u32] entries [crc]
-    auto v1End = [&](std::size_t pos) -> std::size_t {
-        if (pos + 20 > total) return 0;
-        const std::size_t p = walkEntries(pos + 20, readU32LE(bytes.data() + pos + 16),
-                                          readU32LE(bytes.data() + pos + 12));
-        return (p == 0 || p + kCrc > total) ? 0 : p + kCrc;
-    };
-    // v2: [magic][O i64][tableCount u8] { [id u8][rowLen u32][count u32] entries }* [crc]
-    auto v2End = [&](std::size_t pos) -> std::size_t {
-        if (pos + 13 > total) return 0;
-        const uint8_t tableCount = bytes[pos + 12];
-        std::size_t p = pos + 13;
-        for (uint8_t t = 0; t < tableCount; ++t) {
-            if (p + 9 > total) return 0;
-            const uint32_t rowLen = readU32LE(bytes.data() + p + 1);
-            const uint32_t count  = readU32LE(bytes.data() + p + 5);
-            p = walkEntries(p + 9, count, rowLen);
-            if (p == 0) return 0;
-        }
-        return p + kCrc > total ? 0 : p + kCrc;
-    };
-
-    std::vector<std::span<const uint8_t>> out;
-    std::size_t pos = 0;
-    while (pos + 4 <= total) {
-        const uint32_t magic = readU32LE(bytes.data() + pos);
-        std::size_t end = 0;
-        if (magic == rune::view::kViewCheckpointMagic)        end = v1End(pos);
-        else if (magic == rune::view::kViewCheckpointMagicV2) end = v2End(pos);
-        if (end == 0) break;   // unknown magic or truncated trailing record
-        out.push_back(bytes.subspan(pos, end - pos));
-        pos = end;
-    }
-    return out;
-}
-
 WorkerViewSet::WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataDir)
     : channel_(channel), viewDataDir_(std::move(viewDataDir)) {}
 
@@ -432,8 +374,8 @@ void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t 
         // cold start — installViewForRecovery then starts at foldCursor 0 and
         // the committed log is replayed in full by driveRebuild.
         const RecoveredCheckpoint rc = readCheckpointFile(viewDataDir_, viewTopicId, partition);
-        const std::vector<std::span<const uint8_t>> records =
-            splitViewCheckpointRecords(std::span<const uint8_t>(rc.bytes));
+        const ViewCheckpointScan scan = scanViewCheckpoint(std::span<const uint8_t>(rc.bytes));
+        const std::vector<std::span<const uint8_t>>& records = scan.records;
 
         const ViewTemplate& tpl = tit->second;
         std::size_t applied = 0;
@@ -442,7 +384,7 @@ void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t 
                                std::span<const std::span<const uint8_t>>(records.data(), records.size()),
                                committedTail, &applied);
         if (const auto vit = views_.find(instKey(viewTopicId, partition)); vit != views_.end())
-            applyRecoveredCheckpoint_(vit->second, rc, records.size(), applied);
+            applyRecoveredCheckpoint_(vit->second, rc, scan, applied);
     }
 }
 
@@ -601,8 +543,8 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
 void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopicId,
                                             int32_t partition, int64_t committedTail) {
     const RecoveredCheckpoint rc = readCheckpointFile(viewDataDir_, viewTopicId, partition);
-    const std::vector<std::span<const uint8_t>> records =
-        splitViewCheckpointRecords(std::span<const uint8_t>(rc.bytes));
+    const ViewCheckpointScan scan = scanViewCheckpoint(std::span<const uint8_t>(rc.bytes));
+    const std::vector<std::span<const uint8_t>>& records = scan.records;
 
     std::size_t applied = 0;
     const int64_t recoveredO = replayInstance(
@@ -615,11 +557,25 @@ void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopi
     inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
     inst.readiness = (inst.foldCursor >= committedTail) ? ViewReadiness::Ready
                                                         : ViewReadiness::RebuildingViews;
-    applyRecoveredCheckpoint_(inst, rc, records.size(), applied);
+    applyRecoveredCheckpoint_(inst, rc, scan, applied);
 }
 
-void WorkerViewSet::applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, std::size_t records, std::size_t applied) {
-    switch (rc.origin) {
+void WorkerViewSet::applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, const ViewCheckpointScan& scan, std::size_t applied) {
+    // The committed file's class (C7).  A torn tail is repaired by the IO agent before its first append (the worker never
+    // writes the file) and removes nothing recovery could decode; a corrupt file is backed up and rebuilt.
+    CheckpointOrigin origin = rc.origin;
+    bool corrupt = false;
+    if (const auto* torn = std::get_if<ViewCheckpointTornTail>(&scan.tail)) {
+        spdlog::info("VIEW-CHECKPOINT-TORN-TAIL view={} partition={} cleanLen={} dropped={}", inst.plan.viewTopicId, inst.partition,
+                     torn->cleanLen, rc.bytes.size() - torn->cleanLen);
+        if (scan.records.empty()) {   // nothing but a torn first record: as if there were no committed file
+            if (origin == CheckpointOrigin::Committed) origin = CheckpointOrigin::None;
+            else if (origin == CheckpointOrigin::CommittedAndLegacy) origin = CheckpointOrigin::LegacyOnly;
+        }
+    } else if (std::holds_alternative<ViewCheckpointCorrupt>(scan.tail)) {
+        corrupt = true;
+    }
+    switch (origin) {
         case CheckpointOrigin::None: return;
         case CheckpointOrigin::LegacyOnly:   // the legacy format is never loaded: back it up and rebuild from the log
             beginDiscard_(inst, ViewDiscardReason::Legacy);
@@ -629,8 +585,8 @@ void WorkerViewSet::applyRecoveredCheckpoint_(ViewInstance& inst, const Recovere
                 legacyOwed_.push_back(instKey(inst.plan.viewTopicId, inst.partition));
             [[fallthrough]];
         case CheckpointOrigin::Committed:
-            // Unreadable: the file has bytes but no record applied cleanly, or the replay stopped before the last record.
-            if (applied < records || (records == 0 && !rc.bytes.empty())) beginDiscard_(inst, ViewDiscardReason::Unreadable);
+            // Unreadable: a record failed its CRC / framing, or the replay stopped before the last verified record.
+            if (corrupt || applied < scan.records.size()) beginDiscard_(inst, ViewDiscardReason::Unreadable);
             return;
     }
 }

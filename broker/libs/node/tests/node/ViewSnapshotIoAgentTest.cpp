@@ -562,3 +562,140 @@ TEST(ViewBackupRegression, DoneRingIsDrainedByTheWorkerSoAcksDoNotAccumulateRegr
     EXPECT_EQ(agent.lastDurableOffset(kBView, 0), 40);
     EXPECT_EQ(agent.pendingAcksForTest(), 0u);
 }
+
+
+// ===========================================================================
+// C7: the writer never appends after an unverified tail.
+// ===========================================================================
+namespace {
+
+void appendBytes(const std::string& path, const std::vector<uint8_t>& b) {
+    std::ofstream f(path, std::ios::binary | std::ios::app);
+    f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+}
+std::vector<uint8_t> deltaOnly(int64_t O, int32_t hp, const RowLayout& layout) {
+    const auto f = frameDelta(kBView, 0, O, hp, layout);
+    return {f.begin() + rune::node::ViewSnapshotChannel::kDeltaHeaderBytes, f.end()};
+}
+void writeRaw(const std::string& path, const std::vector<uint8_t>& b) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+}
+std::vector<uint8_t> catBytes(std::initializer_list<std::vector<uint8_t>> parts) {
+    std::vector<uint8_t> out;
+    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+std::vector<uint8_t> headBytes(const std::vector<uint8_t>& v, std::size_t k) { return {v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k)}; }
+
+// A fresh agent over `dir` takes one delta (O, hp) after the file was left as `before`; returns the agent's trim count.
+int64_t appendOverFile(const std::string& dir, const std::vector<uint8_t>& before, int64_t O, int32_t hp, const RowLayout& layout) {
+    writeRaw(committedPath(dir, kBView, 0), before);
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir, /*fsyncMs=*/0);
+    rune::consensus::ManualNanoClock clk(0);
+    appendDurable(ch, agent, clk, kBView, 0, O, hp, layout);
+    EXPECT_EQ(agent.lastDurableOffset(kBView, 0), O);
+    return agent.tailTrimsForTest();
+}
+
+}  // namespace
+
+TEST(ViewCheckpointTailRegression, AgentTruncatesATornTailBeforeTheFirstAppendRegression) {
+    const RowLayout layout = testLayout();
+    const auto rec1 = deltaOnly(10, 1, layout), rec2 = deltaOnly(20, 2, layout), rec3 = deltaOnly(30, 3, layout), rec4 = deltaOnly(40, 4, layout);
+    for (const std::size_t k : {std::size_t{1}, std::size_t{4}, std::size_t{13}, rec3.size() - 1}) {
+        SCOPED_TRACE(k);
+        TempDir dir;
+        EXPECT_EQ(appendOverFile(dir.path(), catBytes({rec1, rec2, headBytes(rec3, k)}), 40, 4, layout), 1);
+        EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), catBytes({rec1, rec2, rec4}));
+    }
+}
+
+// Crash between the truncate and its fsync, or between the trim and the next append: every state converges.
+TEST(ViewCheckpointTailRegression, CrashBetweenTruncateAndFsyncIsIdempotentRegression) {
+    const RowLayout layout = testLayout();
+    const auto rec1 = deltaOnly(10, 1, layout), rec2 = deltaOnly(20, 2, layout), rec3 = deltaOnly(30, 3, layout), rec4 = deltaOnly(40, 4, layout);
+    const auto rec5 = deltaOnly(50, 5, layout);
+    struct Row { const char* name; std::vector<uint8_t> before; std::vector<uint8_t> expect; int64_t trims; };
+    const Row rows[] = {
+        {"truncate lost: still torn", catBytes({rec1, rec2, headBytes(rec3, 20)}), catBytes({rec1, rec2, rec5}), 1},
+        {"truncated, rec4 partially appended", catBytes({rec1, rec2, headBytes(rec4, 7)}), catBytes({rec1, rec2, rec5}), 1},
+        {"truncated, rec4 complete", catBytes({rec1, rec2, rec4}), catBytes({rec1, rec2, rec4, rec5}), 0},
+        {"zero-filled extent", catBytes({rec1, rec2, std::vector<uint8_t>(4096, 0)}), catBytes({rec1, rec2, rec5}), 1},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        TempDir dir;
+        EXPECT_EQ(appendOverFile(dir.path(), row.before, 50, 5, layout), row.trims);
+        EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), row.expect);
+    }
+}
+
+// The bug's on-disk shape is not provably lossless to truncate: the agent refuses it until a discard moves it away.
+TEST(ViewCheckpointTailRegression, AgentNeverAppendsAfterACorruptTailRegression) {
+    const RowLayout layout = testLayout();
+    const auto rec1 = deltaOnly(10, 1, layout), rec2 = deltaOnly(20, 2, layout), rec3 = deltaOnly(30, 3, layout), rec4 = deltaOnly(40, 4, layout);
+    TempDir dir;
+    const auto corrupt = catBytes({rec1, rec2, headBytes(rec3, 13), rec4});
+    writeRaw(committedPath(dir.path(), kBView, 0), corrupt);
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/0);
+    rune::consensus::ManualNanoClock clk(0);
+    for (int64_t O : {50, 60, 70}) {
+        const auto f = frameDelta(kBView, 0, O, 9, layout);
+        ASSERT_TRUE(ch.deltas.write(f.data(), f.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+    }
+    for (int i = 0; i < 4; ++i) { agent.doWork(clk.nowNs()); clk.advance(60LL * 1'000'000LL); }
+    EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), corrupt);
+    EXPECT_TRUE(agent.hasError(kBView, 0));
+    EXPECT_EQ(agent.lastDurableOffset(kBView, 0), -1) << "no ack for refused deltas";
+    EXPECT_EQ(agent.tailTrimsForTest(), 0);
+
+    sendDiscard(ch, kBView, 0, ViewDiscardReason::Unreadable);
+    DoneMsg d;
+    ASSERT_TRUE(pollDone(ch, agent, clk, d));
+    EXPECT_EQ(d.status, 0);
+    const auto backups = rune::node::listViewBackups(dir.path(), kBView, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_EQ(readFile(backups[0]), corrupt);
+    appendDurable(ch, agent, clk, kBView, 0, 80, 8, layout);
+    EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), deltaOnly(80, 8, layout));
+}
+
+// A fatal write failure leaves a partial record and stops this boot's appends; the next boot trims it and resumes.
+TEST(ViewCheckpointTailRegression, WriteFailureThenRestartTrimsAndResumesRegression) {
+    const RowLayout layout = testLayout();
+    const auto rec1 = deltaOnly(10, 1, layout), rec2 = deltaOnly(20, 2, layout), rec3 = deltaOnly(30, 3, layout), rec4 = deltaOnly(40, 4, layout);
+    TempDir dir;
+    {   // boot 1
+        rune::node::ViewSnapshotChannel ch;
+        rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/0);
+        rune::consensus::ManualNanoClock clk(0);
+        for (int64_t O : {10, 20, 30}) appendDurable(ch, agent, clk, kBView, 0, O, static_cast<int32_t>(O / 10), layout);
+        appendBytes(committedPath(dir.path(), kBView, 0), headBytes(rec4, 17));   // the partial write the failure left
+        agent.forceErroredForTest(kBView, 0);
+        const auto before = readFile(committedPath(dir.path(), kBView, 0));
+        const auto f = frameDelta(kBView, 0, 40, 4, layout);
+        ASSERT_TRUE(ch.deltas.write(f.data(), f.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+        for (int i = 0; i < 4; ++i) { agent.doWork(clk.nowNs()); clk.advance(60LL * 1'000'000LL); }
+        EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), before) << "a refused stream writes nothing";
+    }
+    {   // boot 2: trims on the first append, later deltas durable
+        rune::node::ViewSnapshotChannel ch;
+        rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/0);
+        rune::consensus::ManualNanoClock clk(0);
+        appendDurable(ch, agent, clk, kBView, 0, 40, 4, layout);
+        appendDurable(ch, agent, clk, kBView, 0, 50, 5, layout);
+        EXPECT_EQ(agent.tailTrimsForTest(), 1);
+    }
+    {   // boot 3: the file is Clean, nothing trimmed, the tip is the boot-2 tip
+        rune::node::ViewSnapshotChannel ch;
+        rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/0);
+        rune::consensus::ManualNanoClock clk(0);
+        appendDurable(ch, agent, clk, kBView, 0, 60, 6, layout);
+        EXPECT_EQ(agent.tailTrimsForTest(), 0);
+        EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)),
+                  catBytes({rec1, rec2, rec3, rec4, deltaOnly(50, 5, layout), deltaOnly(60, 6, layout)}));
+    }
+}

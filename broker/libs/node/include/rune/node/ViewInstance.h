@@ -23,6 +23,7 @@
 #include <rune/view/ViewTable.h>
 
 #include <rune/node/NsSlotTable.h>
+#include <rune/node/ViewCheckpointScan.h>
 #include <rune/node/ViewSnapshotChannel.h>   // ViewDiscardReason
 
 namespace rune::node {
@@ -72,21 +73,8 @@ using ViewPauseState = std::variant<ViewRunning, ViewPaused>;
 // (kNoNsSlot): the instance is not charged to any namespace (unit tests, transient sources, which carry no tag).
 struct NsTag { uint16_t slot = kNoNsSlot; uint32_t nsId = 0; };
 
-// Task 19b: split an on-disk view checkpoint file into its individual Task-12
-// records.  The file a ViewSnapshotIoAgent writes is a BARE concatenation of
-// rune::view::encodeDelta() wire records (the 8-byte routing header is stripped
-// before the bytes hit the file — see ViewSnapshotIoAgent::handleDeltaFrame_),
-// so recovery must split it back into the per-record spans
-// rune::view::replay() expects.  Each record is self-describing:
-//   [magic u32][O i64][rowLen u32][count u32] then count × {rid u32, flags u8,
-//   key u64, [rowLen bytes iff flags==0 (upsert)]} then [crc u32].
-// Bounds-safe (Task 8 lesson): never trusts a length/count field to over-read;
-// a torn/truncated TRAILING record is DROPPED (the returned spans stop before
-// it) rather than over-read — exactly what replay() then treats as the
-// recoverable append-only tail.  The returned spans point INTO `bytes`, which
-// must outlive them.
-[[nodiscard]] std::vector<std::span<const uint8_t>>
-splitViewCheckpointRecords(std::span<const uint8_t> bytes);
+// Task 19b / C7: the on-disk checkpoint file is split and classified by scanViewCheckpoint (ViewCheckpointScan.h): a torn
+// trailing record is reported, never silently dropped.
 
 // Phase 2a: the auxiliary tables of an aggregate (view, partition); Phase 2b
 // Task 5b: plus the per-group Min/Max value blocks when the view has Min/Max.

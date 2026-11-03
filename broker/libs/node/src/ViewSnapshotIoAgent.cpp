@@ -1,6 +1,7 @@
 // ViewSnapshotIoAgent.cpp — Task 13.
 #include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/node/PortableFlushBackend.h> // detail::platformFdatasync (fdatasync; fsync on macOS)
+#include <rune/node/ViewCheckpointScan.h>
 #include <rune/view/ViewCheckpoint.h>
 
 #include <fcntl.h>
@@ -137,12 +138,17 @@ std::string ViewSnapshotIoAgent::deltaFilePathForTest(int32_t viewTopicId, int32
     return deltaFilePath_(Key{viewTopicId, partition});
 }
 
-ViewSnapshotIoAgent::FileState* ViewSnapshotIoAgent::fileFor_(const Key& key) {
+// Cold, once per FileState creation.  INVARIANT (writer side): no byte is ever written to a checkpoint file whose current
+// contents have not been classified Clean (or made Clean by a durable truncate) in this process.  Every write goes through a
+// FileState, and a FileState exists only after this function.  A crash between grouped fdatasyncs can leave a torn last
+// record; appending after it would make every later record unreachable on the next recovery (C7).
+ViewSnapshotIoAgent::FileState* ViewSnapshotIoAgent::openVerified_(const Key& key) {
     auto it = files_.find(key);
     if (it != files_.end()) return &it->second;
 
     const std::string path = deltaFilePath_(key);
-    const int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0644);
+    // Not O_APPEND: this agent positions the write offset itself, after the scan.
+    const int fd = ::open(path.c_str(), O_CREAT | O_RDWR, 0644);
     if (fd < 0) {
         // Review round 1 (IMPORTANT 1): do NOT emplace a FileState for a
         // failed open -- caching fd=-1 here would permanently blackhole
@@ -159,7 +165,49 @@ ViewSnapshotIoAgent::FileState* ViewSnapshotIoAgent::fileFor_(const Key& key) {
     }
     FileState fs;
     fs.fd = fd;
-    auto [ins, inserted] = files_.emplace(key, fs);
+    auto refuse = [&](int32_t err, const char* why) {
+        fs.stream = StreamRefused{err, why};
+        spdlog::error("ViewSnapshotIoAgent: view {} partition {}: checkpoint file {} refused for appends: {} ({})", key.viewTopicId,
+                      key.partition, path, why, std::strerror(err));
+    };
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) {
+        refuse(errno, "fstat failed");
+    } else if (st.st_size > 0) {
+        std::vector<uint8_t> bytes(static_cast<std::size_t>(st.st_size));
+        std::size_t got = 0;
+        int readErr = 0;
+        while (got < bytes.size()) {
+            const ssize_t n = ::pread(fd, bytes.data() + got, bytes.size() - got, static_cast<off_t>(got));
+            if (n < 0) { if (errno == EINTR) continue; readErr = errno; break; }
+            if (n == 0) { readErr = EIO; break; }   // the file shrank under us
+            got += static_cast<std::size_t>(n);
+        }
+        if (readErr != 0) {
+            refuse(readErr, "read failed");
+        } else {
+            const ViewCheckpointScan scan = scanViewCheckpoint(bytes);
+            if (const auto* torn = std::get_if<ViewCheckpointTornTail>(&scan.tail)) {
+                if (::ftruncate(fd, static_cast<off_t>(torn->cleanLen)) != 0) {
+                    refuse(errno, "tail truncate failed");
+                } else if (rune::node::detail::platformFdatasync(fd) != 0) {
+                    refuse(errno, "tail truncate fsync failed");
+                } else {
+                    ++tailTrims_;
+                    spdlog::info("VIEW-CHECKPOINT-TAIL-TRIMMED view={} partition={} from={} to={}", key.viewTopicId, key.partition,
+                                 bytes.size(), torn->cleanLen);
+                    if (::lseek(fd, static_cast<off_t>(torn->cleanLen), SEEK_SET) < 0) refuse(errno, "seek failed");
+                }
+            } else if (std::holds_alternative<ViewCheckpointCorrupt>(scan.tail)) {
+                // Unreachable in correct operation: the worker's Unreadable discard frame precedes every delta for this key
+                // on the same FIFO ring and moves the file away.  Defense in depth: never append after unverified bytes.
+                refuse(EILSEQ, "corrupt checkpoint");
+            } else if (::lseek(fd, 0, SEEK_END) < 0) {
+                refuse(errno, "seek failed");
+            }
+        }
+    }   // size 0: Clean, the fd is already at the end
+    auto [ins, inserted] = files_.emplace(key, std::move(fs));
     (void)inserted;
     return &ins->second;
 }
@@ -341,12 +389,13 @@ void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len, i
     // Review round 1 (IMPORTANT 2): once a file has hit a FATAL write error
     // it must NEVER accept another delta -- a torn/partial record with no
     // resync marker would otherwise misalign every later record's CRC on
-    // replay. fileFor_() below would happily return the SAME (already open)
+    // replay. openVerified_() below would happily return the SAME (already open)
     // FileState for this key, so the errored check must come first.
-    if (auto it = files_.find(key); it != files_.end() && it->second.errored) return;
+    if (auto it = files_.find(key); it != files_.end() && std::holds_alternative<StreamRefused>(it->second.stream)) return;
 
-    FileState* fs = fileFor_(key);
+    FileState* fs = openVerified_(key);
     if (fs == nullptr) return; // open failed this cycle (transient, NOT cached) -- drop, retried next delta
+    if (std::holds_alternative<StreamRefused>(fs->stream)) return;   // a file that could not be verified or repaired: never written
     fs->channelIdx = channelIdx;  // Task 19: route this key's done acks back to its channel
 
     // appendNoSync-style: a plain write(), no fsync here -- fsyncs are
@@ -356,9 +405,9 @@ void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len, i
         // a legitimate short write -- those are retried internally), which
         // means the file may now hold a torn/partial record. Stop trusting
         // it forever: never advance pendingO/lastDurableO past this point,
-        // and never accept another delta for this key (the `errored` check
+        // and never accept another delta for this key (the refused check
         // above enforces that from here on).
-        fs->errored = true;
+        fs->stream = StreamRefused{errno, "write failed"};
         spdlog::error("ViewSnapshotIoAgent: FATAL write failure for viewTopicId={} partition={} at O={}: {} "
                       "-- this delta stream is now stopped (hasError() will report true)",
                       viewTopicId, partition, O, std::strerror(errno));
@@ -491,12 +540,12 @@ int64_t ViewSnapshotIoAgent::lastDurableOffset(int32_t viewTopicId, int32_t part
 
 bool ViewSnapshotIoAgent::hasError(int32_t viewTopicId, int32_t partition) const noexcept {
     auto it = files_.find(Key{viewTopicId, partition});
-    return it != files_.end() && it->second.errored;
+    return it != files_.end() && std::holds_alternative<StreamRefused>(it->second.stream);
 }
 
 void ViewSnapshotIoAgent::forceWriteFailureForTest(int32_t viewTopicId, int32_t partition) {
     const Key key{viewTopicId, partition};
-    FileState* fs = fileFor_(key);
+    FileState* fs = openVerified_(key);
     if (fs == nullptr) return; // open failed -- nothing to break (already "not durable")
     if (fs->fd >= 0) ::close(fs->fd);
     // Reopen read-only: any ::write() to this fd fails with EBADF -- a
@@ -506,7 +555,7 @@ void ViewSnapshotIoAgent::forceWriteFailureForTest(int32_t viewTopicId, int32_t 
 }
 
 void ViewSnapshotIoAgent::forceErroredForTest(int32_t viewTopicId, int32_t partition) {
-    if (FileState* fs = fileFor_(Key{viewTopicId, partition})) fs->errored = true;
+    if (FileState* fs = openVerified_(Key{viewTopicId, partition})) fs->stream = StreamRefused{EIO, "forced"};
 }
 
 } // namespace rune::node

@@ -72,6 +72,7 @@
 #include <rune/view/ViewRow.h>
 
 #include <rune/node/AdminChannels.h>
+#include <rune/node/ViewCheckpointScan.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/node/WorkerViewSet.h>
@@ -498,17 +499,21 @@ struct DiscardRig {
     rune::node::SourceLogBounds bounds{};
     int64_t now = 0;
 
-    DiscardRig(const char* stem, uint8_t persistence, rune::node::ViewBackupPolicy policy = {}) {
+    bool ownsDir = true;
+
+    // `reuseDir` non-null: a restart over an existing data dir (the dir is not removed on destruction).
+    DiscardRig(const char* stem, uint8_t persistence, rune::node::ViewBackupPolicy policy = {}, const std::string* reuseDir = nullptr) {
         const rune::codec::Descriptor* srcs[] = {&src};
         auto comp = rune::view::compileView(hpView(persistence), srcs, kViewId).value();
         plan = comp.plan; layout = comp.rowLayout; outDesc = comp.outputDescriptor;
-        dir = uniqueDir(stem);
+        dir = reuseDir != nullptr ? *reuseDir : uniqueDir(stem);
+        ownsDir = reuseDir == nullptr;
         agent.emplace(channel, dir, /*fsyncMs*/ 1, policy);
         vs.emplace(channel, dir);
         pushRecoveryInstall(channel, plan, outDesc, src, persistence);
         EXPECT_EQ(vs->drainInstalls(), 1);
     }
-    ~DiscardRig() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+    ~DiscardRig() { if (ownsDir) { std::error_code ec; std::filesystem::remove_all(dir, ec); } }
 
     std::string ckptPath() const { return rune::node::viewCheckpointFilePath(dir, kViewId, 0); }
     void writeCheckpoint(const std::vector<uint8_t>& srcBatch, int64_t foldTo) {
@@ -958,4 +963,198 @@ TEST(ViewRecoveryRegression, CorruptThirdOfFiveRecordsIsBackedUpThenRebuiltRegre
 
 TEST(ViewRecoveryRegression, SevenByteGarbageCheckpointIsBackedUpThenRebuiltRegression) {
     expectUnreadableCheckpointIsBackedUpAndRebuilt("rune_t_1_r6-", std::vector<uint8_t>{1, 2, 3, 4, 5, 6, 7});
+}
+
+
+// ── C7: a torn checkpoint tail is repaired (truncated by the IO agent before its first append), never appended after.
+namespace {
+// One v1 (or v2) checkpoint record at offset O with `entries` upsert entries of a 8-byte row.
+std::vector<uint8_t> scanRec(bool v2, int64_t O, int entries = 2) {
+    uint8_t row[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<rune::view::DirtyEntry> es;
+    for (int i = 0; i < entries; ++i) es.push_back(rune::view::DirtyEntry{static_cast<uint32_t>(i), false, static_cast<uint64_t>(100 + i), row});
+    std::vector<uint8_t> out;
+    if (v2) {
+        const rune::view::TableDelta tds[] = {{0, 8, {es.data(), es.size()}}, {1, 8, {es.data(), es.size()}}};
+        rune::view::encodeMultiDelta(tds, O, out);
+    } else {
+        rune::view::encodeDelta(std::span<const rune::view::DirtyEntry>(es.data(), es.size()), O, 8, out);
+    }
+    return out;
+}
+std::vector<uint8_t> cat(std::initializer_list<std::vector<uint8_t>> parts) {
+    std::vector<uint8_t> out;
+    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+std::vector<uint8_t> prefixOf(const std::vector<uint8_t>& v, std::size_t k) { return {v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k)}; }
+}  // namespace
+
+TEST(ViewCheckpointTailRegression, ScanClassifiesEveryTruncationOffsetAsTornTailRegression) {
+    using namespace rune::node;
+    for (const bool v2 : {false, true}) {
+        const auto r1 = scanRec(v2, 10), r2 = scanRec(v2, 20), r3 = scanRec(v2, 30);
+        const auto file = cat({r1, r2, r3});
+        const std::size_t start2 = r1.size(), start3 = r1.size() + r2.size();
+        SCOPED_TRACE(v2 ? "v2" : "v1");
+        for (std::size_t cut = start3 + 1; cut < file.size(); ++cut) {
+            const auto scan = scanViewCheckpoint(prefixOf(file, cut));
+            const auto* torn = std::get_if<ViewCheckpointTornTail>(&scan.tail);
+            ASSERT_NE(torn, nullptr) << "cut=" << cut;
+            EXPECT_EQ(torn->cleanLen, start3) << "cut=" << cut;
+            EXPECT_EQ(scan.records.size(), 2u) << "cut=" << cut;
+        }
+        {   // intact
+            const auto scan = scanViewCheckpoint(file);
+            EXPECT_TRUE(std::holds_alternative<ViewCheckpointClean>(scan.tail));
+            EXPECT_EQ(scan.records.size(), 3u);
+        }
+        {   // zero-filled extent after rec2
+            auto z = cat({r1, r2});
+            z.resize(z.size() + 4096, 0);
+            const auto scan = scanViewCheckpoint(z);
+            const auto* torn = std::get_if<ViewCheckpointTornTail>(&scan.tail);
+            ASSERT_NE(torn, nullptr);
+            EXPECT_EQ(torn->cleanLen, start3);
+            EXPECT_EQ(scan.records.size(), 2u);
+        }
+        {   // one CRC byte flipped in rec2
+            auto f = file;
+            f[start3 - 1] ^= 0x5A;
+            const auto scan = scanViewCheckpoint(f);
+            const auto* bad = std::get_if<ViewCheckpointCorrupt>(&scan.tail);
+            ASSERT_NE(bad, nullptr);
+            EXPECT_EQ(bad->cleanLen, start2);
+            EXPECT_EQ(scan.records.size(), 1u);
+        }
+        for (const std::size_t k : {std::size_t{13}, r3.size() - 1}) {   // the bug's on-disk shape: torn rec3, then a whole rec4
+            const auto bugShape = cat({r1, r2, prefixOf(r3, k), scanRec(v2, 40)});
+            const auto scan = scanViewCheckpoint(bugShape);
+            const auto* bad = std::get_if<ViewCheckpointCorrupt>(&scan.tail);
+            ASSERT_NE(bad, nullptr) << "k=" << k;
+            EXPECT_EQ(bad->cleanLen, start3);
+        }
+        {   // the same shape where the torn record is much longer than prefix + rec4: the walk runs out of bytes, yet a whole
+            // valid record follows -- truncating would drop it
+            const auto big = scanRec(v2, 30, 60);
+            const auto bugShape = cat({r1, r2, prefixOf(big, 40), scanRec(v2, 40, 1)});
+            const auto scan = scanViewCheckpoint(bugShape);
+            const auto* bad = std::get_if<ViewCheckpointCorrupt>(&scan.tail);
+            ASSERT_NE(bad, nullptr) << "a complete valid record after the torn bytes must classify Corrupt";
+            EXPECT_EQ(bad->cleanLen, start3);
+        }
+        {   // unknown non-zero magic
+            auto f = cat({r1});
+            for (const uint8_t b : {0xEF, 0xBE, 0xAD, 0xDE}) f.push_back(b);
+            const auto scan = scanViewCheckpoint(f);
+            const auto* bad = std::get_if<ViewCheckpointCorrupt>(&scan.tail);
+            ASSERT_NE(bad, nullptr);
+            EXPECT_EQ(bad->cleanLen, r1.size());
+        }
+    }
+}
+
+namespace {
+// A restart over `dir` (same data dir, fresh worker and agent).
+std::unique_ptr<DiscardRig> bootOver(const std::string& dir, std::vector<uint8_t> log, int64_t logFrom, int64_t logTo) {
+    auto r = std::make_unique<DiscardRig>("rune_t_c7-", 0, rune::node::ViewBackupPolicy{}, &dir);
+    r->log = std::move(log);
+    r->logFrom = logFrom; r->logTo = logTo;
+    r->bounds = rune::node::SourceLogBounds{logFrom, logTo};
+    return r;
+}
+bool pumpUntilDurable(DiscardRig& r, int64_t O) {
+    for (int i = 0; i < kHardCap && r.agent->lastDurableOffset(kViewId, 0) < O; ++i) r.pump(1);
+    return r.agent->lastDurableOffset(kViewId, 0) >= O;
+}
+void appendBytes(const std::string& path, const std::vector<uint8_t>& b) {
+    std::ofstream f(path, std::ios::binary | std::ios::app);
+    f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+}
+// Boot 1 folds [0,4) durably, then the file is torn the way a crash between fdatasyncs leaves it.
+std::string bootOneThenTear(const char* stem, std::string& dirOut) {
+    DiscardRig r1(stem, 0);
+    dirOut = r1.dir;
+    r1.ownsDir = false;
+    r1.materialize();
+    EXPECT_TRUE(r1.pumpUntilReady());
+    EXPECT_TRUE(pumpUntilDurable(r1, 4));
+    const auto rec5 = makeBaseCheckpoint(r1.plan, r1.layout, r1.src, upsertRun(7, 30, 5, 0), 5);
+    appendBytes(r1.ckptPath(), prefixOf(rec5, 9));
+    return r1.ckptPath();
+}
+}  // namespace
+
+// The bug repro (silent loss): without the trim, boot 2 appends after the torn bytes and boot 3 recovers at the tear.
+TEST(ViewCheckpointTailRegression, TornTailRestartKeepsEveryLaterDeltaRegression) {
+    std::string dir;
+    bootOneThenTear("rune_t_c7_t4-", dir);
+    {   // boot 2
+        auto r = bootOver(dir, upsertRun(7, 30, 8, 0), 0, 8);
+        r->materialize();
+        EXPECT_EQ(r->vs->instanceServeState(kViewId, 0).foldCursor, 4) << "recovers at the last whole record";
+        ASSERT_TRUE(r->pumpUntilReady());
+        ASSERT_TRUE(pumpUntilDurable(*r, 8));
+        EXPECT_EQ(r->agent->tailTrimsForTest(), 1);
+    }
+    {   // boot 3
+        auto r = bootOver(dir, upsertRun(7, 30, 8, 0), 0, 8);
+        r->materialize();
+        EXPECT_EQ(r->vs->instanceServeState(kViewId, 0).foldCursor, 8) << "every delta written after the tear is reachable";
+        EXPECT_EQ(r->vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+        EXPECT_TRUE(rune::node::listViewBackups(dir, kViewId, 0).empty());
+        EXPECT_EQ(r->vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+        const rune::view::RowLayout* L = nullptr;
+        const uint8_t* row = r->vs->getRow(kViewId, 0, 7, L);
+        ASSERT_NE(row, nullptr);
+        EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 37);
+    }
+    std::error_code ec; std::filesystem::remove_all(dir, ec);
+}
+
+TEST(ViewCheckpointTailRegression, TornTailRestartOverATrimmedLogNeedsNoRebuildRegression) {
+    std::string dir;
+    bootOneThenTear("rune_t_c7_t5-", dir);
+    {
+        auto r = bootOver(dir, upsertRun(7, 30, 8, 0), 0, 8);
+        r->materialize();
+        ASSERT_TRUE(r->pumpUntilReady());
+        ASSERT_TRUE(pumpUntilDurable(*r, 8));
+    }
+    {   // retention trimmed the log to [6,8) before boot 3
+        auto r = bootOver(dir, upsertRun(7, 36, 2, 6), 6, 8);
+        r->materialize();
+        ASSERT_TRUE(r->pumpUntilReady());
+        EXPECT_EQ(r->vs->instanceServeState(kViewId, 0).foldCursor, 8);
+        EXPECT_EQ(r->vs->foldCounters(kViewId, 0)->sourceRecordsTrimmed, 0u);
+        EXPECT_EQ(r->vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+        EXPECT_TRUE(rune::node::listViewBackups(dir, kViewId, 0).empty());
+        const rune::view::RowLayout* L = nullptr;
+        const uint8_t* row = r->vs->getRow(kViewId, 0, 7, L);
+        ASSERT_NE(row, nullptr);
+        EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 37);
+    }
+    std::error_code ec; std::filesystem::remove_all(dir, ec);
+}
+
+// A file already broken by the bug (torn record, then a whole later one) is Corrupt: backed up byte for byte, rebuilt.
+TEST(ViewCheckpointTailRegression, FieldFileBrokenByTheBugIsBackedUpThenRebuiltRegression) {
+    DiscardRig r("rune_t_c7_t6-", 0);
+    const auto rec2 = makeBaseCheckpoint(r.plan, r.layout, r.src, upsertRun(7, 30, 2, 0), 2);
+    const auto rec3 = makeBaseCheckpoint(r.plan, r.layout, r.src, upsertRun(7, 30, 3, 0), 3);
+    const auto rec4 = makeBaseCheckpoint(r.plan, r.layout, r.src, upsertRun(7, 30, 4, 0), 4);
+    const auto broken = cat({rec2, prefixOf(rec3, 13), rec4});
+    writeFile(r.ckptPath(), broken);
+    r.materialize();
+    ASSERT_TRUE(r.pumpUntilReady());
+    r.pump(8);
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".unreadable.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), std::string(broken.begin(), broken.end()));
+    expectRowsOfTheLog(r);
+    const std::string now = slurpFile(r.ckptPath());
+    const auto scan = rune::node::scanViewCheckpoint({reinterpret_cast<const uint8_t*>(now.data()), now.size()});
+    EXPECT_TRUE(std::holds_alternative<rune::node::ViewCheckpointClean>(scan.tail));
+    EXPECT_FALSE(scan.records.empty()) << "the new file starts with a valid record";
 }

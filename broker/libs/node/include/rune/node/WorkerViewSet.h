@@ -607,8 +607,8 @@ private:
 
     /// Cold: what to do with the files a recovered instance found (#590).  Legacy only -> back it up and rebuild; a legacy file
     /// next to a committed one -> back the legacy one up, keep the committed rows; a committed file that did not replay cleanly
-    /// (`applied` < `records`, or bytes with no record) -> back it up and rebuild.
-    void applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, std::size_t records, std::size_t applied);
+    /// (a corrupt scan, or `applied` < the verified records) -> back it up and rebuild; a torn tail is only logged (the IO agent trims it).
+    void applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, const ViewCheckpointScan& scan, std::size_t applied);
     /// One kDiscardMsgType{LegacySuperseded} frame (fire and forget: its ack, reason LegacySuperseded, never touches CheckpointState; a failure is only logged and counted).  False = ring full.
     [[nodiscard]] bool tryPushLegacySuperseded_(int32_t viewTopicId, int32_t partition);
     std::vector<uint64_t> legacyOwed_;   ///< instKeys whose superseded-legacy frame awaits ring room (cold path, nearly always empty)
