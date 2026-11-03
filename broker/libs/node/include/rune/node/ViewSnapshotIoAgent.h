@@ -135,7 +135,7 @@ public:
     [[nodiscard]] std::size_t pendingAcksForTest() const noexcept { return pendingAcks_.size(); }
     /// Discard frames handled (acked, OK or not) since construction.
     [[nodiscard]] int64_t discardsForTest() const noexcept { return discards_; }
-    /// Test seam: when on, the durable steps of a discard are logged in order ("backupDir", "viewDir", "ack").
+    /// Test seam: when on, the durable steps of a discard are logged in order ("backupDir", "unlink:view" right after the checkpoint is unlinked, "viewDir", "ack").
     void recordFsyncLogForTest(bool on) { recordFsyncLog_ = on; fsyncLog_.clear(); }
     [[nodiscard]] const std::vector<std::string>& fsyncLogForTest() const noexcept { return fsyncLog_; }
 

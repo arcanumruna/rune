@@ -327,9 +327,11 @@ int ViewSnapshotIoAgent::moveToBackup_(const std::string& path, int32_t view, in
     }
     if (err != 0) return err;
     seqCache_[seqKey(view, part)] = seq;
-    if (::unlink(path.c_str()) != 0 && errno != ENOENT) return errno;   // (after a rename fallback the file is already gone)
-
+    // The backup's directory entry is durable BEFORE the original is unlinked: a filesystem may persist the unlink without the
+    // new link, and a crash then would leave neither copy.  A failure here leaves the original in place (the discard fails).
     if (const int e = fsyncDir_(bdir, "backupDir")) return e;
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) return errno;   // (after a rename fallback the file is already gone)
+    if (recordFsyncLog_) fsyncLog_.emplace_back("unlink:view");
     if (const int e = fsyncDir_(viewDataDir_, "viewDir")) return e;
 
     // Retention: keep the newest `keep`.  A failure here never fails the discard.

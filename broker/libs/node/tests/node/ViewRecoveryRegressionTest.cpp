@@ -48,6 +48,7 @@
 //      driveFolds pass (driveRebuild is NEVER called again for this view) must
 //      still reach Ready and serve the fully-recovered row -- proving the
 //      Ready-flip no longer depends on driveRebuild/hasRecovery() either.
+#include <algorithm>
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -658,6 +659,30 @@ TEST(ViewRecoveryRegression, HeldDeltaAtDiscardLandsInTheBackupRegression) {
     EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
 }
 
+// B3: the backup's directory entry is fsynced before the checkpoint is unlinked (a crash after a reordered unlink must not
+// leave neither copy); the view dir is fsynced after the unlink.
+TEST(ViewBackupRegression, BackupDirIsDurableBeforeTheCheckpointIsUnlinkedRegression) {
+    DiscardRig r("rune_t_1_b3-", 0);
+    r.agent->recordFsyncLogForTest(true);
+    r.writeCheckpoint(upsertRun(7, 30, 2, 0), 2);
+    r.materialize();
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    ASSERT_TRUE(r.pumpUntilSettled());
+    const auto& log = r.agent->fsyncLogForTest();
+    const auto idx = [&](const char* tag) {
+        const auto it = std::find(log.begin(), log.end(), std::string(tag));
+        return it == log.end() ? std::ptrdiff_t{-1} : it - log.begin();
+    };
+    const std::ptrdiff_t unlinked = idx("unlink:view");
+    ASSERT_GE(unlinked, 0) << "the checkpoint was unlinked after its backup";
+    const std::ptrdiff_t backupDir = idx("backupDir");
+    ASSERT_GE(backupDir, 0);
+    EXPECT_LT(backupDir, unlinked) << "the backup dir must be durable before the original is unlinked";
+    const auto viewDir = std::find(log.begin() + unlinked, log.end(), std::string("viewDir"));
+    EXPECT_NE(viewDir, log.end()) << "the view dir is fsynced after the unlink";
+    EXPECT_EQ(rune::node::listViewBackups(r.dir, kViewId, 0).size(), 1u);
+}
+
 // W4: the agent orders backupDir fsync, viewDir fsync, then the ack; and a restart at each crash point (before the
 // link, after the link before the unlink, after the unlink) converges to the same rows.
 TEST(ViewRecoveryRegression, DiscardCrashPointsAllConvergeToTheRecomputedViewRegression) {
@@ -669,9 +694,10 @@ TEST(ViewRecoveryRegression, DiscardCrashPointsAllConvergeToTheRecomputedViewReg
         ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
         ASSERT_TRUE(r.pumpUntilSettled());
         const auto& log = r.agent->fsyncLogForTest();
-        ASSERT_GE(log.size(), 3u);
+        ASSERT_GE(log.size(), 4u);
         const std::size_t n = log.size();
-        EXPECT_EQ(log[n - 3], "backupDir");
+        EXPECT_EQ(log[n - 4], "backupDir");
+        EXPECT_EQ(log[n - 3], "unlink:view");
         EXPECT_EQ(log[n - 2], "viewDir");
         EXPECT_EQ(log[n - 1], "ack");
     }
