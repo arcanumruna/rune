@@ -72,7 +72,7 @@
 //     persisted view char_persisted must serve key RUNE_VIEW_KEY_ID with hp RUNE_VIEW_HP_EXPECT (a restart that backed up
 //     and rebuilt its checkpoint, or repaired a torn tail, still serves exactly what the log holds).  Then RUNE_VIEW_PRODUCE_N
 //     (default 0) more rows are produced with Acks::All (keys RUNE_VIEW_PRODUCE_KEY_BASE.., default 1000.., hp = key) and each
-//     must become readable.  Same RUNE_VIEW_* handoff env as verify_restart.  Prints "VIEW-ROWS: OK produced=<n>".
+//     must become readable.  Same RUNE_VIEW_* handoff env as verify_restart.  Prints "VIEW-ROWS-LAST-OFFSET <offset of the last record produced, -1 if none>" and "VIEW-ROWS: OK produced=<n>".
 //     Exit codes 60..65.
 //   RUNE_MODE=ddl_race (DDL conformance): connect, print "DDL-RACE: READY role=<a|b>",
 //     wait for <RUNE_BARRIER_DIR>/go, then race the other container: define
@@ -1419,6 +1419,7 @@ int main(int argc, char** argv) {
                 return 61;
             }
             if (!decodeAndCheck(r0, keyId, hpExpect, "char_persisted (view_rows)")) return 62;
+            int64_t lastOffset = -1;   // the offset of the last record this call produced (-1 = none)
             if (produceN > 0) {
                 ProducerConfig pcfg;
                 pcfg.acks             = Acks::All;
@@ -1437,6 +1438,7 @@ int main(int argc, char** argv) {
                                   << " status=" << static_cast<int>(done.status) << "\n";
                         return 63;
                     }
+                    lastOffset = done.value;
                 }
                 for (int i = 0; i < produceN; ++i) {
                     const int64_t k = keyBase + i;
@@ -1444,6 +1446,7 @@ int main(int argc, char** argv) {
                     if (!decodeAndCheck(rk, k, k, "char_persisted (view_rows, produced)")) return 64;
                 }
             }
+            std::cout << "VIEW-ROWS-LAST-OFFSET " << lastOffset << std::endl;
             std::cout << "VIEW-ROWS: OK produced=" << produceN << std::endl;
             c.close();
             return 0;
