@@ -136,7 +136,7 @@ struct Rig {
 };
 }  // namespace
 
-TEST(ProducerVerdicts, CoalescedBatchWithOneBadRecord) {
+TEST(ProducerVerdictsRegression, CoalescedBatchWithOneBadRecordRegression) {
     Rig r;
     r.send(8);
     ASSERT_EQ(r.corrs.size(), 1u);
@@ -160,7 +160,7 @@ TEST(ProducerVerdicts, CoalescedBatchWithOneBadRecord) {
 
 // (The Tier-2 first-rejection contract changed with #802: see Tier2BatchReportsEveryRecordVerdictRegression.)
 
-TEST(ProducerVerdicts, VerdictArenaGrowsOnceAndIsCounted) {
+TEST(ProducerVerdictsRegression, VerdictArenaGrowsOnceAndIsCountedRegression) {
     namespace rca = rune::client::agent;
     rca::AgentConfig cfg;
     cfg.transport.ingressChannel = "aeron:udp?endpoint=127.0.0.1:1";
@@ -195,19 +195,32 @@ TEST(ProducerVerdicts, VerdictArenaGrowsOnceAndIsCounted) {
     EXPECT_EQ(a.verdictArenaGrowths(), 1u);
 }
 
-TEST(ProducerVerdicts, ReplayedVerdictsCompleteEachRecordAsTheOriginal) {
+TEST(ProducerVerdictsRegression, ReplayedVerdictsCompleteEachRecordAsTheOriginalRegression) {
     Rig r;
-    r.send(8);
+    r.send(4);
     ASSERT_EQ(r.corrs.size(), 1u);
-    // The first ack is lost; the retry's answer carries the same trailer.
+    // The first ack is lost: the batch's attempt deadline passes and the SAME batch (same correlation id) is re-sent.
+    ASSERT_EQ(r.impl.retransmitStalled(kNow + 60'000LL * 1'000'000 + 1, r.sink), 1);
+    ASSERT_EQ(r.corrs.size(), 2u) << "the retransmit put a second frame on the wire";
+    EXPECT_EQ(rc::producer::batchcorr::base(r.corrs[0]), rc::producer::batchcorr::base(r.corrs[1]))
+        << "the retransmit is the same batch: the same correlation id up to its attempt tag";
+    EXPECT_EQ(rc::producer::batchcorr::attempt(r.corrs[1]), rc::producer::batchcorr::attempt(r.corrs[0]) + 1);
+    // The retry's answer carries the original trailer; every record completes as it would have the first time.
     const auto t = Rig::trailer({3});
-    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);
-    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);   // a stale duplicate answer is ignored
-    for (rc::Token k = 1; k <= 8; ++k) EXPECT_EQ(r.cq.times[k], 1) << "each record completes exactly once";
+    r.impl.onProduceResponse(r.corrs[1], 100, 0, -1, true, t);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);   // the late original answer is ignored
+    for (rc::Token k = 1; k <= 4; ++k) EXPECT_EQ(r.cq.times[k], 1) << "each record completes exactly once";
+    for (rc::Token k = 1; k <= 3; ++k) {
+        EXPECT_EQ(r.cq.done[k].status, OpStatus::Ok) << k;
+        EXPECT_EQ(r.cq.done[k].value, 100 + int64_t(k) - 1) << k;
+    }
     EXPECT_EQ(r.cq.done[4].status, OpStatus::BrokerError);
+    EXPECT_EQ(r.cq.done[4].errorCode, kViolation);
+    EXPECT_EQ(rc::constraintIdOf(r.cq.done[4]), kCid);
+    EXPECT_FALSE(r.impl.hasInFlight());
 }
 
-TEST(ProducerVerdicts, EmptyTrailerIsPlainOk) {
+TEST(ProducerVerdictsRegression, EmptyTrailerIsPlainOkRegression) {
     Rig r;
     r.send(3);
     r.impl.onProduceResponse(r.corrs[0], 10, 0, -1, true, {});
@@ -217,7 +230,7 @@ TEST(ProducerVerdicts, EmptyTrailerIsPlainOk) {
     }
 }
 
-TEST(ProducerVerdicts, DuplicateSequenceOnAViewProducerIsVerdictUnknown) {
+TEST(ProducerVerdictsRegression, DuplicateSequenceOnAViewProducerIsVerdictUnknownRegression) {
     Rig r;
     r.send(8);
     r.impl.onProduceResponse(r.corrs[0], -1, static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence));
@@ -228,7 +241,7 @@ TEST(ProducerVerdicts, DuplicateSequenceOnAViewProducerIsVerdictUnknown) {
     }
 }
 
-TEST(ProducerVerdicts, DuplicateSequenceOnAnAllProducerIsStillOk) {
+TEST(ProducerVerdictsRegression, DuplicateSequenceOnAnAllProducerIsStillOkRegression) {
     Rig r(Acks::All);
     r.send(4);
     r.impl.onProduceResponse(r.corrs[0], -1, static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence));
@@ -238,7 +251,7 @@ TEST(ProducerVerdicts, DuplicateSequenceOnAnAllProducerIsStillOk) {
     }
 }
 
-TEST(ProducerVerdicts, OpStatusThirteenIsReservedAndVerdictUnknownIsFourteen) {
+TEST(ProducerVerdictsRegression, OpStatusThirteenIsReservedAndVerdictUnknownIsFourteenRegression) {
     EXPECT_EQ(static_cast<int>(OpStatus::BrokerTooOld), 12);
     EXPECT_EQ(static_cast<int>(OpStatus::StoredIdUnknown), 13);
     EXPECT_EQ(static_cast<int>(OpStatus::VerdictUnknown), 14);
