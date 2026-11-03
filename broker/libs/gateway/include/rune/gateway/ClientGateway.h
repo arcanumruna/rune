@@ -2729,7 +2729,7 @@ private:
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m,
-                                                                                               std::string_view local) const;
+                                                                                               std::string_view local, uint32_t nsId) const;
     /// D19: READ on every source topic of a CreateView / AlterView plan (an undecodable blob is left to the admin thread).
     [[nodiscard]] std::optional<rune::gateway::Denial> authorizeViewSources_(const Session& session, const uint8_t* blob,
                                                                               std::size_t len) const;

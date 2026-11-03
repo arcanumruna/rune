@@ -8409,7 +8409,7 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     // Authentication Task 12 (spec §2.1): CREATE on the topic name (a CLUSTER grant is part of the table); CreateSchema
     // is the same request.
     if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, res.local,
-                                                     rune::security::Operation::Create), buf, len))
+                                                     rune::security::Operation::Create, res.nsId), buf, len))
         return;
     // Issue #129: if the name is an existing UNTYPED topic, a descriptor makes this a new schema version of it
     // (CreateSchemaOps) - ALTER on the topic, exactly as AlterTopic (ALTER implies DESCRIBE, D15).  Whether the name
@@ -8417,7 +8417,7 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     std::optional<rune::gateway::Denial> adopt;
     if (m.descriptorLen != 0)
         adopt = rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, res.local,
-                                             rune::security::Operation::Alter);
+                                             rune::security::Operation::Alter, res.nsId);
 
     // Copy-and-return: the sink OWNS the copied bytes (every view points into
     // the ingress buffer and is copied by the sink before return).
@@ -8505,7 +8505,7 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
         return;
     }
     if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, res.local,
-                                                     rune::security::Operation::Alter), buf, len))
+                                                     rune::security::Operation::Alter, res.nsId), buf, len))
         return;
 
     // Copy-and-return: the sink OWNS the copied bytes (topicName/opsBlob views
@@ -8556,7 +8556,8 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
     // Authentication Task 12 (spec §2.1, D19): CREATE on the view name AND READ on every source topic of the plan.
     {
         std::optional<rune::gateway::Denial> d = rune::gateway::authorizeName(
-            permsOf_(*session), rune::security::ResourceType::View, res.local, rune::security::Operation::Create);
+            permsOf_(*session), rune::security::ResourceType::View, res.local, rune::security::Operation::Create,
+            res.nsId);
         if (!d) d = authorizeViewSources_(*session, m.planBlob, m.planLen);
         if (deny_(*session, d, buf, len)) return;
     }
@@ -8603,7 +8604,7 @@ void ClientGateway::handleCatalogDdl_(const uint8_t* buf, std::size_t len, const
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidTopicName), kMalformedNameDetail);
         return;
     }
-    if (deny_(*session, authorizeCatalogDdl_(*session, m, res.local), buf, len)) return;   // authentication Task 12
+    if (deny_(*session, authorizeCatalogDdl_(*session, m, res.local, res.nsId), buf, len)) return;   // authentication Task 12
     answerAdminSubmit_(buf, len, submit(m, res.local, ddlMetaOf_(&m.ext, m.sessionId, *session, res.nsId)),
                        "catalog DDL: admin ring full", "catalog DDL: request larger than the admin ring message");
 }
@@ -9241,7 +9242,7 @@ bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint
     const PermissionTable& perms = permsOf_(session);
     if (perms.isAllowAll()) return false;
     const auto group = [&](std::span<const uint8_t> id) {
-        return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read);
+        return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read, perms.nsId());
     };
     const auto topic = [&](int32_t id, int32_t partition) {
         return authorizeTopicIdHere_(perms, id, partition, rsec::Operation::Read);
@@ -9297,10 +9298,10 @@ bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_
     const PermissionTable& perms = permsOf_(session);
     if (perms.isAllowAll()) return false;
     const auto txn = [&](std::span<const uint8_t> id) {
-        return authorizeName(perms, rsec::ResourceType::TransactionalId, sv(id), rsec::Operation::Write);
+        return authorizeName(perms, rsec::ResourceType::TransactionalId, sv(id), rsec::Operation::Write, perms.nsId());
     };
     const auto group = [&](std::span<const uint8_t> id) {
-        return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read);
+        return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read, perms.nsId());
     };
     std::optional<rune::gateway::Denial> d;
     switch (static_cast<pc::TemplateId>(tid)) {
@@ -9356,20 +9357,20 @@ std::optional<rune::gateway::Denial> ClientGateway::authorizeViewSources_(const 
 
 template <class Msg>
 std::optional<rune::gateway::Denial> ClientGateway::authorizeCatalogDdl_(const Session& session, const Msg& m,
-                                                                         std::string_view local) const
+                                                                         std::string_view local, uint32_t nsId) const
 {
     namespace rsec = rune::security;
     using rune::gateway::authorizeName;
     const PermissionTable& perms = permsOf_(session);
     if constexpr (std::is_same_v<Msg, pc::DropTopic>)
-        return authorizeName(perms, rsec::ResourceType::Topic, local, rsec::Operation::Drop);
+        return authorizeName(perms, rsec::ResourceType::Topic, local, rsec::Operation::Drop, nsId);
     else if constexpr (std::is_same_v<Msg, pc::AlterTopicConfig>)
-        return authorizeName(perms, rsec::ResourceType::Topic, local, rsec::Operation::Alter);
+        return authorizeName(perms, rsec::ResourceType::Topic, local, rsec::Operation::Alter, nsId);
     else if constexpr (std::is_same_v<Msg, pc::DropView>)
-        return authorizeName(perms, rsec::ResourceType::View, local, rsec::Operation::Drop);
+        return authorizeName(perms, rsec::ResourceType::View, local, rsec::Operation::Drop, nsId);
     else {
         static_assert(std::is_same_v<Msg, pc::AlterView>);
-        if (auto d = authorizeName(perms, rsec::ResourceType::View, local, rsec::Operation::Alter)) return d;
+        if (auto d = authorizeName(perms, rsec::ResourceType::View, local, rsec::Operation::Alter, nsId)) return d;
         return authorizeViewSources_(session, m.planBlob, m.planLen);
     }
 }
