@@ -821,6 +821,14 @@ TEST(AuthClusterRegression, RehandshakeWhileWorkersSealIsRaceFreeRegression) {
                     eb = t.node(b).peerLinksForTest().epochOf[a];
                     return ea > was && ea == eb;
                 })) << "round " << round << " " << a << "<->" << b << ": " << ea << " / " << eb << " (was " << was << ")";
+                // Every WORKER plane of both nodes reached the new epoch too (the fanout delivered the keys to all of them).
+                auto workersOn = [&](int n, int peer, uint32_t want) {
+                    for (int32_t w = 0; w < t.node(n).workerCountForTest(); ++w)
+                        if (t.node(n).onWorkerThreadForTest(w, [peer](Worker& wk) { return wk.peerLinkEpochForTest(peer); }) != want) return false;
+                    return true;
+                };
+                ASSERT_TRUE(AuthTrio::until(60s, [&] { return workersOn(a, b, ea) && workersOn(b, a, ea); }))
+                    << "round " << round << " " << a << "<->" << b << ": a worker plane did not reach epoch " << ea;
             }
         }
         const int64_t mark = lastAck.load(std::memory_order_acquire);
