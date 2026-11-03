@@ -111,7 +111,7 @@ Catalog `formatVer 2` is namespaces (`kFormatV2`, `kCurrentFormatVer`, `ApplyV2`
 - P4-16 uses `replica->lastCleanOffset()`.
 - Type 19 (`kTxnJudge`) stays reserved: recognised, skipped and always kept by the cleaner. `Part::P11` and `TxnAllOrNothingAndAtomicPerPartition` go, and `TxnTooLarge` leaves the copied constraints.
 - Namespace memory: the judge's members and Part 05's `keyIndexes_` are adopted and charged to their namespace (`adoptNs_` / `chargeMem_`). A member paused by `nsViewGate_` stalls the judge for that source, so delivery and `View` acks wait until it resumes.
-- The control term floor rises with verdict sources: a 32,824 B `View` ack needs `RUNE_AERON_CONTROL_TERM_BYTES` ≥ 512 KiB, so the broker raises the floor to 512 KiB when any verdict source exists.
+- The ack term floor rises for every session: a 32,824 B `View` ack needs a term of at least 512 KiB, so the per-session ack publication is raised to `kMinAckTermBytes` (`broker/libs/node/include/rune/node/AeronChannel.h:24`; `Worker.h:744`; `SessionAckSink.h:1471`) **unconditionally**, not only "when any verdict source exists" (as `docs/configuration.md` says).
 
 **Part 05.** RB4. The test target is `rune_gateway_catalog_tests`. `AbortedFoldLog.h` / `AbortedFoldRig.h` do not exist: use `ViewAbortedTxnRegression`'s rig.
 
@@ -577,7 +577,7 @@ Each item names the owning part. Other parts use the name exactly as given.
 - **Batch form.** A control batch with `attributes = kAttrControl` (0x0020) only, **`kAttrTransactional` clear**, `producerId = -1`, `producerEpoch = -1`, `baseSequence = -1`, and one record. The record key is an int16 LE **type**. The value is `[version u8 = 1][payload]`. `producerId -1` keeps it out of `TxnCleanState` (`LogCleaner.cpp:229`) and the PSM feed (`RcState.h:660`).
 - **Types.** `inline constexpr int16_t kReservation = 16; kVerdictMarker = 17; kConstraintSetChange = 18; kTxnJudge = 19;` (04) and `kVerdictPlan = 20` (09, R09a). Transaction markers use 0 and 1 (`ControlMarkerLayout.h:30-31`). Types 16–20 are taken; a new type starts at 21. Part 11 adds none: it fills 04's reserved 19.
 - **Parser.** `[[nodiscard]] int recordType(const uint8_t* batch, std::size_t len) noexcept` returns the type or `kUnparseable` (−1). One CRC per parse (`parseControl`): `[[nodiscard]] std::optional<ControlRecord> parseControl(const uint8_t*, std::size_t) noexcept` validates the framing and the CRC once and returns `{type, value}` for types 16–19 only; `parseMarker`, `parseMarkerHeader`, `forEachMarkerEntry` and `parseConstraintSetChange` have `ControlRecord` overloads that do no CRC, and their raw-byte forms are `parseControl` plus the view overload.
-- **Hardening (04).** `ControlMarker::extract` (`broker/libs/transaction/src/ControlMarker.cpp:289-296`) and `RcBuilder::step` (`ReadCommittedView.cpp:315`) accept only types 0 and 1. A regression test feeds a batch of each new type to every reader listed in Review Focus 2.
+- **Hardening (04).** `ControlMarker::extract` (`broker/libs/transaction/src/ControlMarker.cpp:289-296`) and `RcBuilder::step` (`ReadCommittedView.cpp:315`) accept only types 0 and 1. `ControlMarker::extract` also refuses producerId < 0 (`broker/libs/transaction/src/ControlMarker.cpp:274`; test `ControlMarkerTest.BuildExtremeProducerIdEpochRoundTrips`, `broker/libs/transaction/tests/transaction/ControlMarkerTest.cpp:704`). A regression test feeds a batch of each new type to every reader listed in Review Focus 2.
 - **Payloads:**
   - `kVerdictMarker` (04): `[fromOffset i64][finalThrough i64][constraintSetId u32][count u32] count × [offsetDelta u32 (offset − fromOffset)][code u16][constraintId u32]`. It covers the judged range `[fromOffset, finalThrough)`. `kMaxMarkerEntries = 4096`; more rejections in one step means several markers.
   - `kConstraintSetChange` (04): `[constraintSetId u32][count u16] count × [viewObjectId u64][kind u8 (VerdictViewKind)][planFingerprint u64]`. The key index appears with `viewObjectId = 0`.
@@ -614,6 +614,7 @@ Each item names the owning part. Other parts use the name exactly as given.
   - It is fed by the `scanTxnState` pre-pass (`LogCleaner.cpp:212`) for control batches with `pid == -1`.
 - **Cleaner bound.**
   - `PartitionReplica::publishCleanerVerdictBound(Offset)` and `[[nodiscard]] Offset cleanerVerdictBound() const noexcept` are an atomic word beside `publishCleanerLso` (`PartitionReplica.h:866`). The default is `kNoCleanerLso`, meaning not a verdict source.
+  - The bound starts closed (`Offset{0}`) for any topic with `topicId >= 0` until the Ready worker publishes it (`publishedVerdictBound_`, `PartitionReplica.h:900-901`, initializer `:2131`).
   - The worker publishes `W` from `PartitionWriteState::rejected.watermark()`.
   - 04 adds `publishCleanerVerdictMarkerEnd(Offset)` / `cleanerVerdictMarkerEnd()`, published before the bound with release order and read after it with acquire order, and `LogCleaner::setVerdictBounds(Offset bound, Offset markerEnd)`.
   - 11 adds `publishCleanerTxnJudgeBound(Offset)` / `cleanerTxnJudgeBound()` (default `kNoCleanerLso`) and `LogCleaner::setTxnJudgeBound(Offset)`.
