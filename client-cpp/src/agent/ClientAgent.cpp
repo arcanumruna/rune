@@ -1852,7 +1852,9 @@ void ClientAgent::setSessionResponsePort(const std::string& endpoint, int32_t po
     try {
         bool found = false;
         for (auto& [ep, known] : nodeResponsePorts_) {
-            if (sameEndpoint(ep, endpoint)) { known = port; found = true; break; }
+            // #762: a 0 port (a Metadata / Redirect that names none) never erases a learnt port; it only fills an
+            // unknown entry (recorded below as known-without-a-port).  A non-zero port always overwrites.
+            if (sameEndpoint(ep, endpoint)) { if (port != 0) known = port; found = true; break; }
         }
         if (!found) nodeResponsePorts_.emplace_back(endpoint, port);
     } catch (...) {

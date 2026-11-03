@@ -322,3 +322,27 @@ TEST(ClientAgentRegression, LearntPortUpgradesAPlainNodeSessionRegression) {
     agent.setSessionResponsePort("aeron:udp?endpoint=seed:1", 41002);
     EXPECT_EQ(agent.serviceResponseUpgradesForTest(4'000'000), 0);
 }
+
+// ===========================================================================
+// #762: a Metadata / Redirect without a `#port` carries 0; it must never erase a learnt response port.
+// ===========================================================================
+
+TEST(MultiNodeRoutingRegression, ZeroResponsePortNeverErasesALearntPortRegression) {
+    const std::string kEp = "aeron:udp?endpoint=hostB:9001";
+    rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
+
+    agent.setSessionResponsePort(kEp, 7000);
+    agent.setSessionResponsePort(kEp, 0);   // a later Metadata without a port
+    EXPECT_EQ(agent.knownResponsePortForTest(kEp), 7000) << "a 0 port erased the learnt one";
+
+    agent.setSessionResponsePort(kEp, 7100);   // a non-zero port always overwrites
+    EXPECT_EQ(agent.knownResponsePortForTest(kEp), 7100);
+
+    const std::string kFresh = "aeron:udp?endpoint=hostC:9002";
+    agent.setSessionResponsePort(kFresh, 0);   // an unknown endpoint: recorded as known-without-a-port
+    EXPECT_EQ(agent.knownResponsePortForTest(kFresh), 0);
+    agent.setSessionResponsePort(kFresh, 7200);   // and a later non-zero port still teaches it
+    EXPECT_EQ(agent.knownResponsePortForTest(kFresh), 7200);
+    agent.setSessionResponsePort(kFresh, 0);
+    EXPECT_EQ(agent.knownResponsePortForTest(kFresh), 7200);
+}
