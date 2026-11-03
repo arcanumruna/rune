@@ -81,7 +81,7 @@ int AeronTransport::epollSelectedForTest(bool reset) noexcept {
 }
 
 int AeronTransport::dutyCycle() noexcept {
-    if (cfg_.driverMode != DriverMode::Invoker || driver_ == nullptr || driverStalledForTest_) [[unlikely]] return 0;
+    if (cfg_.driverMode != DriverMode::Invoker || driver_ == nullptr) [[unlikely]] return 0;
     // spec §3.1 order: driver, then client conductor.  T15 R2: the driver
     // refreshes its heartbeat before the conductor checks it — a second line of
     // defence after mediaDriverTimeoutMsFor(); nothing relies on it alone.
@@ -1149,6 +1149,7 @@ int AeronTransport::pumpDriverFromCaller_() noexcept {
 // ---------------------------------------------------------------------------
 
 void AeronTransport::stopEmbeddedDriver() noexcept {
+    if (stalledDriver_ != nullptr) { driver_ = stalledDriver_; stalledDriver_ = nullptr; }   // a stalled test still closes it
     // Step A: signal the driver thread to stop (control ring close) and join it.
     if (driverThreadLaunched_) {
         driverCtl_->producerClose();

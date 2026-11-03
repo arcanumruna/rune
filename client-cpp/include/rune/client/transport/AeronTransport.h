@@ -116,10 +116,12 @@ public:
 
     /// TEST SEAM (cold; owner thread): while stalled, dutyCycle() pumps nothing, so a registration sent meanwhile stays
     /// Resolving; `retarget`'s publication resolve bound is shortened to `boundNs` (wall clock) so a stalled retarget
-    /// returns promptly.  Stall off / bound 0 restores the defaults.
+    /// returns promptly.  Stall off / bound 0 restores the defaults.  The driver is parked aside rather than flagged,
+    /// so dutyCycle()'s existing `driver_ == nullptr` check stalls it and the hot path carries no test-only branch.
     void setDriverStalledForTest(bool stalled, int64_t retargetBoundNs = 0) noexcept {
-        driverStalledForTest_ = stalled;
-        retargetPubBoundNs_   = retargetBoundNs > 0 ? retargetBoundNs : kResolveTimeoutNs;
+        if (stalled && driver_ != nullptr) { stalledDriver_ = driver_; driver_ = nullptr; }
+        if (!stalled && stalledDriver_ != nullptr) { driver_ = stalledDriver_; stalledDriver_ = nullptr; }
+        retargetPubBoundNs_ = retargetBoundNs > 0 ? retargetBoundNs : kResolveTimeoutNs;
     }
 
     /// True once the Aeron client closed itself (inter-service timeout, driver
@@ -604,7 +606,7 @@ private:
     /// violation when driverThread_ is concurrently driving the same driver.
     int pumpDriverFromCaller_() noexcept;
     int callerPumpViolations_ = 0;  // written/read by the owning (caller) thread only
-    bool             driverStalledForTest_ = false;   // test seam: dutyCycle() is a no-op
+    aeron_driver_t*  stalledDriver_       = nullptr;  // test seam: the driver parked by setDriverStalledForTest
     int64_t          retargetPubBoundNs_   = kResolveTimeoutNs;   // test seam: retarget's publication resolve bound
     PumpStepObserver pumpObserver_    = nullptr;  // test seam (owner thread only)
     void*            pumpObserverCtx_ = nullptr;
