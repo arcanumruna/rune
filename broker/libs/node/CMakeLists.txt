@@ -28,9 +28,23 @@ add_library(rune_node
     src/ViewSnapshotIoAgent.cpp
     src/ViewCheckpointScan.cpp
     src/WorkerViewSet.cpp
-    src/CheckedWriteHook.cpp
-    src/VerdictSource.cpp
     src/TopicDirReconcile.cpp)
+
+# The checked-write produce hook and the partition verdict state, as their own leaf library.  Worker.h's
+# header-inline produce path (instantiated by rune_replication's AeronPartitionTransport.cpp too) calls
+# PartitionWriteState::isVerdictSource/isConstrainedSource and handleProduceBatch<..., CheckedWriteHook>, so
+# rune_replication must link these symbols without linking rune_node (which depends on it).  Linux-only failure
+# before: the replication-only test executables did not link.  The rune_replication edge closes a static-library
+# cycle (VerdictSource appends through PartitionReplica), which CMake resolves by repeating the archives.
+add_library(rune_checked_write
+    src/CheckedWriteHook.cpp
+    src/VerdictSource.cpp)
+target_include_directories(rune_checked_write PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${RUNE_PROTOCOL_INCLUDE})
+target_link_libraries(rune_checked_write PUBLIC rune_storage rune_codec rune_view rune_catalog rune_replication
+    spdlog::spdlog)
+target_link_libraries(rune_node PUBLIC rune_checked_write)
 
 # The worker's io backends, as their own leaf library: Worker.h's header-inline
 # code (instantiated by rune_replication's AeronPartitionTransport.cpp too) calls
