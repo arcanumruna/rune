@@ -7,7 +7,7 @@
 // records - is cleaned by the reaper.  Every step is recorded in the catalog itself (the object drops are catalog
 // events; the other steps are NamespaceDeleteStep events with one bit each), so the registry IS the progress.
 //
-// Nothing is persisted by the reaper and no timer exists.  Whenever it is Idle (boot, a new leadership, after a
+// Nothing is persisted by the reaper and no timer decides anything (a Refused / Waiting answer only paces the retry).  Whenever it is Idle (boot, a new leadership, after a
 // step) it re-derives its state from the registry: the lowest-nsId DELETING namespace, then its first unfinished step
 //
 //     AbortingTxns (bit 1 not set) -> DroppingViews (pending views) -> DroppingTopics (pending topics; a topic's
@@ -50,14 +50,23 @@ public:
     virtual bool securityClean(uint32_t nsId, std::string_view name) = 0;
 };
 
+/// #722: how long an issuing state waits before it asks again after a Refused / Waiting answer or a non-zero DDL code.
+/// A field of the state (every transition builds a new state, so it resets by itself).  `idle` counts the consecutive
+/// non-progress answers (capped); `retryAtNs` is armed lazily by the next doWork (0 = not armed yet).  It only paces
+/// the retries: convergence still comes from the idempotent re-issue, never from this delay.
+struct ReapBackoff {
+    int64_t retryAtNs = 0;
+    uint8_t idle      = 0;
+};
+
 struct ReapIdle {};
-struct ReapAbortingTxns   { uint32_t nsId; uint64_t inFlightCorrelation; };   // 0 = nothing in flight
-struct ReapDroppingViews  { uint32_t nsId; uint64_t inFlightCorrelation; };
-struct ReapDroppingTopics { uint32_t nsId; uint64_t inFlightCorrelation; };
+struct ReapAbortingTxns   { uint32_t nsId; uint64_t inFlightCorrelation; ReapBackoff backoff{}; };   // 0 = nothing in flight
+struct ReapDroppingViews  { uint32_t nsId; uint64_t inFlightCorrelation; ReapBackoff backoff{}; };
+struct ReapDroppingTopics { uint32_t nsId; uint64_t inFlightCorrelation; ReapBackoff backoff{}; };
 /// `step` = the NsDeleteStepBit being cleaned: GroupsTombstoned or TxnStateTombstoned.
-struct ReapTombstoning    { uint32_t nsId; uint8_t step; uint64_t inFlightCorrelation; };
+struct ReapTombstoning    { uint32_t nsId; uint8_t step; uint64_t inFlightCorrelation; ReapBackoff backoff{}; };
 /// The step's work is done; its NamespaceDeleteStep event is being recorded.
-struct ReapRecordingStep  { uint32_t nsId; uint8_t step; uint64_t inFlightCorrelation; };
+struct ReapRecordingStep  { uint32_t nsId; uint8_t step; uint64_t inFlightCorrelation; ReapBackoff backoff{}; };
 struct ReapAwaitRemoval   { uint32_t nsId; };
 using ReapState = std::variant<ReapIdle, ReapAbortingTxns, ReapDroppingViews, ReapDroppingTopics, ReapTombstoning,
                                ReapRecordingStep, ReapAwaitRemoval>;
@@ -69,7 +78,7 @@ public:
 
     /// One pass.  Derives the state from `cs` whenever Idle (or when the current target is no longer DELETING), then
     /// issues the state's next piece of work through `port`.  Returns the number of things issued / transitions made.
-    /// No timer: `nowNs` is only for symmetry with every other agent's doWork.
+    /// `nowNs` paces only the retries after a Refused / Waiting answer (ReapBackoff); there is no other timer.
     int doWork(int64_t nowNs, const rune::catalog::CatalogState& cs, ReaperPort& port);
 
     /// The answer of a DDL / event the port submitted.  A result whose correlation is not the state's in-flight one is
@@ -92,7 +101,7 @@ public:
 
 private:
     [[nodiscard]] ReapState derive_(const rune::catalog::NamespaceRecord& rec) const;
-    int step_(const rune::catalog::CatalogState& cs, ReaperPort& port);
+    int step_(int64_t nowNs, const rune::catalog::CatalogState& cs, ReaperPort& port);
     [[nodiscard]] bool takeBudget_() noexcept {
         if (budget_ == 0) return false;
         if (budget_ > 0) --budget_;

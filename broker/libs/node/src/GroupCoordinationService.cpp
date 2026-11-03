@@ -86,7 +86,7 @@ ReapStatus GroupCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t 
     const rune::replication::Offset leo0 = r->logEndOffset();
     const bool none = offsets_->tombstoneNamespace(nsId, batch, nowNs);
     if (!none) return r->logEndOffset() > leo0 ? ReapStatus::More : ReapStatus::Refused;
-    return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::More;   // all committed
+    return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::Waiting;   // all committed; else the commit is awaited (nothing for the reaper to write)
 }
 
 std::optional<std::size_t> GroupCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const {

@@ -1081,10 +1081,10 @@ void nsAbortCell(AtDelete at, bool refused) {
 
     int64_t now = 10;
     EXPECT_EQ(T.tcs->abortNamespaceTxns(7, now), ReapStatus::Done) << "another namespace's delete";
-    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, now), ReapStatus::More) << "the marker has not been answered yet";
+    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, now), ReapStatus::Waiting) << "the marker has not been answered yet";
     EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), prepared);
-    ReapStatus st = ReapStatus::More;
-    for (int i = 0; i < 64 && st == ReapStatus::More; ++i) {   // the coordinator and the worker, 1 ms apart
+    ReapStatus st = ReapStatus::Waiting;
+    for (int i = 0; i < 64 && st == ReapStatus::Waiting; ++i) {   // the coordinator and the worker, 1 ms apart
         (void)T.tcs->doWork(now);
         T.m.runWorker(now);
         now += 1'000'000;
@@ -1126,7 +1126,7 @@ TEST(NamespaceTxnAbortRegression, AbortNamespaceTxnsNotLoadedIsRefusedRegression
     TxnRig T;
     ASSERT_EQ(T.initPid(), 0);
     ASSERT_EQ(T.addPartition(), 0);
-    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, 10), ReapStatus::More);
+    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, 10), ReapStatus::Waiting);
     T.leader = false;
     (void)T.tcs->doWork(20);
     ASSERT_FALSE(T.tcs->isLoaded());

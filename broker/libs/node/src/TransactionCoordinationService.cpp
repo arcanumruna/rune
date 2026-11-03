@@ -492,10 +492,10 @@ ReapStatus TransactionCoordinationService::abortNamespaceTxns(uint32_t nsId, int
     std::size_t answered = 0;
     for (const auto& [pid, a] : awaiting_) {
         if (rune::coordination::parseScopedId(a.txnId).nsId != nsId) continue;
-        if (static_cast<std::size_t>(std::max(0, a.outstanding)) > a.retries.size()) return ReapStatus::More;
+        if (static_cast<std::size_t>(std::max(0, a.outstanding)) > a.retries.size()) return ReapStatus::Waiting;   // #722: the markers progress on their own; nothing for the reaper to write
         ++answered;
     }
-    return answered < unsettled ? ReapStatus::More : ReapStatus::Done;   // a Prepare* one not dispatched yet
+    return answered < unsettled ? ReapStatus::Waiting : ReapStatus::Done;   // a Prepare* one not dispatched yet
 }
 
 ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs)
@@ -509,7 +509,7 @@ ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uin
     const bool none = txnState_->tombstoneNamespace(nsId, batch, nowNs);
     if (!none) return r->logEndOffset() > leo0 ? ReapStatus::More : ReapStatus::Refused;
     // Nothing left to write: Done only once every tombstone is committed (a leader change must not resurrect a key).
-    return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::More;
+    return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::Waiting;
 }
 
 std::optional<std::size_t> TransactionCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const
