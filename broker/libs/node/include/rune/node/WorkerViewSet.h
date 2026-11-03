@@ -308,6 +308,7 @@ public:
         holdJudges_ = hold;
         for (auto& kv : verdictSources_) kv.second->holdJudgeForTest(hold);
     }
+    /// The records one fold pass of (view, partition) may cover (0 = uncapped).  -1: not hosted.
     [[nodiscard]] int64_t maxRecordsPerPassForTest(int32_t viewTopicId, int32_t partition) const {
         const auto it = views_.find(instKey(viewTopicId, partition));
         return it == views_.end() ? -1 : it->second.maxRecordsPerPass;
