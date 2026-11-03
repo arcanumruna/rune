@@ -243,8 +243,9 @@ const char* nameOf(KiAction a) {
     case KiAction::Restart: return "Restart";
     case KiAction::TruncateTail: return "TruncateTail";
     case KiAction::Compact: return "Compact";
-    default: return "Transaction";
+    case KiAction::Transaction: return "Transaction";
     }
+    return "";
 }
 
 class KiRun {
@@ -332,11 +333,11 @@ private:
     }
 
     // The key index is rebuilt from the local log by the passes after a leadership (one batch per pass here, a segment per batch), and the
-    // judge takes a new write only once it is rebuilt: a write acked is the barrier.
+    // judge takes a new write only once it is rebuilt: an intent batch acked is the barrier, so the seeded run covers intents judged after the rebuild.
     void leadershipBarrier_() {
         waitActive_();
         if (::testing::Test::HasFatalFailure()) return;
-        ASSERT_TRUE(sendIdem_(producers_[0], {Rec{1 + rng_() % kKiKeys, ++vSeq_, 1, false, 0}}));
+        ASSERT_TRUE(sendIdem_(producers_[rng_() % 2], intentBatch_(1 + rng_() % 4)));
     }
 
     void installTag_() {
@@ -487,21 +488,13 @@ private:
             for (uint64_t i = 0; i < n; ++i) aborted_.insert(a->baseOffset + static_cast<int64_t>(i));
     }
 
-    // What a raw subscription from 0 delivers: the accepted records with their intents, and the aborted transactions' (they are in the log).
+    // What a raw and a push-read subscription from 0 deliver: the accepted records with their intents, and the aborted transactions' (they are in the log).
     void checkDelivered_(const CheckedWritesModel& model, const std::set<int64_t>& present) {
-        for (int i = 0; i < VerdictRig::kMaxPass && rig_.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) rig_.pass();
-        ASSERT_EQ(rig_.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
-        const auto& box = rig_.collect(rig_.subscribe(SubKind::Raw, 0));
-        std::vector<std::tuple<int64_t, uint64_t, uint16_t, uint8_t>> got, want;
-        for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.tag, d.intent);
-        const auto addWant = [&](const VerdictRig::RigLogRec& a) {
-            if (present.count(a.offset) != 0) want.emplace_back(a.offset, a.id, a.del ? kTombstoneTag : a.tag, a.intent);
-        };
-        for (const auto& a : model.acceptedRecords()) addWant(a);
+        std::vector<VerdictRig::RigLogRec> aborted;
         for (const int64_t off : aborted_)
-            if (const auto it = data_.find(off); it != data_.end()) addWant(it->second);
-        std::sort(want.begin(), want.end());
-        EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
+            if (const auto it = data_.find(off); it != data_.end()) aborted.push_back(it->second);
+        checkDelivered(rig_, model, rig_.subscribe(SubKind::Raw, 0), false, &present, &aborted);
+        checkDelivered(rig_, model, rig_.subscribe(SubKind::PushRead, 0), false, &present, &aborted);
     }
 
     // IntentVerdictsExact: every 56 / 57 ever reported (an ack, the index or a marker) is the model's, and a record an ack reported as
@@ -607,7 +600,6 @@ TEST_P(CheckedWritesKeyIndexModelRegression, SameSeedSameTrace) {
     if (GetParam() > 8) GTEST_SKIP() << "seeds 1-8 only";
     const std::string first = runKiSeed(GetParam());
     const std::string second = runKiSeed(GetParam());
-    EXPECT_EQ(std::hash<std::string>{}(first), std::hash<std::string>{}(second));
     EXPECT_EQ(first, second);
 }
 
@@ -636,14 +628,14 @@ TEST(CheckedWritesModel, TombstonesAreJudgedOnlyByTheKeyIndex) {
 
 
 // One cleaner pass over more segments than the swap ring has slots (256): the rig drains the ring while it queues.
-TEST(CheckedWritesModel, CompactQueuesMoreSegmentsThanTheSwapRingHoldsRegression) {
+TEST(CheckedWritesRigRegression, CompactQueuesMoreSegmentsThanTheSwapRingHoldsRegression) {
     VerdictRig r(/*follower=*/false, /*rollBytes=*/1);
     r.typed();
     r.installRejectView(kRejTag, kObjTag, tagRule(9));
     r.passes(50);
     for (int64_t v = 1; v <= 300; ++v) ASSERT_EQ(r.produce({{5, v, 0}}), 0);
     ASSERT_TRUE(r.driveUntilJudged());
-    (void)r.compact();
+    EXPECT_GT(r.compact().groups, 256) << "the pass must queue more groups than the ring has slots";
     (void)r.compact();
     const auto data = r.readLog().data;
     ASSERT_EQ(data.size(), 1u);

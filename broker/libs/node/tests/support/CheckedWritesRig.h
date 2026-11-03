@@ -684,7 +684,7 @@ public:
     }
 
     // ---- compaction ----
-    struct Compacted { int64_t bound = 0; int64_t passEnd = 0; int installed = 0; };
+    struct Compacted { int64_t bound = 0; int64_t passEnd = 0; int installed = 0; std::size_t groups = 0; };
     /// Seals the active segment (a reservation record rolls it), then one cleaner pass over [0, firstUncleanable) with the replica's
     /// published bounds - what LogCleanerAgent does for one log - and the owner's swap drain (`drain` false leaves the outputs queued,
     /// see drainSwaps).  `nowMs` is the cleaner's clock (delete horizons).  Needs a small `rollBytes`.
@@ -719,6 +719,7 @@ public:
         rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::maxSlotsFromBudget(1 << 22));
         auto res = cleaner.produceCleanedRangeBounded(log->dir(), bases, sizes, uncleanable, 0, nowMs * 1'000'000, 1000, map, false, 1 << 20, nullptr, nowMs);
         out.passEnd = res.passEnd;
+        out.groups = res.groups.size();
         for (const auto& g : res.groups) {
             std::vector<rune::storage::Log::CleanedMember> members;
             for (const int64_t gb : g.bases) {
@@ -735,7 +736,7 @@ public:
             EXPECT_TRUE(queued);
             if (queued) (void)prebuilt.release();   // the owner owns it now
         }
-        if (drain) out.installed = drainSwaps();
+        if (drain) out.installed += drainSwaps();
         return out;
     }
     /// The owner's drain of the queued compaction outputs; the count of installs (and rejections) it did.

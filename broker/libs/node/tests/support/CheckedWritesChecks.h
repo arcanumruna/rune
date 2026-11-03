@@ -163,19 +163,26 @@ inline void checkViews(VerdictRig& r, const CheckedWritesModel& model, const Ver
     }
 }
 
-/// (c) A subscription delivered exactly the accepted records (Filtered: the live tag-1 ones).
-inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64_t sub, bool filtered, const std::set<int64_t>* present = nullptr) {
+/// (c) A subscription delivered exactly the accepted records (Filtered: the live tag-1 ones), with their intents; `alsoDelivered`
+/// are further log records the subscription delivers (a Raw one gets an aborted transaction's).
+inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64_t sub, bool filtered, const std::set<int64_t>* present = nullptr,
+                           const std::vector<VerdictRig::RigLogRec>* alsoDelivered = nullptr) {
     for (int i = 0; i < VerdictRig::kMaxPass && r.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) r.pass();   // nothing is delivered while the leadership scan runs
     ASSERT_EQ(r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
     const auto& box = r.collect(sub);
-    std::vector<std::tuple<int64_t, uint64_t, uint16_t>> got, want;
-    for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.tag);
+    std::vector<std::tuple<int64_t, uint64_t, uint16_t, uint8_t>> got, want;
+    for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.tag, d.intent);
+    const auto addWant = [&](const VerdictRig::RigLogRec& a) {
+        if (present != nullptr && present->count(a.offset) == 0) return;
+        want.emplace_back(a.offset, a.id, a.del ? kTombstoneTag : a.tag, a.intent);
+    };
     for (const auto& a : model.acceptedRecords()) {
         if (filtered && (a.del || a.tag != 1)) continue;
-        if (present != nullptr && present->count(a.offset) == 0) continue;
-        want.emplace_back(a.offset, a.id, a.del ? kTombstoneTag : a.tag);
+        addWant(a);
     }
-    EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones";
+    if (alsoDelivered != nullptr) for (const auto& a : *alsoDelivered) addWant(a);
+    std::sort(want.begin(), want.end());
+    EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
 }
 
 /// (e)(g) One cleaner pass keeps everything at or above the verdict bound and every key's latest accepted record.
