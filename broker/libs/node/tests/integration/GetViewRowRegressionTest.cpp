@@ -34,6 +34,7 @@
 #include <rune/node/ReadLeaseFanout.h>
 #include <rune/consensus/ReadLease.h>
 #include <rune/node/ViewSnapshotChannel.h>
+#include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/metadata/ShardRouter.h>
 
 #include <rune/node/AdminWorker.h>
@@ -64,6 +65,8 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -1181,4 +1184,137 @@ TEST(ViewReadLeaseRegression, AHeldViewReadEndsNotReadyWhenTheFoldCannotReachIts
     EXPECT_LE(passes, 23);
     EXPECT_EQ(w.viewReadsHeldExpiredForTest(), 1u);
     EXPECT_EQ(w.heldViewReadsForTest(), 0u);
+}
+
+
+// ---------------------------------------------------------------------------
+// #590 restart matrix (real Worker + real IO agent, a disk source): a legacy or unreadable view checkpoint over a full, a
+// retention-trimmed and a compacted source log is backed up (one file, the matching reason) and the view is rebuilt from what
+// the log holds.  RED (the Legacy branch of applyRecoveredCheckpoint_ reverted): no backup, the legacy file stays.
+// ---------------------------------------------------------------------------
+namespace {
+
+enum class LogShape { Full, TrimmedToTwo, Compacted };
+enum class OldCheckpoint { Legacy, Unreadable };
+
+// offsets 0,1: key 9 hp 10,11; offsets 2,3: key 7 hp 30,31 (Full); Trimmed drops [0,2) by retention; Compacted keeps the latest per
+// key: offsets 1 (key 9 hp 11) and 3 (key 7 hp 31), logStart stays at the first remaining offset.
+std::vector<uint8_t> upsertBatch(int64_t baseOffset, std::initializer_list<std::pair<int64_t, int32_t>> recs) {
+    rune::protocol::RecordBatchBuilder b(baseOffset, 0);
+    for (const auto& [id, hp] : recs) {
+        const auto k = keyBytes(id);
+        const auto v = encodeCharacter(id, hp, 1);
+        b.append(asSv(k), asSv(v), 0);
+    }
+    return b.build();
+}
+
+struct RestartSource {
+    TmpDir dir;
+    TmpDir viewDir;
+    rune::replication::InMemoryTransport transport;
+    std::unique_ptr<rune::storage::Log> log;
+    std::unique_ptr<PartitionReplica> replica;
+
+    explicit RestartSource(LogShape shape, const std::string& tag) : dir("g1_log_" + tag), viewDir("g1_view_" + tag) {
+        // One segment per batch, so retention can drop the first.
+        log = std::make_unique<rune::storage::Log>(dir.path, /*segmentRollBytes=*/1);
+        auto put = [&](int64_t base, std::initializer_list<std::pair<int64_t, int32_t>> recs, int64_t last) {
+            const auto batch = upsertBatch(base, recs);
+            ASSERT_GE(log->append(batch, last), 0);
+        };
+        if (shape == LogShape::Compacted) {
+            put(1, {{9, 11}}, 1);
+            put(3, {{7, 31}}, 3);
+        } else {
+            put(0, {{9, 10}, {9, 11}}, 1);
+            put(2, {{7, 30}, {7, 31}}, 3);
+        }
+        PartitionConfig c{};
+        c.topicId = kSrcTopicId; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+        c.replicaLagMaxMs = 1'000'000; c.replicaLagMaxOffset = 1'000'000;
+        c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL;
+        c.maxFetchBytes = 1 << 20; c.pushOnAppend = false;
+        replica = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, log.get(), &transport);
+        replica->becomeLeader(/*epoch=*/2, {1});
+        if (shape == LogShape::TrimmedToTwo) {
+            const int64_t keep = static_cast<int64_t>(upsertBatch(2, {{7, 30}, {7, 31}}).size());
+            EXPECT_GE(log->deleteOldSegments(keep, replica->highWatermark()), 1);
+        }
+    }
+};
+
+}  // namespace
+
+TEST(GetViewRowRegression, LegacyCheckpointRestartMatrixRegression) {
+    const struct { LogShape shape; OldCheckpoint old; const char* name; } rows[] = {
+        {LogShape::Full, OldCheckpoint::Legacy, "legacy over a full log"},
+        {LogShape::TrimmedToTwo, OldCheckpoint::Legacy, "legacy over a retention-trimmed log"},
+        {LogShape::Compacted, OldCheckpoint::Legacy, "legacy over a compacted log"},
+        {LogShape::Full, OldCheckpoint::Unreadable, "unreadable over a full log"},
+        {LogShape::TrimmedToTwo, OldCheckpoint::Unreadable, "unreadable over a retention-trimmed log"},
+        {LogShape::Compacted, OldCheckpoint::Unreadable, "unreadable over a compacted log"},
+    };
+    int n = 0;
+    for (const auto& row : rows) {
+        SCOPED_TRACE(row.name);
+        RestartSource s(row.shape, "m" + std::to_string(n++));
+        ASSERT_GE(s.replica->highWatermark(), 3) << "a committed log";
+        if (row.shape == LogShape::TrimmedToTwo) ASSERT_EQ(s.log->logStartOffset(), 2);
+
+        // The pre-restart view files: bytes a restart must back up, never load, never delete.
+        const std::vector<uint8_t> oldBytes(57, 0xAB);
+        const std::string oldPath = row.old == OldCheckpoint::Legacy
+            ? rune::node::legacyViewCheckpointFilePath(s.viewDir.path, kViewTopicId, 0)
+            : rune::node::viewCheckpointFilePath(s.viewDir.path, kViewTopicId, 0);
+        { std::ofstream f(oldPath, std::ios::binary); f.write(reinterpret_cast<const char*>(oldBytes.data()), static_cast<std::streamsize>(oldBytes.size())); }
+
+        // The restart: a NEW worker + view set + IO agent over the same data, the view installed exactly as BrokerNode does at boot.
+        auto src = charSourceV1();
+        const Descriptor* srcs[] = {&src};
+        auto comp = rv::compileView(hpView(/*persistence*/ 0), srcs, kViewTopicId).value();
+        ViewSnapshotChannel channel;
+        WorkerViewSet vs(channel, s.viewDir.path);
+        ViewSnapshotIoAgent agent(channel, s.viewDir.path, /*fsyncMs=*/1);
+        ViewPlanUpdateMsg m;
+        m.viewTopicId = kViewTopicId; m.persistence = 0; m.recovery = true;
+        m.planBlob = rv::serialize(comp.plan); m.outDescBlob = rune::codec::serialize(comp.outputDescriptor);
+        m.srcDescBlob = rune::codec::serialize(src);
+        ASSERT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m));
+        Worker w(/*workerId*/ 0);
+        w.setOwnedDirect(Worker::OwnedSet{s.replica.get()});
+        w.setViewSet(&vs);
+
+        int64_t hp7 = -1;
+        int pass = 0;
+        for (; pass < 400 && hp7 < 0; ++pass) {   // hard cap: a hang fails here
+            const int64_t now = 1'000'000'000LL * (pass + 1);
+            w.doWork(now);
+            agent.doWork(now);
+            const WorkerReturn r = runGetViewRow(w, kViewTopicId, 0, 7, 0);
+            if (r.errorCode == kOkCode) hp7 = rv::readSlot(r.chunk.data(), comp.rowLayout, 1).i;
+        }
+        ASSERT_EQ(hp7, 31) << "never Ready within the cap";
+        EXPECT_EQ(vs.readiness(kViewTopicId, 0), ViewReadiness::Ready);
+
+        const auto backups = rune::node::listViewBackups(s.viewDir.path, kViewTopicId, 0);
+        ASSERT_EQ(backups.size(), 1u);
+        EXPECT_NE(backups[0].find(row.old == OldCheckpoint::Legacy ? ".legacy.delta" : ".unreadable.delta"), std::string::npos) << backups[0];
+        {
+            std::ifstream f(backups[0], std::ios::binary);
+            const std::vector<uint8_t> got((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            EXPECT_EQ(got, oldBytes) << "the backup is the old file byte for byte";
+        }
+        if (row.old == OldCheckpoint::Legacy) EXPECT_FALSE(std::filesystem::exists(oldPath));
+        EXPECT_EQ(vs.foldCounters(kViewTopicId, 0)->checkpointDiscards, 1u) << "the one backup-and-rebuild; no below-log-start discard on top";
+
+        // rows == a recompute of what the log holds
+        const WorkerReturn r9 = runGetViewRow(w, kViewTopicId, 0, 9, 0);
+        if (row.shape == LogShape::TrimmedToTwo) {
+            EXPECT_NE(r9.errorCode, kOkCode) << "key 9's records were trimmed away";
+        } else {
+            ASSERT_EQ(r9.errorCode, kOkCode);
+            EXPECT_EQ(rv::readSlot(r9.chunk.data(), comp.rowLayout, 1).i, 11);
+        }
+    }
 }
