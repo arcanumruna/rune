@@ -1837,9 +1837,10 @@ template <typename Write>
 // 6-byte header in front, so every committed descriptor fits.
 // statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag.
 inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1;
-// The trailing adoptDenial length prefix (2, issue #129), then the nsId (4, namespaces).
+// The trailing adoptDenial length prefix (2, issue #129), the nsId (4, namespaces), then the
+// key features (flags 1 + partitioner 1 + autoIncrementMax 8 + autoIncrementReserve 4, checked writes Part 05).
 inline constexpr std::size_t kDefineTopicFixedBytes =
-    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2 + 4;
+    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2 + 4 + 1 + 1 + 8 + 4;
 inline constexpr std::size_t kMaxDescriptorViaRequestRing =
     static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
 static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=
