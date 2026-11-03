@@ -4,9 +4,12 @@
 #include <gtest/gtest.h>
 
 #include <charconv>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <set>
 #include <string>
+#include <thread>
 
 using namespace rune::node::cw;
 using rune::node::test::catalog_cluster::ThreeNodes;
@@ -65,3 +68,37 @@ TEST_P(CheckedWritesStressRegression, KeyIndexSeededClusterHoldsTheInvariants) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesStressRegression, ::testing::Range(1, 13));
+
+// Only a leader compacts, and it may drop a committed rejected record before the history reads its log: the record is still on the
+// followers, and the model must judge it (the stress failed with "index entry N (57,0) is not rejected by the model").
+TEST(CheckedWritesStressHistory, RejectionTheLeaderCompactedBeforeAnyHistoryReadIsStillJudged) {
+    using Op = CheckedWritesStressDriver::Op;
+    using Result = CheckedWritesStressDriver::Sent::Result;
+    ThreeNodes cluster = ThreeNodes::startWith("cw05_compacted_reject", [](rune::node::NodeConfig& cfg) { cfg.verdictIntervalMs = 20; });
+    CheckedWritesStressDriver d(cluster, 1, true);
+    d.setUp();
+    ASSERT_FALSE(HasFatalFailure());
+    const uint64_t a = 1;
+    const int part = static_cast<int>(rune::client::Key(a).partition(CheckedWritesStressDriver::kKiParts));
+    uint64_t b = a + 1;
+    while (static_cast<int>(rune::client::Key(b).partition(CheckedWritesStressDriver::kKiParts)) != part) ++b;
+    ASSERT_EQ(d.kiWrite(Op::Insert, a).result, Result::Ok);
+    const CheckedWritesStressDriver::Sent miss = d.kiWrite(Op::Update, b);
+    ASSERT_EQ(miss.result, Result::Violation);
+    ASSERT_EQ(miss.code, 57);
+    // Rejected inserts of `a` roll the segment that holds the 57's record; the leader's cleaner then drops it.
+    const auto gone = [&] {
+        const std::set<int64_t> offs = d.leaderOffsets(part);
+        const auto it = offs.lower_bound(miss.hwBefore);
+        return it == offs.end() || *it >= miss.hwAfter;
+    };
+    for (int i = 0; i < 4000 && !gone(); i += 50)
+        for (int j = 0; j < 50; ++j) ASSERT_EQ(d.kiWrite(Op::Insert, a).result, Result::Violation);
+    for (int poll = 0; poll < 600 && !gone(); ++poll) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_TRUE(gone()) << "the leader never compacted the rejected update (" << miss.hwBefore << ", " << miss.hwAfter << ")";
+    d.quiesce();
+    ASSERT_FALSE(HasFatalFailure());
+    std::string failed;
+    EXPECT_TRUE(d.checkAll(&failed)) << failed;
+    std::printf("%s\n", d.keyIndexTally().c_str());
+}

@@ -230,6 +230,30 @@ public:
     /// The most records the history holds that one node's log no longer holds (a compaction ran).
     [[nodiscard]] std::size_t compactedAway() const { return compactedAway_; }
 
+    /// Key-index mode: one write of `id` through the first client, kept like a burst's write but with no history read after it.
+    Sent kiWrite(Op op, uint64_t id) {
+        Sent s;
+        s.id = id;
+        s.op = op;
+        s.part = static_cast<int>(rune::client::Key(id).partition(parts_));
+        s.hwBefore = highWatermark_(s.part);
+        kiSend_(*kiWriters_.front(), &s);
+        s.hwAfter = highWatermark_(s.part);
+        sent_.push_back(s);
+        return s;
+    }
+    /// The data offsets the partition's leader holds below its high watermark.
+    std::set<int64_t> leaderOffsets(int part) {
+        std::vector<int32_t> leaders;
+        std::set<int64_t> out;
+        if (!rune::node::test::catalog_cluster::awaitLeaders(c_, topicId_, parts_, leaders, 5s)) return out;
+        c_.node(leaders[static_cast<std::size_t>(part)]).onOwnerThreadForTest(topicId_, part, [&out](rune::replication::PartitionReplica& r) {
+            for (const auto& d : readLogOf(*r.log(), r.highWatermark()).data) out.insert(d.offset);
+            return 0;
+        });
+        return out;
+    }
+
 private:
     // ---- clients ----
     struct Writer {
@@ -501,15 +525,9 @@ private:
             const unsigned o = static_cast<unsigned>(rng_() % 100);
             s.op = o < 35 ? Op::Insert : o < 60 ? Op::Update : o < 80 ? Op::RemoveExisting : Op::Remove;
             s.part = static_cast<int>(rune::client::Key(s.id).partition(parts_));
-            const rune::node::test::KiAccount rec{s.id, "n" + std::to_string(++vSeq_), vSeq_};
-            if (s.op == Op::Insert || s.op == Op::Update) std::memcpy(&s.v, rec.name.data(), std::min<std::size_t>(rec.name.size(), sizeof(s.v)));
             if (!killer.joinable()) s.hwBefore = highWatermark_(s.part);
             if (victim > 0 && i == n / 2) { checkCounters_(victim); killer = std::thread([this, victim] { c_.crash(victim); }); }
-            const rune::client::WriteResult r = s.op == Op::Insert ? w.topic->insertAndWait(rec, 10s)
-                                              : s.op == Op::Update ? w.topic->updateAndWait(rec, 10s)
-                                              : s.op == Op::RemoveExisting ? w.topic->removeExistingAndWait(s.id, 10s)
-                                              : w.topic->removeAndWait(s.id, 10s);
-            classify_(r, &s);
+            kiSend_(w, &s);
             // A node going down cannot be asked for its high watermark: the window of a rejected tombstone is unknown, it is not judged.
             if (killer.joinable()) { if (s.result == Sent::Result::Violation && (s.op == Op::RemoveExisting)) s.result = Sent::Result::Unknown; }
             else s.hwAfter = highWatermark_(s.part);
@@ -519,6 +537,16 @@ private:
         }
         if (killer.joinable()) killer.join();
         recordHistory_();
+    }
+    /// Sends `s` (its id and op) through `w`: its token is the new record's name, its result the answer.
+    void kiSend_(KiWriter& w, Sent* s) {
+        const rune::node::test::KiAccount rec{s->id, "n" + std::to_string(++vSeq_), vSeq_};
+        if (s->op == Op::Insert || s->op == Op::Update) std::memcpy(&s->v, rec.name.data(), std::min<std::size_t>(rec.name.size(), sizeof(s->v)));
+        const rune::client::WriteResult r = s->op == Op::Insert ? w.topic->insertAndWait(rec, 10s)
+                                          : s->op == Op::Update ? w.topic->updateAndWait(rec, 10s)
+                                          : s->op == Op::RemoveExisting ? w.topic->removeExistingAndWait(s->id, 10s)
+                                          : w.topic->removeAndWait(s->id, 10s);
+        classify_(r, s);
     }
     /// Ok, KeyExists (insert), KeyNotFound (update, removeExisting) and the outcomes that carry no verdict (a timeout, a lost
     /// session, NotLeader, VerdictUnknown) are the ones a write can come back with; anything else fails the step.
