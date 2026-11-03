@@ -371,3 +371,55 @@ TEST(ClientAgentRegression, UnresolvedWorkerBindIsNotReResolvedUntilTheSessionTa
     EXPECT_EQ(agent.workerBindSessionIndexForTest(0), bIdx);
     EXPECT_EQ(agent.workerBindResolvesForTest(), 3u);
 }
+
+// ===========================================================================
+// #751: a worker's bind entry (and its response publication pair) is freed when the last route naming it moves.
+// ===========================================================================
+
+TEST(ClientAgentRegression, AWorkerBindEntryIsFreedWhenItsLastRouteMovesRegression) {
+    const std::string kNode = "aeron:udp?endpoint=nodeA:9001";
+    const std::string kW    = "aeron:udp?endpoint=hostW:9100";
+    const std::string kW2   = "aeron:udp?endpoint=hostX:9200";
+    constexpr int32_t kTopic = 7, kStream = 21;
+    rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
+    const std::size_t base = agent.activePublicationSlotsForTest();
+    const auto route = [&](int32_t part, const std::string& worker, int32_t port) {
+        return agent.setRoute(kTopic, part, kNode, worker, 0, kStream, port);
+    };
+
+    // Both partitions on worker W: one shared entry, one publication pair.
+    ASSERT_TRUE(route(0, kW, 7000));
+    ASSERT_TRUE(route(1, kW, 7000));
+    const uint32_t wIdx = agent.routeBindIdxForTest(kTopic, 0);
+    ASSERT_NE(wIdx, 0xFFFFFFFFu);
+    ASSERT_EQ(agent.routeBindIdxForTest(kTopic, 1), wIdx);
+    EXPECT_EQ(agent.activePublicationSlotsForTest(), base + 1);
+
+    // One route moves: the entry stays (the other route still names it).
+    ASSERT_TRUE(route(0, kW2, 7100));
+    const uint32_t xIdx = agent.routeBindIdxForTest(kTopic, 0);
+    ASSERT_NE(xIdx, wIdx);
+    EXPECT_FALSE(agent.workerBindFreeForTest(wIdx)) << "freed while a route still names it";
+    EXPECT_EQ(agent.activePublicationSlotsForTest(), base + 2);
+
+    // The last route moves: W's entry is Free and its publication pair is released.
+    ASSERT_TRUE(route(1, kW2, 7100));
+    EXPECT_EQ(agent.routeBindIdxForTest(kTopic, 1), xIdx);
+    EXPECT_TRUE(agent.workerBindFreeForTest(wIdx)) << "the entry of a worker no route names was never freed";
+    EXPECT_EQ(agent.activePublicationSlotsForTest(), base + 1) << "the worker's publication was never released";
+
+    // A route back to W reuses the freed entry and its publication slot.
+    const std::size_t slotsBefore = agent.pubSlotCountForTest();
+    ASSERT_TRUE(route(0, kW, 7000));
+    EXPECT_EQ(agent.routeBindIdxForTest(kTopic, 0), wIdx) << "a Free entry is reused first";
+    EXPECT_FALSE(agent.workerBindFreeForTest(wIdx));
+    EXPECT_EQ(agent.pubSlotCountForTest(), slotsBefore) << "the publication slot is re-initialised, not appended";
+    EXPECT_EQ(agent.activePublicationSlotsForTest(), base + 2);
+
+    // Both routes back on the seed's own path (default): every entry is Free and nothing stays open.
+    ASSERT_TRUE(agent.setRoute(kTopic, 0, "", "", 0, 0, 0));
+    ASSERT_TRUE(agent.setRoute(kTopic, 1, "", "", 0, 0, 0));
+    EXPECT_TRUE(agent.workerBindFreeForTest(wIdx));
+    EXPECT_TRUE(agent.workerBindFreeForTest(xIdx));
+    EXPECT_EQ(agent.activePublicationSlotsForTest(), base);
+}

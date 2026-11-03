@@ -464,6 +464,7 @@ AeronTransport::PubHandle AeronTransport::publicationHandle(const std::string& c
                                                             int32_t streamId) {
     for (std::size_t i = 0; i < pubSlots_.size(); ++i) {
         if (pubSlots_[i].streamId == streamId && pubSlots_[i].channel == channel) {
+            if (std::holds_alternative<PubSlot::Released>(pubSlots_[i].mode)) pubSlots_[i].mode = PubSlot::Plain{};   // #751
             return static_cast<PubHandle>(i);
         }
     }
@@ -478,6 +479,7 @@ bool AeronTransport::offerOn(PubHandle h, const uint8_t* buf, std::size_t len, F
     PubSlot& s = pubSlots_[static_cast<std::size_t>(h)];
     if (aeron::ExclusivePublication* p = s.res.ready()) return offerToPub(*p, buf, len, crc) == OfferResult::Accepted;
     if (!aeron_) return false;
+    if (std::holds_alternative<PubSlot::Released>(s.mode)) [[unlikely]] return false;   // #751: released by its owner
     // NAT-safe egress phase 1: the response subscription must be Ready before the correlated publication is added
     // (Aeron names its registration id in the request publication's URI).
     if (const auto* await = std::get_if<PubSlot::AwaitResponseSub>(&s.mode)) {
@@ -519,6 +521,14 @@ AeronTransport::PubHandle AeronTransport::responsePublicationHandle(const std::s
     for (std::size_t i = 0; i < pubSlots_.size(); ++i) {
         PubSlot& ps = pubSlots_[i];
         if (ps.streamId != streamId || ps.channel != channel) continue;
+        if (std::holds_alternative<PubSlot::Released>(ps.mode)) {   // #751: re-init the released slot in place
+            const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, std::string(responseControlChannel), cfg_.egressStreamId);
+            if (sub < 0) return kNoPub;
+            ps.res = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
+            ps.addChannel.clear();
+            ps.mode = PubSlot::AwaitResponseSub{sub, resolveNow_() + kResolveTimeoutNs};
+            return static_cast<PubHandle>(i);
+        }
         if (std::holds_alternative<PubSlot::Plain>(ps.mode) && !warnedPlainResponse_) {
             warnedPlainResponse_ = true;
             std::fprintf(stderr,
@@ -533,6 +543,23 @@ AeronTransport::PubHandle AeronTransport::responsePublicationHandle(const std::s
     ps.mode = PubSlot::AwaitResponseSub{sub, resolveNow_() + kResolveTimeoutNs};
     pubSlots_.push_back(std::move(ps));
     return static_cast<PubHandle>(pubSlots_.size() - 1);
+}
+
+void AeronTransport::releaseResponsePublication(PubHandle h) noexcept {
+    if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return;
+    PubSlot& ps = pubSlots_[static_cast<std::size_t>(h)];
+    int32_t sub = -1;
+    if (const auto* c = std::get_if<PubSlot::Correlated>(&ps.mode)) sub = c->subSlot;
+    else if (const auto* a = std::get_if<PubSlot::AwaitResponseSub>(&ps.mode)) sub = a->subSlot;
+    else return;   // Plain (not a response pair) or already Released
+    try {
+        drainPub_(std::move(ps.res));   // Ready: released now; still registering: parked until the driver answers
+        ps.res = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
+        ps.addChannel.clear();
+        ps.mode = PubSlot::Released{};
+        retireSubSlot_(sub);   // the response subscription: released at the next poll()
+    } catch (...) {
+    }
 }
 
 bool AeronTransport::rePairResponsePublication(PubHandle h) noexcept {
@@ -621,6 +648,8 @@ AeronTransport::PubHandle AeronTransport::upgradeToResponsePublication(const std
     for (std::size_t i = 0; i < pubSlots_.size(); ++i) {
         PubSlot& ps = pubSlots_[i];
         if (ps.streamId != streamId || ps.channel != channel) continue;
+        if (std::holds_alternative<PubSlot::Released>(ps.mode))
+            return responsePublicationHandle(channel, streamId, responseControlChannel);   // #751: re-init in place
         if (!std::holds_alternative<PubSlot::Plain>(ps.mode) || responseControlChannel.empty())
             return static_cast<PubHandle>(i);
         const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, std::string(responseControlChannel), cfg_.egressStreamId);

@@ -238,6 +238,22 @@ public:
                                            std::string_view responseControlChannel);
     PubHandle responsePublicationHandle(const std::string& channel, int32_t streamId,
                                         std::string_view responseControlChannel);
+    /// #751: release a response-paired publication whose last user is gone: its response subscription retires (#764),
+    /// its request publication is released or drained (#763), and the slot becomes Released (handles are stable; the
+    /// next responsePublicationHandle / publicationHandle on the same key re-inits it).  A plain or unknown handle is
+    /// left alone.  Cold path, owner thread.
+    void releaseResponsePublication(PubHandle h) noexcept;
+    [[nodiscard]] bool publicationReleasedForTest(PubHandle h) const noexcept {
+        return h >= 0 && static_cast<std::size_t>(h) < pubSlots_.size() &&
+               std::holds_alternative<PubSlot::Released>(pubSlots_[static_cast<std::size_t>(h)].mode);
+    }
+    /// TEST SEAM: publication slots that are not Released (a leak shows as growth).
+    [[nodiscard]] std::size_t activePublicationSlotsForTest() const noexcept {
+        std::size_t n = 0;
+        for (const PubSlot& s : pubSlots_) if (!std::holds_alternative<PubSlot::Released>(s.mode)) ++n;
+        return n;
+    }
+    [[nodiscard]] std::size_t pubSlotCountForTest() const noexcept { return pubSlots_.size(); }
     /// The publication of `h` is a response-correlated request publication whose response subscription exists
     /// (Ready or still resolving the publication).  False for a plain / unknown handle or a response subscription
     /// not yet Ready.  Cold path (session connect, bind duty).
@@ -672,10 +688,13 @@ private:
         struct Plain {};
         struct AwaitResponseSub { int32_t subSlot; int64_t deadlineNs; };   // #755: gives up at deadlineNs (resolve clock)
         struct Correlated { int32_t subSlot; };
+        /// #751: the owner released the pair (releaseResponsePublication): no publication, no subscription, offers fail.
+        /// The slot keeps its key so a later responsePublicationHandle / publicationHandle on it re-inits it in place.
+        struct Released {};
         std::string channel;
         int32_t     streamId;
         Resolution<aeron::ExclusivePublication> res;
-        std::variant<Plain, AwaitResponseSub, Correlated> mode{Plain{}};
+        std::variant<Plain, AwaitResponseSub, Correlated, Released> mode{Plain{}};
         std::string addChannel;   ///< the registered channel when Correlated (cold: built once)
     };
     struct SubSlot {

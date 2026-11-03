@@ -1540,6 +1540,19 @@ bool ClientAgent::sameEndpoint(std::string_view a, std::string_view b) noexcept 
     return ka == kb;
 }
 
+void ClientAgent::unrefBind_(uint32_t idx) noexcept {
+    if (idx == kNoBind || idx >= workerBinds_.size()) return;
+    WorkerBindEntry& b = workerBinds_[idx];
+    assert(b.routes > 0 && "a bind entry is released only when no route names it");
+    if (b.routes > 0 && --b.routes > 0) return;
+    transport_.releaseResponsePublication(b.pub);
+    b.pub          = transport::AeronTransport::kNoPub;
+    b.sessionIndex = kNoSession;
+    b.resolvedGen  = UINT64_MAX;
+    b.pair         = ResponsePair::Fresh;
+    b.state        = WorkerBindEntry::Free{};   // a pending Sent dies with it: a late ack matches no entry
+}
+
 void ClientAgent::releaseRoutePub_(transport::AeronTransport::PubHandle h) noexcept {
     if (h == transport::AeronTransport::kNoPub) return;
     for (const PartitionRoute& r : routes_) {
@@ -1573,9 +1586,11 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
     if (isDefault) {
         if (idx == detail::FlatIndexMap::kNone) return false;
         const auto oldPub = routes_[idx].pub;
+        const uint32_t oldBind = routes_[idx].bindIdx;
         routeIndex_.erase(key);
         routes_[idx] = PartitionRoute{};
         freeRoutes_.push_back(idx);
+        unrefBind_(oldBind);       // #751
         releaseRoutePub_(oldPub);  // M4
         return true;
     }
@@ -1595,6 +1610,7 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
             nr.receiverId = receiverId;
             nr.dataOnNode = sameEndpoint(data, sessionEndpoint);
             nr.bindIdx    = bindFor();
+            if (nr.bindIdx != kNoBind) ++workerBinds_[nr.bindIdx].routes;   // #751
             nr.bindStream = bindStream;
             nr.bindPort   = responsePort;
             if (nr.bindIdx != kNoBind) {   // the entry's publication IS the route's (never a separate plain one)
@@ -1611,7 +1627,11 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
                 r.receiverId = receiverId;   // same endpoint, another receiver: keep the publication
                 if (bindChanged) {
                     // The worker's response port / stream moved (restart, rebalance): re-resolve the entry.
+                    const uint32_t oldBind = r.bindIdx;
                     r.bindIdx = bindFor();
+                    if (r.bindIdx != kNoBind) ++workerBinds_[r.bindIdx].routes;   // #751: ref the new entry first
+                    unrefBind_(oldBind);
+                    if (r.bindIdx == kNoBind && oldBind != kNoBind) { r.pub = transport::AeronTransport::kNoPub; r.streamId = -1; }
                     r.bindStream = bindStream;
                     r.bindPort = responsePort;
                     if (r.bindIdx != kNoBind) {
@@ -1622,7 +1642,9 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
                 return true;
             }
             const auto oldPub = r.pub;
+            const uint32_t oldBind = r.bindIdx;
             r = fresh();
+            unrefBind_(oldBind);       // #751
             releaseRoutePub_(oldPub);  // M4: the old worker publication, once unreferenced
             return true;
         }
@@ -1903,6 +1925,7 @@ uint32_t ClientAgent::workerBindFor_(const std::string& sessionEndpoint, const s
     try {
         for (std::size_t i = 0; i < workerBinds_.size(); ++i) {
             WorkerBindEntry& b = workerBinds_[i];
+            if (std::holds_alternative<WorkerBindEntry::Free>(b.state)) continue;
             if (b.streamId == streamId && b.dataChannel == dataChannel) return static_cast<uint32_t>(i);
         }
         const auto respCh = transport::responseControlChannelFor(dataChannel, responsePort);
@@ -1913,6 +1936,11 @@ uint32_t ClientAgent::workerBindFor_(const std::string& sessionEndpoint, const s
         e.streamId        = streamId;
         e.pub             = transport_.responsePublicationHandle(dataChannel, streamId, *respCh);
         if (e.pub == transport::AeronTransport::kNoPub) return kNoBind;
+        for (std::size_t i = 0; i < workerBinds_.size(); ++i) {   // #751: reuse a Free slot first
+            if (!std::holds_alternative<WorkerBindEntry::Free>(workerBinds_[i].state)) continue;
+            workerBinds_[i] = std::move(e);
+            return static_cast<uint32_t>(i);
+        }
         workerBinds_.push_back(std::move(e));
         return static_cast<uint32_t>(workerBinds_.size() - 1);
     } catch (...) {
@@ -1924,6 +1952,7 @@ int ClientAgent::serviceWorkerBinds_() noexcept {
     int sent = 0;
     if (holdWorkerBinds_) [[unlikely]] return 0;
     for (WorkerBindEntry& e : workerBinds_) {
+        if (std::holds_alternative<WorkerBindEntry::Free>(e.state)) [[unlikely]] continue;   // #751
         if (e.sessionIndex == kNoSession) {
             if (e.resolvedGen == sessionTableGen_) continue;   // #750: nothing changed since the last miss
             e.sessionIndex = findSessionIndex_(e.sessionEndpoint);
