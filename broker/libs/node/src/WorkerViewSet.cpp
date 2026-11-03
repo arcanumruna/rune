@@ -999,6 +999,16 @@ void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) 
     (void)tryPushDiscard_(inst);
 }
 
+bool WorkerViewSet::startAtLogStart_(ViewInstance& inst, int64_t logStart) {
+    const int64_t from = inst.foldCursor;
+    if (startAtLogStart(inst, logStart)) {
+        spdlog::info("VIEW-START-AT-LOG-START view={} partition={} from={} logStart={}", inst.plan.viewTopicId, inst.partition, from, logStart);
+        return true;
+    }
+    beginDiscard_(inst, ViewDiscardReason::BelowLogStart);
+    return false;
+}
+
 bool WorkerViewSet::tryPushDiscard_(ViewInstance& inst) {
     const auto* owed = std::get_if<CheckpointDiscardOwed>(&inst.checkpoint);
     if (owed == nullptr) return false;

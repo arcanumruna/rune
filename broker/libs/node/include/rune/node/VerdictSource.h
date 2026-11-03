@@ -119,6 +119,14 @@ private:
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     bool   rejects_(const Member& m, const rune::view::SourceRecord& rec) const noexcept;
+    /// Retention may have trimmed the log below a member's cursor: an empty member starts at the log start, one with rows is
+    /// discarded (BelowLogStart).  False when it was discarded.
+    bool   clampToLogStart_(Member& m) {
+        if (m.inst->foldCursor >= logStart_) return true;
+        if (startAtLogStart(*m.inst, logStart_)) return true;
+        if (hooks_.discard != nullptr) hooks_.discard(hooks_.ctx, *m.inst, ViewDiscardReason::BelowLogStart);
+        return false;
+    }
     template <class ReadRangeFn>
     bool   switchSet_(int64_t changeOffset, ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted, int& work);
 
@@ -206,7 +214,7 @@ bool VerdictSource::switchSet_(int64_t A, ReadRangeFn& readRange, const rune::vi
         if (std::find(active_.begin(), active_.end(), i) != active_.end()) continue;   // staying
         Member& m = members_[i];
         if (!checkpointSettled(*m.inst)) return false;   // its old checkpoint is being backed up: it cannot join a set yet
-        m.inst->foldCursor = std::max(m.inst->foldCursor, logStart_);   // retention deleted what a member that was never folded would read
+        if (!clampToLogStart_(m)) return false;   // retention deleted what this member folded from: it is being backed up and rebuilt
         if (m.inst->foldCursor < A + 1) {
             const rune::storage::LogReadView v = readRange(m.inst->foldCursor, A + 1);
             if (!v.empty()) work += replay_(m, v, A + 1, aborted);
@@ -236,7 +244,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     for (const std::size_t i : active_) {
         Member& m = members_[i];
         if (!checkpointSettled(*m.inst)) continue;   // behind (below): the judge neither folds nor passes it
-        m.inst->foldCursor = std::max(m.inst->foldCursor, logStart_);
+        if (!clampToLogStart_(m)) continue;   // below the log start with rows: discarded, unsettled until the backup is acked
         if (m.inst->foldCursor >= judgeCursor_) continue;
         const rune::storage::LogReadView v = readRange(m.inst->foldCursor, judgeCursor_);
         if (!v.empty()) work += replay_(m, v, judgeCursor_, aborted);

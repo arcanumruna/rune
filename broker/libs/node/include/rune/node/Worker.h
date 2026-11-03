@@ -7030,7 +7030,8 @@ private:
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, skip, nowNs, nullptr,
-                                      replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()}, replica);
+                                      replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()}, replica,
+                                      SourceLogBounds{log->logStartOffset(), log->logEndOffset()});
             } else {
                 // Phase 2b E: a TRANSIENT source — zero-copy view into the
                 // replica's own ring (same thread).  The fold itself stops at its
@@ -7065,7 +7066,8 @@ private:
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
                       int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                       const rune::replication::PartitionReplica* transientRep,
-                      uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, rune::replication::PartitionReplica* replica) {
+                      uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, rune::replication::PartitionReplica* replica,
+                      SourceLogBounds bounds = {}) {
         int work = 0;
         PartitionWriteState* write = writeOf_(replica);
         VerdictSource* judge = write != nullptr ? viewSet_->ensureVerdictSource(topicId, partition, *write) : nullptr;
@@ -7085,10 +7087,10 @@ private:
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
             work += viewSet_->driveRebuild(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
-                                           leaderHwConfirmed, ns, write);
+                                           leaderHwConfirmed, ns, write, bounds);
         }
         work += viewSet_->driveFolds(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
-                                     leaderHwConfirmed, ns, write, judge);
+                                     leaderHwConfirmed, ns, write, judge, bounds);
         return work;
     }
 

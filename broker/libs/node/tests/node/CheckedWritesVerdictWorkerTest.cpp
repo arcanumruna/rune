@@ -561,6 +561,44 @@ TEST(CheckedWritesVerdictRestartRegression, DiscardedVerdictMemberWithBackupOffR
     EXPECT_FALSE(r.hasRow(kRej, 2));
 }
 
+// V2: a persisted member whose checkpoint cursor lies below the source's log start (retention deleted what it folded from)
+// is backed up (below-log-start) and refolded from the log start, not from 0.
+TEST(CheckedWritesVerdictRestartRegression, DiscardedVerdictMemberOverATrimmedLogIsBackedUpThenRefoldedRegression) {
+    VerdictRig r(false, /*rollBytes=*/1);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    const std::vector<uint8_t> oldCheckpoint = slurp(committedFile(r, kRej));
+    ASSERT_FALSE(oldCheckpoint.empty());
+    for (uint64_t i = 2; i <= 6; ++i) ASSERT_EQ(r.produce({{i, int64_t(i) * 10, 0}}), 0);
+    r.installRejectView(kRej + 10, kObj + 1, tagRule(8), "rej2", /*persisted=*/true);   // a newer set change: the first one may go
+    r.passes(100);
+    for (uint64_t i = 7; i <= 8; ++i) ASSERT_EQ(r.produce({{i, int64_t(i) * 10, 0}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    for (int i = 0; i < 300; ++i) {
+        if (const auto snap = r.log->cleanerSnapshot())
+            for (const auto& si : *snap) (void)r.log->enqueueDeletedSegment(si.baseOffset, si.lineage);
+        r.pass();
+    }
+    const int64_t logStart = r.log->logStartOffset();
+    ASSERT_GT(logStart, 2) << "retention deleted the early segments";
+    // The member's checkpoint is the old one: its cursor is below the log start.
+    { std::ofstream f(committedFile(r, kRej), std::ios::binary | std::ios::trunc);
+      f.write(reinterpret_cast<const char*>(oldCheckpoint.data()), static_cast<std::streamsize>(oldCheckpoint.size())); }
+    r.restart();
+    r.passes(600);
+    ASSERT_TRUE(r.vs->allViewsReady());
+    const auto backups = listViewBackups(r.snapDir(), kRej, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".below-log-start.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurp(backups[0]), oldCheckpoint);
+    EXPECT_FALSE(r.hasRow(kRej, 1)) << "its record was trimmed: not in the rebuilt view";
+    EXPECT_TRUE(r.hasRow(kRej, 8));
+}
+
 // V5: when the backup cannot be made, nothing is rebuilt over the unsaved checkpoint: the member stays unsettled and the judge
 // does not pass it (no verdicts, no markers) for the rest of the boot.
 TEST(CheckedWritesVerdictRestartRegression, BackupFailureKeepsTheVerdictMemberUnjudgedRegression) {

@@ -802,3 +802,72 @@ TEST(ViewRecoveryRegression, NonPersistedDiscardResetsWithoutAFrameRegression) {
     EXPECT_TRUE(rune::node::listViewBackups(r.dir, kViewId, 0).empty());
     EXPECT_EQ(r.agent->discardsForTest(), 0) << "no discard frame reached the agent";
 }
+
+// L1: a fresh view over a log whose start retention moved up to 100 starts at the log start and reaches Ready (before
+// the clamp it asked the log for offset 0 forever and never did).
+TEST(ViewRecoveryRegression, FreshViewOverATrimmedLogStartsAtLogStartRegression) {
+    DiscardRig r("rune_t_1_l1-", 0);
+    const auto trimmed = upsertRun(7, 30, 10, 100);   // offsets [100,110)
+    auto rd = [&](int64_t from, int64_t) -> rune::storage::LogReadView {
+        if (from < 100) return {};
+        return rune::storage::LogReadView{trimmed.data(), trimmed.size(), 100, 110};
+    };
+    r.vs->materializeRecoveryInstancesFor(kSrcId, 0, 110);
+    for (int i = 0; i < kHardCap && r.vs->readiness(kViewId, 0) != rune::node::ViewReadiness::Ready; ++i)
+        r.vs->driveFolds(kSrcId, 0, rd, 110, rune::view::kNoSkip, i, nullptr, 0, true, {}, nullptr, nullptr,
+                         rune::node::SourceLogBounds{100, 110});
+    ASSERT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->sourceRecordsTrimmed, 100u);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+    EXPECT_TRUE(rune::node::listViewBackups(r.dir, kViewId, 0).empty());
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 39);
+}
+
+// L2 (persisted): a checkpoint holding rows at O=2 while the log now starts at 5 is backed up (below-log-start) and the
+// view is rebuilt from the log start.
+TEST(ViewRecoveryRegression, CheckpointBelowTheLogStartIsBackedUpAndRebuiltRegression) {
+    DiscardRig r("rune_t_1_l2-", 0);
+    r.writeCheckpoint(upsertRun(9, 10, 2, 0), 2);
+    const std::string before = slurpFile(r.ckptPath());
+    const auto tail = upsertRun(7, 30, 4, 5);   // offsets [5,9)
+    auto rd = [&](int64_t from, int64_t) -> rune::storage::LogReadView {
+        if (from < 5) return {};
+        return rune::storage::LogReadView{tail.data(), tail.size(), 5, 9};
+    };
+    r.vs->materializeRecoveryInstancesFor(kSrcId, 0, 9);
+    for (int i = 0; i < kHardCap && r.vs->readiness(kViewId, 0) != rune::node::ViewReadiness::Ready; ++i) {
+        r.now += 1'000'000'000;
+        r.agent->doWork(r.now);
+        r.vs->drainSnapshotAcks();
+        r.vs->driveFolds(kSrcId, 0, rd, 9, rune::view::kNoSkip, r.now, nullptr, 0, true, {}, nullptr, nullptr,
+                         rune::node::SourceLogBounds{5, 9});
+    }
+    ASSERT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".below-log-start.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), before);
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_EQ(r.vs->getRow(kViewId, 0, 9, L), nullptr);
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33);
+}
+
+// L3: a transient source is reconciled by its own ring bounds and is never clamped or discarded by the disk-log rule.
+TEST(ViewRecoveryRegression, TransientSourceIsNeverClampedRegression) {
+    DiscardRig r("rune_t_1_l3-", 1);
+    r.materialize();
+    r.fold();
+    const int64_t cursor = r.vs->instanceServeState(kViewId, 0).foldCursor;
+    ASSERT_GT(cursor, 0);
+    rune::node::TransientBounds tb;
+    tb.logStart = 0; tb.logEnd = 4;
+    r.vs->driveFolds(kSrcId, 0, r.readLog(), 4, rune::view::kNoSkip, 0, &tb, 0, true, {}, nullptr, nullptr,
+                     rune::node::SourceLogBounds{1000, 2000});
+    EXPECT_EQ(r.vs->instanceServeState(kViewId, 0).foldCursor, cursor);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+}

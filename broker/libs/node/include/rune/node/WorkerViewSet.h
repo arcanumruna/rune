@@ -188,7 +188,8 @@ public:
     int driveRebuild(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
                      int64_t committedTail, const rune::view::FoldSkip& skip, int64_t nowNs,
                      const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
-                     bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr) {
+                     bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr,
+                     SourceLogBounds b = {}) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return 0;
@@ -208,7 +209,7 @@ public:
             ViewInstance& inst = vit->second;
             adoptNs_(inst, ns);
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
-            work += driveView_(inst, readRange, rebuildTail, rskip, transientSrc, leaderGen, leaderHwConfirmed);
+            work += driveView_(inst, readRange, rebuildTail, rskip, transientSrc, leaderGen, leaderHwConfirmed, b);
             if (inst.foldCursor >= rebuildTail && checkpointSettled(inst)) {
                 // N-C1: Ready only once the leader's HW reached its leadership start offset; else CatchingUp
                 // (never left RebuildingViews: that state gates elections).
@@ -258,7 +259,8 @@ public:
     int driveFolds(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
                    int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                    const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
-                     bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr, VerdictSource* judge = nullptr) {
+                     bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr, VerdictSource* judge = nullptr,
+                   SourceLogBounds b = {}) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end() && judge == nullptr) return 0;
@@ -287,7 +289,7 @@ public:
             ViewInstance* inst = getOrCreate_(viewTopicId, partition, bound);
             if (inst == nullptr) continue;  // defensive: template must exist
             adoptNs_(*inst, ns);
-            work += driveView_(*inst, readRange, viewBound, viewSkip, transientSrc, leaderGen, leaderHwConfirmed);
+            work += driveView_(*inst, readRange, viewBound, viewSkip, transientSrc, leaderGen, leaderHwConfirmed, b);
         }
         return work + finishRetired_();
     }
@@ -610,13 +612,19 @@ private:
     template <class ReadRangeFn>
     int driveView_(ViewInstance& inst, ReadRangeFn&& readRange, int64_t bound,
                    const rune::view::FoldSkip& skip,
-                   const TransientBounds* transientSrc, uint64_t leaderGen, bool leaderHwConfirmed) {
+                   const TransientBounds* transientSrc, uint64_t leaderGen, bool leaderHwConfirmed, const SourceLogBounds& b) {
         int work = 0;
         // 0a. A discard in flight (the old checkpoint is being backed up): fold nothing, checkpoint nothing, serve NotReady until
         //     the IO agent acks.  Owed = the frame is not on the ring yet (retry it); Failed = never rebuilt over the unsaved file.
         if (!checkpointSettled(inst)) [[unlikely]] {
             if (std::holds_alternative<CheckpointDiscardOwed>(inst.checkpoint)) return tryPushDiscard_(inst) ? 1 : 0;
             return 0;
+        }
+        // 0c. Retention trimmed the disk source below this cursor (#726; a paused view, a stale checkpoint, a fresh view over a trimmed
+        //     log): an instance without rows starts at the log start; one with rows is backed up and rebuilt.  Pure arithmetic, so it
+        //     runs before the namespace pause return: a resumed view sees it on its first pass.
+        if (transientSrc == nullptr && inst.foldCursor < b.logStart) [[unlikely]] {
+            if (!startAtLogStart_(inst, b.logStart)) return 1;
         }
         // 00. Task 12 (D26): the namespace is over its view-memory limit -> pause at foldCursor (reads answer
         //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.
@@ -752,6 +760,10 @@ private:
     // [viewTopicId i32][partition i32][delta bytes].  Returns false (and keeps
     // pendingValid) on back-pressure; true once committed.
     [[nodiscard]] bool tryPushDelta_(ViewInstance& inst);
+
+    /// Cold: the source log starts above this instance's cursor.  True = it now starts at the log start; false = it held rows
+    /// from trimmed records and a BelowLogStart discard began.
+    [[nodiscard]] bool startAtLogStart_(ViewInstance& inst, int64_t logStart);
 
     ViewSnapshotChannel& channel_;
     std::string          viewDataDir_;

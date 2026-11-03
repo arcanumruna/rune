@@ -270,4 +270,21 @@ struct ViewInstance {
     return i.agg->contributors.size() == 0 && i.agg->groups.size() == 0 && (!i.agg->blocks || i.agg->blocks->size() == 0);
 }
 
+/// The log range a source partition holds: retention may have trimmed it below a cursor (logStart); logEnd bounds a checkpoint.
+/// The default (0, INT64_MAX) says nothing, so a caller without a disk log (a transient source, a unit test) changes no behaviour.
+struct SourceLogBounds {
+    int64_t logStart = 0;
+    int64_t logEnd   = INT64_MAX;
+};
+
+/// Retention trimmed the source below this instance's cursor.  An instance holding no rows starts at the log start (true);
+/// one holding rows folded from records that no longer exist cannot be trusted: false = the caller discards it (BelowLogStart).
+[[nodiscard]] inline bool startAtLogStart(ViewInstance& i, int64_t logStart) noexcept {
+    if (!viewTablesEmpty(i)) return false;
+    i.counters.sourceRecordsTrimmed += static_cast<uint64_t>(logStart - i.foldCursor);
+    i.foldCursor   = logStart;
+    i.lastEncodedO = logStart - 1;
+    return true;
+}
+
 } // namespace rune::node
