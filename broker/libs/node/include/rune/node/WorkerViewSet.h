@@ -685,7 +685,10 @@ private:
             inst.maxRecordsPerPass > 0
                 ? std::min(bound, inst.foldCursor + inst.maxRecordsPerPass)
                 : bound;
-        const rune::storage::LogReadView view = readRange(inst.foldCursor, passBound);
+        rune::storage::LogReadView view = readRange(inst.foldCursor, passBound);
+        // A read stops at the next segment base at or above its end: a compacted gap at a segment end reaching past
+        // passBound reads empty below it.  Nothing is there, so read on to `bound`; the fold still stops at passBound.
+        if (view.empty() && passBound < bound) [[unlikely]] view = readRange(inst.foldCursor, bound);
         if (view.empty()) return work;
 
         int64_t cursor = inst.foldCursor;

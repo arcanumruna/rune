@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +23,8 @@
 
 #include <rune/codec/Descriptor.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/Log.h>
+#include <rune/storage/LogCleaner.h>
 #include <rune/storage/LogReadView.h>
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewRow.h>
@@ -1535,4 +1538,55 @@ TEST(WorkerViewSetRegression, PersistedRetractableMovesDeltasFitTheRingRegressio
     const rune::node::ViewFoldCounters* fc = vs.foldCounters(0x4000000C, 0);
     ASSERT_NE(fc, nullptr);
     EXPECT_EQ(fc->aggInconsistent, 0u);
+}
+
+// REGRESSION: a persisted view folds at most maxRecordsPerPass records a pass, and read only to that pass bound.  Its
+// cursor in a compacted gap at the end of a segment, with the next segment more than maxRecordsPerPass records on, read
+// empty on every pass (the log stops at the next segment base at or above the read end): the view never moved again.
+TEST(WorkerViewSetRegression, PersistedViewAdvancesAcrossACompactionGapAtASegmentEndRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, 0x4000000B).value();
+    constexpr int64_t kN = 20000;   // well over the ~5K records a pass of this view may fold
+    const std::string dir = freshDir("rune-views-gap-log");
+    rune::storage::Log log(dir, /*segmentBytes=*/1);   // one batch per segment
+    log.recover();
+    const auto put = [&](int64_t base, int64_t firstKey, int64_t count, int32_t hp) {
+        rune::protocol::RecordBatchBuilder b(base, 0);
+        for (int64_t i = 0; i < count; ++i) {
+            const auto k = keyBytes(firstKey + i);
+            const auto v = encodeCharacter(firstKey + i, hp, 1);
+            b.append(asSv(k), asSv(v), 0);
+        }
+        log.append(b.build(), base + count - 1);
+    };
+    put(0, 0, 1, 1);              // 0: key 0
+    put(1, 1, kN, 1);             // [1, kN]: keys 1..kN, all superseded below
+    put(kN + 1, 1, kN, 2);        // [kN+1, 2kN]: keys 1..kN again
+    put(2 * kN + 1, 0, 1, 3);     // the active segment
+    rune::storage::LogCleaner cleaner;
+    cleaner.clean(log, 0, log.segmentBaseOffsets().back(), 0, 1'000'000);
+    log.reloadSegments();
+    std::vector<uint8_t> scratch(4 << 20);
+    auto rr = [&](int64_t from, int64_t to) {   // the worker's readNoFault_
+        rune::storage::ReadIntoStatus st;
+        return log.readInto(from, 512 * 1024, scratch.data(), scratch.size(), st, to);
+    };
+    ASSERT_TRUE(rr(1, kN + 1).empty());   // the gap: nothing at 1 below the next segment's base
+    ASSERT_FALSE(rr(1, kN + 2).empty());
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-gap"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    const int64_t bound = 2 * kN + 1;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    int passes = 0;
+    while (vs.instanceServeState(0x4000000B, 0).foldCursor < bound && passes < 1000 && std::chrono::steady_clock::now() < deadline) {
+        (void)vs.driveFolds(5, 0, rr, bound, rune::view::kNoSkip, 0);
+        (void)drainDeltas(ch);
+        ++passes;
+    }
+    ASSERT_EQ(vs.instanceServeState(0x4000000B, 0).foldCursor, bound) << "after " << passes << " passes";
+    EXPECT_GT(passes, 2) << "the passes were capped";
+    for (int64_t key : {int64_t{0}, int64_t{1}, kN / 2, kN}) EXPECT_EQ(slotOf(vs, 0x4000000B, 0, uint64_t(key), 1).i, key == 0 ? 1 : 2) << key;
 }
