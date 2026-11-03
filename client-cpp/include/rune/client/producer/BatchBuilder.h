@@ -1,9 +1,10 @@
 // include/rune/client/producer/BatchBuilder.h
 //
-// CB-3 — Tier-2 Producer: explicit all-or-nothing batch to ONE partition.
+// CB-3 — Tier-2 Producer: explicit batch to ONE partition, appended atomically.
 //
 // A single RecordBatch to one partition is already atomic (one log append) —
-// Tier-2 is the explicit form; NO transaction/markers.
+// Tier-2 is the explicit form; NO transaction/markers.  Atomic is the APPEND: on a View producer
+// (checked writes) every record still gets its own verdict (OpStatus::RecordsRejected + BatchVerdicts).
 //
 // Threading model:
 //   Tier-2 is single-thread per producer: batch() / add() / send() / destruction run on the
@@ -142,7 +143,14 @@ public:
     ///   send()                 no completion (fire-and-forget);
     ///   send(cq, token)        one Completion{op = Tier2Batch, value =
     ///                          baseOffset (or -1), aux = recordCount} into cq
-    ///                          (credit reserved on cq first: QueueFull);
+    ///                          (credit reserved on cq first: QueueFull).  View
+    ///                          producer, n >= 2 records: status Ok (all accepted),
+    ///                          or RecordsRejected with value = the real base and a
+    ///                          payload of every rejection (BatchVerdicts); the
+    ///                          reservation is the whole completion's size, and a
+    ///                          batch whose completion cannot fit one queue record is
+    ///                          refused InvalidArgument with nothing reserved.  A
+    ///                          1-record batch keeps BrokerError / -1;
     ///   send(AckToken{token})  the producer's onAck handler (baseOffset).
     /// Accepted: the batch is consumed (add() throws afterwards) and exactly
     /// one completion follows for the token forms.  Any other result leaves

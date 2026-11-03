@@ -295,6 +295,8 @@ struct AckToken {
 // records that never reached the wire (failed while still in the producer ring,
 // a builder, the Tier-2 queue or the deferred arena: baseSequence = -1,
 // errorCode = kClientFailure).  A Tier-2 batch is one BatchAck.
+// Checked writes (View): a batch of >= 2 records whose records were judged reports EVERY rejection in its BatchAck (see
+// rejectedCount / rejections below), never only the first; a 1-record batch keeps errorCode = its rejection, baseOffset -1.
 struct BatchAck {
     static constexpr int16_t kClientFailure = -1;  ///< delivery timeout / redirect exhausted / closed
     int32_t topicId      = 0;
@@ -512,7 +514,8 @@ private:
 };
 
 /// n records of recLen bytes claimed together and appended as ONE RecordBatch
-/// (one partition, contiguous offsets, all or nothing) — Producer::claimBatch.
+/// (one partition, contiguous offsets, ONE atomic log append — the append is all or nothing, the VERDICTS are not: on a
+/// View producer every record gets its own verdict, see claimBatch) — Producer::claimBatch.
 /// An unfenced claim may JOIN an open RecordBatch with neighbouring sends: its
 /// n records stay contiguous (nothing foreign between them) but the batch is
 /// larger than n.  Call flush() (+ doWork() in Invoker mode) before the claim
@@ -775,7 +778,8 @@ public:
     [[nodiscard]] Claim tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, AckToken token) noexcept;
 
     /// Claim n records of recLen value bytes each for ONE atomic append (one
-    /// RecordBatch on key's partition, contiguous offsets, all or nothing):
+    /// RecordBatch on key's partition, contiguous offsets; the append is atomic, but a View producer reports a
+    /// verdict per record, never all-or-nothing - see the completion form below):
     /// write record(i) for every i, then commit().  Limits — never retryable:
     /// n >= 1 (InvalidArgument); key + recLen <= kMaxRecordBytes, the whole
     /// batch within ProducerConfig::maxFrameBytes (a conservative bound) and,
@@ -791,6 +795,14 @@ public:
     /// RecordBatch (neighbouring sends of an unfenced claim join the same RecordBatch), so that is one ack and
     /// the completion fires exactly once, after the batch's LAST record is covered.  An acked claimBatch also
     /// reserves its n batchAcksTo() units, like the unacked form.  Both modes.
+    /// View producer (Acks::View, a claim of n >= 2): the completion reports EVERY record.  All accepted: status Ok,
+    /// value = base, no payload.  Otherwise status RecordsRejected, value = base, errorCode / constraintIdOf = the first
+    /// rejection's, and the payload lists every rejection (BatchVerdicts: rejectedCount(), rejection(k), accepted(i),
+    /// offsetOf(i)); every other record was stored at base + its index.  Reservation = delivery: the claim reserves
+    /// completionRecordBytes(8 x n) on cq up front (a plain 48 bytes without View, or for n == 1), so a verdict list
+    /// never overflows the queue; a claim whose completion cannot fit one queue record (above the queue's maxRecordBytes,
+    /// default maxResultBytes 16 KiB, or an eighth of its capacity) returns MessageTooLarge with nothing reserved.
+    /// A claim of ONE record keeps single-record semantics (BrokerError, value -1).
     [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
                                         Completions& cq, Token token) noexcept;
     /// claimBatch whose single completion goes to the onAck() handler (same value rule as above).
