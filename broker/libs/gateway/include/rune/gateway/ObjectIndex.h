@@ -110,7 +110,8 @@ private:
             if (s.hash == h && o.nsId == nsId && o.name == name) { s.id = id; return; }   // the newer id wins
         }
     }
-    /// Removes the (nsId, name) slot only when it still points at `id` (a newer holder of the name keeps it).
+    /// Removes the (nsId, name) slot only when it still points at `id` (a newer holder of the name keeps it); an older
+    /// live holder of the same name takes the slot over.
     void unindex_(uint32_t nsId, std::string_view name, int32_t id) noexcept {
         if (slots_.empty()) return;
         const uint32_t h = hash32_(nsId, name);
@@ -124,6 +125,14 @@ private:
             if (o.nsId == nsId && o.name == name) break;
         }
         if (slots_[i].id != id) return;
+        // Issue #625: an older live entry may still share this (nsId, name) (an AlterView's retired sink).  Hand the
+        // slot to the highest such id (the same "newer wins" rule as index_) instead of unlinking the name.  Cold:
+        // removals of the slot holder only.
+        for (std::size_t k = entries_.size(); k-- > 0;) {
+            if (static_cast<int32_t>(k) == id) continue;
+            const ObjectEntry& o = entries_[k];
+            if (!o.name.empty() && o.nsId == nsId && o.name == name) { slots_[i].id = static_cast<int32_t>(k); return; }
+        }
         // Backward-shift deletion: pull later members of the probe run into the hole.
         std::size_t hole = i;
         for (std::size_t j = (i + 1) & mask; slots_[j].id >= 0; j = (j + 1) & mask) {
