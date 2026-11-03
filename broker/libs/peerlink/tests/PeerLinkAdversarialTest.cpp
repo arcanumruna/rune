@@ -254,7 +254,7 @@ TEST(PeerLinkAdversarialRegression, AnAbandonedUnconfirmedAcceptStopsBeingResent
 // ---- Issue #774: the initiator rekeys three times and no Confirm / authenticated frame ever reaches the responder ----
 // (a->b Confirms and data are lost), so the responder keeps sealing under its old send epoch while the initiator holds
 // E+1..E+3.  The initiator must keep the epoch the responder last sealed under: every frame b seals opens at a.
-// Mutation: dropping the lastOpenOrder exclusion in PeerFrameCrypto::installLink evicts that epoch at the third rekey
+// Mutation: dropping the maxOpenOrder exclusion in PeerFrameCrypto::installLink evicts that epoch at the third rekey
 // and b's next frame is an UnknownEpoch drop -> red.
 TEST(PeerLinkAdversarialRegression, ThreeUnpromotedRekeysNeverDropThePeersFramesAdversarialRegression) {
     Sim s(774);

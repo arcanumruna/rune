@@ -374,7 +374,7 @@ TEST(PeerFrameCryptoRegression, EvictionPrefersAnAbandonedReceiveOnlyEpochRegres
 // Issue #774: an initiator that rekeyed three times without a promotion (the peer's frames never reach it, so no
 // Confirm and no epoch change on the peer's side) must not evict the epoch its peer still seals under.  Every held
 // epoch was the send epoch once, so none is "abandoned"; the oldest non-send epoch (E1) is exactly the one the peer
-// last sealed under.  Mutation: dropping the lastOpenOrder exclusion in installLink evicts E1 at E4 -> UnknownEpoch.
+// last sealed under.  Mutation: dropping the maxOpenOrder exclusion in installLink evicts E1 at E4 -> UnknownEpoch.
 TEST(PeerFrameCryptoRegression, AnInitiatorNeverEvictsTheEpochItsPeerLastSealedUnderRegression) {
     using OR = pl::PeerFrameCrypto::OpenResult;
     constexpr auto SR = pl::LinkInstall::SendAndReceive;
@@ -398,6 +398,37 @@ TEST(PeerFrameCryptoRegression, AnInitiatorNeverEvictsTheEpochItsPeerLastSealedU
     EXPECT_EQ(epoch, 1u);
     EXPECT_EQ(a.dropsOf(OR::UnknownEpoch), unknownBefore);
     EXPECT_TRUE(a.holdsEpoch(2, 1));
+}
+
+// Issue #774 (gap): an in-flight straggler under an OLDER epoch must not move the "newest epoch a frame opened under"
+// mark backwards, or eviction keeps the old epoch and evicts the one the peer currently seals under.
+// Mutation: restoring the unconditional `maxOpenOrder = e->installOrder` evicts E2 at E4 -> UnknownEpoch.
+TEST(PeerFrameCryptoRegression, AStragglerUnderAnOlderEpochNeverUnprotectsThePeersCurrentEpochRegression) {
+    using OR = pl::PeerFrameCrypto::OpenResult;
+    constexpr auto SR = pl::LinkInstall::SendAndReceive;
+    auto baseOf = [](uint32_t e) { return static_cast<uint8_t>(10 * e); };
+    pl::PeerFrameCrypto a(1, 0), peer(2, 0);
+    std::vector<uint8_t> wireE1(64), wireE2(64), out(64);
+    ASSERT_TRUE(peer.installLink(1, linkFor(false, 1, baseOf(1), SR), 0));
+    const auto n1 = peer.seal(1, bytes("e1"), 2, wireE1.data(), wireE1.size());   // the straggler, in flight
+    ASSERT_GT(n1, 0u);
+    ASSERT_TRUE(a.installLink(2, linkFor(true, 1, baseOf(1), SR), 0));
+    ASSERT_TRUE(a.installLink(2, linkFor(true, 2, baseOf(2), SR), 0));            // a promotes E2 (send)
+    ASSERT_TRUE(peer.installLink(1, linkFor(false, 2, baseOf(2), SR), 0));        // the peer promotes E2 and seals under it
+    const auto n2 = peer.seal(1, bytes("e2"), 2, wireE2.data(), wireE2.size());
+    ASSERT_GT(n2, 0u);
+    std::size_t outLen = 0; int32_t from = -1; uint32_t epoch = 0;
+    ASSERT_EQ(a.open(wireE2.data(), n2, out.data(), out.size(), outLen, from, epoch), OR::Ok);
+    ASSERT_EQ(epoch, 2u);
+    ASSERT_EQ(a.open(wireE1.data(), n1, out.data(), out.size(), outLen, from, epoch), OR::Ok);   // the straggler
+    ASSERT_EQ(epoch, 1u);
+    for (uint32_t e = 3; e <= 4; ++e) ASSERT_TRUE(a.installLink(2, linkFor(true, e, baseOf(e), SR), 0)) << e;
+    ASSERT_EQ(a.currentEpoch(2), 4u);
+    EXPECT_TRUE(a.holdsEpoch(2, 2)) << "the epoch the peer currently seals under must survive the slot pressure";
+    const auto n3 = peer.seal(1, bytes("e2b"), 3, wireE2.data(), wireE2.size());
+    ASSERT_GT(n3, 0u);
+    EXPECT_EQ(a.open(wireE2.data(), n3, out.data(), out.size(), outLen, from, epoch), OR::Ok);
+    EXPECT_EQ(epoch, 2u);
 }
 
 // Issue #546: the link masters are scrubbed when a LinkKeys dies (every evicted / replaced / superseded copy - the

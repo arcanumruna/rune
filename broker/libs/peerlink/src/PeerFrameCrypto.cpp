@@ -145,7 +145,7 @@ bool PeerFrameCrypto::installLink(int32_t peer, const LinkKeys& keys, int64_t /*
             if (i != s->sendIdx && !e.used && e.installOrder < s->sendOrder && e.installOrder < oldest) { oldest = e.installOrder; at = i; }
         }
     }
-    // 3. (issue #774) The oldest install that is neither the send epoch nor the epoch of the last authenticated frame:
+    // 3. (issue #774) The oldest install that is neither the send epoch nor the newest epoch a frame opened under:
     // an initiator that rekeyed without a promotion holds a send epoch that is the newest, so the oldest non-send
     // slot is the one the peer still seals under.  One slot is the send epoch, one the last-opened, so with three
     // slots a candidate always exists.  Residual: a plane that never opened a frame keeps the plain oldest rule -
@@ -155,7 +155,7 @@ bool PeerFrameCrypto::installLink(int32_t peer, const LinkKeys& keys, int64_t /*
         uint64_t oldest = UINT64_MAX;
         for (std::size_t i = 0; i < kEpochSlots; ++i) {
             const uint64_t order = s->epochs[i]->installOrder;
-            if (i != s->sendIdx && order != s->lastOpenOrder && order < oldest) { oldest = order; at = i; }
+            if (i != s->sendIdx && order != s->maxOpenOrder && order < oldest) { oldest = order; at = i; }
         }
     }
     EpochState fresh;
@@ -249,7 +249,9 @@ PeerFrameCrypto::OpenResult PeerFrameCrypto::open(const uint8_t* frame, std::siz
     if (!replayWindowCheck(r->seq, r->window, seq)) return drop_(OpenResult::Replay);
     if (commitWindow) replayWindowCommit(r->seq, r->window, seq);
     ++s->authFrames;
-    s->lastOpenOrder = e->installOrder;   // issue #774: the epoch the peer seals under is never evicted
+    // issue #774: the newest epoch a frame opened under is never evicted; an in-flight straggler under an older epoch
+    // must not move the mark backwards.
+    if (e->installOrder > s->maxOpenOrder) s->maxOpenOrder = e->installOrder;
     e->used = true;   // issue #584: the peer sealed under it - never an abandoned epoch
     // Issue #241: an authenticated frame under an epoch installed after our send epoch proves the peer holds it.
     if (e->installOrder > s->sendOrder) [[unlikely]] peerUsed_ = PeerEpoch{fromNode, epoch};
