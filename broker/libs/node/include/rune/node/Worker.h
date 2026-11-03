@@ -7007,7 +7007,7 @@ private:
             // partition no installed view is interested in.
             if (!viewSet_->interestedIn(topicId)) {
                 const PartitionWriteState* w = writeOf_(replica);
-                if (w == nullptr || w->constraintSets.latest().empty()) continue;   // a verdict source without its views still judges nothing, but is driven (it waits)
+                if (w == nullptr || (w->verdicts == nullptr && w->constraintSets.latest().empty())) continue;   // a verdict source without its views still judges nothing, but is driven (it waits); a live judge is driven until ensureVerdictSource erases it (#807)
             }
             if (replica->role() != rune::replication::Role::Leader) continue;
             const RcState* rcState = rcServe_(replica, rcOf_(replica));

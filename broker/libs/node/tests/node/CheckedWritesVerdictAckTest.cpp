@@ -326,3 +326,44 @@ TEST_F(CheckedWritesVerdictAckRegression, ReinstallingADroppedPlanWhileItRetires
     EXPECT_FALSE(o.vs->isViewSink(kRej)) << "the old view is released";
     EXPECT_TRUE(o.vs->isViewSink(kRej2));
 }
+
+// #807: the last verdict view is dropped; the judge must be erased (the gate in driveViews_ must still drive a source whose judge
+// is alive with an empty latest set), or the verdict bound freezes and View acks time out.
+TEST_F(CheckedWritesVerdictAckRegression, ViewAckAndConsumersAfterTheLastVerdictViewIsDroppedRegression) {
+    r.worker->setAckTimeoutNs(50 * kMs);
+    const int64_t c0 = r.produceFrame({{1, 1, 1}}, kAcksView, 600, 0);
+    const auto a0 = r.ack(c0);
+    ASSERT_TRUE(a0);
+    ASSERT_EQ(a0->code, 0);
+
+    r.dropRejectView(kRej);
+    r.driveUntilJudged();
+    r.passes(20);
+    EXPECT_EQ(r.vs->verdictSource(VerdictRig::kSrc, 0), nullptr) << "the judge outlived its last verdict view";
+    ASSERT_NE(r.writeState(), nullptr);
+    EXPECT_EQ(r.writeState()->verdicts, nullptr);
+
+    const int64_t c1 = r.produceFrame({{9, 9, 9}}, kAcksView, 601, 0);   // tag 9 is accepted: no view rejects it any more
+    const auto a1 = r.ack(c1, 200);
+    ASSERT_TRUE(a1);
+    EXPECT_EQ(a1->code, 0);
+    EXPECT_TRUE(a1->verdicts.empty());
+
+    const int64_t leoBefore = r.leo();
+    const int64_t c2 = r.produceFrame({{9, 9, 9}}, kAcksView, 601, 0);   // a dedup replay, not a timeout
+    const auto a2 = r.ack(c2, 200);
+    ASSERT_TRUE(a2);
+    EXPECT_EQ(a2->code, 0);
+    EXPECT_EQ(a2->baseOffset, a1->baseOffset);
+    EXPECT_EQ(r.leo(), leoBefore);
+
+    const int64_t s = r.subscribe(SubKind::Raw, 0);
+    const auto& box = r.collect(s);
+    bool saw0 = false, saw1 = false;
+    for (const auto& f : box.frames) {
+        saw0 = saw0 || (f.base <= a0->baseOffset && a0->baseOffset < f.base + f.count);
+        saw1 = saw1 || (f.base <= a1->baseOffset && a1->baseOffset < f.base + f.count);
+    }
+    EXPECT_TRUE(saw0);
+    EXPECT_TRUE(saw1);
+}
