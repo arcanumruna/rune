@@ -161,7 +161,7 @@ public:
     // partition) that is still RebuildingViews: fold the committed range
     // [foldCursor, committedTail) through the SAME driveFolds machinery (same
     // readRange idiom), then flip that instance RebuildingViews -> Ready once
-    // foldCursor >= committedTail.  committedTail is the source partition's LSO
+    // foldCursor >= committedTail (CatchingUp instead while the leader's HW has not reached its start offset, N-C1).  committedTail is the source partition's LSO
     // (passed in by the caller, exactly as driveFolds' `bound`).  Templated so
     // readRange inlines (no std::function).  Returns the progress count (records
     // folded + deltas handled this pass) so the idle strategy stays hot while a

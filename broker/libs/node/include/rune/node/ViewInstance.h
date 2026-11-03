@@ -197,8 +197,15 @@ struct ViewInstance {
     // Task 16 restart readiness of THIS (view, partition).  Defaults to Ready:
     // an instance created on the normal (non-recovery) driveFolds path is
     // serve-ready immediately, so the serve-guard is INERT for every existing
-    // path.  installViewForRecovery is the ONLY writer that lowers it to
-    // RebuildingViews; driveRebuild is the only one that raises it back to Ready.
+    // path.  The full writer list (state graph: the ViewReadiness comment above):
+    //   * defaults to Ready (a plain driveFolds instance);
+    //   * set to RebuildingViews (or Ready when already caught up) at restart recovery by installViewForRecovery and
+    //     loadRecoveryCheckpoint_ (foldCursor vs. committedTail), and lowered to RebuildingViews by
+    //     discardVerdictInstance_;
+    //   * lowered Ready -> CatchingUp on a new source leadership (N-C1) by driveView_ step 0b and flipVerdictMembers_;
+    //   * raised to CatchingUp / Ready only by driveView_ (step 1b and after the fold), flipVerdictMembers_ and
+    //     driveRebuild's caught-up block, all gated on foldCursor >= the bound and on leaderHwConfirmed (Ready only
+    //     when the HW reached the leadership start offset).
     ViewReadiness                      readiness       = ViewReadiness::Ready;
 
     // Task 12 (D26): the view-memory pause, the namespace this instance is charged to, and the bytes charged so far.
