@@ -3528,7 +3528,10 @@ private:
     /// bound (the subscription waits, cursor unchanged) and NEVER the shared egress; every other subscription uses its
     /// own egress publication, then the shared one (unchanged).  One find_ for a session-egress subscription, none else.
     [[nodiscard]] aeron::ExclusivePublication* egressPubOf_(const WorkerSubscription& s) noexcept {
-        if (s.sessionEgress) [[unlikely]] return ackSink_ ? ackSink_->readyPub(s.sessionId) : nullptr;
+        if (s.sessionEgress) [[unlikely]] {
+            if (s.sessionId == failRecordPubSidForTest_) [[unlikely]] return nullptr;   // #769 seam (session-egress branch only)
+            return ackSink_ ? ackSink_->readyPub(s.sessionId) : nullptr;
+        }
         if (s.egressPub) return s.egressPub;
         return workerEgress_ ? workerEgress_->pub() : nullptr;
     }
@@ -8702,6 +8705,10 @@ public:
     /// I2 test seams (worker thread, via onWorkerThreadForTest): refuse the next `n` WorkerBinds without looking at
     /// them (a lost / refused bind), and swallow the next `n` WorkerBindAcks instead of offering them (a lost ack).
     void dropNextWorkerBindsForTest(uint32_t n) noexcept { dropBindsForTest_ = n; }
+    /// #769 seam (worker thread, via onWorkerThreadForTest): the ack sink reports NO publication for session `sid`
+    /// (0 = off), as when the session's response publication failed or was released.  A response-mode subscription of
+    /// that session then waits with its cursor unchanged; the shared egress is never a fallback.
+    void failSessionRecordPubForTest(int64_t sid) noexcept { failRecordPubSidForTest_ = sid; }
     void swallowNextWorkerBindAcksForTest(uint32_t n) noexcept { swallowBindAcksForTest_ = n; }
     /// I4 seam: WorkerBinds that passed the token check and went on to the image lookup / channel build.
     [[nodiscard]] uint64_t workerBindImageLookupsForTest() const noexcept { return workerBindImageLookups_; }
@@ -8752,6 +8759,7 @@ private:
         }
         return sent;
     }
+    int64_t  failRecordPubSidForTest_ = 0;   // #769 seam, 0 = off (a session id is never 0)
     uint64_t responseEgressFrames_   = 0;   // I7: Records frames claimed on a session-egress subscription's response pub
     std::string responseControlEndpoint_;
     uint64_t spoofedIngressDropped_ = 0;

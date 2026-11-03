@@ -1331,3 +1331,81 @@ TEST(MdcSubscriptionRegression, DeclaredPathSessionStillGetsRecordsRegression) {
     EXPECT_GE(cl->testMdcEgressSubscriptions(), 1u) << "the declared MDC egress subscription was added";
     EXPECT_EQ(bindsAccepted(b.node()), 0u) << "a declared-path session never binds";
 }
+
+// =================================================================================================================
+// 15. #769: a response-mode session whose publication is unavailable NEVER has its Records diverted onto the shared
+//     egress (the MDC): the subscription waits with its cursor unchanged and resumes with no loss.
+// =================================================================================================================
+TEST(NatEgressMatrixRegression, ResponseModeRecordsNeverLeakOntoTheMdcRegression) {
+    const RespPorts r = RespPorts::discover(1);
+    OneBroker b("natleak", OneBroker::Runtime::Shard, withResponsePorts(r));
+    rc::Client* admin = b.connectClient();
+    const rc::TopicSpec spec = defineTopic(*admin, "leak", 1, 1);
+    auto cfg = b.clientConfig();
+    cfg.gatewayResponseControlPort = r.gw[0];
+    cfg.connectTimeoutMs = 30'000;
+    cfg.pingTimeoutMs    = 30'000;
+    cfg.topics           = {spec};
+    auto cl = connectOrFail(cfg);
+    ASSERT_NE(cl, nullptr);
+    const int64_t sid = cl->testSeedSessionId();
+    ASSERT_NE(sid, 0);
+    ASSERT_TRUE(cl->testSeedResponseCorrelated());
+    const auto failPub = [&](int64_t s) {
+        for (int32_t w = 0; w < b.node().workerCountForTest(); ++w)
+            b.node().onWorkerThreadForTest(w, [s](Worker& wk) { wk.failSessionRecordPubForTest(s); return 0; });
+    };
+    // Worker-thread round trips are the pass barrier: every one runs between two worker passes.
+    const auto passes = [&](int n) {
+        for (int i = 0; i < n; ++i)
+            for (int32_t w = 0; w < b.node().workerCountForTest(); ++w)
+                (void)b.node().onWorkerThreadForTest(w, [](Worker&) { return 0; });
+    };
+
+    // The witness of the shared egress: a declared-path client connects to the workers' MDC egress publication, so a
+    // Records frame diverted onto it is ACCEPTED (it advances the publication's position); with no subscriber the
+    // offer would simply fail and a leak would be invisible.
+    auto wcfg = b.clientConfig();
+    wcfg.dataDir       = cfg.dataDir + "_witness";
+    wcfg.egressChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    wcfg.connectTimeoutMs = 30'000;
+    wcfg.pingTimeoutMs    = 30'000;
+    auto witness = connectOrFail(wcfg);
+    ASSERT_NE(witness, nullptr);
+    const auto mdcPosition = [&] {
+        int64_t sum = 0;
+        for (int32_t w = 0; w < b.node().workerCountForTest(); ++w)
+            sum += b.node().onWorkerThreadForTest(w, [](Worker& wk) -> int64_t {
+                return wk.workerEgress() != nullptr && wk.workerEgress()->pub() != nullptr ? wk.workerEgress()->pub()->position() : 0;
+            });
+        return sum;
+    };
+
+    const Sent first = produceN(*cl, handleOf(spec), "lk1", 0, 20, rc::Acks::All);
+    ASSERT_EQ(first.ok, 20) << first.firstBad << " undone " << first.undone;
+    Collector col;
+    auto subs = subscribeAll(*cl, spec, col);
+    const auto want1 = asSet(first.okValues);
+    ASSERT_TRUE(waitUntil([&] { return col.count(want1) == want1.size(); }, 60s)) << col.count(want1) << "/20 before the failure";
+
+    passes(10);
+    failPub(sid);   // the session's publication is gone mid-stream
+    const int64_t mdcBefore = mdcPosition();
+    const Sent second = produceN(*cl, handleOf(spec), "lk2", 0, 20, rc::Acks::All);
+    ASSERT_EQ(second.ok, 20) << second.firstBad << " undone " << second.undone;
+    const auto want2 = asSet(second.okValues);
+    passes(50);
+    EXPECT_EQ(col.count(want2), 0u) << "Records were delivered while the session publication was unavailable";
+    EXPECT_EQ(mdcPosition(), mdcBefore) << "Records of a response-mode session were offered on the shared egress";
+
+    failPub(0);   // the publication is back: the subscription resumes where it stopped
+    std::set<std::string> all = want1;
+    all.insert(want2.begin(), want2.end());
+    EXPECT_TRUE(waitUntil([&] { return col.count(all) == all.size(); }, 60s))
+        << col.count(all) << "/40 after the publication returned: records were lost (diverted onto the shared egress)";
+    EXPECT_EQ(col.strays(all), 0u);
+    for (auto& sub : subs) sub.unsubscribe();
+    cl->close();
+    witness->close();
+    EXPECT_EQ(spoofed(b.node()), 0u);
+}
