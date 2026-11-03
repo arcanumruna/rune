@@ -769,15 +769,15 @@ TEST(CheckedWritesVerdictCleanerRegression, ADamagedSegmentMakesTheLogUncleanabl
         EXPECT_EQ(bytes(dup->file), dupBytes);
         EXPECT_TRUE(cleaner.uncleanable());
 
-        // Restart: a fresh cleaner compacts the healthy segment, then meets the damage again.
+        // Restart: a fresh cleaner's pre-pass walks the whole dirty range, meets the damage and refuses the whole pass
+        // (even for a healthy target segment: it never cleans against partial txn/verdict state).
         LogCleaner restarted;
         EXPECT_FALSE(restarted.uncleanable());
-        EXPECT_TRUE(pass(restarted, dupBase).compacted) << "a healthy cleaner drops the superseded duplicate";
-        EXPECT_NE(bytes(dup->file), dupBytes);
-        EXPECT_FALSE(restarted.uncleanable()) << "the healthy segment alone is no damage";
-        EXPECT_FALSE(pass(restarted, victimBase).compacted);
+        EXPECT_FALSE(pass(restarted, dupBase).compacted) << "the pass over a log with a damaged segment is refused whole";
+        EXPECT_EQ(bytes(dup->file), dupBytes);
         EXPECT_TRUE(restarted.uncleanable());
         EXPECT_EQ(restarted.damage()->segBase, victimBase);
+        EXPECT_FALSE(pass(restarted, victimBase).compacted);
         EXPECT_EQ(bytes(victim->file), victimBytes);
     }
     std::filesystem::remove_all(dir);
@@ -893,8 +893,8 @@ DiskView runEngine(int engine, Log& log, int64_t target, int64_t nowMs, int64_t 
 // txn pre-pass never sees the ABORT, so it merges both transactions into one COMMITTED one: the aborted value of `k` is
 // indexed as the latest and the committed value of `k` in an earlier, healthy segment is dropped.
 // URGENT break found by the batch 1 fix-round re-attack (silent loss of a committed record): scanTxnState and
-// buildOffsetMapFromBases stop at a damaged batch without refusing the pass.  DISABLED until that fix lands.
-TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedBatchBeforeAnAbortMarkerNeverDropsTheCommittedValueAdversarialRegression) {
+// buildOffsetMapFromBases stop at a damaged batch without refusing the pass.
+TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchBeforeAnAbortMarkerNeverDropsTheCommittedValueAdversarialRegression) {
     // Run 0..5: intact (the control: nothing is lost), 6..11: the victim CRC-damaged.
     for (int run = 0; run < 2 * kEngines; ++run) {
         const int engine = run % kEngines;
@@ -930,9 +930,8 @@ TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedBatchBeforeAnAbortMa
 
 // The same through the verdict pre-pass: the verdict marker that rejects k@13 sits behind a damaged batch, a later marker
 // covers past it.  The scan never learns k@13 is rejected, indexes it as k's latest and drops the accepted k@0.
-// URGENT break found by the batch 1 fix-round re-attack (silent loss of an accepted record), same root cause.  DISABLED until
-// that fix lands.
-TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedBatchBeforeAVerdictMarkerNeverDropsTheAcceptedValueAdversarialRegression) {
+// URGENT break found by the batch 1 fix-round re-attack (silent loss of an accepted record), same root cause.
+TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchBeforeAVerdictMarkerNeverDropsTheAcceptedValueAdversarialRegression) {
     // Run 0..5: intact (the control: nothing is lost), 6..11: the victim CRC-damaged.
     for (int run = 0; run < 2 * kEngines; ++run) {
         const int engine = run % kEngines;
@@ -971,8 +970,8 @@ TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedBatchBeforeAVerdictM
 // The range and compact engines rewrite the damaged segment first and stop there; the one-file / one-group engines
 // target the marker's segment directly.
 // URGENT break found by the batch 1 fix-round re-attack (an aborted txn's marker removed while its data stays), same root
-// cause.  DISABLED until that fix lands.
-TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedTxnDataBeforeItsMarkerNeverRemovesTheMarkerAdversarialRegression) {
+// cause.
+TEST(CheckedWritesVerdictCleanerRegression, DamagedTxnDataBeforeItsMarkerNeverRemovesTheMarkerAdversarialRegression) {
     // Run 0..5: intact (the control: nothing is lost), 6..11: the victim CRC-damaged.
     for (int run = 0; run < 2 * kEngines; ++run) {
         const int engine = run % kEngines;
@@ -1015,8 +1014,8 @@ TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedTxnDataBeforeItsMark
 // persists) the clean watermark to passEnd, so the dirty records of the damaged segment and of every segment after it
 // would never be indexed again.  The agent builds a fresh LogCleaner every pass (no sticky state reaches it), so passEnd is
 // all it has.  Deferred-install mode, as in production.
-// Non-urgent break (under-cleaning, no loss) found by the batch 1 fix-round re-attack: #840.  DISABLED until #840 is fixed.
-TEST(CheckedWritesVerdictCleanerRegression, DISABLED_ARangePassStoppedByDamageNeverReportsThePassEndPastItAdversarialRegression) {
+// Non-urgent break (under-cleaning, no loss) found by the batch 1 fix-round re-attack: #840.
+TEST(CheckedWritesVerdictCleanerRegression, ARangePassStoppedByDamageNeverReportsThePassEndPastItAdversarialRegression) {
     const auto dir = tempDir();
     {
         Log log(dir.string(), /*segmentBytes=*/900);
@@ -1184,5 +1183,27 @@ TEST(CheckedWritesVerdictCleanerRegression, DamageAtEveryPlaceKeepsEveryUnsupers
         }
     }
     EXPECT_EQ(cases, 3 * 4 * (kEngines - 1));
-    EXPECT_GT(droppedSomewhere, 0) << "the passes must really compact the healthy segments";
+    // A pre-pass walk that meets damage refuses the whole pass: nothing is dropped anywhere (healthy segments wait).
+    EXPECT_EQ(droppedSomewhere, 0) << "a pass over a damaged log must be refused whole";
+    // Control: the same data with no damage IS compacted, so the zero above is the refusal, not an inert workload.
+    {
+        const auto dir = tempDir();
+        Log log(dir.string(), /*segmentBytes=*/900);
+        log.recover();
+        uint32_t rng = 7u;
+        for (int64_t o = 0; o < 80; ++o) {
+            rng = rng * 1664525u + 1013904223u;
+            data(log, o, "k" + std::to_string((rng >> 8) % 9), "v" + std::to_string(o));
+        }
+        auto bases = log.segmentBaseOffsets();
+        const int64_t active = bases.back();
+        bases.pop_back();
+        LogCleaner cleaner;
+        std::vector<int64_t> sizes(bases.size(), 1);
+        SkimpyOffsetMap map(1024);
+        const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1000, map, false, 1 << 20, nullptr, 1'000'000);
+        EXPECT_TRUE(res.compacted) << "the intact control must compact";
+        EXPECT_FALSE(cleaner.uncleanable());
+        std::filesystem::remove_all(dir);
+    }
 }

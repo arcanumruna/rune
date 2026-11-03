@@ -231,7 +231,8 @@ int markerControlType(const uint8_t* batch, std::size_t len, const rune::protoco
 // Returns the bytes read (throttled by the caller like the M3 prefix reads).
 int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, Offset fromOffset, Offset toOffset,
                      Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails,
-                     const BoundaryHook& hook, VerdictCleanState& verdicts, Offset verdictBound, Offset verdictMarkerEnd) {
+                     const BoundaryHook& hook, VerdictCleanState& verdicts, Offset verdictBound, Offset verdictMarkerEnd,
+                     std::optional<LogCleaner::Damaged>& damage) {
     namespace cr = rune::storage::control_record;
     int64_t bytes = 0;
     std::vector<RejectedOffsetIndex::Entry> verdictEntries;
@@ -251,7 +252,7 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             std::optional<cr::ControlRecord> ctl;
             if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;   // a control record: validated once (#804)
             const int64_t base = r.baseOffset();
-            if (base >= scanEnd) break;
+            if (base >= scanEnd) { pos = buf.size(); break; }   // the intended end of the scan, not damage
             const int64_t pid  = r.producerId();
             if (pid < 0 && isControlBatch(r)) {   // a checked-writes control record (16-19)
                 if (const auto& c = ctl) {
@@ -294,6 +295,9 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             }
             pos += static_cast<std::size_t>(total);
         }
+        // A walk that stopped short met a damaged batch: the state fed so far is incomplete (a missed ABORT, verdict
+        // marker or txn data batch), so the caller must refuse the pass (it never cleans against partial state).
+        if (pos != buf.size() && !damage.has_value()) damage = LogCleaner::Damaged{segBase, pos};
     }
     txn.finish(toOffset, markerRemovalBound);
     verdicts.finish(fromOffset, verdictBound, markerRemovalBound);
@@ -380,7 +384,9 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // aborted txn data.  M3: these reads are throttled by the caller.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
-    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_);
+    std::optional<Damaged> scanDamage;
+    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, scanDamage);
+    if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return -1; }   // incomplete state: no map
     toOffset = std::min(txn.cleanLimit(), verdicts.cleanLimit());
 
     for (size_t i = 0; i < bases.size(); ++i) {
@@ -420,6 +426,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             if (full) return map.latestOffset();
             pos += static_cast<size_t>(total);
         }
+        if (pos != buf.size()) noteDamage_(dir, segBase, pos);   // damage: the entry point refuses the pass
     }
     return map.latestOffset();
 }
@@ -438,7 +445,9 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // D3b: transaction pre-pass (+ producer tails) — see the bounded overload.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
-    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_);
+    std::optional<Damaged> scanDamage;
+    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, scanDamage);
+    if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return; }   // incomplete state: no map
     toOffset = std::min(txn.cleanLimit(), verdicts.cleanLimit());
 
     // Walk segments that overlap [fromOffset, toOffset).  `bases` and `dir` are
@@ -487,6 +496,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
 
             pos += static_cast<size_t>(total);
         }
+        if (pos != buf.size()) noteDamage_(dir, segBase, pos);   // damage: the entry point refuses the pass
     }
 }
 
@@ -1005,6 +1015,7 @@ bool LogCleaner::produceCleanedFile(const std::string& dir,
     if (globalDirtyStart < 0) globalDirtyStart = 0;
     OffsetMap map;
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+    if (damaged_.has_value()) return false;   // a pre-pass walk met damage: the state is incomplete, nothing is rewritten
 
     // Rewrite exactly the ONE segment at segBase (pure file I/O: atomic write→
     // rename, or delete when emptied).  Passing the GLOBAL bounds makes the
@@ -1066,6 +1077,7 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
         // Read bytes can be estimated from sealedBases sizes (file reads).
         // For simplicity, throttle after the full map-build pass.
         buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+        if (damaged_.has_value()) { result.passEnd = globalDirtyStart; return result; }   // incomplete state: no advance, nothing written
         if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);   // M3
         if (throttler) {
             // Approximate read bytes: size of the segment file being processed.
@@ -1224,6 +1236,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
     // one pass without a member's keys vanishing after it is deleted.
     map.clear();
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+    if (damaged_.has_value()) { result.passEnd = globalDirtyStart; return result; }   // incomplete state: no advance, nothing written
     // M3: the clean-prefix reads for producer tails count against the I/O throttle.
     if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);
 
@@ -1735,6 +1748,7 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
     std::size_t maxSlots = SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes);
     SkimpyOffsetMap map(maxSlots > 0 ? maxSlots : 1);
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+    if (damaged_.has_value()) { result.passEnd = globalDirtyStart; return result; }   // incomplete state: no advance, nothing written
     if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);   // M3
 
     // Throttle the map-build read phase (approx from combined group size).

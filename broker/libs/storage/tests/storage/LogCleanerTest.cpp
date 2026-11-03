@@ -1348,15 +1348,16 @@ TEST(LogCleaner, CorruptBatchInBuildOffsetMapStopsWalk) {
         ::close(fd);
     }
 
-    // buildOffsetMap: must stop at the corrupt batch, not misparse.
-    // The result may be partial (only k1 from the first good batch).
+    // buildOffsetMap: must stop at the corrupt batch, not misparse, and must say so: a walk that stops short met damage,
+    // so the cleaner is uncleanable and every entry point refuses the pass (never cleans against a partial map).
     OffsetMap map;
     LogCleaner cleaner;
     EXPECT_NO_THROW(cleaner.buildOffsetMap(log, 0, 2, map))
         << "buildOffsetMap must not throw on corrupt batch";
-    // k1 (from the first good batch) must be in the map.
-    EXPECT_TRUE(map.get("k1").has_value()) << "k1 from first good batch must be in map";
-    // k2 (corrupt batch) may or may not be present; no crash is the contract.
+    EXPECT_TRUE(cleaner.uncleanable()) << "a pre-pass walk that stopped at a corrupt batch must mark the cleaner uncleanable";
+    ASSERT_TRUE(cleaner.damage().has_value());
+    EXPECT_EQ(cleaner.damage()->segBase, 0);
+    EXPECT_EQ(cleaner.damage()->byteOffset, firstBatchSize) << "the walk stopped at the corrupt batch";
 
     std::filesystem::remove_all(dir);
 }
