@@ -3431,4 +3431,49 @@ TEST(ResponseControlConfigRegression, SelfAdvertisedDisagreementIsRefusedRegress
     EXPECT_NE(e->find("8th"), std::string::npos) << *e;
 }
 
+
+// #803: every ms knob that is multiplied by 1'000'000 (ns) later is capped at 30 days, so the conversion never overflows an int64.
+namespace {
+struct MsKnobRow {
+    const char* var;
+    int64_t NodeConfig::*field;
+    int64_t okValue;                                  // accepted at the cap (one below for a knob that must stay below another)
+    std::map<std::string, std::string> extra;         // the knobs it is validated against
+};
+}  // namespace
+
+TEST(NodeConfigRegression, MsKnobsAboveThirtyDaysAreRefusedRegression) {
+    constexpr int64_t kCap = NodeConfig::kMaxDurationMs;
+    ASSERT_EQ(kCap, 2'592'000'000LL);
+    const std::vector<MsKnobRow> rows = {
+        {"RUNE_METRICS_SYSTEM_INTERVAL_MS", &NodeConfig::metricsSystemIntervalMs, kCap, {}},
+        {"RUNE_ELECTION_TIMEOUT_MS", &NodeConfig::electionTimeoutMs, kCap, {}},
+        {"RUNE_VERDICT_INTERVAL_MS", &NodeConfig::verdictIntervalMs, kCap, {}},
+        {"RUNE_ELECTION_STATUS_INTERVAL_MS", &NodeConfig::electionStatusIntervalMs, kCap, {}},
+        {"RUNE_STARTUP_CANVASS_TIMEOUT_MS", &NodeConfig::startupCanvassTimeoutMs, kCap, {}},
+        {"RUNE_AUTH_TIMEOUT_MS", &NodeConfig::authTimeoutMs, kCap, {}},
+        // F must stay below R: the cap itself is exercised by R, F takes cap - 1 under an R at the cap.
+        {"RUNE_SECURITY_MAX_STALENESS_MS", &NodeConfig::securityMaxStalenessMs, kCap - 1, {{"RUNE_SECURITY_STALE_SESSION_END_MS", "2592000000"}}},
+        {"RUNE_SECURITY_STALE_SESSION_END_MS", &NodeConfig::securityStaleSessionEndMs, kCap, {}},
+        {"RUNE_SECURITY_GATE_DEADLINE_MS", &NodeConfig::securityGateDeadlineMs, kCap, {}},
+    };
+    for (const MsKnobRow& row : rows) {
+        SCOPED_TRACE(row.var);
+        auto withValue = [&](const std::string& v) {
+            auto env = base3node();
+            for (const auto& [k, x] : row.extra) env[k] = x;
+            env[row.var] = v;
+            return parseNodeConfig(fakeEnv(env));
+        };
+        const auto ok = withValue(std::to_string(row.okValue));
+        ASSERT_TRUE(ok.error.empty()) << ok.error;
+        EXPECT_EQ((*ok.config).*(row.field), row.okValue);
+        for (const char* bad : {"2592000001", "9223372036854775807"}) {
+            const auto r = withValue(bad);
+            EXPECT_FALSE(r.error.empty()) << bad << " was accepted";
+            EXPECT_NE(r.error.find(row.var), std::string::npos) << r.error;
+        }
+    }
+}
+
 } // namespace rune::node

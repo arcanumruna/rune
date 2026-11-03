@@ -586,6 +586,8 @@ struct NodeConfig {
     std::string clusterKeyFile;
     std::string clusterKeyFileNext;
     int64_t     authTimeoutMs    = 10'000;
+    /// The cap of every positive-ms duration knob (30 days): a ms value times 1'000'000 (ns) never overflows an int64.
+    static constexpr int64_t kMaxDurationMs = 30LL * 24 * 3600 * 1000;
     // Namespaces Task 9 (spec §11): RUNE_ANONYMOUS_READ=1|true lets an authenticating broker serve a client that never
     // starts SCRAM as the read-only anonymous principal of `default` (schema / catalog reads only).  Off by default.
     bool        anonymousRead    = false;
