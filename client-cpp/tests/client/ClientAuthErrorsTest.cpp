@@ -2625,3 +2625,27 @@ TEST(ClientAuthErrorsRegression, AuthErrorNamesCoverNamespaceCodesRegression) {
     EXPECT_STREQ(rc::authErrorName(61), "ViewUniqueInvalid");
     EXPECT_EQ(rc::authErrorName(62), nullptr);
 }
+
+// ---------------------------------------------------------------------------
+// #756: the declared-egress test seam is a construction option, never a field of the public ClientConfig.
+// ---------------------------------------------------------------------------
+namespace {
+template <class C> concept HasDeclaredEgressField = requires(C c) { c.declaredEgressChannelForTest; };
+static_assert(!HasDeclaredEgressField<rc::ClientConfig>,
+              "the declared-egress seam must not be a public ClientConfig field (#756)");
+}  // namespace
+
+TEST(ClientConfigRegression, PublicConfigHasNoTestOnlyFieldsRegression) {
+    rc::ClientConfig cfg;
+    cfg.egressChannel = udp(41001);
+    // The option changes only the DECLARED channel: the ConnectRequest declares it, the transport still subscribes
+    // on the real egress channel.
+    rune::client::detail::ClientTestOptions opts;
+    opts.declaredEgressChannel = "aeron:udp?endpoint=192.0.2.1:40200";
+    const auto withOpt = rc::toAgentConfig(cfg, opts);
+    EXPECT_EQ(withOpt.session.egressChannel, opts.declaredEgressChannel);
+    EXPECT_EQ(withOpt.transport.egressChannel, cfg.egressChannel);
+    // The default (no option) declares the real egress channel.
+    const auto plain = rc::toAgentConfig(cfg);
+    EXPECT_EQ(plain.session.egressChannel, cfg.egressChannel);
+}

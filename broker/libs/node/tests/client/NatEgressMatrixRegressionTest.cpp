@@ -3,7 +3,7 @@
 // SIMULATED NAT.
 //
 // The proof idea.  A client behind NAT declares an egress address the broker cannot reach.  In-process that is the
-// client test seam ClientConfig::declaredEgressChannelForTest: the client SUBSCRIBES on its real local egress channel
+// client test seam detail::ClientTestOptions::declaredEgressChannel: the client SUBSCRIBES on its real local egress channel
 // but DECLARES kUnroutable (TEST-NET-1) in its ConnectRequest.  Whatever the broker sends on the declared path is
 // lost, so every ack, Record, Pong, group and DDL answer the client receives proves the response path (the replies
 // ride the client's own flow back: gateway response publication, worker response publication).  An "old" client
@@ -90,11 +90,18 @@ std::function<void(NodeConfig&)> withResponsePorts(const RespPorts& r) {
     };
 }
 
+/// The test options of a client built from `cfg`: every config with a gateway response-control port is a NAT'd client
+/// (it DECLARES the unreachable address); port 0 is a pre-NAT-egress client with a reachable declared channel.
+rune::client::detail::ClientTestOptions natOptions(const rc::ClientConfig& cfg) {
+    rune::client::detail::ClientTestOptions o;
+    if (cfg.gatewayResponseControlPort != 0) o.declaredEgressChannel = kUnroutable;
+    return o;
+}
+
 /// A NAT'd client: subscribes on its real egress channel, DECLARES an unreachable one, and knows the seed's response port.
 rc::ClientConfig natClient(ThreeNodes& c, int id, const RespPorts& r) {
     auto cfg = clientConfigFor(c, id);
     cfg.gatewayResponseControlPort = r.gw[static_cast<std::size_t>(id - 1)];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     return cfg;
@@ -255,7 +262,7 @@ std::set<std::string> asSet(const std::vector<std::string>& v) { return {v.begin
 
 /// A client of `cfg` that has connected (bounded); a failure to connect is a test failure with the reason.
 std::unique_ptr<rc::Client> connectOrFail(const rc::ClientConfig& cfg) {
-    auto cl = std::make_unique<rc::Client>(cfg);
+    auto cl = std::make_unique<rc::Client>(cfg, natOptions(cfg));
     try {
         cl->connectAndWait(60s);
     } catch (const std::exception& e) {
@@ -337,8 +344,8 @@ void everyOperation(std::unique_ptr<rc::Client>& out, rc::ClientConfig cfg, cons
     gcfgClient.dataDir = cfg.dataDir + "_g";
     gcfgClient.egressChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());   // its own local subscription
     gcfgClient.topics  = {spec};
-    auto groupClient = std::make_unique<rc::Client>(gcfgClient);
-    out = std::make_unique<rc::Client>(cfg);
+    auto groupClient = std::make_unique<rc::Client>(gcfgClient, natOptions(gcfgClient));
+    out = std::make_unique<rc::Client>(cfg, natOptions(cfg));
     rc::Client& cl = *out;
     GroupTap tap;
     rc::GroupConfig gcfg;
@@ -448,7 +455,6 @@ TEST(NatEgressMatrixRegression, NewClientEveryOperationOverResponsePathOneNodeRe
 
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     std::unique_ptr<rc::Client> client;
@@ -567,7 +573,7 @@ TEST(NatEgressMatrixRegression, TwoNatClientsOneHostNeverSeeEachOthersRepliesReg
     const std::set<int64_t> before = sessionIds(c.node(2));
     auto cfgA = natClient(c, 2, r);
     auto cfgB = natClient(c, 2, r);
-    ASSERT_EQ(cfgA.declaredEgressChannelForTest, cfgB.declaredEgressChannelForTest) << "both declare the same address";
+    ASSERT_EQ(natOptions(cfgA).declaredEgressChannel, natOptions(cfgB).declaredEgressChannel) << "both declare the same address";
     cfgA.topics = {spec};
     cfgB.topics = {spec};
     auto a = connectOrFail(cfgA);
@@ -721,7 +727,6 @@ void tlsLeg(bool nat, const char* tag) {
     auto cfg = tlsConfig(b, "ws1", kUserPw);
     if (nat) {
         cfg.gatewayResponseControlPort   = r.gw[0];
-        cfg.declaredEgressChannelForTest = kUnroutable;
     }
     const std::string declaredEndpoint = cfg.egressChannel.substr(cfg.egressChannel.rfind('=') + 1);
     auto client = connectOrFail(cfg);
@@ -783,7 +788,6 @@ static void tlsAuthOffLeg(bool nat, const char* tag) {
     cfg.allowUnauthenticatedBroker = true;
     if (nat) {
         cfg.gatewayResponseControlPort   = r.gw[0];
-        cfg.declaredEgressChannelForTest = kUnroutable;
     }
     auto client = connectOrFail(cfg);
     ASSERT_NE(client, nullptr) << "TLS connect with authentication off";
@@ -835,7 +839,7 @@ TEST(NatEgressMatrixRegression, ConnectRacingALeaderChangeConvergesRegression) {
 
     auto cfg = natClient(c, seed, r);
     cfg.topics = {spec};
-    rc::Client client(cfg);
+    rc::Client client(cfg, natOptions(cfg));
     std::thread killer([&] { c.stop(leader); });
     bool connected = true;
     try {
@@ -886,7 +890,6 @@ TEST(NatEgressMatrixRegression, SourcePortChangeEndsTheOldSessionAndNothingReuse
     auto natCfg = [&] {
         auto cfg = b.clientConfig();
         cfg.gatewayResponseControlPort   = r.gw[0];
-        cfg.declaredEgressChannelForTest = kUnroutable;
         cfg.connectTimeoutMs = 30'000;
         cfg.pingTimeoutMs    = 30'000;
         cfg.topics           = {spec};
@@ -954,7 +957,6 @@ TEST(NatEgressMatrixRegression, SameClientReconnectRebindsAndProduceCompletesReg
     const rc::TopicSpec spec = defineTopic(*admin, "recon", 1, 1);
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     cfg.topics           = {spec};
@@ -1003,7 +1005,6 @@ TEST(NatEgressMatrixRegression, BindLostRepeatedlyConvergesByResendRegression) {
     dropNextBinds(b.node(), 6);   // the first six WorkerBinds (more than the old attempt cap) are lost at the worker
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     cfg.topics           = {spec};
@@ -1043,7 +1044,6 @@ TEST(NatEgressMatrixRegression, LostBindAckRecoveredByAlreadyBoundResendRegressi
     const std::set<int64_t> s0 = sessionIds(b.node());
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     cfg.topics           = {spec};
@@ -1099,7 +1099,6 @@ TEST(NatEgressMatrixRegression, DerivedDefaultPortsCarryTheResponsePathRegressio
     ccfg.egressStreamId  = 2;
     ccfg.dataDir         = (dir / "client").string();
     ccfg.gatewayResponseControlPort   = resp->gateway;
-    ccfg.declaredEgressChannelForTest = kUnroutable;
     ccfg.connectTimeoutMs = 30'000;
     ccfg.pingTimeoutMs    = 30'000;
 
@@ -1181,7 +1180,6 @@ TEST(NatEgressMatrixRegression, TlsAuthThreeNodesNewClientRegression) {
 
     auto cfg = tlsCfg(2, "ws1", kUserPw);
     cfg.gatewayResponseControlPort   = r.gw[1];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.topics = {spec};
     auto client = connectOrFail(cfg);
     ASSERT_NE(client, nullptr) << "login over TLS on the three-node cluster";
@@ -1281,7 +1279,6 @@ TEST(NatEgressMatrixRegression, WorkerRestartRebindsRegression) {
     }
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     cfg.topics           = {spec};

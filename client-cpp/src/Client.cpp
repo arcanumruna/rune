@@ -80,10 +80,11 @@ ClientConfig& validatedInPlace(ClientConfig& c) {
 }
 // #682: the agent's config (no password in it); a throw while it is built (bad_alloc) wipes `c.password` - the Client
 // is then not constructed, so nothing else would.  First statement: the moved-from caller copy is wiped.
-agent::AgentConfig agentConfigWipingOnThrow(ClientConfig& c, std::string& callerPassword) {
+agent::AgentConfig agentConfigWipingOnThrow(ClientConfig& c, std::string& callerPassword,
+                                            const detail::ClientTestOptions& opts) {
     detail::wipeString(callerPassword);   // #682: the moved-from caller copy (SSO bytes) never outlives the hand-off
     try {
-        return toAgentConfig(c);
+        return toAgentConfig(c, opts);
     } catch (...) {
         detail::wipeString(c.password);
         throw;
@@ -173,7 +174,7 @@ int64_t subscriptionOfScopedError(std::string_view m) noexcept {
 // Helper: build AgentConfig from ClientConfig
 // ---------------------------------------------------------------------------
 
-agent::AgentConfig toAgentConfig(const ClientConfig& c) {
+agent::AgentConfig toAgentConfig(const ClientConfig& c, const detail::ClientTestOptions& opts) {
     agent::AgentConfig acfg;
     acfg.transport.ingressChannel  = c.gatewayChannel;
     acfg.transport.ingressStreamId = c.gatewayStreamId;
@@ -184,7 +185,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.transport.termBufferLength = c.termBufferBytes;
 
     // Session egress config (for ConnectRequest body).
-    acfg.session.egressChannel  = c.declaredEgressChannelForTest.empty() ? c.egressChannel : c.declaredEgressChannelForTest;
+    acfg.session.egressChannel  = opts.declaredEgressChannel.empty() ? c.egressChannel : opts.declaredEgressChannel;
     acfg.session.egressStreamId = c.egressStreamId;
 
     // Pass through keepalive interval if the caller overrides it.
@@ -248,9 +249,11 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
 // Construction
 // ---------------------------------------------------------------------------
 
-Client::Client(ClientConfig cfg)
+Client::Client(ClientConfig cfg) : Client(std::move(cfg), detail::ClientTestOptions{}) {}
+
+Client::Client(ClientConfig cfg, const detail::ClientTestOptions& opts)
     : cfg_(std::move(validatedInPlace(cfg)))
-    , agent_(agentConfigWipingOnThrow(cfg_, cfg.password), cfg_.password)   // #682: the agent takes the password and wipes cfg_.password
+    , agent_(agentConfigWipingOnThrow(cfg_, cfg.password, opts), cfg_.password)   // #682: the agent takes the password and wipes cfg_.password
     , partitionRouter_(metadataCache_)
     , catalogReader_(std::make_unique<CatalogReader>(*this))   // eagerly, on the owning thread (I2)
     , securityReader_(std::make_unique<SecurityReader>(*this))   // authentication Task 8: same rule

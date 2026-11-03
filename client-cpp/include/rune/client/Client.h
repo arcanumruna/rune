@@ -57,6 +57,7 @@
 #include <rune/client/TypedTopic.h>
 #include <rune/client/Completion.h>
 #include <rune/client/Completions.h>
+#include <rune/client/detail/ClientTestOptions.h>
 #include <rune/client/detail/CoordRoute.h>
 #include <rune/client/detail/OpTarget.h>
 #include <rune/client/detail/StatusRing.h>
@@ -292,10 +293,6 @@ struct ClientConfig {
     /// its own flow through NAT.  The leader's port is learnt from the Redirect `#port` suffix, every broker's from
     /// Metadata.  0 (default) = the declared `egressChannel` path only.
     int32_t     gatewayResponseControlPort = 0;
-    /// Test seam (NAT egress Task 8): when non-empty, the ConnectRequest DECLARES this egress channel while the
-    /// transport still subscribes on `egressChannel` (models a client behind NAT whose declared address is
-    /// unreachable).  Empty (default) = declare `egressChannel`.
-    std::string declaredEgressChannelForTest;
     std::string dataDir;
 
     // High-level timeouts (milliseconds).
@@ -483,7 +480,7 @@ struct ClientConfig {
 };
 
 /// Maps a ClientConfig to the agent/transport configuration (applies env overrides).
-[[nodiscard]] agent::AgentConfig toAgentConfig(const ClientConfig& c);
+[[nodiscard]] agent::AgentConfig toAgentConfig(const ClientConfig& c, const detail::ClientTestOptions& opts = {});
 
 /// Authentication (spec §5): who this Client is to its seed broker right now.
 ///   Authenticated          the seed session is Connected and the broker authenticated `user`.
@@ -515,6 +512,8 @@ public:
     /// before calling connect(); they may be set up to this point safely from
     /// the constructing thread before connect() is called.
     explicit Client(ClientConfig cfg);
+    /// Test-only construction (#756): `opts` carries seams that are not public config (e.g. a declared egress channel).
+    Client(ClientConfig cfg, const detail::ClientTestOptions& opts);
 
     /// = closeImmediately() (user decision 2: a destructor never waits for
     /// the broker).  Idempotent.  Call close() first when delivery matters.
