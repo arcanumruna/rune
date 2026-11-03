@@ -5212,8 +5212,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     };
     auto serves = [this](int32_t topicId) { return ddlTopicServes_(topicId); };
     if (!ddlAnswerGate_.empty()) {
-        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t nowNs = controlNowNs_;   // #723: the control pass's injected clock
         std::string why;   // cold: an overdue answer only
         work += ddlAnswerGate_.release(nowNs, serves, send,
             [this](int64_t session, int32_t topicId) {
@@ -5313,8 +5312,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
         }, 64);
     if (!catalogReadFlow_.idle()) [[unlikely]] work += catalogReadFlow_.service(catalogSink);
     {   // Issue #209: always drained, routed per frame, bounded by the DDL gate's free room (AdminEgressDrain.h).
-        const int64_t gateNowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t gateNowNs = controlNowNs_;   // #723: the control pass's injected clock
         work += drainAdminEgress(agent->egressRing(), ddlAnswerGate_, 16, gateNowNs, serves, send,
             [this, &send](int64_t session, int64_t eventOffset, std::span<const uint8_t> frame) {
                 // #120: the deadline runs on the control pass's injected clock (PR #459 M2).
@@ -5580,8 +5578,7 @@ int BrokerNode::reportUnbuildableReplicas_() {
     const bool     halted = catalogHaltedValue_ != 0;
     // Steady state: the map unchanged and nothing assigned here is unbuilt.
     if (v == unbuiltScanVersion_ && halted == unbuiltScanHalted_ && unbuilt_.empty()) [[likely]] return 0;
-    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t nowNs = controlNowNs_;   // #723: the control pass's injected clock
     const int32_t self = config_.nodeId;
     if (v != unbuiltScanVersion_ || halted != unbuiltScanHalted_) {   // cold: a committed-map / halt change
         unbuiltScanVersion_ = v;
@@ -5702,8 +5699,7 @@ int BrokerNode::resignIfHalted_(bool consensusLeader) {
     // one is live — never leave the cluster without a controller.  With every
     // broker halted this one stays the controller for the data plane (leader
     // election, ISR) and places / unplaces no catalog topic (MetadataService).
-    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t nowNs = controlNowNs_;   // #723: the control pass's injected clock
     // Fix round 1 (review M1/M5): one bad event halts every applier within a
     // replication round-trip of each other; their halt marks need that long to
     // reach this node.  Decide only after the settle window, or a peer that is
@@ -5955,8 +5951,7 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::st
     std::vector<rune::storage::Log*> logs;   // cold: the gateway forgets their addresses (M5)
     for (int32_t part = 0; part < partitions; ++part) logs.push_back(topicRegistry_->log(topicId, part));
     (void)topicRegistry_->dropTopic(topicId);   // serves nothing from now on (`spec` is not used after)
-    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t nowNs = controlNowNs_;   // #723: the control pass's injected clock
     if (gateway_) {
         (void)gateway_->endTopicSubscriptions(topicId);   // explicit UnknownTopic, never silent
         gateway_->forgetDroppedTopic(topicId, partitions, logs);
@@ -6012,8 +6007,7 @@ int BrokerNode::serviceDroppedTopics_() {
     int work = 0;
     const uint64_t safeGen = runtimeAgent_ ? runtimeAgent_->retireSafeGeneration()
                                            : (replicaRegistry_ ? replicaRegistry_->generation() : 0);
-    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t nowNs = controlNowNs_;   // #723: the control pass's injected clock
     bool renamed = false;
     for (std::size_t i = 0; i < droppedAwaitingRetire_.size();) {
         DroppedTopic& d = droppedAwaitingRetire_[i];
@@ -6064,8 +6058,7 @@ int BrokerNode::serviceDroppedTopics_() {
 // control thread, which owns the transaction coordinator and the offset / transaction-state stores.  Idempotent; the
 // answer (Done / More / Refused) always goes back, and the reaper retries anything not Done.
 void BrokerNode::onNsReapRequest_(const ReapRequestMsg& m) {
-    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t nowNs = controlNowNs_;   // #723: the control pass's injected clock
     ReapStatus st = ReapStatus::Done;
     switch (m.op) {
     case ReapOp::AbortTxns:
