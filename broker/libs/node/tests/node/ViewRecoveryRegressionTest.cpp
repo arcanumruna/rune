@@ -703,6 +703,36 @@ TEST(ViewRecoveryRegression, DeltasBeforeTheDiscardLandInTheBackupNotTheNewFileR
     EXPECT_EQ(rune::view::replay(*std::make_unique<rune::view::ViewTable>(r.layout, 16, 1u << 16), r.layout, {}, recs), 4);
 }
 
+// W3b: a delta HELD because the ring is full belongs to the old stream: the discard frame queues behind it, so the held
+// delta lands in the backup, never in the rebuilt file.
+TEST(ViewRecoveryRegression, HeldDeltaAtDiscardLandsInTheBackupRegression) {
+    DiscardRig r("rune_t_1_w3b-", 0);
+    r.materialize();
+    // Fill the deltas ring with frames of a type the agent skips, so the fold's delta cannot be pushed.
+    for (const std::size_t len : {std::size_t{4096}, std::size_t{256}, std::size_t{16}, std::size_t{0}})
+        for (int i = 0; i < 4096; ++i) {
+            const auto c = r.channel.deltas.tryClaim(99, len);
+            if (c < 0) break;
+            r.channel.deltas.commit(c);
+        }
+    r.now += 1000; r.fold();                            // folds [0,4); the delta stays held
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointDiscardOwed>(*r.vs->checkpointStateForTest(kViewId, 0)))
+        << "the held delta precedes the frame, so the frame cannot be sent while the ring is full";
+    ASSERT_TRUE(r.pumpUntilSettled());
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    const std::string bytes = slurpFile(backups[0]);
+    ASSERT_FALSE(bytes.empty()) << "the held delta is in the backup";
+    const auto recs = rune::node::splitViewCheckpointRecords(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+    ASSERT_FALSE(recs.empty());
+    rune::view::ViewTable t(r.layout, 16, 1u << 16);
+    EXPECT_EQ(rune::view::replay(t, r.layout, {}, recs), 4);
+    r.pump(8);
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+}
+
 // W4: the agent orders backupDir fsync, viewDir fsync, then the ack; and a restart at each crash point (before the
 // link, after the link before the unlink, after the unlink) converges to the same rows.
 TEST(ViewRecoveryRegression, DiscardCrashPointsAllConvergeToTheRecomputedViewRegression) {
