@@ -1949,6 +1949,7 @@ public:
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
             if (viewSet_ != nullptr) [[unlikely]] {
                 work += viewSet_->drainInstalls();   // Task 19: install runtime-created view plans (own thread)
+                work += viewSet_->drainSnapshotAcks();   // the IO agent's done ring: durable-offset and discard acks
                 work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
                 work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
             }
@@ -2086,6 +2087,7 @@ private:
             // shard worker that skipped this folded views it had never installed,
             // so every CreateView stayed UnknownView on the live path.
             work += viewSet_->drainInstalls();
+            work += viewSet_->drainSnapshotAcks();   // the IO agent's done ring: durable-offset and discard acks
             work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
             work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
         }

@@ -89,6 +89,11 @@ public:
     // serve-guard), NOT lazily created Ready by the plain driveFolds path.
     int drainInstalls();
 
+    // Drain the IO agent's `done` ring (channel_.done) on THIS thread, the ring's only consumer.  kDoneMsgType frames
+    // (durable-offset acks) are ignored; a kDiscardDoneMsgType frame completes a discard (onDiscardDone_).  Without a
+    // consumer the agent's pendingAcks_ would grow without bound once the 4 KiB ring filled.  Returns frames drained.
+    int drainSnapshotAcks(int limit = 64);
+
     // Task 19b: true iff at least one view here was installed for RESTART
     // recovery (recoveryViews_ non-empty).  The worker duty cycle gates the
     // extra recovery-materialize + driveRebuild work on this, so a broker with
@@ -524,6 +529,7 @@ private:
         const auto it = templates_.find(viewTopicId);
         return it != templates_.end() && it->second.isVerdict;
     }
+    void onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status);
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
     int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
     int finishRetired_();

@@ -362,6 +362,21 @@ int WorkerViewSet::drainInstalls() {
         /*limit=*/8);
 }
 
+int WorkerViewSet::drainSnapshotAcks(int limit) {
+    return channel_.done.drain(
+        [this](int32_t type, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
+            if (type != kDiscardDoneMsgType || len < kDiscardDoneMsgBytes) return;   // kDoneMsgType: durable-offset acks, not needed here
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            onDiscardDone_(static_cast<int32_t>(readU32LE(p)), static_cast<int32_t>(readU32LE(p + 4)),
+                           static_cast<int32_t>(readU32LE(p + 8)));
+        },
+        limit);
+}
+
+void WorkerViewSet::onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status) {
+    spdlog::info("VIEW-DISCARD-ACK view={} partition={} status={}", viewTopicId, partition, status);   // C2 completes the discard
+}
+
 void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t partition,
                                                     int64_t committedTail) {
     if (recoveryViews_.empty()) return;  // no recovery view installed — nothing to do

@@ -67,16 +67,19 @@ public:
     /// @param viewDataDir  Directory the per-(viewTopicId,partition) delta
     ///                     files are created in. Created if missing.
     /// @param fsyncMs      Grouped-fsync window in milliseconds. Default 50.
+    /// @param policy       View-checkpoint backup policy (RUNE_VIEW_BACKUP / RUNE_VIEW_BACKUPS_KEPT), see handleDiscardFrame_.
     explicit ViewSnapshotIoAgent(ViewSnapshotChannel& channel,
                                  std::string viewDataDir,
-                                 int64_t fsyncMs = 50);
+                                 int64_t fsyncMs = 50,
+                                 ViewBackupPolicy policy = {});
     // Task 19: per-NODE agent draining EVERY worker's channel.  Each pointer must
     // outlive this agent (same lifetime discipline as the single-channel ctor).
     // A delta's `done` ack is routed back to the channel it arrived on (so each
     // worker learns the durable offset of its OWN deltas).
     explicit ViewSnapshotIoAgent(std::vector<ViewSnapshotChannel*> channels,
                                  std::string viewDataDir,
-                                 int64_t fsyncMs = 50);
+                                 int64_t fsyncMs = 50,
+                                 ViewBackupPolicy policy = {});
     ~ViewSnapshotIoAgent() override;
 
     ViewSnapshotIoAgent(const ViewSnapshotIoAgent&)            = delete;
@@ -120,6 +123,14 @@ public:
     /// its fd writable, so a later reset frame can truncate it.
     void forceErroredForTest(int32_t viewTopicId, int32_t partition);
 
+    /// Acks the done ring was too full to take (retried each cycle).
+    [[nodiscard]] std::size_t pendingAcksForTest() const noexcept { return pendingAcks_.size(); }
+    /// Discard frames handled (acked, OK or not) since construction.
+    [[nodiscard]] int64_t discardsForTest() const noexcept { return discards_; }
+    /// Test seam: when on, the durable steps of a discard are logged in order ("backupDir", "viewDir", "ack").
+    void recordFsyncLogForTest(bool on) { recordFsyncLog_ = on; fsyncLog_.clear(); }
+    [[nodiscard]] const std::vector<std::string>& fsyncLogForTest() const noexcept { return fsyncLog_; }
+
 private:
     struct Key {
         int32_t viewTopicId;
@@ -147,7 +158,15 @@ private:
     };
 
     void handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx);
-    void handleResetFrame_(const uint8_t* p, std::size_t len, int channelIdx);
+    void handleResetFrame_(const uint8_t* p, std::size_t len, int channelIdx);   // retired kResetMsgType; removed with the discard route
+    // Worker -> IO: move the live (or legacy) checkpoint file into backup/ and ack.  The ack is posted only after every
+    // durable step (link, unlink, fsync(backupDir), fsync(viewDir)) is done; ENOENT is OK (idempotent replay after a crash).
+    void handleDiscardFrame_(const uint8_t* p, std::size_t len, int channelIdx);
+    // Returns 0 or an errno.  Moves `path` into backup/ (or unlinks it when backups are off) and prunes.
+    int  moveToBackup_(const std::string& path, int32_t view, int32_t part, ViewDiscardReason reason);
+    uint32_t nextSeq_(int32_t view, int32_t part);
+    int  fsyncDir_(const std::string& dir, const char* tag);
+    void postDiscardDone_(int channelIdx, int32_t view, int32_t part, int32_t status);
     // Returns nullptr on an ::open() failure -- NOT cached in files_, so the
     // next call for the same key retries open() (review-round-1 fix: a
     // transient failure must never permanently blackhole a key).
@@ -156,12 +175,18 @@ private:
     void flushDue_(int64_t nowNs, bool idle);
     void postDone_(int32_t viewTopicId, int32_t partition, int64_t O, int channelIdx);
     void drainPendingAcks_();
+    bool writeAck_(int channelIdx, int32_t msgType, int32_t view, int32_t part, int64_t value);
 
     std::vector<ViewSnapshotChannel*> channels_;   // Task 19: one or more worker channels
     std::string          viewDataDir_;
     int64_t              fsyncMs_;
     int64_t              lastFsyncNs_   = 0;
     int64_t              openFailures_  = 0; // running total across every key (see openFailureCount())
+    ViewBackupPolicy     policy_;
+    int64_t              discards_ = 0;
+    bool                 recordFsyncLog_ = false;
+    std::vector<std::string> fsyncLog_;
+    std::unordered_map<uint64_t, uint32_t> seqCache_;   // (view, part) -> the last backup seq used; cold (discard path only)
 
     std::unordered_map<Key, FileState, KeyHash> files_;
 
@@ -169,8 +194,12 @@ private:
     // cycle before any new acks (never lost, never reordered ahead of a
     // newer ack for the SAME key since flushDue_ only ever queues the
     // latest durable O per key per pass).
-    struct PendingAck { int32_t viewTopicId; int32_t partition; int64_t O; int channelIdx; };
+    struct PendingAck { int32_t viewTopicId; int32_t partition; int64_t O; int channelIdx; int32_t msgType; int32_t status; };
     std::vector<PendingAck> pendingAcks_;
 };
+
+/// Cold read-back seam (tests, prune, docs): the full paths of `<viewDataDir>/backup/view-<view>-p<part>.<10-digit seq>.<reason>.delta`,
+/// sorted by seq ascending.  Other names are ignored.
+[[nodiscard]] std::vector<std::string> listViewBackups(const std::string& viewDataDir, int32_t view, int32_t part);
 
 } // namespace rune::node

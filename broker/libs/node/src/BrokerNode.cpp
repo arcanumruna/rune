@@ -1903,7 +1903,8 @@ void BrokerNode::buildWorkerPool() {
             workerPool_->worker(i).setViewSet(workerViewSets_.back().get());
         }
         viewSnapshotIoAgent_ = std::make_unique<ViewSnapshotIoAgent>(
-            std::move(chPtrs), viewSnapDir, /*fsyncMs=*/50);
+            std::move(chPtrs), viewSnapDir, /*fsyncMs=*/50,
+            ViewBackupPolicy{config_.viewBackup, static_cast<uint32_t>(config_.viewBackupsKept)});
         viewSnapshotIoIdleStrategy_ = makeShapedBackoff(config_.adminIdleShape());
         viewSnapshotIoRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *viewSnapshotIoAgent_, *viewSnapshotIoIdleStrategy_, viewSnapshotIoClock_);

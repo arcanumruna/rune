@@ -1056,6 +1056,23 @@ ConfigResult parseNodeConfig(
             cfg.storageRecoveryVote = (sv == "1" || sv == "true" || sv == "TRUE");
         }
     }
+    // RUNE_VIEW_BACKUP (default on) / RUNE_VIEW_BACKUPS_KEPT (default 3): strict, so a typo can never turn backups off silently.
+    {
+        const char* raw = getenv_fn("RUNE_VIEW_BACKUP");
+        if (raw && !std::string_view(raw).empty()) {
+            const std::string_view sv(raw);
+            if (sv == "1" || sv == "true" || sv == "TRUE") cfg.viewBackup = true;
+            else if (sv == "0" || sv == "false" || sv == "FALSE") cfg.viewBackup = false;
+            else return {{}, "RUNE_VIEW_BACKUP must be 0/1/true/false, got: " + std::string(sv)};
+        }
+        const char* rawKept = getenv_fn("RUNE_VIEW_BACKUPS_KEPT");
+        if (rawKept && !std::string_view(rawKept).empty()) {
+            int32_t v{};
+            if (!parseInt32(rawKept, v) || v < 1 || v > 1000)
+                return {{}, std::string("RUNE_VIEW_BACKUPS_KEPT must be 1..1000, got: ") + rawKept};
+            cfg.viewBackupsKept = v;
+        }
+    }
     // Re-review 2026-10-04 MEDIUM-B: unclean consensus election (default OFF) —
     // see NodeConfig::uncleanConsensusElection.
     {

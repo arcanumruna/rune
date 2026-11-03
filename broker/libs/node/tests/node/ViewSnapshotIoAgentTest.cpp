@@ -11,6 +11,7 @@
 
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/ViewSnapshotIoAgent.h>
+#include <rune/node/WorkerViewSet.h>
 #include <rune/consensus/NanoClock.h>
 
 #include <rune/view/ViewCheckpoint.h>
@@ -18,12 +19,14 @@
 #include <rune/view/ViewRow.h>
 #include <rune/codec/Descriptor.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -317,4 +320,277 @@ TEST(ViewSnapshotIoAgentRegression, MultiTableDeltaIsPersistedNotDropped) {
     }
     ASSERT_LT(it, kHardCap) << "v2 delta was dropped: durable offset never reached 12";
     EXPECT_EQ(readFile(agent.deltaFilePathForTest(kViewTopicId, kPartition)), delta);
+}
+
+
+// ===========================================================================
+// View checkpoint backups (batch 1, C1): the discard frame moves the live file into backup/ before anything is rebuilt.
+// ===========================================================================
+namespace {
+
+using rune::node::ViewBackupPolicy;
+using rune::node::ViewDiscardReason;
+
+std::string committedPath(const std::string& dir, int32_t view, int32_t part) {
+    return rune::node::viewCheckpointFilePath(dir, view, part);
+}
+std::string legacyPath(const std::string& dir, int32_t view, int32_t part) {
+    return rune::node::legacyViewCheckpointFilePath(dir, view, part);
+}
+
+std::vector<uint8_t> frameDiscard(int32_t view, int32_t part, ViewDiscardReason reason) {
+    std::vector<uint8_t> f(rune::node::kDiscardMsgBytes, 0);
+    for (int i = 0; i < 4; ++i) f[i]     = static_cast<uint8_t>(static_cast<uint32_t>(view) >> (i * 8));
+    for (int i = 0; i < 4; ++i) f[4 + i] = static_cast<uint8_t>(static_cast<uint32_t>(part) >> (i * 8));
+    f[8] = static_cast<uint8_t>(reason);
+    return f;
+}
+
+struct DoneMsg { int32_t type = 0, view = 0, part = 0, status = 0; };
+
+// Reads at most one kDiscardDoneMsgType frame off `ch.done` (kDoneMsgType acks are skipped).
+bool takeDiscardDone(rune::node::ViewSnapshotChannel& ch, DoneMsg& out) {
+    bool got = false;
+    ch.done.drain([&](int32_t type, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
+        if (type != rune::node::kDiscardDoneMsgType || got || len < rune::node::kDiscardDoneMsgBytes) return;
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        auto rd = [&](int o) { return static_cast<int32_t>(p[o] | (p[o + 1] << 8) | (p[o + 2] << 16) | (static_cast<uint32_t>(p[o + 3]) << 24)); };
+        out = DoneMsg{type, rd(0), rd(4), rd(8)};
+        got = true;
+    }, 64);
+    return got;
+}
+
+// Drives the agent (the clock advancing past the fsync window every pass) until a discard ack arrives or kBackupCap passes.
+constexpr int kBackupCap = 32;
+bool pollDone(rune::node::ViewSnapshotChannel& ch, rune::node::ViewSnapshotIoAgent& agent, rune::consensus::ManualNanoClock& clk, DoneMsg& out) {
+    for (int i = 0; i < kBackupCap; ++i) {
+        agent.doWork(clk.nowNs());
+        clk.advance(60LL * 1'000'000LL);
+        if (takeDiscardDone(ch, out)) return true;
+    }
+    return false;
+}
+
+void sendDiscard(rune::node::ViewSnapshotChannel& ch, int32_t view, int32_t part, ViewDiscardReason r) {
+    const auto f = frameDiscard(view, part, r);
+    ASSERT_TRUE(ch.deltas.write(f.data(), f.size(), rune::node::kDiscardMsgType));
+}
+
+// Appends a delta (hp at offset O) through the agent and drives until it is durable.
+void appendDurable(rune::node::ViewSnapshotChannel& ch, rune::node::ViewSnapshotIoAgent& agent, rune::consensus::ManualNanoClock& clk,
+                   int32_t view, int32_t part, int64_t O, int32_t hp, const RowLayout& layout) {
+    const auto f = frameDelta(view, part, O, hp, layout);
+    ASSERT_TRUE(ch.deltas.write(f.data(), f.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+    int i = 0;
+    for (; i < kBackupCap && agent.lastDurableOffset(view, part) < O; ++i) {
+        agent.doWork(clk.nowNs());
+        clk.advance(60LL * 1'000'000LL);
+    }
+    ASSERT_LT(i, kBackupCap) << "delta never became durable";
+}
+
+constexpr int32_t kBView = 7;
+
+} // namespace
+
+TEST(ViewBackupRegression, DiscardMovesTheCommittedFileIntoBackupRegression) {
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/0);
+    rune::consensus::ManualNanoClock clk(0);
+    const RowLayout layout = testLayout();
+    appendDurable(ch, agent, clk, kBView, 0, 10, 1, layout);
+    appendDurable(ch, agent, clk, kBView, 0, 20, 2, layout);
+    const auto F = readFile(committedPath(dir.path(), kBView, 0));
+    ASSERT_FALSE(F.empty());
+
+    sendDiscard(ch, kBView, 0, ViewDiscardReason::Unreadable);
+    DoneMsg d;
+    ASSERT_TRUE(pollDone(ch, agent, clk, d));
+    EXPECT_EQ(d.type, rune::node::kDiscardDoneMsgType);
+    EXPECT_EQ(d.view, kBView);
+    EXPECT_EQ(d.part, 0);
+    EXPECT_EQ(d.status, 0);
+    EXPECT_FALSE(fs::exists(committedPath(dir.path(), kBView, 0)));
+    const auto backups = rune::node::listViewBackups(dir.path(), kBView, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_EQ(fs::path(backups[0]).filename().string(), "view-7-p0.0000000001.unreadable.delta");
+    EXPECT_EQ(readFile(backups[0]), F);
+
+    // A later delta starts a fresh file: exactly its own frame, no stale bytes.
+    appendDurable(ch, agent, clk, kBView, 0, 30, 3, layout);
+    const auto f3 = frameDelta(kBView, 0, 30, 3, layout);
+    const std::vector<uint8_t> delta3(f3.begin() + rune::node::ViewSnapshotChannel::kDeltaHeaderBytes, f3.end());
+    EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), delta3);
+}
+
+TEST(ViewBackupRegression, KnobOffRemovesWithoutBackupRegression) {
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), 0, ViewBackupPolicy{false, 3});
+    rune::consensus::ManualNanoClock clk(0);
+    appendDurable(ch, agent, clk, kBView, 0, 10, 1, testLayout());
+    sendDiscard(ch, kBView, 0, ViewDiscardReason::Unreadable);
+    DoneMsg d;
+    ASSERT_TRUE(pollDone(ch, agent, clk, d));
+    EXPECT_EQ(d.status, 0);
+    EXPECT_FALSE(fs::exists(committedPath(dir.path(), kBView, 0)));
+    EXPECT_FALSE(fs::exists(rune::node::viewBackupDir(dir.path()))) << "backups are off: no backup dir";
+}
+
+TEST(ViewBackupRegression, BackupFailureAcksErrnoAndKeepsTheLiveFileRegression) {
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), 0);
+    rune::consensus::ManualNanoClock clk(0);
+    const RowLayout layout = testLayout();
+    appendDurable(ch, agent, clk, kBView, 0, 10, 1, layout);
+    appendDurable(ch, agent, clk, kBView + 1, 0, 10, 1, layout);
+    const auto F = readFile(committedPath(dir.path(), kBView, 0));
+    { std::ofstream blocker(rune::node::viewBackupDir(dir.path()), std::ios::binary); blocker << "not a directory"; }
+
+    sendDiscard(ch, kBView, 0, ViewDiscardReason::Unreadable);
+    DoneMsg d;
+    ASSERT_TRUE(pollDone(ch, agent, clk, d));
+    EXPECT_EQ(d.status, ENOTDIR);
+    EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), F) << "a failed backup never touches the live file";
+    EXPECT_FALSE(agent.hasError(kBView + 1, 0));
+}
+
+TEST(ViewBackupRegression, RetentionKeepsTheNewestAcrossAgentRestartsRegression) {
+    TempDir dir;
+    const RowLayout layout = testLayout();
+    std::vector<uint8_t> cycle3;
+    // Cycles 1-2 on one agent, cycle 3 on a new one (a cold sequence rescan of the backup dir).
+    auto runCycles = [&](int from, int to) {
+        rune::node::ViewSnapshotChannel ch;
+        rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), 0, ViewBackupPolicy{true, 2});
+        rune::consensus::ManualNanoClock clk(0);
+        for (int cycle = from; cycle <= to; ++cycle) {
+            appendDurable(ch, agent, clk, kBView, 0, 10 * cycle, cycle, layout);
+            if (cycle == 3) cycle3 = readFile(committedPath(dir.path(), kBView, 0));
+            sendDiscard(ch, kBView, 0, ViewDiscardReason::Unreadable);
+            DoneMsg d;
+            ASSERT_TRUE(pollDone(ch, agent, clk, d));
+            ASSERT_EQ(d.status, 0);
+        }
+    };
+    runCycles(1, 2);
+    ASSERT_EQ(rune::node::listViewBackups(dir.path(), kBView, 0).size(), 2u);
+    runCycles(3, 3);
+    const auto backups = rune::node::listViewBackups(dir.path(), kBView, 0);
+    ASSERT_EQ(backups.size(), 2u);
+    EXPECT_EQ(fs::path(backups[0]).filename().string(), "view-7-p0.0000000002.unreadable.delta");
+    EXPECT_EQ(fs::path(backups[1]).filename().string(), "view-7-p0.0000000003.unreadable.delta");
+    EXPECT_EQ(readFile(backups[1]), cycle3);
+}
+
+TEST(ViewBackupRegression, DiscardOfAnAbsentFileAcksOkIdempotentRegression) {
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), 0);
+    rune::consensus::ManualNanoClock clk(0);
+    sendDiscard(ch, kBView, 0, ViewDiscardReason::Unreadable);
+    DoneMsg d;
+    ASSERT_TRUE(pollDone(ch, agent, clk, d));
+    EXPECT_EQ(d.status, 0);
+    EXPECT_TRUE(rune::node::listViewBackups(dir.path(), kBView, 0).empty());
+
+    // Crash replay: a real discard, acked, then the same frame again.
+    appendDurable(ch, agent, clk, kBView, 0, 10, 1, testLayout());
+    sendDiscard(ch, kBView, 0, ViewDiscardReason::Unreadable);
+    ASSERT_TRUE(pollDone(ch, agent, clk, d));
+    ASSERT_EQ(d.status, 0);
+    sendDiscard(ch, kBView, 0, ViewDiscardReason::Unreadable);
+    ASSERT_TRUE(pollDone(ch, agent, clk, d));
+    EXPECT_EQ(d.status, 0);
+    EXPECT_EQ(rune::node::listViewBackups(dir.path(), kBView, 0).size(), 1u);
+}
+
+TEST(ViewBackupRegression, LegacyReasonTargetsTheLegacyFileRegression) {
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), 0);
+    rune::consensus::ManualNanoClock clk(0);
+    appendDurable(ch, agent, clk, kBView, 0, 10, 1, testLayout());
+    const auto C = readFile(committedPath(dir.path(), kBView, 0));
+    const std::vector<uint8_t> L = {'l', 'e', 'g', 'a', 'c', 'y', 1, 2, 3};
+    { std::ofstream o(legacyPath(dir.path(), kBView, 0), std::ios::binary); o.write(reinterpret_cast<const char*>(L.data()), L.size()); }
+
+    sendDiscard(ch, kBView, 0, ViewDiscardReason::LegacySuperseded);
+    DoneMsg d;
+    ASSERT_TRUE(pollDone(ch, agent, clk, d));
+    EXPECT_EQ(d.status, 0);
+    EXPECT_FALSE(fs::exists(legacyPath(dir.path(), kBView, 0)));
+    const auto backups = rune::node::listViewBackups(dir.path(), kBView, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_EQ(fs::path(backups[0]).filename().string(), "view-7-p0.0000000001.legacy-superseded.delta");
+    EXPECT_EQ(readFile(backups[0]), L);
+    EXPECT_EQ(readFile(committedPath(dir.path(), kBView, 0)), C) << "the committed file is untouched";
+}
+
+TEST(ViewBackupRegression, ErroredStreamIsClearedByDiscardRegression) {
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), 0);
+    rune::consensus::ManualNanoClock clk(0);
+    agent.forceErroredForTest(kBView, 0);
+    ASSERT_TRUE(agent.hasError(kBView, 0));
+    sendDiscard(ch, kBView, 0, ViewDiscardReason::Unreadable);
+    DoneMsg d;
+    ASSERT_TRUE(pollDone(ch, agent, clk, d));
+    ASSERT_EQ(d.status, 0);
+    appendDurable(ch, agent, clk, kBView, 0, 10, 1, testLayout());
+    EXPECT_FALSE(agent.hasError(kBView, 0));
+    EXPECT_EQ(agent.lastDurableOffset(kBView, 0), 10);
+}
+
+TEST(ViewBackupRegression, FullDoneRingDefersTheDiscardAckRegression) {
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), 0);
+    rune::consensus::ManualNanoClock clk(0);
+    appendDurable(ch, agent, clk, kBView, 0, 10, 1, testLayout());
+    // Nobody drains `done`: fill it with durable-offset acks.
+    uint8_t ack[rune::node::ViewSnapshotChannel::kDoneMsgBytes] = {};
+    int filled = 0;
+    while (ch.done.write(ack, sizeof(ack), rune::node::ViewSnapshotChannel::kDoneMsgType)) {
+        ASSERT_LT(++filled, 100000);
+    }
+    sendDiscard(ch, kBView, 0, ViewDiscardReason::Unreadable);
+    for (int i = 0; i < 4; ++i) { agent.doWork(clk.nowNs()); clk.advance(60LL * 1'000'000LL); }
+    EXPECT_EQ(agent.pendingAcksForTest(), 1u) << "the ack is held, not dropped";
+    DoneMsg d;
+    EXPECT_FALSE(takeDiscardDone(ch, d)) << "no room for it yet: drained frames were all kDoneMsgType";
+    // Drain the ring (every ack was a kDoneMsgType filler, plus none for the discard) and drive: the ack arrives.
+    ASSERT_TRUE(pollDone(ch, agent, clk, d));
+    EXPECT_EQ(d.status, 0);
+    EXPECT_EQ(agent.pendingAcksForTest(), 0u);
+}
+
+TEST(ViewBackupRegression, DoneRingIsDrainedByTheWorkerSoAcksDoNotAccumulateRegression) {
+    // Production had no consumer of `done`, so once its 4 KiB filled every later ack piled up in pendingAcks_ forever.  Start with
+    // the ring nearly full of unconsumed acks (the state after ~170 flushes), then flush 40 more times: the worker's drain keeps
+    // pendingAcks_ at 0.  (Each flush costs a real fsync, so the fill is simulated instead of repeating it 170 times.)
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), 0);
+    rune::node::WorkerViewSet vs(ch, dir.path());
+    rune::consensus::ManualNanoClock clk(0);
+    const RowLayout layout = testLayout();
+    uint8_t filler[rune::node::ViewSnapshotChannel::kDoneMsgBytes] = {};
+    int filled = 0;
+    while (ch.done.write(filler, sizeof(filler), rune::node::ViewSnapshotChannel::kDoneMsgType)) ASSERT_LT(++filled, 100000);
+    ASSERT_EQ(vs.drainSnapshotAcks(filled - 5), filled - 5);   // 5 slots free, 5 fillers left
+    for (int i = 1; i <= 40; ++i) {
+        const auto f = frameDelta(kBView, 0, i, i, layout);
+        ASSERT_TRUE(ch.deltas.write(f.data(), f.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+        agent.doWork(clk.nowNs());   // appends
+        clk.advance(60LL * 1'000'000LL);
+        agent.doWork(clk.nowNs());   // fsync + ack
+        vs.drainSnapshotAcks();
+    }
+    EXPECT_EQ(agent.lastDurableOffset(kBView, 0), 40);
+    EXPECT_EQ(agent.pendingAcksForTest(), 0u);
 }

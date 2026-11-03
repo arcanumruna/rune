@@ -808,6 +808,47 @@ TEST(NodeConfigRegression, NsDeleteBatchIsParsedAndBoundedRegression) {
     }
 }
 
+// RUNE_VIEW_BACKUP / RUNE_VIEW_BACKUPS_KEPT: strict, so a typo can never turn backups off silently.  RED: a lenient parse.
+TEST(NodeConfigRegression, ViewBackupKnobsParseStrictRegression) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_TRUE(r.config->viewBackup);
+    EXPECT_EQ(r.config->viewBackupsKept, 3);
+    for (const char* off : {"0", "false", "FALSE"}) {
+        auto env = base1node();
+        env["RUNE_VIEW_BACKUP"] = off;
+        auto g = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(g.error.empty()) << off << ": " << g.error;
+        EXPECT_FALSE(g.config->viewBackup) << off;
+    }
+    for (const char* on : {"1", "true", "TRUE"}) {
+        auto env = base1node();
+        env["RUNE_VIEW_BACKUP"] = on;
+        auto g = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(g.error.empty()) << on << ": " << g.error;
+        EXPECT_TRUE(g.config->viewBackup) << on;
+    }
+    {
+        auto env = base1node();
+        env["RUNE_VIEW_BACKUP"] = "yes";
+        const auto g = parseNodeConfig(fakeEnv(env));
+        EXPECT_NE(g.error.find("RUNE_VIEW_BACKUP"), std::string::npos) << g.error;
+    }
+    for (const char* bad : {"0", "1001", "x"}) {
+        auto env = base1node();
+        env["RUNE_VIEW_BACKUPS_KEPT"] = bad;
+        const auto g = parseNodeConfig(fakeEnv(env));
+        EXPECT_NE(g.error.find("RUNE_VIEW_BACKUPS_KEPT"), std::string::npos) << bad;
+    }
+    for (const auto& [raw, want] : std::vector<std::pair<const char*, int32_t>>{{"1", 1}, {"1000", 1000}}) {
+        auto env = base1node();
+        env["RUNE_VIEW_BACKUPS_KEPT"] = raw;
+        const auto g = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(g.error.empty()) << raw << ": " << g.error;
+        EXPECT_EQ(g.config->viewBackupsKept, want) << raw;
+    }
+}
+
 // CP3 I4: RUNE_BROKER_LIVENESS_TIMEOUT_MS — default 0 (the agent uses 3 x the leader-heartbeat timeout); a positive value
 // is carried; garbage is refused.  RED: ignore the variable.
 TEST(NodeConfigRegression, BrokerLivenessTimeoutEnvIsParsedRegression) {

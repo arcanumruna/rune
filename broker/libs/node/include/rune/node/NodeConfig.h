@@ -529,6 +529,12 @@ struct NodeConfig {
     // (replaced-disk) node vote (read by the storage gate, Step 9).
     bool storageRecoveryVote = false;
 
+    // RUNE_VIEW_BACKUP (default on): before a materialized view is rebuilt over a persisted checkpoint (unreadable, ahead of the
+    // log, legacy, ...), that checkpoint file is moved into <data>/__view_snapshots/backup/.  Off = the file is removed instead.
+    bool viewBackup = true;
+    // RUNE_VIEW_BACKUPS_KEPT (default 3, 1..1000): backups kept per (view, partition); older ones are pruned.
+    int32_t viewBackupsKept = 3;
+
     // Re-review 2026-10-04 MEDIUM-B (RUNE_UNCLEAN_CONSENSUS_ELECTION, default
     // false): operator escape hatch for the consensus candidacy gate.  Normally
     // a node votes only for a candidate in the newest durable __cluster_metadata

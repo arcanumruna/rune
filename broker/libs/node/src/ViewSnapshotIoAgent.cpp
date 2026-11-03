@@ -4,12 +4,15 @@
 #include <rune/view/ViewCheckpoint.h>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
+#include <cstdio>
+#include <cstdlib>
 #include <spdlog/spdlog.h>
 
 namespace rune::node {
@@ -98,16 +101,19 @@ void encodeAck(uint8_t* buf, int32_t viewTopicId, int32_t partition, int64_t O) 
 
 ViewSnapshotIoAgent::ViewSnapshotIoAgent(ViewSnapshotChannel& channel,
                                          std::string viewDataDir,
-                                         int64_t fsyncMs)
+                                         int64_t fsyncMs,
+                                         ViewBackupPolicy policy)
     : ViewSnapshotIoAgent(std::vector<ViewSnapshotChannel*>{&channel},
-                          std::move(viewDataDir), fsyncMs) {}
+                          std::move(viewDataDir), fsyncMs, policy) {}
 
 ViewSnapshotIoAgent::ViewSnapshotIoAgent(std::vector<ViewSnapshotChannel*> channels,
                                          std::string viewDataDir,
-                                         int64_t fsyncMs)
+                                         int64_t fsyncMs,
+                                         ViewBackupPolicy policy)
     : channels_(std::move(channels))
     , viewDataDir_(std::move(viewDataDir))
     , fsyncMs_(fsyncMs)
+    , policy_(policy)
 {
     std::error_code ec;
     std::filesystem::create_directories(viewDataDir_, ec);
@@ -180,6 +186,166 @@ void ViewSnapshotIoAgent::handleResetFrame_(const uint8_t* p, std::size_t len, i
     fs->dirtySinceSync = false;
 }
 
+namespace {
+// Backup file names: view-<view>-p<part>.<10-digit seq>.<reason>.delta
+std::string backupPrefix(int32_t view, int32_t part) {
+    return "view-" + std::to_string(static_cast<uint32_t>(view)) + "-p" + std::to_string(part) + ".";
+}
+// seq of `name` when it is a backup of (view, part); false otherwise.
+bool parseBackupName(const std::string& name, const std::string& prefix, uint32_t& seqOut) {
+    if (name.size() < prefix.size() + 10 + 1 + 1 + 6 || name.compare(0, prefix.size(), prefix) != 0) return false;
+    uint64_t seq = 0;
+    for (std::size_t i = 0; i < 10; ++i) {
+        const char c = name[prefix.size() + i];
+        if (c < '0' || c > '9') return false;
+        seq = seq * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (name[prefix.size() + 10] != '.') return false;
+    static const char kSuffix[] = ".delta";
+    if (name.size() < sizeof(kSuffix) - 1 || name.compare(name.size() - (sizeof(kSuffix) - 1), sizeof(kSuffix) - 1, kSuffix) != 0) return false;
+    if (name.size() - (sizeof(kSuffix) - 1) <= prefix.size() + 11) return false;   // the reason tag must be non-empty
+    if (seq > UINT32_MAX) return false;
+    seqOut = static_cast<uint32_t>(seq);
+    return true;
+}
+uint64_t seqKey(int32_t view, int32_t part) noexcept {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(view)) << 32) | static_cast<uint32_t>(part);
+}
+} // namespace
+
+std::vector<std::string> listViewBackups(const std::string& viewDataDir, int32_t view, int32_t part) {
+    std::vector<std::pair<uint32_t, std::string>> found;
+    const std::string dir = viewBackupDir(viewDataDir);
+    const std::string prefix = backupPrefix(view, part);
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        uint32_t seq = 0;
+        if (parseBackupName(name, prefix, seq)) found.emplace_back(seq, it->path().string());
+    }
+    std::sort(found.begin(), found.end());
+    std::vector<std::string> out;
+    out.reserve(found.size());
+    for (auto& f : found) out.push_back(std::move(f.second));
+    return out;
+}
+
+int ViewSnapshotIoAgent::fsyncDir_(const std::string& dir, const char* tag) {
+    if (recordFsyncLog_) fsyncLog_.emplace_back(tag);
+    const int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd < 0) return errno;
+    int rc = 0;
+    if (rune::node::detail::platformFdatasync(fd) != 0) rc = errno;
+    ::close(fd);
+    return rc;
+}
+
+uint32_t ViewSnapshotIoAgent::nextSeq_(int32_t view, int32_t part) {
+    auto it = seqCache_.find(seqKey(view, part));
+    if (it == seqCache_.end()) {
+        uint32_t maxSeq = 0;
+        const std::string prefix = backupPrefix(view, part);
+        for (const std::string& path : listViewBackups(viewDataDir_, view, part)) {
+            uint32_t seq = 0;
+            if (parseBackupName(std::filesystem::path(path).filename().string(), prefix, seq)) maxSeq = std::max(maxSeq, seq);
+        }
+        it = seqCache_.emplace(seqKey(view, part), maxSeq).first;
+    }
+    return ++it->second;
+}
+
+int ViewSnapshotIoAgent::moveToBackup_(const std::string& path, int32_t view, int32_t part, ViewDiscardReason reason) {
+    struct stat st{};
+    if (::lstat(path.c_str(), &st) != 0) return errno == ENOENT ? 0 : errno;   // ENOENT: an idempotent replay after a crash
+    // Nothing is lost by removing an empty file, and a backup of it would only spend a retention slot.
+    if (!policy_.enabled || st.st_size == 0) {
+        if (::unlink(path.c_str()) != 0 && errno != ENOENT) return errno;
+        return fsyncDir_(viewDataDir_, "viewDir");
+    }
+
+    const std::string bdir = viewBackupDir(viewDataDir_);
+    bool madeDir = false;
+    if (::mkdir(bdir.c_str(), 0755) == 0) {
+        madeDir = true;
+    } else if (errno != EEXIST) {
+        return errno;
+    }
+    struct stat bst{};
+    if (::stat(bdir.c_str(), &bst) != 0) return errno;
+    if (!S_ISDIR(bst.st_mode)) return ENOTDIR;
+    if (madeDir) {
+        if (const int e = fsyncDir_(viewDataDir_, "viewDir")) return e;
+    }
+
+    uint32_t seq = nextSeq_(view, part);
+    std::string backup;
+    char name[128];
+    constexpr int kTries = 16;
+    int err = EEXIST;
+    for (int attempt = 0; attempt < kTries; ++attempt, ++seq) {
+        std::snprintf(name, sizeof(name), "view-%u-p%d.%010u.%s.delta", static_cast<uint32_t>(view), part, seq, viewDiscardReasonName(reason));
+        backup = bdir + "/" + name;
+        if (::link(path.c_str(), backup.c_str()) == 0) { err = 0; break; }
+        err = errno;
+        if (err == EEXIST) continue;   // someone else's file at that seq: take the next one
+        if (err == EPERM || err == ENOTSUP || err == EXDEV || err == EMLINK) {   // a filesystem without hard links: rename, never copy
+            if (::access(backup.c_str(), F_OK) == -1 && errno == ENOENT) {
+                if (::rename(path.c_str(), backup.c_str()) == 0) { err = 0; break; }
+                err = errno;
+            } else {
+                err = EEXIST;
+                continue;
+            }
+        }
+        return err;
+    }
+    if (err != 0) return err;
+    seqCache_[seqKey(view, part)] = seq;
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) return errno;   // (after a rename fallback the file is already gone)
+
+    if (const int e = fsyncDir_(bdir, "backupDir")) return e;
+    if (const int e = fsyncDir_(viewDataDir_, "viewDir")) return e;
+
+    // Retention: keep the newest `keep`.  A failure here never fails the discard.
+    std::vector<std::string> all = listViewBackups(viewDataDir_, view, part);
+    bool pruned = false;
+    for (std::size_t i = 0; all.size() - i > policy_.keep; ++i) {
+        if (::unlink(all[i].c_str()) != 0) spdlog::warn("ViewSnapshotIoAgent: pruning backup {} failed: {}", all[i], std::strerror(errno));
+        else pruned = true;
+    }
+    if (pruned && fsyncDir_(bdir, "backupDir") != 0)
+        spdlog::warn("ViewSnapshotIoAgent: fsync of {} after pruning failed: {}", bdir, std::strerror(errno));
+    spdlog::info("VIEW-BACKUP view={} partition={} reason={} seq={} bytes={} file={}", view, part, viewDiscardReasonName(reason), seq,
+                 static_cast<long long>(st.st_size), name);
+    return 0;
+}
+
+void ViewSnapshotIoAgent::handleDiscardFrame_(const uint8_t* p, std::size_t len, int channelIdx) {
+    if (len < static_cast<std::size_t>(kDiscardMsgBytes)) return;
+    const Key key{static_cast<int32_t>(readLE32(p)), static_cast<int32_t>(readLE32(p + 4))};
+    const auto reason = static_cast<ViewDiscardReason>(p[8]);
+    const bool legacy = discardTargetsLegacy(reason);
+    const std::string path = legacy ? legacyViewCheckpointFilePath(viewDataDir_, key.viewTopicId, key.partition)
+                                    : deltaFilePath_(key);
+    if (!legacy) {
+        // The committed file: flush and drop its stream so the next append reopens (and re-verifies) whatever file is there then.
+        // This also clears an errored stream: the discard starts a fresh one.
+        if (auto it = files_.find(key); it != files_.end()) {
+            if (it->second.fd >= 0) {
+                (void)rune::node::detail::platformFdatasync(it->second.fd);
+                ::close(it->second.fd);
+            }
+            files_.erase(it);
+        }
+    }
+    const int status = moveToBackup_(path, key.viewTopicId, key.partition, reason);
+    if (status != 0)
+        spdlog::error("ViewSnapshotIoAgent: discard of view {} partition {} ({}) failed: {}", key.viewTopicId, key.partition,
+                      viewDiscardReasonName(reason), std::strerror(status));
+    if (recordFsyncLog_) fsyncLog_.emplace_back("ack");
+    postDiscardDone_(channelIdx, key.viewTopicId, key.partition, status);
+}
+
 void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx) {
     if (len < ViewSnapshotChannel::kDeltaHeaderBytes) return; // malformed frame -- drop
 
@@ -229,17 +395,35 @@ void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len, i
     fs->dirtySinceSync = true;
 }
 
-void ViewSnapshotIoAgent::postDone_(int32_t viewTopicId, int32_t partition, int64_t O, int channelIdx) {
+// One ack onto `channels_[channelIdx]->done`; false when the ring is full (or the channel is gone).
+bool ViewSnapshotIoAgent::writeAck_(int channelIdx, int32_t msgType, int32_t view, int32_t part, int64_t value) {
+    auto* ch = (channelIdx >= 0 && channelIdx < static_cast<int>(channels_.size())) ? channels_[channelIdx] : nullptr;
+    if (!ch) return false;
+    if (msgType == kDiscardDoneMsgType) {
+        uint8_t buf[kDiscardDoneMsgBytes];
+        writeLE32(buf, static_cast<uint32_t>(view));
+        writeLE32(buf + 4, static_cast<uint32_t>(part));
+        writeLE32(buf + 8, static_cast<uint32_t>(static_cast<int32_t>(value)));
+        return ch->done.write(buf, sizeof(buf), kDiscardDoneMsgType);
+    }
     uint8_t buf[ViewSnapshotChannel::kDoneMsgBytes];
-    encodeAck(buf, viewTopicId, partition, O);
-    auto* ch = (channelIdx >= 0 && channelIdx < static_cast<int>(channels_.size()))
-                   ? channels_[channelIdx] : nullptr;
-    if (!ch || !ch->done.write(buf, sizeof(buf), ViewSnapshotChannel::kDoneMsgType)) {
+    encodeAck(buf, view, part, value);
+    return ch->done.write(buf, sizeof(buf), ViewSnapshotChannel::kDoneMsgType);
+}
+
+void ViewSnapshotIoAgent::postDone_(int32_t viewTopicId, int32_t partition, int64_t O, int channelIdx) {
+    if (!writeAck_(channelIdx, ViewSnapshotChannel::kDoneMsgType, viewTopicId, partition, O)) {
         // Ring momentarily full -- retry next cycle (never dropped). The
         // in-process lastDurableOffset() is already correct regardless of
         // whether this notification lands; see file header.
-        pendingAcks_.push_back(PendingAck{viewTopicId, partition, O, channelIdx});
+        pendingAcks_.push_back(PendingAck{viewTopicId, partition, O, channelIdx, ViewSnapshotChannel::kDoneMsgType, 0});
     }
+}
+
+void ViewSnapshotIoAgent::postDiscardDone_(int channelIdx, int32_t view, int32_t part, int32_t status) {
+    ++discards_;
+    if (!writeAck_(channelIdx, kDiscardDoneMsgType, view, part, status))
+        pendingAcks_.push_back(PendingAck{view, part, 0, channelIdx, kDiscardDoneMsgType, status});   // never dropped: replayed next cycle
 }
 
 void ViewSnapshotIoAgent::drainPendingAcks_() {
@@ -247,11 +431,8 @@ void ViewSnapshotIoAgent::drainPendingAcks_() {
     std::size_t keep = 0;
     for (std::size_t i = 0; i < pendingAcks_.size(); ++i) {
         const auto& ack = pendingAcks_[i];
-        uint8_t buf[ViewSnapshotChannel::kDoneMsgBytes];
-        encodeAck(buf, ack.viewTopicId, ack.partition, ack.O);
-        auto* ch = (ack.channelIdx >= 0 && ack.channelIdx < static_cast<int>(channels_.size()))
-                       ? channels_[ack.channelIdx] : nullptr;
-        if (!ch || !ch->done.write(buf, sizeof(buf), ViewSnapshotChannel::kDoneMsgType)) {
+        const int64_t value = ack.msgType == kDiscardDoneMsgType ? static_cast<int64_t>(ack.status) : ack.O;
+        if (!writeAck_(ack.channelIdx, ack.msgType, ack.viewTopicId, ack.partition, value)) {
             if (keep != i) pendingAcks_[keep] = pendingAcks_[i];
             ++keep;
         }
@@ -307,6 +488,10 @@ int ViewSnapshotIoAgent::doWork(int64_t nowNs) {
                        aeron::util::index_t off, aeron::util::index_t len) {
                 if (type == ViewSnapshotChannel::kResetMsgType) {
                     handleResetFrame_(reinterpret_cast<const uint8_t*>(buf.buffer() + off), static_cast<std::size_t>(len), ci);
+                    return;
+                }
+                if (type == kDiscardMsgType) {
+                    handleDiscardFrame_(reinterpret_cast<const uint8_t*>(buf.buffer() + off), static_cast<std::size_t>(len), ci);
                     return;
                 }
                 if (type != ViewSnapshotChannel::kDeltaMsgType) return;
