@@ -366,6 +366,21 @@ partition logs under `topics/`, `__catalog/` and `__security/` (the replicated e
 - After a crash that lost the marker tail a verdict view discards a checkpoint ahead of its local markers and refolds
   (`verdictCheckpointsDiscarded`). When the rejected-offset index is full the judge stalls and raises `verdictStalls`.
 
+## Key index
+
+- A typed topic created or adopted with `key.index` keeps, per partition, an in-memory index of its live keys (about
+  16 bytes per key). It judges write intents (`insert` fails with `KeyExists` 56 on a stored key, `update` and
+  `removeExisting` with `KeyNotFound` 57 on an absent one) and makes the partition a verdict source; plain upserts and
+  deletes are folded into it and never rejected. It is charged to the topic's namespace.
+- The index is never checkpointed. It is rebuilt from the local log on each new leadership and each restart, at most
+  65,536 records per worker pass. While it rebuilds, delivery and `View` acks wait; intents are accepted and judged once
+  it is done. A key whose tombstone the cleaner already removed is gone from the rebuilt index, as from the log.
+- Stats per partition: `keyIndexRebuilds`, the rejections `rejectionsKeyExists` (56) and `rejectionsKeyNotFound` (57),
+  both with constraint id 0, and `keyIndexSkippedMalformed` (records whose key is not the key field's width, written
+  before an adoption).
+- The key field must be at most 8 bytes wide until wide keys ship; a wider one is refused at DDL ("key.index needs a key
+  of at most 8 bytes"). `key.index` needs every broker at feature level 5.
+
 ## Upgrades
 
 - Upgrade **brokers before clients**: a new client defining a transient topic against an older broker silently gets a

@@ -542,40 +542,48 @@ struct AggRig {
 
 } // namespace
 
+// The BM_ViewFoldReplace workload; BM_ViewFoldVerdict/key_index runs it too, for its gate's baseline.
+static PhaseResult runReplaceFold(size_t& finalSize) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = compileView(hpView(), srcs, 0x51000001).value();
+
+    ViewTable table(comp.rowLayout);
+    VersionDescriptorCache vdc(src);
+
+    const auto ops = generateChurnOps(kTotalOps);
+    const auto stream = buildStream(
+        ops, kBatchSizes, std::size(kBatchSizes),
+        [](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
+            const auto kb = keyBytes(static_cast<int64_t>(op.key));
+            if (op.tombstone) {
+                bb.append(asSv(kb), std::string_view{}, 0);
+            } else {
+                const auto val = encodeCharacter(static_cast<int64_t>(op.key), op.hp, 1);
+                bb.append(asSv(kb), asSv(val), 0);
+            }
+        });
+
+    auto foldOne = [&](size_t i) {
+        auto lv = stream.view(i);
+        int64_t cur = 0;
+        return foldBatch(comp.plan, comp.rowLayout, vdc, table, lv, stream.bound(i), cur, rune::view::kNoSkip);
+    };
+    // Replace: one drain right before the alloc probe (unchanged from Task 11).
+    auto drainAll = [&] { table.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {}); };
+
+    auto r = runPhases(stream, foldOne, drainAll, /*drainEvery*/ 0);
+
+    benchmark::DoNotOptimize(table.size());
+    finalSize = table.size();
+    return r;
+}
+
 static void BM_ViewFoldReplace(benchmark::State& st) {
     for (auto _ : st) {
-        auto src = charSourceV1();
-        const rune::codec::Descriptor* srcs[] = {&src};
-        auto comp = compileView(hpView(), srcs, 0x51000001).value();
-
-        ViewTable table(comp.rowLayout);
-        VersionDescriptorCache vdc(src);
-
-        const auto ops = generateChurnOps(kTotalOps);
-        const auto stream = buildStream(
-            ops, kBatchSizes, std::size(kBatchSizes),
-            [](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
-                const auto kb = keyBytes(static_cast<int64_t>(op.key));
-                if (op.tombstone) {
-                    bb.append(asSv(kb), std::string_view{}, 0);
-                } else {
-                    const auto val = encodeCharacter(static_cast<int64_t>(op.key), op.hp, 1);
-                    bb.append(asSv(kb), asSv(val), 0);
-                }
-            });
-
-        auto foldOne = [&](size_t i) {
-            auto lv = stream.view(i);
-            int64_t cur = 0;
-            return foldBatch(comp.plan, comp.rowLayout, vdc, table, lv, stream.bound(i), cur, rune::view::kNoSkip);
-        };
-        // Replace: one drain right before the alloc probe (unchanged from Task 11).
-        auto drainAll = [&] { table.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {}); };
-
-        auto r = runPhases(stream, foldOne, drainAll, /*drainEvery*/ 0);
-
-        benchmark::DoNotOptimize(table.size());
-        reportCommon(st, "", r, table.size());
+        size_t finalSize = 0;
+        auto r = runReplaceFold(finalSize);
+        reportCommon(st, "", r, finalSize);
     }
 }
 BENCHMARK(BM_ViewFoldReplace)
@@ -603,6 +611,7 @@ rune::view::ViewPlan tagProjectionView() {
                   {"tag", PrimType::Int32, 0, "tag", rune::view::MergeRule::Replace}};
     return v;
 }
+constexpr uint8_t kIntentInsert = 1, kIntentExisting = 2;   // record attributes bits 0-1
 struct VerdictBenchMember {
     rune::codec::Descriptor src = tagSourceV1();
     rune::view::CompileResult comp;
@@ -681,6 +690,82 @@ static void BM_ViewFoldVerdict(benchmark::State& st) {
     }
 }
 BENCHMARK(BM_ViewFoldVerdict)->Arg(0)->Arg(1)->ArgName("rejecting_1pct")->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime();
+
+// Key-index judging (checked writes Part 05): the same churn through a VerdictSource whose only member is the key index,
+// every record an intent and none rejected - a new key is an insert, an update an update, a tombstone a removeExisting.
+// The gate is the spec's §14 judging budget over the plain fold: verdict_record_p50_ns - BM_ViewFoldReplace's
+// record_p50_ns <= 1000, run here first in the same process, and steady_alloc == 0.  The judge drops the key index's
+// dirty rows itself (it is never checkpointed), so drainAll has nothing to do.
+static void BM_ViewFoldVerdictKeyIndex(benchmark::State& st) {
+    for (auto _ : st) {
+        size_t replaceSize = 0;
+        auto base = runReplaceFold(replaceSize);
+        const double replaceP50Ns = percentileUs(base.trueRecordLatNs, 0.50) * 1000.0;
+
+        const auto ops = generateChurnOps(kTotalOps);
+        std::vector<bool> live(kTotalOps + 1);   // a later touch of a key is an update or a removeExisting
+        const auto stream = buildStream(
+            ops, kBatchSizes, std::size(kBatchSizes),
+            [&](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
+                const auto kb = keyBytes(static_cast<int64_t>(op.key));
+                const bool exists = live[op.key];
+                if (op.tombstone) {
+                    bb.append(asSv(kb), std::string_view{}, 0, kIntentExisting);
+                    live[op.key] = false;
+                } else {
+                    const auto val = encodeCharacter(static_cast<int64_t>(op.key), 1, 1);
+                    bb.append(asSv(kb), asSv(val), 0, exists ? kIntentExisting : kIntentInsert);
+                    live[op.key] = true;
+                }
+            });
+
+        // ViewTable's default 32 MiB chunk, as every table of this harness: the churn never plateaus, so the product's 64 KiB
+        // chunk (65,536 one-byte rows) would take its documented chunk-growth allocation inside the alloc probe.
+        const auto src = tagSourceV1();
+        rune::node::ViewInstance index(rune::node::keyIndexPlan(5, src.find("id")->id), rune::node::keyIndexRowLayout(), src, false, 0,
+                                       4096, 32u << 20);
+        rune::node::PartitionWriteState write;
+        rune::node::VerdictSource vs{5, 0};
+        vs.addVerdictView(&index, rune::view::VerdictViewKind::KeyIndex, 0, rune::node::kKeyIndexPlanFingerprint);
+        rune::node::ConstraintSet set;
+        set.id = 1;
+        set.members[set.count++] = {0, rune::view::VerdictViewKind::KeyIndex, rune::node::kKeyIndexPlanFingerprint};
+        write.constraintSets.onChange(0, set);
+        vs.bindState(&write);
+        vs.bindLeader(nullptr, 1, 0);
+        vs.captureAppendedForTest(false);
+        int64_t nowNs = 0;
+
+        const int64_t end = stream.bound(stream.size() - 1);
+        auto readRange = [&](int64_t from, int64_t) {
+            const size_t j = static_cast<size_t>(std::upper_bound(stream.baseOffset.begin(), stream.baseOffset.end(), from) - stream.baseOffset.begin()) - 1;
+            return rune::storage::LogReadView{stream.bytes.data() + stream.byteOffset[j], stream.bytes.size() - stream.byteOffset[j], stream.baseOffset[j], end};
+        };
+        auto foldOne = [&](size_t i) {
+            vs.driveJudge(readRange, stream.bound(i), nowNs += 1'000'000, write);
+            rune::node::verdictOnHw(write, stream.bound(i));
+            return FoldStats{};
+        };
+
+        auto r = runPhases(stream, foldOne, [] {}, /*drainEvery*/ 0);
+        if (vs.judgedThrough() < end - 8) st.SkipWithError("the judge did not reach the end of the stream");
+        if (write.rejected.size() != 0 || index.table.size() != replaceSize) st.SkipWithError("an intent was rejected or the key index lost a key");
+        const double p50 = percentileUs(r.trueRecordLatNs, 0.50) * 1000.0;
+        st.counters["verdict_record_p50_ns"] = p50;
+        st.counters["verdict_record_p99_ns"] = percentileUs(r.trueRecordLatNs, 0.99) * 1000.0;
+        st.counters["steady_alloc"]          = static_cast<double>(r.steadyAlloc);
+        st.counters["replace_record_p50_ns"] = replaceP50Ns;
+        st.counters["rejected_total"]        = static_cast<double>(write.rejected.size());
+        st.counters["key_index_size"]        = static_cast<double>(index.table.size());
+        const bool pass = p50 - replaceP50Ns <= 1000.0 && r.steadyAlloc == 0;
+        st.counters["gate_pass"] = pass ? 1.0 : 0.0;
+        std::fprintf(stderr,
+                     "[ViewFoldVerdict key_index gate] verdict_record_p50_ns=%.0f replace_record_p50_ns=%.0f delta_ns=%.0f (<=1000) "
+                     "steady_alloc=%lld (==0) => %s\n",
+                     p50, replaceP50Ns, p50 - replaceP50Ns, static_cast<long long>(r.steadyAlloc), pass ? "PASS" : "FAIL");
+    }
+}
+BENCHMARK(BM_ViewFoldVerdictKeyIndex)->Name("BM_ViewFoldVerdict/key_index")->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime();
 
 // Aggregate fold gate (Phase 2a): user_totals grouped by userId over
 // 1,000,000 contributors / 10,000 groups. What is warm before timing:
