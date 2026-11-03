@@ -1241,15 +1241,8 @@ OpResult Client::issueTargeted_(detail::HubCommand& cmd, const CompletionTarget&
 
 Completion Client::andWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
                                       detail::AndWaitIssue issue, void* issueCtx, std::string* text) {
-    auto* self = static_cast<Client*>(ctx);
-    Completion out;
-    self->andWait_(what, timeout, 0,
-                   [&](Completions& q, Token t) { return issue(issueCtx, CompletionTarget(q), t); },
-                   [&](const Completion& c, std::span<const uint8_t> p) {
-                       out = c;
-                       if (text != nullptr) text->assign(reinterpret_cast<const char*>(p.data()), p.size());
-                   });
-    return out;
+    // A wait that times out or finds the client closed is a Completion (P5-10), as for the group's sink.
+    return groupAndWaitTrampoline_(ctx, what, timeout, issue, issueCtx, text);
 }
 
 // #378 (C3 review): the GroupConsumer *AndWait sugar.  A wait that ends without a completion (the wait or the

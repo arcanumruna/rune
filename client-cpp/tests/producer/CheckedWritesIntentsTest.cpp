@@ -420,6 +420,20 @@ TEST(CheckedWritesIntents, SendAndWaitReturnsThePerRecordVerdict) {
                  std::invalid_argument);
 }
 
+TEST(CheckedWritesIntents, SendAndWaitReturnsATimeoutCompletionRegression) {
+    Rig r(invokerCfg(4635, 4636));
+    r.gw.idempotence = true;
+    r.connect();
+    rc::Producer p = r.client->producer(cfgOf(Acks::All | Acks::View));
+    const TopicHandle topic = r.client->topic("t");
+    ASSERT_TRUE(r.drive([&] { return p.producerId() >= 0; }));
+
+    // The gateway is not pumped: the produce is never answered.
+    rc::Completion c;
+    ASSERT_NO_THROW(c = p.sendAndWait(topic, Key(uint64_t{1}), kVal, WriteIntent::Insert, std::chrono::milliseconds(300)));
+    EXPECT_EQ(c.status, OpStatus::Timeout);
+}
+
 TEST(CheckedWritesIntents, DefineSendsKeyFeaturesOnlyWhenSet) {
     namespace pc = rune::protocol::client;
     const auto defineWith = [](int32_t brokerVersion, int32_t in, rc::TopicOptions topic,
