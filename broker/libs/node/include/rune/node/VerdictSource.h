@@ -262,8 +262,9 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
         Member& m = members_[i];
         m.inst->foldCursor = std::max(m.inst->foldCursor, logStart_);
         if (m.inst->foldCursor >= judgeCursor_) continue;
-        // Read to the pass bound, not judgeCursor_: a compacted gap ending at judgeCursor_ reads empty below it.
-        const rune::storage::LogReadView v = readRange(m.inst->foldCursor, bound);
+        // Read past judgeCursor_ and to the committed bound: a read stops at the next segment base at or above its end,
+        // so a compacted gap ending at judgeCursor_ (or, after activation above a lagging bound, at the bound) reads empty.
+        const rune::storage::LogReadView v = readRange(m.inst->foldCursor, std::max(bound, judgeCursor_ + 1));
         if (!v.empty()) work += replay_(m, v, judgeCursor_, aborted);
     }
     bool behind = false;

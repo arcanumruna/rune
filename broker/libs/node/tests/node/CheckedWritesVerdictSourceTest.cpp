@@ -817,3 +817,78 @@ TEST(CheckedWritesVerdictSourceRegression, RebuildAcrossACompactionGapBeforeTheM
     EXPECT_TRUE(x.has(2));   // from 4
     EXPECT_TRUE(x.has(3));
 }
+
+// A new leader activates at the coverage K of a marker its scan read above its lagging HW, so judgeCursor_ > bound (here
+// an open transaction starting at 3 holds the LSO at W = 3).  The rejected record 2 was compacted at the end of its
+// segment and the next segment starts at 3 = bound: a member read that stops at the bound is empty until the LSO moves,
+// so the member's catch-up must read past judgeCursor_ as it did before the bound fix.
+TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastTheJudgeCursorAboveTheBoundRegression) {
+    TmpDir dir("cw-judge-above-bound");
+    rune::storage::Log log(dir.path.string(), /*segmentBytes=*/1);   // one batch per segment
+    log.recover();
+    Member x(7, tagEquals(9));
+    const auto put = [&](std::vector<uint8_t> b, int64_t base, int64_t count) {
+        for (int i = 0; i < 8; ++i) b[std::size_t(i)] = uint8_t(uint64_t(base) >> (8 * i));
+        log.append(b, base + count - 1);
+    };
+    const auto data = [&](int64_t base, const std::vector<Rec>& recs) {
+        Log b;
+        b.next = base;
+        b.data(recs);
+        put(b.bytes, base, int64_t(recs.size()));
+    };
+    const auto marker = [&](int64_t at, int64_t from, int64_t through, std::span<const cr::MarkerEntry> entries) {
+        std::vector<uint8_t> m(cr::markerBatchBytes(entries.size()));
+        (void)cr::buildVerdictMarker(m, cr::MarkerHeader{from, through, 1, uint32_t(entries.size())}, entries);
+        put(m, at, 1);
+    };
+    std::vector<uint8_t> change(cr::changeBatchBytes(1));
+    const cr::ChangeMember cm{x.objectId, uint8_t(VerdictViewKind::TestReject), x.rule.fingerprint()};
+    (void)cr::buildConstraintSetChange(change, 1, std::span<const cr::ChangeMember>(&cm, 1));
+    put(change, 0, 1);                                                  // 0: the set {x}
+    data(1, {{1, 1}});                                                  // 1
+    data(2, {{2, 9}});                                                  // 2: rejected, compacted away
+    data(3, {{3, 1}});                                                  // 3: the open transaction's first record
+    const cr::MarkerEntry rejected{1, kViolation, rune::view::constraintIdOf(x.objectId, 1)};   // 2, from 1
+    marker(4, 1, 3, std::span<const cr::MarkerEntry>(&rejected, 1));     // 4: committed, W = 3
+    data(5, {{4, 1}});                                                  // 5
+    marker(6, 3, 6, {});                                                // 6: above the HW, K = 6
+    data(7, {{5, 1}});                                                  // 7: the active segment
+    rune::storage::LogCleaner cleaner;
+    cleaner.setVerdictBounds(3, 5);
+    cleaner.clean(log, 0, log.segmentBaseOffsets().back(), 0, 1'000'000);
+    log.reloadSegments();
+    std::vector<uint8_t> scratch(1 << 20);
+    const auto readRange = [&](int64_t from, int64_t to) {   // the worker's readNoFault_
+        rune::storage::ReadIntoStatus rs;
+        return log.readInto(from, 1 << 16, scratch.data(), scratch.size(), rs, to);
+    };
+    ASSERT_TRUE(readRange(2, 3).empty());   // the gap: the next segment starts at the bound
+    ASSERT_FALSE(readRange(2, 6).empty());
+
+    PartitionWriteState st;
+    verdictFeedBegin(&st, 0, 0);   // the new leader's scan, to its LEO
+    for (int64_t o = 0; o < log.logEndOffset(); ++o) {
+        const auto b = log.read(o, 1 << 20);
+        if (b.empty()) continue;
+        rune::protocol::RecordBatchReader r(b.data(), b.size());
+        if (r.baseOffset() != o) continue;
+        verdictFeedBatch(&st, b.data(), std::size_t(r.totalLength()), o);
+    }
+    st.scanHw = 5;
+    verdictOnHw(st, 5);
+    ASSERT_EQ(st.markers.committedThrough(), 3);
+    ASSERT_EQ(st.rejected.coveredThrough(), 6);
+
+    VerdictSource vs{5, 0};
+    vs.installTestVerdictViewForTest(x.inst.get(), x.objectId, x.rule);
+    vs.bindState(&st);
+    vs.bindLeader(nullptr, 1, log.logStartOffset());
+    for (int i = 0; i < 6; ++i) (void)vs.driveJudge(readRange, /*bound=*/3, 0, st);
+    EXPECT_EQ(vs.judgedThrough(), 6);
+    EXPECT_EQ(x.inst->foldCursor, 6);
+    EXPECT_TRUE(x.has(1));
+    EXPECT_FALSE(x.has(2));
+    EXPECT_TRUE(x.has(3));
+    EXPECT_TRUE(x.has(4));
+}
