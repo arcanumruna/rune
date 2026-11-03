@@ -12,6 +12,9 @@
 // thread IS the polling thread (single-owner contract).  The only cross-thread
 // memory is the ring's own.
 //
+// A poll()/waitFor() handler may issue the next op.  The credit of a ring record is returned when the read ends (the
+// ring head moves then), so while the handler runs reserve() may answer QueueFull ("poll() first" still applies).
+//
 // Two forms:
 //   * Completions(cfg): standalone (C1) — no Client; the duty side reaches the
 //     ring via ring() (tests, custom producers).
@@ -222,7 +225,10 @@ public:
     /// h(const Completion&, std::span<const uint8_t> payload) — the span is
     /// valid only during h.  Completions stashed by waitFor() come first (they
     /// were read from the ring before anything still in it).  Returns the
-    /// number delivered.
+    /// number delivered.  h may issue ops (reserve + hand to the duty side).
+    /// While h runs, the credit of the ring record being handled is not yet
+    /// returned (the ring head moves when the read ends), so reserve() may
+    /// answer QueueFull until poll() returns; it is returned even if h throws.
     template <class H>
     int poll(H&& h, int limit = INT_MAX) {
         int n = 0;
@@ -241,9 +247,11 @@ public:
         }
         if (stashHead_ == stashTail_) stashHead_ = stashTail_ = 0;
         if (stashLive_ != 0 || n >= limit) return n;
+        // The credit of a ring record is returned only after the read ends (the ring head moves then, also on unwind).
+        DeferredCredit deferred{*this};
         n += ring_->read(
-            [this, &h](const Completion& c, std::span<const uint8_t> payload) {
-                consumeCredit_(c);
+            [&deferred, &h](const Completion& c, std::span<const uint8_t> payload) {
+                deferred.add(c);
                 h(c, payload);
             },
             limit - n);
@@ -264,7 +272,8 @@ public:
     /// runner progresses by itself).  The pump is never called once the
     /// producer side has closed (its owner may be gone).  A TimedOut wait only
     /// stops waiting: the op will still complete and must still be polled.
-    /// onDone(const Completion&, std::span<const uint8_t>) runs on this thread.
+    /// onDone(const Completion&, std::span<const uint8_t>) runs on this thread;
+    /// like poll()'s handler it may issue ops, with the same deferred credit.
     template <class H, class Pump = NoPump, class Idle = DefaultWaitIdle>
     Wait waitFor(Token t, std::chrono::nanoseconds timeout, H&& onDone, Pump&& pump = Pump{},
                  Idle&& idle = Idle{}) {
@@ -274,19 +283,21 @@ public:
             const bool closedBefore = ring_->producerClosed();
             int work = closedBefore ? 0 : pump();
             bool done = false;
+            DeferredCredit deferred{*this};
             work += ring_->read(
                 [&](const Completion& c, std::span<const uint8_t> payload) {
                     // Review m6: a BatchAck's token field packs (topic, partition),
                     // never an app token — never taken for one.
                     if (!done && c.token == t && c.op != OpKind::BatchAck) {
                         done = true;
-                        consumeCredit_(c);
+                        deferred.add(c);
                         onDone(c, payload);
                     } else {
                         pushStash_(c, payload);
                     }
                 },
                 INT_MAX);
+            deferred.apply();
             if (done) return Wait::Done;
             if (closedBefore && ring_->empty()) return Wait::NotPending;
             if (now_() >= deadline) return Wait::TimedOut;
@@ -366,13 +377,39 @@ private:
             .count();
     }
 
+    // C6: one BatchAck record returns the credit of every record of its
+    // batch (reservedBytes / kBatchAckUnitBytes reservations; EOS-OOS:
+    // reserved0 carries the batch's producerEpoch).
+    static uint32_t unitsOf_(const Completion& c) noexcept {
+        return (c.op == OpKind::BatchAck) ? batchAckUnits(c) : 1u;
+    }
+
+    // Immediate return of a record's credit: only for a stash entry (not ring space).
     void consumeCredit_(const Completion& c) noexcept {
         reservedTotal_ -= c.reservedBytes;
-        // C6: one BatchAck record returns the credit of every record of its
-        // batch (reservedBytes / kBatchAckUnitBytes reservations; EOS-OOS:
-        // reserved0 carries the batch's producerEpoch).
-        outstanding_ -= (c.op == OpKind::BatchAck) ? batchAckUnits(c) : 1u;
+        outstanding_ -= unitsOf_(c);
     }
+
+    // Credit of records handed over inside one ring read.  OneToOneRingBuffer::read moves the consumer head only after
+    // the whole read (also when the handler throws), so the credit is applied by the destructor, after the read.
+    struct DeferredCredit {
+        Completions& cq;
+        uint32_t     bytes = 0;
+        uint32_t     units = 0;
+        explicit DeferredCredit(Completions& q) noexcept : cq(q) {}
+        DeferredCredit(const DeferredCredit&)            = delete;
+        DeferredCredit& operator=(const DeferredCredit&) = delete;
+        ~DeferredCredit() { apply(); }
+        void add(const Completion& c) noexcept {
+            bytes += c.reservedBytes;
+            units += unitsOf_(c);
+        }
+        void apply() noexcept {
+            cq.reservedTotal_ -= bytes;
+            cq.outstanding_   -= units;
+            bytes = units = 0;
+        }
+    };
 
     // Copy a completion read from the ring into the stash (FIFO).  The stash is
     // as large as the ring and holds only records that were in the ring, each

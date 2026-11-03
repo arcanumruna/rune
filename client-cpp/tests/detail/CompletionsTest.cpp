@@ -16,6 +16,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -712,10 +713,10 @@ TEST(CompletionsAdversarialRegression, WaitForStashesLargeRecordsOutOfOrderAdver
 // pipelined loop.  The credit of a completion returns the moment its handler runs, but the ring's head only moves when the
 // whole read batch ends, so a duty thread that delivers the new op's completion inside that window meets a ring fuller than
 // the credit says.  Here the "duty side" delivers inside the handler (what a fast duty thread does in Thread mode).
-// URGENT break found by the batch 1 adversarial pass (lost completion -> its op never completes): Completions::poll and
-// waitFor return a record's credit inside the ring read, before OneToOneRingBuffer::read publishes the head.  DISABLED until
-// that fix lands; the fix enables it.
-TEST(CompletionsAdversarialRegression, DISABLED_PollHandlerThatReissuesNeverLosesACompletionAdversarialRegression) {
+// URGENT break found by the batch 1 adversarial pass (lost completion -> its op never completes): poll and waitFor used
+// to return a record's credit inside the ring read, before OneToOneRingBuffer::read publishes the head.  The credit is
+// now applied after the read.
+TEST(CompletionsAdversarialRegression, PollHandlerThatReissuesNeverLosesACompletionAdversarialRegression) {
     Completions cq(smallCfg(1024, 88, 64));   // M = 136: 18 outstanding 48-byte ops fill the credit
     Token next = 0;
     std::vector<int> times(64, 0);
@@ -733,4 +734,60 @@ TEST(CompletionsAdversarialRegression, DISABLED_PollHandlerThatReissuesNeverLose
     EXPECT_EQ(cq.ring().lostCompletions(), 0u) << "a reserved completion was refused by the ring: it is lost, its op never completes";
     for (Token t = 0; t < next; ++t) EXPECT_EQ(times[t], 1) << "token " << t;
     EXPECT_EQ(cq.outstanding(), 0u) << "a lost completion leaves its op outstanding forever";
+}
+
+// Same window through waitFor(): the matching record's onDone reissues while the ring is full of other completions.
+TEST(CompletionsAdversarialRegression, WaitForHandlerThatReissuesNeverLosesACompletionAdversarialRegression) {
+    Completions cq(smallCfg(1024, 88, 64));
+    Token next = 0;
+    std::vector<int> times(64, 0);
+    while (cq.reserve(48) == OpResult::Accepted) ASSERT_TRUE(deliver(cq, next++, 48, 0));
+    ASSERT_EQ(next, 18u);
+    std::function<void(const Completion&, std::span<const uint8_t>)> onDone;
+    uint32_t reservedBeforeWait = 0;
+    onDone = [&](const Completion& c, std::span<const uint8_t>) {
+        ++times[c.token];
+        // The handled record is still in the ring (its head moves after the read): its credit is not back yet.
+        // (Only token 0 comes from the ring; the rest are taken from the stash, whose credit is returned at once.)
+        if (c.token == 0) EXPECT_EQ(cq.reservedBytes(), reservedBeforeWait);
+        if (next < times.size() && cq.reserve(48) == OpResult::Accepted) {
+            (void)deliver(cq, next++, 48, 0);
+            reservedBeforeWait += 48;
+        }
+    };
+    Token want = 0;
+    for (int step = 0; step < 1000 && want < times.size(); ++step) {
+        if (want >= next) break;
+        reservedBeforeWait = cq.reservedBytes();
+        ASSERT_EQ(cq.waitFor(want, 0ns, onDone), Completions::Wait::Done) << "token " << want;
+        ++want;
+    }
+    while (cq.poll(onDone) > 0) {}
+    EXPECT_EQ(cq.ring().lostCompletions(), 0u) << "a reserved completion was refused by the ring";
+    for (Token t = 0; t < next; ++t) EXPECT_EQ(times[t], 1) << "token " << t;
+    EXPECT_EQ(next, times.size());
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+}
+
+// A handler that throws still gets the credit of every record already handed over (the ring head advances on unwind).
+TEST(CompletionsAdversarialRegression, PollHandlerThatThrowsStillReturnsTheCreditRegression) {
+    Completions cq(smallCfg(1024, 88, 64));
+    Token next = 0;
+    while (cq.reserve(48) == OpResult::Accepted) ASSERT_TRUE(deliver(cq, next++, 48, 0));
+    const uint32_t total = next;
+    ASSERT_EQ(total, 18u);
+    const uint32_t resv0 = cq.reservedBytes();
+    ASSERT_EQ(cq.outstanding(), total);
+    int seen = 0;
+    const int k = 5;
+    EXPECT_THROW(cq.poll([&](const Completion&, std::span<const uint8_t>) {
+        if (++seen == k) throw std::runtime_error("handler");
+    }), std::runtime_error);
+    EXPECT_EQ(seen, k);
+    EXPECT_EQ(cq.outstanding(), total - k);
+    EXPECT_EQ(cq.reservedBytes(), resv0 - k * 48u);
+    while (cq.poll([](const Completion&, std::span<const uint8_t>) {}) > 0) {}
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
 }
