@@ -590,10 +590,7 @@ static void BM_ViewFoldReplace(benchmark::State& st) {
         }
         rune::view::FoldSkip skip;
         if (txn) {
-            skip.aborted.ctx = &aborted;
-            skip.aborted.fn  = [](const void* ctx, int64_t pid, int64_t base) noexcept {
-                return static_cast<const rune::transaction::AbortedTxnIndex*>(ctx)->isAborted(pid, base);
-            };
+            skip.aborted.index = &aborted;
         }
 
         auto foldOne = [&](size_t i) {

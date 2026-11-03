@@ -249,53 +249,6 @@ void LsoTracker::clear() noexcept
 }
 
 // ===========================================================================
-// AbortedTxnIndex
-// ===========================================================================
-
-void AbortedTxnIndex::onAbortMarker(ProducerId producerId,
-                                     int64_t    firstDataOffset,
-                                     int64_t    abortMarkerOffset)
-{
-    const AbortedTxnRange range{producerId, firstDataOffset, abortMarkerOffset};
-    if (ranges_.size() == ranges_.capacity()) [[unlikely]] ++growths_;   // cold growth (counted)
-    const int64_t span = abortMarkerOffset - firstDataOffset;
-    if (span > maxSpan_) maxSpan_ = span;
-    if (ranges_.empty() || ranges_.back().lastOffset <= abortMarkerOffset) [[likely]] {
-        ranges_.push_back(range);                      // marker order (L1): O(1)
-        return;
-    }
-    // Out of order (cold): keep lastOffset order.
-    auto it = std::upper_bound(ranges_.begin(), ranges_.end(), abortMarkerOffset,
-                               [](int64_t off, const AbortedTxnRange& r) { return off < r.lastOffset; });
-    ranges_.insert(it, range);
-}
-
-bool AbortedTxnIndex::isAborted(ProducerId producerId,
-                                  int64_t    batchBaseOffset) const noexcept
-{
-    if (ranges_.empty()) return false;
-    auto it = std::lower_bound(ranges_.begin(), ranges_.end(), batchBaseOffset,
-                               [](const AbortedTxnRange& r, int64_t off) { return r.lastOffset < off; });
-    const int64_t scanEnd = batchBaseOffset > std::numeric_limits<int64_t>::max() - maxSpan_
-                                ? std::numeric_limits<int64_t>::max() : batchBaseOffset + maxSpan_;
-    for (; it != ranges_.end() && it->lastOffset <= scanEnd; ++it) {
-        if (it->producerId == producerId && it->contains(batchBaseOffset)) return true;
-    }
-    return false;
-}
-
-void AbortedTxnIndex::pruneBelow(int64_t logStartOffset)
-{
-    auto it = std::lower_bound(ranges_.begin(), ranges_.end(), logStartOffset,
-                               [](const AbortedTxnRange& r, int64_t off) { return r.lastOffset < off; });
-    if (it == ranges_.begin()) return;
-    ranges_.erase(ranges_.begin(), it);   // cold (retention); capacity kept
-    int64_t span = 0;
-    for (const auto& r : ranges_) span = std::max(span, r.lastOffset - r.firstOffset);
-    maxSpan_ = span;
-}
-
-// ===========================================================================
 // RcBuilder — step (F15 §2.3, N2 + N3)
 // ===========================================================================
 

@@ -13,7 +13,9 @@ target_include_directories(rune_view PUBLIC
     ${RUNE_PROTOCOL_INCLUDE}
     # ViewFold.h consumes rune::storage::LogReadView (a header-only struct;
     # no link against rune_storage's heavy deps -- aeron et al -- needed).
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../storage/include>)
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../storage/include>
+    # FoldSkip.h consumes the header-only rune/transaction/AbortedTxnIndex.h (#591); no link against rune_transaction.
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../transaction/include>)
 target_link_libraries(rune_view PUBLIC rune_codec)
 
 if(BUILD_TESTING)

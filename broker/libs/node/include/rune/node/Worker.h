@@ -7048,12 +7048,7 @@ private:
     // #537: the fold's aborted-transaction predicate over THIS worker's RC state of
     // the source partition (owner thread; the index is read in place, never copied).
     [[nodiscard]] static rune::view::AbortedTxnFilter rcAbortedFilter_(const RcState& rc) noexcept {
-        rune::view::AbortedTxnFilter f;
-        f.ctx = &rc.aborted();
-        f.fn  = [](const void* ctx, int64_t pid, int64_t base) noexcept {
-            return static_cast<const rune::transaction::AbortedTxnIndex*>(ctx)->isAborted(pid, base);
-        };
-        return f;
+        return rune::view::AbortedTxnFilter{&rc.aborted()};
     }
 
     // One owned source partition's view work.  Order matters: materialize a
