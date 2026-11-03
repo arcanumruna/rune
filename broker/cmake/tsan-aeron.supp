@@ -104,3 +104,10 @@ race:aeron_mpsc_rb_
 # bare `poll<...>` without the aeron:: prefix, so the names above miss them; match by the file instead (only
 # headers inside the Aeron conan package).
 race:*.conan2/*aeron*/include/*
+
+# The C client's async add allocates its command (aeron_alloc's memset, on the caller's thread) and the client
+# conductor frees it (aeron_free) once it has applied it, ordered by the same MPSC command queue as above.  The pinned
+# Aeron build inlines aeron_client_conductor_async_add_* into Aeron::addSubscription, so that entry no longer matches
+# (TSan CI: BrokerNodeTest.*, AuthEnforcementRegression.*, ...: 407 reports, every one in aeron_alloc.c).  Aeron's own
+# allocator file only: its frames appear only when Aeron allocates or frees its own memory.
+race:aeron_alloc.c
