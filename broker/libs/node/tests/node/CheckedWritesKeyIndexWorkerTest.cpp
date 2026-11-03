@@ -737,6 +737,46 @@ TEST(CheckedWritesKeyIndexRegression, ReincarnationDropsTheJudgeAndItsKeyIndexRe
     EXPECT_EQ(r.vs->nsSlotMismatchesForTest(), 0u);
 }
 
+// Final re-review N1: two owned replicas may share a (topic, partition); the judge binds to whichever state called it last.  The
+// replica that leaves must not take the judge with it while a surviving state is bound to it.
+TEST(CheckedWritesKeyIndexRegression, DroppedStateDoesNotTakeAJudgeBoundToASurvivorRegression) {
+    VerdictRig r;
+    r.createKeyIndex();
+    r.enableAcks();
+    r.passes(60);
+    ASSERT_NE(r.writeState(), nullptr);
+
+    const auto logDir = rigTmpPath("log2");
+    rune::storage::Log log2(logDir.string(), 64LL * 1024 * 1024);
+    log2.recover();
+    NullPartitionTransport transport2;
+    const std::vector<rune::replication::NodeId> isr{1};
+    rune::replication::PartitionConfig c{};
+    c.topicId = VerdictRig::kSrc; c.partitionId = 0; c.selfId = 1;
+    c.replicaLagMaxMs = 1'000'000; c.replicaLagMaxOffset = 1'000'000;
+    c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL;
+    c.maxFetchBytes = 1 << 20; c.pushOnAppend = false;
+    rune::replication::PartitionReplica second(c, rune::replication::Role::Leader, 1, isr, isr, &log2, &transport2);
+
+    r.worker->setOwnedDirect(Worker::OwnedSet{r.replica.get(), &second});
+    r.passes(60);
+    ASSERT_EQ(r.vs->verdictSourceKeysForTest().size(), 1u);
+    const VerdictSource* judge = r.vs->verdictSource(VerdictRig::kSrc, 0);
+    ASSERT_NE(judge, nullptr);
+    ASSERT_NE(judge->boundState(), nullptr);
+
+    r.worker->setOwnedDirect(Worker::OwnedSet{&second});
+    const PartitionWriteState* survivor = r.writeState();
+    ASSERT_NE(survivor, nullptr);
+    ASSERT_NE(r.vs->verdictSource(VerdictRig::kSrc, 0), nullptr) << "the judge was dropped while a surviving state is bound to it";
+    EXPECT_EQ(r.vs->verdictSource(VerdictRig::kSrc, 0)->boundState(), survivor);
+    EXPECT_EQ(survivor->verdicts, r.vs->verdictSource(VerdictRig::kSrc, 0));
+
+    r.worker->setOwnedDirect(Worker::OwnedSet{});
+    std::error_code ec;
+    std::filesystem::remove_all(logDir, ec);
+}
+
 // ---- the key-width sweep: the key index judges by the exact bytes of the wire key, at every width the DDL allows (SD8) ----
 namespace {
 struct WidthCase { const char* name; KeyShape shape; };
