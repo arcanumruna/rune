@@ -636,6 +636,58 @@ TEST(CheckedWritesVerdictRestartRegression, DiscardedVerdictMemberOverATrimmedLo
     EXPECT_TRUE(r.hasRow(kRej, 8));
 }
 
+// P4-4 over a retention-trimmed source log: the member's checkpoint is ahead of the local markers (the crash lost the last one) and
+// the early records are gone.  The pre-discard rows are backed up exactly once (knob on) or not at all (knob off); the live member
+// refolds from the current log start and re-judges the survivors.
+namespace {
+void ahead_of_markers_over_a_trimmed_log(bool backupsOn) {
+    VerdictRig r(false, /*rollBytes=*/1);   // one batch per segment
+    r.backupPolicy = ViewBackupPolicy{backupsOn, 3};
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    const int64_t o1 = r.leo();
+    ASSERT_EQ(r.produce({{1, 10, 0}}), 0);
+    r.passes(300);
+    r.installRejectView(0x40000605, 8, tagRule(8), "rej8");   // not persisted: the source logs a second set change C2 above o1
+    r.passes(50);
+    const int64_t c2 = r.readLog().changes.back().offset;
+    ASSERT_GT(c2, o1);
+    ASSERT_EQ(r.produce({{2, 20, 0}, {3, 30, 9}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    const std::vector<uint8_t> committed = slurp(committedFile(r, kRej));
+    ASSERT_FALSE(committed.empty());
+    (void)r.log->deleteOldSegments(0, c2);   // retention up to C2
+    ASSERT_GT(r.log->logStartOffset(), o1);
+    ASSERT_LE(r.log->logStartOffset(), c2);
+    r.restart(true, r.leo() - 1);            // the crash loses the last marker: the checkpoint is ahead of the local markers
+    r.passes(500);
+    ASSERT_NE(r.stats(), nullptr);
+    EXPECT_EQ(r.stats()->verdictCheckpointsDiscarded, 1u);
+    EXPECT_FALSE(r.hasRow(kRej, 1)) << "refolded from the trimmed log start: id 1's record is gone";
+    EXPECT_TRUE(r.hasRow(kRej, 2));
+    EXPECT_FALSE(r.hasRow(kRej, 3)) << "re-judged";
+    const auto backups = listViewBackups(r.snapDir(), kRej, 0);
+    if (backupsOn) {
+        ASSERT_EQ(backups.size(), 1u) << "exactly one backup per discard";
+        EXPECT_NE(backups[0].find(".ahead-of-verdicts.delta"), std::string::npos) << backups[0];
+        EXPECT_EQ(slurp(backups[0]), committed) << "the pre-discard rows, byte for byte";
+    } else {
+        EXPECT_TRUE(backups.empty());
+        EXPECT_FALSE(std::filesystem::exists(viewBackupDir(r.snapDir())));
+    }
+}
+}  // namespace
+
+TEST(CheckedWritesVerdictRestartRegression, DiscardedVerdictMemberAheadOfMarkersOverATrimmedLogIsBackedUpThenRefoldedRegression) {
+    ahead_of_markers_over_a_trimmed_log(/*backupsOn=*/true);
+}
+
+TEST(CheckedWritesVerdictRestartRegression, DiscardedVerdictMemberAheadOfMarkersOverATrimmedLogWithBackupOffKeepsNoBackupRegression) {
+    ahead_of_markers_over_a_trimmed_log(/*backupsOn=*/false);
+}
+
 // V5: when the backup cannot be made, nothing is rebuilt over the unsaved checkpoint: the member stays unsettled and the judge
 // does not pass it (no verdicts, no markers) for the rest of the boot.
 TEST(CheckedWritesVerdictRestartRegression, BackupFailureKeepsTheVerdictMemberUnjudgedRegression) {
