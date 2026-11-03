@@ -122,7 +122,7 @@ public:
         rebuildWriters_(-1);
     }
 
-    [[nodiscard]] std::string keyIndexTally() const { return std::to_string(pinned56_) + " KeyExists and " + std::to_string(pinned57_) + " KeyNotFound pinned to their record, " + std::to_string(provenCompacted_) + " rejections proven compacted away, " + std::to_string(unjudgedInCrash_) + " rejections answered during a crash and not judged, " + std::to_string(sent_.size()) + " writes"; }
+    [[nodiscard]] std::string keyIndexTally() const { return std::to_string(pinned56_) + " KeyExists and " + std::to_string(pinned57_) + " KeyNotFound pinned to their record, " + std::to_string(provenCompacted_) + " rejections proven compacted away, " + std::to_string(sent_.size()) + " writes"; }
 
     /// One seeded action.
     void step() {
@@ -131,7 +131,7 @@ public:
         if (r < 55) {
             sendBurst_(-1);
         } else if (r < 65 && down == 0) {
-            crashLeaderDuringSends_();
+            crashLeaderDuringSends();
         } else if (r < 80) {
             if (down != 0) restartNode_(down, false);
             else restartNonLeader_();
@@ -141,6 +141,15 @@ public:
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(50 + static_cast<int>(rng_() % 150)));
         }
+    }
+
+    /// Crashes a random partition's leader in the middle of a burst of writes.
+    void crashLeaderDuringSends() {
+        const int32_t victim = partitionLeader_(randomPart_());
+        if (victim <= 0) return;
+        ++crashes_;
+        sendBurst_(victim);
+        writersStale_ = true;
     }
 
     /// Every node back, one leader per partition, every replica caught up and the judge past every record.
@@ -228,6 +237,8 @@ public:
         return out;
     }
     [[nodiscard]] int32_t topicId() const noexcept { return topicId_; }
+    /// Key-index mode: `fn` sees every write just before it is sent, and may throw in its place.
+    void setKiSendHookForTest(std::function<void(const Sent&)> fn) { kiSendHook_ = std::move(fn); }
     /// Holds (or lets go) every leadership scan on node `id`: its RC build sees nothing resident, so a partition it leads stays
     /// unjudged and its index empty.
     void holdLeadershipScan(int id, bool hold) {
@@ -482,13 +493,13 @@ private:
         Writer& w = *writers_[rng_() % writers_.size()];
         const int n = 1 + static_cast<int>(rng_() % 80);
         std::vector<std::pair<uint64_t, std::size_t>> toks;
-        std::thread killer;
+        std::jthread killer;   // joined on unwind too: a send that throws mid-crash must not destroy it joinable
         for (int i = 0; i < n; ++i) {
             Sent s;
             s.id = 1 + rng_() % keys_;
             s.tag = (rng_() % 100) < 20 ? 9 : static_cast<uint8_t>(1 + rng_() % 3);
             s.v = ++vSeq_;
-            if (victim > 0 && i == n / 2) { checkCounters_(victim); killer = std::thread([this, victim] { c_.crash(victim); }); }
+            if (victim > 0 && i == n / 2) { checkCounters_(victim); killer = std::jthread([this, victim] { c_.crash(victim); }); }
             toks.emplace_back(w.send(s.id, value_(s.id, s.v, s.tag)), sent_.size());
             sent_.push_back(s);
         }
@@ -506,7 +517,7 @@ private:
     void kiBurst_(int victim) {
         KiWriter& w = *kiWriters_[rng_() % kiWriters_.size()];
         const int n = 1 + static_cast<int>(rng_() % 6);
-        std::thread killer;
+        std::jthread killer;   // joined on unwind too: a send that throws mid-crash must not destroy it joinable
         for (int i = 0; i < n && !::testing::Test::HasFatalFailure(); ++i) {
             Sent s;
             s.id = 1 + rng_() % keys_;
@@ -515,11 +526,12 @@ private:
             s.part = static_cast<int>(rune::client::Key(s.id).partition(parts_));
             s.windowKnown = !killer.joinable() && (victim <= 0 || i < n / 2);
             if (s.windowKnown) s.hwBefore = highWatermark_(s.part);
-            if (victim > 0 && i == n / 2) { checkCounters_(victim); killer = std::thread([this, victim] { c_.crash(victim); }); }
+            if (victim > 0 && i == n / 2) { checkCounters_(victim); killer = std::jthread([this, victim] { c_.crash(victim); }); }
             kiSend_(w, &s);
-            // A node going down cannot be asked for its high watermark: a rejection answered then has no window to be proven by.
+            // A node going down cannot be asked for its high watermark: a rejected removeExisting, found only by its window, is not
+            // judged.  An insert or update is found by its token, and a 56 / 57 answers a committed record, which survives the crash.
             if (s.windowKnown) s.hwAfter = highWatermark_(s.part);
-            else if (s.result == Sent::Result::Violation) { s.result = Sent::Result::Unknown; ++unjudgedInCrash_; }
+            else if (s.result == Sent::Result::Violation && s.op == Op::RemoveExisting) s.result = Sent::Result::Unknown;
 
             if (s.result == Sent::Result::Unknown) writersStale_ = true;   // no answer: the write may or may not be in the log
             sent_.push_back(s);
@@ -529,6 +541,7 @@ private:
     }
     /// Sends `s` (its id and op) through `w`: its token is the new record's name, its result the answer.
     void kiSend_(KiWriter& w, Sent* s) {
+        if (kiSendHook_) kiSendHook_(*s);
         const rune::node::test::KiAccount rec{s->id, "n" + std::to_string(++vSeq_), vSeq_};
         if (s->op == Op::Insert || s->op == Op::Update) std::memcpy(&s->v, rec.name.data(), std::min<std::size_t>(rec.name.size(), sizeof(s->v)));
         const rune::client::WriteResult r = s->op == Op::Insert ? w.topic->insertAndWait(rec, 10s)
@@ -563,13 +576,6 @@ private:
             break;
         }
         ADD_FAILURE() << "seed " << seed_ << ": write of id " << s->id << " (op " << static_cast<int>(s->op) << ") came back with status " << static_cast<int>(r.status()) << " code " << r.code();
-    }
-    void crashLeaderDuringSends_() {
-        const int32_t victim = partitionLeader_(randomPart_());
-        if (victim <= 0) return;
-        ++crashes_;
-        sendBurst_(victim);
-        writersStale_ = true;
     }
     /// The highest high watermark any running node reports for the partition.
     int64_t highWatermark_(int part) {
@@ -641,6 +647,11 @@ private:
         if (!s.windowKnown) return false;
         for (int64_t o = s.hwBefore; o < s.hwAfter; ++o) if (seen_[static_cast<std::size_t>(s.part)].count(o) == 0) return true;
         return false;
+    }
+    /// Why windowHasGap_ proves nothing for `s`.
+    std::string windowProof_(const Sent& s) const {
+        if (!s.windowKnown) return "its window is unknown (answered while a node went down)";
+        return "its window [" + std::to_string(s.hwBefore) + ", " + std::to_string(s.hwAfter) + ") of partition " + std::to_string(s.part) + " has no unseen offset";
     }
     /// One past the last data record: what the judge and the committed markers must cover (a trailing change record needs no marker).
     static int64_t dataEnd_(const VerdictRig::RigLog& l) { return l.data.empty() ? 0 : l.data.back().offset + 1; }
@@ -832,8 +843,12 @@ private:
                 if (d.keyIndex_ && s.v == 0) continue;
                 if (s.result == Sent::Result::Ok && accepted.count(s.v) == 0) { *why = "v " + std::to_string(s.v) + " was acked Ok but no accepted record carries it"; return false; }
                 if (s.result == Sent::Result::Violation && rejected.count(s.v) == 0) {
-                    if (d.keyIndex_ && d.windowHasGap_(s)) continue;   // compacted away on every replica before a history read saw it
-                    *why = "v " + std::to_string(s.v) + " was acked as a violation but no rejected record carries it";
+                    if (!d.keyIndex_) { *why = "v " + std::to_string(s.v) + " was acked as a violation but no rejected record carries it"; return false; }
+                    bool carried = false;
+                    for (const auto& kv : d.data_[static_cast<std::size_t>(s.part)]) carried = carried || (!kv.second.del && kv.second.v == s.v);
+                    if (carried) { *why = "v " + std::to_string(s.v) + " was answered " + std::to_string(s.code) + " but the model accepted its record"; return false; }
+                    if (d.windowHasGap_(s)) continue;   // compacted away on every replica before a history read saw it
+                    *why = "v " + std::to_string(s.v) + " was answered " + std::to_string(s.code) + ", no record carries it and " + d.windowProof_(s);
                     return false;
                 }
             }
@@ -955,14 +970,18 @@ private:
                 const bool tombstone = s.op == Op::RemoveExisting || s.op == Op::Remove;
                 // The record: an Ok carries its offset; a rejection is found by its token, a rejected removeExisting among the
                 // tombstones of its id appended while the write was in flight (the writes are serialized).
-                std::vector<int64_t> candidates;
+                std::vector<int64_t> candidates, wrongIntent;
                 if (s.result == Sent::Result::Ok) candidates.push_back(s.offset);
-                else for (const auto& [off, rec] : data)
-                    if (rec.id == s.id && rec.del == tombstone && (tombstone ? off >= s.hwBefore && off < s.hwAfter && rec.intent == intentOf(s.op) : rec.v == s.v)) candidates.push_back(off);
+                else for (const auto& [off, rec] : data) {
+                    if (rec.id != s.id || rec.del != tombstone) continue;
+                    if (!tombstone) { if (rec.v == s.v) candidates.push_back(off); }
+                    else if (off >= s.hwBefore && off < s.hwAfter) (rec.intent == intentOf(s.op) ? candidates : wrongIntent).push_back(off);
+                }
                 if (candidates.empty()) {
                     if (s.result == Sent::Result::Ok) { *why = "the write of id " + std::to_string(s.id) + " acked at offset " + std::to_string(s.offset) + " has no record in the log"; return false; }
+                    if (!wrongIntent.empty()) { *why = "the removeExisting of id " + std::to_string(s.id) + " answered " + std::to_string(s.code) + " has no intent-2 tombstone in its window [" + std::to_string(s.hwBefore) + ", " + std::to_string(s.hwAfter) + ") of partition " + std::to_string(s.part) + ", but the tombstone at " + std::to_string(wrongIntent.front()) + " carries intent " + std::to_string(data.at(wrongIntent.front()).intent); return false; }
                     if (d.windowHasGap_(s)) { ++d.provenCompacted_; continue; }   // compacted away on every replica before a history read saw it
-                    *why = "the write of id " + std::to_string(s.id) + " answered " + std::to_string(s.code) + " has no record in the log, and its window [" + std::to_string(s.hwBefore) + ", " + std::to_string(s.hwAfter) + ") of partition " + std::to_string(s.part) + " has no gap";
+                    *why = "the write of id " + std::to_string(s.id) + " answered " + std::to_string(s.code) + " has no record in the log and " + d.windowProof_(s);
                     return false;
                 }
                 bool judged = false;
@@ -1014,10 +1033,11 @@ private:
     int64_t vSeq_ = 0;
     int crashes_ = 0, restarts_ = 0, bounces_ = 0;
     int keyExists_ = 0, keyNotFound_ = 0;   ///< answered 56 / 57 (key-index mode)
-    int pinned56_ = 0, pinned57_ = 0, provenCompacted_ = 0, unjudgedInCrash_ = 0;   ///< answers matched to their judged record / proven compacted away / answered during a crash
+    int pinned56_ = 0, pinned57_ = 0, provenCompacted_ = 0;   ///< answers matched to their judged record / proven compacted away
     bool writersStale_ = false;
     std::vector<std::unique_ptr<Writer>> writers_;
     std::vector<std::unique_ptr<KiWriter>> kiWriters_;
+    std::function<void(const Sent&)> kiSendHook_;
     std::vector<Sent> sent_;
     std::vector<std::set<int64_t>> seen_;   ///< per partition: every offset any replica showed as a data record, change record or marker
     std::vector<std::map<int64_t, VerdictRig::RigLogRec>> data_;   ///< per partition

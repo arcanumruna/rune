@@ -132,7 +132,7 @@ TEST(CheckedWritesStressHistory, CheckAllWaitsForTheNewLeadersScanRegression) {
     };
     for (int i = 0; i < 4000 && !compacted(); i += 50)
         for (int j = 0; j < 50; ++j) ASSERT_EQ(d.kiWrite(Op::Insert, a).result, Result::Violation);
-    for (int poll = 0; poll < 600 && !compacted(); ++poll) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (int poll = 0; poll < 100 && !compacted(); ++poll) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     ASSERT_TRUE(compacted()) << "the leader never compacted the rejected insert (" << dup.hwBefore << ", " << dup.hwAfter << ")";
     d.quiesce();
     ASSERT_FALSE(HasFatalFailure());
@@ -140,8 +140,9 @@ TEST(CheckedWritesStressHistory, CheckAllWaitsForTheNewLeadersScanRegression) {
     const std::size_t at = static_cast<std::size_t>(part);
     const auto leads = [&](auto pred) {
         std::vector<int32_t> leaders;
-        for (int poll = 0; poll < 300; ++poll, std::this_thread::sleep_for(std::chrono::milliseconds(100)))
-            if (tcc::awaitLeaders(cluster, d.topicId(), CheckedWritesStressDriver::kKiParts, leaders, std::chrono::seconds(1)) && pred(leaders[at])) return leaders[at];
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (int poll = 0; poll < 100 && std::chrono::steady_clock::now() < deadline; ++poll, std::this_thread::sleep_for(std::chrono::milliseconds(100)))
+            if (tcc::awaitLeaders(cluster, d.topicId(), CheckedWritesStressDriver::kKiParts, leaders, std::chrono::milliseconds(100)) && pred(leaders[at])) return leaders[at];
         return -1;
     };
     const int lead = leads([](int32_t) { return true; });
@@ -156,11 +157,25 @@ TEST(CheckedWritesStressHistory, CheckAllWaitsForTheNewLeadersScanRegression) {
     for (const int id : cluster.runningNodes()) cluster.node(id).setControllerDecisionHoldForTest(false);
     ASSERT_EQ(leads([&](int32_t l) { return l == lead; }), lead) << "node " << lead << " never took partition " << part << " back";
     ASSERT_NE(d.rcStatus(lead, part), rune::node::Worker::kRcReady) << "the leadership scan finished before it was held";
-    std::thread release([&] {
+    std::jthread release([&] {
         std::this_thread::sleep_for(std::chrono::seconds(3));
         d.holdLeadershipScan(lead, false);
     });
     std::string failed;
     EXPECT_TRUE(d.checkAll(&failed)) << failed;
     release.join();
+}
+
+// A send that threw while the killer thread was crashing the leader destroyed that thread joinable: std::terminate (the key-index
+// stress's EXC_CRASH reports, from kiBurst_).  The exception reaches the caller, and the crash has finished.
+TEST(CheckedWritesStressHistory, SendThrowingDuringALeaderCrashReachesTheCallerRegression) {
+    ThreeNodes cluster = ThreeNodes::startWith("cw05_send_throws", [](rune::node::NodeConfig& cfg) { cfg.verdictIntervalMs = 20; });
+    CheckedWritesStressDriver d(cluster, 1, true);
+    d.setUp();
+    ASSERT_FALSE(HasFatalFailure());
+    d.setKiSendHookForTest([](const CheckedWritesStressDriver::Sent& s) {
+        if (!s.windowKnown) throw std::runtime_error("send refused while the leader goes down");   // only a crash burst's sends from the killer on
+    });
+    EXPECT_THROW(d.crashLeaderDuringSends(), std::runtime_error);
+    EXPECT_EQ(cluster.runningNodes().size(), 2u);
 }
