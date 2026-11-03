@@ -1140,6 +1140,52 @@ TEST(AeronTransportRegression, ResponsePairSlotRetiresOnItsOwnReleaseRegression)
     t.stop();
 }
 
+// A response-control channel the driver refuses (an unparsable receive buffer size): the registration is Rejected.
+constexpr const char* kRefusedResponseChannel = "aeron:udp?control=127.0.0.1:9|control-mode=response|so-rcvbuf=abc";
+
+// #754: a sub slot is released by its INDEX through retireSubSlot_, never by position: the table is never shrunk, so
+// no other slot's index (respSeedSlot_, a PubSlot mode) can move or vanish.  The reachable cell is start(): a response
+// subscription the driver refuses is dropped and the declared path is used.
+TEST(AeronTransportRegression, ReleasingAnInnerSubSlotNeverDropsTheLastRegression) {
+    {
+        const uint16_t reqA = rune::client::testing::allocFreeUdpPort();
+        Transport t{invokerConfig(loopback(reqA), loopback(rune::client::testing::allocFreeUdpPort()), 3590)};
+        t.setSeedResponseChannelForTest(kRefusedResponseChannel);
+        t.start();
+        EXPECT_FALSE(t.seedResponseCorrelated()) << "the unbound response sub falls back to the declared path";
+        EXPECT_EQ(t.subSlotCountForTest(), 1u) << "the dropped slot was removed by position (pop_back), not retired by index";
+        EXPECT_FALSE(t.subSlotLiveForTest(0)) << "the dropped slot is Retired";
+        for (int i = 0; i < 3; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }
+        EXPECT_EQ(t.subSlotCountForTest(), 1u) << "reaped to Free, never erased";
+        t.stop();
+    }
+    {   // three response pairs (slots 0, 1, 2): releasing the middle one leaves the last Live
+        Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3591)};
+        t.start();
+        const auto respCtl = rune::client::transport::responseControlChannelFor(loopback(40001), 40002);
+        ASSERT_TRUE(respCtl.has_value());
+        Transport::PubHandle h[3];
+        int32_t slot[3];
+        for (int i = 0; i < 3; ++i) {
+            h[i] = t.responsePublicationHandle(loopback(static_cast<uint16_t>(41000 + i)), 3592 + i, *respCtl);
+            ASSERT_NE(h[i], Transport::kNoPub);
+            slot[i] = t.responseSubSlotForTest(h[i]);
+        }
+        EXPECT_EQ(slot[0], 0);
+        EXPECT_EQ(slot[1], 1);
+        EXPECT_EQ(slot[2], 2);
+        EXPECT_EQ(t.responseSubsAddedForTest(), 3u);
+        t.releaseSubSlotOwnerForTest(slot[1]);
+        for (int i = 0; i < 3; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }
+        EXPECT_TRUE(t.subSlotLiveForTest(slot[0]));
+        EXPECT_FALSE(t.subSlotLiveForTest(slot[1]));
+        EXPECT_TRUE(t.subSlotLiveForTest(slot[2])) << "releasing slot 1 dropped the last slot";
+        EXPECT_EQ(t.responseSubSlotForTest(h[2]), slot[2]);
+        EXPECT_EQ(t.subSlotCountForTest(), 3u);
+        t.stop();
+    }
+}
+
 TEST(InvokerTransportResponseRegression, RetargetPairsTheNewResponseSubscriptionAndFallsBackToPlain) {
     const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
     const uint16_t reqB = rune::client::testing::allocFreeUdpPort(), rB = rune::client::testing::allocFreeUdpPort();

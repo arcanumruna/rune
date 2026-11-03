@@ -213,7 +213,9 @@ void AeronTransport::startBody_() {
     PubRegistry preg{*aeron_, cfg_.ingressChannel, cfg_.ingressStreamId};
     SubRegistry sreg{*aeron_, cfg_.egressChannel, cfg_.egressStreamId};
     const std::optional<std::string> respChannel =
-        responseControlChannelFor(cfg_.ingressChannel, cfg_.gatewayResponseControlPort);
+        !seedResponseChannelForTest_.empty()
+            ? std::optional<std::string>{seedResponseChannelForTest_}
+            : responseControlChannelFor(cfg_.ingressChannel, cfg_.gatewayResponseControlPort);
     std::string correlatedChannel;   // the default publication's registered channel when response-correlated
     if (respChannel) {
         const int32_t slot = addSubSlot_(SubSlot::Kind::ResponsePair, *respChannel, cfg_.egressStreamId);
@@ -234,7 +236,7 @@ void AeronTransport::startBody_() {
                 std::fprintf(stderr,
                              "rune-client: the response subscription (%s) did not resolve; using the declared egress "
                              "channel\n", respChannel->c_str());
-                subSlots_.pop_back();   // the slot was appended last; the declared path needs none
+                retireSubSlot_(slot);   // by index, never by position: the declared path needs none; reaped to Free at the next poll()
             }
         }
     }

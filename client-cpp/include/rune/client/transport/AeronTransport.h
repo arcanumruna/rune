@@ -249,6 +249,10 @@ public:
     [[nodiscard]] bool seedResponseCorrelated() const noexcept { return respSeedSlot_ >= 0; }
     /// TEST SEAM (owner thread, no I/O): move the seed's PHYSICAL ingress identity, as a completed retarget does.
     void setIngressChannelForTest(const std::string& channel) { cfg_.ingressChannel = channel; }
+    /// TEST SEAM (call before start()): the seed's response subscription channel start() registers, in place of the one
+    /// derived from the ingress channel and the response port; a channel the driver refuses forces the fallback to the
+    /// declared path.  Empty = off.
+    void setSeedResponseChannelForTest(std::string channel) { seedResponseChannelForTest_ = std::move(channel); }
     [[nodiscard]] bool publicationIsResponsePairedForTest(PubHandle h) const noexcept {   // awaiting or correlated
         if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return false;
         return !std::holds_alternative<PubSlot::Plain>(pubSlots_[static_cast<std::size_t>(h)].mode);
@@ -282,6 +286,8 @@ public:
         return -1;
     }
     void releaseSubSlotOwnerForTest(int32_t slot) noexcept { retireSubSlot_(slot); }
+    /// TEST SEAM: the sub slot table's size (slots are never erased: a released one is Retired, then Free).
+    [[nodiscard]] std::size_t subSlotCountForTest() const noexcept { return subSlots_.size(); }
     [[nodiscard]] const std::string& seedPublicationChannelForTest() const noexcept { return ingressPubChannel_; }
     /// TEST SEAMS (cold): fresh response subscriptions registered since start (a re-pair adds one), and the identity of
     /// the publication a handle currently holds (null = none Ready), to prove a slot was left alone.
@@ -557,6 +563,7 @@ private:
     /// The channel `ingressPub_` was registered with (== cfg_.ingressChannel, plus the response-correlation-id when
     /// the seed has a response pair).  cfg_.ingressChannel stays the PLAIN identity channel.  Owner thread only.
     std::string                                  ingressPubChannel_;
+    std::string                                  seedResponseChannelForTest_;   // test seam, see setSeedResponseChannelForTest
     /// Index into subSlots_ of the seed's response subscription (-1 = none): the seed's rich response state.
     int32_t                                      respSeedSlot_ = -1;
     /// The seed pair's re-pair state, one explicit state (mirrors PubSlot::AwaitResponseSub -> Correlated):
