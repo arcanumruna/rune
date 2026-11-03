@@ -256,6 +256,21 @@ public:
         }
         return min;
     }
+    /// Cold (#791 diagnostics, a View ack timeout): the view topic id that holds minFoldCursor() (same rules), or -1 when none does.
+    [[nodiscard]] int32_t minFoldCursorViewForDiag(int32_t srcTopicId, int32_t partition, uint64_t leadership = 0, bool judged = true) const noexcept {
+        const auto it = subscriptionIndex_.find(srcTopicId);
+        if (it == subscriptionIndex_.end()) return -1;
+        int64_t min = INT64_MAX;
+        int32_t holder = -1;
+        for (const int32_t viewTopicId : it->second) {
+            if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.retiring) continue;
+            if (!judged && isVerdictTemplate_(viewTopicId)) continue;
+            const auto vit = views_.find(instKey(viewTopicId, partition));
+            const int64_t cursor = vit == views_.end() || (leadership != 0 && vit->second.foldLeadership != leadership) ? 0 : vit->second.foldCursor;
+            if (cursor < min) { min = cursor; holder = viewTopicId; }
+        }
+        return holder;
+    }
 
     // Drive every view interested in (srcTopicId, partition) over the committed
     // range [foldCursor, bound) of THAT partition.  `readRange(from, to) ->

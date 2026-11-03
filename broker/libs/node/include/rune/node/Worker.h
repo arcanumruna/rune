@@ -8331,6 +8331,32 @@ private:
         }));
     }
 
+    // #791 diagnostics, cold (a View ack timeout only): every conjunct of the fire condition of flushOwedAcksView_, so a stuck ack names
+    // the term that held it - the HW or the ISR (replication), the view holding minFoldCursor, the verdict bound, or the judge itself.
+    void logViewAckTimeout_(rune::replication::PartitionReplica* rep, const PartitionWriteState* ws, const PendingAcksView& entry) noexcept {
+        const int64_t minFold = viewSet_ == nullptr ? INT64_MAX
+            : viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration(), rep->isDiskBacked());
+        const int32_t holder = viewSet_ == nullptr ? -1
+            : viewSet_->minFoldCursorViewForDiag(rep->topicId(), rep->partitionId(), rep->leadershipGeneration(), rep->isDiskBacked());
+        spdlog::warn("Worker {}: View ack timeout detail: partition={} lastOffset={} hw={} isr={} minIsr={} acksAll={} minFoldCursor={} (view {}) replay={}",
+                     workerId_, entry.ret.partition, entry.lastOffset, rep->highWatermark(), rep->isr().size(), entry.minIsr,
+                     rune::protocol::client::acksAll(entry.acks), minFold, holder, static_cast<int>(entry.replay));
+        if (ws == nullptr || !ws->isVerdictSource()) return;
+        const int64_t bound = verdictBound_(rep, ws, INT64_MAX);
+        spdlog::warn("Worker {}: View ack timeout detail: partition={} verdictBound={}{} verdictKnownThrough={} committedThrough={} rejectedIndex={}",
+                     workerId_, entry.ret.partition, bound, bound == -1 ? " (leadership scan not Ready)" : "", ws->verdictKnownThrough(),
+                     ws->markers.committedThrough(), ws->rejected.size());
+        if (ws->verdicts == nullptr) {
+            spdlog::warn("Worker {}: View ack timeout detail: partition={} no judge bound", workerId_, entry.ret.partition);
+            return;
+        }
+        const auto d = ws->verdicts->diagSnapshot();
+        spdlog::warn("Worker {}: View ack timeout detail: partition={} judge judgedThrough={} stalled={} stallReason={} waitingForInstall={} "
+                     "needsActivation={} activeSet={} members={} active={} leaderGeneration={}",
+                     workerId_, entry.ret.partition, d.judgedThrough, d.stalled, d.stallReason, d.waitingForInstall, d.needsActivation,
+                     d.activeSetId, d.members, d.active, d.leaderGeneration);
+    }
+
     // -----------------------------------------------------------------------
     // flushOwedAcksView_ - fire View acks: the HW passed the batch, (for All) the ISR still holds, and every view of the
     // source folded past it under THIS leadership (WorkerViewSet::minFoldCursor); no views means nothing to wait for.
@@ -8363,6 +8389,7 @@ private:
             } else if (nowNs >= entry.deadlineNs) {
                 spdlog::warn("Worker {}: View ack timeout for partition={} lastOffset={}; acking Internal error",
                              workerId_, entry.ret.partition, entry.lastOffset);
+                logViewAckTimeout_(rep, ws, entry);   // #791: which conjunct of the fire condition held the ack (cold)
                 code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
             } else {
                 // A replay waiting for its marker must not be passed by a later ack of the partition.

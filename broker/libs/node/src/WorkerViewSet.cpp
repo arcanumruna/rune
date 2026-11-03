@@ -876,6 +876,9 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     want.clear();
     // A logged member keeps its place unless its template retired or was replaced; one whose plan is not installed here is kept
     // (the judge waits for it, it is never dropped by a guess).
+    // #791 diagnostics: why each logged member stayed or went (0 live, 1 replaced by another fingerprint, 2 gone, 3 kept: not installed here).
+    std::array<uint8_t, kMaxVerdictViewsPerSource> why{};
+    std::array<uint64_t, kMaxVerdictViewsPerSource> replacedBy{};
     for (uint8_t i = 0; i < logged.count; ++i) {
         const ConstraintSetMember& m = logged.members[i];
         bool live = false, gone = false;
@@ -884,9 +887,10 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
                 const ViewTemplate& tpl = templates_.at(id);
                 if (!tpl.isVerdict || tpl.verdictObjectId != m.viewObjectId) continue;
                 if (tpl.verdictFingerprint == m.planFingerprint) (tpl.retiring ? gone : live) = true;
-                else if (!tpl.retiring) gone = true;   // replaced by a plan with another fingerprint
+                else if (!tpl.retiring) { gone = true; replacedBy[i] = tpl.verdictFingerprint; }   // replaced by a plan with another fingerprint
             }
         }
+        why[i] = live ? 0 : (gone ? (replacedBy[i] != 0 ? 1 : 2) : 3);
         if (live || !gone) want.push_back(m);   // a retiring view's plan installed again stays (#786)
     }
     if (sit != subscriptionIndex_.end()) {
@@ -912,6 +916,17 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
         const int64_t r = judge.requestChange(desired);
         if (r == VerdictSource::kChangeDeferred) return 0;   // not yet bound or activated: ask again next pass
         work = r >= 0 ? 1 : 0;
+        // #791 diagnostics (cold: only when the logged set differs from what the installed views want).
+        const auto d = judge.diagSnapshot();
+        spdlog::warn("constraint set sync: topic {} partition {}: logged set {} ({} members) -> wanted {} members, change at offset {} (result {}), "
+                     "leader generation {}", srcTopicId, judge.partition(), logged.id, logged.count, desired.count, write.constraintSets.lastChangeOffset(),
+                     r, d.leaderGeneration);
+        for (uint8_t i = 0; i < logged.count; ++i) {
+            static constexpr const char* kWhy[] = {"live", "replaced", "gone", "kept (plan not installed here)"};
+            spdlog::warn("constraint set sync: topic {} partition {}: member object {} fingerprint {}: {}{}", srcTopicId, judge.partition(),
+                         logged.members[i].viewObjectId, logged.members[i].planFingerprint, kWhy[why[i]],
+                         why[i] == 1 ? " by fingerprint " + std::to_string(replacedBy[i]) : std::string());
+        }
     }
     judge.constraintSyncEpoch = verdictEpoch_;
     judge.constraintSyncChange = write.constraintSets.lastChangeOffset();

@@ -179,7 +179,19 @@ void VerdictSource::waitForInstall_() noexcept {
     if (waitingForInstall_) return;
     waitingForInstall_ = true;
     ++stats_.judgeWaitsForInstall;
-    spdlog::info("verdict judge waits for a view install: topic {} partition {}", srcTopicId_, partition_);
+    // #791 diagnostics (cold, once per wait): the first member of the active set no installed view matches, and where that set starts.
+    uint64_t missingObject = 0, missingFingerprint = 0;
+    for (uint8_t i = 0; i < activeSet_.count; ++i) {
+        const ConstraintSetMember& want = activeSet_.members[i];
+        const bool have = std::any_of(members_.begin(), members_.end(), [&](const Member& m) {
+            return !m.retiring && m.objectId == want.viewObjectId && m.fingerprint == want.planFingerprint;
+        });
+        if (!have) { missingObject = want.viewObjectId; missingFingerprint = want.planFingerprint; break; }
+    }
+    spdlog::warn("verdict judge waits for a view install: topic {} partition {}: missing member (object {}, fingerprint {}) of set {} "
+                 "(change at offset {}), judged through {}, {} members installed, {} of {} active",
+                 srcTopicId_, partition_, missingObject, missingFingerprint, activeSet_.id, setFrom_, judgeCursor_, members_.size(),
+                 active_.size(), activeSet_.count);
 }
 
 rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept {

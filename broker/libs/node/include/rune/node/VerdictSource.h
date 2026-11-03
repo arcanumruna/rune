@@ -61,6 +61,14 @@ public:
         if (stallReason_ == StallReason::Full && state_ != nullptr && state_->rejected.size() < state_->rejected.capacity()) stalled_ = false;
     }
     [[nodiscard]] bool waitingForInstall() const noexcept { return waitingForInstall_; }
+    /// Cold (#791 diagnostics, read on a View ack timeout): the judge's state in one snapshot.
+    struct DiagSnapshot {
+        int64_t judgedThrough; bool stalled; int stallReason; bool waitingForInstall; bool needsActivation;
+        uint32_t activeSetId; std::size_t members; std::size_t active; uint64_t leaderGeneration;
+    };
+    [[nodiscard]] DiagSnapshot diagSnapshot() const noexcept {
+        return {judgeCursor_, stalled_, static_cast<int>(stallReason_), waitingForInstall_, needsActivation_, activeSet_.id, members_.size(), active_.size(), generation_};
+    }
 
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);
     void removeVerdictView(int32_t viewTopicId);
