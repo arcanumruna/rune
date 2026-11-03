@@ -157,8 +157,9 @@ public:
         readCap_ = maxRecordsPerRead;
         const rune::node::TransientBounds tb{logStart_, logEnd_, incarnation_, generation_, cutOffset_};
         auto rr = [this](int64_t from, int64_t) { return readRange_(from); };
-        int work = views_->driveRebuild(kSrcTopic, 0, rr, logEnd_, aborted_, nowNs_, &tb, leaderGen, true);
-        work += views_->driveFolds(kSrcTopic, 0, rr, logEnd_, aborted_, nowNs_, &tb, leaderGen, true);
+        const rune::view::FoldSkip skip{.aborted = aborted_};
+        int work = views_->driveRebuild(kSrcTopic, 0, rr, logEnd_, skip, nowNs_, &tb, leaderGen, true);
+        work += views_->driveFolds(kSrcTopic, 0, rr, logEnd_, skip, nowNs_, &tb, leaderGen, true);
         drainDeltas_();
         return work;
     }

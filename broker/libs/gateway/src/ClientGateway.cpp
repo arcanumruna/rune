@@ -820,7 +820,7 @@ int ClientGateway::doWork(int64_t nowNs) {
                         const auto* frame = reinterpret_cast<const uint8_t*>(buffer.buffer() + offset);
                         if (!admitClientFrame_(frame, static_cast<std::size_t>(length))) [[unlikely]]
                             return aeron::ControlledPollAction::ABORT;
-                        currentImageSessionId_ = header.sessionId();   // D14 (one store per frame)
+                        currentImage_ = static_cast<aeron_image_t*>(header.context());   // D14 (one store per frame)
                         // D8c fix round 1: a produce deferred by the per-worker cap is not
                         // consumed — ABORT it (redelivered at the next poll).
                         if (!onClientFrame_(frame, static_cast<std::size_t>(length))) [[unlikely]]
@@ -830,6 +830,7 @@ int ClientGateway::doWork(int64_t nowNs) {
                     b, o, l, h);
             },
             fragmentLimit_);
+        currentImage_ = nullptr;
         controlledImageWatch_.afterPoll(*sub_, controlledAssembler_);
         noteControlledImages_(sub_->imageCount());   // review L1: a lost image's deferral memo
     } else {
@@ -845,6 +846,7 @@ int ClientGateway::doWork(int64_t nowNs) {
                     b, o, l, h);
             },
             fragmentLimit_);
+        currentImage_ = nullptr;
         imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost client images (m-c)
     }
     pollPendingConnects(nowNs);
@@ -1147,7 +1149,7 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
                                aeron::util::index_t             length,
                                aeron::Header&                   header)
 {
-    currentImageSessionId_ = header.sessionId();   // D14: the Connect's source host is read off this image
+    currentImage_ = static_cast<aeron_image_t*>(header.context());   // D14: the Connect's source host is read off this image
     (void)onClientFrame_(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset), static_cast<std::size_t>(length));
 }
 
@@ -2219,14 +2221,14 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // NAT-safe egress (spec D2): a v16 client that sets responseCorrelated is answered on an Aeron response
     // publication correlated with THIS request image - never on the declared channel.
     {
-        const auto image = (sub_ != nullptr && currentImageSessionId_ != 0)
-                               ? sub_->imageBySessionId(currentImageSessionId_) : nullptr;
-        if (image) pc_entry.sourceIdentity = image->sourceIdentity();
+        aeron_image_constants_t image{};
+        const bool hasImage = currentImage_ != nullptr && aeron_image_constants(currentImage_, &image) == 0;
+        if (hasImage) pc_entry.sourceIdentity = image.source_identity;
         const bool wantsResponse = req.clientVersion >= pc::kClientVersionResponseEgress && req.responseCorrelated;
         // Shard mode (Task 6): the workers answer on response publications of their own, so response mode also needs
         // this node's worker response-control base; without it the whole session stays on the declared path.
         const bool workersReady = !shardMode_ || workerResponseBaseOf_(thisNodeId_) > 0;
-        pc_entry.responseEgress = wantsResponse && !responseControlEndpoint_.empty() && image != nullptr && workersReady;
+        pc_entry.responseEgress = wantsResponse && !responseControlEndpoint_.empty() && hasImage && workersReady;
         if (pc_entry.responseEgress && shardMode_) {
             pc_entry.workerResponse = true;
             if (!rune::crypto::randomBytes(std::span<uint8_t>(pc_entry.bindToken)) ||
@@ -2240,7 +2242,7 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
         if (pc_entry.responseEgress) {
             pc_entry.replyChannel = "aeron:udp?control=" + responseControlEndpoint_ +
                                     "|control-mode=response|response-correlation-id=" +
-                                    std::to_string(image->correlationId());
+                                    std::to_string(image.correlation_id);
         } else {
             pc_entry.replyChannel = pc_entry.egressChannel;
             if (wantsResponse) {
@@ -3746,7 +3748,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return true;
     }
     // Namespaces Phase 2 Task 9 (D23): the acks floor of the session's namespace, per produce (a client picks acks per
-    // request): one slot-array load and a compare.  wire acks 0 = Leader, 1 = All; lowestAcks >= 2 requires All.
+    // request): one slot-array load and a compare.  the wire acks byte is a bit set (bit 0 = All, bit 1 = View); lowestAcks >= 2 requires the All bit.
     if (!rune::node::nsAcksAllowed(nsSlots_.limits(session->nsSlot), msg.acks)) [[unlikely]] {
         if (!answerRejection_(*session, *pc::MessageHeader::decode(buf, len), nsLimitCode_(*session),
                               "namespace limit exceeded: acks below the namespace's lowest acks", buf, len))
@@ -8675,13 +8677,11 @@ std::string ClientGateway::sourceHostOf_(std::string_view egressChannel) const
 {
     // The REAL UDP source of the Connect image ("1.2.3.4:5678" / "[::1]:5678"); IPC images have no host, and a test
     // gateway has no subscription: fall back to the host of the client's reply endpoint.
-    if (sub_ != nullptr && currentImageSessionId_ != 0) {
-        if (const auto image = sub_->imageBySessionId(currentImageSessionId_)) {
-            // Image::sourceIdentity() returns a std::string BY VALUE: never bind a string_view to it (it dangled - the
-            // throttle keys and the login log lines carried freed memory); hostOfSourceIdentity copies out.
-            std::string host = rune::gateway::hostOfSourceIdentity(image->sourceIdentity());
-            if (!host.empty()) return host;
-        }
+    aeron_image_constants_t image{};
+    if (currentImage_ != nullptr && aeron_image_constants(currentImage_, &image) == 0) {
+        // source_identity lives as long as the image (the poll is iterating it); hostOfSourceIdentity copies out.
+        std::string host = rune::gateway::hostOfSourceIdentity(image.source_identity);
+        if (!host.empty()) return host;
     }
     return std::string(rune::consensus::PeerHostTable::endpointHost(egressChannel));
 }

@@ -116,6 +116,10 @@ public:
     /// Opens the file first (via fileFor_) if it doesn't exist yet.
     void forceWriteFailureForTest(int32_t viewTopicId, int32_t partition);
 
+    /// Test-only: mark this key's stream errored (as after a FATAL write failure) while keeping
+    /// its fd writable, so a later reset frame can truncate it.
+    void forceErroredForTest(int32_t viewTopicId, int32_t partition);
+
 private:
     struct Key {
         int32_t viewTopicId;
@@ -143,6 +147,7 @@ private:
     };
 
     void handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx);
+    void handleResetFrame_(const uint8_t* p, std::size_t len, int channelIdx);
     // Returns nullptr on an ::open() failure -- NOT cached in files_, so the
     // next call for the same key retries open() (review-round-1 fix: a
     // transient failure must never permanently blackhole a key).

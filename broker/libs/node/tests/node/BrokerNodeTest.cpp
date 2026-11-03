@@ -1194,7 +1194,7 @@ TEST(BrokerNodeRegression, EffectiveMaxBatchDerivedFromTransportRegression) {
     //   worker ring tail  = 8 MiB/8 − WorkerOp framing (SBE header + block + tail
     //                       prefix, from the generated codec — 247 with rune-protocol fb82500)
     //   aeron ingress     = term max msg 131072 − Produce framing (24 hdr? + 24 + 2 + 4)
-    //   replication       = min(ring 262144 − 16 − 32 − 46, term 131072 − 32 − 46) = 130994   (D34: the 32-byte peer frame)
+    //   replication       = min(ring 262144 − 16 − 32 − 54, term 131072 − 32 − 54) = 130986   (D34: the 32-byte peer frame)
     EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 1048576u - kWorkerOpFramingFromCodec);
     EXPECT_EQ(ingressMax, aeronIngressMaxBatchBytes(cfg));
     EXPECT_LT(ingressMax, 131072);
@@ -1202,8 +1202,8 @@ TEST(BrokerNodeRegression, EffectiveMaxBatchDerivedFromTransportRegression) {
                            rune::replication::FetchResponseMsg::encodedSize(0)));
 
     // (1) Default config (no explicit override): effective = min(8 MiB, ingressMax, replMax).
-    // Here the Aeron-ingress Produce framing (54) exceeds the FetchResponse
-    // framing (46), so ingress is the tightest by 8 bytes.
+    // Here the Aeron-ingress Produce framing and the FetchResponse framing are
+    // both 54 (replication v5 fromOffset), so the two bounds tie.
     EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg),
               static_cast<std::size_t>(std::min(ingressMax, replMax)));
     EXPECT_EQ(ingressMax, 131072 - 54);
@@ -1279,13 +1279,13 @@ TEST(BrokerNodeRegression, DefaultMaxBatchConfigNeverRefusedRegression) {
 // transports enforce.  Pins the exact default numbers and checks them against
 // REAL transport instances (one EmbeddedDriver, default 4 MiB term):
 //   legacy (AeronPartitionTransport, 4 MiB outbound ring):
-//     min(524288 − 16 envelope − 32 peer frame − 46 framing, 524288 − 32 − 46) = 524194
-//   per-worker (WorkerReplicationTransport, gather send): 524288 − 32 − 46 = 524210
+//     min(524288 − 16 envelope − 32 peer frame − 54 framing, 524288 − 32 − 54) = 524186
+//   per-worker (WorkerReplicationTransport, gather send): 524288 − 32 − 54 = 524202
 //   worker ingress ring (32 MiB): 4194304 − WorkerOp framing from the codec
 //     (8 SBE header + sbeBlockLength + 4 tail prefix: 4194073 with rune-protocol
 //     66bf9e6, 4194057 with fb82500's targetReplicaId/incarnation fields)
 //   aeron ingress (4 MiB term):   524288 − Produce framing
-// → effective (multi-node) = 524194 = the ENFORCED legacy ceiling (round 4
+// → effective (multi-node) = 524186 (v5; 524194 under v4) = the ENFORCED legacy ceiling (round 4
 //   derived 524210, 16 bytes above what the legacy ring path can carry).
 // ---------------------------------------------------------------------------
 TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
@@ -1301,13 +1301,13 @@ TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
     cfg.replicationOutboundRingBytes = 4 * 1024 * 1024;
     ASSERT_EQ(cfg.workerIngressRingBytes, 32 * 1024 * 1024);
 
-    EXPECT_EQ(replicationHardTransportMaxBytes(cfg), 524194);
+    EXPECT_EQ(replicationHardTransportMaxBytes(cfg), 524186);
     EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 4194304u - kWorkerOpFramingFromCodec);
-    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 524194u);
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 524186u);
     // F3 round 6, item 1: the multi-node fetch/push chunk is bounded by the
-    // replication hard max too (a 1 MiB coalesced push over the 524194 B
+    // replication hard max too (a 1 MiB coalesced push over the 524186 B
     // ceiling was dropped → 20 ms re-serve stall).  Single-node keeps 1 MiB.
-    EXPECT_EQ(userTopicMaxFetchBytes(cfg), 524194);
+    EXPECT_EQ(userTopicMaxFetchBytes(cfg), 524186);
     {
         NodeConfig single = makeSingleNodeConfig(dir);
         EXPECT_EQ(userTopicMaxFetchBytes(single), 1 << 20);
@@ -1331,8 +1331,8 @@ TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
     ASSERT_TRUE(perWorker.resolved());
 
     const std::size_t eff = effectiveMaxProduceBatchBytes(cfg);
-    EXPECT_EQ(legacy.maxFetchResponseBytes(), 524194) << "derived == enforced (legacy ring path)";
-    EXPECT_EQ(perWorker.maxFetchResponseBytes(), 524210) << "derived == enforced (gather path)";
+    EXPECT_EQ(legacy.maxFetchResponseBytes(), 524186) << "derived == enforced (legacy ring path)";
+    EXPECT_EQ(perWorker.maxFetchResponseBytes(), 524202) << "derived == enforced (gather path)";
     EXPECT_GE(static_cast<std::size_t>(legacy.maxFetchResponseBytes()), eff);
     EXPECT_GE(static_cast<std::size_t>(perWorker.maxFetchResponseBytes()), eff);
     EXPECT_EQ(perWorker.maxFetchResponseBytes(),

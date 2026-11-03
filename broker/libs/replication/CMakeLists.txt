@@ -96,6 +96,7 @@ if(BUILD_TESTING)
         tests/replication/LeaderEpochCacheRestartTest.cpp
         tests/replication/BatchPrefixTest.cpp
         tests/replication/LargeBatchServeTest.cpp
+        tests/replication/CompactionGapCatchUpTest.cpp
         tests/replication/OutboundHoldRouterTest.cpp
         tests/replication/F27OwedMemoSwapTest.cpp
         tests/replication/DiagFlagsTest.cpp

@@ -54,7 +54,7 @@ namespace rsbe = ::rune::protocol::replication::sbe;
 // Schema constants
 // ---------------------------------------------------------------------------
 inline constexpr uint16_t kSchemaId      = 112;
-inline constexpr uint16_t kSchemaVersion = 4; // v2: DR-BUG-5 topicId; v3: KIP-320/595 lastFetchedEpoch, AlterIsr; v4: ISR protocol (storage id, correlated AlterIsr answers)
+inline constexpr uint16_t kSchemaVersion = 5; // v2: DR-BUG-5 topicId; v3: KIP-320/595 lastFetchedEpoch, AlterIsr; v4: ISR protocol (storage id, correlated AlterIsr answers); v5: FetchResponse fromOffset (#789)
 /// The oldest schema version whose FetchResponse this binary still applies (v3 leaders send v3 headers during a roll).
 inline constexpr uint16_t kMinReplicationVersion = 3;
 /// Mixed v2/v3 replication is UNSUPPORTED (fail closed): a decoded v2
@@ -286,8 +286,8 @@ struct FetchRequestMsg {
 // consumers), the logStartOffset (earliest offset available in this epoch),
 // an error code, and a variable-length records blob.
 //
-// Fixed block (34 bytes, sbeBlockLength=34; unchanged in v3 — data frames keep
-// their 46-byte framing):  [schema version 2: DR-BUG-5 adds topicId]
+// Fixed block (v5: 42 bytes, sbeBlockLength=42; v2-v4 senders: 34):
+//   [schema version 2: DR-BUG-5 adds topicId; version 5: #789 adds fromOffset]
 // v3: a record-less ERROR answer may carry a 12-byte payload in `records` — see
 // ErrorPayload (DivergingEpoch / OffsetOutOfRange).
 //   leaderEpoch    : Epoch       (int64)  @ +0
@@ -296,15 +296,13 @@ struct FetchRequestMsg {
 //   logStartOffset : Offset      (int64)  @ +20
 //   errorCode      : int16       @ +28
 //   topicId        : int32       @ +30   (DR-BUG-5: multi-topic routing; NO alignment pad)
-// Total fixed: leaderEpoch(8) + partition(4) + highWatermark(8) + logStartOffset(8) +
-//   errorCode(2) + topicId(4) = 34 bytes  (matches generated SBE sbeBlockLength=34;
-//   topicIdEncodingOffset()=30, errorCodeEncodingOffset()=28)
+//   fromOffset     : Offset      (int64)  @ +34  (v5; absent in a 34-byte block → -1)
 //
 // Followed by variable-length records blob:
-//   recordsLength  : uint32      @ +34  (can be 0 for HW-only updates)
-//   recordsData    : uint8[]     @ +38  (recordsLength bytes)
+//   recordsLength  : uint32      @ +42  (can be 0 for HW-only updates)
+//   recordsData    : uint8[]     @ +46  (recordsLength bytes)
 //
-// Total on-wire = 8 (header) + 34 (fixed) + 4 (length prefix) + recordsLength
+// Total on-wire = 8 (header) + 42 (fixed) + 4 (length prefix) + recordsLength
 // ===========================================================================
 struct FetchResponseMsg {
     Epoch                    leaderEpoch;
@@ -314,8 +312,10 @@ struct FetchResponseMsg {
     int16_t                  errorCode;
     int32_t                  topicId;   ///< DR-BUG-5: distinguishes replicas that share a partitionId
     std::span<const uint8_t> records;   ///< Zero-copy view into the decode buf.
+    /// v5 (#789): the offset the leader read `records` from; -1 = error / HW-only answer or a v4 sender.
+    Offset                   fromOffset = -1;
     static constexpr uint16_t TEMPLATE_ID = 2;
-    /// Smallest decodable frame: a v2 sender's (34-byte block) empty answer.
+    /// Smallest decodable frame: a v2-v4 sender's (34-byte block) empty answer.
     static constexpr std::size_t MIN_SIZE = 8 + 34 + 4;
     // Layout constants DERIVED from the generated SBE codec (not hand-magic):
     // the fixed block length and the var-data (records) length-prefix width.
@@ -341,7 +341,8 @@ struct FetchResponseMsg {
                               Offset                   logStartOffset_,
                               int16_t                  errorCode_,
                               std::span<const uint8_t> records_,
-                              int32_t                  topicId_ = 0) noexcept
+                              int32_t                  topicId_ = 0,
+                              Offset                   fromOffset_ = -1) noexcept
     {
         const std::size_t frame = encodedSize(records_.size());
         rsbe::FetchResponse enc;
@@ -351,7 +352,8 @@ struct FetchResponseMsg {
            .highWatermark(highWatermark_)
            .logStartOffset(logStartOffset_)
            .errorCode(errorCode_)
-           .topicId(topicId_);
+           .topicId(topicId_)
+           .fromOffset(fromOffset_);
         enc.putRecords(reinterpret_cast<const char*>(records_.data()),
                        static_cast<std::uint32_t>(records_.size()));
         return frame;
@@ -380,13 +382,14 @@ struct FetchResponseMsg {
         m.logStartOffset = dec.logStartOffset();
         m.errorCode      = dec.errorCode();
         m.topicId        = dec.topicId();
+        m.fromOffset     = (mh.version() >= 5 && mh.blockLength() >= BLOCK_LENGTH_FIXED) ? dec.fromOffset() : -1;
         // Records tail: guard against a malformed/truncated length prefix (a
         // corrupt frame claiming more bytes than the fragment holds) BEFORE reading
         // the view — decode is noexcept and must never over-read or let an SBE
         // bounds-check throw escape.  recordsLength() only reads the 4-byte length
         // field (within the block), which is always present here.
         const std::uint32_t rlen = dec.recordsLength();
-        // header + the frame's OWN block (v2: 34, v3: 46) + len-prefix
+        // header + the frame's OWN block (v2-v4: 34, v5: 42) + len-prefix
         const std::size_t framing = rsbe::MessageHeader::encodedLength() + mh.blockLength()
                                   + VAR_HEADER_SIZE;
         const std::size_t avail   = (cap >= framing) ? static_cast<std::size_t>(cap - framing) : 0;
@@ -411,7 +414,7 @@ struct FetchResponseMsg {
 //   int32 epoch | int64 endOffset   (12 bytes, LE) in its `records` field:
 //   DivergingEpoch (-7): the leader's endOffsetForEpoch(lastFetchedEpoch);
 //   OffsetOutOfRange (-4): epoch -1, endOffset = the leader's log end offset.
-// Data frames are untouched (their framing stays 46 bytes).
+// Data frames are untouched by v3 (v5 grows their framing to 54 bytes).
 // ---------------------------------------------------------------------------
 struct ErrorPayload {
     int32_t epoch     = -1;

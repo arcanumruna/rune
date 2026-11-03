@@ -16,8 +16,8 @@
 <sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
                    package="rune.protocol.replication.sbe"
                    id="112"
-                   version="4"
-                   semanticVersion="1.2"
+                   version="5"
+                   semanticVersion="1.3"
                    description="Rune cross-node replication wire messages"
                    byteOrder="littleEndian">
 
@@ -82,6 +82,10 @@
          = the leader's endOffsetForEpoch(lastFetchedEpoch) (DivergingEpoch) or its
          log end offset (OffsetOutOfRange).  Mixed v2/v3 replication is UNSUPPORTED:
          a v3 replica refuses v2 frames (fail closed). -->
+    <!-- v5: the offset the leader read `records` from (-1 = an error / HW-only answer, or a v4
+         sender).  Offsets missing between it and a batch are absent from the leader's log
+         (compacted away), so a follower whose LEO is >= fromOffset may append across them. -->
+    <field name="fromOffset"     id="8" type="int64" sinceVersion="5"/>
     <data  name="records"        id="7" type="varDataEncoding"/>
   </sbe:message>
 
@@ -131,6 +135,7 @@
     <field name="logStartOffset" id="4" type="int64"/>
     <field name="errorCode"      id="5" type="int16"/>
     <field name="topicId"        id="6" type="int32"/>
+    <field name="fromOffset"     id="8" type="int64" sinceVersion="5"/>
     <data  name="records"        id="7" type="varDataEncoding"/>
   </sbe:message>
 

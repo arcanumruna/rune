@@ -28,6 +28,7 @@ add_library(rune_node
     src/ViewSnapshotIoAgent.cpp
     src/WorkerViewSet.cpp
     src/CheckedWriteHook.cpp
+    src/VerdictSource.cpp
     src/TopicDirReconcile.cpp)
 
 # The worker's io backends, as their own leaf library: Worker.h's header-inline
@@ -199,7 +200,6 @@ if(BUILD_TESTING)
         tests/node/CatalogWritePathTest.cpp
         tests/node/CatalogLeadershipTest.cpp
         tests/node/CatalogReadServerTest.cpp
-        tests/node/CatalogGatesRegressionTest.cpp
         tests/node/WorkerOwnedIndexRegressionTest.cpp
         tests/node/WorkerOpWireRegressionTest.cpp
         tests/node/WorkerDroppedTopicRegressionTest.cpp
@@ -214,6 +214,17 @@ if(BUILD_TESTING)
     include(GoogleTest)
     gtest_discover_tests(rune_node_tests PROPERTIES LABELS small)
     rune_regression_batches(rune_node_tests 4)   # defined in the root CMakeLists.txt
+
+    # Catalog history Task 23: the 10k-event boot replay bound is wall-clock - a latency gate (RUN_SERIAL +
+    # LABELS latency, stage b, idle host; under -j16 it took 24 s against 932 ms alone).  Own binary so it
+    # stays out of rune_node_tests' *Regression* batches.
+    add_executable(rune_catalog_gates_tests tests/node/CatalogGatesRegressionTest.cpp)
+    target_include_directories(rune_catalog_gates_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_catalog_gates_tests PRIVATE rune_node rune_codec rune_view GTest::gtest_main)
+    set(RUNE_CATALOG_GATES_LATENCY_TESTS "CatalogGatesRegression.BootReplayOfTenThousandEventsIsUnderOneSecondRegression")
+    gtest_discover_tests(rune_catalog_gates_tests TEST_FILTER "${RUNE_CATALOG_GATES_LATENCY_TESTS}"
+                         PROPERTIES RUN_SERIAL TRUE LABELS latency)
+    gtest_discover_tests(rune_catalog_gates_tests TEST_FILTER "-${RUNE_CATALOG_GATES_LATENCY_TESTS}")
 
     # Catalog history Task 7 (F12): the admin thread's catalog steady state never
     # allocates.  Replaces the global operator new (binary-wide) — own binary, like
@@ -822,7 +833,9 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesValidationMatrixTest.cpp
         tests/node/CheckedWritesWorkerTest.cpp
         tests/node/CheckedWritesSpecFanoutTest.cpp
-        tests/node/CheckedWritesDdlTest.cpp)
+        tests/node/CheckedWritesDdlTest.cpp
+        tests/node/CheckedWritesTimelineTest.cpp
+        tests/node/CheckedWritesVerdictSourceTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -1343,6 +1356,18 @@ if(BUILD_TESTING)
             target_include_directories(rune_checked_writes_ack_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
             target_link_libraries(rune_checked_writes_ack_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_ack_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Checked writes Part 04: the verdict pipeline on a real Worker.
+            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp)
+            target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
+            target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Checked writes Part 04: the shared interaction matrix (04 cells; the reference model).
+            add_executable(rune_checked_writes_matrix_tests tests/node/CheckedWritesMatrixTest.cpp)
+            target_include_directories(rune_checked_writes_matrix_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
+            target_link_libraries(rune_checked_writes_matrix_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_checked_writes_matrix_tests PROPERTIES TIMEOUT 900 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 03 (hard rule): the write hook and the View acks allocate nothing.  Replaces the global
             # operator new (binary-wide) - its own binary; later checked-writes parts extend it.
@@ -1885,6 +1910,14 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_client_broker_tests TEST_FILTER "-${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
                              PROPERTIES TIMEOUT 600)
 
+        # Checked writes Part 04 Task 11: the seeded verdict stress on three real brokers (each seed is one ctest case).
+        # Labelled stress and kept out of the regular slice (-LE stress) until every seed passes.
+        add_executable(rune_checked_writes_stress_tests tests/integration/CheckedWritesStressTest.cpp)
+        target_include_directories(rune_checked_writes_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_checked_writes_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_checked_writes_stress_tests PROPERTIES TIMEOUT 1800 LABELS stress)
+
         # Namespaces Task 11: the REAL client namespace API and the REAL `rune namespace` / `rune ql` CLI against ONE
         # real authenticating BrokerNode.
         add_executable(rune_namespace_client_tests tests/client/NamespaceClientTest.cpp)
@@ -2057,7 +2090,12 @@ if(BUILD_TESTING)
         target_include_directories(rune_auth_cluster_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_auth_cluster_tests PRIVATE rune_node rune_view rune_codec rune_catalog aeron::aeron
                               GTest::gtest_main)
-        gtest_discover_tests(rune_auth_cluster_tests PROPERTIES TIMEOUT 900)
+        # #454: the 100 ms revoke gate is wall-clock - a latency gate (RUN_SERIAL + LABELS latency, stage b, idle host).
+        set(RUNE_AUTH_CLUSTER_LATENCY_TESTS "AuthClusterRegression.RevokeEndsSubscriptionsOnEveryBrokerWithin100msRegression")
+        gtest_discover_tests(rune_auth_cluster_tests TEST_FILTER "${RUNE_AUTH_CLUSTER_LATENCY_TESTS}"
+                             PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE LABELS latency)
+        gtest_discover_tests(rune_auth_cluster_tests TEST_FILTER "-${RUNE_AUTH_CLUSTER_LATENCY_TESTS}"
+                             PROPERTIES TIMEOUT 900)
 
         # Authentication Task 18: seeded, model-checked stress - racing security DDL vs produce / subscribe / create against
         # an independent permission model (support/PermissionModel.h).

@@ -700,13 +700,18 @@ TEST(ControlMarkerTest, CrcBoundaryOffByOneHandledCorrectly) {
     }
 }
 
-// #21 — build at extreme producerId / epoch values round-trips.
+// #21 — build at extreme producerId / epoch values round-trips.  A negative producerId is no transaction's: extract refuses it.
 TEST(ControlMarkerTest, BuildExtremeProducerIdEpochRoundTrips) {
-    for (ProducerId pid : {INT64_MIN, ProducerId{-1}, INT64_MAX}) {
+    for (ProducerId pid : {INT64_MIN, ProducerId{-1}, ProducerId{0}, INT64_MAX}) {
         for (ProducerEpoch ep : {ProducerEpoch{INT16_MIN}, ProducerEpoch{-1},
                                  ProducerEpoch{INT16_MAX}}) {
             auto b = ControlMarker::build(pid, ep, ControlType::Commit, -7);
             ControlMarkerPayload p;
+            if (pid < 0) {
+                EXPECT_FALSE(ControlMarker::extract(b.data(), 0, p, ControlMarker::ENCODED_SIZE))
+                    << "pid=" << pid << " ep=" << ep;
+                continue;
+            }
             ASSERT_TRUE(ControlMarker::extract(b.data(), 0, p, ControlMarker::ENCODED_SIZE))
                 << "pid=" << pid << " ep=" << ep;
             EXPECT_EQ(p.producerId, pid);

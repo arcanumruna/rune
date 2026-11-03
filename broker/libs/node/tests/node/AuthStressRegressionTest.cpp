@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <random>
 #include <sstream>
+#include <tuple>
 
 using namespace rune::node;
 using namespace rune::node::test;
@@ -133,6 +134,7 @@ struct Sub {
     std::string topic;
     int32_t     topicId = 0;
     int64_t     corr = 0, subId = 0;
+    int64_t     sid = 0;         // the session it was sent on (a reconnect gives the Sess a new one)
     std::size_t estSent = 0;     // changes sent when the SubscribeResponse OK was seen
     Clock::time_point deadline;  // MustEnd: the error is due (1 s after the answer of the change that took READ)
     Clock::time_point liveAt;    // when its SubscribeResponse OK was seen
@@ -155,6 +157,7 @@ struct Req {
     int32_t     topicId = 0;
     bool        routed = false;
     int64_t     corr = 0;
+    int64_t     sid = 0;         // the session it was sent on (a reconnect gives the Sess a new one)
     std::size_t lo = 0;          // changes answered (prefix) when sent
     Clock::time_point sentAt;
     std::size_t step = 0;
@@ -208,8 +211,9 @@ private:
         auto& adm = rig_.broker().admin();
         const std::string ch = rig_.ch();
         const int64_t as = rig_.broker().adminSession();
-        for (int r = 0; r < 2; ++r) { model_.addRole(role_(r)); if (adm.createRole(ch, as, role_(r)).errorCode) failWith_("create role"); }
-        for (int u = 0; u < 2; ++u) { model_.addUser(user_(u)); if (adm.createUser(ch, as, user_(u), AuthRig::kPw).errorCode) failWith_("create user"); }
+        keepRigAlive_();
+        for (int r = 0; r < 2; ++r) { model_.addRole(role_(r)); if (adm.createRole(ch, as, role_(r)).errorCode) failWith_("create role"); keepRigAlive_(); }
+        for (int u = 0; u < 2; ++u) { model_.addUser(user_(u)); if (adm.createUser(ch, as, user_(u), AuthRig::kPw).errorCode) failWith_("create user"); keepRigAlive_(); }
         states_.push_back(model_);
         for (const std::string& t : topicNames_()) exists_[t] = -1;
         for (const std::string& t : {topicNames_()[0], topicNames_()[1], topicNames_()[3], topicNames_()[5]}) builderCreate_(t);
@@ -221,12 +225,23 @@ private:
         for (AuthWireClient* w : uw_) v.push_back(&w->raw());
         return v;
     }
+    /// The rig's admin and builder sessions are reaped after 10 s without a keepalive, and a wait on one wire client
+    /// (a login, a probe) pumps only that client: such waits pump these two as well.
+    void keepRigAlive_() {
+        for (const auto& [c, sid, who] : {std::tuple{&rig_.broker().admin().raw(), rig_.broker().adminSession(), "admin"},
+                                          std::tuple{&rig_.c(), rig_.builder, "builder"}}) {
+            if (const auto quiet = std::chrono::duration_cast<std::chrono::milliseconds>(c->silentFor(sid)); quiet > 8s)
+                failWith_(std::string("the rig's ") + who + " session went " + std::to_string(quiet.count()) + " ms without a keepalive (the gateway reaps it at 10 s)");
+            (void)c->pollFor(0ms, [] { return false; });
+        }
+    }
     void login_(std::size_t i) {
         Sess& s = sess_[i];
         // Issue #189: ONLY a login the per-source throttle refuses (an answer carrying a retry_after hint, spec §5) is
         // retried, after that hint, like the real client - bounded.  Any other refusal of an enabled user (a wrongful
         // AuthenticationFailed after an answered ENABLE, a missing answer) fails the run at once.
         for (int attempt = 0; attempt < 30; ++attempt) {
+            keepRigAlive_();
             s.sid = s.w->connect(rig_.ch());
             if (s.sid <= 0) { failWith_("connect"); return; }
             const auto l = s.w->login(rig_.ch(), s.sid, user_(s.user), {AuthRig::kPw, AuthRig::kPw});
@@ -311,7 +326,7 @@ private:
                     if (code == 0) maxAcked_[r.topicId] = std::max<int64_t>(maxAcked_.count(r.topicId) ? maxAcked_[r.topicId] : -1, a->baseOffset);
                 }
             } else if (const auto a = s.c->awaitDefine(r.corr, Clock::now() + 1ms)) { code = a->errorCode; got = true; if (code == 0) exists_[r.topic] = a->topicId; }
-            if (!got && revokedFrame_(s)) { got = true; code = 46; if (r.kind == Req::Kind::Create) unknown_.insert(r.topic); }   // the create may or may not have happened   // "SessionRevoked on every in-flight request" (spec §10)
+            if (!got && revokedFrame_(s, r.sid)) { got = true; code = 46; if (r.kind == Req::Kind::Create) unknown_.insert(r.topic); }   // the create may or may not have happened   // "SessionRevoked on every in-flight request" (spec §10)
             // A produce ended by the revocation may still have been appended (the worker admitted it; its ack was
             // superseded by the session-level SessionRevoked): it keeps counting toward the log-end bound - but only
             // if some state it was in flight under allowed the WRITE (an unauthorized produce must never be appended).
@@ -348,7 +363,7 @@ private:
                             ++tally_.forcedRaceEnded;
                         }
                     }
-                } else if (revokedFrame_(se)) { s.st = Sub::St::Ended; s.endCode = 46; s.bound = logEndBound_(s); }
+                } else if (revokedFrame_(se, s.sid)) { s.st = Sub::St::Ended; s.endCode = 46; s.bound = logEndBound_(s); }
                 else if (now - s.sentAt_ > 5s) failWith_("unanswered subscribe (step " + std::to_string(s.sentSteps) + ")");
             }
             // invariant 2, the revoke that RACED the Subscribe: it was authorised at some applied prefix <= estSent; once the
@@ -394,8 +409,8 @@ private:
         for (const Req& r : reqs_) b += (r.kind == Req::Kind::Produce && r.topicId == s.topicId) ? 1 : 0;
         return b;
     }
-    static bool revokedFrame_(Sess& s) {
-        for (const auto& e : s.c->errors()) if (e.sessionId == s.sid && e.code == 46) return true;
+    static bool revokedFrame_(const Sess& s, int64_t sid) {
+        for (const auto& e : s.c->errors()) if (e.sessionId == sid && e.code == 46) return true;
         return false;
     }
     static std::size_t pushes_(Sess& s, int64_t subId) {
@@ -452,7 +467,7 @@ private:
         if (si == sess_.size()) { failWith_("forced race: no live session of " + user_(u)); return; }
         Sess& se = sess_[si];
         rig_.broker().node().holdRecordEgressResolveForTest(true);
-        Sub sub; sub.sess = static_cast<int>(si); sub.topic = t; sub.topicId = exists_[t]; sub.forced = true;
+        Sub sub; sub.sess = static_cast<int>(si); sub.sid = se.sid; sub.topic = t; sub.topicId = exists_[t]; sub.forced = true;
         sub.lo_ = answeredPrefix_(); sub.sentAt_ = Clock::now(); sub.sentSteps = step_;
         sub.corr = se.c->sendSubscribe(rig_.ch(), AuthRig::stream(), se.sid, sub.topicId, 0);
         note_("forced race: subscribe " + t + " as " + user_(u) + "/" + std::to_string(si) + " (egress resolve held)");
@@ -559,14 +574,14 @@ private:
         if (roll < 66) {   // produce (worker ingress or gateway-routed)
             const std::string t = ex[static_cast<std::size_t>(pick_(static_cast<int>(ex.size())))];
             Req r; r.kind = Req::Kind::Produce; r.sess = static_cast<int>(si); r.topic = t; r.topicId = exists_[t]; r.routed = pick_(2) == 0;
-            r.corr = s.c->nextCorrelationId(); r.lo = answeredPrefix_(); r.sentAt = Clock::now(); r.step = step_;
+            r.corr = s.c->nextCorrelationId(); r.sid = s.sid; r.lo = answeredPrefix_(); r.sentAt = Clock::now(); r.step = step_;
             note_(std::string("produce(") + (r.routed ? "routed" : "shard") + ") " + t + " as " + user_(s.user) + "/" + std::to_string(si));
             const std::string& chan = r.routed ? rig_.ch() : rig_.broker().workerIngressChannel();
             if (!s.c->produce(chan, AuthRig::stream(), s.sid, r.corr, r.topicId, 0, 1, makeCharBatch(1))) { failWith_("produce send"); return; }
             reqs_.push_back(r);
         } else if (roll < 84) {   // subscribe
             const std::string t = ex[static_cast<std::size_t>(pick_(static_cast<int>(ex.size())))];
-            Sub sub; sub.sess = static_cast<int>(si); sub.topic = t; sub.topicId = exists_[t];
+            Sub sub; sub.sess = static_cast<int>(si); sub.sid = s.sid; sub.topic = t; sub.topicId = exists_[t];
             sub.lo_ = answeredPrefix_(); sub.sentAt_ = Clock::now(); sub.sentSteps = step_;
             sub.corr = s.c->sendSubscribe(rig_.ch(), AuthRig::stream(), s.sid, sub.topicId, 0);
             note_("subscribe " + t + " as " + user_(s.user) + "/" + std::to_string(si));
@@ -577,7 +592,7 @@ private:
             for (const std::string& n : topicNames_()) if (exists_[n] < 0 && !creating_.count(n) && !unknown_.count(n)) free.push_back(n);
             if (free.empty()) { note_("idle"); return; }
             const std::string t = free[static_cast<std::size_t>(pick_(static_cast<int>(free.size())))];
-            Req r; r.kind = Req::Kind::Create; r.sess = static_cast<int>(si); r.topic = t;
+            Req r; r.kind = Req::Kind::Create; r.sess = static_cast<int>(si); r.sid = s.sid; r.topic = t;
             r.corr = s.c->sendDefineTopic(rig_.ch(), AuthRig::stream(), s.sid, t, 1, authRigCharBlob());
             r.lo = answeredPrefix_(); r.sentAt = Clock::now(); r.step = step_;
             note_("create " + t + " as " + user_(s.user) + "/" + std::to_string(si));
@@ -725,6 +740,7 @@ private:
             if (fin.isEnabled(user_(u))) continue;
             ++tally_.disabledUsersAtEnd;
             const auto l = uw_[static_cast<std::size_t>(u) * 3]->connectAndLogin(rig_.ch(), user_(u), AuthRig::kPw);
+            keepRigAlive_();
             rig_.broker().node().resetLoginThrottleForTest();
             if (!(!l.ok() && l.answered() && l.errorCode() == static_cast<uint16_t>(pc::ErrorCode::AuthenticationFailed) && l.fin->retryAfterMs == 0)) {
                 failWith_("CONVERGENCE: the login of disabled user " + user_(u) + " was not definitely refused (answered=" +
@@ -749,6 +765,7 @@ private:
                         const std::string& chan = routed ? rig_.ch() : rig_.broker().workerIngressChannel();
                         if (!s.c->produce(chan, AuthRig::stream(), s.sid, corr, exists_[t], 0, 1, makeCharBatch(1))) break;
                         const auto ack = s.c->awaitProduceResponseUntil(corr, Clock::now() + 5s);
+                        keepRigAlive_();
                         code = ack ? ack->errorCode : kNoAnswer;
                         if (code == 0 || code == 45 || code == kNoAnswer) break;
                         std::this_thread::sleep_for(25ms);
@@ -763,6 +780,7 @@ private:
                 int sc = kNoAnswer;
                 for (int a = 0; a < 80; ++a) {
                     sc = s.c->awaitSubscribeCode(s.c->sendSubscribe(rig_.ch(), AuthRig::stream(), s.sid, exists_[t], 0), Clock::now() + 5s).value_or(kNoAnswer);
+                    keepRigAlive_();
                     if (sc != static_cast<int>(pc::ErrorCode::NotLeader)) break;
                     std::this_thread::sleep_for(25ms);
                 }

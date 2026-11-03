@@ -233,7 +233,7 @@ TEST(GetViewRowRegression, GetViewRowAbsentKeyReturnsTypedAbsent) {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
     };
     SrcReplica srcRep;
-    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, rune::view::kNoAbortedTxns, 0, nullptr, srcRep.gen());
+    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, rune::view::kNoSkip, 0, nullptr, srcRep.gen());
 
     Worker w(/*workerId*/ 0);
     w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
@@ -265,7 +265,7 @@ TEST(GetViewRowRegression, GetViewRowReturnsCurrentRowAfterFold) {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
     };
     SrcReplica srcRep;
-    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, rune::view::kNoAbortedTxns, 0, nullptr, srcRep.gen());
+    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, rune::view::kNoSkip, 0, nullptr, srcRep.gen());
 
     Worker w(/*workerId*/ 0);
     w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
@@ -421,7 +421,7 @@ TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
     };
     SrcReplica srcRep;
-    vsByWorker[srcOwner]->driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, rune::view::kNoAbortedTxns, 0, nullptr,
+    vsByWorker[srcOwner]->driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, rune::view::kNoSkip, 0, nullptr,
                                      srcRep.gen());
 
     pool.worker(srcOwner).setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
@@ -486,7 +486,7 @@ TEST(GetViewRowRegression, ViewReadOnANonLeaderSourceReplicaAnswersNotLeaderNeve
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
     };
     SrcReplica srcRep;
-    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, rune::view::kNoAbortedTxns, 0, nullptr, srcRep.gen());
+    vs.driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, rune::view::kNoSkip, 0, nullptr, srcRep.gen());
 
     Worker w(/*workerId*/ 0);
     w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
@@ -874,7 +874,7 @@ struct LeaseRig {
         auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
             return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
         };
-        vs->driveFolds(kSrcTopicId, 0, readRange, /*bound*/ 1, rune::view::kNoAbortedTxns, 0, nullptr, srcRep.gen());
+        vs->driveFolds(kSrcTopicId, 0, readRange, /*bound*/ 1, rune::view::kNoSkip, 0, nullptr, srcRep.gen());
         w = std::make_unique<Worker>(0);
         w->setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});
         w->setViewSet(vs.get());
@@ -958,7 +958,7 @@ TEST(ViewReadLeaseRegression, ALeaseNeverOvertakesADemotionOnAFullOpRingRegressi
         return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
     };
     SrcReplica srcRep;
-    vs.driveFolds(kSrcTopicId, 0, readRange, 1, rune::view::kNoAbortedTxns, 0, nullptr, srcRep.gen());
+    vs.driveFolds(kSrcTopicId, 0, readRange, 1, rune::view::kNoSkip, 0, nullptr, srcRep.gen());
     // A small op ring so it can be filled.
     Worker w(/*workerId*/ 0, /*ingressRingBytes*/ 64 * 1024);
     w.setOwnedDirect(Worker::OwnedSet{srcRep.replica.get()});

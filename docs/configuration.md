@@ -35,6 +35,7 @@ value as false). *ring/size* values must be powers of two; any other value keeps
 | Variable | Default | Meaning |
 |---|---|---|
 | `RUNE_ELECTION_TIMEOUT_MS` | `150` | Maximum wait per election round (positive ms). Raise it for slow or cross-datacenter links. |
+| `RUNE_VERDICT_INTERVAL_MS` | `100` | How often a verdict source's leader writes a verdict marker when nothing was rejected (positive ms). A rejection writes one at once. |
 | `RUNE_ELECTION_STATUS_INTERVAL_MS` | `20` | Canvass and heartbeat cadence (positive ms). The leader-heartbeat timeout is `max(election timeout, 3 x this)`. |
 | `RUNE_STARTUP_CANVASS_TIMEOUT_MS` | `100` | Extended canvass window on first boot, for peer discovery (positive ms). |
 | `RUNE_CONTROLLED_SHUTDOWN_MS` | `5000` | Budget for handing partition leadership to in-sync peers on SIGTERM. `0` = no hand-off. |
@@ -117,7 +118,7 @@ authentication enabled, and with any of these variables set, instead of starting
 | Variable | Default | Meaning |
 |---|---|---|
 | `RUNE_AERON_TERM_BUFFER_BYTES` | `1048576` (1 MiB) | Term buffer length of the embedded driver (power of two). Every publication maps three terms. |
-| `RUNE_AERON_CONTROL_TERM_BYTES` | `1048576` | Term length of the control-plane publications (power of two, at least 65536). |
+| `RUNE_AERON_CONTROL_TERM_BYTES` | `1048576` | Term length of the control-plane publications (power of two, at least 65536). Per-session ack publications are raised to at least 512 KiB (`withAckTermLength`, the `minAckTermBytes` of `Worker::setShardClient`): a 4096-verdict `View` ack is offered as one message and Aeron caps a message at term / 8. |
 | `RUNE_AERON_MTU` | derived from the host | MTU in bytes, `33` to `65504`. Clamped to a 32-byte multiple and to the socket buffer at start. |
 | `RUNE_AERON_RCV_WINDOW` | derived (Aeron's is 128 KiB) | Receive window (power of two). It must not exceed the socket buffer or half a term. |
 | `RUNE_AERON_SOCKET_BUFFER_BYTES` | derived | `SO_SNDBUF` / `SO_RCVBUF` in bytes; `0` leaves Aeron's default. The kernel clamps it to `net.core.rmem_max` / `wmem_max`. |

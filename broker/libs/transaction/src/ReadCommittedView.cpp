@@ -313,7 +313,9 @@ RcBuilder::Result RcBuilder::step(const uint8_t* batch, std::size_t avail)
 
     const auto attrs = static_cast<uint16_t>(reader.attributes());
     if ((attrs & static_cast<uint16_t>(kAttrControl)) != 0) [[unlikely]] {
-        // Markers are recognised ONLY as real control batches (CRC-verified).
+        // Markers are recognised ONLY as real control batches (CRC-verified).  A producerId -1 control batch is a
+        // checked-writes record (types 16-19): never a COMMIT or ABORT.
+        if (reader.producerId() < 0) return res;
         ControlMarkerPayload payload;
         if (!ControlMarker::extract(batch, 0, payload, static_cast<std::size_t>(totalLen))) return res;
         const bool commit = (payload.controlType == ControlType::Commit);

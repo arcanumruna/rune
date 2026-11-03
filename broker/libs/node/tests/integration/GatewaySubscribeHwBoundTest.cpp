@@ -796,24 +796,10 @@ TEST(GR6_Integration, SubscriberBoundedByHW_FullyReplicated) {
     ASSERT_TRUE(node1.awaitLeader(8s)) << "node1 did not find a leader";
     ASSERT_TRUE(node2.awaitLeader(8s)) << "node2 did not find a leader";
     ASSERT_EQ(rune::node::test::TestCluster({&node0, &node1, &node2}).defineTopic(gr6Topic()), 0);
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0.leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-
     std::array<rune::node::BrokerNode*, 3> allNodes{&node0, &node1, &node2};
-    rune::node::BrokerNode* leaderNode = allNodes[lid];
-
-    // Wait for replication leadership to be propagated.
-    {
-        const auto deadline = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(10ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
+    const int lid = settledPartitionLeader(allNodes);   // D11: the partition leader, not the consensus leader
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
+    rune::node::BrokerNode* leaderNode = allNodes[static_cast<std::size_t>(lid)];
 
     // Wait for full ISR (all 3 nodes).
     ASSERT_TRUE(hasReplica(*leaderNode));

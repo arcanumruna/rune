@@ -70,7 +70,7 @@ struct Set {
     void fold(int32_t partition, int64_t bound, uint64_t leaderGen = 0) {
         const auto batch = upserts(2);
         auto readRange = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2}; };
-        vs.driveFolds(kSrc, partition, readRange, bound, rune::view::kNoAbortedTxns, 0, nullptr, leaderGen);
+        vs.driveFolds(kSrc, partition, readRange, bound, rune::view::kNoSkip, 0, nullptr, leaderGen);
     }
 };
 

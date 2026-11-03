@@ -97,6 +97,7 @@ out=$(docker build \
     --build-context flight-recorder="${FLIGHT_RECORDER_SRC}" \
     --build-context rune-ql="${PROJECTS}/ql" \
     --build-context rune-crypto="${PROJECTS}/crypto" \
+    --build-context aeron-recipe="${PROJECTS}/conan/aeron" \
     -t "${PROBE_IMAGE}" \
     "${CLIENT_REPO}" 2>&1); rc=$?
 set -e

@@ -317,6 +317,7 @@ public:
         const auto deadline = std::chrono::steady_clock::now() + budget;
         while (std::chrono::steady_clock::now() < deadline) { poll_(); if (pred()) return true; pause_(); }
         poll_();
+        keepalive_tick_();   // a zero-budget poll (a test pumping many clients round-robin) never reaches pause_()
         return pred();
     }
     const std::vector<PushedRecords>& records() const noexcept { return records_; }

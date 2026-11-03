@@ -123,7 +123,7 @@ struct Fixture {
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
         worker->setWorkerIngress(ing.get(), true);
         worker->setShardMode(true);
-        worker->setShardClient(client.get());
+        worker->setShardClient(client.get(), 0, /*minAckTermBytes=*/0);   // these tests stall a 64 KiB window
         const int64_t sreg = client->addSubscription("aeron:ipc", kEgress);
         const int64_t preg = client->addExclusivePublication("aeron:ipc", kIngress);
         for (int i = 0; i < kCap && !(egress && producePub && producePub->isConnected()); ++i) {

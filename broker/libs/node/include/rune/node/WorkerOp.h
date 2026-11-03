@@ -14,7 +14,8 @@
 //                     push; return PushReadReturn with the data chunk.
 //   ApplyReplicated — transport → worker; execute PartitionReplica::applyReplicated;
 //                     no return (fire-and-forget — the follower has no response to
-//                     send back to the gateway).
+//                     send back to the gateway).  nextOffset = the leader's read
+//                     origin (FetchResponse.fromOffset, -1 = none; #789).
 //   BecomeLeader    — bridge → worker; execute PartitionReplica::becomeLeader on
 //                     the owning worker thread (shared-nothing E2 role-change fix).
 //   BecomeFollower  — bridge → worker; execute PartitionReplica::becomeFollower on

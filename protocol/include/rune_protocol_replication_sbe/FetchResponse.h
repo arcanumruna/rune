@@ -116,11 +116,11 @@ private:
     }
 
 public:
-    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(34);
+    static constexpr std::uint16_t SBE_BLOCK_LENGTH = static_cast<std::uint16_t>(42);
     static constexpr std::uint16_t SBE_TEMPLATE_ID = static_cast<std::uint16_t>(2);
     static constexpr std::uint16_t SBE_SCHEMA_ID = static_cast<std::uint16_t>(112);
-    static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(4);
-    static constexpr const char* SBE_SEMANTIC_VERSION = "1.2";
+    static constexpr std::uint16_t SBE_SCHEMA_VERSION = static_cast<std::uint16_t>(5);
+    static constexpr const char* SBE_SEMANTIC_VERSION = "1.3";
 
     enum MetaAttribute
     {
@@ -174,7 +174,7 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeBlockLength() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(34);
+        return static_cast<std::uint16_t>(42);
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t sbeBlockAndHeaderLength() SBE_NOEXCEPT
@@ -194,12 +194,12 @@ public:
 
     SBE_NODISCARD static SBE_CONSTEXPR std::uint16_t sbeSchemaVersion() SBE_NOEXCEPT
     {
-        return static_cast<std::uint16_t>(4);
+        return static_cast<std::uint16_t>(5);
     }
 
     SBE_NODISCARD static const char *sbeSemanticVersion() SBE_NOEXCEPT
     {
-        return "1.2";
+        return "1.3";
     }
 
     SBE_NODISCARD static SBE_CONSTEXPR const char *sbeSemanticType() SBE_NOEXCEPT
@@ -693,6 +693,74 @@ public:
         return *this;
     }
 
+    SBE_NODISCARD static const char *fromOffsetMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
+    {
+        switch (metaAttribute)
+        {
+            case MetaAttribute::PRESENCE: return "required";
+            default: return "";
+        }
+    }
+
+    static SBE_CONSTEXPR std::uint16_t fromOffsetId() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::uint64_t fromOffsetSinceVersion() SBE_NOEXCEPT
+    {
+        return 5;
+    }
+
+    SBE_NODISCARD bool fromOffsetInActingVersion() SBE_NOEXCEPT
+    {
+        return m_actingVersion >= fromOffsetSinceVersion();
+    }
+
+    SBE_NODISCARD static SBE_CONSTEXPR std::size_t fromOffsetEncodingOffset() SBE_NOEXCEPT
+    {
+        return 34;
+    }
+
+    static SBE_CONSTEXPR std::int64_t fromOffsetNullValue() SBE_NOEXCEPT
+    {
+        return SBE_NULLVALUE_INT64;
+    }
+
+    static SBE_CONSTEXPR std::int64_t fromOffsetMinValue() SBE_NOEXCEPT
+    {
+        return INT64_C(-9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::int64_t fromOffsetMaxValue() SBE_NOEXCEPT
+    {
+        return INT64_C(9223372036854775807);
+    }
+
+    static SBE_CONSTEXPR std::size_t fromOffsetEncodingLength() SBE_NOEXCEPT
+    {
+        return 8;
+    }
+
+    SBE_NODISCARD std::int64_t fromOffset() const SBE_NOEXCEPT
+    {
+        if (m_actingVersion < 5)
+        {
+            return INT64_MIN;
+        }
+
+        std::int64_t val;
+        std::memcpy(&val, m_buffer + m_offset + 34, sizeof(std::int64_t));
+        return SBE_LITTLE_ENDIAN_ENCODE_64(val);
+    }
+
+    FetchResponse &fromOffset(const std::int64_t value) SBE_NOEXCEPT
+    {
+        std::int64_t val = SBE_LITTLE_ENDIAN_ENCODE_64(value);
+        std::memcpy(m_buffer + m_offset + 34, &val, sizeof(std::int64_t));
+        return *this;
+    }
+
     SBE_NODISCARD static const char *recordsMetaAttribute(const MetaAttribute metaAttribute) SBE_NOEXCEPT
     {
         switch (metaAttribute)
@@ -907,6 +975,10 @@ friend std::basic_ostream<CharT, Traits> & operator << (
     builder << ", ";
     builder << R"("topicId": )";
     builder << +writer.topicId();
+
+    builder << ", ";
+    builder << R"("fromOffset": )";
+    builder << +writer.fromOffset();
 
     builder << ", ";
     builder << R"("records": )";

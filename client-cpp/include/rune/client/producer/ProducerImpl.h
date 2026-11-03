@@ -1105,7 +1105,7 @@ public:
     /// the partition's log start carried with UnknownProducerId (-1 = not
     /// carried) — rule U decides retention (re-sequence) from loss (unknown).
     void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
-                           int64_t logStartOffset = -1);
+                           int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {});
 
     /// Called on redirect-reconnect failure (SessionLost) and by the close paths
     /// (duty-cycle thread, or after it stopped): fails AND drops every accepted
@@ -1725,7 +1725,11 @@ private:
     /// the onAck handler, or the Client's CQ registry.  Duty thread; never
     /// allocates, never throws.
     void completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t aux, OpStatus st,
-                         uint16_t errorCode) noexcept;
+                         uint16_t errorCode, uint32_t constraintId = 0) noexcept;
+    /// completeSlice_ for an Ok batch whose View ack carried a verdict trailer: a rejected record completes BrokerError
+    /// (code, constraintId); a Tier-2 batch completes once, with its first rejection.
+    void completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset, bool tier2,
+                               int32_t recordCount, std::span<const uint8_t> verdicts) noexcept;
     /// Completes the handles of slice [ackStart, ackStart+ackCount): record i ->
     /// baseOffset + i (Ok), or -1 with `st` / `errorCode`.  `tier2`: the slice
     /// is one Tier-2 batch (op Tier2Batch, aux = recordCount).  Zeroes each

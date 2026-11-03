@@ -254,10 +254,10 @@ void BM_NsViewPointRead(benchmark::State& state) {
     auto rd = [&](int64_t f, int64_t t) { return log.read(f, t); };
     for (int i = 0; i < 2; ++i) {
 #if RUNE_NSB
-        (void)vs.driveFolds(1, 0, rd, log.end, rv::kNoAbortedTxns, 0, nullptr, fix.replica->leadershipGeneration(), true,
+        (void)vs.driveFolds(1, 0, rd, log.end, rv::kNoSkip, 0, nullptr, fix.replica->leadershipGeneration(), true,
                             rune::node::NsTag{kSlot, kNs});
 #else
-        (void)vs.driveFolds(1, 0, rd, log.end, rv::kNoAbortedTxns, 0, nullptr, fix.replica->leadershipGeneration(), true);
+        (void)vs.driveFolds(1, 0, rd, log.end, rv::kNoSkip, 0, nullptr, fix.replica->leadershipGeneration(), true);
 #endif
     }
     fix.worker->setViewSet(&vs);

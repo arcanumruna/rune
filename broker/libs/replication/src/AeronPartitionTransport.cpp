@@ -327,7 +327,8 @@ bool AeronPartitionTransport::enqueueFetchResponse(int32_t                 targe
     uint8_t* payload = reinterpret_cast<uint8_t*>(slot) + lenPos + isbe::OutboundFrame::payloadHeaderLength();
     FetchResponseMsg::encode(payload, 0,
                              resp.leaderEpoch, resp.partition, resp.highWatermark,
-                             resp.logStartOffset, resp.errorCode, resp.records, resp.topicId);
+                             resp.logStartOffset, resp.errorCode, resp.records, resp.topicId,
+                             resp.fromOffset);
     if (reconcile) {
         // DR reverse-catch-up: re-stamp the FetchResponse templateId in place so it
         // routes to the reconcile handlers (matches sendReconcileResponse's wire).
@@ -1029,6 +1030,7 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             op.partition                         = resp.partition;
             op.replica                           = rep;
             op.logPtr                            = nullptr; // not needed for ApplyReplicated
+            op.nextOffset                        = resp.fromOffset;   // #789: the leader's read origin
             op.replicatedPayload.leaderEpoch     = resp.leaderEpoch;
             op.replicatedPayload.partition       = resp.partition;
             op.replicatedPayload.highWatermark   = resp.highWatermark;

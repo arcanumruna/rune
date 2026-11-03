@@ -194,7 +194,10 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
 - **`Acks::View`** is a flag that combines with the above (`Acks::All | Acks::View`): the ack waits until the batch is
   folded into the views and carries the per-record write verdicts. It needs a broker that supports checked writes; against
   an older broker every send completes locally with `OpStatus::BrokerTooOld`. `View` batches hold at most 4096 records
-  (`claimBatch` with more returns `SendResult::MessageTooLarge`, `BatchBuilder` throws `std::length_error`). A transactional
+  (`claimBatch` with more returns `SendResult::MessageTooLarge`, `BatchBuilder` throws `std::length_error`). On a verdict source each record of a `View` batch completes as it was judged: `Ok` with its offset, or
+  `BrokerError` with `errorCode` 55 to 57 and `constraintIdOf(completion)`; a Tier-2 batch completes once with its first
+  rejection. A retry inside the broker's window replays the original verdicts; a retry outside it completes the whole batch
+  with `OpStatus::VerdictUnknown` (`errorCode` 21). `OpStatus::StoredIdUnknown` (13) is reserved. A transactional
   producer never sends the `View` bit. `SendResult::WriteNotAllowed` reports a write the broker refuses for the topic. On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
 - **`Key`**: up to 16 inline bytes, built from a `uint64_t`/`int64_t`, a trivially-copyable value or a byte span. The key
   picks the partition (`Key::partition(n)`, FNV-1a 64) and is stored with the record. A key is never truncated: a span of

@@ -273,7 +273,7 @@ log "Step 1c: building the filter_probe image (${PROBE_IMAGE})..."
 set +e
 out=$(docker build --platform linux/amd64 -f "${CLIENT_REPO}/docker/Dockerfile.filter-probe" \
     --build-context rune-protocol="${PROJECTS}/protocol" --build-context rune-codec="${PROJECTS}/codec" \
-    --build-context rune-crypto="${PROJECTS}/crypto" --build-context flight-recorder="${FLIGHT_RECORDER_DIR}" \
+    --build-context rune-crypto="${PROJECTS}/crypto" --build-context aeron-recipe="${PROJECTS}/conan/aeron" --build-context flight-recorder="${FLIGHT_RECORDER_DIR}" \
     --build-context rune-ql="${PROJECTS}/ql" -t "${PROBE_IMAGE}" "${CLIENT_REPO}" 2>&1); rc=$?
 set -e
 echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
