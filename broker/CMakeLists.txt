@@ -515,10 +515,13 @@ if(BUILD_BENCHMARKS)
         benchmark::benchmark_main)
 
     # ── ControlDutyCycleBench — standalone: SystemMetrics cost on the control duty cycle (header-only metrics) ──
-    add_executable(ControlDutyCycleBench
-        benchmark/BenchmarkMain.cpp
-        benchmark/ControlDutyCycleBench.cpp)
-    target_link_libraries(ControlDutyCycleBench PRIVATE metrics benchmark::benchmark)
+    # It measures a Linux-only path (SYS_getdents64), so it is not built elsewhere.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(ControlDutyCycleBench
+            benchmark/BenchmarkMain.cpp
+            benchmark/ControlDutyCycleBench.cpp)
+        target_link_libraries(ControlDutyCycleBench PRIVATE metrics benchmark::benchmark)
+    endif()
 
     # ── NamespaceHotPathBench (namespaces Phase 2 Task 15) — produce / fetch / point read with the namespace gate and counters;
     #    compiled unchanged at the Phase 1 merge for the A side of the ABAB (see the file header).
