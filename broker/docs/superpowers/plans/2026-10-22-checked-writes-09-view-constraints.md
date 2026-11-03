@@ -112,7 +112,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 
 ## What batch 1 decides for this part (binding; added 2026-11-03)
 
-Issue batch 1 (`bugfix/issue-batch-1-views`) settles four things this part builds on. **Start Part 09 only after batch 1 is on `main`.** Where batch 1 contradicts a ruling or task below, batch 1 wins and the task is read as amended here.
+Issue batch 1 (`bugfix/issue-batch-1-views`) settles five things this part builds on. **Start Part 09 only after batch 1 is on `main`.** Where batch 1 contradicts a ruling or task below, batch 1 wins and the task is read as amended here.
 
 1. **B1-1 — A lagging leader never undoes a newer constraint change (#788; amends P9-5, P9-6 and Task 5).**
    - **Bug class.** `syncConstraintSet_` (`WorkerViewSet.cpp`) builds the desired set from the templates installed on this worker. Nothing orders that against the logged set. A leader whose catalog has not yet applied a DDL change computes the old set and logs it. For example, a replace is reverted (fp2 → fp1) and the replicas that had already replaced wait forever (#788). P9-5's candidate path has the same hole, and so do a create or drop that the new leader has not applied yet.
@@ -144,10 +144,13 @@ Issue batch 1 (`bugfix/issue-batch-1-views`) settles four things this part build
      - A checkpoint whose unique-claim tables 6 and 7 are unreadable or inconsistent is a discard. Use reason `unreadable`.
      - A persisted Unique or Check member discarded at activation is a discard. Use reason `ahead-of-verdicts`.
      - Any rebuild this part adds for a persisted constrained view is a discard. Use an existing reason, or add an enumerator to `ViewDiscardReason`.
+     - The enumerators that exist (`ViewSnapshotChannel.h`): `Legacy`, `LegacySuperseded`, `Unreadable`, `AheadOfLog`, `AheadOfVerdicts`, `BelowLogStart`. File names use their kebab form (`unreadable`, `ahead-of-verdicts`, `below-log-start`).
+     - **The log-start rule (#726, batch 1 C3).** `driveView_` and the verdict judge compare a view's `foldCursor` with the source's `logStart` (`SourceLogBounds`, disk sources only): no rows → the cursor starts at `logStart`; rows → `beginDiscard_(BelowLogStart)`. Unique and Check members inherit it, and their claim tables 6 and 7 are part of the backed-up checkpoint. Compaction never moves `logStart`, so `PreExistingDuplicatesSurviveCompactionAndRefoldRegression` stays a refold without a discard; a retention cell (`deleteRetentionMs` past the first segment) must show one `below-log-start` backup.
      - Nothing truncates a checkpoint or resets tables directly.
      - Transient constrained views have no file. `beginDiscard_` resets them in place and sends no frame, so the P9-9 transient rebuild needs nothing extra.
    - **Tests.**
      - The RestartDuringRebuild cells assert exactly one backup per discard of a persisted constrained view. The backup is checked through batch 1's read-back seam and must hold the pre-discard rows and claims.
+       The seam is `listViewBackups(dir, viewTopicId, partition)` and `viewBackupDir(dir)` (`ViewSnapshotIoAgent.h`, `ViewSnapshotChannel.h`), driven with `WorkerViewSet::beginDiscardForTest` / `checkpointStateForTest` and `ViewSnapshotIoAgent::forceWriteFailureForTest` for the failed-backup cell.
      - With the knob off, no backup is taken.
      - A failed backup gives `DiscardFailed`: the view stays NotReady and writers on that source wait. They are never judged against an empty claim table.
 
@@ -171,6 +174,19 @@ Issue batch 1 (`bugfix/issue-batch-1-views`) settles four things this part build
 4. **B1-4 — The verdict-member refold keeps batch 1's fix (amends Task 4 and Task 6).**
    - **Batch 1's fix.** It routes `discardCheckpointAhead_` through `beginDiscard_`, which backs up first and then refolds from `logStart`. Before this, the refold dropped the persisted member's rows with no backup.
    - **What this part must do.** When this part extends the refold to Unique and Check members, including the retained-plan install of P9-8, it calls the same hook. It must not bring back a direct `foldCursor = 0` or a table reset.
+
+5. **B1-5 — The aborted-transaction filter is a concrete type (#591; amends Task 2 and Task 4).**
+   - **Batch 1's change.** `AbortedTxnFilter` holds the concrete `AbortedTxnIndex` and `isAborted` is inline; the fold path no longer makes an indirect call per record (bench `BM_ViewFoldReplace` txn arg).
+   - **What this part must do.** The unique-claim fold and the Check evaluation skip aborted records through the same `AbortedTxnFilter`. No `std::function`, virtual or new indirection is added to that path. Task 12's alloc gate and benches cover the transactional arg.
+
+**What batch 2 changes under this part (`bugfix/issue-batch-2-*`; in progress; whichever of batch 2 and this part merges second rebases onto the other).**
+- **2C #640 — catalog DDL is authorized against the target's namespace.** `authorizeCatalogDdl_` passes the target object's nsId to `authorizeName`, never the caller's. Task 3's `unique` / `check` create, replace and drop go through that path unchanged; add one cell per DDL where a non-root user of namespace A names a view in namespace B → `NotAuthorized` (45).
+- **2C #652 — the DDL audit principal is qualified.** A tenant's DDL event records `<ns>/<user>` (or `#<nsId>/<user>` when the namespace record is gone); `default` stays bare. Constraint DDL events inherit it. The fingerprint ignores the principal, so P9-5's candidate and fingerprint rules are unchanged.
+- **2C #625 — `ObjectIndex` keeps the older live holder of a shared name.** Dropping a constrained view while a newer object of the same name exists re-points the name to the highest live id. P9-12 resolves by `objectId`, so `constraintName` is unaffected; Task 7's "drop then recreate the same name" cell must still resolve the old id to the old view.
+- **2D-2 #737 / #738 / #734 part 2 — `client-cpp/src/producer/ProducerImpl.cpp`.** They edit `onCoordinatorAnswer` and the `sweepTimedOut` signatures, the file Task 7 edits for the rejected record's offset. Hunks are separate; no shared logic.
+- **2E #796 — aborted-fold cells pinned.** New `ViewFold` / `AggFold` tests pin that `skippedAborted` counts aborted *batches*. Task 2's fold changes keep them green.
+- **2E #658 part A — `SkimpyOffsetMap(Sizing)`.** The cleaner's dedupe map is built from `sizingForBudget(budget)` and sized by the new `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` (default 128 MiB, which before allocated 256 MiB). Any cleaner this part constructs in a test (type 20's `VerdictPlanRecordsAreAlwaysKept`) uses that constructor.
+- Batch 2's other waves (peer-link, flakes, transport/NAT egress, metrics, CI) touch nothing this part reads or edits.
 
 **Handoffs, not decisions.**
 - #785 (activation below a drop) and #805 (type 20) stay open for this part's Task 6 and P9-8.
