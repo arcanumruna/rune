@@ -818,12 +818,13 @@ TEST(CheckedWritesVerdictSourceRegression, RebuildAcrossACompactionGapBeforeTheM
     EXPECT_TRUE(x.has(3));
 }
 
-// A new leader activates at the coverage K of a marker its scan read above its lagging HW, so judgeCursor_ > bound (here
-// an open transaction starting at 3 holds the LSO at W = 3).  The rejected record 2 was compacted at the end of its
-// segment and the next segment starts at 3 = bound: a member read that stops at the bound is empty until the LSO moves,
-// so the member's catch-up must read past judgeCursor_ as it did before the bound fix.
-TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastTheJudgeCursorAboveTheBoundRegression) {
-    TmpDir dir("cw-judge-above-bound");
+namespace {
+// 0 change {x}, 1 data, 2 rejected (compacted away, so its segment's tail is a gap), 3 data (an open transaction's first
+// record: the LSO, the bound, stays at 3), 4 the committed marker (W = 3, lists 2), 5 data, 6 a marker above the HW
+// (K = 6) or data (K = 3), 7 the active segment.  HW = 5.  Drives the judge of a new leader at bound 3; the member must
+// reach judgeCursor_ = K.
+void catchUpAcrossTheGapAtTheBound(const char* name, bool markerAboveHw) {
+    TmpDir dir(name);
     rune::storage::Log log(dir.path.string(), /*segmentBytes=*/1);   // one batch per segment
     log.recover();
     Member x(7, tagEquals(9));
@@ -845,15 +846,16 @@ TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastTheJudgeCursorA
     std::vector<uint8_t> change(cr::changeBatchBytes(1));
     const cr::ChangeMember cm{x.objectId, uint8_t(VerdictViewKind::TestReject), x.rule.fingerprint()};
     (void)cr::buildConstraintSetChange(change, 1, std::span<const cr::ChangeMember>(&cm, 1));
-    put(change, 0, 1);                                                  // 0: the set {x}
-    data(1, {{1, 1}});                                                  // 1
-    data(2, {{2, 9}});                                                  // 2: rejected, compacted away
-    data(3, {{3, 1}});                                                  // 3: the open transaction's first record
+    put(change, 0, 1);
+    data(1, {{1, 1}});
+    data(2, {{2, 9}});
+    data(3, {{3, 1}});
     const cr::MarkerEntry rejected{1, kViolation, rune::view::constraintIdOf(x.objectId, 1)};   // 2, from 1
-    marker(4, 1, 3, std::span<const cr::MarkerEntry>(&rejected, 1));     // 4: committed, W = 3
-    data(5, {{4, 1}});                                                  // 5
-    marker(6, 3, 6, {});                                                // 6: above the HW, K = 6
-    data(7, {{5, 1}});                                                  // 7: the active segment
+    marker(4, 1, 3, std::span<const cr::MarkerEntry>(&rejected, 1));
+    data(5, {{4, 1}});
+    if (markerAboveHw) marker(6, 3, 6, {});
+    else data(6, {{6, 1}});
+    data(7, {{5, 1}});
     rune::storage::LogCleaner cleaner;
     cleaner.setVerdictBounds(3, 5);
     cleaner.clean(log, 0, log.segmentBaseOffsets().back(), 0, 1'000'000);
@@ -864,7 +866,7 @@ TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastTheJudgeCursorA
         return log.readInto(from, 1 << 16, scratch.data(), scratch.size(), rs, to);
     };
     ASSERT_TRUE(readRange(2, 3).empty());   // the gap: the next segment starts at the bound
-    ASSERT_FALSE(readRange(2, 6).empty());
+    ASSERT_FALSE(readRange(2, 4).empty());
 
     PartitionWriteState st;
     verdictFeedBegin(&st, 0, 0);   // the new leader's scan, to its LEO
@@ -877,18 +879,33 @@ TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastTheJudgeCursorA
     }
     st.scanHw = 5;
     verdictOnHw(st, 5);
+    const int64_t K = markerAboveHw ? 6 : 3;
     ASSERT_EQ(st.markers.committedThrough(), 3);
-    ASSERT_EQ(st.rejected.coveredThrough(), 6);
+    ASSERT_EQ(st.rejected.coveredThrough(), K);
 
     VerdictSource vs{5, 0};
     vs.installTestVerdictViewForTest(x.inst.get(), x.objectId, x.rule);
     vs.bindState(&st);
     vs.bindLeader(nullptr, 1, log.logStartOffset());
     for (int i = 0; i < 6; ++i) (void)vs.driveJudge(readRange, /*bound=*/3, 0, st);
-    EXPECT_EQ(vs.judgedThrough(), 6);
-    EXPECT_EQ(x.inst->foldCursor, 6);
+    EXPECT_EQ(vs.judgedThrough(), K);
+    EXPECT_EQ(x.inst->foldCursor, K);
     EXPECT_TRUE(x.has(1));
     EXPECT_FALSE(x.has(2));
-    EXPECT_TRUE(x.has(3));
-    EXPECT_TRUE(x.has(4));
+    EXPECT_EQ(x.has(3), markerAboveHw);
+    EXPECT_EQ(x.has(4), markerAboveHw);
+}
+}  // namespace
+
+// A new leader activates at the coverage K of a marker its scan read above its lagging HW, so judgeCursor_ > bound.  The
+// gap's next segment starts at the bound: a member read that stops at the bound is empty until the LSO moves, so the
+// member's catch-up must read past judgeCursor_ as it did before the bound fix.
+TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastTheJudgeCursorAboveTheBoundRegression) {
+    catchUpAcrossTheGapAtTheBound("cw-judge-above-bound", /*markerAboveHw=*/true);
+}
+
+// judgeCursor_ == bound == the gap's next segment base: a read to max(bound, judgeCursor_) stops at that base and is
+// empty, so the member stays behind and the judge held until a write raises the bound.  The read must end past it.
+TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastAJudgeCursorAtTheBoundRegression) {
+    catchUpAcrossTheGapAtTheBound("cw-judge-at-bound", /*markerAboveHw=*/false);
 }
