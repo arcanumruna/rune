@@ -227,6 +227,8 @@ if (p.trySend(events, Key(uint64_t{42}), bytes, cq, /*token=*/7) == SendResult::
 ```
 
 - `trySend(..., AckToken{t})` calls the handler you set with `onAck(fn, ctx)` on the duty thread; it must not block.
+- `onAck(AckCompletionFn, ctx)` is the same handler with the full `Completion` (`value`, `aux`, `op`, `errorCode`, and
+  `constraintIdOf(c)` for a rejected `Send`) plus an empty payload span; the last registration (either form) wins.
 - `onBatchAck` / `batchAcksTo(cq)` deliver one `BatchAck` per batch (`baseOffset`, `baseSequence`, `recordCount`,
   `errorCode`, `producerEpoch`).
 - Every accepted record is reported exactly once, including ones that never reached the wire (`BatchAck::kClientFailure`).

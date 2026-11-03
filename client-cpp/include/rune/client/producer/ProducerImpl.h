@@ -970,8 +970,13 @@ public:
     /// reads it (the first record that needs it was sent after this write:
     /// ring order publishes it).
     void setOnAck(AckFn fn, void* ctx) noexcept {
-        onAckFn_  = fn;
-        onAckCtx_ = ctx;
+        onAck_ = AckHandler{fn != nullptr ? AckHandler::Kind::Plain : AckHandler::Kind::None, {}, ctx};
+        onAck_.fn.plain = fn;
+    }
+    /// The full-Completion form; the last call (either form) wins; a null fn clears.
+    void setOnAck(AckCompletionFn fn, void* ctx) noexcept {
+        onAck_ = AckHandler{fn != nullptr ? AckHandler::Kind::Full : AckHandler::Kind::None, {}, ctx};
+        onAck_.fn.full = fn;
     }
     /// Setup phase: per-batch acks to a handler (exclusive with the CQ form).
     /// Throws std::logic_error after a send / when the CQ form is set.
@@ -2125,8 +2130,14 @@ private:
 
     // ---- F8c C6: ack targets (setup phase; read on the duty thread) ------------
     Hooks        hooks_{};
-    AckFn        onAckFn_       = nullptr;
-    void*        onAckCtx_      = nullptr;
+    /// The per-record ack target of AckToken sends: none, the scalar form, or the full-Completion form (one enum, no flags).
+    struct AckHandler {
+        enum class Kind : uint8_t { None, Plain, Full };
+        Kind kind = Kind::None;
+        union Fn { AckFn plain; AckCompletionFn full; } fn{};
+        void* ctx = nullptr;
+    };
+    AckHandler   onAck_{};
     BatchAckFn   batchAckFn_    = nullptr;
     void*        batchAckCtx_   = nullptr;
     CqRef        batchAckCqRef_ = kNoCqRef;   // duty side: the BatchAck queue's registry ref

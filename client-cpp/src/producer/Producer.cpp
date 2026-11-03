@@ -297,6 +297,10 @@ void Producer::onAck(AckFn fn, void* ctx) noexcept {
     if (impl_) impl_->setOnAck(fn, ctx);
 }
 
+void Producer::onAck(AckCompletionFn fn, void* ctx) noexcept {
+    if (impl_) impl_->setOnAck(fn, ctx);
+}
+
 void Producer::onBatchAck(BatchAckFn fn, void* ctx) {
     if (impl_) impl_->setOnBatchAck(fn, ctx);
 }

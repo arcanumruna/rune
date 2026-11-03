@@ -1342,22 +1342,27 @@ void ProducerImpl::setBatchAckCq(Completions* cq, CqRef ref) {
 void ProducerImpl::completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t aux, OpStatus st,
                                    uint16_t errorCode, uint32_t constraintId) noexcept {
     if (h == 0) return;
-    const Token t = ackhandle::token(h);
-    if (ackhandle::isCq(h)) {
-        if (hooks_.cqDeliver == nullptr) return;  // bare rig: no registry
-        Completion c;
-        c.token         = t;
-        c.value         = value;
-        c.aux           = aux;
-        c.op            = op;
-        c.status        = st;
-        c.errorCode     = errorCode;
-        c.reservedBytes = kAckRecordBytes;
-        c.reserved0     = constraintId;
+    const bool cq = ackhandle::isCq(h);
+    if (cq && hooks_.cqDeliver == nullptr) return;  // bare rig: no registry
+    if (!cq && onAck_.kind == AckHandler::Kind::None) return;
+    Completion c;
+    c.token         = ackhandle::token(h);
+    c.value         = value;
+    c.aux           = aux;
+    c.op            = op;
+    c.status        = st;
+    c.errorCode     = errorCode;
+    c.reservedBytes = kAckRecordBytes;
+    c.reserved0     = constraintId;
+    if (cq) {
         hooks_.cqDeliver(hooks_.ctx, ackhandle::cqRef(h), c);
         return;
     }
-    if (onAckFn_ != nullptr) onAckFn_(onAckCtx_, t, value, st, errorCode);  // noexcept by type
+    switch (onAck_.kind) {   // noexcept by type
+        case AckHandler::Kind::Plain: onAck_.fn.plain(onAck_.ctx, c.token, value, st, errorCode); break;
+        case AckHandler::Kind::Full:  onAck_.fn.full(onAck_.ctx, c, std::span<const uint8_t>{}); break;
+        case AckHandler::Kind::None:  break;
+    }
 }
 
 // ---------------------------------------------------------------------------

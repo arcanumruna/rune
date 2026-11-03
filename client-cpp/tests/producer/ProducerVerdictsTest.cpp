@@ -339,3 +339,120 @@ TEST(ProducerVerdictsRegression, TransactionalViewProducerDuplicateIsOkRegressio
     }
     hub.remove(&r.impl);
 }
+
+// ---- #806: Producer::onAck(AckCompletionFn): AckToken sends receive the full Completion a CQ would drain ----
+namespace {
+struct HandlerCapture {
+    std::map<rc::Token, rc::Completion> done;
+    std::map<rc::Token, int> times;
+    std::map<rc::Token, std::size_t> payloadLen;
+    std::map<rc::Token, OpStatus> plain;       // the scalar form
+    std::map<rc::Token, uint16_t> plainError;
+    int plainCalls = 0;
+    static void full(void* ctx, const rc::Completion& c, std::span<const uint8_t> payload) noexcept {
+        auto* self = static_cast<HandlerCapture*>(ctx);
+        self->done[c.token] = c;
+        ++self->times[c.token];
+        self->payloadLen[c.token] = payload.size();
+    }
+    static void scalar(void* ctx, rc::Token t, int64_t, OpStatus st, uint16_t ec) noexcept {
+        auto* self = static_cast<HandlerCapture*>(ctx);
+        self->plain[t] = st;
+        self->plainError[t] = ec;
+        ++self->plainCalls;
+    }
+};
+// The Rig's send(), with AckToken handles (ackhandle::forHandler) instead of CQ handles.
+void sendToHandler(Rig& r, int n) {
+    for (int i = 0; i < n; ++i)
+        EXPECT_TRUE(r.impl.submitSendRecord(1, 0, rc::Key(uint64_t(i + 1)), kVal, true, ackhandle::forHandler(rc::Token(i + 1))));
+    for (int i = 0; i < 1000 && r.corrs.empty(); ++i) {
+        while (r.impl.drainRing(kNow) != 0) {}
+        (void)r.impl.flushBatches(kNow, 42, r.sink);
+    }
+}
+}  // namespace
+
+TEST(ProducerVerdictsRegression, OnAckCarriesConstraintIdRegression) {
+    Rig r;
+    HandlerCapture cap;
+    r.impl.setOnAck(&HandlerCapture::full, &cap);
+    sendToHandler(r, 3);
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({1}));
+    for (rc::Token k = 1; k <= 3; ++k) ASSERT_EQ(cap.times[k], 1) << k;
+    const auto& bad = cap.done[2];   // record index 1
+    EXPECT_EQ(bad.status, OpStatus::BrokerError);
+    EXPECT_EQ(bad.errorCode, kViolation);
+    EXPECT_EQ(rc::constraintIdOf(bad), kCid);
+    EXPECT_EQ(bad.op, rc::OpKind::Send);
+    EXPECT_EQ(bad.value, -1);
+    EXPECT_EQ(cap.done[1].status, OpStatus::Ok);
+    EXPECT_EQ(cap.done[1].value, 100);
+    EXPECT_EQ(rc::constraintIdOf(cap.done[1]), 0u);
+    EXPECT_EQ(cap.done[3].status, OpStatus::Ok);
+    EXPECT_EQ(cap.done[3].value, 102);
+    for (rc::Token k = 1; k <= 3; ++k) EXPECT_EQ(cap.payloadLen[k], 0u) << "a producer ack carries no inline payload";
+    EXPECT_EQ(r.cq.times.size(), 0u) << "the CQ is not called as well";
+}
+
+TEST(ProducerVerdictsRegression, OnAckTier2CarriesRecordCountRegression) {
+    Rig r;
+    HandlerCapture cap;
+    r.impl.setOnAck(&HandlerCapture::full, &cap);
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    for (int i = 0; i < 5; ++i) b.append(std::string_view("k"), std::string_view("v"), 1000);
+    const auto bytes = b.build();
+    ASSERT_EQ(r.impl.submitTier2Bytes(1, 0, ackhandle::forHandler(rc::Token(1)), 5, bytes), rc::producer::RejectReason::None);
+    for (int i = 0; i < 1000 && r.corrs.empty(); ++i) {
+        while (r.impl.drainRing(kNow) != 0) {}
+        (void)r.impl.flushBatches(kNow, 42, r.sink);
+    }
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, {});
+    ASSERT_EQ(cap.times[1], 1);
+    EXPECT_EQ(cap.done[1].op, rc::OpKind::Tier2Batch);
+    EXPECT_EQ(cap.done[1].aux, 5);
+    EXPECT_EQ(cap.done[1].status, OpStatus::Ok);
+    EXPECT_EQ(cap.done[1].value, 100);
+}
+
+TEST(ProducerVerdictsRegression, PlainOnAckStillCalledRegression) {
+    Rig r;
+    HandlerCapture cap;
+    r.impl.setOnAck(&HandlerCapture::scalar, &cap);
+    sendToHandler(r, 3);
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({1}));
+    EXPECT_EQ(cap.plainCalls, 3);
+    EXPECT_EQ(cap.plain[2], OpStatus::BrokerError);
+    EXPECT_EQ(cap.plainError[2], kViolation);
+    EXPECT_EQ(cap.plain[1], OpStatus::Ok);
+    EXPECT_EQ(cap.plain[3], OpStatus::Ok);
+}
+
+TEST(ProducerVerdictsRegression, LastOnAckRegistrationWinsRegression) {
+    {   // Plain, then Full: only Full is called
+        Rig r;
+        HandlerCapture cap;
+        r.impl.setOnAck(&HandlerCapture::scalar, &cap);
+        r.impl.setOnAck(&HandlerCapture::full, &cap);
+        sendToHandler(r, 2);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, {});
+        EXPECT_EQ(cap.plainCalls, 0);
+        EXPECT_EQ(cap.times[1], 1);
+        EXPECT_EQ(cap.times[2], 1);
+    }
+    {   // Full, then a null scalar handler: neither is called
+        Rig r;
+        HandlerCapture cap;
+        r.impl.setOnAck(&HandlerCapture::full, &cap);
+        r.impl.setOnAck(static_cast<rc::AckFn>(nullptr), nullptr);
+        sendToHandler(r, 2);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, {});
+        EXPECT_EQ(cap.plainCalls, 0);
+        EXPECT_TRUE(cap.times.empty());
+    }
+}

@@ -257,6 +257,12 @@ struct ProducerConfig {
 using AckFn = void (*)(void* ctx, Token token, int64_t baseOffset, OpStatus status,
                        uint16_t errorCode) noexcept;
 
+/// The full-completion form of AckFn (Producer::onAck(AckCompletionFn, ctx)): the same Completion a CQ drains for the record
+/// (token, value, aux, op, status, errorCode, and constraintIdOf(c) for a rejected Send), plus the inline payload of the
+/// completion (empty for a producer ack today).  The span is valid only during the call.  Same rules as AckFn: it runs on
+/// the duty thread, must not block, and `ctx` must outlive every op that targets it.
+using AckCompletionFn = void (*)(void* ctx, const Completion& c, std::span<const uint8_t> payload) noexcept;
+
 /// Tag for the onAck-handler target: trySend(topic, key, value, AckToken{t}).
 struct AckToken {
     Token token = 0;
@@ -789,6 +795,10 @@ public:
     /// Setup phase (before the first AckToken send): the per-record ack
     /// handler.  See AckFn.
     void onAck(AckFn fn, void* ctx) noexcept;
+    /// As above, with the full Completion (constraint id, aux, op) instead of four scalars.  The last registration wins; a
+    /// null fn clears the handler.  A captureless lambda picks the overload by its signature; pass a null as
+    /// `static_cast<AckFn>(nullptr)` or `static_cast<AckCompletionFn>(nullptr)`.
+    void onAck(AckCompletionFn fn, void* ctx) noexcept;
 
     /// Setup phase (before the first send): per-batch acknowledgements to a
     /// handler on the duty thread (one call per batch, not per record).

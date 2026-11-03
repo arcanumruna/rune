@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <span>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -83,6 +84,33 @@ TEST(ProducerAllocRegression, SteadyStateAckedFlushAllocatesNothingRegression) {
     const long allocs = alloc_counter::stop();
     EXPECT_EQ(allocs, 0L) << "acked produce steady state must not allocate";
     EXPECT_FALSE(impl.hasInFlight());
+}
+
+// #806: the full-Completion ack handler (Producer::onAck(AckCompletionFn)) builds the Completion on the stack; steady state
+// must allocate nothing, as the scalar handler does.
+TEST(ProducerAllocRegression, CompletionAckHandlerSteadyStateAllocatesNothingRegression) {
+    ProducerImpl impl(ackCfg(4));
+    uint64_t completed = 0;
+    impl.setOnAck([](void* c, const rune::client::Completion&, std::span<const uint8_t>) noexcept {
+        ++*static_cast<uint64_t*>(c);
+    }, &completed);
+    int64_t lastCorr = 0;
+    const ProducerImpl::SendFn sink = [&lastCorr](int32_t, int32_t, int32_t, const uint8_t* b, std::size_t n) {
+        const auto v = rcc::decodeProduce(b, n);
+        lastCorr = v ? v->correlationId : 0;
+        return true;
+    };
+    auto cycle = [&](uint64_t k) {
+        (void)impl.submitSendRecord(1, 0, Key(k), kVal, true, rune::client::producer::ackhandle::forHandler(rune::client::Token(k + 1)));
+        pump(impl, sink);
+        impl.onProduceResponse(lastCorr, static_cast<int64_t>(k), 0);
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k);
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k);
+    const long allocs = alloc_counter::stop();
+    EXPECT_EQ(allocs, 0L);
+    EXPECT_EQ(completed, 1064u) << "every record reached the handler";
 }
 
 // Regression: the in-flight slot kept its wire frame with vector::assign, whose
