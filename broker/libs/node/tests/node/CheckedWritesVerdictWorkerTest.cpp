@@ -631,6 +631,53 @@ TEST(CheckedWritesVerdictRestartRegression, BackupFailureKeepsTheVerdictMemberUn
     EXPECT_FALSE(r.hasRow(kRej, 3));
 }
 
+// B1: a verdict member waiting on a discard (Failed: never retried; Pending: the ack is outstanding) has no work to do, so the
+// worker must report 0 and idle instead of spinning.
+TEST(CheckedWritesVerdictRestartRegression, DiscardFailedVerdictMemberLetsTheWorkerIdleRegression) {
+    VerdictRig r;
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    r.truncateTo(r.leo() - 1);
+    { std::ofstream blocker(viewBackupDir(r.snapDir()), std::ios::binary); blocker << "not a directory"; }
+    r.restart();
+    r.passes(300);
+    const CheckpointState* st = r.vs->checkpointStateForTest(kRej, 0);
+    ASSERT_NE(st, nullptr);
+    ASSERT_TRUE(std::holds_alternative<CheckpointDiscardFailed>(*st));
+    r.passes(50);
+    int sum = 0;
+    for (int i = 0; i < 100; ++i) sum += r.pass();
+    EXPECT_EQ(sum, 0) << "a member in DiscardFailed must let the worker idle";
+}
+
+TEST(CheckedWritesVerdictRestartRegression, DiscardPendingVerdictMemberLetsTheWorkerIdleRegression) {
+    VerdictRig r;
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    r.truncateTo(r.leo() - 1);
+    r.pauseAgent = true;   // the discard frame goes out, its ack never comes back
+    r.restart();
+    r.passes(300);
+    const CheckpointState* st = r.vs->checkpointStateForTest(kRej, 0);
+    ASSERT_NE(st, nullptr);
+    ASSERT_TRUE(std::holds_alternative<CheckpointDiscardPending>(*st));
+    int sum = 0;
+    for (int i = 0; i < 100; ++i) sum += r.pass();
+    EXPECT_EQ(sum, 0) << "a member in DiscardPending must let the worker idle";
+    ASSERT_TRUE(std::holds_alternative<CheckpointDiscardPending>(*r.vs->checkpointStateForTest(kRej, 0)));
+    r.pauseAgent = false;
+    r.passes(600);
+    EXPECT_TRUE(r.vs->allViewsReady()) << "the member settles once the agent acks";
+}
+
 TEST(CheckedWritesVerdictWorkerRegression, RefoldBelowWIgnoresALaterRuleRegression) {
     VerdictRig r;
     r.typed();

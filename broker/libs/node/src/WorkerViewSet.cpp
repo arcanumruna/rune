@@ -969,8 +969,7 @@ int WorkerViewSet::pushVerdictCheckpoint_(ViewInstance& inst) {
     int work = 0;
     if (!checkpointSettled(inst)) {
         // A discard in flight: the frame goes out (after a held delta), then the instance waits for its ack.  Nothing is checkpointed.
-        if (std::holds_alternative<CheckpointDiscardOwed>(inst.checkpoint)) (void)tryPushDiscard_(inst);
-            return 1;
+        if (std::holds_alternative<CheckpointDiscardOwed>(inst.checkpoint)) return tryPushDiscard_(inst) ? 1 : 0;
         return 0;
     }
     if (inst.pendingValid) {

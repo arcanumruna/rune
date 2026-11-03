@@ -78,6 +78,7 @@ public:
     static constexpr int32_t kSrc = 6;
     static constexpr int kMaxPass = 4000;
     static constexpr int kMaxFlushWait = 1'000'000;   ///< compact(): passes to wait for an in-flight async flush (a hang guard)
+    bool pauseAgent = false;   ///< pass() skips the IO agent: a discard frame stays unacked (CheckpointDiscardPending)
     ViewBackupPolicy backupPolicy{};   ///< the agent's view-backup policy (set before the first persisted install)
     /// The view checkpoint directory (the committed files, and backup/ under it).
     [[nodiscard]] std::string snapDir() const { return viewDir_.string(); }
@@ -282,7 +283,7 @@ public:
         worker->drainReturn([&](WorkerReturn r) {
             if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
         }, [](const TxnReturn&) {});
-        if (agent) (void)agent->doWork(now);
+        if (agent) { if (!pauseAgent) (void)agent->doWork(now); }
         else channel.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, OneToOneByteRing::index_t, OneToOneByteRing::index_t) {});
         return work;
     }
