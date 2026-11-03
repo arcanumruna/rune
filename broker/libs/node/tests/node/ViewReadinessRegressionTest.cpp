@@ -314,6 +314,44 @@ TEST(ViewReadinessRegression, RestartedLeaderWithUnconfirmedHwGoesRebuildingToCa
     EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 31);
 }
 
+// Sibling of the test above: the fold that REACHES the bound is driveFolds' (not driveRebuild's) own post-fold flip.  With
+// the HW unconfirmed that site must land on CatchingUp, never Ready.
+// RED (only the post-fold flip in driveFolds made unconditionally Ready): the first driveFolds pass sees Ready.
+TEST(ViewReadinessRegression, DriveFoldsReachingTheBoundWithUnconfirmedHwIsCatchingUpRegression) {
+    constexpr int32_t kView = 0x40000007;
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, kView).value();
+    const auto baseRec =
+        makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(7, 10, 2, 0), /*foldTo*/ 2);   // hp 11
+
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
+    const std::span<const std::span<const uint8_t>> noDeltas{};
+    vs.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, /*partition*/ 0,
+                              std::span<const uint8_t>(baseRec), noDeltas, /*committedTail*/ 4);
+    ASSERT_EQ(vs.readiness(kView, 0), rune::node::ViewReadiness::RebuildingViews);
+
+    const auto tail = upsertRun(7, 30, 2, 2);   // hp 30, 31 at [2,4)
+    auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{tail.data(), tail.size(), 2, 4};
+    };
+    const rune::view::RowLayout* L = nullptr;
+    rune::node::WorkerViewSet::RowStatus status = rune::node::WorkerViewSet::RowStatus::Ok;
+
+    // Only driveFolds runs: it performs the fold up to the bound with the HW unconfirmed.
+    for (int i = 0; i < 4; ++i) {
+        vs.driveFolds(5, 0, readRange, /*bound*/ 4, rune::view::kNoSkip, i, nullptr, /*leaderGen*/ 1,
+                      /*leaderHwConfirmed*/ false);
+        EXPECT_EQ(vs.readiness(kView, 0), rune::node::ViewReadiness::CatchingUp) << "pass " << i;
+    }
+    EXPECT_EQ(vs.getRow(kView, 0, 7, L, &status), nullptr);
+    EXPECT_EQ(status, rune::node::WorkerViewSet::RowStatus::NotReady);
+
+    vs.driveFolds(5, 0, readRange, 4, rune::view::kNoSkip, 100, nullptr, 1, /*leaderHwConfirmed*/ true);
+    EXPECT_EQ(vs.readiness(kView, 0), rune::node::ViewReadiness::Ready);
+}
+
 // A brand-new view whose source is already empty/caught up (committedTail==0)
 // reaches READY IMMEDIATELY on install-for-recovery — no rebuild step needed.
 TEST(ViewReadinessRegression, EmptySourceIsReadyImmediately) {
