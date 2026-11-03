@@ -114,6 +114,14 @@ public:
     /// driver thread and conductor thread own those duty cycles.
     int dutyCycle() noexcept;
 
+    /// TEST SEAM (cold; owner thread): while stalled, dutyCycle() pumps nothing, so a registration sent meanwhile stays
+    /// Resolving; `retarget`'s publication resolve bound is shortened to `boundNs` (wall clock) so a stalled retarget
+    /// returns promptly.  Stall off / bound 0 restores the defaults.
+    void setDriverStalledForTest(bool stalled, int64_t retargetBoundNs = 0) noexcept {
+        driverStalledForTest_ = stalled;
+        retargetPubBoundNs_   = retargetBoundNs > 0 ? retargetBoundNs : kResolveTimeoutNs;
+    }
+
     /// True once the Aeron client closed itself (inter-service timeout, driver
     /// timeout).  Offers then fail; the owner decides whether to rebuild.
     [[nodiscard]] bool closed() const noexcept {
@@ -243,6 +251,11 @@ public:
     /// next responsePublicationHandle / publicationHandle on the same key re-inits it).  A plain or unknown handle is
     /// left alone.  Cold path, owner thread.
     void releaseResponsePublication(PubHandle h) noexcept;
+    /// #751 review M1: the pair's last bind reference is gone but a plain route still offers on this slot: keep it as a
+    /// plain publication.  The response subscription retires, the correlated request publication is released or
+    /// drained (#763), and the slot (mode Plain, fresh Resolution) re-resolves lazily on the next offerOn /
+    /// publicationHandle.  Plain or Released: no-op.  Cold path, owner thread.
+    void demoteResponsePublication(PubHandle h) noexcept;
     [[nodiscard]] bool publicationReleasedForTest(PubHandle h) const noexcept {
         return h >= 0 && static_cast<std::size_t>(h) < pubSlots_.size() &&
                std::holds_alternative<PubSlot::Released>(pubSlots_[static_cast<std::size_t>(h)].mode);
@@ -251,11 +264,6 @@ public:
     [[nodiscard]] std::size_t activePublicationSlotsForTest() const noexcept {
         std::size_t n = 0;
         for (const PubSlot& s : pubSlots_) if (!std::holds_alternative<PubSlot::Released>(s.mode)) ++n;
-    /// #751 review M1: the pair's last bind reference is gone but a plain route still offers on this slot: keep it as a
-    /// plain publication.  The response subscription retires, the correlated request publication is released or
-    /// drained (#763), and the slot (mode Plain, fresh Resolution) re-resolves lazily on the next offerOn /
-    /// publicationHandle.  Plain or Released: no-op.  Cold path, owner thread.
-    void demoteResponsePublication(PubHandle h) noexcept;
         return n;
     }
     [[nodiscard]] std::size_t pubSlotCountForTest() const noexcept { return pubSlots_.size(); }
@@ -379,12 +387,14 @@ public:
     /// Task 16 fix round 1 (M4): close the publication of `h` when it is Ready (an
     /// unreferenced route's old worker endpoint).  The slot stays (handles are
     /// stable); a later publicationHandle()/offerOn() on it re-resolves.  A slot
-    /// still Resolving is left alone (resetting it would orphan its pending
-    /// driver registration).  Cold path, owner thread.
+    /// still Resolving/TimedOut is parked in the drain set (#763 sibling: resetting
+    /// it would orphan its pending driver registration) and the slot starts afresh.
+    /// Cold path, owner thread.
     void releasePublication(PubHandle h) noexcept {
         if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return;
         PubSlot& s = pubSlots_[static_cast<std::size_t>(h)];
-        if (s.res.ready() != nullptr) s.res.reset();
+        drainPub_(std::move(s.res));
+        s.res = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
     }
     /// The channel of `h` (nullptr for an unknown handle).  Cold path.
     [[nodiscard]] const std::string* publicationChannel(PubHandle h) const noexcept {
@@ -594,6 +604,8 @@ private:
     /// violation when driverThread_ is concurrently driving the same driver.
     int pumpDriverFromCaller_() noexcept;
     int callerPumpViolations_ = 0;  // written/read by the owning (caller) thread only
+    bool             driverStalledForTest_ = false;   // test seam: dutyCycle() is a no-op
+    int64_t          retargetPubBoundNs_   = kResolveTimeoutNs;   // test seam: retarget's publication resolve bound
     PumpStepObserver pumpObserver_    = nullptr;  // test seam (owner thread only)
     void*            pumpObserverCtx_ = nullptr;
 

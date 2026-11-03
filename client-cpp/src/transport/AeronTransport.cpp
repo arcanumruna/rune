@@ -81,7 +81,7 @@ int AeronTransport::epollSelectedForTest(bool reset) noexcept {
 }
 
 int AeronTransport::dutyCycle() noexcept {
-    if (cfg_.driverMode != DriverMode::Invoker || driver_ == nullptr) return 0;
+    if (cfg_.driverMode != DriverMode::Invoker || driver_ == nullptr || driverStalledForTest_) [[unlikely]] return 0;
     // spec §3.1 order: driver, then client conductor.  T15 R2: the driver
     // refreshes its heartbeat before the conductor checks it — a second line of
     // defence after mediaDriverTimeoutMsFor(); nothing relies on it alone.
@@ -938,18 +938,26 @@ bool AeronTransport::retarget(const std::string& newIngressChannel, int32_t resp
         PubRegistry reg{*aeron_, pubChannel, cfg_.ingressStreamId};
         pumpUntil_([&] {
             return res.poll(reg, resolveNow_()) == ResolveStatus::Ready || res.rejected();
-        }, kResolveTimeoutNs);
+        }, retargetPubBoundNs_);
         if (res.ready() == nullptr) {
             if (newRespSlot >= 0 && newRespSlot != respSeedSlot_) retireSubSlot_(newRespSlot);
+            drainPub_(std::move(res));   // #763 sibling: a still-registering publication is parked, not orphaned
             return false;  // old publication stays intact
         }
         // Per-stream publications on the OLD default channel are released and
-        // lazily re-resolved on the new channel (stream ids preserved).
-        // Only Ready slots are released: resetting a Resolving/TimedOut slot would
-        // orphan its pending driver registration (it would later come alive with
-        // no owner); such a slot keeps its registration and resolves on next use.
+        // lazily re-resolved on the new channel (stream ids preserved).  A Plain slot
+        // still Resolving/TimedOut is parked in the drain set (its driver registration
+        // is released once answered) and starts afresh: streamPub_ is cleared below, so
+        // nothing would poll it again.  A response-paired slot (never on the default
+        // channel in practice) keeps the old behaviour: only a Ready one is reset.
         for (PubSlot& s : pubSlots_) {
-            if (s.channel == cfg_.ingressChannel && s.res.ready() != nullptr) s.res.reset();
+            if (s.channel != cfg_.ingressChannel) continue;
+            if (std::holds_alternative<PubSlot::Plain>(s.mode)) {
+                drainPub_(std::move(s.res));
+                s.res = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
+            } else if (s.res.ready() != nullptr) {
+                s.res.reset();
+            }
         }
         streamPub_.clear();
         cfg_.ingressChannel = newIngressChannel;

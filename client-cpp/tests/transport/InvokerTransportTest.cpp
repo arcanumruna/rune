@@ -1270,6 +1270,75 @@ TEST(AeronTransportRegression, RePairWhileThePublicationIsResolvingLeavesNoOrpha
     t.stop();
 }
 
+// #763 sibling class: a retarget whose new default publication is still registering when its (wall-clock) resolve bound
+// runs out used to drop the local Resolution: the driver later completed a publication nobody owned.  The driver is
+// stalled (dutyCycle pumps nothing) so the registration stays Resolving; the injected clock never reaches a deadline.
+TEST(AeronTransportRegression, RetargetThatTimesOutWhileResolvingLeavesNoOrphanRegression) {
+    FastLingerEnv env;
+    const std::string oldGw = loopback(rune::client::testing::allocFreeUdpPort());
+    const std::string newGw = loopback(rune::client::testing::allocFreeUdpPort());
+    Transport t{invokerConfig(oldGw, "aeron:ipc", 3630)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    ASSERT_EQ(t.drainingPubsForTest(), 0u);
+
+    t.setDriverStalledForTest(true, 20'000'000LL);   // 20 ms wall bound
+    EXPECT_FALSE(t.retarget(newGw)) << "the driver was stalled: the new publication cannot have resolved";
+    t.setDriverStalledForTest(false);
+    EXPECT_EQ(t.ingressChannel(), oldGw) << "a failed retarget keeps the old channel";
+    EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving registration was dropped, not drained";
+
+    bool created = false;
+    EXPECT_TRUE(createdThenReleased(t, newGw, created)) << "the publication the driver completed was never released";
+    EXPECT_TRUE(created);
+    t.stop();
+}
+
+// A per-stream publication still registering on the OLD default channel when a retarget succeeds: streamPub_ is
+// cleared, so nothing would poll it again; its registration is parked in the drain set and released.
+TEST(AeronTransportRegression, RetargetWithAStreamPublicationStillResolvingLeavesNoOrphanRegression) {
+    FastLingerEnv env;
+    const std::string oldGw = loopback(rune::client::testing::allocFreeUdpPort());
+    const std::string newGw = loopback(rune::client::testing::allocFreeUdpPort());
+    Transport t{invokerConfig(oldGw, "aeron:ipc", 3640)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const Transport::PubHandle h = t.publicationHandle(t.ingressChannel(), 3641);
+    const uint8_t frame[] = {1};
+    EXPECT_FALSE(t.offerOn(h, frame, sizeof frame)) << "Resolving: the registration is sent, the driver is not pumped yet";
+    ASSERT_EQ(t.drainingPubsForTest(), 0u);
+
+    ASSERT_TRUE(t.retarget(newGw));
+    EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving stream registration was kept in the slot, not drained";
+    bool created = false;
+    EXPECT_TRUE(createdThenReleased(t, oldGw, created)) << "the old-channel stream publication was never released";
+    EXPECT_TRUE(created);
+    t.stop();
+}
+
+// releasePublication on a slot that is still registering parks the registration (it used to leave it alone).
+TEST(AeronTransportRegression, ReleasingAResolvingPublicationLeavesNoOrphanRegression) {
+    FastLingerEnv env;
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3650)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const Transport::PubHandle h = t.publicationHandle(worker, 3651);
+    const uint8_t frame[] = {1};
+    EXPECT_FALSE(t.offerOn(h, frame, sizeof frame)) << "Resolving: the registration is sent, the driver is not pumped yet";
+    ASSERT_EQ(t.drainingPubsForTest(), 0u);
+
+    t.releasePublication(h);
+    EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving registration was left in the slot, not drained";
+    bool created = false;
+    EXPECT_TRUE(createdThenReleased(t, worker, created)) << "the released slot's publication was never closed";
+    EXPECT_TRUE(created);
+    t.stop();
+}
+
 TEST(AeronTransportRegression, ARetiredSubStillResolvingIsNeverResetRegression) {
     Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3620)};
     t.start();
