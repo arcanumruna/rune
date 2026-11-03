@@ -652,6 +652,91 @@ TEST(CheckedWritesKeyIndexRegression, AdoptionMidLeadershipRebuildsOnTheNextActi
     EXPECT_TRUE(a2->verdicts.empty()) << "5 is not in the log: its insert is accepted";
 }
 
+namespace {
+constexpr uint16_t kNsSlot = 3;
+constexpr uint32_t kNsId = 77;
+
+/// A key-index topic charged to namespace kNsId, with keys 1..3 folded.
+struct Charged {
+    VerdictRig r;
+    Intents    p{r, 42};
+    uint64_t   charged = 0;
+    Charged() {
+        r.worker->applyNsSlotAssignDirect(kNsSlot, kNsId, rune::protocol::NamespaceLimits{});
+        r.log->setNsTag(kNsId, kNsSlot);
+        r.createKeyIndex();
+        r.enableAcks();
+        r.passes(60);
+        EXPECT_TRUE(p.sendAck({ins(1), ins(2), ins(3)}));
+        EXPECT_TRUE(r.driveUntilJudged());
+        r.passes(20);
+        charged = r.vs->nsViewMemBytes(kNsSlot);
+    }
+    void dropTopic() {
+        WorkerOp d;
+        d.type = WorkerOp::Type::TopicDropped;
+        d.topicId = VerdictRig::kSrc;
+        r.send(std::move(d));
+    }
+};
+}  // namespace
+
+// Final re-review N1: the partition leaves the worker, so rebuildRcSlots_ frees its write state.  The judge and the key index go
+// with it; a judge left behind would point at the freed state, and the topic drop would write through it.
+TEST(CheckedWritesKeyIndexRegression, OwnershipLossDropsTheJudgeAndItsKeyIndexRegression) {
+    Charged g;
+    VerdictRig& r = g.r;
+    ASSERT_GT(g.charged, 0u);
+    ASSERT_EQ(r.vs->verdictSourceKeysForTest().size(), 1u);
+    ASSERT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 3u);
+
+    r.worker->setOwnedDirect(Worker::OwnedSet{});
+    ASSERT_EQ(r.writeState(), nullptr);
+    EXPECT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 0u);
+    EXPECT_EQ(r.vs->keyIndexFoldCursorForTest(VerdictRig::kSrc, 0), -1);
+    EXPECT_EQ(r.vs->nsViewMemBytes(kNsSlot), 0u) << "the namespace is no longer charged for a partition this worker does not own";
+    ASSERT_TRUE(r.vs->verdictSourceKeysForTest().empty()) << "a judge outlived its write state";
+
+    g.dropTopic();
+    EXPECT_TRUE(r.vs->verdictSourceKeysForTest().empty());
+    EXPECT_EQ(r.vs->nsViewMemBytes(kNsSlot), 0u);
+    EXPECT_EQ(r.vs->nsSlotMismatchesForTest(), 0u);
+}
+
+// Final re-review N1: a re-incarnated partition gets a new write state; the old one's judge and key index are dropped with it,
+// and the next leadership builds both again from the local log.
+TEST(CheckedWritesKeyIndexRegression, ReincarnationDropsTheJudgeAndItsKeyIndexRegression) {
+    Charged g;
+    VerdictRig& r = g.r;
+    ASSERT_GT(g.charged, 0u);
+    ASSERT_EQ(r.vs->verdictSourceKeysForTest().size(), 1u);
+
+    r.demote();   // a follower: no leader pass rebinds a judge before the drop
+    r.replica->setRegistryHandle(r.replica->registryId(), r.replica->incarnation() + 1);
+    r.worker->setOwnedDirect(Worker::OwnedSet{r.replica.get()});
+    ASSERT_NE(r.writeState(), nullptr);
+    EXPECT_EQ(r.writeState()->verdicts, nullptr);
+    EXPECT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 0u);
+    EXPECT_EQ(r.vs->nsViewMemBytes(kNsSlot), 0u);
+    ASSERT_TRUE(r.vs->verdictSourceKeysForTest().empty()) << "the judge of the old incarnation outlived its write state";
+
+    r.promote();
+    r.passes(30);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(20);
+    EXPECT_EQ(r.keyIndexKeys(), idSet(1, 3)) << "rebuilt from the local log";
+    EXPECT_EQ(r.vs->nsViewMemBytes(kNsSlot), g.charged);
+    const auto a = g.p.sendAck({ins(2)});
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->verdicts, (V{{0, kKeyExists, 0}}));
+    ASSERT_NE(r.writeState()->verdicts, nullptr);
+
+    g.dropTopic();
+    EXPECT_TRUE(r.vs->verdictSourceKeysForTest().empty());
+    EXPECT_EQ(r.vs->nsViewMemBytes(kNsSlot), 0u);
+    EXPECT_EQ(r.vs->nsSlotMismatchesForTest(), 0u);
+}
+
 // ---- the key-width sweep: the key index judges by the exact bytes of the wire key, at every width the DDL allows (SD8) ----
 namespace {
 struct WidthCase { const char* name; KeyShape shape; };

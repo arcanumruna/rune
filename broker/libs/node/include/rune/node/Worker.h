@@ -6969,6 +6969,10 @@ private:
             bindVerdictHooks_(slot);
             next.push_back(std::move(slot));
         }
+        // A state not carried over is freed below: its judge and key index go first (the replica may be gone, the judge is not).
+        for (auto& old : rcSlots_)
+            if (old.write && old.write->verdicts != nullptr)
+                viewSet_->dropVerdictSource(old.write->spec->topicId, old.write->verdicts->partition());
         rcSlots_ = std::move(next);
         ringSlots_ = 0;   // E2 residual N5: memory-backed slots (0 -> no ring walk at all)
         for (const auto& sl : rcSlots_) ringSlots_ += sl.replica->isDiskBacked() ? 0u : 1u;

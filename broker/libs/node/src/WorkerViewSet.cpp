@@ -804,13 +804,6 @@ void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
     }
 }
 
-void WorkerViewSet::eraseKeyIndex_(uint64_t key) {
-    if (const auto it = keyIndexes_.find(key); it != keyIndexes_.end()) {
-        releaseMem_(it->second);
-        keyIndexes_.erase(it);
-    }
-}
-
 // Cold.  The key index is built over the source's evolving schema, as every view is: the judge decodes each writer version through it.
 // nullptr until the schema has landed on this worker, or when the key cannot be indexed (the wire key is packed into 8 bytes).
 static const rune::codec::Descriptor* keyIndexSource(const TopicWriteSpec& spec) {

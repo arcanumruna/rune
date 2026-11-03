@@ -558,7 +558,13 @@ private:
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
     int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
     void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
-    void eraseKeyIndex_(uint64_t key);
+    // Inline: Worker.h's rebuildRcSlots_ reaches it, and that header is built into libraries that do not link rune_node.
+    void eraseKeyIndex_(uint64_t key) {
+        if (const auto it = keyIndexes_.find(key); it != keyIndexes_.end()) {
+            releaseMem_(it->second);
+            keyIndexes_.erase(it);
+        }
+    }
     int finishRetired_();
     int pushVerdictCheckpoint_(ViewInstance& inst);
     void discardVerdictInstance_(ViewInstance& inst);
