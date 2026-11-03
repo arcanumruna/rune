@@ -92,7 +92,7 @@ security 64 to 95.
 | 52 | `TxnOffsetCommitResponse` | B→C | `results` |
 | 53 | `EndTxn` | C→B | `producerId`, `producerEpoch`, `commit`, `transactionalId` |
 | 54 | `EndTxnResponse` | B→C | `errorCode` |
-| 64 | `DefineTopic` | C→B | `topicName`, `partitionCount`, `keyField`, `validate` (sent as 1 for a typed topic; a broker of this version ignores it, typed topics always validate), `descriptorBlob`, `persistence`, `replicationFactor`, DDL extension, key features (optional; sent only to a broker of version 10 or later) |
+| 64 | `DefineTopic` | C→B | `topicName`, `partitionCount`, `keyField`, `validate` (sent as 1 for a typed topic; a broker of this version ignores it, typed topics always validate), `descriptorBlob`, `persistence`, `replicationFactor`, DDL extension, key features (optional; sent only when the features are not the defaults, and only to a broker of version 10 or later) |
 | 65 | `DefineTopicResponse` | B→C | `topicId`, `version`, `errorCode` |
 | 66 | `GetTopicSchema` | C→B | `topicName`, `requestedFingerprint` (0 = latest; `~0` = the evolving lineage) |
 | 67 | `TopicSchemaResponse` | B→C | `topicId`, `version`, `errorCode`, `descriptorBlob`, `partitionCount`, key features (optional) |
@@ -233,7 +233,7 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   index when the batch is folded, in offset order, each record against the accepted records before it. A rejected intent
   is a `View` trailer entry with `code` 56 or 57 and `constraintId` 0. An intent is refused with `InvalidRequest` on a
   topic without `key.index`, on the legacy gateway stream, below feature level 5, without an idempotent producer and the
-  `View` bit, or inside a transaction. While a new key index has not yet been logged in the partition's constraint set
+  `View` bit, or inside a transaction or an atomic batch. While a new key index has not yet been logged in the partition's constraint set
   the broker answers `NotLeader` (retriable). Plain upserts and deletes need none of this and are never rejected by the
   key index.
 - On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.

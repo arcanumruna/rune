@@ -217,7 +217,8 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
 - **Batching**: sends within `lingerUs` (default 5 ms) are batched per partition up to `batchBytes` (64 KiB). `lingerUs`
   of 0 defeats batching.
 - **`SendResult`**: `Ok`, `BackPressured`, `ValueTooLarge`, `InvalidTopic`, `Closed`, `QueueFull`, `InvalidArgument`,
-  `MessageTooLarge`, `WrongThread`, `WrongShard`. Anything but `Ok` means the record was not accepted.
+  `MessageTooLarge`, `WrongThread`, `WrongShard`, `ClaimHeld`, `NotInTransaction`, `KeyTooLong`, `WriteNotAllowed`.
+  Anything but `Ok` means the record was not accepted.
 - Retriable broker answers (`MinIsrViolation`, `TransientLogFull`) are re-sent with the same identity after a backoff,
   bounded by `produceTimeoutMs` and `deliveryTimeoutMs`.
 
@@ -529,9 +530,11 @@ players.send(p);                                                       // routed
 - **Checked typed writes**: `insert(rec)`, `update(rec)`, `upsert(rec)`, `remove(key)` and `removeExisting(key)` take
   `(…, Completions& cq, Token token)`; `upsert(rec)` (the same as `send(rec)`) and `remove(key)` also have a
   fire-and-forget form. Each has an `…AndWait(…, timeout = kDefaultWriteWait /* 30 s */)` that returns a `WriteResult`:
-  `ok()`, `status()` (`Ok`, `BrokerError`, `Timeout`, `BrokerTooOld`, `VerdictUnknown`, `DeliveryFailed`), `code()` (56,
-  57, 39 or 24 for a `BrokerError`), `constraintId()`, `offset()` and `key()`. A local refusal (see
-  [Write intents](#write-intents)), an over-long key or an oversized record throws `std::invalid_argument`. `remove` and
+  `ok()`, `status()` (`Ok`, `BrokerError`, `Timeout`, `BrokerTooOld`, `VerdictUnknown`, `DeliveryFailed`, `Closed` when
+  the client closes first), `code()` (56, 57, 39 or 24 for a `BrokerError`), `constraintId()`, `offset()` and `key()`
+  (the broker-assigned key, not the record's; always 0 until autoincrement ships). A local refusal (see
+  [Write intents](#write-intents)) or an over-long key throws `std::invalid_argument`. An oversized record throws
+  `std::invalid_argument` from the `…AndWait` forms and `std::length_error` from the token forms. `remove` and
   `removeExisting` build the record key exactly as `send(rec)` does, so a delete reaches the partition of the write.
 - `TypedTopic<T>` is move-only; `handle()` returns its `TopicHandle` and `boundVersion()` the schema version.
 - Code generation rejects a field whose name ends in `_` (the generated code's own names end in `_`): rename the field.

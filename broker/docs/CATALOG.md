@@ -59,7 +59,7 @@ field and a persisted topic, else `Precondition`. Features are set only at creat
 format carries the prior features over. The fingerprint of a topic with default features is unchanged; non-default
 features are hashed after it, so every v1 and v2 digest replays as before.
 
-**`key.index` DDL.** The leader checks a definition with non-default key features in this order, each a
+**`key.index` DDL.** The leader checks a definition with non-default key features in this order, each an
 `InvalidRequest` (39) with this detail:
 
 1. "key.index needs every broker at feature level 5"
