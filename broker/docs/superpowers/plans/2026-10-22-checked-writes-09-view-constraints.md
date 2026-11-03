@@ -110,6 +110,73 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - **P7-9 (07).** At the engine level a unique view's conflicting record was skipped and counted in `FoldStats::keyConflicts`. This part replaces that with the §8.3 rule (Task 2).
 - **P8-1 / C14.** QL authors `unique = true` and `constraints`; Part 07 compiles them structurally (`CompiledConstraint { ordinal, name, predicate }`, ordinals 1..n in declaration order); this part evaluates them.
 
+## What batch 1 decides for this part (binding; added 2026-11-03)
+
+Issue batch 1 (`bugfix/issue-batch-1-views`) settles four things this part builds on. **Start Part 09 only after batch 1 is on `main`.** Where batch 1 contradicts a ruling or task below, batch 1 wins and the task is read as amended here.
+
+1. **B1-1 — A lagging leader never undoes a newer constraint change (#788; amends P9-5, P9-6 and Task 5).**
+   - **Bug class.** `syncConstraintSet_` (`WorkerViewSet.cpp`) builds the desired set from the templates installed on this worker. Nothing orders that against the logged set. A leader whose catalog has not yet applied a DDL change computes the old set and logs it. For example, a replace is reverted (fp2 → fp1) and the replicas that had already replaced wait forever (#788). P9-5's candidate path has the same hole, and so do a create or drop that the new leader has not applied yet.
+   - **Rule.** Every `ConstraintSetChange` (type 18) records the catalog position it was computed at. A leader asks for a change only when its own catalog has applied at least that position. Otherwise it keeps the logged set and asks again once its catalog advances. The catalog (`__catalog`) is one linear log, so a leader at or past that position knows every DDL that produced the logged set: any difference is a newer DDL, never a stale one. Convergence comes from catalog replication, not from a timeout (rule 16).
+   - **Wire.** The type-18 payload goes to version 2: `[version u8 = 2][constraintSetId u32][catalogThrough i64][count u16]` followed by count × `[viewObjectId u64][kind u8][planFingerprint u64]`. Members are unchanged. Type 18 has never been released (it is not in `broker-v0.3.0`), so readers accept only version 2. A version-1 type 18 is unparseable, and no compatibility path is kept. Types 17, 19 and 20 keep their own version bytes.
+   - **The worker's catalog position.**
+     - The control thread fans a `kCatalogMarkMsgType {appliedThrough i64}` frame out to every worker's `install` ring.
+     - It sends the frame for each `kA2cCatalogApplied`, through the same FIFO `viewFanoutBacklog_` as the plan installs.
+     - So a worker sees an event's installs and uninstalls before the mark that covers them.
+     - `WorkerViewSet::catalogThrough_` starts at -1 at boot. It holds the latest mark, which never moves back.
+   - **Gate.** `syncConstraintSet_` returns 0 without a request while `catalogThrough_ < latestChange.catalogThrough`. `requestChange` stamps `catalogThrough_`. The sync cache (`constraintSyncEpoch`, `constraintSyncChange`) also keys on `catalogThrough_`, so a mark re-runs the sync. The judge's existing wait for an uninstalled member stays as it is.
+   - **Tests this part adds.** Each test fails first. Run each one in the 1-node VerdictRig and with a failover in `ThreeNodes`:
+     - **The #788 repro.** A follower has T1 (fp1). Replicate a change to {obj, fp2} at a catalog position above its own, then promote it. No change re-adds fp1. After the fp2 install and mark arrive, the judge activates.
+     - **The same shape for create and drop.**
+     - **The P9-5 candidate path.**
+     - **Restart before the first mark.**
+     - **Mutation.** Drop the gate, and every one of them logs the stale set.
+
+2. **B1-2 — Every restart-time discard goes through the view backup (owner rule; amends P9-6, P9-8, Tasks 2, 5, 6 and the RestartDuringRebuild timing).**
+   - **Owner rule.** "We first need to create a backup and then rebuild it… whenever we rebuild materialized views on restart… by default unless it's turned off."
+   - **Entry point.** Batch 1 makes `WorkerViewSet::beginDiscard_(ViewInstance&, ViewDiscardReason)` the only way to throw away a view instance's persisted rows. `VerdictSource` reaches it through `VerdictViewHooks::discard`, and it no longer writes `foldCursor` itself.
+   - **What it does.**
+     - The `ViewSnapshotIoAgent` moves the checkpoint to `__view_snapshots/backup/view-<id>-p<n>.<seq>.<reason>.delta` and acks.
+     - The instance waits in `CheckpointState` (`Live | DiscardOwed | DiscardPending | DiscardFailed`). While it waits it folds nothing and serves NotReady.
+     - On the ack it rebuilds from `logStart`.
+     - A failed backup leaves the view NotReady for the rest of the boot. A restart, or `RUNE_VIEW_BACKUP=0`, ends that state.
+   - **Knobs.** `RUNE_VIEW_BACKUP` (default on) and `RUNE_VIEW_BACKUPS_KEPT` (default 3).
+   - **What this part must do.**
+     - A checkpoint whose unique-claim tables 6 and 7 are unreadable or inconsistent is a discard. Use reason `unreadable`.
+     - A persisted Unique or Check member discarded at activation is a discard. Use reason `ahead-of-verdicts`.
+     - Any rebuild this part adds for a persisted constrained view is a discard. Use an existing reason, or add an enumerator to `ViewDiscardReason`.
+     - Nothing truncates a checkpoint or resets tables directly.
+     - Transient constrained views have no file. `beginDiscard_` resets them in place and sends no frame, so the P9-9 transient rebuild needs nothing extra.
+   - **Tests.**
+     - The RestartDuringRebuild cells assert exactly one backup per discard of a persisted constrained view. The backup is checked through batch 1's read-back seam and must hold the pre-discard rows and claims.
+     - With the knob off, no backup is taken.
+     - A failed backup gives `DiscardFailed`: the view stays NotReady and writers on that source wait. They are never judged against an empty claim table.
+
+3. **B1-3 — A batch reports each record's verdict (owner rule; amends P9-11, Task 7 and the client file list).**
+   - **Owner rule.** Batching saves round trips. It does not make the records' verdicts all-or-nothing.
+   - **What batch 1 adds (#802 and claimBatch).**
+     - A new status, `OpStatus::RecordsRejected` (15), for a claim, Tier-2 batch or BatchAck of two or more records where at least one record is rejected.
+     - `value` is the batch's base offset.
+     - `errorCode` and `reserved0` hold the first rejection's code and constraintId.
+     - The payload is the ProduceResponse v12 verdict trailer, 8 bytes per rejection: `u16 index`, `u16 code`, `u32 constraintId`. It is decoded by the zero-copy `BatchVerdicts` reader, with `rejectedCount`, `rejection(k)`, `accepted(i)` and `offsetOf(i)`.
+     - If every record is accepted, the result is plain `Ok`. Single-record sends keep their per-handle completion.
+     - There is no wire change.
+   - **What this part must do.**
+     - Codes 51 `ConstraintViolation`, 52 `KeyExists` and 53 `KeyNotFound` are per-record verdicts. They travel only as trailer entries, with constraintId = `viewObjectId << 16 | ordinal`. A rejected record never fails its claim or batch.
+     - 54 `AutoIncrementExhausted` refuses the whole batch before any record is judged, so it stays a batch-level `BrokerError` with no trailer.
+     - P9-11's "the rejected record's own offset" is `value + rejection(k).index` in a batch completion. The single-record path keeps P9-11 as written.
+     - The duplicate-replay rule (R04e/R04g) replays the same trailer. So a retried batch gets the same `RecordsRejected` payload, and `Client::constraintName` resolves each entry.
+     - Task 7 adds `constraintName` tests over a `RecordsRejected` completion with entries at index 0, in the middle and last.
+     - Task 8's matrix uses `BatchVerdicts` for every multi-record cell.
+
+4. **B1-4 — The verdict-member refold keeps batch 1's fix (amends Task 4 and Task 6).**
+   - **Batch 1's fix.** It routes `discardCheckpointAhead_` through `beginDiscard_`, which backs up first and then refolds from `logStart`. Before this, the refold dropped the persisted member's rows with no backup.
+   - **What this part must do.** When this part extends the refold to Unique and Check members, including the retained-plan install of P9-8, it calls the same hook. It must not bring back a direct `foldCursor = 0` or a table reset.
+
+**Handoffs, not decisions.**
+- #785 (activation below a drop) and #805 (type 20) stay open for this part's Task 6 and P9-8.
+- Batch 1's `parseControl` keeps refusing type 20 until P9-8 switches it on.
+- #791 (judge stall diagnosis) gets its instrumentation in batch 1. Its run waits for the cw05 merge; if the run blames the install wait, the fix belongs to B1-1 or Task 6.
+
 ## Part rulings (P9; binding for executors, recorded so the reviewer can overturn any)
 
 - **P9-1 — Member kinds and fingerprints.**
