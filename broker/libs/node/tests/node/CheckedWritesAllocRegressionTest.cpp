@@ -196,11 +196,16 @@ TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingRegre
         }
         return recs;
     };
+    constexpr int kWarmup = 2000;
+    const auto judged = [&] { const VerdictSourceStats& s = *r.stats(); return s.rejectionsKeyExists + s.rejectionsKeyNotFound + s.markersWritten; };
+    uint64_t judgedInWindows = 0;   // the 56s, 57s and markers of the measured span that a window saw
     int32_t seq = 0;
     const auto drive = [&](int round) -> uint64_t {
         const int records = round % 2 == 0 ? 1 : 16;
         (void)r.produceFrame(recordsOf(records, round), kAllView, kPid, seq);
         seq += records;
+        const bool measured = round >= kWarmup;
+        const uint64_t judgedBefore = measured ? judged() : 0;
         uint64_t allocs = 0;
         {
             rune::testing::AllocWindow w;
@@ -211,12 +216,13 @@ TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingRegre
             }
             allocs = w.count();
         }
+        if (measured) judgedInWindows += judged() - judgedBefore;
         r.passes(1);   // the ack and egress polling are the rig's
         if (round % 50 == 0) (void)r.collect(raw);
         return allocs;
     };
 
-    for (int i = 0; i < 2000; ++i) (void)drive(i);
+    for (int i = 0; i < kWarmup; ++i) (void)drive(i);
     r.passes(100);
     ASSERT_NE(r.stats(), nullptr);
     EXPECT_GT(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 4096u) << "the warm-up grew the key index past its initial slots";
@@ -225,11 +231,13 @@ TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingRegre
     EXPECT_EQ(acksBefore, 2000u) << "every warm-up batch was acked";
 
     uint64_t worst = 0, total = 0;
-    for (int i = 2000; i < 7000; ++i) {
+    for (int i = kWarmup; i < kWarmup + 5000; ++i) {
         const uint64_t a = drive(i);
         total += a;
         worst = std::max(worst, a);
     }
+    EXPECT_EQ(judgedInWindows, judged() - (before.rejectionsKeyExists + before.rejectionsKeyNotFound + before.markersWritten))
+        << "every rejection and marker of the measured batches happened inside a window";
     r.passes(100);
     const VerdictSourceStats& after = *r.stats();
     EXPECT_GT(after.rejectionsKeyExists - before.rejectionsKeyExists, 1000u);

@@ -559,7 +559,7 @@ public:
         if (ackEncrypted_) f = sealC2b_(f);
         aeron::concurrent::AtomicBuffer ab(f.data(), static_cast<aeron::util::index_t>(f.size()));
         int64_t pos;
-        while ((pos = ackPub_->offer(ab, 0, static_cast<aeron::util::index_t>(f.size()))) < 0 && pos >= aeron::ADMIN_ACTION) pass();   // back-pressure / admin: let the worker drain
+        for (int i = 0; (pos = ackPub_->offer(ab, 0, static_cast<aeron::util::index_t>(f.size()))) < 0 && pos >= aeron::ADMIN_ACTION && i < kMaxPass; ++i) pass();   // back-pressure / admin: let the worker drain
         EXPECT_GT(pos, 0) << "the produce frame was refused: " << pos;
         return c;
     }
