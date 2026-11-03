@@ -216,6 +216,9 @@ public:
     /// the tombstones are not yet committed; Done = none left and all committed.
     ReapStatus tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
     /// Read-only test seam: the live transactional ids of `nsId` in this node's store; 0 when the store is not loaded here.
+    /// #663 / #727 test seam: the in-memory coordinator's known transactional ids and held keys.
+    [[nodiscard]] std::size_t coordinatorSizeForTest() const noexcept { return coordinator_.size(); }
+    [[nodiscard]] std::size_t holdCountForTest() const noexcept { return holds_.size(); }
     [[nodiscard]] std::optional<std::size_t> liveKeysOfNamespaceForTest(uint32_t nsId) const;   ///< nullopt = unknown (not loaded / not the coordinator)
 
     /// A control marker this node could not append.  NEVER counts as landed: a
@@ -503,6 +506,7 @@ private:
     /// last record before it; -3: no store).
     void completeHolds_(const std::string& txnId, int64_t record, int64_t putFloor = -1);
     int  releaseCommittedHolds_();
+    void forgetNamespace_(uint32_t nsId);   ///< #663 / #727: drop a deleted namespace's in-memory entries
     /// True when a key of offsetsScratch_ is held by another transaction (or by this id's completing one).
     [[nodiscard]] bool heldByOther_(const std::string& group, const std::string& txnId) const;
 

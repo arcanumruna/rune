@@ -504,12 +504,35 @@ ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uin
     if (loadState_ != LoadState::Loaded) return ReapStatus::Refused;
     (void)coordinator_.abortAllForNamespace(nsId, nowNs);   // idempotent: anything still open ends now
     if (coordinator_.unsettledOfNamespace(nsId) != 0) return ReapStatus::Refused;
+    forgetNamespace_(nsId);   // #663 / #727: before the tombstones, so nothing in memory can write a record back after them
     rune::replication::PartitionReplica* r = txnState_->replica();
     const rune::replication::Offset leo0 = r->logEndOffset();
     const bool none = txnState_->tombstoneNamespace(nsId, batch, nowNs);
     if (!none) return r->logEndOffset() > leo0 ? ReapStatus::More : ReapStatus::Refused;
     // Nothing left to write: Done only once every tombstone is committed (a leader change must not resurrect a key).
     return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::Waiting;
+}
+
+// #663 / #727: every in-memory entry keyed by a scoped transactional id of `nsId` (nothing of it is unsettled): the
+// coordinator's transactions, their holds (a hold in kHoldNeedsPut would re-append a Complete* record after the
+// tombstone), their last-put offsets and the producer-id cache.  Idempotent across re-asks.
+void TransactionCoordinationService::forgetNamespace_(uint32_t nsId)
+{
+    for (auto it = holds_.begin(); it != holds_.end();) {
+        if (rune::coordination::parseScopedId(it->second.txnId).nsId != nsId) { ++it; continue; }
+        auto next = std::next(it);
+        eraseHold_(it);
+        it = next;
+    }
+    for (auto it = lastPutOffset_.begin(); it != lastPutOffset_.end();) {
+        if (rune::coordination::parseScopedId(it->first).nsId == nsId) it = lastPutOffset_.erase(it);
+        else ++it;
+    }
+    for (auto it = pidIndex_.begin(); it != pidIndex_.end();) {
+        if (rune::coordination::parseScopedId(it->second).nsId == nsId) it = pidIndex_.erase(it);
+        else ++it;
+    }
+    (void)coordinator_.eraseNamespace(nsId);
 }
 
 std::optional<std::size_t> TransactionCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const

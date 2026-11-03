@@ -20,15 +20,18 @@
 //   | both           | a                              | tombstone, re-commit, restart  | the new commit lives        | RecommitAfterTombstone
 #include <rune/coordination/NsScopedId.h>
 #include <rune/coordination/ReplicatedOffsetStore.h>
+#include <rune/node/GroupCoordinationService.h>
 #include <rune/node/NodeRuntimeAgent.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/GroupMessages.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -451,4 +454,38 @@ TEST(NamespaceTombstoneRegression, FollowerConvergesTxnStateRegression) {
         EXPECT_EQ(liveTxns(rebuilt, 1, 300), 0);
         EXPECT_EQ(liveTxns(rebuilt, 2, 7), 7);
     }
+}
+
+// ── #663: the group coordinator forgets a deleted namespace's in-memory groups ───────────────────────────────
+TEST(NamespaceTombstoneRegression, GroupTombstoneErasesInMemoryGroupsRegression) {
+    namespace pc = rune::protocol::client;
+    Leader L("gcs_inmem");
+    co::ReplicatedOffsetStore store(L.replica.get());
+    rune::node::GroupCoordinationService gcs(&store, /*topics=*/nullptr);
+    int64_t now = 1'000'000'000;
+    gcs.doWork(now);   // loads the offsets (this node coordinates)
+    std::array<uint8_t, 2048> req{}, out{};
+    auto join = [&](uint32_t ns, const std::string& group) {
+        pc::JoinGroup msg;
+        msg.sessionId = 1; msg.correlationId = 7; msg.sessionTimeoutMs = 5000;
+        msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+        msg.memberId = std::span<const uint8_t>();
+        const std::vector<int32_t> none;
+        const std::size_t n = msg.encode(req.data(), std::span<const int32_t>(none));
+        const rune::coordination::NsRequestContext ctx{ns, false, nullptr};
+        const std::size_t o = gcs.handleJoinGroup(req.data(), n, rune::protocol::client::kClientVersion, now, out.data(), out.size(), ctx);
+        const auto r = pc::JoinGroupResponse::decode(out.data(), o);
+        ASSERT_TRUE(r.has_value());
+        ASSERT_EQ(r->errorCode, 0) << ns << "/" << group;
+    };
+    for (const char* g : {"g1", "g2", "g3"}) join(4, g);
+    join(5, "g1");
+    ASSERT_EQ(gcs.groupCountForTest(), 4u);
+    rune::node::ReapStatus st = rune::node::ReapStatus::More;
+    for (int i = 0; i < kCap && st != rune::node::ReapStatus::Done; ++i) {
+        st = gcs.tombstoneNamespace(4, 256, now);
+        ASSERT_TRUE(L.pumpToEnd());
+    }
+    ASSERT_EQ(st, rune::node::ReapStatus::Done);
+    EXPECT_EQ(gcs.groupCountForTest(), 1u) << "the deleted namespace's groups stay in memory";
 }

@@ -605,6 +605,16 @@ uint32_t TransactionCoordinator::abortAllForNamespace(uint32_t nsId, int64_t /*n
     return n;
 }
 
+uint32_t TransactionCoordinator::eraseNamespace(uint32_t nsId)
+{
+    uint32_t n = 0;
+    for (auto it = txnMap_.begin(); it != txnMap_.end();) {
+        if (rune::coordination::parseScopedId(it->first).nsId == nsId) { it = txnMap_.erase(it); ++n; }
+        else ++it;
+    }
+    return n;
+}
+
 uint32_t TransactionCoordinator::abortAllForSession(int64_t sessionId, int64_t /*nowNs*/)
 {
     if (sessionId == 0) return 0;   // 0 = "no session known": never matches
