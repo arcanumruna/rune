@@ -122,8 +122,9 @@ Issue batch 1 (`bugfix/issue-batch-1-views`) settles five things this part build
 | B1-2 backup: IO agent, `beginDiscard_`, `CheckpointState` (C1, C2, W3) | batch 1 | landed: a17d470b, b42bd9ce, c6b5695f | Use it. |
 | B1-2 log-start rule (#726, C3) | batch 1 | landed: dd542839 | Use it. |
 | B1-2 legacy and unreadable checkpoints (#590, C4) | batch 1 | landed: 99839bd6 | Task 2's tables 6/7 recovery goes through `applyRecoveredCheckpoint_` (below). |
-| B1-2 torn checkpoint tail (C7) | batch 1 | pending, after C4 | Tables 6/7 records go through `scanViewCheckpoint`; merge C7 before Task 2's recovery step. |
-| B1-2 checkpoint ahead of the log (#159, C5) and docs/e2e (C6) | batch 1 | pending | Nothing; Part 09 inherits them. |
+| B1-2 torn checkpoint tail (C7) | batch 1 | landed: 067efee6 | Tables 6/7 records go through `scanViewCheckpoint`; merge C7 before Task 2's recovery step. |
+| B1-2 checkpoint ahead of the log (#159, C5) and docs/e2e (C6) | batch 1 | landed: e7b6b942, c2cce09b, cc8dbc0e, b78ec7fc | Nothing; Part 09 inherits them. |
+| B1-6 review fixes: idle accounting for an unsettled member, backup fsync order | batch 1 | landed: a1b796d8, a3fba9e8 | Follow item 6 below. |
 | B1-3 per-record batch verdicts (#802, claimBatch) | batch 1 (wave 1C, steps 8–10) | pending | Task 7 and Task 8's multi-record cells wait for it. Tasks 1–6 do not. |
 | B1-4 verdict-member discard backed up before its refold ("NEW", wave 1A step 4) | batch 1 | pending, after C6 | Task 4 and Task 6 refold through `VerdictViewHooks::discard` from the start; the backup arrives with the merge. |
 | B1-5 concrete `AbortedTxnFilter` (#591) | batch 1 | landed: f8871a67, b439b046 | Use it. |
@@ -206,9 +207,15 @@ Issue batch 1 (`bugfix/issue-batch-1-views`) settles five things this part build
    - **Batch 1's change.** `AbortedTxnFilter` holds the concrete `AbortedTxnIndex` and `isAborted` is inline; the fold path no longer makes an indirect call per record (bench `BM_ViewFoldReplace` txn arg).
    - **What this part must do.** The unique-claim fold and the Check evaluation skip aborted records through the same `AbortedTxnFilter`. No `std::function`, virtual or new indirection is added to that path. Task 12's alloc gate and benches cover the transactional arg.
 
+6. **B1-6 — A member waiting on its backup costs no CPU (batch 1 review fix a1b796d8; amends Task 4 and Task 6).**
+   - **Batch 1's fix.** Before it, `pushVerdictCheckpoint_` returned 1 for every member whose checkpoint was not settled (`CheckpointDiscardPending`, and `CheckpointDiscardFailed` for good). So one failed backup kept the worker from ever reaching its `IdleStrategy`. Now only an owed discard whose frame went out counts: `return tryPushDiscard_(inst) ? 1 : 0`. Pending and Failed report 0. Tests: `CheckedWritesVerdictRestartRegression.Discard{Failed,Pending}VerdictMemberLetsTheWorkerIdleRegression`, which use the rig's new `pauseAgent` to hold the ack.
+   - **What this part must do.** Every checkpoint push this part adds for Unique and Check members, including the P9-8 retained-plan members, keeps that accounting. A `DiscardFailed` member stays unsettled. The judge counts it as behind and passes no verdict over it, and it costs no CPU.
+   - **Durability order (a3fba9e8).** The IO agent links the checkpoint into `backup/`, fsyncs `backup/`, then unlinks the original and fsyncs the view directory. The test is `ViewBackupRegression.BackupDirIsDurableBeforeTheCheckpointIsUnlinkedRegression`. This part adds no other unlink of a checkpoint file.
+
 **What batch 2 changes under this part (`bugfix/issue-batch-2-*`; in progress; whichever of batch 2 and this part merges second rebases onto the other).**
 - **2C #640 — catalog DDL is authorized against the target's namespace.** `authorizeCatalogDdl_` passes the target object's nsId to `authorizeName`, never the caller's. Task 3's `unique` / `check` create, replace and drop go through that path unchanged; add one cell per DDL where a non-root user of namespace A names a view in namespace B → `NotAuthorized` (45).
 - **2C #652 — the DDL audit principal is qualified.** A tenant's DDL event records `<ns>/<user>` (or `#<nsId>/<user>` when the namespace record is gone); `default` stays bare. Constraint DDL events inherit it. The fingerprint ignores the principal, so P9-5's candidate and fingerprint rules are unchanged.
+- **2C B1 (review) — group and transactional-id grants authorize the scoped local name.** `alpha/g` from alpha is authorized as group `g` in alpha, never as the text "alpha/g". This part adds no group or txn-id checks; nothing changes for it.
 - **2C #625 — `ObjectIndex` keeps the older live holder of a shared name.** Dropping a constrained view while a newer object of the same name exists re-points the name to the highest live id. P9-12 resolves by `objectId`, so `constraintName` is unaffected; Task 7's "drop then recreate the same name" cell must still resolve the old id to the old view.
 - **2D-2 #737 / #738 / #734 part 2 — `client-cpp/src/producer/ProducerImpl.cpp`.** They edit `onCoordinatorAnswer` and the `sweepTimedOut` signatures, the file Task 7 edits for the rejected record's offset. Hunks are separate; no shared logic.
 - **2E #796 — aborted-fold cells pinned.** New `ViewFold` / `AggFold` tests pin that `skippedAborted` counts aborted *batches*. Task 2's fold changes keep them green.
