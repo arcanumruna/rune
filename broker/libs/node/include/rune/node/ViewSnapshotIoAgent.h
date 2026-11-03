@@ -120,7 +120,7 @@ public:
     void forceWriteFailureForTest(int32_t viewTopicId, int32_t partition);
 
     /// Test-only: mark this key's stream errored (as after a FATAL write failure) while keeping
-    /// its fd writable, so a later reset frame can truncate it.
+    /// its fd writable, so a later discard frame can clear it.
     void forceErroredForTest(int32_t viewTopicId, int32_t partition);
 
     /// Acks the done ring was too full to take (retried each cycle).
@@ -158,7 +158,6 @@ private:
     };
 
     void handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx);
-    void handleResetFrame_(const uint8_t* p, std::size_t len, int channelIdx);   // retired kResetMsgType; removed with the discard route
     // Worker -> IO: move the live (or legacy) checkpoint file into backup/ and ack.  The ack is posted only after every
     // durable step (link, unlink, fsync(backupDir), fsync(viewDir)) is done; ENOENT is OK (idempotent replay after a crash).
     void handleDiscardFrame_(const uint8_t* p, std::size_t len, int channelIdx);

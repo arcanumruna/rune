@@ -684,7 +684,8 @@ TEST(CheckedWritesVerdictSourceRegression, ConstraintSetIsReconciledOnlyOnAChang
 TEST(CheckedWritesVerdictSourceRegression, AddVerdictViewBeforeBindDoesNotDiscardCheckpointRegression) {
     struct Discards {
         int n = 0;
-        static void count(void* ctx, ViewInstance&) { ++static_cast<Discards*>(ctx)->n; }
+        ViewDiscardReason reason{};
+        static void count(void* ctx, ViewInstance&, ViewDiscardReason why) { ++static_cast<Discards*>(ctx)->n; static_cast<Discards*>(ctx)->reason = why; }
     } discards;
     Rig r;
     r.vs.setViewHooks({&discards, nullptr, &Discards::count, nullptr});
@@ -706,6 +707,35 @@ TEST(CheckedWritesVerdictSourceRegression, AddVerdictViewBeforeBindDoesNotDiscar
     r.drive();
     EXPECT_EQ(discards.n, 0) << "the checkpoint is behind the markers this node holds";
     EXPECT_EQ(r.vs.stats().verdictCheckpointsDiscarded, 0u);
+}
+
+// V6 (view backups): a persisted member whose checkpoint outran the markers is handed to the owner's discard hook with the
+// AheadOfVerdicts reason; the judge itself no longer touches the member's cursor (the owner backs the file up and rebuilds).
+TEST(CheckedWritesVerdictSourceRegression, DiscardHookReceivesAheadOfVerdictsReasonRegression) {
+    struct Discards {
+        int n = 0;
+        ViewDiscardReason reason{};
+        static void count(void* ctx, ViewInstance&, ViewDiscardReason why) { ++static_cast<Discards*>(ctx)->n; static_cast<Discards*>(ctx)->reason = why; }
+    } discards;
+    Rig r;
+    r.vs.setViewHooks({&discards, nullptr, &Discards::count, nullptr});
+    const TestRejectRule rule = tagEquals(9);
+    r.members.push_back(std::make_unique<Member>(7, rule));
+    ViewInstance& inst = *r.members.back()->inst;
+    inst.persisted  = true;
+    inst.foldCursor = 50;   // far ahead of every marker this node holds (none)
+    r.st.rejected.noteCovered(10);
+    r.log.control();
+    std::vector<Rec> recs;
+    for (int i = 1; i <= 9; ++i) recs.push_back({i, 1});
+    r.log.data(recs);
+    r.vs.installTestVerdictViewForTest(&inst, 7, rule);
+    r.start();
+    r.drive();
+    EXPECT_EQ(discards.n, 1);
+    EXPECT_EQ(discards.reason, ViewDiscardReason::AheadOfVerdicts);
+    EXPECT_EQ(inst.foldCursor, 50) << "the judge leaves the cursor to the owner";
+    EXPECT_EQ(r.vs.stats().verdictCheckpointsDiscarded, 1u);
 }
 
 // A leader cut that loses the uncommitted marker leaves judged records without cover; an idle partition still covers them.

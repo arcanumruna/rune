@@ -105,8 +105,7 @@ struct ViewSnapshotChannel {
     // in its own doWork (WorkerViewSet::drainInstalls) and calls installView on
     // ITS OWN thread — shared-nothing (installView is never called cross-thread).
     static constexpr int32_t     kInstallMsgType   = 3;
-    // 4 was the checkpoint-truncate "reset" frame.  Retired (replaced by kDiscardMsgType = 5, discard + backup); the value is never reused.
-    static constexpr int32_t     kResetMsgType     = 4;
+    // 4 was the checkpoint-truncate "reset" frame.  Retired (replaced by kDiscardMsgType = 5, discard + backup): the value is never reused.
     static constexpr std::size_t kDeltaHeaderBytes = 8;  // viewTopicId i32 + partition i32
     static constexpr std::size_t kDoneMsgBytes      = 16; // viewTopicId i32 + partition i32 + O i64
 

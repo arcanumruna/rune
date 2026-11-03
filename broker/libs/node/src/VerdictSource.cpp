@@ -58,9 +58,8 @@ void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKi
 
 // P4-4: a checkpoint that outran every marker this node holds (a crash lost the log tail carrying them) cannot be trusted.
 void VerdictSource::discardCheckpointAhead_(Member& m) {
-    if (!m.inst->persisted || m.inst->foldCursor <= judgeCursor_ || hooks_.discard == nullptr) return;
-    hooks_.discard(hooks_.ctx, *m.inst);
-    m.inst->foldCursor = logStart_;
+    if (!m.inst->persisted || !checkpointSettled(*m.inst) || m.inst->foldCursor <= judgeCursor_ || hooks_.discard == nullptr) return;
+    hooks_.discard(hooks_.ctx, *m.inst, ViewDiscardReason::AheadOfVerdicts);   // the owner rebuilds it from the log; the cursor is its business
     ++stats_.verdictCheckpointsDiscarded;
 }
 
@@ -376,7 +375,7 @@ int VerdictSource::pushCheckpoints_(PartitionWriteState& state) {
     for (Member& m : members_) {
         ViewInstance& inst = *m.inst;
         // P4-4: a persisted member's delta leaves only once a marker in the local log covers the cursor it is stamped with.
-        if (inst.persisted && state.markers.appendedThrough() < inst.foldCursor && !inst.pendingValid && !inst.resetOwed) continue;
+        if (inst.persisted && state.markers.appendedThrough() < inst.foldCursor && !inst.pendingValid && checkpointSettled(inst)) continue;
         work += hooks_.checkpoint(hooks_.ctx, inst);
     }
     return work;

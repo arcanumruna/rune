@@ -23,6 +23,7 @@
 #include <rune/view/ViewTable.h>
 
 #include <rune/node/NsSlotTable.h>
+#include <rune/node/ViewSnapshotChannel.h>   // ViewDiscardReason
 
 namespace rune::node {
 
@@ -117,7 +118,22 @@ struct ViewFoldCounters {
     uint64_t aggRescans       = 0;   // aggregate (Phase 2b): Min/Max value-block rescans (retracted extreme)
     uint64_t transientRecordsEvicted = 0;   // transient ring dropped records the view had not folded
     uint64_t transientSourceResets   = 0;   // E2: the source ring was recreated / cut under a live cursor (re-folded)
+    uint64_t checkpointDiscards      = 0;   // beginDiscard_: rows thrown away (the checkpoint file is backed up first)
+    uint64_t viewBackupFailures      = 0;   // a discard whose backup failed: the view stays NotReady for the rest of the boot
+    uint64_t checkpointsAheadOfLog   = 0;   // #159: a recovered checkpoint above the source log end
+    uint64_t sourceRecordsTrimmed    = 0;   // source records below the log start that this view never folded (retention, compaction)
 };
+
+// Where the persisted checkpoint of an instance stands in a discard (one explicit state, each holding only what it needs):
+//   CheckpointLive           - the file and the tables agree; the instance folds and checkpoints as usual.
+//   CheckpointDiscardOwed    - the rows were thrown away; the discard frame is not on the ring yet (ring full, or a held delta first).
+//   CheckpointDiscardPending - the frame is with the IO agent; the instance waits for its ack (it folds nothing).
+//   CheckpointDiscardFailed  - the backup failed (errno): nothing is rebuilt over the unsaved checkpoint, NotReady for this boot.
+struct CheckpointLive {};
+struct CheckpointDiscardOwed    { ViewDiscardReason reason; };
+struct CheckpointDiscardPending { ViewDiscardReason reason; };
+struct CheckpointDiscardFailed  { ViewDiscardReason reason; int32_t err; };
+using CheckpointState = std::variant<CheckpointLive, CheckpointDiscardOwed, CheckpointDiscardPending, CheckpointDiscardFailed>;
 
 // The live [logStart, logEnd) of a TRANSIENT (InMemoryLog) source partition,
 // handed to the per-instance fold so it can reconcile its cursor (Phase 2b E),
@@ -201,7 +217,7 @@ struct ViewInstance {
     //   * defaults to Ready (a plain driveFolds instance);
     //   * set to RebuildingViews (or Ready when already caught up) at restart recovery by installViewForRecovery and
     //     loadRecoveryCheckpoint_ (foldCursor vs. committedTail), and lowered to RebuildingViews by
-    //     discardVerdictInstance_;
+    //     beginDiscard_;
     //   * lowered Ready -> CatchingUp on a new source leadership (N-C1) by driveView_ step 0b and flipVerdictMembers_;
     //   * raised to CatchingUp / Ready only by driveView_ (step 1b and after the fold), flipVerdictMembers_ and
     //     driveRebuild's caught-up block, all gated on foldCursor >= the bound and on leaderHwConfirmed (Ready only
@@ -228,8 +244,9 @@ struct ViewInstance {
     // dirty rows, so no delta is ever lost or double-counted.
     std::vector<uint8_t>               pendingDelta;
     bool                               pendingValid    = false;
-    // Part 04 (P4-4): the checkpoint file was discarded with the tables; a reset frame goes out before any new delta.
-    bool                               resetOwed       = false;
+    // Part 04 (P4-4) / view backups: where this instance's checkpoint file stands in a discard (see CheckpointState).  Anything but
+    // CheckpointLive means the instance folds nothing, checkpoints nothing and serves NotReady.
+    CheckpointState                    checkpoint{CheckpointLive{}};
 
     ViewInstance(rune::view::CompiledViewPlan p, rune::view::RowLayout l,
                  rune::codec::Descriptor src, bool persist, int32_t part,
@@ -242,5 +259,15 @@ struct ViewInstance {
           partition(part),
           persisted(persist) {}
 };
+
+/// True while the instance's checkpoint file and tables agree (no discard in flight).  An index compare.
+[[nodiscard]] inline bool checkpointSettled(const ViewInstance& i) noexcept { return i.checkpoint.index() == 0; }
+
+/// True when every table of the instance (output, and the aggregate's contributors, groups and blocks) holds no row.
+[[nodiscard]] inline bool viewTablesEmpty(const ViewInstance& i) noexcept {
+    if (i.table.size() != 0) return false;
+    if (!i.agg) return true;
+    return i.agg->contributors.size() == 0 && i.agg->groups.size() == 0 && (!i.agg->blocks || i.agg->blocks->size() == 0);
+}
 
 } // namespace rune::node

@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -374,7 +375,25 @@ int WorkerViewSet::drainSnapshotAcks(int limit) {
 }
 
 void WorkerViewSet::onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status) {
-    spdlog::info("VIEW-DISCARD-ACK view={} partition={} status={}", viewTopicId, partition, status);   // C2 completes the discard
+    const auto it = views_.find(instKey(viewTopicId, partition));
+    if (it == views_.end()) return;
+    ViewInstance& inst = it->second;
+    const auto* pending = std::get_if<CheckpointDiscardPending>(&inst.checkpoint);
+    if (pending == nullptr) {               // a fire-and-forget discard (legacy file next to a committed one) or a stale ack
+        if (status != 0)
+            spdlog::warn("WorkerViewSet: view {} partition {}: discard of a superseded checkpoint file failed: {}", viewTopicId, partition,
+                         std::strerror(status));
+        return;
+    }
+    if (status == 0) {
+        inst.checkpoint = CheckpointLive{};  // foldCursor stays 0: the rebuild starts from the log
+        return;
+    }
+    ++inst.counters.viewBackupFailures;
+    spdlog::error("VIEW-BACKUP-FAILED view={} partition={} reason={} errno={} ({}) -- the view stays NotReady; fix the disk or "
+                  "permissions and restart, or set RUNE_VIEW_BACKUP=0 to accept the loss of the old checkpoint",
+                  viewTopicId, partition, viewDiscardReasonName(pending->reason), status, std::strerror(status));
+    inst.checkpoint = CheckpointDiscardFailed{pending->reason, status};
 }
 
 void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t partition,
@@ -702,6 +721,7 @@ const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, int32_t partition, uin
 }
 
 int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
+    if (!checkpointSettled(inst)) return 0;   // belt and braces: driveView_ step 0a already returned
     dirtyEntries_.clear();
     rowOffsets_.clear();
     rowScratch_.clear();
@@ -904,7 +924,7 @@ int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, in
             inst.foldLeadership = leaderGen;
             if (inst.readiness == ViewReadiness::Ready) inst.readiness = ViewReadiness::CatchingUp;
         }
-        if (inst.readiness != ViewReadiness::Ready && inst.foldCursor >= bound) {
+        if (inst.readiness != ViewReadiness::Ready && inst.foldCursor >= bound && checkpointSettled(inst)) {
             inst.readiness = leaderHwConfirmed ? ViewReadiness::Ready : ViewReadiness::CatchingUp;
             pruneRecoveryIfAllReady_(id);
         }
@@ -939,15 +959,11 @@ void WorkerViewSet::eraseInstance_(int32_t viewTopicId, int32_t partition) {
 
 int WorkerViewSet::pushVerdictCheckpoint_(ViewInstance& inst) {
     int work = 0;
-    if (inst.resetOwed) {
-        const auto claim = channel_.deltas.tryClaim(ViewSnapshotChannel::kResetMsgType, ViewSnapshotChannel::kDeltaHeaderBytes);
-        if (claim < 0) return 1;   // ring full: retried next pass, no delta may precede the reset
-        uint8_t* dst = channel_.deltas.base() + claim;
-        writeI32LE(dst, inst.plan.viewTopicId);
-        writeI32LE(dst + 4, inst.partition);
-        channel_.deltas.commit(claim);
-        inst.resetOwed = false;
-        ++work;
+    if (!checkpointSettled(inst)) {
+        // A discard in flight: the frame goes out (after a held delta), then the instance waits for its ack.  Nothing is checkpointed.
+        if (std::holds_alternative<CheckpointDiscardOwed>(inst.checkpoint)) (void)tryPushDiscard_(inst);
+            return 1;
+        return 0;
     }
     if (inst.pendingValid) {
         ++work;
@@ -960,17 +976,43 @@ int WorkerViewSet::pushVerdictCheckpoint_(ViewInstance& inst) {
     return work + buildAndPushCheckpoint_(inst);
 }
 
-void WorkerViewSet::discardVerdictInstance_(ViewInstance& inst) {
+// The ONE way an instance's persisted rows are thrown away (recovery, the log-start clamp, a verdict member that outran its
+// markers).  Invariant: afterwards the instance has no rows, is NotReady and folds nothing until its checkpoint is Live again.
+// The checkpoint FILE is moved into backup/ (or removed, with backups off) by the view-snapshot IO agent; the worker never
+// touches the filesystem.  A delta held for the ring still belongs to the old stream: it goes out before the discard frame, so it
+// lands in the backup.
+void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) {
+    if (!checkpointSettled(inst)) return;   // idempotent: one discard at a time
     const std::size_t indexSlots = inst.plan.sizing.capacity != 0 ? ceilPow2(inst.plan.sizing.capacity) : std::size_t{4096};
     const std::size_t chunkBytes = inst.plan.sizing.chunkBytes != 0 ? static_cast<std::size_t>(inst.plan.sizing.chunkBytes) : (std::size_t{32} << 20);
     inst.table = rune::view::ViewTable(inst.layout, indexSlots, chunkBytes);
     if (inst.agg) inst.agg.emplace(rune::view::buildAggLayout(inst.plan, inst.evolvingSrc).value(), indexSlots, chunkBytes);
-    inst.pendingDelta.clear();
-    inst.pendingValid = false;
+    inst.foldCursor = 0;
     inst.lastEncodedO = -1;
-    inst.resetOwed = true;
+    inst.transientCursor = CursorFresh{};
     inst.readiness = ViewReadiness::RebuildingViews;
+    ++inst.counters.checkpointDiscards;
     chargeMem_(inst);
+    spdlog::info("VIEW-DISCARD view={} partition={} reason={}", inst.plan.viewTopicId, inst.partition, viewDiscardReasonName(reason));
+    if (!inst.persisted) return;            // an in-memory view has nothing on disk to save
+    inst.checkpoint = CheckpointDiscardOwed{reason};
+    (void)tryPushDiscard_(inst);
+}
+
+bool WorkerViewSet::tryPushDiscard_(ViewInstance& inst) {
+    const auto* owed = std::get_if<CheckpointDiscardOwed>(&inst.checkpoint);
+    if (owed == nullptr) return false;
+    if (inst.pendingValid && !tryPushDelta_(inst)) return false;   // the held delta belongs to the old stream: it precedes the frame
+    const auto claim = channel_.deltas.tryClaim(kDiscardMsgType, static_cast<std::size_t>(kDiscardMsgBytes));
+    if (claim < 0) return false;            // ring full: retried next pass
+    uint8_t* dst = channel_.deltas.base() + claim;
+    writeI32LE(dst, inst.plan.viewTopicId);
+    writeI32LE(dst + 4, inst.partition);
+    dst[8] = static_cast<uint8_t>(owed->reason);
+    dst[9] = dst[10] = dst[11] = 0;
+    channel_.deltas.commit(claim);
+    inst.checkpoint = CheckpointDiscardPending{owed->reason};
+    return true;
 }
 
 } // namespace rune::node

@@ -23,8 +23,9 @@ struct VerdictViewHooks {
     void* ctx = nullptr;
     /// Push the member's dirty rows as one checkpoint delta (or drop them for a transient member).
     int (*checkpoint)(void* ctx, ViewInstance&) = nullptr;
-    /// A checkpoint that outran the markers (P4-4): empty the member's tables and owe its file a reset.
-    void (*discard)(void* ctx, ViewInstance&) = nullptr;
+    /// A checkpoint that outran the markers (P4-4): the owner empties the member's tables, backs its checkpoint file up and
+    /// rebuilds it (WorkerViewSet::beginDiscard_).  The judge never touches the member's cursor on a discard.
+    void (*discard)(void* ctx, ViewInstance&, ViewDiscardReason) = nullptr;
     /// A retiring member left this partition's set for good (W passed its drop): the owner may erase the partition's instance.
     void (*retired)(void* ctx, int32_t viewTopicId, int32_t partition) = nullptr;
 };
@@ -204,6 +205,7 @@ bool VerdictSource::switchSet_(int64_t A, ReadRangeFn& readRange, const rune::vi
     for (const std::size_t i : scratchIdx_) {
         if (std::find(active_.begin(), active_.end(), i) != active_.end()) continue;   // staying
         Member& m = members_[i];
+        if (!checkpointSettled(*m.inst)) return false;   // its old checkpoint is being backed up: it cannot join a set yet
         m.inst->foldCursor = std::max(m.inst->foldCursor, logStart_);   // retention deleted what a member that was never folded would read
         if (m.inst->foldCursor < A + 1) {
             const rune::storage::LogReadView v = readRange(m.inst->foldCursor, A + 1);
@@ -233,13 +235,14 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     rejectedThisPass_ = 0;
     for (const std::size_t i : active_) {
         Member& m = members_[i];
+        if (!checkpointSettled(*m.inst)) continue;   // behind (below): the judge neither folds nor passes it
         m.inst->foldCursor = std::max(m.inst->foldCursor, logStart_);
         if (m.inst->foldCursor >= judgeCursor_) continue;
         const rune::storage::LogReadView v = readRange(m.inst->foldCursor, judgeCursor_);
         if (!v.empty()) work += replay_(m, v, judgeCursor_, aborted);
     }
     bool behind = false;
-    for (const std::size_t i : active_) behind = behind || members_[i].inst->foldCursor < judgeCursor_;
+    for (const std::size_t i : active_) behind = behind || !checkpointSettled(*members_[i].inst) || members_[i].inst->foldCursor < judgeCursor_;
     const bool ready = activeSet_.count == active_.size() || reindex_();
     if (!ready) {
         waitForInstall_();

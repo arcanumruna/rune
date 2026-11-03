@@ -77,6 +77,9 @@ class VerdictRig {
 public:
     static constexpr int32_t kSrc = 6;
     static constexpr int kMaxPass = 4000;
+    ViewBackupPolicy backupPolicy{};   ///< the agent's view-backup policy (set before the first persisted install)
+    /// The view checkpoint directory (the committed files, and backup/ under it).
+    [[nodiscard]] std::string snapDir() const { return viewDir_.string(); }
 
     /// `follower`: node 2 is in the ISR, so the HW only moves when followerFetch() is called.
     /// `rollBytes`: the log's segment size; compact() needs small segments (1 = one batch per segment).
@@ -119,7 +122,7 @@ public:
 
     /// A TestReject view (and the verdict template behind it) over the source.
     void installRejectView(int32_t viewTopicId, uint64_t objectId, TestRejectRule rule, const char* name = "rej", bool persisted = false) {
-        if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0);
+        if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0, backupPolicy);
         installs_.emplace_back(viewTopicId, [=, this] { installRejectViewNow_(viewTopicId, objectId, rule, name, persisted); });
         installs_.back().second();
     }

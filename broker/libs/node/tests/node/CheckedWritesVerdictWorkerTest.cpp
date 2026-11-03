@@ -2,8 +2,12 @@
 #include "CheckedWritesRig.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <random>
+#include <variant>
 
 using namespace rune::node;
 using namespace rune::node::cw;
@@ -16,6 +20,13 @@ constexpr int32_t kRej = 0x40000601, kProj = 0x40000602;
 constexpr uint64_t kObj = 77;
 
 TestRejectRule tagRule(uint8_t tag) { TestRejectRule r; r.mode = TestRejectRule::Mode::TagEquals; r.tag = tag; return r; }
+constexpr int kPassCap = 300;
+
+std::vector<uint8_t> slurp(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+std::string committedFile(const VerdictRig& r, int32_t view) { return viewCheckpointFilePath(r.snapDir(), view, 0); }
 }  // namespace
 
 TEST(CheckedWritesVerdictWorker, RejectedRecordNeverReachesAnyView) {
@@ -500,6 +511,7 @@ TEST(CheckedWritesVerdictWorker, RestartWithMarkersKeepsTheCheckpoint) {
     EXPECT_EQ(r.stats()->verdictCheckpointsDiscarded, 0u);
     EXPECT_TRUE(r.hasRow(kRej, 1));
     EXPECT_FALSE(r.hasRow(kRej, 2));
+    EXPECT_TRUE(listViewBackups(r.snapDir(), kRej, 0).empty()) << "a checkpoint that is kept is never backed up";   // V4
 }
 
 TEST(CheckedWritesVerdictRestartRegression, CheckpointAheadOfLocalMarkersIsDiscardedAndRefoldedRegression) {
@@ -513,12 +525,72 @@ TEST(CheckedWritesVerdictRestartRegression, CheckpointAheadOfLocalMarkersIsDisca
     ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
     r.truncateTo(r.leo() - 1);   // the crash lost the marker (the last record of the log); the records below stay
     ASSERT_GT(r.leo(), beforeBatch);
+    const std::vector<uint8_t> committed = slurp(committedFile(r, kRej));
+    ASSERT_FALSE(committed.empty());
     r.restart();
     r.passes(500);
     ASSERT_NE(r.stats(), nullptr);
     EXPECT_EQ(r.stats()->verdictCheckpointsDiscarded, 1u);
     EXPECT_TRUE(r.hasRow(kRej, 1));
     EXPECT_FALSE(r.hasRow(kRej, 2)) << "refolded under the re-judged verdicts";
+    // V1: the discarded checkpoint is moved aside, byte for byte, before the refold.
+    const auto backups = listViewBackups(r.snapDir(), kRej, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".ahead-of-verdicts.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurp(backups[0]), committed);
+}
+
+// V3: with backups off the discard removes the old checkpoint instead; the member refolds all the same.
+TEST(CheckedWritesVerdictRestartRegression, DiscardedVerdictMemberWithBackupOffRemovesWithoutBackupRegression) {
+    VerdictRig r;
+    r.backupPolicy = ViewBackupPolicy{false, 3};
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    r.truncateTo(r.leo() - 1);
+    r.restart();
+    r.passes(500);
+    ASSERT_NE(r.stats(), nullptr);
+    EXPECT_EQ(r.stats()->verdictCheckpointsDiscarded, 1u);
+    EXPECT_EQ(r.agent->discardsForTest(), 1);
+    EXPECT_FALSE(std::filesystem::exists(viewBackupDir(r.snapDir()))) << "backups are off: nothing is kept";
+    EXPECT_TRUE(r.hasRow(kRej, 1));
+    EXPECT_FALSE(r.hasRow(kRej, 2));
+}
+
+// V5: when the backup cannot be made, nothing is rebuilt over the unsaved checkpoint: the member stays unsettled and the judge
+// does not pass it (no verdicts, no markers) for the rest of the boot.
+TEST(CheckedWritesVerdictRestartRegression, BackupFailureKeepsTheVerdictMemberUnjudgedRegression) {
+    VerdictRig r;
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    r.truncateTo(r.leo() - 1);
+    const std::vector<uint8_t> committed = slurp(committedFile(r, kRej));
+    { std::ofstream blocker(viewBackupDir(r.snapDir()), std::ios::binary); blocker << "not a directory"; }
+    r.restart();
+    r.passes(300);
+    const CheckpointState* st = r.vs->checkpointStateForTest(kRej, 0);
+    ASSERT_NE(st, nullptr);
+    ASSERT_TRUE(std::holds_alternative<CheckpointDiscardFailed>(*st));
+    EXPECT_EQ(std::get<CheckpointDiscardFailed>(*st).reason, ViewDiscardReason::AheadOfVerdicts);
+    EXPECT_FALSE(r.vs->allViewsReady());
+    EXPECT_EQ(slurp(committedFile(r, kRej)), committed) << "the unsaved checkpoint is untouched";
+    const VerdictSource* judge = r.vs->verdictSource(VerdictRig::kSrc, 0);
+    ASSERT_NE(judge, nullptr);
+    const int64_t judged = judge->judgedThrough();
+    const uint64_t markers = r.stats()->markersWritten;
+    r.produce({{3, 30, 0}, {4, 40, 9}});
+    r.passes(kPassCap);
+    EXPECT_EQ(judge->judgedThrough(), judged) << "an unsettled member counts as behind: the judge does not pass it";
+    EXPECT_EQ(r.stats()->markersWritten, markers) << "no verdicts are issued";
+    EXPECT_FALSE(r.hasRow(kRej, 3));
 }
 
 TEST(CheckedWritesVerdictWorkerRegression, RefoldBelowWIgnoresALaterRuleRegression) {

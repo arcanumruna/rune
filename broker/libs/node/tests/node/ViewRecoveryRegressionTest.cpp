@@ -54,6 +54,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <memory>
+#include <optional>
+#include <variant>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -69,6 +73,7 @@
 
 #include <rune/node/AdminChannels.h>
 #include <rune/node/ViewSnapshotChannel.h>
+#include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/node/WorkerViewSet.h>
 
 namespace {
@@ -548,4 +553,222 @@ TEST(ViewRecoveryRegression, LegacyAndCommittedCheckpointsBothPresentLoadsOnlyTh
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
+}
+
+// ── View-backup discard (C2): a discard moves the checkpoint into backup/ through the IO agent, and the instance
+// folds nothing and serves NotReady until the agent acks.
+namespace {
+
+std::string slurpFile(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+void writeFile(const std::string& path, const std::vector<uint8_t>& b) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+}
+
+constexpr int kHardCap = 256;
+
+// A worker view set and a real IO agent sharing one channel and one data dir; the view holds a checkpoint at O=2.
+struct DiscardRig {
+    rune::codec::Descriptor src = charSourceV1();
+    rune::view::CompiledViewPlan plan;
+    rune::view::RowLayout layout;
+    rune::codec::Descriptor outDesc;
+    std::string dir;
+    rune::node::ViewSnapshotChannel channel;
+    std::optional<rune::node::ViewSnapshotIoAgent> agent;
+    std::optional<rune::node::WorkerViewSet> vs;
+    std::vector<uint8_t> log = upsertRun(7, 30, 4, 0);   // committed log [0,4): key 7 only
+    int64_t now = 0;
+
+    DiscardRig(const char* stem, uint8_t persistence, rune::node::ViewBackupPolicy policy = {}) {
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto comp = rune::view::compileView(hpView(persistence), srcs, kViewId).value();
+        plan = comp.plan; layout = comp.rowLayout; outDesc = comp.outputDescriptor;
+        dir = uniqueDir(stem);
+        agent.emplace(channel, dir, /*fsyncMs*/ 1, policy);
+        vs.emplace(channel, dir);
+        pushRecoveryInstall(channel, plan, outDesc, src, persistence);
+        EXPECT_EQ(vs->drainInstalls(), 1);
+    }
+    ~DiscardRig() { std::error_code ec; std::filesystem::remove_all(dir, ec); }
+
+    std::string ckptPath() const { return rune::node::viewCheckpointFilePath(dir, kViewId, 0); }
+    void writeCheckpoint(const std::vector<uint8_t>& srcBatch, int64_t foldTo) {
+        writeFile(ckptPath(), makeBaseCheckpoint(plan, layout, src, srcBatch, foldTo));
+    }
+    void materialize() { vs->materializeRecoveryInstancesFor(kSrcId, 0, 4); }
+    auto readLog() {
+        return [this](int64_t, int64_t) -> rune::storage::LogReadView {
+            return rune::storage::LogReadView{log.data(), log.size(), 0, 4};
+        };
+    }
+    void fold() { vs->driveFolds(kSrcId, 0, readLog(), 4, rune::view::kNoSkip, now); }
+    // One worker pass plus one agent pass; capped.
+    void pump(int rounds = 8) {
+        for (int i = 0; i < rounds && i < kHardCap; ++i) {
+            now += 1'000'000'000;
+            agent->doWork(now);
+            vs->drainSnapshotAcks();
+            fold();
+        }
+    }
+    bool pumpUntilSettled() {
+        for (int i = 0; i < kHardCap; ++i) {
+            if (std::holds_alternative<rune::node::CheckpointLive>(*vs->checkpointStateForTest(kViewId, 0))) return true;
+            if (std::holds_alternative<rune::node::CheckpointDiscardFailed>(*vs->checkpointStateForTest(kViewId, 0))) return false;
+            pump(1);
+        }
+        return false;
+    }
+    rune::node::WorkerViewSet::RowStatus rowStatus(int64_t key) {
+        const rune::view::RowLayout* L = nullptr;
+        auto st = rune::node::WorkerViewSet::RowStatus::Ok;
+        (void)vs->getRow(kViewId, 0, key, L, &st);
+        return st;
+    }
+};
+
+} // namespace
+
+// W1: while the discard is un-acked the instance folds nothing and serves NotReady; the ack releases it, the old
+// checkpoint is in backup/ byte for byte, and the view then refolds to Ready from the log.
+TEST(ViewRecoveryRegression, DiscardBlocksFoldsUntilTheBackupIsAckedRegression) {
+    DiscardRig r("rune_t_1_w1-", 0);
+    r.writeCheckpoint(upsertRun(9, 10, 2, 0), 2);
+    const std::string before = slurpFile(r.ckptPath());
+    r.materialize();
+    ASSERT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews);
+
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    ASSERT_TRUE(std::holds_alternative<rune::node::CheckpointDiscardPending>(*r.vs->checkpointStateForTest(kViewId, 0)));
+
+    // The agent has not run: many worker passes fold nothing and never reach Ready.
+    for (int i = 0; i < 16; ++i) { r.now += 1000; r.fold(); r.vs->drainSnapshotAcks(); }
+    EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointDiscardPending>(*r.vs->checkpointStateForTest(kViewId, 0)));
+    EXPECT_NE(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    EXPECT_EQ(r.rowStatus(7), rune::node::WorkerViewSet::RowStatus::NotReady);
+    EXPECT_EQ(slurpFile(r.ckptPath()), before) << "the checkpoint is untouched until the agent runs";
+
+    ASSERT_TRUE(r.pumpUntilSettled());
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".ahead-of-log.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), before);
+    r.pump(8);
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_EQ(r.vs->getRow(kViewId, 0, 9, L), nullptr) << "a row only the discarded checkpoint held is gone";
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33);
+}
+
+// W2: a backup the agent cannot make leaves the instance NotReady and unrebuilt for the boot, with the checkpoint kept.
+TEST(ViewRecoveryRegression, BackupFailureLeavesTheViewNotReadyAndUnrebuiltRegression) {
+    DiscardRig r("rune_t_1_w2-", 0);
+    r.writeCheckpoint(upsertRun(9, 10, 2, 0), 2);
+    const std::string before = slurpFile(r.ckptPath());
+    { std::ofstream f(r.dir + "/backup"); f << "not a directory"; }   // backup/ cannot be made
+    r.materialize();
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::Unreadable));
+    EXPECT_FALSE(r.pumpUntilSettled());
+    const auto* failed = std::get_if<rune::node::CheckpointDiscardFailed>(r.vs->checkpointStateForTest(kViewId, 0));
+    ASSERT_NE(failed, nullptr);
+    EXPECT_EQ(failed->reason, rune::node::ViewDiscardReason::Unreadable);
+    EXPECT_NE(failed->err, 0);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->viewBackupFailures, 1u);
+    r.pump(32);
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews);
+    EXPECT_EQ(r.rowStatus(7), rune::node::WorkerViewSet::RowStatus::NotReady);
+    EXPECT_EQ(slurpFile(r.ckptPath()), before) << "the checkpoint is kept";
+}
+
+// W3: deltas already on the ring when the discard is raised belong to the old stream: they land in the backup.
+TEST(ViewRecoveryRegression, DeltasBeforeTheDiscardLandInTheBackupNotTheNewFileRegression) {
+    DiscardRig r("rune_t_1_w3-", 0);
+    r.materialize();                                   // no checkpoint: a cold start
+    r.now += 1000; r.fold();                            // folds [0,4) and pushes its delta
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    ASSERT_TRUE(r.pumpUntilSettled());
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    const std::string bytes = slurpFile(backups[0]);
+    ASSERT_FALSE(bytes.empty()) << "the old stream's delta is in the backup";
+    const auto recs = rune::node::splitViewCheckpointRecords(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+    EXPECT_FALSE(recs.empty());
+    EXPECT_EQ(rune::view::replay(*std::make_unique<rune::view::ViewTable>(r.layout, 16, 1u << 16), r.layout, {}, recs), 4);
+}
+
+// W4: the agent orders backupDir fsync, viewDir fsync, then the ack; and a restart at each crash point (before the
+// link, after the link before the unlink, after the unlink) converges to the same rows.
+TEST(ViewRecoveryRegression, DiscardCrashPointsAllConvergeToTheRecomputedViewRegression) {
+    {
+        DiscardRig r("rune_t_1_w4a-", 0);
+        r.agent->recordFsyncLogForTest(true);
+        r.writeCheckpoint(upsertRun(7, 30, 2, 0), 2);
+        r.materialize();
+        ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+        ASSERT_TRUE(r.pumpUntilSettled());
+        const auto& log = r.agent->fsyncLogForTest();
+        ASSERT_GE(log.size(), 3u);
+        const std::size_t n = log.size();
+        EXPECT_EQ(log[n - 3], "backupDir");
+        EXPECT_EQ(log[n - 2], "viewDir");
+        EXPECT_EQ(log[n - 1], "ack");
+    }
+    // crash point 0: only the checkpoint; 1: checkpoint and its backup link; 2: only the backup.
+    for (int point = 0; point < 3; ++point) {
+        DiscardRig r(("rune_t_1_w4b" + std::to_string(point) + "-").c_str(), 0);
+        const auto ckpt = makeBaseCheckpoint(r.plan, r.layout, r.src, upsertRun(7, 30, 2, 0), 2);
+        if (point < 2) writeFile(r.ckptPath(), ckpt);
+        if (point > 0) {
+            std::filesystem::create_directories(r.dir + "/backup");
+            writeFile(r.dir + "/backup/view-" + std::to_string(kViewId) + "-p0.0000000001.ahead-of-log.delta", ckpt);
+        }
+        r.materialize();
+        r.pump(16);
+        ASSERT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready) << "point " << point;
+        const rune::view::RowLayout* L = nullptr;
+        const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+        ASSERT_NE(row, nullptr) << "point " << point;
+        EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33) << "point " << point;
+    }
+}
+
+// W5: after the backup and refold the view equals a from-scratch recompute of the log.
+TEST(ViewRecoveryRegression, RebuiltViewEqualsRecomputeAfterADiscardRegression) {
+    DiscardRig r("rune_t_1_w5-", 0);
+    r.log = upsertRun(7, 30, 2, 0);
+    { auto more = upsertRun(8, 50, 2, 2); r.log.insert(r.log.end(), more.begin(), more.end()); }
+    r.writeCheckpoint(upsertRun(9, 1, 2, 0), 2);
+    r.materialize();
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    ASSERT_TRUE(r.pumpUntilSettled());
+    r.pump(8);
+    ASSERT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* a = r.vs->getRow(kViewId, 0, 7, L);
+    const uint8_t* b = r.vs->getRow(kViewId, 0, 8, L);
+    ASSERT_NE(a, nullptr); ASSERT_NE(b, nullptr);
+    EXPECT_EQ(rune::view::readSlot(a, *L, 1).i, 31);
+    EXPECT_EQ(rune::view::readSlot(b, *L, 1).i, 51);
+    EXPECT_EQ(r.vs->getRow(kViewId, 0, 9, L), nullptr);
+}
+
+// W6: a transient (in-memory) view resets in place without a frame and stays Live.
+TEST(ViewRecoveryRegression, NonPersistedDiscardResetsWithoutAFrameRegression) {
+    DiscardRig r("rune_t_1_w6-", 1);
+    r.materialize();
+    r.fold();
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointLive>(*r.vs->checkpointStateForTest(kViewId, 0)));
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews);
+    r.pump(8);
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    EXPECT_TRUE(rune::node::listViewBackups(r.dir, kViewId, 0).empty());
+    EXPECT_EQ(r.agent->discardsForTest(), 0) << "no discard frame reached the agent";
 }

@@ -216,38 +216,6 @@ TEST(ViewSnapshotIoAgentRegression, FatalWriteFailureStopsStreamAndNeverAdvances
     EXPECT_EQ(applied->O, 10);
 }
 
-// A checkpoint reset starts a fresh stream: an errored file must accept deltas again after it,
-// otherwise that view partition refolds cold on every restart.
-TEST(ViewSnapshotIoAgentRegression, ResetClearsErroredStreamSoLaterDeltasPersist) {
-    TempDir dir;
-    rune::node::ViewSnapshotChannel ch;
-    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/50);
-    rune::consensus::ManualNanoClock clk(0);
-    const RowLayout layout = testLayout();
-
-    agent.forceErroredForTest(kViewTopicId, kPartition);
-    ASSERT_TRUE(agent.hasError(kViewTopicId, kPartition));
-
-    uint8_t reset[rune::node::ViewSnapshotChannel::kDeltaHeaderBytes] = {};
-    for (int i = 0; i < 4; ++i) reset[i]     = static_cast<uint8_t>(static_cast<uint32_t>(kViewTopicId) >> (i * 8));
-    for (int i = 0; i < 4; ++i) reset[4 + i] = static_cast<uint8_t>(static_cast<uint32_t>(kPartition)   >> (i * 8));
-    ASSERT_TRUE(ch.deltas.write(reset, sizeof(reset), rune::node::ViewSnapshotChannel::kResetMsgType));
-
-    auto frame = frameDelta(kViewTopicId, kPartition, /*O=*/10, /*hp=*/1, layout);
-    ASSERT_TRUE(ch.deltas.write(frame.data(), frame.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
-    for (int i = 0; i < kHardCap && agent.lastDurableOffset(kViewTopicId, kPartition) < 10; ++i) {
-        agent.doWork(clk.nowNs());
-        clk.advance(60LL * 1'000'000LL);
-    }
-
-    EXPECT_FALSE(agent.hasError(kViewTopicId, kPartition));
-    EXPECT_EQ(agent.lastDurableOffset(kViewTopicId, kPartition), 10);
-    ViewTable replayed(layout);
-    auto applied = applyDelta(replayed, layout, readFile(agent.deltaFilePathForTest(kViewTopicId, kPartition)));
-    ASSERT_TRUE(applied.has_value());
-    EXPECT_EQ(applied->O, 10);
-}
-
 // Review round 1, IMPORTANT 1: a transient ::open() failure must be retried,
 // never permanently cached. Uses a FILE sitting where the view-data
 // directory should be, so every ::open() of the per-key delta file fails

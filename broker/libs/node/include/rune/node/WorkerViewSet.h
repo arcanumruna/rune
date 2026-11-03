@@ -89,6 +89,18 @@ public:
     // serve-guard), NOT lazily created Ready by the plain driveFolds path.
     int drainInstalls();
 
+    /// Test seams: throw away one instance's rows exactly as recovery does, and read where its checkpoint stands.
+    bool beginDiscardForTest(int32_t viewTopicId, int32_t partition, ViewDiscardReason reason) {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        if (it == views_.end()) return false;
+        beginDiscard_(it->second, reason);
+        return true;
+    }
+    [[nodiscard]] const CheckpointState* checkpointStateForTest(int32_t viewTopicId, int32_t partition) const {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it == views_.end() ? nullptr : &it->second.checkpoint;
+    }
+
     // Drain the IO agent's `done` ring (channel_.done) on THIS thread, the ring's only consumer.  kDoneMsgType frames
     // (durable-offset acks) are ignored; a kDiscardDoneMsgType frame completes a discard (onDiscardDone_).  Without a
     // consumer the agent's pendingAcks_ would grow without bound once the 4 KiB ring filled.  Returns frames drained.
@@ -197,7 +209,7 @@ public:
             adoptNs_(inst, ns);
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
             work += driveView_(inst, readRange, rebuildTail, rskip, transientSrc, leaderGen, leaderHwConfirmed);
-            if (inst.foldCursor >= rebuildTail) {
+            if (inst.foldCursor >= rebuildTail && checkpointSettled(inst)) {
                 // N-C1: Ready only once the leader's HW reached its leadership start offset; else CatchingUp
                 // (never left RebuildingViews: that state gates elections).
                 inst.readiness = leaderHwConfirmed ? ViewReadiness::Ready : ViewReadiness::CatchingUp;
@@ -534,11 +546,12 @@ private:
     int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
     int finishRetired_();
     int pushVerdictCheckpoint_(ViewInstance& inst);
-    void discardVerdictInstance_(ViewInstance& inst);
+    void beginDiscard_(ViewInstance& inst, ViewDiscardReason reason);
+    [[nodiscard]] bool tryPushDiscard_(ViewInstance& inst);
     bool eraseView_(int32_t viewTopicId);
     void eraseInstance_(int32_t viewTopicId, int32_t partition);
     static int  checkpointHook_(void* ctx, ViewInstance& inst) { return static_cast<WorkerViewSet*>(ctx)->pushVerdictCheckpoint_(inst); }
-    static void discardHook_(void* ctx, ViewInstance& inst) { static_cast<WorkerViewSet*>(ctx)->discardVerdictInstance_(inst); }
+    static void discardHook_(void* ctx, ViewInstance& inst, ViewDiscardReason reason) { static_cast<WorkerViewSet*>(ctx)->beginDiscard_(inst, reason); }
     static void retiredHook_(void* ctx, int32_t viewTopicId, int32_t partition) {
         static_cast<WorkerViewSet*>(ctx)->retiredQueue_.push_back({viewTopicId, partition});
     }
@@ -599,6 +612,12 @@ private:
                    const rune::view::FoldSkip& skip,
                    const TransientBounds* transientSrc, uint64_t leaderGen, bool leaderHwConfirmed) {
         int work = 0;
+        // 0a. A discard in flight (the old checkpoint is being backed up): fold nothing, checkpoint nothing, serve NotReady until
+        //     the IO agent acks.  Owed = the frame is not on the ring yet (retry it); Failed = never rebuilt over the unsaved file.
+        if (!checkpointSettled(inst)) [[unlikely]] {
+            if (std::holds_alternative<CheckpointDiscardOwed>(inst.checkpoint)) return tryPushDiscard_(inst) ? 1 : 0;
+            return 0;
+        }
         // 00. Task 12 (D26): the namespace is over its view-memory limit -> pause at foldCursor (reads answer
         //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.
         if (inst.nsSlot != kNoNsSlot && !nsViewGate_(inst)) return work;

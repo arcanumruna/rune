@@ -164,28 +164,6 @@ ViewSnapshotIoAgent::FileState* ViewSnapshotIoAgent::fileFor_(const Key& key) {
     return &ins->second;
 }
 
-void ViewSnapshotIoAgent::handleResetFrame_(const uint8_t* p, std::size_t len, int channelIdx) {
-    if (len < ViewSnapshotChannel::kDeltaHeaderBytes) return;
-    const Key key{static_cast<int32_t>(readLE32(p)), static_cast<int32_t>(readLE32(p + 4))};
-    FileState* fs = fileFor_(key);
-    if (fs == nullptr) return;
-    fs->channelIdx = channelIdx;
-    if (::ftruncate(fs->fd, 0) != 0) {
-        fs->errored = true;
-        spdlog::error("ViewSnapshotIoAgent: FATAL truncate failure for viewTopicId={} partition={}: {}", key.viewTopicId, key.partition,
-                      std::strerror(errno));
-        return;
-    }
-    // The reset starts a fresh stream, so an earlier write error no longer applies.
-    fs->errored = false;
-    if (rune::node::detail::platformFdatasync(fs->fd) != 0) {
-        spdlog::warn("ViewSnapshotIoAgent: fdatasync failed after reset for viewTopicId={} partition={}: {}",
-                     key.viewTopicId, key.partition, std::strerror(errno));
-    }
-    fs->pendingO = fs->lastDurableO = -1;
-    fs->dirtySinceSync = false;
-}
-
 namespace {
 // Backup file names: view-<view>-p<part>.<10-digit seq>.<reason>.delta
 std::string backupPrefix(int32_t view, int32_t part) {
@@ -486,10 +464,6 @@ int ViewSnapshotIoAgent::doWork(int64_t nowNs) {
         drained += ch->deltas.drain(
             [this, ci](int32_t type, aeron::concurrent::AtomicBuffer& buf,
                        aeron::util::index_t off, aeron::util::index_t len) {
-                if (type == ViewSnapshotChannel::kResetMsgType) {
-                    handleResetFrame_(reinterpret_cast<const uint8_t*>(buf.buffer() + off), static_cast<std::size_t>(len), ci);
-                    return;
-                }
                 if (type == kDiscardMsgType) {
                     handleDiscardFrame_(reinterpret_cast<const uint8_t*>(buf.buffer() + off), static_cast<std::size_t>(len), ci);
                     return;
