@@ -12,8 +12,10 @@
 // thread IS the polling thread (single-owner contract).  The only cross-thread
 // memory is the ring's own.
 //
-// A poll()/waitFor() handler may issue the next op.  The credit of a ring record is returned when the read ends (the
-// ring head moves then), so while the handler runs reserve() may answer QueueFull ("poll() first" still applies).
+// A poll()/waitFor() handler may reserve() and issue the next op, but must NOT call poll()/waitFor() on the same queue:
+// the ring read is not re-entrant, so a nested call is a programming error and throws std::logic_error.  The credit of a
+// ring record is returned when the read ends (the ring head moves then), so while the handler runs reserve() may answer
+// QueueFull: the handler returns, and the app polls again after the outer call.
 //
 // Two forms:
 //   * Completions(cfg): standalone (C1) — no Client; the duty side reaches the
@@ -175,7 +177,7 @@ public:
 
     /// Reserve `bytes` of credit for one op about to be issued.  Accepted: the
     /// op may be issued (and must complete exactly once, or be unreserve()d if
-    /// it is then rejected).  QueueFull: poll() first.  Closed: the producer
+    /// it is then rejected).  QueueFull: poll() after the current handler returns (never from inside one).  Closed: the producer
     /// side closed this queue.  InvalidArgument: not an 8-aligned record size
     /// (use reservationFor()) or larger than maxReservation().
     ///
@@ -229,8 +231,11 @@ public:
     /// While h runs, the credit of the ring record being handled is not yet
     /// returned (the ring head moves when the read ends), so reserve() may
     /// answer QueueFull until poll() returns; it is returned even if h throws.
+    /// h must not call poll() or waitFor() on this queue: that throws std::logic_error (the ring read is not
+    /// re-entrant).  On QueueFull inside h, return and poll again after this call.
     template <class H>
     int poll(H&& h, int limit = INT_MAX) {
+        const ReadScope scope{*this};   // throws if a handler of this queue is running
         int n = 0;
         while (n < limit && stashHead_ < stashTail_) {
             uint8_t* e = stash_.get() + stashHead_;
@@ -273,16 +278,20 @@ public:
     /// producer side has closed (its owner may be gone).  A TimedOut wait only
     /// stops waiting: the op will still complete and must still be polled.
     /// onDone(const Completion&, std::span<const uint8_t>) runs on this thread;
-    /// like poll()'s handler it may issue ops, with the same deferred credit.
+    /// like poll()'s handler it may issue ops, with the same deferred credit, but it must not call poll() or waitFor()
+    /// on this queue (throws std::logic_error: the ring read is not re-entrant).  Calling waitFor() from inside a
+    /// poll()/waitFor() handler of this queue throws too.
     template <class H, class Pump = NoPump, class Idle = DefaultWaitIdle>
     Wait waitFor(Token t, std::chrono::nanoseconds timeout, H&& onDone, Pump&& pump = Pump{},
                  Idle&& idle = Idle{}) {
-        if (takeFromStash_(t, onDone)) return Wait::Done;
+        if (inRead_) throwNested_();
+        if (takeFromStashScoped_(t, onDone)) return Wait::Done;
         const int64_t deadline = now_() + timeout.count();
         for (;;) {
             const bool closedBefore = ring_->producerClosed();
             int work = closedBefore ? 0 : pump();
             bool done = false;
+            const ReadScope scope{*this};   // the pump above is not a handler: only the ring read is guarded
             DeferredCredit deferred{*this};
             work += ring_->read(
                 [&](const Completion& c, std::span<const uint8_t> payload) {
@@ -390,6 +399,29 @@ private:
         outstanding_ -= unitsOf_(c);
     }
 
+    // Re-entrancy guard (owner thread): set while a handler of this queue may run.  OneToOneRingBuffer::read is not
+    // re-entrant (a nested read re-delivers from the unmoved head, and the outer read's head store then moves the head
+    // back: the ring wedges), so a nested poll()/waitFor() is refused loudly, never answered with a silent 0.
+    [[noreturn]] static void throwNested_() {
+        throw std::logic_error("rune::client::Completions: poll()/waitFor() called from inside a completion handler");
+    }
+    struct ReadScope {
+        Completions& cq;
+        explicit ReadScope(Completions& q) : cq(q) {
+            if (q.inRead_) throwNested_();
+            q.inRead_ = true;
+        }
+        ReadScope(const ReadScope&)            = delete;
+        ReadScope& operator=(const ReadScope&) = delete;
+        ~ReadScope() { cq.inRead_ = false; }
+    };
+
+    template <class H>
+    bool takeFromStashScoped_(Token t, H& onDone) {
+        const ReadScope scope{*this};
+        return takeFromStash_(t, onDone);
+    }
+
     // Credit of records handed over inside one ring read.  OneToOneRingBuffer::read moves the consumer head only after
     // the whole read (also when the handler throws), so the credit is applied by the destructor, after the read.
     struct DeferredCredit {
@@ -475,6 +507,7 @@ private:
     uint32_t stashHead_      = 0;  // owner thread only
     uint32_t stashTail_      = 0;
     uint32_t stashLive_      = 0;
+    bool     inRead_         = false;  // owner thread only: a handler of this queue is running (see ReadScope)
     Client*         client_ = nullptr;   // registered with (nullptr: standalone)
     std::thread::id owner_;              // the constructing thread
     CqRef           cqRef_  = kNoCqRef;  // duty-assigned at registration

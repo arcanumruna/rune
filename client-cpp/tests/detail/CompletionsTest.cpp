@@ -920,30 +920,33 @@ TEST(CompletionsAdversarialRegression, ThrowAcrossAWrapReturnsExactlyTheHandedCr
     }
 }
 
-// The doc says a handler may issue ops, and reserve() answering QueueFull means "poll() first".  A handler that does exactly
-// that calls poll() (or waitFor()) from inside poll(): the nested ring read starts from the same, not yet moved, head.  Every
-// completion must still be delivered exactly once and the credit must end at zero; at the least the nested call must be
-// refused, never re-deliver records of the outer read.
+// A handler that sees reserve() answer QueueFull used to call poll() (or waitFor()) from inside poll(): the nested ring read
+// starts from the same, not yet moved, head.  Contract: nesting is a programming error, refused loudly with std::logic_error
+// (never a silent 0 an app could spin on); the handler returns on QueueFull and the app polls again after the outer call.
+// Every completion is delivered exactly once, the credit ends at zero and the ring still works.
 // URGENT break found by the batch 1 fix-round re-attack (hang): OneToOneRingBuffer::read is not re-entrant - the nested read
 // re-delivers from the unmoved head, then the outer read's exit moves the head back over memory the nested one zeroed, and
-// the ring is wedged (later completions never arrive, their ops stay outstanding).  Pre-existing; DISABLED until the fix
-// (a re-entrancy guard in Completions::poll / waitFor) lands.
-TEST(CompletionsAdversarialRegression, DISABLED_NestedPollInsideAPollHandlerDeliversEachCompletionOnceAdversarialRegression) {
+// the ring is wedged (later completions never arrive, their ops stay outstanding).  Fixed by the owner-thread re-entrancy
+// guard in Completions::poll / waitFor.
+TEST(CompletionsAdversarialRegression, NestedPollInsideAPollHandlerDeliversEachCompletionOnceAdversarialRegression) {
     Completions cq(smallCfg(1024, 88, 64));
     Token next = 0;
     std::vector<int> times(64, 0);
     while (cq.reserve(48) == OpResult::Accepted) ASSERT_TRUE(deliver(cq, next++, 48, 0));
     ASSERT_EQ(next, 18u);
-    int depth = 0;
+    int refused = 0;
+    bool attempting = false;   // one nested attempt at a time: without the guard the test fails instead of recursing forever
     std::function<void(const Completion&, std::span<const uint8_t>)> h = [&](const Completion& c, std::span<const uint8_t>) {
         ++times[c.token];
-        if (depth == 0 && cq.reserve(48) == OpResult::QueueFull) {   // "poll() first"
-            ++depth;
-            (void)cq.poll(h, 2);
-            --depth;
+        if (!attempting && cq.reserve(48) == OpResult::QueueFull) {   // the nested call is refused; the handler just returns
+            attempting = true;
+            EXPECT_THROW((void)cq.poll(h, 2), std::logic_error);
+            attempting = false;
+            ++refused;
         }
     };
     for (int i = 0; i < 100 && cq.poll(h) > 0; ++i) {}
+    EXPECT_GT(refused, 0) << "no handler reached the nested call: the test is vacuous";
     for (Token t = 0; t < next; ++t) EXPECT_EQ(times[t], 1) << "token " << t;
     EXPECT_EQ(cq.outstanding(), 0u);
     EXPECT_EQ(cq.reservedBytes(), 0u);
@@ -957,21 +960,26 @@ TEST(CompletionsAdversarialRegression, DISABLED_NestedPollInsideAPollHandlerDeli
 }
 
 // waitFor() inside a poll() handler: issue the next op and wait for it synchronously (a natural request chain).
-// URGENT (same root cause as the nested poll above): DISABLED until the re-entrancy guard lands.
-TEST(CompletionsAdversarialRegression, DISABLED_WaitForInsideAPollHandlerDeliversEachCompletionOnceAdversarialRegression) {
+// URGENT (same root cause as the nested poll above): the nested waitFor() throws std::logic_error; the request chain is
+// continued by the app after the outer poll (the issued op is delivered by a later poll).
+TEST(CompletionsAdversarialRegression, WaitForInsideAPollHandlerDeliversEachCompletionOnceAdversarialRegression) {
     Completions cq(smallCfg(1024, 88, 64));
     std::vector<int> times(64, 0);
     for (Token t = 0; t < 4; ++t) { ASSERT_EQ(cq.reserve(48), OpResult::Accepted); ASSERT_TRUE(deliver(cq, t, 48, 0)); }
     Token next = 4;
+    int refused = 0;
     std::function<void(const Completion&, std::span<const uint8_t>)> h = [&](const Completion& c, std::span<const uint8_t>) {
         ++times[c.token];
         if (c.token < 4 && next < 8 && cq.reserve(48) == OpResult::Accepted) {
             const Token t = next++;
             ASSERT_TRUE(deliver(cq, t, 48, 0));
-            (void)cq.waitFor(t, 0ns, [&](const Completion& d, std::span<const uint8_t>) { ++times[d.token]; });
+            EXPECT_THROW((void)cq.waitFor(t, 0ns, [&](const Completion& d, std::span<const uint8_t>) { ++times[d.token]; }),
+                         std::logic_error);
+            ++refused;
         }
     };
     for (int i = 0; i < 100 && cq.poll(h) > 0; ++i) {}
+    EXPECT_GT(refused, 0) << "no handler reached the nested call: the test is vacuous";
     for (Token t = 0; t < next; ++t) EXPECT_EQ(times[t], 1) << "token " << t;
     EXPECT_EQ(cq.outstanding(), 0u);
     EXPECT_EQ(cq.reservedBytes(), 0u);
