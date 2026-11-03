@@ -1434,6 +1434,7 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     scfg.keepaliveCorrelationId = -(static_cast<int64_t>(sessions_.size()) + 1);   // A10: Pong routing
     scfg.revivedOnDemand = true;   // Issue #481: paced by Backoff, never a revive per duty cycle
     sessions_.emplace_back(std::make_unique<Session>(this, std::move(scfg), endpoint));
+    ++sessionTableGen_;   // #750: a bind entry waiting for this endpoint's session resolves again
     Session& s = *sessions_.back();
     s.machine.useScramCache(&scramCache_);   // authentication: PBKDF2 once per verifier, not once per session
     s.machine.useSharedSecret(&secret_);
@@ -1924,10 +1925,13 @@ int ClientAgent::serviceWorkerBinds_() noexcept {
     if (holdWorkerBinds_) [[unlikely]] return 0;
     for (WorkerBindEntry& e : workerBinds_) {
         if (e.sessionIndex == kNoSession) {
+            if (e.resolvedGen == sessionTableGen_) continue;   // #750: nothing changed since the last miss
             e.sessionIndex = findSessionIndex_(e.sessionEndpoint);
+            e.resolvedGen  = sessionTableGen_;
+            ++workerBindResolves_;
             if (e.sessionIndex == kNoSession) continue;   // the route's first offer opens it
         }
-        if (e.sessionIndex >= sessions_.size()) { e.sessionIndex = kNoSession; continue; }
+        if (e.sessionIndex >= sessions_.size()) { e.sessionIndex = kNoSession; e.resolvedGen = UINT64_MAX; continue; }
         Session& s = *sessions_[e.sessionIndex];
         if (!s.bindRequired || s.machine.state() != session::SessionState::Connected) continue;
         const int64_t sid = s.machine.sessionId();

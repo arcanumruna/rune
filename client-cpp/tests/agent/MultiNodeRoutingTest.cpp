@@ -346,3 +346,28 @@ TEST(MultiNodeRoutingRegression, ZeroResponsePortNeverErasesALearntPortRegressio
     agent.setSessionResponsePort(kFresh, 0);
     EXPECT_EQ(agent.knownResponsePortForTest(kFresh), 7200);
 }
+
+// ===========================================================================
+// #750: an unresolved bind entry is looked up again only when the session table (or the seed's home) changed.
+// ===========================================================================
+
+TEST(ClientAgentRegression, UnresolvedWorkerBindIsNotReResolvedUntilTheSessionTableChangesRegression) {
+    const std::string kB = "aeron:udp?endpoint=hostB:9001";
+    rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
+    agent.addWorkerBindEntryForTest(kB);   // no session to kB yet
+
+    for (int i = 0; i < 100; ++i) EXPECT_EQ(agent.workerBindSessionIndexForTest(0), 0xFFFFFFFFu);   // one duty pass each
+    EXPECT_EQ(agent.workerBindResolvesForTest(), 1u) << "an unresolved entry was looked up on every pass";
+
+    const uint32_t bIdx = agent.sessionIndexForTest(kB);   // the session opens: the table changed
+    ASSERT_EQ(bIdx, 1u);
+    EXPECT_EQ(agent.workerBindSessionIndexForTest(0), bIdx);
+    EXPECT_EQ(agent.workerBindResolvesForTest(), 2u);
+    EXPECT_EQ(agent.workerBindSessionIndexForTest(0), bIdx);   // resolved: never looked up again
+    EXPECT_EQ(agent.workerBindResolvesForTest(), 2u);
+
+    // A seed move invalidates every resolution: the entry looks its session up again, once.
+    agent.setSeedPhysicalIngressForTest("aeron:udp?endpoint=seed:2");
+    EXPECT_EQ(agent.workerBindSessionIndexForTest(0), bIdx);
+    EXPECT_EQ(agent.workerBindResolvesForTest(), 3u);
+}

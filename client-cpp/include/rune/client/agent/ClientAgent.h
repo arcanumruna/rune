@@ -1000,6 +1000,8 @@ public:
         e.sessionEndpoint = sessionEndpoint;
         workerBinds_.push_back(std::move(e));
     }
+    /// #750: session lookups the bind duty ran for an unresolved entry (cold counter).
+    [[nodiscard]] uint64_t workerBindResolvesForTest() const noexcept { return workerBindResolves_; }
     /// Resolve every bind entry's session (the duty pass's first step) and report entry `i`'s index.
     [[nodiscard]] uint32_t workerBindSessionIndexForTest(std::size_t i) noexcept {
         (void)serviceWorkerBinds_();
@@ -1125,6 +1127,9 @@ private:
         int32_t     streamId = 0;
         transport::AeronTransport::PubHandle pub = transport::AeronTransport::kNoPub;
         uint32_t    sessionIndex = kNoSession;   ///< resolved (never opened) by the duty pass
+        /// #750: the sessionTableGen_ at which `sessionIndex` was last looked up (UINT64_MAX = never): an unresolved
+        /// entry is looked up again only when the session table or the seed's home changed since.
+        uint64_t    resolvedGen = UINT64_MAX;
         std::variant<Unbound, Sent, Bound> state{Unbound{}};
         /// The first WorkerBind of a session was accepted on this entry's pair (request publication + response
         /// subscription): the worker's response publication for it pins the subscription, so the NEXT session's bind
@@ -1204,12 +1209,17 @@ private:
     void invalidateRouteSessions_() noexcept {
         for (PartitionRoute& r : routes_) r.sessionIndex = kNoSession;
         for (WorkerBindEntry& b : workerBinds_) b.sessionIndex = kNoSession;
+        ++sessionTableGen_;   // #750: an unresolved bind entry must look its session up again
         ++seedMoves_;   // fix round 1 (C1): the owner re-asks metadata (the no-route set changed meaning)
         // Fix round 3 (N-I1): a resume is valid only on the broker holding the session —
         // a seed that is not Connected connects FRESH (fresh TLS) at its new broker.
         seedSession().machine.abandonResumeHint();
     }
     uint64_t seedMoves_ = 0;   // duty thread only
+    /// #750: bumped whenever a session is opened (openSession_) or the seed moves (invalidateRouteSessions_): the
+    /// only events that can change what findSessionIndex_ answers.  Duty thread only.
+    uint64_t sessionTableGen_ = 0;
+    uint64_t workerBindResolves_ = 0;   // cold counter, test seam workerBindResolvesForTest()
     void releaseRoutePub_(transport::AeronTransport::PubHandle h) noexcept;  // M4
 
     // Pack (topicId, partition) into the routing-table key.  partition is masked to
