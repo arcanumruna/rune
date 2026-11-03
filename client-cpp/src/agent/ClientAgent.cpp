@@ -1941,7 +1941,9 @@ uint32_t ClientAgent::workerBindFor_(const std::string& sessionEndpoint, const s
         e.sessionEndpoint = sessionEndpoint;
         e.dataChannel     = dataChannel;
         e.streamId        = streamId;
-        e.pub             = transport_.responsePublicationHandle(dataChannel, streamId, *respCh);
+        // #751 review: the slot may already be Plain (a port-0 route created it, or a freed entry demoted it under
+        // such a route): upgrade it to a pair, never keep it plain under a bind that needs NAT-safe egress.
+        e.pub             = transport_.upgradeToResponsePublication(dataChannel, streamId, *respCh);
         if (e.pub == transport::AeronTransport::kNoPub) return kNoBind;
         for (std::size_t i = 0; i < workerBinds_.size(); ++i) {   // #751: reuse a Free slot first
             if (!std::holds_alternative<WorkerBindEntry::Free>(workerBinds_[i].state)) continue;

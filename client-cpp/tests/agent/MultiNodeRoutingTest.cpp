@@ -459,6 +459,44 @@ TEST(ClientAgentRegression, ABindPublicationAPlainRouteStillUsesIsDemotedNotRele
     EXPECT_FALSE(agent.publicationResponsePairedForTest(h)) << "the pair is gone: the slot is a plain publication";
 }
 
+// #751 re-review: a bind entry created on a slot that is already Plain (a port-0 route made it, or a freed entry was
+// demoted under such a route) upgrades the slot to a response pair; it never inherits the plain publication.
+TEST(ClientAgentRegression, ABindOnAPlainSlotUpgradesItToAResponsePairRegression) {
+    const std::string kNode = "aeron:udp?endpoint=nodeA:9001";
+    const std::string kW    = "aeron:udp?endpoint=hostW:9100";
+    const std::string kW2   = "aeron:udp?endpoint=hostX:9200";
+    constexpr int32_t kTopic = 7, kStream = 21;
+    rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
+    const auto route = [&](int32_t part, const std::string& worker, int32_t port) {
+        return agent.setRoute(kTopic, part, kNode, worker, 0, kStream, port);
+    };
+    // Demoted slot: p0 plain on the entry's slot, p1 (the entry's last user) moves away.
+    ASSERT_TRUE(route(0, kW, 7000));
+    ASSERT_TRUE(route(1, kW, 7000));
+    ASSERT_TRUE(route(0, kW, 0));
+    agent.routeUsePlainPublicationForTest(kTopic, 0, kStream);
+    const auto h = agent.routePubForTest(kTopic, 0);
+    ASSERT_NE(h, rune::client::transport::AeronTransport::kNoPub);
+    ASSERT_TRUE(route(1, kW2, 7100));
+    ASSERT_FALSE(agent.publicationResponsePairedForTest(h)) << "precondition: the slot was demoted to plain";
+
+    // A route with a port on the same worker binds again: the entry's slot is h, and it is paired again.
+    ASSERT_TRUE(route(2, kW, 7000));
+    ASSERT_NE(agent.routeBindIdxForTest(kTopic, 2), 0xFFFFFFFFu);
+    EXPECT_EQ(agent.routePubForTest(kTopic, 2), h) << "slots are keyed by (channel, stream)";
+    EXPECT_TRUE(agent.publicationResponsePairedForTest(h)) << "the bind kept the plain publication: no NAT-safe egress";
+
+    // Plain-first: a port-0 route opens the slot before any bind on that worker.
+    constexpr int32_t kStream2 = 22;
+    ASSERT_TRUE(agent.setRoute(kTopic, 3, kNode, kW, 0, kStream2, 0));
+    agent.routeUsePlainPublicationForTest(kTopic, 3, kStream2);
+    const auto p = agent.routePubForTest(kTopic, 3);
+    ASSERT_NE(p, rune::client::transport::AeronTransport::kNoPub);
+    ASSERT_FALSE(agent.publicationResponsePairedForTest(p));
+    ASSERT_TRUE(agent.setRoute(kTopic, 4, kNode, kW, 0, kStream2, 7000));
+    EXPECT_TRUE(agent.publicationResponsePairedForTest(p)) << "a bind on a plain-first slot never got its pair";
+}
+
 // The bindChanged branch of setRoute (a metadata update that moves a worker's response port, here to 0) drops the
 // route's reference on the old entry; with no other user the entry is freed and its pair released.
 TEST(ClientAgentRegression, ABindChangedToPortZeroReleasesTheBindReferenceRegression) {
