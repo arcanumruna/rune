@@ -8399,7 +8399,14 @@ private:
                 }
                 return false;
             }
-            if (code == 0 && source) {
+            // Fill from the rejected index whenever the batch's range holds a rejection, even when the judge / logged set is gone
+            // by now (the set emptied while this ack was owed): firing code 0 with no trailer would hide a rejected record.
+            bool fills = source;
+            if (code == 0 && !source && ws != nullptr && ws->rejected.size() != 0) {
+                ws->rejected.forEachIn(entry.ret.baseOffset, entry.lastOffset + 1,
+                                       [&](const rune::storage::RejectedOffsetIndex::Entry&) { fills = true; });
+            }
+            if (code == 0 && fills) {
                 if (entry.replay == 2) {   // outside the dedupe window: stored, its verdicts are gone
                     code = static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
                     if (ws->verdicts != nullptr) ++ws->verdicts->statsMut().verdictUnknownDuplicates;

@@ -367,3 +367,38 @@ TEST_F(CheckedWritesVerdictAckRegression, ViewAckAndConsumersAfterTheLastVerdict
     EXPECT_TRUE(saw0);
     EXPECT_TRUE(saw1);
 }
+
+// Review fix round: a View ack whose partition is NOT a verdict source when it fires (the judge is erased, the logged set is
+// empty) still carries the rejections its batch has in the write state's rejected index (as after a restart, which rebuilds the
+// index from the markers); firing code 0 with no trailer would report a rejected record as accepted.  The judge and the ack fire
+// in the same pass in normal flow, so the state is built by hand: the last verdict view is dropped and the judge erased, a batch is
+// produced with the HW held (a follower in the ISR: the ack is owed), the index gets the rejection of the batch's second record,
+// then the HW is released.
+TEST(CheckedWritesVerdictAckRigRegression, ViewAckAfterTheJudgeIsErasedStillCarriesItsVerdictsRegression) {
+    VerdictRig o(/*follower=*/true);
+    o.typed();
+    o.installRejectView(kRej, kObj, tagRule(9));
+    o.enableAcks();
+    o.passes(60);
+    o.dropRejectView(kRej);
+    ASSERT_TRUE(o.driveUntilJudged());
+    o.passes(20);
+    ASSERT_EQ(o.vs->verdictSource(VerdictRig::kSrc, 0), nullptr) << "the judge is erased";
+    auto* ws = const_cast<PartitionWriteState*>(o.writeState());
+    ASSERT_NE(ws, nullptr);
+    ASSERT_EQ(ws->verdicts, nullptr);
+    ASSERT_FALSE(ws->isVerdictSource()) << "no judge and an empty logged set: not a verdict source";
+
+    const int64_t base = o.leo();
+    const int64_t c = o.produceFrame({{1, 1, 1}, {2, 2, 9}}, kAcksView);
+    o.passes(60);
+    ASSERT_FALSE(o.acked(c)) << "the HW is held: the ack is owed";
+    ASSERT_TRUE(ws->rejected.add(base + 1, kCode, kCid));
+
+    o.followerFetch();
+    const auto a = o.ack(c);
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    EXPECT_TRUE(a->hasVerdicts) << "the rejection must not be dropped from the ack";
+    EXPECT_EQ(a->verdicts, (V{{1, kCode, kCid}}));
+}
