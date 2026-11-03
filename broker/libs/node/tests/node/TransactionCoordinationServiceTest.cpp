@@ -2029,3 +2029,54 @@ TEST_F(TxnNsDeleteRegression, TombstoneErasesInMemoryTxnsRegression) {
     EXPECT_EQ(svc_->coordinatorSizeForTest(), before - 1);
     EXPECT_EQ(svc_->txnStateForTest(b_), tx::TxnState::Ongoing);
 }
+
+// #662 DIAG (2), DISABLED pending the lead: RED (tombstoneNamespace answers Refused for 100 asks). a PrepareCommit stuck on a refused transactional-offset apply (#359) is unsettled, so the txn-state
+// tombstone of its namespace answers Refused for as long as the apply is refused.
+TEST_F(TxnNsDeleteRegression, DISABLED_PrepareCommitStuckOnRefusedOffsetDoesNotBlockDeleteRegression) {
+    const std::string local = "tx-pc";
+    const std::string scoped = rune::coordination::scopedId(4, local);
+    const rune::coordination::NsRequestContext ctx{4, false, nullptr};
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    RefusingSink sink;
+    sink.refusals = 1'000'000'000;   // the group coordinator refuses forever
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    int16_t ep = 0;
+    const int64_t pid = initPidIn(ctx, local, ep);
+    RepTxn r;
+    r.svc = svc_.get();
+    r.answers = &answers_;
+    r.commitAll = [this, &r] { followerFetches(); (void)r.svc->doWork(now_); };
+    r.ctx = ctx;
+    {
+        const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+        const std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, local, parts);
+        const std::size_t k = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size(), ctx);
+        if (k == 0) { followerFetches(); (void)svc_->doWork(now_); answers_.frames.clear(); }
+    }
+    ASSERT_EQ(r.addOffsets(local, pid, ep, "cgp", now_), 0);
+    ASSERT_EQ(r.commit(local, pid, ep, "cgp", 5, now_), 0);
+    ASSERT_EQ(r.endTxn(local, pid, ep, /*commitIt=*/true, now_), 0);
+    followerFetches();   // PrepareCommit is durable; the coordinator reloads and re-drives it (the rig has no gateway)
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    for (int i = 0; i < 3; ++i) { followerFetches(); (void)svc_->doWork(now_); }   // loads, dispatches the markers
+    ASSERT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u) << "premise: the markers were dispatched";
+    svc_->onControlMarkerLanded(0, 0, pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    for (int i = 0; i < 5; ++i) { now_ += 1'100'000'000; followerFetches(); (void)svc_->doWork(now_); }
+    ASSERT_EQ(svc_->txnStateForTest(scoped), tx::TxnState::PrepareCommit) << "premise: stuck on the refused apply";
+    ASSERT_GE(sink.calls, 1) << "premise: the offset apply was attempted and refused";
+    rune::node::ReapStatus abortAnswer = rune::node::ReapStatus::More, tombAnswer = rune::node::ReapStatus::More;
+    for (int i = 0; i < 100; ++i) {
+        abortAnswer = svc_->abortNamespaceTxns(4, now_);
+        tombAnswer = svc_->tombstoneNamespace(4, 64, now_);
+        followerFetches();
+        (void)svc_->doWork(now_);
+        if (tombAnswer == rune::node::ReapStatus::Done) break;
+    }
+    EXPECT_EQ(tombAnswer, rune::node::ReapStatus::Done)
+        << "abortNamespaceTxns=" << static_cast<int>(abortAnswer) << " tombstoneNamespace=" << static_cast<int>(tombAnswer)
+        << " state=" << static_cast<int>(svc_->txnStateForTest(scoped)) << " (4 = PrepareCommit) unsettled keys "
+        << svc_->liveKeysOfNamespaceForTest(4).value_or(999) << " sink calls " << sink.calls;
+}
