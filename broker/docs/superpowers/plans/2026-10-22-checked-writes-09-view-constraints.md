@@ -125,8 +125,8 @@ Issue batch 1 (`bugfix/issue-batch-1-views`) settles five things this part build
 | B1-2 torn checkpoint tail (C7) | batch 1 | landed: 067efee6 | Tables 6/7 records go through `scanViewCheckpoint`; merge C7 before Task 2's recovery step. |
 | B1-2 checkpoint ahead of the log (#159, C5) and docs/e2e (C6) | batch 1 | landed: e7b6b942, c2cce09b, cc8dbc0e, b78ec7fc | Nothing; Part 09 inherits them. |
 | B1-6 review fixes: idle accounting for an unsettled member, backup fsync order | batch 1 | landed: a1b796d8, a3fba9e8 | Follow item 6 below. |
-| B1-3 per-record batch verdicts (#802, claimBatch) | batch 1 (wave 1C, steps 8–10) | pending | Task 7 and Task 8's multi-record cells wait for it. Tasks 1–6 do not. |
-| B1-4 verdict-member discard backed up before its refold ("NEW", wave 1A step 4) | batch 1 | pending, after C6 | Task 4 and Task 6 refold through `VerdictViewHooks::discard` from the start; the backup arrives with the merge. |
+| B1-3 per-record batch verdicts (#802, claimBatch) | batch 1 (wave 1C, steps 8–10) | landed: 8001c769, 9548e771; queue sizing a194cfc8 | Use it (see "Batch 1 fix rounds" below for the queue and size rules). |
+| B1-4 verdict-member discard backed up before its refold ("NEW", wave 1A step 4) | batch 1 | landed: b42bd9ce (test 4ec54371) | Task 4 and Task 6 refold through `VerdictViewHooks::discard`. |
 | B1-5 concrete `AbortedTxnFilter` (#591) | batch 1 | landed: f8871a67, b439b046 | Use it. |
 
 **Pending batch 1 changes in code this part edits (merge before touching these):**
@@ -141,6 +141,27 @@ Issue batch 1 (`bugfix/issue-batch-1-views`) settles five things this part build
 - **#791 instrumentation, wave 1A (cold path).** Warn-level logs in `syncConstraintSet_`, `VerdictSource::waitForInstall_` and the view-ack timeout. B1-1 rewrites `syncConstraintSet_`: keep the logs, and add the gate's decision (`catalogThrough_` vs the change's `catalogThrough`) to them.
 - **`VerdictRig::compact()` (5be53b2c, branch `bugfix/verdict-rig-flush-wait`, merged into batch 1 next).** It now waits for the worker's in-flight async flush before compacting (`Log::flushPinnedSegmentsForTest`), so a swap is never refused with `FlushInFlight` under load. Every compaction cell this part adds to the verdict tests (Task 2's refold-after-compaction, type 20's kept-records cell) uses `compact()` and must not compact by hand around it.
 - **#798, #799, #801, wave 1D.** Tests and contract docs only. They touch the overview contracts this part reads; merge before editing those docs.
+
+**Batch 1 fix rounds and adversarial pass (landed on `bugfix/issue-batch-1-views`, 2026-11-03).** These change behaviour this part's tasks rely on:
+- **a194cfc8 — a View batch fits a default client queue up to 4096 records.**
+  - **Why:** a View batch completion is 48 + 8n bytes. Before this commit, a batch of more than 2048 records was refused (`MessageTooLarge`) on a default queue.
+  - **The reservation rule:** a reservation r above the queue's slack record M (16432 by default) now reserves 2r − 48. `deliver()` caps the record at max((R + 48) / 2, M).
+  - **A BatchAck verdict list too big for the queue's `maxMsgLength`:** it is delivered with an empty list and status `ResultTooLarge`, never truncated.
+  - **Task 7 and Task 8:**
+    - Every multi-record cell uses the default queue.
+    - Add one cell over 2048 records with rejections at index 0, in the middle and last.
+    - Add one cell where the trailer exceeds `maxMsgLength`, expecting `ResultTooLarge` with no entries.
+- **fdcc3c26 — a View ack fills its verdicts from the rejected index even after the judge is erased.**
+  - Task 6's two-phase drop relies on it: an ack still owed when the last constrained view on a source drops still reports its rejections.
+  - Test: `CheckedWritesVerdictAckRigRegression.ViewAckAfterTheJudgeIsErasedStillCarriesItsVerdictsRegression`. Keep it green.
+- **3e1c84a7 — a completion's credit is returned after the ring read, not inside the handler.**
+  - A `poll()` or `waitFor()` handler may issue the next op. Until the read ends, `reserve()` can answer `QueueFull`, so poll again first.
+  - Task 7's `constraintName` tests that reissue from a handler must expect that.
+- **67d40645 — a log cleaner walk that stops at a damaged batch installs nothing.** The log stays uncleanable until restart (`LogCleaner::uncleanable()`, `damage()`).
+  - Type 20's kept-records cell (`VerdictPlanRecordsAreAlwaysKept`) and every compaction cell this part adds run on undamaged segments.
+  - A damaged-segment cell asserts that the segment's bytes are unchanged, not that records were dropped.
+- **eef4d089 (#804) — the cleaner validates a control record once, in `validateBatch` → `parseControl`.** Type 18 v2 and type 20 go through that one parse in the cleaner too. Never add a second CRC or parse of a marker in a cleaner walk.
+- **7dafe303 (#791) — the constraint-set sync detail logs are at debug.** The warn-level logs stay only for the view-ack timeout and the judge's install wait. B1-1's gate decision is logged at debug alongside them.
 
 1. **B1-1 — A lagging leader never undoes a newer constraint change (#788; amends P9-5, P9-6 and Task 5). Decided in batch 1's planning; this part implements it (batch 1 ships no code for it).**
    - **Bug class.** `syncConstraintSet_` (`WorkerViewSet.cpp`) builds the desired set from the templates installed on this worker. Nothing orders that against the logged set. A leader whose catalog has not yet applied a DDL change computes the old set and logs it. For example, a replace is reverted (fp2 → fp1) and the replicas that had already replaced wait forever (#788). P9-5's candidate path has the same hole, and so do a create or drop that the new leader has not applied yet.
