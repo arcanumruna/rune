@@ -330,7 +330,7 @@ Completion Producer::sendAndWait(TopicHandle topic, const Key& key, std::span<co
     if (!impl_ || !topic.valid()) throw std::invalid_argument("Producer::sendAndWait: invalid topic handle");
     if (const char* why = intentRefusal_(topic, value, intent)) throw std::invalid_argument(why);
     const auto& hk = impl_->hooks();
-    if (hk.andWait == nullptr) {
+    if (hk.sendAndWait == nullptr) {
         throw std::logic_error("Producer::sendAndWait: no Client to wait on (use the token form)");
     }
     struct Ctx {
@@ -354,7 +354,7 @@ Completion Producer::sendAndWait(TopicHandle topic, const Key& key, std::span<co
         c->self->flush();
         return OpResult::Accepted;
     };
-    return hk.andWait(hk.ctx, "sendAndWait()", timeout, issue, &ctx, nullptr);
+    return hk.sendAndWait(hk.ctx, "sendAndWait()", timeout, issue, &ctx, nullptr);
 }
 
 void Producer::onAck(AckFn fn, void* ctx) noexcept {

@@ -762,8 +762,8 @@ public:
     /// Send one record with `intent` and wait for its verdict: the Send completion, unchanged (status Ok with
     /// value = the record's offset; BrokerError with errorCode 56 / 57 and constraintIdOf() for a refused intent;
     /// BrokerTooOld).  Flushes at once.  Throws std::invalid_argument for a local refusal (see trySend, KeyTooLong,
-    /// MessageTooLarge) and std::runtime_error when back-pressure or the wait outlasts `timeout`, or the client
-    /// closed first.
+    /// MessageTooLarge).  A wait that outlasts `timeout` (back-pressure included) returns status Timeout, and a
+    /// client closed first returns status Closed.
     [[nodiscard]] Completion sendAndWait(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                          WriteIntent intent, std::chrono::nanoseconds timeout);
 

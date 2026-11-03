@@ -1241,8 +1241,15 @@ OpResult Client::issueTargeted_(detail::HubCommand& cmd, const CompletionTarget&
 
 Completion Client::andWaitTrampoline_(void* ctx, const char* what, std::chrono::nanoseconds timeout,
                                       detail::AndWaitIssue issue, void* issueCtx, std::string* text) {
-    // A wait that times out or finds the client closed is a Completion (P5-10), as for the group's sink.
-    return groupAndWaitTrampoline_(ctx, what, timeout, issue, issueCtx, text);
+    auto* self = static_cast<Client*>(ctx);
+    Completion out;
+    self->andWait_(what, timeout, 0,
+                   [&](Completions& q, Token t) { return issue(issueCtx, CompletionTarget(q), t); },
+                   [&](const Completion& c, std::span<const uint8_t> p) {
+                       out = c;
+                       if (text != nullptr) text->assign(reinterpret_cast<const char*>(p.data()), p.size());
+                   });
+    return out;
 }
 
 // #378 (C3 review): the GroupConsumer *AndWait sugar.  A wait that ends without a completion (the wait or the
@@ -5072,6 +5079,7 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
         hk.sink       = detail::CompletionSink{&Client::deliverTrampoline_, this};
         hk.issueClose = &Client::issueProducerCloseTrampoline_;
         hk.andWait    = &Client::andWaitTrampoline_;
+        hk.sendAndWait = &Client::groupAndWaitTrampoline_;   // P5-10: a timed-out or closed sendAndWait is a Completion
         hk.release    = &Client::hubCommandTrampoline_;  // C7: HandleRelease
         hk.pinTarget  = &Client::pinTargetTrampoline_;   // Phase 2b F Task 8: txn ops read from the producer ring
         impl->setHooks(hk);

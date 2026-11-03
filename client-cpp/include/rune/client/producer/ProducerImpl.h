@@ -956,6 +956,7 @@ public:
         OpResult (*issueClose)(void* ctx, ProducerImpl& impl, const CompletionTarget* target,
                                Token token) = nullptr;
         detail::AndWaitSink andWait = nullptr;
+        detail::AndWaitSink sendAndWait = nullptr;  ///< Producer::sendAndWait: a wait that times out or finds the client closed is a Completion
         /// Phase 2b F Task 8 (duty side): pin a CQ target's registry slot before its completion is delivered
         /// (Client::pinCqSlot_; an op read from the producer ring has no command-ring fence).  Absent (bare rig):
         /// targets are used as they are.

@@ -434,6 +434,19 @@ TEST(CheckedWritesIntents, SendAndWaitReturnsATimeoutCompletionRegression) {
     EXPECT_EQ(c.status, OpStatus::Timeout);
 }
 
+TEST(CheckedWritesIntents, CloseAndWaitStillThrowsOnTimeoutRegression) {
+    Rig r(invokerCfg(4637, 4638));
+    r.gw.idempotence = true;
+    r.connect();
+    rc::Producer p = r.client->producer(cfgOf(Acks::All | Acks::View));
+    const TopicHandle topic = r.client->topic("t");
+    ASSERT_TRUE(r.drive([&] { return p.producerId() >= 0; }));
+
+    // A record the unpumped gateway never answers keeps the drain open.
+    p.send(topic, Key(uint64_t{1}), kVal, rc::AckToken{1}, WriteIntent::Insert);
+    EXPECT_THROW((void)p.closeAndWait(std::chrono::milliseconds(300)), std::runtime_error);
+}
+
 TEST(CheckedWritesIntents, DefineSendsKeyFeaturesOnlyWhenSet) {
     namespace pc = rune::protocol::client;
     const auto defineWith = [](int32_t brokerVersion, int32_t in, rc::TopicOptions topic,
