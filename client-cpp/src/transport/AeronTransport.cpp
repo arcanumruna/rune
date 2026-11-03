@@ -317,6 +317,8 @@ void AeronTransport::stop() noexcept {
     // BEFORE closing the aeron client (same recursive_mutex teardown reason as
     // the publication slots below — Subscription dtors deregister via the conductor).
     seedPair_ = SeedSteady{};           // a pending re-pair's publication resolution, before its Aeron client
+    for (auto& d : drainingPubs_) d.reset();   // abandoned registrations, before the Aeron client closes
+    drainingCount_ = 0;
     subSlots_.clear();                  // assemblers + subscriptions (conductor dereg), the response pairs' too
     respSeedSlot_ = -1;
     retiredSubs_  = 0;
@@ -529,7 +531,7 @@ bool AeronTransport::rePairResponsePublication(PubHandle h) noexcept {
         const std::string respChannel = subSlots_[static_cast<std::size_t>(oldSub)].channel;
         const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, respChannel, cfg_.egressStreamId);
         if (sub < 0) return false;
-        ps.res.reset();   // the old request publication deregisters (its image goes away at the broker)
+        drainPub_(std::move(ps.res));   // the old request publication deregisters (its image goes away at the broker)
         ps.res = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
         ps.addChannel.clear();
         ps.mode = PubSlot::AwaitResponseSub{sub};
@@ -556,9 +558,10 @@ bool AeronTransport::rePairSeedResponse(int32_t responsePort) noexcept {
 }
 
 void AeronTransport::abandonSeedRePair_() noexcept {
-    if (const auto* rp = std::get_if<SeedRePairing>(&seedPair_)) {
+    if (auto* rp = std::get_if<SeedRePairing>(&seedPair_)) {
         const int32_t sub = rp->subSlot;
         retireSubSlot_(sub);   // released at the next poll(); the old pair stays in force
+        drainPub_(std::move(rp->res));   // its request publication may still be registering
     }
     seedPair_ = SeedSteady{};
 }
@@ -606,7 +609,7 @@ AeronTransport::PubHandle AeronTransport::upgradeToResponsePublication(const std
             return static_cast<PubHandle>(i);
         const int32_t sub = addSubSlot_(SubSlot::Kind::ResponsePair, std::string(responseControlChannel), cfg_.egressStreamId);
         if (sub < 0) return static_cast<PubHandle>(i);   // stays plain (the declared path)
-        ps.res.reset();   // the plain publication deregisters; the correlated one is added once the sub is Ready
+        drainPub_(std::move(ps.res));   // the plain publication deregisters; the correlated one is added once the sub is Ready
         ps.res  = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
         ps.addChannel.clear();
         ps.mode = PubSlot::AwaitResponseSub{sub};
@@ -759,13 +762,60 @@ void AeronTransport::retireSubSlot_(int32_t idx) noexcept {
 }
 
 void AeronTransport::reapRetiredSubs_() noexcept {
+    uint32_t pending = 0;
     for (SubSlot& s : subSlots_) {
         if (s.state != SubSlot::State::Retired) continue;
+        // #763: a registration still pending in the driver is never reset (it would complete later with nobody to
+        // release it): the slot stays Retired and is polled until Ready (then closed below) or Rejected (dropped).
+        if (std::holds_alternative<Resolution<aeron::Subscription>::Resolving>(s.res.state()) ||
+            std::holds_alternative<Resolution<aeron::Subscription>::TimedOut>(s.res.state())) {
+            if (aeron_) {
+                SubRegistry reg{*aeron_, s.channel, s.streamId};
+                (void)s.res.poll(reg, resolveNow_());
+            }
+            if (s.res.ready() == nullptr && !s.res.rejected()) { ++pending; continue; }
+        }
         s.assembler.reset();
         s.res.reset();   // the subscription deregisters here, outside any poll callback
         s.state = SubSlot::State::Free;
     }
-    retiredSubs_ = 0;
+    retiredSubs_ = pending;
+}
+
+void AeronTransport::drainPub_(Resolution<aeron::ExclusivePublication>&& r) noexcept {
+    using Res = Resolution<aeron::ExclusivePublication>;
+    if (r.ready() != nullptr) { r.reset(); return; }   // Ready: release it now
+    const bool pending = std::holds_alternative<Res::Resolving>(r.state()) || std::holds_alternative<Res::TimedOut>(r.state());
+    if (!pending) { r.reset(); return; }               // Unstarted / Rejected: nothing registered
+    if (drainingCount_ == kMaxDraining) {
+        if (!warnedDrainOverflow_) {
+            warnedDrainOverflow_ = true;
+            std::fprintf(stderr, "rune-client: %zu abandoned publication registrations are still pending; "
+                                 "the newest is not tracked\n", kMaxDraining);
+        }
+        return;
+    }
+    drainingPubs_[drainingCount_++].emplace(std::move(r));
+}
+
+void AeronTransport::serviceDraining_() noexcept {
+    static const std::string kNoChannel;   // add() is never called here: only a pending registration resumes
+    std::size_t i = 0;
+    while (i < drainingCount_) {
+        auto& slot = drainingPubs_[i];
+        bool done = false;
+        if (!aeron_) {
+            done = true;
+        } else {
+            PubRegistry reg{*aeron_, kNoChannel, 0};
+            (void)slot->poll(reg, resolveNow_());
+            done = slot->ready() != nullptr || slot->rejected();
+        }
+        if (!done) { ++i; continue; }
+        slot.reset();   // Ready: the publication is released here; Rejected: nothing to release
+        --drainingCount_;
+        if (i != drainingCount_) { drainingPubs_[i] = std::move(drainingPubs_[drainingCount_]); drainingPubs_[drainingCount_].reset(); }
+    }
 }
 
 void AeronTransport::addEgressSubscription(const std::string& controlChannel,

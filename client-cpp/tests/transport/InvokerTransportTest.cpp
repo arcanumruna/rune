@@ -1186,6 +1186,112 @@ TEST(AeronTransportRegression, ReleasingAnInnerSubSlotNeverDropsTheLastRegressio
     }
 }
 
+// ---- #763: a Resolution that leaves its owner never orphans a pending driver registration ---------------------------
+
+namespace {
+// The embedded driver reads these once at start: a released publication is freed within ~tens of ms, not 5 s.
+struct FastLingerEnv {
+    FastLingerEnv() {
+        ::setenv("AERON_PUBLICATION_LINGER_TIMEOUT", "10ms", 1);
+        ::setenv("AERON_TIMER_INTERVAL", "10ms", 1);
+    }
+    ~FastLingerEnv() {
+        ::unsetenv("AERON_PUBLICATION_LINGER_TIMEOUT");
+        ::unsetenv("AERON_TIMER_INTERVAL");
+    }
+};
+
+// Drives the transport until the publication whose registered channel ends with `suffix` has been created by the
+// driver AND is gone again (released and lingered) with nothing left draining; false at the 10 s failure deadline.
+bool createdThenReleased(Transport& t, const std::string& suffix, bool& created) {
+    created = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        t.dutyCycle();
+        if (t.publisherLimitCountersForTest(suffix) >= 1) created = true;
+        t.poll([](const uint8_t*, std::size_t) {}, 10);
+        if (created && t.drainingPubsForTest() == 0 && t.publisherLimitCountersForTest(suffix) == 0) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST(AeronTransportRegression, UpgradeWhileThePlainPublicationIsResolvingLeavesNoOrphanRegression) {
+    FastLingerEnv env;
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3600)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, 40900);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.publicationHandle(worker, 3601);
+    const uint8_t frame[] = {1};
+    EXPECT_FALSE(t.offerOn(h, frame, sizeof frame)) << "Resolving: the registration is sent, the driver is not pumped yet";
+    EXPECT_EQ(t.drainingPubsForTest(), 0u);
+
+    ASSERT_EQ(t.upgradeToResponsePublication(worker, 3601, *respCtl), h);
+    EXPECT_TRUE(t.publicationIsResponsePairedForTest(h));
+    EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving plain registration was reset, not drained";
+
+    bool created = false;
+    EXPECT_TRUE(createdThenReleased(t, worker, created)) << "the plain publication the driver completed was never released";
+    EXPECT_TRUE(created);
+    t.stop();
+}
+
+TEST(AeronTransportRegression, RePairWhileThePublicationIsResolvingLeavesNoOrphanRegression) {
+    FastLingerEnv env;
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3610)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, 40901);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3611, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    const uint8_t frame[] = {1};
+    bool correlated = false;
+    for (int i = 0; i < 2'000'000 && !correlated; ++i) {   // hard cap: phase 1 resolves the response subscription
+        t.dutyCycle();
+        (void)t.offerOn(h, frame, sizeof frame);
+        correlated = t.publicationResponseCorrelated(h);
+    }
+    ASSERT_TRUE(correlated);   // the correlated publication is now registered and Resolving: nothing pumped since
+    const std::string suffix = worker + "|response-correlation-id=" + std::to_string(t.responseSubscriptionIdForTest(h));
+    EXPECT_EQ(t.drainingPubsForTest(), 0u);
+
+    ASSERT_TRUE(t.rePairResponsePublication(h));
+    EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving request publication was reset, not drained";
+    bool created = false;
+    EXPECT_TRUE(createdThenReleased(t, suffix, created)) << "the request publication the driver completed was never released";
+    EXPECT_TRUE(created);
+    t.stop();
+}
+
+TEST(AeronTransportRegression, ARetiredSubStillResolvingIsNeverResetRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3620)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, 40902);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3621, *respCtl);   // the sub slot is added
+    const int32_t slot = t.responseSubSlotForTest(h);
+    ASSERT_GE(slot, 0);
+    t.poll([](const uint8_t*, std::size_t) {}, 10);   // a Live slot registers when polled: Resolving, the driver not pumped
+    t.releaseSubSlotOwnerForTest(slot);
+    for (int i = 0; i < 3; ++i) t.poll([](const uint8_t*, std::size_t) {}, 10);   // the driver was never pumped
+    EXPECT_FALSE(t.subSlotFreeForTest(slot)) << "a Retired sub whose registration is pending was reset (orphaned)";
+    ASSERT_TRUE(pumpUntil(t, [&] {
+        t.poll([](const uint8_t*, std::size_t) {}, 10);
+        return t.subSlotFreeForTest(slot);
+    })) << "the pending sub never completed and was never released";
+    t.stop();
+}
+
 TEST(InvokerTransportResponseRegression, RetargetPairsTheNewResponseSubscriptionAndFallsBackToPlain) {
     const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
     const uint16_t reqB = rune::client::testing::allocFreeUdpPort(), rB = rune::client::testing::allocFreeUdpPort();

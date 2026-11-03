@@ -40,6 +40,7 @@ extern "C" {
 #include <rune/client/transport/TransportConfig.h>
 #include <flight_recorder/FlightRecorder.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -286,6 +287,31 @@ public:
         return -1;
     }
     void releaseSubSlotOwnerForTest(int32_t slot) noexcept { retireSubSlot_(slot); }
+    /// TEST SEAMS (cold): publication Resolutions parked by drainPub_ (#763); the registration id of the response
+    /// subscription a response-paired handle names (0 = none Ready); and the driver's publication-limit counters (one
+    /// per live publication) whose label ends with `channelSuffix` (the registered channel, e.g. a plain endpoint).
+    [[nodiscard]] std::size_t drainingPubsForTest() const noexcept { return drainingCount_; }
+    [[nodiscard]] bool subSlotFreeForTest(int32_t slot) const noexcept {
+        return slot >= 0 && static_cast<std::size_t>(slot) < subSlots_.size() &&
+               subSlots_[static_cast<std::size_t>(slot)].state == SubSlot::State::Free;
+    }
+    [[nodiscard]] int64_t responseSubscriptionIdForTest(PubHandle h) const noexcept {
+        const int32_t slot = responseSubSlotForTest(h);
+        if (slot < 0) return 0;
+        const aeron::Subscription* sub = subSlots_[static_cast<std::size_t>(slot)].res.ready();
+        return sub != nullptr ? sub->registrationId() : 0;
+    }
+    [[nodiscard]] int publisherLimitCountersForTest(const std::string& channelSuffix) const {
+        int n = 0;
+        if (!aeron_) return 0;
+        aeron_->countersReader().forEach([&](std::int32_t, std::int32_t typeId, const aeron::concurrent::AtomicBuffer&,
+                                             const std::string& label) {
+            constexpr std::int32_t kPublisherLimitTypeId = 1;   // AERON_COUNTER_PUBLISHER_LIMIT_TYPE_ID
+            if (typeId == kPublisherLimitTypeId && label.size() >= channelSuffix.size() &&
+                label.compare(label.size() - channelSuffix.size(), channelSuffix.size(), channelSuffix) == 0) ++n;
+        });
+        return n;
+    }
     /// TEST SEAM: the sub slot table's size (slots are never erased: a released one is Retired, then Free).
     [[nodiscard]] std::size_t subSlotCountForTest() const noexcept { return subSlots_.size(); }
     [[nodiscard]] const std::string& seedPublicationChannelForTest() const noexcept { return ingressPubChannel_; }
@@ -386,6 +412,7 @@ public:
         // room).  The starting source rotates each poll so no subscription starves.
         int frags = 0;
         if (retiredSubs_ != 0) [[unlikely]] reapRetiredSubs_();   // never inside a poll callback: here is safe
+        if (drainingCount_ != 0) [[unlikely]] serviceDraining_();   // #763: registrations whose owner left them pending
         const std::size_t sources = 1 + subSlots_.size();
         const std::size_t start   = pollStart_ < sources ? pollStart_ : 0;
         pollStart_ = (start + 1 == sources) ? 0 : start + 1;
@@ -672,6 +699,17 @@ private:
     /// marked here and released (with its assembler) at the start of the next poll().
     void retireSubSlot_(int32_t idx) noexcept;
     void reapRetiredSubs_() noexcept;
+    /// #763: a publication Resolution that leaves its owner goes through here, never `reset()`.  Ready: released now.
+    /// Resolving / TimedOut: its driver registration is still pending and would later complete with nobody to release
+    /// it, so it is parked in drainingPubs_ and polled (serviceDraining_, from poll()) until it is Ready (released) or
+    /// Rejected (dropped).  Unstarted / Rejected: nothing registered.  Cold, never blocks.  Overflow (kMaxDraining
+    /// pending at once): logged once, the OLDEST entries are kept and `r` is dropped.
+    void drainPub_(Resolution<aeron::ExclusivePublication>&& r) noexcept;
+    void serviceDraining_() noexcept;
+    static constexpr std::size_t kMaxDraining = 16;
+    std::array<std::optional<Resolution<aeron::ExclusivePublication>>, kMaxDraining> drainingPubs_{};
+    std::size_t drainingCount_ = 0;           // entries in drainingPubs_[0, drainingCount_)
+    bool        warnedDrainOverflow_ = false;   // drainPub_ overflow: logged once
     uint32_t retiredSubs_ = 0;   // Retired slots awaiting reapRetiredSubs_()
     uint64_t freshSubsAdded_ = 0;   // fresh (response-pair) subscription slots added; test seam
     bool     warnedPlainResponse_ = false;   // responsePublicationHandle: logged once
