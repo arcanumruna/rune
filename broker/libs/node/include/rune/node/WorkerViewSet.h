@@ -550,7 +550,7 @@ private:
         const auto it = templates_.find(viewTopicId);
         return it != templates_.end() && it->second.isVerdict;
     }
-    void onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status);
+    void onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status, ViewDiscardReason reason);
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
     int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
     int finishRetired_();
@@ -609,7 +609,7 @@ private:
     /// next to a committed one -> back the legacy one up, keep the committed rows; a committed file that did not replay cleanly
     /// (`applied` < `records`, or bytes with no record) -> back it up and rebuild.
     void applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, std::size_t records, std::size_t applied);
-    /// One kDiscardMsgType{LegacySuperseded} frame (fire and forget: its ack is ignored).  False = ring full.
+    /// One kDiscardMsgType{LegacySuperseded} frame (fire and forget: its ack, reason LegacySuperseded, never touches CheckpointState; a failure is only logged and counted).  False = ring full.
     [[nodiscard]] bool tryPushLegacySuperseded_(int32_t viewTopicId, int32_t partition);
     std::vector<uint64_t> legacyOwed_;   ///< instKeys whose superseded-legacy frame awaits ring room (cold path, nearly always empty)
 

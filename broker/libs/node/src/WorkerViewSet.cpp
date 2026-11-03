@@ -373,15 +373,25 @@ int WorkerViewSet::drainSnapshotAcks(int limit) {
             if (type != kDiscardDoneMsgType || len < kDiscardDoneMsgBytes) return;   // kDoneMsgType: durable-offset acks, not needed here
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
             onDiscardDone_(static_cast<int32_t>(readU32LE(p)), static_cast<int32_t>(readU32LE(p + 4)),
-                           static_cast<int32_t>(readU32LE(p + 8)));
+                           static_cast<int32_t>(readU32LE(p + 8)), static_cast<ViewDiscardReason>(p[12]));
         },
         limit);
 }
 
-void WorkerViewSet::onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status) {
+void WorkerViewSet::onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status, ViewDiscardReason reason) {
     const auto it = views_.find(instKey(viewTopicId, partition));
     if (it == views_.end()) return;
     ViewInstance& inst = it->second;
+    if (reason == ViewDiscardReason::LegacySuperseded) {
+        // Fire and forget, and possibly in flight next to a real discard of this instance: it never touches CheckpointState.
+        if (status != 0) {
+            ++inst.counters.viewBackupFailures;
+            spdlog::warn("VIEW-BACKUP-FAILED view={} partition={} reason=legacy-superseded errno={} ({}) -- the superseded legacy "
+                         "checkpoint file stays in place; the committed rows are unaffected",
+                         viewTopicId, partition, status, std::strerror(status));
+        }
+        return;
+    }
     const auto* pending = std::get_if<CheckpointDiscardPending>(&inst.checkpoint);
     if (pending == nullptr) {               // a fire-and-forget discard (legacy file next to a committed one) or a stale ack
         if (status != 0)

@@ -123,6 +123,10 @@ public:
     /// its fd writable, so a later discard frame can clear it.
     void forceErroredForTest(int32_t viewTopicId, int32_t partition);
 
+    /// Test seam: the Nth discard frame handled from now (1-based, counted from construction) fails with EIO without touching
+    /// any file; 0 = off.
+    void failNthDiscardForTest(int64_t n) noexcept { failNthDiscard_ = n; }
+
     /// Acks the done ring was too full to take (retried each cycle).
     [[nodiscard]] std::size_t pendingAcksForTest() const noexcept { return pendingAcks_.size(); }
     /// Discard frames handled (acked, OK or not) since construction.
@@ -165,7 +169,7 @@ private:
     int  moveToBackup_(const std::string& path, int32_t view, int32_t part, ViewDiscardReason reason);
     uint32_t nextSeq_(int32_t view, int32_t part);
     int  fsyncDir_(const std::string& dir, const char* tag);
-    void postDiscardDone_(int channelIdx, int32_t view, int32_t part, int32_t status);
+    void postDiscardDone_(int channelIdx, int32_t view, int32_t part, int32_t status, ViewDiscardReason reason);
     // Returns nullptr on an ::open() failure -- NOT cached in files_, so the
     // next call for the same key retries open() (review-round-1 fix: a
     // transient failure must never permanently blackhole a key).
@@ -174,7 +178,7 @@ private:
     void flushDue_(int64_t nowNs, bool idle);
     void postDone_(int32_t viewTopicId, int32_t partition, int64_t O, int channelIdx);
     void drainPendingAcks_();
-    bool writeAck_(int channelIdx, int32_t msgType, int32_t view, int32_t part, int64_t value);
+    bool writeAck_(int channelIdx, int32_t msgType, int32_t view, int32_t part, int64_t value, uint8_t reason = 0);
 
     std::vector<ViewSnapshotChannel*> channels_;   // Task 19: one or more worker channels
     std::string          viewDataDir_;
@@ -193,8 +197,9 @@ private:
     // cycle before any new acks (never lost, never reordered ahead of a
     // newer ack for the SAME key since flushDue_ only ever queues the
     // latest durable O per key per pass).
-    struct PendingAck { int32_t viewTopicId; int32_t partition; int64_t O; int channelIdx; int32_t msgType; int32_t status; };
+    struct PendingAck { int32_t viewTopicId; int32_t partition; int64_t O; int channelIdx; int32_t msgType; int32_t status; uint8_t reason; };
     std::vector<PendingAck> pendingAcks_;
+    int64_t failNthDiscard_ = 0;
 };
 
 /// Cold read-back seam (tests, prune, docs): the full paths of `<viewDataDir>/backup/view-<view>-p<part>.<10-digit seq>.<reason>.delta`,

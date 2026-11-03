@@ -844,6 +844,57 @@ TEST(ViewRecoveryRegression, LegacyAndCommittedCheckpointsBothPresentKeepsTheCom
     expectRowsOfTheLog(r);   // committed rows folded forward over the log tail; the legacy-only key is absent
 }
 
+// A fire-and-forget legacy-superseded frame can be in flight next to a real discard of the same instance.  Its ack must
+// never be taken for the real discard's: otherwise the view rebuilds before its own backup is done, and a real backup
+// failure is dropped (rows lost, no backup, no DiscardFailed).
+namespace {
+struct SupersededNextToRealDiscard {
+    DiscardRig r;
+    std::vector<uint8_t> legacy;
+    explicit SupersededNextToRealDiscard(const char* stem) : r(stem, 0) {
+        legacy = legacyBytesOf(r);
+        writeFile(rune::node::legacyViewCheckpointFilePath(r.dir, kViewId, 0), legacy);
+        r.writeCheckpoint(upsertRun(7, 10, 2, 0), 2);
+        r.materialize();   // CommittedAndLegacy: the LegacySuperseded frame is on the ring, the agent has not run
+        EXPECT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::Unreadable));
+        EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointDiscardPending>(*r.vs->checkpointStateForTest(kViewId, 0)));
+    }
+};
+}  // namespace
+
+TEST(ViewBackupRegression, SupersededLegacyAckNeverCompletesTheRealDiscardAdversarialRegression) {
+    SupersededNextToRealDiscard t("rune_t_1_sl1-");
+    DiscardRig& r = t.r;
+    r.agent->failNthDiscardForTest(2);   // frame 1 = legacy-superseded (succeeds), frame 2 = the real unreadable discard (fails)
+    r.pump(8);
+    const auto* failed = std::get_if<rune::node::CheckpointDiscardFailed>(r.vs->checkpointStateForTest(kViewId, 0));
+    ASSERT_NE(failed, nullptr) << "the real discard's failure must not be swallowed by the legacy ack";
+    EXPECT_EQ(failed->reason, rune::node::ViewDiscardReason::Unreadable);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->viewBackupFailures, 1u);
+    EXPECT_EQ(r.rowStatus(7), rune::node::WorkerViewSet::RowStatus::NotReady);
+    EXPECT_NE(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+}
+
+TEST(ViewBackupRegression, SupersededLegacyAckThenRealAckRebuildsOnlyAfterTheRealOneAdversarialRegression) {
+    SupersededNextToRealDiscard t("rune_t_1_sl2-");
+    DiscardRig& r = t.r;
+    r.now += 1'000'000'000;
+    r.agent->doWork(r.now);   // handles both frames, posts both acks
+    EXPECT_EQ(r.agent->discardsForTest(), 2);
+    r.vs->drainSnapshotAcks(1);   // the legacy-superseded ack only
+    EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointDiscardPending>(*r.vs->checkpointStateForTest(kViewId, 0)))
+        << "the legacy ack must not release the real discard";
+    EXPECT_EQ(r.rowStatus(7), rune::node::WorkerViewSet::RowStatus::NotReady);
+    r.vs->drainSnapshotAcks(1);   // the unreadable ack
+    EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointLive>(*r.vs->checkpointStateForTest(kViewId, 0)));
+    ASSERT_TRUE(r.pumpUntilReady());
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 2u);
+    EXPECT_NE(backups[0].find(".legacy-superseded.delta"), std::string::npos) << backups[0];
+    EXPECT_NE(backups[1].find(".unreadable.delta"), std::string::npos) << backups[1];
+    expectRowsOfTheLog(r);
+}
+
 // R3 (the #590 repro): a legacy file over a log retention trimmed to 2: the view is backed up and rebuilt from what remains.
 TEST(ViewRecoveryRegression, LegacyOverATrimmedLogIsBackedUpThenRebuiltFromWhatRemainsRegression) {
     DiscardRig r("rune_t_1_r3-", 0);

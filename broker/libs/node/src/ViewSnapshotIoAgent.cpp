@@ -316,12 +316,13 @@ void ViewSnapshotIoAgent::handleDiscardFrame_(const uint8_t* p, std::size_t len,
             files_.erase(it);
         }
     }
-    const int status = moveToBackup_(path, key.viewTopicId, key.partition, reason);
+    const int status = (failNthDiscard_ != 0 && discards_ + 1 == failNthDiscard_) ? EIO
+                                                                                   : moveToBackup_(path, key.viewTopicId, key.partition, reason);
     if (status != 0)
         spdlog::error("ViewSnapshotIoAgent: discard of view {} partition {} ({}) failed: {}", key.viewTopicId, key.partition,
                       viewDiscardReasonName(reason), std::strerror(status));
     if (recordFsyncLog_) fsyncLog_.emplace_back("ack");
-    postDiscardDone_(channelIdx, key.viewTopicId, key.partition, status);
+    postDiscardDone_(channelIdx, key.viewTopicId, key.partition, status, reason);
 }
 
 void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx) {
@@ -374,7 +375,7 @@ void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len, i
 }
 
 // One ack onto `channels_[channelIdx]->done`; false when the ring is full (or the channel is gone).
-bool ViewSnapshotIoAgent::writeAck_(int channelIdx, int32_t msgType, int32_t view, int32_t part, int64_t value) {
+bool ViewSnapshotIoAgent::writeAck_(int channelIdx, int32_t msgType, int32_t view, int32_t part, int64_t value, uint8_t reason) {
     auto* ch = (channelIdx >= 0 && channelIdx < static_cast<int>(channels_.size())) ? channels_[channelIdx] : nullptr;
     if (!ch) return false;
     if (msgType == kDiscardDoneMsgType) {
@@ -382,6 +383,8 @@ bool ViewSnapshotIoAgent::writeAck_(int channelIdx, int32_t msgType, int32_t vie
         writeLE32(buf, static_cast<uint32_t>(view));
         writeLE32(buf + 4, static_cast<uint32_t>(part));
         writeLE32(buf + 8, static_cast<uint32_t>(static_cast<int32_t>(value)));
+        buf[12] = reason;
+        buf[13] = buf[14] = buf[15] = 0;
         return ch->done.write(buf, sizeof(buf), kDiscardDoneMsgType);
     }
     uint8_t buf[ViewSnapshotChannel::kDoneMsgBytes];
@@ -394,14 +397,14 @@ void ViewSnapshotIoAgent::postDone_(int32_t viewTopicId, int32_t partition, int6
         // Ring momentarily full -- retry next cycle (never dropped). The
         // in-process lastDurableOffset() is already correct regardless of
         // whether this notification lands; see file header.
-        pendingAcks_.push_back(PendingAck{viewTopicId, partition, O, channelIdx, ViewSnapshotChannel::kDoneMsgType, 0});
+        pendingAcks_.push_back(PendingAck{viewTopicId, partition, O, channelIdx, ViewSnapshotChannel::kDoneMsgType, 0, 0});
     }
 }
 
-void ViewSnapshotIoAgent::postDiscardDone_(int channelIdx, int32_t view, int32_t part, int32_t status) {
+void ViewSnapshotIoAgent::postDiscardDone_(int channelIdx, int32_t view, int32_t part, int32_t status, ViewDiscardReason reason) {
     ++discards_;
-    if (!writeAck_(channelIdx, kDiscardDoneMsgType, view, part, status))
-        pendingAcks_.push_back(PendingAck{view, part, 0, channelIdx, kDiscardDoneMsgType, status});   // never dropped: replayed next cycle
+    if (!writeAck_(channelIdx, kDiscardDoneMsgType, view, part, status, static_cast<uint8_t>(reason)))
+        pendingAcks_.push_back(PendingAck{view, part, 0, channelIdx, kDiscardDoneMsgType, status, static_cast<uint8_t>(reason)});   // never dropped: replayed next cycle
 }
 
 void ViewSnapshotIoAgent::drainPendingAcks_() {
@@ -410,7 +413,7 @@ void ViewSnapshotIoAgent::drainPendingAcks_() {
     for (std::size_t i = 0; i < pendingAcks_.size(); ++i) {
         const auto& ack = pendingAcks_[i];
         const int64_t value = ack.msgType == kDiscardDoneMsgType ? static_cast<int64_t>(ack.status) : ack.O;
-        if (!writeAck_(ack.channelIdx, ack.msgType, ack.viewTopicId, ack.partition, value)) {
+        if (!writeAck_(ack.channelIdx, ack.msgType, ack.viewTopicId, ack.partition, value, ack.reason)) {
             if (keep != i) pendingAcks_[keep] = pendingAcks_[i];
             ++keep;
         }

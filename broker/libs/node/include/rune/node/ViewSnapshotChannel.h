@@ -29,8 +29,10 @@
 // ([view i32][part i32][reason u8][pad 3]), after every delta the old stream still owes the file.  The IO agent (the only
 // thread that touches the checkpoint files) MOVES the live file into `<viewDataDir>/backup/` (link + unlink, then fsync the
 // backup dir and the view dir; with RUNE_VIEW_BACKUP=0 it unlinks instead), prunes old backups down to `keep`, and only then
-// acks with kDiscardDoneMsgType ([view i32][part i32][status i32], 0 = OK, else errno) on `done`.  The worker folds nothing
-// for that instance until the ack arrives; a failed backup leaves the view NotReady for the rest of the boot.
+// acks with kDiscardDoneMsgType ([view i32][part i32][status i32][reason u8][pad 3], status 0 = OK, else errno) on `done`, echoing the
+// reason of the frame it acks.  The worker folds nothing for that instance until the ack of its own discard arrives; a failed
+// backup leaves the view NotReady for the rest of the boot.  An ack with reason LegacySuperseded (a fire-and-forget frame
+// that can be in flight next to a real discard of the same instance) never completes or fails a real discard.
 //
 // Both rings are owned together so construction/destruction order between
 // the worker side and the IO side is trivially correct (single struct, no
@@ -71,7 +73,7 @@ constexpr bool discardTargetsLegacy(ViewDiscardReason r) noexcept {
 inline constexpr int32_t kDiscardMsgType = 5;        // worker -> IO on `deltas`
 inline constexpr int32_t kDiscardDoneMsgType = 6;    // IO -> worker on `done`
 inline constexpr int32_t kDiscardMsgBytes = 12;      // [view i32][part i32][reason u8][pad 3]
-inline constexpr int32_t kDiscardDoneMsgBytes = 12;  // [view i32][part i32][status i32]: 0 = OK, else errno
+inline constexpr int32_t kDiscardDoneMsgBytes = 16;  // [view i32][part i32][status i32][reason u8][pad 3]: status 0 = OK, else errno
 
 /// RUNE_VIEW_BACKUP / RUNE_VIEW_BACKUPS_KEPT.
 struct ViewBackupPolicy {
