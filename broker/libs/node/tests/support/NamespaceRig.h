@@ -13,6 +13,7 @@
 #include "support/NamespaceMatrixExpectations.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -189,7 +190,12 @@ public:
         w.sess.clear();
         w.sess2.clear();
         w.root = loginNs(w.r, "admin", AuthBroker::kAdminPassword);
-        w.sess["admin"] = w.root;
+    }
+    /// Issue #647 (test-only): the cached session of `user` as session() returns it, and a way to make it look idle.
+    int64_t userSessionForTest(const std::string& user) { return session(*main_, user); }
+    void ageUserSessionForTest(const std::string& user, std::chrono::seconds by) {
+        const auto it = main_->sess.find(user);
+        if (it != main_->sess.end()) it->second.used -= by;
     }
     /// Bounded wait until root's metadata lists topic `tid` and at least `minCount` topics.
     bool awaitRootListed(int32_t tid, std::size_t minCount) {
@@ -212,7 +218,11 @@ private:
         std::map<std::string, int32_t> tid, vid;   ///< namespace -> its t / v
         int32_t tOnly = kMissingId, vOnly = kMissingId;
         int64_t root = 0;
-        std::map<std::string, int64_t> sess;       ///< logged-in principals by name
+        /// A logged-in principal's session and when the rig last handed it out (issue #647: the broker reaps a session idle
+        /// for 10 s, so session() logs in again after 5 s of idleness - the rule of AuthBroker::freshAdminSid_.  The reap
+        /// clock is the broker's steady clock, which a real-broker rig cannot advance, so the age is wall time).
+        struct CachedSession { int64_t sid = 0; std::chrono::steady_clock::time_point used{}; };
+        std::map<std::string, CachedSession> sess;
         std::map<int, int64_t> sess2;              ///< the timing cells' second session per caller
         uint64_t rid = 0;
         World(const std::string& tag, AuthBroker::Options o) : r(tag, std::move(o)) {}
@@ -323,7 +333,6 @@ private:
         r.createNamespace("a");
         r.createNamespace("b");
         w.root = loginNs(r, "admin", AuthBroker::kAdminPassword);
-        w.sess["admin"] = w.root;
         makeShared(w, "default");
         makeShared(w, "a");
         makeShared(w, "b");
@@ -367,9 +376,12 @@ private:
         }
     }
     int64_t session(World& w, const std::string& user) {
+        const auto now = std::chrono::steady_clock::now();
         auto it = w.sess.find(user);
-        if (it == w.sess.end()) it = w.sess.emplace(user, loginNs(w.r, user, AuthRig::kPw)).first;
-        return it->second;
+        if (it == w.sess.end() || now - it->second.used > std::chrono::seconds(5))
+            it = w.sess.insert_or_assign(user, World::CachedSession{loginNs(w.r, user, AuthRig::kPw), now}).first;
+        it->second.used = now;
+        return it->second.sid;
     }
 
     // ── the cell ────────────────────────────────────────────────────────────────────────────────────────────

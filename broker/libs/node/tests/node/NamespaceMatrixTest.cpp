@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -21,6 +22,24 @@ TEST(NamespaceMatrixRegression, MatrixCountRegression) {
     EXPECT_EQ(k.applicable, 539u);
     EXPECT_EQ(k.timing, 56u);
     EXPECT_EQ(k.total, 595u);
+}
+
+// #647: the rig cached each user session for the whole suite, past the broker's 10 s idle reap.  A cached session idle
+// for more than 5 s is logged in again (the same rule as AuthBroker::freshAdminSid_).
+TEST(NamespaceRigRegression, StaleUserSessionReloggedRegression) {
+    NamespaceRig rig;
+    const int64_t first = rig.userSessionForTest("a/ungranted");
+    EXPECT_EQ(rig.userSessionForTest("a/ungranted"), first) << "a fresh session is reused";
+    rig.ageUserSessionForTest("a/ungranted", std::chrono::seconds(6));
+    const int64_t second = rig.userSessionForTest("a/ungranted");
+    EXPECT_NE(second, first) << "a session idle past 5 s must be replaced before the 10 s reap can take it";
+    // the replacement serves a real cell: the same answer the matrix expects of this caller
+    for (std::size_t o = 0; o < kOps; ++o) {
+        if (naRule(Op(o), Target::OwnNs)) continue;
+        const NamespaceRig::Answer got = rig.run(Op(o), Caller::UserUngranted, Target::OwnNs, 0);
+        EXPECT_EQ(got.code, expect(Op(o), Caller::UserUngranted, Target::OwnNs).code) << name(Op(o));
+        break;
+    }
 }
 
 namespace {
