@@ -428,6 +428,43 @@ TEST(CheckedWritesVerdictWorkerRegression, TruncatedOwnChangeAndMarkerLeaveTheTi
     EXPECT_TRUE(r.hasRow(kProj, 14));
 }
 
+// #809: two log cuts X < Y between two passes: the timeline must drop everything at and above X (the lowest cut), not only above Y.
+TEST(CheckedWritesVerdictWorkerRegression, TwoCutsBetweenPassesTruncateTheTimelineAtTheLowerCutRegression) {
+    constexpr int32_t kRej2 = 0x40000603;
+    VerdictRig r(/*follower=*/true);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(20);
+    r.followerFetch();
+    r.passes(20);
+    ASSERT_EQ(r.produce({{1, 1, 0}, {2, 2, 0}, {3, 3, 9}}), 0);
+    const int64_t dataEnd = r.leo();
+    r.followerFetch(dataEnd);
+    r.passes(300);
+    const int64_t X = dataEnd;   // the marker of the rejection sits here
+    ASSERT_EQ(r.leo(), X + 1);
+    r.installRejectView(kRej2, kObj + 1, tagRule(8), "rej2");   // a second set change above X
+    r.passes(20);
+    ASSERT_EQ(r.readLog().changes.size(), 2u);
+    const PartitionWriteState* w = r.worker->writeStateForTest(VerdictRig::kSrc, 0);
+    ASSERT_NE(w, nullptr);
+    ASSERT_GE(w->markers.appendedThrough(), X);
+    const int64_t changeAt = r.readLog().changes.back().offset;
+    ASSERT_GE(changeAt, X);
+    r.demote();
+    // Cut 1 at X, then a foreign batch above it, then cut 2 at Y > X, with no worker pass in between.
+    r.replica->truncateLogForTest(X);
+    ASSERT_EQ(r.leo(), X);
+    r.replicateNoPass({VerdictRig::batch({{10, 1, 0}, {11, 1, 0}, {12, 1, 0}})});
+    const int64_t Y = X + 2;
+    ASSERT_GT(r.leo(), Y);
+    r.replica->truncateLogForTest(Y);
+    ASSERT_EQ(r.replica->lastTruncationOffset(), Y);
+    r.passes(1);
+    EXPECT_LT(w->constraintSets.lastChangeOffset(), X) << "a set change in [X, Y) survived the two cuts";
+    EXPECT_LT(w->markers.appendedThrough(), X) << "a marker in [X, Y) survived the two cuts";
+}
+
 TEST(CheckedWritesVerdictWorkerRegression, LeadershipScanPastTheLedgerCapacityKeepsWRegression) {
     // More markers in the log than the ledger holds.  The leadership scan feeds them in order without an HW in between, so the
     // ring filled and every later marker was dropped: W stayed at the 1024th until the leader re-marked the range.

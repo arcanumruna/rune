@@ -7203,9 +7203,11 @@ private:
         const uint64_t gen = sl.replica->logGeneration();
         if (gen == w.seenLogGeneration) [[likely]] return;
         if (w.seenLogGeneration != UINT64_MAX) {
-            const int64_t cut = sl.replica->lastTruncationOffset();
-            w.constraintSets.truncateFrom(cut);
-            w.markers.truncateFrom(cut);
+            const int64_t floor = sl.replica->takeTruncationFloor();   // #809: the lowest cut since the last pass, not just the last
+            w.constraintSets.truncateFrom(floor);
+            w.markers.truncateFrom(floor);
+        } else {
+            (void)sl.replica->takeTruncationFloor();   // first sight: nothing to cut, and no stale floor left behind
         }
         w.seenLogGeneration = gen;
     }

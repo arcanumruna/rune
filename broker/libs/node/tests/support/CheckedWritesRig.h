@@ -191,6 +191,11 @@ public:
     }
     /// As a follower: the leader (node 2) replicates `batches` at the LEO, committed.
     void replicate(std::vector<std::vector<uint8_t>> batches) {
+        replicateNoPass(std::move(batches));
+        passes(3);
+    }
+    /// replicate() without a worker pass: the worker sees nothing of it until the next pass (two cuts can land between passes).
+    void replicateNoPass(std::vector<std::vector<uint8_t>> batches) {
         std::vector<uint8_t> bytes;
         int64_t base = leo();
         for (auto& b : batches) {
@@ -205,7 +210,6 @@ public:
         resp.partition = 0; resp.topicId = kSrc; resp.highWatermark = base; resp.logStartOffset = log->logStartOffset();
         resp.records = std::span<const uint8_t>(bytes.data(), bytes.size());
         replica->applyReplicated(resp);
-        passes(3);
     }
     /// A constraint-set change batch (base offset 0, stamped by replicate()).
     static std::vector<uint8_t> changeBatch(uint32_t setId, std::vector<rune::storage::control_record::ChangeMember> members) {
