@@ -479,7 +479,13 @@ TEST(NamespaceGatewayRegression, QualifiedLookingGroupNamesPinnedRegression) {
     ASSERT_GE(joined.second, 0);
     EXPECT_EQ(r.commitAs(g.alice, "g", joined.first, joined.second, g.mine, 11), kOk);
     EXPECT_EQ(r.committedOffset(g.alice, "alpha/g", g.mine), 11) << "alpha/g is alpha's g";
-    EXPECT_NE(r.committedOffset(g.alice, "bravo/g", g.mine), 11) << "a foreign qualifier is a different (literal) group";
+    // a foreign qualifier is an opaque literal group in alpha: alice joins it with her own topic (in bravo that topic
+    // would be unknown) and its offsets are its own, never alpha's g
+    const auto lit = r.joinStable(g.alice, "bravo/g", {g.mine});
+    ASSERT_GE(lit.second, 0) << "bravo/g is a literal group in alpha, joinable with alpha's topic";
+    EXPECT_EQ(r.commitAs(g.alice, "bravo/g", lit.first, lit.second, g.mine, 33), kOk);
+    EXPECT_EQ(r.committedOffset(g.alice, "bravo/g", g.mine), 33);
+    EXPECT_EQ(r.committedOffset(g.alice, "g", g.mine), 11) << "the literal group never moves alpha's g";
 }
 
 // A grant on a group / transactional id is checked against the SCOPED local name the coordinator acts on, never the
