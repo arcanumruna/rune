@@ -1545,7 +1545,14 @@ void ClientAgent::unrefBind_(uint32_t idx) noexcept {
     WorkerBindEntry& b = workerBinds_[idx];
     assert(b.routes > 0 && "a bind entry is released only when no route names it");
     if (b.routes > 0 && --b.routes > 0) return;
-    transport_.releaseResponsePublication(b.pub);
+    // #751 review M1: a route that lost its port still offers on this slot as a plain publication (slots are keyed by
+    // (channel, stream)): keep the slot, drop only the pair.
+    bool plainUser = false;
+    for (const PartitionRoute& r : routes_) {
+        if (r.pub == b.pub) { plainUser = true; break; }
+    }
+    if (plainUser) transport_.demoteResponsePublication(b.pub);
+    else transport_.releaseResponsePublication(b.pub);
     b.pub          = transport::AeronTransport::kNoPub;
     b.sessionIndex = kNoSession;
     b.resolvedGen  = UINT64_MAX;
@@ -1630,8 +1637,8 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
                     const uint32_t oldBind = r.bindIdx;
                     r.bindIdx = bindFor();
                     if (r.bindIdx != kNoBind) ++workerBinds_[r.bindIdx].routes;   // #751: ref the new entry first
+                    if (oldBind != kNoBind) { r.pub = transport::AeronTransport::kNoPub; r.streamId = -1; }   // before the unref: this route is not a plain user of the old entry's slot
                     unrefBind_(oldBind);
-                    if (r.bindIdx == kNoBind && oldBind != kNoBind) { r.pub = transport::AeronTransport::kNoPub; r.streamId = -1; }
                     r.bindStream = bindStream;
                     r.bindPort = responsePort;
                     if (r.bindIdx != kNoBind) {

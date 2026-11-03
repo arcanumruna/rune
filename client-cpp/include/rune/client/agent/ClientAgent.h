@@ -1011,6 +1011,22 @@ public:
         const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
         return idx == detail::FlatIndexMap::kNone ? kNoBind : routes_[idx].bindIdx;
     }
+    /// #751 review M1 seams: the publication handle route (topic, partition) names; make it offer on the plain
+    /// publication for (its data channel, stream) exactly as the offer path does for a route without a bind entry;
+    /// the slot of `h` is Released / response-paired.
+    [[nodiscard]] transport::AeronTransport::PubHandle routePubForTest(int32_t topicId, int32_t partition) const noexcept {
+        const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
+        return idx == detail::FlatIndexMap::kNone ? transport::AeronTransport::kNoPub : routes_[idx].pub;
+    }
+    void routeUsePlainPublicationForTest(int32_t topicId, int32_t partition, int32_t stream) {
+        const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
+        if (idx == detail::FlatIndexMap::kNone) return;
+        routes_[idx].pub      = transport_.publicationHandle(routes_[idx].dataChannel, stream);
+        routes_[idx].streamId = stream;
+    }
+    [[nodiscard]] bool publicationReleasedForTest(transport::AeronTransport::PubHandle h) const noexcept {
+        return transport_.publicationReleasedForTest(h);
+    }
     [[nodiscard]] std::size_t activePublicationSlotsForTest() const noexcept { return transport_.activePublicationSlotsForTest(); }
     [[nodiscard]] std::size_t pubSlotCountForTest() const noexcept { return transport_.pubSlotCountForTest(); }
     /// Resolve every bind entry's session (the duty pass's first step) and report entry `i`'s index.

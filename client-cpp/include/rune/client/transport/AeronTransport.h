@@ -251,6 +251,11 @@ public:
     [[nodiscard]] std::size_t activePublicationSlotsForTest() const noexcept {
         std::size_t n = 0;
         for (const PubSlot& s : pubSlots_) if (!std::holds_alternative<PubSlot::Released>(s.mode)) ++n;
+    /// #751 review M1: the pair's last bind reference is gone but a plain route still offers on this slot: keep it as a
+    /// plain publication.  The response subscription retires, the correlated request publication is released or
+    /// drained (#763), and the slot (mode Plain, fresh Resolution) re-resolves lazily on the next offerOn /
+    /// publicationHandle.  Plain or Released: no-op.  Cold path, owner thread.
+    void demoteResponsePublication(PubHandle h) noexcept;
         return n;
     }
     [[nodiscard]] std::size_t pubSlotCountForTest() const noexcept { return pubSlots_.size(); }

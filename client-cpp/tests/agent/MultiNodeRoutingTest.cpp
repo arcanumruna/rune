@@ -423,3 +423,58 @@ TEST(ClientAgentRegression, AWorkerBindEntryIsFreedWhenItsLastRouteMovesRegressi
     EXPECT_TRUE(agent.workerBindFreeForTest(xIdx));
     EXPECT_EQ(agent.activePublicationSlotsForTest(), base);
 }
+
+// #751 review M1: a route that lost its response port offers on the SAME (channel, stream) slot as the bind entry it
+// left (slots are keyed by channel+stream).  Freeing the entry must demote that slot to a plain publication, never
+// Release it under the route still offering on it.
+TEST(ClientAgentRegression, ABindPublicationAPlainRouteStillUsesIsDemotedNotReleasedRegression) {
+    const std::string kNode = "aeron:udp?endpoint=nodeA:9001";
+    const std::string kW    = "aeron:udp?endpoint=hostW:9100";
+    const std::string kW2   = "aeron:udp?endpoint=hostX:9200";
+    constexpr int32_t kTopic = 7, kStream = 21;
+    rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
+    const auto route = [&](int32_t part, const std::string& worker, int32_t port) {
+        return agent.setRoute(kTopic, part, kNode, worker, 0, kStream, port);
+    };
+    ASSERT_TRUE(route(0, kW, 7000));
+    ASSERT_TRUE(route(1, kW, 7000));
+    const uint32_t wIdx = agent.routeBindIdxForTest(kTopic, 0);
+    ASSERT_NE(wIdx, 0xFFFFFFFFu);
+    const auto h = agent.routePubForTest(kTopic, 1);   // the entry's pair
+    ASSERT_NE(h, rune::client::transport::AeronTransport::kNoPub);
+    ASSERT_TRUE(agent.publicationResponsePairedForTest(h));
+
+    // p0's port goes to 0: it leaves the entry and its next offer resolves the plain publication on the same slot.
+    ASSERT_TRUE(route(0, kW, 0));
+    EXPECT_EQ(agent.routeBindIdxForTest(kTopic, 0), 0xFFFFFFFFu);
+    EXPECT_FALSE(agent.workerBindFreeForTest(wIdx)) << "p1 still names the entry";
+    agent.routeUsePlainPublicationForTest(kTopic, 0, kStream);
+    ASSERT_EQ(agent.routePubForTest(kTopic, 0), h) << "slots are keyed by (channel, stream): the plain route shares the slot";
+
+    // p1 moves away: the entry's last reference is gone, but p0 still offers on h.
+    ASSERT_TRUE(route(1, kW2, 7100));
+    EXPECT_TRUE(agent.workerBindFreeForTest(wIdx));
+    EXPECT_EQ(agent.routePubForTest(kTopic, 0), h);
+    EXPECT_FALSE(agent.publicationReleasedForTest(h)) << "released under a route still offering on it: its offers fail forever";
+    EXPECT_FALSE(agent.publicationResponsePairedForTest(h)) << "the pair is gone: the slot is a plain publication";
+}
+
+// The bindChanged branch of setRoute (a metadata update that moves a worker's response port, here to 0) drops the
+// route's reference on the old entry; with no other user the entry is freed and its pair released.
+TEST(ClientAgentRegression, ABindChangedToPortZeroReleasesTheBindReferenceRegression) {
+    const std::string kNode = "aeron:udp?endpoint=nodeA:9001";
+    const std::string kW    = "aeron:udp?endpoint=hostW:9100";
+    constexpr int32_t kTopic = 7, kStream = 21;
+    rca::ClientAgent agent(makeAgentConfig("aeron:udp?endpoint=seed:1"));
+    const std::size_t base = agent.activePublicationSlotsForTest();
+    ASSERT_TRUE(agent.setRoute(kTopic, 0, kNode, kW, 0, kStream, 7000));
+    const uint32_t wIdx = agent.routeBindIdxForTest(kTopic, 0);
+    ASSERT_NE(wIdx, 0xFFFFFFFFu);
+    EXPECT_FALSE(agent.workerBindFreeForTest(wIdx));
+    EXPECT_EQ(agent.activePublicationSlotsForTest(), base + 1);
+
+    ASSERT_TRUE(agent.setRoute(kTopic, 0, kNode, kW, 0, kStream, 0));   // same endpoint, the port goes away
+    EXPECT_EQ(agent.routeBindIdxForTest(kTopic, 0), 0xFFFFFFFFu) << "the route still names the entry";
+    EXPECT_TRUE(agent.workerBindFreeForTest(wIdx)) << "the bindChanged branch never dropped its reference";
+    EXPECT_EQ(agent.activePublicationSlotsForTest(), base) << "the entry's publication pair was never released";
+}

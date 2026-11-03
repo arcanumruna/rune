@@ -562,6 +562,23 @@ void AeronTransport::releaseResponsePublication(PubHandle h) noexcept {
     }
 }
 
+void AeronTransport::demoteResponsePublication(PubHandle h) noexcept {
+    if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return;
+    PubSlot& ps = pubSlots_[static_cast<std::size_t>(h)];
+    int32_t sub = -1;
+    if (const auto* c = std::get_if<PubSlot::Correlated>(&ps.mode)) sub = c->subSlot;
+    else if (const auto* a = std::get_if<PubSlot::AwaitResponseSub>(&ps.mode)) sub = a->subSlot;
+    else return;   // Plain or Released: nothing to demote
+    try {
+        drainPub_(std::move(ps.res));
+        ps.res = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
+        ps.addChannel.clear();
+        ps.mode = PubSlot::Plain{};
+        retireSubSlot_(sub);
+    } catch (...) {
+    }
+}
+
 bool AeronTransport::rePairResponsePublication(PubHandle h) noexcept {
     if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return false;
     PubSlot& ps = pubSlots_[static_cast<std::size_t>(h)];
