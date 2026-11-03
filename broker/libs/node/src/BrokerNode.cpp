@@ -3645,6 +3645,7 @@ void BrokerNode::publishPeerLinkMetrics_() noexcept {
     controlSet_(RuneMetric::PeerFrameDrops, static_cast<std::int64_t>(peerFrameDropsTotal_()));
     controlSet_(RuneMetric::PeerLinksEstablished, peerLinkAgent_->establishedPeers());
     controlSet_(RuneMetric::PeerLinkRefusals, static_cast<std::int64_t>(peerLinkAgent_->refusals()));
+    controlSet_(RuneMetric::PeerHelloShed, static_cast<std::int64_t>(peerLinkAgent_->helloShed()));
 }
 
 uint64_t BrokerNode::peerFrameDropsTotal_() const noexcept {
