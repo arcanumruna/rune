@@ -101,7 +101,7 @@ Account account(uint64_t id) {
     Account a;
     a.id = id;
     std::snprintf(a.name.data(), a.name.size(), "acct-%llu", static_cast<unsigned long long>(id));
-    a.amount = static_cast<int64_t>(id);
+    a.n = static_cast<int64_t>(id);
     return a;
 }
 
