@@ -77,6 +77,7 @@ class VerdictRig {
 public:
     static constexpr int32_t kSrc = 6;
     static constexpr int kMaxPass = 4000;
+    static constexpr int kMaxFlushWait = 1'000'000;   ///< compact(): passes to wait for an in-flight async flush (a hang guard)
     ViewBackupPolicy backupPolicy{};   ///< the agent's view-backup policy (set before the first persisted install)
     /// The view checkpoint directory (the committed files, and backup/ under it).
     [[nodiscard]] std::string snapDir() const { return viewDir_.string(); }
@@ -588,6 +589,14 @@ public:
             crl::detail::sealBatch(f.data(), pos);
             EXPECT_GE(replica->appendControlBatch(f, false), 0);
             passes(4);
+        }
+        // The worker's background fdatasyncs run on the io backend's own thread; a segment rolled while one is in flight stays
+        // pinned until its completion is reaped, and the owner refuses a swap over it (FlushInFlight).  Wait for that
+        // completion (an event, not a deadline); the cap only turns a lost completion into a failure instead of a hang.
+        for (int i = 0; log->flushPinnedSegmentsForTest() > 0; ++i) {
+            if (i == kMaxFlushWait) { ADD_FAILURE() << "an async flush never completed"; break; }
+            pass();
+            std::this_thread::yield();
         }
         Compacted out;
         for (int i = 0; i < 16 && (log->runCleanerFileOps(nowMs, replica->fileDeleteDelayMs()), log->cleanerFileOpsPending()); ++i) passes(1);   // the posted renames of the last install
