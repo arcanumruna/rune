@@ -638,8 +638,8 @@ TEST(CheckedWritesVerdictCleanerRegression, DamagedMarkerAtEveryByteNeverDropsDa
 // verdict source: plain key compaction), the rewritten segment must still carry every intact batch behind the damage —
 // a rewrite that keeps only the walked prefix silently drops them.  Flip each byte of a mid-segment data batch in turn.
 // URGENT break found by the batch 1 adversarial pass (silent loss of intact records): every engine's walk `break`s at the
-// damaged batch and installs the prefix it walked.  DISABLED until that fix lands; the fix enables it.
-TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedBatchMidSegmentNeverTruncatesTheRewriteAdversarialRegression) {
+// damaged batch and installs the prefix it walked.  Fixed: a damaged walk installs nothing.
+TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchMidSegmentNeverTruncatesTheRewriteAdversarialRegression) {
     std::size_t victimTotal = 0;
     constexpr int64_t kVictim = 6;
     auto build = [](Log& log) {
@@ -714,4 +714,67 @@ TEST(CheckedWritesVerdictCleanerRegression, DISABLED_DamagedBatchMidSegmentNever
     EXPECT_GT(rewrote, 0) << "the pass must really rewrite the damaged segment";
     for (int e = 0; e < 4; ++e)
         EXPECT_EQ(lostCases[e], 0) << "engine " << e << ": " << lostCases[e] << " of " << victimTotal << " damage cases lost intact data; first: " << firstLost[e];
+}
+
+// A damaged segment makes the log uncleanable until restart (Kafka: a corrupt segment is never truncated by the cleaner).
+// After the first pass that meets the damage, the same cleaner reads and changes nothing, even for a healthy segment that a
+// healthy cleaner would compact; a fresh cleaner (restart) compacts that segment and meets the damage again.
+TEST(CheckedWritesVerdictCleanerRegression, ADamagedSegmentMakesTheLogUncleanableUntilRestartRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), /*segmentBytes=*/900);
+        log.recover();
+        for (int64_t o = 0; o < 40; ++o) data(log, o, "k" + std::to_string(o), "v");
+        data(log, 40, "zz", "old");
+        data(log, 41, "zz", "new");
+        for (int64_t o = 42; o < 90; ++o) data(log, o, "f" + std::to_string(o), "v");
+        const auto victim = findBatch(log.dir(), 6);
+        const auto dup    = findBatch(log.dir(), 40);
+        ASSERT_TRUE(victim.has_value() && dup.has_value());
+        ASSERT_NE(victim->file, dup->file) << "the duplicate pair lives in a healthy segment";
+        xorByteAt(victim->file, victim->pos + 20, 0x5A);
+        const int64_t victimBase = std::stoll(victim->file.stem().string());
+        const int64_t dupBase    = std::stoll(dup->file.stem().string());
+        auto bases = log.segmentBaseOffsets();
+        const int64_t active = bases.back();
+        bases.pop_back();
+        ASSERT_LT(dupBase, active);
+        auto bytes = [](const std::filesystem::path& f) {
+            std::ifstream in(f, std::ios::binary);
+            return std::vector<char>((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        };
+        const auto victimBytes = bytes(victim->file);
+        const auto dupBytes    = bytes(dup->file);
+        auto pass = [&](LogCleaner& c, int64_t base) {
+            return c.produceCleanedFileBounded(log.dir(), bases, base, active, 0, 0, 1000, 1 << 20, nullptr, 1'000'000);
+        };
+
+        LogCleaner cleaner;
+        EXPECT_FALSE(cleaner.uncleanable());
+        EXPECT_FALSE(cleaner.damage().has_value());
+        EXPECT_FALSE(pass(cleaner, victimBase).compacted);
+        ASSERT_TRUE(cleaner.uncleanable());
+        ASSERT_TRUE(cleaner.damage().has_value());
+        EXPECT_EQ(cleaner.damage()->segBase, victimBase);
+        EXPECT_GE(cleaner.damage()->byteOffset, victim->pos) << "the walk stopped at or before the damaged batch's end";
+        EXPECT_LT(cleaner.damage()->byteOffset, victim->pos + victim->total + 1);
+        EXPECT_EQ(bytes(victim->file), victimBytes) << "the damaged segment is never rewritten";
+
+        // Second pass, healthy segment: the sticky state reads and changes nothing.
+        EXPECT_FALSE(pass(cleaner, dupBase).compacted);
+        EXPECT_EQ(bytes(dup->file), dupBytes);
+        EXPECT_TRUE(cleaner.uncleanable());
+
+        // Restart: a fresh cleaner compacts the healthy segment, then meets the damage again.
+        LogCleaner restarted;
+        EXPECT_FALSE(restarted.uncleanable());
+        EXPECT_TRUE(pass(restarted, dupBase).compacted) << "a healthy cleaner drops the superseded duplicate";
+        EXPECT_NE(bytes(dup->file), dupBytes);
+        EXPECT_FALSE(restarted.uncleanable()) << "the healthy segment alone is no damage";
+        EXPECT_FALSE(pass(restarted, victimBase).compacted);
+        EXPECT_TRUE(restarted.uncleanable());
+        EXPECT_EQ(restarted.damage()->segBase, victimBase);
+        EXPECT_EQ(bytes(victim->file), victimBytes);
+    }
+    std::filesystem::remove_all(dir);
 }

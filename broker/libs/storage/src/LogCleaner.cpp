@@ -1,6 +1,7 @@
 #include <rune/storage/LogCleaner.h>
 #include <cstring>
 #include <rune/protocol/RecordBatch.h>
+#include <spdlog/spdlog.h>
 #include <rune/storage/ControlMarkerLayout.h>
 #include <rune/storage/ControlRecordLayout.h>
 
@@ -489,6 +490,13 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     }
 }
 
+void LogCleaner::noteDamage_(const std::string& dir, int64_t segBase, std::size_t pos) {
+    if (damaged_.has_value()) return;
+    damaged_ = Damaged{segBase, pos};
+    spdlog::warn("LogCleaner: damaged batch in {} segment {} at byte {}: the log is uncleanable until restart",
+                 dir, segBase, pos);
+}
+
 // ---------------------------------------------------------------------------
 // rewriteSegmentImpl  (internal — type-erased core)
 // ---------------------------------------------------------------------------
@@ -499,6 +507,8 @@ bool LogCleaner::rewriteSegmentImpl(
     int64_t nowNs, int64_t deleteRetentionMs,
     int64_t nowMs, bool* changed, const ProducerTails* tails, const TxnCleanState* txn, VerdictCleanState* verdicts)
 {
+    if (changed) *changed = false;
+    if (damaged_.has_value()) return false;   // uncleanable: nothing read, nothing changed
     // D3b: never clean at/after the pass's first unresolved transaction (LSO).
     if (txn != nullptr) cleanBoundaryOffset = std::min(cleanBoundaryOffset, txn->cleanLimit());
     if (verdicts != nullptr) {
@@ -798,6 +808,14 @@ bool LogCleaner::rewriteSegmentImpl(
         pos += static_cast<size_t>(total);
     }
 
+    // A walk that stopped before the end met a damaged batch.  Installing what was walked would drop every intact record
+    // behind it (an empty output even deletes the segment): install nothing, leave the original untouched.
+    if (pos != buf.size()) {
+        noteDamage_(dir, segBase, pos);
+        if (changed) *changed = false;
+        return false;
+    }
+
     // A4: If compaction removed ALL records from a non-active segment, outBuf is
     // empty.  Writing a 0-byte .log would leave a permanent dangling file that
     // never gets garbage-collected.  Instead, delete the segment and its index
@@ -898,6 +916,7 @@ void LogCleaner::compact(Log& log, OffsetMap& map,
                          int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs) {
     const std::string& dir = log.dir();
     rewriteSegmentsRead_ = 0;
+    if (damaged_.has_value()) return;   // uncleanable until restart
 
     // Clean up any stale .log.new temp files left by a previous crashed run.
     for (auto& e : std::filesystem::directory_iterator(dir)) {
@@ -925,6 +944,7 @@ void LogCleaner::compact(Log& log, OffsetMap& map,
         // compaction gap there would be taken for a lost write (truncation).
         if (i + 1 < bases.size() && !log.compactionAllowedThrough(bases[i + 1])) break;
         rewriteSegment(dir, segBase, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
+        if (damaged_.has_value()) break;   // the pass stops at the damaged segment
     }
 
     // Reload the log's in-memory state from the rewritten files.
@@ -960,6 +980,7 @@ bool LogCleaner::produceCleanedFile(const std::string& dir,
                                     Offset globalDirtyStart,
                                     int64_t nowNs, int64_t deleteRetentionMs) {
     if (sealedBases.empty()) return false;
+    if (damaged_.has_value()) return false;   // uncleanable until restart
 
     // Guard: segBase must be one of the sealed segments in the snapshot AND must
     // be strictly below the active/uncleanable boundary.  We NEVER read segments_
@@ -1016,6 +1037,7 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
 {
     CleanPassResult result{false, activeBase};
     rewriteSegmentsRead_ = 0;
+    if (damaged_.has_value()) return result;   // uncleanable until restart
 
     if (sealedBases.empty()) return result;
     if (segBase >= activeBase) return result;
@@ -1178,6 +1200,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
     RangeCleanResult result;
     rewriteSegmentsRead_ = 0;
     result.passEnd = activeBase;   // default: nothing dirty → advance to activeBase
+    if (damaged_.has_value()) return result;   // uncleanable until restart: nothing read, nothing changed
     // Fix round 2: deferred-install mode collects outputs into result.groups.
     struct DeferredScope {
         std::vector<CleanedGroup>*& slot;
@@ -1271,6 +1294,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
                 result.compacted = true;
                 for (int64_t b : g.bases) result.rewrittenBases.push_back(b);
             }
+            if (damaged_.has_value()) break;   // the pass stops at the damaged group; finished groups stand
         }
         return result;
     }
@@ -1283,6 +1307,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
         bool changed = false;
         rewriteSegmentImpl(dir, b, getLatest, globalDirtyStart, passEnd,
                            nowNs, deleteRetentionMs, nowMs, &changed, &map.producerTails(), &map.txnState(), &map.verdictState());
+        if (damaged_.has_value()) break;   // the pass stops at the damaged segment; finished segments stand
 
         // A segment needs a swap enqueue iff its on-disk content changed (records
         // dropped / tombstone stamped / emptied), OR its .log is now absent (emptied
@@ -1462,6 +1487,7 @@ void LogCleaner::mergeGroupWithMap(
 {
     if (changed) *changed = false;
     if (groupInPass.empty()) return;
+    if (damaged_.has_value()) return;   // uncleanable: nothing read, nothing changed
     // D3b: never at/after the first unresolved transaction (LSO).
     const TxnCleanState* txn = &map.txnState();
     VerdictCleanState* verdicts = &map.verdictState();
@@ -1628,6 +1654,12 @@ void LogCleaner::mergeGroupWithMap(
 
             pos += static_cast<size_t>(total);
         }
+        // A walk that stopped short met a damaged batch: the whole group produces no output and nothing is installed or
+        // deleted for any of its bases (the intact records behind the damage would be dropped).
+        if (pos != buf.size()) {
+            noteDamage_(dir, segBase, pos);
+            return;
+        }
     }
     (void)globalDirtyStart; // dirty range is captured by the map bounds
 
@@ -1682,6 +1714,7 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
 {
     CleanPassResult result{false, activeBase};
     rewriteSegmentsRead_ = 0;
+    if (damaged_.has_value()) return result;   // uncleanable until restart
     if (group.bases.empty()) return result;
 
     // All bases in the group must be < activeBase.
