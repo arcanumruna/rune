@@ -308,6 +308,10 @@ public:
         holdJudges_ = hold;
         for (auto& kv : verdictSources_) kv.second->holdJudgeForTest(hold);
     }
+    [[nodiscard]] int64_t maxRecordsPerPassForTest(int32_t viewTopicId, int32_t partition) const {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it == views_.end() ? -1 : it->second.maxRecordsPerPass;
+    }
     [[nodiscard]] bool keyIndexContainsForTest(int32_t src, int32_t partition, std::string_view wireKey) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
         return it != keyIndexes_.end() && it->second.table.get(rune::view::ViewKey::fromU64(keyIndexWord(wireKey)).asU64()) != nullptr;
@@ -686,8 +690,9 @@ private:
                 ? std::min(bound, inst.foldCursor + inst.maxRecordsPerPass)
                 : bound;
         rune::storage::LogReadView view = readRange(inst.foldCursor, passBound);
-        // A read stops at the next segment base at or above its end: a compacted gap at a segment end reaching past
+        // A disk read stops at the next segment base at or above its end: a compacted gap at a segment end reaching past
         // passBound reads empty below it.  Nothing is there, so read on to `bound`; the fold still stops at passBound.
+        // (A transient source's read ignores the end, so the second read just repeats the first.)
         if (view.empty() && passBound < bound) [[unlikely]] view = readRange(inst.foldCursor, bound);
         if (view.empty()) return work;
 
@@ -699,6 +704,7 @@ private:
                                                       passBound, cursor, skip)
                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view,
                                              passBound, cursor, skip);
+        work += cursor != inst.foldCursor;   // a pass across a compacted gap folds nothing but moves the cursor
         inst.foldCursor = cursor;
         chargeMem_(inst);   // Task 12: the pass may have appended chunks
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted +
