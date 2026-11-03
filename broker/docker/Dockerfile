@@ -41,6 +41,9 @@ RUN case "${TARGETARCH}" in \
     && cmake --version
 
 RUN conan profile detect --force
+# aeron/1.51.0-rune.1: 1.51.0 + the upstream unavailable-image refcount fix (recipe in conan/aeron).
+COPY --from=aeron-recipe . /aeron-recipe
+RUN conan export /aeron-recipe --version=1.51.0-rune.1
 
 # ── Broker build ──────────────────────────────────────────────────────────────
 FROM toolchain AS builder
@@ -93,7 +96,7 @@ COPY --from=rune-codec include /rune-codec/include
 # CMakeLists wires add_library(rune_crypto ...) from ${RUNE_CRYPTO_ROOT} and links
 # it PUBLIC on rune_gateway → transitively into rune_node/rune_broker.  Supplied via
 # the BuildKit named build context `rune-crypto`:
-#   docker build --build-context rune-crypto=../crypto ...
+#   docker build --build-context rune-crypto=../crypto --build-context aeron-recipe=../conan/aeron ...
 # The configure below passes -DRUNE_CRYPTO_ROOT=/rune-crypto; OpenSSL comes from conan.
 COPY --from=rune-crypto src     /rune-crypto/src
 COPY --from=rune-crypto include /rune-crypto/include

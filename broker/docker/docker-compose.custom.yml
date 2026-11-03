@@ -16,6 +16,7 @@
 #       --build-context rune-protocol=../protocol --build-context flight-recorder=${FLIGHT_RECORDER_DIR:-../../flight-recorder} \
 #       --build-context arcanum-metrics=${ARCANUM_METRICS_DIR:-../../arcanum-metrics} \
 #       --build-context rune-codec=../codec --build-context rune-crypto=../crypto \
+#       --build-context aeron-recipe=../conan/aeron \
 #       -f docker/Dockerfile -t rune:latest .)
 
 name: rune-cluster

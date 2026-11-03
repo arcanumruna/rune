@@ -167,6 +167,7 @@ client_build_out=$(docker build \
     --build-context rune-ql="${PROJECTS}/ql" \
     --build-context flight-recorder="${FLIGHT_RECORDER_SRC}" \
     --build-context rune-crypto="${PROJECTS}/crypto" \
+    --build-context aeron-recipe="${PROJECTS}/conan/aeron" \
     -t "${CLIENT_IMAGE}" \
     "${CLIENT_REPO}" 2>&1)
 client_build_rc=$?
