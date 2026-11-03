@@ -1,6 +1,6 @@
 // tools/make_player_event_blob.cpp — Phase 2c fixtures: writes player_event.blob, nine_ints.blob and shadow_names.blob into the
 // given directory (default "."), from which CMake generates player_event.gen.h / nine_ints.gen.h for
-// FilterGeneratedTest.  The player_event builder calls duplicate client-cpp/examples/filter/PlayerEventSchema.h
+// FilterGeneratedTest; plus the shadow_locals* blobs for GeneratedLocalNamesTest.  The player_event builder calls duplicate client-cpp/examples/filter/PlayerEventSchema.h
 // (the codec cannot include client files); a pinned literal fingerprint in both test suites keeps them equal.
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
@@ -40,6 +40,28 @@ int main(int argc, char* argv[]) {
     const auto nineInts = nb.build();
     // fields named like the locals of the generated Filter::encodeTo: they must still compile (this->name).
     const auto shadow = DescriptorBuilder("shadow_names").add("w", PrimType::UInt32).add("out", PrimType::UInt32).build();
+    // fields named like every local / parameter / private member the generated struct, Encoder and Decoder emit: each
+    // must still compile and round-trip (the generated names end in '_', which no field name may).
+    const auto locals = DescriptorBuilder("shadow_locals")
+        .add("record", PrimType::UInt64, 1, /*isKey=*/true)
+        .add("n", PrimType::Int64).add("r", PrimType::UInt32).add("bl", PrimType::UInt16).add("ver", PrimType::UInt16)
+        .addFixedStr("row", 8).add("p", PrimType::Int64).add("buf", PrimType::UInt32).add("wr16", PrimType::UInt16)
+        .add("wr32", PrimType::UInt32).add("wr64", PrimType::UInt64).add("_tmp", PrimType::Float64).add("at", PrimType::Int32)
+        .add("v", PrimType::Int32).add("i", PrimType::Int32).add("w", PrimType::UInt32).add("out", PrimType::UInt32)
+        .add("b", PrimType::Bool).add("pos", PrimType::String).add("len", PrimType::Bytes)
+        .build();
+    const auto localsFixed = DescriptorBuilder("shadow_locals_fixed")
+        .add("v", PrimType::UInt64, 1, /*isKey=*/true)
+        .add("n", PrimType::Int64).add("r", PrimType::UInt32).add("bl", PrimType::UInt16).add("ver", PrimType::UInt16)
+        .addFixedStr("row", 8).add("p", PrimType::Int64).add("_tmp", PrimType::Float64).add("buf", PrimType::UInt32)
+        .add("rec", PrimType::UInt32).add("keyValue", PrimType::UInt32).add("Rebind", PrimType::UInt32)
+        .add("off", PrimType::UInt32).add("w", PrimType::UInt32).add("i", PrimType::UInt32).add("s", PrimType::Int32)
+        .build();
+    const auto localsStrKey = DescriptorBuilder("shadow_locals_str_key")
+        .addFixedStr("s", 8, 1, /*isKey=*/true).add("v", PrimType::Int64)
+        .build();
     return writeBlob(dir + "/player_event.blob", playerEvent) && writeBlob(dir + "/nine_ints.blob", nineInts) &&
-                   writeBlob(dir + "/shadow_names.blob", shadow) ? 0 : 1;
+                   writeBlob(dir + "/shadow_names.blob", shadow) && writeBlob(dir + "/shadow_locals.blob", locals) &&
+                   writeBlob(dir + "/shadow_locals_fixed.blob", localsFixed) &&
+                   writeBlob(dir + "/shadow_locals_str_key.blob", localsStrKey) ? 0 : 1;
 }
