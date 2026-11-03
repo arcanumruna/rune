@@ -174,9 +174,10 @@ inline void verdictFeedBegin(void* state, int64_t, int64_t target) noexcept {
 
 inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int64_t base) noexcept {
     auto& s = *static_cast<PartitionWriteState*>(state);
-    const int type = cr::recordType(b, len);
-    if (type == cr::kVerdictMarker) {
-        const auto m = cr::parseMarker(b, len);
+    const auto c = cr::parseControl(b, len);   // one CRC per batch (#804)
+    if (!c) return;
+    if (c->type == cr::kVerdictMarker) {
+        const auto m = cr::parseMarker(*c);
         if (!m) return;
         if (s.rejected.capacity() == 0) s.rejected.reserve(kIndexReserve);
         s.rejected.onMarker(m->header.fromOffset, m->header.finalThrough, m->header.count, [&](std::size_t i) {
@@ -186,11 +187,11 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
             s.markers.onHw(std::min(base, s.scanHw));
             (void)s.markers.onMarker(base, m->header.finalThrough);   // still full: 1024 uncommitted markers above the HW, the leader re-marks
         }
-    } else if (type == cr::kConstraintSetChange) {
+    } else if (c->type == cr::kConstraintSetChange) {
         std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
         uint32_t id = 0;
         uint16_t count = 0;
-        if (!cr::parseConstraintSetChange(b, len, id, wire, count)) return;
+        if (!cr::parseConstraintSetChange(*c, id, wire, count)) return;
         ConstraintSet set;
         set.id = id;
         set.count = static_cast<uint8_t>(count);

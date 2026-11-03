@@ -238,25 +238,27 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             const int64_t base = r.baseOffset();
             if (base >= scanEnd) break;
             const int64_t pid  = r.producerId();
-            if (pid < 0 && isControlBatch(r)) {   // a checked-writes control record (16-19)
-                switch (cr::recordType(buf.data() + pos, static_cast<std::size_t>(total))) {
-                case cr::kVerdictMarker:
-                    if (const auto m = cr::parseMarker(buf.data() + pos, static_cast<std::size_t>(total))) {
-                        verdictEntries.clear();
-                        for (uint32_t i = 0; i < m->header.count; ++i)
-                            verdictEntries.push_back(RejectedOffsetIndex::Entry{m->offsetAt(i), m->codeAt(i), m->constraintIdAt(i)});
-                        verdicts.onVerdictMarker(base, m->header.fromOffset, m->header.finalThrough, verdictEntries);
+            if (pid < 0 && isControlBatch(r)) {   // a checked-writes control record (16-19): validated once (#804)
+                if (const auto c = cr::parseControl(buf.data() + pos, static_cast<std::size_t>(total))) {
+                    switch (c->type) {
+                    case cr::kVerdictMarker:
+                        if (const auto m = cr::parseMarker(*c)) {
+                            verdictEntries.clear();
+                            for (uint32_t i = 0; i < m->header.count; ++i)
+                                verdictEntries.push_back(RejectedOffsetIndex::Entry{m->offsetAt(i), m->codeAt(i), m->constraintIdAt(i)});
+                            verdicts.onVerdictMarker(base, m->header.fromOffset, m->header.finalThrough, verdictEntries);
+                        }
+                        break;
+                    case cr::kConstraintSetChange: {
+                        std::array<cr::ChangeMember, 32> wire{};
+                        uint32_t id = 0;
+                        uint16_t count = 0;
+                        if (cr::parseConstraintSetChange(*c, id, wire, count)) verdicts.onConstraintSetChange(base, count != 0);
+                        break;
                     }
-                    break;
-                case cr::kConstraintSetChange: {
-                    std::array<cr::ChangeMember, 32> wire{};
-                    uint32_t id = 0;
-                    uint16_t count = 0;
-                    if (cr::parseConstraintSetChange(buf.data() + pos, static_cast<std::size_t>(total), id, wire, count)) verdicts.onConstraintSetChange(base, count != 0);
-                    break;
-                }
-                case cr::kReservation: verdicts.onReservation(base); break;
-                default: break;
+                    case cr::kReservation: verdicts.onReservation(base); break;
+                    default: break;
+                    }
                 }
             }
             if (base >= toOffset) { pos += static_cast<std::size_t>(total); continue; }   // above it only the control records above are read
@@ -292,7 +294,8 @@ MarkerAction markerAction(const rune::protocol::RecordBatchReader& r, const uint
                           Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts, int64_t nowMs) {
     if (nowMs < 0 || batchLastOffset >= cleanBoundaryOffset) return MarkerAction::Keep;
     if (r.producerId() < 0) {   // a checked-writes control record (16-19): its own rules
-        const int type = rune::storage::control_record::recordType(batch, len);
+        const auto c = rune::storage::control_record::parseControl(batch, len);
+        const int type = c ? c->type : rune::storage::control_record::kUnparseable;
         if (type == rune::storage::control_record::kUnparseable || verdicts == nullptr ||
             verdicts->keepsControlRecord(r.baseOffset(), static_cast<int16_t>(type)))
             return MarkerAction::Keep;

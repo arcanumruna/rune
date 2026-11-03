@@ -836,14 +836,13 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
                     out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[20]), false});
                 });
             } else if (r.baseOffset() < through) {
-                const int t = crl::recordType(b, total);
-                if (t == crl::kConstraintSetChange) {
+                if (const auto c = crl::parseControl(b, total); c && c->type == crl::kConstraintSetChange) {
                     std::array<crl::ChangeMember, 32> ms{};
                     uint32_t setId = 0; uint16_t n = 0;
-                    if (crl::parseConstraintSetChange(b, total, setId, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n)});
-                } else if (t == crl::kVerdictMarker) {
-                    VerdictRig::RigMarker m{r.baseOffset(), *crl::parseMarkerHeader(b, total), {}, r.hasDeleteHorizon()};
-                    (void)crl::forEachMarkerEntry(b, total, [&](int64_t o, uint16_t c, uint32_t cid) { m.entries.emplace_back(o, c, cid); });
+                    if (crl::parseConstraintSetChange(*c, setId, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n)});
+                } else if (c && c->type == crl::kVerdictMarker) {
+                    VerdictRig::RigMarker m{r.baseOffset(), *crl::parseMarkerHeader(*c), {}, r.hasDeleteHorizon()};
+                    (void)crl::forEachMarkerEntry(*c, [&](int64_t o, uint16_t cc, uint32_t cid) { m.entries.emplace_back(o, cc, cid); });
                     out.markers.push_back(std::move(m));
                 }
             }

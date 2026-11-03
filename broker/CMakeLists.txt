@@ -582,7 +582,8 @@ if(BUILD_BENCHMARKS)
         benchmark/AuthCheckBench.cpp
         benchmark/PeerFrameBench.cpp
         benchmark/RebalanceFailoverBench.cpp
-        benchmark/FilterPushBench.cpp)
+        benchmark/FilterPushBench.cpp
+        benchmark/VerdictFeedBench.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     # FilterPushBench reuses the filter test fakes (player_event rows and batches) and the shared example schema.
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_CLIENT_ROOT}/examples)
