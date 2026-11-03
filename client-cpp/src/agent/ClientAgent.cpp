@@ -836,14 +836,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     // I2: a WorkerBindAck (87) is plaintext BY CONTRACT even on an encrypted session (it carries only the session id and
     // the bind's correlation id, no secret) and is not an ingress template (checkFrame refuses it): handled here, before
     // the sealed-session filter, and only an exact (sid, corr) match of a Sent bind changes anything.
-    if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE &&
-        rune::protocol::client::detail::getLE16(buf, 2) == rune::protocol::client::WorkerBindAck::TEMPLATE_ID) {
-        onWorkerBindAck_(buf, len);
-        return;
-    }
+    // #765: the template id is read ONCE and reused by the ack branch and the sealed-session peek below.
     if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE) {
-        const auto peekedTid = static_cast<codec::TemplateId>(
-            rune::protocol::client::detail::getLE16(buf, 2));
+        const uint16_t tid = rune::protocol::client::detail::getLE16(buf, 2);
+        if (tid == rune::protocol::client::WorkerBindAck::TEMPLATE_ID) {
+            onWorkerBindAck_(buf, len);
+            return;
+        }
+        const auto peekedTid = static_cast<codec::TemplateId>(tid);
         if (peekedTid != codec::TemplateId::ConnectResponse &&
             peekedTid != codec::TemplateId::HandshakeContinueResponse) {
             const int64_t sid = rune::protocol::client::detail::getLE64(buf, 8);
