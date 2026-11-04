@@ -2091,6 +2091,33 @@ TEST(ClientConfigRegression, NegativeTimeoutsAndRetryBudgetsAreRefusedAtConstruc
     })}) << "huge values are saturated, never refused";
 }
 
+// #744: subscribeTimeoutMs (and produceTimeoutMs) at 0 or below would time every subscribe / produce attempt out on its
+// first pass; refused at construction naming the field.  1 and INT64_MAX (saturated by nsAfter) construct.
+// RED: drop the check in validateConfigInPlace.
+TEST(ClientConfigRegression, NonPositiveSubscribeTimeoutIsRefusedAtConstructionRegression) {
+    auto with = [](int32_t in, auto&& set) {
+        rc::ClientConfig c = authCfg(in, "", "");
+        set(c);
+        return c;
+    };
+    for (const int64_t bad : {int64_t{0}, int64_t{-1}}) {
+        try {
+            rc::Client c{with(3894, [bad](auto& cfg) { cfg.subscribeTimeoutMs = bad; })};
+            ADD_FAILURE() << "subscribeTimeoutMs=" << bad << " constructed";
+        } catch (const std::invalid_argument& e) {
+            EXPECT_NE(std::string(e.what()).find("subscribeTimeoutMs"), std::string::npos) << e.what();
+        }
+        try {
+            rc::Client c{with(3894, [bad](auto& cfg) { cfg.produceTimeoutMs = bad; })};
+            ADD_FAILURE() << "produceTimeoutMs=" << bad << " constructed";
+        } catch (const std::invalid_argument& e) {
+            EXPECT_NE(std::string(e.what()).find("produceTimeoutMs"), std::string::npos) << e.what();
+        }
+    }
+    EXPECT_NO_THROW(rc::Client{with(3896, [](auto& c) { c.subscribeTimeoutMs = 1; c.produceTimeoutMs = 1; })});
+    EXPECT_NO_THROW(rc::Client{with(3898, [](auto& c) { c.subscribeTimeoutMs = INT64_MAX; })});
+}
+
 // Issue #115: offerCrypto with the system store, no tlsExpectHost and a gateway channel that names no host would check
 // no name at all - any public certificate for any name would pass.  Refused at construction; a host in the channel, an
 // explicit tlsExpectHost or a pinned CA each make it valid.  RED: drop the tlsHostOfChannel check in validatedConfig.

@@ -94,6 +94,9 @@ void validateConfigInPlace(ClientConfig& c) {
     // A negative timeout or retry budget has no meaning (0 = none / at once); refused, never silently clamped.
     if (c.connectTimeoutMs < 0 || c.pingTimeoutMs < 0 || c.ddlTimeoutMs < 0)
         throw std::invalid_argument("ClientConfig: connectTimeoutMs / pingTimeoutMs / ddlTimeoutMs must be >= 0");
+    // #744: a subscribe / produce attempt with no time at all would time out on its first pass.
+    if (c.subscribeTimeoutMs <= 0 || c.produceTimeoutMs <= 0)
+        throw std::invalid_argument("ClientConfig: subscribeTimeoutMs / produceTimeoutMs must be > 0");
     if (c.ddlRetryBudget.count() < 0 || c.viewReadRetryBudget.count() < 0)
         throw std::invalid_argument("ClientConfig: ddlRetryBudget / viewReadRetryBudget must be >= 0");
     if (c.traceDdlRetries && c.runnerMode != RunnerMode::Invoker)
