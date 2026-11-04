@@ -42,6 +42,7 @@
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/testing/DamageSegmentForTest.h>
 #include <rune/protocol/MetadataRecords.h>
 
 #include <atomic>
@@ -370,6 +371,52 @@ TEST(MetadataReplicationTest, Restart_SnapshotPlusReplayYieldsIdenticalMap) {
         EXPECT_EQ(pa->leaderEpoch,    knownPairs[static_cast<std::size_t>(t)].first);
         EXPECT_EQ(pa->partitionEpoch, knownPairs[static_cast<std::size_t>(t)].second);
     }
+}
+
+// ===========================================================================
+// #839: a DAMAGED middle segment of __cluster_metadata is a hole.  The rebuild must report not-loaded (and leave the
+// controller deciding nothing), never commit a map that is missing the records in the damaged range.
+// ===========================================================================
+TEST(MetadataReplicationTest, RebuildStopsAtDamageRegression) {
+    MrtTempDir dir("damage");
+    rune::storage::Log log(dir.path, /*segmentRollBytes=*/512);
+    log.recover();
+
+    const NodeId selfId = 1;
+    const std::vector<NodeId> nodes = {selfId};
+    InMemoryTransport transport;
+    auto replica = std::make_unique<PartitionReplica>(
+        makeMetaCfg(selfId, /*minIsr=*/1), Role::Leader, /*epoch=*/1, nodes, nodes, &log, &transport);
+    transport.setLeader(replica.get());
+
+    const std::vector<int32_t> isr = {1};
+    const std::vector<int32_t> replicas = {1};
+    constexpr int kRecords = 30;
+    for (int t = 0; t < kRecords; ++t)
+        ASSERT_GE(appendAssignment(replica.get(), t, 0, 1, isr, replicas, 1, t + 1), 0);
+    int64_t clock = 0;
+    for (int i = 0; i < 100 && replica->highWatermark() < kRecords; ++i) {
+        clock += 2'000'000LL;
+        replica->doWork(clock);
+        transport.pump(clock);
+    }
+    ASSERT_GE(replica->highWatermark(), kRecords);
+    ASSERT_GE(log.segmentBaseOffsets().size(), 4u) << "three segments around the damaged one";
+
+    {   // control: the undamaged log loads every assignment
+        MetadataService ok(replica.get(), selfId);
+        ASSERT_TRUE(ok.rebuildFromLog());
+        ASSERT_NE(ok.assignment(0, 0), nullptr);
+        ASSERT_NE(ok.assignment(kRecords - 1, 0), nullptr);
+    }
+    ASSERT_GE(rune::storage::testing::damageSecondBatchOfSegment(dir.path, 1), 0);
+    ASSERT_TRUE(log.reloadSegments());
+    ASSERT_EQ(log.damagedSegmentCount(), 1u);
+
+    MetadataService svc(replica.get(), selfId);
+    EXPECT_FALSE(svc.rebuildFromLog()) << "a damaged segment is a hole: the map must not load around it";
+    EXPECT_EQ(svc.assignment(kRecords - 1, 0), nullptr) << "records behind the damage are not served either";
+    EXPECT_TRUE(svc.haltedForTest()) << "the controller decides nothing on a map with a hole";
 }
 
 // ===========================================================================

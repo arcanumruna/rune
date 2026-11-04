@@ -364,7 +364,8 @@ segment as it is. A sealed segment whose bytes after the last whole, CRC-valid b
 
 - **Kept.** The file is not touched (no truncation, no rename). The broker logs `Log <dir>: segment <base> is DAMAGED at byte <n>
   (offset <o>)` at error level when it finds it (at boot, or when the legacy compactor or the cleaner reloads the segment),
-  and the gauge `rune-log-damaged-segments` counts the damaged segments found at boot. The node still starts.
+  and the gauge `rune-log-damaged-segments` counts the damaged segments found at boot. A node with a damaged **partition**
+  segment still starts; a damaged **system log** refuses to start (below).
 - **Reads fail at the damage.** A read at or after the damaged offset, up to the next segment, is never skipped past. A consumer
   or subscription that reaches it gets `StorageError (26)` ("the stored batch is corrupt (damaged log segment)") and the client
   fails that subscription with `CorruptBatch`; records before the damage and in later segments are served.
@@ -372,6 +373,14 @@ segment as it is. A sealed segment whose bytes after the last whole, CRC-valid b
   and leaves the in-sync set; nothing is repaired automatically.
 - **Cleaner.** The log cleaner refuses a log that has a damaged segment until an operator acts.
 - **Retention.** Retention deletes the damaged segment whole, once it ages out. The size accounting counts only its valid prefix.
+- **System logs refuse to start.** Damage in `__catalog`, `__security`, `__consumer_offsets`, `__transaction_state` or
+  `__cluster_metadata` stops the node at boot: it logs `system log <dir> has a damaged segment at offset <o> - refusing to
+  start`, halts through the storage-failure path (exit 74) and serves nothing. These logs are replayed into the node's
+  state (topics, users and grants, committed group offsets, transactions, partition assignments), so loading around a hole
+  would serve a wrong state. The recovery is to wipe that node's data directory and let it resync from its peers (a
+  single-node cluster restores from a backup). Damage that appears after boot (a reload) makes the same loaders stop
+  instead of skipping: the group coordinator and the transaction coordinator stay unloaded, and the metadata controller
+  decides nothing.
 - **Active segment.** The newest segment is different: a torn tail there is a normal crash artefact and is still cut at the last
   whole batch.
 

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -790,6 +791,12 @@ public:
     /// #839: sealed segments flagged damaged (bytes kept on disk, reads at the damage fail with ReadIntoStatus::Corrupt).
     /// Cold, O(segments); owner thread.
     [[nodiscard]] std::size_t damagedSegmentCount() const noexcept;
+    /// #839: the damage offset when the segment holding `offset` is damaged and `offset` is at or after it (a read there fails
+    /// Corrupt); nullopt otherwise.  For status-less cold readers (system-log loaders) that read empty and would skip to the
+    /// next segment: they must stop instead.  Cold, O(log segments); owner thread / startup.
+    [[nodiscard]] std::optional<int64_t> damageAt(int64_t offset) const noexcept;
+    /// #839: the lowest damage offset over every damaged segment; nullopt when none.  Cold.
+    [[nodiscard]] std::optional<int64_t> firstDamageOffset() const noexcept;
     /// #839: damage detections since construction (boot recovery, reloadSegments, a cleaner-swap reload); monotonic.
     [[nodiscard]] uint64_t damageDetections() const noexcept { return damageDetections_; }
 

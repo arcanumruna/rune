@@ -1059,3 +1059,24 @@ TEST(DamagedSegmentRegression, UnCrcCoveredHeaderFlipIsDamageRegression) {
         EXPECT_EQ(readAt(*rec, f.bases[0]).st, ReadIntoStatus::Ok);
     }
 }
+
+// F2 (#839): damageAt tells a status-less cold reader that an empty read at `offset` is damage, not the end of the segment.
+TEST(DamagedSegmentRegression, DamageAtNamesTheDamageForOffsetsInAndAfterItRegression) {
+    DamagedFixture f("dmg_damageat");
+    f.xorSecondBatch();
+    auto rec = openRecovered(f.dir, kDmgRoll, false);
+    ASSERT_EQ(rec->damagedSegmentCount(), 1u);
+    EXPECT_EQ(rec->damageAt(f.bases[0]), std::nullopt) << "before the damage: readable";
+    EXPECT_EQ(rec->damageAt(f.D - 1), std::nullopt);
+    EXPECT_EQ(rec->damageAt(f.D), f.D);
+    EXPECT_EQ(rec->damageAt(f.D + 1), f.D);
+    EXPECT_EQ(rec->damageAt(f.bases[1] - 1), f.D) << "the rest of the damaged segment";
+    EXPECT_EQ(rec->damageAt(f.bases[1]), std::nullopt) << "the next segment is intact";
+    EXPECT_EQ(rec->damageAt(rec->logEndOffset()), std::nullopt);
+    EXPECT_EQ(rec->damageAt(-5), std::nullopt) << "below the first segment";
+    // A healthy log never reports damage.
+    DamagedFixture g("dmg_damageat_ok");
+    auto ok = openRecovered(g.dir, kDmgRoll, false);
+    EXPECT_EQ(ok->damagedSegmentCount(), 0u);
+    for (int64_t o = g.bases[0]; o < ok->logEndOffset(); ++o) EXPECT_EQ(ok->damageAt(o), std::nullopt);
+}

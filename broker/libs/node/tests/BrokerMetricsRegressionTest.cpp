@@ -180,6 +180,7 @@ TEST(ViewBackupRestoreDocRegression, RestoreTableNamesEveryReasonAndForbidsLegac
 #include <rune/node/RuneMetrics.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/testing/DamageSegmentForTest.h>
 
 #include "support/TestCluster.h"
 
@@ -190,6 +191,8 @@ TEST(ViewBackupRestoreDocRegression, RestoreTableNamesEveryReasonAndForbidsLegac
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -248,6 +251,44 @@ std::int64_t headerStartEpochNs(const metrics::MetricsFile& f) {
     std::int64_t v = 0;
     std::memcpy(&v, static_cast<const std::byte*>(f.base()) + metrics::kHdrStartEpochNsOffset, sizeof(v));
     return v;
+}
+
+// #839: the halt handler of an owner (the test): records the exit code the node halted with.
+struct HaltCapture {
+    std::mutex m;
+    std::condition_variable cv;
+    int code = 0;
+    static void handler(void* ctx, int exitCode) noexcept {
+        auto* self = static_cast<HaltCapture*>(ctx);
+        { std::lock_guard<std::mutex> g(self->m); self->code = exitCode; }
+        self->cv.notify_all();
+    }
+    int await(std::chrono::milliseconds cap) {
+        std::unique_lock<std::mutex> l(m);
+        cv.wait_for(l, cap, [this] { return code != 0; });
+        return code;
+    }
+};
+
+// #839: writes >= 3 segments (cleanly closed: the recovery point reaches the log end, so the sealed ones recover KEEPING
+// damage) into `logDir` with a standalone Log, then flips a byte inside the 2nd batch of segment 0.  The log's content is
+// not a valid system-log format - the refusal must fire before any loader reads it.
+void writeDamagedSealedLog(const fs::path& logDir, int64_t roll) {
+    fs::create_directories(logDir);
+    {
+        rune::storage::Log raw(logDir.string(), roll);
+        raw.recover();
+        raw.setEpochHistoryCap(INT64_MAX);
+        raw.setDeferSealSync(false);
+        for (int64_t v = 0; raw.segmentBaseOffsets().size() < 3 && v < 10'000; ++v) {
+            rune::protocol::RecordBatchBuilder b(raw.logEndOffset(), 1000);
+            b.append(std::string_view("k"), std::string_view("value-" + std::to_string(v)), 1000);
+            const auto batch = b.build();
+            raw.append(batch, raw.logEndOffset());
+        }
+        raw.sync();
+    }
+    ASSERT_GE(rune::storage::testing::damageSecondBatchOfSegment(logDir.string(), 0), 0);
 }
 
 std::string startError(NodeConfig cfg) {
@@ -504,6 +545,40 @@ TEST(BrokerMetricsRegression, DamagedSegmentsGaugeCountsBootDamageRegression) {
     EXPECT_EQ(node.bootDamagedSegmentsForTest(), 1);
     EXPECT_TRUE(awaitMetric(node, RuneMetric::DamagedSegments, 1));
     node.stop();
+}
+
+
+// #839 (F2): a damaged sealed segment in a SYSTEM log (their loaders replay state from the log and must never load around a
+// hole) refuses the start: critical line, halt path (exit 74), nothing served.  One leg per system log.  The logs are
+// written by a standalone Log before the first boot; the refusal fires right after each log is recovered, before its first
+// reader, so the content need not be a valid system-log format.
+TEST(BrokerMetricsRegression, DamagedSystemLogRefusesStartRegression) {
+    for (const char* leg : {"__consumer_offsets", "__transaction_state", "__cluster_metadata", "__catalog", "__security"}) {
+        SCOPED_TRACE(leg);
+        MetricsTempDir tmp{std::string("sysdmg_")};
+        NodeConfig cfg = singleNode(tmp.path);
+        cfg.offsetLogSegmentRollBytes = 2048;
+        {   // a first boot writes node-state.dat / term.log (a data dir without them is refused as partly deleted)
+            BrokerNode first{cfg};
+            first.start();
+            ASSERT_TRUE(first.awaitLeader(10s));
+            first.stop();
+        }
+        fs::remove_all(tmp.path / leg);   // replaced by a standalone Log's damaged multi-segment log
+        ASSERT_NO_FATAL_FAILURE(writeDamagedSealedLog(tmp.path / leg, 2048));
+        BrokerNode node{cfg};
+        HaltCapture halt;
+        node.setHaltHandler(&HaltCapture::handler, &halt);
+        try {
+            node.start();
+            ADD_FAILURE() << "a damaged system log never serves";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("damaged segment"), std::string::npos) << e.what();
+        }
+        EXPECT_EQ(halt.await(1000ms), BrokerNode::kExitStorageFailure) << "through the halt path (exit 74)";
+        EXPECT_EQ(node.bootDamagedSegmentsForTest(), 1) << "the boot gauge counts the damage before the refusal";
+        node.stop();
+    }
 }
 
 #endif  // RUNE_BROKER_METRICS_NODE_TESTS

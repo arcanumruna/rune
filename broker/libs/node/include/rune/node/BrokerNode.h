@@ -2939,6 +2939,11 @@ private:
     bool                                         haltRaised_  = false;   // runtime thread only
     void onStorageFailure_(const std::string& logDir, int err);
     void refuseStartOnFailedRecovery_();
+    /// #839: a damaged segment in a system log (__catalog, __security, __consumer_offsets, __transaction_state,
+    /// __cluster_metadata) refuses the start (exit 74): their loaders replay state from the log and must never load around a
+    /// hole.  Called right after each of those logs is recovered, before its first reader.  Throws SystemLogDamaged.
+    struct SystemLogDamaged : std::runtime_error { using std::runtime_error::runtime_error; };
+    void refuseStartOnDamagedSystemLog_();
     void onInvariantViolation_(const std::string& what);
     int  recoveryFaultForTest_ = 0;
     bool skipProvisionerRunnerForTest_ = false;

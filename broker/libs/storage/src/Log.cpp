@@ -1417,6 +1417,22 @@ std::size_t Log::damagedSegmentCount() const noexcept {
     return n;
 }
 
+std::optional<int64_t> Log::damageAt(int64_t offset) const noexcept {
+    auto it = segments_.upper_bound(offset);   // first segment based above `offset`
+    if (it == segments_.begin()) return std::nullopt;
+    --it;   // the segment holding offset: base <= offset < next base (or the last segment)
+    if (!it->second || !it->second->damaged()) return std::nullopt;
+    const int64_t at = it->second->damage()->offset;
+    if (offset < at) return std::nullopt;
+    return at;
+}
+
+std::optional<int64_t> Log::firstDamageOffset() const noexcept {
+    for (const auto& [b, seg] : segments_)   // ascending base: the first damaged segment holds the lowest offset
+        if (seg && seg->damaged()) return seg->damage()->offset;
+    return std::nullopt;
+}
+
 void Log::validateFromRecoveryPoint_(int64_t rp, bool deleteOnGap) {
     // Trusted region: segments whose end (= the next segment's base) is at or
     // below rp — CRC-recovered (a torn tail there is KEPT and flagged, #839), never

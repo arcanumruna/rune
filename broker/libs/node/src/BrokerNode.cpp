@@ -1966,6 +1966,24 @@ void BrokerNode::onInvariantViolation_(const std::string& what) {
     std::_Exit(kExitInvariantViolation);
 }
 
+void BrokerNode::refuseStartOnDamagedSystemLog_() {
+    rune::storage::Log* first = nullptr;
+    int64_t damaged = 0;
+    for (auto* l : {catalogLog_.get(), securityLog_.get(), offsetLog_.get(), txnLog_.get(), metadataLog_.get()}) {
+        if (!l || l->damagedSegmentCount() == 0) continue;
+        damaged += static_cast<int64_t>(l->damagedSegmentCount());
+        if (!first) first = l;
+    }
+    if (!first) return;
+    // The boot gauge counts first (refuseStartOnFailedRecovery_ never runs on this path), then the refusal fires.
+    bootDamagedSegments_ = damaged;
+    controlSet_(RuneMetric::DamagedSegments, damaged);
+    spdlog::critical("BrokerNode[{}]: system log {} has a damaged segment at offset {} - refusing to start", config_.nodeId,
+                     first->dir(), first->firstDamageOffset().value_or(-1));
+    onStorageFailure_(first->dir(), EIO);   // halt path: handler (exit 74) or _Exit(74)
+    throw SystemLogDamaged("BrokerNode: system log " + first->dir() + " has a damaged segment - refusing to start");
+}
+
 void BrokerNode::refuseStartOnFailedRecovery_() {
     // Every log this node will serve — registry replicas AND the logs outside
     // the registry (__catalog; the internal offset / txn / metadata logs; every
@@ -2309,6 +2327,7 @@ void BrokerNode::buildGateway() {
             offsetLog_ = std::make_unique<rune::storage::Log>(
                 offsetDir.string(), config_.offsetLogSegmentRollBytes);
             offsetLog_->recover();
+            refuseStartOnDamagedSystemLog_();   // #839: before offsetStore_->rebuildFromLog() (its first reader)
 
             // Wrap in a PartitionReplica for the __consumer_offsets topic.
             // topicId=-1 is the sentinel for the offset log (not a user topic).
@@ -2425,6 +2444,8 @@ void BrokerNode::buildGateway() {
 
             spdlog::info("BrokerNode[{}]: GroupCoordinationService wired (offsets at {})",
                          nodeId, offsetDir.string());
+        } catch (const SystemLogDamaged&) {
+            throw;   // #839: a damaged system log refuses the start; never "group consumers will not work"
         } catch (const std::exception& ex) {
             spdlog::error("BrokerNode[{}]: GroupCoordinationService setup failed: {}; "
                           "group consumers will not work", nodeId, ex.what());
@@ -2452,6 +2473,7 @@ void BrokerNode::buildGateway() {
 
             txnLog_ = std::make_unique<rune::storage::Log>(txnDir.string(), config_.offsetLogSegmentRollBytes);
             txnLog_->recover();
+            refuseStartOnDamagedSystemLog_();   // #839: before the txn store's rebuild (its first reader)
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
 
@@ -2589,6 +2611,8 @@ void BrokerNode::buildGateway() {
 
             spdlog::info("BrokerNode[{}]: TransactionCoordinationService wired (txn state at {})",
                          nodeId, txnDir.string());
+        } catch (const SystemLogDamaged&) {
+            throw;   // #839
         } catch (const std::exception& ex) {
             spdlog::error("BrokerNode[{}]: TransactionCoordinationService setup failed: {}; "
                           "transactions will not work", nodeId, ex.what());
@@ -2638,6 +2662,7 @@ void BrokerNode::buildGateway() {
 
             metadataLog_ = std::make_unique<rune::storage::Log>(metaDir.string(), config_.offsetLogSegmentRollBytes);
             metadataLog_->recover();
+            refuseStartOnDamagedSystemLog_();   // #839: before metadataService_->rebuildFromLog() (its first reader)
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
 
@@ -2824,6 +2849,8 @@ void BrokerNode::buildGateway() {
             // the catalog leader; data ops per partition).  Never inferred from
             // the routing image, which an empty cluster never has.
             gateway_->setSessionAdmission(rune::gateway::ClientGateway::SessionAdmission::AnyNode);
+        } catch (const SystemLogDamaged&) {
+            throw;   // #839
         } catch (const std::exception& ex) {
             spdlog::error("BrokerNode[{}]: MetadataService setup failed: {}; "
                           "cluster metadata will not be tracked", nodeId, ex.what());
@@ -4039,6 +4066,7 @@ void BrokerNode::bootFromCatalog_() {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog recovery failed "
                                  "(storage error " + std::to_string(catalogLog_->storageErrno()) + ") at " +
                                  dir.string() + " — refusing to start before the boot replay");
+    refuseStartOnDamagedSystemLog_();   // #839: before the boot replay (its first reader)
     // Never compacted / retention-deleted: a recovered catalog always starts at
     // 0 — a follower can never be "below the leader's start".  Anything else is
     // a damaged (or foreign) directory: refuse loudly instead of serving it.
@@ -4298,6 +4326,7 @@ void BrokerNode::bootFromSecurity_() {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security recovery failed "
                                  "(storage error " + std::to_string(securityLog_->storageErrno()) + ") at " +
                                  dir.string() + " - refusing to start");
+    refuseStartOnDamagedSystemLog_();   // #839: before the boot replay (its first reader)
     // Never compacted / retention-deleted: a recovered security log always starts at 0.
     if (securityLog_->logStartOffset() != 0)
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security at " + dir.string() +
