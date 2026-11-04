@@ -6670,6 +6670,9 @@ private:
             if (r == nullptr || !r->isDiskBacked()) continue;
             const rune::storage::Log* l = r->log();
             if (l == nullptr || l->nsSlot() >= nsDiskBytes_.size()) continue;
+            // #724: internal topics (topicId < 0) belong to no namespace, and a retiring log whose slot was reused by another
+            // namespace must not be charged to the new owner: charge only while the slot still holds the log's nsId.
+            if (r->topicId() < 0 || !nsSlots_.matches(l->nsSlot(), l->nsId())) continue;
             nsDiskBytes_[l->nsSlot()] += l->bytesOnDisk();
         }
     }

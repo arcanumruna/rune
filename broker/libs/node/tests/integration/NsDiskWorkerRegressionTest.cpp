@@ -194,3 +194,43 @@ TEST(OverDiskRegression, ScanEqualsLogBytesRegression) {
     EXPECT_EQ(rig.worker().nsDiskBytesForTest(0), 0) << "another slot is not charged";
     EXPECT_FALSE(rig.worker().nsOverDiskForTest(kSlot)) << "0 = unlimited";
 }
+
+namespace {
+/// Append ~1 MiB straight to the rig's log (no worker pass: only the disk accounting is under test).
+void write1MiB(Rig& rig) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    b.append("k", std::string(1 << 20, 'x'), 1000);
+    const auto v = b.build();
+    ASSERT_GE(rig.log->append(v, 0), 0);
+    ASSERT_GE(rig.log->bytesOnDisk(), 1 << 20);
+}
+}  // namespace
+
+// #724: the disk scan charged a log's bytes to its slot without checking the slot still belongs to the log's namespace, and
+// charged internal topics to slot 0.
+TEST(NsDiskWorkerRegression, ReusedSlotAndInternalTopicNotChargedRegression) {
+    {
+        Rig rig;
+        rig.log->setNsTag(7, 2);
+        write1MiB(rig);
+        rune::protocol::NamespaceLimits l;
+        rig.worker().applyNsSlotAssignDirect(2, 7, l);
+        rig.worker().scanNamespaceDiskForTest(rig.now);
+        ASSERT_GE(rig.worker().nsDiskBytesForTest(2), 1 << 20) << "the owner is charged";
+        ASSERT_TRUE(rig.worker().applyNsSlotReleaseDirect(2, 7));
+        rig.worker().applyNsSlotAssignDirect(2, 9, l);   // the slot is reused; the retiring log still carries nsId 7
+        rig.worker().scanNamespaceDiskForTest(rig.now);
+        EXPECT_EQ(rig.worker().nsDiskBytesForTest(2), 0) << "the retiring log of namespace 7 is not charged to namespace 9";
+    }
+    {
+        Rig rig(false, 64 * 1024 * 1024, nullptr, false, false, /*partitionTopicId=*/-3);
+        rig.log->setNsTag(0, 0);
+        write1MiB(rig);
+        // The pool never hands a topicId < 0 partition to a worker; put it in the owned set directly so the scan's own guard is
+        // what is under test (slot 0 holds nsId 0, so the slot check alone would charge it).
+        rig.worker().setOwnedDirect({rig.rep});
+        ASSERT_EQ(rig.rep->topicId(), -3);
+        rig.worker().scanNamespaceDiskForTest(rig.now);
+        EXPECT_EQ(rig.worker().nsDiskBytesForTest(0), 0) << "an internal topic (topicId < 0) is not charged to default";
+    }
+}
