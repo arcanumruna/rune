@@ -136,6 +136,43 @@ TEST(PeerLinkFanoutRegression, EveryEpochReachesAWorkerInOrderAcrossBackPressure
     }
 }
 
+// Issue #540: a later epoch of a peer never reaches a worker before an earlier epoch of that peer did.  In production
+// worker 1's ring can drain (its own thread) between E1's attempt and E2's attempt inside ONE pump call; the fake pool
+// models that: worker 1 answers Full once (for E1) and accepts afterwards.  E2 must still not reach worker 1 first.
+// Mutation: PeerLinkFanout::pumpWith `upTo = pool->workerCount()` (ignoring workerLimit) -> worker 1 gets {E2} first.
+namespace {
+struct FakeWorker {
+    std::vector<uint32_t> epochs;
+    int fullBudget = 0;
+    EnqueueResult enqueueOp(const WorkerOp& op) {
+        if (fullBudget > 0) { --fullBudget; return EnqueueResult::Full; }
+        epochs.push_back(static_cast<uint32_t>(op.partition));
+        return EnqueueResult::Enqueued;
+    }
+};
+struct FakePool {
+    FakeWorker workers[2];
+    int32_t workerCount() const { return 2; }
+    FakeWorker& worker(int32_t w) { return workers[w]; }
+};
+} // namespace
+
+TEST(PeerLinkFanoutRegression, OrderingLimitHoldsALaterEpochBehindAnEarlierOneRegression) {
+    FakePool pool;
+    pool.workers[1].fullBudget = 1;
+    PeerLinkFanout f;
+    f.post(2, keysAt(1, 1));
+    f.post(2, keysAt(2, 2));
+    (void)f.pumpWith(&pool, nullptr);
+    EXPECT_EQ(pool.workers[0].epochs, (std::vector<uint32_t>{1, 2}));
+    EXPECT_TRUE(pool.workers[1].epochs.empty()) << "E2 reached worker 1 before E1 did";
+    EXPECT_EQ(f.pendingForTest(), 2u);
+    (void)f.pumpWith(&pool, nullptr);
+    EXPECT_EQ(pool.workers[1].epochs, (std::vector<uint32_t>{1, 2}));
+    EXPECT_EQ(pool.workers[0].epochs, (std::vector<uint32_t>{1, 2})) << "no duplicate to worker 0";
+    EXPECT_EQ(f.pendingForTest(), 0u);
+}
+
 // Issue #540: more than kEpochSlots epochs pending for one peer - a destination would evict the oldest anyway, so the
 // fanout drops (scrubs) the oldest pending entry and delivers the newest kEpochSlots in order.
 TEST(PeerLinkFanoutRegression, MoreThanKEpochSlotsPendingDropsTheOldestRegression) {

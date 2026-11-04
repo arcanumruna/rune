@@ -53,7 +53,12 @@ public:
     }
 
     /// Control thread, every duty cycle.  `admin` may be null (no admin thread).  Returns the number delivered.
-    int pump(WorkerPool* pool, OneToOneByteRing* admin) {
+    int pump(WorkerPool* pool, OneToOneByteRing* admin) { return pumpWith<WorkerPool>(pool, admin); }
+
+    /// The pump body, templated on the pool type only as a test seam (a fake pool lets a test drain a ring between two
+    /// attempts of one pump); header-only, no virtuals.
+    template <class Pool>
+    int pumpWith(Pool* pool, OneToOneByteRing* admin) {
         int work = 0;
         for (std::size_t i = 0; i < pending_.size(); ) {
             Pending& p = pending_[i];
