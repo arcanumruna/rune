@@ -680,13 +680,32 @@ TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentRecordsAndDropsThem) {
     drainAll(impl);
     impl.flushBatches(kNow, /*sessionId=*/0, sink);  // no session: nothing is sent
     ASSERT_TRUE(cap.frames.empty());
-    impl.sweepTimedOut(std::chrono::steady_clock::time_point{
-        std::chrono::nanoseconds{kNow + 10'000'000'000LL}});  // deliveryTimeoutMs = 10 s
+    impl.sweepTimedOut(kNow + 10'000'000'000LL);  // deliveryTimeoutMs = 10 s
     ASSERT_EQ(L.times(1), 1);
     EXPECT_EQ(L.value(1), -1);
     EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
     impl.flushBatches(kNow + 10'000'000'001LL, 42, sink);
     EXPECT_TRUE(cap.frames.empty()) << "expired records are dropped, never sent after failing";
+}
+
+// #734 part 2: the sweep takes the duty-clock ns the Client hands it - never a wall-clock time_point.  A record
+// accepted at duty time kNow with a 10 s delivery timeout is NOT failed one ns before kNow + 10 s and IS failed at it,
+// whatever the wall clock says (the wall clock here is ~uptime, far from kNow's epoch of 1e12+).
+// RED (mutation): sweeping from steady_clock::now() - the record is failed at once (before its deadline).
+TEST(ProducerSendRegression, SweepTimedOutUsesTheDutyClockRegression) {
+    ProducerImpl impl(ackCfg(8));
+    Capture cap;
+    const auto sink = cap.fn();
+    AckLedger L;
+    L.attach(impl);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(1)));
+    drainAll(impl);
+    impl.flushBatches(kNow, /*sessionId=*/0, sink);   // no session: held until the deadline
+    impl.sweepTimedOut(kNow + 10'000'000'000LL - 1);
+    EXPECT_EQ(L.times(1), 0) << "swept before its duty-clock deadline";
+    impl.sweepTimedOut(kNow + 10'000'000'000LL);
+    ASSERT_EQ(L.times(1), 1);
+    EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
 }
 
 // Tier-2 counterpart: a Tier-2 batch that never left the partition queue (no
@@ -704,8 +723,7 @@ TEST(ProducerAcks, DeliveryTimeoutFailsNeverSentTier2BatchesAndDropsThemRegressi
     drainAll(*impl);
     impl->flushBatches(kNow, /*sessionId=*/0, sink);
     ASSERT_TRUE(cap.frames.empty());
-    impl->sweepTimedOut(std::chrono::steady_clock::time_point{
-        std::chrono::nanoseconds{kNow + 10'000'000'000LL}});
+    impl->sweepTimedOut(kNow + 10'000'000'000LL);
     ASSERT_EQ(L.times(1), 1);
     EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
     impl->flushBatches(kNow + 10'000'000'001LL, 42, sink);

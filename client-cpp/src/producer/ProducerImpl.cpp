@@ -3307,9 +3307,7 @@ void ProducerImpl::failBatch(int64_t corrId) {
     }
 }
 
-void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
-    const int64_t nowNs =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+void ProducerImpl::sweepTimedOut(int64_t nowNs) {
     lastNowNs_ = nowNs;  // the duty-cycle clock (Client passes its own now)
     retryStatus_();  // FD9: a refused identity snapshot is re-offered (cold, once per sweep)
     const DutyScope duty(*this);  // fix1 C1: failure callbacks below defer their retries

@@ -301,7 +301,7 @@ struct Rig {
     void answer(const test_support::AnswerFrame& f) {
         ASSERT_TRUE(hub.onCoordinatorResponse(f.templateId, f.data(), f.len, now));
     }
-    void sweep() { impl->sweepTimedOut(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(now))); }
+    void sweep() { impl->sweepTimedOut(now); }
 
     // ---- AddPartitionsToTxn ----
     [[nodiscard]] std::vector<const OfferedFrame*> adds() const {

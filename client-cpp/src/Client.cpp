@@ -3799,8 +3799,7 @@ void Client::sweepTimeouts(int64_t nowNs) {
     // Producer deadlines are on the duty-cycle clock (injected in tests): any
     // pending ProduceResponse ack older than produceTimeoutMs is failed so
     // futures/callbacks never hang.
-    producerHub_.sweepTimedOut(
-        std::chrono::steady_clock::time_point{std::chrono::nanoseconds{nowNs}});
+    producerHub_.sweepTimedOut(nowNs);
 
     // No-progress backstop (moved from the per-cycle drain hook; the refresh it arms
     // is itself backoff-gated at >= 100 ms, so the 100 ms sweep cadence loses nothing):

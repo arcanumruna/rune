@@ -280,10 +280,10 @@ bool ProducerHub::hasInFlight() const noexcept {
     return false;
 }
 
-void ProducerHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
+void ProducerHub::sweepTimedOut(int64_t nowNs) {
     for (ProducerImpl* impl : active_) {
         if (impl == nullptr) continue;
-        impl->sweepTimedOut(now);
+        impl->sweepTimedOut(nowNs);
     }
 }
 
