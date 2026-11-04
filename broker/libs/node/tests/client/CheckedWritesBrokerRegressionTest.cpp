@@ -644,7 +644,7 @@ TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShar
     Sender tx(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All, "tx-cw");
     tx.prod->initTransactionsAndWait(30s);
     tx.prod->beginTransaction();
-    (void)tx.send(1);
+    ASSERT_TRUE(isOk(tx.await(tx.send(1), 10s))) << "premise: the open transaction's record is in the log";
     Sender parked(b.clientConfig(), "acct", f.topicId, 1, kAllView);
     EXPECT_TRUE(isOk(parked.await(parked.send(2), 10s))) << "the View send acks before the open transaction commits";
     tx.prod->commitTransactionAndWait(30s);
