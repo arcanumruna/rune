@@ -149,7 +149,13 @@ struct Sim {
     }
 
     /// Lossless quiescence: drain everything, tick past every retry, until both ends seal under the same epoch.
-    bool converge() {
+    bool converge() { return converge_(false); }
+    /// Issue #545 only: like converge(), but a responder-side unconfirmed Accept that its initiator ABANDONED (kAwaitNs
+    /// old, no longer re-sent, never the send epoch) is also a converged state.  Every other test uses converge().
+    bool convergeAllowingAbandonedAccept() { return converge_(true); }
+
+private:
+    bool converge_(bool allowAbandonedAccept) {
         for (int round = 0; round < 64 && failure.empty(); ++round) {
             seal(0); seal(1);
             while ((!hsTo[0].empty() || !hsTo[1].empty() || !data.empty()) && failure.empty()) {
@@ -158,12 +164,11 @@ struct Sim {
             }
             now += pl::PeerHandshake::kRetryNs;
             tick();
-            // Issue #545: the Accept is either confirmed, or abandoned (kAwaitNs old, no longer re-sent) and never
-            // became the send epoch.
             const auto* eb = std::get_if<pl::Established>(&b.hs.state());
             if (data.empty() && hsTo[0].empty() && hsTo[1].empty() && eb &&
-                (!eb->unconfirmedAccept || (now - eb->sinceNs >= pl::PeerHandshake::kAwaitNs &&
-                                            eb->keys.epoch != b.crypto.currentEpoch(1))) &&
+                (!eb->unconfirmedAccept ||
+                 (allowAbandonedAccept && now - eb->sinceNs >= pl::PeerHandshake::kAwaitNs &&
+                  eb->keys.epoch != b.crypto.currentEpoch(1))) &&
                 std::holds_alternative<pl::Established>(a.hs.state()) && a.crypto.currentEpoch(2) == b.crypto.currentEpoch(1))
                 return true;
         }
@@ -242,7 +247,7 @@ TEST(PeerLinkAdversarialRegression, AnAbandonedUnconfirmedAcceptStopsBeingResent
     EXPECT_GE(accepts, 1);
     // A new exchange replaces the stale unconfirmed epoch and both ends converge on it.
     s.absorb(0, s.a.hs.rekeyForTest(s.now));
-    ASSERT_TRUE(s.converge()) << s.describe();
+    ASSERT_TRUE(s.convergeAllowingAbandonedAccept()) << s.describe();
     const auto* eb = estOf(s.b.hs);
     ASSERT_TRUE(eb);
     EXPECT_FALSE(eb->unconfirmedAccept);
