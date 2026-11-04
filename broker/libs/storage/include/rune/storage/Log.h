@@ -787,6 +787,12 @@ public:
     /// lineage (MAJOR-2 observability).  Owner thread.
     [[nodiscard]] uint64_t staleCleanerOpsDropped() const noexcept { return staleCleanerOps_; }
 
+    /// #839: sealed segments flagged damaged (bytes kept on disk, reads at the damage fail with ReadIntoStatus::Corrupt).
+    /// Cold, O(segments); owner thread.
+    [[nodiscard]] std::size_t damagedSegmentCount() const noexcept;
+    /// #839: damage detections since construction (boot recovery, reloadSegments, a cleaner-swap reload); monotonic.
+    [[nodiscard]] uint64_t damageDetections() const noexcept { return damageDetections_; }
+
     /// CP-9 SPSC consumer (owner thread): validate retention proposals; for each
     /// valid one rename its files to *.deleted, erase it from segments_ and
     /// update the sealed snapshot.  Called from NodeRuntimeAgent::doWork (same thread as
@@ -1144,6 +1150,8 @@ private:
     /// recover(): the segment-chain validation from the recovery point onward.
     /// `deleteOnGap` false = a corrupt checkpoint (fail-stop): never delete.
     void validateFromRecoveryPoint_(int64_t rp, bool deleteOnGap);
+    /// #839: count and log one damaged sealed segment.  Cold.
+    [[gnu::cold]] void noteDamagedSegment_(const LogSegment& s);
     /// CP-8 incremental largestTimestamp: running max of maxTimestamp() across all
     /// batches appended to the ACTIVE segment since the last roll.  Reset to 0 at
     /// each roll (after publishSealedSnapshot captures it for the newly-sealed
@@ -1279,6 +1287,7 @@ private:
     static constexpr std::size_t kDeleteRingCapacity = 256;
     static constexpr std::size_t kDeleteRingMask     = kDeleteRingCapacity - 1;
     std::array<SegRef, kDeleteRingCapacity> deleteRing_{};
+    uint64_t damageDetections_ = 0;   ///< see damageDetections() (owner thread)
     uint64_t staleCleanerOps_ = 0;   ///< see staleCleanerOpsDropped() (owner thread)
     /// MAJOR-2: true when queued cleaner work for `base`/`lineage` may act — the
     /// segment exists, is NOT the active one, and (unless kAnyLineage) is the

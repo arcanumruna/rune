@@ -643,7 +643,7 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
 LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                                  ReadIntoStatus& st, int64_t boundOffset, int* errOut) noexcept {
     st = ReadIntoStatus::Absent;
-    if (logSize_ <= 0) return {};                                     // nothing written: absent
+    if (logSize_ <= 0) { if (damage_) [[unlikely]] st = ReadIntoStatus::Corrupt; return {}; }   // nothing written: absent
     if (fd_ < 0 || buf == nullptr || bufCap == 0) { st = ReadIntoStatus::Unreadable; return {}; }
     // Lows A/B/C review M1: a failed log is never pread again (a bad sector
     // re-read on every worker pass blocks the duty pass for the drive's retry
@@ -662,7 +662,7 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
     // skip + maxBytes.
     const OffsetPosition op = index_->lookup(startOffset);
     const int64_t pos0 = op.position > 0 ? op.position : 0;
-    if (pos0 >= logSize_) return {};
+    if (pos0 >= logSize_) { if (damage_) [[unlikely]] st = ReadIntoStatus::Corrupt; return {}; }
     const std::size_t remaining = static_cast<std::size_t>(logSize_ - pos0);
     // Only what this read needs: maxBytes + the sparse-index skip (<= two index
     // intervals) — never the whole buffer.  A first batch past it -> read on.
@@ -740,7 +740,7 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
         if (pos + kOverhead > got) {
             // Window ended between batches: read on (up to the buffer) unless
             // the segment's bytes are exhausted (the offset is absent).
-            if (got >= remaining) return {};
+            if (got >= remaining) { if (damage_) [[unlikely]] st = ReadIntoStatus::Corrupt; return {}; }
             if (got >= limit) {
                 // Not even this batch's header fits after the skip: read it
                 // aside to learn the batch's extent (cold).
@@ -925,7 +925,7 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
     return 0;
 }
 
-int64_t LogSegment::recover(bool syncIndex) {
+int64_t LogSegment::recover(bool syncIndex, RecoverMode mode) {
     // D20 review L3 — ONE rule for every error: it fails the log (sticky
     // failedErrno, routed to the halt by the owner's loop), and it THROWS only
     // while the segment's state is unknown (fstat / pread: no valid prefix
@@ -990,13 +990,20 @@ int64_t LogSegment::recover(bool syncIndex) {
         pos += total;
     }
 
-    // Truncate torn tail.
-    // D20: through the segment's own fd (its inode), never by path.
-    if (::ftruncate(fd_, static_cast<off_t>(validBytes)) != 0) {
-        // State known (validBytes / next); the torn tail stays on disk behind a
-        // failed log (no append reaches it) and restart recovery cuts it.
-        if (!storage_) fail(errno, "LogSegment::recover ftruncate " + logPath_);
-        failSticky(errno);
+    // #839: a SEALED segment (KeepDamage) with bytes past its last whole batch is damaged, not torn: keep every byte, flag it.
+    damage_.reset();
+    const bool keepDamage = mode == RecoverMode::KeepDamage && validBytes < static_cast<int64_t>(buf.size());
+    if (keepDamage) {
+        damage_ = SegmentDamage{validBytes, next, fileSize};
+    } else {
+        // Truncate torn tail.
+        // D20: through the segment's own fd (its inode), never by path.
+        if (::ftruncate(fd_, static_cast<off_t>(validBytes)) != 0) {
+            // State known (validBytes / next); the torn tail stays on disk behind a
+            // failed log (no append reaches it) and restart recovery cuts it.
+            if (!storage_) fail(errno, "LogSegment::recover ftruncate " + logPath_);
+            failSticky(errno);
+        }
     }
     logSize_ = validBytes; nextOffset_ = next;
     tooLargeOkPos_ = -1;   // review L6
