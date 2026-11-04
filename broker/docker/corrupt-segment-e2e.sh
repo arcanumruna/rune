@@ -5,7 +5,8 @@
 #                bootstrapped (docker/lib/auth.sh); topic corrupt_e2e (1 partition, segment.bytes = 4096);
 #   2. FILL:     the rune_produce_subscribe example (RUNE_MODE=ws) produces 200 acked records, one batch each, so the log
 #                rolls into >= 3 sealed segments;
-#   3. DAMAGE:   `docker compose stop` the broker, flip one byte of the FIRST sealed segment (below the recovery point), start;
+#   3. DAMAGE:   `docker compose stop` the broker, flip the first record byte of the 2nd batch of the FIRST sealed segment
+#                (position read from the file; below the recovery point), start;
 #   4. ASSERT:   the broker starts and logs "1 damaged log segment(s) at boot" (the line written beside the gauge
 #                rune-log-damaged-segments, metric 1000270, from the same value: the gauge itself is read by the in-process
 #                BrokerMetricsRegressionTest); a subscription from the start ends CorruptBatch; a subscription from the
@@ -172,9 +173,11 @@ FIRST="$(echo "${SEGS}" | grep "^${PART_DIR}/" | head -1)"
 LAST="$(echo "${SEGS}" | grep "^${PART_DIR}/" | tail -1)"
 LAST_BASE="$(basename "${LAST}" .log | sed 's/^0*//')"
 [ -n "${LAST_BASE}" ] || fail "the last segment has base 0: the log never rolled"
-log "Step 3: damaging ${FIRST} at byte 300; the last segment starts at offset ${LAST_BASE}"
-# xor byte 300 with 0xff, in place (POSIX sh: od, printf with an octal escape, dd conv=notrunc)
-FLIP='f="$1"; b=$(dd if="$f" bs=1 skip=300 count=1 2>/dev/null | od -An -tu1 | tr -d " "); n=$(( b ^ 255 )); o=$(printf "%03o" "$n"); printf "\\$o" | dd of="$f" bs=1 seek=300 conv=notrunc 2>/dev/null'
+log "Step 3: damaging ${FIRST} in the first record byte of its 2nd batch; the last segment starts at offset ${LAST_BASE}"
+# The position comes from the file, never a fixed byte: batch 1 is 12 + its little-endian length field (bytes 8-11) long,
+# and batch 2's records start 61 bytes (the batch header) after that: inside the CRC-covered part.  xor that byte with 0xff
+# in place (POSIX sh: od, printf with an octal escape, dd conv=notrunc).
+FLIP='f="$1"; set -- $(dd if="$f" bs=1 skip=8 count=4 2>/dev/null | od -An -tu1); len=$(( $1 + $2 * 256 + $3 * 65536 + $4 * 16777216 )); pos=$(( len + 12 + 61 )); b=$(dd if="$f" bs=1 skip=$pos count=1 2>/dev/null | od -An -tu1 | tr -d " "); [ -n "$b" ] || exit 1; n=$(( b ^ 255 )); o=$(printf "%03o" "$n"); printf "\\$o" | dd of="$f" bs=1 seek=$pos conv=notrunc 2>/dev/null'
 docker run --rm --platform linux/amd64 --entrypoint sh -v "${VOLUME}:/data" "${QL_IMAGE}" -c "${FLIP}" sh "${FIRST}" \
     || fail "flipping the byte failed"
 
@@ -183,7 +186,7 @@ SINCE="$(date +%s)"
 dc start rune-1 >/dev/null || fail "docker compose start failed"
 wait_until "${LEADER_WAIT_S}" "the node leading again" leader_since \
     || { docker logs --tail 60 "$(broker_id)" >&2 || true; fail "the broker did not lead again within ${LEADER_WAIT_S}s: a damaged sealed segment must not stop it starting"; }
-docker logs "$(broker_id)" 2>&1 | grep -q "1 damaged log segment(s) at boot" \
+docker logs "$(broker_id)" 2>&1 | grep -Eq "(^|[^0-9])1 damaged log segment\(s\) at boot" \
     || { docker logs --tail 80 "$(broker_id)" >&2 || true; fail "the broker did not report exactly 1 damaged segment (the gauge rune-log-damaged-segments)"; }
 log "Step 4a: the broker serves and reports 1 damaged segment"
 

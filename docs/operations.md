@@ -381,6 +381,15 @@ segment as it is. A sealed segment whose bytes after the last whole, CRC-valid b
   single-node cluster restores from a backup). Damage that appears after boot (a reload) makes the same loaders stop
   instead of skipping: the group coordinator and the transaction coordinator stay unloaded, and the metadata controller
   decides nothing.
+- **Group consumers.** A group member whose fetch subscription reaches the damage ends with `CorruptBatch` (an
+  undeliverable batch: `UndeliverableBatch`), the same as a plain subscription.
+- **Views, checked writes and filtered groups.** The view fold, the checked-write verdict judge and a filtered group's
+  scan stop at the damage with no terminal error of their own: a view over the damaged partition never becomes Ready and a
+  checked write never gets a verdict until the segment is repaired or retention deletes it. Watch the gauge
+  `rune-log-damaged-segments` and the `DAMAGED` log lines.
+- **Upgrade.** A data directory written before the recovery-point file existed has no recovery point: an old torn tail in a
+  sealed segment then counts as damage at the first start after the upgrade, where it used to be cut silently, and readers
+  that reach it fail. The `DAMAGED` line names the segment; restore it from a backup or let retention delete it.
 - **Active segment.** The newest segment is different: a torn tail there is a normal crash artefact and is still cut at the last
   whole batch.
 
