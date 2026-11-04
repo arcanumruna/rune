@@ -1026,3 +1026,36 @@ TEST(DamagedSegmentRegression, InPlaceTruncationIntoTheDamageClearsItRegression)
         EXPECT_EQ(rec->damagedSegmentCount(), 0u);
     }
 }
+
+// F5: baseOffset (0-7), partitionLeaderEpoch (12-15) and magic (16) are not covered by the batch CRC, so a flip there still
+// verifies.  Recovery must treat it as the end of the valid prefix: damage, never a served wrong offset.
+TEST(DamagedSegmentRegression, UnCrcCoveredHeaderFlipIsDamageRegression) {
+    for (int c = 0; c < 3; ++c) {
+        SCOPED_TRACE(c == 0 ? "baseOffset" : c == 1 ? "magic" : "epoch");
+        DamagedFixture f(("dmg_hdr" + std::to_string(c)).c_str());
+        ASSERT_GE(f.starts.size(), 3u);
+        // The 2nd batch's position comes from the file: the 1st batch's totalLength.
+        std::ifstream in(f.seg0, std::ios::binary);
+        std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), {});
+        in.close();
+        const std::size_t p = static_cast<std::size_t>(RecordBatchReader(buf.data(), buf.size()).totalLength());
+        ASSERT_EQ(p, f.starts.at(1));
+        ASSERT_GE(f.D, 1);
+        if (c == 0) {
+            // Lower the base below the expected offset: clear D's lowest set bit (byte 0 holds it, D < 256).
+            ASSERT_LT(f.D, 256);
+            xorByteAt(f.seg0, p + 0, static_cast<uint8_t>(f.D & -f.D));
+        } else if (c == 1) {
+            xorByteAt(f.seg0, p + static_cast<std::size_t>(batch::kMagicOffset));
+        } else {
+            const std::size_t e = p + static_cast<std::size_t>(batch::kPartitionLeaderEpochOffset);
+            ASSERT_NE(buf[e], 0);   // the test batches carry epoch -1: clearing the low bit of byte 12 lowers it
+            xorByteAt(f.seg0, e, static_cast<uint8_t>(buf[e] & -buf[e]));
+        }
+        auto rec = openRecovered(f.dir, kDmgRoll, false);
+        EXPECT_EQ(rec->damagedSegmentCount(), 1u);
+        EXPECT_EQ(fs::file_size(f.seg0), f.sz0) << "kept, not cut";
+        EXPECT_EQ(readAt(*rec, f.D).st, ReadIntoStatus::Corrupt);
+        EXPECT_EQ(readAt(*rec, f.bases[0]).st, ReadIntoStatus::Ok);
+    }
+}

@@ -1,3 +1,4 @@
+#include <rune/storage/BatchHeaderCursor.h>
 #include <rune/storage/Timestamps.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
@@ -2099,6 +2100,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
     int64_t keptMaxTs = 0;
     bool found = false;
     std::size_t pos = 0;
+    BatchHeaderCursor hdr(seg.baseOffset());   // #839: the header fields the CRC does not cover
     while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
         rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
         int32_t total = r.totalLength();
@@ -2106,6 +2108,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
         // A3: CRC-gate the walk — a corrupt batch terminates the scan so we
         // don't misparse a corrupt totalLength as a valid batch boundary.
         if (!r.ensureValid()) break;
+        if (!hdr.accept(r)) break;   // #839: a bad baseOffset / magic / epoch is damage like a CRC failure
 
         // A batch must be dropped if ANY of its records is at offset >= truncateOffset.
         // Since records in a batch are contiguous [baseOffset .. baseOffset+lastOffsetDelta],

@@ -1,3 +1,4 @@
+#include <rune/storage/BatchHeaderCursor.h>
 #include <rune/storage/LogCleaner.h>
 #include <cstring>
 #include <rune/protocol/RecordBatch.h>
@@ -245,12 +246,15 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
         const auto buf = readFile(segmentLogPath(dir, segBase));
         bytes += static_cast<int64_t>(buf.size());
         std::size_t pos = 0;
+        BatchHeaderCursor hdr(segBase);
         while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             const int32_t total = r.totalLength();
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
             std::optional<cr::ControlRecord> ctl;
             if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;   // a control record: validated once (#804)
+            // #839: baseOffset / magic / epoch are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
+            if (!hdr.accept(r)) break;
             const int64_t base = r.baseOffset();
             if (base >= scanEnd) { pos = buf.size(); break; }   // the intended end of the scan, not damage
             const int64_t pid  = r.producerId();
@@ -401,12 +405,15 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         if (buf.empty()) continue;
 
         size_t pos = 0;
+        BatchHeaderCursor hdr(segBase);
         while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
                <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             int32_t total = r.totalLength();
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             if (!r.ensureValid()) break;
+            // #839: baseOffset / magic / epoch are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
+            if (!hdr.accept(r)) break;
 
             bool full = false;
             if (!isControlBatch(r) && !(isTransactionalBatch(r) && txn.isAborted(r.producerId(), r.baseOffset())))
@@ -476,6 +483,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         if (buf.empty()) continue;
 
         size_t pos = 0;
+        BatchHeaderCursor hdr(segBase);
         while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
                <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
@@ -484,6 +492,8 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             // A3: CRC-gate the walk — stop on the first corrupt batch (same as recover()).
             if (!r.ensureValid()) break;
+            // #839: baseOffset / magic / epoch are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
+            if (!hdr.accept(r)) break;
 
             if (!isControlBatch(r) && !(isTransactionalBatch(r) && txn.isAborted(r.producerId(), r.baseOffset())))
                 r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
@@ -559,6 +569,7 @@ bool LogCleaner::rewriteSegmentImpl(
     // swap enqueue entirely (avoids churning already-clean prefix segments that
     // the Kafka-faithful from-log-start sweep re-visits every pass).
     bool modified = false;
+    BatchHeaderCursor hdr(segBase);
 
     while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
            <= buf.size()) {
@@ -570,6 +581,7 @@ bool LogCleaner::rewriteSegmentImpl(
         // parseControl (#804); its result goes on to markerAction.
         std::optional<rune::storage::control_record::ControlRecord> ctl;
         if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;
+        if (!hdr.accept(r)) break;   // #839: baseOffset / magic / epoch are not CRC-covered: damage like a CRC failure
 
         // CP-8: KIP-534 delete-horizon gate.
         // CONTRACT: when hasDeleteHorizon() is true, baseTimestamp() IS the horizon
@@ -1530,6 +1542,7 @@ void LogCleaner::mergeGroupWithMap(
         outBuf.reserve(outBuf.size() + buf.size());
 
         std::size_t pos = 0;
+        BatchHeaderCursor hdr(segBase);
         while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
                <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
@@ -1537,6 +1550,7 @@ void LogCleaner::mergeGroupWithMap(
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             std::optional<rune::storage::control_record::ControlRecord> ctl;   // a control record is validated once (#804)
             if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;
+            if (!hdr.accept(r)) break;   // #839: baseOffset / magic / epoch are not CRC-covered: damage like a CRC failure
 
             // CP-8: horizon gate (same logic as rewriteSegmentImpl).
             const bool batchHasHorizon  = r.hasDeleteHorizon();
