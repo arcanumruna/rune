@@ -331,21 +331,43 @@ TEST(NamespaceLifecycleTrioRegression, SuspendConvergesOnEveryNodeRegression) {
             << "node " << n << ": DDL after resume (routed to the catalog leader)";
 }
 
-// The catalog leader is killed after the reaper took 2 of its steps: the new leader's reaper re-derives from the registry
-// and finishes; the namespace is erased and its directories are gone on every node, the restarted old leader included.
-TEST(NamespaceLifecycleTrioRegression, DeleteFinishesAfterLeaderKillRegression) {
-    auto w = setupWorld("nslct_kill");
+// #707: after the delete, on `node`: the namespace's slot is free in the control table AND in worker 0's table (the
+// sticky Deleting gate is not enough: the release must reach the worker), and the ns-<id> directory is gone.  The other namespace `other` keeps its slot, live.
+bool deletedCleanlyOn(World& W, int node, uint32_t id, uint32_t other) {
+    BrokerNode& n = W.t.node(node);
+    const uint16_t ctrl = n.nsSlotOfForTest(id);
+    const bool workerFree = n.onWorkerThreadForTest(0, [id](Worker& wk) { return wk.nsSlotsForTest().slotOf(id) == kNoNsSlot; });
+    return ctrl == kNoNsSlot && workerFree && W.dirsGone(node, id);
+}
+bool otherUntouchedOn(World& W, int node, uint32_t other) {
+    BrokerNode& n = W.t.node(node);
+    if (n.nsSlotOfForTest(other) == kNoNsSlot) return false;
+    return n.onWorkerThreadForTest(0, [other](Worker& wk) {
+        const uint16_t slot = wk.nsSlotsForTest().slotOf(other);
+        return slot != kNoNsSlot && !wk.nsDeletingForTest(slot);
+    });
+}
+
+// The catalog leader is killed after the reaper took N of its steps (#707: N in {0,1,2,4,5}): the new leader's reaper
+// re-derives from the registry and finishes; the namespace is erased, its slot is released and its directories are gone
+// on every node (the follower included), the restarted old leader too.  A second namespace is never touched.
+class NamespaceLifecycleTrioDeleteRegression : public ::testing::TestWithParam<int> {};
+
+TEST_P(NamespaceLifecycleTrioDeleteRegression, DeleteFinishesAfterLeaderKillRegression) {
+    const int budget = GetParam();
+    auto w = setupWorld("nslct_kill" + std::to_string(budget));
     World& W = *w;
+    const Ans other = W.ns(1, pc::NamespaceDdlKind::Create, "b");
+    ASSERT_EQ(other.code, 0) << other.detail;
+    const auto otherId = static_cast<uint32_t>(other.id);
     const int L = W.t.cluster().settledLeader();
     ASSERT_GT(L, 0);
     BrokerNode& ln = W.t.node(L);
-    ln.onAdminThreadForTest([&] { ln.adminWorkerAgentForTest()->worker().reaperForTest().setIssueBudgetForTest(2); return 0; });
+    ln.onAdminThreadForTest([&] { ln.adminWorkerAgentForTest()->worker().reaperForTest().setIssueBudgetForTest(budget); return 0; });
     ASSERT_EQ(W.ns(L, pc::NamespaceDdlKind::Delete, "a").code, 0);
     ASSERT_TRUE(AuthTrio::until(60s, [&] {
-        return ln.onAdminThreadForTest([&] { return ln.adminWorkerAgentForTest()->worker().reaper().eventsIssued(); }) == 2;
-    })) << "the leader's reaper never took its 2 steps";
-    for (const int n : {W.firstNodeOtherThan(L), W.firstNodeOtherThan(L, W.firstNodeOtherThan(L))})
-        EXPECT_FALSE(W.erasedOn(n, 1)) << "node " << n << ": the budget should have stopped the delete before the end";
+        return ln.onAdminThreadForTest([&] { return ln.adminWorkerAgentForTest()->worker().reaper().eventsIssued(); }) == static_cast<uint64_t>(budget);
+    })) << "the leader's reaper never took its " << budget << " steps";
     W.stop(L);   // the kill
     ASSERT_TRUE(W.t.cluster().awaitCatalogLeaderOtherThan(L, 60s)) << "no new catalog leader";
     const int S1 = W.firstNodeOtherThan(L), S2 = W.firstNodeOtherThan(L, S1);
@@ -353,9 +375,16 @@ TEST(NamespaceLifecycleTrioRegression, DeleteFinishesAfterLeaderKillRegression) 
         ASSERT_TRUE(AuthTrio::until(120s, [&] { return W.erasedOn(n, 1); })) << "node " << n << ": the namespace was never erased";
         EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.dirsGone(n, 1); })) << "node " << n << ": ns-1 directory survived";
     }
+    // the leader and the follower alike: the slot is released everywhere (the control table and the worker's)
+    for (const int n : {S1, S2})
+        EXPECT_TRUE(AuthTrio::until(60s, [&] { return deletedCleanlyOn(W, n, 1, otherId); }))
+            << "node " << n << ": the deleted namespace's slot is still assigned (budget " << budget << ")";
     W.restart(L);
     ASSERT_TRUE(AuthTrio::until(120s, [&] { return W.erasedOn(L, 1); })) << "the restarted old leader never converged";
-    EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.dirsGone(L, 1); })) << "node " << L << " (restarted): ns-1 directory survived";
+    EXPECT_TRUE(AuthTrio::until(60s, [&] { return deletedCleanlyOn(W, L, 1, otherId); }))
+        << "node " << L << " (restarted): the deleted namespace's slot or ns-1 directory survived (budget " << budget << ")";
+    for (const int n : {1, 2, 3})
+        EXPECT_TRUE(AuthTrio::until(30s, [&] { return otherUntouchedOn(W, n, otherId); })) << "node " << n << ": namespace b lost its slot or turned Deleting";
     // The name is free and the new namespace holds nothing of the old one.
     const Ans again = W.ns(S1, pc::NamespaceDdlKind::Create, "a");
     ASSERT_EQ(again.code, 0) << again.detail;
@@ -365,6 +394,8 @@ TEST(NamespaceLifecycleTrioRegression, DeleteFinishesAfterLeaderKillRegression) 
             << "node " << n << ": a topic of the old namespace is listed";
     }
 }
+INSTANTIATE_TEST_SUITE_P(Budgets, NamespaceLifecycleTrioDeleteRegression, ::testing::Values(0, 1, 2, 4, 5),
+                         [](const auto& info) { return "budget" + std::to_string(info.param); });
 
 // A follower down for the whole delete rejoins and converges: registry, directories and security records.
 TEST(NamespaceLifecycleTrioRegression, FollowerRejoinsAfterDeleteRegression) {
@@ -386,6 +417,18 @@ TEST(NamespaceLifecycleTrioRegression, FollowerRejoinsAfterDeleteRegression) {
     W.restart(f);
     ASSERT_TRUE(AuthTrio::until(120s, [&] { return W.erasedOn(f, 1); })) << "the rejoined follower still lists the deleted namespace";
     EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.dirsGone(f, 1); })) << "the rejoined follower kept ns-1 on disk";
+    // #707: the same three checks as the leader-kill cells: the slot of the deleted namespace is free on the follower too
+    // (the re-created namespace has a new id, so slot 1's owner is gone), and the re-created one is live
+    EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.t.node(f).nsSlotOfForTest(1) == kNoNsSlot; }))
+        << "the rejoined follower still assigns a slot to the deleted namespace";
+    EXPECT_TRUE(AuthTrio::until(60s, [&] {
+        return W.t.node(f).onWorkerThreadForTest(0, [](Worker& wk) {
+            const uint16_t slot = wk.nsSlotsForTest().slotOf(1);
+            return slot == kNoNsSlot;
+        });
+    })) << "the rejoined follower's worker never released the deleted namespace's slot";
+    EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.t.node(f).nsSlotOfForTest(static_cast<uint32_t>(again.id)) != kNoNsSlot; }))
+        << "the rejoined follower gave the re-created namespace no slot";
     ASSERT_TRUE(AuthTrio::until(60s, [&] { const auto e = W.entry(f, static_cast<uint32_t>(again.id)); return e && e->name == "a" && e->state == 0; }))
         << "the follower does not list the re-created namespace";
     EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.tryLogin(f, "a/alice").code == kAuthFailed; }))
