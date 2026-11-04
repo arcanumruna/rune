@@ -1560,7 +1560,7 @@ TEST_F(GroupConsumerHubTest, TwoThreadCommitDoWork_NoRaceRegression) {
         SendFn send{[](void* ctx, int32_t, const uint8_t* b, std::size_t n) -> bool {
             if (n >= 4 && (static_cast<uint16_t>(b[2]) | (static_cast<uint16_t>(b[3]) << 8)) ==
                               static_cast<uint16_t>(rpc::TemplateId::OffsetCommit)) {
-                static_cast<std::atomic<int>*>(ctx)->fetch_add(1, std::memory_order_relaxed);
+                static_cast<decltype(commitsSent)*>(ctx)->fetch_add(1, std::memory_order_relaxed);
             }
             return true;
         }, &commitsSent};

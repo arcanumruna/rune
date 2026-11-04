@@ -4523,12 +4523,12 @@ TEST(GroupClockRegression, ClockJumpFiresOneHeartbeatAndOneAutoCommitNotABurstAd
     }
 }
 
-// #701, input bound: subscribeTimeoutMs = INT64_MAX.  The relative timeout saturates and the duty thread's adoption
+// #701, input bound: subscribeTimeoutMs = the 30-day cap.  The relative timeout is huge and the duty thread's adoption
 // stamp (now + timeout) saturates too: the Subscribe never times out however far the clock runs.  Mutation (a plain
 // add at adoption: the deadline wraps negative): TimedOut on the first sweep - red.
 TEST(SubscribeClockRegression, MaxSubscribeTimeoutSaturatesAndNeverTimesOutAdversarialRegression) {
     RigOptions o         = routingClockOptions(100'000);
-    o.subscribeTimeoutMs = std::numeric_limits<int64_t>::max();
+    o.subscribeTimeoutMs = 2'592'000'000;   // the 30-day cap: INT64_MAX is refused at construction (E1)
     GroupRig r(4715, 4716, o);
     int errors = 0;
     r.client.onError([&](const std::string&) { ++errors; });

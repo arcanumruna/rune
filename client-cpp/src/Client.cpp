@@ -57,6 +57,9 @@ static_assert(kMaxPasswordBytes == detail::FixedSecret::kCapacity);
 
 namespace {
 
+/// The largest accepted `*Ms` timeout in ClientConfig / ProducerConfig: 30 days.
+constexpr int64_t kMaxTimeoutMs = 30LL * 24 * 3600 * 1000;
+
 // now + ms, in ns, saturated at INT64_MAX: a huge timeout or retry budget (e.g. milliseconds::max(), "let the
 // deadline end it") never wraps into the past.  ms <= 0 is now (validatedInPlace refuses negatives).
 int64_t nsAfter(int64_t nowNs, int64_t ms) noexcept {
@@ -97,6 +100,18 @@ void validateConfigInPlace(ClientConfig& c) {
     // #744: a subscribe / produce attempt with no time at all would time out on its first pass.
     if (c.subscribeTimeoutMs <= 0 || c.produceTimeoutMs <= 0)
         throw std::invalid_argument("ClientConfig: subscribeTimeoutMs / produceTimeoutMs must be > 0");
+    // E1: every *Ms field becomes ns; above 30 days it would saturate into "never" (or wrap in a *1'000'000 site).
+    // Refused naming the field, never silently clamped.
+    for (const auto& [name, ms] : {std::pair<const char*, int64_t>{"connectTimeoutMs", c.connectTimeoutMs},
+                                   {"pingTimeoutMs", c.pingTimeoutMs},
+                                   {"produceTimeoutMs", c.produceTimeoutMs},
+                                   {"subscribeTimeoutMs", c.subscribeTimeoutMs},
+                                   {"ddlTimeoutMs", c.ddlTimeoutMs},
+                                   {"closeTimeoutMs", c.closeTimeoutMs}}) {
+        if (ms > kMaxTimeoutMs)
+            throw std::invalid_argument(std::string("ClientConfig: ") + name + " must be <= " +
+                                        std::to_string(kMaxTimeoutMs) + " ms (30 days), got " + std::to_string(ms));
+    }
     if (c.ddlRetryBudget.count() < 0 || c.viewReadRetryBudget.count() < 0)
         throw std::invalid_argument("ClientConfig: ddlRetryBudget / viewReadRetryBudget must be >= 0");
     if (c.traceDdlRetries && c.runnerMode != RunnerMode::Invoker)
@@ -5044,6 +5059,15 @@ Producer Client::testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap) {
 
 Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool direct) {
     if (!acksValid(cfg.acks)) throw std::invalid_argument("ProducerConfig: acks View needs Leader or All, and no unknown bits");
+    // E1: the producer's *Ms fields are converted to ns at many sites (`* 1'000'000`); above 30 days they would wrap.
+    for (const auto& [name, ms] : {std::pair<const char*, int64_t>{"produceTimeoutMs", cfg.produceTimeoutMs},
+                                   {"transactionOpTimeoutMs", cfg.transactionOpTimeoutMs},
+                                   {"deliveryTimeoutMs", cfg.deliveryTimeoutMs},
+                                   {"agentLivenessTimeoutMs", cfg.agentLivenessTimeoutMs}}) {
+        if (ms > kMaxTimeoutMs)
+            throw std::invalid_argument(std::string("ProducerConfig: ") + name + " must be <= " +
+                                        std::to_string(kMaxTimeoutMs) + " ms (30 days), got " + std::to_string(ms));
+    }
     // Phase 2b F: creation validation of a transactional producer.
     if (!cfg.transactionalId.empty()) {
         if (cfg.acks == Acks::None) {
