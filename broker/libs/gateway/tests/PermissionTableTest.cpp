@@ -1,6 +1,7 @@
 // PermissionTableTest.cpp - authentication Task 12: the per-session permission table (compile, created-after-login,
 // write bits) and the Authorizer (the one place a code or a detail text is chosen).
 #include <rune/gateway/Authorizer.h>
+#include <rune/gateway/NsResolve.h>
 #include <rune/gateway/ObjectIndex.h>
 #include <rune/gateway/PermissionPool.h>
 #include <rune/gateway/PermissionTable.h>
@@ -134,7 +135,7 @@ TEST(AuthorizerRegression, DetailTextIsBuiltOnlyFromTheRequest) {
     EXPECT_EQ(hidden->code, 45);
     EXPECT_EQ(hidden->detail, "not authorized: READ on TOPIC 0");
     EXPECT_EQ(missing->detail, "not authorized: READ on TOPIC 77");
-    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, "t1", Operation::Drop)->detail, "not authorized: DROP on TOPIC t1");
+    EXPECT_EQ(rg::authorizeName(t, ResourceType::Topic, "t1", Operation::Drop, 0)->detail, "not authorized: DROP on TOPIC t1");
     EXPECT_EQ(rg::authorizeCluster(t, Operation::Admin)->detail, "not authorized: ADMIN on CLUSTER");
 }
 
@@ -159,15 +160,35 @@ TEST(AuthorizerRegression, GrantedRequestsAreNotDenied) {
     rg::ObjectIndex idx; idx.onTopic(0, "a");
     auto t = rg::PermissionTable::compile({{g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "a")}}, idx);
     EXPECT_FALSE(rg::authorizeTopicId(t, 0, Operation::Write, idx).has_value());
-    EXPECT_FALSE(rg::authorizeName(t, ResourceType::Topic, "a", Operation::Write).has_value());
+    EXPECT_FALSE(rg::authorizeName(t, ResourceType::Topic, "a", Operation::Write, 0).has_value());
     EXPECT_FALSE(rg::authorizeCluster(rg::PermissionTable::allowAll(), Operation::Admin).has_value());
 }
 
 TEST(AuthorizerRegression, AnOverlongNameIsCutInTheDetailIdenticallyForHiddenAndMissing) {
     auto t = rg::PermissionTable::denyAll();
-    const auto d = rg::authorizeName(t, ResourceType::Topic, std::string(5000, 'x'), Operation::Drop);
+    const auto d = rg::authorizeName(t, ResourceType::Topic, std::string(5000, 'x'), Operation::Drop, 0);
     ASSERT_TRUE(d.has_value());
     EXPECT_LE(d->detail.size(), 300u);
+}
+
+// #640: a name of another namespace is never authorized by a non-root table, even if a grant pattern matches the
+// local name (defence in depth behind NsResolve's hide).  kHiddenNsId keeps its "missing" answer; root passes.
+TEST(AuthorizerRegression, ForeignNsNameDeniedRegression) {
+    rg::ObjectIndex idx;
+    auto t = rg::PermissionTable::compile({{g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "")}}, 1, idx);
+    const auto foreign = rg::authorizeName(t, ResourceType::Topic, "x", Operation::Write, 2);
+    ASSERT_TRUE(foreign.has_value()) << "a foreign-namespace name was authorized by a local grant pattern";
+    EXPECT_EQ(foreign->code, 45);
+    EXPECT_FALSE(rg::authorizeName(t, ResourceType::Topic, "x", Operation::Write, 1).has_value());
+    EXPECT_FALSE(rg::authorizeName(t, ResourceType::Topic, "x", Operation::Write, rg::kHiddenNsId).has_value());
+    EXPECT_TRUE(rg::authorizeTopicOrViewName(t, "x", Operation::Write, idx, 2).has_value());
+    EXPECT_FALSE(rg::authorizeTopicOrViewName(t, "x", Operation::Write, idx, 1).has_value());
+    EXPECT_FALSE(rg::authorizeTopicOrViewName(t, "x", Operation::Write, idx, rg::kHiddenNsId).has_value());
+
+    auto root = rg::PermissionTable::compile({{g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, ""),
+                                               g(Operation::Write, ResourceType::Topic, PatternKind::Prefix, "")}}, 1, idx);
+    ASSERT_TRUE(root.isRoot());
+    EXPECT_FALSE(rg::authorizeName(root, ResourceType::Topic, "x", Operation::Write, 2).has_value());
 }
 
 // ── Issue #259 (X108): one compiled table per distinct grant set ──
@@ -355,24 +376,24 @@ TEST(AuthorizerRegression, AViewGrantNeverDescribesATopicRegression) {
     rg::ObjectIndex idx; idx.onTopic(0, "payments"); idx.onView(1, "payboard");
     const auto viewOnly  = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::View, PatternKind::Prefix, "pay")}}, idx);
     const auto topicOnly = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::Topic, PatternKind::Prefix, "pay")}}, idx);
-    const auto denied = rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx);
+    const auto denied = rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx, 0);
     ASSERT_TRUE(denied.has_value()) << "a VIEW grant must not describe the topic 'payments'";
     EXPECT_EQ(denied->code, 45);
     EXPECT_EQ(denied->detail, "not authorized: DESCRIBE on TOPIC payments") << "the text always says TOPIC (D23)";
-    EXPECT_TRUE(rg::authorizeTopicOrViewName(topicOnly, "payboard", Operation::Describe, idx).has_value())
+    EXPECT_TRUE(rg::authorizeTopicOrViewName(topicOnly, "payboard", Operation::Describe, idx, 0).has_value())
         << "a TOPIC grant must not describe the view 'payboard'";
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payboard", Operation::Describe, idx).has_value());
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(topicOnly, "payments", Operation::Describe, idx).has_value());
+    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payboard", Operation::Describe, idx, 0).has_value());
+    EXPECT_FALSE(rg::authorizeTopicOrViewName(topicOnly, "payments", Operation::Describe, idx, 0).has_value());
 }
 
 TEST(AuthorizerRegression, AnUnknownSchemaNameAcceptsEitherKindsGrantRegression) {   // D22 parity: "unknown" follows
     rg::ObjectIndex idx; idx.onTopic(0, "payments");
     const auto viewOnly = rg::PermissionTable::compile({{g(Operation::Describe, ResourceType::View, PatternKind::Prefix, "pay")}}, idx);
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payroll", Operation::Describe, idx).has_value());
+    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payroll", Operation::Describe, idx, 0).has_value());
     idx.onDropped(0);
-    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx).has_value())
+    EXPECT_FALSE(rg::authorizeTopicOrViewName(viewOnly, "payments", Operation::Describe, idx, 0).has_value())
         << "a dropped name is unknown again";
-    EXPECT_TRUE(rg::authorizeTopicOrViewName(viewOnly, "orders", Operation::Describe, idx).has_value());
+    EXPECT_TRUE(rg::authorizeTopicOrViewName(viewOnly, "orders", Operation::Describe, idx, 0).has_value());
 }
 
 // #211: hasAnyGrant(type, op) - any literal, prefixed or wildcard grant of `op` ON that type, kept at compile time

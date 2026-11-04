@@ -133,6 +133,10 @@ struct Sim final : ReaperPort {
     bool holdResults = false;                      // keep results in the inbox (a slow admin thread)
     uint32_t batch = 256;
     int64_t now = 0;
+    int refuseControl = 0;                         // #722: the next N AbortTxns asks answer Refused
+    int tombMore = 0;                              // #722: the next N group tombstone asks answer More without progress
+    int tombWaiting = 0;                           // #722: the next N group tombstone asks answer Waiting
+    int idleTicks = 0;                             // #722: ticks whose doWork returned 0
 
     Sim(Cat& c, Stores& st, uint32_t b = 256) : cat(c), stores(st), reaper(std::make_unique<NamespaceReaper>(b)), batch(b) {}
 
@@ -150,9 +154,19 @@ struct Sim final : ReaperPort {
         switch (op) {
         case ReapOp::AbortTxns:
             ops.push_back("abort ns" + std::to_string(ns));
+            if (refuseControl > 0) { --refuseControl; inbox.push_back({true, corr, ReapStatus::Refused, 0}); break; }
             inbox.push_back({true, corr, ReapStatus::Done, 0});
             break;
-        case ReapOp::TombstoneGroups:   drain(stores.groupKeys, "tombstone-groups"); break;
+        case ReapOp::TombstoneGroups:
+            if (tombMore > 0 || tombWaiting > 0) {
+                ops.push_back("tombstone-groups ns" + std::to_string(ns));
+                const bool more = tombMore > 0;
+                if (more) --tombMore; else --tombWaiting;
+                inbox.push_back({true, corr, more ? ReapStatus::More : ReapStatus::Waiting, 0});
+                break;
+            }
+            drain(stores.groupKeys, "tombstone-groups");
+            break;
         case ReapOp::TombstoneTxnState: drain(stores.txnKeys, "tombstone-txn"); break;
         }
         return true;
@@ -185,7 +199,10 @@ struct Sim final : ReaperPort {
                 else reaper->onDdlResult(p.corr, p.code);
             }
         }
-        (void)reaper->doWork(now, cat.s, *this);
+        if (reaper->doWork(now, cat.s, *this) == 0) ++idleTicks;
+    }
+    int count(const std::string& prefix) const {
+        return static_cast<int>(std::count_if(ops.begin(), ops.end(), [&](const std::string& o) { return o.rfind(prefix, 0) == 0; }));
     }
     /// Ticks until `done()`; fails (returns false) at the cap.
     bool run(const std::function<bool()>& done) {
@@ -476,4 +493,54 @@ TEST(NamespaceReaperRegression, AdminWorkerDrivesDeleteToEndRegression) {
     const int64_t c = f.trio.submitCreateNamespaceNoWait(1, "a", {});
     EXPECT_EQ(f.trio.awaitAnswer(1, c).code, 0);
     EXPECT_GT(f.trio.admin(1).applier().state().namespaces().byName("a")->nsId, f.ns);
+}
+
+// ── #722: a refused / waiting step is paced, a step that made progress is not ────────────────────────────────
+TEST(NamespaceReaperRegression, RefusedStepBacksOffRegression) {
+    Cat cat; Stores st;
+    const uint32_t ns = standardNs(cat, st);
+    cat.deleteNs(ns);
+    Sim sim(cat, st);
+    sim.refuseControl = 1'000'000;
+    for (int i = 0; i < 200; ++i) sim.tick();   // 1 ms per tick
+    EXPECT_LE(sim.count("abort ns"), 9) << "gaps 2, 4, 8 ... 128 ms: at most 9 asks in 200 ms; ops:" << join(sim.ops);
+    EXPECT_GE(sim.idleTicks, 180) << "doWork returns 0 while the backoff holds";
+    EXPECT_EQ(sim.reaper->stateName(), "AbortingTxns") << "a refused step is never skipped";
+    sim.refuseControl = 0;
+    int ticks = 0;
+    while (!cat.erased(ns) && ticks < 400) {
+        if (st.securityRecords[ns] && std::find(sim.ops.begin(), sim.ops.end(), "step 4") != sim.ops.end())
+            st.securityRecords[ns] = false;
+        sim.tick();
+        ++ticks;
+    }
+    EXPECT_TRUE(cat.erased(ns)) << "converges once the control thread answers; state " << sim.reaper->stateName();
+}
+
+TEST(NamespaceReaperRegression, WaitingTombstoneBacksOffMoreDoesNotRegression) {
+    {   // More = progress: asked again on the very next tick, 30 times, then Done
+        Cat cat; Stores st;
+        const uint32_t ns = standardNs(cat, st);
+        st.groupKeys[ns] = 0;
+        cat.deleteNs(ns);
+        Sim sim(cat, st);
+        sim.tombMore = 30;
+        for (int i = 0; i < 2000 && sim.count("tombstone-groups") == 0; ++i) sim.tick();
+        ASSERT_EQ(sim.count("tombstone-groups"), 1);
+        for (int i = 0; i < 30; ++i) sim.tick();
+        EXPECT_EQ(sim.count("tombstone-groups"), 31) << "30 More answers are re-asked on consecutive ticks; ops:" << join(sim.ops);
+    }
+    {   // Waiting = nothing changed: paced
+        Cat cat; Stores st;
+        const uint32_t ns = standardNs(cat, st);
+        st.groupKeys[ns] = 0;
+        cat.deleteNs(ns);
+        Sim sim(cat, st);
+        sim.tombWaiting = 30;
+        for (int i = 0; i < 2000 && sim.count("tombstone-groups") == 0; ++i) sim.tick();
+        ASSERT_EQ(sim.count("tombstone-groups"), 1);
+        for (int i = 0; i < 200; ++i) sim.tick();
+        EXPECT_LE(sim.count("tombstone-groups"), 9) << join(sim.ops);
+        EXPECT_GE(sim.count("tombstone-groups"), 2);
+    }
 }

@@ -1971,7 +1971,7 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_ns_keyed_stores_tests PROPERTIES TIMEOUT 600)
 
         # Namespaces Phase 2 Task 8 (D22): per-node namespace slots, the broadcast to every worker and the gateway.
-        add_executable(rune_ns_slot_tests tests/node/NsSlotRegressionTest.cpp)
+        add_executable(rune_ns_slot_tests tests/node/NsSlotRegressionTest.cpp tests/support/AllocWindow.cpp)
         target_include_directories(rune_ns_slot_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_ns_slot_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
@@ -2256,8 +2256,9 @@ if(BUILD_TESTING)
         gtest_discover_tests(rune_namespace_gateway_tests PROPERTIES TIMEOUT 360)
 
         # Namespaces Task 12: the Op x Caller x Target matrix (support/NamespaceMatrixExpectations.h) on one real broker.
-        add_executable(rune_namespace_matrix_tests tests/node/NamespaceMatrixTest.cpp)
+        add_executable(rune_namespace_matrix_tests tests/node/NamespaceMatrixTest.cpp tests/node/NamespaceTestHygieneRegressionTest.cpp)
         target_include_directories(rune_namespace_matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_compile_definitions(rune_namespace_matrix_tests PRIVATE RUNE_NODE_TESTS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests")
         target_link_libraries(rune_namespace_matrix_tests PRIVATE rune_node rune_view rune_replication rune_codec rune_catalog aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_namespace_matrix_tests DISCOVERY_TIMEOUT 60 PROPERTIES TIMEOUT 900 LABELS small)
         rune_regression_batches(rune_namespace_matrix_tests 2)

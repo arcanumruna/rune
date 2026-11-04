@@ -5144,6 +5144,12 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         handleSecuritySubscribe_(*session, msg);
         return;
     }
+    // #721: a DELETING namespace is not readable by id, even by a root session (exempt from the Deleting revoke): the
+    // same answer as a topic that does not exist.
+    if (inDeletingNs_(msg.topicId)) [[unlikely]] {
+        sendResp(pc::ErrorCode::UnknownTopic, 0, 0);
+        return;
+    }
 
     // GB-4 / MD1-9: Leadership check — data ops MUST reach the partition leader.
     //
@@ -8265,7 +8271,7 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
 // client fields and a {0, 0} request id.  Views into the ingress buffer / session.
 // ---------------------------------------------------------------------------
 rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext, int64_t sessionId,
-                                                     const Session& session, uint32_t targetNsId) noexcept
+                                                     const Session& session, uint32_t targetNsId)
 {
     rune::gateway::DdlMetaView m;
     m.targetNsId    = targetNsId;   // namespaces Task 10: the object's resolved namespace (kHiddenNsId = answered missing)
@@ -8273,9 +8279,22 @@ rune::gateway::DdlMetaView ClientGateway::ddlMetaOf_(const pc::DdlExtension* ext
     m.sourceAddress = session.sourceIdentity;   // the Connect image's source, never the declared channel (#227)
     // The authenticated user (Task 11; Task 12 makes the catalog principal carry it too): a view into the session's
     // auth state, copied by the admin ring submit before this frame's handler returns.
-    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) m.authenticated = a->user;
-    else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session.auth)) m.authenticated = p->user;
     m.callerNsId = sessionNsId_(session);   // namespaces Task 9: the login's namespace (0 = `default` / anonymous)
+    const std::string* user = nullptr;
+    if (const auto* a = std::get_if<rune::gateway::AuthAuthenticated>(&session.auth)) user = &a->user;
+    else if (const auto* p = std::get_if<rune::gateway::AuthPasswordChangeRequired>(&session.auth)) user = &p->user;
+    if (user != nullptr) {
+        // Issue #652 (D3): `<ns>/<user>`; `default` stays bare.  A namespace the registry no longer knows (a delete
+        // race) falls back to `#<nsId>/<user>`, which cannot collide with a valid namespace name.
+        ddlPrincipalScratch_.clear();
+        if (m.callerNsId != rune::catalog::kDefaultNsId) {
+            if (const auto* ns = namespaces_.registry().byId(m.callerNsId)) ddlPrincipalScratch_.append(ns->name);
+            else { ddlPrincipalScratch_.push_back('#'); ddlPrincipalScratch_.append(std::to_string(m.callerNsId)); }
+            ddlPrincipalScratch_.push_back('/');
+        }
+        ddlPrincipalScratch_.append(*user);
+        m.authenticated = ddlPrincipalScratch_;
+    }
     if (ext != nullptr) {
         m.statement         = ext->statement;
         m.clientName        = ext->clientName;
@@ -8416,7 +8435,7 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     // Authentication Task 12 (spec §2.1): CREATE on the topic name (a CLUSTER grant is part of the table); CreateSchema
     // is the same request.
     if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, res.local,
-                                                     rune::security::Operation::Create), buf, len))
+                                                     rune::security::Operation::Create, res.nsId), buf, len))
         return;
     // Issue #129: if the name is an existing UNTYPED topic, a descriptor makes this a new schema version of it
     // (CreateSchemaOps) - ALTER on the topic, exactly as AlterTopic (ALTER implies DESCRIBE, D15).  Whether the name
@@ -8424,7 +8443,7 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     std::optional<rune::gateway::Denial> adopt;
     if (m.descriptorLen != 0)
         adopt = rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, res.local,
-                                             rune::security::Operation::Alter);
+                                             rune::security::Operation::Alter, res.nsId);
 
     // Copy-and-return: the sink OWNS the copied bytes (every view points into
     // the ingress buffer and is copied by the sink before return).
@@ -8513,7 +8532,7 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
         return;
     }
     if (deny_(*session, rune::gateway::authorizeName(permsOf_(*session), rune::security::ResourceType::Topic, res.local,
-                                                     rune::security::Operation::Alter), buf, len))
+                                                     rune::security::Operation::Alter, res.nsId), buf, len))
         return;
 
     // Copy-and-return: the sink OWNS the copied bytes (topicName/opsBlob views
@@ -8564,7 +8583,8 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
     // Authentication Task 12 (spec §2.1, D19): CREATE on the view name AND READ on every source topic of the plan.
     {
         std::optional<rune::gateway::Denial> d = rune::gateway::authorizeName(
-            permsOf_(*session), rune::security::ResourceType::View, res.local, rune::security::Operation::Create);
+            permsOf_(*session), rune::security::ResourceType::View, res.local, rune::security::Operation::Create,
+            res.nsId);
         if (!d) d = authorizeViewSources_(*session, m.planBlob, m.planLen);
         if (deny_(*session, d, buf, len)) return;
     }
@@ -8611,7 +8631,7 @@ void ClientGateway::handleCatalogDdl_(const uint8_t* buf, std::size_t len, const
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidTopicName), kMalformedNameDetail);
         return;
     }
-    if (deny_(*session, authorizeCatalogDdl_(*session, m, res.local), buf, len)) return;   // authentication Task 12
+    if (deny_(*session, authorizeCatalogDdl_(*session, m, res.local, res.nsId), buf, len)) return;   // authentication Task 12
     answerAdminSubmit_(buf, len, submit(m, res.local, ddlMetaOf_(&m.ext, m.sessionId, *session, res.nsId)),
                        "catalog DDL: admin ring full", "catalog DDL: request larger than the admin ring message");
 }
@@ -8754,9 +8774,24 @@ void ClientGateway::onNamespaceUpserted(const rune::catalog::NamespaceRecord& r)
     nsSlots_.setLimits(nsSlots_.slotOf(r.nsId), r.limits);
     if (txnService_ != nullptr) txnService_->setNamespaceTxnLimits(r.nsId, r.limits.maxOpenTxns, r.limits.maxTxnTimeMs);   // Task 10
     const NsStateTag tag = rune::catalog::tagOf(r.state);
+    {   // #721: track DELETING for the read gates (Subscribe / GetViewRow); a root session is exempt from the revoke below
+        const auto it = std::lower_bound(deletingNs_.begin(), deletingNs_.end(), r.nsId);
+        const bool have = it != deletingNs_.end() && *it == r.nsId;
+        if (tag == NsStateTag::Deleting && !have) deletingNs_.insert(it, r.nsId);
+        else if (tag != NsStateTag::Deleting && have) deletingNs_.erase(it);
+    }
+    if (tag == NsStateTag::Deleting) {
+        // #721: end every live subscription on the namespace's topics - the same path as a topic drop (the gateway
+        // sub ends, its in-flight PushRead is forgotten).  A root session keeps its login at Deleting, so without this
+        // it would keep receiving records until the reaper drops the topic.
+        objectIndex_.forEachInNs(r.nsId, [&](int32_t id, const rune::gateway::ObjectEntry& e) {
+            if (e.type == rune::security::ResourceType::Topic) (void)endTopicSubscriptions(id);
+        });
+    }
     // Namespaces Phase 2 Task 4: on every node, at the apply of the state change.  Only the node whose transaction
     // coordinator is loaded holds transactions (others return 0), so this covers the transactions whose sessions live
     // on other gateways or are already gone.  Idempotent.
+    if (txnService_ != nullptr) txnService_->setNamespaceTxnGate(r.nsId, tag != NsStateTag::Active, tag == NsStateTag::Deleting);   // #661: a coordinator that loads later re-derives from it
     if (tag != NsStateTag::Active && txnService_ != nullptr) (void)txnService_->abortAllForNamespace(r.nsId, nowNs_);
     nsGateScratch_.clear();
     sessions_.forEach([&](Session& s) {
@@ -9249,7 +9284,11 @@ bool ClientGateway::denyGroupRequest_(Session& session, uint16_t tid, const uint
     const PermissionTable& perms = permsOf_(session);
     if (perms.isAllowAll()) return false;
     const auto group = [&](std::span<const uint8_t> id) {
-        return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read);
+        // Authorize the name the coordinator will act on (scopeClientIdInto): the scoped local name, never the qualified text.
+        const auto r = resolve_(session, sv(id));
+        return r.r == rune::gateway::Resolved::Found
+            ? authorizeName(perms, rsec::ResourceType::Group, r.local, rsec::Operation::Read, r.nsId)
+            : authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read, perms.nsId());
     };
     const auto topic = [&](int32_t id, int32_t partition) {
         return authorizeTopicIdHere_(perms, id, partition, rsec::Operation::Read);
@@ -9305,10 +9344,18 @@ bool ClientGateway::denyTxnRequest_(Session& session, uint16_t tid, const uint8_
     const PermissionTable& perms = permsOf_(session);
     if (perms.isAllowAll()) return false;
     const auto txn = [&](std::span<const uint8_t> id) {
-        return authorizeName(perms, rsec::ResourceType::TransactionalId, sv(id), rsec::Operation::Write);
+        // Authorize the name the coordinator will act on (scopeClientIdInto): the scoped local name, never the qualified text.
+        const auto r = resolve_(session, sv(id));
+        return r.r == rune::gateway::Resolved::Found
+            ? authorizeName(perms, rsec::ResourceType::TransactionalId, r.local, rsec::Operation::Write, r.nsId)
+            : authorizeName(perms, rsec::ResourceType::TransactionalId, sv(id), rsec::Operation::Write, perms.nsId());
     };
     const auto group = [&](std::span<const uint8_t> id) {
-        return authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read);
+        // Authorize the name the coordinator will act on (scopeClientIdInto): the scoped local name, never the qualified text.
+        const auto r = resolve_(session, sv(id));
+        return r.r == rune::gateway::Resolved::Found
+            ? authorizeName(perms, rsec::ResourceType::Group, r.local, rsec::Operation::Read, r.nsId)
+            : authorizeName(perms, rsec::ResourceType::Group, sv(id), rsec::Operation::Read, perms.nsId());
     };
     std::optional<rune::gateway::Denial> d;
     switch (static_cast<pc::TemplateId>(tid)) {
@@ -9364,20 +9411,20 @@ std::optional<rune::gateway::Denial> ClientGateway::authorizeViewSources_(const 
 
 template <class Msg>
 std::optional<rune::gateway::Denial> ClientGateway::authorizeCatalogDdl_(const Session& session, const Msg& m,
-                                                                         std::string_view local) const
+                                                                         std::string_view local, uint32_t nsId) const
 {
     namespace rsec = rune::security;
     using rune::gateway::authorizeName;
     const PermissionTable& perms = permsOf_(session);
     if constexpr (std::is_same_v<Msg, pc::DropTopic>)
-        return authorizeName(perms, rsec::ResourceType::Topic, local, rsec::Operation::Drop);
+        return authorizeName(perms, rsec::ResourceType::Topic, local, rsec::Operation::Drop, nsId);
     else if constexpr (std::is_same_v<Msg, pc::AlterTopicConfig>)
-        return authorizeName(perms, rsec::ResourceType::Topic, local, rsec::Operation::Alter);
+        return authorizeName(perms, rsec::ResourceType::Topic, local, rsec::Operation::Alter, nsId);
     else if constexpr (std::is_same_v<Msg, pc::DropView>)
-        return authorizeName(perms, rsec::ResourceType::View, local, rsec::Operation::Drop);
+        return authorizeName(perms, rsec::ResourceType::View, local, rsec::Operation::Drop, nsId);
     else {
         static_assert(std::is_same_v<Msg, pc::AlterView>);
-        if (auto d = authorizeName(perms, rsec::ResourceType::View, local, rsec::Operation::Alter)) return d;
+        if (auto d = authorizeName(perms, rsec::ResourceType::View, local, rsec::Operation::Alter, nsId)) return d;
         return authorizeViewSources_(session, m.planBlob, m.planLen);
     }
 }
@@ -10201,8 +10248,9 @@ void ClientGateway::handleListNamespaces(const uint8_t* buf, std::size_t len)
 // gateway's own connection counts, and the live object counts of its ObjectIndex / TopicRegistry (the catalog's effects).
 // Usage is per NODE, like every limit enforcement input (D24).  Authorization: a cluster admin, or a session of the namespace
 // itself holding DESCRIBE (or ADMIN) ON NAMESPACE "<name>"; a foreign / unknown name is NotAuthorized for everyone else (the
-// answer never says whether the namespace exists).  Fields with no usage meaning here (schemas, schema versions, groups, users,
-// message / batch / retention, open transactions, txn time, replication, acks, features) read 0 = n/a.
+// answer never says whether the namespace exists).  Fields with no usage meaning here (message / batch / retention, txn time,
+// replication, acks, features) read 0 = n/a.  Schemas and versions come from the gateway's schema registry, groups, users and
+// open transactions from their owners (the group / transaction coordinator is loaded on one node: 0 elsewhere).
 void ClientGateway::handleNamespaceUsage(const uint8_t* buf, std::size_t len)
 {
     auto msgOpt = pc::NamespaceUsageRequest::decode(buf, len);
@@ -10248,11 +10296,15 @@ void ClientGateway::handleNamespaceUsage(const uint8_t* buf, std::size_t len)
     r.limits        = rec->limits;
     auto& u = r.usage;
     // Catalog counts: the live objects of the namespace on this node's index.
-    uint64_t topics = 0, partitionsTotal = 0, partitionsMax = 0, views = 0;
+    uint64_t topics = 0, partitionsTotal = 0, partitionsMax = 0, views = 0, schemas = 0, schemaVersionMax = 0;
     objectIndex_.forEachInNs(rec->nsId, [&](int32_t id, const rune::gateway::ObjectEntry& e) {
         if (e.type == rune::security::ResourceType::View) { ++views; return; }
         if (e.type != rune::security::ResourceType::Topic) return;
         ++topics;
+        if (const rune::codec::FilterSchema* fs = filterSchemas_.find(id); fs != nullptr) {   // #696: a typed topic is one schema
+            ++schemas;
+            schemaVersionMax = std::max<uint64_t>(schemaVersionMax, fs->maxVersion());
+        }
         if (topicRegistry_ != nullptr)
             if (const rune::node::TopicSpec* t = topicRegistry_->topic(id); t != nullptr && t->partitionCount > 0) {
                 partitionsTotal += static_cast<uint64_t>(t->partitionCount);
@@ -10260,6 +10312,13 @@ void ClientGateway::handleNamespaceUsage(const uint8_t* buf, std::size_t len)
             }
     });
     u[0] = topics; u[1] = partitionsMax; u[2] = partitionsTotal; u[3] = views;
+    u[4] = schemas; u[5] = schemaVersionMax;
+    // #696: groups / users / open transactions come from the owner of the count their limit check reads (per node, D24: the
+    // groups and transactions are non-zero only where the coordinator is).
+    if (groupService_ != nullptr) u[6] = groupService_->groupsOfNamespace(rec->nsId);
+    if (securityView_ != nullptr)
+        for (const auto& [uid, usr] : securityView_->state().users()) if (usr.nsId == rec->nsId) ++u[7];
+    if (txnService_ != nullptr) u[21] = txnService_->openTxnsOfNamespace(rec->nsId);
     // The slot's counters: the aggregator's last totals / rates, and this gateway's connections.
     const uint16_t slot = nsSlots_.slotOf(rec->nsId);
     if (slot != rune::node::kNoNsSlot) {
@@ -10487,6 +10546,12 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
         if (deny_(*session, authorizeTopicIdHere_(perms, m.viewTopicId, 0, rune::security::Operation::Read,
                                                              rune::security::ResourceType::View), buf, len))
             return;
+
+    // #721: a view of a DELETING namespace is gone for readers, a root session included (one compare when none deletes).
+    if (inDeletingNs_(m.viewTopicId)) [[unlikely]] {
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "GetViewRow: namespace is being deleted");
+        return;
+    }
 
     // Resolve the owning partition from the key (canonical 8-byte LE key bytes).
     // partitionForKey needs the view's output topic in the registry; an unknown

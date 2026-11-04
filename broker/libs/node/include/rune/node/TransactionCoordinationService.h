@@ -48,6 +48,7 @@
 //   lookup — transparent comparators (std::less<>) on the coordinator map.
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <optional>
 #include <spdlog/spdlog.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
@@ -201,6 +202,8 @@ public:
     /// suspended or deleted namespace.  0 when this node is not the loaded coordinator.
     uint32_t abortAllForSession(int64_t sessionId, int64_t nowNs) override;
     uint32_t abortAllForNamespace(uint32_t nsId, int64_t nowNs) override;
+    void setNamespaceTxnGate(uint32_t nsId, bool blocked, bool deleting) override;   ///< #661
+    [[nodiscard]] uint64_t openTxnsOfNamespace(uint32_t nsId) const override { return coordinator_.openTxnsOfNamespace(nsId); }   ///< #696
     void setNamespaceTxnLimits(uint32_t nsId, uint64_t maxOpenTxns, uint64_t maxTxnTimeMs) override {
         coordinator_.setNamespaceTxnLimits(nsId, maxOpenTxns, maxTxnTimeMs);
     }
@@ -216,6 +219,12 @@ public:
     /// the tombstones are not yet committed; Done = none left and all committed.
     ReapStatus tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
     /// Read-only test seam: the live transactional ids of `nsId` in this node's store; 0 when the store is not loaded here.
+    /// #663 / #727 test seam: the in-memory coordinator's known transactional ids and held keys.
+    [[nodiscard]] std::size_t coordinatorSizeForTest() const noexcept { return coordinator_.size(); }
+    [[nodiscard]] std::size_t holdCountForTest() const noexcept { return holds_.size(); }
+    /// Entries of namespace `nsId` still held IN MEMORY (the coordinator's transactions, holds, last-put offsets and the
+    /// producer-id cache: what forgetNamespace_ erases).  Cold scan; independent of the persisted store.
+    [[nodiscard]] std::size_t inMemoryEntriesOfNamespaceForTest(uint32_t nsId) const;
     [[nodiscard]] std::optional<std::size_t> liveKeysOfNamespaceForTest(uint32_t nsId) const;   ///< nullopt = unknown (not loaded / not the coordinator)
 
     /// A control marker this node could not append.  NEVER counts as landed: a
@@ -242,6 +251,7 @@ public:
     /// Task 10 round 5: an asynchronously appended marker landed.
     void onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,
                                int32_t coordinatorEpoch) override;
+    [[nodiscard]] uint64_t mootOffsetsDroppedForTest() const noexcept { return mootOffsetsDropped_; }
     [[nodiscard]] std::size_t awaitingMarkerTxnsForTest() const noexcept { return awaiting_.size(); }
     [[nodiscard]] uint64_t transactionsCompletedForTest() const noexcept { return transactionsCompleted_; }
     [[nodiscard]] uint64_t controlMarkersRefusedForTest() const noexcept { return controlMarkersRefused_; }
@@ -503,6 +513,12 @@ private:
     /// last record before it; -3: no store).
     void completeHolds_(const std::string& txnId, int64_t record, int64_t putFloor = -1);
     int  releaseCommittedHolds_();
+    void forgetNamespace_(uint32_t nsId);
+    /// #661: the namespaces that are not ACTIVE (sorted; control thread, cold).  Re-applied at every load.
+    std::vector<uint32_t> deletingNs_;   ///< sorted: namespaces in Deleting - their transactional offsets are moot (suspend still applies them)
+    uint64_t mootOffsetsDropped_ = 0;
+    [[nodiscard]] bool nsDeleting_(uint32_t ns) const noexcept { return std::binary_search(deletingNs_.begin(), deletingNs_.end(), ns); }
+    std::vector<uint32_t> blockedNs_;   ///< #663 / #727: drop a deleted namespace's in-memory entries
     /// True when a key of offsetsScratch_ is held by another transaction (or by this id's completing one).
     [[nodiscard]] bool heldByOther_(const std::string& group, const std::string& txnId) const;
 

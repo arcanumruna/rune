@@ -113,6 +113,17 @@ struct ITxnRequestHandler {
     // the gateway on every namespace record upsert (and cleared on the erase).  Control thread, cold.  Default: ignored.
     virtual void setNamespaceTxnLimits(uint32_t /*nsId*/, uint64_t /*maxOpenTxns*/, uint64_t /*maxTxnTimeMs*/) {}
 
+    // #661: the durable-state mirror of "this namespace is not ACTIVE" (ReadOnly, RejectAll or Deleting), pushed by the
+    // gateway on every namespace upsert (blocked = state != Active), on the erase (false) and, for the booted
+    // namespaces, at setTxnService.  A coordinator that loads AFTER the apply re-derives from it: it aborts every open
+    // transaction of a blocked namespace at its load (abortAllForNamespace answers 0 while unloaded).  Control thread,
+    // cold.  Default: ignored.
+    virtual void setNamespaceTxnGate(uint32_t /*nsId*/, bool /*blocked*/, bool /*deleting*/) {}
+
+    // #696: the Ongoing transactions of namespace `nsId` on this node's coordinator (the count its maxOpenTxns limit checks).
+    // 0 when the coordinator is not loaded here (usage is per node, D24).  Control thread, cold.  Default: 0.
+    [[nodiscard]] virtual uint64_t openTxnsOfNamespace(uint32_t /*nsId*/) const { return 0; }
+
     // F15-FU1 (#112, KIP-890 part 1): may a transactional data batch of (producerId,
     // producerEpoch) open a transaction on (topicId, partition)?  Asked by a partition
     // leader for the first such batch of a producer with no open transaction there.

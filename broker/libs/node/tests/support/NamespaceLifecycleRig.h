@@ -12,7 +12,7 @@
 // plan holds it at DroppingTopics; no public observation tells the two apart (a DELETING name answers as a missing one),
 // and holding it at its first step keeps every older DELETING namespace from consuming a later cell's budget.
 //
-// Every wait is bounded (AuthRig::dl); no sleeps.
+// Every wait is bounded (the client's pollFor budget or AuthRig::dl); the rig has no sleep_for of its own (ShardTestClient::pollFor pumps the egress and pauses briefly inside the poll).
 
 #include "support/AuthRig.h"
 #include "support/NamespaceLifecycleMatrixExpectations.h"
@@ -361,11 +361,7 @@ public:
     }
     /// Polls (bounded) until `pred()`; the caller pumps nothing: the broker runs on its own threads.
     template <class F> bool until(F&& pred, int tries = 3000) {
-        for (int i = 0; i < tries; ++i) {
-            if (pred()) return true;
-            w_->r.c().pollFor(std::chrono::milliseconds(10), [] { return false; });
-        }
-        return pred();
+        return w_->r.c().pollFor(std::chrono::milliseconds(10) * tries, std::forward<F>(pred));   // #711: the client's own poll
     }
     /// The number of `kind` events of namespace `nsId` in the node's whole __catalog log (committed or not).
     [[nodiscard]] std::size_t catalogEventCount(rune::catalog::EventKind kind, uint32_t nsId) {

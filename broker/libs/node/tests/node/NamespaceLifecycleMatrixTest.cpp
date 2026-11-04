@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -144,10 +145,12 @@ TEST_P(NamespaceLifecycleMatrixRegression, Cell) {
         EXPECT_TRUE(got.topicsRemain) << label << ": lowering a limit deletes nothing";
         EXPECT_EQ(got.followUpCode, static_cast<int>(ErrorCode::NamespaceLimitExceeded)) << label << ": a new topic is refused";
     }
-    if (ran && want.kind != LcOutcome::Missing && (p.op == LcOp::SetLimitsRaise || p.op == LcOp::SetLimitsLowerRetention) &&
-        p.target != LcTarget::Default) {
+    // #708: the stored limit is read back for every accepted cell, the Default target included, and LowerBelowUsage too.
+    if (ran && want.kind != LcOutcome::Missing &&
+        (p.op == LcOp::SetLimitsRaise || p.op == LcOp::SetLimitsLowerRetention || p.op == LcOp::SetLimitsLowerBelowUsage)) {
         const auto& o = got;
         if (p.op == LcOp::SetLimitsRaise) EXPECT_GT(o.limitsAfter.maxTopics, 5000u) << label << ": the raised limit is stored";
+        else if (p.op == LcOp::SetLimitsLowerBelowUsage) EXPECT_EQ(o.limitsAfter.maxTopics, 1u) << label << ": the lowered topic limit is stored";
         else EXPECT_EQ(o.limitsAfter.maxRetentionMs, 1u) << label << ": the lowered retention is stored";
     }
     // A refused SetLimits changed no stored limit: read back the way the accepted cells do.
@@ -508,7 +511,7 @@ bool waitFor(const std::function<bool()>& pred, std::chrono::seconds limit = 30s
     const auto deadline = std::chrono::steady_clock::now() + limit;
     while (std::chrono::steady_clock::now() < deadline) {
         if (pred()) return true;
-        std::this_thread::sleep_for(2ms);
+        std::this_thread::yield();   // #711: a poll on the awaited state under a hard deadline; no wall-clock sleep
     }
     return pred();
 }
@@ -573,6 +576,18 @@ void txnOpen(const TCell& p) {
     ASSERT_TRUE(waitFor([&] { return uncommittedSawS.load(); }, 20s)) << "premise: the sentinel is in the log";
     subU.unsubscribe();
     EXPECT_TRUE(snapshot().empty()) << "premise: an open transaction pins the last stable offset";
+    // #721: a DELETING namespace is not readable by id, the cluster admin's subscription included (it ends at the Deleting
+    // apply), so for Delete the witness of the abort is the partition's last stable offset (pinned below the sentinel by the
+    // open transaction, past it once the ABORT marker is in the log) instead of the sentinel's delivery.
+    auto replicaInt = [&](auto read) {
+        return b.node().onOwnerThreadForTest(spec.topicId, 0, [&](rune::replication::PartitionReplica* r) {
+            return r != nullptr ? static_cast<int64_t>(read(*r)) : int64_t{-1};
+        });
+    };
+    const auto lsoOf = [&] { return replicaInt([](rune::replication::PartitionReplica& r) { return r.cleanerLastStableOffset(); }); };
+    const auto endOf = [&] { return replicaInt([](rune::replication::PartitionReplica& r) { return r.logEndOffset(); }); };
+    const int64_t endBefore = endOf();
+    if (p.variant >= 2) ASSERT_LT(lsoOf(), endBefore) << "premise: the open transaction pins the LSO below the sentinel";
     switch (p.variant) {
         case 0: ASSERT_TRUE(admin->suspendNamespace("a", pc::NsSuspendMode::ReadOnly).has_value()); break;
         case 1: ASSERT_TRUE(admin->suspendNamespace("a", pc::NsSuspendMode::RejectAll).has_value()); break;
@@ -586,9 +601,14 @@ void txnOpen(const TCell& p) {
             ASSERT_TRUE(admin->deleteNamespace("a").has_value());
             break;
     }
-    ASSERT_TRUE(waitFor([&] { const auto s = snapshot(); return std::find(s.begin(), s.end(), "S") != s.end(); }, 40s))
-        << "the sentinel never became visible: the open transaction was not aborted";
-    for (const std::string& v : snapshot()) EXPECT_EQ(v, "S") << "an aborted record is visible to read_committed";
+    if (p.variant >= 2) {
+        ASSERT_TRUE(waitFor([&] { return lsoOf() >= endBefore; }, 40s))
+            << "the LSO never passed the sentinel: the open transaction was not aborted; lso " << lsoOf() << " end " << endOf();
+    } else {
+        ASSERT_TRUE(waitFor([&] { const auto s = snapshot(); return std::find(s.begin(), s.end(), "S") != s.end(); }, 40s))
+            << "the sentinel never became visible: the open transaction was not aborted";
+        for (const std::string& v : snapshot()) EXPECT_EQ(v, "S") << "an aborted record is visible to read_committed";
+    }
     // The commit fails at once with a definite outcome - never by waiting out its timeout (review B1: a timeout used to
     // pass here and hid two client hangs: EndTxn 51 retried until the deadline, a RejectAll's corr-0 51 ignored).
     if (p.variant != 0) {
@@ -613,9 +633,17 @@ void txnOpen(const TCell& p) {
     if (p.variant == 0) {
         // ReadOnly: the session lives; the gateway refuses EndTxn NamespaceSuspended and the client goes FatalError.
         EXPECT_EQ(err, "commitTransaction(): broker error code 51 (EndTxn failed (fatal))");
+        // #715: a platform-aborted end is offered exactly once - no client resend loop on the 51
+        EXPECT_EQ(txn.endTxnAttemptsForTest(), 1u) << "EndTxn was not submitted exactly once";
+        EXPECT_EQ(txn.endTxnWireOffersForTest(), 1u) << "EndTxn was not offered on the wire exactly once";
     } else {
         // RejectAll (corr-0 51) / Delete (corr-0 46) ended the session: the client failed for good before the commit.
-        EXPECT_EQ(err, "commitTransaction(): client closed");
+        // Which definite outcome the commit sees depends on whether the client has finished closing: "client closed", or
+        // the terminal FatalError the corr-0 answer left behind (both fail at once, neither sends EndTxn).
+        const std::string fatal = std::string("commitTransaction(): broker error code ") + (p.variant == 1 ? "51" : "46") +
+                                  " (transactional producer in FatalError (terminal))";
+        EXPECT_TRUE(err == "commitTransaction(): client closed" || err == fatal) << err;
+        EXPECT_EQ(txn.endTxnAttemptsForTest(), 0u) << "the session ended first: the commit must not send EndTxn at all";
     }
     sub.unsubscribe();
 }
@@ -685,4 +713,213 @@ TEST(NamespaceDeletingProduceRegression, ClusterAdminProduceToDeletingNamespaceI
     rig.releaseReaper();
     ASSERT_TRUE(rig.until([&] { return rig.erased(nsId); }));
     for (const int32_t id : ids) EXPECT_EQ(rig.auth().produce(rig.rootSid(), id), kUnknownTopic) << "erased: topic " << id;
+}
+
+// #709 (in-process twin of namespace-e2e.sh step 15): a namespace holding a VIEW WITH A ROW, a consumer group's committed
+// offset and an OPEN transaction (InitProducerId + AddPartitionsToTxn + a transactional produce, no EndTxn) is deleted.
+// After the delete: the reaper dropped the view (one DropView event) and the view row is gone (the same getViewRow that
+// answered OK before answers 4), the keyed stores (TransactionCoordinationService / GroupCoordinationService
+// liveKeysOfNamespaceForTest, through BrokerNode::nsKeyedStoresCleanForTest) hold nothing of the old id, no ns-<id>
+// directory is left, and in the re-created same-name namespace the same transactional id starts FRESH: the first
+// InitProducerId answers epoch 0 with no open transaction (the old one was bumped to epoch >= 1 and open).
+// Mutations: skip the reaper's DroppingViews step -> red (DropView 0 / the delete never completes); skip its
+// TxnsAborted step (NamespaceReaper.cpp) -> red (the open transaction is never aborted, the delete never completes).
+TEST(NamespaceLifecycleMatrixDeleteRegression, DeleteWithViewsGroupsTxnsLeavesNothingRegression) {
+    using namespace rune::node::test::grants;
+    constexpr int kViewRowGone = 4;
+    LcRig rig("nsdelvgt");
+    const std::string nm = "d";
+    const int64_t userSid = rig.seedDeleteWorkload(nm);
+    const uint32_t id = rig.observe(nm).nsId;
+    ASSERT_NE(id, 0u);
+    const auto oldTopics = rig.topicIds(nm);
+    ASSERT_EQ(oldTopics.size(), 2u);
+    const int32_t src = oldTopics.front();
+    const int32_t view = rig.auth().createView(rig.rootSid(), nm + "/v", src);
+    ASSERT_GE(view, 0) << "the view is created in the namespace";
+    // The view holds a row BEFORE the delete: OK, not the not-found code.
+    ASSERT_EQ(rig.auth().produce(rig.rootSid(), src, /*untilOk=*/true), 0);
+    ASSERT_TRUE(rig.until([&] { return rig.auth().getViewRow(rig.rootSid(), view) == 0; }, 500))
+        << "premise: the view never held a row (getViewRow " << rig.auth().getViewRow(rig.rootSid(), view) << ")";
+    // An OPEN transaction: a fresh epoch, a partition added, a transactional record produced, no EndTxn.
+    const auto ids = rig.auth().initProducer(userSid, "x");
+    ASSERT_EQ(ids.code, 0);
+    ASSERT_GE(ids.epoch, 1) << "the seed's InitProducerId made epoch 0, this one bumped it";
+    ASSERT_EQ(rig.auth().addPartitions(userSid, "x", src, ids.pid, ids.epoch), 0);
+    // ConcurrentTransactions (27) = the AddPartitions registration is not durable yet: retriable, bounded.
+    int produced = -1;
+    ASSERT_TRUE(rig.until([&] {
+        produced = rig.auth().produceAs(userSid, src, ids.pid, ids.epoch, 0, /*transactional=*/true).code;
+        return produced != static_cast<int>(pc::ErrorCode::ConcurrentTransactions);
+    }, 500));
+    ASSERT_EQ(produced, 0) << "premise: the transactional produce is acked, the transaction stays open";
+    EXPECT_FALSE(rig.auth().keyedStoresCleanBounded(id)) << "premise: the coordinators hold keys of the namespace";
+    ASSERT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Delete, nm).code, 0);
+    EXPECT_TRUE(rig.waitSessionGone(userSid));
+    rig.releaseReaper();   // the rig holds the reaper from the start
+    ASSERT_TRUE(rig.until([&] { return rig.erased(id); })) << "the delete never completed";
+    EXPECT_EQ(rig.catalogEventCount(rune::catalog::EventKind::DropView, id), 1u) << "the view dropped exactly once";
+    EXPECT_TRUE(rig.until([&] {
+        return !std::filesystem::exists(nsRoot(rig.dataDir(), id)) &&
+               !std::filesystem::exists(std::filesystem::path(nsRoot(rig.dataDir(), id).string() + ".deleting"));
+    })) << "ns-<id> directory";
+    EXPECT_TRUE(rig.auth().keyedStoresCleanBounded(id)) << "a live consumer-offset or transaction-state key of the deleted namespace";
+    EXPECT_EQ(rig.auth().getViewRow(rig.rootSid(), view), kViewRowGone) << "the old view's row is gone";
+    ASSERT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Create, nm).code, 0);
+    EXPECT_NE(rig.observe(nm).nsId, id);
+    const auto md = rig.rootMetadata();
+    for (const int32_t t : oldTopics) EXPECT_FALSE(std::binary_search(md.begin(), md.end(), t)) << "old topic " << t << " listed";
+    EXPECT_FALSE(std::binary_search(md.begin(), md.end(), view)) << "the old view " << view << " is listed";
+    // The same transactional id in the re-created namespace: the coordinator holds nothing for it, so it starts fresh.
+    rig.broker().createUser(nm + "/u", AuthRig::kPw,
+                            {prefix(SO::Write, ST::TransactionalId, ""), prefix(SO::Describe, ST::TransactionalId, "")});
+    const int64_t sid2 = rig.auth().login(nm + "/u", AuthRig::kPw, pc::kClientVersionNamespaces);
+    ASSERT_GT(sid2, 0);
+    const auto fresh = rig.auth().initProducer(sid2, "x");
+    EXPECT_EQ(fresh.code, 0);
+    EXPECT_EQ(fresh.epoch, 0) << "a transactional id of the deleted namespace survived in the coordinator (epoch " << fresh.epoch << ")";
+}
+
+// #721: DELETING gated produce at the worker, but a read of the namespace by id was still served to a root session
+// (exempt from the Deleting revoke): its live subscriptions kept receiving, a new Subscribe was accepted and GetViewRow
+// answered, until the reaper dropped the topic.  Held reaper = the window stays open.
+TEST(NamespaceDeletingProduceRegression, RootReadsOfDeletingNamespaceAreUnknownTopicRegression) {
+    constexpr int kUnknownTopic = static_cast<int>(pc::ErrorCode::UnknownTopic);
+    LcRig rig("nsdelread");   // the reaper is held: a deleted namespace stays DELETING
+    rig.prepare("dr", LcTarget::Active, 0, LcCaller::ClusterAdmin);
+    const std::vector<int32_t> ids = rig.topicIds("dr");
+    ASSERT_EQ(ids.size(), 2u);
+    AuthRig& a = rig.auth();
+    auto& c = a.c();
+    const int64_t sid = rig.rootSid();
+    const int32_t vid = a.createView(sid, "dr/v", ids[0]);
+    ASSERT_GE(vid, 0);
+    for (int i = 0; i < 5; ++i) ASSERT_EQ(a.produce(sid, ids[0], /*untilOk=*/true), 0) << "record " << i;
+
+    const int64_t s1 = c.sendSubscribe(a.ch(), a.stream(), sid, ids[0], 0);
+    const auto s1Code = c.awaitSubscribeCode(s1, AuthRig::dl());
+    ASSERT_TRUE(s1Code.has_value());
+    ASSERT_EQ(*s1Code, 0);
+    const auto s1Id = c.subscriptionIdOf(s1);
+    ASSERT_TRUE(s1Id.has_value());
+    auto framesOf = [&](int64_t subId) {
+        std::size_t n = 0;
+        for (const auto& r : c.records()) if (r.subscriptionId == subId) ++n;
+        return n;
+    };
+    ASSERT_TRUE(c.pollUntil([&] { return framesOf(*s1Id) > 0; })) << "baseline: S1 receives the 5 records";
+    const int64_t rowCorr = c.sendGetViewRow(a.ch(), a.stream(), sid, vid, 1);
+    const auto row = c.awaitViewRowOrError(rowCorr, AuthRig::dl());
+    ASSERT_TRUE(row.has_value());
+    ASSERT_FALSE(row->isError) << "baseline: GetViewRow code " << row->errorCode;
+    ASSERT_LE(row->status, 2u) << "baseline: GetViewRow status";
+
+    const uint32_t nsId = rig.observe("dr").nsId;
+    ASSERT_NE(nsId, 0u);
+    ASSERT_EQ(rig.ns(sid, pc::NamespaceDdlKind::Delete, "dr").code, 0);
+
+    // (1) S1 ends with UnknownTopic at the Deleting apply (same path as a topic drop), not at the reaper's drop.
+    ASSERT_TRUE(c.pollUntil([&] {
+        for (const auto& e : c.errors()) if (e.correlationId == s1) return e.code == kUnknownTopic;
+        return false;
+    })) << "S1 of the DELETING namespace was not ended";
+    const std::size_t framesAtEnd = framesOf(*s1Id);
+    ASSERT_FALSE(rig.erased(nsId)) << "the reaper is held: the namespace is still DELETING";
+
+    // (2) a new root Subscribe by the topic's id answers like a topic that never existed.
+    constexpr int32_t kNeverExisted = 987654;
+    const int64_t nCorr = c.sendSubscribe(a.ch(), a.stream(), sid, kNeverExisted, 0);
+    const auto nCode = c.awaitSubscribeCode(nCorr, AuthRig::dl());
+    ASSERT_TRUE(nCode.has_value());
+    ASSERT_EQ(*nCode, kUnknownTopic) << "baseline: a never-existing id";
+    for (const int32_t id : ids) {
+        const int64_t corr = c.sendSubscribe(a.ch(), a.stream(), sid, id, 0);
+        const auto code = c.awaitSubscribeCode(corr, AuthRig::dl());
+        ASSERT_TRUE(code.has_value()) << "topic " << id;
+        EXPECT_EQ(*code, *nCode) << "a root Subscribe to topic " << id << " of the DELETING namespace";
+        EXPECT_EQ(c.subscriptionIdOf(corr).value_or(0), 0) << "topic " << id << " got a subscription";   // a refusal carries id 0
+    }
+
+    // (3) GetViewRow of the namespace's view: the missing-view answer.
+    const int64_t gCorr = c.sendGetViewRow(a.ch(), a.stream(), sid, vid, 1);
+    const auto g = c.awaitViewRowOrError(gCorr, AuthRig::dl());
+    ASSERT_TRUE(g.has_value());
+    EXPECT_FALSE(g->isError);
+    EXPECT_EQ(g->status, pc::ViewRowResponse::kUnknownView) << "GetViewRow on a view of the DELETING namespace";
+
+    EXPECT_EQ(framesOf(*s1Id), framesAtEnd) << "S1 received a frame after it ended";
+}
+
+// ── #708: lowering a namespace's max-retention-ms reaches the cleaner and deletes the oldest segment ─────────────────
+namespace {
+std::vector<std::string> segmentFileNames(const std::filesystem::path& topicDir) {
+    std::vector<std::string> v;
+    std::error_code ec;
+    if (!std::filesystem::exists(topicDir, ec)) return v;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(topicDir, ec))
+        if (e.is_regular_file() && e.path().extension() == ".log") v.push_back(e.path().filename().string());
+    std::sort(v.begin(), v.end());
+    return v;
+}
+}  // namespace
+
+TEST(NamespaceLifecycleMatrixLimitsRegression, SetLimitsLowerRetentionDeletesOldestSegmentRegression) {
+    using namespace grants;
+    AuthBroker b("nslclr");
+    b.bootstrapAdmin(kAdminPw);
+    auto admin = newClient(b, "admin");
+    const auto nsId = admin->createNamespace("a");
+    ASSERT_TRUE(nsId.has_value());
+    b.createUser("a/ua", kUserPw,
+                 {prefix(SO::Create, ST::Topic, ""), prefix(SO::Describe, ST::Topic, ""), prefix(SO::Write, ST::Topic, ""),
+                  prefix(SO::Read, ST::Topic, "")});
+    // topic r: 4 KiB segments, retention 1 h, the topic's own retention pass every 50 ms (a per-topic setting)
+    rc::TopicOptions topic;
+    topic.config.segmentRollBytes = 4096;
+    topic.config.retentionMs = 3'600'000;
+    topic.config.retentionCheckMs = 50;
+    rc::TopicSpec spec;
+    {
+        auto c = newClient(b, "a/ua");
+        const auto r = c->defineTopicAndWait("r", 1, "", {}, rc::Persistence::Disk, topic, {}, 20s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+        spec = rc::TopicSpec{"r", r.topicId, 1};
+        c->close();
+    }
+    auto ua = newClient(b, "a/ua", {spec});
+    {   // ~600 KiB: a 4 KiB roll setting still maps 16 KiB per segment (about 14 records), so this is at least 16 segments
+        rc::ProducerConfig pcfg;
+        pcfg.acks = rc::Acks::All;
+        pcfg.batchRecords = 1;   // one batch per record: a segment rolls between batches, never inside one
+        rc::Producer p = ua->producer(pcfg);
+        const std::string v(1000, 'x');
+        for (int i = 0; i < 600; ++i) p.send(ua->topic("r"), rc::Key(static_cast<int64_t>(i)), bytesOf(v));
+        ASSERT_EQ(p.closeAndWait(30s), rc::OpStatus::Ok);
+    }
+    const auto logStart = [&] {
+        return b.node().onOwnerThreadForTest(spec.topicId, 0, [](rune::replication::PartitionReplica* r) {
+            return r != nullptr && r->log() != nullptr ? r->log()->logStartOffset() : int64_t{-1};
+        });
+    };
+    const auto dir = topicsRoot(b.dir() / "broker", *nsId) / "r";
+    const std::vector<std::string> before = segmentFileNames(dir);
+    ASSERT_GE(before.size(), 16u) << "premise: the data spread over at least 16 segments";
+    // premise: the cleaner has run passes (its own 50 ms cadence) and, with a 1 h retention, deleted nothing
+    const uint64_t cycles0 = b.node().cleanerCyclesForTest();
+    ASSERT_TRUE(waitFor([&] { return b.node().cleanerCyclesForTest() >= cycles0 + 3; }, 20s)) << "premise: the cleaner is running";
+    ASSERT_EQ(logStart(), 0) << "premise: nothing is deleted under a 1 h retention";
+    ASSERT_EQ(segmentFileNames(dir).front(), before.front()) << "premise: the oldest segment is still there";
+
+    std::size_t retentionField = rune::protocol::kNamespaceLimitFieldCount;
+    for (std::size_t i = 0; i < rune::client::kNamespaceLimitFields.size(); ++i)
+        if (rune::client::kNamespaceLimitFields[i].name == "max-retention-ms") retentionField = i;
+    ASSERT_LT(retentionField, rune::protocol::kNamespaceLimitFieldCount);
+    rune::client::NamespaceLimitsPatch patch;
+    ASSERT_TRUE(patch.set(retentionField, 1));
+    ASSERT_TRUE(admin->setNamespaceLimits("a", patch).has_value());
+
+    EXPECT_TRUE(waitFor([&] { return logStart() > 0; }, 40s))
+        << "the namespace's lowered retention never reached the cleaner: the log start offset stays " << logStart();
+    EXPECT_TRUE(waitFor([&] { const auto now = segmentFileNames(dir); return !now.empty() && now.front() != before.front(); }, 20s))
+        << "the oldest segment file survived";
 }

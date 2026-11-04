@@ -9,7 +9,9 @@
 #include "SecurityScript.h"
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <fstream>
+#include <random>
 #include <map>
 #include <string>
 #include <tuple>
@@ -279,6 +281,55 @@ TEST(NamespaceSecurityV2Regression, NsAdminIsNotSecurityAdminRegression) {
     // a disabled namespace admin is not listed
     ASSERT_TRUE(sc.runIn(kNs1, rs::AlterUserOps{rs::DisableUser{}}, "boss").has_value());
     EXPECT_TRUE(sc.s.nsAdminOf(kNs1, "arena").empty());
+}
+
+// #653: isNsAdmin answers the yes/no question for one user without building nsAdminOf's vector; it must agree with
+// nsAdminOf for every (user, namespace), including disabled admins, unknown users and other namespaces' users.
+TEST(NamespaceSecurityV2Regression, IsNsAdminMatchesNsAdminOfRegression) {
+    constexpr uint32_t kNsCount = 3;
+    constexpr int kUsers = 20;
+    const char* const names[kNsCount + 1] = {"default", "arena", "lobby", "pit"};
+    std::mt19937 rng(0x653);
+    Script sc;
+    for (uint32_t ns = 1; ns <= kNsCount; ++ns)
+        for (int i = 0; i < kUsers; ++i) {
+            const std::string u = "u" + std::to_string(i);
+            ASSERT_TRUE(sc.runIn(ns, rs::CreateUserOps{v(1)}, u).has_value());
+            if (rng() % 2 == 0) {
+                const char* target = names[1 + rng() % kNsCount];   // sometimes a grant naming another namespace (inert)
+                ASSERT_TRUE(sc.runIn(ns, rs::GrantOps{rs::GranteeKind::User,
+                                                      g(Operation::Admin, ResourceType::Namespace, PatternKind::Exact, target)}, u).has_value());
+            }
+            if (rng() % 3 == 0) ASSERT_TRUE(sc.runIn(ns, rs::AlterUserOps{rs::DisableUser{}}, u).has_value());
+        }
+    std::size_t admins = 0, nonAdmins = 0, disabledAdmins = 0;
+    for (uint32_t ns = 1; ns <= kNsCount; ++ns) {
+        const auto listed = sc.s.nsAdminOf(ns, names[ns]);
+        for (uint32_t userNs = 1; userNs <= kNsCount; ++userNs)
+            for (int i = 0; i < kUsers; ++i) {
+                const rs::UserObject* u = sc.s.userByName(userNs, "u" + std::to_string(i));
+                ASSERT_NE(u, nullptr);
+                // Independent of isNsAdmin (nsAdminOf is built on it): enabled, of this namespace, ADMIN on its NAMESPACE.
+                const bool expected = u->enabled && u->nsId == ns && rs::effectivePerms(sc.s, u->objectId, names[ns]).nsAdmin;
+                EXPECT_EQ(std::find(listed.begin(), listed.end(), u->objectId) != listed.end(), expected)
+                    << "nsAdminOf: user " << i << " of ns " << userNs << " asked about ns " << ns;
+                EXPECT_EQ(sc.s.isNsAdmin(u->objectId, ns, names[ns]), expected)
+                    << "user " << i << " of ns " << userNs << " asked about ns " << ns;
+                if (userNs == ns) {
+                    (expected ? admins : nonAdmins)++;
+                    if (!u->enabled && rs::effectivePerms(sc.s, u->objectId, names[ns]).nsAdmin) {
+                        ++disabledAdmins;
+                        EXPECT_FALSE(sc.s.isNsAdmin(u->objectId, ns, names[ns])) << "a disabled admin is not an admin";
+                    }
+                } else {
+                    EXPECT_FALSE(sc.s.isNsAdmin(u->objectId, ns, names[ns])) << "a user of another namespace";
+                }
+            }
+    }
+    EXPECT_GT(admins, 0u);
+    EXPECT_GT(nonAdmins, 0u);
+    EXPECT_GT(disabledAdmins, 0u) << "the seed must produce a disabled admin or the leg is vacuous";
+    EXPECT_FALSE(sc.s.isNsAdmin(999999, 1, "arena")) << "unknown user";
 }
 
 TEST(NamespaceSecurityV2Regression, PatternScopedToRoleNsRegression) {

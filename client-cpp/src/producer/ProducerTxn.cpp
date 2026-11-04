@@ -499,6 +499,7 @@ int ProducerImpl::endStep_(int64_t nowNs) noexcept {
                                                      cfg_.transactionalId.size());
         s->setFrameLen(static_cast<uint16_t>(m.encode(s->frame.data())));
         coord_->submit(*s);
+        ++endTxnSubmits_;   // #715 probe
         op.deadlineNs = deadline;
         phase         = EndSent{s, std::holds_alternative<ResendEnd>(phase) ? EndTry::Resend : EndTry::First};
         return 1;
@@ -829,6 +830,7 @@ void ProducerImpl::noteEndReoffer_() noexcept {
 }
 
 void ProducerImpl::onEndTxnAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& s, int64_t nowNs) noexcept {
+    endTxnWireOffers_ += s.offers;   // #715 probe
     noteEndReoffer_();   // an offer after the first one: its answer is about a request that may already have landed
     auto* cm = std::get_if<Committing>(&txn_);
     auto* ab = std::get_if<Aborting>(&txn_);

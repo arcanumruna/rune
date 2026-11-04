@@ -79,6 +79,20 @@ public:
         for (std::size_t i = 0; i < entries_.size(); ++i)
             if (!entries_[i].name.empty() && entries_[i].nsId == nsId) f(static_cast<int32_t>(i), entries_[i]);
     }
+    /// Test hooks: steps taken by the older-sharer re-point scan, and a name's shadowed count (0 when absent).
+    [[nodiscard]] std::size_t scanStepsForTest() const noexcept { return scanSteps_; }
+    [[nodiscard]] uint32_t shadowedForTest(uint32_t nsId, std::string_view name) const noexcept {
+        if (slots_.empty()) return 0;
+        const uint32_t h = hash32_(nsId, name);
+        const std::size_t mask = slots_.size() - 1;
+        for (std::size_t i = h & mask;; i = (i + 1) & mask) {
+            const Slot& s = slots_[i];
+            if (s.id < 0) return 0;
+            if (s.hash != h) continue;
+            const ObjectEntry& e = entries_[static_cast<std::size_t>(s.id)];
+            if (e.nsId == nsId && e.name == name) return s.shadowed;
+        }
+    }
     /// One past the highest id ever created.
     [[nodiscard]] int32_t idLimit() const noexcept { return static_cast<int32_t>(entries_.size()); }
 
@@ -86,6 +100,7 @@ private:
     struct Slot {
         int32_t  id   = -1;   // -1 = empty
         uint32_t hash = 0;
+        uint32_t shadowed = 0;   // OTHER live entries with this holder's (nsId, name): the re-point scan runs only when > 0
     };
     [[nodiscard]] static uint32_t hash32_(uint32_t nsId, std::string_view name) noexcept {
         return static_cast<uint32_t>(hashNsName(nsId, name));
@@ -107,10 +122,11 @@ private:
             Slot& s = slots_[i];
             if (s.id < 0) { s = Slot{id, h}; ++count_; return; }
             const ObjectEntry& o = entries_[static_cast<std::size_t>(s.id)];
-            if (s.hash == h && o.nsId == nsId && o.name == name) { s.id = id; return; }   // the newer id wins
+            if (s.hash == h && o.nsId == nsId && o.name == name) { if (s.id != id) ++s.shadowed; s.id = id; return; }   // the newer id wins
         }
     }
-    /// Removes the (nsId, name) slot only when it still points at `id` (a newer holder of the name keeps it).
+    /// Removes the (nsId, name) slot only when it still points at `id` (a newer holder of the name keeps it); an older
+    /// live holder of the same name takes the slot over.
     void unindex_(uint32_t nsId, std::string_view name, int32_t id) noexcept {
         if (slots_.empty()) return;
         const uint32_t h = hash32_(nsId, name);
@@ -123,7 +139,25 @@ private:
             const ObjectEntry& o = entries_[static_cast<std::size_t>(s.id)];
             if (o.nsId == nsId && o.name == name) break;
         }
-        if (slots_[i].id != id) return;
+        if (slots_[i].id != id) {   // `id` is a shadowed sharer of the name: the holder stays, one fewer sharer
+            if (slots_[i].shadowed > 0) --slots_[i].shadowed;
+            return;
+        }
+        // Issue #625: an older live entry may still share this (nsId, name) (an AlterView's retired sink).  Hand the
+        // slot to the highest such id (the same "newer wins" rule as index_) instead of unlinking the name.  The scan
+        // runs only when the name has a counted older sharer (`shadowed`), so dropping unique names stays O(1).
+        if (slots_[i].shadowed > 0) {
+            for (std::size_t k = entries_.size(); k-- > 0;) {
+                ++scanSteps_;
+                if (static_cast<int32_t>(k) == id) continue;
+                const ObjectEntry& o = entries_[k];
+                if (!o.name.empty() && o.nsId == nsId && o.name == name) {
+                    slots_[i].id = static_cast<int32_t>(k);
+                    --slots_[i].shadowed;
+                    return;
+                }
+            }
+        }
         // Backward-shift deletion: pull later members of the probe run into the hole.
         std::size_t hole = i;
         for (std::size_t j = (i + 1) & mask; slots_[j].id >= 0; j = (j + 1) & mask) {
@@ -149,6 +183,7 @@ private:
     std::vector<ObjectEntry> entries_;
     std::vector<Slot>        slots_;    // power-of-two open-addressing table over entries_, load <= 1/2
     std::size_t              count_ = 0;
+    std::size_t              scanSteps_ = 0;   // test hook: re-point scan iterations
 };
 
 } // namespace rune::gateway

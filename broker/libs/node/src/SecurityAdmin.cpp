@@ -451,8 +451,7 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
         if (const auto who = rune::catalog::parseQualified(m.meta.authenticated)) {
             if (const sec::UserObject* u = state.userByName(m.callerNsId, who->local)) {
                 callerUserId = u->objectId;
-                const std::vector<uint64_t> admins = state.nsAdminOf(m.callerNsId, callerNs.name);
-                caller.nsAdmin = std::find(admins.begin(), admins.end(), u->objectId) != admins.end();
+                caller.nsAdmin = state.isNsAdmin(u->objectId, m.callerNsId, callerNs.name);   // #653: no vector, no scan
             }
         }
     }

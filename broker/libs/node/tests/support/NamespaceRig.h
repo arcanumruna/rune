@@ -9,13 +9,20 @@
 //
 // Every wait is bounded (AuthRig::dl); no sleeps.
 
+#include "support/AuthLogReader.h"
 #include "support/AuthRig.h"
 #include "support/NamespaceMatrixExpectations.h"
 
+#include <rune/node/AdminWorker.h>
+#include <rune/node/BrokerNode.h>
+#include <rune/node/Worker.h>
+
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <utility>
 #include <optional>
 #include <string>
 #include <vector>
@@ -68,10 +75,26 @@ public:
         }
     };
 
+    using NsContents = std::map<std::string, std::string>;
+    using Snapshot = std::map<std::string, NsContents>;
+
     NamespaceRig() : main_(std::make_unique<World>("nsmx", AuthBroker::Options{})) { setupMain(); }
 
     Answer run(Op op, Caller c, Target t, int ordinal) { return exec(op, c, t, ordinal, /*twin=*/false); }
     Answer runTwin(Op op, Caller c, Target t, int ordinal) { return exec(op, c, t, ordinal, /*twin=*/true); }
+    /// Issue #643: run() with the admin thread's contents (sameNameSnapshot()) taken right before the op is issued (after
+    /// the cell's fresh objects exist) and right after its answer.
+    Answer runSnapshotted(Op op, Caller c, Target t, int ordinal, Snapshot& before, Snapshot& after) {
+        Snapshot* const b = std::exchange(snapBefore_, &before);
+        Snapshot* const a = std::exchange(snapAfter_, &after);
+        Answer ans;
+        try { ans = exec(op, c, t, ordinal, /*twin=*/false); } catch (...) { snapBefore_ = b; snapAfter_ = a; throw; }
+        snapBefore_ = b;
+        snapAfter_ = a;
+        return ans;
+    }
+    /// Issue #643: run() with the admin thread's catalog / security contents (sameNameSnapshot()) taken right before the
+    /// op is issued (after the cell's fresh objects exist) and right after its answer.
 
     // ── the timing cells (one node): the caller is root or a/admin, the object is a fresh one of namespace `a` ──
     using RequestId = rune::protocol::RequestId;
@@ -79,7 +102,7 @@ public:
     /// Root precreates what the op consumes (DropTopic: `a/d<ord>`).
     void prepareTimed(Op op, int ord) {
         World& w = *main_;
-        if (op == Op::DropTopic) need(w.r.defineTopic(w.root, "a/d" + std::to_string(ord)) >= 0, "fresh topic to drop");
+        if (op == Op::DropTopic) need(w.r.defineTopic(rootSession(w), "a/d" + std::to_string(ord)) >= 0, "fresh topic to drop");
     }
     /// A second logged-in session of the caller (kept until the next restart).
     int64_t secondSession(Caller who) { return timedSession(*main_, who, true); }
@@ -159,12 +182,12 @@ public:
         return awaitTimed(sendTimed(op, who, ord, rid, false, arg));
     }
     /// Root's ListNamespaces answer (body without header; compare two with normalized()).
-    Answer rootListNamespaces() { return issue(*main_, Op::ListNamespaces, main_->root, Names{}); }
+    Answer rootListNamespaces() { return issue(*main_, Op::ListNamespaces, rootSession(*main_), Names{}); }
     /// `a`'s maxTopics as root's ListNamespaces lists it (-1: `a` not listed).
     int64_t maxTopicsOfA() {
         World& w = *main_;
         pc::ListNamespaces m;
-        m.sessionId = w.root; m.correlationId = w.r.c().nextCorrelationId(); m.afterNsId = 0; m.max = 100;
+        m.sessionId = rootSession(w); m.correlationId = w.r.c().nextCorrelationId(); m.afterNsId = 0; m.max = 100;
         std::vector<uint8_t> buf(m.encodedSize());
         buf.resize(m.encode(buf.data()));
         need(w.r.c().send(w.r.ch(), AuthRig::stream(), buf.data(), buf.size()), "send ListNamespaces");
@@ -176,9 +199,18 @@ public:
         return -1;
     }
     std::vector<int32_t> rootMetadata() {
-        auto ids = main_->r.metadataTopics(main_->root);
+        auto ids = main_->r.metadataTopics(rootSession(*main_));
         std::sort(ids.begin(), ids.end());
         return ids;
+    }
+    /// Issue #652 (test-only): the audit principal of the CreateTopic catalog event of topic `local` (any namespace
+    /// spelling "<ns>/<local>" or bare), or nullopt when the catalog log holds none.
+    std::optional<std::string> createTopicPrincipalForTest(const std::string& local) {
+        std::optional<std::string> out;
+        for (const auto& e : readCatalogEvents(main_->r.broker().node()))
+            if (e.kind == rune::catalog::EventKind::CreateTopic && (e.objectName == local || e.objectName == "a/" + local))
+                out = e.principal.authenticated;
+        return out;
     }
     uint64_t securityDigest() { return main_->r.broker().node().securityViewForTest().digest; }
     int32_t topicIdA() { return main_->tid["a"]; }
@@ -188,18 +220,76 @@ public:
         w.r.restart();
         w.sess.clear();
         w.sess2.clear();
-        w.root = loginNs(w.r, "admin", AuthBroker::kAdminPassword);
-        w.sess["admin"] = w.root;
+        w.root = {};
+        (void)rootSession(w);
+    }
+    /// Issue #647 (test-only): the cached session of `user` as session() returns it, and a way to make it look idle.
+    int64_t userSessionForTest(const std::string& user) { return session(*main_, user); }
+    void ageUserSessionForTest(const std::string& user, std::chrono::seconds by) {
+        const auto it = main_->sess.find(user);
+        if (it != main_->sess.end()) it->second.used -= by;
+    }
+    /// Issue #647 follow-up (test-only): root's session and the timing cells' second session, and a way to age them.
+    int64_t rootSessionForTest() { return rootSession(*main_); }
+    void ageRootSessionForTest(std::chrono::seconds by) { main_->root.used -= by; }
+    int64_t secondSessionForTest(Caller who) { return timedSession(*main_, who, true); }
+    void ageSecondSessionForTest(Caller who, std::chrono::seconds by) {
+        const auto it = main_->sess2.find(static_cast<int>(who));
+        if (it != main_->sess2.end()) it->second.used -= by;
+    }
+    /// Issue #643 (test-only): what the admin thread's applied catalog and security states hold, per namespace
+    /// (default, a, b): every topic and view (object id, version, schema version) and every user and role (object id,
+    /// version, grants).  Keyed "T:<name>" / "V:<name>" / "U:<name>" / "R:<name>".  A SameNameBoth cell compares one
+    /// before and after: only the caller's namespace may change, and only as the op requires.
+    Snapshot sameNameSnapshot() {
+        BrokerNode& n = main_->r.broker().node();
+        return n.onAdminThreadForTest([&n] {
+            Snapshot out;
+            auto& worker = n.adminWorkerAgentForTest()->worker();
+            const auto& cat = worker.applier().state();
+            const auto* sa = worker.securityApplierForTest();
+            need(sa != nullptr, "security applier");
+            const auto& sec = sa->state();
+            std::map<uint32_t, std::string> names;
+            for (const std::string ns : {"default", "a", "b"}) {
+                const auto* rec = ns == "default" ? cat.namespaces().byId(0) : cat.namespaces().byName(ns);
+                need(rec != nullptr, "namespace " + ns);
+                names[rec->nsId] = ns;
+                out[ns];
+            }
+            for (const auto* t : cat.topics())
+                if (names.count(t->nsId))
+                    out[names[t->nsId]]["T:" + t->name] = "id=" + std::to_string(t->objectId) + " ver=" + std::to_string(t->version) +
+                        " schema=" + (t->schema ? std::to_string(t->schema->schemaVersion) : std::string("-"));
+            for (const auto* v : cat.views())
+                if (names.count(v->nsId))
+                    out[names[v->nsId]]["V:" + v->name] = "id=" + std::to_string(v->objectId) + " ver=" + std::to_string(v->version);
+            auto grantsOf = [](const auto& gs) {
+                std::string g;
+                for (const auto& x : gs)
+                    g += " " + std::to_string(static_cast<int>(x.op)) + ":" + std::to_string(static_cast<int>(x.resource.type)) + ":" +
+                         std::to_string(static_cast<int>(x.resource.kind)) + ":" + x.resource.name;
+                return g;
+            };
+            for (const auto& [id, u] : sec.users())
+                if (names.count(u.nsId))
+                    out[names[u.nsId]]["U:" + u.name] = "id=" + std::to_string(id) + " ver=" + std::to_string(u.version) +
+                        " grants[" + std::to_string(u.grants.size()) + "]" + grantsOf(u.grants);
+            for (const auto& [id, r] : sec.roles())
+                if (names.count(r.nsId))
+                    out[names[r.nsId]]["R:" + r.name] = "id=" + std::to_string(id) + " ver=" + std::to_string(r.version) +
+                        " grants[" + std::to_string(r.grants.size()) + "]" + grantsOf(r.grants);
+            return out;
+        });
     }
     /// Bounded wait until root's metadata lists topic `tid` and at least `minCount` topics.
     bool awaitRootListed(int32_t tid, std::size_t minCount) {
         World& w = *main_;
-        for (int i = 0; i < 400; ++i) {
-            const auto ids = w.r.metadataTopics(w.root);
-            if (ids.size() >= minCount && std::find(ids.begin(), ids.end(), tid) != ids.end()) return true;
-            w.r.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
-        }
-        return false;
+        // #648: the awaited event is the listing itself (the topics are placed), polled until it holds - no fixed pause.
+        return w.r.c().pollFor(std::chrono::seconds(10), [&] {
+            const auto ids = w.r.metadataTopics(rootSession(w));
+            return ids.size() >= minCount && std::find(ids.begin(), ids.end(), tid) != ids.end();
+        });
     }
 
 private:
@@ -211,9 +301,13 @@ private:
         AuthRig r;
         std::map<std::string, int32_t> tid, vid;   ///< namespace -> its t / v
         int32_t tOnly = kMissingId, vOnly = kMissingId;
-        int64_t root = 0;
-        std::map<std::string, int64_t> sess;       ///< logged-in principals by name
-        std::map<int, int64_t> sess2;              ///< the timing cells' second session per caller
+        /// A logged-in principal's session and when the rig last handed it out (issue #647: the broker reaps a session idle
+        /// for 10 s, so session() logs in again after 5 s of idleness - the rule of AuthBroker::freshAdminSid_.  The reap
+        /// clock is the broker's steady clock, which a real-broker rig cannot advance, so the age is wall time).
+        struct CachedSession { int64_t sid = 0; std::chrono::steady_clock::time_point used{}; };
+        CachedSession root;                        ///< root's session (issue #647: re-logged in after 5 s idle, like sess)
+        std::map<std::string, CachedSession> sess;
+        std::map<int, CachedSession> sess2;              ///< the timing cells' second session per caller
         uint64_t rid = 0;
         World(const std::string& tag, AuthBroker::Options o) : r(tag, std::move(o)) {}
     };
@@ -224,16 +318,16 @@ private:
     };
 
     std::unique_ptr<World> main_, anon_;
+    Snapshot* snapBefore_ = nullptr;   ///< runSnapshotted's out-parameters, read by exec()
+    Snapshot* snapAfter_ = nullptr;
     std::optional<AuthWireClient::Verifier> ver_;   ///< one verifier for every timed CreateUser (a retry is byte-identical)
 
     int64_t timedSession(World& w, Caller who, bool second) {
         const bool root = who == Caller::ClusterAdmin;
-        if (!second) return root ? w.root : session(w, "a/admin");
-        auto it = w.sess2.find(static_cast<int>(who));
-        if (it == w.sess2.end())
-            it = w.sess2.emplace(static_cast<int>(who), root ? loginNs(w.r, "admin", AuthBroker::kAdminPassword)
-                                                             : loginNs(w.r, "a/admin", AuthRig::kPw)).first;
-        return it->second;
+        if (!second) return root ? rootSession(w) : session(w, "a/admin");
+        return cachedSid(w.sess2[static_cast<int>(who)], [&] {
+            return root ? loginNs(w.r, "admin", AuthBroker::kAdminPassword) : loginNs(w.r, "a/admin", AuthRig::kPw);
+        });
     }
     /// The fresh object of a timing cell: root names it qualified, a/admin unqualified.
     static std::string timedName(Op op, Caller who, int ord, const std::string& sfx) {
@@ -297,18 +391,18 @@ private:
     /// The shared objects of namespace `ns` (default: unqualified): topic t, view v, user x, role r.
     void makeShared(World& w, const std::string& ns) {
         AuthRig& r = w.r;
-        const int32_t t = r.defineTopic(w.root, full(ns, "t"));
+        const int32_t t = r.defineTopic(rootSession(w), full(ns, "t"));
         need(t >= 0, "topic t in " + ns);
-        const int32_t v = r.createView(w.root, full(ns, "v"), t);
+        const int32_t v = r.createView(rootSession(w), full(ns, "v"), t);
         need(v >= 0, "view v in " + ns);
         w.tid[ns] = t;
         w.vid[ns] = v;
     }
     /// The objects only namespace b holds (the ForeignNs targets).
     void makeOnly(World& w) {
-        w.tOnly = w.r.defineTopic(w.root, "b/only");
+        w.tOnly = w.r.defineTopic(rootSession(w), "b/only");
         need(w.tOnly >= 0, "topic b/only");
-        w.vOnly = w.r.createView(w.root, "b/onlyv", w.tOnly);
+        w.vOnly = w.r.createView(rootSession(w), "b/onlyv", w.tOnly);
         need(w.vOnly >= 0, "view b/onlyv");
     }
     /// User x and role r of namespace `ns` (the security ops' targets).
@@ -322,8 +416,7 @@ private:
         AuthRig& r = w.r;
         r.createNamespace("a");
         r.createNamespace("b");
-        w.root = loginNs(r, "admin", AuthBroker::kAdminPassword);
-        w.sess["admin"] = w.root;
+        (void)rootSession(w);
         makeShared(w, "default");
         makeShared(w, "a");
         makeShared(w, "b");
@@ -339,11 +432,11 @@ private:
         // The placements are committed before the first cell (a listing names them).
         for (const auto& [who, ns] : std::vector<std::pair<std::string, std::string>>{{"a/admin", "a"}, {"b/admin", "b"}}) {
             const int64_t sid = session(w, who);
-            for (int i = 0; i < 400; ++i) {
-                const auto ids = r.metadataTopics(sid);
-                if (std::find(ids.begin(), ids.end(), w.tid[ns]) != ids.end()) break;
-                r.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
-            }
+            const int32_t want = w.tid[ns];
+            need(r.c().pollFor(std::chrono::seconds(10), [&r, sid, want] {   // placed: the listing names the id
+                     const auto ids = r.metadataTopics(sid);
+                     return std::find(ids.begin(), ids.end(), want) != ids.end();
+                 }), "the placement of topic t in " + ns + " was never listed");
         }
     }
     void setupAnon() {
@@ -354,22 +447,29 @@ private:
         anon_ = std::make_unique<World>("nsmxanon", std::move(o));
         World& w = *anon_;
         w.r.createNamespace("b");
-        w.root = loginNs(w.r, "admin", AuthBroker::kAdminPassword);
+        (void)rootSession(w);
         makeShared(w, "default");
         makeShared(w, "b");
         makeOnly(w);
         for (const char* ns : {"default", "b"}) makeSecurityTargets(w, ns);
         const int32_t t = w.tid["default"];
-        for (int i = 0; i < 400; ++i) {   // placed: the anonymous listing names it
-            const auto ids = w.r.metadataTopics(w.root);
-            if (std::find(ids.begin(), ids.end(), t) != ids.end()) break;
-            w.r.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
-        }
+        need(w.r.c().pollFor(std::chrono::seconds(10), [&] {   // placed: the anonymous listing names it
+                 const auto ids = w.r.metadataTopics(rootSession(w));
+                 return std::find(ids.begin(), ids.end(), t) != ids.end();
+             }), "the placement of the anonymous world's topic t was never listed");
+    }
+    /// The session of `c`, logged in again by `login` when it is new or has been idle for more than 5 s (issue #647).
+    template <class Login> static int64_t cachedSid(World::CachedSession& c, Login&& login) {
+        const auto now = std::chrono::steady_clock::now();
+        if (c.sid == 0 || now - c.used > std::chrono::seconds(5)) c.sid = login();
+        c.used = now;
+        return c.sid;
+    }
+    int64_t rootSession(World& w) {
+        return cachedSid(w.root, [&] { return loginNs(w.r, "admin", AuthBroker::kAdminPassword); });
     }
     int64_t session(World& w, const std::string& user) {
-        auto it = w.sess.find(user);
-        if (it == w.sess.end()) it = w.sess.emplace(user, loginNs(w.r, user, AuthRig::kPw)).first;
-        return it->second;
+        return cachedSid(w.sess[user], [&] { return loginNs(w.r, user, AuthRig::kPw); });
     }
 
     // ── the cell ────────────────────────────────────────────────────────────────────────────────────────────
@@ -381,7 +481,7 @@ private:
         }
         const bool foreign = t == Target::ForeignNs;
         switch (c) {
-            case Caller::ClusterAdmin: return {w.root, "default"};
+            case Caller::ClusterAdmin: return {rootSession(w), "default"};
             case Caller::NsAdminSame: return foreign ? Sess{session(w, "b/admin"), "b"} : Sess{session(w, "a/admin"), "a"};
             case Caller::NsAdminForeign: return foreign ? Sess{session(w, "a/admin"), "a"} : Sess{session(w, "b/admin"), "b"};
             case Caller::UserGranted: return {session(w, "a/granted"), "a"};
@@ -449,10 +549,10 @@ private:
         for (const std::string& ns : nss) {
             switch (op) {
                 case Op::AlterTopic: case Op::DropTopic:
-                    need(r.defineTopic(w.root, full(ns, "d" + o)) >= 0, "fresh topic d" + o + " in " + ns);
+                    need(r.defineTopic(rootSession(w), full(ns, "d" + o)) >= 0, "fresh topic d" + o + " in " + ns);
                     break;
                 case Op::DropView:
-                    need(r.createView(w.root, full(ns, "dv" + o), w.tid[ns]) >= 0, "fresh view dv" + o + " in " + ns);
+                    need(r.createView(rootSession(w), full(ns, "dv" + o), w.tid[ns]) >= 0, "fresh view dv" + o + " in " + ns);
                     break;
                 case Op::DropUser:
                     r.broker().createUser(full(ns, "d" + o), AuthRig::kPw, {});
@@ -475,7 +575,9 @@ private:
         World& w = anon ? *anon_ : *main_;
         const Sess s = sessionFor(w, c, t, anon);
         const Names n = namesFor(w, op, t, ordinal, s, anon, twin);
+        if (snapBefore_ != nullptr) *snapBefore_ = sameNameSnapshot();
         Answer a = issue(w, op, s.sid, n);
+        if (snapAfter_ != nullptr) *snapAfter_ = sameNameSnapshot();
         a.askedNs = n.askedNs;
         switch (op) {   // the ids the request carried
             case Op::Produce: case Op::Fetch: case Op::Metadata: case Op::GroupJoin: a.ids = {n.tid}; break;
@@ -559,26 +661,25 @@ private:
             }
             case Op::DropTopic: ddl(w, a, c.sendDropTopic(ch, st, sid, n.topic)); break;
             case Op::Produce: {
-                for (int attempt = 0; attempt < 40; ++attempt) {
+                // NotLeader (the partition's leader is not serving yet) is retried until it is: the event, not a pause.
+                (void)c.pollFor(std::chrono::seconds(10), [&] {
                     const int64_t corr = c.nextCorrelationId();
-                    if (!c.produce(ch, st, sid, corr, n.tid, 0, 1, makeCharBatch(1))) break;
+                    if (!c.produce(ch, st, sid, corr, n.tid, 0, 1, makeCharBatch(1))) return true;
                     const auto ack = c.awaitProduceResponseUntil(corr, AuthRig::dl());
                     a.code = ack ? ack->errorCode : kNoAnswer;
                     frameOf(w, a, corr);
-                    if (a.code != static_cast<int>(pc::ErrorCode::NotLeader) && a.code != kNoAnswer) break;
-                    c.pollFor(std::chrono::milliseconds(25), [] { return false; });
-                }
+                    return a.code != static_cast<int>(pc::ErrorCode::NotLeader) && a.code != kNoAnswer;
+                });
                 break;
             }
             case Op::Fetch: {
-                for (int attempt = 0; attempt < 40; ++attempt) {
+                (void)c.pollFor(std::chrono::seconds(10), [&] {
                     const int64_t corr = c.sendSubscribe(ch, st, sid, n.tid, 0);
                     const auto code = c.awaitSubscribeCode(corr, AuthRig::dl());
                     a.code = code ? *code : kNoAnswer;
                     frameOf(w, a, corr);
-                    if (a.code != static_cast<int>(pc::ErrorCode::NotLeader) && a.code != kNoAnswer) break;
-                    c.pollFor(std::chrono::milliseconds(25), [] { return false; });
-                }
+                    return a.code != static_cast<int>(pc::ErrorCode::NotLeader) && a.code != kNoAnswer;
+                });
                 break;
             }
             case Op::Metadata: {

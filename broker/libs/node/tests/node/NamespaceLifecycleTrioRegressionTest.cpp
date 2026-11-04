@@ -37,7 +37,9 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -188,7 +190,11 @@ public:
                     last.code != static_cast<int>(pc::ErrorCode::AuthUnavailable)) return last;
             }
             if (Clock3::now() >= deadline) return last;
-            std::this_thread::sleep_for(50ms);
+            // #711: a refused round is retried once the cluster has a settled catalog and security leader (an observable state
+            // under a cap), not after a fixed pause.
+            // #711: a refused round is retried once the cluster has a settled catalog and security leader (an observable state
+            // under a cap), not after a fixed pause.
+            (void)AuthTrio::until(5s, [&] { return t.cluster().settledLeader() > 0 && security_cluster::settledSecurityLeader(t.cluster()) > 0; });
         }
     }
     Ans ns(int prefer, pc::NamespaceDdlKind kind, const std::string& name, uint8_t mode = 1, int field = -1, uint64_t value = 0) {
@@ -331,21 +337,43 @@ TEST(NamespaceLifecycleTrioRegression, SuspendConvergesOnEveryNodeRegression) {
             << "node " << n << ": DDL after resume (routed to the catalog leader)";
 }
 
-// The catalog leader is killed after the reaper took 2 of its steps: the new leader's reaper re-derives from the registry
-// and finishes; the namespace is erased and its directories are gone on every node, the restarted old leader included.
-TEST(NamespaceLifecycleTrioRegression, DeleteFinishesAfterLeaderKillRegression) {
-    auto w = setupWorld("nslct_kill");
+// #707: after the delete, on `node`: the namespace's slot is free in the control table AND in worker 0's table (the
+// sticky Deleting gate is not enough: the release must reach the worker), and the ns-<id> directory is gone.  The other namespace `other` keeps its slot, live.
+bool deletedCleanlyOn(World& W, int node, uint32_t id, uint32_t other) {
+    BrokerNode& n = W.t.node(node);
+    const uint16_t ctrl = n.nsSlotOfForTest(id);
+    const bool workerFree = n.onWorkerThreadForTest(0, [id](Worker& wk) { return wk.nsSlotsForTest().slotOf(id) == kNoNsSlot; });
+    return ctrl == kNoNsSlot && workerFree && W.dirsGone(node, id);
+}
+bool otherUntouchedOn(World& W, int node, uint32_t other) {
+    BrokerNode& n = W.t.node(node);
+    if (n.nsSlotOfForTest(other) == kNoNsSlot) return false;
+    return n.onWorkerThreadForTest(0, [other](Worker& wk) {
+        const uint16_t slot = wk.nsSlotsForTest().slotOf(other);
+        return slot != kNoNsSlot && !wk.nsDeletingForTest(slot);
+    });
+}
+
+// The catalog leader is killed after the reaper took N of its steps (#707: N in {0,1,2,4,5}): the new leader's reaper
+// re-derives from the registry and finishes; the namespace is erased, its slot is released and its directories are gone
+// on every node (the follower included), the restarted old leader too.  A second namespace is never touched.
+class NamespaceLifecycleTrioDeleteRegression : public ::testing::TestWithParam<int> {};
+
+TEST_P(NamespaceLifecycleTrioDeleteRegression, DeleteFinishesAfterLeaderKillRegression) {
+    const int budget = GetParam();
+    auto w = setupWorld("nslct_kill" + std::to_string(budget));
     World& W = *w;
+    const Ans other = W.ns(1, pc::NamespaceDdlKind::Create, "b");
+    ASSERT_EQ(other.code, 0) << other.detail;
+    const auto otherId = static_cast<uint32_t>(other.id);
     const int L = W.t.cluster().settledLeader();
     ASSERT_GT(L, 0);
     BrokerNode& ln = W.t.node(L);
-    ln.onAdminThreadForTest([&] { ln.adminWorkerAgentForTest()->worker().reaperForTest().setIssueBudgetForTest(2); return 0; });
+    ln.onAdminThreadForTest([&] { ln.adminWorkerAgentForTest()->worker().reaperForTest().setIssueBudgetForTest(budget); return 0; });
     ASSERT_EQ(W.ns(L, pc::NamespaceDdlKind::Delete, "a").code, 0);
     ASSERT_TRUE(AuthTrio::until(60s, [&] {
-        return ln.onAdminThreadForTest([&] { return ln.adminWorkerAgentForTest()->worker().reaper().eventsIssued(); }) == 2;
-    })) << "the leader's reaper never took its 2 steps";
-    for (const int n : {W.firstNodeOtherThan(L), W.firstNodeOtherThan(L, W.firstNodeOtherThan(L))})
-        EXPECT_FALSE(W.erasedOn(n, 1)) << "node " << n << ": the budget should have stopped the delete before the end";
+        return ln.onAdminThreadForTest([&] { return ln.adminWorkerAgentForTest()->worker().reaper().eventsIssued(); }) == static_cast<uint64_t>(budget);
+    })) << "the leader's reaper never took its " << budget << " steps";
     W.stop(L);   // the kill
     ASSERT_TRUE(W.t.cluster().awaitCatalogLeaderOtherThan(L, 60s)) << "no new catalog leader";
     const int S1 = W.firstNodeOtherThan(L), S2 = W.firstNodeOtherThan(L, S1);
@@ -353,9 +381,16 @@ TEST(NamespaceLifecycleTrioRegression, DeleteFinishesAfterLeaderKillRegression) 
         ASSERT_TRUE(AuthTrio::until(120s, [&] { return W.erasedOn(n, 1); })) << "node " << n << ": the namespace was never erased";
         EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.dirsGone(n, 1); })) << "node " << n << ": ns-1 directory survived";
     }
+    // the leader and the follower alike: the slot is released everywhere (the control table and the worker's)
+    for (const int n : {S1, S2})
+        EXPECT_TRUE(AuthTrio::until(60s, [&] { return deletedCleanlyOn(W, n, 1, otherId); }))
+            << "node " << n << ": the deleted namespace's slot is still assigned (budget " << budget << ")";
     W.restart(L);
     ASSERT_TRUE(AuthTrio::until(120s, [&] { return W.erasedOn(L, 1); })) << "the restarted old leader never converged";
-    EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.dirsGone(L, 1); })) << "node " << L << " (restarted): ns-1 directory survived";
+    EXPECT_TRUE(AuthTrio::until(60s, [&] { return deletedCleanlyOn(W, L, 1, otherId); }))
+        << "node " << L << " (restarted): the deleted namespace's slot or ns-1 directory survived (budget " << budget << ")";
+    for (const int n : {1, 2, 3})
+        EXPECT_TRUE(AuthTrio::until(30s, [&] { return otherUntouchedOn(W, n, otherId); })) << "node " << n << ": namespace b lost its slot or turned Deleting";
     // The name is free and the new namespace holds nothing of the old one.
     const Ans again = W.ns(S1, pc::NamespaceDdlKind::Create, "a");
     ASSERT_EQ(again.code, 0) << again.detail;
@@ -365,6 +400,8 @@ TEST(NamespaceLifecycleTrioRegression, DeleteFinishesAfterLeaderKillRegression) 
             << "node " << n << ": a topic of the old namespace is listed";
     }
 }
+INSTANTIATE_TEST_SUITE_P(Budgets, NamespaceLifecycleTrioDeleteRegression, ::testing::Values(0, 1, 2, 4, 5),
+                         [](const auto& info) { return "budget" + std::to_string(info.param); });
 
 // A follower down for the whole delete rejoins and converges: registry, directories and security records.
 TEST(NamespaceLifecycleTrioRegression, FollowerRejoinsAfterDeleteRegression) {
@@ -386,6 +423,18 @@ TEST(NamespaceLifecycleTrioRegression, FollowerRejoinsAfterDeleteRegression) {
     W.restart(f);
     ASSERT_TRUE(AuthTrio::until(120s, [&] { return W.erasedOn(f, 1); })) << "the rejoined follower still lists the deleted namespace";
     EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.dirsGone(f, 1); })) << "the rejoined follower kept ns-1 on disk";
+    // #707: the same three checks as the leader-kill cells: the slot of the deleted namespace is free on the follower too
+    // (the re-created namespace has a new id, so slot 1's owner is gone), and the re-created one is live
+    EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.t.node(f).nsSlotOfForTest(1) == kNoNsSlot; }))
+        << "the rejoined follower still assigns a slot to the deleted namespace";
+    EXPECT_TRUE(AuthTrio::until(60s, [&] {
+        return W.t.node(f).onWorkerThreadForTest(0, [](Worker& wk) {
+            const uint16_t slot = wk.nsSlotsForTest().slotOf(1);
+            return slot == kNoNsSlot;
+        });
+    })) << "the rejoined follower's worker never released the deleted namespace's slot";
+    EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.t.node(f).nsSlotOfForTest(static_cast<uint32_t>(again.id)) != kNoNsSlot; }))
+        << "the rejoined follower gave the re-created namespace no slot";
     ASSERT_TRUE(AuthTrio::until(60s, [&] { const auto e = W.entry(f, static_cast<uint32_t>(again.id)); return e && e->name == "a" && e->state == 0; }))
         << "the follower does not list the re-created namespace";
     EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.tryLogin(f, "a/alice").code == kAuthFailed; }))
@@ -471,7 +520,7 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     rc::Completions cq(c);
     uint64_t key = 0;
     struct Tally { int ok = 0, refused = 0, other = 0; int lastCode = 0; int lastStatus = 0; };
-    int acked = 0;   // every burst's acked records, not only the last burst's
+    std::set<uint64_t> ackedKeys;   // #716: every burst's acked record keys (the completion token is the key), not only the last burst's
     auto burst = [&](int n) {
         Tally tl;
         int sent = 0, done = 0;
@@ -486,15 +535,17 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
                 }
             }
             p.flush();
-            (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) {
-                ++done;
-                if (d.status == rc::OpStatus::Ok) ++tl.ok;
-                else if (d.errorCode == kSuspended) ++tl.refused;
-                else { ++tl.other; tl.lastCode = d.errorCode; tl.lastStatus = static_cast<int>(d.status); }
-            });
-            std::this_thread::sleep_for(1ms);
+            auto drain = [&] {
+                (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) {
+                    ++done;
+                    if (d.status == rc::OpStatus::Ok) { ++tl.ok; ackedKeys.insert(d.token); }
+                    else if (d.errorCode == kSuspended) ++tl.refused;
+                    else { ++tl.other; tl.lastCode = d.errorCode; tl.lastStatus = static_cast<int>(d.status); }
+                });
+                return done >= n || sent < n;   // #711: wait on the awaited completions (a free send slot ends the wait too)
+            };
+            (void)W.raw().pollFor(2ms, drain);
         }
-        acked += tl.ok;
         return tl;
     };
     const Tally before = burst(50);
@@ -512,7 +563,7 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     ASSERT_TRUE(AuthTrio::until(30s, [&] { after = burst(50); return after.ok == 50; })) << "after resume: ok " << after.ok << ", other " << after.other;
     p.close();
 
-    const int total = acked;
+    const int total = static_cast<int>(ackedKeys.size());
     // Every replica holds exactly the acked records.
     for (int n = 1; n <= 3; ++n) {
         const int64_t end = W.t.node(n).onOwnerThreadForTest(W.tA, 0, [](rune::replication::PartitionReplica* r) {
@@ -524,24 +575,47 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
                    }) == total;
         })) << "node " << n << ": log end " << end << ", acked " << total;
     }
-    // ... and the consumer sees exactly them.
-    std::atomic<int> got{0};
+    // ... and the consumer sees exactly them (#716: the key SET and the offsets, not a count).
+    struct Seen { uint64_t key; int64_t offset; };
+    std::mutex seenMu;
+    std::vector<Seen> seen;
+    // Test-only fault injection for the mutation check: one duplicated and one dropped record in the consumer callback.
+    const bool injectFault = std::getenv("RUNE_NS_TEST_CONSUMER_FAULT") != nullptr;
+    int delivered = 0;
     rc::SubscribeOptions so;
     so.from = rc::From::earliest();
-    rc::Subscription sub = c.subscribe(th, 0, so, [&](const rc::Record&) { ++got; });
-    // Bounded wait until the consumer has read up to the log end offset, then compare with what was acked.
+    rc::Subscription sub = c.subscribe(th, 0, so, [&](const rc::Record& r) {
+        uint64_t k = 0;
+        for (std::size_t i = 0; i < 8 && i < r.key.size(); ++i) k |= static_cast<uint64_t>(r.key[i]) << (8 * i);
+        std::lock_guard<std::mutex> lk(seenMu);
+        const int n = delivered++;
+        if (injectFault && n == 3) return;                                        // drop one
+        seen.push_back({k, r.offset});
+        if (injectFault && n == 7) seen.push_back({k, r.offset});                 // duplicate one
+    });
     const int64_t logEnd = W.t.node(1).onOwnerThreadForTest(W.tA, 0, [](rune::replication::PartitionReplica* r) {
         return r != nullptr ? r->logEndOffset() : int64_t{-1};
     });
-    EXPECT_TRUE(AuthTrio::until(40s, [&] { return got.load() >= logEnd; })) << "consumed " << got.load() << " of log end " << logEnd;
-    EXPECT_EQ(got.load(), total) << "produced != consumed";
+    EXPECT_TRUE(AuthTrio::until(40s, [&] { std::lock_guard<std::mutex> lk(seenMu); return delivered >= logEnd; }))
+        << "delivered " << delivered << " of log end " << logEnd;
+    {
+        std::lock_guard<std::mutex> lk(seenMu);
+        std::set<uint64_t> consumedKeys;
+        for (const Seen& e : seen) consumedKeys.insert(e.key);
+        EXPECT_EQ(consumedKeys, ackedKeys) << "the consumed key set differs from the acked key set";
+        EXPECT_EQ(seen.size(), consumedKeys.size()) << "a key was consumed twice";
+        EXPECT_EQ(static_cast<int64_t>(seen.size()), logEnd) << "produced != consumed";
+        for (std::size_t i = 1; i < seen.size(); ++i)
+            EXPECT_GT(seen[i].offset, seen[i - 1].offset) << "offsets must strictly increase (record " << i << ")";
+    }
     sub.unsubscribe();
 }
 
 // Every permission ship of a ReadOnly namespace's session binds the SUSPENDED table on the workers, not its grants: a
 // login during the suspend, a grant change during it and the suspend itself.  Before the fix only the suspend bound a
 // deny table (answered 45, not 51) and the login / grant change re-shipped the full WRITE table, so the session could
-// produce on the worker-ingress path while its namespace was read-only.
+// produce on the worker-ingress path while its namespace was read-only.  #713: the gateway's permission-ship counter proves
+// each step really shipped (a step that ships nothing proves nothing).
 TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspendedRegression) {
     constexpr int kMaxConnectionsField = 18;
     auto w = setupWorld("nslct_roship");
@@ -557,16 +631,26 @@ TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspended
             return r != nullptr ? r->logEndOffset() : int64_t{-1};
         });
     };
+    BrokerNode& ln = W.t.node(leader);
+    uint64_t ships = ln.permissionShipsForTest();
+    // every step below must really ship (the counter moves) and the session must still answer 51 afterwards
+    auto shipped = [&](const char* what) {
+        const uint64_t now = ln.permissionShipsForTest();
+        EXPECT_GT(now, ships) << what << ": no permission ship happened, so the check below proves nothing";
+        ships = now;
+    };
     ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::Suspend, "a", 1).code, 0);
     // 1. the suspend itself: the existing session's next produce is refused 51 at the worker (once the bind landed).
     ASSERT_TRUE(AuthTrio::until(30s, [&] {
         const auto r = W.produce(alice, leader, W.tA, 64);
         return r.has_value() && r->errorCode == kSuspended;
     })) << "the suspend never reached the worker as NamespaceSuspended";
+    shipped("the suspend");
     const int64_t endAtSuspend = logEnd();
     // 2. a login while ReadOnly (allowed): its very first produce is refused 51 - its grants were never shipped.
     const World::Login bob = W.tryLogin(leader, "a/bob");
     ASSERT_EQ(bob.code, 0) << "ReadOnly still admits a login";
+    shipped("a login during ReadOnly");
     const auto rb = W.produce(bob.sid, leader, W.tA, 64);
     ASSERT_TRUE(rb.has_value());
     EXPECT_EQ(rb->errorCode, kSuspended) << "a login during ReadOnly shipped its WRITE grants to the worker";
@@ -578,10 +662,15 @@ TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspended
             return c.grant(ch, s, "a/alice", false, g.op, g.type, g.kind, g.pattern);
         });
         EXPECT_NE(ga.errorCode, 0) << "a grant into a ReadOnly namespace was accepted";
+        // #713: a refused grant (39 for the cluster admin too) refreshes nobody, and must-change-password is only ever set on
+        // the bootstrap admin (ApplyV1 createUser): so in a ReadOnly namespace the ships are the suspend, a login and the
+        // resume - exactly the ones counted here.
+        EXPECT_EQ(ln.permissionShipsForTest(), ships) << "a refused grant shipped permissions";
     }
-    // 4. a limits change while ReadOnly re-upserts `a` and re-ships every session's permissions: still suspended.
+    // 5. a limits change while ReadOnly re-upserts `a`; the gate is unchanged, so it ships nothing and the binds stand.
     ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::SetLimits, "a", 1, kMaxConnectionsField, 1000).code, 0);
     ASSERT_TRUE(W.t.awaitDigestsAgree(0, 30s));
+    EXPECT_EQ(ln.permissionShipsForTest(), ships) << "a limits change that leaves the gate unchanged ships nothing";
     for (int i = 0; i < 5; ++i)
         for (const int64_t s : {alice, bob.sid}) {
             const auto r = W.produce(s, leader, W.tA, 64);
@@ -593,6 +682,7 @@ TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspended
         << "a suspended session is never answered NotAuthorized by the worker";
     // Resume ships the real tables: both write again.
     ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::Resume, "a").code, 0);
+    EXPECT_TRUE(AuthTrio::until(30s, [&] { return ln.permissionShipsForTest() > ships; })) << "the resume shipped nothing";
     for (const int64_t s : {alice, bob.sid})
         EXPECT_TRUE(AuthTrio::until(30s, [&] {
             const auto r = W.produce(s, leader, W.tA, 64);

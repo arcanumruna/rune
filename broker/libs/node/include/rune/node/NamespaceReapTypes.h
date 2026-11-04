@@ -12,6 +12,9 @@ enum class ReapOp : uint8_t { AbortTxns = 1, TombstoneGroups = 2, TombstoneTxnSt
 /// The answer: Done = the step is complete (a tombstone call that found nothing left to write, all committed); More = a
 /// batch was written, ask again; Refused = this node cannot do it now (not the coordinator / not loaded / below minIsr /
 /// a transaction still ending) - ask again, nothing was skipped.
-enum class ReapStatus : uint8_t { Done = 0, More = 1, Refused = 2 };
+///
+/// Waiting = nothing was written and nothing is refused, the step only awaits something on its own (markers answered, a
+/// tombstone committed): ask again, but back off (#722).  More = progress was made, ask again now.
+enum class ReapStatus : uint8_t { Done = 0, More = 1, Refused = 2, Waiting = 3 };
 
 }  // namespace rune::node

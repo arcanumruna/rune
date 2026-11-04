@@ -319,9 +319,27 @@ TEST(TxnAbortOnSuspendRegression, DeleteAbortsRegression) {
     // the drop even though the ABORT marker is in the log first (under load: landed 3 ms before the drop, never delivered).
     BrokerNode& node = s.f.b.node();
     node.onAdminThreadForTest([&] { node.adminWorkerAgentForTest()->worker().reaperForTest().setIssueBudgetForTest(0); return 0; });
+    // #721: a DELETING namespace is not readable by id, the cluster admin's subscription included (it ends at the Deleting apply),
+    // so the sentinel cannot be the witness here.  The witness is the partition's last stable offset: pinned at the open
+    // transaction's first record before the delete, past the sentinel once the ABORT marker is in the log.
+    const auto lsoOf = [&] {
+        return node.onOwnerThreadForTest(s.f.tA.topicId, 0, [](rune::replication::PartitionReplica* r) {
+            return r != nullptr ? static_cast<int64_t>(r->cleanerLastStableOffset()) : int64_t{-1};
+        });
+    };
+    const auto endOf = [&] {
+        return node.onOwnerThreadForTest(s.f.tA.topicId, 0, [](rune::replication::PartitionReplica* r) {
+            return r != nullptr ? static_cast<int64_t>(r->logEndOffset()) : int64_t{-1};
+        });
+    };
+    const int64_t endBefore = endOf();
+    ASSERT_GT(endBefore, 0);
+    ASSERT_LT(lsoOf(), endBefore) << "premise: the open transaction pins the LSO below the sentinel";
     const auto del = s.f.admin->deleteNamespace("a");
     ASSERT_TRUE(del.has_value()) << del.error().errorCode << " " << del.error().detail;
-    s.expectAborted();
+    ASSERT_TRUE(waitFor([&] { return lsoOf() >= endBefore; }, 40s))
+        << "the LSO never passed the sentinel: the open transaction was not aborted (its ABORT marker is not in the log); lso "
+        << lsoOf() << " end " << endOf();
     const auto pastAbortTxns = [&] {   // the step answered Done: the reaper records TxnsAborted next
         return node.onAdminThreadForTest([&] {
             return std::holds_alternative<ReapRecordingStep>(node.adminWorkerAgentForTest()->worker().reaperForTest().state()) ? 1 : 0;
@@ -374,4 +392,25 @@ TEST(TxnAbortOnSuspendRegression, OtherNamespaceUntouchedRegression) {
     const auto got = rb.snapshot();
     EXPECT_EQ(got.size(), 10u);
     for (int i = 0; i < 10; ++i) EXPECT_EQ(got[static_cast<size_t>(i)], "y" + std::to_string(i));
+}
+
+// #661 (real-broker guard): a namespace suspended ReadOnly, then the broker restarts over the same data (the catalog
+// replays into the gateway, the transaction coordinator loads): a's open transaction is aborted, the sentinel appended
+// after its records becomes visible to a read_committed reader, and none of the 10 records does.  Green with or without
+// the load-time re-derive when the suspend's own abort reached the log first; the unit leg
+// (TxnNsDeleteRegression.CoordinatorLoadedAfterSuspendAbortsTheNamespacesOpenTxnsRegression) is the failing-first one.
+TEST(TxnAbortOnSuspendRegression, SuspendThenRestartAbortsRegression) {
+    Scenario s("txnabort_restart");
+    ASSERT_TRUE(s.f.admin->suspendNamespace("a", pc::NsSuspendMode::ReadOnly).has_value());
+    const rc::TopicSpec tA = s.f.tA;
+    s.reader.reset();
+    s.txn.reset();
+    s.ua.reset();
+    s.f.admin.reset();
+    s.f.b.restart(/*reloginAdmin=*/false);   // the fixture bootstraps its own admin password
+    auto admin = newClient(s.f.b, "admin");
+    CommittedReader reader(*admin, Fix::handleOf(tA));
+    ASSERT_TRUE(waitFor([&] { return reader.has("S"); }, 40s))
+        << "the sentinel never became visible: the open transaction survived the suspend + restart";
+    for (const std::string& v : reader.snapshot()) EXPECT_EQ(v, "S") << "an aborted record is visible to read_committed";
 }

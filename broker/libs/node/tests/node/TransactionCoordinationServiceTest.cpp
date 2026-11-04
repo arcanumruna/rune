@@ -23,6 +23,7 @@
 #include <gtest/gtest.h>
 #include <rune/protocol/ProducerIdBinding.h>
 
+#include <rune/coordination/NsScopedId.h>
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/transaction/Types.h>
@@ -1598,6 +1599,7 @@ struct RepTxn {
     CapturedAnswers*      answers = nullptr;
     std::array<uint8_t, 1024> req{}, out{};
     int64_t corr = 100;
+    rune::coordination::NsRequestContext ctx{};   ///< #663: the session's namespace (default: ns 0, ids unscoped)
     /// The answer's first error code: inline, or (parked) once the records commit.
     template <class Resp>
     int16_t answer(std::size_t n) {
@@ -1618,7 +1620,7 @@ struct RepTxn {
         m.transactionalId = {reinterpret_cast<const uint8_t*>(txn.data()), txn.size()};
         m.groupId = {reinterpret_cast<const uint8_t*>(group.data()), group.size()};
         return answer<pc::AddOffsetsToTxnResponse>(svc->handleAddOffsets(req.data(), m.encode(req.data()), now,
-                                                                         out.data(), out.size()));
+                                                                         out.data(), out.size(), ctx));
     }
     int16_t commit(const std::string& txn, int64_t pid, int16_t ep, const std::string& group, int64_t offset,
                    int64_t now) {
@@ -1627,7 +1629,7 @@ struct RepTxn {
         m.transactionalId = {reinterpret_cast<const uint8_t*>(txn.data()), txn.size()};
         m.groupId = {reinterpret_cast<const uint8_t*>(group.data()), group.size()};
         const std::vector<pc::TxnOffsetCommitEntry> e = {{0, 0, offset, {}}};
-        const std::size_t n = svc->handleTxnOffsetCommit(req.data(), m.encode(req.data(), e), now, out.data(), out.size());
+        const std::size_t n = svc->handleTxnOffsetCommit(req.data(), m.encode(req.data(), e), now, out.data(), out.size(), ctx);
         if (n == 0) {
             commitAll();
             if (answers->frames.empty()) return -1;
@@ -1641,7 +1643,7 @@ struct RepTxn {
     }
     int16_t endTxn(const std::string& txn, int64_t pid, int16_t ep, bool commitIt, int64_t now) {
         const std::size_t n = encodeEndTxn(req.data(), req.size(), 1, ++corr, pid, ep, commitIt, txn);
-        return answer<pc::EndTxnResponse>(svc->handleEndTxn(req.data(), n, now, out.data(), out.size()));
+        return answer<pc::EndTxnResponse>(svc->handleEndTxn(req.data(), n, now, out.data(), out.size(), ctx));
     }
 };
 }  // namespace
@@ -1937,4 +1939,331 @@ TEST_F(TxnPrepareGateRegression, AProduceIntoARegistrationWhosePutWasRefusedIsRe
     replica_->setMinIsrForTest(1);
     ASSERT_EQ(addPartitions("tx562p", pid, ep, 0), 0);
     EXPECT_EQ(svc_->verifyTxnPartition(pid, ep, 0, 0, now_), 0);
+}
+
+// ===========================================================================
+// #663 / #727: a deleted namespace's in-memory coordinator entries and holds go with its tombstones; a hold whose
+// Complete* append was refused before the tombstone must not write the record back after it.
+// ===========================================================================
+class TxnNsDeleteRegression : public TxnStateReplicationTest {
+protected:
+    /// InitProducerId of `local` in the namespace of `ctx` (the fixture's initPid, with the namespace context).
+    int64_t initPidIn(const rune::coordination::NsRequestContext& ctx, const std::string& local, int16_t& epoch,
+                      int32_t timeoutMs = 30'000) {
+        const std::size_t reqLen = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, timeoutMs, local);
+        EXPECT_EQ(svc_->handleInitProducerId(reqBuf_.data(), reqLen, now_, outBuf_.data(), outBuf_.size(), ctx), 0u);
+        followerFetches();
+        (void)svc_->doWork(now_);
+        EXPECT_EQ(answers_.frames.size(), 1u);
+        const auto r = pc::InitProducerIdResponse::decode(answers_.frames.back().data(), answers_.frames.back().size());
+        EXPECT_TRUE(r && r->errorCode == 0);
+        answers_.frames.clear();
+        epoch = r ? r->producerEpoch : 0;
+        return r ? r->producerId : -1;
+    }
+    /// ns 4's "tx-ra" aborted by its timeout with a hold on group "cgr", and ns 5's "tx-rb" open on group "cgs".  With
+    /// `refuseComplete` the Complete* append of tx-ra is refused (min-ISR) so its hold rests in kHoldNeedsPut.
+    void setUpRig(bool refuseComplete) {
+        a_ = rune::coordination::scopedId(4, "tx-ra");
+        b_ = rune::coordination::scopedId(5, "tx-rb");
+        svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+        int16_t epA = 0, epB = 0;
+        const rune::coordination::NsRequestContext ctxA{4, false, nullptr}, ctxB{5, false, nullptr};
+        const int64_t pa = initPidIn(ctxA, "tx-ra", epA, /*timeoutMs=*/100);
+        const int64_t pb = initPidIn(ctxB, "tx-rb", epB);
+        RepTxn r;
+        r.svc = svc_.get();
+        r.answers = &answers_;
+        r.commitAll = [this, &r] { followerFetches(); (void)r.svc->doWork(now_); };
+        r.ctx = ctxA;
+        ASSERT_EQ(r.addOffsets("tx-ra", pa, epA, "cgr", now_), 0);
+        ASSERT_EQ(r.commit("tx-ra", pa, epA, "cgr", 42, now_), 0);
+        r.ctx = ctxB;
+        ASSERT_EQ(r.addOffsets("tx-rb", pb, epB, "cgs", now_), 0);
+        ASSERT_EQ(r.commit("tx-rb", pb, epB, "cgs", 7, now_), 0);
+        now_ += 1'000'000'000;                       // past a's 100 ms timeout: PrepareAbort is appended
+        (void)svc_->doWork(now_);
+        ASSERT_EQ(svc_->txnStateForTest(a_), tx::TxnState::PrepareAbort);
+        followerFetches();
+        if (refuseComplete) replica_->setMinIsrForTest(3);
+        for (int i = 0; i < 5; ++i) (void)svc_->doWork(now_ + i);
+        ASSERT_EQ(svc_->txnStateForTest(a_), tx::TxnState::CompleteAbort);
+        if (refuseComplete) {
+            ASSERT_EQ(txnStore_->get(a_)->state, tx::TxnState::PrepareAbort) << "premise: Complete* not appended";
+            replica_->setMinIsrForTest(1);
+        } else {
+            for (int i = 0; i < 3; ++i) { followerFetches(); (void)svc_->doWork(now_); }
+        }
+    }
+    /// tombstoneNamespace(4) until Done, the follower fetching between calls; fails at the cap.
+    void tombstoneNs4ToDone() {
+        rune::node::ReapStatus st = rune::node::ReapStatus::More;
+        for (int i = 0; i < 64 && st != rune::node::ReapStatus::Done; ++i) {
+            st = svc_->tombstoneNamespace(4, 64, now_);
+            followerFetches();
+        }
+        ASSERT_EQ(st, rune::node::ReapStatus::Done);
+    }
+    std::string a_, b_;
+};
+
+TEST_F(TxnNsDeleteRegression, TombstonedNamespaceTxnIsNeverRewrittenRegression) {
+    setUpRig(/*refuseComplete=*/true);
+    ASSERT_EQ(svc_->holdCountForTest(), 2u);
+    tombstoneNs4ToDone();
+    for (int i = 0; i < 10; ++i) { followerFetches(); (void)svc_->doWork(now_); }
+    EXPECT_EQ(svc_->liveKeysOfNamespaceForTest(4), std::optional<std::size_t>{0u})
+        << "a hold re-appended the Complete* record after the tombstone";
+    EXPECT_EQ(txnStore_->get(a_), nullptr);
+    EXPECT_EQ(svc_->holdCountForTest(), 1u) << "only the other namespace's hold remains";
+    EXPECT_EQ(svc_->txnStateForTest(b_), tx::TxnState::Ongoing) << "ns 5 is untouched";
+    EXPECT_EQ(svc_->liveKeysOfNamespaceForTest(5), std::optional<std::size_t>{1u});
+}
+
+TEST_F(TxnNsDeleteRegression, TombstoneErasesInMemoryTxnsRegression) {
+    setUpRig(/*refuseComplete=*/false);
+    const std::size_t before = svc_->coordinatorSizeForTest();
+    ASSERT_EQ(svc_->txnStateForTest(a_), tx::TxnState::CompleteAbort);
+    tombstoneNs4ToDone();
+    EXPECT_EQ(svc_->txnStateForTest(a_), tx::TxnState::Empty) << "the deleted namespace's entry is still in memory";
+    EXPECT_EQ(svc_->coordinatorSizeForTest(), before - 1);
+    EXPECT_EQ(svc_->txnStateForTest(b_), tx::TxnState::Ongoing);
+}
+
+// #661: a coordinator that loads AFTER a namespace was suspended / deleted aborts that namespace's open transactions at
+// its load (the apply's abortAllForNamespace answered 0 while the coordinator was unloaded).
+TEST_F(TxnNsDeleteRegression, CoordinatorLoadedAfterSuspendAbortsTheNamespacesOpenTxnsRegression) {
+    const std::string x = rune::coordination::scopedId(4, "tx"), y = rune::coordination::scopedId(5, "ty");
+    const rune::coordination::NsRequestContext ctxX{4, false, nullptr}, ctxY{5, false, nullptr};
+    int16_t epX = 0, epY = 0;
+    const int64_t px = initPidIn(ctxX, "tx", epX);
+    const int64_t py = initPidIn(ctxY, "ty", epY);
+    RepTxn r;
+    r.svc = svc_.get();
+    r.answers = &answers_;
+    r.commitAll = [this, &r] { followerFetches(); (void)r.svc->doWork(now_); };
+    r.ctx = ctxX;
+    ASSERT_EQ(r.addOffsets("tx", px, epX, "cgx", now_), 0);
+    r.ctx = ctxY;
+    ASSERT_EQ(r.addOffsets("ty", py, epY, "cgy", now_), 0);
+    ASSERT_EQ(svc_->txnStateForTest(x), tx::TxnState::Ongoing);
+    ASSERT_EQ(svc_->txnStateForTest(y), tx::TxnState::Ongoing);
+
+    isLeader_ = false;                        // the coordinator unloads
+    replica_->becomeFollower(2, 2);
+    (void)svc_->doWork(now_);
+    ASSERT_FALSE(svc_->isLoaded());
+    svc_->setNamespaceTxnGate(4, true, false);       // ns 4 is suspended / deleted meanwhile: the gateway's apply
+    EXPECT_EQ(svc_->abortAllForNamespace(4, now_), 0u) << "unloaded: the apply aborts nothing";
+
+    isLeader_ = true;                         // ... and the coordinator loads later
+    replica_->becomeLeader(3, {1, 2});
+    followerFetches();
+    for (int i = 0; i < 4; ++i) { (void)svc_->doWork(now_); followerFetches(); }
+    ASSERT_TRUE(svc_->isLoaded());
+    const tx::TxnState sx = svc_->txnStateForTest(x);
+    EXPECT_TRUE(sx == tx::TxnState::PrepareAbort || sx == tx::TxnState::CompleteAbort)
+        << "state " << static_cast<int>(sx) << ": the suspended namespace's open txn survived the load";
+    EXPECT_EQ(svc_->txnStateForTest(y), tx::TxnState::Ongoing) << "another namespace is untouched";
+
+    svc_->setNamespaceTxnGate(4, false, false);      // the erase: a later load aborts nothing of it
+    svc_->setNamespaceTxnGate(4, false, false);      // idempotent
+}
+
+// #662: a PrepareCommit stuck on a refused transactional-offset apply (#359) is unsettled; once its namespace is Deleting
+// the offset is moot (the reaper tombstones the group), so the commit settles and the txn-state tombstone completes.
+TEST_F(TxnNsDeleteRegression, PrepareCommitStuckOnRefusedOffsetDoesNotBlockDeleteRegression) {
+    const std::string local = "tx-pc";
+    const std::string scoped = rune::coordination::scopedId(4, local);
+    const rune::coordination::NsRequestContext ctx{4, false, nullptr};
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    RefusingSink sink;
+    sink.refusals = 1'000'000'000;   // the group coordinator refuses forever
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    int16_t ep = 0;
+    const int64_t pid = initPidIn(ctx, local, ep);
+    RepTxn r;
+    r.svc = svc_.get();
+    r.answers = &answers_;
+    r.commitAll = [this, &r] { followerFetches(); (void)r.svc->doWork(now_); };
+    r.ctx = ctx;
+    {
+        const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+        const std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, local, parts);
+        const std::size_t k = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size(), ctx);
+        if (k == 0) { followerFetches(); (void)svc_->doWork(now_); answers_.frames.clear(); }
+    }
+    ASSERT_EQ(r.addOffsets(local, pid, ep, "cgp", now_), 0);
+    ASSERT_EQ(r.commit(local, pid, ep, "cgp", 5, now_), 0);
+    ASSERT_EQ(r.endTxn(local, pid, ep, /*commitIt=*/true, now_), 0);
+    followerFetches();   // PrepareCommit is durable; the coordinator reloads and re-drives it (the rig has no gateway)
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    for (int i = 0; i < 3; ++i) { followerFetches(); (void)svc_->doWork(now_); }   // loads, dispatches the markers
+    ASSERT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u) << "premise: the markers were dispatched";
+    svc_->onControlMarkerLanded(0, 0, pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    for (int i = 0; i < 5; ++i) { now_ += 1'100'000'000; followerFetches(); (void)svc_->doWork(now_); }
+    ASSERT_EQ(svc_->txnStateForTest(scoped), tx::TxnState::PrepareCommit) << "premise: stuck on the refused apply";
+    ASSERT_GE(sink.calls, 1) << "premise: the offset apply was attempted and refused";
+    rune::node::ReapStatus abortAnswer = rune::node::ReapStatus::More, tombAnswer = rune::node::ReapStatus::More;
+    svc_->setNamespaceTxnGate(4, true, /*deleting=*/true);   // the delete's apply
+    const int callsBeforeDelete = sink.calls;
+    for (int i = 0; i < 100; ++i) {
+        now_ += 1'100'000'000;
+        abortAnswer = svc_->abortNamespaceTxns(4, now_);
+        tombAnswer = svc_->tombstoneNamespace(4, 64, now_);
+        followerFetches();
+        (void)svc_->doWork(now_);
+        if (tombAnswer == rune::node::ReapStatus::Done) break;
+    }
+    EXPECT_EQ(tombAnswer, rune::node::ReapStatus::Done)
+        << "abortNamespaceTxns=" << static_cast<int>(abortAnswer) << " tombstoneNamespace=" << static_cast<int>(tombAnswer)
+        << " state=" << static_cast<int>(svc_->txnStateForTest(scoped)) << " (4 = PrepareCommit) unsettled keys "
+        << svc_->liveKeysOfNamespaceForTest(4).value_or(999) << " sink calls " << sink.calls;
+    EXPECT_EQ(sink.calls, callsBeforeDelete) << "a moot offset must never reach the group coordinator";
+    EXPECT_EQ(sink.accepted, 0);
+    EXPECT_GE(svc_->mootOffsetsDroppedForTest(), 1u);
+}
+
+// ADVERSARIAL (#662 / #663 class): the AbortTxns step must not finish while a commit of the namespace still applies offsets.
+TEST_F(TxnNsDeleteRegression, AbortStepNeverDoneWhileANamespaceCommitStillAppliesOffsetsAdversarialRegression) {
+    const std::string local = "tx-pc";
+    const std::string scoped = rune::coordination::scopedId(4, local);
+    const rune::coordination::NsRequestContext ctx{4, false, nullptr};
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    RefusingSink sink;
+    sink.refusals = 1'000'000'000;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    int16_t ep = 0;
+    const int64_t pid = initPidIn(ctx, local, ep);
+    RepTxn r; r.svc = svc_.get(); r.answers = &answers_;
+    r.commitAll = [this, &r] { followerFetches(); (void)r.svc->doWork(now_); };
+    r.ctx = ctx;
+    {
+        const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+        const std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, local, parts);
+        const std::size_t k = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size(), ctx);
+        if (k == 0) { followerFetches(); (void)svc_->doWork(now_); answers_.frames.clear(); }
+    }
+    ASSERT_EQ(r.addOffsets(local, pid, ep, "cgp", now_), 0);
+    ASSERT_EQ(r.commit(local, pid, ep, "cgp", 5, now_), 0);
+    ASSERT_EQ(r.endTxn(local, pid, ep, /*commitIt=*/true, now_), 0);
+    followerFetches();
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    for (int i = 0; i < 3; ++i) { followerFetches(); (void)svc_->doWork(now_); }
+    ASSERT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u);
+    svc_->onControlMarkerLanded(0, 0, pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    for (int i = 0; i < 5; ++i) { now_ += 1'100'000'000; followerFetches(); (void)svc_->doWork(now_); }
+    ASSERT_EQ(svc_->txnStateForTest(scoped), tx::TxnState::PrepareCommit);
+    ASSERT_EQ(sink.accepted, 0);
+    svc_->setNamespaceTxnGate(4, true, /*deleting=*/true);   // the delete's apply
+    rune::node::ReapStatus abortAnswer = svc_->abortNamespaceTxns(4, now_);
+    // the commit still has its offsets pending: the step is not Done until a doWork retry settles them
+    EXPECT_EQ(abortAnswer, rune::node::ReapStatus::Waiting) << "AbortTxns answered " << static_cast<int>(abortAnswer)
+        << " while a commit of the namespace still had offsets pending";
+    sink.refusals = 0;   // the group coordinator takes offsets again (after the reaper tombstoned the groups)
+    bool done = abortAnswer == rune::node::ReapStatus::Done;
+    for (int i = 0; i < 20; ++i) {
+        now_ += 1'100'000'000; followerFetches(); (void)svc_->doWork(now_);
+        abortAnswer = svc_->abortNamespaceTxns(4, now_);
+        done = done || abortAnswer == rune::node::ReapStatus::Done;
+    }
+    EXPECT_TRUE(done) << "the AbortTxns step never answered Done";
+    EXPECT_EQ(sink.accepted, 0) << "moot offsets reached the sink: " << ::testing::PrintToString(sink.acceptedOffsets);
+    EXPECT_EQ(svc_->mootOffsetsDroppedForTest(), 1u);
+    const tx::TxnState st = svc_->txnStateForTest(scoped);
+    EXPECT_TRUE(st == tx::TxnState::CompleteCommit) << "state " << static_cast<int>(st);
+}
+
+// Guards the suspend semantic: a Suspended (blocked, not deleting) namespace still applies its committing txns' offsets.
+TEST_F(TxnNsDeleteRegression, SuspendedNamespaceStillAppliesTxnOffsetsRegression) {
+    const std::string local = "tx-pc";
+    const std::string scoped = rune::coordination::scopedId(4, local);
+    const rune::coordination::NsRequestContext ctx{4, false, nullptr};
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    RefusingSink sink;
+    sink.refusals = 1'000'000'000;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    int16_t ep = 0;
+    const int64_t pid = initPidIn(ctx, local, ep);
+    RepTxn r; r.svc = svc_.get(); r.answers = &answers_;
+    r.commitAll = [this, &r] { followerFetches(); (void)r.svc->doWork(now_); };
+    r.ctx = ctx;
+    {
+        const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+        const std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, local, parts);
+        const std::size_t k = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size(), ctx);
+        if (k == 0) { followerFetches(); (void)svc_->doWork(now_); answers_.frames.clear(); }
+    }
+    ASSERT_EQ(r.addOffsets(local, pid, ep, "cgp", now_), 0);
+    ASSERT_EQ(r.commit(local, pid, ep, "cgp", 5, now_), 0);
+    ASSERT_EQ(r.endTxn(local, pid, ep, /*commitIt=*/true, now_), 0);
+    followerFetches();
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    for (int i = 0; i < 3; ++i) { followerFetches(); (void)svc_->doWork(now_); }
+    ASSERT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u);
+    svc_->setNamespaceTxnGate(4, /*blocked=*/true, /*deleting=*/false);   // Suspended
+    sink.refusals = 0;
+    svc_->onControlMarkerLanded(0, 0, pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    for (int i = 0; i < 20; ++i) { now_ += 1'100'000'000; followerFetches(); (void)svc_->doWork(now_); }
+    EXPECT_EQ(sink.accepted, 1) << "a suspended namespace's committing txn must still apply its offset";
+    EXPECT_EQ(svc_->mootOffsetsDroppedForTest(), 0u);
+    EXPECT_EQ(svc_->txnStateForTest(scoped), tx::TxnState::CompleteCommit);
+}
+
+// ADVERSARIAL (batch-2 union review, c86df044 re-attack, rule 16): once the namespace is Deleting its deferred commit's
+// offsets are moot and the commit must settle on the NEXT doWork - on a FROZEN clock (no retry back-off to wait out).
+// The reaper's AbortTxns step then answers Done.  Mutation: drop `a.offsetDueNs = 0` in setNamespaceTxnGate -> red.
+TEST_F(TxnNsDeleteRegression, DeletingSettlesDeferredCommitOnAFrozenClockAdversarialRegression) {
+    const std::string local = "tx-pc";
+    const std::string scoped = rune::coordination::scopedId(4, local);
+    const rune::coordination::NsRequestContext ctx{4, false, nullptr};
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    RefusingSink sink;
+    sink.refusals = 1'000'000'000;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    int16_t ep = 0;
+    const int64_t pid = initPidIn(ctx, local, ep);
+    RepTxn r; r.svc = svc_.get(); r.answers = &answers_;
+    r.commitAll = [this, &r] { followerFetches(); (void)r.svc->doWork(now_); };
+    r.ctx = ctx;
+    {
+        const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+        const std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, local, parts);
+        const std::size_t k = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size(), ctx);
+        if (k == 0) { followerFetches(); (void)svc_->doWork(now_); answers_.frames.clear(); }
+    }
+    ASSERT_EQ(r.addOffsets(local, pid, ep, "cgp", now_), 0);
+    ASSERT_EQ(r.commit(local, pid, ep, "cgp", 5, now_), 0);
+    ASSERT_EQ(r.endTxn(local, pid, ep, /*commitIt=*/true, now_), 0);
+    followerFetches();
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    for (int i = 0; i < 3; ++i) { followerFetches(); (void)svc_->doWork(now_); }
+    ASSERT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u);
+    svc_->onControlMarkerLanded(0, 0, pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    for (int i = 0; i < 5; ++i) { now_ += 1'100'000'000; followerFetches(); (void)svc_->doWork(now_); }
+    ASSERT_EQ(svc_->txnStateForTest(scoped), tx::TxnState::PrepareCommit) << "premise: deferred on the refused offset";
+    // One refused retry right now arms the back-off; from here the clock never moves.
+    followerFetches(); (void)svc_->doWork(now_);
+    svc_->setNamespaceTxnGate(4, true, /*deleting=*/true);   // the delete's apply
+    rune::node::ReapStatus abortAnswer = rune::node::ReapStatus::More;
+    for (int i = 0; i < 8 && abortAnswer != rune::node::ReapStatus::Done; ++i) {   // hard cap, frozen clock
+        followerFetches(); (void)svc_->doWork(now_);
+        abortAnswer = svc_->abortNamespaceTxns(4, now_);
+    }
+    EXPECT_EQ(abortAnswer, rune::node::ReapStatus::Done) << "the deferred commit waited for wall time after the delete";
+    EXPECT_EQ(svc_->txnStateForTest(scoped), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(sink.accepted, 0);
+    EXPECT_EQ(svc_->mootOffsetsDroppedForTest(), 1u);
 }

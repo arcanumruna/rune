@@ -49,10 +49,16 @@ bool SecurityState::hasSecurityAdmin() const {
     return false;
 }
 
+bool SecurityState::isNsAdmin(uint64_t userId, uint32_t nsId, std::string_view nsName) const {
+    const auto it = users_.find(userId);
+    return it != users_.end() && it->second.enabled && it->second.nsId == nsId &&
+           effectivePerms(*this, userId, nsName).nsAdmin;
+}
+
 std::vector<uint64_t> SecurityState::nsAdminOf(uint32_t nsId, std::string_view nsName) const {
     std::vector<uint64_t> out;
     for (const auto& [id, u] : users_)   // std::map: ascending id = sorted
-        if (u.enabled && u.nsId == nsId && effectivePerms(*this, id, nsName).nsAdmin) out.push_back(id);
+        if (isNsAdmin(id, nsId, nsName)) out.push_back(id);
     return out;
 }
 

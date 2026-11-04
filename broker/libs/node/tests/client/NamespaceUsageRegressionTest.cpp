@@ -148,6 +148,85 @@ TEST(NamespaceUsageRegression, ValuesMatchCountsRegression) {
     EXPECT_EQ(d->usage[kTopics], 0u);
 }
 
+// #696: schemas, the highest schema version, groups, users and open transactions read 0 ("n/a") although the namespace holds
+// them.  Each now comes from the owner of the count its limit check reads.  Usage is per node; this is one broker.
+TEST(NamespaceUsageRegression, SchemasGroupsUsersTxnsReportedRegression) {
+    constexpr std::size_t kSchemas = 4, kVersionMax = 5, kGroups = 6, kUsers = 7, kOpenTxns = 21;
+    AuthBroker b("nsusage_more");
+    b.bootstrapAdmin(kAdminPw);
+    auto admin = connected(b, "admin");
+    ASSERT_TRUE(admin->createNamespace("a").has_value());
+    std::vector<AuthGrant> g = builderGrants("a", false);
+    g.push_back(prefix(SO::Write, ST::Topic, ""));
+    g.push_back(prefix(SO::Alter, ST::Topic, ""));
+    g.push_back(prefix(SO::Read, ST::Group, ""));
+    g.push_back(prefix(SO::Describe, ST::Group, ""));
+    g.push_back(prefix(SO::Write, ST::TransactionalId, ""));
+    g.push_back(prefix(SO::Describe, ST::TransactionalId, ""));
+    b.createUser("a/w", kUserPw, g);
+    b.createUser("a/x", kUserPw, g);
+    b.createUser("a/y", kUserPw, builderGrants("a", false));
+    auto w = connected(b, "a/w");
+    auto x = connected(b, "a/x");   // one GroupConsumer per Client
+
+    // Two typed topics, one of them at version 3 (two adds); an untyped one for the transaction.
+    ASSERT_EQ(w->defineTopicAndWait("s1", 1, "id", rune::node::test::charBlob(), rc::Persistence::Disk, {}, {}, 60s).errorCode, 0);
+    const auto s2 = w->defineTopicAndWait("s2", 1, "id", rune::node::test::charBlob(), rc::Persistence::Disk, {}, {}, 60s);
+    ASSERT_EQ(s2.errorCode, 0) << s2.detail;
+    const auto tx = w->defineTopicAndWait("tx", 1, "", {}, 60s);
+    ASSERT_EQ(tx.errorCode, 0) << tx.detail;
+    for (const char* field : {"f1", "f2"}) {
+        rune::codec::AlterOp op{};
+        op.type = rune::codec::AlterOpType::Add;
+        op.name = field;
+        op.primType = rune::codec::PrimType::Int64;
+        const auto r = w->alterTopicAndWait("s1", 0, rune::codec::encodeAlterOps({op}), {}, 60s);
+        ASSERT_EQ(r.errorCode, 0) << field << ": " << r.detail;
+    }
+
+    // Two groups (a group exists from its first join).
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 30'000;
+    rc::GroupConsumer g1 = w->subscribeGroup("g1", {"s2"}, gcfg);
+    rc::GroupConsumer g2 = x->subscribeGroup("g2", {"s2"}, gcfg);
+
+    // One open transaction.
+    rc::ProducerConfig pcfg;
+    pcfg.acks = rc::Acks::All;
+    pcfg.transactionalId = "x1";
+    rc::Producer p = w->producer(pcfg);
+    p.initTransactionsAndWait(20s);
+    p.beginTransaction();
+    const uint8_t v[1] = {1};
+    ASSERT_EQ(p.trySend(rc::TopicHandle{tx.topicId, 1}, rc::Key(int64_t{1}), std::span<const uint8_t>(v, 1)), rc::SendResult::Ok);
+    p.flushAndWait(20s);
+
+    pc::NamespaceUsageResponse got;
+    ASSERT_TRUE(until([&] {
+        const auto r = admin->namespaceUsage("a", 20s);
+        if (!r) return false;
+        got = *r;
+        return got.usage[kGroups] == 2 && got.usage[kOpenTxns] == 1 && got.usage[kSchemas] == 2 && got.usage[kVersionMax] == 3;
+    })) << "usage: schemas " << got.usage[kSchemas] << " max version " << got.usage[kVersionMax] << " groups "
+        << got.usage[kGroups] << " users " << got.usage[kUsers] << " open txns " << got.usage[kOpenTxns];
+    EXPECT_EQ(got.usage[kSchemas], 2u);
+    EXPECT_EQ(got.usage[kVersionMax], 3u);
+    EXPECT_EQ(got.usage[kGroups], 2u);
+    EXPECT_EQ(got.usage[kUsers], 3u);
+    EXPECT_EQ(got.usage[kOpenTxns], 1u);
+
+    // The count follows the transaction's end.
+    p.commitTransactionAndWait(20s);
+    EXPECT_TRUE(until([&] { const auto r = admin->namespaceUsage("a", 20s); return r && r->usage[kOpenTxns] == 0; }))
+        << "the commit reaches the usage";
+    // `default` holds none of them in this namespace's sense: its counts are its own.
+    const auto d = admin->namespaceUsage("default", 20s);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->usage[kSchemas], 0u);
+    EXPECT_EQ(d->usage[kGroups], 0u);
+    EXPECT_EQ(d->usage[kOpenTxns], 0u);
+}
+
 TEST(NamespaceUsageRegression, NamespaceUserWithDescribeRegression) {
     AuthBroker b("nsusage_user");
     b.bootstrapAdmin(kAdminPw);

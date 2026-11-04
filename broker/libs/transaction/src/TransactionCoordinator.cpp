@@ -587,10 +587,15 @@ bool TransactionCoordinator::nsOpenTxnsAtLimit_(const TransactionalId& txnId) co
     const uint32_t nsId = rune::coordination::parseScopedId(txnId).nsId;
     const auto it = nsTxnLimits_.find(nsId);
     if (it == nsTxnLimits_.end() || it->second.maxOpenTxns == 0) return false;
+    return openTxnsOfNamespace(nsId) >= it->second.maxOpenTxns;
+}
+
+uint64_t TransactionCoordinator::openTxnsOfNamespace(uint32_t nsId) const
+{
     uint64_t open = 0;
     for (const auto& [id, meta] : txnMap_)
         if (meta.state == TxnState::Ongoing && rune::coordination::parseScopedId(id).nsId == nsId) ++open;
-    return open >= it->second.maxOpenTxns;
+    return open;
 }
 
 // The coordinator's own abort of an Ongoing transaction (timeout, namespace suspend / delete): PrepareAbort, the
@@ -613,6 +618,23 @@ uint32_t TransactionCoordinator::abortAllForNamespace(uint32_t nsId, int64_t /*n
         beginInternalAbort_(meta);
         ++n;
     }
+    return n;
+}
+
+uint32_t TransactionCoordinator::eraseNamespace(uint32_t nsId)
+{
+    uint32_t n = 0;
+    for (auto it = txnMap_.begin(); it != txnMap_.end();) {
+        if (rune::coordination::parseScopedId(it->first).nsId == nsId) { it = txnMap_.erase(it); ++n; }
+        else ++it;
+    }
+    return n;
+}
+
+std::size_t TransactionCoordinator::countOfNamespaceForTest(uint32_t nsId) const
+{
+    std::size_t n = 0;
+    for (const auto& kv : txnMap_) n += rune::coordination::parseScopedId(kv.first).nsId == nsId ? 1 : 0;
     return n;
 }
 

@@ -762,6 +762,9 @@ uint64_t Producer::framesSent() const noexcept {
     return impl_ ? impl_->framesSent() : 0u;
 }
 
+uint32_t Producer::endTxnAttemptsForTest() const noexcept { return impl_ ? impl_->endTxnAttemptsForTest() : 0u; }
+uint32_t Producer::endTxnWireOffersForTest() const noexcept { return impl_ ? impl_->endTxnWireOffersForTest() : 0u; }
+
 uint64_t Producer::testCallbackExceptionCount() const noexcept {
     return impl_ ? impl_->testCallbackExceptionCount() : 0u;
 }
