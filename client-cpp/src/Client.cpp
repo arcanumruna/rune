@@ -342,10 +342,7 @@ Client::Client(ClientConfig cfg, const detail::ClientTestOptions& opts)
     // D4: every group frame goes to the COORDINATOR session — the seed's ring
     // path (unchanged) while the coordinator is the seed, else that node's own
     // session (re-stamped with its id; held = refused while it connects).
-    coordSendFn_ = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-        if (coordIdx() == 0) return agent_.submitSend(fb, fl);
-        return agent_.offerToCoordinator(coordIdx(), fb, fl) != transport::AeronTransport::OfferResult::Retry;
-    };
+    coordSendFn_ = group::SendFn{&Client::coordSendThunk_, this};   // #718: a thunk, never a std::function
     {
         group::GroupConsumerHub::FetchRouter fr;
         fr.ctx           = this;
@@ -630,9 +627,7 @@ void Client::closeImpl_(bool drainDeadlineHit) {
     // sendFn here is a best-effort last send (transport may be stopping).
     {
         const auto snap = agent_.stateAndSessionId();
-        const group::SendFn gcSendFn = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-            return agent_.submitSend(fb, fl);
-        };
+        const group::SendFn gcSendFn{&Client::seedSendThunk_, this};
         groupConsumerHub_.closeAll(snap.sessionId, gcSendFn);
     }
 
@@ -3480,7 +3475,7 @@ int Client::dutyCycle(int64_t nowNs) {
             work += groupConsumerHub_.flushRequestedCommits(gsid);
             // #371: a pending seek / seekToCommitted progresses on THIS pass (its OffsetFetch answer, its
             // resubscribe, its completion), not on the 100 ms sweep.
-            work += groupConsumerHub_.driveRewinds(nowNs, gsid, coordSendFn_);
+            if (groupConsumerHub_.activeRewinds() != 0) work += groupConsumerHub_.driveRewinds(nowNs, gsid, coordSendFn_);
             if (groupConsumerHub_.pendingLeaves() != 0) work += groupConsumerHub_.retryPendingLeaves(gsid);
             // M2: refused fetch Unsubscribes are re-offered every pass until sent / moot.
             if (groupConsumerHub_.pendingFetchUnsubscribes() != 0) work += groupConsumerHub_.retryFetchUnsubscribes();
@@ -6118,6 +6113,16 @@ int Client::watchSilentLeaders_(int64_t nowNs) {
         }
     }
     return 0;
+}
+
+bool Client::coordSendThunk_(void* ctx, int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) {
+    auto* self = static_cast<Client*>(ctx);
+    if (self->coordIdx() == 0) return self->agent_.submitSend(fb, fl);
+    return self->agent_.offerToCoordinator(self->coordIdx(), fb, fl) != transport::AeronTransport::OfferResult::Retry;
+}
+
+bool Client::seedSendThunk_(void* ctx, int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) {
+    return static_cast<Client*>(ctx)->agent_.submitSend(fb, fl);
 }
 
 int64_t Client::nextCorrTrampoline_(void* ctx) noexcept {

@@ -1652,6 +1652,10 @@ private:
     /// Every group frame (JoinGroup / SyncGroup / Heartbeat / OffsetFetch):
     /// the seed's ring path, or the coordinator session (built once).
     group::SendFn coordSendFn_;
+    /// #718: the group hub's send path: the coordinator session's ring (seed) or its own node session.
+    static bool coordSendThunk_(void* ctx, int32_t streamId, const uint8_t* fb, std::size_t fl);
+    /// closeAll's best-effort last send on the seed.
+    static bool seedSendThunk_(void* ctx, int32_t streamId, const uint8_t* fb, std::size_t fl);
     /// Phase 2b F: the CoordinatorSink every producer's CoordinatorLink offers through.
     [[nodiscard]] static producer::CoordinatorSink::Offer coordOfferTrampoline_(void* ctx, const uint8_t* buf,
                                                                                 std::size_t len) noexcept;

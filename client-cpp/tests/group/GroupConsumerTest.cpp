@@ -337,8 +337,12 @@ static int64_t g_lastOffsetFetchCorr = 0;
 struct CaptureSink {
     std::vector<CapturedFrame> frames;
 
-    SendFn fn() {
-        return [this](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
+    SendFn fn() { return SendFn{&CaptureSink::thunk, this}; }
+    static bool thunk(void* ctx, int32_t /*streamId*/, const uint8_t* buf, std::size_t len) {
+        return static_cast<CaptureSink*>(ctx)->capture(buf, len);
+    }
+    bool capture(const uint8_t* buf, std::size_t len) {
+        {
             CapturedFrame f;
             f.data.assign(buf, buf + len);
             if (auto of = rpc::OffsetFetch::decode(buf, len)) g_lastOffsetFetchCorr = of->correlationId;
@@ -354,7 +358,7 @@ struct CaptureSink {
             }
             frames.push_back(std::move(f));
             return true;
-        };
+        }
     }
 
     void clear() { frames.clear(); }
@@ -1553,13 +1557,13 @@ TEST_F(GroupConsumerHubTest, TwoThreadCommitDoWork_NoRaceRegression) {
     std::atomic<int>  commitsSent{0};
 
     std::thread duty([&]() {
-        SendFn send = [&](int32_t, const uint8_t* b, std::size_t n) -> bool {
+        SendFn send{[](void* ctx, int32_t, const uint8_t* b, std::size_t n) -> bool {
             if (n >= 4 && (static_cast<uint16_t>(b[2]) | (static_cast<uint16_t>(b[3]) << 8)) ==
                               static_cast<uint16_t>(rpc::TemplateId::OffsetCommit)) {
-                commitsSent.fetch_add(1, std::memory_order_relaxed);
+                static_cast<std::atomic<int>*>(ctx)->fetch_add(1, std::memory_order_relaxed);
             }
             return true;
-        };
+        }, &commitsSent};
         while (!appDone.load(std::memory_order_acquire)) {
             ch.drainInto(*hub_);
             const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
