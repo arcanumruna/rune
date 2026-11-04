@@ -53,6 +53,7 @@ bool foreignNs(const PermissionTable& t, uint32_t nsId) noexcept {
 std::optional<Denial> authorizeTopicId(const PermissionTable& t, int32_t topicId, rsec::Operation op,
                                        const ObjectIndex& index, rsec::ResourceType shownType)
 {
+    if (op == rsec::Operation::Import) return deny(op, shownType, std::to_string(topicId));   // opBit(Import) is 0: IMPORT is allowsImport
     if (t.allows(topicId, rsec::opBit(op))) return std::nullopt;
     if (index.at(topicId) == nullptr && t.allowsCluster(rsec::opBit(rsec::Operation::Describe))) return std::nullopt;   // D22
     return deny(op, shownType, std::to_string(topicId));
@@ -67,7 +68,7 @@ std::optional<Denial> authorizeViewSource(const PermissionTable& t, int32_t topi
 std::optional<Denial> authorizeName(const PermissionTable& t, rsec::ResourceType type, std::string_view name, rsec::Operation op,
                                   uint32_t nsId)
 {
-    if (foreignNs(t, nsId)) return deny(op, type, name);   // #640
+    if (op == rsec::Operation::Import || foreignNs(t, nsId)) return deny(op, type, name);   // #640; IMPORT: see authorizeTopicId
     if (t.allowsName(type, name, rsec::opBit(op))) return std::nullopt;
     return deny(op, type, name);
 }
@@ -75,7 +76,7 @@ std::optional<Denial> authorizeName(const PermissionTable& t, rsec::ResourceType
 std::optional<Denial> authorizeTopicOrViewName(const PermissionTable& t, std::string_view name, rsec::Operation op,
                                                const ObjectIndex& index, uint32_t nsId)
 {
-    if (foreignNs(t, nsId)) return deny(op, rsec::ResourceType::Topic, name);   // #640
+    if (op == rsec::Operation::Import || foreignNs(t, nsId)) return deny(op, rsec::ResourceType::Topic, name);   // #640; IMPORT: see authorizeTopicId
     if (const auto id = index.byName(nsId, name)) {   // #128: only the object's own kind's grants count
         const ObjectEntry* e = index.at(*id);
         if (t.allowsName(e->type, name, rsec::opBit(op))) return std::nullopt;
@@ -89,13 +90,14 @@ std::optional<Denial> authorizeTopicOrViewName(const PermissionTable& t, std::st
 
 std::optional<Denial> authorizeCluster(const PermissionTable& t, rsec::Operation op)
 {
+    if (op == rsec::Operation::Import) return deny(op, rsec::ResourceType::Cluster, {});   // see authorizeTopicId
     if (t.allowsCluster(rsec::opBit(op))) return std::nullopt;
     return deny(op, rsec::ResourceType::Cluster, {});
 }
 
 std::optional<Denial> authorizeAnyGrant(const PermissionTable& t, rsec::ResourceType type, rsec::Operation op)
 {
-    if (t.hasAnyGrant(type, op)) return std::nullopt;
+    if (op != rsec::Operation::Import && t.hasAnyGrant(type, op)) return std::nullopt;   // see authorizeTopicId
     Denial d;
     d.detail = std::string("not authorized: ") + opName(op) + " on any " + typeName(type);
     return d;

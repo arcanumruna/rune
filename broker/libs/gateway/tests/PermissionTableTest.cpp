@@ -534,3 +534,17 @@ TEST(CheckedWritesImportGrant, NothingImpliesImport) {
     EXPECT_FALSE(t.allowsImport(3)) << "a compiled root grant set does not imply IMPORT (an allow-all table does)";
     EXPECT_TRUE(t.importBits().empty() || t.importBits()[0] == 0);
 }
+
+TEST(CheckedWritesImportGrantRegression, TheOpMaskEntryPointsNeverAuthorizeImportRegression) {
+    rg::ObjectIndex idx; idx.onTopic(3, "user");
+    const std::vector<rs::GrantSpec> plain = {g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "user")};
+    const std::vector<rs::GrantSpec> root = {g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")};
+    for (const auto& grants : {plain, root}) {
+        const auto t = rg::PermissionTable::compile(grants, idx);
+        EXPECT_TRUE(rg::authorizeTopicId(t, 3, Operation::Import, idx).has_value());
+        EXPECT_TRUE(rg::authorizeName(t, ResourceType::Topic, "user", Operation::Import, 0).has_value());
+        EXPECT_TRUE(rg::authorizeTopicOrViewName(t, "user", Operation::Import, idx, 0).has_value());
+        EXPECT_TRUE(rg::authorizeCluster(t, Operation::Import).has_value());
+        EXPECT_TRUE(rg::authorizeAnyGrant(t, ResourceType::Topic, Operation::Import).has_value());
+    }
+}

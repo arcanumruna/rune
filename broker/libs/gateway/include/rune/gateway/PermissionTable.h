@@ -74,7 +74,7 @@ public:
 
     /// The WRITE bit per topic / view id (word i bit b = id 64*i+b), kept in step with ops_ (Task 13 ships it).
     [[nodiscard]] std::span<const uint64_t> writeBits() const noexcept { return writeBits_; }
-    /// The IMPORT bit per topic id (same layout as writeBits()); empty when the table grants IMPORT nowhere.
+    /// The IMPORT bit per topic id (same layout as writeBits()); all zero when the table grants IMPORT nowhere.
     [[nodiscard]] std::span<const uint64_t> importBits() const noexcept { return importBits_; }
 
 private:
