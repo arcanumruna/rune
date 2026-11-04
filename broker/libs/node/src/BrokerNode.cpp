@@ -1993,7 +1993,7 @@ void BrokerNode::refuseStartOnFailedRecovery_() {
     if (replicaRegistry_)
         for (auto* r : replicaRegistry_->allReplicas())
             if (r && r->isDiskBacked()) logs.push_back(r->log());
-    for (auto* l : {catalogLog_.get(), offsetLog_.get(), txnLog_.get(), metadataLog_.get()})
+    for (auto* l : {catalogLog_.get(), securityLog_.get(), offsetLog_.get(), txnLog_.get(), metadataLog_.get()})   // #839: __security too
         if (l) logs.push_back(l);
     if (topicRegistry_)
         for (const auto& ts : bootTopics_)
