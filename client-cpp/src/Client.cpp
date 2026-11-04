@@ -3040,6 +3040,8 @@ TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t 
                  result.version        = static_cast<uint16_t>(c.aux);
                  result.errorCode      = c.errorCode;
                  result.partitionCount = static_cast<int32_t>(c.reserved0);  // Phase 2b C
+                result.hasKeyFeatures = schemaHasKeyFeatures(c);
+                if (result.hasKeyFeatures) result.keyFeatures = schemaKeyFeaturesOf(c);
                  if (c.status == OpStatus::Ok) result.descriptorBlob.assign(p.begin(), p.end());
              });
     return result;
@@ -4882,7 +4884,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
             const std::span<const uint8_t> blob(
                 opt->descriptorBlob, (opt->descriptorBlob != nullptr) ? opt->descriptorLen : 0u);
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
-                         opt->topicId, opt->version, opt->errorCode, blob,
+                         opt->topicId, opt->hasKeyFeatures ? schemaAuxOf(opt->version, opt->keyFeatures) : opt->version,
+                         opt->errorCode, blob,
                          detail::CompletionRing::Overflow::TooLarge,
                          static_cast<uint32_t>(opt->partitionCount));  // Phase 2b C (<=0 = not reported)
         }
@@ -5631,7 +5634,7 @@ Subscription Client::subscribe(TopicHandle      topic,
                                 SubscribeOptions opts,
                                 RecordHandler    handler)
 {
-    const int32_t partition = key.partition(topic.partitionCount);
+    const int32_t partition = key.partition(topic.partitionCount, topic.partitioner);
     return subscribeImpl(topic, partition, /*partitionKnown=*/0,
                          key.bytes(), opts, std::move(handler));
 }

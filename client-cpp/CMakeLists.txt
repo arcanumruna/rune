@@ -1594,6 +1594,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerAckPathTest.cpp
             tests/producer/ProducerAcksFlagsTest.cpp
             tests/producer/CheckedWritesIntentsTest.cpp
+            tests/producer/CheckedWritesAutoIncClientTest.cpp
             tests/producer/ProducerVerdictsTest.cpp
             tests/producer/ProducerTier2PoolTest.cpp
             tests/producer/ProducerSendTest.cpp

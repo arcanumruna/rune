@@ -99,7 +99,7 @@ public:
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                      WriteIntent intent = WriteIntent::Upsert) noexcept {
         if (!topic.valid()) return SendResult::InvalidTopic;
-        return trySendTo(topic, key.partition(topic.partitionCount), key, value, intent);
+        return trySendTo(topic, key.partition(topic.partitionCount, topic.partitioner), key, value, intent);
     }
     /// Router form: `partition` is the caller's key.partition(partitionCount)
     /// (ShardGroup computed it to route) — used as is, never re-hashed.
@@ -341,7 +341,7 @@ private:
     void teardown_(uint32_t i, bool drained = false) noexcept;
     [[nodiscard]] int32_t partitionOf_(TopicHandle topic, const Key& key) const noexcept {
         if (cfg_.testPartitioner != nullptr) [[unlikely]] return cfg_.testPartitioner(key, topic.partitionCount);
-        return key.partition(topic.partitionCount);
+        return key.partition(topic.partitionCount, topic.partitioner);
     }
 
     ShardGroupConfig                          cfg_;

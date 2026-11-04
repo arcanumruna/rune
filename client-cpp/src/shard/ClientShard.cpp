@@ -59,7 +59,7 @@ ClientShard::~ClientShard() { closeImmediately(); }
 
 void ClientShard::send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, WriteIntent intent) {
     if (!topic.valid()) throw std::invalid_argument("ClientShard::send: invalid topic handle");
-    sendTo(topic, key.partition(topic.partitionCount), key, value, intent);
+    sendTo(topic, key.partition(topic.partitionCount, topic.partitioner), key, value, intent);
 }
 
 void ClientShard::sendTo(TopicHandle topic, int32_t partition, const Key& key, std::span<const uint8_t> value,

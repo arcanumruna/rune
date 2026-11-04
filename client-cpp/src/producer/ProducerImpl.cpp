@@ -380,11 +380,12 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
                                      std::span<const uint8_t> value,
                                      bool wantAck,
                                      int64_t correlationId,
-                                     uint8_t intent) noexcept
+                                     uint8_t intent,
+                                     uint32_t idStride) noexcept
 {
     const std::size_t keyLen   = key.size();
     const std::size_t valueLen = value.size();
-    const std::size_t totalLen = static_cast<std::size_t>(kRecHeaderSize) + valueLen;
+    const std::size_t totalLen = static_cast<std::size_t>(kRecHeaderSize) + valueLen + (idStride != 0 ? kKeyZeroTrailerBytes : 0);
 
     // Public contract (backlog B6): a record is capped at kMaxRecordBytes
     // (key + value).  Returns false (not accepted) on an oversized record;
@@ -410,9 +411,11 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
 
         uint8_t* dst = ring_.base() + idx;
         writeRecordHeader(dst, topicId, partition, key.bytes().data(), keyLen,
-                          static_cast<uint8_t>((wantAck ? kFlagWantAck : 0) | (intent << kFlagIntentShift)), correlationId);
+                          static_cast<uint8_t>((wantAck ? kFlagWantAck : 0) | (intent << kFlagIntentShift) | (idStride != 0 ? kFlagKeyZero : 0)),
+                          correlationId);
         writeLE32u(dst, kRecValLenOff, static_cast<uint32_t>(valueLen));
         if (valueLen > 0) std::memcpy(dst + kRecValBytesOff, value.data(), valueLen);
+        if (idStride != 0) writeLE32u(dst, kRecValBytesOff + static_cast<int>(valueLen), idStride);
 
         ring_.commit(idx);
         committed = true;
@@ -441,7 +444,7 @@ int64_t ProducerImpl::steadyNowNs_() noexcept {
 
 SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key& key,
                                    std::span<const uint8_t> value, int64_t ackHandle,
-                                   RejectReason* why, uint8_t intent) noexcept {
+                                   RejectReason* why, uint8_t intent, uint32_t idStride) noexcept {
     if (key.tooLong()) [[unlikely]] return SendResult::KeyTooLong;
     // Phase 2b F: the one extra branch on the hot path (a byte load + compare).  Direct mode decides
     // WrongThread FIRST (the gate is owner-written), so its gate check lives in tryAppendDirect_.
@@ -451,11 +454,11 @@ SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key
     }
     if (mode_ == IngressMode::Direct) {
         RejectReason w = RejectReason::None;
-        const SendResult r = tryAppendDirect_(topicId, partition, key, value, ackHandle, w, intent);
+        const SendResult r = tryAppendDirect_(topicId, partition, key, value, ackHandle, w, intent, idStride);
         if (why != nullptr) *why = w;
         return r;
     }
-    const SendResult r = trySubmitRing_(topicId, partition, key, value, ackHandle, intent);
+    const SendResult r = trySubmitRing_(topicId, partition, key, value, ackHandle, intent, idStride);
     if (why != nullptr) [[unlikely]] {
         *why = r == SendResult::Ok            ? RejectReason::None
              : r == SendResult::Closed        ? RejectReason::Closed
@@ -466,7 +469,7 @@ SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key
     return r;
 }
 
-SendResult ProducerImpl::ringRecordFits_(std::size_t keySize, std::size_t valueLen) const noexcept {
+SendResult ProducerImpl::ringRecordFits_(std::size_t keySize, std::size_t valueLen, std::size_t trailer) const noexcept {
     // Backlog B6: one O(1) compare at append (key + value <= 16 KiB).
     if (keySize + valueLen > rune::client::Producer::kMaxRecordBytes) [[unlikely]] return SendResult::MessageTooLarge;
     // fix1 minor 11: a value that can NEVER fit this ring (maxMsgLength is a
@@ -474,14 +477,15 @@ SendResult ProducerImpl::ringRecordFits_(std::size_t keySize, std::size_t valueL
     // e.g. a small test ring) must not be reported as retryable back-pressure:
     // no amount of draining ever makes room for a message the ring cannot hold,
     // so BackPressured here would livelock sendBlocking's retry loop forever.
-    if (static_cast<std::size_t>(kRecHeaderSize) + valueLen > static_cast<std::size_t>(ring_.maxMsgLength())) {
+    if (static_cast<std::size_t>(kRecHeaderSize) + valueLen + trailer > static_cast<std::size_t>(ring_.maxMsgLength())) {
         return SendResult::ValueTooLarge;
     }
     return SendResult::Ok;
 }
 
 SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, const Key& key,
-                                        std::span<const uint8_t> value, int64_t ackHandle, uint8_t intent) noexcept {
+                                        std::span<const uint8_t> value, int64_t ackHandle, uint8_t intent,
+                                        uint32_t idStride) noexcept {
     // fix1 C2/I3 + F8c C1(a): closed is a terminal state, decided by the claim
     // itself — the ring's closed bit lives in the tail word tryClaim() CASes, so
     // a send is either accepted before Client::closeImpl_ closed the ring (and
@@ -490,10 +494,11 @@ SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, cons
     // load on the hot path: the rejected claim is told apart from back-pressure
     // only on the (cold) failure branch below.  sendBlocking() still checks
     // closed_() before ever touching the pump hook's context.
-    if (const SendResult fits = ringRecordFits_(key.size(), value.size()); fits != SendResult::Ok) [[unlikely]] {
+    if (const SendResult fits = ringRecordFits_(key.size(), value.size(), idStride != 0 ? kKeyZeroTrailerBytes : 0);
+        fits != SendResult::Ok) [[unlikely]] {
         return fits;
     }
-    if (submitSendRecord(topicId, partition, key, value, ackHandle != 0, ackHandle, intent)) [[likely]] {
+    if (submitSendRecord(topicId, partition, key, value, ackHandle != 0, ackHandle, intent, idStride)) [[likely]] {
         return SendResult::Ok;
     }
     return ring_.closed() ? SendResult::Closed : SendResult::BackPressured;
@@ -501,7 +506,7 @@ SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, cons
 
 SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, const Key& key,
                                           std::span<const uint8_t> value, int64_t ackHandle,
-                                          RejectReason& why, uint8_t intent) noexcept {
+                                          RejectReason& why, uint8_t intent, uint32_t idStride) noexcept {
     // Task 14: the owner thread IS the duty-cycle thread — append straight into
     // the partition builder (no ring, no CAS, no second copy).  Every piece of
     // state touched here is owner-thread-only; any other thread is rejected
@@ -535,11 +540,12 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
         return SendResult::MessageTooLarge;
     }
     const auto kb = key.bytes();
-    const uint8_t flags = static_cast<uint8_t>((ackHandle != 0 ? kFlagWantAck : 0) | (intent << kFlagIntentShift));
+    const uint8_t flags = static_cast<uint8_t>((ackHandle != 0 ? kFlagWantAck : 0) | (intent << kFlagIntentShift) |
+                                               (idStride != 0 ? kFlagKeyZero : 0));
     // Task 14 fix1 C1 / fix2: inside this producer's own duty work (a callback
     // it fired mid-walk / mid-reset) the record is DEFERRED into the arena and
     // applied when that work completes.
-    if (inDuty_) [[unlikely]] return deferRecord_(topicId, partition, kb, value, flags, ackHandle, why);
+    if (inDuty_) [[unlikely]] return deferRecord_(topicId, partition, kb, value, flags, ackHandle, why, idStride);
     // Outside: only THIS partition's deferred records (and, conservatively,
     // records for not-yet-created partitions) must go first — applied inline
     // now.  If this partition is still stalled the send must not overtake them.
@@ -557,7 +563,7 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
     try {
         const auto a = appendRecord_(topicId, partition, kb.data(), static_cast<uint8_t>(kb.size()),
                                      value.data(), static_cast<uint32_t>(value.size()), flags,
-                                     static_cast<uint64_t>(ackHandle), lastNowNs_);
+                                     static_cast<uint64_t>(ackHandle), lastNowNs_, idStride);
         if (a == rune::client::detail::ControlledAction::ABORT) {
             why = RejectReason::BackPressured;
             return SendResult::BackPressured;
@@ -587,7 +593,7 @@ void ProducerImpl::enableDirectIngress(const DirectIngress& d) {
     // and one partition may hold at most its share (default min(arena/2,
     // 4 x batchBytes)) so a stalled partition cannot exhaust the arena.
     constexpr std::size_t kMaxRec = DeferredArena::recordSize(
-        static_cast<std::size_t>(kRecHeaderSize) + rune::client::Producer::kMaxRecordBytes);
+        static_cast<std::size_t>(kRecHeaderSize) + kKeyZeroTrailerBytes + rune::client::Producer::kMaxRecordBytes);
     const std::size_t want = cfg_.directDeferredBytes > 0
                                  ? static_cast<std::size_t>(cfg_.directDeferredBytes) : 0u;
     // #344/#699: the largest possible claim is one whole builder, so the quarantine reserve is exactly that: an abandon
@@ -620,7 +626,7 @@ uint8_t* ProducerImpl::pushDeferred_(const DeferredHdr& h) noexcept {
 
 SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
                                       std::span<const uint8_t> key, std::span<const uint8_t> value,
-                                      uint8_t flags, int64_t ackHandle, RejectReason& why) noexcept {
+                                      uint8_t flags, int64_t ackHandle, RejectReason& why, uint32_t idStride) noexcept {
     PartitionState* ps = findPartition_(topicId, partition);
     // fix2 minor 4: validate BEFORE accepting — a partition the table can never
     // hold is reported now, never accepted and then lost at apply time.
@@ -629,7 +635,7 @@ SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
         why = RejectReason::Unaddressable;
         return SendResult::InvalidTopic;
     }
-    const uint32_t len = static_cast<uint32_t>(kRecHeaderSize + value.size());
+    const uint32_t len = static_cast<uint32_t>(kRecHeaderSize + value.size() + (idStride != 0 ? kKeyZeroTrailerBytes : 0));
     const std::size_t size = DeferredArena::recordSize(len);
     // Per-partition share; records for not-yet-created partitions share ONE
     // aggregate share (fix3) — neither can exhaust the arena.
@@ -653,6 +659,7 @@ SendResult ProducerImpl::deferRecord_(int32_t topicId, int32_t partition,
     writeRecordHeader(d, topicId, partition, key.data(), key.size(), flags, ackHandle);
     writeLE32u(d, kRecValLenOff, static_cast<uint32_t>(value.size()));
     if (!value.empty()) std::memcpy(d + kRecValBytesOff, value.data(), value.size());
+    if (idStride != 0) writeLE32u(d, kRecValBytesOff + static_cast<int>(value.size()), idStride);
     if (ps != nullptr) {
         ++ps->deferredCount;
         ps->deferredBytes += static_cast<uint32_t>(size);
@@ -908,9 +915,10 @@ void ProducerImpl::applyDeferred_() noexcept {
                 if (failAt != 0 && ++visited >= failAt && visited < failEnd) [[unlikely]] {
                     throw std::runtime_error("test seam: forced deferred apply failure");
                 }
+                const uint32_t valueLen = readLE32u(p, kRecValLenOff);
                 const auto a = appendRecord_(h->topicId, h->partition, p + kRecKeyBytesOff,
-                                             p[kRecKeyLenOff], p + kRecValBytesOff,
-                                             readLE32u(p, kRecValLenOff), flags, handle, h->submitNs);
+                                             p[kRecKeyLenOff], p + kRecValBytesOff, valueLen, flags, handle, h->submitNs,
+                                             (flags & kFlagKeyZero) ? readLE32u(p, kRecValBytesOff + static_cast<int>(valueLen)) : 0u);
                 if (a == ControlledAction::ABORT) keep = true;
                 else applied = true;
             } catch (...) {
@@ -1144,13 +1152,13 @@ void ProducerImpl::blockingWaitStep(BlockingWait& w) {
 }
 
 void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition, const Key& key,
-                                std::span<const uint8_t> value, uint8_t intent) {
+                                std::span<const uint8_t> value, uint8_t intent, uint32_t idStride) {
     BlockingWait w = beginBlockingWait();
     for (;;) {
         if (r == SendResult::Ok) return;
         throwForSendResult(r);  // every non-retryable result throws
         blockingWaitStep(w);
-        r = trySubmit(topicId, partition, key, value, 0, nullptr, intent);
+        r = trySubmit(topicId, partition, key, value, 0, nullptr, intent, idStride);
     }
 }
 
@@ -1587,7 +1595,8 @@ int ProducerImpl::drainRing(int64_t nowNs, int messageLimit) {
 
                 const ControlledAction a =
                     appendRecord_(topicId, partition, p + kRecKeyBytesOff, keyLen,
-                                  p + kRecValBytesOff, valueLen, flags, ackHandle, nowNs);
+                                  p + kRecValBytesOff, valueLen, flags, ackHandle, nowNs,
+                                  (flags & kFlagKeyZero) ? readLE32u(p, kRecValBytesOff + static_cast<int>(valueLen)) : 0u);
                 if (a == ControlledAction::ABORT) lastDrainStop_ = DrainStop::Blocked;
                 return a;
             }
@@ -1736,6 +1745,16 @@ rune::client::detail::ControlledAction ProducerImpl::admitRecord_(PartitionState
     // Task 14 fix1 I1: never overtake a Tier-2 batch queued earlier on the
     // partition (flushBatches sends Tier-1 first).
     if (ps.hasTier2()) return ControlledAction::ABORT;
+    // Autoincrement: a batch holds only key-0 creates or only other records - a kind change seals the open one first.
+    const uint8_t kind = (flags & kFlagKeyZero) != 0 ? uint8_t{1} : uint8_t{0};
+    if (ps.builder && ps.builder->recordCount() > 0) {
+        if (ps.openKind != kind) [[unlikely]] {
+            ps.flushRequested = true;
+            return ControlledAction::ABORT;
+        }
+    } else {
+        ps.openKind = kind;
+    }
 
     // M2: the per-frame cap computed once at construction (cfg_ immutable).
     const bool    frameCapped = frameCapped_;
@@ -1808,13 +1827,14 @@ void ProducerImpl::noteAppended_(PartitionState& ps, int32_t firstIndex, int32_t
 
 rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     int32_t topicId, int32_t partition, const uint8_t* keyBytes, uint8_t keyLen,
-    const uint8_t* valBytes, uint32_t valueLen, uint8_t flags, uint64_t ackHandle, int64_t nowNs)
+    const uint8_t* valBytes, uint32_t valueLen, uint8_t flags, uint64_t ackHandle, int64_t nowNs, uint32_t idStride)
 {
     using rune::client::detail::ControlledAction;
     PartitionState& ps = getOrCreatePartition(topicId, partition);
     if (admitRecord_(ps, keyLen, valueLen, flags, ackHandle) == ControlledAction::ABORT) {
         return ControlledAction::ABORT;
     }
+    if (idStride != 0) ps.keyZeroStride = idStride;
     const int32_t index = ps.builder->recordCount();
     const std::string_view kv(reinterpret_cast<const char*>(keyBytes), static_cast<std::size_t>(keyLen));
     const std::string_view vv(reinterpret_cast<const char*>(valBytes), static_cast<std::size_t>(valueLen));
@@ -1832,6 +1852,10 @@ rune::client::detail::ControlledAction ProducerImpl::admitBatch_(PartitionState&
     const int64_t body = claimBatchWireBound(keyLen, n, recLen) -
                          static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead);
     if (ps.builder && ps.builder->recordCount() > 0) {
+        if (ps.openKind != 0) [[unlikely]] {   // a claim is never a key-0 create: it seals the open key-0 batch
+            ps.flushRequested = true;
+            return ControlledAction::ABORT;
+        }
         // Join the open batch only when the WHOLE claim fits it; otherwise
         // flush that batch first and start an empty one with the claim.  `body` is the claim's wire UPPER bound
         // (every record charged the widest timestamp delta and the last offsetDelta) against builderBytes, the
@@ -1846,6 +1870,7 @@ rune::client::detail::ControlledAction ProducerImpl::admitBatch_(PartitionState&
         }
     }
     ensureBuilder_(ps);
+    if (ps.builder->recordCount() == 0) ps.openKind = 0;
     ps.builder->reserveExtra(static_cast<std::size_t>(body));  // the n appends cannot reallocate / throw
     // #324: the batch's one completion handle lands at its FIRST record's index - reserve that ack slot here, where
     // growing may still throw (before anything is committed), exactly like admitRecord_.
@@ -1994,6 +2019,7 @@ bool ProducerImpl::encodeAndSend(
         b.lastSendTick      = ++sendTick_;
         b.ingressStreamId   = ps.ingressStreamId;
         b.tier2             = false;
+        b.idStride          = ps.openKind != 0 ? ps.keyZeroStride : 0;
         b.laneGen           = ps.laneGen;  // NEW-4(b): attempt 0 on the current lane
         b.laneFirstTag      = 0;
         b.laneOut           = 1;
@@ -2174,6 +2200,7 @@ bool ProducerImpl::encodeAndSendTier2(
         ib.lastSendTick      = ++sendTick_;
         ib.ingressStreamId   = ps.ingressStreamId;
         ib.tier2             = true;
+        ib.idStride          = 0;
         ib.laneGen           = ps.laneGen;  // NEW-4(b)
         ib.laneFirstTag      = 0;
         ib.laneOut           = 1;
@@ -2355,6 +2382,11 @@ int ProducerImpl::flushBatches(
             ps.dirty          = false;
             ps.flushRequested = false;
             continue;
+        }
+        // ---- SD11: a batch of key-0 creates toward a seed broker below that version is failed locally, nothing is offered.
+        if (ps.builder && ps.builder->recordCount() > 0 && keyZeroRefused_(ps)) [[unlikely]] {
+            failBuilder_(ps, OpStatus::BrokerTooOld);
+            ps.flushRequested = false;
         }
         // ---- Tier-1: flush pending auto-batch if triggered -------------------
         //

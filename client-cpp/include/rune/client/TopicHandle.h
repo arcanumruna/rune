@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <rune/protocol/CatalogTypes.h>          // Partitioner
 #include <rune/protocol/client/Protocol.h>   // kCatalogTopicId
 
 #include <cstdint>
@@ -38,6 +39,8 @@ struct TopicHandle {
     int32_t   topicId        = -1;
     int32_t   partitionCount =  1;
     TopicKind kind           = TopicKind::Unknown;
+    /// How the topic maps a key to a partition (the topic's key features); Modulo = an autoincrement topic.
+    rune::protocol::Partitioner partitioner = rune::protocol::Partitioner::Fnv1a;
 
     [[nodiscard]] bool valid() const noexcept { return topicId >= 0; }
 

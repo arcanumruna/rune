@@ -13,6 +13,8 @@
 //
 // No std::function, no virtual call, no allocation on any of these types.
 
+#include <rune/protocol/CatalogTypes.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -138,6 +140,21 @@ static_assert(sizeof(Completion) == 40);
 [[nodiscard]] constexpr uint32_t constraintIdOf(const Completion& c) noexcept { return c.reserved0; }
 /// Checked writes: the broker-assigned id of a Send (aux), 0 = none.
 [[nodiscard]] constexpr uint64_t assignedKeyOf(const Completion& c) noexcept { return static_cast<uint64_t>(c.aux); }
+
+/// GetTopicSchema: aux = the schema version (bits 0-15), then, when the broker sent a key-features block, bit 16 (present),
+/// bit 17 keyIndex, bit 18 autoIncrement and the partitioner in bits 24-31.  autoIncrementMax / Reserve are not carried.
+[[nodiscard]] constexpr int64_t schemaAuxOf(uint16_t version, const rune::protocol::TopicKeyFeatures& f) noexcept {
+    return static_cast<int64_t>(version) | (int64_t{1} << 16) | (f.keyIndex ? int64_t{1} << 17 : 0) |
+           (f.autoIncrement ? int64_t{1} << 18 : 0) | (static_cast<int64_t>(f.partitioner) << 24);
+}
+[[nodiscard]] constexpr bool schemaHasKeyFeatures(const Completion& c) noexcept { return ((c.aux >> 16) & 1) != 0; }
+[[nodiscard]] constexpr rune::protocol::TopicKeyFeatures schemaKeyFeaturesOf(const Completion& c) noexcept {
+    rune::protocol::TopicKeyFeatures f;
+    f.keyIndex      = ((c.aux >> 17) & 1) != 0;
+    f.autoIncrement = ((c.aux >> 18) & 1) != 0;
+    f.partitioner   = static_cast<rune::protocol::Partitioner>((c.aux >> 24) & 0xFF);
+    return f;
+}
 
 /// One rejected record of a judged batch, decoded from its 8-byte wire entry (u16 record index, u16 code, u32 constraintId, LE).
 struct RecordVerdict {

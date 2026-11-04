@@ -470,6 +470,7 @@ struct InvokerGateway {
     uint16_t schemaVersion  = 1;
     uint16_t schemaErrorCode = 0;
     std::vector<uint8_t> schemaBlob;  // the GetTopicSchema descriptor blob
+    std::optional<rune::protocol::TopicKeyFeatures> schemaKeyFeatures;  // the GetTopicSchema reply's key-features block
     int defines = 0;
     int schemaGets = 0;
     std::vector<int64_t> subscribeCorrIds;  // correlationIds of the Subscribes received
@@ -2197,6 +2198,8 @@ private:
             r.errorCode      = schemaErrorCode;
             r.descriptorBlob = schemaBlob.data();
             r.descriptorLen  = static_cast<uint32_t>(schemaBlob.size());
+            r.hasKeyFeatures = schemaKeyFeatures.has_value();
+            if (schemaKeyFeatures) r.keyFeatures = *schemaKeyFeatures;
             // Task 19: a nonzero requestedFingerprint selects by fingerprint
             // (the real broker's Task 13/18 behavior).  This stub only knows
             // one materialized version (schemaBlob/schemaVersion), so a

@@ -250,7 +250,8 @@ public:
         // version (Task 18), reserved0 = partitionCount (Phase 2b Part C).
         return TypedTopic(client.producer(),
                           TopicHandle{static_cast<int32_t>(c.value),
-                                      typedPartitionCount(static_cast<int32_t>(c.reserved0)), TopicKind::Typed},
+                                      typedPartitionCount(static_cast<int32_t>(c.reserved0)), TopicKind::Typed,
+                                      schemaKeyFeaturesOf(c).partitioner},
                           static_cast<uint16_t>(c.aux));
     }
 

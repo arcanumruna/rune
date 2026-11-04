@@ -90,6 +90,7 @@ struct InFlightBatch {
     int32_t  attempts          = 0;
     int32_t  redirectCount     = 0;
     int16_t  producerEpoch     = 0;  ///< epoch the frame was stamped with (unresolved-sequence bump)
+    uint32_t idStride          = 0;  ///< a key-0 batch: the topic's partition count (its ids step by it); 0 = any other batch
     bool     tier2             = false;  ///< F8c C6: a Tier-2 batch (ONE ack: op Tier2Batch; 1 credit unit)
     /// EOS-OOS: the broker answered OutOfOrderSequence while an OLDER batch of
     /// the same epoch was still live (an earlier frame was lost / is unresolved).
