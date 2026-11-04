@@ -94,7 +94,7 @@ them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this vers
 | `RUNE_FOLLOWER_FLUSH_INTERVAL_MS` | `0` | Periodic flush of follower copies; `0` = never (0 to 2 592 000 000). |
 | `RUNE_ENABLE_COALESCING` | `true` | `0` or `false` (any case) turns compaction coalescing off. |
 | `RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND` | unlimited | Cleaner I/O throttle (positive bytes per second). |
-| `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` | `134217728` (128 MiB) | Memory for the cleaner's dedupe map, in bytes, 1048576 to 4294967296. The table is the largest power of two entries that fits, so it never allocates more than this. |
+| `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` | `134217728` (128 MiB) | Memory for the cleaner's dedupe map, in bytes, 1048576 to 4294967296. The offset table is the largest power of two entries that fits, so the table itself stays within this budget. The cleaner's producer tails add up to 25% of the budget (minimum 1024 x 64 B) on top, so the total is at most about 1.25 times this value. |
 
 ## Authentication and TLS
 
