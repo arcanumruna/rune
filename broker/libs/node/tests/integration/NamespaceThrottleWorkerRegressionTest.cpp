@@ -177,3 +177,26 @@ TEST(NamespaceThrottleRegression, WorkerReportsCountersRegression) {
     EXPECT_EQ(got[static_cast<int>(rune::node::NsMetric::RequestOps)], 4u);
     EXPECT_EQ(rig.worker().reportNsUsageForTest(), 0) << "nothing changed: nothing is sent";
 }
+
+// #730: the worker's own Deleting gate, in isolation.  The gateway already passed the produce (it was resolved and routed
+// to the owning worker); the namespace turns Deleting BEFORE the worker applies it.  The worker must refuse it
+// (UnknownTopic, like a missing namespace) and append nothing - its records would be erased with the namespace, never acked.
+// Mutation: skip the `gate != 0` branch for kNsGateDeleting in Worker.h (the produce path) -> the produce is appended and acked, red.
+TEST(NamespaceThrottleRegression, WorkerRefusesAProduceResolvedBeforeTheDeleteRegression) {
+    Rig rig;
+    setup(rig);
+    const auto frame = produceFrame(1, 1, 0, 200, 1);
+    rig.pass(&frame);
+    ASSERT_EQ(answerOf(rig).code, 0) << "served while the namespace is live";
+    const int64_t end = rig.log->logEndOffset();
+    rig.worker().applyNsThrottleDirect(kSlotA, kNsA, ThrottleKind::NsDeleting, 0);
+    ASSERT_TRUE(rig.worker().nsDeletingForTest(kSlotA));
+    rig.pass(&frame);
+    EXPECT_EQ(answerOf(rig).code, static_cast<int>(pc::ErrorCode::UnknownTopic));
+    EXPECT_EQ(rig.log->logEndOffset(), end) << "a produce resolved before the delete appends nothing";
+    // Sticky: a Throttle clear for another kind does not lift it; only the slot release does.
+    rig.worker().applyNsThrottleDirect(kSlotA, kNsA, ThrottleKind::ProduceBytes, 0);
+    rig.pass(&frame);
+    EXPECT_EQ(answerOf(rig).code, static_cast<int>(pc::ErrorCode::UnknownTopic));
+    EXPECT_EQ(rig.log->logEndOffset(), end);
+}
