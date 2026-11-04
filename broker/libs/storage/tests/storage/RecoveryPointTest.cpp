@@ -1003,3 +1003,26 @@ TEST(DamagedSegmentRegression, ActiveSegmentTornTailIsStillCutRegression) {
     rec.reset();
     fs::remove_all(dir);
 }
+
+// F1: a worker-driven log (deferSeals) cuts in place.  A cut into a damaged sealed segment removes the damaged bytes, so the
+// segment (now the active one) must read Absent at the log end and no longer count as damaged.
+TEST(DamagedSegmentRegression, InPlaceTruncationIntoTheDamageClearsItRegression) {
+    for (int c = 0; c < 3; ++c) {
+        SCOPED_TRACE("case " + std::to_string(c));
+        DamagedFixture f(("dmg_inplace" + std::to_string(c)).c_str());
+        f.xorSecondBatch();
+        auto rec = openRecovered(f.dir, kDmgRoll, /*deferSeals=*/true);
+        ASSERT_EQ(rec->damagedSegmentCount(), 1u);
+        const int64_t cut = c == 0 ? f.D + 1 : c == 1 ? f.D : f.bases[0];
+        ASSERT_TRUE(rec->truncateTo(cut));
+        const int64_t leo = rec->logEndOffset();
+        EXPECT_EQ(leo, c == 2 ? f.bases[0] : f.D);
+        EXPECT_EQ(readAt(*rec, leo).st, ReadIntoStatus::Absent) << "no stale damage at the log end";
+        appendOne(*rec);
+        EXPECT_EQ(readAt(*rec, leo + 1).st, ReadIntoStatus::Absent);
+        const auto got = readAt(*rec, leo);
+        EXPECT_EQ(got.st, ReadIntoStatus::Ok);
+        EXPECT_EQ(got.base, leo);
+        EXPECT_EQ(rec->damagedSegmentCount(), 0u);
+    }
+}

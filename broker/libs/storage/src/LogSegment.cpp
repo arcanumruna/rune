@@ -911,6 +911,9 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
     if (::ftruncate(fd_, static_cast<off_t>(pos)) != 0) return errno != 0 ? errno : EIO;
     const int64_t lastIdx = index_->truncateToPosition(static_cast<int64_t>(pos));
     logSize_ = static_cast<int64_t>(pos);
+    // #839: the walk stops at the valid prefix, so the cut always ends at or below the damage: the damaged bytes are gone
+    // and this segment (now the active one) must read Absent, not Corrupt, at its end.
+    damage_.reset();
     tooLargeOkPos_ = -1;   // review L6: the bytes past the cut may be rewritten
     // Walked the whole segment without reaching truncateOffset (pos == size):
     // nothing is cut.  A compacted segment's logical end can lie past its last
