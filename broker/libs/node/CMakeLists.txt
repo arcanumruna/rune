@@ -1171,8 +1171,8 @@ if(BUILD_TESTING)
     target_link_libraries(rune_ns_produce_size_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
     gtest_discover_tests(rune_ns_produce_size_tests)
     # Namespaces Phase 2 Task 14 (D22, D28): the Throttle message at the owning worker (HotPathBRig, no Aeron).
-    add_executable(rune_ns_throttle_worker_tests tests/integration/NamespaceThrottleWorkerRegressionTest.cpp)
-    target_include_directories(rune_ns_throttle_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    add_executable(rune_ns_throttle_worker_tests tests/integration/NamespaceThrottleWorkerRegressionTest.cpp tests/support/AllocWindow.cpp)
+    target_include_directories(rune_ns_throttle_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_ns_throttle_worker_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
     gtest_discover_tests(rune_ns_throttle_worker_tests)
     # Namespaces Phase 2 Task 15: the namespace gate and counters allocate nothing (AllocWindow replaces operator new here).

@@ -6531,7 +6531,16 @@ private:
     int64_t               nextNsReportNs_ = kNsReportUnarmed;
     uint64_t              throttledRefusals_ = 0;
     uint16_t              lastViewReadSlot_ = kNoNsSlot;
+    // The slots that hold a namespace (dense; slot 0 = default is always live), with the index map slot -> position.  Assign
+    // appends, release swaps with the last and pops.  Both are sized to the table capacity at boot (configureNsSlots), so a
+    // slot assign / release never allocates.
+    static std::vector<uint16_t> initialLiveSlots_() { std::vector<uint16_t> v; v.reserve(NsSlotTable::kDefaultCapacity); v.push_back(0); return v; }
+    static std::vector<uint16_t> initialLivePos_()   { std::vector<uint16_t> v(NsSlotTable::kDefaultCapacity, kNoNsSlot); v[0] = 0; return v; }
+    std::vector<uint16_t> nsLiveSlots_ = initialLiveSlots_();
+    std::vector<uint16_t> nsLivePos_   = initialLivePos_();   ///< kNoNsSlot = the slot is free
+    uint32_t              nsUsageVisited_ = 0;   ///< slots the last usage report visited (a test seam; one add per slot, cold path)
 public:
+    [[nodiscard]] uint32_t nsUsageVisitedForTest() const noexcept { return nsUsageVisited_; }
     [[nodiscard]] int64_t  nsDiskBytesForTest(uint16_t slot) const noexcept { return slot < nsDiskBytes_.size() ? nsDiskBytes_[slot] : 0; }
     [[nodiscard]] bool     nsOverDiskForTest(uint16_t slot) const noexcept { return slot < nsOverDisk_.size() && nsOverDisk_[slot] == kNsGateOverDisk; }
     [[nodiscard]] bool     nsDeletingForTest(uint16_t slot) const noexcept { return slot < nsOverDisk_.size() && nsOverDisk_[slot] == kNsGateDeleting; }
@@ -6566,6 +6575,11 @@ public:
     /// Boot only (before the runner starts): size the slot table to RUNE_MAX_NAMESPACES.
     void configureNsSlots(uint32_t capacity) {
         nsSlots_.reset(capacity);
+        nsLiveSlots_.clear();
+        nsLiveSlots_.reserve(nsSlots_.capacity());
+        nsLiveSlots_.push_back(0);   // default
+        nsLivePos_.assign(nsSlots_.capacity(), kNoNsSlot);
+        nsLivePos_[0] = 0;
         nsDiskBytes_.assign(nsSlots_.capacity(), 0);
         nsOverDisk_.assign(nsSlots_.capacity(), 0);
         nsHot_.assign(nsSlots_.capacity(), NsHot{});
@@ -6602,6 +6616,8 @@ private:
                 noteNsSlotMismatch_();   // the slot is out of range or holds another namespace: never applied
                 return;
             }
+            nsLivePos_[slot] = static_cast<uint16_t>(nsLiveSlots_.size());   // place() succeeded: the slot was free
+            nsLiveSlots_.push_back(slot);
             resetNsSlotState_(slot);     // a reused slot starts from zero usage and no throttle (D22)
         }
         nsSlots_.setLimits(slot, l);
@@ -6615,6 +6631,13 @@ private:
     [[gnu::cold]] bool applyNsSlotRelease_(uint16_t slot, uint32_t nsId) {
         if (!nsSlots_.release(slot, nsId)) { noteNsSlotMismatch_(); return false; }
         if (viewSet_ != nullptr) viewSet_->onNsSlotFreed(slot, nsId);
+        {   // swap with the last live slot and pop (release() succeeded, so the slot was live)
+            const uint16_t pos = nsLivePos_[slot], last = nsLiveSlots_.back();
+            nsLiveSlots_[pos] = last;
+            nsLivePos_[last]  = pos;
+            nsLivePos_[slot]  = kNoNsSlot;
+            nsLiveSlots_.pop_back();
+        }
         resetNsSlotState_(slot);
         return true;
     }
@@ -6648,10 +6671,12 @@ private:
     /// return ring).  A full ring keeps the metric unreported (retried next interval) - never a spin, never dropped.
     int reportNsUsage_() {
         int sent = 0;
-        const std::size_t cap = nsHot_.size();
-        for (std::size_t sl = 0; sl < cap; ++sl) {
-            const uint32_t nsId = nsSlots_.nsIdAt(static_cast<uint16_t>(sl));
-            if (nsId == NsSlotTable::kFreeSlot) continue;
+        nsUsageVisited_ = 0;
+        // #728: only the live slots (the dense list is the state), not every slot of the table.
+        for (const uint16_t liveSlot : nsLiveSlots_) {
+            ++nsUsageVisited_;
+            const std::size_t sl = liveSlot;
+            const uint32_t nsId = nsSlots_.nsIdAt(liveSlot);
             const NsHot& h = nsHot_[sl];
             const uint64_t vals[kNsMetrics] = {h.produceBytes, h.produceRecords, h.fetchBytes, h.requestOps, h.queryCycles,
                                                static_cast<uint64_t>(nsDiskBytes_[sl]),
