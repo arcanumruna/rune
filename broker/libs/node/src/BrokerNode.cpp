@@ -1986,6 +1986,18 @@ void BrokerNode::refuseStartOnFailedRecovery_() {
         catalogLog_->recover();
         catalogLog_->setSyncFaultForTest(0);
     }
+    // #839: the registry and the topic registry can list one log twice - count each damaged segment once.
+    std::sort(logs.begin(), logs.end());
+    logs.erase(std::unique(logs.begin(), logs.end()), logs.end());
+    {
+        int64_t damaged = 0;
+        for (auto* l : logs) damaged += static_cast<int64_t>(l->damagedSegmentCount());
+        bootDamagedSegments_ = damaged;
+        controlSet_(RuneMetric::DamagedSegments, damaged);   // metrics exist since createMetrics_; boot-only value
+        if (damaged > 0)
+            spdlog::error("BrokerNode[{}]: {} damaged log segment(s) at boot (see the Log ... DAMAGED lines); "
+                          "reads that reach them fail with StorageError", config_.nodeId, damaged);
+    }
     for (auto* l : logs) {
         if (!l->storageFailed()) continue;
         spdlog::critical("BrokerNode[{}]: log {} FAILED recovery (errno={}) — refusing to start",

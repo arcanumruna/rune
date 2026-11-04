@@ -176,7 +176,12 @@ TEST(ViewBackupRestoreDocRegression, RestoreTableNamesEveryReasonAndForbidsLegac
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/RuneMetricSlot.h>
+#include <rune/node/NamespacePaths.h>
 #include <rune/node/RuneMetrics.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/storage/Log.h>
+
+#include "support/TestCluster.h"
 
 #include <metrics/MetricsReader.h>
 
@@ -444,6 +449,60 @@ TEST(BrokerMetricsRegression, RestartRecreatesFileRegression) {
     EXPECT_TRUE(awaitMetric(node, RuneMetric::StorageGateState, 0)) << "recovered: CONFIRMED again";
     EXPECT_TRUE(awaitMetric(node, RuneMetric::CatalogApplyHalted, 0));
     EXPECT_TRUE(awaitMetric(node, RuneMetric::AuthMode, 0));
+    node.stop();
+}
+
+// #839: a sealed segment damaged on disk is counted by the boot gauge (summed over every log the node serves), and the
+// node still starts.  RED (the sum skipped): the gauge reads 0.
+TEST(BrokerMetricsRegression, DamagedSegmentsGaugeCountsBootDamageRegression) {
+    MetricsTempDir tmp{"damaged_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    rune::node::TopicSpec ts;
+    ts.name              = "t";
+    ts.partitionCount    = 1;
+    ts.topicId           = 0;
+    ts.segmentRollBytes  = 2048;
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(cfg, {ts}));
+
+    const fs::path partDir = rune::node::topicsRoot(tmp.path, 0) / ts.name / "0";
+    {   // node stopped: a standalone Log writes the partition (single writer)
+        rune::storage::Log raw(partDir.string(), ts.segmentRollBytes);
+        raw.recover();
+        raw.setEpochHistoryCap(INT64_MAX);   // the node's epoch-history guard holds R until its owner lifts it
+        raw.setDeferSealSync(false);   // inline seals: the recovery point is persisted per roll
+        for (int64_t v = 0; raw.segmentBaseOffsets().size() < 3 && v < 10'000; ++v) {
+            rune::protocol::RecordBatchBuilder b(raw.logEndOffset(), 1000);
+            b.append(std::string_view("k"), std::string_view("value-" + std::to_string(v)), 1000);
+            const auto batch = b.build();
+            raw.append(batch, raw.logEndOffset());
+        }
+        raw.append(rune::protocol::RecordBatchBuilder(raw.logEndOffset(), 1000).build(), raw.logEndOffset());
+        raw.sync();
+        ASSERT_GE(raw.segmentBaseOffsets().size(), 3u);
+    }
+    // Damage the first record byte of the 2nd batch of segment 0.
+    fs::path seg0;
+    for (const auto& e : fs::directory_iterator(partDir))
+        if (e.path().extension() == ".log" && (seg0.empty() || e.path() < seg0)) seg0 = e.path();
+    ASSERT_FALSE(seg0.empty());
+    {
+        std::ifstream in(seg0, std::ios::binary);
+        std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), {});
+        in.close();
+        rune::protocol::RecordBatchReader first(buf.data(), buf.size());
+        const std::size_t second = static_cast<std::size_t>(first.totalLength());
+        ASSERT_LT(second + rune::protocol::batch::kRecordBatchOverhead, buf.size());
+        std::fstream f(seg0, std::ios::in | std::ios::out | std::ios::binary);
+        const std::size_t at = second + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+        char c = static_cast<char>(buf[at] ^ 0x5A);
+        f.seekp(static_cast<std::streamoff>(at));
+        f.write(&c, 1);
+    }
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10s));
+    EXPECT_EQ(node.bootDamagedSegmentsForTest(), 1);
+    EXPECT_TRUE(awaitMetric(node, RuneMetric::DamagedSegments, 1));
     node.stop();
 }
 

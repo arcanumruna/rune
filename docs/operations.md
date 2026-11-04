@@ -266,6 +266,7 @@ sampling the file; the broker keeps no history.
 | 1000240 | `rune-txn-offset-commits-stuck` | gauge | control | Transaction commits waiting because the group coordinator refuses their consumer-group offsets. Alert on a non-zero value that persists. |
 | 1000241 | `rune-txn-offset-stuck-age-ms` | gauge | control | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
 | 1000242 | `rune-ns-slot-mismatch` | counter | control | Namespace slot tags refused by the gateway or a worker (`rune.ns.slot_mismatch`): a message or request whose (slot, nsId) pair the receiver's slot table does not hold. Any rise is a bug. |
+| 1000270 | `rune-log-damaged-segments` | gauge | control | Sealed log segments found damaged at boot, summed over every log the node serves: bytes after the last whole batch of a segment below the recovery point. They stay on disk and reads that reach them fail (see Damaged log segments). Set once at start; damage found later is only logged. |
 
 Per-namespace metrics (one series per namespace on this node, allocated when the namespace is created and freed when it is
 erased; the key is the namespace id and the slot's owner tag is the namespace id too):
@@ -355,6 +356,27 @@ partition logs under `topics/`, `__catalog/` and `__security/` (the replicated e
   change. Follow the runbook in CATALOG.md.
 - **Proof.** The DR suite ([testing.md](testing.md#disaster-recovery-suite-dr-e2e)) kills, pauses, restarts and
   partitions nodes under load and asserts no loss, per-key ordering, exactly-once and a single leader.
+
+## Damaged log segments
+
+Recovery used to cut a sealed log segment at its first bad batch and let readers skip to the next segment. It now keeps the
+segment as it is. A sealed segment whose bytes after the last whole, CRC-valid batch are torn or corrupt is **damaged**:
+
+- **Kept.** The file is not touched (no truncation, no rename). The broker logs `Log <dir>: segment <base> is DAMAGED at byte <n>
+  (offset <o>)` at error level when it finds it (at boot, or when the legacy compactor or the cleaner reloads the segment),
+  and the gauge `rune-log-damaged-segments` counts the damaged segments found at boot. The node still starts.
+- **Reads fail at the damage.** A read at or after the damaged offset, up to the next segment, is never skipped past. A consumer
+  or subscription that reaches it gets `StorageError (26)` ("the stored batch is corrupt (damaged log segment)") and the client
+  fails that subscription with `CorruptBatch`; records before the damage and in later segments are served.
+- **Replication.** A leader asked to fetch the damaged range answers `kErrCorruptRecord` (-12). The follower stops at its log end
+  and leaves the in-sync set; nothing is repaired automatically.
+- **Cleaner.** The log cleaner refuses a log that has a damaged segment until an operator acts.
+- **Retention.** Retention deletes the damaged segment whole, once it ages out. The size accounting counts only its valid prefix.
+- **Active segment.** The newest segment is different: a torn tail there is a normal crash artefact and is still cut at the last
+  whole batch.
+
+**Repair.** Restore the partition directory from a backup (see Backups and disaster recovery), or let retention delete the segment.
+There is no automatic repair.
 
 ## View checkpoint backups
 
