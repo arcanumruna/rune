@@ -2313,8 +2313,7 @@ TEST(TxnCoordAuditA8Test, DoWorkTimeoutBoundaryAndHugeTimeoutNoOverflow)
         EXPECT_EQ(coord.doWork(ms2ns(100) + 1), 1);
         EXPECT_EQ(coord.state("txn-to"), TxnState::PrepareAbort);
     }
-    // Huge timeout: INT32_MAX ms * 1e6 fits in int64 (~2.1e15) — must NOT abort
-    // at a modest nowNs.
+    // Huge stored timeout: INT32_MAX ms * 1e6 fits in int64 (~2.1e15); restore clamps it to the cap.
     {
         auto path = coordTmpPath();
         CoordTempFile tf{path};
@@ -2326,8 +2325,11 @@ TEST(TxnCoordAuditA8Test, DoWorkTimeoutBoundaryAndHugeTimeoutNoOverflow)
         }
         TransactionLog log2(path);
         TransactionCoordinator coord(ProducerIdAllocator{100}, 60'000, &log2);
-        EXPECT_EQ(coord.doWork(ms2ns(1'000'000)), 0);  // well within the huge window
+        // #837: a restored timeout above the 15-minute cap is clamped to it (no overflow, no 24-day window).
+        EXPECT_EQ(coord.doWork(ms2ns(899'999)), 0);   // inside the clamped window
         EXPECT_EQ(coord.state("txn-huge"), TxnState::Ongoing);
+        EXPECT_EQ(coord.doWork(ms2ns(900'000) + 1), 1);   // one ns past the clamp: aborted
+        EXPECT_EQ(coord.state("txn-huge"), TxnState::PrepareAbort);
     }
 }
 

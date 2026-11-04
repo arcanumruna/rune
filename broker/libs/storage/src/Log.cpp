@@ -1,3 +1,4 @@
+#include <rune/storage/BatchHeaderCursor.h>
 #include <rune/storage/Timestamps.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
@@ -1079,7 +1080,8 @@ LogReadView Log::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, s
     // D26: nothing at/after startOffset in its segment — a compacted TAIL gap
     // of a sealed segment (or an emptied one): continue at the next segment's
     // base (below the bound), else a cursor there is answered empty forever.
-    // Never past torn / unreadable bytes or an I/O error.  One compare when found.
+    // Never past torn / unreadable bytes, a damaged segment's damage (Corrupt, #839) or an I/O error: the loop runs only
+    // while st == Absent.  One compare when found.
     while (st == ReadIntoStatus::Absent && std::next(it) != segments_.end()) [[unlikely]] {
         ++it;
         if (it->first >= boundOffset) break;
@@ -1400,15 +1402,49 @@ int64_t Log::recover() {
     return next;
 }
 
+void Log::noteDamagedSegment_(const LogSegment& s) {
+    ++damageDetections_;
+    const auto& d = *s.damage();
+    spdlog::error("Log {}: segment {} is DAMAGED at byte {} (offset {}) of {} bytes: kept on disk, reads at or after offset {} "
+                  "in it fail (Corrupt); the cleaner refuses this log",
+                  dir_, s.baseOffset(), d.bytePos, d.offset, d.fileBytes, d.offset);
+}
+
+std::size_t Log::damagedSegmentCount() const noexcept {
+    std::size_t n = 0;
+    for (const auto& [b, seg] : segments_)
+        if (seg && seg->damaged()) ++n;
+    return n;
+}
+
+std::optional<int64_t> Log::damageAt(int64_t offset) const noexcept {
+    auto it = segments_.upper_bound(offset);   // first segment based above `offset`
+    if (it == segments_.begin()) return std::nullopt;
+    --it;   // the segment holding offset: base <= offset < next base (or the last segment)
+    if (!it->second || !it->second->damaged()) return std::nullopt;
+    const int64_t at = it->second->damage()->offset;
+    if (offset < at) return std::nullopt;
+    return at;
+}
+
+std::optional<int64_t> Log::firstDamageOffset() const noexcept {
+    for (const auto& [b, seg] : segments_)   // ascending base: the first damaged segment holds the lowest offset
+        if (seg && seg->damaged()) return seg->damage()->offset;
+    return std::nullopt;
+}
+
 void Log::validateFromRecoveryPoint_(int64_t rp, bool deleteOnGap) {
     // Trusted region: segments whose end (= the next segment's base) is at or
-    // below rp — CRC-recovered (a torn tail there is still cut), never
+    // below rp — CRC-recovered (a torn tail there is KEPT and flagged, #839), never
     // chain-checked: compaction legitimately leaves offset gaps between them.
     auto it = segments_.begin();
     for (; it != segments_.end(); ++it) {
         auto nx = std::next(it);
         if (nx == segments_.end() || nx->first > rp) break;
-        it->second->recover();
+        // #839: a sealed segment wholly below the recovery point was fsynced before R moved past it (E1d), so bytes after
+        // its last whole batch are real damage, not a torn tail: keep them, flag the segment, fail reads at it.
+        it->second->recover(true, LogSegment::RecoverMode::KeepDamage, nx->first);   // nx != end() (loop guard)
+        if (it->second->damaged()) noteDamagedSegment_(*it->second);
         it->second->setDurableNext(it->second->nextOffset());
     }
     // Validated region: from the segment holding rp onward, each segment must
@@ -1417,8 +1453,9 @@ void Log::validateFromRecoveryPoint_(int64_t rp, bool deleteOnGap) {
     // that never completed must not leave the log claiming offsets it lacks.
     bool deleted = false;
     for (; it != segments_.end(); ++it) {
-        const int64_t next = it->second->recover();
         auto nx = std::next(it);
+        const int64_t next = it->second->recover(true, LogSegment::RecoverMode::CutTornTail,
+                                                 nx == segments_.end() ? std::nullopt : std::optional<int64_t>(nx->first));
         if (nx == segments_.end()) break;
         if (next == nx->first || !deleteOnGap) continue;
         spdlog::warn("Log::recover {}: segment {} ends at {} but the next segment starts at {} "
@@ -2080,6 +2117,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
     int64_t keptMaxTs = 0;
     bool found = false;
     std::size_t pos = 0;
+    BatchHeaderCursor hdr(seg.baseOffset(), BatchHeaderCursor::upperFor(seg.baseOffset()));   // #839: the header fields the CRC does not cover; the active segment has no successor
     while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
         rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
         int32_t total = r.totalLength();
@@ -2087,6 +2125,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
         // A3: CRC-gate the walk — a corrupt batch terminates the scan so we
         // don't misparse a corrupt totalLength as a valid batch boundary.
         if (!r.ensureValid()) break;
+        if (!hdr.accept(r)) break;   // #839: a bad baseOffset / magic / epoch is damage like a CRC failure
 
         // A batch must be dropped if ANY of its records is at offset >= truncateOffset.
         // Since records in a batch are contiguous [baseOffset .. baseOffset+lastOffsetDelta],
@@ -2109,6 +2148,9 @@ bool Log::truncateTo_(int64_t truncateOffset) {
         // No batch containing any record at offset >= truncateOffset was found.
         // All existing batches are fully below the boundary: keep them all.
         cutPos = validEnd;
+        if (cutPos < buf.size())   // #839: the walk stopped at damage before the target: the cut removes bytes past it
+            spdlog::warn("Log::truncateTo {}: segment {} has damaged bytes at {} of {}; the truncation to offset {} cuts there "
+                         "(the follower re-fetches that range)", dir_, lpath, cutPos, buf.size(), truncateOffset);
     }
 
     // Truncate the file at cutPos.
@@ -2251,8 +2293,15 @@ bool Log::reloadSegments() {
     // whole reconstruction, not just segment construction: a throwing
     // recover() also leaves segments_ (the old generation) untouched.
     int64_t next = 0;
-    for (auto& [base, seg] : newSegments) {
-        next = seg->recover();
+    const int64_t highestBase = newSegments.rbegin()->first;   // #839: the NEW generation's active segment
+    for (auto itNew = newSegments.begin(); itNew != newSegments.end(); ++itNew) {
+        auto& base = itNew->first;
+        auto& seg = itNew->second;
+        const auto succ = std::next(itNew);
+        const std::optional<int64_t> succBase = succ == newSegments.end() ? std::nullopt : std::optional<int64_t>(succ->first);
+        // #839: every sealed segment keeps its damage (flagged, never cut); the active one is cut as before.
+        next = seg->recover(true, base == highestBase ? LogSegment::RecoverMode::CutTornTail
+                                                      : LogSegment::RecoverMode::KeepDamage, succBase);
         // E1d: a rewritten (cleaner: fsynced before rename) or untouched segment
         // is as durable as the object it replaces; a brand-new base is not.
         auto old = segments_.find(base);
@@ -2278,6 +2327,8 @@ bool Log::reloadSegments() {
     retiredSegments_.reserve(retiredSegments_.size() + segments_.size());
     for (auto& [b, seg] : segments_) retire_(std::move(seg));
     segments_.swap(newSegments);   // old (now all-null) entries die with newSegments
+    for (auto& [b, seg] : segments_)   // #839: note AFTER the swap, never before (the strong guarantee)
+        if (seg->damaged()) noteDamagedSegment_(*seg);
     logEndOffset_ = next;
     if (recoveryPoint_ > logEndOffset_) recoveryPoint_ = logEndOffset_;   // E1d (never above the LEO)
     // Log-snapshot review audit: segments_ was rebuilt (a cleaner-emptied
@@ -2351,7 +2402,10 @@ void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
                                                  false, false, 0, fileMode_));
     LogSegment& fresh = *segments_[baseOffset];
     fresh.raiseTsFloor(floorTs);
-    fresh.recover();
+    const auto freshIt = segments_.find(baseOffset);
+    fresh.recover(true, LogSegment::RecoverMode::KeepDamage,
+                  std::next(freshIt) == segments_.end() ? std::nullopt : std::optional<int64_t>(std::next(freshIt)->first));   // #839: a sealed segment (the active one returned above)
+    if (fresh.damaged()) noteDamagedSegment_(fresh);
     // E1d: the cleaner fsyncs a rewritten segment before its rename.
     fresh.setDurableNext(wasDurable ? fresh.nextOffset() : std::min(oldDurable, fresh.nextOffset()));
 }

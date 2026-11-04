@@ -106,7 +106,14 @@ ViewCheckpointScan scanViewCheckpoint(std::span<const uint8_t> bytes) {
             out.tail = hasValidRecordAfter(bytes, pos) ? ViewCheckpointTail{ViewCheckpointCorrupt{pos}} : ViewCheckpointTail{ViewCheckpointTornTail{pos}};
             return out;
         }
-        if (!crcOk(bytes, pos, end)) { out.tail = ViewCheckpointCorrupt{pos}; return out; }
+        if (!crcOk(bytes, pos, end)) {
+            // #817: size committed, data not. A complete-length record whose every byte after its fixed header, to EOF (not to
+            // the record end), is zero is the LAST thing in the file and holds nothing: truncating there loses nothing.
+            const std::size_t hdr = magic == rune::view::kViewCheckpointMagic ? 20 : 13;   // v1 / v2 header (recordEnd)
+            out.tail = allZero(bytes.subspan(pos + hdr)) ? ViewCheckpointTail{ViewCheckpointTornTail{pos}}
+                                                         : ViewCheckpointTail{ViewCheckpointCorrupt{pos}};
+            return out;
+        }
         out.records.push_back(bytes.subspan(pos, end - pos));
         pos = end;
     }

@@ -14,6 +14,8 @@
 
 #include <gtest/gtest.h>
 
+#include <initializer_list>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -22,6 +24,8 @@ using rune::coordination::scopedId;
 
 namespace {
 constexpr int64_t kSec = 1'000'000'000LL;
+constexpr int32_t kMinMs = 1;        // the coordinator's kMinTxnTimeoutMs
+constexpr int32_t kMaxMs = 900'000;  // ... and kMaxTxnTimeoutMs
 
 struct Opened { ProducerId pid; ProducerEpoch epoch; };
 Opened init(TransactionCoordinator& c, const std::string& id, int32_t timeoutMs = 0) {
@@ -97,4 +101,47 @@ TEST(LimitEnforcementTableRegression, TxnTimeRegression) {
     EXPECT_EQ(c.metadata(u)->state, TxnState::Ongoing) << "another namespace keeps its own timeout";
     EXPECT_EQ(c.doWork(59 * kSec), 0);
     EXPECT_EQ(c.doWork(61 * kSec), 1) << "the global timeout still applies";
+}
+
+// #837: a namespace record written by an older broker can carry any uint64 maxTxnTimeMs.  The sweep converted it to ns with a
+// signed multiply, which wraps negative above ~9.2e12 ms and aborted every open transaction of the namespace at once.
+TEST(LimitEnforcementTableRegression, HugeNamespaceTxnTimeNeverAbortsAtOnceRegression) {
+    for (const uint64_t x : std::initializer_list<uint64_t>{9'300'000'000'000ULL, 1ULL << 63, UINT64_MAX}) {
+        SCOPED_TRACE(x);
+        TransactionCoordinator c(ProducerIdAllocator{}, 60'000);
+        const std::string id = scopedId(1, "h");
+        const Opened o = init(c, id, 60'000);
+        ASSERT_EQ(addPart(c, id, o, 0), AddPartitionsResult::kOk);
+        c.setNamespaceTxnLimits(1, 0, x);
+        EXPECT_EQ(c.doWork(1 * kSec), 0) << "a huge limit is no limit: no early abort";
+        EXPECT_EQ(c.metadata(id)->state, TxnState::Ongoing);
+        EXPECT_EQ(c.doWork(60 * kSec + 1), 1) << "the transaction's own timeout still applies";
+    }
+}
+
+// #837 (F12): a restored transaction whose stored timeout is negative (or above the maximum) is clamped to the range
+// InitProducerId admits: it neither aborts at once nor wraps to a huge value in the namespace-cap compare.
+// RED by mutation: drop the clamp in TransactionCoordinator::adoptRecovered_.
+TEST(LimitEnforcementTableRegression, RestoredOutOfRangeTxnTimeoutIsClampedRegression) {
+    for (const int32_t stored : {-1, INT32_MIN, 0}) {
+        SCOPED_TRACE(stored);
+        TransactionCoordinator c;
+        std::map<std::string, TransactionMetadata> snapshot;
+        TransactionMetadata m;
+        m.txnId = "t"; m.producerId = 5; m.producerEpoch = 0; m.state = TxnState::Ongoing; m.txnTimeoutMs = stored;
+        snapshot.emplace("t", m);
+        (void)c.reload(snapshot, 1, 0);
+        ASSERT_NE(c.metadata("t"), nullptr);
+        EXPECT_EQ(c.metadata("t")->txnTimeoutMs, kMinMs);
+        EXPECT_EQ(c.doWork(1), 0) << "a clamped timeout does not abort the transaction at once";
+        EXPECT_EQ(c.metadata("t")->state, TxnState::Ongoing);
+        EXPECT_EQ(c.doWork(static_cast<int64_t>(kMinMs) * 1'000'000LL + 1), 1) << "the clamped timeout applies";
+    }
+    TransactionCoordinator c;
+    std::map<std::string, TransactionMetadata> snapshot;
+    TransactionMetadata m;
+    m.txnId = "t"; m.producerId = 5; m.producerEpoch = 0; m.state = TxnState::Ongoing; m.txnTimeoutMs = INT32_MAX;
+    snapshot.emplace("t", m);
+    (void)c.reload(snapshot, 1, 0);
+    EXPECT_EQ(c.metadata("t")->txnTimeoutMs, kMaxMs);
 }

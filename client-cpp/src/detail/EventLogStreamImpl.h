@@ -505,6 +505,15 @@ std::optional<CatalogResult<void>> EventLogStream<P>::pollRefresh(int64_t nowNs,
             return std::unexpected(CatalogReadError{CatalogReadError::Kind::Rejected,
                                                     std::string(P::kName) + " Subscribe could not be routed",
                                                     replayer_.nextOffset(), 0});
+        case SubscriptionFailReason::UndeliverableBatch:   // the broker parked the read: its next batch cannot be delivered
+        case SubscriptionFailReason::CorruptBatch:         // #839: ... or is stored in a damaged log segment
+        case SubscriptionFailReason::BrokerTooOld:
+            return std::unexpected(CatalogReadError{CatalogReadError::Kind::Rejected,
+                                                    std::string(P::kName) + " read ended: the broker cannot serve it (" +
+                                                        (why == SubscriptionFailReason::CorruptBatch ? "a corrupt stored batch"
+                                                         : why == SubscriptionFailReason::UndeliverableBatch ? "an undeliverable batch"
+                                                                                                             : "broker too old") + ")",
+                                                    replayer_.nextOffset(), code});
         case SubscriptionFailReason::None:
             return std::unexpected(CatalogReadError{CatalogReadError::Kind::Closed, "client closed",
                                                     replayer_.nextOffset(), 0});

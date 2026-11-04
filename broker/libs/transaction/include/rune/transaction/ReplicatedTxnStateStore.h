@@ -102,7 +102,10 @@ public:
     ///
     /// Iterates ALL segments by looping with advancing fetchOffset (avoids
     /// the CG-2 bug of reading only the first segment).
-    void rebuildFromLog();
+    ///
+    /// @returns false (state left empty) when the scan reaches a DAMAGED log segment (#839): the caller must not load a
+    ///          coordinator from it.  True otherwise (including an empty log).
+    bool rebuildFromLog();
 
     // -----------------------------------------------------------------------
     // F15 §5.1 / §5.6 — coordinator load + persisted pid block ceiling.
@@ -174,6 +177,7 @@ private:
     // can be called with string_view without constructing a std::string.
     // -----------------------------------------------------------------------
     std::map<TransactionalId, TransactionMetadata, std::less<>> index_;
+    bool damageReported_ = false;   ///< #839: the damaged-log critical line is logged once (the load retries)
 
     rune::replication::PartitionReplica* replica_;  ///< non-owning
 

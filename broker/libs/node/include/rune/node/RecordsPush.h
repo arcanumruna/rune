@@ -211,6 +211,7 @@ inline constexpr std::size_t kPushTooLargeErrorMaxBytes =
 enum class PushTooLargeCause : uint8_t {
     EgressFrame,   ///< F19: the Records frame exceeds the egress maxMessageLength
     ReturnRing,    ///< F15 S3 I-4: a stored batch exceeds the worker return ring
+    CorruptBatch,  ///< #839: a stored batch at the cursor is damaged (a damaged log segment); code StorageError
 };
 
 /// Encode the error that fails a push subscription whose next batch at
@@ -230,20 +231,33 @@ inline std::size_t encodePushTooLargeError(uint8_t* buf, int64_t sessionId, int6
 {
     namespace pc = rune::protocol::client;
     char msg[192];
-    const int m = cause == PushTooLargeCause::EgressFrame
-        ? std::snprintf(msg, sizeof msg,
+    int m = 0;
+    switch (cause) {
+    case PushTooLargeCause::EgressFrame:
+        m = std::snprintf(msg, sizeof msg,
               "subscription %lld topic %d partition %d offset %lld: Records frame %zu B exceeds the "
               "egress max message %lld B",
               static_cast<long long>(subscriptionId), topicId, partition,
-              static_cast<long long>(atOffset), frameLen, static_cast<long long>(maxMessage))
-        : std::snprintf(msg, sizeof msg,
+              static_cast<long long>(atOffset), frameLen, static_cast<long long>(maxMessage));
+        break;
+    case PushTooLargeCause::ReturnRing:
+        m = std::snprintf(msg, sizeof msg,
               "subscription %lld topic %d partition %d offset %lld: batch exceeds the broker return ring",
               static_cast<long long>(subscriptionId), topicId, partition,
               static_cast<long long>(atOffset));
+        break;
+    case PushTooLargeCause::CorruptBatch:
+        m = std::snprintf(msg, sizeof msg,
+              "subscription %lld topic %d partition %d offset %lld: the stored batch is corrupt (damaged log segment)",
+              static_cast<long long>(subscriptionId), topicId, partition,
+              static_cast<long long>(atOffset));
+        break;
+    }
     pc::ErrorResponse err;
     err.sessionId     = sessionId;
     err.correlationId = 0;
-    err.code          = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
+    err.code          = static_cast<int16_t>(cause == PushTooLargeCause::CorruptBatch ? pc::ErrorCode::StorageError
+                                                                                      : pc::ErrorCode::MessageTooLarge);
     err.message       = std::string_view(
         msg, m > 0 ? static_cast<std::size_t>(m < static_cast<int>(sizeof msg) ? m : sizeof msg - 1) : 0u);
     return err.encode(buf);

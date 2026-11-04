@@ -35,6 +35,8 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1290,6 +1292,104 @@ TEST_F(WorkerFilterEndedRegression, EndedFilteredMemberFreesItsSlotAtTheCapForTh
     EXPECT_EQ(w.filterGroupForTest(kTopic, 0, 0)->memberCount(), static_cast<uint32_t>(kCap));
     EXPECT_EQ(w.subscriptionEndsSeenForTest(), 1u);
     std::filesystem::remove_all(dir);
+}
+
+
+// ===========================================================================
+// #839: damage helpers (copied from the B1 storage tests): a sealed segment's 2nd batch gets one flipped byte.
+// ===========================================================================
+namespace corruptutil {
+inline std::vector<std::size_t> batchStarts(const std::string& logPath) {
+    std::ifstream in(logPath, std::ios::binary);
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), {});
+    std::vector<std::size_t> out;
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
+        rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+        const int32_t total = r.totalLength();
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
+        out.push_back(pos);
+        pos += static_cast<std::size_t>(total);
+    }
+    return out;
+}
+inline void xorByteAt(const std::string& path, std::size_t pos, uint8_t mask = 0x5A) {
+    std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+    f.seekg(static_cast<std::streamoff>(pos));
+    char c = 0;
+    f.read(&c, 1);
+    c = static_cast<char>(static_cast<uint8_t>(c) ^ mask);
+    f.seekp(static_cast<std::streamoff>(pos));
+    f.write(&c, 1);
+}
+inline int64_t batchBaseAt(const std::string& logPath, std::size_t p) {
+    std::ifstream in(logPath, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(p));
+    std::vector<uint8_t> hdr(static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead));
+    in.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
+    return rune::protocol::RecordBatchReader(hdr.data(), hdr.size()).baseOffset();
+}
+/// The lowest-base .log file of a partition directory ("" = none).
+inline std::string firstSegment(const std::filesystem::path& dir) {
+    std::string best;
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().extension() == ".log" && (best.empty() || e.path().string() < best)) best = e.path().string();
+    return best;
+}
+/// Flip the first record byte of segment 0's 2nd batch; returns that batch's first offset (-1 = could not).
+inline int64_t damageSecondBatchOfSegment0(const std::filesystem::path& dir) {
+    const std::string seg0 = firstSegment(dir);
+    if (seg0.empty()) return -1;
+    const auto starts = batchStarts(seg0);
+    if (starts.size() < 2) return -1;
+    const int64_t d = batchBaseAt(seg0, starts[1]);
+    xorByteAt(seg0, starts[1] + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead));
+    return d;
+}
+}  // namespace corruptutil
+
+// ---- #839: a filtered group's source read reaches a damaged segment ----
+TEST_F(WorkerFilterPushRegression, FilteredMemberAtTheDamageFailsWithStorageErrorRegression) {
+    auto dirA = tempLogDir();
+    auto dirB = tempLogDir();
+    rune::storage::Log logA(dirA.string(), 2048);
+    rune::storage::Log logB(dirB.string(), 64LL * 1024 * 1024);
+    logA.recover();
+    logA.setDeferSealSync(false);   // inline seals: the recovery point is persisted per roll
+    for (int i = 0; i < 40; ++i) appendRows(logA, worlds({7}));   // one-record batches over several sealed segments
+    logA.sync();
+    const int64_t D = corruptutil::damageSecondBatchOfSegment0(dirA);
+    ASSERT_GT(D, 0);
+    ASSERT_TRUE(logA.reloadSegments());
+    ASSERT_EQ(logA.damagedSegmentCount(), 1u);
+    appendRows(logB, worlds({7}));
+    appendRows(logB, worlds({7}));
+
+    openEgress(3417);
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(eg_.get());
+    const Fb f = worldEq(7);
+    ASSERT_TRUE(w.tryEnqueueOp(schemaOp(kTopic, 2)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(1, kTopic, 0, 0, &logA, f)));
+    ASSERT_TRUE(w.tryEnqueueOp(filteredSubscribeOp(2, kTopic, 0, 0, &logA, f)));
+    ASSERT_TRUE(w.tryEnqueueOp(plainSubscribeOp(3, kTopic, 1, 0, &logB)));   // the unfiltered neighbour, healthy log
+    FilterCollector c;
+    ASSERT_TRUE(pump(w, c, [&] { return c.errors.size() >= 2 && c.offsets(3).size() == 2; }))
+        << "errors=" << c.errors.size() << " neighbour=" << c.offsets(3).size();
+    settle(w, c, 50ms);
+    ASSERT_EQ(c.errors.size(), 2u) << "one error per member, no spin";
+    for (const auto& e : c.errors) {
+        EXPECT_EQ(e.code, static_cast<int16_t>(pc::ErrorCode::StorageError));
+        EXPECT_EQ(e.correlationId, 0);
+        EXPECT_NE(e.message.find("topic 10 partition 0 offset " + std::to_string(D)), std::string::npos) << e.message;
+    }
+    EXPECT_NE(c.errors[0].message.find("subscription 1 "), std::string::npos) << c.errors[0].message;
+    EXPECT_NE(c.errors[1].message.find("subscription 2 "), std::string::npos) << c.errors[1].message;
+    for (const int64_t sub : {int64_t{1}, int64_t{2}})
+        for (const int64_t o : c.offsets(sub)) EXPECT_LT(o, D) << "a record at or past the damage reached sub " << sub;
+    EXPECT_EQ(c.offsets(3).size(), 2u) << "the neighbour keeps flowing";
+    std::filesystem::remove_all(dirA);
+    std::filesystem::remove_all(dirB);
 }
 
 }  // namespace

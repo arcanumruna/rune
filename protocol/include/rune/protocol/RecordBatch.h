@@ -334,6 +334,8 @@ public:
     // partitionLeaderEpoch: the leader-epoch under which this batch was written.
     // Excluded from the CRC; -1 (unset) until a broker stamps it (stampLeaderEpoch).
     int32_t partitionLeaderEpoch() const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kPartitionLeaderEpochOffset)); }
+    /// magic byte (offset 16), EXCLUDED from the CRC.
+    int8_t magic()            const { return static_cast<int8_t>(d_[batch::kMagicOffset]); }
     int32_t lastOffsetDelta() const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kLastOffsetDeltaOffset)); }
     int32_t recordCount()     const { return static_cast<int32_t>(detail::getLE32(d_ + batch::kRecordCountOffset)); }
     /// Total batch size (length field + 12).  Overflow-safe: a length field that

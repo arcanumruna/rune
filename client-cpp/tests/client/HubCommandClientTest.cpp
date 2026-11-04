@@ -1471,6 +1471,37 @@ TEST(HubCommandClient, SubscriptionScopedErrorFailsThatSubscriptionRegression) {
     EXPECT_TRUE(p.ok()) << "the session survives a subscription-scoped error";
 }
 
+// #839: the broker cannot read the subscription's next batch (it is stored in a damaged log segment): the same
+// subscription-scoped shape as above (correlationId 0, the subscription named in the message) with
+// ErrorResponse{StorageError}.  The client fails THAT subscription with CorruptBatch (never UndeliverableBatch), releases
+// the parked broker subscription, leaves the others alone, and the app's onError still hears the message.
+// RED by mutation: handle only MessageTooLarge in the scoped-error branch - the subscription stays active forever.
+TEST(HubCommandClient, CorruptBatchErrorFailsThatSubscriptionRegression) {
+    HubRig r(4614);
+    r.gw.replyPongs = true;
+    std::string lastError;
+    r.client.onError([&](const std::string& m) { lastError = m; });
+    r.connect();
+    auto a = subscribeT(r.client);
+    auto b = subscribeT(r.client);
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.size() == 2 && a.subscriptionId() > 0 && b.subscriptionId() > 0; }));
+    const int64_t aId = a.subscriptionId();
+    const std::string msg = "subscription " + std::to_string(aId) +
+                            " topic 1 partition 0 offset 7: the stored batch is corrupt (damaged log segment)";
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError), msg,
+                   r.gw.subscribed[0].sessionId, /*corrId=*/0);
+    ASSERT_TRUE(r.drive([&] { return a.finished(); }, 200'000)) << "the subscription-scoped error never reached it";
+    EXPECT_EQ(a.failReason(), rc::SubscriptionFailReason::CorruptBatch);
+    EXPECT_TRUE(b.active()) << "another subscription was failed";
+    EXPECT_EQ(b.failReason(), rc::SubscriptionFailReason::None);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.unsubscribed.empty(); }));
+    EXPECT_EQ(r.gw.unsubscribed[0], aId) << "the parked broker subscription was not released";
+    EXPECT_EQ(lastError, msg);
+    auto p = r.pingOp(rc::Bytes{1, 2});
+    ASSERT_TRUE(r.drive([&] { return p.ready(); }));
+    EXPECT_TRUE(p.ok()) << "the session survives a subscription-scoped error";
+}
+
 // #355: the void commit() never drops a refused submit silently.  Its submit is
 // the HubCommand path (never an OpResult): a full ring is waited out where that
 // is safe and THROWS where it is not, so a dropped commit always reaches the

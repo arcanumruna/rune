@@ -1,3 +1,4 @@
+#include <rune/storage/BatchHeaderCursor.h>
 #include <rune/storage/LogCleaner.h>
 #include <cstring>
 #include <rune/protocol/RecordBatch.h>
@@ -229,6 +230,19 @@ int markerControlType(const uint8_t* batch, std::size_t len, const rune::protoco
 // Markers at/after toOffset (<= the committed HW) are not trusted: a txn whose
 // marker was not seen stays unresolved and caps the pass (txn.cleanLimit()).
 // Returns the bytes read (throttled by the caller like the M3 prefix reads).
+// #839: the exclusive offset bound of bases[i]: the next listed base, else nullopt (the list's last entry: nothing known to
+// follow it - the `activeBase` / `toOffset` parameters are cleanable LIMITS that can lie below the segment's real end -
+// so only the int32 index range bounds its batches; Log::recover covers the sealed-to-active seam).
+std::optional<int64_t> successorInList(const std::vector<int64_t>& bases, std::size_t i) {
+    return i + 1 < bases.size() ? std::optional<int64_t>(bases[i + 1]) : std::nullopt;
+}
+
+// #839: the base following `b` in the ascending `sealedBases`, if it is listed.
+std::optional<int64_t> successorOf(const std::vector<int64_t>& sealedBases, int64_t b) {
+    const auto it = std::upper_bound(sealedBases.begin(), sealedBases.end(), b);
+    return it != sealedBases.end() ? std::optional<int64_t>(*it) : std::nullopt;
+}
+
 int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, Offset fromOffset, Offset toOffset,
                      Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails,
                      const BoundaryHook& hook, VerdictCleanState& verdicts, Offset verdictBound, Offset verdictMarkerEnd,
@@ -239,18 +253,22 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
     // Markers above toOffset are read too, but only in `bases` (sealed segments): the marker carrying W in the active
     // segment is never read, so cleanLimit trails W by up to the active segment (cleans less, never more).
     const Offset scanEnd = std::max(toOffset, verdictMarkerEnd);
-    for (int64_t segBase : bases) {
+    for (std::size_t bi = 0; bi < bases.size(); ++bi) {
+        const int64_t segBase = bases[bi];
         if (segBase >= scanEnd) break;
         hook();   // fix round 6: segment boundary
         const auto buf = readFile(segmentLogPath(dir, segBase));
         bytes += static_cast<int64_t>(buf.size());
         std::size_t pos = 0;
+        BatchHeaderCursor hdr(segBase, BatchHeaderCursor::upperFor(segBase, successorInList(bases, bi)));
         while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             const int32_t total = r.totalLength();
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
             std::optional<cr::ControlRecord> ctl;
             if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;   // a control record: validated once (#804)
+            // #839: baseOffset / magic are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
+            if (!hdr.accept(r)) break;
             const int64_t base = r.baseOffset();
             if (base >= scanEnd) { pos = buf.size(); break; }   // the intended end of the scan, not damage
             const int64_t pid  = r.producerId();
@@ -401,12 +419,15 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         if (buf.empty()) continue;
 
         size_t pos = 0;
+        BatchHeaderCursor hdr(segBase, BatchHeaderCursor::upperFor(segBase, successorInList(bases, i)));
         while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
                <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             int32_t total = r.totalLength();
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             if (!r.ensureValid()) break;
+            // #839: baseOffset / magic are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
+            if (!hdr.accept(r)) break;
 
             bool full = false;
             if (!isControlBatch(r) && !(isTransactionalBatch(r) && txn.isAborted(r.producerId(), r.baseOffset())))
@@ -476,6 +497,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         if (buf.empty()) continue;
 
         size_t pos = 0;
+        BatchHeaderCursor hdr(segBase, BatchHeaderCursor::upperFor(segBase, successorInList(bases, i)));
         while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
                <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
@@ -484,6 +506,8 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             // A3: CRC-gate the walk — stop on the first corrupt batch (same as recover()).
             if (!r.ensureValid()) break;
+            // #839: baseOffset / magic are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
+            if (!hdr.accept(r)) break;
 
             if (!isControlBatch(r) && !(isTransactionalBatch(r) && txn.isAborted(r.producerId(), r.baseOffset())))
                 r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
@@ -515,7 +539,8 @@ bool LogCleaner::rewriteSegmentImpl(
     const std::function<std::optional<Offset>(std::string_view)>& getLatest,
     Offset fromOffset, Offset cleanBoundaryOffset,
     int64_t nowNs, int64_t deleteRetentionMs,
-    int64_t nowMs, bool* changed, const ProducerTails* tails, const TxnCleanState* txn, VerdictCleanState* verdicts)
+    int64_t nowMs, bool* changed, const ProducerTails* tails, const TxnCleanState* txn, VerdictCleanState* verdicts,
+    std::optional<int64_t> nextSegBase)
 {
     if (changed) *changed = false;
     if (damaged_.has_value()) return false;   // uncleanable: nothing read, nothing changed
@@ -559,6 +584,7 @@ bool LogCleaner::rewriteSegmentImpl(
     // swap enqueue entirely (avoids churning already-clean prefix segments that
     // the Kafka-faithful from-log-start sweep re-visits every pass).
     bool modified = false;
+    BatchHeaderCursor hdr(segBase, BatchHeaderCursor::upperFor(segBase, nextSegBase));
 
     while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
            <= buf.size()) {
@@ -570,6 +596,7 @@ bool LogCleaner::rewriteSegmentImpl(
         // parseControl (#804); its result goes on to markerAction.
         std::optional<rune::storage::control_record::ControlRecord> ctl;
         if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;
+        if (!hdr.accept(r)) break;   // #839: baseOffset / magic are not CRC-covered: damage like a CRC failure
 
         // CP-8: KIP-534 delete-horizon gate.
         // CONTRACT: when hasDeleteHorizon() is true, baseTimestamp() IS the horizon
@@ -898,11 +925,11 @@ bool LogCleaner::rewriteSegmentImpl(
 bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetMap& map,
                                 Offset fromOffset, Offset cleanBoundaryOffset,
                                 int64_t nowNs, int64_t deleteRetentionMs,
-                                int64_t nowMs) {
+                                int64_t nowMs, std::optional<int64_t> nextSegBase) {
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
         fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
-        &map.producerTails(), &map.txnState(), &map.verdictState());
+        &map.producerTails(), &map.txnState(), &map.verdictState(), nextSegBase);
 }
 
 // ---------------------------------------------------------------------------
@@ -911,11 +938,11 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetM
 bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, SkimpyOffsetMap& map,
                                 Offset fromOffset, Offset cleanBoundaryOffset,
                                 int64_t nowNs, int64_t deleteRetentionMs,
-                                int64_t nowMs) {
+                                int64_t nowMs, std::optional<int64_t> nextSegBase) {
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
         fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
-        &map.producerTails(), &map.txnState(), &map.verdictState());
+        &map.producerTails(), &map.txnState(), &map.verdictState(), nextSegBase);
 }
 
 // ---------------------------------------------------------------------------
@@ -953,7 +980,8 @@ void LogCleaner::compact(Log& log, OffsetMap& map,
         // recovery point — restart recovery chain-validates it, and a
         // compaction gap there would be taken for a lost write (truncation).
         if (i + 1 < bases.size() && !log.compactionAllowedThrough(bases[i + 1])) break;
-        rewriteSegment(dir, segBase, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
+        rewriteSegment(dir, segBase, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs,
+                       successorInList(bases, i));
         if (damaged_.has_value()) break;   // the pass stops at the damaged segment
     }
 
@@ -1021,7 +1049,7 @@ bool LogCleaner::produceCleanedFile(const std::string& dir,
     // rename, or delete when emptied).  Passing the GLOBAL bounds makes the
     // per-record filter drop globally-superseded records.
     return rewriteSegment(dir, segBase, map, globalDirtyStart, activeBase,
-                          nowNs, deleteRetentionMs);
+                          nowNs, deleteRetentionMs, -1, successorOf(sealedBases, segBase));
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,7 +1157,8 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
     // enqueue next cycle.  We do NOT advance the watermark without a successful
     // enqueue (preserves the CP-6 ring-full invariant).
     const bool wrote = rewriteSegment(dir, segBase, map, globalDirtyStart,
-                                      passEnd, nowNs, deleteRetentionMs, nowMs);
+                                      passEnd, nowNs, deleteRetentionMs, nowMs,
+                                      successorOf(sealedBases, segBase));
     // CP-8: throttle the write phase.
     if (wrote && throttler) {
         const std::string logPath2 = segmentLogPath(dir, segBase);
@@ -1301,7 +1330,8 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
             if (g.bases.empty()) continue;
             bool changed = false;
             mergeGroupWithMap(dir, g.bases, map, globalDirtyStart, passEnd,
-                              nowNs, deleteRetentionMs, nowMs, throttler, &changed);
+                              nowNs, deleteRetentionMs, nowMs, throttler, &changed,
+                              successorOf(sealedBases, g.bases.back()));
             if (changed) {
                 result.compacted = true;
                 for (int64_t b : g.bases) result.rewrittenBases.push_back(b);
@@ -1318,7 +1348,8 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
     for (int64_t b : inPassBases) {
         bool changed = false;
         rewriteSegmentImpl(dir, b, getLatest, globalDirtyStart, passEnd,
-                           nowNs, deleteRetentionMs, nowMs, &changed, &map.producerTails(), &map.txnState(), &map.verdictState());
+                           nowNs, deleteRetentionMs, nowMs, &changed, &map.producerTails(), &map.txnState(), &map.verdictState(),
+                           successorOf(sealedBases, b));
         if (damaged_.has_value()) break;   // the pass stops at the damaged segment; finished segments stand
 
         // A segment needs a swap enqueue iff its on-disk content changed (records
@@ -1495,7 +1526,7 @@ void LogCleaner::mergeGroupWithMap(
     SkimpyOffsetMap& map,
     Offset globalDirtyStart, Offset passEnd,
     int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs,
-    Throttler* throttler, bool* changed)
+    Throttler* throttler, bool* changed, std::optional<int64_t> afterGroupBase)
 {
     if (changed) *changed = false;
     if (groupInPass.empty()) return;
@@ -1521,7 +1552,8 @@ void LogCleaner::mergeGroupWithMap(
     // avoids one heap allocation per kept record in the coalescing path.
     std::vector<uint8_t> tmpBatch;
     tmpBatch.reserve(512);
-    for (int64_t segBase : groupInPass) {
+    for (std::size_t gi = 0; gi < groupInPass.size(); ++gi) {
+        const int64_t segBase = groupInPass[gi];
         ++rewriteSegmentsRead_;
         hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
@@ -1529,6 +1561,7 @@ void LogCleaner::mergeGroupWithMap(
         outBuf.reserve(outBuf.size() + buf.size());
 
         std::size_t pos = 0;
+        BatchHeaderCursor hdr(segBase, BatchHeaderCursor::upperFor(segBase, successorInList(groupInPass, gi).has_value() ? successorInList(groupInPass, gi) : afterGroupBase));
         while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
                <= buf.size()) {
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
@@ -1536,6 +1569,7 @@ void LogCleaner::mergeGroupWithMap(
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             std::optional<rune::storage::control_record::ControlRecord> ctl;   // a control record is validated once (#804)
             if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;
+            if (!hdr.accept(r)) break;   // #839: baseOffset / magic are not CRC-covered: damage like a CRC failure
 
             // CP-8: horizon gate (same logic as rewriteSegmentImpl).
             const bool batchHasHorizon  = r.hasDeleteHorizon();
@@ -1773,7 +1807,8 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
 
     bool changed = false;
     mergeGroupWithMap(dir, groupInPass, map, globalDirtyStart, passEnd,
-                      nowNs, deleteRetentionMs, nowMs, throttler, &changed);
+                      nowNs, deleteRetentionMs, nowMs, throttler, &changed,
+                      successorOf(sealedBases, groupInPass.back()));
     result.compacted = changed;
     return result;
 }

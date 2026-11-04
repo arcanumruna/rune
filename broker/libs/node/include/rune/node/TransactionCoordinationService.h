@@ -611,7 +611,7 @@ private:
     /// The txn-state replica's logGeneration() the loaded state was folded from.
     uint64_t loadedLogGen_ = 0;
     [[nodiscard]] bool stillLoaded_() const;
-    void load_(int64_t nowNs);
+    [[nodiscard]] bool load_(int64_t nowNs);   ///< false: the txn log is damaged (#839), the coordinator stays Unloaded
     void unload_();
     /// Reply epoch filter: a marker reply counts only for the loaded epoch.
     [[nodiscard]] bool currentEpoch_(int32_t coordinatorEpoch) const noexcept;

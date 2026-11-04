@@ -18,6 +18,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -427,7 +428,10 @@ TEST(NamespaceCliRegression, UnknownNamespaceRegression) {
 
 namespace {
 uint64_t limitMaxOf(std::size_t i) {
-    return i == rc::kNamespaceFeatureBitsField ? uint64_t{UINT32_MAX} : UINT64_MAX;
+    if (i == rc::kNamespaceFeatureBitsField) return uint64_t{UINT32_MAX};
+    // #837: the broker caps max-txn-time-ms at 30 days (its ns product would overflow above ~292 years).
+    if (std::string_view(rc::kNamespaceLimitFields[i].name) == "max-txn-time-ms") return 2'592'000'000ULL;
+    return UINT64_MAX;
 }
 std::vector<uint64_t> limitsOf(rc::Client& c, const std::string& ns) {
     const auto all = c.listNamespaces();

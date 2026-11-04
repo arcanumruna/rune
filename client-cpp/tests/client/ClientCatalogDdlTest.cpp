@@ -119,7 +119,7 @@ TEST_F(ClientCatalogDdl, DefineTopicSendsReplicationFactorConfigAndExtension) {
     EXPECT_EQ(m->partitionCount, 4u);
     EXPECT_EQ(m->keyField, "player");
     EXPECT_EQ(m->descriptorLen, 0u) << "an empty descriptor = an untyped topic";
-    EXPECT_TRUE(m->validate);
+    EXPECT_FALSE(m->validate) << "an untyped topic (empty descriptor) validates nothing (#780: validate = a descriptor is present)";
     EXPECT_EQ(m->persistence, pc::DefineTopic::kPersistenceTransient);
     ASSERT_TRUE(m->hasExt);
     EXPECT_EQ(m->replicationFactor, 3);

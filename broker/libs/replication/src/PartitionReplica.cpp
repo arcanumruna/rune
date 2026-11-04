@@ -978,7 +978,22 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // fails per min-ISR) instead of re-fetching forever behind silent drops.
     rune::storage::LogReadView view{};
     if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_()) {
-        view = readLog_(req.fetchOffset, req.maxBytes);
+        rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
+        view = readLog_(req.fetchOffset, req.maxBytes, &st);
+        if (view.empty() && rune::storage::unservable(st)) [[unlikely]] {
+            // #839: the stored copy is damaged.  Not liveness (before onFollowerFetch), never retriable at this offset.
+            if (corruptReadsServed_++ == 0 || (corruptReadsServed_ & 1023u) == 0) {
+                spdlog::error("PartitionReplica[node={} topic={} part={}]: the stored batch at offset {} is DAMAGED; "
+                              "answering follower {} kErrCorruptRecord (not ISR liveness; it wedges there).  (count={})",
+                              cfg_.selfId, cfg_.topicId, cfg_.partitionId, req.fetchOffset, req.followerId,
+                              corruptReadsServed_);
+            }
+            if (slot) slot->servedTimeNs = 0;
+            auto resp = makeFetchResponse(highWatermark(), kErrCorruptRecord, {});
+            sendFetchAnswer_(slot, req.followerId, resp, req.fetchOffset, req.maxBytes,
+                             /*data=*/false, /*dataEnd=*/-1);
+            return kErrCorruptRecord;
+        }
         if (view.len > static_cast<std::size_t>(req.maxBytes)) [[unlikely]] {
             int64_t frame = std::numeric_limits<int64_t>::max();
             onTransport([&](auto& t) { frame = t.maxFetchRecordsBytes(); });
@@ -1163,8 +1178,13 @@ int PartitionReplica::retryOwedFetchAnswers_() noexcept
         if (owed.data && owed.fetchOffset < leo) {
             // The view itself is re-taken every attempt (cheap; never cached across
             // passes — a cleaner swap may remap the segment between them).
-            view = readLog_(owed.fetchOffset, owed.maxBytes);
-            if (view.empty()) [[unlikely]] continue;   // transient read-map failure: next pass
+            rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
+            view = readLog_(owed.fetchOffset, owed.maxBytes, &st);
+            if (view.empty()) [[unlikely]] {
+                // #839: a damaged range is never re-served from the owed slot; the follower's next real fetch gets -12.
+                if (rune::storage::unservable(st)) s.owed = FollowerSlot::OwedAnswer{};
+                continue;   // else a transient read-map failure: next pass
+            }
             // F7 / R2: the whole-batch walk is memoised only while the LEO, the
             // view (same mapping, same length) AND the log's segment install
             // generation are unchanged — a compaction swap at the same LEO
@@ -1291,6 +1311,13 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             followerSync_.forceBehind();
             if (role_ == Role::Follower && resp.leaderEpoch >= epoch_)
                 wedgeAt_(logEndOffset_(), "the leader cannot fit it in one replication frame");
+        }
+        // #839: the leader's stored copy of the batch at our LEO is damaged — never retriable here: Behind, then wedge
+        // (same rules as above: a stale-epoch answer never wedges).
+        if (resp.errorCode == kErrCorruptRecord) {
+            followerSync_.forceBehind();
+            if (role_ == Role::Follower && resp.leaderEpoch >= epoch_)
+                wedgeAt_(logEndOffset_(), "the leader's stored copy of this batch is corrupt");
         }
         // KIP-320/595: our (fetchOffset, lastFetchedEpoch) is off the leader's
         // lineage — KIP-279 truncation, then re-fetch.
@@ -3940,14 +3967,17 @@ Offset PartitionReplica::pushFloor_() const noexcept
     return floor;
 }
 
-rune::storage::LogReadView PartitionReplica::readLog_(Offset from, int32_t maxBytes) noexcept
+rune::storage::LogReadView PartitionReplica::readLog_(Offset from, int32_t maxBytes,
+                                                      rune::storage::ReadIntoStatus* stOut) noexcept
 {
+    if (stOut != nullptr) *stOut = rune::storage::ReadIntoStatus::Ok;
     if (!memoryBacked_ && readScratch_ != nullptr) [[likely]] {
         rune::storage::ReadIntoStatus st;
         int err = 0;
         const rune::storage::LogReadView v =
             diskLog_->readInto(from, maxBytes, readScratch_, readScratchCap_, st, INT64_MAX, &err);
         if (st != rune::storage::ReadIntoStatus::FirstTooLarge) [[likely]] {
+            if (stOut != nullptr) *stOut = st;
             // D26: an I/O error is answered empty — never retried through the
             // read mapping (SIGBUS on the bad page).  Review M1: it failed the
             // log (sticky); the owner's storage-failure check halts / takes
@@ -4015,7 +4045,9 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
             // transport copies the bytes once, straight into the follower's term.
             // (F3 round 6 item 1: chunk capped at the transport's LIVE ceiling —
             // F18 m-3's pushCap; one ceiling: maxFetchRecordsBytes().)
-            v = readLog_(from, static_cast<int32_t>(pushCap));
+            rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
+            v = readLog_(from, static_cast<int32_t>(pushCap), &st);
+            if (v.empty() && rune::storage::unservable(st)) [[unlikely]] continue;   // #839: never push a damaged range
             // F18 / KIP-74: a first batch larger than maxFetchBytes is still pushed
             // whole (never stuck).  FLOW CONTROL: no batch that begins at or beyond
             // pushCeiling is pushed (in-flight <= kPushFlowWindow).
