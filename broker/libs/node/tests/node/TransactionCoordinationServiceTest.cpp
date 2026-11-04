@@ -2163,8 +2163,9 @@ TEST_F(TxnNsDeleteRegression, AbortStepNeverDoneWhileANamespaceCommitStillApplie
     ASSERT_EQ(sink.accepted, 0);
     svc_->setNamespaceTxnGate(4, true, /*deleting=*/true);   // the delete's apply
     rune::node::ReapStatus abortAnswer = svc_->abortNamespaceTxns(4, now_);
-    const int acceptedAtFirstAnswer = sink.accepted;
-    if (abortAnswer == rune::node::ReapStatus::Done) EXPECT_EQ(sink.accepted, acceptedAtFirstAnswer);
+    // the commit still has its offsets pending: the step is not Done until a doWork retry settles them
+    EXPECT_EQ(abortAnswer, rune::node::ReapStatus::Waiting) << "AbortTxns answered " << static_cast<int>(abortAnswer)
+        << " while a commit of the namespace still had offsets pending";
     sink.refusals = 0;   // the group coordinator takes offsets again (after the reaper tombstoned the groups)
     bool done = abortAnswer == rune::node::ReapStatus::Done;
     for (int i = 0; i < 20; ++i) {
