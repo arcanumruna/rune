@@ -6,8 +6,11 @@
 //
 // formatVer 2 (namespaces, plan D2) is formatVer 1 with `u32 nsId` inserted right after `u16 kind`; the rest is
 // unchanged.  For object kinds (1..9) nsId is the namespace of the object; for namespace kinds (32..35) it is the
-// subject namespace.  A formatVer-1 event decodes with nsId = 0 and cannot carry another.  The broker writes only
-// formatVer 2 (kCurrentFormatVer).
+// subject namespace.  A formatVer-1 event decodes with nsId = 0 and cannot carry another.
+//
+// formatVer 3 (checked writes) is formatVer 2 plus a trailing 14-byte TopicKeyFeatures block in every SchemaDef body
+// (CreateTopic with a schema, CreateSchema).  The broker writes kFormatV3 once the cluster feature level reaches 5 (kCheckedWrites),
+// else kCurrentFormatVer (formatVer 2); it never writes formatVer 1.
 //
 // formatVer-1 layout (all little-endian, written and read byte-wise — host-endian independent):
 //   u16 formatVer | u16 kind | u64 objectId | u32 prevVersion | u32 newVersion |
@@ -50,8 +53,9 @@ enum class EventKind : uint16_t {
 };
 inline constexpr uint16_t kFormatV1          = 1;
 inline constexpr uint16_t kFormatV2          = 2;
+inline constexpr uint16_t kFormatV3          = 3;
 inline constexpr uint16_t kCurrentFormatVer  = kFormatV2;
-/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2 accepts 32..36 and refuses 37..63.
+/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2 and 3 accept 32..36 and refuse 37..63.
 inline constexpr uint16_t kReservedKindFirst = 32;
 inline constexpr uint16_t kReservedKindLast  = 63;
 inline constexpr uint16_t kLastNamespaceKind = 36;
@@ -75,6 +79,7 @@ struct SchemaDef {
     bool                 validate = false;
     std::vector<uint8_t> descriptorBlob;     // rune::codec::serialize(Descriptor) — the initial EVOLVING blob
     uint16_t             nextTag  = 0;       // = descriptor field count
+    rune::protocol::TopicKeyFeatures keyFeatures{};   // formatVer 3; a v1 / v2 event must keep the defaults
     bool operator==(const SchemaDef&) const = default;
 };
 
@@ -250,18 +255,19 @@ inline constexpr std::size_t kMaxListCount  = 0xFFFF;
 enum class EncodeError : uint8_t {
     FieldTooLong,      // a string / blob (or the ops blob) exceeds its length prefix's width
     TooManyElements,   // a list exceeds its u16 count
-    UnknownFormatVer,  // formatVer not 1 or 2               (decode: UnknownFormatVer)
-    ReservedKind,      // v1: kind in [32, 63]; v2: [36, 63] (decode: ReservedKind)
+    UnknownFormatVer,  // formatVer not 1, 2 or 3            (decode: UnknownFormatVer)
+    ReservedKind,      // v1: kind in [32, 63]; v2, v3: [37, 63] (decode: ReservedKind)
     UnknownKind,       // kind not 1..9 and not reserved    (decode: UnknownKind)
     KindOpsMismatch,   // kind != kindOf(ops)               (decode: KindOpsMismatch)
     BadEnum,           // an enum field outside its range, or a v1 event with nsId != 0 (decode: BadEnum)
+    NeedsFormatV3,     // a v1 / v2 event with non-default keyFeatures (a decoder never produces one)
 };
 
 [[nodiscard]] EventKind kindOf(const Ops& ops) noexcept;
 /// Clears `out` and encodes into it, reusing its capacity.  On error `out` is left empty.
 [[nodiscard]] std::expected<void, EncodeError> encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out);
 [[nodiscard]] std::expected<std::vector<uint8_t>, EncodeError> encode(const CatalogEvent& e);
-/// Bounds-checked decode of one formatVer-1 or -2 event; the same validation as encode, plus the
+/// Bounds-checked decode of one formatVer-1, -2 or -3 event; the same validation as encode, plus the
 /// byte-level refusals (Truncated, TrailingBytes, a bool byte other than 0/1 → BadEnum).
 [[nodiscard]] std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) noexcept;
 [[nodiscard]] std::string_view kindName(EventKind k) noexcept;

@@ -97,12 +97,15 @@
 // ensureValid()-passing -- a real, not synthetic, wire format) BEFORE any
 // timed/tracked phase; building/grouping the op stream is harness cost,
 // never measured.
+#include "BenchGate.h"
+
 #include <benchmark/benchmark.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/node/VerdictSource.h>
 #include <rune/node/WriteState.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/LogReadView.h>
+#include <rune/transaction/ReadCommittedView.h>
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/AggFold.h>
 #include <rune/view/AggState.h>
@@ -334,10 +337,16 @@ struct BatchStream {
     int64_t bound(size_t i) const { return baseOffset[i] + recCount[i]; }
 };
 
-// `append(RecordBatchBuilder&, const Op&)` writes one record (NOT timed).
-template <class AppendFn>
+// #591: the default per-batch hook (a no-op): the other benches' streams are unchanged.
+struct NoPrepare {
+    void operator()(rune::protocol::RecordBatchBuilder&, size_t /*batchIdx*/) const noexcept {}
+};
+
+// `append(RecordBatchBuilder&, const Op&)` writes one record (NOT timed); `prepare(RecordBatchBuilder&, batchIdx)`
+// runs once per batch before its records (e.g. to mark the batch transactional).
+template <class AppendFn, class PrepareFn = NoPrepare>
 BatchStream buildStream(const std::vector<Op>& ops, const int* sizes, size_t sizesLen,
-                        AppendFn&& append) {
+                        AppendFn&& append, PrepareFn&& prepare = PrepareFn{}) {
     BatchStream s;
     s.bytes.reserve(ops.size() * 48);
     s.byteOffset.reserve(ops.size());
@@ -353,6 +362,7 @@ BatchStream buildStream(const std::vector<Op>& ops, const int* sizes, size_t siz
         const uint32_t n = static_cast<uint32_t>(std::min<size_t>(want, ops.size() - opIdx));
 
         rune::protocol::RecordBatchBuilder bb(nextOffset, 0);
+        prepare(bb, s.size());
         for (uint32_t j = 0; j < n; ++j) append(bb, ops[opIdx + j]);
 
         const size_t byteOff = s.bytes.size();
@@ -542,43 +552,73 @@ struct AggRig {
 
 } // namespace
 
+// The BM_ViewFoldReplace workload; BM_ViewFoldVerdict/key_index runs it too, for its gate's baseline.
+// Arg "txn": 0 = plain batches (kNoSkip, as before); 1 = EVERY batch is transactional (producerId 1 + batchIdx % 8) and
+// the fold carries an aborted-transaction index of 64 ranges (pids 100..163, spread over the stream's offsets, never the
+// batch pids), so every batch does a real, non-empty index lookup that answers "not aborted" (#591).
+static PhaseResult runReplaceFold(size_t& finalSize, bool txn = false) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = compileView(hpView(), srcs, 0x51000001).value();
+
+    ViewTable table(comp.rowLayout);
+    VersionDescriptorCache vdc(src);
+
+    const auto ops = generateChurnOps(kTotalOps);
+    const auto stream = buildStream(
+        ops, kBatchSizes, std::size(kBatchSizes),
+        [](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
+            const auto kb = keyBytes(static_cast<int64_t>(op.key));
+            if (op.tombstone) {
+                bb.append(asSv(kb), std::string_view{}, 0);
+            } else {
+                const auto val = encodeCharacter(static_cast<int64_t>(op.key), op.hp, 1);
+                bb.append(asSv(kb), asSv(val), 0);
+            }
+        },
+        [txn](rune::protocol::RecordBatchBuilder& bb, size_t batchIdx) {
+            if (!txn) return;
+            bb.setProducerId(static_cast<int64_t>(1 + batchIdx % 8));
+            bb.setProducerEpoch(0);
+            bb.setBaseSequence(0);
+            bb.setTransactional(true);
+        });
+
+    rune::transaction::AbortedTxnIndex aborted;
+    if (txn) {
+        const int64_t span = static_cast<int64_t>(kTotalOps) / 64;
+        for (int64_t i = 0; i < 64; ++i) aborted.onAbortMarker(100 + i, i * span, i * span + span - 1);
+    }
+    rune::view::FoldSkip skip;
+    if (txn) {
+        skip.aborted.index = &aborted;
+    }
+
+    auto foldOne = [&](size_t i) {
+        auto lv = stream.view(i);
+        int64_t cur = 0;
+        return foldBatch(comp.plan, comp.rowLayout, vdc, table, lv, stream.bound(i), cur, skip);
+    };
+    // Replace: one drain right before the alloc probe (unchanged from Task 11).
+    auto drainAll = [&] { table.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {}); };
+
+    auto r = runPhases(stream, foldOne, drainAll, /*drainEvery*/ 0);
+
+    benchmark::DoNotOptimize(table.size());
+    finalSize = table.size();
+    return r;
+}
+
 static void BM_ViewFoldReplace(benchmark::State& st) {
+    const bool txn = st.range(0) == 1;
     for (auto _ : st) {
-        auto src = charSourceV1();
-        const rune::codec::Descriptor* srcs[] = {&src};
-        auto comp = compileView(hpView(), srcs, 0x51000001).value();
-
-        ViewTable table(comp.rowLayout);
-        VersionDescriptorCache vdc(src);
-
-        const auto ops = generateChurnOps(kTotalOps);
-        const auto stream = buildStream(
-            ops, kBatchSizes, std::size(kBatchSizes),
-            [](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
-                const auto kb = keyBytes(static_cast<int64_t>(op.key));
-                if (op.tombstone) {
-                    bb.append(asSv(kb), std::string_view{}, 0);
-                } else {
-                    const auto val = encodeCharacter(static_cast<int64_t>(op.key), op.hp, 1);
-                    bb.append(asSv(kb), asSv(val), 0);
-                }
-            });
-
-        auto foldOne = [&](size_t i) {
-            auto lv = stream.view(i);
-            int64_t cur = 0;
-            return foldBatch(comp.plan, comp.rowLayout, vdc, table, lv, stream.bound(i), cur, rune::view::kNoSkip);
-        };
-        // Replace: one drain right before the alloc probe (unchanged from Task 11).
-        auto drainAll = [&] { table.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {}); };
-
-        auto r = runPhases(stream, foldOne, drainAll, /*drainEvery*/ 0);
-
-        benchmark::DoNotOptimize(table.size());
-        reportCommon(st, "", r, table.size());
+        size_t finalSize = 0;
+        auto r = runReplaceFold(finalSize, txn);
+        reportCommon(st, "", r, finalSize);
     }
 }
 BENCHMARK(BM_ViewFoldReplace)
+    ->ArgName("txn")->Arg(0)->Arg(1)
     ->Unit(benchmark::kMicrosecond)
     ->Iterations(1)
     ->UseRealTime();
@@ -603,6 +643,8 @@ rune::view::ViewPlan tagProjectionView() {
                   {"tag", PrimType::Int32, 0, "tag", rune::view::MergeRule::Replace}};
     return v;
 }
+constexpr auto kIntentInsert = static_cast<uint8_t>(rune::protocol::record::Intent::Insert);
+constexpr auto kIntentExisting = static_cast<uint8_t>(rune::protocol::record::Intent::Existing);
 struct VerdictBenchMember {
     rune::codec::Descriptor src = tagSourceV1();
     rune::view::CompileResult comp;
@@ -681,6 +723,89 @@ static void BM_ViewFoldVerdict(benchmark::State& st) {
     }
 }
 BENCHMARK(BM_ViewFoldVerdict)->Arg(0)->Arg(1)->ArgName("rejecting_1pct")->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime();
+
+// Key-index judging (checked writes Part 05): the same churn through a VerdictSource whose only member is the key index,
+// every record an intent and none rejected - a new key is an insert, an update an update, a tombstone a removeExisting.
+// The gate is the spec's §14 judging budget over the plain fold: verdict_record_p50_ns - BM_ViewFoldReplace's
+// record_p50_ns <= 1000, run here first in the same process, and steady_alloc == 0.  The judge drops the key index's
+// dirty rows itself (it is never checkpointed), so drainAll has nothing to do.
+static void BM_ViewFoldVerdictKeyIndex(benchmark::State& st) {
+    for (auto _ : st) {
+        size_t replaceSize = 0;
+        auto base = runReplaceFold(replaceSize);
+        const double replaceP50Ns = percentileUs(base.trueRecordLatNs, 0.50) * 1000.0;
+
+        const auto ops = generateChurnOps(kTotalOps);
+        std::vector<bool> live(kTotalOps + 1);   // a later touch of a key is an update or a removeExisting
+        const auto stream = buildStream(
+            ops, kBatchSizes, std::size(kBatchSizes),
+            [&](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
+                const auto kb = keyBytes(static_cast<int64_t>(op.key));
+                const bool exists = live[op.key];
+                if (op.tombstone) {
+                    bb.append(asSv(kb), std::string_view{}, 0, kIntentExisting);
+                    live[op.key] = false;
+                } else {
+                    const auto val = encodeCharacter(static_cast<int64_t>(op.key), 1, 1);
+                    bb.append(asSv(kb), asSv(val), 0, exists ? kIntentExisting : kIntentInsert);
+                    live[op.key] = true;
+                }
+            });
+
+        // A 1 MiB chunk (1,048,576 one-byte rows, above the stream's ~954k final population): the churn never plateaus, so the
+        // product's 64 KiB chunk would take its documented chunk-growth allocation inside the alloc probe.  The product reuses rows
+        // through the free list, so a bounded population never appends a chunk; a growing one appends one 64 KiB chunk per 65,536
+        // new high-water keys.
+        const auto src = tagSourceV1();
+        rune::node::ViewInstance index(rune::node::keyIndexPlan(5, src.find("id")->id), rune::node::keyIndexRowLayout(), src, false, 0,
+                                       4096, 1u << 20);
+        rune::node::PartitionWriteState write;
+        rune::node::VerdictSource vs{5, 0};
+        vs.addVerdictView(&index, rune::view::VerdictViewKind::KeyIndex, 0, rune::node::kKeyIndexPlanFingerprint);
+        rune::node::ConstraintSet set;
+        set.id = 1;
+        set.members[set.count++] = {0, rune::view::VerdictViewKind::KeyIndex, rune::node::kKeyIndexPlanFingerprint};
+        write.constraintSets.onChange(0, set);
+        vs.bindState(&write);
+        vs.bindLeader(nullptr, 1, 0);
+        vs.captureAppendedForTest(false);
+        int64_t nowNs = 0;
+
+        const int64_t end = stream.bound(stream.size() - 1);
+        auto readRange = [&](int64_t from, int64_t) {
+            const size_t j = static_cast<size_t>(std::upper_bound(stream.baseOffset.begin(), stream.baseOffset.end(), from) - stream.baseOffset.begin()) - 1;
+            return rune::storage::LogReadView{stream.bytes.data() + stream.byteOffset[j], stream.bytes.size() - stream.byteOffset[j], stream.baseOffset[j], end};
+        };
+        auto foldOne = [&](size_t i) {
+            vs.driveJudge(readRange, stream.bound(i), nowNs += 1'000'000, write);
+            rune::node::verdictOnHw(write, stream.bound(i));
+            return FoldStats{};
+        };
+
+        auto r = runPhases(stream, foldOne, [] {}, /*drainEvery*/ 0);
+        const bool judgedAll = vs.judgedThrough() >= end - 8;
+        const bool exact = write.rejected.size() == 0 && index.table.size() == replaceSize;
+        const double p50 = percentileUs(r.trueRecordLatNs, 0.50) * 1000.0;
+        st.counters["verdict_record_p50_ns"] = p50;
+        st.counters["verdict_record_p99_ns"] = percentileUs(r.trueRecordLatNs, 0.99) * 1000.0;
+        st.counters["steady_alloc"]          = static_cast<double>(r.steadyAlloc);
+        st.counters["replace_record_p50_ns"] = replaceP50Ns;
+        st.counters["rejected_total"]        = static_cast<double>(write.rejected.size());
+        st.counters["key_index_size"]        = static_cast<double>(index.table.size());
+        // The delta subtracts a fold the key-index path never runs: a key-index topic with a projection pays both, so read
+        // verdict_record_p50_ns itself against the same 1000 ns as well.
+        const bool pass = p50 - replaceP50Ns <= 1000.0 && r.steadyAlloc == 0 && judgedAll && exact;
+        st.counters["gate_pass"] = pass ? 1.0 : 0.0;
+        rune::bench::gateCheck(st, pass, !judgedAll ? "the judge did not reach the end of the stream"
+                                         : !exact   ? "an intent was rejected or the key index lost a key"
+                                                    : "judging adds more than 1000 ns per record or allocates in steady state");
+        std::fprintf(stderr,
+                     "[ViewFoldVerdict key_index gate] verdict_record_p50_ns=%.0f replace_record_p50_ns=%.0f delta_ns=%.0f (<=1000) "
+                     "steady_alloc=%lld (==0) => %s\n",
+                     p50, replaceP50Ns, p50 - replaceP50Ns, static_cast<long long>(r.steadyAlloc), pass ? "PASS" : "FAIL");
+    }
+}
+BENCHMARK(BM_ViewFoldVerdictKeyIndex)->Name("BM_ViewFoldVerdict/key_index")->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime();
 
 // Aggregate fold gate (Phase 2a): user_totals grouped by userId over
 // 1,000,000 contributors / 10,000 groups. What is warm before timing:

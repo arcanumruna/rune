@@ -2694,6 +2694,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
             resp.leaderMemberId    = thisNodeId_;
             resp.assignedSessionId = pending.sessionId;
+            if (advertisedBrokerVersion_ > 0) resp.brokerVersion = advertisedBrokerVersion_;
             // Authentication Task 10 (D11): a v9 client of an authenticating broker is told how it authenticates and
             // where it stands.  A NEVER-bootstrapped cluster (no `__security` event yet: nobody exists who could log
             // in): Anonymous - it may send ONLY SecurityBootstrap.  Otherwise MustAuthenticate - also while the window
@@ -8445,7 +8446,8 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
                                                      m.keyField, m.validate, m.descriptorBlob, m.descriptorLen,
                                                      m.persistence, m.replicationFactor, m.config,
                                                      ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId),
-                                                     adopt ? std::string_view(adopt->detail) : std::string_view{}),
+                                                     adopt ? std::string_view(adopt->detail) : std::string_view{},
+                                                     m.hasKeyFeatures ? m.keyFeatures : rune::protocol::TopicKeyFeatures{}),
                        "DefineTopic: admin ring full", "DefineTopic: request larger than the admin ring message");
 }
 

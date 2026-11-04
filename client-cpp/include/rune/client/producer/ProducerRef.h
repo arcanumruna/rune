@@ -17,6 +17,7 @@
 #include <rune/client/producer/Producer.h>
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <span>
 #include <type_traits>
@@ -34,6 +35,16 @@ public:
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value) const {
         check_();
         p_->send(topic, key, value);
+    }
+    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, Completions& cq, Token token,
+              WriteIntent intent) const {
+        check_();
+        p_->send(topic, key, value, cq, token, intent);
+    }
+    [[nodiscard]] Completion sendAndWait(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+                                         WriteIntent intent, std::chrono::nanoseconds timeout) const {
+        check_();
+        return p_->sendAndWait(topic, key, value, intent, timeout);
     }
     SendResult trySendTo(TopicHandle topic, int32_t partition, const Key& key,
                          std::span<const uint8_t> value) const noexcept {

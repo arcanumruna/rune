@@ -356,6 +356,44 @@ partition logs under `topics/`, `__catalog/` and `__security/` (the replicated e
 - **Proof.** The DR suite ([testing.md](testing.md#disaster-recovery-suite-dr-e2e)) kills, pauses, restarts and
   partitions nodes under load and asserts no loss, per-key ordering, exactly-once and a single leader.
 
+## View checkpoint backups
+
+A persisted view keeps a checkpoint file per partition, `<data dir>/__view_snapshots/view-<id>-p<n>.committed.delta`. When the
+broker cannot trust one it throws the rows away and rebuilds them from the log. With `RUNE_VIEW_BACKUP=1` (the default) it first
+copies the file to `<data dir>/__view_snapshots/backup/view-<id>-p<n>.<10-digit seq>.<reason>.delta`. The view serves nothing
+(`NotReady`) until the copy is on disk and the rebuild has caught up.
+
+| Reason | The checkpoint was discarded because |
+|---|---|
+| `legacy` | it is in the old format, which may hold rows of aborted transactions |
+| `legacy-superseded` | an old-format file sat next to a current one (copied only, never rebuilds the view) |
+| `unreadable` | a record failed its CRC or would not decode, or the file is damaged before its last record |
+| `ahead-of-log` | its offset is above the end of the source log (the log lost its tail) |
+| `ahead-of-verdicts` | a verdict view is ahead of the verdict markers in the local log |
+| `below-log-start` | the view's cursor fell below the source's log start while rows were in the table |
+
+Log lines: `VIEW-DISCARD` (rows thrown away, with the reason), `VIEW-BACKUP` (file copied: seq, bytes, name),
+`VIEW-BACKUP-FAILED` (see below), `VIEW-START-AT-LOG-START` (a view with nothing to resume from starts at the log start),
+`VIEW-CHECKPOINT-TORN-TAIL` and `VIEW-CHECKPOINT-TAIL-TRIMMED` (see below). Per-view counters: `checkpointDiscards`,
+`viewBackupFailures`, `checkpointsAheadOfLog`.
+
+**A failed backup.** If the copy fails (disk full, I/O error) the broker logs `VIEW-BACKUP-FAILED` with the errno and does not
+rebuild over the unsaved file: the view stays `NotReady` for that boot. Free space or fix the disk and restart the node.
+
+**Disk sizing.** Budget up to `RUNE_VIEW_BACKUPS_KEPT` (default 3) copies of each view partition's checkpoint file, kept until
+newer backups push them out.
+
+**Torn tail.** A crash can leave a half-written last record. The broker finds it by CRC, logs `VIEW-CHECKPOINT-TORN-TAIL`, cuts
+the file back to the last whole record (`VIEW-CHECKPOINT-TAIL-TRIMMED`) and carries on. No rebuild and no backup happen for
+this. Damage anywhere else is `unreadable`.
+
+**Restoring a backup** (for example when the discard was a false alarm):
+1. Stop the node.
+2. Pick the backup in `__view_snapshots/backup/` by view, partition and seq.
+3. Move the current `view-<id>-p<n>.committed.delta` aside.
+4. Copy the backup to `view-<id>-p<n>.committed.delta`.
+5. Start the node. It validates the file again; if it is still not usable it is backed up and rebuilt as before.
+
 ## Verdict sources
 
 - A partition whose latest constraint set is non-empty is a verdict source. Its leader judges every record once, in offset
@@ -365,8 +403,24 @@ partition logs under `topics/`, `__catalog/` and `__security/` (the replicated e
 - **Verdict lag** (judgedThrough behind the log end) delays delivery and `View` acks, not `acks=all` for writers that did not
   ask for a verdict. Delivery stops at judgedThrough while a constraint view builds. A judge waits (`judgeWaitsForInstall`)
   while a member of the logged set is not installed on its worker.
-- After a crash that lost the marker tail a verdict view discards a checkpoint ahead of its local markers and refolds
+- After a crash that lost the marker tail a verdict view backs up and rebuilds a checkpoint ahead of its local markers
   (`verdictCheckpointsDiscarded`). When the rejected-offset index is full the judge stalls and raises `verdictStalls`.
+
+## Key index
+
+- A typed topic created or adopted with `key.index` keeps, per partition, an in-memory index of its live keys (about
+  25-40 bytes per key). It judges write intents (`insert` fails with `KeyExists` 56 on a stored key, `update` and
+  `removeExisting` with `KeyNotFound` 57 on an absent one) and makes the partition a verdict source; plain upserts and
+  deletes are folded into it and never rejected. It is charged to the topic's namespace.
+- The index is never checkpointed. It is rebuilt from the local log on each new leadership and each restart, at most
+  65,536 records per worker pass. While it rebuilds, delivery and `View` acks wait; intents are accepted and judged once
+  it is done. A key whose tombstone the cleaner already removed is gone from the rebuilt index, as from the log.
+- Stats per partition: `keyIndexRebuilds` (not counting the first build after a create or restart; an index adopted while
+  the partition already leads is rebuilt, and counted, at its next leadership), the rejections `rejectionsKeyExists` (56) and `rejectionsKeyNotFound` (57),
+  both with constraint id 0, and `keyIndexSkippedMalformed` (records whose key is not the key field's width, written
+  before an adoption).
+- The key field must be at most 8 bytes wide until wide keys ship; a wider one is refused at DDL ("key.index needs a key
+  of at most 8 bytes"). `key.index` needs every broker at feature level 5.
 
 ## Upgrades
 

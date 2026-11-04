@@ -595,7 +595,7 @@ private:
         deps.respondError = [record](int64_t, int64_t corr, uint16_t code, std::string_view message) {
             record(corr, Answer{code, -1, 0, std::string(message), 0, -1, 0, Answer::Kind::Error});
         };
-        deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t) {};
+        deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t, const rune::protocol::TopicKeyFeatures&) {};
         br->admin = std::make_unique<AdminWorker>(br->schemas, id, std::move(deps), &br->views, br->replica.get(), nullptr);
         CatalogEffects fx;
         fx.topicApplied = [this, self](const rune::catalog::TopicObject& t) { onTopicApplied_(*self, t); };

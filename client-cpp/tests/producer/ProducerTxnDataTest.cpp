@@ -104,7 +104,7 @@ struct Op {
 /// CQ-form record completions (the Client's cqDeliver seam): per token.
 struct CqLedger {
     std::map<Token, std::pair<int, rc::Completion>> e;
-    static void deliver(void* ctx, rc::CqRef, const rc::Completion& c) noexcept {
+    static void deliver(void* ctx, rc::CqRef, const rc::Completion& c, std::span<const uint8_t>) noexcept {
         if (c.op == OpKind::BatchAck) return;
         auto& x = static_cast<CqLedger*>(ctx)->e[c.token];
         ++x.first;

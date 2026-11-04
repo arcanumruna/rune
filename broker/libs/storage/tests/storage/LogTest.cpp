@@ -1849,6 +1849,15 @@ TEST(LogRegression, RestampAppendStampsTheLeaderEpochZeroCopy) {
 // 4000-segment test took 70 s).  Every sealed segment must keep its OWN
 // timestamp through every republish.
 TEST(LogRegression, SealedSnapshotKeepsEachSegmentsTimestampAcrossManyRollsRegression) {
+    // 1500 live segments hold ~3000 fds: over the default Linux soft RLIMIT_NOFILE
+    // (1024; macOS shells allow far more, so this only failed on Linux with EMFILE).
+    // Raise soft to hard for this test only, like the rolling / compaction stress tests.
+    struct ::rlimit fdLimit{};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &fdLimit), 0);
+    const struct ::rlimit savedFdLimit = fdLimit;
+    fdLimit.rlim_cur = fdLimit.rlim_max;
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &fdLimit), 0);
+    struct RestoreFdLimit { struct ::rlimit l; ~RestoreFdLimit() { ::setrlimit(RLIMIT_NOFILE, &l); } } restore{savedFdLimit};
     auto dir = makeTempDir("rune_log_d11");
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), /*rollBytes=*/64);       // every batch seals a segment

@@ -14,17 +14,41 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace rune::node {
+
+// Checked writes Part 05: the key index, a verdict member over a one-byte-row table keyed by the packed wire key.
+inline constexpr uint64_t    kKeyIndexPlanFingerprint      = 0x4B45'5949'4E44'4558ull;   // "KEYINDEX"
+inline constexpr std::size_t kKeyIndexChunkBytes           = 64u << 10;
+inline constexpr int64_t     kKeyIndexReplayRecordsPerPass = 65536;
+
+struct KeyIndexFold {
+    rune::view::ViewTable& table;
+    uint8_t                keyWidth = 0;
+};
+
+/// The wire key's bytes packed little-endian; the caller checked the width (at most 8).
+[[nodiscard]] uint64_t keyIndexWord(std::string_view wireKey) noexcept;
+[[nodiscard]] rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold&, const rune::view::SourceRecord&, rune::view::Prospect&) noexcept;
+/// The intent table (P5-3) over the key state the prospect holds; a Malformed prospect is accepted.
+[[nodiscard]] rune::view::Verdict evaluateIntent(const rune::view::SourceRecord&, const rune::view::Prospect&) noexcept;
+void applyKeyIndex(KeyIndexFold&, const rune::view::SourceRecord&, const rune::view::Prospect&) noexcept;
+/// foldBatch's contract (batch, bound, cursor, corrupt tail) over the accepted records: nothing is judged.
+rune::view::FoldStats foldKeyIndexBatch(KeyIndexFold&, const rune::storage::LogReadView&, int64_t bound, int64_t& cursor,
+                                        const rune::view::FoldSkip&) noexcept;
+[[nodiscard]] rune::view::CompiledViewPlan keyIndexPlan(int32_t srcTopicId, uint16_t keyFieldId);   // cold
+[[nodiscard]] rune::view::RowLayout keyIndexRowLayout();                                           // rowLen 1
 
 /// What the owning WorkerViewSet does for a judge's members (fn-pointer + ctx, no std::function).
 struct VerdictViewHooks {
     void* ctx = nullptr;
     /// Push the member's dirty rows as one checkpoint delta (or drop them for a transient member).
     int (*checkpoint)(void* ctx, ViewInstance&) = nullptr;
-    /// A checkpoint that outran the markers (P4-4): empty the member's tables and owe its file a reset.
-    void (*discard)(void* ctx, ViewInstance&) = nullptr;
+    /// A checkpoint that outran the markers (P4-4): the owner empties the member's tables, backs its checkpoint file up and
+    /// rebuilds it (WorkerViewSet::beginDiscard_).  The judge never touches the member's cursor on a discard.
+    void (*discard)(void* ctx, ViewInstance&, ViewDiscardReason) = nullptr;
     /// A retiring member left this partition's set for good (W passed its drop): the owner may erase the partition's instance.
     void (*retired)(void* ctx, int32_t viewTopicId, int32_t partition) = nullptr;
 };
@@ -41,6 +65,7 @@ public:
 
     /// The partition state judge() records rejections in and driveJudge() reads the timeline from.
     void bindState(PartitionWriteState* state) noexcept { state_ = state; }
+    [[nodiscard]] PartitionWriteState* boundState() const noexcept { return state_; }
 
     /// Prepares every member of the active set for `rec`, evaluates them in set order, applies all or none.  A rejection
     /// is added to the index and returned.  A full index or an exhausted prospect sets stalled() and applies nothing.
@@ -60,6 +85,18 @@ public:
         if (stallReason_ == StallReason::Full && state_ != nullptr && state_->rejected.size() < state_->rejected.capacity()) stalled_ = false;
     }
     [[nodiscard]] bool waitingForInstall() const noexcept { return waitingForInstall_; }
+    /// Cold (#791 diagnostics, read on a View ack timeout): the judge's state in one snapshot.
+    struct DiagSnapshot {
+        int64_t judgedThrough; bool stalled; int stallReason; bool waitingForInstall; bool needsActivation;
+        uint32_t activeSetId; std::size_t members; std::size_t active; uint64_t leaderGeneration;
+    };
+    [[nodiscard]] DiagSnapshot diagSnapshot() const noexcept {
+        return {judgeCursor_, stalled_, static_cast<int>(stallReason_), waitingForInstall_, needsActivation_, activeSet_.id, members_.size(), active_.size(), generation_};
+    }
+    [[nodiscard]] bool activationPending() const noexcept { return needsActivation_; }
+    /// A leadership has activated this judge and no new one is pending: what it folds now belongs to that leadership.
+    [[nodiscard]] bool activated() const noexcept { return generation_ != kUnbound && !needsActivation_; }
+    [[nodiscard]] int64_t logStart() const noexcept { return logStart_; }
 
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);
     void removeVerdictView(int32_t viewTopicId);
@@ -97,6 +134,7 @@ private:
         uint64_t                    objectId = 0, fingerprint = 0;
         TestRejectRule              rule;
         rune::view::Prospect        prospect;
+        uint8_t                     keyWidth = 0;   // KeyIndex: the wire key width of the source's key field
         bool                        retiring = false, leaving = false;
         int64_t                     leaveOffset = -1;
     };
@@ -117,7 +155,16 @@ private:
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
-    bool   rejects_(const Member& m, const rune::view::SourceRecord& rec) const noexcept;
+    /// Retention may have trimmed the log below a member's cursor: an empty member starts at the log start, one with rows is
+    /// discarded (BelowLogStart).  False when it was discarded.
+    bool   clampToLogStart_(Member& m) {
+        if (m.inst->foldCursor >= logStart_) return true;
+        if (startAtLogStart(*m.inst, logStart_)) return true;
+        if (hooks_.discard != nullptr) hooks_.discard(hooks_.ctx, *m.inst, ViewDiscardReason::BelowLogStart);
+        return false;
+    }
+    static void discardKeyIndexDirty_(ViewInstance& inst) noexcept;
+    [[nodiscard]] rune::view::Verdict verdictOf_(const Member& m, const rune::view::SourceRecord& rec) const noexcept;
     template <class ReadRangeFn>
     bool   switchSet_(int64_t changeOffset, ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted, int& work);
 
@@ -165,9 +212,10 @@ inline void verdictFeedBegin(void* state, int64_t, int64_t target) noexcept {
 
 inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int64_t base) noexcept {
     auto& s = *static_cast<PartitionWriteState*>(state);
-    const int type = cr::recordType(b, len);
-    if (type == cr::kVerdictMarker) {
-        const auto m = cr::parseMarker(b, len);
+    const auto c = cr::parseControl(b, len);   // one CRC per batch (#804)
+    if (!c) return;
+    if (c->type == cr::kVerdictMarker) {
+        const auto m = cr::parseMarker(*c);
         if (!m) return;
         if (s.rejected.capacity() == 0) s.rejected.reserve(kIndexReserve);
         s.rejected.onMarker(m->header.fromOffset, m->header.finalThrough, m->header.count, [&](std::size_t i) {
@@ -177,11 +225,11 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
             s.markers.onHw(std::min(base, s.scanHw));
             (void)s.markers.onMarker(base, m->header.finalThrough);   // still full: 1024 uncommitted markers above the HW, the leader re-marks
         }
-    } else if (type == cr::kConstraintSetChange) {
+    } else if (c->type == cr::kConstraintSetChange) {
         std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
         uint32_t id = 0;
         uint16_t count = 0;
-        if (!cr::parseConstraintSetChange(b, len, id, wire, count)) return;
+        if (!cr::parseConstraintSetChange(*c, id, wire, count)) return;
         ConstraintSet set;
         set.id = id;
         set.count = static_cast<uint8_t>(count);
@@ -204,7 +252,8 @@ bool VerdictSource::switchSet_(int64_t A, ReadRangeFn& readRange, const rune::vi
     for (const std::size_t i : scratchIdx_) {
         if (std::find(active_.begin(), active_.end(), i) != active_.end()) continue;   // staying
         Member& m = members_[i];
-        m.inst->foldCursor = std::max(m.inst->foldCursor, logStart_);   // retention deleted what a member that was never folded would read
+        if (!checkpointSettled(*m.inst)) return false;   // its old checkpoint is being backed up: it cannot join a set yet
+        if (!clampToLogStart_(m)) return false;   // retention deleted what this member folded from: it is being backed up and rebuilt
         if (m.inst->foldCursor < A + 1) {
             const rune::storage::LogReadView v = readRange(m.inst->foldCursor, A + 1);
             if (!v.empty()) work += replay_(m, v, A + 1, aborted);
@@ -233,13 +282,17 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     rejectedThisPass_ = 0;
     for (const std::size_t i : active_) {
         Member& m = members_[i];
-        m.inst->foldCursor = std::max(m.inst->foldCursor, logStart_);
+        if (!checkpointSettled(*m.inst)) continue;   // behind (below): the judge neither folds nor passes it
+        if (!clampToLogStart_(m)) continue;   // below the log start with rows: discarded, unsettled until the backup is acked
         if (m.inst->foldCursor >= judgeCursor_) continue;
-        const rune::storage::LogReadView v = readRange(m.inst->foldCursor, judgeCursor_);
+        // A read stops at the next segment base at or above its end: a compacted gap whose next segment starts at
+        // judgeCursor_ reads empty to judgeCursor_, and still to the bound when judgeCursor_ == bound.  So read to the
+        // bound and at least one past judgeCursor_.
+        const rune::storage::LogReadView v = readRange(m.inst->foldCursor, std::max(bound, judgeCursor_ + 1));
         if (!v.empty()) work += replay_(m, v, judgeCursor_, aborted);
     }
     bool behind = false;
-    for (const std::size_t i : active_) behind = behind || members_[i].inst->foldCursor < judgeCursor_;
+    for (const std::size_t i : active_) behind = behind || !checkpointSettled(*members_[i].inst) || members_[i].inst->foldCursor < judgeCursor_;
     const bool ready = activeSet_.count == active_.size() || reindex_();
     if (!ready) {
         waitForInstall_();

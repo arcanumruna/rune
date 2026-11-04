@@ -2,6 +2,7 @@
 // sweep invariants) and CheckedWriteHook::check on real record bytes.
 #include <rune/node/CheckedWriteHook.h>
 #include <rune/node/NamespaceLimitCheck.h>
+#include <rune/node/VerdictSource.h>
 
 #include "support/CheckedWritesBatches.h"
 
@@ -18,6 +19,7 @@ namespace {
 
 constexpr ErrorCode OK  = ErrorCode::OK;
 constexpr ErrorCode IR  = ErrorCode::InvalidRequest;
+constexpr ErrorCode NL  = ErrorCode::NotLeader;
 using H = HookRefusal;
 
 enum Shape { Plain, Reserved, InsertExplicit, Update, RemoveExisting, KeyZero, KeyZeroMixed, ManyPlain, ManyPlainOver };
@@ -44,7 +46,8 @@ constexpr WriteFacts F(uint8_t acks, bool idem, bool txn, bool atomic, bool lega
     f.acks = acks; f.idempotent = idem; f.transactional = txn; f.atomicBatch = atomic; f.legacyMode = legacy; f.levelCheckedWrites = level;
     return f;
 }
-constexpr TopicHookFacts T(bool keyIndex, bool autoInc, bool constrained, bool verdict) { return {keyIndex, autoInc, constrained, verdict}; }
+// `active` defaults to `keyIndex`: the 03 rows describe a key-index topic whose logged set already holds it.
+constexpr TopicHookFacts T(bool keyIndex, bool autoInc, bool constrained, bool verdict, int active = -1) { return {keyIndex, autoInc, constrained, verdict, active < 0 ? keyIndex : active != 0}; }
 
 struct Row { const char* why; Shape shape; WriteFacts f; TopicHookFacts t; ErrorCode code; H refusal; };
 
@@ -117,6 +120,13 @@ const std::vector<Row>& rows() {
         {"62 insert explicit, acks 3, idempotent, all topic facts", InsertExplicit, kIdemView, T(1,1,1,1), OK, H::None},
         {"63 reserved bits under legacy and no level", Reserved, F(3, true, true, true, true, false), T(1,1,1,1), IR, H::ReservedBits},
         {"64 plain acks 1 below the level", Plain, F(1, true, false, false, false, false), T(0,0,0,0), OK, H::None},
+        // Part 05 (P5-4): no intent is applied before the logged set holds the key index
+        {"65 insert explicit, acks 3, idempotent, key index not active: retriable", InsertExplicit, kIdemView, T(1,0,0,0,0), NL, H::KeyIndexActivating},
+        {"66 the same, not idempotent: the definite refusal first", InsertExplicit, F(3, false, false, false, false, true), T(1,0,0,0,0), IR, H::ExplicitKeyNeedsIdempotentAndView},
+        {"67 the same, key index active", InsertExplicit, kIdemView, T(1,0,0,0,1), OK, H::None},
+        {"68 plain, acks 1, key index not active: plain writes never wait (P5-12)", Plain, F(1, false, false, false, false, true), T(1,0,0,0,0), OK, H::None},
+        {"69 key-0 creates, definite refusal before the wait", KeyZero, F(0, true, false, false, false, true), T(1,1,0,0,0), IR, H::KeyZeroCreateNeedsIdempotentAll},
+        {"70 key-0 creates, key index not active", KeyZero, kIdemView, T(1,1,0,0,0), NL, H::KeyIndexActivating},
     };
     return r;
 }
@@ -130,11 +140,13 @@ static_assert(isRow(ManyPlainOver, kIdemView, T(0,0,0,1), IR, H::ViewBatchTooLar
 static_assert(isRow(Reserved, F(0, false, false, false, true, false), T(0,0,0,0), IR, H::ReservedBits));
 static_assert(isRow(KeyZero, F(1, true, false, false, false, true), T(1,1,0,0), OK, H::None));
 static_assert(isRow(KeyZero, F(1, true, false, false, false, true), T(1,1,1,0), IR, H::KeyZeroCreateNeedsView));
+static_assert(isRow(InsertExplicit, kIdemView, T(1,0,0,0,0), NL, H::KeyIndexActivating));
+static_assert(isRow(InsertExplicit, kIdemView, T(1,0,0,0,1), OK, H::None));
 
 }  // namespace
 
 TEST(CheckedWritesRequirementTable, PinnedRows) {
-    ASSERT_EQ(rows().size(), 64u);
+    ASSERT_EQ(rows().size(), 70u);
     for (const Row& r : rows()) {
         const auto v = evaluateRequirements(intentsOf(r.shape), r.f, r.t);
         EXPECT_EQ(v.code, r.code) << r.why;
@@ -154,10 +166,11 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         case 4: return false;                                                                                                      // import
         case 5: return h == H::LegacyMode;                                                                                         // legacy
         case 6: return h == H::LevelTooLow;                                                                                        // level
-        case 7: return h == H::NoKeyIndex;                                                                                         // keyIndex
+        case 7: return h == H::NoKeyIndex || h == H::KeyIndexActivating;                                                           // keyIndex
         case 8: return false;                                                                                                      // autoIncrement
         case 9: return h == H::TxnOnConstrainedSource || h == H::KeyZeroCreateNeedsView;                                           // constrained
-        default: return h == H::ViewBatchTooLarge;                                                                                 // verdict source
+        case 10: return h == H::ViewBatchTooLarge;                                                                                 // verdict source
+        default: return h == H::KeyIndexActivating;                                                                                // keyIndexActive
         }
     };
     const auto build = [](uint32_t m, WriteFacts& f, TopicHookFacts& t) {
@@ -165,7 +178,7 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         f.acks = m & 3; f.idempotent = m & 4; f.transactional = m & 8; f.atomicBatch = m & 16; f.importGranted = m & 32;
         f.legacyMode = m & 64; f.levelCheckedWrites = m & 128;
         t = {};
-        t.keyIndex = m & 256; t.autoIncrement = m & 512; t.constrainedSource = m & 1024; t.verdictSource = m & 2048;
+        t.keyIndex = m & 256; t.autoIncrement = m & 512; t.constrainedSource = m & 1024; t.verdictSource = m & 2048; t.keyIndexActive = m & 4096;
     };
     // Matrix B: every intent shape x reserved bits on / off x records {1, 4096, 4097} x the 12 facts (import included).
     const Shape shapes[] = {Plain, InsertExplicit, Update, RemoveExisting, KeyZero, KeyZeroMixed};
@@ -181,7 +194,8 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         case 7: return m ^ 256u;
         case 8: return m ^ 512u;
         case 9: return m ^ 1024u;
-        default: return m ^ 2048u;
+        case 10: return m ^ 2048u;
+        default: return m ^ 4096u;
         }
     };
     int cells = 0;
@@ -191,7 +205,7 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         BatchIntents b = intentsOf(s);
         b.reservedBits = reserved;
         b.records = records;
-        for (uint32_t m = 0; m < 4096; ++m) {
+        for (uint32_t m = 0; m < 8192; ++m) {
             WriteFacts f; TopicHookFacts t;
             build(m, f, t);
             const auto v = evaluateRequirements(b, f, t);
@@ -202,8 +216,8 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
             }
             if (b.reservedBits) ASSERT_EQ(v.why, H::ReservedBits) << "(ii)";
             if (!b.reservedBits && f.legacyMode && (b.anyIntent || view)) ASSERT_EQ(v.why, H::LegacyMode) << "(iii)";
-            if (v.code != OK) ASSERT_EQ(v.code, IR) << "(iv)";
-            for (int fact = 0; fact < 11; ++fact) {
+            if (v.code != OK) ASSERT_EQ(v.code, v.why == H::KeyIndexActivating ? NL : IR) << "(iv)";
+            for (int fact = 0; fact < 12; ++fact) {
                 WriteFacts f2; TopicHookFacts t2;
                 build(flip(m, fact), f2, t2);
                 const auto w = evaluateRequirements(b, f2, t2);
@@ -211,7 +225,7 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
             }
         }
     }
-    EXPECT_EQ(cells, 6 * 2 * 3 * 4096);
+    EXPECT_EQ(cells, 6 * 2 * 3 * 8192);
 }
 
 namespace {
@@ -331,6 +345,59 @@ TEST(CheckedWritesHook, AnyIntentIsRefusedUntilAKeyIndexExists) {
     HookRefusal why{};
     EXPECT_EQ(h.run(withAttrs({{validRecord(1), 1}}), &why), IR);
     EXPECT_EQ(why, H::NoKeyIndex);
+}
+
+namespace {
+ConstraintSet keyIndexSet() {
+    ConstraintSet set;
+    set.id = 1;
+    set.count = 1;
+    set.members[0] = ConstraintSetMember{0, rune::view::VerdictViewKind::KeyIndex, kKeyIndexPlanFingerprint};
+    return set;
+}
+}  // namespace
+
+TEST(CheckedWritesHook, TopicFactsTakeTheSpecAndTheLoggedSet) {
+    Hooked h;
+    EXPECT_FALSE(topicHookFactsOf(h.state).keyIndex);
+    EXPECT_FALSE(topicHookFactsOf(h.state).keyIndexActive);
+    h.spec.keyIndex = true;
+    EXPECT_TRUE(topicHookFactsOf(h.state).keyIndex);
+    EXPECT_FALSE(topicHookFactsOf(h.state).keyIndexActive) << "the spec alone is not the logged set";
+    h.state.constraintSets.onChange(7, keyIndexSet());
+    EXPECT_TRUE(topicHookFactsOf(h.state).keyIndexActive);
+    ConstraintSet other;
+    other.id = 2;
+    other.count = 1;
+    other.members[0] = ConstraintSetMember{5, rune::view::VerdictViewKind::TestReject, 1};
+    h.state.constraintSets.onChange(9, other);
+    EXPECT_FALSE(topicHookFactsOf(h.state).keyIndexActive) << "the key index is member 0 or the fact is false";
+}
+
+TEST(CheckedWritesHook, AnIntentWaitsForTheLoggedKeyIndexThenPasses) {
+    Hooked h;
+    h.spec.keyIndex = true;
+    HookRefusal why{};
+    const auto insert = withAttrs({{validRecord(1), 1}});
+    EXPECT_EQ(h.run(insert, &why), ErrorCode::NotLeader);
+    EXPECT_EQ(why, H::KeyIndexActivating);
+    EXPECT_EQ(h.run(withAttrs({{validRecord(1), 0}}), &why), OK) << "a plain upsert never waits";
+    h.state.constraintSets.onChange(7, keyIndexSet());
+    EXPECT_EQ(h.run(insert, &why), OK);
+    EXPECT_EQ(why, H::None);
+}
+
+TEST(CheckedWritesHook, InsertTombstoneIsReservedBits) {
+    Hooked h;
+    h.spec.keyIndex = true;
+    h.state.constraintSets.onChange(7, keyIndexSet());
+    Parts p;
+    p.tombstone = true;
+    HookRefusal why{};
+    EXPECT_EQ(h.run(withAttrs({{encode(p), 1}}), &why), IR);
+    EXPECT_EQ(why, H::ReservedBits) << "an insert needs a value";
+    EXPECT_EQ(h.run(withAttrs({{encode(p), 2}}), &why), OK) << "removeExisting is a tombstone with intent 2";
+    EXPECT_EQ(h.run(withAttrs({{encode(p), 0}}), &why), OK) << "a plain remove";
 }
 
 TEST(CheckedWritesHook, StageIsIdentityAndAssignedBaseIsZero) {

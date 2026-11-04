@@ -392,13 +392,9 @@ TEST(AggFoldRegression, MidBatchCursorSkipsAlreadyFoldedRecordsRegression) {
 // ---------------------------------------------------------------------------
 namespace {
 struct AbortedPid {   // every batch of `pid` is aborted
-    int64_t pid;
-    [[nodiscard]] rune::view::AbortedTxnFilter filter() const {
-        rune::view::AbortedTxnFilter f;
-        f.ctx = this;
-        f.fn  = [](const void* c, int64_t pid, int64_t) noexcept { return pid == static_cast<const AbortedPid*>(c)->pid; };
-        return f;
-    }
+    rune::transaction::AbortedTxnIndex idx;
+    explicit AbortedPid(int64_t pid) { idx.onAbortMarker(pid, 0, int64_t{1} << 40); }
+    [[nodiscard]] rune::view::AbortedTxnFilter filter() const { return rune::view::AbortedTxnFilter{&idx}; }
 };
 std::vector<uint8_t> orderBatchAt(int64_t base, const std::vector<std::pair<int64_t, std::vector<uint8_t>>>& recs,
                                   int64_t pid) {

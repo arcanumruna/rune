@@ -48,12 +48,17 @@
 //      driveFolds pass (driveRebuild is NEVER called again for this view) must
 //      still reach Ready and serve the fully-recovered row -- proving the
 //      Ready-flip no longer depends on driveRebuild/hasRecovery() either.
+#include <algorithm>
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <memory>
+#include <optional>
+#include <variant>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -68,7 +73,9 @@
 #include <rune/view/ViewRow.h>
 
 #include <rune/node/AdminChannels.h>
+#include <rune/node/ViewCheckpointScan.h>
 #include <rune/node/ViewSnapshotChannel.h>
+#include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/node/WorkerViewSet.h>
 
 namespace {
@@ -463,89 +470,889 @@ TEST(ViewRecoveryRegression, TwoOwnedPartitionsLazyRecoveryNeverServesHalfBuilt)
     std::filesystem::remove_all(dir, ec);
 }
 
-// Issue #537: a checkpoint written BEFORE the fold skipped aborted transactions
-// (the legacy "view-<id>-p<n>.delta" file) may hold aborted rows.  Recovery never
-// replays it: it removes it, cold-starts the instance (foldCursor 0) and re-folds
-// the view from the log — rows that live only in the legacy file are gone.
-TEST(ViewRecoveryRegression, LegacyCheckpointIsDiscardedAndTheViewRefoldsFromTheLogRegression) {
-    auto src = charSourceV1();
-    const rune::codec::Descriptor* srcs[] = {&src};
-    auto comp = rune::view::compileView(hpView(0), srcs, kViewId).value();
-    const std::string dir = uniqueDir("rune-view-legacy-");
-    // A legacy checkpoint at O=2 holding key 9 (as if folded from an aborted txn).
-    const auto legacyBase = makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(9, 10, 2, 0), 2);
-    const std::string legacy = rune::node::legacyViewCheckpointFilePath(dir, kViewId, 0);
-    { std::ofstream f(legacy, std::ios::binary); f.write(reinterpret_cast<const char*>(legacyBase.data()),
-                                                         static_cast<std::streamsize>(legacyBase.size())); }
+// ── View-backup discard (C2): a discard moves the checkpoint into backup/ through the IO agent, and the instance
+// folds nothing and serves NotReady until the agent acks.
+namespace {
 
-    rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, dir);
-    pushRecoveryInstall(channel, comp.plan, comp.outputDescriptor, src, /*persistence*/ 0);
-    EXPECT_EQ(vs.drainInstalls(), 1);
-    vs.materializeRecoveryInstancesFor(kSrcId, /*partition*/ 0, /*committedTail*/ 4);
-    EXPECT_FALSE(std::filesystem::exists(legacy)) << "the legacy checkpoint is removed";
-    EXPECT_EQ(vs.readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews) << "a cold start";
-
-    const auto log = upsertRun(7, 30, 4, /*baseOffset*/ 0);   // the committed log: key 7 only
-    int64_t firstFrom = -1;
-    auto readRange = [&](int64_t from, int64_t) -> rune::storage::LogReadView {
-        if (firstFrom < 0) firstFrom = from;
-        return rune::storage::LogReadView{log.data(), log.size(), 0, 4};
-    };
-    for (int i = 0; i < 64 && !vs.allViewsReady(); ++i)
-        vs.driveRebuild(kSrcId, 0, readRange, /*committedTail*/ 4, rune::view::kNoSkip, i);
-    ASSERT_TRUE(vs.allViewsReady());
-    EXPECT_EQ(firstFrom, 0) << "the re-fold starts at the log start";
-    const rune::view::RowLayout* L = nullptr;
-    EXPECT_EQ(vs.getRow(kViewId, 0, 9, L), nullptr) << "a row only the legacy checkpoint held is gone";
-    const uint8_t* row = vs.getRow(kViewId, 0, 7, L);
-    ASSERT_NE(row, nullptr);
-    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33);
-
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
+std::string slurpFile(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+void writeFile(const std::string& path, const std::vector<uint8_t>& b) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
 }
 
-// PR #589 adversarial review (#537, crash and restart / version skew): a data dir holding BOTH the legacy
-// checkpoint and the committed-fold one (an upgrade, a downgrade that wrote the legacy name again, and a second
-// upgrade).  Recovery loads only the committed-fold file, removes the legacy one, and resumes from the committed
-// file's offset — never a row of the legacy file.
-TEST(ViewRecoveryRegression, LegacyAndCommittedCheckpointsBothPresentLoadsOnlyTheCommittedAdversarialRegression) {
-    auto src = charSourceV1();
-    const rune::codec::Descriptor* srcs[] = {&src};
-    auto comp = rune::view::compileView(hpView(0), srcs, kViewId).value();
-    const std::string dir = uniqueDir("rune-view-legacy-both-");
-    const auto legacyBase = makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(9, 10, 2, 0), 2);
-    const auto committedBase = makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(7, 10, 2, 0), 2);
-    const std::string legacy = rune::node::legacyViewCheckpointFilePath(dir, kViewId, 0);
-    const std::string current = rune::node::viewCheckpointFilePath(dir, kViewId, 0);
-    { std::ofstream f(legacy, std::ios::binary); f.write(reinterpret_cast<const char*>(legacyBase.data()),
-                                                         static_cast<std::streamsize>(legacyBase.size())); }
-    { std::ofstream f(current, std::ios::binary); f.write(reinterpret_cast<const char*>(committedBase.data()),
-                                                          static_cast<std::streamsize>(committedBase.size())); }
+constexpr int kHardCap = 256;
 
+// A worker view set and a real IO agent sharing one channel and one data dir; the view holds a checkpoint at O=2.
+struct DiscardRig {
+    rune::codec::Descriptor src = charSourceV1();
+    rune::view::CompiledViewPlan plan;
+    rune::view::RowLayout layout;
+    rune::codec::Descriptor outDesc;
+    std::string dir;
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, dir);
-    pushRecoveryInstall(channel, comp.plan, comp.outputDescriptor, src, /*persistence*/ 0);
-    EXPECT_EQ(vs.drainInstalls(), 1);
-    vs.materializeRecoveryInstancesFor(kSrcId, /*partition*/ 0, /*committedTail*/ 4);
-    EXPECT_FALSE(std::filesystem::exists(legacy)) << "the legacy checkpoint is removed";
-    EXPECT_TRUE(std::filesystem::exists(current)) << "the committed-fold checkpoint is kept";
+    std::optional<rune::node::ViewSnapshotIoAgent> agent;
+    std::optional<rune::node::WorkerViewSet> vs;
+    std::vector<uint8_t> log = upsertRun(7, 30, 4, 0);   // committed log [logFrom,logTo): key 7 only
+    int64_t logFrom = 0, logTo = 4;
+    rune::node::SourceLogBounds bounds{};
+    int64_t now = 0;
 
-    const auto log = upsertRun(7, 30, 4, /*baseOffset*/ 0);
-    int64_t firstFrom = -1;
-    auto readRange = [&](int64_t from, int64_t) -> rune::storage::LogReadView {
-        if (firstFrom < 0) firstFrom = from;
-        return rune::storage::LogReadView{log.data(), log.size(), 0, 4};
-    };
-    for (int i = 0; i < 64 && !vs.allViewsReady(); ++i)
-        vs.driveRebuild(kSrcId, 0, readRange, /*committedTail*/ 4, rune::view::kNoSkip, i);
-    ASSERT_TRUE(vs.allViewsReady());
-    EXPECT_EQ(firstFrom, 2) << "the rebuild resumes at the committed-fold checkpoint's offset";
+    bool ownsDir = true;
+
+    // `reuseDir` non-null: a restart over an existing data dir (the dir is not removed on destruction).
+    DiscardRig(const char* stem, uint8_t persistence, rune::node::ViewBackupPolicy policy = {}, const std::string* reuseDir = nullptr) {
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto comp = rune::view::compileView(hpView(persistence), srcs, kViewId).value();
+        plan = comp.plan; layout = comp.rowLayout; outDesc = comp.outputDescriptor;
+        dir = reuseDir != nullptr ? *reuseDir : uniqueDir(stem);
+        ownsDir = reuseDir == nullptr;
+        agent.emplace(channel, dir, /*fsyncMs*/ 1, policy);
+        vs.emplace(channel, dir);
+        pushRecoveryInstall(channel, plan, outDesc, src, persistence);
+        EXPECT_EQ(vs->drainInstalls(), 1);
+    }
+    ~DiscardRig() { if (ownsDir) { std::error_code ec; std::filesystem::remove_all(dir, ec); } }
+
+    std::string ckptPath() const { return rune::node::viewCheckpointFilePath(dir, kViewId, 0); }
+    void writeCheckpoint(const std::vector<uint8_t>& srcBatch, int64_t foldTo) {
+        writeFile(ckptPath(), makeBaseCheckpoint(plan, layout, src, srcBatch, foldTo));
+    }
+    void materialize() { vs->materializeRecoveryInstancesFor(kSrcId, 0, logTo, bounds); }
+    auto readLog() {
+        return [this](int64_t from, int64_t) -> rune::storage::LogReadView {
+            if (from < logFrom) return {};
+            return rune::storage::LogReadView{log.data(), log.size(), logFrom, logTo};
+        };
+    }
+    void fold() { vs->driveFolds(kSrcId, 0, readLog(), logTo, rune::view::kNoSkip, now, nullptr, 0, true, {}, nullptr, nullptr, bounds); }
+    bool pumpUntilReady() {
+        for (int i = 0; i < kHardCap && vs->readiness(kViewId, 0) != rune::node::ViewReadiness::Ready; ++i) pump(1);
+        return vs->readiness(kViewId, 0) == rune::node::ViewReadiness::Ready;
+    }
+    // One worker pass plus one agent pass; capped.
+    void pump(int rounds = 8) {
+        for (int i = 0; i < rounds && i < kHardCap; ++i) {
+            now += 1'000'000'000;
+            agent->doWork(now);
+            vs->drainSnapshotAcks();
+            fold();
+        }
+    }
+    bool pumpUntilSettled() {
+        for (int i = 0; i < kHardCap; ++i) {
+            if (std::holds_alternative<rune::node::CheckpointLive>(*vs->checkpointStateForTest(kViewId, 0))) return true;
+            if (std::holds_alternative<rune::node::CheckpointDiscardFailed>(*vs->checkpointStateForTest(kViewId, 0))) return false;
+            pump(1);
+        }
+        return false;
+    }
+    rune::node::WorkerViewSet::RowStatus rowStatus(int64_t key) {
+        const rune::view::RowLayout* L = nullptr;
+        auto st = rune::node::WorkerViewSet::RowStatus::Ok;
+        (void)vs->getRow(kViewId, 0, key, L, &st);
+        return st;
+    }
+};
+
+} // namespace
+
+// W1: while the discard is un-acked the instance folds nothing and serves NotReady; the ack releases it, the old
+// checkpoint is in backup/ byte for byte, and the view then refolds to Ready from the log.
+TEST(ViewRecoveryRegression, DiscardBlocksFoldsUntilTheBackupIsAckedRegression) {
+    DiscardRig r("rune_t_1_w1-", 0);
+    r.writeCheckpoint(upsertRun(9, 10, 2, 0), 2);
+    const std::string before = slurpFile(r.ckptPath());
+    r.materialize();
+    ASSERT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews);
+
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    ASSERT_TRUE(std::holds_alternative<rune::node::CheckpointDiscardPending>(*r.vs->checkpointStateForTest(kViewId, 0)));
+
+    // The agent has not run: many worker passes fold nothing and never reach Ready.
+    for (int i = 0; i < 16; ++i) { r.now += 1000; r.fold(); r.vs->drainSnapshotAcks(); }
+    EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointDiscardPending>(*r.vs->checkpointStateForTest(kViewId, 0)));
+    EXPECT_NE(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    EXPECT_EQ(r.rowStatus(7), rune::node::WorkerViewSet::RowStatus::NotReady);
+    EXPECT_EQ(slurpFile(r.ckptPath()), before) << "the checkpoint is untouched until the agent runs";
+
+    ASSERT_TRUE(r.pumpUntilSettled());
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".ahead-of-log.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), before);
+    r.pump(8);
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
     const rune::view::RowLayout* L = nullptr;
-    EXPECT_EQ(vs.getRow(kViewId, 0, 9, L), nullptr) << "a legacy-only row was served";
-    ASSERT_NE(vs.getRow(kViewId, 0, 7, L), nullptr);
+    EXPECT_EQ(r.vs->getRow(kViewId, 0, 9, L), nullptr) << "a row only the discarded checkpoint held is gone";
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33);
+}
 
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
+// W2: a backup the agent cannot make leaves the instance NotReady and unrebuilt for the boot, with the checkpoint kept.
+TEST(ViewRecoveryRegression, BackupFailureLeavesTheViewNotReadyAndUnrebuiltRegression) {
+    DiscardRig r("rune_t_1_w2-", 0);
+    r.writeCheckpoint(upsertRun(9, 10, 2, 0), 2);
+    const std::string before = slurpFile(r.ckptPath());
+    { std::ofstream f(r.dir + "/backup"); f << "not a directory"; }   // backup/ cannot be made
+    r.materialize();
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::Unreadable));
+    EXPECT_FALSE(r.pumpUntilSettled());
+    const auto* failed = std::get_if<rune::node::CheckpointDiscardFailed>(r.vs->checkpointStateForTest(kViewId, 0));
+    ASSERT_NE(failed, nullptr);
+    EXPECT_EQ(failed->reason, rune::node::ViewDiscardReason::Unreadable);
+    EXPECT_NE(failed->err, 0);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->viewBackupFailures, 1u);
+    r.pump(32);
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews);
+    EXPECT_EQ(r.rowStatus(7), rune::node::WorkerViewSet::RowStatus::NotReady);
+    EXPECT_EQ(slurpFile(r.ckptPath()), before) << "the checkpoint is kept";
+}
+
+// W3: deltas already on the ring when the discard is raised belong to the old stream: they land in the backup.
+TEST(ViewRecoveryRegression, DeltasBeforeTheDiscardLandInTheBackupNotTheNewFileRegression) {
+    DiscardRig r("rune_t_1_w3-", 0);
+    r.materialize();                                   // no checkpoint: a cold start
+    r.now += 1000; r.fold();                            // folds [0,4) and pushes its delta
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    ASSERT_TRUE(r.pumpUntilSettled());
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    const std::string bytes = slurpFile(backups[0]);
+    ASSERT_FALSE(bytes.empty()) << "the old stream's delta is in the backup";
+    const auto recs = rune::node::splitViewCheckpointRecords(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+    EXPECT_FALSE(recs.empty());
+    EXPECT_EQ(rune::view::replay(*std::make_unique<rune::view::ViewTable>(r.layout, 16, 1u << 16), r.layout, {}, recs), 4);
+}
+
+// W3b: a delta HELD because the ring is full belongs to the old stream: the discard frame queues behind it, so the held
+// delta lands in the backup, never in the rebuilt file.
+TEST(ViewRecoveryRegression, HeldDeltaAtDiscardLandsInTheBackupRegression) {
+    DiscardRig r("rune_t_1_w3b-", 0);
+    r.materialize();
+    // Fill the deltas ring with frames of a type the agent skips, so the fold's delta cannot be pushed.
+    for (const std::size_t len : {std::size_t{4096}, std::size_t{256}, std::size_t{16}, std::size_t{0}})
+        for (int i = 0; i < 4096; ++i) {
+            const auto c = r.channel.deltas.tryClaim(99, len);
+            if (c < 0) break;
+            r.channel.deltas.commit(c);
+        }
+    r.now += 1000; r.fold();                            // folds [0,4); the delta stays held
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointDiscardOwed>(*r.vs->checkpointStateForTest(kViewId, 0)))
+        << "the held delta precedes the frame, so the frame cannot be sent while the ring is full";
+    ASSERT_TRUE(r.pumpUntilSettled());
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    const std::string bytes = slurpFile(backups[0]);
+    ASSERT_FALSE(bytes.empty()) << "the held delta is in the backup";
+    const auto recs = rune::node::splitViewCheckpointRecords(
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+    ASSERT_FALSE(recs.empty());
+    rune::view::ViewTable t(r.layout, 16, 1u << 16);
+    EXPECT_EQ(rune::view::replay(t, r.layout, {}, recs), 4);
+    r.pump(8);
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+}
+
+// B3: the backup's directory entry is fsynced before the checkpoint is unlinked (a crash after a reordered unlink must not
+// leave neither copy); the view dir is fsynced after the unlink.
+TEST(ViewBackupRegression, BackupDirIsDurableBeforeTheCheckpointIsUnlinkedRegression) {
+    DiscardRig r("rune_t_1_b3-", 0);
+    r.agent->recordFsyncLogForTest(true);
+    r.writeCheckpoint(upsertRun(7, 30, 2, 0), 2);
+    r.materialize();
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    ASSERT_TRUE(r.pumpUntilSettled());
+    const auto& log = r.agent->fsyncLogForTest();
+    const auto idx = [&](const char* tag) {
+        const auto it = std::find(log.begin(), log.end(), std::string(tag));
+        return it == log.end() ? std::ptrdiff_t{-1} : it - log.begin();
+    };
+    const std::ptrdiff_t unlinked = idx("unlink:view");
+    ASSERT_GE(unlinked, 0) << "the checkpoint was unlinked after its backup";
+    const std::ptrdiff_t backupDir = idx("backupDir");
+    ASSERT_GE(backupDir, 0);
+    EXPECT_LT(backupDir, unlinked) << "the backup dir must be durable before the original is unlinked";
+    const auto viewDir = std::find(log.begin() + unlinked, log.end(), std::string("viewDir"));
+    EXPECT_NE(viewDir, log.end()) << "the view dir is fsynced after the unlink";
+    EXPECT_EQ(rune::node::listViewBackups(r.dir, kViewId, 0).size(), 1u);
+}
+
+// W4: the agent orders backupDir fsync, viewDir fsync, then the ack; and a restart at each crash point (before the
+// link, after the link before the unlink, after the unlink) converges to the same rows.
+TEST(ViewRecoveryRegression, DiscardCrashPointsAllConvergeToTheRecomputedViewRegression) {
+    {
+        DiscardRig r("rune_t_1_w4a-", 0);
+        r.agent->recordFsyncLogForTest(true);
+        r.writeCheckpoint(upsertRun(7, 30, 2, 0), 2);
+        r.materialize();
+        ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+        ASSERT_TRUE(r.pumpUntilSettled());
+        const auto& log = r.agent->fsyncLogForTest();
+        ASSERT_GE(log.size(), 4u);
+        const std::size_t n = log.size();
+        EXPECT_EQ(log[n - 4], "backupDir");
+        EXPECT_EQ(log[n - 3], "unlink:view");
+        EXPECT_EQ(log[n - 2], "viewDir");
+        EXPECT_EQ(log[n - 1], "ack");
+    }
+    // crash point 0: only the checkpoint; 1: checkpoint and its backup link; 2: only the backup.
+    for (int point = 0; point < 3; ++point) {
+        DiscardRig r(("rune_t_1_w4b" + std::to_string(point) + "-").c_str(), 0);
+        const auto ckpt = makeBaseCheckpoint(r.plan, r.layout, r.src, upsertRun(7, 30, 2, 0), 2);
+        if (point < 2) writeFile(r.ckptPath(), ckpt);
+        if (point > 0) {
+            std::filesystem::create_directories(r.dir + "/backup");
+            writeFile(r.dir + "/backup/view-" + std::to_string(kViewId) + "-p0.0000000001.ahead-of-log.delta", ckpt);
+        }
+        r.materialize();
+        r.pump(16);
+        ASSERT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready) << "point " << point;
+        const rune::view::RowLayout* L = nullptr;
+        const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+        ASSERT_NE(row, nullptr) << "point " << point;
+        EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33) << "point " << point;
+    }
+}
+
+// W5: after the backup and refold the view equals a from-scratch recompute of the log.
+TEST(ViewRecoveryRegression, RebuiltViewEqualsRecomputeAfterADiscardRegression) {
+    DiscardRig r("rune_t_1_w5-", 0);
+    r.log = upsertRun(7, 30, 2, 0);
+    { auto more = upsertRun(8, 50, 2, 2); r.log.insert(r.log.end(), more.begin(), more.end()); }
+    r.writeCheckpoint(upsertRun(9, 1, 2, 0), 2);
+    r.materialize();
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    ASSERT_TRUE(r.pumpUntilSettled());
+    r.pump(8);
+    ASSERT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* a = r.vs->getRow(kViewId, 0, 7, L);
+    const uint8_t* b = r.vs->getRow(kViewId, 0, 8, L);
+    ASSERT_NE(a, nullptr); ASSERT_NE(b, nullptr);
+    EXPECT_EQ(rune::view::readSlot(a, *L, 1).i, 31);
+    EXPECT_EQ(rune::view::readSlot(b, *L, 1).i, 51);
+    EXPECT_EQ(r.vs->getRow(kViewId, 0, 9, L), nullptr);
+}
+
+// W6: a transient (in-memory) view resets in place without a frame and stays Live.
+TEST(ViewRecoveryRegression, NonPersistedDiscardResetsWithoutAFrameRegression) {
+    DiscardRig r("rune_t_1_w6-", 1);
+    r.materialize();
+    r.fold();
+    ASSERT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::AheadOfLog));
+    EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointLive>(*r.vs->checkpointStateForTest(kViewId, 0)));
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews);
+    r.pump(8);
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    EXPECT_TRUE(rune::node::listViewBackups(r.dir, kViewId, 0).empty());
+    EXPECT_EQ(r.agent->discardsForTest(), 0) << "no discard frame reached the agent";
+}
+
+// L1: a fresh view over a log whose start retention moved up to 100 starts at the log start and reaches Ready (before
+// the clamp it asked the log for offset 0 forever and never did).
+TEST(ViewRecoveryRegression, FreshViewOverATrimmedLogStartsAtLogStartRegression) {
+    DiscardRig r("rune_t_1_l1-", 0);
+    const auto trimmed = upsertRun(7, 30, 10, 100);   // offsets [100,110)
+    auto rd = [&](int64_t from, int64_t) -> rune::storage::LogReadView {
+        if (from < 100) return {};
+        return rune::storage::LogReadView{trimmed.data(), trimmed.size(), 100, 110};
+    };
+    r.vs->materializeRecoveryInstancesFor(kSrcId, 0, 110);
+    for (int i = 0; i < kHardCap && r.vs->readiness(kViewId, 0) != rune::node::ViewReadiness::Ready; ++i)
+        r.vs->driveFolds(kSrcId, 0, rd, 110, rune::view::kNoSkip, i, nullptr, 0, true, {}, nullptr, nullptr,
+                         rune::node::SourceLogBounds{100, 110});
+    ASSERT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->sourceRecordsTrimmed, 100u);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+    EXPECT_TRUE(rune::node::listViewBackups(r.dir, kViewId, 0).empty());
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 39);
+}
+
+// L2 (persisted): a checkpoint holding rows at O=2 while the log now starts at 5 is backed up (below-log-start) and the
+// view is rebuilt from the log start.
+TEST(ViewRecoveryRegression, CheckpointBelowTheLogStartIsBackedUpAndRebuiltRegression) {
+    DiscardRig r("rune_t_1_l2-", 0);
+    r.writeCheckpoint(upsertRun(9, 10, 2, 0), 2);
+    const std::string before = slurpFile(r.ckptPath());
+    const auto tail = upsertRun(7, 30, 4, 5);   // offsets [5,9)
+    auto rd = [&](int64_t from, int64_t) -> rune::storage::LogReadView {
+        if (from < 5) return {};
+        return rune::storage::LogReadView{tail.data(), tail.size(), 5, 9};
+    };
+    r.vs->materializeRecoveryInstancesFor(kSrcId, 0, 9);
+    for (int i = 0; i < kHardCap && r.vs->readiness(kViewId, 0) != rune::node::ViewReadiness::Ready; ++i) {
+        r.now += 1'000'000'000;
+        r.agent->doWork(r.now);
+        r.vs->drainSnapshotAcks();
+        r.vs->driveFolds(kSrcId, 0, rd, 9, rune::view::kNoSkip, r.now, nullptr, 0, true, {}, nullptr, nullptr,
+                         rune::node::SourceLogBounds{5, 9});
+    }
+    ASSERT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".below-log-start.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), before);
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_EQ(r.vs->getRow(kViewId, 0, 9, L), nullptr);
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33);
+}
+
+// L3: a transient source is reconciled by its own ring bounds and is never clamped or discarded by the disk-log rule.
+TEST(ViewRecoveryRegression, TransientSourceIsNeverClampedRegression) {
+    DiscardRig r("rune_t_1_l3-", 1);
+    r.materialize();
+    r.fold();
+    const int64_t cursor = r.vs->instanceServeState(kViewId, 0).foldCursor;
+    ASSERT_GT(cursor, 0);
+    rune::node::TransientBounds tb;
+    tb.logStart = 0; tb.logEnd = 4;
+    r.vs->driveFolds(kSrcId, 0, r.readLog(), 4, rune::view::kNoSkip, 0, &tb, 0, true, {}, nullptr, nullptr,
+                     rune::node::SourceLogBounds{1000, 2000});
+    EXPECT_EQ(r.vs->instanceServeState(kViewId, 0).foldCursor, cursor);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+}
+
+// ── C4 (#590): recovery never deletes a checkpoint file; legacy and unreadable ones are backed up, then rebuilt.
+namespace {
+std::vector<uint8_t> legacyBytesOf(const DiscardRig& r) {   // a legacy checkpoint at O=2 holding key 9
+    return makeBaseCheckpoint(r.plan, r.layout, r.src, upsertRun(9, 10, 2, 0), 2);
+}
+void expectRowsOfTheLog(DiscardRig& r) {   // key 7 at hp 33, key 9 (only in the discarded files) gone
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_EQ(r.vs->getRow(kViewId, 0, 9, L), nullptr);
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33);
+}
+}  // namespace
+
+// R1 (#537/#590): a legacy checkpoint is never loaded and never deleted: the agent moves it into backup/ (reason legacy),
+// and the view refolds from the log.
+TEST(ViewRecoveryRegression, LegacyCheckpointIsBackedUpAndTheViewRefoldsFromTheLogRegression) {
+    DiscardRig r("rune_t_1_r1-", 0);
+    const auto legacy = legacyBytesOf(r);
+    const std::string legacyPath = rune::node::legacyViewCheckpointFilePath(r.dir, kViewId, 0);
+    writeFile(legacyPath, legacy);
+    r.materialize();
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews) << "a cold start";
+    ASSERT_TRUE(r.pumpUntilReady());
+    EXPECT_FALSE(std::filesystem::exists(legacyPath));
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".legacy.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), std::string(legacy.begin(), legacy.end()));
+    expectRowsOfTheLog(r);
+}
+
+// R2: a legacy file next to a committed one: the committed rows are served with no refold, the legacy file is backed up
+// as legacy-superseded and no rebuild happens.
+TEST(ViewRecoveryRegression, LegacyAndCommittedCheckpointsBothPresentKeepsTheCommittedAndBacksUpTheLegacyAdversarialRegression) {
+    DiscardRig r("rune_t_1_r2-", 0);
+    const auto legacy = legacyBytesOf(r);
+    const std::string legacyPath = rune::node::legacyViewCheckpointFilePath(r.dir, kViewId, 0);
+    writeFile(legacyPath, legacy);
+    r.writeCheckpoint(upsertRun(7, 10, 2, 0), 2);   // committed at O=2: key 7 hp 11
+    r.materialize();
+    EXPECT_EQ(r.vs->instanceServeState(kViewId, 0).foldCursor, 2) << "resumes at the committed file's offset, no refold";
+    ASSERT_TRUE(r.pumpUntilReady());
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+    EXPECT_FALSE(std::filesystem::exists(legacyPath));
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".legacy-superseded.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), std::string(legacy.begin(), legacy.end()));
+    expectRowsOfTheLog(r);   // committed rows folded forward over the log tail; the legacy-only key is absent
+}
+
+// A fire-and-forget legacy-superseded frame can be in flight next to a real discard of the same instance.  Its ack must
+// never be taken for the real discard's: otherwise the view rebuilds before its own backup is done, and a real backup
+// failure is dropped (rows lost, no backup, no DiscardFailed).
+namespace {
+struct SupersededNextToRealDiscard {
+    DiscardRig r;
+    std::vector<uint8_t> legacy;
+    explicit SupersededNextToRealDiscard(const char* stem) : r(stem, 0) {
+        legacy = legacyBytesOf(r);
+        writeFile(rune::node::legacyViewCheckpointFilePath(r.dir, kViewId, 0), legacy);
+        r.writeCheckpoint(upsertRun(7, 10, 2, 0), 2);
+        r.materialize();   // CommittedAndLegacy: the LegacySuperseded frame is on the ring, the agent has not run
+        EXPECT_TRUE(r.vs->beginDiscardForTest(kViewId, 0, rune::node::ViewDiscardReason::Unreadable));
+        EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointDiscardPending>(*r.vs->checkpointStateForTest(kViewId, 0)));
+    }
+};
+}  // namespace
+
+TEST(ViewBackupRegression, SupersededLegacyAckNeverCompletesTheRealDiscardAdversarialRegression) {
+    SupersededNextToRealDiscard t("rune_t_1_sl1-");
+    DiscardRig& r = t.r;
+    r.agent->failNthDiscardForTest(2);   // frame 1 = legacy-superseded (succeeds), frame 2 = the real unreadable discard (fails)
+    r.pump(8);
+    const auto* failed = std::get_if<rune::node::CheckpointDiscardFailed>(r.vs->checkpointStateForTest(kViewId, 0));
+    ASSERT_NE(failed, nullptr) << "the real discard's failure must not be swallowed by the legacy ack";
+    EXPECT_EQ(failed->reason, rune::node::ViewDiscardReason::Unreadable);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->viewBackupFailures, 1u);
+    EXPECT_EQ(r.rowStatus(7), rune::node::WorkerViewSet::RowStatus::NotReady);
+    EXPECT_NE(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+}
+
+TEST(ViewBackupRegression, SupersededLegacyAckThenRealAckRebuildsOnlyAfterTheRealOneAdversarialRegression) {
+    SupersededNextToRealDiscard t("rune_t_1_sl2-");
+    DiscardRig& r = t.r;
+    r.now += 1'000'000'000;
+    r.agent->doWork(r.now);   // handles both frames, posts both acks
+    EXPECT_EQ(r.agent->discardsForTest(), 2);
+    r.vs->drainSnapshotAcks(1);   // the legacy-superseded ack only
+    EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointDiscardPending>(*r.vs->checkpointStateForTest(kViewId, 0)))
+        << "the legacy ack must not release the real discard";
+    EXPECT_EQ(r.rowStatus(7), rune::node::WorkerViewSet::RowStatus::NotReady);
+    r.vs->drainSnapshotAcks(1);   // the unreadable ack
+    EXPECT_TRUE(std::holds_alternative<rune::node::CheckpointLive>(*r.vs->checkpointStateForTest(kViewId, 0)));
+    ASSERT_TRUE(r.pumpUntilReady());
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 2u);
+    EXPECT_NE(backups[0].find(".legacy-superseded.delta"), std::string::npos) << backups[0];
+    EXPECT_NE(backups[1].find(".unreadable.delta"), std::string::npos) << backups[1];
+    expectRowsOfTheLog(r);
+}
+
+// R3 (the #590 repro): a legacy file over a log retention trimmed to 2: the view is backed up and rebuilt from what remains.
+TEST(ViewRecoveryRegression, LegacyOverATrimmedLogIsBackedUpThenRebuiltFromWhatRemainsRegression) {
+    DiscardRig r("rune_t_1_r3-", 0);
+    writeFile(rune::node::legacyViewCheckpointFilePath(r.dir, kViewId, 0), legacyBytesOf(r));
+    r.log = upsertRun(7, 30, 2, 2);          // offsets [2,4)
+    r.logFrom = 2; r.logTo = 4;
+    r.bounds = rune::node::SourceLogBounds{2, 4};
+    r.materialize();
+    ASSERT_TRUE(r.pumpUntilReady());
+    EXPECT_EQ(r.vs->instanceServeState(kViewId, 0).foldCursor, 4);
+    EXPECT_EQ(rune::node::listViewBackups(r.dir, kViewId, 0).size(), 1u);
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_EQ(r.vs->getRow(kViewId, 0, 9, L), nullptr);
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 31);
+}
+
+namespace {
+// R4-R6: a committed file that does not replay cleanly is backed up byte for byte (reason unreadable), the view is rebuilt
+// from the log, and new deltas start a fresh file.
+void expectUnreadableCheckpointIsBackedUpAndRebuilt(const char* stem, const std::vector<uint8_t>& corrupt) {
+    DiscardRig r(stem, 0);
+    writeFile(r.ckptPath(), corrupt);
+    r.materialize();
+    ASSERT_TRUE(r.pumpUntilReady());
+    r.pump(8);
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".unreadable.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), std::string(corrupt.begin(), corrupt.end()));
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointDiscards, 1u);
+    expectRowsOfTheLog(r);
+    const std::string fresh = slurpFile(r.ckptPath());
+    ASSERT_FALSE(fresh.empty()) << "the rebuilt view checkpoints into a fresh file";
+    const std::vector<uint8_t> freshBytes(fresh.begin(), fresh.end());
+    const auto recs = rune::node::splitViewCheckpointRecords(freshBytes);
+    ASSERT_FALSE(recs.empty());
+    rune::view::ViewTable t(r.layout, 16, 1u << 16);
+    EXPECT_EQ(rune::view::replay(t, r.layout, {}, recs), 4) << "the first frame of the fresh file is a base the replay accepts";
+}
+}  // namespace
+
+TEST(ViewRecoveryRegression, CorruptBaseRecordIsBackedUpThenRebuiltRegression) {
+    DiscardRig probe("rune_t_1_r4p-", 0);
+    auto base = makeBaseCheckpoint(probe.plan, probe.layout, probe.src, upsertRun(9, 10, 2, 0), 2);
+    base[base.size() / 2] ^= 0xFF;
+    expectUnreadableCheckpointIsBackedUpAndRebuilt("rune_t_1_r4-", base);
+}
+
+TEST(ViewRecoveryRegression, CorruptThirdOfFiveRecordsIsBackedUpThenRebuiltRegression) {
+    DiscardRig probe("rune_t_1_r5p-", 0);
+    std::vector<uint8_t> file;
+    for (int i = 0; i < 5; ++i) {
+        auto rec = makeBaseCheckpoint(probe.plan, probe.layout, probe.src, upsertRun(9, 10 + i, 2, 0), 2 + i);
+        if (i == 2) rec[rec.size() / 2] ^= 0xFF;
+        file.insert(file.end(), rec.begin(), rec.end());
+    }
+    expectUnreadableCheckpointIsBackedUpAndRebuilt("rune_t_1_r5-", file);
+}
+
+TEST(ViewRecoveryRegression, SevenByteGarbageCheckpointIsBackedUpThenRebuiltRegression) {
+    expectUnreadableCheckpointIsBackedUpAndRebuilt("rune_t_1_r6-", std::vector<uint8_t>{1, 2, 3, 4, 5, 6, 7});
+}
+
+
+// ── C7: a torn checkpoint tail is repaired (truncated by the IO agent before its first append), never appended after.
+namespace {
+// One v1 (or v2) checkpoint record at offset O with `entries` upsert entries of a 8-byte row.
+std::vector<uint8_t> scanRec(bool v2, int64_t O, int entries = 2) {
+    uint8_t row[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    std::vector<rune::view::DirtyEntry> es;
+    for (int i = 0; i < entries; ++i) es.push_back(rune::view::DirtyEntry{static_cast<uint32_t>(i), false, static_cast<uint64_t>(100 + i), row});
+    std::vector<uint8_t> out;
+    if (v2) {
+        const rune::view::TableDelta tds[] = {{0, 8, {es.data(), es.size()}}, {1, 8, {es.data(), es.size()}}};
+        rune::view::encodeMultiDelta(tds, O, out);
+    } else {
+        rune::view::encodeDelta(std::span<const rune::view::DirtyEntry>(es.data(), es.size()), O, 8, out);
+    }
+    return out;
+}
+std::vector<uint8_t> cat(std::initializer_list<std::vector<uint8_t>> parts) {
+    std::vector<uint8_t> out;
+    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+std::vector<uint8_t> prefixOf(const std::vector<uint8_t>& v, std::size_t k) { return {v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k)}; }
+}  // namespace
+
+TEST(ViewCheckpointTailRegression, ScanClassifiesEveryTruncationOffsetAsTornTailRegression) {
+    using namespace rune::node;
+    for (const bool v2 : {false, true}) {
+        const auto r1 = scanRec(v2, 10), r2 = scanRec(v2, 20), r3 = scanRec(v2, 30);
+        const auto file = cat({r1, r2, r3});
+        const std::size_t start2 = r1.size(), start3 = r1.size() + r2.size();
+        SCOPED_TRACE(v2 ? "v2" : "v1");
+        for (std::size_t cut = start3 + 1; cut < file.size(); ++cut) {
+            const auto scan = scanViewCheckpoint(prefixOf(file, cut));
+            const auto* torn = std::get_if<ViewCheckpointTornTail>(&scan.tail);
+            ASSERT_NE(torn, nullptr) << "cut=" << cut;
+            EXPECT_EQ(torn->cleanLen, start3) << "cut=" << cut;
+            EXPECT_EQ(scan.records.size(), 2u) << "cut=" << cut;
+        }
+        {   // intact
+            const auto scan = scanViewCheckpoint(file);
+            EXPECT_TRUE(std::holds_alternative<ViewCheckpointClean>(scan.tail));
+            EXPECT_EQ(scan.records.size(), 3u);
+        }
+        {   // zero-filled extent after rec2
+            auto z = cat({r1, r2});
+            z.resize(z.size() + 4096, 0);
+            const auto scan = scanViewCheckpoint(z);
+            const auto* torn = std::get_if<ViewCheckpointTornTail>(&scan.tail);
+            ASSERT_NE(torn, nullptr);
+            EXPECT_EQ(torn->cleanLen, start3);
+            EXPECT_EQ(scan.records.size(), 2u);
+        }
+        {   // one CRC byte flipped in rec2
+            auto f = file;
+            f[start3 - 1] ^= 0x5A;
+            const auto scan = scanViewCheckpoint(f);
+            const auto* bad = std::get_if<ViewCheckpointCorrupt>(&scan.tail);
+            ASSERT_NE(bad, nullptr);
+            EXPECT_EQ(bad->cleanLen, start2);
+            EXPECT_EQ(scan.records.size(), 1u);
+        }
+        for (const std::size_t k : {std::size_t{13}, r3.size() - 1}) {   // the bug's on-disk shape: torn rec3, then a whole rec4
+            const auto bugShape = cat({r1, r2, prefixOf(r3, k), scanRec(v2, 40)});
+            const auto scan = scanViewCheckpoint(bugShape);
+            const auto* bad = std::get_if<ViewCheckpointCorrupt>(&scan.tail);
+            ASSERT_NE(bad, nullptr) << "k=" << k;
+            EXPECT_EQ(bad->cleanLen, start3);
+        }
+        {   // the same shape where the torn record is much longer than prefix + rec4: the walk runs out of bytes, yet a whole
+            // valid record follows -- truncating would drop it
+            const auto big = scanRec(v2, 30, 60);
+            const auto bugShape = cat({r1, r2, prefixOf(big, 40), scanRec(v2, 40, 1)});
+            const auto scan = scanViewCheckpoint(bugShape);
+            const auto* bad = std::get_if<ViewCheckpointCorrupt>(&scan.tail);
+            ASSERT_NE(bad, nullptr) << "a complete valid record after the torn bytes must classify Corrupt";
+            EXPECT_EQ(bad->cleanLen, start3);
+        }
+        {   // unknown non-zero magic
+            auto f = cat({r1});
+            for (const uint8_t b : {0xEF, 0xBE, 0xAD, 0xDE}) f.push_back(b);
+            const auto scan = scanViewCheckpoint(f);
+            const auto* bad = std::get_if<ViewCheckpointCorrupt>(&scan.tail);
+            ASSERT_NE(bad, nullptr);
+            EXPECT_EQ(bad->cleanLen, r1.size());
+        }
+    }
+}
+
+namespace {
+// A restart over `dir` (same data dir, fresh worker and agent).
+std::unique_ptr<DiscardRig> bootOver(const std::string& dir, std::vector<uint8_t> log, int64_t logFrom, int64_t logTo) {
+    auto r = std::make_unique<DiscardRig>("rune_t_c7-", 0, rune::node::ViewBackupPolicy{}, &dir);
+    r->log = std::move(log);
+    r->logFrom = logFrom; r->logTo = logTo;
+    r->bounds = rune::node::SourceLogBounds{logFrom, logTo};
+    return r;
+}
+bool pumpUntilDurable(DiscardRig& r, int64_t O) {
+    for (int i = 0; i < kHardCap && r.agent->lastDurableOffset(kViewId, 0) < O; ++i) r.pump(1);
+    return r.agent->lastDurableOffset(kViewId, 0) >= O;
+}
+void appendBytes(const std::string& path, const std::vector<uint8_t>& b) {
+    std::ofstream f(path, std::ios::binary | std::ios::app);
+    f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+}
+// Boot 1 folds [0,4) durably, then the file is torn the way a crash between fdatasyncs leaves it.
+std::string bootOneThenTear(const char* stem, std::string& dirOut) {
+    DiscardRig r1(stem, 0);
+    dirOut = r1.dir;
+    r1.ownsDir = false;
+    r1.materialize();
+    EXPECT_TRUE(r1.pumpUntilReady());
+    EXPECT_TRUE(pumpUntilDurable(r1, 4));
+    const auto rec5 = makeBaseCheckpoint(r1.plan, r1.layout, r1.src, upsertRun(7, 30, 5, 0), 5);
+    appendBytes(r1.ckptPath(), prefixOf(rec5, 9));
+    return r1.ckptPath();
+}
+}  // namespace
+
+// The bug repro (silent loss): without the trim, boot 2 appends after the torn bytes and boot 3 recovers at the tear.
+TEST(ViewCheckpointTailRegression, TornTailRestartKeepsEveryLaterDeltaRegression) {
+    std::string dir;
+    bootOneThenTear("rune_t_c7_t4-", dir);
+    {   // boot 2
+        auto r = bootOver(dir, upsertRun(7, 30, 8, 0), 0, 8);
+        r->materialize();
+        EXPECT_EQ(r->vs->instanceServeState(kViewId, 0).foldCursor, 4) << "recovers at the last whole record";
+        ASSERT_TRUE(r->pumpUntilReady());
+        ASSERT_TRUE(pumpUntilDurable(*r, 8));
+        EXPECT_EQ(r->agent->tailTrimsForTest(), 1);
+    }
+    {   // boot 3
+        auto r = bootOver(dir, upsertRun(7, 30, 8, 0), 0, 8);
+        r->materialize();
+        EXPECT_EQ(r->vs->instanceServeState(kViewId, 0).foldCursor, 8) << "every delta written after the tear is reachable";
+        EXPECT_EQ(r->vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+        EXPECT_TRUE(rune::node::listViewBackups(dir, kViewId, 0).empty());
+        EXPECT_EQ(r->vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+        const rune::view::RowLayout* L = nullptr;
+        const uint8_t* row = r->vs->getRow(kViewId, 0, 7, L);
+        ASSERT_NE(row, nullptr);
+        EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 37);
+    }
+    std::error_code ec; std::filesystem::remove_all(dir, ec);
+}
+
+TEST(ViewCheckpointTailRegression, TornTailRestartOverATrimmedLogNeedsNoRebuildRegression) {
+    std::string dir;
+    bootOneThenTear("rune_t_c7_t5-", dir);
+    {
+        auto r = bootOver(dir, upsertRun(7, 30, 8, 0), 0, 8);
+        r->materialize();
+        ASSERT_TRUE(r->pumpUntilReady());
+        ASSERT_TRUE(pumpUntilDurable(*r, 8));
+    }
+    {   // retention trimmed the log to [6,8) before boot 3
+        auto r = bootOver(dir, upsertRun(7, 36, 2, 6), 6, 8);
+        r->materialize();
+        ASSERT_TRUE(r->pumpUntilReady());
+        EXPECT_EQ(r->vs->instanceServeState(kViewId, 0).foldCursor, 8);
+        EXPECT_EQ(r->vs->foldCounters(kViewId, 0)->sourceRecordsTrimmed, 0u);
+        EXPECT_EQ(r->vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+        EXPECT_TRUE(rune::node::listViewBackups(dir, kViewId, 0).empty());
+        const rune::view::RowLayout* L = nullptr;
+        const uint8_t* row = r->vs->getRow(kViewId, 0, 7, L);
+        ASSERT_NE(row, nullptr);
+        EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 37);
+    }
+    std::error_code ec; std::filesystem::remove_all(dir, ec);
+}
+
+// A file already broken by the bug (torn record, then a whole later one) is Corrupt: backed up byte for byte, rebuilt.
+TEST(ViewCheckpointTailRegression, FieldFileBrokenByTheBugIsBackedUpThenRebuiltRegression) {
+    DiscardRig r("rune_t_c7_t6-", 0);
+    const auto rec2 = makeBaseCheckpoint(r.plan, r.layout, r.src, upsertRun(7, 30, 2, 0), 2);
+    const auto rec3 = makeBaseCheckpoint(r.plan, r.layout, r.src, upsertRun(7, 30, 3, 0), 3);
+    const auto rec4 = makeBaseCheckpoint(r.plan, r.layout, r.src, upsertRun(7, 30, 4, 0), 4);
+    const auto broken = cat({rec2, prefixOf(rec3, 13), rec4});
+    writeFile(r.ckptPath(), broken);
+    r.materialize();
+    ASSERT_TRUE(r.pumpUntilReady());
+    r.pump(8);
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".unreadable.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), std::string(broken.begin(), broken.end()));
+    expectRowsOfTheLog(r);
+    const std::string now = slurpFile(r.ckptPath());
+    const auto scan = rune::node::scanViewCheckpoint({reinterpret_cast<const uint8_t*>(now.data()), now.size()});
+    EXPECT_TRUE(std::holds_alternative<rune::node::ViewCheckpointClean>(scan.tail));
+    EXPECT_FALSE(scan.records.empty()) << "the new file starts with a valid record";
+}
+
+
+// ── C5 (#159): a checkpoint whose offset is above the source log end is backed up and rebuilt, never served.
+namespace {
+// 20 source records: key 7 at offsets [0,12), key 9 at [12,20).  The log the rig holds is only the first 12 (key 7).
+std::vector<uint8_t> twentyRecordsKey7ThenKey9() {
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    for (int i = 0; i < 20; ++i) {
+        const int64_t key = i < 12 ? 7 : 9;
+        const auto k = keyBytes(key);
+        const auto v = encodeCharacter(key, 30 + i, 1);
+        b.append(asSv(k), asSv(v), 0);
+    }
+    return b.build();
+}
+void rigOverTwelveRecordLog(DiscardRig& r) {
+    r.log = upsertRun(7, 30, 12, 0);
+    r.logFrom = 0; r.logTo = 12;
+    r.bounds = rune::node::SourceLogBounds{0, 12};
+}
+void expectAheadOfLogRecovered(DiscardRig& r, const std::string& before) {
+    ASSERT_TRUE(r.pumpUntilReady());
+    r.pump(4);
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".ahead-of-log.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurpFile(backups[0]), before);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointsAheadOfLog, 1u);
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_EQ(r.vs->getRow(kViewId, 0, 9, L), nullptr) << "a row only the future checkpoint held is not served";
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 41);   // the recompute of [0,12): hp 30..41
+    EXPECT_EQ(r.vs->instanceServeState(kViewId, 0).foldCursor, 12);
+}
+}  // namespace
+
+TEST(ViewBackupRegression, CheckpointAheadOfTheLogIsBackedUpThenRebuiltRegression) {
+    DiscardRig r("rune_t_c5_a1-", 0);
+    rigOverTwelveRecordLog(r);
+    r.writeCheckpoint(twentyRecordsKey7ThenKey9(), 20);
+    const std::string before = slurpFile(r.ckptPath());
+    r.materialize();
+    EXPECT_NE(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready) << "never Ready on rows from records the log does not have";
+    expectAheadOfLogRecovered(r, before);
+}
+
+// The same, for an instance created lazily by the first fold pass (recovery ran without bounds): the driveView_ check catches it.
+TEST(ViewBackupRegression, LazilyRecoveredCheckpointAheadOfTheLogIsBackedUpThenRebuiltRegression) {
+    DiscardRig r("rune_t_c5_a1b-", 0);
+    rigOverTwelveRecordLog(r);
+    r.writeCheckpoint(twentyRecordsKey7ThenKey9(), 20);
+    const std::string before = slurpFile(r.ckptPath());
+    r.fold();   // no materialize: getOrCreate_ loads the checkpoint without bounds
+    expectAheadOfLogRecovered(r, before);
+}
+
+// O == logEnd is a caught-up checkpoint: nothing to discard, Ready at once.
+TEST(ViewBackupRegression, CheckpointAtTheLogEndIsKeptRegression) {
+    DiscardRig r("rune_t_c5_a2-", 0);
+    r.writeCheckpoint(upsertRun(7, 30, 4, 0), 4);
+    r.bounds = rune::node::SourceLogBounds{0, 4};
+    r.materialize();
+    EXPECT_EQ(r.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    r.fold();
+    r.pump(4);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointsAheadOfLog, 0u);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+    EXPECT_TRUE(rune::node::listViewBackups(r.dir, kViewId, 0).empty());
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33);
+}
+
+// O == logEnd + 1 is the boundary: one record the log never held.
+TEST(ViewBackupRegression, CheckpointOneAboveTheLogEndIsDiscardedRegression) {
+    DiscardRig r("rune_t_c5_a3-", 0);
+    r.writeCheckpoint(upsertRun(7, 30, 5, 0), 5);
+    const std::string before = slurpFile(r.ckptPath());
+    r.bounds = rune::node::SourceLogBounds{0, 4};
+    r.materialize();
+    ASSERT_TRUE(r.pumpUntilReady());
+    r.pump(4);
+    EXPECT_EQ(r.vs->foldCounters(kViewId, 0)->checkpointsAheadOfLog, 1u);
+    const auto backups = rune::node::listViewBackups(r.dir, kViewId, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_EQ(slurpFile(backups[0]), before);
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = r.vs->getRow(kViewId, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 33) << "the rebuild folds [0,4) only";
+}
+
+// ── Batch 1 adversarial pass: backup-then-rebuild, crash at every durable step, with the RUNE_VIEW_BACKUP knob on and off.
+// A checkpoint ahead of a 12-record log (O = 20, it holds key 9 the log never had) is discarded; the node crashes at each
+// durable step of the discard and of the rebuild, and boots again over the same data dir.  Every boot converges to the
+// recompute of the log (key 7 = 41, key 9 absent, cursor 12); with the knob on the old checkpoint survives in backup/ byte for
+// byte, with it off no backup is ever made and a backup left by an earlier run is neither used nor pruned; a boot after the
+// rebuild finished never discards again.
+TEST(ViewBackupRegression, CrashAtEveryDiscardStepConvergesWithTheKnobOnAndOffAdversarialRegression) {
+    // 0: before the discard (only the checkpoint); 1: after the backup link and its dir fsync, before the unlink (both);
+    // 2: after the unlink, before the ack (only the backup); 3: after the whole rebuild, durable at 12 (the refolded checkpoint).
+    for (const bool knob : {true, false}) {
+        for (int point = 0; point < 4; ++point) {
+            SCOPED_TRACE(std::string("knob ") + (knob ? "on" : "off") + " point " + std::to_string(point));
+            const auto dir = (std::filesystem::temp_directory_path() /
+                              ("rune_t_adv_bk-" + std::to_string(::getpid()) + "-" + std::to_string(knob) + std::to_string(point))).string();
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+            std::filesystem::create_directories(dir);
+            const rune::node::ViewBackupPolicy policy{knob, 3};
+            std::string before;
+            std::size_t backupsBefore = 0;
+            {   // boot 1: lay the crash state down
+                DiscardRig r1("unused", 0, policy, &dir);
+                rigOverTwelveRecordLog(r1);
+                r1.writeCheckpoint(twentyRecordsKey7ThenKey9(), 20);
+                before = slurpFile(r1.ckptPath());
+                const std::string bk = dir + "/backup/view-" + std::to_string(kViewId) + "-p0.0000000001.ahead-of-log.delta";
+                if (point == 1 || point == 2) {
+                    std::filesystem::create_directories(dir + "/backup");
+                    std::filesystem::create_hard_link(r1.ckptPath(), bk);
+                    if (point == 2) std::filesystem::remove(r1.ckptPath());
+                } else if (point == 3) {
+                    r1.materialize();
+                    ASSERT_TRUE(r1.pumpUntilReady());
+                    ASSERT_TRUE(pumpUntilDurable(r1, 12));
+                }
+                backupsBefore = rune::node::listViewBackups(dir, kViewId, 0).size();
+            }
+            {   // boot 2 over the same dir
+                DiscardRig r2("unused", 0, policy, &dir);
+                rigOverTwelveRecordLog(r2);
+                r2.materialize();
+                ASSERT_TRUE(r2.pumpUntilReady());
+                r2.pump(4);
+                const rune::view::RowLayout* L = nullptr;
+                EXPECT_EQ(r2.vs->getRow(kViewId, 0, 9, L), nullptr) << "a row only the future checkpoint held is never served";
+                const uint8_t* row = r2.vs->getRow(kViewId, 0, 7, L);
+                ASSERT_NE(row, nullptr);
+                EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 41) << "the recompute of [0,12)";
+                EXPECT_EQ(r2.vs->instanceServeState(kViewId, 0).foldCursor, 12);
+                const auto backups = rune::node::listViewBackups(dir, kViewId, 0);
+                for (const auto& b : backups) EXPECT_EQ(slurpFile(b), before) << b << ": a backup is the old checkpoint, byte for byte";
+                if (knob) {
+                    EXPECT_GE(backups.size(), 1u) << "the old checkpoint survives in backup/";
+                    EXPECT_LE(backups.size(), 2u);   // a replay after a crash between link and unlink links again (#838)
+                    if (point == 3) EXPECT_EQ(backups.size(), backupsBefore) << "a boot after the rebuild never discards again";
+                } else {
+                    EXPECT_EQ(backups.size(), backupsBefore) << "knob off: no backup made, and an earlier one is neither used nor pruned";
+                }
+                EXPECT_EQ(r2.vs->foldCounters(kViewId, 0)->checkpointDiscards, (point == 0 || point == 1) ? 1u : 0u)
+                    << "the boot discards exactly when a checkpoint ahead of the log is still in place";
+                if (point != 3) ASSERT_TRUE(pumpUntilDurable(r2, 12)) << "the refold reaches disk";   // 3: already durable at 12
+            }
+            {   // boot 3: the refolded checkpoint is the truth now; nothing more is discarded
+                DiscardRig r3("unused", 0, policy, &dir);
+                rigOverTwelveRecordLog(r3);
+                r3.materialize();
+                EXPECT_EQ(r3.vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+                EXPECT_EQ(r3.vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+                const rune::view::RowLayout* L = nullptr;
+                const uint8_t* row = r3.vs->getRow(kViewId, 0, 7, L);
+                ASSERT_NE(row, nullptr);
+                EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 41);
+                EXPECT_EQ(r3.vs->getRow(kViewId, 0, 9, L), nullptr);
+            }
+            std::filesystem::remove_all(dir, ec);
+        }
+    }
 }

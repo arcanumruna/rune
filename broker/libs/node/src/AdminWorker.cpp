@@ -58,7 +58,7 @@ constexpr uint16_t kViewSourceNotFound   = 33;
 constexpr uint16_t kViewFieldUnresolved  = 34;
 constexpr uint16_t kViewKeyInvalid       = 35;
 constexpr uint16_t kViewNotCoPartitioned = 36;
-constexpr uint16_t kViewSourceTransient  = 37;
+// 37 (ViewSourceTransient) is reserved and never sent: a persisted view may read a transient source (checked writes Part 10)
 constexpr uint16_t kViewNotAlterable     = 38;
 constexpr uint16_t kInvalidRequest       = 39;
 constexpr uint16_t kInvalidTopicName     = 40;
@@ -279,6 +279,7 @@ DdlRejection encodeErrorAnswer(cat::EncodeError e) {
     case cat::EncodeError::TooManyElements:
     case cat::EncodeError::ReservedKind:
     case cat::EncodeError::BadEnum:
+    case cat::EncodeError::NeedsFormatV3:
         break;
     }
     return reject(kInvalidRequest, "the catalog event cannot be encoded: " + std::string{cat::encodeErrorName(e)});
@@ -646,33 +647,35 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     if (!named && msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint) {
         // Checked writes kind probe: an untyped topic is OK with no blob (a raw handle binds to it).
         if (const cat::TopicObject* t = applier_.state().topicByName(msg.nsId, msg.name)) {
-            deps_.respondGet(msg.session, msg.corr, t->topicId, 0, t->partitions, {}, kOK);
+            deps_.respondGet(msg.session, msg.corr, t->topicId, 0, t->partitions, {}, kOK, {});
             return;
         }
     }
     if (!named) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {});
         return;
     }
+    const cat::TopicObject* topic = applier_.state().topicByName(msg.nsId, msg.name);
+    const rune::protocol::TopicKeyFeatures features = topic != nullptr && topic->schema ? topic->schema->keyFeatures : rune::protocol::TopicKeyFeatures{};
     if (msg.requestedFingerprint == rune::protocol::client::kSchemaLineageFingerprint) {
         // #418: the topic's lineage - the latest entry's EVOLVING blob (every field ever declared, with its
         // lifetime), so a typed reader can place a record of any version.
         deps_.respondGet(msg.session, msg.corr, named->topicId, named->version, named->partitionCount,
-                         named->descriptorBlob, kOK);
+                         named->descriptorBlob, kOK, features);
         return;
     }
     const RegistryEntry* e = (msg.requestedFingerprint == 0 || msg.requestedFingerprint == rune::protocol::client::kSchemaKindFingerprint)
                                  ? named
                                  : reg_.byFingerprint(named->topicId, msg.requestedFingerprint);
     if (!e) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic, {});
         return;
     }
     // The wire blob is the MATERIALIZED-as-of-version descriptor (its fingerprint
     // is e->fingerprint), never the evolving blob; the partition count is the
     // topic's (the latest entry).
     deps_.respondGet(msg.session, msg.corr, e->topicId, e->version, named->partitionCount,
-                     rune::codec::serialize(e->descriptor), kOK);
+                     rune::codec::serialize(e->descriptor), kOK, features);
 }
 
 void AdminWorker::respondList_(const ListNamespacesMsg& m) {
@@ -1355,7 +1358,7 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
     // leader's wall clock when the event is built for its append).
     const DdlMeta& meta = metaOf(req);
     const int64_t session = std::visit([](const auto& m) { return m.session; }, req);
-    b->formatVer                 = cat::kCurrentFormatVer;
+    b->formatVer                 = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kCheckedWrites ? cat::kFormatV3 : cat::kCurrentFormatVer;
     b->statement                 = meta.statement;
     b->principal.sessionId       = meta.sessionId != 0 ? meta.sessionId : session;
     b->principal.clientName      = meta.clientName;
@@ -1388,6 +1391,26 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
     return b;
 }
 
+namespace {
+
+// Checked writes Part 05 (P5-6): the leader-only rules for a new definition's key features.  `keyWidth` is the key
+// field's encoded width (0 = no such field, which stays the applier's precondition).
+std::optional<DdlRejection> keyFeaturesRefusal(const rune::protocol::TopicKeyFeatures& f, const TopicShape& shape,
+                                               uint32_t keyWidth, int16_t level) {
+    if (f == rune::protocol::TopicKeyFeatures{}) return std::nullopt;
+    if (level < rune::replication::MetadataFeature::kCheckedWrites)
+        return reject(kInvalidRequest, "key.index needs every broker at feature level 5");
+    if (const auto why = featureRefusal(DbFeature::KeyIndex, shape)) return reject(kInvalidRequest, std::string(*why));
+    if (keyWidth > 8) return reject(kInvalidRequest, "key.index needs a key of at most 8 bytes");
+    if (f.autoIncrement || f.partitioner != rune::protocol::Partitioner::Fnv1a ||
+        f.autoIncrementMax != rune::protocol::kAutoIncrementMaxDefault ||
+        f.autoIncrementReserve != rune::protocol::kAutoIncrementReserveDefault)
+        return reject(kInvalidRequest, "autoincrement is not supported by this broker yet");
+    return std::nullopt;
+}
+
+}  // namespace
+
 AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat::CatalogState& s) const {
     if (s.namespaces().byId(m.nsId) == nullptr) return Rejected(reject(kUnknownTopic, kNoNamespaceDetail));
     if (!persistenceFromWire(m.persistence)) return Rejected(reject(kInvalidSchema));   // a direct submit
@@ -1397,6 +1420,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     // A non-empty descriptor must be well-formed; nextTag starts past every tag.
     uint16_t nextTag = 0;
     std::optional<DdlRejection> keyRefusal;   // P4: judges a new definition only, after the existing-name answers below
+    uint32_t keyWidth = 0;
     if (!m.blob.empty()) {
         try {
             const rune::codec::Descriptor d =
@@ -1408,10 +1432,12 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
             // apply rule, so a catalog that already holds such a topic replays unchanged, and a re-define of it still
             // answers TopicExists.  A key field that does not exist stays the applier's precondition.
             if (!m.keyField.empty())
-                if (const rune::codec::FieldDescriptor* k = d.find(m.keyField);
-                    k != nullptr && !rune::codec::isTopicKeyType(k->type, rune::codec::fieldWidth(*k)))
-                    keyRefusal = reject(kInvalidSchema, "key field '" + m.keyField + "' is " + keyTypeSpelling(*k) +
-                                                            ": a topic key is an integer or string(N) with N <= 16");
+                if (const rune::codec::FieldDescriptor* k = d.find(m.keyField); k != nullptr) {
+                    keyWidth = rune::codec::fieldWidth(*k);
+                    if (!rune::codec::isTopicKeyType(k->type, keyWidth))
+                        keyRefusal = reject(kInvalidSchema, "key field '" + m.keyField + "' is " + keyTypeSpelling(*k) +
+                                                                ": a topic key is an integer or string(N) with N <= 16");
+                }
             uint32_t past = static_cast<uint32_t>(d.fields.size());
             for (const auto& f : d.fields) past = std::max<uint32_t>(past, uint32_t{f.id} + 1);
             if (past > 0xFFFF) return Rejected(reject(kInvalidSchema));
@@ -1428,6 +1454,9 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         if (t->schema) return Rejected(reject(kTopicExists, {}, t->topicId, t->schema->schemaVersion));
         if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
         if (keyRefusal) return Rejected(std::move(*keyRefusal));
+        if (auto why = keyFeaturesRefusal(m.keyFeatures, TopicShape{true, !m.keyField.empty(), t->persistence == cat::Persistence::Transient},
+                                          keyWidth, clusterFeatureLevel_))
+            return Rejected(std::move(*why));
         // Issue #129: adopting a schema is a new version of a LIVE topic (every other producer's records are then
         // validated against it), so it needs ALTER on the topic - the gateway's verdict - not CREATE alone.
         if (!m.adoptDenial.empty()) return Rejected(reject(kNotAuthorized, m.adoptDenial));
@@ -1440,7 +1469,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         e.objectId    = t->objectId;
         e.prevVersion = t->version;
         e.newVersion  = t->version + 1;
-        e.ops = cat::CreateSchemaOps{cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag}};
+        e.ops = cat::CreateSchemaOps{cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag, m.keyFeatures}};
         return e;
     }
     if (const cat::ViewObject* v = s.viewByName(m.nsId, m.name)) {
@@ -1449,6 +1478,9 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     }
     if (auto fold = foldCollision(s, m.nsId, m.name)) return Rejected(std::move(*fold));
     if (keyRefusal) return Rejected(std::move(*keyRefusal));
+    if (auto why = keyFeaturesRefusal(m.keyFeatures, TopicShape{!m.blob.empty(), !m.keyField.empty(), m.persistence == 1},
+                                      keyWidth, clusterFeatureLevel_))
+        return Rejected(std::move(*why));
 
     // Spec §8: the replication factor is bounded by the brokers and the minIsr.
     const int32_t rf = m.replicationFactor;
@@ -1483,7 +1515,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     op.replicationFactor = m.replicationFactor;
     op.persistence       = m.persistence == 1 ? cat::Persistence::Transient : cat::Persistence::Disk;
     op.config            = m.config;
-    if (!m.blob.empty()) op.schema = cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag};
+    if (!m.blob.empty()) op.schema = cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag, m.keyFeatures};
     e.ops = std::move(op);
     return e;
 }
@@ -1561,9 +1593,7 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
             }
         const RegistryEntry* e = t != nullptr ? reg_.byId(src.topicId) : nullptr;
         if (e == nullptr) return Rejected(reject(kViewSourceNotFound));
-        // Phase 2b E: a view that reads a transient topic must itself be transient.
-        if (t->persistence == cat::Persistence::Transient && persistence == 0)
-            return Rejected(reject(kViewSourceTransient));
+        // Checked writes Part 10 (spec 9a): any view may read a transient topic (a keyless source is refused above, spec 4).
         srcDescs.push_back(&e->descriptor);
         sourceNames.push_back(t->name);
     }

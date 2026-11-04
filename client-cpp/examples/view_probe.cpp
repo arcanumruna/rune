@@ -41,6 +41,7 @@
 //     VIEW_TOPIC_ID_AGG=<id>
 //     VIEW_FP_AGG=<fp>
 //     VIEW_TT_TOPIC_ID=<id>
+//     VIEW_PRESENCE_PV_SRC_ID / _TOPIC_ID / _FP / _N=<..>   (persisted view over a transient topic, Part 10)
 //     VIEW-PROBE-SETUP: OK
 //   to stdout — the e2e script scrapes these into env vars for mode 2.
 //
@@ -66,8 +67,17 @@
 //     (e) (Phase 2b E/E2) presence_t: TopicExists with the same id, first
 //         produce at offset 0, subscribe and read_committed from earliest ->
 //         position 1.
+//     (f) (Part 10) presence_totals, a PERSISTED view over the TRANSIENT presence_pv, serves its checkpoint rows
+//         while the ring is empty, then folds the new ring (setup prints PERSISTED-OVER-TRANSIENT: OK, this leg
+//         PERSISTED-OVER-TRANSIENT-RESTART: OK).
 //   Prints "VIEW-ENGINE-E2E: OK" on success.
 //
+//   RUNE_MODE=view_rows (view checkpoint e2e Steps 9-11; read-only apart from the rows it adds, after verify_restart): the
+//     persisted view char_persisted must serve key RUNE_VIEW_KEY_ID with hp RUNE_VIEW_HP_EXPECT (a restart that backed up
+//     and rebuilt its checkpoint, or repaired a torn tail, still serves exactly what the log holds).  Then RUNE_VIEW_PRODUCE_N
+//     (default 0) more rows are produced with Acks::All (keys RUNE_VIEW_PRODUCE_KEY_BASE.., default 1000.., hp = key) and each
+//     must become readable.  Same RUNE_VIEW_* handoff env as verify_restart.  Prints "VIEW-ROWS-LAST-OFFSET <offset of the last record produced, -1 if none>" and "VIEW-ROWS: OK produced=<n>".
+//     Exit codes 60..65.
 //   RUNE_MODE=ddl_race (DDL conformance): connect, print "DDL-RACE: READY role=<a|b>",
 //     wait for <RUNE_BARRIER_DIR>/go, then race the other container: define
 //     "race_topic" (a: disk, b: transient), createView "race_view", and a/b define vs
@@ -404,6 +414,63 @@ static bool waitForAbsent(Client& c, int32_t viewId, uint64_t fp, int64_t u, int
     }
     std::cerr << "PROBE: " << who << " correctly AbsentKey\n";
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Checked writes Part 10: a PERSISTED view over a TRANSIENT topic.  presence_totals = GROUP BY hp over presence_pv:
+// {hp, n = Count(*), minId = Min(id)}.
+// ---------------------------------------------------------------------------
+static rcv::ViewPlan presenceTotalsPlan(int32_t srcTopicId) {
+    using P = rune::codec::PrimType;
+    rcv::ViewPlan p;
+    p.viewName = "presence_totals"; p.key = "hp"; p.persistence = 0;
+    p.sources.push_back(rcv::SourceSpec{srcTopicId, "hp"});
+    p.output.push_back(rcv::AuthoredField{"hp", P::Int64, 0, "hp", rcv::MergeRule::Replace});
+    p.output.push_back(rcv::AuthoredField{"n", P::Int64, 0, "", rcv::MergeRule::CountAll});
+    p.output.push_back(rcv::AuthoredField{"minId", P::Int64, 0, "id", rcv::MergeRule::Min});
+    return p;
+}
+// Slot order == presenceTotalsPlan output order: hp, n, minId.
+static rcv::RowLayout presenceTotalsRowLayout() {
+    const rune::codec::PrimType types[] = {rune::codec::PrimType::Int64, rune::codec::PrimType::Int64, rune::codec::PrimType::Int64};
+    return rcv::buildRowLayout(types);
+}
+// Polls group `hp` until the row is {hp, n, minId} or the bound expires.
+static bool waitForPresenceTotals(Client& c, int32_t viewId, uint64_t fp, int64_t hp, int64_t n, int64_t minId,
+                                  int boundMs, int timeoutMs, const char* who) {
+    const rcv::RowLayout L = presenceTotalsRowLayout();
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(boundMs);
+    ViewRowResult r;
+    for (;;) {
+        r = c.getViewRowAndWait(viewId, static_cast<uint64_t>(hp), fp, std::chrono::milliseconds(timeoutMs));
+        if (r.status == ViewRowResult::kOk && r.rowBytes.size() == L.rowLen) {
+            const auto row = std::span<const uint8_t>(r.rowBytes);
+            const auto hf = rcv::readSlot(row, L, 0), nf = rcv::readSlot(row, L, 1), mf = rcv::readSlot(row, L, 2);
+            if (hf.present && nf.present && mf.present && hf.i == hp && nf.i == n && mf.i == minId) {
+                std::cerr << "PROBE: " << who << " OK hp=" << hp << " n=" << n << " minId=" << minId << "\n";
+                return true;
+            }
+            if (std::chrono::steady_clock::now() >= dl) {
+                std::cerr << "PROBE: FAIL " << who << " got hp=" << hf.i << " n=" << nf.i << " minId=" << mf.i
+                          << " want n=" << n << " minId=" << minId << "\n";
+                return false;
+            }
+        } else if (std::chrono::steady_clock::now() >= dl) {
+            std::cerr << "PROBE: FAIL " << who << " status=" << r.status << "\n";
+            return false;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+}
+// One acked record {id, hp} on a topic.
+static bool sendCharacter(Client& c, int32_t topicId, int64_t id, int64_t hp, int timeoutMs) {
+    ProducerConfig pcfg; pcfg.acks = Acks::All;
+    pcfg.produceTimeoutMs = timeoutMs;
+    auto p = c.producer(pcfg);
+    Completions cq(c); Completion done;
+    const auto v = encodeCharacter(id, hp, /*version=*/1);
+    return sendAndWaitAck(cq, p, TopicHandle{topicId, 1}, Key(static_cast<uint64_t>(id)), std::span<const uint8_t>(v), 1, timeoutMs, done) &&
+           done.status == OpStatus::Ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -1359,6 +1426,34 @@ int main(int argc, char** argv) {
             std::cerr << "PROBE: transient topic presence_t topicId=" << tt.topicId
                       << " produced (None/Leader/All) + subscribed (earliest/offset/latest) + read_committed OK\n";
 
+            // ---- 7b. Checked writes Part 10: a PERSISTED view over a TRANSIENT topic.  Exit codes 180..185. ----
+            DefineTopicResult pv = c.defineTopicAndWait(
+                "presence_pv", /*partitions=*/1, /*keyField=*/"id",
+                std::span<const uint8_t>(blob), Persistence::Transient, wait);
+            if (pv.errorCode != 0) { std::cerr << "PROBE: FAIL defineTopic(presence_pv transient) errorCode=" << pv.errorCode << "\n"; return 180; }
+            const auto pvBlob = rcv::serializeAuthored(presenceTotalsPlan(pv.topicId));
+            CreateViewResult viewPV = c.createViewAndWait("presence_totals", "hp", /*persistence=*/0, std::span<const uint8_t>(pvBlob), wait);
+            if (viewPV.errorCode != 0) {
+                std::cerr << "PROBE: FAIL createView(presence_totals persisted over transient) errorCode=" << viewPV.errorCode << " " << viewPV.detail << "\n";
+                return 181;
+            }
+            if (!sendCharacter(c, pv.topicId, 1, 5, timeoutMs) || !sendCharacter(c, pv.topicId, 2, 5, timeoutMs) ||
+                !sendCharacter(c, pv.topicId, 3, 7, timeoutMs)) { std::cerr << "PROBE: FAIL produce(presence_pv)\n"; return 182; }
+            if (!waitForPresenceTotals(c, viewPV.viewTopicId, viewPV.outputFingerprint, 5, 2, 1, boundMs, timeoutMs,
+                                       "presence_totals hp5 (initial)")) return 183;
+            if (!waitForPresenceTotals(c, viewPV.viewTopicId, viewPV.outputFingerprint, 7, 1, 3, boundMs, timeoutMs,
+                                       "presence_totals hp7 (initial)")) return 184;
+            {
+                // A keyless transient source still refuses a view: ViewKeyInvalid (35), never the retired 37.
+                DefineTopicResult nk = c.defineTopicAndWait("presence_nk", 1, "", std::span<const uint8_t>(blob), Persistence::Transient, wait);
+                if (nk.errorCode != 0) { std::cerr << "PROBE: FAIL defineTopic(presence_nk) errorCode=" << nk.errorCode << "\n"; return 185; }
+                const auto nkBlob = rcv::serializeAuthored(presenceTotalsPlan(nk.topicId));
+                CreateViewResult bad = c.createViewAndWait("presence_nk_totals", "hp", 0, std::span<const uint8_t>(nkBlob), wait);
+                if (bad.errorCode != 35) { std::cerr << "PROBE: FAIL view over a keyless transient topic errorCode=" << bad.errorCode << " (want 35)\n"; return 185; }
+            }
+            std::cerr << "PROBE: persisted view presence_totals over transient presence_pv folds OK\n";
+            std::cout << "PERSISTED-OVER-TRANSIENT: OK\n";
+
             // ---- Handoff for the restart leg (scraped by the e2e script) ----
             std::cout << "VIEW_SRC_TOPIC_ID="       << def.topicId            << "\n";
             std::cout << "VIEW_TOPIC_ID_PERSISTED=" << viewP.viewTopicId      << "\n";
@@ -1372,6 +1467,10 @@ int main(int argc, char** argv) {
             std::cout << "VIEW_FP_AGG="         << viewA.outputFingerprint  << "\n";
             std::cout << "VIEW_TT_TOPIC_ID="    << tt.topicId               << "\n";
             std::cout << "VIEW_TT_END="         << ttEnd                    << "\n";   // C1: the group_commit leg
+            std::cout << "VIEW_PRESENCE_PV_SRC_ID="   << pv.topicId            << "\n";
+            std::cout << "VIEW_PRESENCE_PV_TOPIC_ID=" << viewPV.viewTopicId    << "\n";
+            std::cout << "VIEW_PRESENCE_PV_FP="       << viewPV.outputFingerprint << "\n";
+            std::cout << "VIEW_PRESENCE_PV_N="        << 3                     << "\n";   // records produced
             std::cout << "VIEW-PROBE-SETUP: OK\n";
             std::cout.flush();
             c.close();
@@ -1394,6 +1493,58 @@ int main(int argc, char** argv) {
             return rc;
         }
 
+        if (mode == "view_rows") {
+            const int32_t  srcTopicId = static_cast<int32_t>(getEnvI64("RUNE_VIEW_SRC_TOPIC_ID", -1));
+            const int32_t  viewIdP    = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TOPIC_ID_PERSISTED", -1));
+            const uint64_t fpP        = getEnvU64("RUNE_VIEW_FP_PERSISTED", 0);
+            const int64_t  keyId      = getEnvI64("RUNE_VIEW_KEY_ID", -1);
+            const int64_t  hpExpect   = getEnvI64("RUNE_VIEW_HP_EXPECT", -1);
+            const int      produceN   = getEnvInt("RUNE_VIEW_PRODUCE_N", 0);
+            const int64_t  keyBase    = getEnvI64("RUNE_VIEW_PRODUCE_KEY_BASE", 1000);
+            if (srcTopicId < 0 || viewIdP < 0 || keyId < 0 || hpExpect < 0) {
+                std::cerr << "PROBE: FAIL view_rows requires RUNE_VIEW_SRC_TOPIC_ID / RUNE_VIEW_TOPIC_ID_PERSISTED / "
+                             "RUNE_VIEW_KEY_ID / RUNE_VIEW_HP_EXPECT\n";
+                return 60;
+            }
+            const ViewRowResult r0 = waitResolved(c, viewIdP, static_cast<uint64_t>(keyId), fpP, boundMs, timeoutMs);
+            if (r0.status != ViewRowResult::kOk) {
+                std::cerr << "PROBE: FAIL view_rows char_persisted status=" << r0.status << " (want kOk)\n";
+                return 61;
+            }
+            if (!decodeAndCheck(r0, keyId, hpExpect, "char_persisted (view_rows)")) return 62;
+            int64_t lastOffset = -1;   // the offset of the last record this call produced (-1 = none)
+            if (produceN > 0) {
+                ProducerConfig pcfg;
+                pcfg.acks             = Acks::All;
+                pcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
+                auto p = c.producer(pcfg);
+                Completions cq(c);
+                const TopicHandle srcTh{srcTopicId, /*partitionCount=*/1};
+                for (int i = 0; i < produceN; ++i) {
+                    const int64_t k = keyBase + i;
+                    Completion done;
+                    const auto value = encodeCharacter(k, k, /*version=*/1);
+                    const bool waited = sendAndWaitAck(cq, p, srcTh, Key(static_cast<uint64_t>(k)),
+                                                       std::span<const uint8_t>(value), static_cast<Token>(i + 1), timeoutMs, done);
+                    if (!waited || done.status != OpStatus::Ok) {
+                        std::cerr << "PROBE: FAIL view_rows produce key=" << k << " waited=" << waited
+                                  << " status=" << static_cast<int>(done.status) << "\n";
+                        return 63;
+                    }
+                    lastOffset = done.value;
+                }
+                for (int i = 0; i < produceN; ++i) {
+                    const int64_t k = keyBase + i;
+                    const ViewRowResult rk = waitForHp(c, viewIdP, static_cast<uint64_t>(k), fpP, k, k, boundMs, timeoutMs);
+                    if (!decodeAndCheck(rk, k, k, "char_persisted (view_rows, produced)")) return 64;
+                }
+            }
+            std::cout << "VIEW-ROWS-LAST-OFFSET " << lastOffset << std::endl;
+            std::cout << "VIEW-ROWS: OK produced=" << produceN << std::endl;
+            c.close();
+            return 0;
+        }
+
         if (mode == "verify_restart") {
             const int32_t  srcTopicId     = static_cast<int32_t>(getEnvI64("RUNE_VIEW_SRC_TOPIC_ID", -1));
             const int32_t  viewIdP        = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TOPIC_ID_PERSISTED", -1));
@@ -1407,6 +1558,10 @@ int main(int argc, char** argv) {
             const int32_t  viewIdA        = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TOPIC_ID_AGG", -1));
             const uint64_t fpA            = getEnvU64("RUNE_VIEW_FP_AGG", 0);
             const int32_t  ttTopic        = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TT_TOPIC_ID", -1));
+            const int32_t  pvSrc          = static_cast<int32_t>(getEnvI64("RUNE_VIEW_PRESENCE_PV_SRC_ID", -1));
+            const int32_t  pvView         = static_cast<int32_t>(getEnvI64("RUNE_VIEW_PRESENCE_PV_TOPIC_ID", -1));
+            const uint64_t pvFp           = getEnvU64("RUNE_VIEW_PRESENCE_PV_FP", 0);
+            const int64_t  pvN            = getEnvI64("RUNE_VIEW_PRESENCE_PV_N", -1);
 
             if (srcTopicId < 0 || viewIdP < 0 || viewIdT < 0 || keyId < 0) {
                 std::cerr << "PROBE: FAIL verify_restart requires RUNE_VIEW_SRC_TOPIC_ID / "
@@ -1509,13 +1664,32 @@ int main(int argc, char** argv) {
                 std::cerr << "PROBE: presence_t exists after restart, empty, produce+subscribe+read_committed OK\n";
             }
 
+            // ---- (f) Checked writes Part 10: the persisted view over the transient presence_pv keeps its checkpoint rows
+            //         across the restart (the ring came back empty) and folds the new ring on top.  Exit codes 186..189. ----
+            if (pvSrc < 0 || pvView < 0 || pvN != 3) { std::cerr << "PROBE: FAIL missing RUNE_VIEW_PRESENCE_PV_* handoff env\n"; return 186; }
+            if (!waitForPresenceTotals(c, pvView, pvFp, 5, 2, 1, boundMs, timeoutMs, "presence_totals hp5 (post-restart, from the checkpoint)") ||
+                !waitForPresenceTotals(c, pvView, pvFp, 7, 1, 3, boundMs, timeoutMs, "presence_totals hp7 (post-restart, from the checkpoint)")) return 187;
+            {
+                const auto pvBlob = rune::codec::serialize(characterDescriptor());
+                DefineTopicResult again = c.defineTopicAndWait("presence_pv", 1, "id", std::span<const uint8_t>(pvBlob), Persistence::Transient, wait);
+                if (again.errorCode != 25 || again.topicId != pvSrc) {
+                    std::cerr << "PROBE: FAIL presence_pv after restart errorCode=" << again.errorCode << " topicId=" << again.topicId << "\n";
+                    return 188;
+                }
+            }
+            // The new ring starts at offset 0, below the old cursor 3: (4,5) joins hp5, (1,7) moves key 1 from hp5 to hp7.
+            if (!sendCharacter(c, pvSrc, 4, 5, timeoutMs) || !sendCharacter(c, pvSrc, 1, 7, timeoutMs)) { std::cerr << "PROBE: FAIL produce(presence_pv) after restart\n"; return 189; }
+            if (!waitForPresenceTotals(c, pvView, pvFp, 5, 2, 2, boundMs, timeoutMs, "presence_totals hp5 (post-restart fold)") ||
+                !waitForPresenceTotals(c, pvView, pvFp, 7, 2, 1, boundMs, timeoutMs, "presence_totals hp7 (post-restart fold)")) return 189;
+            std::cout << "PERSISTED-OVER-TRANSIENT-RESTART: OK\n";
+
             std::cout << "VIEW-ENGINE-E2E: OK\n";
             std::cout.flush();
             c.close();
             return 0;
         }
 
-        std::cerr << "PROBE: FAIL unknown RUNE_MODE='" << mode << "' (want setup|verify_restart|ddl_race|catalog_dump|transient_failover)\n";
+        std::cerr << "PROBE: FAIL unknown RUNE_MODE='" << mode << "' (want setup|verify_restart|view_rows|ddl_race|catalog_dump|transient_failover)\n";
         c.close();
         return 20;
     } catch (const std::exception& ex) {

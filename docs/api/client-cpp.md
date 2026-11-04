@@ -156,6 +156,13 @@ is replicated in memory and never written to disk. The usual way to create topic
 | Fetch a schema | `getTopicSchema` / `getTopicSchemaAndWait(name [, fingerprint])` |
 | List topics | `listTopics(timeout)` returns `(name, topicId)` pairs in definition order |
 
+`TopicOptions::keyFeatures.keyIndex = true` creates the topic with a **key index**, which
+write intents need. The broker refuses it with `InvalidRequest` and a detail: "key.index needs every broker at feature level
+5", "key.index needs a typed topic", "key.index needs a key", "key.index needs a persisted topic", "key.index needs a key of
+at most 8 bytes". The other `TopicKeyFeatures` fields (`autoIncrement`, `partitioner`, `autoIncrementMax`,
+`autoIncrementReserve`) must stay at their defaults ("autoincrement is not supported by this broker yet"). A define with
+key features against a broker older than version 10 completes with `OpStatus::BrokerTooOld`.
+
 `DefineTopicResult::topicId` plus the partition count you passed make the `TopicHandle{topicId, partitionCount}` that a
 producer needs. `Client::topic(name)` finds a handle only in the static `ClientConfig::topics` list.
 
@@ -195,10 +202,16 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
   folded into the views and carries the per-record write verdicts. It needs a broker that supports checked writes; against
   an older broker every send completes locally with `OpStatus::BrokerTooOld`. `View` batches hold at most 4096 records
   (`claimBatch` with more returns `SendResult::MessageTooLarge`, `BatchBuilder` throws `std::length_error`). On a verdict source each record of a `View` batch completes as it was judged: `Ok` with its offset, or
-  `BrokerError` with `errorCode` 55 to 57 and `constraintIdOf(completion)`; a Tier-2 batch completes once with its first
-  rejection. A retry inside the broker's window replays the original verdicts; a retry outside it completes the whole batch
+  `BrokerError` with `errorCode` 55 to 57 and `constraintIdOf(completion)`; a `claimBatch` or Tier-2 batch of two or more records completes once and reports every
+  record: `Ok` when all were accepted, else `RecordsRejected` (15) with `value` = the base offset, the first rejection's
+  `errorCode`, and a payload of every rejection (`BatchVerdicts`: `rejectedCount()`, `rejection(k)`, `accepted(i)`,
+  `offsetOf(i)`); the other records were stored at base + index. A batch of one record keeps the single-record form
+  (`BrokerError`, value -1). The completion reserves its full size up front (`claimBatch` above the queue's record
+  limit returns `MessageTooLarge`). A retry inside the broker's window replays the original verdicts; a retry outside it completes the whole batch
   with `OpStatus::VerdictUnknown` (`errorCode` 21). `OpStatus::StoredIdUnknown` (13) is reserved. A transactional
   producer never sends the `View` bit. `SendResult::WriteNotAllowed` reports a write the broker refuses for the topic. On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
+- **`WriteIntent`**: every `send`, `trySend`, `sendTo` and `trySendTo` takes a trailing `WriteIntent` (`Upsert`, the
+  default, `Insert` or `Update`), carried in the record's attribute bits 0-1. See [Write intents](#write-intents).
 - **`Key`**: up to 16 inline bytes, built from a `uint64_t`/`int64_t`, a trivially-copyable value or a byte span. The key
   picks the partition (`Key::partition(n)`, FNV-1a 64) and is stored with the record. A key is never truncated: a span of
   more than 16 bytes is an over-long key (`Key::tooLong()`), `trySend` returns `SendResult::KeyTooLong` and `send` throws
@@ -208,9 +221,36 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
 - **Batching**: sends within `lingerUs` (default 5 ms) are batched per partition up to `batchBytes` (64 KiB). `lingerUs`
   of 0 defeats batching.
 - **`SendResult`**: `Ok`, `BackPressured`, `ValueTooLarge`, `InvalidTopic`, `Closed`, `QueueFull`, `InvalidArgument`,
-  `MessageTooLarge`, `WrongThread`, `WrongShard`. Anything but `Ok` means the record was not accepted.
+  `MessageTooLarge`, `WrongThread`, `WrongShard`, `ClaimHeld`, `NotInTransaction`, `KeyTooLong`, `WriteNotAllowed`.
+  Anything but `Ok` means the record was not accepted.
 - Retriable broker answers (`MinIsrViolation`, `TransientLogFull`) are re-sent with the same identity after a backoff,
   bounded by `produceTimeoutMs` and `deliveryTimeoutMs`.
+
+### Write intents
+
+On a typed topic with a key index an intent says what the write expects. The broker judges it when the batch is folded,
+in offset order, against the records accepted before it:
+
+| Intent | Value | Fails with |
+|---|---|---|
+| `Upsert` | a record | never |
+| `Upsert` | empty (a delete) | never |
+| `Insert` | a record | `KeyExists` (56) when the key exists |
+| `Update` | a record | `KeyNotFound` (57) when the key is absent |
+| `Update` | empty (removeExisting) | `KeyNotFound` (57) when the key is absent |
+
+- **Requirements**: intents need `Acks::All | Acks::View` (or `Acks::Leader | Acks::View`) and an idempotent producer
+  (every acked producer is). A rejected record is never visible; its completion is `BrokerError` with `errorCode` 56 or 57
+  and `constraintIdOf(completion)` 0. A topic without a key index answers an intent `InvalidRequest`.
+- **Refused locally**: these sends return `SendResult::WriteNotAllowed` (nothing is queued and no completion follows), and
+  the blocking forms throw `std::invalid_argument` with the text in quotes: an intent on a raw handle ("intents need a typed
+  topic"), any send of a `View` producer on a raw handle ("acks View needs a typed topic"), an intent without `View` ("intents
+  need acks including View"), an intent on a transactional producer ("intents inside a transaction need Part G"), and an
+  `Insert` with an empty value ("an insert needs a value"). Tier-2 batches and claims carry no intent.
+- **Retries**: a lost ack is retried and replays the original verdict, so a retried `Insert` gets its own `Ok`, never
+  `KeyExists` against itself. A retry outside the broker's window completes with `OpStatus::VerdictUnknown`.
+- `Producer::sendAndWait(topic, key, value, intent, timeout)` sends one record and returns its `Completion`.
+- Plain upserts and deletes to a key-index topic need no `View` and no particular client version.
 
 ### Acknowledgements
 
@@ -227,14 +267,17 @@ if (p.trySend(events, Key(uint64_t{42}), bytes, cq, /*token=*/7) == SendResult::
 ```
 
 - `trySend(..., AckToken{t})` calls the handler you set with `onAck(fn, ctx)` on the duty thread; it must not block.
+- `onAck(AckCompletionFn, ctx)` is the same handler with the full `Completion` (`value`, `aux`, `op`, `errorCode`, and
+  `constraintIdOf(c)` for a rejected `Send`) plus an empty payload span; the last registration (either form) wins.
 - `onBatchAck` / `batchAcksTo(cq)` deliver one `BatchAck` per batch (`baseOffset`, `baseSequence`, `recordCount`,
-  `errorCode`, `producerEpoch`).
+  `errorCode`, `producerEpoch`); a checked-writes batch also reports `rejectedCount` and `rejections` (every rejected
+  record), or the list as the completion payload with `batchAcksTo`.
 - Every accepted record is reported exactly once, including ones that never reached the wire (`BatchAck::kClientFailure`).
 
 ### Batches and flush
 
 ```cpp
-auto batch = p.batch(events, Key(uint64_t{42}));   // one atomic append to one partition: contiguous offsets, all or nothing
+auto batch = p.batch(events, Key(uint64_t{42}));   // one atomic append to one partition: contiguous offsets; View producers get a verdict per record
 batch.add(bytes);
 batch.send();
 p.flush();
@@ -491,8 +534,20 @@ players.send(p);                                                       // routed
   evolves, and every `send` stamps the version it is bound to.
 - Routing: when `T` has a key field, `send` hashes `T::key()` (at most 16 bytes, never truncated) to the partition. A schema
   without a key sends to partition 0. The partition count comes from the broker (`typedPartitionCount`).
+- **Checked typed writes**: `insert(rec)`, `update(rec)`, `upsert(rec)`, `remove(key)` and `removeExisting(key)` take
+  `(…, Completions& cq, Token token)`; `upsert(rec)` (the same as `send(rec)`) and `remove(key)` also have a
+  fire-and-forget form. Each has an `…AndWait(…, timeout = kDefaultWriteWait /* 30 s */)` that returns a `WriteResult`:
+  `ok()`, `status()` (`Ok`, `BrokerError`, `Timeout`, `BrokerTooOld`, `VerdictUnknown`, `DeliveryFailed`, `Closed` when
+  the client closes first), `code()` (56, 57, 39 or 24 for a `BrokerError`), `constraintId()`, `offset()` and `key()`
+  (the broker-assigned key, not the record's; always 0 until autoincrement ships). A local refusal (see
+  [Write intents](#write-intents)) or an over-long key throws `std::invalid_argument`. An oversized record throws
+  `std::invalid_argument` from the `…AndWait` forms and `std::length_error` from the token forms. `remove` and
+  `removeExisting` build the record key exactly as `send(rec)` does, so a delete reaches the partition of the write.
 - `TypedTopic<T>` is move-only; `handle()` returns its `TopicHandle` and `boundVersion()` the schema version.
-- Reading: `T::decode` / `T::Decoder` place each record by its own version. `lineageAndWait<T>(topic)` returns the
+- Code generation rejects a field whose name ends in `_` (the generated code's own names end in `_`): rename the field.
+- Reading: `T::decode` / `T::Decoder` place each record by its own version. `Record::op()` classifies a delivered record:
+  `Delete` for an empty value, otherwise `Insert` (intent 1), `Update` (intent 2) or `Upsert`. On a raw topic the intent
+  bits are whatever the producer sent. `lineageAndWait<T>(topic)` returns the
   lineage that also places records written after `T` was generated ([codec.md](codec.md#generate-c-types)).
 
 ## Materialized views
@@ -535,7 +590,7 @@ if (row.status == ViewRowResult::kOk) {
   acknowledged before the read was sent. A leader that lost its lease (cut off from the controller) answers `NotLeader`;
   the client retries it within `ddlRetryBudget`.
 - Rules: an aggregate view needs a **one-partition** source (`ViewNotCoPartitioned` otherwise); a view over a transient
-  topic must itself be transient (`ViewSourceTransient`); a view cannot read another view (`ViewSourceIsView`). `READ` on
+  topic is allowed, persisted or transient (a keyless source answers `ViewKeyInvalid`); a view cannot read another view (`ViewSourceIsView`). `READ` on
   the view is needed to read a row and `READ` on each source to create it.
 - Related calls: `alterView(AndWait)`, `dropView(AndWait)`.
 
@@ -556,7 +611,8 @@ with the broker code). They need `DESCRIBE` on `CLUSTER`.
 
 | Where | How a failure shows |
 |---|---|
-| `*AndWait` | `std::runtime_error` whose text is `<op>: <reason>`, for example `timed out`, `client closed`, `session lost before the answer`, `broker error code 45 (NotAuthorized): <detail>`. A *broker error code on a DDL or schema op* is **returned in the result** (`errorCode`, `detail`) instead of thrown. |
+| Typed `…AndWait`, `Producer::sendAndWait` | A `WriteResult` / `Completion` for every broker and transport outcome, `Timeout` included; `std::invalid_argument` for a local refusal. |
+| Other `*AndWait` | `std::runtime_error` whose text is `<op>: <reason>`, for example `timed out`, `client closed`, `session lost before the answer`, `broker error code 45 (NotAuthorized): <detail>`. A *broker error code on a DDL or schema op* is **returned in the result** (`errorCode`, `detail`) instead of thrown. |
 | Token form | `OpResult` at issue (`Accepted`, `Closed`, `QueueFull`, `BackPressured`, `InvalidArgument`, `WrongThread`), then a `Completion` with `OpStatus` (`Ok`, `BrokerError`, `Timeout`, `Closed`, `NotConnected`, `Superseded`, `Rejoined`, `SessionLost`, `Fenced`, `DeliveryFailed`, `ResultTooLarge`, `InvalidArgument`) and `errorCode` when `BrokerError`. |
 | `Producer::trySend` | `SendResult`, never an exception. `send` throws `std::length_error` (too large), `std::invalid_argument` (bad topic), `std::logic_error` (client closed) or `std::runtime_error` (back-pressured where pumping is unsafe, or the runner stopped draining). |
 | Wrong thread | `std::logic_error`: a blocking call on the runner thread or from a callback, a catalog read off the constructing thread. |

@@ -102,12 +102,17 @@ TEST(AeronPumpInvokerRegression, PumpWithOnThreadedDriverIsDefaultSleepingPump) 
     aeron::Context ctx; ctx.aeronDir(dir.string());
     auto client = aeron::Aeron::connect(ctx);
 
-    auto pump = driver->pumpWith(client.get());
-    EXPECT_FALSE(pump.invoker()) << "a threaded driver must hand out the default (sleeping) pump";
-    WorkerIngress ing(client, "aeron:ipc", 7101, pump);
-    EXPECT_TRUE(ing.resolved());
-    EXPECT_EQ(driver->foreignPumpAttempts(), 0u) << "the resolver must never try to pump a threaded driver";
-
+    {
+        auto pump = driver->pumpWith(client.get());
+        EXPECT_FALSE(pump.invoker()) << "a threaded driver must hand out the default (sleeping) pump";
+        WorkerIngress ing(client, "aeron:ipc", 7101, pump);
+        EXPECT_TRUE(ing.resolved());
+        EXPECT_EQ(driver->foreignPumpAttempts(), 0u) << "the resolver must never try to pump a threaded driver";
+    }
+    // The ingress holds its own reference to the client: it must be gone before the driver closes, or the client's
+    // conductor outlives the driver, its liveness check fails and Aeron's default error handler calls exit() while
+    // this thread is still logging (TSan CI: heap-use-after-free of spdlog's registry in EmbeddedDriver::close).
+    ASSERT_EQ(client.use_count(), 1) << "the client must be closed here, before the driver";
     client.reset(); driver.reset();
     std::error_code ec; fs::remove_all(dir, ec);
 }

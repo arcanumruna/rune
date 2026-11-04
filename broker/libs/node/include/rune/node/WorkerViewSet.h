@@ -45,6 +45,13 @@
 
 namespace rune::node {
 
+enum class CheckpointOrigin : uint8_t { None, Committed, CommittedAndLegacy, LegacyOnly };
+
+struct RecoveredCheckpoint {
+    std::vector<uint8_t> bytes;   // the committed file's bytes (empty for None and LegacyOnly)
+    CheckpointOrigin     origin = CheckpointOrigin::None;
+};
+
 class WorkerViewSet {
 public:
     // `channel` is THIS worker's own ViewSnapshotChannel (per-worker SPSC — the
@@ -89,6 +96,23 @@ public:
     // serve-guard), NOT lazily created Ready by the plain driveFolds path.
     int drainInstalls();
 
+    /// Test seams: throw away one instance's rows exactly as recovery does, and read where its checkpoint stands.
+    bool beginDiscardForTest(int32_t viewTopicId, int32_t partition, ViewDiscardReason reason) {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        if (it == views_.end()) return false;
+        beginDiscard_(it->second, reason);
+        return true;
+    }
+    [[nodiscard]] const CheckpointState* checkpointStateForTest(int32_t viewTopicId, int32_t partition) const {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it == views_.end() ? nullptr : &it->second.checkpoint;
+    }
+
+    // Drain the IO agent's `done` ring (channel_.done) on THIS thread, the ring's only consumer.  kDoneMsgType frames
+    // (durable-offset acks) are ignored; a kDiscardDoneMsgType frame completes a discard (onDiscardDone_).  Without a
+    // consumer the agent's pendingAcks_ would grow without bound once the 4 KiB ring filled.  Returns frames drained.
+    int drainSnapshotAcks(int limit = 64);
+
     // Task 19b: true iff at least one view here was installed for RESTART
     // recovery (recoveryViews_ non-empty).  The worker duty cycle gates the
     // extra recovery-materialize + driveRebuild work on this, so a broker with
@@ -108,7 +132,7 @@ public:
     // calls this BEFORE driveRebuild/driveFolds so a recovery view never gets a
     // fresh Ready instance that would bypass its checkpoint + serve-guard.
     void materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t partition,
-                                         int64_t committedTail);
+                                         int64_t committedTail, const SourceLogBounds& b = {});
 
     // Task 16: install a view FOR RECOVERY for ONE partition.  Registers the
     // plan template (like installView) AND eagerly creates the (view, partition)
@@ -131,7 +155,7 @@ public:
                                 rune::codec::Descriptor evolvingSrc, bool persisted,
                                 int32_t partition, std::span<const uint8_t> base,
                                 std::span<const std::span<const uint8_t>> deltasInOrder,
-                                int64_t committedTail);
+                                int64_t committedTail, std::size_t* appliedOut = nullptr);
 
     // Status of a getRow probe — lets the serve path (Task 20) distinguish an
     // absent key (terminal NotFound) from a view still rebuilding (RETRIABLE
@@ -161,8 +185,8 @@ public:
     // partition) that is still RebuildingViews: fold the committed range
     // [foldCursor, committedTail) through the SAME driveFolds machinery (same
     // readRange idiom), then flip that instance RebuildingViews -> Ready once
-    // foldCursor >= committedTail.  committedTail is the source partition's LSO
-    // (passed in by the caller, exactly as driveFolds' `bound`).  Templated so
+    // foldCursor >= committedTail (CatchingUp instead while the leader's HW has not reached its start offset, N-C1).
+    // committedTail is the source partition's LSO (passed in by the caller, exactly as driveFolds' `bound`).  Templated so
     // readRange inlines (no std::function).  Returns the progress count (records
     // folded + deltas handled this pass) so the idle strategy stays hot while a
     // rebuild is pending.  Bounded: each pass folds at most one committed range;
@@ -171,7 +195,8 @@ public:
     int driveRebuild(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
                      int64_t committedTail, const rune::view::FoldSkip& skip, int64_t nowNs,
                      const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
-                     bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr) {
+                     bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr,
+                     SourceLogBounds b = {}) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return 0;
@@ -191,8 +216,8 @@ public:
             ViewInstance& inst = vit->second;
             adoptNs_(inst, ns);
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
-            work += driveView_(inst, readRange, rebuildTail, rskip, transientSrc, leaderGen, leaderHwConfirmed);
-            if (inst.foldCursor >= rebuildTail) {
+            work += driveView_(inst, readRange, rebuildTail, rskip, transientSrc, leaderGen, leaderHwConfirmed, b);
+            if (inst.foldCursor >= rebuildTail && checkpointSettled(inst)) {
                 // N-C1: Ready only once the leader's HW reached its leadership start offset; else CatchingUp
                 // (never left RebuildingViews: that state gates elections).
                 inst.readiness = leaderHwConfirmed ? ViewReadiness::Ready : ViewReadiness::CatchingUp;
@@ -216,18 +241,35 @@ public:
 
     // The slowest foldCursor over the views interested in (srcTopicId, partition): a View ack may fire once this passes
     // its last offset.  INT64_MAX when no view is interested.  An instance that was never created counts 0, and with
-    // `leadership != 0` so does one folded under another leadership (its table says nothing about this one).
-    [[nodiscard]] int64_t minFoldCursor(int32_t srcTopicId, int32_t partition, uint64_t leadership = 0) const noexcept {
+    // `leadership != 0` so does one folded under another leadership (its table says nothing about this one).  `judged` is false on a memory-backed replica:
+    // its verdict views are skipped (no judge ever folds them).
+    [[nodiscard]] int64_t minFoldCursor(int32_t srcTopicId, int32_t partition, uint64_t leadership = 0, bool judged = true) const noexcept {
         const auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return INT64_MAX;
         int64_t min = INT64_MAX;
         for (const int32_t viewTopicId : it->second) {
             if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.retiring) continue;   // a dropped verdict view is judged to its drop, never waited for
+            if (!judged && isVerdictTemplate_(viewTopicId)) continue;   // #808: a memory-backed replica never hosts a judge (SD9), so its verdict views are never folded and never waited for
             const auto vit = views_.find(instKey(viewTopicId, partition));
             const int64_t cursor = vit == views_.end() || (leadership != 0 && vit->second.foldLeadership != leadership) ? 0 : vit->second.foldCursor;
             if (cursor < min) min = cursor;
         }
         return min;
+    }
+    /// Cold (#791 diagnostics, a View ack timeout): the view topic id that holds minFoldCursor() (same rules), or -1 when none does.
+    [[nodiscard]] int32_t minFoldCursorViewForDiag(int32_t srcTopicId, int32_t partition, uint64_t leadership = 0, bool judged = true) const noexcept {
+        const auto it = subscriptionIndex_.find(srcTopicId);
+        if (it == subscriptionIndex_.end()) return -1;
+        int64_t min = INT64_MAX;
+        int32_t holder = -1;
+        for (const int32_t viewTopicId : it->second) {
+            if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.retiring) continue;
+            if (!judged && isVerdictTemplate_(viewTopicId)) continue;
+            const auto vit = views_.find(instKey(viewTopicId, partition));
+            const int64_t cursor = vit == views_.end() || (leadership != 0 && vit->second.foldLeadership != leadership) ? 0 : vit->second.foldCursor;
+            if (cursor < min) { min = cursor; holder = viewTopicId; }
+        }
+        return holder;
     }
 
     // Drive every view interested in (srcTopicId, partition) over the committed
@@ -241,7 +283,8 @@ public:
     int driveFolds(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
                    int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                    const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
-                     bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr, VerdictSource* judge = nullptr) {
+                     bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr, VerdictSource* judge = nullptr,
+                   SourceLogBounds b = {}) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end() && judge == nullptr) return 0;
@@ -255,6 +298,7 @@ public:
             viewSkip.rejected = &write->rejected;
             if (judge != nullptr) {
                 work += syncConstraintSet_(srcTopicId, *judge, *write);
+                if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
                 work += judge->driveJudge(readRange, bound, nowNs, *write, skip.aborted);
                 viewBound = std::min(bound, judge->judgedThrough());
                 work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns);
@@ -270,7 +314,7 @@ public:
             ViewInstance* inst = getOrCreate_(viewTopicId, partition, bound);
             if (inst == nullptr) continue;  // defensive: template must exist
             adoptNs_(*inst, ns);
-            work += driveView_(*inst, readRange, viewBound, viewSkip, transientSrc, leaderGen, leaderHwConfirmed);
+            work += driveView_(*inst, readRange, viewBound, viewSkip, transientSrc, leaderGen, leaderHwConfirmed, b);
         }
         return work + finishRetired_();
     }
@@ -284,7 +328,10 @@ public:
     /// members.  nullptr when the partition is not a verdict source.  Cheap when nothing changed.
     VerdictSource* ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write);
     /// The partition's write state is gone: its judge goes with it.
-    void dropVerdictSource(int32_t srcTopicId, int32_t partition) { verdictSources_.erase(instKey(srcTopicId, partition)); }
+    void dropVerdictSource(int32_t srcTopicId, int32_t partition) {
+        verdictSources_.erase(instKey(srcTopicId, partition));
+        eraseKeyIndex_(instKey(srcTopicId, partition));
+    }
     [[nodiscard]] std::vector<uint64_t> verdictSourceKeysForTest() const {
         std::vector<uint64_t> keys;
         for (const auto& kv : verdictSources_) keys.push_back(kv.first);
@@ -294,6 +341,33 @@ public:
     void setVerdictIntervalNs(int64_t ns) noexcept {
         verdictIntervalNs_ = ns;
         for (auto& kv : verdictSources_) kv.second->setVerdictIntervalNs(ns);
+    }
+    /// Cold: the source topic is gone; its judges and key indexes go with it.
+    void dropSourceTopic(int32_t srcTopicId);
+    /// Cold: a topic's write spec changed key.index, so syncConstraintSet_ must run again.
+    void noteWriteSpecChange() noexcept { ++verdictEpoch_; }
+    /// Test seam: every judge, existing and later created, is held (nothing activates, replays or judges).
+    void holdJudgesForTest(bool hold) noexcept {
+        holdJudges_ = hold;
+        for (auto& kv : verdictSources_) kv.second->holdJudgeForTest(hold);
+    }
+    /// The records one fold pass of (view, partition) may cover (0 = uncapped).  -1: not hosted.
+    [[nodiscard]] int64_t maxRecordsPerPassForTest(int32_t viewTopicId, int32_t partition) const {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it == views_.end() ? -1 : it->second.maxRecordsPerPass;
+    }
+    [[nodiscard]] bool keyIndexContainsForTest(int32_t src, int32_t partition, std::string_view wireKey) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it != keyIndexes_.end() && it->second.table.get(rune::view::ViewKey::fromU64(keyIndexWord(wireKey)).asU64()) != nullptr;
+    }
+    [[nodiscard]] std::size_t keyIndexSizeForTest(int32_t src, int32_t partition) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? 0 : it->second.table.size();
+    }
+    /// -1: the partition has no key index.
+    [[nodiscard]] int64_t keyIndexFoldCursorForTest(int32_t src, int32_t partition) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? -1 : it->second.foldCursor;
     }
     /// Test seam: a TestReject verdict view (viewObjectId, rule) over the source of `plan`.
     void installTestVerdictViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout, rune::codec::Descriptor src,
@@ -306,7 +380,7 @@ public:
     // worker-owned state.
     //
     // SERVE-GUARD (Task 16, Review-focus #5): when the hosted instance is NOT
-    // Ready (still RebuildingViews/Recovering after a restart) getRow returns
+    // Ready (RebuildingViews/Recovering after a restart or a discard, or CatchingUp) getRow returns
     // nullptr with `*outStatus = NotReady` — a RETRIABLE not-ready that the
     // GetViewRow serve path surfaces so a probe never sees a half-built row.
     // `outStatus` is optional (nullptr ignores it), keeping every existing
@@ -345,6 +419,18 @@ public:
         const ViewPaused* pz = std::get_if<ViewPaused>(&it->second.pause);
         return InstanceServeState{it->second.foldLeadership, it->second.foldCursor, true,
                                   it->second.readiness == ViewReadiness::Ready, pz != nullptr, pz ? pz->offset : 0};
+    }
+
+    /// The (view, partition) instance's fold cursor, -1 when it is not hosted.  Tests only.
+    [[nodiscard]] int64_t foldCursorForTest(int32_t viewTopicId, int32_t partition) const noexcept {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it == views_.end() ? -1 : it->second.foldCursor;
+    }
+
+    /// The (view, partition) instance's key index slot count, 0 when it is not hosted.  Tests only.
+    [[nodiscard]] std::size_t indexSlotsForTest(int32_t viewTopicId, int32_t partition) const noexcept {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it == views_.end() ? 0 : it->second.table.indexSlotsForTest();
     }
 
     /// VLS B.3: is `topicId` a view this worker has the plan of -- i.e. a view SINK id?  Pure read of worker-owned
@@ -524,20 +610,34 @@ private:
         const auto it = templates_.find(viewTopicId);
         return it != templates_.end() && it->second.isVerdict;
     }
+    void onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status, ViewDiscardReason reason);
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
     int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
+    void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
+    // Inline: Worker.h's rebuildRcSlots_ reaches it, and that header is built into libraries that do not link rune_node.
+    void eraseKeyIndex_(uint64_t key) {
+        if (const auto it = keyIndexes_.find(key); it != keyIndexes_.end()) {
+            releaseMem_(it->second);
+            keyIndexes_.erase(it);
+        }
+    }
     int finishRetired_();
     int pushVerdictCheckpoint_(ViewInstance& inst);
-    void discardVerdictInstance_(ViewInstance& inst);
+    void beginDiscard_(ViewInstance& inst, ViewDiscardReason reason);
+    [[nodiscard]] bool tryPushDiscard_(ViewInstance& inst);
     bool eraseView_(int32_t viewTopicId);
     void eraseInstance_(int32_t viewTopicId, int32_t partition);
     static int  checkpointHook_(void* ctx, ViewInstance& inst) { return static_cast<WorkerViewSet*>(ctx)->pushVerdictCheckpoint_(inst); }
-    static void discardHook_(void* ctx, ViewInstance& inst) { static_cast<WorkerViewSet*>(ctx)->discardVerdictInstance_(inst); }
+    static void discardHook_(void* ctx, ViewInstance& inst, ViewDiscardReason reason) { static_cast<WorkerViewSet*>(ctx)->beginDiscard_(inst, reason); }
     static void retiredHook_(void* ctx, int32_t viewTopicId, int32_t partition) {
         static_cast<WorkerViewSet*>(ctx)->retiredQueue_.push_back({viewTopicId, partition});
     }
 
     std::unordered_map<uint64_t, std::unique_ptr<VerdictSource>> verdictSources_;   // (srcTopicId, partition) -> judge
+    // The key index of a key.index partition: a verdict member of its judge that is in neither views_ nor templates_.  Rebuilt from the
+    // local log at every activation; never persisted.  unordered_map keeps the node's address across the move-assign that rebuilds it.
+    std::unordered_map<uint64_t, ViewInstance> keyIndexes_;
+    bool holdJudges_ = false;
     struct Retired { int32_t viewTopicId, partition; };
     uint64_t verdictEpoch_ = 0;   // bumped by every verdict template install, retire and erase; syncConstraintSet_ reruns on a change
     std::vector<Retired> retiredQueue_;   // the members the judges dropped, per partition
@@ -577,6 +677,16 @@ private:
     void loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopicId, int32_t partition,
                                  int64_t committedTail);
 
+    /// Cold: what to do with the files a recovered instance found (#590).  Legacy only -> back it up and rebuild; a legacy file
+    /// next to a committed one -> back the legacy one up, keep the committed rows; a committed file that did not replay cleanly
+    /// (a corrupt scan, or `applied` < the verified records) -> back it up and rebuild; a torn tail is only logged (the IO agent trims it);
+    /// a clean checkpoint whose offset is above the source log end (`b.logEnd`) -> back it up and rebuild (#159).
+    void applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, const ViewCheckpointScan& scan, std::size_t applied,
+                                   const SourceLogBounds& b);
+    /// One kDiscardMsgType{LegacySuperseded} frame (fire and forget: its ack, reason LegacySuperseded, never touches CheckpointState; a failure is only logged and counted).  False = ring full.
+    [[nodiscard]] bool tryPushLegacySuperseded_(int32_t viewTopicId, int32_t partition);
+    std::vector<uint64_t> legacyOwed_;   ///< instKeys whose superseded-legacy frame awaits ring room (cold path, nearly always empty)
+
     // Task 19b: if every hosted (viewTopicId, *) instance is Ready, erase
     // viewTopicId from recoveryViews_ (so hasRecovery() returns to false once a
     // view's restart recovery is complete).  No-op if the view is not a recovery
@@ -591,8 +701,28 @@ private:
     template <class ReadRangeFn>
     int driveView_(ViewInstance& inst, ReadRangeFn&& readRange, int64_t bound,
                    const rune::view::FoldSkip& skip,
-                   const TransientBounds* transientSrc, uint64_t leaderGen, bool leaderHwConfirmed) {
+                   const TransientBounds* transientSrc, uint64_t leaderGen, bool leaderHwConfirmed, const SourceLogBounds& b) {
         int work = 0;
+        // 0a. A discard in flight (the old checkpoint is being backed up): fold nothing, checkpoint nothing, serve NotReady until
+        //     the IO agent acks.  Owed = the frame is not on the ring yet (retry it); Failed = never rebuilt over the unsaved file.
+        if (!checkpointSettled(inst)) [[unlikely]] {
+            if (std::holds_alternative<CheckpointDiscardOwed>(inst.checkpoint)) return tryPushDiscard_(inst) ? 1 : 0;
+            return 0;
+        }
+        // 0c. Retention trimmed the disk source below this cursor (#726; a paused view, a stale checkpoint, a fresh view over a trimmed
+        //     log): an instance without rows starts at the log start; one with rows is backed up and rebuilt.  Pure arithmetic, so it
+        //     runs before the namespace pause return: a resumed view sees it on its first pass.
+        if (transientSrc == nullptr && inst.foldCursor < b.logStart) [[unlikely]] {
+            if (!startAtLogStart_(inst, b.logStart)) return 1;
+        }
+        // 0c'. #159: a persisted instance whose cursor is above the source log end holds rows from records the log no longer has
+        //      (a checkpoint outran a lost or truncated log; a lazily recovered instance, created without bounds, lands here on its
+        //      first pass): back it up and rebuild from the log.
+        if (transientSrc == nullptr && inst.persisted && inst.foldCursor > b.logEnd) [[unlikely]] {
+            ++inst.counters.checkpointsAheadOfLog;
+            beginDiscard_(inst, ViewDiscardReason::AheadOfLog);
+            return 1;
+        }
         // 00. Task 12 (D26): the namespace is over its view-memory limit -> pause at foldCursor (reads answer
         //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.
         if (inst.nsSlot != kNoNsSlot && !nsViewGate_(inst)) return work;
@@ -653,7 +783,11 @@ private:
             inst.maxRecordsPerPass > 0
                 ? std::min(bound, inst.foldCursor + inst.maxRecordsPerPass)
                 : bound;
-        const rune::storage::LogReadView view = readRange(inst.foldCursor, passBound);
+        rune::storage::LogReadView view = readRange(inst.foldCursor, passBound);
+        // A disk read stops at the next segment base at or above its end: a compacted gap at a segment end reaching past
+        // passBound reads empty below it.  Nothing is there, so read on to `bound`; the fold still stops at passBound.
+        // (A transient source's read ignores the end, so the second read just repeats the first.)
+        if (view.empty() && passBound < bound) [[unlikely]] view = readRange(inst.foldCursor, bound);
         if (view.empty()) return work;
 
         int64_t cursor = inst.foldCursor;
@@ -664,6 +798,7 @@ private:
                                                       passBound, cursor, skip)
                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view,
                                              passBound, cursor, skip);
+        work += cursor != inst.foldCursor;   // a pass across a compacted gap folds nothing but moves the cursor
         inst.foldCursor = cursor;
         chargeMem_(inst);   // Task 12: the pass may have appended chunks
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted +
@@ -727,6 +862,10 @@ private:
     // [viewTopicId i32][partition i32][delta bytes].  Returns false (and keeps
     // pendingValid) on back-pressure; true once committed.
     [[nodiscard]] bool tryPushDelta_(ViewInstance& inst);
+
+    /// Cold: the source log starts above this instance's cursor.  True = it now starts at the log start; false = it held rows
+    /// from trimmed records and a BelowLogStart discard began.
+    [[nodiscard]] bool startAtLogStart_(ViewInstance& inst, int64_t logStart);
 
     ViewSnapshotChannel& channel_;
     std::string          viewDataDir_;

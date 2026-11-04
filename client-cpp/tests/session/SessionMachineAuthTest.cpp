@@ -1131,7 +1131,7 @@ TEST(SessionMachineAuthRegression, LoginAnsweredSessionEndCodeIsRejectedRegressi
             t.connectAuthRequired();
             Server srv; srv.verifiers.push_back(*rs::makeVerifier("correct horse battery"));
             std::string combined; (void)t.serverFirst(srv, t.clientFirst(), combined);
-            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = static_cast<int16_t>(code)}, 3);
+            t.m->onAuthServerFinal(pc::AuthServerFinal{.errorCode = static_cast<uint16_t>(code)}, 3);
             EXPECT_EQ(t.m->state(), sm::SessionState::Rejected);
             EXPECT_EQ(t.m->rejectCode(), code);
             EXPECT_TRUE(sm::SessionMachine::nonRetriableConnectError(static_cast<int16_t>(code)));

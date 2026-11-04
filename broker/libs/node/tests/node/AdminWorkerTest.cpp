@@ -404,6 +404,8 @@ TEST(AdminWorkerRegression, CatalogDdlRingFramesRoundTripEveryRequestRegression)
     OneToOneByteRing ring{kAdminRequestRingBytes};
     DefineTopicMsg d; d.session = 7; d.corr = 8; d.name = "p"; d.blob = {1, 2}; d.persistence = 1;
     d.replicationFactor = 3; d.config.retentionMs = 99; d.config.partitionKey = "k"; d.meta = meta;
+    d.keyFeatures.keyIndex = true; d.keyFeatures.autoIncrement = true; d.keyFeatures.partitioner = rune::protocol::Partitioner::Modulo;
+    d.keyFeatures.autoIncrementMax = 1000; d.keyFeatures.autoIncrementReserve = 9;
     AlterTopicConfigMsg c; c.session = 7; c.corr = 9; c.name = "p"; c.expectedVersion = 4;
     c.changes = {{rc::ConfigKey::RetentionBytes, 10}, {rc::ConfigKey::MaxCompactionLagMs, -1}}; c.meta = meta;
     AlterViewMsg v; v.session = 7; v.corr = 10; v.name = "v"; v.keyField = "id"; v.persistence = 1;
@@ -424,6 +426,16 @@ TEST(AdminWorkerRegression, CatalogDdlRingFramesRoundTripEveryRequestRegression)
             const auto& got = std::get<DefineTopicMsg>(r);
             EXPECT_EQ(got.blob, d.blob); EXPECT_EQ(got.persistence, 1u); EXPECT_EQ(got.replicationFactor, 3);
             EXPECT_EQ(got.config, d.config); EXPECT_EQ(got.meta, meta);
+            EXPECT_EQ(got.keyFeatures, d.keyFeatures);
+            // The 14-byte key features block is the frame's tail: an unknown flag bit or partitioner is malformed, never cast.
+            for (const auto& [at, value] : {std::pair{n - 14, uint8_t{0x04}}, std::pair{n - 13, uint8_t{2}}}) {
+                std::vector<uint8_t> badFeatures(p, p + n);
+                badFeatures[at] = value;
+                const DdlRequest r2 = decodeDefineTopic(badFeatures.data(), badFeatures.size());
+                const auto* m2 = std::get_if<MalformedDdl>(&r2);
+                ASSERT_NE(m2, nullptr);
+                EXPECT_EQ(m2->reason, "an unknown key feature bit or partitioner");
+            }
             // Truncated: malformed, never a default request; session / corr survive.
             const DdlRequest cutR = decodeDefineTopic(p, n - 1);
             const auto* cut = std::get_if<MalformedDdl>(&cutR);

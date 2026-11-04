@@ -515,10 +515,13 @@ if(BUILD_BENCHMARKS)
         benchmark::benchmark_main)
 
     # ── ControlDutyCycleBench — standalone: SystemMetrics cost on the control duty cycle (header-only metrics) ──
-    add_executable(ControlDutyCycleBench
-        benchmark/BenchmarkMain.cpp
-        benchmark/ControlDutyCycleBench.cpp)
-    target_link_libraries(ControlDutyCycleBench PRIVATE metrics benchmark::benchmark)
+    # It measures a Linux-only path (SYS_getdents64), so it is not built elsewhere.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(ControlDutyCycleBench
+            benchmark/BenchmarkMain.cpp
+            benchmark/ControlDutyCycleBench.cpp)
+        target_link_libraries(ControlDutyCycleBench PRIVATE metrics benchmark::benchmark)
+    endif()
 
     # ── NamespaceHotPathBench (namespaces Phase 2 Task 15) — produce / fetch / point read with the namespace gate and counters;
     #    compiled unchanged at the Phase 1 merge for the A side of the ABAB (see the file header).
@@ -579,12 +582,15 @@ if(BUILD_BENCHMARKS)
         benchmark/AuthCheckBench.cpp
         benchmark/PeerFrameBench.cpp
         benchmark/RebalanceFailoverBench.cpp
-        benchmark/FilterPushBench.cpp)
+        benchmark/FilterPushBench.cpp
+        benchmark/VerdictFeedBench.cpp)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     # FilterPushBench reuses the filter test fakes (player_event rows and batches) and the shared example schema.
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_CLIENT_ROOT}/examples)
     # FusedRuntimePassBench drives a real broker with the shard tests' wire client.
     target_include_directories(rune_broker_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/tests/support)
+    # CatalogBootLog.h (support/) includes "support/TestNodeConfig.h".
+    target_include_directories(rune_broker_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/tests)
     target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway rune_node rune_metadata_msm rune_dynamic_balancer rune_view benchmark::benchmark)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_NODE_INCLUDE})
     if(aeron_FOUND)

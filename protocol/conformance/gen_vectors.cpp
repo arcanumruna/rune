@@ -475,6 +475,33 @@ int main(int argc, char** argv) {
         if (n == 0) { std::fprintf(stderr, "define_topic_v8: encode failed\n"); return 1; }
         write_vec(dir, "define_topic_v8.bin", buf, n);
     }
+    // 18b. define_topic_v17_key_index.bin — define_topic_v8 fields + the TopicKeyFeatures block
+    {
+        rpc::DefineTopic m;
+        m.sessionId = kSessionId; m.correlationId = kCorrelationId;
+        m.topicName = "events"; m.partitionCount = 4; m.persistence = 0; m.replicationFactor = 3;
+        m.config.retentionMs = 60'000; m.config.cleanupPolicy = 1; m.config.partitionKey = "k";
+        m.hasExt = true; m.ext.statement = "topic events partitions 4 replicas 3;"; m.ext.clientName = "cli";
+        m.ext.requestId = {.hi = 0xC11E, .lo = 77};
+        m.ext.hasReplayedFrom = 1; m.ext.replayedClusterId = "src"; m.ext.replayedOffset = 5;
+        m.hasKeyFeatures = true; m.keyFeatures.keyIndex = true;
+        n = m.encode(buf);
+        if (n == 0) { std::fprintf(stderr, "define_topic_v17_key_index: encode failed\n"); return 1; }
+        write_vec(dir, "define_topic_v17_key_index.bin", buf, n);
+    }
+    // 18c. topic_schema_response_v17_key_index.bin
+    {
+        static constexpr uint8_t blob[] = {0xDE, 0xAD, 0xBE};
+        rpc::TopicSchemaResponse m;
+        m.sessionId = kSessionId; m.correlationId = kCorrelationId;
+        m.topicId = 0x40000007; m.version = 2; m.errorCode = 0;
+        m.descriptorBlob = blob; m.descriptorLen = sizeof(blob);
+        m.partitionCount = 4;
+        m.hasKeyFeatures = true; m.keyFeatures.keyIndex = true;
+        n = m.encode(buf);
+        if (n == 0) { std::fprintf(stderr, "topic_schema_response_v17_key_index: encode failed\n"); return 1; }
+        write_vec(dir, "topic_schema_response_v17_key_index.bin", buf, n);
+    }
     // 19. drop_topic.bin
     {
         rpc::DropTopic m;

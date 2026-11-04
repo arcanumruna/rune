@@ -135,7 +135,7 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
               << "        uint8_t* const p = p_;\n"
               << "        ::rune::codec::fly::storeFixedStr(p + 4u + " << f.offset << "u, v, "
               << f.fixedLen << "u);\n"
-              << "        return " << cls << "(p, Rebind{});\n"
+              << "        return " << cls << "(p, Rebind_{});\n"
               << "    }\n";
         } else {
             o << "    [[gnu::always_inline]] " << cls << " " << f.name << "(" << cppType(f.type)
@@ -143,7 +143,7 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
               << "        uint8_t* const p = p_;\n"
               << "        ::rune::codec::fly::store<" << flyType(f.type) << ">(p + 4u + " << f.offset
               << "u, v);\n"
-              << "        return " << cls << "(p, Rebind{});\n"
+              << "        return " << cls << "(p, Rebind_{});\n"
               << "    }\n";
         }
     }
@@ -153,11 +153,11 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
                 o << "    [[gnu::always_inline]] " << cls << " key(const KeyType& v) noexcept {\n"
                   << "        uint8_t* const p = p_;\n"
                   << "        std::memcpy(p + 4u + " << k->offset << "u, v.data(), " << k->fixedLen << "u);\n"
-                  << "        return " << cls << "(p, Rebind{});\n"
+                  << "        return " << cls << "(p, Rebind_{});\n"
                   << "    }\n";
             } else {
-                o << "    [[gnu::always_inline]] " << cls << " key(KeyType v) noexcept { return " << k->name
-                  << "(v); }\n";
+                o << "    [[gnu::always_inline]] " << cls << " key(KeyType v_) noexcept { return " << k->name
+                  << "(v_); }\n";
             }
         }
         if (k->type == PrimType::FixedStr) {
@@ -174,8 +174,8 @@ static void emitEncoder(std::ostringstream& o, const Descriptor& d, const std::s
         }
     }
     o << "\nprivate:\n";
-    o << "    struct Rebind {};  // a setter's returned copy: no header write, no zeroing\n";
-    o << "    " << cls << "(uint8_t* p, Rebind) noexcept : p_(p) {}\n";
+    o << "    struct Rebind_ {};  // a setter's returned copy: no header write, no zeroing\n";
+    o << "    " << cls << "(uint8_t* p, Rebind_) noexcept : p_(p) {}\n";
     o << "    uint8_t* p_;\n";
     o << "};\n\n";
 }
@@ -261,10 +261,10 @@ static void emitDecoder(std::ostringstream& o, const Descriptor& d, const std::s
     if (k != nullptr && k->name != "key") {
         if (k->type == PrimType::FixedStr) {
             o << "    [[nodiscard]] KeyType key() const noexcept {\n"
-              << "        KeyType v{};\n"
-              << "        const std::string_view s = " << k->name << "();\n"
-              << "        if (s.size() == " << k->fixedLen << "u) std::memcpy(v.data(), s.data(), " << k->fixedLen << "u);\n"
-              << "        return v;\n"
+              << "        KeyType v_{};\n"
+              << "        const std::string_view s_ = " << k->name << "();\n"
+              << "        if (s_.size() == " << k->fixedLen << "u) std::memcpy(v_.data(), s_.data(), " << k->fixedLen << "u);\n"
+              << "        return v_;\n"
               << "    }\n";
         } else {
             o << "    [[nodiscard]] KeyType key() const noexcept { return " << k->name << "(); }\n";
@@ -426,14 +426,14 @@ static void emitLineage(std::ostringstream& o, const Descriptor& evolving, const
 /// The steady state of decode_(): a whole record of kVersion reads every field at its constant offset (one
 /// predicted branch, no table, no reset: every member is assigned).
 static void emitDecodeFastPath(std::ostringstream& o, const Descriptor& d) {
-    o << "        if (::rune::codec::fly::load<uint16_t>(r + 2) == kVersion && bl >= kBlockLength) [[likely]] {\n";
+    o << "        if (::rune::codec::fly::load<uint16_t>(r_ + 2) == kVersion && bl_ >= kBlockLength) [[likely]] {\n";
     std::vector<const FieldDescriptor*> vars;
     for (const auto& f : d.fields) {
         if (isVarLen(f.type)) { vars.push_back(&f); continue; }
         if (f.type == PrimType::FixedStr) {
-            o << "            std::memcpy(" << f.name << ".data(), r + 4u + " << f.offset << "u, " << f.fixedLen << "u);\n";
+            o << "            std::memcpy(" << f.name << ".data(), r_ + 4u + " << f.offset << "u, " << f.fixedLen << "u);\n";
         } else {
-            o << "            " << f.name << " = ::rune::codec::fly::load<" << flyType(f.type) << ">(r + 4u + " << f.offset
+            o << "            " << f.name << " = ::rune::codec::fly::load<" << flyType(f.type) << ">(r_ + 4u + " << f.offset
               << "u);\n";
         }
     }
@@ -442,15 +442,15 @@ static void emitDecodeFastPath(std::ostringstream& o, const Descriptor& d) {
         // At kVersion the var fields are exactly the members, in var-index order: one sequential walk.
         // F1 (PR #434 review): a hostile block length past the record's end starts the walk AT the end (every var
         // field empty) - `n - pos` never wraps.
-        o << "            std::size_t pos = 4u + bl <= n ? 4u + bl : n;\n";
+        o << "            std::size_t pos_ = 4u + bl_ <= n_ ? 4u + bl_ : n_;\n";
         for (const FieldDescriptor* f : vars) {
-            o << "            if (n - pos >= 4u && ::rune::codec::fly::load<uint32_t>(r + pos) <= n - pos - 4u) {\n"
-              << "                const uint32_t len = ::rune::codec::fly::load<uint32_t>(r + pos);\n"
-              << "                " << f->name << " = std::string_view(reinterpret_cast<const char*>(r + pos + 4u), len);\n"
-              << "                pos += 4u + len;\n"
+            o << "            if (n_ - pos_ >= 4u && ::rune::codec::fly::load<uint32_t>(r_ + pos_) <= n_ - pos_ - 4u) {\n"
+              << "                const uint32_t len_ = ::rune::codec::fly::load<uint32_t>(r_ + pos_);\n"
+              << "                " << f->name << " = std::string_view(reinterpret_cast<const char*>(r_ + pos_ + 4u), len_);\n"
+              << "                pos_ += 4u + len_;\n"
               << "            } else {\n"
               << "                " << f->name << " = {};\n"
-              << "                pos = n;   // truncated: every later var field reads empty\n"
+              << "                pos_ = n_;   // truncated: every later var field reads empty\n"
               << "            }\n";
         }
     }
@@ -474,46 +474,46 @@ static void emitDecode(std::ostringstream& o, const Descriptor& d, const std::st
       << "        return decodeOwn_(record) || decodeAny_(record, &lineage);\n"
       << "    }\n\n";
     o << "    /// The steady state, inlined: a whole record of kVersion at the constant offsets (false: anything else).\n";
-    o << "    [[nodiscard]] bool decodeOwn_(std::span<const uint8_t> record) noexcept {\n";
-    o << "        if (record.size() < 4u + kBlockLength) return false;\n";
-    o << "        const uint8_t* const r = record.data();\n";
-    o << "        const std::size_t n = record.size();\n";
-    o << "        const uint32_t bl = ::rune::codec::fly::load<uint16_t>(r);\n";
-    o << "        (void)n;\n";
+    o << "    [[nodiscard]] bool decodeOwn_(std::span<const uint8_t> record_) noexcept {\n";
+    o << "        if (record_.size() < 4u + kBlockLength) return false;\n";
+    o << "        const uint8_t* const r_ = record_.data();\n";
+    o << "        const std::size_t n_ = record_.size();\n";
+    o << "        const uint32_t bl_ = ::rune::codec::fly::load<uint16_t>(r_);\n";
+    o << "        (void)n_;\n";
     emitDecodeFastPath(o, d);
     o << "        return false;\n";
     o << "    }\n";
     o << "    /// Any other record: every member reset, then each field through the row of the record's version.\n";
-    o << "    [[gnu::noinline]] [[nodiscard]] bool decodeAny_(std::span<const uint8_t> record, const Lineage* lineage) noexcept {\n";
+    o << "    [[gnu::noinline]] [[nodiscard]] bool decodeAny_(std::span<const uint8_t> record_, const Lineage* lineage_) noexcept {\n";
     o << "        *this = " << structName << "{};\n";
-    o << "        if (record.size() < 4) return false;\n";
-    o << "        const uint8_t* const r = record.data();\n";
-    o << "        const std::size_t n = record.size();\n";
-    o << "        const uint32_t bl = ::rune::codec::fly::load<uint16_t>(r);\n";
-    o << "        const uint16_t ver = ::rune::codec::fly::load<uint16_t>(r + 2);\n";
-    o << "        const uint32_t* const row = layoutFor(ver, lineage);\n";
-    o << "        if (row == nullptr) return false;\n";
-    o << "        (void)bl; (void)n;\n";
+    o << "        if (record_.size() < 4) return false;\n";
+    o << "        const uint8_t* const r_ = record_.data();\n";
+    o << "        const std::size_t n_ = record_.size();\n";
+    o << "        const uint32_t bl_ = ::rune::codec::fly::load<uint16_t>(r_);\n";
+    o << "        const uint16_t ver_ = ::rune::codec::fly::load<uint16_t>(r_ + 2);\n";
+    o << "        const uint32_t* const row_ = layoutFor(ver_, lineage_);\n";
+    o << "        if (row_ == nullptr) return false;\n";
+    o << "        (void)bl_; (void)n_;\n";
     bool anyVar = false;
     for (std::size_t i = 0; i < d.fields.size(); ++i) {
         const auto& f = d.fields[i];
         if (isVarLen(f.type)) { anyVar = true; continue; }
         const uint32_t w = fieldWidth(f);
-        o << "        if (row[" << i << "] != ::rune::codec::kAbsentField && row[" << i << "] + " << w << "u <= bl && 4u + row["
-          << i << "] + " << w << "u <= n) ";
+        o << "        if (row_[" << i << "] != ::rune::codec::kAbsentField && row_[" << i << "] + " << w << "u <= bl_ && 4u + row_["
+          << i << "] + " << w << "u <= n_) ";
         if (f.type == PrimType::FixedStr) {
-            o << "std::memcpy(" << f.name << ".data(), r + 4u + row[" << i << "], " << w << "u);\n";
+            o << "std::memcpy(" << f.name << ".data(), r_ + 4u + row_[" << i << "], " << w << "u);\n";
         } else {
-            o << f.name << " = ::rune::codec::fly::load<" << flyType(f.type) << ">(r + 4u + row[" << i << "]);\n";
+            o << f.name << " = ::rune::codec::fly::load<" << flyType(f.type) << ">(r_ + 4u + row_[" << i << "]);\n";
         }
     }
     if (anyVar) {
-        o << "        std::size_t pos = 4u + bl <= n ? 4u + bl : n;   // never past the end (F1)\n";
-        o << "        uint32_t    at  = 0;\n";
+        o << "        std::size_t pos_ = 4u + bl_ <= n_ ? 4u + bl_ : n_;   // never past the end (F1)\n";
+        o << "        uint32_t    at_  = 0;\n";
         for (std::size_t i = 0; i < d.fields.size(); ++i) {
             const auto& f = d.fields[i];
             if (!isVarLen(f.type)) continue;
-            o << "        if (row[" << i << "] != ::rune::codec::kAbsentField) (void)::rune::codec::fly::readVar(r, n, pos, at, row["
+            o << "        if (row_[" << i << "] != ::rune::codec::kAbsentField) (void)::rune::codec::fly::readVar(r_, n_, pos_, at_, row_["
               << i << "], " << f.name << ");\n";
         }
     }
@@ -539,6 +539,12 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
     if (d.find("encodeTo") != nullptr)
         throw std::invalid_argument("generateHeader: schema '" + d.name +
             "' has a field named 'encodeTo', which collides with the generated Filter::encodeTo — rename the field");
+    // A trailing '_' is the generator's: its locals, parameters and private members (n_, p_, row_, decodeAny_, ...)
+    // all end in one, so no field name may.
+    for (const auto& f : d.fields)
+        if (!f.name.empty() && f.name.back() == '_')
+            throw std::invalid_argument("generateHeader: schema '" + d.name + "' has a field named '" + f.name +
+                "', and a trailing '_' is reserved for the generated code's own names — rename the field");
     if (d.find("Filter") != nullptr)
         throw std::invalid_argument("generateHeader: schema '" + d.name +
             "' has a field named 'Filter', which collides with the generated filter type — rename the field");
@@ -686,25 +692,25 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
     // ── encodedSize() ────────────────────────────────────────────────────────
     // total = 4 (header) + blockLength + sum(4 + len) for each var field
     o << "    [[nodiscard]] size_t encodedSize() const noexcept {\n";
-    o << "        size_t n = 4 + kBlockLength;\n";
+    o << "        size_t n_ = 4 + kBlockLength;\n";
     for (const auto& f : d.fields) {
         if (isVarLen(f.type)) {
-            o << "        n += 4 + " << f.name << ".size();\n";
+            o << "        n_ += 4 + " << f.name << ".size();\n";
         }
     }
-    o << "        return n;\n";
+    o << "        return n_;\n";
     o << "    }\n\n";
 
     // ── encode() ─────────────────────────────────────────────────────────────
     // Layout: [blockLength:u16 LE][version:u16 LE] [fixed block] [var fields: u32len+bytes each]
-    o << "    size_t encode(uint8_t* buf) const noexcept {\n";
-    o << "        uint8_t* p = buf;\n";
+    o << "    size_t encode(uint8_t* buf_) const noexcept {\n";
+    o << "        uint8_t* p_ = buf_;\n";
     o << "        // Header: blockLength (u16 LE) + version (u16 LE)\n";
-    o << "        auto wr16 = [&](uint16_t v) { *p++ = uint8_t(v & 0xff); *p++ = uint8_t(v >> 8); };\n";
-    o << "        auto wr32 = [&](uint32_t v) { *p++ = uint8_t(v); *p++ = uint8_t(v>>8); *p++ = uint8_t(v>>16); *p++ = uint8_t(v>>24); };\n";
-    o << "        auto wr64 = [&](uint64_t v) { for(int i=0;i<8;i++) *p++=uint8_t(v>>(8*i)); };\n";
-    o << "        wr16(kBlockLength);\n";
-    o << "        wr16(kVersion);\n";
+    o << "        auto wr16_ = [&](uint16_t v) { *p_++ = uint8_t(v & 0xff); *p_++ = uint8_t(v >> 8); };\n";
+    o << "        auto wr32_ = [&](uint32_t v) { *p_++ = uint8_t(v); *p_++ = uint8_t(v>>8); *p_++ = uint8_t(v>>16); *p_++ = uint8_t(v>>24); };\n";
+    o << "        auto wr64_ = [&](uint64_t v) { for(int i=0;i<8;i++) *p_++=uint8_t(v>>(8*i)); };\n";
+    o << "        wr16_(kBlockLength);\n";
+    o << "        wr16_(kVersion);\n";
     o << "        // Fixed block\n";
 
     // Emit fixed fields in offset order (they are already in declaration order by the builder)
@@ -725,28 +731,28 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
             switch (f->type) {
                 case PrimType::Int32:
                 case PrimType::Enum:
-                    o << "        wr32(static_cast<uint32_t>(" << f->name << "));\n";
+                    o << "        wr32_(static_cast<uint32_t>(" << f->name << "));\n";
                     break;
                 case PrimType::Int64:
-                    o << "        wr64(static_cast<uint64_t>(" << f->name << "));\n";
+                    o << "        wr64_(static_cast<uint64_t>(" << f->name << "));\n";
                     break;
                 case PrimType::UInt16:
-                    o << "        wr16(" << f->name << ");\n";
+                    o << "        wr16_(" << f->name << ");\n";
                     break;
                 case PrimType::UInt32:
-                    o << "        wr32(" << f->name << ");\n";
+                    o << "        wr32_(" << f->name << ");\n";
                     break;
                 case PrimType::UInt64:
-                    o << "        wr64(" << f->name << ");\n";
+                    o << "        wr64_(" << f->name << ");\n";
                     break;
                 case PrimType::Float64:
-                    o << "        { uint64_t _tmp; std::memcpy(&_tmp, &" << f->name << ", 8); wr64(_tmp); }\n";
+                    o << "        { uint64_t tmp_; std::memcpy(&tmp_, &" << f->name << ", 8); wr64_(tmp_); }\n";
                     break;
                 case PrimType::Bool:
-                    o << "        *p++ = " << f->name << " ? uint8_t(1) : uint8_t(0);\n";
+                    o << "        *p_++ = " << f->name << " ? uint8_t(1) : uint8_t(0);\n";
                     break;
                 case PrimType::FixedStr:
-                    o << "        std::memcpy(p, " << f->name << ".data(), " << f->fixedLen << "u); p += " << f->fixedLen << "u;\n";
+                    o << "        std::memcpy(p_, " << f->name << ".data(), " << f->fixedLen << "u); p_ += " << f->fixedLen << "u;\n";
                     break;
                 default:
                     break;
@@ -768,12 +774,12 @@ std::string generateHeader(const Descriptor& evolving, uint16_t version, std::st
                       return a->offset < b->offset;
                   });
         for (const FieldDescriptor* f : varFields) {
-            o << "        wr32(uint32_t(" << f->name << ".size()));\n";
-            o << "        std::memcpy(p, " << f->name << ".data(), " << f->name << ".size()); p += " << f->name << ".size();\n";
+            o << "        wr32_(uint32_t(" << f->name << ".size()));\n";
+            o << "        std::memcpy(p_, " << f->name << ".data(), " << f->name << ".size()); p_ += " << f->name << ".size();\n";
         }
     }
 
-    o << "        return static_cast<size_t>(p - buf);\n";
+    o << "        return static_cast<size_t>(p_ - buf_);\n";
     o << "    }\n\n";
 
     // ── decode() — #418: through the row of the record's OWN version ─────────

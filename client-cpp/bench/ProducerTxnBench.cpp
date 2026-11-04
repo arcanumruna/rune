@@ -107,7 +107,9 @@ uint32_t recordsPerOp(Path p) { return (p == Path::Batch8 || p == Path::ClaimBat
 // once, before any producer or thread exists, and only read afterwards.
 Completions* g_cq = nullptr;
 
-void deliverRecord(void*, CqRef, const Completion& c) noexcept { (void)g_cq->ring().deliver(c, {}); }
+void deliverRecord(void*, CqRef, const Completion& c, std::span<const uint8_t> payload) noexcept {
+    (void)g_cq->ring().deliver(c, payload);
+}
 void deliverOp(void*, const rune::client::detail::OpTarget& t, const Completion& c,
                std::span<const uint8_t> payload) noexcept {
     if (t.handler.fn != nullptr) {

@@ -4,11 +4,17 @@
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
+#if defined(__APPLE__)
+#include <util.h>   // openpty
+#else
 #include <pty.h>
+#endif
 #include <poll.h>
 #include <sched.h>
 #include <sys/resource.h>
+#if defined(__linux__)
 #include <sys/syscall.h>
+#endif
 #include <sys/wait.h>
 #include <termios.h>
 #include <signal.h>
@@ -949,6 +955,9 @@ TEST(ConsolePollingSourceRegression, WouldBlockAtEveryPositionNeverEndsOrSplitsA
 // is accepted TRUNCATED to its first burst and the login fails with the wrong password.  The rest of the line arrives
 // once the reader waits; the whole password must come back.
 TEST(ConsolePromptRegression, PasswordOnANonBlockingFdIsNotCutAtEagainAdversarialRegression) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "writeWhenBlocked reads /proc/<pid>/task/<tid>/stat (Linux only)";
+#else
     int fds[2];
     ASSERT_EQ(::pipe(fds), 0);
     ASSERT_EQ(::fcntl(fds[0], F_SETFL, ::fcntl(fds[0], F_GETFL) | O_NONBLOCK), 0);
@@ -969,12 +978,16 @@ TEST(ConsolePromptRegression, PasswordOnANonBlockingFdIsNotCutAtEagainAdversaria
     EXPECT_EQ(pw, "secret-pw") << "the password was cut at the first EAGAIN";
     rune::client::detail::wipeString(pw);
     ::close(fds[0]); ::close(fds[1]);
+#endif
 }
 
 // C20 adversarial review (#672 bug class - `-f -` scripts): a script on a non-blocking stdin pipe is read up to the
 // first EAGAIN and the prefix RUNS as if it were the whole script (rc 0): `rune console -f -` and `rune ql -f -`
 // share readScript.  The whole script must run.
 TEST(RuneConsoleOfflineRegression, StdinScriptOnANonBlockingPipeIsReadWholeAdversarialRegression) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "writeWhenBlocked reads /proc/<pid>/task/<tid>/stat (Linux only)";
+#else
     int in[2], res[2];
     ASSERT_EQ(::pipe(in), 0);
     ASSERT_EQ(::pipe(res), 0);
@@ -1003,6 +1016,7 @@ TEST(RuneConsoleOfflineRegression, StdinScriptOnANonBlockingPipeIsReadWholeAdver
     EXPECT_EQ(got.rfind("0\n", 0), 0u) << got;
     EXPECT_NE(got.find("first"), std::string::npos) << got;
     EXPECT_NE(got.find("second"), std::string::npos) << "the script was cut at the first EAGAIN: " << got;
+#endif
 }
 
 // ---- Whole-branch review of PR #704: readScript ('-' through std::cin, 25275f44) attacked through the public CLI ----
@@ -1134,6 +1148,9 @@ TEST(RuneConsoleOfflineRegression, HugeStdinScriptInRandomBurstsOnANonBlockingPi
 // EINTR: a signal (no SA_RESTART) interrupting the blocked stdin read of a '-' script is not end of input: the
 // statements written after it run too.
 TEST(RuneConsoleOfflineRegression, SignalInterruptingTheStdinScriptReadIsNotEndOfInputAdversarialRegression) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "awaitSleeping reads /proc/<pid>/task/<tid>/stat (Linux only)";
+#else
     for (const char* cmd : {"console", "ql"}) {
         int in[2], sig[2];
         ASSERT_EQ(::pipe(in), 0);
@@ -1164,6 +1181,7 @@ TEST(RuneConsoleOfflineRegression, SignalInterruptingTheStdinScriptReadIsNotEndO
         EXPECT_NE(got.find("before_signal"), std::string::npos) << cmd << ": " << got;
         EXPECT_NE(got.find("after_signal"), std::string::npos) << cmd << ": EINTR ended the script: " << got;
     }
+#endif
 }
 
 // A stdin read ERROR (fd 0 write-only: EBADF; a directory: EISDIR) fails the command with nothing run - never an

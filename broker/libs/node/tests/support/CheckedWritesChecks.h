@@ -47,6 +47,58 @@ inline std::string markerUnionProblem(const std::vector<VerdictRig::RigMarker>& 
 // `present` (where a function takes one): the offsets the log still holds.  A compaction removes superseded and rejected records, so
 // the model, built from the history, may name offsets the log no longer has; with `present` null the log is the whole history.
 
+// ---- the ack checks and the retry timings of the matrix drivers (04 and 05) --------------------------------------------------------
+
+using AckTrailer = std::vector<std::tuple<uint16_t, uint16_t, uint32_t>>;
+
+/// The trailer an ack of `n` records based at a.baseOffset must carry: the model's rejections, as (record index, code, constraint id).
+inline AckTrailer trailerFromModel(const CheckedWritesModel& model, const VerdictRig::Ack& a, std::size_t n) {
+    AckTrailer want;
+    for (std::size_t i = 0; i < n; ++i)
+        if (const auto it = model.verdicts().find(a.baseOffset + static_cast<int64_t>(i)); it != model.verdicts().end())
+            want.emplace_back(static_cast<uint16_t>(i), it->second.code, it->second.constraintId);
+    return want;
+}
+
+/// An Ok View ack of `n` records: the trailer is exactly the model's rejections and the frame has the matching length.
+inline void checkModelTrailer(const CheckedWritesModel& model, const VerdictRig::Ack& a, std::size_t n, int64_t corr) {
+    EXPECT_TRUE(a.hasVerdicts);
+    const AckTrailer want = trailerFromModel(model, a, n);
+    EXPECT_EQ(a.verdicts, want) << "the trailer is the model's rejections, corr " << corr;
+    EXPECT_EQ(a.frameLen, 54u + 2 + 8 * want.size());
+}
+
+/// The ack of a re-sent batch against the original's: outside the window DuplicateSequence with no trailer, else the original's ack.
+inline void checkDupAck(const VerdictRig& r, const VerdictRig::Ack& orig, const VerdictRig::Ack& dup, bool outsideWindow) {
+    if (outsideWindow) {
+        EXPECT_EQ(dup.code, static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence));
+        EXPECT_EQ(dup.frameLen, 54u);
+        EXPECT_FALSE(dup.hasVerdicts);
+        EXPECT_EQ(r.stats()->verdictUnknownDuplicates, 1u);
+    } else {
+        EXPECT_EQ(dup.code, 0);
+        EXPECT_EQ(dup.baseOffset, orig.baseOffset);
+        EXPECT_EQ(dup.verdicts, orig.verdicts) << "a retry in the window replays the original verdicts";
+    }
+}
+
+/// The retry timings: `sendOp` sends the batch, `sendFiller(i)` one other write, `resend` the same batch again.  `judgeFirst`: the judge
+/// catches up before the re-send (RetryAfterJudge, RetryAfterWindow); `pastWindow`: 33 more writes push the batch out of the producer's
+/// window first (RetryAfterWindow).  false = the judge did not catch up.
+template <class SendOp, class SendFiller, class Resend>
+bool executeRetry(VerdictRig& r, bool judgeFirst, bool pastWindow, SendOp sendOp, SendFiller sendFiller, Resend resend) {
+    sendOp();
+    if (judgeFirst && !r.driveUntilJudged()) return false;
+    if (pastWindow) {
+        for (uint64_t i = 0; i < 33; ++i) sendFiller(i);
+        if (!r.driveUntilJudged()) return false;
+        r.settle(150);
+    }
+    resend();
+    if (judgeFirst) r.settle(150);
+    return true;
+}
+
 /// (a) The worker's rejected-offset index is the model's verdicts.
 inline void checkIndex(VerdictRig& r, const CheckedWritesModel& model, const std::set<int64_t>* present = nullptr) {
     std::map<int64_t, ModelVerdict> got;
@@ -111,19 +163,26 @@ inline void checkViews(VerdictRig& r, const CheckedWritesModel& model, const Ver
     }
 }
 
-/// (c) A subscription delivered exactly the accepted records (Filtered: the live tag-1 ones).
-inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64_t sub, bool filtered, const std::set<int64_t>* present = nullptr) {
+/// (c) A subscription delivered exactly the accepted records (Filtered: the live tag-1 ones), with their intents; `alsoDelivered`
+/// are further log records the subscription delivers (a Raw one gets an aborted transaction's).
+inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64_t sub, bool filtered, const std::set<int64_t>* present = nullptr,
+                           const std::vector<VerdictRig::RigLogRec>* alsoDelivered = nullptr) {
     for (int i = 0; i < VerdictRig::kMaxPass && r.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) r.pass();   // nothing is delivered while the leadership scan runs
     ASSERT_EQ(r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
     const auto& box = r.collect(sub);
-    std::vector<std::tuple<int64_t, uint64_t, uint16_t>> got, want;
-    for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.tag);
+    std::vector<std::tuple<int64_t, uint64_t, uint16_t, uint8_t>> got, want;
+    for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.tag, d.intent);
+    const auto addWant = [&](const VerdictRig::RigLogRec& a) {
+        if (present != nullptr && present->count(a.offset) == 0) return;
+        want.emplace_back(a.offset, a.id, a.del ? kTombstoneTag : a.tag, a.intent);
+    };
     for (const auto& a : model.acceptedRecords()) {
         if (filtered && (a.del || a.tag != 1)) continue;
-        if (present != nullptr && present->count(a.offset) == 0) continue;
-        want.emplace_back(a.offset, a.id, a.del ? kTombstoneTag : a.tag);
+        addWant(a);
     }
-    EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones";
+    if (alsoDelivered != nullptr) for (const auto& a : *alsoDelivered) addWant(a);
+    std::sort(want.begin(), want.end());
+    EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
 }
 
 /// (e)(g) One cleaner pass keeps everything at or above the verdict bound and every key's latest accepted record.

@@ -14,6 +14,7 @@
 #include <rune/client/producer/ProducerHub.h>
 #include <rune/client/producer/ProducerImpl.h>
 #include <rune/client/producer/ProducerRef.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/TxnMessages.h>
 
@@ -24,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <span>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -83,6 +85,103 @@ TEST(ProducerAllocRegression, SteadyStateAckedFlushAllocatesNothingRegression) {
     const long allocs = alloc_counter::stop();
     EXPECT_EQ(allocs, 0L) << "acked produce steady state must not allocate";
     EXPECT_FALSE(impl.hasInFlight());
+}
+
+// #806: the full-Completion ack handler (Producer::onAck(AckCompletionFn)) builds the Completion on the stack; steady state
+// must allocate nothing, as the scalar handler does.
+TEST(ProducerAllocRegression, CompletionAckHandlerSteadyStateAllocatesNothingRegression) {
+    ProducerImpl impl(ackCfg(4));
+    uint64_t completed = 0;
+    impl.setOnAck([](void* c, const rune::client::Completion&, std::span<const uint8_t>) noexcept {
+        ++*static_cast<uint64_t*>(c);
+    }, &completed);
+    int64_t lastCorr = 0;
+    const ProducerImpl::SendFn sink = [&lastCorr](int32_t, int32_t, int32_t, const uint8_t* b, std::size_t n) {
+        const auto v = rcc::decodeProduce(b, n);
+        lastCorr = v ? v->correlationId : 0;
+        return true;
+    };
+    auto cycle = [&](uint64_t k) {
+        (void)impl.submitSendRecord(1, 0, Key(k), kVal, true, rune::client::producer::ackhandle::forHandler(rune::client::Token(k + 1)));
+        pump(impl, sink);
+        impl.onProduceResponse(lastCorr, static_cast<int64_t>(k), 0);
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k);
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k);
+    const long allocs = alloc_counter::stop();
+    EXPECT_EQ(allocs, 0L);
+    EXPECT_EQ(completed, 1064u) << "every record reached the handler";
+}
+
+// #802: a View producer's per-record verdicts (a claim's rebased list, the span taker, the payload hand-off) allocate nothing
+// in steady state.  One cycle = a claim of 8 answered with rejections {1, 5} and one single send; CQ hooks count what they get.
+namespace {
+struct VerdictCqCount {
+    uint64_t completions = 0, rejected = 0, payloadBytes = 0;
+    static void deliver(void* ctx, rune::client::CqRef, const rune::client::Completion& c,
+                        std::span<const uint8_t> payload) noexcept {
+        auto* self = static_cast<VerdictCqCount*>(ctx);
+        ++self->completions;
+        if (c.status == rune::client::OpStatus::RecordsRejected) ++self->rejected;
+        self->payloadBytes += payload.size();
+    }
+};
+}  // namespace
+TEST(ProducerAllocRegression, ViewBatchVerdictsAllocateNothingRegression) {
+    ProducerConfig cfg = ackCfg(4);
+    cfg.acks = Acks::All | Acks::View;
+    ProducerImpl impl(cfg);
+    VerdictCqCount count;
+    ProducerImpl::Hooks h;
+    h.ctx = &count;
+    h.cqDeliver = &VerdictCqCount::deliver;
+    impl.setHooks(h);
+    int64_t lastCorr = 0;
+    const ProducerImpl::SendFn sink = [&lastCorr](int32_t, int32_t, int32_t, const uint8_t* b, std::size_t n) {
+        const auto v = rcc::decodeProduce(b, n);
+        lastCorr = v ? v->correlationId : 0;
+        return true;
+    };
+    // The trailer {1, 5}: two 8-byte entries (index, code 55, constraint id), built once.
+    std::array<uint8_t, 16> trailer{};
+    for (int e = 0; e < 2; ++e) {
+        trailer[8 * e] = e == 0 ? 1 : 5;
+        trailer[8 * e + 2] = 55;
+        trailer[8 * e + 4] = 1;
+    }
+    // The Tier-2 leg: a sealed 8-record batch (built once) rejected at {0, 7}.
+    std::array<uint8_t, 16> trailer2{};
+    for (int e = 0; e < 2; ++e) {
+        trailer2[8 * e] = e == 0 ? 0 : 7;
+        trailer2[8 * e + 2] = 55;
+        trailer2[8 * e + 4] = 1;
+    }
+    rune::protocol::RecordBatchBuilder tb(0, 1000);
+    for (int i = 0; i < 8; ++i) tb.append(std::string_view("k"), std::string_view("v"), 1000);
+    const auto tier2Bytes = tb.build();
+    const auto cycle = [&](uint64_t k) {
+        (void)impl.submitTier2Bytes(1, 0, rune::client::producer::ackhandle::forCq(0, k + 200'000), 8, tier2Bytes);
+        pump(impl, sink);
+        impl.onProduceResponse(lastCorr, static_cast<int64_t>(k), 0, -1, true, trailer2);
+        const auto g = impl.claimBatch(1, 0, Key(k), 8, 16, rune::client::producer::ackhandle::forCq(0, k + 1));
+        if (g.result != rune::client::SendResult::Ok) return;
+        for (uint32_t i = 0; i < 8; ++i) std::memset(g.base + static_cast<std::size_t>(i) * 16, 0x22, 16);
+        (void)impl.commitClaim(g.token);
+        pump(impl, sink);
+        impl.onProduceResponse(lastCorr, static_cast<int64_t>(k), 0, -1, true, trailer);
+        (void)impl.submitSendRecord(1, 0, Key(k), kVal, true, rune::client::producer::ackhandle::forCq(0, k + 100'000));
+        pump(impl, sink);
+        impl.onProduceResponse(lastCorr, static_cast<int64_t>(k), 0, -1, true, {});
+    };
+    for (uint64_t k = 0; k < 64; ++k) cycle(k);   // warm-up: builder, ring, scratch, frame capacity
+    alloc_counter::start();
+    for (uint64_t k = 64; k < 1064; ++k) cycle(k);
+    const long allocs = alloc_counter::stop();
+    EXPECT_EQ(allocs, 0L) << "a View batch's verdicts must not allocate in steady state";
+    EXPECT_EQ(count.completions, 3u * 1064u);
+    EXPECT_EQ(count.rejected, 2u * 1064u);
+    EXPECT_EQ(count.payloadBytes, 32u * 1064u);
 }
 
 // Regression: the in-flight slot kept its wire frame with vector::assign, whose
@@ -200,7 +299,9 @@ namespace rc  = rune::client;
 // identity Completions::client() is checked against); the rig's one queue is reached through this pointer, set
 // while the rig lives (single test thread).
 rc::Completions* g_txnCq = nullptr;
-void txnDeliverRecord(void*, rc::CqRef, const rc::Completion& c) noexcept { (void)g_txnCq->ring().deliver(c, {}); }
+void txnDeliverRecord(void*, rc::CqRef, const rc::Completion& c, std::span<const uint8_t> payload) noexcept {
+    (void)g_txnCq->ring().deliver(c, payload);
+}
 void txnDeliverOp(void*, const rc::detail::OpTarget& t, const rc::Completion& c,
                   std::span<const uint8_t> payload) noexcept {
     rc::Completion done = c;

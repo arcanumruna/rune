@@ -113,6 +113,14 @@ enum class Acks : uint8_t {
 }
 
 // ---------------------------------------------------------------------------
+// WriteIntent — what a send requires of the topic's key index (checked writes, broker >= 10, acks with View).
+// Upsert (the default) is an ordinary write and rides the wire exactly as before.  Insert fails when the key exists;
+// Update fails when it does not.  An empty value with Update deletes an existing record.
+// ---------------------------------------------------------------------------
+enum class WriteIntent : uint8_t { Upsert = 0, Insert = 1, Update = 2 };
+[[nodiscard]] constexpr uint8_t intentBits(WriteIntent i) noexcept { return static_cast<uint8_t>(i); }
+
+// ---------------------------------------------------------------------------
 // TopicPartitionKey - (topicId, partition) pair.
 // ---------------------------------------------------------------------------
 struct TopicPartitionKey {
@@ -257,6 +265,12 @@ struct ProducerConfig {
 using AckFn = void (*)(void* ctx, Token token, int64_t baseOffset, OpStatus status,
                        uint16_t errorCode) noexcept;
 
+/// The full-completion form of AckFn (Producer::onAck(AckCompletionFn, ctx)): the same Completion a CQ drains for the record
+/// (token, value, aux, op, status, errorCode, and constraintIdOf(c) for a rejected Send), plus the inline payload of the
+/// completion (empty for a producer ack today).  The span is valid only during the call.  Same rules as AckFn: it runs on
+/// the duty thread, must not block, and `ctx` must outlive every op that targets it.
+using AckCompletionFn = void (*)(void* ctx, const Completion& c, std::span<const uint8_t> payload) noexcept;
+
 /// Tag for the onAck-handler target: trySend(topic, key, value, AckToken{t}).
 struct AckToken {
     Token token = 0;
@@ -289,6 +303,8 @@ struct AckToken {
 // records that never reached the wire (failed while still in the producer ring,
 // a builder, the Tier-2 queue or the deferred arena: baseSequence = -1,
 // errorCode = kClientFailure).  A Tier-2 batch is one BatchAck.
+// Checked writes (View): a batch of >= 2 records whose records were judged reports EVERY rejection in its BatchAck (see
+// rejectedCount / rejections below), never only the first; a 1-record batch keeps errorCode = its rejection, baseOffset -1.
 struct BatchAck {
     static constexpr int16_t kClientFailure = -1;  ///< delivery timeout / redirect exhausted / closed
     int32_t topicId      = 0;
@@ -303,6 +319,14 @@ struct BatchAck {
     /// rotation).  Handler form (onBatchAck) only; -1 in the Completions form
     /// (batchAcksTo / batchAckOf: no room in a Completion) and when not sequenced.
     int64_t producerId = -1;
+    /// Checked writes (View, a batch of >= 2 records): the batch was STORED and judged, and the records listed here were
+    /// rejected; every other record was accepted at baseOffset + its index.  `errorCode != 0` with `rejectedCount > 0` means
+    /// exactly that (baseOffset is the real base, errorCode the FIRST rejection's code).  `rejections` points at
+    /// `rejectedCount` 8-byte LE entries (u16 record index, u16 code, u32 constraintId), ascending index; valid only during the
+    /// call.  Handler form (onBatchAck) only; the Completions form carries the list as the completion's payload (status
+    /// RecordsRejected; a Tier-2 batch's BatchAck holds one credit unit and carries the status with an empty payload).
+    uint32_t       rejectedCount = 0;
+    const uint8_t* rejections    = nullptr;
 };
 
 /// Per-batch handler (Producer::onBatchAck): called on the duty thread, one
@@ -404,6 +428,7 @@ struct ClaimOpen {
     Completions*            cq    = nullptr;  ///< per-record ack credit (tryClaim(.., cq, token)); nullptr: none
     Completions*            bq    = nullptr;  ///< batch-ack credit (batchAcksTo); nullptr: none
     uint32_t                units = 0;        ///< batch-ack units reserved on bq
+    uint32_t                cqBytes = kBatchAckUnitBytes;  ///< bytes reserved on cq for the ONE completion (batchCompletionBytes)
 };
 /// Settles a claim and its Completions credit (a friend of Completions).
 struct ClaimCredit {
@@ -497,7 +522,8 @@ private:
 };
 
 /// n records of recLen bytes claimed together and appended as ONE RecordBatch
-/// (one partition, contiguous offsets, all or nothing) — Producer::claimBatch.
+/// (one partition, contiguous offsets, ONE atomic log append — the append is all or nothing, the VERDICTS are not: on a
+/// View producer every record gets its own verdict, see claimBatch) — Producer::claimBatch.
 /// An unfenced claim may JOIN an open RecordBatch with neighbouring sends: its
 /// n records stay contiguous (nothing foreign between them) but the batch is
 /// larger than n.  Call flush() (+ doWork() in Invoker mode) before the claim
@@ -635,8 +661,12 @@ public:
     /// in the ring, it only stops draining them) once close() actually runs.
     /// Acks-expecting callers must treat a late close() the same as any other
     /// failure path; the void path has no acknowledgement to lose.
-    [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key,
-                                     std::span<const uint8_t> value) noexcept;
+    /// A non-Upsert `intent` (here and in every send form below) is refused locally, before anything is queued or
+    /// reserved, with SendResult::WriteNotAllowed (the blocking forms throw std::invalid_argument naming the
+    /// rule): on a raw handle, without View in the producer's acks, in a transaction, or Insert with an empty value.
+    /// A View producer also refuses every send on a raw handle.
+    [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+                                     WriteIntent intent = WriteIntent::Upsert) noexcept;
 
     /// Fire-and-forget send that NEVER drops.  On BackPressured it retries:
     /// Invoker mode, called on the owner thread outside a callback, pumps the
@@ -705,7 +735,7 @@ public:
     /// a full builder at maxInFlight); sends keep accumulating in the ring and
     /// back-pressure once it is full.  In Invoker mode only that partition's
     /// sends report BackPressured.
-    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
+    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, WriteIntent intent = WriteIntent::Upsert);
 
     /// Router forms (T15b M3: a ShardGroup / ClientShard hashes the key ONCE to
     /// route and passes the result down): `partition` is the caller's
@@ -714,8 +744,10 @@ public:
     /// otherwise exactly trySend().  sendTo: exactly send() (std::invalid_argument
     /// for a bad partition).
     [[nodiscard]] SendResult trySendTo(TopicHandle topic, int32_t partition, const Key& key,
-                                       std::span<const uint8_t> value) noexcept;
-    void sendTo(TopicHandle topic, int32_t partition, const Key& key, std::span<const uint8_t> value);
+                                       std::span<const uint8_t> value,
+                                       WriteIntent intent = WriteIntent::Upsert) noexcept;
+    void sendTo(TopicHandle topic, int32_t partition, const Key& key, std::span<const uint8_t> value,
+                WriteIntent intent = WriteIntent::Upsert);
 
     // ---- Opt-in ack paths (F8c C6: ZERO per-send allocation) ----------------
 
@@ -728,20 +760,30 @@ public:
     /// owner thread (WrongThread otherwise — checked in every build).  Statuses
     /// as for AckFn.  acks=None: Ok with value -1 when handed to the transport.
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
-                                     Completions& cq, Token token) noexcept;
+                                     Completions& cq, Token token,
+                                     WriteIntent intent = WriteIntent::Upsert) noexcept;
 
     /// Send whose completion goes to the onAck() handler (duty thread).
     /// InvalidArgument for token > kMaxToken.  Without a handler installed the
     /// completion is dropped (the record is still sent and tracked).
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
-                                     AckToken token) noexcept;
+                                     AckToken token, WriteIntent intent = WriteIntent::Upsert) noexcept;
 
     /// Blocking-on-back-pressure forms (the void send() rules: Invoker owner
     /// pumps, other threads back off; QueueFull is NOT retried here — it
     /// throws std::runtime_error, since only the caller can poll its queue).
     void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, Completions& cq,
-              Token token);
-    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, AckToken token);
+              Token token, WriteIntent intent = WriteIntent::Upsert);
+    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, AckToken token,
+              WriteIntent intent = WriteIntent::Upsert);
+
+    /// Send one record with `intent` and wait for its verdict: the Send completion, unchanged (status Ok with
+    /// value = the record's offset; BrokerError with errorCode 56 / 57 and constraintIdOf() for a refused intent;
+    /// BrokerTooOld).  Flushes at once.  Throws std::invalid_argument for a local refusal (see trySend, KeyTooLong,
+    /// MessageTooLarge).  A wait that outlasts `timeout` (back-pressure included) returns status Timeout, and a
+    /// client closed first returns status Closed.
+    [[nodiscard]] Completion sendAndWait(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+                                         WriteIntent intent, std::chrono::nanoseconds timeout);
 
     // ---- Phase 2b Part B: zero-copy produce (ZERO allocation) -----------------
 
@@ -760,7 +802,8 @@ public:
     [[nodiscard]] Claim tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, AckToken token) noexcept;
 
     /// Claim n records of recLen value bytes each for ONE atomic append (one
-    /// RecordBatch on key's partition, contiguous offsets, all or nothing):
+    /// RecordBatch on key's partition, contiguous offsets; the append is atomic, but a View producer reports a
+    /// verdict per record, never all-or-nothing - see the completion form below):
     /// write record(i) for every i, then commit().  Limits — never retryable:
     /// n >= 1 (InvalidArgument); key + recLen <= kMaxRecordBytes, the whole
     /// batch within ProducerConfig::maxFrameBytes (a conservative bound) and,
@@ -776,6 +819,15 @@ public:
     /// RecordBatch (neighbouring sends of an unfenced claim join the same RecordBatch), so that is one ack and
     /// the completion fires exactly once, after the batch's LAST record is covered.  An acked claimBatch also
     /// reserves its n batchAcksTo() units, like the unacked form.  Both modes.
+    /// View producer (Acks::View, a claim of n >= 2): the completion reports EVERY record.  All accepted: status Ok,
+    /// value = base, no payload.  Otherwise status RecordsRejected, value = base, errorCode / constraintIdOf = the first
+    /// rejection's, and the payload lists every rejection (BatchVerdicts: rejectedCount(), rejection(k), accepted(i),
+    /// offsetOf(i)); every other record was stored at base + its index.  Reservation = delivery: the claim reserves
+    /// 2 x completionRecordBytes(8 x n) - 48 on cq up front (the record plus its own end-of-buffer padding; a plain 48
+    /// bytes without View, or for n == 1), so a verdict list never overflows the queue; a claim whose completion record cannot
+    /// fit one queue record (an eighth of the queue's capacity), or whose reservation exceeds Completions::maxReservation(),
+    /// returns MessageTooLarge with nothing reserved (4096 records fit a default queue).
+    /// A claim of ONE record keeps single-record semantics (BrokerError, value -1).
     [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
                                         Completions& cq, Token token) noexcept;
     /// claimBatch whose single completion goes to the onAck() handler (same value rule as above).
@@ -789,6 +841,10 @@ public:
     /// Setup phase (before the first AckToken send): the per-record ack
     /// handler.  See AckFn.
     void onAck(AckFn fn, void* ctx) noexcept;
+    /// As above, with the full Completion (constraint id, aux, op) instead of four scalars.  The last registration wins; a
+    /// null fn clears the handler.  A captureless lambda picks the overload by its signature; pass a null as
+    /// `static_cast<AckFn>(nullptr)` or `static_cast<AckCompletionFn>(nullptr)`.
+    void onAck(AckCompletionFn fn, void* ctx) noexcept;
 
     /// Setup phase (before the first send): per-batch acknowledgements to a
     /// handler on the duty thread (one call per batch, not per record).
@@ -1048,7 +1104,16 @@ private:
                      int32_t generationId = -1, std::string_view memberId = {});
     /// T15b M3: the one send body; `part` computed once by the caller.
     [[nodiscard]] SendResult trySendPart_(TopicHandle topic, int32_t part, const Key& key,
-                                          std::span<const uint8_t> value) noexcept;
+                                          std::span<const uint8_t> value, WriteIntent intent) noexcept;
+    /// P5-9: the local refusal text for a send, or nullptr when it is allowed.  An Upsert on a non-raw handle of a
+    /// producer without View pays one branch.
+    [[nodiscard]] const char* intentRefusal_(TopicHandle topic, std::span<const uint8_t> value,
+                                             WriteIntent intent) const noexcept;
+    /// True when a send needs intentRefusal_: a non-Upsert intent, or View acks on a raw handle.  Branchless, so the
+    /// caller's single [[unlikely]] test is the only branch an Upsert pays.
+    [[nodiscard]] bool needsIntentCheck_(TopicHandle topic, WriteIntent intent) const noexcept {
+        return (intentBits(intent) | (viewByte_ & static_cast<uint8_t>(topic.kind == TopicKind::Raw))) != 0;
+    }
     /// 2b-B: the one claim body; `part` computed once by the caller, the
     /// per-record ack credit (cq) already reserved by the caller.
     [[nodiscard]] Claim claimPart_(TopicHandle topic, int32_t part, const Key& key, uint32_t valueLen,
@@ -1061,6 +1126,7 @@ private:
     void release_() noexcept;
 
     producer::ProducerImpl* impl_ = nullptr;  // the handle's share (§3.3): ONE load per send
+    uint8_t viewByte_ = 0;                    // 1 when the acks include View (constant from construction)
 };
 
 } // namespace rune::client

@@ -12,7 +12,7 @@ namespace detail {
 
 namespace {
 void giveBack(const ClaimOpen& o) noexcept {
-    if (o.cq != nullptr) o.cq->unreserve(producer::kAckRecordBytes);
+    if (o.cq != nullptr) o.cq->unreserve(o.cqBytes);
     if (o.bq != nullptr) {
         for (uint32_t i = 0; i < o.units; ++i) o.bq->unreserve(producer::kAckRecordBytes);
     }
