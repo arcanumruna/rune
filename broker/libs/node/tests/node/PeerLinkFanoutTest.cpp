@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include <type_traits>
+
 using namespace rune::node;
 
 namespace {
@@ -290,4 +292,24 @@ TEST(PeerLinkFanoutRegression, AConsumedKeysRecordLeavesNoMasterBytesInTheRingRe
     ASSERT_EQ(msgs.size(), 1u);
     EXPECT_EQ(countOf(0xC3), 0u) << "the consumed record left the send master in the ring";
     EXPECT_EQ(countOf(0xC4), 0u) << "the consumed record left the recv master in the ring";
+}
+
+// Issue #546 sibling: Worker::enqueueOp took its WorkerOp BY VALUE, leaving a copy of a PeerLinkKeys op's masters in an
+// unscrubbed parameter (the caller can only scrub its own op).  It now takes const& (the encode reads the op and writes
+// the ring slot directly: there is no scratch copy), so the caller's scrub covers every copy.  tryEnqueueOp likewise.
+// Mutation: either signature back to by-value -> does not compile (red at these asserts).
+TEST(PeerLinkFanoutRegression, EnqueueOpNeverCopiesAKeyCarryingOpRegression) {
+    static_assert(std::is_same_v<decltype(&Worker::enqueueOp), EnqueueResult (Worker::*)(const WorkerOp&)>,
+                  "enqueueOp must not copy the op: its peerKeys would outlive the caller's scrub");
+    static_assert(std::is_same_v<decltype(&Worker::tryEnqueueOp), bool (Worker::*)(const WorkerOp&)>,
+                  "tryEnqueueOp must not copy the op");
+    auto p = pool(1);
+    WorkerOp op;
+    op.type = WorkerOp::Type::PeerLinkKeys; op.topicId = 2; op.partition = 3;
+    op.peerKeys.fill(0x5A);
+    ASSERT_EQ(p->worker(0).enqueueOp(op), EnqueueResult::Enqueued);
+    // The caller scrubs its (only) copy, exactly as PeerLinkFanout::pump does; nothing else holds the masters.
+    std::memset(op.peerKeys.data(), 0, op.peerKeys.size());
+    drainAll(*p);
+    EXPECT_TRUE(workerHolds(*p, 0, 2, 3)) << "the keys still reached the worker";
 }

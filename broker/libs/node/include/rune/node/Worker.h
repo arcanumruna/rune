@@ -1263,13 +1263,16 @@ public:
                t == WorkerOp::Type::PeerLinkKeys;   // Task 15: cold control-plane, ordered with session lifecycle
     }
 
-    [[nodiscard]] bool tryEnqueueOp(WorkerOp op) {
-        return enqueueOp(std::move(op)) == EnqueueResult::Enqueued;
+    [[nodiscard]] bool tryEnqueueOp(const WorkerOp& op) {
+        return enqueueOp(op) == EnqueueResult::Enqueued;
     }
 
     /// F18 (m-1): tryEnqueueOp with the failure kind exposed — Full (ring
     /// back-pressure: retry) vs TooLarge (can never fit: never retry).
-    [[nodiscard]] EnqueueResult enqueueOp(WorkerOp op) {
+    /// Issue #546 sibling: the op is only READ (const&, never copied into a parameter), so a PeerLinkKeys op's masters
+    /// live in the caller's op alone, which the caller scrubs (PeerLinkFanout::pump); the encode goes straight from it
+    /// into the claimed ring slot (no scratch copy).
+    [[nodiscard]] EnqueueResult enqueueOp(const WorkerOp& op) {
         // SBE wrap-in-place: reserve the exact ring slot (computeLength — no
         // hand-rolled size), then encode the WorkerOp DIRECTLY into the claimed
         // buffer via the SBE flyweight (no intermediate struct, no memcpy).

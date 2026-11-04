@@ -76,7 +76,7 @@ public:
                     op.isolation = static_cast<uint8_t>(p.keys.install);   // issue #241: the install mode
                     std::memcpy(op.peerKeys.data(), p.keys.sendMaster.data(), 32);
                     std::memcpy(op.peerKeys.data() + 32, p.keys.recvMaster.data(), 32);
-                    const EnqueueResult r = pool->worker(w).enqueueOp(std::move(op));
+                    const EnqueueResult r = pool->worker(w).enqueueOp(op);
                     scrub_(op.peerKeys.data(), op.peerKeys.size());
                     if (r == EnqueueResult::Full) break;   // back-pressure: this worker again next cycle
                     if (r == EnqueueResult::TooLarge) [[unlikely]]
