@@ -1338,6 +1338,7 @@ void BrokerNode::buildReplication() {
             pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec->durability);
             // E3 Task 5: forward async-durability tier (0=Leader, 1=Majority, 2=Strict).
             pcfg.durabilityTier = spec->durabilityTier;
+            pcfg.producerTailDepth = spec->autoIncrement ? rune::storage::kRetryWindowSize : 1;
 
             // Determine the transport:
             //
@@ -1525,6 +1526,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         pcfg.logStartOffset         = spec.logStartOffset;
         pcfg.durability = static_cast<rune::replication::DurabilityMode>(spec.durability);
         pcfg.durabilityTier = spec.durabilityTier;
+        pcfg.producerTailDepth = spec.autoIncrement ? rune::storage::kRetryWindowSize : 1;
 
         const bool onPerWorkerPlane =
             (topicId >= 0 && !perWorkerReplTransports_.empty());
@@ -4077,7 +4079,8 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m);   // defined wi
 // frame — the SAME mapping (a boot topic is byte-for-byte the topic the live effect
 // would have built).
 TopicSpec bootSpecOfFrame(uint32_t nsId, int32_t topicId, const std::string& name, int32_t partitions, int16_t rf,
-                          rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c) {
+                          rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c,
+                          const rune::protocol::TopicKeyFeatures& kf) {
     CatalogTopicAppliedMsg m;
     m.nsId              = nsId;
     m.topicId           = topicId;
@@ -4086,6 +4089,7 @@ TopicSpec bootSpecOfFrame(uint32_t nsId, int32_t topicId, const std::string& nam
     m.replicationFactor = rf;
     m.persistence       = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
     m.config            = c;
+    m.keyFeatures       = kf;
     return topicSpecFromCatalog(m);
 }
 
@@ -4127,14 +4131,14 @@ void BrokerNode::bootFromCatalog_() {
     sink.topicApplied = [&catalogTopics, this](const cat::TopicObject& t) {
         bootObjects_.onTopic(t.nsId, t.topicId, t.name);
         catalogTopics.push_back(bootSpecOfFrame(t.nsId, t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence,
-                                                t.config));
+                                                t.config, t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}));
     };
     sink.sinkApplied = [&catalogTopics, this](const SinkSpec& sp) {   // a view's sink: a keyed, compacted table, every broker
         bootObjects_.onView(sp.nsId, sp.topicId, sp.name);
         rune::protocol::TopicConfig c;
         c.cleanupPolicy = 1;   // Compact
         c.partitionKey  = sp.keyField;
-        TopicSpec bs = bootSpecOfFrame(sp.nsId, sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c);
+        TopicSpec bs = bootSpecOfFrame(sp.nsId, sp.topicId, sp.name, sp.partitions, /*rf*/0, sp.persistence, c, sp.sourceKeyFeatures);
         bs.viewSink = true;   // VLS B.2: catalog-only -- no dir, no log, no replica
         catalogTopics.push_back(std::move(bs));
     };
@@ -5839,6 +5843,8 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m) {
     s.durabilityTier         = c.durabilityTier;
     s.coPartitionGroup       = c.coPartitionGroup;
     s.partitionKey           = c.partitionKey;
+    s.partitioner            = m.keyFeatures.partitioner;
+    s.autoIncrement          = m.keyFeatures.autoIncrement;
     return s;
 }
 } // namespace

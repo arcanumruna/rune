@@ -1470,7 +1470,9 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 //                             maxCompactionLagMs:i64 retentionCheckMs:i64
 //                             fileDeleteDelayMs:i64 durability:u8 durabilityTier:u8
 //                             coPartitionGroupLen:u16 + bytes, partitionKeyLen:u16 + bytes
-//                             [nsId:u32]   (namespaces Task 5: the owning namespace; appended LAST)
+//                             [nsId:u32]   (namespaces Task 5: the owning namespace)
+//                             [flags:u8 (bit0 keyIndex, bit1 autoIncrement)][partitioner:u8]   (checked writes Part 06;
+//                             a frame without these two bytes is Fnv1a with no autoincrement; appended LAST)
 //   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name][nsId:u32]
 //   kA2cCatalogTopicConfig  : [topicId:i32][count:u16][(key:u8, value:i64) * count]
 //   kA2cViewUninstall       : [viewTopicId:i32]
@@ -1515,19 +1517,23 @@ struct CatalogTopicAppliedMsg {
     uint8_t                     persistence       = 0;   // 0 disk, 1 transient
     rune::protocol::TopicConfig config;
     uint32_t                    nsId              = 0;   // the owning namespace (names are per namespace)
+    rune::protocol::TopicKeyFeatures keyFeatures{};   // only keyIndex, autoIncrement and partitioner travel
 };
+
+/// The key-feature flags and partitioner bytes after nsId.
+inline constexpr std::size_t kCatalogTopicAppliedFeatureBytes = 2;
 
 /// 0 = cannot be encoded (a string longer than a u16 prefix holds).
 [[nodiscard]] inline std::size_t catalogTopicAppliedWireLen(std::string_view name,
                                                             const rune::protocol::TopicConfig& c) noexcept {
     if (name.size() > kMaxStr16 || c.coPartitionGroup.size() > kMaxStr16 || c.partitionKey.size() > kMaxStr16)
         return 0;
-    return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c) + 4;
+    return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c) + 4 + kCatalogTopicAppliedFeatureBytes;
 }
 
 inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_view name, int32_t partitions,
                                      int16_t rf, uint8_t persistence, const rune::protocol::TopicConfig& c,
-                                     uint32_t nsId = 0) {
+                                     uint32_t nsId = 0, const rune::protocol::TopicKeyFeatures& kf = {}) {
     using namespace admin_wire;
     putI32(p, topicId); p += 4;
     p = putStr16(p, name);
@@ -1548,7 +1554,9 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     *p++ = c.durabilityTier;
     p = putStr16(p, c.coPartitionGroup);
     p = putStr16(p, c.partitionKey);
-    putU32(p, nsId);
+    putU32(p, nsId); p += 4;
+    *p++ = static_cast<uint8_t>((kf.keyIndex ? 1u : 0u) | (kf.autoIncrement ? 2u : 0u));
+    *p   = static_cast<uint8_t>(kf.partitioner);
 }
 
 [[nodiscard]] inline bool decodeCatalogTopicApplied(const uint8_t* buf, std::size_t len, CatalogTopicAppliedMsg& m) {
@@ -1579,6 +1587,16 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     if (!getStr16(buf, len, pos, c.partitionKey)) return false;
     if (pos + 4 > len) return false;
     m.nsId = getU32(buf + pos); pos += 4;
+    m.keyFeatures = {};
+    if (pos != len) {   // the feature bytes; a frame without them is Fnv1a, no autoincrement
+        if (pos + kCatalogTopicAppliedFeatureBytes != len || (buf[pos] & 0xFC) != 0 ||
+            buf[pos + 1] > static_cast<uint8_t>(rune::protocol::Partitioner::Modulo))
+            return false;
+        m.keyFeatures.keyIndex      = (buf[pos] & 1u) != 0;
+        m.keyFeatures.autoIncrement = (buf[pos] & 2u) != 0;
+        m.keyFeatures.partitioner   = static_cast<rune::protocol::Partitioner>(buf[pos + 1]);
+        pos += kCatalogTopicAppliedFeatureBytes;
+    }
     return pos == len && m.topicId >= 0 && m.partitions > 0 && !m.name.empty();
 }
 

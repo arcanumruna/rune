@@ -2,6 +2,7 @@
 #include <rune/protocol/PartitionHash.h>
 
 #include <array>
+#include <random>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -9,6 +10,8 @@
 #include <vector>
 
 using rune::protocol::fnv1a64;
+using rune::protocol::Partitioner;
+using rune::protocol::partitionFor;
 using rune::protocol::partitionForKey;
 
 namespace {
@@ -186,4 +189,45 @@ TEST(PartitionHashRegression, EmptyKeyIsPartitionZero) {
         EXPECT_EQ(partitionForKey(empty, n), 0) << "partitionCount=" << n;
     }
     static_assert(partitionForKey(std::span<const uint8_t>{}, 8) == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Checked writes Part 06: partitionFor and the Modulo partitioner.
+// ---------------------------------------------------------------------------
+namespace {
+template <std::size_t N>
+std::array<uint8_t, N> leBytes(uint64_t v) {
+    std::array<uint8_t, N> k{};
+    for (std::size_t i = 0; i < N; ++i) k[i] = static_cast<uint8_t>(v >> (8 * i));
+    return k;
+}
+} // namespace
+
+TEST(CheckedWritesAutoIncRouting, ModuloIsTheLittleEndianIdModP) {
+    EXPECT_EQ(partitionFor(leBytes<8>(4097), 4, Partitioner::Modulo), 1);
+    EXPECT_EQ(partitionFor(leBytes<4>(7), 3, Partitioner::Modulo), 1);
+    EXPECT_EQ(partitionFor(leBytes<8>(0), 5, Partitioner::Modulo), 0);
+    EXPECT_EQ(partitionFor(std::span<const uint8_t>{}, 5, Partitioner::Modulo), 0);
+    EXPECT_EQ(partitionFor(leBytes<9>(12345), 5, Partitioner::Modulo), 0);
+    EXPECT_EQ(partitionFor(leBytes<8>(12345), 1, Partitioner::Modulo), 0);
+
+    std::mt19937_64 rng(42);
+    for (int i = 0; i < 10000; ++i) {
+        const int32_t P = 2 + static_cast<int32_t>(rng() % 63);
+        const int32_t p = static_cast<int32_t>(rng() % static_cast<uint64_t>(P));
+        const uint64_t n = rng() % (UINT64_MAX / 64);
+        EXPECT_EQ(partitionFor(leBytes<8>(n * static_cast<uint64_t>(P) + static_cast<uint64_t>(p)), P, Partitioner::Modulo), p);
+    }
+    static constexpr std::array<uint8_t, 8> kId{0x01, 0x10, 0, 0, 0, 0, 0, 0};   // 4097
+    static_assert(partitionFor(kId, 4, Partitioner::Modulo) == 1);
+}
+
+TEST(CheckedWritesAutoIncRoutingRegression, Fnv1aIsUnchangedRegression) {
+    std::mt19937_64 rng(7);
+    for (int i = 0; i < 10000; ++i) {
+        std::vector<uint8_t> k(rng() % 17);
+        for (auto& b : k) b = static_cast<uint8_t>(rng());
+        const int32_t P = 1 + static_cast<int32_t>(rng() % 64);
+        EXPECT_EQ(partitionFor(k, P, Partitioner::Fnv1a), partitionForKey(k, P));
+    }
 }

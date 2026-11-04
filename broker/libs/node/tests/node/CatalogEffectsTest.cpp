@@ -138,10 +138,11 @@ public:
     const fs::path& dataDir() const { return dir_; }
 
     // ── catalog effects, as the applier's production sink posts them ─────────
-    void applyCreateTopic(int32_t topicId, const std::string& name, int32_t partitions) {
+    void applyCreateTopic(int32_t topicId, const std::string& name, int32_t partitions,
+                          const rune::protocol::TopicKeyFeatures& kf = {}) {
         const rune::protocol::TopicConfig c;   // the catalog's defaults (Delete, retention off)
         std::vector<uint8_t> f(catalogTopicAppliedWireLen(name, c));
-        writeCatalogTopicApplied(f.data(), topicId, name, partitions, /*rf*/0, /*persistence=*/0, c);
+        writeCatalogTopicApplied(f.data(), topicId, name, partitions, /*rf*/0, /*persistence=*/0, c, /*nsId=*/0, kf);
         node_->postCatalogEffectForTest(kA2cCatalogTopicApplied, std::move(f));
     }
     void applyDropTopic(int32_t topicId, const std::string& name) {
@@ -185,6 +186,13 @@ public:
     bool awaitTopicState(int32_t topicId, rune::gateway::TopicRegistry::TopicState st,
                          std::chrono::milliseconds timeout) {
         return awaitTrue([&] { return topicState(topicId) == st; }, timeout);
+    }
+    std::optional<rune::protocol::Partitioner> registryPartitioner(int32_t topicId, bool viewSink) {
+        return node_->onControlThreadForTest([&]() -> std::optional<rune::protocol::Partitioner> {
+            const auto* reg = node_->gatewayForTest()->topicRegistry();
+            const TopicSpec* spec = viewSink ? reg->viewSinkSpec(topicId) : reg->topic(topicId);
+            return spec ? std::optional(spec->partitioner) : std::nullopt;
+        });
     }
     int32_t registryTopicCount() {
         return node_->onControlThreadForTest([&] { return node_->gatewayForTest()->topicRegistry()->topicCount(); });
@@ -324,6 +332,31 @@ TEST_P(CatalogEffectsRegression, AppliedTopicIsCreatedAtItsCatalogIdAndPlaced) {
     EXPECT_EQ(n.topicIdForName("later"), 5);
     EXPECT_EQ(n.topicState(3), rune::gateway::TopicRegistry::TopicState::Unknown) << "a never-seen id: a Gap";
     EXPECT_EQ(n.produceErrorCode(3, 0), kUnknownTopic);
+}
+
+// Checked writes Part 06: the topic's partitioner reaches the registry, an autoincrement topic's replicas keep the
+// whole producer retry window, a view sink routes like its source, and a plain topic stays Fnv1a with depth 1.
+TEST_P(CatalogEffectsRegression, CheckedWritesAutoIncRoutingCatalogEffectCarriesThePartitioner) {
+    SingleNode n("eff_modulo", GetParam());
+    const rune::protocol::TopicKeyFeatures modulo{.autoIncrement = true, .partitioner = rune::protocol::Partitioner::Modulo};
+    n.applyCreateTopic(0, "ids", 2, modulo);
+    n.applyCreateTopic(1, "plain", 1);
+    ASSERT_TRUE(n.awaitServes(0, 10s));
+    ASSERT_TRUE(n.awaitServes(1, 10s));
+    EXPECT_EQ(n.registryPartitioner(0, false), rune::protocol::Partitioner::Modulo);
+    EXPECT_EQ(n.registryPartitioner(1, false), rune::protocol::Partitioner::Fnv1a);
+    EXPECT_EQ(n.node()->onOwnerThreadForTest(0, 1, [](PartitionReplica& r) { return r.producerTailDepth(); }),
+              rune::protocol::client::kIdempotentMaxInFlightBatches);
+    EXPECT_EQ(n.node()->onOwnerThreadForTest(1, 0, [](PartitionReplica& r) { return r.producerTailDepth(); }), 1);
+
+    rune::protocol::TopicConfig c;   // a view sink over the autoincrement topic
+    c.cleanupPolicy = 1;
+    c.partitionKey  = "id";
+    std::vector<uint8_t> f(catalogTopicAppliedWireLen("ids_view", c));
+    writeCatalogTopicApplied(f.data(), 2, "ids_view", 2, 0, /*persistence=*/1, c, /*nsId=*/0, modulo);
+    n.postRaw(kA2cCatalogSinkApplied, std::move(f));
+    ASSERT_TRUE(n.awaitServes(2, 10s));
+    EXPECT_EQ(n.registryPartitioner(2, true), rune::protocol::Partitioner::Modulo);
 }
 
 // Review focus #3 (F23: the assertion checks the NEW object id).  RED: the reused
