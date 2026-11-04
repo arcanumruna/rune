@@ -105,6 +105,7 @@
 #include <rune/node/WriteState.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/LogReadView.h>
+#include <rune/transaction/ReadCommittedView.h>
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/AggFold.h>
 #include <rune/view/AggState.h>
@@ -336,10 +337,16 @@ struct BatchStream {
     int64_t bound(size_t i) const { return baseOffset[i] + recCount[i]; }
 };
 
-// `append(RecordBatchBuilder&, const Op&)` writes one record (NOT timed).
-template <class AppendFn>
+// #591: the default per-batch hook (a no-op): the other benches' streams are unchanged.
+struct NoPrepare {
+    void operator()(rune::protocol::RecordBatchBuilder&, size_t /*batchIdx*/) const noexcept {}
+};
+
+// `append(RecordBatchBuilder&, const Op&)` writes one record (NOT timed); `prepare(RecordBatchBuilder&, batchIdx)`
+// runs once per batch before its records (e.g. to mark the batch transactional).
+template <class AppendFn, class PrepareFn = NoPrepare>
 BatchStream buildStream(const std::vector<Op>& ops, const int* sizes, size_t sizesLen,
-                        AppendFn&& append) {
+                        AppendFn&& append, PrepareFn&& prepare = PrepareFn{}) {
     BatchStream s;
     s.bytes.reserve(ops.size() * 48);
     s.byteOffset.reserve(ops.size());
@@ -355,6 +362,7 @@ BatchStream buildStream(const std::vector<Op>& ops, const int* sizes, size_t siz
         const uint32_t n = static_cast<uint32_t>(std::min<size_t>(want, ops.size() - opIdx));
 
         rune::protocol::RecordBatchBuilder bb(nextOffset, 0);
+        prepare(bb, s.size());
         for (uint32_t j = 0; j < n; ++j) append(bb, ops[opIdx + j]);
 
         const size_t byteOff = s.bytes.size();
@@ -545,7 +553,10 @@ struct AggRig {
 } // namespace
 
 // The BM_ViewFoldReplace workload; BM_ViewFoldVerdict/key_index runs it too, for its gate's baseline.
-static PhaseResult runReplaceFold(size_t& finalSize) {
+// Arg "txn": 0 = plain batches (kNoSkip, as before); 1 = EVERY batch is transactional (producerId 1 + batchIdx % 8) and
+// the fold carries an aborted-transaction index of 64 ranges (pids 100..163, spread over the stream's offsets, never the
+// batch pids), so every batch does a real, non-empty index lookup that answers "not aborted" (#591).
+static PhaseResult runReplaceFold(size_t& finalSize, bool txn = false) {
     auto src = charSourceV1();
     const rune::codec::Descriptor* srcs[] = {&src};
     auto comp = compileView(hpView(), srcs, 0x51000001).value();
@@ -564,12 +575,29 @@ static PhaseResult runReplaceFold(size_t& finalSize) {
                 const auto val = encodeCharacter(static_cast<int64_t>(op.key), op.hp, 1);
                 bb.append(asSv(kb), asSv(val), 0);
             }
+        },
+        [txn](rune::protocol::RecordBatchBuilder& bb, size_t batchIdx) {
+            if (!txn) return;
+            bb.setProducerId(static_cast<int64_t>(1 + batchIdx % 8));
+            bb.setProducerEpoch(0);
+            bb.setBaseSequence(0);
+            bb.setTransactional(true);
         });
+
+    rune::transaction::AbortedTxnIndex aborted;
+    if (txn) {
+        const int64_t span = static_cast<int64_t>(kTotalOps) / 64;
+        for (int64_t i = 0; i < 64; ++i) aborted.onAbortMarker(100 + i, i * span, i * span + span - 1);
+    }
+    rune::view::FoldSkip skip;
+    if (txn) {
+        skip.aborted.index = &aborted;
+    }
 
     auto foldOne = [&](size_t i) {
         auto lv = stream.view(i);
         int64_t cur = 0;
-        return foldBatch(comp.plan, comp.rowLayout, vdc, table, lv, stream.bound(i), cur, rune::view::kNoSkip);
+        return foldBatch(comp.plan, comp.rowLayout, vdc, table, lv, stream.bound(i), cur, skip);
     };
     // Replace: one drain right before the alloc probe (unchanged from Task 11).
     auto drainAll = [&] { table.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {}); };
@@ -582,13 +610,15 @@ static PhaseResult runReplaceFold(size_t& finalSize) {
 }
 
 static void BM_ViewFoldReplace(benchmark::State& st) {
+    const bool txn = st.range(0) == 1;
     for (auto _ : st) {
         size_t finalSize = 0;
-        auto r = runReplaceFold(finalSize);
+        auto r = runReplaceFold(finalSize, txn);
         reportCommon(st, "", r, finalSize);
     }
 }
 BENCHMARK(BM_ViewFoldReplace)
+    ->ArgName("txn")->Arg(0)->Arg(1)
     ->Unit(benchmark::kMicrosecond)
     ->Iterations(1)
     ->UseRealTime();

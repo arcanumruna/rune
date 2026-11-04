@@ -773,6 +773,14 @@ public:
     /// logGeneration() (a reconcile append records the LEO before it): every
     /// offset below it is unchanged by that change.  Owner thread only.
     [[nodiscard]] Offset      lastTruncationOffset() const noexcept { return lastTruncationOffset_; }
+    /// #809: the LOWEST cut since the previous take (max = none), then reset.  lastTruncationOffset() is only the last cut; two
+    /// cuts X < Y between two worker passes leave a consumer that folds a timeline (the verdict timeline) holding entries in [X, Y).
+    /// Exactly one consumer takes it (the worker's verdictOnLogCut_); nothing else resets it.
+    [[nodiscard]] Offset      takeTruncationFloor() noexcept {
+        const Offset f = cutFloor_;
+        cutFloor_ = std::numeric_limits<Offset>::max();
+        return f;
+    }
     /// F15 S4: bumped on every Leader <-> Follower transition (becomeLeader from
     /// a non-leader, becomeFollower, self-demotion in onFetchRequest) — NOT on a
     /// leader-epoch bump while still Leader.  While Follower the log may grow by
@@ -1669,6 +1677,7 @@ private:
     uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation
     uint64_t leaderAnswers_ = 0;           ///< issues #15 / #111: accepted current-leader answers (see leaderAnswers())
     Offset   lastTruncationOffset_ = 0;    ///< F15: cut point of the last generation bump
+    Offset   cutFloor_ = std::numeric_limits<Offset>::max();   ///< #809: lowest cut point since takeTruncationFloor()
     uint64_t leadershipGeneration_ = 0;    ///< F15 S4: bumped on every Leader <-> Follower transition
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
     static constexpr Offset kChangedFromLatest = INT64_MIN;

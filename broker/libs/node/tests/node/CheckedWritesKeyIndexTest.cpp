@@ -12,6 +12,7 @@
 #include <rune/node/VerdictSource.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/RejectedOffsetIndex.h>
+#include <rune/transaction/AbortedTxnIndex.h>
 #include <rune/view/PlanCompiler.h>
 
 using namespace rune::node;
@@ -212,7 +213,6 @@ TEST(CheckedWritesKeyIndex, TombstonesAreNeverRejectedExceptRemoveExistingOnAbse
 
 namespace {
 
-bool abortedPid77(const void*, int64_t pid, int64_t) noexcept { return pid == 77; }
 
 }  // namespace
 
@@ -229,7 +229,9 @@ TEST(CheckedWritesKeyIndex, FoldReplaysUnjudgedAndSkips) {
     rejected.reserve(16);
     ASSERT_TRUE(rejected.add(3, kViolation, 0));
     ASSERT_TRUE(rejected.add(7, kViolation, 0));
-    const rune::view::FoldSkip skip{.aborted = {abortedPid77, nullptr}, .rejected = &rejected};
+    rune::transaction::AbortedTxnIndex aborted;
+    aborted.onAbortMarker(/*pid*/ 77, /*firstDataOffset*/ 4, /*abortMarkerOffset*/ 6);
+    const rune::view::FoldSkip skip{.aborted = {&aborted}, .rejected = &rejected};
     const std::set<int64_t> live{3, 7, 8};
     const auto liveSet = [&](rune::view::ViewTable& t) {
         std::set<int64_t> out;

@@ -1578,8 +1578,9 @@ private:
     /// producer completion to registry slot `ref` (generation check + the
     /// producer-op accounting above), and the begin-close / closeImmediately
     /// issue path.
-    static void producerCqDeliverTrampoline_(void* ctx, CqRef ref, const Completion& c) noexcept;
-    void producerCqDeliver_(CqRef ref, const Completion& c) noexcept;
+    static void producerCqDeliverTrampoline_(void* ctx, CqRef ref, const Completion& c,
+                                             std::span<const uint8_t> payload) noexcept;
+    void producerCqDeliver_(CqRef ref, const Completion& c, std::span<const uint8_t> payload) noexcept;
     static OpResult issueProducerCloseTrampoline_(void* ctx, producer::ProducerImpl& impl,
                                                   const CompletionTarget* target, Token token);
     OpResult issueProducerClose_(producer::ProducerImpl& impl, const CompletionTarget* target, Token token);

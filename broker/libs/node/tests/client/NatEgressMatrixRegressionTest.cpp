@@ -43,6 +43,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <thread>
 #include <vector>
 
@@ -1219,32 +1220,68 @@ static void seedFailoverLeg(bool nat, const char* tag) {
     std::vector<int32_t> leaders;
     ASSERT_TRUE(awaitLeaders(c, spec.topicId, 3, leaders, 30s));
 
+    // The seed and session state belong to the client's duty thread: the test never reads it while the client runs (a
+    // TSan race on the seed's channel string).  The duty thread copies it here from its own callbacks (onConnected and
+    // every record) and the test reads the copy under the lock.  Declared before the client, which outlives it.
+    struct SeedSeen {
+        std::mutex               mu;
+        uint64_t                 failovers  = 0;
+        std::string              seedChannel;
+        bool                     correlated = false;
+        std::vector<std::string> leaderSessionChannels;   // Connected sessions other than the seed's
+    } seen;
+    const auto seenCopy = [&seen] {
+        std::lock_guard lk(seen.mu);
+        return std::tuple{seen.failovers, seen.seedChannel, seen.correlated, seen.leaderSessionChannels};
+    };
+
     const int seed = 1;
     auto cfg = nat ? natClient(c, seed, r) : oldClient(c, seed);
     cfg.topics = {spec};
     auto client = connectOrFail(cfg);
     ASSERT_NE(client, nullptr);
+    const auto snap = [&seen, cl = client.get()] {   // on the duty thread only
+        std::lock_guard lk(seen.mu);
+        seen.failovers   = cl->testSeedFailovers();
+        seen.seedChannel = cl->testSeedChannel();
+        seen.correlated  = cl->testSeedResponseCorrelated();
+        seen.leaderSessionChannels.clear();
+        for (uint32_t i = 1; i < cl->testSessionCount(); ++i)
+            if (cl->testSessionStateAt(i) == rune::client::session::SessionState::Connected)
+                seen.leaderSessionChannels.push_back(cl->testSessionChannelAt(i));
+    };
+    client->onConnected([snap](int64_t) { snap(); });
     Collector col;
-    auto subs = subscribeAll(*client, spec, col);
+    std::vector<rc::Subscription> subs;
+    {
+        rc::SubscribeOptions o;
+        o.from = rc::From::earliest();
+        for (int32_t p = 0; p < spec.partitionCount; ++p)
+            subs.push_back(client->subscribe(handleOf(spec), p, o, [&col, snap](const rc::Record& rec) {
+                col.add(rec);
+                snap();
+            }));
+    }
     // Every partition leader now has a session (and a bind) from this client.
     const Sent before = produceN(*client, handleOf(spec), "seedA", 0, 150, rc::Acks::All);
     EXPECT_EQ(before.ok, 150) << before.firstBad << " undone " << before.undone;
+    // The last of them delivered: the copy is the state after every leader session was used.
+    ASSERT_TRUE(waitUntil([&] { return col.count(asSet(before.okValues)) == before.okValues.size(); }, 60s));
 
     // Topology (C1), asserted BEFORE acting: the client holds Connected leader sessions on nodes other than the seed.
     // The seed's first failover attempt prefers a broker a node session is Connected to, so it lands ON one of them.
-    std::vector<std::string> leaderSessionChannels;
-    for (uint32_t i = 1; i < client->testSessionCount(); ++i)
-        if (client->testSessionStateAt(i) == rune::client::session::SessionState::Connected)
-            leaderSessionChannels.push_back(client->testSessionChannelAt(i));
+    const auto [failoversBefore, seedBefore, correlatedBefore, leaderSessionChannels] = seenCopy();
+    ASSERT_EQ(failoversBefore, 0u) << "the seed failed over before its node was stopped";
     ASSERT_FALSE(leaderSessionChannels.empty()) << "no leader session besides the seed's: the topology C1 needs is not there";
     for (const auto& ch : leaderSessionChannels)
-        ASSERT_NE(ch, client->testSeedChannel()) << "a leader session on the seed's own node is not the failover topology";
+        ASSERT_NE(ch, seedBefore) << "a leader session on the seed's own node is not the failover topology";
 
     c.stop(seed);
-    ASSERT_TRUE(waitUntil([&] { return client->testSeedFailovers() >= 1; }, 60s)) << "the seed never failed over";
-    EXPECT_NE(std::find(leaderSessionChannels.begin(), leaderSessionChannels.end(), client->testSeedChannel()),
+    ASSERT_TRUE(waitUntil([&] { return std::get<0>(seenCopy()) >= 1; }, 60s)) << "the seed never failed over";
+    const std::string seedAfter = std::get<1>(seenCopy());
+    EXPECT_NE(std::find(leaderSessionChannels.begin(), leaderSessionChannels.end(), seedAfter),
               leaderSessionChannels.end())
-        << "the seed must have failed over ONTO a node that holds a leader session (" << client->testSeedChannel() << ")";
+        << "the seed must have failed over ONTO a node that holds a leader session (" << seedAfter << ")";
     std::vector<int32_t> survivors;
     ASSERT_TRUE(awaitLeaders(c, spec.topicId, 3, survivors, 60s)) << "every partition re-led on the survivors";
     const Sent after = produceN(*client, handleOf(spec), "seedB", 0, 150, rc::Acks::All);
@@ -1255,7 +1292,7 @@ static void seedFailoverLeg(bool nat, const char* tag) {
     for (auto& sub : subs) sub.unsubscribe();
     // (the control client has no seed response port, but the cluster's Metadata teaches it the survivors' ports, so
     // after the failover its seed pair is response-correlated too: only the NAT leg asserts the mode)
-    if (nat) EXPECT_TRUE(client->testSeedResponseCorrelated());
+    if (nat) EXPECT_TRUE(std::get<2>(seenCopy())) << "as of the last record delivered";
     client->close();
     EXPECT_GE(client->testSeedFailovers(), 1u) << "the seed never failed over";
     for (int id : c.runningNodes()) EXPECT_EQ(spoofed(c.node(id)), 0u);

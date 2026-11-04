@@ -1,6 +1,7 @@
 #include <rune/storage/LogCleaner.h>
 #include <cstring>
 #include <rune/protocol/RecordBatch.h>
+#include <spdlog/spdlog.h>
 #include <rune/storage/ControlMarkerLayout.h>
 #include <rune/storage/ControlRecordLayout.h>
 
@@ -15,6 +16,7 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -151,6 +153,18 @@ namespace {
 bool isControlBatch(const rune::protocol::RecordBatchReader& r) {
     return (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0;
 }
+// The validity gate of a cleaner walk (#804).  A checked-writes control record (no producer id, control bit) is validated ONCE, by
+// parseControl, whose result `ctl` the caller reuses; every other batch (data, a transaction marker) by ensureValid.  A control
+// batch parseControl refuses (type 20 and above, or a damaged one) falls back to ensureValid: only a CRC-damaged one stops the walk.
+bool validateBatch(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t total,
+                   std::optional<rune::storage::control_record::ControlRecord>& ctl) {
+    ctl.reset();
+    if (r.producerId() < 0 && (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0) {
+        ctl = rune::storage::control_record::parseControl(batch, total);
+        if (ctl) return true;
+    }
+    return r.ensureValid();
+}
 bool isTransactionalBatch(const rune::protocol::RecordBatchReader& r) {
     return (static_cast<uint16_t>(r.attributes()) &
             static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional)) != 0;
@@ -217,7 +231,8 @@ int markerControlType(const uint8_t* batch, std::size_t len, const rune::protoco
 // Returns the bytes read (throttled by the caller like the M3 prefix reads).
 int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, Offset fromOffset, Offset toOffset,
                      Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails,
-                     const BoundaryHook& hook, VerdictCleanState& verdicts, Offset verdictBound, Offset verdictMarkerEnd) {
+                     const BoundaryHook& hook, VerdictCleanState& verdicts, Offset verdictBound, Offset verdictMarkerEnd,
+                     std::optional<LogCleaner::Damaged>& damage) {
     namespace cr = rune::storage::control_record;
     int64_t bytes = 0;
     std::vector<RejectedOffsetIndex::Entry> verdictEntries;
@@ -234,29 +249,32 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             const int32_t total = r.totalLength();
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
-            if (!r.ensureValid()) break;
+            std::optional<cr::ControlRecord> ctl;
+            if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;   // a control record: validated once (#804)
             const int64_t base = r.baseOffset();
-            if (base >= scanEnd) break;
+            if (base >= scanEnd) { pos = buf.size(); break; }   // the intended end of the scan, not damage
             const int64_t pid  = r.producerId();
             if (pid < 0 && isControlBatch(r)) {   // a checked-writes control record (16-19)
-                switch (cr::recordType(buf.data() + pos, static_cast<std::size_t>(total))) {
-                case cr::kVerdictMarker:
-                    if (const auto m = cr::parseMarker(buf.data() + pos, static_cast<std::size_t>(total))) {
-                        verdictEntries.clear();
-                        for (uint32_t i = 0; i < m->header.count; ++i)
-                            verdictEntries.push_back(RejectedOffsetIndex::Entry{m->offsetAt(i), m->codeAt(i), m->constraintIdAt(i)});
-                        verdicts.onVerdictMarker(base, m->header.fromOffset, m->header.finalThrough, verdictEntries);
+                if (const auto& c = ctl) {
+                    switch (c->type) {
+                    case cr::kVerdictMarker:
+                        if (const auto m = cr::parseMarker(*c)) {
+                            verdictEntries.clear();
+                            for (uint32_t i = 0; i < m->header.count; ++i)
+                                verdictEntries.push_back(RejectedOffsetIndex::Entry{m->offsetAt(i), m->codeAt(i), m->constraintIdAt(i)});
+                            verdicts.onVerdictMarker(base, m->header.fromOffset, m->header.finalThrough, verdictEntries);
+                        }
+                        break;
+                    case cr::kConstraintSetChange: {
+                        std::array<cr::ChangeMember, 32> wire{};
+                        uint32_t id = 0;
+                        uint16_t count = 0;
+                        if (cr::parseConstraintSetChange(*c, id, wire, count)) verdicts.onConstraintSetChange(base, count != 0);
+                        break;
                     }
-                    break;
-                case cr::kConstraintSetChange: {
-                    std::array<cr::ChangeMember, 32> wire{};
-                    uint32_t id = 0;
-                    uint16_t count = 0;
-                    if (cr::parseConstraintSetChange(buf.data() + pos, static_cast<std::size_t>(total), id, wire, count)) verdicts.onConstraintSetChange(base, count != 0);
-                    break;
-                }
-                case cr::kReservation: verdicts.onReservation(base); break;
-                default: break;
+                    case cr::kReservation: verdicts.onReservation(base); break;
+                    default: break;
+                    }
                 }
             }
             if (base >= toOffset) { pos += static_cast<std::size_t>(total); continue; }   // above it only the control records above are read
@@ -277,6 +295,9 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             }
             pos += static_cast<std::size_t>(total);
         }
+        // A walk that stopped short met a damaged batch: the state fed so far is incomplete (a missed ABORT, verdict
+        // marker or txn data batch), so the caller must refuse the pass (it never cleans against partial state).
+        if (pos != buf.size() && !damage.has_value()) damage = LogCleaner::Damaged{segBase, pos};
     }
     txn.finish(toOffset, markerRemovalBound);
     verdicts.finish(fromOffset, verdictBound, markerRemovalBound);
@@ -288,11 +309,12 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
 // horizon, a pass at/after the horizon drops it).  Without a wall clock (nowMs < 0,
 // the legacy path) a marker is never removed.
 enum class MarkerAction { Keep, Stamp, Drop };
-MarkerAction markerAction(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t batchLastOffset,
-                          Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts, int64_t nowMs) {
+MarkerAction markerAction(const rune::protocol::RecordBatchReader& r, const std::optional<rune::storage::control_record::ControlRecord>& c,
+                          int64_t batchLastOffset, Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts,
+                          int64_t nowMs) {
     if (nowMs < 0 || batchLastOffset >= cleanBoundaryOffset) return MarkerAction::Keep;
     if (r.producerId() < 0) {   // a checked-writes control record (16-19): its own rules
-        const int type = rune::storage::control_record::recordType(batch, len);
+        const int type = c ? c->type : rune::storage::control_record::kUnparseable;
         if (type == rune::storage::control_record::kUnparseable || verdicts == nullptr ||
             verdicts->keepsControlRecord(r.baseOffset(), static_cast<int16_t>(type)))
             return MarkerAction::Keep;
@@ -321,10 +343,11 @@ void appendStampedControlBatch(std::vector<uint8_t>& out, const uint8_t* batch, 
 // D3b: the rewrite's handling of one control batch (shared by every path).
 // Returns true iff the segment's content changed.
 bool rewriteControlBatch(std::vector<uint8_t>& out, const uint8_t* batch, std::size_t len,
-                         const rune::protocol::RecordBatchReader& r, int64_t batchLastOffset,
+                         const rune::protocol::RecordBatchReader& r,
+                         const std::optional<rune::storage::control_record::ControlRecord>& ctl, int64_t batchLastOffset,
                          Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts, int64_t nowMs,
                          int64_t deleteRetentionMs) {
-    switch (markerAction(r, batch, len, batchLastOffset, cleanBoundaryOffset, txn, verdicts, nowMs)) {
+    switch (markerAction(r, ctl, batchLastOffset, cleanBoundaryOffset, txn, verdicts, nowMs)) {
         case MarkerAction::Drop:  return true;
         case MarkerAction::Stamp: appendStampedControlBatch(out, batch, len, nowMs + deleteRetentionMs); return true;
         case MarkerAction::Keep:  break;
@@ -361,7 +384,9 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // aborted txn data.  M3: these reads are throttled by the caller.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
-    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_);
+    std::optional<Damaged> scanDamage;
+    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, scanDamage);
+    if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return -1; }   // incomplete state: no map
     toOffset = std::min(txn.cleanLimit(), verdicts.cleanLimit());
 
     for (size_t i = 0; i < bases.size(); ++i) {
@@ -401,6 +426,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             if (full) return map.latestOffset();
             pos += static_cast<size_t>(total);
         }
+        if (pos != buf.size()) noteDamage_(dir, segBase, pos);   // damage: the entry point refuses the pass
     }
     return map.latestOffset();
 }
@@ -419,7 +445,9 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // D3b: transaction pre-pass (+ producer tails) — see the bounded overload.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
-    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_);
+    std::optional<Damaged> scanDamage;
+    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, scanDamage);
+    if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return; }   // incomplete state: no map
     toOffset = std::min(txn.cleanLimit(), verdicts.cleanLimit());
 
     // Walk segments that overlap [fromOffset, toOffset).  `bases` and `dir` are
@@ -468,7 +496,15 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
 
             pos += static_cast<size_t>(total);
         }
+        if (pos != buf.size()) noteDamage_(dir, segBase, pos);   // damage: the entry point refuses the pass
     }
+}
+
+void LogCleaner::noteDamage_(const std::string& dir, int64_t segBase, std::size_t pos) {
+    if (damaged_.has_value()) return;
+    damaged_ = Damaged{segBase, pos};
+    spdlog::warn("LogCleaner: damaged batch in {} segment {} at byte {}: the log is uncleanable until restart",
+                 dir, segBase, pos);
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +517,8 @@ bool LogCleaner::rewriteSegmentImpl(
     int64_t nowNs, int64_t deleteRetentionMs,
     int64_t nowMs, bool* changed, const ProducerTails* tails, const TxnCleanState* txn, VerdictCleanState* verdicts)
 {
+    if (changed) *changed = false;
+    if (damaged_.has_value()) return false;   // uncleanable: nothing read, nothing changed
     // D3b: never clean at/after the pass's first unresolved transaction (LSO).
     if (txn != nullptr) cleanBoundaryOffset = std::min(cleanBoundaryOffset, txn->cleanLimit());
     if (verdicts != nullptr) {
@@ -528,8 +566,10 @@ bool LogCleaner::rewriteSegmentImpl(
         int32_t total = r.totalLength();
         // A3: bounds check before CRC; a corrupt totalLength must not misparse the walk.
         if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
-        // A3: CRC-gate the walk — stop on the first corrupt batch.
-        if (!r.ensureValid()) break;
+        // A3: CRC-gate the walk — stop on the first corrupt batch.  A checked-writes control record is validated once, by
+        // parseControl (#804); its result goes on to markerAction.
+        std::optional<rune::storage::control_record::ControlRecord> ctl;
+        if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;
 
         // CP-8: KIP-534 delete-horizon gate.
         // CONTRACT: when hasDeleteHorizon() is true, baseTimestamp() IS the horizon
@@ -578,7 +618,7 @@ bool LogCleaner::rewriteSegmentImpl(
             continue;
         }
         if (isControlBatch(r)) {   // D3: markers are never key-compacted; D3b: removed once empty + past horizon
-            if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, batchLastOffset,
+            if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, ctl, batchLastOffset,
                                     cleanBoundaryOffset, txn, verdicts, nowMs, deleteRetentionMs))
                 modified = true;
             pos += static_cast<size_t>(total);
@@ -778,6 +818,14 @@ bool LogCleaner::rewriteSegmentImpl(
         pos += static_cast<size_t>(total);
     }
 
+    // A walk that stopped before the end met a damaged batch.  Installing what was walked would drop every intact record
+    // behind it (an empty output even deletes the segment): install nothing, leave the original untouched.
+    if (pos != buf.size()) {
+        noteDamage_(dir, segBase, pos);
+        if (changed) *changed = false;
+        return false;
+    }
+
     // A4: If compaction removed ALL records from a non-active segment, outBuf is
     // empty.  Writing a 0-byte .log would leave a permanent dangling file that
     // never gets garbage-collected.  Instead, delete the segment and its index
@@ -878,6 +926,7 @@ void LogCleaner::compact(Log& log, OffsetMap& map,
                          int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs) {
     const std::string& dir = log.dir();
     rewriteSegmentsRead_ = 0;
+    if (damaged_.has_value()) return;   // uncleanable until restart
 
     // Clean up any stale .log.new temp files left by a previous crashed run.
     for (auto& e : std::filesystem::directory_iterator(dir)) {
@@ -905,6 +954,7 @@ void LogCleaner::compact(Log& log, OffsetMap& map,
         // compaction gap there would be taken for a lost write (truncation).
         if (i + 1 < bases.size() && !log.compactionAllowedThrough(bases[i + 1])) break;
         rewriteSegment(dir, segBase, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
+        if (damaged_.has_value()) break;   // the pass stops at the damaged segment
     }
 
     // Reload the log's in-memory state from the rewritten files.
@@ -940,6 +990,7 @@ bool LogCleaner::produceCleanedFile(const std::string& dir,
                                     Offset globalDirtyStart,
                                     int64_t nowNs, int64_t deleteRetentionMs) {
     if (sealedBases.empty()) return false;
+    if (damaged_.has_value()) return false;   // uncleanable until restart
 
     // Guard: segBase must be one of the sealed segments in the snapshot AND must
     // be strictly below the active/uncleanable boundary.  We NEVER read segments_
@@ -964,6 +1015,7 @@ bool LogCleaner::produceCleanedFile(const std::string& dir,
     if (globalDirtyStart < 0) globalDirtyStart = 0;
     OffsetMap map;
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+    if (damaged_.has_value()) return false;   // a pre-pass walk met damage: the state is incomplete, nothing is rewritten
 
     // Rewrite exactly the ONE segment at segBase (pure file I/O: atomic write→
     // rename, or delete when emptied).  Passing the GLOBAL bounds makes the
@@ -996,6 +1048,7 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
 {
     CleanPassResult result{false, activeBase};
     rewriteSegmentsRead_ = 0;
+    if (damaged_.has_value()) return result;   // uncleanable until restart
 
     if (sealedBases.empty()) return result;
     if (segBase >= activeBase) return result;
@@ -1024,6 +1077,7 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
         // Read bytes can be estimated from sealedBases sizes (file reads).
         // For simplicity, throttle after the full map-build pass.
         buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+        if (damaged_.has_value()) { result.passEnd = globalDirtyStart; return result; }   // incomplete state: no advance, nothing written
         if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);   // M3
         if (throttler) {
             // Approximate read bytes: size of the segment file being processed.
@@ -1158,6 +1212,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
     RangeCleanResult result;
     rewriteSegmentsRead_ = 0;
     result.passEnd = activeBase;   // default: nothing dirty → advance to activeBase
+    if (damaged_.has_value()) return result;   // uncleanable until restart: nothing read, nothing changed
     // Fix round 2: deferred-install mode collects outputs into result.groups.
     struct DeferredScope {
         std::vector<CleanedGroup>*& slot;
@@ -1181,6 +1236,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
     // one pass without a member's keys vanishing after it is deleted.
     map.clear();
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+    if (damaged_.has_value()) { result.passEnd = globalDirtyStart; return result; }   // incomplete state: no advance, nothing written
     // M3: the clean-prefix reads for producer tails count against the I/O throttle.
     if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);
 
@@ -1251,6 +1307,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
                 result.compacted = true;
                 for (int64_t b : g.bases) result.rewrittenBases.push_back(b);
             }
+            if (damaged_.has_value()) break;   // the pass stops at the damaged group; finished groups stand
         }
         return result;
     }
@@ -1263,6 +1320,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
         bool changed = false;
         rewriteSegmentImpl(dir, b, getLatest, globalDirtyStart, passEnd,
                            nowNs, deleteRetentionMs, nowMs, &changed, &map.producerTails(), &map.txnState(), &map.verdictState());
+        if (damaged_.has_value()) break;   // the pass stops at the damaged segment; finished segments stand
 
         // A segment needs a swap enqueue iff its on-disk content changed (records
         // dropped / tombstone stamped / emptied), OR its .log is now absent (emptied
@@ -1442,6 +1500,7 @@ void LogCleaner::mergeGroupWithMap(
 {
     if (changed) *changed = false;
     if (groupInPass.empty()) return;
+    if (damaged_.has_value()) return;   // uncleanable: nothing read, nothing changed
     // D3b: never at/after the first unresolved transaction (LSO).
     const TxnCleanState* txn = &map.txnState();
     VerdictCleanState* verdicts = &map.verdictState();
@@ -1476,7 +1535,8 @@ void LogCleaner::mergeGroupWithMap(
             rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
             int32_t total = r.totalLength();
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
-            if (!r.ensureValid()) break;
+            std::optional<rune::storage::control_record::ControlRecord> ctl;   // a control record is validated once (#804)
+            if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;
 
             // CP-8: horizon gate (same logic as rewriteSegmentImpl).
             const bool batchHasHorizon  = r.hasDeleteHorizon();
@@ -1509,7 +1569,7 @@ void LogCleaner::mergeGroupWithMap(
                 continue;
             }
             if (isControlBatch(r)) {   // D3: never key-compacted; D3b: removed once empty + past horizon
-                if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, batchLastOffset,
+                if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, ctl, batchLastOffset,
                                         passEnd, txn, verdicts, nowMs, deleteRetentionMs))
                     modified = true;
                 pos += static_cast<size_t>(total);
@@ -1607,6 +1667,12 @@ void LogCleaner::mergeGroupWithMap(
 
             pos += static_cast<size_t>(total);
         }
+        // A walk that stopped short met a damaged batch: the whole group produces no output and nothing is installed or
+        // deleted for any of its bases (the intact records behind the damage would be dropped).
+        if (pos != buf.size()) {
+            noteDamage_(dir, segBase, pos);
+            return;
+        }
     }
     (void)globalDirtyStart; // dirty range is captured by the map bounds
 
@@ -1661,6 +1727,7 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
 {
     CleanPassResult result{false, activeBase};
     rewriteSegmentsRead_ = 0;
+    if (damaged_.has_value()) return result;   // uncleanable until restart
     if (group.bases.empty()) return result;
 
     // All bases in the group must be < activeBase.
@@ -1681,6 +1748,7 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
     std::size_t maxSlots = SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes);
     SkimpyOffsetMap map(maxSlots > 0 ? maxSlots : 1);
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+    if (damaged_.has_value()) { result.passEnd = globalDirtyStart; return result; }   // incomplete state: no advance, nothing written
     if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);   // M3
 
     // Throttle the map-build read phase (approx from combined group size).

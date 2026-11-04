@@ -1695,7 +1695,7 @@ void BrokerNode::buildWorkerPool() {
     for (int32_t i = 0; i < wc; ++i) {
         workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
-        workerPool_->worker(i).setVerdictIntervalNs(config_.verdictIntervalMs * 1'000'000);
+        workerPool_->worker(i).setVerdictIntervalNs(config_.verdictIntervalMs * 1'000'000LL);
         workerPool_->worker(i).setBackgroundSyncIntervalNs(config_.workerSyncIntervalMs * 1'000'000LL);
         if (!config_.ioWorkerCpus.empty()) workerPool_->worker(i).setIoWorkerCpus(config_.ioWorkerCpus);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
@@ -1905,7 +1905,8 @@ void BrokerNode::buildWorkerPool() {
             workerPool_->worker(i).setViewSet(workerViewSets_.back().get());
         }
         viewSnapshotIoAgent_ = std::make_unique<ViewSnapshotIoAgent>(
-            std::move(chPtrs), viewSnapDir, /*fsyncMs=*/50);
+            std::move(chPtrs), viewSnapDir, /*fsyncMs=*/50,
+            ViewBackupPolicy{config_.viewBackup, static_cast<uint32_t>(config_.viewBackupsKept)});
         viewSnapshotIoIdleStrategy_ = makeShapedBackoff(config_.adminIdleShape());
         viewSnapshotIoRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *viewSnapshotIoAgent_, *viewSnapshotIoIdleStrategy_, viewSnapshotIoClock_);

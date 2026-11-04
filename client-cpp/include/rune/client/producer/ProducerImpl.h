@@ -40,6 +40,7 @@
 #include <rune/client/Completion.h>
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
+#include <rune/client/detail/CompletionRing.h>
 #include <rune/client/detail/OpTarget.h>
 #include <rune/client/producer/Producer.h>
 
@@ -151,6 +152,11 @@ inline constexpr int kRecHeaderSize  = 38;  // bytes before value
 namespace ackhandle {
 inline constexpr uint64_t kCqBit      = uint64_t{1} << 63;
 inline constexpr uint64_t kHandlerBit = uint64_t{1} << 62;
+/// Checked writes: the ack-ring marker of a View claim's records AFTER its first (record k of a claim of n holds this in slot
+/// first + k; the claim's one handle sits at slot `first`).  Never a handle: forCq always sets bit 63, forHandler always bit 62,
+/// 0 is "no handle", and every handle comes from those two encoders.  Walkers take a handle and its continuation run together
+/// (ProducerImpl::takeHandleSpan_), so a rejection of record first+k is visible to the claim's one completion.
+inline constexpr uint64_t kClaimContinuation = uint64_t{1} << 61;
 inline constexpr int      kRefShift   = 48;
 inline constexpr uint64_t kRefMask    = 0x7FFF;
 [[nodiscard]] constexpr uint64_t forCq(CqRef ref, Token t) noexcept {
@@ -162,11 +168,35 @@ inline constexpr uint64_t kRefMask    = 0x7FFF;
     return static_cast<CqRef>((h >> kRefShift) & kRefMask);
 }
 [[nodiscard]] constexpr Token token(uint64_t h) noexcept { return h & kMaxToken; }
+static_assert(forCq(kRefMask, kMaxToken) != kClaimContinuation);
+static_assert(forHandler(kMaxToken) != kClaimContinuation);
+static_assert(!isCq(kClaimContinuation));
+static_assert((kClaimContinuation & kHandlerBit) == 0);
 }  // namespace ackhandle
 
 /// The reservation (and returned credit) of one producer completion record: a
 /// per-record / Tier-2 ack, and each credit unit of a BatchAck record.
 inline constexpr uint32_t kAckRecordBytes = kBatchAckUnitBytes;  // CompletionRing::completionRecordBytes(0)
+
+/// The reservation (and delivered reservedBytes) of ONE completion that covers a batch of `n` records: a claimBatch's or a
+/// Tier-2 batch's.  A View producer's completion may carry one 8-byte verdict entry per record (status RecordsRejected), so it
+/// reserves for them up front: reservation = delivery on every status.  A 1-record batch, and a producer without View, keep
+/// the plain record.  Single sends and tryClaim always use kAckRecordBytes.
+///
+/// The record r = completionRecordBytes(8 n) can exceed the queue's slack record M, and a record above M can wrap and leave up
+/// to r bytes of end-of-buffer padding.  So a batch of n >= 2 reserves 2r - 48: the record AND that padding (the ring's
+/// deliver() never writes a record above (reserved + 48) / 2 for a reservation above M).  Reserve, unreserve and the derive path
+/// all come from this ONE function, so the credit balances.
+[[nodiscard]] constexpr uint32_t batchCompletionBytes(bool viewSent, uint32_t n) noexcept {
+    if (!viewSent || n <= 1) return kAckRecordBytes;
+    const uint32_t r = detail::CompletionRing::completionRecordBytes(8u * n);
+    return 2u * r - detail::CompletionRing::completionRecordBytes(0);
+}
+
+/// The record a batch completion of `n` records delivers at most (the inverse of batchCompletionBytes' doubling).
+[[nodiscard]] constexpr uint32_t batchCompletionRecordBytes(uint32_t n) noexcept {
+    return detail::CompletionRing::completionRecordBytes(8u * n);
+}
 
 // kMsgTier2Batch token: 8 bytes = the pooled Tier2Slot's index (int64 LE, in-process).
 // The slot's ownership travels through the ring (spec §1a.2) — no side queue, no
@@ -914,6 +944,13 @@ public:
     /// SD11: the seed broker's version (0 = unknown: sends).  Set from the duty thread on every seed connect.
     void setBrokerVersion(int32_t v) noexcept { brokerVersion_ = v; }
     [[nodiscard]] bool viewAcks() const noexcept { return has(cfg_.acks, Acks::View); }
+    /// The reservation of ONE completion covering `n` records (a claimBatch / Tier-2 batch) on this producer.
+    [[nodiscard]] uint32_t batchCompletionBytes(uint32_t n) const noexcept {
+        return producer::batchCompletionBytes(viewSent_(), n);
+    }
+    /// True when ONE completion for a batch of `n` records can be reserved on `cq` at all: its record fits one ring record
+    /// (kRecordHeaderBytes + maxMsgLength) and its reservation is within cq.maxReservation().  Never retryable when false.
+    [[nodiscard]] bool batchCompletionFits(const Completions& cq, uint32_t n) const noexcept;
     [[nodiscard]] bool onBatchThread() const noexcept { return std::this_thread::get_id() == t2Thread_; }
     /// Rebind the issuing thread to the caller, before the first batch() from the new thread.  A
     /// builder still live on the old thread is refused there and hands its slot back through the
@@ -951,7 +988,7 @@ public:
     ///   andWait   — the blocking close() (Client::andWait_).
     struct Hooks {
         void* ctx = nullptr;  ///< the Client (identity for Completions::client())
-        void (*cqDeliver)(void* ctx, CqRef ref, const Completion& c) noexcept = nullptr;
+        void (*cqDeliver)(void* ctx, CqRef ref, const Completion& c, std::span<const uint8_t> payload) noexcept = nullptr;
         detail::CompletionSink sink{};
         OpResult (*issueClose)(void* ctx, ProducerImpl& impl, const CompletionTarget* target,
                                Token token) = nullptr;
@@ -973,8 +1010,13 @@ public:
     /// reads it (the first record that needs it was sent after this write:
     /// ring order publishes it).
     void setOnAck(AckFn fn, void* ctx) noexcept {
-        onAckFn_  = fn;
-        onAckCtx_ = ctx;
+        onAck_ = AckHandler{fn != nullptr ? AckHandler::Kind::Plain : AckHandler::Kind::None, {}, ctx};
+        onAck_.fn.plain = fn;
+    }
+    /// The full-Completion form; the last call (either form) wins; a null fn clears.
+    void setOnAck(AckCompletionFn fn, void* ctx) noexcept {
+        onAck_ = AckHandler{fn != nullptr ? AckHandler::Kind::Full : AckHandler::Kind::None, {}, ctx};
+        onAck_.fn.full = fn;
     }
     /// Setup phase: per-batch acks to a handler (exclusive with the CQ form).
     /// Throws std::logic_error after a send / when the CQ form is set.
@@ -1727,8 +1769,17 @@ private:
     /// F8c C6: deliver ONE ack handle's completion (0 = void: nothing) —
     /// the onAck handler, or the Client's CQ registry.  Duty thread; never
     /// allocates, never throws.
+    /// `payload`: the inline payload (a batch's verdict entries; valid during the call).  `reservedBytes`: what the op reserved
+    /// (and the delivered reservedBytes): 0 = derive it (a Tier-2 batch: batchCompletionBytes(viewSent, aux = its record
+    /// count); everything else: kAckRecordBytes); a claim span passes batchCompletionBytes(viewSent, span).
     void completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t aux, OpStatus st,
-                         uint16_t errorCode, uint32_t constraintId = 0) noexcept;
+                         uint16_t errorCode, uint32_t constraintId = 0, std::span<const uint8_t> payload = {},
+                         uint32_t reservedBytes = 0) noexcept;
+    /// Takes slot `i`'s handle (into `h`) and zeroes it together with the kClaimContinuation run after it; returns the
+    /// records the handle covers (1 = a plain handle, or no span).  A claim lands whole in one RecordBatch, so a span never
+    /// crosses `ackCount`.
+    [[nodiscard]] int32_t takeHandleSpan_(PartitionState& ps, uint64_t ackStart, int32_t i, int32_t ackCount,
+                                          uint64_t& h) noexcept;
     /// completeSlice_ for an Ok batch whose View ack carried a verdict trailer: a rejected record completes BrokerError
     /// (code, constraintId); a Tier-2 batch completes once, with its first rejection.
     void completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset, bool tier2,
@@ -1797,7 +1848,8 @@ private:
     /// batch; 1 for a Tier-2 batch / a single never-sent record).
     void emitBatchAck_(int32_t topicId, int32_t partition, int32_t baseSequence, int32_t recordCount,
                        int64_t baseOffset, int16_t errorCode, OpStatus st, uint32_t units,
-                       int16_t producerEpoch, int64_t producerId = -1) noexcept;
+                       int16_t producerEpoch, int64_t producerId = -1,
+                       std::span<const uint8_t> rejections = {}) noexcept;
     /// Records that never reached a batch (failed in the ring / a builder /
     /// the Tier-2 queue / the arena): a BatchAck{baseSequence -1, kClientFailure}.
     /// Phase 2b F Task 6: every record failure goes through here or txnNoteLoss_ directly - a transactional
@@ -2128,11 +2180,24 @@ private:
 
     // ---- F8c C6: ack targets (setup phase; read on the duty thread) ------------
     Hooks        hooks_{};
-    AckFn        onAckFn_       = nullptr;
-    void*        onAckCtx_      = nullptr;
+    /// The per-record ack target of AckToken sends: none, the scalar form, or the full-Completion form (one enum, no flags).
+    struct AckHandler {
+        enum class Kind : uint8_t { None, Plain, Full };
+        Kind kind = Kind::None;
+        union Fn { AckFn plain; AckCompletionFn full; } fn{};
+        void* ctx = nullptr;
+    };
+    AckHandler   onAck_{};
+    /// A View producer's claim span is rebased into this (entries index - first): reserved once in the constructor
+    /// (8 * kMaxJudgedBatchRecords), never resized.
+    std::vector<uint8_t> claimVerdictScratch_;
     BatchAckFn   batchAckFn_    = nullptr;
     void*        batchAckCtx_   = nullptr;
     CqRef        batchAckCqRef_ = kNoCqRef;   // duty side: the BatchAck queue's registry ref
+    // duty side, immutable after setBatchAckCq (copied from the queue at setup, so the duty thread never reads the app-owned
+    // queue): its slack record M and its ring's largest message.  Defaults: a default-config Completions.
+    uint32_t     batchAckMaxRecord_ = detail::CompletionRing::completionRecordBytes(16u << 10);
+    uint32_t     batchAckMaxMsg_    = (1u << 20) / 8;
     // fix2 minor: plain counter (see testCallbackExceptionCount()).
     uint64_t     callbackExceptions_ = 0;
 

@@ -616,6 +616,109 @@ echo "${pv_logs}" | grep -a "view ${VIEW_PRESENCE_PV_TOPIC_ID} partition 0" | gr
     || fail "no transient-source reset (resets=1) logged for presence_totals (view ${VIEW_PRESENCE_PV_TOPIC_ID})"
 log "presence_totals recovered its checkpoint rows and counted one transient-source reset"
 
+# ---------------------------------------------------------------------------
+# Steps 9-11: view checkpoint backups (Part 09 C5-C7).  Order is 9, 11, 10.
+# ---------------------------------------------------------------------------
+SNAP_DIR="/var/lib/rune/__view_snapshots"
+COMPOSE=(docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}")
+
+# Run a shell snippet against the broker's data volume while the broker is stopped.
+volume_sh() {
+    "${COMPOSE[@]}" run --rm --no-deps --entrypoint sh rune-1 -c "$1"
+}
+broker_log_lines() { "${COMPOSE[@]}" logs --no-log-prefix rune-1 2>/dev/null | wc -l | tr -d ' '; }
+# Broker log lines after the first $1 lines (scopes a grep to one leg; a restart keeps the container's log).
+broker_log_after() { "${COMPOSE[@]}" logs --no-log-prefix rune-1 2>/dev/null | tail -n +"$(( $1 + 1 ))"; }
+VIEW_ROWS_OUT=""   # the last view_rows probe output (read VIEW-ROWS-LAST-OFFSET from it)
+view_rows() {   # $1 = expected hp, $2 = rows to produce.  Blocks until the view is Ready: the barrier before grepping its log lines.
+    local out rc
+    set +e
+    out=$(run_client view_rows \
+        -e RUNE_VIEW_SRC_TOPIC_ID="${VIEW_SRC_TOPIC_ID}" \
+        -e RUNE_VIEW_TOPIC_ID_PERSISTED="${VIEW_TOPIC_ID_PERSISTED}" \
+        -e RUNE_VIEW_FP_PERSISTED="${VIEW_FP_PERSISTED}" \
+        -e RUNE_VIEW_KEY_ID="${VIEW_KEY_ID}" \
+        -e RUNE_VIEW_HP_EXPECT="$1" \
+        -e RUNE_VIEW_PRODUCE_N="$2" 2>&1)
+    rc=$?
+    set -e
+    echo "${out}" >&2
+    VIEW_ROWS_OUT="${out}"
+    [ "${rc}" -eq 0 ] || fail "view_rows (hp=$1 produce=$2) exited ${rc}"
+    echo "${out}" | grep -q "^VIEW-ROWS: OK" || fail "view_rows (hp=$1 produce=$2) lacks the VIEW-ROWS: OK sentinel"
+}
+backup_count() {   # backups of char_persisted in the data volume
+    volume_sh "ls ${SNAP_DIR}/backup 2>/dev/null | grep -c '^view-${VIEW_TOPIC_ID_PERSISTED}-p' || true" | tr -d '\r' | tail -1
+}
+HP_AFTER_RESTART=$(( VIEW_HP_INITIAL + 1 ))
+
+log "Step 9: corrupt char_persisted's checkpoint head -> expect backup (reason=unreadable) + rebuild (default knob)..."
+"${COMPOSE[@]}" stop rune-1
+backups_before="$(backup_count)"
+sha_before="$(volume_sh "cd ${SNAP_DIR} && for f in view-${VIEW_TOPIC_ID_PERSISTED}-p*.committed.delta; do [ -s \"\$f\" ] && dd if=/dev/urandom of=\"\$f\" bs=16 count=1 conv=notrunc 2>/dev/null && sha256sum \"\$f\" | cut -d' ' -f1; done" | tr -d '\r' | grep -E '^[0-9a-f]{64}$' || true)"
+[ -n "${sha_before}" ] || fail "Step 9: no non-empty char_persisted checkpoint file to corrupt"
+leg_start="$(broker_log_lines)"
+pre_leader_count="$(leader_line_count)"
+"${COMPOSE[@]}" start rune-1
+await_leader "${pre_leader_count}" >/dev/null || fail "Step 9: no leader after the corrupting restart"
+view_rows "${HP_AFTER_RESTART}" 0   # the VIEW-BACKUP line is written once the view recovers, after the LEADER line
+leg_logs="$(broker_log_after "${leg_start}")"
+echo "${leg_logs}" | grep -aE "VIEW-BACKUP view=${VIEW_TOPIC_ID_PERSISTED} .*reason=unreadable" >&2 \
+    || fail "Step 9: no VIEW-BACKUP ... reason=unreadable line for view ${VIEW_TOPIC_ID_PERSISTED}"
+backup_shas="$(volume_sh "cd ${SNAP_DIR}/backup && sha256sum view-${VIEW_TOPIC_ID_PERSISTED}-p*.unreadable.delta | cut -d' ' -f1" | tr -d '\r')"
+for h in ${sha_before}; do
+    echo "${backup_shas}" | grep -q "${h}" || fail "Step 9: no unreadable backup is byte-equal to the corrupted file (sha ${h})"
+done
+backups_after_9="$(backup_count)"
+[ "${backups_after_9}" -gt "${backups_before}" ] || fail "Step 9: backup count did not grow (${backups_before} -> ${backups_after_9})"
+log "Step 9 OK: corrupted checkpoint backed up byte-for-byte, view rebuilt, rows correct"
+
+log "Step 11: torn checkpoint tail (knob unset) -> trimmed in place, no rebuild, no backup..."
+"${COMPOSE[@]}" stop rune-1
+volume_sh "cd ${SNAP_DIR} && for f in view-${VIEW_TOPIC_ID_PERSISTED}-p*.committed.delta; do [ \$(wc -c < \"\$f\") -gt 7 ] && truncate -s -7 \"\$f\"; done; true"
+leg_start="$(broker_log_lines)"
+pre_leader_count="$(leader_line_count)"
+"${COMPOSE[@]}" start rune-1
+await_leader "${pre_leader_count}" >/dev/null || fail "Step 11: no leader after the torn-tail restart"
+view_rows "${HP_AFTER_RESTART}" 20
+LAST_PRODUCED_OFFSET="$(echo "${VIEW_ROWS_OUT}" | tr -d '\r' | sed -nE 's/^VIEW-ROWS-LAST-OFFSET (-?[0-9]+)$/\1/p' | tail -1)"
+[ -n "${LAST_PRODUCED_OFFSET}" ] && [ "${LAST_PRODUCED_OFFSET}" -ge 0 ] || fail "Step 11: view_rows did not report the last produced offset"
+broker_log_after "${leg_start}" | grep -aE "VIEW-CHECKPOINT-TORN-TAIL view=${VIEW_TOPIC_ID_PERSISTED} " >&2 \
+    || fail "Step 11: no VIEW-CHECKPOINT-TORN-TAIL line for view ${VIEW_TOPIC_ID_PERSISTED}"
+leg_start="$(broker_log_lines)"
+pre_leader_count="$(leader_line_count)"
+"${COMPOSE[@]}" restart rune-1
+await_leader "${pre_leader_count}" >/dev/null || fail "Step 11: no leader after the second restart"
+view_rows "${HP_AFTER_RESTART}" 0   # the VIEW-RECOVERED line is written once the view recovers, after the LEADER line
+leg_logs="$(broker_log_after "${leg_start}")"
+echo "${leg_logs}" | grep -aE "VIEW-RECOVERED view=${VIEW_TOPIC_ID_PERSISTED} partition=[0-9]+ O=[1-9][0-9]* " >&2 \
+    || fail "Step 11: char_persisted not recovered from its (trimmed, then extended) checkpoint"
+# O is the exclusive resume cursor (WorkerViewSet.cpp: foldCursor = recoveredO): the checkpoint must cover every row produced
+# before the restart, so O > the offset of the last of them.
+recovered_o="$(echo "${leg_logs}" | grep -aE "VIEW-RECOVERED view=${VIEW_TOPIC_ID_PERSISTED} " | head -1 | sed -E 's/.* O=([0-9]+) .*/\1/')"
+[ "${recovered_o}" -gt "${LAST_PRODUCED_OFFSET}" ] \
+    || fail "Step 11: recovered O=${recovered_o} does not cover the last row produced before the restart (offset ${LAST_PRODUCED_OFFSET})"
+if echo "${leg_logs}" | grep -aqE "VIEW-BACKUP view=${VIEW_TOPIC_ID_PERSISTED} "; then
+    fail "Step 11: a torn tail must be repaired without a backup, but VIEW-BACKUP was logged"
+fi
+[ "$(backup_count)" -eq "${backups_after_9}" ] || fail "Step 11: the backup count changed on a torn-tail repair"
+log "Step 11 OK: torn tail trimmed in place, later deltas kept, no rebuild, no backup"
+
+log "Step 10: RUNE_VIEW_BACKUP=0 -> corrupt checkpoint is discarded without a backup..."
+"${COMPOSE[@]}" stop rune-1
+volume_sh "cd ${SNAP_DIR} && for f in view-${VIEW_TOPIC_ID_PERSISTED}-p*.committed.delta; do [ -s \"\$f\" ] && dd if=/dev/urandom of=\"\$f\" bs=16 count=1 conv=notrunc 2>/dev/null; done; true"
+backups_before_10="$(backup_count)"
+RUNE_VIEW_BACKUP=0 "${COMPOSE[@]}" up -d --no-build rune-1   # recreates the container: its log starts empty
+await_leader 0 >/dev/null || fail "Step 10: no leader with RUNE_VIEW_BACKUP=0"
+view_rows "${HP_AFTER_RESTART}" 0   # the VIEW-DISCARD line is written once the view recovers, after the LEADER line
+"${COMPOSE[@]}" logs --no-log-prefix rune-1 2>/dev/null | grep -aE "VIEW-DISCARD view=${VIEW_TOPIC_ID_PERSISTED} .*reason=unreadable" >&2 \
+    || fail "Step 10: no VIEW-DISCARD ... reason=unreadable line for view ${VIEW_TOPIC_ID_PERSISTED}"
+if "${COMPOSE[@]}" logs --no-log-prefix rune-1 2>/dev/null | grep -aqE "VIEW-BACKUP view=${VIEW_TOPIC_ID_PERSISTED} "; then
+    fail "Step 10: VIEW-BACKUP logged with RUNE_VIEW_BACKUP=0"
+fi
+[ "$(backup_count)" -eq "${backups_before_10}" ] || fail "Step 10: a backup file appeared with RUNE_VIEW_BACKUP=0"
+log "Step 10 OK: knob off -> discarded and rebuilt, no backup written, rows correct"
+
 log ""
 log "========================================"
 log "  VIEW-ENGINE E2E (full, incl. restart) PASSED"

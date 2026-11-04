@@ -202,8 +202,12 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
   folded into the views and carries the per-record write verdicts. It needs a broker that supports checked writes; against
   an older broker every send completes locally with `OpStatus::BrokerTooOld`. `View` batches hold at most 4096 records
   (`claimBatch` with more returns `SendResult::MessageTooLarge`, `BatchBuilder` throws `std::length_error`). On a verdict source each record of a `View` batch completes as it was judged: `Ok` with its offset, or
-  `BrokerError` with `errorCode` 55 to 57 and `constraintIdOf(completion)`; a Tier-2 batch completes once with its first
-  rejection. A retry inside the broker's window replays the original verdicts; a retry outside it completes the whole batch
+  `BrokerError` with `errorCode` 55 to 57 and `constraintIdOf(completion)`; a `claimBatch` or Tier-2 batch of two or more records completes once and reports every
+  record: `Ok` when all were accepted, else `RecordsRejected` (15) with `value` = the base offset, the first rejection's
+  `errorCode`, and a payload of every rejection (`BatchVerdicts`: `rejectedCount()`, `rejection(k)`, `accepted(i)`,
+  `offsetOf(i)`); the other records were stored at base + index. A batch of one record keeps the single-record form
+  (`BrokerError`, value -1). The completion reserves its full size up front (`claimBatch` above the queue's record
+  limit returns `MessageTooLarge`). A retry inside the broker's window replays the original verdicts; a retry outside it completes the whole batch
   with `OpStatus::VerdictUnknown` (`errorCode` 21). `OpStatus::StoredIdUnknown` (13) is reserved. A transactional
   producer never sends the `View` bit. `SendResult::WriteNotAllowed` reports a write the broker refuses for the topic. On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
 - **`WriteIntent`**: every `send`, `trySend`, `sendTo` and `trySendTo` takes a trailing `WriteIntent` (`Upsert`, the
@@ -263,14 +267,17 @@ if (p.trySend(events, Key(uint64_t{42}), bytes, cq, /*token=*/7) == SendResult::
 ```
 
 - `trySend(..., AckToken{t})` calls the handler you set with `onAck(fn, ctx)` on the duty thread; it must not block.
+- `onAck(AckCompletionFn, ctx)` is the same handler with the full `Completion` (`value`, `aux`, `op`, `errorCode`, and
+  `constraintIdOf(c)` for a rejected `Send`) plus an empty payload span; the last registration (either form) wins.
 - `onBatchAck` / `batchAcksTo(cq)` deliver one `BatchAck` per batch (`baseOffset`, `baseSequence`, `recordCount`,
-  `errorCode`, `producerEpoch`).
+  `errorCode`, `producerEpoch`); a checked-writes batch also reports `rejectedCount` and `rejections` (every rejected
+  record), or the list as the completion payload with `batchAcksTo`.
 - Every accepted record is reported exactly once, including ones that never reached the wire (`BatchAck::kClientFailure`).
 
 ### Batches and flush
 
 ```cpp
-auto batch = p.batch(events, Key(uint64_t{42}));   // one atomic append to one partition: contiguous offsets, all or nothing
+auto batch = p.batch(events, Key(uint64_t{42}));   // one atomic append to one partition: contiguous offsets; View producers get a verdict per record
 batch.add(bytes);
 batch.send();
 p.flush();

@@ -170,9 +170,8 @@ void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKi
 
 // P4-4: a checkpoint that outran every marker this node holds (a crash lost the log tail carrying them) cannot be trusted.
 void VerdictSource::discardCheckpointAhead_(Member& m) {
-    if (!m.inst->persisted || m.inst->foldCursor <= judgeCursor_ || hooks_.discard == nullptr) return;
-    hooks_.discard(hooks_.ctx, *m.inst);
-    m.inst->foldCursor = logStart_;
+    if (!m.inst->persisted || !checkpointSettled(*m.inst) || m.inst->foldCursor <= judgeCursor_ || hooks_.discard == nullptr) return;
+    hooks_.discard(hooks_.ctx, *m.inst, ViewDiscardReason::AheadOfVerdicts);   // the owner rebuilds it from the log; the cursor is its business
     ++stats_.verdictCheckpointsDiscarded;
 }
 
@@ -292,7 +291,19 @@ void VerdictSource::waitForInstall_() noexcept {
     if (waitingForInstall_) return;
     waitingForInstall_ = true;
     ++stats_.judgeWaitsForInstall;
-    spdlog::info("verdict judge waits for a view install: topic {} partition {}", srcTopicId_, partition_);
+    // #791 diagnostics (cold, once per wait): the first member of the active set no installed view matches, and where that set starts.
+    uint64_t missingObject = 0, missingFingerprint = 0;
+    for (uint8_t i = 0; i < activeSet_.count; ++i) {
+        const ConstraintSetMember& want = activeSet_.members[i];
+        const bool have = std::any_of(members_.begin(), members_.end(), [&](const Member& m) {
+            return !m.retiring && m.objectId == want.viewObjectId && m.fingerprint == want.planFingerprint;
+        });
+        if (!have) { missingObject = want.viewObjectId; missingFingerprint = want.planFingerprint; break; }
+    }
+    spdlog::warn("verdict judge waits for a view install: topic {} partition {}: missing member (object {}, fingerprint {}) of set {} "
+                 "(change at offset {}), judged through {}, {} members installed, {} of {} active",
+                 srcTopicId_, partition_, missingObject, missingFingerprint, activeSet_.id, setFrom_, judgeCursor_, members_.size(),
+                 active_.size(), activeSet_.count);
 }
 
 rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept {
@@ -519,7 +530,7 @@ int VerdictSource::pushCheckpoints_(PartitionWriteState& state) {
     for (Member& m : members_) {
         ViewInstance& inst = *m.inst;
         // P4-4: a persisted member's delta leaves only once a marker in the local log covers the cursor it is stamped with.
-        if (inst.persisted && state.markers.appendedThrough() < inst.foldCursor && !inst.pendingValid && !inst.resetOwed) continue;
+        if (inst.persisted && state.markers.appendedThrough() < inst.foldCursor && !inst.pendingValid && checkpointSettled(inst)) continue;
         work += hooks_.checkpoint(hooks_.ctx, inst);
     }
     return work;

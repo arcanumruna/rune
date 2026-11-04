@@ -106,6 +106,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rune::node {
@@ -274,6 +275,11 @@ public:
     }
     /// Test-only: CP-7 checkpoint entries held (one per compacted Log).
     [[nodiscard]] std::size_t checkpointCountForTest() const noexcept { return checkpoints_.size(); }
+    /// #840: logs whose cleaner met a damaged batch; each stays out of selection until the broker restarts
+    /// (Kafka: LogCleanerManager.uncleanablePartitions).  Cleaner-thread-owned; cold.
+    [[nodiscard]] std::size_t uncleanableLogCountForTest() const noexcept { return uncleanable_.size(); }
+    /// Range passes started (one per selected log per cycle).  Cleaner-thread-owned; test seam.
+    [[nodiscard]] uint64_t passesStartedForTest() const noexcept { return passesStarted_; }
 
     /// Test-only accessor: return the configured I/O throttle rate.
     /// -1 = unlimited.  Used by BrokerNodeTest to prove Fix-1 wiring.
@@ -424,6 +430,8 @@ public:
 
             rune::storage::Log* log = replica->log();
             if (!log) continue;
+            // #840: a log whose cleaner met damage is never read again until restart.
+            if (!uncleanable_.empty() && uncleanable_.count(log->dir()) != 0) continue;
 
             // Fix round 3: never start a pass while this log's previous outputs
             // are still queued for the owner (it installs one group per duty
@@ -705,6 +713,7 @@ public:
             LogCleanerAgent& a;
             ~HookReset() { a.throttler_.setBoundaryHook({}); a.boundaryExclude_ = nullptr; }
         } hookReset{*this};
+        ++passesStarted_;
         rune::storage::RangeCleanResult passResult = cleaner.produceCleanedRangeBounded(
             best.dir,
             sealedBases,
@@ -720,6 +729,14 @@ public:
             /*nowMs=*/            nowMs);
 
         const int64_t passEnd = passResult.passEnd;
+        // #840: the LogCleaner is per pass, so its sticky damage state ends with it; the agent keeps the log out of
+        // selection and never advances (or persists) the watermark past damage.
+        const bool damagedLog = cleaner.uncleanable();
+        if (damagedLog && uncleanable_.insert(best.dir).second) {
+            const auto dmg = cleaner.damage();
+            spdlog::warn("LogCleanerAgent: {} is uncleanable until restart (damaged batch in segment {} at byte {})",
+                         best.dir, dmg ? dmg->segBase : -1, dmg ? dmg->byteOffset : 0);
+        }
 
         // ---------------------------------------------------------------
         // Phase 5: enqueue swaps for the rewritten/deleted segments, then advance
@@ -729,7 +746,7 @@ public:
         //   - a rewritten base → reloadSegment picks up the new .log.
         //   - a merged/emptied base → reloadSegment finds the .log gone, drops it.
         // ---------------------------------------------------------------
-        const bool advance = passEnd > globalDirtyStart &&
+        const bool advance = !damagedLog && passEnd > globalDirtyStart &&
                              best.replica->cleanerRole() == rune::replication::Role::Leader;
         bool allEnqueued = true;
         for (std::size_t gi = 0; gi < passResult.groups.size(); ++gi) {
@@ -1069,6 +1086,12 @@ private:
             for (auto* r : view_) live = live || (r && r->isDiskBacked() && r->log() == it->first);
             it = live ? std::next(it) : checkpoints_.erase(it);
         }
+        // #840: forget an uncleanable log when it is deleted or unassigned (its dir leaves the view).
+        for (auto it = uncleanable_.begin(); it != uncleanable_.end();) {
+            bool live = false;
+            for (auto* r : view_) live = live || (r && r->isDiskBacked() && r->log() != nullptr && r->log()->dir() == *it);
+            it = live ? std::next(it) : uncleanable_.erase(it);
+        }
     }
 
     ReplicaRegistry*        registry_;            // non-owning; nullptr once a view channel is attached
@@ -1115,7 +1138,7 @@ private:
                 building_.clear();
                 viewGen_    = gen;
                 ackPending_ = true;
-                if (!checkpoints_.empty()) pruneCheckpoints_();   // Task 8 (cold)
+                if (!checkpoints_.empty() || !uncleanable_.empty()) pruneCheckpoints_();   // Task 8 (cold)
             }
         }, 64);
         if (ackPending_ && !holdViewAckForTest_ && channel_->ack.write(reinterpret_cast<const uint8_t*>(&viewGen_), 8,
@@ -1152,6 +1175,8 @@ private:
             (void)l->runCleanerFileOps(boundaryNowMs_, r->fileDeleteDelayMs());
         }
     }
+    std::unordered_set<std::string> uncleanable_;   ///< #840: dirs of damaged logs (cleaner thread; cold)
+    uint64_t passesStarted_ = 0;                    ///< test seam (cleaner thread)
     uint64_t cleanedSeq_ = 0;   ///< fix round 2: unique .cleaned output names (cleaner thread)
     std::array<rune::storage::Log::CleanedMember, rune::storage::LogCleaner::kMaxDeferredGroupMembers> scratchMembers_{};
     std::vector<int64_t> scratchSizes_;

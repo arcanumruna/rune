@@ -206,10 +206,7 @@ TEST(CheckedWritesTransientViewRegression, AbortedRangeInTheNewRingNeverDiscards
     rig.appendTransactional(7, Rec{50, 10, 1});   // offset 0, below the old cursor 4
     rig.appendAbortMarker(7);                     // offset 1
     rune::view::AbortedTxnFilter filter;
-    filter.ctx = &idx;
-    filter.fn  = [](const void* ctx, int64_t pid, int64_t base) noexcept {
-        return static_cast<const rune::transaction::AbortedTxnIndex*>(ctx)->isAborted(pid, base);
-    };
+    filter.index = &idx;
     rig.restart(filter);
     ASSERT_TRUE(rig.driveUntilCaughtUp(3));
 

@@ -94,3 +94,87 @@ TEST(CheckedWritesControlRecord, RecordTypeRefusesLookalikes) {
         if (type19[i] == 17 && type19[i + 1] == 0 && type19[i - 1] == 0x04) { type19[i] = 19; break; }
     EXPECT_EQ(cr::recordType(reseal(type19).data(), type19.size()), cr::kTxnJudge);
 }
+
+// #804: parseControl validates (framing + CRC) once and hands out a view; the view overloads do no CRC of their own.
+TEST(CheckedWritesControlRecordRegression, ParseControlOnceGivesTypeAndViewsRegression) {
+    const auto marker1 = marker(100, 140, 3, {{5, 55, 0x00070001}, {12, 56, 0}});
+    const std::vector<cr::ChangeMember> members{{0, 1, 0}, {7, 200, 0xF00D}};
+    std::vector<uint8_t> change(cr::changeBatchBytes(2));
+    ASSERT_EQ(cr::buildConstraintSetChange(change, 2, members), change.size());
+
+    // type 17 and 18: the type matches, and the view parse equals the raw parse
+    const auto cm = cr::parseControl(marker1.data(), marker1.size());
+    ASSERT_TRUE(cm.has_value());
+    EXPECT_EQ(cm->type, cr::kVerdictMarker);
+    const auto hv = cr::parseMarkerHeader(*cm), hr = cr::parseMarkerHeader(marker1.data(), marker1.size());
+    ASSERT_TRUE(hv && hr);
+    EXPECT_EQ(std::memcmp(&*hv, &*hr, sizeof(cr::MarkerHeader)), 0);
+    const auto mv = cr::parseMarker(*cm), mr = cr::parseMarker(marker1.data(), marker1.size());
+    ASSERT_TRUE(mv && mr);
+    ASSERT_EQ(mv->header.count, 2u);
+    for (uint32_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(mv->offsetAt(i), mr->offsetAt(i));
+        EXPECT_EQ(mv->codeAt(i), mr->codeAt(i));
+        EXPECT_EQ(mv->constraintIdAt(i), mr->constraintIdAt(i));
+    }
+    EXPECT_EQ(mv->offsetAt(1), 112);
+    std::vector<std::tuple<int64_t, uint16_t, uint32_t>> viaView, viaRaw;
+    EXPECT_TRUE(cr::forEachMarkerEntry(*cm, [&](int64_t o, uint16_t c, uint32_t id) { viaView.emplace_back(o, c, id); }));
+    EXPECT_TRUE(cr::forEachMarkerEntry(marker1.data(), marker1.size(), [&](int64_t o, uint16_t c, uint32_t id) { viaRaw.emplace_back(o, c, id); }));
+    EXPECT_EQ(viaView, viaRaw);
+    EXPECT_EQ(viaView.size(), 2u);
+
+    const auto cc = cr::parseControl(change.data(), change.size());
+    ASSERT_TRUE(cc.has_value());
+    EXPECT_EQ(cc->type, cr::kConstraintSetChange);
+    uint32_t idV = 0, idR = 0;
+    uint16_t nV = 0, nR = 0;
+    std::vector<cr::ChangeMember> outV(8), outR(8);
+    ASSERT_TRUE(cr::parseConstraintSetChange(*cc, idV, outV, nV));
+    ASSERT_TRUE(cr::parseConstraintSetChange(change.data(), change.size(), idR, outR, nR));
+    EXPECT_EQ(idV, idR);
+    ASSERT_EQ(nV, nR);
+    EXPECT_EQ(outV[1].planFingerprint, outR[1].planFingerprint);
+    EXPECT_EQ(outV[1].viewObjectId, 7u);
+
+    // a view of the wrong type is refused, with no CRC involved
+    EXPECT_FALSE(cr::parseMarkerHeader(*cc).has_value());
+    EXPECT_FALSE(cr::parseMarker(*cc).has_value());
+    EXPECT_FALSE(cr::forEachMarkerEntry(*cc, [](int64_t, uint16_t, uint32_t) {}));
+    EXPECT_FALSE(cr::parseConstraintSetChange(*cm, idV, outV, nV));
+
+    // types 16 and 19 are control records too, and parse to their type
+    for (const int16_t t : {cr::kReservation, cr::kTxnJudge}) {
+        auto b = marker(0, 10, 1, {});
+        for (std::size_t i = 61; i + 1 < b.size(); ++i)
+            if (b[i] == 17 && b[i + 1] == 0 && b[i - 1] == 0x04) { b[i] = static_cast<uint8_t>(t); break; }
+        const uint32_t crc = rune::protocol::crc32c(b.data() + 21, b.size() - 21);
+        std::memcpy(b.data() + 17, &crc, 4);
+        const auto c = cr::parseControl(b.data(), b.size());
+        ASSERT_TRUE(c.has_value()) << t;
+        EXPECT_EQ(c->type, t);
+        EXPECT_FALSE(cr::parseMarkerHeader(*c).has_value()) << "a view of another type";
+    }
+
+    // type 20 is not a control record of this family
+    auto type20 = marker(0, 10, 1, {});
+    for (std::size_t i = 61; i + 1 < type20.size(); ++i)
+        if (type20[i] == 17 && type20[i + 1] == 0 && type20[i - 1] == 0x04) { type20[i] = 20; break; }
+    { const uint32_t crc = rune::protocol::crc32c(type20.data() + 21, type20.size() - 21); std::memcpy(type20.data() + 17, &crc, 4); }
+    EXPECT_FALSE(cr::parseControl(type20.data(), type20.size()).has_value());
+
+    // one flipped value byte: the CRC refuses it
+    auto flipped = marker1;
+    flipped[flipped.size() - 3] ^= 0x01;
+    EXPECT_FALSE(cr::parseControl(flipped.data(), flipped.size()).has_value());
+
+    // a transaction marker and a data-less buffer are not control records of this family
+    const auto txn = rune::transaction::ControlMarker::build(5, 0, rune::transaction::ControlType::Commit, 1);
+    EXPECT_FALSE(cr::parseControl(txn.data(), txn.size()).has_value());
+    EXPECT_FALSE(cr::parseControl(nullptr, 0).has_value());
+
+    // truncated at every offset, for both shapes
+    for (const std::vector<uint8_t>* whole : {&marker1, static_cast<const std::vector<uint8_t>*>(&change)})
+        for (std::size_t n = 0; n < whole->size(); ++n)
+            EXPECT_FALSE(cr::parseControl(whole->data(), n).has_value()) << "truncated at " << n;
+}

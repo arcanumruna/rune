@@ -5,6 +5,7 @@
 #include <rune/storage/Throttler.h>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <functional>
 #include <vector>
 
@@ -89,6 +90,17 @@ public:
     [[nodiscard]] int64_t lastPrefixBytesRead() const noexcept { return prefixBytesRead_; }
 
     LogCleaner() = default;
+
+    /// Where the first damaged batch was found (Kafka: a corrupt segment makes the partition uncleanable).
+    struct Damaged {
+        int64_t     segBase;      ///< base offset of the segment whose walk stopped short
+        std::size_t byteOffset;   ///< byte position in that segment's .log where the walk stopped
+    };
+    /// Sticky: once a cleaning walk stops before the end of a segment (a batch failing the bounds check or its CRC, or
+    /// trailing bytes shorter than a batch), this cleaner reads and changes nothing more.  The cleaner never installs
+    /// the part it walked: every intact record behind the damage would be dropped.  Cleared only by a restart.
+    [[nodiscard]] bool uncleanable() const noexcept { return damaged_.has_value(); }
+    [[nodiscard]] std::optional<Damaged> damage() const noexcept { return damaged_; }
 
     /// D3b fix 1: a COMMIT/ABORT marker may be removed (horizon-stamped, then
     /// dropped) only below this offset — the minimum fetch position over EVERY
@@ -426,6 +438,9 @@ private:
     Offset  verdictBound_           = std::numeric_limits<Offset>::max();
     Offset  verdictMarkerEnd_       = 0;
     int64_t rewriteSegmentsRead_    = 0;
+    std::optional<Damaged> damaged_{};   ///< sticky uncleanable state (see uncleanable())
+    /// A walk of `segBase` stopped at `pos` short of its end: enter the uncleanable state (first time: log once).
+    void noteDamage_(const std::string& dir, int64_t segBase, std::size_t pos);
     uint64_t* deferredSeq_          = nullptr;   ///< non-null = deferred-install mode
     BoundaryHook hook_{};
     std::vector<CleanedGroup>* deferredOut_ = nullptr;   ///< set for one pass

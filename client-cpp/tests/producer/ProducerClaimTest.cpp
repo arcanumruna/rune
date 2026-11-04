@@ -2279,7 +2279,7 @@ TEST(ProducerClaimRegression, DiscardOfAMalformedRingMessageEmitsNoBatchAckRegre
 namespace {
 rc::Completions* g_ackCq = nullptr;  // the one queue the rig's producer delivers per-record completions to
 rc::Completions* g_ackBq = nullptr;  // C14 review: a batchAcksTo() queue, routed by its CqRef (else everything -> g_ackCq)
-void deliverToAckCq(void*, rc::CqRef ref, const rc::Completion& c) noexcept {
+void deliverToAckCq(void*, rc::CqRef ref, const rc::Completion& c, std::span<const uint8_t>) noexcept {
     rc::Completions* q = (g_ackBq != nullptr && ref == g_ackBq->cqRef()) ? g_ackBq : g_ackCq;
     if (q != nullptr) (void)q->ring().deliver(c, {});
 }

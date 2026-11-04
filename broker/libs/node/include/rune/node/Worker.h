@@ -1956,6 +1956,7 @@ public:
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
             if (viewSet_ != nullptr) [[unlikely]] {
                 work += viewSet_->drainInstalls();   // Task 19: install runtime-created view plans (own thread)
+                work += viewSet_->drainSnapshotAcks();   // the IO agent's done ring: durable-offset and discard acks
                 work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
                 work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
             }
@@ -2093,6 +2094,7 @@ private:
             // shard worker that skipped this folded views it had never installed,
             // so every CreateView stayed UnknownView on the live path.
             work += viewSet_->drainInstalls();
+            work += viewSet_->drainSnapshotAcks();   // the IO agent's done ring: durable-offset and discard acks
             work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
             work += serveHeldViewReads_();       // issue #82: reads the fold barrier held, now folded
         }
@@ -7022,7 +7024,7 @@ private:
             // partition no installed view is interested in.
             if (!viewSet_->interestedIn(topicId)) {
                 const PartitionWriteState* w = writeOf_(replica);
-                if (w == nullptr || (w->constraintSets.latest().empty() && !w->spec->keyIndex)) continue;   // a verdict source without its views still judges nothing, but is driven (it waits); a key index needs no view
+                if (w == nullptr || (w->verdicts == nullptr && w->constraintSets.latest().empty() && !w->spec->keyIndex)) continue;   // a verdict source without its views still judges nothing, but is driven (it waits); a key index needs no view; a live judge is driven until ensureVerdictSource erases it (#807)
             }
             if (replica->role() != rune::replication::Role::Leader) continue;
             const RcState* rcState = rcServe_(replica, rcOf_(replica));
@@ -7045,7 +7047,8 @@ private:
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, skip, nowNs, nullptr,
-                                      replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()}, replica);
+                                      replica->leadershipGeneration(), hwConfirmed, NsTag{log->nsSlot(), log->nsId()}, replica,
+                                      SourceLogBounds{log->logStartOffset(), log->logEndOffset()});
             } else {
                 // Phase 2b E: a TRANSIENT source — zero-copy view into the
                 // replica's own ring (same thread).  The fold itself stops at its
@@ -7065,12 +7068,7 @@ private:
     // #537: the fold's aborted-transaction predicate over THIS worker's RC state of
     // the source partition (owner thread; the index is read in place, never copied).
     [[nodiscard]] static rune::view::AbortedTxnFilter rcAbortedFilter_(const RcState& rc) noexcept {
-        rune::view::AbortedTxnFilter f;
-        f.ctx = &rc.aborted();
-        f.fn  = [](const void* ctx, int64_t pid, int64_t base) noexcept {
-            return static_cast<const rune::transaction::AbortedTxnIndex*>(ctx)->isAborted(pid, base);
-        };
-        return f;
+        return rune::view::AbortedTxnFilter{&rc.aborted()};
     }
 
     // One owned source partition's view work.  Order matters: materialize a
@@ -7085,12 +7083,14 @@ private:
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
                       int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                       const rune::replication::PartitionReplica* transientRep,
-                      uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, rune::replication::PartitionReplica* replica) {
+                      uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, rune::replication::PartitionReplica* replica,
+                      SourceLogBounds bounds = {}) {
         int work = 0;
         PartitionWriteState* write = writeOf_(replica);
-        VerdictSource* judge = write != nullptr ? viewSet_->ensureVerdictSource(topicId, partition, *write) : nullptr;
-        if (judge != nullptr)
-            judge->bindLeader(replica, leaderGen, replica->isDiskBacked() ? replica->log()->logStartOffset() : replica->memoryLog()->logStartOffset());
+        // A judge lives only on a disk-backed replica (#808): SD9 refuses every production constraint on a transient topic, and the
+        // ring has no verdict feed, so a judge there would build its timeline from local requests alone and fail open.
+        VerdictSource* judge = (write != nullptr && replica->isDiskBacked()) ? viewSet_->ensureVerdictSource(topicId, partition, *write) : nullptr;
+        if (judge != nullptr) judge->bindLeader(replica, leaderGen, replica->log()->logStartOffset());
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
         if (transientRep != nullptr) {
@@ -7103,12 +7103,12 @@ private:
             tbp              = &tb;
         }
         if (viewSet_->hasRecovery()) [[unlikely]] {
-            viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
+            viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound, bounds);
             work += viewSet_->driveRebuild(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
-                                           leaderHwConfirmed, ns, write);
+                                           leaderHwConfirmed, ns, write, bounds);
         }
         work += viewSet_->driveFolds(topicId, partition, readRange, bound, skip, nowNs, tbp, leaderGen,
-                                     leaderHwConfirmed, ns, write, judge);
+                                     leaderHwConfirmed, ns, write, judge, bounds);
         return work;
     }
 
@@ -7221,9 +7221,11 @@ private:
         const uint64_t gen = sl.replica->logGeneration();
         if (gen == w.seenLogGeneration) [[likely]] return;
         if (w.seenLogGeneration != UINT64_MAX) {
-            const int64_t cut = sl.replica->lastTruncationOffset();
-            w.constraintSets.truncateFrom(cut);
-            w.markers.truncateFrom(cut);
+            const int64_t floor = sl.replica->takeTruncationFloor();   // #809: the lowest cut since the last pass, not just the last
+            w.constraintSets.truncateFrom(floor);
+            w.markers.truncateFrom(floor);
+        } else {
+            (void)sl.replica->takeTruncationFloor();   // first sight: nothing to cut, and no stale floor left behind
         }
         w.seenLogGeneration = gen;
     }
@@ -8346,6 +8348,32 @@ private:
         }));
     }
 
+    // #791 diagnostics, cold (a View ack timeout only): every conjunct of the fire condition of flushOwedAcksView_, so a stuck ack names
+    // the term that held it - the HW or the ISR (replication), the view holding minFoldCursor, the verdict bound, or the judge itself.
+    void logViewAckTimeout_(rune::replication::PartitionReplica* rep, const PartitionWriteState* ws, const PendingAcksView& entry) noexcept {
+        const int64_t minFold = viewSet_ == nullptr ? INT64_MAX
+            : viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration(), rep->isDiskBacked());
+        const int32_t holder = viewSet_ == nullptr ? -1
+            : viewSet_->minFoldCursorViewForDiag(rep->topicId(), rep->partitionId(), rep->leadershipGeneration(), rep->isDiskBacked());
+        spdlog::warn("Worker {}: View ack timeout detail: partition={} lastOffset={} hw={} isr={} minIsr={} acksAll={} minFoldCursor={} (view {}) replay={}",
+                     workerId_, entry.ret.partition, entry.lastOffset, rep->highWatermark(), rep->isr().size(), entry.minIsr,
+                     rune::protocol::client::acksAll(entry.acks), minFold, holder, static_cast<int>(entry.replay));
+        if (ws == nullptr || !ws->isVerdictSource()) return;
+        const int64_t bound = verdictBound_(rep, ws, INT64_MAX);
+        spdlog::warn("Worker {}: View ack timeout detail: partition={} verdictBound={}{} verdictKnownThrough={} committedThrough={} rejectedIndex={}",
+                     workerId_, entry.ret.partition, bound, bound == -1 ? " (leadership scan not Ready)" : "", ws->verdictKnownThrough(),
+                     ws->markers.committedThrough(), ws->rejected.size());
+        if (ws->verdicts == nullptr) {
+            spdlog::warn("Worker {}: View ack timeout detail: partition={} no judge bound", workerId_, entry.ret.partition);
+            return;
+        }
+        const auto d = ws->verdicts->diagSnapshot();
+        spdlog::warn("Worker {}: View ack timeout detail: partition={} judge judgedThrough={} stalled={} stallReason={} waitingForInstall={} "
+                     "needsActivation={} activeSet={} members={} active={} leaderGeneration={}",
+                     workerId_, entry.ret.partition, d.judgedThrough, d.stalled, d.stallReason, d.waitingForInstall, d.needsActivation,
+                     d.activeSetId, d.members, d.active, d.leaderGeneration);
+    }
+
     // -----------------------------------------------------------------------
     // flushOwedAcksView_ - fire View acks: the HW passed the batch, (for All) the ISR still holds, and every view of the
     // source folded past it under THIS leadership (WorkerViewSet::minFoldCursor); no views means nothing to wait for.
@@ -8371,13 +8399,14 @@ private:
             } else if (rep->highWatermark() > entry.lastOffset &&
                        (!rune::protocol::client::acksAll(entry.acks) || static_cast<int>(rep->isr().size()) >= entry.minIsr) &&
                        (viewSet_ == nullptr ||
-                        viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration()) > entry.lastOffset) &&
+                        viewSet_->minFoldCursor(rep->topicId(), rep->partitionId(), rep->leadershipGeneration(), rep->isDiskBacked()) > entry.lastOffset) &&
                        (!source || (verdictBound_(rep, ws, INT64_MAX) > entry.lastOffset &&
                                     (entry.replay == 0 || ws->markers.committedThrough() > entry.lastOffset)))) {
                 code = 0;
             } else if (nowNs >= entry.deadlineNs) {
                 spdlog::warn("Worker {}: View ack timeout for partition={} lastOffset={}; acking Internal error",
                              workerId_, entry.ret.partition, entry.lastOffset);
+                logViewAckTimeout_(rep, ws, entry);   // #791: which conjunct of the fire condition held the ack (cold)
                 code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
             } else {
                 // A replay waiting for its marker must not be passed by a later ack of the partition.
@@ -8387,7 +8416,14 @@ private:
                 }
                 return false;
             }
-            if (code == 0 && source) {
+            // Fill from the rejected index whenever the batch's range holds a rejection, even when the judge / logged set is gone
+            // by now (the set emptied while this ack was owed): firing code 0 with no trailer would hide a rejected record.
+            bool fills = source;
+            if (code == 0 && !source && ws != nullptr && ws->rejected.size() != 0) {
+                ws->rejected.forEachIn(entry.ret.baseOffset, entry.lastOffset + 1,
+                                       [&](const rune::storage::RejectedOffsetIndex::Entry&) { fills = true; });
+            }
+            if (code == 0 && fills) {
                 if (entry.replay == 2) {   // outside the dedupe window: stored, its verdicts are gone
                     code = static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
                     if (ws->verdicts != nullptr) ++ws->verdicts->statsMut().verdictUnknownDuplicates;

@@ -532,6 +532,12 @@ struct NodeConfig {
     // (replaced-disk) node vote (read by the storage gate, Step 9).
     bool storageRecoveryVote = false;
 
+    // RUNE_VIEW_BACKUP (default on): before a materialized view is rebuilt over a persisted checkpoint (unreadable, ahead of the
+    // log, legacy, ...), that checkpoint file is moved into <data>/__view_snapshots/backup/.  Off = the file is removed instead.
+    bool viewBackup = true;
+    // RUNE_VIEW_BACKUPS_KEPT (default 3, 1..1000): backups kept per (view, partition); older ones are pruned.
+    int32_t viewBackupsKept = 3;
+
     // Re-review 2026-10-04 MEDIUM-B (RUNE_UNCLEAN_CONSENSUS_ELECTION, default
     // false): operator escape hatch for the consensus candidacy gate.  Normally
     // a node votes only for a candidate in the newest durable __cluster_metadata
@@ -583,6 +589,8 @@ struct NodeConfig {
     std::string clusterKeyFile;
     std::string clusterKeyFileNext;
     int64_t     authTimeoutMs    = 10'000;
+    /// The cap of every positive-ms duration knob (30 days): a ms value times 1'000'000 (ns) never overflows an int64.
+    static constexpr int64_t kMaxDurationMs = 30LL * 24 * 3600 * 1000;
     // Namespaces Task 9 (spec §11): RUNE_ANONYMOUS_READ=1|true lets an authenticating broker serve a client that never
     // starts SCRAM as the read-only anonymous principal of `default` (schema / catalog reads only).  Off by default.
     bool        anonymousRead    = false;

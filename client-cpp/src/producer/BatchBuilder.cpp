@@ -217,6 +217,12 @@ OpResult BatchBuilder::send() {
     return r;
 }
 
+uint32_t BatchBuilder::recordCount_() const noexcept {
+    if (state_ != State::Open && state_ != State::Built) return 1;
+    const producer::Tier2Slot& t = impl_->tier2Slot(slot_);
+    return static_cast<uint32_t>(state_ == State::Open ? t.builder.recordCount() : t.recordCount);
+}
+
 OpResult BatchBuilder::send(Completions& cq, Token token) {
     checkProducer_();
     checkTxnGate_();
@@ -225,19 +231,23 @@ OpResult BatchBuilder::send(Completions& cq, Token token) {
         return OpResult::InvalidArgument;
     }
     if (!cq.onOwnerThread()) return OpResult::WrongThread;
-    const OpResult rr = cq.reserve(producer::kAckRecordBytes);
+    // ONE completion for the whole batch: a View batch of n records reserves for its n verdict entries (reservation = delivery).
+    // A batch whose completion cannot fit one queue record is refused here (InvalidArgument), nothing reserved.
+    if (!impl_->batchCompletionFits(cq, recordCount_())) return OpResult::InvalidArgument;
+    const uint32_t cqBytes = impl_->batchCompletionBytes(recordCount_());
+    const OpResult rr = cq.reserve(cqBytes);
     if (rr != OpResult::Accepted) return rr;
     Completions* bq = impl_->batchAckCq();
     const OpResult u = reserveUnit(bq);
     if (u != OpResult::Accepted) {
-        cq.unreserve(producer::kAckRecordBytes);
+        cq.unreserve(cqBytes);
         return u;
     }
     OpResult r = OpResult::InvalidArgument;
     try {
         r = submit_(producer::ackhandle::forCq(cq.cqRef_, token));
     } catch (...) {
-        cq.unreserve(producer::kAckRecordBytes);
+        cq.unreserve(cqBytes);
         if (bq != nullptr) bq->unreserve(producer::kAckRecordBytes);
         throw;
     }
@@ -245,7 +255,7 @@ OpResult BatchBuilder::send(Completions& cq, Token token) {
         ++cq.producerIssued_;
         if (bq != nullptr) ++bq->producerIssued_;
     } else {
-        cq.unreserve(producer::kAckRecordBytes);
+        cq.unreserve(cqBytes);
         if (bq != nullptr) bq->unreserve(producer::kAckRecordBytes);
     }
     return r;

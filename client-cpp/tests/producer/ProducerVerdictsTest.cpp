@@ -16,9 +16,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <string>
 #include <cstdint>
 #include <map>
+#include <thread>
 #include <vector>
 
 namespace rc  = rune::client;
@@ -37,10 +40,12 @@ const std::vector<uint8_t> kVal(16, 0x11);
 struct CqCapture {
     std::map<rc::Token, rc::Completion> done;
     std::map<rc::Token, int> times;
-    static void deliver(void* ctx, rc::CqRef, const rc::Completion& c) noexcept {
+    std::map<rc::Token, std::vector<uint8_t>> payloads;   // the inline payload, per token (test-only copy)
+    static void deliver(void* ctx, rc::CqRef, const rc::Completion& c, std::span<const uint8_t> payload) noexcept {
         auto* self = static_cast<CqCapture*>(ctx);
         self->done[c.token] = c;
         ++self->times[c.token];
+        self->payloads[c.token].assign(payload.begin(), payload.end());
     }
 };
 
@@ -66,11 +71,44 @@ struct Rig {
         return c;
     }
     explicit Rig(Acks acks = Acks::All | Acks::View, bool tier2 = false) : Rig(cfg(acks)) { (void)tier2; }
-    explicit Rig(const rc::ProducerConfig& c) : impl(c, 1 << 16) {
+    explicit Rig(const rc::ProducerConfig& c, bool direct = false, std::size_t ringBytes = 1 << 16) : impl(c, ringBytes) {
         ProducerImpl::Hooks h;
         h.ctx = &cq;
         h.cqDeliver = &CqCapture::deliver;
         impl.setHooks(h);
+        if (direct) impl.enableDirectIngress({std::this_thread::get_id(), nullptr, nullptr, kNow});
+    }
+    // Pump until one frame is captured (capped).
+    void pump() {
+        for (int i = 0; i < 1000 && corrs.empty(); ++i) {
+            while (impl.drainRing(kNow) != 0) {}
+            (void)impl.flushBatches(kNow, 42, sink);
+        }
+    }
+    // One CLAIM of n records of recLen bytes (the values written through the grant, then committed); no pump.
+    void claimNoPump(int n, uint64_t handle, uint32_t recLen = 16) {
+        const auto g = impl.claimBatch(1, 0, rc::Key(uint64_t{1}), static_cast<uint32_t>(n), recLen, handle);
+        ASSERT_EQ(g.result, rc::SendResult::Ok);
+        for (int i = 0; i < n; ++i) {
+            uint8_t* d = g.offsets != nullptr ? g.base + g.offsets[i] : g.base + static_cast<std::size_t>(i) * recLen;
+            std::fill(d, d + recLen, uint8_t{0x22});
+        }
+        ASSERT_TRUE(impl.commitClaim(g.token));
+    }
+    void claim(int n, rc::Token tok, uint32_t recLen = 16) {
+        claimNoPump(n, ackhandle::forCq(0, tok), recLen);
+        pump();
+    }
+    // One Tier-2 batch of n records (handle `handle`); pumped until a frame is captured.
+    void tier2(int n, uint64_t handle) {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        for (int i = 0; i < n; ++i) b.append(std::string_view("k"), std::string_view("v"), 1000);
+        const auto bytes = b.build();
+        ASSERT_EQ(impl.submitTier2Bytes(1, 0, handle, n, bytes), rc::producer::RejectReason::None);
+        pump();
+    }
+    void submitOne(rc::Token tok) {
+        EXPECT_TRUE(impl.submitSendRecord(1, 0, rc::Key(uint64_t(tok)), kVal, true, ackhandle::forCq(0, tok)));
     }
     std::vector<rc::BatchAck> batchAcks;
     void captureBatchAcks() {
@@ -85,7 +123,8 @@ struct Rig {
             (void)impl.flushBatches(kNow, 42, sink);
         }
     }
-    static std::vector<uint8_t> trailer(std::initializer_list<uint16_t> idx) {
+    static std::vector<uint8_t> trailer(std::initializer_list<uint16_t> idx) { return trailer(std::vector<uint16_t>(idx)); }
+    static std::vector<uint8_t> trailer(const std::vector<uint16_t>& idx) {
         std::vector<uint8_t> b;
         for (const uint16_t i : idx) {
             b.push_back(uint8_t(i)); b.push_back(uint8_t(i >> 8));
@@ -97,7 +136,7 @@ struct Rig {
 };
 }  // namespace
 
-TEST(ProducerVerdicts, CoalescedBatchWithOneBadRecord) {
+TEST(ProducerVerdictsRegression, CoalescedBatchWithOneBadRecordRegression) {
     Rig r;
     r.send(8);
     ASSERT_EQ(r.corrs.size(), 1u);
@@ -119,30 +158,9 @@ TEST(ProducerVerdicts, CoalescedBatchWithOneBadRecord) {
     EXPECT_FALSE(r.impl.hasInFlight());
 }
 
-TEST(ProducerVerdicts, Tier2BatchCarriesTheFirstRejection) {
-    Rig r;
-    rune::protocol::RecordBatchBuilder b(0, 1000);
-    for (int i = 0; i < 5; ++i) b.append(std::string_view("k"), std::string_view("v"), 1000);
-    const auto bytes = b.build();
-    ASSERT_EQ(r.impl.submitTier2Bytes(1, 0, ackhandle::forCq(0, rc::Token(1)), 5, bytes), rc::producer::RejectReason::None);
-    for (int i = 0; i < 1000 && r.corrs.empty(); ++i) {
-        while (r.impl.drainRing(kNow) != 0) {}
-        (void)r.impl.flushBatches(kNow, 42, r.sink);
-    }
-    ASSERT_EQ(r.corrs.size(), 1u);
-    const auto t = Rig::trailer({2, 4});   // two rejected records: the batch reports the first
-    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);
-    ASSERT_EQ(r.cq.times[1], 1) << "one completion for the whole batch";
-    const auto& c = r.cq.done[1];
-    EXPECT_EQ(c.op, rc::OpKind::Tier2Batch);
-    EXPECT_EQ(c.aux, 5);
-    EXPECT_EQ(c.status, OpStatus::BrokerError);
-    EXPECT_EQ(c.errorCode, kViolation);
-    EXPECT_EQ(rc::constraintIdOf(c), kCid);
-    EXPECT_FALSE(r.impl.hasInFlight());
-}
+// (The Tier-2 first-rejection contract changed with #802: see Tier2BatchReportsEveryRecordVerdictRegression.)
 
-TEST(ProducerVerdicts, VerdictArenaGrowsOnceAndIsCounted) {
+TEST(ProducerVerdictsRegression, VerdictArenaGrowsOnceAndIsCountedRegression) {
     namespace rca = rune::client::agent;
     rca::AgentConfig cfg;
     cfg.transport.ingressChannel = "aeron:udp?endpoint=127.0.0.1:1";
@@ -177,19 +195,32 @@ TEST(ProducerVerdicts, VerdictArenaGrowsOnceAndIsCounted) {
     EXPECT_EQ(a.verdictArenaGrowths(), 1u);
 }
 
-TEST(ProducerVerdicts, ReplayedVerdictsCompleteEachRecordAsTheOriginal) {
+TEST(ProducerVerdictsRegression, ReplayedVerdictsCompleteEachRecordAsTheOriginalRegression) {
     Rig r;
-    r.send(8);
+    r.send(4);
     ASSERT_EQ(r.corrs.size(), 1u);
-    // The first ack is lost; the retry's answer carries the same trailer.
+    // The first ack is lost: the batch's attempt deadline passes and the SAME batch (same correlation id) is re-sent.
+    ASSERT_EQ(r.impl.retransmitStalled(kNow + 60'000LL * 1'000'000 + 1, r.sink), 1);
+    ASSERT_EQ(r.corrs.size(), 2u) << "the retransmit put a second frame on the wire";
+    EXPECT_EQ(rc::producer::batchcorr::base(r.corrs[0]), rc::producer::batchcorr::base(r.corrs[1]))
+        << "the retransmit is the same batch: the same correlation id up to its attempt tag";
+    EXPECT_EQ(rc::producer::batchcorr::attempt(r.corrs[1]), rc::producer::batchcorr::attempt(r.corrs[0]) + 1);
+    // The retry's answer carries the original trailer; every record completes as it would have the first time.
     const auto t = Rig::trailer({3});
-    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);
-    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);   // a stale duplicate answer is ignored
-    for (rc::Token k = 1; k <= 8; ++k) EXPECT_EQ(r.cq.times[k], 1) << "each record completes exactly once";
+    r.impl.onProduceResponse(r.corrs[1], 100, 0, -1, true, t);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);   // the late original answer is ignored
+    for (rc::Token k = 1; k <= 4; ++k) EXPECT_EQ(r.cq.times[k], 1) << "each record completes exactly once";
+    for (rc::Token k = 1; k <= 3; ++k) {
+        EXPECT_EQ(r.cq.done[k].status, OpStatus::Ok) << k;
+        EXPECT_EQ(r.cq.done[k].value, 100 + int64_t(k) - 1) << k;
+    }
     EXPECT_EQ(r.cq.done[4].status, OpStatus::BrokerError);
+    EXPECT_EQ(r.cq.done[4].errorCode, kViolation);
+    EXPECT_EQ(rc::constraintIdOf(r.cq.done[4]), kCid);
+    EXPECT_FALSE(r.impl.hasInFlight());
 }
 
-TEST(ProducerVerdicts, EmptyTrailerIsPlainOk) {
+TEST(ProducerVerdictsRegression, EmptyTrailerIsPlainOkRegression) {
     Rig r;
     r.send(3);
     r.impl.onProduceResponse(r.corrs[0], 10, 0, -1, true, {});
@@ -199,7 +230,7 @@ TEST(ProducerVerdicts, EmptyTrailerIsPlainOk) {
     }
 }
 
-TEST(ProducerVerdicts, DuplicateSequenceOnAViewProducerIsVerdictUnknown) {
+TEST(ProducerVerdictsRegression, DuplicateSequenceOnAViewProducerIsVerdictUnknownRegression) {
     Rig r;
     r.send(8);
     r.impl.onProduceResponse(r.corrs[0], -1, static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence));
@@ -210,7 +241,7 @@ TEST(ProducerVerdicts, DuplicateSequenceOnAViewProducerIsVerdictUnknown) {
     }
 }
 
-TEST(ProducerVerdicts, DuplicateSequenceOnAnAllProducerIsStillOk) {
+TEST(ProducerVerdictsRegression, DuplicateSequenceOnAnAllProducerIsStillOkRegression) {
     Rig r(Acks::All);
     r.send(4);
     r.impl.onProduceResponse(r.corrs[0], -1, static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence));
@@ -220,10 +251,11 @@ TEST(ProducerVerdicts, DuplicateSequenceOnAnAllProducerIsStillOk) {
     }
 }
 
-TEST(ProducerVerdicts, OpStatusThirteenIsReservedAndVerdictUnknownIsFourteen) {
+TEST(ProducerVerdictsRegression, OpStatusThirteenIsReservedAndVerdictUnknownIsFourteenRegression) {
     EXPECT_EQ(static_cast<int>(OpStatus::BrokerTooOld), 12);
     EXPECT_EQ(static_cast<int>(OpStatus::StoredIdUnknown), 13);
     EXPECT_EQ(static_cast<int>(OpStatus::VerdictUnknown), 14);
+    EXPECT_EQ(static_cast<int>(OpStatus::RecordsRejected), 15);
 }
 
 TEST(ProducerVerdictsRegression, UnhandledRejectedRecordDoesNotHideALaterRejectionRegression) {
@@ -246,19 +278,6 @@ TEST(ProducerVerdictsRegression, UnhandledRejectedRecordDoesNotHideALaterRejecti
             EXPECT_EQ(c.status, OpStatus::Ok) << k;
         }
     }
-}
-
-TEST(ProducerVerdictsRegression, BatchAckCarriesTheFirstRejectionRegression) {
-    Rig r;
-    r.captureBatchAcks();
-    r.send(8);
-    ASSERT_EQ(r.corrs.size(), 1u);
-    const auto t = Rig::trailer({3, 5});
-    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, t);
-    ASSERT_EQ(r.batchAcks.size(), 1u);
-    EXPECT_EQ(r.batchAcks[0].errorCode, static_cast<int16_t>(kViolation));
-    EXPECT_EQ(r.batchAcks[0].baseOffset, -1);
-    EXPECT_EQ(r.batchAcks[0].recordCount, 8);
 }
 
 TEST(ProducerVerdictsRegression, BatchAckOnAViewDuplicateIsVerdictUnknownRegression) {
@@ -338,4 +357,502 @@ TEST(ProducerVerdictsRegression, TransactionalViewProducerDuplicateIsOkRegressio
         EXPECT_EQ(r.cq.done[k].value, -1);
     }
     hub.remove(&r.impl);
+}
+
+// ---- #806: Producer::onAck(AckCompletionFn): AckToken sends receive the full Completion a CQ would drain ----
+namespace {
+struct HandlerCapture {
+    std::map<rc::Token, rc::Completion> done;
+    std::map<rc::Token, int> times;
+    std::map<rc::Token, std::size_t> payloadLen;
+    std::map<rc::Token, std::vector<uint8_t>> payload;
+    std::map<rc::Token, OpStatus> plain;       // the scalar form
+    std::map<rc::Token, int64_t> plainValue;
+    std::map<rc::Token, uint16_t> plainError;
+    int plainCalls = 0;
+    static void full(void* ctx, const rc::Completion& c, std::span<const uint8_t> payload) noexcept {
+        auto* self = static_cast<HandlerCapture*>(ctx);
+        self->done[c.token] = c;
+        ++self->times[c.token];
+        self->payloadLen[c.token] = payload.size();
+        self->payload[c.token].assign(payload.begin(), payload.end());
+    }
+    static void scalar(void* ctx, rc::Token t, int64_t v, OpStatus st, uint16_t ec) noexcept {
+        auto* self = static_cast<HandlerCapture*>(ctx);
+        self->plainValue[t] = v;
+        self->plain[t] = st;
+        self->plainError[t] = ec;
+        ++self->plainCalls;
+    }
+};
+// The Rig's send(), with AckToken handles (ackhandle::forHandler) instead of CQ handles.
+void sendToHandler(Rig& r, int n) {
+    for (int i = 0; i < n; ++i)
+        EXPECT_TRUE(r.impl.submitSendRecord(1, 0, rc::Key(uint64_t(i + 1)), kVal, true, ackhandle::forHandler(rc::Token(i + 1))));
+    for (int i = 0; i < 1000 && r.corrs.empty(); ++i) {
+        while (r.impl.drainRing(kNow) != 0) {}
+        (void)r.impl.flushBatches(kNow, 42, r.sink);
+    }
+}
+}  // namespace
+
+TEST(ProducerVerdictsRegression, OnAckCarriesConstraintIdRegression) {
+    Rig r;
+    HandlerCapture cap;
+    r.impl.setOnAck(&HandlerCapture::full, &cap);
+    sendToHandler(r, 3);
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({1}));
+    for (rc::Token k = 1; k <= 3; ++k) ASSERT_EQ(cap.times[k], 1) << k;
+    const auto& bad = cap.done[2];   // record index 1
+    EXPECT_EQ(bad.status, OpStatus::BrokerError);
+    EXPECT_EQ(bad.errorCode, kViolation);
+    EXPECT_EQ(rc::constraintIdOf(bad), kCid);
+    EXPECT_EQ(bad.op, rc::OpKind::Send);
+    EXPECT_EQ(bad.value, -1);
+    EXPECT_EQ(cap.done[1].status, OpStatus::Ok);
+    EXPECT_EQ(cap.done[1].value, 100);
+    EXPECT_EQ(rc::constraintIdOf(cap.done[1]), 0u);
+    EXPECT_EQ(cap.done[3].status, OpStatus::Ok);
+    EXPECT_EQ(cap.done[3].value, 102);
+    for (rc::Token k = 1; k <= 3; ++k) EXPECT_EQ(cap.payloadLen[k], 0u) << "a producer ack carries no inline payload";
+    EXPECT_EQ(r.cq.times.size(), 0u) << "the CQ is not called as well";
+}
+
+TEST(ProducerVerdictsRegression, OnAckTier2CarriesRecordCountRegression) {
+    Rig r;
+    HandlerCapture cap;
+    r.impl.setOnAck(&HandlerCapture::full, &cap);
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    for (int i = 0; i < 5; ++i) b.append(std::string_view("k"), std::string_view("v"), 1000);
+    const auto bytes = b.build();
+    ASSERT_EQ(r.impl.submitTier2Bytes(1, 0, ackhandle::forHandler(rc::Token(1)), 5, bytes), rc::producer::RejectReason::None);
+    for (int i = 0; i < 1000 && r.corrs.empty(); ++i) {
+        while (r.impl.drainRing(kNow) != 0) {}
+        (void)r.impl.flushBatches(kNow, 42, r.sink);
+    }
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, {});
+    ASSERT_EQ(cap.times[1], 1);
+    EXPECT_EQ(cap.done[1].op, rc::OpKind::Tier2Batch);
+    EXPECT_EQ(cap.done[1].aux, 5);
+    EXPECT_EQ(cap.done[1].status, OpStatus::Ok);
+    EXPECT_EQ(cap.done[1].value, 100);
+}
+
+TEST(ProducerVerdictsRegression, PlainOnAckStillCalledRegression) {
+    Rig r;
+    HandlerCapture cap;
+    r.impl.setOnAck(&HandlerCapture::scalar, &cap);
+    sendToHandler(r, 3);
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({1}));
+    EXPECT_EQ(cap.plainCalls, 3);
+    EXPECT_EQ(cap.plain[2], OpStatus::BrokerError);
+    EXPECT_EQ(cap.plainError[2], kViolation);
+    EXPECT_EQ(cap.plain[1], OpStatus::Ok);
+    EXPECT_EQ(cap.plain[3], OpStatus::Ok);
+}
+
+TEST(ProducerVerdictsRegression, LastOnAckRegistrationWinsRegression) {
+    {   // Plain, then Full: only Full is called
+        Rig r;
+        HandlerCapture cap;
+        r.impl.setOnAck(&HandlerCapture::scalar, &cap);
+        r.impl.setOnAck(&HandlerCapture::full, &cap);
+        sendToHandler(r, 2);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, {});
+        EXPECT_EQ(cap.plainCalls, 0);
+        EXPECT_EQ(cap.times[1], 1);
+        EXPECT_EQ(cap.times[2], 1);
+    }
+    {   // Full, then a null scalar handler: neither is called
+        Rig r;
+        HandlerCapture cap;
+        r.impl.setOnAck(&HandlerCapture::full, &cap);
+        r.impl.setOnAck(static_cast<rc::AckFn>(nullptr), nullptr);
+        sendToHandler(r, 2);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, {});
+        EXPECT_EQ(cap.plainCalls, 0);
+        EXPECT_TRUE(cap.times.empty());
+    }
+}
+
+// ---- #802 (claim): a claimBatch reports EVERY record's verdict --------------------------------------------------------
+namespace {
+std::vector<uint8_t> payloadOf(const Rig& r, rc::Token t) {
+    const auto it = r.cq.payloads.find(t);
+    return it == r.cq.payloads.end() ? std::vector<uint8_t>{} : it->second;
+}
+// The rejected-index sets of a claim of 8: first, middle, last, several, none, all.
+const std::vector<std::vector<uint16_t>>& claimSets() {
+    static const std::vector<std::vector<uint16_t>> s = {{0}, {3}, {7}, {1, 4, 6}, {}, {0, 1, 2, 3, 4, 5, 6, 7}};
+    return s;
+}
+// The claim's whole-batch contract for a claim of `n` at base 100 and rejected index set `set`.
+void expectClaimVerdicts(const Rig& r, rc::Token tok, uint32_t n, const std::vector<uint16_t>& set,
+                         rc::OpKind op = rc::OpKind::Send) {
+    ASSERT_EQ(r.cq.times.count(tok) ? r.cq.times.at(tok) : 0, 1) << "one completion for the claim";
+    const rc::Completion& c = r.cq.done.at(tok);
+    const auto payload = payloadOf(r, tok);
+    EXPECT_EQ(c.op, op);
+    EXPECT_EQ(c.reservedBytes, rc::producer::batchCompletionBytes(true, n));
+    if (set.empty()) {
+        EXPECT_EQ(c.status, OpStatus::Ok);
+        EXPECT_EQ(c.value, 100);
+        EXPECT_EQ(c.payloadLen, 0u);
+        EXPECT_TRUE(payload.empty());
+        return;
+    }
+    EXPECT_EQ(c.status, OpStatus::RecordsRejected);
+    EXPECT_EQ(c.value, 100);
+    EXPECT_EQ(c.errorCode, kViolation);
+    EXPECT_EQ(rc::constraintIdOf(c), kCid);
+    ASSERT_EQ(c.payloadLen, 8u * set.size());
+    ASSERT_EQ(payload.size(), 8u * set.size());
+    const rc::BatchVerdicts v(c, payload);
+    ASSERT_EQ(v.rejectedCount(), set.size());
+    for (uint32_t i = 0; i < n; ++i) {
+        const bool rejected = std::find(set.begin(), set.end(), static_cast<uint16_t>(i)) != set.end();
+        EXPECT_EQ(v.accepted(i), !rejected) << i;
+        EXPECT_EQ(v.offsetOf(i), rejected ? -1 : 100 + static_cast<int64_t>(i)) << i;
+    }
+    for (uint32_t k = 0; k < set.size(); ++k) {
+        const rc::RecordVerdict rv = v.rejection(k);
+        EXPECT_EQ(rv.index, set[k]);
+        EXPECT_EQ(rv.errorCode, kViolation);
+        EXPECT_EQ(rv.constraintId, kCid);
+    }
+}
+}  // namespace
+
+TEST(ProducerVerdictsRegression, ClaimBatchReportsEveryRecordVerdictRegression) {
+    for (const auto& set : claimSets()) {
+        SCOPED_TRACE("rejected=" + std::to_string(set.size()) + " first=" + (set.empty() ? "-" : std::to_string(set[0])));
+        Rig r;
+        r.claim(8, 1);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer(set));
+        expectClaimVerdicts(r, 1, 8, set);
+        EXPECT_FALSE(r.impl.hasInFlight());
+    }
+}
+
+TEST(ProducerVerdictsRegression, DirectClaimReportsEveryRecordVerdictRegression) {
+    for (const auto& set : claimSets()) {
+        SCOPED_TRACE("Direct rejected=" + std::to_string(set.size()));
+        Rig r(Rig::cfg(Acks::All | Acks::View), /*direct=*/true);
+        r.claim(8, 1);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer(set));
+        expectClaimVerdicts(r, 1, 8, set);
+    }
+}
+
+TEST(ProducerVerdictsRegression, ClaimSharingABatchWithSendsRebasesItsIndexesRegression) {
+    {
+        Rig r;
+        r.submitOne(1);
+        r.submitOne(2);
+        r.claimNoPump(4, ackhandle::forCq(0, 3));
+        r.submitOne(4);
+        r.pump();
+        ASSERT_EQ(r.corrs.size(), 1u) << "one frame holds the two sends, the claim and the last send";
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({1, 3, 5, 6}));
+        for (rc::Token t = 1; t <= 4; ++t) ASSERT_EQ(r.cq.times[t], 1) << t;
+        EXPECT_EQ(r.cq.done[1].status, OpStatus::Ok);
+        EXPECT_EQ(r.cq.done[1].value, 100);
+        EXPECT_EQ(r.cq.done[2].status, OpStatus::BrokerError);       // record 1
+        EXPECT_EQ(r.cq.done[4].status, OpStatus::BrokerError);       // record 6
+        EXPECT_EQ(r.cq.done[4].reservedBytes, rc::producer::kAckRecordBytes);
+        const rc::Completion& c = r.cq.done[3];                      // records 2..5: rejected 3 and 5 -> claim 1 and 3
+        EXPECT_EQ(c.status, OpStatus::RecordsRejected);
+        EXPECT_EQ(c.value, 102);                                     // the claim's own base: record 0 of the claim
+        const auto payload = payloadOf(r, 3);
+        const rc::BatchVerdicts v(c, payload);
+        ASSERT_EQ(v.rejectedCount(), 2u);
+        EXPECT_EQ(v.rejection(0).index, 1);
+        EXPECT_EQ(v.rejection(1).index, 3);
+        EXPECT_TRUE(v.accepted(0));
+        EXPECT_FALSE(v.accepted(1));
+        EXPECT_TRUE(v.accepted(2));
+        EXPECT_FALSE(v.accepted(3));
+        EXPECT_EQ(v.offsetOf(2), 104);
+        EXPECT_EQ(c.reservedBytes, rc::producer::batchCompletionBytes(true, 4));
+    }
+}
+
+TEST(ProducerVerdictsRegression, ClaimBatchCompletesOnceOnEveryFailurePathRegression) {
+    const uint32_t R = rc::producer::batchCompletionBytes(true, 4);
+    const auto check = [&](Rig& r, OpStatus st) {
+        ASSERT_EQ(r.cq.times[1], 1);
+        EXPECT_EQ(r.cq.done[1].status, st);
+        EXPECT_EQ(r.cq.done[1].payloadLen, 0u);
+        EXPECT_EQ(r.cq.done[1].reservedBytes, R);
+        EXPECT_EQ(r.cq.times[1], 1);
+    };
+    {   // DuplicateSequence -> VerdictUnknown
+        Rig r;
+        r.claim(4, 1);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], -1, static_cast<int16_t>(rpc::ErrorCode::DuplicateSequence));
+        check(r, OpStatus::VerdictUnknown);
+    }
+    {   // the delivery timeout -> DeliveryFailed
+        Rig r;
+        r.claim(4, 1);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        (void)r.impl.retransmitStalled(kNow + 130'000LL * 1'000'000, r.sink);
+        check(r, OpStatus::DeliveryFailed);
+    }
+    {   // close -> Closed
+        Rig r;
+        r.claim(4, 1);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        EXPECT_EQ(r.impl.closeImmediately(), rc::OpResult::Accepted);
+        check(r, OpStatus::Closed);
+    }
+}
+
+TEST(ProducerVerdictsRegression, ClaimContinuationNeverCollidesRegression) {
+    using namespace ackhandle;
+    static_assert(forCq(kRefMask, rc::kMaxToken) != kClaimContinuation);
+    static_assert(forHandler(rc::kMaxToken) != kClaimContinuation);
+    static_assert(!isCq(kClaimContinuation));
+    static_assert((kClaimContinuation & kHandlerBit) == 0);
+    EXPECT_NE(forCq(0, 0), kClaimContinuation);
+    EXPECT_NE(forHandler(0), kClaimContinuation);
+    // A claim of the cap (4096 records): its span covers exactly 4096 ack slots, and it completes once.
+    Rig r(Rig::cfg(Acks::All | Acks::View), /*direct=*/false, std::size_t{1} << 22);
+    r.claimNoPump(4096, ackhandle::forCq(0, 1), 8);
+    while (r.impl.drainRing(kNow) != 0) {}
+    const auto* ps = r.impl.partitionState(1, 0);
+    ASSERT_NE(ps, nullptr);
+    EXPECT_EQ(ps->batchAckCount, 4096);
+    r.pump();
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({4095}));
+    ASSERT_EQ(r.cq.times[1], 1);
+    EXPECT_EQ(r.cq.done[1].status, OpStatus::RecordsRejected);
+    EXPECT_EQ(r.cq.done[1].reservedBytes, rc::producer::batchCompletionBytes(true, 4096));
+    const auto payload = payloadOf(r, 1);
+    const rc::BatchVerdicts v(r.cq.done[1], payload);
+    ASSERT_EQ(v.rejectedCount(), 1u);
+    EXPECT_EQ(v.rejection(0).index, 4095);
+    EXPECT_FALSE(r.impl.hasInFlight());
+}
+
+TEST(ProducerVerdictsRegression, OnAckFullHandlerGetsTheBatchVerdictsRegression) {
+    {   // Full: the payload holds the one entry
+        Rig r;
+        HandlerCapture cap;
+        r.impl.setOnAck(&HandlerCapture::full, &cap);
+        r.claimNoPump(4, ackhandle::forHandler(1));
+        r.pump();
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({2}));
+        ASSERT_EQ(cap.times[1], 1);
+        EXPECT_EQ(cap.done[1].status, OpStatus::RecordsRejected);
+        ASSERT_EQ(cap.payload[1].size(), 8u);
+        const rc::BatchVerdicts v(cap.done[1], cap.payload[1]);
+        ASSERT_EQ(v.rejectedCount(), 1u);
+        EXPECT_EQ(v.rejection(0).index, 2);
+        EXPECT_EQ(v.rejection(0).errorCode, kViolation);
+        EXPECT_EQ(v.rejection(0).constraintId, kCid);
+    }
+    {   // Plain: (RecordsRejected, base, first code)
+        Rig r;
+        HandlerCapture cap;
+        r.impl.setOnAck(&HandlerCapture::scalar, &cap);
+        r.claimNoPump(4, ackhandle::forHandler(1));
+        r.pump();
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({2}));
+        ASSERT_EQ(cap.plainCalls, 1);
+        EXPECT_EQ(cap.plain[1], OpStatus::RecordsRejected);
+        EXPECT_EQ(cap.plainValue[1], 100);
+        EXPECT_EQ(cap.plainError[1], kViolation);
+    }
+}
+
+// ---- #802 (Tier-2 + BatchAck): one completion reports every record of a Tier-2 batch; a BatchAck reports every rejection ------
+TEST(ProducerVerdictsRegression, Tier2BatchReportsEveryRecordVerdictRegression) {
+    for (const auto& set : claimSets()) {
+        SCOPED_TRACE("rejected=" + std::to_string(set.size()) + " first=" + (set.empty() ? "-" : std::to_string(set[0])));
+        Rig r;
+        r.tier2(8, ackhandle::forCq(0, 1));
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer(set));
+        expectClaimVerdicts(r, 1, 8, set, rc::OpKind::Tier2Batch);
+        EXPECT_EQ(r.cq.done[1].aux, 8);
+        EXPECT_FALSE(r.impl.hasInFlight());
+    }
+}
+
+TEST(ProducerVerdictsRegression, OneRecordClaimAndTier2KeepSingleRecordSemanticsRegression) {
+    {   // a claim of 1
+        Rig r;
+        r.claim(1, 1);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({0}));
+        const auto& c = r.cq.done[1];
+        EXPECT_EQ(c.status, OpStatus::BrokerError);
+        EXPECT_EQ(c.value, -1);
+        EXPECT_EQ(c.errorCode, kViolation);
+        EXPECT_EQ(rc::constraintIdOf(c), kCid);
+        EXPECT_EQ(c.reservedBytes, rc::producer::kAckRecordBytes);
+        EXPECT_EQ(c.payloadLen, 0u);
+    }
+    {   // a Tier-2 batch of 1
+        Rig r;
+        r.tier2(1, ackhandle::forCq(0, 1));
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({0}));
+        const auto& c = r.cq.done[1];
+        EXPECT_EQ(c.op, rc::OpKind::Tier2Batch);
+        EXPECT_EQ(c.status, OpStatus::BrokerError);
+        EXPECT_EQ(c.value, -1);
+        EXPECT_EQ(c.errorCode, kViolation);
+        EXPECT_EQ(rc::constraintIdOf(c), kCid);
+        EXPECT_EQ(c.reservedBytes, rc::producer::kAckRecordBytes);
+        EXPECT_EQ(c.payloadLen, 0u);
+    }
+}
+
+TEST(ProducerVerdictsRegression, BatchAckReportsEveryRejectionRegression) {
+    {   // handler form
+        Rig r;
+        r.captureBatchAcks();
+        r.send(8);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({3, 5}));
+        ASSERT_EQ(r.batchAcks.size(), 1u);
+        EXPECT_EQ(r.batchAcks[0].baseOffset, 100) << "stored: the real base";
+        EXPECT_EQ(r.batchAcks[0].errorCode, static_cast<int16_t>(kViolation));
+        EXPECT_EQ(r.batchAcks[0].recordCount, 8);
+        EXPECT_EQ(r.batchAcks[0].rejectedCount, 2u);
+    }
+    {   // the entries themselves (copied during the call)
+        Rig r;
+        std::vector<uint8_t> seen;
+        r.impl.setOnBatchAck([](void* ctx, const rc::BatchAck& a) noexcept {
+            auto* v = static_cast<std::vector<uint8_t>*>(ctx);
+            if (a.rejectedCount != 0) v->assign(a.rejections, a.rejections + 8u * a.rejectedCount);
+        }, &seen);
+        r.send(8);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({3, 5}));
+        EXPECT_EQ(seen, Rig::trailer({3, 5}));
+    }
+    {   // CQ form
+        Rig r;
+        std::vector<rc::Completion> got;
+        std::vector<std::vector<uint8_t>> pl;
+        struct Cap { std::vector<rc::Completion>* c; std::vector<std::vector<uint8_t>>* p; } cap{&got, &pl};
+        ProducerImpl::Hooks h;
+        h.ctx = &cap;
+        h.cqDeliver = [](void* ctx, rc::CqRef, const rc::Completion& c, std::span<const uint8_t> p) noexcept {
+            auto* k = static_cast<Cap*>(ctx);
+            if (c.op == rc::OpKind::BatchAck) { k->c->push_back(c); k->p->emplace_back(p.begin(), p.end()); }
+        };
+        r.impl.setHooks(h);
+        r.impl.setBatchAckCq(nullptr, 7);
+        r.send(8);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({3, 5}));
+        ASSERT_EQ(got.size(), 1u);
+        EXPECT_EQ(got[0].status, OpStatus::RecordsRejected);
+        EXPECT_EQ(got[0].value, 100);
+        EXPECT_EQ(pl[0], Rig::trailer({3, 5}));
+        EXPECT_EQ(got[0].reservedBytes, 8u * rc::kBatchAckUnitBytes);
+    }
+    {   // Tier-2 under batchAcksTo: the status, no list (one credit unit)
+        Rig r;
+        std::vector<rc::Completion> got;
+        std::vector<std::size_t> plen;
+        struct Cap { std::vector<rc::Completion>* c; std::vector<std::size_t>* p; } cap{&got, &plen};
+        ProducerImpl::Hooks h;
+        h.ctx = &cap;
+        h.cqDeliver = [](void* ctx, rc::CqRef, const rc::Completion& c, std::span<const uint8_t> p) noexcept {
+            auto* k = static_cast<Cap*>(ctx);
+            if (c.op == rc::OpKind::BatchAck) { k->c->push_back(c); k->p->push_back(p.size()); }
+        };
+        r.impl.setHooks(h);
+        r.impl.setBatchAckCq(nullptr, 7);
+        r.tier2(8, 0);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({3, 5}));
+        ASSERT_EQ(got.size(), 1u);
+        EXPECT_EQ(got[0].status, OpStatus::RecordsRejected);
+        EXPECT_EQ(plen[0], 0u);
+        EXPECT_EQ(got[0].reservedBytes, rc::kBatchAckUnitBytes);
+    }
+    {   // a 1-record batch's BatchAck keeps the first-rejection form
+        Rig r;
+        r.captureBatchAcks();
+        r.send(1);
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({0}));
+        ASSERT_EQ(r.batchAcks.size(), 1u);
+        EXPECT_EQ(r.batchAcks[0].baseOffset, -1);
+        EXPECT_EQ(r.batchAcks[0].errorCode, static_cast<int16_t>(kViolation));
+        EXPECT_EQ(r.batchAcks[0].rejectedCount, 0u);
+    }
+}
+
+TEST(ProducerVerdictsRegression, OnAckFullHandlerGetsTheTier2VerdictsRegression) {
+    Rig r;
+    HandlerCapture cap;
+    r.impl.setOnAck(&HandlerCapture::full, &cap);
+    r.tier2(4, ackhandle::forHandler(1));
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({1, 3}));
+    ASSERT_EQ(cap.times[1], 1);
+    EXPECT_EQ(cap.done[1].op, rc::OpKind::Tier2Batch);
+    EXPECT_EQ(cap.done[1].status, OpStatus::RecordsRejected);
+    ASSERT_EQ(cap.payload[1].size(), 16u);
+    const rc::BatchVerdicts v(cap.done[1], cap.payload[1]);
+    EXPECT_EQ(v.rejection(0).index, 1);
+    EXPECT_EQ(v.rejection(1).index, 3);
+}
+
+// Review fix round: a BatchAck's verdict list rides along only when its record is deliverable on THE queue (fits the
+// reservation, and one ring record).  A 4096-record batch with 2000 rejections is a 16 KB list: on a 64 KiB queue (maxMsg 8 KiB)
+// it goes out as RecordsRejected with an empty list and the base offset, and nothing is lost to the ring.
+TEST(ProducerVerdictsRegression, BatchAckVerdictListTooLargeIsDeliveredEmptyRegression) {
+    rc::CompletionsConfig cc;
+    cc.capacityBytes  = 64u << 10;
+    cc.maxResultBytes = 8192u - 40u;   // a 64 KiB ring's largest message is 8 KiB
+    rc::Completions cq(cc);
+    struct Sink { rc::Completions* cq; std::vector<rc::Completion> acks; } sink{&cq, {}};
+    for (const bool big : {true, false}) {
+        sink.acks.clear();
+        Rig r(Rig::cfg(Acks::All | Acks::View), /*direct=*/false, std::size_t{1} << 22);
+        ProducerImpl::Hooks h;
+        h.ctx = &sink;
+        h.cqDeliver = [](void* ctx, rc::CqRef, const rc::Completion& c, std::span<const uint8_t> p) noexcept {
+            auto* k = static_cast<Sink*>(ctx);
+            if (c.op != rc::OpKind::BatchAck) return;
+            k->acks.push_back(c);
+            (void)k->cq->ring().deliver(c, p, rc::detail::CompletionRing::Overflow::TooLarge);   // as Client::producerCqDeliver_
+        };
+        r.impl.setHooks(h);
+        r.impl.setBatchAckCq(&cq, 7);
+        r.send(4096);
+        ASSERT_EQ(r.corrs.size(), 1u);
+        std::vector<uint16_t> rej;
+        for (uint16_t i = 0; i < (big ? 2000 : 2); ++i) rej.push_back(static_cast<uint16_t>(i * 2));
+        r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer(rej));
+        ASSERT_EQ(sink.acks.size(), 1u);
+        std::vector<rc::Completion> got;
+        std::vector<std::size_t> plen;
+        cq.poll([&](const rc::Completion& c, std::span<const uint8_t> p) {
+            if (c.op == rc::OpKind::BatchAck) { got.push_back(c); plen.push_back(p.size()); }
+        });
+        ASSERT_EQ(got.size(), 1u);
+        EXPECT_EQ(got[0].status, OpStatus::RecordsRejected) << (big ? "big" : "small");
+        EXPECT_EQ(got[0].value, 100);
+        EXPECT_EQ(got[0].errorCode, kViolation);
+        EXPECT_EQ(plen[0], big ? 0u : 16u) << (big ? "an undeliverable list is dropped" : "a list that fits still rides along");
+        EXPECT_EQ(cq.ring().lostCompletions(), 0u);
+    }
 }

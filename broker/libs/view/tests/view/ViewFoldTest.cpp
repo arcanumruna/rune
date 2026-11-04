@@ -367,20 +367,11 @@ TEST(ViewFoldResumeRegression, MidBatchCursorSkipsAlreadyFoldedRecords) {
 // predicate for TRANSACTIONAL batches only.
 // ---------------------------------------------------------------------------
 namespace {
-// One aborted range [first, last] of one producer; counts the predicate calls.
+// One aborted range [first, last] of one producer, in the REAL index the worker hands the fold.
 struct OneAbortedRange {
-    int64_t pid, first, last;
-    mutable int calls = 0;
-    [[nodiscard]] rune::view::AbortedTxnFilter filter() const {
-        rune::view::AbortedTxnFilter f;
-        f.ctx = this;
-        f.fn  = [](const void* c, int64_t pid, int64_t base) noexcept {
-            const auto* r = static_cast<const OneAbortedRange*>(c);
-            ++r->calls;
-            return pid == r->pid && base >= r->first && base <= r->last;
-        };
-        return f;
-    }
+    rune::transaction::AbortedTxnIndex idx;
+    OneAbortedRange(int64_t pid, int64_t first, int64_t last) { idx.onAbortMarker(pid, first, last); }
+    [[nodiscard]] rune::view::AbortedTxnFilter filter() const { return rune::view::AbortedTxnFilter{&idx}; }
 };
 std::vector<uint8_t> charBatch(int64_t base, std::initializer_list<std::pair<int64_t, int32_t>> recs,
                                int64_t pid = -1) {
@@ -421,7 +412,71 @@ TEST(ViewFoldRegression, AbortedTxnBatchesAreSkippedCommittedOnesFoldRegression)
     EXPECT_NE(t.get(3), nullptr) << "a plain record folds";
     EXPECT_NE(t.get(4), nullptr) << "a committed transactional record folds";
     EXPECT_EQ(t.get(5), nullptr);
-    EXPECT_EQ(ab.calls, 3) << "the predicate is asked for transactional batches only";
+    // (that only TRANSACTIONAL batches reach the index: ANonTransactionalBatchInsideAnAbortedRangeStillFoldsRegression)
+}
+
+// #591: a batch that is NOT transactional is never asked of the index, even when its producer id and offset lie
+// inside an aborted range of that same producer (the attribute-bit test comes first).
+// RED (kAttrTransactional test dropped from AbortedTxnFilter::skips): key 1 is skipped.
+TEST(ViewFoldRegression, ANonTransactionalBatchInsideAnAbortedRangeStillFoldsRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+    rune::view::ViewTable t(comp.rowLayout);
+    rune::view::VersionDescriptorCache vdc(src);
+    rune::protocol::RecordBatchBuilder plain(0, 0);
+    plain.setProducerId(5); plain.setProducerEpoch(0); plain.setBaseSequence(0);   // idempotent, NOT transactional
+    {
+        const auto k = keyBytes(1);
+        const auto v = encodeCharacter(1, 10, 1);
+        plain.append(asSv(k), asSv(v), 0);
+    }
+    const auto bytes = concatBytes({plain.build(), charBatch(1, {{2, 20}}, 5)});
+    const OneAbortedRange ab{5, 0, 4};
+    const rune::storage::LogReadView v{bytes.data(), bytes.size(), 0, 2};
+    int64_t cur = 0;
+    const auto st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 2, cur, rune::view::FoldSkip{.aborted = ab.filter()});
+    EXPECT_EQ(cur, 2);
+    EXPECT_EQ(st.applied, 1u);
+    EXPECT_EQ(st.skippedAborted, 1u);
+    EXPECT_NE(t.get(1), nullptr) << "the non-transactional pid-5 batch folds";
+    EXPECT_EQ(t.get(2), nullptr) << "the transactional pid-5 batch inside the range is skipped";
+}
+
+// #591: the fold asks the REAL AbortedTxnIndex, including its ordering rules: an out-of-order insert, and the wide
+// span of one long-running aborted transaction that a later lookup must still reach (the maxSpan_ forward scan).
+// Batches (pid@offset): 6@2 aborted; 5@11 aborted; 5@15 committed (between the ranges); 5@30 aborted by the WIDE range
+// [20,40]; 7@31 committed (other pid).  RED (isAborted without its maxSpan_ forward scan): 30 is applied.
+TEST(ViewFoldRegression, AbortedTxnFilterUsesTheRealIndexOrderingRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+    rune::view::ViewTable t(comp.rowLayout);
+    rune::view::VersionDescriptorCache vdc(src);
+    rune::transaction::AbortedTxnIndex idx;
+    idx.onAbortMarker(5, 10, 12);
+    idx.onAbortMarker(6, 0, 3);      // out of marker order: placed by binary search
+    idx.onAbortMarker(5, 20, 40);    // wide span
+    const struct { int64_t base; int64_t pid; int64_t key; } batches[] = {
+        {2, 6, 1}, {11, 5, 2}, {15, 5, 3}, {30, 5, 4}, {31, 7, 5}};
+    int64_t cur = 0;
+    uint64_t applied = 0, skipped = 0;
+    for (const auto& b : batches) {
+        const auto bytes = charBatch(b.base, {{b.key, 10}}, b.pid);
+        const rune::storage::LogReadView v{bytes.data(), bytes.size(), b.base, b.base + 1};
+        cur = b.base;
+        const auto st = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, b.base + 1, cur,
+                                              rune::view::FoldSkip{.aborted = rune::view::AbortedTxnFilter{&idx}});
+        applied += st.applied;
+        skipped += st.skippedAborted;
+    }
+    EXPECT_EQ(skipped, 3u);
+    EXPECT_EQ(applied, 2u);
+    EXPECT_EQ(t.get(1), nullptr);   // 6@2
+    EXPECT_EQ(t.get(2), nullptr);   // 5@11
+    EXPECT_NE(t.get(3), nullptr);   // 5@15
+    EXPECT_EQ(t.get(4), nullptr);   // 5@30 (wide range)
+    EXPECT_NE(t.get(5), nullptr);   // 7@31
 }
 
 // A capped pass whose bound cuts an aborted batch applies none of it and

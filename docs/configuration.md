@@ -34,10 +34,10 @@ value as false). *ring/size* values must be powers of two; any other value keeps
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RUNE_ELECTION_TIMEOUT_MS` | `150` | Maximum wait per election round (positive ms). Raise it for slow or cross-datacenter links. |
-| `RUNE_VERDICT_INTERVAL_MS` | `100` | How often a verdict source's leader writes a verdict marker when nothing was rejected (positive ms). A rejection writes one at once. |
-| `RUNE_ELECTION_STATUS_INTERVAL_MS` | `20` | Canvass and heartbeat cadence (positive ms). The leader-heartbeat timeout is `max(election timeout, 3 x this)`. |
-| `RUNE_STARTUP_CANVASS_TIMEOUT_MS` | `100` | Extended canvass window on first boot, for peer discovery (positive ms). |
+| `RUNE_ELECTION_TIMEOUT_MS` | `150` | Maximum wait per election round (positive ms). Raise it for slow or cross-datacenter links. Max 2592000000 (30 days). |
+| `RUNE_VERDICT_INTERVAL_MS` | `100` | How often a verdict source's leader writes a verdict marker when nothing was rejected (positive ms). A rejection writes one at once. Max 2592000000 (30 days). |
+| `RUNE_ELECTION_STATUS_INTERVAL_MS` | `20` | Canvass and heartbeat cadence (positive ms). The leader-heartbeat timeout is `max(election timeout, 3 x this)`. Max 2592000000 (30 days). |
+| `RUNE_STARTUP_CANVASS_TIMEOUT_MS` | `100` | Extended canvass window on first boot, for peer discovery (positive ms). Max 2592000000 (30 days). |
 | `RUNE_CONTROLLED_SHUTDOWN_MS` | `5000` | Budget for handing partition leadership to in-sync peers on SIGTERM. `0` = no hand-off. |
 | `RUNE_MIN_ISR` | majority (`peers / 2 + 1`) | Minimum in-sync replicas for an `acks=all` produce, and the lower bound for a topic's `replicas`. Integer of at least 1. |
 | `RUNE_BROKER_LIVENESS_TIMEOUT_MS` | `0` (3 x the leader-heartbeat timeout) | How long the controller waits without a heartbeat before it fails a node's partitions over. A fault-test knob. |
@@ -81,10 +81,12 @@ them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this vers
 | Variable | Default | Meaning |
 |---|---|---|
 | `RUNE_STORAGE_FORMAT` | unset (never format) | `new`, `join` or `auto`. Read only when the data directory is empty and not formatted. Unset: the broker refuses to start (exit 78) and prints the command. `auto` is development only. See [SELF-HOSTING](../broker/docs/SELF-HOSTING.md#formatting-the-data-directory). |
+| `RUNE_VIEW_BACKUP` | `1` | `0`/`1`/`true`/`false`. When on, a view checkpoint file the broker throws away (see [View checkpoint backups](operations.md#view-checkpoint-backups)) is copied to `<data dir>/__view_snapshots/backup/` first. Off: it is deleted. |
+| `RUNE_VIEW_BACKUPS_KEPT` | `3` | 1 to 1000. Backups kept per view partition; the oldest are removed beyond that. |
 | `RUNE_STORAGE_RECOVERY_VOTE` | off | `1`/`true`/`TRUE`. Unsafe, disaster recovery only: lets an unconfirmed (replaced-disk) node vote. Logged at critical level. |
 | `RUNE_AERON_DIR` | `<data dir>/aeron` | Aeron directory (CnC file and mapped term buffers). Put it on tmpfs (`/dev/shm`) for performance. |
 | `RUNE_METRICS_FILE` | `<data dir>/metrics/rune-metrics.dat` | The broker's metrics file (arcanum-metrics format), created afresh at every start; the broker refuses to start if it cannot create it. Read it with `rune_role`. Metrics: [operations](operations.md#metrics). |
-| `RUNE_METRICS_SYSTEM_INTERVAL_MS` | `1000` | How often the control agent samples `/proc/self` into the process metrics (positive ms). |
+| `RUNE_METRICS_SYSTEM_INTERVAL_MS` | `1000` | How often the control agent samples `/proc/self` into the process metrics (positive ms). Max 2592000000 (30 days). |
 | `RUNE_IO_BACKEND` | `uring` when available, else `portable` | `uring` (Linux io_uring) or `portable`. An unset value falls back to `portable` when io_uring cannot start (old kernel, seccomp, Docker Desktop on Apple Silicon). An explicit `uring` fails loudly. |
 | `RUNE_TRANSIENT_LOG_RING_BYTES` | `8388608` (8 MiB) | Node-wide ring size of every transient partition (power of two). `RUNE_MEMORY_LOG_RING_BYTES` is a deprecated alias that logs one warning; the canonical name wins when both are set. |
 | `RUNE_PRODUCER_ID_EXPIRATION_MS` | `604800000` (7 days) | How long an idle producer id is remembered for idempotence (0 or more). |
@@ -99,13 +101,13 @@ them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this vers
 |---|---|---|
 | `RUNE_AUTH` | `enabled` | `enabled` or `disabled`. `disabled` is dev mode: no login, every request runs as `anonymous` with full access. A broker whose `RUNE_PEERS` lists more than one node refuses to start in dev mode. |
 | `RUNE_CLUSTER_KEY_FILE_NEXT` | unset | Second key for [rotation](operations.md#rotating-the-cluster-key): the broker accepts the current or the next key. |
-| `RUNE_AUTH_TIMEOUT_MS` | `10000` | A session that has not finished its login within this is answered `AuthenticationFailed` and ended (positive ms). |
+| `RUNE_AUTH_TIMEOUT_MS` | `10000` | A session that has not finished its login within this is answered `AuthenticationFailed` and ended (positive ms). Max 2592000000 (30 days). |
 | `RUNE_ANONYMOUS_MAX_CONNECTIONS` | `16` | The most anonymous-reader sessions one gateway holds (`RUNE_ANONYMOUS_READ` on). The next session's first request is answered `NamespaceLimitExceeded`. Integer in [1, 1000000]; applied before any namespace limit. |
 | `RUNE_ANONYMOUS_REQUEST_OPS_PER_SEC` | `1000` | One token bucket (burst = one second) shared by every anonymous-reader session on a gateway; a request over it is answered `Throttled` with the retry-after. Integer in [1, 1000000]. |
 | `RUNE_NS_LIMIT_TICK_US` | `10000` | Period of the per-namespace limit aggregator (microseconds): every tick it compares each namespace's produce / fetch / request / query rates with its limits and broadcasts a throttle deadline on change only; the workers report usage at the same period. A smaller tick reacts faster and costs more control-thread work. Integer in [1000, 1000000]. |
-| `RUNE_SECURITY_MAX_STALENESS_MS` | `1000` | F: a broker whose `__security` leader (or the consensus) has been silent this long answers logins, `__security` reads and security DDL `AuthUnavailable` (48) until it is current again. Must exceed the broker liveness timeout + 500 ms (an explicit smaller value is refused; the default is raised to it). A hard leader failure does not make a current in-ISR follower stale (#460). |
-| `RUNE_SECURITY_STALE_SESSION_END_MS` | `10000` | R (> F): a broker stale this long ends its authenticated sessions with a session-level `AuthUnavailable`, so their clients reconnect to a current broker. |
-| `RUNE_SECURITY_GATE_DEADLINE_MS` | `5000` | A security DDL OK whose enforcement on this broker is not confirmed within this is answered `Internal` "committed at offset N; enforcement not confirmed" (retry with the same request id). |
+| `RUNE_SECURITY_MAX_STALENESS_MS` | `1000` | F: a broker whose `__security` leader (or the consensus) has been silent this long answers logins, `__security` reads and security DDL `AuthUnavailable` (48) until it is current again. Must exceed the broker liveness timeout + 500 ms (an explicit smaller value is refused; the default is raised to it). A hard leader failure does not make a current in-ISR follower stale (#460). Max 2592000000 (30 days). |
+| `RUNE_SECURITY_STALE_SESSION_END_MS` | `10000` | R (> F): a broker stale this long ends its authenticated sessions with a session-level `AuthUnavailable`, so their clients reconnect to a current broker. Max 2592000000 (30 days). |
+| `RUNE_SECURITY_GATE_DEADLINE_MS` | `5000` | A security DDL OK whose enforcement on this broker is not confirmed within this is answered `Internal` "committed at offset N; enforcement not confirmed" (retry with the same request id). Max 2592000000 (30 days). |
 | `RUNE_TLS_CERT_FILE` | unset | PEM certificate file, reloaded on SIGHUP. **Required with authentication**: every client session of an authenticating broker is TLS, and a plaintext Connect is answered `HandshakeFailed` (29). |
 | `RUNE_TLS_KEY_FILE` | unset | PEM private key file. Same conditions. |
 | `RUNE_REQUIRE_TLS` | on with authentication | `true`/`1`: every client session must be TLS (always so with authentication). `false`/`0` is accepted only in dev mode (`RUNE_AUTH=disabled`); with authentication the broker refuses to start. Any other value is refused. |

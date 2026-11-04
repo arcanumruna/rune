@@ -24,6 +24,10 @@ constexpr uint64_t kObjTag = 7, kObjCap = 8;
 constexpr uint8_t kAcksView = rune::protocol::client::kAcksWireView;
 constexpr int kSteps = 250;
 constexpr uint64_t kKeys = 12;
+// Several batches per segment: the cleaner still has sealed segments of repeated keys to compact, and a restart recovers tens of
+// segments, not one per batch (a thousand under a sanitizer took long enough to time the embedded driver's client out, and their
+// fds passed the default soft limit of 1024).
+constexpr int64_t kModelRollBytes = 4096;
 
 TestRejectRule tagRule(uint8_t tag) { TestRejectRule r; r.mode = TestRejectRule::Mode::TagEquals; r.tag = tag; return r; }
 TestRejectRule capRule(uint32_t cap) { TestRejectRule r; r.mode = TestRejectRule::Mode::CapLiveKeys; r.cap = cap; return r; }
@@ -37,7 +41,7 @@ struct Producer {
 
 class Run {
 public:
-    explicit Run(uint64_t seed) : rng_(seed), rig_(/*follower=*/true, /*rollBytes=*/1) {
+    explicit Run(uint64_t seed) : rng_(seed), rig_(/*follower=*/true, kModelRollBytes) {
         rig_.typed();
         installCap_(3);
         rig_.installRejectView(kRejTag, kObjTag, tagRule(9));
@@ -250,7 +254,7 @@ const char* nameOf(KiAction a) {
 
 class KiRun {
 public:
-    explicit KiRun(uint64_t seed) : rng_(seed), rig_(/*follower=*/true, /*rollBytes=*/1) {
+    explicit KiRun(uint64_t seed) : rng_(seed), rig_(/*follower=*/true, kModelRollBytes) {
         rig_.createKeyIndex();
         installTag_();
         rig_.installProjection(kProj);

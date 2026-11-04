@@ -296,3 +296,27 @@ TEST(TransientReplicaRegression, FollowerRingFullAboveTheHwRefusesRetriablyAndAp
     EXPECT_GT(mem.logStartOffset(), 0);
     EXPECT_EQ(r2.wedgedAtOffset(), -1);
 }
+
+// #809: the transient ring reset is a cut like a log truncation; it feeds the same floor.
+TEST(TransientReplicaRegression, TransientResetFeedsTheTruncationFloorRegression) {
+    rune::storage::InMemoryLog mem1(8 * 1024, 1000), mem2(1 << 20, 100'000);
+    InMemoryTransport transport;
+    const std::vector<NodeId> all = {1, 2};
+    const std::vector<NodeId> leaderOnly = {1};
+    PartitionReplica r1(tcfg(1), Role::Leader,   1, all, leaderOnly, &mem1, &transport);
+    PartitionReplica r2(tcfg(2), Role::Follower, 1, all, all,        &mem2, &transport);
+    const std::vector<uint8_t> payload(1024, 0x5A);
+    for (int i = 0; i < 40; ++i) ASSERT_GE(r1.append(std::span<const uint8_t>(payload), false), 0);
+    ASSERT_GT(mem1.logStartOffset(), 0) << "precondition: the leader's ring evicted its oldest records";
+    ASSERT_EQ(r2.takeTruncationFloor(), std::numeric_limits<Offset>::max());
+    transport.setLeader(&r1);
+    transport.addFollower(2, &r2);
+    int64_t clock = 0;
+    for (int i = 0; i < kCap && r2.logEndOffset() < r1.logEndOffset(); ++i) {
+        clock += 1'000'000;
+        r1.doWork(clock); r2.doWork(clock); transport.pump(clock);
+    }
+    ASSERT_EQ(r2.transientLogResetsForTest(), 1u);
+    EXPECT_EQ(r2.takeTruncationFloor(), r2.lastTruncationOffset());
+    EXPECT_EQ(r2.takeTruncationFloor(), std::numeric_limits<Offset>::max());
+}

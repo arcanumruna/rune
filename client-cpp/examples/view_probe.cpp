@@ -72,6 +72,12 @@
 //         PERSISTED-OVER-TRANSIENT-RESTART: OK).
 //   Prints "VIEW-ENGINE-E2E: OK" on success.
 //
+//   RUNE_MODE=view_rows (view checkpoint e2e Steps 9-11; read-only apart from the rows it adds, after verify_restart): the
+//     persisted view char_persisted must serve key RUNE_VIEW_KEY_ID with hp RUNE_VIEW_HP_EXPECT (a restart that backed up
+//     and rebuilt its checkpoint, or repaired a torn tail, still serves exactly what the log holds).  Then RUNE_VIEW_PRODUCE_N
+//     (default 0) more rows are produced with Acks::All (keys RUNE_VIEW_PRODUCE_KEY_BASE.., default 1000.., hp = key) and each
+//     must become readable.  Same RUNE_VIEW_* handoff env as verify_restart.  Prints "VIEW-ROWS-LAST-OFFSET <offset of the last record produced, -1 if none>" and "VIEW-ROWS: OK produced=<n>".
+//     Exit codes 60..65.
 //   RUNE_MODE=ddl_race (DDL conformance): connect, print "DDL-RACE: READY role=<a|b>",
 //     wait for <RUNE_BARRIER_DIR>/go, then race the other container: define
 //     "race_topic" (a: disk, b: transient), createView "race_view", and a/b define vs
@@ -1487,6 +1493,58 @@ int main(int argc, char** argv) {
             return rc;
         }
 
+        if (mode == "view_rows") {
+            const int32_t  srcTopicId = static_cast<int32_t>(getEnvI64("RUNE_VIEW_SRC_TOPIC_ID", -1));
+            const int32_t  viewIdP    = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TOPIC_ID_PERSISTED", -1));
+            const uint64_t fpP        = getEnvU64("RUNE_VIEW_FP_PERSISTED", 0);
+            const int64_t  keyId      = getEnvI64("RUNE_VIEW_KEY_ID", -1);
+            const int64_t  hpExpect   = getEnvI64("RUNE_VIEW_HP_EXPECT", -1);
+            const int      produceN   = getEnvInt("RUNE_VIEW_PRODUCE_N", 0);
+            const int64_t  keyBase    = getEnvI64("RUNE_VIEW_PRODUCE_KEY_BASE", 1000);
+            if (srcTopicId < 0 || viewIdP < 0 || keyId < 0 || hpExpect < 0) {
+                std::cerr << "PROBE: FAIL view_rows requires RUNE_VIEW_SRC_TOPIC_ID / RUNE_VIEW_TOPIC_ID_PERSISTED / "
+                             "RUNE_VIEW_KEY_ID / RUNE_VIEW_HP_EXPECT\n";
+                return 60;
+            }
+            const ViewRowResult r0 = waitResolved(c, viewIdP, static_cast<uint64_t>(keyId), fpP, boundMs, timeoutMs);
+            if (r0.status != ViewRowResult::kOk) {
+                std::cerr << "PROBE: FAIL view_rows char_persisted status=" << r0.status << " (want kOk)\n";
+                return 61;
+            }
+            if (!decodeAndCheck(r0, keyId, hpExpect, "char_persisted (view_rows)")) return 62;
+            int64_t lastOffset = -1;   // the offset of the last record this call produced (-1 = none)
+            if (produceN > 0) {
+                ProducerConfig pcfg;
+                pcfg.acks             = Acks::All;
+                pcfg.produceTimeoutMs = static_cast<int64_t>(timeoutMs);
+                auto p = c.producer(pcfg);
+                Completions cq(c);
+                const TopicHandle srcTh{srcTopicId, /*partitionCount=*/1};
+                for (int i = 0; i < produceN; ++i) {
+                    const int64_t k = keyBase + i;
+                    Completion done;
+                    const auto value = encodeCharacter(k, k, /*version=*/1);
+                    const bool waited = sendAndWaitAck(cq, p, srcTh, Key(static_cast<uint64_t>(k)),
+                                                       std::span<const uint8_t>(value), static_cast<Token>(i + 1), timeoutMs, done);
+                    if (!waited || done.status != OpStatus::Ok) {
+                        std::cerr << "PROBE: FAIL view_rows produce key=" << k << " waited=" << waited
+                                  << " status=" << static_cast<int>(done.status) << "\n";
+                        return 63;
+                    }
+                    lastOffset = done.value;
+                }
+                for (int i = 0; i < produceN; ++i) {
+                    const int64_t k = keyBase + i;
+                    const ViewRowResult rk = waitForHp(c, viewIdP, static_cast<uint64_t>(k), fpP, k, k, boundMs, timeoutMs);
+                    if (!decodeAndCheck(rk, k, k, "char_persisted (view_rows, produced)")) return 64;
+                }
+            }
+            std::cout << "VIEW-ROWS-LAST-OFFSET " << lastOffset << std::endl;
+            std::cout << "VIEW-ROWS: OK produced=" << produceN << std::endl;
+            c.close();
+            return 0;
+        }
+
         if (mode == "verify_restart") {
             const int32_t  srcTopicId     = static_cast<int32_t>(getEnvI64("RUNE_VIEW_SRC_TOPIC_ID", -1));
             const int32_t  viewIdP        = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TOPIC_ID_PERSISTED", -1));
@@ -1631,7 +1689,7 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        std::cerr << "PROBE: FAIL unknown RUNE_MODE='" << mode << "' (want setup|verify_restart|ddl_race|catalog_dump|transient_failover)\n";
+        std::cerr << "PROBE: FAIL unknown RUNE_MODE='" << mode << "' (want setup|verify_restart|view_rows|ddl_race|catalog_dump|transient_failover)\n";
         c.close();
         return 20;
     } catch (const std::exception& ex) {

@@ -12,6 +12,11 @@
 // thread IS the polling thread (single-owner contract).  The only cross-thread
 // memory is the ring's own.
 //
+// A poll()/waitFor() handler may reserve() and issue the next op, but must NOT call poll()/waitFor() on the same queue:
+// the ring read is not re-entrant, so a nested call is a programming error and throws std::logic_error.  The credit of a
+// ring record is returned when the read ends (the ring head moves then), so while the handler runs reserve() may answer
+// QueueFull: the handler returns, and the app polls again after the outer call.
+//
 // Two forms:
 //   * Completions(cfg): standalone (C1) — no Client; the duty side reaches the
 //     ring via ring() (tests, custom producers).
@@ -88,11 +93,17 @@ public:
     /// Standalone queue (no Client).
     explicit Completions(CompletionsConfig cfg = {})
         : cfg_(validate(cfg))
-        , ring_(new detail::CompletionRing(cfg_.capacityBytes))
-        , stash_(new uint8_t[cfg_.capacityBytes])
         , maxRecordBytes_(detail::CompletionRing::completionRecordBytes(
               cfg_.maxResultBytes > cfg_.maxErrorText ? cfg_.maxResultBytes : cfg_.maxErrorText))
-        , owner_(std::this_thread::get_id()) {}
+        , ring_(new detail::CompletionRing(cfg_.capacityBytes, maxRecordBytes_))
+        , stash_(new uint8_t[cfg_.capacityBytes])
+        , owner_(std::this_thread::get_id()) {
+        // A batch completion above the slack record M reserves 2r - 48 (see reserve()), up to the largest record the ring
+        // takes (header + maxMsgLength).
+        const uint32_t bigRec = 2u * (detail::CompletionRing::kRecordHeaderBytes + ring_->maxMsgLength()) -
+                                detail::CompletionRing::completionRecordBytes(0);
+        maxReservation_ = bigRec > maxRecordBytes_ ? bigRec : maxRecordBytes_;
+    }
 
     /// Registered with `client` (C2).  The constructing thread becomes the
     /// owner: the only thread that may issue ops on, poll, wait on, or destroy
@@ -166,9 +177,14 @@ public:
 
     /// Reserve `bytes` of credit for one op about to be issued.  Accepted: the
     /// op may be issued (and must complete exactly once, or be unreserve()d if
-    /// it is then rejected).  QueueFull: poll() first.  Closed: the producer
+    /// it is then rejected).  QueueFull: poll() after the current handler returns (never from inside one).  Closed: the producer
     /// side closed this queue.  InvalidArgument: not an 8-aligned record size
-    /// (use reservationFor()) or larger than one maximal record.  WrongThread
+    /// (use reservationFor()) or larger than maxReservation().
+    ///
+    /// A reservation above maxRecordBytes() (a View batch completion with its verdict list) stands for a record of at most
+    /// (bytes + 48) / 2: the ring enforces that cap in deliver().  A record r above the slack record M can wrap and leave up
+    /// to r bytes of end-of-buffer padding; reserving 2r - 48 pays for the record AND that padding, because 2r - 48 + M >=
+    /// 2r (M >= 48), so reservations + M still bound the ring and deliver() never meets a full ring.  WrongThread
     /// (debug builds): called off the owner thread — the credit counters are
     /// owner-thread state (spec risk 3).
     [[nodiscard]] OpResult reserve(uint32_t bytes) noexcept {
@@ -178,7 +194,7 @@ public:
         if (ring_->producerClosed()) return OpResult::Closed;
         // A reservation is a ring record size: 8-aligned (review m2) — an
         // unaligned one could under-reserve the aligned record by up to 7 bytes.
-        if (bytes < detail::CompletionRing::completionRecordBytes(0) || bytes > maxRecordBytes_ ||
+        if (bytes < detail::CompletionRing::completionRecordBytes(0) || bytes > maxReservation_ ||
             (bytes & 7u) != 0) {
             return OpResult::InvalidArgument;
         }
@@ -211,9 +227,15 @@ public:
     /// h(const Completion&, std::span<const uint8_t> payload) — the span is
     /// valid only during h.  Completions stashed by waitFor() come first (they
     /// were read from the ring before anything still in it).  Returns the
-    /// number delivered.
+    /// number delivered.  h may issue ops (reserve + hand to the duty side).
+    /// While h runs, the credit of the ring record being handled is not yet
+    /// returned (the ring head moves when the read ends), so reserve() may
+    /// answer QueueFull until poll() returns; it is returned even if h throws.
+    /// h must not call poll() or waitFor() on this queue: that throws std::logic_error (the ring read is not
+    /// re-entrant).  On QueueFull inside h, return and poll again after this call.
     template <class H>
     int poll(H&& h, int limit = INT_MAX) {
+        const ReadScope scope{*this};   // throws if a handler of this queue is running
         int n = 0;
         while (n < limit && stashHead_ < stashTail_) {
             uint8_t* e = stash_.get() + stashHead_;
@@ -230,9 +252,11 @@ public:
         }
         if (stashHead_ == stashTail_) stashHead_ = stashTail_ = 0;
         if (stashLive_ != 0 || n >= limit) return n;
+        // The credit of a ring record is returned only after the read ends (the ring head moves then, also on unwind).
+        DeferredCredit deferred{*this};
         n += ring_->read(
-            [this, &h](const Completion& c, std::span<const uint8_t> payload) {
-                consumeCredit_(c);
+            [&deferred, &h](const Completion& c, std::span<const uint8_t> payload) {
+                deferred.add(c);
                 h(c, payload);
             },
             limit - n);
@@ -253,29 +277,36 @@ public:
     /// runner progresses by itself).  The pump is never called once the
     /// producer side has closed (its owner may be gone).  A TimedOut wait only
     /// stops waiting: the op will still complete and must still be polled.
-    /// onDone(const Completion&, std::span<const uint8_t>) runs on this thread.
+    /// onDone(const Completion&, std::span<const uint8_t>) runs on this thread;
+    /// like poll()'s handler it may issue ops, with the same deferred credit, but it must not call poll() or waitFor()
+    /// on this queue (throws std::logic_error: the ring read is not re-entrant).  Calling waitFor() from inside a
+    /// poll()/waitFor() handler of this queue throws too.
     template <class H, class Pump = NoPump, class Idle = DefaultWaitIdle>
     Wait waitFor(Token t, std::chrono::nanoseconds timeout, H&& onDone, Pump&& pump = Pump{},
                  Idle&& idle = Idle{}) {
-        if (takeFromStash_(t, onDone)) return Wait::Done;
+        if (inRead_) throwNested_();
+        if (takeFromStashScoped_(t, onDone)) return Wait::Done;
         const int64_t deadline = now_() + timeout.count();
         for (;;) {
             const bool closedBefore = ring_->producerClosed();
             int work = closedBefore ? 0 : pump();
             bool done = false;
+            const ReadScope scope{*this};   // the pump above is not a handler: only the ring read is guarded
+            DeferredCredit deferred{*this};
             work += ring_->read(
                 [&](const Completion& c, std::span<const uint8_t> payload) {
                     // Review m6: a BatchAck's token field packs (topic, partition),
                     // never an app token — never taken for one.
                     if (!done && c.token == t && c.op != OpKind::BatchAck) {
                         done = true;
-                        consumeCredit_(c);
+                        deferred.add(c);
                         onDone(c, payload);
                     } else {
                         pushStash_(c, payload);
                     }
                 },
                 INT_MAX);
+            deferred.apply();
             if (done) return Wait::Done;
             if (closedBefore && ring_->empty()) return Wait::NotPending;
             if (now_() >= deadline) return Wait::TimedOut;
@@ -295,6 +326,10 @@ public:
     }
     [[nodiscard]] const CompletionsConfig& config() const noexcept { return cfg_; }
     [[nodiscard]] uint32_t maxRecordBytes() const noexcept { return maxRecordBytes_; }
+    /// The largest reservation reserve() accepts (see reserve()).
+    [[nodiscard]] uint32_t maxReservation() const noexcept { return maxReservation_; }
+    /// The ring's largest message (capacity / 8): the largest record is kRecordHeaderBytes + this.
+    [[nodiscard]] uint32_t maxMsgLength() const noexcept { return ring_->maxMsgLength(); }
 
     /// Token of the internal registration record (outside the app's 48-bit space).
     static constexpr Token kRegistrationToken = ~Token{0};
@@ -310,6 +345,7 @@ private:
         ring_           = std::exchange(o.ring_, nullptr);
         stash_          = std::move(o.stash_);
         maxRecordBytes_ = o.maxRecordBytes_;
+        maxReservation_ = o.maxReservation_;
         reservedTotal_  = o.reservedTotal_;
         outstanding_    = o.outstanding_;
         stashHead_      = o.stashHead_;
@@ -350,13 +386,62 @@ private:
             .count();
     }
 
+    // C6: one BatchAck record returns the credit of every record of its
+    // batch (reservedBytes / kBatchAckUnitBytes reservations; EOS-OOS:
+    // reserved0 carries the batch's producerEpoch).
+    static uint32_t unitsOf_(const Completion& c) noexcept {
+        return (c.op == OpKind::BatchAck) ? batchAckUnits(c) : 1u;
+    }
+
+    // Immediate return of a record's credit: only for a stash entry (not ring space).
     void consumeCredit_(const Completion& c) noexcept {
         reservedTotal_ -= c.reservedBytes;
-        // C6: one BatchAck record returns the credit of every record of its
-        // batch (reservedBytes / kBatchAckUnitBytes reservations; EOS-OOS:
-        // reserved0 carries the batch's producerEpoch).
-        outstanding_ -= (c.op == OpKind::BatchAck) ? batchAckUnits(c) : 1u;
+        outstanding_ -= unitsOf_(c);
     }
+
+    // Re-entrancy guard (owner thread): set while a handler of this queue may run.  OneToOneRingBuffer::read is not
+    // re-entrant (a nested read re-delivers from the unmoved head, and the outer read's head store then moves the head
+    // back: the ring wedges), so a nested poll()/waitFor() is refused loudly, never answered with a silent 0.
+    [[noreturn]] static void throwNested_() {
+        throw std::logic_error("rune::client::Completions: poll()/waitFor() called from inside a completion handler");
+    }
+    struct ReadScope {
+        Completions& cq;
+        explicit ReadScope(Completions& q) : cq(q) {
+            if (q.inRead_) throwNested_();
+            q.inRead_ = true;
+        }
+        ReadScope(const ReadScope&)            = delete;
+        ReadScope& operator=(const ReadScope&) = delete;
+        ~ReadScope() { cq.inRead_ = false; }
+    };
+
+    template <class H>
+    bool takeFromStashScoped_(Token t, H& onDone) {
+        const ReadScope scope{*this};
+        return takeFromStash_(t, onDone);
+    }
+
+    // Credit of records handed over inside one ring read.  OneToOneRingBuffer::read moves the consumer head only after
+    // the whole read (also when the handler throws), so the credit is applied by the destructor, after the read.
+    struct DeferredCredit {
+        Completions& cq;
+        uint32_t     bytes = 0;
+        uint32_t     units = 0;
+        explicit DeferredCredit(Completions& q) noexcept : cq(q) {}
+        DeferredCredit(const DeferredCredit&)            = delete;
+        DeferredCredit& operator=(const DeferredCredit&) = delete;
+        ~DeferredCredit() { apply(); }
+        void add(const Completion& c) noexcept {
+            bytes += c.reservedBytes;
+            units += unitsOf_(c);
+        }
+        void apply() noexcept {
+            cq.reservedTotal_ -= bytes;
+            cq.outstanding_   -= units;
+            bytes = units = 0;
+        }
+    };
 
     // Copy a completion read from the ring into the stash (FIFO).  The stash is
     // as large as the ring and holds only records that were in the ring, each
@@ -413,14 +498,16 @@ private:
     }
 
     CompletionsConfig          cfg_;
+    uint32_t maxRecordBytes_ = 0;  // before ring_: the ring is built with it
+    uint32_t maxReservation_ = 0;
     detail::CompletionRing*    ring_ = nullptr;  // owned per the §3.3 protocol (see the class doc)
     std::unique_ptr<uint8_t[]> stash_;
-    uint32_t maxRecordBytes_ = 0;
     uint32_t reservedTotal_  = 0;  // owner thread only
     uint32_t outstanding_    = 0;  // owner thread only
     uint32_t stashHead_      = 0;  // owner thread only
     uint32_t stashTail_      = 0;
     uint32_t stashLive_      = 0;
+    bool     inRead_         = false;  // owner thread only: a handler of this queue is running (see ReadScope)
     Client*         client_ = nullptr;   // registered with (nullptr: standalone)
     std::thread::id owner_;              // the constructing thread
     CqRef           cqRef_  = kNoCqRef;  // duty-assigned at registration

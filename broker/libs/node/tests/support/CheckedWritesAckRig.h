@@ -143,14 +143,17 @@ public:
     }
 
     // ---- views ----
+    /// The worker's view set, created on first use.
+    void ensureViewSet_() {
+        if (vs) return;
+        channel = std::make_unique<ViewSnapshotChannel>();
+        vs = std::make_unique<WorkerViewSet>(*channel, (std::filesystem::temp_directory_path() /
+                                                        ("rune_cwrig_views_" + std::to_string(::getpid()) + "_" + std::to_string(viewSeq++))).string());
+        worker->setViewSet(vs.get());
+    }
     /// A projection view over the typed topic (`id` -> `id`), installed on the worker.
     void installView(int32_t viewTopicId, const char* name = "v") {
-        if (!vs) {
-            channel = std::make_unique<ViewSnapshotChannel>();
-            vs = std::make_unique<WorkerViewSet>(*channel, (std::filesystem::temp_directory_path() /
-                                                            ("rune_cwrig_views_" + std::to_string(::getpid()) + "_" + std::to_string(viewSeq++))).string());
-            worker->setViewSet(vs.get());
-        }
+        ensureViewSet_();
         viewSource_ = rune::codec::DescriptorBuilder("m", 1).add("id", rune::codec::PrimType::UInt64, 1, /*isKey*/ true)
                           .addFixedStr("name", 16).add("bio", rune::codec::PrimType::String).add("blob", rune::codec::PrimType::Bytes)
                           .add("kind", rune::codec::PrimType::Enum, 1, false, {1, 2, 3}).build();
@@ -161,6 +164,22 @@ public:
         auto comp = rune::view::compileView(v, srcs, viewTopicId);
         ASSERT_TRUE(comp.has_value());
         vs->installView(comp->plan, comp->rowLayout, viewSource_, /*persisted*/ false);
+        steps(2);
+    }
+    /// The TestReject verdict seam (WorkerViewSet::installTestVerdictViewForTest) over the typed topic, an in-memory projection of `id`.
+    void installTestRejectView(int32_t viewTopicId, uint64_t objectId, TestRejectRule rule, const char* name = "rej") {
+        ensureViewSet_();
+        viewSource_ = rune::codec::DescriptorBuilder("m", 1).add("id", rune::codec::PrimType::UInt64, 1, /*isKey*/ true)
+                          .addFixedStr("name", 16).add("bio", rune::codec::PrimType::String).add("blob", rune::codec::PrimType::Bytes)
+                          .add("kind", rune::codec::PrimType::Enum, 1, false, {1, 2, 3}).build();
+        rune::view::ViewPlan v;
+        v.viewName = name; v.key = "id"; v.sources = {{kTopicId, "id"}};
+        v.output = {{"id", rune::codec::PrimType::UInt64, 0, "id", rune::view::MergeRule::Replace}};
+        v.persistence = 1;
+        const rune::codec::Descriptor* srcs[] = {&viewSource_};
+        auto comp = rune::view::compileView(v, srcs, viewTopicId);
+        ASSERT_TRUE(comp.has_value());
+        vs->installTestVerdictViewForTest(comp->plan, comp->rowLayout, viewSource_, /*persisted*/ false, objectId, rule, /*underRecovery*/ false);
         steps(2);
     }
     [[nodiscard]] int64_t foldCursor(int32_t viewTopicId) const { return vs->instanceServeState(viewTopicId, 0).foldCursor; }

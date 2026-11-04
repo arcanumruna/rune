@@ -2410,9 +2410,10 @@ TEST(SessionResponseEgressRegression, ConnectRequestCarriesTheIoFlagAtVersion16)
     }
 }
 
-TEST(SessionResponseEgressRegression, DefaultSessionConfigAnnouncesVersion16) {
-    EXPECT_EQ(sm::SessionConfig{}.clientVersion, 16);
-    EXPECT_EQ(rpc::kClientVersion, 16);
+// The response-correlated flag needs version 16; later versions (17: checked writes) keep announcing it.
+TEST(SessionResponseEgressRegression, DefaultSessionConfigAnnouncesAtLeastVersion16) {
+    EXPECT_EQ(sm::SessionConfig{}.clientVersion, rpc::kClientVersion);
+    EXPECT_GE(rpc::kClientVersion, 16);
 }
 
 TEST(SessionResponseEgressRegression, FlagIsNotSentBelowVersion16) {

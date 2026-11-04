@@ -95,6 +95,11 @@ class VerdictRig {
 public:
     static constexpr int32_t kSrc = 6;
     static constexpr int kMaxPass = 4000;
+    static constexpr int kMaxFlushWait = 1'000'000;   ///< compact(): passes to wait for an in-flight async flush (a hang guard)
+    bool pauseAgent = false;   ///< pass() skips the IO agent: a discard frame stays unacked (CheckpointDiscardPending)
+    ViewBackupPolicy backupPolicy{};   ///< the agent's view-backup policy (set before the first persisted install)
+    /// The view checkpoint directory (the committed files, and backup/ under it).
+    [[nodiscard]] std::string snapDir() const { return viewDir_.string(); }
 
     /// `follower`: node 2 is in the ISR, so the HW only moves when followerFetch() is called.
     /// `rollBytes`: the log's segment size; compact() needs small segments (1 = one batch per segment).
@@ -166,7 +171,7 @@ public:
 
     /// A TestReject view (and the verdict template behind it) over the source.
     void installRejectView(int32_t viewTopicId, uint64_t objectId, TestRejectRule rule, const char* name = "rej", bool persisted = false) {
-        if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0);
+        if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0, backupPolicy);
         installs_.emplace_back(viewTopicId, [=, this] { installRejectViewNow_(viewTopicId, objectId, rule, name, persisted); });
         installs_.back().second();
     }
@@ -237,6 +242,11 @@ public:
     }
     /// As a follower: the leader (node 2) replicates `batches` at the LEO, committed.
     void replicate(std::vector<std::vector<uint8_t>> batches) {
+        replicateNoPass(std::move(batches));
+        passes(3);
+    }
+    /// replicate() without a worker pass: the worker sees nothing of it until the next pass (two cuts can land between passes).
+    void replicateNoPass(std::vector<std::vector<uint8_t>> batches) {
         std::vector<uint8_t> bytes;
         int64_t base = leo();
         for (auto& b : batches) {
@@ -251,7 +261,6 @@ public:
         resp.partition = 0; resp.topicId = kSrc; resp.highWatermark = base; resp.logStartOffset = log->logStartOffset();
         resp.records = std::span<const uint8_t>(bytes.data(), bytes.size());
         replica->applyReplicated(resp);
-        passes(3);
     }
     /// A constraint-set change batch (base offset 0, stamped by replicate()).
     static std::vector<uint8_t> changeBatch(uint32_t setId, std::vector<rune::storage::control_record::ChangeMember> members) {
@@ -360,7 +369,7 @@ public:
         worker->drainReturn([&](WorkerReturn r) {
             if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
         }, [](const TxnReturn&) {});
-        if (agent) (void)agent->doWork(now);
+        if (agent) { if (!pauseAgent) (void)agent->doWork(now); }
         else channel.deltas.drain([this](int32_t, aeron::concurrent::AtomicBuffer& buf, OneToOneByteRing::index_t off, OneToOneByteRing::index_t) {
             int32_t viewTopicId;
             std::memcpy(&viewTopicId, buf.buffer() + off, 4);
@@ -698,6 +707,14 @@ public:
             EXPECT_GE(replica->appendControlBatch(f, false), 0);
             passes(4);
         }
+        // The worker's background fdatasyncs run on the io backend's own thread; a segment rolled while one is in flight stays
+        // pinned until its completion is reaped, and the owner refuses a swap over it (FlushInFlight).  Wait for that
+        // completion (an event, not a deadline); the cap only turns a lost completion into a failure instead of a hang.
+        for (int i = 0; log->flushPinnedSegmentsForTest() > 0; ++i) {
+            if (i == kMaxFlushWait) { ADD_FAILURE() << "an async flush never completed"; break; }
+            pass();
+            std::this_thread::yield();
+        }
         Compacted out;
         for (int i = 0; i < 16 && (log->runCleanerFileOps(nowMs, replica->fileDeleteDelayMs()), log->cleanerFileOpsPending()); ++i) passes(1);   // the posted renames of the last install
         out.bound = replica->cleanerVerdictBound();
@@ -946,14 +963,13 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
                     out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[4 + kw + 8]), false, intent});
                 });
             } else if (r.baseOffset() < through) {
-                const int t = crl::recordType(b, total);
-                if (t == crl::kConstraintSetChange) {
+                if (const auto c = crl::parseControl(b, total); c && c->type == crl::kConstraintSetChange) {
                     std::array<crl::ChangeMember, 32> ms{};
                     uint32_t setId = 0; uint16_t n = 0;
-                    if (crl::parseConstraintSetChange(b, total, setId, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n)});
-                } else if (t == crl::kVerdictMarker) {
-                    VerdictRig::RigMarker m{r.baseOffset(), *crl::parseMarkerHeader(b, total), {}, r.hasDeleteHorizon()};
-                    (void)crl::forEachMarkerEntry(b, total, [&](int64_t o, uint16_t c, uint32_t cid) { m.entries.emplace_back(o, c, cid); });
+                    if (crl::parseConstraintSetChange(*c, setId, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n)});
+                } else if (c && c->type == crl::kVerdictMarker) {
+                    VerdictRig::RigMarker m{r.baseOffset(), *crl::parseMarkerHeader(*c), {}, r.hasDeleteHorizon()};
+                    (void)crl::forEachMarkerEntry(*c, [&](int64_t o, uint16_t cc, uint32_t cid) { m.entries.emplace_back(o, cc, cid); });
                     out.markers.push_back(std::move(m));
                 }
             }

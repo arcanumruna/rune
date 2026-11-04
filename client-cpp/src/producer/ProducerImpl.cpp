@@ -306,6 +306,8 @@ ProducerImpl::ProducerImpl(ProducerConfig cfg,
     // FD4: a transactional producer has no usable id until initTransactions (Task 5), even as a bare rig.
     if (!cfg_.transactionalId.empty()) identity_ = IdUnassigned{};
     publishStatus_();   // FD9: a bare rig reports its rig id
+    // Checked writes: a View claim's rebased verdict list (8 B per record) lives here; sized once, never resized.
+    if (viewSent_()) claimVerdictScratch_.reserve(8u * static_cast<std::size_t>(rune::protocol::client::kMaxJudgedBatchRecords));
     // Tier-2 slot pool geometry only: the pool itself (tier2Slots x 2 x tier2SlotBytes, ~8 MiB by default) is
     // allocated ONCE by the first batch() / bindBatchThread() (ensureTier2Pool_, #393), so a producer that never
     // uses Tier-2 reserves nothing.  Sized once; steady state never allocates.  Every slot starts on the app's
@@ -1323,6 +1325,12 @@ void ProducerImpl::setOnBatchAck(BatchAckFn fn, void* ctx) {
     batchAckCtx_ = ctx;
 }
 
+bool ProducerImpl::batchCompletionFits(const Completions& cq, uint32_t n) const noexcept {
+    const uint32_t rec = viewSent_() && n > 1 ? producer::batchCompletionRecordBytes(n) : kAckRecordBytes;
+    return rec <= detail::CompletionRing::kRecordHeaderBytes + cq.maxMsgLength() &&
+           batchCompletionBytes(n) <= cq.maxReservation();
+}
+
 void ProducerImpl::setBatchAckCq(Completions* cq, CqRef ref) {
     if (batchAckCq_ != nullptr) throw std::logic_error("Producer::batchAcksTo: already set");
     if (batchAckFn_ != nullptr) {
@@ -1338,27 +1346,62 @@ void ProducerImpl::setBatchAckCq(Completions* cq, CqRef ref) {
     if (sentBefore) throw std::logic_error("Producer::batchAcksTo: called after a send (setup phase only)");
     batchAckCqRef_ = ref;
     batchAckCq_    = cq;
+    if (cq != nullptr && cq->valid()) {
+        batchAckMaxRecord_ = cq->maxRecordBytes();
+        batchAckMaxMsg_    = cq->maxMsgLength();
+    }
 }
 
 void ProducerImpl::completeHandle_(uint64_t h, OpKind op, int64_t value, int64_t aux, OpStatus st,
-                                   uint16_t errorCode, uint32_t constraintId) noexcept {
-    if (h == 0) return;
-    const Token t = ackhandle::token(h);
-    if (ackhandle::isCq(h)) {
-        if (hooks_.cqDeliver == nullptr) return;  // bare rig: no registry
-        Completion c;
-        c.token         = t;
-        c.value         = value;
-        c.aux           = aux;
-        c.op            = op;
-        c.status        = st;
-        c.errorCode     = errorCode;
-        c.reservedBytes = kAckRecordBytes;
-        c.reserved0     = constraintId;
-        hooks_.cqDeliver(hooks_.ctx, ackhandle::cqRef(h), c);
+                                   uint16_t errorCode, uint32_t constraintId, std::span<const uint8_t> payload,
+                                   uint32_t reservedBytes) noexcept {
+    if (h == 0 || h == ackhandle::kClaimContinuation) return;   // 0: void; the sentinel is never a handle (defence in depth)
+    const bool cq = ackhandle::isCq(h);
+    if (cq && hooks_.cqDeliver == nullptr) return;  // bare rig: no registry
+    if (!cq && onAck_.kind == AckHandler::Kind::None) return;
+    Completion c;
+    c.token         = ackhandle::token(h);
+    c.value         = value;
+    c.aux           = aux;
+    c.op            = op;
+    c.status        = st;
+    c.errorCode     = errorCode;
+    c.payloadLen    = static_cast<uint32_t>(payload.size());
+    // 0 = derive: a Tier-2 batch reserved batchCompletionBytes(viewSent, its record count) (aux), everything else one record.
+    c.reservedBytes = reservedBytes != 0 ? reservedBytes
+                      : op == OpKind::Tier2Batch ? batchCompletionBytes(static_cast<uint32_t>(aux))
+                                                 : kAckRecordBytes;
+    c.reserved0     = constraintId;
+    if (cq) {
+        hooks_.cqDeliver(hooks_.ctx, ackhandle::cqRef(h), c, payload);
         return;
     }
-    if (onAckFn_ != nullptr) onAckFn_(onAckCtx_, t, value, st, errorCode);  // noexcept by type
+    switch (onAck_.kind) {   // noexcept by type
+        case AckHandler::Kind::Plain: onAck_.fn.plain(onAck_.ctx, c.token, value, st, errorCode); break;
+        case AckHandler::Kind::Full:  onAck_.fn.full(onAck_.ctx, c, payload); break;
+        case AckHandler::Kind::None:  break;
+    }
+}
+
+int32_t ProducerImpl::takeHandleSpan_(PartitionState& ps, uint64_t ackStart, int32_t i, int32_t ackCount,
+                                      uint64_t& h) noexcept {
+    // Copy + zero BEFORE any delivery: a handler may send (deferred in Direct mode) - never hold a reference into ackRing
+    // across user code.
+    uint64_t& slot = ps.ackRing[(ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
+    h = slot;
+    slot = 0;
+    if (h == ackhandle::kClaimContinuation) {   // an orphan marker (never expected at a span head): not a handle
+        h = 0;
+        return 1;
+    }
+    int32_t span = 1;
+    while (h != 0 && i + span < ackCount) {
+        uint64_t& next = ps.ackRing[(ackStart + static_cast<uint64_t>(i + span)) & ps.ackMask];
+        if (next != ackhandle::kClaimContinuation) break;
+        next = 0;
+        ++span;
+    }
+    return span;
 }
 
 // ---------------------------------------------------------------------------
@@ -1753,6 +1796,10 @@ void ProducerImpl::noteAppended_(PartitionState& ps, int32_t firstIndex, int32_t
         if (ps.batchAckCount == 0) ps.batchAckStart = ps.ackHead;
         while (ps.batchAckCount < firstIndex) pushAck_(ps, 0);
         pushAck_(ps, ackHandle);
+        // Checked writes: a claim of n >= 2 records on a View producer holds n slots - its handle, then n-1 continuation
+        // markers - so a walker sees a rejection of ANY of its records (room reserved by admitBatch_).
+        if (count > 1 && viewSent_())
+            for (int32_t k = 1; k < count; ++k) pushAck_(ps, ackhandle::kClaimContinuation);
     }
     // The TRUE encoded wire size (batch header + record bodies).
     ps.builderBytes = static_cast<int32_t>(rune::protocol::batch::kRecordBatchOverhead + ps.builder->bodyBytes());
@@ -1803,7 +1850,8 @@ rune::client::detail::ControlledAction ProducerImpl::admitBatch_(PartitionState&
     // #324: the batch's one completion handle lands at its FIRST record's index - reserve that ack slot here, where
     // growing may still throw (before anything is committed), exactly like admitRecord_.
     if (ackHandle != 0) {
-        const uint64_t need = static_cast<uint64_t>(ps.builder->recordCount() - ps.batchAckCount) + 1u;
+        const uint64_t need = static_cast<uint64_t>(ps.builder->recordCount() - ps.batchAckCount) + 1u +
+                              (viewSent_() ? static_cast<uint64_t>(n) - 1u : 0u);   // + the claim's continuation slots
         while (ps.ackHead - ps.ackTail + need > ps.ackRing.size()) growAckRing(ps);
     }
     return ControlledAction::CONTINUE;
@@ -2554,10 +2602,15 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         // wrote it earlier; Kafka DUPLICATE_SEQUENCE parity): success, offset
         // unknown — every record completes Ok with -1, exactly once.
         const int64_t off = baseOffset < 0 ? -1 : baseOffset;
-        if (hasVerdicts && !verdicts.empty())   // the batch ack carries the first rejection
-            emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1,
-                          static_cast<int16_t>(verdicts[2] | (verdicts[3] << 8)),
-                          OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+        if (hasVerdicts && !verdicts.empty()) {
+            const int16_t firstCode = static_cast<int16_t>(verdicts[2] | (verdicts[3] << 8));
+            if (b->recordCount > 1)   // stored and judged: the real base, the first code, and every rejection
+                emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, firstCode,
+                              OpStatus::RecordsRejected, units, b->producerEpoch, b->producerId, verdicts);
+            else                      // a 1-record batch keeps single-record semantics
+                emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, firstCode,
+                              OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
+        }
         else if (dupSeq && viewSent_())
             emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, errorCode,
                           OpStatus::VerdictUnknown, units, b->producerEpoch, b->producerId);
@@ -3052,18 +3105,17 @@ void ProducerImpl::completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t
                                   int32_t recordCount) noexcept {
     const bool ok = st == OpStatus::Ok;
     for (int32_t i = 0; i < ackCount; ++i) {
-        // Copy + zero the slot BEFORE the delivery: a handler may send (deferred
-        // in Direct mode) — never hold a reference into ackRing across user code.
-        uint64_t& slot = ps.ackRing[(ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
-        const uint64_t h = slot;
-        slot = 0;
+        uint64_t h = 0;
+        const int32_t span = takeHandleSpan_(ps, ackStart, i, ackCount, h);   // a claim's handle and its continuation run
+        i += span - 1;
         if (h == 0) continue;
+        const int32_t first = i - (span - 1);
         // baseOffset < 0 on Ok: offset unknown (known-old duplicate) — -1 for every record.
-        const int64_t value = (ok && baseOffset >= 0) ? baseOffset + (tier2 ? 0 : i) : -1;
+        const int64_t value = (ok && baseOffset >= 0) ? baseOffset + (tier2 ? 0 : first) : -1;
         FLIGHT_RECORDER_MARK_VAL_PRODUCE(flight_recorder::Site::ClientAckComplete, static_cast<uint32_t>(h),
                                  static_cast<double>(value));
         completeHandle_(h, tier2 ? OpKind::Tier2Batch : OpKind::Send, value, tier2 ? recordCount : 0,
-                        st, errorCode);
+                        st, errorCode, 0, {}, span > 1 ? batchCompletionBytes(static_cast<uint32_t>(span)) : 0u);
     }
 }
 
@@ -3076,40 +3128,72 @@ void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, 
     const std::size_t n = verdicts.size() / 8;
     std::size_t next = 0;   // entries are in ascending record order
     for (int32_t i = 0; i < ackCount; ++i) {
-        uint64_t& slot = ps.ackRing[(ackStart + static_cast<uint64_t>(i)) & ps.ackMask];
-        const uint64_t h = slot;
-        slot = 0;
+        uint64_t h = 0;
+        const int32_t span = takeHandleSpan_(ps, ackStart, i, ackCount, h);
         if (tier2) {
             if (h == 0) continue;
-            if (n != 0)
+            const int64_t base = baseOffset >= 0 ? baseOffset : -1;
+            if (n == 0) {
+                completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::Ok, 0);
+            } else if (recordCount > 1) {
+                // One completion reports every record: the trailer's entries are the batch's own (0-based) - passed through.
+                completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::RecordsRejected, le16(verdicts.data() + 2),
+                                le32(verdicts.data() + 4), verdicts.first(n * 8));
+            } else {   // a 1-record batch keeps single-record semantics
                 completeHandle_(h, OpKind::Tier2Batch, -1, recordCount, OpStatus::BrokerError, le16(verdicts.data() + 2), le32(verdicts.data() + 4));
-            else
-                completeHandle_(h, OpKind::Tier2Batch, baseOffset >= 0 ? baseOffset : -1, recordCount, OpStatus::Ok, 0);
+            }
             continue;
         }
         while (next < n && le16(verdicts.data() + next * 8) < static_cast<uint16_t>(i)) ++next;
-        const bool rej = next < n && le16(verdicts.data() + next * 8) == static_cast<uint16_t>(i);
-        if (h == 0) {   // no handle (back-filled), but a rejection of it still consumes its entry
-            if (rej) ++next;
+        if (h == 0) {   // no handle (back-filled): its own rejection, if any, is skipped by the advance above
+            i += span - 1;
             continue;
         }
-        if (rej) {
-            const uint8_t* e = verdicts.data() + next * 8;
-            ++next;
-            completeHandle_(h, OpKind::Send, -1, 0, OpStatus::BrokerError, le16(e + 2), le32(e + 4));
-        } else {
-            completeHandle_(h, OpKind::Send, baseOffset >= 0 ? baseOffset + i : -1, 0, OpStatus::Ok, 0);
+        const int64_t base = baseOffset >= 0 ? baseOffset + i : -1;
+        if (span == 1) {   // a single record (or a 1-record claim): its own verdict
+            if (next < n && le16(verdicts.data() + next * 8) == static_cast<uint16_t>(i)) {
+                const uint8_t* e = verdicts.data() + next * 8;
+                ++next;
+                completeHandle_(h, OpKind::Send, -1, 0, OpStatus::BrokerError, le16(e + 2), le32(e + 4));
+            } else {
+                completeHandle_(h, OpKind::Send, base, 0, OpStatus::Ok, 0);
+            }
+            continue;
         }
+        // A claim of `span` records [i, i + span): ONE completion that reports every record.
+        std::size_t k = 0;   // the entries inside the span
+        while (next + k < n && le16(verdicts.data() + (next + k) * 8) < static_cast<uint16_t>(i + span)) ++k;
+        const uint32_t bytes = batchCompletionBytes(static_cast<uint32_t>(span));
+        if (k == 0) {
+            completeHandle_(h, OpKind::Send, base, 0, OpStatus::Ok, 0, 0, {}, bytes);
+        } else {
+            // Rebase into the per-producer scratch (reserved once; k <= span <= kMaxJudgedBatchRecords, so no growth).
+            claimVerdictScratch_.resize(k * 8);
+            for (std::size_t e = 0; e < k; ++e) {
+                const uint8_t* src = verdicts.data() + (next + e) * 8;
+                uint8_t* dst = claimVerdictScratch_.data() + e * 8;
+                std::memcpy(dst, src, 8);
+                const uint16_t rebased = static_cast<uint16_t>(le16(src) - static_cast<uint16_t>(i));
+                dst[0] = static_cast<uint8_t>(rebased);
+                dst[1] = static_cast<uint8_t>(rebased >> 8);
+            }
+            const uint8_t* first = verdicts.data() + next * 8;
+            next += k;
+            completeHandle_(h, OpKind::Send, base, 0, OpStatus::RecordsRejected, le16(first + 2), le32(first + 4),
+                            std::span<const uint8_t>(claimVerdictScratch_.data(), k * 8), bytes);
+        }
+        i += span - 1;
     }
 }
 
 void ProducerImpl::completeSentUnacked_(PartitionState& ps) noexcept {
     if (ps.batchAckCount <= 0) return;
     for (int32_t i = 0; i < ps.batchAckCount; ++i) {
-        uint64_t& slot = ps.ackRing[(ps.batchAckStart + static_cast<uint64_t>(i)) & ps.ackMask];
-        const uint64_t h = slot;
-        slot = 0;
-        completeHandle_(h, OpKind::Send, -1, 0, OpStatus::Ok, 0);  // "sent, offset unknown"
+        uint64_t h = 0;
+        const int32_t span = takeHandleSpan_(ps, ps.batchAckStart, i, ps.batchAckCount, h);
+        i += span - 1;
+        completeHandle_(h, OpKind::Send, -1, 0, OpStatus::Ok, 0, 0, {},
+                        span > 1 ? batchCompletionBytes(static_cast<uint32_t>(span)) : 0u);  // "sent, offset unknown"
     }
     // The builder slice is always the newest one and acks=None never has an
     // in-flight slice, so the slice is reclaimed by rewinding the head.
@@ -3121,10 +3205,16 @@ void ProducerImpl::completeSentUnacked_(PartitionState& ps) noexcept {
 void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t baseSequence,
                                  int32_t recordCount, int64_t baseOffset, int16_t errorCode,
                                  OpStatus st, uint32_t units, int16_t producerEpoch,
-                                 int64_t producerId) noexcept {
+                                 int64_t producerId, std::span<const uint8_t> rejections) noexcept {
+    // Checked writes: `rejections` = the stored batch's verdict entries (a batch of >= 2 records whose trailer is not empty):
+    // the batch was STORED at baseOffset and only the listed records were rejected, so baseOffset is real and errorCode is the
+    // first rejection's code.
+    const bool stored = st == OpStatus::RecordsRejected;
     if (batchAckFn_ != nullptr) {
-        const BatchAck a{topicId, partition, errorCode == 0 ? baseOffset : -1, baseSequence,
-                         recordCount, errorCode, producerEpoch, producerId};
+        BatchAck a{topicId, partition, (errorCode == 0 || stored) ? baseOffset : -1, baseSequence,
+                   recordCount, errorCode, producerEpoch, producerId};
+        a.rejectedCount = static_cast<uint32_t>(rejections.size() / 8);
+        a.rejections    = rejections.empty() ? nullptr : rejections.data();
         batchAckFn_(batchAckCtx_, a);  // noexcept by type
         return;
     }
@@ -3132,7 +3222,7 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
     Completion c;
     c.token = (static_cast<uint64_t>(static_cast<uint32_t>(topicId)) << 32) |
               static_cast<uint32_t>(partition);
-    c.value = errorCode == 0 ? baseOffset : -1;
+    c.value = (errorCode == 0 || stored) ? baseOffset : -1;
     c.aux   = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(baseSequence)) << 32) |
                                    static_cast<uint32_t>(recordCount));
     c.op            = OpKind::BatchAck;
@@ -3140,7 +3230,18 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
     c.errorCode     = static_cast<uint16_t>(errorCode);
     c.reservedBytes = units * kAckRecordBytes;  // the credit of every record it covers (batchAckUnits)
     c.reserved0     = static_cast<uint16_t>(producerEpoch);  // batchAckOf() -> BatchAck::producerEpoch
-    hooks_.cqDeliver(hooks_.ctx, batchAckCqRef_, c);
+    // The list rides along only when the record it makes, rec = completionRecordBytes(8 count), is deliverable on THIS queue:
+    //  (a) it fits the reservation: rec <= units * 48 when rec <= the queue's slack record M, else 2 rec - 48 <= units * 48
+    //      (the ring's deliver() writes no record above (reserved + 48) / 2 for a reservation above M); and
+    //  (b) it is one ring record: rec <= kRecordHeaderBytes + the ring's maxMsgLength.
+    // Otherwise the status goes out with an empty list (value = the base offset, errorCode = the first rejection), as a Tier-2
+    // BatchAck does (one unit).  With deliver()'s cap a list that passes (a) and (b) cannot lose a completion.
+    const uint32_t rec = detail::CompletionRing::completionRecordBytes(static_cast<uint32_t>(rejections.size()));
+    const uint64_t need = rec <= batchAckMaxRecord_ ? rec : 2ull * rec - kAckRecordBytes;
+    const bool carry = stored && need <= c.reservedBytes && rec <= detail::CompletionRing::kRecordHeaderBytes + batchAckMaxMsg_;
+    const std::span<const uint8_t> list = carry ? rejections : std::span<const uint8_t>{};
+    c.payloadLen = static_cast<uint32_t>(list.size());
+    hooks_.cqDeliver(hooks_.ctx, batchAckCqRef_, c, list);
 }
 
 void ProducerImpl::failBatch_(PartitionState& ps, InFlightBatch& b, OpStatus st, uint16_t errorCode) {
@@ -3492,7 +3593,7 @@ int ProducerImpl::discardRing_(OpStatus st, int limit, uint16_t errorCode) {
                 const int32_t part = readLE32(p, kRecPartOff);
                 const int32_t n    = static_cast<int32_t>(readLE32u(p, kBatchCountOff));
                 emitUnsentBatchAck_(tid, part, n, st, static_cast<uint32_t>(n), errorCode);
-                completeHandle_(h, OpKind::Send, -1, 0, st, errorCode);
+                completeHandle_(h, OpKind::Send, -1, 0, st, errorCode, 0, {}, batchCompletionBytes(static_cast<uint32_t>(n)));
             }
             else if (type == kMsgTxnControl) {
                 // Phase 2b F Task 8: a control op that reaches a closed / discarding producer completes Closed
@@ -3562,7 +3663,8 @@ int ProducerImpl::refuseRingTxn_(int limit) noexcept {
                 const uint64_t h = (p[kRecFlagsOff] & kFlagWantAck) ? static_cast<uint64_t>(readLE64(p, kRecCorrIdOff)) : 0u;
                 emitBatchAck_(readLE32(p, kRecTopicIdOff), readLE32(p, kRecPartOff), -1, nrec, -1,
                               BatchAck::kClientFailure, o.status, static_cast<uint32_t>(nrec), -1);
-                if (h != 0) completeHandle_(h, OpKind::Send, -1, 0, o.status, o.errorCode);   // #324: the batch's completion
+                if (h != 0) completeHandle_(h, OpKind::Send, -1, 0, o.status, o.errorCode, 0, {},
+                                            batchCompletionBytes(static_cast<uint32_t>(nrec)));   // #324: the batch's completion
                 else voids += static_cast<uint64_t>(nrec);
             }
             // kMsgFlush: nothing to complete (a plain flush token carries no completion).

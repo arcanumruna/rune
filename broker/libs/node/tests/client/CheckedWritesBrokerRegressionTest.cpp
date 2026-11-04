@@ -638,6 +638,28 @@ TEST(CheckedWritesBrokerRegression, LeaderViewBehavesLikeAllViewShardRegression)
 TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShardRegression) {
     OneBroker b("cw-noview", OneBroker::Runtime::Shard);
     const AcctFixture f = defineAcct(b, /*withView=*/false);
+
+    // No view folds this partition, so a View send does not wait for one: it acks at commit even while an open
+    // transaction holds back the fold point a view would wait for.
+    Sender tx(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All, "tx-cw");
+    tx.prod->initTransactionsAndWait(30s);
+    tx.prod->beginTransaction();
+    ASSERT_TRUE(isOk(tx.await(tx.send(1), 10s))) << "premise: the open transaction's record is in the log";
+    Sender parked(b.clientConfig(), "acct", f.topicId, 1, kAllView);
+    EXPECT_TRUE(isOk(parked.await(parked.send(2), 10s))) << "the View send acks before the open transaction commits";
+    tx.prod->commitTransactionAndWait(30s);
+
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define RUNE_CW_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define RUNE_CW_SANITIZED 1
+#endif
+#ifndef RUNE_CW_SANITIZED
+    // The latency ratio is a wall-clock bound: under a sanitizer the time is the sanitizer's (TSan box, -j8: All|View
+    // p50 2.07 x All p50), so only the deterministic open-transaction check above runs there.
     const auto p50 = [&](rc::Acks acks, uint64_t firstId) {
         Sender s(b.clientConfig(), "acct", f.topicId, 1, acks);
         std::vector<std::chrono::nanoseconds> lat;
@@ -653,6 +675,7 @@ TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShar
     const auto view  = p50(kAllView, 2000);
     EXPECT_LE(view, 2 * plain) << "no view folds this partition, so View adds no wait (All p50 " << plain.count() / 1000 << " us, All|View p50 "
                                << view.count() / 1000 << " us)";
+#endif
 }
 
 TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesTheViewBitRegression) {
@@ -840,6 +863,162 @@ TEST(CheckedWritesBrokerRegression, VerdictAcksCarryThePerRecordResultShardRegre
         r = s.prod->trySend(*s.topic, rc::Key(uint64_t{100}), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v9.data()), v9.size()), *s.cq, tok);
     s.prod->flush();
     EXPECT_TRUE(isOk(s.await(tok, 15s))) << "the next batch is acked normally";
+}
+
+// #802: a claimBatch reports EVERY record's verdict (RecordsRejected + the rejection list), and the Raw subscriber receives
+// exactly the accepted records.  (The Tier-2 leg of this test is added with the Tier-2 change.)
+TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRegression) {
+    OneBroker b("cw-batchverdict", OneBroker::Runtime::Shard);
+    const int32_t src = defineVerdictSource(b);
+    Sender s(b.clientConfig(), "vt", src, 1, kAllView);
+    const std::vector<uint16_t> tags = {1, 9, 1, 1, 9, 9};   // records 1, 4 and 5 are rejected (TagEquals 9)
+    std::vector<std::string> vals;
+    for (std::size_t i = 0; i < tags.size(); ++i) vals.push_back(verdictValue(1, 1, tags[i]));   // the claim has one key: id 1 throughout
+    const uint32_t recLen = static_cast<uint32_t>(vals[0].size());
+
+    std::mutex mu;
+    std::set<int64_t> got;
+    rc::SubscribeOptions o;
+    o.from = rc::From::earliest();
+    rc::Subscription sub = s.client->subscribe(*s.topic, 0, o, [&](const rc::Record& r) {
+        std::lock_guard<std::mutex> g(mu);
+        got.insert(r.offset);
+    });
+
+    // ---- the claim ----
+    const uint64_t tok = s.next++;
+    rc::BatchClaim claim;
+    for (int i = 0; i < 100000; ++i) {
+        claim = s.prod->claimBatch(*s.topic, rc::Key(uint64_t{1}), static_cast<uint32_t>(tags.size()), recLen, *s.cq, tok);
+        if (claim.result() != rc::SendResult::BackPressured) break;
+    }
+    ASSERT_EQ(claim.result(), rc::SendResult::Ok);
+    for (uint32_t i = 0; i < tags.size(); ++i) {
+        const auto dst = claim.record(i);
+        ASSERT_EQ(dst.size(), recLen);
+        std::memcpy(dst.data(), vals[i].data(), recLen);
+    }
+    ASSERT_TRUE(claim.commit());
+    s.prod->flush();
+    std::optional<rc::Completion> c;
+    std::vector<uint8_t> payload;
+    (void)s.cq->waitFor(tok, 15s, [&](const rc::Completion& d, std::span<const uint8_t> p) { c = d; payload.assign(p.begin(), p.end()); });
+    ASSERT_TRUE(c);
+    ASSERT_EQ(c->status, rc::OpStatus::RecordsRejected);
+    EXPECT_EQ(c->errorCode, static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation));
+    EXPECT_EQ(rc::constraintIdOf(*c), rune::view::constraintIdOf(7, 1));
+    const rc::BatchVerdicts v(*c, payload);
+    ASSERT_EQ(v.rejectedCount(), 3u);
+    EXPECT_EQ(v.rejection(0).index, 1);
+    EXPECT_EQ(v.rejection(1).index, 4);
+    EXPECT_EQ(v.rejection(2).index, 5);
+    const int64_t base = c->value;
+    ASSERT_GE(base, 0);
+    EXPECT_EQ(v.offsetOf(0), base);
+    EXPECT_EQ(v.offsetOf(1), -1);
+    EXPECT_EQ(v.offsetOf(3), base + 3);
+
+    // ---- the Tier-2 batch: the same tags, one completion, the same per-record verdicts ----
+    const uint64_t tok2 = s.next++;
+    rc::BatchBuilder bb = s.prod->batch(*s.topic, rc::Key(uint64_t{1}));
+    const std::string recKey = std::string("\x01\0\0\0\0\0\0\0", 8);   // the typed record key: id 1, 8 bytes LE
+    for (const auto& val : vals) bb.add(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()), recKey);
+    rc::OpResult sr = rc::OpResult::BackPressured;
+    for (int i = 0; i < 100000 && sr == rc::OpResult::BackPressured; ++i) sr = bb.send(*s.cq, tok2);
+    ASSERT_EQ(sr, rc::OpResult::Accepted);
+    s.prod->flush();
+    std::optional<rc::Completion> c2;
+    std::vector<uint8_t> payload2;
+    (void)s.cq->waitFor(tok2, 15s, [&](const rc::Completion& d, std::span<const uint8_t> p) { c2 = d; payload2.assign(p.begin(), p.end()); });
+    ASSERT_TRUE(c2);
+    ASSERT_EQ(c2->op, rc::OpKind::Tier2Batch);
+    ASSERT_EQ(c2->status, rc::OpStatus::RecordsRejected) << "err=" << c2->errorCode;
+    EXPECT_EQ(rc::constraintIdOf(*c2), rune::view::constraintIdOf(7, 1));
+    const rc::BatchVerdicts v2(*c2, payload2);
+    ASSERT_EQ(v2.rejectedCount(), 3u);
+    EXPECT_EQ(v2.rejection(0).index, 1);
+    EXPECT_EQ(v2.rejection(1).index, 4);
+    EXPECT_EQ(v2.rejection(2).index, 5);
+    const int64_t base2 = c2->value;
+    ASSERT_GE(base2, 0);
+    EXPECT_EQ(v2.offsetOf(0), base2);
+    EXPECT_EQ(v2.offsetOf(4), -1);
+
+    // ---- the Raw subscriber gets exactly the accepted records: a capped poll ending on a sentinel accepted send ----
+    const std::string sentinelVal = verdictValue(100, 1, 1);
+    const uint64_t stok = s.sendValue(100, sentinelVal);
+    const auto sc = s.await(stok, 15s);
+    ASSERT_TRUE(isOk(sc));
+    const int64_t sentinelOff = sc->value;
+    bool seen = false;
+    for (int i = 0; i < 1200 && !seen; ++i) {
+        {
+            std::lock_guard<std::mutex> g(mu);
+            seen = got.count(sentinelOff) != 0;
+        }
+        if (!seen) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(seen) << "the sentinel never reached the subscriber";
+    sub.unsubscribe();
+    std::lock_guard<std::mutex> g(mu);
+    EXPECT_EQ(got, (std::set<int64_t>{base + 0, base + 2, base + 3, base2 + 0, base2 + 2, base2 + 3, sentinelOff}));
+}
+
+// A batch whose every record is rejected is skipped by the group fetch path too: the group consumer sees exactly the accepted
+// batches around it, and its position moves past the rejected one.
+TEST(CheckedWritesBrokerRegression, FullyRejectedBatchIsSkippedOnTheGroupPathShardRegression) {
+    OneBroker b("cw-groupskip", OneBroker::Runtime::Shard);
+    const int32_t src = defineVerdictSource(b);
+    Sender s(b.clientConfig(), "vt", src, 1, kAllView);
+    const std::string recKey = std::string("\x01\0\0\0\0\0\0\0", 8);   // the typed record key: id 1
+    const auto sendBatch = [&](uint16_t tag, int n) -> std::pair<rc::Completion, std::vector<uint8_t>> {
+        const uint64_t tok = s.next++;
+        rc::BatchBuilder bb = s.prod->batch(*s.topic, rc::Key(uint64_t{1}));
+        for (int i = 0; i < n; ++i) {
+            const std::string v = verdictValue(1, i, tag);
+            bb.add(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()), recKey);
+        }
+        rc::OpResult sr = rc::OpResult::BackPressured;
+        for (int i = 0; i < 100000 && sr == rc::OpResult::BackPressured; ++i) sr = bb.send(*s.cq, tok);
+        EXPECT_EQ(sr, rc::OpResult::Accepted);
+        s.prod->flush();
+        std::optional<rc::Completion> c;
+        std::vector<uint8_t> payload;
+        (void)s.cq->waitFor(tok, 15s, [&](const rc::Completion& d, std::span<const uint8_t> p) { c = d; payload.assign(p.begin(), p.end()); });
+        EXPECT_TRUE(c.has_value());
+        return {c.value_or(rc::Completion{}), payload};
+    };
+    const auto [ca, pa] = sendBatch(1, 3);   // A: accepted
+    const auto [cb, pb] = sendBatch(9, 3);   // B: every record rejected
+    const auto [cc, pc] = sendBatch(1, 3);   // C: accepted
+    ASSERT_EQ(ca.status, rc::OpStatus::Ok);
+    ASSERT_EQ(cb.status, rc::OpStatus::RecordsRejected);
+    ASSERT_EQ(rc::BatchVerdicts(cb, pb).rejectedCount(), 3u) << "B is fully rejected";
+    ASSERT_EQ(cc.status, rc::OpStatus::Ok);
+    std::set<int64_t> want;
+    for (int i = 0; i < 3; ++i) { want.insert(ca.value + i); want.insert(cc.value + i); }
+
+    std::mutex mu;
+    std::set<int64_t> got;
+    rc::GroupConfig gcfg;
+    gcfg.autoCommit = false;
+    rc::GroupConsumer group = s.client->subscribeGroup("cw-g", {"vt"}, gcfg);
+    group.onRecords([&](const rc::RecordSet& rs) {
+        std::lock_guard<std::mutex> g(mu);
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { got.insert(off); });
+    });
+    const int64_t lastC = cc.value + 2;
+    bool arrived = false;
+    for (int i = 0; i < 1200 && !arrived; ++i) {   // 50 ms each: a 60 s deadline
+        {
+            std::lock_guard<std::mutex> g(mu);
+            arrived = got.count(lastC) != 0;
+        }
+        if (!arrived) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(arrived) << "the group never delivered the last accepted record";
+    std::lock_guard<std::mutex> g(mu);
+    EXPECT_EQ(got, want) << "the group sees A and C, and not one record of the fully rejected B";
 }
 
 // ===========================================================================================================

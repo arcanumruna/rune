@@ -57,6 +57,8 @@ if(aeron_FOUND)
     # ...and the worker io backends that header-inline worker code submits to
     # (UringFlushBackend on Linux) — a leaf library, no cycle (libs/node).
     target_link_libraries(rune_replication PUBLIC rune_io_backend)
+    # ...and the checked-write hook and verdict state the header-inline produce path calls (libs/node).
+    target_link_libraries(rune_replication PUBLIC rune_checked_write)
 endif()
 
 option(BUILD_REPLICATION_INTEGRATION_TESTING

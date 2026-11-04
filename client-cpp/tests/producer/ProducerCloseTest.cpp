@@ -631,7 +631,7 @@ struct ReentryRig {
         if (closeOnFirstBatch && batches.size() == 1) closeNow();
     }
     static void onBatch(void* c, const rc::BatchAck& a) noexcept { static_cast<ReentryRig*>(c)->batch(a); }
-    static void cqDeliver(void* c, rc::CqRef, const rc::Completion& done) noexcept {
+    static void cqDeliver(void* c, rc::CqRef, const rc::Completion& done, std::span<const uint8_t>) noexcept {
         auto* self = static_cast<ReentryRig*>(c);
         (void)self->bq.ring().deliver(done, {});
         self->batch(rc::batchAckOf(done));

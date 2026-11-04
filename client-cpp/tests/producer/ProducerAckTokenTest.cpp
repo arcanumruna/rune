@@ -128,7 +128,7 @@ struct BareCq {
         return c;
     }()};
     uint64_t delivered = 0;
-    static void deliver(void* ctx, rc::CqRef, const rc::Completion& c) noexcept {
+    static void deliver(void* ctx, rc::CqRef, const rc::Completion& c, std::span<const uint8_t>) noexcept {
         auto* self = static_cast<BareCq*>(ctx);
         (void)self->q.ring().deliver(c, {});
         ++self->delivered;

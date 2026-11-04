@@ -74,6 +74,8 @@ services:
       RUNE_ELECTION_STATUS_INTERVAL_MS: "50"
       RUNE_STARTUP_CANVASS_TIMEOUT_MS: "200"
       RUNE_LOG_LEVEL: "info"
+      # View checkpoint backups (default on); view-engine-e2e.sh Step 10 sets 0.
+      RUNE_VIEW_BACKUP: "${RUNE_VIEW_BACKUP:-1}"
       # Explicit off; "0" (= unset) is also the default — RUNE_FS_LOG is opt-in.
       RUNE_FS_LOG: "0"
       # Container /dev/shm budget (2026-10-02 defaults): the broker DEFAULT term is
