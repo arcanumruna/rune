@@ -621,7 +621,11 @@ void txnOpen(const TCell& p) {
         EXPECT_EQ(txn.endTxnWireOffersForTest(), 1u) << "EndTxn was not offered on the wire exactly once";
     } else {
         // RejectAll (corr-0 51) / Delete (corr-0 46) ended the session: the client failed for good before the commit.
-        EXPECT_EQ(err, "commitTransaction(): client closed");
+        // Which definite outcome the commit sees depends on whether the client has finished closing: "client closed", or
+        // the terminal FatalError the corr-0 answer left behind (both fail at once, neither sends EndTxn).
+        const std::string fatal = std::string("commitTransaction(): broker error code ") + (p.variant == 1 ? "51" : "46") +
+                                  " (transactional producer in FatalError (terminal))";
+        EXPECT_TRUE(err == "commitTransaction(): client closed" || err == fatal) << err;
         EXPECT_EQ(txn.endTxnAttemptsForTest(), 0u) << "the session ended first: the commit must not send EndTxn at all";
     }
     sub.unsubscribe();
@@ -694,21 +698,45 @@ TEST(NamespaceDeletingProduceRegression, ClusterAdminProduceToDeletingNamespaceI
     for (const int32_t id : ids) EXPECT_EQ(rig.auth().produce(rig.rootSid(), id), kUnknownTopic) << "erased: topic " << id;
 }
 
-// #709 (in-process twin of namespace-e2e.sh step 15): a namespace holding a VIEW, a consumer group's committed offset and
-// a transactional id is deleted: the reaper drops the view (its own DropView event), the keyed stores hold nothing of the
-// old id, no ns-<id> directory is left, and the old view id answers UnknownTopic; the re-created namespace is empty.
-// Mutation: skip the reaper's DroppingViews step (NamespaceReaper.cpp) -> the view is never dropped (DropView count 0).
+// #709 (in-process twin of namespace-e2e.sh step 15): a namespace holding a VIEW WITH A ROW, a consumer group's committed
+// offset and an OPEN transaction (InitProducerId + AddPartitionsToTxn + a transactional produce, no EndTxn) is deleted.
+// After the delete: the reaper dropped the view (one DropView event) and the view row is gone (the same getViewRow that
+// answered OK before answers 4), the keyed stores (TransactionCoordinationService / GroupCoordinationService
+// liveKeysOfNamespaceForTest, through BrokerNode::nsKeyedStoresCleanForTest) hold nothing of the old id, no ns-<id>
+// directory is left, and in the re-created same-name namespace the same transactional id starts FRESH: the first
+// InitProducerId answers epoch 0 with no open transaction (the old one was bumped to epoch >= 1 and open).
+// Mutations: skip the reaper's DroppingViews step -> red (DropView 0 / the delete never completes); skip its
+// TxnsAborted step (NamespaceReaper.cpp) -> red (the open transaction is never aborted, the delete never completes).
 TEST(NamespaceLifecycleMatrixDeleteRegression, DeleteWithViewsGroupsTxnsLeavesNothingRegression) {
+    using namespace rune::node::test::grants;
+    constexpr int kViewRowGone = 4;
     LcRig rig("nsdelvgt");
     const std::string nm = "d";
     const int64_t userSid = rig.seedDeleteWorkload(nm);
     const uint32_t id = rig.observe(nm).nsId;
     ASSERT_NE(id, 0u);
-    const int32_t src = rig.topicIds(nm).front();
-    const int32_t view = rig.auth().createView(rig.rootSid(), nm + "/v", src);
-    ASSERT_GE(view, 0) << "the view is created in the namespace";
     const auto oldTopics = rig.topicIds(nm);
     ASSERT_EQ(oldTopics.size(), 2u);
+    const int32_t src = oldTopics.front();
+    const int32_t view = rig.auth().createView(rig.rootSid(), nm + "/v", src);
+    ASSERT_GE(view, 0) << "the view is created in the namespace";
+    // The view holds a row BEFORE the delete: OK, not the not-found code.
+    ASSERT_EQ(rig.auth().produce(rig.rootSid(), src, /*untilOk=*/true), 0);
+    ASSERT_TRUE(rig.until([&] { return rig.auth().getViewRow(rig.rootSid(), view) == 0; }, 500))
+        << "premise: the view never held a row (getViewRow " << rig.auth().getViewRow(rig.rootSid(), view) << ")";
+    // An OPEN transaction: a fresh epoch, a partition added, a transactional record produced, no EndTxn.
+    const auto ids = rig.auth().initProducer(userSid, "x");
+    ASSERT_EQ(ids.code, 0);
+    ASSERT_GE(ids.epoch, 1) << "the seed's InitProducerId made epoch 0, this one bumped it";
+    ASSERT_EQ(rig.auth().addPartitions(userSid, "x", src, ids.pid, ids.epoch), 0);
+    // ConcurrentTransactions (27) = the AddPartitions registration is not durable yet: retriable, bounded.
+    int produced = -1;
+    ASSERT_TRUE(rig.until([&] {
+        produced = rig.auth().produceAs(userSid, src, ids.pid, ids.epoch, 0, /*transactional=*/true).code;
+        return produced != static_cast<int>(pc::ErrorCode::ConcurrentTransactions);
+    }, 500));
+    ASSERT_EQ(produced, 0) << "premise: the transactional produce is acked, the transaction stays open";
+    EXPECT_FALSE(rig.auth().keyedStoresCleanBounded(id)) << "premise: the coordinators hold keys of the namespace";
     ASSERT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Delete, nm).code, 0);
     EXPECT_TRUE(rig.waitSessionGone(userSid));
     rig.releaseReaper();   // the rig holds the reaper from the start
@@ -719,11 +747,20 @@ TEST(NamespaceLifecycleMatrixDeleteRegression, DeleteWithViewsGroupsTxnsLeavesNo
                !std::filesystem::exists(std::filesystem::path(nsRoot(rig.dataDir(), id).string() + ".deleting"));
     })) << "ns-<id> directory";
     EXPECT_TRUE(rig.auth().keyedStoresCleanBounded(id)) << "a live consumer-offset or transaction-state key of the deleted namespace";
+    EXPECT_EQ(rig.auth().getViewRow(rig.rootSid(), view), kViewRowGone) << "the old view's row is gone";
     ASSERT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Create, nm).code, 0);
     EXPECT_NE(rig.observe(nm).nsId, id);
     const auto md = rig.rootMetadata();
     for (const int32_t t : oldTopics) EXPECT_FALSE(std::binary_search(md.begin(), md.end(), t)) << "old topic " << t << " listed";
     EXPECT_FALSE(std::binary_search(md.begin(), md.end(), view)) << "the old view " << view << " is listed";
+    // The same transactional id in the re-created namespace: the coordinator holds nothing for it, so it starts fresh.
+    rig.broker().createUser(nm + "/u", AuthRig::kPw,
+                            {prefix(SO::Write, ST::TransactionalId, ""), prefix(SO::Describe, ST::TransactionalId, "")});
+    const int64_t sid2 = rig.auth().login(nm + "/u", AuthRig::kPw, pc::kClientVersionNamespaces);
+    ASSERT_GT(sid2, 0);
+    const auto fresh = rig.auth().initProducer(sid2, "x");
+    EXPECT_EQ(fresh.code, 0);
+    EXPECT_EQ(fresh.epoch, 0) << "a transactional id of the deleted namespace survived in the coordinator (epoch " << fresh.epoch << ")";
 }
 
 // #721: DELETING gated produce at the worker, but a read of the namespace by id was still served to a root session
