@@ -9,7 +9,8 @@
 //   kVerdictMarker       [fromOffset i64][finalThrough i64][constraintSetId u32][count u32]
 //                        count x [offsetDelta u32][code u16][constraintId u32]
 //   kConstraintSetChange [constraintSetId u32][count u16] count x [viewObjectId u64][kind u8][planFingerprint u64]
-//   kReservation (06) and kTxnJudge (11) are recognised and skipped by every reader; their payloads are those parts'.
+//   kReservation         [reservedThroughN u64]
+//   kTxnJudge (11) is recognised and skipped by every reader; its payload is that part's.
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
 
@@ -37,6 +38,7 @@ inline constexpr std::size_t kMarkerFixedBytes = 1 + 8 + 8 + 4 + 4;
 inline constexpr std::size_t kMarkerEntryBytes = 4 + 2 + 4;
 inline constexpr std::size_t kChangeFixedBytes = 1 + 4 + 2;
 inline constexpr std::size_t kChangeMemberBytes = 8 + 1 + 8;
+inline constexpr std::size_t kReservationBytes  = 1 + 8;
 
 namespace detail {
 
@@ -137,6 +139,19 @@ inline std::optional<std::span<const uint8_t>> valueOf(const uint8_t* batch, std
 }
 [[nodiscard]] inline std::size_t changeBatchBytes(uint16_t count) noexcept {
     return detail::batchBytes(kChangeFixedBytes + count * kChangeMemberBytes);
+}
+
+[[nodiscard]] inline std::size_t reservationBatchBytes() noexcept { return detail::batchBytes(kReservationBytes); }
+
+/// 0 = `out` too small.
+inline std::size_t buildReservation(std::span<uint8_t> out, uint64_t reservedThroughN) noexcept {
+    const std::size_t total = reservationBatchBytes();
+    if (out.size() < total) return 0;
+    std::size_t p = detail::beginBatch(out.data(), kReservation, kReservationBytes);
+    out[p++] = kPayloadVersion;
+    detail::put<uint64_t>(out.data() + p, reservedThroughN); p += 8;
+    detail::sealBatch(out.data(), p);
+    return total;
 }
 
 /// 0 = `out` too small, or `entries.size() != h.count`, or more than kMaxMarkerEntries.
@@ -265,6 +280,12 @@ bool forEachMarkerEntry(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept
                                                    std::span<ChangeMember> out, uint16_t& count) noexcept {
     const auto c = parseControl(batch, len);
     return c && parseConstraintSetChange(*c, setId, out, count);
+}
+
+[[nodiscard]] inline std::optional<uint64_t> parseReservation(const uint8_t* batch, std::size_t len) noexcept {
+    const auto c = parseControl(batch, len);
+    if (!c || c->type != kReservation || c->value.size() != kReservationBytes) return std::nullopt;
+    return detail::get<uint64_t>(c->value.data() + 1);
 }
 
 }  // namespace rune::storage::control_record

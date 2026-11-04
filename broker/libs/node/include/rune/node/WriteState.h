@@ -13,6 +13,7 @@
 #include <rune/codec/Validator.h>
 #include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/node/AutoInc.h>
 #include <rune/node/VerdictState.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/RejectedOffsetIndex.h>
@@ -210,6 +211,9 @@ struct PartitionWriteState {
     uint64_t                           seenLogGeneration = UINT64_MAX;   ///< the replica's log generation the timeline and ledger are in step with
     int64_t                            scanHw = 0;           ///< the replica HW at the start of this pass: the scan feed commits ledger slots below it
     bool                               growOwed = false;     ///< the judge saw the rejected index cross 75 %: the worker's cold maintenance grows it
+    AutoIncState                       autoInc;              ///< the partition's id counter (an autoincrement topic only)
+    AssignedBaseWindow                 assignedBases;        ///< the last assigned bases per producer, for retried key-0 batches
+    AutoIncStats                       autoIncStats;
 
     /// A judge is attached or the latest logged set is non-empty.
     [[nodiscard]] bool isVerdictSource() const noexcept;
