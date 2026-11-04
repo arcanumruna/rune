@@ -987,6 +987,8 @@ public:
         PushState pushState = PushState::Live;
         /// ErrorOwed/Failed: the undeliverable Records frame size (named in the error).
         std::size_t failedFrameLen = 0;
+        /// ErrorOwed/Failed: why (#839) - the owed error's text and code (EgressFrame/ReturnRing: MessageTooLarge; CorruptBatch: StorageError).
+        PushTooLargeCause failedCause = PushTooLargeCause::EgressFrame;
         /// F15 S4: the partition's RC state (this worker's), re-resolved on every
         /// ownership apply and Subscribe — null when not owned / internal.
         RcState* rc = nullptr;
@@ -3702,11 +3704,15 @@ private:
         /// Whole batches from the batch holding `from`: at least that one, even when it is larger than `cap`.
         [[nodiscard]] std::span<const uint8_t> read(int64_t from, std::size_t cap) noexcept {
             const std::size_t c = std::min<std::size_t>(static_cast<std::size_t>(kPushMaxChunkBytes), cap);
+            rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
             const rune::storage::LogReadView v = s_.logPtr != nullptr
-                ? w_.readNoFault_(s_.logPtr, from, c, bound_)
+                ? w_.readNoFault_(s_.logPtr, from, c, bound_, st)
                 : mem_->readView(from, static_cast<int32_t>(c));   // zero-copy ring view
+            if (v.len == 0 && rune::storage::unservable(st)) [[unlikely]] corruptAt_ = from;   // #839
             return {v.data, v.len};
         }
+        /// #839: the offset a disk read reached damage at (-1 = none this pass).
+        [[nodiscard]] int64_t corruptAt() const noexcept { return corruptAt_; }
         [[nodiscard]] bool readCommitted() const noexcept { return rc_ != nullptr; }
         [[nodiscard]] bool isAborted(int64_t pid, int64_t base) const noexcept { return rc_->isAborted(pid, base); }
         /// Transient: the ring start when `from` was evicted.  Disk: the log start when retention deleted `from`.
@@ -3723,6 +3729,7 @@ private:
         const RcState* rc_ = nullptr;
         const PartitionWriteState* ws_ = nullptr;
         int64_t bound_ = 0;
+        int64_t corruptAt_ = -1;
     };
 
     class FilterSinkImpl {
@@ -3779,6 +3786,7 @@ private:
             s.pushState      = WorkerSubscription::PushState::ErrorOwed;
             pushListDirty_   = true;   // the unfiltered pass must now visit it (the owed error)
             s.failedFrameLen = rec.encodedSize();
+            s.failedCause    = PushTooLargeCause::EgressFrame;
             (void)sendPushTooLarge_(s, pub, sealPtr, baseOffset);
             return filter::SendOutcome::TooLarge;
         }
@@ -3810,6 +3818,25 @@ private:
         return work;
     }
 
+    /// #839 (cold): the group's source read reached damage at `at`.  Every Live filtered member of group `gi` positioned
+    /// there fails with StorageError (parked, one owed error each); like filterSend_'s TooLarge it never calls
+    /// leaveFilter_: the member stops being deliverable and its owed error is retried by the unfiltered pass.  A member
+    /// at another damaged offset fails on its own next read.
+    [[gnu::cold]] [[gnu::noinline]] int failFilteredCorrupt_(std::size_t gi, int64_t at) {
+        int work = 0;
+        for (WorkerSubscription& s : subs_) {
+            if (!s.active || s.pushState != WorkerSubscription::PushState::Live) continue;
+            const SubFiltered* f = std::get_if<SubFiltered>(&s.filter);
+            if (f == nullptr || f->group != gi || positionOf_(s) != at) continue;
+            aeron::ExclusivePublication* pub = egressPubOf_(s);
+            if (pub == nullptr) continue;
+            RecordsSealCtx seal;
+            const RecordsSealCtx* sealPtr = sealCtxFor_(s.sessionId, seal);
+            work += failCorrupt_(s, pub, sealPtr, at);
+        }
+        return work;
+    }
+
     /// One pass over every live filtered group (fair: the walk starts where the budget ran out last time).
     int pushFilteredGroups_(int64_t nowNs, bool freshBudget) {
         const std::size_t n = filterGroups_.size();
@@ -3828,6 +3855,7 @@ private:
             // Only the group that finds the budget still untouched may take the first-batch allowance.
             work += g.pass(src, snk, *filterGroupSchemas_[gi], filterScratch_, nowNs, pushBudgetLeft_,
                            freshBudget && pushBudgetLeft_ == entry);
+            if (src.corruptAt() >= 0) [[unlikely]] work += failFilteredCorrupt_(gi, src.corruptAt());
         }
         return work;
     }
@@ -3909,7 +3937,7 @@ private:
         static_assert(kPushTooLargeErrorMaxBytes <= kEgressScratchSize);
         const std::size_t n = encodePushTooLargeError(
             egressScratch_.data(), s.sessionId, s.subscriptionId, s.topicId, s.partition,
-            atOffset, s.failedFrameLen, pub->maxMessageLength());
+            atOffset, s.failedFrameLen, pub->maxMessageLength(), s.failedCause);
         if (seal) [[unlikely]] {
             const std::size_t sn = sealRecordsFrame(*seal, egressScratch_.data(), n,
                                                     pushTooLargeSealScratch_.data(), pushTooLargeSealScratch_.size());
@@ -3921,6 +3949,21 @@ private:
         if (sendEncodedToPub_(pub, egressScratch_.data(), n) <= 0) return 0;
         s.pushState = WorkerSubscription::PushState::Failed;
         return 1;
+    }
+
+    /// #839 (cold): the stored batch at `atOffset` is damaged.  The subscription is parked AT it (cursor never advances
+    /// past the damage) and ONE ErrorResponse{StorageError, correlationId 0} is owed - sent now, else retried every pass
+    /// by the owed-error block until it is.
+    [[gnu::cold]] [[gnu::noinline]] int failCorrupt_(WorkerSubscription& s, aeron::ExclusivePublication* pub,
+                                                      const RecordsSealCtx* seal, int64_t atOffset) {
+        spdlog::error("Worker {}: push sub={} (topicId={} partition={}) failed at offset={}: the stored batch is corrupt "
+                      "(damaged log segment) - StorageError, subscription parked (cursor not advanced)",
+                      workerId_, s.subscriptionId, s.topicId, s.partition, atOffset);
+        s.pushState      = WorkerSubscription::PushState::ErrorOwed;
+        s.failedCause    = PushTooLargeCause::CorruptBatch;
+        s.failedFrameLen = 0;
+        pushListDirty_   = true;
+        return sendPushTooLarge_(s, pub, seal, atOffset);
     }
 
     /// The unfiltered push pass.  With no filtered group it walks every subscription (the pre-2c loop); with one it walks
@@ -4059,10 +4102,14 @@ private:
             // a failed read is an empty view (retry next pass; an I/O error is
             // counted + logged, never retried through the mapping).
             const std::size_t readCap = std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_);
+            rune::storage::ReadIntoStatus readSt = rune::storage::ReadIntoStatus::Ok;
             const rune::storage::LogReadView view =
-                s.logPtr != nullptr ? readNoFault_(s.logPtr, s.nextOffset, readCap, bound)
+                s.logPtr != nullptr ? readNoFault_(s.logPtr, s.nextOffset, readCap, bound, readSt)
                                     : mem->readView(s.nextOffset, static_cast<int32_t>(readCap));   // E2: zero-copy ring view
-            if (view.empty()) continue;
+            if (view.empty()) {
+                if (rune::storage::unservable(readSt)) [[unlikely]] work += failCorrupt_(s, egressPub, sealPtr, s.nextOffset);
+                continue;
+            }
 
             std::size_t pos = 0;
             int pushed = 0;
@@ -4169,6 +4216,7 @@ private:
                                   rec.encodedSize(), egressPub->maxMessageLength());
                     s.pushState      = WorkerSubscription::PushState::ErrorOwed;
                     s.failedFrameLen = rec.encodedSize();
+                    s.failedCause    = PushTooLargeCause::EgressFrame;
                     work += sendPushTooLarge_(s, egressPub, sealPtr, s.nextOffset);
                     break;
                 }
@@ -4675,6 +4723,12 @@ private:
                 ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::MessageTooLarge);
                 notePushReadOversize_(topicId, partition, nextOffset);
                 break;
+            case PushChunk::Corrupt:
+                // #839: damaged bytes at the cursor - non-retriable, answered StorageError (the gateway fails the
+                // subscription once; the cursor never moves past the damage).
+                ret.newNextOffset = nextOffset;
+                ret.errorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError);
+                break;
             case PushChunk::Empty:
                 break;                          // nothing deliverable (cursor may have advanced)
             }
@@ -4697,7 +4751,7 @@ private:
     //              order now (FIFO non-empty / ring full): serve it next pass
     //              (the read is idempotent — nothing consumed);
     //   TooLarge — the first deliverable batch alone exceeds the ring's max message.
-    enum class PushChunk : uint8_t { Written, Empty, Deferred, TooLarge };
+    enum class PushChunk : uint8_t { Written, Empty, Deferred, TooLarge, Corrupt };   // Corrupt (#839): damaged bytes at the cursor
     PushChunk readPushChunk_(const PushReadArgs& a, WorkerReturn& ret, rune::storage::Log* log,
                              rune::storage::InMemoryLog* mem, int64_t bound, const RcState* rc) {
         using rune::protocol::RecordBatchReader;
@@ -4712,10 +4766,11 @@ private:
         // next cycle.
         // Phase 2b E2: a TRANSIENT partition reads a zero-copy view of its ring
         // (same thread, no syscall); the bound clamp below applies unchanged.
+        rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
         const rune::storage::LogReadView v =
-            log != nullptr ? readNoFault_(log, a.nextOffset, cap, bound)
+            log != nullptr ? readNoFault_(log, a.nextOffset, cap, bound, st)
                            : mem->readView(a.nextOffset, static_cast<int32_t>(cap));
-        if (v.empty()) return PushChunk::Empty;
+        if (v.empty()) return rune::storage::unservable(st) ? PushChunk::Corrupt : PushChunk::Empty;
         const bool preCarrier = a.isGroup && !a.carrier;
         std::size_t rd = 0, nRuns = 0, total = 0, rebuilt = 0;
         const PartitionWriteState* const ws = writeOf_(a.replica);
@@ -4902,16 +4957,34 @@ private:
     // The view is valid until the next push read on this thread.
     rune::storage::LogReadView readNoFault_(rune::storage::Log* log, int64_t offset, std::size_t maxBytes,
                                             int64_t bound) noexcept {
+        rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
+        return readNoFault_(log, offset, maxBytes, bound, st);
+    }
+    /// #839: `stOut` is the read's status (Ok on the map fallback).  An unservable one (Corrupt / Unreadable: a damaged
+    /// sealed segment or a torn length field) is counted and logged here; the caller fails its subscription with
+    /// StorageError instead of waiting for bytes that will never come.
+    rune::storage::LogReadView readNoFault_(rune::storage::Log* log, int64_t offset, std::size_t maxBytes,
+                                            int64_t bound, rune::storage::ReadIntoStatus& stOut) noexcept {
         rune::storage::ReadIntoStatus st;
         int err = 0;
         const rune::storage::LogReadView v = log->readInto(offset, static_cast<int32_t>(maxBytes), pushScratch_.data(),
                                                            pushScratch_.size(), st, bound, &err);
         if (st != rune::storage::ReadIntoStatus::FirstTooLarge) [[likely]] {
+            stOut = st;
             if (st == rune::storage::ReadIntoStatus::IoError) [[unlikely]] notePushReadError_(log, offset, err);
+            else if (rune::storage::unservable(st)) [[unlikely]] noteCorruptRead_(log, offset, st);
             return v;
         }
+        stOut = rune::storage::ReadIntoStatus::Ok;
         ++pushReadMapFallbacks_;
         return log->readView(offset, static_cast<int32_t>(maxBytes));
+    }
+    [[gnu::cold]] [[gnu::noinline]] void noteCorruptRead_(const rune::storage::Log* log, int64_t offset,
+                                                          rune::storage::ReadIntoStatus st) noexcept {
+        ++corruptReads_;
+        if ((corruptReads_ & (corruptReads_ - 1)) == 0)   // rate-limited: powers of two
+            spdlog::error("Worker {}: read of {} at offset {} reached a damaged segment (status {}) - not served "
+                          "(reads={})", workerId_, log->dir(), offset, static_cast<int>(st), corruptReads_);
     }
     [[gnu::cold]] void notePushReadError_(const rune::storage::Log* log, int64_t offset, int err) noexcept {
         ++pushReadErrors_;
@@ -6111,6 +6184,8 @@ public:
     /// #65: push reads that fell back to the segment read mmap (first batch > scratch).
     [[nodiscard]] uint64_t pushReadMapFallbacksForTest() const noexcept { return pushReadMapFallbacks_; }
     [[nodiscard]] uint64_t pushReadErrorsForTest() const noexcept { return pushReadErrors_; }
+    /// #839: reads that reached a damaged segment (Corrupt / Unreadable) and were not served.
+    [[nodiscard]] uint64_t corruptReadsForTest() const noexcept { return corruptReads_; }
     [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
     /// Phase 2b E2 (TRANSIENT partitions): produces/markers the ring refused;
     /// reads whose cursor was below the ring start, and the records they skipped.
@@ -6137,6 +6212,7 @@ private:
     uint64_t transientFreshCursorsRaised_ = 0;   ///< E2 M2: bind-time cursors below the ring start (not lag)
     uint64_t                              pushReadMapFallbacks_ = 0;
     uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
+    uint64_t                              corruptReads_ = 0;     ///< #839: reads that reached a damaged segment
     /// D26: replication read scratch — a fetch serve / owed re-serve / push of
     /// an owned replica preads into it (PartitionReplica::setReadScratch), never
     /// faulting through the segment read map.  maxFetchBytes (1 MiB) + the
