@@ -336,6 +336,10 @@ sub.unsubscribe();
   (`RejectedByBroker`, `TimedOut`, `SessionLost`, `NotAuthorized`, `SessionRevoked`, ...) with `brokerErrorCode()`.
 - A subscription follows a leader move on its own and resumes from its position. On a transient partition, `dataResets()`
   counts how many times the data was reset under it (records are never skipped silently).
+- A plain subscription to a partition another node leads follows that partition's leader on the leader's own session,
+  also while a consumer group is active on the same `Client` (the seed, the group coordinator's session, is never moved).
+  Only a redirect that would have to move the seed is refused while a group is active: `failReason()` is
+  `LeaderElsewhereWhileGroupActive` (use a separate `Client` for it).
 
 ## Subscription filters
 

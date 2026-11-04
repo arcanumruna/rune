@@ -2351,6 +2351,28 @@ TEST(SessionLivenessRegression, OwnStallPastTimeoutResumesEvenWithBufferedActivi
     EXPECT_NE(m.state(), sm::SessionState::Connected);
 }
 
+// #735: a duty-clock gap of EXACTLY responseTimeoutNs is the client's own stall (>=), booked as ownStall, not as
+// broker silence.  Gaps T-1 / T / T+1 after a tick at T0+1 (activity at T0).
+TEST(SessionMachineRegression, OwnStallAtExactlyTheTimeoutIsBookedAsOwnStallRegression) {
+    struct Row { int64_t gapDelta; sm::SessionState state; uint64_t own; uint64_t stale; };
+    const Row rows[] = {{-1, sm::SessionState::Connected, 0, 0},
+                        {0, sm::SessionState::Resuming, 1, 1},
+                        {+1, sm::SessionState::Resuming, 1, 1}};
+    for (const Row& row : rows) {
+        FakeIo io;
+        auto cfg = testConfig();
+        sm::SessionMachine m(io, cfg);
+        m.connect(T0);
+        m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), 2, 42LL, m.correlationId(), T0);
+        m.tick(T0 + 1);
+        ASSERT_EQ(m.state(), sm::SessionState::Connected);
+        m.tick(T0 + 1 + cfg.responseTimeoutNs + row.gapDelta);
+        EXPECT_EQ(m.state(), row.state) << "gap delta " << row.gapDelta;
+        EXPECT_EQ(m.ownStallLosses(), row.own) << "gap delta " << row.gapDelta;
+        EXPECT_EQ(m.staleSessionLosses(), row.stale) << "gap delta " << row.gapDelta;
+    }
+}
+
 // ...while a session ticked regularly and kept busy by acks never goes stale.
 TEST(SessionLivenessRegression, RegularTicksWithActivityStayConnected) {
     FakeIo io;

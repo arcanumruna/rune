@@ -122,6 +122,27 @@ public:
         return a;
     }
 
+    /// #737/#738: the answer a coordinator gives a whole TxnOffsetCommit frame: EVERY entry named, each with `code`.
+    /// (`answer(TxnOffsetCommit, ...)` names only topic 1 / partition 0; the producer treats an entry an answer
+    /// does not name as failed.)  An undecodable frame falls back to `answer()`.
+    [[nodiscard]] static AnswerFrame answerCommitNaming(const uint8_t* req, std::size_t n, int64_t corrId,
+                                                        int16_t code) noexcept {
+        const auto q = rpc::TxnOffsetCommit::decode(req, n);
+        if (!q) return answer(ReqKind::TxnOffsetCommit, corrId, code);
+        AnswerFrame a;
+        rpc::TxnOffsetCommitResponse m;
+        m.correlationId = corrId;
+        std::array<rpc::TxnPartitionResult, 480> named{};
+        std::size_t k = 0;
+        for (const auto& e : q->entries) {
+            if (k == named.size()) break;
+            named[k++] = {e.topicId, e.partition, code};
+        }
+        a.len        = m.encode(a.buf.data(), std::span<const rpc::TxnPartitionResult>(named.data(), k));
+        a.templateId = rpc::TxnOffsetCommitResponse::TEMPLATE_ID;
+        return a;
+    }
+
     /// The same for a request this fake was offered (by its corrId); an unknown corrId falls back to `answer()`.
     [[nodiscard]] AnswerFrame answerAdd(int64_t corrId, int16_t errorCode) const noexcept {
         for (const auto& r : addRequests_) {

@@ -176,7 +176,7 @@ TEST(ProducerTier2Pool, SlotsReturnAfterAckAndAfterFailure) {
         impl.drainRing(kNow, 16);
         impl.flushBatches(kNow, /*sessionId=*/0, sink);
         EXPECT_EQ(impl.tier2FreeCount(), 2u);
-        impl.sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{kNow + 10'000'000'000LL}});
+        impl.sweepTimedOut(kNow + 10'000'000'000LL);
         EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
         EXPECT_EQ(L.status(2), OpStatus::DeliveryFailed);
         EXPECT_EQ(impl.tier2FreeCount(), 4u);

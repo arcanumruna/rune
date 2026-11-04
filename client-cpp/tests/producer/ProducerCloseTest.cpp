@@ -261,7 +261,7 @@ TEST(ProducerClose, BeginCloseDeadlineCompletesTimeoutRegression) {
     ASSERT_EQ(CL.got.size(), 1u);
     EXPECT_EQ(CL.got[0].status, OpStatus::Timeout);
     EXPECT_EQ(L.times(1), 0) << "the record is still pending: Timeout only stops the close";
-    impl.sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{kNow + 20'000'000'000LL}});
+    impl.sweepTimedOut(kNow + 20'000'000'000LL);
     EXPECT_EQ(L.times(1), 1);
     EXPECT_EQ(L.status(1), OpStatus::DeliveryFailed);
 }
@@ -774,8 +774,7 @@ TEST(ProducerClose, CloseImmediatelyDuringFailAllAndSweepCompletesEachRecordOnce
                 ASSERT_TRUE(R.send(1, 3));                   // Ring: token 3 in the ring
                 R.closeOnToken = 1;
                 const int16_t epoch0 = R.impl.producerEpoch();
-                R.impl.sweepTimedOut(std::chrono::steady_clock::time_point{
-                    std::chrono::nanoseconds{kNow + 10'000'000LL}});
+                R.impl.sweepTimedOut(kNow + 10'000'000LL);
                 EXPECT_EQ(R.closes, 1);
                 EXPECT_EQ(R.impl.producerEpoch(), epoch0 + 1) << "exactly one bump: the timed-out batch";
                 for (int i = 0; i < 5; ++i) (void)R.impl.drainRing(kNow, 256);

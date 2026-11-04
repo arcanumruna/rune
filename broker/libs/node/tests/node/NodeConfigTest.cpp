@@ -1169,6 +1169,37 @@ TEST(NodeConfigRegression, CleanerIoMaxBytesPerSecondParsesAndRefusesGarbageRegr
     }
 }
 
+// #658: RUNE_CLEANER_DEDUPE_BUFFER_BYTES is strict and bounded to [1 MiB, 4 GiB].
+// RED (no bound check): "1048575" and "4294967297" parse.
+TEST(NodeConfigRegression, CleanerDedupeBufferBytesParsesStrictRegression) {
+    {
+        auto r = rune::node::parseNodeConfig(fakeEnv(base1node()));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_EQ(r.config->cleanerDedupeBufferBytes, 134217728) << "absent = 128 MiB";
+    }
+    {
+        auto base = base1node();
+        base["RUNE_CLEANER_DEDUPE_BUFFER_BYTES"] = "";
+        auto r = rune::node::parseNodeConfig(fakeEnv(base));
+        ASSERT_TRUE(r.config.has_value()) << r.error;
+        EXPECT_EQ(r.config->cleanerDedupeBufferBytes, 134217728) << "empty = the default";
+    }
+    for (const auto& [text, want] : {std::pair{"1048576", int64_t{1048576}}, std::pair{"4294967296", int64_t{4294967296}}}) {
+        auto base = base1node();
+        base["RUNE_CLEANER_DEDUPE_BUFFER_BYTES"] = text;
+        auto r = rune::node::parseNodeConfig(fakeEnv(base));
+        ASSERT_TRUE(r.config.has_value()) << text << ": " << r.error;
+        EXPECT_EQ(r.config->cleanerDedupeBufferBytes, want) << text;
+    }
+    for (const char* v : {"1048575", "4294967297", "abc", "-1", "0", "1048576x"}) {
+        auto base = base1node();
+        base["RUNE_CLEANER_DEDUPE_BUFFER_BYTES"] = v;
+        auto r = rune::node::parseNodeConfig(fakeEnv(base));
+        EXPECT_FALSE(r.config.has_value()) << v;
+        EXPECT_NE(r.error.find("RUNE_CLEANER_DEDUPE_BUFFER_BYTES"), std::string::npos) << r.error;
+    }
+}
+
 TEST(NodeConfig, IdleSpinsYieldsParse) {
     auto base = base1node();
     base["RUNE_IDLE_SPINS"]  = "3";

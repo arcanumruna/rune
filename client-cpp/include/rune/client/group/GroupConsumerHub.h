@@ -30,6 +30,7 @@
 #include <rune/protocol/client/OffsetMessages.h>
 
 #include <chrono>
+#include <type_traits>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -46,7 +47,18 @@ using ImplList = std::vector<GroupConsumerImpl*>;  // F8c C7: not owning (see ow
 // ingressStreamId=0 means "use the default ingress stream".
 // Matches ClientAgent::SendFn so Task 1.3 can route group frames to the
 // coordinator session without an adapter at every call site.
-using SendFn = std::function<bool(int32_t, const uint8_t*, std::size_t)>;
+//
+// #718: a plain function pointer + context, never a std::function: a type-erased call can allocate and hides a virtual
+// hop on the group send path.  Trivially copyable; the owner of `ctx` outlives every call.
+struct SendFn {
+    bool (*fn)(void* ctx, int32_t streamId, const uint8_t* buf, std::size_t len) = nullptr;
+    void* ctx = nullptr;
+    bool operator()(int32_t streamId, const uint8_t* buf, std::size_t len) const {
+        return fn != nullptr && fn(ctx, streamId, buf, len);
+    }
+    explicit operator bool() const noexcept { return fn != nullptr; }
+};
+static_assert(std::is_trivially_copyable_v<SendFn>);
 
 class GroupConsumerHub {
 public:
@@ -124,7 +136,7 @@ public:
     /// C16 (#371, #357.2): the duty-pass step of every pending seek / seekToCommitted: moves it forward
     /// (AwaitFetch -> Resubscribe -> Ok), ends it (Rejoined / Timeout), and sends the OffsetFetch of a seekToCommitted
     /// at once - on the pass the event arrives, not on the 100 ms sweep.  O(consumers); returns immediately when no
-    /// rewind is pending.  Returns the rewinds visited.
+    /// rewind is pending (activeRewinds() == 0 returns at once, #718).  Returns the rewinds visited.
     int driveRewinds(int64_t nowNs, int64_t sessionId, const SendFn& sendFn);
 
     /// fix3 M4: LeaveGroup frames the transport refused (GroupConsumer close),
@@ -231,11 +243,15 @@ public:
     /// down — fails every pending commitSync with SessionLostError.
     void setSessionConnected(bool connected, int64_t sessionId = 0, int64_t episode = 0) noexcept;
     [[nodiscard]] bool sessionConnected() const noexcept { return sessionConnected_; }
-    /// #701: the duty clock the hub's timers (heartbeat, auto-commit, rejoin backoff, join deadline) are stamped on
-    /// - the Client's injected ClientConfig::nanoClock.  nullptr = the real steady clock (the same epoch as
-    /// Client::nowNs()).  Set before the first doWork.
-    void setClock(int64_t (*clock)() noexcept) noexcept { clock_ = clock; }
+    /// #743: the hub's timers (heartbeat, auto-commit, rejoin backoff, join deadline) run on the DUTY clock only, as
+    /// Aeron's cached clock does: every entry that takes `nowNs` stores it first, and `noteDutyNow` is the explicit
+    /// store for a pass that reaches the hub through a response handler.  There is no wall-clock fallback.
+    void noteDutyNow(int64_t nowNs) noexcept { dutyNowNs_ = nowNs; }
     [[nodiscard]] bool hasPendingCommitSync() const noexcept;
+    /// #718: consumers with a rewind outstanding (started or parked); changed only by setRewind_ / release.
+    [[nodiscard]] std::size_t activeRewinds() const noexcept { return activeRewinds_; }
+    /// #718 test seam: consumers driveRewinds walked past its early return (0 while no rewind is outstanding).
+    [[nodiscard]] std::size_t rewindImplsVisitedForTest() const noexcept { return rewindImplsVisited_; }
 
     /// fix1 I4: consumers whose generation snapshot a near-full status ring
     /// refused; the duty cycle calls republishDirty() while non-zero.
@@ -443,12 +459,12 @@ private:
     int32_t brokerVersion_ = rune::protocol::client::kBrokerVersion;
     int32_t connectedMaxBrokerVersion_ = 0;   // #440: router-less hubs only (see setConnectedMaxBrokerVersion)
     bool    anyJoinDeferred_ = false;         // #440: some consumer's join is deferred — re-checked every doWork
-    int64_t (*clock_)() noexcept = nullptr;   // #701: nullptr = steady_clock
-    [[nodiscard]] int64_t nowNs_() const noexcept {
-        return clock_ != nullptr ? clock_()
-                                 : std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now().time_since_epoch()).count();
-    }
+    int64_t dutyNowNs_ = 0;   // #743: the cached duty clock (see noteDutyNow)
+    std::size_t activeRewinds_        = 0;   // #718: impls whose `rewind` is not NoRewind
+    std::size_t rewindImplsVisited_   = 0;   // #718: test seam
+    /// The only writer of GroupConsumerImpl::rewind: keeps activeRewinds_ exact.
+    void setRewind_(GroupConsumerImpl& impl, GroupConsumerImpl::Rewind next) noexcept;
+    [[nodiscard]] int64_t nowNs_() const noexcept { return dutyNowNs_; }
     /// #440: the highest version a Connected session announces now (the coordinator's own included).
     [[nodiscard]] int32_t liveMaxBrokerVersion_() const noexcept;
     /// #440: every deferred join re-checked against the live sessions: Refuse ends it (BrokerTooOld).

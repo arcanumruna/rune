@@ -149,7 +149,13 @@ struct Sim {
     }
 
     /// Lossless quiescence: drain everything, tick past every retry, until both ends seal under the same epoch.
-    bool converge() {
+    bool converge() { return converge_(false); }
+    /// Issue #545 only: like converge(), but a responder-side unconfirmed Accept that its initiator ABANDONED (kAwaitNs
+    /// old, no longer re-sent, never the send epoch) is also a converged state.  Every other test uses converge().
+    bool convergeAllowingAbandonedAccept() { return converge_(true); }
+
+private:
+    bool converge_(bool allowAbandonedAccept) {
         for (int round = 0; round < 64 && failure.empty(); ++round) {
             seal(0); seal(1);
             while ((!hsTo[0].empty() || !hsTo[1].empty() || !data.empty()) && failure.empty()) {
@@ -159,7 +165,10 @@ struct Sim {
             now += pl::PeerHandshake::kRetryNs;
             tick();
             const auto* eb = std::get_if<pl::Established>(&b.hs.state());
-            if (data.empty() && hsTo[0].empty() && hsTo[1].empty() && eb && !eb->unconfirmedAccept &&
+            if (data.empty() && hsTo[0].empty() && hsTo[1].empty() && eb &&
+                (!eb->unconfirmedAccept ||
+                 (allowAbandonedAccept && now - eb->sinceNs >= pl::PeerHandshake::kAwaitNs &&
+                  eb->keys.epoch != b.crypto.currentEpoch(1))) &&
                 std::holds_alternative<pl::Established>(a.hs.state()) && a.crypto.currentEpoch(2) == b.crypto.currentEpoch(1))
                 return true;
         }
@@ -189,6 +198,105 @@ TEST(PeerLinkAdversarialRegression, NoDeliveredFrameIsDroppedAcrossLossyReordere
     }
     EXPECT_GT(rekeys, 1'000u) << "the model must actually re-handshake";
     EXPECT_GT(opened, 20'000u);
+}
+
+namespace {
+const pl::Established* estOf(const pl::PeerHandshake& h);
+/// Pops the next handshake frame queued to `to`, asserts its tag and returns it (empty when the queue is empty).
+Bytes popHs(Sim& s, int to, pl::PeerMsg want) {
+    if (s.hsTo[to].empty()) { ADD_FAILURE() << "no handshake frame queued to " << to; return {}; }
+    Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+    EXPECT_EQ(f[0], static_cast<uint8_t>(want)) << "to " << to;
+    return f;
+}
+} // namespace
+
+// ---- Issue #545: an unconfirmed Accept whose initiator abandoned the exchange stops being re-sent.  Every Accept is ----
+// lost; the initiator's ChallengeSent gives up after kAwaitNs and restores its prior epoch.  Over 11 s the responder
+// sends at most kAwaitNs / kRetryNs + 1 Accepts, and a later re-handshake still completes with one send epoch.
+// Mutation: dropping the `nowNs - e->sinceNs < kAwaitNs` bound from PeerHandshake::tick (fix 3) -> ~55 Accepts -> red.
+TEST(PeerLinkAdversarialRegression, AnAbandonedUnconfirmedAcceptStopsBeingResentRegression) {
+    Sim s(545);
+    s.link();
+    ASSERT_TRUE(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1));
+    const uint32_t e0 = s.a.crypto.currentEpoch(2);
+    s.now += 2'000 * kMs;
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::HelloV2));
+    s.deliverHs(0, popHs(s, 0, pl::PeerMsg::ChallengeV2));
+    s.deliverHs(1, popHs(s, 1, pl::PeerMsg::ProofV2));
+    ASSERT_TRUE(estOf(s.b.hs) && estOf(s.b.hs)->unconfirmedAccept);
+    int accepts = 0;
+    const int64_t end = s.now + 11'000 * kMs;
+    for (int i = 0; i < 1'000 && s.now < end; ++i) {
+        for (int to : {0, 1}) {
+            while (!s.hsTo[to].empty()) {
+                Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+                if (to == 0 && f[0] == static_cast<uint8_t>(pl::PeerMsg::Accept)) { ++accepts; continue; }   // lost
+                s.deliverHs(to, f);
+            }
+        }
+        s.now += 50 * kMs;
+        s.tick();
+    }
+    ASSERT_TRUE(s.failure.empty()) << s.failure;
+    ASSERT_TRUE(estOf(s.a.hs)) << "the initiator gave up and restored its prior epoch";
+    EXPECT_EQ(s.a.crypto.currentEpoch(2), e0);
+    EXPECT_LE(accepts, static_cast<int>(pl::PeerHandshake::kAwaitNs / pl::PeerHandshake::kRetryNs) + 1)
+        << "the abandoned Accept must not be re-sent forever";
+    EXPECT_GE(accepts, 1);
+    // A new exchange replaces the stale unconfirmed epoch and both ends converge on it.
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));
+    ASSERT_TRUE(s.convergeAllowingAbandonedAccept()) << s.describe();
+    const auto* eb = estOf(s.b.hs);
+    ASSERT_TRUE(eb);
+    EXPECT_FALSE(eb->unconfirmedAccept);
+    EXPECT_GT(s.b.crypto.currentEpoch(1), e0);
+    EXPECT_EQ(s.b.crypto.currentEpoch(1), s.a.crypto.currentEpoch(2));
+    EXPECT_EQ(eb->keys.epoch, s.b.crypto.currentEpoch(1));
+}
+
+// ---- Issue #774: the initiator rekeys three times and no Confirm / authenticated frame ever reaches the responder ----
+// (a->b Confirms and data are lost), so the responder keeps sealing under its old send epoch while the initiator holds
+// E+1..E+3.  The initiator must keep the epoch the responder last sealed under: every frame b seals opens at a.
+// Mutation: dropping the maxOpenOrder exclusion in PeerFrameCrypto::installLink evicts that epoch at the third rekey
+// and b's next frame is an UnknownEpoch drop -> red.
+TEST(PeerLinkAdversarialRegression, ThreeUnpromotedRekeysNeverDropThePeersFramesAdversarialRegression) {
+    Sim s(774);
+    s.link();
+    ASSERT_TRUE(s.a.crypto.hasLink(2) && s.b.crypto.hasLink(1));
+    const uint32_t e0 = s.b.crypto.currentEpoch(1);
+    uint64_t sent = 0;
+    auto bSealsAndAOpens = [&]() {
+        s.seal(1);
+        ++sent;
+        ASSERT_EQ(s.data.size(), 1u);
+        s.open(0);
+    };
+    bSealsAndAOpens();
+    ASSERT_TRUE(s.failure.empty()) << s.failure;
+    for (int rekey = 0; rekey < 3; ++rekey) {
+        s.now += pl::PeerHandshake::kAwaitNs;
+        s.absorb(0, s.a.hs.rekeyForTest(s.now));
+        for (int guard = 0; guard < 64 && (!s.hsTo[0].empty() || !s.hsTo[1].empty()); ++guard) {
+            for (int to : {0, 1}) {
+                if (s.hsTo[to].empty()) continue;
+                Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+                if (to == 1 && f[0] == static_cast<uint8_t>(pl::PeerMsg::Confirm)) continue;   // a->b is down
+                s.deliverHs(to, f);
+            }
+        }
+        ASSERT_TRUE(s.hsTo[0].empty() && s.hsTo[1].empty()) << "the exchange did not settle";
+        ASSERT_TRUE(s.failure.empty()) << s.failure;
+        bSealsAndAOpens();
+        ASSERT_TRUE(s.failure.empty()) << s.failure;
+    }
+    EXPECT_EQ(s.b.crypto.currentEpoch(1), e0) << "b never promoted: nothing reached it";
+    EXPECT_EQ(s.a.crypto.currentEpoch(2), e0 + 3);
+    bSealsAndAOpens();
+    EXPECT_TRUE(s.failure.empty()) << s.failure;
+    EXPECT_EQ(s.opened, sent);
+    EXPECT_EQ(s.a.crypto.dropsOf(OR::UnknownEpoch), 0u);
 }
 
 // ---- Input bounds: every new wire message truncated / extended at every length, and each tag under another body. ----
@@ -780,3 +888,67 @@ TEST(PeerLinkAdversarialRegression, ForgedHintsNeverRekeyALinkWhoseKeepalivesArr
                 static_cast<unsigned long long>(opened), static_cast<unsigned long long>(replays),
                 static_cast<unsigned long long>(rekeysLossy));
 }
+
+// ==== Adversarial review of PR #619 (issues #584 / #545): attacks on the bounded Accept re-send and the initiator's ====
+// any-state Confirm.
+
+// ---- Protocol state (replay): an Accept captured from an earlier, CONFIRMED exchange is replayed to an initiator ----
+// that is mid-rekey (HelloSent, then ChallengeSent).  The any-state answer (#584) may only repeat the Confirm of its
+// live epoch: no state change, no install, and the responder ignores that repeated Confirm.  An Accept of an epoch the
+// initiator no longer lives on gets nothing.  The exchange in flight then completes normally with no drop.
+TEST(PeerLinkAdversarialRegression, AnOldAcceptReplayedToARekeyingInitiatorOnlyRepeatsItsConfirmAdversarialRegression) {
+    Sim s(6191);
+    s.link();
+    std::vector<Bytes> accepts;
+    auto rehandshake = [&] {
+        s.now += 2'000 * kMs;
+        s.absorb(0, s.a.hs.rekeyForTest(s.now));
+        for (int guard = 0; guard < 16 && (!s.hsTo[0].empty() || !s.hsTo[1].empty()); ++guard)
+            for (int to : {0, 1}) {
+                if (s.hsTo[to].empty()) continue;
+                Bytes f = s.hsTo[to].front(); s.hsTo[to].pop_front();
+                if (f[0] == static_cast<uint8_t>(pl::PeerMsg::Accept)) accepts.push_back(f);
+                s.deliverHs(to, f);
+            }
+    };
+    rehandshake();   // E2, confirmed
+    rehandshake();   // E3, confirmed
+    ASSERT_TRUE(s.failure.empty()) << s.failure;
+    ASSERT_EQ(accepts.size(), 2u);
+    ASSERT_EQ(s.a.crypto.currentEpoch(2), 3u);
+    ASSERT_EQ(s.b.crypto.currentEpoch(1), 3u);
+    pl::PeerAccept old2, live3;
+    ASSERT_TRUE(pl::PeerAccept::decode(accepts[0].data(), accepts[0].size(), old2));
+    ASSERT_TRUE(pl::PeerAccept::decode(accepts[1].data(), accepts[1].size(), live3));
+
+    s.now += 2'000 * kMs;
+    s.absorb(0, s.a.hs.rekeyForTest(s.now));   // HelloSent, prior = E3
+    ASSERT_TRUE(std::holds_alternative<pl::HelloSent>(s.a.hs.state()));
+    for (int phase = 0; phase < 2; ++phase) {
+        auto o = s.a.hs.onAccept(old2, s.now);
+        EXPECT_FALSE(o.frame) << "phase " << phase << ": an Accept of an epoch no longer live gets nothing";
+        EXPECT_FALSE(o.established);
+        o = s.a.hs.onAccept(live3, s.now);
+        ASSERT_TRUE(o.frame) << "phase " << phase << ": the live epoch's Accept is answered with its Confirm";
+        EXPECT_EQ(o.frame->bytes[0], static_cast<uint8_t>(pl::PeerMsg::Confirm));
+        EXPECT_FALSE(o.established) << "phase " << phase << ": nothing is (re)installed";
+        pl::PeerConfirm c;
+        ASSERT_TRUE(pl::PeerConfirm::decode(o.frame->data(), o.frame->size(), c));
+        EXPECT_EQ(c.linkEpoch, 3u);
+        EXPECT_FALSE(s.b.hs.onConfirm(c, s.now).established) << "phase " << phase << ": a confirmed epoch is not re-promoted";
+        if (phase == 0) {
+            EXPECT_TRUE(std::holds_alternative<pl::HelloSent>(s.a.hs.state())) << "the replay never moves the initiator";
+            s.deliverHs(1, popHs(s, 1, pl::PeerMsg::HelloV2));
+            s.deliverHs(0, popHs(s, 0, pl::PeerMsg::ChallengeV2));
+            ASSERT_TRUE(std::holds_alternative<pl::ChallengeSent>(s.a.hs.state()));
+        } else {
+            EXPECT_TRUE(std::holds_alternative<pl::ChallengeSent>(s.a.hs.state())) << "the replay never moves the initiator";
+        }
+    }
+    EXPECT_EQ(s.a.crypto.currentEpoch(2), 3u);
+    ASSERT_TRUE(s.converge()) << s.describe();
+    EXPECT_EQ(s.a.crypto.currentEpoch(2), 4u) << "the exchange in flight completed";
+    EXPECT_EQ(s.b.crypto.currentEpoch(1), 4u);
+    EXPECT_EQ(s.a.crypto.dropsOf(OR::UnknownEpoch) + s.b.crypto.dropsOf(OR::UnknownEpoch), 0u);
+}
+

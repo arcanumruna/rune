@@ -57,6 +57,7 @@
 #include <rune/client/TypedTopic.h>
 #include <rune/client/Completion.h>
 #include <rune/client/Completions.h>
+#include <rune/client/detail/ClientTestOptions.h>
 #include <rune/client/detail/CoordRoute.h>
 #include <rune/client/detail/OpTarget.h>
 #include <rune/client/detail/StatusRing.h>
@@ -293,10 +294,6 @@ struct ClientConfig {
     /// its own flow through NAT.  The leader's port is learnt from the Redirect `#port` suffix, every broker's from
     /// Metadata.  0 (default) = the declared `egressChannel` path only.
     int32_t     gatewayResponseControlPort = 0;
-    /// Test seam (NAT egress Task 8): when non-empty, the ConnectRequest DECLARES this egress channel while the
-    /// transport still subscribes on `egressChannel` (models a client behind NAT whose declared address is
-    /// unreachable).  Empty (default) = declare `egressChannel`.
-    std::string declaredEgressChannelForTest;
     std::string dataDir;
 
     // High-level timeouts (milliseconds).
@@ -484,7 +481,7 @@ struct ClientConfig {
 };
 
 /// Maps a ClientConfig to the agent/transport configuration (applies env overrides).
-[[nodiscard]] agent::AgentConfig toAgentConfig(const ClientConfig& c);
+[[nodiscard]] agent::AgentConfig toAgentConfig(const ClientConfig& c, const detail::ClientTestOptions& opts = {});
 
 /// Authentication (spec §5): who this Client is to its seed broker right now.
 ///   Authenticated          the seed session is Connected and the broker authenticated `user`.
@@ -516,6 +513,8 @@ public:
     /// before calling connect(); they may be set up to this point safely from
     /// the constructing thread before connect() is called.
     explicit Client(ClientConfig cfg);
+    /// Test-only construction (#756): `opts` carries seams that are not public config (e.g. a declared egress channel).
+    Client(ClientConfig cfg, const detail::ClientTestOptions& opts);
 
     /// = closeImmediately() (user decision 2: a destructor never waits for
     /// the broker).  Idempotent.  Call close() first when delivery matters.
@@ -753,6 +752,8 @@ public:
     [[nodiscard]] const std::string& testSeedChannel() const noexcept { return agent_.seedChannel(); }
     /// Fix round 1 test seam (duty thread / Invoker owner): an urgent metadata ask.
     void testRequestMetadataNow() noexcept { lastUrgentMetadataNs_ = INT64_MIN; requestMetadataNow_(); }
+    /// True while a MetadataRequest is unanswered (its answer timer is armed).  Test seam (duty thread).
+    [[nodiscard]] bool testMetadataAnswerPending() const noexcept { return metadataAnswerByNs_ != 0; }
     /// Test hook (duty-cycle thread only): agent session `i`'s state.
     [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
     /// Test hook (duty-cycle thread only / after quiescence): the endpoint channel of agent session `i`.
@@ -1272,13 +1273,13 @@ public:
 
     /// Subscribe to a topic partition using a Key (partition resolved via FNV-1a).
     ///
-    /// Plain subscriptions are sent on the seed session.  While a consumer group
-    /// (subscribeGroup) is active on this Client, that session is the group
-    /// coordinator's and never follows a redirect: a plain subscription to a
-    /// partition another node leads is then finished with
-    /// Subscription::failReason() == SubscriptionFailReason::
-    /// LeaderElsewhereWhileGroupActive (re-subscribing cannot succeed; use a
-    /// separate Client for it).
+    /// Plain subscriptions start on the seed session.  A subscription to a partition another node leads follows
+    /// that partition's leader on the leader's own session - also while a consumer group (subscribeGroup) is
+    /// active on this Client: the seed, which is then the group coordinator's session, is never moved.  Only a
+    /// redirect that would have to move the seed (the target is not a node this client can route to) is refused
+    /// while a group is active: the subscription is finished with Subscription::failReason() ==
+    /// SubscriptionFailReason::LeaderElsewhereWhileGroupActive (re-subscribing cannot succeed; use a separate
+    /// Client for it).
     ///
     /// Returns a Subscription handle immediately.  Records begin flowing once
     /// the broker acknowledges (SubscribeResponse) — the Subscription does NOT
@@ -1651,6 +1652,10 @@ private:
     /// Every group frame (JoinGroup / SyncGroup / Heartbeat / OffsetFetch):
     /// the seed's ring path, or the coordinator session (built once).
     group::SendFn coordSendFn_;
+    /// #718: the group hub's send path: the coordinator session's ring (seed) or its own node session.
+    static bool coordSendThunk_(void* ctx, int32_t streamId, const uint8_t* fb, std::size_t fl);
+    /// closeAll's best-effort last send on the seed.
+    static bool seedSendThunk_(void* ctx, int32_t streamId, const uint8_t* fb, std::size_t fl);
     /// Phase 2b F: the CoordinatorSink every producer's CoordinatorLink offers through.
     [[nodiscard]] static producer::CoordinatorSink::Offer coordOfferTrampoline_(void* ctx, const uint8_t* buf,
                                                                                 std::size_t len) noexcept;
@@ -1917,6 +1922,7 @@ private:
     static std::string redirectMessageOf_(const HeldRedirect& h) {
         return h.responsePort > 0 ? h.endpoint + "#" + std::to_string(h.responsePort) : h.endpoint;
     }
+    void heldFallbackBySeed_(const HeldRedirect& h);   // #749
     std::vector<HeldRedirect> heldRedirectFollows_;   // duty thread; cold
     uint64_t redirectFollowsHeld_ = 0;
     uint64_t staleSubscribeRedirects_ = 0;   // R4: Redirects from a session the Subscribe is not outstanding on

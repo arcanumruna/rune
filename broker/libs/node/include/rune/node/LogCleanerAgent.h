@@ -121,7 +121,7 @@ public:
     /// @param dedupeBufferBytes  Memory budget for the SkimpyOffsetMap dedupe pass.
     ///                           Default -1 = use cycleBudgetBytes (or 128 MiB if
     ///                           cycleBudgetBytes is 0).  The map is sized to
-    ///                           floor(dedupeBufferBytes / kEntryBytes × loadFactor).
+    ///                           bit_floor(dedupeBufferBytes / kEntryBytes) entries, so the table never exceeds the budget.
     /// @param ioMaxBytesPerSec   Shared I/O throttle (bytes/sec). -1 = unlimited.
     /// @param useCoalescing      CP-8: enable segment coalescing — when true,
     ///                           consecutive sealed segments that together fit
@@ -147,7 +147,7 @@ public:
         , throttler_(ioMaxBytesPerSec)
         , useCoalescing_(useCoalescing)
         , coalescingRollBytes_(coalescingRollBytes)
-        , dedupeMap_(rune::storage::SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes_))
+        , dedupeMap_(rune::storage::SkimpyOffsetMap::sizingForBudget(dedupeBufferBytes_))
     {
         overrides_.reserve(kPolicyOverridesReserved);   // Task 8: buckets reserved at start
     }
@@ -287,6 +287,10 @@ public:
         return throttler_.maxBytesPerSec();
     }
     [[nodiscard]] int64_t dedupeBufferBytesForTest() const noexcept { return dedupeBufferBytes_; }
+    /// Test-only (#658): bytes of the dedupe table actually allocated.
+    [[nodiscard]] std::size_t dedupeTableBytes() const noexcept {
+        return dedupeMap_.capacity() * rune::storage::SkimpyOffsetMap::kEntryBytes;
+    }
 
     // -----------------------------------------------------------------------
     // Agent::doWork — one cleaner cycle.

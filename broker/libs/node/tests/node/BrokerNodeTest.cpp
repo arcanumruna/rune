@@ -929,6 +929,20 @@ TEST(BrokerNodeTest, CleanerDedupeBufferBytes_ReachesCleaner) {
     }
 }
 
+// #658: the knob sizes the REAL table, and the table never exceeds the budget (a 128 MiB default allocated 256 MiB).
+// RED (BrokerNode passes -1 to the cleaner): the table is 128 MiB, not 4 MiB.
+TEST(CompactionCleanerAgentRegression, DedupeBufferKnobSizesTheCleanerMapRegression) {
+    TempDir tmp{"cleaner_dedupe_map_"};
+    fs::create_directories(tmp.path);
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.cleanerDedupeBufferBytes = int64_t{4} << 20;
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10s));
+    EXPECT_EQ(node.cleanerDedupeTableBytesForTest(), int64_t{4} << 20);
+    node.stop();
+}
+
 // ===========================================================================
 // Task M1 precondition #1: durability=all-in-sync wires end-to-end.
 //

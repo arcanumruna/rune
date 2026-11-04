@@ -365,17 +365,118 @@ TEST(BrokerMetricsRegression, StartRefusedWhenFileTooSmallRegression) {
     EXPECT_FALSE(fs::exists(cfg.effectiveMetricsFile())) << "no file is left behind";
 }
 
-// The 10th allocation (row 9, rune-catalog-apply-halted) returning Full refuses the start and names that metric.
+// A refused start inside createMetrics_ leaves NO file behind, wherever it stops: the first row, the 10th
+// (rune-catalog-apply-halted) and the last.  A half-allocated file with a Role row would make rune_role print
+// ROLE ... role=NONE with exit 0 for a process that never started (#631).
+// RED (the unlink dropped from discardMetricsFile_): the file exists.
 TEST(BrokerMetricsRegression, StartRefusedOnAllocFailureRegression) {
-    MetricsTempDir tmp{"alloc_"};
+    using rune::node::kRuneMetrics;
+    for (const std::int32_t row : {0, 9, static_cast<std::int32_t>(kRuneMetrics.size()) - 1}) {
+        SCOPED_TRACE("failAllocAt=" + std::to_string(row));
+        MetricsTempDir tmp{"alloc_"};
+        NodeConfig cfg = singleNode(tmp.path);
+        cfg.metricsFailAllocAtForTest = row;
+        const auto& def = kRuneMetrics[static_cast<std::size_t>(row)];
+        const std::string err = startError(cfg);
+        EXPECT_NE(err.find(std::string{"metrics allocation failed for "} + std::string{def.labelPrefix} + " (type " +
+                           std::to_string(static_cast<std::int32_t>(def.id)) + "): Full"),
+                  std::string::npos)
+            << err;
+        EXPECT_FALSE(fs::exists(fs::path{cfg.effectiveAeronDir()} / "cnc.dat")) << "the driver never started";
+        EXPECT_FALSE(fs::exists(cfg.effectiveMetricsFile())) << "no half-allocated file is left behind";
+    }
+}
+
+// A previous run's file at the same path is replaced by create() and then discarded with the refused start: a stale
+// role file of a dead process is not left behind.
+TEST(BrokerMetricsRegression, StartRefusedOnAllocFailureRemovesAPreviousRunsFileRegression) {
+    MetricsTempDir tmp{"alloc_prev_"};
     NodeConfig cfg = singleNode(tmp.path);
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(5s));
+        node.stop();
+    }
+    ASSERT_TRUE(fs::exists(cfg.effectiveMetricsFile())) << "the good run left its file";
     cfg.metricsFailAllocAtForTest = 9;
     const std::string err = startError(cfg);
-    EXPECT_NE(err.find("metrics allocation failed for rune-catalog-apply-halted (type 1000217): Full"),
-              std::string::npos)
-        << err;
-    EXPECT_FALSE(fs::exists(fs::path{cfg.effectiveAeronDir()} / "cnc.dat")) << "the driver never started";
+    EXPECT_NE(err.find("metrics allocation failed for"), std::string::npos) << err;
+    EXPECT_FALSE(fs::exists(cfg.effectiveMetricsFile())) << "the refused start leaves no file, not even the old one";
 }
+
+// #631 review: a refusal inside createMetrics_ detaches the writer and drops its free stack along with the unmapped
+// file, so a later allocate / write can never touch the unmapped mapping.
+// RED (the writer reset and the free-stack clear dropped from discardMetricsFile_): the writer still holds its rows.
+TEST(BrokerMetricsRegression, DiscardDetachesTheMetricsWriterRegression) {
+    MetricsTempDir tmp{"detach_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    cfg.metricsFailAllocAtForTest = 9;
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_EQ(node.metricsWriterAllocatedForTest(), 0) << "the writer still counts rows of the unmapped file";
+    EXPECT_EQ(node.metricsFreeStackSizeForTest(), 0u) << "the free stack still names slots of the unmapped file";
+}
+
+// L10 (#631): a start that fails AFTER createMetrics_ returned leaves the complete, valid file (every row allocated,
+// the observer's NONE / -1 values): only a refusal inside createMetrics_ removes it.  The later failure here is a
+// per-worker replication peer with a different worker count.
+TEST(BrokerMetricsRegression, LaterStartFailureLeavesACompleteFileRegression) {
+    MetricsTempDir tmp{"later_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    cfg.perWorkerReplication = true;   // an asymmetric peer worker count refuses the start, after createMetrics_
+    PeerConfig other;
+    other.id            = 1;
+    other.host          = "127.0.0.1";
+    other.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();
+    other.workerCount   = cfg.workerCount + 1;
+    cfg.peers.push_back(other);
+    const std::string err = startError(cfg);
+    ASSERT_FALSE(err.empty()) << "the start must fail after the metrics file was created";
+    ASSERT_TRUE(fs::exists(cfg.effectiveMetricsFile())) << err;
+    for (const auto& def : kRuneMetrics) {
+        const auto live = rune::node::test::readRuneMetricLiveAt(cfg.effectiveMetricsFile(),
+                                                                 static_cast<std::int32_t>(def.id), cfg.nodeId);
+        EXPECT_TRUE(live.has_value()) << "row " << def.labelPrefix << " missing from the kept file: " << err;
+    }
+}
+
+#if defined(__linux__)
+// #632: the process metrics (fd walk of /proc/self/fd, linear in open fds) are sampled by the ADMIN agent, never the
+// control thread.  The row moves with the process's fds AND the admin agent counts its samples.
+// RED (the sample moved back into the control loop): the row still moves, but the admin agent took 0 samples.
+TEST(BrokerMetricsRegression, SystemMetricsSampleOnTheAdminAgentRegression) {
+    MetricsTempDir tmp{"sysadmin_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    cfg.metricsSystemIntervalMs = 1;
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s));
+    constexpr std::int32_t kOpenFds = 1000301;   // process_open_fds
+    const auto readFds = [&]() -> std::int64_t {
+        const auto v = rune::node::test::readRuneMetricAt(node.metricsFilePath(), kOpenFds, cfg.nodeId);
+        return v.value_or(-1);
+    };
+    const auto await = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (pred()) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return pred();
+    };
+    ASSERT_TRUE(await([&] { return readFds() > 0; })) << "the first sample lands";
+    const std::int64_t baseline = readFds();
+    std::vector<int> fds;
+    for (int i = 0; i < 64; ++i) fds.push_back(::dup(0));
+    const bool moved = await([&] { return readFds() >= baseline + 64; });
+    for (const int fd : fds) if (fd >= 0) ::close(fd);
+    EXPECT_TRUE(moved) << "process_open_fds follows 64 new fds (baseline " << baseline << ")";
+    EXPECT_TRUE(await([&] { return node.adminSystemMetricsSamplesForTest() >= 2; }))
+        << "the admin agent took the samples: " << node.adminSystemMetricsSamplesForTest();
+    node.stop();
+}
+#endif  // __linux__
 
 // stop + start recreates the file: a new startEpochNs, a reader on the old mapping sees sameInstanceAs() == false,
 // and the values restart from the node's recovered state.

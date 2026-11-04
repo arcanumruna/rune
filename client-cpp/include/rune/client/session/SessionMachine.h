@@ -399,7 +399,13 @@ public:
     [[nodiscard]] SessionState state()         const noexcept { return state_; }
     [[nodiscard]] int64_t      sessionId()     const noexcept { return sessionId_; }
     /// #426: true when `sid` names the session whose keys this machine discarded while it was encrypted.
-    [[nodiscard]] bool namesRetiredSealedSession(int64_t sid) const noexcept { return sid != 0 && sid == retiredSealedSid_; }
+    /// The last kRetiredSealedSlots retired episodes are remembered (#732); zero retired is one compare.
+    [[nodiscard]] bool namesRetiredSealedSession(int64_t sid) const noexcept {
+        if (retiredCount_ == 0 || sid == 0) return false;
+        for (uint8_t i = 0; i < retiredCount_; ++i)
+            if (retiredSealed_[i] == sid) return true;
+        return false;
+    }
     [[nodiscard]] int64_t      keepaliveCorrelationId() const noexcept { return cfg_.keepaliveCorrelationId; }
     [[nodiscard]] int64_t      correlationId() const noexcept { return correlationId_; }
     [[nodiscard]] int           redirectCount() const noexcept { return redirectCount_; }
@@ -1120,7 +1126,7 @@ public:
         // timeout is a stall of the CLIENT (SIGSTOP, a long pause): the broker may
         // have expired the session meanwhile, and frames buffered during the stall
         // (read just before this tick) prove nothing — treat the session as stale.
-        const bool ownStall = lastTickNs_ != 0 && nowNs - lastTickNs_ > cfg_.responseTimeoutNs;
+        const bool ownStall = lastTickNs_ != 0 && nowNs - lastTickNs_ >= cfg_.responseTimeoutNs;
         lastTickNs_ = nowNs;
         if (ownStall && state_ == SessionState::Connected) [[unlikely]] {
             ++staleSessionLosses_;
@@ -1195,7 +1201,11 @@ private:
     /// #426: the id of the encrypted session whose keys are about to be dropped is remembered, so a frame the broker
     /// still seals under that discarded key (its lease has not expired) is never mistaken for a clear frame.
     void retireSealedSessionId_() noexcept {
-        if (cryptoState_.encrypted && sessionId_ != 0) retiredSealedSid_ = sessionId_;
+        if (!cryptoState_.encrypted || sessionId_ == 0) return;
+        if (namesRetiredSealedSession(sessionId_)) return;   // already remembered: no duplicate slot
+        retiredSealed_[retiredNext_] = sessionId_;
+        retiredNext_ = static_cast<uint8_t>((retiredNext_ + 1) % kRetiredSealedSlots);
+        if (retiredCount_ < kRetiredSealedSlots) ++retiredCount_;
     }
     /// Every crypto reset goes through here; it runs BEFORE any `sessionId_ = 0` on the same path.
     void discardCrypto_() noexcept {
@@ -1621,7 +1631,8 @@ private:
         // (onSealedFrameOpened) - an optimistic Connected followed by a final-leg failure keeps its growing delay.
         if (!cryptoState_.encrypted) {
             backoff_ = {};
-            if (sessionId_ == retiredSealedSid_) retiredSealedSid_ = 0;   // #426: a plaintext episode resuming the SAME id: its frames are legitimately clear; a new id never reads the old sealed ack
+            for (uint8_t i = 0; i < retiredCount_; ++i)
+                if (retiredSealed_[i] == sessionId_) retiredSealed_[i] = 0;   // #426: a plaintext episode resuming the SAME id: its frames are legitimately clear; a new id never reads the old sealed ack
         }
         lastConnectError_    = 0;      // I2: refused attempts are history now
         transitionTo(SessionState::Connected);
@@ -1926,9 +1937,13 @@ private:
 
     SessionState  state_            = SessionState::Disconnected;
     int64_t       sessionId_        = 0;
-    /// The session id of the last episode whose keys were discarded while encrypted; a frame naming it that no live
-    /// key opens is old-episode ciphertext and is never read in clear (#426).
-    int64_t       retiredSealedSid_ = 0;
+    /// The session ids of the last kRetiredSealedSlots episodes whose keys were discarded while encrypted (a ring: the
+    /// oldest is overwritten); a frame naming one that no live key opens is old-episode ciphertext and is never read in
+    /// clear (#426, #732).  A cleared slot holds 0, which no lookup matches.
+    static constexpr uint8_t kRetiredSealedSlots = 4;
+    std::array<int64_t, kRetiredSealedSlots> retiredSealed_{};
+    uint8_t       retiredNext_      = 0;
+    uint8_t       retiredCount_     = 0;
     int64_t       correlationId_    = 0;
     int64_t       correlationIdCounter_ = 0;
 

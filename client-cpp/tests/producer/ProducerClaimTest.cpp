@@ -1397,7 +1397,7 @@ TEST(ProducerClaimRegression, DeliverySweepAbandonKeepsTheHeldBatchClaimOutOfThe
     ASSERT_TRUE(b);
 
     // The records were never sent (no session): the sweep fails the builder.
-    r.impl->sweepTimedOut(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(kNow + 200'000'000)));
+    r.impl->sweepTimedOut(kNow + 200'000'000);
     ASSERT_EQ(h.failed, 1);
     EXPECT_EQ(r.impl->claimsAbandoned(), 1u);
     for (uint32_t i = 0; i < b.count(); ++i) std::memset(b.record(i).data(), 'Z', b.recordLength());

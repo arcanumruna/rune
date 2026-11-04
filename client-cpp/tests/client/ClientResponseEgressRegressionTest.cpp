@@ -559,6 +559,30 @@ TEST(ClientAgentRegression, StaleWorkerBindAckIgnoredRegression) {
     ASSERT_TRUE(r.drive([&] { return r.client.testWorkerBindAcksIgnored() == 3u; }));
 }
 
+// #765: a WorkerBindAck is plaintext BY CONTRACT even on an ENCRYPTED session, and is handled before the sealed-session
+// filter.  An encrypted session with the bind in Sent, then a plaintext ack with the exact (sid, corr): Bound, and the
+// held produce is released.
+TEST(ClientAgentRegression, PlaintextWorkerBindAckOnAnEncryptedSessionStillBindsRegression) {
+    Options o; o.fakeClock = true; o.tls = true;
+    Rig r(4215, 4216, o);
+    const auto w = r.addWorker(0, 4217);
+    r.gw.noBindAcks = true;
+    connectThenFreeze(r);
+    if (::testing::Test::HasFatalFailure()) return;
+    ASSERT_TRUE(r.drive([&] { return r.gw.tlsSessions == 1; })) << "the session must be encrypted";
+    auto p = r.client.producer(noLinger());
+    const rc::Token t = sendOne(r, p);
+    ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 1 && r.client.testHeldOffers() > 0; }));
+    EXPECT_TRUE(r.gw.produced.empty()) << "held while unacknowledged";
+    const auto b = rp::WorkerBind::decode(r.gw.workerBindFrames[0].data(), r.gw.workerBindFrames[0].size());
+    ASSERT_TRUE(b.has_value());
+    r.gw.sendBindAck(w.endpoint, b->sessionId, b->correlationId);   // plaintext, exact (sid, corr)
+    EXPECT_TRUE(completedOk(r, t));
+    EXPECT_EQ(r.client.testWorkerBindAcksAccepted(), 1u);
+    EXPECT_EQ(r.client.testWorkerBindAcksIgnored(), 0u) << "the ack was dropped by the sealed-session filter";
+    EXPECT_EQ(r.gw.binds.size(), 1u) << "no resend: the ack bound it";
+}
+
 // A lost FIRST ack (datagram) is recovered by the resend: the worker answers a repeated bind again.
 TEST(ClientAgentRegression, LostWorkerBindAckIsRecoveredByResendRegression) {
     Options o; o.fakeClock = true;
