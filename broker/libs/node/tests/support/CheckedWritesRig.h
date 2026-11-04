@@ -80,7 +80,7 @@ struct Rec { uint64_t id; int64_t v; uint8_t tag = 0; bool del = false; uint8_t 
 /// What a consumer received: one record of a delivered batch.
 inline constexpr uint16_t kTombstoneTag = 0xFFFF;   ///< Delivered::tag of a tombstone
 struct Delivered { int64_t offset; uint64_t id; uint16_t tag; uint8_t intent = 0; };
-enum class SubKind : uint8_t { Raw, Filtered, PushRead };   ///< Filtered: tag == 1
+enum class SubKind : uint8_t { Raw, Filtered, PushRead, Group };   ///< Filtered: tag == 1; Group: Raw as a group member (isGroup, isolation carrier received)
 
 class NullPartitionTransport final : public rune::replication::PartitionTransport {
 public:
@@ -462,6 +462,7 @@ public:
         op.subscriptionId = id; op.sessionId = 4200 + id; op.correlationId = 9000 + id;
         op.topicId = kSrc; op.partition = 0; op.nextOffset = from;
         op.replica = replica.get(); op.logPtr = log.get();
+        if (kind == SubKind::Group) { op.isGroup = 1; op.groupCarrierReceived = 1; }
         if (kind == SubKind::Filtered) {
             rune::codec::FilterBytes fb;
             rune::codec::FilterWriter w(std::span<uint8_t>(fb.bytes.data(), fb.bytes.size()));
@@ -476,11 +477,14 @@ public:
         return id;
     }
 
+    /// Every collect() drive loop's hard cap: fails rather than hangs.
+    static constexpr int kCollectMaxPasses = 100'000;
     /// Drives until the consumer has nothing more to deliver, then returns what it got so far (cumulative).
     const Inbox& collect(int64_t subId) {
         Inbox& box = inboxes_[subId];
         if (kinds_.at(subId) == SubKind::PushRead) {
-            for (;;) {
+            for (int iter = 0;; ++iter) {
+                if (iter == kCollectMaxPasses) { ADD_FAILURE() << "collect(" << subId << "): no quiescence after " << kCollectMaxPasses << " PushReads"; break; }
                 WorkerOp op;
                 op.type = WorkerOp::Type::PushRead;
                 op.subscriptionId = subId; op.sessionId = 4200 + subId; op.topicId = kSrc; op.partition = 0;
@@ -504,7 +508,8 @@ public:
         }
         // The subscription cursor reached what the HW and the judge allow, the worker is idle, the image has read everything the egress
         // published and nothing new was polled.
-        for (;;) {
+        for (int iter = 0;; ++iter) {
+            if (iter == kCollectMaxPasses) { ADD_FAILURE() << "collect(" << subId << "): no quiescence after " << kCollectMaxPasses << " passes"; break; }
             const int work = pass();
             const std::size_t before = box.frames.size();
             sub_->poll(aeron::FragmentAssembler([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
@@ -685,11 +690,12 @@ public:
 
     /// Drives until the view's instance folded through `target` (and serves).
     void driveUntilFolded(int32_t viewTopicId, int64_t target) {
-        for (;;) {
+        for (int iter = 0; iter < kCollectMaxPasses; ++iter) {
             const auto st = vs->instanceServeState(viewTopicId, 0);
             if (st.hosted && st.ready && st.foldCursor >= target) return;
             pass();
         }
+        ADD_FAILURE() << "driveUntilFolded(" << viewTopicId << ", " << target << "): not folded after " << kCollectMaxPasses << " passes";
     }
 
     // ---- compaction ----

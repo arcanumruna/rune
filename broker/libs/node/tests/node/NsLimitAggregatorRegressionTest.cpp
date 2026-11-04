@@ -288,3 +288,19 @@ TEST(NsLimitAggregatorRegression, ChurnEmitsBoundedEventsRegression) {
     }
     EXPECT_GT(rig.throttles.size(), 3u);
 }
+
+// #728 (the tick): the aggregator visits the live slots only, never the table capacity.
+TEST(NsLimitAggregatorRegression, AggregatorTickVisitsLiveSlotsOnlyRegression) {
+    NsLimitAggregator agg;
+    agg.configure(65535, 1, kTick);
+    int64_t now = 1'000'000'000;
+    (void)agg.doWork(now);   // baseline
+    for (uint16_t s = 1; s <= 3; ++s) agg.onSlotAssign(s, 100 + s, NamespaceLimits{});
+    now += kTick;
+    (void)agg.doWork(now);
+    EXPECT_EQ(agg.visitedLastTickForTest(), 4u) << "default + 3 namespaces, not 65535";
+    agg.onSlotFreed(2, 102);
+    now += kTick;
+    (void)agg.doWork(now);
+    EXPECT_EQ(agg.visitedLastTickForTest(), 3u);
+}
