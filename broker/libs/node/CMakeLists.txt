@@ -1167,12 +1167,12 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_ns_disk_worker_tests)
     # max-message-bytes / max-batch-bytes at the owning worker's produce intake (HotPathBRig, no Aeron).
     add_executable(rune_ns_produce_size_tests tests/node/NsProduceSizeLimitRegressionTest.cpp)
-    target_include_directories(rune_ns_produce_size_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    target_include_directories(rune_ns_produce_size_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_ns_produce_size_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
     gtest_discover_tests(rune_ns_produce_size_tests)
     # Namespaces Phase 2 Task 14 (D22, D28): the Throttle message at the owning worker (HotPathBRig, no Aeron).
-    add_executable(rune_ns_throttle_worker_tests tests/integration/NamespaceThrottleWorkerRegressionTest.cpp)
-    target_include_directories(rune_ns_throttle_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    add_executable(rune_ns_throttle_worker_tests tests/integration/NamespaceThrottleWorkerRegressionTest.cpp tests/support/AllocWindow.cpp)
+    target_include_directories(rune_ns_throttle_worker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_ns_throttle_worker_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
     gtest_discover_tests(rune_ns_throttle_worker_tests)
     # Namespaces Phase 2 Task 15: the namespace gate and counters allocate nothing (AllocWindow replaces operator new here).
@@ -1181,6 +1181,11 @@ if(BUILD_TESTING)
     target_link_libraries(rune_ns_hotpath_alloc_tests PRIVATE rune_node rune_view rune_codec rune_replication rune_storage
                           rune_transaction GTest::gtest_main)
     gtest_discover_tests(rune_ns_hotpath_alloc_tests)
+    # Adversarial regressions of batch 2 (#724, #712, #728): the disk scan, the usage report and the transient gates (no Aeron).
+    add_executable(rune_ns_adv_tests tests/integration/NsAdversarialRegressionTest.cpp tests/support/AllocWindow.cpp)
+    target_include_directories(rune_ns_adv_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_ns_adv_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
+    gtest_discover_tests(rune_ns_adv_tests)
     add_executable(rune_hotpath_b_alloc_regression_tests
         tests/integration/HotPathBAllocRegressionTest.cpp)
     target_link_libraries(rune_hotpath_b_alloc_regression_tests PRIVATE
@@ -1379,6 +1384,12 @@ if(BUILD_TESTING)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # The namespace fetch gate on the default consume paths (worker-owned, group, filtered subscriptions; legacy PushRead).
+            add_executable(rune_ns_fetch_adv_tests tests/node/NsFetchGateAdversarialRegressionTest.cpp)
+            target_include_directories(rune_ns_fetch_adv_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_ns_fetch_adv_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_ns_fetch_adv_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 04: the shared interaction matrix (04 cells; the reference model).
             add_executable(rune_checked_writes_matrix_tests tests/node/CheckedWritesMatrixTest.cpp)

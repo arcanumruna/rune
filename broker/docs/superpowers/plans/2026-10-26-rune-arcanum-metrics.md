@@ -307,7 +307,8 @@ numbers are hints; use the quoted anchors):
 - **D62. `SystemMetrics` runs on the control agent.** The control agent's `doWork(nowNs)` calls
   `systemMetrics_.doWork(nowNs)`. That call returns at once until `RUNE_METRICS_SYSTEM_INTERVAL_MS` has passed.
   `/proc` is read with `pread` on fds opened at construction, into fixed stack buffers. Control-plane I/O belongs
-  on the control agent, which already does I/O.
+  on the control agent, which already does I/O. Superseded by #632: admin agent (the fd walk is linear in open fds and
+  stalled the control thread).
 - **D63. Library CI in arcanum-metrics** (GitHub Actions):
   - gcc-13 and clang-18 on ubuntu, each building Debug, ASan+UBSan and TSan, and running every test with
     `--repeat until-fail:5`;

@@ -514,7 +514,7 @@ if(BUILD_BENCHMARKS)
         rune_metadata
         benchmark::benchmark_main)
 
-    # ── ControlDutyCycleBench — standalone: SystemMetrics cost on the control duty cycle (header-only metrics) ──
+    # ── ControlDutyCycleBench — standalone: SystemMetrics cost on the admin duty cycle (#632) (header-only metrics) ──
     # It measures a Linux-only path (SYS_getdents64), so it is not built elsewhere.
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(ControlDutyCycleBench

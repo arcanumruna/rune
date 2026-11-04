@@ -65,6 +65,16 @@ void PeerLinkAgent::absorb_(PeerSlot& p, pl::PeerHandshake::Out&& o, int64_t now
     if (o.established && sinkFn_ != nullptr) sinkFn_(sinkCtx_, p.id, *o.established, nowNs);
 }
 
+// Issue #554 / #683: charged AFTER decode and the crypto-free checks, per peer.  A Hello that fails the cheap checks is
+// let through unbudgeted (it is refused without crypto); one that would cost crypto spends this peer's budget.
+bool PeerLinkAgent::admitHello_(PeerSlot& p, int32_t from, int32_t to, uint64_t keyId) noexcept {
+    if (!p.hs.helloNeedsCrypto(from, to, keyId)) return true;
+    if (p.helloBudget == 0) { ++p.helloShed; ++helloShedTotal_; return false; }
+    --p.helloBudget;
+    ++helloAnswered_;
+    return true;
+}
+
 void PeerLinkAgent::onFrame_(const uint8_t* b, std::size_t len, int64_t nowNs) {
     // Route by the sender named in the frame (its from field leads each body at offset 1).
     if (len < 9) { ++malformed_; return; }
@@ -78,13 +88,13 @@ void PeerLinkAgent::onFrame_(const uint8_t* b, std::size_t len, int64_t nowNs) {
         return;
     }
     switch (static_cast<pl::PeerMsg>(tag)) {
-    case pl::PeerMsg::Hello:     { pl::PeerHello m;     if (pl::PeerHello::decode(b, len, m))     absorb_(*p, p->hs.onHello(m, nowNs), nowNs);     else ++malformed_; break; }
+    case pl::PeerMsg::Hello:     { pl::PeerHello m;     if (pl::PeerHello::decode(b, len, m)) { if (admitHello_(*p, m.from, m.to, m.keyId)) absorb_(*p, p->hs.onHello(m, nowNs), nowNs); } else ++malformed_; break; }
     case pl::PeerMsg::Challenge: { pl::PeerChallenge m; if (pl::PeerChallenge::decode(b, len, m)) absorb_(*p, p->hs.onChallenge(m, nowNs), nowNs); else ++malformed_; break; }
     case pl::PeerMsg::Proof:     { pl::PeerProof m;     if (pl::PeerProof::decode(b, len, m))     absorb_(*p, p->hs.onProof(m, nowNs), nowNs);     else ++malformed_; break; }
     case pl::PeerMsg::Accept:    { pl::PeerAccept m;    if (pl::PeerAccept::decode(b, len, m))    absorb_(*p, p->hs.onAccept(m, nowNs), nowNs);    else ++malformed_; break; }
     case pl::PeerMsg::Refuse:    { pl::PeerRefuse m;    if (pl::PeerRefuse::decode(b, len, m))    absorb_(*p, p->hs.onRefuse(m, nowNs), nowNs);    else ++malformed_; break; }
     case pl::PeerMsg::Confirm:   { pl::PeerConfirm m;   if (pl::PeerConfirm::decode(b, len, m))   absorb_(*p, p->hs.onConfirm(m, nowNs), nowNs);   else ++malformed_; break; }
-    case pl::PeerMsg::HelloV2:     { pl::PeerHelloV2 m;     if (pl::PeerHelloV2::decode(b, len, m))     absorb_(*p, p->hs.onHelloV2(m, nowNs), nowNs);     else ++malformed_; break; }
+    case pl::PeerMsg::HelloV2:     { pl::PeerHelloV2 m;     if (pl::PeerHelloV2::decode(b, len, m)) { if (admitHello_(*p, m.from, m.to, m.keyId)) absorb_(*p, p->hs.onHelloV2(m, nowNs), nowNs); } else ++malformed_; break; }
     case pl::PeerMsg::ChallengeV2: { pl::PeerChallengeV2 m; if (pl::PeerChallengeV2::decode(b, len, m)) absorb_(*p, p->hs.onChallengeV2(m, nowNs), nowNs); else ++malformed_; break; }
     case pl::PeerMsg::ProofV2:     { pl::PeerProofV2 m;     if (pl::PeerProofV2::decode(b, len, m))     absorb_(*p, p->hs.onProofV2(m, nowNs), nowNs);     else ++malformed_; break; }
     }
@@ -92,6 +102,7 @@ void PeerLinkAgent::onFrame_(const uint8_t* b, std::size_t len, int64_t nowNs) {
 
 int PeerLinkAgent::doWork(int64_t nowNs) {
     lastNowNs_ = nowNs;
+    for (auto& p : peers_) p.helloBudget = kHelloAnswersPerPeerPerCycle;   // issue #554: before the poll
     int work = sub_->poll(
         [this](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
             onFrame_(reinterpret_cast<const uint8_t*>(buf.buffer()) + off, static_cast<std::size_t>(len), lastNowNs_);

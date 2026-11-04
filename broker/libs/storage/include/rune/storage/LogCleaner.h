@@ -242,7 +242,7 @@ public:
     ///
     /// @param dedupeBufferBytes  Memory budget for the SkimpyOffsetMap.
     ///                           Must be > 0.  Sized via
-    ///                           SkimpyOffsetMap::maxSlotsFromBudget().
+    ///                           SkimpyOffsetMap::sizingForBudget().
     /// @param throttler          Optional shared I/O throttler (may be nullptr).
     ///                           Called after each segment file read/write.
     ///                           MUST be called only on the cleaner thread.

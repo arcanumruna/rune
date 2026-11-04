@@ -98,6 +98,13 @@ A broker **never formats an empty data directory on its own**. It refuses to sta
 Never delete or copy `storage.meta` on its own. Details, refusal table and the multi-disk-loss procedure
 (`RUNE_STORAGE_RECOVERY_VOTE`) are in SELF-HOSTING.
 
+### Memory footprint
+
+Two fixed costs set the resident floor of a node, before any topic or view:
+
+- Per node: the cleaner's dedupe map, `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` (default 128 MiB, written whole at start and on every cleaner pass). The offset table stays within that budget; the producer tails add up to 25% of it (minimum 1024 x 64 B) on top, so the total is at most about 1.25 times the budget.
+- Per embedded Aeron driver: 3 x 128 MiB command rings, resident from the start. That is the Aeron default; the `aeron/1.51.0-rune.2` build honours the `AERON_DRIVER_COMMAND_QUEUE_CAPACITY` environment variable (bytes per ring), which the broker does not set (see #658).
+
 ## Health and failure
 
 - **Leadership.** Each broker logs `rune-broker: node N is LEADER term T` and every change (`leadership change`).
@@ -189,10 +196,10 @@ enforced, each with one precise code:
 | `min-replication-factor`, `max-replication-factor`, `lowest-acks`, `lowest-min-insync` | at topic DDL; the acks floor at every produce | `NamespaceLimitExceeded (52)` |
 | feature bits | the `compaction`, `views`, `txns`, `anonymous read` and `scram` bits are enforced at the DDL or at connect / login. The `ql`, `sql` and `redis` bits are stored only: there is no serving path for them yet | `NamespaceLimitExceeded (52)` |
 | `max-connections`, `max-connections-per-user`, `max-sessions-per-user`, `max-open-txns`, `max-txn-time-ms` | at login / `InitProducerId` / `AddPartitions`, **per node** | `NamespaceLimitExceeded (52)` |
-| `max-disk-bytes` | measured on the node that leads the partition | produce on the leader: `NamespaceLimitExceeded (52)`; follower apply, replication catch-up and the log cleaner are never refused |
+| `max-disk-bytes` | measured on the node that leads the partition | produce on the leader: `NamespaceLimitExceeded (52)`; follower apply, replication catch-up and the log cleaner are never refused. A transient topic neither charges nor is refused by `max-disk-bytes` (it has no disk bytes) |
 | `max-message-bytes`, `max-batch-bytes` | the worker's produce intake on the leader. A batch longer than `max-batch-bytes`, or a record whose length field (its body bytes) is longer than `max-message-bytes`, is refused and nothing is appended. The record fields are checked against that length field; a batch whose records do not match their length fields or the header's record count, or that has trailing bytes, is malformed and refused. 0 = unlimited | `NamespaceLimitExceeded (52)`; a malformed batch: `InvalidRequest (39)` |
 | `max-retention-ms`, `max-retention-bytes` | a topic DDL above the maximum is refused; the cleaner applies `min(topic retention, namespace maximum)` | `NamespaceLimitExceeded (52)` at DDL |
-| `produce-bytes-per-sec`, `produce-records-per-sec`, `fetch-bytes-per-sec`, `request-ops-per-sec`, `query-cycles-per-sec` | a per-namespace aggregator compares the node's usage with `limit x elapsed` every `RUNE_NS_LIMIT_TICK_US` (default 10000) | `Throttled (53)` carrying a retry-after; the client library waits it out and retries |
+| `produce-bytes-per-sec`, `produce-records-per-sec`, `fetch-bytes-per-sec`, `request-ops-per-sec`, `query-cycles-per-sec` | a per-namespace aggregator compares the node's usage with `limit x elapsed` every `RUNE_NS_LIMIT_TICK_US` (default 10000) | `Throttled (53)` carrying a retry-after; the client library waits it out and retries. `fetch-bytes-per-sec` and `request-ops-per-sec` also apply to subscriptions: a throttled namespace is simply not pushed to until the throttle lapses, and a subscription's request ops are counted once per Subscribe |
 | `max-view-memory-bytes` | the node's view chunks | the namespace's views pause at their offset and a view read answers `ViewPaused (54)`; they resume when memory falls or the limit is raised |
 
 - **`max-txn-time-ms` is at most 2592000000 (30 days).** A larger value on `CreateNamespace` or `SetLimits` is refused with
@@ -266,6 +273,7 @@ sampling the file; the broker keeps no history.
 | 1000240 | `rune-txn-offset-commits-stuck` | gauge | control | Transaction commits waiting because the group coordinator refuses their consumer-group offsets. Alert on a non-zero value that persists. |
 | 1000241 | `rune-txn-offset-stuck-age-ms` | gauge | control | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
 | 1000242 | `rune-ns-slot-mismatch` | counter | control | Namespace slot tags refused by the gateway or a worker (`rune.ns.slot_mismatch`): a message or request whose (slot, nsId) pair the receiver's slot table does not hold. Any rise is a bug. |
+| 1000243 | `rune-peer-hello-shed` | counter | control | Peer-link Hello / HelloV2 frames dropped because the sending peer had used its one crypto-costing Hello answer for this duty cycle (a flood, or a legitimate initiator retrying in the same cycle as a forged one). A sustained rise means an off-path Hello flood; the real initiator re-sends every 200 ms and still links. |
 | 1000270 | `rune-log-damaged-segments` | gauge | control | Sealed log segments found damaged at boot, summed over every log the node serves: bytes after the last whole batch of a segment below the recovery point. They stay on disk and reads that reach them fail (see Damaged log segments). Set once at start; damage found later is only logged. |
 
 Per-namespace metrics (one series per namespace on this node, allocated when the namespace is created and freed when it is
@@ -283,7 +291,7 @@ metrics and structured logs, not `__security` events.
 
 ### Process metrics
 
-On Linux the control agent samples `/proc/self` every `RUNE_METRICS_SYSTEM_INTERVAL_MS` (default 1000) and writes the rows
+On Linux the admin agent samples `/proc/self` every `RUNE_METRICS_SYSTEM_INTERVAL_MS` (default 1000) and writes the rows
 below. Other hosts have no `/proc`, and their brokers export no process metrics.
 
 | Type id | Label | Kind | Meaning |

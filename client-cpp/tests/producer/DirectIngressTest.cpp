@@ -448,7 +448,7 @@ TEST(DirectIngress, DirectRetryFromTimeoutCallbackIsNotDroppedRegression) {
     });
     ASSERT_EQ(impl.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, h), rc::SendResult::Ok);
     const int64_t sweepNs = 1'000 + 10'000'000 + 1;  // never sent (no flush), past delivery
-    impl.sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{sweepNs}});
+    impl.sweepTimedOut(sweepNs);
     EXPECT_EQ(failedWith, -1);
     EXPECT_EQ(retryR, rc::SendResult::Ok);
     EXPECT_EQ(builderRecords(impl, 0), 1) << "the retry must survive the builder reset";
@@ -480,8 +480,7 @@ TEST(DirectIngress, DirectSendToNewPartitionFromSweepCallbackRegression) {
         }
     });
     ASSERT_EQ(impl.trySubmit(1, 0, rc::Key(uint64_t{1}), kVal, h), rc::SendResult::Ok);
-    impl.sweepTimedOut(std::chrono::steady_clock::time_point{
-        std::chrono::nanoseconds{1'000 + 10'000'000 + 1}});
+    impl.sweepTimedOut(1'000 + 10'000'000 + 1);
     EXPECT_EQ(acceptedButNotApplied, kFresh) << "no partitions_ growth under the sweep's walk";
     for (int32_t part = 1; part <= kFresh; ++part) {
         EXPECT_EQ(builderRecords(impl, part), 1) << "partition " << part;
@@ -830,9 +829,9 @@ TEST(DirectIngress, DeferredRecordFailsWithinDeliveryTimeoutRegression) {
         if (fx.send(0, 'd', h) != rc::SendResult::Ok) fx.S.rejected(h);
     });
     ASSERT_EQ(fx.impl.deferredCount(), 1u);
-    fx.impl.sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{t0 + D - 1}});
+    fx.impl.sweepTimedOut(t0 + D - 1);
     EXPECT_EQ(outcome, 0) << "not before the deadline";
-    fx.impl.sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{t0 + D}});
+    fx.impl.sweepTimedOut(t0 + D);
     EXPECT_EQ(outcome, -1) << "failed at deliveryTimeoutMs from acceptance";
     EXPECT_EQ(fx.impl.deferredCount(), 0u);
 }

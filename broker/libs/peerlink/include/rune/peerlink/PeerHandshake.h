@@ -55,7 +55,10 @@
 // Issue #241: the responder of a re-handshake with the SAME initiator incarnation installs the new epoch RECEIVE-ONLY
 // (Out.established->install) and keeps sealing under the old one until the initiator proves it holds the new epoch:
 // its Confirm, or (a legacy initiator) an authenticated frame under it (onPeerUsedEpoch).  The unconfirmed Accept is
-// re-sent every kRetryNs and an Established initiator answers it with its Confirm again.
+// re-sent every kRetryNs while the epoch is fresh (kAwaitNs after its install, the initiator's own give-up; issue #545)
+// and the initiator answers it with its Confirm again from any state whose live link holds that epoch (issue #584).
+// After kAwaitNs the Accept is no longer re-sent but the epoch stays unconfirmed: a late Confirm or authenticated frame
+// still promotes it.
 //
 // Rule 3: the link is ONE variant, each alternative holding exactly what that state needs.
 #include <rune/peerlink/ClusterKeys.h>
@@ -86,8 +89,9 @@ struct EphSecret {
     void scrub() noexcept { rune::crypto::secureZero({bytes.data(), bytes.size()}); }
 };
 /// Issue #241 - the receive-first install of a re-handshake:
-///   responder: `unconfirmedAccept` is the Accept of an epoch installed RECEIVE-ONLY, re-sent every kRetryNs until the
-///              initiator's Confirm (MAC `wantConfirm`) or an authenticated frame under the epoch promotes it;
+///   responder: `unconfirmedAccept` is the Accept of an epoch installed RECEIVE-ONLY, promoted by the initiator's
+///              Confirm (MAC `wantConfirm`) or an authenticated frame under the epoch.  Re-sent every kRetryNs only
+///              while `sinceNs` is less than kAwaitNs ago (#545); kept after that (a late promotion still works);
 ///   initiator: `confirm` is the Confirm it sent for this epoch (re-sent when the same Accept comes again) and
 ///              `acceptConfirm` the Accept MAC it verified (a re-sent Accept is recognised by a constant-time compare).
 struct Established {
@@ -191,6 +195,12 @@ public:
     [[nodiscard]] uint64_t macComputations() const noexcept { return macOps_; }
     [[nodiscard]] const LinkState& state() const noexcept { return state_; }
     [[nodiscard]] bool initiator() const noexcept { return self_ < peer_; }
+    /// Issue #554: would answering a Hello (v1 or v2) naming (from, to, keyId) cost crypto (a cookie HMAC, an X25519
+    /// base-point multiplication, the Challenge MAC)?  These are the crypto-free checks answerHello_ / answerHelloV2_
+    /// make first: a responder, the right peer pair, a key id we hold.  Anything else is refused cheaply.
+    [[nodiscard]] bool helloNeedsCrypto(int32_t from, int32_t to, uint64_t keyId) const noexcept {
+        return !initiator() && from == peer_ && to == self_ && keys_.byId(keyId) != nullptr;
+    }
     [[nodiscard]] int32_t peer() const noexcept { return peer_; }
 
 private:

@@ -19,6 +19,7 @@
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/client/shard/ShardState.h>
 #include <rune/client/subscriber/Subscription.h>
 #include <rune/node/NamespacePaths.h>
 #include <rune/node/NamespaceReaper.h>
@@ -32,6 +33,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -483,7 +485,8 @@ void recreateUnderThrottleGateway() {
 constexpr const char* kAdminPw = "namespace-admin-password-1";
 constexpr const char* kUserPw = "namespace-user-password-12";
 
-std::unique_ptr<rc::Client> newClient(AuthBroker& b, const std::string& user, std::vector<rc::TopicSpec> topics = {}) {
+std::unique_ptr<rc::Client> newClient(AuthBroker& b, const std::string& user, std::vector<rc::TopicSpec> topics = {},
+                                      bool shardStatus = false) {
     rc::ClientConfig c;
     c.gatewayChannel  = b.channel();
     c.gatewayStreamId = 1;
@@ -495,6 +498,7 @@ std::unique_ptr<rc::Client> newClient(AuthBroker& b, const std::string& user, st
     c.offerCrypto     = true;
     c.tlsTrustPem     = AuthBroker::tlsCaPem();
     c.topics          = std::move(topics);
+    c.shardStatus     = shardStatus;   // the duty thread publishes its status on a ring the test thread drains
     auto client = std::make_unique<rc::Client>(c);
     client->connectAndWait(20s);
     return client;
@@ -528,7 +532,7 @@ void txnOpen(const TCell& p) {
         c->close();
     }
     const rc::TopicHandle th{spec.topicId, 1};
-    auto ua = newClient(b, "a/ua", {spec});
+    auto ua = newClient(b, "a/ua", {spec}, /*shardStatus=*/true);
     rc::ProducerConfig tcfg;
     tcfg.acks = rc::Acks::All;
     tcfg.transactionalId = "tx";
@@ -587,6 +591,19 @@ void txnOpen(const TCell& p) {
     for (const std::string& v : snapshot()) EXPECT_EQ(v, "S") << "an aborted record is visible to read_committed";
     // The commit fails at once with a definite outcome - never by waiting out its timeout (review B1: a timeout used to
     // pass here and hid two client hangs: EndTxn 51 retried until the deadline, a RejectAll's corr-0 51 ignored).
+    if (p.variant != 0) {
+        // #784: RejectAll / Delete end the session with a corr-0 frame, and the commit below must run only after the client
+        // has failed on it - else the EndTxn goes out first and fails by the frame's code instead of "client closed".  The
+        // client's own shard status (published by its duty thread once it failed for good) is the barrier, not wall time.
+        const int16_t want = static_cast<int16_t>(p.variant == 1 ? pc::ErrorCode::NamespaceSuspended : pc::ErrorCode::SessionRevoked);
+        std::optional<rc::shard::ShardStatus> failed;
+        ASSERT_TRUE(waitFor([&] {
+            ua->pollShardStatus([&](const rc::shard::ShardStatus& st) { if (st.state == rc::shard::ShardState::Failed) failed = st; });
+            return failed.has_value();
+        }, 20s)) << "the client never failed on the session-ending frame";
+        EXPECT_EQ(failed->failure, rc::shard::ShardFailure::Rejected);
+        EXPECT_EQ(failed->rejectCode, want) << "the session-ending frame's code";
+    }
     std::string err;
     const auto t0 = std::chrono::steady_clock::now();
     try { txn.commitTransactionAndWait(15s); } catch (const std::exception& e) { err = e.what(); }

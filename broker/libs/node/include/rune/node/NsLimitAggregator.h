@@ -119,6 +119,8 @@ public:
         return slot < slots_.capacity() ? sentUntil_[static_cast<std::size_t>(slot) * kThrottleKinds + static_cast<std::size_t>(k)] : 0;
     }
     [[nodiscard]] const NsSlotTable& slotsForTest() const noexcept { return slots_; }
+    /// Test seam: how many slots the last tick visited.
+    [[nodiscard]] uint32_t visitedLastTickForTest() const noexcept { return visitedLastTick_; }
 
 private:
     struct Event {
@@ -135,6 +137,7 @@ private:
     int64_t     lastTickNs_ = 0;
     bool        started_ = false;
     uint64_t    staleReports_ = 0;
+    uint32_t    visitedLastTick_ = 0;
     std::vector<uint64_t> last_;        // [slot][source][metric]
     std::vector<uint64_t> total_;       // [slot][metric]
     std::vector<uint64_t> prevTotal_;   // [slot][metric] at the previous tick (rates)

@@ -697,7 +697,12 @@ struct PhaseRig {
     std::map<rc::Token, Seenc> seen;
     int64_t                 now = 1'000'000'000;
     int                     subscribes = 0;
-    rune::client::group::SendFn send = [](int32_t, const uint8_t*, std::size_t) { return true; };
+    int                     sends = 0;   // frames the hub sent through `send`
+    static bool sendThunk(void* ctx, int32_t, const uint8_t*, std::size_t) {
+        ++static_cast<PhaseRig*>(ctx)->sends;
+        return true;
+    }
+    rune::client::group::SendFn send{&sendThunk, this};
     const rc::TopicPartition p0{kTopic, 0}, p1{kTopic, 1};
 
     static uint32_t leader(void*, int32_t, int32_t) { return 0; }
@@ -1048,17 +1053,122 @@ TEST(GroupSeekRegression, DriveRewindsAllocatesNothingIdleOrPendingAdversarialRe
     EXPECT_EQ(idleAllocs, 0) << "driveRewinds allocated with no rewind pending";
     EXPECT_EQ(idleWork, 0);
     constexpr rc::Token T = 9;
-    int sends = 0;
-    r.send = [&sends](int32_t, const uint8_t*, std::size_t) { ++sends; return true; };
     r.seekToCommitted(T);
     for (int i = 0; i < 300; ++i) { r.now += 1'000'000; (void)r.hub.driveRewinds(r.now, PhaseRig::kSid, r.send); }   // warm: scratch sized
-    const int warmSends = sends;
+    const int warmSends = r.sends;
     alloc_counter::startThisThread();
     for (int i = 0; i < 5'000; ++i) { r.now += 1'000'000; (void)r.hub.driveRewinds(r.now, PhaseRig::kSid, r.send); }
     const long pendingAllocs = alloc_counter::stopThisThread();
     EXPECT_EQ(pendingAllocs, 0) << "driveRewinds allocated while a rewind waited for its fetch";
-    EXPECT_GT(sends, warmSends) << "the window never re-sent the fetch (the attack did not reach the send path)";
+    EXPECT_GT(r.sends, warmSends) << "the window never re-sent the fetch (the attack did not reach the send path)";
     EXPECT_EQ(r.seen[T].times, 0) << "the rewind ended inside the window (deadline 30 s)";
+}
+
+// ===========================================================================
+// #718: activeRewinds_ is the count of non-NoRewind impls; driveRewinds returns at once when it is 0
+// ===========================================================================
+
+// One rewind per outcome: Ok, Timeout, SessionLost, Superseded (the count stays 1 across the swap), Closed, Rejoined,
+// and a parked one (issued while the coordinator session is down) counts as 1.  Every completion brings the count
+// back to 0.  Mutation: skip the decrement in release() / completeRewind_'s setRewind_ -> the count stays 1.
+TEST(GroupSeekRegression, ActiveRewindCountTracksEveryCompletionRegression) {
+    using S = rc::OpStatus;
+    constexpr rc::Token T1 = 1, T2 = 2;
+    {   // Ok
+        PhaseRig r;
+        ASSERT_EQ(r.hub.activeRewinds(), 0u);
+        r.seek(T1, 3);
+        EXPECT_EQ(r.hub.activeRewinds(), 1u);
+        r.bindAll(); r.drive();
+        ASSERT_EQ(r.seen[T1].times, 1); EXPECT_EQ(r.seen[T1].status, S::Ok);
+        EXPECT_EQ(r.hub.activeRewinds(), 0u) << "Ok";
+    }
+    {   // Timeout
+        PhaseRig r;
+        r.seekToCommitted(T1);
+        r.drive();
+        EXPECT_EQ(r.hub.activeRewinds(), 1u);
+        r.now += 3600LL * 1'000'000'000LL;
+        r.drive();
+        ASSERT_EQ(r.seen[T1].times, 1); EXPECT_EQ(r.seen[T1].status, S::Timeout);
+        EXPECT_EQ(r.hub.activeRewinds(), 0u) << "Timeout";
+    }
+    {   // SessionLost
+        PhaseRig r;
+        r.seekToCommitted(T1);
+        r.drive();
+        EXPECT_EQ(r.hub.activeRewinds(), 1u);
+        r.hub.setSessionConnected(false);
+        r.drive();
+        ASSERT_EQ(r.seen[T1].times, 1); EXPECT_EQ(r.seen[T1].status, S::SessionLost);
+        EXPECT_EQ(r.hub.activeRewinds(), 0u) << "SessionLost";
+    }
+    {   // Superseded: the count stays 1 across the swap
+        PhaseRig r;
+        r.seek(T1, 3);
+        EXPECT_EQ(r.hub.activeRewinds(), 1u);
+        r.seek(T2, 5);
+        ASSERT_EQ(r.seen[T1].times, 1); EXPECT_EQ(r.seen[T1].status, S::Superseded);
+        EXPECT_EQ(r.hub.activeRewinds(), 1u) << "the second rewind is pending";
+        r.bindAll(); r.drive();
+        ASSERT_EQ(r.seen[T2].times, 1);
+        EXPECT_EQ(r.hub.activeRewinds(), 0u) << "Superseded + Ok";
+    }
+    {   // Closed (release mid-rewind)
+        PhaseRig r;
+        r.seek(T1, 3);
+        EXPECT_EQ(r.hub.activeRewinds(), 1u);
+        r.hub.applyCommandDirect(r.cmd(PhaseRig::Op::GroupClose, 0), r.now);
+        r.drive();
+        ASSERT_EQ(r.seen[T1].times, 1); EXPECT_EQ(r.seen[T1].status, S::Closed);
+        EXPECT_EQ(r.hub.activeRewinds(), 0u) << "Closed";
+        (void)r.hub.release(r.impl.get());
+        EXPECT_EQ(r.hub.activeRewinds(), 0u) << "release() after the close";
+    }
+    {   // Rejoined
+        PhaseRig r;
+        r.seek(T1, 3);
+        EXPECT_EQ(r.hub.activeRewinds(), 1u);
+        r.hub.onCoordinatorMoved();
+        r.drive();
+        ASSERT_EQ(r.seen[T1].times, 1); EXPECT_EQ(r.seen[T1].status, S::Rejoined);
+        EXPECT_EQ(r.hub.activeRewinds(), 0u) << "Rejoined";
+    }
+    {   // parked (issued while the coordinator session is down) counts as 1, then completes
+        PhaseRig r;
+        r.hub.setSessionConnected(false);
+        r.seekToCommitted(T1);
+        EXPECT_EQ(r.hub.activeRewinds(), 1u) << "a parked rewind is active";
+        r.now += 3600LL * 1'000'000'000LL;
+        r.drive();
+        ASSERT_EQ(r.seen[T1].times, 1); EXPECT_EQ(r.seen[T1].status, S::Timeout);
+        EXPECT_EQ(r.hub.activeRewinds(), 0u) << "a parked rewind that timed out";
+    }
+}
+
+// Hot path: driveRewinds runs on every duty pass.  With 8 consumers and no rewind it allocates nothing and does not
+// even visit a consumer.  Mutation: drop the activeRewinds_ == 0 early return -> visited > 0.
+TEST(GroupSeekRegression, DriveRewindsWithNoneActiveAllocatesNothingRegression) {
+    PhaseRig r;
+    std::vector<std::unique_ptr<PhaseRig::Impl>> extra;
+    for (int i = 0; i < 7; ++i) {
+        auto e = std::make_unique<PhaseRig::Impl>();
+        e->groupId = "g" + std::to_string(i);
+        e->topicIds = {kTopic};
+        e->state = rc::GroupConsumerState::Unjoined;
+        e->active = true;
+        r.hub.add(e.get());
+        extra.push_back(std::move(e));
+    }
+    for (int i = 0; i < 100; ++i) { r.now += 1'000'000; (void)r.hub.driveRewinds(r.now, PhaseRig::kSid, r.send); }
+    const std::size_t visitedBefore = r.hub.rewindImplsVisitedForTest();
+    alloc_counter::startThisThread();
+    int work = 0;
+    for (int i = 0; i < 10'000; ++i) { r.now += 1'000'000; work += r.hub.driveRewinds(r.now, PhaseRig::kSid, r.send); }
+    const long allocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(allocs, 0);
+    EXPECT_EQ(work, 0);
+    EXPECT_EQ(r.hub.rewindImplsVisitedForTest() - visitedBefore, 0u) << "walked consumers with no rewind outstanding";
 }
 
 // ===========================================================================

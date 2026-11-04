@@ -1095,8 +1095,7 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
 
     // Build the bounded SkimpyOffsetMap over [globalDirtyStart, activeBase).
     // The map scan stops when the map is full; latestOffset() is the boundary.
-    std::size_t maxSlots = SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes);
-    SkimpyOffsetMap map(maxSlots > 0 ? maxSlots : 1);
+    SkimpyOffsetMap map(SkimpyOffsetMap::sizingForBudget(dedupeBufferBytes));   // #658: the table fits the budget
 
     // CP-8: throttle the offset-map build (read phase).
     // We read each segment file during buildOffsetMapFromBases; accumulate bytes
@@ -1779,8 +1778,7 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
     if (globalDirtyStart < 0) globalDirtyStart = 0;
 
     // Build offset map over the full dirty range.
-    std::size_t maxSlots = SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes);
-    SkimpyOffsetMap map(maxSlots > 0 ? maxSlots : 1);
+    SkimpyOffsetMap map(SkimpyOffsetMap::sizingForBudget(dedupeBufferBytes));   // #658: the table fits the budget
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
     if (damaged_.has_value()) { result.passEnd = globalDirtyStart; return result; }   // incomplete state: no advance, nothing written
     if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);   // M3

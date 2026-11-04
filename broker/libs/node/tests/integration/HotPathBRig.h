@@ -86,7 +86,7 @@ struct Rig {
     std::unique_ptr<rune::node::SegmentProvisionerAgent> prov;   ///< driven on the test thread (its own "thread")
 
     explicit Rig(bool controllerManaged = false, int64_t rollBytes = 64 * 1024 * 1024, const fs::path* at = nullptr,
-                 bool provisioned = false, bool withFollower = false) {
+                 bool provisioned = false, bool withFollower = false, int32_t partitionTopicId = 1) {
         dir.p = at ? *at : ownDir.p;
         log = std::make_unique<rune::storage::Log>(dir.p.string(), rollBytes);
         log->recover();
@@ -96,7 +96,7 @@ struct Rig {
             log->setProvisioning(prov->channel(), 50);
         }
         PartitionConfig c;
-        c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+        c.topicId = partitionTopicId; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
         c.replicaLagMaxOffset = 1'000'000'000;
         c.followerFlushIntervalNs = 0;
         const std::vector<int32_t> set = withFollower ? std::vector<int32_t>{1, 2} : std::vector<int32_t>{1};

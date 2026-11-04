@@ -162,6 +162,10 @@ struct Rig {
         ASSERT_TRUE(hub.onCoordinatorResponse(f.templateId, f.data(), f.len, now));
     }
     void answerFrame(const Capture::Frame& f, rp::ReqKind kind, int16_t code) {
+        if (kind == rp::ReqKind::TxnOffsetCommit) {   // #737/#738: name every entry the request carried
+            answer(FakeCoordinator::answerCommitNaming(cap.data(f), f.len, f.corrId, code));
+            return;
+        }
         answer(FakeCoordinator::answer(kind, f.corrId, code));
     }
     /// initTransactions answered OK, then beginTransaction().
@@ -989,10 +993,66 @@ TEST(ProducerTxnControlRegression, LiveProducerFailAllCompletesControlOpsWithThe
 namespace {
 /// A late / duplicate answer: routed to us (ours), changes nothing.
 void answerLate(Rig& r, const Capture::Frame& f, rp::ReqKind kind, int16_t code) {
-    const auto a = FakeCoordinator::answer(kind, f.corrId, code);
+    const auto a = kind == rp::ReqKind::TxnOffsetCommit
+                       ? FakeCoordinator::answerCommitNaming(r.cap.data(f), f.len, f.corrId, code)
+                       : FakeCoordinator::answer(kind, f.corrId, code);
     (void)r.hub.onCoordinatorResponse(a.templateId, a.data(), a.len, r.now);
 }
 }  // namespace
+
+// #738 x unrequested results: the TxnOffsetCommit answer names every requested entry Ok and also an entry that was
+// never asked for (another topic) with ProducerFenced.  The call's verdict is the requested entries': it completes Ok
+// and the producer is not fenced.
+// RED (mutation): the verdict ranks every result of the answer - the call fails Fenced.
+TEST(ProducerTxnOffsetsRegression, UnrequestedTxnOffsetCommitResultsAreIgnoredRegression) {
+    Rig r;
+    r.inTxn();
+    const auto offs = offsetsOf(3);
+    const Token t   = r.sendOffsets(offs);
+    r.tick();
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    const auto oc = r.lastOf(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    const auto q  = rpc::TxnOffsetCommit::decode(r.cap.data(oc), oc.len);
+    ASSERT_TRUE(q.has_value());
+    std::vector<rpc::TxnPartitionResult> res;
+    for (const auto& e : q->entries) res.push_back({e.topicId, e.partition, 0});
+    res.push_back({99, 0, ec(rpc::ErrorCode::ProducerFenced)});
+    test_support::AnswerFrame a;
+    rpc::TxnOffsetCommitResponse m;
+    m.correlationId = oc.corrId;
+    a.len        = m.encode(a.buf.data(), std::span<const rpc::TxnPartitionResult>(res.data(), res.size()));
+    a.templateId = rpc::TxnOffsetCommitResponse::TEMPLATE_ID;
+    r.answer(a);
+    ASSERT_EQ(r.d(t).times, 1);
+    EXPECT_EQ(r.d(t).status, OpStatus::Ok) << "an unrequested result decided the call";
+    EXPECT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction);
+}
+
+// #738 x an omitted entry: the answer names only some requested entries - the call fails (InvalidRequest), never Ok.
+TEST(ProducerTxnOffsetsRegression, TxnOffsetCommitAnswerOmittingAnEntryFailsTheCallRegression) {
+    Rig r;
+    r.inTxn();
+    const auto offs = offsetsOf(3);
+    const Token t   = r.sendOffsets(offs);
+    r.tick();
+    r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+    r.tick();
+    const auto oc = r.lastOf(rpc::TxnOffsetCommit::TEMPLATE_ID);
+    const auto q  = rpc::TxnOffsetCommit::decode(r.cap.data(oc), oc.len);
+    ASSERT_TRUE(q.has_value());
+    std::vector<rpc::TxnPartitionResult> res;
+    for (const auto& e : q->entries) res.push_back({e.topicId, e.partition, 0});
+    res.pop_back();
+    test_support::AnswerFrame a;
+    rpc::TxnOffsetCommitResponse m;
+    m.correlationId = oc.corrId;
+    a.len        = m.encode(a.buf.data(), std::span<const rpc::TxnPartitionResult>(res.data(), res.size()));
+    a.templateId = rpc::TxnOffsetCommitResponse::TEMPLATE_ID;
+    r.answer(a);
+    ASSERT_EQ(r.d(t).times, 1);
+    EXPECT_NE(r.d(t).status, OpStatus::Ok) << "an entry the broker never answered counted as committed";
+}
 
 // sendOffsets is two-phase (AddOffsetsToTxn -> TxnOffsetCommit) and completes exactly once - never at phase 1,
 // never twice on duplicates; a commit waits for the offsets (they are part of the transaction).

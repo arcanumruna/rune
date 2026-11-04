@@ -1327,7 +1327,7 @@ TEST(HubCommandClient, ARefusedHeadFrameNeverHoldsTheCommandRingPastTheResponseT
 // an int64-overflowed deadline in the past.  RED (no clamp): the drain is cut at
 // once — the in-flight record completes Closed and the deadline counter is 1.
 TEST(HubCommandClient, CloseTimeoutHugeIsClampedNotOverflowedRegression) {
-    HubRig r(4604, 0, nullptr, /*closeTimeoutMs=*/INT64_MAX);
+    HubRig r(4604, 0, nullptr, /*closeTimeoutMs=*/2'592'000'000);   // the 30-day cap (INT64_MAX is refused, E1)
     r.connect();
     r.gw.replyAcks = false;
     rc::ProducerConfig pc;

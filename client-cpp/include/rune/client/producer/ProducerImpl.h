@@ -1309,7 +1309,7 @@ public:
 
     /// Called from Client::sweepTimeouts(): fail in-flight batches past the
     /// delivery timeout, and fail + drop never-sent records past it.
-    void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
+    void sweepTimedOut(int64_t nowNs);
 
     // ---- Accessors -----------------------------------------------------------
 

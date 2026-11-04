@@ -9,6 +9,16 @@
 // rings — shared-nothing; nothing here is read by another thread).
 //
 // Runs only for AuthMode::Enabled with more than one peer; InProcessUnauthenticated / DevDisabled build none.
+//
+// Issue #554 / #683, a per-peer handshake work budget: a Hello / HelloV2 is unauthenticated, yet answering one costs a
+// cookie HMAC, an X25519 base-point multiplication and the Challenge MAC on the CONTROL thread (which also runs
+// consensus).  Each duty cycle answers at most kHelloAnswersPerPeerPerCycle crypto-costing Hellos PER PEER; the rest
+// are dropped and counted (helloShedOf / helloShed, metric rune-peer-hello-shed).  The budget is charged only AFTER the
+// frame decoded and passed the crypto-free checks (PeerHandshake::helloNeedsCrypto: a responder, the right pair, a key
+// id we hold), so garbage and the cheap refusals are never charged and a flood naming one peer cannot starve another's
+// real Hello.  Worst case per duty cycle: min(8 polled fragments, peers) answers.  Residual: a flood that forges a
+// valid key id for peer X still competes with X's real Hello; X re-sends every PeerHandshake::kRetryNs and gets one
+// answer per cycle, so it still links, only more slowly.  Every other frame is unbudgeted.
 #include <rune/aeronutil/AeronPump.h>
 #include <rune/aeronutil/FragmentAssembler.h>
 #include <rune/consensus/PeerResolution.h>
@@ -70,6 +80,14 @@ public:
     /// Refusals logged by this broker, both directions (counter 1'000'234); monotonic.
     [[nodiscard]] uint64_t refusals() const noexcept { return refusals_; }
     [[nodiscard]] uint64_t malformedFrames() const noexcept { return malformed_; }
+    /// Issue #554: Hellos answered within the budget / dropped over it (both monotonic); shed per peer and in total.
+    [[nodiscard]] uint64_t helloAnswered() const noexcept { return helloAnswered_; }
+    [[nodiscard]] uint64_t helloShed() const noexcept { return helloShedTotal_; }
+    [[nodiscard]] uint64_t helloShedOf(int32_t peer) const noexcept {
+        for (const auto& p : peers_) if (p.id == peer) return p.helloShed;
+        return 0;
+    }
+    static constexpr uint8_t kHelloAnswersPerPeerPerCycle = 1;
     [[nodiscard]] const rune::peerlink::LinkState* stateOf(int32_t peer) const noexcept;
 
 private:
@@ -78,9 +96,12 @@ private:
         rune::peerlink::PeerHandshake   hs;
         uint64_t                        authSeen = 0;   // the transports' authenticated-frame total last observed
         uint64_t                        refusals = 0;   // this peer's: the log is rate-limited (first, then every 64th ~ 13 s)
+        uint8_t                         helloBudget = 0;   // crypto-costing Hellos still answerable this cycle (#554)
+        uint64_t                        helloShed = 0;     // this peer's Hellos dropped over the budget (#554)
     };
 
     void onFrame_(const uint8_t* b, std::size_t len, int64_t nowNs);
+    [[nodiscard]] bool admitHello_(PeerSlot& p, int32_t from, int32_t to, uint64_t keyId) noexcept;
     void absorb_(PeerSlot& p, rune::peerlink::PeerHandshake::Out&& o, int64_t nowNs);
     [[nodiscard]] PeerSlot* slot_(int32_t id) noexcept;
 
@@ -94,6 +115,8 @@ private:
     uint64_t                                 refusals_ = 0;
     uint64_t                                 malformed_ = 0;
     int64_t                                  lastNowNs_ = 0;   // the pass's clock, for the fragment handler
+    uint64_t                                 helloAnswered_ = 0;
+    uint64_t                                 helloShedTotal_ = 0;
 };
 
 } // namespace rune::node

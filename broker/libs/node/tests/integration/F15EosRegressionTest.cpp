@@ -5944,7 +5944,7 @@ TEST(PsmLogConsistencyRegression, ProducerTailsAreBoundedByTheCleanerBudget) {
     // I1 (bound): the tails map lives inside the dedupe budget; past its cap it
     // never grows — unrecorded producers keep their metadata conservatively
     // (never the contract), and expiry still applies.
-    rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::maxSlotsFromBudget(1 << 20));
+    rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::sizingForBudget(1 << 20));
     EXPECT_LT(map.producerTails().capacity(), rune::storage::ProducerTails::kUnbounded);
     rune::storage::ProducerTails t(2);
     t.note(1, 10, 100);
