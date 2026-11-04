@@ -716,11 +716,8 @@ public:
 #if defined(__linux__)
         if (systemMetrics_ != nullptr) {
             const int s = systemMetrics_->doWork(nowNs);
-            if (s != 0) {
-                std::atomic_ref<uint64_t> n(systemSamples_);
-                n.store(n.load(std::memory_order_relaxed) + static_cast<uint64_t>(s), std::memory_order_relaxed);
-                work += s;
-            }
+            systemSamples_ += static_cast<uint64_t>(s);
+            work += s;
         }
 #endif
         return work;
@@ -731,10 +728,8 @@ public:
     /// systemMetrics_, initialised on the start thread; after this call only this agent's thread touches it, and
     /// BrokerNode joins this runner before it resets the pointee.
     void adoptSystemMetrics(metrics::SystemMetrics* sm) noexcept { systemMetrics_ = sm; }
-    /// Test-only, any thread: samples this agent has taken.
-    [[nodiscard]] uint64_t systemMetricsSamplesForTest() const noexcept {
-        return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(systemSamples_)).load(std::memory_order_relaxed);
-    }
+    /// Test-only, ADMIN thread only (call inside onAdminThreadForTest): samples this agent has taken.
+    [[nodiscard]] uint64_t systemMetricsSamplesForTest() const noexcept { return systemSamples_; }
 #endif
 
     /// admin → control ring (T10; F3 r6 extended): kA2cStorageFailure
@@ -1112,7 +1107,7 @@ private:
     uint64_t         reportedPeerDrops_    = 0;
 #if defined(__linux__)
     metrics::SystemMetrics* systemMetrics_ = nullptr;   // #632: borrowed from BrokerNode; admin thread only after start
-    uint64_t                systemSamples_ = 0;         // written by the admin thread, read via atomic_ref (test seam)
+    uint64_t                systemSamples_ = 0;         // admin thread only (the test reads it via onAdminThreadForTest)
 #endif
     uint64_t         badRequestFrames_ = 0;        // request-ring frames of an unknown type
     // Fix round 2: preallocated, bounded (was an unbounded vector<vector> with
@@ -2197,7 +2192,8 @@ public:
     /// Test-only (#632): process-metrics samples the admin agent has taken; 0 when there is no agent or no sampler.
     [[nodiscard]] uint64_t adminSystemMetricsSamplesForTest() const noexcept {
 #if defined(__linux__)
-        return adminWorkerAgent_ ? adminWorkerAgent_->systemMetricsSamplesForTest() : 0;
+        if (!started_ || stopped_ || !adminWorkerAgent_ || !adminWorkerRunner_) return 0;
+        return onAdminThreadForTest([this]() -> uint64_t { return adminWorkerAgent_->systemMetricsSamplesForTest(); });
 #else
         return 0;
 #endif
@@ -2212,6 +2208,10 @@ public:
     /// Test-only: the cleaner's dedupe map budget (-2 = no cleaner).
     [[nodiscard]] int64_t cleanerDedupeBufferBytesForTest() const noexcept {
         return cleanerAgent_ ? cleanerAgent_->dedupeBufferBytesForTest() : -2;
+    }
+    /// Test-only (#658): bytes the cleaner's dedupe table really allocated (-2 = no cleaner).
+    [[nodiscard]] int64_t cleanerDedupeTableBytesForTest() const noexcept {
+        return cleanerAgent_ ? static_cast<int64_t>(cleanerAgent_->dedupeTableBytes()) : -2;
     }
     /// D25: completed log-cleaner cycles (0 when there is no cleaner) — tests
     /// wait on cleaner progress instead of sleeping.
