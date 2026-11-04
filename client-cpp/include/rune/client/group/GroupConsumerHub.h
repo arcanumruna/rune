@@ -353,6 +353,9 @@ public:
     /// instance: the stream it can no longer serve): the consumer is finished RefusedByBroker, never re-armed.
     /// False when not a live filtered group fetch.
     bool onFetchInvalidRequest(int64_t corrId);
+    /// #839: a subscription-scoped error (correlationId 0, the subscription named in the message): when
+    /// `subscriptionId` is one of a member's fetch subscriptions, finishes that consumer with `why`.
+    bool onFetchScopedError(int64_t subscriptionId, GroupFailReason why);
     /// Authentication (D26): the session was revoked — every active consumer is finished SessionRevoked.
     int revokeAll();
     /// M2: Unsubscribes the transport refused, re-offered by the duty cycle

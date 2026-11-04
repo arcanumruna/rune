@@ -211,6 +211,13 @@ enum class GroupFailReason : int32_t {
     /// Phase 2c: the group already runs with another filter (the first member fixes it), or this client cannot
     /// apply the group's filter (a non-routed hub).  Not retriable: recreate with the group's filter.
     FilterMismatch = 6,
+    /// #839: a partition leader parked this member's fetch subscription because a stored batch is damaged
+    /// (StorageError).  The consumer is finished; the partition cannot be read past the damage until an operator
+    /// repairs the log.
+    CorruptBatch = 7,
+    /// #839: a partition leader parked this member's fetch subscription because its next batch cannot be
+    /// delivered (MessageTooLarge).  The consumer is finished.
+    UndeliverableBatch = 8,
 };
 
 struct GroupConsumerStatus {

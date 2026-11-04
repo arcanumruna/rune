@@ -4574,6 +4574,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     [this](int32_t /*streamId*/, const uint8_t* fbuf, std::size_t flen) -> bool {
                         return agent_.submitSend(fbuf, flen);
                     });
+                // #839: the same scoped error fails a group member whose fetch subscription it names.
+                (void)groupConsumerHub_.onFetchScopedError(
+                    subId, ec == rpc::ErrorCode::StorageError ? GroupFailReason::CorruptBatch
+                                                              : GroupFailReason::UndeliverableBatch);
             }
         }
 

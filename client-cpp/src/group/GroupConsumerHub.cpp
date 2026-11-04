@@ -1316,6 +1316,20 @@ bool GroupConsumerHub::onFetchInvalidRequest(int64_t corrId)
     return false;
 }
 
+bool GroupConsumerHub::onFetchScopedError(int64_t subscriptionId, GroupFailReason why)
+{
+    if (subscriptionId <= 0) return false;
+    for (GroupConsumerImpl* impl : impls_) {
+        if (!impl->active) continue;
+        for (auto& [tp, fs] : impl->fetch) {
+            if (fs.epoch == 0 || fs.subscriptionId != subscriptionId) continue;
+            refuse_(*impl, why);
+            return true;
+        }
+    }
+    return false;
+}
+
 int GroupConsumerHub::revokeAll()
 {
     int n = 0;
