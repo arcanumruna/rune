@@ -669,7 +669,9 @@ TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchMidSegmentNeverTruncates
     std::array<std::string, 4> firstLost{};
     // Engines: 0 range, 1 range + coalesce, 2 one file (produceCleanedFileBounded), 3 one group (produceCleanedGroupBounded).
     for (int engine = 0; engine < 4; ++engine) {
-        for (std::size_t i = 0; i < victimTotal; ++i) {
+        // i == victimTotal is the CONTROL: no flip.  Since #839 a flip of the un-CRC-covered header bytes (baseOffset, magic) is
+        // damage too, so every flip leaves the log uncleanable; the control keeps the "the pass really rewrites" guard non-vacuous.
+        for (std::size_t i = 0; i <= victimTotal; ++i) {
             SCOPED_TRACE("engine " + std::to_string(engine) + " flip " + std::to_string(i));
             const auto dir = tempDir();
             {
@@ -679,7 +681,7 @@ TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchMidSegmentNeverTruncates
                 const auto at = findBatch(log.dir(), kVictim);
                 ASSERT_TRUE(at.has_value());
                 ASSERT_EQ(std::stoll(at->file.stem().string()), 0) << "the victim shares the first segment with the dup pair";
-                xorByteAt(at->file, at->pos + i, 0x5A);
+                if (i < victimTotal) xorByteAt(at->file, at->pos + i, 0x5A);
                 const std::set<int64_t> before = diskDataOffsets(log.dir());
                 if (i < 8 || i >= 12) ASSERT_TRUE(before.count(kVictim + 1)) << "the record right behind the damaged batch is on disk";
                 if (engine < 2) {
@@ -714,7 +716,7 @@ TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchMidSegmentNeverTruncates
             if (::testing::Test::HasFatalFailure()) return;
         }
     }
-    EXPECT_EQ(cases, static_cast<int>(4 * victimTotal));
+    EXPECT_EQ(cases, static_cast<int>(4 * (victimTotal + 1)));
     EXPECT_GT(rewrote, 0) << "the pass must really rewrite the damaged segment";
     for (int e = 0; e < 4; ++e)
         EXPECT_EQ(lostCases[e], 0) << "engine " << e << ": " << lostCases[e] << " of " << victimTotal << " damage cases lost intact data; first: " << firstLost[e];
@@ -1278,4 +1280,42 @@ TEST(CheckedWritesVerdictCleanerRegression, ASegmentCutAtEveryLengthRefusesOnlyT
         restore.write(whole.data(), static_cast<std::streamsize>(whole.size()));
     }
     std::filesystem::remove_all(dir);
+}
+
+// F5 (#839): baseOffset and magic are not covered by the batch CRC.  The cleaner's walk treats a bad one as damage
+// (the log is uncleanable, the segment is never rewritten), exactly like a CRC failure.
+TEST(CheckedWritesVerdictCleanerRegression, UnCrcCoveredHeaderFlipMakesTheLogUncleanableRegression) {
+    for (int c = 0; c < 2; ++c) {
+        SCOPED_TRACE(c == 0 ? "baseOffset" : "magic");
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/900);
+            log.recover();
+            for (int64_t o = 0; o < 40; ++o) data(log, o, "k" + std::to_string(o % 3), "v");   // plenty of dead duplicates
+            const auto victim = findBatch(log.dir(), 6);
+            ASSERT_TRUE(victim.has_value());
+            std::ifstream in(victim->file, std::ios::binary);
+            std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            in.close();
+            const std::size_t at = victim->pos + (c == 0 ? 0 : 16);
+            // baseOffset 6: clear its lowest set bit (lowers it below the expected offset); magic: xor it.
+            const uint8_t b = static_cast<uint8_t>(raw.at(at));
+            ASSERT_NE(b, 0);
+            xorByteAt(victim->file, at, c == 1 ? 0x5A : static_cast<uint8_t>(b & -b));
+            const int64_t victimBase = std::stoll(victim->file.stem().string());
+            auto bases = log.segmentBaseOffsets();
+            const int64_t active = bases.back();
+            bases.pop_back();
+            auto bytes = [](const std::filesystem::path& f) {
+                std::ifstream i2(f, std::ios::binary);
+                return std::vector<char>((std::istreambuf_iterator<char>(i2)), std::istreambuf_iterator<char>());
+            };
+            const auto before = bytes(victim->file);
+            LogCleaner cleaner;
+            EXPECT_FALSE(cleaner.produceCleanedFileBounded(log.dir(), bases, victimBase, active, 0, 0, 1000, 1 << 20, nullptr, 1'000'000).compacted);
+            EXPECT_TRUE(cleaner.uncleanable());
+            EXPECT_EQ(bytes(victim->file), before) << "the damaged segment is never rewritten";
+        }
+        std::filesystem::remove_all(dir);
+    }
 }

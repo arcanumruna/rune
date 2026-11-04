@@ -40,6 +40,8 @@
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <thread>
 #include <unistd.h>
@@ -1471,7 +1473,7 @@ std::vector<uint8_t> concat(std::initializer_list<std::vector<uint8_t>> parts) {
 struct LegacyAcksRig {
     struct Answer { bool inlineError; int16_t code; int64_t base; int64_t corr = 0; };
     TmpDir d;
-    rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", 1}}, d.path.string()};
+    rune::gateway::TopicRegistry topics;
     NullTransport t;
     ReplicaRegistry reg;
     WorkerPool pool{1, rune::metadata::ShardRouter(1), 1 << 16, 1 << 16, 16, 16};
@@ -1487,8 +1489,14 @@ struct LegacyAcksRig {
     PartitionReplica* r = nullptr;
     int64_t sid = 0;
     int64_t now = 1;
+    static rune::node::TopicSpec topicSpecWithRoll(int64_t segmentRollBytes) {
+        rune::node::TopicSpec ts{"t", 1};
+        ts.segmentRollBytes = segmentRollBytes;
+        return ts;
+    }
     explicit LegacyAcksRig(std::vector<NodeId> isr = {1, 2}, uint8_t tier = 1, int minIsr = 1,
-                           int64_t replicaLagMaxMs = 1'000'000) {
+                           int64_t replicaLagMaxMs = 1'000'000, int64_t segmentRollBytes = 64LL << 20)
+        : topics({topicSpecWithRoll(segmentRollBytes)}, d.path.string()) {
         auto c = cfg(1, tier, 0, 0);
         c.minIsr = minIsr;
         c.replicaLagMaxMs = replicaLagMaxMs;
@@ -3226,6 +3234,115 @@ TEST(ReturnOverflowRegression, GatewayFailsSubscriptionOnOversizeBatchWithoutSpi
     // re-subscribe past the batch recovers.
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_EXIT(gatewayOversizeChild(), ::testing::ExitedWithCode(0), "");
+}
+
+
+// ===========================================================================
+// #839: damage helpers (copied from the B1 storage tests): a sealed segment's 2nd batch gets one flipped byte.
+// ===========================================================================
+namespace corruptutil {
+inline std::vector<std::size_t> batchStarts(const std::string& logPath) {
+    std::ifstream in(logPath, std::ios::binary);
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), {});
+    std::vector<std::size_t> out;
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
+        rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+        const int32_t total = r.totalLength();
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
+        out.push_back(pos);
+        pos += static_cast<std::size_t>(total);
+    }
+    return out;
+}
+inline void xorByteAt(const std::string& path, std::size_t pos, uint8_t mask = 0x5A) {
+    std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+    f.seekg(static_cast<std::streamoff>(pos));
+    char c = 0;
+    f.read(&c, 1);
+    c = static_cast<char>(static_cast<uint8_t>(c) ^ mask);
+    f.seekp(static_cast<std::streamoff>(pos));
+    f.write(&c, 1);
+}
+inline int64_t batchBaseAt(const std::string& logPath, std::size_t p) {
+    std::ifstream in(logPath, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(p));
+    std::vector<uint8_t> hdr(static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead));
+    in.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
+    return rune::protocol::RecordBatchReader(hdr.data(), hdr.size()).baseOffset();
+}
+/// The lowest-base .log file of a partition directory ("" = none).
+inline std::string firstSegment(const std::filesystem::path& dir) {
+    std::string best;
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().extension() == ".log" && (best.empty() || e.path().string() < best)) best = e.path().string();
+    return best;
+}
+/// Flip the first record byte of segment 0's 2nd batch; returns that batch's first offset (-1 = could not).
+inline int64_t damageSecondBatchOfSegment0(const std::filesystem::path& dir) {
+    const std::string seg0 = firstSegment(dir);
+    if (seg0.empty()) return -1;
+    const auto starts = batchStarts(seg0);
+    if (starts.size() < 2) return -1;
+    const int64_t d = batchBaseAt(seg0, starts[1]);
+    xorByteAt(seg0, starts[1] + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead));
+    return d;
+}
+}  // namespace corruptutil
+
+namespace {
+[[noreturn]] void gatewayCorruptChild() {
+    // 2 KiB segments: the log rolls many times; every roll is sealed inline so the recovery point passes it.
+    LegacyAcksRig R({1}, 1, 1, 1'000'000, 2048);
+    rune::storage::Log* log = R.r->log();
+    log->setDeferSealSync(false);
+    for (int64_t i = 0; i < 400 && log->segmentBaseOffsets().size() < 4; ++i) (void)log->append(batchAt(i), i);
+    R.r->onLeaderLogAppended();
+    log->sync();
+    const auto bases = log->segmentBaseOffsets();
+    if (bases.size() < 4) std::_Exit(10);
+    const int64_t D = corruptutil::damageSecondBatchOfSegment0(log->dir());
+    if (D <= 0 || !log->reloadSegments() || log->damagedSegmentCount() != 1u) std::_Exit(11);
+    auto subscribe = [](LegacyAcksRig& R, int64_t corr, int64_t from) {
+        pc::Subscribe sub;
+        sub.sessionId = R.sid; sub.correlationId = corr; sub.topicId = 0; sub.partition = 0;
+        sub.partitionKnown = 1; sub.fromOffset = from; sub.isolation = 0;
+        std::vector<uint8_t> frame(sub.encodedSize());
+        sub.encode(frame.data());
+        R.gw.applySubscribeForTest(frame.data(), frame.size());
+    };
+    R.gw.setOnEgressFrame([&R](int64_t, const uint8_t* b, std::size_t n) {
+        if (auto rec = pc::Records::decode(b, n)) R.records.emplace_back(rec->subscriptionId, rec->baseOffset);
+    });
+    R.runWorker();
+    subscribe(R, 77, 0);                                  // reaches the damage at D
+    for (int i = 0; i < 8; ++i) { R.gw.pushSubscriptionsForTest(); R.runWorker(); }
+    std::size_t storageErrors = 0;
+    bool corrZero = true;
+    for (const auto& a : R.answers)
+        if (a.inlineError && a.code == static_cast<int16_t>(pc::ErrorCode::StorageError)) {
+            ++storageErrors;
+            corrZero = corrZero && a.corr == 0;
+        }
+    if (storageErrors != 1u || !corrZero) std::_Exit(1);
+    for (const auto& rec : R.records) if (rec.second >= D) std::_Exit(2);   // nothing at or past the damage
+    if (R.w().corruptReadsForTest() != 1u) std::_Exit(3);
+    for (int i = 0; i < 8; ++i) { R.gw.pushSubscriptionsForTest(); R.runWorker(); }
+    if (R.w().corruptReadsForTest() != 1u) std::_Exit(4);                  // parked: never re-read
+    R.records.clear();
+    subscribe(R, 78, bases[1]);                           // healthy past the damaged segment
+    for (int i = 0; i < 8; ++i) { R.gw.pushSubscriptionsForTest(); R.runWorker(); }
+    if (R.records.empty() || R.records[0].second != bases[1]) std::_Exit(5);
+    std::_Exit(0);
+}
+} // namespace
+
+TEST(WorkerCorruptPushRegression, PushReadAnswersStorageErrorAndTheGatewayFailsOnceRegression) {
+    // #839, default gateway path: the worker answers a PushRead that reaches a damaged sealed segment with StorageError;
+    // the gateway fails the subscription ONCE (correlationId 0), parks it (never re-read), never delivers past the
+    // damage, and a subscription past the damaged segment still flows.
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(gatewayCorruptChild(), ::testing::ExitedWithCode(0), "");
 }
 
 // ============================================================================

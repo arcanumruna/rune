@@ -26,6 +26,14 @@ enum class ReadIntoStatus : uint8_t {
                     ///< retried through the read mapping (that would SIGBUS on the same bad page).
                     ///< The log is then storage-failed (sticky, review M1): every later readInto
                     ///< answers IoError without a pread; the owner routes it to the halt.
+    Corrupt,        ///< the read reached the damage of a damaged sealed segment (bytes kept on disk, never
+                    ///< served); never skipped past (#839).  Log::readInto's scan stops on it.
 };
+
+/// A status a consumer must fail loudly on rather than wait out: damaged bytes (Corrupt) or torn length fields at the cursor
+/// (Unreadable).  Both leave the view empty, and nothing at that cursor will ever become readable.
+[[nodiscard]] constexpr bool unservable(ReadIntoStatus s) noexcept {
+    return s == ReadIntoStatus::Corrupt || s == ReadIntoStatus::Unreadable;
+}
 
 } // namespace rune::storage

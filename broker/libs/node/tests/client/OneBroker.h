@@ -133,6 +133,20 @@ public:
         startNode_();
     }
 
+    /// #839: a clean stop, then `f(dataDir)` while the node is DOWN (a test damages a file on disk), then a start on the
+    /// same data dir and ports.  Every client connected through connectClient() is dropped first; a client the caller
+    /// built from clientConfig() must be destroyed by the caller before this.
+    void restartWhileStopped(const std::function<void(const std::filesystem::path& dataDir)>& f) {
+        clients_.clear();
+        node_->stop();
+        node_.reset();
+        f(dataDir());
+        startNode_();
+    }
+
+    /// The broker's data directory (the node's NodeConfig::dataDir).
+    [[nodiscard]] std::filesystem::path dataDir() const { return dir_ / "broker"; }
+
     [[nodiscard]] BrokerNode& node() noexcept { return *node_; }
     [[nodiscard]] std::string endpoint() const { return "127.0.0.1:" + std::to_string(clientPort_); }
     [[nodiscard]] const std::string& clientChannel() const noexcept { return channel_; }

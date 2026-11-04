@@ -180,18 +180,18 @@ bool TransactionCoordinationService::ensureLoaded_(int64_t nowNs)
         unload_();                                      // an epoch change reloads below
     }
     if (!loadable_()) return false;
-    load_(nowNs);
+    if (!load_(nowNs)) return false;   // #839: a damaged txn log never loads; every request answers NotCoordinator
     advancePidBlock_();
     return true;
 }
 
-void TransactionCoordinationService::load_(int64_t nowNs)
+bool TransactionCoordinationService::load_(int64_t nowNs)
 {
     // While Unloaded this service is the txn-state partition's sole appender
     // and does not append, so HW == LEO means the whole log is committed: fold
     // it (rebuildFromLog reads [0, HW)).  Cold, synchronous, control thread.
     if (txnState_ != nullptr) {
-        txnState_->rebuildFromLog();
+        if (!txnState_->rebuildFromLog()) return false;   // #839: damaged log: stay Unloaded
         coordinatorEpoch_ = static_cast<int32_t>(txnState_->replica()->epoch());
         loadedLogGen_     = txnState_->replica()->logGeneration();
     } else {
@@ -230,6 +230,7 @@ void TransactionCoordinationService::load_(int64_t nowNs)
     loadState_ = LoadState::Loaded;
     spdlog::info("TCS: coordinator LOADED (coordinatorEpoch={}, {} transactional ids, next pid {})",
                  coordinatorEpoch_, coordinator_.size(), coordinator_.allocator().nextId());
+    return true;
 }
 
 void TransactionCoordinationService::unload_()

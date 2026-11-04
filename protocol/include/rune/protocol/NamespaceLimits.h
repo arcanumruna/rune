@@ -54,6 +54,10 @@ inline constexpr uint32_t kNsFeatureAuthScram     = 1u << 7;
 static_assert(sizeof(NamespaceLimits) == kNamespaceLimitsBytes, "NamespaceLimits must be exactly 256 bytes, no padding");
 static_assert(offsetof(NamespaceLimits, maxTopics) == 0);
 static_assert(offsetof(NamespaceLimits, featureBits) == 28 * 8);
+// #837: the present-mask bit (== u64 slot) of maxTxnTimeMs; the admin checks it by this name, never a bare 22.
+inline constexpr std::size_t kNsLimitFieldMaxTxnTimeMs = 22;
+static_assert(offsetof(NamespaceLimits, maxTxnTimeMs) == kNsLimitFieldMaxTxnTimeMs * 8,
+              "kNsLimitFieldMaxTxnTimeMs must be maxTxnTimeMs's slot");
 static_assert(offsetof(NamespaceLimits, reserved1) == 28 * 8 + 8);
 
 namespace detail {

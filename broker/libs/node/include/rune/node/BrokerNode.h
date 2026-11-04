@@ -1658,6 +1658,8 @@ public:
     [[nodiscard]] rune::replication::PartitionReplica* catalogReplicaForTest() const noexcept {
         return catalogReplica_.get();
     }
+    /// #839: damaged sealed log segments found by boot recovery, summed over every log the node serves.
+    [[nodiscard]] int64_t bootDamagedSegmentsForTest() const noexcept { return bootDamagedSegments_; }
     /// Test-only: the __catalog Log — ONLY while the admin thread is quiesced
     /// (before start(), after stop()); otherwise read it inside onAdminThreadForTest.
     [[nodiscard]] rune::storage::Log* catalogLogForTest() const noexcept { return catalogLog_.get(); }
@@ -2985,6 +2987,11 @@ private:
     bool                                         haltRaised_  = false;   // runtime thread only
     void onStorageFailure_(const std::string& logDir, int err);
     void refuseStartOnFailedRecovery_();
+    /// #839: a damaged segment in a system log (__catalog, __security, __consumer_offsets, __transaction_state,
+    /// __cluster_metadata) refuses the start (exit 74): their loaders replay state from the log and must never load around a
+    /// hole.  Called right after each of those logs is recovered, before its first reader.  Throws SystemLogDamaged.
+    struct SystemLogDamaged : std::runtime_error { using std::runtime_error::runtime_error; };
+    void refuseStartOnDamagedSystemLog_();
     void onInvariantViolation_(const std::string& what);
     int  recoveryFaultForTest_ = 0;
     bool skipProvisionerRunnerForTest_ = false;
@@ -3087,6 +3094,7 @@ private:
     // drain (kA2cCatalogHalted / kA2cCatalogApplied) into the metrics file.
     std::int64_t                     catalogHaltedValue_  = 0;    // control-thread-owned (0 = applying)
     std::int64_t                     catalogAppliedValue_ = -1;   // control-thread-owned
+    std::int64_t                     bootDamagedSegments_ = 0;    // #839: set once by refuseStartOnFailedRecovery_ (start thread)
     void publishCatalogMetrics_() noexcept;
     // D9 review MEDIUM-3 / #359: the TCS sinks (control thread) - stuck markers, stuck txn offset commits + oldest age.
     static bool publishStuckMarkers_(void* self, std::int64_t value);

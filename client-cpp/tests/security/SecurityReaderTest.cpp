@@ -47,6 +47,7 @@ public:
         gw_.templateHandlers[pc::Subscribe::TEMPLATE_ID] = [this](int ep, const uint8_t* f, std::size_t len) { onSubscribe(ep, f, len); };
     }
     void refuseWith(pc::ErrorCode c) { refuse_ = c; }          // ErrorResponse{c} on the Subscribe's corr
+    void scopedErrorAfterBind(pc::ErrorCode c) { scoped_ = c; }   // #839: bind, then a subscription-scoped error (corr 0)
     void tamperFingerprintAt(std::size_t i) { tamper_ = i; }   // the record at i claims another resulting state: fingerprint mismatch
     [[nodiscard]] int subscribes() const noexcept { return subscribes_.load(); }
     [[nodiscard]] std::vector<int64_t> froms() const { return froms_; }
@@ -66,6 +67,11 @@ private:
         uint8_t out[64];
         const int64_t subId = (int64_t{1} << 62) | nextSub_++;
         gw_.send(ep, out, rcc::encodeSubscribeResponse(out, sizeof out, 0, 0, subId, sid, corr));
+        if (scoped_) {
+            gw_.sendError(ep, static_cast<int16_t>(*scoped_),
+                          "subscription " + std::to_string(subId) + " topic -7 partition 0 offset 0: parked", sid, 0);
+            return;
+        }
         frame(ep, subId, sid, corr, -1, epochBytes());
         const int64_t from = sv->fromOffset < 0 ? 0 : std::min<int64_t>(sv->fromOffset, std::ssize(log_));
         for (int64_t off = from; off < std::ssize(log_); ++off) {
@@ -97,6 +103,7 @@ private:
     std::vector<int64_t> froms_;
     std::atomic<int> subscribes_{0};
     std::optional<pc::ErrorCode> refuse_;
+    std::optional<pc::ErrorCode> scoped_;
     std::optional<std::size_t> tamper_;
     int64_t nextSub_ = 1;
     uint64_t epoch_ = 0x5ec0000000000001ULL;
@@ -244,4 +251,29 @@ TEST(SecurityReaderRegression, ANonAdminReadIsRejectedNotAuthorized) {
     EXPECT_EQ(done->error().brokerErrorCode, 45);
     EXPECT_NE(done->error().detail.find("security"), std::string::npos);
     EXPECT_EQ(feed.subscribes(), 1) << "NotAuthorized is never retried";
+}
+
+// #839 (F9): the EventLogStream's scoped-error table.  A subscription-scoped StorageError / MessageTooLarge parks the
+// read; it ends as a Rejected error naming the cause (never retried, never a silent stall).
+// RED by mutation: map CorruptBatch to the "broker too old" text in EventLogStreamImpl.h.
+TEST(SecurityReaderRegression, ScopedErrorTableEndsTheReadNamingTheCauseRegression) {
+    struct Leg { pc::ErrorCode code; const char* needle; int32_t in; };
+    const Leg legs[] = {
+        {pc::ErrorCode::StorageError, "a corrupt stored batch", 3810},
+        {pc::ErrorCode::MessageTooLarge, "an undeliverable batch", 3812},
+    };
+    for (const Leg& leg : legs) {
+        const auto script = rsec::testing::goldenScriptV1();
+        Rig r(invokerCfg(leg.in, leg.in + 1));
+        SecurityFeed feed(r.gw, script);
+        feed.scopedErrorAfterBind(leg.code);
+        r.connect();
+        rc::SecurityReader& reader = r.client.securityReader();
+        auto done = refreshOnce(r, reader, 5'000'000'000LL);
+        ASSERT_TRUE(done.has_value());
+        ASSERT_FALSE(done->has_value());
+        EXPECT_EQ(done->error().kind, rc::CatalogReadError::Kind::Rejected);
+        EXPECT_NE(done->error().detail.find(leg.needle), std::string::npos) << done->error().detail;
+        EXPECT_EQ(feed.subscribes(), 1) << "a parked read is never re-subscribed in a loop";
+    }
 }

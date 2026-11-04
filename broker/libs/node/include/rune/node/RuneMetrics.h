@@ -61,6 +61,7 @@ enum class RuneMetric : std::int32_t {
     StuckTxnOffsetAgeMs        = 1'000'241,
     NsSlotMismatch             = 1'000'242,   // monotonic: namespace slot tags refused (gateway + every worker)
     PeerHelloShed              = 1'000'243,   // monotonic: crypto-costing peer Hellos dropped over the per-peer budget
+    DamagedSegments            = 1'000'270,   // gauge: damaged sealed log segments found at boot (every log the node serves)
 };
 
 /// Per-namespace rows (namespaces Phase 2 Task 8): allocated per namespace on the control thread when it is created,
@@ -119,6 +120,7 @@ inline constexpr std::array<RuneMetricDef, 32> kRuneMetrics = {{
     {detail::M::StuckTxnOffsetAgeMs,       detail::K::Gauge,   "rune-txn-offset-stuck-age-ms",                 detail::O::Control},
     {detail::M::NsSlotMismatch,            detail::K::Counter, "rune-ns-slot-mismatch",                        detail::O::Control},
     {detail::M::PeerHelloShed,             detail::K::Counter, "rune-peer-hello-shed",                         detail::O::Control},
+    {detail::M::DamagedSegments,           detail::K::Gauge,   "rune-log-damaged-segments",                    detail::O::Control},
 }};
 
 /// The metric's type id in the metrics file (D61: the enumerator value, equal to the old Aeron counter type id).

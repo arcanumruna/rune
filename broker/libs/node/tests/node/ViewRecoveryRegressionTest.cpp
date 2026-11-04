@@ -1014,6 +1014,12 @@ std::vector<uint8_t> cat(std::initializer_list<std::vector<uint8_t>> parts) {
     return out;
 }
 std::vector<uint8_t> prefixOf(const std::vector<uint8_t>& v, std::size_t k) { return {v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k)}; }
+// #817: a copy of `rec` with every byte from the fixed header (v2 13, v1 20) to its end set to 0: the file size was committed, the
+// data was not.
+std::vector<uint8_t> zeroBody(std::vector<uint8_t> rec, bool v2) {
+    for (std::size_t i = v2 ? 13 : 20; i < rec.size(); ++i) rec[i] = 0;
+    return rec;
+}
 }  // namespace
 
 TEST(ViewCheckpointTailRegression, ScanClassifiesEveryTruncationOffsetAsTornTailRegression) {
@@ -1080,6 +1086,76 @@ TEST(ViewCheckpointTailRegression, ScanClassifiesEveryTruncationOffsetAsTornTail
     }
 }
 
+// #817: a complete-length LAST record whose body is all zero (size committed, data not) is a torn tail, not corruption.
+TEST(ViewCheckpointTailRegression, ZeroBodyLastRecordIsTornTailRegression) {
+    using namespace rune::node;
+    for (const bool v2 : {false, true}) {
+        SCOPED_TRACE(v2 ? "v2" : "v1");
+        const auto r1 = scanRec(v2, 10), r2 = scanRec(v2, 20), r3 = scanRec(v2, 30);
+        const std::size_t start3 = r1.size() + r2.size();
+        auto expectTorn = [&](const std::vector<uint8_t>& file, const char* what) {
+            const auto scan = scanViewCheckpoint(file);
+            const auto* torn = std::get_if<ViewCheckpointTornTail>(&scan.tail);
+            ASSERT_NE(torn, nullptr) << what;
+            EXPECT_EQ(torn->cleanLen, start3) << what;
+            EXPECT_EQ(scan.records.size(), 2u) << what;
+        };
+        expectTorn(cat({r1, r2, zeroBody(r3, v2)}), "a");
+        {   // (b) plus a zero extent
+            auto f = cat({r1, r2, zeroBody(r3, v2)});
+            f.resize(f.size() + 4096, 0);
+            expectTorn(f, "b");
+        }
+        if (v2) {   // (c) the table headers are zero too: recordEnd gives a shorter record, the rest is zeros
+            auto z = r3;
+            for (std::size_t i = 13; i < z.size(); ++i) z[i] = 0;
+            expectTorn(cat({r1, r2, z}), "c");
+        }
+        if (!v2) {  // (d) a v1 record with count 0 and its CRC zeroed
+            auto z = scanRec(false, 30, 0);
+            for (std::size_t i = z.size() - 4; i < z.size(); ++i) z[i] = 0;
+            expectTorn(cat({r1, r2, z}), "d");
+        }
+    }
+}
+
+TEST(ViewCheckpointTailRegression, ZeroBodyIsCorruptWhenAnyByteIsNonZeroOrARecordFollowsRegression) {
+    using namespace rune::node;
+    for (const bool v2 : {false, true}) {
+        SCOPED_TRACE(v2 ? "v2" : "v1");
+        const std::size_t hdr = v2 ? 13 : 20;
+        const auto r1 = scanRec(v2, 10), r2 = scanRec(v2, 20), r3 = scanRec(v2, 30);
+        const std::size_t start3 = r1.size() + r2.size();
+        auto expectCorrupt = [&](const std::vector<uint8_t>& file, std::size_t at, std::size_t records, const std::string& what) {
+            const auto scan = scanViewCheckpoint(file);
+            const auto* bad = std::get_if<ViewCheckpointCorrupt>(&scan.tail);
+            ASSERT_NE(bad, nullptr) << what;
+            EXPECT_EQ(bad->cleanLen, at) << what;
+            EXPECT_EQ(scan.records.size(), records) << what;
+        };
+        for (std::size_t k = hdr; k < r3.size(); ++k) {   // (a) one non-zero byte anywhere in the body
+            auto z = zeroBody(r3, v2);
+            z[k] = 0x01;
+            // v2 only: a high byte of a table's entry count (13+6.., 22+6..) makes the length walk run past EOF; that is the
+            // pre-existing "strict prefix of one record" branch (no complete record can follow), still a torn tail.
+            const bool countHighByte = v2 && (k == 19 || k == 20 || k == 21 || k == 28 || k == 29 || k == 30);
+            if (countHighByte) {
+                const auto scan = scanViewCheckpoint(cat({r1, r2, z}));
+                EXPECT_TRUE(std::holds_alternative<ViewCheckpointTornTail>(scan.tail)) << "k=" << k;
+                continue;
+            }
+            expectCorrupt(cat({r1, r2, z}), start3, 2, "a k=" + std::to_string(k));
+        }
+        expectCorrupt(cat({r1, r2, zeroBody(r3, v2), scanRec(v2, 40)}), start3, 2, "b");   // a valid record follows
+        expectCorrupt(cat({r1, zeroBody(r2, v2), r3}), r1.size(), 1, "c");                  // a zeroed middle record
+        {   // (d) one non-zero byte after the zeroed record
+            auto f = cat({r1, r2, zeroBody(r3, v2)});
+            f.push_back(0x01);
+            expectCorrupt(f, start3, 2, "d");
+        }
+    }
+}
+
 namespace {
 // A restart over `dir` (same data dir, fresh worker and agent).
 std::unique_ptr<DiscardRig> bootOver(const std::string& dir, std::vector<uint8_t> log, int64_t logFrom, int64_t logTo) {
@@ -1109,6 +1185,22 @@ std::string bootOneThenTear(const char* stem, std::string& dirOut) {
     appendBytes(r1.ckptPath(), prefixOf(rec5, 9));
     return r1.ckptPath();
 }
+// Boot 1 folds [0,4) durably, then a last record whose size was committed but whose body is zero is appended (#817).
+std::string bootOneThenZeroBody(const char* stem, std::string& dirOut) {
+    DiscardRig r1(stem, 0);
+    dirOut = r1.dir;
+    r1.ownsDir = false;
+    r1.materialize();
+    EXPECT_TRUE(r1.pumpUntilReady());
+    EXPECT_TRUE(pumpUntilDurable(r1, 4));
+    auto rec5 = makeBaseCheckpoint(r1.plan, r1.layout, r1.src, upsertRun(7, 30, 5, 0), 5);
+    uint32_t magic = 0;
+    std::memcpy(&magic, rec5.data(), sizeof(magic));   // little-endian host
+    const std::size_t hdr = magic == rune::view::kViewCheckpointMagicV2 ? 13 : 20;
+    for (std::size_t i = hdr; i < rec5.size(); ++i) rec5[i] = 0;
+    appendBytes(r1.ckptPath(), rec5);
+    return r1.ckptPath();
+}
 }  // namespace
 
 // The bug repro (silent loss): without the trim, boot 2 appends after the torn bytes and boot 3 recovers at the tear.
@@ -1130,6 +1222,32 @@ TEST(ViewCheckpointTailRegression, TornTailRestartKeepsEveryLaterDeltaRegression
         EXPECT_EQ(r->vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
         EXPECT_TRUE(rune::node::listViewBackups(dir, kViewId, 0).empty());
         EXPECT_EQ(r->vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+        const rune::view::RowLayout* L = nullptr;
+        const uint8_t* row = r->vs->getRow(kViewId, 0, 7, L);
+        ASSERT_NE(row, nullptr);
+        EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 37);
+    }
+    std::error_code ec; std::filesystem::remove_all(dir, ec);
+}
+
+TEST(ViewCheckpointTailRegression, ZeroBodyLastRecordRestartTrimsWithoutBackupRegression) {
+    std::string dir;
+    bootOneThenZeroBody("rune_t_817_z-", dir);
+    {   // boot 2
+        auto r = bootOver(dir, upsertRun(7, 30, 8, 0), 0, 8);
+        r->materialize();
+        EXPECT_EQ(r->vs->instanceServeState(kViewId, 0).foldCursor, 4) << "recovers at the last whole record";
+        ASSERT_TRUE(r->pumpUntilReady());
+        ASSERT_TRUE(pumpUntilDurable(*r, 8));
+        EXPECT_EQ(r->agent->tailTrimsForTest(), 1);
+        EXPECT_TRUE(rune::node::listViewBackups(dir, kViewId, 0).empty()) << "a torn tail is trimmed, never backed up";
+        EXPECT_EQ(r->vs->foldCounters(kViewId, 0)->checkpointDiscards, 0u);
+    }
+    {   // boot 3
+        auto r = bootOver(dir, upsertRun(7, 30, 8, 0), 0, 8);
+        r->materialize();
+        EXPECT_EQ(r->vs->instanceServeState(kViewId, 0).foldCursor, 8);
+        EXPECT_EQ(r->vs->readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
         const rune::view::RowLayout* L = nullptr;
         const uint8_t* row = r->vs->getRow(kViewId, 0, 7, L);
         ASSERT_NE(row, nullptr);

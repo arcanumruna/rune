@@ -23,6 +23,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/testing/DamageSegmentForTest.h>
 
 #include <atomic>
 #include <chrono>
@@ -487,6 +488,42 @@ TEST(RebuildAcrossSegmentRoll, ReconstructsAllCommitsAcrossRoll) {
         EXPECT_EQ(co->metadata, val.meta)
             << "Wrong metadata for (" << grp << ", " << tpc << ", " << part << ")";
     }
+}
+
+// ===========================================================================
+// 8b. #839: a DAMAGED middle segment is a hole, never skipped
+//
+// rebuildFromLog() skips to the next segment base on an empty read (compaction leaves such gaps).  An empty read at a
+// damaged segment must NOT: loading around the missing commits rewinds a group's committed offset.
+// ===========================================================================
+TEST(RebuildAcrossSegmentRoll, RebuildStopsAtDamageRegression) {
+    constexpr int64_t kTinyRoll = 512;
+    TempDir dir("ros_damage");
+    rune::storage::Log log(dir.path, kTinyRoll);
+    NullTransport nt;
+    PartitionReplica replica(makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &nt);
+    ReplicatedOffsetStore store(&replica);
+    int64_t clock = 0;
+    constexpr int kNumCommits = 40;
+    for (int i = 0; i < kNumCommits; ++i)
+        ASSERT_TRUE(store.commit("grp" + std::to_string(i % 3), tp("topic" + std::to_string(i % 2), i % 4), i * 10,
+                                 "meta_" + std::to_string(i), i * 1000LL));
+    for (int i = 0; i < kDriverCap && replica.highWatermark() < kNumCommits; ++i) { clock += 1'000'000LL; replica.doWork(clock); }
+    ASSERT_GE(replica.highWatermark(), kNumCommits);
+    ASSERT_GE(log.segmentBaseOffsets().size(), 4u) << "three segments around the damaged one";
+
+    {   // control: the undamaged log loads
+        ReplicatedOffsetStore ok(&replica);
+        ASSERT_TRUE(ok.rebuildFromLog());
+    }
+    const int64_t damaged = rune::storage::testing::damageSecondBatchOfSegment(dir.path, 1);
+    ASSERT_GE(damaged, 0) << "the middle segment holds at least two batches";
+    ASSERT_TRUE(log.reloadSegments());
+    ASSERT_EQ(log.damagedSegmentCount(), 1u);
+
+    ReplicatedOffsetStore rebuilt(&replica);
+    EXPECT_FALSE(rebuilt.rebuildFromLog()) << "a damaged segment is a hole: the index must not load around it";
+    EXPECT_FALSE(rebuilt.fetch("grp0", tp("topic0", 0)).has_value()) << "nothing half-loaded is served";
 }
 
 // ===========================================================================

@@ -1919,6 +1919,7 @@ if(BUILD_TESTING)
                        tests/client/RuneConsoleBrokerRegressionTest.cpp
                        tests/client/ClaimBrokerRegressionTest.cpp
                        tests/client/ProducerIdBrokerRegressionTest.cpp
+                       tests/client/CorruptSegmentBrokerRegressionTest.cpp
                        tests/client/CheckedWritesBrokerRegressionTest.cpp
                        tests/client/CheckedWritesTransientViewBrokerRegressionTest.cpp)
         # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed

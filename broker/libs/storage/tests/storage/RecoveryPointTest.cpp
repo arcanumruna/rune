@@ -810,3 +810,269 @@ TEST(RecoveryPointRegression, RecoveryWithGapDeletion_FsyncsDirectoryOnce) {
     EXPECT_EQ(rec->directorySyncsCompletedForTest(), 1u) << "recovery fsynced the directory more than once";
     fs::remove_all(dir);
 }
+
+// ===========================================================================
+// #839: a damaged SEALED segment is kept on disk, flagged, and fails reads at the damage (never skipped, never cut).
+// ===========================================================================
+namespace {
+
+constexpr int64_t kDmgRoll = 2048;   // >= 3 single-record batches per segment
+
+// Byte offsets of every whole batch in a .log file.
+std::vector<std::size_t> batchStarts(const std::string& logPath) {
+    std::ifstream in(logPath, std::ios::binary);
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), {});
+    std::vector<std::size_t> out;
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(batch::kRecordBatchOverhead) <= buf.size()) {
+        RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+        const int32_t total = r.totalLength();
+        if (total < batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
+        out.push_back(pos);
+        pos += static_cast<std::size_t>(total);
+    }
+    return out;
+}
+
+// XOR byte `pos` of a file in place.
+void xorByteAt(const std::string& path, std::size_t pos, uint8_t mask = 0x5A) {
+    std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+    ASSERT_TRUE(f.is_open());
+    f.seekg(static_cast<std::streamoff>(pos));
+    char c = 0;
+    f.read(&c, 1);
+    ASSERT_EQ(f.gcount(), 1);
+    c = static_cast<char>(static_cast<uint8_t>(c) ^ mask);
+    f.seekp(static_cast<std::streamoff>(pos));
+    f.write(&c, 1);
+}
+
+// The first offset of the batch at file position p.
+int64_t batchBaseAt(const std::string& logPath, std::size_t p) {
+    std::ifstream in(logPath, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(p));
+    std::vector<uint8_t> hdr(static_cast<std::size_t>(batch::kRecordBatchOverhead));
+    in.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
+    return RecordBatchReader(hdr.data(), hdr.size()).baseOffset();
+}
+
+struct ReadOut { ReadIntoStatus st; int64_t base; std::size_t len; };
+ReadOut readAt(Log& log, int64_t off) {
+    std::vector<uint8_t> buf(1 << 16);
+    ReadIntoStatus st = ReadIntoStatus::Ok;
+    const LogReadView v = log.readInto(off, 1 << 16, buf.data(), buf.size(), st);
+    return {st, v.empty() ? -1 : v.baseOffset, v.len};
+}
+
+// A log with >= 4 sealed-or-active segments, cleanly closed (R == LEO), nothing damaged yet.
+struct DamagedFixture {
+    fs::path dir;
+    std::vector<int64_t> bases;
+    int64_t leo = 0;
+    std::string seg0;
+    uintmax_t sz0 = 0;
+    std::vector<std::size_t> starts;   // batch starts in segment 0
+    int64_t D = 0;                     // first offset of segment 0's 2nd batch
+    std::unique_ptr<Log> log;
+
+    explicit DamagedFixture(const char* stem, std::size_t segments = 4, bool closeCleanly = true) {
+        dir = freshDir(stem);
+        log = openRecovered(dir, kDmgRoll, false);
+        while (log->segmentBaseOffsets().size() < segments) appendOne(*log);
+        appendOne(*log);
+        log->sync();
+        bases = log->segmentBaseOffsets();
+        leo = log->logEndOffset();
+        seg0 = segPath(dir, bases[0]);
+        sz0 = fs::file_size(seg0);
+        starts = batchStarts(seg0);
+        D = batchBaseAt(seg0, starts.at(1));
+        if (closeCleanly) log.reset();
+    }
+    void xorSecondBatch() const { xorByteAt(seg0, starts.at(1) + static_cast<std::size_t>(batch::kRecordBatchOverhead)); }
+    ~DamagedFixture() { log.reset(); std::error_code ec; fs::remove_all(dir, ec); }
+};
+
+}  // namespace
+
+TEST(DamagedSegmentRegression, SealedSegmentBelowRecoveryPointIsKeptNotCutRegression) {
+    DamagedFixture f("dmg_kept");
+    ASSERT_GE(f.starts.size(), 3u);
+    f.xorSecondBatch();
+    auto rec = openRecovered(f.dir, kDmgRoll, false);
+    EXPECT_EQ(fs::file_size(f.seg0), f.sz0) << "a damaged sealed segment below R is kept, never cut";
+    EXPECT_EQ(rec->damagedSegmentCount(), 1u);
+    EXPECT_EQ(rec->damageDetections(), 1u);
+    EXPECT_EQ(rec->segmentBaseOffsets(), f.bases);
+    EXPECT_EQ(rec->logEndOffset(), f.leo);
+    EXPECT_EQ(rec->segmentNextOffsetAt(f.bases[0]), f.D);
+    EXPECT_EQ(readPersistedR(f.dir), f.leo);
+}
+
+TEST(DamagedSegmentRegression, ReadAtTheDamageIsCorruptNeverSkippedRegression) {
+    DamagedFixture f("dmg_read");
+    f.xorSecondBatch();
+    auto rec = openRecovered(f.dir, kDmgRoll, false);
+    const auto first = readAt(*rec, f.bases[0]);
+    EXPECT_EQ(first.st, ReadIntoStatus::Ok);
+    EXPECT_EQ(first.base, f.bases[0]);
+    EXPECT_GT(first.len, 0u);
+    const auto atD = readAt(*rec, f.D);
+    EXPECT_EQ(atD.st, ReadIntoStatus::Corrupt) << "the read at the damage must fail, not skip to the next segment";
+    EXPECT_EQ(atD.len, 0u);
+    EXPECT_EQ(readAt(*rec, f.D + 1).st, ReadIntoStatus::Corrupt);
+    EXPECT_EQ(readAt(*rec, f.bases[1] - 1).st, ReadIntoStatus::Corrupt);
+    const auto past = readAt(*rec, f.bases[1]);
+    EXPECT_EQ(past.st, ReadIntoStatus::Ok);
+    EXPECT_EQ(past.base, f.bases[1]);
+}
+
+TEST(DamagedSegmentRegression, TornPartialTailBelowRecoveryPointIsKeptRegression) {
+    DamagedFixture f("dmg_partial");
+    const int64_t lastBase = batchBaseAt(f.seg0, f.starts.back());
+    const auto keep = f.starts.back() + 10;
+    fs::resize_file(f.seg0, keep);
+    auto rec = openRecovered(f.dir, kDmgRoll, false);
+    EXPECT_EQ(fs::file_size(f.seg0), keep) << "a partial last batch below R is kept";
+    EXPECT_EQ(rec->damagedSegmentCount(), 1u);
+    EXPECT_EQ(readAt(*rec, lastBase).st, ReadIntoStatus::Corrupt) << "the read must not skip to the next segment";
+    EXPECT_EQ(readAt(*rec, f.bases[1]).st, ReadIntoStatus::Ok);
+}
+
+TEST(DamagedSegmentRegression, ReloadSegmentsKeepsADamagedSealedSegmentRegression) {
+    DamagedFixture f("dmg_reload", 3, /*closeCleanly=*/false);
+    f.xorSecondBatch();   // while the log is open
+    ASSERT_TRUE(f.log->reloadSegments());
+    EXPECT_EQ(fs::file_size(f.seg0), f.sz0) << "reloadSegments must not cut a damaged sealed segment";
+    EXPECT_EQ(f.log->damagedSegmentCount(), 1u);
+    EXPECT_EQ(readAt(*f.log, f.D).st, ReadIntoStatus::Corrupt);
+    EXPECT_EQ(f.log->logEndOffset(), f.leo);
+}
+
+TEST(DamagedSegmentRegression, CleanerSwapReloadKeepsDamageRegression) {
+    DamagedFixture f("dmg_swap", 3, /*closeCleanly=*/false);
+    f.xorSecondBatch();
+    f.log->reloadSegment(f.bases[0]);
+    EXPECT_EQ(fs::file_size(f.seg0), f.sz0) << "a cleaner-swap reload must not cut a damaged sealed segment";
+    EXPECT_EQ(f.log->damagedSegmentCount(), 1u);
+    EXPECT_EQ(readAt(*f.log, f.D).st, ReadIntoStatus::Corrupt);
+    EXPECT_EQ(f.log->logEndOffset(), f.leo);
+}
+
+TEST(DamagedSegmentRegression, SecondRestartSeesTheSameDamageRegression) {
+    DamagedFixture f("dmg_twice");
+    f.xorSecondBatch();
+    auto rec = openRecovered(f.dir, kDmgRoll, false);
+    ASSERT_EQ(rec->damagedSegmentCount(), 1u);
+    rec.reset();
+    rec = openRecovered(f.dir, kDmgRoll, false);
+    EXPECT_EQ(rec->damagedSegmentCount(), 1u);
+    EXPECT_EQ(fs::file_size(f.seg0), f.sz0);
+    EXPECT_EQ(readAt(*rec, f.D).st, ReadIntoStatus::Corrupt);
+}
+
+TEST(DamagedSegmentRegression, RetentionDeletesADamagedSegmentWholeRegression) {
+    DamagedFixture f("dmg_retention");
+    f.xorSecondBatch();
+    auto rec = openRecovered(f.dir, kDmgRoll, false);
+    ASSERT_EQ(rec->damagedSegmentCount(), 1u);
+    for (int i = 0; i < 16 && fs::exists(f.seg0); ++i) (void)rec->deleteOldSegments(/*retainBytes=*/1, /*hw=*/f.leo);
+    EXPECT_FALSE(fs::exists(f.seg0));
+    EXPECT_EQ(rec->damagedSegmentCount(), 0u);
+    EXPECT_EQ(rec->damageDetections(), 1u);
+}
+
+// A pin: the ACTIVE segment's torn tail is still cut (the invariant: damage_ is never set on the highest-base segment).
+TEST(DamagedSegmentRegression, ActiveSegmentTornTailIsStillCutRegression) {
+    const auto dir = freshDir("dmg_active");
+    auto log = openRecovered(dir, kDmgRoll, false);
+    while (log->segmentBaseOffsets().size() < 2) appendOne(*log);
+    appendOne(*log); appendOne(*log); appendOne(*log);
+    log->sync();
+    const auto bases = log->segmentBaseOffsets();
+    const std::string active = segPath(dir, bases.back());
+    log.reset();
+    const auto starts = batchStarts(active);
+    ASSERT_GE(starts.size(), 3u);
+    const int64_t D = batchBaseAt(active, starts[1]);
+    xorByteAt(active, starts[1] + static_cast<std::size_t>(batch::kRecordBatchOverhead));
+    auto rec = openRecovered(dir, kDmgRoll, false);
+    EXPECT_EQ(fs::file_size(active), starts[1]) << "the active segment's torn tail is cut as before";
+    EXPECT_EQ(rec->damagedSegmentCount(), 0u);
+    EXPECT_EQ(rec->logEndOffset(), D);
+    rec.reset();
+    fs::remove_all(dir);
+}
+
+// F1: a worker-driven log (deferSeals) cuts in place.  A cut into a damaged sealed segment removes the damaged bytes, so the
+// segment (now the active one) must read Absent at the log end and no longer count as damaged.
+TEST(DamagedSegmentRegression, InPlaceTruncationIntoTheDamageClearsItRegression) {
+    for (int c = 0; c < 3; ++c) {
+        SCOPED_TRACE("case " + std::to_string(c));
+        DamagedFixture f(("dmg_inplace" + std::to_string(c)).c_str());
+        f.xorSecondBatch();
+        auto rec = openRecovered(f.dir, kDmgRoll, /*deferSeals=*/true);
+        ASSERT_EQ(rec->damagedSegmentCount(), 1u);
+        const int64_t cut = c == 0 ? f.D + 1 : c == 1 ? f.D : f.bases[0];
+        ASSERT_TRUE(rec->truncateTo(cut));
+        const int64_t leo = rec->logEndOffset();
+        EXPECT_EQ(leo, c == 2 ? f.bases[0] : f.D);
+        EXPECT_EQ(readAt(*rec, leo).st, ReadIntoStatus::Absent) << "no stale damage at the log end";
+        appendOne(*rec);
+        EXPECT_EQ(readAt(*rec, leo + 1).st, ReadIntoStatus::Absent);
+        const auto got = readAt(*rec, leo);
+        EXPECT_EQ(got.st, ReadIntoStatus::Ok);
+        EXPECT_EQ(got.base, leo);
+        EXPECT_EQ(rec->damagedSegmentCount(), 0u);
+    }
+}
+
+// F5: baseOffset (0-7) and magic (16) are not covered by the batch CRC, so a flip there still verifies (partitionLeaderEpoch,
+// 12-15, is not either, but stored epochs are not monotonic - unstamped -1 and re-stamped batches mix - so it is not checked).  Recovery must treat it as the end of the valid prefix: damage, never a served wrong offset.
+TEST(DamagedSegmentRegression, UnCrcCoveredHeaderFlipIsDamageRegression) {
+    for (int c = 0; c < 2; ++c) {
+        SCOPED_TRACE(c == 0 ? "baseOffset" : "magic");
+        DamagedFixture f(("dmg_hdr" + std::to_string(c)).c_str());
+        ASSERT_GE(f.starts.size(), 3u);
+        // The 2nd batch's position comes from the file: the 1st batch's totalLength.
+        std::ifstream in(f.seg0, std::ios::binary);
+        std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), {});
+        in.close();
+        const std::size_t p = static_cast<std::size_t>(RecordBatchReader(buf.data(), buf.size()).totalLength());
+        ASSERT_EQ(p, f.starts.at(1));
+        ASSERT_GE(f.D, 1);
+        if (c == 0) {
+            // Lower the base below the expected offset: clear D's lowest set bit (byte 0 holds it, D < 256).
+            ASSERT_LT(f.D, 256);
+            xorByteAt(f.seg0, p + 0, static_cast<uint8_t>(f.D & -f.D));
+        } else {
+            xorByteAt(f.seg0, p + static_cast<std::size_t>(batch::kMagicOffset));
+        }
+        auto rec = openRecovered(f.dir, kDmgRoll, false);
+        EXPECT_EQ(rec->damagedSegmentCount(), 1u);
+        EXPECT_EQ(fs::file_size(f.seg0), f.sz0) << "kept, not cut";
+        EXPECT_EQ(readAt(*rec, f.D).st, ReadIntoStatus::Corrupt);
+        EXPECT_EQ(readAt(*rec, f.bases[0]).st, ReadIntoStatus::Ok);
+    }
+}
+
+// F2 (#839): damageAt tells a status-less cold reader that an empty read at `offset` is damage, not the end of the segment.
+TEST(DamagedSegmentRegression, DamageAtNamesTheDamageForOffsetsInAndAfterItRegression) {
+    DamagedFixture f("dmg_damageat");
+    f.xorSecondBatch();
+    auto rec = openRecovered(f.dir, kDmgRoll, false);
+    ASSERT_EQ(rec->damagedSegmentCount(), 1u);
+    EXPECT_EQ(rec->damageAt(f.bases[0]), std::nullopt) << "before the damage: readable";
+    EXPECT_EQ(rec->damageAt(f.D - 1), std::nullopt);
+    EXPECT_EQ(rec->damageAt(f.D), f.D);
+    EXPECT_EQ(rec->damageAt(f.D + 1), f.D);
+    EXPECT_EQ(rec->damageAt(f.bases[1] - 1), f.D) << "the rest of the damaged segment";
+    EXPECT_EQ(rec->damageAt(f.bases[1]), std::nullopt) << "the next segment is intact";
+    EXPECT_EQ(rec->damageAt(rec->logEndOffset()), std::nullopt);
+    EXPECT_EQ(rec->damageAt(-5), std::nullopt) << "below the first segment";
+    // A healthy log never reports damage.
+    DamagedFixture g("dmg_damageat_ok");
+    auto ok = openRecovered(g.dir, kDmgRoll, false);
+    EXPECT_EQ(ok->damagedSegmentCount(), 0u);
+    for (int64_t o = g.bases[0]; o < ok->logEndOffset(); ++o) EXPECT_EQ(ok->damageAt(o), std::nullopt);
+}

@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <optional>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <utility>
@@ -228,7 +229,20 @@ public:
     /// `syncIndex` = false (hot-path B F7, a worker-driven log's truncation):
     /// the rebuilt index is renamed into place without msync / directory fsync
     /// (the owner gates R on an async directory fsync instead).
-    int64_t recover(bool syncIndex = true);
+    ///
+    /// #839: `mode` decides what happens to bytes after the last whole, CRC-valid batch.  CutTornTail (the active segment,
+    /// and the validated region) ftruncates them.  KeepDamage (a SEALED segment) keeps every byte on disk and flags the
+    /// segment (damaged()): logSize_/nextOffset_ stop at the end of the valid prefix, the rebuilt index covers only that
+    /// prefix, and readInto answers Corrupt at the damage.
+    ///
+    /// Invariant: damage_ is set only on a segment that is not the log's highest-base (active) segment, and a segment with
+    /// damage_ keeps every byte on disk.
+    enum class RecoverMode : uint8_t { CutTornTail, KeepDamage };
+    struct SegmentDamage { int64_t bytePos; int64_t offset; int64_t fileBytes; };
+    int64_t recover(bool syncIndex = true, RecoverMode mode = RecoverMode::CutTornTail);
+    /// #839: set by a KeepDamage recover that found bytes past the last whole batch.  Cold.
+    [[nodiscard]] bool damaged() const noexcept { return damage_.has_value(); }
+    [[nodiscard]] const std::optional<SegmentDamage>& damage() const noexcept { return damage_; }
     /// Hot-path B review M2: truncate THIS (active) segment in place at the
     /// batch holding `truncateOffset` (rounded down, as truncateTo): one
     /// ftruncate of the open fd, the index entries past the cut zeroed in its
@@ -460,6 +474,7 @@ private:
     int64_t  publishedTs_ = INT64_MIN; ///< see publishedTs()
     uint64_t dirEntryGen_ = 0;   ///< E1d MEDIUM-2: see dirEntryGen()
     int64_t logSize_ = 0; int64_t nextOffset_; int64_t bytesSinceIndex_ = 0;
+    std::optional<SegmentDamage> damage_;   ///< see damaged()
     int64_t syncedBytes_ = -1;   ///< see syncedBytesForTest()
     int64_t durableNext_ = 0;    ///< E1d: see durableNext() (== baseOffset_ when none)
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment

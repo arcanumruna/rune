@@ -36,6 +36,8 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 #include <thread>
@@ -1020,3 +1022,184 @@ TEST_F(TransientOwnedPushRegression, OwnershipMovedParksTheSubscriptionAndNeverR
 
 
 } // namespace
+
+// ===========================================================================
+// #839: damage helpers (copied from the B1 storage tests): a sealed segment's 2nd batch gets one flipped byte.
+// ===========================================================================
+namespace corruptutil {
+inline std::vector<std::size_t> batchStarts(const std::string& logPath) {
+    std::ifstream in(logPath, std::ios::binary);
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), {});
+    std::vector<std::size_t> out;
+    std::size_t pos = 0;
+    while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
+        rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+        const int32_t total = r.totalLength();
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
+        out.push_back(pos);
+        pos += static_cast<std::size_t>(total);
+    }
+    return out;
+}
+inline void xorByteAt(const std::string& path, std::size_t pos, uint8_t mask = 0x5A) {
+    std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+    f.seekg(static_cast<std::streamoff>(pos));
+    char c = 0;
+    f.read(&c, 1);
+    c = static_cast<char>(static_cast<uint8_t>(c) ^ mask);
+    f.seekp(static_cast<std::streamoff>(pos));
+    f.write(&c, 1);
+}
+inline int64_t batchBaseAt(const std::string& logPath, std::size_t p) {
+    std::ifstream in(logPath, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(p));
+    std::vector<uint8_t> hdr(static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead));
+    in.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
+    return rune::protocol::RecordBatchReader(hdr.data(), hdr.size()).baseOffset();
+}
+/// The lowest-base .log file of a partition directory ("" = none).
+inline std::string firstSegment(const std::filesystem::path& dir) {
+    std::string best;
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().extension() == ".log" && (best.empty() || e.path().string() < best)) best = e.path().string();
+    return best;
+}
+/// Flip the first record byte of segment 0's 2nd batch; returns that batch's first offset (-1 = could not).
+inline int64_t damageSecondBatchOfSegment0(const std::filesystem::path& dir) {
+    const std::string seg0 = firstSegment(dir);
+    if (seg0.empty()) return -1;
+    const auto starts = batchStarts(seg0);
+    if (starts.size() < 2) return -1;
+    const int64_t d = batchBaseAt(seg0, starts[1]);
+    xorByteAt(seg0, starts[1] + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead));
+    return d;
+}
+}  // namespace corruptutil
+
+namespace {
+// A log with 40 one-record batches over several sealed 2 KiB segments, its 2nd batch of segment 0 damaged on the LIVE log
+// (reloadSegments: the issue's path).  Returns D (the first offset of the damaged batch).
+int64_t makeDamagedLog(rune::storage::Log& log, const std::filesystem::path& dir) {
+    log.recover();
+    log.setDeferSealSync(false);   // inline seals: the recovery point is persisted per roll
+    for (int64_t i = 0; i < 40; ++i) {
+        rune::protocol::RecordBatchBuilder b(i, 1000 + i);
+        b.append("k", "v" + std::to_string(i), 1000 + i);
+        (void)log.append(b.build(), i);
+    }
+    log.sync();
+    const int64_t d = corruptutil::damageSecondBatchOfSegment0(dir);
+    if (d < 0 || !log.reloadSegments() || log.damagedSegmentCount() != 1u) return -1;
+    return d;
+}
+
+class WorkerCorruptPushRegression : public WorkerPushFixture {};
+}  // namespace
+
+TEST_F(WorkerCorruptPushRegression, OwnedSubscriptionFailsWithStorageErrorAtTheDamageRegression) {
+    auto dirA = tempLogDir();
+    auto dirB = tempLogDir();
+    rune::storage::Log logA(dirA.string(), 2048);
+    rune::storage::Log logB(dirB.string(), 64LL * 1024 * 1024);
+    const int64_t D = makeDamagedLog(logA, dirA);
+    ASSERT_GT(D, 0);
+    appendBatch(logB, 0, 1);
+    appendBatch(logB, 1, 1);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3141);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3141);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &logA)));
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(2, 10, 1, 0, &logB)));
+
+    F19Egress c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return !c.errors.empty() && c.recordsFor(2) >= 2;
+    }, 10s)) << "errors=" << c.errors.size() << " sub2 records=" << c.recordsFor(2);
+    ASSERT_EQ(c.errors.size(), 1u);
+    EXPECT_EQ(c.errors[0].code, static_cast<int16_t>(pc::ErrorCode::StorageError));
+    EXPECT_EQ(c.errors[0].correlationId, 0);
+    EXPECT_NE(c.errors[0].message.find("subscription 1 topic 10 partition 0 offset " + std::to_string(D)),
+              std::string::npos) << c.errors[0].message;
+    EXPECT_NE(c.errors[0].message.find("corrupt"), std::string::npos) << c.errors[0].message;
+    EXPECT_EQ(c.recordsFor(2), 2u) << "the healthy subscription keeps flowing";
+    // sub 1 got exactly the records below the damage.
+    std::vector<int64_t> got;
+    for (const auto& r : c.records) if (r.subId == 1) got.push_back(r.baseOffset);
+    ASSERT_EQ(static_cast<int64_t>(got.size()), D);
+    for (int64_t i = 0; i < D; ++i) EXPECT_EQ(got[static_cast<std::size_t>(i)], i);
+
+    // Parked: no second error, no record at or past the damage, never re-read.
+    for (int i = 0; i < 200; ++i) { w.doWork(1); sub->poll(c.fa.handler(), 64); }
+    EXPECT_EQ(c.errors.size(), 1u) << "exactly one error, no spin";
+    for (const auto& r : c.records) if (r.subId == 1) EXPECT_LT(r.baseOffset, D);
+    for (const auto& s : w.subscriptionsForTest()) if (s.subscriptionId == 1) EXPECT_EQ(s.nextOffset, D);
+    EXPECT_EQ(w.corruptReadsForTest(), 1u) << "the parked subscription is never re-read";
+    std::filesystem::remove_all(dirA);
+    std::filesystem::remove_all(dirB);
+}
+
+// The Unreadable sibling: a torn length field in the ACTIVE segment (no sealed-segment damage flag involved).
+TEST_F(WorkerCorruptPushRegression, TornLengthInTheActiveSegmentFailsTheSubscriptionRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    for (int i = 0; i < 3; ++i) appendBatch(log, i, 1);
+    log.sync();
+    const std::string seg = corruptutil::firstSegment(dir);
+    ASSERT_FALSE(seg.empty());
+    const auto starts = corruptutil::batchStarts(seg);
+    ASSERT_EQ(starts.size(), 3u);
+    {   // while the log is open: batch 1's totalLength := 0x7fffffff
+        std::fstream f(seg, std::ios::in | std::ios::out | std::ios::binary);
+        const uint8_t huge[4] = {0xff, 0xff, 0xff, 0x7f};
+        f.seekp(static_cast<std::streamoff>(starts[1] + static_cast<std::size_t>(rune::protocol::batch::kLengthOffset)));
+        f.write(reinterpret_cast<const char*>(huge), 4);
+    }
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3142);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3142);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+    F19Egress c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64); return !c.errors.empty(); }, 10s));
+    ASSERT_EQ(c.errors.size(), 1u);
+    EXPECT_EQ(c.errors[0].code, static_cast<int16_t>(pc::ErrorCode::StorageError));
+    EXPECT_NE(c.errors[0].message.find("subscription 1 topic 10 partition 0 offset 1"), std::string::npos)
+        << c.errors[0].message;
+    ASSERT_EQ(c.recordsFor(1), 1u) << "batch 0 is delivered, nothing after the torn length";
+    EXPECT_EQ(c.records[0].baseOffset, 0);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(RecordsPushRegression, CorruptBatchCauseEncodesStorageErrorRegression) {
+    uint8_t buf[kPushTooLargeErrorMaxBytes];
+    const auto decode = [&](PushTooLargeCause cause) {
+        const std::size_t n = encodePushTooLargeError(buf, 77, 5, 3, 1, 9, 0, 0, cause);
+        return pc::ErrorResponse::decode(buf, n);
+    };
+    const auto corrupt = decode(PushTooLargeCause::CorruptBatch);
+    ASSERT_TRUE(corrupt.has_value());
+    EXPECT_EQ(corrupt->code, static_cast<int16_t>(pc::ErrorCode::StorageError));
+    EXPECT_EQ(corrupt->code, 26);
+    EXPECT_EQ(corrupt->correlationId, 0);
+    EXPECT_NE(corrupt->message.find("subscription 5 topic 3 partition 1 offset 9: the stored batch is corrupt"),
+              std::string_view::npos);
+    for (const auto cause : {PushTooLargeCause::EgressFrame, PushTooLargeCause::ReturnRing}) {
+        const auto other = decode(cause);
+        ASSERT_TRUE(other.has_value());
+        EXPECT_EQ(other->code, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+    }
+}

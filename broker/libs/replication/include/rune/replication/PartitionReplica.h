@@ -117,6 +117,10 @@ inline constexpr int16_t kErrReconcileDeferred = -5;
 // forever.  Cleared by a leadership/epoch change or a truncation that moves the
 // follower's LEO.
 inline constexpr int16_t kErrRecordTooLarge = -6;
+// #839: the batch at the fetch offset is stored DAMAGED on the leader (a sealed segment kept with its bad bytes, or an
+// unreadable range).  Never retriable at that offset and, like -6, not ISR liveness: the follower is forced Behind and
+// wedges there.  Cleared by an epoch change or a truncation that moves the follower's LEO.  The leader repairs nothing.
+inline constexpr int16_t kErrCorruptRecord = -12;
 // KIP-320/595 DivergingEpoch: the follower's (fetchOffset, lastFetchedEpoch) is
 // not on the leader's epoch lineage.  The answer carries divergingEpoch /
 // divergingEndOffset (= the leader's endOffsetForEpoch(lastFetchedEpoch)); the
@@ -1293,6 +1297,8 @@ public:
     // F18 (cumulative, never reset — exported for ops/tests).
     /// Leader: fetches answered kErrRecordTooLarge (first batch > one frame).
     [[nodiscard]] uint64_t recordTooLargeServed() const noexcept { return recordTooLargeServed_; }
+    /// Leader: fetches answered kErrCorruptRecord (the batch at the fetch offset is stored damaged).
+    [[nodiscard]] uint64_t corruptReadsServed() const noexcept { return corruptReadsServed_; }
     /// Follower: times this replica wedged on an unreplicable batch.
     [[nodiscard]] uint64_t wedgedRefusals() const noexcept { return wedgedRefusals_; }
     /// Follower: the offset it is wedged at (stops fetching it), or -1.
@@ -1518,7 +1524,8 @@ private:
     /// D26: a whole-batch read of the active log — a pread into readScratch_
     /// when set (disk log), else the mapped view.  The view lives until the next
     /// read through this helper on the same thread.
-    rune::storage::LogReadView readLog_(Offset from, int32_t maxBytes) noexcept;
+    /// `stOut` (optional) receives the disk read's status (Ok on the memory-backed and map paths).
+    rune::storage::LogReadView readLog_(Offset from, int32_t maxBytes, rune::storage::ReadIntoStatus* stOut = nullptr) noexcept;
     PartitionTransport*         transport_;   ///< non-owning
     using PerWorkerTransport = WorkerReplicationTransportImpl<AeronPubRegistry>;
     TransportKind       tkind_     = TransportKind::Generic;  ///< fixed at construction
@@ -1766,6 +1773,7 @@ private:
     int64_t rtApplyBytes_ = 0, rtPushBytes_ = 0;
     // F18 unreplicable-batch state (see kErrRecordTooLarge).
     uint64_t recordTooLargeServed_ = 0;
+    uint64_t corruptReadsServed_   = 0;   ///< #839: fetches answered kErrCorruptRecord
     uint64_t wedgedRefusals_       = 0;
     Offset   wedgedAtOffset_       = -1;
     void wedgeAt_(Offset at, const char* why);   ///< F18: enter the wedged state (log + count)

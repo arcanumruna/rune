@@ -2043,6 +2043,22 @@ public:
         spdlog::info("MetadataService[{}]: halted (node stopping) — no further controller decisions", selfId_);
     }
     [[nodiscard]] bool haltedForTest() const noexcept { return halted_; }
+private:
+    /// #839: true when `cursor` (an offset an empty read just returned nothing for) lies in a damaged segment of the
+    /// metadata log.  Logs a critical line once.
+    [[nodiscard]] bool damagedAt_(rune::replication::Offset cursor) {
+        if (!replica_->isDiskBacked()) return false;
+        const auto dmg = replica_->log()->damageAt(static_cast<int64_t>(cursor));
+        if (!dmg) return false;
+        if (!damageReported_) {
+            damageReported_ = true;
+            spdlog::critical("MetadataService[{}]: __cluster_metadata has a damaged segment at offset {} - the metadata map is "
+                             "NOT loaded and this controller decides nothing (wipe this node's data directory and let it "
+                             "resync)", selfId_, static_cast<long long>(*dmg));
+        }
+        return true;
+    }
+public:
     /// M2: a preferred-leader (re-spread) pass is due — the controller just
     /// caught up, or the committed map changed since the last pass (a returned
     /// replica re-entered an ISR: it becomes a preferred-leader candidate only
@@ -2547,7 +2563,12 @@ public:
         while (cursor < hw) {
             const std::vector<uint8_t> data =
                 replica_->read(cursor, kChunkBytes);
-            if (data.empty()) break;
+            if (data.empty()) {
+                // #839: an empty read at a damaged segment is a HOLE: committing around it would publish a map missing
+                // records.  Fail closed (decide nothing) and apply nothing more.
+                if (damagedAt_(cursor)) { halt(); return 0; }
+                break;
+            }
 
             std::size_t pos = 0;
             rune::replication::Offset lastBatchEnd = cursor;
@@ -2642,7 +2663,11 @@ public:
         while (cursor < hw) {
             const std::vector<uint8_t> data =
                 replica_->readUpTo(cursor, kChunkBytes, hw);
-            if (data.empty()) break;
+            if (data.empty()) {
+                // #839: a hole, not the end: the map stays empty and un-committed, the controller decides nothing (halt()).
+                if (damagedAt_(cursor)) { halt(); return false; }
+                break;
+            }
 
             std::size_t pos = 0;
             rune::replication::Offset lastBatchEnd = cursor;
@@ -3507,6 +3532,7 @@ private:
     bool     resignRequested_ = false;   ///< the empty-log guard asks NodeRuntimeAgent to resign the consensus
     MayBootstrapFn mayBootstrapFn_  = nullptr;
     void*          mayBootstrapCtx_ = nullptr;
+    bool     damageReported_     = false;   ///< #839: the damaged-log critical line is logged once
     bool     halted_             = false;   ///< fix round 2 N2: stopping — decides nothing
     bool     recheckOnCatchUp_   = false;
     uint64_t preferredCheckedVersion_ = 0;

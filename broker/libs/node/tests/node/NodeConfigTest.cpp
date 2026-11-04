@@ -2363,8 +2363,9 @@ TEST(NodeConfigTest, PsmLogConsistencyRegression_ProducerIdExpirationDefaultAndO
     EXPECT_EQ(r2.config->producerIdExpirationMs, 3'600'000);
     env["RUNE_PRODUCER_ID_EXPIRATION_MS"] = "-5";
     auto r3 = parseNodeConfig(fakeEnv(env));
-    ASSERT_TRUE(r3.error.empty()) << r3.error;
-    EXPECT_EQ(r3.config->producerIdExpirationMs, 7LL * 24 * 3600 * 1000) << "invalid -> default";
+    // #837: a negative (or garbage) value now refuses startup instead of silently keeping the default.
+    EXPECT_FALSE(r3.error.empty());
+    EXPECT_NE(r3.error.find("RUNE_PRODUCER_ID_EXPIRATION_MS"), std::string::npos) << r3.error;
 }
 
 TEST(ResponseControlConfigRegression, SegmentSevenOrEightZeroIsRefusedRegression) {
@@ -3510,10 +3511,12 @@ TEST(NodeConfigRegression, MsKnobsAboveThirtyDaysAreRefusedRegression) {
 // Batch 1 adversarial pass, #803 sibling class: the ms knobs #803 did not route through the 30-day cap.  RUNE_CONTROLLED_SHUTDOWN_MS
 // becomes std::chrono::milliseconds that BrokerNode::controlledShutdown adds to a steady_clock (ns) time point, and
 // RUNE_NS_DEFAULT_MAX_TXN_TIME_MS is multiplied by 1'000'000 in TransactionCoordinator::doWork; above the cap both overflow.
-// Kept out of the suite until the issue is fixed (#837).
-TEST(NodeConfigRegression, DISABLED_UncappedMsKnobsAboveThirtyDaysAreRefusedAdversarialRegression) {
+// RUNE_PRODUCER_ID_EXPIRATION_MS ignored strtoll's end pointer (#837).
+TEST(NodeConfigRegression, UncappedMsKnobsAboveThirtyDaysAreRefusedAdversarialRegression) {
     constexpr int64_t kCap = NodeConfig::kMaxDurationMs;
-    for (const char* var : {"RUNE_CONTROLLED_SHUTDOWN_MS", "RUNE_NS_DEFAULT_MAX_TXN_TIME_MS"}) {
+    const char* const vars[] = {"RUNE_CONTROLLED_SHUTDOWN_MS", "RUNE_NS_DEFAULT_MAX_TXN_TIME_MS",
+                                "RUNE_PRODUCER_ID_EXPIRATION_MS"};
+    for (const char* var : vars) {
         SCOPED_TRACE(var);
         auto withValue = [&](const std::string& v) {
             auto env = base3node();
@@ -3527,13 +3530,75 @@ TEST(NodeConfigRegression, DISABLED_UncappedMsKnobsAboveThirtyDaysAreRefusedAdve
             EXPECT_FALSE(r.error.empty()) << bad << " was accepted";
             EXPECT_NE(r.error.find(var), std::string::npos) << r.error;
         }
+        // Trailing garbage, ERANGE, a negative and a trailing blank are refused too, each error naming the variable.
+        // (RUNE_NS_DEFAULT_* values are trimmed by design, for every field, so "5 " is only refused for the others.)
+        const bool trimmed = std::string_view(var) == "RUNE_NS_DEFAULT_MAX_TXN_TIME_MS";
+        for (const char* bad : {"5000abc", "99999999999999999999", "-1", "5 "}) {
+            if (trimmed && std::string_view(bad) == "5 ") continue;
+            const auto r = withValue(bad);
+            EXPECT_FALSE(r.error.empty()) << var << "=" << bad << " was accepted";
+            EXPECT_NE(r.error.find(var), std::string::npos) << r.error;
+        }
     }
-    // RUNE_PRODUCER_ID_EXPIRATION_MS is parsed with strtoll and no end check: trailing garbage and ERANGE are accepted silently.
-    for (const char* bad : {"5000abc", "99999999999999999999"}) {
+}
+
+// #837: the microsecond knobs that are multiplied by 1000 to ns had no end check and no cap.
+TEST(NodeConfigRegression, MicrosecondParkAndFetchKnobsAreBoundedRegression) {
+    auto parseWith = [](const char* var, const std::string& v) {
         auto env = base3node();
-        env["RUNE_PRODUCER_ID_EXPIRATION_MS"] = bad;
-        const auto r = parseNodeConfig(fakeEnv(env));
-        EXPECT_FALSE(r.error.empty()) << "RUNE_PRODUCER_ID_EXPIRATION_MS=" << bad << " was accepted";
+        env[var] = v;
+        return parseNodeConfig(fakeEnv(env));
+    };
+    {
+        const char* var = "RUNE_SEGMENT_PROVISIONER_MAX_PARK_US";
+        SCOPED_TRACE(var);
+        for (const char* okv : {"1", "1000000"}) {
+            const auto r = parseWith(var, okv);
+            ASSERT_TRUE(r.error.empty()) << okv << ": " << r.error;
+            EXPECT_EQ(r.config->segmentProvisionerMaxParkUs, std::stoll(okv));
+        }
+        for (const char* bad : {"0", "1000001", "10abc", "99999999999999999999"}) {
+            const auto r = parseWith(var, bad);
+            EXPECT_FALSE(r.error.empty()) << bad << " was accepted";
+            EXPECT_NE(r.error.find(var), std::string::npos) << r.error;
+        }
+    }
+    {
+        const char* var = "RUNE_FETCH_INTERVAL_US";
+        SCOPED_TRACE(var);
+        const auto one = parseWith(var, "1");
+        ASSERT_TRUE(one.error.empty()) << one.error;
+        EXPECT_EQ(one.config->fetchIntervalNs, 1000);
+        const auto cap = parseWith(var, "2592000000000");
+        ASSERT_TRUE(cap.error.empty()) << cap.error;
+        EXPECT_EQ(cap.config->fetchIntervalNs, 2'592'000'000'000'000LL);
+        for (const char* bad : {"0", "2592000000001", "5000x", "9223372036854775807"}) {
+            const auto r = parseWith(var, bad);
+            EXPECT_FALSE(r.error.empty()) << bad << " was accepted";
+            EXPECT_NE(r.error.find(var), std::string::npos) << r.error;
+        }
+    }
+}
+
+// #837 (F12): strtoll skips leading whitespace and accepts a sign; these knobs take a plain decimal number.
+// RED by mutation: drop the isDigitFirst check from one of the sites in NodeConfig.cpp.
+TEST(NodeConfigRegression, LeadingWhitespaceOrSignIsRefusedByTheStrictMsKnobsRegression) {
+    const char* const vars[] = {"RUNE_CONTROLLED_SHUTDOWN_MS", "RUNE_PRODUCER_ID_EXPIRATION_MS",
+                                "RUNE_SEGMENT_PROVISIONER_MAX_PARK_US", "RUNE_FETCH_INTERVAL_US"};
+    for (const char* var : vars) {
+        SCOPED_TRACE(var);
+        auto parseWith = [&](const std::string& v) {
+            auto env = base3node();
+            env[var] = v;
+            return parseNodeConfig(fakeEnv(env));
+        };
+        const auto ok = parseWith("5");
+        ASSERT_TRUE(ok.error.empty()) << ok.error;
+        for (const char* bad : {" 5", "\t5", "+5", "\n5"}) {
+            const auto r = parseWith(bad);
+            EXPECT_FALSE(r.error.empty()) << "'" << bad << "' was accepted";
+            EXPECT_NE(r.error.find(var), std::string::npos) << r.error;
+        }
     }
 }
 

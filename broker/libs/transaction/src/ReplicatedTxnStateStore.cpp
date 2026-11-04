@@ -15,6 +15,8 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>  // RecordBatchReader (for rebuildFromLog)
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -354,13 +356,13 @@ void ReplicatedTxnStateStore::applyRecord(std::string_view payload)
 // durability fix): Log::read() resolves only ONE segment per call, so we loop
 // advancing fetchOffset to the next-batch start until we reach the HW.
 // ---------------------------------------------------------------------------
-void ReplicatedTxnStateStore::rebuildFromLog()
+bool ReplicatedTxnStateStore::rebuildFromLog()
 {
     index_.clear();
     persistedPidCeiling_ = -1;
 
     const rune::replication::Offset hw = replica_->highWatermark();
-    if (hw <= 0) return;
+    if (hw <= 0) return true;
 
     static constexpr int32_t kChunkBytes = 64 * 1024 * 1024; // 64 MiB per segment read
 
@@ -380,6 +382,18 @@ void ReplicatedTxnStateStore::rebuildFromLog()
         std::vector<uint8_t> data = replica_->read(fetchOffset, kChunkBytes);
         if (data.empty()) {
             if (diskLog == nullptr) break;
+            // #839: an empty read at a damaged segment is a HOLE, not a compaction gap: skipping would forget the txn state
+            // in it (an ongoing/prepared txn's markers never written).  Not loaded.
+            if (const auto dmg = diskLog->damageAt(static_cast<int64_t>(fetchOffset))) {
+                if (!damageReported_) {
+                    damageReported_ = true;
+                    spdlog::critical("ReplicatedTxnStateStore: __transaction_state has a damaged segment at offset {} - the txn "
+                                     "state is NOT loaded (wipe this node's data directory and let it resync)", *dmg);
+                }
+                index_.clear();
+                persistedPidCeiling_ = -1;
+                return false;
+            }
             const auto bases = diskLog->segmentBaseOffsets();
             const auto it = std::upper_bound(bases.begin(), bases.end(), static_cast<int64_t>(fetchOffset));
             if (it == bases.end()) break;
@@ -428,6 +442,7 @@ void ReplicatedTxnStateStore::rebuildFromLog()
         if (lastBatchEnd <= fetchOffset) break; // no progress → stop
         fetchOffset = lastBatchEnd;
     }
+    return true;
 }
 
 } // namespace rune::transaction

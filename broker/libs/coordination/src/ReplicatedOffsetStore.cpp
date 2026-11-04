@@ -34,6 +34,8 @@
 #include <rune/coordination/NsScopedId.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -417,6 +419,17 @@ bool ReplicatedOffsetStore::rebuildFromLog()
             // segment were deleted, leaving a gap).  Simply breaking here would
             // stop the rebuild prematurely, losing committed offsets from later
             // segments.  Advance to the start of the next segment instead.
+            // #839: an empty read at a damaged segment is a HOLE, not a compaction gap: skipping to the next segment would
+            // load committed offsets around the missing commits (a group rewinds: duplicate delivery).  Not loaded.
+            if (const auto dmg = replica_->log()->damageAt(static_cast<int64_t>(fetchOffset))) {
+                if (!damageReported_) {
+                    damageReported_ = true;
+                    spdlog::critical("ReplicatedOffsetStore: __consumer_offsets has a damaged segment at offset {} - the offset "
+                                     "index is NOT loaded (wipe this node's data directory and let it resync)", *dmg);
+                }
+                index_.clear();
+                return false;
+            }
             const auto segBases = replica_->log()->segmentBaseOffsets();
             auto it = std::upper_bound(segBases.begin(), segBases.end(),
                                        static_cast<int64_t>(fetchOffset));
