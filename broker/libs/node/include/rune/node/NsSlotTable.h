@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace rune::node {
@@ -43,6 +44,11 @@ public:
         limits_.assign(capacity, rune::protocol::NamespaceLimits{});
         nsId_[0] = 0;
         used_    = 1;
+        live_.clear();
+        live_.reserve(capacity);   // the dense live list never allocates after reset()
+        live_.push_back(0);        // default
+        pos_.assign(capacity, kNoPos);
+        pos_[0] = 0;
     }
 
     [[nodiscard]] uint32_t capacity() const noexcept { return static_cast<uint32_t>(nsId_.size()); }
@@ -56,6 +62,7 @@ public:
             nsId_[s]  = nsId;
             limits_[s] = rune::protocol::NamespaceLimits{};   // a reused slot never inherits the old owner's limits
             ++used_;
+            markLive_(static_cast<uint16_t>(s));
             return static_cast<uint16_t>(s);
         }
         return std::nullopt;
@@ -71,6 +78,7 @@ public:
         nsId_[slot]  = nsId;
         limits_[slot] = rune::protocol::NamespaceLimits{};
         ++used_;
+        markLive_(slot);
         return true;
     }
 
@@ -80,8 +88,17 @@ public:
         if (slot == 0 || slot >= nsId_.size() || nsId_[slot] != nsId || nsId == kFreeSlot) return false;
         nsId_[slot] = kFreeSlot;
         --used_;
+        const uint16_t at = pos_[slot], last = live_.back();   // swap-pop
+        live_[at]  = last;
+        pos_[last] = at;
+        pos_[slot] = kNoPos;
+        live_.pop_back();
         return true;
     }
+
+    /// The slots currently held, dense (default first, then in no particular order).  Per-tick loops iterate this, never
+    /// capacity().  Stable until the next assign / place / release / reset.
+    [[nodiscard]] std::span<const uint16_t> liveSlots() const noexcept { return {live_.data(), live_.size()}; }
 
     /// The slot holding `nsId`, kNoNsSlot when none.  Linear: login / DDL time only.
     [[nodiscard]] uint16_t slotOf(uint32_t nsId) const noexcept {
@@ -107,6 +124,13 @@ public:
     }
 
 private:
+    static constexpr uint16_t kNoPos = 0xFFFF;
+    void markLive_(uint16_t slot) noexcept {   // free -> held only; push_back stays within the reserved capacity
+        pos_[slot] = static_cast<uint16_t>(live_.size());
+        live_.push_back(slot);
+    }
+    std::vector<uint16_t>                         live_;
+    std::vector<uint16_t>                         pos_;
     std::vector<uint32_t>                         nsId_;
     std::vector<rune::protocol::NamespaceLimits>  limits_;
     uint32_t                                      used_ = 0;

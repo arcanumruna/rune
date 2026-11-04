@@ -11,9 +11,11 @@
 //   | push read (fetch)         | tagged, limits set, not throttled       | 0 allocations / 10 000         | NsHotPathAllocRegression.FetchZeroAllocRegression
 //   | GetViewRow                | tagged source, limits set               | 0 allocations / 10 000         | NsHotPathAllocRegression.ViewReadZeroAllocRegression
 //   | produce / push / view read| Throttled (any kind), over-disk         | refused, 0 allocations / 10 000 each | NsHotPathAllocRegression.ThrottledRefusalZeroAllocRegression
+//   | leader produce (#712)     | TRANSIENT partition, tagged, limits set | 0 allocations / 10 000         | NsHotPathAllocRegression.TransientProduceZeroAllocRegression
 //   | the counters              | every path above                        | the counters moved (not vacuous)| each test asserts the counter delta
 // Mutation (Step 1): build the Throttled reply in a std::vector (Worker.h, the produce refusal) -> ThrottledRefusalZeroAllocRegression fails.
 #include "HotPathBRig.h"
+#include "TransientRig.h"
 #include "support/AllocWindow.h"
 
 #include <rune/codec/Descriptor.h>
@@ -246,4 +248,36 @@ TEST(NsHotPathAllocRegression, ThrottledRefusalZeroAllocRegression) {
         EXPECT_EQ(allocsOver(v.rig, kRequests, read, nullptr), 0u) << "the Throttled view-read refusal allocated";
         EXPECT_EQ(v.rig.worker().throttledRefusalsForTest() - before, static_cast<uint64_t>(kRequests));
     }
+}
+
+// #712: a transient partition (InMemoryLog) now runs the same namespace gates and counters as a disk log; they allocate nothing.
+TEST(NsHotPathAllocRegression, TransientProduceZeroAllocRegression) {
+    transient_rig::Rig rig;
+    rig.mem.setNsTag(kNs, kSlot);
+    rune::protocol::NamespaceLimits l;
+    l.produceBytesPerSec = 1ull << 40; l.produceRecordsPerSec = 1ull << 40; l.requestOpsPerSec = 1ull << 40;
+    l.maxBatchBytes = 1ull << 30; l.maxMessageBytes = 1ull << 30;
+    rig.worker().applyNsSlotAssignDirect(kSlot, kNs, l);
+    const auto frame = transient_rig::produceFrame(1, transient_rig::batchOf(1, 100), 1);
+    auto run = [&](int requests) {
+        uint64_t allocs = 0;
+        for (int i = 0; i < requests; ++i) {
+            rig.now += 1'000'000;
+            {
+                rune::testing::AllocWindow w;
+                (void)rig.worker().handleIngressFrameForTest(frame.data(), frame.size(), rig.now);
+                (void)rig.worker().doWork(rig.now);
+                allocs += w.count();
+            }
+            rig.pool.drainAllReturns([](WorkerReturn) {});
+        }
+        return allocs;
+    };
+    (void)run(kWarmup);
+    const uint64_t before = rig.worker().nsCounterForTest(kSlot, NsMetric::ProduceRecords);
+    const uint64_t allocs = run(kRequests);
+    EXPECT_EQ(allocs, 0u) << "the transient produce path (gate + counters) allocated";
+    EXPECT_EQ(rig.worker().nsCounterForTest(kSlot, NsMetric::ProduceRecords) - before, static_cast<uint64_t>(kRequests))
+        << "not vacuous: every transient produce was counted";
+    EXPECT_EQ(rig.worker().throttledRefusalsForTest(), 0u);
 }

@@ -40,12 +40,12 @@ int NsLimitAggregator::doWork(int64_t nowNs) {
     const int64_t elapsed = nowNs - lastTickNs_;
     lastTickNs_ = nowNs;
     const std::size_t before = events_.size();
-    const uint32_t cap = slots_.capacity();
-    for (uint32_t su = 0; su < cap; ++su) {
-        const auto slot = static_cast<uint16_t>(su);
-        if (slots_.nsIdAt(slot) == NsSlotTable::kFreeSlot) continue;
+    visitedLastTick_ = 0;
+    // #728: only the live slots (the table's dense list), never the capacity; the loop does not change the table.
+    for (const uint16_t slot : slots_.liveSlots()) {
+        ++visitedLastTick_;
         const rune::protocol::NamespaceLimits& L = slots_.limits(slot);
-        const std::size_t s = su;
+        const std::size_t s = slot;
 
         // ---- rates (D28) ----
         for (const RateRow& r : kRates) {

@@ -283,4 +283,28 @@ void BM_NsViewPointRead(benchmark::State& state) {
 }
 BENCHMARK(BM_NsViewPointRead)->Unit(benchmark::kMicrosecond);
 
+#if RUNE_NSB
+// ---- 4. the per-slot usage report (#728): cost of one report pass with 3 live namespaces in a table of `max-namespaces` slots.
+// The shared bench main takes only --benchmark_* flags, so max-namespaces is this benchmark's Arg (RUNE_MAX_NAMESPACES at the
+// broker): run `--benchmark_filter=BM_NsUsageReport` for 1024 and 65535 slots.  Before #728 the pass walked every slot.
+void BM_NsUsageReport(benchmark::State& state) {
+    Fixture fix;
+    fix.worker->configureNsSlots(static_cast<uint32_t>(state.range(0)));
+    const rune::protocol::NamespaceLimits l;
+    for (uint32_t i = 0; i < 3; ++i) fix.worker->applyNsSlotAssignDirect(static_cast<uint16_t>(1 + i), 100 + i, l);
+    (void)fix.worker->reportNsUsageForTest();   // the first pass reports the initial values; later passes find nothing changed
+    fix.worker->drainReturn([](WorkerReturn&&) {});
+    std::vector<int64_t> samples;
+    samples.reserve(1 << 17);
+    for (auto _ : state) {
+        const auto t0 = std::chrono::steady_clock::now();
+        benchmark::DoNotOptimize(fix.worker->reportNsUsageForTest());
+        samples.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    }
+    state.SetItemsProcessed(state.iterations());
+    reportPercentiles(state, samples);
+}
+BENCHMARK(BM_NsUsageReport)->Arg(1024)->Arg(65535)->Unit(benchmark::kNanosecond);
+#endif
+
 }  // namespace
