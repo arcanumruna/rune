@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <initializer_list>
 #include <map>
 #include <string>
 #include <vector>
@@ -105,7 +106,7 @@ TEST(LimitEnforcementTableRegression, TxnTimeRegression) {
 // #837: a namespace record written by an older broker can carry any uint64 maxTxnTimeMs.  The sweep converted it to ns with a
 // signed multiply, which wraps negative above ~9.2e12 ms and aborted every open transaction of the namespace at once.
 TEST(LimitEnforcementTableRegression, HugeNamespaceTxnTimeNeverAbortsAtOnceRegression) {
-    for (const uint64_t x : {9'300'000'000'000ULL, 1ULL << 63, UINT64_MAX}) {
+    for (const uint64_t x : std::initializer_list<uint64_t>{9'300'000'000'000ULL, 1ULL << 63, UINT64_MAX}) {
         SCOPED_TRACE(x);
         TransactionCoordinator c(ProducerIdAllocator{}, 60'000);
         const std::string id = scopedId(1, "h");
