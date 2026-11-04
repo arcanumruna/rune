@@ -319,9 +319,27 @@ TEST(TxnAbortOnSuspendRegression, DeleteAbortsRegression) {
     // the drop even though the ABORT marker is in the log first (under load: landed 3 ms before the drop, never delivered).
     BrokerNode& node = s.f.b.node();
     node.onAdminThreadForTest([&] { node.adminWorkerAgentForTest()->worker().reaperForTest().setIssueBudgetForTest(0); return 0; });
+    // #721: a DELETING namespace is not readable by id, the cluster admin's subscription included (it ends at the Deleting apply),
+    // so the sentinel cannot be the witness here.  The witness is the partition's last stable offset: pinned at the open
+    // transaction's first record before the delete, past the sentinel once the ABORT marker is in the log.
+    const auto lsoOf = [&] {
+        return node.onOwnerThreadForTest(s.f.tA.topicId, 0, [](rune::replication::PartitionReplica* r) {
+            return r != nullptr ? static_cast<int64_t>(r->cleanerLastStableOffset()) : int64_t{-1};
+        });
+    };
+    const auto endOf = [&] {
+        return node.onOwnerThreadForTest(s.f.tA.topicId, 0, [](rune::replication::PartitionReplica* r) {
+            return r != nullptr ? static_cast<int64_t>(r->logEndOffset()) : int64_t{-1};
+        });
+    };
+    const int64_t endBefore = endOf();
+    ASSERT_GT(endBefore, 0);
+    ASSERT_LT(lsoOf(), endBefore) << "premise: the open transaction pins the LSO below the sentinel";
     const auto del = s.f.admin->deleteNamespace("a");
     ASSERT_TRUE(del.has_value()) << del.error().errorCode << " " << del.error().detail;
-    s.expectAborted();
+    ASSERT_TRUE(waitFor([&] { return lsoOf() >= endBefore; }, 40s))
+        << "the LSO never passed the sentinel: the open transaction was not aborted (its ABORT marker is not in the log); lso "
+        << lsoOf() << " end " << endOf();
     const auto pastAbortTxns = [&] {   // the step answered Done: the reaper records TxnsAborted next
         return node.onAdminThreadForTest([&] {
             return std::holds_alternative<ReapRecordingStep>(node.adminWorkerAgentForTest()->worker().reaperForTest().state()) ? 1 : 0;

@@ -569,6 +569,18 @@ void txnOpen(const TCell& p) {
     ASSERT_TRUE(waitFor([&] { return uncommittedSawS.load(); }, 20s)) << "premise: the sentinel is in the log";
     subU.unsubscribe();
     EXPECT_TRUE(snapshot().empty()) << "premise: an open transaction pins the last stable offset";
+    // #721: a DELETING namespace is not readable by id, the cluster admin's subscription included (it ends at the Deleting
+    // apply), so for Delete the witness of the abort is the partition's last stable offset (pinned below the sentinel by the
+    // open transaction, past it once the ABORT marker is in the log) instead of the sentinel's delivery.
+    auto replicaInt = [&](auto read) {
+        return b.node().onOwnerThreadForTest(spec.topicId, 0, [&](rune::replication::PartitionReplica* r) {
+            return r != nullptr ? static_cast<int64_t>(read(*r)) : int64_t{-1};
+        });
+    };
+    const auto lsoOf = [&] { return replicaInt([](rune::replication::PartitionReplica& r) { return r.cleanerLastStableOffset(); }); };
+    const auto endOf = [&] { return replicaInt([](rune::replication::PartitionReplica& r) { return r.logEndOffset(); }); };
+    const int64_t endBefore = endOf();
+    if (p.variant >= 2) ASSERT_LT(lsoOf(), endBefore) << "premise: the open transaction pins the LSO below the sentinel";
     switch (p.variant) {
         case 0: ASSERT_TRUE(admin->suspendNamespace("a", pc::NsSuspendMode::ReadOnly).has_value()); break;
         case 1: ASSERT_TRUE(admin->suspendNamespace("a", pc::NsSuspendMode::RejectAll).has_value()); break;
@@ -582,9 +594,14 @@ void txnOpen(const TCell& p) {
             ASSERT_TRUE(admin->deleteNamespace("a").has_value());
             break;
     }
-    ASSERT_TRUE(waitFor([&] { const auto s = snapshot(); return std::find(s.begin(), s.end(), "S") != s.end(); }, 40s))
-        << "the sentinel never became visible: the open transaction was not aborted";
-    for (const std::string& v : snapshot()) EXPECT_EQ(v, "S") << "an aborted record is visible to read_committed";
+    if (p.variant >= 2) {
+        ASSERT_TRUE(waitFor([&] { return lsoOf() >= endBefore; }, 40s))
+            << "the LSO never passed the sentinel: the open transaction was not aborted; lso " << lsoOf() << " end " << endOf();
+    } else {
+        ASSERT_TRUE(waitFor([&] { const auto s = snapshot(); return std::find(s.begin(), s.end(), "S") != s.end(); }, 40s))
+            << "the sentinel never became visible: the open transaction was not aborted";
+        for (const std::string& v : snapshot()) EXPECT_EQ(v, "S") << "an aborted record is visible to read_committed";
+    }
     // The commit fails at once with a definite outcome - never by waiting out its timeout (review B1: a timeout used to
     // pass here and hid two client hangs: EndTxn 51 retried until the deadline, a RejectAll's corr-0 51 ignored).
     std::string err;
