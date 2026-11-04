@@ -90,6 +90,9 @@ public:
     /// the namespace guard (spec §4).  Not owned; it must outlive this object (the AdminWorker's CatalogApplier state).
     /// nullptr (a rig without a catalog): only `default` exists.
     void bindCatalog(const rune::catalog::CatalogState* catalog) noexcept { catalog_ = catalog; }
+    /// The cluster feature level (the AdminWorker's), read when a grant needs a minimum level.  Not owned.
+    /// nullptr (a rig without one): no level gate.
+    void bindFeatureLevel(const int16_t* level) noexcept { featureLevel_ = level; }
 
     /// Queued, one in flight.  Beyond kMaxPending the request is answered Internal at once (never started).
     void submit(SecurityRequest r);
@@ -164,6 +167,7 @@ private:
     SecurityRespond                      respond_;
     int32_t                              selfId_;
     const rune::catalog::CatalogState*   catalog_ = nullptr;
+    const int16_t*                       featureLevel_ = nullptr;
     SecurityRole                         role_{SecurityFollower{}};
     std::variant<Idle, AwaitingCommit>   inFlight_;
     std::deque<SecurityRequest>          pending_;

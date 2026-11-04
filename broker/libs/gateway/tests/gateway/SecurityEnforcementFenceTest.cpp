@@ -17,10 +17,14 @@
 #include <rune/node/SessionSignalKind.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/security/Permissions.h>
 #include <rune/security/SecurityEvent.h>
+
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/WorkerOp.h>
 
 #include <gtest/gtest.h>
 
@@ -35,6 +39,7 @@ using namespace rune::node::test;
 namespace pc  = rune::protocol::client;
 namespace sec = rune::security;
 namespace fs  = std::filesystem;
+namespace sbe = rune::protocol::internal::sbe;
 
 namespace {
 
@@ -491,4 +496,45 @@ TEST(SecurityEnforcementFenceRegression, TheBehindFlagShipsEdgesOnlyRegression) 
     for (int i = 0; i < 3; ++i) r.runAll(10 + i);
     EXPECT_EQ(r.gw.permissionOpsShippedForTest() - before, 4u);
     for (int32_t w = 0; w < 2; ++w) EXPECT_FALSE(r.pool.worker(w).securityBehindForTest()) << w;
+}
+
+namespace {
+/// Sends one produce on `sid` and returns the `deferAck` flag byte of the op the gateway queued for the worker.
+uint8_t routedProduceFlags(FenceRig& r, int64_t sid) {
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    b.append(std::string_view{}, std::string_view{"v"}, 0);
+    const std::vector<uint8_t> batch = b.build();
+    pc::Produce m;
+    m.sessionId = sid; m.correlationId = 1; m.topicId = 0; m.partition = 0;
+    m.partitionKnown = 1; m.acks = 0; m.producerId = -1; m.producerEpoch = 0; m.baseSequence = -1;
+    m.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+    std::vector<uint8_t> buf(m.encodedSize());
+    m.encode(buf.data());
+    r.gw.applyProduceForTest(buf.data(), buf.size());
+    int seen = 0;
+    uint8_t flags = 0;
+    r.pool.worker(0).opRingForDoorbell().drain([&](int32_t, aeron::concurrent::AtomicBuffer& ab, aeron::util::index_t off, aeron::util::index_t len) {
+        char* c = reinterpret_cast<char*>(ab.buffer()) + off;
+        sbe::MessageHeader mh;
+        mh.wrap(c, 0, 0, static_cast<std::size_t>(len));
+        sbe::WorkerOp op;
+        op.wrapForDecode(c, sbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(),
+                         static_cast<std::size_t>(len));
+        flags = op.deferAck();
+        ++seen;
+    }, 16);
+    EXPECT_EQ(seen, 1) << "one routed produce op";
+    return flags;
+}
+}  // namespace
+
+TEST(CheckedWritesImportGrant, GatewaySetsTheOpFlagOnlyWithTheGrant) {
+    FenceRig r(1);
+    (void)r.apply(sec::CreateUserOps{testVerifier(3)}, "i", "CREATE USER i WITH PASSWORD '<redacted>';");
+    for (const auto op : {sec::Operation::Write, sec::Operation::Import})
+        (void)r.apply(sec::GrantOps{sec::GranteeKind::User, topicGrant(op, "events")}, "i", "GRANT ... ON TOPIC events TO USER i;");
+    const int64_t withGrant = r.login("i");
+    const int64_t writeOnly = r.login("w");
+    EXPECT_NE(routedProduceFlags(r, withGrant) & rune::node::kOpFlagImportGranted, 0);
+    EXPECT_EQ(routedProduceFlags(r, writeOnly) & rune::node::kOpFlagImportGranted, 0);
 }

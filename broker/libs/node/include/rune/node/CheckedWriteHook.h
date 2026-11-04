@@ -28,6 +28,7 @@ struct WriteFacts {
     bool    transactional      = false;
     bool    atomicBatch        = false;
     bool    importGranted      = false;
+    int64_t producerId         = -1;
     bool    legacyMode         = false;
     bool    levelCheckedWrites = false;
 };

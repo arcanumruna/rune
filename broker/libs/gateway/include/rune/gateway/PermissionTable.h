@@ -43,6 +43,12 @@ public:
     [[nodiscard]] bool allows(int32_t objectId, uint8_t opBits) const noexcept {   // ONE bounds check + ONE load
         return allowAll_ || (static_cast<uint32_t>(objectId) < ops_.size() && (ops_[static_cast<std::size_t>(objectId)] & opBits) == opBits);
     }
+    /// IMPORT on a topic (checked writes): its own bit per id, outside the op masks.  Root and ADMIN never imply it;
+    /// only an allow-all table answers true without a grant.
+    [[nodiscard]] bool allowsImport(int32_t objectId) const noexcept {
+        const auto i = static_cast<uint32_t>(objectId);
+        return allowAll_ || ((i >> 6) < importBits_.size() && ((importBits_[i >> 6] >> (i & 63)) & 1u));
+    }
     [[nodiscard]] bool allowsCluster(uint8_t opBits) const noexcept { return allowAll_ || (clusterOps_ & opBits) == opBits; }
     /// Name-addressed (groups, transactional ids, DDL names): the retained patterns matched against `name`.  Cold.
     [[nodiscard]] bool allowsName(rune::security::ResourceType, std::string_view name, uint8_t opBits) const noexcept;
@@ -68,9 +74,12 @@ public:
 
     /// The WRITE bit per topic / view id (word i bit b = id 64*i+b), kept in step with ops_ (Task 13 ships it).
     [[nodiscard]] std::span<const uint64_t> writeBits() const noexcept { return writeBits_; }
+    /// The IMPORT bit per topic id (same layout as writeBits()); empty when the table grants IMPORT nowhere.
+    [[nodiscard]] std::span<const uint64_t> importBits() const noexcept { return importBits_; }
 
 private:
-    void setOps_(int32_t id, uint8_t ops);
+    void setOps_(int32_t id, uint8_t ops, bool import);
+    [[nodiscard]] bool importOf_(const ObjectEntry& e) const noexcept;
     [[nodiscard]] uint8_t opsOf_(const ObjectEntry& e) const noexcept;   // 0 on a foreign object unless root
     bool allowAll_ = false;
     bool root_ = false;
@@ -81,6 +90,7 @@ private:
     std::vector<uint8_t> ops_;                          // by object id; capacity persists
     std::vector<rune::security::GrantSpec> grants_;     // retained for onObjectCreated / allowsName
     std::vector<uint64_t> writeBits_;                   // WRITE bit per id, kept in step with ops_
+    std::vector<uint64_t> importBits_;                  // IMPORT bit per id, from the grants whose op is Import
 };
 
 } // namespace rune::gateway

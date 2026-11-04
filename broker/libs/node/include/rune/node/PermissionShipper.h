@@ -49,6 +49,17 @@ public:
         it.key = tableId; it.first = first; it.total = total; it.words.assign(words.begin(), words.end());
         return push_(pool, std::move(it));
     }
+    /// Table `tableId`'s IMPORT bitmap, right behind its shipTable (only for a table that has an IMPORT bit).
+    uint64_t shipImportTable(WorkerPool& pool, uint32_t tableId, std::span<const uint64_t> bits) {
+        Item it{Kind::Table};
+        it.key = tableId; it.import = true; it.words.assign(bits.begin(), bits.end()); it.total = bits.size();
+        return push_(pool, std::move(it));
+    }
+    uint64_t patchImportTable(WorkerPool& pool, uint32_t tableId, uint64_t first, std::span<const uint64_t> words, uint64_t total) {
+        Item it{Kind::Patch};
+        it.key = tableId; it.import = true; it.first = first; it.total = total; it.words.assign(words.begin(), words.end());
+        return push_(pool, std::move(it));
+    }
     /// Session `sessionId` uses table `tableId` (kDenyTable: nothing); `owner` (issue #122) its principal.
     uint64_t bind(WorkerPool& pool, int64_t sessionId, int64_t tableId, uint64_t epoch, uint64_t owner) {
         Item it{Kind::Bind};
@@ -112,6 +123,7 @@ private:
         uint64_t              epoch = 0;
         uint64_t              owner = 0;
         bool                  grantAll = false;
+        bool                  import   = false;   ///< Table / Patch: the IMPORT bitmap, not the WRITE one
         std::vector<uint64_t> words;
     };
     struct Cursor { uint64_t nextSeq = 1; std::size_t nextWord = 0; };   // per worker: the next item and, in a Table, word
@@ -128,6 +140,7 @@ private:
         op.type      = WorkerOp::Type::SessionPermissions;
         op.sessionId = it.key;
         last = true;
+        op.topicId = it.import ? kPermBitmapImport : kPermBitmapWrite;
         switch (it.kind) {
         case Kind::Table: {
             const std::size_t count = std::min<std::size_t>(kChunkWords, it.words.size() - word);

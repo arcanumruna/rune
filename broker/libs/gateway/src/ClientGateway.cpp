@@ -4264,6 +4264,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         op.correlationId = msg.correlationId;
         op.acks          = msg.acks;
         op.producerId    = msg.producerId;
+        op.importGranted = permsOf_(*session).allowsImport(msg.topicId);
         op.producerEpoch = msg.producerEpoch;
         op.baseSequence  = msg.baseSequence;
         op.lastOffsetDelta = lastOffsetDelta;
@@ -9083,10 +9084,13 @@ void ClientGateway::syncPermissionTables_()
     const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
     permPool_.drainEvents([&](rune::gateway::PermissionPool::Event ev, uint32_t id, const PermissionTable& t) {
         if (!shipping) return;
-        if (ev == rune::gateway::PermissionPool::Event::Created)
+        if (ev == rune::gateway::PermissionPool::Event::Created) {
             (void)permissionShipper_.shipTable(*workerPool_, id, t.writeBits(), t.isAllowAll());
-        else
+            if (std::ranges::any_of(t.importBits(), [](uint64_t w) { return w != 0; }))   // most tables have no IMPORT bit
+                (void)permissionShipper_.shipImportTable(*workerPool_, id, t.importBits());
+        } else {
             (void)permissionShipper_.dropTable(*workerPool_, id);
+        }
     });
 }
 
@@ -9104,10 +9108,13 @@ void ClientGateway::onCatalogObjectApplied(uint32_t nsId, int32_t id, const std:
     // prefix grant now covering it, spec §6) ships that one word - never a full bitmap.
     syncPermissionTables_();   // the workers know every live table before any patch of one
     const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
-    permPool_.onObjectCreated(id, *e, [&](uint32_t tid, const PermissionTable& t, bool before, bool after) {
-        if (!shipping || before == after) return;
+    permPool_.onObjectCreated(id, *e, [&](uint32_t tid, const PermissionTable& t, bool before, bool after, bool beforeImport, bool afterImport) {
+        if (!shipping) return;
         const auto w = static_cast<std::size_t>(id) / 64;
-        (void)permissionShipper_.patchTable(*workerPool_, tid, w, t.writeBits().subspan(w, 1), t.writeBits().size());
+        if (before != after)
+            (void)permissionShipper_.patchTable(*workerPool_, tid, w, t.writeBits().subspan(w, 1), t.writeBits().size());
+        if (beforeImport != afterImport)
+            (void)permissionShipper_.patchImportTable(*workerPool_, tid, w, t.importBits().subspan(w, 1), t.importBits().size());
     });
     // Issue #197: the object's DDL OK must not leave before every worker ring accepted what was queued above (the
     // worker's grace hold covers an item on its ring, not one still in this queue).  queuedSeq() covers the table
@@ -9161,11 +9168,13 @@ void ClientGateway::onCatalogObjectDropped(int32_t id)
     std::erase_if(objectShipSeqs_, [id](const auto& e) { return e.first == id; });   // issue #197: it never serves
     syncPermissionTables_();
     const bool shipping = authMode_ == rune::gateway::GatewayAuthMode::Required && shardMode_ && workerPool_;
-    permPool_.onObjectDropped(id, [&](uint32_t tid, const PermissionTable& t, bool before, bool) {
-        if (!shipping || !before) return;
+    permPool_.onObjectDropped(id, [&](uint32_t tid, const PermissionTable& t, bool before, bool, bool beforeImport, bool) {
+        if (!shipping) return;
         const auto w = static_cast<std::size_t>(id) / 64;
-        if (w < t.writeBits().size())
+        if (before && w < t.writeBits().size())
             (void)permissionShipper_.patchTable(*workerPool_, tid, w, t.writeBits().subspan(w, 1), t.writeBits().size());
+        if (beforeImport && w < t.importBits().size())
+            (void)permissionShipper_.patchImportTable(*workerPool_, tid, w, t.importBits().subspan(w, 1), t.importBits().size());
     });
 }
 

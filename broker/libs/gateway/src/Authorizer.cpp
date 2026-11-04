@@ -19,6 +19,7 @@ const char* opName(rsec::Operation o) noexcept {
         case rsec::Operation::Describe: return "DESCRIBE";
         case rsec::Operation::Admin:    return "ADMIN";
         case rsec::Operation::Truncate: return "TRUNCATE";
+        case rsec::Operation::Import:   return "IMPORT";
     }
     return "?";
 }

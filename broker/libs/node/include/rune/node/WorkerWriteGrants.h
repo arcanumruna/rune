@@ -11,6 +11,8 @@
 //   kPermFlagTable  a chunk of table `sessionId`'s full bitmap (nextOffset = first word, hwBound = total words);
 //                   staged and swapped in on the LAST chunk (a partial table is never visible);
 //   kPermFlagPatch  words [nextOffset, +n) of table `sessionId`, resized to hwBound words (a created / dropped object);
+//   (a Table / Patch item whose op `topicId` is kPermBitmapImport carries the IMPORT bitmap of the table instead of the
+//   WRITE one; a table without such an item denies IMPORT everywhere)
 //   kPermFlagBind   session `sessionId` now uses table `nextOffset` (-1 = deny everything, -2 = its namespace is
 //                   suspended ReadOnly: deny everything, answered NamespaceSuspended); correlationId = epoch,
 //                   producerId = the principal (#122);
@@ -31,6 +33,7 @@ namespace rune::node {
 struct WritePermTable {
     std::vector<uint64_t> bits;      ///< bit (id & 63) of word (id >> 6); capacity persists
     bool                  grantAll = false;
+    std::vector<uint64_t> importBits;   ///< the same layout for IMPORT; empty = IMPORT nowhere
 };
 /// The two fixed tables: nothing (default deny) and everything (dev / in-process announces).
 [[nodiscard]] inline const WritePermTable* denyWriteTable() noexcept { static const WritePermTable t{}; return &t; }
@@ -52,6 +55,12 @@ struct WriteGrantSlot {
     return p.grantAll | ((t >> 6) < p.bits.size() && ((p.bits[t >> 6] >> (t & 63)) & 1u));
 }
 
+[[nodiscard]] inline bool allowsImport(const WriteGrantSlot& s, int32_t topicId) noexcept {
+    const WritePermTable& p = *s.table;
+    const uint32_t t = static_cast<uint32_t>(topicId);
+    return p.grantAll | ((t >> 6) < p.importBits.size() && ((p.importBits[t >> 6] >> (t & 63)) & 1u));
+}
+
 /// SESSION_PERMISSIONS wire flags (the op's `isolation` byte).
 inline constexpr uint8_t kPermFlagLast     = 0x01;
 inline constexpr uint8_t kPermFlagGrantAll = 0x02;
@@ -69,6 +78,9 @@ inline constexpr uint8_t kPermFlagFence    = 0x40;
 /// acknowledged on both rings, so the revoked bitmaps and the ended subscriptions are installed first.  Carries no
 /// table.
 inline constexpr uint8_t kPermFlagSecurityBehind = 0x80;
+/// SESSION_PERMISSIONS `topicId` of a Table / Patch item: which bitmap of the table it carries.
+inline constexpr int32_t kPermBitmapWrite  = 0;
+inline constexpr int32_t kPermBitmapImport = 1;
 /// The worker's table store bound (== gateway PermissionPool::kMaxTables).
 inline constexpr std::size_t kMaxWritePermTables = 4096;
 
@@ -85,12 +97,13 @@ enum class PermissionChunkResult : uint8_t { Staged, Installed, Dropped };
 
 /// The worker's chunk assembler of a full TABLE: ONE per worker; the buffer circulates between it, the tables and
 /// `spare_` so nothing allocates once the buffers reached their peak size.  `Sink` provides
-/// installWriteGrants(key, words&, grantAll, epoch, owner) - `key` the table id (issue #259).
+/// installWriteGrants(key, words&, grantAll, epoch, owner) and installImportGrants(key, words&) - `key` the table id
+/// (issue #259).
 class PermissionStager {
 public:
     template <class Sink>
     PermissionChunkResult apply(Sink& sink, int64_t sessionId, uint64_t firstWord, uint64_t totalWords, uint8_t flags,
-                                uint64_t epoch, const uint8_t* tail, std::size_t tailLen, uint64_t owner) {
+                                uint64_t epoch, const uint8_t* tail, std::size_t tailLen, uint64_t owner, int32_t bitmap) {
         static_assert(sizeof(uint64_t) == 8);
         if (tailLen % 8 != 0 || firstWord > totalWords || (tailLen / 8) > totalWords - firstWord) return drop_();
         const std::size_t count = tailLen / 8;
@@ -110,7 +123,9 @@ public:
         st->filled = firstWord + count;
         if ((flags & kPermFlagLast) == 0) return PermissionChunkResult::Staged;
         if (st->filled != totalWords) return drop_();
-        const bool ok = sink.installWriteGrants(sessionId, st->words, (flags & kPermFlagGrantAll) != 0, epoch, owner);
+        const bool ok = bitmap == kPermBitmapImport
+            ? sink.installImportGrants(sessionId, st->words)
+            : sink.installWriteGrants(sessionId, st->words, (flags & kPermFlagGrantAll) != 0, epoch, owner);
         spare_ = std::move(st->words);                         // the swapped-out slot buffer: the next staging buffer
         state_ = NoUpdate{};
         return ok ? PermissionChunkResult::Installed : PermissionChunkResult::Dropped;   // unknown / closed session

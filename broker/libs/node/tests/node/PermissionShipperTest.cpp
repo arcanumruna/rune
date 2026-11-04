@@ -94,3 +94,25 @@ TEST(PermissionShipperRegression, APatchIsOneOpOfItsWordsOnlyRegression) {
     EXPECT_EQ(s.chunksSentForTest(), 2u) << "one op per worker";
     EXPECT_EQ(s.wordsSentForTest(), 2u) << "one word per worker, never the 1600-word table";
 }
+
+TEST(CheckedWritesImportGrantRegression, WriteTablesShipUnchangedRegression) {
+    auto p = pool(1);
+    PermissionShipper s;
+    const uint64_t t = s.shipTable(*p, 3, words(10), false);
+    (void)s.bind(*p, 5, 3, 1, /*owner=*/7);
+    EXPECT_EQ(s.queuedSeq(), t + 1) << "a table without IMPORT bits queues no import item";
+    drain(p->worker(0));
+    EXPECT_EQ(p->worker(0).sessionPermissionChunksSeenForTest(), 2u);
+    EXPECT_EQ(s.chunksSentForTest(), 2u);
+}
+
+TEST(CheckedWritesImportGrant, AnImportTableAndPatchShipAsOneChunkEachBehindTheirTable) {
+    auto p = pool(1);
+    PermissionShipper s;
+    (void)s.shipTable(*p, 3, words(10), false);
+    (void)s.shipImportTable(*p, 3, words(10));
+    (void)s.patchImportTable(*p, 3, 0, words(1), 10);
+    drain(p->worker(0));
+    EXPECT_EQ(p->worker(0).sessionPermissionChunksSeenForTest(), 3u);
+    EXPECT_EQ(s.chunksSentForTest(), 3u);
+}

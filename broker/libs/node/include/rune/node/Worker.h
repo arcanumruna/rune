@@ -1471,6 +1471,7 @@ public:
            .batchAttrs(op.batchAttrs)
            .deferAck(static_cast<std::uint8_t>((op.deferAck ? kOpFlagDeferAck : 0u) |
                                                (op.crcValidated ? kOpFlagCrcValidated : 0u) |
+                                               (op.importGranted ? kOpFlagImportGranted : 0u) |
                                                (op.freshCursor ? kOpFlagFreshCursor : 0u) |
                                                (op.type == WorkerOp::Type::SessionAnnounce && op.grantAll
                                                     ? kOpFlagGrantAll : 0u) |
@@ -2923,11 +2924,13 @@ private:
         } else if ((flags & kPermFlagDrop) != 0) {
             ok = ackSink_->dropWriteTable(op.sessionId());
         } else if ((flags & kPermFlagPatch) != 0) {
-            ok = tailLen % 8 == 0 && ackSink_->patchWriteTable(op.sessionId(), first, total, tail, tailLen / 8);
+            ok = tailLen % 8 == 0 && (op.topicId() == kPermBitmapImport
+                     ? ackSink_->patchImportTable(op.sessionId(), first, total, tail, tailLen / 8)
+                     : ackSink_->patchWriteTable(op.sessionId(), first, total, tail, tailLen / 8));
         } else if ((flags & kPermFlagTable) != 0) {
             ok = permStager_.apply(*ackSink_, op.sessionId(), first, total, flags,
                                    static_cast<uint64_t>(op.correlationId()), tail, tailLen,
-                                   static_cast<uint64_t>(op.producerId())) != PermissionChunkResult::Dropped;
+                                   static_cast<uint64_t>(op.producerId()), op.topicId()) != PermissionChunkResult::Dropped;
         } else {
             ok = false;   // no variant flag: not sent by this runtime
         }
@@ -4285,6 +4288,7 @@ private:
         f.acks           = static_cast<uint8_t>((static_cast<uint8_t>(op.acks()) & rune::protocol::client::kAcksWireView) |
                                                 (((op.deferAck() & kOpFlagDeferAck) != 0 && rep != nullptr) ? rune::protocol::client::kAcksWireAll : 0));
         f.crcValidated   = (op.deferAck() & kOpFlagCrcValidated) != 0;
+        f.importGranted  = (op.deferAck() & kOpFlagImportGranted) != 0;
         f.durabilityTier = op.durabilityTier();
         f.enqueuedAtNs   = op.enqueuedAtNs();
         f.fromOp         = true;
@@ -9236,6 +9240,7 @@ private:
         // bit load.  NotEnforcing workers (dev mode, unit rigs without auth) keep no session table and enforce
         // nothing.  A session this worker has no slot for is denied (fail closed), and an Enforcing worker with no
         // sink attached (M4, X012) refuses every frame: it has no grants to consult.
+        bool importGranted = true;   // NotEnforcing: nothing is checked
         if (const auto* enf = std::get_if<Enforcing>(&enforcement_)) {
             if (enf->sink == nullptr) [[unlikely]] {
                 if (openSeq != 0) commitProduceSeq(openCtx, openSeq);   // consumed (answered)
@@ -9268,6 +9273,7 @@ private:
                 if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
                 return refuseNotAuthorized_(msg, directAck);
             }
+            importGranted = allowsImport(*grants, msg.topicId);
         }
 
         // X036: a client never writes a control batch (after the WRITE check, so an unauthorized sender hears 45).
@@ -9305,6 +9311,7 @@ private:
         f.partition     = msg.partition;
         f.baseSequence  = msg.baseSequence;
         f.producerEpoch = msg.producerEpoch;
+        f.importGranted = importGranted;
         f.durabilityTier = replica ? replica->durabilityTier() : uint8_t{1};
         f.acks          = msg.acks;
         f.fromOp        = false;   // the poll budget (ingressPollBudget_) reserved its answer
@@ -9465,6 +9472,7 @@ private:
         uint8_t acks          = 0;      ///< the Produce.acks wire byte: bit 0 All, bit 1 View
         bool    fromOp        = false;  ///< op-ring produce: reserve a parked answer here
         bool    crcValidated  = false;  ///< the op producer validated this batch's CRC (M-3)
+        bool    importGranted = false;  ///< the session holds IMPORT on the topic (or the worker does not enforce)
         uint8_t directAck     = 0;      ///< D8d: direct-budget admission (worker ingress only)
         int64_t enqueuedAtNs  = 0;      ///< gateway enqueue time (op path; latency attribution)
         [[nodiscard]] bool acksAll() const noexcept { return rune::protocol::client::acksAll(acks); }
@@ -9806,7 +9814,7 @@ private:
         rune::storage::ProduceOutcome outcome;
         if (ws != nullptr) [[unlikely]] {
             const WriteFacts facts{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = false,
-                                   .importGranted = false, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_()};
+                                   .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_()};
             CheckedWriteHook hook(*ws, facts, {});
             if (log != nullptr) {
                 outcome = rune::storage::handleProduceBatch(
