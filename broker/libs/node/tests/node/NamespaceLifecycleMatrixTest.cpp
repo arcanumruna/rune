@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -142,10 +143,12 @@ TEST_P(NamespaceLifecycleMatrixRegression, Cell) {
         EXPECT_TRUE(got.topicsRemain) << label << ": lowering a limit deletes nothing";
         EXPECT_EQ(got.followUpCode, static_cast<int>(ErrorCode::NamespaceLimitExceeded)) << label << ": a new topic is refused";
     }
-    if (ran && want.kind != LcOutcome::Missing && (p.op == LcOp::SetLimitsRaise || p.op == LcOp::SetLimitsLowerRetention) &&
-        p.target != LcTarget::Default) {
+    // #708: the stored limit is read back for every accepted cell, the Default target included, and LowerBelowUsage too.
+    if (ran && want.kind != LcOutcome::Missing &&
+        (p.op == LcOp::SetLimitsRaise || p.op == LcOp::SetLimitsLowerRetention || p.op == LcOp::SetLimitsLowerBelowUsage)) {
         const auto& o = got;
         if (p.op == LcOp::SetLimitsRaise) EXPECT_GT(o.limitsAfter.maxTopics, 5000u) << label << ": the raised limit is stored";
+        else if (p.op == LcOp::SetLimitsLowerBelowUsage) EXPECT_EQ(o.limitsAfter.maxTopics, 1u) << label << ": the lowered topic limit is stored";
         else EXPECT_EQ(o.limitsAfter.maxRetentionMs, 1u) << label << ": the lowered retention is stored";
     }
     // A refused SetLimits changed no stored limit: read back the way the accepted cells do.
@@ -504,7 +507,7 @@ bool waitFor(const std::function<bool()>& pred, std::chrono::seconds limit = 30s
     const auto deadline = std::chrono::steady_clock::now() + limit;
     while (std::chrono::steady_clock::now() < deadline) {
         if (pred()) return true;
-        std::this_thread::sleep_for(2ms);
+        std::this_thread::yield();   // #711: a poll on the awaited state under a hard deadline; no wall-clock sleep
     }
     return pred();
 }
@@ -755,4 +758,78 @@ TEST(NamespaceDeletingProduceRegression, RootReadsOfDeletingNamespaceAreUnknownT
     EXPECT_EQ(g->status, pc::ViewRowResponse::kUnknownView) << "GetViewRow on a view of the DELETING namespace";
 
     EXPECT_EQ(framesOf(*s1Id), framesAtEnd) << "S1 received a frame after it ended";
+}
+
+// ── #708: lowering a namespace's max-retention-ms reaches the cleaner and deletes the oldest segment ─────────────────
+namespace {
+std::vector<std::string> segmentFileNames(const std::filesystem::path& topicDir) {
+    std::vector<std::string> v;
+    std::error_code ec;
+    if (!std::filesystem::exists(topicDir, ec)) return v;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(topicDir, ec))
+        if (e.is_regular_file() && e.path().extension() == ".log") v.push_back(e.path().filename().string());
+    std::sort(v.begin(), v.end());
+    return v;
+}
+}  // namespace
+
+TEST(NamespaceLifecycleMatrixLimitsRegression, SetLimitsLowerRetentionDeletesOldestSegmentRegression) {
+    using namespace grants;
+    AuthBroker b("nslclr");
+    b.bootstrapAdmin(kAdminPw);
+    auto admin = newClient(b, "admin");
+    const auto nsId = admin->createNamespace("a");
+    ASSERT_TRUE(nsId.has_value());
+    b.createUser("a/ua", kUserPw,
+                 {prefix(SO::Create, ST::Topic, ""), prefix(SO::Describe, ST::Topic, ""), prefix(SO::Write, ST::Topic, ""),
+                  prefix(SO::Read, ST::Topic, "")});
+    // topic r: 4 KiB segments, retention 1 h, the topic's own retention pass every 50 ms (a per-topic setting)
+    rc::TopicOptions topic;
+    topic.config.segmentRollBytes = 4096;
+    topic.config.retentionMs = 3'600'000;
+    topic.config.retentionCheckMs = 50;
+    rc::TopicSpec spec;
+    {
+        auto c = newClient(b, "a/ua");
+        const auto r = c->defineTopicAndWait("r", 1, "", {}, rc::Persistence::Disk, topic, {}, 20s);
+        ASSERT_EQ(r.errorCode, 0) << r.detail;
+        spec = rc::TopicSpec{"r", r.topicId, 1};
+        c->close();
+    }
+    auto ua = newClient(b, "a/ua", {spec});
+    {   // ~600 KiB: a 4 KiB roll setting still maps 16 KiB per segment (about 14 records), so this is at least 16 segments
+        rc::ProducerConfig pcfg;
+        pcfg.acks = rc::Acks::All;
+        pcfg.batchRecords = 1;   // one batch per record: a segment rolls between batches, never inside one
+        rc::Producer p = ua->producer(pcfg);
+        const std::string v(1000, 'x');
+        for (int i = 0; i < 600; ++i) p.send(ua->topic("r"), rc::Key(static_cast<int64_t>(i)), bytesOf(v));
+        ASSERT_EQ(p.closeAndWait(30s), rc::OpStatus::Ok);
+    }
+    const auto logStart = [&] {
+        return b.node().onOwnerThreadForTest(spec.topicId, 0, [](rune::replication::PartitionReplica* r) {
+            return r != nullptr && r->log() != nullptr ? r->log()->logStartOffset() : int64_t{-1};
+        });
+    };
+    const auto dir = topicsRoot(b.dir() / "broker", *nsId) / "r";
+    const std::vector<std::string> before = segmentFileNames(dir);
+    ASSERT_GE(before.size(), 16u) << "premise: the data spread over at least 16 segments";
+    // premise: the cleaner has run passes (its own 50 ms cadence) and, with a 1 h retention, deleted nothing
+    const uint64_t cycles0 = b.node().cleanerCyclesForTest();
+    ASSERT_TRUE(waitFor([&] { return b.node().cleanerCyclesForTest() >= cycles0 + 3; }, 20s)) << "premise: the cleaner is running";
+    ASSERT_EQ(logStart(), 0) << "premise: nothing is deleted under a 1 h retention";
+    ASSERT_EQ(segmentFileNames(dir).front(), before.front()) << "premise: the oldest segment is still there";
+
+    std::size_t retentionField = rune::protocol::kNamespaceLimitFieldCount;
+    for (std::size_t i = 0; i < rune::client::kNamespaceLimitFields.size(); ++i)
+        if (rune::client::kNamespaceLimitFields[i].name == "max-retention-ms") retentionField = i;
+    ASSERT_LT(retentionField, rune::protocol::kNamespaceLimitFieldCount);
+    rune::client::NamespaceLimitsPatch patch;
+    ASSERT_TRUE(patch.set(retentionField, 1));
+    ASSERT_TRUE(admin->setNamespaceLimits("a", patch).has_value());
+
+    EXPECT_TRUE(waitFor([&] { return logStart() > 0; }, 40s))
+        << "the namespace's lowered retention never reached the cleaner: the log start offset stays " << logStart();
+    EXPECT_TRUE(waitFor([&] { const auto now = segmentFileNames(dir); return !now.empty() && now.front() != before.front(); }, 20s))
+        << "the oldest segment file survived";
 }
