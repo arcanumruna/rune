@@ -850,6 +850,7 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesSpecFanoutTest.cpp
         tests/node/CheckedWritesDdlTest.cpp
         tests/node/CheckedWritesKeyIndexDdlTest.cpp
+        tests/node/CheckedWritesAutoIncDdlTest.cpp
         tests/node/CheckedWritesTimelineTest.cpp
         tests/node/CheckedWritesVerdictSourceTest.cpp
         tests/node/CheckedWritesKeyIndexTest.cpp)

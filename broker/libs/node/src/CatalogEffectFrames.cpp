@@ -62,7 +62,7 @@ std::optional<std::string> topicEffectFramesError(const cat::TopicObject& t, std
         } catch (const std::exception& ex) {
             return "the schema of '" + t.name + "' does not materialize: " + ex.what();
         }
-        if (auto e = tooLarge("the WriteSpec effect", t.name, kTopicWriteSpecWireLen, maxFrame)) return e;
+        if (auto e = tooLarge("the WriteSpec effect", t.name, kTopicWriteSpecAutoIncWireLen, maxFrame)) return e;
     }
     // Phase 2c: every typed topic also posts its FilterSchema (the EVOLVING descriptor: retired fields stay, so it can
     // outgrow the materialized one) - validate or not.  Unsized, a frame the ring cannot take is refused on every broker

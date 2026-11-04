@@ -1239,8 +1239,8 @@ private:
     void postCatalogWriteSpec_(const rune::catalog::TopicObject& t) {
         const auto w = writeSpecWireOf(t);
         if (!w) return;
-        postCatalog_(kA2cWriteSpec, kTopicWriteSpecWireLen, [&](uint8_t* p) {
-            (void)encodeTopicWriteSpec(*w, std::span<uint8_t>(p, kTopicWriteSpecWireLen));
+        postCatalog_(kA2cWriteSpec, topicWriteSpecWireLen(*w), [&](uint8_t* p) {
+            (void)encodeTopicWriteSpec(*w, std::span<uint8_t>(p, topicWriteSpecWireLen(*w)));
         });
     }
 

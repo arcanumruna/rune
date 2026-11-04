@@ -65,6 +65,7 @@ inline constexpr ConfigKey kLastConfigKey  = ConfigKey::MaxCompactionLagMs;
 enum class Partitioner : uint8_t { Fnv1a = 0, Modulo = 1 };
 inline constexpr uint64_t kAutoIncrementMaxDefault     = (uint64_t{1} << 53) - 1;
 inline constexpr uint32_t kAutoIncrementReserveDefault = 4096;
+inline constexpr uint32_t kAutoIncrementReserveMax     = 1'048'576;
 struct TopicKeyFeatures {
     bool        keyIndex             = false;
     bool        autoIncrement        = false;

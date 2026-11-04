@@ -72,4 +72,13 @@ inline constexpr uint64_t kBasicV3Digests[] = {
     0x9d8f857d8af595f8ull,   // offset 7 DropTopic
     0x237b2ff80947b166ull,   // offset 8 NamespaceCreated
 };
+// tests/catalog/golden/v3/autoinc.rcat, printed by `make_catalog_golden <out> v3-autoinc` (checked writes plan, Part 06
+// Task 4).  FROZEN like the v1, v2 and v3 pins.
+inline constexpr uint64_t kAutoIncV3Digests[] = {
+    0x00ae36366e8c3c25ull,   // offset 0 CreateTopic
+    0x3eceabed1cb3fda6ull,   // offset 1 CreateTopic
+    0x49e251442baa02dcull,   // offset 2 AlterSchema
+    0x2eb08771bce68f1cull,   // offset 3 AlterTopicConfig
+    0x2c2a3ff3654c99e2ull,   // offset 4 CreateTopic
+};
 } // namespace rune::catalog::golden

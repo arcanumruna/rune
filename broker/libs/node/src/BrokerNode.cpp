@@ -5964,7 +5964,7 @@ void BrokerNode::postBootWriteSpecs_() {
         for (uint16_t v = 1; v <= t->schema->schemaVersion; ++v)
             if (const RegistryEntry* e = schemaRegistry_->byIdVersion(t->topicId, v))
                 schemaFanout_.post(t->topicId, v, rune::codec::serialize(e->descriptor));
-        std::vector<uint8_t> spec(kTopicWriteSpecWireLen);
+        std::vector<uint8_t> spec(topicWriteSpecWireLen(*w));
         (void)encodeTopicWriteSpec(*w, spec);
         schemaFanout_.postWriteSpec(t->topicId, std::move(spec));
     }
