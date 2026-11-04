@@ -702,11 +702,7 @@ public:
         if (vs->nsSlotCapacity() != nsSlots_.capacity()) vs->configureNsSlots(nsSlots_.capacity());
         vs->setVerdictIntervalNs(verdictIntervalNs_);
         // The boot slots were applied to this worker before its view set existed.
-        for (uint32_t s = 0; s < nsSlots_.capacity(); ++s) {
-            const uint16_t sl = static_cast<uint16_t>(s);
-            const uint32_t id = nsSlots_.nsIdAt(sl);
-            if (id != NsSlotTable::kFreeSlot) vs->onNsSlotAssign(sl, id, nsSlots_.limits(sl));
-        }
+        for (const uint16_t sl : nsSlots_.liveSlots()) vs->onNsSlotAssign(sl, nsSlots_.nsIdAt(sl), nsSlots_.limits(sl));
     }
     /// Part 04 (SD14): how often a verdict source writes a marker for accepted-only progress.
     void setVerdictIntervalNs(int64_t ns) noexcept {
@@ -964,6 +960,7 @@ public:
         bool    active               = true;
         uint32_t registryId          = 0;   ///< target replica identity (Task 10 fix 3)
         uint32_t incarnation         = 0;
+        NsTag    ns{};                      ///< the source's namespace tag, re-resolved with `rc`
         // Hybrid egress: per-consumer UNICAST egress publication for this
         // subscription's consumer session.  Created + lifetime-owned by the
         // gateway; written ONLY here on the worker thread (single-writer,
@@ -3115,6 +3112,8 @@ private:
                 s.incarnation          = op.incarnation();
                 s.active               = true;   // re-subscribe (passed the guard) re-activates
                 s.rc                   = rcOf_(subReplica_(s));
+                s.ns                   = subNsTag_(s);
+                if (NsHot* const m = nsReadMeter_(s.topicId, s.ns)) ++m->requestOps;   // once per Subscribe op applied
                 s.cursorFresh          = true;   // M2: a requested cursor again (rewind / re-seed)
                 if (hasFilter) [[unlikely]] bindFilter_(si, filterTail);
                 return;
@@ -3137,6 +3136,8 @@ private:
         s.registryId           = op.targetReplicaId();
         s.incarnation          = op.incarnation();
         s.rc                   = rcOf_(subReplica_(s));
+        s.ns                   = subNsTag_(s);
+        if (NsHot* const m = nsReadMeter_(s.topicId, s.ns)) ++m->requestOps;   // once per Subscribe op applied
         subs_.push_back(s);
         pushListDirty_ = true;
         if (hasFilter) [[unlikely]] bindFilter_(subs_.size() - 1, filterTail);
@@ -3686,6 +3687,10 @@ private:
             if (s_.incarnation != 0 && rep_ == nullptr) return -1;   // not owned
             mem_ = (s_.logPtr == nullptr && rep_ != nullptr) ? rep_->memoryLog() : nullptr;
             if (s_.logPtr == nullptr && mem_ == nullptr) return -1;
+            if (NsHot* const m = w_.nsReadMeter_(s_.topicId, s_.ns); m != nullptr && w_.passNowNs_ < m->fetchUntil) [[unlikely]] {
+                ++w_.throttledRefusals_;
+                return -1;   // fetch-throttled namespace: not servable this pass
+            }
             bound_ = rep_ != nullptr ? rep_->highWatermark() : s_.logPtr->logEndOffset();
             rc_ = nullptr;
             if (s_.isolation == kIsolationReadCommitted && s_.topicId >= 0) [[unlikely]] {
@@ -3782,7 +3787,10 @@ private:
             (void)sendPushTooLarge_(s, pub, sealPtr, baseOffset);
             return filter::SendOutcome::TooLarge;
         }
-        if (sent.position > 0 && s.sessionEgress) [[unlikely]] ++responseEgressFrames_;   // I7
+        if (sent.position > 0) {
+            if (!isNote) { if (NsHot* const m = nsReadMeter_(s.topicId, s.ns)) m->fetchBytes += batch.size(); }   // record frames only
+            if (s.sessionEgress) [[unlikely]] ++responseEgressFrames_;   // I7
+        }
         return sent.position > 0 ? filter::SendOutcome::Sent : filter::SendOutcome::Retry;
     }
 
@@ -4052,6 +4060,9 @@ private:
             const PartitionWriteState* const ws = writeOf_(rep);
             bound = verdictBound_(rep, ws, bound);
             if (s.nextOffset >= bound) continue;
+            // The namespace's fetch pace (fetch-bytes / request-ops): a throttled namespace is not read for this pass.
+            NsHot* const meter = nsReadMeter_(s.topicId, s.ns);
+            if (meter != nullptr && passNowNs_ < meter->fetchUntil) [[unlikely]] { ++throttledRefusals_; continue; }
 
             const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
             // #65 (review MAJOR-1): a pread into the worker's scratch — never the
@@ -4174,6 +4185,7 @@ private:
                 }
                 const int64_t r = sent.position;
                 if (r > 0) {
+                    if (meter != nullptr) meter->fetchBytes += out.size();   // the bytes actually sent
                     if (s.sessionEgress) [[unlikely]] ++responseEgressFrames_;   // I7: delivered on the response pub
                     s.nextOffset = baseOffset + static_cast<int64_t>(recordCount);
                     pos += batchSize;
@@ -4385,13 +4397,11 @@ private:
                 enqueueReturn_(std::move(ret));
                 return ViewServe::Answered;
             }
-            uint16_t srcSlot = kNoNsSlot;
-            if (srcRep->isDiskBacked()) { if (const rune::storage::Log* l = srcRep->log()) srcSlot = l->nsSlot(); }
-            else if (const rune::storage::InMemoryLog* m = srcRep->memoryLog()) srcSlot = m->nsSlot();
-            if (srcSlot != kNoNsSlot && src >= 0) {   // Task 14: count + pace (one add, one compare), whatever the source's persistence
-                NsHot& nh = nsHot_[srcSlot];
+            const NsTag srcTag = srcRep->isDiskBacked() ? nsTagOfLog_(srcRep->log(), nullptr) : nsTagOfLog_(nullptr, srcRep->memoryLog());
+            if (NsHot* const meter = nsReadMeter_(src, srcTag)) {   // Task 14: count + pace (one add, one compare), whatever the source's persistence
+                NsHot& nh = *meter;
                 ++nh.requestOps;
-                lastViewReadSlot_ = srcSlot;
+                lastViewReadSlot_ = srcTag.slot;
                 if (passNowNs_ < nh.queryUntil) [[unlikely]] {
                     ++throttledRefusals_;
                     ret.errorCode  = static_cast<int16_t>(RS::kThrottled);
@@ -4587,8 +4597,8 @@ private:
         // read is UNANSWERED (the gateway re-issues it on its next push cycle, nothing parks), which paces delivery to the
         // limit.  One array index and one compare; internal topics (topicId < 0) are never paced.
         const NsTag nsTag = nsTagOfLog_(log, mem);   // #712: a transient source is paced too
-        if (topicId >= 0) {
-            NsHot& nh = nsHot_[nsTag.slot];
+        if (NsHot* const meter = nsReadMeter_(topicId, nsTag)) {
+            NsHot& nh = *meter;
             ++nh.requestOps;
             if (passNowNs_ < nh.fetchUntil) [[unlikely]] {
                 ++throttledRefusals_;
@@ -4799,8 +4809,7 @@ private:
         ++pushReadChunks_;
         pushReadBytes_ += total;
         {   // Task 14 (D28): one add; #712: a transient source's bytes count too
-            const NsTag nsTag = nsTagOfLog_(log, mem);
-            if (nsTag.slot != kNoNsSlot) nsHot_[nsTag.slot].fetchBytes += total;
+            if (NsHot* const m = nsReadMeter_(a.topicId, nsTagOfLog_(log, mem))) m->fetchBytes += total;
         }
         return PushChunk::Written;
     }
@@ -6531,16 +6540,13 @@ private:
     int64_t               nextNsReportNs_ = kNsReportUnarmed;
     uint64_t              throttledRefusals_ = 0;
     uint16_t              lastViewReadSlot_ = kNoNsSlot;
-    // The slots that hold a namespace (dense; slot 0 = default is always live), with the index map slot -> position.  Assign
-    // appends, release swaps with the last and pops.  Both are sized to the table capacity at boot (configureNsSlots), so a
-    // slot assign / release never allocates.
-    static std::vector<uint16_t> initialLiveSlots_() { std::vector<uint16_t> v; v.reserve(NsSlotTable::kDefaultCapacity); v.push_back(0); return v; }
-    static std::vector<uint16_t> initialLivePos_()   { std::vector<uint16_t> v(NsSlotTable::kDefaultCapacity, kNoNsSlot); v[0] = 0; return v; }
-    std::vector<uint16_t> nsLiveSlots_ = initialLiveSlots_();
-    std::vector<uint16_t> nsLivePos_   = initialLivePos_();   ///< kNoNsSlot = the slot is free
-    uint32_t              nsUsageVisited_ = 0;   ///< slots the last usage report visited (a test seam; one add per slot, cold path)
+    // The slots that hold a namespace are NsSlotTable::liveSlots() (dense, maintained by assign/place/release, no allocation
+    // after reset()): every per-tick or per-scan loop iterates that list, never the table capacity (#728).
+    uint32_t              nsUsageVisited_ = 0;
+    uint32_t              nsDiskScanVisited_ = 0;   ///< slots the last disk scan zeroed (a test seam)   ///< slots the last usage report visited (a test seam; one add per slot, cold path)
 public:
     [[nodiscard]] uint32_t nsUsageVisitedForTest() const noexcept { return nsUsageVisited_; }
+    [[nodiscard]] uint32_t nsDiskScanVisitedForTest() const noexcept { return nsDiskScanVisited_; }
     [[nodiscard]] int64_t  nsDiskBytesForTest(uint16_t slot) const noexcept { return slot < nsDiskBytes_.size() ? nsDiskBytes_[slot] : 0; }
     [[nodiscard]] bool     nsOverDiskForTest(uint16_t slot) const noexcept { return slot < nsOverDisk_.size() && nsOverDisk_[slot] == kNsGateOverDisk; }
     [[nodiscard]] bool     nsDeletingForTest(uint16_t slot) const noexcept { return slot < nsOverDisk_.size() && nsOverDisk_[slot] == kNsGateDeleting; }
@@ -6575,11 +6581,6 @@ public:
     /// Boot only (before the runner starts): size the slot table to RUNE_MAX_NAMESPACES.
     void configureNsSlots(uint32_t capacity) {
         nsSlots_.reset(capacity);
-        nsLiveSlots_.clear();
-        nsLiveSlots_.reserve(nsSlots_.capacity());
-        nsLiveSlots_.push_back(0);   // default
-        nsLivePos_.assign(nsSlots_.capacity(), kNoNsSlot);
-        nsLivePos_[0] = 0;
         nsDiskBytes_.assign(nsSlots_.capacity(), 0);
         nsOverDisk_.assign(nsSlots_.capacity(), 0);
         nsHot_.assign(nsSlots_.capacity(), NsHot{});
@@ -6600,6 +6601,16 @@ private:
         if (mem != nullptr) return NsTag{mem->nsSlot(), mem->nsId()};
         return NsTag{};
     }
+    /// The namespace tag of a subscription's source (its disk log, else the owned replica's ring).
+    [[nodiscard]] NsTag subNsTag_(const WorkerSubscription& s) noexcept {
+        auto* const rep = subReplica_(s);
+        return nsTagOfLog_(s.logPtr, rep != nullptr ? rep->memoryLog() : nullptr);
+    }
+    /// The one read-metering predicate: the hot counters of the slot a USER topic's read is charged to and paced by, or
+    /// nullptr for an internal topic or a tag this worker's table no longer holds (a stale tag is never paced nor charged).
+    [[nodiscard]] NsHot* nsReadMeter_(int32_t topicId, NsTag t) noexcept {
+        return (topicId >= 0 && nsSlots_.matches(t.slot, t.nsId)) ? &nsHot_[t.slot] : nullptr;
+    }
     /// Hot path: does this worker's table hold `nsId` in `slot`?  Counts a mismatch.
     [[nodiscard]] bool checkNsTag_(uint16_t slot, uint32_t nsId) {
         if (nsSlots_.matches(slot, nsId)) [[likely]] return true;
@@ -6616,8 +6627,6 @@ private:
                 noteNsSlotMismatch_();   // the slot is out of range or holds another namespace: never applied
                 return;
             }
-            nsLivePos_[slot] = static_cast<uint16_t>(nsLiveSlots_.size());   // place() succeeded: the slot was free
-            nsLiveSlots_.push_back(slot);
             resetNsSlotState_(slot);     // a reused slot starts from zero usage and no throttle (D22)
         }
         nsSlots_.setLimits(slot, l);
@@ -6631,13 +6640,6 @@ private:
     [[gnu::cold]] bool applyNsSlotRelease_(uint16_t slot, uint32_t nsId) {
         if (!nsSlots_.release(slot, nsId)) { noteNsSlotMismatch_(); return false; }
         if (viewSet_ != nullptr) viewSet_->onNsSlotFreed(slot, nsId);
-        {   // swap with the last live slot and pop (release() succeeded, so the slot was live)
-            const uint16_t pos = nsLivePos_[slot], last = nsLiveSlots_.back();
-            nsLiveSlots_[pos] = last;
-            nsLivePos_[last]  = pos;
-            nsLivePos_[slot]  = kNoNsSlot;
-            nsLiveSlots_.pop_back();
-        }
         resetNsSlotState_(slot);
         return true;
     }
@@ -6673,7 +6675,7 @@ private:
         int sent = 0;
         nsUsageVisited_ = 0;
         // #728: only the live slots (the dense list is the state), not every slot of the table.
-        for (const uint16_t liveSlot : nsLiveSlots_) {
+        for (const uint16_t liveSlot : nsSlots_.liveSlots()) {
             ++nsUsageVisited_;
             const std::size_t sl = liveSlot;
             const uint32_t nsId = nsSlots_.nsIdAt(liveSlot);
@@ -6701,7 +6703,9 @@ private:
     /// Cold, every kDiskScanIntervalNs: recount each slot's bytes from the owned disk logs and set the over-disk byte.
     [[gnu::cold]] void scanNamespaceDisk_(int64_t nowNs) {
         nextDiskScanNs_ = nowNs + kDiskScanIntervalNs;
-        std::fill(nsDiskBytes_.begin(), nsDiskBytes_.end(), int64_t{0});
+        // #728: only the live slots hold bytes (a free slot was zeroed when it was released), so zero those, not the capacity.
+        nsDiskScanVisited_ = 0;
+        for (const uint16_t liveSlot : nsSlots_.liveSlots()) { nsDiskBytes_[liveSlot] = 0; ++nsDiskScanVisited_; }
         for (const auto* r : owned_) {
             if (r == nullptr || !r->isDiskBacked()) continue;
             const rune::storage::Log* l = r->log();
@@ -7031,7 +7035,7 @@ private:
         for (auto& sl : rcSlots_)
             if (sl.inc != 0 && sl.replica->registryId() < rcById_.size()) rcById_[sl.replica->registryId()] = sl.rc.get();
         rebuildWriteById_();
-        for (auto& sub : subs_) sub.rc = rcOf_(subReplica_(sub));
+        for (auto& sub : subs_) { sub.rc = rcOf_(subReplica_(sub)); sub.ns = subNsTag_(sub); }
     }
     [[nodiscard]] static RcFacts rcFacts_(const rune::replication::PartitionReplica* r) noexcept {
         RcFacts f;
