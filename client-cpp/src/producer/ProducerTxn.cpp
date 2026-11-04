@@ -1065,7 +1065,7 @@ void ProducerImpl::onAddPartitionsAnswer_(const CoordAnswer& a, CoordinatorLink:
             bool named = false;
             for (std::size_t i = 0; i < m->results.size(); ++i) {
                 const auto r = m->results[i];
-                if (r.topicId == ps.topicId && r.partition == ps.partition) {
+                if (CoordinatorLink::answers(r.topicId, r.partition, ps.topicId, ps.partition)) {
                     // #737: a duplicate result takes the worst, never the first.
                     if (!named || CoordinatorLink::rank(ReqKind::AddPartitions, r.errorCode) >
                                       CoordinatorLink::rank(ReqKind::AddPartitions, code)) {
