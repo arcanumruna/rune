@@ -1273,13 +1273,13 @@ public:
 
     /// Subscribe to a topic partition using a Key (partition resolved via FNV-1a).
     ///
-    /// Plain subscriptions are sent on the seed session.  While a consumer group
-    /// (subscribeGroup) is active on this Client, that session is the group
-    /// coordinator's and never follows a redirect: a plain subscription to a
-    /// partition another node leads is then finished with
-    /// Subscription::failReason() == SubscriptionFailReason::
-    /// LeaderElsewhereWhileGroupActive (re-subscribing cannot succeed; use a
-    /// separate Client for it).
+    /// Plain subscriptions start on the seed session.  A subscription to a partition another node leads follows
+    /// that partition's leader on the leader's own session - also while a consumer group (subscribeGroup) is
+    /// active on this Client: the seed, which is then the group coordinator's session, is never moved.  Only a
+    /// redirect that would have to move the seed (the target is not a node this client can route to) is refused
+    /// while a group is active: the subscription is finished with Subscription::failReason() ==
+    /// SubscriptionFailReason::LeaderElsewhereWhileGroupActive (re-subscribing cannot succeed; use a separate
+    /// Client for it).
     ///
     /// Returns a Subscription handle immediately.  Records begin flowing once
     /// the broker acknowledges (SubscribeResponse) — the Subscription does NOT
@@ -1922,6 +1922,7 @@ private:
     static std::string redirectMessageOf_(const HeldRedirect& h) {
         return h.responsePort > 0 ? h.endpoint + "#" + std::to_string(h.responsePort) : h.endpoint;
     }
+    void heldFallbackBySeed_(const HeldRedirect& h);   // #749
     std::vector<HeldRedirect> heldRedirectFollows_;   // duty thread; cold
     uint64_t redirectFollowsHeld_ = 0;
     uint64_t staleSubscribeRedirects_ = 0;   // R4: Redirects from a session the Subscribe is not outstanding on

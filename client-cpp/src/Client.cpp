@@ -4391,7 +4391,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // which would strand every subscription already bound on the seed
             // (a silent stall).  Round 5 (R3): also before the first metadata
             // answer — the Redirect's endpoint installs the partition's route.
-            if (!groupActive && subscriberHub_.isNewPendingSubscribe(opt->correlationId) &&
+            // #749: this holds while a consumer group is active too - following ONE partition's leader on its own
+            // session never moves the seed (the group coordinator's); only a BySeed redirect is refused (below).
+            if (subscriberHub_.isNewPendingSubscribe(opt->correlationId) &&
                 !agent::ClientAgent::sameEndpoint(toChannel(newEndpoint), agent_.seedChannel())) {
                 bool handled = false;
                 switch (redirectFollowFor_(newEndpoint)) {
@@ -4423,12 +4425,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
             if (groupActive) {
                 // MEDIUM-4: while a group is active the seed session (the group
                 // coordinator's) never follows a data-op redirect.
-                //  * A plain Subscribe: plain subscriptions are sent on the seed
-                //    only (no per-partition routing for them — they have no
-                //    position / leader-change model; ticketed), so one for a
-                //    partition another node leads can never succeed here: it is
-                //    finished with SubscriptionFailReason::
-                //    LeaderElsewhereWhileGroupActive (documented on subscribe()).
+                //  * A plain Subscribe that could not be followed per partition
+                //    above (BySeed: the target is not a node this client can
+                //    route to) would have to move the seed: it is finished with
+                //    SubscriptionFailReason::LeaderElsewhereWhileGroupActive
+                //    (documented on subscribe()).
                 //  * A produce whose partition this handler could not map
                 //    (havePart false) is retried through its partition route.
                 //  * Anything else (a transactional producer's Produce, whose
@@ -5929,6 +5930,16 @@ Client::RedirectFollow Client::redirectFollowFor_(const std::string& endpoint) c
     return metadataResponses_ == 0 ? RedirectFollow::Hold : RedirectFollow::BySeed;
 }
 
+// #749: a held follow that cannot go per partition falls back to the seed - unless a group is active, whose
+// coordinator session the seed is: then the subscribe is refused with the documented reason, the seed unmoved.
+void Client::heldFallbackBySeed_(const HeldRedirect& h) {
+    if (!groupConsumerHub_.empty()) {
+        (void)subscriberHub_.failPendingSubscribe(h.corrId, SubscriptionFailReason::LeaderElsewhereWhileGroupActive);
+        return;
+    }
+    redirectBySeed_(h.corrId, h.endpoint, h.responsePort);
+}
+
 // R3: a metadata answer arrived since the follow was held — decide it now.
 int Client::releaseHeldRedirectFollows_() {
     int work = 0;
@@ -5943,11 +5954,11 @@ int Client::releaseHeldRedirectFollows_() {
             if (subscriberHub_.adoptRedirectedSubscribe(h.corrId) &&
                 followMovedSubscriptionRedirect_(h.corrId, redirectMessageOf_(h)))
                 break;
-            redirectBySeed_(h.corrId, h.endpoint, h.responsePort);
+            heldFallbackBySeed_(h);
             break;
         case RedirectFollow::Hold:   // still no answer applied (cannot happen: metaSeen moved)
         case RedirectFollow::BySeed:
-            redirectBySeed_(h.corrId, h.endpoint, h.responsePort);
+            heldFallbackBySeed_(h);
             break;
         }
     }
