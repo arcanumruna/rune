@@ -899,7 +899,7 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
         rune::protocol::RecordBatchReader r(base + pos, size - pos);
         const int32_t total = r.totalLength();
         if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > size) break;
-        if (!hdr.accept(r)) break;   // a bad baseOffset / magic / epoch ends the valid prefix; the check below fails loudly
+        if (!hdr.accept(r)) break;   // a bad baseOffset / magic ends the valid prefix; the check below fails loudly
         if (r.baseOffset() + r.lastOffsetDelta() >= truncateOffset) { atCut = true; break; }   // cut here (whole batch)
         const int64_t ts = toEpochMs(r.maxTimestamp());
         if (ts > maxTs) maxTs = ts;
@@ -987,7 +987,7 @@ int64_t LogSegment::recover(bool syncIndex, RecoverMode mode) {
         RecordBatchReader r(buf.data() + pos, buf.size() - pos);
         int32_t total = r.totalLength();
         if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size() || !r.ensureValid()) break;
-        if (!hdr.accept(r)) break;   // #839: baseOffset / magic / epoch are not CRC-covered: a bad one ends the valid prefix
+        if (!hdr.accept(r)) break;   // #839: baseOffset / magic are not CRC-covered: a bad one ends the valid prefix
         // C2: use the same shouldIndex() predicate as append()
         if (shouldIndex(bytesSinceIndex_, indexIntervalBytes_)) {
             index_->append(r.baseOffset(), validBytes); // C4: OffsetIndex::append guards 2GiB

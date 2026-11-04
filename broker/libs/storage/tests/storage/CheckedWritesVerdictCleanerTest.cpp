@@ -669,7 +669,7 @@ TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchMidSegmentNeverTruncates
     std::array<std::string, 4> firstLost{};
     // Engines: 0 range, 1 range + coalesce, 2 one file (produceCleanedFileBounded), 3 one group (produceCleanedGroupBounded).
     for (int engine = 0; engine < 4; ++engine) {
-        // i == victimTotal is the CONTROL: no flip.  Since #839 a flip of the un-CRC-covered header bytes (baseOffset, epoch, magic) is
+        // i == victimTotal is the CONTROL: no flip.  Since #839 a flip of the un-CRC-covered header bytes (baseOffset, magic) is
         // damage too, so every flip leaves the log uncleanable; the control keeps the "the pass really rewrites" guard non-vacuous.
         for (std::size_t i = 0; i <= victimTotal; ++i) {
             SCOPED_TRACE("engine " + std::to_string(engine) + " flip " + std::to_string(i));
@@ -1282,11 +1282,11 @@ TEST(CheckedWritesVerdictCleanerRegression, ASegmentCutAtEveryLengthRefusesOnlyT
     std::filesystem::remove_all(dir);
 }
 
-// F5 (#839): baseOffset, epoch and magic are not covered by the batch CRC.  The cleaner's walk treats a bad one as damage
+// F5 (#839): baseOffset and magic are not covered by the batch CRC.  The cleaner's walk treats a bad one as damage
 // (the log is uncleanable, the segment is never rewritten), exactly like a CRC failure.
 TEST(CheckedWritesVerdictCleanerRegression, UnCrcCoveredHeaderFlipMakesTheLogUncleanableRegression) {
-    for (int c = 0; c < 3; ++c) {
-        SCOPED_TRACE(c == 0 ? "baseOffset" : c == 1 ? "magic" : "epoch");
+    for (int c = 0; c < 2; ++c) {
+        SCOPED_TRACE(c == 0 ? "baseOffset" : "magic");
         const auto dir = tempDir();
         {
             Log log(dir.string(), /*segmentBytes=*/900);
@@ -1297,8 +1297,8 @@ TEST(CheckedWritesVerdictCleanerRegression, UnCrcCoveredHeaderFlipMakesTheLogUnc
             std::ifstream in(victim->file, std::ios::binary);
             std::vector<char> raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             in.close();
-            const std::size_t at = victim->pos + (c == 0 ? 0 : c == 1 ? 16 : 12);
-            // baseOffset 6: clear its lowest set bit (lowers it below the expected offset); epoch: clear byte 12's lowest set bit.
+            const std::size_t at = victim->pos + (c == 0 ? 0 : 16);
+            // baseOffset 6: clear its lowest set bit (lowers it below the expected offset); magic: xor it.
             const uint8_t b = static_cast<uint8_t>(raw.at(at));
             ASSERT_NE(b, 0);
             xorByteAt(victim->file, at, c == 1 ? 0x5A : static_cast<uint8_t>(b & -b));

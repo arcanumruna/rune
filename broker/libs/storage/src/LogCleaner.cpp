@@ -253,7 +253,7 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
             std::optional<cr::ControlRecord> ctl;
             if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;   // a control record: validated once (#804)
-            // #839: baseOffset / magic / epoch are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
+            // #839: baseOffset / magic are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
             if (!hdr.accept(r)) break;
             const int64_t base = r.baseOffset();
             if (base >= scanEnd) { pos = buf.size(); break; }   // the intended end of the scan, not damage
@@ -412,7 +412,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             int32_t total = r.totalLength();
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             if (!r.ensureValid()) break;
-            // #839: baseOffset / magic / epoch are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
+            // #839: baseOffset / magic are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
             if (!hdr.accept(r)) break;
 
             bool full = false;
@@ -492,7 +492,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             // A3: CRC-gate the walk — stop on the first corrupt batch (same as recover()).
             if (!r.ensureValid()) break;
-            // #839: baseOffset / magic / epoch are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
+            // #839: baseOffset / magic are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
             if (!hdr.accept(r)) break;
 
             if (!isControlBatch(r) && !(isTransactionalBatch(r) && txn.isAborted(r.producerId(), r.baseOffset())))
@@ -581,7 +581,7 @@ bool LogCleaner::rewriteSegmentImpl(
         // parseControl (#804); its result goes on to markerAction.
         std::optional<rune::storage::control_record::ControlRecord> ctl;
         if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;
-        if (!hdr.accept(r)) break;   // #839: baseOffset / magic / epoch are not CRC-covered: damage like a CRC failure
+        if (!hdr.accept(r)) break;   // #839: baseOffset / magic are not CRC-covered: damage like a CRC failure
 
         // CP-8: KIP-534 delete-horizon gate.
         // CONTRACT: when hasDeleteHorizon() is true, baseTimestamp() IS the horizon
@@ -1550,7 +1550,7 @@ void LogCleaner::mergeGroupWithMap(
             if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
             std::optional<rune::storage::control_record::ControlRecord> ctl;   // a control record is validated once (#804)
             if (!validateBatch(r, buf.data() + pos, static_cast<std::size_t>(total), ctl)) break;
-            if (!hdr.accept(r)) break;   // #839: baseOffset / magic / epoch are not CRC-covered: damage like a CRC failure
+            if (!hdr.accept(r)) break;   // #839: baseOffset / magic are not CRC-covered: damage like a CRC failure
 
             // CP-8: horizon gate (same logic as rewriteSegmentImpl).
             const bool batchHasHorizon  = r.hasDeleteHorizon();

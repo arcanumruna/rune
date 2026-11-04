@@ -1027,11 +1027,11 @@ TEST(DamagedSegmentRegression, InPlaceTruncationIntoTheDamageClearsItRegression)
     }
 }
 
-// F5: baseOffset (0-7), partitionLeaderEpoch (12-15) and magic (16) are not covered by the batch CRC, so a flip there still
-// verifies.  Recovery must treat it as the end of the valid prefix: damage, never a served wrong offset.
+// F5: baseOffset (0-7) and magic (16) are not covered by the batch CRC, so a flip there still verifies (partitionLeaderEpoch,
+// 12-15, is not either, but stored epochs are not monotonic - unstamped -1 and re-stamped batches mix - so it is not checked).  Recovery must treat it as the end of the valid prefix: damage, never a served wrong offset.
 TEST(DamagedSegmentRegression, UnCrcCoveredHeaderFlipIsDamageRegression) {
-    for (int c = 0; c < 3; ++c) {
-        SCOPED_TRACE(c == 0 ? "baseOffset" : c == 1 ? "magic" : "epoch");
+    for (int c = 0; c < 2; ++c) {
+        SCOPED_TRACE(c == 0 ? "baseOffset" : "magic");
         DamagedFixture f(("dmg_hdr" + std::to_string(c)).c_str());
         ASSERT_GE(f.starts.size(), 3u);
         // The 2nd batch's position comes from the file: the 1st batch's totalLength.
@@ -1045,12 +1045,8 @@ TEST(DamagedSegmentRegression, UnCrcCoveredHeaderFlipIsDamageRegression) {
             // Lower the base below the expected offset: clear D's lowest set bit (byte 0 holds it, D < 256).
             ASSERT_LT(f.D, 256);
             xorByteAt(f.seg0, p + 0, static_cast<uint8_t>(f.D & -f.D));
-        } else if (c == 1) {
-            xorByteAt(f.seg0, p + static_cast<std::size_t>(batch::kMagicOffset));
         } else {
-            const std::size_t e = p + static_cast<std::size_t>(batch::kPartitionLeaderEpochOffset);
-            ASSERT_NE(buf[e], 0);   // the test batches carry epoch -1: clearing the low bit of byte 12 lowers it
-            xorByteAt(f.seg0, e, static_cast<uint8_t>(buf[e] & -buf[e]));
+            xorByteAt(f.seg0, p + static_cast<std::size_t>(batch::kMagicOffset));
         }
         auto rec = openRecovered(f.dir, kDmgRoll, false);
         EXPECT_EQ(rec->damagedSegmentCount(), 1u);
