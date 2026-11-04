@@ -5,6 +5,7 @@
 #include <metrics/MetricsFile.h>
 #include <metrics/MetricsLayout.h>
 #include <rune/node/RuneMetrics.h>
+#include <rune/node/ViewSnapshotChannel.h>
 
 #include <gtest/gtest.h>
 
@@ -117,6 +118,46 @@ TEST(BrokerMetricsRegression, OperationsDocTableMatchesRegression) {
         EXPECT_EQ(rows[i].label, def.labelPrefix);
         EXPECT_EQ(rows[i].kind, kindName(def.kind));
         EXPECT_EQ(rows[i].owner, ownerName(def.owner));
+    }
+}
+
+// #819: docs/operations.md "Restoring a backup" names every discard reason and forbids restoring the unsafe ones as
+// committed.delta.  A new ViewDiscardReason value forces a new row here.
+static_assert(static_cast<int>(rune::node::ViewDiscardReason::BelowLogStart) == 6,
+              "a new ViewDiscardReason needs a row in the docs/operations.md restore table and in this test");
+
+TEST(ViewBackupRestoreDocRegression, RestoreTableNamesEveryReasonAndForbidsLegacyRegression) {
+    const std::string docPath = std::string(RUNE_REPO_ROOT) + "/docs/operations.md";
+    std::ifstream in(docPath);
+    ASSERT_TRUE(in.good()) << "cannot open " << docPath;
+    std::vector<std::string> section;
+    std::string line;
+    bool inSection = false;
+    while (std::getline(in, line)) {
+        if (!inSection) {
+            if (line.rfind("**Restoring a backup**", 0) == 0) inSection = true;
+            else continue;
+        } else if (line.rfind("## ", 0) == 0) {
+            break;
+        }
+        section.push_back(line);
+    }
+    ASSERT_FALSE(section.empty()) << "docs/operations.md has no '**Restoring a backup**' section";
+    for (int v = 1; v <= 6; ++v) {
+        const auto reason = static_cast<rune::node::ViewDiscardReason>(v);
+        const std::string name = rune::node::viewDiscardReasonName(reason);
+        SCOPED_TRACE(name);
+        const std::string prefix = "| `" + name + "` |";
+        int rows = 0;
+        std::string row;
+        for (const std::string& l : section)
+            if (l.rfind(prefix, 0) == 0) { ++rows; row = l; }
+        ASSERT_EQ(rows, 1) << "exactly one restore-table row per reason";
+        const bool never = row.find("**Never**") != std::string::npos;
+        if (reason == rune::node::ViewDiscardReason::Unreadable)
+            EXPECT_FALSE(never) << row;
+        else
+            EXPECT_TRUE(never) << row;
     }
 }
 

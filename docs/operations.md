@@ -387,12 +387,24 @@ newer backups push them out.
 the file back to the last whole record (`VIEW-CHECKPOINT-TAIL-TRIMMED`) and carries on. No rebuild and no backup happen for
 this. Damage anywhere else is `unreadable`.
 
-**Restoring a backup** (for example when the discard was a false alarm):
+**Restoring a backup** (for example when the discard was a false alarm). Only some backups are safe to put back:
+
+| Reason | Restore as `committed.delta`? | Why |
+|---|---|---|
+| `legacy` | **Never** | old format; may hold rows of aborted transactions, which it would serve as committed |
+| `legacy-superseded` | **Never** | the same file kind; the committed file next to it is the truth |
+| `unreadable` | Only after upgrading to a broker that fixes the cause | a still-damaged file is backed up and rebuilt again; a false alarm (a decode bug) loads once fixed |
+| `ahead-of-log` | **Never** | the log lost the records those rows came from; it is discarded again, or, once the log grows past it, serves rows the log does not hold |
+| `ahead-of-verdicts` | **Never** | its rows were judged by markers the log no longer holds |
+| `below-log-start` | **Never** | the records needed to complete it are gone; it is discarded again |
+
 1. Stop the node.
-2. Pick the backup in `__view_snapshots/backup/` by view, partition and seq.
+2. Pick an `unreadable` backup in `__view_snapshots/backup/` by view, partition and seq (the highest seq is the newest).
 3. Move the current `view-<id>-p<n>.committed.delta` aside.
 4. Copy the backup to `view-<id>-p<n>.committed.delta`.
 5. Start the node. It validates the file again; if it is still not usable it is backed up and rebuilt as before.
+
+A whole-directory restore (see Backups and disaster recovery) is the way to get back state the log no longer holds.
 
 ## Verdict sources
 
