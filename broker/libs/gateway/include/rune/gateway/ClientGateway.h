@@ -539,6 +539,9 @@ public:
         (void)shipPermissions_(*s);
     }
     int servicePermissionShippingForTest() { return servicePermissionShipping_(); }
+    /// #713 probe (control thread): permission ships so far - every bind of a session's table (login, the must-change transition, a
+    /// gate change, a permission refresh), the suspended / deny tables included.  Plain counter, no allocation.
+    [[nodiscard]] uint64_t permissionShipsForTest() const noexcept { return permEpoch_; }
     /// Issue #259 probes: tables compiled so far, live pooled tables, and the words / ops shipped to the workers.
     [[nodiscard]] uint64_t permissionCompilesForTest() const noexcept { return permPool_.compiles(); }
     [[nodiscard]] std::size_t permissionTablesForTest() const noexcept { return permPool_.liveTables(); }

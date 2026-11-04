@@ -1795,6 +1795,11 @@ public:
     void holdPermissionShippingForTest(bool on) {
         onControlThreadForTest([this, on]() { if (gateway_) gateway_->holdPermissionShippingForTest(on); return 0; });
     }
+    /// Issue #713 probe (CONTROL thread): how many permission ships this broker's gateway has made (ClientGateway::permissionShipsForTest).
+    template <class = void>   // instantiated after onControlThreadForTest is defined
+    uint64_t permissionShipsForTest() {
+        return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->permissionShipsForTest() : 0; });
+    }
     /// Issue #189 seam (CONTROL thread): forget every login-throttle entry of this broker's gateway.
     template <class = void>   // instantiated after onControlThreadForTest is defined
     void resetLoginThrottleForTest() {

@@ -584,7 +584,8 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
 // Every permission ship of a ReadOnly namespace's session binds the SUSPENDED table on the workers, not its grants: a
 // login during the suspend, a grant change during it and the suspend itself.  Before the fix only the suspend bound a
 // deny table (answered 45, not 51) and the login / grant change re-shipped the full WRITE table, so the session could
-// produce on the worker-ingress path while its namespace was read-only.
+// produce on the worker-ingress path while its namespace was read-only.  #713: the gateway's permission-ship counter proves
+// each step really shipped (a step that ships nothing proves nothing).
 TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspendedRegression) {
     constexpr int kMaxConnectionsField = 18;
     auto w = setupWorld("nslct_roship");
@@ -600,16 +601,26 @@ TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspended
             return r != nullptr ? r->logEndOffset() : int64_t{-1};
         });
     };
+    BrokerNode& ln = W.t.node(leader);
+    uint64_t ships = ln.permissionShipsForTest();
+    // every step below must really ship (the counter moves) and the session must still answer 51 afterwards
+    auto shipped = [&](const char* what) {
+        const uint64_t now = ln.permissionShipsForTest();
+        EXPECT_GT(now, ships) << what << ": no permission ship happened, so the check below proves nothing";
+        ships = now;
+    };
     ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::Suspend, "a", 1).code, 0);
     // 1. the suspend itself: the existing session's next produce is refused 51 at the worker (once the bind landed).
     ASSERT_TRUE(AuthTrio::until(30s, [&] {
         const auto r = W.produce(alice, leader, W.tA, 64);
         return r.has_value() && r->errorCode == kSuspended;
     })) << "the suspend never reached the worker as NamespaceSuspended";
+    shipped("the suspend");
     const int64_t endAtSuspend = logEnd();
     // 2. a login while ReadOnly (allowed): its very first produce is refused 51 - its grants were never shipped.
     const World::Login bob = W.tryLogin(leader, "a/bob");
     ASSERT_EQ(bob.code, 0) << "ReadOnly still admits a login";
+    shipped("a login during ReadOnly");
     const auto rb = W.produce(bob.sid, leader, W.tA, 64);
     ASSERT_TRUE(rb.has_value());
     EXPECT_EQ(rb->errorCode, kSuspended) << "a login during ReadOnly shipped its WRITE grants to the worker";
@@ -621,10 +632,15 @@ TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspended
             return c.grant(ch, s, "a/alice", false, g.op, g.type, g.kind, g.pattern);
         });
         EXPECT_NE(ga.errorCode, 0) << "a grant into a ReadOnly namespace was accepted";
+        // #713: a refused grant (39 for the cluster admin too) refreshes nobody, and must-change-password is only ever set on
+        // the bootstrap admin (ApplyV1 createUser): so in a ReadOnly namespace the ships are the suspend, a login and the
+        // resume - exactly the ones counted here.
+        EXPECT_EQ(ln.permissionShipsForTest(), ships) << "a refused grant shipped permissions";
     }
-    // 4. a limits change while ReadOnly re-upserts `a` and re-ships every session's permissions: still suspended.
+    // 5. a limits change while ReadOnly re-upserts `a`; the gate is unchanged, so it ships nothing and the binds stand.
     ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::SetLimits, "a", 1, kMaxConnectionsField, 1000).code, 0);
     ASSERT_TRUE(W.t.awaitDigestsAgree(0, 30s));
+    EXPECT_EQ(ln.permissionShipsForTest(), ships) << "a limits change that leaves the gate unchanged ships nothing";
     for (int i = 0; i < 5; ++i)
         for (const int64_t s : {alice, bob.sid}) {
             const auto r = W.produce(s, leader, W.tA, 64);
@@ -636,6 +652,7 @@ TEST(NamespaceLifecycleTrioRegression, ReadOnlyEveryPermissionShipStaysSuspended
         << "a suspended session is never answered NotAuthorized by the worker";
     // Resume ships the real tables: both write again.
     ASSERT_EQ(W.ns(1, pc::NamespaceDdlKind::Resume, "a").code, 0);
+    EXPECT_TRUE(AuthTrio::until(30s, [&] { return ln.permissionShipsForTest() > ships; })) << "the resume shipped nothing";
     for (const int64_t s : {alice, bob.sid})
         EXPECT_TRUE(AuthTrio::until(30s, [&] {
             const auto r = W.produce(s, leader, W.tA, 64);
