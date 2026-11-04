@@ -15,12 +15,15 @@
 // bytes the log reported durable (Log::syncedExtentsForTest), after a CRASH
 // (Log::crashForTest — no clean-shutdown checkpoint).  No sleeps, no threads.
 #include <gtest/gtest.h>
+#include <rune/storage/BatchHeaderCursor.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -1075,4 +1078,104 @@ TEST(DamagedSegmentRegression, DamageAtNamesTheDamageForOffsetsInAndAfterItRegre
     auto ok = openRecovered(g.dir, kDmgRoll, false);
     EXPECT_EQ(ok->damagedSegmentCount(), 0u);
     for (int64_t o = g.bases[0]; o < ok->logEndOffset(); ++o) EXPECT_EQ(ok->damageAt(o), std::nullopt);
+}
+
+// ADVERSARIAL (batch-2 union review): baseOffset is not CRC-covered; #839's BatchHeaderCursor only refuses a base that
+// went DOWN.  A rot that RAISES a batch's base (high byte flip) must be damage too - never a batch served at offsets it
+// was never written at.  Every batch of segment 0, each with bit 0 of byte 5 flipped (+2^40).
+TEST(DamagedSegmentRegression, UpwardBaseOffsetFlipIsDamageAdversarialRegression) {
+    DamagedFixture probe("dmg_up_probe");
+    const std::size_t nBatches = probe.starts.size();
+    ASSERT_GE(nBatches, 3u);
+    for (std::size_t b = 0; b < nBatches; ++b) {
+        SCOPED_TRACE("batch " + std::to_string(b));
+        DamagedFixture f(("dmg_up" + std::to_string(b)).c_str());
+        const int64_t base = batchBaseAt(f.seg0, f.starts.at(b));
+        xorByteAt(f.seg0, f.starts.at(b) + 5, 0x01);   // baseOffset += 2^40 (little-endian byte 5)
+        auto rec = openRecovered(f.dir, kDmgRoll, false);
+        EXPECT_EQ(rec->damagedSegmentCount(), 1u) << "an upward-rotted baseOffset was accepted as a healthy batch";
+        EXPECT_EQ(rec->logEndOffset(), f.leo) << "the LEO moved with the rotted base";
+        const auto at = readAt(*rec, base);
+        EXPECT_FALSE(at.st == ReadIntoStatus::Ok && at.base != base)
+            << "offset " << base << " was answered with a batch whose base reads " << at.base << " (status " << static_cast<int>(at.st) << ")";
+        EXPECT_NE(at.st, ReadIntoStatus::Ok) << "offset " << base << " served (base " << at.base << ") although its batch rotted";
+        const auto past = readAt(*rec, f.bases[1]);
+        EXPECT_EQ(past.st, ReadIntoStatus::Ok);
+        EXPECT_EQ(past.base, f.bases[1]);
+    }
+}
+
+// ADVERSARIAL: the same +2^40 rot on the LAST batch of the ACTIVE segment (below R: the log closed cleanly) must not
+// move the LEO 2^40 forward (the next append would be numbered past a 1-TiB offset hole).
+TEST(DamagedSegmentRegression, UpwardBaseOffsetFlipInActiveSegmentKeepsTheLeoAdversarialRegression) {
+    DamagedFixture f("dmg_up_active");
+    const std::string active = segPath(f.dir, f.bases.back());
+    const auto starts = batchStarts(active);
+    ASSERT_FALSE(starts.empty());
+    const int64_t base = batchBaseAt(active, starts.back());
+    xorByteAt(active, starts.back() + 5, 0x01);
+    auto rec = openRecovered(f.dir, kDmgRoll, false);
+    EXPECT_LE(rec->logEndOffset(), f.leo) << "the LEO followed a rotted baseOffset";
+    const auto at = readAt(*rec, base);
+    EXPECT_FALSE(at.st == ReadIntoStatus::Ok && at.base != base) << "offset " << base << " answered with base " << at.base;
+}
+
+// #839: a LOW-byte flip (+2^16) on the last batch of a SEALED segment stays inside the int32 index range, so only the
+// next segment's base bounds it: the batch would claim offsets of a later segment.  This is the nextSegmentBase leg
+// (byte-5 flips are caught by the format bound alone).
+TEST(DamagedSegmentRegression, LowByteBaseOffsetFlipBelowTheNextSegmentIsDamageRegression) {
+    DamagedFixture f("dmg_lowbyte");
+    ASSERT_GE(f.starts.size(), 2u);
+    ASSERT_LT(f.bases[1] - f.bases[0], int64_t{1} << 16) << "premise: +2^16 crosses the next segment's base";
+    const int64_t base = batchBaseAt(f.seg0, f.starts.back());
+    xorByteAt(f.seg0, f.starts.back() + 2, 0x01);   // baseOffset += 2^16 (little-endian byte 2)
+    auto rec = openRecovered(f.dir, kDmgRoll, false);
+    EXPECT_EQ(rec->damagedSegmentCount(), 1u) << "a rotted base inside the next segment's range was accepted";
+    const auto at = readAt(*rec, base);
+    EXPECT_FALSE(at.st == ReadIntoStatus::Ok && at.base != base)
+        << "offset " << base << " answered with base " << at.base;
+    EXPECT_NE(at.st, ReadIntoStatus::Ok);
+    const auto past = readAt(*rec, f.bases[1]);
+    EXPECT_EQ(past.st, ReadIntoStatus::Ok);
+    EXPECT_EQ(past.base, f.bases[1]);
+}
+
+// BatchHeaderCursor's exclusive upper bound: (segBase, upper, base, lastDelta) -> accept / refuse.
+TEST(BatchHeaderCursorRegression, UpperBoundRegression) {
+    struct Case { int64_t segBase, upper, base; int32_t delta; bool accept; const char* what; };
+    constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+    const Case cases[] = {
+        {0, 100, 0, 0, true, "first offset"},
+        {0, 100, 99, 0, true, "base == upper-1, delta 0"},
+        {0, 100, 98, 1, true, "last offset == upper-1"},
+        {0, 100, 98, 2, false, "delta reaches upper"},
+        {0, 100, 99, 1, false, "delta pushes past upper"},
+        {0, 100, 100, 0, false, "base == upper"},
+        {0, 100, 5, -1, false, "negative delta"},
+        {0, 100, 5, std::numeric_limits<int32_t>::min(), false, "most negative delta"},
+        {0, 100, int64_t{1} << 40, 0, false, "base rotted +2^40"},
+        {0, 100, kMax, 0, false, "base INT64_MAX"},
+        {0, 100, kMax, std::numeric_limits<int32_t>::max(), false, "base INT64_MAX, max delta (no overflow)"},
+        {0, kMax, kMax - 1, 0, true, "upper INT64_MAX, base just below"},
+        {0, kMax, kMax - 1, 1, false, "upper INT64_MAX, delta reaches it"},
+        {0, kMax, 5, std::numeric_limits<int32_t>::max(), true, "max delta well inside a huge bound"},
+        {50, 100, 49, 0, false, "base below the segment base"},
+        {50, 100, 50, 49, true, "whole segment in one batch"},
+        {50, 100, 50, 50, false, "one past the segment"},
+    };
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.what);
+        std::vector<uint8_t> hdr(static_cast<std::size_t>(batch::kRecordBatchOverhead), 0);
+        std::memcpy(hdr.data() + batch::kBaseOffsetOffset, &c.base, 8);
+        hdr[batch::kMagicOffset] = static_cast<uint8_t>(batch::kMagicValue);
+        std::memcpy(hdr.data() + batch::kLastOffsetDeltaOffset, &c.delta, 4);
+        const RecordBatchReader r(hdr.data(), hdr.size());
+        BatchHeaderCursor cur(c.segBase, c.upper);
+        EXPECT_EQ(cur.accept(r), c.accept);
+    }
+    // upperFor: the format bound, cut to the successor's base, overflow-safe.
+    EXPECT_EQ(BatchHeaderCursor::upperFor(10), int64_t{10} + INT32_MAX + 1);
+    EXPECT_EQ(BatchHeaderCursor::upperFor(10, 500), 500);
+    EXPECT_EQ(BatchHeaderCursor::upperFor(10, int64_t{1} << 40), int64_t{10} + INT32_MAX + 1);
+    EXPECT_EQ(BatchHeaderCursor::upperFor(std::numeric_limits<int64_t>::max() - 5), std::numeric_limits<int64_t>::max());
 }

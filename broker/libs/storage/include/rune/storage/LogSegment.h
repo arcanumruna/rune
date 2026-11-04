@@ -239,7 +239,11 @@ public:
     /// damage_ keeps every byte on disk.
     enum class RecoverMode : uint8_t { CutTornTail, KeepDamage };
     struct SegmentDamage { int64_t bytePos; int64_t offset; int64_t fileBytes; };
-    int64_t recover(bool syncIndex = true, RecoverMode mode = RecoverMode::CutTornTail);
+    ///
+    /// `nextSegmentBase` (#839): the base of the segment that follows this one in the log (nullopt = this is the last).
+    /// A batch whose offsets reach it, or the int32 index range above this segment's base, is damage (BatchHeaderCursor).
+    int64_t recover(bool syncIndex = true, RecoverMode mode = RecoverMode::CutTornTail,
+                    std::optional<int64_t> nextSegmentBase = std::nullopt);
     /// #839: set by a KeepDamage recover that found bytes past the last whole batch.  Cold.
     [[nodiscard]] bool damaged() const noexcept { return damage_.has_value(); }
     [[nodiscard]] const std::optional<SegmentDamage>& damage() const noexcept { return damage_; }

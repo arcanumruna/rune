@@ -400,7 +400,8 @@ private:
                             int64_t nowMs = -1, bool* changed = nullptr,
                             const ProducerTails* tails = nullptr,
                             const TxnCleanState* txn = nullptr,
-                            VerdictCleanState* verdicts = nullptr);
+                            VerdictCleanState* verdicts = nullptr,
+                            std::optional<int64_t> nextSegBase = std::nullopt);
 
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones
@@ -414,13 +415,13 @@ private:
     bool rewriteSegment(const std::string& dir, int64_t segBase, OffsetMap& map,
                         Offset fromOffset, Offset cleanBoundaryOffset,
                         int64_t nowNs, int64_t deleteRetentionMs,
-                        int64_t nowMs = -1);
+                        int64_t nowMs = -1, std::optional<int64_t> nextSegBase = std::nullopt);
 
     /// SkimpyOffsetMap overload of rewriteSegment.
     bool rewriteSegment(const std::string& dir, int64_t segBase, SkimpyOffsetMap& map,
                         Offset fromOffset, Offset cleanBoundaryOffset,
                         int64_t nowNs, int64_t deleteRetentionMs,
-                        int64_t nowMs = -1);
+                        int64_t nowMs = -1, std::optional<int64_t> nextSegBase = std::nullopt);
 
     /// Coalesce the in-pass segments of one group into the group's lowest base,
     /// filtering every record against the PREBUILT dirty `map` (built once over the
@@ -431,7 +432,8 @@ private:
                            SkimpyOffsetMap& map,
                            Offset globalDirtyStart, Offset passEnd,
                            int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs,
-                           Throttler* throttler, bool* changed);
+                           Throttler* throttler, bool* changed,
+                           std::optional<int64_t> afterGroupBase = std::nullopt);
     int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
     int64_t prefixBytesRead_        = 0;
     Offset  markerRemovalBound_     = 0;
