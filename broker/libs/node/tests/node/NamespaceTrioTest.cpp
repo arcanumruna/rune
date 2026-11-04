@@ -402,11 +402,13 @@ int dupCode(Op o) {
         default: return 0;   // SetNamespaceLimits
     }
 }
-/// How many events of `n`'s `__security` log carry request id `rid` (its first word, little endian, is stored once per
-/// event that carries the id).
-int countInLog(BrokerNode& n, const RequestId& rid) {
-    return n.onAdminThreadForTest([&n, &rid]() -> int {
-        const std::vector<uint8_t> bytes = n.securityLogForTest()->read(0, 1 << 22);
+/// How many events of `n`'s `__security` log (security ops) or `__catalog` log (all others) carry request id `rid` (its
+/// first word, little endian, is stored once per event that carries the id).  #645: every op is counted, not only the
+/// security ones.
+int countInLog(BrokerNode& n, const RequestId& rid, bool security) {
+    return n.onAdminThreadForTest([&n, &rid, security]() -> int {
+        rune::storage::Log* log = security ? n.securityLogForTest() : n.catalogLogForTest();
+        const std::vector<uint8_t> bytes = log->read(0, 1 << 22);
         const std::string_view hay(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         char needle[8];
         for (int i = 0; i < 8; ++i) needle[i] = static_cast<char>((rid.hi >> (8 * i)) & 0xFF);
@@ -555,10 +557,11 @@ TEST_P(NamespaceTrioLeaderChangeRegression, LeaderChangeMidCreateConvergesRegres
     if (ok && p.op == Op::SetNamespaceLimits)
         EXPECT_EQ(W.maxTopicsOf("admin", L2, "a"), static_cast<int64_t>(lim)) << label;
 
-    if (ok && sec) {
-        ASSERT_TRUE(t.awaitDigestsAgree(secBefore + 1, 30s));
+    if (ok && sec) ASSERT_TRUE(t.awaitDigestsAgree(secBefore + 1, 30s));
+    if (ok) {
+        // #645: the retry (same request id) must not have written a second event, in either log, on any live node
         for (BrokerNode* n : t.cluster().live())
-            EXPECT_EQ(countInLog(*n, req.rid), 1) << label << ": node " << n->nodeIdForTest() << ": exactly one event for the request";
+            EXPECT_EQ(countInLog(*n, req.rid, sec), 1) << label << ": node " << n->nodeIdForTest() << ": exactly one event for the request";
     }
 
     // g. L comes back and holds it exactly once
@@ -583,7 +586,7 @@ TEST_P(NamespaceTrioLeaderChangeRegression, LeaderChangeMidCreateConvergesRegres
                 break;
             default: break;   // CreateUser / Grant: the digests agree and the log holds the request once (below)
         }
-        if (sec) EXPECT_EQ(countInLog(t.node(L), req.rid), 1) << label << ": the restarted leader's log holds the request once";
+        EXPECT_EQ(countInLog(t.node(L), req.rid, sec), 1) << label << ": the restarted leader's log holds the request once";
     }
 }
 
