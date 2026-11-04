@@ -31,6 +31,7 @@
 //                                     majority = |peers|/2+1 (e.g. 2 for 3 nodes, 1 for 1 node).
 //
 //   RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND — int64 > 0, the log cleaner's shared I/O throttle. Default unlimited.
+//   RUNE_CLEANER_DEDUPE_BUFFER_BYTES — int64 in [1 MiB, 4 GiB], the log cleaner's dedupe map budget. Default 128 MiB.
 //
 // Consumer groups (all optional):
 //   RUNE_GROUP_MAX_GROUPS           — int32 > 0, the most consumer groups this broker coordinates at once (#214).
@@ -1069,9 +1070,14 @@ struct NodeConfig {
     /// Kafka log.cleaner.io.max.bytes.per.second). Absent/empty = -1 = unlimited.
     int64_t cleanerIoMaxBytesPerSecond = -1;
 
-    /// The log cleaner's dedupe map budget (Kafka log.cleaner.dedupe.buffer.size). -1 = 128 MiB. Tests set it small:
-    /// every cleaner pass and broker start rewrites the whole map, which a sanitizer build makes minutes-slow.
-    int64_t cleanerDedupeBufferBytes = -1;
+    /// RUNE_CLEANER_DEDUPE_BUFFER_BYTES — the log cleaner's dedupe map budget (Kafka log.cleaner.dedupe.buffer.size).
+    /// The table is the largest power-of-two entry count that fits the budget, so it never allocates more than this
+    /// (#658).  Default 128 MiB; the env knob is bounded to [1 MiB, 4 GiB].  -1 (tests only) = the agent's 128 MiB.
+    /// Tests set it small: every cleaner pass and broker start rewrites the whole map, which a sanitizer build makes
+    /// minutes-slow.
+    static constexpr int64_t kMinCleanerDedupeBufferBytes = int64_t{1} << 20;
+    static constexpr int64_t kMaxCleanerDedupeBufferBytes = int64_t{1} << 32;
+    int64_t cleanerDedupeBufferBytes = int64_t{128} << 20;
 
     // PSM fix round 1 (I1, Kafka producer.id.expiration.ms): compaction keeps the
     // last batch METADATA of every producer active within this window (a

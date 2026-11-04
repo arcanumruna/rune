@@ -563,3 +563,23 @@ TEST(SkimpyOffsetMap, SOM6_SingleWriterInvariantPreserved) {
         }
     }
 }
+
+// #658: a byte budget bounds the table.  Building from the slot count rounded UP to the next power of two past the
+// budget: 128 MiB allocated 256 MiB, all of it written by resetTable_.
+// RED (build the map from maxSlotsFromBudget through the slots constructor): capacity * 16 is 256 MiB at 128 MiB.
+TEST(SkimpyOffsetMapRegression, BudgetBoundsTheTableBytesRegression) {
+    using rune::storage::SkimpyOffsetMap;
+    constexpr int64_t kMiB = int64_t{1} << 20;
+    for (const int64_t budget : {int64_t{1} << 10, kMiB, 3 * kMiB, 128 * kMiB, 128 * kMiB + 1, int64_t{4} << 30}) {
+        SCOPED_TRACE("budget=" + std::to_string(budget));
+        const auto z = SkimpyOffsetMap::sizingForBudget(budget);
+        const uint64_t bytes = uint64_t{z.capacity} * SkimpyOffsetMap::kEntryBytes;
+        EXPECT_LE(bytes, static_cast<uint64_t>(budget)) << "the table fits the budget";
+        EXPECT_GT(bytes, static_cast<uint64_t>(budget) / 2) << "and is the largest power of two that does";
+        EXPECT_EQ(z.capacity & (z.capacity - 1), 0u) << "a power of two";
+        EXPECT_EQ(z.maxSlots, static_cast<std::size_t>(static_cast<double>(z.capacity) * 0.9));
+    }
+    const SkimpyOffsetMap one(SkimpyOffsetMap::sizingForBudget(kMiB));
+    EXPECT_EQ(one.capacity() * SkimpyOffsetMap::kEntryBytes, static_cast<std::size_t>(kMiB)) << "allocated, not only computed";
+    EXPECT_EQ(one.maxSlots(), SkimpyOffsetMap::sizingForBudget(kMiB).maxSlots);
+}
