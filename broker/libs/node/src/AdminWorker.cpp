@@ -58,7 +58,7 @@ constexpr uint16_t kViewSourceNotFound   = 33;
 constexpr uint16_t kViewFieldUnresolved  = 34;
 constexpr uint16_t kViewKeyInvalid       = 35;
 constexpr uint16_t kViewNotCoPartitioned = 36;
-constexpr uint16_t kViewSourceTransient  = 37;
+// 37 (ViewSourceTransient) is reserved and never sent: a persisted view may read a transient source (checked writes Part 10)
 constexpr uint16_t kViewNotAlterable     = 38;
 constexpr uint16_t kInvalidRequest       = 39;
 constexpr uint16_t kInvalidTopicName     = 40;
@@ -1589,9 +1589,7 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
             }
         const RegistryEntry* e = t != nullptr ? reg_.byId(src.topicId) : nullptr;
         if (e == nullptr) return Rejected(reject(kViewSourceNotFound));
-        // Phase 2b E: a view that reads a transient topic must itself be transient.
-        if (t->persistence == cat::Persistence::Transient && persistence == 0)
-            return Rejected(reject(kViewSourceTransient));
+        // Checked writes Part 10 (spec 9a): any view may read a transient topic (a keyless source is refused above, spec 4).
         srcDescs.push_back(&e->descriptor);
         sourceNames.push_back(t->name);
     }

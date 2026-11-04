@@ -32,7 +32,7 @@ x-broker-build: &broker-build
     rune-codec: ../../codec
     # rune-crypto (client<->broker TLS/AEAD): the Dockerfile COPYs --from=rune-crypto.
     rune-crypto: ../../crypto
-    # aeron-recipe: local aeron/1.51.0-rune.1 recipe; the Dockerfile COPYs --from=aeron-recipe.
+    # aeron-recipe: local aeron/1.51.0-rune.2 recipe; the Dockerfile COPYs --from=aeron-recipe.
     aeron-recipe: ../../conan/aeron
 
 x-broker-env: &broker-env

@@ -68,7 +68,7 @@ struct ViewPaused { ViewPauseReason reason = ViewPauseReason::OverLimit; int64_t
 using ViewPauseState = std::variant<ViewRunning, ViewPaused>;
 
 // The namespace a source partition (hence its views) lives in, as the owning worker's log tag.  Default = untagged
-// (kNoNsSlot): the instance is not charged to any namespace (unit tests, transient sources, which carry no tag).
+// (kNoNsSlot): the instance is not charged to any namespace (unit tests).
 struct NsTag { uint16_t slot = kNoNsSlot; uint32_t nsId = 0; };
 
 // Task 19b: split an on-disk view checkpoint file into its individual Task-12
@@ -116,7 +116,7 @@ struct ViewFoldCounters {
     uint64_t aggInconsistent  = 0;   // aggregate: retraction found missing/zero state
     uint64_t aggRescans       = 0;   // aggregate (Phase 2b): Min/Max value-block rescans (retracted extreme)
     uint64_t transientRecordsEvicted = 0;   // transient ring dropped records the view had not folded
-    uint64_t transientSourceResets   = 0;   // E2: the source ring was recreated / cut under a live cursor (re-folded)
+    uint64_t transientSourceResets   = 0;   // the source ring was recreated, cut or restarted under the cursor, or a recovered checkpoint met a new ring (re-folded)
 };
 
 // The live [logStart, logEnd) of a TRANSIENT (InMemoryLog) source partition,
@@ -145,8 +145,8 @@ struct TransientBounds {
 //                                 an EARLIER incarnation of the source.  A
 //                                 transient source restarts empty and reuses
 //                                 offsets, so that cursor is meaningless: the
-//                                 first reconcile warns once, resets to logStart
-//                                 and keeps the rows.
+//                                 first reconcile logs once (INFO), counts a source
+//                                 reset, resets to logStart and keeps the rows.
 //   CursorLive{incarnation, logGeneration}
 //                               — cursor tracks THIS source ring: re-folded from
 //                                 logStart when the ring was recreated (new
@@ -155,7 +155,7 @@ struct TransientBounds {
 //                                 from logStart when the generation moved by
 //                                 more (only the last cut is known);
 //                                 EVICTED when it falls below logStart,
-//                                 invariant breach when above logEnd.
+//                                 a source restart when above logEnd.
 struct CursorFresh {};
 struct CursorRecoveredUnreconciled {};
 struct CursorLive {

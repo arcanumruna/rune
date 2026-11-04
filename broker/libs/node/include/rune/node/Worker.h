@@ -698,8 +698,15 @@ public:
     void setViewSet(WorkerViewSet* vs) noexcept {
         viewSet_ = vs;
         // Task 12: the view set's per-slot arrays follow this worker's slot table size.
-        if (vs != nullptr && vs->nsSlotCapacity() != nsSlots_.capacity()) vs->configureNsSlots(nsSlots_.capacity());
-        if (vs != nullptr) vs->setVerdictIntervalNs(verdictIntervalNs_);
+        if (vs == nullptr) return;
+        if (vs->nsSlotCapacity() != nsSlots_.capacity()) vs->configureNsSlots(nsSlots_.capacity());
+        vs->setVerdictIntervalNs(verdictIntervalNs_);
+        // The boot slots were applied to this worker before its view set existed.
+        for (uint32_t s = 0; s < nsSlots_.capacity(); ++s) {
+            const uint16_t sl = static_cast<uint16_t>(s);
+            const uint32_t id = nsSlots_.nsIdAt(sl);
+            if (id != NsSlotTable::kFreeSlot) vs->onNsSlotAssign(sl, id, nsSlots_.limits(sl));
+        }
     }
     /// Part 04 (SD14): how often a verdict source writes a marker for accepted-only progress.
     void setVerdictIntervalNs(int64_t ns) noexcept {
@@ -4293,7 +4300,7 @@ private:
     }
 
     /// Task 14 (D28): the cycles one view read costs are charged to its namespace's queryCycles (two counter reads and
-    /// one add).  The read's slot is the source log's; a transient source is untagged and not charged.
+    /// one add).  The read's slot is the namespace tag of the source's ring or log.
     ViewServe serveViewRead_(ViewReadReq& r) {
         lastViewReadSlot_ = kNoNsSlot;
         const uint64_t t0 = readCycleCounter_();
@@ -4376,10 +4383,13 @@ private:
                 enqueueReturn_(std::move(ret));
                 return ViewServe::Answered;
             }
-            if (rune::storage::Log* const sl = srcRep->isDiskBacked() ? srcRep->log() : nullptr; sl != nullptr && src >= 0) {   // Task 14: count + pace (one add, one compare); a transient source has no Log and no namespace tag
-                NsHot& nh = nsHot_[sl->nsSlot()];
+            uint16_t srcSlot = kNoNsSlot;
+            if (srcRep->isDiskBacked()) { if (const rune::storage::Log* l = srcRep->log()) srcSlot = l->nsSlot(); }
+            else if (const rune::storage::InMemoryLog* m = srcRep->memoryLog()) srcSlot = m->nsSlot();
+            if (srcSlot != kNoNsSlot && src >= 0) {   // Task 14: count + pace (one add, one compare), whatever the source's persistence
+                NsHot& nh = nsHot_[srcSlot];
                 ++nh.requestOps;
-                lastViewReadSlot_ = sl->nsSlot();
+                lastViewReadSlot_ = srcSlot;
                 if (passNowNs_ < nh.queryUntil) [[unlikely]] {
                     ++throttledRefusals_;
                     ret.errorCode  = static_cast<int16_t>(RS::kThrottled);
@@ -7046,7 +7056,7 @@ private:
                     return mem->readView(from, kPushMaxChunkBytes);
                 };
                 work += driveViewsOf_(topicId, partition, readRange, bound, skip, nowNs, replica,
-                                      replica->leadershipGeneration(), hwConfirmed, NsTag{}, replica);
+                                      replica->leadershipGeneration(), hwConfirmed, NsTag{mem->nsSlot(), mem->nsId()}, replica);
             }
         }
         return work;

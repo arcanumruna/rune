@@ -146,7 +146,7 @@ Every DDL is answered. No request is silently dropped.
 | A leader change during the DDL, a new leader not yet caught up, or `__catalog` below its minimum ISR | `NotLeader` (2), retriable. The client retries for `ddlRetryBudget` (10 s by default), then fails with `NotLeader`. |
 | A name that is taken, or differs from a live name only in ASCII letter case | `TopicExists` (25) |
 | A bad name | `InvalidTopicName` (40) |
-| Invalid DDL: replication factor, a setting out of range, a view over a transient topic, ... | The specific code (for example `SchemaIncompatible` 30, `SchemaConflict` 31, `ViewExists` 32, `ViewSourceNotFound` 33, `ViewSourceTransient` 37, `ViewNotAlterable` 38, `ViewSourceIsView` 41), otherwise `InvalidRequest` (39) with a detail. |
+| Invalid DDL: replication factor, a setting out of range, ... | The specific code (for example `SchemaIncompatible` 30, `SchemaConflict` 31, `ViewExists` 32, `ViewSourceNotFound` 33, `ViewNotAlterable` 38, `ViewSourceIsView` 41), otherwise `InvalidRequest` (39) with a detail. |
 | An unknown topic or view | `UnknownTopic` (7) |
 | The broker's catalog apply halted | `Internal` (6) until an operator resolves it. |
 | A DDL from a client older than version 8 on a broker that is not the leader | `InvalidRequest` (39) in the request's own response type. See the release note. |

@@ -1009,12 +1009,10 @@ std::vector<uint8_t> upsertRun(int64_t base, int n) {
 }
 } // namespace
 
-// Invariant breach: a view over a transient topic is itself transient, so its
-// cursor can never sit above the source end.  If it does (the source restarted
-// EMPTY and reuses offsets 0.. below a live cursor) the rows are kept, one warn
-// is logged, and every post-restart record must fold (without the reset the
-// cursor 2 would silently skip the new record at offset 0).
-TEST(WorkerViewSetRegression, TransientSourceCursorAboveLogEndIsInvariantBreachRegression) {
+// The source restarted EMPTY and reuses offsets below a live cursor: the rows are kept, one INFO line is logged and the
+// reset is counted; every post-restart record must fold (without the reset the cursor 2 would silently skip the new
+// record at offset 0).
+TEST(WorkerViewSetRegression, TransientSourceCursorAboveLogEndRefoldsAndCountsAResetRegression) {
     auto src = charSourceV1();
     const rune::codec::Descriptor* srcs[] = {&src};
     auto comp = rune::view::compileView(hpView(1), srcs, 0x40000031).value();
@@ -1033,7 +1031,7 @@ TEST(WorkerViewSetRegression, TransientSourceCursorAboveLogEndIsInvariantBreachR
     const auto after = upsertAt(0, 9, 77);                                   // reused offset 0
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{after.data(), after.size(), 0, 1}; };
     const rune::node::TransientBounds tb1{0, 0};
-    vs.driveFolds(5, 0, rr1, 0, rune::view::kNoSkip, 0, &tb1);                                    // breach: cursor -> 0
+    vs.driveFolds(5, 0, rr1, 0, rune::view::kNoSkip, 0, &tb1);                                    // above logEnd: cursor -> 0
     const rune::node::TransientBounds tb2{0, 1};
     vs.driveFolds(5, 0, rr1, 1, rune::view::kNoSkip, 0, &tb2);
     const uint8_t* row9 = vs.getRow(0x40000031, 0, 9, L);
@@ -1041,6 +1039,7 @@ TEST(WorkerViewSetRegression, TransientSourceCursorAboveLogEndIsInvariantBreachR
     EXPECT_EQ(rune::view::readSlot(row9, *L, 1).i, 77);
     EXPECT_NE(vs.getRow(0x40000031, 0, 7, L), nullptr) << "pre-restart rows are kept";
     EXPECT_EQ(vs.foldCounters(0x40000031, 0)->transientRecordsEvicted, 0u);
+    EXPECT_EQ(vs.foldCounters(0x40000031, 0)->transientSourceResets, 1u);
 }
 
 // The ring evicted records the view had not folded yet: skip to logStart and

@@ -378,6 +378,18 @@ public:
                                   it->second.readiness == ViewReadiness::Ready, pz != nullptr, pz ? pz->offset : 0};
     }
 
+    /// The (view, partition) instance's fold cursor, -1 when it is not hosted.  Tests only.
+    [[nodiscard]] int64_t foldCursorForTest(int32_t viewTopicId, int32_t partition) const noexcept {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it == views_.end() ? -1 : it->second.foldCursor;
+    }
+
+    /// The (view, partition) instance's key index slot count, 0 when it is not hosted.  Tests only.
+    [[nodiscard]] std::size_t indexSlotsForTest(int32_t viewTopicId, int32_t partition) const noexcept {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it == views_.end() ? 0 : it->second.table.indexSlotsForTest();
+    }
+
     /// VLS B.3: is `topicId` a view this worker has the plan of -- i.e. a view SINK id?  Pure read of worker-owned
     /// state (the plan install ring carries every view id to every worker).
     [[nodiscard]] bool isViewSink(int32_t topicId) const noexcept { return templates_.find(topicId) != templates_.end(); }

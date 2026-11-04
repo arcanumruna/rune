@@ -66,7 +66,7 @@ namespace rune::node {
 //   OK 0, NotLeader 2, Internal 6, UnknownTopic 7, InvalidSchema 23, TopicExists 25,
 //   SchemaIncompatible 30, SchemaConflict 31, ViewExists 32, ViewSourceNotFound 33,
 //   ViewFieldUnresolved 34, ViewKeyInvalid 35, ViewNotCoPartitioned 36,
-//   ViewSourceTransient 37, ViewNotAlterable 38, InvalidRequest 39 (with a detail),
+//   ViewSourceTransient 37 (reserved, never sent), ViewNotAlterable 38, InvalidRequest 39 (with a detail),
 //   InvalidTopicName 40, ViewSourceIsView 41.
 
 // ---------------------------------------------------------------------------
