@@ -1819,7 +1819,11 @@ public:
                 return n && *n != 0;
             };
             const bool dirty = (groupCoordService_ && fold(groupCoordService_->liveKeysOfNamespaceForTest(nsId))) |
-                               (txnCoordService_ && fold(txnCoordService_->liveKeysOfNamespaceForTest(nsId)));
+                               (txnCoordService_ && fold(txnCoordService_->liveKeysOfNamespaceForTest(nsId))) |
+                               // the coordinators' in-memory entries too (#663 / #727): a delete that tombstoned the stores but
+                               // left a group or transaction in memory is Dirty
+                               (groupCoordService_ && groupCoordService_->inMemoryGroupsOfNamespaceForTest(nsId) != 0) |
+                               (txnCoordService_ && txnCoordService_->inMemoryEntriesOfNamespaceForTest(nsId) != 0);
             return dirty ? KeyedStoresState::Dirty : unknown ? KeyedStoresState::Unknown : KeyedStoresState::Clean;
         });
     }

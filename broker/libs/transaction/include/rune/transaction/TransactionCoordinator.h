@@ -599,6 +599,8 @@ public:
     /// #663 / #727: forget every transactional id of namespace `nsId` (a deleted namespace's, once nothing of it is
     /// unsettled).  Cold; no persistence (the caller tombstones the durable records).  Returns the count erased.
     uint32_t eraseNamespace(uint32_t nsId);
+    /// Test seam (cold scan): the transactional ids of namespace `nsId` this coordinator still holds in memory.
+    [[nodiscard]] std::size_t countOfNamespaceForTest(uint32_t nsId) const;
 
     /// #696: the Ongoing transactions of namespace `nsId` (the count nsOpenTxnsAtLimit_ checks maxOpenTxns against).
     /// Cold scan.

@@ -539,6 +539,15 @@ void TransactionCoordinationService::forgetNamespace_(uint32_t nsId)
     (void)coordinator_.eraseNamespace(nsId);
 }
 
+std::size_t TransactionCoordinationService::inMemoryEntriesOfNamespaceForTest(uint32_t nsId) const
+{
+    std::size_t n = coordinator_.countOfNamespaceForTest(nsId);
+    for (const auto& kv : holds_) n += rune::coordination::parseScopedId(kv.second.txnId).nsId == nsId ? 1 : 0;
+    for (const auto& kv : lastPutOffset_) n += rune::coordination::parseScopedId(kv.first).nsId == nsId ? 1 : 0;
+    for (const auto& kv : pidIndex_) n += rune::coordination::parseScopedId(kv.second).nsId == nsId ? 1 : 0;
+    return n;
+}
+
 std::optional<std::size_t> TransactionCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const
 {
     if (txnState_ == nullptr || loadState_ != LoadState::Loaded) return std::nullopt;   // unknown: store not loaded

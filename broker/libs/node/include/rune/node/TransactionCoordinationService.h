@@ -221,6 +221,9 @@ public:
     /// #663 / #727 test seam: the in-memory coordinator's known transactional ids and held keys.
     [[nodiscard]] std::size_t coordinatorSizeForTest() const noexcept { return coordinator_.size(); }
     [[nodiscard]] std::size_t holdCountForTest() const noexcept { return holds_.size(); }
+    /// Entries of namespace `nsId` still held IN MEMORY (the coordinator's transactions, holds, last-put offsets and the
+    /// producer-id cache: what forgetNamespace_ erases).  Cold scan; independent of the persisted store.
+    [[nodiscard]] std::size_t inMemoryEntriesOfNamespaceForTest(uint32_t nsId) const;
     [[nodiscard]] std::optional<std::size_t> liveKeysOfNamespaceForTest(uint32_t nsId) const;   ///< nullopt = unknown (not loaded / not the coordinator)
 
     /// A control marker this node could not append.  NEVER counts as landed: a

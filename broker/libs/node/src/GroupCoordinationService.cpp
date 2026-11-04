@@ -94,6 +94,12 @@ ReapStatus GroupCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t 
     return ReapStatus::Done;
 }
 
+std::size_t GroupCoordinationService::inMemoryGroupsOfNamespaceForTest(uint32_t nsId) const {
+    std::size_t n = 0;
+    for (const auto& kv : coordinators_) n += rune::coordination::parseScopedId(kv.first).nsId == nsId ? 1 : 0;
+    return n;
+}
+
 std::optional<std::size_t> GroupCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const {
     if (offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return std::nullopt;   // unknown: not loaded / not the coordinator
     return offsets_->liveKeysOfNamespaceForTest(nsId);

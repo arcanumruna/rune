@@ -280,6 +280,8 @@ public:
     /// written, or the tombstones are not yet committed; Done = none left and all committed.
     ReapStatus tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs);
     /// Read-only test seam: the live offset keys of `nsId` in this node's store; nullopt (unknown, NOT zero) when the store is not loaded here.
+    /// Groups of namespace `nsId` still held IN MEMORY (coordinators_).  Cold scan; independent of the persisted store.
+    [[nodiscard]] std::size_t inMemoryGroupsOfNamespaceForTest(uint32_t nsId) const;
     [[nodiscard]] std::optional<std::size_t> liveKeysOfNamespaceForTest(uint32_t nsId) const;   ///< nullopt = unknown (not loaded / not the coordinator)
     /// Issue #212: the session was revoked (terminal) - every member tracked on it leaves its group now (cold).
     void removeSessionMembers(int64_t sessionId, int64_t nowNs) override;

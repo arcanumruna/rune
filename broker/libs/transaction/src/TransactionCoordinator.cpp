@@ -620,6 +620,13 @@ uint32_t TransactionCoordinator::eraseNamespace(uint32_t nsId)
     return n;
 }
 
+std::size_t TransactionCoordinator::countOfNamespaceForTest(uint32_t nsId) const
+{
+    std::size_t n = 0;
+    for (const auto& kv : txnMap_) n += rune::coordination::parseScopedId(kv.first).nsId == nsId ? 1 : 0;
+    return n;
+}
+
 uint32_t TransactionCoordinator::abortAllForSession(int64_t sessionId, int64_t /*nowNs*/)
 {
     if (sessionId == 0) return 0;   // 0 = "no session known": never matches
