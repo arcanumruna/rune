@@ -1310,7 +1310,7 @@ TEST(CompactionCleanerAgentRegression, ADamagedLogIsNeverSelectedAgainUntilResta
 // same in-place path), so every remaining and every new segment is intact, yet the agent never selects the log again until
 // the broker restarts: a compacted topic stops compacting and grows without bound.  The mark is keyed by the log's dir and
 // only dropped when the dir leaves the view.
-// Non-urgent break (under-cleaning, no loss): DISABLED until the issue filed from this review is fixed.
+// Non-urgent break (under-cleaning, no loss): #853, DISABLED until it is fixed.
 TEST(CompactionCleanerAgentRegression, DISABLED_AnUncleanableLogIsSelectedAgainOnceItsDamageIsTruncatedAwayAdversarialRegression) {
     auto dir = cp6TempDir("cp840_truncated_damage");
     Log log(dir.string(), /*rollBytes=*/128);
