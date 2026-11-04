@@ -1167,6 +1167,7 @@ if(BUILD_TESTING)
         tests/session/SessionMachineTest.cpp
         tests/session/SessionMachineAuthTest.cpp   # authentication Task 7: the SCRAM client + Authenticating
         tests/session/SessionMachineTransientRetryTest.cpp   # C4 review: transient refusals (48 / rate-limited 44)
+        tests/support/AllocCounter.cpp   # #732: zero-alloc namesRetiredSealedSession gate
     )
     # client<->broker TLS/AEAD (Task 5): SessionMachine.h now drives a real
     # TlsSession/AeadCipher directly (header-only) — this target links rune_crypto
