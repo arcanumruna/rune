@@ -38,7 +38,7 @@ value as false). *ring/size* values must be powers of two; any other value keeps
 | `RUNE_VERDICT_INTERVAL_MS` | `100` | How often a verdict source's leader writes a verdict marker when nothing was rejected (positive ms). A rejection writes one at once. Max 2592000000 (30 days). |
 | `RUNE_ELECTION_STATUS_INTERVAL_MS` | `20` | Canvass and heartbeat cadence (positive ms). The leader-heartbeat timeout is `max(election timeout, 3 x this)`. Max 2592000000 (30 days). |
 | `RUNE_STARTUP_CANVASS_TIMEOUT_MS` | `100` | Extended canvass window on first boot, for peer discovery (positive ms). Max 2592000000 (30 days). |
-| `RUNE_CONTROLLED_SHUTDOWN_MS` | `5000` | Budget for handing partition leadership to in-sync peers on SIGTERM. `0` = no hand-off. |
+| `RUNE_CONTROLLED_SHUTDOWN_MS` | `5000` | Budget for handing partition leadership to in-sync peers on SIGTERM. `0` = no hand-off. An integer in `[0, 2592000000]` ms (30 days); anything else refuses startup. |
 | `RUNE_MIN_ISR` | majority (`peers / 2 + 1`) | Minimum in-sync replicas for an `acks=all` produce, and the lower bound for a topic's `replicas`. Integer of at least 1. |
 | `RUNE_BROKER_LIVENESS_TIMEOUT_MS` | `0` (3 x the leader-heartbeat timeout) | How long the controller waits without a heartbeat before it fails a node's partitions over. A fault-test knob. |
 | `RUNE_SURVIVOR_LEADER_ELECTION` | off | `1`/`true`/`TRUE` enables the position-proven survivor election for a partition whose committed ISR has no live member. Off by default, as Kafka's `unclean.leader.election.enable`. |
@@ -89,7 +89,7 @@ them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this vers
 | `RUNE_METRICS_SYSTEM_INTERVAL_MS` | `1000` | How often the control agent samples `/proc/self` into the process metrics (positive ms). Max 2592000000 (30 days). |
 | `RUNE_IO_BACKEND` | `uring` when available, else `portable` | `uring` (Linux io_uring) or `portable`. An unset value falls back to `portable` when io_uring cannot start (old kernel, seccomp, Docker Desktop on Apple Silicon). An explicit `uring` fails loudly. |
 | `RUNE_TRANSIENT_LOG_RING_BYTES` | `8388608` (8 MiB) | Node-wide ring size of every transient partition (power of two). `RUNE_MEMORY_LOG_RING_BYTES` is a deprecated alias that logs one warning; the canonical name wins when both are set. |
-| `RUNE_PRODUCER_ID_EXPIRATION_MS` | `604800000` (7 days) | How long an idle producer id is remembered for idempotence (0 or more). |
+| `RUNE_PRODUCER_ID_EXPIRATION_MS` | `604800000` (7 days) | How long an idle producer id is remembered for idempotence. An integer in `[0, 2592000000]` ms (30 days); garbage, a negative or a larger value refuses startup. |
 | `RUNE_WORKER_SYNC_INTERVAL_MS` | `0` | Periodic fsync of the worker's logs; `0` = never (0 to 2 592 000 000). |
 | `RUNE_FOLLOWER_FLUSH_INTERVAL_MS` | `0` | Periodic flush of follower copies; `0` = never (0 to 2 592 000 000). |
 | `RUNE_ENABLE_COALESCING` | `true` | `0` or `false` (any case) turns compaction coalescing off. |
@@ -160,7 +160,7 @@ authentication enabled, and with any of these variables set, instead of starting
 | `RUNE_IDLE_DOORBELL` | `true` | Doorbell wake of parked workers, `0`/`1`/`false`/`true`. |
 | `RUNE_IDLE_DOORBELL_MIN_PARK_US` | `1000` | Doorbell minimum park, `1` to `1000000` us; must not exceed the next row. |
 | `RUNE_IDLE_DOORBELL_PARK_US` | `1000` | Doorbell park, `1` to `1000000` us. |
-| `RUNE_FETCH_INTERVAL_US` | `5000` | Follower periodic-fetch backstop cadence (positive us). |
+| `RUNE_FETCH_INTERVAL_US` | `5000` | Follower periodic-fetch backstop cadence. An integer in `[1, 2592000000000]` us; anything else refuses startup. |
 | `RUNE_PER_WORKER_INGRESS` | `false` | `1`/`true`/`TRUE`. Forced on by shard mode. |
 | `RUNE_PER_WORKER_EGRESS` | `false` | Same. Forced on by shard mode. |
 | `RUNE_PER_WORKER_REPLICATION` | `false` | Same. Forced on by shard mode. |
@@ -197,7 +197,7 @@ in a cluster, `RUNE_REPL_OUTBOUND_RING_BYTES / 8` and `min(term / 8, 16 MiB)`. L
 | `RUNE_SEGMENT_PROVISION_THRESHOLD_PCT` | `50` | Fill percentage of the active segment that triggers provisioning, clamped to `1` to `100`. |
 | `RUNE_SEGMENT_PROVISION_CAP_BYTES` | `-1` (no cap) | Cap on bytes of pre-created segments; negative = none. |
 | `RUNE_SEGMENT_PROVISION_CAP_FREE_PCT` | `10` | Cap as a percentage of free disk, clamped to `1` to `100`. |
-| `RUNE_SEGMENT_PROVISIONER_MAX_PARK_US` | `10000` | Longest park of the provisioner (1 or more). |
+| `RUNE_SEGMENT_PROVISIONER_MAX_PARK_US` | `10000` | Longest park of the provisioner. An integer in `[1, 1000000]` us; anything else refuses startup. |
 
 Per-topic retention, compaction and segment settings are **not** environment variables: they are `with (...)`
 settings of the `topic` statement ([Rune QL](api/ql.md#topics)).

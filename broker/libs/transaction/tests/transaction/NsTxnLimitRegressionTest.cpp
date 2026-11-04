@@ -98,3 +98,19 @@ TEST(LimitEnforcementTableRegression, TxnTimeRegression) {
     EXPECT_EQ(c.doWork(59 * kSec), 0);
     EXPECT_EQ(c.doWork(61 * kSec), 1) << "the global timeout still applies";
 }
+
+// #837: a namespace record written by an older broker can carry any uint64 maxTxnTimeMs.  The sweep converted it to ns with a
+// signed multiply, which wraps negative above ~9.2e12 ms and aborted every open transaction of the namespace at once.
+TEST(LimitEnforcementTableRegression, HugeNamespaceTxnTimeNeverAbortsAtOnceRegression) {
+    for (const uint64_t x : {9'300'000'000'000ULL, 1ULL << 63, UINT64_MAX}) {
+        SCOPED_TRACE(x);
+        TransactionCoordinator c(ProducerIdAllocator{}, 60'000);
+        const std::string id = scopedId(1, "h");
+        const Opened o = init(c, id, 60'000);
+        ASSERT_EQ(addPart(c, id, o, 0), AddPartitionsResult::kOk);
+        c.setNamespaceTxnLimits(1, 0, x);
+        EXPECT_EQ(c.doWork(1 * kSec), 0) << "a huge limit is no limit: no early abort";
+        EXPECT_EQ(c.metadata(id)->state, TxnState::Ongoing);
+        EXPECT_EQ(c.doWork(60 * kSec + 1), 1) << "the transaction's own timeout still applies";
+    }
+}

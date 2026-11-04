@@ -195,6 +195,8 @@ enforced, each with one precise code:
 | `produce-bytes-per-sec`, `produce-records-per-sec`, `fetch-bytes-per-sec`, `request-ops-per-sec`, `query-cycles-per-sec` | a per-namespace aggregator compares the node's usage with `limit x elapsed` every `RUNE_NS_LIMIT_TICK_US` (default 10000) | `Throttled (53)` carrying a retry-after; the client library waits it out and retries |
 | `max-view-memory-bytes` | the node's view chunks | the namespace's views pause at their offset and a view read answers `ViewPaused (54)`; they resume when memory falls or the limit is raised |
 
+- **`max-txn-time-ms` is at most 2592000000 (30 days).** A larger value on `CreateNamespace` or `SetLimits` is refused with
+  `InvalidRequest (39)`; so is `RUNE_NS_DEFAULT_MAX_TXN_TIME_MS` above it, at startup.
 - **Lowering a limit deletes nothing**, except the retention maximum: objects over a lowered count stay and the next
   create is refused; a lowered retention maximum deletes old segments on the next retention pass and the SetLimits is answered Ok with the warning `retention clamped on N topics` in the
   DDL response's detail.
