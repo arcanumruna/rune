@@ -160,6 +160,30 @@ int dupCode(Op o) {
 }
 }  // namespace
 
+// #650: the plan's "Justified deviations" section (2026-10-26-rune-namespaces.md) records these rules; pin each one so
+// the doc and the expectations cannot drift apart.  No broker: expect() and the code tables only.
+TEST(NamespaceMatrixCountRegression, JustifiedDeviationsPinnedRegression) {
+    // anonymous Fetch and GetViewRow are NotAuthorized (spec §11), not the plan's rule 2 "Ok"
+    for (const Op o : {Op::Fetch, Op::GetViewRow})
+        for (const Target t : {Target::OwnNs, Target::SameNameBoth, Target::ForeignNs, Target::Missing})
+            EXPECT_EQ(expect(o, Caller::Anonymous, t), Outcome::notAuthorized()) << name(o) << "/" << name(t);
+    // an ungranted data op on a ForeignNs target is NotAuthorized, not Missing
+    for (const Op o : {Op::CreateTopic, Op::AlterTopic, Op::DropTopic, Op::Produce, Op::Fetch, Op::GetTopicSchema})
+        EXPECT_EQ(expect(o, Caller::UserUngranted, Target::ForeignNs), Outcome::notAuthorized()) << name(o);
+    // root ListNamespaces on a Missing target is Ok
+    EXPECT_EQ(expect(Op::ListNamespaces, Caller::ClusterAdmin, Target::Missing), Outcome::ok());
+    // a duplicate user or role answers 39, the code of the security "missing" answer
+    for (const Op o : {Op::CreateUser, Op::CreateRole}) {
+        EXPECT_EQ(expect(o, Caller::ClusterAdmin, Target::OwnNs), Outcome::exists(39)) << name(o);
+        EXPECT_EQ(expectedCodes(o)[0], 39) << name(o);
+    }
+    // DropTopic duplicate -> 7 and Grant duplicate -> 39: the same codes as their "missing" answers
+    EXPECT_EQ(dupCode(Op::DropTopic), 7);
+    EXPECT_EQ(expectedCodes(Op::DropTopic)[0], 7);
+    EXPECT_EQ(dupCode(Op::Grant), 39);
+    EXPECT_EQ(expectedCodes(Op::Grant)[0], 39);
+}
+
 TEST(NamespaceMatrixTimingCountRegression, TimingCellCountRegression) {
     EXPECT_EQ(timingCells().size(), 42u);
 }
