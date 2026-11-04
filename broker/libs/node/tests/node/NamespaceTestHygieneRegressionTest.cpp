@@ -67,12 +67,14 @@ TEST(NamespaceTestHygieneRegression, NoSleepPollsOrResendsRegression) {
     }
 }
 
-// #711: the lifecycle rig and the stress test wait with the client's pollFor, never with a wall-clock sleep.  (The
-// matrix `waitFor` and the trio World `call`/`burst` pace external client threads and keep their bounded sleeps.)
+// #711: the lifecycle rig, the stress test, the trio tests and the matrix wait on the awaited state (the client's pollFor,
+// AuthTrio::until, a yield under a deadline), never with a wall-clock sleep_for of their own.
 TEST(NamespaceTestHygieneRegression, NoSleepForInLifecycleTestsRegression) {
     const std::regex sleeps(R"(\bsleep_for\s*\()");
     EXPECT_EQ(findAll("sample", "std::this_thread::sleep_for(2ms);", sleeps).size(), 1u);
-    for (const char* file : {"support/NamespaceLifecycleRig.h", "support/NamespaceRig.h", "node/NamespaceStressTest.cpp"}) {
+    for (const char* file : {"support/NamespaceLifecycleRig.h", "support/NamespaceRig.h", "node/NamespaceStressTest.cpp",
+                              "node/NamespaceLifecycleTrioRegressionTest.cpp", "node/NamespaceTrioTest.cpp",
+                              "node/NamespaceLifecycleMatrixTest.cpp"}) {
         const std::string text = slurp(file);
         ASSERT_FALSE(text.empty()) << file;
         for (const std::string& hit : findAll(file, text, sleeps))

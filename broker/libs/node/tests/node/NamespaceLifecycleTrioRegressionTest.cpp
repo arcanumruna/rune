@@ -190,7 +190,11 @@ public:
                     last.code != static_cast<int>(pc::ErrorCode::AuthUnavailable)) return last;
             }
             if (Clock3::now() >= deadline) return last;
-            std::this_thread::sleep_for(50ms);
+            // #711: a refused round is retried once the cluster has a settled catalog and security leader (an observable state
+            // under a cap), not after a fixed pause.
+            // #711: a refused round is retried once the cluster has a settled catalog and security leader (an observable state
+            // under a cap), not after a fixed pause.
+            (void)AuthTrio::until(5s, [&] { return t.cluster().settledLeader() > 0 && security_cluster::settledSecurityLeader(t.cluster()) > 0; });
         }
     }
     Ans ns(int prefer, pc::NamespaceDdlKind kind, const std::string& name, uint8_t mode = 1, int field = -1, uint64_t value = 0) {
