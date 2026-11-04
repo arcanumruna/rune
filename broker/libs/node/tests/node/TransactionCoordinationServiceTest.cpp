@@ -2218,3 +2218,52 @@ TEST_F(TxnNsDeleteRegression, SuspendedNamespaceStillAppliesTxnOffsetsRegression
     EXPECT_EQ(svc_->mootOffsetsDroppedForTest(), 0u);
     EXPECT_EQ(svc_->txnStateForTest(scoped), tx::TxnState::CompleteCommit);
 }
+
+// ADVERSARIAL (batch-2 union review, c86df044 re-attack, rule 16): once the namespace is Deleting its deferred commit's
+// offsets are moot and the commit must settle on the NEXT doWork - on a FROZEN clock (no retry back-off to wait out).
+// The reaper's AbortTxns step then answers Done.  Mutation: drop `a.offsetDueNs = 0` in setNamespaceTxnGate -> red.
+TEST_F(TxnNsDeleteRegression, DeletingSettlesDeferredCommitOnAFrozenClockAdversarialRegression) {
+    const std::string local = "tx-pc";
+    const std::string scoped = rune::coordination::scopedId(4, local);
+    const rune::coordination::NsRequestContext ctx{4, false, nullptr};
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    RefusingSink sink;
+    sink.refusals = 1'000'000'000;
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    int16_t ep = 0;
+    const int64_t pid = initPidIn(ctx, local, ep);
+    RepTxn r; r.svc = svc_.get(); r.answers = &answers_;
+    r.commitAll = [this, &r] { followerFetches(); (void)r.svc->doWork(now_); };
+    r.ctx = ctx;
+    {
+        const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+        const std::size_t n = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, ++corr_, pid, ep, local, parts);
+        const std::size_t k = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size(), ctx);
+        if (k == 0) { followerFetches(); (void)svc_->doWork(now_); answers_.frames.clear(); }
+    }
+    ASSERT_EQ(r.addOffsets(local, pid, ep, "cgp", now_), 0);
+    ASSERT_EQ(r.commit(local, pid, ep, "cgp", 5, now_), 0);
+    ASSERT_EQ(r.endTxn(local, pid, ep, /*commitIt=*/true, now_), 0);
+    followerFetches();
+    svc_ = std::make_unique<rune::node::TransactionCoordinationService>(
+        txnStore_.get(), /*topics=*/nullptr, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
+    svc_->setTxnOffsetSink(&RefusingSink::apply, &sink);
+    svc_->setAppendFnOverride([](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t { return 0; });
+    for (int i = 0; i < 3; ++i) { followerFetches(); (void)svc_->doWork(now_); }
+    ASSERT_EQ(svc_->awaitingMarkerTxnsForTest(), 1u);
+    svc_->onControlMarkerLanded(0, 0, pid, rune::gateway::ITxnRequestHandler::kAnyCoordinatorEpoch);
+    for (int i = 0; i < 5; ++i) { now_ += 1'100'000'000; followerFetches(); (void)svc_->doWork(now_); }
+    ASSERT_EQ(svc_->txnStateForTest(scoped), tx::TxnState::PrepareCommit) << "premise: deferred on the refused offset";
+    // One refused retry right now arms the back-off; from here the clock never moves.
+    followerFetches(); (void)svc_->doWork(now_);
+    svc_->setNamespaceTxnGate(4, true, /*deleting=*/true);   // the delete's apply
+    rune::node::ReapStatus abortAnswer = rune::node::ReapStatus::More;
+    for (int i = 0; i < 8 && abortAnswer != rune::node::ReapStatus::Done; ++i) {   // hard cap, frozen clock
+        followerFetches(); (void)svc_->doWork(now_);
+        abortAnswer = svc_->abortNamespaceTxns(4, now_);
+    }
+    EXPECT_EQ(abortAnswer, rune::node::ReapStatus::Done) << "the deferred commit waited for wall time after the delete";
+    EXPECT_EQ(svc_->txnStateForTest(scoped), tx::TxnState::CompleteCommit);
+    EXPECT_EQ(sink.accepted, 0);
+    EXPECT_EQ(svc_->mootOffsetsDroppedForTest(), 1u);
+}
