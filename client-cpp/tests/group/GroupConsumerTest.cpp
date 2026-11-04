@@ -373,11 +373,19 @@ struct CaptureSink {
 // ---------------------------------------------------------------------------
 // Helper: run a consumer through Joining → Syncing → Stable with one partition.
 // ---------------------------------------------------------------------------
+/// #743: the hub has no wall-clock fallback; tests whose later doWork passes steady_clock time stamp the hub's
+/// duty clock with the same epoch before the first timer is armed.
+static int64_t steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 static void bringToStable(GroupConsumerHub& hub, CaptureSink& sink,
                            int32_t topicId, int32_t partition,
                            int32_t genId = 1,
                            const std::string& memberId = "m1")
 {
+    hub.noteDutyNow(steadyNowNs());
     // Trigger join.
     hub.onConnected(kSessionId, sink.fn());
     sink.clear();
@@ -3446,6 +3454,21 @@ struct CtlRig {
 }  // namespace
 
 class GroupConsumerHubRegression : public GroupConsumerHubTest {};
+
+TEST_F(GroupConsumerHubRegression, JoinDeadlineUsesTheDutyClockNotWallTimeRegression) {
+    constexpr int64_t kStart = 1'000;
+    const int64_t     joinTimeoutNs = static_cast<int64_t>(impl_->cfg.sessionTimeoutMs) * 1'000'000LL;
+    hub_->noteDutyNow(kStart);
+    hub_->onConnected(kSessionId, sink_.fn());
+    ASSERT_EQ(impl_->state, GroupConsumerState::Joining);
+    ASSERT_EQ(sink_.frames.size(), 1u);   // the first JoinGroup
+    sink_.clear();
+    hub_->doWork(kStart + joinTimeoutNs - 1, kSessionId, sink_.fn());
+    EXPECT_TRUE(sink_.frames.empty()) << "re-sent before the duty-clock deadline";
+    hub_->doWork(kStart + joinTimeoutNs + 1, kSessionId, sink_.fn());
+    ASSERT_EQ(sink_.frames.size(), 1u) << "the join deadline did not fire on the duty clock";
+    EXPECT_EQ(sink_.templateId(0), static_cast<uint16_t>(rpc::TemplateId::JoinGroup));
+}
 
 TEST_F(GroupConsumerHubRegression, AJoinErrorEndsOnlyTheConsumerItAnswersRegression) {
     for (int failing = 0; failing < 2; ++failing) {   // either impl order: the old "first Joining impl" heuristic fails one

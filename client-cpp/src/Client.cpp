@@ -329,7 +329,7 @@ Client::Client(ClientConfig cfg, const detail::ClientTestOptions& opts)
     cqFree_.assign(kMaxCqs, 0);  // FIFO ring of released slots (I3)
     releases_.reserve(16);       // C7: handle releases (cold; grows only on a burst of releases)
     groupConsumerHub_.setSessionConnected(false);  // fix3: not connected until the first connect
-    groupConsumerHub_.setClock(cfg_.nanoClock);   // #701: its timers run on the duty clock (nullptr = steady, as nowNs())
+    groupConsumerHub_.noteDutyNow(now());   // #743: the hub's timers run on the duty clock (stored each pass in dutyCycle)
     // F8c C4: commitSync completions go through the completion-queue registry.
     groupConsumerHub_.setCompletionSink(detail::CompletionSink{&Client::deliverTrampoline_, this});
     subscriberHub_.setSessionConnected(false);
@@ -3438,6 +3438,7 @@ int Client::dutyCycle(int64_t nowNs) {
 
     // 1. Agent: driver/conductor (invoker), command ring, egress, session ticks.
     //    ProduceResponses are decoded and buffered, not dispatched through hooks.
+    groupConsumerHub_.noteDutyNow(nowNs);   // #743: before any frame reaches a hub handler this pass
     int work = agent_.doWork(nowNs);
     // I3': owner releases fenced on the command ring apply once the drain passed them.
     if (!deferredReleases_.empty()) [[unlikely]] work += applyDeferredReleases_(false);

@@ -231,10 +231,10 @@ public:
     /// down — fails every pending commitSync with SessionLostError.
     void setSessionConnected(bool connected, int64_t sessionId = 0, int64_t episode = 0) noexcept;
     [[nodiscard]] bool sessionConnected() const noexcept { return sessionConnected_; }
-    /// #701: the duty clock the hub's timers (heartbeat, auto-commit, rejoin backoff, join deadline) are stamped on
-    /// - the Client's injected ClientConfig::nanoClock.  nullptr = the real steady clock (the same epoch as
-    /// Client::nowNs()).  Set before the first doWork.
-    void setClock(int64_t (*clock)() noexcept) noexcept { clock_ = clock; }
+    /// #743: the hub's timers (heartbeat, auto-commit, rejoin backoff, join deadline) run on the DUTY clock only, as
+    /// Aeron's cached clock does: every entry that takes `nowNs` stores it first, and `noteDutyNow` is the explicit
+    /// store for a pass that reaches the hub through a response handler.  There is no wall-clock fallback.
+    void noteDutyNow(int64_t nowNs) noexcept { dutyNowNs_ = nowNs; }
     [[nodiscard]] bool hasPendingCommitSync() const noexcept;
 
     /// fix1 I4: consumers whose generation snapshot a near-full status ring
@@ -443,12 +443,8 @@ private:
     int32_t brokerVersion_ = rune::protocol::client::kBrokerVersion;
     int32_t connectedMaxBrokerVersion_ = 0;   // #440: router-less hubs only (see setConnectedMaxBrokerVersion)
     bool    anyJoinDeferred_ = false;         // #440: some consumer's join is deferred — re-checked every doWork
-    int64_t (*clock_)() noexcept = nullptr;   // #701: nullptr = steady_clock
-    [[nodiscard]] int64_t nowNs_() const noexcept {
-        return clock_ != nullptr ? clock_()
-                                 : std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now().time_since_epoch()).count();
-    }
+    int64_t dutyNowNs_ = 0;   // #743: the cached duty clock (see noteDutyNow)
+    [[nodiscard]] int64_t nowNs_() const noexcept { return dutyNowNs_; }
     /// #440: the highest version a Connected session announces now (the coordinator's own included).
     [[nodiscard]] int32_t liveMaxBrokerVersion_() const noexcept;
     /// #440: every deferred join re-checked against the live sessions: Refuse ends it (BrokerTooOld).

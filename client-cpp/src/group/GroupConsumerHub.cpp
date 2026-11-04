@@ -351,6 +351,7 @@ static void resetOffsetFetch_(GroupConsumerImpl& impl) noexcept {
 }
 
 int GroupConsumerHub::driveRewinds(int64_t nowNs, int64_t sessionId, const SendFn& sendFn) {
+    dutyNowNs_ = nowNs;   // #743
     int n = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
@@ -368,6 +369,7 @@ int GroupConsumerHub::driveRewinds(int64_t nowNs, int64_t sessionId, const SendF
 }
 
 int GroupConsumerHub::sweepCommitSyncTimeouts(int64_t nowNs) {
+    dutyNowNs_ = nowNs;   // #743
     int n = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
@@ -558,12 +560,14 @@ GroupConsumerHub::DispatchScope::~DispatchScope() {
 }
 
 void GroupConsumerHub::applyCommand(const detail::HubCommand& cmd, int64_t nowNs) {
+    if (nowNs != 0) dutyNowNs_ = nowNs;   // #743 (0 = the caller has no time to give: keep the last duty clock)
     // Ring path: commands are FIFO behind their GroupAdd — resolve the
     // identity against the hub's own list (never dereference an unknown one).
     applyTo_(cmd, cmd.op == detail::HubCommand::Op::GroupAdd ? nullptr : find_(cmd.handle), nowNs);
 }
 
 void GroupConsumerHub::applyCommandDirect(const detail::HubCommand& cmd, int64_t nowNs) {
+    if (nowNs != 0) dutyNowNs_ = nowNs;   // #743 (0 = the caller has no time to give: keep the last duty clock)
     // fix3 I3: direct path (duty thread, the caller's handle keeps the impl
     // alive): act on the IMPL itself, even if its GroupAdd is still queued in
     // the ring — add() honours what was done (closed => never added).
@@ -1369,6 +1373,7 @@ bool GroupConsumerHub::onFetchSubscribeRefused(int64_t corrId, bool park, int32_
 
 int GroupConsumerHub::retryOffsetFetch(int64_t nowNs, int64_t sessionId, const SendFn& sendFn)
 {
+    dutyNowNs_ = nowNs;   // #743
     if (!routed_() || !sessionConnected_) return 0;
     int sent = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
@@ -1582,6 +1587,7 @@ int GroupConsumerHub::doWork(int64_t nowNs,
 {
     int work = 0;
     const int64_t now = nowNs;   // the duty clock, as passed by the caller
+    dutyNowNs_ = nowNs;          // #743
     if (anyJoinDeferred_) [[unlikely]] recheckDeferredJoins_();   // #440: the newer node may be gone
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
