@@ -3327,7 +3327,8 @@ void BrokerNode::createMetrics_() {
         slots_[i] = RuneMetricSlot{r.writer, d.owner, &metricWrittenBy_[i]};
     }
     // D59: the observer's slots are copied here, on the observer (start) thread, before any agent thread starts;
-    // the provisioner receives its slots in its constructor (start()).  Every other row is the control thread's.
+    // the provisioner receives its slots in its constructor (start()).  Every other row is the control thread's, except
+    // the process-metrics rows (library SlotWriters, no MetricOwner tag), whose single writer is the admin agent (#632).
     observerSlots_ = ObserverSlots{slots_[static_cast<std::size_t>(runeMetricRow(RuneMetric::Role))],
                                    slots_[static_cast<std::size_t>(runeMetricRow(RuneMetric::Term))],
                                    slots_[static_cast<std::size_t>(runeMetricRow(RuneMetric::OutOfSyncPartitions))]};
@@ -4515,6 +4516,10 @@ void BrokerNode::buildAdminWorker() {
             catalogReplica_.get(), catalogPlane_.get());
         // Task 16 (F4): the applier the startup phase booted — Booted, never replayed
         // again; the admin thread's first pass makes it Live.
+#if defined(__linux__)
+        // #632: the process metrics sample on this agent's thread (D62 superseded), never on the control thread.
+        adminWorkerAgent_->adoptSystemMetrics(systemMetrics_ ? &*systemMetrics_ : nullptr);
+#endif
         adminWorkerAgent_->worker().adoptBootedApplier(std::move(*bootApplier_), adminWorkerAgent_->catalogLiveEffects());
         bootApplier_.reset();
         // Authentication Task 9: the same for the booted SecurityApplier + the `__security` replica.
@@ -4554,6 +4559,9 @@ void BrokerNode::buildAdminWorker() {
             nodeId, ex.what());
         adminWorkerRunner_.reset();
         adminWorkerAgent_.reset();
+#if defined(__linux__)
+        if (systemMetrics_) spdlog::warn("BrokerNode[{}]: process metrics off: no admin agent", nodeId);
+#endif
     }
     // Catalog history Task 6: the catalog has no other driver than the admin
     // thread — no admin worker means an undriven catalog: never start so.
@@ -4868,7 +4876,8 @@ void BrokerNode::stop() {
 
     if (mtuProbeFd_ >= 0) { ::close(mtuProbeFd_); mtuProbeFd_ = -1; }   // re-check I1
     // arcanum-metrics Task 8: the metrics file stays mapped (and its values readable) until the node is destroyed;
-    // the system metrics close their /proc fds here.
+    // the system metrics close their /proc fds here.  #632: the admin agent samples them, and its runner was
+    // stopAndJoin'ed above, so no thread touches systemMetrics_ any more: keep this reset after that join.
 #if defined(__linux__)
     systemMetrics_.reset();
 #endif
@@ -5058,9 +5067,6 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     work += reportUnbuildableReplicas_();
     work += checkLinkMtu_(nowNs, /*force=*/false);   // re-check I1: the runtime's clock, no per-pass clock read
     work += publishStorageMetrics_();                // ISR v3 §3.10
-#if defined(__linux__)
-    if (systemMetrics_) work += systemMetrics_->doWork(nowNs);   // arcanum-metrics D62: process metrics, own interval
-#endif
     if (consensusUnmarked_ && nowNs - lastConsensusMarkCheckNs_ >= 1'000'000'000LL) {   // ISR v3 Step 6 (cold: until marked)
         lastConsensusMarkCheckNs_ = nowNs;
         markConsensusWhenPresent_();

@@ -281,7 +281,7 @@ metrics and structured logs, not `__security` events.
 
 ### Process metrics
 
-On Linux the control agent samples `/proc/self` every `RUNE_METRICS_SYSTEM_INTERVAL_MS` (default 1000) and writes the rows
+On Linux the admin agent samples `/proc/self` every `RUNE_METRICS_SYSTEM_INTERVAL_MS` (default 1000) and writes the rows
 below. Other hosts have no `/proc`, and their brokers export no process metrics.
 
 | Type id | Label | Kind | Meaning |

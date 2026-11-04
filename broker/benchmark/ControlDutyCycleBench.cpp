@@ -1,14 +1,18 @@
-// ControlDutyCycleBench — metrics plan Task 12: what SystemMetrics adds to one control-agent duty cycle.
+// ControlDutyCycleBench — metrics plan Task 12: what SystemMetrics adds to one admin-agent duty cycle.
 //
-// The control agent's doWork does `if (systemMetrics_) work += systemMetrics_->doWork(nowNs);` (D62). This bench
-// isolates that increment on a real metrics file and the real /proc/self, in three cases:
+// The ADMIN agent's doWork does `if (systemMetrics_) work += systemMetrics_->doWork(nowNs);` (#632 moved it off the
+// control thread; D62 superseded). This bench isolates that increment on a real metrics file and the real /proc/self,
+// in four cases:
 //   * NoSystemMetrics  — the optional is empty (metrics file off): the baseline branch.
 //   * OffInterval      — sampled once, then every call lands inside the interval: the steady-state cost.
 //   * OnInterval       — intervalNs = 1 and nowNs advances every call, so every call samples (pread statm and
 //                        status, getdents64 the fd dir): the worst case, which the default 1 s interval hits once
 //                        a second.
+//   * OnIntervalWith4000Fds — OnInterval with 4000 extra open fds (dup(0)) held across the loop: the fd walk is linear
+//                        in open fds (about 200 ns each), which is why the sample is not on the control thread.
 // Gates (checked after the timed loop, BenchGate.h): zero allocations in every case; OffInterval < 50 ns per cycle;
-// OnInterval < 50 µs per cycle (well under one control-loop budget; it runs at most once per interval).
+// OnInterval < 50 µs per cycle in this small process; OnIntervalWith4000Fds < 2 ms per sample (the admin agent's
+// budget; the 50 µs control-thread budget no longer applies because the control thread no longer samples).
 // The full BrokerNode control doWork is not driven here: it needs a whole broker, and the produce path is covered
 // by the ABAB single-node produce p99 run (BENCHMARKING.md).
 #include "BenchGate.h"
@@ -40,6 +44,8 @@ constexpr int32_t kSlots = 64;
 // call runCase with so few cycles that the two clock reads dominate ns_per_cycle and trip the time gate.
 constexpr benchmark::IterationCount kCycleIterations = 10'000'000;
 constexpr benchmark::IterationCount kSampleIterations = 50'000;
+constexpr benchmark::IterationCount kFdWalkIterations = 2'000;
+constexpr int kExtraFds = 4000;
 
 // A metrics file in a private temp directory, removed on exit.
 struct MetricsFixture {
@@ -66,14 +72,14 @@ struct MetricsFixture {
     }
 };
 
-// The control-agent increment under test, exactly as BrokerNode's control doWork writes it.
+// The admin-agent increment under test, exactly as AdminWorkerAgent::doWork writes it.
 inline int controlIncrement(std::optional<metrics::SystemMetrics>& sm, int64_t nowNs) noexcept {
     int work = 0;
     if (sm) work += sm->doWork(nowNs);
     return work;
 }
 
-enum class Mode { None, OffInterval, OnInterval };
+enum class Mode { None, OffInterval, OnInterval, OnInterval4000Fds };
 
 void runCase(benchmark::State& state, Mode mode, double gateNs, const char* gateMsg) {
     MetricsFixture f;
@@ -81,8 +87,18 @@ void runCase(benchmark::State& state, Mode mode, double gateNs, const char* gate
         state.SkipWithError("metrics file setup failed");
         return;
     }
+    std::vector<int> extraFds;   // closed on every exit path
+    struct CloseAll { std::vector<int>& v; ~CloseAll() { for (const int fd : v) if (fd >= 0) ::close(fd); } } closeAll{extraFds};
+    if (mode == Mode::OnInterval4000Fds) {
+        extraFds.reserve(kExtraFds);
+        for (int i = 0; i < kExtraFds; ++i) extraFds.push_back(::dup(0));
+        if (extraFds.back() < 0) {
+            state.SkipWithError("cannot open 4000 fds (raise RLIMIT_NOFILE)");
+            return;
+        }
+    }
     std::optional<metrics::SystemMetrics> sm;
-    const int64_t intervalNs = mode == Mode::OnInterval ? 1 : int64_t{3'600} * 1'000'000'000;  // 1 ns, or 1 h
+    const int64_t intervalNs = mode == Mode::OnInterval || mode == Mode::OnInterval4000Fds ? 1 : int64_t{3'600} * 1'000'000'000;  // 1 ns, or 1 h
     int64_t nowNs = 1'000'000'000;
     if (mode != Mode::None) {
         sm.emplace();
@@ -116,7 +132,7 @@ void runCase(benchmark::State& state, Mode mode, double gateNs, const char* gate
     state.counters["sampled_cycles"] = static_cast<double>(work);
     if (!rune::bench::gateCheck(state, allocs == 0, "allocation on the control duty cycle")) return;
     // An OnInterval run that did not sample every call measures the wrong thing.
-    if (mode == Mode::OnInterval &&
+    if ((mode == Mode::OnInterval || mode == Mode::OnInterval4000Fds) &&
         !rune::bench::gateCheck(state, work == static_cast<int64_t>(state.iterations()), "OnInterval did not sample every cycle")) {
         return;
     }
@@ -140,5 +156,10 @@ void BM_ControlDutyCycle_SystemMetricsOnInterval(benchmark::State& state) {
     runCase(state, Mode::OnInterval, 50'000.0, "SystemMetrics on-interval cycle >= 50 us");
 }
 BENCHMARK(BM_ControlDutyCycle_SystemMetricsOnInterval)->Iterations(kSampleIterations);
+
+void BM_ControlDutyCycle_SystemMetricsOnIntervalWith4000Fds(benchmark::State& state) {
+    runCase(state, Mode::OnInterval4000Fds, 2'000'000.0, "SystemMetrics on-interval sample with 4000 fds >= 2 ms");
+}
+BENCHMARK(BM_ControlDutyCycle_SystemMetricsOnIntervalWith4000Fds)->Iterations(kFdWalkIterations);
 
 }  // namespace

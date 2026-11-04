@@ -86,7 +86,7 @@ them in `RUNE_PEERS` (7th and 8th segments, only after every node runs this vers
 | `RUNE_STORAGE_RECOVERY_VOTE` | off | `1`/`true`/`TRUE`. Unsafe, disaster recovery only: lets an unconfirmed (replaced-disk) node vote. Logged at critical level. |
 | `RUNE_AERON_DIR` | `<data dir>/aeron` | Aeron directory (CnC file and mapped term buffers). Put it on tmpfs (`/dev/shm`) for performance. |
 | `RUNE_METRICS_FILE` | `<data dir>/metrics/rune-metrics.dat` | The broker's metrics file (arcanum-metrics format), created afresh at every start; the broker refuses to start if it cannot create it. Read it with `rune_role`. Metrics: [operations](operations.md#metrics). |
-| `RUNE_METRICS_SYSTEM_INTERVAL_MS` | `1000` | How often the control agent samples `/proc/self` into the process metrics (positive ms). Max 2592000000 (30 days). |
+| `RUNE_METRICS_SYSTEM_INTERVAL_MS` | `1000` | How often the admin agent samples `/proc/self` into the process metrics (positive ms). Max 2592000000 (30 days). |
 | `RUNE_IO_BACKEND` | `uring` when available, else `portable` | `uring` (Linux io_uring) or `portable`. An unset value falls back to `portable` when io_uring cannot start (old kernel, seccomp, Docker Desktop on Apple Silicon). An explicit `uring` fails loudly. |
 | `RUNE_TRANSIENT_LOG_RING_BYTES` | `8388608` (8 MiB) | Node-wide ring size of every transient partition (power of two). `RUNE_MEMORY_LOG_RING_BYTES` is a deprecated alias that logs one warning; the canonical name wins when both are set. |
 | `RUNE_PRODUCER_ID_EXPIRATION_MS` | `604800000` (7 days) | How long an idle producer id is remembered for idempotence (0 or more). |

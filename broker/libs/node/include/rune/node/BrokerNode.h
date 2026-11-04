@@ -710,8 +710,32 @@ public:
                 if (failureRing_.write(b, sizeof b, kA2cPeerFrameDrops)) reportedPeerDrops_ = drops;
             }
         }
+        // #632: the process metrics sample here, off the control thread.  The sample lseeks and getdents64s the whole
+        // /proc/self/fd directory (about 200 ns per open fd; no /proc file gives the count), a stall the control
+        // thread (elections, ISR, admin replies) must not take.  This is the ONLY thread that calls it.
+#if defined(__linux__)
+        if (systemMetrics_ != nullptr) {
+            const int s = systemMetrics_->doWork(nowNs);
+            if (s != 0) {
+                std::atomic_ref<uint64_t> n(systemSamples_);
+                n.store(n.load(std::memory_order_relaxed) + static_cast<uint64_t>(s), std::memory_order_relaxed);
+                work += s;
+            }
+        }
+#endif
         return work;
     }
+
+#if defined(__linux__)
+    /// Startup thread only, once, before the runner starts (buildAdminWorker).  The pointee is BrokerNode's
+    /// systemMetrics_, initialised on the start thread; after this call only this agent's thread touches it, and
+    /// BrokerNode joins this runner before it resets the pointee.
+    void adoptSystemMetrics(metrics::SystemMetrics* sm) noexcept { systemMetrics_ = sm; }
+    /// Test-only, any thread: samples this agent has taken.
+    [[nodiscard]] uint64_t systemMetricsSamplesForTest() const noexcept {
+        return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(systemSamples_)).load(std::memory_order_relaxed);
+    }
+#endif
 
     /// admin → control ring (T10; F3 r6 extended): kA2cStorageFailure
     /// ([errno:i32][dir]) and kA2cSchemaUpdate ([topicId:i32][version:u16][blob]).
@@ -1086,6 +1110,10 @@ private:
     bool             storageFailureSignalled_ = false;
     int64_t          nextPeerDropReportNs_ = 0;   // Task 16: paced report of the admin plane's dropped peer frames
     uint64_t         reportedPeerDrops_    = 0;
+#if defined(__linux__)
+    metrics::SystemMetrics* systemMetrics_ = nullptr;   // #632: borrowed from BrokerNode; admin thread only after start
+    uint64_t                systemSamples_ = 0;         // written by the admin thread, read via atomic_ref (test seam)
+#endif
     uint64_t         badRequestFrames_ = 0;        // request-ring frames of an unknown type
     // Fix round 2: preallocated, bounded (was an unbounded vector<vector> with
     // O(n) front erase).  4x the ring: one tick's answers fit by construction.
@@ -2166,6 +2194,15 @@ public:
         return adminWorkerAgent_.get();
     }
 
+    /// Test-only (#632): process-metrics samples the admin agent has taken; 0 when there is no agent or no sampler.
+    [[nodiscard]] uint64_t adminSystemMetricsSamplesForTest() const noexcept {
+#if defined(__linux__)
+        return adminWorkerAgent_ ? adminWorkerAgent_->systemMetricsSamplesForTest() : 0;
+#else
+        return 0;
+#endif
+    }
+
     /// Test-only: return the I/O throttle rate wired into the LogCleanerAgent.
     /// -1 = unlimited.  Valid after start().  Used by CP-10 Fix-1 wiring test.
     [[nodiscard]] int64_t cleanerThrottleRateForTest() const noexcept {
@@ -3067,7 +3104,7 @@ private:
     struct ObserverSlots { RuneMetricSlot role, term, outOfSync; };
     ObserverSlots                                         observerSlots_{};     // observer thread only (publishRole)
 #if defined(__linux__)
-    std::optional<metrics::SystemMetrics>                 systemMetrics_;      // control thread (D62)
+    std::optional<metrics::SystemMetrics>                 systemMetrics_;      // sampled by the ADMIN agent (#632, was D62 control)
 #endif
     bool                                                  metricsReady_ = false;   // set by start(), before agents
     std::string                                           metricsPath_;

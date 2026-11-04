@@ -428,6 +428,43 @@ TEST(BrokerMetricsRegression, LaterStartFailureLeavesACompleteFileRegression) {
     }
 }
 
+#if defined(__linux__)
+// #632: the process metrics (fd walk of /proc/self/fd, linear in open fds) are sampled by the ADMIN agent, never the
+// control thread.  The row moves with the process's fds AND the admin agent counts its samples.
+// RED (the sample moved back into the control loop): the row still moves, but the admin agent took 0 samples.
+TEST(BrokerMetricsRegression, SystemMetricsSampleOnTheAdminAgentRegression) {
+    MetricsTempDir tmp{"sysadmin_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    cfg.metricsSystemIntervalMs = 1;
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s));
+    constexpr std::int32_t kOpenFds = 1000301;   // process_open_fds
+    const auto readFds = [&]() -> std::int64_t {
+        const auto v = rune::node::test::readRuneMetricAt(node.metricsFilePath(), kOpenFds, cfg.nodeId);
+        return v.value_or(-1);
+    };
+    const auto await = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (pred()) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return pred();
+    };
+    ASSERT_TRUE(await([&] { return readFds() > 0; })) << "the first sample lands";
+    const std::int64_t baseline = readFds();
+    std::vector<int> fds;
+    for (int i = 0; i < 64; ++i) fds.push_back(::dup(0));
+    const bool moved = await([&] { return readFds() >= baseline + 64; });
+    for (const int fd : fds) if (fd >= 0) ::close(fd);
+    EXPECT_TRUE(moved) << "process_open_fds follows 64 new fds (baseline " << baseline << ")";
+    EXPECT_TRUE(await([&] { return node.adminSystemMetricsSamplesForTest() >= 2; }))
+        << "the admin agent took the samples: " << node.adminSystemMetricsSamplesForTest();
+    node.stop();
+}
+#endif  // __linux__
+
 // stop + start recreates the file: a new startEpochNs, a reader on the old mapping sees sameInstanceAs() == false,
 // and the values restart from the node's recovered state.
 TEST(BrokerMetricsRegression, RestartRecreatesFileRegression) {
