@@ -4539,6 +4539,9 @@ TEST(GroupRoutingRegression, AFanOutRoundAnsweredByTheSeedAloneIsNotReAskedAdver
                                  [](const rc::Record&) {});
     ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.active(); }));
     r.opt.stepNs = 0;   // settle with the duty clock frozen
+    // The reader only brought node 1's session up.  Left bound, the silent-leader watch (#514) would arm its own
+    // refresh whenever node 1's Pong lags the free-running duty clock in real time - a re-ask for another cause.
+    s0.unsubscribe();
     for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
     r.gw.holdMetadata = true;
     const std::size_t asked = r.gw.metadataCorrIds.size();
@@ -4550,7 +4553,9 @@ TEST(GroupRoutingRegression, AFanOutRoundAnsweredByTheSeedAloneIsNotReAskedAdver
         if (r.gw.metadataEndpoints[i] == 0) seedCorr = r.gw.metadataCorrIds[i];
     ASSERT_NE(seedCorr, 0) << "precondition: one request went to the seed";
     r.gw.sendMetadata(r.seedSid, seedCorr, 0);   // the seed answers; node 1's request stays unanswered
-    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    // The answer travels over real UDP: pump until the client has APPLIED it (a fixed pass count raced a loaded
+    // host, and the duty clock then ran past the answer timer before the answer arrived: a re-ask for another cause).
+    for (int i = 0; i < 200'000 && r.client.testMetadataAnswerPending(); ++i) { r.client.doWork(); r.gw.pump(); }
     r.gw.holdMetadata = false;
     r.opt.stepNs = 10'000'000;
     const int64_t t0 = g_routingClockNs;
