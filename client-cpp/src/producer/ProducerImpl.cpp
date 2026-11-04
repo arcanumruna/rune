@@ -2637,7 +2637,8 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
         const int64_t off = baseOffset < 0 ? -1 : baseOffset;
         // A key-0 batch's ids are base + i * stride: without a trustworthy base (a known-old duplicate, a retry whose ack
         // lost it) the records are stored but their ids are unknown.
-        const bool idsUnknown = b->idStride != 0 && (dupSeq || off < 0 || assignedBase == 0) && !(hasVerdicts && !verdicts.empty());
+        const bool hasTrailer = hasVerdicts && !verdicts.empty();
+        const bool idsUnknown = b->idStride != 0 && (dupSeq || (!hasTrailer && (off < 0 || assignedBase == 0)));
         if (hasVerdicts && !verdicts.empty()) {
             const int16_t firstCode = static_cast<int16_t>(verdicts[2] | (verdicts[3] << 8));
             if (b->recordCount > 1)   // stored and judged: the real base, the first code, and every rejection
@@ -2654,7 +2655,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
             emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, 0,
                           OpStatus::Ok, units, b->producerEpoch, b->producerId);
         if (hasVerdicts && !verdicts.empty())
-            completeVerdictSlice_(ps, b->ackStart, b->ackCount, off, b->tier2, b->recordCount, verdicts, assignedBase, b->idStride);
+            completeVerdictSlice_(ps, b->ackStart, b->ackCount, off, b->tier2, b->recordCount, verdicts, dupSeq ? 0 : assignedBase, b->idStride);
         else if (idsUnknown)   // stored, but the ids are not known: never Ok without them
             completeSlice_(ps, b->ackStart, b->ackCount, off, OpStatus::StoredIdUnknown, static_cast<uint16_t>(errorCode), b->tier2, b->recordCount);
         else if (dupSeq && viewSent_())   // stored, but this retry's verdicts are gone: never per-record errors
@@ -3142,6 +3143,7 @@ void ProducerImpl::completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t
                                   int64_t baseOffset, OpStatus st, uint16_t errorCode, bool tier2,
                                   int32_t recordCount, uint64_t assignedBase, uint32_t idStride) noexcept {
     const bool ok = st == OpStatus::Ok || st == OpStatus::StoredIdUnknown;
+    const bool withIds = st == OpStatus::Ok && idStride != 0 && !tier2;
     for (int32_t i = 0; i < ackCount; ++i) {
         uint64_t h = 0;
         const int32_t span = takeHandleSpan_(ps, ackStart, i, ackCount, h);   // a claim's handle and its continuation run
@@ -3152,7 +3154,7 @@ void ProducerImpl::completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t
         const int64_t value = (ok && baseOffset >= 0) ? baseOffset + (tier2 ? 0 : first) : -1;
         FLIGHT_RECORDER_MARK_VAL_PRODUCE(flight_recorder::Site::ClientAckComplete, static_cast<uint32_t>(h),
                                  static_cast<double>(value));
-        const int64_t aux = tier2 ? recordCount : (st == OpStatus::Ok && idStride != 0 ? static_cast<int64_t>(assignedBase + static_cast<uint64_t>(first) * idStride) : 0);
+        const int64_t aux = tier2 ? recordCount : (withIds ? static_cast<int64_t>(assignedBase + static_cast<uint64_t>(first) * idStride) : 0);
         completeHandle_(h, tier2 ? OpKind::Tier2Batch : OpKind::Send, value, aux,
                         st, errorCode, 0, {}, span > 1 ? batchCompletionBytes(static_cast<uint32_t>(span)) : 0u);
     }

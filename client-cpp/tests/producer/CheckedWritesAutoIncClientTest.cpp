@@ -539,6 +539,35 @@ INSTANTIATE_TEST_SUITE_P(CheckedWritesAutoIncClient, CheckedWritesAutoIncClientU
         UnknownCase{"NoAssignedBase", Acks::All, 0, 100, 0}),
     [](const ::testing::TestParamInfo<UnknownCase>& i) { return std::string(i.param.name); });
 
+TEST(CheckedWritesAutoIncClientRegression, AcceptedRecordsWithoutABaseAreStoredIdUnknownRegression) {
+    AckRig r(Acks::All | Acks::View);
+    r.send(3, 4);
+    uint8_t v[8] = {1, 0, kViolation, 0, 0x01, 0x00, 0x07, 0x00};
+    r.answer(0, 100, 0, v);
+    for (rc::Token t = 1; t <= 3; ++t) {
+        ASSERT_EQ(r.times[t], 1) << t;
+        EXPECT_EQ(rc::assignedKeyOf(r.done[t]), 0u);
+        if (t == 2) {
+            EXPECT_EQ(r.done[t].status, OpStatus::BrokerError);
+            EXPECT_EQ(r.done[t].errorCode, kViolation);
+        } else {
+            EXPECT_EQ(r.done[t].status, OpStatus::StoredIdUnknown) << t;
+        }
+    }
+}
+
+TEST(CheckedWritesAutoIncClientRegression, DuplicateSequenceWithATrailerNeverCompletesOkRegression) {
+    AckRig r(Acks::All | Acks::View);
+    r.send(3, 4);
+    uint8_t v[8] = {1, 0, kViolation, 0, 0x01, 0x00, 0x07, 0x00};
+    r.answer(int16_t(rpc::ErrorCode::DuplicateSequence), -1, 9, v);
+    for (rc::Token t = 1; t <= 3; ++t) {
+        ASSERT_EQ(r.times[t], 1) << t;
+        EXPECT_EQ(rc::assignedKeyOf(r.done[t]), 0u);
+        EXPECT_EQ(r.done[t].status, t == 2 ? OpStatus::BrokerError : OpStatus::StoredIdUnknown) << t;
+    }
+}
+
 TEST(CheckedWritesAutoIncClientRegression, NonKeyZeroBatchesKeepTheirMappingRegression) {
     {   // an update batch answered DuplicateSequence stays VerdictUnknown
         AckRig r(Acks::All | Acks::View);
@@ -611,5 +640,10 @@ TEST(CheckedWritesAutoIncClient, TestKnobsAreOffByDefault) {
         ASSERT_TRUE(r.drive([&] { return f.ready(); }));
         EXPECT_TRUE(f.ok()) << f.describe();
         EXPECT_GE(r.gw.produced.size(), 2u);
+        for (int i = 0; i < 2000; ++i) {   // a stray second completion would show up here
+            r.client->doWork();
+            r.gw.pump();
+        }
+        EXPECT_EQ(cq.timesCompleted(f.token()), 1);
     }
 }
