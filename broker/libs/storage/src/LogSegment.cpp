@@ -892,7 +892,8 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
     const std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
     std::size_t pos = 0;
     int64_t next = baseOffset_;
-    BatchHeaderCursor hdr(baseOffset_);   // #839: the header fields the CRC does not cover
+    // #839: the active (last) segment: only the int32 index range bounds it.
+    BatchHeaderCursor hdr(baseOffset_, BatchHeaderCursor::upperFor(baseOffset_));   // the header fields the CRC does not cover
     int64_t maxTs = 0;
     bool atCut = false;
     while (pos + kOverhead <= size) {
@@ -931,7 +932,7 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
     return 0;
 }
 
-int64_t LogSegment::recover(bool syncIndex, RecoverMode mode) {
+int64_t LogSegment::recover(bool syncIndex, RecoverMode mode, std::optional<int64_t> nextSegmentBase) {
     // D20 review L3 — ONE rule for every error: it fails the log (sticky
     // failedErrno, routed to the halt by the owner's loop), and it THROWS only
     // while the segment's state is unknown (fstat / pread: no valid prefix
@@ -979,7 +980,7 @@ int64_t LogSegment::recover(bool syncIndex, RecoverMode mode) {
     index_ = std::make_unique<OffsetIndex>(indexTmp, baseOffset_, indexMaxBytes_, false, fileMode_);
 
     size_t pos = 0; int64_t validBytes = 0; int64_t next = baseOffset_;
-    BatchHeaderCursor hdr(baseOffset_);
+    BatchHeaderCursor hdr(baseOffset_, BatchHeaderCursor::upperFor(baseOffset_, nextSegmentBase));
     // C2: seed bytesSinceIndex_ identically to append() so the index is reproducible.
     bytesSinceIndex_ = 0;
     using rune::protocol::RecordBatchReader;

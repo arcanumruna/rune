@@ -1443,7 +1443,7 @@ void Log::validateFromRecoveryPoint_(int64_t rp, bool deleteOnGap) {
         if (nx == segments_.end() || nx->first > rp) break;
         // #839: a sealed segment wholly below the recovery point was fsynced before R moved past it (E1d), so bytes after
         // its last whole batch are real damage, not a torn tail: keep them, flag the segment, fail reads at it.
-        it->second->recover(true, LogSegment::RecoverMode::KeepDamage);
+        it->second->recover(true, LogSegment::RecoverMode::KeepDamage, nx->first);   // nx != end() (loop guard)
         if (it->second->damaged()) noteDamagedSegment_(*it->second);
         it->second->setDurableNext(it->second->nextOffset());
     }
@@ -1453,8 +1453,9 @@ void Log::validateFromRecoveryPoint_(int64_t rp, bool deleteOnGap) {
     // that never completed must not leave the log claiming offsets it lacks.
     bool deleted = false;
     for (; it != segments_.end(); ++it) {
-        const int64_t next = it->second->recover();
         auto nx = std::next(it);
+        const int64_t next = it->second->recover(true, LogSegment::RecoverMode::CutTornTail,
+                                                 nx == segments_.end() ? std::nullopt : std::optional<int64_t>(nx->first));
         if (nx == segments_.end()) break;
         if (next == nx->first || !deleteOnGap) continue;
         spdlog::warn("Log::recover {}: segment {} ends at {} but the next segment starts at {} "
@@ -2116,7 +2117,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
     int64_t keptMaxTs = 0;
     bool found = false;
     std::size_t pos = 0;
-    BatchHeaderCursor hdr(seg.baseOffset());   // #839: the header fields the CRC does not cover
+    BatchHeaderCursor hdr(seg.baseOffset(), BatchHeaderCursor::upperFor(seg.baseOffset()));   // #839: the header fields the CRC does not cover; the active segment has no successor
     while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
         rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
         int32_t total = r.totalLength();
@@ -2293,10 +2294,14 @@ bool Log::reloadSegments() {
     // recover() also leaves segments_ (the old generation) untouched.
     int64_t next = 0;
     const int64_t highestBase = newSegments.rbegin()->first;   // #839: the NEW generation's active segment
-    for (auto& [base, seg] : newSegments) {
+    for (auto itNew = newSegments.begin(); itNew != newSegments.end(); ++itNew) {
+        auto& base = itNew->first;
+        auto& seg = itNew->second;
+        const auto succ = std::next(itNew);
+        const std::optional<int64_t> succBase = succ == newSegments.end() ? std::nullopt : std::optional<int64_t>(succ->first);
         // #839: every sealed segment keeps its damage (flagged, never cut); the active one is cut as before.
         next = seg->recover(true, base == highestBase ? LogSegment::RecoverMode::CutTornTail
-                                                      : LogSegment::RecoverMode::KeepDamage);
+                                                      : LogSegment::RecoverMode::KeepDamage, succBase);
         // E1d: a rewritten (cleaner: fsynced before rename) or untouched segment
         // is as durable as the object it replaces; a brand-new base is not.
         auto old = segments_.find(base);
@@ -2397,7 +2402,9 @@ void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
                                                  false, false, 0, fileMode_));
     LogSegment& fresh = *segments_[baseOffset];
     fresh.raiseTsFloor(floorTs);
-    fresh.recover(true, LogSegment::RecoverMode::KeepDamage);   // #839: a sealed segment (the active one returned above)
+    const auto freshIt = segments_.find(baseOffset);
+    fresh.recover(true, LogSegment::RecoverMode::KeepDamage,
+                  std::next(freshIt) == segments_.end() ? std::nullopt : std::optional<int64_t>(std::next(freshIt)->first));   // #839: a sealed segment (the active one returned above)
     if (fresh.damaged()) noteDamagedSegment_(fresh);
     // E1d: the cleaner fsyncs a rewritten segment before its rename.
     fresh.setDurableNext(wasDurable ? fresh.nextOffset() : std::min(oldDurable, fresh.nextOffset()));

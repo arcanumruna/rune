@@ -305,14 +305,16 @@ TEST(CheckedWritesVerdictCleanerRegression, RebuildKeepsRecordAttributesRegressi
         {
             Log log(dir.string(), /*segmentBytes=*/1);
             log.recover();
+            // (#839: the lastOffset passed to append is the batch's real last offset - a lower one rolled the next segment at 1,
+            // INSIDE this batch, which the header bound rightly calls damage.)
             rune::protocol::RecordBatchBuilder a(0, 2000);   // offset 0 is superseded: the batch is rebuilt without it
             a.append("k1", "old", 2000, 0);
             a.append("k2", "kept", 2001, 2);
-            log.append(a.build(), 0);
+            log.append(a.build(), 1);
             rune::protocol::RecordBatchBuilder b(2, 2002);
             b.append("k1", "new", 2002, 1);
             b.append("k3", "also", 2003, 3);
-            log.append(b.build(), 2);
+            log.append(b.build(), 3);
             data(log, 4, "tail", "t");
             clean(log, path, /*verdictBound=*/kMax, /*markerEnd=*/kMax);
             const auto attrs = recordAttributes(log);
@@ -1318,4 +1320,43 @@ TEST(CheckedWritesVerdictCleanerRegression, UnCrcCoveredHeaderFlipMakesTheLogUnc
         }
         std::filesystem::remove_all(dir);
     }
+}
+
+// Coverage of the cleaner's scanEnd cut: no batch-2 mutation reddens this test.  With the BatchHeaderCursor upper bound
+// the rotted batch now also ends the cleaner's valid prefix (it is refused like a CRC failure), so the offset map never
+// sees the inflated offset.
+// ADVERSARIAL (batch-2 union review, #839 F5 gap): a baseOffset that rots UPWARD (+2^40, byte 5) still verifies and passes
+// BatchHeaderCursor (it only refuses a base that went down).  Mid-segment, the NEXT batch then looks like damage; but on the
+// LAST batch of a sealed segment nothing follows it, so the cleaner's offset map sees that key at offset 2^40+o - "newer"
+// than every real record of the key - and the pass deletes the genuinely newest one.  Every old duplicate 0..36 is rotted
+// in turn (fresh log each); the newest k0 / k1 / k2 (39 / 37 / 38) must always survive.
+TEST(CheckedWritesVerdictCleanerRegression, UpwardBaseOffsetRotNeverDropsTheNewestRecordAdversarialRegression) {
+    int lastInSegmentCases = 0;
+    for (int64_t victimOff = 0; victimOff <= 36; ++victimOff) {
+        SCOPED_TRACE("rotted offset " + std::to_string(victimOff));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/900);
+            log.recover();
+            for (int64_t o = 0; o < 40; ++o) data(log, o, "k" + std::to_string(o % 3), "v" + std::to_string(o));
+            for (int64_t o = 40; o < 80; ++o) data(log, o, "u" + std::to_string(o), "pad");   // the newest k* are sealed
+            log.sync();
+            const auto bases = log.segmentBaseOffsets();
+            ASSERT_GE(bases.size(), 3u);
+            const auto victim = findBatch(log.dir(), victimOff);
+            ASSERT_TRUE(victim.has_value());
+            if (victim->pos + victim->total == std::filesystem::file_size(victim->file)) ++lastInSegmentCases;
+            const auto newest = findBatch(log.dir(), 39);
+            ASSERT_TRUE(newest.has_value());
+            ASSERT_LT(std::stoll(newest->file.stem().string()), bases.back()) << "premise: k0@39 is in a sealed segment";
+            xorByteAt(victim->file, victim->pos + 5, 0x01);
+            cleanFilesOnly(log.dir(), bases, Path::Range, kMax, kMax);
+            const std::set<int64_t> after = diskDataOffsets(log.dir());
+            const int64_t newestOfKey = victimOff % 3 == 0 ? 39 : victimOff % 3 == 1 ? 37 : 38;
+            EXPECT_TRUE(after.count(newestOfKey)) << "the newest record of k" << victimOff % 3 << " (offset " << newestOfKey
+                                                  << ") was deleted: a rotted batch claimed a higher offset";
+        }
+        std::filesystem::remove_all(dir);
+    }
+    EXPECT_GT(lastInSegmentCases, 0) << "premise: some victim is the last batch of its segment";
 }
