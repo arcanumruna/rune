@@ -477,11 +477,14 @@ public:
         return id;
     }
 
+    /// Every collect() drive loop's hard cap: fails rather than hangs.
+    static constexpr int kCollectMaxPasses = 100'000;
     /// Drives until the consumer has nothing more to deliver, then returns what it got so far (cumulative).
     const Inbox& collect(int64_t subId) {
         Inbox& box = inboxes_[subId];
         if (kinds_.at(subId) == SubKind::PushRead) {
-            for (;;) {
+            for (int iter = 0;; ++iter) {
+                if (iter == kCollectMaxPasses) { ADD_FAILURE() << "collect(" << subId << "): no quiescence after " << kCollectMaxPasses << " PushReads"; break; }
                 WorkerOp op;
                 op.type = WorkerOp::Type::PushRead;
                 op.subscriptionId = subId; op.sessionId = 4200 + subId; op.topicId = kSrc; op.partition = 0;
@@ -505,7 +508,8 @@ public:
         }
         // The subscription cursor reached what the HW and the judge allow, the worker is idle, the image has read everything the egress
         // published and nothing new was polled.
-        for (;;) {
+        for (int iter = 0;; ++iter) {
+            if (iter == kCollectMaxPasses) { ADD_FAILURE() << "collect(" << subId << "): no quiescence after " << kCollectMaxPasses << " passes"; break; }
             const int work = pass();
             const std::size_t before = box.frames.size();
             sub_->poll(aeron::FragmentAssembler([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len, aeron::Header&) {
@@ -686,11 +690,12 @@ public:
 
     /// Drives until the view's instance folded through `target` (and serves).
     void driveUntilFolded(int32_t viewTopicId, int64_t target) {
-        for (;;) {
+        for (int iter = 0; iter < kCollectMaxPasses; ++iter) {
             const auto st = vs->instanceServeState(viewTopicId, 0);
             if (st.hosted && st.ready && st.foldCursor >= target) return;
             pass();
         }
+        ADD_FAILURE() << "driveUntilFolded(" << viewTopicId << ", " << target << "): not folded after " << kCollectMaxPasses << " passes";
     }
 
     // ---- compaction ----
