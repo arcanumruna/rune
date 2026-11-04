@@ -1013,3 +1013,98 @@ TEST(CompletionsAdversarialRegression, DeferredCreditPollAndWaitForAllocateNothi
     EXPECT_EQ(cq.outstanding(), 0u);
     EXPECT_EQ(cq.reservedBytes(), 0u);
 }
+
+// ---------------------------------------------------------------------------
+// PR #851 review re-attack (7bd588a9): the re-entrancy guard covers every handler entry point, not only poll()'s ring
+// read.  A waitFor() onDone run from the ring and one run from the stash, and a poll() handler run from the stash, each
+// refuse a nested poll()/waitFor() with std::logic_error; every completion is still delivered exactly once.
+// ---------------------------------------------------------------------------
+TEST(CompletionsAdversarialRegression, NestedCallsInsideWaitForAndStashHandlersAreRefusedAdversarialRegression) {
+    Completions cq(smallCfg(1024, 88, 64));
+    std::vector<int> times(16, 0);
+    for (Token t = 0; t < 6; ++t) { ASSERT_EQ(cq.reserve(48), OpResult::Accepted); ASSERT_TRUE(deliver(cq, t, 48, 0)); }
+    auto count = [&](const Completion& d, std::span<const uint8_t>) { ++times[d.token]; };
+    int refused = 0;
+    auto nestBoth = [&]() {
+        EXPECT_THROW((void)cq.poll(count), std::logic_error);
+        EXPECT_THROW((void)cq.waitFor(0, 0ns, count), std::logic_error);
+        ++refused;
+    };
+    // 1. waitFor's onDone delivered from the ring (tokens 0..4 are stashed on the way to 5).
+    ASSERT_EQ(cq.waitFor(5, 0ns, [&](const Completion& c, std::span<const uint8_t> p) { count(c, p); nestBoth(); }),
+              Completions::Wait::Done);
+    EXPECT_EQ(cq.stashed(), 5u);
+    // 2. waitFor's onDone delivered from the stash.
+    ASSERT_EQ(cq.waitFor(4, 0ns, [&](const Completion& c, std::span<const uint8_t> p) { count(c, p); nestBoth(); }),
+              Completions::Wait::Done);
+    // 3. poll()'s handler delivered from the stash (0..3).
+    int polled = cq.poll([&](const Completion& c, std::span<const uint8_t> p) { count(c, p); nestBoth(); });
+    EXPECT_EQ(polled, 4);
+    EXPECT_EQ(refused, 6);
+    for (Token t = 0; t < 6; ++t) EXPECT_EQ(times[t], 1) << "token " << t;
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    EXPECT_EQ(cq.stashed(), 0u);
+    EXPECT_TRUE(cq.ring().empty());
+}
+
+// A nested call the handler does not catch unwinds out of the outer poll()/waitFor().  The guard must be released on that
+// unwind (else every later poll() throws and the queue is dead), the record whose handler threw counts as delivered, and
+// the rest are delivered exactly once by the next poll.
+TEST(CompletionsAdversarialRegression, AnEscapingNestedCallLeavesTheQueueUsableAdversarialRegression) {
+    Completions cq(smallCfg(1024, 88, 64));
+    std::vector<int> times(16, 0);
+    for (Token t = 0; t < 6; ++t) { ASSERT_EQ(cq.reserve(48), OpResult::Accepted); ASSERT_TRUE(deliver(cq, t, 48, 0)); }
+    auto count = [&](const Completion& d, std::span<const uint8_t>) { ++times[d.token]; };
+    // Ring path of poll(): the handler of token 0 nests and lets the logic_error escape.
+    EXPECT_THROW((void)cq.poll([&](const Completion& c, std::span<const uint8_t> p) {
+                     count(c, p);
+                     if (c.token == 0) (void)cq.poll(count);
+                 }),
+                 std::logic_error);
+    // waitFor() ring path: onDone of token 3 nests and escapes; 1 and 2 are stashed on the way.
+    EXPECT_THROW((void)cq.waitFor(3, 0ns, [&](const Completion& c, std::span<const uint8_t> p) {
+                     count(c, p);
+                     (void)cq.waitFor(4, 0ns, count);
+                 }),
+                 std::logic_error);
+    // Stash path of poll(): the handler of token 1 nests and escapes.
+    EXPECT_THROW((void)cq.poll([&](const Completion& c, std::span<const uint8_t> p) {
+                     count(c, p);
+                     if (c.token == 1) (void)cq.poll(count);
+                 }),
+                 std::logic_error);
+    // The queue is not left "inside a read": a plain poll drains the rest.
+    for (int i = 0; i < 8 && cq.poll(count) > 0; ++i) {}
+    for (Token t = 0; t < 6; ++t) EXPECT_EQ(times[t], 1) << "token " << t;
+    EXPECT_EQ(cq.outstanding(), 0u);
+    EXPECT_EQ(cq.reservedBytes(), 0u);
+    EXPECT_EQ(cq.stashed(), 0u);
+    ASSERT_EQ(cq.reserve(48), OpResult::Accepted);
+    ASSERT_TRUE(deliver(cq, 9, 48, 0));
+    EXPECT_EQ(cq.waitFor(9, 0ns, count), Completions::Wait::Done) << "the guard stuck after an unwind";
+    EXPECT_EQ(times[9], 1);
+}
+
+// The guard is per queue: a handler of one queue may poll() and waitFor() ANOTHER queue (an app routing completions
+// between its own queues); that is never refused.
+TEST(CompletionsAdversarialRegression, AHandlerMayPollAnotherQueueAdversarialRegression) {
+    Completions a(smallCfg(1024, 88, 64));
+    Completions b(smallCfg(1024, 88, 64));
+    for (Token t = 0; t < 3; ++t) {
+        ASSERT_EQ(a.reserve(48), OpResult::Accepted); ASSERT_TRUE(deliver(a, t, 48, 0));
+        ASSERT_EQ(b.reserve(48), OpResult::Accepted); ASSERT_TRUE(deliver(b, t, 48, 0));
+    }
+    int fromB = 0;
+    auto countB = [&](const Completion&, std::span<const uint8_t>) { ++fromB; };
+    int fromA = 0;
+    EXPECT_NO_THROW((void)a.poll([&](const Completion& c, std::span<const uint8_t>) {
+        ++fromA;
+        if (c.token == 0) { EXPECT_EQ(b.waitFor(2, 0ns, countB), Completions::Wait::Done); }
+        else if (c.token == 1) { EXPECT_EQ(b.poll(countB), 2); }
+    }));
+    EXPECT_EQ(fromA, 3);
+    EXPECT_EQ(fromB, 3);
+    EXPECT_EQ(a.outstanding(), 0u);
+    EXPECT_EQ(b.outstanding(), 0u);
+}

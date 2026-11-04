@@ -1207,3 +1207,75 @@ TEST(CheckedWritesVerdictCleanerRegression, DamageAtEveryPlaceKeepsEveryUnsupers
         std::filesystem::remove_all(dir);
     }
 }
+
+// PR #851 review re-attack (edf94a73, #840): a middle sealed segment cut at EVERY byte length from one past its first
+// batch to its full size.  A cut inside a batch is damage: the range pass (the agent's engine, deferred-install mode) is
+// refused whole (uncleanable, passEnd == globalDirtyStart, no group, no output file).  A cut exactly at a batch boundary is
+// a shorter, intact segment and must NOT mark the log uncleanable (a false positive would stop compaction of a healthy
+// log until restart): the pass compacts.
+TEST(CheckedWritesVerdictCleanerRegression, ASegmentCutAtEveryLengthRefusesOnlyTornBatchesAdversarialRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), /*segmentBytes=*/900);
+        log.recover();
+        for (int64_t o = 0; o < 80; ++o) data(log, o, "k" + std::to_string(o % 5), "v" + std::to_string(o));
+        auto bases = log.segmentBaseOffsets();
+        ASSERT_GE(bases.size(), 5u);
+        const int64_t active = bases.back();
+        bases.pop_back();
+        const int64_t victimBase = bases[bases.size() / 2];
+        const auto first = findBatch(log.dir(), victimBase);
+        ASSERT_TRUE(first.has_value());
+        const std::filesystem::path file = first->file;
+        std::vector<char> whole;
+        {
+            std::ifstream in(file, std::ios::binary);
+            whole.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        // Batch boundaries of the victim segment.
+        std::set<std::size_t> boundaries;
+        for (std::size_t pos = 0; pos + rune::protocol::batch::kRecordBatchOverhead <= whole.size();) {
+            boundaries.insert(pos);
+            rune::protocol::RecordBatchReader r(reinterpret_cast<const uint8_t*>(whole.data()) + pos, whole.size() - pos);
+            pos += static_cast<std::size_t>(r.totalLength());
+        }
+        boundaries.insert(whole.size());
+        ASSERT_GE(boundaries.size(), 3u) << "the victim segment needs several batches";
+        int torn = 0, intact = 0;
+        for (std::size_t cut = first->total + 1; cut <= whole.size(); ++cut) {
+            SCOPED_TRACE("cut " + std::to_string(cut) + " of " + std::to_string(whole.size()));
+            {
+                std::ofstream out(file, std::ios::binary | std::ios::trunc);
+                out.write(whole.data(), static_cast<std::streamsize>(cut));
+            }
+            LogCleaner cleaner;
+            uint64_t seq = 1;
+            cleaner.setDeferredInstall(&seq);
+            std::vector<int64_t> sizes(bases.size(), 1);
+            SkimpyOffsetMap map(1024);
+            auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1000, map, false, 1 << 20,
+                                                          nullptr, 1'000'000);
+            const bool atBoundary = boundaries.count(cut) != 0;
+            if (atBoundary) {
+                ++intact;
+                EXPECT_FALSE(cleaner.uncleanable()) << "a segment ending at a batch boundary was taken for damage";
+                EXPECT_GT(res.passEnd, 0) << "the intact pass did not advance";
+            } else {
+                ++torn;
+                EXPECT_TRUE(cleaner.uncleanable()) << "a torn batch was not noticed";
+                ASSERT_TRUE(cleaner.damage().has_value());
+                EXPECT_EQ(cleaner.damage()->segBase, victimBase);
+                EXPECT_EQ(res.passEnd, 0) << "a refused pass reported progress";
+                EXPECT_TRUE(res.groups.empty()) << "a refused pass produced output";
+            }
+            for (const auto& g : res.groups)
+                if (g.hasOutput) std::filesystem::remove(Log::cleanedLogPath(log.dir(), g.bases.front(), g.seq));
+            if (::testing::Test::HasFailure()) break;
+        }
+        EXPECT_GT(torn, 50);
+        EXPECT_GE(intact, 2);
+        std::ofstream restore(file, std::ios::binary | std::ios::trunc);
+        restore.write(whole.data(), static_cast<std::streamsize>(whole.size()));
+    }
+    std::filesystem::remove_all(dir);
+}
