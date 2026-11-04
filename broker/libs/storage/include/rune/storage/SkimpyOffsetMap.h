@@ -34,6 +34,7 @@
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -148,7 +149,6 @@ public:
         // Backing capacity: at least ceil(maxSlots / 0.9), rounded to next power of 2.
         // This ensures load ≤ 90% at capacity.
         constexpr double kInvLoadFactor = 1.0 / 0.9;
-        constexpr std::size_t kMaxAllocSlots = (1u << 28); // 4 GiB
         std::size_t needed = static_cast<std::size_t>(
             static_cast<double>(maxSlots_) * kInvLoadFactor + 0.5) + 1;
         if (needed > kMaxAllocSlots) needed = kMaxAllocSlots;
@@ -158,15 +158,32 @@ public:
         // Clamp maxSlots_ to what fits in this capped capacity.
         std::size_t effectiveMax = static_cast<std::size_t>(cap * 0.9);
         if (maxSlots_ > effectiveMax) maxSlots_ = effectiveMax;
+        allocate_(cap);
+    }
 
-        capacity_ = cap;
-        mask_     = cap - 1;
-        table_.reset(new Entry[cap]);   // trivial Entry: no per-slot construction; resetTable_ writes each once
-        resetTable_();
-        // I1: the producer tails share the dedupe budget — at most a quarter
-        // of it (kEntryBytes per key slot vs ProducerTails::kBytesPerProducer).
-        tails_.setCapacity(std::max<std::size_t>(
-            1024, cap * kEntryBytes / 4 / ProducerTails::kBytesPerProducer));
+    /// The table size derived from a BYTE budget (#658): the largest power-of-two entry count whose table fits the
+    /// budget, and the key limit at 90% load of it.  Building from the slot count (maxSlotsFromBudget) instead rounded
+    /// UP past the budget: a 128 MiB budget allocated 256 MiB.
+    struct Sizing {
+        std::size_t capacity;   ///< backing entries, a power of two; capacity * kEntryBytes <= the budget
+        std::size_t maxSlots;   ///< keys before put() returns false: floor(capacity * 0.9), at least 1
+    };
+    static constexpr std::size_t kMaxAllocSlots = std::size_t{1} << 28;   // 4 GiB of entries
+    static constexpr Sizing sizingForBudget(int64_t budgetBytes) noexcept {
+        const std::size_t bytes = budgetBytes < static_cast<int64_t>(kEntryBytes) ? kEntryBytes
+                                                                                  : static_cast<std::size_t>(budgetBytes);
+        std::size_t cap = bytes / kEntryBytes;
+        cap = std::size_t{1} << (std::bit_width(cap) - 1);   // bit_floor
+        if (cap > kMaxAllocSlots) cap = kMaxAllocSlots;
+        std::size_t slots = static_cast<std::size_t>(static_cast<double>(cap) * kDefaultLoadFactor);
+        if (slots < 1) slots = 1;
+        return {cap, slots};
+    }
+    /// Construct from a byte budget's sizing: the capacity is used as given (no second rounding).
+    explicit SkimpyOffsetMap(Sizing sizing)
+        : maxSlots_(sizing.maxSlots)
+    {
+        allocate_(sizing.capacity);
     }
 
     // Disable copy (large allocation, should never be copied).
@@ -260,6 +277,9 @@ public:
     static constexpr std::size_t kEntryBytes        = sizeof(uint64_t) + sizeof(int64_t); // 16
     static constexpr double      kDefaultLoadFactor = 0.9;
 
+    /// Slot count for a byte budget (kept for tests that pass a slot count to the slots constructor).
+    /// NOT a table size: feeding it to the slots constructor rounds the table UP past the budget (#658).  Build
+    /// from sizingForBudget instead.
     static std::size_t maxSlotsFromBudget(int64_t budgetBytes) noexcept {
         if (budgetBytes <= 0) return 1;
         auto raw = static_cast<std::size_t>(budgetBytes) / kEntryBytes;
@@ -285,6 +305,16 @@ private:
     std::size_t          mask_         = 0;
     std::size_t          size_         = 0;
     Offset               latestOffset_ = -1;
+    void allocate_(std::size_t cap) {
+        capacity_ = cap;
+        mask_     = cap - 1;
+        table_.reset(new Entry[cap]);   // trivial Entry: no per-slot construction; resetTable_ writes each once
+        resetTable_();
+        // I1: the producer tails share the dedupe budget — at most a quarter
+        // of it (kEntryBytes per key slot vs ProducerTails::kBytesPerProducer).
+        tails_.setCapacity(std::max<std::size_t>(
+            1024, cap * kEntryBytes / 4 / ProducerTails::kBytesPerProducer));
+    }
     /// Every slot {kEmpty, -1}.  A raw loop over the array, not std::vector::assign: an unoptimized (Debug /
     /// sanitizer) build constructed and destroyed a multi-million-slot vector element by element through the
     /// allocator — seconds per broker start for the cleaner's default dedupe budget.

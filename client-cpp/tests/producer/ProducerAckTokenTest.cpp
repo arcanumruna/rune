@@ -289,7 +289,7 @@ TEST(ProducerAckToken, DeliveryTimeoutCompletesDeliveryFailedOnceRegression) {
     ASSERT_EQ(bb.send(AckToken{3}), OpResult::Accepted);
     for (int i = 0; i < 10 && impl->drainRing(kNow) > 0; ++i) {}
     (void)impl->flushBatches(kNow, /*sessionId=*/0, sink);  // no session: 2 and 3 never sent
-    impl->sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{kNow + 10'000'000'000LL}});
+    impl->sweepTimedOut(kNow + 10'000'000'000LL);
     for (rc::Token t = 1; t <= 3; ++t) {
         ASSERT_EQ(L.times(t), 1) << t;
         EXPECT_EQ(L.status(t), OpStatus::DeliveryFailed) << t;

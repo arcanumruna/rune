@@ -1,10 +1,12 @@
 // PeerLinkFanoutTest.cpp — authentication plan Task 15 (D33): the control thread hands an established link's keys to
-// every worker (lifecycle ring) and the admin thread (control -> admin ring); resumable, newest epoch wins.
+// every worker (lifecycle ring) and the admin thread (control -> admin ring); resumable, every epoch in order (#540).
 #include <rune/node/PeerLinkFanout.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/replication/WorkerReplicationTransport.h>
 
 #include <gtest/gtest.h>
+
+#include <type_traits>
 
 using namespace rune::node;
 
@@ -96,21 +98,107 @@ TEST(PeerLinkFanoutRegression, AFullWorkerRingIsRetriedAndOnlyTheMissingDestinat
     EXPECT_EQ(f.deliveredForTest(), 3u);
 }
 
-TEST(PeerLinkFanoutRegression, ANewerEpochSupersedesAnUndeliveredOlderOne) {
-    auto p = pool(1, /*ringBytes=*/4096);
-    OneToOneByteRing admin(1 << 12);
-    WorkerOp filler; filler.type = WorkerOp::Type::SessionClose; filler.sessionId = 1;
-    while (p->worker(0).tryEnqueueOp(filler)) {}
+// Issue #540: two re-handshakes complete while a worker's ring is full.  The worker must still install EVERY epoch, in
+// order (E2 then E3): the peer's plane may already seal under E2.  Mutation: the old "newest supersedes" post -> the
+// worker never holds E2 -> red.
+TEST(PeerLinkFanoutRegression, EveryEpochReachesAWorkerInOrderAcrossBackPressureRegression) {
+    for (int32_t workers : {1, 2}) {
+        auto p = pool(workers, /*ringBytes=*/4096);
+        OneToOneByteRing admin(1 << 12);
+        PeerLinkFanout f;
+        f.post(2, keysAt(1, 1));
+        (void)f.pump(p.get(), &admin);
+        drainAll(*p);
+        (void)adminMsgs(admin);
+        WorkerOp filler; filler.type = WorkerOp::Type::SessionClose; filler.sessionId = 1;
+        while (p->worker(workers - 1).tryEnqueueOp(filler)) {}
+        f.post(2, keysAt(2, 2));
+        (void)f.pump(p.get(), &admin);           // the last worker's ring is full
+        f.post(2, keysAt(3, 3));
+        (void)f.pump(p.get(), &admin);
+        EXPECT_EQ(f.pendingForTest(), 2u) << workers << " workers: both epochs are pending";
+        for (int i = 0; i < 8 && f.pendingForTest() > 0; ++i) {
+            for (int32_t w = 0; w < workers; ++w) p->worker(w).doWork(1);
+            (void)f.pump(p.get(), &admin);
+        }
+        EXPECT_EQ(f.pendingForTest(), 0u);
+        drainAll(*p);
+        for (int32_t w = 0; w < workers; ++w) {
+            EXPECT_TRUE(workerHolds(*p, w, 2, 2)) << "worker " << w << " skipped E2";
+            EXPECT_TRUE(workerHolds(*p, w, 2, 3)) << "worker " << w;
+            EXPECT_EQ(p->worker(w).peerLinkEpochForTest(2), 3u) << "worker " << w << ": E2 then E3, in order";
+            EXPECT_EQ(p->worker(w).peerLinkKeysSeenForTest(), 3u) << "worker " << w << ": E1, E2, E3 once each";
+        }
+        const auto msgs = adminMsgs(admin);
+        ASSERT_EQ(msgs.size(), 2u);
+        EXPECT_EQ(msgs[0].epoch, 2u);
+        EXPECT_EQ(msgs[1].epoch, 3u);
+    }
+}
+
+// Issue #540: a later epoch of a peer never reaches a worker before an earlier epoch of that peer did.  In production
+// worker 1's ring can drain (its own thread) between E1's attempt and E2's attempt inside ONE pump call; the fake pool
+// models that: worker 1 answers Full once (for E1) and accepts afterwards.  E2 must still not reach worker 1 first.
+// Mutation: PeerLinkFanout::pumpWith `upTo = pool->workerCount()` (ignoring workerLimit) -> worker 1 gets {E2} first.
+namespace {
+struct FakeWorker {
+    std::vector<uint32_t> epochs;
+    int fullBudget = 0;
+    EnqueueResult enqueueOp(const WorkerOp& op) {
+        if (fullBudget > 0) { --fullBudget; return EnqueueResult::Full; }
+        epochs.push_back(static_cast<uint32_t>(op.partition));
+        return EnqueueResult::Enqueued;
+    }
+};
+struct FakePool {
+    FakeWorker workers[2];
+    int32_t workerCount() const { return 2; }
+    FakeWorker& worker(int32_t w) { return workers[w]; }
+};
+} // namespace
+
+TEST(PeerLinkFanoutRegression, OrderingLimitHoldsALaterEpochBehindAnEarlierOneRegression) {
+    FakePool pool;
+    pool.workers[1].fullBudget = 1;
     PeerLinkFanout f;
     f.post(2, keysAt(1, 1));
-    (void)f.pump(p.get(), &admin);
-    f.post(2, keysAt(2, 2));                 // the peer restarted before worker 0 took epoch 1
-    EXPECT_EQ(f.pendingForTest(), 1u);
-    p->worker(0).doWork(1);
-    (void)f.pump(p.get(), &admin);
+    f.post(2, keysAt(2, 2));
+    (void)f.pumpWith(&pool, nullptr);
+    EXPECT_EQ(pool.workers[0].epochs, (std::vector<uint32_t>{1, 2}));
+    EXPECT_TRUE(pool.workers[1].epochs.empty()) << "E2 reached worker 1 before E1 did";
+    EXPECT_EQ(f.pendingForTest(), 2u);
+    (void)f.pumpWith(&pool, nullptr);
+    EXPECT_EQ(pool.workers[1].epochs, (std::vector<uint32_t>{1, 2}));
+    EXPECT_EQ(pool.workers[0].epochs, (std::vector<uint32_t>{1, 2})) << "no duplicate to worker 0";
+    EXPECT_EQ(f.pendingForTest(), 0u);
+}
+
+// Issue #540: more than kEpochSlots epochs pending for one peer - a destination would evict the oldest anyway, so the
+// fanout drops (scrubs) the oldest pending entry and delivers the newest kEpochSlots in order.
+TEST(PeerLinkFanoutRegression, MoreThanKEpochSlotsPendingDropsTheOldestRegression) {
+    constexpr uint32_t kSlots = static_cast<uint32_t>(rune::peerlink::PeerFrameCrypto::kEpochSlots);
+    auto p = pool(1, /*ringBytes=*/4096);
+    PeerLinkFanout f;
+    f.post(2, keysAt(1, 1));
+    (void)f.pump(p.get(), nullptr);
     drainAll(*p);
-    EXPECT_EQ(p->worker(0).peerLinkEpochForTest(2), 2u);
-    EXPECT_EQ(p->worker(0).peerLinkKeysSeenForTest(), 1u) << "the stale epoch was never sent to the worker";
+    WorkerOp filler; filler.type = WorkerOp::Type::SessionClose; filler.sessionId = 1;
+    while (p->worker(0).tryEnqueueOp(filler)) {}
+    for (uint32_t e = 2; e <= 2 + kSlots; ++e) {
+        f.post(2, keysAt(e, static_cast<uint8_t>(e)));
+        (void)f.pump(p.get(), nullptr);
+    }
+    EXPECT_EQ(f.pendingForTest(), static_cast<std::size_t>(kSlots)) << "capped at kEpochSlots per peer";
+    f.post(3, keysAt(1, 9));                     // another peer is never capped by peer 2's entries
+    EXPECT_EQ(f.pendingForTest(), static_cast<std::size_t>(kSlots) + 1);
+    for (int i = 0; i < 8 && f.pendingForTest() > 0; ++i) { p->worker(0).doWork(1); (void)f.pump(p.get(), nullptr); }
+    EXPECT_EQ(f.pendingForTest(), 0u);
+    drainAll(*p);
+    EXPECT_FALSE(workerHolds(*p, 0, 2, 2)) << "the oldest pending epoch was dropped";
+    for (uint32_t e = 3; e <= 2 + kSlots; ++e) EXPECT_TRUE(workerHolds(*p, 0, 2, e)) << e;
+    EXPECT_EQ(p->worker(0).peerLinkEpochForTest(2), 2 + kSlots);
+    EXPECT_EQ(p->worker(0).peerLinkEpochForTest(3), 1u);
+    EXPECT_EQ(p->worker(0).peerLinkKeysSeenForTest(), 1u + kSlots + 1u);
 }
 
 TEST(PeerLinkFanoutRegression, NoAdminRingNoWorkersStillDrains) {
@@ -214,4 +302,51 @@ TEST(PeerLinkFanoutRegression, AWorkerRefusesAnUnknownInstallModeRegression) {
     drainAll(*p);
     EXPECT_FALSE(workerHolds(*p, 0, 2, 3)) << "refused, never installed";
     EXPECT_EQ(p->worker(0).peerLinkEpochForTest(2), 0u);
+}
+
+// Issue #546: the ring zeroes every consumed record (O2ORingBuffer::read -> setMemory), so a consumed PeerLinkKeys
+// record leaves no master bytes in the ring; no consumer-side scrub of ring memory is needed.  Non-vacuous: the
+// pattern is in the ring before the consumer reads it.  Mutation: removing the setMemory in O2ORingBuffer::read leaves
+// the masters behind -> red.
+TEST(PeerLinkFanoutRegression, AConsumedKeysRecordLeavesNoMasterBytesInTheRingRegression) {
+    constexpr int kCap = 1 << 12;
+    OneToOneByteRing admin(kCap);
+    PeerLinkFanout f;
+    f.post(2, keysAt(5, 0xC3));          // sendMaster = 32 x 0xC3, recvMaster = 32 x 0xC4
+    (void)f.pump(nullptr, &admin);
+    auto countOf = [&](uint8_t v) {
+        std::size_t run = 0, hits = 0;
+        const uint8_t* b = admin.base();
+        for (int i = 0; i < kCap; ++i) {
+            run = b[i] == v ? run + 1 : 0;
+            if (run == 32) ++hits;
+        }
+        return hits;
+    };
+    EXPECT_EQ(countOf(0xC3), 1u) << "precondition: the send master is in the ring before it is consumed";
+    EXPECT_EQ(countOf(0xC4), 1u) << "precondition: the recv master is in the ring before it is consumed";
+    const auto msgs = adminMsgs(admin);
+    ASSERT_EQ(msgs.size(), 1u);
+    EXPECT_EQ(countOf(0xC3), 0u) << "the consumed record left the send master in the ring";
+    EXPECT_EQ(countOf(0xC4), 0u) << "the consumed record left the recv master in the ring";
+}
+
+// Issue #546 sibling: Worker::enqueueOp took its WorkerOp BY VALUE, leaving a copy of a PeerLinkKeys op's masters in an
+// unscrubbed parameter (the caller can only scrub its own op).  It now takes const& (the encode reads the op and writes
+// the ring slot directly: there is no scratch copy), so the caller's scrub covers every copy.  tryEnqueueOp likewise.
+// Mutation: either signature back to by-value -> does not compile (red at these asserts).
+TEST(PeerLinkFanoutRegression, EnqueueOpNeverCopiesAKeyCarryingOpRegression) {
+    static_assert(std::is_same_v<decltype(&Worker::enqueueOp), EnqueueResult (Worker::*)(const WorkerOp&)>,
+                  "enqueueOp must not copy the op: its peerKeys would outlive the caller's scrub");
+    static_assert(std::is_same_v<decltype(&Worker::tryEnqueueOp), bool (Worker::*)(const WorkerOp&)>,
+                  "tryEnqueueOp must not copy the op");
+    auto p = pool(1);
+    WorkerOp op;
+    op.type = WorkerOp::Type::PeerLinkKeys; op.topicId = 2; op.partition = 3;
+    op.peerKeys.fill(0x5A);
+    ASSERT_EQ(p->worker(0).enqueueOp(op), EnqueueResult::Enqueued);
+    // The caller scrubs its (only) copy, exactly as PeerLinkFanout::pump does; nothing else holds the masters.
+    std::memset(op.peerKeys.data(), 0, op.peerKeys.size());
+    drainAll(*p);
+    EXPECT_TRUE(workerHolds(*p, 0, 2, 3)) << "the keys still reached the worker";
 }

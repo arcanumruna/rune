@@ -54,6 +54,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <csignal>
@@ -220,6 +221,8 @@ using Expected = std::map<int, std::vector<std::string>>;
 
 /// Per-DDL hooks of Rig::drive.
 struct Hooks {
+    /// Right before the sendNo-th frame goes to `node`.
+    std::function<void(int sendNo, int node)> beforeSend;
     /// After the sendNo-th frame went to `node` (before its answer is awaited); true: the answer is in doubt.
     std::function<bool(int sendNo, int node)> afterSend;
     bool followRedirects = true;   ///< false: the Redirect is the terminal answer (the RED of "no redirect following")
@@ -307,6 +310,7 @@ public:
         r.viaWasLeader = via == c_.settledLeader();
         int cur = via, sendNo = 0;
         for (const auto deadline = Clock::now() + budget; Clock::now() < deadline;) {
+            if (hooks.beforeSend) hooks.beforeSend(sendNo, cur);
             const int64_t corr = sendOnly(cur, s, rid);
             bool inDoubt = false;
             Answer a;
@@ -594,20 +598,31 @@ public:
         int                  finalCode = -1;        // the final answer's ErrorResponse code, or its ViewRowResponse status
         std::vector<uint8_t> row;                   // the final answer's row bytes (status OK)
         int                  finalNode = -1;
+        bool                 leaseLapse = false;    // #793: the final NotLeader was finalNode's read without a lease (#82)
         [[nodiscard]] bool ok() const { return answered && !finalIsError && finalCode == pc::ViewRowResponse::kOk; }
     };
+    /// #793: the view reads broker `n`'s workers answered NotLeader for want of a read lease (#82), on their own threads.
+    uint64_t viewReadsWithoutLease(int n) {
+        uint64_t total = 0;
+        for (int32_t w = 0; w < c_.node(n).workerCountForTest(); ++w)
+            total += c_.node(n).onWorkerThreadForTest(w, [](Worker& wk) { return wk.viewReadsWithoutLeaseForTest(); });
+        return total;
+    }
     ViewRead viewRowFollowing(int n, int32_t viewTopicId, uint64_t key) {
         ViewRead r;
         int cur = n;
         for (int hop = 0; hop < 3; ++hop) {
             const int64_t sid = session(cur);
             if (sid <= 0) return r;
+            const uint64_t lapsedBefore = viewReadsWithoutLease(cur);
             const int64_t corr = cl_.sendGetViewRow(c_.clientChannel(cur), kClientStream, sid, viewTopicId, key);
             const auto a = cl_.awaitViewRowOrError(corr, Clock::now() + 10s);
             if (!a) return r;
             const int code = a->isError ? a->errorCode : a->status;
             if (hop == 0) { r.firstIsError = a->isError; r.firstCode = code; r.firstMessage = a->message; }
             r.answered = true; r.finalIsError = a->isError; r.finalCode = code; r.row = a->row; r.finalNode = cur;
+            // The harness is this broker's only view reader, so a rise of its count during this read is this read's answer.
+            r.leaseLapse = a->isError && code == cNotLeader && viewReadsWithoutLease(cur) > lapsedBefore;
             if (a->isError && code == cRedirect && nodeOf(a->message) > 0) { cur = nodeOf(a->message); continue; }
             return r;
         }
@@ -826,6 +841,7 @@ struct Perturbation {
     bool                                        earlyNotLeader = false;  ///< a NotLeader reached the R7 window (evidence)
     std::map<int, BrokerNode::EvidenceTimes>    ev;         // per running broker: when it produced evidence since the reset
     int64_t                                     harnessFirstNs = 0, harnessLastNs = 0;   // leader-moved / early in-doubt seen
+    uint64_t                                    leaseLapses = 0;   ///< #793: window NotLeaders that were the #82 read-lease answer
     void stampHarness() {
         const int64_t t = rune::node::testing::SchedulerWatchdog::nowNs();
         if (harnessFirstNs == 0) harnessFirstNs = t;
@@ -903,13 +919,16 @@ struct CellOutcome {
     bool        passBlocked = false;     ///< a broker pass gap >= kStallEvidenceNs with the watchdog quiet (not injected)
     int64_t     maxGapNs = 0;            ///< the max admin / control pass gap
     int64_t     watchdogGapNs = 0;       ///< the test process's SchedulerWatchdog overshoot, anywhere in [baseline - 1 s, end]
+    uint64_t    leaseLapses = 0;         ///< #793: window view reads answered NotLeader for want of a read lease
 };
 /// Test seams of runCell (all optional).
 struct CellSeams {
     std::function<void(NodeConfig&)>                   configTweak;
     std::function<void(ThreeNodes&, Rig&)>             afterPrecondition;
+    std::function<void(ThreeNodes&, Rig&, int)>        beforeLeaderSend;   ///< CreateRacesPlacement: once, before the frame to the leader
     std::function<void(ThreeNodes&, Rig&, int)>        onLeaderSend;
     std::function<void(ThreeNodes&, Rig&)>             afterAnswerRelease;
+    std::function<void(ThreeNodes&, Rig&)>             afterWindow;   ///< CreateRacesPlacement: right after the 1.5 s window
     bool                                               answerHoldInWindow = true;   ///< false: the RED of Recipe 2 step 2
     bool                                               injectsStall = false;  ///< the seams stall a broker / the harness themselves
     bool                                               suppressTimingHook = false;   ///< T9: RestartMidApply's hook never acts
@@ -1131,6 +1150,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
     bool restartedInHook = false;    // RestartMidApply: the hook restarted the victim while the DDL committed / applied
     int crashedNode = -1;
     bool placementReleased = false;
+    bool beforeLeaderSendRan = false;   // CreateRacesPlacement: seams.beforeLeaderSend ran (once)
     int answersHeldOn = -1;
     uint64_t baseline = 0;
     std::function<void()> afterDrive;   // R10: the checks that run after the drop's answer, before the placement is released
@@ -1187,6 +1207,11 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
             // long the warm-up takes; the window (1.5 s) is then bounded inside the gate's hold cap (kDdlAnswerMaxHoldNs).
             rig.holdPlacementEverywhere(true);
             if (seams.answerHoldInWindow) { c.node(leader).holdCatalogAnswersForTest(true); answersHeldOn = leader; }
+            hooks.beforeSend = [&](int, int node) {
+                if (node != c.catalogLeaderId() || beforeLeaderSendRan || !seams.beforeLeaderSend) return;
+                beforeLeaderSendRan = true;
+                seams.beforeLeaderSend(c, rig, node);
+            };
             hooks.afterSend = [&](int, int node) {
                 const int lead = c.catalogLeaderId();
                 if (node != lead || placementReleased) return false;
@@ -1262,9 +1287,13 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
                             } else {
                                 // A bare NotLeader is the retriable refusal of a leader demoted / fenced in the window: evidence like the
                                 // R7 window's, excused only by a stall (the injected one, or the watchdog's) in the verdict below.
+                                // #793: unless the answering worker counted it as a read without a lease (#82): the source leader's
+                                // lease lapsed (an owner thread of the lease chain descheduled past it on a loaded host), which says
+                                // nothing about the placement - counted, never R7 evidence.
                                 const auto notLeader = [&](const Rig::ViewRead& v) {
                                     const bool nl = v.answered && v.finalIsError && v.finalCode == cNotLeader;
-                                    if (nl) { pert.earlyNotLeader = true; pert.stampHarness(); }
+                                    if (nl && v.leaseLapse) ++pert.leaseLapses;
+                                    else if (nl) { pert.earlyNotLeader = true; pert.stampHarness(); }
                                     return nl;
                                 };
                                 const auto r = rig.viewRowFollowing(n, info->id, static_cast<uint64_t>(kRacesViewSentinelKey));
@@ -1282,6 +1311,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
                             }
                         }
                     }
+                    if (seams.afterWindow) seams.afterWindow(c, rig);
                 }
                 release();
                 EXPECT_GE(probes, 6) << what << ": the no-placement window was observed (vacuity guard)";
@@ -1406,6 +1436,9 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
                                   std::to_string(msOf(watchdogAtLast)) + " ms before the last, " + std::to_string(msOf(watchdogAny)) +
                                   " ms in the cell; max pass gap " + std::to_string(msOf(maxGap)) + " ms" +
                                   (pert.injectedStall ? ", injected" : "") + ")";
+    if (pert.leaseLapses > 0)   // #793: visible, never evidence (the source leader's #82 lease lapsed on a loaded host)
+        std::fprintf(stderr, "[ lease lapse ] %s: %llu window view read(s) answered NotLeader without a read lease\n", cell.c_str(),
+                     static_cast<unsigned long long>(pert.leaseLapses));
     switch (verdict) {
     case CellVerdict::Exact:
     case CellVerdict::SlowPass:   // the cell's own timing only: the matrix's exact codes
@@ -1453,6 +1486,7 @@ void runCell(const CellParam& param, const CellSeams& seams = {}, CellOutcome* o
         outcome->res = res; outcome->roles = CellRoles{preLeader, leader, via, rig.silentReconnects()}; outcome->perturbedWhy = why;
         outcome->stallObserved = excusedByWatchdog; outcome->maxGapNs = maxGap; outcome->watchdogGapNs = watchdogAny;
         outcome->passBlocked = verdict == CellVerdict::SlowPass || verdict == CellVerdict::BlockingPass;
+        outcome->leaseLapses = pert.leaseLapses;
         if (after.nl.count(leader) && pert0.nl.count(leader)) outcome->belowMinIsrOnLeader = after.nl.at(leader).belowMinIsr - pert0.nl.at(leader).belowMinIsr;
     }
     ASSERT_EQ(res.finalCode, cOk) << cell << res.trace;    // ALWAYS
@@ -1890,14 +1924,32 @@ TEST(CatalogClusterRegression, EarlyNotLeaderInThePlacementWindowNeedsAStallRegr
         seams.configTweak = [](NodeConfig& cfg) { cfg.replicaLagMaxMs = 1000; };
         seams.answerHoldInWindow = false;
         seams.injectsStall = injected;
-        seams.onLeaderSend = [](ThreeNodes& c, Rig& rig, int lead) {
-            std::vector<std::thread> th;
+        // #427: the followers' admin threads (they drive the __catalog replicas) are frozen BEFORE the DDL frame reaches the
+        // leader, and the send waits until both freezes run.  Frozen only after the send, a loaded host let the followers fetch
+        // and ack the DDL first: it committed (no below-minIsr NotLeader) and its OK aged in the gate through the freeze.
+        std::vector<std::thread> th;
+        std::atomic<int> frozen{0};
+        int followers = 0;
+        seams.beforeLeaderSend = [&](ThreeNodes& c, Rig& rig, int lead) {
             for (int f : c.runningNodes())
-                if (f != lead) th.emplace_back([&c, f] { try { c.node(f).onAdminThreadForTest([] { std::this_thread::sleep_for(4s); return 0; }, 15s); } catch (...) {} });
+                if (f != lead) {
+                    ++followers;
+                    th.emplace_back([&c, &frozen, f] {
+                        try { c.node(f).onAdminThreadForTest([&frozen] { frozen.fetch_add(1); std::this_thread::sleep_for(4s); return 0; }, 15s); }
+                        catch (...) {}
+                    });
+                }
+            rig.pumping([&] {
+                for (const auto until = Clock::now() + 10s; Clock::now() < until && frozen.load() < followers;) std::this_thread::sleep_for(1ms);
+            });
+            EXPECT_EQ(frozen.load(), followers) << "both followers' admin threads are frozen before the DDL is sent";
+        };
+        seams.onLeaderSend = [&](ThreeNodes& c, Rig& rig, int lead) {
             rig.pumping([&] {
                 for (const auto until = Clock::now() + 10s; Clock::now() < until && c.catalogIsrSizeOn(lead) != 1;) std::this_thread::sleep_for(50ms);
             });
             rig.pumping([&] { for (auto& t : th) t.join(); });
+            th.clear();
         };
         CellOutcome out;
         ::testing::TestPartResultArray failures;
@@ -1906,6 +1958,7 @@ TEST(CatalogClusterRegression, EarlyNotLeaderInThePlacementWindowNeedsAStallRegr
                                                                   &failures);
             runCell({cm::Kind::CreateTopic, cm::Timing::CreateRacesPlacement, 0}, seams, &out);
         }
+        for (auto& t : th) if (t.joinable()) t.join();   // the cell never reached onLeaderSend
         int notExcused = 0;
         for (int i = 0; i < failures.size(); ++i) {
             const std::string m = failures.GetTestPartResult(i).message();
@@ -1916,6 +1969,27 @@ TEST(CatalogClusterRegression, EarlyNotLeaderInThePlacementWindowNeedsAStallRegr
         EXPECT_NE(out.perturbedWhy.find("notLeader(belowMinIsr)"), std::string::npos) << "vacuity guard: " << out.perturbedWhy;
         if (!injected && !schedulerStall(out.watchdogGapNs)) EXPECT_EQ(notExcused, 1) << "a broker's own block is never an excuse";
     }
+}
+
+// #793: a view read the source leader answers NotLeader because its read lease (#82) lapsed - on a loaded host an owner thread
+// of the lease chain is descheduled past the 200 ms lease (measured: 124-257 ms wall with ~0 thread CPU) - is the lease's
+// safety answer, not a placement fenced in the R7 window: counted, never evidence.  Every worker's lease clock is pushed far
+// past its lease for the window, so every window read through the source leader lapses, deterministically.
+// RED: drop the leaseLapse branch of the window's notLeader probe -> early-notLeader evidence with no stall -> "NO stall".
+TEST(CatalogClusterRegression, ViewReadLeaseLapseInThePlacementWindowIsNotR7EvidenceRegression) {
+    static const int64_t kFarPastEveryLease = INT64_MAX / 4;
+    const auto setLeaseClock = [](ThreeNodes& c, const int64_t* now) {
+        for (int n : c.runningNodes())
+            for (int32_t w = 0; w < c.node(n).workerCountForTest(); ++w)
+                c.node(n).onWorkerThreadForTest(w, [now](Worker& wk) { wk.setLeaseClockForTest(now); return 0; });
+    };
+    CellSeams seams;
+    seams.afterAnswerRelease = [&](ThreeNodes& c, Rig&) { setLeaseClock(c, &kFarPastEveryLease); };
+    seams.afterWindow        = [&](ThreeNodes& c, Rig&) { setLeaseClock(c, nullptr); };
+    CellOutcome out;
+    runCell({cm::Kind::CreateView, cm::Timing::CreateRacesPlacement, 0}, seams, &out);
+    EXPECT_GT(out.leaseLapses, 0u) << "vacuity guard: the window's view reads lapsed";
+    EXPECT_EQ(out.perturbedWhy.find("early-notLeader"), std::string::npos) << out.perturbedWhy;
 }
 
 // R3-M2: a watchdog whose thread cannot start (after pipe()) leaks no fd.

@@ -1197,6 +1197,15 @@ ConfigResult parseNodeConfig(
         cfg.cleanerIoMaxBytesPerSecond = v;
     }
 
+    // --- RUNE_CLEANER_DEDUPE_BUFFER_BYTES (optional; absent/empty = 128 MiB; 1 MiB .. 4 GiB) --- #658
+    if (const char* raw = getenv_fn("RUNE_CLEANER_DEDUPE_BUFFER_BYTES"); raw && *raw) {
+        int64_t v = 0;
+        if (!parseInt64Positive(raw, v) || v < NodeConfig::kMinCleanerDedupeBufferBytes ||
+            v > NodeConfig::kMaxCleanerDedupeBufferBytes)
+            return {{}, std::string("RUNE_CLEANER_DEDUPE_BUFFER_BYTES must be an integer in [1048576, 4294967296] (bytes), got: ") + raw};
+        cfg.cleanerDedupeBufferBytes = v;
+    }
+
     // --- RUNE_PRODUCER_ID_EXPIRATION_MS (optional, >= 0) — PSM fix round 1 (I1). ---
     if (const char* raw = getenv_fn("RUNE_PRODUCER_ID_EXPIRATION_MS"); raw && *raw) {
         char* end = nullptr;

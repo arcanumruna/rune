@@ -784,15 +784,44 @@ TEST(GroupRoutingRegression, AlreadyDisconnectedLeaderSessionIsRevivedRegression
     ASSERT_TRUE(r.drive([&] { return led.records[1] == 2; }));
 }
 
-// MEDIUM-3 (re-review): while a group is active, a plain subscription to a
-// partition another node leads finishes with a distinct, documented reason
-// (never a seed redirect).
-TEST(GroupRoutingRegression, PlainSubscribeRedirectedWhileGroupActiveReportsWhyRegression) {
+// MEDIUM-3 (re-review) / #749: while a group is active, a plain subscription to a partition another node leads FOLLOWS
+// that partition's leader on the leader's own session - the seed (the group coordinator's session) is never moved.
+// RED (mutation): restoring the `!groupActive` gate on the per-partition follow - the subscribe finishes with
+// LeaderElsewhereWhileGroupActive.
+TEST(GroupRoutingRegression, PlainSubscribeRedirectedWhileGroupActiveFollowsTheLeaderRegression) {
     GroupRig r(4141, 4142, routingClockOptions());
     const auto [n1, p1port] = r.addNode(4141);
     r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
     r.gw.partitions      = {{1, 0, 0, 1, 4141, ""}, {2, 0, 1, 1, 4141, ""}};
     r.gw.subscribeLeader = {{0, n1}};  // topic b / partition 0: node 1 (the fake keys by partition)
+    r.gw.groupAssignment = {{1, 0}};
+    r.gw.holdJoins       = false;
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    int plain = 0;
+    auto sub = r.client.subscribe(r.client.topic("b"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [&](const rc::Record&) { ++plain; });
+    const auto onLeader = [&]() -> const test_support::InvokerGateway::Subscribed* {
+        const auto* s = r.gw.latestSubscription(2, 0);   // topic b
+        return (s != nullptr && s->endpoint == n1) ? s : nullptr;
+    };
+    ASSERT_TRUE(r.drive([&] { return sub.finished() || onLeader() != nullptr; }));
+    ASSERT_FALSE(sub.finished()) << "failed with reason " << static_cast<int>(sub.failReason());
+    ASSERT_NE(onLeader(), nullptr) << "the redirected subscribe never reached the leader";
+    r.gw.pushRecords(*onLeader(), 0, 3);
+    ASSERT_TRUE(r.drive([&] { return plain == 3; })) << "no records from the leader";
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), r.c.gatewayChannel) << "the seed moved";
+}
+
+// #749 second leg: a redirect to an endpoint the client cannot route per partition (not a node of the cluster) would
+// have to move the seed: while a group is active the subscribe still fails with the documented reason, seed unmoved.
+// RED (mutation): letting the BySeed fallback retarget the seed - the channel moves.
+TEST(GroupRoutingRegression, RedirectToAnUnknownEndpointWhileGroupActiveStillReportsWhyRegression) {
+    GroupRig r(4141 + 400, 4142 + 400, routingClockOptions());
+    const auto [n1, p1port] = r.addNode(4141 + 400);
+    (void)p1port;
+    r.gw.partitions      = {{1, 0, 0, 1, 4541, ""}, {2, 0, 1, 1, 4541, ""}};   // metadata does NOT list node n1
+    r.gw.subscribeLeader = {{0, n1}};
     r.gw.groupAssignment = {{1, 0}};
     r.gw.holdJoins       = false;
     auto gc = r.client.subscribeGroup("g", {"t"});
@@ -4494,12 +4523,12 @@ TEST(GroupClockRegression, ClockJumpFiresOneHeartbeatAndOneAutoCommitNotABurstAd
     }
 }
 
-// #701, input bound: subscribeTimeoutMs = INT64_MAX.  The relative timeout saturates and the duty thread's adoption
+// #701, input bound: subscribeTimeoutMs = the 30-day cap.  The relative timeout is huge and the duty thread's adoption
 // stamp (now + timeout) saturates too: the Subscribe never times out however far the clock runs.  Mutation (a plain
 // add at adoption: the deadline wraps negative): TimedOut on the first sweep - red.
 TEST(SubscribeClockRegression, MaxSubscribeTimeoutSaturatesAndNeverTimesOutAdversarialRegression) {
     RigOptions o         = routingClockOptions(100'000);
-    o.subscribeTimeoutMs = std::numeric_limits<int64_t>::max();
+    o.subscribeTimeoutMs = 2'592'000'000;   // the 30-day cap: INT64_MAX is refused at construction (E1)
     GroupRig r(4715, 4716, o);
     int errors = 0;
     r.client.onError([&](const std::string&) { ++errors; });
@@ -4539,6 +4568,9 @@ TEST(GroupRoutingRegression, AFanOutRoundAnsweredByTheSeedAloneIsNotReAskedAdver
                                  [](const rc::Record&) {});
     ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.active(); }));
     r.opt.stepNs = 0;   // settle with the duty clock frozen
+    // The reader only brought node 1's session up.  Left bound, the silent-leader watch (#514) would arm its own
+    // refresh whenever node 1's Pong lags the free-running duty clock in real time - a re-ask for another cause.
+    s0.unsubscribe();
     for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
     r.gw.holdMetadata = true;
     const std::size_t asked = r.gw.metadataCorrIds.size();
@@ -4550,7 +4582,9 @@ TEST(GroupRoutingRegression, AFanOutRoundAnsweredByTheSeedAloneIsNotReAskedAdver
         if (r.gw.metadataEndpoints[i] == 0) seedCorr = r.gw.metadataCorrIds[i];
     ASSERT_NE(seedCorr, 0) << "precondition: one request went to the seed";
     r.gw.sendMetadata(r.seedSid, seedCorr, 0);   // the seed answers; node 1's request stays unanswered
-    for (int i = 0; i < 50; ++i) { r.client.doWork(); r.gw.pump(); }
+    // The answer travels over real UDP: pump until the client has APPLIED it (a fixed pass count raced a loaded
+    // host, and the duty clock then ran past the answer timer before the answer arrived: a re-ask for another cause).
+    for (int i = 0; i < 200'000 && r.client.testMetadataAnswerPending(); ++i) { r.client.doWork(); r.gw.pump(); }
     r.gw.holdMetadata = false;
     r.opt.stepNs = 10'000'000;
     const int64_t t0 = g_routingClockNs;

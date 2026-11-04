@@ -236,7 +236,11 @@ PeerHandshake::Out PeerHandshake::tick(int64_t nowNs) {
     }
     // Issue #241: an Accept not yet confirmed is re-sent (the same bytes) - retransmission only; the promotion waits for
     // the Confirm or for an authenticated frame under the epoch, never for a timer.
-    if (auto* e = std::get_if<Established>(&state_); e && e->unconfirmedAccept && nowNs - e->acceptSentNs >= kRetryNs) {
+    // Issue #545: only while the epoch is fresh (kAwaitNs after its install, the initiator's own give-up): an initiator
+    // that abandoned the exchange never answers, so the Accept is not re-sent forever.  The epoch stays unconfirmed (a
+    // late Confirm or an authenticated frame under it still promotes it) and a new exchange may replace it.
+    if (auto* e = std::get_if<Established>(&state_); e && e->unconfirmedAccept && nowNs - e->sinceNs < kAwaitNs &&
+                                                       nowNs - e->acceptSentNs >= kRetryNs) {
         e->acceptSentNs = nowNs;
         return frameOut(*e->unconfirmedAccept);
     }
@@ -487,12 +491,15 @@ PeerHandshake::Out PeerHandshake::establishAsResponder_(const ClusterKey& key, c
 
 PeerHandshake::Out PeerHandshake::onAccept(const PeerAccept& a, int64_t nowNs) {
     if (!initiator() || a.from != peer_ || a.to != self_) return {};
-    // Issue #241: the responder re-sent the Accept of the epoch we hold (our Confirm was lost): the Confirm again,
-    // nothing else changes.  Any other Accept while Established is ignored.
-    if (auto* e = std::get_if<Established>(&state_)) {
-        if (e->confirm && a.linkEpoch == e->keys.epoch && mac32Eq(a.confirm, e->acceptConfirm)) return frameOut(*e->confirm);
-        return {};
-    }
+    // Issue #241: the responder re-sent the Accept of the epoch our live link holds (our Confirm was lost): the Confirm
+    // again, nothing else changes.  Issue #584: in EVERY state - a HelloSent / ChallengeSent initiator answers from its
+    // `prior` and stays in its state (the responder re-sends that epoch's Accept every kRetryNs for kAwaitNs after
+    // installing it, #545, and the prior Confirm answers each re-send).  Any other
+    // Accept while Established is ignored.
+    if (const Established* live = liveLink_(); live && live->confirm && a.linkEpoch == live->keys.epoch &&
+                                               mac32Eq(a.confirm, live->acceptConfirm))
+        return frameOut(*live->confirm);
+    if (std::holds_alternative<Established>(state_)) return {};
     auto* cs = std::get_if<ChallengeSent>(&state_);
     if (!cs) return {};
     const ClusterKey* key = keys_.byId(cs->keyId);

@@ -153,6 +153,15 @@ In CI, `.github/workflows/sanitizers.yml` runs these checkpoint sanitizer suites
 client, `-R Regression -LE latency`) on demand only (Actions → sanitizers → Run workflow; it never runs on pull
 requests or pushes), and uploads the test logs when a run fails. Use its result for the checkpoint instead of running the sanitizer builds on a shared box.
 
+## CI on pull requests
+
+`.github/workflows/pr.yml` is the only check that runs on a pull request. A PR runs the client build with examples and
+its `-R Regression -LE latency` suite, the source guards, and the broker build with the Regression suite on one shard
+of six (shard = PR number mod 6, about one runner-hour). The full six-shard broker job runs on every push to `main`,
+nightly, and on PRs labelled `ci:full`. Latency gates and sanitizers never run there.
+`client-cpp/scripts/check_pr_workflow.py` (ctest `PrWorkflowRunsTheClientSuiteGuardRegression`) fails if that
+workflow loses its `pull_request` trigger or stops running the client suite.
+
 ## Source guards
 
 Python scripts run as ctest tests (names end in `Regression`) and fail the build when a rule of the engineering philosophy

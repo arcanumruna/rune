@@ -138,10 +138,10 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationOnSyncGroupResponse)
 
     // Capture all frames sent by the hub.
     std::vector<std::vector<uint8_t>> capturedFrames;
-    SendFn sendFn = [&capturedFrames](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
-        capturedFrames.emplace_back(buf, buf + len);
+    SendFn sendFn{[](void* ctx, int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
+        static_cast<std::vector<std::vector<uint8_t>>*>(ctx)->emplace_back(buf, buf + len);
         return true;
-    };
+    }, &capturedFrames};
 
     // Build a SyncGroupResponse assigning partition (topicId=42, partition=0).
     rpc::SyncGroupResponse syncResp;
@@ -224,10 +224,10 @@ TEST(GroupConsumerReadCommittedTest, WireIsolationReadUncommittedIsZero)
     hub.add(impl.get());
 
     std::vector<std::vector<uint8_t>> capturedFrames;
-    SendFn sendFn = [&capturedFrames](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
-        capturedFrames.emplace_back(buf, buf + len);
+    SendFn sendFn{[](void* ctx, int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
+        static_cast<std::vector<std::vector<uint8_t>>*>(ctx)->emplace_back(buf, buf + len);
         return true;
-    };
+    }, &capturedFrames};
 
     rpc::SyncGroupResponse syncResp;
     syncResp.sessionId     = kSessionId;

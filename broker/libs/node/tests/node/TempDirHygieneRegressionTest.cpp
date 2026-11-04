@@ -191,25 +191,56 @@ TEST(TempDirHygieneRegression, TheTestTmpRootIsPerProcessRegression) {
 TEST(TempDirHygieneRegression, ADeadOwnersRootIsSweptAtStartupRegression) {
     const fs::path root = fs::temp_directory_path();
     ASSERT_EQ(root.filename().string(), ownRootName()) << "precondition: the per-process root is wired";
-    // The child starts in our root's parent (the inherited TMPDIR), as every sibling test binary does.
-    const fs::path base = root.parent_path();
+    // A private sweep base inside our own root: no other test binary ever sweeps here, so a concurrently starting
+    // suite binary cannot remove the planted dead root (#781). The child starts here, as every sibling does in the
+    // shared TMPDIR.
+    const fs::path base = root / "sweep_base";
+    fs::remove_all(base);
+    fs::create_directories(base);
 
-    // A dead owner: a child that exits at once, reaped before its root is planted.
-    const pid_t dead = ::fork();
-    ASSERT_GE(dead, 0);
-    if (dead == 0) ::_exit(0);
-    int st = 0;
-    ASSERT_EQ(::waitpid(dead, &st, 0), dead);
-    const fs::path deadRoot = base / ("rune_t" + std::to_string(static_cast<long>(dead)));
+    // A dead owner: a child that exits at once, reaped before its root is planted. A pid that was reused by the time
+    // the child sweeps would be kept, so re-check just before the run and pick a fresh dead pid (bounded).
+    const auto reapDeadPid = [](pid_t& out) {
+        const pid_t c = ::fork();
+        if (c < 0) return false;
+        if (c == 0) ::_exit(0);
+        int st = 0;
+        if (::waitpid(c, &st, 0) != c) return false;
+        out = c;
+        return true;
+    };
+    const auto isDead = [](pid_t p) { return ::kill(p, 0) == -1 && errno == ESRCH; };
+    const auto deadRootOf = [&](pid_t p) { return base / ("rune_t" + std::to_string(static_cast<long>(p))); };
+
+    pid_t dead = 0;
+    ASSERT_TRUE(reapDeadPid(dead));
+    fs::path deadRoot = deadRootOf(dead);
     fs::create_directories(deadRoot / "x" / "y");
     { std::ofstream{deadRoot / "x" / "y" / "f"} << "leftover"; }
-    // A live owner (our own root) and a name that is not rune_t<digits>.
+    // A live owner (our own root name) and a name that is not rune_t<digits>.
     const fs::path liveRoot = base / ownRootName();
-    ASSERT_EQ(liveRoot, root);
     fs::create_directories(liveRoot / "z");
     const fs::path unrelated = base / ("rune_tx_keep" + std::to_string(static_cast<long>(::getpid())));
     fs::create_directories(unrelated);
+
+    // A concurrent suite binary sweeping the shared parent must not see the planted tree.
+    {
+        const ChildResult sib = runSelf(
+            {"--gtest_filter=TempDirHygieneRegression.TheTestTmpRootIsPerProcessRegression"},
+            root.parent_path().string(), {}, (root / "sibling_child.log").string());
+        ASSERT_TRUE(sib.exited) << sib.error;
+    }
     ASSERT_TRUE(fs::exists(deadRoot / "x" / "y" / "f"));
+
+    for (int tries = 0; tries < 8 && !isDead(dead); ++tries) {
+        pid_t fresh = 0;
+        ASSERT_TRUE(reapDeadPid(fresh));
+        const fs::path freshRoot = deadRootOf(fresh);
+        fs::rename(deadRoot, freshRoot);
+        dead = fresh;
+        deadRoot = freshRoot;
+    }
+    if (!isDead(dead)) GTEST_SKIP() << "could not obtain a dead pid (pid reuse)";
 
     const ChildResult r = runSelf({"--gtest_filter=TempDirHygieneRegression.TheTestTmpRootIsPerProcessRegression"},
                                   base.string(), {}, (root / "sweep_child.log").string());
@@ -219,8 +250,14 @@ TEST(TempDirHygieneRegression, ADeadOwnersRootIsSweptAtStartupRegression) {
     EXPECT_FALSE(fs::exists(deadRoot)) << "a dead owner's root survived the child's startup sweep: " << deadRoot;
     EXPECT_TRUE(fs::is_directory(liveRoot / "z")) << "a live owner's root was touched";
     EXPECT_TRUE(fs::is_directory(unrelated)) << "a non rune_t<digits> entry was touched";
-    fs::remove_all(liveRoot / "z");
-    fs::remove_all(unrelated);
+    // The child's own root is removed at its exit: nothing but our fixtures remains.
+    for (const auto& e : fs::directory_iterator(base)) {
+        const std::string n = e.path().filename().string();
+        if (n != ownRootName() && n.rfind("rune_t", 0) == 0 &&
+            n.find_first_not_of("0123456789", 6) == std::string::npos)
+            ADD_FAILURE() << "left behind in the sweep base: " << e.path();
+    }
+    fs::remove_all(base);
 }
 
 // Helper body for AFailingBinaryRemovesItsRootAtExitRegression: fails only inside that test's child.

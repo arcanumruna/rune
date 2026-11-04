@@ -2086,9 +2086,102 @@ TEST(ClientConfigRegression, NegativeTimeoutsAndRetryBudgetsAreRefusedAtConstruc
     EXPECT_NO_THROW(rc::Client{with(3892, [](auto& c) {
         c.ddlRetryBudget = milliseconds::max();
         c.viewReadRetryBudget = milliseconds::max();
-        c.ddlTimeoutMs = INT64_MAX;
-        c.pingTimeoutMs = INT64_MAX;
-    })}) << "huge values are saturated, never refused";
+    })}) << "huge retry budgets are saturated, never refused (the *Ms fields are capped, see the 30-day test)";
+}
+
+// E1: every ClientConfig *Ms field is converted to ns, so one above 30 days (2'592'000'000 ms) is refused at
+// construction naming the field, never wrapped or saturated into "forever".  The cap itself is accepted.
+// RED: drop the kMaxTimeoutMs check in validateConfigInPlace / producerWithRingCap_.
+TEST(ClientConfigRegression, MsTimeoutsAboveThirtyDaysAreRefusedAtConstructionRegression) {
+    constexpr int64_t kCap = 2'592'000'000;
+    struct Field {
+        const char* name;
+        void (*set)(rc::ClientConfig&, int64_t);
+    };
+    const Field fields[] = {
+        {"connectTimeoutMs", [](rc::ClientConfig& c, int64_t v) { c.connectTimeoutMs = v; }},
+        {"pingTimeoutMs", [](rc::ClientConfig& c, int64_t v) { c.pingTimeoutMs = v; }},
+        {"produceTimeoutMs", [](rc::ClientConfig& c, int64_t v) { c.produceTimeoutMs = v; }},
+        {"subscribeTimeoutMs", [](rc::ClientConfig& c, int64_t v) { c.subscribeTimeoutMs = v; }},
+        {"ddlTimeoutMs", [](rc::ClientConfig& c, int64_t v) { c.ddlTimeoutMs = v; }},
+        {"closeTimeoutMs", [](rc::ClientConfig& c, int64_t v) { c.closeTimeoutMs = v; }},
+    };
+    int32_t in = 3910;
+    for (const Field& f : fields) {
+        {
+            rc::ClientConfig c = authCfg(in, "", "");
+            f.set(c, kCap);
+            EXPECT_NO_THROW(rc::Client{std::move(c)}) << f.name << " at the cap";
+        }
+        in += 2;
+        for (const int64_t bad : {kCap + 1, INT64_MAX}) {
+            rc::ClientConfig c = authCfg(in, "", "");
+            f.set(c, bad);
+            try {
+                rc::Client k{std::move(c)};
+                ADD_FAILURE() << f.name << "=" << bad << " constructed";
+            } catch (const std::invalid_argument& e) {
+                EXPECT_NE(std::string(e.what()).find(f.name), std::string::npos) << e.what();
+            }
+        }
+        in += 2;
+    }
+    // The producer's own *Ms fields (converted to ns at many sites) carry the same cap.
+    struct PField {
+        const char* name;
+        void (*set)(rc::ProducerConfig&, int64_t);
+    };
+    const PField pfields[] = {
+        {"produceTimeoutMs", [](rc::ProducerConfig& p, int64_t v) { p.produceTimeoutMs = v; }},
+        {"transactionOpTimeoutMs", [](rc::ProducerConfig& p, int64_t v) { p.transactionOpTimeoutMs = v; }},
+        {"deliveryTimeoutMs", [](rc::ProducerConfig& p, int64_t v) { p.deliveryTimeoutMs = v; }},
+        {"agentLivenessTimeoutMs", [](rc::ProducerConfig& p, int64_t v) { p.agentLivenessTimeoutMs = v; }},
+    };
+    rc::Client client{authCfg(in, "", "")};
+    for (const PField& f : pfields) {
+        {
+            rc::ProducerConfig p;
+            f.set(p, kCap);
+            EXPECT_NO_THROW(client.producer(p)) << f.name << " at the cap";
+        }
+        for (const int64_t bad : {kCap + 1, INT64_MAX}) {
+            rc::ProducerConfig p;
+            f.set(p, bad);
+            try {
+                client.producer(p);
+                ADD_FAILURE() << "producer " << f.name << "=" << bad << " constructed";
+            } catch (const std::invalid_argument& e) {
+                EXPECT_NE(std::string(e.what()).find(f.name), std::string::npos) << e.what();
+            }
+        }
+    }
+}
+
+// #744: subscribeTimeoutMs (and produceTimeoutMs) at 0 or below would time every subscribe / produce attempt out on its
+// first pass; refused at construction naming the field.  1 and the 30-day cap construct.
+// RED: drop the check in validateConfigInPlace.
+TEST(ClientConfigRegression, NonPositiveSubscribeTimeoutIsRefusedAtConstructionRegression) {
+    auto with = [](int32_t in, auto&& set) {
+        rc::ClientConfig c = authCfg(in, "", "");
+        set(c);
+        return c;
+    };
+    for (const int64_t bad : {int64_t{0}, int64_t{-1}}) {
+        try {
+            rc::Client c{with(3894, [bad](auto& cfg) { cfg.subscribeTimeoutMs = bad; })};
+            ADD_FAILURE() << "subscribeTimeoutMs=" << bad << " constructed";
+        } catch (const std::invalid_argument& e) {
+            EXPECT_NE(std::string(e.what()).find("subscribeTimeoutMs"), std::string::npos) << e.what();
+        }
+        try {
+            rc::Client c{with(3894, [bad](auto& cfg) { cfg.produceTimeoutMs = bad; })};
+            ADD_FAILURE() << "produceTimeoutMs=" << bad << " constructed";
+        } catch (const std::invalid_argument& e) {
+            EXPECT_NE(std::string(e.what()).find("produceTimeoutMs"), std::string::npos) << e.what();
+        }
+    }
+    EXPECT_NO_THROW(rc::Client{with(3896, [](auto& c) { c.subscribeTimeoutMs = 1; c.produceTimeoutMs = 1; })});
+    EXPECT_NO_THROW(rc::Client{with(3898, [](auto& c) { c.subscribeTimeoutMs = 2'592'000'000; })});
 }
 
 // Issue #115: offerCrypto with the system store, no tlsExpectHost and a gateway channel that names no host would check
@@ -2624,4 +2717,28 @@ TEST(ClientAuthErrorsRegression, AuthErrorNamesCoverNamespaceCodesRegression) {
     EXPECT_STREQ(rc::authErrorName(55), "ConstraintViolation");
     EXPECT_STREQ(rc::authErrorName(61), "ViewUniqueInvalid");
     EXPECT_EQ(rc::authErrorName(62), nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// #756: the declared-egress test seam is a construction option, never a field of the public ClientConfig.
+// ---------------------------------------------------------------------------
+namespace {
+template <class C> concept HasDeclaredEgressField = requires(C c) { c.declaredEgressChannelForTest; };
+static_assert(!HasDeclaredEgressField<rc::ClientConfig>,
+              "the declared-egress seam must not be a public ClientConfig field (#756)");
+}  // namespace
+
+TEST(ClientConfigRegression, PublicConfigHasNoTestOnlyFieldsRegression) {
+    rc::ClientConfig cfg;
+    cfg.egressChannel = udp(41001);
+    // The option changes only the DECLARED channel: the ConnectRequest declares it, the transport still subscribes
+    // on the real egress channel.
+    rune::client::detail::ClientTestOptions opts;
+    opts.declaredEgressChannel = "aeron:udp?endpoint=192.0.2.1:40200";
+    const auto withOpt = rc::toAgentConfig(cfg, opts);
+    EXPECT_EQ(withOpt.session.egressChannel, opts.declaredEgressChannel);
+    EXPECT_EQ(withOpt.transport.egressChannel, cfg.egressChannel);
+    // The default (no option) declares the real egress channel.
+    const auto plain = rc::toAgentConfig(cfg);
+    EXPECT_EQ(plain.session.egressChannel, cfg.egressChannel);
 }

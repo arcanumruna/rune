@@ -8,6 +8,8 @@
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewFold.h>
 
+#include "AbortedFoldFixtures.h"
+
 namespace {
 
 // --- Test fixtures -----------------------------------------------------
@@ -367,12 +369,8 @@ TEST(ViewFoldResumeRegression, MidBatchCursorSkipsAlreadyFoldedRecords) {
 // predicate for TRANSACTIONAL batches only.
 // ---------------------------------------------------------------------------
 namespace {
-// One aborted range [first, last] of one producer, in the REAL index the worker hands the fold.
-struct OneAbortedRange {
-    rune::transaction::AbortedTxnIndex idx;
-    OneAbortedRange(int64_t pid, int64_t first, int64_t last) { idx.onAbortMarker(pid, first, last); }
-    [[nodiscard]] rune::view::AbortedTxnFilter filter() const { return rune::view::AbortedTxnFilter{&idx}; }
-};
+using abortedfix::OneAbortedRange;
+using abortedfix::concatBytes;
 std::vector<uint8_t> charBatch(int64_t base, std::initializer_list<std::pair<int64_t, int32_t>> recs,
                                int64_t pid = -1) {
     rune::protocol::RecordBatchBuilder b(base, 0);
@@ -383,11 +381,6 @@ std::vector<uint8_t> charBatch(int64_t base, std::initializer_list<std::pair<int
         b.append(asSv(k), asSv(v), 0);
     }
     return b.build();
-}
-std::vector<uint8_t> concatBytes(std::initializer_list<std::vector<uint8_t>> parts) {
-    std::vector<uint8_t> out;
-    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
-    return out;
 }
 } // namespace
 

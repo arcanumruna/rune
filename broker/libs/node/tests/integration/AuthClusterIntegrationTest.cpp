@@ -742,6 +742,117 @@ TEST(AuthClusterRegression, KeyRotationAcrossARollingRestartKeepsTrafficFlowingR
         std::printf("ROTATION recovery bound not enforced (set RUNE_LATENCY_GATES=1 on an idle host)\n");
 }
 
+// Issue #275 (h): a re-handshake while the WORKER replication planes seal traffic is race-free (this test carries the
+// `Regression` name, so the TSan CI job runs it) and loses nothing.  A producer (acks=all) and a consumer run
+// throughout; for 5 rounds every initiator re-handshakes every peer (control thread) while the workers keep sealing
+// and opening under their own per-thread PeerFrameCrypto, the keys reaching them over the fanout rings.  Expected: every
+// pair promotes the new epoch, no plane (control, admin, every worker) drops a frame as UnknownEpoch, and the consumer
+// sees every acknowledged offset exactly once.  Non-vacuity: a worker plane of every node opened sealed frames during
+// the run.  Mutation: PeerLinkFanout::pump skipping the workers leaves them keyless -> red.
+TEST(AuthClusterRegression, RehandshakeWhileWorkersSealIsRaceFreeRegression) {
+    AuthTrio t("rekeyw");
+    t.start();
+    t.bootstrapAdmin();
+    createBuilder(t);
+    t.createUser(1, "prod");
+    t.grant(1, "prod", SO::Write, ST::Topic, SP::Prefix, "rkw.");
+    t.createUser(1, "cons");
+    t.grant(1, "cons", SO::Read, ST::Topic, SP::Prefix, "rkw.");
+    const std::vector<AuthTrio::Session> bs = sessionsOnEveryBroker(t, "builder");
+    ASSERT_EQ(bs.size(), 3u) << "a builder session on every broker";
+    const int32_t topic = defineTopicAnywhere(t, bs, "rkw.t", 1);
+    ASSERT_GE(topic, 0);
+    ASSERT_TRUE(AuthTrio::until(60s, [&] { const int32_t l = leaderOf(t, bs[0], topic, 0); return l >= 1 && l <= 3; }));
+    const std::size_t batchBytes = makeCharBatch(1).size();
+    const std::array<std::string, 3> channels{t.channel(1), t.channel(2), t.channel(3)};
+
+    std::promise<int64_t> target;
+    std::promise<ProducerResult> pOut;
+    std::promise<ConsumerResult> cOut;
+    auto pFut = pOut.get_future();
+    auto cFut = cOut.get_future();
+    const std::filesystem::path prodDir = t.cluster().clientsDir->path / "rkw_prod", consDir = t.cluster().clientsDir->path / "rkw_cons";
+    LastAck lastAck{0};
+    std::jthread producer;
+    std::jthread consumer;
+    producer = std::jthread([&pOut, &lastAck, ch = channels, prodDir, topic](std::stop_token st) {
+        try { pOut.set_value(runProducer(st, ch, prodDir, topic, &lastAck)); }
+        catch (...) { pOut.set_exception(std::current_exception()); }
+    });
+    consumer = std::jthread([&cOut, ch = channels, consDir, topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
+        try { cOut.set_value(runConsumer(st, std::move(fut), ch, consDir, topic, batchBytes)); }
+        catch (...) { cOut.set_exception(std::current_exception()); }
+    });
+
+    ASSERT_TRUE(AuthTrio::until(60s, [&] {
+        for (int id : {1, 2, 3}) if (t.counter(id, typeIdOf(RuneMetric::PeerLinksEstablished)).value_or(0) != 2) return false;
+        return lastAck.load(std::memory_order_acquire) > 0;
+    })) << "links established and traffic flowing";
+
+    // Every plane's UnknownEpoch drops (control ingress + legacy replication, admin plane, every worker) and the
+    // authenticated frames every worker plane opened (the non-vacuity witness).
+    auto unknownEpochDrops = [&](BrokerNode& n) {
+        uint64_t d = n.peerLinksForTest().unknownEpochDrops + n.adminPeerUnknownEpochDropsForTest();
+        for (int32_t w = 0; w < n.workerCountForTest(); ++w) d += n.workerPeerUnknownEpochDropsForTest(w);
+        return d;
+    };
+    auto workerAuthFrames = [&](BrokerNode& n) {
+        uint64_t f = 0;
+        for (int32_t w = 0; w < n.workerCountForTest(); ++w)
+            for (int p : {1, 2, 3}) if (p != n.nodeIdForTest()) f += n.workerPeerAuthFramesForTest(w, p);
+        return f;
+    };
+    std::map<int, uint64_t> dropsBefore, authBefore;
+    for (int id : {1, 2, 3}) { dropsBefore[id] = unknownEpochDrops(t.node(id)); authBefore[id] = workerAuthFrames(t.node(id)); }
+
+    constexpr int kRounds = 5;
+    for (int round = 0; round < kRounds; ++round) {
+        for (int a : {1, 2, 3}) {
+            for (int b : {1, 2, 3}) {
+                if (a == b) continue;
+                const uint32_t was = t.node(a).peerLinksForTest().epochOf[b];
+                const bool started = t.node(a).forcePeerRekeyForTest(b);
+                ASSERT_EQ(started, a < b) << "round " << round << ": only the lower id initiates (" << a << "->" << b << ")";
+                if (!started) continue;
+                // Drive until the new epoch is the SEND epoch on both ends (promotion), a capped wait.
+                uint32_t ea = 0, eb = 0;
+                ASSERT_TRUE(AuthTrio::until(60s, [&] {
+                    ea = t.node(a).peerLinksForTest().epochOf[b];
+                    eb = t.node(b).peerLinksForTest().epochOf[a];
+                    return ea > was && ea == eb;
+                })) << "round " << round << " " << a << "<->" << b << ": " << ea << " / " << eb << " (was " << was << ")";
+                // Every WORKER plane of both nodes reached the new epoch too (the fanout delivered the keys to all of them).
+                auto workersOn = [&](int n, int peer, uint32_t want) {
+                    for (int32_t w = 0; w < t.node(n).workerCountForTest(); ++w)
+                        if (t.node(n).onWorkerThreadForTest(w, [peer](Worker& wk) { return wk.peerLinkEpochForTest(peer); }) != want) return false;
+                    return true;
+                };
+                ASSERT_TRUE(AuthTrio::until(60s, [&] { return workersOn(a, b, ea) && workersOn(b, a, ea); }))
+                    << "round " << round << " " << a << "<->" << b << ": a worker plane did not reach epoch " << ea;
+            }
+        }
+        const int64_t mark = lastAck.load(std::memory_order_acquire);
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { return lastAck.load(std::memory_order_acquire) > mark; }))
+            << "round " << round << ": no ack after the round's re-handshakes";
+    }
+    for (int id : {1, 2, 3}) {
+        EXPECT_GT(workerAuthFrames(t.node(id)), authBefore[id]) << "node " << id << ": the worker planes carried no sealed traffic (vacuous)";
+        EXPECT_EQ(unknownEpochDrops(t.node(id)) - dropsBefore[id], 0u) << "node " << id << " dropped frames as UnknownEpoch";
+    }
+
+    producer.request_stop();
+    producer.join();
+    const ProducerResult prod = pFut.get();
+    ASSERT_FALSE(prod.acked.empty());
+    const int64_t last = *std::max_element(prod.acked.begin(), prod.acked.end());
+    target.set_value(last);
+    consumer.join();
+    const ConsumerResult cons = cFut.get();
+    EXPECT_TRUE(cons.complete) << "the consumer reached the last acknowledged offset";
+    for (const int64_t a : prod.acked) EXPECT_TRUE(cons.offsets.count(a)) << "acked offset " << a << " must be consumed";
+    for (const auto& [o, n] : cons.deliveries) EXPECT_EQ(n, 1) << "offset " << o << " delivered " << n << " times";
+}
+
 // D8: AuthServerFirst for an unknown user carries the same fake salt and iteration count from every broker (derived from
 // the replicated fake-salt seed), so a client cannot tell the brokers apart or an absent user from a present one.
 TEST(AuthClusterRegression, UnknownUserSaltIsTheSameOnEveryBrokerRegression) {
@@ -1394,6 +1505,41 @@ TEST(AuthRestartAdversarialRegression, ACutOffSecurityLeaderNeverMakesTheSurvivo
         EXPECT_EQ(loginCode(t, id, "ws1"), 0) << "survivor " << id << " login after the failover";
     }
     t.node(leader).partitionFromPeersForTest(false);
+}
+
+// Issue #581 (deterministic leg): the same scenario with a 1 s election timeout, so the survivors' silence window is
+// wide by construction instead of by luck.
+TEST(AuthRestartAdversarialRegression, ASecurityLeaderCrashUnderASlowElectionNeverServesStaleAdversarialRegression) {
+    AuthTrio t("advleadercrashslow");
+    { auto base = t.cluster().configTweak;   // a slow election: the survivors are silent for ~1 s, deterministically
+      t.cluster().configTweak = [base](NodeConfig& c) { if (base) base(c); c.electionTimeoutMs = 1000; }; }
+    ServingBounds b;
+    captureBounds(t, b);
+    t.start();
+    t.bootstrapAdmin();
+    t.createUser(1, "ws1");
+    const int32_t leader = settledSecurityLeader(t.cluster());
+    ASSERT_GT(leader, 0);
+    std::vector<int> survivors;
+    for (int id : {1, 2, 3}) if (id != leader) survivors.push_back(id);
+    for (int id : survivors) ASSERT_TRUE(AuthTrio::until(30s, [&] { return t.node(id).securityServingForTest() == "Serving"; }));
+    t.node(leader).crashForTest();
+    t.stopNode(leader);
+    const auto crashed = std::chrono::steady_clock::now();
+    std::map<int, std::string> lapses;
+    bool newLeader = false;
+    while (msSince(crashed) < 20'000) {
+        for (int id : survivors) {
+            const std::string s = t.node(id).securityServingForTest();
+            if (s != "Serving" && lapses[id].empty()) lapses[id] = s + " at " + std::to_string(msSince(crashed)) + " ms";
+        }
+        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster()); newLeader = l > 0 && l != leader; }
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_TRUE(newLeader) << "a new __security leader";
+    for (int id : survivors)
+        EXPECT_TRUE(lapses[id].empty()) << "survivor " << id << " stopped serving logins during a normal failover: " << lapses[id]
+                                        << " (F=" << b.fMs << " ms, liveness=" << b.livenessMs << " ms)";
 }
 
 // A restart with no seam at all: node 3 comes back after ws1 was DISABLEd while it was down, and is hammered with ws1's

@@ -1000,6 +1000,35 @@ public:
         e.sessionEndpoint = sessionEndpoint;
         workerBinds_.push_back(std::move(e));
     }
+    /// #750: session lookups the bind duty ran for an unresolved entry (cold counter).
+    [[nodiscard]] uint64_t workerBindResolvesForTest() const noexcept { return workerBindResolves_; }
+    /// #751 test seams: bind entry `i` is Free; the entry index route (topic, partition) names (kNoBind = none);
+    /// the transport (publication slots that are not Released).
+    [[nodiscard]] bool workerBindFreeForTest(std::size_t i) const noexcept {
+        return i < workerBinds_.size() && std::holds_alternative<WorkerBindEntry::Free>(workerBinds_[i].state);
+    }
+    [[nodiscard]] uint32_t routeBindIdxForTest(int32_t topicId, int32_t partition) const noexcept {
+        const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
+        return idx == detail::FlatIndexMap::kNone ? kNoBind : routes_[idx].bindIdx;
+    }
+    /// #751 review M1 seams: the publication handle route (topic, partition) names; make it offer on the plain
+    /// publication for (its data channel, stream) exactly as the offer path does for a route without a bind entry;
+    /// the slot of `h` is Released / response-paired.
+    [[nodiscard]] transport::AeronTransport::PubHandle routePubForTest(int32_t topicId, int32_t partition) const noexcept {
+        const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
+        return idx == detail::FlatIndexMap::kNone ? transport::AeronTransport::kNoPub : routes_[idx].pub;
+    }
+    void routeUsePlainPublicationForTest(int32_t topicId, int32_t partition, int32_t stream) {
+        const uint32_t idx = routeIndex_.find(routeKey(topicId, partition));
+        if (idx == detail::FlatIndexMap::kNone) return;
+        routes_[idx].pub      = transport_.publicationHandle(routes_[idx].dataChannel, stream);
+        routes_[idx].streamId = stream;
+    }
+    [[nodiscard]] bool publicationReleasedForTest(transport::AeronTransport::PubHandle h) const noexcept {
+        return transport_.publicationReleasedForTest(h);
+    }
+    [[nodiscard]] std::size_t activePublicationSlotsForTest() const noexcept { return transport_.activePublicationSlotsForTest(); }
+    [[nodiscard]] std::size_t pubSlotCountForTest() const noexcept { return transport_.pubSlotCountForTest(); }
     /// Resolve every bind entry's session (the duty pass's first step) and report entry `i`'s index.
     [[nodiscard]] uint32_t workerBindSessionIndexForTest(std::size_t i) noexcept {
         (void)serviceWorkerBinds_();
@@ -1120,12 +1149,20 @@ private:
         /// (the ack echoes it), `attempts` the sends so far, `nextRetryNs` the duty-clock deadline of the next resend.
         struct Sent { int64_t sid; int64_t corr; uint8_t attempts; int64_t nextRetryNs; };
         struct Bound { int64_t sid; };   ///< the session id the worker ACKNOWLEDGED the bind for (WorkerBindAck)
+        /// #751: no route names this entry any more: its publication and response pair are released and the slot is
+        /// reused by the next workerBindFor_ (never matched by key, never serviced).
+        struct Free {};
         std::string sessionEndpoint;     ///< the node session this worker's binds ride (its token / sid)
         std::string dataChannel;
         int32_t     streamId = 0;
         transport::AeronTransport::PubHandle pub = transport::AeronTransport::kNoPub;
         uint32_t    sessionIndex = kNoSession;   ///< resolved (never opened) by the duty pass
-        std::variant<Unbound, Sent, Bound> state{Unbound{}};
+        /// #750: the sessionTableGen_ at which `sessionIndex` was last looked up (UINT64_MAX = never): an unresolved
+        /// entry is looked up again only when the session table or the seed's home changed since.
+        uint64_t    resolvedGen = UINT64_MAX;
+        std::variant<Unbound, Sent, Bound, Free> state{Unbound{}};
+        /// #751: routes naming this entry (setRoute ++ / -- ); the entry is released when the last one leaves.
+        uint32_t    routes = 0;
         /// The first WorkerBind of a session was accepted on this entry's pair (request publication + response
         /// subscription): the worker's response publication for it pins the subscription, so the NEXT session's bind
         /// needs a fresh pair.
@@ -1204,13 +1241,20 @@ private:
     void invalidateRouteSessions_() noexcept {
         for (PartitionRoute& r : routes_) r.sessionIndex = kNoSession;
         for (WorkerBindEntry& b : workerBinds_) b.sessionIndex = kNoSession;
+        ++sessionTableGen_;   // #750: an unresolved bind entry must look its session up again
         ++seedMoves_;   // fix round 1 (C1): the owner re-asks metadata (the no-route set changed meaning)
         // Fix round 3 (N-I1): a resume is valid only on the broker holding the session —
         // a seed that is not Connected connects FRESH (fresh TLS) at its new broker.
         seedSession().machine.abandonResumeHint();
     }
     uint64_t seedMoves_ = 0;   // duty thread only
+    /// #750: bumped whenever a session is opened (openSession_) or the seed moves (invalidateRouteSessions_): the
+    /// only events that can change what findSessionIndex_ answers.  Duty thread only.
+    uint64_t sessionTableGen_ = 0;
+    uint64_t workerBindResolves_ = 0;   // cold counter, test seam workerBindResolvesForTest()
     void releaseRoutePub_(transport::AeronTransport::PubHandle h) noexcept;  // M4
+    /// #751: a route stopped naming bind entry `idx`: at zero routes the entry's publication pair is released.
+    void unrefBind_(uint32_t idx) noexcept;
 
     // Pack (topicId, partition) into the routing-table key.  partition is masked to
     // its unsigned 32-bit value so negative partitions (never valid) can't alias.

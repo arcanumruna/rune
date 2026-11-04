@@ -836,14 +836,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
     // I2: a WorkerBindAck (87) is plaintext BY CONTRACT even on an encrypted session (it carries only the session id and
     // the bind's correlation id, no secret) and is not an ingress template (checkFrame refuses it): handled here, before
     // the sealed-session filter, and only an exact (sid, corr) match of a Sent bind changes anything.
-    if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE &&
-        rune::protocol::client::detail::getLE16(buf, 2) == rune::protocol::client::WorkerBindAck::TEMPLATE_ID) {
-        onWorkerBindAck_(buf, len);
-        return;
-    }
+    // #765: the template id is read ONCE and reused by the ack branch and the sealed-session peek below.
     if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE) {
-        const auto peekedTid = static_cast<codec::TemplateId>(
-            rune::protocol::client::detail::getLE16(buf, 2));
+        const uint16_t tid = rune::protocol::client::detail::getLE16(buf, 2);
+        if (tid == rune::protocol::client::WorkerBindAck::TEMPLATE_ID) {
+            onWorkerBindAck_(buf, len);
+            return;
+        }
+        const auto peekedTid = static_cast<codec::TemplateId>(tid);
         if (peekedTid != codec::TemplateId::ConnectResponse &&
             peekedTid != codec::TemplateId::HandshakeContinueResponse) {
             const int64_t sid = rune::protocol::client::detail::getLE64(buf, 8);
@@ -1434,6 +1434,7 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     scfg.keepaliveCorrelationId = -(static_cast<int64_t>(sessions_.size()) + 1);   // A10: Pong routing
     scfg.revivedOnDemand = true;   // Issue #481: paced by Backoff, never a revive per duty cycle
     sessions_.emplace_back(std::make_unique<Session>(this, std::move(scfg), endpoint));
+    ++sessionTableGen_;   // #750: a bind entry waiting for this endpoint's session resolves again
     Session& s = *sessions_.back();
     s.machine.useScramCache(&scramCache_);   // authentication: PBKDF2 once per verifier, not once per session
     s.machine.useSharedSecret(&secret_);
@@ -1539,6 +1540,26 @@ bool ClientAgent::sameEndpoint(std::string_view a, std::string_view b) noexcept 
     return ka == kb;
 }
 
+void ClientAgent::unrefBind_(uint32_t idx) noexcept {
+    if (idx == kNoBind || idx >= workerBinds_.size()) return;
+    WorkerBindEntry& b = workerBinds_[idx];
+    assert(b.routes > 0 && "a bind entry is released only when no route names it");
+    if (b.routes > 0 && --b.routes > 0) return;
+    // #751 review M1: a route that lost its port still offers on this slot as a plain publication (slots are keyed by
+    // (channel, stream)): keep the slot, drop only the pair.
+    bool plainUser = false;
+    for (const PartitionRoute& r : routes_) {
+        if (r.pub == b.pub) { plainUser = true; break; }
+    }
+    if (plainUser) transport_.demoteResponsePublication(b.pub);
+    else transport_.releaseResponsePublication(b.pub);
+    b.pub          = transport::AeronTransport::kNoPub;
+    b.sessionIndex = kNoSession;
+    b.resolvedGen  = UINT64_MAX;
+    b.pair         = ResponsePair::Fresh;
+    b.state        = WorkerBindEntry::Free{};   // a pending Sent dies with it: a late ack matches no entry
+}
+
 void ClientAgent::releaseRoutePub_(transport::AeronTransport::PubHandle h) noexcept {
     if (h == transport::AeronTransport::kNoPub) return;
     for (const PartitionRoute& r : routes_) {
@@ -1572,9 +1593,11 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
     if (isDefault) {
         if (idx == detail::FlatIndexMap::kNone) return false;
         const auto oldPub = routes_[idx].pub;
+        const uint32_t oldBind = routes_[idx].bindIdx;
         routeIndex_.erase(key);
         routes_[idx] = PartitionRoute{};
         freeRoutes_.push_back(idx);
+        unrefBind_(oldBind);       // #751
         releaseRoutePub_(oldPub);  // M4
         return true;
     }
@@ -1594,6 +1617,7 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
             nr.receiverId = receiverId;
             nr.dataOnNode = sameEndpoint(data, sessionEndpoint);
             nr.bindIdx    = bindFor();
+            if (nr.bindIdx != kNoBind) ++workerBinds_[nr.bindIdx].routes;   // #751
             nr.bindStream = bindStream;
             nr.bindPort   = responsePort;
             if (nr.bindIdx != kNoBind) {   // the entry's publication IS the route's (never a separate plain one)
@@ -1610,7 +1634,11 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
                 r.receiverId = receiverId;   // same endpoint, another receiver: keep the publication
                 if (bindChanged) {
                     // The worker's response port / stream moved (restart, rebalance): re-resolve the entry.
+                    const uint32_t oldBind = r.bindIdx;
                     r.bindIdx = bindFor();
+                    if (r.bindIdx != kNoBind) ++workerBinds_[r.bindIdx].routes;   // #751: ref the new entry first
+                    if (oldBind != kNoBind) { r.pub = transport::AeronTransport::kNoPub; r.streamId = -1; }   // before the unref: this route is not a plain user of the old entry's slot
+                    unrefBind_(oldBind);
                     r.bindStream = bindStream;
                     r.bindPort = responsePort;
                     if (r.bindIdx != kNoBind) {
@@ -1621,7 +1649,9 @@ bool ClientAgent::setRoute(int32_t topicId, int32_t partition, const std::string
                 return true;
             }
             const auto oldPub = r.pub;
+            const uint32_t oldBind = r.bindIdx;
             r = fresh();
+            unrefBind_(oldBind);       // #751
             releaseRoutePub_(oldPub);  // M4: the old worker publication, once unreferenced
             return true;
         }
@@ -1852,7 +1882,9 @@ void ClientAgent::setSessionResponsePort(const std::string& endpoint, int32_t po
     try {
         bool found = false;
         for (auto& [ep, known] : nodeResponsePorts_) {
-            if (sameEndpoint(ep, endpoint)) { known = port; found = true; break; }
+            // #762: a 0 port (a Metadata / Redirect that names none) never erases a learnt port; it only fills an
+            // unknown entry (recorded below as known-without-a-port).  A non-zero port always overwrites.
+            if (sameEndpoint(ep, endpoint)) { if (port != 0) known = port; found = true; break; }
         }
         if (!found) nodeResponsePorts_.emplace_back(endpoint, port);
     } catch (...) {
@@ -1900,6 +1932,7 @@ uint32_t ClientAgent::workerBindFor_(const std::string& sessionEndpoint, const s
     try {
         for (std::size_t i = 0; i < workerBinds_.size(); ++i) {
             WorkerBindEntry& b = workerBinds_[i];
+            if (std::holds_alternative<WorkerBindEntry::Free>(b.state)) continue;
             if (b.streamId == streamId && b.dataChannel == dataChannel) return static_cast<uint32_t>(i);
         }
         const auto respCh = transport::responseControlChannelFor(dataChannel, responsePort);
@@ -1908,8 +1941,15 @@ uint32_t ClientAgent::workerBindFor_(const std::string& sessionEndpoint, const s
         e.sessionEndpoint = sessionEndpoint;
         e.dataChannel     = dataChannel;
         e.streamId        = streamId;
-        e.pub             = transport_.responsePublicationHandle(dataChannel, streamId, *respCh);
+        // #751 review: the slot may already be Plain (a port-0 route created it, or a freed entry demoted it under
+        // such a route): upgrade it to a pair, never keep it plain under a bind that needs NAT-safe egress.
+        e.pub             = transport_.upgradeToResponsePublication(dataChannel, streamId, *respCh);
         if (e.pub == transport::AeronTransport::kNoPub) return kNoBind;
+        for (std::size_t i = 0; i < workerBinds_.size(); ++i) {   // #751: reuse a Free slot first
+            if (!std::holds_alternative<WorkerBindEntry::Free>(workerBinds_[i].state)) continue;
+            workerBinds_[i] = std::move(e);
+            return static_cast<uint32_t>(i);
+        }
         workerBinds_.push_back(std::move(e));
         return static_cast<uint32_t>(workerBinds_.size() - 1);
     } catch (...) {
@@ -1921,11 +1961,15 @@ int ClientAgent::serviceWorkerBinds_() noexcept {
     int sent = 0;
     if (holdWorkerBinds_) [[unlikely]] return 0;
     for (WorkerBindEntry& e : workerBinds_) {
+        if (std::holds_alternative<WorkerBindEntry::Free>(e.state)) [[unlikely]] continue;   // #751
         if (e.sessionIndex == kNoSession) {
+            if (e.resolvedGen == sessionTableGen_) continue;   // #750: nothing changed since the last miss
             e.sessionIndex = findSessionIndex_(e.sessionEndpoint);
+            e.resolvedGen  = sessionTableGen_;
+            ++workerBindResolves_;
             if (e.sessionIndex == kNoSession) continue;   // the route's first offer opens it
         }
-        if (e.sessionIndex >= sessions_.size()) { e.sessionIndex = kNoSession; continue; }
+        if (e.sessionIndex >= sessions_.size()) { e.sessionIndex = kNoSession; e.resolvedGen = UINT64_MAX; continue; }
         Session& s = *sessions_[e.sessionIndex];
         if (!s.bindRequired || s.machine.state() != session::SessionState::Connected) continue;
         const int64_t sid = s.machine.sessionId();
