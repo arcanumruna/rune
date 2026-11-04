@@ -75,7 +75,7 @@ enum class OpStatus : uint8_t {
     InvalidArgument, ///< the duty thread refused the op as malformed before sending it (payload = why)
     BrokerTooOld,    ///< checked writes: the seed broker is below kBrokerVersionCheckedWrites, so a View send was
                      ///< failed locally (nothing was sent)
-    StoredIdUnknown, ///< 13: reserved for key-0 creates (Part 06 documents and first returns it); keeps the enum without a hole
+    StoredIdUnknown, ///< 13: stored; its id is unknown (the retry fell outside the dedupe window)
     VerdictUnknown,  ///< 14: stored, but its verdicts are unknown (a View retry fell outside the broker's dedupe window)
     RecordsRejected, ///< 15: checked writes: a BATCH (a claimBatch of >= 2 records, a Tier-2 batch of >= 2, or a BatchAck of >= 2)
                      ///< was stored and judged, and one or more of its records was rejected.  value = the batch's base offset

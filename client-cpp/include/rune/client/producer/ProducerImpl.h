@@ -954,6 +954,8 @@ public:
     // bindBatchThread().  Every Tier-2 entry compares against it BEFORE touching the pool.
     /// SD11: the seed broker's version (0 = unknown: sends).  Set from the duty thread on every seed connect.
     void setBrokerVersion(int32_t v) noexcept { brokerVersion_ = v; }
+    /// Test seam: the Produce frames carry partitionKnown = 0 (the broker routes by key).
+    void setPartitionUnknownForTest(bool on) noexcept { partitionKnownWire_ = on ? 0 : 1; }
     [[nodiscard]] bool viewAcks() const noexcept { return has(cfg_.acks, Acks::View); }
     /// The reservation of ONE completion covering `n` records (a claimBatch / Tier-2 batch) on this producer.
     [[nodiscard]] uint32_t batchCompletionBytes(uint32_t n) const noexcept {
@@ -1165,8 +1167,10 @@ public:
     /// once the older batches resolve (Kafka parity).  D6: `logStartOffset` is
     /// the partition's log start carried with UnknownProducerId (-1 = not
     /// carried) — rule U decides retention (re-sequence) from loss (unknown).
+    /// Client 17: `assignedBase` = the first broker-assigned id of a key-0 batch; record i gets assignedBase + i * idStride.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
-                           int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {});
+                           int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {},
+                           uint64_t assignedBase = 0);
 
     /// Called on redirect-reconnect failure (SessionLost) and by the close paths
     /// (duty-cycle thread, or after it stopped): fails AND drops every accepted
@@ -1810,14 +1814,18 @@ private:
                                           uint64_t& h) noexcept;
     /// completeSlice_ for an Ok batch whose View ack carried a verdict trailer: a rejected record completes BrokerError
     /// (code, constraintId); a Tier-2 batch completes once, with its first rejection.
+    /// A key-0 batch (`idStride` != 0): an accepted record's aux is its id, assignedBase + i * idStride (no base: StoredIdUnknown).
     void completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset, bool tier2,
-                               int32_t recordCount, std::span<const uint8_t> verdicts) noexcept;
+                               int32_t recordCount, std::span<const uint8_t> verdicts, uint64_t assignedBase, uint32_t idStride) noexcept;
     /// Completes the handles of slice [ackStart, ackStart+ackCount): record i ->
     /// baseOffset + i (Ok), or -1 with `st` / `errorCode`.  `tier2`: the slice
     /// is one Tier-2 batch (op Tier2Batch, aux = recordCount).  Zeroes each
     /// slot so nothing completes twice.
+    /// A key-0 batch (`idStride` != 0) completing Ok: the aux of record i is assignedBase + i * idStride.
+    /// StoredIdUnknown keeps the offset when it is known.
     void completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset,
-                        OpStatus st, uint16_t errorCode, bool tier2, int32_t recordCount) noexcept;
+                        OpStatus st, uint16_t errorCode, bool tier2, int32_t recordCount,
+                        uint64_t assignedBase = 0, uint32_t idStride = 0) noexcept;
     /// acks=None: completes the just-sent builder slice with -1 ("sent, offset
     /// unknown") and reclaims it — nothing waits for a response.
     void completeSentUnacked_(PartitionState& ps) noexcept;
@@ -1915,6 +1923,7 @@ private:
         return ps.openKind != 0 && brokerVersion_ >= 1 && brokerVersion_ < rune::protocol::client::kBrokerVersionCheckedWrites;
     }
     int32_t brokerVersion_ = 0;
+    uint8_t partitionKnownWire_ = 1;
     /// Draining: every accepted record completed and the ring consumed to the
     /// closed tail.
     [[nodiscard]] bool fullyDrained_() const noexcept;

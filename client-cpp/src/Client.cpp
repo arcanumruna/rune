@@ -3749,7 +3749,7 @@ int Client::routeBufferedAcks_() {
     bool notLeader = false;
     for (const auto& a : acks) {
         producerHub_.onProduceResponse(a.correlationId, a.baseOffset, a.errorCode, a.logStartOffset, a.hasVerdicts,
-                                       agent_.verdictBytes(a));
+                                       agent_.verdictBytes(a), a.assignedBase);
         notLeader |= a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
     }
     agent_.clearProduceAcks();

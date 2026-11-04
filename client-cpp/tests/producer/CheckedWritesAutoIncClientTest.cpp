@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <poll.h>
 #include <random>
@@ -411,4 +412,204 @@ TEST(CheckedWritesAutoIncClientRegression, SchemaKeyFeaturesRoundTripToTheResult
     ASSERT_TRUE(result.hasKeyFeatures);
     EXPECT_EQ(result.keyFeatures, f);
     EXPECT_EQ(result.descriptorBlob, r.gw.schemaBlob);
+}
+
+// ---- Task 6: the ack of a key-0 batch: assignedBase + i * stride, StoredIdUnknown ----
+
+namespace {
+namespace ackhandle = rune::client::producer::ackhandle;
+constexpr uint16_t kViolation = 55;
+constexpr uint32_t kCid       = 0x00070001;
+
+// A bare impl whose completions are captured with their aux; the broker's answers are injected.
+struct AckRig {
+    ProducerImpl                              impl;
+    std::map<rc::Token, rc::Completion>       done;
+    std::map<rc::Token, int>                  times;
+    std::vector<int64_t>                      corrs;
+    ProducerImpl::SendFn sink = [this](int32_t, int32_t, int32_t, const uint8_t* b, std::size_t n) {
+        const auto v = rc::codec::decodeProduce(b, n);
+        if (!v) return false;
+        corrs.push_back(v->correlationId);
+        return true;
+    };
+    static void deliver(void* ctx, rc::CqRef, const rc::Completion& c, std::span<const uint8_t>) noexcept {
+        auto* self = static_cast<AckRig*>(ctx);
+        self->done[c.token] = c;
+        ++self->times[c.token];
+    }
+    explicit AckRig(Acks acks) : impl(cfgOf(acks), 1 << 16) {
+        ProducerImpl::Hooks h;
+        h.ctx       = this;
+        h.cqDeliver = &AckRig::deliver;
+        impl.setHooks(h);
+        impl.setBrokerVersion(rpc::kBrokerVersionCheckedWrites);
+    }
+    // n records of one batch: key-0 creates with stride, else updates (View) / upserts.
+    void send(int n, uint32_t stride, WriteIntent intent = WriteIntent::Insert) {
+        for (int i = 0; i < n; ++i) {
+            const Key key = stride != 0 ? keyZero() : Key(uint64_t(i + 1));
+            ASSERT_EQ(impl.trySubmit(3, 0, key, kVal, ackhandle::forCq(0, rc::Token(i + 1)), nullptr, rc::intentBits(intent), stride),
+                      SendResult::Ok);
+        }
+        pump();
+    }
+    void pump() {
+        while (impl.drainRing(kNow) != 0) {}
+        (void)impl.flushBatches(kNow, 42, sink);
+    }
+    void answer(int16_t ec, int64_t base, uint64_t assignedBase, std::span<const uint8_t> verdicts = {}) {
+        impl.onProduceResponse(corrs.back(), base, ec, -1, !verdicts.empty(), verdicts, assignedBase);
+    }
+};
+}  // namespace
+
+TEST(CheckedWritesAutoIncClient, EachRecordGetsBasePlusIStride) {
+    AckRig r(Acks::All | Acks::View);
+    r.send(5, 4);
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.answer(0, 100, 9);
+    for (rc::Token t = 1; t <= 5; ++t) {
+        ASSERT_EQ(r.times[t], 1) << t;
+        EXPECT_EQ(r.done[t].status, OpStatus::Ok);
+        EXPECT_EQ(r.done[t].value, 100 + int64_t(t - 1));
+        EXPECT_EQ(rc::assignedKeyOf(r.done[t]), 9u + 4u * (t - 1));
+    }
+}
+
+TEST(CheckedWritesAutoIncClient, RejectedCreateHasNoId) {
+    AckRig r(Acks::All | Acks::View);
+    r.send(5, 4);
+    uint8_t v[8] = {1, 0, kViolation, 0, 0x01, 0x00, 0x07, 0x00};   // record 1: ConstraintViolation, 0x00070001
+    static_assert(kCid == 0x00070001);
+    r.answer(0, 100, 9, v);
+    for (rc::Token t = 1; t <= 5; ++t) {
+        ASSERT_EQ(r.times[t], 1) << t;
+        if (t == 2) {
+            EXPECT_EQ(r.done[t].status, OpStatus::BrokerError);
+            EXPECT_EQ(r.done[t].errorCode, kViolation);
+            EXPECT_EQ(rc::constraintIdOf(r.done[t]), kCid);
+            EXPECT_EQ(rc::assignedKeyOf(r.done[t]), 0u);
+        } else {
+            EXPECT_EQ(r.done[t].status, OpStatus::Ok) << t;
+            EXPECT_EQ(rc::assignedKeyOf(r.done[t]), 9u + 4u * (t - 1)) << t;
+        }
+    }
+}
+
+TEST(CheckedWritesAutoIncClientRegression, LostAckRetryCompletesOnceWithTheOriginalIdsRegression) {
+    AckRig r(Acks::All | Acks::View);
+    r.send(3, 4);
+    ASSERT_EQ(r.corrs.size(), 1u);   // its ack is lost
+    (void)r.impl.retransmitStalled(kNow + 5'000'000'000, r.sink);
+    ASSERT_EQ(r.corrs.size(), 2u);
+    r.answer(0, 100, 9);
+    for (rc::Token t = 1; t <= 3; ++t) {
+        EXPECT_EQ(r.times[t], 1) << t;
+        EXPECT_EQ(r.done[t].status, OpStatus::Ok);
+        EXPECT_EQ(rc::assignedKeyOf(r.done[t]), 9u + 4u * (t - 1));
+    }
+}
+
+struct UnknownCase {
+    const char* name;
+    Acks        acks;
+    int16_t     ec;
+    int64_t     base;
+    uint64_t    assignedBase;
+};
+class CheckedWritesAutoIncClientUnknown : public ::testing::TestWithParam<UnknownCase> {};
+
+TEST_P(CheckedWritesAutoIncClientUnknown, StoredIdUnknownCases) {
+    const UnknownCase& c = GetParam();
+    AckRig r(c.acks);
+    r.send(3, 4);
+    r.answer(c.ec, c.base, c.assignedBase);
+    for (rc::Token t = 1; t <= 3; ++t) {
+        ASSERT_EQ(r.times[t], 1) << t;
+        EXPECT_EQ(r.done[t].status, OpStatus::StoredIdUnknown);
+        EXPECT_EQ(r.done[t].errorCode, c.ec == 0 ? 0 : 21);
+        EXPECT_EQ(rc::assignedKeyOf(r.done[t]), 0u);
+    }
+}
+INSTANTIATE_TEST_SUITE_P(CheckedWritesAutoIncClient, CheckedWritesAutoIncClientUnknown,
+    ::testing::Values(
+        UnknownCase{"DuplicateSequenceOnView", Acks::All | Acks::View, int16_t(rpc::ErrorCode::DuplicateSequence), -1, 9},
+        UnknownCase{"KnownOldOnAll", Acks::All, 0, -1, 9},
+        UnknownCase{"NoAssignedBase", Acks::All, 0, 100, 0}),
+    [](const ::testing::TestParamInfo<UnknownCase>& i) { return std::string(i.param.name); });
+
+TEST(CheckedWritesAutoIncClientRegression, NonKeyZeroBatchesKeepTheirMappingRegression) {
+    {   // an update batch answered DuplicateSequence stays VerdictUnknown
+        AckRig r(Acks::All | Acks::View);
+        r.send(2, 0, WriteIntent::Update);
+        r.answer(int16_t(rpc::ErrorCode::DuplicateSequence), -1, 0);
+        for (rc::Token t = 1; t <= 2; ++t) {
+            EXPECT_EQ(r.done[t].status, OpStatus::VerdictUnknown);
+            EXPECT_EQ(rc::assignedKeyOf(r.done[t]), 0u);
+        }
+    }
+    {   // OK -1 on an All producer stays Ok -1
+        AckRig r(Acks::All);
+        r.send(2, 0, WriteIntent::Upsert);
+        r.answer(0, -1, 0);
+        for (rc::Token t = 1; t <= 2; ++t) {
+            EXPECT_EQ(r.done[t].status, OpStatus::Ok);
+            EXPECT_EQ(r.done[t].value, -1);
+            EXPECT_EQ(rc::assignedKeyOf(r.done[t]), 0u);
+        }
+    }
+}
+
+TEST(CheckedWritesAutoIncClient, TestKnobsAreOffByDefault) {
+    const auto knobCfg = [](int32_t in, int32_t eg) {
+        rc::ClientConfig c = invokerCfg(in, eg);
+        rc::TopicSpec    ts;
+        ts.name           = "t";
+        ts.topicId        = 1;
+        ts.partitionCount = 1;
+        c.topics.push_back(ts);
+        return c;
+    };
+    const auto produceOne = [](Rig& r, test_support::TestCq& cq, rc::Producer& p) {
+        return cq.send(p, r.client->topic("t"), Key(uint64_t{7}), std::span<const uint8_t>(kVal));
+    };
+    rc::ProducerConfig pc = cfgOf(Acks::Leader);
+    pc.produceTimeoutMs   = 50;
+    {   // defaults: partitionKnown = 1 and every ack is delivered
+        Rig r(knobCfg(4655, 4656));
+        r.connect();
+        ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));
+        rc::Producer p = r.client->producer(pc);
+        test_support::TestCq cq(*r.client);
+        auto f = produceOne(r, cq, p);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+        ASSERT_FALSE(r.gw.produced.empty());
+        EXPECT_EQ(r.gw.produced[0].partitionKnown, 1);
+        EXPECT_TRUE(f.ok()) << f.describe();
+    }
+    {
+        Rig r(knobCfg(4657, 4658));
+        r.connect();
+        ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));
+        r.client->producePartitionUnknownForTest(true);
+        rc::Producer p = r.client->producer(pc);
+        test_support::TestCq cq(*r.client);
+        auto f = produceOne(r, cq, p);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+        ASSERT_FALSE(r.gw.produced.empty());
+        EXPECT_EQ(r.gw.produced[0].partitionKnown, 0);
+    }
+    {   // the first ack is discarded; the retry's ack completes the record once
+        Rig r(knobCfg(4659, 4660));
+        r.connect();
+        ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests > 0; }));
+        r.client->dropProduceAcksForTest(1);
+        rc::Producer p = r.client->producer(pc);
+        test_support::TestCq cq(*r.client);
+        auto f = produceOne(r, cq, p);
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+        EXPECT_TRUE(f.ok()) << f.describe();
+        EXPECT_GE(r.gw.produced.size(), 2u);
+    }
 }

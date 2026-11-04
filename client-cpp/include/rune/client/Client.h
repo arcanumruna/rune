@@ -615,6 +615,9 @@ public:
     /// Test hook: fill the agent command ring so the next registration finds it full.
     /// Issue #60: how many Rejected-route sweeps ran (edge-triggered: one per Rejected edge / refused routing).
     [[nodiscard]] uint64_t routedBrokerSweeps() const noexcept { return routedBrokerSweeps_; }
+    /// Test seams: producers send partitionKnown = 0; the next `n` ProduceResponses are discarded.
+    void producePartitionUnknownForTest(bool on) noexcept { producerHub_.setPartitionUnknownForTest(on); }
+    void dropProduceAcksForTest(int n) noexcept { agent_.dropProduceAcksForTest(n); }
     [[nodiscard]] uint32_t rejectedLeaderSessionsForTest() const noexcept { return agent_.rejectedLeaderSessions(); }
     [[nodiscard]] std::string_view testAgentSecret() const noexcept { return agent_.secretForTest().view(); }
     /// The command ring's record area (not the position trailer): a consumed record must be zeroed.

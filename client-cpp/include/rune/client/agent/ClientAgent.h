@@ -673,6 +673,7 @@ public:
         bool     hasVerdicts   = false;   ///< client 17: a View ack's trailer follows (verdictCount entries at verdictOffset)
         uint16_t verdictCount  = 0;
         uint32_t verdictOffset = 0;       ///< into the agent's verdict bytes (verdictBytes())
+        uint64_t assignedBase  = 0;       ///< client 17: the first broker-assigned id of a key-0 batch (0 = none)
     };
     [[nodiscard]] std::span<const ProduceAck> produceAcks() const noexcept {
         return {produceAcks_.data(), produceAcks_.size()};
@@ -682,6 +683,8 @@ public:
         return {verdictBytes_.data() + a.verdictOffset, std::size_t{a.verdictCount} * 8};
     }
     void clearProduceAcks() noexcept { produceAcks_.clear(); verdictBytes_.clear(); }
+    /// Test seam: discards the next `n` ProduceResponses (a lost ack).
+    void dropProduceAcksForTest(int n) noexcept { dropProduceAcks_ = n; }
     /// Times the trailer bytes had to grow (a duty cycle with more verdicts than ever before).
     [[nodiscard]] uint64_t verdictArenaGrowths() const noexcept { return verdictArenaGrowths_; }
 
@@ -1216,6 +1219,7 @@ private:
     bool                        rejectedRouteHit_ = false;   // issue #60: a produce offer met a Rejected leader
     std::vector<PartitionRoute> routes_;
     std::vector<uint32_t>       freeRoutes_;
+    int                         dropProduceAcks_ = 0;
     std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears
     std::vector<uint8_t>        verdictBytes_; // the trailers of produceAcks_, cleared with them; grows only for a larger duty cycle
     uint64_t                    verdictArenaGrowths_ = 0;

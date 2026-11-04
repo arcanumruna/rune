@@ -1142,6 +1142,7 @@ if(BUILD_TESTING)
         tests/client/TypedTopicRoutingRegressionTest.cpp   # Phase 2b C
         tests/client/KeyRoutingRegressionTest.cpp          # Phase 2b C: Key == protocol hash
         tests/client/CheckedWritesTypedTopicTest.cpp       # checked writes: TypedTopic ops + WriteResult
+        tests/client/CheckedWritesAutoIncTypedTest.cpp     # checked writes Part 06: WriteResult::key()
         tests/support/AllocCounter.cpp                     # zero-alloc send check
     )
     add_dependencies(rune_open_topic_tests generate_characters_header)

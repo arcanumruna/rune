@@ -70,6 +70,7 @@ struct InvokerGateway {
         int32_t baseSequence;
         int     endpoint;  // index of the endpoint that received it (0 = node)
         int16_t producerEpoch = -1;  // the frame's producer epoch (Task 16 fix round 1)
+        uint8_t partitionKnown = 1;  // the frame's partitionKnown
     };
     struct Endpoint {
         std::string channel;
@@ -2034,6 +2035,7 @@ private:
             Produced pr{pv->topicId, pv->partition, pv->sessionId, pv->correlationId,
                         r.recordCount(), r.baseSequence(), endpoint};
             pr.producerEpoch = pv->producerEpoch;
+            pr.partitionKnown = pv->partitionKnown;
             produced.push_back(pr);
             if (keepValues) {
                 auto& vs = values[pv->partition];

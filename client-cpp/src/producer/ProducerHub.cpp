@@ -48,6 +48,7 @@ void ProducerHub::add(ProducerImpl* impl)
     if (nextBase_.size() <= ord) nextBase_.resize(ord + 1, 0);
     impl->setOrdinal(ord, nextBase_[ord]);  // F2: past every sequence a previous incarnation used
     impl->setBrokerVersion(brokerVersion_);
+    impl->setPartitionUnknownForTest(partitionUnknownForTest_);
     if (nextCoordSeq_.size() <= ord) nextCoordSeq_.resize(ord + 1, 0);
     if (coordSink_.offer != nullptr) {   // Phase 2b F: after the ordinal
         const bool coordinated = impl->enableCoordinator(coordSink_, nextCoordSeq_[ord]);
@@ -85,13 +86,14 @@ void ProducerHub::remove(ProducerImpl* impl) noexcept
 // ---------------------------------------------------------------------------
 
 void ProducerHub::onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
-                                    int64_t logStartOffset, bool hasVerdicts, std::span<const uint8_t> verdicts) {
+                                    int64_t logStartOffset, bool hasVerdicts, std::span<const uint8_t> verdicts,
+                                    uint64_t assignedBase) {
     // O(1): the batch id names its producer.  Matching is by correlation id only,
     // never by the publisher the response arrived on.
     if (!batchcorr::isBatch(correlationId)) return;       // txn / non-producer id
     const uint32_t o = batchcorr::ordinal(correlationId);
     if (o < producers_.size() && producers_[o] != nullptr) {
-        producers_[o]->onProduceResponse(correlationId, baseOffset, errorCode, logStartOffset, hasVerdicts, verdicts);
+        producers_[o]->onProduceResponse(correlationId, baseOffset, errorCode, logStartOffset, hasVerdicts, verdicts, assignedBase);
     }
 }
 
