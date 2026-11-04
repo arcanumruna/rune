@@ -4517,10 +4517,14 @@ void ProducerImpl::onInitExpired_(CoordinatorLink::Slot& s) noexcept {
     }
 }
 
-void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noexcept {
+void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& wire, int64_t nowNs) noexcept {
     ++coordAnswersSeen_;
-    lastCoordCorrId_ = a.corrId;
+    lastCoordCorrId_ = wire.corrId;
     if (!coord_) return;
+    // #737/#738: the hub's code is the worst over ALL results; the verdict is the worst over the entries this request
+    // named (an omitted one an error, an unrequested one ignored).
+    CoordAnswer a = wire;
+    a.errorCode   = coord_->requestedWorst(wire);
     CoordinatorLink::Slot* s = coord_->onAnswer(a, nowNs);
     if (s == nullptr) return;
     // The answer's slot is released only after its machine handled it (and any completion it delivered): a

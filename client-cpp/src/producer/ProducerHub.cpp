@@ -102,23 +102,11 @@ namespace rpc = rune::protocol::client;
 /// ok) so a 27 never masks a non-retriable error.  Returns the code that earned it.
 template <class Results>
 int16_t worstResult(ReqKind kind, const Results& results) noexcept {
-    auto rank = [](Verdict v) {
-        switch (v) {
-        case Verdict::Fenced:     return 5;
-        case Verdict::Fatal:      return 4;
-        case Verdict::Abortable:
-        case Verdict::Reject:     return 3;
-        case Verdict::Rediscover: return 2;
-        case Verdict::Retry:      return 1;
-        case Verdict::Ok:         return 0;
-        }
-        return 0;
-    };
     int16_t worst = 0;
     int     best  = 0;
     for (std::size_t i = 0; i < results.size(); ++i) {
         const int16_t code = results[i].errorCode;
-        const int     r    = rank(CoordinatorLink::classify(kind, code));
+        const int     r    = CoordinatorLink::rank(kind, code);
         if (r > best) { best = r; worst = code; }
     }
     return worst;
