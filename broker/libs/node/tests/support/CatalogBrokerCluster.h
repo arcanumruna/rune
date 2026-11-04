@@ -110,6 +110,7 @@ inline NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p
     cfg.workerIngressBaseStreamId = kIngressStream;
     cfg.gatewayMinIsr = nodes == 1 ? 1 : 2;
     cfg.aeronTermBufferBytes = 1 << 20;
+    cfg.cleanerDedupeBufferBytes = 1 << 20;   // the 128 MiB default made each TSan cleaner pass/restart minutes-long
     cfg.workerCoreBase = -1;   // tests never auto-pin busy-spinning workers (ctest -j)
     for (int i = 0; i < nodes; ++i) {
         PeerConfig pc;

@@ -41,9 +41,9 @@ RUN case "${TARGETARCH}" in \
     && cmake --version
 
 RUN conan profile detect --force
-# aeron/1.51.0-rune.1: 1.51.0 + the upstream unavailable-image refcount fix (recipe in conan/aeron).
+# aeron/1.51.0-rune.2: 1.51.0 + fork fixes (recipe in conan/aeron).
 COPY --from=aeron-recipe . /aeron-recipe
-RUN conan export /aeron-recipe --version=1.51.0-rune.1
+RUN conan export /aeron-recipe --version=1.51.0-rune.2
 
 # ── Broker build ──────────────────────────────────────────────────────────────
 FROM toolchain AS builder

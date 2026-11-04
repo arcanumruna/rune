@@ -361,6 +361,9 @@ struct NodeConfig {
     // TEST-ONLY (ISR v3 Step 10): the metadata feature level this controller supports (0 = kBase: no storage tracking,
     // no NodeStorageRecord - the old-cluster path).  -1 (default): the binary's own level.
     int16_t testSupportedFeatureLevel = -1;
+    // TEST-ONLY (checked writes Part 05): the brokerVersion the OK ConnectResponse advertises when above 0 (0 = kBrokerVersion); lets a
+    // test present an older broker to the client's capability gates.
+    int32_t testAdvertisedBrokerVersion = 0;
     // TEST-ONLY (checked writes Part 02): SchemaFanout keeps every WriteSpecUpdate undelivered for this many control passes
     // after it is posted, to prove a typed topic is not built before its spec reaches every worker.  0 = off.
     uint32_t testHoldWriteSpecPasses = 0;
@@ -529,6 +532,12 @@ struct NodeConfig {
     // (replaced-disk) node vote (read by the storage gate, Step 9).
     bool storageRecoveryVote = false;
 
+    // RUNE_VIEW_BACKUP (default on): before a materialized view is rebuilt over a persisted checkpoint (unreadable, ahead of the
+    // log, legacy, ...), that checkpoint file is moved into <data>/__view_snapshots/backup/.  Off = the file is removed instead.
+    bool viewBackup = true;
+    // RUNE_VIEW_BACKUPS_KEPT (default 3, 1..1000): backups kept per (view, partition); older ones are pruned.
+    int32_t viewBackupsKept = 3;
+
     // Re-review 2026-10-04 MEDIUM-B (RUNE_UNCLEAN_CONSENSUS_ELECTION, default
     // false): operator escape hatch for the consensus candidacy gate.  Normally
     // a node votes only for a candidate in the newest durable __cluster_metadata
@@ -580,6 +589,8 @@ struct NodeConfig {
     std::string clusterKeyFile;
     std::string clusterKeyFileNext;
     int64_t     authTimeoutMs    = 10'000;
+    /// The cap of every positive-ms duration knob (30 days): a ms value times 1'000'000 (ns) never overflows an int64.
+    static constexpr int64_t kMaxDurationMs = 30LL * 24 * 3600 * 1000;
     // Namespaces Task 9 (spec §11): RUNE_ANONYMOUS_READ=1|true lets an authenticating broker serve a client that never
     // starts SCRAM as the read-only anonymous principal of `default` (schema / catalog reads only).  Off by default.
     bool        anonymousRead    = false;
@@ -1057,6 +1068,10 @@ struct NodeConfig {
     /// RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND — the log cleaner's shared I/O throttle (bytes/s across all cleaner work;
     /// Kafka log.cleaner.io.max.bytes.per.second). Absent/empty = -1 = unlimited.
     int64_t cleanerIoMaxBytesPerSecond = -1;
+
+    /// The log cleaner's dedupe map budget (Kafka log.cleaner.dedupe.buffer.size). -1 = 128 MiB. Tests set it small:
+    /// every cleaner pass and broker start rewrites the whole map, which a sanitizer build makes minutes-slow.
+    int64_t cleanerDedupeBufferBytes = -1;
 
     // PSM fix round 1 (I1, Kafka producer.id.expiration.ms): compaction keeps the
     // last batch METADATA of every producer active within this window (a

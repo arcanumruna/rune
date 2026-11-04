@@ -423,15 +423,14 @@ private:
     }
 
     /// The source rules of CreateView / AlterView ("view validity", Spec §5.1) - EVERY one that applies.  The specific
-    /// codes are production contract AdminWorker.cpp:1065 / :1068 / :1070 (viewDef_: 41 / 33 / 37) and the untyped-source rule
+    /// codes are production contract AdminWorker.cpp:1065 / :1068 / :1070 (viewDef_: 41 / 33) and the untyped-source rule
     /// (an untyped topic has no schema to read: 33).  A source is a live typed TOPIC; a view's sink carries no change
-    /// events (41); a persisted view over a transient source is refused (37).
+    /// events (41). 37 is never sent (checked writes Part 10).
     void sourceRefusals_(const Request& r, std::vector<Code>& out) const {
         const auto it = live_.find(r.source);
         if (it == live_.end()) { out.push_back(Code::ViewSourceNotFound); return; }
         if (it->second.isView) { out.push_back(Code::ViewSourceIsView); return; }
         if (!it->second.typed) out.push_back(Code::ViewSourceNotFound);
-        if (it->second.transient && !r.transient) out.push_back(Code::ViewSourceTransient);
     }
 
     /// EVERY refusal that applies to `r` (empty = accepted).  Codes: Spec §9 "name collision -> TopicExists (25)", "the

@@ -325,3 +325,35 @@ TEST(SubscriberHubAdversarialRegression, AFrameOpeningWithABrokerLayoutMarkerMov
     EXPECT_EQ(b.impl->nextOffset, 3) << "never stuck before the marker";
     EXPECT_EQ(b.hub.malformedBatches(), 0u);
 }
+
+// ---- #798: the checked-writes control records (types 16..19: reservation, verdict marker, constraint-set change, txn judge)
+// are written by the broker as control batches with producerId -1 and a 2-byte type key.  Neither client reader may deliver one
+// as data: the subscriber hub consumes its offset, and a RecordsView (the DataCodec decode of a fetched span) never visits it.
+namespace {
+std::vector<uint8_t> checkedWritesControl(int64_t base, int16_t type) {
+    rune::protocol::RecordBatchBuilder b(base, 1'000'000);
+    b.setControl(true);
+    const char key[2] = {static_cast<char>(type & 0xFF), static_cast<char>((type >> 8) & 0xFF)};
+    const char val[6] = {1, 0, 0, 0, 0, 0};
+    b.append(std::string_view(key, 2), std::string_view(val, 6), 1'000'000);
+    return b.build();
+}
+}   // namespace
+
+TEST(SubscriberHubRecordsRegression, CheckedWritesControlTypes16To19AreConsumedNeverDeliveredRegression) {
+    int cases = 0;
+    for (const int16_t type : {int16_t{16}, int16_t{17}, int16_t{18}, int16_t{19}}) {
+        SCOPED_TRACE("control type " + std::to_string(type));
+        const auto frame = concat({batchAt(0, 2), checkedWritesControl(2, type), batchAt(3, 2)});
+        Bound b(kTopic, 1100 + type, 1200 + type);
+        const auto view = b.view(frame, 0);
+        EXPECT_EQ(visited(view), 4u) << "the RecordsView decode visits the 4 data records, never the control record";
+        b.hub.onRecords(view);
+        EXPECT_EQ(b.delivered, (std::vector<int64_t>{0, 1, 3, 4})) << "no control record is delivered";
+        EXPECT_EQ(b.impl->nextOffset, 5) << "the control record's offset is consumed";
+        EXPECT_EQ(b.hub.controlBatchesSkipped(), 1u);
+        EXPECT_EQ(b.hub.malformedBatches(), 0u);
+        ++cases;
+    }
+    EXPECT_EQ(cases, 4);
+}

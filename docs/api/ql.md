@@ -36,6 +36,7 @@ transient topic ... ;
 - A key field is an integer type or `string(N)` with `N` at most 16; any other key field type is refused with
   `InvalidSchema` (23).
 - `transient topic` replicates in memory and never writes to disk. Persistence is fixed at creation.
+- A view (created from code) may read a keyed transient topic, persisted or transient; a persisted one keeps its checkpointed rows across a restart (see SELF-HOSTING.md, Transient topics).
 - `replicas` is the replication factor, `0` to `32767`; `0` or omitted means every broker. It must be at most the
   broker count and at least `RUNE_MIN_ISR`.
 - Topic names: 1 to 249 bytes of ASCII letters, digits, `.`, `_` and `-`, not `.` or `..`, not starting with `__`. Two

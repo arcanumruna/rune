@@ -94,6 +94,9 @@ struct SimLog {
     struct B { std::vector<uint8_t> bytes; int64_t base; int32_t count; };
     std::vector<B> batches;
     int64_t end = 0;
+    int64_t start = 0;   ///< the log start: retention has deleted everything below it
+    /// Retention: the log now starts at `s` (a batch boundary).
+    void trimTo(int64_t s) { start = s; }
     /// Appends `n` upserts for keys firstKey .. firstKey+n-1 as ONE batch.
     void append(int64_t firstKey, int n, int32_t hpMul = 10) {
         rune::protocol::RecordBatchBuilder b(end, 0);
@@ -107,6 +110,7 @@ struct SimLog {
         end += n;
     }
     rune::storage::LogReadView read(int64_t from, int64_t /*to*/) const {
+        if (from < start) return {};
         for (const B& b : batches)
             if (from >= b.base && from < b.base + b.count)
                 return rune::storage::LogReadView{b.bytes.data(), b.bytes.size(), b.base, b.base + b.count};
@@ -173,7 +177,8 @@ struct Rig {
     void release(uint16_t slot, uint32_t ns) { vs.onNsSlotFreed(slot, ns); limits_.erase(slot); }
     int drive(int32_t srcTopic, uint16_t slot, uint32_t ns, const SimLog& log, uint64_t gen = 0) {
         auto rd = [&](int64_t f, int64_t t) { return log.read(f, t); };
-        const int n = vs.driveFolds(srcTopic, 0, rd, log.end, rv::kNoSkip, 0, nullptr, gen, true, NsTag{slot, ns});
+        const int n = vs.driveFolds(srcTopic, 0, rd, log.end, rv::kNoSkip, 0, nullptr, gen, true, NsTag{slot, ns},
+                                nullptr, nullptr, SourceLogBounds{log.start, log.end});
         settle();
         return n;
     }
@@ -307,6 +312,45 @@ TEST(NsViewMemoryRegression, ResumeCatchesUpEqualsRecomputeRegression) {
     EXPECT_EQ(checked, static_cast<int>(R) + 1 + 7);
 }
 
+// #726: a view paused at P whose source log retention then trimmed past P holds rows folded from records that no longer
+// exist.  It must not resume by silently skipping them: it is discarded (BelowLogStart) and rebuilt from the log start.
+TEST(NsViewMemoryRegression, PausedViewWhoseCursorFallsBelowLogStartIsBackedUpAndRebuiltRegression) {
+    Rig rig(/*limit chunks*/ 1);
+    const int64_t R = rig.rowsPerChunk;
+    SimLog log;
+    log.append(1, static_cast<int>(R) + 1);        // crosses the limit
+    rig.driveA(log);
+    rig.driveA(log);                               // pauses at end-of-batch-1
+    const int64_t pausedAt = rig.vs.instanceServeState(kViewA, 0).pausedOffset;
+    ASSERT_EQ(pausedAt, log.end);
+    log.append(1000, 7);                           // appended while paused ...
+    log.append(2000, 2);
+    log.trimTo(pausedAt + 7);                      // ... and retention deleted everything before the last batch
+    rig.assign(kSlotA, kNsA, 100 * rig.chunkB);    // the limit is raised
+    for (int i = 0; i < 16 && rig.vs.instanceServeState(kViewA, 0).foldCursor != log.end; ++i) rig.driveA(log);
+
+    EXPECT_EQ(rig.vs.foldCounters(kViewA, 0)->checkpointDiscards, 1u) << "exactly one BelowLogStart discard";
+    EXPECT_EQ(rig.vs.instanceServeState(kViewA, 0).foldCursor, log.end);
+    WorkerViewSet::RowStatus rs{};
+    EXPECT_EQ(rig.row(kViewA, 1, rs), nullptr) << "a key from the trimmed range is gone";
+    EXPECT_EQ(rs, WorkerViewSet::RowStatus::NotFound);
+    EXPECT_EQ(rig.row(kViewA, 1000, rs), nullptr);
+    Rig ref(/*unlimited*/ 0);
+    SimLog all;
+    all.end = all.start = pausedAt + 7;
+    all.append(2000, 2);
+    ref.driveA(all);
+    ref.driveA(all);
+    for (const int64_t k : {int64_t{2000}, int64_t{2001}}) {
+        WorkerViewSet::RowStatus a{}, b{};
+        const uint8_t* ra = rig.row(kViewA, k, a);
+        const uint8_t* rb = ref.row(kViewA, k, b);
+        ASSERT_NE(ra, nullptr) << "key " << k;
+        ASSERT_NE(rb, nullptr);
+        EXPECT_EQ(std::memcmp(ra, rb, rig.rowLen), 0) << "key " << k;
+    }
+}
+
 // A single fold pass covers one batch: at the limit, one batch of N new keys overshoots by at most its own chunks and
 // the batch after it is NOT folded (the view pauses first).
 TEST(NsViewMemoryRegression, OvershootAtMostOneBatchRegression) {
@@ -382,4 +426,33 @@ TEST(NsViewMemoryRegression, ReusedSlotStartsFromZeroRegression) {
     rig.driveA(log);
     EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), 0u);
     EXPECT_GE(rig.vs.nsSlotMismatchesForTest(), before);
+}
+
+// Boot slots are applied to a worker before its view set is attached: attaching must replay them, so a view in a
+// non-default namespace is charged after a restart.
+// Mutation: drop the replay loop in Worker::setViewSet -> this test fails.
+TEST(NsViewMemoryRegression, SetViewSetReplaysBootSlotsRegression) {
+    const rune::codec::Descriptor src = charSource();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rv::compileView(hpPlan(kSrcA), srcs, kViewA).value();
+    ViewSnapshotChannel channel;
+    WorkerViewSet vs{channel, tmpDir("rune-ns-viewmem-replay")};
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    rune::protocol::NamespaceLimits l;
+    l.maxViewMemoryBytes = 1 << 20;
+    Worker w(/*workerId=*/0);
+    w.configureNsSlots(8);
+    w.applyNsSlotAssignDirect(3, 7, l);
+    w.setViewSet(&vs);
+
+    EXPECT_EQ(vs.nsSlotCapacity(), 8u);
+    EXPECT_EQ(vs.nsSlotsForTest().nsIdAt(3), 7u);
+    EXPECT_EQ(vs.nsSlotsForTest().limits(3), l);
+
+    SimLog log;
+    log.append(1, 4);
+    auto rd = [&](int64_t f, int64_t t) { return log.read(f, t); };
+    vs.driveFolds(kSrcA, 0, rd, log.end, rv::kNoSkip, 0, nullptr, 0, true, NsTag{3, 7});
+    EXPECT_GT(vs.nsViewMemBytes(3), 0u);
 }

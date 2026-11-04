@@ -1242,6 +1242,131 @@ TEST(CompactionCleanerAgent, SwapRingFullDoesNotLoseCompaction) {
 }
 
 // ===========================================================================
+// #840: a log whose cleaner met a damaged batch is uncleanable until restart.
+// The LogCleaner is per pass, so its sticky state ends with the pass: the agent must keep the log out of selection,
+// never advance (or persist) the clean watermark past the damage, and try it once more after a restart (a fresh agent).
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, ADamagedLogIsNeverSelectedAgainUntilRestartRegression) {
+    auto dir = cp6TempDir("cp840_uncleanable");
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(1840, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->becomeLeader(1, {1});
+    for (int v = 0; v < 120; ++v) log.append(cp6Batch(v, "k" + std::to_string(v % 5), "v" + std::to_string(v)), v);
+    replica->onLeaderLogAppended();
+    ASSERT_GE(log.segmentBaseOffsets().size(), 4u);
+
+    // CRC-damage the last batch of the second segment (sealed).
+    std::vector<fs::path> logs;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (e.path().extension() == ".log") logs.push_back(e.path());
+    std::sort(logs.begin(), logs.end());
+    ASSERT_GE(logs.size(), 3u);
+    {
+        const auto sz = fs::file_size(logs[1]);
+        std::fstream f(logs[1], std::ios::in | std::ios::out | std::ios::binary);
+        char c = 0;
+        f.seekg(static_cast<std::streamoff>(sz) - 1);
+        f.read(&c, 1);
+        c = static_cast<char>(c ^ 0x5A);
+        f.seekp(static_cast<std::streamoff>(sz) - 1);
+        f.write(&c, 1);
+    }
+
+    rune::node::ReplicaRegistry registry;
+    PartitionReplica* raw = replica.get();
+    registry.add(1840, 0, std::move(replica));
+    {
+        rune::node::LogCleanerAgent agent(&registry, /*cycleBudgetBytes=*/0);
+        int64_t now = 1'000'000;
+        agent.doWork(now);
+        ASSERT_EQ(agent.passesStartedForTest(), 1u) << "the first cycle must attempt the damaged log once";
+        EXPECT_EQ(agent.uncleanableLogCountForTest(), 1u) << "the damaged log is not in the uncleanable set";
+        EXPECT_EQ(raw->lastCleanOffset(), 0) << "the watermark moved past the damage";
+        for (int i = 0; i < 20; ++i) {   // capped: further cycles never read the log again
+            now += 1'000'000;
+            agent.doWork(now);
+        }
+        EXPECT_EQ(agent.passesStartedForTest(), 1u) << "an uncleanable log was selected again";
+        EXPECT_EQ(raw->lastCleanOffset(), 0);
+    }
+    {
+        rune::node::LogCleanerAgent restarted(&registry, /*cycleBudgetBytes=*/0);   // the restart: no sticky state
+        restarted.doWork(100'000'000);
+        EXPECT_EQ(restarted.passesStartedForTest(), 1u) << "a fresh agent must try the log once more";
+        EXPECT_EQ(restarted.uncleanableLogCountForTest(), 1u);
+        EXPECT_EQ(raw->lastCleanOffset(), 0);
+    }
+    fs::remove_all(dir);
+}
+
+// PR #851 review re-attack (edf94a73, #840): the uncleanable mark outlives the damage it was set for.  The log is
+// truncated below the damaged segment (an unclean-election / divergent-follower truncation; a namespace TRUNCATE takes the
+// same in-place path), so every remaining and every new segment is intact, yet the agent never selects the log again until
+// the broker restarts: a compacted topic stops compacting and grows without bound.  The mark is keyed by the log's dir and
+// only dropped when the dir leaves the view.
+// Non-urgent break (under-cleaning, no loss): #853, DISABLED until it is fixed.
+TEST(CompactionCleanerAgentRegression, DISABLED_AnUncleanableLogIsSelectedAgainOnceItsDamageIsTruncatedAwayAdversarialRegression) {
+    auto dir = cp6TempDir("cp840_truncated_damage");
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(1841, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->becomeLeader(1, {1});
+    for (int v = 0; v < 120; ++v) log.append(cp6Batch(v, "k" + std::to_string(v % 5), "v" + std::to_string(v)), v);
+    replica->onLeaderLogAppended();
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 4u);
+    std::vector<fs::path> logs;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (e.path().extension() == ".log") logs.push_back(e.path());
+    std::sort(logs.begin(), logs.end());
+    {   // CRC-damage the last batch of the second (sealed) segment.
+        const auto sz = fs::file_size(logs[1]);
+        std::fstream f(logs[1], std::ios::in | std::ios::out | std::ios::binary);
+        char c = 0;
+        f.seekg(static_cast<std::streamoff>(sz) - 1);
+        f.read(&c, 1);
+        c = static_cast<char>(c ^ 0x5A);
+        f.seekp(static_cast<std::streamoff>(sz) - 1);
+        f.write(&c, 1);
+    }
+    rune::node::ReplicaRegistry registry;
+    PartitionReplica* raw = replica.get();
+    registry.add(1841, 0, std::move(replica));
+    rune::node::LogCleanerAgent agent(&registry, /*cycleBudgetBytes=*/0);
+    int64_t now = 1'000'000;
+    agent.doWork(now);
+    ASSERT_EQ(agent.uncleanableLogCountForTest(), 1u) << "precondition: the damage was met";
+    ASSERT_EQ(agent.passesStartedForTest(), 1u);
+
+    // Truncate below the damaged segment: only the intact first segment is left, then the log grows intact sealed
+    // segments of repeated keys again.
+    ASSERT_TRUE(log.truncateTo(bases[1]));
+    log.drainCleanerSwaps();
+    for (int64_t o = bases[1]; o < bases[1] + 120; ++o)
+        log.append(cp6Batch(o, "k" + std::to_string(o % 5), "w" + std::to_string(o)), o);
+    raw->onLeaderLogAppended();
+    ASSERT_GE(log.segmentBaseOffsets().size(), 4u);
+    for (int i = 0; i < 20; ++i) {
+        now += 1'000'000;
+        agent.doWork(now);
+    }
+    EXPECT_GT(agent.passesStartedForTest(), 1u) << "the log stayed uncleanable after its damage was truncated away";
+    EXPECT_EQ(agent.uncleanableLogCountForTest(), 0u);
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
 // TEST 8: CheckpointResumesAcrossAgentRestart  (CP-7)
 //
 // The cleaner-offset-checkpoint persists lastCleanOffset to disk so the

@@ -162,8 +162,8 @@ struct Model {
     }
     /// The plan's view-source rules, evaluated when the op STARTS on the ids bound
     /// at submit.  Per source, in order: unbound or no longer that id -> 33; a
-    /// view's output -> 41 (D3b/B9); not a typed topic -> 33; a typed transient
-    /// topic under a persisted view -> 37 (Phase 2b E).  Then 2+ sources -> 34.
+    /// view's output -> 41 (D3b/B9); not a typed topic -> 33.  37 is never sent
+    /// (checked writes Part 10).  Then 2+ sources -> 34.
     uint16_t sourceRule(const Submitted& s) const {
         for (const Bound& b : s.sources) {
             const auto it = topicId.find(b.name);
@@ -171,7 +171,6 @@ struct Model {
             const Occupant o = exact(b.name);
             if (isViewOcc(o)) return kViewSourceIsView;
             if (!isTyped(o)) return kViewSourceNotFound;
-            if (o == Occupant::TypedTransient && s.persistedView) return kViewSourceTransient;
         }
         return s.sources.size() > 1 ? kViewFieldUnresolved : kOk;
     }

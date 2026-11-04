@@ -2,6 +2,7 @@
 // tests/catalog/CatalogGoldenPins.h:
 //   make_catalog_golden <out.rcat>        -> golden/v1/basic.rcat        (kBasicV1Digests)
 //   make_catalog_golden <out.rcat> v2     -> golden/v2/namespaces.rcat   (kNamespacesV2Digests)
+//   make_catalog_golden <out.rcat> v3     -> golden/v3/basic.rcat        (kBasicV3Digests)
 // Run ONCE when a formatVer is introduced; never re-run for an existing one.
 #include <rune/catalog/CatalogFile.h>
 #include <rune/catalog/CatalogReplayer.h>
@@ -10,15 +11,16 @@
 #include <fstream>
 #include <string>
 int main(int argc, char** argv) {
-    if (argc != 2 && argc != 3) { std::fprintf(stderr, "usage: make_catalog_golden <out.rcat> [v1|v2]\n"); return 2; }
-    const bool v2 = argc == 3 && std::string(argv[2]) == "v2";
-    if (argc == 3 && !v2 && std::string(argv[2]) != "v1") { std::fprintf(stderr, "unknown version %s\n", argv[2]); return 2; }
+    if (argc != 2 && argc != 3) { std::fprintf(stderr, "usage: make_catalog_golden <out.rcat> [v1|v2|v3]\n"); return 2; }
+    const std::string version = argc == 3 ? argv[2] : "v1";
+    if (version != "v1" && version != "v2" && version != "v3") { std::fprintf(stderr, "unknown version %s\n", version.c_str()); return 2; }
     std::ofstream out(argv[1], std::ios::binary | std::ios::trunc);
     rune::catalog::writeRcatHeader(out);
     rune::catalog::CatalogReplayer r;
-    std::printf("inline constexpr uint64_t %s[] = {\n", v2 ? "kNamespacesV2Digests" : "kBasicV1Digests");
+    std::printf("inline constexpr uint64_t %s[] = {\n", version == "v3" ? "kBasicV3Digests" : version == "v2" ? "kNamespacesV2Digests" : "kBasicV1Digests");
     int64_t off = 0;
-    const auto script = v2 ? rune::catalog::testing::goldenScriptV2() : rune::catalog::testing::goldenScriptV1();
+    const auto script = version == "v3" ? rune::catalog::testing::goldenScriptV3()
+                        : version == "v2" ? rune::catalog::testing::goldenScriptV2() : rune::catalog::testing::goldenScriptV1();
     for (const auto& e : script) {
         const auto bytes = rune::catalog::encode(e);
         if (!bytes) {

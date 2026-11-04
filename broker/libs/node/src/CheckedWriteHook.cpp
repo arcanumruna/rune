@@ -20,7 +20,8 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
 
     const bool walked = rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& r) {
         if (stopped != pc::ErrorCode::OK) return;
-        if ((r.attributes & rec::kAttrReservedMask) != 0 || rec::intentOf(r.attributes) == 3) {
+        const uint8_t intent = rec::intentOf(r.attributes);
+        if ((r.attributes & rec::kAttrReservedMask) != 0 || intent == 3 || (intent == static_cast<uint8_t>(rec::Intent::Insert) && r.value.empty())) {   // an insert needs a value (P5-5)
             intents.reservedBits = true;
             stopped = pc::ErrorCode::InvalidRequest;
             refusal_ = HookRefusal::ReservedBits;
@@ -37,7 +38,6 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
             refusal_ = HookRefusal::VersionAhead;
             return;
         }
-        const uint8_t intent = rec::intentOf(r.attributes);
         if (intent == static_cast<uint8_t>(rec::Intent::Upsert)) return;
         intents.anyIntent = true;
         bool zeroKey = r.key.size() == spec.keyWidth && spec.keyWidth != 0;

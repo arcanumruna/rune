@@ -5551,3 +5551,17 @@ TEST(PartitionReplicaRegression, FollowerKeepaliveAboveCapFetchIntervalRegressio
     static_assert(PartitionReplica::followerKeepaliveNs(2, 1'000'000'000) == 1'000'000'000);   // interval > cap, low lag
     EXPECT_EQ(PartitionReplica::followerKeepaliveNs(30'000, 50'000'000), 20'000'000);
 }
+
+// #809: lastTruncationOffset() is the LAST cut; a consumer that folds a timeline needs the lowest cut since it last looked.
+TEST_F(TwoReplicaTest, TruncationFloorIsTheLowestCutSinceTakeRegression) {
+    for (int i = 0; i < 10; ++i) ASSERT_GE(leader_->append(makePayload(static_cast<uint8_t>(i))), 0);
+    ASSERT_EQ(leader_->logEndOffset(), 10);
+    ASSERT_EQ(leader_->takeTruncationFloor(), std::numeric_limits<Offset>::max()) << "no cut yet";
+    leader_->truncateLogForTest(6);
+    for (int i = 0; i < 3; ++i) ASSERT_GE(leader_->append(makePayload(static_cast<uint8_t>(i))), 0);
+    ASSERT_EQ(leader_->logEndOffset(), 9);
+    leader_->truncateLogForTest(8);
+    EXPECT_EQ(leader_->lastTruncationOffset(), 8);
+    EXPECT_EQ(leader_->takeTruncationFloor(), 6) << "the lower of the two cuts";
+    EXPECT_EQ(leader_->takeTruncationFloor(), std::numeric_limits<Offset>::max()) << "a take resets the floor";
+}

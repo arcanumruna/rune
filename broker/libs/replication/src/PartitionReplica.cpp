@@ -3776,6 +3776,7 @@ void PartitionReplica::resetTransientLogTo_(Offset start)
     // over this source (Phase 2b E2 Task 9) re-validate instead of trusting a
     // cursor into the dropped ring.
     lastTruncationOffset_ = prevStart;
+    cutFloor_ = std::min(cutFloor_, prevStart);
     ++logGeneration_;
     // Every epoch entry named offsets this ring no longer holds; the next
     // fetch carries lastFetchedEpoch -1 (an empty log: no lineage to validate)
@@ -3859,6 +3860,7 @@ void PartitionReplica::truncateLog(Offset truncateOffset)
     // F15 §2.1 step 3: the log's existing content changed at and above
     // truncateOffset — every parked waiter / RC build re-validates against it.
     lastTruncationOffset_ = truncateOffset;
+    cutFloor_ = std::min(cutFloor_, truncateOffset);
     ++logGeneration_;
 
     // Task 11: PSM re-rebuild on low truncation.

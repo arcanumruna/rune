@@ -2,8 +2,12 @@
 #include "CheckedWritesRig.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <random>
+#include <variant>
 
 using namespace rune::node;
 using namespace rune::node::cw;
@@ -16,6 +20,13 @@ constexpr int32_t kRej = 0x40000601, kProj = 0x40000602;
 constexpr uint64_t kObj = 77;
 
 TestRejectRule tagRule(uint8_t tag) { TestRejectRule r; r.mode = TestRejectRule::Mode::TagEquals; r.tag = tag; return r; }
+constexpr int kPassCap = 300;
+
+std::vector<uint8_t> slurp(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+std::string committedFile(const VerdictRig& r, int32_t view) { return viewCheckpointFilePath(r.snapDir(), view, 0); }
 }  // namespace
 
 TEST(CheckedWritesVerdictWorker, RejectedRecordNeverReachesAnyView) {
@@ -417,6 +428,43 @@ TEST(CheckedWritesVerdictWorkerRegression, TruncatedOwnChangeAndMarkerLeaveTheTi
     EXPECT_TRUE(r.hasRow(kProj, 14));
 }
 
+// #809: two log cuts X < Y between two passes: the timeline must drop everything at and above X (the lowest cut), not only above Y.
+TEST(CheckedWritesVerdictWorkerRegression, TwoCutsBetweenPassesTruncateTheTimelineAtTheLowerCutRegression) {
+    constexpr int32_t kRej2 = 0x40000603;
+    VerdictRig r(/*follower=*/true);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(20);
+    r.followerFetch();
+    r.passes(20);
+    ASSERT_EQ(r.produce({{1, 1, 0}, {2, 2, 0}, {3, 3, 9}}), 0);
+    const int64_t dataEnd = r.leo();
+    r.followerFetch(dataEnd);
+    r.passes(300);
+    const int64_t X = dataEnd;   // the marker of the rejection sits here
+    ASSERT_EQ(r.leo(), X + 1);
+    r.installRejectView(kRej2, kObj + 1, tagRule(8), "rej2");   // a second set change above X
+    r.passes(20);
+    ASSERT_EQ(r.readLog().changes.size(), 2u);
+    const PartitionWriteState* w = r.worker->writeStateForTest(VerdictRig::kSrc, 0);
+    ASSERT_NE(w, nullptr);
+    ASSERT_GE(w->markers.appendedThrough(), X);
+    const int64_t changeAt = r.readLog().changes.back().offset;
+    ASSERT_GE(changeAt, X);
+    r.demote();
+    // Cut 1 at X, then a foreign batch above it, then cut 2 at Y > X, with no worker pass in between.
+    r.replica->truncateLogForTest(X);
+    ASSERT_EQ(r.leo(), X);
+    r.replicateNoPass({VerdictRig::batch({{10, 1, 0}, {11, 1, 0}, {12, 1, 0}})});
+    const int64_t Y = X + 2;
+    ASSERT_GT(r.leo(), Y);
+    r.replica->truncateLogForTest(Y);
+    ASSERT_EQ(r.replica->lastTruncationOffset(), Y);
+    r.passes(1);
+    EXPECT_LT(w->constraintSets.lastChangeOffset(), X) << "a set change in [X, Y) survived the two cuts";
+    EXPECT_LT(w->markers.appendedThrough(), X) << "a marker in [X, Y) survived the two cuts";
+}
+
 TEST(CheckedWritesVerdictWorkerRegression, LeadershipScanPastTheLedgerCapacityKeepsWRegression) {
     // More markers in the log than the ledger holds.  The leadership scan feeds them in order without an HW in between, so the
     // ring filled and every later marker was dropped: W stayed at the 1024th until the leader re-marked the range.
@@ -500,6 +548,7 @@ TEST(CheckedWritesVerdictWorker, RestartWithMarkersKeepsTheCheckpoint) {
     EXPECT_EQ(r.stats()->verdictCheckpointsDiscarded, 0u);
     EXPECT_TRUE(r.hasRow(kRej, 1));
     EXPECT_FALSE(r.hasRow(kRej, 2));
+    EXPECT_TRUE(listViewBackups(r.snapDir(), kRej, 0).empty()) << "a checkpoint that is kept is never backed up";   // V4
 }
 
 TEST(CheckedWritesVerdictRestartRegression, CheckpointAheadOfLocalMarkersIsDiscardedAndRefoldedRegression) {
@@ -513,12 +562,209 @@ TEST(CheckedWritesVerdictRestartRegression, CheckpointAheadOfLocalMarkersIsDisca
     ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
     r.truncateTo(r.leo() - 1);   // the crash lost the marker (the last record of the log); the records below stay
     ASSERT_GT(r.leo(), beforeBatch);
+    const std::vector<uint8_t> committed = slurp(committedFile(r, kRej));
+    ASSERT_FALSE(committed.empty());
     r.restart();
     r.passes(500);
     ASSERT_NE(r.stats(), nullptr);
     EXPECT_EQ(r.stats()->verdictCheckpointsDiscarded, 1u);
     EXPECT_TRUE(r.hasRow(kRej, 1));
     EXPECT_FALSE(r.hasRow(kRej, 2)) << "refolded under the re-judged verdicts";
+    // V1: the discarded checkpoint is moved aside, byte for byte, before the refold.
+    const auto backups = listViewBackups(r.snapDir(), kRej, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".ahead-of-verdicts.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurp(backups[0]), committed);
+}
+
+// V3: with backups off the discard removes the old checkpoint instead; the member refolds all the same.
+TEST(CheckedWritesVerdictRestartRegression, DiscardedVerdictMemberWithBackupOffRemovesWithoutBackupRegression) {
+    VerdictRig r;
+    r.backupPolicy = ViewBackupPolicy{false, 3};
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    r.truncateTo(r.leo() - 1);
+    r.restart();
+    r.passes(500);
+    ASSERT_NE(r.stats(), nullptr);
+    EXPECT_EQ(r.stats()->verdictCheckpointsDiscarded, 1u);
+    EXPECT_EQ(r.agent->discardsForTest(), 1);
+    EXPECT_FALSE(std::filesystem::exists(viewBackupDir(r.snapDir()))) << "backups are off: nothing is kept";
+    EXPECT_TRUE(r.hasRow(kRej, 1));
+    EXPECT_FALSE(r.hasRow(kRej, 2));
+}
+
+// V2: a persisted member whose checkpoint cursor lies below the source's log start (retention deleted what it folded from)
+// is backed up (below-log-start) and refolded from the log start, not from 0.
+TEST(CheckedWritesVerdictRestartRegression, DiscardedVerdictMemberOverATrimmedLogIsBackedUpThenRefoldedRegression) {
+    VerdictRig r(false, /*rollBytes=*/1);
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    const std::vector<uint8_t> oldCheckpoint = slurp(committedFile(r, kRej));
+    ASSERT_FALSE(oldCheckpoint.empty());
+    for (uint64_t i = 2; i <= 6; ++i) ASSERT_EQ(r.produce({{i, int64_t(i) * 10, 0}}), 0);
+    r.installRejectView(kRej + 10, kObj + 1, tagRule(8), "rej2", /*persisted=*/true);   // a newer set change: the first one may go
+    r.passes(100);
+    for (uint64_t i = 7; i <= 8; ++i) ASSERT_EQ(r.produce({{i, int64_t(i) * 10, 0}}), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    for (int i = 0; i < 300; ++i) {
+        if (const auto snap = r.log->cleanerSnapshot())
+            for (const auto& si : *snap) (void)r.log->enqueueDeletedSegment(si.baseOffset, si.lineage);
+        r.pass();
+    }
+    const int64_t logStart = r.log->logStartOffset();
+    ASSERT_GT(logStart, 2) << "retention deleted the early segments";
+    // The member's checkpoint is the old one: its cursor is below the log start.
+    { std::ofstream f(committedFile(r, kRej), std::ios::binary | std::ios::trunc);
+      f.write(reinterpret_cast<const char*>(oldCheckpoint.data()), static_cast<std::streamsize>(oldCheckpoint.size())); }
+    r.restart();
+    r.passes(600);
+    ASSERT_TRUE(r.vs->allViewsReady());
+    const auto backups = listViewBackups(r.snapDir(), kRej, 0);
+    ASSERT_EQ(backups.size(), 1u);
+    EXPECT_NE(backups[0].find(".below-log-start.delta"), std::string::npos) << backups[0];
+    EXPECT_EQ(slurp(backups[0]), oldCheckpoint);
+    EXPECT_FALSE(r.hasRow(kRej, 1)) << "its record was trimmed: not in the rebuilt view";
+    EXPECT_TRUE(r.hasRow(kRej, 8));
+}
+
+// P4-4 over a retention-trimmed source log: the member's checkpoint is ahead of the local markers (the crash lost the last one) and
+// the early records are gone.  The pre-discard rows are backed up exactly once (knob on) or not at all (knob off); the live member
+// refolds from the current log start and re-judges the survivors.
+namespace {
+void ahead_of_markers_over_a_trimmed_log(bool backupsOn) {
+    VerdictRig r(false, /*rollBytes=*/1);   // one batch per segment
+    r.backupPolicy = ViewBackupPolicy{backupsOn, 3};
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    const int64_t o1 = r.leo();
+    ASSERT_EQ(r.produce({{1, 10, 0}}), 0);
+    r.passes(300);
+    r.installRejectView(0x40000605, 8, tagRule(8), "rej8");   // not persisted: the source logs a second set change C2 above o1
+    r.passes(50);
+    const int64_t c2 = r.readLog().changes.back().offset;
+    ASSERT_GT(c2, o1);
+    ASSERT_EQ(r.produce({{2, 20, 0}, {3, 30, 9}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    const std::vector<uint8_t> committed = slurp(committedFile(r, kRej));
+    ASSERT_FALSE(committed.empty());
+    (void)r.log->deleteOldSegments(0, c2);   // retention up to C2
+    ASSERT_GT(r.log->logStartOffset(), o1);
+    ASSERT_LE(r.log->logStartOffset(), c2);
+    r.restart(true, r.leo() - 1);            // the crash loses the last marker: the checkpoint is ahead of the local markers
+    r.passes(500);
+    ASSERT_NE(r.stats(), nullptr);
+    EXPECT_EQ(r.stats()->verdictCheckpointsDiscarded, 1u);
+    EXPECT_FALSE(r.hasRow(kRej, 1)) << "refolded from the trimmed log start: id 1's record is gone";
+    EXPECT_TRUE(r.hasRow(kRej, 2));
+    EXPECT_FALSE(r.hasRow(kRej, 3)) << "re-judged";
+    const auto backups = listViewBackups(r.snapDir(), kRej, 0);
+    if (backupsOn) {
+        ASSERT_EQ(backups.size(), 1u) << "exactly one backup per discard";
+        EXPECT_NE(backups[0].find(".ahead-of-verdicts.delta"), std::string::npos) << backups[0];
+        EXPECT_EQ(slurp(backups[0]), committed) << "the pre-discard rows, byte for byte";
+    } else {
+        EXPECT_TRUE(backups.empty());
+        EXPECT_FALSE(std::filesystem::exists(viewBackupDir(r.snapDir())));
+    }
+}
+}  // namespace
+
+TEST(CheckedWritesVerdictRestartRegression, DiscardedVerdictMemberAheadOfMarkersOverATrimmedLogIsBackedUpThenRefoldedRegression) {
+    ahead_of_markers_over_a_trimmed_log(/*backupsOn=*/true);
+}
+
+TEST(CheckedWritesVerdictRestartRegression, DiscardedVerdictMemberAheadOfMarkersOverATrimmedLogWithBackupOffKeepsNoBackupRegression) {
+    ahead_of_markers_over_a_trimmed_log(/*backupsOn=*/false);
+}
+
+// V5: when the backup cannot be made, nothing is rebuilt over the unsaved checkpoint: the member stays unsettled and the judge
+// does not pass it (no verdicts, no markers) for the rest of the boot.
+TEST(CheckedWritesVerdictRestartRegression, BackupFailureKeepsTheVerdictMemberUnjudgedRegression) {
+    VerdictRig r;
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    r.truncateTo(r.leo() - 1);
+    const std::vector<uint8_t> committed = slurp(committedFile(r, kRej));
+    { std::ofstream blocker(viewBackupDir(r.snapDir()), std::ios::binary); blocker << "not a directory"; }
+    r.restart();
+    r.passes(300);
+    const CheckpointState* st = r.vs->checkpointStateForTest(kRej, 0);
+    ASSERT_NE(st, nullptr);
+    ASSERT_TRUE(std::holds_alternative<CheckpointDiscardFailed>(*st));
+    EXPECT_EQ(std::get<CheckpointDiscardFailed>(*st).reason, ViewDiscardReason::AheadOfVerdicts);
+    EXPECT_FALSE(r.vs->allViewsReady());
+    EXPECT_EQ(slurp(committedFile(r, kRej)), committed) << "the unsaved checkpoint is untouched";
+    const VerdictSource* judge = r.vs->verdictSource(VerdictRig::kSrc, 0);
+    ASSERT_NE(judge, nullptr);
+    const int64_t judged = judge->judgedThrough();
+    const uint64_t markers = r.stats()->markersWritten;
+    r.produce({{3, 30, 0}, {4, 40, 9}});
+    r.passes(kPassCap);
+    EXPECT_EQ(judge->judgedThrough(), judged) << "an unsettled member counts as behind: the judge does not pass it";
+    EXPECT_EQ(r.stats()->markersWritten, markers) << "no verdicts are issued";
+    EXPECT_FALSE(r.hasRow(kRej, 3));
+}
+
+// B1: a verdict member waiting on a discard (Failed: never retried; Pending: the ack is outstanding) has no work to do, so the
+// worker must report 0 and idle instead of spinning.
+TEST(CheckedWritesVerdictRestartRegression, DiscardFailedVerdictMemberLetsTheWorkerIdleRegression) {
+    VerdictRig r;
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    r.truncateTo(r.leo() - 1);
+    { std::ofstream blocker(viewBackupDir(r.snapDir()), std::ios::binary); blocker << "not a directory"; }
+    r.restart();
+    r.passes(300);
+    const CheckpointState* st = r.vs->checkpointStateForTest(kRej, 0);
+    ASSERT_NE(st, nullptr);
+    ASSERT_TRUE(std::holds_alternative<CheckpointDiscardFailed>(*st));
+    r.passes(50);
+    int sum = 0;
+    for (int i = 0; i < 100; ++i) sum += r.pass();
+    EXPECT_EQ(sum, 0) << "a member in DiscardFailed must let the worker idle";
+}
+
+TEST(CheckedWritesVerdictRestartRegression, DiscardPendingVerdictMemberLetsTheWorkerIdleRegression) {
+    VerdictRig r;
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    r.passes(300);
+    ASSERT_GT(r.agent->lastDurableOffset(kRej, 0), 0);
+    r.truncateTo(r.leo() - 1);
+    r.pauseAgent = true;   // the discard frame goes out, its ack never comes back
+    r.restart();
+    r.passes(300);
+    const CheckpointState* st = r.vs->checkpointStateForTest(kRej, 0);
+    ASSERT_NE(st, nullptr);
+    ASSERT_TRUE(std::holds_alternative<CheckpointDiscardPending>(*st));
+    int sum = 0;
+    for (int i = 0; i < 100; ++i) sum += r.pass();
+    EXPECT_EQ(sum, 0) << "a member in DiscardPending must let the worker idle";
+    ASSERT_TRUE(std::holds_alternative<CheckpointDiscardPending>(*r.vs->checkpointStateForTest(kRej, 0)));
+    r.pauseAgent = false;
+    r.passes(600);
+    EXPECT_TRUE(r.vs->allViewsReady()) << "the member settles once the agent acks";
 }
 
 TEST(CheckedWritesVerdictWorkerRegression, RefoldBelowWIgnoresALaterRuleRegression) {
@@ -646,4 +892,92 @@ TEST(CheckedWritesVerdictCleaner, RigCompactionKeepsTheAcceptedLatest) {
         ASSERT_NE(it, inLog.end()) << "key " << id << " lost";
         EXPECT_EQ(it->second, want) << "key " << id;
     }
+}
+
+// ---- #798: a replica that lags the verdict marker leads after the cleaner ran ----
+namespace {
+/// Every batch of `log` from `from`, as raw bytes, in offset order (the walk controlTypes() does).
+std::vector<std::vector<uint8_t>> rawBatchesOf(rune::storage::Log& log, int64_t from, int64_t through) {
+    std::vector<std::vector<uint8_t>> out;
+    for (int64_t off = from; off < through;) {
+        const auto v = log.readView(off, 1 << 20);
+        if (v.empty()) break;
+        for (std::size_t p = 0; p + 12 <= v.len;) {
+            int32_t blen = 0;
+            std::memcpy(&blen, v.data + p + 8, 4);
+            const std::size_t total = 12 + static_cast<std::size_t>(blen);
+            if (p + total > v.len) break;
+            int64_t base = 0;
+            std::memcpy(&base, v.data + p, 8);
+            if (base >= through) return out;
+            if (base >= from) out.emplace_back(v.data + p, v.data + p + total);
+            p += total;
+        }
+        off = v.nextOffset;
+    }
+    return out;
+}
+}  // namespace
+
+// Node 1 leads and judges two batches (markers M1 over the first, M2 over the second); node 2 fetched only up to M1.  The cleaner
+// runs twice (stamp, then drop) with the replica's published bound: it must keep M1, because node 2 holds the first batch's rejected
+// record but not M1.  Node 2 then leads from its own copy of the pre-compaction head plus what it fetches from node 1 afterwards:
+// it delivers no rejected record and its views hold no row of one.
+TEST(CheckedWritesVerdictWorkerRegression, LaggingReplicaLeadsAndDeliversNoRejectedRecordRegression) {
+    VerdictRig a(/*follower=*/true, /*rollBytes=*/1);
+    a.typed();
+    a.installRejectView(kRej, kObj, tagRule(9));
+    a.passes(50);
+    ASSERT_EQ(a.produce({{1, 10, 0}, {2, 20, 9}}), 0);
+    ASSERT_TRUE(a.driveUntilJudged());
+    ASSERT_EQ(a.produce({{3, 30, 0}, {4, 40, 9}}), 0);
+    ASSERT_TRUE(a.driveUntilJudged());
+    const auto before = a.readLog();
+    ASSERT_EQ(before.markers.size(), 2u);
+    const int64_t M1 = before.markers.front().offset;
+    int64_t rejectedFirst = -1, rejectedSecond = -1;
+    for (const auto& d : before.data) {
+        if (d.id == 2) rejectedFirst = d.offset;
+        if (d.id == 4) rejectedSecond = d.offset;
+    }
+    ASSERT_LT(rejectedFirst, M1);
+    ASSERT_GT(rejectedSecond, M1);
+    // Node 2's copy of the head (everything below M1), taken before the cleaner runs.
+    const auto head = rawBatchesOf(*a.log, 0, M1);
+    ASSERT_FALSE(head.empty());
+    a.followerFetch(M1);   // node 2 is behind M1
+    const int64_t t0 = 1'000'000;
+    (void)a.compact(t0);
+    (void)a.compact(t0 + 5000);
+    ASSERT_EQ(a.readLog().markers.size(), 2u) << "M1 is kept: a replica has not fetched it";
+    ASSERT_EQ(a.readLog().markers.front().offset, M1);
+    const auto tail = rawBatchesOf(*a.log, M1, a.leo());   // what node 2 fetches from node 1 afterwards
+    ASSERT_FALSE(tail.empty());
+
+    VerdictRig b(/*follower=*/true, 1);
+    b.demote();   // a follower from the start: its log is only what node 1 replicates (offsets match node 1's)
+    b.typed();
+    b.installRejectView(kRej, kObj, tagRule(9));
+    b.passes(20);
+    ASSERT_EQ(b.leo(), 0);
+    b.replicate(head);
+    b.replicate(tail);
+    b.promote();
+    // Node 2 learns the first batch's rejection on taking the lead, from the replicated marker M1 (the kept one): its rejected index
+    // holds exactly that record.  Were M1 dropped, the index would be empty and the record would be delivered.
+    ASSERT_NE(b.writeState(), nullptr);
+    EXPECT_TRUE(b.writeState()->rejected.isRejected(rejectedFirst)) << "learned from M1 when node 2 took the lead";
+    for (int i = 0; i < 100; ++i) { b.followerFetch(); b.passes(5); }
+    // The log of node 2 holds exactly the two markers node 1 replicated: M1 (over the first batch, rejecting its second record) and
+    // M2 (over the second batch); node 2's judge adds none, because both batches are already covered.
+    EXPECT_EQ(b.readLog().markers.size(), 2u);
+    const int64_t s = b.subscribe(SubKind::Raw, 0);
+    std::vector<uint64_t> ids;
+    for (const auto& d : b.collect(s).records) ids.push_back(d.id);
+    std::sort(ids.begin(), ids.end());
+    EXPECT_EQ(ids, (std::vector<uint64_t>{1, 3})) << "no rejected record is delivered";
+    EXPECT_TRUE(b.hasRow(kRej, 1));
+    EXPECT_FALSE(b.hasRow(kRej, 2));
+    EXPECT_TRUE(b.hasRow(kRej, 3));
+    EXPECT_FALSE(b.hasRow(kRej, 4));
 }

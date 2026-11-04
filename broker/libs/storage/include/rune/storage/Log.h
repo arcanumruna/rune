@@ -317,6 +317,13 @@ public:
     }
     /// Rolls deferred by rollDeferred()'s condition (appends that overshot).
     [[nodiscard]] uint64_t rollDeferralsForTest() const noexcept { return rollDeferrals_; }
+    /// Segments with an async flush still in flight (owner thread; cold, walks the map).  The cleaner's swap refuses such a
+    /// segment (RejectReason::FlushInFlight), so a test that compacts right after a roll waits for this to reach 0 first.
+    [[nodiscard]] std::size_t flushPinnedSegmentsForTest() const noexcept {
+        std::size_t n = 0;
+        for (const auto& [base, seg] : segments_) n += seg->flushPins() > 0 ? 1 : 0;
+        return n;
+    }
     static constexpr std::size_t kMaxPendingSealsForTest() noexcept { return kMaxPendingSeals; }
     [[nodiscard]] std::size_t pendingSealCount() const noexcept { return pendingSealCount_; }
     /// Oldest pending seal (pinned; the caller submits its logFd()).

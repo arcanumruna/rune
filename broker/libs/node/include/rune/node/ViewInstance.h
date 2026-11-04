@@ -23,6 +23,8 @@
 #include <rune/view/ViewTable.h>
 
 #include <rune/node/NsSlotTable.h>
+#include <rune/node/ViewCheckpointScan.h>
+#include <rune/node/ViewSnapshotChannel.h>   // ViewDiscardReason
 
 namespace rune::node {
 
@@ -53,7 +55,8 @@ namespace rune::node {
 // checkpoint + a replay of its own committed source log — no cluster/peer
 // dependency, no cross-thread coordination.  It is bounded by the checkpoint
 // cadence (each rebuild pass folds a bounded committed range), deadlock-free,
-// and monotone (Recovering -> RebuildingViews -> (CatchingUp ->) Ready), except Ready -> CatchingUp on a new source leadership.
+// and monotone (Recovering -> RebuildingViews -> (CatchingUp ->) Ready), except Ready -> CatchingUp on a new source
+// leadership and, from either, back to RebuildingViews when beginDiscard_ throws the rows away.
 enum class ViewReadiness : uint8_t { Recovering, RebuildingViews, CatchingUp, Ready };
 
 // Namespaces Phase 2 Task 12 (D26): a view's run state over its namespace's memory limit.  ORTHOGONAL to ViewReadiness
@@ -68,24 +71,11 @@ struct ViewPaused { ViewPauseReason reason = ViewPauseReason::OverLimit; int64_t
 using ViewPauseState = std::variant<ViewRunning, ViewPaused>;
 
 // The namespace a source partition (hence its views) lives in, as the owning worker's log tag.  Default = untagged
-// (kNoNsSlot): the instance is not charged to any namespace (unit tests, transient sources, which carry no tag).
+// (kNoNsSlot): the instance is not charged to any namespace (unit tests).
 struct NsTag { uint16_t slot = kNoNsSlot; uint32_t nsId = 0; };
 
-// Task 19b: split an on-disk view checkpoint file into its individual Task-12
-// records.  The file a ViewSnapshotIoAgent writes is a BARE concatenation of
-// rune::view::encodeDelta() wire records (the 8-byte routing header is stripped
-// before the bytes hit the file — see ViewSnapshotIoAgent::handleDeltaFrame_),
-// so recovery must split it back into the per-record spans
-// rune::view::replay() expects.  Each record is self-describing:
-//   [magic u32][O i64][rowLen u32][count u32] then count × {rid u32, flags u8,
-//   key u64, [rowLen bytes iff flags==0 (upsert)]} then [crc u32].
-// Bounds-safe (Task 8 lesson): never trusts a length/count field to over-read;
-// a torn/truncated TRAILING record is DROPPED (the returned spans stop before
-// it) rather than over-read — exactly what replay() then treats as the
-// recoverable append-only tail.  The returned spans point INTO `bytes`, which
-// must outlive them.
-[[nodiscard]] std::vector<std::span<const uint8_t>>
-splitViewCheckpointRecords(std::span<const uint8_t> bytes);
+// Task 19b / C7: the on-disk checkpoint file is split and classified by scanViewCheckpoint (ViewCheckpointScan.h): a torn
+// trailing record is reported, never silently dropped.
 
 // Phase 2a: the auxiliary tables of an aggregate (view, partition); Phase 2b
 // Task 5b: plus the per-group Min/Max value blocks when the view has Min/Max.
@@ -116,8 +106,23 @@ struct ViewFoldCounters {
     uint64_t aggInconsistent  = 0;   // aggregate: retraction found missing/zero state
     uint64_t aggRescans       = 0;   // aggregate (Phase 2b): Min/Max value-block rescans (retracted extreme)
     uint64_t transientRecordsEvicted = 0;   // transient ring dropped records the view had not folded
-    uint64_t transientSourceResets   = 0;   // E2: the source ring was recreated / cut under a live cursor (re-folded)
+    uint64_t transientSourceResets   = 0;   // the source ring was recreated, cut or restarted under the cursor, or a recovered checkpoint met a new ring (re-folded)
+    uint64_t checkpointDiscards      = 0;   // beginDiscard_: rows thrown away (the checkpoint file is backed up first)
+    uint64_t viewBackupFailures      = 0;   // a discard whose backup failed: the view stays NotReady for the rest of the boot
+    uint64_t checkpointsAheadOfLog   = 0;   // #159: a recovered checkpoint above the source log end
+    uint64_t sourceRecordsTrimmed    = 0;   // source records below the log start that this view never folded (retention, compaction)
 };
+
+// Where the persisted checkpoint of an instance stands in a discard (one explicit state, each holding only what it needs):
+//   CheckpointLive           - the file and the tables agree; the instance folds and checkpoints as usual.
+//   CheckpointDiscardOwed    - the rows were thrown away; the discard frame is not on the ring yet (ring full, or a held delta first).
+//   CheckpointDiscardPending - the frame is with the IO agent; the instance waits for its ack (it folds nothing).
+//   CheckpointDiscardFailed  - the backup failed (errno): nothing is rebuilt over the unsaved checkpoint, NotReady for this boot.
+struct CheckpointLive {};
+struct CheckpointDiscardOwed    { ViewDiscardReason reason; };
+struct CheckpointDiscardPending { ViewDiscardReason reason; };
+struct CheckpointDiscardFailed  { ViewDiscardReason reason; int32_t err; };
+using CheckpointState = std::variant<CheckpointLive, CheckpointDiscardOwed, CheckpointDiscardPending, CheckpointDiscardFailed>;
 
 // The live [logStart, logEnd) of a TRANSIENT (InMemoryLog) source partition,
 // handed to the per-instance fold so it can reconcile its cursor (Phase 2b E),
@@ -145,8 +150,8 @@ struct TransientBounds {
 //                                 an EARLIER incarnation of the source.  A
 //                                 transient source restarts empty and reuses
 //                                 offsets, so that cursor is meaningless: the
-//                                 first reconcile warns once, resets to logStart
-//                                 and keeps the rows.
+//                                 first reconcile logs once (INFO), counts a source
+//                                 reset, resets to logStart and keeps the rows.
 //   CursorLive{incarnation, logGeneration}
 //                               — cursor tracks THIS source ring: re-folded from
 //                                 logStart when the ring was recreated (new
@@ -155,7 +160,7 @@ struct TransientBounds {
 //                                 from logStart when the generation moved by
 //                                 more (only the last cut is known);
 //                                 EVICTED when it falls below logStart,
-//                                 invariant breach when above logEnd.
+//                                 a source restart when above logEnd.
 struct CursorFresh {};
 struct CursorRecoveredUnreconciled {};
 struct CursorLive {
@@ -197,8 +202,15 @@ struct ViewInstance {
     // Task 16 restart readiness of THIS (view, partition).  Defaults to Ready:
     // an instance created on the normal (non-recovery) driveFolds path is
     // serve-ready immediately, so the serve-guard is INERT for every existing
-    // path.  installViewForRecovery is the ONLY writer that lowers it to
-    // RebuildingViews; driveRebuild is the only one that raises it back to Ready.
+    // path.  The full writer list (state graph: the ViewReadiness comment above):
+    //   * defaults to Ready (a plain driveFolds instance);
+    //   * set to RebuildingViews (or Ready when already caught up) at restart recovery by installViewForRecovery and
+    //     loadRecoveryCheckpoint_ (foldCursor vs. committedTail);
+    //   * beginDiscard_ is the one writer that lowers Ready or CatchingUp to RebuildingViews (the rows are thrown away);
+    //   * lowered Ready -> CatchingUp on a new source leadership (N-C1) by driveView_ step 0b and flipVerdictMembers_;
+    //   * raised to CatchingUp / Ready only by driveView_ (step 1b and after the fold), flipVerdictMembers_ and
+    //     driveRebuild's caught-up block, all gated on foldCursor >= the bound and on leaderHwConfirmed (Ready only
+    //     when the HW reached the leadership start offset).
     ViewReadiness                      readiness       = ViewReadiness::Ready;
 
     // Task 12 (D26): the view-memory pause, the namespace this instance is charged to, and the bytes charged so far.
@@ -221,8 +233,9 @@ struct ViewInstance {
     // dirty rows, so no delta is ever lost or double-counted.
     std::vector<uint8_t>               pendingDelta;
     bool                               pendingValid    = false;
-    // Part 04 (P4-4): the checkpoint file was discarded with the tables; a reset frame goes out before any new delta.
-    bool                               resetOwed       = false;
+    // Part 04 (P4-4) / view backups: where this instance's checkpoint file stands in a discard (see CheckpointState).  Anything but
+    // CheckpointLive means the instance folds nothing, checkpoints nothing and serves NotReady.
+    CheckpointState                    checkpoint{CheckpointLive{}};
 
     ViewInstance(rune::view::CompiledViewPlan p, rune::view::RowLayout l,
                  rune::codec::Descriptor src, bool persist, int32_t part,
@@ -235,5 +248,32 @@ struct ViewInstance {
           partition(part),
           persisted(persist) {}
 };
+
+/// True while the instance's checkpoint file and tables agree (no discard in flight).  An index compare.
+[[nodiscard]] inline bool checkpointSettled(const ViewInstance& i) noexcept { return i.checkpoint.index() == 0; }
+
+/// True when every table of the instance (output, and the aggregate's contributors, groups and blocks) holds no row.
+[[nodiscard]] inline bool viewTablesEmpty(const ViewInstance& i) noexcept {
+    if (i.table.size() != 0) return false;
+    if (!i.agg) return true;
+    return i.agg->contributors.size() == 0 && i.agg->groups.size() == 0 && (!i.agg->blocks || i.agg->blocks->size() == 0);
+}
+
+/// The log range a source partition holds: retention may have trimmed it below a cursor (logStart); logEnd bounds a checkpoint.
+/// The default (0, INT64_MAX) says nothing, so a caller without a disk log (a transient source, a unit test) changes no behaviour.
+struct SourceLogBounds {
+    int64_t logStart = 0;
+    int64_t logEnd   = INT64_MAX;
+};
+
+/// Retention trimmed the source below this instance's cursor.  An instance holding no rows starts at the log start (true);
+/// one holding rows folded from records that no longer exist cannot be trusted: false = the caller discards it (BelowLogStart).
+[[nodiscard]] inline bool startAtLogStart(ViewInstance& i, int64_t logStart) noexcept {
+    if (!viewTablesEmpty(i)) return false;
+    i.counters.sourceRecordsTrimmed += static_cast<uint64_t>(logStart - i.foldCursor);
+    i.foldCursor   = logStart;
+    i.lastEncodedO = logStart - 1;
+    return true;
+}
 
 } // namespace rune::node

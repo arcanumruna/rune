@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -59,22 +60,20 @@ std::vector<uint8_t> readWholeFile(const std::string& path) {
     return out;
 }
 
-// Task 19b: this (view, partition)'s checkpoint bytes — the very file the IO
-// agent appends to (viewCheckpointFilePath).  Issue #537: a pre-fix checkpoint
-// (legacyViewCheckpointFilePath) may hold aborted-transaction data; it is never
-// replayed — it is removed here, loudly, and the instance cold-starts (foldCursor
-// 0 → RebuildingViews → driveRebuild re-folds the committed log).  Cold: once per
-// instance, on the worker that owns it (the IO agent never touches the legacy name).
-std::vector<uint8_t> readCheckpointFile(const std::string& dir, int32_t viewTopicId, int32_t partition) {
-    const std::string legacy = legacyViewCheckpointFilePath(dir, viewTopicId, partition);
+// Which checkpoint files a (view, partition) had on disk at recovery.  Issue #537: a legacy file
+// (legacyViewCheckpointFilePath) may hold aborted-transaction data and is never replayed.  Issue #590: recovery
+// never deletes anything -- it only reads; the IO agent (the one filesystem toucher) backs files up when told to.
+// Task 19b: this (view, partition)'s checkpoint bytes -- the very file the IO agent appends to (viewCheckpointFilePath).
+// A pure read: cold, once per instance, on the worker that owns it.
+RecoveredCheckpoint readCheckpointFile(const std::string& dir, int32_t viewTopicId, int32_t partition) {
+    RecoveredCheckpoint rc;
+    rc.bytes = readWholeFile(viewCheckpointFilePath(dir, viewTopicId, partition));
     std::error_code ec;
-    if (std::filesystem::exists(legacy, ec)) [[unlikely]] {
-        const bool removed = std::filesystem::remove(legacy, ec);
-        spdlog::warn("WorkerViewSet: view {} partition {}: a checkpoint written before aborted transactions were "
-                     "skipped by the fold ({}) may hold aborted data — {}; re-folding the view from the log",
-                     viewTopicId, partition, legacy, removed ? "removed" : "NOT removed (" + ec.message() + ")");
-    }
-    return readWholeFile(viewCheckpointFilePath(dir, viewTopicId, partition));
+    const bool legacy = std::filesystem::exists(legacyViewCheckpointFilePath(dir, viewTopicId, partition), ec);
+    const bool committed = !rc.bytes.empty();
+    rc.origin = committed ? (legacy ? CheckpointOrigin::CommittedAndLegacy : CheckpointOrigin::Committed)
+                          : (legacy ? CheckpointOrigin::LegacyOnly : CheckpointOrigin::None);
+    return rc;
 }
 
 // Replays checkpoint records into one instance: v1 into the output table for a
@@ -178,64 +177,6 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
 }
 
 } // namespace
-
-// ---------------------------------------------------------------------------
-// splitViewCheckpointRecords — see the header for the contract + wire format.
-// ---------------------------------------------------------------------------
-std::vector<std::span<const uint8_t>>
-splitViewCheckpointRecords(std::span<const uint8_t> bytes) {
-    static constexpr std::size_t kEntryHdr = 4 + 1 + 8;  // rid u32 + flags u8 + key u64
-    static constexpr std::size_t kCrc      = 4;
-    const std::size_t total = bytes.size();
-
-    // Walks `count` entries of `rowLen` from `p`; 0 on truncation, else the end.
-    auto walkEntries = [&](std::size_t p, uint32_t count, uint32_t rowLen) -> std::size_t {
-        for (uint32_t i = 0; i < count; ++i) {
-            if (p + kEntryHdr > total) return 0;
-            const uint8_t flags = bytes[p + 4];
-            p += kEntryHdr;
-            if (flags == 0) {  // upsert carries rowLen payload bytes; a delete does not
-                if (p + rowLen > total) return 0;
-                p += rowLen;
-            }
-        }
-        return p;
-    };
-    // v1: [magic][O i64][rowLen u32][count u32] entries [crc]
-    auto v1End = [&](std::size_t pos) -> std::size_t {
-        if (pos + 20 > total) return 0;
-        const std::size_t p = walkEntries(pos + 20, readU32LE(bytes.data() + pos + 16),
-                                          readU32LE(bytes.data() + pos + 12));
-        return (p == 0 || p + kCrc > total) ? 0 : p + kCrc;
-    };
-    // v2: [magic][O i64][tableCount u8] { [id u8][rowLen u32][count u32] entries }* [crc]
-    auto v2End = [&](std::size_t pos) -> std::size_t {
-        if (pos + 13 > total) return 0;
-        const uint8_t tableCount = bytes[pos + 12];
-        std::size_t p = pos + 13;
-        for (uint8_t t = 0; t < tableCount; ++t) {
-            if (p + 9 > total) return 0;
-            const uint32_t rowLen = readU32LE(bytes.data() + p + 1);
-            const uint32_t count  = readU32LE(bytes.data() + p + 5);
-            p = walkEntries(p + 9, count, rowLen);
-            if (p == 0) return 0;
-        }
-        return p + kCrc > total ? 0 : p + kCrc;
-    };
-
-    std::vector<std::span<const uint8_t>> out;
-    std::size_t pos = 0;
-    while (pos + 4 <= total) {
-        const uint32_t magic = readU32LE(bytes.data() + pos);
-        std::size_t end = 0;
-        if (magic == rune::view::kViewCheckpointMagic)        end = v1End(pos);
-        else if (magic == rune::view::kViewCheckpointMagicV2) end = v2End(pos);
-        if (end == 0) break;   // unknown magic or truncated trailing record
-        out.push_back(bytes.subspan(pos, end - pos));
-        pos = end;
-    }
-    return out;
-}
 
 WorkerViewSet::WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataDir)
     : channel_(channel), viewDataDir_(std::move(viewDataDir)) {}
@@ -362,8 +303,57 @@ int WorkerViewSet::drainInstalls() {
         /*limit=*/8);
 }
 
+int WorkerViewSet::drainSnapshotAcks(int limit) {
+    // A legacy-superseded frame the ring had no room for: retried here (cold, empty almost always).
+    while (!legacyOwed_.empty()) {
+        const uint64_t key = legacyOwed_.back();
+        if (!tryPushLegacySuperseded_(static_cast<int32_t>(static_cast<uint32_t>(key >> 32)), static_cast<int32_t>(static_cast<uint32_t>(key)))) break;
+        legacyOwed_.pop_back();
+    }
+    return channel_.done.drain(
+        [this](int32_t type, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
+            if (type != kDiscardDoneMsgType || len < kDiscardDoneMsgBytes) return;   // kDoneMsgType: durable-offset acks, not needed here
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            onDiscardDone_(static_cast<int32_t>(readU32LE(p)), static_cast<int32_t>(readU32LE(p + 4)),
+                           static_cast<int32_t>(readU32LE(p + 8)), static_cast<ViewDiscardReason>(p[12]));
+        },
+        limit);
+}
+
+void WorkerViewSet::onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status, ViewDiscardReason reason) {
+    const auto it = views_.find(instKey(viewTopicId, partition));
+    if (it == views_.end()) return;
+    ViewInstance& inst = it->second;
+    if (reason == ViewDiscardReason::LegacySuperseded) {
+        // Fire and forget, and possibly in flight next to a real discard of this instance: it never touches CheckpointState.
+        if (status != 0) {
+            ++inst.counters.viewBackupFailures;
+            spdlog::warn("VIEW-BACKUP-FAILED view={} partition={} reason=legacy-superseded errno={} ({}) -- the superseded legacy "
+                         "checkpoint file stays in place; the committed rows are unaffected",
+                         viewTopicId, partition, status, std::strerror(status));
+        }
+        return;
+    }
+    const auto* pending = std::get_if<CheckpointDiscardPending>(&inst.checkpoint);
+    if (pending == nullptr) {               // a fire-and-forget discard (legacy file next to a committed one) or a stale ack
+        if (status != 0)
+            spdlog::warn("WorkerViewSet: view {} partition {}: discard of a superseded checkpoint file failed: {}", viewTopicId, partition,
+                         std::strerror(status));
+        return;
+    }
+    if (status == 0) {
+        inst.checkpoint = CheckpointLive{};  // foldCursor stays 0: the rebuild starts from the log
+        return;
+    }
+    ++inst.counters.viewBackupFailures;
+    spdlog::error("VIEW-BACKUP-FAILED view={} partition={} reason={} errno={} ({}) -- the view stays NotReady; fix the disk or "
+                  "permissions and restart, or set RUNE_VIEW_BACKUP=0 to accept the loss of the old checkpoint",
+                  viewTopicId, partition, viewDiscardReasonName(pending->reason), status, std::strerror(status));
+    inst.checkpoint = CheckpointDiscardFailed{pending->reason, status};
+}
+
 void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t partition,
-                                                    int64_t committedTail) {
+                                                    int64_t committedTail, const SourceLogBounds& b) {
     if (recoveryViews_.empty()) return;  // no recovery view installed — nothing to do
     auto sit = subscriptionIndex_.find(srcTopicId);
     if (sit == subscriptionIndex_.end()) return;
@@ -383,16 +373,18 @@ void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t 
         // split it back into Task-12 records.  A missing/empty file is a valid
         // cold start — installViewForRecovery then starts at foldCursor 0 and
         // the committed log is replayed in full by driveRebuild.
-        const std::vector<uint8_t> file =
-            readCheckpointFile(viewDataDir_, viewTopicId, partition);
-        const std::vector<std::span<const uint8_t>> records =
-            splitViewCheckpointRecords(std::span<const uint8_t>(file));
+        const RecoveredCheckpoint rc = readCheckpointFile(viewDataDir_, viewTopicId, partition);
+        const ViewCheckpointScan scan = scanViewCheckpoint(std::span<const uint8_t>(rc.bytes));
+        const std::vector<std::span<const uint8_t>>& records = scan.records;
 
         const ViewTemplate& tpl = tit->second;
+        std::size_t applied = 0;
         installViewForRecovery(tpl.plan, tpl.layout, tpl.evolvingSrc, tpl.persisted, partition,
                                /*base=*/std::span<const uint8_t>{},
                                std::span<const std::span<const uint8_t>>(records.data(), records.size()),
-                               committedTail);
+                               committedTail, &applied);
+        if (const auto vit = views_.find(instKey(viewTopicId, partition)); vit != views_.end())
+            applyRecoveredCheckpoint_(vit->second, rc, scan, applied, b);
     }
 }
 
@@ -404,13 +396,12 @@ int WorkerViewSet::reconcileTransient_(ViewInstance& inst, const TransientBounds
         inst.foldCursor = tb.logStart;
         return 1;
     }
-    if (std::holds_alternative<CursorRecoveredUnreconciled>(inst.transientCursor)) {   // older incarnation
-        spdlog::warn("WorkerViewSet: view {} partition {}: recovered checkpoint cursor {} refers to "
-                     "an earlier incarnation of its transient source (now [{}, {})) -- invariant "
-                     "breach (a view over a transient source must be transient); keeping the rows, "
-                     "re-folding from offset {}",
-                     viewTopicId, inst.partition, inst.foldCursor, tb.logStart, tb.logEnd,
-                     tb.logStart);
+    if (std::holds_alternative<CursorRecoveredUnreconciled>(inst.transientCursor)) {   // older life of the source
+        ++inst.counters.transientSourceResets;
+        spdlog::info("WorkerViewSet: view {} partition {}: recovered checkpoint cursor {} is from an earlier life of its "
+                     "transient source (now [{}, {})); keeping the checkpoint rows, re-folding from offset {} (resets={})",
+                     viewTopicId, inst.partition, inst.foldCursor, tb.logStart, tb.logEnd, tb.logStart,
+                     inst.counters.transientSourceResets);
         inst.transientCursor = CursorLive{tb.incarnation, tb.logGeneration};
         inst.foldCursor      = tb.logStart;
         return 1;
@@ -455,11 +446,12 @@ int WorkerViewSet::reconcileTransient_(ViewInstance& inst, const TransientBounds
             moved = 1;
         }
     }
-    if (inst.foldCursor > tb.logEnd) {                                          // INVARIANT BREACH
-        spdlog::warn("WorkerViewSet: view {} partition {}: cursor {} is above its transient "
-                     "source end {} -- invariant breach (a view over a transient source must "
-                     "be transient); keeping the rows, re-folding from offset {}",
-                     viewTopicId, inst.partition, inst.foldCursor, tb.logEnd, tb.logStart);
+    if (inst.foldCursor > tb.logEnd) {                                          // SOURCE RESTARTED
+        ++inst.counters.transientSourceResets;
+        spdlog::info("WorkerViewSet: view {} partition {}: cursor {} is above its transient source end {} (the source "
+                     "restarted under it); keeping the rows, re-folding from offset {} (resets={})",
+                     viewTopicId, inst.partition, inst.foldCursor, tb.logEnd, tb.logStart,
+                     inst.counters.transientSourceResets);
         inst.foldCursor = tb.logStart;
         return 1;
     }
@@ -550,10 +542,9 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
 
 void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopicId,
                                             int32_t partition, int64_t committedTail) {
-    const std::vector<uint8_t> file =
-        readCheckpointFile(viewDataDir_, viewTopicId, partition);
-    const std::vector<std::span<const uint8_t>> records =
-        splitViewCheckpointRecords(std::span<const uint8_t>(file));
+    const RecoveredCheckpoint rc = readCheckpointFile(viewDataDir_, viewTopicId, partition);
+    const ViewCheckpointScan scan = scanViewCheckpoint(std::span<const uint8_t>(rc.bytes));
+    const std::vector<std::span<const uint8_t>>& records = scan.records;
 
     std::size_t applied = 0;
     const int64_t recoveredO = replayInstance(
@@ -566,13 +557,63 @@ void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopi
     inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
     inst.readiness = (inst.foldCursor >= committedTail) ? ViewReadiness::Ready
                                                         : ViewReadiness::RebuildingViews;
+    applyRecoveredCheckpoint_(inst, rc, scan, applied, SourceLogBounds{});   // bounds unknown here: the first driveView_ pass repeats the check
+}
+
+void WorkerViewSet::applyRecoveredCheckpoint_(ViewInstance& inst, const RecoveredCheckpoint& rc, const ViewCheckpointScan& scan, std::size_t applied,
+                                              const SourceLogBounds& b) {
+    // The committed file's class (C7).  A torn tail is repaired by the IO agent before its first append (the worker never
+    // writes the file) and removes nothing recovery could decode; a corrupt file is backed up and rebuilt.
+    CheckpointOrigin origin = rc.origin;
+    bool corrupt = false;
+    if (const auto* torn = std::get_if<ViewCheckpointTornTail>(&scan.tail)) {
+        spdlog::info("VIEW-CHECKPOINT-TORN-TAIL view={} partition={} cleanLen={} dropped={}", inst.plan.viewTopicId, inst.partition,
+                     torn->cleanLen, rc.bytes.size() - torn->cleanLen);
+        if (scan.records.empty()) {   // nothing but a torn first record: as if there were no committed file
+            if (origin == CheckpointOrigin::Committed) origin = CheckpointOrigin::None;
+            else if (origin == CheckpointOrigin::CommittedAndLegacy) origin = CheckpointOrigin::LegacyOnly;
+        }
+    } else if (std::holds_alternative<ViewCheckpointCorrupt>(scan.tail)) {
+        corrupt = true;
+    }
+    switch (origin) {
+        case CheckpointOrigin::None: return;
+        case CheckpointOrigin::LegacyOnly:   // the legacy format is never loaded: back it up and rebuild from the log
+            beginDiscard_(inst, ViewDiscardReason::Legacy);
+            return;
+        case CheckpointOrigin::CommittedAndLegacy:   // the committed file is the truth; the superseded legacy one is only backed up
+            if (!tryPushLegacySuperseded_(inst.plan.viewTopicId, inst.partition))
+                legacyOwed_.push_back(instKey(inst.plan.viewTopicId, inst.partition));
+            [[fallthrough]];
+        case CheckpointOrigin::Committed:
+            // Unreadable: a record failed its CRC / framing, or the replay stopped before the last verified record.
+            if (corrupt || applied < scan.records.size()) {
+                beginDiscard_(inst, ViewDiscardReason::Unreadable);
+            } else if (inst.foldCursor > b.logEnd) {   // #159: rows folded from records the source log no longer holds
+                ++inst.counters.checkpointsAheadOfLog;
+                beginDiscard_(inst, ViewDiscardReason::AheadOfLog);
+            }
+            return;
+    }
+}
+
+bool WorkerViewSet::tryPushLegacySuperseded_(int32_t viewTopicId, int32_t partition) {
+    const auto claim = channel_.deltas.tryClaim(kDiscardMsgType, static_cast<std::size_t>(kDiscardMsgBytes));
+    if (claim < 0) return false;
+    uint8_t* dst = channel_.deltas.base() + claim;
+    writeI32LE(dst, viewTopicId);
+    writeI32LE(dst + 4, partition);
+    dst[8] = static_cast<uint8_t>(ViewDiscardReason::LegacySuperseded);
+    dst[9] = dst[10] = dst[11] = 0;
+    channel_.deltas.commit(claim);
+    return true;
 }
 
 void WorkerViewSet::installViewForRecovery(
     rune::view::CompiledViewPlan plan, rune::view::RowLayout layout,
     rune::codec::Descriptor evolvingSrc, bool persisted, int32_t partition,
     std::span<const uint8_t> base,
-    std::span<const std::span<const uint8_t>> deltasInOrder, int64_t committedTail) {
+    std::span<const std::span<const uint8_t>> deltasInOrder, int64_t committedTail, std::size_t* appliedOut) {
     const int32_t viewTopicId = plan.viewTopicId;
 
     // Register the plan template + reactor index exactly as the normal path
@@ -612,6 +653,7 @@ void WorkerViewSet::installViewForRecovery(
     // nothing applied (empty/missing checkpoint) -> foldCursor starts at 0.
     std::size_t applied = 0;
     const int64_t recoveredO = replayInstance(*inst, base, deltasInOrder, applied);
+    if (appliedOut != nullptr) *appliedOut = applied;
     logRecovered(*inst, recoveredO, applied);
     discardDirty_(*inst);  // restored rows == the durable checkpoint: nothing to re-send
     inst->foldCursor   = std::max<int64_t>(recoveredO, 0);
@@ -687,6 +729,7 @@ const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, int32_t partition, uin
 }
 
 int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
+    if (!checkpointSettled(inst)) return 0;   // belt and braces: driveView_ step 0a already returned
     dirtyEntries_.clear();
     rowOffsets_.clear();
     rowScratch_.clear();
@@ -790,6 +833,60 @@ void WorkerViewSet::installTestVerdictViewForTest(rune::view::CompiledViewPlan p
     tpl.testRule = rule;
 }
 
+void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
+    const auto ofTopic = [&](const auto& kv) { return static_cast<int32_t>(kv.first >> 32) == srcTopicId; };
+    std::erase_if(verdictSources_, [&](const auto& kv) {
+        if (!ofTopic(kv)) return false;
+        if (PartitionWriteState* s = kv.second->boundState()) s->verdicts = nullptr;   // the state may outlive its judge
+        return true;
+    });
+    for (auto it = keyIndexes_.begin(); it != keyIndexes_.end();) {
+        if (!ofTopic(*it)) { ++it; continue; }
+        releaseMem_(it->second);
+        it = keyIndexes_.erase(it);
+    }
+}
+
+// Cold.  The key index is built over the source's evolving schema, as every view is: the judge decodes each writer version through it.
+// nullptr until the schema has landed on this worker, or when the key cannot be indexed (the wire key is packed into 8 bytes).
+static const rune::codec::Descriptor* keyIndexSource(const TopicWriteSpec& spec) {
+    if (!spec.evolving || spec.keyWidth == 0 || spec.keyWidth > 8) return nullptr;
+    const bool hasKey = std::any_of(spec.evolving->fields.begin(), spec.evolving->fields.end(), [&](const auto& f) { return f.id == spec.keyFieldId; });
+    return hasKey ? &*spec.evolving : nullptr;
+}
+
+// A key index no leadership has activated yet: its first activation keeps it (it holds nothing), a later one rebuilds it.
+static constexpr uint64_t kNeverActivated = UINT64_MAX;
+// A key index adopted under an active leadership: it folds that leadership's writes, so the next activation rebuilds it.
+static constexpr uint64_t kAdoptedLive = UINT64_MAX - 1;
+
+static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src) {
+    ViewInstance inst(keyIndexPlan(srcTopicId, spec.keyFieldId), keyIndexRowLayout(), src, /*persist=*/false,
+                      partition, /*indexSlots=*/4096, kKeyIndexChunkBytes);
+    inst.maxRecordsPerPass = kKeyIndexReplayRecordsPerPass;
+    inst.foldLeadership = kNeverActivated;
+    return inst;
+}
+
+// A new leadership starts from the local log: an instance carried over could hold what a follower-time compaction removed.
+void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen) {
+    const auto it = keyIndexes_.find(instKey(srcTopicId, partition));
+    if (it == keyIndexes_.end() || it->second.foldLeadership == leaderGen) return;   // already fresh for this leadership (the judge may be held)
+    if (it->second.foldLeadership != kNeverActivated) {
+        const rune::codec::Descriptor* src = keyIndexSource(spec);
+        if (src == nullptr) {   // the spec can no longer be indexed: nothing stale stays behind
+            judge.removeVerdictView(it->second.plan.viewTopicId);
+            eraseKeyIndex_(it->first);
+            return;
+        }
+        releaseMem_(it->second);
+        it->second = freshKeyIndex(srcTopicId, partition, spec, *src);
+        ++judge.statsMut().keyIndexRebuilds;
+    }
+    it->second.foldCursor = judge.logStart();
+    it->second.foldLeadership = leaderGen;
+}
+
 VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write) {
     const auto sit = subscriptionIndex_.find(srcTopicId);
     bool anyTemplate = false;
@@ -797,23 +894,32 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
         for (const int32_t id : sit->second) anyTemplate = anyTemplate || isVerdictTemplate_(id);
     const uint64_t key = instKey(srcTopicId, partition);
     auto vit = verdictSources_.find(key);
-    if (!anyTemplate && write.constraintSets.latest().empty()) {
+    if (!anyTemplate && !write.spec->keyIndex && write.constraintSets.latest().empty()) {
         if (vit == verdictSources_.end()) return nullptr;
         // The set was dropped: the judge stays until it has passed the drop and holds no member.
         if (vit->second->hasMembers() || vit->second->judgedThrough() <= write.constraintSets.lastChangeOffset()) return vit->second.get();
         write.verdicts = nullptr;
         verdictSources_.erase(vit);
+        eraseKeyIndex_(key);
         return nullptr;
     }
     if (vit == verdictSources_.end()) {
         auto v = std::make_unique<VerdictSource>(srcTopicId, partition);
         v->setViewHooks(VerdictViewHooks{this, &checkpointHook_, &discardHook_, &retiredHook_});
         v->setVerdictIntervalNs(verdictIntervalNs_);
+        v->holdJudgeForTest(holdJudges_);
         vit = verdictSources_.emplace(key, std::move(v)).first;
     }
     VerdictSource* judge = vit->second.get();
     judge->bindState(&write);
     write.verdicts = judge;
+    if (write.spec->keyIndex && !judge->hasMember(0, kKeyIndexPlanFingerprint)) {
+        if (const rune::codec::Descriptor* src = keyIndexSource(*write.spec)) {
+            ViewInstance& inst = keyIndexes_.try_emplace(key, freshKeyIndex(srcTopicId, partition, *write.spec, *src)).first->second;
+            if (judge->activated()) inst.foldLeadership = kAdoptedLive;
+            judge->addVerdictView(&inst, rune::view::VerdictViewKind::KeyIndex, 0, kKeyIndexPlanFingerprint);
+        }
+    }
     if (sit == subscriptionIndex_.end()) return judge;
     for (const int32_t id : sit->second) {
         const ViewTemplate& tpl = templates_.at(id);
@@ -833,6 +939,9 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     want.clear();
     // A logged member keeps its place unless its template retired or was replaced; one whose plan is not installed here is kept
     // (the judge waits for it, it is never dropped by a guess).
+    // #791 diagnostics: why each logged member stayed or went (0 live, 1 replaced by another fingerprint, 2 gone, 3 kept: not installed here).
+    std::array<uint8_t, kMaxVerdictViewsPerSource> why{};
+    std::array<uint64_t, kMaxVerdictViewsPerSource> replacedBy{};
     for (uint8_t i = 0; i < logged.count; ++i) {
         const ConstraintSetMember& m = logged.members[i];
         bool live = false, gone = false;
@@ -841,9 +950,10 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
                 const ViewTemplate& tpl = templates_.at(id);
                 if (!tpl.isVerdict || tpl.verdictObjectId != m.viewObjectId) continue;
                 if (tpl.verdictFingerprint == m.planFingerprint) (tpl.retiring ? gone : live) = true;
-                else if (!tpl.retiring) gone = true;   // replaced by a plan with another fingerprint
+                else if (!tpl.retiring) { gone = true; replacedBy[i] = tpl.verdictFingerprint; }   // replaced by a plan with another fingerprint
             }
         }
+        why[i] = live ? 0 : (gone ? (replacedBy[i] != 0 ? 1 : 2) : 3);
         if (live || !gone) want.push_back(m);   // a retiring view's plan installed again stays (#786)
     }
     if (sit != subscriptionIndex_.end()) {
@@ -860,6 +970,8 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
             if (!present) want.push_back(ConstraintSetMember{tpl.verdictObjectId, tpl.verdictKind, tpl.verdictFingerprint});
         }
     }
+    if (write.spec->keyIndex && std::none_of(want.begin(), want.end(), [](const ConstraintSetMember& m) { return m.kind == rune::view::VerdictViewKind::KeyIndex; }))
+        want.push_back(ConstraintSetMember{0, rune::view::VerdictViewKind::KeyIndex, kKeyIndexPlanFingerprint});
     std::sort(want.begin(), want.end(), [](const ConstraintSetMember& a, const ConstraintSetMember& b) { return a.viewObjectId < b.viewObjectId; });
     ConstraintSet desired;
     desired.count = static_cast<uint8_t>(std::min(want.size(), desired.members.size()));
@@ -869,6 +981,20 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
         const int64_t r = judge.requestChange(desired);
         if (r == VerdictSource::kChangeDeferred) return 0;   // not yet bound or activated: ask again next pass
         work = r >= 0 ? 1 : 0;
+        // #791 diagnostics (cold: only when the logged set differs from what the installed views want).  A legitimate change logs
+        // here too, so it is debug detail; the strings are built only when debug is on.
+        if (spdlog::should_log(spdlog::level::debug)) {
+            const auto d = judge.diagSnapshot();
+            spdlog::debug("constraint set sync: topic {} partition {}: logged set {} ({} members) -> wanted {} members, change at offset {} (result {}), "
+                          "leader generation {}", srcTopicId, judge.partition(), logged.id, logged.count, desired.count, write.constraintSets.lastChangeOffset(),
+                          r, d.leaderGeneration);
+            for (uint8_t i = 0; i < logged.count; ++i) {
+                static constexpr const char* kWhy[] = {"live", "replaced", "gone", "kept (plan not installed here)"};
+                spdlog::debug("constraint set sync: topic {} partition {}: member object {} fingerprint {}: {}{}", srcTopicId, judge.partition(),
+                              logged.members[i].viewObjectId, logged.members[i].planFingerprint, kWhy[why[i]],
+                              why[i] == 1 ? " by fingerprint " + std::to_string(replacedBy[i]) : std::string());
+            }
+        }
     }
     judge.constraintSyncEpoch = verdictEpoch_;
     judge.constraintSyncChange = write.constraintSets.lastChangeOffset();
@@ -876,6 +1002,10 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
 }
 
 int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {
+    if (const auto kit = keyIndexes_.find(instKey(srcTopicId, partition)); kit != keyIndexes_.end()) {
+        adoptNs_(kit->second, ns);
+        chargeMem_(kit->second);
+    }
     const auto sit = subscriptionIndex_.find(srcTopicId);
     if (sit == subscriptionIndex_.end()) return 0;
     for (const int32_t id : sit->second) {
@@ -889,7 +1019,7 @@ int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, in
             inst.foldLeadership = leaderGen;
             if (inst.readiness == ViewReadiness::Ready) inst.readiness = ViewReadiness::CatchingUp;
         }
-        if (inst.readiness != ViewReadiness::Ready && inst.foldCursor >= bound) {
+        if (inst.readiness != ViewReadiness::Ready && inst.foldCursor >= bound && checkpointSettled(inst)) {
             inst.readiness = leaderHwConfirmed ? ViewReadiness::Ready : ViewReadiness::CatchingUp;
             pruneRecoveryIfAllReady_(id);
         }
@@ -924,15 +1054,10 @@ void WorkerViewSet::eraseInstance_(int32_t viewTopicId, int32_t partition) {
 
 int WorkerViewSet::pushVerdictCheckpoint_(ViewInstance& inst) {
     int work = 0;
-    if (inst.resetOwed) {
-        const auto claim = channel_.deltas.tryClaim(ViewSnapshotChannel::kResetMsgType, ViewSnapshotChannel::kDeltaHeaderBytes);
-        if (claim < 0) return 1;   // ring full: retried next pass, no delta may precede the reset
-        uint8_t* dst = channel_.deltas.base() + claim;
-        writeI32LE(dst, inst.plan.viewTopicId);
-        writeI32LE(dst + 4, inst.partition);
-        channel_.deltas.commit(claim);
-        inst.resetOwed = false;
-        ++work;
+    if (!checkpointSettled(inst)) {
+        // A discard in flight: the frame goes out (after a held delta), then the instance waits for its ack.  Nothing is checkpointed.
+        if (std::holds_alternative<CheckpointDiscardOwed>(inst.checkpoint)) return tryPushDiscard_(inst) ? 1 : 0;
+        return 0;
     }
     if (inst.pendingValid) {
         ++work;
@@ -945,17 +1070,53 @@ int WorkerViewSet::pushVerdictCheckpoint_(ViewInstance& inst) {
     return work + buildAndPushCheckpoint_(inst);
 }
 
-void WorkerViewSet::discardVerdictInstance_(ViewInstance& inst) {
+// The ONE way an instance's persisted rows are thrown away (recovery, the log-start clamp, a verdict member that outran its
+// markers).  Invariant: afterwards the instance has no rows, is NotReady and folds nothing until its checkpoint is Live again.
+// The checkpoint FILE is moved into backup/ (or removed, with backups off) by the view-snapshot IO agent; the worker never
+// touches the filesystem.  A delta held for the ring still belongs to the old stream: it goes out before the discard frame, so it
+// lands in the backup.
+void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) {
+    if (!checkpointSettled(inst)) return;   // idempotent: one discard at a time
     const std::size_t indexSlots = inst.plan.sizing.capacity != 0 ? ceilPow2(inst.plan.sizing.capacity) : std::size_t{4096};
     const std::size_t chunkBytes = inst.plan.sizing.chunkBytes != 0 ? static_cast<std::size_t>(inst.plan.sizing.chunkBytes) : (std::size_t{32} << 20);
     inst.table = rune::view::ViewTable(inst.layout, indexSlots, chunkBytes);
     if (inst.agg) inst.agg.emplace(rune::view::buildAggLayout(inst.plan, inst.evolvingSrc).value(), indexSlots, chunkBytes);
-    inst.pendingDelta.clear();
-    inst.pendingValid = false;
+    inst.foldCursor = 0;
     inst.lastEncodedO = -1;
-    inst.resetOwed = true;
+    inst.transientCursor = CursorFresh{};
     inst.readiness = ViewReadiness::RebuildingViews;
+    ++inst.counters.checkpointDiscards;
     chargeMem_(inst);
+    spdlog::info("VIEW-DISCARD view={} partition={} reason={}", inst.plan.viewTopicId, inst.partition, viewDiscardReasonName(reason));
+    if (!inst.persisted) return;            // an in-memory view has nothing on disk to save
+    inst.checkpoint = CheckpointDiscardOwed{reason};
+    (void)tryPushDiscard_(inst);
+}
+
+bool WorkerViewSet::startAtLogStart_(ViewInstance& inst, int64_t logStart) {
+    const int64_t from = inst.foldCursor;
+    if (startAtLogStart(inst, logStart)) {
+        spdlog::info("VIEW-START-AT-LOG-START view={} partition={} from={} logStart={}", inst.plan.viewTopicId, inst.partition, from, logStart);
+        return true;
+    }
+    beginDiscard_(inst, ViewDiscardReason::BelowLogStart);
+    return false;
+}
+
+bool WorkerViewSet::tryPushDiscard_(ViewInstance& inst) {
+    const auto* owed = std::get_if<CheckpointDiscardOwed>(&inst.checkpoint);
+    if (owed == nullptr) return false;
+    if (inst.pendingValid && !tryPushDelta_(inst)) return false;   // the held delta belongs to the old stream: it precedes the frame
+    const auto claim = channel_.deltas.tryClaim(kDiscardMsgType, static_cast<std::size_t>(kDiscardMsgBytes));
+    if (claim < 0) return false;            // ring full: retried next pass
+    uint8_t* dst = channel_.deltas.base() + claim;
+    writeI32LE(dst, inst.plan.viewTopicId);
+    writeI32LE(dst + 4, inst.partition);
+    dst[8] = static_cast<uint8_t>(owed->reason);
+    dst[9] = dst[10] = dst[11] = 0;
+    channel_.deltas.commit(claim);
+    inst.checkpoint = CheckpointDiscardPending{owed->reason};
+    return true;
 }
 
 } // namespace rune::node

@@ -104,3 +104,17 @@ race:aeron_mpsc_rb_
 # bare `poll<...>` without the aeron:: prefix, so the names above miss them; match by the file instead (only
 # headers inside the Aeron conan package).
 race:*.conan2/*aeron*/include/*
+
+# The C client's async add allocates its command (aeron_alloc's memset, on the caller's thread) and the client
+# conductor frees it (aeron_free) once it has applied it, ordered by the same MPSC command queue as above.  The pinned
+# Aeron build inlines aeron_client_conductor_async_add_* into Aeron::addSubscription, so that entry no longer matches
+# (TSan CI: BrokerNodeTest.*, AuthEnforcementRegression.*, ...: 407 reports, every one in aeron_alloc.c).  Aeron's own
+# allocator file only: its frames appear only when Aeron allocates or frees its own memory.
+race:aeron_alloc.c
+
+# The C client conductor's registering-resources sweep reads an async add's registration_status with a plain load
+# (aeron_client_conductor.c check_registering_resources) while the polling thread stores POLL_COMPLETED with
+# AERON_SET_RELEASE (aeron_client_conductor_async_resource_poll); the conductor only uses the value to time the command
+# out or free it once the poller is done with it.  A missing acquire inside Aeron, to fix in the fork (#850) (TSan box:
+# NatEgressMatrixRegression.TlsAuthThreeNodesNewClientRegression).  That one Aeron function only.
+race:aeron_client_conductor_check_registering_resources

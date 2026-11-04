@@ -223,3 +223,57 @@ TEST(CheckedWritesViewAckRegression, TransactionalViewBatchIsAckedAtTheHwWhileIt
     EXPECT_EQ(r.foldCursor(kView), 0) << "the open transaction still holds the fold at the ack";
     EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::LevelTooLow), 0u);
 }
+
+// #808: a memory-backed replica never hosts a judge (SD9 refuses every production constraint on transient topics, and the ring has
+// no verdict feed, so a judge there would build its timeline from local requests only and fail open).
+namespace {
+AckRig::Options memoryBacked() {
+    AckRig::Options o;
+    o.transient = true;
+    return o;
+}
+TestRejectRule offsetOne() {
+    TestRejectRule rule;
+    rule.mode = TestRejectRule::Mode::OffsetSet;
+    rule.offsets[0] = 1;
+    rule.offsetCount = 1;
+    return rule;
+}
+AckRig::Write threeRecords(int64_t corr, uint8_t acks) {
+    AckRig::Write w = write(corr, acks);
+    for (uint64_t i = 1; i <= 3; ++i) w.records.push_back(validRecord(static_cast<uint64_t>(corr) * 10 + i));
+    return w;
+}
+}  // namespace
+
+TEST(CheckedWritesViewAckRegression, MemoryBackedReplicaNeverStartsAJudgeRegression) {
+    AckRig r(memoryBacked());
+    r.typed(); r.setLevel(kLevel);
+    r.installTestRejectView(0x40000601, 7, offsetOne());
+    r.steps(50);
+    r.produce(threeRecords(1, kLeaderView));
+    ASSERT_EQ(r.answer(1), kOk);
+    r.steps(50);
+    EXPECT_TRUE(r.vs->verdictSourceKeysForTest().empty()) << "a judge was created on a memory-backed replica";
+    const PartitionWriteState* w = r.worker->writeStateForTest(AckRig::kTopicId, 0);
+    if (w != nullptr) EXPECT_EQ(w->constraintSets.size(), 0u);
+    EXPECT_EQ(r.leo(), 3) << "a set change or a marker record was appended";
+}
+
+TEST(CheckedWritesViewAckRegression, MemoryBackedViewAckCarriesNoVerdictsRegression) {
+    AckRig r(memoryBacked());
+    r.typed(); r.setLevel(kLevel);
+    r.installTestRejectView(0x40000601, 7, offsetOne());
+    r.steps(50);
+    r.produce(threeRecords(1, kLeaderView));
+    ASSERT_EQ(r.answer(1), kOk);
+    EXPECT_FALSE(r.acks[1].hasVerdicts);
+    EXPECT_EQ(r.acks[1].verdictCount, 0u);
+    r.demote();
+    r.promote();
+    r.produce(threeRecords(2, kLeaderView));
+    ASSERT_EQ(r.answer(2), kOk) << "no Internal timeout after a leadership change";
+    EXPECT_FALSE(r.acks[2].hasVerdicts);
+    EXPECT_EQ(r.acks[2].verdictCount, 0u);
+    EXPECT_TRUE(r.vs->verdictSourceKeysForTest().empty());
+}

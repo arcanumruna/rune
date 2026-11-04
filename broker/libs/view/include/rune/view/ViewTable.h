@@ -104,6 +104,9 @@ public:
 
     size_t size() const noexcept { return sz_; }
 
+    // Index slot count, doubled by every grow.  Tests only.
+    size_t indexSlotsForTest() const noexcept { return cap_; }
+
     // Number of row-slab chunks currently allocated. Grows by 1 each time
     // `put` needs a row-id beyond the current total chunk capacity.
     size_t chunkCount() const noexcept { return chunks_.size(); }

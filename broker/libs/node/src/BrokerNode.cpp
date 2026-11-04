@@ -1284,6 +1284,7 @@ void BrokerNode::buildReplication() {
                         kMemLogMaxBytes, kMemLogMaxRecords,
                         rune::storage::FullPolicy::DropOldest));
                 memLogPtr = memoryLogs_.back().get();
+                memLogPtr->setNsTag(spec->nsId, spec->nsSlot);
                 spdlog::debug("BrokerNode[{}]: transient topic '{}' partition {} on InMemoryLog",
                               config_.nodeId, spec->name, part);
             } else {
@@ -1486,6 +1487,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
                 kMemLogMaxBytes, kMemLogMaxRecords,
                 rune::storage::FullPolicy::DropOldest));
             memLogPtr = memoryLogs_.back().get();
+            memLogPtr->setNsTag(spec.nsId, spec.nsSlot);
         } else {
             // Reuse the Log created + recovered by TopicRegistry::createTopic (Task 5).
             diskLogPtr = topicRegistry_->log(topicId, part);
@@ -1693,7 +1695,7 @@ void BrokerNode::buildWorkerPool() {
     for (int32_t i = 0; i < wc; ++i) {
         workerPool_->worker(i).setDesiredFragmentLimit(config_.gatewayFragmentLimit);
         workerPool_->worker(i).setAckSlotBytes(config_.workerAckSlotBytes);
-        workerPool_->worker(i).setVerdictIntervalNs(config_.verdictIntervalMs * 1'000'000);
+        workerPool_->worker(i).setVerdictIntervalNs(config_.verdictIntervalMs * 1'000'000LL);
         workerPool_->worker(i).setBackgroundSyncIntervalNs(config_.workerSyncIntervalMs * 1'000'000LL);
         if (!config_.ioWorkerCpus.empty()) workerPool_->worker(i).setIoWorkerCpus(config_.ioWorkerCpus);
         workerPool_->worker(i).setIngressDrainLimit(config_.workerIngressDrainLimit);
@@ -1903,7 +1905,8 @@ void BrokerNode::buildWorkerPool() {
             workerPool_->worker(i).setViewSet(workerViewSets_.back().get());
         }
         viewSnapshotIoAgent_ = std::make_unique<ViewSnapshotIoAgent>(
-            std::move(chPtrs), viewSnapDir, /*fsyncMs=*/50);
+            std::move(chPtrs), viewSnapDir, /*fsyncMs=*/50,
+            ViewBackupPolicy{config_.viewBackup, static_cast<uint32_t>(config_.viewBackupsKept)});
         viewSnapshotIoIdleStrategy_ = makeShapedBackoff(config_.adminIdleShape());
         viewSnapshotIoRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *viewSnapshotIoAgent_, *viewSnapshotIoIdleStrategy_, viewSnapshotIoClock_);
@@ -2148,6 +2151,7 @@ void BrokerNode::buildGateway() {
                 gateway_->onNsSlotAssign(static_cast<uint16_t>(sl), nsSlots_.nsIdAt(static_cast<uint16_t>(sl)),
                                          nsSlots_.limits(static_cast<uint16_t>(sl)));
         if (bootApplier_) gateway_->setBootNamespaces(bootApplier_->state().namespaces());
+        gateway_->setAdvertisedBrokerVersionForTest(config_.testAdvertisedBrokerVersion);
         gateway_->setAnonymousRead(config_.anonymousRead);   // spec §11: RUNE_ANONYMOUS_READ, off by default
         gateway_->setAnonymousCaps(config_.anonymousMaxConnections, config_.anonymousRequestOpsPerSec);   // #236 (Task 10)
         gateway_->setNsLimitAggregator(&nsAggregator_);   // Task 14: worker usage reports -> the aggregator (same thread)
@@ -3042,7 +3046,7 @@ void BrokerNode::buildGateway() {
         cleanerAgent_ = std::make_unique<LogCleanerAgent>(
             replicaRegistry_.get(),
             /*cycleBudgetBytes=*/   128LL * 1024 * 1024,
-            /*dedupeBufferBytes=*/  -1,
+            /*dedupeBufferBytes=*/  config_.cleanerDedupeBufferBytes,
             /*ioMaxBytesPerSec=*/   cleanerIoMaxBytesPerSec,
             /*useCoalescing=*/      config_.enableCompactionCoalescing,
             /*coalescingRollBytes=*/64LL * 1024 * 1024);
@@ -4419,12 +4423,12 @@ void BrokerNode::buildAdminWorker() {
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
                                  uint16_t version, int32_t partitionCount,
                                  const std::vector<uint8_t>& blob,
-                                 uint16_t errorCode) {
+                                 uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures) {
             if (!adminWorkerAgent_) return;
             // Fix round 3: the encode / post / MessageTooLarge logic lives in
             // AdminWorkerAgent::postTopicSchemaResponse (directly testable).
             adminWorkerAgent_->postTopicSchemaResponse(session, corr, topicId, version, partitionCount,
-                                                       blob, errorCode);
+                                                       blob, errorCode, keyFeatures);
         };
         deps.respondCreateView = [this](int64_t session, int64_t corr, int32_t viewTopicId,
                                         uint64_t outputFingerprint, uint16_t errorCode) {

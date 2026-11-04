@@ -66,7 +66,7 @@ namespace rune::node {
 //   OK 0, NotLeader 2, Internal 6, UnknownTopic 7, InvalidSchema 23, TopicExists 25,
 //   SchemaIncompatible 30, SchemaConflict 31, ViewExists 32, ViewSourceNotFound 33,
 //   ViewFieldUnresolved 34, ViewKeyInvalid 35, ViewNotCoPartitioned 36,
-//   ViewSourceTransient 37, ViewNotAlterable 38, InvalidRequest 39 (with a detail),
+//   ViewSourceTransient 37 (reserved, never sent), ViewNotAlterable 38, InvalidRequest 39 (with a detail),
 //   InvalidTopicName 40, ViewSourceIsView 41.
 
 // ---------------------------------------------------------------------------
@@ -82,7 +82,7 @@ struct AdminDeps {
     std::function<void(int64_t session, int64_t corr, int32_t topicId,
                        uint16_t version, int32_t partitionCount,
                        const std::vector<uint8_t>& blob,
-                       uint16_t errorCode)> respondGet;
+                       uint16_t errorCode, const rune::protocol::TopicKeyFeatures& keyFeatures)> respondGet;
     /// AlterTopicResponse (69).  On OK `newVersion` is the new schema version; on
     /// an error, the current one (the client re-reads and retries its CAS).
     std::function<void(int64_t session, int64_t corr, int32_t topicId,

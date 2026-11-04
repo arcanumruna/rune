@@ -68,8 +68,10 @@ static std::string parseOptionalInt64Ms(
 {
     const char* raw = getenv_fn(varName);
     if (!raw || std::string_view(raw).empty()) return {}; // use default
-    if (!parseInt64Positive(raw, out))
-        return std::string(varName) + " must be a positive integer (ms), got: " + raw;
+    int64_t v = 0;
+    if (!parseInt64Positive(raw, v) || v > NodeConfig::kMaxDurationMs)
+        return std::string(varName) + " must be an integer in [1, " + std::to_string(NodeConfig::kMaxDurationMs) + "] (ms), got: " + raw;
+    out = v;
     return {};
 }
 
@@ -1056,6 +1058,23 @@ ConfigResult parseNodeConfig(
             cfg.storageRecoveryVote = (sv == "1" || sv == "true" || sv == "TRUE");
         }
     }
+    // RUNE_VIEW_BACKUP (default on) / RUNE_VIEW_BACKUPS_KEPT (default 3): strict, so a typo can never turn backups off silently.
+    {
+        const char* raw = getenv_fn("RUNE_VIEW_BACKUP");
+        if (raw && !std::string_view(raw).empty()) {
+            const std::string_view sv(raw);
+            if (sv == "1" || sv == "true" || sv == "TRUE") cfg.viewBackup = true;
+            else if (sv == "0" || sv == "false" || sv == "FALSE") cfg.viewBackup = false;
+            else return {{}, "RUNE_VIEW_BACKUP must be 0/1/true/false, got: " + std::string(sv)};
+        }
+        const char* rawKept = getenv_fn("RUNE_VIEW_BACKUPS_KEPT");
+        if (rawKept && !std::string_view(rawKept).empty()) {
+            int32_t v{};
+            if (!parseInt32(rawKept, v) || v < 1 || v > 1000)
+                return {{}, std::string("RUNE_VIEW_BACKUPS_KEPT must be 1..1000, got: ") + rawKept};
+            cfg.viewBackupsKept = v;
+        }
+    }
     // Re-review 2026-10-04 MEDIUM-B: unclean consensus election (default OFF) —
     // see NodeConfig::uncleanConsensusElection.
     {
@@ -1116,12 +1135,7 @@ ConfigResult parseNodeConfig(
                             ", " + std::to_string(NodeConfig::kMaxNsLimitTickUs) + "], got: " + raw};
         cfg.nsLimitTickUs = static_cast<int32_t>(v);
     }
-    if (const char* raw = getenv_fn("RUNE_AUTH_TIMEOUT_MS"); raw && *raw) {
-        int64_t v = 0;
-        if (!parseInt64Positive(raw, v))
-            return {{}, std::string("RUNE_AUTH_TIMEOUT_MS must be a positive integer (ms), got: ") + raw};
-        cfg.authTimeoutMs = v;
-    }
+    if (auto err = parseOptionalInt64Ms(getenv_fn, "RUNE_AUTH_TIMEOUT_MS", cfg.authTimeoutMs); !err.empty()) return {{}, err};
     // Issues #15 / #111 / #120: the security serving bounds (validated together, last, below).
     bool securityStalenessSet = false, securitySessionEndSet = false;
     {
@@ -1131,10 +1145,7 @@ ConfigResult parseNodeConfig(
                               {"RUNE_SECURITY_GATE_DEADLINE_MS", &cfg.securityGateDeadlineMs, nullptr}};
         for (const Knob& k : knobs) {
             if (const char* raw = getenv_fn(k.name); raw && *raw) {
-                int64_t v = 0;
-                if (!parseInt64Positive(raw, v))
-                    return {{}, std::string(k.name) + " must be a positive integer (ms), got: " + raw};
-                *k.field = v;
+                if (auto err = parseOptionalInt64Ms(getenv_fn, k.name, *k.field); !err.empty()) return {{}, err};
                 if (k.set != nullptr) *k.set = true;
             }
         }
@@ -1267,8 +1278,7 @@ ConfigResult parseNodeConfig(
         if (const char* raw = getenv_fn(name); raw && *raw) {
             char* end = nullptr;
             const long long v = std::strtoll(raw, &end, 10);
-            constexpr long long kMaxMs = 30LL * 24 * 3600 * 1000;   // 30 days: ms->ns never overflows
-            if (end == raw || *end != '\0' || v < 0 || v > kMaxMs)
+            if (end == raw || *end != '\0' || v < 0 || v > NodeConfig::kMaxDurationMs)   // 30 days: ms->ns never overflows
                 return {{}, std::string(name) + " must be an integer in [0, 2592000000] ms (0 = never), got '" +
                                 raw + "'"};
             *field = v;

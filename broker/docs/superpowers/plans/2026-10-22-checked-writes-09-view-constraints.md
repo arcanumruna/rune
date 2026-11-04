@@ -110,6 +110,144 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - **P7-9 (07).** At the engine level a unique view's conflicting record was skipped and counted in `FoldStats::keyConflicts`. This part replaces that with the §8.3 rule (Task 2).
 - **P8-1 / C14.** QL authors `unique = true` and `constraints`; Part 07 compiles them structurally (`CompiledConstraint { ordinal, name, predicate }`, ordinals 1..n in declaration order); this part evaluates them.
 
+## What batch 1 decides for this part (binding; added 2026-11-03)
+
+Issue batch 1 (`bugfix/issue-batch-1-views`) settles five things this part builds on. Where batch 1 contradicts a ruling or task below, batch 1 wins and the task is read as amended here.
+
+**Part 09 runs in parallel with batch 1 (owner, 2026-11-03).** Batch 1 is not on `main` yet. Part 09's branch merges `origin/bugfix/issue-batch-1-views` in as batch 1 commits land; never rebase onto it or cherry-pick from it. Once batch 1 merges to `main`, merge `main` instead. Status per item, as of 2026-11-03:
+
+| Item | Who builds it | Status | What Part 09 does until it lands |
+|---|---|---|---|
+| B1-1 catalog-ordered set changes (#788) | **Part 09** (batch 1 defers #788 and #785 to this part; no batch 1 code) | not started | Build it here, as Task 5's first step, before P9-5's candidate path. |
+| B1-2 backup: IO agent, `beginDiscard_`, `CheckpointState` (C1, C2, W3) | batch 1 | landed: a17d470b, b42bd9ce, c6b5695f | Use it. |
+| B1-2 log-start rule (#726, C3) | batch 1 | landed: dd542839 | Use it. |
+| B1-2 legacy and unreadable checkpoints (#590, C4) | batch 1 | landed: 99839bd6 | Task 2's tables 6/7 recovery goes through `applyRecoveredCheckpoint_` (below). |
+| B1-2 torn checkpoint tail (C7) | batch 1 | landed: 067efee6 | Tables 6/7 records go through `scanViewCheckpoint`; merge C7 before Task 2's recovery step. |
+| B1-2 checkpoint ahead of the log (#159, C5) and docs/e2e (C6) | batch 1 | landed: e7b6b942, c2cce09b, cc8dbc0e, b78ec7fc | Nothing; Part 09 inherits them. |
+| B1-6 review fixes: idle accounting for an unsettled member, backup fsync order | batch 1 | landed: a1b796d8, a3fba9e8 | Follow item 6 below. |
+| B1-3 per-record batch verdicts (#802, claimBatch) | batch 1 (wave 1C, steps 8–10) | landed: 8001c769, 9548e771; queue sizing a194cfc8 | Use it (see "Batch 1 fix rounds" below for the queue and size rules). |
+| B1-4 verdict-member discard backed up before its refold ("NEW", wave 1A step 4) | batch 1 | landed: b42bd9ce (test 4ec54371) | Task 4 and Task 6 refold through `VerdictViewHooks::discard`. |
+| B1-5 concrete `AbortedTxnFilter` (#591) | batch 1 | landed: f8871a67, b439b046 | Use it. |
+
+**Pending batch 1 changes in code this part edits (merge before touching these):**
+- **C4 (#590, landed 99839bd6), `WorkerViewSet.cpp` recovery.** `readCheckpointFile` is a pure read returning `RecoveredCheckpoint{bytes, CheckpointOrigin}` (`None | Committed | CommittedAndLegacy | LegacyOnly`, `WorkerViewSet.h`); it never removes a file. `loadRecoveryCheckpoint_` and `installViewForRecovery` call `applyRecoveredCheckpoint_(inst, rc, records, applied)`: `LegacyOnly` → `beginDiscard_(Legacy)`; `CommittedAndLegacy` → the legacy file is backed up as `legacy-superseded` and the committed one loads; `Committed` with `applied < records`, or bytes with no record → `beginDiscard_(Unreadable)`. There is no `ReplayResult` type: the replay's record and applied counts are the result. Task 2's "tables 6/7 unreadable or inconsistent → discard" makes a tables 6/7 record that fails to apply count as not applied, so it falls into that `Unreadable` branch; it adds no new branch. C4 does not pass `SourceLogBounds` into `materializeRecoveryInstancesFor` or `driveJudge` (the judge uses `bindLeader`'s `logStart`); C5 adds that where it needs it.
+- **C7, the checkpoint splitter.** `splitViewCheckpointRecords` (`ViewInstance.h`, `WorkerViewSet.cpp`) is replaced by `scanViewCheckpoint`, which classifies a file `Clean | TornTail{cleanLen} | Corrupt{cleanLen}`. The IO agent truncates a `TornTail` on open, with no backup (nothing decodable is removed), and `Corrupt` is `Unreadable`. Any record kind this part adds to the checkpoint (claim tables 6 and 7) must be a CRC-framed record the scan understands. Never add a format the scan would call `Corrupt` when it is torn.
+- **C5 (#159).** `checkpointsAheadOfLog` and `beginDiscard_(AheadOfLog)` in `applyRecoveredCheckpoint_` and the first `driveView_` pass. Constrained views inherit it.
+- **#807, wave 1A (`Worker.h` gate before `driveViewsOf_`, `ensureVerdictSource`'s erase branch).** A source whose last verdict view is dropped erases its judge. Task 6's two-phase drop relies on it: after the last constrained view on a source drops, `write.verdicts` is null and nothing waits on a frozen `judgedThrough`.
+- **#809, wave 1B (`verdictOnLogCut_`).** The verdict timeline is cut at the lowest truncation since the last pass, not the last one. Task 4's timeline work uses that floor.
+- **#808, wave 1B (`driveViewsOf_`).** A judge is created only on a disk-backed replica. Unique and Check members never run on a memory-backed replica (SD9 already refuses them in production).
+- **#804, wave 1C (`ControlRecordLayout.h`).** New `parseControl` → `ControlRecord{type, value}` with one CRC per record. `LogCleaner`, `verdictFeedBatch` and the rig parse through it. Type 18 v2 (B1-1) and type 20 (P9-8) parse through `parseControl`; `parseControl` keeps refusing type 20 until P9-8 switches it on.
+- **#806, wave 1C (`Producer.h`, `ProducerImpl.cpp`).** New `AckCompletionFn(ctx, const Completion&, payload)` and an `onAck` overload: an ack handler sees constraintId, aux, op and the verdict trailer. Task 7's `constraintName` tests cover both the CQ and the handler paths.
+- **#791 instrumentation, wave 1A (cold path).** Warn-level logs in `syncConstraintSet_`, `VerdictSource::waitForInstall_` and the view-ack timeout. B1-1 rewrites `syncConstraintSet_`: keep the logs, and add the gate's decision (`catalogThrough_` vs the change's `catalogThrough`) to them.
+- **`VerdictRig::compact()` (5be53b2c, branch `bugfix/verdict-rig-flush-wait`, merged into batch 1 next).** It now waits for the worker's in-flight async flush before compacting (`Log::flushPinnedSegmentsForTest`), so a swap is never refused with `FlushInFlight` under load. Every compaction cell this part adds to the verdict tests (Task 2's refold-after-compaction, type 20's kept-records cell) uses `compact()` and must not compact by hand around it.
+- **#798, #799, #801, wave 1D.** Tests and contract docs only. They touch the overview contracts this part reads; merge before editing those docs.
+
+**Batch 1 fix rounds and adversarial pass (landed on `bugfix/issue-batch-1-views`, 2026-11-03).** These change behaviour this part's tasks rely on:
+- **a194cfc8 — a View batch fits a default client queue up to 4096 records.**
+  - **Why:** a View batch completion is 48 + 8n bytes. Before this commit, a batch of more than 2048 records was refused (`MessageTooLarge`) on a default queue.
+  - **The reservation rule:** a reservation r above the queue's slack record M (16432 by default) now reserves 2r − 48. `deliver()` caps the record at max((R + 48) / 2, M).
+  - **A BatchAck verdict list too big for the queue's `maxMsgLength`:** it is delivered with an empty list and status `ResultTooLarge`, never truncated.
+  - **Task 7 and Task 8:**
+    - Every multi-record cell uses the default queue.
+    - Add one cell over 2048 records with rejections at index 0, in the middle and last.
+    - Add one cell where the trailer exceeds `maxMsgLength`, expecting `ResultTooLarge` with no entries.
+- **fdcc3c26 — a View ack fills its verdicts from the rejected index even after the judge is erased.**
+  - Task 6's two-phase drop relies on it: an ack still owed when the last constrained view on a source drops still reports its rejections.
+  - Test: `CheckedWritesVerdictAckRigRegression.ViewAckAfterTheJudgeIsErasedStillCarriesItsVerdictsRegression`. Keep it green.
+- **3e1c84a7 — a completion's credit is returned after the ring read, not inside the handler.**
+  - A `poll()` or `waitFor()` handler may issue the next op. Until the read ends, `reserve()` can answer `QueueFull`, so poll again first.
+  - Task 7's `constraintName` tests that reissue from a handler must expect that.
+- **67d40645 — a log cleaner walk that stops at a damaged batch installs nothing.** The log stays uncleanable until restart (`LogCleaner::uncleanable()`, `damage()`).
+  - Type 20's kept-records cell (`VerdictPlanRecordsAreAlwaysKept`) and every compaction cell this part adds run on undamaged segments.
+  - A damaged-segment cell asserts that the segment's bytes are unchanged, not that records were dropped.
+- **eef4d089 (#804) — the cleaner validates a control record once, in `validateBatch` → `parseControl`.** Type 18 v2 and type 20 go through that one parse in the cleaner too. Never add a second CRC or parse of a marker in a cleaner walk.
+- **7dafe303 (#791) — the constraint-set sync detail logs are at debug.** The warn-level logs stay only for the view-ack timeout and the judge's install wait. B1-1's gate decision is logged at debug alongside them.
+
+1. **B1-1 — A lagging leader never undoes a newer constraint change (#788; amends P9-5, P9-6 and Task 5). Decided in batch 1's planning; this part implements it (batch 1 ships no code for it).**
+   - **Bug class.** `syncConstraintSet_` (`WorkerViewSet.cpp`) builds the desired set from the templates installed on this worker. Nothing orders that against the logged set. A leader whose catalog has not yet applied a DDL change computes the old set and logs it. For example, a replace is reverted (fp2 → fp1) and the replicas that had already replaced wait forever (#788). P9-5's candidate path has the same hole, and so do a create or drop that the new leader has not applied yet.
+   - **Rule.** Every `ConstraintSetChange` (type 18) records the catalog position it was computed at. A leader asks for a change only when its own catalog has applied at least that position. Otherwise it keeps the logged set and asks again once its catalog advances. The catalog (`__catalog`) is one linear log, so a leader at or past that position knows every DDL that produced the logged set: any difference is a newer DDL, never a stale one. Convergence comes from catalog replication, not from a timeout (rule 16).
+   - **Wire.** The type-18 payload goes to version 2: `[version u8 = 2][constraintSetId u32][catalogThrough i64][count u16]` followed by count × `[viewObjectId u64][kind u8][planFingerprint u64]`. Members are unchanged. Type 18 has never been released (it is not in `broker-v0.3.0`), so readers accept only version 2. A version-1 type 18 is unparseable, and no compatibility path is kept. Types 17, 19 and 20 keep their own version bytes.
+   - **The worker's catalog position.**
+     - The control thread fans a `kCatalogMarkMsgType {appliedThrough i64}` frame out to every worker's `install` ring.
+     - It sends the frame for each `kA2cCatalogApplied`, through the same FIFO `viewFanoutBacklog_` as the plan installs.
+     - So a worker sees an event's installs and uninstalls before the mark that covers them.
+     - `WorkerViewSet::catalogThrough_` starts at -1 at boot. It holds the latest mark, which never moves back.
+   - **Gate.** `syncConstraintSet_` returns 0 without a request while `catalogThrough_ < latestChange.catalogThrough`. `requestChange` stamps `catalogThrough_`. The sync cache (`constraintSyncEpoch`, `constraintSyncChange`) also keys on `catalogThrough_`, so a mark re-runs the sync. The judge's existing wait for an uninstalled member stays as it is.
+   - **Tests this part adds.** Each test fails first and is named `…Regression`; closing #788 cites the repro test. Run each one in the 1-node VerdictRig and with a failover in `ThreeNodes`:
+     - **The #788 repro.** A follower has T1 (fp1). Replicate a change to {obj, fp2} at a catalog position above its own, then promote it. No change re-adds fp1. After the fp2 install and mark arrive, the judge activates.
+     - **The same shape for create and drop.**
+     - **The P9-5 candidate path.**
+     - **Restart before the first mark.**
+     - **Mutation.** Drop the gate, and every one of them logs the stale set.
+
+2. **B1-2 — Every restart-time discard goes through the view backup (owner rule; amends P9-6, P9-8, Tasks 2, 5, 6 and the RestartDuringRebuild timing).**
+   - **Owner rule.** "We first need to create a backup and then rebuild it… whenever we rebuild materialized views on restart… by default unless it's turned off."
+   - **Entry point.** Batch 1 makes `WorkerViewSet::beginDiscard_(ViewInstance&, ViewDiscardReason)` the only way to throw away a view instance's persisted rows. `VerdictSource` reaches it through `VerdictViewHooks::discard`, and it no longer writes `foldCursor` itself.
+   - **What it does.**
+     - The `ViewSnapshotIoAgent` moves the checkpoint to `__view_snapshots/backup/view-<id>-p<n>.<seq>.<reason>.delta` and acks.
+     - The instance waits in `CheckpointState` (`Live | DiscardOwed | DiscardPending | DiscardFailed`). While it waits it folds nothing and serves NotReady.
+     - On the ack it rebuilds from `logStart`.
+     - A failed backup leaves the view NotReady for the rest of the boot. A restart, or `RUNE_VIEW_BACKUP=0`, ends that state.
+   - **Knobs.** `RUNE_VIEW_BACKUP` (default on) and `RUNE_VIEW_BACKUPS_KEPT` (default 3).
+   - **What this part must do.**
+     - A checkpoint whose unique-claim tables 6 and 7 are unreadable or inconsistent is a discard. Use reason `unreadable`.
+     - A persisted Unique or Check member discarded at activation is a discard. Use reason `ahead-of-verdicts`.
+     - Any rebuild this part adds for a persisted constrained view is a discard. Use an existing reason, or add an enumerator to `ViewDiscardReason`.
+     - The enumerators that exist (`ViewSnapshotChannel.h`): `Legacy`, `LegacySuperseded`, `Unreadable`, `AheadOfLog`, `AheadOfVerdicts`, `BelowLogStart`. File names use their kebab form (`unreadable`, `ahead-of-verdicts`, `below-log-start`).
+     - **The log-start rule (#726, batch 1 C3).** `driveView_` and the verdict judge compare a view's `foldCursor` with the source's `logStart` (`SourceLogBounds`, disk sources only): no rows → the cursor starts at `logStart`; rows → `beginDiscard_(BelowLogStart)`. Unique and Check members inherit it, and their claim tables 6 and 7 are part of the backed-up checkpoint. Compaction never moves `logStart`, so `PreExistingDuplicatesSurviveCompactionAndRefoldRegression` stays a refold without a discard; a retention cell (`deleteRetentionMs` past the first segment) must show one `below-log-start` backup.
+     - Nothing truncates a checkpoint or resets tables directly.
+     - Transient constrained views have no file. `beginDiscard_` resets them in place and sends no frame, so the P9-9 transient rebuild needs nothing extra.
+   - **Tests.**
+     - The RestartDuringRebuild cells assert exactly one backup per discard of a persisted constrained view. The backup is checked through batch 1's read-back seam and must hold the pre-discard rows and claims.
+       The seam is `listViewBackups(dir, viewTopicId, partition)` and `viewBackupDir(dir)` (`ViewSnapshotIoAgent.h`, `ViewSnapshotChannel.h`), driven with `WorkerViewSet::beginDiscardForTest` / `checkpointStateForTest` and `ViewSnapshotIoAgent::forceWriteFailureForTest` for the failed-backup cell.
+     - With the knob off, no backup is taken.
+     - A failed backup gives `DiscardFailed`: the view stays NotReady and writers on that source wait. They are never judged against an empty claim table.
+
+3. **B1-3 — A batch reports each record's verdict (owner rule; amends P9-11, Task 7 and the client file list).**
+   - **Owner rule.** Batching saves round trips. It does not make the records' verdicts all-or-nothing.
+   - **What batch 1 adds (#802 and claimBatch).**
+     - A new status, `OpStatus::RecordsRejected` (15), for a claim, Tier-2 batch or BatchAck of two or more records where at least one record is rejected.
+     - `value` is the batch's base offset.
+     - `errorCode` and `reserved0` hold the first rejection's code and constraintId.
+     - The payload is the ProduceResponse v12 verdict trailer, 8 bytes per rejection: `u16 index`, `u16 code`, `u32 constraintId`. It is decoded by the zero-copy `BatchVerdicts` reader, with `rejectedCount`, `rejection(k)`, `accepted(i)` and `offsetOf(i)`.
+     - If every record is accepted, the result is plain `Ok`. Single-record sends keep their per-handle completion.
+     - There is no wire change.
+   - **What this part must do.**
+     - Codes 51 `ConstraintViolation`, 52 `KeyExists` and 53 `KeyNotFound` are per-record verdicts. They travel only as trailer entries, with constraintId = `viewObjectId << 16 | ordinal`. A rejected record never fails its claim or batch.
+     - 54 `AutoIncrementExhausted` refuses the whole batch before any record is judged, so it stays a batch-level `BrokerError` with no trailer.
+     - P9-11's "the rejected record's own offset" is `value + rejection(k).index` in a batch completion. The single-record path keeps P9-11 as written.
+     - The duplicate-replay rule (R04e/R04g) replays the same trailer. So a retried batch gets the same `RecordsRejected` payload, and `Client::constraintName` resolves each entry.
+     - Task 7 adds `constraintName` tests over a `RecordsRejected` completion with entries at index 0, in the middle and last.
+     - Task 8's matrix uses `BatchVerdicts` for every multi-record cell.
+
+4. **B1-4 — The verdict-member refold keeps batch 1's fix (amends Task 4 and Task 6).**
+   - **Batch 1's fix.** It routes `discardCheckpointAhead_` through `beginDiscard_`, which backs up first and then refolds from `logStart`. Before this, the refold dropped the persisted member's rows with no backup.
+   - **What this part must do.** When this part extends the refold to Unique and Check members, including the retained-plan install of P9-8, it calls the same hook. It must not bring back a direct `foldCursor = 0` or a table reset.
+
+5. **B1-5 — The aborted-transaction filter is a concrete type (#591; amends Task 2 and Task 4).**
+   - **Batch 1's change.** `AbortedTxnFilter` holds the concrete `AbortedTxnIndex` and `isAborted` is inline; the fold path no longer makes an indirect call per record (bench `BM_ViewFoldReplace` txn arg).
+   - **What this part must do.** The unique-claim fold and the Check evaluation skip aborted records through the same `AbortedTxnFilter`. No `std::function`, virtual or new indirection is added to that path. Task 12's alloc gate and benches cover the transactional arg.
+
+6. **B1-6 — A member waiting on its backup costs no CPU (batch 1 review fix a1b796d8; amends Task 4 and Task 6).**
+   - **Batch 1's fix.** Before it, `pushVerdictCheckpoint_` returned 1 for every member whose checkpoint was not settled (`CheckpointDiscardPending`, and `CheckpointDiscardFailed` for good). So one failed backup kept the worker from ever reaching its `IdleStrategy`. Now only an owed discard whose frame went out counts: `return tryPushDiscard_(inst) ? 1 : 0`. Pending and Failed report 0. Tests: `CheckedWritesVerdictRestartRegression.Discard{Failed,Pending}VerdictMemberLetsTheWorkerIdleRegression`, which use the rig's new `pauseAgent` to hold the ack.
+   - **What this part must do.** Every checkpoint push this part adds for Unique and Check members, including the P9-8 retained-plan members, keeps that accounting. A `DiscardFailed` member stays unsettled. The judge counts it as behind and passes no verdict over it, and it costs no CPU.
+   - **Durability order (a3fba9e8).** The IO agent links the checkpoint into `backup/`, fsyncs `backup/`, then unlinks the original and fsyncs the view directory. The test is `ViewBackupRegression.BackupDirIsDurableBeforeTheCheckpointIsUnlinkedRegression`. This part adds no other unlink of a checkpoint file.
+
+**What batch 2 changes under this part (`bugfix/issue-batch-2-*`; in progress; whichever of batch 2 and this part merges second rebases onto the other).**
+- **2C #640 — catalog DDL is authorized against the target's namespace.** `authorizeCatalogDdl_` passes the target object's nsId to `authorizeName`, never the caller's. Task 3's `unique` / `check` create, replace and drop go through that path unchanged; add one cell per DDL where a non-root user of namespace A names a view in namespace B → `NotAuthorized` (45).
+- **2C #652 — the DDL audit principal is qualified.** A tenant's DDL event records `<ns>/<user>` (or `#<nsId>/<user>` when the namespace record is gone); `default` stays bare. Constraint DDL events inherit it. The fingerprint ignores the principal, so P9-5's candidate and fingerprint rules are unchanged.
+- **2C B1 (review) — group and transactional-id grants authorize the scoped local name.** `alpha/g` from alpha is authorized as group `g` in alpha, never as the text "alpha/g". This part adds no group or txn-id checks; nothing changes for it.
+- **2C #625 — `ObjectIndex` keeps the older live holder of a shared name.** Dropping a constrained view while a newer object of the same name exists re-points the name to the highest live id. P9-12 resolves by `objectId`, so `constraintName` is unaffected; Task 7's "drop then recreate the same name" cell must still resolve the old id to the old view.
+- **2D-2 #737 / #738 / #734 part 2 — `client-cpp/src/producer/ProducerImpl.cpp`.** They edit `onCoordinatorAnswer` and the `sweepTimedOut` signatures, the file Task 7 edits for the rejected record's offset. Hunks are separate; no shared logic.
+- **2E #796 — aborted-fold cells pinned.** New `ViewFold` / `AggFold` tests pin that `skippedAborted` counts aborted *batches*. Task 2's fold changes keep them green.
+- **2E #658 part A — `SkimpyOffsetMap(Sizing)`.** The cleaner's dedupe map is built from `sizingForBudget(budget)` and sized by the new `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` (default 128 MiB, which before allocated 256 MiB). Any cleaner this part constructs in a test (type 20's `VerdictPlanRecordsAreAlwaysKept`) uses that constructor.
+- Batch 2's other waves (peer-link, flakes, transport/NAT egress, metrics, CI) touch nothing this part reads or edits.
+
+**Handoffs, not decisions.**
+- #785 (activation below a drop) and #805 (type 20) stay open for this part's Task 6 and P9-8.
+- Batch 1's `parseControl` keeps refusing type 20 until P9-8 switches it on.
+- #791 (judge stall diagnosis) gets its instrumentation in batch 1. Its run waits for the cw05 merge; if the run blames the install wait, the fix belongs to B1-1 or Task 6.
+
 ## Part rulings (P9; binding for executors, recorded so the reviewer can overturn any)
 
 - **P9-1 — Member kinds and fingerprints.**

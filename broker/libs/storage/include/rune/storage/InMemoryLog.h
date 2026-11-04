@@ -338,6 +338,11 @@ public:
 
     /// The ring's byte capacity (a batch larger than this is kRefusedTooLarge).
     [[nodiscard]] std::size_t capacityBytes() const noexcept { return maxBytes_; }
+    /// The (nsId, nsSlot) of the namespace this transient topic lives in, as Log::setNsTag: set by the control thread once,
+    /// before a worker sees the ring.  A view over this ring is charged to that namespace.
+    void setNsTag(uint32_t nsId, uint16_t nsSlot) noexcept { nsId_ = nsId; nsSlot_ = nsSlot; }
+    [[nodiscard]] uint32_t nsId() const noexcept { return nsId_; }
+    [[nodiscard]] uint16_t nsSlot() const noexcept { return nsSlot_; }
     /// Appends refused because the ring would have had to evict at/above the floor.
     [[nodiscard]] uint64_t fullRefusals() const noexcept { return fullRefusals_; }
     /// Records evicted (retention), summed over evicted batches.
@@ -609,6 +614,8 @@ private:
     static constexpr int64_t kNoEvictionFloor = std::numeric_limits<int64_t>::max();
     int64_t               evictionFloor_  = kNoEvictionFloor;   ///< E2: see setEvictionFloor
     int32_t               leaderEpochStamp_ = -1;                                   ///< E2: see setLeaderEpochStamp
+    uint32_t              nsId_           = 0;   // see setNsTag()
+    uint16_t              nsSlot_         = 0;
     uint64_t              fullRefusals_   = 0;
     uint64_t              evictedRecords_ = 0;
 

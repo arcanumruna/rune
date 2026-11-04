@@ -72,7 +72,7 @@ TEST(GeneratedRoundTrip, VersionStampHonoredForV2Field) {
     // 1. The generator must emit kVersion=2 and stamp it (not a hard-coded 1).
     const std::string hdr = generateHeader(d);
     EXPECT_NE(hdr.find("kVersion     = 2u"), std::string::npos);
-    EXPECT_NE(hdr.find("wr16(kVersion);"), std::string::npos);
+    EXPECT_NE(hdr.find("wr16_(kVersion);"), std::string::npos);
     EXPECT_EQ(hdr.find("wr16(uint16_t(1)); // version"), std::string::npos);
 
     // 2. Hand-frame a record with the correct v2 header stamp and confirm the

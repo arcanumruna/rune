@@ -808,6 +808,47 @@ TEST(NodeConfigRegression, NsDeleteBatchIsParsedAndBoundedRegression) {
     }
 }
 
+// RUNE_VIEW_BACKUP / RUNE_VIEW_BACKUPS_KEPT: strict, so a typo can never turn backups off silently.  RED: a lenient parse.
+TEST(NodeConfigRegression, ViewBackupKnobsParseStrictRegression) {
+    auto r = parseNodeConfig(fakeEnv(base1node()));
+    ASSERT_TRUE(r.error.empty()) << r.error;
+    EXPECT_TRUE(r.config->viewBackup);
+    EXPECT_EQ(r.config->viewBackupsKept, 3);
+    for (const char* off : {"0", "false", "FALSE"}) {
+        auto env = base1node();
+        env["RUNE_VIEW_BACKUP"] = off;
+        auto g = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(g.error.empty()) << off << ": " << g.error;
+        EXPECT_FALSE(g.config->viewBackup) << off;
+    }
+    for (const char* on : {"1", "true", "TRUE"}) {
+        auto env = base1node();
+        env["RUNE_VIEW_BACKUP"] = on;
+        auto g = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(g.error.empty()) << on << ": " << g.error;
+        EXPECT_TRUE(g.config->viewBackup) << on;
+    }
+    {
+        auto env = base1node();
+        env["RUNE_VIEW_BACKUP"] = "yes";
+        const auto g = parseNodeConfig(fakeEnv(env));
+        EXPECT_NE(g.error.find("RUNE_VIEW_BACKUP"), std::string::npos) << g.error;
+    }
+    for (const char* bad : {"0", "1001", "x"}) {
+        auto env = base1node();
+        env["RUNE_VIEW_BACKUPS_KEPT"] = bad;
+        const auto g = parseNodeConfig(fakeEnv(env));
+        EXPECT_NE(g.error.find("RUNE_VIEW_BACKUPS_KEPT"), std::string::npos) << bad;
+    }
+    for (const auto& [raw, want] : std::vector<std::pair<const char*, int32_t>>{{"1", 1}, {"1000", 1000}}) {
+        auto env = base1node();
+        env["RUNE_VIEW_BACKUPS_KEPT"] = raw;
+        const auto g = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(g.error.empty()) << raw << ": " << g.error;
+        EXPECT_EQ(g.config->viewBackupsKept, want) << raw;
+    }
+}
+
 // CP3 I4: RUNE_BROKER_LIVENESS_TIMEOUT_MS — default 0 (the agent uses 3 x the leader-heartbeat timeout); a positive value
 // is carried; garbage is refused.  RED: ignore the variable.
 TEST(NodeConfigRegression, BrokerLivenessTimeoutEnvIsParsedRegression) {
@@ -3388,6 +3429,81 @@ TEST(ResponseControlConfigRegression, SelfAdvertisedDisagreementIsRefusedRegress
     ASSERT_TRUE(e.has_value());
     EXPECT_NE(e->find("RUNE_GATEWAY_RESPONSE_CONTROL_PORT"), std::string::npos) << *e;
     EXPECT_NE(e->find("8th"), std::string::npos) << *e;
+}
+
+
+// #803: every ms knob that is multiplied by 1'000'000 (ns) later is capped at 30 days, so the conversion never overflows an int64.
+namespace {
+struct MsKnobRow {
+    const char* var;
+    int64_t NodeConfig::*field;
+    int64_t okValue;                                  // accepted at the cap (one below for a knob that must stay below another)
+    std::map<std::string, std::string> extra;         // the knobs it is validated against
+};
+}  // namespace
+
+TEST(NodeConfigRegression, MsKnobsAboveThirtyDaysAreRefusedRegression) {
+    constexpr int64_t kCap = NodeConfig::kMaxDurationMs;
+    ASSERT_EQ(kCap, 2'592'000'000LL);
+    const std::vector<MsKnobRow> rows = {
+        {"RUNE_METRICS_SYSTEM_INTERVAL_MS", &NodeConfig::metricsSystemIntervalMs, kCap, {}},
+        {"RUNE_ELECTION_TIMEOUT_MS", &NodeConfig::electionTimeoutMs, kCap, {}},
+        {"RUNE_VERDICT_INTERVAL_MS", &NodeConfig::verdictIntervalMs, kCap, {}},
+        {"RUNE_ELECTION_STATUS_INTERVAL_MS", &NodeConfig::electionStatusIntervalMs, kCap, {}},
+        {"RUNE_STARTUP_CANVASS_TIMEOUT_MS", &NodeConfig::startupCanvassTimeoutMs, kCap, {}},
+        {"RUNE_AUTH_TIMEOUT_MS", &NodeConfig::authTimeoutMs, kCap, {}},
+        // F must stay below R: the cap itself is exercised by R, F takes cap - 1 under an R at the cap.
+        {"RUNE_SECURITY_MAX_STALENESS_MS", &NodeConfig::securityMaxStalenessMs, kCap - 1, {{"RUNE_SECURITY_STALE_SESSION_END_MS", "2592000000"}}},
+        {"RUNE_SECURITY_STALE_SESSION_END_MS", &NodeConfig::securityStaleSessionEndMs, kCap, {}},
+        {"RUNE_SECURITY_GATE_DEADLINE_MS", &NodeConfig::securityGateDeadlineMs, kCap, {}},
+    };
+    for (const MsKnobRow& row : rows) {
+        SCOPED_TRACE(row.var);
+        auto withValue = [&](const std::string& v) {
+            auto env = base3node();
+            for (const auto& [k, x] : row.extra) env[k] = x;
+            env[row.var] = v;
+            return parseNodeConfig(fakeEnv(env));
+        };
+        const auto ok = withValue(std::to_string(row.okValue));
+        ASSERT_TRUE(ok.error.empty()) << ok.error;
+        EXPECT_EQ((*ok.config).*(row.field), row.okValue);
+        for (const char* bad : {"2592000001", "9223372036854775807"}) {
+            const auto r = withValue(bad);
+            EXPECT_FALSE(r.error.empty()) << bad << " was accepted";
+            EXPECT_NE(r.error.find(row.var), std::string::npos) << r.error;
+        }
+    }
+}
+
+// Batch 1 adversarial pass, #803 sibling class: the ms knobs #803 did not route through the 30-day cap.  RUNE_CONTROLLED_SHUTDOWN_MS
+// becomes std::chrono::milliseconds that BrokerNode::controlledShutdown adds to a steady_clock (ns) time point, and
+// RUNE_NS_DEFAULT_MAX_TXN_TIME_MS is multiplied by 1'000'000 in TransactionCoordinator::doWork; above the cap both overflow.
+// Kept out of the suite until the issue is fixed (#837).
+TEST(NodeConfigRegression, DISABLED_UncappedMsKnobsAboveThirtyDaysAreRefusedAdversarialRegression) {
+    constexpr int64_t kCap = NodeConfig::kMaxDurationMs;
+    for (const char* var : {"RUNE_CONTROLLED_SHUTDOWN_MS", "RUNE_NS_DEFAULT_MAX_TXN_TIME_MS"}) {
+        SCOPED_TRACE(var);
+        auto withValue = [&](const std::string& v) {
+            auto env = base3node();
+            env[var] = v;
+            return parseNodeConfig(fakeEnv(env));
+        };
+        const auto ok = withValue(std::to_string(kCap));
+        ASSERT_TRUE(ok.error.empty()) << ok.error;
+        for (const char* bad : {"2592000001", "9223372036854775807"}) {
+            const auto r = withValue(bad);
+            EXPECT_FALSE(r.error.empty()) << bad << " was accepted";
+            EXPECT_NE(r.error.find(var), std::string::npos) << r.error;
+        }
+    }
+    // RUNE_PRODUCER_ID_EXPIRATION_MS is parsed with strtoll and no end check: trailing garbage and ERANGE are accepted silently.
+    for (const char* bad : {"5000abc", "99999999999999999999"}) {
+        auto env = base3node();
+        env["RUNE_PRODUCER_ID_EXPIRATION_MS"] = bad;
+        const auto r = parseNodeConfig(fakeEnv(env));
+        EXPECT_FALSE(r.error.empty()) << "RUNE_PRODUCER_ID_EXPIRATION_MS=" << bad << " was accepted";
+    }
 }
 
 } // namespace rune::node

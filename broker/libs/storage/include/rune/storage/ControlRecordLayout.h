@@ -180,21 +180,38 @@ inline std::size_t buildConstraintSetChange(std::span<uint8_t> out, uint32_t con
     return total;
 }
 
-/// The type (16-19) of a well-formed checked-writes control batch, else kUnparseable.
-[[nodiscard]] inline int recordType(const uint8_t* batch, std::size_t len) noexcept {
-    int16_t type = 0;
-    if (!detail::valueOf(batch, len, type)) return kUnparseable;
-    return type >= kReservation && type <= kTxnJudge ? type : kUnparseable;
-}
+/// A validated checked-writes control batch (type 16-19): the type and the value view into the batch bytes.  Obtain one only from
+/// parseControl, which runs the framing and the CRC once; the view overloads below do no CRC and trust it.
+struct ControlRecord {
+    int16_t                  type;
+    std::span<const uint8_t> value;   // valid while the batch bytes are
+};
 
-[[nodiscard]] inline std::optional<MarkerHeader> parseMarkerHeader(const uint8_t* batch, std::size_t len) noexcept {
+/// Validates `batch` once (framing + CRC32C) and returns its type and value; nullopt for anything that is not a well-formed control
+/// batch of type 16-19 (a transaction marker, a data batch, a damaged or truncated batch, type 20 and above).
+[[nodiscard]] inline std::optional<ControlRecord> parseControl(const uint8_t* batch, std::size_t len) noexcept {
     int16_t type = 0;
     const auto v = detail::valueOf(batch, len, type);
-    if (!v || type != kVerdictMarker || v->size() < kMarkerFixedBytes) return std::nullopt;
-    const uint8_t* p = v->data() + 1;
+    if (!v || type < kReservation || type > kTxnJudge) return std::nullopt;
+    return ControlRecord{type, *v};
+}
+
+/// The type (16-19) of a well-formed checked-writes control batch, else kUnparseable.
+[[nodiscard]] inline int recordType(const uint8_t* batch, std::size_t len) noexcept {
+    const auto c = parseControl(batch, len);
+    return c ? c->type : kUnparseable;
+}
+
+[[nodiscard]] inline std::optional<MarkerHeader> parseMarkerHeader(const ControlRecord& c) noexcept {
+    if (c.type != kVerdictMarker || c.value.size() < kMarkerFixedBytes) return std::nullopt;
+    const uint8_t* p = c.value.data() + 1;
     MarkerHeader h{detail::get<int64_t>(p), detail::get<int64_t>(p + 8), detail::get<uint32_t>(p + 16), detail::get<uint32_t>(p + 20)};
-    if (h.count > kMaxMarkerEntries || v->size() != kMarkerFixedBytes + h.count * kMarkerEntryBytes) return std::nullopt;
+    if (h.count > kMaxMarkerEntries || c.value.size() != kMarkerFixedBytes + h.count * kMarkerEntryBytes) return std::nullopt;
     return h;
+}
+[[nodiscard]] inline std::optional<MarkerHeader> parseMarkerHeader(const uint8_t* batch, std::size_t len) noexcept {
+    const auto c = parseControl(batch, len);
+    return c ? parseMarkerHeader(*c) : std::nullopt;
 }
 
 /// A parsed marker: the header and a random-access view of its entries (absolute offsets), without copying.
@@ -206,39 +223,48 @@ struct MarkerView {
     [[nodiscard]] uint32_t constraintIdAt(uint32_t i) const noexcept { return detail::get<uint32_t>(entries + i * kMarkerEntryBytes + 6); }
 };
 
-[[nodiscard]] inline std::optional<MarkerView> parseMarker(const uint8_t* batch, std::size_t len) noexcept {
-    const auto h = parseMarkerHeader(batch, len);
+[[nodiscard]] inline std::optional<MarkerView> parseMarker(const ControlRecord& c) noexcept {
+    const auto h = parseMarkerHeader(c);
     if (!h) return std::nullopt;
-    int16_t type = 0;
-    return MarkerView{*h, detail::valueOf(batch, len, type)->data() + kMarkerFixedBytes};
+    return MarkerView{*h, c.value.data() + kMarkerFixedBytes};
+}
+[[nodiscard]] inline std::optional<MarkerView> parseMarker(const uint8_t* batch, std::size_t len) noexcept {
+    const auto c = parseControl(batch, len);
+    return c ? parseMarker(*c) : std::nullopt;
 }
 
-/// fn(int64_t offset, uint16_t code, uint32_t constraintId) per entry; false when `batch` is not a marker.
+/// fn(int64_t offset, uint16_t code, uint32_t constraintId) per entry; false when `c` is not a marker.
 template <class Fn>
-bool forEachMarkerEntry(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept {
-    const auto h = parseMarkerHeader(batch, len);
-    if (!h) return false;
-    int16_t type = 0;
-    const uint8_t* p = detail::valueOf(batch, len, type)->data() + kMarkerFixedBytes;
-    for (uint32_t i = 0; i < h->count; ++i, p += kMarkerEntryBytes)
-        fn(h->fromOffset + static_cast<int64_t>(detail::get<uint32_t>(p)), detail::get<uint16_t>(p + 4), detail::get<uint32_t>(p + 6));
+bool forEachMarkerEntry(const ControlRecord& c, Fn&& fn) noexcept {
+    const auto m = parseMarker(c);
+    if (!m) return false;
+    for (uint32_t i = 0; i < m->header.count; ++i) fn(m->offsetAt(i), m->codeAt(i), m->constraintIdAt(i));
     return true;
 }
+/// false when `batch` is not a marker.
+template <class Fn>
+bool forEachMarkerEntry(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept {
+    const auto c = parseControl(batch, len);
+    return c && forEachMarkerEntry(*c, static_cast<Fn&&>(fn));
+}
 
-/// false when `batch` is not a change record or holds more members than `out`.
-[[nodiscard]] inline bool parseConstraintSetChange(const uint8_t* batch, std::size_t len, uint32_t& setId,
-                                                   std::span<ChangeMember> out, uint16_t& count) noexcept {
-    int16_t type = 0;
-    const auto v = detail::valueOf(batch, len, type);
-    if (!v || type != kConstraintSetChange || v->size() < kChangeFixedBytes) return false;
-    const uint8_t* p = v->data() + 1;
+/// false when `c` is not a change record or holds more members than `out`.
+[[nodiscard]] inline bool parseConstraintSetChange(const ControlRecord& c, uint32_t& setId, std::span<ChangeMember> out, uint16_t& count) noexcept {
+    if (c.type != kConstraintSetChange || c.value.size() < kChangeFixedBytes) return false;
+    const uint8_t* p = c.value.data() + 1;
     setId = detail::get<uint32_t>(p);
     count = detail::get<uint16_t>(p + 4);
-    if (v->size() != kChangeFixedBytes + count * kChangeMemberBytes || count > out.size()) return false;
+    if (c.value.size() != kChangeFixedBytes + count * kChangeMemberBytes || count > out.size()) return false;
     p += 6;
     for (uint16_t i = 0; i < count; ++i, p += kChangeMemberBytes)
         out[i] = ChangeMember{detail::get<uint64_t>(p), p[8], detail::get<uint64_t>(p + 9)};
     return true;
+}
+/// false when `batch` is not a change record or holds more members than `out`.
+[[nodiscard]] inline bool parseConstraintSetChange(const uint8_t* batch, std::size_t len, uint32_t& setId,
+                                                   std::span<ChangeMember> out, uint16_t& count) noexcept {
+    const auto c = parseControl(batch, len);
+    return c && parseConstraintSetChange(*c, setId, out, count);
 }
 
 }  // namespace rune::storage::control_record
