@@ -243,7 +243,7 @@ public:
                                      std::to_string(static_cast<int>(c.status)) + ", errorCode " +
                                      std::to_string(c.errorCode) + ")");
         }
-        if (!schemaMatches(T::kFingerprint, descriptorBlob)) {
+        if (!schemaMatches(T::kFingerprint, schemaBlobOf(c, descriptorBlob))) {
             throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
         }
         // GetTopicSchema completion wire contract: value = topicId, aux =
@@ -251,7 +251,7 @@ public:
         return TypedTopic(client.producer(),
                           TopicHandle{static_cast<int32_t>(c.value),
                                       typedPartitionCount(static_cast<int32_t>(c.reserved0)), TopicKind::Typed,
-                                      schemaKeyFeaturesOf(c).partitioner},
+                                      schemaKeyFeaturesOf(c, descriptorBlob).partitioner},
                           static_cast<uint16_t>(c.aux));
     }
 

@@ -368,3 +368,47 @@ TEST(CheckedWritesAutoIncClient, OpenTopicCarriesThePartitioner) {
     r.gw.schemaKeyFeatures = f;
     EXPECT_EQ(partitionerOf(), Partitioner::Modulo);
 }
+
+TEST(CheckedWritesAutoIncClient, RefusedAndBackPressuredCreatesDoNotAdvanceTheStickyRun) {
+    Bare b(cfgOf(Acks::All), 1 << 11);   // a ring of a few records
+    const TopicHandle topic = moduloTopic(4);
+    for (int i = 0; i < 70; ++i)
+        ASSERT_EQ(b.p.trySend(topic, keyZero(), std::span<const uint8_t>{}, WriteIntent::Insert), SendResult::WriteNotAllowed);
+    int accepted = 0, backPressured = 0;
+    while (accepted < 130) {
+        const SendResult r = b.p.trySend(topic, keyZero(), kVal, WriteIntent::Insert);
+        if (r == SendResult::Ok) {
+            ++accepted;
+        } else {
+            ASSERT_EQ(r, SendResult::BackPressured);
+            ++backPressured;
+            b.pump();
+        }
+    }
+    b.pump();
+    EXPECT_GT(backPressured, 0);
+    std::vector<int32_t> partitionOf;
+    for (const Captured::Frame& f : b.cap.frames) partitionOf.insert(partitionOf.end(), f.keys.size(), f.partition);
+    ASSERT_EQ(partitionOf.size(), 130u);
+    for (int i = 0; i < 130; ++i) EXPECT_EQ(partitionOf[static_cast<std::size_t>(i)], i / 64) << "record " << i;
+}
+
+TEST(CheckedWritesAutoIncClientRegression, SchemaKeyFeaturesRoundTripToTheResultRegression) {
+    Rig r(invokerCfg(4653, 4654));
+    r.gw.replySchemas = true;
+    r.gw.schemaBlob   = rune::codec::serialize(stubDescriptor());
+    rune::protocol::TopicKeyFeatures f;
+    f.keyIndex             = true;
+    f.autoIncrement        = true;
+    f.partitioner          = Partitioner::Modulo;
+    f.autoIncrementMax     = 1'000'000;
+    f.autoIncrementReserve = 77;
+    r.gw.schemaKeyFeatures = f;
+    r.connect();
+    rc::TopicSchemaResult result;
+    r.whilePumping([&] { result = r.client->getTopicSchemaAndWait("autoinc_stub", StubRecord::kFingerprint); });
+    EXPECT_EQ(result.errorCode, 0);
+    ASSERT_TRUE(result.hasKeyFeatures);
+    EXPECT_EQ(result.keyFeatures, f);
+    EXPECT_EQ(result.descriptorBlob, r.gw.schemaBlob);
+}

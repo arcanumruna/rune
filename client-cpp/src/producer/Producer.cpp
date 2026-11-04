@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
-#include <new>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -63,7 +63,7 @@ Producer::Producer(producer::ProducerImpl* impl) noexcept
 {}
 
 Producer::Producer(Producer&& o) noexcept
-    : impl_(std::exchange(o.impl_, nullptr)), viewByte_(o.viewByte_), sticky_(std::move(o.sticky_))
+    : impl_(std::exchange(o.impl_, nullptr)), viewByte_(o.viewByte_), sticky_(o.sticky_), stickyUsed_(o.stickyUsed_)
 {}
 
 Producer& Producer::operator=(Producer&& o) noexcept {
@@ -71,7 +71,8 @@ Producer& Producer::operator=(Producer&& o) noexcept {
         release_();  // the current producer: closeImmediately + released
         impl_ = std::exchange(o.impl_, nullptr);
         viewByte_ = o.viewByte_;
-        sticky_   = std::move(o.sticky_);
+        sticky_     = o.sticky_;
+        stickyUsed_ = o.stickyUsed_;
     }
     return *this;
 }
@@ -169,24 +170,24 @@ const char* Producer::intentRefusal_(TopicHandle topic, const Key& key, std::spa
 
 int32_t Producer::partitionOf_(TopicHandle topic, const Key& key, WriteIntent intent) noexcept {
     if (!isKeyZeroCreate(topic, key, intent)) [[likely]] return key.partition(topic.partitionCount, topic.partitioner);
-    StickyRun* run = nullptr;
-    for (StickyRun& r : sticky_) {
-        if (r.topicId == topic.topicId) run = &r;
+    for (const StickyRun& r : std::span(sticky_.data(), stickyUsed_)) {
+        if (r.topicId == topic.topicId) return r.partition % std::max(topic.partitionCount, 1);
     }
-    if (run == nullptr) {
-        try {
-            run = &sticky_.emplace_back(StickyRun{topic.topicId, 0, 0});
-        } catch (const std::bad_alloc&) {
-            return key.partition(topic.partitionCount, topic.partitioner);   // unbalanced, still a valid partition
-        }
-    }
+    return 0;
+}
+
+void Producer::stickyAdvance_(TopicHandle topic) noexcept {
     const int32_t count = std::max(topic.partitionCount, 1);
-    const int32_t part  = run->partition % count;
-    if (++run->sent >= kKeyZeroStickyRun) {
-        run->sent      = 0;
-        run->partition = (part + 1) % count;
+    for (StickyRun& r : std::span(sticky_.data(), stickyUsed_)) {
+        if (r.topicId != topic.topicId) continue;
+        if (++r.sent >= kKeyZeroStickyRun) {
+            r.sent      = 0;
+            r.partition = (r.partition % count + 1) % count;
+        }
+        return;
     }
-    return part;
+    // Topics past kStickyTopics keep partition 0 (valid, just not spread).
+    if (stickyUsed_ < kStickyTopics) sticky_[stickyUsed_++] = StickyRun{topic.topicId, 0, 1};
 }
 
 SendResult Producer::trySendPart_(TopicHandle topic, int32_t part, const Key& key,
@@ -196,14 +197,19 @@ SendResult Producer::trySendPart_(TopicHandle topic, int32_t part, const Key& ke
         if (intentRefusal_(topic, key, value, intent) != nullptr) return SendResult::WriteNotAllowed;
     }
     const uint32_t idStride = idStrideOf_(topic, key, intent);
+    const bool routed = part == kRouteByKey;
+    if (routed) part = partitionOf_(topic, key, intent);
     Completions* bq = impl->batchAckCq();
     if (bq == nullptr) [[likely]] {
-        return impl->trySubmit(topic.topicId, part, key, value, 0, nullptr, intentBits(intent), idStride);
+        const SendResult r = impl->trySubmit(topic.topicId, part, key, value, 0, nullptr, intentBits(intent), idStride);
+        if (r == SendResult::Ok && routed && idStride != 0) [[unlikely]] stickyAdvance_(topic);
+        return r;
     }
     if (impl->gateRefusesBeforeCredit()) [[unlikely]] return SendResult::NotInTransaction;  // #339: before any credit
     const SendResult u = reserveBatchUnit(*bq);
     if (u != SendResult::Ok) return u;
     const SendResult r = impl->trySubmit(topic.topicId, part, key, value, 0, nullptr, intentBits(intent), idStride);
+    if (r == SendResult::Ok && routed && idStride != 0) [[unlikely]] stickyAdvance_(topic);
     if (r == SendResult::Ok) {
         ++bq->producerIssued_;
     } else {
@@ -218,7 +224,7 @@ SendResult Producer::trySend(TopicHandle            topic,
                              WriteIntent            intent) noexcept
 {
     if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
-    return trySendPart_(topic, partitionOf_(topic, key, intent), key, value, intent);
+    return trySendPart_(topic, kRouteByKey, key, value, intent);
 }
 
 SendResult Producer::trySendTo(TopicHandle topic, int32_t partition, const Key& key,
@@ -236,7 +242,11 @@ void Producer::send(TopicHandle            topic,
     if (!impl_ || !topic.valid()) {
         throw std::invalid_argument("Producer::send: invalid topic handle");
     }
+    if (needsIntentCheck_(topic, intent)) [[unlikely]] {
+        if (const char* why = intentRefusal_(topic, key, value, intent)) throw std::invalid_argument(why);
+    }
     sendTo(topic, partitionOf_(topic, key, intent), key, value, intent);
+    if (isKeyZeroCreate(topic, key, intent)) [[unlikely]] stickyAdvance_(topic);
 }
 
 void Producer::sendTo(TopicHandle topic, int32_t part, const Key& key, std::span<const uint8_t> value,
@@ -296,9 +306,11 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
         }
     }
     const uint64_t h = producer::ackhandle::forCq(cq.cqRef_, token);
+    const uint32_t idStride = idStrideOf_(topic, key, intent);
     const SendResult r = impl_->trySubmit(topic.topicId, partitionOf_(topic, key, intent), key, value,
-                                          static_cast<int64_t>(h), nullptr, intentBits(intent), idStrideOf_(topic, key, intent));
+                                          static_cast<int64_t>(h), nullptr, intentBits(intent), idStride);
     if (r == SendResult::Ok) [[likely]] {
+        if (idStride != 0) [[unlikely]] stickyAdvance_(topic);
         ++cq.producerIssued_;
         if (bq != nullptr) ++bq->producerIssued_;
         return r;
@@ -323,8 +335,10 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
         if (u != SendResult::Ok) return u;
     }
     const uint64_t h = producer::ackhandle::forHandler(token.token);
+    const uint32_t idStride = idStrideOf_(topic, key, intent);
     const SendResult r = impl_->trySubmit(topic.topicId, partitionOf_(topic, key, intent), key, value,
-                                          static_cast<int64_t>(h), nullptr, intentBits(intent), idStrideOf_(topic, key, intent));
+                                          static_cast<int64_t>(h), nullptr, intentBits(intent), idStride);
+    if (r == SendResult::Ok && idStride != 0) [[unlikely]] stickyAdvance_(topic);
     if (bq != nullptr) {
         if (r == SendResult::Ok) ++bq->producerIssued_;
         else bq->unreserve(producer::kAckRecordBytes);

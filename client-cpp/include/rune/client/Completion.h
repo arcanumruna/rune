@@ -141,18 +141,23 @@ static_assert(sizeof(Completion) == 40);
 /// Checked writes: the broker-assigned id of a Send (aux), 0 = none.
 [[nodiscard]] constexpr uint64_t assignedKeyOf(const Completion& c) noexcept { return static_cast<uint64_t>(c.aux); }
 
-/// GetTopicSchema: aux = the schema version (bits 0-15), then, when the broker sent a key-features block, bit 16 (present),
-/// bit 17 keyIndex, bit 18 autoIncrement and the partitioner in bits 24-31.  autoIncrementMax / Reserve are not carried.
-[[nodiscard]] constexpr int64_t schemaAuxOf(uint16_t version, const rune::protocol::TopicKeyFeatures& f) noexcept {
-    return static_cast<int64_t>(version) | (int64_t{1} << 16) | (f.keyIndex ? int64_t{1} << 17 : 0) |
-           (f.autoIncrement ? int64_t{1} << 18 : 0) | (static_cast<int64_t>(f.partitioner) << 24);
+/// GetTopicSchema: aux = the schema version (bits 0-15); bit 16 set when the broker sent a key-features block, which then
+/// follows the descriptor blob in the payload as its 14 wire bytes (putTopicKeyFeatures).
+[[nodiscard]] constexpr int64_t schemaAuxOf(uint16_t version, bool hasKeyFeatures) noexcept {
+    return static_cast<int64_t>(version) | (hasKeyFeatures ? int64_t{1} << 16 : 0);
 }
 [[nodiscard]] constexpr bool schemaHasKeyFeatures(const Completion& c) noexcept { return ((c.aux >> 16) & 1) != 0; }
-[[nodiscard]] constexpr rune::protocol::TopicKeyFeatures schemaKeyFeaturesOf(const Completion& c) noexcept {
+/// The descriptor blob of a GetTopicSchema payload, without the key-features block.
+[[nodiscard]] constexpr std::span<const uint8_t> schemaBlobOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
+    return schemaHasKeyFeatures(c) && payload.size() >= rune::protocol::kTopicKeyFeaturesWireLen
+               ? payload.first(payload.size() - rune::protocol::kTopicKeyFeaturesWireLen) : payload;
+}
+/// The key features of a GetTopicSchema completion (the defaults when the broker sent none).
+[[nodiscard]] inline rune::protocol::TopicKeyFeatures schemaKeyFeaturesOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
     rune::protocol::TopicKeyFeatures f;
-    f.keyIndex      = ((c.aux >> 17) & 1) != 0;
-    f.autoIncrement = ((c.aux >> 18) & 1) != 0;
-    f.partitioner   = static_cast<rune::protocol::Partitioner>((c.aux >> 24) & 0xFF);
+    if (schemaHasKeyFeatures(c) && payload.size() >= rune::protocol::kTopicKeyFeaturesWireLen)
+        (void)rune::protocol::getTopicKeyFeatures(payload.data() + payload.size() - rune::protocol::kTopicKeyFeaturesWireLen,
+                                                  rune::protocol::kTopicKeyFeaturesWireLen, f);
     return f;
 }
 

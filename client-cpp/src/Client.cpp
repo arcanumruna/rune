@@ -3041,8 +3041,11 @@ TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t 
                  result.errorCode      = c.errorCode;
                  result.partitionCount = static_cast<int32_t>(c.reserved0);  // Phase 2b C
                 result.hasKeyFeatures = schemaHasKeyFeatures(c);
-                if (result.hasKeyFeatures) result.keyFeatures = schemaKeyFeaturesOf(c);
-                 if (c.status == OpStatus::Ok) result.descriptorBlob.assign(p.begin(), p.end());
+                if (result.hasKeyFeatures) result.keyFeatures = schemaKeyFeaturesOf(c, p);
+                 if (c.status == OpStatus::Ok) {
+                    const auto blob = schemaBlobOf(c, p);
+                    result.descriptorBlob.assign(blob.begin(), blob.end());
+                }
              });
     return result;
 }
@@ -4881,11 +4884,16 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 topicSchemaCache_.put(opt->topicId,
                     metadata::TopicSchemaEntry{opt->version, /*validate=*/false, /*keyField=*/""});
             }
-            const std::span<const uint8_t> blob(
-                opt->descriptorBlob, (opt->descriptorBlob != nullptr) ? opt->descriptorLen : 0u);
+            std::vector<uint8_t> payload;   // cold path: the descriptor blob, then the key-features block when sent
+            if (opt->descriptorBlob != nullptr) payload.assign(opt->descriptorBlob, opt->descriptorBlob + opt->descriptorLen);
+            if (opt->hasKeyFeatures) {
+                payload.resize(payload.size() + rune::protocol::kTopicKeyFeaturesWireLen);
+                rune::protocol::putTopicKeyFeatures(payload.data() + payload.size() - rune::protocol::kTopicKeyFeaturesWireLen,
+                                                    opt->keyFeatures);
+            }
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
-                         opt->topicId, opt->hasKeyFeatures ? schemaAuxOf(opt->version, opt->keyFeatures) : opt->version,
-                         opt->errorCode, blob,
+                         opt->topicId, schemaAuxOf(opt->version, opt->hasKeyFeatures),
+                         opt->errorCode, payload,
                          detail::CompletionRing::Overflow::TooLarge,
                          static_cast<uint32_t>(opt->partitionCount));  // Phase 2b C (<=0 = not reported)
         }

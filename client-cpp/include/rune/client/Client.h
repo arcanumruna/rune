@@ -173,7 +173,6 @@ struct TopicSchemaResult {
     /// — typed topics then route over 1 partition (typedPartitionCount).
     int32_t              partitionCount = 0;
     /// Checked writes: the topic's key features when the broker sent them (it does iff they are not the defaults);
-    /// autoIncrementMax / autoIncrementReserve are not reported here.
     bool                             hasKeyFeatures = false;
     rune::protocol::TopicKeyFeatures keyFeatures{};
 };
@@ -843,8 +842,9 @@ public:
     //   Ping           payload = the echo bytes.
     //   DefineTopic    value = topicId, aux = version; a broker errorCode in the
     //                  response -> BrokerError (errorCode, value/aux kept).
-    //   GetTopicSchema value = topicId, aux = version (+ the key features, see schemaAuxOf), payload = descriptor
-    //                  blob (polled form: up to maxResultBytes, else
+    //   GetTopicSchema value = topicId, aux = version (+ a key-features flag, see schemaAuxOf), payload = descriptor
+    //                  blob, then the 14-byte key-features block when the aux flag says so (schemaBlobOf strips it)
+    //                  (polled form: up to maxResultBytes, else
     //                  ResultTooLarge with value = the real size),
     //                  reserved0 = the topic's partitionCount (Phase 2b; <= 0
     //                  = not reported, e.g. a pre-2b broker).

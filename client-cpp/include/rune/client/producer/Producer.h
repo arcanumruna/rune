@@ -56,6 +56,7 @@
 #include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/group/GroupMetadata.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -65,7 +66,6 @@
 #include <string_view>
 #include <utility>
 #include <variant>
-#include <vector>
 
 namespace rune::client {
 
@@ -1124,8 +1124,11 @@ private:
     [[nodiscard]] const char* intentRefusal_(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                              WriteIntent intent) const noexcept;
     /// The partition a send routes to: the topic's partitioner, except a key-0 create, which goes to its topic's current
-    /// sticky partition (and counts toward the run).
+    /// sticky partition.  A key-0 create that was accepted then counts toward the run (stickyAdvance_).
     [[nodiscard]] int32_t partitionOf_(TopicHandle topic, const Key& key, WriteIntent intent) noexcept;
+    void stickyAdvance_(TopicHandle topic) noexcept;
+    /// trySendPart_'s `part` when the key routes the send.
+    static constexpr int32_t kRouteByKey = -1;
     /// True when a send needs intentRefusal_: a non-Upsert intent, View acks on a raw handle, or a Modulo handle.
     /// Branchless, so the caller's single [[unlikely]] test is the only branch an Upsert on a hashed handle pays.
     [[nodiscard]] bool needsIntentCheck_(TopicHandle topic, WriteIntent intent) const noexcept {
@@ -1150,7 +1153,9 @@ private:
     producer::ProducerImpl* impl_ = nullptr;  // the handle's share (§3.3): ONE load per send
     uint8_t viewByte_ = 0;                    // 1 when the acks include View (constant from construction)
     struct StickyRun { int32_t topicId; int32_t partition; int32_t sent; };
-    std::vector<StickyRun> sticky_;           // app thread: the key-0 run each Modulo topic is in
+    static constexpr std::size_t kStickyTopics = 16;
+    std::array<StickyRun, kStickyTopics> sticky_{};   // app thread: the key-0 run of the first kStickyTopics Modulo topics
+    std::size_t stickyUsed_ = 0;
 };
 
 } // namespace rune::client
