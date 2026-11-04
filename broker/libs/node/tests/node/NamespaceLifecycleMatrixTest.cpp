@@ -616,9 +616,13 @@ void txnOpen(const TCell& p) {
     if (p.variant == 0) {
         // ReadOnly: the session lives; the gateway refuses EndTxn NamespaceSuspended and the client goes FatalError.
         EXPECT_EQ(err, "commitTransaction(): broker error code 51 (EndTxn failed (fatal))");
+        // #715: a platform-aborted end is offered exactly once - no client resend loop on the 51
+        EXPECT_EQ(txn.endTxnAttemptsForTest(), 1u) << "EndTxn was not submitted exactly once";
+        EXPECT_EQ(txn.endTxnWireOffersForTest(), 1u) << "EndTxn was not offered on the wire exactly once";
     } else {
         // RejectAll (corr-0 51) / Delete (corr-0 46) ended the session: the client failed for good before the commit.
         EXPECT_EQ(err, "commitTransaction(): client closed");
+        EXPECT_EQ(txn.endTxnAttemptsForTest(), 0u) << "the session ended first: the commit must not send EndTxn at all";
     }
     sub.unsubscribe();
 }

@@ -895,6 +895,10 @@ protected:
             // #715: no wall-clock bound; the outcome itself is the check (a definite answer, never the end-wait's "timed out").
             EXPECT_EQ(err.find("timed out"), std::string::npos) << ns << ": " << err;
             if (commit) EXPECT_FALSE(err.empty()) << "a commit succeeded after the platform aborted the transaction of " << ns;
+            // #715: the end is offered at most once (no client resend loop on the refusal): the producer's own submit count and the
+            // link's wire offers.  (0 when the session already ended before the end could be sent.)
+            EXPECT_LE(it->second.producer->endTxnAttemptsForTest(), 1u) << ns << ": EndTxn was submitted more than once";
+            EXPECT_LE(it->second.producer->endTxnWireOffersForTest(), 1u) << ns << ": EndTxn was offered on the wire more than once";
         } else if (n != nullptr && n->state == 0 && timedOut) {
             if (commit && !err.empty()) EXPECT_NE(err.find("broker error code 19"), std::string::npos) << "a commit past the transaction timeout failed otherwise: " << err;
             EXPECT_EQ(err.find("timed out"), std::string::npos) << "ending a transaction past its timeout got no answer: " << err;
