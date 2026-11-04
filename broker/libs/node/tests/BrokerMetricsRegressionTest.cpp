@@ -365,16 +365,67 @@ TEST(BrokerMetricsRegression, StartRefusedWhenFileTooSmallRegression) {
     EXPECT_FALSE(fs::exists(cfg.effectiveMetricsFile())) << "no file is left behind";
 }
 
-// The 10th allocation (row 9, rune-catalog-apply-halted) returning Full refuses the start and names that metric.
+// A refused start inside createMetrics_ leaves NO file behind, wherever it stops: the first row, the 10th
+// (rune-catalog-apply-halted) and the last.  A half-allocated file with a Role row would make rune_role print
+// ROLE ... role=NONE with exit 0 for a process that never started (#631).
+// RED (the unlink dropped from discardMetricsFile_): the file exists.
 TEST(BrokerMetricsRegression, StartRefusedOnAllocFailureRegression) {
-    MetricsTempDir tmp{"alloc_"};
+    using rune::node::kRuneMetrics;
+    for (const std::int32_t row : {0, 9, static_cast<std::int32_t>(kRuneMetrics.size()) - 1}) {
+        SCOPED_TRACE("failAllocAt=" + std::to_string(row));
+        MetricsTempDir tmp{"alloc_"};
+        NodeConfig cfg = singleNode(tmp.path);
+        cfg.metricsFailAllocAtForTest = row;
+        const auto& def = kRuneMetrics[static_cast<std::size_t>(row)];
+        const std::string err = startError(cfg);
+        EXPECT_NE(err.find(std::string{"metrics allocation failed for "} + std::string{def.labelPrefix} + " (type " +
+                           std::to_string(static_cast<std::int32_t>(def.id)) + "): Full"),
+                  std::string::npos)
+            << err;
+        EXPECT_FALSE(fs::exists(fs::path{cfg.effectiveAeronDir()} / "cnc.dat")) << "the driver never started";
+        EXPECT_FALSE(fs::exists(cfg.effectiveMetricsFile())) << "no half-allocated file is left behind";
+    }
+}
+
+// A previous run's file at the same path is replaced by create() and then discarded with the refused start: a stale
+// role file of a dead process is not left behind.
+TEST(BrokerMetricsRegression, StartRefusedOnAllocFailureRemovesAPreviousRunsFileRegression) {
+    MetricsTempDir tmp{"alloc_prev_"};
     NodeConfig cfg = singleNode(tmp.path);
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(5s));
+        node.stop();
+    }
+    ASSERT_TRUE(fs::exists(cfg.effectiveMetricsFile())) << "the good run left its file";
     cfg.metricsFailAllocAtForTest = 9;
     const std::string err = startError(cfg);
-    EXPECT_NE(err.find("metrics allocation failed for rune-catalog-apply-halted (type 1000217): Full"),
-              std::string::npos)
-        << err;
-    EXPECT_FALSE(fs::exists(fs::path{cfg.effectiveAeronDir()} / "cnc.dat")) << "the driver never started";
+    EXPECT_NE(err.find("metrics allocation failed for"), std::string::npos) << err;
+    EXPECT_FALSE(fs::exists(cfg.effectiveMetricsFile())) << "the refused start leaves no file, not even the old one";
+}
+
+// L10 (#631): a start that fails AFTER createMetrics_ returned leaves the complete, valid file (every row allocated,
+// the observer's NONE / -1 values): only a refusal inside createMetrics_ removes it.  The later failure here is a
+// per-worker replication peer with a different worker count.
+TEST(BrokerMetricsRegression, LaterStartFailureLeavesACompleteFileRegression) {
+    MetricsTempDir tmp{"later_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    cfg.perWorkerReplication = true;   // an asymmetric peer worker count refuses the start, after createMetrics_
+    PeerConfig other;
+    other.id            = 1;
+    other.host          = "127.0.0.1";
+    other.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();
+    other.workerCount   = cfg.workerCount + 1;
+    cfg.peers.push_back(other);
+    const std::string err = startError(cfg);
+    ASSERT_FALSE(err.empty()) << "the start must fail after the metrics file was created";
+    ASSERT_TRUE(fs::exists(cfg.effectiveMetricsFile())) << err;
+    for (const auto& def : kRuneMetrics) {
+        const auto live = rune::node::test::readRuneMetricLiveAt(cfg.effectiveMetricsFile(),
+                                                                 static_cast<std::int32_t>(def.id), cfg.nodeId);
+        EXPECT_TRUE(live.has_value()) << "row " << def.labelPrefix << " missing from the kept file: " << err;
+    }
 }
 
 // stop + start recreates the file: a new startEpochNs, a reader on the old mapping sees sameInstanceAs() == false,

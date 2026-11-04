@@ -3295,6 +3295,11 @@ void BrokerNode::createMetrics_() {
         spdlog::error("BrokerNode[{}]: {}", config_.nodeId, msg);
         throw std::runtime_error(msg);
     }
+    // #631: from here the file is at its canonical path, so ANY refusal below discards it: a half-allocated file
+    // would hold a Role row for a process that never started (rune_role would print role=NONE, exit 0).  Failures
+    // after createMetrics_ returns (later in start()) leave the complete, valid file: the observer publishes
+    // NONE / -1 and every row exists.
+    try {
     metricsFreeStack_.assign(static_cast<std::size_t>(maxSlots), 0);
     if (const metrics::WriterStatus ws = metrics::MetricsWriter::create(metricsFile_, metricsFreeStack_, metricsWriter_);
         ws != metrics::WriterStatus::Ok) {
@@ -3346,11 +3351,30 @@ void BrokerNode::createMetrics_() {
         const std::string msg = "metrics file " + metricsPath_ + ": system metrics init failed (" +
                                 (ss == metrics::SystemMetrics::Status::OpenFailed ? "OpenFailed" : "AllocFailed") + ")";
         spdlog::error("BrokerNode[{}]: {}", config_.nodeId, msg);
-        systemMetrics_.reset();
         throw std::runtime_error(msg);
     }
 #endif
     metricsReady_ = true;
+    } catch (...) {
+        discardMetricsFile_();
+        throw;
+    }
+}
+
+// #631: undo createMetrics_ after a refusal.  Order matters: the system metrics and the slots that point into the
+// mapping go first, then the mapping, then the path.  The unlink runs only when the path still names OUR file (a
+// second process may have recreated it).
+void BrokerNode::discardMetricsFile_() noexcept {
+#if defined(__linux__)
+    systemMetrics_.reset();
+#endif
+    const bool ours = metricsFile_.sameInstanceAs(metricsPath_.c_str());
+    slots_ = {};
+    observerSlots_ = {};
+    std::fill(nsMetricSlots_.begin(), nsMetricSlots_.end(), metrics::SlotWriter{});
+    metricsFile_ = metrics::MetricsFile{};
+    if (ours) (void)::unlink(metricsPath_.c_str());
+    metricsReady_ = false;
 }
 
 // ---------------------------------------------------------------------------

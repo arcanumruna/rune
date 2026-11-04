@@ -3072,6 +3072,7 @@ private:
     bool                                                  metricsReady_ = false;   // set by start(), before agents
     std::string                                           metricsPath_;
     void createMetrics_();   // startup thread: steps 1-4 of the plan's start order
+    void discardMetricsFile_() noexcept;   // #631: a refusal after the file was created removes it
     /// A control-thread store into a MetricOwner::Control row.
     void controlSet_(RuneMetric m, std::int64_t v) noexcept {
         slots_[static_cast<std::size_t>(runeMetricRow(m))].set(v, MetricOwner::Control);
