@@ -87,7 +87,7 @@ using M = RuneMetric;
 }  // namespace detail
 
 /// One row per live metric, in type-id order.  The row index is the slot index in BrokerNode::slots_.
-inline constexpr std::array<RuneMetricDef, 32> kRuneMetrics = {{
+inline constexpr std::array<RuneMetricDef, 33> kRuneMetrics = {{
     {detail::M::Role,                      detail::K::Gauge,   "rune-cluster-node-role",                       detail::O::Observer},
     {detail::M::Term,                      detail::K::Gauge,   "rune-cluster-leadership-term",                 detail::O::Observer},
     {detail::M::StuckMarkers,              detail::K::Gauge,   "rune-txn-stuck-markers",                       detail::O::Control},
