@@ -1120,7 +1120,7 @@ public:
         // timeout is a stall of the CLIENT (SIGSTOP, a long pause): the broker may
         // have expired the session meanwhile, and frames buffered during the stall
         // (read just before this tick) prove nothing — treat the session as stale.
-        const bool ownStall = lastTickNs_ != 0 && nowNs - lastTickNs_ > cfg_.responseTimeoutNs;
+        const bool ownStall = lastTickNs_ != 0 && nowNs - lastTickNs_ >= cfg_.responseTimeoutNs;
         lastTickNs_ = nowNs;
         if (ownStall && state_ == SessionState::Connected) [[unlikely]] {
             ++staleSessionLosses_;
