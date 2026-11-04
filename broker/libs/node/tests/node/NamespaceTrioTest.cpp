@@ -592,3 +592,118 @@ TEST_P(NamespaceTrioLeaderChangeRegression, LeaderChangeMidCreateConvergesRegres
 
 INSTANTIATE_TEST_SUITE_P(All, NamespaceTrioLeaderChangeRegression, ::testing::ValuesIn(leaderChangeCells()),
                          [](const auto& info) { return lcName(info.param); });
+
+// ── #644: the leader appended the event but replicated it to nobody ───────────────────────────────────────────────
+
+namespace {
+
+/// The catalog-op cells whose first op succeeds: the ones that append an event to `__catalog`.
+std::vector<LCell> beforeReplicationCells() {
+    std::vector<LCell> v;
+    for (const LCell& c : leaderChangeCells()) {
+        if (securityOp(c.op)) continue;
+        if (expect(c.op, c.caller, isCreateOp(c.op) ? Target::Missing : Target::OwnNs).kind != Kind::Ok) continue;
+        v.push_back(c);
+    }
+    return v;
+}
+
+}  // namespace
+
+class NamespaceTrioBeforeReplicationRegression : public ::testing::TestWithParam<LCell> {};
+
+TEST_P(NamespaceTrioBeforeReplicationRegression, LeaderChangeBeforeReplicationConvergesRegression) {
+    const LCell& p = GetParam();
+    const bool root = p.caller == Caller::ClusterAdmin;
+    const std::string label = lcName(p);
+    auto w = setupWorld("nstrio_br_" + label);
+    World& W = *w;
+    AuthTrio& t = W.t;
+    const std::string user = root ? "admin" : "a/admin";
+    auto qa = [&](const std::string& local) { return root ? "a/" + local : local; };
+    constexpr uint64_t lim = 778;
+
+    Req req;
+    req.op = p.op;
+    req.rid = RequestId{0xB2C, 44};
+    int32_t dropId = -1;
+    switch (p.op) {
+        case Op::CreateNamespace: req.name = "n1"; break;
+        case Op::SetNamespaceLimits: req.name = "a"; req.arg = lim; break;
+        case Op::CreateTopic: req.name = qa("k1"); break;
+        case Op::DropTopic: req.name = qa("d1"); break;
+        case Op::CreateView: req.name = qa("kv1"); req.src = W.tA; break;
+        default: FAIL() << "not a catalog op";
+    }
+    if (p.op == Op::DropTopic) {
+        const Ans d = W.call("admin", 1, Req{Op::CreateTopic, "a/d1"});
+        ASSERT_EQ(d.code, 0) << d.detail;
+        dropId = static_cast<int32_t>(d.id);
+        for (int n = 1; n <= 3; ++n)
+            ASSERT_TRUE(AuthTrio::until(30s, [&] { return has(W.ids("admin", n), dropId); })) << "a/d1 listed on node " << n;
+    }
+    ASSERT_TRUE(t.awaitDigestsAgree(0, 30s));
+    const std::vector<int32_t> ids0 = W.ids("admin", 1);
+
+    ASSERT_TRUE(AuthTrio::until(60s, [&] { return t.cluster().settledLeader() > 0; }));
+    const int L = t.cluster().settledLeader();
+    const int S = W.firstNodeOtherThan(L);
+    const int S2 = W.firstNodeOtherThan(L, S);
+
+    // a. both followers hear nothing from L; L appends the op but cannot commit it (minIsr 2)
+    t.node(S).holdCatalogReplicationForTest(true);
+    t.node(S2).holdCatalogReplicationForTest(true);
+    const int64_t sidL = W.sid(user, L);
+    const int64_t corr = W.send(L, sidL, req);
+    ASSERT_NE(corr, 0) << label << ": send";
+    // premise: the window was really hit - L's catalog log holds the request once, the followers' hold it never
+    ASSERT_TRUE(AuthTrio::until(30s, [&] { return countInLog(t.node(L), req.rid, false) == 1; })) << label << ": L appended the op";
+    EXPECT_EQ(countInLog(t.node(S), req.rid, false), 0) << label << ": premise: follower " << S << " holds nothing";
+    EXPECT_EQ(countInLog(t.node(S2), req.rid, false), 0) << label << ": premise: follower " << S2 << " holds nothing";
+    EXPECT_FALSE(W.raw().awaitAnyDdlAnswer(corr, Clock3::now() + 1s).has_value()) << label << ": premise: L never committed, so never answered";
+
+    // b. crash L, release the followers, a new leader is elected without the event
+    t.node(L).crashForTest();
+    W.stop(L);
+    t.node(S).holdCatalogReplicationForTest(false);
+    t.node(S2).holdCatalogReplicationForTest(false);
+    ASSERT_TRUE(AuthTrio::until(60s, [&] { const int l = t.cluster().settledLeader(); return l > 0 && l != L; })) << label << ": a new leader";
+    const int L2 = t.cluster().settledLeader();
+    EXPECT_EQ(countInLog(t.node(L2), req.rid, false), 0) << label << ": the new leader never had the event";
+
+    // c. the SAME request on L2: Ok, one effect
+    const Ans again = W.call(user, L2, req);
+    EXPECT_EQ(again.code, 0) << label << ": the retry [" << again.detail << "]";
+    const Ans dup = [&] { Req f = req; f.rid = RequestId{}; return W.call(user, L2, f); }();
+    EXPECT_EQ(dup.code, dupCode(p.op)) << label << ": the effect was applied exactly once [" << dup.detail << "]";
+
+    // d. L restarts and truncates its divergent event: one event on every node, the same object everywhere
+    W.restart(L);
+    ASSERT_TRUE(t.awaitDigestsAgree(0, 60s)) << label << ": digests agree after the restart";
+    for (const int n : {1, 2, 3}) {
+        EXPECT_TRUE(AuthTrio::until(60s, [&] { return countInLog(t.node(n), req.rid, false) == 1; }))
+            << label << ": node " << n << " holds the request " << countInLog(t.node(n), req.rid, false) << " times";
+        switch (p.op) {
+            case Op::CreateNamespace:
+                EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.nsIdOf("admin", n, "n1") == static_cast<int64_t>(again.id); }))
+                    << label << ": node " << n << " lists n1 as " << W.nsIdOf("admin", n, "n1") << ", want " << again.id;
+                EXPECT_EQ(W.countNs("admin", n, "n1"), 1) << label << ": node " << n;
+                break;
+            case Op::SetNamespaceLimits:
+                EXPECT_TRUE(AuthTrio::until(60s, [&] { return W.maxTopicsOf("admin", n, "a") == static_cast<int64_t>(lim); })) << label << ": node " << n;
+                break;
+            case Op::CreateTopic: case Op::CreateView:
+                EXPECT_TRUE(AuthTrio::until(60s, [&] { return has(W.ids("admin", n), static_cast<int32_t>(again.id)); }))
+                    << label << ": node " << n << " has the object " << again.id;
+                EXPECT_EQ(W.ids("admin", n).size(), ids0.size() + 1) << label << ": node " << n << ": exactly one new object";
+                break;
+            case Op::DropTopic:
+                EXPECT_TRUE(AuthTrio::until(60s, [&] { return !has(W.ids("admin", n), dropId); })) << label << ": node " << n;
+                break;
+            default: break;
+        }
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(All, NamespaceTrioBeforeReplicationRegression, ::testing::ValuesIn(beforeReplicationCells()),
+                         [](const auto& info) { return lcName(info.param); });

@@ -739,6 +739,10 @@ int AdminWorker::doWork(int64_t nowNs) {
         work += catalogPlane_->poll(kCatalogFragmentLimit,
             [this, nowNs, &replicas](int32_t topicId, int32_t partition, uint16_t templateId,
                                      const uint8_t* frame, std::size_t len) {
+                if (catalogReplicationHeldForTest_) [[unlikely]]   // #644 test seam: the follower hears nothing from the leader
+                    if (topicId == kAdminLogCatalogTopicId &&
+                        templateId == static_cast<uint16_t>(rune::replication::ReplicationTemplateId::FetchResponse))
+                        return;
                 dispatchAdminLogFrame(replicas, topicId, partition, templateId, frame, len, nowNs, catalogFrameStats_);
             });
     }

@@ -1784,6 +1784,11 @@ public:
     void holdCatalogAnswersForTest(bool on) {
         onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdAnswersForTest(on); return 0; });
     }
+    /// Issue #644 seam (ADMIN thread via onAdminThreadForTest): while held, this broker ignores the `__catalog` FetchResponse
+    /// frames its leader sends (AdminWorker::holdCatalogReplicationForTest) - the event the leader appends reaches no follower.
+    void holdCatalogReplicationForTest(bool on) {
+        onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdCatalogReplicationForTest(on); return 0; });
+    }
     /// Issue #197 seam (CONTROL thread): hold / release the gateway's permission shipper (queued, never sent while held;
     /// releasing ships the backlog at once).
     template <class = void>   // instantiated after onControlThreadForTest is defined
