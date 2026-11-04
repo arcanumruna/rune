@@ -1582,7 +1582,7 @@ TEST(CheckedWritesBrokerRegression, KeyIndexDdlRefusalsShardRegression) {
                   "key.index needs a key of at most 8 bytes");
     rc::TopicOptions autoInc = keyIndex;
     autoInc.keyFeatures.autoIncrement = true;
-    expectRefused(c.defineTopicAndWait("autoinc", 1, "id", blob, rc::Persistence::Disk, autoInc, {}, 30s), "autoincrement is not supported by this broker yet");
+    expectRefused(c.defineTopicAndWait("autoinc", 1, "id", blob, rc::Persistence::Disk, autoInc, {}, 30s), "autoincrement needs cleanup.policy = compact");
 
     // A key-feature block with an unknown flag bit does not decode: the gateway rejects the frame as InvalidSchema ("DefineTopic body undecodable" in its log).
     // The ErrorResponse carries no message (encodeRejection has none), so only the code is asserted.
