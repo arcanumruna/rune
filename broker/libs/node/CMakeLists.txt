@@ -1167,7 +1167,7 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_ns_disk_worker_tests)
     # max-message-bytes / max-batch-bytes at the owning worker's produce intake (HotPathBRig, no Aeron).
     add_executable(rune_ns_produce_size_tests tests/node/NsProduceSizeLimitRegressionTest.cpp)
-    target_include_directories(rune_ns_produce_size_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration)
+    target_include_directories(rune_ns_produce_size_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_ns_produce_size_tests PRIVATE rune_node rune_replication rune_storage rune_transaction GTest::gtest_main)
     gtest_discover_tests(rune_ns_produce_size_tests)
     # Namespaces Phase 2 Task 14 (D22, D28): the Throttle message at the owning worker (HotPathBRig, no Aeron).

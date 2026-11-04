@@ -4586,8 +4586,9 @@ private:
         // Namespaces Phase 2 Task 14 (D28): a namespace over its fetch-bytes (or request-ops) rate is not read for: the
         // read is UNANSWERED (the gateway re-issues it on its next push cycle, nothing parks), which paces delivery to the
         // limit.  One array index and one compare; internal topics (topicId < 0) are never paced.
-        if (log != nullptr && topicId >= 0) {
-            NsHot& nh = nsHot_[log->nsSlot()];
+        const NsTag nsTag = nsTagOfLog_(log, mem);   // #712: a transient source is paced too
+        if (topicId >= 0) {
+            NsHot& nh = nsHot_[nsTag.slot];
             ++nh.requestOps;
             if (passNowNs_ < nh.fetchUntil) [[unlikely]] {
                 ++throttledRefusals_;
@@ -4797,7 +4798,10 @@ private:
         pushBudgetLeft_ -= std::min(total, pushBudgetLeft_);
         ++pushReadChunks_;
         pushReadBytes_ += total;
-        if (log != nullptr) nsHot_[log->nsSlot()].fetchBytes += total;   // Task 14 (D28): one add
+        {   // Task 14 (D28): one add; #712: a transient source's bytes count too
+            const NsTag nsTag = nsTagOfLog_(log, mem);
+            if (nsTag.slot != kNoNsSlot) nsHot_[nsTag.slot].fetchBytes += total;
+        }
         return PushChunk::Written;
     }
 
@@ -6575,6 +6579,13 @@ public:
     /// Test seam: the hot-path check a stale (slot, nsId) tag goes through (counts + reports on a mismatch).
     bool checkNsTagForTest(uint16_t slot, uint32_t nsId) { return checkNsTag_(slot, nsId); }
 private:
+    /// The (slot, nsId) tag of a partition's log, read from whichever concrete log it has (#712: a transient partition's
+    /// InMemoryLog carries the tag too).  Concrete types plus a branch - no virtual.  {kNoNsSlot, 0} when neither exists.
+    [[nodiscard]] static NsTag nsTagOfLog_(const rune::storage::Log* log, const rune::storage::InMemoryLog* mem) noexcept {
+        if (log != nullptr) return NsTag{log->nsSlot(), log->nsId()};
+        if (mem != nullptr) return NsTag{mem->nsSlot(), mem->nsId()};
+        return NsTag{};
+    }
     /// Hot path: does this worker's table hold `nsId` in `slot`?  Counts a mismatch.
     [[nodiscard]] bool checkNsTag_(uint16_t slot, uint32_t nsId) {
         if (nsSlots_.matches(slot, nsId)) [[likely]] return true;
@@ -9469,8 +9480,12 @@ private:
         // Namespaces Phase 2 Task 8 (D22): the topic's (nsId, nsSlot) tag must match THIS worker's slot table.  One array
         // index and a compare.  A slot this worker has not been told about yet (the assign is still queued behind a full
         // ring) is the retriable NotLeader; a slot that holds another namespace is a stale tag: InvalidRequest.
-        if (log != nullptr && !nsSlots_.matches(log->nsSlot(), log->nsId())) [[unlikely]] {
-            const bool unassigned = nsSlots_.nsIdAt(log->nsSlot()) == NsSlotTable::kFreeSlot;
+        // #712: ONE tag source for both log kinds (a disk Log or a transient partition's InMemoryLog): every namespace gate
+        // below (slot check, DELETING, size limits, throttle, requestOps, accounting) runs for both.  Past the not-owned
+        // answer above, `log` or `mem` is non-null.
+        const NsTag nsTag = nsTagOfLog_(log, mem);
+        if (!nsSlots_.matches(nsTag.slot, nsTag.nsId)) [[unlikely]] {
+            const bool unassigned = nsSlots_.nsIdAt(nsTag.slot) == NsSlotTable::kFreeSlot;
             noteNsSlotMismatch_();
             ret.errorCode = static_cast<int16_t>(unassigned ? pc::ErrorCode::NotLeader : pc::ErrorCode::InvalidRequest);
             enqueueReturn_(ret);
@@ -9479,10 +9494,12 @@ private:
         // Namespaces Phase 2 Task 11 (D25): a LEADER produce to a user topic of a namespace over its disk limit is refused
         // (one byte load); nothing is appended.  Internal topics (topicId < 0), follower apply, catch-up and the cleaner
         // never get here / never read it.
-        if (log != nullptr && f.topicId >= 0) {
-            NsHot& nh = nsHot_[log->nsSlot()];
+        if (f.topicId >= 0) {
+            NsHot& nh = nsHot_[nsTag.slot];
             ++nh.requestOps;   // Task 14 (D28): one add ...
-            if (const uint8_t gate = nsOverDisk_[log->nsSlot()]; gate != 0) [[unlikely]] {
+            // The OverDisk gate applies to DISK logs only (#712): a transient partition (log == nullptr) holds no disk, so a
+            // namespace over its disk limit still serves it.  DELETING applies to both kinds.
+            if (const uint8_t gate = nsOverDisk_[nsTag.slot]; gate != 0 && (gate == kNsGateDeleting || log != nullptr)) [[unlikely]] {
                 if (gate == kNsGateOverDisk) ++overDiskRefusals_;
                 ret.errorCode = static_cast<int16_t>(gate == kNsGateOverDisk ? pc::ErrorCode::NamespaceLimitExceeded
                                                                              : pc::ErrorCode::UnknownTopic);
@@ -9757,9 +9774,9 @@ private:
         if (replica) {
             replica->onLeaderLogAppended();
         }
-        if (log != nullptr && f.topicId >= 0) {   // Task 11 (D25) + Task 14 (D28): the append's bytes and records, one add each
-            noteDiskAppend_(log->nsSlot(), rbSpan.size());
-            NsHot& nh = nsHot_[log->nsSlot()];
+        if (f.topicId >= 0) {   // Task 11 (D25) + Task 14 (D28): the append's bytes and records, one add each
+            if (log != nullptr) noteDiskAppend_(nsTag.slot, rbSpan.size());   // disk bytes: a transient partition holds none (#712)
+            NsHot& nh = nsHot_[nsTag.slot];
             nh.produceBytes   += rbSpan.size();
             nh.produceRecords += static_cast<uint64_t>(ret.lastOffset - ret.baseOffset + 1);
         }

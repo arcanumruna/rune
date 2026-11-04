@@ -12,7 +12,11 @@
 //   | max-batch-bytes    | leader produce           | batch L-1 / L / L+1                   | ok / ok / 52, no append        | BatchBytesRegression
 //   | both 0             | leader produce           | large batch                           | ok (unlimited)                 | UnlimitedRegression
 //   | both              | slot release + reassign  | no limits                             | ok                             | ReleaseThenReassignRegression
+//   | every gate (#712) | leader produce, TRANSIENT| size x2 / throttle / DELETING / OverDisk | 52 / 53 / UnknownTopic / served | TransientPartitionEnforcedRegression
+//   | request-ops (#712)| leader produce, TRANSIENT| one produce                          | counted once                   | TransientPartitionRequestOpsCountedRegression
 #include "HotPathBRig.h"
+#include "TransientRig.h"
+#include "support/LimitEnforcementTable.h"
 
 #include <rune/protocol/NamespaceLimits.h>
 #include <rune/protocol/Varint.h>
@@ -222,4 +226,115 @@ TEST(NsProduceSizeLimitRegression, TrailingBytesAdversarialRegression) {
     const int64_t end = rig.log->logEndOffset();
     EXPECT_EQ(produce(rig, b), kInvalid);
     EXPECT_EQ(rig.log->logEndOffset(), end);
+}
+
+// ---- #712: a transient partition (InMemoryLog, no disk Log) goes through the same namespace gates -------------------------
+
+namespace {
+
+using rune::node::test::TransientExpect;
+using rune::node::test::TransientGate;
+
+constexpr uint32_t kTNs   = 1;
+constexpr uint16_t kTSlot = 1;
+
+void tAssign(transient_rig::Rig& rig, uint64_t maxMessage, uint64_t maxBatch) {
+    rig.mem.setNsTag(kTNs, kTSlot);
+    rune::protocol::NamespaceLimits l;
+    l.maxMessageBytes = maxMessage;
+    l.maxBatchBytes   = maxBatch;
+    rig.worker().applyNsSlotAssignDirect(kTSlot, kTNs, l);
+}
+
+}  // namespace
+
+TEST(NsProduceSizeLimitRegression, TransientPartitionEnforcedRegression) {
+    for (const auto& row : rune::node::test::kTransientRows) {
+        SCOPED_TRACE(std::string(row.operation));
+        transient_rig::Rig rig;
+        const auto big = transient_rig::batchOf(1, 4096);   // one 4 KiB record
+        switch (row.gate) {
+            case TransientGate::MessageBytes:   tAssign(rig, 1024, 0); break;
+            case TransientGate::BatchBytes:     tAssign(rig, 0, 2048); break;
+            case TransientGate::Throttle:
+                tAssign(rig, 0, 0);
+                rig.worker().applyNsThrottleDirect(kTSlot, kTNs, rune::node::ThrottleKind::ProduceBytes, rig.now + 1'000'000'000);
+                break;
+            case TransientGate::Deleting:
+                tAssign(rig, 0, 0);
+                rig.worker().applyNsThrottleDirect(kTSlot, kTNs, rune::node::ThrottleKind::NsDeleting, 0);
+                break;
+            case TransientGate::OverDiskExempt:
+                tAssign(rig, 0, 0);
+                rig.worker().applyNsThrottleDirect(kTSlot, kTNs, rune::node::ThrottleKind::Disk, INT64_MAX);
+                ASSERT_TRUE(rig.worker().nsOverDiskForTest(kTSlot)) << "precondition: the slot's OverDisk byte is set";
+                break;
+        }
+        const int64_t endBefore = rig.mem.logEndOffset();
+        const int16_t code = rig.produce(big, 1);
+        switch (row.expect) {
+            case TransientExpect::LimitExceeded52:
+                EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::NamespaceLimitExceeded));
+                EXPECT_EQ(rig.mem.logEndOffset(), endBefore) << "nothing appended";
+                break;
+            case TransientExpect::Throttled53:
+                EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::Throttled));
+                EXPECT_EQ(rig.mem.logEndOffset(), endBefore) << "nothing appended";
+                break;
+            case TransientExpect::UnknownTopic:
+                EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::UnknownTopic));
+                EXPECT_EQ(rig.mem.logEndOffset(), endBefore) << "nothing appended";
+                break;
+            case TransientExpect::Served:
+                EXPECT_EQ(code, 0);
+                EXPECT_GT(rig.mem.logEndOffset(), endBefore) << "appended";
+                EXPECT_EQ(rig.worker().overDiskRefusalsForTest(), 0u) << "the OverDisk gate never counts a transient refusal";
+                break;
+        }
+    }
+}
+
+TEST(NsProduceSizeLimitRegression, TransientPartitionRequestOpsCountedRegression) {
+    transient_rig::Rig rig;
+    tAssign(rig, 0, 0);
+    ASSERT_EQ(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::RequestOps), 0u);
+    EXPECT_EQ(rig.produce(transient_rig::batchOf(2, 100), 1), 0);
+    EXPECT_EQ(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::RequestOps), 1u) << "one produce, one request op";
+    EXPECT_GT(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::ProduceBytes), 0u) << "produce accounting reads the same tag";
+    EXPECT_EQ(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::ProduceRecords), 2u);
+    EXPECT_EQ(rig.worker().nsDiskBytesForTest(kTSlot), 0) << "a transient partition is never charged disk bytes";
+}
+
+// #712 siblings: fetch pacing and fetch-bytes accounting read the same tag, so a transient source is paced and counted.
+TEST(NsProduceSizeLimitRegression, TransientPartitionFetchPacedAndCountedRegression) {
+    transient_rig::Rig rig;
+    tAssign(rig, 0, 0);
+    ASSERT_EQ(rig.produce(transient_rig::batchOf(2, 200), 1), 0);
+    const uint64_t opsBefore = rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::RequestOps);
+    const auto served = rig.readOnce(/*subId=*/5, /*from=*/0);
+    ASSERT_TRUE(served.has_value());
+    EXPECT_GT(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::FetchBytes), 0u) << "the delivered bytes are charged to the slot";
+    EXPECT_GT(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::RequestOps), opsBefore) << "a read is a request op";
+    // Over its fetch-bytes rate: the read is UNANSWERED (push bound -1) and counted as throttled; nothing is delivered.
+    const uint64_t fetchBytes = rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::FetchBytes);
+    rig.worker().applyNsThrottleDirect(kTSlot, kTNs, rune::node::ThrottleKind::FetchBytes, rig.now + 1'000'000'000);
+    const auto paced = rig.readOnce(/*subId=*/6, /*from=*/0);
+    ASSERT_TRUE(paced.has_value());
+    EXPECT_EQ(paced->pushEffectiveBound(), -1) << "an unanswered read";
+    EXPECT_EQ(rig.worker().throttledRefusalsForTest(), 1u);
+    EXPECT_EQ(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::FetchBytes), fetchBytes) << "nothing was read for a paced namespace";
+}
+
+// #712 slot-state cells: the (slot, nsId) tag check covers a transient partition too.
+TEST(NsProduceSizeLimitRegression, TransientPartitionSlotStateRegression) {
+    transient_rig::Rig rig;
+    rig.mem.setNsTag(kTNs, kTSlot);   // the slot was never assigned on this worker: retriable NotLeader
+    const auto batch = transient_rig::batchOf(1, 100);
+    EXPECT_EQ(rig.produce(batch, 1), static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    tAssign(rig, 0, 0);               // assigned: served
+    EXPECT_EQ(rig.produce(batch, 1), 0);
+    ASSERT_TRUE(rig.worker().applyNsSlotReleaseDirect(kTSlot, kTNs));
+    rig.worker().applyNsSlotAssignDirect(kTSlot, kTNs + 1, rune::protocol::NamespaceLimits{});   // reused by another namespace
+    EXPECT_EQ(rig.produce(batch, 1), static_cast<int16_t>(pc::ErrorCode::InvalidRequest)) << "a stale tag is never charged to the new owner";
+    EXPECT_EQ(rig.worker().nsCounterForTest(kTSlot, rune::node::NsMetric::ProduceBytes), 0u);
 }
