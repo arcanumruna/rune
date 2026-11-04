@@ -118,7 +118,7 @@ struct ITxnRequestHandler {
     // namespaces, at setTxnService.  A coordinator that loads AFTER the apply re-derives from it: it aborts every open
     // transaction of a blocked namespace at its load (abortAllForNamespace answers 0 while unloaded).  Control thread,
     // cold.  Default: ignored.
-    virtual void setNamespaceTxnGate(uint32_t /*nsId*/, bool /*blocked*/) {}
+    virtual void setNamespaceTxnGate(uint32_t /*nsId*/, bool /*blocked*/, bool /*deleting*/) {}
 
     // #696: the Ongoing transactions of namespace `nsId` on this node's coordinator (the count its maxOpenTxns limit checks).
     // 0 when the coordinator is not loaded here (usage is per node, D24).  Control thread, cold.  Default: 0.

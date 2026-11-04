@@ -82,16 +82,30 @@ bool GroupCoordinationService::isLocalCoordinator() const {
 ReapStatus GroupCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs) {
     if (offsets_ == nullptr) return ReapStatus::Done;   // no offset store (a rig): nothing to remove
     if (!isLocalCoordinator() || !offsetsLoaded_()) return ReapStatus::Refused;
+    if (nsId != 0) {   // a transactional offset still in flight must not re-append a live key after the tombstones
+        for (auto it = txnOffsetsInFlight_.begin(); it != txnOffsetsInFlight_.end();) {
+            if (rune::coordination::parseScopedId(it->first.group).nsId == nsId) {
+                txnOffsetsWaiting_ -= it->second.waiters.size();
+                it = txnOffsetsInFlight_.erase(it);
+            } else ++it;
+        }
+    }
     rune::replication::PartitionReplica* r = offsets_->replica();
     const rune::replication::Offset leo0 = r->logEndOffset();
     const bool none = offsets_->tombstoneNamespace(nsId, batch, nowNs);
     if (!none) return r->logEndOffset() > leo0 ? ReapStatus::More : ReapStatus::Refused;
     if (r->highWatermark() < r->logEndOffset()) return ReapStatus::Waiting;   // the commit is awaited (nothing for the reaper to write)
     for (auto it = coordinators_.begin(); it != coordinators_.end();) {   // #663: the deleted namespace's in-memory groups go
-        if (nsId != 0 && rune::coordination::parseScopedId(it->first).nsId == nsId) it = coordinators_.erase(it);
+        if (nsId != 0 && rune::coordination::parseScopedId(it->first).nsId == nsId) it = dropGroup_(it);
         else ++it;
     }
     return ReapStatus::Done;
+}
+
+std::size_t GroupCoordinationService::txnOffsetsInFlightKeysOfNamespaceForTest(uint32_t nsId) const {
+    std::size_t n = 0;
+    for (const auto& kv : txnOffsetsInFlight_) n += rune::coordination::parseScopedId(kv.first.group).nsId == nsId ? 1 : 0;
+    return n;
 }
 
 std::size_t GroupCoordinationService::inMemoryGroupsOfNamespaceForTest(uint32_t nsId) const {
@@ -352,14 +366,7 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
     for (auto it = coordinators_.begin(); it != coordinators_.end();) {
         const coord::GroupCoordinator& gc = it->second;
         if (gc.isEmpty() && gc.state() == coord::GroupState::Empty && !gc.hasDeparted()) {
-            pruneGroupLineageState_(it->first);
-            if (!filterMismatchRefusals_.empty()) {
-                const std::string& g = it->first;
-                std::erase_if(filterMismatchRefusals_, [&](const auto& e) {
-                    return e.first.size() > g.size() && e.first.compare(0, g.size(), g) == 0 && e.first[g.size()] == '\x1f';
-                });
-            }
-            it = coordinators_.erase(it);
+            it = dropGroup_(it);
             ++groupsPruned_;
             ++work;
         } else {
@@ -484,6 +491,35 @@ int GroupCoordinationService::unloadGroups_(const char* why) {
     coordinators_.clear();
     spdlog::info("GroupCoordinationService: {} — unloaded {} group(s) (#565 / #570)", why, n);
     return static_cast<int>(n);
+}
+
+GroupCoordinationService::GroupMap::iterator
+GroupCoordinationService::dropGroup_(
+    GroupMap::iterator it)
+{
+    const std::string& g = it->first;
+    sessionScratch_.clear();   // the sessions whose bindings go (cold path)
+    for (const auto& member : it->second.members()) {
+        buildMemberKey_(g, member.memberId);
+        const auto b = memberSessionMap_.find(memberKeyScratch_);
+        if (b == memberSessionMap_.end()) continue;
+        sessionScratch_.push_back(b->second.sessionId);
+        memberSessionMap_.erase(b);
+    }
+    if (gateway_) {   // revokeGroupSubscriptions is session-wide: only for a session left with no other group binding
+        for (const int64_t sid : sessionScratch_) {
+            bool other = false;
+            for (const auto& [key, binding] : memberSessionMap_) if (binding.sessionId == sid) { other = true; break; }
+            if (!other) gateway_->revokeGroupSubscriptions(sid);
+        }
+    }
+    pruneGroupLineageState_(g);
+    if (!filterMismatchRefusals_.empty()) {
+        std::erase_if(filterMismatchRefusals_, [&](const auto& e) {
+            return e.first.size() > g.size() && e.first.compare(0, g.size(), g) == 0 && e.first[g.size()] == '\x1f';
+        });
+    }
+    return coordinators_.erase(it);
 }
 
 void GroupCoordinationService::pruneGroupLineageState_(const std::string& groupId) {

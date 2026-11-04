@@ -80,7 +80,8 @@ struct Leader {
     NullTransport transport;
     std::unique_ptr<rr::PartitionReplica> replica;
     int64_t clock = 0;
-    explicit Leader(std::string_view tag, int64_t rollBytes = 64 * 1024 * 1024, int64_t deleteRetentionMs = 86'400'000)
+    explicit Leader(std::string_view tag, int64_t rollBytes = 64 * 1024 * 1024, int64_t deleteRetentionMs = 86'400'000,
+                    bool silentFollower = false)
         : dir(tag), log(dir.path, rollBytes) {
         rr::PartitionConfig cfg;
         cfg.topicId = 301; cfg.partitionId = 0; cfg.selfId = 1; cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
@@ -89,10 +90,12 @@ struct Leader {
         cfg.cleanupPolicy = rr::CleanupPolicy::Compact;
         cfg.minCleanableDirtyRatio = 0.0;
         cfg.deleteRetentionMs = deleteRetentionMs;
-        replica = std::make_unique<rr::PartitionReplica>(cfg, rr::Role::Leader, 1, std::vector<rr::NodeId>{1},
-                                                         std::vector<rr::NodeId>{1}, &log, &transport);
-        replica->becomeLeader(1, {1});
+        replica = std::make_unique<rr::PartitionReplica>(cfg, rr::Role::Leader, 1, silentFollower ? std::vector<rr::NodeId>{1, 2} : std::vector<rr::NodeId>{1},
+                                                         silentFollower ? std::vector<rr::NodeId>{1, 2} : std::vector<rr::NodeId>{1}, &log, &transport);
+        replica->becomeLeader(1, silentFollower ? std::vector<rr::NodeId>{1, 2} : std::vector<rr::NodeId>{1});
     }
+    /// With a silent follower the high watermark stalls (appends stay uncommitted) until the ISR shrinks past the lag limit.
+    void shrinkIsr() { clock += 20'000'000'000LL; replica->doWork(clock); }
     /// Pumps until the high watermark reaches the log end.
     bool pumpToEnd() {
         const rr::Offset target = replica->logEndOffset();
@@ -488,4 +491,66 @@ TEST(NamespaceTombstoneRegression, GroupTombstoneErasesInMemoryGroupsRegression)
     }
     ASSERT_EQ(st, rune::node::ReapStatus::Done);
     EXPECT_EQ(gcs.groupCountForTest(), 1u) << "the deleted namespace's groups stay in memory";
+}
+
+// ── MINOR-1 (#663 / #709): a group tombstoned with a live member leaves no member binding behind ─────────────
+TEST(NamespaceTombstoneRegression, GroupTombstoneWithLiveMemberLeavesNoBindingAdversarialRegression) {
+    namespace pc = rune::protocol::client;
+    Leader L("gcs_bind");
+    co::ReplicatedOffsetStore store(L.replica.get());
+    rune::node::GroupCoordinationService gcs(&store, /*topics=*/nullptr);
+    int64_t now = 1'000'000'000;
+    gcs.doWork(now);
+    std::array<uint8_t, 2048> req{}, out{};
+    auto join = [&](uint32_t ns, int64_t sid, const std::string& group) {
+        pc::JoinGroup msg;
+        msg.sessionId = sid; msg.correlationId = 7; msg.sessionTimeoutMs = 30000;
+        msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+        msg.memberId = std::span<const uint8_t>();
+        const std::vector<int32_t> none;
+        const std::size_t n = msg.encode(req.data(), std::span<const int32_t>(none));
+        const rune::coordination::NsRequestContext ctx{ns, false, nullptr};
+        const std::size_t o = gcs.handleJoinGroup(req.data(), n, pc::kClientVersion, now, out.data(), out.size(), ctx);
+        const auto r = pc::JoinGroupResponse::decode(out.data(), o);
+        ASSERT_TRUE(r.has_value()); ASSERT_EQ(r->errorCode, 0);
+    };
+    join(4, 11, "g1");
+    join(5, 12, "g1");
+    for (int i = 0; i < 4; ++i) { now += 1'000'000; gcs.doWork(now); }
+    ASSERT_EQ(gcs.memberBindingCountForTest(), 2u);
+    rune::node::ReapStatus st = rune::node::ReapStatus::More;
+    for (int i = 0; i < kCap && st != rune::node::ReapStatus::Done; ++i) { st = gcs.tombstoneNamespace(4, 256, now); ASSERT_TRUE(L.pumpToEnd()); }
+    ASSERT_EQ(st, rune::node::ReapStatus::Done);
+    ASSERT_EQ(gcs.inMemoryGroupsOfNamespaceForTest(4), 0u);
+    EXPECT_EQ(gcs.memberBindingCountForTest(), 1u) << "the erased group's member binding survived the tombstone";
+    gcs.removeSessionMembers(11, now);
+    EXPECT_EQ(gcs.memberBindingCountForTest(), 1u);
+    EXPECT_EQ(gcs.inMemoryGroupsOfNamespaceForTest(5), 1u);
+}
+
+// ── MAJOR-1 (#662 / #663 class): a transactional offset still in flight at the tombstone is forgotten with the group ──
+TEST(NamespaceTombstoneRegression, GroupTombstoneDropsInFlightTxnOffsetsRegression) {
+    Leader L("gcs_inflight", 64 * 1024 * 1024, 86'400'000, /*silentFollower=*/true);
+    co::ReplicatedOffsetStore store(L.replica.get());
+    rune::node::GroupCoordinationService gcs(&store, /*topics=*/nullptr);
+    int64_t now = 1'000'000'000;
+    gcs.doWork(now);
+    const co::TxnOffsetToken tok4{77, 0, 5, 1}, tok5{78, 0, 6, 1};
+    // Single-node replica: the appended record is not committed until the replica is driven (Replicating).
+    ASSERT_EQ(gcs.applyTransactionalOffset(gid(4, 0), tp(), 42, now, tok4), co::TxnOffsetApply::Replicating);
+    ASSERT_EQ(gcs.applyTransactionalOffset(gid(5, 0), tp(), 43, now, tok5), co::TxnOffsetApply::Replicating);
+    ASSERT_EQ(gcs.txnOffsetsReplicating(), 2u);
+    ASSERT_EQ(gcs.txnOffsetsInFlightKeysOfNamespaceForTest(4), 1u);
+    L.shrinkIsr();   // the offsets partition commits again (the tombstones can be pumped)
+    rune::node::ReapStatus st = rune::node::ReapStatus::More;
+    for (int i = 0; i < kCap && st != rune::node::ReapStatus::Done; ++i) { st = gcs.tombstoneNamespace(4, 256, now); ASSERT_TRUE(L.pumpToEnd()); }
+    ASSERT_EQ(st, rune::node::ReapStatus::Done);
+    EXPECT_EQ(gcs.txnOffsetsInFlightKeysOfNamespaceForTest(4), 0u) << "an in-flight txn offset of the deleted namespace survived";
+    EXPECT_EQ(gcs.txnOffsetsReplicating(), 1u) << "only namespace 5's waiter remains";
+    EXPECT_EQ(gcs.txnOffsetsInFlightKeysOfNamespaceForTest(5), 1u);
+    // An offsets-leader change and further driving never bring a live key of the deleted namespace back.
+    L.replica->becomeLeader(2, {1});
+    for (int i = 0; i < 50; ++i) { now += 1'000'000; gcs.doWork(now); L.clock += 1'000'000; L.replica->doWork(L.clock); }
+    EXPECT_FALSE(store.fetch(gid(4, 0), tp()).has_value()) << "a live offset key of the deleted namespace is in the store";
+    EXPECT_EQ(store.liveKeysOfNamespaceForTest(4), 0u);
 }

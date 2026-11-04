@@ -705,6 +705,16 @@ TEST_P(NamespaceTrioBeforeReplicationRegression, LeaderChangeBeforeReplicationCo
             default: break;
         }
     }
+
+    // e. #644: byte identity. A divergent event that is kept (not truncated) can have the same effect, digest and request
+    // count as the new leader's, so only the log bytes tell: every node's __catalog log equals the new leader's.
+    auto logBytes = [&](int n) {
+        return t.node(n).onAdminThreadForTest([&t, n]() { return t.node(n).catalogLogForTest()->read(0, 1 << 22); });
+    };
+    EXPECT_TRUE(AuthTrio::until(60s, [&] {
+        const auto want = logBytes(L2);
+        return logBytes(1) == want && logBytes(2) == want && logBytes(3) == want;
+    })) << label << ": a node's __catalog log differs from the new leader's (a divergent event kept, not truncated)";
 }
 
 INSTANTIATE_TEST_SUITE_P(All, NamespaceTrioBeforeReplicationRegression, ::testing::ValuesIn(beforeReplicationCells()),

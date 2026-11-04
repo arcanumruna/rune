@@ -8785,7 +8785,7 @@ void ClientGateway::onNamespaceUpserted(const rune::catalog::NamespaceRecord& r)
     // Namespaces Phase 2 Task 4: on every node, at the apply of the state change.  Only the node whose transaction
     // coordinator is loaded holds transactions (others return 0), so this covers the transactions whose sessions live
     // on other gateways or are already gone.  Idempotent.
-    if (txnService_ != nullptr) txnService_->setNamespaceTxnGate(r.nsId, tag != NsStateTag::Active);   // #661: a coordinator that loads later re-derives from it
+    if (txnService_ != nullptr) txnService_->setNamespaceTxnGate(r.nsId, tag != NsStateTag::Active, tag == NsStateTag::Deleting);   // #661: a coordinator that loads later re-derives from it
     if (tag != NsStateTag::Active && txnService_ != nullptr) (void)txnService_->abortAllForNamespace(r.nsId, nowNs_);
     nsGateScratch_.clear();
     sessions_.forEach([&](Session& s) {

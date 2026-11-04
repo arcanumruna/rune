@@ -282,6 +282,8 @@ public:
     /// Read-only test seam: the live offset keys of `nsId` in this node's store; nullopt (unknown, NOT zero) when the store is not loaded here.
     /// Groups of namespace `nsId` still held IN MEMORY (coordinators_).  Cold scan; independent of the persisted store.
     [[nodiscard]] std::size_t inMemoryGroupsOfNamespaceForTest(uint32_t nsId) const;
+    [[nodiscard]] std::size_t memberBindingCountForTest() const noexcept { return memberSessionMap_.size(); }
+    [[nodiscard]] std::size_t txnOffsetsInFlightKeysOfNamespaceForTest(uint32_t nsId) const;
     [[nodiscard]] std::optional<std::size_t> liveKeysOfNamespaceForTest(uint32_t nsId) const;   ///< nullopt = unknown (not loaded / not the coordinator)
     /// Issue #212: the session was revoked (terminal) - every member tracked on it leaves its group now (cold).
     void removeSessionMembers(int64_t sessionId, int64_t nowNs) override;
@@ -557,6 +559,10 @@ private:
                           bool genEntry, int64_t nowNs);
     void retryPendingChecks_(int64_t nowNs);
     void pruneGroupLineageState_(const std::string& groupId);
+    /// Everything one group owns: its members' bindings (and, once a session holds no other binding, its group push
+    /// subscriptions), the per-group lineage / filter-refusal state, then the coordinator itself.  Returns the next iterator.
+    using GroupMap = std::map<GroupId, rune::coordination::GroupCoordinator, std::less<>>;
+    GroupMap::iterator dropGroup_(GroupMap::iterator it);
     /// #565: this node is not the group coordinator — drop every in-memory group (Kafka-style unload): end the
     /// members' group push subscriptions, forget the member bindings and per-group lineage state.  No Assign frame
     /// (a member learns NotCoordinator on its next request).  Returns the number of groups unloaded.
@@ -659,6 +665,7 @@ private:
     std::string groupIdScratch_;    ///< groupId span → reusable std::string
     std::string memberIdScratch_;   ///< memberId span → reusable std::string
     std::string memberKeyScratch_;  ///< "groupId:memberId" composite lookup key
+    std::vector<int64_t> sessionScratch_;     ///< dropGroup_: sessions of the dropped members (cold path)
     std::vector<std::string> evictScratch_;   ///< fix round 4: members to evict (cold path)
     /// Every member tracked on `sessionId` leaves its group (subscriptions revoked, session mapping dropped); `why`
     /// names the cause in the warn line.  evictSessionMembers / removeSessionMembers (#212).  Cold.
