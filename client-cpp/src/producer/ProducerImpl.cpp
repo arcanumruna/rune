@@ -379,7 +379,8 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
                                      const Key& key,
                                      std::span<const uint8_t> value,
                                      bool wantAck,
-                                     int64_t correlationId) noexcept
+                                     int64_t correlationId,
+                                     uint8_t intent) noexcept
 {
     const std::size_t keyLen   = key.size();
     const std::size_t valueLen = value.size();
@@ -408,8 +409,8 @@ bool ProducerImpl::submitSendRecord(int32_t topicId,
         if (idx < 0) return false; // INSUFFICIENT_CAPACITY → back-pressure
 
         uint8_t* dst = ring_.base() + idx;
-        writeRecordHeader(dst, topicId, partition, key.bytes().data(), keyLen, wantAck ? kFlagWantAck : uint8_t{0},
-                          correlationId);
+        writeRecordHeader(dst, topicId, partition, key.bytes().data(), keyLen,
+                          static_cast<uint8_t>((wantAck ? kFlagWantAck : 0) | (intent << kFlagIntentShift)), correlationId);
         writeLE32u(dst, kRecValLenOff, static_cast<uint32_t>(valueLen));
         if (valueLen > 0) std::memcpy(dst + kRecValBytesOff, value.data(), valueLen);
 
@@ -440,7 +441,7 @@ int64_t ProducerImpl::steadyNowNs_() noexcept {
 
 SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key& key,
                                    std::span<const uint8_t> value, int64_t ackHandle,
-                                   RejectReason* why) noexcept {
+                                   RejectReason* why, uint8_t intent) noexcept {
     if (key.tooLong()) [[unlikely]] return SendResult::KeyTooLong;
     // Phase 2b F: the one extra branch on the hot path (a byte load + compare).  Direct mode decides
     // WrongThread FIRST (the gate is owner-written), so its gate check lives in tryAppendDirect_.
@@ -450,11 +451,11 @@ SendResult ProducerImpl::trySubmit(int32_t topicId, int32_t partition, const Key
     }
     if (mode_ == IngressMode::Direct) {
         RejectReason w = RejectReason::None;
-        const SendResult r = tryAppendDirect_(topicId, partition, key, value, ackHandle, w);
+        const SendResult r = tryAppendDirect_(topicId, partition, key, value, ackHandle, w, intent);
         if (why != nullptr) *why = w;
         return r;
     }
-    const SendResult r = trySubmitRing_(topicId, partition, key, value, ackHandle);
+    const SendResult r = trySubmitRing_(topicId, partition, key, value, ackHandle, intent);
     if (why != nullptr) [[unlikely]] {
         *why = r == SendResult::Ok            ? RejectReason::None
              : r == SendResult::Closed        ? RejectReason::Closed
@@ -480,7 +481,7 @@ SendResult ProducerImpl::ringRecordFits_(std::size_t keySize, std::size_t valueL
 }
 
 SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, const Key& key,
-                                        std::span<const uint8_t> value, int64_t ackHandle) noexcept {
+                                        std::span<const uint8_t> value, int64_t ackHandle, uint8_t intent) noexcept {
     // fix1 C2/I3 + F8c C1(a): closed is a terminal state, decided by the claim
     // itself — the ring's closed bit lives in the tail word tryClaim() CASes, so
     // a send is either accepted before Client::closeImpl_ closed the ring (and
@@ -492,7 +493,7 @@ SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, cons
     if (const SendResult fits = ringRecordFits_(key.size(), value.size()); fits != SendResult::Ok) [[unlikely]] {
         return fits;
     }
-    if (submitSendRecord(topicId, partition, key, value, ackHandle != 0, ackHandle)) [[likely]] {
+    if (submitSendRecord(topicId, partition, key, value, ackHandle != 0, ackHandle, intent)) [[likely]] {
         return SendResult::Ok;
     }
     return ring_.closed() ? SendResult::Closed : SendResult::BackPressured;
@@ -500,7 +501,7 @@ SendResult ProducerImpl::trySubmitRing_(int32_t topicId, int32_t partition, cons
 
 SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, const Key& key,
                                           std::span<const uint8_t> value, int64_t ackHandle,
-                                          RejectReason& why) noexcept {
+                                          RejectReason& why, uint8_t intent) noexcept {
     // Task 14: the owner thread IS the duty-cycle thread — append straight into
     // the partition builder (no ring, no CAS, no second copy).  Every piece of
     // state touched here is owner-thread-only; any other thread is rejected
@@ -534,7 +535,7 @@ SendResult ProducerImpl::tryAppendDirect_(int32_t topicId, int32_t partition, co
         return SendResult::MessageTooLarge;
     }
     const auto kb = key.bytes();
-    const uint8_t flags = ackHandle != 0 ? kFlagWantAck : uint8_t{0};
+    const uint8_t flags = static_cast<uint8_t>((ackHandle != 0 ? kFlagWantAck : 0) | (intent << kFlagIntentShift));
     // Task 14 fix1 C1 / fix2: inside this producer's own duty work (a callback
     // it fired mid-walk / mid-reset) the record is DEFERRED into the arena and
     // applied when that work completes.
@@ -1143,13 +1144,13 @@ void ProducerImpl::blockingWaitStep(BlockingWait& w) {
 }
 
 void ProducerImpl::sendBlocking(SendResult r, int32_t topicId, int32_t partition, const Key& key,
-                                std::span<const uint8_t> value) {
+                                std::span<const uint8_t> value, uint8_t intent) {
     BlockingWait w = beginBlockingWait();
     for (;;) {
         if (r == SendResult::Ok) return;
         throwForSendResult(r);  // every non-retryable result throws
         blockingWaitStep(w);
-        r = trySubmit(topicId, partition, key, value, 0);
+        r = trySubmit(topicId, partition, key, value, 0, nullptr, intent);
     }
 }
 
@@ -1817,7 +1818,7 @@ rune::client::detail::ControlledAction ProducerImpl::appendRecord_(
     const int32_t index = ps.builder->recordCount();
     const std::string_view kv(reinterpret_cast<const char*>(keyBytes), static_cast<std::size_t>(keyLen));
     const std::string_view vv(reinterpret_cast<const char*>(valBytes), static_cast<std::size_t>(valueLen));
-    ps.builder->append(kv, vv, wallMs());
+    ps.builder->append(kv, vv, wallMs(), static_cast<uint8_t>((flags & kFlagIntentMask) >> kFlagIntentShift));
     // ---- committed: nothing below throws -----------------------------------
     noteAppended_(ps, index, 1, flags, ackHandle, nowNs);
     return ControlledAction::CONTINUE;

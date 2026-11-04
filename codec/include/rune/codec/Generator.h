@@ -40,7 +40,8 @@ namespace rune::codec {
 /// @throws std::invalid_argument if the descriptor has a key field AND a field
 ///         named "key" (the member would collide with the key() accessor), or a
 ///         field named "Filter" (it would collide with the generated filter type) or
-///         "encodeTo" (it would collide with Filter::encodeTo).
+///         "encodeTo" (it would collide with Filter::encodeTo), or a field whose name ends in '_' (reserved for the
+///         generated code's own locals, parameters and private members, so none can collide with a field).
 ///
 /// @param d       The descriptor to generate code for.
 /// @param nspace  The C++ namespace to emit the struct in (default "rune::gen").

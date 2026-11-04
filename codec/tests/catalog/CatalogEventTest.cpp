@@ -396,7 +396,7 @@ TEST(CatalogEventRegression, OpsLengthDisagreeingWithItsBodyIsRefused) {
 
 // ── value refusals: encode refuses EXACTLY what decode refuses (one validation) ─
 TEST(CatalogEventRegression, UnknownFormatVersionIsRefusedByEncodeAndDecode) {
-    for (const uint16_t v : {uint16_t{0}, uint16_t{3}, uint16_t{0xFFFF}}) {   // 1 and 2 are the known formats
+    for (const uint16_t v : {uint16_t{0}, uint16_t{4}, uint16_t{0xFFFF}}) {   // 1, 2 and 3 are the known formats
         auto b = rc::encode(baseEvent(rc::DropTopicOps{.topicId = 1})).value();
         putU16(b, 0, v);
         auto d = rc::decode(b);

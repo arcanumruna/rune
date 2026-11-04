@@ -71,7 +71,7 @@ namespace cd = rune::codec;
 /// does not preview or apply (the script is broken — never silently emitted).
 class ScriptBuilder {
 public:
-    /// formatVer 1 (the frozen v1 script) or 2 (the namespace script).  Object helpers act in the namespace
+    /// formatVer 1 (the frozen v1 script), 2 (the namespace script) or 3 (the key-features script).  Object helpers act in the namespace
     /// set by inNs() (default 0); the namespace helpers name their subject explicitly.
     explicit ScriptBuilder(uint16_t formatVer = kFormatV1) : formatVer_(formatVer) {}
     void inNs(uint32_t nsId) { ns_ = nsId; }
@@ -444,6 +444,46 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
     b.nsDeleteStep(3, SecurityPurged, "DELETE STEP gamma security");
     b.inNs(2);
     b.dropTopic("t", "DROP TOPIC t");
+    return std::move(b).take();
+}
+
+/// The 9 formatVer-3 golden events, offsets 0..8, all in the default namespace but the last
+/// (tests/catalog/golden/v3/basic.rcat):
+///    0 CreateTopic ki (typed, keyed, key.index)   1 CreateTopic raw (untyped)
+///    2 CreateSchema on raw (keyed, key.index)     3 AlterSchema ADD on ki   4 SetCompatibility on ki
+///    5 CreateTopic plain (typed, default features)   6 AlterTopicConfig on ki   7 DropTopic plain
+///    8 NamespaceCreated ns1 (v3 keeps the v2 kinds)
+[[nodiscard]] inline std::vector<CatalogEvent> goldenScriptV3() {
+    namespace cd = rune::codec;
+    golden_detail::ScriptBuilder b(kFormatV3);
+    auto keyed = [](const std::string& name, bool keyIndex) {
+        cd::DescriptorBuilder d(name);
+        d.add("id", cd::PrimType::Int64, 1, /*isKey=*/true).add("v", cd::PrimType::Int32);
+        SchemaDef def{.keyField = "id", .validate = true, .descriptorBlob = cd::serialize(d.build()), .nextTag = 2};
+        def.keyFeatures.keyIndex = keyIndex;
+        return def;
+    };
+    {
+        CreateTopicOps o;
+        o.partitions = 2;
+        o.schema = keyed("ki", true);
+        b.createTopic("ki", std::move(o), "CREATE TOPIC ki (id INT64 KEY, v INT32) WITH (key.index=true)");
+    }
+    b.createTopic("raw", CreateTopicOps{}, "CREATE TOPIC raw");
+    b.createSchema("raw", keyed("raw", true), "DEFINE TOPIC raw (id INT64 KEY, v INT32) WITH (key.index=true)");
+    b.alterSchema("ki", {golden_detail::addOp("w", cd::PrimType::Int64)}, "ALTER TOPIC ki ADD w INT64");
+    b.setCompat("ki", cd::CompatMode::Forward, "ALTER TOPIC ki SET COMPATIBILITY FORWARD");
+    {
+        CreateTopicOps o;
+        o.schema = keyed("plain", false);
+        b.createTopic("plain", std::move(o), "CREATE TOPIC plain (id INT64 KEY, v INT32)");
+    }
+    b.alterConfig("ki", {{ConfigKey::RetentionMs, 60'000}}, "ALTER TOPIC ki SET (retention.ms=60000)");
+    b.dropTopic("plain", "DROP TOPIC plain");
+    rune::protocol::NamespaceLimits limits;
+    limits.maxTopics = 10; limits.maxViews = 5; limits.maxUsers = 100; limits.featureBits = 0x0F;
+    limits.maxPartitionsPerTopic = 64; limits.maxMessageBytes = 1 << 20; limits.produceBytesPerSec = 50'000'000;
+    b.nsCreate("ns1", limits, "CREATE NAMESPACE ns1");
     return std::move(b).take();
 }
 

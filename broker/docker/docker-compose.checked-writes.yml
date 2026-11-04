@@ -1,0 +1,19 @@
+# docker-compose.checked-writes.yml - the 3-node key-index cluster of docker/checked-writes-e2e.sh (overlay on
+# docker-compose.yml + docker-compose.auth.yml).
+#
+#   docker compose -p rune-checked-writes-e2e -f docker/docker-compose.yml -f docker/docker-compose.auth.yml \
+#       -f docker/docker-compose.checked-writes.yml up -d rune-1 rune-2 rune-3
+#
+# One knob (docs/configuration.md): how often a verdict source's leader writes a verdict marker when nothing was rejected.
+# 20 ms instead of the 100 ms default keeps the markers, and so the 80,000 racing writes, quick.
+
+x-checked-writes-env: &checked-writes-env
+  RUNE_VERDICT_INTERVAL_MS: "20"
+
+services:
+  rune-1:
+    environment: *checked-writes-env
+  rune-2:
+    environment: *checked-writes-env
+  rune-3:
+    environment: *checked-writes-env

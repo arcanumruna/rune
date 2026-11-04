@@ -732,6 +732,14 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_create_view_tests
         PROPERTIES TIMEOUT 60)
 
+    # Checked writes Part 10 (spec 9a): persisted views over transient sources - view-set timings, matrix, model.
+    add_executable(rune_checked_writes_transient_view_tests tests/integration/PersistedOverTransientViewTest.cpp)
+    target_include_directories(rune_checked_writes_transient_view_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE}
+                               ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_checked_writes_transient_view_tests PRIVATE rune_node rune_view rune_codec
+                          rune_transaction GTest::gtest_main)
+    gtest_discover_tests(rune_checked_writes_transient_view_tests PROPERTIES TIMEOUT 300 LABELS small)
+
     # ---------------------------------------------------------------------------
     # DDL conformance plan: DdlHarness suites — fix regressions (B1-B4, KL2), the
     # Occupant x Op matrix and the pair x timing matrix.  On-host (no Aeron),
@@ -841,8 +849,10 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesWorkerTest.cpp
         tests/node/CheckedWritesSpecFanoutTest.cpp
         tests/node/CheckedWritesDdlTest.cpp
+        tests/node/CheckedWritesKeyIndexDdlTest.cpp
         tests/node/CheckedWritesTimelineTest.cpp
-        tests/node/CheckedWritesVerdictSourceTest.cpp)
+        tests/node/CheckedWritesVerdictSourceTest.cpp
+        tests/node/CheckedWritesKeyIndexTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -1365,7 +1375,7 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_checked_writes_ack_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 04: the verdict pipeline on a real Worker.
-            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp)
+            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
@@ -1898,7 +1908,8 @@ if(BUILD_TESTING)
                        tests/client/RuneConsoleBrokerRegressionTest.cpp
                        tests/client/ClaimBrokerRegressionTest.cpp
                        tests/client/ProducerIdBrokerRegressionTest.cpp
-                       tests/client/CheckedWritesBrokerRegressionTest.cpp)
+                       tests/client/CheckedWritesBrokerRegressionTest.cpp
+                       tests/client/CheckedWritesTransientViewBrokerRegressionTest.cpp)
         # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed
         # `position.gen.h` (rune_gen_claim_schemas); the embedded client builds it under its own binary dir.
         add_dependencies(rune_client_broker_tests generate_claim_schema_headers)
@@ -2119,7 +2130,8 @@ if(BUILD_TESTING)
         # build-time generated all-fixed position.gen.h (typed claim through ProducerRef).
         add_executable(rune_client_failover_broker_tests tests/client/ClientFailoverBrokerRegressionTest.cpp
                        tests/client/EosBrokerRegressionTest.cpp
-                       tests/client/FilterBrokerRegressionTest.cpp)
+                       tests/client/FilterBrokerRegressionTest.cpp
+                       tests/client/CheckedWritesTransientViewFailoverBrokerRegressionTest.cpp)
         add_dependencies(rune_client_failover_broker_tests generate_claim_schema_headers)
         target_include_directories(rune_client_failover_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
                                    ${RUNE_CLIENT_ROOT}/tests ${CMAKE_BINARY_DIR}/rune-client/claim-gen

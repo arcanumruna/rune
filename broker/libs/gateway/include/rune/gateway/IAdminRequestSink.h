@@ -96,7 +96,8 @@ struct IAdminRequestSink {
                                           uint8_t persistence,   // Phase 2b E: 0 disk, 1 transient
                                           int16_t replicationFactor,
                                           const rune::protocol::TopicConfigView& config,
-                                          const DdlMetaView& meta, std::string_view adoptDenial) = 0;
+                                          const DdlMetaView& meta, std::string_view adoptDenial,
+                                          const rune::protocol::TopicKeyFeatures& keyFeatures) = 0;
 
     // GetTopicSchema (66) — a read, no DDL extension.  requestedFingerprint
     // (Task 13): 0 = latest; non-zero = the SPECIFIC version whose per-version

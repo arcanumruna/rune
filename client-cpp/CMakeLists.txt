@@ -257,12 +257,13 @@ set(RUNE_CLAIM_GEN_HEADERS
     "${RUNE_CLAIM_GEN_DIR}/gen/long_key.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/short_key.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/eos_out.gen.h"
-    "${RUNE_CLAIM_GEN_DIR}/gen/player_event.gen.h")
+    "${RUNE_CLAIM_GEN_DIR}/gen/player_event.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/ki_account.gen.h")
 add_custom_command(
     OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
     COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"
     DEPENDS rune_gen_claim_schemas
-    COMMENT "2b-B: generating position / tick_sample / long_key / short_key / eos_out / player_event .gen.h"
+    COMMENT "generating the claim and probe schema .gen.h headers (tests/support/GenClaimSchemas.cpp)"
 )
 add_custom_target(generate_claim_schema_headers DEPENDS ${RUNE_CLAIM_GEN_HEADERS})
 endif()
@@ -766,6 +767,28 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         endif()
     endif()
 
+    # ── Checked writes Part 05 — key index probe (broker/docker/checked-writes-e2e.sh) ──
+    #
+    # checked_writes_probe.cpp includes the build-time generated ki_account.gen.h (tests/support/GenClaimSchemas.cpp),
+    # so the probe image needs tests/ in its context.
+    if(TARGET generate_claim_schema_headers)
+        add_executable(checked_writes_probe examples/checked_writes_probe.cpp)
+        add_dependencies(checked_writes_probe generate_claim_schema_headers)
+        target_include_directories(checked_writes_probe PRIVATE ${RUNE_PROTOCOL_INCLUDE} "${RUNE_CLAIM_GEN_DIR}/gen" "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+        target_link_libraries(checked_writes_probe PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            rune_codec
+        )
+        if(UNIX AND NOT APPLE)
+            find_library(UUID_LIB_CHECKED_WRITES_PROBE uuid)
+            if(UUID_LIB_CHECKED_WRITES_PROBE)
+                target_link_libraries(checked_writes_probe PRIVATE ${UUID_LIB_CHECKED_WRITES_PROBE})
+            endif()
+        endif()
+    endif()
+
     # ── Task 10 (0c #11 gate) — CLI-driven rune-ql typed probe ────────────────
     #
     # tests/e2e/rune_ql_probe.cpp is the 0c single-node real-Aeron probe.  Unlike
@@ -1106,11 +1129,16 @@ if(BUILD_TESTING)
         tests/client/OpenTopicTest.cpp
         tests/client/TypedTopicRoutingRegressionTest.cpp   # Phase 2b C
         tests/client/KeyRoutingRegressionTest.cpp          # Phase 2b C: Key == protocol hash
+        tests/client/CheckedWritesTypedTopicTest.cpp       # checked writes: TypedTopic ops + WriteResult
         tests/support/AllocCounter.cpp                     # zero-alloc send check
     )
     add_dependencies(rune_open_topic_tests generate_characters_header)
+    if(TARGET generate_claim_schema_headers)   # #377: guarded like the generator itself
+        add_dependencies(rune_open_topic_tests generate_claim_schema_headers)
+    endif()
     target_include_directories(rune_open_topic_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${RUNE_CLAIM_GEN_DIR}
         ${RUNE_CODEC_ROOT}/include
         ${RUNE_PROTOCOL_INCLUDE}
         "${CMAKE_CURRENT_BINARY_DIR}/gen"                  # characters.gen.h
@@ -1437,6 +1465,7 @@ if(BUILD_TESTING)
             tests/subscriber/SubscriberTest.cpp
             tests/subscriber/SubscriberHubCommandTest.cpp
             tests/subscriber/SubscriberHubRecordsRegressionTest.cpp   # catalog history Task 13 fix round 2
+            tests/subscriber/CheckedWritesRecordOpTest.cpp
             tests/support/AllocCounter.cpp                             # zero-alloc onRecords gate
         )
         target_include_directories(rune_subscriber_tests PRIVATE
@@ -1551,6 +1580,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerAllocRegressionTest.cpp
             tests/producer/ProducerAckPathTest.cpp
             tests/producer/ProducerAcksFlagsTest.cpp
+            tests/producer/CheckedWritesIntentsTest.cpp
             tests/producer/ProducerVerdictsTest.cpp
             tests/producer/ProducerTier2PoolTest.cpp
             tests/producer/ProducerSendTest.cpp
@@ -1574,6 +1604,7 @@ if(BUILD_TESTING)
             tests/client/TxnStressTest.cpp
             tests/client/ClaimClientTest.cpp
             tests/client/TypedClaimTest.cpp
+            tests/client/CheckedWritesTypedTopicCqTest.cpp   # checked writes: TypedTopic cq forms, ProducerRef
             tests/client/IngressEndpointRoutingTest.cpp
             tests/client/ClientResponseEgressRegressionTest.cpp   # NAT egress Task 7
             tests/producer/ProducerRouteParkTest.cpp

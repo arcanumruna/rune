@@ -912,6 +912,23 @@ TEST(BrokerNodeTest, CP10_IoMaxBytesPerSecond_ReachesThrottler) {
     }
 }
 
+// NodeConfig::cleanerDedupeBufferBytes reaches the cleaner; -1 keeps the 128 MiB (Kafka) default.  Regression: the
+// budget was hardcoded, so test clusters rewrote a 128 MiB map on every cleaner pass and broker start (KeyIndex stress
+// seeds timed out under TSan).
+TEST(BrokerNodeTest, CleanerDedupeBufferBytes_ReachesCleaner) {
+    for (const int64_t configured : {int64_t{-1}, int64_t{1} << 20}) {
+        TempDir tmp{"cleaner_dedupe_"};
+        fs::create_directories(tmp.path);
+        NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+        cfg.cleanerDedupeBufferBytes = configured;
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(10s));
+        EXPECT_EQ(node.cleanerDedupeBufferBytesForTest(), configured < 0 ? 128LL * 1024 * 1024 : configured);
+        node.stop();
+    }
+}
+
 // ===========================================================================
 // Task M1 precondition #1: durability=all-in-sync wires end-to-end.
 //

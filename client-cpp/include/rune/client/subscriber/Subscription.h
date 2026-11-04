@@ -24,6 +24,7 @@
 #include <rune/client/detail/StatusRing.h>
 
 #include <rune/codec/FilterWire.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <concepts>
 #include <cstring>
@@ -113,13 +114,25 @@ struct SubscribeOptions {
 // IMPORTANT: key and value spans are views into the Aeron fragment buffer.
 // They are valid ONLY during the RecordHandler callback.  Copy any data you
 // need to retain beyond the callback.
+//
+// op() classifies the write: an empty value is a Delete, otherwise the intent bits of `attributes` pick Insert (1),
+// Update (2) or Upsert (0 or 3).  On a raw topic the bits are whatever the producer sent.
 // ---------------------------------------------------------------------------
+enum class RecordOp : uint8_t { Upsert, Insert, Update, Delete };
+
 struct Record {
     int64_t                  offset;    // absolute offset in the partition log
     int64_t                  timestamp; // producer timestamp, epoch MILLISECONDS (wire contract, Kafka parity)
     std::span<const uint8_t> key;       // zero-copy — valid only in-callback
     std::span<const uint8_t> value;     // zero-copy — valid only in-callback
     int32_t                  partition = 0;  // the partition the record was read from (the bound one)
+    uint8_t                  attributes = 0; // the record's attributes byte; bits 0-1 are the write intent
+
+    [[nodiscard]] RecordOp op() const noexcept {
+        if (value.empty()) return RecordOp::Delete;
+        const uint8_t intent = rune::protocol::record::intentOf(attributes);
+        return intent == 1 ? RecordOp::Insert : intent == 2 ? RecordOp::Update : RecordOp::Upsert;
+    }
 };
 
 // ---------------------------------------------------------------------------

@@ -41,9 +41,9 @@ RUN case "${TARGETARCH}" in arm64) CMAKE_ARCH=aarch64 ;; *) CMAKE_ARCH=x86_64 ;;
 
 WORKDIR /build
 RUN conan profile detect --force
-# aeron/1.51.0-rune.1: 1.51.0 + the upstream unavailable-image refcount fix (recipe in conan/aeron).
+# aeron/1.51.0-rune.2: 1.51.0 + fork fixes (recipe in conan/aeron).
 COPY --from=aeron-recipe . /aeron-recipe
-RUN conan export /aeron-recipe --version=1.51.0-rune.1
+RUN conan export /aeron-recipe --version=1.51.0-rune.2
 
 # Conan install (cached independently of source edits).
 COPY conanfile.py conandata.yml VERSION.txt ./

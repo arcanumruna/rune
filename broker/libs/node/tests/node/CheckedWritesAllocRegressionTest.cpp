@@ -165,3 +165,85 @@ TEST(CheckedWritesAllocRegression, SteadyStateJudgingAndMarkersAllocateNothingRe
     EXPECT_GT(r.worker->subscriptionPositionForTest(filtered), 1000) << "the Filtered subscription was served";
     EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
 }
+
+// Part 05: judging intents against the key index allocates nothing in steady state - the prepare / evaluate / apply of
+// every intent, the 56 / 57 rejections and their View-ack verdicts, the markers, the projection's fold and the Raw delivery.
+// The warm-up grows the key index (4096 slots at start) and the projection past 10,000 ids; the measured batches reuse them.
+// Each window brackets the worker's passes of one batch (doWork + drainReturnView); the frame encode and offer, the ack and
+// egress polling are the rig's, between windows.
+TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingRegression) {
+    VerdictRig r;
+    r.createKeyIndex();
+    r.installProjection(0x40000602);
+    r.enableAcks();
+    r.worker->setVerdictIntervalNs(20'000'000);
+    r.passes(60);
+    const int64_t raw = r.subscribe(SubKind::Raw);
+    r.passes(60);
+
+    constexpr uint64_t kIds = 10'000;
+    constexpr int64_t kPid = 42;
+    uint64_t lcg = 0x9E3779B97F4A7C15ull;
+    const auto next = [&] { lcg = lcg * 6364136223846793005ull + 1442695040888963407ull; return lcg >> 33; };
+    const auto recordsOf = [&](int records, int round) {
+        std::vector<Rec> recs;
+        for (int i = 0; i < records; ++i) {
+            const uint64_t id = next() % kIds + 1, pick = next() % 10;
+            if (pick < 4) recs.push_back({id, round, 1, false, 1});        // insert
+            else if (pick < 6) recs.push_back({id, round, 1, false, 2});   // update
+            else if (pick < 8) recs.push_back({id, 0, 0, true, 2});        // removeExisting
+            else recs.push_back({id, round, 1, false, 0});                 // plain upsert
+        }
+        return recs;
+    };
+    constexpr int kWarmup = 2000;
+    const auto judged = [&] { const VerdictSourceStats& s = *r.stats(); return s.rejectionsKeyExists + s.rejectionsKeyNotFound + s.markersWritten; };
+    uint64_t judgedInWindows = 0;   // the 56s, 57s and markers of the measured span that a window saw
+    int32_t seq = 0;
+    const auto drive = [&](int round) -> uint64_t {
+        const int records = round % 2 == 0 ? 1 : 16;
+        (void)r.produceFrame(recordsOf(records, round), kAllView, kPid, seq);
+        seq += records;
+        const bool measured = round >= kWarmup;
+        const uint64_t judgedBefore = measured ? judged() : 0;
+        uint64_t allocs = 0;
+        {
+            rune::testing::AllocWindow w;
+            for (int i = 0; i < 3; ++i) {
+                r.now += 1'000'000;
+                r.worker->doWork(r.now);
+                r.worker->drainReturnView([](WorkerReturn&&) {});
+            }
+            allocs = w.count();
+        }
+        if (measured) judgedInWindows += judged() - judgedBefore;
+        r.passes(1);   // the ack and egress polling are the rig's
+        if (round % 50 == 0) (void)r.collect(raw);
+        return allocs;
+    };
+
+    for (int i = 0; i < kWarmup; ++i) (void)drive(i);
+    r.passes(100);
+    ASSERT_NE(r.stats(), nullptr);
+    EXPECT_GT(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 4096u) << "the warm-up grew the key index past its initial slots";
+    const VerdictSourceStats before = *r.stats();
+    const std::size_t acksBefore = r.ackOrder().size();
+    EXPECT_EQ(acksBefore, 2000u) << "every warm-up batch was acked";
+
+    uint64_t worst = 0, total = 0;
+    for (int i = kWarmup; i < kWarmup + 5000; ++i) {
+        const uint64_t a = drive(i);
+        total += a;
+        worst = std::max(worst, a);
+    }
+    EXPECT_EQ(judgedInWindows, judged() - (before.rejectionsKeyExists + before.rejectionsKeyNotFound + before.markersWritten))
+        << "every rejection and marker of the measured batches happened inside a window";
+    r.passes(100);
+    const VerdictSourceStats& after = *r.stats();
+    EXPECT_GT(after.rejectionsKeyExists - before.rejectionsKeyExists, 1000u);
+    EXPECT_GT(after.rejectionsKeyNotFound - before.rejectionsKeyNotFound, 1000u);
+    EXPECT_GT(after.markersWritten - before.markersWritten, 100u) << "markers were emitted in the window";
+    EXPECT_EQ(r.ackOrder().size() - acksBefore, 5000u) << "every batch was acked";
+    EXPECT_GT(r.worker->subscriptionPositionForTest(raw), 10'000) << "the Raw subscription was served";
+    EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
+}

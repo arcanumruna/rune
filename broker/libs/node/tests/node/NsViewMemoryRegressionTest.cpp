@@ -427,3 +427,32 @@ TEST(NsViewMemoryRegression, ReusedSlotStartsFromZeroRegression) {
     EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), 0u);
     EXPECT_GE(rig.vs.nsSlotMismatchesForTest(), before);
 }
+
+// Boot slots are applied to a worker before its view set is attached: attaching must replay them, so a view in a
+// non-default namespace is charged after a restart.
+// Mutation: drop the replay loop in Worker::setViewSet -> this test fails.
+TEST(NsViewMemoryRegression, SetViewSetReplaysBootSlotsRegression) {
+    const rune::codec::Descriptor src = charSource();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rv::compileView(hpPlan(kSrcA), srcs, kViewA).value();
+    ViewSnapshotChannel channel;
+    WorkerViewSet vs{channel, tmpDir("rune-ns-viewmem-replay")};
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    rune::protocol::NamespaceLimits l;
+    l.maxViewMemoryBytes = 1 << 20;
+    Worker w(/*workerId=*/0);
+    w.configureNsSlots(8);
+    w.applyNsSlotAssignDirect(3, 7, l);
+    w.setViewSet(&vs);
+
+    EXPECT_EQ(vs.nsSlotCapacity(), 8u);
+    EXPECT_EQ(vs.nsSlotsForTest().nsIdAt(3), 7u);
+    EXPECT_EQ(vs.nsSlotsForTest().limits(3), l);
+
+    SimLog log;
+    log.append(1, 4);
+    auto rd = [&](int64_t f, int64_t t) { return log.read(f, t); };
+    vs.driveFolds(kSrcA, 0, rd, log.end, rv::kNoSkip, 0, nullptr, 0, true, NsTag{3, 7});
+    EXPECT_GT(vs.nsViewMemBytes(3), 0u);
+}

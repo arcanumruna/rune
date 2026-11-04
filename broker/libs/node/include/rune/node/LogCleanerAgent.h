@@ -286,6 +286,7 @@ public:
     [[nodiscard]] int64_t throttleRateForTest() const noexcept {
         return throttler_.maxBytesPerSec();
     }
+    [[nodiscard]] int64_t dedupeBufferBytesForTest() const noexcept { return dedupeBufferBytes_; }
 
     // -----------------------------------------------------------------------
     // Agent::doWork — one cleaner cycle.

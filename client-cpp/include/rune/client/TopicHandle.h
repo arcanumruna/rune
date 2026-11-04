@@ -31,9 +31,13 @@ struct TopicSpec {
 // TopicHandle — returned by Client::topic(name).
 // Cheap value type: two ints.
 // ---------------------------------------------------------------------------
+/// What a TopicHandle was opened as: an untyped topic (rawTopicAndWait) or a typed one.  A hand-built handle is Unknown.
+enum class TopicKind : uint8_t { Unknown = 0, Raw = 1, Typed = 2 };
+
 struct TopicHandle {
-    int32_t topicId        = -1;
-    int32_t partitionCount =  1;
+    int32_t   topicId        = -1;
+    int32_t   partitionCount =  1;
+    TopicKind kind           = TopicKind::Unknown;
 
     [[nodiscard]] bool valid() const noexcept { return topicId >= 0; }
 

@@ -643,7 +643,8 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
             reader.forEachRecord([&](std::string_view keyView,
                                      std::string_view valView,
                                      int64_t          absOffset,
-                                     int64_t          timestamp)
+                                     int64_t          timestamp,
+                                     uint8_t          attributes)
             {
                 // The handler may have unsubscribed this subscription (directly, on
                 // this thread): deliver nothing more of the batch.
@@ -654,6 +655,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
                 rec.partition = partitionOfRecords;
                 rec.offset    = absOffset;
                 rec.timestamp = timestamp;
+                rec.attributes = attributes;
                 rec.key   = std::span<const uint8_t>(
                     reinterpret_cast<const uint8_t*>(keyView.data()), keyView.size());
                 rec.value = std::span<const uint8_t>(

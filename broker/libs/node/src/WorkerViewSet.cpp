@@ -396,13 +396,12 @@ int WorkerViewSet::reconcileTransient_(ViewInstance& inst, const TransientBounds
         inst.foldCursor = tb.logStart;
         return 1;
     }
-    if (std::holds_alternative<CursorRecoveredUnreconciled>(inst.transientCursor)) {   // older incarnation
-        spdlog::warn("WorkerViewSet: view {} partition {}: recovered checkpoint cursor {} refers to "
-                     "an earlier incarnation of its transient source (now [{}, {})) -- invariant "
-                     "breach (a view over a transient source must be transient); keeping the rows, "
-                     "re-folding from offset {}",
-                     viewTopicId, inst.partition, inst.foldCursor, tb.logStart, tb.logEnd,
-                     tb.logStart);
+    if (std::holds_alternative<CursorRecoveredUnreconciled>(inst.transientCursor)) {   // older life of the source
+        ++inst.counters.transientSourceResets;
+        spdlog::info("WorkerViewSet: view {} partition {}: recovered checkpoint cursor {} is from an earlier life of its "
+                     "transient source (now [{}, {})); keeping the checkpoint rows, re-folding from offset {} (resets={})",
+                     viewTopicId, inst.partition, inst.foldCursor, tb.logStart, tb.logEnd, tb.logStart,
+                     inst.counters.transientSourceResets);
         inst.transientCursor = CursorLive{tb.incarnation, tb.logGeneration};
         inst.foldCursor      = tb.logStart;
         return 1;
@@ -447,11 +446,12 @@ int WorkerViewSet::reconcileTransient_(ViewInstance& inst, const TransientBounds
             moved = 1;
         }
     }
-    if (inst.foldCursor > tb.logEnd) {                                          // INVARIANT BREACH
-        spdlog::warn("WorkerViewSet: view {} partition {}: cursor {} is above its transient "
-                     "source end {} -- invariant breach (a view over a transient source must "
-                     "be transient); keeping the rows, re-folding from offset {}",
-                     viewTopicId, inst.partition, inst.foldCursor, tb.logEnd, tb.logStart);
+    if (inst.foldCursor > tb.logEnd) {                                          // SOURCE RESTARTED
+        ++inst.counters.transientSourceResets;
+        spdlog::info("WorkerViewSet: view {} partition {}: cursor {} is above its transient source end {} (the source "
+                     "restarted under it); keeping the rows, re-folding from offset {} (resets={})",
+                     viewTopicId, inst.partition, inst.foldCursor, tb.logEnd, tb.logStart,
+                     inst.counters.transientSourceResets);
         inst.foldCursor = tb.logStart;
         return 1;
     }
@@ -833,6 +833,60 @@ void WorkerViewSet::installTestVerdictViewForTest(rune::view::CompiledViewPlan p
     tpl.testRule = rule;
 }
 
+void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
+    const auto ofTopic = [&](const auto& kv) { return static_cast<int32_t>(kv.first >> 32) == srcTopicId; };
+    std::erase_if(verdictSources_, [&](const auto& kv) {
+        if (!ofTopic(kv)) return false;
+        if (PartitionWriteState* s = kv.second->boundState()) s->verdicts = nullptr;   // the state may outlive its judge
+        return true;
+    });
+    for (auto it = keyIndexes_.begin(); it != keyIndexes_.end();) {
+        if (!ofTopic(*it)) { ++it; continue; }
+        releaseMem_(it->second);
+        it = keyIndexes_.erase(it);
+    }
+}
+
+// Cold.  The key index is built over the source's evolving schema, as every view is: the judge decodes each writer version through it.
+// nullptr until the schema has landed on this worker, or when the key cannot be indexed (the wire key is packed into 8 bytes).
+static const rune::codec::Descriptor* keyIndexSource(const TopicWriteSpec& spec) {
+    if (!spec.evolving || spec.keyWidth == 0 || spec.keyWidth > 8) return nullptr;
+    const bool hasKey = std::any_of(spec.evolving->fields.begin(), spec.evolving->fields.end(), [&](const auto& f) { return f.id == spec.keyFieldId; });
+    return hasKey ? &*spec.evolving : nullptr;
+}
+
+// A key index no leadership has activated yet: its first activation keeps it (it holds nothing), a later one rebuilds it.
+static constexpr uint64_t kNeverActivated = UINT64_MAX;
+// A key index adopted under an active leadership: it folds that leadership's writes, so the next activation rebuilds it.
+static constexpr uint64_t kAdoptedLive = UINT64_MAX - 1;
+
+static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src) {
+    ViewInstance inst(keyIndexPlan(srcTopicId, spec.keyFieldId), keyIndexRowLayout(), src, /*persist=*/false,
+                      partition, /*indexSlots=*/4096, kKeyIndexChunkBytes);
+    inst.maxRecordsPerPass = kKeyIndexReplayRecordsPerPass;
+    inst.foldLeadership = kNeverActivated;
+    return inst;
+}
+
+// A new leadership starts from the local log: an instance carried over could hold what a follower-time compaction removed.
+void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen) {
+    const auto it = keyIndexes_.find(instKey(srcTopicId, partition));
+    if (it == keyIndexes_.end() || it->second.foldLeadership == leaderGen) return;   // already fresh for this leadership (the judge may be held)
+    if (it->second.foldLeadership != kNeverActivated) {
+        const rune::codec::Descriptor* src = keyIndexSource(spec);
+        if (src == nullptr) {   // the spec can no longer be indexed: nothing stale stays behind
+            judge.removeVerdictView(it->second.plan.viewTopicId);
+            eraseKeyIndex_(it->first);
+            return;
+        }
+        releaseMem_(it->second);
+        it->second = freshKeyIndex(srcTopicId, partition, spec, *src);
+        ++judge.statsMut().keyIndexRebuilds;
+    }
+    it->second.foldCursor = judge.logStart();
+    it->second.foldLeadership = leaderGen;
+}
+
 VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write) {
     const auto sit = subscriptionIndex_.find(srcTopicId);
     bool anyTemplate = false;
@@ -840,23 +894,32 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
         for (const int32_t id : sit->second) anyTemplate = anyTemplate || isVerdictTemplate_(id);
     const uint64_t key = instKey(srcTopicId, partition);
     auto vit = verdictSources_.find(key);
-    if (!anyTemplate && write.constraintSets.latest().empty()) {
+    if (!anyTemplate && !write.spec->keyIndex && write.constraintSets.latest().empty()) {
         if (vit == verdictSources_.end()) return nullptr;
         // The set was dropped: the judge stays until it has passed the drop and holds no member.
         if (vit->second->hasMembers() || vit->second->judgedThrough() <= write.constraintSets.lastChangeOffset()) return vit->second.get();
         write.verdicts = nullptr;
         verdictSources_.erase(vit);
+        eraseKeyIndex_(key);
         return nullptr;
     }
     if (vit == verdictSources_.end()) {
         auto v = std::make_unique<VerdictSource>(srcTopicId, partition);
         v->setViewHooks(VerdictViewHooks{this, &checkpointHook_, &discardHook_, &retiredHook_});
         v->setVerdictIntervalNs(verdictIntervalNs_);
+        v->holdJudgeForTest(holdJudges_);
         vit = verdictSources_.emplace(key, std::move(v)).first;
     }
     VerdictSource* judge = vit->second.get();
     judge->bindState(&write);
     write.verdicts = judge;
+    if (write.spec->keyIndex && !judge->hasMember(0, kKeyIndexPlanFingerprint)) {
+        if (const rune::codec::Descriptor* src = keyIndexSource(*write.spec)) {
+            ViewInstance& inst = keyIndexes_.try_emplace(key, freshKeyIndex(srcTopicId, partition, *write.spec, *src)).first->second;
+            if (judge->activated()) inst.foldLeadership = kAdoptedLive;
+            judge->addVerdictView(&inst, rune::view::VerdictViewKind::KeyIndex, 0, kKeyIndexPlanFingerprint);
+        }
+    }
     if (sit == subscriptionIndex_.end()) return judge;
     for (const int32_t id : sit->second) {
         const ViewTemplate& tpl = templates_.at(id);
@@ -907,6 +970,8 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
             if (!present) want.push_back(ConstraintSetMember{tpl.verdictObjectId, tpl.verdictKind, tpl.verdictFingerprint});
         }
     }
+    if (write.spec->keyIndex && std::none_of(want.begin(), want.end(), [](const ConstraintSetMember& m) { return m.kind == rune::view::VerdictViewKind::KeyIndex; }))
+        want.push_back(ConstraintSetMember{0, rune::view::VerdictViewKind::KeyIndex, kKeyIndexPlanFingerprint});
     std::sort(want.begin(), want.end(), [](const ConstraintSetMember& a, const ConstraintSetMember& b) { return a.viewObjectId < b.viewObjectId; });
     ConstraintSet desired;
     desired.count = static_cast<uint8_t>(std::min(want.size(), desired.members.size()));
@@ -937,6 +1002,10 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
 }
 
 int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {
+    if (const auto kit = keyIndexes_.find(instKey(srcTopicId, partition)); kit != keyIndexes_.end()) {
+        adoptNs_(kit->second, ns);
+        chargeMem_(kit->second);
+    }
     const auto sit = subscriptionIndex_.find(srcTopicId);
     if (sit == subscriptionIndex_.end()) return 0;
     for (const int32_t id : sit->second) {

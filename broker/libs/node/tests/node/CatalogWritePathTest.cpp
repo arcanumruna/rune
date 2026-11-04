@@ -512,7 +512,7 @@ TEST(CatalogWritePathRegression, EncodeErrorMapsLeaderBugsToInternalAndInputToIn
         SCOPED_TRACE(std::string(rc::encodeErrorName(e)));
         EXPECT_EQ(rune::node::encodeErrorAnswer(e).code, 6);
     }
-    for (E e : {E::FieldTooLong, E::TooManyElements, E::ReservedKind, E::BadEnum}) {
+    for (E e : {E::FieldTooLong, E::TooManyElements, E::ReservedKind, E::BadEnum, E::NeedsFormatV3}) {
         SCOPED_TRACE(std::string(rc::encodeErrorName(e)));
         const auto r = rune::node::encodeErrorAnswer(e);
         EXPECT_EQ(r.code, 39);

@@ -11,7 +11,7 @@ Each event is one record. Its layout is fixed per `formatVer`.
 
 | Field | Meaning |
 |---|---|
-| `formatVer` | The event-format version. It selects the frozen apply rules. Only 1 exists. |
+| `formatVer` | The event-format version. It selects the apply rules: 1 (the original layout), 2 (namespaces: a `u32 nsId` after `kind`) or 3 (key features, below). |
 | `kind` | What changed (the table below). |
 | `objectId` | The object's permanent id. Assigned at creation, never reused. |
 | `objectName` | The object's name at the time of the event. |
@@ -37,7 +37,9 @@ Kinds:
 | `AlterView` | 8 | `alterView` (a fresh output topic under the same object id) |
 | `DropView` | 9 | `drop view` |
 
-Kinds 32 to 63 are reserved for later features; `formatVer` 1 refuses them.
+Kinds 32 to 36 are the namespace kinds of `formatVer` 2 and 3 (`NamespaceCreated` 32, `NamespaceLimitsSet` 33,
+`NamespaceStateChanged` 34, `NamespaceDeleted` 35, `NamespaceDeleteStep` 36). Kinds 37 to 63 are reserved for later
+features; `formatVer` 1 refuses all of 32 to 63.
 
 A drop is an event. A dropped name can be created again, and the new object gets a new `objectId`,
 so history never mixes the two.
@@ -46,6 +48,25 @@ so history never mixes the two.
 raw log and shows as `kind raw` in `rune catalog show`. `SchemaDef::validate` is still recorded and fingerprinted as
 before, but it only decides whether a topic validates below metadata feature level 5 (`kCheckedWrites`); from that level
 every typed topic validates fully and the flag is ignored.
+
+**`formatVer` 3** is `formatVer` 2 byte for byte plus a trailing 14-byte key-features block in every schema definition
+(`CreateTopic` with a schema, `CreateSchema`): `[flags u8: bit 0 keyIndex, bit 1 autoIncrement][partitioner u8]
+[autoIncrementMax u64][autoIncrementReserve u32]`. Other flag bits and a partitioner above 1 are `BadEnum`. The leader
+writes `formatVer` 3 once the cluster feature level is 5 (`kCheckedWrites`) and `formatVer` 2 below it, for every DDL,
+namespace DDL included; it never writes 1. An encoder refuses a v1 or v2 event with non-default features
+(`NeedsFormatV3`). Under `formatVer` 3 the created topic's schema takes the event's features, and `keyIndex` needs a key
+field and a persisted topic, else `Precondition`. Features are set only at create or adoption: an `AlterSchema` of any
+format carries the prior features over. The fingerprint of a topic with default features is unchanged; non-default
+features are hashed after it, so every v1 and v2 digest replays as before.
+
+**`key.index` DDL.** The leader checks a definition with non-default key features in this order, each an
+`InvalidRequest` (39) with this detail:
+
+1. "key.index needs every broker at feature level 5"
+2. "key.index needs a typed topic", "key.index needs a key", "key.index needs a persisted topic"
+3. "key.index needs a key of at most 8 bytes" (until wide keys ship)
+4. "autoincrement is not supported by this broker yet" (`autoIncrement`, a partitioner other than `Fnv1a`, or a
+   non-default `autoIncrementMax` / `autoIncrementReserve`)
 
 **`formatVer` rules.** The apply rules of a `formatVer` are frozen and never edited. A rule change
 ships under a new `formatVer`, and old events keep replaying under their own rules. A reader that
@@ -125,7 +146,7 @@ Every DDL is answered. No request is silently dropped.
 | A leader change during the DDL, a new leader not yet caught up, or `__catalog` below its minimum ISR | `NotLeader` (2), retriable. The client retries for `ddlRetryBudget` (10 s by default), then fails with `NotLeader`. |
 | A name that is taken, or differs from a live name only in ASCII letter case | `TopicExists` (25) |
 | A bad name | `InvalidTopicName` (40) |
-| Invalid DDL: replication factor, a setting out of range, a view over a transient topic, ... | The specific code (for example `SchemaIncompatible` 30, `SchemaConflict` 31, `ViewExists` 32, `ViewSourceNotFound` 33, `ViewSourceTransient` 37, `ViewNotAlterable` 38, `ViewSourceIsView` 41), otherwise `InvalidRequest` (39) with a detail. |
+| Invalid DDL: replication factor, a setting out of range, ... | The specific code (for example `SchemaIncompatible` 30, `SchemaConflict` 31, `ViewExists` 32, `ViewSourceNotFound` 33, `ViewNotAlterable` 38, `ViewSourceIsView` 41), otherwise `InvalidRequest` (39) with a detail. |
 | An unknown topic or view | `UnknownTopic` (7) |
 | The broker's catalog apply halted | `Internal` (6) until an operator resolves it. |
 | A DDL from a client older than version 8 on a broker that is not the leader | `InvalidRequest` (39) in the request's own response type. See the release note. |

@@ -81,9 +81,9 @@ public:
     /// Kafka v2 record: length attrs tsDelta offsetDelta keyLen key valueLen value
     /// headerCount(0) — the exact bytes RecordBatchBuilder::append produces, but
     /// written once, without its reserve-and-memmove.
-    void append(std::string_view key, std::string_view value, int64_t timestamp) {
+    void append(std::string_view key, std::string_view value, int64_t timestamp, uint8_t attributes = 0) {
         const auto* v = reinterpret_cast<const uint8_t*>(value.data());
-        (void)writePrefix_(key, value.size(), timestamp);
+        (void)writePrefix_(key, value.size(), timestamp, attributes);
         frame_.insert(frame_.end(), v, v + value.size());
         frame_.push_back(0);  // headerCount = varint(0)
         noteRecord_(timestamp);
@@ -227,12 +227,12 @@ private:
     /// [length varint | attrs | tsDelta | offsetDelta | keyLen | key | valueLen]
     /// — the exact bytes RecordBatchBuilder::append produces before the value;
     /// returns the frame offset where the value goes.
-    std::size_t writePrefix_(std::string_view key, std::size_t valueLen, int64_t timestamp) {
+    std::size_t writePrefix_(std::string_view key, std::size_t valueLen, int64_t timestamp, uint8_t attributes = 0) {
         using ::rune::protocol::writeVarint;
         using ::rune::protocol::writeVarlong;
         uint8_t pre[48];
         std::size_t n = 0;
-        pre[n++] = 0;  // attributes
+        pre[n++] = attributes;
         n += writeVarlong(timestamp - baseTimestamp_, pre + n);
         n += writeVarint(recordCount_, pre + n);
         n += writeVarint(static_cast<int32_t>(key.size()), pre + n);
