@@ -79,6 +79,12 @@ void TransactionCoordinator::adoptRecovered_(TransactionMetadata& m) noexcept
         m.pendingNewProducerId    = -1;
         m.pendingNewProducerEpoch = -1;
     }
+    // #837: a stored timeout outside the range InitProducerId admits (a damaged or hand-written record) is clamped:
+    // a negative one would abort the transaction at once, and wraps to a huge value in the namespace-cap compare.
+    if (m.state == TxnState::Ongoing) {
+        if (m.txnTimeoutMs < kMinTxnTimeoutMs) m.txnTimeoutMs = kMinTxnTimeoutMs;
+        else if (m.txnTimeoutMs > kMaxTxnTimeoutMs) m.txnTimeoutMs = kMaxTxnTimeoutMs;
+    }
 }
 
 // ---------------------------------------------------------------------------

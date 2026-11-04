@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,8 @@ using rune::coordination::scopedId;
 
 namespace {
 constexpr int64_t kSec = 1'000'000'000LL;
+constexpr int32_t kMinMs = 1;        // the coordinator's kMinTxnTimeoutMs
+constexpr int32_t kMaxMs = 900'000;  // ... and kMaxTxnTimeoutMs
 
 struct Opened { ProducerId pid; ProducerEpoch epoch; };
 Opened init(TransactionCoordinator& c, const std::string& id, int32_t timeoutMs = 0) {
@@ -113,4 +116,31 @@ TEST(LimitEnforcementTableRegression, HugeNamespaceTxnTimeNeverAbortsAtOnceRegre
         EXPECT_EQ(c.metadata(id)->state, TxnState::Ongoing);
         EXPECT_EQ(c.doWork(60 * kSec + 1), 1) << "the transaction's own timeout still applies";
     }
+}
+
+// #837 (F12): a restored transaction whose stored timeout is negative (or above the maximum) is clamped to the range
+// InitProducerId admits: it neither aborts at once nor wraps to a huge value in the namespace-cap compare.
+// RED by mutation: drop the clamp in TransactionCoordinator::adoptRecovered_.
+TEST(LimitEnforcementTableRegression, RestoredOutOfRangeTxnTimeoutIsClampedRegression) {
+    for (const int32_t stored : {-1, INT32_MIN, 0}) {
+        SCOPED_TRACE(stored);
+        TransactionCoordinator c;
+        std::map<std::string, TransactionMetadata> snapshot;
+        TransactionMetadata m;
+        m.txnId = "t"; m.producerId = 5; m.producerEpoch = 0; m.state = TxnState::Ongoing; m.txnTimeoutMs = stored;
+        snapshot.emplace("t", m);
+        (void)c.reload(snapshot, 1, 0);
+        ASSERT_NE(c.metadata("t"), nullptr);
+        EXPECT_EQ(c.metadata("t")->txnTimeoutMs, kMinMs);
+        EXPECT_EQ(c.doWork(1), 0) << "a clamped timeout does not abort the transaction at once";
+        EXPECT_EQ(c.metadata("t")->state, TxnState::Ongoing);
+        EXPECT_EQ(c.doWork(static_cast<int64_t>(kMinMs) * 1'000'000LL + 1), 1) << "the clamped timeout applies";
+    }
+    TransactionCoordinator c;
+    std::map<std::string, TransactionMetadata> snapshot;
+    TransactionMetadata m;
+    m.txnId = "t"; m.producerId = 5; m.producerEpoch = 0; m.state = TxnState::Ongoing; m.txnTimeoutMs = INT32_MAX;
+    snapshot.emplace("t", m);
+    (void)c.reload(snapshot, 1, 0);
+    EXPECT_EQ(c.metadata("t")->txnTimeoutMs, kMaxMs);
 }

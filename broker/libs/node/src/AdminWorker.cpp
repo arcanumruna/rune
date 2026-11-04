@@ -1747,7 +1747,7 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
     }
     switch (static_cast<pc::NamespaceDdlKind>(m.kind)) {
     case pc::NamespaceDdlKind::Create: {
-        if (pc::namespaceMaskHas(m.mask, 22) &&
+        if (pc::namespaceMaskHas(m.mask, rune::protocol::kNsLimitFieldMaxTxnTimeMs) &&
             m.limits.maxTxnTimeMs > static_cast<uint64_t>(NodeConfig::kMaxDurationMs))
             return Rejected(reject(kInvalidRequest, "max-txn-time-ms must be at most " +
                                                         std::to_string(NodeConfig::kMaxDurationMs) +
@@ -1787,7 +1787,7 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
         return e;
     }
     case pc::NamespaceDdlKind::SetLimits: {
-        if (pc::namespaceMaskHas(m.mask, 22) &&
+        if (pc::namespaceMaskHas(m.mask, rune::protocol::kNsLimitFieldMaxTxnTimeMs) &&
             m.limits.maxTxnTimeMs > static_cast<uint64_t>(NodeConfig::kMaxDurationMs))
             return Rejected(reject(kInvalidRequest, "max-txn-time-ms must be at most " +
                                                         std::to_string(NodeConfig::kMaxDurationMs) +

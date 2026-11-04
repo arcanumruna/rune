@@ -3549,4 +3549,26 @@ TEST(NodeConfigRegression, MicrosecondParkAndFetchKnobsAreBoundedRegression) {
     }
 }
 
+// #837 (F12): strtoll skips leading whitespace and accepts a sign; these knobs take a plain decimal number.
+// RED by mutation: drop the isDigitFirst check from one of the sites in NodeConfig.cpp.
+TEST(NodeConfigRegression, LeadingWhitespaceOrSignIsRefusedByTheStrictMsKnobsRegression) {
+    const char* const vars[] = {"RUNE_CONTROLLED_SHUTDOWN_MS", "RUNE_PRODUCER_ID_EXPIRATION_MS",
+                                "RUNE_SEGMENT_PROVISIONER_MAX_PARK_US", "RUNE_FETCH_INTERVAL_US"};
+    for (const char* var : vars) {
+        SCOPED_TRACE(var);
+        auto parseWith = [&](const std::string& v) {
+            auto env = base3node();
+            env[var] = v;
+            return parseNodeConfig(fakeEnv(env));
+        };
+        const auto ok = parseWith("5");
+        ASSERT_TRUE(ok.error.empty()) << ok.error;
+        for (const char* bad : {" 5", "\t5", "+5", "\n5"}) {
+            const auto r = parseWith(bad);
+            EXPECT_FALSE(r.error.empty()) << "'" << bad << "' was accepted";
+            EXPECT_NE(r.error.find(var), std::string::npos) << r.error;
+        }
+    }
+}
+
 } // namespace rune::node

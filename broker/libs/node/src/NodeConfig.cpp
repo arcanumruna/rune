@@ -53,6 +53,9 @@ static bool parseInt32(std::string_view sv, int32_t& out) {
 }
 
 /// Parse a positive int64_t from sv using from_chars. Returns false on failure.
+/// #837: strtoll skips leading whitespace and accepts a sign; the knobs that call it take a plain decimal number.
+static bool isDigitFirst(const char* s) noexcept { return s != nullptr && *s >= '0' && *s <= '9'; }
+
 static bool parseInt64Positive(std::string_view sv, int64_t& out) {
     sv = trim(sv);
     if (sv.empty()) return false;
@@ -913,7 +916,7 @@ ConfigResult parseNodeConfig(
             char* end = nullptr;
             errno = 0;
             const long long v = std::strtoll(raw, &end, 10);
-            if (end == raw || *end != '\0' || errno == ERANGE || v < 0 || v > NodeConfig::kMaxDurationMs)
+            if (end == raw || !isDigitFirst(raw) || *end != '\0' || errno == ERANGE || v < 0 || v > NodeConfig::kMaxDurationMs)
                 return {{}, std::string("RUNE_CONTROLLED_SHUTDOWN_MS must be an integer in [0, ") +
                                 std::to_string(NodeConfig::kMaxDurationMs) + "] ms (0 = no hand-off), got '" + raw + "'"};
             cfg.controlledShutdownMs = static_cast<int64_t>(v);
@@ -1208,7 +1211,7 @@ ConfigResult parseNodeConfig(
         char* end = nullptr;
         errno = 0;
         const long long v = std::strtoll(raw, &end, 10);
-        if (end == raw || *end != '\0' || errno == ERANGE || v < 0 || v > NodeConfig::kMaxDurationMs)
+        if (end == raw || !isDigitFirst(raw) || *end != '\0' || errno == ERANGE || v < 0 || v > NodeConfig::kMaxDurationMs)
             return {{}, std::string("RUNE_PRODUCER_ID_EXPIRATION_MS must be an integer in [0, ") +
                             std::to_string(NodeConfig::kMaxDurationMs) + "] ms, got '" + raw + "'"};
         cfg.producerIdExpirationMs = static_cast<int64_t>(v);
@@ -1239,7 +1242,7 @@ ConfigResult parseNodeConfig(
         char* end = nullptr;
         errno = 0;
         const long long v = std::strtoll(raw, &end, 10);
-        if (end == raw || *end != '\0' || errno == ERANGE || v < 1 || v > 1'000'000)
+        if (end == raw || !isDigitFirst(raw) || *end != '\0' || errno == ERANGE || v < 1 || v > 1'000'000)
             return {{}, std::string("RUNE_SEGMENT_PROVISIONER_MAX_PARK_US must be an integer in [1, 1000000] us, got '") +
                             raw + "'"};
         cfg.segmentProvisionerMaxParkUs = static_cast<int64_t>(v);
@@ -1537,7 +1540,7 @@ ConfigResult parseNodeConfig(
         char* end = nullptr;
         errno = 0;
         const long long v = std::strtoll(raw, &end, 10);
-        if (end == raw || *end != '\0' || errno == ERANGE || v < 1 || v > kMaxHeldIdleMsCap)
+        if (end == raw || !isDigitFirst(raw) || *end != '\0' || errno == ERANGE || v < 1 || v > kMaxHeldIdleMsCap)
             return {{}, std::string("RUNE_MAX_HELD_IDLE_MS must be an integer in [1, 86400000] (ms), got '") + raw + "'"};
         cfg.maxHeldIdleMs = v;
     }
@@ -1547,7 +1550,7 @@ ConfigResult parseNodeConfig(
         char* end = nullptr;
         errno = 0;
         const long long v = std::strtoll(raw, &end, 10);
-        if (end == raw || *end != '\0' || errno == ERANGE || v < 1 ||
+        if (end == raw || !isDigitFirst(raw) || *end != '\0' || errno == ERANGE || v < 1 ||
             v > static_cast<long long>(NodeConfig::kMaxGatewayProduceCredits))
             return {{}, std::string("RUNE_GATEWAY_PRODUCE_CREDITS must be an integer in [1, ") +
                             std::to_string(NodeConfig::kMaxGatewayProduceCredits) + "], got '" + raw + "'"};
@@ -1562,7 +1565,7 @@ ConfigResult parseNodeConfig(
             char* end = nullptr;
             errno = 0;
             const long long us = std::strtoll(fiv, &end, 10);
-            if (end == fiv || *end != '\0' || errno == ERANGE || us < 1 || us > NodeConfig::kMaxDurationMs * 1000LL)
+            if (end == fiv || !isDigitFirst(fiv) || *end != '\0' || errno == ERANGE || us < 1 || us > NodeConfig::kMaxDurationMs * 1000LL)
                 return {{}, std::string("RUNE_FETCH_INTERVAL_US must be an integer in [1, ") +
                                 std::to_string(NodeConfig::kMaxDurationMs * 1000LL) + "] us, got '" + fiv + "'"};
             cfg.fetchIntervalNs = us * 1000LL;
