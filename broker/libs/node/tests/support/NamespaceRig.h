@@ -285,12 +285,11 @@ public:
     /// Bounded wait until root's metadata lists topic `tid` and at least `minCount` topics.
     bool awaitRootListed(int32_t tid, std::size_t minCount) {
         World& w = *main_;
-        for (int i = 0; i < 400; ++i) {
+        // #648: the awaited event is the listing itself (the topics are placed), polled until it holds - no fixed pause.
+        return w.r.c().pollFor(std::chrono::seconds(10), [&] {
             const auto ids = w.r.metadataTopics(rootSession(w));
-            if (ids.size() >= minCount && std::find(ids.begin(), ids.end(), tid) != ids.end()) return true;
-            w.r.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
-        }
-        return false;
+            return ids.size() >= minCount && std::find(ids.begin(), ids.end(), tid) != ids.end();
+        });
     }
 
 private:
@@ -433,11 +432,11 @@ private:
         // The placements are committed before the first cell (a listing names them).
         for (const auto& [who, ns] : std::vector<std::pair<std::string, std::string>>{{"a/admin", "a"}, {"b/admin", "b"}}) {
             const int64_t sid = session(w, who);
-            for (int i = 0; i < 400; ++i) {
-                const auto ids = r.metadataTopics(sid);
-                if (std::find(ids.begin(), ids.end(), w.tid[ns]) != ids.end()) break;
-                r.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
-            }
+            const int32_t want = w.tid[ns];
+            need(r.c().pollFor(std::chrono::seconds(10), [&r, sid, want] {   // placed: the listing names the id
+                     const auto ids = r.metadataTopics(sid);
+                     return std::find(ids.begin(), ids.end(), want) != ids.end();
+                 }), "the placement of topic t in " + ns + " was never listed");
         }
     }
     void setupAnon() {
@@ -454,11 +453,10 @@ private:
         makeOnly(w);
         for (const char* ns : {"default", "b"}) makeSecurityTargets(w, ns);
         const int32_t t = w.tid["default"];
-        for (int i = 0; i < 400; ++i) {   // placed: the anonymous listing names it
-            const auto ids = w.r.metadataTopics(rootSession(w));
-            if (std::find(ids.begin(), ids.end(), t) != ids.end()) break;
-            w.r.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
-        }
+        need(w.r.c().pollFor(std::chrono::seconds(10), [&] {   // placed: the anonymous listing names it
+                 const auto ids = w.r.metadataTopics(rootSession(w));
+                 return std::find(ids.begin(), ids.end(), t) != ids.end();
+             }), "the placement of the anonymous world's topic t was never listed");
     }
     /// The session of `c`, logged in again by `login` when it is new or has been idle for more than 5 s (issue #647).
     template <class Login> static int64_t cachedSid(World::CachedSession& c, Login&& login) {
@@ -663,26 +661,25 @@ private:
             }
             case Op::DropTopic: ddl(w, a, c.sendDropTopic(ch, st, sid, n.topic)); break;
             case Op::Produce: {
-                for (int attempt = 0; attempt < 40; ++attempt) {
+                // NotLeader (the partition's leader is not serving yet) is retried until it is: the event, not a pause.
+                (void)c.pollFor(std::chrono::seconds(10), [&] {
                     const int64_t corr = c.nextCorrelationId();
-                    if (!c.produce(ch, st, sid, corr, n.tid, 0, 1, makeCharBatch(1))) break;
+                    if (!c.produce(ch, st, sid, corr, n.tid, 0, 1, makeCharBatch(1))) return true;
                     const auto ack = c.awaitProduceResponseUntil(corr, AuthRig::dl());
                     a.code = ack ? ack->errorCode : kNoAnswer;
                     frameOf(w, a, corr);
-                    if (a.code != static_cast<int>(pc::ErrorCode::NotLeader) && a.code != kNoAnswer) break;
-                    c.pollFor(std::chrono::milliseconds(25), [] { return false; });
-                }
+                    return a.code != static_cast<int>(pc::ErrorCode::NotLeader) && a.code != kNoAnswer;
+                });
                 break;
             }
             case Op::Fetch: {
-                for (int attempt = 0; attempt < 40; ++attempt) {
+                (void)c.pollFor(std::chrono::seconds(10), [&] {
                     const int64_t corr = c.sendSubscribe(ch, st, sid, n.tid, 0);
                     const auto code = c.awaitSubscribeCode(corr, AuthRig::dl());
                     a.code = code ? *code : kNoAnswer;
                     frameOf(w, a, corr);
-                    if (a.code != static_cast<int>(pc::ErrorCode::NotLeader) && a.code != kNoAnswer) break;
-                    c.pollFor(std::chrono::milliseconds(25), [] { return false; });
-                }
+                    return a.code != static_cast<int>(pc::ErrorCode::NotLeader) && a.code != kNoAnswer;
+                });
                 break;
             }
             case Op::Metadata: {

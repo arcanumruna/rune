@@ -264,3 +264,10 @@ cd broker && scripts/run-linux-regression-vm.sh 3 ../build     # stage c: jobs, 
   (`load1 < 1`) and has room (3 GiB free on `/`, 1 GiB in `/dev/shm`).
 - **Disk.** Clean up what you create: remove run directories, `docker image rm` your tags, and avoid `docker system prune`
   on a shared VM.
+
+## Long-run namespace stress
+
+`rune_namespace_stress_tests` runs 20 seeds of 300 steps by default. For a long run, set `RUNE_NS_STRESS_STEPS=2000`
+(hard cap 2000) in the environment, for example
+`RUNE_NS_STRESS_STEPS=2000 ctest -R NamespaceStressRegression.SeededModelRegression -j 6`. There is no scheduled
+workflow for it yet; run it by hand before a release checkpoint.

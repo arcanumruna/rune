@@ -11,7 +11,8 @@
 // (every 50 steps) and, in NamespaceLifecycleStressTrio, leader change on three real AdminWorkers.  A model map holds the
 // expected registry (name, state, limits), the per-namespace contents and the transactions.  After EVERY step:
 //   (5) the registry equals the model (names, states, maxTopics; a deleted id is absent or DELETING, never ACTIVE);
-//   (6) nothing of a deleted nsId resolves by name or by id (topics, views), and a re-created name holds none of it;
+//   (6) nothing of a deleted nsId resolves by name or by id (topics, views), no produce by id is acked after the Delete
+//       committed and the log end never moves past its value at the commit, and a re-created name holds none of it;
 //   (7) topic counts respect the limits (a lowered limit keeps what exists and refuses the next create);
 //   (8) a ReadOnly namespace refuses produce and offset commits with 51; offsets never move back;
 // and at every checkpoint (every 100 steps and at the end):
@@ -32,7 +33,10 @@
 #include <rune/client/Completions.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/subscriber/Subscription.h>
+#include <rune/node/AdminWorker.h>
 #include <rune/node/NamespacePaths.h>
+#include <rune/node/ViewRegistry.h>
+#include <rune/node/Worker.h>
 
 #include <algorithm>
 #include <chrono>
@@ -121,6 +125,8 @@ struct NsModel {
     std::map<std::string, int32_t> topics;   ///< local name -> topic id
     std::map<std::string, int32_t> views;    ///< local name -> view topic id
     std::set<std::string> viewedTopics;      ///< topics some view reads (not droppable)
+    std::map<std::string, std::string> viewSrc;   ///< view local name -> the topic local name it reads
+    std::map<std::string, std::multiset<std::string>> produced;   ///< topic local name -> the "pp..." records produced by id
     std::vector<std::string> users;          ///< full user names
     uint8_t state = 0;                       ///< NsStateTag: 0 Active, 1 SuspendedReadOnly, 2 SuspendedRejectAll
     uint64_t maxTopics = 0;                  ///< the stored maxTopics (0 = unlimited, the default record)
@@ -135,6 +141,8 @@ struct GoneNs {
     std::string name;
     std::vector<std::string> topicNames;     ///< qualified: <name>/<local>
     std::vector<int32_t> topicIds, viewIds;
+    std::map<int32_t, int64_t> leo0;         ///< #730: each topic's log end offset when the Delete committed
+    std::set<int32_t> txnTopicIds;           ///< topics a transaction touched: the platform abort appends markers, so their log end may grow
     std::vector<std::string> users;
     bool erasedSeen = false;
 };
@@ -156,6 +164,8 @@ struct Fingerprint {
     std::vector<std::string> namespaces;
     std::vector<int32_t> topics;
     uint64_t digest = 0;
+    uint64_t catalogDigest = 0;              ///< #646: the applied catalog state's digest (every definition, counter, drop)
+    std::vector<std::string> views;          ///< #646: the views the node serves ("<nsId>:<name>:<sink topic id>")
     bool operator==(const Fingerprint&) const = default;
 };
 
@@ -203,22 +213,23 @@ protected:
         return s.sid;
     }
     int64_t rootSid() { return fresh(root_, "admin", AuthBroker::kAdminPassword); }
+    int64_t rootSid2() { return fresh(root2_, "admin", AuthBroker::kAdminPassword); }   ///< #646: root's second session
     int64_t userSid(const std::string& user) { return fresh(sess_[user], user, AuthRig::kPw); }
-    void relogin(const std::string& user) {
-        if (user.empty()) root_.sid = 0; else sess_[user].sid = 0;
-    }
     void evictSessions(const std::vector<std::string>& users) {
         for (const std::string& u : users) sess_.erase(u);
     }
-    /// A login that may be refused: its AuthServerFinal code (0 = logged in).
-    int loginCode(const std::string& user) {
+    /// A login that may be refused: its AuthServerFinal code (0 = logged in), and the retry-after a throttled answer carries.
+    struct LoginAnswer { int code = kNoAnswer; uint32_t retryAfterMs = 0; };
+    LoginAnswer loginAnswer(const std::string& user) {
         AuthWireClient& w = r_.wire();
         const int64_t sid = w.connect(r_.ch(), pc::kClientVersionNamespaces);
-        if (sid <= 0) return kNoAnswer;
+        if (sid <= 0) return {};
         const auto l = w.login(r_.ch(), sid, user, {AuthRig::kPw, AuthRig::kPw});
-        if (l.ok()) { r_.broker().noteLoginOk(); return 0; }
-        return l.answered() ? static_cast<int>(l.errorCode()) : kNoAnswer;
+        if (l.ok()) { r_.broker().noteLoginOk(); return {0, 0}; }
+        if (!l.answered()) return {};
+        return {static_cast<int>(l.errorCode()), l.fin->retryAfterMs};
     }
+    int loginCode(const std::string& user) { return loginAnswer(user).code; }
 
     // ── root DDL ────────────────────────────────────────────────────────────────────────────────────────────
     /// One NamespaceDdl as root; the answer code, and (Create) the new nsId.
@@ -261,14 +272,12 @@ protected:
     }
     /// Root's Metadata listing until it holds every id of `want` and none of `gone` (bounded).
     bool awaitIds(const std::vector<int32_t>& want, const std::vector<int32_t>& gone = {}) {
-        for (int i = 0; i < 400; ++i) {
+        // #648: polled on the awaited event (the listing), not paused on a timer.
+        return r_.c().pollFor(std::chrono::seconds(10), [&] {
             const auto ids = r_.metadataTopics(rootSid());
             const auto has = [&](int32_t id) { return std::find(ids.begin(), ids.end(), id) != ids.end(); };
-            if (std::all_of(want.begin(), want.end(), has) &&
-                std::none_of(gone.begin(), gone.end(), has)) return true;
-            r_.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
-        }
-        return false;
+            return std::all_of(want.begin(), want.end(), has) && std::none_of(gone.begin(), gone.end(), has);
+        });
     }
 
     // ── probes ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -292,14 +301,12 @@ protected:
         a.code = !ans->isError && status >= 0 && status <= 2 ? 0 : status;
         return a;
     }
-    /// One probe as `user`, re-logging in once when the session was reaped.
+    /// One probe as `user`, sent once (#648): an answer that never comes fails the step.  The session is fresh (fresh()
+    /// logs in again after 2 s idle, inside the broker's reap window), so a missing answer is a finding, not a reason to resend.
     template <class F>
-    Answer withRetry(const std::string& user, F&& f) {
+    Answer probeAs(const std::string& user, F&& f) {
         Answer a = f(userSid(user));
-        if (a.code == kNoAnswer || a.code == 0xFFFF) {
-            relogin(user);
-            a = f(userSid(user));
-        }
+        if (a.code == kNoAnswer || a.code == 0xFFFF) ADD_FAILURE() << "no answer to a probe as " << user;
         return a;
     }
 
@@ -337,6 +344,15 @@ protected:
         f.topics = r_.metadataTopics(rootSid());
         std::sort(f.topics.begin(), f.topics.end());
         f.digest = r_.broker().node().securityViewForTest().digest;
+        BrokerNode& node = r_.broker().node();
+        node.onAdminThreadForTest([&] {   // the admin thread owns both: the catalog state and the view registry
+            f.catalogDigest = node.adminWorkerAgentForTest()->worker().applier().state().digest();
+            for (const ViewRecord* v : node.viewRegistryForTest()->all())
+                if (v->viewTopicId >= 0)
+                    f.views.push_back(std::to_string(v->nsId) + ":" + v->viewName + ":" + std::to_string(v->viewTopicId));
+            return 0;
+        });
+        std::sort(f.views.begin(), f.views.end());
         return f;
     }
     std::string show(const Fingerprint& f) {
@@ -344,7 +360,9 @@ protected:
         for (const auto& n : f.namespaces) s += n + " ";
         s += "] topics[";
         for (const int32_t t : f.topics) s += std::to_string(t) + " ";
-        return s + "] digest=" + std::to_string(f.digest);
+        s += "] digest=" + std::to_string(f.digest) + " catalog=" + std::to_string(f.catalogDigest) + " views[";
+        for (const auto& v : f.views) s += v + " ";
+        return s + "]";
     }
 
     // ── steps: the Phase 1 mix (Active namespaces only: a suspended namespace's DDL is not modelled) ─────────
@@ -397,6 +415,7 @@ protected:
         n->topics.erase(l);
         n->acked.erase(l);
         n->committed.erase(l);
+        n->produced.erase(l);
         ASSERT_TRUE(awaitIds({}, {id})) << "dropped topic id " << id << " still listed";
     }
     void stepCreateView(int step) {
@@ -410,12 +429,167 @@ protected:
         const int32_t id = r_.createView(rootSid(), full(*n, local), n->topics[l]);
         ASSERT_GE(id, 0) << "create view " << full(*n, local) << " on " << l;
         n->views[local] = id;
+        n->viewSrc[local] = l;
         n->viewedTopics.insert(l);
     }
     void stepCreateUser(int step) {
         NsModel* n = pickActive();
         if (n == nullptr) return stepProbe(step);
         addUser(*n, std::to_string(step), "create user");
+    }
+
+    // ── steps: #646 (drop view, drop user, grant, produce / fetch by id, two DDLs back to back) ──────────────────────
+    void stepDropView(int step) {
+        std::vector<std::pair<NsModel*, std::string>> c;
+        for (NsModel& n : ns_)
+            if (n.state == 0) for (const auto& [l, id] : n.views) c.emplace_back(&n, l);
+        if (c.empty()) return stepProbe(step);
+        return dropViewOf(*c[rnd(static_cast<uint32_t>(c.size()))].first, step);
+    }
+    void dropViewOf(NsModel& n, int step) {
+        auto it = std::next(n.views.begin(), rnd(static_cast<uint32_t>(n.views.size())));
+        const std::string local = it->first;
+        const int32_t id = it->second;
+        trace_ += " drop-view:" + full(n, local);
+        ASSERT_EQ(r_.dropViewCode(rootSid(), full(n, local)), 0) << "drop view " << full(n, local) << " (step " << step << ")";
+        const std::string src = n.viewSrc[local];
+        n.views.erase(local);
+        n.viewSrc.erase(local);
+        const bool stillRead = std::any_of(n.viewSrc.begin(), n.viewSrc.end(), [&](const auto& kv) { return kv.second == src; });
+        if (!stillRead) n.viewedTopics.erase(src);
+        ASSERT_TRUE(r_.c().pollFor(std::chrono::seconds(10), [&] { return viewRowOf(rootSid(), id).code != 0; }))
+            << "the dropped view " << full(n, local) << " (id " << id << ") is still readable";
+    }
+    void stepDropUser(int step) {
+        NsModel* n = pickNs([](const NsModel& x) { return x.state == 0 && x.users.size() > 1; });   // users[0] is the txn / produce user
+        if (n == nullptr) return stepProbe(step);
+        const std::size_t at = 1 + rnd(static_cast<uint32_t>(n->users.size() - 1));
+        const std::string user = n->users[at];
+        trace_ += " drop-user:" + user;
+        ASSERT_EQ(r_.wire().dropUser(r_.ch(), rootSid(), user).errorCode, 0) << "drop user " << user;
+        n->users.erase(n->users.begin() + static_cast<std::ptrdiff_t>(at));
+        sess_.erase(user);
+        // AuthUnavailable (48): the broker's __security view is behind the committed event - served again once applied.
+        int code = kNoAnswer;
+        (void)r_.c().pollFor(std::chrono::seconds(10), [&] {
+            code = loginCode(user);
+            return code != static_cast<int>(pc::ErrorCode::AuthUnavailable);
+        });
+        ASSERT_EQ(code, kAuthFailed) << "a dropped user must be refused AuthenticationFailed: " << user;
+    }
+    void stepGrant(int step) {
+        NsModel* n = pickActive();
+        if (n == nullptr || n->users.empty()) return stepProbe(step);
+        const std::string user = n->users[rnd(static_cast<uint32_t>(n->users.size()))];
+        const std::string pattern = "z" + std::to_string(step);
+        trace_ += " grant:" + user + "->" + pattern;
+        const int64_t sid = rootSid();
+        ASSERT_EQ(r_.wire().grant(r_.ch(), sid, user, false, grants::SO::Read, grants::ST::Topic, grants::SP::Prefix, pattern).errorCode, 0) << "grant to " << user;
+        ASSERT_EQ(r_.wire().grant(r_.ch(), sid, user, false, grants::SO::Read, grants::ST::Topic, grants::SP::Prefix, pattern).errorCode,
+                  static_cast<int>(pc::ErrorCode::InvalidRequest)) << "the same grant twice must answer InvalidRequest (AlreadyGranted): " << user;
+    }
+    /// Produce two records to a topic BY ID with unique keys, then fetch the topic by id from the start: the fetched "pp"
+    /// records are exactly the produced ones (no loss, no duplicate).  Topics a transaction touched are skipped (the
+    /// last stable offset may sit before the plain records).
+    void stepProduceFetch(int step) {
+        std::vector<std::pair<NsModel*, std::string>> c;
+        for (NsModel& n : ns_)
+            if (n.state == 0) for (const auto& [l, id] : n.topics) if (!txnTopic(n.nsId, l)) c.emplace_back(&n, l);
+        if (c.empty()) return stepProbe(step);
+        const auto pick = c[rnd(static_cast<uint32_t>(c.size()))];
+        NsModel& n = *pick.first;
+        const std::string local = pick.second;
+        const int32_t tid = n.topics.at(local);
+        trace_ += " produce-fetch:" + full(n, local);
+        const rc::TopicHandle th{tid, 1};
+        rc::Client& root = rootClient();
+        {
+            rc::ProducerConfig pcfg;
+            pcfg.acks = rc::Acks::All;
+            rc::Producer plain = root.producer(pcfg);
+            for (int i = 0; i < 2; ++i) {
+                const int64_t key = ++pkeys_;
+                const std::string raw = "pp" + std::to_string(seed_) + "_" + std::to_string(step) + "_" + std::to_string(i);
+                const std::string value = charValue(raw, key);
+                plain.send(th, rc::Key(key), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size()));
+                n.produced[local].insert(raw);
+                n.acked[local].push_back(raw);   // the log holds it: checkpoint()'s produced == logged counts it
+            }
+            ASSERT_EQ(plain.closeAndWait(std::chrono::seconds(30)), rc::OpStatus::Ok) << "produce by id on " << full(n, local);
+        }
+        std::mutex mu;
+        std::multiset<std::string> fetched;
+        rc::SubscribeOptions o;
+        o.from = rc::From::earliest();
+        rc::Subscription sub = root.subscribe(th, 0, o, [&](const rc::Record& r) {
+            const std::string v(reinterpret_cast<const char*>(r.value.data()), r.value.size());
+            if (v.size() > kCharValuePrefix && v.compare(kCharValuePrefix, 2, "pp") == 0) {
+                std::lock_guard<std::mutex> lk(mu);
+                fetched.insert(v.substr(kCharValuePrefix));
+            }
+        });
+        const std::multiset<std::string>& want = n.produced[local];
+        const bool seen = r_.c().pollFor(std::chrono::seconds(30), [&] {
+            std::lock_guard<std::mutex> lk(mu);
+            return fetched.size() >= want.size();
+        });
+        sub.unsubscribe();
+        std::lock_guard<std::mutex> lk(mu);
+        ASSERT_TRUE(seen) << "fetch by id of " << full(n, local) << " saw " << fetched.size() << " of " << want.size() << " produced records";
+        ASSERT_TRUE(fetched == want) << "fetch by id of " << full(n, local) << " differs from what was produced (" << fetched.size()
+                                     << " fetched, " << want.size() << " produced): a record is lost or duplicated";
+    }
+    /// Two DDLs sent back to back before either answer, on two root sessions.  Either serial order is accepted; the end
+    /// state must equal exactly one of them.
+    void stepConcurrent(int step) {
+        NsModel* np = pickNs([](const NsModel& x) { return x.state == 0 && !x.lowered; });
+        if (np == nullptr) return stepProbe(step);
+        NsModel& n = *np;
+        const int64_t s1 = rootSid(), s2 = rootSid2();
+        constexpr int32_t st = AuthRig::stream();
+        auto& cl = r_.c();
+        std::vector<std::string> sources;
+        for (const auto& [l, id] : n.topics) if (!txnTopic(n.nsId, l) && !n.viewedTopics.count(l)) sources.push_back(l);
+        if (rnd(2) == 0 || sources.empty()) {
+            const std::string local = "c" + std::to_string(step);
+            trace_ += " concurrent-create:" + full(n, local);
+            const auto send = [&](int64_t sid) {
+                return cl.sendDefineTopic(r_.ch(), st, sid, full(n, local), 1, authRigCharBlob(), 0, {}, 0, authRigTopicConfig());
+            };
+            const int64_t c1 = send(s1), c2 = send(s2);
+            const auto a1 = cl.awaitDefine(c1, AuthRig::dl(20)), a2 = cl.awaitDefine(c2, AuthRig::dl(20));
+            ASSERT_TRUE(a1 && a2) << "a back-to-back DefineTopic got no answer";
+            const int e1 = a1->errorCode, e2 = a2->errorCode, exists = static_cast<int>(pc::ErrorCode::TopicExists);
+            ASSERT_TRUE((e1 == 0 && e2 == exists) || (e1 == exists && e2 == 0)) << "same-name create twice: codes " << e1 << ", " << e2;
+            const int32_t id = e1 == 0 ? a1->topicId : a2->topicId;
+            n.topics[local] = id;
+            ASSERT_TRUE(awaitIds({id})) << "topic " << full(n, local) << " (id " << id << ") never listed for root";
+            return;
+        }
+        // create a view on a topic  ||  drop that topic: exactly one serial order wins
+        const std::string src = sources[rnd(static_cast<uint32_t>(sources.size()))];
+        const int32_t srcId = n.topics.at(src);
+        const std::string vlocal = "v" + std::to_string(step);
+        trace_ += " concurrent-view-vs-drop:" + full(n, src);
+        const int64_t cv = cl.sendCreateView(r_.ch(), st, s1, full(n, vlocal), "id", 0, authRigViewPlan(vlocal, {srcId}));
+        const int64_t cd = cl.sendDropTopic(r_.ch(), st, s2, full(n, src));
+        const auto av = cl.awaitCreateView(cv, AuthRig::dl(20));
+        const int dropCode = r_.ddlCode(cd);
+        ASSERT_TRUE(av.has_value()) << "a back-to-back CreateView got no answer";
+        const bool viewMade = av->errorCode == 0, dropped = dropCode == 0;
+        ASSERT_NE(viewMade, dropped) << "create view / drop its source: exactly one serial order must win (view " << av->errorCode
+                                     << ", drop " << dropCode << ")";
+        if (viewMade) {
+            n.views[vlocal] = av->viewTopicId;
+            n.viewSrc[vlocal] = src;
+            n.viewedTopics.insert(src);
+        } else {
+            n.topics.erase(src);
+            n.acked.erase(src);
+            n.committed.erase(src);
+            n.produced.erase(src);
+            ASSERT_TRUE(awaitIds({}, {srcId})) << "dropped topic id " << srcId << " still listed";
+        }
     }
 
     void stepProbe(int step) {
@@ -437,12 +611,12 @@ protected:
         trace_ += " probe:" + user + "->" + b.name + "/" + o.local + (o.view ? "(view)" : "(topic)") + (o.exists ? "" : "(missing)");
 
         if (o.view) {
-            const Answer got = withRetry(user, [&](int64_t sid) { return viewRowOf(sid, o.id); });
+            const Answer got = probeAs(user, [&](int64_t sid) { return viewRowOf(sid, o.id); });
             if (visible) {
                 ASSERT_EQ(got.code, 0) << "own view must be readable";
             } else {
                 ASSERT_NE(got.code, 0) << "a foreign view's row must be hidden (invariant 1)";
-                const Answer twin = withRetry(user, [&](int64_t sid) { return viewRowOf(sid, kMissingId); });
+                const Answer twin = probeAs(user, [&](int64_t sid) { return viewRowOf(sid, kMissingId); });
                 ASSERT_EQ(got.code, twin.code) << "hidden view code differs from the missing twin (invariant 2)";
                 ASSERT_EQ(hex(normalized(got, twin)), hex(normalized(twin, got)))
                     << "hidden view answer bytes differ from the missing twin (invariant 2)";
@@ -451,7 +625,7 @@ protected:
         }
         // A caller names its own namespace's objects unqualified; a foreign one qualified (default: unqualified).
         const std::string asked = (same || b.nsId == 0) ? o.local : b.name + "/" + o.local;
-        const Answer got = withRetry(user, [&](int64_t sid) { return schemaOf(sid, asked); });
+        const Answer got = probeAs(user, [&](int64_t sid) { return schemaOf(sid, asked); });
         if (visible) {
             ASSERT_EQ(got.code, 0) << "own topic " << asked << " must resolve";
         } else {
@@ -459,7 +633,7 @@ protected:
             const auto slash = asked.find('/');   // same qualification form, same length, never created
             const std::string twinName = slash == std::string::npos ? std::string(asked.size(), 'q')
                 : asked.substr(0, slash + 1) + std::string(asked.size() - slash - 1, 'q');
-            const Answer twin = withRetry(user, [&](int64_t sid) { return schemaOf(sid, twinName); });
+            const Answer twin = probeAs(user, [&](int64_t sid) { return schemaOf(sid, twinName); });
             ASSERT_EQ(twinName.size(), asked.size());
             ASSERT_EQ(got.code, twin.code) << "hidden code differs from the missing twin " << twinName << " (invariant 2)";
             ASSERT_EQ(hex(normalized(got, twin)), hex(normalized(twin, got)))
@@ -497,19 +671,31 @@ protected:
         GoneNs g;
         g.nsId = n->nsId;
         g.name = n->name;
-        for (const auto& [l, id] : n->topics) { g.topicNames.push_back(n->name + "/" + l); g.topicIds.push_back(id); }
+        for (const auto& [l, id] : n->topics) {
+            g.topicNames.push_back(n->name + "/" + l);
+            g.topicIds.push_back(id);
+            if (txnTopic(n->nsId, l)) g.txnTopicIds.insert(id);
+        }
         for (const auto& [l, id] : n->views) { g.topicNames.push_back(n->name + "/" + l); g.viewIds.push_back(id); }
         g.users = n->users;
         ASSERT_EQ(nsDdl(pc::NamespaceDdlKind::Delete, n->name), 0) << "delete " << n->name;
+        for (const int32_t id : g.topicIds) g.leo0[id] = r_.logEnd(id);   // #730: the log end at the NamespaceDeleted commit
         platformAbort(n->nsId);
         closeTxnClient(n->name);
         evictSessions(n->users);
+        // #714: wait on the events, not on a retry count.  The namespace is erased from the catalog (the reaper ran to the end,
+        // read on the admin thread) and this broker's __security view has applied everything its log holds (so it is no longer
+        // AuthUnavailable behind a committed event); then the throttle is reset and each login is a single attempt that must
+        // answer AuthenticationFailed with no retry-after (a throttled answer carries one).
+        ASSERT_TRUE(r_.c().pollFor(std::chrono::seconds(60), [&] { return erasedOnAdminThread(g.nsId); }))
+            << "the reaper never erased the deleted " << g.name << " (id " << g.nsId << ") from the catalog";
+        ASSERT_TRUE(r_.c().pollFor(std::chrono::seconds(30), [&] { return securityViewCaughtUp(); }))
+            << "the __security view never applied the whole log after the delete of " << g.name;
         for (const std::string& u : g.users) {
-            // AuthUnavailable (48) is the broker's own transient "my __security view is behind a committed event": it refuses
-            // and serves again once applied.  Wait it out (bounded), then the answer must be exactly AuthenticationFailed.
-            int code = loginCode(u);
-            for (int i = 0; i < 500 && code == static_cast<int>(pc::ErrorCode::AuthUnavailable); ++i) code = loginCode(u);
-            ASSERT_EQ(code, kAuthFailed) << "a user of the deleted namespace " << n->name << " must be refused AuthenticationFailed";
+            r_.broker().node().resetLoginThrottleForTest();
+            const LoginAnswer a = loginAnswer(u);
+            ASSERT_EQ(a.code, kAuthFailed) << "a user of the deleted namespace " << g.name << " must be refused AuthenticationFailed: " << u;
+            ASSERT_EQ(a.retryAfterMs, 0u) << "the refusal of " << u << " is the throttle's answer (it carries a retry-after), not the deleted namespace's";
         }
         gone_.push_back(std::move(g));
         ns_.erase(ns_.begin() + (n - ns_.data()));
@@ -560,11 +746,10 @@ protected:
         const std::string user = n->users[0];
         trace_ += " produce:" + full(*n, it->first) + "(state " + std::to_string(n->state) + ")";
         int code = kNoAnswer;
-        for (int attempt = 0; attempt < 40; ++attempt) {
+        (void)r_.c().pollFor(std::chrono::seconds(10), [&] {   // NotLeader: the partition is not serving yet
             code = r_.produce(userSid(user), it->second);
-            if (code != static_cast<int>(pc::ErrorCode::NotLeader)) break;
-            r_.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
-        }
+            return code != static_cast<int>(pc::ErrorCode::NotLeader);
+        });
         if (n->state == 0) {
             ASSERT_EQ(code, 0) << "produce in an ACTIVE namespace";
             n->acked[it->first].push_back("");
@@ -784,14 +969,26 @@ protected:
     }
 
     // ── deleted namespaces ───────────────────────────────────────────────────────────────────────────────────
+    /// The namespace is gone from the catalog state the admin thread applied (the reaper erased it).
+    bool erasedOnAdminThread(uint32_t nsId) {
+        BrokerNode& node = r_.broker().node();
+        return node.onAdminThreadForTest([&] {
+            return node.adminWorkerAgentForTest()->worker().applier().state().namespaces().byId(nsId) == nullptr;
+        });
+    }
+    /// The control thread's __security view has applied every record the admin thread's __security log holds.
+    bool securityViewCaughtUp() {
+        BrokerNode& node = r_.broker().node();
+        const int64_t end = node.onAdminThreadForTest([&] { return node.securityReplicaForTest()->logEndOffset(); });
+        const BrokerNode::SecurityViewSnap v = node.securityViewForTest();
+        return v.present && !v.halted && v.appliedOffset >= end - 1;
+    }
     bool awaitErased(uint32_t nsId) {
-        for (int i = 0; i < 4000; ++i) {   // 4000 x 25 ms: the reaper runs to the end, a hard cap that fails
+        return r_.c().pollFor(std::chrono::seconds(100), [&] {   // the reaper runs to the end: a hard cap that fails
             bool present = false;
             for (const Listed& l : listNamespaces()) present = present || l.nsId == nsId;
-            if (!present) return true;
-            r_.c().pollFor(std::chrono::milliseconds(25), [] { return false; });
-        }
-        return false;
+            return !present;
+        });
     }
     void awaitAllGoneErased() {
         for (GoneNs& g : gone_) {
@@ -843,14 +1040,20 @@ protected:
                 const Answer a = schemaOf(rootSid(), q);
                 ASSERT_NE(a.code, 0) << "topic " << q << " of the deleted namespace " << it->name << " still resolves (invariant 6)";
             }
-            for (const int32_t id : it->topicIds) {   // by id: a produce to the old topic id answers UnknownTopic (the
-                // workers' DELETING gate rides their ingress ring, one hop after the commit: a bounded wait, never a sleep)
-                int code = r_.produce(rootSid(), id);
-                for (int i = 0; i < 500 && code != kUnknownTopic; ++i) {
-                    r_.c().pollFor(std::chrono::milliseconds(10), [] { return false; });
+            for (const int32_t id : it->topicIds) {   // by id: a produce to the old topic id is refused from the commit on (#730)
+                int code = kNoAnswer, acked = 0;
+                (void)r_.c().pollFor(std::chrono::seconds(5), [&] {
                     code = r_.produce(rootSid(), id);
-                }
+                    if (code == 0) ++acked;
+                    return code == kUnknownTopic;
+                });
                 ASSERT_EQ(code, kUnknownTopic) << "topic id " << id << " of the deleted namespace " << it->name << " still resolves (invariant 6)";
+                ASSERT_EQ(acked, 0) << "topic id " << id << " of the deleted namespace " << it->name
+                                    << " acked a produce after the NamespaceDeleted commit (invariant 6)";
+                const int64_t end = r_.logEnd(id);   // -1: the reaper already dropped the topic
+                if (end >= 0 && it->txnTopicIds.count(id) == 0)
+                    ASSERT_EQ(end, it->leo0.at(id)) << "topic id " << id << " of the deleted namespace " << it->name
+                                                    << " grew after the NamespaceDeleted commit (invariant 6)";
             }
             for (const int32_t v : it->viewIds) {
                 const Answer a = viewRowOf(rootSid(), v);
@@ -884,6 +1087,7 @@ protected:
         const Fingerprint f1 = fingerprint();
         r_.restart();
         root_ = {};
+        root2_ = {};
         sess_.clear();
         rootSid();
         for (const NsModel& n : ns_) if (n.state != 2) for (const std::string& u : n.users) userSid(u);
@@ -912,7 +1116,7 @@ protected:
         ASSERT_FALSE(HasFatalFailure());
         for (int step = 1; step <= steps; ++step) {
             trace_.clear();
-            const uint32_t roll = rnd(100);
+            const uint32_t roll = rnd(120);   // #646: 78..94 are the new ops; the probe keeps its ~22%
             const char* op = "probe";
             if (roll < 4 && ns_.size() < kMaxNamespaces) op = "create-namespace";
             else if (roll < 16) op = "create-topic";
@@ -928,6 +1132,11 @@ protected:
             else if (roll < 64) op = "commit-offset";
             else if (roll < 72) op = "txn-begin";
             else if (roll < 78) op = "txn-end";
+            else if (roll < 81) op = "drop-view";
+            else if (roll < 84) op = "drop-user";
+            else if (roll < 87) op = "grant";
+            else if (roll < 91) op = "produce-fetch";
+            else if (roll < 94) op = "concurrent";
             SCOPED_TRACE("seed=" + std::to_string(seed_) + " step=" + std::to_string(step) + " op=" + op);
             ++tally_[op];
             const auto stepStart = Clk::now();
@@ -946,6 +1155,11 @@ protected:
                 else if (!std::strcmp(op, "commit-offset")) stepCommitOffset();
                 else if (!std::strcmp(op, "txn-begin")) stepTxnBegin(step);
                 else if (!std::strcmp(op, "txn-end")) stepTxnEnd();
+                else if (!std::strcmp(op, "drop-view")) stepDropView(step);
+                else if (!std::strcmp(op, "drop-user")) stepDropUser(step);
+                else if (!std::strcmp(op, "grant")) stepGrant(step);
+                else if (!std::strcmp(op, "produce-fetch")) stepProduceFetch(step);
+                else if (!std::strcmp(op, "concurrent")) stepConcurrent(step);
                 else stepProbe(step);
                 if (!HasFatalFailure() && !HasNonfatalFailure()) checkInvariants();
                 if (std::getenv("RUNE_NS_STRESS_TRACE") != nullptr) std::printf("[ TRACE ] seed=%u step=%d op=%s%s (%lld ms)\n", seed_, step, op, trace_.c_str(), static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clk::now() - stepStart).count()));
@@ -990,7 +1204,8 @@ protected:
     uint32_t lastNsId_ = 0;
     uint64_t rid_ = 0;
     int sentinels_ = 0;
-    Session root_;
+    Session root_, root2_;
+    int64_t pkeys_ = 0;                      ///< #646: the next unique key of a record produced by id
     std::map<std::string, Session> sess_;
     std::string trace_;
     std::map<std::string, int> tally_;
