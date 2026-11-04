@@ -1,6 +1,7 @@
 # Pull request CI (#706): every PR builds and runs the *Regression* suite; latency gates never run in CI (they need an
 # idle host). The steps are the ones of sanitizers.yml without sanitizer flags: plain Debug.
-# Conan only installs dependencies here; it never creates, exports or uploads a package.
+# Conan installs dependencies here and exports the in-repo recipe (conan export conan/aeron, as sanitizers.yml does);
+# it never creates or uploads a package.
 #
 # Cost (docs/testing.md, "CI"):
 #   * client           the standalone client: every example compiles, the client *Regression* suite runs.
@@ -8,6 +9,7 @@
 #   * broker           the root tree + the broker *Regression* suite in 6 shards. A PR runs ONE shard (its number
 #                      modulo 6, so the shards rotate across PRs and fit about one runner-hour); every push to main, the
 #                      nightly run, a manual run and a PR labelled `ci:full` run all 6.
+# The `labeled` event matters only for `ci:full`: any other label neither runs a job nor cancels the run in progress.
 # Making these checks required is a branch-protection setting, not part of this file.
 name: pr
 
@@ -25,7 +27,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: pr-${{ github.event.pull_request.number || github.ref }}
+  group: pr-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci:full' && '-label' || '' }}
   cancel-in-progress: true
 
 env:
@@ -38,6 +40,7 @@ jobs:
   # The broker shards to run: one for a plain PR, all six otherwise.
   plan:
     name: plan
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci:full'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -57,6 +60,7 @@ jobs:
 
   client:
     name: client (Debug)
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci:full'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -163,6 +167,7 @@ jobs:
   # The broker's Python source guards (broker/CMakeLists.txt): no build, the same commands the ctests run.
   broker-ratchets:
     name: broker ratchets
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci:full'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -184,6 +189,7 @@ jobs:
 
   broker:
     name: broker ${{ matrix.shard }}/6
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci:full'
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 240
