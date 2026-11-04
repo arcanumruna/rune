@@ -12,7 +12,7 @@
 // plan holds it at DroppingTopics; no public observation tells the two apart (a DELETING name answers as a missing one),
 // and holding it at its first step keeps every older DELETING namespace from consuming a later cell's budget.
 //
-// Every wait is bounded (the client's pollFor budget or AuthRig::dl); the rig itself never sleeps.
+// Every wait is bounded (the client's pollFor budget or AuthRig::dl); the rig has no sleep_for of its own (ShardTestClient::pollFor pumps the egress and pauses briefly inside the poll).
 
 #include "support/AuthRig.h"
 #include "support/NamespaceLifecycleMatrixExpectations.h"

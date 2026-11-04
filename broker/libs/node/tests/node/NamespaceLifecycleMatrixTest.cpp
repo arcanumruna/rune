@@ -694,6 +694,38 @@ TEST(NamespaceDeletingProduceRegression, ClusterAdminProduceToDeletingNamespaceI
     for (const int32_t id : ids) EXPECT_EQ(rig.auth().produce(rig.rootSid(), id), kUnknownTopic) << "erased: topic " << id;
 }
 
+// #709 (in-process twin of namespace-e2e.sh step 15): a namespace holding a VIEW, a consumer group's committed offset and
+// a transactional id is deleted: the reaper drops the view (its own DropView event), the keyed stores hold nothing of the
+// old id, no ns-<id> directory is left, and the old view id answers UnknownTopic; the re-created namespace is empty.
+// Mutation: skip the reaper's DroppingViews step (NamespaceReaper.cpp) -> the view is never dropped (DropView count 0).
+TEST(NamespaceLifecycleMatrixDeleteRegression, DeleteWithViewsGroupsTxnsLeavesNothingRegression) {
+    LcRig rig("nsdelvgt");
+    const std::string nm = "d";
+    const int64_t userSid = rig.seedDeleteWorkload(nm);
+    const uint32_t id = rig.observe(nm).nsId;
+    ASSERT_NE(id, 0u);
+    const int32_t src = rig.topicIds(nm).front();
+    const int32_t view = rig.auth().createView(rig.rootSid(), nm + "/v", src);
+    ASSERT_GE(view, 0) << "the view is created in the namespace";
+    const auto oldTopics = rig.topicIds(nm);
+    ASSERT_EQ(oldTopics.size(), 2u);
+    ASSERT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Delete, nm).code, 0);
+    EXPECT_TRUE(rig.waitSessionGone(userSid));
+    rig.releaseReaper();   // the rig holds the reaper from the start
+    ASSERT_TRUE(rig.until([&] { return rig.erased(id); })) << "the delete never completed";
+    EXPECT_EQ(rig.catalogEventCount(rune::catalog::EventKind::DropView, id), 1u) << "the view dropped exactly once";
+    EXPECT_TRUE(rig.until([&] {
+        return !std::filesystem::exists(nsRoot(rig.dataDir(), id)) &&
+               !std::filesystem::exists(std::filesystem::path(nsRoot(rig.dataDir(), id).string() + ".deleting"));
+    })) << "ns-<id> directory";
+    EXPECT_TRUE(rig.auth().keyedStoresCleanBounded(id)) << "a live consumer-offset or transaction-state key of the deleted namespace";
+    ASSERT_EQ(rig.ns(rig.rootSid(), pc::NamespaceDdlKind::Create, nm).code, 0);
+    EXPECT_NE(rig.observe(nm).nsId, id);
+    const auto md = rig.rootMetadata();
+    for (const int32_t t : oldTopics) EXPECT_FALSE(std::binary_search(md.begin(), md.end(), t)) << "old topic " << t << " listed";
+    EXPECT_FALSE(std::binary_search(md.begin(), md.end(), view)) << "the old view " << view << " is listed";
+}
+
 // #721: DELETING gated produce at the worker, but a read of the namespace by id was still served to a root session
 // (exempt from the Deleting revoke): its live subscriptions kept receiving, a new Subscribe was accepted and GetViewRow
 // answered, until the reaper dropped the topic.  Held reaper = the window stays open.
