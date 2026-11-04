@@ -638,6 +638,28 @@ TEST(CheckedWritesBrokerRegression, LeaderViewBehavesLikeAllViewShardRegression)
 TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShardRegression) {
     OneBroker b("cw-noview", OneBroker::Runtime::Shard);
     const AcctFixture f = defineAcct(b, /*withView=*/false);
+
+    // No view folds this partition, so a View send does not wait for one: it acks at commit even while an open
+    // transaction holds back the fold point a view would wait for.
+    Sender tx(b.clientConfig(), "acct", f.topicId, 1, rc::Acks::All, "tx-cw");
+    tx.prod->initTransactionsAndWait(30s);
+    tx.prod->beginTransaction();
+    (void)tx.send(1);
+    Sender parked(b.clientConfig(), "acct", f.topicId, 1, kAllView);
+    EXPECT_TRUE(isOk(parked.await(parked.send(2), 10s))) << "the View send acks before the open transaction commits";
+    tx.prod->commitTransactionAndWait(30s);
+
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define RUNE_CW_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define RUNE_CW_SANITIZED 1
+#endif
+#ifndef RUNE_CW_SANITIZED
+    // The latency ratio is a wall-clock bound: under a sanitizer the time is the sanitizer's (TSan box, -j8: All|View
+    // p50 2.07 x All p50), so only the deterministic open-transaction check above runs there.
     const auto p50 = [&](rc::Acks acks, uint64_t firstId) {
         Sender s(b.clientConfig(), "acct", f.topicId, 1, acks);
         std::vector<std::chrono::nanoseconds> lat;
@@ -653,6 +675,7 @@ TEST(CheckedWritesBrokerRegression, ViewOnAPartitionWithoutViewsAcksAtCommitShar
     const auto view  = p50(kAllView, 2000);
     EXPECT_LE(view, 2 * plain) << "no view folds this partition, so View adds no wait (All p50 " << plain.count() / 1000 << " us, All|View p50 "
                                << view.count() / 1000 << " us)";
+#endif
 }
 
 TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesTheViewBitRegression) {
