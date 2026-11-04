@@ -200,6 +200,10 @@ enum class SubscriptionFailReason : int32_t {
     /// broker would ignore the filter and deliver everything, so nothing was sent.  Upgrade the broker, or
     /// subscribe unfiltered.
     BrokerTooOld = 9,
+    /// #839: the broker cannot read the subscription's next batch - it is stored in a damaged log segment
+    /// (ErrorResponse{StorageError 26} naming this subscription); the client released it.  Re-subscribing from the
+    /// same offset meets the same damage; resume past it only if losing those records is acceptable.
+    CorruptBatch = 10,
 };
 
 struct SubscriptionStatus {

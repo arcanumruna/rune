@@ -47,6 +47,7 @@
 //   RUNE_GROUP_ID        consume in this consumer group (unset: a plain subscription from earliest)
 //   RUNE_PRODUCE_N       records to produce, acked one by one (0 = until RUNE_STOP_FILE exists), default 20
 //   RUNE_PRODUCE_INTERVAL_US  pause after every acked record (default 0)
+//   RUNE_CONSUME_FROM    plain subscription start offset (default: earliest); ignored for a group consumer
 //   RUNE_CONSUME_EXPECT  consumer exit 0 once this many DISTINCT records arrived (0 = until RUNE_STOP_FILE)
 //   RUNE_EXPECT_FILE     consumer exit 0 once every sequence number listed in this file (the producer's
 //                        RUNE_ACKED_FILE, written when it ends) has arrived.  Role both: every acked record.
@@ -260,6 +261,7 @@ const char* subFailName(SubscriptionFailReason r, uint16_t code) {
         return "RejectedByBroker";
     case SubscriptionFailReason::SessionLost:     return "SessionLost";
     case SubscriptionFailReason::TimedOut:        return "TimedOut";
+    case SubscriptionFailReason::CorruptBatch:    return "CorruptBatch";
     default:                                      return "Ended";
     }
 }
@@ -346,6 +348,7 @@ int runWorldServer(ClientConfig& cfg, const std::string& role, int timeoutMs) {
     const int         produceN     = getEnvInt("RUNE_PRODUCE_N", 20);
     const int         intervalUs   = getEnvInt("RUNE_PRODUCE_INTERVAL_US", 0);
     const int         expect       = getEnvInt("RUNE_CONSUME_EXPECT", 0);
+    const long long   consumeFrom  = getEnvInt("RUNE_CONSUME_FROM", -1);   // -1 = earliest
     const std::string stopFile     = getEnvStr("RUNE_STOP_FILE");
     const std::string ackedFile    = getEnvStr("RUNE_ACKED_FILE");
     const std::string receivedFile = getEnvStr("RUNE_RECEIVED_FILE");
@@ -382,7 +385,7 @@ int runWorldServer(ClientConfig& cfg, const std::string& role, int timeoutMs) {
         if (doConsume && group.empty()) {
             const TopicHandle th = c.topic(consumeTopic);
             SubscribeOptions opts;
-            opts.from      = From::earliest();
+            opts.from      = consumeFrom >= 0 ? From::offset(consumeFrom) : From::earliest();
             opts.isolation = Isolation::ReadUncommitted;
             sub.emplace(c.subscribe(th, 0, opts, [&](const Record& r) {
                 seen.add(parseSeq(std::string_view(reinterpret_cast<const char*>(r.value.data()), r.value.size())));

@@ -4561,11 +4561,16 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // subscription named in the message, "subscription S topic T ...": the
         // broker parked a push subscription whose next batch it cannot deliver)
         // fails THAT subscription; the app's onError still hears it below.
-        if (opt->correlationId == 0 && ec == rpc::ErrorCode::MessageTooLarge) {
+        // #839: StorageError (a damaged stored batch) is the same scoped shape and fails it as CorruptBatch.
+        if (opt->correlationId == 0 &&
+            (ec == rpc::ErrorCode::MessageTooLarge || ec == rpc::ErrorCode::StorageError)) {
             if (const int64_t subId = subscriptionOfScopedError(opt->message); subId > 0) {
                 const auto snap = agent_.stateAndSessionId();
                 (void)subscriberHub_.failActiveSubscription(
-                    subId, SubscriptionFailReason::UndeliverableBatch, nextCorrId_++, snap.sessionId,
+                    subId,
+                    ec == rpc::ErrorCode::StorageError ? SubscriptionFailReason::CorruptBatch
+                                                       : SubscriptionFailReason::UndeliverableBatch,
+                    nextCorrId_++, snap.sessionId,
                     [this](int32_t /*streamId*/, const uint8_t* fbuf, std::size_t flen) -> bool {
                         return agent_.submitSend(fbuf, flen);
                     });
