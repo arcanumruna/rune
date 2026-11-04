@@ -301,7 +301,7 @@ struct Rig {
     void answer(const test_support::AnswerFrame& f) {
         ASSERT_TRUE(hub.onCoordinatorResponse(f.templateId, f.data(), f.len, now));
     }
-    void sweep() { impl->sweepTimedOut(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(now))); }
+    void sweep() { impl->sweepTimedOut(now); }
 
     // ---- AddPartitionsToTxn ----
     [[nodiscard]] std::vector<const OfferedFrame*> adds() const {
@@ -3339,6 +3339,87 @@ TEST(ProducerTxnDataRegression, AnAddPartitionsAnswerWithUnrequestedResultsLeave
     EXPECT_EQ(commit.status(), OpStatus::Ok);
     EXPECT_EQ(r.acks.times(921), 1);
     EXPECT_EQ(r.acks.status(921), OpStatus::Ok);
+}
+
+// #737 x duplicate results: the answer names the requested partition twice, Ok first and InvalidRequest (39) second.
+// The partition takes the worst of its results (AddFailed 39), never the first.
+// RED (mutation): breaking out of the result scan at the first match - the partition is Added.
+TEST(ProducerTxnDataRegression, DuplicateAddPartitionsResultTakesTheWorstRegression) {
+    Rig r;
+    r.initOk(42, 0);
+    r.begin();
+    ASSERT_EQ(r.sendAck(0, 1, 931), SendResult::Ok);
+    r.ticks(2);
+    const OfferedFrame* add = r.pendingAdd();
+    ASSERT_NE(add, nullptr);
+    const std::array<rpc::TxnPartitionResult, 2> res{{{kTopic, 0, 0}, {kTopic, 0, ec(rpc::ErrorCode::InvalidRequest)}}};
+    test_support::AnswerFrame a;
+    rpc::AddPartitionsToTxnResponse m;
+    m.correlationId = add->corrId;
+    a.len        = m.encode(a.buf.data(), std::span<const rpc::TxnPartitionResult>(res.data(), res.size()));
+    a.templateId = rpc::AddPartitionsToTxnResponse::TEMPLATE_ID;
+    r.answeredAdds.push_back(add->corrId);
+    r.answer(a);
+    r.ticks(2);
+    const auto* f = std::get_if<rp::AddFailed>(&r.membership(0));
+    ASSERT_NE(f, nullptr) << "a duplicate Ok masked the error";
+    EXPECT_EQ(f->errorCode, uint16_t{39});
+    EXPECT_TRUE(r.wire.empty()) << "a failed partition never produced";
+}
+
+// #737/#738 x unrequested results carrying a severe code: the requested partition is Ok; results for another topic
+// (ProducerFenced 18 - fatal for the producer) and ConcurrentTransactions (27) were never asked for.  Neither fences
+// the producer nor makes the link re-send the request.
+// RED (mutation): the verdict ranks every result of the answer - the 18 fences the producer.
+TEST(ProducerTxnDataRegression, UnrequestedAddPartitionsResultsAreIgnoredByTheVerdictRegression) {
+    {
+        Rig r;
+        r.initOk(42, 0);
+        r.begin();
+        ASSERT_EQ(r.sendAck(0, 1, 941), SendResult::Ok);
+        r.ticks(2);
+        const OfferedFrame* add = r.pendingAdd();
+        ASSERT_NE(add, nullptr);
+        const std::array<rpc::TxnPartitionResult, 2> res{{{kTopic, 0, 0},
+                                                          {kTopic + 1, 0, ec(rpc::ErrorCode::ProducerFenced)}}};
+        test_support::AnswerFrame a;
+        rpc::AddPartitionsToTxnResponse m;
+        m.correlationId = add->corrId;
+        a.len        = m.encode(a.buf.data(), std::span<const rpc::TxnPartitionResult>(res.data(), res.size()));
+        a.templateId = rpc::AddPartitionsToTxnResponse::TEMPLATE_ID;
+        r.answeredAdds.push_back(add->corrId);
+        r.answer(a);
+        r.ticks(2);
+        EXPECT_TRUE(std::holds_alternative<rp::Added>(r.membership(0)));
+        EXPECT_EQ(r.state(), TxnState::InTransaction) << "an unrequested 18 fenced the producer";
+        r.ackAll();
+        r.abort();
+        r.ticks(2);
+    }
+    {
+        Rig r;
+        r.initOk(42, 0);
+        r.begin();
+        ASSERT_EQ(r.sendAck(0, 1, 942), SendResult::Ok);
+        r.ticks(2);
+        const OfferedFrame* add = r.pendingAdd();
+        ASSERT_NE(add, nullptr);
+        const std::array<rpc::TxnPartitionResult, 2> res{{{kTopic, 0, 0},
+                                                          {kTopic + 1, 0, ec(rpc::ErrorCode::ConcurrentTransactions)}}};
+        test_support::AnswerFrame a;
+        rpc::AddPartitionsToTxnResponse m;
+        m.correlationId = add->corrId;
+        a.len        = m.encode(a.buf.data(), std::span<const rpc::TxnPartitionResult>(res.data(), res.size()));
+        a.templateId = rpc::AddPartitionsToTxnResponse::TEMPLATE_ID;
+        r.answeredAdds.push_back(add->corrId);
+        r.answer(a);
+        r.ticks(3, 200'000'000);
+        EXPECT_EQ(r.adds().size(), 1u) << "an unrequested 27 made the link re-send the request";
+        EXPECT_TRUE(std::holds_alternative<rp::Added>(r.membership(0)));
+        r.ackAll();
+        r.abort();
+        r.ticks(2);
+    }
 }
 
 // #345 x the sibling end path: an ABORT (Plain - nothing lost, no gap) that leaves a partition's sequence space more

@@ -98,6 +98,13 @@ A broker **never formats an empty data directory on its own**. It refuses to sta
 Never delete or copy `storage.meta` on its own. Details, refusal table and the multi-disk-loss procedure
 (`RUNE_STORAGE_RECOVERY_VOTE`) are in SELF-HOSTING.
 
+### Memory footprint
+
+Two fixed costs set the resident floor of a node, before any topic or view:
+
+- Per node: the cleaner's dedupe map, `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` (default 128 MiB, written whole at start and on every cleaner pass). The offset table stays within that budget; the producer tails add up to 25% of it (minimum 1024 x 64 B) on top, so the total is at most about 1.25 times the budget.
+- Per embedded Aeron driver: 3 x 128 MiB command rings, resident from the start. That is the Aeron default; the `aeron/1.51.0-rune.2` build honours the `AERON_DRIVER_COMMAND_QUEUE_CAPACITY` environment variable (bytes per ring), which the broker does not set (see #658).
+
 ## Health and failure
 
 - **Leadership.** Each broker logs `rune-broker: node N is LEADER term T` and every change (`leadership change`).
@@ -264,6 +271,7 @@ sampling the file; the broker keeps no history.
 | 1000240 | `rune-txn-offset-commits-stuck` | gauge | control | Transaction commits waiting because the group coordinator refuses their consumer-group offsets. Alert on a non-zero value that persists. |
 | 1000241 | `rune-txn-offset-stuck-age-ms` | gauge | control | Age of the oldest of those, in ms. A WARN names it every 30 s while any is stuck. |
 | 1000242 | `rune-ns-slot-mismatch` | counter | control | Namespace slot tags refused by the gateway or a worker (`rune.ns.slot_mismatch`): a message or request whose (slot, nsId) pair the receiver's slot table does not hold. Any rise is a bug. |
+| 1000243 | `rune-peer-hello-shed` | counter | control | Peer-link Hello / HelloV2 frames dropped because the sending peer had used its one crypto-costing Hello answer for this duty cycle (a flood, or a legitimate initiator retrying in the same cycle as a forged one). A sustained rise means an off-path Hello flood; the real initiator re-sends every 200 ms and still links. |
 
 Per-namespace metrics (one series per namespace on this node, allocated when the namespace is created and freed when it is
 erased; the key is the namespace id and the slot's owner tag is the namespace id too):
@@ -280,7 +288,7 @@ metrics and structured logs, not `__security` events.
 
 ### Process metrics
 
-On Linux the control agent samples `/proc/self` every `RUNE_METRICS_SYSTEM_INTERVAL_MS` (default 1000) and writes the rows
+On Linux the admin agent samples `/proc/self` every `RUNE_METRICS_SYSTEM_INTERVAL_MS` (default 1000) and writes the rows
 below. Other hosts have no `/proc`, and their brokers export no process metrics.
 
 | Type id | Label | Kind | Meaning |

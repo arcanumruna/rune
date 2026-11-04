@@ -733,7 +733,7 @@ public:
         cleaner.setMarkerRemovalBound(replica->cleanerMarkerRemovalBound());
         cleaner.setVerdictBounds(out.bound, markerEnd);
         cleaner.setDeferredInstall(&cleanedSeq_);
-        rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::maxSlotsFromBudget(1 << 22));
+        rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::sizingForBudget(1 << 22));
         auto res = cleaner.produceCleanedRangeBounded(log->dir(), bases, sizes, uncleanable, 0, nowMs * 1'000'000, 1000, map, false, 1 << 20, nullptr, nowMs);
         out.passEnd = res.passEnd;
         out.groups = res.groups.size();

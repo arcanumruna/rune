@@ -40,6 +40,7 @@ extern "C" {
 #include <rune/client/transport/TransportConfig.h>
 #include <flight_recorder/FlightRecorder.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -112,6 +113,16 @@ public:
     /// client conductor (useConductorAgentInvoker).  Thread mode: returns 0 — the
     /// driver thread and conductor thread own those duty cycles.
     int dutyCycle() noexcept;
+
+    /// TEST SEAM (cold; owner thread): while stalled, dutyCycle() pumps nothing, so a registration sent meanwhile stays
+    /// Resolving; `retarget`'s publication resolve bound is shortened to `boundNs` (wall clock) so a stalled retarget
+    /// returns promptly.  Stall off / bound 0 restores the defaults.  The driver is parked aside rather than flagged,
+    /// so dutyCycle()'s existing `driver_ == nullptr` check stalls it and the hot path carries no test-only branch.
+    void setDriverStalledForTest(bool stalled, int64_t retargetBoundNs = 0) noexcept {
+        if (stalled && driver_ != nullptr) { stalledDriver_ = driver_; driver_ = nullptr; }
+        if (!stalled && stalledDriver_ != nullptr) { driver_ = stalledDriver_; stalledDriver_ = nullptr; }
+        retargetPubBoundNs_ = retargetBoundNs > 0 ? retargetBoundNs : kResolveTimeoutNs;
+    }
 
     /// True once the Aeron client closed itself (inter-service timeout, driver
     /// timeout).  Offers then fail; the owner decides whether to rebuild.
@@ -237,6 +248,27 @@ public:
                                            std::string_view responseControlChannel);
     PubHandle responsePublicationHandle(const std::string& channel, int32_t streamId,
                                         std::string_view responseControlChannel);
+    /// #751: release a response-paired publication whose last user is gone: its response subscription retires (#764),
+    /// its request publication is released or drained (#763), and the slot becomes Released (handles are stable; the
+    /// next responsePublicationHandle / publicationHandle on the same key re-inits it).  A plain or unknown handle is
+    /// left alone.  Cold path, owner thread.
+    void releaseResponsePublication(PubHandle h) noexcept;
+    /// #751 review M1: the pair's last bind reference is gone but a plain route still offers on this slot: keep it as a
+    /// plain publication.  The response subscription retires, the correlated request publication is released or
+    /// drained (#763), and the slot (mode Plain, fresh Resolution) re-resolves lazily on the next offerOn /
+    /// publicationHandle.  Plain or Released: no-op.  Cold path, owner thread.
+    void demoteResponsePublication(PubHandle h) noexcept;
+    [[nodiscard]] bool publicationReleasedForTest(PubHandle h) const noexcept {
+        return h >= 0 && static_cast<std::size_t>(h) < pubSlots_.size() &&
+               std::holds_alternative<PubSlot::Released>(pubSlots_[static_cast<std::size_t>(h)].mode);
+    }
+    /// TEST SEAM: publication slots that are not Released (a leak shows as growth).
+    [[nodiscard]] std::size_t activePublicationSlotsForTest() const noexcept {
+        std::size_t n = 0;
+        for (const PubSlot& s : pubSlots_) if (!std::holds_alternative<PubSlot::Released>(s.mode)) ++n;
+        return n;
+    }
+    [[nodiscard]] std::size_t pubSlotCountForTest() const noexcept { return pubSlots_.size(); }
     /// The publication of `h` is a response-correlated request publication whose response subscription exists
     /// (Ready or still resolving the publication).  False for a plain / unknown handle or a response subscription
     /// not yet Ready.  Cold path (session connect, bind duty).
@@ -249,6 +281,10 @@ public:
     [[nodiscard]] bool seedResponseCorrelated() const noexcept { return respSeedSlot_ >= 0; }
     /// TEST SEAM (owner thread, no I/O): move the seed's PHYSICAL ingress identity, as a completed retarget does.
     void setIngressChannelForTest(const std::string& channel) { cfg_.ingressChannel = channel; }
+    /// TEST SEAM (call before start()): the seed's response subscription channel start() registers, in place of the one
+    /// derived from the ingress channel and the response port; a channel the driver refuses forces the fallback to the
+    /// declared path.  Empty = off.
+    void setSeedResponseChannelForTest(std::string channel) { seedResponseChannelForTest_ = std::move(channel); }
     [[nodiscard]] bool publicationIsResponsePairedForTest(PubHandle h) const noexcept {   // awaiting or correlated
         if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return false;
         return !std::holds_alternative<PubSlot::Plain>(pubSlots_[static_cast<std::size_t>(h)].mode);
@@ -262,10 +298,53 @@ public:
         return slot >= 0 && static_cast<std::size_t>(slot) < subSlots_.size() &&
                subSlots_[static_cast<std::size_t>(slot)].state == SubSlot::State::Live;
     }
-    [[nodiscard]] uint32_t subSlotOwnersForTest(int32_t slot) const noexcept {
+    [[nodiscard]] uint32_t subSlotMdcRefsForTest(int32_t slot) const noexcept {
         return slot >= 0 && static_cast<std::size_t>(slot) < subSlots_.size()
-                   ? subSlots_[static_cast<std::size_t>(slot)].owners : 0;
+                   ? subSlots_[static_cast<std::size_t>(slot)].mdcRefs : 0;
     }
+    /// TEST SEAMS (cold): the Live shared-MDC slot for (channel, stream) or -1; the response subscription slot a
+    /// response-paired publication names (-1 = none); and a release of one owner of a slot (what a user's release does).
+    [[nodiscard]] int32_t mdcSubSlotForTest(const std::string& channel, int32_t streamId) const noexcept {
+        for (std::size_t i = 0; i < subSlots_.size(); ++i)
+            if (subSlots_[i].state == SubSlot::State::Live && subSlots_[i].kind == SubSlot::Kind::SharedMdc &&
+                subSlots_[i].streamId == streamId && subSlots_[i].channel == channel) return static_cast<int32_t>(i);
+        return -1;
+    }
+    [[nodiscard]] int32_t responseSubSlotForTest(PubHandle h) const noexcept {
+        if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return -1;
+        const auto& m = pubSlots_[static_cast<std::size_t>(h)].mode;
+        if (const auto* a = std::get_if<PubSlot::AwaitResponseSub>(&m)) return a->subSlot;
+        if (const auto* c = std::get_if<PubSlot::Correlated>(&m)) return c->subSlot;
+        return -1;
+    }
+    void releaseSubSlotOwnerForTest(int32_t slot) noexcept { retireSubSlot_(slot); }
+    /// TEST SEAMS (cold): publication Resolutions parked by drainPub_ (#763); the registration id of the response
+    /// subscription a response-paired handle names (0 = none Ready); and the driver's publication-limit counters (one
+    /// per live publication) whose label ends with `channelSuffix` (the registered channel, e.g. a plain endpoint).
+    [[nodiscard]] std::size_t drainingPubsForTest() const noexcept { return drainingCount_; }
+    [[nodiscard]] bool subSlotFreeForTest(int32_t slot) const noexcept {
+        return slot >= 0 && static_cast<std::size_t>(slot) < subSlots_.size() &&
+               subSlots_[static_cast<std::size_t>(slot)].state == SubSlot::State::Free;
+    }
+    [[nodiscard]] int64_t responseSubscriptionIdForTest(PubHandle h) const noexcept {
+        const int32_t slot = responseSubSlotForTest(h);
+        if (slot < 0) return 0;
+        const aeron::Subscription* sub = subSlots_[static_cast<std::size_t>(slot)].res.ready();
+        return sub != nullptr ? sub->registrationId() : 0;
+    }
+    [[nodiscard]] int publisherLimitCountersForTest(const std::string& channelSuffix) const {
+        int n = 0;
+        if (!aeron_) return 0;
+        aeron_->countersReader().forEach([&](std::int32_t, std::int32_t typeId, const aeron::concurrent::AtomicBuffer&,
+                                             const std::string& label) {
+            constexpr std::int32_t kPublisherLimitTypeId = 1;   // AERON_COUNTER_PUBLISHER_LIMIT_TYPE_ID
+            if (typeId == kPublisherLimitTypeId && label.size() >= channelSuffix.size() &&
+                label.compare(label.size() - channelSuffix.size(), channelSuffix.size(), channelSuffix) == 0) ++n;
+        });
+        return n;
+    }
+    /// TEST SEAM: the sub slot table's size (slots are never erased: a released one is Retired, then Free).
+    [[nodiscard]] std::size_t subSlotCountForTest() const noexcept { return subSlots_.size(); }
     [[nodiscard]] const std::string& seedPublicationChannelForTest() const noexcept { return ingressPubChannel_; }
     /// TEST SEAMS (cold): fresh response subscriptions registered since start (a re-pair adds one), and the identity of
     /// the publication a handle currently holds (null = none Ready), to prove a slot was left alone.
@@ -310,12 +389,14 @@ public:
     /// Task 16 fix round 1 (M4): close the publication of `h` when it is Ready (an
     /// unreferenced route's old worker endpoint).  The slot stays (handles are
     /// stable); a later publicationHandle()/offerOn() on it re-resolves.  A slot
-    /// still Resolving is left alone (resetting it would orphan its pending
-    /// driver registration).  Cold path, owner thread.
+    /// still Resolving/TimedOut is parked in the drain set (#763 sibling: resetting
+    /// it would orphan its pending driver registration) and the slot starts afresh.
+    /// Cold path, owner thread.
     void releasePublication(PubHandle h) noexcept {
         if (h < 0 || static_cast<std::size_t>(h) >= pubSlots_.size()) return;
         PubSlot& s = pubSlots_[static_cast<std::size_t>(h)];
-        if (s.res.ready() != nullptr) s.res.reset();
+        drainPub_(std::move(s.res));
+        s.res = Resolution<aeron::ExclusivePublication>{kResolveTimeoutNs, kResolveRetryNs};
     }
     /// The channel of `h` (nullptr for an unknown handle).  Cold path.
     [[nodiscard]] const std::string* publicationChannel(PubHandle h) const noexcept {
@@ -364,6 +445,7 @@ public:
         // room).  The starting source rotates each poll so no subscription starves.
         int frags = 0;
         if (retiredSubs_ != 0) [[unlikely]] reapRetiredSubs_();   // never inside a poll callback: here is safe
+        if (drainingCount_ != 0) [[unlikely]] serviceDraining_();   // #763: registrations whose owner left them pending
         const std::size_t sources = 1 + subSlots_.size();
         const std::size_t start   = pollStart_ < sources ? pollStart_ : 0;
         pollStart_ = (start + 1 == sources) ? 0 : start + 1;
@@ -524,6 +606,8 @@ private:
     /// violation when driverThread_ is concurrently driving the same driver.
     int pumpDriverFromCaller_() noexcept;
     int callerPumpViolations_ = 0;  // written/read by the owning (caller) thread only
+    aeron_driver_t*  stalledDriver_       = nullptr;  // test seam: the driver parked by setDriverStalledForTest
+    int64_t          retargetPubBoundNs_   = kResolveTimeoutNs;   // test seam: retarget's publication resolve bound
     PumpStepObserver pumpObserver_    = nullptr;  // test seam (owner thread only)
     void*            pumpObserverCtx_ = nullptr;
 
@@ -541,6 +625,7 @@ private:
     /// The channel `ingressPub_` was registered with (== cfg_.ingressChannel, plus the response-correlation-id when
     /// the seed has a response pair).  cfg_.ingressChannel stays the PLAIN identity channel.  Owner thread only.
     std::string                                  ingressPubChannel_;
+    std::string                                  seedResponseChannelForTest_;   // test seam, see setSeedResponseChannelForTest
     /// Index into subSlots_ of the seed's response subscription (-1 = none): the seed's rich response state.
     int32_t                                      respSeedSlot_ = -1;
     /// The seed pair's re-pair state, one explicit state (mirrors PubSlot::AwaitResponseSub -> Correlated):
@@ -552,6 +637,7 @@ private:
         int32_t     subSlot;
         std::string addChannel;
         Resolution<aeron::ExclusivePublication> res;
+        int64_t     deadlineNs;   // #755: the re-pair is abandoned (old pair kept) at this resolve-clock time
     };
     std::variant<SeedSteady, SeedRePairing> seedPair_{SeedSteady{}};
     /// Advance a pending seed re-pair; true = swapped (the new pair is in force), false = still pending or abandoned.
@@ -619,33 +705,54 @@ private:
         ///   Correlated{idx}        the publication is registered (or resolving/ready) on `addChannel`, which names
         ///                          that subscription's registration id.
         struct Plain {};
-        struct AwaitResponseSub { int32_t subSlot; };
+        struct AwaitResponseSub { int32_t subSlot; int64_t deadlineNs; };   // #755: gives up at deadlineNs (resolve clock)
         struct Correlated { int32_t subSlot; };
+        /// #751: the owner released the pair (releaseResponsePublication): no publication, no subscription, offers fail.
+        /// The slot keeps its key so a later responsePublicationHandle / publicationHandle on it re-inits it in place.
+        struct Released {};
         std::string channel;
         int32_t     streamId;
         Resolution<aeron::ExclusivePublication> res;
-        std::variant<Plain, AwaitResponseSub, Correlated> mode{Plain{}};
+        std::variant<Plain, AwaitResponseSub, Correlated, Released> mode{Plain{}};
         std::string addChannel;   ///< the registered channel when Correlated (cold: built once)
     };
     struct SubSlot {
         enum class State : uint8_t { Live, Retired, Free };
+        /// What the slot is, one explicit state (#764): SharedMdc is deduplicated among Live slots and refcounted
+        /// (`mdcRefs` users); ResponsePair is ONE-SHOT (Aeron pins it to the first response session), never shared,
+        /// has exactly one owner and no count, and retires on its own release.
+        enum class Kind : uint8_t { SharedMdc, ResponsePair };
         std::string channel;
         int32_t     streamId;
         Resolution<aeron::Subscription> res;
         std::unique_ptr<aeron::FragmentAssembler> assembler;  // built on Ready
-        uint32_t    owners = 1;   ///< I1: acquirers of this Live slot (addSubSlot_ ++; retireSubSlot_ -- , Retired at 0)
+        Kind        kind = Kind::SharedMdc;
+        uint32_t    mdcRefs = 0;   ///< SharedMdc only: users of this Live slot (addSubSlot_ ++; retireSubSlot_ --, Retired at 0)
         State       state = State::Live;   ///< Retired: not polled, released by reapRetiredSubs_(); Free: reusable
     };
-    /// Open (idempotently, among Live slots) a subscription slot; its index, or -1 on allocation failure.  Cold.
-    /// I1: every successful call is one OWNER of the slot and must be matched by one retireSubSlot_ on its release path.
-    int32_t addSubSlot_(const std::string& channel, int32_t streamId, bool fresh = false) noexcept;
+    /// Open a subscription slot; its index, or -1 on allocation failure.  Cold.  SharedMdc is idempotent among Live
+    /// SharedMdc slots (one more user); ResponsePair always opens a fresh slot.  Every successful call is one OWNER of
+    /// the slot and must be matched by one retireSubSlot_ on its release path.
+    int32_t addSubSlot_(SubSlot::Kind kind, const std::string& channel, int32_t streamId) noexcept;
     /// A response subscription retired by retarget() may be the one whose poll callback is running: it is only
     /// marked here and released (with its assembler) at the start of the next poll().
     void retireSubSlot_(int32_t idx) noexcept;
     void reapRetiredSubs_() noexcept;
+    /// #763: a publication Resolution that leaves its owner goes through here, never `reset()`.  Ready: released now.
+    /// Resolving / TimedOut: its driver registration is still pending and would later complete with nobody to release
+    /// it, so it is parked in drainingPubs_ and polled (serviceDraining_, from poll()) until it is Ready (released) or
+    /// Rejected (dropped).  Unstarted / Rejected: nothing registered.  Cold, never blocks.  Overflow (kMaxDraining
+    /// pending at once): logged once, the OLDEST entries are kept and `r` is dropped.
+    void drainPub_(Resolution<aeron::ExclusivePublication>&& r) noexcept;
+    void serviceDraining_() noexcept;
+    static constexpr std::size_t kMaxDraining = 16;
+    std::array<std::optional<Resolution<aeron::ExclusivePublication>>, kMaxDraining> drainingPubs_{};
+    std::size_t drainingCount_ = 0;           // entries in drainingPubs_[0, drainingCount_)
+    bool        warnedDrainOverflow_ = false;   // drainPub_ overflow: logged once
     uint32_t retiredSubs_ = 0;   // Retired slots awaiting reapRetiredSubs_()
     uint64_t freshSubsAdded_ = 0;   // fresh (response-pair) subscription slots added; test seam
     bool     warnedPlainResponse_ = false;   // responsePublicationHandle: logged once
+    bool     warnedResponseGiveUp_ = false;   // offerOn fell back from a response pair to plain: logged once
     std::vector<PubSlot>  pubSlots_;   // index == PubHandle (stable, never erased)
     detail::FlatIndexMap  streamPub_;  // default-channel streamId -> PubHandle
     std::vector<SubSlot>  subSlots_;   // per-worker dynamic-MDC egress subscriptions

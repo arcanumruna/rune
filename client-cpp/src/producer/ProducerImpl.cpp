@@ -3307,9 +3307,7 @@ void ProducerImpl::failBatch(int64_t corrId) {
     }
 }
 
-void ProducerImpl::sweepTimedOut(const std::chrono::steady_clock::time_point& now) {
-    const int64_t nowNs =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+void ProducerImpl::sweepTimedOut(int64_t nowNs) {
     lastNowNs_ = nowNs;  // the duty-cycle clock (Client passes its own now)
     retryStatus_();  // FD9: a refused identity snapshot is re-offered (cold, once per sweep)
     const DutyScope duty(*this);  // fix1 C1: failure callbacks below defer their retries
@@ -4517,10 +4515,14 @@ void ProducerImpl::onInitExpired_(CoordinatorLink::Slot& s) noexcept {
     }
 }
 
-void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& a, int64_t nowNs) noexcept {
+void ProducerImpl::onCoordinatorAnswer(const CoordAnswer& wire, int64_t nowNs) noexcept {
     ++coordAnswersSeen_;
-    lastCoordCorrId_ = a.corrId;
+    lastCoordCorrId_ = wire.corrId;
     if (!coord_) return;
+    // #737/#738: the hub's code is the worst over ALL results; the verdict is the worst over the entries this request
+    // named (an omitted one an error, an unrequested one ignored).
+    CoordAnswer a = wire;
+    a.errorCode   = coord_->requestedWorst(wire);
     CoordinatorLink::Slot* s = coord_->onAnswer(a, nowNs);
     if (s == nullptr) return;
     // The answer's slot is released only after its machine handled it (and any completion it delivered): a

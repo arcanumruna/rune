@@ -142,7 +142,7 @@ The headline target (p50 50 µs / p99 200 µs) is a single-node hot-path figure.
 These benches are in-process and need no prepared box. Still, run them on an idle host for a verdict.
 
 **`ControlDutyCycleBench`** (`broker/benchmark/ControlDutyCycleBench.cpp`, built with `-DBUILD_BENCHMARKS=ON`) measures what
-`SystemMetrics` adds to one control-agent duty cycle: `if (systemMetrics_) work += systemMetrics_->doWork(nowNs);`, run on a
+`SystemMetrics` adds to one admin-agent duty cycle (moved off the control thread by #632): `if (systemMetrics_) work += systemMetrics_->doWork(nowNs);`, run on a
 real metrics file and the real `/proc/self`. It gates two things after the timed loop: zero allocations in every case, and
 the time per cycle shown in the table. The full BrokerNode control `doWork` is not driven here. The produce path is covered by
 the ABAB single-node produce p99 run.
@@ -152,11 +152,12 @@ the ABAB single-node produce p99 run.
 | no `SystemMetrics` (the bare loop: the floor, not a broker config, since a started broker always samples) | 0.47 ns | < 50 ns | metrics plan Task 12, 2026-10-27, `-O2`, shared dev host (load ~3) |
 | `SystemMetrics`, off-interval (the steady state) | 1.0 ns | < 50 ns | same |
 | `SystemMetrics`, on-interval (`pread` of statm and status, `getdents64` of the fd dir) | 5.9 µs | < 50 µs | same |
+| `SystemMetrics`, on-interval with 4000 extra open fds (`OnIntervalWith4000Fds`) | not yet measured (about 0.8 ms expected; no bench box, #841–#845) | < 2 ms per sample (the admin agent's budget) | #632 |
 
-At the default 1 s interval, the on-interval cost is paid once a second on the control thread, and it is never paid on a
-produce, fetch or query path. The 5.9 µs is for the bench's own small process. The `getdents64` walk costs about 200 ns per
-open fd, so a broker holding 4000 fds (segments, sockets) spends about 0.8 ms per sample on the control thread, over the
-50 µs gate. Measured by opening 4000 extra fds in the bench process.
+At the default 1 s interval, the on-interval cost is paid once a second on the admin agent's thread (#632), and it is never
+paid on a produce, fetch, query or control path. The 5.9 µs is for the bench's own small process. The `getdents64` walk costs about 200 ns per
+open fd, so a broker holding 4000 fds (segments, sockets) spends about 0.8 ms per sample, over the old 50 µs control-thread
+gate and the reason the sample moved to the admin agent, whose gate is 2 ms. Measured by opening 4000 extra fds in the bench process.
 
 **`NamespaceHotPathBench`** (`broker/bench/NamespaceHotPathBench.cpp`, `-DBUILD_BENCHMARKS=ON`) measures produce, fetch and
 view point read with namespaces on and limits set (the slot tag check, the throttle compare and the per-namespace counters).

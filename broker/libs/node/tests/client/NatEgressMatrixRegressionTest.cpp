@@ -3,7 +3,7 @@
 // SIMULATED NAT.
 //
 // The proof idea.  A client behind NAT declares an egress address the broker cannot reach.  In-process that is the
-// client test seam ClientConfig::declaredEgressChannelForTest: the client SUBSCRIBES on its real local egress channel
+// client test seam detail::ClientTestOptions::declaredEgressChannel: the client SUBSCRIBES on its real local egress channel
 // but DECLARES kUnroutable (TEST-NET-1) in its ConnectRequest.  Whatever the broker sends on the declared path is
 // lost, so every ack, Record, Pong, group and DDL answer the client receives proves the response path (the replies
 // ride the client's own flow back: gateway response publication, worker response publication).  An "old" client
@@ -91,11 +91,18 @@ std::function<void(NodeConfig&)> withResponsePorts(const RespPorts& r) {
     };
 }
 
+/// The test options of a client built from `cfg`: every config with a gateway response-control port is a NAT'd client
+/// (it DECLARES the unreachable address); port 0 is a pre-NAT-egress client with a reachable declared channel.
+rune::client::detail::ClientTestOptions natOptions(const rc::ClientConfig& cfg) {
+    rune::client::detail::ClientTestOptions o;
+    if (cfg.gatewayResponseControlPort != 0) o.declaredEgressChannel = kUnroutable;
+    return o;
+}
+
 /// A NAT'd client: subscribes on its real egress channel, DECLARES an unreachable one, and knows the seed's response port.
 rc::ClientConfig natClient(ThreeNodes& c, int id, const RespPorts& r) {
     auto cfg = clientConfigFor(c, id);
     cfg.gatewayResponseControlPort = r.gw[static_cast<std::size_t>(id - 1)];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     return cfg;
@@ -256,7 +263,7 @@ std::set<std::string> asSet(const std::vector<std::string>& v) { return {v.begin
 
 /// A client of `cfg` that has connected (bounded); a failure to connect is a test failure with the reason.
 std::unique_ptr<rc::Client> connectOrFail(const rc::ClientConfig& cfg) {
-    auto cl = std::make_unique<rc::Client>(cfg);
+    auto cl = std::make_unique<rc::Client>(cfg, natOptions(cfg));
     try {
         cl->connectAndWait(60s);
     } catch (const std::exception& e) {
@@ -330,23 +337,16 @@ struct GroupTap {
 /// closed (its duty thread gone), so its duty-owned observers can be read race-free.
 void everyOperation(std::unique_ptr<rc::Client>& out, rc::ClientConfig cfg, const rc::TopicSpec& spec,
                     const std::string& scratch, const std::string& tag,
-                    const std::function<void(rc::Client&, rc::Client&)>& beforeClose) {
-    // The GROUP leg runs on a second NAT client (same declared address, own data dir): while a group is active on a
-    // Client a plain subscribe() to a partition another node leads is failed by design (documented contract of
-    // Client::subscribe(), LeaderElsewhereWhileGroupActive; issue #749).
-    rc::ClientConfig gcfgClient = cfg;
-    gcfgClient.dataDir = cfg.dataDir + "_g";
-    gcfgClient.egressChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());   // its own local subscription
-    gcfgClient.topics  = {spec};
-    auto groupClient = std::make_unique<rc::Client>(gcfgClient);
-    out = std::make_unique<rc::Client>(cfg);
+                    const std::function<void(rc::Client&)>& beforeClose) {
+    cfg.topics = {spec};   // the group and the plain subscriptions share this one client (#749)
+    out = std::make_unique<rc::Client>(cfg, natOptions(cfg));
     rc::Client& cl = *out;
     GroupTap tap;
     rc::GroupConfig gcfg;
     gcfg.autoCommit          = false;
     gcfg.sessionTimeoutMs    = 30'000;
     gcfg.commitSyncTimeoutMs = 30'000;
-    auto gc = groupClient->subscribeGroup("g-" + tag, {spec.name}, gcfg);
+    auto gc = cl.subscribeGroup("g-" + tag, {spec.name}, gcfg);
     gc.onAssigned([&tap](std::vector<rc::TopicPartition> tps) {
         std::lock_guard lk(tap.mu);
         for (const auto& tp : tps) tap.partitions.insert(tp.partition);
@@ -359,7 +359,6 @@ void everyOperation(std::unique_ptr<rc::Client>& out, rc::ClientConfig cfg, cons
         });
     });
     ASSERT_NO_THROW(cl.connectAndWait(60s)) << "connect over the response path";
-    ASSERT_NO_THROW(groupClient->connectAndWait(60s)) << "group client connect over the response path";
 
     // The group joins and is assigned every partition before the data is produced.
     ASSERT_TRUE(waitUntil([&] { std::lock_guard lk(tap.mu); return tap.partitions.size() == static_cast<std::size_t>(spec.partitionCount); }, 60s))
@@ -428,10 +427,9 @@ void everyOperation(std::unique_ptr<rc::Client>& out, rc::ClientConfig cfg, cons
     }
 
     // Duty-owned observers are read here, with every operation finished (close() resets the transport's pairing).
-    beforeClose(cl, *groupClient);
+    beforeClose(cl);
     for (auto& s : subs) s.unsubscribe();
     gc.close();
-    groupClient->close();
     cl.close();
 }
 
@@ -449,17 +447,14 @@ TEST(NatEgressMatrixRegression, NewClientEveryOperationOverResponsePathOneNodeRe
 
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     std::unique_ptr<rc::Client> client;
-    everyOperation(client, cfg, spec, "scratch", "n1", [](rc::Client& cl, rc::Client& gcl) {
+    everyOperation(client, cfg, spec, "scratch", "n1", [](rc::Client& cl) {
         // I7: a response-path client never adds the declared MDC egress subscription, so the broker cannot deliver
         // to it that way (this is what makes the NAT test mean something).
         EXPECT_EQ(cl.testMdcEgressSubscriptions(), 0u) << "a response-path client added an MDC egress subscription";
-        EXPECT_EQ(gcl.testMdcEgressSubscriptions(), 0u);
         EXPECT_TRUE(cl.testSeedResponseCorrelated()) << "the seed session is response-correlated";
-        EXPECT_TRUE(gcl.testSeedResponseCorrelated()) << "the group client's seed session is response-correlated";
     });
     ASSERT_NE(client, nullptr);
     EXPECT_GE(bindsAccepted(b.node()), 1u) << "the worker accepted the client's WorkerBind";
@@ -482,13 +477,12 @@ TEST(NatEgressMatrixRegression, NewClientEveryOperationOverResponsePathThreeNode
     ASSERT_TRUE(awaitLeaders(c, spec.topicId, 3, leaders, 30s));
 
     std::unique_ptr<rc::Client> client;
-    everyOperation(client, natClient(c, 1, r), spec, "scratch", "n3", [&](rc::Client& cl, rc::Client& gcl) {
+    everyOperation(client, natClient(c, 1, r), spec, "scratch", "n3", [&](rc::Client& cl) {
         // I-D: the declared MDC subscription is skipped only for a leader whose session is KNOWN to be on the response
         // path when Metadata arrives (the seed's node: asserted by the one-node cell).  A leader session that is not
         // connected yet is subscribed at once (an unused subscription is harmless; a missing one loses records), so the
         // count here is not zero by design.
         EXPECT_TRUE(cl.testSeedResponseCorrelated());
-        EXPECT_TRUE(gcl.testSeedResponseCorrelated());
         // The gateway response port of every node was learnt (Metadata brokers entries / the seed's own config).
         for (int k = 1; k <= 3; ++k)
             EXPECT_EQ(cl.testKnownResponsePort(c.clientChannel(k)), r.gw[static_cast<std::size_t>(k - 1)])
@@ -568,7 +562,7 @@ TEST(NatEgressMatrixRegression, TwoNatClientsOneHostNeverSeeEachOthersRepliesReg
     const std::set<int64_t> before = sessionIds(c.node(2));
     auto cfgA = natClient(c, 2, r);
     auto cfgB = natClient(c, 2, r);
-    ASSERT_EQ(cfgA.declaredEgressChannelForTest, cfgB.declaredEgressChannelForTest) << "both declare the same address";
+    ASSERT_EQ(natOptions(cfgA).declaredEgressChannel, natOptions(cfgB).declaredEgressChannel) << "both declare the same address";
     cfgA.topics = {spec};
     cfgB.topics = {spec};
     auto a = connectOrFail(cfgA);
@@ -722,7 +716,6 @@ void tlsLeg(bool nat, const char* tag) {
     auto cfg = tlsConfig(b, "ws1", kUserPw);
     if (nat) {
         cfg.gatewayResponseControlPort   = r.gw[0];
-        cfg.declaredEgressChannelForTest = kUnroutable;
     }
     const std::string declaredEndpoint = cfg.egressChannel.substr(cfg.egressChannel.rfind('=') + 1);
     auto client = connectOrFail(cfg);
@@ -784,7 +777,6 @@ static void tlsAuthOffLeg(bool nat, const char* tag) {
     cfg.allowUnauthenticatedBroker = true;
     if (nat) {
         cfg.gatewayResponseControlPort   = r.gw[0];
-        cfg.declaredEgressChannelForTest = kUnroutable;
     }
     auto client = connectOrFail(cfg);
     ASSERT_NE(client, nullptr) << "TLS connect with authentication off";
@@ -836,7 +828,7 @@ TEST(NatEgressMatrixRegression, ConnectRacingALeaderChangeConvergesRegression) {
 
     auto cfg = natClient(c, seed, r);
     cfg.topics = {spec};
-    rc::Client client(cfg);
+    rc::Client client(cfg, natOptions(cfg));
     std::thread killer([&] { c.stop(leader); });
     bool connected = true;
     try {
@@ -887,7 +879,6 @@ TEST(NatEgressMatrixRegression, SourcePortChangeEndsTheOldSessionAndNothingReuse
     auto natCfg = [&] {
         auto cfg = b.clientConfig();
         cfg.gatewayResponseControlPort   = r.gw[0];
-        cfg.declaredEgressChannelForTest = kUnroutable;
         cfg.connectTimeoutMs = 30'000;
         cfg.pingTimeoutMs    = 30'000;
         cfg.topics           = {spec};
@@ -955,7 +946,6 @@ TEST(NatEgressMatrixRegression, SameClientReconnectRebindsAndProduceCompletesReg
     const rc::TopicSpec spec = defineTopic(*admin, "recon", 1, 1);
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     cfg.topics           = {spec};
@@ -1004,7 +994,6 @@ TEST(NatEgressMatrixRegression, BindLostRepeatedlyConvergesByResendRegression) {
     dropNextBinds(b.node(), 6);   // the first six WorkerBinds (more than the old attempt cap) are lost at the worker
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     cfg.topics           = {spec};
@@ -1044,7 +1033,6 @@ TEST(NatEgressMatrixRegression, LostBindAckRecoveredByAlreadyBoundResendRegressi
     const std::set<int64_t> s0 = sessionIds(b.node());
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     cfg.topics           = {spec};
@@ -1100,7 +1088,6 @@ TEST(NatEgressMatrixRegression, DerivedDefaultPortsCarryTheResponsePathRegressio
     ccfg.egressStreamId  = 2;
     ccfg.dataDir         = (dir / "client").string();
     ccfg.gatewayResponseControlPort   = resp->gateway;
-    ccfg.declaredEgressChannelForTest = kUnroutable;
     ccfg.connectTimeoutMs = 30'000;
     ccfg.pingTimeoutMs    = 30'000;
 
@@ -1182,7 +1169,6 @@ TEST(NatEgressMatrixRegression, TlsAuthThreeNodesNewClientRegression) {
 
     auto cfg = tlsCfg(2, "ws1", kUserPw);
     cfg.gatewayResponseControlPort   = r.gw[1];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.topics = {spec};
     auto client = connectOrFail(cfg);
     ASSERT_NE(client, nullptr) << "login over TLS on the three-node cluster";
@@ -1318,7 +1304,6 @@ TEST(NatEgressMatrixRegression, WorkerRestartRebindsRegression) {
     }
     auto cfg = b.clientConfig();
     cfg.gatewayResponseControlPort   = r.gw[0];
-    cfg.declaredEgressChannelForTest = kUnroutable;
     cfg.connectTimeoutMs = 30'000;
     cfg.pingTimeoutMs    = 30'000;
     cfg.topics           = {spec};
@@ -1370,4 +1355,82 @@ TEST(MdcSubscriptionRegression, DeclaredPathSessionStillGetsRecordsRegression) {
     cl->close();
     EXPECT_GE(cl->testMdcEgressSubscriptions(), 1u) << "the declared MDC egress subscription was added";
     EXPECT_EQ(bindsAccepted(b.node()), 0u) << "a declared-path session never binds";
+}
+
+// =================================================================================================================
+// 15. #769: a response-mode session whose publication is unavailable NEVER has its Records diverted onto the shared
+//     egress (the MDC): the subscription waits with its cursor unchanged and resumes with no loss.
+// =================================================================================================================
+TEST(NatEgressMatrixRegression, ResponseModeRecordsNeverLeakOntoTheMdcRegression) {
+    const RespPorts r = RespPorts::discover(1);
+    OneBroker b("natleak", OneBroker::Runtime::Shard, withResponsePorts(r));
+    rc::Client* admin = b.connectClient();
+    const rc::TopicSpec spec = defineTopic(*admin, "leak", 1, 1);
+    auto cfg = b.clientConfig();
+    cfg.gatewayResponseControlPort = r.gw[0];
+    cfg.connectTimeoutMs = 30'000;
+    cfg.pingTimeoutMs    = 30'000;
+    cfg.topics           = {spec};
+    auto cl = connectOrFail(cfg);
+    ASSERT_NE(cl, nullptr);
+    const int64_t sid = cl->testSeedSessionId();
+    ASSERT_NE(sid, 0);
+    ASSERT_TRUE(cl->testSeedResponseCorrelated());
+    const auto failPub = [&](int64_t s) {
+        for (int32_t w = 0; w < b.node().workerCountForTest(); ++w)
+            b.node().onWorkerThreadForTest(w, [s](Worker& wk) { wk.failSessionRecordPubForTest(s); return 0; });
+    };
+    // Worker-thread round trips are the pass barrier: every one runs between two worker passes.
+    const auto passes = [&](int n) {
+        for (int i = 0; i < n; ++i)
+            for (int32_t w = 0; w < b.node().workerCountForTest(); ++w)
+                (void)b.node().onWorkerThreadForTest(w, [](Worker&) { return 0; });
+    };
+
+    // The witness of the shared egress: a declared-path client connects to the workers' MDC egress publication, so a
+    // Records frame diverted onto it is ACCEPTED (it advances the publication's position); with no subscriber the
+    // offer would simply fail and a leak would be invisible.
+    auto wcfg = b.clientConfig();
+    wcfg.dataDir       = cfg.dataDir + "_witness";
+    wcfg.egressChannel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    wcfg.connectTimeoutMs = 30'000;
+    wcfg.pingTimeoutMs    = 30'000;
+    auto witness = connectOrFail(wcfg);
+    ASSERT_NE(witness, nullptr);
+    const auto mdcPosition = [&] {
+        int64_t sum = 0;
+        for (int32_t w = 0; w < b.node().workerCountForTest(); ++w)
+            sum += b.node().onWorkerThreadForTest(w, [](Worker& wk) -> int64_t {
+                return wk.workerEgress() != nullptr && wk.workerEgress()->pub() != nullptr ? wk.workerEgress()->pub()->position() : 0;
+            });
+        return sum;
+    };
+
+    const Sent first = produceN(*cl, handleOf(spec), "lk1", 0, 20, rc::Acks::All);
+    ASSERT_EQ(first.ok, 20) << first.firstBad << " undone " << first.undone;
+    Collector col;
+    auto subs = subscribeAll(*cl, spec, col);
+    const auto want1 = asSet(first.okValues);
+    ASSERT_TRUE(waitUntil([&] { return col.count(want1) == want1.size(); }, 60s)) << col.count(want1) << "/20 before the failure";
+
+    passes(10);
+    failPub(sid);   // the session's publication is gone mid-stream
+    const int64_t mdcBefore = mdcPosition();
+    const Sent second = produceN(*cl, handleOf(spec), "lk2", 0, 20, rc::Acks::All);
+    ASSERT_EQ(second.ok, 20) << second.firstBad << " undone " << second.undone;
+    const auto want2 = asSet(second.okValues);
+    passes(50);
+    EXPECT_EQ(col.count(want2), 0u) << "Records were delivered while the session publication was unavailable";
+    EXPECT_EQ(mdcPosition(), mdcBefore) << "Records of a response-mode session were offered on the shared egress";
+
+    failPub(0);   // the publication is back: the subscription resumes where it stopped
+    std::set<std::string> all = want1;
+    all.insert(want2.begin(), want2.end());
+    EXPECT_TRUE(waitUntil([&] { return col.count(all) == all.size(); }, 60s))
+        << col.count(all) << "/40 after the publication returned: records were lost (diverted onto the shared egress)";
+    EXPECT_EQ(col.strays(all), 0u);
+    for (auto& sub : subs) sub.unsubscribe();
+    cl->close();
+    witness->close();
+    EXPECT_EQ(spoofed(b.node()), 0u);
 }

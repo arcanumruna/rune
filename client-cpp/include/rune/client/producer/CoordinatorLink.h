@@ -150,6 +150,13 @@ public:
 
     /// The verdict table (FD5 / FD6; Kafka parity, plus auth).
     [[nodiscard]] static Verdict classify(ReqKind kind, int16_t errorCode) noexcept;
+    /// Severity of a code for `kind` (fenced 5 > fatal 4 > abortable/reject 3 > rediscover 2 > retry 1 > ok 0).
+    [[nodiscard]] static int rank(ReqKind kind, int16_t errorCode) noexcept;
+    /// #737/#738: the answer's verdict over the entries the REQUEST named: per requested entry the worst of its
+    /// results (duplicates included); an entry the answer omits counts as an error; results for entries never asked
+    /// for are ignored.  The request is the matching slot's frame.  Falls back to `a.errorCode` for an ErrorResponse,
+    /// a stale answer or an undecodable frame.  Allocation-free (zero-copy views).
+    [[nodiscard]] int16_t requestedWorst(const CoordAnswer& a) const noexcept;
     /// min(1 ms << (attempt - 1), 100 ms); attempt 0 -> 0.
     [[nodiscard]] static int64_t backoffNs(uint32_t attempt) noexcept;
 

@@ -404,7 +404,7 @@ TEST(ProducerIdRegression, StatusSnapshotsAreNeverLostWhenTheRingIsFullRegressio
     // The app finally looks: it drains what the ring held (stale: the final snapshot was refused) ...
     EXPECT_EQ(r.impl->appProducerId(), -1) << "precondition: the final snapshot did not fit the ring";
     // ... and the duty side re-offers the newest snapshot from its cold sweep point.
-    r.impl->sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{r.now}});
+    r.impl->sweepTimedOut(r.now);
     EXPECT_EQ(r.impl->appProducerId(), 6161);
     EXPECT_EQ(r.impl->appProducerEpoch(), 5);
 }
@@ -485,7 +485,7 @@ TEST(ProducerIdRegression, HeldRecordsFailAtDeliveryTimeoutWhileTheIdKeepsRetryi
         r.ticks(1, 5'000 * kMs);
         r.ticks(2, kMs);
         r.ticks(1, 6'000 * kMs);
-        r.impl->sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{r.now}});
+        r.impl->sweepTimedOut(r.now);
         EXPECT_FALSE(r.impl->identityAssigned());
         EXPECT_GE(r.initRequests(), 2u) << "still asking";
         for (rc::Token t = 1; t <= (direct ? 2u : 3u); ++t) {
@@ -493,7 +493,7 @@ TEST(ProducerIdRegression, HeldRecordsFailAtDeliveryTimeoutWhileTheIdKeepsRetryi
             EXPECT_EQ(L.status(t), OpStatus::DeliveryFailed);
         }
         EXPECT_GE(L.batchAckedRecords(), direct ? 3 : 7) << "the void send and the batch are counted";
-        r.impl->sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{r.now + kMs}});
+        r.impl->sweepTimedOut(r.now + kMs);
         for (rc::Token t = 1; t <= 2; ++t) EXPECT_EQ(L.times(t), 1) << "never twice";
     }
 }
@@ -518,7 +518,7 @@ TEST(ProducerIdRegression, CloseWithHeldRecordsCompletesWithinTheBoundRegression
     r.ticks(1, 9'000 * kMs);
     EXPECT_EQ(got.n, 0) << "inside the bound";
     r.ticks(1, 2'000 * kMs);
-    r.impl->sweepTimedOut(std::chrono::steady_clock::time_point{std::chrono::nanoseconds{r.now}});
+    r.impl->sweepTimedOut(r.now);
     r.ticks(2, kMs);
     ASSERT_EQ(got.n, 1) << "completes within deliveryTimeoutMs + one pass";
     EXPECT_EQ(L.times(1), 1);

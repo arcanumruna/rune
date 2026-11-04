@@ -1167,7 +1167,7 @@ TEST(Producer, ProduceAckTimeout) {
         h.gw->poll();
 
         // Simulate the Client's sweepTimeouts() calling hub.sweepTimedOut().
-        h.hub.sweepTimedOut(std::chrono::steady_clock::now());
+        h.hub.sweepTimedOut(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 
         if (L.times(1) != 0) {
             resolved = true;
@@ -1213,7 +1213,7 @@ TEST(Producer, ProduceAckTimeoutCallback) {
     while (std::chrono::steady_clock::now() < deadline) {
         h.agent->doWork(monoNs());
         h.gw->poll();
-        h.hub.sweepTimedOut(std::chrono::steady_clock::now());
+        h.hub.sweepTimedOut(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
         if (L.times(1) != 0) break;
         std::this_thread::sleep_for(20ms);
     }

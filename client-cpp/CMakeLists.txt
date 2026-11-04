@@ -94,6 +94,18 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py --tests
             ${CMAKE_CURRENT_SOURCE_DIR})
+    # #706: the pull request workflow keeps running the client suite (pull_request trigger, examples built, `-R Regression
+    # -LE latency`, never `-L latency`).  Registered when the repo's .github exists (a standalone client tarball has none);
+    # then a deleted pr.yml fails the guard.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../.github")
+        add_test(NAME PrWorkflowGuardSelfTestRegression
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_pr_workflow.py --selftest)
+        add_test(NAME PrWorkflowRunsTheClientSuiteGuardRegression
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_pr_workflow.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/../.github/workflows/pr.yml)
+    endif()
     add_test(NAME NoSharedPtrHandlesGuardRegression
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py --handles
@@ -1167,6 +1179,7 @@ if(BUILD_TESTING)
         tests/session/SessionMachineTest.cpp
         tests/session/SessionMachineAuthTest.cpp   # authentication Task 7: the SCRAM client + Authenticating
         tests/session/SessionMachineTransientRetryTest.cpp   # C4 review: transient refusals (48 / rate-limited 44)
+        tests/support/AllocCounter.cpp   # #732: zero-alloc namesRetiredSealedSession gate
     )
     # client<->broker TLS/AEAD (Task 5): SessionMachine.h now drives a real
     # TlsSession/AeadCipher directly (header-only) — this target links rune_crypto

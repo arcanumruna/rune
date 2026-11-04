@@ -1510,7 +1510,8 @@ TEST(D9CrossNodeMarkerIntegrationRegression, CommitAcrossTwoRemoteLeadersComplet
     for (int i = 0; i < 50; ++i) C.pass();
     EXPECT_EQ(C.node(1).deliveredCount(sub0, 0), 1) << "delivered exactly once";
     EXPECT_EQ(C.node(2).deliveredCount(sub1, 0), 1);
-    EXPECT_EQ(C.coord().gw.markersInFlightForTest(), 0u);
+    ASSERT_TRUE(C.passUntil([&] { return C.coord().gw.markersInFlightForTest() == 0u; }, kPassCap))
+        << "a marker is still in flight after the txn completed";
 }
 
 // Abort variant: the data stays hidden from read_committed; data produced after
@@ -1559,7 +1560,8 @@ TEST(D9CrossNodeMarkerIntegrationRegression, LeaderKilledMidEndTxnMarkerLandsOnT
     ASSERT_EQ(C.txnState(), rune::transaction::TxnState::PrepareCommit);
     ASSERT_TRUE(C.passUntil([&] { return controlBatchCount(C.node(2).log(1)) == 1; }))
         << "p1's marker (live leader) landed";
-    for (int i = 0; i < 200; ++i) C.pass();
+    ASSERT_TRUE(C.passUntil([&] { return C.coord().gw.remoteMarkersInFlightForTest() == 1u; }, kPassCap))
+        << "precondition: p0's marker never went in flight to node 1";
     ASSERT_EQ(C.txnState(), rune::transaction::TxnState::PrepareCommit)
         << "precondition: p0's marker is stuck on the dead leader, so the txn has not completed";
     EXPECT_EQ(C.addPartitions(), -1) << "the next txn may not start while p0's marker is unwritten (#557: parked)";
