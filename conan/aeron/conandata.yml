@@ -1,7 +1,8 @@
 # Aeron 1.51.0 + upstream 2f9e9e49f1 (aeron-io/aeron#2226): the C++ wrapper's unavailable-image callback dropped the
-# image's list reference, so the conductor freed images a poll was still iterating. Drop this recipe for the first
-# upstream release that carries the fix.
+# image's list reference, so the conductor freed images a poll was still iterating. rune.2 adds __atomic x86-64 atomics,
+# the AERON_DRIVER_COMMAND_QUEUE_CAPACITY env var (tests run with 1m) and a fix for concurrent driver inits writing the
+# shared default UDP bindings. Drop this recipe for the first upstream release that carries all of them.
 sources:
-  1.51.0-rune.1:
-    sha256: 22386309bed6f17bd4ca68348299ad19cf5110591bad75e093d1e150683d271c
-    url: https://github.com/arcanumruna/aeron/archive/refs/tags/1.51.0-rune.1.tar.gz
+  1.51.0-rune.2:
+    sha256: 5da67adcecceb65b69d420e84bfabf8c74b27f3623dcea3849b5011b63232e1f
+    url: https://github.com/arcanumruna/aeron/archive/refs/tags/1.51.0-rune.2.tar.gz
