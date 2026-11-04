@@ -405,6 +405,19 @@ TEST(BrokerMetricsRegression, StartRefusedOnAllocFailureRemovesAPreviousRunsFile
     EXPECT_FALSE(fs::exists(cfg.effectiveMetricsFile())) << "the refused start leaves no file, not even the old one";
 }
 
+// #631 review: a refusal inside createMetrics_ detaches the writer and drops its free stack along with the unmapped
+// file, so a later allocate / write can never touch the unmapped mapping.
+// RED (the writer reset and the free-stack clear dropped from discardMetricsFile_): the writer still holds its rows.
+TEST(BrokerMetricsRegression, DiscardDetachesTheMetricsWriterRegression) {
+    MetricsTempDir tmp{"detach_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    cfg.metricsFailAllocAtForTest = 9;
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_EQ(node.metricsWriterAllocatedForTest(), 0) << "the writer still counts rows of the unmapped file";
+    EXPECT_EQ(node.metricsFreeStackSizeForTest(), 0u) << "the free stack still names slots of the unmapped file";
+}
+
 // L10 (#631): a start that fails AFTER createMetrics_ returned leaves the complete, valid file (every row allocated,
 // the observer's NONE / -1 values): only a refusal inside createMetrics_ removes it.  The later failure here is a
 // per-worker replication peer with a different worker count.

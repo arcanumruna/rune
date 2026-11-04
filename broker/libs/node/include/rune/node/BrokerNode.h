@@ -1567,6 +1567,11 @@ public:
         return std::atomic_ref<std::uint8_t>(b).load(std::memory_order_relaxed);
     }
 
+    /// Test seam (#631 review): slots the metrics writer still holds, and the size of its free stack.  Both 0 once
+    /// discardMetricsFile_ detached the writer from the unmapped file.  Call only while no agent thread runs.
+    [[nodiscard]] std::int32_t metricsWriterAllocatedForTest() const noexcept { return metricsWriter_.allocatedCount(); }
+    [[nodiscard]] std::size_t  metricsFreeStackSizeForTest() const noexcept { return metricsFreeStack_.size(); }
+
     /// Return the leader's client Aeron channel for data-op redirect (GB-4).
     /// Observer thread (see above): ring-drained snapshot + immutable peer config.
     /// - If this node IS the leader → returns empty string (no self-redirect).

@@ -3373,6 +3373,8 @@ void BrokerNode::discardMetricsFile_() noexcept {
     slots_ = {};
     observerSlots_ = {};
     std::fill(nsMetricSlots_.begin(), nsMetricSlots_.end(), metrics::SlotWriter{});
+    metricsWriter_ = metrics::MetricsWriter{};   // detached: allocate is Full, nothing points into the unmapped file
+    metricsFreeStack_.clear();
     metricsFile_ = metrics::MetricsFile{};
     if (ours) (void)::unlink(metricsPath_.c_str());
     metricsReady_ = false;
