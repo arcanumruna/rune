@@ -2211,7 +2211,7 @@ public:
     }
 
     /// Test-only (#632): process-metrics samples the admin agent has taken; 0 when there is no agent or no sampler.
-    [[nodiscard]] uint64_t adminSystemMetricsSamplesForTest() const noexcept {
+    [[nodiscard]] uint64_t adminSystemMetricsSamplesForTest() noexcept {
 #if defined(__linux__)
         if (!started_ || stopped_ || !adminWorkerAgent_ || !adminWorkerRunner_) return 0;
         return onAdminThreadForTest([this]() -> uint64_t { return adminWorkerAgent_->systemMetricsSamplesForTest(); });
