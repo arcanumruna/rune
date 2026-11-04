@@ -245,7 +245,7 @@ public:
     void failPending(int64_t corrId);
 
     /// Sweep timed-out acks (called from Client::sweepTimeouts).
-    void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
+    void sweepTimedOut(int64_t nowNs);
 
     bool empty() const noexcept {
         // Runner-thread-only read of the single-owner vector — no lock, no atomic.

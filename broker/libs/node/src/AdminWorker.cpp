@@ -3,6 +3,7 @@
 #include "rune/node/AdminWorker.h"
 
 #include <rune/node/NamespaceLimitCheck.h>
+#include <rune/node/NodeConfig.h>
 #include <rune/node/TopicFeatureRules.h>
 #include <rune/node/CatalogEffectFrames.h>
 #include <rune/node/FdBudget.h>
@@ -1750,6 +1751,11 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
     }
     switch (static_cast<pc::NamespaceDdlKind>(m.kind)) {
     case pc::NamespaceDdlKind::Create: {
+        if (pc::namespaceMaskHas(m.mask, rune::protocol::kNsLimitFieldMaxTxnTimeMs) &&
+            m.limits.maxTxnTimeMs > static_cast<uint64_t>(NodeConfig::kMaxDurationMs))
+            return Rejected(reject(kInvalidRequest, "max-txn-time-ms must be at most " +
+                                                        std::to_string(NodeConfig::kMaxDurationMs) +
+                                                        " (30 days), got " + std::to_string(m.limits.maxTxnTimeMs)));
         if (!rune::catalog::validNamespaceName(m.name))
             return Rejected(reject(kInvalidRequest, "invalid namespace name " + quotedName(m.name)));
         if (nss.byName(m.name) != nullptr)
@@ -1785,6 +1791,11 @@ AdminWorker::Built AdminWorker::buildNamespace_(const NamespaceDdlMsg& m, const 
         return e;
     }
     case pc::NamespaceDdlKind::SetLimits: {
+        if (pc::namespaceMaskHas(m.mask, rune::protocol::kNsLimitFieldMaxTxnTimeMs) &&
+            m.limits.maxTxnTimeMs > static_cast<uint64_t>(NodeConfig::kMaxDurationMs))
+            return Rejected(reject(kInvalidRequest, "max-txn-time-ms must be at most " +
+                                                        std::to_string(NodeConfig::kMaxDurationMs) +
+                                                        " (30 days), got " + std::to_string(m.limits.maxTxnTimeMs)));
         const cat::NamespaceRecord* rec = nss.byName(m.name);
         if (rec == nullptr) return Rejected(reject(kUnknownTopic, "no namespace named " + quotedName(m.name)));
         // The untouched predefined default holds no event-carried limits: its base is the boot defaults.

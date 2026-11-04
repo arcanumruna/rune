@@ -422,6 +422,7 @@ CatalogReadServer::PushResult CatalogReadServer::pushRange_(Sub& s, int64_t& nex
     case st::ReadIntoStatus::FirstTooLarge: return PushResult{Push::Ended, kMessageTooLarge,
                                                               "a stored batch larger than the read buffer"};
     case st::ReadIntoStatus::Absent:        return PushResult{Push::Ended, kInternal, "no batch at a committed offset"};
+    case st::ReadIntoStatus::Corrupt:
     case st::ReadIntoStatus::Unreadable:    return PushResult{Push::Ended, kInternal, "torn or corrupt bytes"};
     case st::ReadIntoStatus::IoError:       return PushResult{Push::Ended, kInternal, "an I/O error"};
     }

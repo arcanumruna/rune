@@ -139,8 +139,8 @@ private:
         uint8_t                                             sendIdx = kNoSend;   // the send epoch's slot
         uint64_t                                            sendOrder = 0;       // its installOrder (0 = none)
         uint64_t                                            authFrames = 0;
-        uint64_t                                            lastOpenOrder = 0;   // installOrder of the epoch of the last
-                                                                                  // authenticated frame (0 = none; #774)
+        uint64_t                                            maxOpenOrder = 0;   // installOrder of the newest epoch a
+                                                                                  // frame opened under (0 = none; #774)
     };
     struct PeerEpoch { int32_t peer = -1; uint32_t epoch = 0; };
 

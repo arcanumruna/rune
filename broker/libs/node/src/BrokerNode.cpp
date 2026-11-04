@@ -1967,6 +1967,24 @@ void BrokerNode::onInvariantViolation_(const std::string& what) {
     std::_Exit(kExitInvariantViolation);
 }
 
+void BrokerNode::refuseStartOnDamagedSystemLog_() {
+    rune::storage::Log* first = nullptr;
+    int64_t damaged = 0;
+    for (auto* l : {catalogLog_.get(), securityLog_.get(), offsetLog_.get(), txnLog_.get(), metadataLog_.get()}) {
+        if (!l || l->damagedSegmentCount() == 0) continue;
+        damaged += static_cast<int64_t>(l->damagedSegmentCount());
+        if (!first) first = l;
+    }
+    if (!first) return;
+    // The boot gauge counts first (refuseStartOnFailedRecovery_ never runs on this path), then the refusal fires.
+    bootDamagedSegments_ = damaged;
+    controlSet_(RuneMetric::DamagedSegments, damaged);
+    spdlog::critical("BrokerNode[{}]: system log {} has a damaged segment at offset {} - refusing to start", config_.nodeId,
+                     first->dir(), first->firstDamageOffset().value_or(-1));
+    onStorageFailure_(first->dir(), EIO);   // halt path: handler (exit 74) or _Exit(74)
+    throw SystemLogDamaged("BrokerNode: system log " + first->dir() + " has a damaged segment - refusing to start");
+}
+
 void BrokerNode::refuseStartOnFailedRecovery_() {
     // Every log this node will serve — registry replicas AND the logs outside
     // the registry (__catalog; the internal offset / txn / metadata logs; every
@@ -1976,7 +1994,7 @@ void BrokerNode::refuseStartOnFailedRecovery_() {
     if (replicaRegistry_)
         for (auto* r : replicaRegistry_->allReplicas())
             if (r && r->isDiskBacked()) logs.push_back(r->log());
-    for (auto* l : {catalogLog_.get(), offsetLog_.get(), txnLog_.get(), metadataLog_.get()})
+    for (auto* l : {catalogLog_.get(), securityLog_.get(), offsetLog_.get(), txnLog_.get(), metadataLog_.get()})   // #839: __security too
         if (l) logs.push_back(l);
     if (topicRegistry_)
         for (const auto& ts : bootTopics_)
@@ -1986,6 +2004,18 @@ void BrokerNode::refuseStartOnFailedRecovery_() {
         catalogLog_->setSyncFaultForTest(catalogRecoveryFaultForTest_);
         catalogLog_->recover();
         catalogLog_->setSyncFaultForTest(0);
+    }
+    // #839: the registry and the topic registry can list one log twice - count each damaged segment once.
+    std::sort(logs.begin(), logs.end());
+    logs.erase(std::unique(logs.begin(), logs.end()), logs.end());
+    {
+        int64_t damaged = 0;
+        for (auto* l : logs) damaged += static_cast<int64_t>(l->damagedSegmentCount());
+        bootDamagedSegments_ = damaged;
+        controlSet_(RuneMetric::DamagedSegments, damaged);   // metrics exist since createMetrics_; boot-only value
+        if (damaged > 0)
+            spdlog::error("BrokerNode[{}]: {} damaged log segment(s) at boot (see the Log ... DAMAGED lines); "
+                          "reads that reach them fail with StorageError", config_.nodeId, damaged);
     }
     for (auto* l : logs) {
         if (!l->storageFailed()) continue;
@@ -2298,6 +2328,7 @@ void BrokerNode::buildGateway() {
             offsetLog_ = std::make_unique<rune::storage::Log>(
                 offsetDir.string(), config_.offsetLogSegmentRollBytes);
             offsetLog_->recover();
+            refuseStartOnDamagedSystemLog_();   // #839: before offsetStore_->rebuildFromLog() (its first reader)
 
             // Wrap in a PartitionReplica for the __consumer_offsets topic.
             // topicId=-1 is the sentinel for the offset log (not a user topic).
@@ -2414,6 +2445,8 @@ void BrokerNode::buildGateway() {
 
             spdlog::info("BrokerNode[{}]: GroupCoordinationService wired (offsets at {})",
                          nodeId, offsetDir.string());
+        } catch (const SystemLogDamaged&) {
+            throw;   // #839: a damaged system log refuses the start; never "group consumers will not work"
         } catch (const std::exception& ex) {
             spdlog::error("BrokerNode[{}]: GroupCoordinationService setup failed: {}; "
                           "group consumers will not work", nodeId, ex.what());
@@ -2441,6 +2474,7 @@ void BrokerNode::buildGateway() {
 
             txnLog_ = std::make_unique<rune::storage::Log>(txnDir.string(), config_.offsetLogSegmentRollBytes);
             txnLog_->recover();
+            refuseStartOnDamagedSystemLog_();   // #839: before the txn store's rebuild (its first reader)
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
 
@@ -2578,6 +2612,8 @@ void BrokerNode::buildGateway() {
 
             spdlog::info("BrokerNode[{}]: TransactionCoordinationService wired (txn state at {})",
                          nodeId, txnDir.string());
+        } catch (const SystemLogDamaged&) {
+            throw;   // #839
         } catch (const std::exception& ex) {
             spdlog::error("BrokerNode[{}]: TransactionCoordinationService setup failed: {}; "
                           "transactions will not work", nodeId, ex.what());
@@ -2627,6 +2663,7 @@ void BrokerNode::buildGateway() {
 
             metadataLog_ = std::make_unique<rune::storage::Log>(metaDir.string(), config_.offsetLogSegmentRollBytes);
             metadataLog_->recover();
+            refuseStartOnDamagedSystemLog_();   // #839: before metadataService_->rebuildFromLog() (its first reader)
 
             const NodeId selfId = static_cast<NodeId>(config_.nodeId);
 
@@ -2813,6 +2850,8 @@ void BrokerNode::buildGateway() {
             // the catalog leader; data ops per partition).  Never inferred from
             // the routing image, which an empty cluster never has.
             gateway_->setSessionAdmission(rune::gateway::ClientGateway::SessionAdmission::AnyNode);
+        } catch (const SystemLogDamaged&) {
+            throw;   // #839
         } catch (const std::exception& ex) {
             spdlog::error("BrokerNode[{}]: MetadataService setup failed: {}; "
                           "cluster metadata will not be tracked", nodeId, ex.what());
@@ -3296,6 +3335,11 @@ void BrokerNode::createMetrics_() {
         spdlog::error("BrokerNode[{}]: {}", config_.nodeId, msg);
         throw std::runtime_error(msg);
     }
+    // #631: from here the file is at its canonical path, so ANY refusal below discards it: a half-allocated file
+    // would hold a Role row for a process that never started (rune_role would print role=NONE, exit 0).  Failures
+    // after createMetrics_ returns (later in start()) leave the complete, valid file: the observer publishes
+    // NONE / -1 and every row exists.
+    try {
     metricsFreeStack_.assign(static_cast<std::size_t>(maxSlots), 0);
     if (const metrics::WriterStatus ws = metrics::MetricsWriter::create(metricsFile_, metricsFreeStack_, metricsWriter_);
         ws != metrics::WriterStatus::Ok) {
@@ -3323,7 +3367,8 @@ void BrokerNode::createMetrics_() {
         slots_[i] = RuneMetricSlot{r.writer, d.owner, &metricWrittenBy_[i]};
     }
     // D59: the observer's slots are copied here, on the observer (start) thread, before any agent thread starts;
-    // the provisioner receives its slots in its constructor (start()).  Every other row is the control thread's.
+    // the provisioner receives its slots in its constructor (start()).  Every other row is the control thread's, except
+    // the process-metrics rows (library SlotWriters, no MetricOwner tag), whose single writer is the admin agent (#632).
     observerSlots_ = ObserverSlots{slots_[static_cast<std::size_t>(runeMetricRow(RuneMetric::Role))],
                                    slots_[static_cast<std::size_t>(runeMetricRow(RuneMetric::Term))],
                                    slots_[static_cast<std::size_t>(runeMetricRow(RuneMetric::OutOfSyncPartitions))]};
@@ -3347,11 +3392,32 @@ void BrokerNode::createMetrics_() {
         const std::string msg = "metrics file " + metricsPath_ + ": system metrics init failed (" +
                                 (ss == metrics::SystemMetrics::Status::OpenFailed ? "OpenFailed" : "AllocFailed") + ")";
         spdlog::error("BrokerNode[{}]: {}", config_.nodeId, msg);
-        systemMetrics_.reset();
         throw std::runtime_error(msg);
     }
 #endif
     metricsReady_ = true;
+    } catch (...) {
+        discardMetricsFile_();
+        throw;
+    }
+}
+
+// #631: undo createMetrics_ after a refusal.  Order matters: the system metrics and the slots that point into the
+// mapping go first, then the mapping, then the path.  The unlink runs only when the path still names OUR file (a
+// second process may have recreated it).
+void BrokerNode::discardMetricsFile_() noexcept {
+#if defined(__linux__)
+    systemMetrics_.reset();
+#endif
+    const bool ours = metricsFile_.sameInstanceAs(metricsPath_.c_str());
+    slots_ = {};
+    observerSlots_ = {};
+    std::fill(nsMetricSlots_.begin(), nsMetricSlots_.end(), metrics::SlotWriter{});
+    metricsWriter_ = metrics::MetricsWriter{};   // detached: allocate is Full, nothing points into the unmapped file
+    metricsFreeStack_.clear();
+    metricsFile_ = metrics::MetricsFile{};
+    if (ours) (void)::unlink(metricsPath_.c_str());
+    metricsReady_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -3650,6 +3716,7 @@ void BrokerNode::publishPeerLinkMetrics_() noexcept {
     controlSet_(RuneMetric::PeerFrameDrops, static_cast<std::int64_t>(peerFrameDropsTotal_()));
     controlSet_(RuneMetric::PeerLinksEstablished, peerLinkAgent_->establishedPeers());
     controlSet_(RuneMetric::PeerLinkRefusals, static_cast<std::int64_t>(peerLinkAgent_->refusals()));
+    controlSet_(RuneMetric::PeerHelloShed, static_cast<std::int64_t>(peerLinkAgent_->helloShed()));
 }
 
 uint64_t BrokerNode::peerFrameDropsTotal_() const noexcept {
@@ -3700,6 +3767,14 @@ uint64_t BrokerNode::workerPeerUnknownEpochDropsForTest(int32_t w) {
     return onWorkerThreadForTest(w, [](Worker& wk) -> uint64_t {
         const auto* t = wk.replicationTransport();
         return t != nullptr ? t->unknownEpochFrames() : 0u;
+    });
+}
+
+uint64_t BrokerNode::workerPeerAuthFramesForTest(int32_t w, int32_t peer) {
+    return onWorkerThreadForTest(w, [peer](Worker& wk) -> uint64_t {
+        const auto* t = wk.replicationTransport();
+        const auto* c = t != nullptr ? t->peerCrypto() : nullptr;
+        return c != nullptr ? c->authFrames(peer) : 0u;
     });
 }
 
@@ -4028,6 +4103,7 @@ void BrokerNode::bootFromCatalog_() {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog recovery failed "
                                  "(storage error " + std::to_string(catalogLog_->storageErrno()) + ") at " +
                                  dir.string() + " — refusing to start before the boot replay");
+    refuseStartOnDamagedSystemLog_();   // #839: before the boot replay (its first reader)
     // Never compacted / retention-deleted: a recovered catalog always starts at
     // 0 — a follower can never be "below the leader's start".  Anything else is
     // a damaged (or foreign) directory: refuse loudly instead of serving it.
@@ -4287,6 +4363,7 @@ void BrokerNode::bootFromSecurity_() {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security recovery failed "
                                  "(storage error " + std::to_string(securityLog_->storageErrno()) + ") at " +
                                  dir.string() + " - refusing to start");
+    refuseStartOnDamagedSystemLog_();   // #839: before the boot replay (its first reader)
     // Never compacted / retention-deleted: a recovered security log always starts at 0.
     if (securityLog_->logStartOffset() != 0)
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __security at " + dir.string() +
@@ -4483,6 +4560,10 @@ void BrokerNode::buildAdminWorker() {
             catalogReplica_.get(), catalogPlane_.get());
         // Task 16 (F4): the applier the startup phase booted — Booted, never replayed
         // again; the admin thread's first pass makes it Live.
+#if defined(__linux__)
+        // #632: the process metrics sample on this agent's thread (D62 superseded), never on the control thread.
+        adminWorkerAgent_->adoptSystemMetrics(systemMetrics_ ? &*systemMetrics_ : nullptr);
+#endif
         adminWorkerAgent_->worker().adoptBootedApplier(std::move(*bootApplier_), adminWorkerAgent_->catalogLiveEffects());
         bootApplier_.reset();
         // Authentication Task 9: the same for the booted SecurityApplier + the `__security` replica.
@@ -4522,6 +4603,9 @@ void BrokerNode::buildAdminWorker() {
             nodeId, ex.what());
         adminWorkerRunner_.reset();
         adminWorkerAgent_.reset();
+#if defined(__linux__)
+        if (systemMetrics_) spdlog::warn("BrokerNode[{}]: process metrics off: no admin agent", nodeId);
+#endif
     }
     // Catalog history Task 6: the catalog has no other driver than the admin
     // thread — no admin worker means an undriven catalog: never start so.
@@ -4836,7 +4920,8 @@ void BrokerNode::stop() {
 
     if (mtuProbeFd_ >= 0) { ::close(mtuProbeFd_); mtuProbeFd_ = -1; }   // re-check I1
     // arcanum-metrics Task 8: the metrics file stays mapped (and its values readable) until the node is destroyed;
-    // the system metrics close their /proc fds here.
+    // the system metrics close their /proc fds here.  #632: the admin agent samples them, and its runner was
+    // stopAndJoin'ed above, so no thread touches systemMetrics_ any more: keep this reset after that join.
 #if defined(__linux__)
     systemMetrics_.reset();
 #endif
@@ -5026,9 +5111,6 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
     work += reportUnbuildableReplicas_();
     work += checkLinkMtu_(nowNs, /*force=*/false);   // re-check I1: the runtime's clock, no per-pass clock read
     work += publishStorageMetrics_();                // ISR v3 §3.10
-#if defined(__linux__)
-    if (systemMetrics_) work += systemMetrics_->doWork(nowNs);   // arcanum-metrics D62: process metrics, own interval
-#endif
     if (consensusUnmarked_ && nowNs - lastConsensusMarkCheckNs_ >= 1'000'000'000LL) {   // ISR v3 Step 6 (cold: until marked)
         lastConsensusMarkCheckNs_ = nowNs;
         markConsensusWhenPresent_();

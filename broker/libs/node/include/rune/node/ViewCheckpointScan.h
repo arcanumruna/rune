@@ -9,7 +9,9 @@
 // The scan sorts every file into exactly one class and never silently drops a tail:
 //   Clean               every byte belongs to a CRC-valid record;
 //   TornTail{cleanLen}  CRC-valid records up to cleanLen, then bytes holding NO complete CRC-valid record (a strict prefix of
-//                       one record, or zeros).  Truncating the file to cleanLen loses nothing recovery could ever decode;
+//                       one record, or zeros, or a complete-length LAST record whose CRC fails and whose every byte after its
+//                       fixed header, to EOF, is zero: size committed, data not).  Truncating the file to cleanLen loses
+//                       nothing recovery could ever decode;
 //   Corrupt{cleanLen}   anything else (a complete-length record whose CRC fails, an unknown non-zero magic, a complete valid
 //                       record after bytes that do not verify).  Not provably lossless: backed up and rebuilt, never truncated.
 // Bounds-safe (never trusts a length/count to over-read).  Cold: the IO agent runs it once per file open, the worker once per

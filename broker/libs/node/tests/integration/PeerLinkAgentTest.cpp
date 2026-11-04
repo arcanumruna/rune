@@ -222,7 +222,7 @@ TEST(PeerLinkAgentRegression, AnAgentWithNoPeersTicksQuietly) {
 }
 
 // Issue #554: a flood of forged HelloV2s (a real peer id and key id, random nonces and shares) onto a responder's
-// peer-auth stream is answered at most kHelloAnswersPerCycle per duty cycle; the rest are shed before any crypto.  The
+// peer-auth stream is answered at most kHelloAnswersPerPeerPerCycle per peer per duty cycle; the rest are shed before any crypto.  The
 // real initiator still links afterwards (its Hello is retried).  Mutation: removing the budget in onFrame_ -> every
 // Hello answered, helloShed() == 0 -> red.
 TEST(PeerLinkAgentRegression, AHelloFloodIsAnsweredAtMostTheBudgetPerDutyCycleAdversarialRegression) {
@@ -270,8 +270,8 @@ TEST(PeerLinkAgentRegression, AHelloFloodIsAnsweredAtMostTheBudgetPerDutyCycleAd
         std::this_thread::yield();
     }
     ASSERT_EQ(b.helloAnswered() + b.helloShed(), static_cast<uint64_t>(kFlood)) << "every forged Hello consumed";
-    EXPECT_LE(maxPerCycle, static_cast<uint64_t>(PeerLinkAgent::kHelloAnswersPerCycle));
-    EXPECT_LE(b.helloAnswered(), static_cast<uint64_t>(PeerLinkAgent::kHelloAnswersPerCycle) * static_cast<uint64_t>(cycles));
+    EXPECT_LE(maxPerCycle, static_cast<uint64_t>(PeerLinkAgent::kHelloAnswersPerPeerPerCycle));
+    EXPECT_LE(b.helloAnswered(), static_cast<uint64_t>(PeerLinkAgent::kHelloAnswersPerPeerPerCycle) * static_cast<uint64_t>(cycles));
     EXPECT_GT(b.helloShed(), 0u) << "a burst larger than the budget is shed";
     EXPECT_EQ(b.establishedPeers(), 0);
 
@@ -279,6 +279,106 @@ TEST(PeerLinkAgentRegression, AHelloFloodIsAnsweredAtMostTheBudgetPerDutyCycleAd
     ASSERT_TRUE(rig.runUntil(2000ms, [&] {
         return rig.agents[1]->establishedPeers() == 1 && rig.agents[2]->establishedPeers() == 1;
     })) << "shed " << b.helloShed();
+}
+
+namespace {
+/// Connects a publication from the test onto `target`'s peer-auth stream, driving `target` until it is connected.
+std::shared_ptr<aeron::Publication> connectForgePub(AgentRig& rig, int32_t target) {
+    const std::string ch = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rig.ports[static_cast<std::size_t>(target - 1)]);
+    const int64_t regId = rig.aeron->addPublication(ch, kPeerAuthStream);
+    std::shared_ptr<aeron::Publication> pub;
+    const auto connectBy = std::chrono::steady_clock::now() + 10s;
+    for (int i = 0; i < 10'000'000 && !(pub && pub->isConnected()) && std::chrono::steady_clock::now() < connectBy; ++i) {
+        if (!pub) pub = rig.aeron->findPublication(regId);
+        (void)rig.agents[target]->doWork(AgentRig::nowNs());
+        std::this_thread::yield();
+    }
+    return pub;
+}
+bool offerWire(aeron::Publication& pub, const uint8_t* data, std::size_t n) {
+    aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(data), n);
+    int64_t r = -1;
+    for (int t = 0; t < 1'000'000 && (r = pub.offer(ab, 0, static_cast<aeron::util::index_t>(n))) < 0; ++t) std::this_thread::yield();
+    return r >= 0;
+}
+bool offerHelloV2(aeron::Publication& pub, std::mt19937_64& rng, int32_t from, int32_t to, uint64_t keyId) {
+    pl::PeerHelloV2 h; h.from = from; h.to = to; h.keyId = keyId; h.incarnation = rng();
+    for (auto& x : h.nonceA) x = static_cast<uint8_t>(rng());
+    for (auto& x : h.shareA) x = static_cast<uint8_t>(rng());
+    std::array<uint8_t, pl::PeerHelloV2::kSize> wire{};
+    h.encode(wire.data());
+    return offerWire(pub, wire.data(), wire.size());
+}
+}  // namespace
+
+// Issue #683: the budget is PER PEER.  A flood of HelloV2s naming peer 1 (a valid key id) onto node 3 must not shed
+// peer 2's Hello.  Every polled batch of 8 fragments is [peer 1, peer 1, peer 2, peer 1 x5]: under a global budget the
+// two peer-1 frames in front spend it and peer 2's frame is shed; per peer, peer 2's frame is the only one of its peer
+// in the cycle and is always answered.  Afterwards the real node 2 links with node 3.
+// Mutation: a global budget (the first version of #554) sheds peer 2's frames -> helloShedOf(2) > 0 -> red.
+TEST(PeerLinkAgentRegression, AHelloFloodNamingOnePeerNeverStarvesAnotherAdversarialRegression) {
+    AgentRig rig;
+    rig.start(3, keysOf('k'), 103);   // the responder of both (1,3) and (2,3)
+    PeerLinkAgent& c = *rig.agents[3];
+    auto pub = connectForgePub(rig, 3);
+    ASSERT_TRUE(pub && pub->isConnected());
+    ASSERT_EQ(c.helloAnswered() + c.helloShed(), 0u);
+    std::mt19937_64 rng(683);
+    const uint64_t keyId = keysOf('k').current.keyId;
+    constexpr int kGroups = 8;
+    for (int g = 0; g < kGroups; ++g)
+        for (int i = 0; i < 8; ++i)
+            ASSERT_TRUE(offerHelloV2(*pub, rng, i == 2 ? 2 : 1, 3, keyId)) << g << "/" << i;
+    constexpr uint64_t kTotal = kGroups * 8;
+    const auto drainBy = std::chrono::steady_clock::now() + 10s;
+    for (int i = 0; i < 10'000'000 && c.helloAnswered() + c.helloShed() < kTotal && std::chrono::steady_clock::now() < drainBy; ++i) {
+        (void)c.doWork(AgentRig::nowNs());
+        std::this_thread::yield();
+    }
+    ASSERT_EQ(c.helloAnswered() + c.helloShed(), kTotal) << "every forged Hello consumed";
+    EXPECT_EQ(c.helloShedOf(2), 0u) << "peer 2 was starved by a flood naming peer 1";
+    EXPECT_GT(c.helloShedOf(1), 0u);
+    EXPECT_EQ(c.helloShed(), c.helloShedOf(1) + c.helloShedOf(2));
+
+    rig.start(2, keysOf('k'), 102);   // a real handshake with node 3 still completes within the usual bound
+    ASSERT_TRUE(rig.runUntil(3000ms, [&] { return rig.agents[2]->establishedPeers() >= 1 && c.establishedPeers() >= 1; }))
+        << "shed(2)=" << c.helloShedOf(2);
+}
+
+// Issue #554: garbage wearing a Hello tag is never charged: a body that does not decode, and a well-formed HelloV2 with
+// a key id we do not hold (refused cheaply).  None of it sheds, and a real handshake still links afterwards.
+// Mutation: charging before decode / before the key check sheds most of the 64 frames -> helloShed() > 0 -> red.
+TEST(PeerLinkAgentRegression, GarbageWithAHelloTagIsNeverChargedRegression) {
+    AgentRig rig;
+    rig.start(2, keysOf('k'), 102);
+    PeerLinkAgent& b = *rig.agents[2];
+    auto pub = connectForgePub(rig, 2);
+    ASSERT_TRUE(pub && pub->isConnected());
+    std::mt19937_64 rng(554);
+    const uint64_t before = b.malformedFrames() + b.refusals();
+    constexpr int kFlood = 64;
+    for (int i = 0; i < kFlood; ++i) {
+        if (i % 2 == 0) {   // a truncated body: tag + from, no decode
+            std::array<uint8_t, 12> w{};
+            w[0] = static_cast<uint8_t>(pl::PeerMsg::HelloV2); w[1] = 1;
+            for (std::size_t k = 9; k < w.size(); ++k) w[k] = static_cast<uint8_t>(rng());
+            ASSERT_TRUE(offerWire(*pub, w.data(), w.size()));
+        } else {            // well-formed, but a key id nobody holds
+            ASSERT_TRUE(offerHelloV2(*pub, rng, 1, 2, keysOf('k').current.keyId ^ 0xDEADBEEFull));
+        }
+    }
+    const auto drainBy = std::chrono::steady_clock::now() + 10s;
+    for (int i = 0; i < 10'000'000 && b.malformedFrames() + b.refusals() - before < kFlood &&
+                    std::chrono::steady_clock::now() < drainBy; ++i) {
+        (void)b.doWork(AgentRig::nowNs());
+        std::this_thread::yield();
+    }
+    EXPECT_GE(b.malformedFrames() + b.refusals() - before, static_cast<uint64_t>(kFlood)) << "every frame refused or malformed";
+    EXPECT_EQ(b.helloShed(), 0u) << "garbage is never charged";
+    EXPECT_EQ(b.helloAnswered(), 0u);
+
+    rig.start(1, keysOf('k'), 101);
+    ASSERT_TRUE(rig.runUntil(2000ms, [&] { return rig.agents[1]->establishedPeers() == 1 && b.establishedPeers() == 1; }));
 }
 
 // ---- Part 2: BrokerNodes, authMode Enabled ------------------------------------------------------------------

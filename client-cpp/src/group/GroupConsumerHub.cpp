@@ -111,8 +111,18 @@ GroupConsumerImpl* GroupConsumerHub::find_(uint64_t handle) const noexcept {
     return nullptr;
 }
 
+void GroupConsumerHub::setRewind_(GroupConsumerImpl& impl, GroupConsumerImpl::Rewind next) noexcept {
+    const bool was = !std::holds_alternative<GroupConsumerImpl::NoRewind>(impl.rewind);
+    const bool now = !std::holds_alternative<GroupConsumerImpl::NoRewind>(next);
+    impl.rewind = next;
+    if (was == now) return;
+    if (now) ++activeRewinds_;
+    else --activeRewinds_;
+}
+
 bool GroupConsumerHub::release(GroupConsumerImpl* impl) noexcept {
     if (impl == dispatching_ || impl->active || impl->leavePending || impl->statusDirty) return false;
+    setRewind_(*impl, GroupConsumerImpl::NoRewind{});   // #718: a rewind that outlived the close no longer counts
     for (std::size_t i = 0; i < impls_.size(); ++i) {
         if (impls_[i] == impl) {
             impls_.erase(impls_.begin() + static_cast<std::ptrdiff_t>(i));  // keeps the drive order
@@ -156,7 +166,7 @@ void GroupConsumerHub::completeRewind_(GroupConsumerImpl& impl, OpStatus st, std
     else return;
     // Cleared BEFORE delivery: a handler may issue a new rewind (applied directly on this
     // thread) — it must find none pending to supersede.
-    impl.rewind = R::NoRewind{};
+    setRewind_(impl, R::NoRewind{});
     for (auto& [tp, fs] : impl.fetch) fs.phase = GroupConsumerImpl::FetchPhase::Bound;
     Completion c;
     c.token = token;
@@ -200,7 +210,7 @@ void GroupConsumerHub::advanceRewind_(GroupConsumerImpl& impl, int64_t nowNs) {
         if (nowNs >= parked->deadlineNs) { completeRewind_(impl, OpStatus::Timeout); return; }
         if (!sessionConnected_) return;   // keep waiting
         const R::RewindAwaitSession p = *parked;
-        impl.rewind = R::NoRewind{};
+        setRewind_(impl, R::NoRewind{});
         const bool isSeek = p.kind == OpKind::Seek;
         OpStatus st{};
         std::string_view text;
@@ -251,7 +261,7 @@ void GroupConsumerHub::advanceRewind_(GroupConsumerImpl& impl, int64_t nowNs) {
     }
     if (auto* a = std::get_if<R::RewindAwaitFetch>(&impl.rewind)) {
         if (anyUnknown) return;
-        impl.rewind = R::RewindResubscribe{a->kind, a->target, a->token, a->deadlineNs, a->generation};
+        setRewind_(impl, R::RewindResubscribe{a->kind, a->target, a->token, a->deadlineNs, a->generation});
     }
     if (!anyUnknown && !anyUnbound) completeRewind_(impl, OpStatus::Ok);
 }
@@ -287,7 +297,7 @@ void GroupConsumerHub::applyRewind_(const detail::HubCommand& cmd, GroupConsumer
         // A rewind already pending is superseded (exactly once) and replaced.
         completeRewind_(*impl, OpStatus::Superseded);
         if (!impl->active) { reply(OpStatus::Closed); return; }   // its handler closed the consumer
-        impl->rewind = R::RewindAwaitSession{kind, target, token, deadlineNs, seekTp, cmd.d};
+        setRewind_(*impl, R::RewindAwaitSession{kind, target, token, deadlineNs, seekTp, cmd.d});
         return;
     }
     startRewind_(impl, kind, target, token, seekTp, cmd.d, deadlineNs);
@@ -322,11 +332,11 @@ void GroupConsumerHub::startRewind_(GroupConsumerImpl* impl, OpKind kind, const 
     };
     if (isSeek) {
         restart(seekTp, impl->assignment.find(seekTp)->second, seekOffset, /*known=*/true);
-        impl->rewind = R::RewindResubscribe{kind, target, token, deadlineNs, impl->generationId};
+        setRewind_(*impl, R::RewindResubscribe{kind, target, token, deadlineNs, impl->generationId});
     } else {
         if (impl->assignment.empty()) { reply(OpStatus::Ok); return; }
         for (auto& [tp, pos] : impl->assignment) restart(tp, pos, GroupConsumerImpl::kUnseededSentinel, /*known=*/false);
-        impl->rewind = R::RewindAwaitFetch{kind, target, token, deadlineNs, impl->generationId};
+        setRewind_(*impl, R::RewindAwaitFetch{kind, target, token, deadlineNs, impl->generationId});
     }
     // seekToCommitted: an OffsetFetch in flight may predate the rewind (its committed offsets could be older than
     // a commit already sent): its answer is ignored; the next pass sends a fresh one for the partitions whose start
@@ -351,9 +361,12 @@ static void resetOffsetFetch_(GroupConsumerImpl& impl) noexcept {
 }
 
 int GroupConsumerHub::driveRewinds(int64_t nowNs, int64_t sessionId, const SendFn& sendFn) {
+    dutyNowNs_ = nowNs;   // #743
+    if (activeRewinds_ == 0) [[likely]] return 0;   // #718: nothing outstanding - no walk over the consumers
     int n = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
+        ++rewindImplsVisited_;
         if (std::holds_alternative<GroupConsumerImpl::NoRewind>(impl->rewind)) continue;
         advanceRewind_(*impl, nowNs);   // Task 10: bound / fetched / rejoined / timed out
         ++n;
@@ -368,6 +381,7 @@ int GroupConsumerHub::driveRewinds(int64_t nowNs, int64_t sessionId, const SendF
 }
 
 int GroupConsumerHub::sweepCommitSyncTimeouts(int64_t nowNs) {
+    dutyNowNs_ = nowNs;   // #743
     int n = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
         GroupConsumerImpl* const impl = impls_[ix];
@@ -558,12 +572,14 @@ GroupConsumerHub::DispatchScope::~DispatchScope() {
 }
 
 void GroupConsumerHub::applyCommand(const detail::HubCommand& cmd, int64_t nowNs) {
+    if (nowNs != 0) dutyNowNs_ = nowNs;   // #743 (0 = the caller has no time to give: keep the last duty clock)
     // Ring path: commands are FIFO behind their GroupAdd — resolve the
     // identity against the hub's own list (never dereference an unknown one).
     applyTo_(cmd, cmd.op == detail::HubCommand::Op::GroupAdd ? nullptr : find_(cmd.handle), nowNs);
 }
 
 void GroupConsumerHub::applyCommandDirect(const detail::HubCommand& cmd, int64_t nowNs) {
+    if (nowNs != 0) dutyNowNs_ = nowNs;   // #743 (0 = the caller has no time to give: keep the last duty clock)
     // fix3 I3: direct path (duty thread, the caller's handle keeps the impl
     // alive): act on the IMPL itself, even if its GroupAdd is still queued in
     // the ring — add() honours what was done (closed => never added).
@@ -1316,6 +1332,20 @@ bool GroupConsumerHub::onFetchInvalidRequest(int64_t corrId)
     return false;
 }
 
+bool GroupConsumerHub::onFetchScopedError(int64_t subscriptionId, GroupFailReason why)
+{
+    if (subscriptionId <= 0) return false;
+    for (GroupConsumerImpl* impl : impls_) {
+        if (!impl->active) continue;
+        for (auto& [tp, fs] : impl->fetch) {
+            if (fs.epoch == 0 || fs.subscriptionId != subscriptionId) continue;
+            refuse_(*impl, why);
+            return true;
+        }
+    }
+    return false;
+}
+
 int GroupConsumerHub::revokeAll()
 {
     int n = 0;
@@ -1369,6 +1399,7 @@ bool GroupConsumerHub::onFetchSubscribeRefused(int64_t corrId, bool park, int32_
 
 int GroupConsumerHub::retryOffsetFetch(int64_t nowNs, int64_t sessionId, const SendFn& sendFn)
 {
+    dutyNowNs_ = nowNs;   // #743
     if (!routed_() || !sessionConnected_) return 0;
     int sent = 0;
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
@@ -1582,6 +1613,7 @@ int GroupConsumerHub::doWork(int64_t nowNs,
 {
     int work = 0;
     const int64_t now = nowNs;   // the duty clock, as passed by the caller
+    dutyNowNs_ = nowNs;          // #743
     if (anyJoinDeferred_) [[unlikely]] recheckDeferredJoins_();   // #440: the newer node may be gone
 
     for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)

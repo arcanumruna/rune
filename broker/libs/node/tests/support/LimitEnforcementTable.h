@@ -87,6 +87,25 @@ inline constexpr std::array kLimitRows = {
 };
 // clang-format on
 
+// ---- #712: the worker's namespace produce gates on a TRANSIENT partition (an InMemoryLog; no disk) ---------------------------
+// Every gate of a leader produce reads the log's (nsId, nsSlot) tag through one source for BOTH log kinds.  The transient row of
+// each gate: what the produce answers.  The OverDisk gate is the one exemption: a transient partition uses no disk, so a
+// namespace over its disk limit still serves it (DELETING, the size limits, the throttle and requestOps apply to both kinds).
+enum class TransientGate : uint8_t { MessageBytes, BatchBytes, Throttle, Deleting, OverDiskExempt };
+enum class TransientExpect : uint8_t { LimitExceeded52, Throttled53, UnknownTopic, Served };
+struct TransientRow {
+    TransientGate    gate;
+    TransientExpect  expect;
+    std::string_view operation;
+};
+inline constexpr std::array kTransientRows = {
+    TransientRow{TransientGate::MessageBytes,  TransientExpect::LimitExceeded52, "max-message-bytes = 1024, a 4 KiB record"},
+    TransientRow{TransientGate::BatchBytes,    TransientExpect::LimitExceeded52, "max-batch-bytes = 2048, a 4 KiB batch"},
+    TransientRow{TransientGate::Throttle,      TransientExpect::Throttled53,     "a ProduceBytes throttle deadline in the future"},
+    TransientRow{TransientGate::Deleting,      TransientExpect::UnknownTopic,    "the namespace is DELETING"},
+    TransientRow{TransientGate::OverDiskExempt, TransientExpect::Served,         "the namespace is over its disk limit: a transient partition holds no disk"},
+};
+
 [[nodiscard]] constexpr const LimitRow* rowOf(std::string_view field) noexcept {
     for (const LimitRow& r : kLimitRows) if (r.field == field) return &r;
     return nullptr;

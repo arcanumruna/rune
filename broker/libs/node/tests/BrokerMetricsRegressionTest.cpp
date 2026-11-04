@@ -5,6 +5,7 @@
 #include <metrics/MetricsFile.h>
 #include <metrics/MetricsLayout.h>
 #include <rune/node/RuneMetrics.h>
+#include <rune/node/ViewSnapshotChannel.h>
 
 #include <gtest/gtest.h>
 
@@ -120,6 +121,46 @@ TEST(BrokerMetricsRegression, OperationsDocTableMatchesRegression) {
     }
 }
 
+// #819: docs/operations.md "Restoring a backup" names every discard reason and forbids restoring the unsafe ones as
+// committed.delta.  A new ViewDiscardReason value forces a new row here.
+static_assert(static_cast<int>(rune::node::ViewDiscardReason::BelowLogStart) == 6,
+              "a new ViewDiscardReason needs a row in the docs/operations.md restore table and in this test");
+
+TEST(ViewBackupRestoreDocRegression, RestoreTableNamesEveryReasonAndForbidsLegacyRegression) {
+    const std::string docPath = std::string(RUNE_REPO_ROOT) + "/docs/operations.md";
+    std::ifstream in(docPath);
+    ASSERT_TRUE(in.good()) << "cannot open " << docPath;
+    std::vector<std::string> section;
+    std::string line;
+    bool inSection = false;
+    while (std::getline(in, line)) {
+        if (!inSection) {
+            if (line.rfind("**Restoring a backup**", 0) == 0) inSection = true;
+            else continue;
+        } else if (line.rfind("## ", 0) == 0) {
+            break;
+        }
+        section.push_back(line);
+    }
+    ASSERT_FALSE(section.empty()) << "docs/operations.md has no '**Restoring a backup**' section";
+    for (int v = 1; v <= 6; ++v) {
+        const auto reason = static_cast<rune::node::ViewDiscardReason>(v);
+        const std::string name = rune::node::viewDiscardReasonName(reason);
+        SCOPED_TRACE(name);
+        const std::string prefix = "| `" + name + "` |";
+        int rows = 0;
+        std::string row;
+        for (const std::string& l : section)
+            if (l.rfind(prefix, 0) == 0) { ++rows; row = l; }
+        ASSERT_EQ(rows, 1) << "exactly one restore-table row per reason";
+        const bool never = row.find("**Never**") != std::string::npos;
+        if (reason == rune::node::ViewDiscardReason::Unreadable)
+            EXPECT_FALSE(never) << row;
+        else
+            EXPECT_TRUE(never) << row;
+    }
+}
+
 // ===========================================================================
 // arcanum-metrics plan Task 8 (spec §5.3; D54, D55, D59, D61): every Rune metric lives in the node's metrics file,
 // allocated at start before any agent thread; a file or allocation failure refuses the start.
@@ -135,7 +176,13 @@ TEST(BrokerMetricsRegression, OperationsDocTableMatchesRegression) {
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/RuneMetricSlot.h>
+#include <rune/node/NamespacePaths.h>
 #include <rune/node/RuneMetrics.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/storage/Log.h>
+#include <rune/storage/testing/DamageSegmentForTest.h>
+
+#include "support/TestCluster.h"
 
 #include <metrics/MetricsReader.h>
 
@@ -144,6 +191,8 @@ TEST(BrokerMetricsRegression, OperationsDocTableMatchesRegression) {
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -202,6 +251,44 @@ std::int64_t headerStartEpochNs(const metrics::MetricsFile& f) {
     std::int64_t v = 0;
     std::memcpy(&v, static_cast<const std::byte*>(f.base()) + metrics::kHdrStartEpochNsOffset, sizeof(v));
     return v;
+}
+
+// #839: the halt handler of an owner (the test): records the exit code the node halted with.
+struct HaltCapture {
+    std::mutex m;
+    std::condition_variable cv;
+    int code = 0;
+    static void handler(void* ctx, int exitCode) noexcept {
+        auto* self = static_cast<HaltCapture*>(ctx);
+        { std::lock_guard<std::mutex> g(self->m); self->code = exitCode; }
+        self->cv.notify_all();
+    }
+    int await(std::chrono::milliseconds cap) {
+        std::unique_lock<std::mutex> l(m);
+        cv.wait_for(l, cap, [this] { return code != 0; });
+        return code;
+    }
+};
+
+// #839: writes >= 3 segments (cleanly closed: the recovery point reaches the log end, so the sealed ones recover KEEPING
+// damage) into `logDir` with a standalone Log, then flips a byte inside the 2nd batch of segment 0.  The log's content is
+// not a valid system-log format - the refusal must fire before any loader reads it.
+void writeDamagedSealedLog(const fs::path& logDir, int64_t roll) {
+    fs::create_directories(logDir);
+    {
+        rune::storage::Log raw(logDir.string(), roll);
+        raw.recover();
+        raw.setEpochHistoryCap(INT64_MAX);
+        raw.setDeferSealSync(false);
+        for (int64_t v = 0; raw.segmentBaseOffsets().size() < 3 && v < 10'000; ++v) {
+            rune::protocol::RecordBatchBuilder b(raw.logEndOffset(), 1000);
+            b.append(std::string_view("k"), std::string_view("value-" + std::to_string(v)), 1000);
+            const auto batch = b.build();
+            raw.append(batch, raw.logEndOffset());
+        }
+        raw.sync();
+    }
+    ASSERT_GE(rune::storage::testing::damageSecondBatchOfSegment(logDir.string(), 0), 0);
 }
 
 std::string startError(NodeConfig cfg) {
@@ -365,17 +452,118 @@ TEST(BrokerMetricsRegression, StartRefusedWhenFileTooSmallRegression) {
     EXPECT_FALSE(fs::exists(cfg.effectiveMetricsFile())) << "no file is left behind";
 }
 
-// The 10th allocation (row 9, rune-catalog-apply-halted) returning Full refuses the start and names that metric.
+// A refused start inside createMetrics_ leaves NO file behind, wherever it stops: the first row, the 10th
+// (rune-catalog-apply-halted) and the last.  A half-allocated file with a Role row would make rune_role print
+// ROLE ... role=NONE with exit 0 for a process that never started (#631).
+// RED (the unlink dropped from discardMetricsFile_): the file exists.
 TEST(BrokerMetricsRegression, StartRefusedOnAllocFailureRegression) {
-    MetricsTempDir tmp{"alloc_"};
+    using rune::node::kRuneMetrics;
+    for (const std::int32_t row : {0, 9, static_cast<std::int32_t>(kRuneMetrics.size()) - 1}) {
+        SCOPED_TRACE("failAllocAt=" + std::to_string(row));
+        MetricsTempDir tmp{"alloc_"};
+        NodeConfig cfg = singleNode(tmp.path);
+        cfg.metricsFailAllocAtForTest = row;
+        const auto& def = kRuneMetrics[static_cast<std::size_t>(row)];
+        const std::string err = startError(cfg);
+        EXPECT_NE(err.find(std::string{"metrics allocation failed for "} + std::string{def.labelPrefix} + " (type " +
+                           std::to_string(static_cast<std::int32_t>(def.id)) + "): Full"),
+                  std::string::npos)
+            << err;
+        EXPECT_FALSE(fs::exists(fs::path{cfg.effectiveAeronDir()} / "cnc.dat")) << "the driver never started";
+        EXPECT_FALSE(fs::exists(cfg.effectiveMetricsFile())) << "no half-allocated file is left behind";
+    }
+}
+
+// A previous run's file at the same path is replaced by create() and then discarded with the refused start: a stale
+// role file of a dead process is not left behind.
+TEST(BrokerMetricsRegression, StartRefusedOnAllocFailureRemovesAPreviousRunsFileRegression) {
+    MetricsTempDir tmp{"alloc_prev_"};
     NodeConfig cfg = singleNode(tmp.path);
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(5s));
+        node.stop();
+    }
+    ASSERT_TRUE(fs::exists(cfg.effectiveMetricsFile())) << "the good run left its file";
     cfg.metricsFailAllocAtForTest = 9;
     const std::string err = startError(cfg);
-    EXPECT_NE(err.find("metrics allocation failed for rune-catalog-apply-halted (type 1000217): Full"),
-              std::string::npos)
-        << err;
-    EXPECT_FALSE(fs::exists(fs::path{cfg.effectiveAeronDir()} / "cnc.dat")) << "the driver never started";
+    EXPECT_NE(err.find("metrics allocation failed for"), std::string::npos) << err;
+    EXPECT_FALSE(fs::exists(cfg.effectiveMetricsFile())) << "the refused start leaves no file, not even the old one";
 }
+
+// #631 review: a refusal inside createMetrics_ detaches the writer and drops its free stack along with the unmapped
+// file, so a later allocate / write can never touch the unmapped mapping.
+// RED (the writer reset and the free-stack clear dropped from discardMetricsFile_): the writer still holds its rows.
+TEST(BrokerMetricsRegression, DiscardDetachesTheMetricsWriterRegression) {
+    MetricsTempDir tmp{"detach_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    cfg.metricsFailAllocAtForTest = 9;
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_EQ(node.metricsWriterAllocatedForTest(), 0) << "the writer still counts rows of the unmapped file";
+    EXPECT_EQ(node.metricsFreeStackSizeForTest(), 0u) << "the free stack still names slots of the unmapped file";
+}
+
+// L10 (#631): a start that fails AFTER createMetrics_ returned leaves the complete, valid file (every row allocated,
+// the observer's NONE / -1 values): only a refusal inside createMetrics_ removes it.  The later failure here is a
+// per-worker replication peer with a different worker count.
+TEST(BrokerMetricsRegression, LaterStartFailureLeavesACompleteFileRegression) {
+    MetricsTempDir tmp{"later_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    cfg.perWorkerReplication = true;   // an asymmetric peer worker count refuses the start, after createMetrics_
+    PeerConfig other;
+    other.id            = 1;
+    other.host          = "127.0.0.1";
+    other.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();
+    other.workerCount   = cfg.workerCount + 1;
+    cfg.peers.push_back(other);
+    const std::string err = startError(cfg);
+    ASSERT_FALSE(err.empty()) << "the start must fail after the metrics file was created";
+    ASSERT_TRUE(fs::exists(cfg.effectiveMetricsFile())) << err;
+    for (const auto& def : kRuneMetrics) {
+        const auto live = rune::node::test::readRuneMetricLiveAt(cfg.effectiveMetricsFile(),
+                                                                 static_cast<std::int32_t>(def.id), cfg.nodeId);
+        EXPECT_TRUE(live.has_value()) << "row " << def.labelPrefix << " missing from the kept file: " << err;
+    }
+}
+
+#if defined(__linux__)
+// #632: the process metrics (fd walk of /proc/self/fd, linear in open fds) are sampled by the ADMIN agent, never the
+// control thread.  The row moves with the process's fds AND the admin agent counts its samples.
+// RED (the sample moved back into the control loop): the row still moves, but the admin agent took 0 samples.
+TEST(BrokerMetricsRegression, SystemMetricsSampleOnTheAdminAgentRegression) {
+    MetricsTempDir tmp{"sysadmin_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    cfg.metricsSystemIntervalMs = 1;
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(5s));
+    constexpr std::int32_t kOpenFds = 1000301;   // process_open_fds
+    const auto readFds = [&]() -> std::int64_t {
+        const auto v = rune::node::test::readRuneMetricAt(node.metricsFilePath(), kOpenFds, cfg.nodeId);
+        return v.value_or(-1);
+    };
+    const auto await = [&](auto&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (pred()) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return pred();
+    };
+    ASSERT_TRUE(await([&] { return readFds() > 0; })) << "the first sample lands";
+    const std::int64_t baseline = readFds();
+    std::vector<int> fds;
+    for (int i = 0; i < 64; ++i) fds.push_back(::dup(0));
+    const bool moved = await([&] { return readFds() >= baseline + 64; });
+    for (const int fd : fds) if (fd >= 0) ::close(fd);
+    EXPECT_TRUE(moved) << "process_open_fds follows 64 new fds (baseline " << baseline << ")";
+    EXPECT_TRUE(await([&] { return node.adminSystemMetricsSamplesForTest() >= 2; }))
+        << "the admin agent took the samples: " << node.adminSystemMetricsSamplesForTest();
+    node.stop();
+}
+#endif  // __linux__
 
 // stop + start recreates the file: a new startEpochNs, a reader on the old mapping sees sameInstanceAs() == false,
 // and the values restart from the node's recovered state.
@@ -404,6 +592,94 @@ TEST(BrokerMetricsRegression, RestartRecreatesFileRegression) {
     EXPECT_TRUE(awaitMetric(node, RuneMetric::CatalogApplyHalted, 0));
     EXPECT_TRUE(awaitMetric(node, RuneMetric::AuthMode, 0));
     node.stop();
+}
+
+// #839: a sealed segment damaged on disk is counted by the boot gauge (summed over every log the node serves), and the
+// node still starts.  RED (the sum skipped): the gauge reads 0.
+TEST(BrokerMetricsRegression, DamagedSegmentsGaugeCountsBootDamageRegression) {
+    MetricsTempDir tmp{"damaged_"};
+    NodeConfig cfg = singleNode(tmp.path);
+    rune::node::TopicSpec ts;
+    ts.name              = "t";
+    ts.partitionCount    = 1;
+    ts.topicId           = 0;
+    ts.segmentRollBytes  = 2048;
+    ASSERT_NO_FATAL_FAILURE(rune::node::test::defineTopicsThenStop(cfg, {ts}));
+
+    const fs::path partDir = rune::node::topicsRoot(tmp.path, 0) / ts.name / "0";
+    {   // node stopped: a standalone Log writes the partition (single writer)
+        rune::storage::Log raw(partDir.string(), ts.segmentRollBytes);
+        raw.recover();
+        raw.setEpochHistoryCap(INT64_MAX);   // the node's epoch-history guard holds R until its owner lifts it
+        raw.setDeferSealSync(false);   // inline seals: the recovery point is persisted per roll
+        for (int64_t v = 0; raw.segmentBaseOffsets().size() < 3 && v < 10'000; ++v) {
+            rune::protocol::RecordBatchBuilder b(raw.logEndOffset(), 1000);
+            b.append(std::string_view("k"), std::string_view("value-" + std::to_string(v)), 1000);
+            const auto batch = b.build();
+            raw.append(batch, raw.logEndOffset());
+        }
+        raw.append(rune::protocol::RecordBatchBuilder(raw.logEndOffset(), 1000).build(), raw.logEndOffset());
+        raw.sync();
+        ASSERT_GE(raw.segmentBaseOffsets().size(), 3u);
+    }
+    // Damage the first record byte of the 2nd batch of segment 0.
+    fs::path seg0;
+    for (const auto& e : fs::directory_iterator(partDir))
+        if (e.path().extension() == ".log" && (seg0.empty() || e.path() < seg0)) seg0 = e.path();
+    ASSERT_FALSE(seg0.empty());
+    {
+        std::ifstream in(seg0, std::ios::binary);
+        std::vector<uint8_t> buf((std::istreambuf_iterator<char>(in)), {});
+        in.close();
+        rune::protocol::RecordBatchReader first(buf.data(), buf.size());
+        const std::size_t second = static_cast<std::size_t>(first.totalLength());
+        ASSERT_LT(second + rune::protocol::batch::kRecordBatchOverhead, buf.size());
+        std::fstream f(seg0, std::ios::in | std::ios::out | std::ios::binary);
+        const std::size_t at = second + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+        char c = static_cast<char>(buf[at] ^ 0x5A);
+        f.seekp(static_cast<std::streamoff>(at));
+        f.write(&c, 1);
+    }
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10s));
+    EXPECT_EQ(node.bootDamagedSegmentsForTest(), 1);
+    EXPECT_TRUE(awaitMetric(node, RuneMetric::DamagedSegments, 1));
+    node.stop();
+}
+
+
+// #839 (F2): a damaged sealed segment in a SYSTEM log (their loaders replay state from the log and must never load around a
+// hole) refuses the start: critical line, halt path (exit 74), nothing served.  One leg per system log.  The logs are
+// written by a standalone Log before the first boot; the refusal fires right after each log is recovered, before its first
+// reader, so the content need not be a valid system-log format.
+TEST(BrokerMetricsRegression, DamagedSystemLogRefusesStartRegression) {
+    for (const char* leg : {"__consumer_offsets", "__transaction_state", "__cluster_metadata", "__catalog", "__security"}) {
+        SCOPED_TRACE(leg);
+        MetricsTempDir tmp{std::string("sysdmg_")};
+        NodeConfig cfg = singleNode(tmp.path);
+        cfg.offsetLogSegmentRollBytes = 2048;
+        {   // a first boot writes node-state.dat / term.log (a data dir without them is refused as partly deleted)
+            BrokerNode first{cfg};
+            first.start();
+            ASSERT_TRUE(first.awaitLeader(10s));
+            first.stop();
+        }
+        fs::remove_all(tmp.path / leg);   // replaced by a standalone Log's damaged multi-segment log
+        ASSERT_NO_FATAL_FAILURE(writeDamagedSealedLog(tmp.path / leg, 2048));
+        BrokerNode node{cfg};
+        HaltCapture halt;
+        node.setHaltHandler(&HaltCapture::handler, &halt);
+        try {
+            node.start();
+            ADD_FAILURE() << "a damaged system log never serves";
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("damaged segment"), std::string::npos) << e.what();
+        }
+        EXPECT_EQ(halt.await(1000ms), BrokerNode::kExitStorageFailure) << "through the halt path (exit 74)";
+        EXPECT_EQ(node.bootDamagedSegmentsForTest(), 1) << "the boot gauge counts the damage before the refusal";
+        node.stop();
+    }
 }
 
 #endif  // RUNE_BROKER_METRICS_NODE_TESTS

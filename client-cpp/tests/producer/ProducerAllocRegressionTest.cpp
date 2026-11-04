@@ -411,6 +411,14 @@ struct TxnAllocRig {
             q.corrId     = h->correlationId;
             q.templateId = h->templateId;
             q.nParts     = 0;
+            if (h->templateId == rpc::TxnOffsetCommit::TEMPLATE_ID) {   // #737/#738: the answer names every entry asked
+                if (const auto m = rpc::TxnOffsetCommit::decode(b, n)) {
+                    for (const auto& e : m->entries) {
+                        if (q.nParts == q.parts.size()) break;
+                        q.parts[q.nParts++] = {e.topicId, e.partition, 0};
+                    }
+                }
+            }
             if (h->templateId == rpc::AddPartitionsToTxn::TEMPLATE_ID) {   // #698: the answer names every partition asked
                 if (const auto m = rpc::AddPartitionsToTxn::decode(b, n)) {
                     for (std::size_t i = 0; i < m->partitions.size() && q.nParts < q.parts.size(); ++i) {
@@ -461,7 +469,14 @@ struct TxnAllocRig {
             case rpc::EndTxn::TEMPLATE_ID:             kind = rp::ReqKind::EndTxn; break;
             default: break;
             }
-            const auto a = kind == rp::ReqKind::AddPartitions
+            test_support::AnswerFrame a;
+            if (kind == rp::ReqKind::TxnOffsetCommit) {
+                rpc::TxnOffsetCommitResponse m;
+                m.correlationId = reqs[i].corrId;
+                a.len        = m.encode(a.buf.data(), std::span<const rpc::TxnPartitionResult>(reqs[i].parts.data(), reqs[i].nParts));
+                a.templateId = rpc::TxnOffsetCommitResponse::TEMPLATE_ID;
+            } else
+            a = kind == rp::ReqKind::AddPartitions
                 ? test_support::FakeCoordinator::answerNaming(
                       reqs[i].corrId, 0, std::span<const rpc::TxnPartitionResult>(reqs[i].parts.data(), reqs[i].nParts))
                 : test_support::FakeCoordinator::answer(kind, reqs[i].corrId, 0);

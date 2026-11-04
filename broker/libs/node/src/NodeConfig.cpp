@@ -53,6 +53,9 @@ static bool parseInt32(std::string_view sv, int32_t& out) {
 }
 
 /// Parse a positive int64_t from sv using from_chars. Returns false on failure.
+/// #837: strtoll skips leading whitespace and accepts a sign; the knobs that call it take a plain decimal number.
+static bool isDigitFirst(const char* s) noexcept { return s != nullptr && *s >= '0' && *s <= '9'; }
+
 static bool parseInt64Positive(std::string_view sv, int64_t& out) {
     sv = trim(sv);
     if (sv.empty()) return false;
@@ -910,11 +913,13 @@ ConfigResult parseNodeConfig(
 
         // Controlled shutdown budget (0 = no hand-off).
         if (const char* raw = getenv_fn("RUNE_CONTROLLED_SHUTDOWN_MS"); raw && !std::string_view(raw).empty()) {
-            int64_t v = 0;
-            if (std::string_view(raw) == "0") v = 0;
-            else if (!parseInt64Positive(raw, v))
-                return {{}, std::string("RUNE_CONTROLLED_SHUTDOWN_MS must be a non-negative integer (ms), got: ") + raw};
-            cfg.controlledShutdownMs = v;
+            char* end = nullptr;
+            errno = 0;
+            const long long v = std::strtoll(raw, &end, 10);
+            if (end == raw || !isDigitFirst(raw) || *end != '\0' || errno == ERANGE || v < 0 || v > NodeConfig::kMaxDurationMs)
+                return {{}, std::string("RUNE_CONTROLLED_SHUTDOWN_MS must be an integer in [0, ") +
+                                std::to_string(NodeConfig::kMaxDurationMs) + "] ms (0 = no hand-off), got '" + raw + "'"};
+            cfg.controlledShutdownMs = static_cast<int64_t>(v);
         }
     }
 
@@ -990,6 +995,10 @@ ConfigResult parseNodeConfig(
                 (isFeatureBits && parsed > UINT32_MAX))
                 return {{}, std::string(kNsDefaultVars[i]) + " must be a non-negative integer" +
                                 (isFeatureBits ? " that fits 32 bits" : "") + ", got: " + v};
+            if (std::string_view(kNsDefaultVars[i]) == "RUNE_NS_DEFAULT_MAX_TXN_TIME_MS" &&
+                parsed > static_cast<uint64_t>(NodeConfig::kMaxDurationMs))
+                return {{}, std::string("RUNE_NS_DEFAULT_MAX_TXN_TIME_MS must be an integer in [0, ") +
+                                std::to_string(NodeConfig::kMaxDurationMs) + "] ms (0 = unlimited), got: " + v};
             if (isFeatureBits) rune::protocol::detail::putLimitU32(enc + 28 * 8, static_cast<uint32_t>(parsed));
             else               rune::protocol::detail::putLimitU64(enc + 8 * i, parsed);
         }
@@ -1197,11 +1206,24 @@ ConfigResult parseNodeConfig(
         cfg.cleanerIoMaxBytesPerSecond = v;
     }
 
+    // --- RUNE_CLEANER_DEDUPE_BUFFER_BYTES (optional; absent/empty = 128 MiB; 1 MiB .. 4 GiB) --- #658
+    if (const char* raw = getenv_fn("RUNE_CLEANER_DEDUPE_BUFFER_BYTES"); raw && *raw) {
+        int64_t v = 0;
+        if (!parseInt64Positive(raw, v) || v < NodeConfig::kMinCleanerDedupeBufferBytes ||
+            v > NodeConfig::kMaxCleanerDedupeBufferBytes)
+            return {{}, std::string("RUNE_CLEANER_DEDUPE_BUFFER_BYTES must be an integer in [1048576, 4294967296] (bytes), got: ") + raw};
+        cfg.cleanerDedupeBufferBytes = v;
+    }
+
     // --- RUNE_PRODUCER_ID_EXPIRATION_MS (optional, >= 0) — PSM fix round 1 (I1). ---
     if (const char* raw = getenv_fn("RUNE_PRODUCER_ID_EXPIRATION_MS"); raw && *raw) {
         char* end = nullptr;
+        errno = 0;
         const long long v = std::strtoll(raw, &end, 10);
-        if (end != raw && v >= 0) cfg.producerIdExpirationMs = static_cast<int64_t>(v);
+        if (end == raw || !isDigitFirst(raw) || *end != '\0' || errno == ERANGE || v < 0 || v > NodeConfig::kMaxDurationMs)
+            return {{}, std::string("RUNE_PRODUCER_ID_EXPIRATION_MS must be an integer in [0, ") +
+                            std::to_string(NodeConfig::kMaxDurationMs) + "] ms, got '" + raw + "'"};
+        cfg.producerIdExpirationMs = static_cast<int64_t>(v);
     }
 
     // --- hotpath-A F2: RUNE_SEGMENT_PROVISION_DEPTH / RUNE_SEGMENT_PROVISIONER_MAX_PARK_US ---
@@ -1227,8 +1249,12 @@ ConfigResult parseNodeConfig(
     }
     if (const char* raw = getenv_fn("RUNE_SEGMENT_PROVISIONER_MAX_PARK_US"); raw && *raw) {
         char* end = nullptr;
+        errno = 0;
         const long long v = std::strtoll(raw, &end, 10);
-        if (end != raw && v >= 1) cfg.segmentProvisionerMaxParkUs = static_cast<int64_t>(v);
+        if (end == raw || !isDigitFirst(raw) || *end != '\0' || errno == ERANGE || v < 1 || v > 1'000'000)
+            return {{}, std::string("RUNE_SEGMENT_PROVISIONER_MAX_PARK_US must be an integer in [1, 1000000] us, got '") +
+                            raw + "'"};
+        cfg.segmentProvisionerMaxParkUs = static_cast<int64_t>(v);
     }
 
     // --- RUNE_WORKERS (optional) — Milestone E1: in-process partition worker count (floor 1). ---
@@ -1523,7 +1549,7 @@ ConfigResult parseNodeConfig(
         char* end = nullptr;
         errno = 0;
         const long long v = std::strtoll(raw, &end, 10);
-        if (end == raw || *end != '\0' || errno == ERANGE || v < 1 || v > kMaxHeldIdleMsCap)
+        if (end == raw || !isDigitFirst(raw) || *end != '\0' || errno == ERANGE || v < 1 || v > kMaxHeldIdleMsCap)
             return {{}, std::string("RUNE_MAX_HELD_IDLE_MS must be an integer in [1, 86400000] (ms), got '") + raw + "'"};
         cfg.maxHeldIdleMs = v;
     }
@@ -1533,7 +1559,7 @@ ConfigResult parseNodeConfig(
         char* end = nullptr;
         errno = 0;
         const long long v = std::strtoll(raw, &end, 10);
-        if (end == raw || *end != '\0' || errno == ERANGE || v < 1 ||
+        if (end == raw || !isDigitFirst(raw) || *end != '\0' || errno == ERANGE || v < 1 ||
             v > static_cast<long long>(NodeConfig::kMaxGatewayProduceCredits))
             return {{}, std::string("RUNE_GATEWAY_PRODUCE_CREDITS must be an integer in [1, ") +
                             std::to_string(NodeConfig::kMaxGatewayProduceCredits) + "], got '" + raw + "'"};
@@ -1546,8 +1572,12 @@ ConfigResult parseNodeConfig(
     if (const char* fiv = getenv_fn("RUNE_FETCH_INTERVAL_US")) {
         if (fiv && !std::string_view(fiv).empty()) {
             char* end = nullptr;
-            long long us = std::strtoll(fiv, &end, 10);
-            if (end != fiv && us > 0) cfg.fetchIntervalNs = us * 1000LL;
+            errno = 0;
+            const long long us = std::strtoll(fiv, &end, 10);
+            if (end == fiv || !isDigitFirst(fiv) || *end != '\0' || errno == ERANGE || us < 1 || us > NodeConfig::kMaxDurationMs * 1000LL)
+                return {{}, std::string("RUNE_FETCH_INTERVAL_US must be an integer in [1, ") +
+                                std::to_string(NodeConfig::kMaxDurationMs * 1000LL) + "] us, got '" + fiv + "'"};
+            cfg.fetchIntervalNs = us * 1000LL;
         }
     }
 

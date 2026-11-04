@@ -79,6 +79,12 @@ void TransactionCoordinator::adoptRecovered_(TransactionMetadata& m) noexcept
         m.pendingNewProducerId    = -1;
         m.pendingNewProducerEpoch = -1;
     }
+    // #837: a stored timeout outside the range InitProducerId admits (a damaged or hand-written record) is clamped:
+    // a negative one would abort the transaction at once, and wraps to a huge value in the namespace-cap compare.
+    if (m.state == TxnState::Ongoing) {
+        if (m.txnTimeoutMs < kMinTxnTimeoutMs) m.txnTimeoutMs = kMinTxnTimeoutMs;
+        else if (m.txnTimeoutMs > kMaxTxnTimeoutMs) m.txnTimeoutMs = kMaxTxnTimeoutMs;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -559,7 +565,12 @@ int TransactionCoordinator::doWork(int64_t nowNs)
         if (!nsTxnLimits_.empty()) {
             if (const auto it = nsTxnLimits_.find(rune::coordination::parseScopedId(id).nsId);
                 it != nsTxnLimits_.end() && it->second.maxTxnTimeMs != 0)
-                timeoutNs = std::min<int64_t>(timeoutNs, static_cast<int64_t>(it->second.maxTxnTimeMs) * 1'000'000LL);
+            {
+                // Compare in ms: a stored value above ~9.2e12 would overflow the ns product (A1, #837). The
+                // invariant meta.txnTimeoutMs <= kMaxTxnTimeoutMs (900'000) keeps the product below 9e14.
+                const uint64_t cap = it->second.maxTxnTimeMs;
+                if (cap < static_cast<uint64_t>(meta.txnTimeoutMs)) timeoutNs = static_cast<int64_t>(cap) * 1'000'000LL;
+            }
         }
         if (nowNs - meta.txnStartNs > timeoutNs) {
             beginInternalAbort_(meta);

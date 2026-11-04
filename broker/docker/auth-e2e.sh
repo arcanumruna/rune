@@ -285,7 +285,7 @@ log "Step 3 OK: ws1 holds the four grants via role:world_server"
 log "Step 4a: ws1 produces ${RECORDS} records to world_zone1 through rune-3 and consumes them in group world-1..."
 t0=$(now_ms)
 ws_run ws-main 3 ws1 /work/ws1.pw RUNE_WS_ROLE=both RUNE_GROUP_ID=world-1 RUNE_PRODUCE_N="${RECORDS}" RUNE_QUIET=1 \
-    RUNE_PRODUCE_TOPIC=world_zone1 RUNE_CONSUME_TOPIC=world_zone1
+    RUNE_PRODUCE_TOPIC=world_zone1 RUNE_VALUE_FORMAT=typed RUNE_CONSUME_TOPIC=world_zone1
 [ "${WS_RC}" -eq 0 ] || { echo "${WS_OUT}" | tail -40 >&2; fail "step 4a: the world-server client exited ${WS_RC} (want 0)"; }
 echo "${WS_OUT}" | grep -q "WS-PRODUCER: acked=${RECORDS} failed=0" || { echo "${WS_OUT}" | tail -20 >&2; fail "step 4a: not all ${RECORDS} records were acked"; }
 echo "${WS_OUT}" | grep -q "WS-CONSUMER: distinct=${RECORDS} " || { echo "${WS_OUT}" | tail -20 >&2; fail "step 4a: not every record was consumed in group world-1"; }
@@ -298,7 +298,7 @@ echo "${WS_OUT}" | grep -q "NotAuthorized" || { echo "${WS_OUT}" | tail -20 >&2;
 
 log "Step 4c: a client with a wrong password -> exit 1 AuthenticationFailed..."
 ( umask 077; printf 'not-the-password-of-ws1-0000\n' > "${WORK_DIR}/wrong.pw" )
-ws_run ws-wrongpw 3 ws1 /work/wrong.pw RUNE_WS_ROLE=produce RUNE_PRODUCE_TOPIC=world_zone1 RUNE_PRODUCE_N=5
+ws_run ws-wrongpw 3 ws1 /work/wrong.pw RUNE_WS_ROLE=produce RUNE_PRODUCE_TOPIC=world_zone1 RUNE_VALUE_FORMAT=typed RUNE_PRODUCE_N=5
 [ "${WS_RC}" -eq 1 ] || { echo "${WS_OUT}" | tail -20 >&2; fail "step 4c: the wrong password exited ${WS_RC} (want 1)"; }
 echo "${WS_OUT}" | grep -q "AuthenticationFailed" || { echo "${WS_OUT}" | tail -20 >&2; fail "step 4c: the refusal does not name AuthenticationFailed"; }
 log "Step 4 OK: produce+consume 0; player_events 1 NotAuthorized; wrong password 1 AuthenticationFailed"
@@ -327,7 +327,7 @@ log "Step 5a OK: the consumer ended ${ended_in} ms after the REVOKE: subscriptio
 
 log "Step 5b: restore READ; a live producer; REVOKE WRITE -> its next send fails NotAuthorized..."
 admin_ql -e "GRANT READ ON TOPIC PREFIX 'world_' TO ROLE world_server;" --broker "rune-1:${BROKER_PORT}" || fail "step 5b: re-GRANT READ failed"
-ws_start live-producer 2 ws1 /work/ws1.pw RUNE_WS_ROLE=produce RUNE_PRODUCE_TOPIC=world_zone1 RUNE_PRODUCE_N=0 \
+ws_start live-producer 2 ws1 /work/ws1.pw RUNE_WS_ROLE=produce RUNE_PRODUCE_TOPIC=world_zone1 RUNE_VALUE_FORMAT=typed RUNE_PRODUCE_N=0 \
     RUNE_PRODUCE_INTERVAL_US=20000 RUNE_STOP_FILE=/work/live-producer.stop
 wait_until "${READY_WAIT_S}" "the live producer READY" bg_ready live-producer \
     || { bg_out live-producer >&2; fail "step 5b: the live producer never became ready"; }

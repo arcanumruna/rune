@@ -84,8 +84,10 @@ std::vector<uint8_t> offsetFetchResponse(int32_t partition, int64_t offset) {
 
 struct Sink {
     std::vector<std::vector<uint8_t>> frames;
-    SendFn fn() {
-        return [this](int32_t, const uint8_t* b, std::size_t n) -> bool {
+    SendFn fn() { return SendFn{&Sink::thunk, this}; }
+    static bool thunk(void* ctx, int32_t, const uint8_t* b, std::size_t n) { return static_cast<Sink*>(ctx)->capture(b, n); }
+    bool capture(const uint8_t* b, std::size_t n) {
+        {
             if (auto of = rpc::OffsetFetch::decode(b, n)) g_lastOffsetFetchCorr = of->correlationId;
             if (n >= 4) {
                 const auto tid = static_cast<uint16_t>(b[2] | (b[3] << 8));
@@ -97,7 +99,7 @@ struct Sink {
             }
             frames.emplace_back(b, b + n);
             return true;
-        };
+        }
     }
     [[nodiscard]] std::vector<std::vector<uint8_t>> ofTemplate(rpc::TemplateId t) const {
         std::vector<std::vector<uint8_t>> v;

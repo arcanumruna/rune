@@ -133,6 +133,7 @@ public:
     ///          GroupCoordinationService::doWork): on a cold cluster restart the
     ///          HW is briefly gated at 0 while the ISR re-expands, and a one-shot
     ///          rebuild here would silently recover no committed offsets.
+    ///          Also false (index left empty) when the scan reaches a DAMAGED log segment (#839): never loaded around a hole.
     bool rebuildFromLog();
 
     /// Namespaces Phase 2 Task 6b (D20): writes at most `batch` TOMBSTONES (the record key of the offset, an empty
@@ -169,6 +170,7 @@ private:
     // -----------------------------------------------------------------------
     using TpMap = std::unordered_map<TopicPartition, CommittedOffset>;
     std::unordered_map<std::string, TpMap> index_;
+    bool damageReported_ = false;   ///< #839: the damaged-log critical line is logged once (the retry is every duty cycle)
 
     rune::replication::PartitionReplica* replica_;  ///< non-owning
 

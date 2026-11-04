@@ -19,6 +19,8 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <vector>
@@ -524,4 +526,131 @@ TEST(FollowerRollBackPressureRegression, FollowerStopsFetchingDataWhileRollDefer
         drive(10);
     }
     EXPECT_EQ(follower->logEndOffset(), leader->logEndOffset());
+}
+
+
+// ===========================================================================
+// #839: a sealed segment of the LEADER's log is stored damaged (kept, flagged, reads at it Corrupt).  A follower fetch
+// that reaches the damage is answered kErrCorruptRecord (-12): never ISR liveness, never retried at that offset; the
+// follower wedges there.  Everything outside the damaged range is still served.  The leader repairs nothing.
+// ===========================================================================
+namespace {
+constexpr int64_t kCorruptRoll = 2048;
+
+class CorruptBatchReplicationRegression : public ::testing::Test {
+protected:
+    TempDir            leaderDir{"c_leader"}, followerDir{"c_follower"};
+    std::unique_ptr<rune::storage::Log> leaderLog, followerLog;
+    CapturingTransport transport;
+    std::unique_ptr<PartitionReplica> leader, follower;
+    int64_t              clock = 0;
+    int64_t              D = -1;                 // first offset of segment 0's 2nd batch (the damage)
+    std::vector<int64_t> bases;
+    std::vector<uint8_t> scratch = std::vector<uint8_t>(64 * 1024);   // the worker's pread scratch (the production read path)
+
+    void buildDamagedLeader() {
+        {
+            auto log = std::make_unique<rune::storage::Log>(leaderDir.path, kCorruptRoll);
+            log->recover();
+            log->setDeferSealSync(false);        // inline seals: the recovery point is persisted per roll
+            log->setEpochHistoryCap(std::numeric_limits<int64_t>::max());
+            const std::vector<NodeId> solo{kLeaderId};
+            PartitionReplica l(makeCfg(kLeaderId, false), Role::Leader, 1, solo, solo, log.get(), &transport);
+            const std::vector<uint8_t> small(kSmallValue, 0x51);
+            for (int i = 0; i < 400 && log->segmentBaseOffsets().size() < 4; ++i) ASSERT_GE(l.append(small), 0);
+            ASSERT_GE(l.append(small), 0);
+            log->sync();
+            ASSERT_GE(log->segmentBaseOffsets().size(), 4u);
+        }   // clean shutdown: the recovery point = LEO
+        std::string seg0;
+        for (const auto& e : std::filesystem::directory_iterator(leaderDir.path))
+            if (e.path().extension() == ".log" && (seg0.empty() || e.path().string() < seg0)) seg0 = e.path().string();
+        ASSERT_FALSE(seg0.empty());
+        std::vector<uint8_t> buf;
+        {
+            std::ifstream in(seg0, std::ios::binary);
+            buf.assign(std::istreambuf_iterator<char>(in), {});
+        }
+        rune::protocol::RecordBatchReader first(buf.data(), buf.size());
+        const std::size_t second = static_cast<std::size_t>(first.totalLength());
+        const std::size_t at = second + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+        ASSERT_LT(at, buf.size());
+        D = rune::protocol::RecordBatchReader(buf.data() + second, buf.size() - second).baseOffset();
+        {
+            std::fstream f(seg0, std::ios::in | std::ios::out | std::ios::binary);
+            const char c = static_cast<char>(buf[at] ^ 0x5A);
+            f.seekp(static_cast<std::streamoff>(at));
+            f.write(&c, 1);
+        }
+        leaderLog = std::make_unique<rune::storage::Log>(leaderDir.path, kCorruptRoll);
+        leaderLog->recover();
+        ASSERT_EQ(leaderLog->damagedSegmentCount(), 1u);
+        bases = leaderLog->segmentBaseOffsets();
+        followerLog = std::make_unique<rune::storage::Log>(followerDir.path);
+        const std::vector<NodeId> replicas{kLeaderId, kFollowerId};
+        leader = std::make_unique<PartitionReplica>(lagCfg(kLeaderId, 1), Role::Leader, 1, replicas, replicas,
+                                                    leaderLog.get(), &transport);
+        leader->setReadScratch(scratch.data(), scratch.size());
+        follower = std::make_unique<PartitionReplica>(lagCfg(kFollowerId, 1), Role::Follower, 1, replicas, replicas,
+                                                      followerLog.get(), &transport);
+        follower->becomeFollower(1, kLeaderId);
+        transport.setLeader(leader.get());
+        transport.addFollower(kFollowerId, follower.get());
+    }
+};
+} // namespace
+
+TEST_F(CorruptBatchReplicationRegression, LeaderAnswersCorruptRecordAtTheDamageRegression) {
+    ASSERT_NO_FATAL_FAILURE(buildDamagedLeader());
+    ASSERT_EQ(leader->onFetchRequest(fetchReq(D, 1), ++clock), kErrCorruptRecord);
+    EXPECT_NE(std::find(transport.fetchErrors.begin(), transport.fetchErrors.end(), kErrCorruptRecord),
+              transport.fetchErrors.end()) << "the follower must be TOLD (kErrCorruptRecord)";
+    EXPECT_EQ(leader->corruptReadsServed(), 1u);
+}
+
+TEST_F(CorruptBatchReplicationRegression, FollowerWedgesOnCorruptRecordRegression) {
+    ASSERT_NO_FATAL_FAILURE(buildDamagedLeader());
+    FetchResponseMsg corrupt{};
+    corrupt.leaderEpoch = 1;
+    corrupt.partition   = 0;
+    corrupt.errorCode   = kErrCorruptRecord;
+    follower->applyReplicated(corrupt);
+    EXPECT_EQ(follower->wedgedAtOffset(), 0);
+    EXPECT_EQ(follower->wedgedRefusals(), 1u);
+    // A stale-epoch answer (a deposed leader) never wedges.
+    follower->becomeFollower(2, kLeaderId);   // clears the wedge
+    ASSERT_EQ(follower->wedgedAtOffset(), -1);
+    corrupt.leaderEpoch = 1;
+    follower->applyReplicated(corrupt);
+    EXPECT_EQ(follower->wedgedAtOffset(), -1);
+    EXPECT_EQ(follower->wedgedRefusals(), 1u);
+}
+
+TEST_F(CorruptBatchReplicationRegression, CatchUpFollowerStopsAtTheDamageAndLeavesIsrRegression) {
+    ASSERT_NO_FATAL_FAILURE(buildDamagedLeader());
+    int fetchesAtWedge = -1;
+    for (int i = 0; i < 300; ++i) {
+        clock += 1'000'000LL;
+        leader->doWork(clock);
+        follower->doWork(clock);
+        transport.pump(clock);
+        if (fetchesAtWedge < 0 && follower->wedgedAtOffset() >= 0) fetchesAtWedge = transport.fetchRequests;
+    }
+    EXPECT_EQ(followerLog->logEndOffset(), D) << "everything before the damage replicated, nothing after";
+    EXPECT_EQ(follower->wedgedAtOffset(), D);
+    ASSERT_GE(fetchesAtWedge, 0) << "the follower never wedged";
+    EXPECT_LE(transport.fetchRequests - fetchesAtWedge, 1) << "no infinite re-fetch";
+    EXPECT_EQ(leader->isr(), std::vector<NodeId>{kLeaderId}) << "a follower stuck at the damage leaves the ISR";
+    EXPECT_GE(leader->corruptReadsServed(), 1u);
+}
+
+TEST_F(CorruptBatchReplicationRegression, LeaderServesEverythingOutsideTheDamagedRangeRegression) {
+    ASSERT_NO_FATAL_FAILURE(buildDamagedLeader());
+    ASSERT_GE(bases.size(), 2u);
+    ASSERT_EQ(leader->onFetchRequest(fetchReq(bases[1], 1), ++clock), kErrNone);
+    ASSERT_FALSE(transport.fetchResponses.empty());
+    const auto served = batchesOf(transport.fetchResponses.back());
+    ASSERT_FALSE(served.empty());
+    EXPECT_EQ(served[0].base, bases[1]);
+    EXPECT_EQ(leader->corruptReadsServed(), 0u);
 }

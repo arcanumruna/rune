@@ -1062,11 +1062,16 @@ void ProducerImpl::onAddPartitionsAnswer_(const CoordAnswer& a, CoordinatorLink:
         // #698: a parsed answer that does not name this partition fails it (InvalidRequest): the broker never said Ok.
         int16_t code = m ? static_cast<int16_t>(kInvalidRequest) : worst;
         if (m) {
+            bool named = false;
             for (std::size_t i = 0; i < m->results.size(); ++i) {
                 const auto r = m->results[i];
                 if (r.topicId == ps.topicId && r.partition == ps.partition) {
-                    code = r.errorCode;
-                    break;
+                    // #737: a duplicate result takes the worst, never the first.
+                    if (!named || CoordinatorLink::rank(ReqKind::AddPartitions, r.errorCode) >
+                                      CoordinatorLink::rank(ReqKind::AddPartitions, code)) {
+                        code = r.errorCode;
+                    }
+                    named = true;
                 }
             }
         }

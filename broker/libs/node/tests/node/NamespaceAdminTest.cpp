@@ -49,6 +49,7 @@ std::array<uint8_t, 4> maskOf(std::initializer_list<std::size_t> fields) {
 }
 constexpr std::size_t kFieldMaxTopics = 0;
 constexpr std::size_t kFieldMaxViews  = 3;
+constexpr std::size_t kFieldMaxTxnTimeMs = 22;
 
 rp::NamespaceLimits defaults(uint64_t topics) {
     rp::NamespaceLimits l;
@@ -193,6 +194,32 @@ TEST(NamespaceAdminRegression, SetLimitsFullRecordIdempotentRegression) {
     EXPECT_EQ(std::get<cat::NamespaceLimitsSetOps>(sets[1].event.ops).limits, expect);
 
     EXPECT_EQ(rig.setNamespaceLimits("nope", maskOf({kFieldMaxViews}), given).code, kCodeUnknown);
+}
+
+// #837: a max-txn-time-ms above 30 days is refused (InvalidRequest) on Create and SetLimits - the coordinator converts
+// it to ns.  A field absent from the mask is never checked.  RED (the check dropped): the first refusal is Ok.
+TEST(NamespaceAdminRegression, MaxTxnTimeAboveThirtyDaysIsRefusedRegression) {
+    CatalogDdlRig rig("ns_txntime");
+    serveWith(rig, defaults(100));
+    ASSERT_EQ(rig.createNamespace("a").code, kCodeOk);
+    const std::size_t setsBefore = eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceLimitsSet).size();
+    rp::NamespaceLimits given;
+    given.maxTxnTimeMs = 2'592'000'001ULL;
+    const auto over = rig.setNamespaceLimits("a", maskOf({kFieldMaxTxnTimeMs}), given);
+    EXPECT_EQ(over.code, kCodeInvalid) << over.detail;
+    EXPECT_NE(over.detail.find("max-txn-time-ms"), std::string::npos) << over.detail;
+    EXPECT_EQ(eventsOfKind(rig.recordedLog(), cat::EventKind::NamespaceLimitsSet).size(), setsBefore);
+    given.maxTxnTimeMs = 2'592'000'000ULL;
+    EXPECT_EQ(rig.setNamespaceLimits("a", maskOf({kFieldMaxTxnTimeMs}), given).code, kCodeOk);
+    rp::NamespaceLimits huge;
+    huge.maxTxnTimeMs = UINT64_MAX;
+    const auto b = rig.createNamespace("b", maskOf({kFieldMaxTxnTimeMs}), huge);
+    EXPECT_EQ(b.code, kCodeInvalid) << b.detail;
+    EXPECT_EQ(rig.admin().applier().state().namespaces().byName("b"), nullptr);
+    rp::NamespaceLimits absent = huge;
+    absent.maxViews = 3;
+    EXPECT_EQ(rig.setNamespaceLimits("a", maskOf({kFieldMaxViews}), absent).code, kCodeOk)
+        << "a field absent from the mask is not checked";
 }
 
 // Defaults are read at REQUEST time from the broker's (boot) config: a reboot with new defaults between two creates

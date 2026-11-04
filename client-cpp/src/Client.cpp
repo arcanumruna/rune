@@ -57,6 +57,9 @@ static_assert(kMaxPasswordBytes == detail::FixedSecret::kCapacity);
 
 namespace {
 
+/// The largest accepted `*Ms` timeout in ClientConfig / ProducerConfig: 30 days.
+constexpr int64_t kMaxTimeoutMs = 30LL * 24 * 3600 * 1000;
+
 // now + ms, in ns, saturated at INT64_MAX: a huge timeout or retry budget (e.g. milliseconds::max(), "let the
 // deadline end it") never wraps into the past.  ms <= 0 is now (validatedInPlace refuses negatives).
 int64_t nsAfter(int64_t nowNs, int64_t ms) noexcept {
@@ -80,10 +83,11 @@ ClientConfig& validatedInPlace(ClientConfig& c) {
 }
 // #682: the agent's config (no password in it); a throw while it is built (bad_alloc) wipes `c.password` - the Client
 // is then not constructed, so nothing else would.  First statement: the moved-from caller copy is wiped.
-agent::AgentConfig agentConfigWipingOnThrow(ClientConfig& c, std::string& callerPassword) {
+agent::AgentConfig agentConfigWipingOnThrow(ClientConfig& c, std::string& callerPassword,
+                                            const detail::ClientTestOptions& opts) {
     detail::wipeString(callerPassword);   // #682: the moved-from caller copy (SSO bytes) never outlives the hand-off
     try {
-        return toAgentConfig(c);
+        return toAgentConfig(c, opts);
     } catch (...) {
         detail::wipeString(c.password);
         throw;
@@ -93,6 +97,21 @@ void validateConfigInPlace(ClientConfig& c) {
     // A negative timeout or retry budget has no meaning (0 = none / at once); refused, never silently clamped.
     if (c.connectTimeoutMs < 0 || c.pingTimeoutMs < 0 || c.ddlTimeoutMs < 0)
         throw std::invalid_argument("ClientConfig: connectTimeoutMs / pingTimeoutMs / ddlTimeoutMs must be >= 0");
+    // #744: a subscribe / produce attempt with no time at all would time out on its first pass.
+    if (c.subscribeTimeoutMs <= 0 || c.produceTimeoutMs <= 0)
+        throw std::invalid_argument("ClientConfig: subscribeTimeoutMs / produceTimeoutMs must be > 0");
+    // E1: every *Ms field becomes ns; above 30 days it would saturate into "never" (or wrap in a *1'000'000 site).
+    // Refused naming the field, never silently clamped.
+    for (const auto& [name, ms] : {std::pair<const char*, int64_t>{"connectTimeoutMs", c.connectTimeoutMs},
+                                   {"pingTimeoutMs", c.pingTimeoutMs},
+                                   {"produceTimeoutMs", c.produceTimeoutMs},
+                                   {"subscribeTimeoutMs", c.subscribeTimeoutMs},
+                                   {"ddlTimeoutMs", c.ddlTimeoutMs},
+                                   {"closeTimeoutMs", c.closeTimeoutMs}}) {
+        if (ms > kMaxTimeoutMs)
+            throw std::invalid_argument(std::string("ClientConfig: ") + name + " must be <= " +
+                                        std::to_string(kMaxTimeoutMs) + " ms (30 days), got " + std::to_string(ms));
+    }
     if (c.ddlRetryBudget.count() < 0 || c.viewReadRetryBudget.count() < 0)
         throw std::invalid_argument("ClientConfig: ddlRetryBudget / viewReadRetryBudget must be >= 0");
     if (c.traceDdlRetries && c.runnerMode != RunnerMode::Invoker)
@@ -173,7 +192,7 @@ int64_t subscriptionOfScopedError(std::string_view m) noexcept {
 // Helper: build AgentConfig from ClientConfig
 // ---------------------------------------------------------------------------
 
-agent::AgentConfig toAgentConfig(const ClientConfig& c) {
+agent::AgentConfig toAgentConfig(const ClientConfig& c, const detail::ClientTestOptions& opts) {
     agent::AgentConfig acfg;
     acfg.transport.ingressChannel  = c.gatewayChannel;
     acfg.transport.ingressStreamId = c.gatewayStreamId;
@@ -184,7 +203,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
     acfg.transport.termBufferLength = c.termBufferBytes;
 
     // Session egress config (for ConnectRequest body).
-    acfg.session.egressChannel  = c.declaredEgressChannelForTest.empty() ? c.egressChannel : c.declaredEgressChannelForTest;
+    acfg.session.egressChannel  = opts.declaredEgressChannel.empty() ? c.egressChannel : opts.declaredEgressChannel;
     acfg.session.egressStreamId = c.egressStreamId;
 
     // Pass through keepalive interval if the caller overrides it.
@@ -248,9 +267,11 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
 // Construction
 // ---------------------------------------------------------------------------
 
-Client::Client(ClientConfig cfg)
+Client::Client(ClientConfig cfg) : Client(std::move(cfg), detail::ClientTestOptions{}) {}
+
+Client::Client(ClientConfig cfg, const detail::ClientTestOptions& opts)
     : cfg_(std::move(validatedInPlace(cfg)))
-    , agent_(agentConfigWipingOnThrow(cfg_, cfg.password), cfg_.password)   // #682: the agent takes the password and wipes cfg_.password
+    , agent_(agentConfigWipingOnThrow(cfg_, cfg.password, opts), cfg_.password)   // #682: the agent takes the password and wipes cfg_.password
     , partitionRouter_(metadataCache_)
     , catalogReader_(std::make_unique<CatalogReader>(*this))   // eagerly, on the owning thread (I2)
     , securityReader_(std::make_unique<SecurityReader>(*this))   // authentication Task 8: same rule
@@ -323,7 +344,7 @@ Client::Client(ClientConfig cfg)
     cqFree_.assign(kMaxCqs, 0);  // FIFO ring of released slots (I3)
     releases_.reserve(16);       // C7: handle releases (cold; grows only on a burst of releases)
     groupConsumerHub_.setSessionConnected(false);  // fix3: not connected until the first connect
-    groupConsumerHub_.setClock(cfg_.nanoClock);   // #701: its timers run on the duty clock (nullptr = steady, as nowNs())
+    groupConsumerHub_.noteDutyNow(now());   // #743: the hub's timers run on the duty clock (stored each pass in dutyCycle)
     // F8c C4: commitSync completions go through the completion-queue registry.
     groupConsumerHub_.setCompletionSink(detail::CompletionSink{&Client::deliverTrampoline_, this});
     subscriberHub_.setSessionConnected(false);
@@ -336,10 +357,7 @@ Client::Client(ClientConfig cfg)
     // D4: every group frame goes to the COORDINATOR session — the seed's ring
     // path (unchanged) while the coordinator is the seed, else that node's own
     // session (re-stamped with its id; held = refused while it connects).
-    coordSendFn_ = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-        if (coordIdx() == 0) return agent_.submitSend(fb, fl);
-        return agent_.offerToCoordinator(coordIdx(), fb, fl) != transport::AeronTransport::OfferResult::Retry;
-    };
+    coordSendFn_ = group::SendFn{&Client::coordSendThunk_, this};   // #718: a thunk, never a std::function
     {
         group::GroupConsumerHub::FetchRouter fr;
         fr.ctx           = this;
@@ -624,9 +642,7 @@ void Client::closeImpl_(bool drainDeadlineHit) {
     // sendFn here is a best-effort last send (transport may be stopping).
     {
         const auto snap = agent_.stateAndSessionId();
-        const group::SendFn gcSendFn = [this](int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) -> bool {
-            return agent_.submitSend(fb, fl);
-        };
+        const group::SendFn gcSendFn{&Client::seedSendThunk_, this};
         groupConsumerHub_.closeAll(snap.sessionId, gcSendFn);
     }
 
@@ -3432,6 +3448,7 @@ int Client::dutyCycle(int64_t nowNs) {
 
     // 1. Agent: driver/conductor (invoker), command ring, egress, session ticks.
     //    ProduceResponses are decoded and buffered, not dispatched through hooks.
+    groupConsumerHub_.noteDutyNow(nowNs);   // #743: before any frame reaches a hub handler this pass
     int work = agent_.doWork(nowNs);
     // I3': owner releases fenced on the command ring apply once the drain passed them.
     if (!deferredReleases_.empty()) [[unlikely]] work += applyDeferredReleases_(false);
@@ -3473,7 +3490,7 @@ int Client::dutyCycle(int64_t nowNs) {
             work += groupConsumerHub_.flushRequestedCommits(gsid);
             // #371: a pending seek / seekToCommitted progresses on THIS pass (its OffsetFetch answer, its
             // resubscribe, its completion), not on the 100 ms sweep.
-            work += groupConsumerHub_.driveRewinds(nowNs, gsid, coordSendFn_);
+            if (groupConsumerHub_.activeRewinds() != 0) work += groupConsumerHub_.driveRewinds(nowNs, gsid, coordSendFn_);
             if (groupConsumerHub_.pendingLeaves() != 0) work += groupConsumerHub_.retryPendingLeaves(gsid);
             // M2: refused fetch Unsubscribes are re-offered every pass until sent / moot.
             if (groupConsumerHub_.pendingFetchUnsubscribes() != 0) work += groupConsumerHub_.retryFetchUnsubscribes();
@@ -3797,8 +3814,7 @@ void Client::sweepTimeouts(int64_t nowNs) {
     // Producer deadlines are on the duty-cycle clock (injected in tests): any
     // pending ProduceResponse ack older than produceTimeoutMs is failed so
     // futures/callbacks never hang.
-    producerHub_.sweepTimedOut(
-        std::chrono::steady_clock::time_point{std::chrono::nanoseconds{nowNs}});
+    producerHub_.sweepTimedOut(nowNs);
 
     // No-progress backstop (moved from the per-cycle drain hook; the refresh it arms
     // is itself backoff-gated at >= 100 ms, so the 100 ms sweep cadence loses nothing):
@@ -4390,7 +4406,9 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // which would strand every subscription already bound on the seed
             // (a silent stall).  Round 5 (R3): also before the first metadata
             // answer — the Redirect's endpoint installs the partition's route.
-            if (!groupActive && subscriberHub_.isNewPendingSubscribe(opt->correlationId) &&
+            // #749: this holds while a consumer group is active too - following ONE partition's leader on its own
+            // session never moves the seed (the group coordinator's); only a BySeed redirect is refused (below).
+            if (subscriberHub_.isNewPendingSubscribe(opt->correlationId) &&
                 !agent::ClientAgent::sameEndpoint(toChannel(newEndpoint), agent_.seedChannel())) {
                 bool handled = false;
                 switch (redirectFollowFor_(newEndpoint)) {
@@ -4422,12 +4440,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
             if (groupActive) {
                 // MEDIUM-4: while a group is active the seed session (the group
                 // coordinator's) never follows a data-op redirect.
-                //  * A plain Subscribe: plain subscriptions are sent on the seed
-                //    only (no per-partition routing for them — they have no
-                //    position / leader-change model; ticketed), so one for a
-                //    partition another node leads can never succeed here: it is
-                //    finished with SubscriptionFailReason::
-                //    LeaderElsewhereWhileGroupActive (documented on subscribe()).
+                //  * A plain Subscribe that could not be followed per partition
+                //    above (BySeed: the target is not a node this client can
+                //    route to) would have to move the seed: it is finished with
+                //    SubscriptionFailReason::LeaderElsewhereWhileGroupActive
+                //    (documented on subscribe()).
                 //  * A produce whose partition this handler could not map
                 //    (havePart false) is retried through its partition route.
                 //  * Anything else (a transactional producer's Produce, whose
@@ -4561,14 +4578,23 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // subscription named in the message, "subscription S topic T ...": the
         // broker parked a push subscription whose next batch it cannot deliver)
         // fails THAT subscription; the app's onError still hears it below.
-        if (opt->correlationId == 0 && ec == rpc::ErrorCode::MessageTooLarge) {
+        // #839: StorageError (a damaged stored batch) is the same scoped shape and fails it as CorruptBatch.
+        if (opt->correlationId == 0 &&
+            (ec == rpc::ErrorCode::MessageTooLarge || ec == rpc::ErrorCode::StorageError)) {
             if (const int64_t subId = subscriptionOfScopedError(opt->message); subId > 0) {
                 const auto snap = agent_.stateAndSessionId();
                 (void)subscriberHub_.failActiveSubscription(
-                    subId, SubscriptionFailReason::UndeliverableBatch, nextCorrId_++, snap.sessionId,
+                    subId,
+                    ec == rpc::ErrorCode::StorageError ? SubscriptionFailReason::CorruptBatch
+                                                       : SubscriptionFailReason::UndeliverableBatch,
+                    nextCorrId_++, snap.sessionId,
                     [this](int32_t /*streamId*/, const uint8_t* fbuf, std::size_t flen) -> bool {
                         return agent_.submitSend(fbuf, flen);
                     });
+                // #839: the same scoped error fails a group member whose fetch subscription it names.
+                (void)groupConsumerHub_.onFetchScopedError(
+                    subId, ec == rpc::ErrorCode::StorageError ? GroupFailReason::CorruptBatch
+                                                              : GroupFailReason::UndeliverableBatch);
             }
         }
 
@@ -5042,6 +5068,15 @@ Producer Client::testProducerWithRingCap(ProducerConfig cfg, int32_t ringCap) {
 
 Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool direct) {
     if (!acksValid(cfg.acks)) throw std::invalid_argument("ProducerConfig: acks View needs Leader or All, and no unknown bits");
+    // E1: the producer's *Ms fields are converted to ns at many sites (`* 1'000'000`); above 30 days they would wrap.
+    for (const auto& [name, ms] : {std::pair<const char*, int64_t>{"produceTimeoutMs", cfg.produceTimeoutMs},
+                                   {"transactionOpTimeoutMs", cfg.transactionOpTimeoutMs},
+                                   {"deliveryTimeoutMs", cfg.deliveryTimeoutMs},
+                                   {"agentLivenessTimeoutMs", cfg.agentLivenessTimeoutMs}}) {
+        if (ms > kMaxTimeoutMs)
+            throw std::invalid_argument(std::string("ProducerConfig: ") + name + " must be <= " +
+                                        std::to_string(kMaxTimeoutMs) + " ms (30 days), got " + std::to_string(ms));
+    }
     // Phase 2b F: creation validation of a transactional producer.
     if (!cfg.transactionalId.empty()) {
         if (cfg.acks == Acks::None) {
@@ -5928,6 +5963,16 @@ Client::RedirectFollow Client::redirectFollowFor_(const std::string& endpoint) c
     return metadataResponses_ == 0 ? RedirectFollow::Hold : RedirectFollow::BySeed;
 }
 
+// #749: a held follow that cannot go per partition falls back to the seed - unless a group is active, whose
+// coordinator session the seed is: then the subscribe is refused with the documented reason, the seed unmoved.
+void Client::heldFallbackBySeed_(const HeldRedirect& h) {
+    if (!groupConsumerHub_.empty()) {
+        (void)subscriberHub_.failPendingSubscribe(h.corrId, SubscriptionFailReason::LeaderElsewhereWhileGroupActive);
+        return;
+    }
+    redirectBySeed_(h.corrId, h.endpoint, h.responsePort);
+}
+
 // R3: a metadata answer arrived since the follow was held — decide it now.
 int Client::releaseHeldRedirectFollows_() {
     int work = 0;
@@ -5942,11 +5987,11 @@ int Client::releaseHeldRedirectFollows_() {
             if (subscriberHub_.adoptRedirectedSubscribe(h.corrId) &&
                 followMovedSubscriptionRedirect_(h.corrId, redirectMessageOf_(h)))
                 break;
-            redirectBySeed_(h.corrId, h.endpoint, h.responsePort);
+            heldFallbackBySeed_(h);
             break;
         case RedirectFollow::Hold:   // still no answer applied (cannot happen: metaSeen moved)
         case RedirectFollow::BySeed:
-            redirectBySeed_(h.corrId, h.endpoint, h.responsePort);
+            heldFallbackBySeed_(h);
             break;
         }
     }
@@ -6111,6 +6156,16 @@ int Client::watchSilentLeaders_(int64_t nowNs) {
         }
     }
     return 0;
+}
+
+bool Client::coordSendThunk_(void* ctx, int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) {
+    auto* self = static_cast<Client*>(ctx);
+    if (self->coordIdx() == 0) return self->agent_.submitSend(fb, fl);
+    return self->agent_.offerToCoordinator(self->coordIdx(), fb, fl) != transport::AeronTransport::OfferResult::Retry;
+}
+
+bool Client::seedSendThunk_(void* ctx, int32_t /*streamId*/, const uint8_t* fb, std::size_t fl) {
+    return static_cast<Client*>(ctx)->agent_.submitSend(fb, fl);
 }
 
 int64_t Client::nextCorrTrampoline_(void* ctx) noexcept {

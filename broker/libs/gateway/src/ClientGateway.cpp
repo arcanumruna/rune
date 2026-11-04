@@ -7511,13 +7511,19 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 Subscription& sub = it->second;
                 sub.failed         = true;
                 sub.errorOwed      = true;
-                sub.failedCause    = rune::node::PushTooLargeCause::ReturnRing;
+                // #839: StorageError = a damaged stored batch (CorruptBatch); anything else = the return ring.
+                const bool corrupt = ret.errorCode ==
+                    static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError);
+                sub.failedCause    = corrupt ? rune::node::PushTooLargeCause::CorruptBatch
+                                             : rune::node::PushTooLargeCause::ReturnRing;
                 sub.failedFrameLen = 0;
                 spdlog::error("ClientGateway: subscription {} (topicId={} partition={} offset={}) failed: "
-                              "worker answered error {} (a stored batch exceeds the worker return ring) — "
-                              "MessageTooLarge, subscription parked (cursor not advanced)",
+                              "worker answered error {} ({}) - {}, subscription parked (cursor not advanced)",
                               ret.subscriptionId, ret.readTopicId, ret.readPartition, ret.newNextOffset,
-                              ret.errorCode);
+                              ret.errorCode,
+                              corrupt ? "a stored batch is corrupt (damaged log segment)"
+                                      : "a stored batch exceeds the worker return ring",
+                              corrupt ? "StorageError" : "MessageTooLarge");
                 if (Session* session = sessions_.find(sub.sessionId))
                     trySendOwedPushError_(sub, *session);
                 return;

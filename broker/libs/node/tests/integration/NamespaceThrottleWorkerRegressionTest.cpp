@@ -11,8 +11,11 @@
 //   | a live throttle                 | slot deleted + recreated        | before any message              | the new owner starts clear                   | NamespaceThrottleRegression.RecreateUnderThrottleStartsClearRegression
 //   | Throttle{Disk, INT64_MAX}/{0}   | the owner                       | set, then cleared               | refused 52, then served                      | NamespaceThrottleRegression.DiskThrottleIsTheAggregatorsRegression
 //   | Throttle{RequestOps}            | the owner                       | produce                         | refused 53 (the shared kind gates produce)   | NamespaceThrottleRegression.RequestOpsGatesProduceRegression
+//   | usage report (#728)             | capacity 1024, 3 assigned, 1 released | visits the live slots only (3+default, then 2+default) | NsThrottleWorkerRegression.UsageReportVisitsLiveSlotsOnlyRegression
+//   | slot assign / release churn     | x1000                           | 0 allocations                   | NsThrottleWorkerRegression.UsageReportVisitsLiveSlotsOnlyRegression
 //   | the worker's counters           | produces                        | usage report                    | NsUsage signals carry the cumulative bytes   | NamespaceThrottleRegression.WorkerReportsCountersRegression
 #include "HotPathBRig.h"
+#include "support/AllocWindow.h"
 
 #include <rune/node/NsLimitAggregator.h>
 #include <rune/protocol/NamespaceLimits.h>
@@ -176,6 +179,41 @@ TEST(NamespaceThrottleRegression, WorkerReportsCountersRegression) {
     EXPECT_EQ(got[static_cast<int>(rune::node::NsMetric::ProduceRecords)], 12u);
     EXPECT_EQ(got[static_cast<int>(rune::node::NsMetric::RequestOps)], 4u);
     EXPECT_EQ(rig.worker().reportNsUsageForTest(), 0) << "nothing changed: nothing is sent";
+}
+
+// #728: the usage report walked every slot of the table (capacity x 7 metrics every 5 ms).  It now visits only the live slots
+// (the dense list IS the state): slot 0 (default) plus the assigned ones.
+TEST(NsThrottleWorkerRegression, UsageReportVisitsLiveSlotsOnlyRegression) {
+    Rig rig;
+    Worker& w = rig.worker();
+    w.configureNsSlots(1024);
+    const rune::protocol::NamespaceLimits l;
+    w.applyNsSlotAssignDirect(1, 11, l);
+    w.applyNsSlotAssignDirect(2, 12, l);
+    w.applyNsSlotAssignDirect(3, 13, l);
+    (void)w.reportNsUsageForTest();
+    EXPECT_EQ(w.nsUsageVisitedForTest(), 4u) << "the default slot + the 3 assigned slots, not the 1024-slot capacity";
+    ASSERT_TRUE(w.applyNsSlotReleaseDirect(2, 12));
+    (void)w.reportNsUsageForTest();
+    EXPECT_EQ(w.nsUsageVisitedForTest(), 3u) << "a released slot is no longer visited";
+    w.applyNsSlotAssignDirect(2, 14, l);   // reuse
+    (void)w.reportNsUsageForTest();
+    EXPECT_EQ(w.nsUsageVisitedForTest(), 4u);
+    // Churn: assign / release x1000 allocates nothing (the list and its index are preallocated to the capacity).
+    ASSERT_TRUE(w.applyNsSlotReleaseDirect(2, 14));
+    uint64_t allocs = 0;
+    {
+        rune::testing::AllocWindow win;
+        for (uint32_t i = 0; i < 1000; ++i) {
+            const uint32_t nsId = 100 + i;
+            w.applyNsSlotAssignDirect(2, nsId, l);
+            (void)w.applyNsSlotReleaseDirect(2, nsId);
+        }
+        allocs = win.count();
+    }
+    EXPECT_EQ(allocs, 0u) << "slot assign / release churn allocated";
+    (void)w.reportNsUsageForTest();
+    EXPECT_EQ(w.nsUsageVisitedForTest(), 3u) << "after the churn: default + slots 1 and 3";
 }
 
 // #730: the worker's own Deleting gate, in isolation.  The gateway already passed the produce (it was resolved and routed

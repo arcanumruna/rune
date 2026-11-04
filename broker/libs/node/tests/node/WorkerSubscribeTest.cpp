@@ -7,9 +7,12 @@
 // subscriptions and round-trips every scalar field through the wire.
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/storage/Log.h>
 
 #include <gtest/gtest.h>
 #include <cstdint>
+#include <filesystem>
+#include <unistd.h>
 
 using namespace rune::node;
 
@@ -45,7 +48,13 @@ static WorkerOp makeUnsubscribe(int64_t subId) {
 
 TEST(WorkerSubscribe, RegisterRoundTripsAllFields) {
     Worker w(/*workerId=*/0, kRingBytes, kRingBytes);
-    auto* fakeLog = reinterpret_cast<rune::storage::Log*>(0xABCD0000);
+    // A real Log: the Subscribe resolves the source's namespace tag from it (a bogus pointer is never dereferenceable).
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("rune_wsub_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    rune::storage::Log realLog(dir.string(), 64 * 1024 * 1024);
+    realLog.recover();
+    auto* fakeLog = &realLog;
 
     ASSERT_TRUE(w.tryEnqueueOp(makeSubscribe(/*subId=*/100, /*topic=*/10, /*part=*/3,
                                              /*nextOffset=*/42, /*isolation=*/1,
@@ -64,6 +73,8 @@ TEST(WorkerSubscribe, RegisterRoundTripsAllFields) {
     EXPECT_TRUE(s.isGroup);
     EXPECT_FALSE(s.groupCarrierReceived);
     EXPECT_EQ(s.logPtr, fakeLog) << "logPtr must round-trip through the wire as uintptr_t";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
 }
 
 TEST(WorkerSubscribe, DuplicateSubscribeUpdatesNotDuplicates) {

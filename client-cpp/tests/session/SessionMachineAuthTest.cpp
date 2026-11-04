@@ -11,6 +11,8 @@
 #include <rune/protocol/client/AuthMessages.h>
 #include <rune/protocol/client/ControlMessages.h>
 
+#include "../support/AllocCounter.h"
+
 #include <gtest/gtest.h>
 
 #include <array>
@@ -1137,4 +1139,80 @@ TEST(SessionMachineAuthRegression, LoginAnsweredSessionEndCodeIsRejectedRegressi
             EXPECT_TRUE(sm::SessionMachine::nonRetriableConnectError(static_cast<int16_t>(code)));
         }
     }
+}
+
+// #732: the machine remembers the last FOUR retired sealed session ids, not one.  Five TLS episodes (sids 41..45),
+// each ended by a final-leg HandshakeFailed that discards its crypto: 42..45 are all still named, 41 was evicted.  A
+// plaintext episode resuming 44 clears only 44.  RED (old): a single slot, so 42..44 read false.
+TEST(SessionMachineAuthRegression, FourRetiredSealedEpisodesAreAllRememberedRegression) {
+    const std::string serverPem = slurp(testdata("server.pem")), serverKey = slurp(testdata("server.key")),
+                      caPem = slurp(testdata("ca.pem"));
+    CapturingIo io; sm::SessionConfig cfg;
+    cfg.offerCrypto = true; cfg.tlsTrustPem = caPem; cfg.tlsExpectHost = "localhost";
+    cfg.username = "ws1"; cfg.password = "correct horse battery";
+    cfg.maxConnectRetries = 10;
+    cfg.allowUnauthenticatedBroker = true;   // the plaintext leg below is a dev-mode broker
+    sm::SessionMachine m(io, cfg);
+    m.connect(0);
+    for (int64_t sid = 41; sid <= 45; ++sid) {
+        cr::TlsSession srv = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+        ASSERT_TRUE(srv.valid());
+        ASSERT_FALSE(io.frames.empty());
+        std::size_t delivered = io.frames.size() - 1;   // this episode's ConnectRequest
+        bool first = true;
+        for (int i = 0; i < 20 && m.state() != sm::SessionState::Authenticating; ++i) {
+            ASSERT_GT(io.frames.size(), delivered);
+            const auto& frame = io.frames[delivered++];
+            std::string_view peer; int64_t corr = 0; uint8_t cipher = 0;
+            if (first) {
+                auto req = rune::client::codec::decodeConnectRequest(frame.data(), frame.size());
+                ASSERT_TRUE(req.has_value());
+                peer = req->handshakeBytes; corr = req->correlationId; cipher = req->cipherList[0];
+            } else {
+                auto hc = rune::client::codec::decodeHandshakeContinue(frame.data(), frame.size());
+                ASSERT_TRUE(hc.has_value());
+                peer = hc->handshakeBytes; corr = hc->correlationId;
+            }
+            ASSERT_NE(srv.readInbound(reinterpret_cast<const uint8_t*>(peer.data()), peer.size()), cr::HsState::Failed);
+            uint8_t out[16384];
+            const std::size_t n = srv.writeOutbound(out, sizeof out);
+            const std::string_view outView(reinterpret_cast<const char*>(out), n);
+            if (first) m.onConnectResponse(0, -1, sid, corr, 1, cipher, outView, pc::AuthMode::Required,
+                                           pc::AuthState::MustAuthenticate);
+            else m.onHandshakeContinueResponse(0, outView, corr, 1);
+            first = false;
+        }
+        ASSERT_EQ(m.state(), sm::SessionState::Authenticating) << "episode sid " << sid;
+        m.onHandshakeContinueResponse(static_cast<int16_t>(pc::ErrorCode::HandshakeFailed), {}, m.correlationId(), 2,
+                                      sid);
+        ASSERT_EQ(m.state(), sm::SessionState::Connecting) << "retried, sid " << sid;
+    }
+    EXPECT_FALSE(m.namesRetiredSealedSession(41)) << "the fifth episode evicted the oldest";
+    for (int64_t sid = 42; sid <= 45; ++sid)
+        EXPECT_TRUE(m.namesRetiredSealedSession(sid)) << "sid " << sid << " was forgotten";
+    EXPECT_FALSE(m.namesRetiredSealedSession(0));
+    EXPECT_FALSE(m.namesRetiredSealedSession(46));
+
+    // A plaintext episode resuming 44 (the broker declined crypto): its frames are legitimately clear, so only 44 clears.
+    m.onConnectResponse(0, -1, 44, m.correlationId(), 10);   // plaintext OK, no cipher chosen
+    ASSERT_EQ(m.sessionId(), 44);
+    m.tick(10);
+    m.tick(10 + cfg.responseTimeoutNs * 2);   // stale -> Resuming
+    m.tick(10 + cfg.responseTimeoutNs * 2 + 1);   // doResume: a plaintext ConnectRequest naming 44
+    EXPECT_FALSE(m.namesRetiredSealedSession(44)) << "the plaintext resume of 44 clears it";
+    EXPECT_TRUE(m.namesRetiredSealedSession(42));
+    EXPECT_TRUE(m.namesRetiredSealedSession(43));
+    EXPECT_TRUE(m.namesRetiredSealedSession(45));
+}
+
+// #732 hot path: namesRetiredSealedSession runs for every egress frame (ClientAgent) and allocates nothing.
+TEST(SessionMachineAuthRegression, NamesRetiredSealedSessionAllocatesNothingRegression) {
+    CapturingIo io; sm::SessionConfig cfg;
+    sm::SessionMachine m(io, cfg);
+    long hits = 0;
+    alloc_counter::startThisThread();
+    for (int64_t i = 0; i < 10'000; ++i) hits += m.namesRetiredSealedSession(i) ? 1 : 0;
+    const long allocs = alloc_counter::stopThisThread();
+    EXPECT_EQ(allocs, 0);
+    EXPECT_EQ(hits, 0);
 }

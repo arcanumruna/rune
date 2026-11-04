@@ -126,6 +126,41 @@ TEST(GroupFilterClient, BoundInstanceRefusedByTheLeaderEndsTheGroupRegression) {
     EXPECT_EQ(r.gw.subscribeFrames.size(), frames) << "never re-armed";
 }
 
+// #839: a subscription-scoped StorageError / MessageTooLarge (correlationId 0, the subscription named in the text)
+// names a group member's fetch subscription: that consumer ends CorruptBatch / UndeliverableBatch instead of
+// stalling silently.  A scoped error naming some other subscription leaves it running.
+// RED by mutation: drop the groupConsumerHub_.onFetchScopedError call in Client.cpp's scoped-error branch.
+TEST(GroupScopedErrorClient, ScopedErrorFailsTheGroupConsumerRegression) {
+    struct Leg { rune::protocol::client::ErrorCode code; rc::GroupFailReason want; int32_t stream; };
+    const Leg legs[] = {
+        {rune::protocol::client::ErrorCode::StorageError, rc::GroupFailReason::CorruptBatch, 4520},
+        {rune::protocol::client::ErrorCode::MessageTooLarge, rc::GroupFailReason::UndeliverableBatch, 4522},
+    };
+    for (const Leg& leg : legs) {
+        FilteredGroup r(leg.stream);
+        auto gc = r.client.subscribeGroup("g", {"t"});
+        r.connect();
+        ASSERT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
+        r.gw.releaseJoins();
+        ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; }));
+        const auto s0 = *r.subAt(0, 0);
+        ASSERT_TRUE(r.drive([&] { return gc.active() && s0.subscriptionId != 0; }));
+        r.passes(20);
+        ASSERT_EQ(gc.failReason(), rc::GroupFailReason::None);
+        // Control: another subscription's id leaves the consumer alone.
+        r.gw.sendError(0, static_cast<int16_t>(leg.code),
+                       "subscription " + std::to_string(s0.subscriptionId + 1000) + " topic 1 partition 0 offset 7: x",
+                       s0.sessionId, /*corrId=*/0);
+        r.passes(100);
+        EXPECT_EQ(gc.failReason(), rc::GroupFailReason::None) << "a scoped error naming another subscription failed it";
+        r.gw.sendError(0, static_cast<int16_t>(leg.code),
+                       "subscription " + std::to_string(s0.subscriptionId) + " topic 1 partition 0 offset 7: x",
+                       s0.sessionId, /*corrId=*/0);
+        ASSERT_TRUE(r.drive([&] { return gc.failReason() == leg.want; }, 200'000))
+            << "the scoped error never failed the group consumer";
+    }
+}
+
 // N2: a seek re-arms the partition with the group's filter bytes.
 TEST(GroupFilterClient, SeekReArmsWithTheFilterBytesRegression) {
     FilteredGroup r(4508);

@@ -22,6 +22,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/testing/DamageSegmentForTest.h>
 
 #include <atomic>
 #include <chrono>
@@ -192,6 +193,39 @@ TEST(ReplicatedTxnStateStore, RebuildLastWriteWinsAcrossSegments) {
     s2.rebuildFromLog();
     ASSERT_TRUE(s2.get("tx1"));
     EXPECT_EQ(s2.get("tx1")->state, TxnState::CompleteCommit);
+}
+
+// ===========================================================================
+// 2b. #839: a DAMAGED middle segment is a hole, never skipped (the txn state in it would be forgotten)
+// ===========================================================================
+TEST(ReplicatedTxnStateStore, RebuildStopsAtDamageRegression) {
+    TxnTempDir dir("damage");
+    constexpr int64_t kTinyRoll = 512;
+    rune::storage::Log log(dir.path, kTinyRoll);
+    NullTransport nt;
+    PartitionReplica replica(makeSingleNodeConfig(1, 1), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &nt);
+    int64_t clock = 0;
+    constexpr int kPuts = 40;
+    {
+        ReplicatedTxnStateStore s(&replica);
+        for (int i = 0; i < kPuts; ++i) ASSERT_TRUE(s.put(makeMeta("tx" + std::to_string(i), 100 + i, 0, TxnState::Ongoing), 1));
+        for (int i = 0; i < kDriverCap && replica.highWatermark() < kPuts; ++i) { clock += 1'000'000LL; replica.doWork(clock); }
+        ASSERT_GE(replica.highWatermark(), kPuts);
+    }
+    ASSERT_GE(log.segmentBaseOffsets().size(), 4u) << "three segments around the damaged one";
+    {   // control: the undamaged log loads, every txn present
+        ReplicatedTxnStateStore ok(&replica);
+        ASSERT_TRUE(ok.rebuildFromLog());
+        ASSERT_TRUE(ok.get("tx0"));
+        ASSERT_TRUE(ok.get("tx" + std::to_string(kPuts - 1)));
+    }
+    ASSERT_GE(rune::storage::testing::damageSecondBatchOfSegment(dir.path, 1), 0);
+    ASSERT_TRUE(log.reloadSegments());
+    ASSERT_EQ(log.damagedSegmentCount(), 1u);
+
+    ReplicatedTxnStateStore rebuilt(&replica);
+    EXPECT_FALSE(rebuilt.rebuildFromLog()) << "a damaged segment is a hole: the txn state must not load around it";
+    EXPECT_EQ(rebuilt.get("tx0"), nullptr) << "nothing half-loaded is served";
 }
 
 // ===========================================================================

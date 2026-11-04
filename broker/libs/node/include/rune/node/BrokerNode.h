@@ -710,8 +710,27 @@ public:
                 if (failureRing_.write(b, sizeof b, kA2cPeerFrameDrops)) reportedPeerDrops_ = drops;
             }
         }
+        // #632: the process metrics sample here, off the control thread.  The sample lseeks and getdents64s the whole
+        // /proc/self/fd directory (about 200 ns per open fd; no /proc file gives the count), a stall the control
+        // thread (elections, ISR, admin replies) must not take.  This is the ONLY thread that calls it.
+#if defined(__linux__)
+        if (systemMetrics_ != nullptr) {
+            const int s = systemMetrics_->doWork(nowNs);
+            systemSamples_ += static_cast<uint64_t>(s);
+            work += s;
+        }
+#endif
         return work;
     }
+
+#if defined(__linux__)
+    /// Startup thread only, once, before the runner starts (buildAdminWorker).  The pointee is BrokerNode's
+    /// systemMetrics_, initialised on the start thread; after this call only this agent's thread touches it, and
+    /// BrokerNode joins this runner before it resets the pointee.
+    void adoptSystemMetrics(metrics::SystemMetrics* sm) noexcept { systemMetrics_ = sm; }
+    /// Test-only, ADMIN thread only (call inside onAdminThreadForTest): samples this agent has taken.
+    [[nodiscard]] uint64_t systemMetricsSamplesForTest() const noexcept { return systemSamples_; }
+#endif
 
     /// admin → control ring (T10; F3 r6 extended): kA2cStorageFailure
     /// ([errno:i32][dir]) and kA2cSchemaUpdate ([topicId:i32][version:u16][blob]).
@@ -1086,6 +1105,10 @@ private:
     bool             storageFailureSignalled_ = false;
     int64_t          nextPeerDropReportNs_ = 0;   // Task 16: paced report of the admin plane's dropped peer frames
     uint64_t         reportedPeerDrops_    = 0;
+#if defined(__linux__)
+    metrics::SystemMetrics* systemMetrics_ = nullptr;   // #632: borrowed from BrokerNode; admin thread only after start
+    uint64_t                systemSamples_ = 0;         // admin thread only (the test reads it via onAdminThreadForTest)
+#endif
     uint64_t         badRequestFrames_ = 0;        // request-ring frames of an unknown type
     // Fix round 2: preallocated, bounded (was an unbounded vector<vector> with
     // O(n) front erase).  4x the ring: one tick's answers fit by construction.
@@ -1544,6 +1567,11 @@ public:
         return std::atomic_ref<std::uint8_t>(b).load(std::memory_order_relaxed);
     }
 
+    /// Test seam (#631 review): slots the metrics writer still holds, and the size of its free stack.  Both 0 once
+    /// discardMetricsFile_ detached the writer from the unmapped file.  Call only while no agent thread runs.
+    [[nodiscard]] std::int32_t metricsWriterAllocatedForTest() const noexcept { return metricsWriter_.allocatedCount(); }
+    [[nodiscard]] std::size_t  metricsFreeStackSizeForTest() const noexcept { return metricsFreeStack_.size(); }
+
     /// Return the leader's client Aeron channel for data-op redirect (GB-4).
     /// Observer thread (see above): ring-drained snapshot + immutable peer config.
     /// - If this node IS the leader → returns empty string (no self-redirect).
@@ -1630,6 +1658,8 @@ public:
     [[nodiscard]] rune::replication::PartitionReplica* catalogReplicaForTest() const noexcept {
         return catalogReplica_.get();
     }
+    /// #839: damaged sealed log segments found by boot recovery, summed over every log the node serves.
+    [[nodiscard]] int64_t bootDamagedSegmentsForTest() const noexcept { return bootDamagedSegments_; }
     /// Test-only: the __catalog Log — ONLY while the admin thread is quiesced
     /// (before start(), after stop()); otherwise read it inside onAdminThreadForTest.
     [[nodiscard]] rune::storage::Log* catalogLogForTest() const noexcept { return catalogLog_.get(); }
@@ -1692,6 +1722,9 @@ public:
     /// Issue #241: frames worker `w` / the admin plane dropped as UnknownEpoch; read ON that thread.
     [[nodiscard]] uint64_t workerPeerUnknownEpochDropsForTest(int32_t w);
     [[nodiscard]] uint64_t adminPeerUnknownEpochDropsForTest();
+    /// Issue #275: frames worker `w`'s replication plane opened from `peer` (monotonic); read ON that thread.  The
+    /// non-vacuity witness of the rekey-under-traffic test: a rise proves the plane really carried sealed traffic.
+    [[nodiscard]] uint64_t workerPeerAuthFramesForTest(int32_t w, int32_t peer);
     /// Issue #241: this (initiator) node re-handshakes its link to `peer` now, same incarnation (control thread).
     /// False: no peer links, or not an Established initiator for `peer`.
     [[nodiscard]] bool forcePeerRekeyForTest(int32_t peer);
@@ -2177,6 +2210,16 @@ public:
         return adminWorkerAgent_.get();
     }
 
+    /// Test-only (#632): process-metrics samples the admin agent has taken; 0 when there is no agent or no sampler.
+    [[nodiscard]] uint64_t adminSystemMetricsSamplesForTest() noexcept {
+#if defined(__linux__)
+        if (!started_ || stopped_ || !adminWorkerAgent_ || !adminWorkerRunner_) return 0;
+        return onAdminThreadForTest([this]() -> uint64_t { return adminWorkerAgent_->systemMetricsSamplesForTest(); });
+#else
+        return 0;
+#endif
+    }
+
     /// Test-only: return the I/O throttle rate wired into the LogCleanerAgent.
     /// -1 = unlimited.  Valid after start().  Used by CP-10 Fix-1 wiring test.
     [[nodiscard]] int64_t cleanerThrottleRateForTest() const noexcept {
@@ -2186,6 +2229,10 @@ public:
     /// Test-only: the cleaner's dedupe map budget (-2 = no cleaner).
     [[nodiscard]] int64_t cleanerDedupeBufferBytesForTest() const noexcept {
         return cleanerAgent_ ? cleanerAgent_->dedupeBufferBytesForTest() : -2;
+    }
+    /// Test-only (#658): bytes the cleaner's dedupe table really allocated (-2 = no cleaner).
+    [[nodiscard]] int64_t cleanerDedupeTableBytesForTest() const noexcept {
+        return cleanerAgent_ ? static_cast<int64_t>(cleanerAgent_->dedupeTableBytes()) : -2;
     }
     /// D25: completed log-cleaner cycles (0 when there is no cleaner) — tests
     /// wait on cleaner progress instead of sleeping.
@@ -2954,6 +3001,11 @@ private:
     bool                                         haltRaised_  = false;   // runtime thread only
     void onStorageFailure_(const std::string& logDir, int err);
     void refuseStartOnFailedRecovery_();
+    /// #839: a damaged segment in a system log (__catalog, __security, __consumer_offsets, __transaction_state,
+    /// __cluster_metadata) refuses the start (exit 74): their loaders replay state from the log and must never load around a
+    /// hole.  Called right after each of those logs is recovered, before its first reader.  Throws SystemLogDamaged.
+    struct SystemLogDamaged : std::runtime_error { using std::runtime_error::runtime_error; };
+    void refuseStartOnDamagedSystemLog_();
     void onInvariantViolation_(const std::string& what);
     int  recoveryFaultForTest_ = 0;
     bool skipProvisionerRunnerForTest_ = false;
@@ -3056,6 +3108,7 @@ private:
     // drain (kA2cCatalogHalted / kA2cCatalogApplied) into the metrics file.
     std::int64_t                     catalogHaltedValue_  = 0;    // control-thread-owned (0 = applying)
     std::int64_t                     catalogAppliedValue_ = -1;   // control-thread-owned
+    std::int64_t                     bootDamagedSegments_ = 0;    // #839: set once by refuseStartOnFailedRecovery_ (start thread)
     void publishCatalogMetrics_() noexcept;
     // D9 review MEDIUM-3 / #359: the TCS sinks (control thread) - stuck markers, stuck txn offset commits + oldest age.
     static bool publishStuckMarkers_(void* self, std::int64_t value);
@@ -3078,11 +3131,12 @@ private:
     struct ObserverSlots { RuneMetricSlot role, term, outOfSync; };
     ObserverSlots                                         observerSlots_{};     // observer thread only (publishRole)
 #if defined(__linux__)
-    std::optional<metrics::SystemMetrics>                 systemMetrics_;      // control thread (D62)
+    std::optional<metrics::SystemMetrics>                 systemMetrics_;      // sampled by the ADMIN agent (#632, was D62 control)
 #endif
     bool                                                  metricsReady_ = false;   // set by start(), before agents
     std::string                                           metricsPath_;
     void createMetrics_();   // startup thread: steps 1-4 of the plan's start order
+    void discardMetricsFile_() noexcept;   // #631: a refusal after the file was created removes it
     /// A control-thread store into a MetricOwner::Control row.
     void controlSet_(RuneMetric m, std::int64_t v) noexcept {
         slots_[static_cast<std::size_t>(runeMetricRow(m))].set(v, MetricOwner::Control);

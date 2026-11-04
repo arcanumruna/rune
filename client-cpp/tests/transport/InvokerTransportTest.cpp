@@ -1055,7 +1055,7 @@ TEST(AeronTransportRegression, SeedAndLeaderPairsOwnTheirOwnResponseSubscription
     ASSERT_TRUE(t.seedResponseCorrelated());
     const int32_t slot = t.seedResponseSlotForTest();
     ASSERT_GE(slot, 0);
-    EXPECT_EQ(t.subSlotOwnersForTest(slot), 1u);
+    const uint64_t pairsBefore = t.responseSubsAddedForTest();
 
     // A second owner: a leader session's correlated control publication to the SAME gateway.
     const std::string gwA = loopback(reqA);
@@ -1063,7 +1063,8 @@ TEST(AeronTransportRegression, SeedAndLeaderPairsOwnTheirOwnResponseSubscription
     ASSERT_TRUE(respCtl.has_value());
     const Transport::PubHandle h = t.responsePublicationHandle(gwA, 3551, *respCtl);
     ASSERT_NE(h, Transport::kNoPub);
-    EXPECT_EQ(t.subSlotOwnersForTest(slot), 1u) << "the seed's response subscription is never shared (one-shot per pair)";
+    EXPECT_EQ(t.responseSubsAddedForTest(), pairsBefore + 1) << "the leader's pair registered its OWN response subscription";
+    EXPECT_NE(t.responseSubSlotForTest(h), slot) << "the seed's response subscription is never shared (one-shot per pair)";
 
     // The seed fails over to B: only the seed's share is released.
     ASSERT_TRUE(t.retarget(loopback(reqB), rB));
@@ -1087,6 +1088,376 @@ TEST(AeronTransportRegression, SeedAndLeaderPairsOwnTheirOwnResponseSubscription
         return !got.empty();
     }));
     EXPECT_EQ(got, reply);
+    t.stop();
+}
+
+// #764: a slot's kind is its own state. A ResponsePair slot has exactly one owner and retires on its own release; only a
+// SharedMdc slot carries a refcount. A shared-MDC user of the SAME (channel, stream) as a response pair never joins the pair.
+TEST(AeronTransportRegression, ResponsePairSlotRetiresOnItsOwnReleaseRegression) {
+    const uint16_t reqA = rune::client::testing::allocFreeUdpPort(), rA = rune::client::testing::allocFreeUdpPort();
+    Config c = responseConfig(loopback(reqA), rA, 3580);
+    Transport t{c};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    const int32_t seedSlot = t.seedResponseSlotForTest();
+    const auto respCtl = rune::client::transport::responseControlChannelFor(loopback(reqA), rA);
+    ASSERT_TRUE(respCtl.has_value());
+    const auto reap = [&] { for (int i = 0; i < 3; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); } };
+
+    // Cell 1: an MDC user of the seed pair's own (channel, stream) gets its own slot, never the pair's.
+    t.addEgressSubscription(*respCtl, c.egressStreamId);
+    const int32_t sameKey = t.mdcSubSlotForTest(*respCtl, c.egressStreamId);
+    ASSERT_GE(sameKey, 0);
+    EXPECT_NE(sameKey, seedSlot) << "a shared-MDC user joined the response pair's one-shot slot";
+    EXPECT_EQ(t.subSlotMdcRefsForTest(sameKey), 1u);
+
+    // Cell 2: one MDC subscription shared by two users (refs 2) and one response pair.
+    t.addEgressSubscription("aeron:ipc", 3581);
+    t.addEgressSubscription("aeron:ipc", 3581);
+    const int32_t mdc = t.mdcSubSlotForTest("aeron:ipc", 3581);
+    ASSERT_GE(mdc, 0);
+    EXPECT_EQ(t.subSlotMdcRefsForTest(mdc), 2u);
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3582, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    const int32_t pair = t.responseSubSlotForTest(h);
+    ASSERT_GE(pair, 0);
+    EXPECT_TRUE(t.subSlotLiveForTest(pair));
+
+    t.releaseSubSlotOwnerForTest(pair);   // the pair's one owner leaves
+    reap();
+    EXPECT_FALSE(t.subSlotLiveForTest(pair)) << "the pair slot retires at once on its own release";
+    EXPECT_TRUE(t.subSlotLiveForTest(mdc));
+    EXPECT_EQ(t.subSlotMdcRefsForTest(mdc), 2u) << "the pair's release never touches the MDC refcount";
+
+    t.releaseSubSlotOwnerForTest(mdc);    // one MDC user leaves: still Live with refs 1
+    reap();
+    EXPECT_TRUE(t.subSlotLiveForTest(mdc));
+    EXPECT_EQ(t.subSlotMdcRefsForTest(mdc), 1u);
+    t.releaseSubSlotOwnerForTest(mdc);    // the last one leaves: Retired, then reaped
+    reap();
+    EXPECT_FALSE(t.subSlotLiveForTest(mdc));
+    t.stop();
+}
+
+// A response-control channel the driver refuses (an unparsable receive buffer size): the registration is Rejected.
+constexpr const char* kRefusedResponseChannel = "aeron:udp?control=127.0.0.1:9|control-mode=response|so-rcvbuf=abc";
+
+// #754: a sub slot is released by its INDEX through retireSubSlot_, never by position: the table is never shrunk, so
+// no other slot's index (respSeedSlot_, a PubSlot mode) can move or vanish.  The reachable cell is start(): a response
+// subscription the driver refuses is dropped and the declared path is used.
+TEST(AeronTransportRegression, ReleasingAnInnerSubSlotNeverDropsTheLastRegression) {
+    {
+        const uint16_t reqA = rune::client::testing::allocFreeUdpPort();
+        Transport t{invokerConfig(loopback(reqA), loopback(rune::client::testing::allocFreeUdpPort()), 3590)};
+        t.setSeedResponseChannelForTest(kRefusedResponseChannel);
+        t.start();
+        EXPECT_FALSE(t.seedResponseCorrelated()) << "the unbound response sub falls back to the declared path";
+        EXPECT_EQ(t.subSlotCountForTest(), 1u) << "the dropped slot was removed by position (pop_back), not retired by index";
+        EXPECT_FALSE(t.subSlotLiveForTest(0)) << "the dropped slot is Retired";
+        for (int i = 0; i < 3; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }
+        EXPECT_EQ(t.subSlotCountForTest(), 1u) << "reaped to Free, never erased";
+        t.stop();
+    }
+    {   // three response pairs (slots 0, 1, 2): releasing the middle one leaves the last Live
+        Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3591)};
+        t.start();
+        const auto respCtl = rune::client::transport::responseControlChannelFor(loopback(40001), 40002);
+        ASSERT_TRUE(respCtl.has_value());
+        Transport::PubHandle h[3];
+        int32_t slot[3];
+        for (int i = 0; i < 3; ++i) {
+            h[i] = t.responsePublicationHandle(loopback(static_cast<uint16_t>(41000 + i)), 3592 + i, *respCtl);
+            ASSERT_NE(h[i], Transport::kNoPub);
+            slot[i] = t.responseSubSlotForTest(h[i]);
+        }
+        EXPECT_EQ(slot[0], 0);
+        EXPECT_EQ(slot[1], 1);
+        EXPECT_EQ(slot[2], 2);
+        EXPECT_EQ(t.responseSubsAddedForTest(), 3u);
+        t.releaseSubSlotOwnerForTest(slot[1]);
+        for (int i = 0; i < 3; ++i) { t.dutyCycle(); t.poll([](const uint8_t*, std::size_t) {}, 10); }
+        EXPECT_TRUE(t.subSlotLiveForTest(slot[0]));
+        EXPECT_FALSE(t.subSlotLiveForTest(slot[1]));
+        EXPECT_TRUE(t.subSlotLiveForTest(slot[2])) << "releasing slot 1 dropped the last slot";
+        EXPECT_EQ(t.responseSubSlotForTest(h[2]), slot[2]);
+        EXPECT_EQ(t.subSlotCountForTest(), 3u);
+        t.stop();
+    }
+}
+
+// ---- #763: a Resolution that leaves its owner never orphans a pending driver registration ---------------------------
+
+namespace {
+// The embedded driver reads these once at start: a released publication is freed within ~tens of ms, not 5 s.
+struct FastLingerEnv {
+    FastLingerEnv() {
+        ::setenv("AERON_PUBLICATION_LINGER_TIMEOUT", "10ms", 1);
+        ::setenv("AERON_TIMER_INTERVAL", "10ms", 1);
+    }
+    ~FastLingerEnv() {
+        ::unsetenv("AERON_PUBLICATION_LINGER_TIMEOUT");
+        ::unsetenv("AERON_TIMER_INTERVAL");
+    }
+};
+
+// Drives the transport until the publication whose registered channel ends with `suffix` has been created by the
+// driver AND is gone again (released and lingered) with nothing left draining; false at the 10 s failure deadline.
+bool createdThenReleased(Transport& t, const std::string& suffix, bool& created) {
+    created = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        t.dutyCycle();
+        if (t.publisherLimitCountersForTest(suffix) >= 1) created = true;
+        t.poll([](const uint8_t*, std::size_t) {}, 10);
+        if (created && t.drainingPubsForTest() == 0 && t.publisherLimitCountersForTest(suffix) == 0) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST(AeronTransportRegression, UpgradeWhileThePlainPublicationIsResolvingLeavesNoOrphanRegression) {
+    FastLingerEnv env;
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3600)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, 40900);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.publicationHandle(worker, 3601);
+    const uint8_t frame[] = {1};
+    EXPECT_FALSE(t.offerOn(h, frame, sizeof frame)) << "Resolving: the registration is sent, the driver is not pumped yet";
+    EXPECT_EQ(t.drainingPubsForTest(), 0u);
+
+    ASSERT_EQ(t.upgradeToResponsePublication(worker, 3601, *respCtl), h);
+    EXPECT_TRUE(t.publicationIsResponsePairedForTest(h));
+    EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving plain registration was reset, not drained";
+
+    bool created = false;
+    EXPECT_TRUE(createdThenReleased(t, worker, created)) << "the plain publication the driver completed was never released";
+    EXPECT_TRUE(created);
+    t.stop();
+}
+
+TEST(AeronTransportRegression, RePairWhileThePublicationIsResolvingLeavesNoOrphanRegression) {
+    FastLingerEnv env;
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3610)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, 40901);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3611, *respCtl);
+    ASSERT_NE(h, Transport::kNoPub);
+    const uint8_t frame[] = {1};
+    bool correlated = false;
+    for (int i = 0; i < 2'000'000 && !correlated; ++i) {   // hard cap: phase 1 resolves the response subscription
+        t.dutyCycle();
+        (void)t.offerOn(h, frame, sizeof frame);
+        correlated = t.publicationResponseCorrelated(h);
+    }
+    ASSERT_TRUE(correlated);   // the correlated publication is now registered and Resolving: nothing pumped since
+    const std::string suffix = worker + "|response-correlation-id=" + std::to_string(t.responseSubscriptionIdForTest(h));
+    EXPECT_EQ(t.drainingPubsForTest(), 0u);
+
+    ASSERT_TRUE(t.rePairResponsePublication(h));
+    EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving request publication was reset, not drained";
+    bool created = false;
+    EXPECT_TRUE(createdThenReleased(t, suffix, created)) << "the request publication the driver completed was never released";
+    EXPECT_TRUE(created);
+    t.stop();
+}
+
+// #763 sibling class: a retarget whose new default publication is still registering when its (wall-clock) resolve bound
+// runs out used to drop the local Resolution: the driver later completed a publication nobody owned.  The driver is
+// stalled (dutyCycle pumps nothing) so the registration stays Resolving; the injected clock never reaches a deadline.
+TEST(AeronTransportRegression, RetargetThatTimesOutWhileResolvingLeavesNoOrphanRegression) {
+    FastLingerEnv env;
+    const std::string oldGw = loopback(rune::client::testing::allocFreeUdpPort());
+    const std::string newGw = loopback(rune::client::testing::allocFreeUdpPort());
+    Transport t{invokerConfig(oldGw, "aeron:ipc", 3630)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    ASSERT_EQ(t.drainingPubsForTest(), 0u);
+
+    t.setDriverStalledForTest(true, 20'000'000LL);   // 20 ms wall bound
+    EXPECT_FALSE(t.retarget(newGw)) << "the driver was stalled: the new publication cannot have resolved";
+    t.setDriverStalledForTest(false);
+    EXPECT_EQ(t.ingressChannel(), oldGw) << "a failed retarget keeps the old channel";
+    EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving registration was dropped, not drained";
+
+    bool created = false;
+    EXPECT_TRUE(createdThenReleased(t, newGw, created)) << "the publication the driver completed was never released";
+    EXPECT_TRUE(created);
+    t.stop();
+}
+
+// A per-stream publication still registering on the OLD default channel when a retarget succeeds: streamPub_ is
+// cleared, so nothing would poll it again; its registration is parked in the drain set and released.
+TEST(AeronTransportRegression, RetargetWithAStreamPublicationStillResolvingLeavesNoOrphanRegression) {
+    FastLingerEnv env;
+    const std::string oldGw = loopback(rune::client::testing::allocFreeUdpPort());
+    const std::string newGw = loopback(rune::client::testing::allocFreeUdpPort());
+    Transport t{invokerConfig(oldGw, "aeron:ipc", 3640)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const Transport::PubHandle h = t.publicationHandle(t.ingressChannel(), 3641);
+    const uint8_t frame[] = {1};
+    EXPECT_FALSE(t.offerOn(h, frame, sizeof frame)) << "Resolving: the registration is sent, the driver is not pumped yet";
+    ASSERT_EQ(t.drainingPubsForTest(), 0u);
+
+    ASSERT_TRUE(t.retarget(newGw));
+    EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving stream registration was kept in the slot, not drained";
+    bool created = false;
+    EXPECT_TRUE(createdThenReleased(t, oldGw, created)) << "the old-channel stream publication was never released";
+    EXPECT_TRUE(created);
+    t.stop();
+}
+
+// releasePublication on a slot that is still registering parks the registration (it used to leave it alone).
+TEST(AeronTransportRegression, ReleasingAResolvingPublicationLeavesNoOrphanRegression) {
+    FastLingerEnv env;
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3650)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const Transport::PubHandle h = t.publicationHandle(worker, 3651);
+    const uint8_t frame[] = {1};
+    EXPECT_FALSE(t.offerOn(h, frame, sizeof frame)) << "Resolving: the registration is sent, the driver is not pumped yet";
+    ASSERT_EQ(t.drainingPubsForTest(), 0u);
+
+    t.releasePublication(h);
+    EXPECT_EQ(t.drainingPubsForTest(), 1u) << "the Resolving registration was left in the slot, not drained";
+    bool created = false;
+    EXPECT_TRUE(createdThenReleased(t, worker, created)) << "the released slot's publication was never closed";
+    EXPECT_TRUE(created);
+    t.stop();
+}
+
+TEST(AeronTransportRegression, ARetiredSubStillResolvingIsNeverResetRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3620)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto respCtl = rune::client::transport::responseControlChannelFor(worker, 40902);
+    ASSERT_TRUE(respCtl.has_value());
+    const Transport::PubHandle h = t.responsePublicationHandle(worker, 3621, *respCtl);   // the sub slot is added
+    const int32_t slot = t.responseSubSlotForTest(h);
+    ASSERT_GE(slot, 0);
+    t.poll([](const uint8_t*, std::size_t) {}, 10);   // a Live slot registers when polled: Resolving, the driver not pumped
+    t.releaseSubSlotOwnerForTest(slot);
+    for (int i = 0; i < 3; ++i) t.poll([](const uint8_t*, std::size_t) {}, 10);   // the driver was never pumped
+    EXPECT_FALSE(t.subSlotFreeForTest(slot)) << "a Retired sub whose registration is pending was reset (orphaned)";
+    ASSERT_TRUE(pumpUntil(t, [&] {
+        t.poll([](const uint8_t*, std::size_t) {}, 10);
+        return t.subSlotFreeForTest(slot);
+    })) << "the pending sub never completed and was never released";
+    t.stop();
+}
+
+// ---- #755: a response pair that cannot form gives up and falls back to the declared (plain) path -----------------------
+
+namespace {
+constexpr int64_t kResolveTimeoutNsForTest = 5'000'000'000LL;   // AeronTransport::kResolveMaxMs
+void pollOnce(Transport& t) { t.poll([](const uint8_t*, std::size_t) {}, 10); }
+} // namespace
+
+TEST(AeronTransportRegression, AResponseSubThatNeverResolvesFallsBackToTheDeclaredPathRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3630)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const uint8_t frame[] = {1};
+    const auto respCtl = [](uint16_t endpointPort, int32_t respPort) {
+        const auto c = rune::client::transport::responseControlChannelFor(loopback(endpointPort), respPort);
+        return c.value();
+    };
+
+    {   // cell 1: offerOn on a response handle; the driver is never pumped, so the sub stays Resolving
+        const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+        const auto h = t.responsePublicationHandle(worker, 3631, respCtl(41100, 1));
+        ASSERT_NE(h, Transport::kNoPub);
+        const int32_t slot = t.responseSubSlotForTest(h);
+        EXPECT_FALSE(t.offerOn(h, frame, sizeof frame));
+        EXPECT_TRUE(t.publicationIsResponsePairedForTest(h)) << "inside the deadline the pair is still awaited";
+        g_nowNs += kResolveTimeoutNsForTest + 1;
+        (void)t.offerOn(h, frame, sizeof frame);   // no dutyCycle
+        EXPECT_FALSE(t.publicationIsResponsePairedForTest(h)) << "past the deadline the handle stays response-paired forever";
+        pollOnce(t);
+        EXPECT_FALSE(t.subSlotLiveForTest(slot)) << "the abandoned response sub is retired";
+        EXPECT_FALSE(t.publicationResponseCorrelated(h));
+    }
+    {   // cell 2: upgrade of a plain handle (the response port was learnt late) that never resolves
+        const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+        const auto h = t.publicationHandle(worker, 3632);
+        ASSERT_EQ(t.upgradeToResponsePublication(worker, 3632, respCtl(41101, 1)), h);
+        const int32_t slot = t.responseSubSlotForTest(h);
+        ASSERT_TRUE(t.publicationIsResponsePairedForTest(h));
+        EXPECT_FALSE(t.offerOn(h, frame, sizeof frame));
+        g_nowNs += kResolveTimeoutNsForTest + 1;
+        (void)t.offerOn(h, frame, sizeof frame);
+        EXPECT_FALSE(t.publicationIsResponsePairedForTest(h));
+        pollOnce(t);
+        EXPECT_FALSE(t.subSlotLiveForTest(slot));
+    }
+    {   // cell 3: rePair of a response handle whose new sub never resolves
+        const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+        const auto h = t.responsePublicationHandle(worker, 3633, respCtl(41102, 1));
+        ASSERT_NE(h, Transport::kNoPub);
+        ASSERT_TRUE(t.rePairResponsePublication(h));
+        const int32_t slot = t.responseSubSlotForTest(h);
+        EXPECT_FALSE(t.offerOn(h, frame, sizeof frame));
+        g_nowNs += kResolveTimeoutNsForTest + 1;
+        (void)t.offerOn(h, frame, sizeof frame);
+        EXPECT_FALSE(t.publicationIsResponsePairedForTest(h));
+        pollOnce(t);
+        EXPECT_FALSE(t.subSlotLiveForTest(slot));
+    }
+    t.stop();
+}
+
+TEST(AeronTransportRegression, ARefusedResponseSubFallsBackToThePlainPathAtOnceRegression) {
+    Transport t{invokerConfig("aeron:ipc", "aeron:ipc", 3640)};
+    t.start();
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const std::string worker = loopback(rune::client::testing::allocFreeUdpPort());
+    const auto h = t.responsePublicationHandle(worker, 3641, kRefusedResponseChannel);
+    ASSERT_NE(h, Transport::kNoPub);
+    const int32_t slot = t.responseSubSlotForTest(h);
+    const uint8_t frame[] = {1};
+    ASSERT_TRUE(pumpUntil(t, [&] {   // the driver refuses the registration: Rejected, no clock advance
+        (void)t.offerOn(h, frame, sizeof frame);
+        return !t.publicationIsResponsePairedForTest(h);
+    })) << "a Rejected response sub kept the handle response-paired";
+    pollOnce(t);
+    EXPECT_FALSE(t.subSlotLiveForTest(slot));
+    t.stop();
+}
+
+TEST(SeedRePairRegression, ASeedRePairThatNeverResolvesIsAbandonedAtTheDeadlineRegression) {
+    const uint16_t reqPort = rune::client::testing::allocFreeUdpPort();
+    const uint16_t rPort   = rune::client::testing::allocFreeUdpPort();
+    Transport t{responseConfig(loopback(reqPort), rPort, 3650)};
+    t.start();
+    ASSERT_TRUE(t.seedResponseCorrelated());
+    t.setResolveClock(&fakeNow);
+    g_nowNs = 1'000'000'000;
+    const int64_t oldReg = t.seedResponseSubscriptionIdForTest();
+    const uint8_t frame[] = {1, 2};
+    ASSERT_TRUE(t.rePairSeedResponse(rPort));
+    EXPECT_FALSE(t.offer(frame, sizeof frame)) << "inside the deadline the re-pair is awaited (Retry)";
+    EXPECT_TRUE(t.seedRePairingForTest());
+    g_nowNs += kResolveTimeoutNsForTest + 1;
+    (void)t.offer(frame, sizeof frame);   // no dutyCycle: nothing resolved
+    EXPECT_FALSE(t.seedRePairingForTest()) << "a re-pair that cannot resolve stays in force forever";
+    EXPECT_EQ(t.seedResponseSubscriptionIdForTest(), oldReg) << "the old pair stays in force";
     t.stop();
 }
 

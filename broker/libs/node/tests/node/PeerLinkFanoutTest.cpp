@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include <type_traits>
+
 using namespace rune::node;
 
 namespace {
@@ -132,6 +134,43 @@ TEST(PeerLinkFanoutRegression, EveryEpochReachesAWorkerInOrderAcrossBackPressure
         EXPECT_EQ(msgs[0].epoch, 2u);
         EXPECT_EQ(msgs[1].epoch, 3u);
     }
+}
+
+// Issue #540: a later epoch of a peer never reaches a worker before an earlier epoch of that peer did.  In production
+// worker 1's ring can drain (its own thread) between E1's attempt and E2's attempt inside ONE pump call; the fake pool
+// models that: worker 1 answers Full once (for E1) and accepts afterwards.  E2 must still not reach worker 1 first.
+// Mutation: PeerLinkFanout::pumpWith `upTo = pool->workerCount()` (ignoring workerLimit) -> worker 1 gets {E2} first.
+namespace {
+struct FakeWorker {
+    std::vector<uint32_t> epochs;
+    int fullBudget = 0;
+    EnqueueResult enqueueOp(const WorkerOp& op) {
+        if (fullBudget > 0) { --fullBudget; return EnqueueResult::Full; }
+        epochs.push_back(static_cast<uint32_t>(op.partition));
+        return EnqueueResult::Enqueued;
+    }
+};
+struct FakePool {
+    FakeWorker workers[2];
+    int32_t workerCount() const { return 2; }
+    FakeWorker& worker(int32_t w) { return workers[w]; }
+};
+} // namespace
+
+TEST(PeerLinkFanoutRegression, OrderingLimitHoldsALaterEpochBehindAnEarlierOneRegression) {
+    FakePool pool;
+    pool.workers[1].fullBudget = 1;
+    PeerLinkFanout f;
+    f.post(2, keysAt(1, 1));
+    f.post(2, keysAt(2, 2));
+    (void)f.pumpWith(&pool, nullptr);
+    EXPECT_EQ(pool.workers[0].epochs, (std::vector<uint32_t>{1, 2}));
+    EXPECT_TRUE(pool.workers[1].epochs.empty()) << "E2 reached worker 1 before E1 did";
+    EXPECT_EQ(f.pendingForTest(), 2u);
+    (void)f.pumpWith(&pool, nullptr);
+    EXPECT_EQ(pool.workers[1].epochs, (std::vector<uint32_t>{1, 2}));
+    EXPECT_EQ(pool.workers[0].epochs, (std::vector<uint32_t>{1, 2})) << "no duplicate to worker 0";
+    EXPECT_EQ(f.pendingForTest(), 0u);
 }
 
 // Issue #540: more than kEpochSlots epochs pending for one peer - a destination would evict the oldest anyway, so the
@@ -290,4 +329,24 @@ TEST(PeerLinkFanoutRegression, AConsumedKeysRecordLeavesNoMasterBytesInTheRingRe
     ASSERT_EQ(msgs.size(), 1u);
     EXPECT_EQ(countOf(0xC3), 0u) << "the consumed record left the send master in the ring";
     EXPECT_EQ(countOf(0xC4), 0u) << "the consumed record left the recv master in the ring";
+}
+
+// Issue #546 sibling: Worker::enqueueOp took its WorkerOp BY VALUE, leaving a copy of a PeerLinkKeys op's masters in an
+// unscrubbed parameter (the caller can only scrub its own op).  It now takes const& (the encode reads the op and writes
+// the ring slot directly: there is no scratch copy), so the caller's scrub covers every copy.  tryEnqueueOp likewise.
+// Mutation: either signature back to by-value -> does not compile (red at these asserts).
+TEST(PeerLinkFanoutRegression, EnqueueOpNeverCopiesAKeyCarryingOpRegression) {
+    static_assert(std::is_same_v<decltype(&Worker::enqueueOp), EnqueueResult (Worker::*)(const WorkerOp&)>,
+                  "enqueueOp must not copy the op: its peerKeys would outlive the caller's scrub");
+    static_assert(std::is_same_v<decltype(&Worker::tryEnqueueOp), bool (Worker::*)(const WorkerOp&)>,
+                  "tryEnqueueOp must not copy the op");
+    auto p = pool(1);
+    WorkerOp op;
+    op.type = WorkerOp::Type::PeerLinkKeys; op.topicId = 2; op.partition = 3;
+    op.peerKeys.fill(0x5A);
+    ASSERT_EQ(p->worker(0).enqueueOp(op), EnqueueResult::Enqueued);
+    // The caller scrubs its (only) copy, exactly as PeerLinkFanout::pump does; nothing else holds the masters.
+    std::memset(op.peerKeys.data(), 0, op.peerKeys.size());
+    drainAll(*p);
+    EXPECT_TRUE(workerHolds(*p, 0, 2, 3)) << "the keys still reached the worker";
 }

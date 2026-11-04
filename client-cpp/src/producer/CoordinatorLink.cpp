@@ -3,6 +3,7 @@
 
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/TxnMessages.h>
 
 #include <algorithm>
 #include <cassert>
@@ -67,6 +68,68 @@ Verdict CoordinatorLink::classify(ReqKind kind, int16_t ec) noexcept {
         return Verdict::Abortable;                                     // 19 / unknown: the transaction can only abort
     }
     return Verdict::Abortable;
+}
+
+int CoordinatorLink::rank(ReqKind kind, int16_t ec) noexcept {
+    switch (classify(kind, ec)) {
+    case Verdict::Fenced:     return 5;
+    case Verdict::Fatal:      return 4;
+    case Verdict::Abortable:
+    case Verdict::Reject:     return 3;
+    case Verdict::Rediscover: return 2;
+    case Verdict::Retry:      return 1;
+    case Verdict::Ok:         return 0;
+    }
+    return 0;
+}
+
+namespace {
+/// The worst code among `results` naming (topicId, partition); `missing` when none does.
+template <class Results>
+int16_t worstFor(ReqKind kind, const Results& results, int32_t topicId, int32_t partition, int16_t missing) noexcept {
+    int16_t worst = 0;
+    int     best  = -1;
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        const auto r = results[i];
+        if (r.topicId != topicId || r.partition != partition) continue;
+        const int k = CoordinatorLink::rank(kind, r.errorCode);
+        if (k > best) { best = k; worst = r.errorCode; }
+    }
+    return best < 0 ? missing : worst;
+}
+}  // namespace
+
+int16_t CoordinatorLink::requestedWorst(const CoordAnswer& a) const noexcept {
+    if (a.anyKind || (a.kind != ReqKind::AddPartitions && a.kind != ReqKind::TxnOffsetCommit)) return a.errorCode;
+    if (!coordcorr::isCoord(a.corrId) || coordcorr::ordinal(a.corrId) != (ordinal_ & batchcorr::kMaxOrdinal)) return a.errorCode;
+    const std::size_t i = coordcorr::slot(a.corrId);
+    if (i >= capacity_) return a.errorCode;
+    const Slot& s = slots_[i];
+    if (std::holds_alternative<Free>(s.state) || s.corrId != a.corrId || s.kind() != a.kind) return a.errorCode;
+    const std::size_t flen = std::min<std::size_t>(s.frameLen(), s.frame.size());
+    int16_t worst = 0;
+    int     best  = 0;
+    auto take = [&](int16_t code) {
+        const int k = rank(a.kind, code);
+        if (k > best) { best = k; worst = code; }
+    };
+    if (a.kind == ReqKind::AddPartitions) {
+        const auto req = rpc::AddPartitionsToTxn::decode(s.frame.data(), flen);
+        const auto rsp = rpc::AddPartitionsToTxnResponse::decode(a.frame.data(), a.frame.size());
+        if (!req || !rsp) return a.errorCode;
+        for (std::size_t k = 0; k < req->partitions.size(); ++k) {
+            const auto tp = req->partitions[k];
+            take(worstFor(a.kind, rsp->results, tp.topicId, tp.partition, kInvalidRequest));
+        }
+    } else {
+        const auto req = rpc::TxnOffsetCommit::decode(s.frame.data(), flen);
+        const auto rsp = rpc::TxnOffsetCommitResponse::decode(a.frame.data(), a.frame.size());
+        if (!req || !rsp) return a.errorCode;
+        for (const auto& e : req->entries) {
+            take(worstFor(a.kind, rsp->results, e.topicId, e.partition, kInvalidRequest));
+        }
+    }
+    return worst;
 }
 
 int64_t CoordinatorLink::backoffNs(uint32_t attempt) noexcept {

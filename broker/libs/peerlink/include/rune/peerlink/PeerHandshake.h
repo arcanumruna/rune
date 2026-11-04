@@ -195,6 +195,12 @@ public:
     [[nodiscard]] uint64_t macComputations() const noexcept { return macOps_; }
     [[nodiscard]] const LinkState& state() const noexcept { return state_; }
     [[nodiscard]] bool initiator() const noexcept { return self_ < peer_; }
+    /// Issue #554: would answering a Hello (v1 or v2) naming (from, to, keyId) cost crypto (a cookie HMAC, an X25519
+    /// base-point multiplication, the Challenge MAC)?  These are the crypto-free checks answerHello_ / answerHelloV2_
+    /// make first: a responder, the right peer pair, a key id we hold.  Anything else is refused cheaply.
+    [[nodiscard]] bool helloNeedsCrypto(int32_t from, int32_t to, uint64_t keyId) const noexcept {
+        return !initiator() && from == peer_ && to == self_ && keys_.byId(keyId) != nullptr;
+    }
     [[nodiscard]] int32_t peer() const noexcept { return peer_; }
 
 private:

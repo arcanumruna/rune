@@ -53,7 +53,12 @@ public:
     }
 
     /// Control thread, every duty cycle.  `admin` may be null (no admin thread).  Returns the number delivered.
-    int pump(WorkerPool* pool, OneToOneByteRing* admin) {
+    int pump(WorkerPool* pool, OneToOneByteRing* admin) { return pumpWith<WorkerPool>(pool, admin); }
+
+    /// The pump body, templated on the pool type only as a test seam (a fake pool lets a test drain a ring between two
+    /// attempts of one pump); header-only, no virtuals.
+    template <class Pool>
+    int pumpWith(Pool* pool, OneToOneByteRing* admin) {
         int work = 0;
         for (std::size_t i = 0; i < pending_.size(); ) {
             Pending& p = pending_[i];
@@ -76,7 +81,7 @@ public:
                     op.isolation = static_cast<uint8_t>(p.keys.install);   // issue #241: the install mode
                     std::memcpy(op.peerKeys.data(), p.keys.sendMaster.data(), 32);
                     std::memcpy(op.peerKeys.data() + 32, p.keys.recvMaster.data(), 32);
-                    const EnqueueResult r = pool->worker(w).enqueueOp(std::move(op));
+                    const EnqueueResult r = pool->worker(w).enqueueOp(op);
                     scrub_(op.peerKeys.data(), op.peerKeys.size());
                     if (r == EnqueueResult::Full) break;   // back-pressure: this worker again next cycle
                     if (r == EnqueueResult::TooLarge) [[unlikely]]

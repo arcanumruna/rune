@@ -323,6 +323,7 @@ int CatalogApplier::applyRange_(rune::storage::Log* log, int64_t bound) {
         case st::ReadIntoStatus::Absent:
             cannotRead(from, "Absent — the log holds no batch at or after it");
             return applied;
+        case st::ReadIntoStatus::Corrupt:
         case st::ReadIntoStatus::Unreadable:
             cannotRead(from, "unreadable — torn or corrupt bytes");
             return applied;
