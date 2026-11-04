@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -22,6 +23,8 @@
 
 #include <rune/codec/Descriptor.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/Log.h>
+#include <rune/storage/LogCleaner.h>
 #include <rune/storage/LogReadView.h>
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewRow.h>
@@ -1534,4 +1537,123 @@ TEST(WorkerViewSetRegression, PersistedRetractableMovesDeltasFitTheRingRegressio
     const rune::node::ViewFoldCounters* fc = vs.foldCounters(0x4000000C, 0);
     ASSERT_NE(fc, nullptr);
     EXPECT_EQ(fc->aggInconsistent, 0u);
+}
+
+namespace {
+// One batch per segment: [0] key 0, [1, kN] keys 1..kN, [kN+1, 2kN] keys 1..kN again, then the active segment.  The
+// cleaner empties [1, kN], so a cursor at 1 sits in a gap whose next segment starts kN records on.
+// `batch(base, firstKey, count, pass)` builds one batch.
+struct GapLog {
+    static constexpr int64_t kN = 20000;   // well over the ~5K records a pass of these views may fold
+    rune::storage::Log log;
+    std::vector<uint8_t> scratch = std::vector<uint8_t>(4 << 20);
+    template <class BatchFn>
+    GapLog(const std::string& dir, BatchFn&& batch) : log(dir, /*segmentBytes=*/1) {
+        log.recover();
+        const auto put = [&](int64_t base, int64_t firstKey, int64_t count, int pass) { log.append(batch(base, firstKey, count, pass), base + count - 1); };
+        put(0, 0, 1, 1);
+        put(1, 1, kN, 1);
+        put(kN + 1, 1, kN, 2);
+        put(2 * kN + 1, 0, 1, 3);
+        rune::storage::LogCleaner cleaner;
+        cleaner.clean(log, 0, log.segmentBaseOffsets().back(), 0, 1'000'000);
+        log.reloadSegments();
+    }
+    [[nodiscard]] int64_t bound() const { return 2 * kN + 1; }
+    rune::storage::LogReadView read(int64_t from, int64_t to) {   // the worker's readNoFault_
+        rune::storage::ReadIntoStatus st;
+        return log.readInto(from, 512 * 1024, scratch.data(), scratch.size(), st, to);
+    }
+};
+std::vector<uint8_t> charBatch(int64_t base, int64_t firstKey, int64_t count, int pass) {
+    rune::protocol::RecordBatchBuilder b(base, 0);
+    for (int64_t i = 0; i < count; ++i) {
+        const auto k = keyBytes(firstKey + i);
+        const auto v = encodeCharacter(firstKey + i, pass, 1);
+        b.append(asSv(k), asSv(v), 0);
+    }
+    return b.build();
+}
+// Drives `pass()` until the view's foldCursor reaches the bound (at most 1000 passes and 10 s).  Every pass that moves the
+// cursor moves it by at most the view's cap and reports work.
+template <class PassFn>
+int crossGap(rune::node::WorkerViewSet& vs, rune::node::ViewSnapshotChannel& ch, int32_t view, int64_t bound, PassFn&& pass) {
+    const int64_t cap = vs.maxRecordsPerPassForTest(view, 0);
+    EXPECT_GT(cap, 0);
+    EXPECT_GT(GapLog::kN, cap) << "the gap must be longer than one pass";
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    int passes = 0;
+    while (vs.instanceServeState(view, 0).foldCursor < bound && passes < 1000 && std::chrono::steady_clock::now() < deadline) {
+        const int64_t before = vs.instanceServeState(view, 0).foldCursor;
+        const int work = pass();
+        (void)drainDeltas(ch);
+        ++passes;
+        const int64_t after = vs.instanceServeState(view, 0).foldCursor;
+        EXPECT_LE(after - before, cap) << "pass " << passes;
+        if (after != before) EXPECT_GT(work, 0) << "pass " << passes << " moved the cursor " << before << " -> " << after;
+    }
+    EXPECT_EQ(vs.instanceServeState(view, 0).foldCursor, bound) << "after " << passes << " passes";
+    return passes;
+}
+} // namespace
+
+// REGRESSION: a persisted view folds at most maxRecordsPerPass records a pass, and read only to that pass bound.  Its
+// cursor in a compacted gap at the end of a segment, with the next segment more than maxRecordsPerPass records on, read
+// empty on every pass (the log stops at the next segment base at or above the read end): the view never moved again.
+TEST(WorkerViewSetRegression, PersistedViewAdvancesAcrossACompactionGapAtASegmentEndRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, 0x4000000B).value();
+    GapLog g(freshDir("rune-views-gap-log"), charBatch);
+    auto rr = [&](int64_t from, int64_t to) { return g.read(from, to); };
+    ASSERT_TRUE(rr(1, GapLog::kN + 1).empty());   // the gap: nothing at 1 below the next segment's base
+    ASSERT_FALSE(rr(1, GapLog::kN + 2).empty());
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-gap"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    (void)vs.driveFolds(5, 0, rr, g.bound(), rune::view::kNoSkip, 0);   // creates the instance (folds offset 0)
+    crossGap(vs, ch, 0x4000000B, g.bound(), [&] { return vs.driveFolds(5, 0, rr, g.bound(), rune::view::kNoSkip, 0); });
+    for (int64_t key : {int64_t{0}, int64_t{1}, GapLog::kN / 2, GapLog::kN}) EXPECT_EQ(slotOf(vs, 0x4000000B, 0, uint64_t(key), 1).i, key == 0 ? 1 : 2) << key;
+}
+
+// The restart rebuild drives the same fold: a recovered instance in that gap reaches Ready.
+TEST(WorkerViewSetRegression, RebuildAdvancesAcrossACompactionGapAtASegmentEndRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, 0x4000000B).value();
+    GapLog g(freshDir("rune-views-gap-rebuild-log"), charBatch);
+    auto rr = [&](int64_t from, int64_t to) { return g.read(from, to); };
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-gap-rebuild"));
+    vs.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, 0, {}, {}, g.bound());
+    ASSERT_EQ(vs.readiness(0x4000000B, 0), rune::node::ViewReadiness::RebuildingViews);
+    crossGap(vs, ch, 0x4000000B, g.bound(), [&] { return vs.driveRebuild(5, 0, rr, g.bound(), rune::view::kNoSkip, 0); });
+    EXPECT_EQ(vs.readiness(0x4000000B, 0), rune::node::ViewReadiness::Ready);
+    EXPECT_EQ(slotOf(vs, 0x4000000B, 0, uint64_t(GapLog::kN), 1).i, 2);
+}
+
+// The aggregate fold crosses the same gap.
+TEST(WorkerViewSetRegression, PersistedAggregateAdvancesAcrossACompactionGapAtASegmentEndRegression) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userTotalsPlan(0), srcs, 0x40000009).value();
+    GapLog g(freshDir("rune-views-gap-agg-log"), [](int64_t base, int64_t firstKey, int64_t count, int pass) {
+        std::vector<std::array<int64_t, 3>> recs;
+        for (int64_t i = 0; i < count; ++i) recs.push_back({firstKey + i, (firstKey + i) % 10, pass});
+        return orderBatch(base, recs);
+    });
+    auto rr = [&](int64_t from, int64_t to) { return g.read(from, to); };
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-gap-agg"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    (void)vs.driveFolds(6, 0, rr, g.bound(), rune::view::kNoSkip, 0);
+    crossGap(vs, ch, 0x40000009, g.bound(), [&] { return vs.driveFolds(6, 0, rr, g.bound(), rune::view::kNoSkip, 0); });
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = vs.getRow(0x40000009, 0, 1, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, GapLog::kN / 10);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 2 * (GapLog::kN / 10));
 }

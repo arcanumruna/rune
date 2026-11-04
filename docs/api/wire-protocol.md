@@ -92,10 +92,10 @@ security 64 to 95.
 | 52 | `TxnOffsetCommitResponse` | B→C | `results` |
 | 53 | `EndTxn` | C→B | `producerId`, `producerEpoch`, `commit`, `transactionalId` |
 | 54 | `EndTxnResponse` | B→C | `errorCode` |
-| 64 | `DefineTopic` | C→B | `topicName`, `partitionCount`, `keyField`, `validate` (sent as 1 for a typed topic; a broker of this version ignores it, typed topics always validate), `descriptorBlob`, `persistence`, `replicationFactor`, DDL extension |
+| 64 | `DefineTopic` | C→B | `topicName`, `partitionCount`, `keyField`, `validate` (sent as 1 for a typed topic; a broker of this version ignores it, typed topics always validate), `descriptorBlob`, `persistence`, `replicationFactor`, DDL extension, key features (optional; sent only when the features are not the defaults, and only to a broker of version 10 or later) |
 | 65 | `DefineTopicResponse` | B→C | `topicId`, `version`, `errorCode` |
 | 66 | `GetTopicSchema` | C→B | `topicName`, `requestedFingerprint` (0 = latest; `~0` = the evolving lineage) |
-| 67 | `TopicSchemaResponse` | B→C | `topicId`, `version`, `errorCode`, `descriptorBlob`, `partitionCount` |
+| 67 | `TopicSchemaResponse` | B→C | `topicId`, `version`, `errorCode`, `descriptorBlob`, `partitionCount`, key features (optional) |
 | 68 | `AlterTopic` | C→B | `topicName`, `expectedVersion`, `opsBlob`, DDL extension |
 | 69 | `AlterTopicResponse` | B→C | `topicId`, `newVersion`, `errorCode` |
 | 70 | `CreateView` | C→B | `viewName`, `keyField`, `persistence`, `planBlob`, DDL extension |
@@ -153,6 +153,19 @@ The `recordBatch` of `Produce` and `Records` is the on-disk batch, Kafka v2 layo
 | 53 | `baseSequence` | i32 |
 | 57 | `recordCount` | i32 |
 | 61 | records (zigzag-varint framed) | |
+
+Each record has its own `attributes` byte. Bits 0 and 1 are the **write intent** (client version 17, typed topics with a
+key index):
+
+| Bits 0-1 | Live record (a value) | Tombstone (empty value) |
+|---|---|---|
+| 0 | upsert | remove (no error when the key is absent) |
+| 1 | insert: `KeyExists` (56) when the key exists | refused: `InvalidRequest` |
+| 2 | update: `KeyNotFound` (57) when the key is absent | removeExisting: `KeyNotFound` (57) when the key is absent |
+| 3 | `InvalidRequest` | `InvalidRequest` |
+
+The other bits are reserved and answered `InvalidRequest`. On a raw topic the bits are stored as sent and not
+interpreted.
 
 ## Authentication flow (SCRAM-SHA-512)
 
@@ -216,7 +229,25 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
 - **Limits and refusals**: the client sends at most 4096 records in a `View` batch (a verdict source refuses more). A `View` produce is answered `InvalidRequest` on the
   legacy gateway stream, while the cluster feature level is below checked writes, or without a replica to fold from. A
   `View` bit on a transactional batch is ignored. Error codes 55 to 61 are sent only to sessions at 17 or above.
+- **Intents** (record `attributes` bits 0-1, see [Record batch](#record-batch-v2)) are judged against the topic's key
+  index when the batch is folded, in offset order, each record against the accepted records before it. A rejected intent
+  is a `View` trailer entry with `code` 56 or 57 and `constraintId` 0. An intent is refused with `InvalidRequest` on a
+  topic without `key.index`, on the legacy gateway stream, below feature level 5, without an idempotent producer and the
+  `View` bit, or inside a transaction or an atomic batch. While a new key index has not yet been logged in the partition's constraint set
+  the broker answers `NotLeader` (retriable). Plain upserts and deletes need none of this and are never rejected by the
+  key index.
 - On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
+- **Key features** (`DefineTopic`, `TopicSchemaResponse`): a 14-byte block, little-endian
+  ([`CatalogTypes.h`](../../protocol/include/rune/protocol/CatalogTypes.h)). On `DefineTopic` it follows the DDL
+  extension and needs it; on `TopicSchemaResponse` it follows `partitionCount` and is sent only for a topic whose
+  features are not the defaults (an older decoder stops before it).
+
+  | Offset | Field | Type |
+  |---|---|---|
+  | 0 | `flags`: bit 0 `keyIndex`, bit 1 `autoIncrement`; other bits make the frame undecodable | u8 |
+  | 1 | `partitioner`: 0 `Fnv1a`, 1 `Modulo`; above 1 is undecodable | u8 |
+  | 2 | `autoIncrementMax` (default 2^53 - 1) | u64 |
+  | 10 | `autoIncrementReserve` (default 4096) | u32 |
 
 ## Encrypted frames (TLS 1.3 / AEAD)
 

@@ -27,6 +27,7 @@ struct SchemaState {
     uint16_t                schemaVersion = 1;
     uint16_t                nextTag       = 0;
     rune::codec::CompatMode compat        = rune::codec::CompatMode::Backward;
+    rune::protocol::TopicKeyFeatures keyFeatures{};
     bool operator==(const SchemaState&) const = default;
 };
 struct TopicObject {

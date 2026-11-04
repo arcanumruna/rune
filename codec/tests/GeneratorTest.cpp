@@ -102,7 +102,7 @@ TEST(GeneratorRegression, FlyweightSettersChainByValueWithoutReloadingThePointer
     EXPECT_EQ(hdr.find("PositionEncoder& zone("), std::string::npos) << "no reference chaining";
     EXPECT_NE(hdr.find("        uint8_t* const p = p_;\n"
                        "        ::rune::codec::fly::store<int32_t>(p + 4u + 8u, v);\n"
-                       "        return PositionEncoder(p, Rebind{});\n"),
+                       "        return PositionEncoder(p, Rebind_{});\n"),
               std::string::npos);
     EXPECT_NE(hdr.find("[[gnu::always_inline]] PositionClaimEncoder zone(int32_t v) noexcept {\n"
                        "        return PositionClaimEncoder(PositionEncoder::zone(v));\n"),
@@ -118,7 +118,7 @@ TEST(Generator, NoFlyweightsForASchemaWithVarLenFields) {
     const std::string hdr = generateHeader(d);
     EXPECT_EQ(hdr.find("Encoder"), std::string::npos);
     EXPECT_EQ(hdr.find("Decoder"), std::string::npos);
-    EXPECT_NE(hdr.find("size_t encode(uint8_t* buf) const noexcept"), std::string::npos)
+    EXPECT_NE(hdr.find("size_t encode(uint8_t* buf_) const noexcept"), std::string::npos)
         << "var-len schemas keep today's struct + encode()";
 }
 
@@ -190,4 +190,13 @@ TEST(Generator, RetiredFieldsGetNoFilterMember) {
 TEST(GeneratorRegression, AFieldNamedEncodeToIsRejectedRegression) {
     auto d = DescriptorBuilder("t").add("encodeTo", PrimType::Int64).build();
     EXPECT_THROW((void)generateHeader(d), std::invalid_argument);
+}
+
+TEST(GeneratorRegression, AFieldNameEndingInUnderscoreIsRejectedRegression) {
+    // A trailing '_' is the generator's own (locals, parameters, private members: n_, p_, decodeAny_, ...).
+    for (const char* name : {"n_", "p_", "decodeAny_", "x__"}) {
+        auto d = DescriptorBuilder("t").add("id", PrimType::Int64).add(name, PrimType::Int64).build();
+        EXPECT_THROW((void)generateHeader(d), std::invalid_argument) << name;
+    }
+    EXPECT_NO_THROW((void)generateHeader(DescriptorBuilder("t").add("_n", PrimType::Int64).add("a_b", PrimType::Int64).build()));
 }

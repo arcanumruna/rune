@@ -1411,6 +1411,8 @@ OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::st
     msg.config            = rune::protocol::convertTopicConfig<rpc::TopicConfigWire>(topic.config);
     msg.hasExt            = true;   // catalog history: every DDL carries the extension
     msg.ext               = ddlExt_(ddl);
+    msg.hasKeyFeatures    = topic.keyFeatures != rune::protocol::TopicKeyFeatures{};
+    msg.keyFeatures       = topic.keyFeatures;
     std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
     if (n == 0) return OpResult::InvalidArgument;   // a field does not fit its wire width
@@ -1516,6 +1518,17 @@ rune::protocol::client::DdlExtension Client::ddlExt_(const DdlOptions& ddl) cons
     }
     return e;
 }
+
+namespace {
+// SD11: a DefineTopic that carries key features cannot go to a broker below v10 (it could not decode the trailer).
+// `brokerVersion` 0 = unknown: sent.
+bool defineKeyFeaturesTooOld(std::span<const uint8_t> frame, int32_t brokerVersion) {
+    namespace rpc = rune::protocol::client;
+    if (brokerVersion < 1 || brokerVersion >= rpc::kBrokerVersionCheckedWrites) return false;
+    const auto d = rpc::DefineTopic::decode(frame.data(), frame.size());
+    return d && d->hasKeyFeatures;
+}
+}  // namespace
 
 namespace {
 // Review M2: where the requestId of an encoded DDL frame of `op` sits, found by
@@ -1838,7 +1851,13 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     // op, its Redirect hops and its NotLeader budget (budgetEnd <= deadline).
     p.deadlineNs = nsAfter(nowNs, isDdlOp(h.op) ? cfg_.ddlTimeoutMs : cfg_.pingTimeoutMs);
     if (h.op == OpKind::DefineTopic) {
-        if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) p.topicName = std::string(d->topicName);
+        if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) {
+            p.topicName = std::string(d->topicName);
+            if (defineKeyFeaturesTooOld(frame, agent_.sessionBrokerVersion(0))) {
+                completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
+                return;
+            }
+        }
     }
     ctlScratch_.assign(frame.begin(), frame.end());
     rpc::detail::putLE64(ctlScratch_.data(), 8, machine.sessionId());
@@ -1961,6 +1980,13 @@ int Client::driveAwaitingSeed_() {
         if (terminal) {
             PendingCtl dead = takeCtl_(i);
             completeCtl_(dead, OpStatus::NotConnected);
+            ++work;
+            continue;
+        }
+        if (pendingCtl_[i].op == OpKind::DefineTopic &&
+            defineKeyFeaturesTooOld(a->frame, agent_.sessionBrokerVersion(0))) {
+            PendingCtl dead = takeCtl_(i);
+            completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
             ++work;
             continue;
         }
@@ -2315,6 +2341,12 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
             heldRedirects   = hld->redirects;
             heldBudgetEndNs = hld->budgetEndNs;
         } else if (!std::holds_alternative<DdlUnsentOnSeed>(d->retry)) { ++i; continue; }
+        if (p.op == OpKind::DefineTopic && defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0))) {
+            PendingCtl dead = takeCtl_(i);   // queued before the seed connected: the version is known now
+            completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
+            ++work;
+            continue;
+        }
         switch (offerDdl_(*d, nowNs, sentOn)) {
         case Offer::Accepted:
             setDdlRetry_(*d, DdlSent{heldRedirects, sentOn});
@@ -2943,7 +2975,7 @@ TopicHandle Client::rawTopicAndWait(std::string_view name, std::chrono::nanoseco
     if (!r.descriptorBlob.empty())
         throw std::runtime_error("rawTopic: '" + std::string(name) + "' is a typed topic; open it with openTopicAndWait<T> "
                                  "(the raw send path is for untyped topics only)");
-    return TopicHandle{r.topicId, r.partitionCount > 0 ? r.partitionCount : 1};
+    return TopicHandle{r.topicId, r.partitionCount > 0 ? r.partitionCount : 1, TopicKind::Raw};
 }
 
 void Client::throwOpenTopicFailure(std::string_view name, uint16_t code, std::chrono::nanoseconds remaining) {
@@ -5047,6 +5079,7 @@ Producer Client::producerWithRingCap_(ProducerConfig cfg, int32_t ringCap, bool 
         hk.sink       = detail::CompletionSink{&Client::deliverTrampoline_, this};
         hk.issueClose = &Client::issueProducerCloseTrampoline_;
         hk.andWait    = &Client::andWaitTrampoline_;
+        hk.sendAndWait = &Client::groupAndWaitTrampoline_;   // P5-10: a timed-out or closed sendAndWait is a Completion
         hk.release    = &Client::hubCommandTrampoline_;  // C7: HandleRelease
         hk.pinTarget  = &Client::pinTargetTrampoline_;   // Phase 2b F Task 8: txn ops read from the producer ring
         impl->setHooks(hk);

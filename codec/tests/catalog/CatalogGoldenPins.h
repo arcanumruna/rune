@@ -58,4 +58,18 @@ inline constexpr uint64_t kNamespacesV2Digests[] = {
     0x1e8a7d79d4e2d1e5ull,   // offset 17 NamespaceDeleteStep
     0xe36227922641b793ull,   // offset 18 DropTopic
 };
+
+// tests/catalog/golden/v3/basic.rcat, printed by `make_catalog_golden <out> v3` when formatVer 3 was introduced
+// (checked writes plan, Part 05 Task 2).  Frozen like the v1 and v2 pins.
+inline constexpr uint64_t kBasicV3Digests[] = {
+    0xf435bc161466881cull,   // offset 0 CreateTopic
+    0xcb102f1254b291c8ull,   // offset 1 CreateTopic
+    0x0ac65471dd66176dull,   // offset 2 CreateSchema
+    0x314a2b45885a055cull,   // offset 3 AlterSchema
+    0x48cb5422a8a6a25full,   // offset 4 SetCompatibility
+    0xa5fd9cf992c557efull,   // offset 5 CreateTopic
+    0x474d3ad1b7b5ceb9ull,   // offset 6 AlterTopicConfig
+    0x9d8f857d8af595f8ull,   // offset 7 DropTopic
+    0x237b2ff80947b166ull,   // offset 8 NamespaceCreated
+};
 } // namespace rune::catalog::golden

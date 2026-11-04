@@ -9,6 +9,7 @@
 #include <rune/codec/Serialize.h>
 #include "ApplyV1.h"
 #include "ApplyV2.h"
+#include "ApplyV3.h"
 
 #include <algorithm>
 #include <exception>
@@ -85,6 +86,9 @@ uint64_t CatalogState::digest() const noexcept {
     auto fp = [](uint64_t objectFingerprint, uint32_t nsId) {
         return nsId == kDefaultNsId ? objectFingerprint : objectFingerprintV2(objectFingerprint, nsId);
     };
+    auto topicFingerprint = [](const TopicObject& t) {
+        return ApplyV3::keyFeaturesFingerprint(fingerprintOf(t), t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{});
+    };
     uint64_t h = rune::codec::detail::kFnvSeed;
     h = detail::fnvU64(h, static_cast<uint64_t>(appliedOffset_));
     h = detail::fnvU64(h, nextObjectId_);
@@ -94,7 +98,7 @@ uint64_t CatalogState::digest() const noexcept {
     auto v = views_.begin();
     while (t != topics_.end() || v != views_.end()) {
         if (v == views_.end() || (t != topics_.end() && t->first < v->first)) {
-            h = detail::fnvU64(h, fp(fingerprintOf(t->second), t->second.nsId));
+            h = detail::fnvU64(h, fp(topicFingerprint(t->second), t->second.nsId));
             ++t;
         } else {
             h = detail::fnvU64(h, fp(fingerprintOf(v->second), v->second.nsId));
@@ -116,44 +120,63 @@ uint64_t CatalogState::digest() const noexcept {
 }
 
 // ── apply ─────────────────────────────────────────────────────────────────────
-std::expected<Applied, ApplyError> apply(CatalogState& s, const CatalogEvent& e, int64_t offset) {
-    if (e.formatVer != kFormatV1 && e.formatVer != kFormatV2)
+namespace {
+/// The staged change of `e` under its formatVer's rules, and the fingerprint it must carry.
+struct Prepared { StagedV2 staged; uint64_t fingerprint; };
+
+std::expected<StagedV2, ApplyError> runRules(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
+    if (e.formatVer == kFormatV3) return ApplyV3::run(s, e, offset);
+    if (e.formatVer == kFormatV2) return ApplyV2::run(s, e, offset);
+    auto v1 = ApplyV1::run(s, e, offset);   // formatVer 1: nsId is 0 (the event validation refuses anything else)
+    if (!v1) return std::unexpected(std::move(v1.error()));
+    return StagedV2{std::move(*v1)};
+}
+
+uint64_t stagedFingerprint(const CatalogEvent& e, const StagedV2& st) noexcept {
+    if (e.formatVer == kFormatV3) return ApplyV3::fingerprintOfStaged(e, st);
+    if (e.formatVer == kFormatV2) return ApplyV2::fingerprintOfStaged(e, st);
+    return ApplyV1::fingerprintOfStaged(std::get<Staged>(st));
+}
+
+std::expected<Prepared, ApplyError> prepare(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
+    auto staged = runRules(s, e, offset);
+    if (!staged) return std::unexpected(std::move(staged.error()));
+    ApplyV3::carryKeyFeatures(s, *staged);
+    const uint64_t base = stagedFingerprint(e, *staged);
+    return Prepared{std::move(*staged), ApplyV3::keyFeaturesFingerprint(base, ApplyV3::keyFeaturesOf(*staged))};
+}
+
+std::expected<void, ApplyError> checkFormat(const CatalogEvent& e, int64_t offset) {
+    if (e.formatVer < kFormatV1 || e.formatVer > kFormatV3)
         return std::unexpected(ApplyError{offset, ApplyError::Code::UnsupportedFormat, 0, 0,
                                           "formatVer " + std::to_string(e.formatVer) + " has no apply rules"});
+    return {};
+}
+} // namespace
+
+std::expected<Applied, ApplyError> apply(CatalogState& s, const CatalogEvent& e, int64_t offset) {
+    if (auto f = checkFormat(e, offset); !f) return std::unexpected(std::move(f.error()));
     if (offset <= s.appliedOffset())
         return std::unexpected(ApplyError{offset, ApplyError::Code::Precondition, 0, 0,
                                           "offset " + std::to_string(offset) + " is not past the applied offset " +
                                               std::to_string(s.appliedOffset())});
-    if (e.formatVer == kFormatV2) {
-        auto staged = ApplyV2::run(s, e, offset);
-        if (!staged) return std::unexpected(std::move(staged.error()));
-        const uint64_t actual = ApplyV2::fingerprintOfStaged(e, *staged);
-        if (actual != e.fingerprint)
-            return std::unexpected(ApplyError{offset, ApplyError::Code::FingerprintMismatch, e.fingerprint, actual,
-                                              std::string(kindName(e.kind)) + " '" + e.objectName + "'"});
-        return ApplyV2::commit(s, e, offset, actual, std::move(*staged));
-    }
-    auto staged = ApplyV1::run(s, e, offset);   // formatVer 1: nsId is 0 (the event validation refuses anything else)
-    if (!staged) return std::unexpected(std::move(staged.error()));
-    const uint64_t actual = ApplyV1::fingerprintOfStaged(*staged);
-    if (actual != e.fingerprint)
-        return std::unexpected(ApplyError{offset, ApplyError::Code::FingerprintMismatch, e.fingerprint, actual,
+    auto prepared = prepare(s, e, offset);
+    if (!prepared) return std::unexpected(std::move(prepared.error()));
+    if (prepared->fingerprint != e.fingerprint)
+        return std::unexpected(ApplyError{offset, ApplyError::Code::FingerprintMismatch, e.fingerprint, prepared->fingerprint,
                                           std::string(kindName(e.kind)) + " '" + e.objectName + "'"});
-    return ApplyV1::commit(s, e, offset, actual, std::move(*staged));
+    if (e.formatVer == kFormatV3)
+        return ApplyV3::commit(s, e, offset, prepared->fingerprint, std::move(prepared->staged));
+    if (e.formatVer == kFormatV2)
+        return ApplyV2::commit(s, e, offset, prepared->fingerprint, std::move(prepared->staged));
+    return ApplyV1::commit(s, e, offset, prepared->fingerprint, std::move(std::get<Staged>(prepared->staged)));
 }
 
 std::expected<uint64_t, ApplyError> previewFingerprint(const CatalogState& s, const CatalogEvent& e) {
-    if (e.formatVer != kFormatV1 && e.formatVer != kFormatV2)
-        return std::unexpected(ApplyError{-1, ApplyError::Code::UnsupportedFormat, 0, 0,
-                                          "formatVer " + std::to_string(e.formatVer) + " has no apply rules"});
-    if (e.formatVer == kFormatV2) {
-        auto staged = ApplyV2::run(s, e, -1);
-        if (!staged) return std::unexpected(std::move(staged.error()));
-        return ApplyV2::fingerprintOfStaged(e, *staged);
-    }
-    auto staged = ApplyV1::run(s, e, -1);
-    if (!staged) return std::unexpected(std::move(staged.error()));
-    return ApplyV1::fingerprintOfStaged(*staged);
+    if (auto f = checkFormat(e, -1); !f) return std::unexpected(std::move(f.error()));
+    auto prepared = prepare(s, e, -1);
+    if (!prepared) return std::unexpected(std::move(prepared.error()));
+    return prepared->fingerprint;
 }
 
 std::string_view applyErrorName(ApplyError::Code c) noexcept {

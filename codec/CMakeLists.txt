@@ -27,6 +27,7 @@ add_library(rune_catalog STATIC
     src/catalog/CatalogFingerprintV2.cpp
     src/catalog/ApplyV1.cpp
     src/catalog/ApplyV2.cpp
+    src/catalog/ApplyV3.cpp
     src/catalog/NamespaceRegistry.cpp
     src/catalog/CatalogReplayer.cpp
     src/catalog/CatalogQueries.cpp
@@ -145,6 +146,9 @@ set(SHADOW_NAMES_GEN_H  "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_name
 set(NINE_INTS_GEN_H    "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/nine_ints.gen.h")
 add_custom_command(
     OUTPUT  "${PLAYER_EVENT_BLOB}" "${NINE_INTS_BLOB}" "${SHADOW_NAMES_BLOB}"
+            "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_locals.blob"
+            "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_locals_fixed.blob"
+            "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_locals_str_key.blob"
     COMMAND make_player_event_blob "${CMAKE_CURRENT_BINARY_DIR}/tests/generated"
     DEPENDS make_player_event_blob
     COMMENT "Generating player_event.blob / nine_ints.blob (2c filter fixtures)"
@@ -167,7 +171,19 @@ add_custom_command(
     DEPENDS rune_codec_gen "${SHADOW_NAMES_BLOB}"
     COMMENT "Generating shadow_names.gen.h from shadow_names.blob"
 )
-add_custom_target(generate_filter_fixture_headers DEPENDS "${PLAYER_EVENT_GEN_H}" "${NINE_INTS_GEN_H}" "${SHADOW_NAMES_GEN_H}")
+# Fields named like the generator's own locals (GeneratedLocalNamesTest).
+set(SHADOW_LOCALS_HEADERS "")
+foreach(_n shadow_locals shadow_locals_fixed shadow_locals_str_key)
+    add_custom_command(
+        OUTPUT  "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/${_n}.gen.h"
+        COMMAND rune_codec_gen "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/${_n}.blob"
+                "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/${_n}.gen.h"
+        DEPENDS rune_codec_gen "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/${_n}.blob"
+        COMMENT "Generating ${_n}.gen.h from ${_n}.blob")
+    list(APPEND SHADOW_LOCALS_HEADERS "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/${_n}.gen.h")
+endforeach()
+add_custom_target(generate_filter_fixture_headers DEPENDS "${PLAYER_EVENT_GEN_H}" "${NINE_INTS_GEN_H}" "${SHADOW_NAMES_GEN_H}"
+                  ${SHADOW_LOCALS_HEADERS})
 
 # ── #418 fixture: the evo_mix / evo_fix lineages at every version (tests/LineageFixtures.h) -> one generated type
 #    per version, from that version's EVOLVING descriptor (what `rune schema generate` fetches).
@@ -226,6 +242,7 @@ add_executable(rune_codec_tests
     tests/FilterPredicateTest.cpp
     tests/FilterBuilderTest.cpp
     tests/FilterGeneratedTest.cpp
+    tests/GeneratedLocalNamesTest.cpp
     tests/LineageDecodeTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
@@ -248,6 +265,7 @@ add_executable(rune_catalog_tests
     tests/catalog/CatalogQueriesTest.cpp
     tests/catalog/CatalogGoldenTest.cpp
     tests/catalog/NamespaceCatalogV2Test.cpp
+    tests/catalog/CheckedWritesCatalogV3Test.cpp
     tests/catalog/NamespaceLifecycleApplyRegressionTest.cpp)
 target_link_libraries(rune_catalog_tests PRIVATE rune_catalog GTest::gtest_main)
 target_compile_definitions(rune_catalog_tests PRIVATE

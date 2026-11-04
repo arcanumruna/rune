@@ -104,6 +104,8 @@ rune schema generate <topic> --out <dir> [--broker <ep>]
 | `generate --from-file` | Generate a C++ header from a serialized descriptor blob, offline. |
 | `generate <topic>` | Fetch the topic's schema lineage from the broker and write `<out>/<topic>.gen.h`, a type that reads records of every version up to the current one. |
 
+`generate` refuses a schema with a field whose name ends in `_`: a trailing `_` is reserved for the generated code's own names.
+
 ## `rune catalog`
 
 The catalog is the replicated log of every DDL ([CATALOG.md](../../broker/docs/CATALOG.md)). These commands need

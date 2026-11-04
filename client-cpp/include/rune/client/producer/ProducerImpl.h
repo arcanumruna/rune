@@ -24,7 +24,7 @@
 //   [4..7]   partition : int32 LE
 //   [8]      keyLen    : uint8  (≤16)
 //   [9..24]  keyBytes  : uint8[keyLen] (inline)
-//   [25]     flags     : uint8  (bit0=wantAck)
+//   [25]     flags     : uint8  (bit0=wantAck, bits1-2=write intent)
 //   [26..33] ackHandle : int64 LE ackhandle:: tagged token (only meaningful
 //                        when wantAck)
 //   [34..37] valueLen  : uint32 LE
@@ -129,7 +129,7 @@ inline constexpr int kRecTopicIdOff  = 0;   // int32 LE
 inline constexpr int kRecPartOff     = 4;   // int32 LE
 inline constexpr int kRecKeyLenOff   = 8;   // uint8
 inline constexpr int kRecKeyBytesOff = 9;   // uint8[keyLen] (≤16)
-inline constexpr int kRecFlagsOff    = 25;  // uint8 (bit0=wantAck)
+inline constexpr int kRecFlagsOff    = 25;  // uint8 (bit0=wantAck, bits1-2=intent)
 inline constexpr int kRecCorrIdOff   = 26;  // int64 LE (only when wantAck)
 inline constexpr int kRecValLenOff   = 34;  // uint32 LE
 inline constexpr int kRecValBytesOff = 38;  // value bytes
@@ -177,7 +177,9 @@ inline constexpr int kT2TokenSize = 8;
 inline constexpr uint32_t kNoTier2Slot = 0xFFFF'FFFFu;
 
 // Flags bits
-inline constexpr uint8_t kFlagWantAck = 0x01;
+inline constexpr uint8_t kFlagWantAck    = 0x01;
+inline constexpr uint8_t kFlagIntentShift = 1;
+inline constexpr uint8_t kFlagIntentMask  = 0x06;  ///< the record's WriteIntent, which becomes its attributes
 
 // Default ring capacity for a producer (per-producer, separate from agent ring).
 // This is the app→agent handoff buffer (Kafka's buffer.memory analogue): sized to
@@ -630,7 +632,7 @@ public:
                           const Key& key,
                           std::span<const uint8_t> value,
                           bool wantAck,
-                          int64_t correlationId) noexcept;
+                          int64_t correlationId, uint8_t intent = 0) noexcept;
 
     // ---- Phase 2b F: the handle gate (issuing-thread state) -------------------
     //
@@ -664,7 +666,7 @@ public:
     /// return (None when accepted).
     [[nodiscard]] SendResult trySubmit(int32_t topicId, int32_t partition, const Key& key,
                                        std::span<const uint8_t> value, int64_t ackHandle,
-                                       RejectReason* why = nullptr) noexcept;
+                                       RejectReason* why = nullptr, uint8_t intent = 0) noexcept;
 
     // ---- Phase 2b Part B: zero-copy claims (Producer::tryClaim / claimBatch) ----
 
@@ -746,7 +748,7 @@ public:
     /// concurrent close() is decided immediately — never by waiting out the
     /// timeout (fix1 C2/I3).
     void sendBlocking(SendResult first, int32_t topicId, int32_t partition, const Key& key,
-                      std::span<const uint8_t> value);
+                      std::span<const uint8_t> value, uint8_t intent = 0);
 
     /// F8c C6: the pieces of sendBlocking() for the token forms (Producer.cpp):
     /// one back-pressure wait step (pump on the duty thread / heartbeat-bounded
@@ -954,6 +956,7 @@ public:
         OpResult (*issueClose)(void* ctx, ProducerImpl& impl, const CompletionTarget* target,
                                Token token) = nullptr;
         detail::AndWaitSink andWait = nullptr;
+        detail::AndWaitSink sendAndWait = nullptr;  ///< Producer::sendAndWait: a wait that times out or finds the client closed is a Completion
         /// Phase 2b F Task 8 (duty side): pin a CQ target's registry slot before its completion is delivered
         /// (Client::pinCqSlot_; an op read from the producer ring has no command-ring fence).  Absent (bare rig):
         /// targets are used as they are.
@@ -1546,10 +1549,10 @@ private:
     /// Task 14: trySubmit's Direct path (owner thread; no ring, no atomic).
     /// Ring-mode body of trySubmit (unchanged hot path).
     SendResult trySubmitRing_(int32_t topicId, int32_t partition, const Key& key,
-                              std::span<const uint8_t> value, int64_t ackHandle) noexcept;
+                              std::span<const uint8_t> value, int64_t ackHandle, uint8_t intent) noexcept;
     SendResult tryAppendDirect_(int32_t topicId, int32_t partition, const Key& key,
                                 std::span<const uint8_t> value, int64_t ackHandle,
-                                RejectReason& why) noexcept;
+                                RejectReason& why, uint8_t intent) noexcept;
 
     /// One record into its partition builder — the single append path shared by
     /// the ring drain (Ring) and trySubmit (Direct).  Owner/duty thread only.

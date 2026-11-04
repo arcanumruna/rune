@@ -59,6 +59,45 @@ enum class ConfigKey : uint8_t {
 inline constexpr ConfigKey kFirstConfigKey = ConfigKey::RetentionMs;
 inline constexpr ConfigKey kLastConfigKey  = ConfigKey::MaxCompactionLagMs;
 
+/// A topic's key features (checked writes): the key index, autoincrement and the
+/// key -> partition function.  One definition for the wire (DefineTopic,
+/// TopicSchemaResponse), rune-codec's catalog events and the client.
+enum class Partitioner : uint8_t { Fnv1a = 0, Modulo = 1 };
+inline constexpr uint64_t kAutoIncrementMaxDefault     = (uint64_t{1} << 53) - 1;
+inline constexpr uint32_t kAutoIncrementReserveDefault = 4096;
+struct TopicKeyFeatures {
+    bool        keyIndex             = false;
+    bool        autoIncrement        = false;
+    Partitioner partitioner          = Partitioner::Fnv1a;
+    uint64_t    autoIncrementMax     = kAutoIncrementMaxDefault;
+    uint32_t    autoIncrementReserve = kAutoIncrementReserveDefault;
+    bool operator==(const TopicKeyFeatures&) const = default;
+};
+
+/// Wire block: [flags u8: bit0 keyIndex, bit1 autoIncrement][partitioner u8]
+/// [autoIncrementMax u64 LE][autoIncrementReserve u32 LE].
+inline constexpr std::size_t kTopicKeyFeaturesWireLen = 14;
+
+inline void putTopicKeyFeatures(uint8_t* out, const TopicKeyFeatures& f) noexcept {
+    out[0] = static_cast<uint8_t>((f.keyIndex ? 1u : 0u) | (f.autoIncrement ? 2u : 0u));
+    out[1] = static_cast<uint8_t>(f.partitioner);
+    for (int i = 0; i < 8; ++i) out[2 + i] = static_cast<uint8_t>(f.autoIncrementMax >> (8 * i));
+    for (int i = 0; i < 4; ++i) out[10 + i] = static_cast<uint8_t>(f.autoIncrementReserve >> (8 * i));
+}
+
+/// False on a short buffer, an unknown flag bit or a partitioner above Modulo.
+[[nodiscard]] inline bool getTopicKeyFeatures(const uint8_t* in, std::size_t avail, TopicKeyFeatures& out) noexcept {
+    if (avail < kTopicKeyFeaturesWireLen || (in[0] & 0xFC) != 0 || in[1] > static_cast<uint8_t>(Partitioner::Modulo)) return false;
+    out.keyIndex      = (in[0] & 1u) != 0;
+    out.autoIncrement = (in[0] & 2u) != 0;
+    out.partitioner   = static_cast<Partitioner>(in[1]);
+    out.autoIncrementMax = 0;
+    for (int i = 0; i < 8; ++i) out.autoIncrementMax |= uint64_t{in[2 + i]} << (8 * i);
+    out.autoIncrementReserve = 0;
+    for (int i = 0; i < 4; ++i) out.autoIncrementReserve |= uint32_t{in[10 + i]} << (8 * i);
+    return true;
+}
+
 /// A DDL's logical id (F14): hi = the issuing client instance's random 64-bit id
 /// (never 0), lo = that instance's counter.  {0, 0} = none (a pre-v8 client).
 /// Stable across every resend of the same DDL.

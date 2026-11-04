@@ -110,7 +110,8 @@ private:
 
 struct VerdictSourceStats {
     uint64_t rejectionsConstraint = 0, markersWritten = 0, markerAppendRetries = 0, judgeWaitsForInstall = 0, verdictStalls = 0,
-             verdictCheckpointsDiscarded = 0, verdictUnknownDuplicates = 0, verdictReplays = 0;
+             verdictCheckpointsDiscarded = 0, verdictUnknownDuplicates = 0, verdictReplays = 0,
+             rejectionsKeyExists = 0, rejectionsKeyNotFound = 0, keyIndexRebuilds = 0, keyIndexSkippedMalformed = 0;
     struct PerConstraint { uint32_t constraintId = 0; uint64_t rejections = 0; };
     std::array<PerConstraint, 256> perConstraint{};
     uint16_t perConstraintCount = 0;

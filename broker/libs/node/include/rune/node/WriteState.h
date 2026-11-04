@@ -29,13 +29,14 @@ namespace rune::node {
 inline constexpr uint16_t kNoKeyField  = 0xFFFF;
 inline constexpr uint32_t kNoKeyOffset = 0xFFFFFFFF;
 
-/// The WriteSpecUpdate tail: [topicId i32][keyFieldId u16][keyType u8][keyWidth u8][flags u8: bit0 legacyValidate].
+/// The WriteSpecUpdate tail: [topicId i32][keyFieldId u16][keyType u8][keyWidth u8][flags u8: bit0 legacyValidate, bit1 keyIndex].
 struct TopicWriteSpecWire {
     int32_t              topicId        = -1;
     uint16_t             keyFieldId     = kNoKeyField;   ///< the key field's durable tag; kNoKeyField = a keyless topic
     rune::codec::PrimType keyType       = rune::codec::PrimType::Int32;
     uint8_t              keyWidth       = 0;             ///< 0 = the key cannot be checked (a key type from before the topic key rule)
     bool                 legacyValidate = false;         ///< the catalog's SchemaDef::validate: validates below kCheckedWrites
+    bool                 keyIndex       = false;         ///< the topic's key.index feature
     bool operator==(const TopicWriteSpecWire&) const = default;
 };
 inline constexpr std::size_t kTopicWriteSpecWireLen = 9;
@@ -47,18 +48,19 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
     std::memcpy(out.data() + 4, &w.keyFieldId, 2);
     out[6] = static_cast<uint8_t>(w.keyType);
     out[7] = w.keyWidth;
-    out[8] = w.legacyValidate ? 1 : 0;
+    out[8] = static_cast<uint8_t>((w.legacyValidate ? 1 : 0) | (w.keyIndex ? 2 : 0));
     return kTopicWriteSpecWireLen;
 }
 
 [[nodiscard]] inline std::optional<TopicWriteSpecWire> decodeTopicWriteSpec(std::span<const uint8_t> in) noexcept {
-    if (in.size() != kTopicWriteSpecWireLen) return std::nullopt;
+    if (in.size() != kTopicWriteSpecWireLen || (in[8] & 0xFC) != 0) return std::nullopt;
     TopicWriteSpecWire w;
     std::memcpy(&w.topicId, in.data(), 4);
     std::memcpy(&w.keyFieldId, in.data() + 4, 2);
     w.keyType        = static_cast<rune::codec::PrimType>(in[6]);
     w.keyWidth       = in[7];
     w.legacyValidate = (in[8] & 1) != 0;
+    w.keyIndex       = (in[8] & 2) != 0;
     return w;
 }
 
@@ -68,6 +70,7 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
     TopicWriteSpecWire w;
     w.topicId        = t.topicId;
     w.legacyValidate = t.schema->validate;
+    w.keyIndex       = t.schema->keyFeatures.keyIndex;
     if (t.schema->keyField.empty()) return w;
     const rune::codec::Descriptor d = rune::codec::deserialize(t.schema->evolvingBlob);
     for (const auto& f : d.fields) {
@@ -93,6 +96,9 @@ public:
     rune::codec::PrimType keyType        = rune::codec::PrimType::Int32;
     uint8_t               keyWidth       = 0;
     bool                  legacyValidate = false;
+    bool                  keyIndex       = false;
+    /// The topic's evolving descriptor (every field ever declared), from the FilterSchema op; the key index decodes each writer version through it.
+    std::optional<rune::codec::Descriptor> evolving;
 
     [[nodiscard]] const SpecVersion* versionFor(uint16_t version) const noexcept {
         return version < versions_.size() ? versions_[version].get() : nullptr;
@@ -124,6 +130,7 @@ public:
         keyType        = w.keyType;
         keyWidth       = w.keyWidth;
         legacyValidate = w.legacyValidate;
+        keyIndex       = w.keyIndex;
         hasFacts_      = true;
         for (auto& sv : versions_)
             if (sv) setKeyOffset_(*sv);

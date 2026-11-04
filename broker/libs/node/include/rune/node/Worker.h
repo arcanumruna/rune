@@ -2796,6 +2796,7 @@ private:
             break;
         case WorkerOp::Type::TopicDropped:
             markTopicDropped_(op.topicId());
+            if (viewSet_ != nullptr) viewSet_->dropSourceTopic(op.topicId());
             dropWriteSpec_(op.topicId());
             break;
         case WorkerOp::Type::NsSlotAssign:
@@ -3367,13 +3368,14 @@ private:
             return;
         }
         TopicWriteSpec& spec = writeSpecOf_(w->topicId);
+        if (viewSet_ != nullptr && spec.keyIndex != w->keyIndex) viewSet_->noteWriteSpecChange();
         spec.setFacts(*w);
         if (w->keyFieldId != kNoKeyField && w->keyWidth == 0)
             spdlog::warn("Worker {}: topic {} key field cannot be a topic key; wire-key check skipped (pre-existing topic)",
                          workerId_, w->topicId);
         for (auto& sl : rcSlots_)
             if (!sl.write && sl.replica->topicId() == w->topicId) {
-                sl.write = std::make_unique<PartitionWriteState>(PartitionWriteState{&spec});
+                sl.write = std::make_unique<PartitionWriteState>(PartitionWriteState{.spec = &spec});
                 bindVerdictHooks_(sl);
             }
         rebuildWriteById_();
@@ -3430,7 +3432,7 @@ private:
         const uint32_t tailLen = op.tailLength();
         const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
         try {
-            const rune::codec::Descriptor desc = rune::codec::deserialize(std::span<const uint8_t>(tail, tailLen));
+            rune::codec::Descriptor desc = rune::codec::deserialize(std::span<const uint8_t>(tail, tailLen));
             rune::codec::FilterSchema built = rune::codec::FilterSchema::build(desc, version);
             auto it = filterSchemas_.find(topicId);
             if (it == filterSchemas_.end()) {
@@ -3442,6 +3444,7 @@ private:
                 ++filterSchemaReplacements_;
                 recompileFilters_(topicId);
             }
+            writeSpecOf_(topicId).evolving = std::move(desc);
             spdlog::debug("Worker {}: FilterSchema installed for topicId={} version={}", workerId_, topicId, version);
         } catch (const std::exception& ex) {
             ++filterSchemaErrors_;
@@ -6972,10 +6975,14 @@ private:
             installReadAhead_(slot);
             if (!slot.write)
                 if (const auto it = writeSpecs_.find(r->topicId()); it != writeSpecs_.end() && it->second->hasFacts())
-                    slot.write = std::make_unique<PartitionWriteState>(PartitionWriteState{it->second.get()});
+                    slot.write = std::make_unique<PartitionWriteState>(PartitionWriteState{.spec = it->second.get()});
             bindVerdictHooks_(slot);
             next.push_back(std::move(slot));
         }
+        // A state not carried over is freed below: its judge and key index go first (the replica may be gone, the judge is not).
+        for (auto& old : rcSlots_)
+            if (old.write && old.write->verdicts != nullptr && old.write->verdicts->boundState() == old.write.get())
+                viewSet_->dropVerdictSource(old.write->spec->topicId, old.write->verdicts->partition());
         rcSlots_ = std::move(next);
         ringSlots_ = 0;   // E2 residual N5: memory-backed slots (0 -> no ring walk at all)
         for (const auto& sl : rcSlots_) ringSlots_ += sl.replica->isDiskBacked() ? 0u : 1u;
@@ -7015,7 +7022,7 @@ private:
             // partition no installed view is interested in.
             if (!viewSet_->interestedIn(topicId)) {
                 const PartitionWriteState* w = writeOf_(replica);
-                if (w == nullptr || w->constraintSets.latest().empty()) continue;   // a verdict source without its views still judges nothing, but is driven (it waits)
+                if (w == nullptr || (w->constraintSets.latest().empty() && !w->spec->keyIndex)) continue;   // a verdict source without its views still judges nothing, but is driven (it waits); a key index needs no view
             }
             if (replica->role() != rune::replication::Role::Leader) continue;
             const RcState* rcState = rcServe_(replica, rcOf_(replica));

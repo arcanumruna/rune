@@ -361,6 +361,9 @@ struct NodeConfig {
     // TEST-ONLY (ISR v3 Step 10): the metadata feature level this controller supports (0 = kBase: no storage tracking,
     // no NodeStorageRecord - the old-cluster path).  -1 (default): the binary's own level.
     int16_t testSupportedFeatureLevel = -1;
+    // TEST-ONLY (checked writes Part 05): the brokerVersion the OK ConnectResponse advertises when above 0 (0 = kBrokerVersion); lets a
+    // test present an older broker to the client's capability gates.
+    int32_t testAdvertisedBrokerVersion = 0;
     // TEST-ONLY (checked writes Part 02): SchemaFanout keeps every WriteSpecUpdate undelivered for this many control passes
     // after it is posted, to prove a typed topic is not built before its spec reaches every worker.  0 = off.
     uint32_t testHoldWriteSpecPasses = 0;
@@ -1057,6 +1060,10 @@ struct NodeConfig {
     /// RUNE_CLEANER_IO_MAX_BYTES_PER_SECOND — the log cleaner's shared I/O throttle (bytes/s across all cleaner work;
     /// Kafka log.cleaner.io.max.bytes.per.second). Absent/empty = -1 = unlimited.
     int64_t cleanerIoMaxBytesPerSecond = -1;
+
+    /// The log cleaner's dedupe map budget (Kafka log.cleaner.dedupe.buffer.size). -1 = 128 MiB. Tests set it small:
+    /// every cleaner pass and broker start rewrites the whole map, which a sanitizer build makes minutes-slow.
+    int64_t cleanerDedupeBufferBytes = -1;
 
     // PSM fix round 1 (I1, Kafka producer.id.expiration.ms): compaction keeps the
     // last batch METADATA of every producer active within this window (a

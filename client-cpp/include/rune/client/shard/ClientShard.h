@@ -96,28 +96,31 @@ public:
     /// shard owns (nothing accepted, no completion); Closed once the shard
     /// failed or was closed.  Invoker: QueueFull when the batch-ack queue has no
     /// credit — pollBatchAcks(), then retry.  Agent: any app thread.
-    [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key,
-                                     std::span<const uint8_t> value) noexcept {
+    [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+                                     WriteIntent intent = WriteIntent::Upsert) noexcept {
         if (!topic.valid()) return SendResult::InvalidTopic;
-        return trySendTo(topic, key.partition(topic.partitionCount), key, value);
+        return trySendTo(topic, key.partition(topic.partitionCount), key, value, intent);
     }
     /// Router form: `partition` is the caller's key.partition(partitionCount)
     /// (ShardGroup computed it to route) — used as is, never re-hashed.
     /// InvalidArgument for a partition outside [0, partitionCount).
     [[nodiscard]] SendResult trySendTo(TopicHandle topic, int32_t partition, const Key& key,
-                                       std::span<const uint8_t> value) noexcept {
+                                       std::span<const uint8_t> value,
+                                       WriteIntent intent = WriteIntent::Upsert) noexcept {
         if (closed_) return SendResult::Closed;  // Invoker owner state; never set in Agent mode
         if (!topic.valid()) return SendResult::InvalidTopic;
         if (partition < 0 || partition >= topic.partitionCount) [[unlikely]] return SendResult::InvalidArgument;
         if (!owns(topic.topicId, partition)) return SendResult::WrongShard;
-        return producer_.trySendTo(topic, partition, key, value);
+        return producer_.trySendTo(topic, partition, key, value, intent);
     }
 
     /// Never drops (Producer::send semantics).  WrongShard -> std::logic_error,
     /// Closed -> std::runtime_error, Invoker QueueFull -> std::runtime_error
     /// (only this thread can pollBatchAcks()); otherwise Producer::send's rules.
-    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value);
-    void sendTo(TopicHandle topic, int32_t partition, const Key& key, std::span<const uint8_t> value);
+    void send(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
+              WriteIntent intent = WriteIntent::Upsert);
+    void sendTo(TopicHandle topic, int32_t partition, const Key& key, std::span<const uint8_t> value,
+                WriteIntent intent = WriteIntent::Upsert);
 
     // ---- duty (Invoker) ----------------------------------------------------------
 

@@ -33,6 +33,9 @@
 //
 //   ProducerT contract (default = Producer):
 //     void send(TopicHandle, const Key&, std::span<const uint8_t>)
+//   plus, for the checked writes (insert / update / upsert / remove / removeExisting):
+//     void send(TopicHandle, const Key&, std::span<const uint8_t>, Completions&, Token, WriteIntent)
+//     Completion sendAndWait(TopicHandle, const Key&, std::span<const uint8_t>, WriteIntent, std::chrono::nanoseconds)
 //
 //   ProducerRef (FD7) is the production alternative: TypedTopic<T, ProducerRef> borrows a Producer (e.g. one
 //   inside a transaction) instead of owning one - Client::openTopicAndWait<T>(name, producer).
@@ -52,6 +55,7 @@
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerRef.h>
 #include <rune/client/TopicHandle.h>
+#include <rune/client/WriteResult.h>
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/Serialize.h>
 
@@ -92,6 +96,12 @@ namespace rune::client {
 /// (rune-codec emits key() only for schemas with an isKey field).
 template <class R>
 concept HasRecordKey = requires(const R& r) { r.key(); };
+
+namespace detail {
+/// The type of a record's key() value (a byte span for a string/bytes key).
+template <class R>
+using RecordKeyT = std::remove_cvref_t<decltype(std::declval<const R&>().key())>;
+}  // namespace detail
 
 /// Phase 2b Part C: the partition count a typed topic routes over, from the
 /// broker-reported value (TopicSchemaResult::partitionCount /
@@ -240,7 +250,7 @@ public:
         // version (Task 18), reserved0 = partitionCount (Phase 2b Part C).
         return TypedTopic(client.producer(),
                           TopicHandle{static_cast<int32_t>(c.value),
-                                      typedPartitionCount(static_cast<int32_t>(c.reserved0))},
+                                      typedPartitionCount(static_cast<int32_t>(c.reserved0)), TopicKind::Typed},
                           static_cast<uint16_t>(c.aux));
     }
 
@@ -263,6 +273,64 @@ public:
             // (documented pre-2b behaviour, kept by spec §C).
             sendWithKey_(rec, Key{});
         }
+    }
+
+    // ---- Checked writes: the write intent decides what the broker checks ------
+
+    /// Fails with KeyExists (56) when the key is already stored.
+    void insert(const T& rec, Completions& cq, Token token) {
+        producer_.send(topic_, keyOfRecord_(rec), intentValue_(rec), cq, token, WriteIntent::Insert);
+    }
+    [[nodiscard]] WriteResult insertAndWait(const T& rec, std::chrono::nanoseconds timeout = kDefaultWriteWait) {
+        return WriteResult::fromCompletion(
+            producer_.sendAndWait(topic_, keyOfRecord_(rec), intentValue_(rec), WriteIntent::Insert, timeout));
+    }
+
+    /// Fails with KeyNotFound (57) when the key is not stored.
+    void update(const T& rec, Completions& cq, Token token) {
+        producer_.send(topic_, keyOfRecord_(rec), intentValue_(rec), cq, token, WriteIntent::Update);
+    }
+    [[nodiscard]] WriteResult updateAndWait(const T& rec, std::chrono::nanoseconds timeout = kDefaultWriteWait) {
+        return WriteResult::fromCompletion(
+            producer_.sendAndWait(topic_, keyOfRecord_(rec), intentValue_(rec), WriteIntent::Update, timeout));
+    }
+
+    /// Same as send(rec).
+    void upsert(const T& rec) { send(rec); }
+    void upsert(const T& rec, Completions& cq, Token token) {
+        producer_.send(topic_, keyOfRecord_(rec), intentValue_(rec), cq, token, WriteIntent::Upsert);
+    }
+    [[nodiscard]] WriteResult upsertAndWait(const T& rec, std::chrono::nanoseconds timeout = kDefaultWriteWait) {
+        return WriteResult::fromCompletion(
+            producer_.sendAndWait(topic_, keyOfRecord_(rec), intentValue_(rec), WriteIntent::Upsert, timeout));
+    }
+
+    /// Deletes the key (an empty value); no error when it is not stored.
+    template <class U = T> requires HasRecordKey<U>
+    void remove(const detail::RecordKeyT<U>& key) {
+        producer_.send(topic_, keyOf_(key), std::span<const uint8_t>{});
+    }
+    template <class U = T> requires HasRecordKey<U>
+    void remove(const detail::RecordKeyT<U>& key, Completions& cq, Token token) {
+        producer_.send(topic_, keyOf_(key), std::span<const uint8_t>{}, cq, token, WriteIntent::Upsert);
+    }
+    template <class U = T> requires HasRecordKey<U>
+    [[nodiscard]] WriteResult removeAndWait(const detail::RecordKeyT<U>& key,
+                                            std::chrono::nanoseconds timeout = kDefaultWriteWait) {
+        return WriteResult::fromCompletion(
+            producer_.sendAndWait(topic_, keyOf_(key), std::span<const uint8_t>{}, WriteIntent::Upsert, timeout));
+    }
+
+    /// Deletes the key; fails with KeyNotFound (57) when it is not stored.
+    template <class U = T> requires HasRecordKey<U>
+    void removeExisting(const detail::RecordKeyT<U>& key, Completions& cq, Token token) {
+        producer_.send(topic_, keyOf_(key), std::span<const uint8_t>{}, cq, token, WriteIntent::Update);
+    }
+    template <class U = T> requires HasRecordKey<U>
+    [[nodiscard]] WriteResult removeExistingAndWait(const detail::RecordKeyT<U>& key,
+                                                    std::chrono::nanoseconds timeout = kDefaultWriteWait) {
+        return WriteResult::fromCompletion(
+            producer_.sendAndWait(topic_, keyOf_(key), std::span<const uint8_t>{}, WriteIntent::Update, timeout));
     }
 
     // ---- Phase 2b Part B: zero-copy typed produce (all-fixed schemas) -------
@@ -350,35 +418,46 @@ public:
 private:
     /// Phase 2b Part C: the record key, exactly as a Producer::send caller
     /// would build it from the key field — never truncated.
-    [[nodiscard]] static Key recordKey_(const T& rec) {
-        using KeyT = std::remove_cvref_t<decltype(rec.key())>;
+    template <class U = T>
+    [[nodiscard]] static Key keyOf_(const detail::RecordKeyT<U>& keyValue) {
+        using KeyT = detail::RecordKeyT<U>;
         if constexpr (std::is_same_v<KeyT, std::span<const uint8_t>>) {
-            const std::span<const uint8_t> kb = rec.key();
-            if (kb.size() > Key::kMaxInline) [[unlikely]] {
+            if (keyValue.size() > Key::kMaxInline) [[unlikely]] {
                 throw std::invalid_argument(
-                    "TypedTopic::send: key field is " + std::to_string(kb.size()) +
+                    "TypedTopic::send: key field is " + std::to_string(keyValue.size()) +
                     " bytes; a record key holds at most " + std::to_string(Key::kMaxInline) +
                     " (it is never truncated)");
             }
-            return Key(kb);
+            return Key(keyValue);
         } else {
             static_assert(std::is_trivially_copyable_v<KeyT>,
                           "TypedTopic: key() must return a trivially-copyable value or a byte span");
             static_assert(sizeof(KeyT) <= Key::kMaxInline,
                           "TypedTopic: the key field is wider than Key::kMaxInline (16 bytes) and "
                           "cannot be a record key without truncation");
-            return Key(rec.key());
+            return Key(keyValue);
         }
     }
 
-    void sendWithKey_(const T& rec, const Key& key) {
+    [[nodiscard]] static Key recordKey_(const T& rec) { return keyOf_(rec.key()); }
+
+    /// A schema with no key field: partition 0, empty record key.
+    [[nodiscard]] static Key keyOfRecord_(const T& rec) {
+        if constexpr (HasRecordKey<T>) {
+            return recordKey_(rec);
+        } else {
+            return Key{};
+        }
+    }
+
+    /// Encode `rec` into the reused buffer, stamped with the bound schema version.  Empty when the record encodes to nothing.
+    [[nodiscard]] std::span<const uint8_t> encode_(const T& rec) {
         const std::size_t needed = rec.encodedSize();
         // Grow buf_ if needed but never shrink (capacity persists — RULE #4).
         if (needed > buf_.size()) {
             buf_.resize(needed);
         }
         const std::size_t n = rec.encode(buf_.data());
-        if (n == 0) return;
 
         // Task 19: stamp the BOUND version onto the encoded record header,
         // overwriting the codegen-baked T::kVersion at bytes [2..3] (LE u16 —
@@ -390,8 +469,20 @@ private:
             buf_[2] = static_cast<uint8_t>(version_ & 0xffu);
             buf_[3] = static_cast<uint8_t>((version_ >> 8) & 0xffu);
         }
+        return {buf_.data(), n};
+    }
 
-        producer_.send(topic_, key, std::span<const uint8_t>(buf_.data(), n));
+    /// encode_ for an insert / update / upsert: an empty value would be a delete.
+    [[nodiscard]] std::span<const uint8_t> intentValue_(const T& rec) {
+        const std::span<const uint8_t> value = encode_(rec);
+        if (value.empty()) throw std::invalid_argument("an encoded record must not be empty");
+        return value;
+    }
+
+    void sendWithKey_(const T& rec, const Key& key) {
+        const std::span<const uint8_t> value = encode_(rec);
+        if (value.empty()) return;
+        producer_.send(topic_, key, value);
     }
 
     ProducerT              producer_;

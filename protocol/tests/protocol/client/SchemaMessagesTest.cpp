@@ -1,4 +1,7 @@
 #include <gtest/gtest.h>
+#include <array>
+#include <cstdio>
+#include <string>
 #include <vector>
 #include <cstring>
 #include "rune/protocol/client/SchemaMessages.h"
@@ -243,4 +246,164 @@ TEST(SchemaMessagesRegression, DefineTopicUnknownPersistenceValueIsRejected) {
     in.encode(buf.data());
     buf.back() = 2;   // one past Transient: append-only enum, never cast
     EXPECT_FALSE(DefineTopic::decode(buf.data(), buf.size()).has_value());
+}
+
+// Checked writes (client version 17): the 14-byte TopicKeyFeatures block trails
+// DefineTopic (after the v8 extension) and TopicSchemaResponse (after partitionCount).
+namespace {
+rune::protocol::TopicKeyFeatures keyIndexFeatures() {
+    rune::protocol::TopicKeyFeatures f;
+    f.keyIndex = true;
+    return f;
+}
+DefineTopic defineTopicWithExt() {
+    DefineTopic m;
+    m.sessionId = 7; m.correlationId = 99;
+    m.topicName = "events"; m.partitionCount = 4;
+    m.hasExt = true; m.replicationFactor = 3;
+    m.ext.statement = "topic events;"; m.ext.clientName = "cli";
+    return m;
+}
+}   // namespace
+
+TEST(CheckedWritesSchemaWire, KeyFeaturesBlockRoundTrips) {
+    const auto f = keyIndexFeatures();
+    ASSERT_EQ(f.autoIncrementMax, (uint64_t{1} << 53) - 1);
+    ASSERT_EQ(f.autoIncrementReserve, 4096u);
+    std::array<uint8_t, rune::protocol::kTopicKeyFeaturesWireLen> wire{};
+    rune::protocol::putTopicKeyFeatures(wire.data(), f);
+    const std::array<uint8_t, 14> want{0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00, 0x10, 0x00, 0x00};
+    EXPECT_EQ(wire, want);
+    rune::protocol::TopicKeyFeatures back;
+    ASSERT_TRUE(rune::protocol::getTopicKeyFeatures(wire.data(), wire.size(), back));
+    EXPECT_EQ(back, f);
+
+    auto bad = wire; bad[0] = 0x04;
+    EXPECT_FALSE(rune::protocol::getTopicKeyFeatures(bad.data(), bad.size(), back));
+    bad = wire; bad[1] = 2;
+    EXPECT_FALSE(rune::protocol::getTopicKeyFeatures(bad.data(), bad.size(), back));
+    EXPECT_FALSE(rune::protocol::getTopicKeyFeatures(wire.data(), 13, back));
+
+    auto both = f; both.autoIncrement = true; both.partitioner = rune::protocol::Partitioner::Modulo;
+    rune::protocol::putTopicKeyFeatures(wire.data(), both);
+    EXPECT_EQ(wire[0], 0x03); EXPECT_EQ(wire[1], 1);
+    ASSERT_TRUE(rune::protocol::getTopicKeyFeatures(wire.data(), wire.size(), back));
+    EXPECT_EQ(back, both);
+}
+
+TEST(CheckedWritesSchemaWire, DefineTopicCarriesKeyFeaturesAfterTheExtension) {
+    DefineTopic plain = defineTopicWithExt();
+    DefineTopic m = plain;
+    m.hasKeyFeatures = true; m.keyFeatures = keyIndexFeatures();
+    ASSERT_EQ(m.encodedSize(), plain.encodedSize() + 14u);
+    std::vector<uint8_t> buf(m.encodedSize());
+    ASSERT_EQ(m.encode(buf.data()), buf.size());
+
+    auto d = DefineTopic::decode(buf.data(), buf.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_TRUE(d->hasKeyFeatures);
+    EXPECT_EQ(d->keyFeatures, m.keyFeatures);
+    EXPECT_TRUE(d->hasExt);
+    EXPECT_EQ(d->ext, m.ext);
+    EXPECT_EQ(d->replicationFactor, 3);
+
+    EXPECT_FALSE(DefineTopic::decode(buf.data(), buf.size() - 1).has_value());
+    buf.push_back(0);
+    EXPECT_FALSE(DefineTopic::decode(buf.data(), buf.size()).has_value());
+
+    std::vector<uint8_t> noBlock(plain.encodedSize());
+    ASSERT_EQ(plain.encode(noBlock.data()), noBlock.size());
+    auto p = DefineTopic::decode(noBlock.data(), noBlock.size());
+    ASSERT_TRUE(p.has_value());
+    EXPECT_FALSE(p->hasKeyFeatures);
+}
+
+TEST(CheckedWritesSchemaWireRegression, DefineTopicWithoutFeaturesIsByteIdenticalRegression) {
+    DefineTopic m;
+    m.sessionId = static_cast<int64_t>(0x1122334455667788ULL); m.correlationId = static_cast<int64_t>(0x0A0B0C0D0E0F1011ULL);
+    m.topicName = "events"; m.partitionCount = 4; m.persistence = 0; m.replicationFactor = 3;
+    m.config.retentionMs = 60'000; m.config.cleanupPolicy = 1; m.config.partitionKey = "k";
+    m.hasExt = true; m.ext.statement = "topic events partitions 4 replicas 3;"; m.ext.clientName = "cli";
+    m.ext.requestId = {.hi = 0xC11E, .lo = 77}; m.ext.hasReplayedFrom = 1; m.ext.replayedClusterId = "src";
+    m.ext.replayedOffset = 5;
+    ASSERT_FALSE(m.hasKeyFeatures);
+    std::vector<uint8_t> got(m.encodedSize());
+    ASSERT_EQ(m.encode(got.data()), got.size());
+
+    const std::string path = std::string(RUNE_CONFORMANCE_DIR) + "/vectors/define_topic_v8.bin";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    ASSERT_NE(f, nullptr) << path;
+    std::vector<uint8_t> golden(4096);
+    golden.resize(std::fread(golden.data(), 1, golden.size(), f));
+    std::fclose(f);
+    EXPECT_EQ(got, golden);
+}
+
+TEST(CheckedWritesSchemaWire, KeyFeaturesNeedTheExtension) {
+    DefineTopic m;
+    m.topicName = "t";
+    m.hasKeyFeatures = true; m.keyFeatures = keyIndexFeatures();
+    EXPECT_FALSE(m.fits());
+    std::vector<uint8_t> buf(m.encodedSize() + 14);
+    EXPECT_EQ(m.encode(buf.data()), 0u);
+}
+
+TEST(CheckedWritesSchemaWire, TopicSchemaResponseTrailer) {
+    std::vector<uint8_t> blob = {9, 8, 7};
+    TopicSchemaResponse in; in.sessionId = 1; in.correlationId = 2;
+    in.topicId = 5; in.version = 3;
+    in.descriptorBlob = blob.data(); in.descriptorLen = 3;
+    in.partitionCount = 8;
+
+    std::vector<uint8_t> plain(in.encodedSize());
+    ASSERT_EQ(in.encode(plain.data()), plain.size());
+    auto p = TopicSchemaResponse::decode(plain.data(), plain.size());
+    ASSERT_TRUE(p.has_value());
+    EXPECT_FALSE(p->hasKeyFeatures);
+
+    in.hasKeyFeatures = true; in.keyFeatures = keyIndexFeatures();
+    ASSERT_EQ(in.encodedSize(), plain.size() + 14u);
+    std::vector<uint8_t> buf(in.encodedSize());
+    ASSERT_EQ(in.encode(buf.data()), buf.size());
+    auto d = TopicSchemaResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(d.has_value());
+    EXPECT_TRUE(d->hasKeyFeatures);
+    EXPECT_EQ(d->keyFeatures, in.keyFeatures);
+    EXPECT_EQ(d->partitionCount, 8);
+
+    // A 1-13 byte remainder is not a block: an older or garbled tail decodes as none.
+    for (std::size_t extra = 1; extra <= 13; ++extra) {
+        auto cut = TopicSchemaResponse::decode(buf.data(), plain.size() + extra);
+        ASSERT_TRUE(cut.has_value()) << extra;
+        EXPECT_FALSE(cut->hasKeyFeatures) << extra;
+        EXPECT_EQ(cut->partitionCount, 8) << extra;
+    }
+}
+
+TEST(CheckedWritesSchemaWireRegression, TopicSchemaResponseRefusesAMalformedKeyFeaturesBlock) {
+    TopicSchemaResponse in; in.sessionId = 1; in.correlationId = 2;
+    in.topicId = 5; in.partitionCount = 8;
+    in.hasKeyFeatures = true; in.keyFeatures = keyIndexFeatures();
+    std::vector<uint8_t> buf(in.encodedSize());
+    ASSERT_EQ(in.encode(buf.data()), buf.size());
+    ASSERT_TRUE(TopicSchemaResponse::decode(buf.data(), buf.size()).has_value());
+    const std::size_t block = buf.size() - 14;
+
+    auto badFlags = buf; badFlags[block] = 0x04;
+    EXPECT_FALSE(TopicSchemaResponse::decode(badFlags.data(), badFlags.size()).has_value());
+    auto badPartitioner = buf; badPartitioner[block + 1] = 2;
+    EXPECT_FALSE(TopicSchemaResponse::decode(badPartitioner.data(), badPartitioner.size()).has_value());
+}
+
+TEST(CheckedWritesSchemaWireRegression, DefineTopicRefusesAMalformedKeyFeaturesBlock) {
+    DefineTopic m = defineTopicWithExt();
+    m.hasKeyFeatures = true; m.keyFeatures = keyIndexFeatures();
+    std::vector<uint8_t> buf(m.encodedSize());
+    ASSERT_EQ(m.encode(buf.data()), buf.size());
+    const std::size_t block = buf.size() - 14;
+
+    auto badFlags = buf; badFlags[block] = 0x04;
+    EXPECT_FALSE(DefineTopic::decode(badFlags.data(), badFlags.size()).has_value());
+    auto badPartitioner = buf; badPartitioner[block + 1] = 2;
+    EXPECT_FALSE(DefineTopic::decode(badPartitioner.data(), badPartitioner.size()).has_value());
 }
