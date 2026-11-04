@@ -8,6 +8,8 @@ docker/secrets/*.key
 CMakeUserPresets.json
 compile_commands.json
 Testing/
+# ctest's Testing/ only: on a case-insensitive checkout it also matches the source test-helper dirs below.
+!**/include/rune/**/testing/
 *.log
 .DS_Store
 .idea/
