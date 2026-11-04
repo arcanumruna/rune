@@ -1349,7 +1349,7 @@ inline void writeReapResult(uint8_t* p, const ReapResultMsg& m) noexcept {
     p[8] = static_cast<uint8_t>(m.status);
 }
 [[nodiscard]] inline bool decodeReapResult(const uint8_t* buf, std::size_t len, ReapResultMsg& m) {
-    if (buf == nullptr || len != kReapResultWireLen || buf[8] > 2) return false;
+    if (buf == nullptr || len != kReapResultWireLen || buf[8] > 3) return false;   // #722: Waiting = 3
     std::memcpy(&m.correlation, buf, 8);
     m.status = static_cast<ReapStatus>(buf[8]);
     return true;

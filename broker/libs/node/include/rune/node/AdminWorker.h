@@ -398,6 +398,11 @@ public:
     /// out) although its event commits and applies normally — the leader that is crashed meanwhile dies
     /// with a committed, unanswered DDL (the in-doubt client).  Never set in production.
     void holdAnswersForTest(bool on) noexcept { answersHeldForTest_ = on; }
+    /// Test seam (#644, ADMIN thread): while held, this broker drops every `__catalog` FetchResponse frame it receives on the
+    /// admin plane before it reaches the replica, so a follower learns nothing from the leader.  The leader that is
+    /// crashed meanwhile dies with an event appended but replicated to nobody.  Checked only on the admin frame path.
+    /// Never set in production.
+    void holdCatalogReplicationForTest(bool on) noexcept { catalogReplicationHeldForTest_ = on; }
     /// Issue #296: the open-file limit DDL is admitted against (a broker restarted with a lower limit).
     void setFdLimitForTest(uint64_t limit) noexcept { deps_.fdLimit = limit; }
     /// The catalog leader serving DDL.
@@ -589,6 +594,7 @@ private:
     uint64_t ddlRefusedFdBudget_ = 0;   ///< issue #296
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)
     bool     answersHeldForTest_ = false;  // holdAnswersForTest (test seam only)
+    bool     catalogReplicationHeldForTest_ = false;  // holdCatalogReplicationForTest (test seam only)
 
     // Namespaces Phase 2 Task 7: drives every DELETING namespace to removal.  Stepped on the catalog leader only.
     NamespaceReaper reaper_;

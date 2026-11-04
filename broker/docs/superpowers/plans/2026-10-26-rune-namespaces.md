@@ -1125,6 +1125,24 @@ Spec §8, §10; CLAUDE.md rule 11.
 **Checkpoint E**, then the final whole-branch review (most capable model, exhaustive and adversarial, against the
 Review Focus list and the matrix).
 
+## Justified deviations (recorded from the Task 12-14 review, #650)
+
+The tests assert these rules, which differ from the plan text above.  Each was justified in review.  The code reference
+is `broker/libs/node/tests/support/NamespaceMatrixExpectations.h`; the test
+`NamespaceMatrixCountRegression.JustifiedDeviationsPinnedRegression` pins every bullet.
+
+- Anonymous Fetch and GetViewRow are NotAuthorized (`:189`), matching spec §11 (an anonymous session may read the
+  schema only), against plan rule 2.
+- An ungranted data op on a ForeignNs target is NotAuthorized, not Missing (`:213`). No leak: the answer depends only on
+  the caller's own grants, and the matrix byte-checks it against the twin.
+- Root ListNamespaces on a Missing target is Ok (`:195`): ListNamespaces takes no target.
+- A duplicate user or role answers 39 (`:165`), the same code as the security "missing" answer. They differ only in the
+  detail text.
+- DropTopic and Grant duplicate codes equal their missing codes (7 and 39). "The effect happened once" still holds.
+- The resolveName mutation turns 33 cells red, below the plan's ">100": 33 is the structural maximum for
+  name-addressed ops.
+- The CreateUser leader-change cells count request ids in `__security` instead of comparing object ids.
+
 ## Spec gaps (decided here, recorded for review)
 
 - The spec does not say which code a duplicate namespace name gets. This plan reuses `TopicExists` (25) (Global

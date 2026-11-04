@@ -1034,6 +1034,11 @@ public:
     /// (no try/catch on the hot path), so nothing is counted any more — kept for
     /// the existing read-safety contract and tests (always 0).
     [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept { return callbackExceptions_; }
+    /// #715 test probes (duty / owner thread; plain counters, no allocation): EndTxn requests this producer submitted to the
+    /// coordinator link (a commit / abort attempt, a re-send after an in-doubt timeout included), and the wire offers the
+    /// link made for the EndTxn requests that were answered (first send + every re-send of the link).
+    [[nodiscard]] uint32_t endTxnAttemptsForTest() const noexcept { return endTxnSubmits_; }
+    [[nodiscard]] uint32_t endTxnWireOffersForTest() const noexcept { return endTxnWireOffers_; }
 
     // ---- F8c C6a: close (rich-state lifecycle) ----------------------------------
     //
@@ -2200,6 +2205,8 @@ private:
     uint32_t     batchAckMaxMsg_    = (1u << 20) / 8;
     // fix2 minor: plain counter (see testCallbackExceptionCount()).
     uint64_t     callbackExceptions_ = 0;
+    uint32_t     endTxnSubmits_    = 0;   // #715 probe: see endTxnAttemptsForTest()
+    uint32_t     endTxnWireOffers_ = 0;   // #715 probe: see endTxnWireOffersForTest()
 
     // ---- F8c C6a: lifecycle (duty-thread state; rich states) ---------------------
     struct LifeOpen {};

@@ -379,6 +379,7 @@ public:
         if (txnService_ != nullptr)
             namespaces_.registry().forEach([this](const rune::catalog::NamespaceRecord& r) {
                 txnService_->setNamespaceTxnLimits(r.nsId, r.limits.maxOpenTxns, r.limits.maxTxnTimeMs);
+                txnService_->setNamespaceTxnGate(r.nsId, rune::catalog::tagOf(r.state) != rune::catalog::NsStateTag::Active, rune::catalog::tagOf(r.state) == rune::catalog::NsStateTag::Deleting);   // #661
             });
     }
 
@@ -539,6 +540,9 @@ public:
         (void)shipPermissions_(*s);
     }
     int servicePermissionShippingForTest() { return servicePermissionShipping_(); }
+    /// #713 probe (control thread): permission ships so far - every bind of a session's table (login, the must-change transition, a
+    /// gate change, a permission refresh), the suspended / deny tables included.  Plain counter, no allocation.
+    [[nodiscard]] uint64_t permissionShipsForTest() const noexcept { return permEpoch_; }
     /// Issue #259 probes: tables compiled so far, live pooled tables, and the words / ops shipped to the workers.
     [[nodiscard]] uint64_t permissionCompilesForTest() const noexcept { return permPool_.compiles(); }
     [[nodiscard]] std::size_t permissionTablesForTest() const noexcept { return permPool_.liveTables(); }
@@ -562,7 +566,12 @@ public:
     /// Phase 2 Task 3: a deleted namespace is gone (kA2cNamespaceErased); its sessions were closed at Deleting.
     void onNamespaceErased(uint32_t nsId) {
         (void)namespaces_.erase(nsId);
-        if (txnService_ != nullptr) txnService_->setNamespaceTxnLimits(nsId, 0, 0);   // Task 10
+        if (const auto it = std::lower_bound(deletingNs_.begin(), deletingNs_.end(), nsId);
+            it != deletingNs_.end() && *it == nsId) deletingNs_.erase(it);   // #721
+        if (txnService_ != nullptr) {
+            txnService_->setNamespaceTxnLimits(nsId, 0, 0);   // Task 10
+            txnService_->setNamespaceTxnGate(nsId, false, false);    // #661
+        }
         if (const uint16_t sl = nsSlots_.slotOf(nsId); sl != rune::node::kNoNsSlot && nsId != 0) onNsSlotFreed(sl, nsId);
     }
     // Namespaces Phase 2 Task 8 (D22): this gateway's OWN copy of the node's slot table, fed by the control thread
@@ -2055,9 +2064,12 @@ private:
     void handleAlterView       (const uint8_t* buf, std::size_t len);
     template <class Msg, class Submit>
     void handleCatalogDdl_(const uint8_t* buf, std::size_t len, const char* what, Submit&& submit);
-    [[nodiscard]] static rune::gateway::DdlMetaView
+    /// Issue #652: `authenticated` is the QUALIFIED login name (`<ns>/<user>`; the bare user in `default`), built into
+    /// `ddlPrincipalScratch_` (control thread, cold DDL path), so a tenant's audit principal never equals a default user's.
+    [[nodiscard]] rune::gateway::DdlMetaView
         ddlMetaOf_(const rune::protocol::client::DdlExtension* ext, int64_t sessionId, const Session& session,
-                   uint32_t targetNsId) noexcept;
+                   uint32_t targetNsId);
+    std::string ddlPrincipalScratch_;
     void answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune::gateway::AdminSubmit r,
                             const char* ringFull, const char* tooLarge);
     /// Task 11: the DDL route gate — true = answered here (never submitted):
@@ -2570,6 +2582,16 @@ private:
     rune::gateway::GatewayAuthMode authMode_ = rune::gateway::GatewayAuthMode::InProcess;
     rune::catalog::NamespaceMirror namespaces_;   ///< namespaces Task 9: control thread's copy (login lookup)
     rune::node::NsSlotTable nsSlots_;             ///< namespaces Phase 2 Task 8: this gateway's own slot table
+    /// #721: the namespaces in the DELETING state (sorted, tiny: a namespace is there only until the reaper erases it).
+    /// Empty in steady state, so the read gates below cost one compare.  Control thread only.
+    std::vector<uint32_t>   deletingNs_;
+    /// #721: true when topic / view `id` belongs to a DELETING namespace.  O(1) when none is deleting, otherwise one
+    /// ObjectIndex array load plus a binary search over a handful of ids; never allocates.
+    [[nodiscard]] bool inDeletingNs_(int32_t id) const noexcept {
+        if (deletingNs_.empty()) [[likely]] return false;
+        const rune::gateway::ObjectEntry* e = objectIndex_.at(id);
+        return e != nullptr && std::binary_search(deletingNs_.begin(), deletingNs_.end(), e->nsId);
+    }
     uint64_t                nsSlotMismatches_ = 0;
     rune::node::NsLimitAggregator* nsAggregator_ = nullptr;   ///< Task 14: not owned; same thread
     std::vector<uint64_t>   workerNsSlotMismatches_;   ///< cumulative, per worker (SessionSignal NsSlotMismatch)
@@ -2730,7 +2752,7 @@ private:
     [[nodiscard]] bool denyGroupRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     [[nodiscard]] bool denyTxnRequest_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len);
     template <class Msg> [[nodiscard]] std::optional<rune::gateway::Denial> authorizeCatalogDdl_(const Session& session, const Msg& m,
-                                                                                               std::string_view local) const;
+                                                                                               std::string_view local, uint32_t nsId) const;
     /// D19: READ on every source topic of a CreateView / AlterView plan (an undecodable blob is left to the admin thread).
     [[nodiscard]] std::optional<rune::gateway::Denial> authorizeViewSources_(const Session& session, const uint8_t* blob,
                                                                               std::size_t len) const;

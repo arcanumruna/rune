@@ -85,6 +85,9 @@ public:
     /// codec has no catalog, so the caller supplies the namespace's name; a grant naming another namespace is inert.
     /// A namespace admin never counts toward hasSecurityAdmin().
     [[nodiscard]] std::vector<uint64_t> nsAdminOf(uint32_t nsId, std::string_view nsName) const;
+    /// Issue #653: the yes/no form of nsAdminOf for ONE user (no vector, no scan of every user): the user exists, is
+    /// enabled, belongs to namespace `nsId` and effectively holds ADMIN on NAMESPACE "<nsName>".
+    [[nodiscard]] bool isNsAdmin(uint64_t userId, uint32_t nsId, std::string_view nsName) const;
     [[nodiscard]] int64_t appliedOffset() const noexcept { return appliedOffset_; }   // -1 = nothing applied
     [[nodiscard]] uint64_t nextObjectId() const noexcept { return nextObjectId_; }    // users and roles share one counter
     [[nodiscard]] std::optional<RequestRecord> request(const RequestId&) const;

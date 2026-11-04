@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -21,6 +22,43 @@ TEST(NamespaceMatrixRegression, MatrixCountRegression) {
     EXPECT_EQ(k.applicable, 539u);
     EXPECT_EQ(k.timing, 56u);
     EXPECT_EQ(k.total, 595u);
+}
+
+// #647: the rig cached each user session for the whole suite, past the broker's 10 s idle reap.  A cached session idle
+// for more than 5 s is logged in again (the same rule as AuthBroker::freshAdminSid_).
+TEST(NamespaceRigRegression, StaleUserSessionReloggedRegression) {
+    NamespaceRig rig;
+    const int64_t first = rig.userSessionForTest("a/ungranted");
+    EXPECT_EQ(rig.userSessionForTest("a/ungranted"), first) << "a fresh session is reused";
+    rig.ageUserSessionForTest("a/ungranted", std::chrono::seconds(6));
+    const int64_t second = rig.userSessionForTest("a/ungranted");
+    EXPECT_NE(second, first) << "a session idle past 5 s must be replaced before the 10 s reap can take it";
+    // the replacement serves a real cell: the same answer the matrix expects of this caller
+    for (std::size_t o = 0; o < kOps; ++o) {
+        if (naRule(Op(o), Target::OwnNs)) continue;
+        const NamespaceRig::Answer got = rig.run(Op(o), Caller::UserUngranted, Target::OwnNs, 0);
+        EXPECT_EQ(got.code, expect(Op(o), Caller::UserUngranted, Target::OwnNs).code) << name(Op(o));
+        break;
+    }
+
+    // #647 follow-up: root's session and the timing cells' second sessions are replaced after 5 s idle too.
+    const int64_t rootFirst = rig.rootSessionForTest();
+    EXPECT_EQ(rig.rootSessionForTest(), rootFirst) << "a fresh root session is reused";
+    rig.ageRootSessionForTest(std::chrono::seconds(6));
+    const int64_t rootSecond = rig.rootSessionForTest();
+    EXPECT_NE(rootSecond, rootFirst) << "root's session idle past 5 s must be replaced";
+    for (std::size_t o = 0; o < kOps; ++o) {
+        if (naRule(Op(o), Target::OwnNs)) continue;
+        const NamespaceRig::Answer got = rig.run(Op(o), Caller::ClusterAdmin, Target::OwnNs, 0);
+        EXPECT_EQ(got.code, expect(Op(o), Caller::ClusterAdmin, Target::OwnNs).code) << name(Op(o));
+        break;
+    }
+    for (const Caller who : {Caller::ClusterAdmin, Caller::NsAdminSame}) {
+        const int64_t s1 = rig.secondSessionForTest(who);
+        EXPECT_EQ(rig.secondSessionForTest(who), s1) << "a fresh second session is reused";
+        rig.ageSecondSessionForTest(who, std::chrono::seconds(6));
+        EXPECT_NE(rig.secondSessionForTest(who), s1) << "a second session idle past 5 s must be replaced: " << name(who);
+    }
 }
 
 namespace {
@@ -39,6 +77,49 @@ std::string cellName(const Cell& c) {
 }
 }  // namespace
 
+/// The namespace a caller's session lives in on a SameNameBoth cell (the rig's sessionFor).
+const char* callerNs(Caller c) {
+    switch (c) {
+        case Caller::ClusterAdmin: return "default";
+        case Caller::NsAdminForeign: case Caller::UserForeign: return "b";
+        default: return "a";
+    }
+}
+/// #643: after an Ok SameNameBoth cell the caller's namespace holds exactly the op's effect and every other namespace is
+/// byte-equal to what it held before.
+void checkSameNameEffect(const Cell& c, const NamespaceRig::Snapshot& before, const NamespaceRig::Snapshot& after) {
+    const std::string who = callerNs(c.caller);
+    const std::string ord = std::to_string(c.ordinal);
+    const std::string label = cellName(c) + " (caller namespace " + who + ")";
+    for (const auto& [ns, contents] : before) {
+        if (ns == who) continue;
+        ASSERT_TRUE(after.count(ns)) << label;
+        EXPECT_EQ(after.at(ns), contents) << label << ": namespace " << ns << " changed, it is not the caller's";
+    }
+    NamespaceRig::NsContents expected = before.at(who);
+    const NamespaceRig::NsContents& now = after.at(who);
+    auto expectChanged = [&](const std::string& key) {
+        ASSERT_TRUE(expected.count(key)) << label << ": " << key << " was not there before";
+        ASSERT_TRUE(now.count(key)) << label << ": " << key << " vanished";
+        EXPECT_NE(now.at(key), expected.at(key)) << label << ": " << key << " did not change: " << now.at(key);
+        expected[key] = now.at(key);
+    };
+    auto expectDropped = [&](const std::string& key) {
+        ASSERT_TRUE(expected.count(key)) << label << ": " << key << " was not there before";
+        EXPECT_FALSE(now.count(key)) << label << ": " << key << " is still in " << who;
+        expected.erase(key);
+    };
+    switch (c.op) {
+        case Op::AlterTopic: expectChanged("T:d" + ord); break;
+        case Op::DropTopic: expectDropped("T:d" + ord); break;
+        case Op::DropView: expectDropped("V:dv" + ord); break;
+        case Op::DropUser: expectDropped("U:d" + ord); break;
+        case Op::Grant: case Op::Revoke: expectChanged("U:x"); break;
+        default: break;   // the reads, the join and the txn id change neither the catalog nor the security state
+    }
+    EXPECT_EQ(now, expected) << label << ": the caller's namespace changed beyond the op's own effect";
+}
+
 class NamespaceMatrixRegression : public ::testing::TestWithParam<Cell> {
 protected:
     static void SetUpTestSuite() { rig_ = std::make_unique<NamespaceRig>(); }
@@ -49,7 +130,11 @@ protected:
 TEST_P(NamespaceMatrixRegression, SequentialCell) {
     const Cell& c = GetParam();
     const Outcome want = expect(c.op, c.caller, c.target);
-    const NamespaceRig::Answer got = rig_->run(c.op, c.caller, c.target, c.ordinal);
+    // #643: a SameNameBoth cell that succeeds must change the CALLER's namespace's object only, as the op requires.
+    const bool sameNameOk = c.target == Target::SameNameBoth && want.kind == Kind::Ok && c.caller != Caller::Anonymous;
+    NamespaceRig::Snapshot before, after;
+    const NamespaceRig::Answer got = sameNameOk ? rig_->runSnapshotted(c.op, c.caller, c.target, c.ordinal, before, after)
+                                                : rig_->run(c.op, c.caller, c.target, c.ordinal);
     const std::string label = cellName(c) + ": want " + describe(want) + ", got code " + std::to_string(got.code) + " [" + got.detail + "]";
     switch (want.kind) {
         case Kind::Ok: case Kind::Exists: case Kind::NotAuthorized: case Kind::Refused: case Kind::LimitExceeded:
@@ -60,12 +145,18 @@ TEST_P(NamespaceMatrixRegression, SequentialCell) {
             break;
         case Kind::NotApplicable: FAIL() << label; break;
     }
+    if (sameNameOk && got.code == want.code) checkSameNameEffect(c, before, after);
     // Hidden objects (a namespace the caller cannot see): whatever the answer, it is byte-equal to the same op on
     // a namespace that does not exist.
     const bool foreignCaller = c.caller == Caller::NsAdminForeign || c.caller == Caller::UserForeign;
-    const bool hidden = !isNamespaceOp(c.op) &&
-                        ((c.target == Target::ForeignNs && c.caller != Caller::ClusterAdmin && c.caller != Caller::NsAdminSame) ||
-                         (c.target == Target::OwnNs && foreignCaller));
+    // #649: a foreign caller on a Missing target is hidden too (the missing name lives in the namespace under test), and
+    // so is a namespace op (create / set limits) by a non-root caller on an existing namespace it cannot see.
+    const bool existingHidden = (c.target == Target::ForeignNs && c.caller != Caller::ClusterAdmin && c.caller != Caller::NsAdminSame) ||
+                                (c.target == Target::OwnNs && foreignCaller);
+    const bool nsOpHidden = (c.op == Op::CreateNamespace || c.op == Op::SetNamespaceLimits) && c.caller != Caller::ClusterAdmin &&
+                            existingHidden;
+    const bool hidden = isNamespaceOp(c.op) ? nsOpHidden
+                                            : existingHidden || (c.target == Target::Missing && foreignCaller);
     // Phase 2 Task 5 (D19): a transactional id is scoped to the caller's own namespace, so InitProducerId answers Ok
     // for a foreign caller too, and its body carries a freshly allocated producer id (unique per call): there is no
     // hidden object to compare, and the two Ok bodies differ in the id alone.
@@ -121,6 +212,30 @@ int dupCode(Op o) {
     }
 }
 }  // namespace
+
+// #650: the plan's "Justified deviations" section (2026-10-26-rune-namespaces.md) records these rules; pin each one so
+// the doc and the expectations cannot drift apart.  No broker: expect() and the code tables only.
+TEST(NamespaceMatrixCountRegression, JustifiedDeviationsPinnedRegression) {
+    // anonymous Fetch and GetViewRow are NotAuthorized (spec §11), not the plan's rule 2 "Ok"
+    for (const Op o : {Op::Fetch, Op::GetViewRow})
+        for (const Target t : {Target::OwnNs, Target::SameNameBoth, Target::ForeignNs, Target::Missing})
+            EXPECT_EQ(expect(o, Caller::Anonymous, t), Outcome::notAuthorized()) << name(o) << "/" << name(t);
+    // an ungranted data op on a ForeignNs target is NotAuthorized, not Missing
+    for (const Op o : {Op::CreateTopic, Op::AlterTopic, Op::DropTopic, Op::Produce, Op::Fetch, Op::GetTopicSchema})
+        EXPECT_EQ(expect(o, Caller::UserUngranted, Target::ForeignNs), Outcome::notAuthorized()) << name(o);
+    // root ListNamespaces on a Missing target is Ok
+    EXPECT_EQ(expect(Op::ListNamespaces, Caller::ClusterAdmin, Target::Missing), Outcome::ok());
+    // a duplicate user or role answers 39, the code of the security "missing" answer
+    for (const Op o : {Op::CreateUser, Op::CreateRole}) {
+        EXPECT_EQ(expect(o, Caller::ClusterAdmin, Target::OwnNs), Outcome::exists(39)) << name(o);
+        EXPECT_EQ(expectedCodes(o)[0], 39) << name(o);
+    }
+    // DropTopic duplicate -> 7 and Grant duplicate -> 39: the same codes as their "missing" answers
+    EXPECT_EQ(dupCode(Op::DropTopic), 7);
+    EXPECT_EQ(expectedCodes(Op::DropTopic)[0], 7);
+    EXPECT_EQ(dupCode(Op::Grant), 39);
+    EXPECT_EQ(expectedCodes(Op::Grant)[0], 39);
+}
 
 TEST(NamespaceMatrixTimingCountRegression, TimingCellCountRegression) {
     EXPECT_EQ(timingCells().size(), 42u);
@@ -186,6 +301,15 @@ TEST_P(NamespaceMatrixTimingRegression, TimingCell) {
             auto snap = [&] { return Snap{r.rootListNamespaces(), r.rootMetadata(), r.securityDigest()}; };
             const auto a = r.timed(p.op, p.caller, p.ordinal, {}, lim);
             EXPECT_EQ(a.code, first.code) << label << " [" << a.detail << "]";
+            // #652: the catalog event of a tenant's DDL carries the qualified login name, before and after a restart.
+            const bool principalCell = ok && p.op == Op::CreateTopic;
+            const std::string wantPrincipal = p.caller == Caller::ClusterAdmin ? "admin" : "a/admin";
+            const std::string made = "k" + std::to_string(p.ordinal);
+            if (principalCell) {
+                const auto got = r.createTopicPrincipalForTest(made);
+                ASSERT_TRUE(got.has_value()) << label << ": no CreateTopic event for " << made;
+                EXPECT_EQ(*got, wantPrincipal) << label << ": the audit principal before the restart";
+            }
             const Snap s1 = snap();
             r.restartForTest();
             EXPECT_TRUE(r.awaitRootListed(r.topicIdA(), s1.ids.size())) << label << ": the topics did not come back";
@@ -193,6 +317,11 @@ TEST_P(NamespaceMatrixTimingRegression, TimingCell) {
             EXPECT_EQ(s1.ns.normalized(s2.ns), s2.ns.normalized(s1.ns)) << label << ": ListNamespaces changed";
             EXPECT_EQ(s1.ids, s2.ids) << label << ": the topic listing changed";
             EXPECT_EQ(s1.digest, s2.digest) << label << ": the security view changed";
+            if (principalCell) {
+                const auto got = r.createTopicPrincipalForTest(made);
+                ASSERT_TRUE(got.has_value()) << label << ": the CreateTopic event is gone after the restart";
+                EXPECT_EQ(*got, wantPrincipal) << label << ": the audit principal after the restart";
+            }
             if (ok) {
                 const auto again = r.timed(p.op, p.caller, p.ordinal, {}, lim);
                 EXPECT_EQ(again.code, dup) << label << ": the effect did not survive the restart [" << again.detail << "]";

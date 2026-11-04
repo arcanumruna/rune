@@ -1083,10 +1083,10 @@ void nsAbortCell(AtDelete at, bool refused) {
 
     int64_t now = 10;
     EXPECT_EQ(T.tcs->abortNamespaceTxns(7, now), ReapStatus::Done) << "another namespace's delete";
-    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, now), ReapStatus::More) << "the marker has not been answered yet";
+    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, now), ReapStatus::Waiting) << "the marker has not been answered yet";
     EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), prepared);
-    ReapStatus st = ReapStatus::More;
-    for (int i = 0; i < 64 && st == ReapStatus::More; ++i) {   // the coordinator and the worker, 1 ms apart
+    ReapStatus st = ReapStatus::Waiting;
+    for (int i = 0; i < 64 && st == ReapStatus::Waiting; ++i) {   // the coordinator and the worker, 1 ms apart
         (void)T.tcs->doWork(now);
         T.m.runWorker(now);
         now += 1'000'000;
@@ -1122,13 +1122,40 @@ TEST(NamespaceTxnAbortRegression, AbortNamespaceTxnsNeverWaitsOnARefusedMarkerRe
     for (const AtDelete at : {AtDelete::Ongoing, AtDelete::PrepareCommit, AtDelete::PrepareAbort}) nsAbortCell(at, true);
 }
 
+// #662 DIAG (1): a PrepareAbort whose marker was refused (minIsr) settles through the RETRY path once the partition is
+// dropped (the reaper's DropTopics): retryRefusedMarkers_ finds no partition and drops the marker, so the namespace's
+// transactions are all settled and the txn-state tombstone is no longer refused for them.
+// RED when the `!partitionExists_` drop in retryRefusedMarkers_ is removed: the txn stays PrepareAbort for ever.
+TEST(NamespaceTxnAbortRegression, PrepareAbortWithRefusedMarkerSettlesAfterPartitionDropRegression) {
+    TxnRig T(/*minIsr=*/2, /*withStore=*/true);
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(1 + i);
+    ASSERT_TRUE(T.endTxnOkPreparing(/*commit=*/false));
+    int64_t now = 10;
+    for (int i = 0; i < 8 && T.tcs->controlMarkersRefusedForTest() == 0; ++i) { (void)T.tcs->doWork(now); T.m.runWorker(now); now += 1'000'000; }
+    ASSERT_GE(T.tcs->controlMarkersRefusedForTest(), 1u) << "precondition: the marker was refused";
+    EXPECT_EQ(T.tcs->tombstoneNamespace(0, 64, now), ReapStatus::Refused) << "the transaction is still ending";
+    ASSERT_TRUE(T.m.topics.dropTopic(0));   // the reaper's DropTopics
+    ReapStatus st = ReapStatus::Refused;
+    for (int i = 0; i < 50 && st != ReapStatus::Done; ++i) {   // past every retry backoff, 50 ms apart
+        now += 50'000'000;
+        (void)T.tcs->doWork(now);
+        T.m.runWorker(now);
+        st = T.tcs->tombstoneNamespace(0, 64, now);
+    }
+    EXPECT_EQ(T.tcs->txnStateForTest(T.txnId), tx::TxnState::CompleteAbort) << "the dropped partition's marker held the txn";
+    EXPECT_EQ(st, ReapStatus::Done);
+}
+
 // RED (Done when not loaded): the catalog leader that is not the coordinator would let the topics go before the
 // coordinator elsewhere wrote its markers.
 TEST(NamespaceTxnAbortRegression, AbortNamespaceTxnsNotLoadedIsRefusedRegression) {
     TxnRig T;
     ASSERT_EQ(T.initPid(), 0);
     ASSERT_EQ(T.addPartition(), 0);
-    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, 10), ReapStatus::More);
+    EXPECT_EQ(T.tcs->abortNamespaceTxns(0, 10), ReapStatus::Waiting);
     T.leader = false;
     (void)T.tcs->doWork(20);
     ASSERT_FALSE(T.tcs->isLoaded());

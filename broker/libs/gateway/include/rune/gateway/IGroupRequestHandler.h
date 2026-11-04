@@ -104,6 +104,9 @@ struct IGroupRequestHandler {
     // Issue #212: the session ended for good (revoked: user dropped / disabled, TERMINATE SESSIONS): its members leave
     // their groups now, so the group rebalances at once instead of at their heartbeat timeout.  Cold.  Default: nothing.
     virtual void removeSessionMembers(int64_t sessionId, int64_t nowNs) { (void)sessionId; (void)nowNs; }
+    // #696: the distinct groups of namespace `nsId` on this node's coordinator (the count its maxGroups limit checks).  0 when
+    // this node coordinates none (usage is per node, D24).  Control thread, cold.  Default: 0.
+    [[nodiscard]] virtual uint64_t groupsOfNamespace(uint32_t nsId) const { (void)nsId; return 0; }
 };
 
 } // namespace rune::gateway

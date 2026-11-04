@@ -1821,11 +1821,21 @@ public:
     void holdCatalogAnswersForTest(bool on) {
         onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdAnswersForTest(on); return 0; });
     }
+    /// Issue #644 seam (ADMIN thread via onAdminThreadForTest): while held, this broker ignores the `__catalog` FetchResponse
+    /// frames its leader sends (AdminWorker::holdCatalogReplicationForTest) - the event the leader appends reaches no follower.
+    void holdCatalogReplicationForTest(bool on) {
+        onAdminThreadForTest([this, on]() { adminWorkerAgent_->worker().holdCatalogReplicationForTest(on); return 0; });
+    }
     /// Issue #197 seam (CONTROL thread): hold / release the gateway's permission shipper (queued, never sent while held;
     /// releasing ships the backlog at once).
     template <class = void>   // instantiated after onControlThreadForTest is defined
     void holdPermissionShippingForTest(bool on) {
         onControlThreadForTest([this, on]() { if (gateway_) gateway_->holdPermissionShippingForTest(on); return 0; });
+    }
+    /// Issue #713 probe (CONTROL thread): how many permission ships this broker's gateway has made (ClientGateway::permissionShipsForTest).
+    template <class = void>   // instantiated after onControlThreadForTest is defined
+    uint64_t permissionShipsForTest() {
+        return onControlThreadForTest([this]() -> uint64_t { return gateway_ ? gateway_->permissionShipsForTest() : 0; });
     }
     /// Issue #189 seam (CONTROL thread): forget every login-throttle entry of this broker's gateway.
     template <class = void>   // instantiated after onControlThreadForTest is defined
@@ -1846,7 +1856,11 @@ public:
                 return n && *n != 0;
             };
             const bool dirty = (groupCoordService_ && fold(groupCoordService_->liveKeysOfNamespaceForTest(nsId))) |
-                               (txnCoordService_ && fold(txnCoordService_->liveKeysOfNamespaceForTest(nsId)));
+                               (txnCoordService_ && fold(txnCoordService_->liveKeysOfNamespaceForTest(nsId))) |
+                               // the coordinators' in-memory entries too (#663 / #727): a delete that tombstoned the stores but
+                               // left a group or transaction in memory is Dirty
+                               (groupCoordService_ && groupCoordService_->inMemoryGroupsOfNamespaceForTest(nsId) != 0) |
+                               (txnCoordService_ && txnCoordService_->inMemoryEntriesOfNamespaceForTest(nsId) != 0);
             return dirty ? KeyedStoresState::Dirty : unknown ? KeyedStoresState::Unknown : KeyedStoresState::Clean;
         });
     }

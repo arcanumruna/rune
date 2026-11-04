@@ -19,6 +19,23 @@ std::optional<uint32_t> targetOf(const ReapState& s) {
     }, s);
 }
 
+/// #722: gate an issuing state's next ask.  After a non-progress answer (`idle` > 0) the first call arms the deadline
+/// (1 ms << idle, capped by idle <= 7 at 128 ms); the state asks again only once `nowNs` reaches it.
+[[nodiscard]] bool backoffElapsed(ReapBackoff& b, int64_t nowNs) noexcept {
+    if (b.idle == 0) return true;
+    if (b.retryAtNs == 0) b.retryAtNs = nowNs + (int64_t{1'000'000} << b.idle);
+    return nowNs >= b.retryAtNs;
+}
+
+/// A non-progress answer: back off further (the deadline is armed by the next doWork).
+void noteNoProgress(ReapBackoff& b) noexcept {
+    b.idle = static_cast<uint8_t>(b.idle < 7 ? b.idle + 1 : 7);
+    b.retryAtNs = 0;
+}
+
+/// Progress (More) or an applied DDL: ask again at once.
+void noteProgress(ReapBackoff& b) noexcept { b = ReapBackoff{}; }
+
 }  // namespace
 
 std::string_view NamespaceReaper::stateName() const noexcept {
@@ -44,7 +61,7 @@ ReapState NamespaceReaper::derive_(const cat::NamespaceRecord& rec) const {
     return ReapAwaitRemoval{id};   // only SecurityPurged is left (an entry with every bit and no object is already erased)
 }
 
-int NamespaceReaper::doWork(int64_t /*nowNs*/, const cat::CatalogState& cs, ReaperPort& port) {
+int NamespaceReaper::doWork(int64_t nowNs, const cat::CatalogState& cs, ReaperPort& port) {
     const cat::NamespaceRegistry& reg = cs.namespaces();
     int work = 0;
     // The target left DELETING (erased by the apply of its last event): whatever was in flight is moot.
@@ -64,10 +81,10 @@ int NamespaceReaper::doWork(int64_t /*nowNs*/, const cat::CatalogState& cs, Reap
         state_ = derive_(*target);
         ++work;
     }
-    return work + step_(cs, port);
+    return work + step_(nowNs, cs, port);
 }
 
-int NamespaceReaper::step_(const cat::CatalogState& cs, ReaperPort& port) {
+int NamespaceReaper::step_(int64_t nowNs, const cat::CatalogState& cs, ReaperPort& port) {
     const cat::NamespaceRegistry& reg = cs.namespaces();
     return std::visit([&](auto& st) -> int {
         using T = std::decay_t<decltype(st)>;
@@ -80,6 +97,7 @@ int NamespaceReaper::step_(const cat::CatalogState& cs, ReaperPort& port) {
             if constexpr (std::is_same_v<T, ReapAbortingTxns>) {
                 if ((d->stepMask & cat::TxnsAborted) != 0) { state_ = ReapIdle{}; return 1; }   // recorded meanwhile
                 if (st.inFlightCorrelation != 0) return 0;
+                if (!backoffElapsed(st.backoff, nowNs)) return 0;   // #722: paced after a Refused / Waiting answer
                 const uint64_t c = nextCorrelation_++;
                 if (!port.askControl(c, ReapOp::AbortTxns, st.nsId, 0)) return 0;   // retried next pass
                 st.inFlightCorrelation = c;
@@ -89,6 +107,7 @@ int NamespaceReaper::step_(const cat::CatalogState& cs, ReaperPort& port) {
                 const auto& pending = views ? d->pendingViews : d->pendingTopics;
                 if (pending.empty()) { state_ = ReapIdle{}; return 1; }   // the last drop applied: re-derive
                 if (st.inFlightCorrelation != 0) return 0;
+                if (!backoffElapsed(st.backoff, nowNs)) return 0;   // #722: paced after a Refused / Waiting answer
                 const uint64_t objectId = *pending.begin();               // lowest objectId first: deterministic
                 const std::string* name = nullptr;
                 if constexpr (views) { if (const auto* v = cs.viewByObjectId(objectId)) name = &v->name; }
@@ -107,6 +126,7 @@ int NamespaceReaper::step_(const cat::CatalogState& cs, ReaperPort& port) {
             } else if constexpr (std::is_same_v<T, ReapTombstoning>) {
                 if ((d->stepMask & st.step) != 0) { state_ = ReapIdle{}; return 1; }
                 if (st.inFlightCorrelation != 0) return 0;
+                if (!backoffElapsed(st.backoff, nowNs)) return 0;   // #722: paced after a Refused / Waiting answer
                 const uint64_t c = nextCorrelation_++;
                 const ReapOp op = st.step == cat::GroupsTombstoned ? ReapOp::TombstoneGroups : ReapOp::TombstoneTxnState;
                 if (!port.askControl(c, op, st.nsId, batch_)) return 0;
@@ -115,6 +135,7 @@ int NamespaceReaper::step_(const cat::CatalogState& cs, ReaperPort& port) {
             } else if constexpr (std::is_same_v<T, ReapRecordingStep>) {
                 if ((d->stepMask & st.step) != 0) { state_ = ReapIdle{}; return 1; }   // applied
                 if (st.inFlightCorrelation != 0) return 0;
+                if (!backoffElapsed(st.backoff, nowNs)) return 0;   // #722: paced after a Refused / Waiting answer
                 if (budget_ == 0) return 0;
                 const uint64_t c = nextCorrelation_++;
                 if (!port.submitDeleteStep(c, st.nsId, st.step)) return 0;
@@ -131,13 +152,17 @@ int NamespaceReaper::step_(const cat::CatalogState& cs, ReaperPort& port) {
     }, state_);
 }
 
-void NamespaceReaper::onDdlResult(uint64_t correlation, uint16_t /*code*/) noexcept {
+void NamespaceReaper::onDdlResult(uint64_t correlation, uint16_t code) noexcept {
     if (correlation == 0) return;
     std::visit([&](auto& st) {
         using T = std::decay_t<decltype(st)>;
         if constexpr (std::is_same_v<T, ReapDroppingViews> || std::is_same_v<T, ReapDroppingTopics> ||
                       std::is_same_v<T, ReapRecordingStep>) {
-            if (st.inFlightCorrelation == correlation) st.inFlightCorrelation = 0;   // the registry says what is left
+            if (st.inFlightCorrelation == correlation) {
+                st.inFlightCorrelation = 0;   // the registry says what is left
+                if (code != 0) noteNoProgress(st.backoff);   // #722: a refused DDL is retried paced, not at once
+                else           noteProgress(st.backoff);
+            }
         }
     }, state_);
 }
@@ -146,12 +171,18 @@ void NamespaceReaper::onControlResult(uint64_t correlation, ReapStatus status) n
     if (correlation == 0) return;
     if (auto* a = std::get_if<ReapAbortingTxns>(&state_); a != nullptr && a->inFlightCorrelation == correlation) {
         if (status == ReapStatus::Done) state_ = ReapRecordingStep{a->nsId, cat::TxnsAborted, 0};
-        else a->inFlightCorrelation = 0;   // More / Refused: ask again on the next pass
+        else {
+            a->inFlightCorrelation = 0;   // More: ask again now; Waiting / Refused: ask again, paced (#722)
+            if (status == ReapStatus::More) noteProgress(a->backoff); else noteNoProgress(a->backoff);
+        }
         return;
     }
     if (auto* t = std::get_if<ReapTombstoning>(&state_); t != nullptr && t->inFlightCorrelation == correlation) {
         if (status == ReapStatus::Done) state_ = ReapRecordingStep{t->nsId, t->step, 0};
-        else t->inFlightCorrelation = 0;   // More: the next batch; Refused: the same call again
+        else {
+            t->inFlightCorrelation = 0;   // More: the next batch now; Waiting / Refused: the same call again, paced (#722)
+            if (status == ReapStatus::More) noteProgress(t->backoff); else noteNoProgress(t->backoff);
+        }
     }
 }
 

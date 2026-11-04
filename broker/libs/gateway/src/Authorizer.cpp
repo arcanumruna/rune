@@ -1,5 +1,6 @@
 // Authorizer.cpp - see rune/gateway/Authorizer.h.
 #include <rune/gateway/Authorizer.h>
+#include <rune/gateway/NsResolve.h>
 
 namespace rune::gateway {
 
@@ -42,6 +43,10 @@ Denial deny(rsec::Operation op, rsec::ResourceType type, std::string_view what) 
     }
     return d;
 }
+/// #640: the target's namespace is neither the table's own, nor the "already hidden" marker, and the table is not root.
+bool foreignNs(const PermissionTable& t, uint32_t nsId) noexcept {
+    return !t.isRoot() && nsId != kHiddenNsId && nsId != t.nsId();
+}
 } // namespace
 
 std::optional<Denial> authorizeTopicId(const PermissionTable& t, int32_t topicId, rsec::Operation op,
@@ -58,8 +63,10 @@ std::optional<Denial> authorizeViewSource(const PermissionTable& t, int32_t topi
     return deny(rsec::Operation::Read, rsec::ResourceType::Topic, std::to_string(topicId));
 }
 
-std::optional<Denial> authorizeName(const PermissionTable& t, rsec::ResourceType type, std::string_view name, rsec::Operation op)
+std::optional<Denial> authorizeName(const PermissionTable& t, rsec::ResourceType type, std::string_view name, rsec::Operation op,
+                                  uint32_t nsId)
 {
+    if (foreignNs(t, nsId)) return deny(op, type, name);   // #640
     if (t.allowsName(type, name, rsec::opBit(op))) return std::nullopt;
     return deny(op, type, name);
 }
@@ -67,6 +74,7 @@ std::optional<Denial> authorizeName(const PermissionTable& t, rsec::ResourceType
 std::optional<Denial> authorizeTopicOrViewName(const PermissionTable& t, std::string_view name, rsec::Operation op,
                                                const ObjectIndex& index, uint32_t nsId)
 {
+    if (foreignNs(t, nsId)) return deny(op, rsec::ResourceType::Topic, name);   // #640
     if (const auto id = index.byName(nsId, name)) {   // #128: only the object's own kind's grants count
         const ObjectEntry* e = index.at(*id);
         if (t.allowsName(e->type, name, rsec::opBit(op))) return std::nullopt;

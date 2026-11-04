@@ -1074,6 +1074,10 @@ public:
     /// the read-safety contract: the owner thread in Invoker mode; after
     /// close() in Thread mode).
     [[nodiscard]] uint64_t testCallbackExceptionCount() const noexcept;
+    /// #715 test probes (the owner thread; plain counters): EndTxn requests submitted by this producer, and the wire offers
+    /// of the EndTxn requests that were answered.  A platform-aborted end is offered exactly once (attempts == offers == 1).
+    [[nodiscard]] uint32_t endTxnAttemptsForTest() const noexcept;
+    [[nodiscard]] uint32_t endTxnWireOffersForTest() const noexcept;
 
     /// Test seams (T15b R3, Ring ingress only): claim a void record in the
     /// producer ring WITHOUT committing it (returns the claim index; < 0: not

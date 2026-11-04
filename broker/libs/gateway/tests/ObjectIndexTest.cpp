@@ -117,27 +117,76 @@ TEST(ObjectIndexRegression, RetiredSinkDropKeepsNewHolderRegression) {
     EXPECT_FALSE(idx.byName(0, "board"));
 }
 
+// #625: removing the newer holder of a shared (nsId, name) must re-point the slot at the older LIVE entry, not
+// leave the name unresolvable while that entry is still in the index.
+TEST(ObjectIndexRegression, UnindexNewerSharedNameKeepsOlderRegression) {
+    rg::ObjectIndex idx;
+    idx.onTopic(3, 5, "t");
+    idx.onTopic(3, 9, "t");
+    ASSERT_TRUE(idx.byName(3, "t"));
+    EXPECT_EQ(*idx.byName(3, "t"), 9);
+    idx.onDropped(9);
+    ASSERT_TRUE(idx.byName(3, "t")) << "older live holder lost when the newer holder was removed";
+    EXPECT_EQ(*idx.byName(3, "t"), 5);
+    idx.onDropped(5);
+    EXPECT_FALSE(idx.byName(3, "t"));
+
+    // Three holders 4, 7, 9: removing 9 hands the name to the highest remaining live id (7); removing 4 keeps 7.
+    rg::ObjectIndex three;
+    three.onTopic(3, 4, "t");
+    three.onTopic(3, 7, "t");
+    three.onTopic(3, 9, "t");
+    three.onDropped(9);
+    ASSERT_TRUE(three.byName(3, "t"));
+    EXPECT_EQ(*three.byName(3, "t"), 7);
+    three.onDropped(4);
+    ASSERT_TRUE(three.byName(3, "t"));
+    EXPECT_EQ(*three.byName(3, "t"), 7);
+    three.onDropped(7);
+    EXPECT_FALSE(three.byName(3, "t"));
+}
+
 // Seeded model check against std::map: create / re-apply / drop in random order across namespaces; deletion must keep
 // every other probe chain reachable (backward-shift), and the table must agree with the model after every step.
+// #625 follow-up: dropping N objects with unique names never runs the older-sharer scan (it was O(N) per drop).
+TEST(ObjectIndexRegression, DropManyUniqueNamesNeverScansRegression) {
+    rg::ObjectIndex idx;
+    constexpr int kN = 5000;
+    for (int i = 0; i < kN; ++i) idx.onTopic(static_cast<uint32_t>(i % 3), i, "u" + std::to_string(i));
+    for (int i = 0; i < kN; ++i) idx.onDropped(i);
+    EXPECT_EQ(idx.scanStepsForTest(), 0u) << "a drop with no older sharer scanned entries_";
+    for (int i = 0; i < kN; ++i) EXPECT_FALSE(idx.byName(static_cast<uint32_t>(i % 3), "u" + std::to_string(i)).has_value());
+}
+
 TEST(ObjectIndexRegression, RandomizedModelRegression) {
     for (uint32_t seed = 1; seed <= 20; ++seed) {
         std::mt19937 rng(seed);
         rg::ObjectIndex idx;
         std::map<std::pair<uint32_t, std::string>, int32_t> model;   // live key -> id
         std::map<int32_t, std::pair<uint32_t, std::string>> byId;
+        // #625: when the slot holder of a key goes away, the highest remaining live id of that key takes the name.
+        const auto releaseKey = [&](const std::pair<uint32_t, std::string>& key, int32_t gone) {
+            auto m = model.find(key);
+            if (m == model.end() || m->second != gone) return;
+            model.erase(m);
+            for (auto r = byId.rbegin(); r != byId.rend(); ++r)
+                if (r->first != gone && r->second == key) { model[key] = r->first; break; }
+        };
         for (int step = 0; step < 4000; ++step) {
             const int32_t id = static_cast<int32_t>(rng() % 300);
             if (rng() % 3 == 0) {
                 idx.onDropped(id);
                 if (auto it = byId.find(id); it != byId.end()) {
-                    if (auto m = model.find(it->second); m != model.end() && m->second == id) model.erase(m);
+                    const auto key = it->second;
                     byId.erase(it);
+                    releaseKey(key, id);
                 }
             } else {
                 const uint32_t ns = rng() % 4;
                 const std::string name = "n" + std::to_string(rng() % 60);
                 if (auto it = byId.find(id); it != byId.end()) {   // re-apply under another key
-                    if (auto m = model.find(it->second); m != model.end() && m->second == id) model.erase(m);
+                    const auto key = it->second;
+                    releaseKey(key, id);
                 }
                 idx.onTopic(ns, id, name);
                 byId[id] = {ns, name};
@@ -151,6 +200,11 @@ TEST(ObjectIndexRegression, RandomizedModelRegression) {
                         const auto m = model.find({ns, name});
                         ASSERT_EQ(got.has_value(), m != model.end()) << "seed " << seed << " step " << step;
                         if (got) ASSERT_EQ(*got, m->second) << "seed " << seed << " step " << step;
+                        if (got) {
+                            std::size_t live = 0;
+                            for (const auto& [i, k] : byId) if (k.first == ns && k.second == name) ++live;
+                            ASSERT_EQ(idx.shadowedForTest(ns, name), live - 1) << "seed " << seed << " step " << step;
+                        }
                     }
             }
         }

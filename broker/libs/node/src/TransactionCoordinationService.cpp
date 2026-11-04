@@ -108,6 +108,10 @@ TransactionCoordinationService::TransactionCoordinationService(
 bool TransactionCoordinationService::applyTxnOffset_(const std::string& group,
                                                      const rune::coordination::TopicPartition& tp, int64_t offset)
 {
+    if (!deletingNs_.empty() && nsDeleting_(rune::coordination::parseScopedId(group).nsId)) {
+        ++mootOffsetsDropped_;   // moot: the reaper tombstones the group; counts as applied so the commit completes
+        return true;
+    }
     if (offsetSink_ == nullptr) [[unlikely]] {
         // #360: no offset store wired on this node - the offset cannot be applied, so it must not count as applied
         // (it would be dropped and the commit completed without it).  Refused: the commit stays PrepareCommit,
@@ -228,6 +232,10 @@ bool TransactionCoordinationService::load_(int64_t nowNs)
         pidCeilingPendingOffset_ = -1;
     }
     loadState_ = LoadState::Loaded;
+    // #661: the suspend / delete apply of a namespace that happened while this coordinator was not loaded aborted nothing
+    // (abortAllForNamespace answers 0 while unloaded): the gate mirror is re-derived at every load.  PrepareAbort goes
+    // through the usual gate and doWork hands the markers out.
+    for (const uint32_t ns : blockedNs_) (void)coordinator_.abortAllForNamespace(ns, nowNs);
     spdlog::info("TCS: coordinator LOADED (coordinatorEpoch={}, {} transactional ids, next pid {})",
                  coordinatorEpoch_, coordinator_.size(), coordinator_.allocator().nextId());
     return true;
@@ -493,10 +501,11 @@ ReapStatus TransactionCoordinationService::abortNamespaceTxns(uint32_t nsId, int
     std::size_t answered = 0;
     for (const auto& [pid, a] : awaiting_) {
         if (rune::coordination::parseScopedId(a.txnId).nsId != nsId) continue;
-        if (static_cast<std::size_t>(std::max(0, a.outstanding)) > a.retries.size()) return ReapStatus::More;
+        if (a.offsetsPending) return ReapStatus::Waiting;   // its offsets settle on the next doWork retry (moot once the namespace is Deleting)
+        if (static_cast<std::size_t>(std::max(0, a.outstanding)) > a.retries.size()) return ReapStatus::Waiting;   // #722: the markers progress on their own; nothing for the reaper to write
         ++answered;
     }
-    return answered < unsettled ? ReapStatus::More : ReapStatus::Done;   // a Prepare* one not dispatched yet
+    return answered < unsettled ? ReapStatus::Waiting : ReapStatus::Done;   // a Prepare* one not dispatched yet
 }
 
 ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uint32_t batch, int64_t nowNs)
@@ -505,18 +514,69 @@ ReapStatus TransactionCoordinationService::tombstoneNamespace(uint32_t nsId, uin
     if (loadState_ != LoadState::Loaded) return ReapStatus::Refused;
     (void)coordinator_.abortAllForNamespace(nsId, nowNs);   // idempotent: anything still open ends now
     if (coordinator_.unsettledOfNamespace(nsId) != 0) return ReapStatus::Refused;
+    if (nsId != 0) forgetNamespace_(nsId);   // `default` is never deleted (the store keeps its records too); #663 / #727: before the tombstones, so nothing in memory can write a record back after them
     rune::replication::PartitionReplica* r = txnState_->replica();
     const rune::replication::Offset leo0 = r->logEndOffset();
     const bool none = txnState_->tombstoneNamespace(nsId, batch, nowNs);
     if (!none) return r->logEndOffset() > leo0 ? ReapStatus::More : ReapStatus::Refused;
     // Nothing left to write: Done only once every tombstone is committed (a leader change must not resurrect a key).
-    return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::More;
+    return r->highWatermark() >= r->logEndOffset() ? ReapStatus::Done : ReapStatus::Waiting;
+}
+
+// #663 / #727: every in-memory entry keyed by a scoped transactional id of `nsId` (nothing of it is unsettled): the
+// coordinator's transactions, their holds (a hold in kHoldNeedsPut would re-append a Complete* record after the
+// tombstone), their last-put offsets and the producer-id cache.  Idempotent across re-asks.
+void TransactionCoordinationService::forgetNamespace_(uint32_t nsId)
+{
+    for (auto it = holds_.begin(); it != holds_.end();) {
+        if (rune::coordination::parseScopedId(it->second.txnId).nsId != nsId) { ++it; continue; }
+        auto next = std::next(it);
+        eraseHold_(it);
+        it = next;
+    }
+    for (auto it = lastPutOffset_.begin(); it != lastPutOffset_.end();) {
+        if (rune::coordination::parseScopedId(it->first).nsId == nsId) it = lastPutOffset_.erase(it);
+        else ++it;
+    }
+    for (auto it = pidIndex_.begin(); it != pidIndex_.end();) {
+        if (rune::coordination::parseScopedId(it->second).nsId == nsId) it = pidIndex_.erase(it);
+        else ++it;
+    }
+    (void)coordinator_.eraseNamespace(nsId);
+}
+
+std::size_t TransactionCoordinationService::inMemoryEntriesOfNamespaceForTest(uint32_t nsId) const
+{
+    std::size_t n = coordinator_.countOfNamespaceForTest(nsId);
+    for (const auto& kv : holds_) n += rune::coordination::parseScopedId(kv.second.txnId).nsId == nsId ? 1 : 0;
+    for (const auto& kv : lastPutOffset_) n += rune::coordination::parseScopedId(kv.first).nsId == nsId ? 1 : 0;
+    for (const auto& kv : pidIndex_) n += rune::coordination::parseScopedId(kv.second).nsId == nsId ? 1 : 0;
+    return n;
 }
 
 std::optional<std::size_t> TransactionCoordinationService::liveKeysOfNamespaceForTest(uint32_t nsId) const
 {
     if (txnState_ == nullptr || loadState_ != LoadState::Loaded) return std::nullopt;   // unknown: store not loaded
     return txnState_->liveKeysOfNamespaceForTest(nsId);
+}
+
+void TransactionCoordinationService::setNamespaceTxnGate(uint32_t nsId, bool blocked, bool deleting)
+{
+    {
+        const auto d = std::lower_bound(deletingNs_.begin(), deletingNs_.end(), nsId);
+        const bool dp = d != deletingNs_.end() && *d == nsId;
+        if (deleting && !dp) {
+            deletingNs_.insert(d, nsId);
+            // its deferred commits retry at once (their offsets are moot now): the reaper's AbortTxns step waits on them
+            for (auto& [pid, a] : awaiting_)
+                if (a.offsetsPending && rune::coordination::parseScopedId(a.txnId).nsId == nsId) a.offsetDueNs = 0;
+        }
+        else if (!deleting && dp) deletingNs_.erase(d);
+    }
+    const auto it = std::lower_bound(blockedNs_.begin(), blockedNs_.end(), nsId);
+    const bool present = it != blockedNs_.end() && *it == nsId;
+    if (blocked && !present) blockedNs_.insert(it, nsId);
+    else if (!blocked && present) blockedNs_.erase(it);
 }
 
 uint32_t TransactionCoordinationService::abortAllForNamespace(uint32_t nsId, int64_t nowNs)
