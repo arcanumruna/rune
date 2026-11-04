@@ -66,3 +66,16 @@ TEST(NamespaceTestHygieneRegression, NoSleepPollsOrResendsRegression) {
             ADD_FAILURE() << "a probe resent after a missing answer (a missing answer fails the step): " << hit;
     }
 }
+
+// #711: the lifecycle rig and the stress test wait with the client's pollFor, never with a wall-clock sleep.  (The
+// matrix `waitFor` and the trio World `call`/`burst` pace external client threads and keep their bounded sleeps.)
+TEST(NamespaceTestHygieneRegression, NoSleepForInLifecycleTestsRegression) {
+    const std::regex sleeps(R"(\bsleep_for\s*\()");
+    EXPECT_EQ(findAll("sample", "std::this_thread::sleep_for(2ms);", sleeps).size(), 1u);
+    for (const char* file : {"support/NamespaceLifecycleRig.h", "support/NamespaceRig.h", "node/NamespaceStressTest.cpp"}) {
+        const std::string text = slurp(file);
+        ASSERT_FALSE(text.empty()) << file;
+        for (const std::string& hit : findAll(file, text, sleeps))
+            ADD_FAILURE() << "a wall-clock sleep (poll on the awaited event with pollFor): " << hit;
+    }
+}

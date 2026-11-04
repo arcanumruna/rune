@@ -946,12 +946,10 @@ protected:
                 values.emplace_back(reinterpret_cast<const char*>(r.value.data()), r.value.size());
             });
             auto snap = [&] { std::lock_guard<std::mutex> lk(mu); return values; };
-            bool seen = false;
-            for (int i = 0; i < 20'000 && !seen; ++i) {   // 20 000 x 2 ms: a hard cap that fails
+            const bool seen = r_.c().pollFor(std::chrono::seconds(40), [&] {   // #711: a bounded poll that fails
                 const auto s = snap();
-                seen = std::find(s.begin(), s.end(), charValue(sentinel)) != s.end();
-                if (!seen) std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
+                return std::find(s.begin(), s.end(), charValue(sentinel)) != s.end();
+            });
             sub.unsubscribe();
             ASSERT_TRUE(seen) << "the sentinel never reached read_committed on " << full(*n, t.topic)
                               << ": a transaction is still holding the last stable offset";
@@ -1004,12 +1002,9 @@ protected:
                 ASSERT_TRUE(std::find(ids.begin(), ids.end(), t) == ids.end()) << "topic id " << t << " of erased " << g.name << " is listed";
         }
     }
-    static bool waitGone(const std::filesystem::path& p) {
-        for (int i = 0; i < 2000; ++i) {   // the off-thread purge of ns-<id>.deleting: 2000 x 10 ms
-            if (!std::filesystem::exists(p)) return true;
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-        return !std::filesystem::exists(p);
+    bool waitGone(const std::filesystem::path& p) {
+        // the off-thread purge of ns-<id>.deleting, bounded (#711)
+        return r_.c().pollFor(std::chrono::seconds(20), [&] { return !std::filesystem::exists(p); });
     }
 
     // ── invariants after every step ──────────────────────────────────────────────────────────────────────────
