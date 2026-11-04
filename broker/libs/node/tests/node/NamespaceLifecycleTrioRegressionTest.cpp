@@ -37,7 +37,9 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -514,7 +516,7 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     rc::Completions cq(c);
     uint64_t key = 0;
     struct Tally { int ok = 0, refused = 0, other = 0; int lastCode = 0; int lastStatus = 0; };
-    int acked = 0;   // every burst's acked records, not only the last burst's
+    std::set<uint64_t> ackedKeys;   // #716: every burst's acked record keys (the completion token is the key), not only the last burst's
     auto burst = [&](int n) {
         Tally tl;
         int sent = 0, done = 0;
@@ -529,15 +531,17 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
                 }
             }
             p.flush();
-            (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) {
-                ++done;
-                if (d.status == rc::OpStatus::Ok) ++tl.ok;
-                else if (d.errorCode == kSuspended) ++tl.refused;
-                else { ++tl.other; tl.lastCode = d.errorCode; tl.lastStatus = static_cast<int>(d.status); }
-            });
-            std::this_thread::sleep_for(1ms);
+            auto drain = [&] {
+                (void)cq.poll([&](const rc::Completion& d, std::span<const uint8_t>) {
+                    ++done;
+                    if (d.status == rc::OpStatus::Ok) { ++tl.ok; ackedKeys.insert(d.token); }
+                    else if (d.errorCode == kSuspended) ++tl.refused;
+                    else { ++tl.other; tl.lastCode = d.errorCode; tl.lastStatus = static_cast<int>(d.status); }
+                });
+                return done >= n || sent < n;   // #711: wait on the awaited completions (a free send slot ends the wait too)
+            };
+            (void)W.raw().pollFor(2ms, drain);
         }
-        acked += tl.ok;
         return tl;
     };
     const Tally before = burst(50);
@@ -555,7 +559,7 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
     ASSERT_TRUE(AuthTrio::until(30s, [&] { after = burst(50); return after.ok == 50; })) << "after resume: ok " << after.ok << ", other " << after.other;
     p.close();
 
-    const int total = acked;
+    const int total = static_cast<int>(ackedKeys.size());
     // Every replica holds exactly the acked records.
     for (int n = 1; n <= 3; ++n) {
         const int64_t end = W.t.node(n).onOwnerThreadForTest(W.tA, 0, [](rune::replication::PartitionReplica* r) {
@@ -567,17 +571,39 @@ TEST(NamespaceLifecycleTrioRegression, AcksAllNoLossAcrossSuspendResumeRegressio
                    }) == total;
         })) << "node " << n << ": log end " << end << ", acked " << total;
     }
-    // ... and the consumer sees exactly them.
-    std::atomic<int> got{0};
+    // ... and the consumer sees exactly them (#716: the key SET and the offsets, not a count).
+    struct Seen { uint64_t key; int64_t offset; };
+    std::mutex seenMu;
+    std::vector<Seen> seen;
+    // Test-only fault injection for the mutation check: one duplicated and one dropped record in the consumer callback.
+    const bool injectFault = std::getenv("RUNE_NS_TEST_CONSUMER_FAULT") != nullptr;
+    int delivered = 0;
     rc::SubscribeOptions so;
     so.from = rc::From::earliest();
-    rc::Subscription sub = c.subscribe(th, 0, so, [&](const rc::Record&) { ++got; });
-    // Bounded wait until the consumer has read up to the log end offset, then compare with what was acked.
+    rc::Subscription sub = c.subscribe(th, 0, so, [&](const rc::Record& r) {
+        uint64_t k = 0;
+        for (std::size_t i = 0; i < 8 && i < r.key.size(); ++i) k |= static_cast<uint64_t>(r.key[i]) << (8 * i);
+        std::lock_guard<std::mutex> lk(seenMu);
+        const int n = delivered++;
+        if (injectFault && n == 3) return;                                        // drop one
+        seen.push_back({k, r.offset});
+        if (injectFault && n == 7) seen.push_back({k, r.offset});                 // duplicate one
+    });
     const int64_t logEnd = W.t.node(1).onOwnerThreadForTest(W.tA, 0, [](rune::replication::PartitionReplica* r) {
         return r != nullptr ? r->logEndOffset() : int64_t{-1};
     });
-    EXPECT_TRUE(AuthTrio::until(40s, [&] { return got.load() >= logEnd; })) << "consumed " << got.load() << " of log end " << logEnd;
-    EXPECT_EQ(got.load(), total) << "produced != consumed";
+    EXPECT_TRUE(AuthTrio::until(40s, [&] { std::lock_guard<std::mutex> lk(seenMu); return delivered >= logEnd; }))
+        << "delivered " << delivered << " of log end " << logEnd;
+    {
+        std::lock_guard<std::mutex> lk(seenMu);
+        std::set<uint64_t> consumedKeys;
+        for (const Seen& e : seen) consumedKeys.insert(e.key);
+        EXPECT_EQ(consumedKeys, ackedKeys) << "the consumed key set differs from the acked key set";
+        EXPECT_EQ(seen.size(), consumedKeys.size()) << "a key was consumed twice";
+        EXPECT_EQ(static_cast<int64_t>(seen.size()), logEnd) << "produced != consumed";
+        for (std::size_t i = 1; i < seen.size(); ++i)
+            EXPECT_GT(seen[i].offset, seen[i - 1].offset) << "offsets must strictly increase (record " << i << ")";
+    }
     sub.unsubscribe();
 }
 
