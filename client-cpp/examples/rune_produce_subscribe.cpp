@@ -48,6 +48,7 @@
 //   RUNE_PRODUCE_N       records to produce, acked one by one (0 = until RUNE_STOP_FILE exists), default 20
 //   RUNE_PRODUCE_INTERVAL_US  pause after every acked record (default 0)
 //   RUNE_CONSUME_FROM    plain subscription start offset (default: earliest); ignored for a group consumer
+//   RUNE_VALUE_FORMAT    text (default: "ws:<seq>") or typed (a { id int64, hp int64 } v1 record, id = seq)
 //   RUNE_CONSUME_EXPECT  consumer exit 0 once this many DISTINCT records arrived (0 = until RUNE_STOP_FILE)
 //   RUNE_EXPECT_FILE     consumer exit 0 once every sequence number listed in this file (the producer's
 //                        RUNE_ACKED_FILE, written when it ends) has arrived.  Role both: every acked record.
@@ -326,8 +327,25 @@ void writeSeqFile(const std::string& path, const SeqSet& seqs) {
     (void)rune::examples::writeFileAtomically(path, text);
 }
 
-// "ws:<seq>" -> seq (-1 if foreign).
+// RUNE_VALUE_FORMAT=typed: the codec's fixed block of a typed { id int64, hp int64 } topic at version 1 -
+// [blockLength:u16 = 16][version:u16 = 1][id:i64 = seq][hp:i64], little-endian.  A checked-writes broker validates
+// every record of a typed topic, so text values are refused there.
+constexpr std::size_t kTypedLen = 20;
+std::size_t encodeTypedSeq(long n, char* b) {
+    auto put = [&](std::size_t off, uint64_t v) { for (int i = 0; i < 8; ++i) b[off + i] = static_cast<char>(v >> (8 * i)); };
+    b[0] = 16; b[1] = 0; b[2] = 1; b[3] = 0;
+    put(4, static_cast<uint64_t>(n));
+    put(12, static_cast<uint64_t>(n * 10 + 7));
+    return kTypedLen;
+}
+
+// "ws:<seq>" or a typed { id, hp } value -> seq (-1 if foreign).
 long parseSeq(std::string_view v) {
+    if (v.size() == kTypedLen && v[0] == 16 && v[1] == 0 && v[2] == 1 && v[3] == 0) {
+        uint64_t id = 0;
+        for (int i = 7; i >= 0; --i) id = (id << 8) | static_cast<uint8_t>(v[4 + static_cast<std::size_t>(i)]);
+        return static_cast<long>(id);
+    }
     if (v.size() < 4 || v.substr(0, 3) != "ws:") return -1;
     long n = 0;
     for (const char ch : v.substr(3)) {
@@ -349,6 +367,7 @@ int runWorldServer(ClientConfig& cfg, const std::string& role, int timeoutMs) {
     const int         intervalUs   = getEnvInt("RUNE_PRODUCE_INTERVAL_US", 0);
     const int         expect       = getEnvInt("RUNE_CONSUME_EXPECT", 0);
     const long long   consumeFrom  = getEnvInt("RUNE_CONSUME_FROM", -1);   // -1 = earliest
+    const bool        typedValues  = getEnvStr("RUNE_VALUE_FORMAT", "text") == "typed";
     const std::string stopFile     = getEnvStr("RUNE_STOP_FILE");
     const std::string ackedFile    = getEnvStr("RUNE_ACKED_FILE");
     const std::string receivedFile = getEnvStr("RUNE_RECEIVED_FILE");
@@ -429,7 +448,8 @@ int runWorldServer(ClientConfig& cfg, const std::string& role, int timeoutMs) {
                 if (fileExists(stopFile)) break;
                 if (const char* e = consumerEnded()) { std::cout << "subscription ended: " << e << "\n"; std::cout.flush(); rc = 1; break; }
                 char valBuf[32];   // one preallocated payload buffer: formatted in place per record, no string / vector
-                const int valLen = std::snprintf(valBuf, sizeof valBuf, "ws:%ld", n);
+                const int valLen = typedValues ? static_cast<int>(encodeTypedSeq(n, valBuf))
+                                               : std::snprintf(valBuf, sizeof valBuf, "ws:%ld", n);
                 const std::span<const uint8_t> val(reinterpret_cast<const uint8_t*>(valBuf), static_cast<std::size_t>(valLen));
                 Completion done;
                 const bool waited = sendAndWaitAck(c, cq, p, th, Key(static_cast<uint64_t>(n)), val,
