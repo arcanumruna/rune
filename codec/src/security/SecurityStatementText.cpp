@@ -24,11 +24,12 @@ std::string quoted(std::string_view n) {
 }
 std::string ident(std::string_view n) { return plainIdent(n) ? std::string(n) : quoted(n); }
 
-// SecurityOperation: Read 0, Write 1, Create 2, Alter 3, Drop 4, Describe 5, Admin 6, Truncate 7.
+// SecurityOperation: Read 0, Write 1, Create 2, Alter 3, Drop 4, Describe 5, Admin 6, Truncate 7, Import 8.
 const char* opText(uint8_t o) noexcept {
     switch (o) {
         case 0: return "READ";   case 1: return "WRITE";    case 2: return "CREATE"; case 3: return "ALTER";
         case 4: return "DROP";   case 5: return "DESCRIBE"; case 6: return "ADMIN"; case 7: return "TRUNCATE";
+        case 8: return "IMPORT";
         default: return nullptr;
     }
 }

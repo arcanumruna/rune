@@ -198,7 +198,8 @@ TEST(NamespaceMessagesRegression, SecurityEnumsRegression) {
     EXPECT_EQ(static_cast<uint8_t>(rp::SecurityOperation::Truncate), 7);
     EXPECT_EQ(static_cast<uint8_t>(rp::SecurityResourceType::Namespace), 5);
     EXPECT_TRUE(rp::validSecurityOperation(7));
-    EXPECT_FALSE(rp::validSecurityOperation(8));
+    EXPECT_TRUE(rp::validSecurityOperation(8));
+    EXPECT_FALSE(rp::validSecurityOperation(9));
     EXPECT_TRUE(rp::validSecurityOperation(6));
     EXPECT_TRUE(rp::validSecurityResourceType(5));
     EXPECT_FALSE(rp::validSecurityResourceType(6));

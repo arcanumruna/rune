@@ -31,6 +31,7 @@ const char* opText(SecOp o) noexcept {
         case SecOp::Create: return "CREATE";   case SecOp::Alter: return "ALTER";
         case SecOp::Drop: return "DROP";       case SecOp::Describe: return "DESCRIBE";
         case SecOp::Admin: return "ADMIN";     case SecOp::Truncate: return "TRUNCATE";
+        case SecOp::Import: return "IMPORT";
     }
     return "?";
 }

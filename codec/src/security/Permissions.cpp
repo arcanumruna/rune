@@ -52,7 +52,7 @@ uint8_t clusterOps(std::span<const GrantSpec> grants) noexcept {
     if (isRoot(grants)) return kAllOps;   // root holds every cluster operation (CREATE TOPIC, DESCRIBE CLUSTER, ...)
     uint8_t bits = 0;
     for (const GrantSpec& g : grants)
-        if (g.resource.type == ResourceType::Cluster) bits = static_cast<uint8_t>(bits | opBit(g.op));
+        if (g.resource.type == ResourceType::Cluster && g.op != Operation::Import) bits = static_cast<uint8_t>(bits | opBit(g.op));
     return bits;
 }
 
@@ -64,7 +64,7 @@ uint8_t opsOn(std::span<const GrantSpec> grants, ResourceType type, std::string_
     if (type != ResourceType::Namespace && !internal && isRoot(grants)) return kAllOps;
     uint8_t bits = 0;
     for (const GrantSpec& g : grants)
-        if (matches(g.resource, type, name)) bits = static_cast<uint8_t>(bits | opBit(g.op));
+        if (g.op != Operation::Import && matches(g.resource, type, name)) bits = static_cast<uint8_t>(bits | opBit(g.op));
     // D16: CREATE / ALTER / DROP / DESCRIBE ON CLUSTER reach every topic and view; DESCRIBE reaches
     // groups and transactional ids.  READ / WRITE / TRUNCATE never come from a cluster grant (only root above).
     const uint8_t cluster = clusterOps(grants);

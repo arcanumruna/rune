@@ -48,6 +48,7 @@ TEST(SecurityStatementsRegression, BadStatementsAreLocatedErrors) {
         {"ALTER USER ws1 DROP PASSWORD 3;", "password index is 1 (oldest) or 2"},
         {"GRANT READ ON CLUSTERS TO USER u;", "expected 'cluster', 'topic', 'view', 'group', 'transactional_id' or 'namespace'"},
         {"GRANT FLY ON TOPIC t TO USER u;", "expected an operation"},
+        {"GRANT FLY ON TOPIC t TO USER u;", "'import'"},
         {"CREATE USER ws1 WITH PASSWORD '';", "password must not be empty"},
         {"GRANT READ ON TOPIC t TO u;", "expected 'user' or 'role'"},
         {"SHOW GRANTS FOR ws1;", "expected 'user' or 'role'"},
@@ -400,4 +401,19 @@ TEST(SecurityStatementTextRegression, AQuoteInsideALiteralIsDoubledByBothRendere
     const std::string quotes(249, '\'');
     EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 3, 1, quotes, ""),
               "GRANT READ ON GROUP PREFIX '" + std::string(498, '\'') + "' TO ROLE r;");
+}
+
+TEST(CheckedWritesImportGrant, ParsesGrantAndRevokeImport) {
+    auto g = std::get<ql::GrantDef>(ql::parse("grant import on topic 'user' to user backfill;").value());
+    EXPECT_EQ(g.op, ql::SecOp::Import);
+    EXPECT_EQ(g.resource.type, ql::SecResource::Topic);
+    EXPECT_FALSE(g.resource.prefix);
+    EXPECT_EQ(g.resource.name, "user");
+    EXPECT_EQ(g.granteeName, "backfill");
+    auto r = std::get<ql::RevokeDef>(ql::parse("revoke import on topic prefix 'world.' from role r;").value());
+    EXPECT_EQ(r.op, ql::SecOp::Import);
+    EXPECT_TRUE(r.resource.prefix);
+    EXPECT_EQ(r.resource.name, "world.");
+    EXPECT_EQ(r.grantee, ql::Grantee::Role);
+    EXPECT_EQ(ql::redactedText(ql::parse("grant import on topic 'user' to user backfill;").value()).substr(0, 12), "GRANT IMPORT");
 }

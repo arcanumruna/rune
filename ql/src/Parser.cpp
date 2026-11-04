@@ -26,7 +26,7 @@
 //   grantStmt   := "grant" ( OPERATION "on" resource "to" ( "user" | "role" ) NAME | "role" NAME "to" "user" NAME ) ";"
 //   revokeStmt  := "revoke" ( OPERATION "on" resource "from" ( "user" | "role" ) NAME | "role" NAME "from" "user" NAME ) ";"
 //   resource    := "cluster" | ( "topic" | "view" | "group" | "transactional_id" ) ( "prefix" STRING | NAME )
-//   OPERATION   := "read" | "write" | "create" | "alter" | "drop" | "describe" | "admin"
+//   OPERATION   := "read" | "write" | "create" | "alter" | "drop" | "describe" | "admin" | "truncate" | "import"
 //   showSecurity:= "show" ( "users" | "roles" ) ";"
 //                | "show" "grants" "for" ( "user" | "role" ) NAME [ "as" "of" ( "offset" INT | "time" STRING ) ] ";"
 //                | "show" "security" "history" [ ( "user" | "role" ) NAME ] [ "since" STRING ] ";"
@@ -935,11 +935,11 @@ struct Parser {
         static constexpr std::pair<std::string_view, SecOp> kOps[] = {
             {"read", SecOp::Read}, {"write", SecOp::Write}, {"create", SecOp::Create}, {"alter", SecOp::Alter},
             {"drop", SecOp::Drop}, {"describe", SecOp::Describe}, {"admin", SecOp::Admin},
-            {"truncate", SecOp::Truncate}};
+            {"truncate", SecOp::Truncate}, {"import", SecOp::Import}};
         if (cur.kind == TK::Ident)
             for (const auto& [kw, op] : kOps)
                 if (ieq(cur.text, kw)) { advance(); return op; }
-        return std::unexpected(err("expected an operation ('read', 'write', 'create', 'alter', 'drop', 'describe', 'admin' or 'truncate'), got " + got()));
+        return std::unexpected(err("expected an operation ('read', 'write', 'create', 'alter', 'drop', 'describe', 'admin', 'truncate' or 'import'), got " + got()));
     }
 
     std::expected<SecPattern, ParseError> parseResource() noexcept {

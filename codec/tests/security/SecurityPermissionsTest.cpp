@@ -111,3 +111,18 @@ TEST(SecurityPermissionsRegression, NoPatternEverMatchesAnInternalObjectRegressi
     EXPECT_TRUE(rs::matches({ResourceType::Topic, PatternKind::Prefix, ""}, ResourceType::Topic, "_single")) << "one underscore is an ordinary name";
     EXPECT_TRUE(rs::matches({ResourceType::Cluster, PatternKind::Exact, ""}, ResourceType::Cluster, ""));
 }
+
+TEST(CheckedWritesImportGrant, ValidOnTopicsOnly) {
+    for (PatternKind k : {PatternKind::Exact, PatternKind::Prefix})
+        EXPECT_TRUE(rs::validGrant(0, "default", g(Operation::Import, ResourceType::Topic, k, "user")));
+    for (ResourceType t : {ResourceType::View, ResourceType::Group, ResourceType::TransactionalId})
+        EXPECT_FALSE(rs::validGrant(0, "default", g(Operation::Import, t, PatternKind::Exact, "user")));
+    EXPECT_FALSE(rs::validGrant(0, "default", g(Operation::Import, ResourceType::Cluster, PatternKind::Exact, "")));
+}
+
+TEST(CheckedWritesImportGrant, OpsOnIgnoresImport) {
+    const rs::GrantSpec imp = g(Operation::Import, ResourceType::Topic, PatternKind::Exact, "user");
+    const rs::GrantSpec wr  = g(Operation::Write,  ResourceType::Topic, PatternKind::Exact, "user");
+    EXPECT_EQ(rs::opsOn(std::vector{imp}, ResourceType::Topic, "user"), 0) << "no bit, and no implied DESCRIBE";
+    EXPECT_EQ(rs::opsOn(std::vector{imp, wr}, ResourceType::Topic, "user"), rs::opsOn(std::vector{wr}, ResourceType::Topic, "user"));
+}
