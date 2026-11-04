@@ -3043,7 +3043,7 @@ void BrokerNode::buildGateway() {
         cleanerAgent_ = std::make_unique<LogCleanerAgent>(
             replicaRegistry_.get(),
             /*cycleBudgetBytes=*/   128LL * 1024 * 1024,
-            /*dedupeBufferBytes=*/  -1,
+            /*dedupeBufferBytes=*/  config_.cleanerDedupeBufferBytes,
             /*ioMaxBytesPerSec=*/   cleanerIoMaxBytesPerSec,
             /*useCoalescing=*/      config_.enableCompactionCoalescing,
             /*coalescingRollBytes=*/64LL * 1024 * 1024);

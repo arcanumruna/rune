@@ -1061,6 +1061,10 @@ struct NodeConfig {
     /// Kafka log.cleaner.io.max.bytes.per.second). Absent/empty = -1 = unlimited.
     int64_t cleanerIoMaxBytesPerSecond = -1;
 
+    /// The log cleaner's dedupe map budget (Kafka log.cleaner.dedupe.buffer.size). -1 = 128 MiB. Tests set it small:
+    /// every cleaner pass and broker start rewrites the whole map, which a sanitizer build makes minutes-slow.
+    int64_t cleanerDedupeBufferBytes = -1;
+
     // PSM fix round 1 (I1, Kafka producer.id.expiration.ms): compaction keeps the
     // last batch METADATA of every producer active within this window (a
     // record-less batch when its last record is compacted away) so a

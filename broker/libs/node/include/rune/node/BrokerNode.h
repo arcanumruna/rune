@@ -2166,6 +2166,10 @@ public:
         if (!cleanerAgent_) return -2; // -2 = no cleaner (sentinel for test)
         return cleanerAgent_->throttleRateForTest();
     }
+    /// Test-only: the cleaner's dedupe map budget (-2 = no cleaner).
+    [[nodiscard]] int64_t cleanerDedupeBufferBytesForTest() const noexcept {
+        return cleanerAgent_ ? cleanerAgent_->dedupeBufferBytesForTest() : -2;
+    }
     /// D25: completed log-cleaner cycles (0 when there is no cleaner) — tests
     /// wait on cleaner progress instead of sleeping.
     [[nodiscard]] uint64_t cleanerCyclesForTest() const noexcept {
