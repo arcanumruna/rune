@@ -1284,6 +1284,7 @@ void BrokerNode::buildReplication() {
                         kMemLogMaxBytes, kMemLogMaxRecords,
                         rune::storage::FullPolicy::DropOldest));
                 memLogPtr = memoryLogs_.back().get();
+                memLogPtr->setNsTag(spec->nsId, spec->nsSlot);
                 spdlog::debug("BrokerNode[{}]: transient topic '{}' partition {} on InMemoryLog",
                               config_.nodeId, spec->name, part);
             } else {
@@ -1486,6 +1487,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
                 kMemLogMaxBytes, kMemLogMaxRecords,
                 rune::storage::FullPolicy::DropOldest));
             memLogPtr = memoryLogs_.back().get();
+            memLogPtr->setNsTag(spec.nsId, spec.nsSlot);
         } else {
             // Reuse the Log created + recovered by TopicRegistry::createTopic (Task 5).
             diskLogPtr = topicRegistry_->log(topicId, part);

@@ -535,7 +535,7 @@ if (row.status == ViewRowResult::kOk) {
   acknowledged before the read was sent. A leader that lost its lease (cut off from the controller) answers `NotLeader`;
   the client retries it within `ddlRetryBudget`.
 - Rules: an aggregate view needs a **one-partition** source (`ViewNotCoPartitioned` otherwise); a view over a transient
-  topic must itself be transient (`ViewSourceTransient`); a view cannot read another view (`ViewSourceIsView`). `READ` on
+  topic is allowed, persisted or transient (a keyless source answers `ViewKeyInvalid`); a view cannot read another view (`ViewSourceIsView`). `READ` on
   the view is needed to read a row and `READ` on each source to create it.
 - Related calls: `alterView(AndWait)`, `dropView(AndWait)`.
 

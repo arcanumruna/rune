@@ -190,8 +190,7 @@ struct AlterTopicResult {
 /// ViewExists=32, ViewSourceNotFound=33, ViewFieldUnresolved=34, TopicExists=25,
 /// InvalidTopicName=40 (same name rule as defineTopic), ViewSourceIsView=41 (a source is
 /// another view's output - not supported until Phase 3),
-/// ViewSourceTransient=37: a view that reads a transient topic must itself be
-/// transient).
+/// ViewSourceTransient=37 is reserved and never sent: a persisted view may read a transient topic).
 struct CreateViewResult {
     int32_t  viewTopicId       = -1;
     uint64_t outputFingerprint = 0;
@@ -999,8 +998,8 @@ public:
                                        std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
 
     /// Task 21: createView(), blocking. A broker errorCode (e.g. ViewExists,
-    /// ViewSourceNotFound, ViewFieldUnresolved, ViewSourceTransient=37 - a view
-    /// over a transient topic must itself be transient) is returned in the result
+    /// ViewSourceNotFound, ViewFieldUnresolved, ViewKeyInvalid=35 - a keyless
+    /// source) is returned in the result
     /// (not thrown).
     CreateViewResult createViewAndWait(std::string_view viewName, std::string_view keyField,
                                        uint8_t persistence, std::span<const uint8_t> planBlob,
