@@ -101,9 +101,14 @@ TEST_P(NamespaceMatrixRegression, SequentialCell) {
     // Hidden objects (a namespace the caller cannot see): whatever the answer, it is byte-equal to the same op on
     // a namespace that does not exist.
     const bool foreignCaller = c.caller == Caller::NsAdminForeign || c.caller == Caller::UserForeign;
-    const bool hidden = !isNamespaceOp(c.op) &&
-                        ((c.target == Target::ForeignNs && c.caller != Caller::ClusterAdmin && c.caller != Caller::NsAdminSame) ||
-                         (c.target == Target::OwnNs && foreignCaller));
+    // #649: a foreign caller on a Missing target is hidden too (the missing name lives in the namespace under test), and
+    // so is a namespace op (create / set limits) by a non-root caller on an existing namespace it cannot see.
+    const bool existingHidden = (c.target == Target::ForeignNs && c.caller != Caller::ClusterAdmin && c.caller != Caller::NsAdminSame) ||
+                                (c.target == Target::OwnNs && foreignCaller);
+    const bool nsOpHidden = (c.op == Op::CreateNamespace || c.op == Op::SetNamespaceLimits) && c.caller != Caller::ClusterAdmin &&
+                            existingHidden;
+    const bool hidden = isNamespaceOp(c.op) ? nsOpHidden
+                                            : existingHidden || (c.target == Target::Missing && foreignCaller);
     // Phase 2 Task 5 (D19): a transactional id is scoped to the caller's own namespace, so InitProducerId answers Ok
     // for a foreign caller too, and its body carries a freshly allocated producer id (unique per call): there is no
     // hidden object to compare, and the two Ok bodies differ in the id alone.
