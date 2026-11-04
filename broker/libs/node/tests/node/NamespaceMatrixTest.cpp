@@ -77,6 +77,49 @@ std::string cellName(const Cell& c) {
 }
 }  // namespace
 
+/// The namespace a caller's session lives in on a SameNameBoth cell (the rig's sessionFor).
+const char* callerNs(Caller c) {
+    switch (c) {
+        case Caller::ClusterAdmin: return "default";
+        case Caller::NsAdminForeign: case Caller::UserForeign: return "b";
+        default: return "a";
+    }
+}
+/// #643: after an Ok SameNameBoth cell the caller's namespace holds exactly the op's effect and every other namespace is
+/// byte-equal to what it held before.
+void checkSameNameEffect(const Cell& c, const NamespaceRig::Snapshot& before, const NamespaceRig::Snapshot& after) {
+    const std::string who = callerNs(c.caller);
+    const std::string ord = std::to_string(c.ordinal);
+    const std::string label = cellName(c) + " (caller namespace " + who + ")";
+    for (const auto& [ns, contents] : before) {
+        if (ns == who) continue;
+        ASSERT_TRUE(after.count(ns)) << label;
+        EXPECT_EQ(after.at(ns), contents) << label << ": namespace " << ns << " changed, it is not the caller's";
+    }
+    NamespaceRig::NsContents expected = before.at(who);
+    const NamespaceRig::NsContents& now = after.at(who);
+    auto expectChanged = [&](const std::string& key) {
+        ASSERT_TRUE(expected.count(key)) << label << ": " << key << " was not there before";
+        ASSERT_TRUE(now.count(key)) << label << ": " << key << " vanished";
+        EXPECT_NE(now.at(key), expected.at(key)) << label << ": " << key << " did not change: " << now.at(key);
+        expected[key] = now.at(key);
+    };
+    auto expectDropped = [&](const std::string& key) {
+        ASSERT_TRUE(expected.count(key)) << label << ": " << key << " was not there before";
+        EXPECT_FALSE(now.count(key)) << label << ": " << key << " is still in " << who;
+        expected.erase(key);
+    };
+    switch (c.op) {
+        case Op::AlterTopic: expectChanged("T:d" + ord); break;
+        case Op::DropTopic: expectDropped("T:d" + ord); break;
+        case Op::DropView: expectDropped("V:dv" + ord); break;
+        case Op::DropUser: expectDropped("U:d" + ord); break;
+        case Op::Grant: case Op::Revoke: expectChanged("U:x"); break;
+        default: break;   // the reads, the join and the txn id change neither the catalog nor the security state
+    }
+    EXPECT_EQ(now, expected) << label << ": the caller's namespace changed beyond the op's own effect";
+}
+
 class NamespaceMatrixRegression : public ::testing::TestWithParam<Cell> {
 protected:
     static void SetUpTestSuite() { rig_ = std::make_unique<NamespaceRig>(); }
@@ -87,7 +130,11 @@ protected:
 TEST_P(NamespaceMatrixRegression, SequentialCell) {
     const Cell& c = GetParam();
     const Outcome want = expect(c.op, c.caller, c.target);
-    const NamespaceRig::Answer got = rig_->run(c.op, c.caller, c.target, c.ordinal);
+    // #643: a SameNameBoth cell that succeeds must change the CALLER's namespace's object only, as the op requires.
+    const bool sameNameOk = c.target == Target::SameNameBoth && want.kind == Kind::Ok && c.caller != Caller::Anonymous;
+    NamespaceRig::Snapshot before, after;
+    const NamespaceRig::Answer got = sameNameOk ? rig_->runSnapshotted(c.op, c.caller, c.target, c.ordinal, before, after)
+                                                : rig_->run(c.op, c.caller, c.target, c.ordinal);
     const std::string label = cellName(c) + ": want " + describe(want) + ", got code " + std::to_string(got.code) + " [" + got.detail + "]";
     switch (want.kind) {
         case Kind::Ok: case Kind::Exists: case Kind::NotAuthorized: case Kind::Refused: case Kind::LimitExceeded:
@@ -98,6 +145,7 @@ TEST_P(NamespaceMatrixRegression, SequentialCell) {
             break;
         case Kind::NotApplicable: FAIL() << label; break;
     }
+    if (sameNameOk && got.code == want.code) checkSameNameEffect(c, before, after);
     // Hidden objects (a namespace the caller cannot see): whatever the answer, it is byte-equal to the same op on
     // a namespace that does not exist.
     const bool foreignCaller = c.caller == Caller::NsAdminForeign || c.caller == Caller::UserForeign;

@@ -13,11 +13,16 @@
 #include "support/AuthRig.h"
 #include "support/NamespaceMatrixExpectations.h"
 
+#include <rune/node/AdminWorker.h>
+#include <rune/node/BrokerNode.h>
+#include <rune/node/Worker.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <utility>
 #include <optional>
 #include <string>
 #include <vector>
@@ -70,10 +75,26 @@ public:
         }
     };
 
+    using NsContents = std::map<std::string, std::string>;
+    using Snapshot = std::map<std::string, NsContents>;
+
     NamespaceRig() : main_(std::make_unique<World>("nsmx", AuthBroker::Options{})) { setupMain(); }
 
     Answer run(Op op, Caller c, Target t, int ordinal) { return exec(op, c, t, ordinal, /*twin=*/false); }
     Answer runTwin(Op op, Caller c, Target t, int ordinal) { return exec(op, c, t, ordinal, /*twin=*/true); }
+    /// Issue #643: run() with the admin thread's contents (sameNameSnapshot()) taken right before the op is issued (after
+    /// the cell's fresh objects exist) and right after its answer.
+    Answer runSnapshotted(Op op, Caller c, Target t, int ordinal, Snapshot& before, Snapshot& after) {
+        Snapshot* const b = std::exchange(snapBefore_, &before);
+        Snapshot* const a = std::exchange(snapAfter_, &after);
+        Answer ans;
+        try { ans = exec(op, c, t, ordinal, /*twin=*/false); } catch (...) { snapBefore_ = b; snapAfter_ = a; throw; }
+        snapBefore_ = b;
+        snapAfter_ = a;
+        return ans;
+    }
+    /// Issue #643: run() with the admin thread's catalog / security contents (sameNameSnapshot()) taken right before the
+    /// op is issued (after the cell's fresh objects exist) and right after its answer.
 
     // ── the timing cells (one node): the caller is root or a/admin, the object is a fresh one of namespace `a` ──
     using RequestId = rune::protocol::RequestId;
@@ -216,6 +237,51 @@ public:
         const auto it = main_->sess2.find(static_cast<int>(who));
         if (it != main_->sess2.end()) it->second.used -= by;
     }
+    /// Issue #643 (test-only): what the admin thread's applied catalog and security states hold, per namespace
+    /// (default, a, b): every topic and view (object id, version, schema version) and every user and role (object id,
+    /// version, grants).  Keyed "T:<name>" / "V:<name>" / "U:<name>" / "R:<name>".  A SameNameBoth cell compares one
+    /// before and after: only the caller's namespace may change, and only as the op requires.
+    Snapshot sameNameSnapshot() {
+        BrokerNode& n = main_->r.broker().node();
+        return n.onAdminThreadForTest([&n] {
+            Snapshot out;
+            auto& worker = n.adminWorkerAgentForTest()->worker();
+            const auto& cat = worker.applier().state();
+            const auto* sa = worker.securityApplierForTest();
+            need(sa != nullptr, "security applier");
+            const auto& sec = sa->state();
+            std::map<uint32_t, std::string> names;
+            for (const std::string ns : {"default", "a", "b"}) {
+                const auto* rec = ns == "default" ? cat.namespaces().byId(0) : cat.namespaces().byName(ns);
+                need(rec != nullptr, "namespace " + ns);
+                names[rec->nsId] = ns;
+                out[ns];
+            }
+            for (const auto* t : cat.topics())
+                if (names.count(t->nsId))
+                    out[names[t->nsId]]["T:" + t->name] = "id=" + std::to_string(t->objectId) + " ver=" + std::to_string(t->version) +
+                        " schema=" + (t->schema ? std::to_string(t->schema->schemaVersion) : std::string("-"));
+            for (const auto* v : cat.views())
+                if (names.count(v->nsId))
+                    out[names[v->nsId]]["V:" + v->name] = "id=" + std::to_string(v->objectId) + " ver=" + std::to_string(v->version);
+            auto grantsOf = [](const auto& gs) {
+                std::string g;
+                for (const auto& x : gs)
+                    g += " " + std::to_string(static_cast<int>(x.op)) + ":" + std::to_string(static_cast<int>(x.resource.type)) + ":" +
+                         std::to_string(static_cast<int>(x.resource.kind)) + ":" + x.resource.name;
+                return g;
+            };
+            for (const auto& [id, u] : sec.users())
+                if (names.count(u.nsId))
+                    out[names[u.nsId]]["U:" + u.name] = "id=" + std::to_string(id) + " ver=" + std::to_string(u.version) +
+                        " grants[" + std::to_string(u.grants.size()) + "]" + grantsOf(u.grants);
+            for (const auto& [id, r] : sec.roles())
+                if (names.count(r.nsId))
+                    out[names[r.nsId]]["R:" + r.name] = "id=" + std::to_string(id) + " ver=" + std::to_string(r.version) +
+                        " grants[" + std::to_string(r.grants.size()) + "]" + grantsOf(r.grants);
+            return out;
+        });
+    }
     /// Bounded wait until root's metadata lists topic `tid` and at least `minCount` topics.
     bool awaitRootListed(int32_t tid, std::size_t minCount) {
         World& w = *main_;
@@ -253,6 +319,8 @@ private:
     };
 
     std::unique_ptr<World> main_, anon_;
+    Snapshot* snapBefore_ = nullptr;   ///< runSnapshotted's out-parameters, read by exec()
+    Snapshot* snapAfter_ = nullptr;
     std::optional<AuthWireClient::Verifier> ver_;   ///< one verifier for every timed CreateUser (a retry is byte-identical)
 
     int64_t timedSession(World& w, Caller who, bool second) {
@@ -509,7 +577,9 @@ private:
         World& w = anon ? *anon_ : *main_;
         const Sess s = sessionFor(w, c, t, anon);
         const Names n = namesFor(w, op, t, ordinal, s, anon, twin);
+        if (snapBefore_ != nullptr) *snapBefore_ = sameNameSnapshot();
         Answer a = issue(w, op, s.sid, n);
+        if (snapAfter_ != nullptr) *snapAfter_ = sameNameSnapshot();
         a.askedNs = n.askedNs;
         switch (op) {   // the ids the request carried
             case Op::Produce: case Op::Fetch: case Op::Metadata: case Op::GroupJoin: a.ids = {n.tid}; break;
