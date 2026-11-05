@@ -12,6 +12,7 @@
 #include <cstring>
 #include <atomic>
 #include <memory>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -1688,6 +1689,21 @@ void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& na
     Collector col;
     col.subscribeAll(c, topic.handle());
 
+    // The cleaner may drop a value its tombstone supersedes before the collector reads it (a compacted topic's contract): its
+    // thread is held until every record was delivered, so the count is exact.
+    std::promise<void> entered, release;
+    std::shared_future<void> released = release.get_future().share();
+    std::thread hold([&b, &entered, released] {
+        try { b.node().onCleanerThreadForTest([&entered, released] { entered.set_value(); released.wait(); return 0; }, 60s); }
+        catch (...) {}   // the test's own waits report a hold that never ran
+    });
+    struct Release {
+        std::promise<void>& p; std::thread& t; bool done = false;
+        void operator()() { if (!done) { done = true; p.set_value(); t.join(); } }
+        ~Release() { (*this)(); }
+    } releaseHold{release, hold};
+    ASSERT_EQ(entered.get_future().wait_for(10s), std::future_status::ready) << "the cleaner thread never ran the hold";
+
     std::multiset<std::pair<int32_t, std::string>> tombstones;
     for (int i = 0; i < kRecords; ++i) {
         const Rec rec = Rec::make(i);
@@ -1705,6 +1721,7 @@ void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& na
     for (const Seen& s : col.seen())
         if (s.tombstone) got.emplace(s.partition, s.key);
     EXPECT_TRUE(got == tombstones) << "every tombstone sits on the partition of its record with the same key bytes";
+    releaseHold();   // the cleaner passes below need its thread
 
     // The cleaner skips the active segment: one tombstone per partition for a key that was never written (the segment is
     // past its 256 bytes, so the next append rolls it once the provisioner has a segment ready) seals the real tombstones.
