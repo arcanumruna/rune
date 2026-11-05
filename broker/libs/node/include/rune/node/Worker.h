@@ -1830,7 +1830,6 @@ public:
     }
     /// The side window's initial producer capacity of partitions installed from now on (cold).
     void setAssignedBaseReserveForTest(std::size_t producers) noexcept { assignedBaseReserve_ = producers; }
-    void maintainAutoIncWindowsForTest() { maintainAutoIncWindows_(); }
 
     // -----------------------------------------------------------------------
     // rune::consensus::Agent interface
@@ -1982,6 +1981,7 @@ public:
             work += flushOwedAcksView_(nowNs);   // a worker without views still releases and times out View waiters
             publishVerdictCleanerBounds_();
             if ((++verdictPasses_ & 1023) == 0) [[unlikely]] { maintainVerdictIndexes_(); maintainAutoIncWindows_(); }
+            if (autoIncGrowDue_) [[unlikely]] { autoIncGrowDue_ = false; maintainAutoIncWindows_(); }
             if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
             work += serveHeldPushReads_();
         }
@@ -2120,6 +2120,7 @@ private:
         work += flushOwedAcksView_(nowNs);       // a worker without views still releases and times out View waiters
         publishVerdictCleanerBounds_();
         if ((++verdictPasses_ & 1023) == 0) [[unlikely]] { maintainVerdictIndexes_(); maintainAutoIncWindows_(); }
+        if (autoIncGrowDue_) [[unlikely]] { autoIncGrowDue_ = false; maintainAutoIncWindows_(); }
         if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
         work += serveHeldPushReads_();
         // 4b. background disk work → io backend, never an inline fsync
@@ -5194,7 +5195,10 @@ private:
         } catch (...) {
             spdlog::warn("Worker {}: becomeFollower threw unknown exception", workerId_);
         }
-        if (PartitionWriteState* ws = writeOf_(replica)) ws->autoInc.deactivate();   // P6-7: a follower assigns nothing
+        // P6-7: a follower assigns nothing.  A becomeFollower that threw before the role changed leaves a live leader whose
+        // RcState stays Ready: its counter stays Ready too.  (No fault seam makes becomeFollower throw; untested.)
+        if (replica->role() != rune::replication::Role::Leader)
+            if (PartitionWriteState* ws = writeOf_(replica)) ws->autoInc.deactivate();
     }
 
     // -------------------------------------------------------------------
@@ -6401,6 +6405,7 @@ private:
     WriteFacts lastWriteFacts_{};
     std::vector<uint8_t> autoIncScratch_;   // Part 06: a key-0 batch is copied here to patch its ids (maxIntakeBatchBytes_, cold)
     std::size_t assignedBaseReserve_ = kAssignedBaseProducersInitial;
+    bool autoIncGrowDue_ = false;   // a fresh key-0 append left a side window above 75 % load
     std::array<uint64_t, std::to_underlying(HookRefusal::Count_)> hookRefusals_{};   // by reason
 
     // Phase 2c: filtered subscriptions (worker thread only).  filterSchemas_ is never erased (topic ids are never
@@ -7118,8 +7123,7 @@ private:
         for (auto& sl : rcSlots_) {
             if (!sl.write || !sl.write->spec->autoIncrement) continue;
             AssignedBaseWindow& w = sl.write->assignedBases;
-            if (w.producers() * 4 >= w.capacity() * 3 && w.capacity() < kAssignedBaseProducersMax)
-                w.grow(std::min(w.capacity() * 2, kAssignedBaseProducersMax));
+            if (w.wantsGrowth()) w.grow(std::min(w.capacity() * 2, kAssignedBaseProducersMax));
         }
     }
     // Cold (ownership apply): carry still-owned states, create + reserve new
@@ -9895,6 +9899,7 @@ private:
             if (hook.checked()) ++hookChecks_;
             if (hook.refusal() != HookRefusal::None) [[unlikely]] noteHookRefusal_(hook.refusal(), f);
             if (!outcome.isOK()) [[unlikely]] hook.onProduceFailed();
+            if (hook.assignedBase() != 0 && ws->assignedBases.wantsGrowth()) [[unlikely]] autoIncGrowDue_ = true;   // P6-8: grown next pass
             // P6-3: an in-window retry of a key-0 batch answers the ids its original took, from the side window.
             if (outcome.isDuplicate && outcome.baseOffset >= 0 && ws->spec->autoIncrement && keyZeroFirstRecord_(*ws->spec, rbSpan)) [[unlikely]] {
                 outcome.assignedBase = ws->assignedBases.find(f.producerId, outcome.baseOffset);

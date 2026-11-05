@@ -178,7 +178,7 @@ TEST(CheckedWritesAutoIncWorker, ActivationAnswersNotLeaderUntilTheScanEnds) {
     Producer p{r, 42};
     uint64_t maxId = 0;
     for (int i = 0; i < 24; ++i) maxId = std::max(maxId, p.createIds(2).back());
-    r.rcScanBytesPerPass = 256;   // the restarted worker scans a few batches per pass
+    r.rcScanBytesPerPass = 1;   // one batch per pass
     r.restart();
     ASSERT_FALSE(r.autoIncState()) << "precondition: the scan is still running";
     const auto refused = p.ackOf(p.resend(creates(1), p.seq));
@@ -268,6 +268,40 @@ TEST(CheckedWritesAutoIncRegression, TruncatedReservationTakesItsDataWithItRegre
     for (const auto& [off, n] : r.reservations()) r16 += n == 16 ? 1 : 0;
     EXPECT_EQ(r16, 1u) << "exactly one R 16";
     EXPECT_EQ(loggedIds(r), (std::vector<uint64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}));
+}
+
+// Task 9 fix round 1 (finding 4): the old leader's own worker, holding Ready{13, R 16} and the cut batch's producer state, follows
+// the new leader's history and leads again: the counter is rebuilt from the cut log, never from its memory.
+TEST(CheckedWritesAutoIncRegression, SameWorkerTruncationRebuildsTheCounterFromTheCutLogRegression) {
+    AutoInc g(AutoIncShape{.reserve = 8}, /*follower=*/true);
+    VerdictRig& r = g.r;
+    Producer p{r, 42, kAllView, /*fetching=*/true};
+    ASSERT_EQ(p.createIds(8).back(), 8u);
+    const int64_t hw = r.replica->highWatermark();
+    const int32_t seq = p.seq;
+    (void)p.send(creates(4));
+    r.passes(3);
+    ASSERT_EQ(r.reservations().back().second, 16u);
+    ASSERT_TRUE(r.autoIncState());
+    ASSERT_EQ(r.autoIncState()->nextN, 13u) << "precondition: the memory holds the cut batch's ids";
+    r.demoteByOp();
+    r.truncateReplicaTo(hw);
+    ASSERT_EQ(r.leo(), hw);
+    r.promote();
+    for (int i = 0; i < VerdictRig::kMaxPass && !r.autoIncState(); ++i) r.pass();
+    ASSERT_TRUE(r.autoIncState());
+    EXPECT_EQ(r.autoIncState()->nextN, 9u) << "R 8 + 1: R 16 went with the cut";
+    const auto a = p.ackOf(p.resend(creates(4), seq));
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    EXPECT_EQ(a->assignedBase, 9u) << "ids 9-12 again";
+    EXPECT_EQ(r.autoIncState()->nextN, 13u);
+    std::size_t r16 = 0;
+    for (const auto& [off, n] : r.reservations()) r16 += n == 16 ? 1 : 0;
+    EXPECT_EQ(r16, 1u) << "R 16 re-appended once";
+    EXPECT_EQ(loggedIds(r), (std::vector<uint64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    EXPECT_EQ(r.autoIncStats().assignedKeyExists, 0u);
 }
 
 // P6-7: a demoted partition assigns nothing until its next leadership scan rebuilds the counter.
@@ -500,24 +534,28 @@ TEST(CheckedWritesAutoIncWorker, AbortedTransactionBurnsItsIds) {
     EXPECT_EQ(r.autoIncStats().idsBurned, 2u);
 }
 
+// 8f: producers that fill the window within one pass are refused retriably; the window grows on the next pass.
 TEST(CheckedWritesAutoIncWorker, WindowFullIsRetriableUntilItGrows) {
     VerdictRig r;
     r.reserveAssignedBases(4);
     r.createAutoIncTopic();
     r.enableAcks();
     r.passes(20);
+    std::vector<int64_t> corrs;
+    for (int64_t pid = 1; pid <= 5; ++pid) corrs.push_back(r.produceFrame(creates(1), kAllView, pid, 0));   // one burst, one pass
     for (int64_t pid = 1; pid <= 4; ++pid) {
-        Producer p{r, pid};
-        ASSERT_EQ(p.createIds(1).size(), 1u);
+        const auto a = r.ack(corrs[std::size_t(pid - 1)]);
+        ASSERT_TRUE(a);
+        EXPECT_EQ(a->code, 0) << "producer " << pid;
     }
-    Producer fifth{r, 5};
-    const auto a = fifth.ackOf(fifth.resend(creates(1), 0));
-    ASSERT_TRUE(a);
-    EXPECT_EQ(a->code, kNotLeader);
+    const auto full = r.ack(corrs[4]);
+    ASSERT_TRUE(full);
+    EXPECT_EQ(full->code, kNotLeader);
     EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::AutoIncWindowFull), 1u);
-    r.worker->maintainAutoIncWindowsForTest();
-    EXPECT_EQ(fifth.createIds(1), std::vector<uint64_t>{5});
+    r.passes(2);
     EXPECT_EQ(r.writeState()->assignedBases.capacity(), 8u);
+    Producer fifth{r, 5};
+    EXPECT_EQ(fifth.createIds(1), std::vector<uint64_t>{5});
 }
 
 TEST(CheckedWritesAutoIncWorker, GatewayRoutedCreatesUseTheOpScratch) {
@@ -599,11 +637,13 @@ namespace {
 struct ScanFeed {
     int begins = 0, ends = 0, dataBatches = 0;
     bool endWithoutBegin = false;
+    int64_t lastBeginStart = -1;
 };
-void feedBegin(void* c, int64_t, int64_t) noexcept {
+void feedBegin(void* c, int64_t logStart, int64_t) noexcept {
     auto& f = *static_cast<ScanFeed*>(c);
     if (f.begins != f.ends) f.endWithoutBegin = true;   // a begin before the previous scan ended: counted as unpaired
     ++f.begins;
+    f.lastBeginStart = logStart;
 }
 void feedData(void* c, const uint8_t*, std::size_t, int64_t) noexcept { ++static_cast<ScanFeed*>(c)->dataBatches; }
 void feedEnd(void* c) noexcept {
@@ -653,4 +693,131 @@ TEST(CheckedWritesAutoIncRegression, RingScanPairsBeginAndEndAndFeedsDataBatches
     EXPECT_EQ(feed.begins, 3);
     EXPECT_EQ(feed.ends, 3);
     EXPECT_FALSE(feed.endWithoutBegin);
+}
+
+// Task 9 fix round 1 (finding 1): a scan budget below one batch header still moves the disk scan, one batch per pass.
+TEST(CheckedWritesAutoIncRegression, DiskScanBelowTheBatchOverheadReachesReadyRegression) {
+    for (const int32_t budget : {1, 16}) {
+        SCOPED_TRACE(budget);
+        const auto dir = rigTmpPath("rcbudget");
+        {
+            rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+            constexpr int kBatches = 12;
+            for (int i = 0; i < kBatches; ++i) {
+                auto b = producerBatch(9, i);
+                int64_t base = 0;
+                ASSERT_GE(log.appendNoSyncRestamp(b.data(), b.size(), 0, base), 0);
+            }
+            RcState rc;
+            rc.reserve(8);
+            RcFacts f;
+            f.leader = true; f.epoch = 1;
+            int passes = 0;
+            for (; passes < kBatches + 8 && !rc.ready(); ++passes) (void)rc.advance(f, &log, budget);
+            EXPECT_TRUE(rc.ready()) << "still scanning after " << passes << " passes";
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+}
+
+namespace {
+/// demotePromote() on the same worker, then passes until the new leadership's scan made the counter Ready.
+void reLead(VerdictRig& r) {
+    r.demotePromote();
+    for (int i = 0; i < VerdictRig::kMaxPass && !r.autoIncState(); ++i) r.pass();
+    ASSERT_TRUE(r.autoIncState());
+}
+}  // namespace
+
+// Task 9 fix round 1 (finding 2): a rescan of the same reservation on the same worker counts its gap once.
+TEST(CheckedWritesAutoIncRegression, ReLeadershipCountsTheBurnedGapOnceRegression) {
+    AutoInc g;
+    VerdictRig& r = g.r;
+    Producer p{r, 42};
+    ASSERT_EQ(p.createIds(3).back(), 3u);
+    reLead(r);
+    EXPECT_EQ(r.autoIncStats().idsBurned, 4093u);
+    reLead(r);
+    EXPECT_EQ(r.autoIncStats().idsBurned, 4093u) << "the second scan over R 4096 adds nothing";
+    EXPECT_EQ(p.createIds(1), std::vector<uint64_t>{4097});
+}
+
+// Task 9 fix round 1 (finding 2): ids an append failure burned are not counted again by the next scan's gap.
+TEST(CheckedWritesAutoIncRegression, AppendFailureThenReLeadershipCountsEachIdOnceRegression) {
+    AutoInc g;
+    VerdictRig& r = g.r;
+    Producer p{r, 42};
+    ASSERT_EQ(p.createIds(2).back(), 2u);
+    r.log->setWriteFaultForTest(EIO);
+    ASSERT_TRUE(p.ackOf(p.resend(creates(3), p.seq)));
+    ASSERT_EQ(r.autoIncStats().idsBurned, 3u);
+    r.log->setWriteFaultForTest(0);
+    reLead(r);
+    EXPECT_EQ(r.autoIncStats().idsBurned, 4096u - 2u) << "R - 2: ids 3-5 once, 6-4096 once";
+}
+
+// Task 9 fix round 1 (finding 3, P6-8): a window whose load passes 75 % grows on the next pass, not at the 1024-pass maintenance.
+TEST(CheckedWritesAutoIncRegression, WindowGrowsOnTheNextPassAfterItPassesThreeQuartersRegression) {
+    VerdictRig r;
+    r.reserveAssignedBases(8);
+    r.createAutoIncTopic();
+    r.enableAcks();
+    r.passes(20);
+    for (int64_t pid = 1; pid <= 6; ++pid) {
+        Producer p{r, pid};
+        ASSERT_EQ(p.createIds(1).size(), 1u);
+    }
+    r.passes(3);
+    EXPECT_EQ(r.writeState()->assignedBases.capacity(), 16u);
+    for (int64_t pid = 7; pid <= 9; ++pid) {
+        Producer p{r, pid};
+        const auto ids = p.createIds(1);
+        ASSERT_EQ(ids.size(), 1u) << "producer " << pid;
+    }
+    EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::AutoIncWindowFull), 0u);
+}
+
+// Task 9 fix round 1 (finding 5): an import behind an update in its batch still raises the scan's highest assigned n, so
+// the burned gap is not overstated.
+TEST(CheckedWritesAutoIncRegression, ImportBehindAnUpdateCountsAsAssignedInTheScanRegression) {
+    AutoInc g;
+    VerdictRig& r = g.r;
+    Producer p{r, 42};
+    ASSERT_EQ(p.createIds(3).back(), 3u);
+    const auto a = p.sendAck({upd(1), import(100)});
+    ASSERT_TRUE(a);
+    ASSERT_EQ(a->code, 0);
+    ASSERT_TRUE(a->verdicts.empty());
+    reLead(r);
+    EXPECT_EQ(r.autoIncStats().idsBurned, 4096u - 100u) << "R - 100, not R - 3";
+}
+
+// Task 9 fix round 1 (finding 8): a ring scan restarted by eviction begins the feed again from the new ring start, so the
+// window and the counter scan never hold entries fed before the restart.
+TEST(CheckedWritesAutoIncRegression, RingScanRestartBeginsTheFeedAgainRegression) {
+    rune::storage::InMemoryLog mem(1 << 20, 4);   // at most 4 batches: later appends evict the oldest
+    const auto append = [&](int32_t seq) {
+        auto b = producerBatch(9, seq);
+        int64_t base = 0;
+        ASSERT_GE(mem.appendNoSyncRestamp(b.data(), b.size(), 0, base), 0);
+    };
+    for (int i = 0; i < 4; ++i) append(i);
+    ScanFeed feed;
+    RcState rc;
+    rc.reserve(8);
+    rc.reserveRingRebuild();
+    rc.setVerdictHooks(RcVerdictHooks{.begin = &feedBegin, .ctx = &feed, .dataBatch = &feedData, .end = &feedEnd});
+    RcFacts f;
+    f.leader = true; f.epoch = 1;
+    (void)rc.advance(f, nullptr, /*budget=*/1, &mem);
+    ASSERT_FALSE(rc.ready());
+    ASSERT_EQ(feed.begins, 1);
+    for (int i = 4; i < 8; ++i) append(i);
+    ASSERT_GT(mem.logStartOffset(), 1) << "precondition: the ring evicted past the scan cursor";
+    for (int i = 0; i < 64 && !rc.ready(); ++i) (void)rc.advance(f, nullptr, 1, &mem);
+    ASSERT_TRUE(rc.ready());
+    EXPECT_EQ(feed.begins, 2) << "the restart began the feed again";
+    EXPECT_EQ(feed.lastBeginStart, mem.logStartOffset());
+    EXPECT_EQ(feed.ends, 1);
 }

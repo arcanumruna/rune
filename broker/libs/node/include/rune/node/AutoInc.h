@@ -58,15 +58,20 @@ public:
     void onAssignedThrough(uint64_t n) noexcept {
         if (auto* s = std::get_if<AutoIncScanning>(&st_)) s->maxAssignedN = std::max(s->maxAssignedN, n);
     }
-    /// Moves to Ready{R + 1, R}; returns the burned gap R - maxAssignedN (0 when not positive).
+    /// Moves to Ready{R + 1, R}; returns the burned gap R - max(maxAssignedN, burnedThroughN) (0 when not positive).  An id
+    /// is counted burned once: a later scan over the same reservation, or over ids an append failure burned, adds nothing.
     [[nodiscard]] uint64_t finishScan() noexcept {
         const auto* s = std::get_if<AutoIncScanning>(&st_);
         if (s == nullptr) return 0;
         const uint64_t r = s->reservedThroughN;
-        const uint64_t burned = r > s->maxAssignedN ? r - s->maxAssignedN : 0;
+        const uint64_t counted = std::max(s->maxAssignedN, burnedThroughN_);
+        const uint64_t burned = r > counted ? r - counted : 0;
+        burnedThroughN_ = std::max(burnedThroughN_, r);
         st_ = AutoIncReady{r + 1, r};
         return burned;
     }
+    /// The ids through `n` are counted burned (an append failure after they were taken).
+    void burnedThrough(uint64_t n) noexcept { burnedThroughN_ = std::max(burnedThroughN_, n); }
     void deactivate() noexcept { st_ = AutoIncInactive{}; }
     [[nodiscard]] bool ready() const noexcept { return std::holds_alternative<AutoIncReady>(st_); }
 
@@ -108,6 +113,7 @@ public:
 
 private:
     std::variant<AutoIncInactive, AutoIncScanning, AutoIncReady> st_;
+    uint64_t burnedThroughN_ = 0;   // every id through it is already in idsBurned; kept across scans
     int32_t  partition_  = 0;
     int32_t  partitions_ = 1;
     uint32_t reserve_    = 0;
@@ -148,6 +154,8 @@ public:
     }
 
     [[nodiscard]] std::size_t producers() const noexcept { return used_; }
+    /// P6-8: the producer load passed 75 % and the window can still grow.
+    [[nodiscard]] bool wantsGrowth() const noexcept { return used_ * 4 >= slots_.size() * 3 && slots_.size() < kAssignedBaseProducersMax; }
     [[nodiscard]] std::size_t capacity() const noexcept { return slots_.size(); }
 
     /// Cold.

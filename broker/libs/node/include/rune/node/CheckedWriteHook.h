@@ -140,7 +140,10 @@ public:
     void onAppended(int64_t base, int64_t last) noexcept;
     /// The produce failed after stage() took the key-0 batch's ids (its data append was refused or threw): they are burned.
     void onProduceFailed() noexcept {
-        if (idsTaken_) state_.autoIncStats.idsBurned += keyZeroCount_;
+        if (idsTaken_) {
+            state_.autoIncStats.idsBurned += keyZeroCount_;
+            state_.autoInc.burnedThrough(plan_.firstN + keyZeroCount_ - 1);
+        }
         idsTaken_ = false;
     }
     [[nodiscard]] uint64_t assignedBase() const noexcept { return assignedBase_; }

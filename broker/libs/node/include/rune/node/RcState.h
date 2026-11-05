@@ -120,7 +120,7 @@ struct RcFacts {
 };
 
 /// The leadership scan's feed for checked writes.  `begin` runs on the Unbuilt -> Scanning edge (`target` = the LEO at
-/// entry), `end` once on the Ready edge of the scan it began; `batch` for every checked-writes control batch
+/// entry) and again when an evicting ring restarts the scan, `end` once on the Ready edge of the scan last begun; `batch` for every checked-writes control batch
 /// (producerId < 0, types 16-19) a disk scan walks, `dataBatch` for every data batch of a producer (producerId >= 0)
 /// either scan walks.  fn-pointer + ctx, no std::function.
 struct RcVerdictHooks {
@@ -807,6 +807,7 @@ private:
     std::size_t scanResident_(Scanning& s, const rune::storage::Log::SegmentBytes& m, std::size_t budget) {
         using rune::protocol::RecordBatchReader;
         constexpr std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+        budget = std::max(budget, kOverhead);   // a window below one batch header never parses: the scan would never move
         const uint8_t*    p     = m.data + s.bytePos;
         const std::size_t avail = m.size - s.bytePos;
         const std::size_t want  = std::min(avail, budget);
@@ -967,6 +968,7 @@ private:
             const RcFacts f{true, rs.logGen, rs.leadGen, rs.epoch};
             beginRingScan_(f, ring);   // the same alternative: `rs` now holds the restarted build
             rs.boost = boost;
+            if (verdict_.begin != nullptr) verdict_.begin(verdict_.ctx, ring.logStartOffset(), ring.logEndOffset());   // the feed restarts too
         }
         RingScanning& cur = rs;
         rune::transaction::RcBuilder builder(&tracker_, &aborted_);

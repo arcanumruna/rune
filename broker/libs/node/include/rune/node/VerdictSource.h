@@ -254,8 +254,9 @@ inline void autoIncFeedBegin(void* state, int64_t logStart, int64_t target) noex
     s.assignedBases.clear();
 }
 
-/// Autoincrement (P6-3): an idempotent data batch whose first record is an insert refills its producer's window entry with
-/// the first key as the base (a key-0 batch and an import look the same in the log), and raises the highest n assigned.
+/// Autoincrement (P6-3): every insert in an idempotent data batch raises the highest n assigned; a batch whose first record is
+/// an insert also refills its producer's window entry with the first key as the base (a key-0 batch and an import look the
+/// same in the log).
 inline void autoIncFeedDataBatch(void* state, const uint8_t* b, std::size_t len, int64_t base) noexcept {
     auto& s = *static_cast<PartitionWriteState*>(state);
     const rune::protocol::RecordBatchReader r(b, len);
@@ -270,9 +271,8 @@ inline void autoIncFeedDataBatch(void* state, const uint8_t* b, std::size_t len,
         if (rec.index == 0) { insertFirst = true; firstKey = key; }
         maxN = std::max(maxN, key / partitions);
     });
-    if (!insertFirst) return;
-    s.assignedBases.recordScanned(r.producerId(), base, firstKey);
     s.autoInc.onAssignedThrough(maxN);
+    if (insertFirst) s.assignedBases.recordScanned(r.producerId(), base, firstKey);
 }
 /// The scan ended: the counter resumes above the latest reservation, and the reserved ids nothing took are burned.
 inline void autoIncFeedEnd(void* state) noexcept {
