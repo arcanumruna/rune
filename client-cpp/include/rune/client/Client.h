@@ -759,6 +759,8 @@ public:
     void testRequestMetadataNow() noexcept { lastUrgentMetadataNs_ = INT64_MIN; requestMetadataNow_(); }
     /// True while a MetadataRequest is unanswered (its answer timer is armed).  Test seam (duty thread).
     [[nodiscard]] bool testMetadataAnswerPending() const noexcept { return metadataAnswerByNs_ != 0; }
+    /// The armed backoff refresh's due time on the duty clock (kMetadataRefreshNotArmed: none).  Test seam (duty thread).
+    [[nodiscard]] int64_t testMetadataRefreshDueNs() const noexcept { return nextMetadataRefreshAtNs_; }
     /// Test hook (duty-cycle thread only): agent session `i`'s state.
     [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
     /// Test hook (duty-cycle thread only / after quiescence): the endpoint channel of agent session `i`.
