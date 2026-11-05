@@ -198,7 +198,7 @@ namespace {
 template <std::size_t N>
 std::array<uint8_t, N> leBytes(uint64_t v) {
     std::array<uint8_t, N> k{};
-    for (std::size_t i = 0; i < N; ++i) k[i] = static_cast<uint8_t>(v >> (8 * i));
+    for (std::size_t i = 0; i < N && i < 8; ++i) k[i] = static_cast<uint8_t>(v >> (8 * i));
     return k;
 }
 } // namespace
