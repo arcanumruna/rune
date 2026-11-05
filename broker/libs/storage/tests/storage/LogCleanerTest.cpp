@@ -1182,15 +1182,17 @@ TEST(LogCleaner, EmptyCompactedSegmentDeletedNotLeft) {
 
     // The first non-active segment (bases[0]) contains k1@0 which will be
     // superseded by k1@8 in a later segment.  After compaction, bases[0] must
-    // be fully empty → A4 fix deletes the file.
+    // be fully empty → A4 fix deletes the file, except that the log's first
+    // segment stays as an empty placeholder (fix pass 2: compaction never moves
+    // the log start).
     int64_t cleanBoundary = bases.back(); // don't compact active segment
 
     LogCleaner cleaner;
     cleaner.clean(log, 0, cleanBoundary, 0, 1'000'000);
 
-    // Verify: no 0-byte .log files remain.
+    // Verify: no 0-byte .log files remain but the first.
     for (auto& e : std::filesystem::directory_iterator(dir)) {
-        if (e.path().extension() == ".log") {
+        if (e.path().extension() == ".log" && std::stoll(e.path().stem().string()) != bases.front()) {
             EXPECT_GT(std::filesystem::file_size(e.path()), 0u)
                 << "No 0-byte .log files should remain: " << e.path();
         }
@@ -1200,6 +1202,7 @@ TEST(LogCleaner, EmptyCompactedSegmentDeletedNotLeft) {
     Log log2(dir.string(), 256);
     log2.recover();
     EXPECT_GT(log2.logEndOffset(), 0) << "LEO must be intact after empty-segment deletion";
+    EXPECT_EQ(log2.logStartOffset(), bases.front()) << "the log start stays";
 
     // k1 must appear exactly once — the latest version.
     auto recs = readAllRecords(log2, 0);
@@ -2338,6 +2341,44 @@ TEST(LogCleanerRegression, DeferredOutputCarriesIndexAndNextOffsetAndInstallsReg
     }
     for (int k = 0; k < 4; ++k) EXPECT_EQ(latest["k" + std::to_string(k)], "v" + std::to_string(36 + k));
     EXPECT_LT(live, 40);
+    std::filesystem::remove_all(dir);
+}
+
+// Fix pass 2 (M1): a deferred install of an emptied first segment installs an empty placeholder, so the log start stays.
+// RED: the group had no output, the owner dropped the segment and the log start moved to 1.
+TEST(LogCleanerRegression, DeferredEmptiedFirstSegmentKeepsTheLogStartRegression) {
+    auto dir = makeTempDir("fp2_deferred_first");
+    std::filesystem::create_directories(dir);
+    Log log(dir.string(), /*rollBytes=*/1);
+    log.append(makeBatch(0, "k", "old", 1000), 0);
+    log.append(makeBatch(1, "k", "new", 1001), 1);
+    log.append(makeBatch(2, "pad", "x", 1002), 2);
+    auto bases = log.segmentBaseOffsets();
+    const int64_t active = bases.back();
+    bases.pop_back();
+    uint64_t seq = 0;
+    LogCleaner cleaner;
+    cleaner.setDeferredInstall(&seq);
+    SkimpyOffsetMap map(1024);
+    std::vector<int64_t> sizes(bases.size(), 1);
+    const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1'000'000,
+                                                        map, /*coalesce=*/false, 1 << 20, nullptr, -1);
+    ASSERT_EQ(res.groups.size(), 1u);
+    const auto& g = res.groups.front();
+    ASSERT_EQ(g.bases, std::vector<int64_t>{0});
+    EXPECT_TRUE(g.hasOutput) << "an empty placeholder";
+    const auto snap = log.ownerSealedSnapshot();
+    std::vector<Log::CleanedMember> members;
+    for (const auto& si : *snap) if (si.baseOffset == 0) members.push_back({0, si.lineage});
+    ASSERT_TRUE(log.enqueueCleanedGroup(members.data(), members.size(), g.seq, g.hasOutput, g.nextOffset,
+                                        g.hasOutput ? log.openCleanedOutput(0, g.seq, g.nextOffset).release() : nullptr));
+    log.drainCleanerSwaps();
+    log.runCleanerFileOps(0);
+    EXPECT_EQ(log.cleanerGroupsRejected(), 0u);
+    EXPECT_EQ(log.logStartOffset(), 0);
+    const auto bytes = log.read(1, 1 << 20);
+    ASSERT_FALSE(bytes.empty());
+    EXPECT_EQ(RecordBatchReader(bytes.data(), bytes.size()).baseOffset(), 1);
     std::filesystem::remove_all(dir);
 }
 

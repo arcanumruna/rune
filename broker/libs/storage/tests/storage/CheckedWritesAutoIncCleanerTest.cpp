@@ -325,6 +325,29 @@ TEST(CheckedWritesAutoIncCleanerRegression, RewriteKeepsTheSegmentAppendTimeRegr
     }
 }
 
+// Fix pass 2 (M1): compaction never moves the log start.  RED: every record of the first segment was superseded, the cleaner
+// deleted the emptied segment and the log start jumped to the next segment's base.
+TEST(CheckedWritesAutoIncCleanerRegression, EmptiedFirstSegmentKeepsTheLogStartRegression) {
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            rec(log, 0, -1, -1, 5, "insert");
+            rec(log, 1, -1, -1, 5, "update");
+            pad(log, 2);
+            (void)clean(log, Pass{.depth = 1, .coalesce = coalesce});
+            ASSERT_FALSE(dataOffsets(log).count(0)) << "the superseded insert is gone";
+            EXPECT_EQ(log.logStartOffset(), 0);
+            (void)clean(log, Pass{.depth = 1, .coalesce = coalesce});
+            EXPECT_EQ(log.logStartOffset(), 0) << "and stays put on the next pass";
+            EXPECT_TRUE(dataOffsets(log).count(1));
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
 TEST(CheckedWritesAutoIncCleaner, PinnedTombstoneOutlivesDeleteRetention) {
     for (const bool coalesce : {false, true}) {
         SCOPED_TRACE(name(coalesce));

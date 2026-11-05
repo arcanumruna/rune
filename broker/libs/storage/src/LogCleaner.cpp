@@ -73,6 +73,14 @@ void keepAppendTime(const std::string& out, const std::string& dir, const std::v
     if (t != std::filesystem::file_time_type::min()) std::filesystem::last_write_time(out, t, ec);
 }
 
+// Fix pass 2: compaction never moves the log start (the first segment's base), so an emptied first segment stays as an empty
+// placeholder.  Cold: asked only when a rewrite's output is empty.
+bool isFirstSegment(const std::string& dir, int64_t segBase) {
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().extension() == ".log" && std::stoll(e.path().stem().string()) < segBase) return false;
+    return true;
+}
+
 // Write bytes to path (overwrite) and fsync the fd before returning.
 // Uses POSIX open/write/fsync so we can get the fd for fsync — matching
 // the idiom in libs/coordination/OffsetStore.cpp (pwrite+fsync pattern).
@@ -959,11 +967,12 @@ bool LogCleaner::rewriteSegmentImpl(
     // A4: If compaction removed ALL records from a non-active segment, outBuf is
     // empty.  Writing a 0-byte .log would leave a permanent dangling file that
     // never gets garbage-collected.  Instead, delete the segment and its index
-    // directly and fsync the directory so the deletions are durable.
+    // directly and fsync the directory so the deletions are durable.  The log's
+    // first segment is the exception: it is rewritten empty (isFirstSegment).
     // Log::reloadSegments() (called by compact() after all segments are
     // rewritten) only discovers segments with on-disk .log files, so a deleted
     // segment is simply absent — Log remains consistent and LEO is unaffected.
-    if (outBuf.empty()) {
+    if (outBuf.empty() && !isFirstSegment(dir, segBase)) {
         if (changed) *changed = true; // segment removed — content changed
         if (deferredOut_ != nullptr) {   // fix round 2: the owner thread drops it
             deferInstall_(dir, {segBase}, outBuf);
@@ -1503,7 +1512,7 @@ void LogCleaner::deferInstall_(const std::string& dir, const std::vector<int64_t
     CleanedGroup g;
     g.bases = bases;
     g.seq = static_cast<uint32_t>(++*deferredSeq_);
-    g.hasOutput = !out.empty();
+    g.hasOutput = !out.empty() || isFirstSegment(dir, bases.front());   // an emptied first segment: an empty placeholder
     if (g.hasOutput) {
         // Fix round 3: the cleaner builds the COMPLETE segment so the owner's
         // install is O(1) — CRC-verify every output batch, derive nextOffset and
@@ -1849,8 +1858,8 @@ void LogCleaner::mergeGroupWithMap(
         return;
     }
 
-    if (outBuf.empty()) {
-        // All records removed — delete every member segment.
+    if (outBuf.empty() && !isFirstSegment(dir, outBase)) {
+        // All records removed — delete every member segment (the log's first segment stays, empty).
         for (int64_t b : groupInPass) {
             std::filesystem::remove(segmentLogPath(dir, b));
             std::filesystem::remove(segmentIndexPath(dir, b));

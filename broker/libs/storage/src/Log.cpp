@@ -2492,7 +2492,7 @@ bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBo
     }
     const int64_t end = cur->first;   // next segment after the last member (exists: none is active)
     if (!compactionAllowedThrough(end)) return reject(RejectReason::RecoveryPoint);
-    if (head.hasOutput && (head.prebuilt == nullptr || head.nextOffset <= b1 || head.nextOffset > end ||
+    if (head.hasOutput && (head.prebuilt == nullptr || head.nextOffset < b1 || head.nextOffset > end ||
                            head.prebuilt->baseOffset() != b1))
         return reject(RejectReason::BadOutput);
 
