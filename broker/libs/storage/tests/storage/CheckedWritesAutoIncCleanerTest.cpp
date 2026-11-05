@@ -16,6 +16,7 @@
 #include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogCleaner.h>
+#include <rune/storage/ProducerBatchWindow.h>
 #include <rune/storage/ProducerTails.h>
 #include <rune/storage/SkimpyOffsetMap.h>
 
@@ -41,12 +42,16 @@ std::string idKey(uint64_t id) {
     for (int i = 0; i < 8; ++i) k[std::size_t(i)] = static_cast<char>(id >> (8 * i));
     return k;
 }
-/// A one-record batch of `id` at `off`: idempotent when pid >= 0, a tombstone when `val` is empty.
-void rec(Log& log, int64_t off, int64_t pid, int32_t seq, uint64_t id, const std::string& val) {
-    rune::protocol::RecordBatchBuilder b(off, 2000 + off);
+/// A batch of `ids` from `off` (timestamp `ts`, default 2000 + off): idempotent when pid >= 0, tombstones when `val` is empty.
+void recs(Log& log, int64_t off, int64_t pid, int32_t seq, const std::vector<uint64_t>& ids, const std::string& val, int64_t ts = -1) {
+    if (ts < 0) ts = 2000 + off;
+    rune::protocol::RecordBatchBuilder b(off, ts);
     if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
-    b.append(idKey(id), val, 2000 + off);
-    log.append(b.build(), off);
+    for (const uint64_t id : ids) b.append(idKey(id), val, ts);
+    log.append(b.build(), off + static_cast<int64_t>(ids.size()) - 1);
+}
+void rec(Log& log, int64_t off, int64_t pid, int32_t seq, uint64_t id, const std::string& val, int64_t ts = -1) {
+    recs(log, off, pid, seq, {id}, val, ts);
 }
 void pad(Log& log, int64_t off) { rec(log, off, -1, -1, 1'000'000 + uint64_t(off), "pad"); }
 void reservation(Log& log, int64_t off, uint64_t n) {
@@ -77,6 +82,8 @@ struct Pass {
     int64_t retentionMs = 1000;
     bool coalesce = false;
     int64_t verdictBound = kMax;
+    std::size_t mapSlots = 1024;
+    int64_t* dirty = nullptr;   ///< the clean watermark the pass starts from and advances, as LogCleanerAgent does; null = 0
 };
 /// One range pass over the sealed region; true = the cleaner built a ProducerBatchWindow.
 bool clean(Log& log, const Pass& p) {
@@ -88,8 +95,10 @@ bool clean(Log& log, const Pass& p) {
     cleaner.setVerdictBounds(p.verdictBound, p.verdictBound);
     cleaner.setProducerTailDepth(p.depth);
     std::vector<int64_t> sizes(bases.size(), 1);
-    SkimpyOffsetMap map(1024);
-    (void)cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, p.retentionMs, map, p.coalesce, 1 << 20, nullptr, p.nowMs);
+    SkimpyOffsetMap map(p.mapSlots);
+    const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, p.dirty ? *p.dirty : 0, 0, p.retentionMs, map, p.coalesce,
+                                                        1 << 20, nullptr, p.nowMs);
+    if (p.dirty && res.passEnd > *p.dirty) *p.dirty = res.passEnd;
     log.reloadSegments();
     return cleaner.producerBatchWindowForTest() != nullptr;
 }
@@ -176,6 +185,32 @@ TEST(CheckedWritesAutoIncCleaner, OnlyTheLatestReservationSurvives) {
             (void)clean(log, Pass{.coalesce = coalesce});
             (void)clean(log, Pass{.nowMs = 1'000'000 + 2000, .coalesce = coalesce});   // past the delete horizon
             EXPECT_EQ(reservations(log), (std::map<int64_t, uint64_t>{{40, 12288}}));
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 1: a type-16 record whose payload is no reservation (the leader's scan skips it) never outranks the latest one.  RED:
+// the pre-pass counted it as the highest reservation, so the real latest went past its horizon and a restart reused its ids.
+TEST(CheckedWritesAutoIncCleanerRegression, MalformedReservationDoesNotOutrankTheLatestRegression) {
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            reservation(log, 0, 4096);
+            rec(log, 1, 7, 0, 1, "v");
+            std::vector<uint8_t> junk(cr::detail::batchBytes(1));
+            std::size_t pos = cr::detail::beginBatch(junk.data(), cr::kReservation, 1);
+            junk[pos++] = cr::kPayloadVersion;   // no reserved-through field
+            cr::detail::sealBatch(junk.data(), pos);
+            stampBase(junk, 2);
+            log.append(junk, 2);
+            pad(log, 3);
+            (void)clean(log, Pass{.coalesce = coalesce});
+            (void)clean(log, Pass{.nowMs = 1'000'000 + 2000, .coalesce = coalesce});   // past the delete horizon
+            EXPECT_EQ(reservations(log), (std::map<int64_t, uint64_t>{{0, 4096}}));
         }
         std::filesystem::remove_all(dir);
     }
@@ -317,4 +352,150 @@ TEST(CheckedWritesAutoIncCleanerRegression, DepthOneTakesTodaysPathRegression) {
     EXPECT_EQ(cleaner.producerBatchWindowForTest()->depth(), 32);
     cleaner.setProducerTailDepth(1);
     EXPECT_EQ(cleaner.producerBatchWindowForTest(), nullptr);
+}
+
+// Fix round 1 (finding 1): the passes start from the watermark the previous pass returned, as LogCleanerAgent's do.  RED: the pass
+// that pinned the tombstone advanced the watermark past the protected insert; once 32 later batches released it, the next map no
+// longer held key 5, so the insert stayed (a key absent from the map is kept) while its expired tombstone went - id 5 came back.
+TEST(CheckedWritesAutoIncCleanerRegression, IncrementalPassesNeverResurrectADeletedIdRegression) {
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            protectedInsertThenTombstone(log);
+            int64_t dirty = 0;
+            const auto noInsertWithoutItsTombstone = [&](const char* when) {
+                const auto offs = dataOffsets(log);
+                EXPECT_TRUE(!offs.count(0) || offs.count(1)) << when << ": the insert of id 5 is live without its tombstone";
+            };
+            (void)clean(log, Pass{.retentionMs = 0, .coalesce = coalesce, .dirty = &dirty});
+            noInsertWithoutItsTombstone("the pass that stamps the horizon");
+            (void)clean(log, Pass{.nowMs = 1'000'001, .retentionMs = 0, .coalesce = coalesce, .dirty = &dirty});
+            noInsertWithoutItsTombstone("a pass past the horizon, the insert protected");
+            for (int i = 0; i < 32; ++i) rec(log, 3 + i, 7, 1 + i, 100 + uint64_t(i), "later");
+            pad(log, 35);
+            for (int i = 0; i < 3; ++i) {
+                (void)clean(log, Pass{.nowMs = 1'000'002 + i, .retentionMs = 0, .coalesce = coalesce, .dirty = &dirty});
+                noInsertWithoutItsTombstone("a pass after 32 later batches");
+            }
+            const auto offs = dataOffsets(log);
+            EXPECT_FALSE(offs.count(0)) << "the released insert is superseded";
+            EXPECT_FALSE(offs.count(1)) << "and its tombstone expires with it";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 1 (finding 1): once the window moves on, the inserts it kept are compacted like any other.  RED: the first pass moved
+// the watermark past them, so no later map held their keys and they were never dropped.
+TEST(CheckedWritesAutoIncCleanerRegression, IncrementalPassesCompactWhatTheWindowReleasedRegression) {
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            insertsThenUpdates(log);
+            int64_t dirty = 0;
+            (void)clean(log, Pass{.coalesce = coalesce, .dirty = &dirty});
+            for (int64_t o = 8; o < 40; ++o) ASSERT_TRUE(dataOffsets(log).count(o)) << "protected insert at " << o;
+            for (int i = 0; i < 32; ++i) rec(log, 81 + i, 7, 40 + i, 1001 + uint64_t(i), "later");
+            for (int i = 0; i < 32; ++i) rec(log, 113 + i, 8, 40 + i, 2001 + uint64_t(i), "later");
+            pad(log, 145);
+            (void)clean(log, Pass{.coalesce = coalesce, .dirty = &dirty});
+            std::map<std::string, int> perKey;
+            for (const auto& [base, b] : batches(log)) {
+                rune::protocol::RecordBatchReader r(b.data(), b.size());
+                if ((r.attributes() & rune::protocol::batch::kAttrControl) == 0)
+                    r.forEachRecord([&](std::string_view k, std::string_view, int64_t, int64_t) { ++perKey[std::string(k)]; });
+            }
+            for (uint64_t id = 1; id <= 40; ++id) EXPECT_EQ(perKey[idKey(id)], 1) << "id " << id << " converged to its update";
+            const auto offs = dataOffsets(log);
+            for (int64_t o = 40; o < 80; ++o) EXPECT_TRUE(offs.count(o)) << "update at " << o;
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 1 (finding 2): the map fills inside a protected batch, so the pass boundary splits it.  RED: the batch was protected
+// only when it ended below the boundary, so the record rules ran on it and dropped its superseded first record.
+TEST(CheckedWritesAutoIncCleanerRegression, ProtectedBatchSplitByAFullMapIsKeptWholeRegression) {
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            pad(log, 0);
+            recs(log, 1, 7, 0, {1, 1, 2, 3}, "v");   // offsets 1-4; a three-key map fills at key 3 (offset 4)
+            pad(log, 5);
+            const auto before = batches(log);
+            ASSERT_TRUE(before.count(1));
+            (void)clean(log, Pass{.coalesce = coalesce, .mapSlots = 3});
+            const auto after = batches(log);
+            EXPECT_TRUE(after.count(1) && after.at(1) == before.at(1)) << "the protected batch is kept byte for byte";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 1 (finding 4): past its budget the window records no more producers, and every batch is then protected whatever its own
+// timestamp.  RED: an unrecorded producer's batch expired on its own maxTimestamp although the producer's last batch was recent.
+TEST(CheckedWritesAutoIncCleanerRegression, OverflowedWindowProtectsAnUnrecordedProducerRegression) {
+    using rune::storage::ProducerBatchWindow;
+    const int64_t exp = rune::storage::ProducerTails::kDefaultExpirationMs;
+    const int64_t now = 10'000 + exp;
+    ProducerBatchWindow w(32);
+    w.setBudget(ProducerBatchWindow::kBytesPerProducer + 64);   // producer 7 and its batch fit, producer 8 does not
+    w.noteBatch(7, 0, 0, now, 0, 0);
+    w.noteBatch(8, 1, 1, 2000, 1, 0);   // this batch alone has expired
+    w.noteBatch(8, 2, 2, now, 2, 0);
+    w.finish(now, exp, [](int64_t, std::size_t, std::vector<uint64_t>& keys) { keys.push_back(1); return true; });
+    ASSERT_TRUE(w.overflowed());
+    EXPECT_TRUE(w.protects(1)) << "the unrecorded producer's superseded insert is kept";
+    EXPECT_TRUE(w.pinsTombstone(idKey(5))) << "and its key's tombstone is pinned";
+    EXPECT_EQ(w.lowestProtectedBase(), std::numeric_limits<int64_t>::min()) << "and the watermark is held";
+}
+
+// Fix round 1 (finding 3): the window costs its budget at most - rings grow per batch, an expired producer is dropped at finish(),
+// and each kept key is held once.  RED (before): every new producer allocated all 32 ring slots, its batches' keys were copied
+// twice, and expired producers stayed.
+TEST(CheckedWritesAutoIncCleanerRegression, WindowStaysWithinItsBudgetRegression) {
+    using rune::storage::ProducerBatchWindow;
+    const int64_t exp = rune::storage::ProducerTails::kDefaultExpirationMs;
+    const int64_t now = 10'000 + exp;
+    const auto keysOf = [](int64_t, std::size_t pos, std::vector<uint64_t>& keys) {
+        keys.push_back(pos);
+        keys.push_back(pos);   // a key twice in one batch
+        return true;
+    };
+    {
+        ProducerBatchWindow w(32);
+        w.noteBatch(7, 0, 0, now, 0, 0);
+        const std::size_t one = w.bytes();
+        w.noteBatch(7, 1, 1, now, 1, 1);
+        EXPECT_EQ(w.bytes() - one, one - ProducerBatchWindow::kBytesPerProducer) << "a batch costs one slot: the ring grows lazily";
+        w.noteBatch(9, 2, 2, 2000, 2, 2);   // producer 9 has expired
+        w.finish(now, exp, keysOf);
+        EXPECT_TRUE(w.protects(0) && w.protects(1));
+        EXPECT_FALSE(w.protects(2)) << "the expired producer is dropped";
+        EXPECT_TRUE(w.pinsTombstone(idKey(0)));
+        EXPECT_FALSE(w.pinsTombstone(idKey(2)));
+        EXPECT_EQ(w.bytes(), 2 * (one - ProducerBatchWindow::kBytesPerProducer) + 2 * sizeof(uint64_t))
+            << "two batches and two keys, each key held once; no producer is kept past finish()";
+    }
+    {
+        const std::size_t budget = 64 * 1024;
+        ProducerBatchWindow w(32);
+        w.setBudget(budget);
+        int64_t off = 0;
+        for (int64_t pid = 0; pid < 4096 && !w.overflowed(); ++pid)
+            for (int i = 0; i < 32; ++i, ++off) w.noteBatch(pid, off, off, now, off, 0);
+        EXPECT_TRUE(w.overflowed()) << "4096 producers of 32 batches do not fit 64 KiB";
+        EXPECT_LE(w.bytes(), budget);
+        w.finish(now, exp, keysOf);
+        EXPECT_TRUE(w.protects(off - 1)) << "overflowed: conservative";
+    }
 }

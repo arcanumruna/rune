@@ -773,9 +773,10 @@ public:
 
     // ---- compaction ----
     struct Compacted { int64_t bound = 0; int64_t passEnd = 0; int installed = 0; std::size_t groups = 0; };
-    /// Seals the active segment (a reservation record rolls it), then one cleaner pass over [0, firstUncleanable) with the replica's
-    /// published bounds - what LogCleanerAgent does for one log - and the owner's swap drain (`drain` false leaves the outputs queued,
-    /// see drainSwaps).  `nowMs` is the cleaner's clock (delete horizons).  Needs a small `rollBytes`.
+    /// Seals the active segment (a reservation record rolls it), then one cleaner pass over [lastCleanOffset, firstUncleanable) with
+    /// the replica's published bounds, advancing lastCleanOffset to its passEnd - what LogCleanerAgent does for one log - and the
+    /// owner's swap drain (`drain` false leaves the outputs queued, see drainSwaps).  `nowMs` is the cleaner's clock (delete
+    /// horizons).  Needs a small `rollBytes`.
     Compacted compact(int64_t nowMs = 1'000'000, bool seal = true, bool drain = true) {
         namespace crl = rune::storage::control_record;
         if (seal) {
@@ -796,6 +797,8 @@ public:
         }
         Compacted out;
         for (int i = 0; i < 16 && (log->runCleanerFileOps(nowMs, replica->fileDeleteDelayMs()), log->cleanerFileOpsPending()); ++i) passes(1);   // the posted renames of the last install
+        replica->applyCleanerRewind();
+        const int64_t dirtyStart = replica->lastCleanOffset();
         out.bound = replica->cleanerVerdictBound();
         const int64_t markerEnd = replica->cleanerVerdictMarkerEnd();
         const auto snap = log->cleanerSnapshot();
@@ -814,7 +817,7 @@ public:
         cleaner.setProducerTailDepth(autoInc_ ? rune::storage::kRetryWindowSize : 1);   // what BrokerNode configures the partition with
         cleaner.setDeferredInstall(&cleanedSeq_);
         rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::sizingForBudget(1 << 22));
-        auto res = cleaner.produceCleanedRangeBounded(log->dir(), bases, sizes, uncleanable, 0, nowMs * 1'000'000, 1000, map, false, 1 << 20, nullptr, nowMs);
+        auto res = cleaner.produceCleanedRangeBounded(log->dir(), bases, sizes, uncleanable, dirtyStart, nowMs * 1'000'000, 1000, map, false, 1 << 20, nullptr, nowMs);
         out.passEnd = res.passEnd;
         out.groups = res.groups.size();
         for (const auto& g : res.groups) {
@@ -833,6 +836,8 @@ public:
             EXPECT_TRUE(queued);
             if (queued) (void)prebuilt.release();   // the owner owns it now
         }
+        if (res.passEnd > dirtyStart && !cleaner.uncleanable()) replica->setLastCleanOffset(res.passEnd);
+        replica->applyCleanerRewind();
         if (drain) out.installed += drainSwaps();
         return out;
     }

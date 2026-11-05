@@ -1985,3 +1985,30 @@ TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesIntentsRegression) {
     KiWriter plain(c, "ki", rc::Acks::All);
     EXPECT_TRUE(plain.topic.upsertAndWait(acct(1)).ok());
 }
+
+#include <rune/storage/ProducerStateManager.h>
+
+// Part 06 Task 10 (fix round 1): a restarted broker builds its autoincrement topic's replicas from the catalog with the whole
+// producer retry window, the depth the cleaner keeps (a runtime create is CatalogEffectsTest's).
+TEST(CheckedWritesBrokerRegression, AutoIncTopicKeepsTheRetryWindowDepthAcrossARestartRegression) {
+    OneBroker b("cw-ai-depth", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    rc::TopicOptions to;
+    to.config.cleanupPolicy = 1;   // compact
+    to.keyFeatures.autoIncrement = true;
+    const auto t = c.defineTopicAndWait("ai", 1, "id", rune::codec::serialize(kiAccountDescriptor()), rc::Persistence::Disk, to, {}, 60s);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const auto depth = [&] {
+        return b.node().onOwnerThreadForTest(t.topicId, 0, [](rune::replication::PartitionReplica& r) { return r.producerTailDepth(); });
+    };
+    EXPECT_EQ(depth(), rune::storage::kRetryWindowSize);
+    b.restart();
+    int got = 0;
+    for (int i = 0; i < 400 && got != rune::storage::kRetryWindowSize; ++i) {
+        try { got = depth(); } catch (const std::runtime_error&) {}   // the replica is rebuilt after the boot
+        if (got != rune::storage::kRetryWindowSize) std::this_thread::sleep_for(25ms);
+    }
+    EXPECT_EQ(got, rune::storage::kRetryWindowSize) << "the boot path keeps the retry window";
+}

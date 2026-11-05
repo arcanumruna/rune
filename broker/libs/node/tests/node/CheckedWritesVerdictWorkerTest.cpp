@@ -842,6 +842,7 @@ TEST(CheckedWritesVerdictCleanerRegression, RemovedMarkerNeverStallsCoverageRegr
     int64_t rejectedOffset = -1;
     for (const auto& d : r.readLog().data) if (d.id == 4) rejectedOffset = d.offset;
     (void)r.compact(1'000'000);   // the first marker's records are gone: it is stamped
+    r.replica->setLastCleanOffset(0);   // nothing new is dirty: the drop needs a pass from the log start (a leader without a checkpoint)
     (void)r.compact(1'005'000);   // past the delete horizon: dropped
     const auto log = r.readLog();
     ASSERT_EQ(log.markers.size(), 1u) << "the first marker was removed";

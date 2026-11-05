@@ -88,7 +88,8 @@ public:
     [[nodiscard]] int64_t producerIdExpirationMs() const noexcept { return producerIdExpirationMs_; }
     /// Part 06 (P6-9): producer-state batches the partition keeps per producer (PartitionReplica::producerTailDepth).  Above 1
     /// (an autoincrement topic) a live producer's last `depth` batches are kept whole and their keys' tombstones pinned
-    /// (ProducerBatchWindow.h); 1 builds no window and cleans as ProducerTails alone dictates.
+    /// (ProducerBatchWindow.h), and produceCleanedRangeBounded's passEnd stops at the oldest protected batch; 1 builds no window
+    /// and cleans as ProducerTails alone dictates.
     void setProducerTailDepth(int depth) {
         if (depth <= 1) window_.reset();
         else if (!window_ || window_->depth() != depth) window_.emplace(depth);
@@ -445,6 +446,7 @@ private:
                            std::optional<int64_t> afterGroupBase = std::nullopt);
     int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
     std::optional<ProducerBatchWindow> window_{};   ///< depth > 1 only
+    int64_t windowNowMs_ = -1;                       ///< the window's expiry clock: the last produceCleanedRangeBounded's nowMs
     int64_t prefixBytesRead_        = 0;
     Offset  markerRemovalBound_     = 0;
     Offset  verdictBound_           = std::numeric_limits<Offset>::max();

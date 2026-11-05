@@ -823,22 +823,28 @@ TEST(CheckedWritesAutoIncRegression, RingScanRestartBeginsTheFeedAgainRegression
 }
 
 // Task 10 (Review Focus 3): the highest id, removed and compacted away with its tombstone, is never assigned again (the cleaner
-// kept the latest reservation) and never comes back (its insert went with the tombstone).
+// kept the latest reservation) and never comes back (its insert went with the tombstone).  Fix round 1: the rig cleans from
+// lastCleanOffset as the agent does, and the first passes run while id 50's batch and the remove are still protected.  RED (before
+// the watermark stopped at the oldest protected batch): those passes moved the watermark past both, the later maps never held key
+// 50, so its insert stayed while the tombstone expired - id 50 came back.
 TEST(CheckedWritesAutoIncCleanerRegression, HighestIdDeletedAndCompactedIsNeverReusedNorResurrectedRegression) {
     AutoInc g({}, false, /*rollBytes=*/1);
     VerdictRig& r = g.r;
     Producer a{r, 42};
     ASSERT_EQ(a.createIds(50).back(), 50u);
-    for (uint64_t id = 1; id <= 40; ++id) ASSERT_TRUE(a.sendAck({upd(id)}));   // id 50's batch leaves A's last 32
     const auto rm = a.sendAck({rmEx(50)});
     ASSERT_TRUE(rm && rm->code == 0);
-    for (uint64_t id = 1; id <= 32; ++id) ASSERT_TRUE(a.sendAck({upd(id)}));   // and so does the remove's own batch
     ASSERT_TRUE(r.driveUntilJudged());
     const auto has50 = [&] {
         for (const auto& d : r.readLog().data) if (d.id == 50) return true;
         return false;
     };
-    for (int i = 0; i < 6 && has50(); ++i) (void)r.compact(1'000'000 + i * 5'000);
+    (void)r.compact();
+    (void)r.compact(1'005'000);   // past the delete horizon
+    ASSERT_TRUE(has50()) << "both batches are in A's last 32: kept whole, the tombstone pinned";
+    for (uint64_t id = 1; id <= 40; ++id) ASSERT_TRUE(a.sendAck({upd(id)}));   // both leave A's last 32
+    ASSERT_TRUE(r.driveUntilJudged());
+    for (int i = 0; i < 6 && has50(); ++i) (void)r.compact(1'010'000 + i * 5'000);
     ASSERT_FALSE(has50()) << "neither id 50's insert nor its tombstone is in the log";
     EXPECT_FALSE(r.reservations().empty()) << "the latest reservation is kept";
     r.restart(/*reinstall=*/false);
