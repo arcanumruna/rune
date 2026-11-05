@@ -207,6 +207,8 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     }
     aeron_driver_context_set_dir_delete_on_start(ctx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(ctx_, cfg_.deleteDirOnShutdown);
+    if (cfg_.countersValuesBytes > 0)
+        aeron_driver_context_set_counters_buffer_length(ctx_, static_cast<size_t>(cfg_.countersValuesBytes));
     aeron_driver_context_set_term_buffer_sparse_file(ctx_, cfg_.termBufferSparse.value_or(true));
     if (cfg_.udpGso) {
         gso_ = rune_gso_bindings_create(1, 1);   // NULL when the kernel/platform has neither -> stock Aeron

@@ -949,6 +949,7 @@ private:
         // reading its acks) hit it at the same depth whatever the host derives.
         c.rcvWindowBytes = rcvWindowBytes;
         if (rcvWindowBytes < 64 * 1024) c.mtuBytes = 1408;
+        c.countersValuesBytes = kTestClientCountersBytes;   // a client's few counters: a small CnC (#883)
         return c;
     }
     template <class M>
