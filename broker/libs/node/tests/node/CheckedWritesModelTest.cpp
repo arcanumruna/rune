@@ -711,6 +711,7 @@ public:
     }
 
     std::string trace;
+    std::size_t markersRemoved = 0, tombstonesRemoved = 0;   ///< by the compactions: the 8.5 marker drop and the tombstone horizon ran
 
     AiAction pick() {
         const unsigned r = static_cast<unsigned>(rng_() % 100);
@@ -1079,8 +1080,14 @@ private:
             compact_ = false;
             compacted_ = true;
             const auto reservedBefore = rig_.reservations();
-            checkCompaction(rig_, model, log);
+            checkCompaction(rig_, model, log, 1'000'000 + 2'000 * ++compactions_);   // past the last pass's horizon (retention 1 s)
             const auto reservedAfter = rig_.reservations();
+            const auto after = rig_.readLog();
+            std::set<int64_t> kept;
+            for (const auto& d : after.data) kept.insert(d.offset);
+            for (const auto& m : after.markers) kept.insert(m.offset);
+            for (const auto& m : log.markers) markersRemoved += kept.count(m.offset) == 0 ? 1 : 0;
+            for (const auto& d : log.data) tombstonesRemoved += d.del && kept.count(d.offset) == 0 ? 1 : 0;
             if (!reservedBefore.empty()) {
                 ASSERT_FALSE(reservedAfter.empty()) << "the compaction removed every reservation";
                 EXPECT_EQ(reservedAfter.back().second, reservedBefore.back().second) << "the latest reservation is kept";
@@ -1106,15 +1113,18 @@ private:
     int32_t rejTopic_ = 0, rejSeq_ = 0;
     int64_t vSeq_ = 0, txns_ = 0;
     bool compact_ = false, compacted_ = false, setChanged_ = false;
+    int64_t compactions_ = 0;
 };
 
-std::string runAiSeed(uint64_t seed) {
+std::string runAiSeed(uint64_t seed, std::size_t* markersRemoved = nullptr, std::size_t* tombstonesRemoved = nullptr) {
     AiRun run(seed);
     for (int step = 0; step < kAiSteps && !::testing::Test::HasFatalFailure(); ++step) {
         const AiAction action = run.pick();
         SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step) + " action=" + nameOf(action) + " trace=" + run.trace);
         run.step(action);
     }
+    if (markersRemoved != nullptr) *markersRemoved = run.markersRemoved;
+    if (tombstonesRemoved != nullptr) *tombstonesRemoved = run.tombstonesRemoved;
     return run.trace;
 }
 }  // namespace
@@ -1122,8 +1132,11 @@ std::string runAiSeed(uint64_t seed) {
 class CheckedWritesAutoIncModelRegression : public ::testing::TestWithParam<uint64_t> {};
 
 TEST_P(CheckedWritesAutoIncModelRegression, SeededRigMatchesTheModel) {
-    const std::string trace = runAiSeed(GetParam());
+    std::size_t markers = 0, tombstones = 0;
+    const std::string trace = runAiSeed(GetParam(), &markers, &tombstones);
     EXPECT_FALSE(trace.empty());
+    EXPECT_GT(markers, 0u) << "no compaction removed a marker (8.5)";
+    EXPECT_GT(tombstones, 0u) << "no compaction removed a tombstone";
 }
 
 // The history is a function of the seed: seeds 1-8 run twice make the same choices, the same ids and the same verdicts.

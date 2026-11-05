@@ -70,8 +70,9 @@ TEST_P(CheckedWritesStressRegression, KeyIndexSeededClusterHoldsTheInvariants) {
 TEST_P(CheckedWritesStressRegression, AutoIncSeededClusterHoldsTheInvariants) {
     const int seed = GetParam();
     if (seed > 8) GTEST_SKIP() << "the autoincrement run covers seeds 1-8";
-    // The cleaner keeps a live producer's last 32 batches whole (spec 6.6), and no writer here reaches 32: only producers that expired at
-    // rest leave anything to compact.
+    // The cleaner keeps a live producer's last 32 batches whole (spec 6.6), and no writer here reaches 32: only expired producers leave
+    // anything to compact.  Writers are rebuilt after every fault, so old pids expire and are compacted mid-run, the last ones at rest.
+    // Only the cleaner reads this expiry; the producer state still dedupes those pids.
     ThreeNodes cluster = ThreeNodes::startWith("cw06_" + std::to_string(seed), [](rune::node::NodeConfig& cfg) {
         cfg.verdictIntervalMs = 20;
         cfg.producerIdExpirationMs = 3'000;
@@ -88,6 +89,7 @@ TEST_P(CheckedWritesStressRegression, AutoIncSeededClusterHoldsTheInvariants) {
     ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
     std::string failed;
     EXPECT_TRUE(d.checkAll(&failed)) << failed;
+    EXPECT_EQ(d.autoIncWorkShortfall(), "") << "seed " << seed;
     std::printf("seed %d: %s\n", seed, d.autoIncTally().c_str());
 }
 

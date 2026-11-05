@@ -140,6 +140,10 @@ inline void checkMarkers(const CheckedWritesModel& model, const VerdictRig::RigL
         const auto it = model.verdicts().find(off);
         EXPECT_TRUE(it != model.verdicts().end() && it->second == verdict) << "(b) marker entry " << off << " is not the model's verdict";
     }
+    // 8.5: a marker goes only once every record it lists is gone, so a rejected record the log still holds is listed by a survivor.
+    for (const auto& d : log.data)
+        if (d.offset < reach && model.verdicts().count(d.offset) != 0)
+            EXPECT_TRUE(union_.count(d.offset) != 0) << "(b) rejected offset " << d.offset << " is in the log but no marker lists it";
 }
 
 /// (c)(d) The projection and the count views hold the model's live keys.
@@ -186,8 +190,9 @@ inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64
 }
 
 /// (e)(g) One cleaner pass keeps everything at or above the verdict bound and every key's latest accepted record.
-inline void checkCompaction(VerdictRig& r, const CheckedWritesModel& model, const VerdictRig::RigLog& before) {
-    const auto cp = r.compact();
+/// `nowMs`: the cleaner's clock; a later one than the last pass's horizon removes what that pass stamped.
+inline void checkCompaction(VerdictRig& r, const CheckedWritesModel& model, const VerdictRig::RigLog& before, int64_t nowMs = 1'000'000) {
+    const auto cp = r.compact(nowMs);
     const auto after = r.readLog();
     std::set<int64_t> kept;
     for (const auto& d : after.data) kept.insert(d.offset);

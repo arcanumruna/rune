@@ -8,8 +8,9 @@
 // key.index on, no TestReject members; three typed clients send insert / update / removeExisting / remove on 64 ids, one write at a
 // time, and IntentVerdictsExact and KeyIndexEqualsLiveKeys join the invariants above, which then run on both partitions.
 // Autoincrement mode (plan 06): the source is the compacted `ai` topic {id uint64 key autoincrement, n int64} with two partitions and
-// delete retention 0; three typed clients create (key 0), update and removeExisting, one write at a time, a fourth imports ids below and above
-// the counter, and NoIdTwiceNoReuse joins the invariants (the view and KeyIndexEqualsLiveKeys do not run: the ids grow without a bound).
+// delete retention 0; three typed clients create (key 0), update, removeExisting and import (a live id, which must be refused, or an id
+// above every one seen), one write at a time, and NoIdTwiceNoReuse joins the invariants (the view and KeyIndexEqualsLiveKeys do not run:
+// the ids grow without a bound).
 #include "CheckedWritesChecks.h"
 #include "CheckedWritesModel.h"
 #include "client/ClusterClient.h"
@@ -149,6 +150,18 @@ public:
             else ++removes;
         }
         return std::to_string(creates) + " creates, " + std::to_string(updates) + " updates, " + std::to_string(removes) + " removes and " + std::to_string(imports) + " imports acked, " + std::to_string(keyExists_) + " KeyExists and " + std::to_string(keyNotFound_) + " KeyNotFound answered, " + std::to_string(sent_.size()) + " writes";
+    }
+    /// Autoincrement mode: the run created ids, and (when it stopped a node) created some on both sides of one stop.  "" = it did.
+    [[nodiscard]] std::string autoIncWorkShortfall() const {
+        const auto createdIn = [this](std::size_t from, std::size_t to) {
+            return std::any_of(sent_.begin() + static_cast<std::ptrdiff_t>(from), sent_.begin() + static_cast<std::ptrdiff_t>(to),
+                               [](const Sent& s) { return s.keyZero && s.result == Sent::Result::Ok; });
+        };
+        if (!createdIn(0, sent_.size())) return "no create was acked";
+        if (faultsAt_.empty()) return {};
+        for (const std::size_t f : faultsAt_)
+            if (createdIn(0, f) && createdIn(f, sent_.size())) return {};
+        return "no node stop has acked creates on both sides";
     }
     [[nodiscard]] std::string keyIndexTally() const { return std::to_string(pinned56_) + " KeyExists and " + std::to_string(pinned57_) + " KeyNotFound pinned to their record, " + std::to_string(provenCompacted_) + " rejections proven compacted away, " + std::to_string(sent_.size()) + " writes"; }
 
@@ -492,6 +505,7 @@ private:
     }
     /// A node's counters die with it: the ones that must stay zero are read just before it goes.
     void checkCounters_(int id) {
+        faultsAt_.push_back(sent_.size());
         if (!keyIndex_) return;
         for (int p = 0; p < parts_; ++p) {
             const NodeSnap s = snapNode_(id, p);
@@ -733,7 +747,9 @@ private:
             s.leo = r.logEndOffset();
             s.hw = r.highWatermark();
             s.logStart = r.log()->logStartOffset();
-            s.cleanedThrough = r.lastCleanOffset(); s.verdictBound = r.cleanerVerdictBound(); s.lso = r.cleanerLastStableOffset();
+            s.cleanedThrough = r.lastCleanOffset();
+            s.verdictBound = r.cleanerVerdictBound();
+            s.lso = r.cleanerLastStableOffset();
             s.leader = r.role() == rune::replication::Role::Leader;
             s.log = readLogOf(*r.log(), s.hw);
             return 0;
@@ -823,11 +839,17 @@ private:
         for (const int id : c_.runningNodes())
             for (int p = 0; p < parts_; ++p) {
                 VerdictRig::RigLog log;
-                c_.node(id).onOwnerThreadForTest(topicId_, p, [&log](rune::replication::PartitionReplica& r) {
+                bool leader = false;
+                c_.node(id).onOwnerThreadForTest(topicId_, p, [&log, &leader](rune::replication::PartitionReplica& r) {
                     log = readLogOf(*r.log(), r.highWatermark());
+                    leader = r.role() == rune::replication::Role::Leader;
                     return 0;
                 });
                 record(p, log);
+                if (autoInc_ && leader) {   // NoIdTwiceNoReuse part 3 holds for every leader the run meets, not only the last
+                    const auto counter = c_.node(id).onWorkerThreadForTest(worker_(id, p), [this, p](Worker& wk) { return wk.autoIncStateForTest(topicId_, p); });
+                    if (counter) leadCounters_.push_back({id, p, *counter, sent_.size()});
+                }
             }
     }
     VerdictRig::RigLog history_(int part) const {
@@ -1008,6 +1030,12 @@ private:
                 for (const auto& rec : d.models_[static_cast<std::size_t>(p)].acceptedRecords()) if (present.count(rec.offset) != 0) want[static_cast<std::size_t>(p)].insert(rec.offset);
             }
             const auto [raw, group] = d.delivered_(want);
+            for (int p = 0; p < d.parts_; ++p) {   // the cleaner keeps running: a record it removed before the subscription read it is not due
+                const NodeSnap now = d.snapNode_(d.leaderOf_(d.snaps_, p)->id, p);
+                std::set<int64_t> still;
+                for (const auto& rec : now.log.data) still.insert(rec.offset);
+                std::erase_if(want[static_cast<std::size_t>(p)], [&](int64_t off) { return still.count(off) == 0; });
+            }
             for (int p = 0; p < d.parts_; ++p) {
                 const std::size_t i = static_cast<std::size_t>(p);
                 std::set<int64_t> rejected;
@@ -1198,15 +1226,31 @@ private:
             std::set<uint64_t> removed;
             std::array<uint64_t, kAiParts> highest{};
             std::array<std::vector<CheckedWritesModel::AutoIncAck>, kAiParts> acks;
-            for (const Sent& s : d.sent_) {
+            std::map<int64_t, std::size_t> partOfValue;   // a write's value is unique: it finds the partition a create went to
+            for (int p = 0; p < kAiParts; ++p)
+                for (const auto& [off, rec] : d.data_[static_cast<std::size_t>(p)]) if (!rec.del) partOfValue.emplace(rec.v, static_cast<std::size_t>(p));
+            for (std::size_t n = 0; n < d.sent_.size(); ++n) {
+                const Sent& s = d.sent_[n];
                 if (s.result != Sent::Result::Ok) continue;
                 if (s.op == Op::RemoveExisting) removed.insert(s.id);
                 if (s.op != Op::Insert) continue;
                 if (++acked[s.id] > 1) { *why = "id " + std::to_string(s.id) + " is in two Ok results"; return false; }
                 if (removed.count(s.id) != 0) { *why = "id " + std::to_string(s.id) + " was acked again after it was removed"; return false; }
-                const std::size_t part = s.id % kAiParts;
+                const auto found = s.keyZero ? partOfValue.find(s.v) : partOfValue.end();
+                const std::size_t part = found != partOfValue.end() ? found->second : s.id % kAiParts;
                 highest[part] = std::max(highest[part], s.id);
-                if (s.keyZero && d.data_[part].count(s.offset) != 0) acks[part].push_back({s.offset, s.id, 1});
+                for (const LeadCounter& lc : d.leadCounters_) {
+                    if (lc.part != static_cast<int>(part) || lc.sentBefore <= n) continue;
+                    const uint64_t next = autoIncId(lc.counter.nextN, kAiParts, lc.part);
+                    if (next <= s.id) { *why = "node " + std::to_string(lc.id) + " partition " + std::to_string(lc.part) + " led with a counter that hands out " + std::to_string(next) + ", not above the acked " + std::to_string(s.id); return false; }
+                }
+                if (!s.keyZero) continue;
+                if (found != partOfValue.end()) {
+                    acks[part].push_back({s.offset, s.id, 1});
+                    continue;
+                }
+                // Never read as a data record: legal only if the cleaner removed it before any read, so no read showed anything at its offset.
+                if (d.seen_[part].count(s.offset) != 0 || d.reservations_[part].count(s.offset) != 0) { *why = "the create of id " + std::to_string(s.id) + " was acked at offset " + std::to_string(s.offset) + " of partition " + std::to_string(part) + ", which holds no record of it"; return false; }
             }
             if (d.indefiniteCreates_ != 0) { *why = std::to_string(d.indefiniteCreates_) + " creates were answered StoredIdUnknown or VerdictUnknown"; return false; }
             for (const NodeSnap& s : d.snaps_) {
@@ -1263,6 +1307,9 @@ private:
     std::vector<std::map<int64_t, VerdictRig::RigLogRec>> data_;   ///< per partition
     std::vector<std::map<int64_t, VerdictRig::RigChange>> changes_;
     std::vector<std::map<int64_t, uint64_t>> reservations_;        ///< per partition: (offset, reserved-through n) of every reservation record any replica showed
+    struct LeadCounter { int id, part; AutoIncReady counter; std::size_t sentBefore; };
+    std::vector<std::size_t> faultsAt_;                            ///< sent_.size() when a node was stopped or crashed
+    std::vector<LeadCounter> leadCounters_;                        ///< autoincrement mode: a leader's counter, read after sent_[0, sentBefore)
     std::vector<NodeSnap> snaps_;
     std::vector<CheckedWritesModel> models_;
     std::vector<std::pair<std::string, Invariant>> invariants_;
