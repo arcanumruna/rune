@@ -19,10 +19,20 @@
 //   refusals   key.index on a transient topic, an untyped topic, a keyless topic and a string(9) key: InvalidRequest with
 //              the exact detail of each.  Prints CHECKED-WRITES-REFUSALS: OK.
 //
+// The autoincrement legs (Part 06) use ai_user {userId key, provider, subject, createdAt} and write `<id> <op> <code>` where id is
+// the id the write was answered with (a key-0 create) or sent (an import); the user comes from RUNE_USER.
+//   ai-setup     defines ai_user (1 partition, rf 3, compact, autoincrement); prints AI_TOPIC_ID and CHECKED-WRITES-AI-SETUP: OK.
+//   ai-backfill  --ids <a>-<b> [--step <s>] [--tag <t>]: import every s-th explicit id of the range (tag defaults to ai-backfill).
+//   ai-create    --worker <i> --count <n> [--tag <t>]: n key-0 creates; writes <tag>-progress-w<i> (tag defaults to ai-create).
+//   ai-remove    --ids <id>-<id>: removeExisting of that id.
+//   ai-verify    a subscription from 0 holds exactly the ids of the ai-backfill and ai-create result files, one insert each.
+//   ai-refusals  autoincrement on a cleanup.policy = delete topic: InvalidRequest with the exact detail.
+//
 // Environment: RUNE_TARGET, RUNE_EGRESS_HOST + RUNE_EGRESS_PORT, RUNE_DATA_DIR, RUNE_USER / RUNE_PASSWORD_FILE /
 // RUNE_TLS_CA_FILE, RUNE_TIMEOUT_MS, KI_E2E_SHARED (a writable directory shared between legs), KI_E2E_THREADS.
 
 #include "ExampleAuth.h"
+#include "ai_user.gen.h"
 #include "ki_account.gen.h"
 
 #include <rune/client/Client.h>
@@ -57,10 +67,13 @@ using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
 using Account = rune::gen::KiAccount;
 using Typed   = TypedTopic<Account, ProducerRef>;
+using AiUser  = rune::gen::AiUser;
+using AiTyped = TypedTopic<AiUser, ProducerRef>;
 
 namespace {
 
 constexpr const char* kTopicName = "ki_account";
+constexpr const char* kAiTopicName = "ai_user";
 constexpr uint32_t    kParts     = 4;
 constexpr uint16_t    kInvalidRequest = 39;
 constexpr uint64_t    kAbsentBase = 1'000'000;   // ids no leg ever inserts
@@ -200,7 +213,8 @@ int runSetup() {
 struct Args {
     int      worker = 0;
     uint64_t lo = 1, hi = 0;
-    std::string tag = "race";
+    uint64_t step = 1, count = 0;
+    std::string tag;
 };
 bool parseArgs(int argc, char** argv, Args& a) {
     for (int i = 2; i < argc; ++i) {
@@ -209,6 +223,8 @@ bool parseArgs(int argc, char** argv, Args& a) {
         const std::string v = argv[++i];
         if (k == "--worker") a.worker = std::atoi(v.c_str());
         else if (k == "--tag") a.tag = v;
+        else if (k == "--step") a.step = std::strtoull(v.c_str(), nullptr, 10);
+        else if (k == "--count") a.count = std::strtoull(v.c_str(), nullptr, 10);
         else if (k == "--ids") {
             const auto dash = v.find('-');
             if (dash == std::string::npos) return false;
@@ -216,10 +232,11 @@ bool parseArgs(int argc, char** argv, Args& a) {
             a.hi = std::strtoull(v.c_str() + dash + 1, nullptr, 10);
         } else return false;
     }
-    return a.hi >= a.lo;
+    return a.step >= 1 && (a.hi >= a.lo || a.count > 0);
 }
 
-int runRace(const Args& a) {
+int runRace(Args a) {
+    if (a.tag.empty()) a.tag = "race";
     Client c(makeConfig());
     c.connectAndWait();
     std::atomic<int64_t> done{0};
@@ -403,6 +420,181 @@ int runRefusals() {
     return 0;
 }
 
+// ---- autoincrement ---------------------------------------------------------------------------------------------------
+
+/// One thread's writer on ai_user, as Writer is on ki_account.
+struct AiWriter {
+    Producer producer;
+    AiTyped  topic;
+    explicit AiWriter(Client& c) : producer(c.producer(writerConfig())), topic(c.openTopicAndWait<AiUser>(kAiTopicName, producer, 60s)) {}
+    ~AiWriter() { producer.closeImmediately(); }
+};
+
+/// Runs `body(topic, thread index, thread count, lines)` on KI_E2E_THREADS threads, each with its own AiWriter.
+template <class Body>
+std::vector<Line> runAiThreads(Client& c, Body&& body) {
+    const int threads = static_cast<int>(envInt("KI_E2E_THREADS", 16));
+    std::vector<std::vector<Line>> lines(static_cast<std::size_t>(threads));
+    std::vector<std::unique_ptr<AiWriter>> writers;
+    for (int i = 0; i < threads; ++i) writers.push_back(std::make_unique<AiWriter>(c));
+    std::vector<std::thread> ts;
+    for (int i = 0; i < threads; ++i)
+        ts.emplace_back([&, i] { body(writers[static_cast<std::size_t>(i)]->topic, i, threads, lines[static_cast<std::size_t>(i)]); });
+    for (auto& t : ts) t.join();
+    std::vector<Line> all;
+    for (auto& l : lines) all.insert(all.end(), l.begin(), l.end());
+    return all;
+}
+
+/// insertAndWait of ai_user `id` (0 = take the next id from the broker); the line carries the id the broker answered with for a key-0 create.
+Line aiInsert(AiTyped& t, uint64_t id) {
+    AiUser u;
+    u.userId   = id;
+    u.provider = 1;
+    std::snprintf(u.subject.data(), u.subject.size(), "subject-%llu", static_cast<unsigned long long>(id));
+    try {
+        const WriteResult r = t.insertAndWait(u, std::chrono::seconds(kWriteWaitS));
+        if (r.ok()) return {id != 0 ? id : r.key(), Op::Insert, 0};
+        return {id, Op::Insert, r.code() != 0 ? r.code() : 10000 + static_cast<int>(r.status())};
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "insert %llu threw: %s\n", static_cast<unsigned long long>(id), e.what());
+        return {id, Op::Insert, kClientErr};
+    }
+}
+
+int runAiSetup() {
+    Client c(makeConfig());
+    c.connectAndWait();
+    TopicOptions to;
+    to.replicationFactor         = 3;
+    to.config.cleanupPolicy      = 1;   // compact
+    to.keyFeatures.autoIncrement = true;
+    const auto def = c.defineTopicAndWait(kAiTopicName, 1, "userId", rune::codec::serialize(AiUser::descriptor()), Persistence::Disk, to, {}, 60s);
+    if (def.errorCode != 0) { fail("CHECKED-WRITES-AI-SETUP", std::string("define ai_user: ") + def.detail); return 1; }
+    std::printf("AI_TOPIC_ID=%d\nCHECKED-WRITES-AI-SETUP: OK\n", def.topicId);
+    std::fflush(stdout);
+    return 0;
+}
+
+int runAiBackfill(Args a) {
+    if (a.tag.empty()) a.tag = "ai-backfill";
+    Client c(makeConfig());
+    c.connectAndWait();
+    const auto lines = runAiThreads(c, [&](AiTyped& t, int idx, int threads, std::vector<Line>& out) {
+        for (uint64_t k = static_cast<uint64_t>(idx); a.lo + k * a.step <= a.hi; k += static_cast<uint64_t>(threads)) out.push_back(aiInsert(t, a.lo + k * a.step));
+    });
+    saveLines(shared() + "/" + a.tag + "-w" + std::to_string(a.worker) + ".txt", lines);
+    std::printf("CHECKED-WRITES-AI-BACKFILL: DONE rows=%zu\n", lines.size());
+    std::fflush(stdout);
+    return 0;
+}
+
+int runAiCreate(Args a) {
+    if (a.tag.empty()) a.tag = "ai-create";
+    Client c(makeConfig());
+    c.connectAndWait();
+    std::atomic<int64_t> done{0};
+    std::atomic<bool> finished{false};
+    const std::string progress = shared() + "/" + a.tag + "-progress-w" + std::to_string(a.worker);
+    std::thread reporter([&] {
+        while (!finished.load()) {
+            writeFileAtomic(progress, std::to_string(done.load()) + "\n");
+            std::this_thread::sleep_for(250ms);
+        }
+    });
+    const auto lines = runAiThreads(c, [&](AiTyped& t, int idx, int threads, std::vector<Line>& out) {
+        for (uint64_t i = static_cast<uint64_t>(idx); i < a.count; i += static_cast<uint64_t>(threads)) {
+            out.push_back(aiInsert(t, 0));
+            ++done;
+        }
+    });
+    finished = true;
+    reporter.join();
+    writeFileAtomic(progress, std::to_string(done.load()) + "\n");
+    saveLines(shared() + "/" + a.tag + "-w" + std::to_string(a.worker) + ".txt", lines);
+    std::printf("CHECKED-WRITES-AI-CREATE: DONE worker=%d creates=%zu\n", a.worker, lines.size());
+    std::fflush(stdout);
+    return 0;
+}
+
+int runAiRemove(const Args& a) {
+    Client c(makeConfig());
+    c.connectAndWait();
+    AiWriter w(c);
+    const WriteResult r = w.topic.removeExistingAndWait(a.lo, std::chrono::seconds(kWriteWaitS));
+    if (!r.ok()) { fail("CHECKED-WRITES-AI-REMOVE", "removeExisting " + std::to_string(a.lo) + " gave code " + std::to_string(r.code())); return 1; }
+    std::printf("CHECKED-WRITES-AI-REMOVE: OK id=%llu\n", static_cast<unsigned long long>(a.lo));
+    std::fflush(stdout);
+    return 0;
+}
+
+int runAiVerify() {
+    std::map<uint64_t, int> expected;
+    for (const auto& e : std::filesystem::directory_iterator(shared())) {
+        const std::string name = e.path().filename().string();
+        if ((name.rfind("ai-backfill-w", 0) != 0 && name.rfind("ai-create-w", 0) != 0) || name.compare(name.size() - 4, 4, ".txt") != 0) continue;
+        std::ifstream f(e.path());
+        uint64_t id; std::string op; int code;
+        while (f >> id >> op >> code) {
+            if (code != 0) { fail("CHECKED-WRITES-AI-VERIFY", name + ": " + std::to_string(id) + " gave " + std::to_string(code)); return 1; }
+            if (++expected[id] > 1) { fail("CHECKED-WRITES-AI-VERIFY", "id " + std::to_string(id) + " was answered twice"); return 1; }
+        }
+    }
+    if (expected.empty()) { fail("CHECKED-WRITES-AI-VERIFY", "no accepted write in the result files"); return 1; }
+
+    Client c(makeConfig());
+    c.connectAndWait();
+    AiWriter w(c);
+    std::mutex mu;
+    std::map<uint64_t, int> seen;
+    std::string malformed;
+    SubscribeOptions so;
+    so.from = From::earliest();
+    SubscriptionSet set = c.subscribe(w.topic.handle(), AllPartitions{}, so, [&](const Record& r) {
+        std::lock_guard<std::mutex> g(mu);
+        if (r.key.size() != sizeof(uint64_t) || r.op() != RecordOp::Insert) { if (malformed.empty()) malformed = std::string("a ") + recordOpName(r.op()) + " record with a key of " + std::to_string(r.key.size()) + " bytes"; return; }
+        uint64_t id = 0;
+        std::memcpy(&id, r.key.data(), sizeof id);
+        ++seen[id];
+    });
+    const auto deadline = Clock::now() + std::chrono::seconds(envInt("KI_E2E_VERIFY_S", 300));
+    for (; Clock::now() < deadline; std::this_thread::sleep_for(100ms)) {
+        for (std::size_t i = 0; i < set.size(); ++i)
+            if (set[i].finished()) { fail("CHECKED-WRITES-AI-VERIFY", "partition " + std::to_string(i) + " ended: broker code " + std::to_string(set[i].brokerErrorCode())); return 1; }
+        std::lock_guard<std::mutex> g(mu);
+        if (!malformed.empty() || seen == expected) break;
+    }
+    std::this_thread::sleep_for(5s);   // a quiet window: a stray or duplicate record lands now
+    std::lock_guard<std::mutex> g(mu);
+    int shown = 0;
+    for (const auto& [id, n] : expected)
+        if (seen[id] != n && shown++ < 10) fail("CHECKED-WRITES-AI-VERIFY", "id " + std::to_string(id) + " delivered " + std::to_string(seen[id]) + " times, answered once");
+    for (const auto& [id, n] : seen)
+        if (expected.count(id) == 0 && shown++ < 10) fail("CHECKED-WRITES-AI-VERIFY", "id " + std::to_string(id) + " delivered " + std::to_string(n) + " times but never answered");
+    if (!malformed.empty()) fail("CHECKED-WRITES-AI-VERIFY", malformed);
+    if (!malformed.empty() || seen != expected) return 1;
+    std::printf("CHECKED-WRITES-AI-VERIFY: OK ids=%zu\n", expected.size());
+    std::fflush(stdout);
+    return 0;
+}
+
+int runAiRefusals() {
+    Client c(makeConfig());
+    c.connectAndWait();
+    TopicOptions to;
+    to.config.cleanupPolicy      = 0;   // delete
+    to.keyFeatures.autoIncrement = true;
+    const auto r = c.defineTopicAndWait("ai_bad", 1, "userId", rune::codec::serialize(AiUser::descriptor()), Persistence::Disk, to, {}, 60s);
+    const char* detail = "autoincrement needs cleanup.policy = compact";
+    if (r.errorCode != kInvalidRequest || r.detail != detail) {
+        fail("CHECKED-WRITES-AI-REFUSALS", "cleanup.policy = delete: error " + std::to_string(r.errorCode) + " '" + r.detail + "', want " + std::to_string(kInvalidRequest) + " '" + detail + "'");
+        return 1;
+    }
+    std::printf("CHECKED-WRITES-AI-REFUSALS: OK\n");
+    std::fflush(stdout);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -414,6 +606,14 @@ int main(int argc, char** argv) {
             if (!parseArgs(argc, argv, a)) { std::fprintf(stderr, "usage: race --worker <i> --ids <a>-<b> [--tag <t>]\n"); return 2; }
             return runRace(a);
         }
+        if (mode == "ai-setup") return runAiSetup();
+        if (mode == "ai-backfill" || mode == "ai-create" || mode == "ai-remove") {
+            Args a;
+            if (!parseArgs(argc, argv, a)) { std::fprintf(stderr, "usage: ai-backfill --ids <a>-<b> [--step <s>] [--tag <t>] | ai-create --worker <i> --count <n> [--tag <t>] | ai-remove --ids <id>-<id>\n"); return 2; }
+            return mode == "ai-backfill" ? runAiBackfill(a) : mode == "ai-create" ? runAiCreate(a) : runAiRemove(a);
+        }
+        if (mode == "ai-verify") return runAiVerify();
+        if (mode == "ai-refusals") return runAiRefusals();
         if (mode == "lifecycle") return runLifecycle();
         if (mode == "verify") return runVerify();
         if (mode == "refusals") return runRefusals();
@@ -421,6 +621,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "CHECKED-WRITES-PROBE: %s threw: %s\n", mode.c_str(), e.what());
         return 1;
     }
-    std::fprintf(stderr, "CHECKED-WRITES-PROBE: mode must be setup, race, lifecycle, verify or refusals (got '%s')\n", mode.c_str());
+    std::fprintf(stderr, "CHECKED-WRITES-PROBE: mode must be setup, race, lifecycle, verify, refusals or an ai-* mode (got '%s')\n", mode.c_str());
     return 2;
 }
