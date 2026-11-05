@@ -1845,6 +1845,57 @@ TEST(LogCleanerTxnAbortRegression, AbortedTxnDataNeverSupersedesCommittedValue) 
     }
 }
 
+// A record-less producer-tail batch (C2) keeps its source batch's partitionLeaderEpoch, on every clean path and for
+// both ways a tail loses its records: an aborted transaction, and an idempotent batch whose key is superseded.  It was
+// rebuilt unstamped (-1): when that batch was the first of a leader epoch, a follower fetching the cleaned copy started
+// the epoch one batch later than the leader, and the leader's epoch-history check refused it for good (the partition
+// stayed leaderless: CheckedWritesStressRegression.KeyIndexSeededClusterHoldsTheInvariants seed 1).
+TEST(LogCleanerRegression, ARetainedProducerTailKeepsItsLeaderEpochRegression) {
+    constexpr int32_t kEpoch = 7;
+    const auto stamped = [](std::vector<uint8_t> b, int32_t epoch) {
+        RecordBatchReader::stampLeaderEpoch(b.data(), epoch);
+        return b;
+    };
+    for (const bool aborted : {true, false}) {
+        for (CleanPath path : {CleanPath::Sync, CleanPath::Range, CleanPath::RangeCoalesce}) {
+            const std::string what = std::string(pathName(path)) + (aborted ? " aborted txn" : " superseded idempotent");
+            auto dir = makeTempDir("lc_tail_epoch");
+            std::filesystem::create_directories(dir);
+            {
+                Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+                log.append(stamped(makeBatch(0, "pad0", "p", 2000), kEpoch - 1), 0);
+                if (aborted) {
+                    log.append(stamped(d3bTxn(1, "k", "v1", 0), kEpoch), 1);
+                    log.append(stamped(d3bMarker(2, /*abort=*/true), kEpoch), 2);
+                } else {
+                    RecordBatchBuilder b(1, 1001);
+                    b.setProducerId(kD3bPid); b.setProducerEpoch(3); b.setBaseSequence(0);
+                    b.append("k", "v1", 1001);
+                    log.append(stamped(b.build(), kEpoch), 1);
+                    log.append(stamped(makeBatch(2, "k", "v2", 2002), kEpoch), 2);   // supersedes k@1
+                }
+                for (int64_t i = 3; i < 6; ++i) log.append(stamped(makeBatch(i, "pad", "p", 2000 + i), kEpoch), i);
+                {
+                    const auto before = batchAt(log, 1);
+                    ASSERT_FALSE(before.empty()) << what;
+                    ASSERT_EQ(RecordBatchReader(before.data(), before.size()).partitionLeaderEpoch(), kEpoch)
+                        << what << ": precondition (the append keeps the stamp)";
+                }
+
+                cleanOnce(log, path);
+                const auto tail = batchAt(log, 1);
+                ASSERT_FALSE(tail.empty()) << what << ": the producer-tail batch @1 is retained";
+                RecordBatchReader tr(tail.data(), tail.size());
+                ASSERT_EQ(tr.recordCount(), 0) << what << ": the tail keeps metadata only (the premise)";
+                EXPECT_TRUE(tr.ensureValid()) << what;
+                EXPECT_EQ(tr.partitionLeaderEpoch(), kEpoch) << what << ": the tail lost its leader epoch";
+                EXPECT_EQ(tr.producerId(), kD3bPid) << what;
+            }
+            std::filesystem::remove_all(dir);
+        }
+    }
+}
+
 // 1(a): the txn is still OPEN at clean time (no marker yet) and aborts later.
 // The open txn's data must not be cleaned or indexed (clean limit capped at its
 // first offset, Kafka's LSO); after the ABORT the next pass still keeps v1.
