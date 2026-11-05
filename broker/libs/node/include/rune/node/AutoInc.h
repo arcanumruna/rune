@@ -80,17 +80,17 @@ public:
         p.firstN          = keyZeroCount > 0 ? s->nextN : 0;
         p.count           = keyZeroCount;
         p.exhausted       = keyZeroCount > 0 && lastN > nMax_;
-        p.reserve         = !p.exhausted && highestN > s->reservedThroughN;
         p.reserveThroughN = std::min(nMax_, std::max(highestN, s->reservedThroughN + reserve_));
+        p.reserve         = !p.exhausted && highestN > s->reservedThroughN && p.reserveThroughN > s->reservedThroughN;   // the caller rejects an importMaxN above nMax
         p.newNextN        = std::max(s->nextN + keyZeroCount, importMaxN + 1);
         return p;
     }
 
     void commitReservation(uint64_t reservedThroughN) noexcept {
-        if (auto* s = std::get_if<AutoIncReady>(&st_)) s->reservedThroughN = reservedThroughN;
+        if (auto* s = std::get_if<AutoIncReady>(&st_)) s->reservedThroughN = std::max(s->reservedThroughN, reservedThroughN);
     }
     void commitNext(uint64_t newNextN) noexcept {
-        if (auto* s = std::get_if<AutoIncReady>(&st_)) s->nextN = newNextN;
+        if (auto* s = std::get_if<AutoIncReady>(&st_)) s->nextN = std::max(s->nextN, newNextN);
     }
 
     [[nodiscard]] uint64_t nextN() const noexcept {
@@ -127,7 +127,7 @@ public:
     /// True when a batch of `producerId` can be recorded: it has a slot or a free one remains.
     [[nodiscard]] bool canAccept(int64_t producerId) const noexcept { return used_ < slots_.size() || locate_(producerId) != nullptr; }
 
-    /// Key-0 batches only.  Precondition: canAccept(producerId).
+    /// Key-0 batches only.  Precondition: producerId >= 0, canAccept(producerId), and reserve() has been called.
     void record(int64_t producerId, int64_t baseOffset, uint64_t assignedBase) noexcept { put_(producerId, baseOffset, assignedBase, true); }
 
     /// Cold: a scan refill; grows when full.  The provenance of the batch is unknown.

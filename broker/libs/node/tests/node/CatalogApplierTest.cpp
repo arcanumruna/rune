@@ -799,9 +799,11 @@ TEST(CheckedWritesAutoIncRouting, SinkSpecCarriesTheSourcesKeyFeatures) {
     gd::ScriptBuilder b(cat::kFormatV3);
     cat::CreateTopicOps o;
     o.partitions = 2;
-    o.schema = cat::SchemaDef{.keyField = "", .validate = false, .descriptorBlob = wideDescriptor("ids", 2, 8, false),
-                              .nextTag = 2};
-    o.schema->keyFeatures = {.autoIncrement = true, .partitioner = rune::protocol::Partitioner::Modulo};
+    o.config.cleanupPolicy = 1;
+    rune::codec::DescriptorBuilder d("ids");
+    d.add("id", rune::codec::PrimType::UInt64, 1, /*isKey=*/true).add("v", rune::codec::PrimType::Int64);
+    o.schema = cat::SchemaDef{.keyField = "id", .validate = true, .descriptorBlob = rune::codec::serialize(d.build()), .nextTag = 2};
+    o.schema->keyFeatures = {.keyIndex = true, .autoIncrement = true, .partitioner = rune::protocol::Partitioner::Modulo};
     b.createTopic("ids", std::move(o), "CREATE TOPIC ids (...)");
     cat::ViewDef v;
     v.sinkPartitions = 2;

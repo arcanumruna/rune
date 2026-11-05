@@ -18,6 +18,17 @@ AutoIncState readyAt(int32_t partition, int32_t partitions, uint64_t max, uint32
     EXPECT_EQ(s.finishScan(), 0u);
     return s;
 }
+
+/// A fresh Ready{1, 0} moved up by the commits.
+AutoIncState freshAt(int32_t partition, int32_t partitions, uint64_t max, uint32_t reserve, uint64_t nextN, uint64_t reservedThroughN) {
+    AutoIncState s;
+    s.configure(partition, partitions, max, reserve);
+    s.beginScan();
+    EXPECT_EQ(s.finishScan(), 0u);
+    s.commitReservation(reservedThroughN);
+    s.commitNext(nextN);
+    return s;
+}
 }  // namespace
 
 TEST(CheckedWritesAutoIncState, FreshTopicStartsAtOne) {
@@ -49,8 +60,7 @@ TEST(CheckedWritesAutoIncState, ResumesAboveTheLatestReservation) {
 }
 
 TEST(CheckedWritesAutoIncState, CrossingTheReservationReservesAFullBlock) {
-    AutoIncState s = readyAt(0, 1, kMax53, 8, 8);
-    s.commitNext(7);
+    const AutoIncState s = freshAt(0, 1, kMax53, 8, 7, 8);
     const AutoIncPlan p = s.plan(8, 0);
     EXPECT_EQ(p.firstN, 7u);
     EXPECT_EQ(p.count, 8u);
@@ -88,9 +98,7 @@ TEST(CheckedWritesAutoIncState, ExhaustionIsExactAtTheCap) {
 }
 
 TEST(CheckedWritesAutoIncState, ImportMovesTheCounterPastIt) {
-    const AutoIncState s = readyAt(1, 2, kMax53, 4096, 4096);
-    AutoIncState t = s;
-    t.commitNext(5);
+    const AutoIncState t = freshAt(1, 2, kMax53, 4096, 5, 4096);
     const AutoIncPlan low = t.plan(0, 50);
     EXPECT_EQ(low.newNextN, 51u);
     EXPECT_FALSE(low.reserve);
@@ -99,6 +107,25 @@ TEST(CheckedWritesAutoIncState, ImportMovesTheCounterPastIt) {
     EXPECT_TRUE(high.reserve);
     EXPECT_EQ(high.reserveThroughN, 8192u);
     EXPECT_EQ(t.plan(0, 3).newNextN, 5u);
+}
+
+TEST(CheckedWritesAutoIncState, ImportAboveTheCapReservesNothing) {
+    AutoIncState s = readyAt(0, 1, 10, 4096, 10);
+    const AutoIncPlan p = s.plan(0, 50);
+    EXPECT_FALSE(p.reserve);
+    EXPECT_EQ(p.reserveThroughN, 10u);
+}
+
+TEST(CheckedWritesAutoIncState, CommitsNeverMoveBackwards) {
+    AutoIncState s = readyAt(0, 1, kMax53, 4096, 100);
+    s.commitNext(50);
+    s.commitReservation(40);
+    EXPECT_EQ(s.nextN(), 101u);
+    EXPECT_EQ(s.reservedThroughN(), 100u);
+    s.commitNext(120);
+    s.commitReservation(200);
+    EXPECT_EQ(s.nextN(), 120u);
+    EXPECT_EQ(s.reservedThroughN(), 200u);
 }
 
 TEST(CheckedWritesAutoIncState, NotReadyOutsideReady) {
