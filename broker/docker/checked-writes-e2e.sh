@@ -161,7 +161,8 @@ partition_leader() {
     echo "${best_n}"
 }
 
-kill_node() { docker kill "$(cname $(( $1 + 1 )))" >/dev/null || fail "docker kill of rune-$(( $1 + 1 )) failed"; }
+KILLED_AT=0
+kill_node() { docker kill "$(cname $(( $1 + 1 )))" >/dev/null || fail "docker kill of rune-$(( $1 + 1 )) failed"; KILLED_AT="$(now_s)"; }
 SINCE=""
 links_since() {
     local n="$1" id c
@@ -173,6 +174,8 @@ links_since() {
 }
 restart_node() {
     local n=$(( $1 + 1 ))
+    # a restart inside the driver dir lock's 1 s heartbeat window of the kill is refused (same pid 1): wait it out
+    [ "$(( $(now_s) - KILLED_AT ))" -ge 3 ] || sleep 3
     SINCE="$(date +%s)"   # epoch seconds: no timezone ambiguity
     docker start "$(cname "${n}")" >/dev/null || fail "docker start of rune-${n} failed"
     wait_until "${LINK_WAIT_S}" "rune-${n}'s peer links" links_since "${n}" \
