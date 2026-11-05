@@ -812,10 +812,10 @@ bool LogCleaner::rewriteSegmentImpl(
 
             auto keep = [&]() { keepWithHorizon(-1); };
 
-            // Records at/past the clean boundary (HW / passEnd) are always kept
-            // verbatim.  For bounded-range passes, cleanBoundaryOffset == passEnd
-            // which may be less than activeBase, so records beyond the pass boundary
-            // are preserved for the next pass.
+            // Records at/past the clean boundary (HW / passEnd) are always kept, for
+            // the next pass.  Only a batch the boundary splits gets here with such a
+            // record (a batch starting past it was copied whole above), and its kept
+            // records are re-framed one per batch unless the window protects it.
             if (offset >= cleanBoundaryOffset) { keep(); return; }
 
             // Part 04: a record the verdict markers rejected is dropped, null key or not.
@@ -1746,7 +1746,7 @@ void LogCleaner::mergeGroupWithMap(
                 };
                 auto keep2 = [&]() { keepWithHorizon2(-1); };
 
-                // Records at/past the pass boundary are kept verbatim.
+                // Records at/past the pass boundary are kept, re-framed (only a batch the boundary splits gets here).
                 if (offset >= passEnd) { keep2(); return; }
                 if (verdicts->isRejected(offset)) { modified = true; return; }   // Part 04: a rejected record is dropped
                 if (key.empty())       { keep2(); return; }

@@ -450,7 +450,8 @@ TEST(CheckedWritesAutoIncCleanerRegression, ProtectedBatchSplitByAFullMapIsKeptW
 
 // The verdict coverage ends inside a segment the pass rewrites, and a live producer's newest batch lies just above it.  RED: a batch
 // starting at or past the clean boundary was not protected and its records were re-framed one per batch, so a leader rebuilt from
-// the log answered the batch's retry with DuplicateSequence instead of its ack (AutoIncModel seed 10).
+// the log answered the batch's retry with DuplicateSequence instead of its ack (AutoIncModel seed 10).  A batch past the boundary is
+// copied whole whatever its producer, so a non-idempotent one above it stays byte for byte too.
 TEST(CheckedWritesAutoIncCleanerRegression, LiveProducersBatchAboveTheVerdictCoverageIsKeptWholeRegression) {
     for (const bool coalesce : {false, true}) {
         SCOPED_TRACE(name(coalesce));
@@ -463,15 +464,17 @@ TEST(CheckedWritesAutoIncCleanerRegression, LiveProducersBatchAboveTheVerdictCov
             rec(log, 2, -1, -1, 1, "new");
             marker(log, 3, 1, 3, {});                      // the verdicts cover [.., 3): the pass cleans below 3
             recs(log, 4, 7, 0, {10, 11, 12, 13}, "v");     // offsets 4-7, producer 7's newest batch
-            rec(log, 8, -1, -1, 99, std::string(4096, 'x'));   // fills the segment
-            pad(log, 9);
-            ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 9}));
+            recs(log, 8, -1, -1, {20, 21, 22}, "v");       // offsets 8-10, no producer: outside the window
+            rec(log, 11, -1, -1, 99, std::string(4096, 'x'));   // fills the segment
+            pad(log, 12);
+            ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 12}));
             const auto before = batches(log);
-            ASSERT_TRUE(before.count(4));
+            ASSERT_TRUE(before.count(4) && before.count(8));
             (void)clean(log, Pass{.coalesce = coalesce});
             ASSERT_FALSE(dataOffsets(log).count(1)) << "the segment was rewritten";
             const auto after = batches(log);
             EXPECT_TRUE(after.count(4) && after.at(4) == before.at(4)) << "the batch is kept byte for byte";
+            EXPECT_TRUE(after.count(8) && after.at(8) == before.at(8)) << "the non-idempotent batch is kept byte for byte";
         }
         std::filesystem::remove_all(dir);
     }
