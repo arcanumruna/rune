@@ -138,6 +138,11 @@ public:
     template <class LogT>
     [[nodiscard]] rune::storage::HookStaged stage(LogT& log, const uint8_t* batch, std::size_t len) noexcept;
     void onAppended(int64_t base, int64_t last) noexcept;
+    /// The produce failed after stage() took the key-0 batch's ids (its data append was refused or threw): they are burned.
+    void onProduceFailed() noexcept {
+        if (idsTaken_) state_.autoIncStats.idsBurned += keyZeroCount_;
+        idsTaken_ = false;
+    }
     [[nodiscard]] uint64_t assignedBase() const noexcept { return assignedBase_; }
     [[nodiscard]] HookRefusal refusal() const noexcept { return refusal_; }
     [[nodiscard]] bool checked() const noexcept { return checked_; }
@@ -154,6 +159,7 @@ private:
     uint32_t             keyZeroCount_ = 0;
     uint64_t             importMaxN_   = 0;
     uint64_t             assignedBase_ = 0;
+    bool                 idsTaken_     = false;   // stage() committed the key-0 ids and onAppended has not run
     std::array<uint8_t, kReservationScratch> resv_;
 };
 
@@ -178,7 +184,10 @@ rune::storage::HookStaged CheckedWriteHook::stage(LogT& log, const uint8_t* batc
         return {ErrorCode::OK, batch, len};
     }
     const rune::storage::HookStaged patched = patchKeyZeroIds_(batch, len);
-    if (patched.error == ErrorCode::OK) state_.autoInc.commitNext(plan_.newNextN);
+    if (patched.error == ErrorCode::OK) {
+        state_.autoInc.commitNext(plan_.newNextN);
+        idsTaken_ = true;
+    }
     return patched;
 }
 

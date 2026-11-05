@@ -282,10 +282,13 @@ bool forEachMarkerEntry(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept
     return c && parseConstraintSetChange(*c, setId, out, count);
 }
 
+[[nodiscard]] inline std::optional<uint64_t> parseReservation(const ControlRecord& c) noexcept {
+    if (c.type != kReservation || c.value.size() != kReservationBytes) return std::nullopt;
+    return detail::get<uint64_t>(c.value.data() + 1);
+}
 [[nodiscard]] inline std::optional<uint64_t> parseReservation(const uint8_t* batch, std::size_t len) noexcept {
     const auto c = parseControl(batch, len);
-    if (!c || c->type != kReservation || c->value.size() != kReservationBytes) return std::nullopt;
-    return detail::get<uint64_t>(c->value.data() + 1);
+    return c ? parseReservation(*c) : std::nullopt;
 }
 
 }  // namespace rune::storage::control_record

@@ -404,6 +404,15 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
     return {};
 }
 
+void VerdictSource::noteKeyZeroRejection_(const Verdict& v, const rune::view::SourceRecord& rec) noexcept {
+    if (v.code != static_cast<uint16_t>(rune::protocol::client::ErrorCode::KeyExists)) {
+        ++state_->autoIncStats.idsBurned;
+        return;
+    }
+    ++state_->autoIncStats.assignedKeyExists;   // an assigned id the key index already holds: the counter reused it
+    spdlog::critical("AUTOINC-ID-REUSE topic={} partition={} id={}", srcTopicId_, partition_, keyIndexWord(rec.key));
+}
+
 int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted) {
     ViewInstance& inst = *m.inst;
     const rune::view::FoldSkip skip{.aborted = aborted, .rejected = &state_->rejected};
@@ -447,9 +456,12 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
             pos += static_cast<std::size_t>(r.totalLength());
             continue;
         }
+        // P6-13: a key-0 batch this leadership appended (record() wrote its window entry); an import or a rebuilt entry is not one.
+        const bool keyZero = state_->assignedBases.producers() != 0 && r.producerId() >= 0 && state_->assignedBases.isKeyZeroBatch(r.producerId(), r.baseOffset());
         const bool skipBatch = (attrs & proto::batch::kAttrControl) != 0 || aborted.skips(r, attrs);
         if (skipBatch) {
             if (last >= limit) break;
+            if (keyZero && (attrs & proto::batch::kAttrControl) == 0) [[unlikely]] state_->autoIncStats.idsBurned += static_cast<uint64_t>(r.lastOffsetDelta()) + 1;   // aborted
             judgeCursor_ = last + 1;
             pos += static_cast<std::size_t>(r.totalLength());
             ++work;
@@ -464,8 +476,9 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
             rune::view::SourceRecord rec{span.key, span.value, span.offset, rune::protocol::record::intentOf(span.attributes), nullptr};
             if (!span.value.empty()) rec.writer = &first.vdc.materializedFor(writerVersionOf(span.value, first.vdc.defaultVersion()));
             lastIntent_ = rec.intent;
-            (void)judge(rec);
+            const Verdict v = judge(rec);
             if (stalled_) return;
+            if (keyZero && !v.accepted()) [[unlikely]] noteKeyZeroRejection_(v, rec);
             judgeCursor_ = span.offset + 1;
             judgedRecord_ = true;
             ++work;

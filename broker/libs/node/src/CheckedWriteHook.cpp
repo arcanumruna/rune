@@ -135,6 +135,7 @@ rune::storage::HookStaged CheckedWriteHook::patchKeyZeroIds_(const uint8_t* batc
 
 void CheckedWriteHook::onAppended(int64_t base, int64_t) noexcept {
     if (keyZeroCount_ == 0) return;
+    idsTaken_ = false;
     assignedBase_ = autoIncId(plan_.firstN, state_.autoInc.partitions(), state_.autoInc.partition());
     ++state_.autoIncStats.keyZeroBatches;
     if (facts_.producerId >= 0) state_.assignedBases.record(facts_.producerId, base, assignedBase_);

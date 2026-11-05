@@ -88,6 +88,14 @@ public:
     bool sendFetchResponse(rune::replication::NodeId, const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
+/// An autoincrement source (Part 06): the topic's partition count P, key type, reservation block and id cap.  The rig owns partition 0.
+struct AutoIncShape {
+    int32_t partitions = 1;
+    rune::codec::PrimType keyType = rune::codec::PrimType::UInt64;
+    uint32_t reserve = 4096;
+    uint64_t max = rune::protocol::kAutoIncrementMaxDefault;
+};
+
 /// The replica and worker settings a cell may change: minIsr and durabilityTier (2 = Strict) of the partition, the acks=all commit-wait (0 = the default).
 struct RigTuning { int minIsr = 1; uint8_t durabilityTier = 1; int64_t ackTimeoutNs = 0; };
 
@@ -125,6 +133,53 @@ public:
         keyShape_ = s;
         keyIndexOn_ = enabled;
         typedWith_(5, s, enabled);
+    }
+    /// An autoincrement key-index source of `shape` (the topic {id key autoincrement, v int64, tag}); returns once the first leadership
+    /// scan made the counter Ready and the key index is the logged set's member.  A restart brings the topic back the same way.
+    void createAutoIncTopic(AutoIncShape shape = {}) {
+        autoInc_ = shape;
+        createKeyIndex(KeyShape{shape.keyType}, true);
+        for (int i = 0; i < kMaxPass && !(autoIncState() && keyIndexLogged_()); ++i) pass();
+        ASSERT_TRUE(autoIncState().has_value()) << "the first scan never made the counter Ready";
+        ASSERT_TRUE(keyIndexLogged_()) << "the key index never became the logged set's member";
+    }
+    [[nodiscard]] std::optional<AutoIncReady> autoIncState() const { return worker->autoIncStateForTest(kSrc, 0); }
+    [[nodiscard]] const AutoIncStats& autoIncStats() const { return *worker->autoIncStatsForTest(kSrc, 0); }
+    /// The reservation records (type 16) in the log as (offset, reserved-through n), in offset order.
+    [[nodiscard]] std::vector<std::pair<int64_t, uint64_t>> reservations() const {
+        std::vector<std::pair<int64_t, uint64_t>> out;
+        for (int64_t off = log->logStartOffset(); off < leo();) {
+            const auto v = log->readView(off, 1 << 20);
+            if (v.empty()) break;
+            for (std::size_t p = 0; p + 12 <= v.len;) {
+                int32_t blen = 0;
+                std::memcpy(&blen, v.data + p + 8, 4);
+                const std::size_t total = 12 + static_cast<std::size_t>(blen);
+                if (p + total > v.len) break;
+                if (const auto r = rune::storage::control_record::parseReservation(v.data + p, total))
+                    out.emplace_back(rune::protocol::RecordBatchReader(v.data + p, total).baseOffset(), *r);
+                p += total;
+            }
+            off = v.nextOffset;
+        }
+        return out;
+    }
+    /// Session kAckSession leaves grantAll: it is bound to a table that grants WRITE on the source and, with `import`, IMPORT.
+    /// Both bitmaps are sent every time: table 0 keeps a bitmap it is not sent again.
+    void bindGrants(bool import) {
+        const std::vector<uint64_t> bits{uint64_t{1} << kSrc}, none{0};
+        const auto table = [&](int32_t bitmap, const std::vector<uint64_t>& words) {
+            WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = 0; o.topicId = bitmap;
+            o.nextOffset = 0; o.hwBound = 1; o.isolation = kPermFlagTable | kPermFlagLast;
+            o.permWords = words.data(); o.permWordCount = words.size();
+            EXPECT_TRUE(worker->tryEnqueueOp(std::move(o)));
+        };
+        table(kPermBitmapWrite, bits);
+        table(kPermBitmapImport, import ? bits : none);
+        WorkerOp b; b.type = WorkerOp::Type::SessionPermissions; b.sessionId = kAckSession; b.nextOffset = 0;
+        b.correlationId = ++grantEpoch_; b.producerId = 7; b.isolation = kPermFlagBind | kPermFlagLast;
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(b)));
+        passes(4);
     }
     /// The write spec is sent again with key.index set: an adoption of a live topic.
     void enableKeyIndex() {
@@ -229,6 +284,14 @@ public:
         replica->becomeFollower(++epoch_, 2);
         passes(3);
     }
+    /// demote() through the worker's BecomeFollower op (the runtime's path).
+    void demoteByOp() {
+        WorkerOp op;
+        op.type = WorkerOp::Type::BecomeFollower; op.topicId = kSrc; op.partition = 0; op.replica = replica.get();
+        op.logPtr = replica->log(); op.roleEpoch = ++epoch_; op.roleLeaderId = 2;
+        op.targetReplicaId = replica->registryId(); op.incarnation = replica->incarnation();
+        send(std::move(op));
+    }
     void demotePromote() {
         demote();
         replica->becomeLeader(++epoch_, isr_);
@@ -274,10 +337,14 @@ private:
         TopicWriteSpecWire w;
         w.topicId = kSrc; w.keyFieldId = 0; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
         w.keyWidth = static_cast<uint8_t>(keyWidthOf(keyShape_));
+        if (autoInc_) {
+            w.autoIncrement = true; w.partitioner = rune::protocol::Partitioner::Modulo;
+            w.autoIncrementMax = autoInc_->max; w.autoIncrementReserve = autoInc_->reserve; w.partitionCount = autoInc_->partitions;
+        }
         WorkerOp s;
         s.type = WorkerOp::Type::WriteSpecUpdate; s.topicId = kSrc;
-        s.schemaUpdateBlob.resize(kTopicWriteSpecWireLen);
-        EXPECT_EQ(encodeTopicWriteSpec(w, s.schemaUpdateBlob), kTopicWriteSpecWireLen);
+        s.schemaUpdateBlob.resize(topicWriteSpecWireLen(w));
+        EXPECT_EQ(encodeTopicWriteSpec(w, s.schemaUpdateBlob), topicWriteSpecWireLen(w));
         return s;
     }
     void typedWith_(int16_t level, const KeyShape& shape, bool keyIndex) {
@@ -526,6 +593,7 @@ public:
     struct Ack {
         int16_t code = 0;
         int64_t baseOffset = 0;
+        uint64_t assignedBase = 0;
         bool    hasVerdicts = false;
         std::vector<std::tuple<uint16_t, uint16_t, uint32_t>> verdicts;
         std::size_t frameLen = 0;
@@ -563,7 +631,10 @@ public:
     }
     /// A Produce frame on the worker's ingress; returns its correlation id.  `recs` is one batch.
     int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool txn = false) {
-        const auto bytes = batch(recs, pid, seq, keyShape_, txn);
+        return produceBytes(batch(recs, pid, seq, keyShape_, txn), acks, pid, seq);
+    }
+    /// A Produce frame carrying `bytes` as its batch (a hand-made one); returns its correlation id.
+    int64_t produceBytes(const std::vector<uint8_t>& bytes, uint8_t acks, int64_t pid = -1, int32_t seq = -1) {
         const int64_t c = ++corr;
         rune::protocol::client::Produce m;
         m.sessionId = kAckSession; m.correlationId = c; m.topicId = kSrc; m.partition = 0; m.partitionKnown = 1;
@@ -578,7 +649,8 @@ public:
         return c;
     }
     /// The same batch the way a gateway routes it: a Produce op on the op ring, answered through the ack sink.
-    int64_t routedFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1) {
+    /// `importGranted`: the gateway found IMPORT on the topic (kOpFlagImportGranted).
+    int64_t routedFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool importGranted = true) {
         const auto bytes = batch(recs, pid, seq, keyShape_);
         WorkerOp op;
         op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = 0;
@@ -588,6 +660,7 @@ public:
         op.lastOffsetDelta = static_cast<int32_t>(recs.size()) - 1; op.recordCount = static_cast<int32_t>(recs.size());
         op.durabilityTier = replica->durabilityTier();
         op.deferAck = (acks & rune::protocol::client::kAcksWireAll) != 0;
+        op.importGranted = importGranted;
         op.recordBatchView = std::span<const uint8_t>(bytes);
         EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
         return corr;
@@ -870,7 +943,7 @@ private:
             const auto r = rune::protocol::client::ProduceResponse::decode(wire, wireLen);
             if (!r) return;
             Ack a;
-            a.code = r->errorCode; a.baseOffset = r->baseOffset; a.hasVerdicts = r->hasVerdicts; a.frameLen = static_cast<std::size_t>(l) - (ackEncrypted_ ? rune::protocol::client::kCryptoOverhead : 0); a.step = passNo_;
+            a.code = r->errorCode; a.baseOffset = r->baseOffset; a.assignedBase = r->assignedBase; a.hasVerdicts = r->hasVerdicts; a.frameLen = static_cast<std::size_t>(l) - (ackEncrypted_ ? rune::protocol::client::kCryptoOverhead : 0); a.step = passNo_;
             r->forEachVerdict([&](uint16_t i, uint16_t code, uint32_t cid) { a.verdicts.emplace_back(i, code, cid); });
             if (acksSeen_.emplace(r->correlationId, std::move(a)).second) ackOrder_.push_back(r->correlationId);
         }).handler(), 64);
@@ -913,6 +986,7 @@ private:
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
         worker->setViewSet(vs.get());
         if (rcScanBytesPerPass != 0) worker->setRcScanBytesPerPass(rcScanBytesPerPass);
+        if (assignedBaseReserve_ != 0) worker->setAssignedBaseReserveForTest(assignedBaseReserve_);
         if (egress_) worker->setWorkerEgress(egress_.get());
         wireAcks_();
     }
@@ -920,7 +994,21 @@ private:
     std::vector<rune::replication::NodeId> isr_;
  public:
     int32_t rcScanBytesPerPass = 0;   ///< the leadership scan budget of a (re)started worker; 0 = the default
+    /// The side window's producer capacity of every autoincrement partition installed from now on, this worker's and a restarted one's.
+    void reserveAssignedBases(std::size_t producers) {
+        assignedBaseReserve_ = producers;
+        worker->setAssignedBaseReserveForTest(producers);
+    }
  private:
+    std::size_t assignedBaseReserve_ = 0;
+    [[nodiscard]] bool keyIndexLogged_() const {
+        const PartitionWriteState* w = writeState();
+        if (w == nullptr) return false;
+        const ConstraintSet& set = w->constraintSets.latest();
+        return set.count > 0 && set.members[0].kind == rune::view::VerdictViewKind::KeyIndex;
+    }
+    std::optional<AutoIncShape> autoInc_;
+    uint64_t grantEpoch_ = 0;
     int64_t rollBytes_;
     RigTuning tuning_;
     uint64_t cleanedSeq_ = 0;

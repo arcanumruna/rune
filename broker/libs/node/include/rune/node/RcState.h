@@ -119,13 +119,16 @@ struct RcFacts {
     int32_t  epoch                = 0;
 };
 
-/// The leadership scan's feed for checked-writes control records (producerId < 0, types 16-19).  `begin` runs on the
-/// Unbuilt -> Scanning edge of a disk scan (`target` = the LEO at entry); `batch` for every such control batch the scan
-/// walks.  fn-pointer + ctx, no std::function.
+/// The leadership scan's feed for checked writes.  `begin` runs on the Unbuilt -> Scanning edge (`target` = the LEO at
+/// entry), `end` once on the Ready edge of the scan it began; `batch` for every checked-writes control batch
+/// (producerId < 0, types 16-19) a disk scan walks, `dataBatch` for every data batch of a producer (producerId >= 0)
+/// either scan walks.  fn-pointer + ctx, no std::function.
 struct RcVerdictHooks {
     void (*begin)(void* ctx, int64_t logStart, int64_t target) noexcept = nullptr;
     void (*batch)(void* ctx, const uint8_t* batch, std::size_t len, int64_t baseOffset) noexcept = nullptr;
     void* ctx = nullptr;
+    void (*dataBatch)(void* ctx, const uint8_t* batch, std::size_t len, int64_t baseOffset) noexcept = nullptr;
+    void (*end)(void* ctx) noexcept = nullptr;
 };
 
 /// A fixed-capacity open-addressing set of producer ids (>= 0): linear probing at
@@ -600,9 +603,12 @@ public:
                 // ring anyway.
                 if (psm_ != nullptr) psm_->clearPartition(psmTopic_, psmPartition_);
                 if (memLog == nullptr) {
+                    if (verdict_.begin != nullptr) verdict_.begin(verdict_.ctx, 0, 0);
                     st_ = Ready{f.epoch, f.logGeneration, f.leadershipGeneration};
+                    if (verdict_.end != nullptr) verdict_.end(verdict_.ctx);
                     return 0;
                 }
+                if (verdict_.begin != nullptr) verdict_.begin(verdict_.ctx, memLog->logStartOffset(), memLog->logEndOffset());
                 beginRingScan_(f, *memLog);
             } else {
                 // F15 S5 (I3): the producer state is rebuilt from the log by this
@@ -866,6 +872,8 @@ private:
                 if (verdict_.batch != nullptr && out.outcome == rune::transaction::RcBuilder::Outcome::Ignored &&
                     (r.attributes() & rune::protocol::batch::kAttrControl) != 0 && r.producerId() < 0) [[unlikely]]
                     verdict_.batch(verdict_.ctx, p + pos, len, base);
+                if (verdict_.dataBatch != nullptr && r.producerId() >= 0 && (r.attributes() & rune::protocol::batch::kAttrControl) == 0) [[unlikely]]
+                    verdict_.dataBatch(verdict_.ctx, p + pos, len, base);
                 s.cursor = last + 1;
             }
             pos += len;
@@ -991,6 +999,8 @@ private:
             if (out.outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
                 haltInvariant_("RcBuilder refused a whole batch of the ring (RC build)");
             if (psm_ != nullptr) feedProducerState_(r, out.outcome, v.data, v.len, /*markerFromRebuild=*/true);
+            if (verdict_.dataBatch != nullptr && r.producerId() >= 0 && (r.attributes() & kAttrControl) == 0) [[unlikely]]
+                verdict_.dataBatch(verdict_.ctx, v.data, v.len, r.baseOffset());
             bytes     += v.len;
             cur.cursor = v.nextOffset;
         }
@@ -1001,6 +1011,7 @@ private:
             for (const TailEvent& e : tail_) applyMarker_(e.producerId, e.offset, e.commit);
             tail_.clear();
             st_ = Ready{cur.epoch, cur.logGen, cur.leadGen};
+            if (verdict_.end != nullptr) verdict_.end(verdict_.ctx);
         }
         return bytes;
     }
@@ -1010,6 +1021,7 @@ private:
         for (const TailEvent& e : tail_) applyMarker_(e.producerId, e.offset, e.commit);
         tail_.clear();
         st_ = Ready{s.epoch, s.logGen, s.leadGen};
+        if (verdict_.end != nullptr) verdict_.end(verdict_.ctx);
     }
 
     rune::transaction::LsoTracker      tracker_;

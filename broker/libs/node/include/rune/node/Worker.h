@@ -1815,6 +1815,22 @@ public:
     [[nodiscard]] uint64_t typedVersionAheadForTest() const noexcept { return typedVersionAhead_; }
     [[nodiscard]] uint64_t hookChecksForTest() const noexcept { return hookChecks_; }
     [[nodiscard]] uint64_t hookRefusalsForTest(HookRefusal why) const noexcept { return hookRefusals_[std::to_underlying(why)]; }
+    /// The facts of the last write that reached the write hook.
+    [[nodiscard]] WriteFacts lastWriteFactsForTest() const noexcept { return lastWriteFacts_; }
+    /// Part 06: an autoincrement partition's counters (nullptr: not owned or untyped).
+    [[nodiscard]] const AutoIncStats* autoIncStatsForTest(int32_t topicId, int32_t partition) const noexcept {
+        const PartitionWriteState* w = writeStateForTest(topicId, partition);
+        return w != nullptr ? &w->autoIncStats : nullptr;
+    }
+    /// The counter when Ready, else nullopt.
+    [[nodiscard]] std::optional<AutoIncReady> autoIncStateForTest(int32_t topicId, int32_t partition) const {
+        const PartitionWriteState* w = writeStateForTest(topicId, partition);
+        if (w == nullptr || !w->autoInc.ready()) return std::nullopt;
+        return AutoIncReady{w->autoInc.nextN(), w->autoInc.reservedThroughN()};
+    }
+    /// The side window's initial producer capacity of partitions installed from now on (cold).
+    void setAssignedBaseReserveForTest(std::size_t producers) noexcept { assignedBaseReserve_ = producers; }
+    void maintainAutoIncWindowsForTest() { maintainAutoIncWindows_(); }
 
     // -----------------------------------------------------------------------
     // rune::consensus::Agent interface
@@ -1965,7 +1981,7 @@ public:
             }
             work += flushOwedAcksView_(nowNs);   // a worker without views still releases and times out View waiters
             publishVerdictCleanerBounds_();
-            if ((++verdictPasses_ & 1023) == 0) [[unlikely]] maintainVerdictIndexes_();
+            if ((++verdictPasses_ & 1023) == 0) [[unlikely]] { maintainVerdictIndexes_(); maintainAutoIncWindows_(); }
             if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
             work += serveHeldPushReads_();
         }
@@ -2103,7 +2119,7 @@ private:
         }
         work += flushOwedAcksView_(nowNs);       // a worker without views still releases and times out View waiters
         publishVerdictCleanerBounds_();
-        if ((++verdictPasses_ & 1023) == 0) [[unlikely]] maintainVerdictIndexes_();
+        if ((++verdictPasses_ & 1023) == 0) [[unlikely]] { maintainVerdictIndexes_(); maintainAutoIncWindows_(); }
         if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
         work += serveHeldPushReads_();
         // 4b. background disk work → io backend, never an inline fsync
@@ -3384,11 +3400,16 @@ private:
         if (w->keyFieldId != kNoKeyField && w->keyWidth == 0)
             spdlog::warn("Worker {}: topic {} key field cannot be a topic key; wire-key check skipped (pre-existing topic)",
                          workerId_, w->topicId);
-        for (auto& sl : rcSlots_)
-            if (!sl.write && sl.replica->topicId() == w->topicId) {
+        for (auto& sl : rcSlots_) {
+            if (sl.replica->topicId() != w->topicId) continue;
+            if (!sl.write) {
                 sl.write = std::make_unique<PartitionWriteState>(PartitionWriteState{.spec = &spec});
+                installAutoInc_(*sl.write, static_cast<int32_t>(sl.replica->partitionId()));
                 bindVerdictHooks_(sl);
+            } else {
+                installAutoInc_(*sl.write, static_cast<int32_t>(sl.replica->partitionId()));
             }
+        }
         rebuildWriteById_();
     }
 
@@ -5173,6 +5194,7 @@ private:
         } catch (...) {
             spdlog::warn("Worker {}: becomeFollower threw unknown exception", workerId_);
         }
+        if (PartitionWriteState* ws = writeOf_(replica)) ws->autoInc.deactivate();   // P6-7: a follower assigns nothing
     }
 
     // -------------------------------------------------------------------
@@ -6376,6 +6398,9 @@ private:
     uint64_t typedRejects_      = 0;   // batches refused SchemaValidationFailed by checkTypedBatch
     uint64_t typedVersionAhead_ = 0;   // batches answered NotLeader: a record's version has not been installed here yet
     uint64_t hookChecks_        = 0;   // CheckedWriteHook::check ran
+    WriteFacts lastWriteFacts_{};
+    std::vector<uint8_t> autoIncScratch_;   // Part 06: a key-0 batch is copied here to patch its ids (maxIntakeBatchBytes_, cold)
+    std::size_t assignedBaseReserve_ = kAssignedBaseProducersInitial;
     std::array<uint64_t, std::to_underlying(HookRefusal::Count_)> hookRefusals_{};   // by reason
 
     // Phase 2c: filtered subscriptions (worker thread only).  filterSchemas_ is never erased (topic ids are never
@@ -7068,11 +7093,34 @@ private:
     }
     // Part 04 (P4-1): the leadership scan of a disk partition with a write state feeds its verdict markers and constraint-set
     // changes into that state.
+    // Part 06 (P6-7): an autoincrement partition's counter and side window are rebuilt by the same scan.
     static void bindVerdictHooks_(RcSlot& slot) noexcept {
-        if (slot.write && slot.rc && slot.replica->isDiskBacked())
-            slot.rc->setVerdictHooks(RcVerdictHooks{&verdictFeedBegin, &verdictFeedBatch, slot.write.get()});
-        else if (slot.rc)
+        if (slot.write && slot.rc && slot.replica->isDiskBacked()) {
+            const bool autoInc = slot.write->spec->autoIncrement;
+            slot.rc->setVerdictHooks(RcVerdictHooks{.begin = autoInc ? &autoIncFeedBegin : &verdictFeedBegin, .batch = &verdictFeedBatch, .ctx = slot.write.get(),
+                                                    .dataBatch = autoInc ? &autoIncFeedDataBatch : nullptr,
+                                                    .end = autoInc ? &autoIncFeedEnd : nullptr});
+        } else if (slot.rc) {
             slot.rc->setVerdictHooks(RcVerdictHooks{});
+        }
+    }
+    // Cold: an autoincrement partition's counter facts, its side window and the worker's patch scratch (sized once).
+    void installAutoInc_(PartitionWriteState& w, int32_t partition) {
+        const TopicWriteSpec& spec = *w.spec;
+        if (!spec.autoIncrement) return;
+        w.autoInc.configure(partition, std::max(spec.partitionCount, 1), effectiveAutoIncMax(spec.keyType, spec.autoIncrementMax),
+                            spec.autoIncrementReserve);
+        w.assignedBases.reserve(assignedBaseReserve_);
+        if (autoIncScratch_.size() < maxIntakeBatchBytes_) autoIncScratch_.resize(maxIntakeBatchBytes_);
+    }
+    // P6-8: a side window at or above 75 % load doubles, up to kAssignedBaseProducersMax producers; cold.
+    void maintainAutoIncWindows_() {
+        for (auto& sl : rcSlots_) {
+            if (!sl.write || !sl.write->spec->autoIncrement) continue;
+            AssignedBaseWindow& w = sl.write->assignedBases;
+            if (w.producers() * 4 >= w.capacity() * 3 && w.capacity() < kAssignedBaseProducersMax)
+                w.grow(std::min(w.capacity() * 2, kAssignedBaseProducersMax));
+        }
     }
     // Cold (ownership apply): carry still-owned states, create + reserve new
     // ones, drop the rest; re-resolve every subscription's cached pointer.
@@ -7105,8 +7153,10 @@ private:
             }
             installReadAhead_(slot);
             if (!slot.write)
-                if (const auto it = writeSpecs_.find(r->topicId()); it != writeSpecs_.end() && it->second->hasFacts())
+                if (const auto it = writeSpecs_.find(r->topicId()); it != writeSpecs_.end() && it->second->hasFacts()) {
                     slot.write = std::make_unique<PartitionWriteState>(PartitionWriteState{.spec = it->second.get()});
+                    installAutoInc_(*slot.write, static_cast<int32_t>(r->partitionId()));
+                }
             bindVerdictHooks_(slot);
             next.push_back(std::move(slot));
         }
@@ -9553,6 +9603,18 @@ private:
                          f.topicId, f.partition, hookRefusals_[std::to_underlying(why)]);
     }
 
+    // P6-3: the produce's first record is a key-0 create (an insert whose key is keyWidth zero bytes).  Cold: a duplicate only.
+    [[nodiscard]] static bool keyZeroFirstRecord_(const TopicWriteSpec& spec, std::span<const uint8_t> batch) noexcept {
+        bool zero = false;
+        (void)rune::protocol::forEachRecordSpan(batch.data(), batch.size(), [&](const rune::protocol::RecordSpan& r) {
+            if (r.index != 0) return;
+            zero = spec.keyWidth != 0 && r.key.size() == spec.keyWidth &&
+                   rune::protocol::record::intentOf(r.attributes) == static_cast<uint8_t>(rune::protocol::record::Intent::Insert) &&
+                   std::all_of(r.key.begin(), r.key.end(), [](char c) { return c == '\0'; });
+        });
+        return zero;
+    }
+
     int produceCore_(const ProduceFields& f, rune::storage::Log* log,
                      rune::replication::PartitionReplica* replica,
                      std::span<const uint8_t> rbSpan, int64_t nowNs) {
@@ -9815,7 +9877,8 @@ private:
         if (ws != nullptr) [[unlikely]] {
             const WriteFacts facts{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = false,
                                    .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_()};
-            CheckedWriteHook hook(*ws, facts, {});
+            lastWriteFacts_ = facts;
+            CheckedWriteHook hook(*ws, facts, ws->spec->autoIncrement ? std::span<uint8_t>(autoIncScratch_) : std::span<uint8_t>{});
             if (log != nullptr) {
                 outcome = rune::storage::handleProduceBatch(
                     rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
@@ -9831,6 +9894,12 @@ private:
             }
             if (hook.checked()) ++hookChecks_;
             if (hook.refusal() != HookRefusal::None) [[unlikely]] noteHookRefusal_(hook.refusal(), f);
+            if (!outcome.isOK()) [[unlikely]] hook.onProduceFailed();
+            // P6-3: an in-window retry of a key-0 batch answers the ids its original took, from the side window.
+            if (outcome.isDuplicate && outcome.baseOffset >= 0 && ws->spec->autoIncrement && keyZeroFirstRecord_(*ws->spec, rbSpan)) [[unlikely]] {
+                outcome.assignedBase = ws->assignedBases.find(f.producerId, outcome.baseOffset);
+                if (outcome.assignedBase == 0) ++ws->autoIncStats.windowMisses;
+            }
         } else if (log != nullptr) {
             outcome = rune::storage::handleProduceBatch(
                 rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
