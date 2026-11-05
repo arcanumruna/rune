@@ -21,7 +21,9 @@
 //   (10) the deleted namespaces have been erased (reaper to the end): absent from the listing, their directories gone.
 // The Phase 1 TODO (delete invariant) is closed by (5), (6) and (10).
 //
-// The plan caps a seed at 2000 steps; 300 keeps the 20 seeds fast (RUNE_NS_STRESS_STEPS overrides, hard cap 2000).
+// The plan caps a seed at 2000 steps; 150 keeps each of the 40 seeds well under 20 s (RUNE_NS_STRESS_STEPS overrides,
+// hard cap 2000).  #883: was 20 seeds of 300 steps (up to 33 s a seed on CI); 40 x 150 keeps the 6000 steps and the
+// 120 restarts in total, each seed a different world, at half the depth (a deep run is RUNE_NS_STRESS_STEPS=2000).
 // Every failure message carries seed=<n> step=<k> op=<...> (SCOPED_TRACE).  Every wait has a deadline (a hard cap that
 // FAILS, never a hang): the broker runs on its own threads, so the bounded polls are on its observable state only.
 
@@ -30,6 +32,7 @@
 #include "support/NamespaceLifecycleMatrixExpectations.h"
 
 #include <rune/client/Client.h>
+#include <rune/gateway/ClientGateway.h>
 #include <rune/client/Completions.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/subscriber/Subscription.h>
@@ -173,11 +176,14 @@ struct Fingerprint {
 
 class NamespaceStressRegression : public ::testing::TestWithParam<uint32_t> {
 protected:
-    NamespaceStressRegression() : seed_(GetParam()), r_("nsst" + std::to_string(GetParam())), rng_(GetParam()) {}
+    // The real client's ScramCache: PBKDF2 once per user and wire, not on every re-login (#883).
+    NamespaceStressRegression() : seed_(GetParam()), r_("nsst" + std::to_string(GetParam())), rng_(GetParam()) {
+        r_.wire().cacheSaltedPasswords(true);
+    }
     ~NamespaceStressRegression() override { closeAllTxnClients(); }
 
     static int stepsFromEnv() {
-        int steps = 300;
+        int steps = 150;
         if (const char* e = std::getenv("RUNE_NS_STRESS_STEPS")) steps = std::atoi(e);
         return std::clamp(steps, 1, 2000);
     }
@@ -205,10 +211,13 @@ protected:
     std::filesystem::path dataDir() { return r_.broker().dir() / "broker"; }
 
     // ── sessions ────────────────────────────────────────────────────────────────────────────────────────────
-    /// Sessions idle for > 5 s are reaped by the broker (no keepalives): a session unused for 2 s is logged in again.
+    /// The broker reaps a session idle for 10 s (ClientGateway::kDefaultSessionTimeoutNs), keepalives or not: one used
+    /// within the last 8 s is still live (`last` is stamped before the request, so the broker saw it later).  Older ones
+    /// are logged in again.  (Was 2 s against a 5 s reap; every extra re-login cost a connect + SCRAM, #883.)
     int64_t fresh(Session& s, const std::string& user, const std::string& pw) {
         const auto now = Clk::now();
-        if (s.sid == 0 || now - s.last > std::chrono::seconds(2)) s.sid = r_.login(user, pw, pc::kClientVersionNamespaces);
+        static_assert(rune::gateway::ClientGateway::kDefaultSessionTimeoutNs == 10'000'000'000LL, "re-derive the 8 s below");
+        if (s.sid == 0 || now - s.last > std::chrono::seconds(8)) s.sid = r_.login(user, pw, pc::kClientVersionNamespaces);
         s.last = now;
         return s.sid;
     }
@@ -801,6 +810,7 @@ protected:
         c.offerCrypto     = true;
         c.tlsTrustPem     = AuthBroker::tlsCaPem();
         c.topics          = std::move(topics);
+        c.driverCountersBytes = rune::client::transport::kMinDriverCountersBytes;   // a client per transaction: a small CnC (#883)
         auto cl = std::make_unique<rc::Client>(c);
         cl->connectAndWait(std::chrono::seconds(20));
         return cl;
@@ -1085,6 +1095,7 @@ protected:
         ASSERT_TRUE(awaitIds(want)) << "before restart: model topics not all listed";
         const Fingerprint f1 = fingerprint();
         r_.restart();
+        r_.wire().cacheSaltedPasswords(true);   // a fresh wire
         root_ = {};
         root2_ = {};
         sess_.clear();
@@ -1212,7 +1223,7 @@ protected:
 
 TEST_P(NamespaceStressRegression, SeededModelRegression) { run(); }
 
-INSTANTIATE_TEST_SUITE_P(Seeds, NamespaceStressRegression, ::testing::Range(1u, 21u));
+INSTANTIATE_TEST_SUITE_P(Seeds, NamespaceStressRegression, ::testing::Range(1u, 41u));
 
 
 // ── the 3-node variant: the catalog ops under random leader changes (three real AdminWorkers, CatalogTrio) ────────────────
