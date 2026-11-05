@@ -1349,6 +1349,15 @@ void captureBounds(AuthTrio& t, ServingBounds& b) {
 int64_t msSince(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 }
+/// #883: how long the survivors are watched after their leader is lost.  A survivor that stops hearing a leader lapses
+/// at most F (the staleness bound) after the last heartbeat, i.e. within F of the cut; one that is refreshed by the
+/// new leader cannot lapse later for the old one's loss.  So the watch ends once a new leader is settled AND 2 F have
+/// passed since it was (never before 2 F after the cut), instead of a fixed 20 s; 20 s stays the hard cap, where the
+/// "a new __security leader" expectation fails if none was settled.
+bool watchingSurvivors(int64_t sinceMs, int64_t newLeaderAtMs, const ServingBounds& b) {
+    if (sinceMs >= 20'000) return false;
+    return newLeaderAtMs < 0 || sinceMs < std::max<int64_t>(newLeaderAtMs, 0) + 2 * b.fMs;
+}
 }  // namespace
 
 // The healed zombie: it believed it led `__security` through the whole partition, so its admin verdict never lapsed;
@@ -1457,12 +1466,13 @@ TEST(AuthRestartAdversarialRegression, ASecurityLeaderCrashNeverMakesTheSurvivor
     const auto crashed = std::chrono::steady_clock::now();
     std::map<int, std::string> lapses;
     bool newLeader = false;
-    while (msSince(crashed) < 20'000) {
+    int64_t newLeaderAt = -1;
+    while (watchingSurvivors(msSince(crashed), newLeaderAt, b)) {
         for (int id : survivors) {
             const std::string s = t.node(id).securityServingForTest();
             if (s != "Serving" && lapses[id].empty()) lapses[id] = s + " at " + std::to_string(msSince(crashed)) + " ms";
         }
-        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster()); newLeader = l > 0 && l != leader; }
+        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster()); newLeader = l > 0 && l != leader; if (newLeader) newLeaderAt = msSince(crashed); }
         std::this_thread::sleep_for(5ms);
     }
     EXPECT_TRUE(newLeader) << "a new __security leader";
@@ -1490,12 +1500,13 @@ TEST(AuthRestartAdversarialRegression, ACutOffSecurityLeaderNeverMakesTheSurvivo
     const auto cut = std::chrono::steady_clock::now();
     std::map<int, std::string> lapses;
     bool newLeader = false;
-    while (msSince(cut) < 20'000) {
+    int64_t newLeaderAt = -1;
+    while (watchingSurvivors(msSince(cut), newLeaderAt, b)) {
         for (int id : survivors) {
             const std::string s = t.node(id).securityServingForTest();
             if (s != "Serving" && lapses[id].empty()) lapses[id] = s + " at " + std::to_string(msSince(cut)) + " ms";
         }
-        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster(), leader); newLeader = l > 0 && l != leader; }
+        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster(), leader); newLeader = l > 0 && l != leader; if (newLeader) newLeaderAt = msSince(cut); }
         std::this_thread::sleep_for(5ms);
     }
     EXPECT_TRUE(newLeader) << "a new __security leader";
@@ -1528,12 +1539,13 @@ TEST(AuthRestartAdversarialRegression, ASecurityLeaderCrashUnderASlowElectionNev
     const auto crashed = std::chrono::steady_clock::now();
     std::map<int, std::string> lapses;
     bool newLeader = false;
-    while (msSince(crashed) < 20'000) {
+    int64_t newLeaderAt = -1;
+    while (watchingSurvivors(msSince(crashed), newLeaderAt, b)) {
         for (int id : survivors) {
             const std::string s = t.node(id).securityServingForTest();
             if (s != "Serving" && lapses[id].empty()) lapses[id] = s + " at " + std::to_string(msSince(crashed)) + " ms";
         }
-        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster()); newLeader = l > 0 && l != leader; }
+        if (!newLeader) { const int32_t l = settledSecurityLeader(t.cluster()); newLeader = l > 0 && l != leader; if (newLeader) newLeaderAt = msSince(crashed); }
         std::this_thread::sleep_for(5ms);
     }
     EXPECT_TRUE(newLeader) << "a new __security leader";
