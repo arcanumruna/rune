@@ -88,7 +88,7 @@ public:
     bool sendFetchResponse(rune::replication::NodeId, const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
-/// An autoincrement source (Part 06): the topic's partition count P, key type, reservation block and id cap.  The rig owns partition 0.
+/// An autoincrement source (Part 06): the topic's partition count P, key type, reservation block and id cap.  The rig owns RigTuning::partition.
 struct AutoIncShape {
     int32_t partitions = 1;
     rune::codec::PrimType keyType = rune::codec::PrimType::UInt64;
@@ -96,8 +96,9 @@ struct AutoIncShape {
     uint64_t max = rune::protocol::kAutoIncrementMaxDefault;
 };
 
-/// The replica and worker settings a cell may change: minIsr and durabilityTier (2 = Strict) of the partition, the acks=all commit-wait (0 = the default).
-struct RigTuning { int minIsr = 1; uint8_t durabilityTier = 1; int64_t ackTimeoutNs = 0; };
+/// The replica and worker settings a cell may change: minIsr and durabilityTier (2 = Strict) of the partition, the acks=all commit-wait (0 = the default),
+/// and the partition of topic 6 the rig owns (an autoincrement cell at P > 1 owns another than 0).
+struct RigTuning { int minIsr = 1; uint8_t durabilityTier = 1; int64_t ackTimeoutNs = 0; int32_t partition = 0; };
 
 class VerdictRig {
 public:
@@ -143,27 +144,10 @@ public:
         ASSERT_TRUE(autoIncState().has_value()) << "the first scan never made the counter Ready";
         ASSERT_TRUE(keyIndexLogged_()) << "the key index never became the logged set's member";
     }
-    [[nodiscard]] std::optional<AutoIncReady> autoIncState() const { return worker->autoIncStateForTest(kSrc, 0); }
-    [[nodiscard]] const AutoIncStats& autoIncStats() const { return *worker->autoIncStatsForTest(kSrc, 0); }
+    [[nodiscard]] std::optional<AutoIncReady> autoIncState() const { return worker->autoIncStateForTest(kSrc, tuning_.partition); }
+    [[nodiscard]] const AutoIncStats& autoIncStats() const { return *worker->autoIncStatsForTest(kSrc, tuning_.partition); }
     /// The reservation records (type 16) in the log as (offset, reserved-through n), in offset order.
-    [[nodiscard]] std::vector<std::pair<int64_t, uint64_t>> reservations() const {
-        std::vector<std::pair<int64_t, uint64_t>> out;
-        for (int64_t off = log->logStartOffset(); off < leo();) {
-            const auto v = log->readView(off, 1 << 20);
-            if (v.empty()) break;
-            for (std::size_t p = 0; p + 12 <= v.len;) {
-                int32_t blen = 0;
-                std::memcpy(&blen, v.data + p + 8, 4);
-                const std::size_t total = 12 + static_cast<std::size_t>(blen);
-                if (p + total > v.len) break;
-                if (const auto r = rune::storage::control_record::parseReservation(v.data + p, total))
-                    out.emplace_back(rune::protocol::RecordBatchReader(v.data + p, total).baseOffset(), *r);
-                p += total;
-            }
-            off = v.nextOffset;
-        }
-        return out;
-    }
+    [[nodiscard]] std::vector<std::pair<int64_t, uint64_t>> reservations() const { return readLog().reservations; }
     /// Session kAckSession leaves grantAll: it is bound to a table that grants WRITE on the source and, with `import`, IMPORT.
     /// Both bitmaps are sent every time: table 0 keeps a bitmap it is not sent again.
     void bindGrants(bool import) {
@@ -218,9 +202,9 @@ public:
         std::string key(kw, '\0');
         for (uint64_t id = 0; id < 4096; ++id) {
             for (uint32_t i = 0; i < kw; ++i) key[i] = i < 8 ? static_cast<char>(id >> (8 * i)) : '\0';
-            if (vs->keyIndexContainsForTest(kSrc, 0, key)) out.insert(std::to_string(id));
+            if (vs->keyIndexContainsForTest(kSrc, tuning_.partition, key)) out.insert(std::to_string(id));
         }
-        EXPECT_EQ(out.size(), vs->keyIndexSizeForTest(kSrc, 0)) << "a key outside [0, 4096)";
+        EXPECT_EQ(out.size(), vs->keyIndexSizeForTest(kSrc, tuning_.partition)) << "a key outside [0, 4096)";
         return out;
     }
 
@@ -272,7 +256,7 @@ public:
     }
     /// The follower (node 2) fetches everything, or up to `to`: the HW moves there.
     void followerFetch(int64_t to = -1) {
-        rune::replication::FetchRequestMsg fr{epoch_, 0, 2, to < 0 ? leo() : to, 1 << 20, kSrc};
+        rune::replication::FetchRequestMsg fr{epoch_, tuning_.partition, 2, to < 0 ? leo() : to, 1 << 20, kSrc};
         (void)replica->onFetchRequest(fr, now);
         passes(2);
     }
@@ -289,7 +273,7 @@ public:
     /// demote() through the worker's BecomeFollower op (the runtime's path).
     void demoteByOp() {
         WorkerOp op;
-        op.type = WorkerOp::Type::BecomeFollower; op.topicId = kSrc; op.partition = 0; op.replica = replica.get();
+        op.type = WorkerOp::Type::BecomeFollower; op.topicId = kSrc; op.partition = tuning_.partition; op.replica = replica.get();
         op.logPtr = replica->log(); op.roleEpoch = ++epoch_; op.roleLeaderId = 2;
         op.targetReplicaId = replica->registryId(); op.incarnation = replica->incarnation();
         send(std::move(op));
@@ -323,7 +307,7 @@ public:
         }
         rune::replication::FetchResponseMsg resp{};
         resp.leaderEpoch = static_cast<rune::replication::Epoch>(epoch_);
-        resp.partition = 0; resp.topicId = kSrc; resp.highWatermark = base; resp.logStartOffset = log->logStartOffset();
+        resp.partition = tuning_.partition; resp.topicId = kSrc; resp.highWatermark = base; resp.logStartOffset = log->logStartOffset();
         resp.records = std::span<const uint8_t>(bytes.data(), bytes.size());
         replica->applyReplicated(resp);
     }
@@ -453,7 +437,7 @@ public:
         const auto bytes = batch(recs, -1, -1, keyShape_);
         for (int i = 0; i < kMaxPass; ++i) {
             WorkerOp op;
-            op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = 0;
+            op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = tuning_.partition;
             op.replica = replica.get(); op.logPtr = log.get(); op.sessionId = 1;
             op.correlationId = ++corr; op.durabilityTier = 1; op.recordBatchBytes = bytes;
             EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
@@ -486,7 +470,7 @@ public:
         if (r == nullptr) return std::nullopt;
         return rune::view::readSlot(r, *L, 1).i;
     }
-    [[nodiscard]] const VerdictSourceStats* stats() const { return worker->verdictStatsForTest(kSrc, 0); }
+    [[nodiscard]] const VerdictSourceStats* stats() const { return worker->verdictStatsForTest(kSrc, tuning_.partition); }
     [[nodiscard]] int64_t leo() const { return replica->logEndOffset(); }
 
 
@@ -529,7 +513,7 @@ public:
         WorkerOp op;
         op.type = WorkerOp::Type::Subscribe;
         op.subscriptionId = id; op.sessionId = 4200 + id; op.correlationId = 9000 + id;
-        op.topicId = kSrc; op.partition = 0; op.nextOffset = from;
+        op.topicId = kSrc; op.partition = tuning_.partition; op.nextOffset = from;
         op.replica = replica.get(); op.logPtr = log.get();
         if (kind == SubKind::Group) { op.isGroup = 1; op.groupCarrierReceived = 1; }
         if (kind == SubKind::Filtered) {
@@ -556,7 +540,7 @@ public:
                 if (iter == kCollectMaxPasses) { ADD_FAILURE() << "collect(" << subId << "): no quiescence after " << kCollectMaxPasses << " PushReads"; break; }
                 WorkerOp op;
                 op.type = WorkerOp::Type::PushRead;
-                op.subscriptionId = subId; op.sessionId = 4200 + subId; op.topicId = kSrc; op.partition = 0;
+                op.subscriptionId = subId; op.sessionId = 4200 + subId; op.topicId = kSrc; op.partition = tuning_.partition;
                 op.nextOffset = cursors_[subId]; op.hwBound = leo();
                 op.replica = replica.get(); op.logPtr = log.get();
                 EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
@@ -639,7 +623,7 @@ public:
     int64_t produceBytes(const std::vector<uint8_t>& bytes, uint8_t acks, int64_t pid = -1, int32_t seq = -1) {
         const int64_t c = ++corr;
         rune::protocol::client::Produce m;
-        m.sessionId = kAckSession; m.correlationId = c; m.topicId = kSrc; m.partition = 0; m.partitionKnown = 1;
+        m.sessionId = kAckSession; m.correlationId = c; m.topicId = kSrc; m.partition = tuning_.partition; m.partitionKnown = 1;
         m.acks = acks; m.producerId = pid; m.producerEpoch = 0; m.baseSequence = seq;
         m.recordBatch = std::span<const uint8_t>(bytes);
         std::vector<uint8_t> f(m.encodedSize()); m.encode(f.data());
@@ -655,7 +639,7 @@ public:
     int64_t routedFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool importGranted = true) {
         const auto bytes = batch(recs, pid, seq, keyShape_);
         WorkerOp op;
-        op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = 0;
+        op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = tuning_.partition;
         op.replica = replica.get(); op.logPtr = log.get();
         op.sessionId = kAckSession; op.correlationId = ++corr; op.acks = acks;
         op.producerId = pid; op.producerEpoch = 0; op.baseSequence = seq;
@@ -670,7 +654,7 @@ public:
     /// A transaction coordinator's COMMIT / ABORT marker for `pid`.
     void marker(int64_t pid, bool commit) {
         WorkerOp op;
-        op.type = WorkerOp::Type::AppendControlRecord; op.topicId = kSrc; op.partition = 0; op.replica = replica.get();
+        op.type = WorkerOp::Type::AppendControlRecord; op.topicId = kSrc; op.partition = tuning_.partition; op.replica = replica.get();
         op.logPtr = log.get(); op.correlationId = 9000 + pid; op.producerId = pid;
         op.targetReplicaId = replica->registryId(); op.incarnation = replica->incarnation();
         op.recordBatchBytes = rune::transaction::ControlMarker::build(
@@ -727,15 +711,15 @@ public:
     }
 
     // ---- the log, read back ----
-    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; };
+    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; uint64_t valueId = 0; };   ///< valueId: the value's own key field
     struct RigChange { int64_t offset; std::vector<rune::storage::control_record::ChangeMember> members; };
     struct RigMarker { int64_t offset; rune::storage::control_record::MarkerHeader header; std::vector<std::tuple<int64_t, uint16_t, uint32_t>> entries; bool horizon = false; };
-    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; };
+    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; std::vector<std::pair<int64_t, uint64_t>> reservations; };   ///< reservations: (offset, reserved-through n)
 
     /// Every data record, change record and marker below `through`, in offset order, straight from the segments.
     [[nodiscard]] RigLog readLog(int64_t through = INT64_MAX) const;
 
-    [[nodiscard]] const PartitionWriteState* writeState() const { return worker->writeStateForTest(kSrc, 0); }
+    [[nodiscard]] const PartitionWriteState* writeState() const { return worker->writeStateForTest(kSrc, tuning_.partition); }
 
     /// One past the last data record or change record: what the judge and the markers must cover.
     [[nodiscard]] int64_t dataEnd() const {
@@ -751,13 +735,13 @@ public:
     bool driveUntilJudged(int64_t target = -1, int maxPasses = kMaxPass) {
         if (target < 0) target = dataEnd();
         for (int i = 0; i < maxPasses; ++i) {
-            const VerdictSource* judge = vs->verdictSource(kSrc, 0);
+            const VerdictSource* judge = vs->verdictSource(kSrc, tuning_.partition);
             const PartitionWriteState* w = writeState();
             if ((judge == nullptr || judge->judgedThrough() >= target) && w != nullptr && w->markers.committedThrough() >= target) return true;   // no judge: the last member left
             if (isr_.size() > 1 && i % 8 == 0) followerFetch();
             pass();
         }
-        const VerdictSource* judge = vs->verdictSource(kSrc, 0);
+        const VerdictSource* judge = vs->verdictSource(kSrc, tuning_.partition);
         const PartitionWriteState* w = writeState();
         ADD_FAILURE() << "judgedThrough " << (judge ? judge->judgedThrough() : -9) << " committed " << (w ? w->markers.committedThrough() : -9) << " target " << target << " leo " << leo() << " hw " << replica->highWatermark() << " waiting " << (judge ? judge->waitingForInstall() : -1) << " stalled " << (judge ? judge->stalled() : -1) << " stalls " << (stats() ? stats()->verdictStalls : 0) << " waitsInstall " << (stats() ? stats()->judgeWaitsForInstall : 0) << " markers " << (w ? w->markers.appendedThrough() : -9);
         return false;
@@ -987,7 +971,7 @@ private:
         log = std::make_unique<rune::storage::Log>(logDir_.string(), rollBytes_);
         log->recover();
         rune::replication::PartitionConfig c{};
-        c.topicId = kSrc; c.partitionId = 0; c.selfId = 1; c.minIsr = tuning_.minIsr; c.durabilityTier = tuning_.durabilityTier;
+        c.topicId = kSrc; c.partitionId = tuning_.partition; c.selfId = 1; c.minIsr = tuning_.minIsr; c.durabilityTier = tuning_.durabilityTier;
         c.replicaLagMaxMs = 1'000'000; c.replicaLagMaxOffset = 1'000'000;
         c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL;
         c.maxFetchBytes = 1 << 20; c.pushOnAppend = false;
@@ -1062,17 +1046,20 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
                     const std::size_t kw = rs.key.size();   // the wire key is the id, kw bytes wide
                     for (std::size_t i = 0; i < std::min<std::size_t>(kw, 8); ++i) id |= uint64_t(uint8_t(rs.key[i])) << (8 * i);
                     const auto intent = static_cast<uint8_t>(rs.attributes & 0x03);
-                    if (rs.value.empty()) { out.data.push_back({rs.offset, id, 0, 0, true, intent}); return; }
+                    if (rs.value.empty()) { out.data.push_back({rs.offset, id, 0, 0, true, intent, id}); return; }
                     const auto* val = reinterpret_cast<const uint8_t*>(rs.value.data());
-                    uint64_t x = 0;
+                    uint64_t x = 0, valueId = 0;
                     for (int i = 0; i < 8; ++i) x |= uint64_t(val[4 + kw + i]) << (8 * i);
-                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[4 + kw + 8]), false, intent});
+                    for (std::size_t i = 0; i < std::min<std::size_t>(kw, 8); ++i) valueId |= uint64_t(val[4 + i]) << (8 * i);
+                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[4 + kw + 8]), false, intent, valueId});
                 });
             } else if (r.baseOffset() < through) {
                 if (const auto c = crl::parseControl(b, total); c && c->type == crl::kConstraintSetChange) {
                     std::array<crl::ChangeMember, 32> ms{};
                     uint32_t setId = 0; uint16_t n = 0;
                     if (crl::parseConstraintSetChange(*c, setId, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n)});
+                } else if (const auto reserved = crl::parseReservation(b, total)) {
+                    out.reservations.emplace_back(r.baseOffset(), *reserved);
                 } else if (c && c->type == crl::kVerdictMarker) {
                     VerdictRig::RigMarker m{r.baseOffset(), *crl::parseMarkerHeader(*c), {}, r.hasDeleteHorizon()};
                     (void)crl::forEachMarkerEntry(*c, [&](int64_t o, uint16_t cc, uint32_t cid) { m.entries.emplace_back(o, cc, cid); });
