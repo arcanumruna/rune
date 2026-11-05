@@ -484,6 +484,35 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
 - The key field must be at most 8 bytes wide until wide keys ship; a wider one is refused at DDL ("key.index needs a key
   of at most 8 bytes"). `key.index` needs every broker at feature level 5.
 
+## Autoincrement
+
+- **Reservations.** The leader of a partition of an `autoincrement` topic reserves ids in the log: before it hands out an id
+  above the reserved `n`, it appends a reservation record (control record 16) that reserves a block of `autoincrement.reserve`
+  more (4096 by default). A new leader, and every restart, reads the highest reservation and starts above it. The ids that
+  were reserved but not stored are never handed out again: a failover leaves a gap of up to one block, counted in
+  `idsBurned`. So do a rejected record and an aborted transaction. An import above the counter moves it, and reserves
+  through its id.
+- **Retries.** The leader keeps the ids of the last 32 key-0 batches of each idempotent producer, so a retried batch is
+  answered with its original ids. A new leader rebuilds this side window from the log during its leadership scan; until
+  the scan ends a create is answered `NotLeader` and retried by the client. The window starts at 1024 producers and doubles,
+  from a cold step that runs about every 1,024 passes and whenever it is 75 % full, up to 1,048,576. While it is full, a
+  create from a producer it does not hold is answered `NotLeader`.
+- **The cleaner.** `cleanup.policy = compact` with no retention: the log start never moves and compaction removes no live
+  id. The cleaner removes every reservation record except the latest. It copies the last 32 idempotent data batches of each
+  live producer whole, so a retry after a failover still finds its ids; a deleted id's tombstone is kept
+  while such a batch holds that id. A producer that sent nothing for `RUNE_PRODUCER_ID_EXPIRATION_MS` (by the segment
+  append time on the broker, not the client's timestamps) is no longer protected. The memory budget for these batches is
+  the producer-tails capacity times about 1.3 KB; past it the cleaner logs once "the producer batch window ... is over its
+  budget" and protects only each producer's last batch, so a late retry may complete `StoredIdUnknown`. Raise
+  `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` to avoid it.
+- **Stats** per partition: `idsBurned`, `reservationsAppended`, `keyZeroBatches`, `importsMovedCounter`,
+  `windowFullRefusals`, `windowMisses` and `assignedKeyExists`; the checked-writes stats (C16) serve the counter, the
+  reserved-through id and `idsBurned` as ids 8 to 10, the first two only on a leader whose scan has finished.
+- **Alarms.** `windowMisses` counts a retried key-0 batch the window could not answer (the client sees `StoredIdUnknown`); it
+  should stay 0. `assignedKeyExists` counts an assigned id the key index already held and logs `AUTOINC-ID-REUSE` at critical
+  level with the topic, partition and id: the counter handed out an id twice. Both are asserted 0 by the tests. A
+  `KeyExists` on an import below the counter is the expected answer and is never counted.
+
 ## Upgrades
 
 - Upgrade **brokers before clients**: a new client defining a transient topic against an older broker silently gets a

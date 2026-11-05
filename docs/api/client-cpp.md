@@ -159,9 +159,12 @@ is replicated in memory and never written to disk. The usual way to create topic
 `TopicOptions::keyFeatures.keyIndex = true` creates the topic with a **key index**, which
 write intents need. The broker refuses it with `InvalidRequest` and a detail: "key.index needs every broker at feature level
 5", "key.index needs a typed topic", "key.index needs a key", "key.index needs a persisted topic", "key.index needs a key of
-at most 8 bytes". The other `TopicKeyFeatures` fields (`autoIncrement`, `partitioner`, `autoIncrementMax`,
-`autoIncrementReserve`) must stay at their defaults ("autoincrement is not supported by this broker yet"). A define with
-key features against a broker older than version 10 completes with `OpStatus::BrokerTooOld`.
+at most 8 bytes". `autoIncrement` (with `autoIncrementMax` and `autoIncrementReserve`) creates an
+[autoincrement](#autoincrement) topic and implies the key index and `partitioner = Modulo`; the broker refuses it with
+`InvalidRequest` and a detail such as "autoincrement needs cleanup.policy = compact" or "autoincrement needs a new topic".
+A define with key features against a broker older than version 10 completes with `OpStatus::BrokerTooOld`.
+`TopicSchemaResult::keyFeatures` (valid when `hasKeyFeatures`) reports the stored features of an opened topic; `openTopicAndWait`
+takes the handle's partitioner from it.
 
 `DefineTopicResult::topicId` plus the partition count you passed make the `TopicHandle{topicId, partitionCount}` that a
 producer needs. `Client::topic(name)` finds a handle only in the static `ClientConfig::topics` list.
@@ -208,7 +211,7 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
   `offsetOf(i)`); the other records were stored at base + index. A batch of one record keeps the single-record form
   (`BrokerError`, value -1). The completion reserves its full size up front (`claimBatch` above the queue's record
   limit returns `MessageTooLarge`). A retry inside the broker's window replays the original verdicts; a retry outside it completes the whole batch
-  with `OpStatus::VerdictUnknown` (`errorCode` 21). `OpStatus::StoredIdUnknown` (13) is reserved. A transactional
+  with `OpStatus::VerdictUnknown` (`errorCode` 21). `OpStatus::StoredIdUnknown` (13) is the same for a key-0 create (see [Autoincrement](#autoincrement)). A transactional
   producer never sends the `View` bit. `SendResult::WriteNotAllowed` reports a write the broker refuses for the topic. On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
 - **`WriteIntent`**: every `send`, `trySend`, `sendTo` and `trySendTo` takes a trailing `WriteIntent` (`Upsert`, the
   default, `Insert` or `Update`), carried in the record's attribute bits 0-1. See [Write intents](#write-intents).
@@ -251,6 +254,29 @@ in offset order, against the records accepted before it:
   `KeyExists` against itself. A retry outside the broker's window completes with `OpStatus::VerdictUnknown`.
 - `Producer::sendAndWait(topic, key, value, intent, timeout)` sends one record and returns its `Completion`.
 - Plain upserts and deletes to a key-index topic need no `View` and no particular client version.
+
+### Autoincrement
+
+On a topic created with `autoIncrement` the broker assigns the key. A record whose key field is 0, written with
+`Insert`, is a **key-0 create**: `typed.insertAndWait(rec).key()` is the id the broker gave it, and a `Send` of a key-0 batch
+completes `Ok` with `value` = the offset and `aux` = the id (`assignedKeyOf(completion)`; 0 for a record that was rejected).
+
+- **Requirements**: a key-0 create needs an idempotent producer with `Acks::All`; use `Acks::All | Acks::View` where a
+  constraint can reject the create, so the completion carries the verdict. A key-0 create is exempt from the intent rules
+  that need `View` and from the transaction refusal.
+- **Batches and routing**: the producer never puts a key-0 create in a partition batch with other records, or the reverse. Key-0
+  creates go to one partition at a time and move to the next after 64 records; every other record on the topic routes by
+  `id mod partitions`.
+- **Refused locally** (`SendResult::WriteNotAllowed`; the blocking forms throw `std::invalid_argument` with the text in
+  quotes): a key-0 create from a producer that is not idempotent ("autoincrement creates need an idempotent producer") or without
+  `All` ("autoincrement creates need acks All"), and a plain upsert ("an autoincrement topic takes no plain upserts"). Against
+  a broker below version 10 the batch completes `OpStatus::BrokerTooOld`.
+- **Explicit ids** (an import) answer `key()` 0: the id is the one you wrote. They need the `IMPORT` grant, `Insert`, and
+  `All | View` on an idempotent producer.
+- **Lost acks**: a retry inside the broker's window answers the original ids. A retry the broker can no longer match
+  completes the whole batch with `OpStatus::StoredIdUnknown`: it was stored, its ids are unknown.
+- **Orphaned rows**: an `insertAndWait` that times out may have created the row. Look it up through a unique view before
+  inserting again.
 
 ### Acknowledgements
 
@@ -543,7 +569,7 @@ players.send(p);                                                       // routed
   fire-and-forget form. Each has an `…AndWait(…, timeout = kDefaultWriteWait /* 30 s */)` that returns a `WriteResult`:
   `ok()`, `status()` (`Ok`, `BrokerError`, `Timeout`, `BrokerTooOld`, `VerdictUnknown`, `DeliveryFailed`, `Closed` when
   the client closes first), `code()` (56, 57, 39 or 24 for a `BrokerError`), `constraintId()`, `offset()` and `key()`
-  (the broker-assigned key, not the record's; always 0 until autoincrement ships). A local refusal (see
+  (the broker-assigned key of an autoincrement create, not the record's; 0 for every other write). A local refusal (see
   [Write intents](#write-intents)) or an over-long key throws `std::invalid_argument`. An oversized record throws
   `std::invalid_argument` from the `…AndWait` forms and `std::length_error` from the token forms. `remove` and
   `removeExisting` build the record key exactly as `send(rec)` does, so a delete reaches the partition of the write.

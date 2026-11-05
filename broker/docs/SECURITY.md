@@ -14,7 +14,7 @@ For what changed for existing deployments, see [the release notes](release-notes
 - **Principal:** a user. Services such as world servers are users too.
 - **Role:** a named set of grants.
 - **Grant:** an operation on a resource type, matched by an exact name or a prefix.
-  - Operations: `READ`, `WRITE`, `CREATE`, `ALTER`, `DROP`, `DESCRIBE`, `ADMIN`.
+  - Operations: `READ`, `WRITE`, `CREATE`, `ALTER`, `DROP`, `DESCRIBE`, `ADMIN`, `IMPORT`.
   - Resource types: `CLUSTER`, `TOPIC`, `VIEW`, `GROUP`, `TRANSACTIONAL_ID`.
   - Pattern: `'name'` (exact) or `PREFIX 'p'`.
 - A user receives roles, and can also receive grants directly. The effective permissions are the
@@ -24,12 +24,15 @@ For what changed for existing deployments, see [the release notes](release-notes
 Rules that keep the model small (D15 to D17):
 
 - Any granted operation on an object implies `DESCRIBE` on it.
-- Valid pairs: `TOPIC`: `READ WRITE CREATE ALTER DROP DESCRIBE`. `VIEW`: `READ CREATE ALTER DROP DESCRIBE`.
+- Valid pairs: `TOPIC`: `READ WRITE CREATE ALTER DROP DESCRIBE IMPORT`. `VIEW`: `READ CREATE ALTER DROP DESCRIBE`.
   `GROUP`: `READ DESCRIBE`. `TRANSACTIONAL_ID`: `WRITE DESCRIBE`. Any other pair is refused.
 - `CLUSTER` takes `CREATE ALTER DROP DESCRIBE ADMIN` only. `CREATE`, `ALTER`, `DROP` and `DESCRIBE`
   on `CLUSTER` apply to every topic and view (`DESCRIBE` also to groups and transactional ids).
   `READ` and `WRITE` on `CLUSTER` are refused: use `PREFIX ''`.
 - `ADMIN ON CLUSTER` makes a security admin. It implies no data access.
+- `IMPORT` is a `TOPIC` operation that nothing implies, not `ADMIN` and not a `CLUSTER` grant. It lets a writer store
+  records with explicit ids on an autoincrement topic (key-0 creates need only `WRITE`). A `grant import` is refused with
+  `InvalidRequest` until every broker is at feature level 5, since an older broker cannot read the operation.
 - Internal objects (names starting `__`) cannot be granted by pattern.
 - User and role names are `[A-Za-z0-9._@-]`, 1 to 128 characters, not starting with `__`.
 
@@ -38,6 +41,7 @@ Rules that keep the model small (D15 to D17):
 | Request | Needs |
 |---|---|
 | Produce, transactional produce | `WRITE` on the topic |
+| Produce a record with an explicit key to an autoincrement topic (an import) | `IMPORT` on the topic, as well as `WRITE`; without it `NotAuthorized` |
 | Transaction init / markers | `WRITE` on the transactional id |
 | `AddOffsetsToTxn` / `TxnOffsetCommit` (D18) | `WRITE` on the transactional id and `READ` on the group |
 | Subscribe (any form) | `READ` on the topic |
