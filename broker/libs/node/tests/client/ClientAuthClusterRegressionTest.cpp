@@ -369,10 +369,11 @@ TEST(ClientAuthClusterRegression, EosPipelineSurvivesTheCoordinatorCrashOnAnAuth
     }));
     const int seed = ctl == 1 ? 2 : 1;
     int seq = 0;
-    auto client = [&](int id, std::vector<rc::TopicSpec> topics) {
+    auto client = [&](int id, std::vector<rc::TopicSpec> topics, int64_t staleNs = 0) {
         std::unique_ptr<rc::Client> cl;
         auto cfg = configFor(t, id, "eos-user", "eos-user-password-1", seq++);
         cfg.topics = std::move(topics);
+        cfg.responseTimeoutNs = staleNs;
         EXPECT_TRUE(AuthTrio::until(60s, [&] {
             try { cl = std::make_unique<rc::Client>(cfg); cl->connectAndWait(30s); return true; }
             catch (const std::exception&) { cl.reset(); return false; }
@@ -409,7 +410,10 @@ TEST(ClientAuthClusterRegression, EosPipelineSurvivesTheCoordinatorCrashOnAnAuth
     struct Item { int32_t partition; int64_t offset; };
     std::mutex mu;
     std::vector<Item> pending;
-    auto cl = client(seed, {in, out});
+    // #883: the pipeline client declares a silent session stale after 3 s (3x the 1 s keepalive) instead of the
+    // 10 s default - the crashed coordinator's session is given up (then kCoordDownFallbackNs) in ~8 s, not ~15 s
+    // (#893).  The recovery path is the same; only its threshold is shorter.
+    auto cl = client(seed, {in, out}, 3'000'000'000LL);
     ASSERT_TRUE(cl);
     rc::GroupConfig gcfg;
     gcfg.autoCommit       = false;
