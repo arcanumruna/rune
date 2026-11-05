@@ -459,7 +459,8 @@ public:
             auto snap = log->cleanerSnapshot();
             if (!snap || snap->size() < 1) continue;  // need at least one sealed segment
 
-            const int64_t firstDirtyOffset = replica->lastCleanOffset();
+            // Part 06: where the last pass ended - a retry window may hold lastCleanOffset below it.
+            const int64_t firstDirtyOffset = replica->cleanerProgress();
             // TSan race fix: use the cleaner-visible HW snapshot (atomic acquire),
             // NOT highWatermark() which reads leaderState_/isr_/leaderComplete_/
             // lastHealthyHw_ concurrently with the duty thread.  A slightly-stale
@@ -702,6 +703,7 @@ public:
         cleaner.setVerdictBounds(verdictBound, best.replica->cleanerVerdictMarkerEnd());
         // Part 06: an autoincrement partition keeps each live producer's whole retry window (ProducerBatchWindow.h).
         cleaner.setProducerTailDepth(best.replica->producerTailDepth());
+        cleaner.setPreviousPassEnd(best.replica->cleanerProgress());
         // Fix round 2 (Kafka-style): the cleaner NEVER replaces / deletes a
         // segment file — outputs go to unique .cleaned files the owner thread
         // validates and installs (Log::drainCleanerSwaps).
@@ -752,8 +754,10 @@ public:
         //   - a rewritten base → reloadSegment picks up the new .log.
         //   - a merged/emptied base → reloadSegment finds the .log gone, drops it.
         // ---------------------------------------------------------------
-        const bool advance = !damagedLog && passEnd > globalDirtyStart &&
-                             best.replica->cleanerRole() == rune::replication::Role::Leader;
+        const bool leader  = best.replica->cleanerRole() == rune::replication::Role::Leader;
+        const bool advance = !damagedLog && passEnd > globalDirtyStart && leader;
+        // Part 06: the pass cleaned past the watermark a retry window held.
+        const bool held    = !damagedLog && leader && passResult.cleanedThrough > std::max(passEnd, globalDirtyStart);
         bool allEnqueued = true;
         for (std::size_t gi = 0; gi < passResult.groups.size(); ++gi) {
             const auto& g = passResult.groups[gi];
@@ -811,12 +815,15 @@ public:
         // Advance lastCleanOffset to passEnd (MONOTONIC: forward-only, leader-only).
         // The guard also covers the ensureCheckpoint ordering hazard (a restored
         // checkpoint may already have bumped the watermark past passEnd).
-        if (advance) {
+        if (advance) best.replica->setLastCleanOffset(passEnd);
+        if (held) best.replica->setCleanerProgress(passResult.cleanedThrough);
+        if (advance || held) {
             // The cleaner is the ONLY writer of the clean watermark (N-MEDIUM-1);
             // a rewind the owner published meanwhile is folded in right after,
             // so the checkpoint never persists past a rejected range.
-            best.replica->setLastCleanOffset(passEnd);
             best.replica->applyCleanerRewind();
+        }
+        if (advance) {
             // CP-7: persist the checkpoint (pure file I/O; cleaner-thread-safe).
             if (auto it = checkpoints_.find(best.log); it != checkpoints_.end()) {
                 it->second->store(best.replica->lastCleanOffset());

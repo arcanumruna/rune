@@ -3618,3 +3618,65 @@ TEST(CompactionCleanerAgentRegression, TruncateOfOtherLogCompletesDuringThrottle
     fs::remove_all(dirA);
     fs::remove_all(dirB);
 }
+
+// Part 06 Task 10 (fix round 2): an idle producer's batch on an autoincrement log holds that log's watermark for as long as the
+// producer lives, but selection measures the log from where its last pass ended - with nothing new it is not dirty, and another
+// log gets the next cycles.  RED: the held log's ratio stayed 1.0 and won every cycle.
+TEST(CompactionCleanerAgentRegression, HeldAutoIncWatermarkDoesNotStarveAnotherLogRegression) {
+    auto dirA = cp6TempDir("cw06_held_a");
+    auto dirB = cp6TempDir("cw06_held_b");
+    Log logA(dirA.string(), /*rollBytes=*/128);
+    Log logB(dirB.string(), /*rollBytes=*/128);
+    Cp6NullTransport transport;
+    {
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        RecordBatchBuilder b(0, nowMs);   // a live idempotent producer's only batch: protected
+        b.setProducerId(77);
+        b.setProducerEpoch(0);
+        b.setBaseSequence(0);
+        b.append("idle", "v", nowMs);
+        logA.append(b.build(), 0);
+    }
+    for (int v = 1; v < 200; ++v) logA.append(cp6Batch(v, "hot", "v" + std::to_string(v)), v);
+    for (int v = 0; v < 200; ++v) logB.append(cp6Batch(v, "hot", "v" + std::to_string(v)), v);
+
+    auto cfgA = makeCompactConfig(611, 0.0);
+    cfgA.producerTailDepth = rune::storage::kRetryWindowSize;
+    auto cfgB = makeCompactConfig(612, 0.0);
+    PartitionReplica* raw[2] = {};
+    rune::node::ReplicaRegistry registry;
+    for (auto [cfg, log] : {std::pair{cfgA, &logA}, std::pair{cfgB, &logB}}) {
+        auto rep = std::make_unique<PartitionReplica>(cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, log, &transport);
+        rep->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+        rep->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+        rep->becomeLeader(1, {1});
+        rep->onLeaderLogAppended();
+        raw[log == &logA ? 0 : 1] = rep.get();
+        registry.add(cfg.topicId, 0, std::move(rep));
+    }
+    const auto basesB = logB.segmentBaseOffsets();
+    ASSERT_GE(basesB.size(), 3u);
+    raw[1]->setLastCleanOffset(basesB[basesB.size() / 2]);   // B is half clean: A (all dirty) is the filthier
+
+    rune::node::LogCleanerAgent cleaner(&registry);
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    const int beforeA = cp6CountLiveRecords(logA);
+    const int beforeB = cp6CountLiveRecords(logB);
+    for (int i = 0; i < 4; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        for (int j = 0; j < 1000 && (logA.cleanerSwapsPending() || logB.cleanerSwapsPending()); ++j)   // the owner installs one group per pass
+            dutyCycleAgent.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+    }
+    logA.reloadSegments();
+    logB.reloadSegments();
+    EXPECT_EQ(raw[0]->lastCleanOffset(), 0) << "the idle producer's batch holds A's watermark";
+    EXPECT_GT(raw[0]->cleanerProgress(), 0) << "A's pass ended above it";
+    EXPECT_LT(cp6CountLiveRecords(logA), beforeA) << "A was compacted";
+    EXPECT_LT(cp6CountLiveRecords(logB), beforeB) << "B was cleaned in a later cycle";
+    EXPECT_GT(raw[1]->lastCleanOffset(), basesB[basesB.size() / 2]);
+
+    fs::remove_all(dirA);
+    fs::remove_all(dirB);
+}

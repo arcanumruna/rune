@@ -252,12 +252,17 @@ public:
 
     /// Clear all entries (reuse without reallocating).
     void clear() noexcept {
-        resetTable_();
-        size_          = 0;
-        latestOffset_  = -1;
+        clearKeys();
         tails_.clear();
         txn_.clear();
         verdict_.clear();
+    }
+
+    /// Clear the key entries only (the scan's tails, txn and verdict state stay).
+    void clearKeys() noexcept {
+        resetTable_();
+        size_          = 0;
+        latestOffset_  = -1;
     }
 
     /// The last data batch of every producer in the scanned range (retained by

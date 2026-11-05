@@ -251,9 +251,9 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
     int64_t bytes = 0;
     std::vector<RejectedOffsetIndex::Entry> verdictEntries;
     if (window != nullptr) {   // the share of the dedupe budget the producer tails get
-        window->clear();
-        window->setBudget(tails.capacity() == ProducerTails::kUnbounded ? ProducerTails::kUnbounded
-                                                                         : tails.capacity() * ProducerTails::kBytesPerProducer);
+        window->begin(tails.capacity() == ProducerTails::kUnbounded ? ProducerTails::kUnbounded
+                                                                     : tails.capacity() * ProducerTails::kBytesPerProducer,
+                      windowNowMs, expirationMs);
     }
     // Markers above toOffset are read too, but only in `bases` (sealed segments): the marker carrying W in the active
     // segment is never read, so cleanLimit trails W by up to the active segment (cleans less, never more).
@@ -333,7 +333,7 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
     if (window != nullptr && !damage.has_value()) {   // the keys of the batches the window keeps, each segment read once
         std::vector<uint8_t> seg;
         int64_t segOf = -1;
-        window->finish(windowNowMs, expirationMs, [&](int64_t segBase, std::size_t pos, std::vector<uint64_t>& keys) {
+        window->finish([&](int64_t segBase, std::size_t pos, std::vector<uint64_t>& keys) {
             if (segBase != segOf) {
                 seg = readFile(segmentLogPath(dir, segBase));
                 bytes += static_cast<int64_t>(seg.size());
@@ -440,47 +440,60 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return -1; }   // incomplete state: no map
     toOffset = std::min(txn.cleanLimit(), verdicts.cleanLimit());
 
-    for (size_t i = 0; i < bases.size(); ++i) {
-        int64_t segBase = bases[i];
-        int64_t segEnd  = (i + 1 < bases.size()) ? bases[i + 1] : toOffset;
+    // Maps the keys in [from, toOffset); true when the map filled.
+    const auto mapFrom = [&](Offset from) {
+        for (size_t i = 0; i < bases.size(); ++i) {
+            int64_t segBase = bases[i];
+            int64_t segEnd  = (i + 1 < bases.size()) ? bases[i + 1] : toOffset;
 
-        if (segBase >= toOffset)  break;
-        if (segEnd <= fromOffset) continue;   // clean prefix: covered by the pre-pass
+            if (segBase >= toOffset)  break;
+            if (segEnd <= from) continue;   // clean prefix: covered by the pre-pass
 
-        hook_();   // fix round 6: segment boundary
-        auto buf = readFile(segmentLogPath(dir, segBase));
-        if (buf.empty()) continue;
+            hook_();   // fix round 6: segment boundary
+            auto buf = readFile(segmentLogPath(dir, segBase));
+            if (buf.empty()) continue;
 
-        size_t pos = 0;
-        BatchHeaderCursor hdr(segBase, BatchHeaderCursor::upperFor(segBase, successorInList(bases, i)));
-        while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
-               <= buf.size()) {
-            rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
-            int32_t total = r.totalLength();
-            if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
-            if (!r.ensureValid()) break;
-            // #839: baseOffset / magic are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
-            if (!hdr.accept(r)) break;
+            size_t pos = 0;
+            BatchHeaderCursor hdr(segBase, BatchHeaderCursor::upperFor(segBase, successorInList(bases, i)));
+            while (pos + static_cast<size_t>(rune::protocol::batch::kRecordBatchOverhead)
+                   <= buf.size()) {
+                rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+                int32_t total = r.totalLength();
+                if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<size_t>(total) > buf.size()) break;
+                if (!r.ensureValid()) break;
+                // #839: baseOffset / magic are not CRC-covered: a bad one ends the valid prefix like a CRC failure.
+                if (!hdr.accept(r)) break;
 
-            bool full = false;
-            if (!isControlBatch(r) && !(isTransactionalBatch(r) && txn.isAborted(r.producerId(), r.baseOffset())))
-                r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
-                          int64_t offset, int64_t /*ts*/) {
-                if (full) return;
-                if (offset < fromOffset || offset >= toOffset) return;
-                if (key.empty()) return; // null-key: not compactable
-                if (verdicts.isRejected(offset)) return;   // a rejected record is never the latest
-                if (!map.put(key, offset)) {
-                    // Map is full — stop the pass.  latestOffset() holds the
-                    // highest offset that made it into the map.
-                    full = true;
-                }
-            });
+                bool full = false;
+                if (!isControlBatch(r) && !(isTransactionalBatch(r) && txn.isAborted(r.producerId(), r.baseOffset())))
+                    r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
+                              int64_t offset, int64_t /*ts*/) {
+                    if (full) return;
+                    if (offset < from || offset >= toOffset) return;
+                    if (key.empty()) return; // null-key: not compactable
+                    if (verdicts.isRejected(offset)) return;   // a rejected record is never the latest
+                    if (!map.put(key, offset)) {
+                        // Map is full — stop the pass.  latestOffset() holds the
+                        // highest offset that made it into the map.
+                        full = true;
+                    }
+                });
 
-            if (full) return map.latestOffset();
-            pos += static_cast<size_t>(total);
+                if (full) return true;
+                pos += static_cast<size_t>(total);
+            }
+            if (pos != buf.size()) noteDamage_(dir, segBase, pos);   // damage: the entry point refuses the pass
         }
-        if (pos != buf.size()) noteDamage_(dir, segBase, pos);   // damage: the entry point refuses the pass
+        return false;
+    };
+    const bool full = mapFrom(fromOffset);
+    // Part 06: a held watermark (the oldest protected batch at or below it) whose map fills below the previous pass's end would
+    // redo that pass for as long as the batch stays protected - map from where it ended instead (setPreviousPassEnd).
+    if (full && window_ && window_->lowestProtectedBase() <= fromOffset && map.latestOffset() < previousPassEnd_ && previousPassEnd_ < toOffset
+        && !damaged_.has_value()) {
+        map.clearKeys();
+        heldFrom_ = fromOffset;
+        (void)mapFrom(previousPassEnd_);
     }
     return map.latestOffset();
 }
@@ -847,7 +860,8 @@ bool LogCleaner::rewriteSegmentImpl(
                 //   - If nowMs is available: stamp a horizon (nowMs + deleteRetentionMs).
                 //   - Otherwise: fall back to legacy nowNs retention.
                 // Part 06: a protected batch holds the key - dropping the tombstone would bring its insert back.
-                const bool pinned = window != nullptr && window->pinsTombstone(key);
+                // A forward pass (setPreviousPassEnd) lacks the keys below its map: the insert may be in a batch just released.
+                const bool pinned = window != nullptr && (window->pinsTombstone(key) || (!latest && offset >= heldFrom_));
                 if (batchHasHorizon) {
                     if (horizonExpired && !pinned) {
                         modified = true;
@@ -1258,12 +1272,14 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     }
     if (window_) window_->clear();   // a pass that scans nothing protects nothing
     windowNowMs_ = nowMs;
+    heldFrom_ = std::numeric_limits<Offset>::max();
     try {
         RangeCleanResult result = produceCleanedRangeBoundedImpl_(dir, sealedBases, sealedSizes, activeBase,
                                                                   globalDirtyStart, nowNs, deleteRetentionMs, map,
                                                                   useCoalescing, groupRollBytes, throttler, nowMs);
         // Part 06: the watermark never passes the oldest protected batch, so the records superseding it (its keys' tombstones
         // among them) stay in the next pass's map and go with it once it is released.
+        result.cleanedThrough = result.passEnd;
         if (window_ && !damaged_.has_value())
             result.passEnd = std::min(result.passEnd, std::max(globalDirtyStart, window_->lowestProtectedBase()));
         return result;
@@ -1742,7 +1758,7 @@ void LogCleaner::mergeGroupWithMap(
                 if (latest.has_value() && offset < *latest) { modified = true; return; }
 
                 if (isTombstone(val)) {
-                    const bool pinned = window != nullptr && window->pinsTombstone(key);   // Part 06
+                    const bool pinned = window != nullptr && (window->pinsTombstone(key) || (!latest && offset >= heldFrom_));   // Part 06
                     if (batchHasHorizon) {
                         if (horizonExpired && !pinned) { modified = true; return; }
                         keepWithHorizon2(batchHorizonMs); return;

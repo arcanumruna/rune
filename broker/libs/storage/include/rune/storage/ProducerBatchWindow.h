@@ -11,9 +11,10 @@
 //
 // Expiry is ProducerTails': a producer whose last batch's maxTimestamp is older than nowMs - expirationMs is not protected (nowMs < 0
 // never expires); finish() drops it.  The ring holds each batch's position only, and finish() reads the keys of the batches it
-// keeps.  Memory is bounded by a byte budget (the cleaner gives it the share of its dedupe budget ProducerTails gets): past it the
-// window is OVERFLOWED and conservative - every data batch protected, every tombstone pinned, the watermark held
-// (lowestProtectedBase).
+// keeps.  Memory is bounded by a byte budget (the cleaner gives it the share of its dedupe budget ProducerTails gets).  A charge past
+// it first evicts the producers already expired at the pass's clock, keeping only their ids (8 bytes each): one of them seen again
+// later in the scan could be live, so that overflows.  Past the budget the window is OVERFLOWED and conservative - every data batch
+// protected, every tombstone pinned, the watermark held (lowestProtectedBase).
 //
 // The cleaner keeps its watermark at or below lowestProtectedBase(): a protected batch and the records superseding it stay in the
 // dirty range until the pass that releases it, so a protected insert and its tombstone go in the same pass.
@@ -41,14 +42,21 @@ public:
     explicit ProducerBatchWindow(int depth) : depth_(static_cast<std::size_t>(depth)) {}
 
     [[nodiscard]] int depth() const noexcept { return static_cast<int>(depth_); }
-    void setBudget(std::size_t bytes) noexcept { budget_ = bytes; }
 
     void clear() noexcept {
         producers_.clear();
+        evicted_.clear();
         batches_.clear();
         keys_.clear();
         bytes_ = 0;
         overflowed_ = false;
+    }
+    /// Start of a pre-pass: an empty window of `budget` bytes whose producers expire at `nowMs` (see expired()).
+    void begin(std::size_t budget, int64_t nowMs, int64_t expirationMs) noexcept {
+        clear();
+        budget_ = budget;
+        nowMs_ = nowMs;
+        expirationMs_ = expirationMs;
     }
 
     // ---- pre-pass feed (offset order) -------------------------------------
@@ -58,13 +66,14 @@ public:
         if (overflowed_) return;
         auto it = producers_.find(producerId);
         if (it == producers_.end()) {
-            if (!charge(kBytesPerProducer)) return;
+            if (std::binary_search(evicted_.begin(), evicted_.end(), producerId)) { overflow(); return; }
+            if (!charge(kBytesPerProducer, producerId)) return;
             it = producers_.emplace(producerId, Producer{}).first;
         }
         Producer& p = it->second;
         const Batch b{baseOffset, lastOffset, segBase, pos};
         if (p.ring.size() < depth_) {
-            if (!charge(sizeof(Batch))) return;
+            if (!charge(sizeof(Batch), producerId)) return;
             p.ring.push_back(b);
         } else {
             p.ring[p.head] = b;
@@ -76,10 +85,11 @@ public:
     /// appends the LE uint64 keys of the batch at byte `pos` of segment `segBase` (called in offset order) and returns false if it
     /// cannot read it (the window then overflows).
     template <class ReadKeys>
-    void finish(int64_t nowMs, int64_t expirationMs, ReadKeys&& readKeys) {
+    void finish(ReadKeys&& readKeys) {
         for (const auto& [pid, p] : producers_)
-            if (!expired(p.lastMaxTs, nowMs, expirationMs)) batches_.insert(batches_.end(), p.ring.begin(), p.ring.end());
+            if (!expired(p.lastMaxTs)) batches_.insert(batches_.end(), p.ring.begin(), p.ring.end());
         producers_.clear();
+        evicted_.clear();
         std::sort(batches_.begin(), batches_.end(), [](const Batch& a, const Batch& b) { return a.base < b.base; });
         bytes_ = batches_.size() * sizeof(Batch);
         for (const Batch& b : batches_) {
@@ -126,10 +136,20 @@ private:
     struct Batch { int64_t base, last, segBase; std::size_t pos; };
     struct Producer { std::vector<Batch> ring; std::size_t head = 0; int64_t lastMaxTs = 0; };
 
-    static bool expired(int64_t maxTimestampMs, int64_t nowMs, int64_t expirationMs) noexcept {
-        return nowMs >= 0 && expirationMs >= 0 && toEpochMs(maxTimestampMs) < nowMs - expirationMs;
+    bool expired(int64_t maxTimestampMs) const noexcept {
+        return nowMs_ >= 0 && expirationMs_ >= 0 && toEpochMs(maxTimestampMs) < nowMs_ - expirationMs_;
     }
-    bool charge(std::size_t n) {
+    /// Charges `n` bytes for `producerId`, evicting the other expired producers first when they do not fit.
+    bool charge(std::size_t n, int64_t producerId) {
+        if (bytes() + n > budget_) {
+            for (auto it = producers_.begin(); it != producers_.end();) {
+                if (it->first == producerId || !expired(it->second.lastMaxTs)) { ++it; continue; }
+                bytes_ -= kBytesPerProducer + it->second.ring.size() * sizeof(Batch) - sizeof(int64_t);
+                evicted_.push_back(it->first);
+                it = producers_.erase(it);
+            }
+            std::sort(evicted_.begin(), evicted_.end());
+        }
         if (bytes() + n > budget_) { overflow(); return false; }
         bytes_ += n;
         return true;
@@ -141,7 +161,10 @@ private:
 
     std::size_t depth_;
     std::size_t budget_ = std::numeric_limits<std::size_t>::max();
+    int64_t nowMs_ = -1;
+    int64_t expirationMs_ = -1;
     std::unordered_map<int64_t, Producer> producers_;
+    std::vector<int64_t> evicted_;                       // the expired producers charge() dropped, ascending
     std::vector<Batch> batches_;                         // the protected batches, ascending base (finish)
     std::vector<uint64_t> keys_;                         // their keys, ascending (finish)
     std::size_t bytes_ = 0;

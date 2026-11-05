@@ -51,6 +51,9 @@ struct CleanedGroup {
 struct RangeCleanResult {
     bool                 compacted = false;
     Offset               passEnd   = -1;
+    /// Where the pass's rewrite ended: passEnd, or above it when a producer's retry window held the watermark back
+    /// (setProducerTailDepth).  What the next pass's setPreviousPassEnd takes.
+    Offset               cleanedThrough = -1;
     std::vector<int64_t> rewrittenBases;
     /// Deferred-install mode only (setDeferredInstall): the outputs to hand to
     /// the owner thread (Log::enqueueCleanedGroup).  rewrittenBases still lists
@@ -94,6 +97,11 @@ public:
         if (depth <= 1) window_.reset();
         else if (!window_ || window_->depth() != depth) window_.emplace(depth);
     }
+    /// Part 06: the previous pass's cleanedThrough.  When the watermark is held and a map built from it fills below this offset
+    /// (the pass would redo the last one), produceCleanedRangeBounded maps the keys from here instead: the pass still compacts
+    /// above it, the watermark stays, and a tombstone at or above the watermark whose key that map lacks is kept (its insert may
+    /// be one the window just released).  Window only.
+    void setPreviousPassEnd(Offset offset) noexcept { previousPassEnd_ = offset; }
     [[nodiscard]] const ProducerBatchWindow* producerBatchWindowForTest() const noexcept { return window_ ? &*window_ : nullptr; }
     /// M3: bytes the last offset-map build read from clean-prefix segments
     /// (producer tails) — throttled by the bounded passes.
@@ -447,6 +455,8 @@ private:
     int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
     std::optional<ProducerBatchWindow> window_{};   ///< depth > 1 only
     int64_t windowNowMs_ = -1;                       ///< the window's expiry clock: the last produceCleanedRangeBounded's nowMs
+    Offset previousPassEnd_ = -1;                    ///< setPreviousPassEnd
+    Offset heldFrom_ = std::numeric_limits<Offset>::max();   ///< a forward pass's watermark (setPreviousPassEnd); max otherwise
     int64_t prefixBytesRead_        = 0;
     Offset  markerRemovalBound_     = 0;
     Offset  verdictBound_           = std::numeric_limits<Offset>::max();

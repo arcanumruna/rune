@@ -253,6 +253,7 @@ public:
     /// `specDelayPasses`: the write spec carrying key.index reaches the worker that many passes after restart() returns; until then the
     /// topic is typed without it (the leader scan restores the logged set from the log).
     void restart(bool reinstall = true, int64_t cutTo = -1, int specDelayPasses = 0) {
+        const int64_t clean = replica->lastCleanOffset();   // what LogCleanerAgent's checkpoint reloads (a cut forgets it)
         worker.reset();
         vs.reset();
         replica.reset();
@@ -262,6 +263,7 @@ public:
         vs = std::make_unique<WorkerViewSet>(channel, viewDir_.string());
         vs->holdJudgesForTest(holdJudge_);
         open();
+        if (cutTo < 0) replica->setLastCleanOffset(clean);
         typedWith_(5, keyShape_, keyIndexOn_ && specDelayPasses == 0);
         recovering_ = true;
         if (reinstall) reinstallAll();
@@ -815,6 +817,7 @@ public:
         cleaner.setMarkerRemovalBound(replica->cleanerMarkerRemovalBound());
         cleaner.setVerdictBounds(out.bound, markerEnd);
         cleaner.setProducerTailDepth(autoInc_ ? rune::storage::kRetryWindowSize : 1);   // what BrokerNode configures the partition with
+        cleaner.setPreviousPassEnd(replica->cleanerProgress());
         cleaner.setDeferredInstall(&cleanedSeq_);
         rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::sizingForBudget(1 << 22));
         auto res = cleaner.produceCleanedRangeBounded(log->dir(), bases, sizes, uncleanable, dirtyStart, nowMs * 1'000'000, 1000, map, false, 1 << 20, nullptr, nowMs);
@@ -837,6 +840,7 @@ public:
             if (queued) (void)prebuilt.release();   // the owner owns it now
         }
         if (res.passEnd > dirtyStart && !cleaner.uncleanable()) replica->setLastCleanOffset(res.passEnd);
+        if (res.cleanedThrough > std::max(res.passEnd, dirtyStart) && !cleaner.uncleanable()) replica->setCleanerProgress(res.cleanedThrough);
         replica->applyCleanerRewind();
         if (drain) out.installed += drainSwaps();
         return out;

@@ -862,6 +862,43 @@ TEST(CheckedWritesAutoIncCleanerRegression, HighestIdDeletedAndCompactedIsNeverR
 
 // Task 10 (section 15): the ack of a key-0 batch is lost, its ids are updated, the log is compacted and the leader fails over: the
 // retry still answers the original ids, because the protected batch kept its records.
+// Fix round 2 (M1): a restart reloads the watermark the window held (the cleaner checkpoint), and cleaning on from it never brings
+// a deleted id back.  RED (restoring where the last pass ended instead): the next passes started above id 50's insert and tombstone,
+// so the tombstone went past its horizon once the window released the insert, and the insert stayed.
+TEST(CheckedWritesAutoIncCleanerRegression, RestartFromAHeldWatermarkNeverResurrectsADeletedIdRegression) {
+    AutoInc g({}, false, /*rollBytes=*/1);
+    VerdictRig& r = g.r;
+    Producer a{r, 42};
+    ASSERT_EQ(a.createIds(50).back(), 50u);
+    const auto rm = a.sendAck({rmEx(50)});
+    ASSERT_TRUE(rm && rm->code == 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    const auto has50 = [&] {
+        for (const auto& d : r.readLog().data) if (d.id == 50) return true;
+        return false;
+    };
+    (void)r.compact();
+    (void)r.compact(1'005'000);   // past the delete horizon
+    for (uint64_t id = 1; id <= 10; ++id) ASSERT_TRUE(a.sendAck({upd(id)}));   // both batches stay in A's last 32
+    ASSERT_TRUE(r.driveUntilJudged());
+    (void)r.compact(1'006'000);
+    ASSERT_TRUE(has50());
+    const int64_t held = r.replica->lastCleanOffset();
+    ASSERT_GT(held, 0) << "the cleaner has a watermark to persist";
+    ASSERT_GT(r.replica->cleanerProgress(), held) << "held below where the passes ended";
+    r.restart(/*reinstall=*/false);
+    EXPECT_EQ(r.replica->lastCleanOffset(), held) << "the checkpoint is reloaded";
+    for (int i = 0; i < VerdictRig::kMaxPass && !r.autoIncState(); ++i) r.pass();
+    for (uint64_t id = 11; id <= 40; ++id) ASSERT_TRUE(a.sendAck({upd(id)}));   // both leave A's last 32
+    ASSERT_TRUE(r.driveUntilJudged());
+    for (int i = 0; i < 6 && has50(); ++i) (void)r.compact(1'010'000 + i * 5'000);
+    ASSERT_FALSE(has50()) << "neither id 50's insert nor its tombstone is in the log";
+    const int64_t sub = r.subscribe(SubKind::Raw, r.log->logStartOffset());
+    for (const auto& d : r.collect(sub).records) EXPECT_FALSE(d.id == 50 && d.tag != kTombstoneTag) << "id 50 delivered live at " << d.offset;
+    r.installProjection(kProj);
+    r.driveUntilFolded(kProj, r.leo());
+    EXPECT_FALSE(r.hasRow(kProj, 50)) << "a fresh projection has no row 50";
+}
 TEST(CheckedWritesAutoIncCleanerRegression, RetryAfterFailoverAndCompactionStillReturnsItsIdsRegression) {
     AutoInc g({}, false, /*rollBytes=*/1);
     VerdictRig& r = g.r;

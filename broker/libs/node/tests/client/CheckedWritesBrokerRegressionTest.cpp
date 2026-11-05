@@ -75,6 +75,7 @@ TEST(CheckedWritesBrokerRegression, DroppedWhileAwaitingSpecNeverBuildsRegressio
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/ProducerStateManager.h>
 
 #include <filesystem>
 #include <sstream>
@@ -1985,8 +1986,6 @@ TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesIntentsRegression) {
     KiWriter plain(c, "ki", rc::Acks::All);
     EXPECT_TRUE(plain.topic.upsertAndWait(acct(1)).ok());
 }
-
-#include <rune/storage/ProducerStateManager.h>
 
 // Part 06 Task 10 (fix round 1): a restarted broker builds its autoincrement topic's replicas from the catalog with the whole
 // producer retry window, the depth the cleaner keeps (a runtime create is CatalogEffectsTest's).
