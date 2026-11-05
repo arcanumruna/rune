@@ -184,15 +184,20 @@ void noteProducerTail(const uint8_t* batch, const rune::protocol::RecordBatchRea
 // C2 (Kafka BatchRetention.RETAIN_EMPTY): the RECORD-LESS producer-tail batch —
 // covers `lastOffset`, carries the producer id / epoch / the batch's last
 // sequence / its maxTimestamp, holds no record (no key can resurrect).
+// Kafka parity: it keeps the source batch's partitionLeaderEpoch.  An unstamped
+// (-1) batch at the first offset of a leader epoch made a follower that fetched
+// it start that epoch one batch later than the leader did; the leader's
+// epoch-history check then refused the follower for good (it never truncates).
 void appendEmptyTailBatch(std::vector<uint8_t>& out, std::vector<uint8_t>& tmp, int64_t lastOffset,
                           int64_t maxTimestampMs, int64_t producerId, int16_t producerEpoch, int32_t lastSequence,
-                          bool transactional) {
+                          bool transactional, int32_t partitionLeaderEpoch) {
     rune::protocol::RecordBatchBuilder b(lastOffset, maxTimestampMs);
     b.setTransactional(transactional);
     b.setProducerId(producerId);
     b.setProducerEpoch(producerEpoch);
     b.setBaseSequence(lastSequence);
     b.buildInto(tmp);   // recordCount 0 (the builder writes lastOffsetDelta -1)
+    rune::protocol::RecordBatchReader::stampLeaderEpoch(tmp.data(), partitionLeaderEpoch);
     rune::protocol::detail::putLE(tmp, rune::protocol::batch::kLastOffsetDeltaOffset, static_cast<uint32_t>(0));
     const uint32_t crc = rune::protocol::crc32c(tmp.data() + rune::protocol::batch::kAttributesOffset,
                                                 tmp.size() - rune::protocol::batch::kAttributesOffset);
@@ -660,7 +665,7 @@ bool LogCleaner::rewriteSegmentImpl(
             if (tailNeeded)
                 appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId, origProducerEpoch,
                                      origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset),
-                                     /*transactional=*/true);
+                                     /*transactional=*/true, r.partitionLeaderEpoch());
             pos += static_cast<size_t>(total);
             continue;
         }
@@ -839,7 +844,7 @@ bool LogCleaner::rewriteSegmentImpl(
         if (tailNeeded && !lastKept) {
             appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId, origProducerEpoch,
                                  origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset),
-                                 batchIsTxn);
+                                 batchIsTxn, r.partitionLeaderEpoch());
         }
 
         pos += static_cast<size_t>(total);
@@ -1616,7 +1621,7 @@ void LogCleaner::mergeGroupWithMap(
                     appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId,
                                          origProducerEpoch,
                                          origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset),
-                                         /*transactional=*/true);
+                                         /*transactional=*/true, r.partitionLeaderEpoch());
                 pos += static_cast<size_t>(total);
                 continue;
             }
@@ -1695,7 +1700,7 @@ void LogCleaner::mergeGroupWithMap(
                 appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId,
                                      origProducerEpoch,
                                      origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset),
-                                 batchIsTxn);
+                                 batchIsTxn, r.partitionLeaderEpoch());
             }
 
             pos += static_cast<size_t>(total);

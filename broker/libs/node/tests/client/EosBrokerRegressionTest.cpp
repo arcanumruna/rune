@@ -1356,7 +1356,13 @@ TEST(EosBrokerRegression, PipelineSurvivesTheCoordinatorCrashWithSeekToCommitted
     }
     struct Item { int32_t partition; int64_t offset; int64_t id; };
     std::vector<Item> pending;
-    auto cc = std::make_unique<rc::Client>(e.cfg(seed, {in}));
+    // #883: the pipeline's clients declare a silent session stale after 3 s (3x the 1 s keepalive) instead of the
+    // 10 s default - the crashed coordinator's session is given up (then kCoordDownFallbackNs) in ~8 s, not ~15 s
+    // (#893).  The recovery path is the same; only its threshold is shorter.
+    constexpr int64_t kStaleNs = 3'000'000'000LL;
+    auto ccfg = e.cfg(seed, {in});
+    ccfg.responseTimeoutNs = kStaleNs;
+    auto cc = std::make_unique<rc::Client>(ccfg);
     rc::GroupConfig gcfg;
     gcfg.autoCommit          = false;
     gcfg.isolation           = rc::IsolationLevel::ReadCommitted;
@@ -1369,7 +1375,9 @@ TEST(EosBrokerRegression, PipelineSurvivesTheCoordinatorCrashWithSeekToCommitted
         });
     });
     cc->connectAndWait(30s);
-    auto cp = e.open(seed, {out});
+    auto pcfg0 = e.cfg(seed, {out});
+    pcfg0.responseTimeoutNs = kStaleNs;
+    auto cp = connectClient(e.c, pcfg0);
     rc::Producer pp = cp->producer(txnConfig("eos-crash"));
     Writer w(*cp, pp, cp->topic("eos.out"), kParts);
     w.alsoPump(cc.get());

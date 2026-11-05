@@ -1279,6 +1279,9 @@ public:
     /// TEST-ONLY: see NodeConfig::testUserDecisionHoldMs.  The window opens the first time this controller is
     /// ready and is never re-armed (one-shot per process).
     void setUserDecisionHoldForTest(int64_t ns) noexcept { userDecisionHoldNs_ = ns; }
+    /// TEST-ONLY (CONTROL thread, via onControlThreadForTest): end the hold now, whatever its length - a test holds
+    /// "until released" on an event instead of waiting out a wall-clock window (#883).  Never re-armed.
+    void releaseUserDecisionHoldForTest() noexcept { userDecisionHoldNs_ = 0; }
     [[nodiscard]] bool userDecisionHeld_() noexcept {
         if (userDecisionHoldNs_ <= 0) return false;
         if (userDecisionHoldUntilNs_ == kHoldUnarmed) userDecisionHoldUntilNs_ = lastNowNs_ + userDecisionHoldNs_;

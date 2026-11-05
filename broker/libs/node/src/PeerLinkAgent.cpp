@@ -61,8 +61,53 @@ void PeerLinkAgent::absorb_(PeerSlot& p, pl::PeerHandshake::Out&& o, int64_t now
             spdlog::info("BrokerNode[{}]: {}", self_, o.log->view());
         }
     }
-    if (o.frame) sink_.send(static_cast<rune::consensus::NodeId>(p.id), o.frame->data(), o.frame->size());
-    if (o.established && sinkFn_ != nullptr) sinkFn_(sinkCtx_, p.id, *o.established, nowNs);
+    // A peer may seal under an epoch towards this node only once EVERY plane here can open it: the control-thread
+    // transports, every worker and the admin thread (the last two get the keys over rings and drain them once per pass,
+    // so the order of the calls proves nothing).  What lets the peer seal under it: our Accept (responder), our
+    // Confirm and any frame we seal under it (initiator: the responder promotes on either).  So a new epoch is
+    // installed RECEIVE-ONLY on every plane first; once every plane acknowledged that install (BrokerNode::
+    // servicePeerLinks_ -> releaseHeldAt) the send side switches if the handshake granted it, and the held Accept /
+    // Confirm (or its newest re-send) leaves.  Without other planes (the sink answers 0) the keys apply at once.
+    //
+    // Except a responder's send-and-receive Accept (a first link, or a restarted initiator - no live link): it leaves at
+    // once with the keys as granted.  Holding it cannot be made time-independent: the initiator's ChallengeSent gives up
+    // after kAwaitNs with no prior link to fall back on, retries with a NEW epoch, and planes slower than kAwaitNs would
+    // hold every retry as long - the link never comes up (rule 16).  A rekey's receive-only Accept is held safely: an
+    // initiator that gives up keeps its prior link.  The initiator always holds (the responder never gives up on a
+    // Confirm - a late one still promotes it).
+    const auto tag = o.frame ? static_cast<pl::PeerMsg>(pl::peekPeerMsg(o.frame->data(), o.frame->size())) : pl::PeerMsg{};
+    if (o.established && sinkFn_ != nullptr) {
+        if (tag == pl::PeerMsg::Accept && o.established->install == pl::LinkInstall::SendAndReceive) {
+            p.await.reset();   // a fresh link supersedes any held exchange: its frame and keys are void
+            (void)sinkFn_(sinkCtx_, p.id, *o.established, nowNs);
+        } else {
+            pl::LinkKeys ro = *o.established;   // ~LinkKeys scrubs
+            ro.install = pl::LinkInstall::ReceiveOnly;
+            const uint64_t seq = sinkFn_(sinkCtx_, p.id, ro, nowNs);
+            if (seq == 0) {
+                if (o.established->install == pl::LinkInstall::SendAndReceive) (void)sinkFn_(sinkCtx_, p.id, *o.established, nowNs);
+            } else {
+                // A newer epoch supersedes an exchange still waiting: only the newest switches send, only its frame leaves.
+                p.await.emplace();
+                p.await->seq = seq;
+                if (o.established->install == pl::LinkInstall::SendAndReceive) p.await->promote = *o.established;
+            }
+        }
+    }
+    if (o.frame) {
+        if (p.await && (tag == pl::PeerMsg::Accept || tag == pl::PeerMsg::Confirm)) p.await->held = std::move(o.frame);
+        else sink_.send(static_cast<rune::consensus::NodeId>(p.id), o.frame->data(), o.frame->size());
+    }
+}
+
+void PeerLinkAgent::releaseHeldAt(std::size_t i) {
+    PeerSlot& p = peers_[i];
+    if (!p.await) return;
+    // Every plane opens the epoch now: switch the send side (its acknowledgement is not awaited - the peer holds the
+    // epoch already, it is the one that offered it), then let the peer seal under it.
+    if (p.await->promote && sinkFn_ != nullptr) (void)sinkFn_(sinkCtx_, p.id, *p.await->promote, lastNowNs_);
+    if (p.await->held) sink_.send(static_cast<rune::consensus::NodeId>(p.id), p.await->held->data(), p.await->held->size());
+    p.await.reset();
 }
 
 // Issue #554 / #683: charged AFTER decode and the crypto-free checks, per peer.  A Hello that fails the cheap checks is

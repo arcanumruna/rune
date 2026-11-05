@@ -92,7 +92,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build ccache uuid-dev zlib1g-dev
+          sudo apt-get install -y --no-install-recommends ninja-build ccache uuid-dev zlib1g-dev gdb
           python3 -m pip install --user "conan>=2,<3" "cmake>=3.31"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -152,8 +152,13 @@ jobs:
       # and the PR-workflow guard are *Regression* ctests, so they run here.
       - name: Regression suite (client)
         run: |
+          .github/scripts/hang-watch.sh 120 build-client/cmake/Testing/Temporary/hangs & watch=$!
+          rc=0
           ctest --test-dir build-client/cmake -R Regression -LE latency -E 'UdpGsoBindings\.Ipv6RoundTrip' -j4 \
-            --output-on-failure
+            --output-on-failure || rc=$?
+          kill "$watch" || true
+          .github/scripts/hang-watch.sh --print build-client/cmake/Testing/Temporary/hangs
+          exit "$rc"
 
       - name: Upload test logs
         if: failure()
@@ -235,7 +240,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ninja-build ccache uuid-dev zlib1g-dev
+          sudo apt-get install -y --no-install-recommends ninja-build ccache uuid-dev zlib1g-dev gdb
           python3 -m pip install --user "conan>=2,<3" "cmake>=3.31"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -293,8 +298,13 @@ jobs:
           SHARD: ${{ matrix.shard }}
         run: |
           total=$(ctest --test-dir build-broker -N | sed -nE 's/^Total Tests: ([0-9]+)/\1/p')
+          .github/scripts/hang-watch.sh 120 build-broker/Testing/Temporary/hangs & watch=$!
+          rc=0
           ctest --test-dir build-broker -R Regression -LE "latency|stress" -E 'UdpGsoBindings\.Ipv6RoundTrip' \
-            -I "$((SHARD+1)),$total,6" -j2 --output-on-failure
+            -I "$((SHARD+1)),$total,6" -j2 --output-on-failure || rc=$?
+          kill "$watch" || true
+          .github/scripts/hang-watch.sh --print build-broker/Testing/Temporary/hangs
+          exit "$rc"
 
       - name: Upload test logs
         if: failure()

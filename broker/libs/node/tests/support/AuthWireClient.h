@@ -222,11 +222,12 @@ public:
     }
     DdlAnswer grant(const std::string& channel, int64_t sid, const std::string& grantee, bool granteeIsRole,
                     rune::protocol::SecurityOperation op, rune::protocol::SecurityResourceType type,
-                    rune::protocol::SecurityPatternKind kind, const std::string& pattern) {
+                    rune::protocol::SecurityPatternKind kind, const std::string& pattern,
+                    std::chrono::milliseconds within = std::chrono::seconds{30}) {
         pc::SecurityDdl m; m.sessionId = sid; m.kind = pc::SecurityOpKind::Grant; m.name = grantee;
         m.granteeKind = granteeIsRole ? 1 : 0; m.op = static_cast<uint8_t>(op); m.resourceType = static_cast<uint8_t>(type);
         m.patternKind = static_cast<uint8_t>(kind); m.pattern = pattern;
-        return securityDdl(channel, m, "GRANT ...;");
+        return securityDdl(channel, m, "GRANT ...;", within);
     }
     DdlAnswer revoke(const std::string& channel, int64_t sid, const std::string& grantee, bool granteeIsRole,
                      rune::protocol::SecurityOperation op, rune::protocol::SecurityResourceType type,

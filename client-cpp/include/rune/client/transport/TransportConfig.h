@@ -43,6 +43,9 @@ inline constexpr std::size_t kJumboMtuLength           = 8192;
 inline constexpr std::size_t kAeronDefaultRcvWindowLength = 128u * 1024;
 inline constexpr std::size_t kMinTermLength            = 64u * 1024;
 inline constexpr std::size_t kMaxTermLength            = 1024u * 1024 * 1024;
+/// The CnC counter-values buffer bounds Aeron enforces (aeron_driver_context.h AERON_COUNTERS_VALUES_BUFFER_LENGTH_*).
+inline constexpr std::size_t kMinDriverCountersBytes   = 1024u * 1024;
+inline constexpr std::size_t kMaxDriverCountersBytes   = 500u * 1024 * 1024;
 /// Liveness floor: 2x the Aeron C++ client's fixed 500 ms driver keepalive
 /// (ClientConductor.h:47 KEEPALIVE_TIMEOUT_MS).  The client's inter-service
 /// timeout is the driver's liveness value (Aeron.cpp:57), so anything near
@@ -103,6 +106,9 @@ struct TransportConfig {
     /// owning thread must call dutyCycle() at least this often, otherwise the
     /// Aeron ClientConductor inter-service timeout closes the client.
     int64_t clientLivenessTimeoutNs = 10'000'000'000LL;
+    /// The driver CnC's counter-values buffer: 0 = Aeron's default (8 MiB), else
+    /// [kMinDriverCountersBytes, kMaxDriverCountersBytes] (ClientConfig::driverCountersBytes).
+    std::size_t driverCountersBytes = 0;
 };
 
 /// The aeron::Context::mediaDriverTimeout the transport applies (T15 R2).
@@ -167,6 +173,11 @@ struct TransportConfig {
         return "clientLivenessTimeoutNs must be >= 1000000000 (1 s = 2x the Aeron client's "
                "500 ms driver keepalive; lower values time out a healthy client): " +
                std::to_string(c.clientLivenessTimeoutNs);
+    }
+    if (c.driverCountersBytes != 0 &&
+        (c.driverCountersBytes < kMinDriverCountersBytes || c.driverCountersBytes > kMaxDriverCountersBytes)) {
+        return "driverCountersBytes must be 0 (Aeron default) or in [1048576, 524288000]: " +
+               std::to_string(c.driverCountersBytes);
     }
     if (c.clientLivenessTimeoutNs > kMaxClientLivenessTimeoutNs) {
         return "clientLivenessTimeoutNs must be <= 3600000000000 (1 hour): " +

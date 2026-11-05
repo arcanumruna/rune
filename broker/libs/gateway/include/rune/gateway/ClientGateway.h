@@ -481,6 +481,7 @@ public:
     [[nodiscard]] bool securityBehind() const noexcept { return securityBehind_; }
     /// Test probe (#603): the value last shipped to the workers.
     [[nodiscard]] bool workersSecurityBehindForTest() const noexcept { return workersBehind_; }
+    [[nodiscard]] int64_t sessionTimeoutNsForTest() const noexcept { return sessionTimeoutNs_; }
     [[nodiscard]] uint64_t securityBehindRefusals() const noexcept { return securityBehindRefusals_; }
     /// Issues #15 / #111: this broker stayed stale longer than R - every authenticated / must-change-password session
     /// is told AuthUnavailable at session level (corr 0) and closed; its client reconnects to a current broker.
@@ -2244,9 +2245,14 @@ public:
     /// (WorkerReturn SessionSignal kind PeerFrameDrops) is handed to the runtime (counter 1'000'235) - control thread.
     using PeerFrameDropSinkFn = void (*)(void* ctx, int32_t worker, uint64_t cumulativeDrops);
     void setPeerFrameDropSink(PeerFrameDropSinkFn fn, void* ctx) noexcept { peerDropFn_ = fn; peerDropCtx_ = ctx; }
+    /// A worker ran the peer-link install `seq` of `peer` (SessionSignal PeerLinkKeysApplied) - control thread.
+    using PeerLinkKeysAppliedSinkFn = void (*)(void* ctx, int32_t worker, int32_t peer, uint64_t seq);
+    void setPeerLinkKeysAppliedSink(PeerLinkKeysAppliedSinkFn fn, void* ctx) noexcept { peerKeysFn_ = fn; peerKeysCtx_ = ctx; }
 private:
     PeerFrameDropSinkFn peerDropFn_  = nullptr;
     void*               peerDropCtx_ = nullptr;
+    PeerLinkKeysAppliedSinkFn peerKeysFn_  = nullptr;
+    void*                     peerKeysCtx_ = nullptr;
     void sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid);
     /// Evict the oldest pending connect (the kMaxPendingConnects cap).
     void evictOldestPendingConnect_(std::string_view incomingHost = {});

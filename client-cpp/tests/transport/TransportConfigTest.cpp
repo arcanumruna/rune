@@ -207,6 +207,24 @@ TEST(TransportConfig, RejectsLivenessAboveOneHourCapRegression) {
     }
 }
 
+// #883: the driver counters knob is 0 (Aeron default) or inside Aeron's own bounds; anything else would make the
+// driver refuse to start with an opaque aeron_driver_init error.  Mutation: the validate() bounds check removed -> red.
+TEST(TransportConfigRegression, DriverCountersBytesIsZeroOrWithinAeronBoundsRegression) {
+    using rune::client::transport::kMaxDriverCountersBytes;
+    using rune::client::transport::kMinDriverCountersBytes;
+    TransportConfig c;
+    EXPECT_EQ(c.driverCountersBytes, 0u) << "the default leaves Aeron's own size";
+    for (std::size_t ok : {std::size_t{0}, kMinDriverCountersBytes, kMaxDriverCountersBytes}) {
+        c.driverCountersBytes = ok;
+        EXPECT_FALSE(validate(c).has_value()) << ok;
+    }
+    for (std::size_t bad : {std::size_t{1}, kMinDriverCountersBytes - 1, kMaxDriverCountersBytes + 1}) {
+        c.driverCountersBytes = bad;
+        ASSERT_TRUE(validate(c).has_value()) << bad;
+        EXPECT_NE(validate(c)->find("driverCountersBytes"), std::string::npos);
+    }
+}
+
 // UDP GSO/GRO (rune-broker spec 2026-10-03-aeron-udp-gso-gro): default on; env forces it off / sets batching.
 TEST(TransportConfig, UdpGsoDefaultsOnEnvTurnsOffAndSetsMsgsPerSend) {
     EXPECT_TRUE(TransportConfig{}.udpGso);

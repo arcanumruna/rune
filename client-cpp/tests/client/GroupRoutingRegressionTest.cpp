@@ -4154,10 +4154,12 @@ TEST(GroupRoutingRegression, LaggingMetadataAnswersNeverPostponeTheArmedRefreshA
 // The armed metadata refresh is driven by the injected duty clock (rule 2: one injected clock), not by the wall
 // clock.  Setup: MetadataRequests are never answered, so each one arms the backoff refresh a response timeout (2 s)
 // after it was sent, and the backoff doubles per cycle (100 ms, 200 ms, ...).  The duty clock moves 100 ms per pass
-// (= one timeout sweep per pass) until a fire whose armed wait was 800 ms; the NEXT refresh is then armed with a
-// 1.6 s wait.  The clock is FROZEN while it is armed: no MetadataRequest is sent however many passes run; once the
-// clock moves past the wait exactly one is.  RED before the fix: the refresh used the wall clock (it fired while the
-// duty clock stood still, or did not fire when the duty clock jumped).
+// until the client arms a refresh at least 1.5 s ahead (the 1.6 s cycle); the clock is then FROZEN: no MetadataRequest
+// is sent however many passes run, none at one ns before the armed due time, exactly one at the first sweep past it.  The due time is the
+// client's own (testMetadataRefreshDueNs), never inferred from when the gateway saw a request: that arrives over real
+// IPC some passes later, and each pass moved the clock 100 ms (the inference flaked, about 3 runs in 10).
+// RED before the fix: the refresh used the wall clock (it fired while the duty clock stood still, or did not fire
+// when the duty clock jumped).
 TEST(GroupRoutingRegression, MetadataRefreshFollowsTheInjectedClockRegression) {
     constexpr int64_t kStepNs = 100'000'000LL;   // one timeout sweep per pass
     RigOptions o        = routingClockOptions(100'000);   // fine steps while connecting
@@ -4168,26 +4170,29 @@ TEST(GroupRoutingRegression, MetadataRefreshFollowsTheInjectedClockRegression) {
     r.gw.holdMetadata = true;   // requests are counted, never answered
     r.connect();
     ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests >= 1; }, 20'000));
-    r.opt.stepNs        = kStepNs;
-    int seen            = r.gw.metadataRequests;
-    int64_t lastFireNs  = g_routingClockNs;
-    int64_t waitNs      = 0;   // the armed wait of the cycle that just fired (gap - the 2 s answer timeout)
+    r.opt.stepNs = kStepNs;
+    constexpr int64_t kNotArmed = std::numeric_limits<int64_t>::max();
+    int64_t due = kNotArmed;
     ASSERT_TRUE(r.drive([&] {
-        if (r.gw.metadataRequests == seen) return false;
-        waitNs     = (g_routingClockNs - lastFireNs) - 2'000'000'000LL;
-        lastFireNs = g_routingClockNs;
-        seen       = r.gw.metadataRequests;
-        return waitNs >= 700'000'000LL;   // the 800 ms cycle just fired: the next wait is 1.6 s
-    }, 20'000)) << "the backoff never reached 800 ms";
-    // 2.2 s later the next refresh is armed (answer timeout 2 s) and due 1.6 s after that.
-    ASSERT_TRUE(r.drive([&] { return g_routingClockNs >= lastFireNs + 2'200'000'000LL; }, 1'000));
-    ASSERT_EQ(r.gw.metadataRequests, seen) << "precondition: the armed refresh fired early";
+        due = r.client.testMetadataRefreshDueNs();
+        return due != kNotArmed && due - g_routingClockNs >= 1'500'000'000LL;
+    }, 20'000)) << "the backoff never reached 1.6 s";
     r.opt.stepNs = 0;   // freeze the duty clock
-    for (int i = 0; i < 5000; ++i) { r.client.doWork(); r.gw.pump(); }
+    auto passes = [&](int n) { for (int i = 0; i < n; ++i) { r.client.doWork(); r.gw.pump(); } };
+    passes(2000);       // requests sent before the freeze land at the gateway
+    const int seen = r.gw.metadataRequests;
+    passes(5000);
     EXPECT_EQ(r.gw.metadataRequests, seen) << "a refresh fired while the duty clock stood still";
-    g_routingClockNs += 1'600'000'000LL;   // past the armed wait (arm <= +2.1 s, due <= +3.7 s; now +3.8 s)
-    for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
-    EXPECT_EQ(r.gw.metadataRequests, seen + 1) << "the armed refresh did not fire once the duty clock passed it";
+    EXPECT_EQ(r.client.testMetadataRefreshDueNs(), due) << "the armed refresh moved while the duty clock stood still";
+    g_routingClockNs = due - 1;
+    passes(2000);
+    EXPECT_EQ(r.gw.metadataRequests, seen) << "the armed refresh fired before its due time";
+    // The refresh is ticked by the timeout sweep (every kSweepIntervalMs of the duty clock); the sweep that just ran
+    // at due - 1 schedules the next one a sweep interval later, the first sweep at or after the due time.
+    g_routingClockNs = due - 1 + kStepNs;   // kStepNs == the 100 ms sweep interval
+    for (int i = 0; i < 20'000 && r.gw.metadataRequests == seen; ++i) passes(1);
+    passes(2000);
+    EXPECT_EQ(r.gw.metadataRequests, seen + 1) << "the armed refresh did not fire exactly once at the first sweep past its due time";
 }
 
 // #705: a LAGGING MetadataResponse (the answer to an older request) must not clear the answer timer of the NEWER

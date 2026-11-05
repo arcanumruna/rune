@@ -174,12 +174,15 @@ struct SessionConfig {
 
     // DR-BUG-2 FIX: fast-retry cadence for ConnectRequest when the ingress
     // publication was not-connected or back-pressured at send time.  The
-    // SessionMachine retries the ConnectRequest at this interval (default 200 ms)
-    // without waiting the full connectTimeoutNs.  Bounded: at most
-    // connectTimeoutNs / connectRetryIntervalNs retries per connect attempt
-    // (capped by maxConnectRetries episodes).  Connect-path only — no effect on
-    // the steady-state produce/subscribe hot path.
-    int64_t connectRetryIntervalNs = 200'000'000LL;  // 200 ms fast-retry cadence
+    // SessionMachine re-offers the ConnectRequest once this long has passed since
+    // the refused offer, without waiting the full connectTimeoutNs.  Default 0:
+    // the next tick, like Aeron Cluster's AsyncConnect re-offering its connect
+    // request every step.  A refused offer is local (nothing reaches the network),
+    // and a session opened to a new node always finds its publication not yet
+    // connected: a 200 ms cadence made every first write to another leader wait
+    // ~250 ms (#883).  The duty cycle's IdleStrategy paces the re-offers.
+    // Connect-path only — no effect on the steady-state produce/subscribe hot path.
+    int64_t connectRetryIntervalNs = 0;
 
     // Redirect/retry caps — prevent infinite loops.
     int maxRedirects     = 5;  // per connect() call
@@ -1683,9 +1686,10 @@ private:
             // DR-BUG-2 FIX: fast-retry the ConnectRequest when the ingress
             // publication was not-connected at offer time (connectSentOk_==false).
             // The ingress UDP pub to the broker needs time to establish under
-            // concurrent-client load; retrying at connectRetryIntervalNs (200ms)
-            // ensures the broker receives the ConnectRequest once the UDP link
-            // is up, without waiting the full connectTimeoutNs (5s default).
+            // concurrent-client load; re-offering once connectRetryIntervalNs has
+            // passed (default: the next tick) gets the ConnectRequest to the broker
+            // as soon as the UDP link is up, without waiting the full
+            // connectTimeoutNs (5s default).
             //
             // We do NOT generate a new correlationId on fast-retry: the broker
             // may have already created a PendingConnect for an earlier send that

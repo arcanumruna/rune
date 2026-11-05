@@ -275,6 +275,8 @@ public:
     }
     /// Test-only: CP-7 checkpoint entries held (one per compacted Log).
     [[nodiscard]] std::size_t checkpointCountForTest() const noexcept { return checkpoints_.size(); }
+    /// Logs out of selection because their last pass could not advance (cleaner thread).
+    [[nodiscard]] std::size_t stalledLogsForTest() const noexcept { return stalled_.size(); }
     /// #840: logs whose cleaner met a damaged batch; each stays out of selection until the broker restarts
     /// (Kafka: LogCleanerManager.uncleanablePartitions).  Cleaner-thread-owned; cold.
     [[nodiscard]] std::size_t uncleanableLogCountForTest() const noexcept { return uncleanable_.size(); }
@@ -531,6 +533,17 @@ public:
                 }
             }
 
+            // A log whose last pass could not advance (its own limits - an unresolved txn the scan found, verdict markers
+            // still in the active segment - sat at its dirty start) stays out until an input of that pass changes: the
+            // sealed snapshot, the dirty start, the cleanable bound or a published bound.  Filthiest-first re-picked it every
+            // cycle otherwise, and no other log on the broker was cleaned again.
+            if (const auto st = stalled_.find(log); st != stalled_.end()) {
+                if (st->second.sameInputs(snap, firstDirtyOffset, firstUncleanable, replica->cleanerVerdictBound(),
+                                          replica->cleanerVerdictMarkerEnd(), replica->cleanerMarkerRemovalBound()))
+                    continue;
+                stalled_.erase(st);
+            }
+
             // Compute byte-based dirty ratio (Kafka-exact formula §3.2).
             //
             // CP-7 bounded-range-per-pass amendment: after a partial pass,
@@ -697,9 +710,11 @@ public:
         cleaner.setProducerIdExpirationMs(producerIdExpirationMs_);
         // D3b fix round 1: a txn marker is removed only below the minimum fetch
         // position of EVERY assigned replica (a lagging replica must still get it).
-        cleaner.setMarkerRemovalBound(best.replica->cleanerMarkerRemovalBound());
+        const int64_t markerRemovalBound = best.replica->cleanerMarkerRemovalBound();
+        cleaner.setMarkerRemovalBound(markerRemovalBound);
         const int64_t verdictBound = best.replica->cleanerVerdictBound();   // the bound first, then the marker end that carries it
-        cleaner.setVerdictBounds(verdictBound, best.replica->cleanerVerdictMarkerEnd());
+        const int64_t verdictMarkerEnd = best.replica->cleanerVerdictMarkerEnd();
+        cleaner.setVerdictBounds(verdictBound, verdictMarkerEnd);
         // Fix round 2 (Kafka-style): the cleaner NEVER replaces / deletes a
         // segment file — outputs go to unique .cleaned files the owner thread
         // validates and installs (Log::drainCleanerSwaps).
@@ -752,6 +767,11 @@ public:
         // ---------------------------------------------------------------
         const bool advance = !damagedLog && passEnd > globalDirtyStart &&
                              best.replica->cleanerRole() == rune::replication::Role::Leader;
+        if (!damagedLog && passEnd <= globalDirtyStart && passResult.groups.empty())
+            stalled_.insert_or_assign(best.log, Stall{best.snap, globalDirtyStart, best.firstUncleanable, verdictBound,
+                                                      verdictMarkerEnd, markerRemovalBound});
+        else
+            stalled_.erase(best.log);
         bool allEnqueued = true;
         for (std::size_t gi = 0; gi < passResult.groups.size(); ++gi) {
             const auto& g = passResult.groups[gi];
@@ -1090,6 +1110,11 @@ private:
             for (auto* r : view_) live = live || (r && r->isDiskBacked() && r->log() == it->first);
             it = live ? std::next(it) : checkpoints_.erase(it);
         }
+        for (auto it = stalled_.begin(); it != stalled_.end();) {
+            bool live = false;
+            for (auto* r : view_) live = live || (r && r->isDiskBacked() && r->log() == it->first);
+            it = live ? std::next(it) : stalled_.erase(it);
+        }
         // #840: forget an uncleanable log when it is deleted or unassigned (its dir leaves the view).
         for (auto it = uncleanable_.begin(); it != uncleanable_.end();) {
             bool live = false;
@@ -1142,7 +1167,7 @@ private:
                 building_.clear();
                 viewGen_    = gen;
                 ackPending_ = true;
-                if (!checkpoints_.empty() || !uncleanable_.empty()) pruneCheckpoints_();   // Task 8 (cold)
+                if (!checkpoints_.empty() || !uncleanable_.empty() || !stalled_.empty()) pruneCheckpoints_();   // Task 8 (cold)
             }
         }, 64);
         if (ackPending_ && !holdViewAckForTest_ && channel_->ack.write(reinterpret_cast<const uint8_t*>(&viewGen_), 8,
@@ -1180,6 +1205,18 @@ private:
         }
     }
     std::unordered_set<std::string> uncleanable_;   ///< #840: dirs of damaged logs (cleaner thread; cold)
+    /// A pass that could not advance, and the inputs it ran on (cleaner thread; cold: written once per stall).  The snapshot
+    /// is held, so a new one never reuses its address while the log is skipped.
+    struct Stall {
+        std::shared_ptr<const rune::storage::SealedSegmentSnapshot> snap;
+        int64_t dirtyStart, firstUncleanable, verdictBound, verdictMarkerEnd, markerRemovalBound;
+        [[nodiscard]] bool sameInputs(const std::shared_ptr<const rune::storage::SealedSegmentSnapshot>& s, int64_t dirty,
+                                      int64_t uncleanable, int64_t vb, int64_t vme, int64_t mrb) const noexcept {
+            return s == snap && dirty == dirtyStart && uncleanable == firstUncleanable && vb == verdictBound &&
+                   vme == verdictMarkerEnd && mrb == markerRemovalBound;
+        }
+    };
+    std::unordered_map<const rune::storage::Log*, Stall> stalled_;
     uint64_t passesStarted_ = 0;                    ///< test seam (cleaner thread)
     uint64_t cleanedSeq_ = 0;   ///< fix round 2: unique .cleaned output names (cleaner thread)
     std::array<rune::storage::Log::CleanedMember, rune::storage::LogCleaner::kMaxDeferredGroupMembers> scratchMembers_{};

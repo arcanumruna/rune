@@ -208,6 +208,23 @@ TEST(BrokerNodeRegression, AeronDirOverrideIsWhereTheDriverRuns) {
     node.stop();
 }
 
+// The TEST-ONLY session lease knob reaches the client gateway (stall-past-the-lease tests rely on it),
+// and 0 keeps the production default.
+TEST(BrokerNodeRegression, TestSessionTimeoutReachesTheGatewayRegression) {
+    for (const int64_t ms : {int64_t{0}, int64_t{2'500}}) {
+        TempDir data{"sesslease_"};
+        NodeConfig cfg = makeSingleNodeConfig(data.path);
+        cfg.testSessionTimeoutMs = ms;
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(2s));
+        ASSERT_NE(node.gatewayForTest(), nullptr);
+        EXPECT_EQ(node.gatewayForTest()->sessionTimeoutNsForTest(),
+                  ms > 0 ? ms * 1'000'000LL : rune::gateway::ClientGateway::kDefaultSessionTimeoutNs);
+        node.stop();
+    }
+}
+
 // An Aeron dir equal to the data dir would be recursively deleted by the driver
 // (dir_delete_on_start) — start() must refuse before any side effect.
 TEST(BrokerNodeRegression, AeronDirEqualToDataDirRefusedAtStartLogSurvives) {

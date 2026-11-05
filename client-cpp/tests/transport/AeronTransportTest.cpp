@@ -144,6 +144,30 @@ TEST(AeronTransport, IpcLoopbackEcho) {
     t.stop();
 }
 
+// #883: driverCountersBytes reaches the embedded driver - its CnC (zero-filled at start) is ~11 MiB at Aeron's 1 MiB
+// minimum against ~46 MiB by default - and the transport still echoes over it.  Mutation: AeronTransport not applying
+// driverCountersBytes -> the small CnC is default-sized -> red.
+TEST(AeronTransportRegression, DriverCountersBytesShrinksTheCncRegression) {
+    Config small = makeLoopbackConfig(1001);
+    small.driverCountersBytes = rune::client::transport::kMinDriverCountersBytes;
+    Transport t{small};
+    t.start();
+    const Config dflt = makeLoopbackConfig(1002);
+    Transport d{dflt};
+    d.start();
+    const auto cnc = [](const Config& c) { return std::filesystem::file_size(std::filesystem::path(c.dataDir) / "aeron" / "cnc.dat"); };
+    EXPECT_LT(cnc(small), 16u * 1024 * 1024) << "Aeron's 1 MiB counters minimum";
+    EXPECT_GT(cnc(dflt), 40u * 1024 * 1024) << "the default keeps Aeron's 8 MiB counters";
+    awaitConnected(t);
+    const uint8_t kPayload[] = {0x01, 0x02, 0x03};
+    ASSERT_TRUE(boundedOffer(t, kPayload, sizeof(kPayload)));
+    std::vector<uint8_t> received;
+    ASSERT_TRUE(awaitFrame(t, received)) << "an echo over the small CnC";
+    EXPECT_EQ(received.size(), sizeof(kPayload));
+    d.stop();
+    t.stop();
+}
+
 // ---------------------------------------------------------------------------
 // Test: IpcLoopbackEchoEmpty — empty payload
 // ---------------------------------------------------------------------------

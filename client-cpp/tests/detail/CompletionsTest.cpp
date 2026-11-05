@@ -51,11 +51,28 @@ CompletionsConfig smallCfg(uint32_t cap = 4096, uint32_t maxResult = 256, uint32
 
 uint8_t patternByte(Token t, std::size_t k) { return static_cast<uint8_t>((t * 31u + k) & 0xFFu); }
 
+/// The first n bytes of token t's pattern as one span (pattern(t, n)[k] == patternByte(t, k)): the pattern is a byte ramp
+/// shifted by t * 31, so one ramp built once serves every token - no per-byte fill or compare loop (#883: those loops were
+/// most of the large-record models' time in Debug).
+std::span<const uint8_t> pattern(Token t, std::size_t n) {
+    static const std::vector<uint8_t> ramp = [] {
+        std::vector<uint8_t> v(256 + (1u << 20));
+        for (std::size_t i = 0; i < v.size(); ++i) v[i] = static_cast<uint8_t>(i);
+        return v;
+    }();
+    const std::size_t off = static_cast<std::size_t>((t * 31u) & 0xFFu);
+    if (n > ramp.size() - off) throw std::length_error("pattern longer than the ramp");
+    return {ramp.data() + off, n};
+}
+/// p is token t's pattern, byte for byte.
+bool matchesPattern(Token t, std::span<const uint8_t> p) {
+    return p.empty() || std::memcmp(p.data(), pattern(t, p.size()).data(), p.size()) == 0;
+}
+
 /// Duty-side delivery of `t` within reservation `r` with a patterned payload.
 bool deliver(Completions& cq, Token t, uint32_t r, uint32_t payloadLen,
              CompletionRing::Overflow ov = CompletionRing::Overflow::Truncate) {
-    std::vector<uint8_t> p(payloadLen);
-    for (uint32_t k = 0; k < payloadLen; ++k) p[k] = patternByte(t, k);
+    const std::span<const uint8_t> p = pattern(t, payloadLen);
     Completion c;
     c.token = t;
     c.op = OpKind::Ping;
@@ -113,7 +130,7 @@ TEST(Completions, CompletionRingTwoThreadExactlyOnceRegression) {
     auto onDone = [&](const Completion& c, std::span<const uint8_t> p) {
         const uint32_t want = static_cast<uint32_t>((c.token * 7919u) % 600u);
         if (c.token != next || c.value != static_cast<int64_t>(c.token) * 3 || p.size() != want) ok = false;
-        for (std::size_t k = 0; ok && k < p.size(); ++k) ok = p[k] == patternByte(c.token, k);
+        ok = ok && matchesPattern(c.token, p);
         ++next;
     };
     for (Token t = 0; t < kN; ++t) {
@@ -391,9 +408,7 @@ TEST(CompletionsLargeRecordsRegression, CompletionRingLargeRecordsNeverLoseAComp
                     inRing.pop_front();
                     EXPECT_EQ(c.token, h.t);
                     ASSERT_EQ(p.size(), h.n > 1 ? 8u * h.n : 0u);
-                    for (std::size_t k = 0; k < p.size(); ++k) {
-                        if (p[k] != patternByte(h.t, k)) { ADD_FAILURE() << "payload byte " << k << " of token " << h.t; break; }
-                    }
+                    if (!matchesPattern(h.t, p)) ADD_FAILURE() << "the payload of token " << h.t << " differs from its pattern";
                     ++polled;
                 }, static_cast<int>(limit));
             };

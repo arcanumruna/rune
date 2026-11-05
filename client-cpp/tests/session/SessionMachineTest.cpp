@@ -2487,3 +2487,39 @@ TEST(SessionResponseEgressRegression, ConnectResponseRedirectOverloadSplitsThePo
     ASSERT_EQ(io.retargetPorts.size(), 1u);
     EXPECT_EQ(io.retargetPorts[0], 40263);
 }
+
+// #883: a session opened to a new node always finds its ingress publication not yet connected, so its first
+// ConnectRequest offer is refused locally.  On the default cadence the machine re-offers it on the very next tick
+// (a refused offer never reaches the network): a 200 ms cadence made every first write to another leader wait
+// ~250 ms.  Mutation: the 200 ms default back -> no re-offer at T0 + 1 µs, and none before T0 + 200 ms.
+TEST(SessionMachineRegression, ARefusedConnectIsReofferedOnTheNextTickRegression) {
+    FakeIo io;
+    auto cfg = testConfig();
+    cfg.connectTimeoutNs = 5'000'000'000LL;   // the production window: the re-offer must come long before it
+    ASSERT_EQ(cfg.connectRetryIntervalNs, sm::SessionConfig{}.connectRetryIntervalNs) << "the default cadence";
+    sm::SessionMachine m(io, cfg);
+
+    io.sendSucceeds = false;   // the new node's publication is still connecting
+    m.connect(T0);
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+    ASSERT_EQ(io.sendCount(), 1u);
+    const int64_t corrId = m.correlationId();
+
+    m.tick(T0 + 1'000);   // the next duty cycle, still refused: offered again
+    ASSERT_EQ(io.sendCount(), 2u) << "a refused ConnectRequest is re-offered on the next tick";
+
+    io.sendSucceeds = true;   // the publication connects
+    m.tick(T0 + 2'000);
+    ASSERT_EQ(io.sendCount(), 3u);
+    const auto req = io.lastConnectRequest();
+    ASSERT_TRUE(req.has_value());
+    EXPECT_EQ(req->correlationId, corrId) << "the re-offer is the same request";
+
+    m.tick(T0 + 3'000);   // accepted: no further offers while the broker answers
+    m.tick(T0 + 1'000'000'000LL);
+    EXPECT_EQ(io.sendCount(), 3u) << "an accepted ConnectRequest is never re-offered";
+
+    m.onConnectResponse(static_cast<int16_t>(rpc::ErrorCode::OK), /*leaderMemberId=*/0, /*assignedSessionId=*/77, corrId,
+                        T0 + 1'000'000'001LL);
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+}

@@ -306,6 +306,11 @@ struct ClientConfig {
     // deep in-flight on high-throughput small-record producing.
     std::size_t termBufferBytes = 4u * 1024 * 1024;
 
+    // Counter-values buffer of the embedded driver's CnC.  0 = Aeron's default (8 MiB of values + 32 MiB of metadata,
+    // zero-filled when the driver starts).  A client owns a few dozen counters: Aeron's 1 MiB minimum
+    // (transport::kMinDriverCountersBytes) holds 8192 of them and starts the driver ~4x faster.  Else [1 MiB, 500 MiB].
+    std::size_t driverCountersBytes = 0;
+
     // Explicit Aeron knobs (spec §4.1/§4.3).  Env overrides (RUNE_CLIENT_AERON_MTU,
     // RUNE_AERON_SOCKET_BUFFER_BYTES, RUNE_CLIENT_AERON_DRIVER_IDLE) win; a
     // malformed env value is logged once at construction and not applied.
@@ -754,6 +759,8 @@ public:
     void testRequestMetadataNow() noexcept { lastUrgentMetadataNs_ = INT64_MIN; requestMetadataNow_(); }
     /// True while a MetadataRequest is unanswered (its answer timer is armed).  Test seam (duty thread).
     [[nodiscard]] bool testMetadataAnswerPending() const noexcept { return metadataAnswerByNs_ != 0; }
+    /// The armed backoff refresh's due time on the duty clock (kMetadataRefreshNotArmed: none).  Test seam (duty thread).
+    [[nodiscard]] int64_t testMetadataRefreshDueNs() const noexcept { return nextMetadataRefreshAtNs_; }
     /// Test hook (duty-cycle thread only): agent session `i`'s state.
     [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
     /// Test hook (duty-cycle thread only / after quiescence): the endpoint channel of agent session `i`.

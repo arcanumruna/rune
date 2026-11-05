@@ -67,6 +67,32 @@ TEST(EmbeddedDriverRegression, ThreadedStartNeverPumpsFromCaller) {
     a.reset();
 }
 
+// #883: a test client's driver sets Aeron's minimum counters buffer, so its CnC (zero-filled page by page at start) is
+// ~11 MiB instead of the default ~46 MiB; the default config keeps Aeron's size.  A client still connects and publishes
+// over the small CnC.  Mutation: EmbeddedDriver ignoring countersValuesBytes -> both CnCs are the default size -> red.
+TEST(EmbeddedDriverRegression, TestClientCountersShrinkTheCncRegression) {
+    TmpDir small, dflt;
+    EmbeddedDriverConfig sc = cfgAt(small.path);
+    sc.countersValuesBytes = kTestClientCountersBytes;
+    EmbeddedDriver s(sc, DriverMode::Threaded);
+    EmbeddedDriver d(cfgAt(dflt.path), DriverMode::Threaded);
+    const auto smallCnc = fs::file_size(small.path / "cnc.dat");
+    const auto dfltCnc = fs::file_size(dflt.path / "cnc.dat");
+    EXPECT_LT(smallCnc, 16u * 1024 * 1024) << "the test-client CnC";
+    EXPECT_GT(dfltCnc, 40u * 1024 * 1024) << "the default CnC keeps Aeron's 8 MiB counters";
+    auto a = connect(small.path, /*invoker=*/false);
+    ASSERT_TRUE(a);
+    const int64_t reg = a->addPublication("aeron:ipc", 7);
+    std::shared_ptr<aeron::Publication> pub;
+    for (int i = 0; i < 5000 && !pub; ++i) {
+        pub = a->findPublication(reg);
+        if (!pub) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(pub) << "a publication resolves over the small CnC";
+    pub.reset();
+    a.reset();
+}
+
 TEST(EmbeddedDriver, InvokerModeRoundTripOnOneThreadOnly) {
     TmpDir d;
     EmbeddedDriver drv(cfgAt(d.path), DriverMode::Invoker);

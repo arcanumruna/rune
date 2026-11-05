@@ -232,6 +232,7 @@ public:
         dc.dir = aeronDir_;
         dc.termBufferBytes = 64 * 1024;
         dc.rcvWindowBytes = 128 * 1024;
+        dc.countersValuesBytes = rune::node::kTestClientCountersBytes;
         driver_ = std::make_unique<rune::node::EmbeddedDriver>(dc, rune::node::DriverMode::Threaded);
         aeron::Context ctx;
         ctx.aeronDir(aeronDir_);

@@ -350,6 +350,11 @@ struct NodeConfig {
     // never set in production.
     int64_t testUserDecisionHoldMs = 0;
 
+    // TEST-ONLY: the client gateway's session lease (a session silent, or Lost on a worker, this long
+    // is reaped).  Lets a stall-past-the-lease test stall a few seconds instead of outlasting the
+    // 10 s default.  0 (default): ClientGateway::kDefaultSessionTimeoutNs; never set in production.
+    int64_t testSessionTimeoutMs = 0;
+
     // TEST-ONLY (ISR v3 Step 9, R-I1): hold the consensus candidacy from boot even for a Founder/Legacy storage,
     // until the test releases it (BrokerNode::setTestCandidacyHold).  Makes a fresh-cluster formation
     // deterministic: every node decides its storage before anyone stands.  Never set in production.

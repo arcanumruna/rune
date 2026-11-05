@@ -78,6 +78,7 @@ public:
             replica = std::make_unique<rune::replication::PartitionReplica>(c, rune::replication::Role::Leader, 1, opts_.replicas,
                                                                             opts_.replicas, log.get(), &transport_);
         EmbeddedDriverConfig dc; dc.dir = adir_.string(); dc.termBufferBytes = 64 * 1024;
+        dc.countersValuesBytes = kTestClientCountersBytes;
         drv_ = std::make_unique<EmbeddedDriver>(dc, DriverMode::Invoker);
         aeron::Context ctx; ctx.aeronDir(adir_.string()); ctx.useConductorAgentInvoker(true);
         client_ = aeron::Aeron::connect(ctx);

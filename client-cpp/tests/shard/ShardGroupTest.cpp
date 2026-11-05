@@ -11,6 +11,7 @@
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/shard/ClientShard.h>
+#include <rune/client/transport/TransportConfig.h>
 
 #include <gtest/gtest.h>
 
@@ -58,6 +59,9 @@ rs::ShardGroupConfig group(int32_t in, int32_t eg, uint32_t count, int32_t parti
     g.base.gatewayStreamId = in;
     g.base.egressChannel   = "aeron:ipc";
     g.base.egressStreamId  = eg;
+    // #883: each shard's embedded driver maps a 1 MiB counters CnC (~11 MiB), not the 46 MiB default -
+    // prefaulting it was most of every iteration of the race tests.
+    g.base.driverCountersBytes = rune::client::transport::kMinDriverCountersBytes;
     g.base.dataDir = std::filesystem::temp_directory_path().string() + "/shardgrp_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr++);
     g_sweeper.dirs.push_back(g.base.dataDir);
     rc::TopicSpec ts;

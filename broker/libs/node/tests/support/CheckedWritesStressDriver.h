@@ -220,7 +220,7 @@ public:
         s.part = static_cast<int>(rune::client::Key(id).partition(parts_));
         s.windowKnown = true;
         s.hwBefore = highWatermark_(s.part);
-        kiSend_(*kiWriters_.front(), &s);
+        kiSend_(kiWriter_(0), &s);
         s.hwAfter = highWatermark_(s.part);
         sent_.push_back(s);
         return s;
@@ -264,6 +264,10 @@ public:
 
 private:
     // ---- clients ----
+    /// A write answers in ~30 ms; one in flight to a leader that just crashed can only time out, an outcome the model already
+    /// accounts for (Unknown).  The 5 s default made each of those writes cost the seed 5 s (#883).
+    static constexpr int64_t kWriteTimeoutMs = 2'000;
+
     struct Writer {
         std::unique_ptr<rune::client::Client> client;
         std::optional<rune::client::Producer> prod;
@@ -277,6 +281,7 @@ private:
             rune::client::ProducerConfig pc;
             pc.acks = rune::client::Acks::All | rune::client::Acks::View;
             pc.lingerUs = 1;
+            pc.produceTimeoutMs = kWriteTimeoutMs;
             prod.emplace(client->producer(pc));
             client->connectAndWait(30s);
             cq = std::make_unique<rune::client::Completions>(*client);
@@ -312,6 +317,7 @@ private:
             rune::client::ProducerConfig pc;
             pc.acks = rune::client::Acks::All | rune::client::Acks::View;
             pc.lingerUs = 1;
+            pc.produceTimeoutMs = kWriteTimeoutMs;
             prod.emplace(client->producer(pc));
             client->connectAndWait(30s);
             topic.emplace(client->openTopicAndWait<rune::node::test::KiAccount>("ki", *prod, 30s));
@@ -482,24 +488,38 @@ private:
     }
 
     // ---- writes ----
+    /// Three writer slots, each seeded at one of the running nodes but `avoid`.  A slot's client connects on its first use: a burst
+    /// writes through one of them, and most are rebuilt before they are used (#883: 3 connects per rebuild were a fifth of a seed).
     void rebuildWriters_(int avoid) {
         writers_.clear();
         kiWriters_.clear();
+        writerSeeds_.clear();
         std::vector<int> seeds;
         for (const int id : c_.runningNodes()) if (id != avoid) seeds.push_back(id);
-        for (std::size_t i = 0; i < 3; ++i) {
-            rune::client::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c_, seeds[i % seeds.size()]);
-            cfg.connectTimeoutMs = 30'000;
-            cfg.pingTimeoutMs = 30'000;
-            if (keyIndex_) kiWriters_.push_back(std::make_unique<KiWriter>(cfg));
-            else writers_.push_back(std::make_unique<Writer>(cfg, topicId_));
-        }
+        for (std::size_t i = 0; i < 3; ++i) writerSeeds_.push_back(seeds[i % seeds.size()]);
+        writers_.resize(3);
+        kiWriters_.resize(3);
         writersStale_ = false;
+    }
+    /// Built when the slot connects: the config reserves the client's egress port.
+    rune::client::ClientConfig writerCfg_(std::size_t i) const {
+        rune::client::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c_, writerSeeds_[i]);
+        cfg.connectTimeoutMs = 30'000;
+        cfg.pingTimeoutMs = 30'000;
+        return cfg;
+    }
+    Writer& writer_(std::size_t i) {
+        if (!writers_[i]) writers_[i] = std::make_unique<Writer>(writerCfg_(i), topicId_);
+        return *writers_[i];
+    }
+    KiWriter& kiWriter_(std::size_t i) {
+        if (!kiWriters_[i]) kiWriters_[i] = std::make_unique<KiWriter>(writerCfg_(i));
+        return *kiWriters_[i];
     }
     void sendBurst_(int victim) {
         if (writersStale_ || victim > 0) rebuildWriters_(victim);
         if (keyIndex_) return kiBurst_(victim);
-        Writer& w = *writers_[rng_() % writers_.size()];
+        Writer& w = writer_(rng_() % writers_.size());
         const int n = 1 + static_cast<int>(rng_() % 80);
         std::vector<std::pair<uint64_t, std::size_t>> toks;
         std::jthread killer;   // joined on unwind too: a send that throws mid-crash must not destroy it joinable
@@ -524,7 +544,7 @@ private:
     /// Key-index mode: 1 to 6 typed writes through one client, each waited for, with the partition's high watermark around it so an
     /// answer without an offset (a rejection carries none) is found again in the log.  Every outcome is one the model can account for.
     void kiBurst_(int victim) {
-        KiWriter& w = *kiWriters_[rng_() % kiWriters_.size()];
+        KiWriter& w = kiWriter_(rng_() % kiWriters_.size());
         const int n = 1 + static_cast<int>(rng_() % 6);
         std::jthread killer;   // joined on unwind too: a send that throws mid-crash must not destroy it joinable
         for (int i = 0; i < n && !::testing::Test::HasFatalFailure(); ++i) {
@@ -1047,6 +1067,7 @@ private:
     bool writersStale_ = false;
     std::vector<std::unique_ptr<Writer>> writers_;
     std::vector<std::unique_ptr<KiWriter>> kiWriters_;
+    std::vector<int> writerSeeds_;   ///< each writer slot's seed node (rebuildWriters_)
     std::function<void(const Sent&)> kiSendHook_;
     std::function<void()> viewLookupHook_;
     std::vector<Sent> sent_;

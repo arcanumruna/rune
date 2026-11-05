@@ -9,7 +9,7 @@
 //   |------------------------|-----------------------------------|--------------------------|------------------------------------------------|-----
 //   | produce-bytes-per-sec  | raw produce burst, acks=1         | over the rate            | 53, retryAfter in (0, 10 s] in logStartOffset  | NamespaceThrottleRegression.ProduceThrottledReturnsRetryAfterRegression
 //   | produce-bytes-per-sec  | same burst in namespace `free`    | `d` throttled            | every produce served                           | NamespaceThrottleRegression.OtherNamespaceNotThrottledRegression
-//   | produce-bytes-per-sec  | client library, acks=All          | a burst over the rate    | all records acked; elapsed >= the rate floor; >= 1 backoff | NamespaceThrottleRegression.ClientBacksOffAndSucceedsRegression
+//   | produce-bytes-per-sec  | client library, acks=All          | a burst over the rate    | all records acked; a wave refused (53) at least once and still acked in full | NamespaceThrottleRegression.ClientBacksOffAndSucceedsRegression
 //   | produce-bytes-per-sec  | SetLimits removes the limit       | throttled                | the throttle clears at the next tick           | NamespaceThrottleRegression.RaisedLimitClearsThrottleRegression
 #include "support/AuthRig.h"
 #include "support/LimitEnforcementTable.h"
@@ -244,13 +244,23 @@ TEST(NamespaceThrottleRegression, ClientBacksOffAndSucceedsRegression) {
     EXPECT_EQ(w1.ok, kWave) << "wave 1 failed " << w1.failed;
     // ... then the namespace is over its rate: the worker holds a throttle deadline seconds away.
     ASSERT_TRUE(until([&] { return throttleUntil() != 0; })) << "the aggregator never throttled the namespace";
-    const uint64_t before = refusals();
-    // Wave 2 meets the throttle: the broker answers 53, the client waits out the retry-after and every record still lands.
-    const Wave w2 = wave();
-    EXPECT_EQ(w2.ok, kWave) << "wave 2 failed " << w2.failed;
-    EXPECT_EQ(w2.failed, 0);
-    EXPECT_GE(w2.took, 1s) << "the second wave could only complete after the throttle deadline (~2 s for 80 KiB over 40 KiB/s)";
-    EXPECT_GT(refusals(), before) << "the broker refused at least once while the client was backing off";
+    // The next wave meets the throttle: the broker answers 53, the client waits out the retry-after and every record
+    // still lands.  #867: whether a wave starts before the deadline passes is wall-clock luck under load (TSan), so the
+    // test never assumes it - a wave that missed the throttle is itself twice the rate and throttles the namespace
+    // again, and the next wave meets that.  Bounded; every wave lands in full.
+    bool met = false;
+    for (int k = 0; k < 4 && !met; ++k) {
+        ASSERT_TRUE(until([&] { return throttleUntil() != 0; })) << "wave " << k + 2;
+        const uint64_t before = refusals();
+        const Wave w = wave();
+        EXPECT_EQ(w.ok, kWave) << "wave " << k + 2 << " failed " << w.failed;
+        EXPECT_EQ(w.failed, 0) << "wave " << k + 2;
+        met = refusals() > before;
+        std::printf("THROTTLE: wave %d took %lld ms, %s\n", k + 2,
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(w.took).count()),
+                    met ? "refused and backed off" : "missed the throttle");
+    }
+    EXPECT_TRUE(met) << "no wave met the throttle: the broker never refused while the client was sending";
     p.close();
 }
 
