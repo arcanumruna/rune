@@ -736,11 +736,20 @@ public:
         execute_();
         if (::testing::Test::HasFatalFailure()) return;
 
-        waitCommitted_();
-        const auto appended = withoutAbortedTxn_(r_.readLog());   // an aborted transaction at the tail needs no verdicts
-        const int64_t target = std::max(appended.data.empty() ? 0 : appended.data.back().offset + 1, appended.changes.empty() ? 0 : appended.changes.back().offset + 1);
-        ASSERT_TRUE(r_.driveUntilJudged(target, VerdictRig::kMaxPass * strictFactor_()));
-        r_.passes(60);
+        const auto judgeAll = [&] {
+            waitCommitted_();
+            const auto appended = withoutAbortedTxn_(r_.readLog());   // an aborted transaction at the tail needs no verdicts
+            const int64_t reach = std::max(appended.data.empty() ? 0 : appended.data.back().offset + 1, appended.changes.empty() ? 0 : appended.changes.back().offset + 1);
+            EXPECT_TRUE(r_.driveUntilJudged(reach, VerdictRig::kMaxPass * strictFactor_()));
+            r_.passes(60);
+            return reach;
+        };
+        int64_t target = judgeAll();
+        if (::testing::Test::HasFatalFailure()) return;
+        if (ex.check == Check::Burned && !faulty_()) {   // a create after the judge: the burned ids are not given back
+            sendOpRecs_(kOpPid, {createRec(1)});
+            target = judgeAll();
+        }
         const auto log = r_.readLog();
         const auto judged = withoutAbortedTxn_(log);
         CheckedWritesModel model;
@@ -1054,6 +1063,11 @@ private:
             std::size_t stored = 0;
             for (const auto& [offset, n] : batches_) stored += n;
             EXPECT_EQ(log.data.size(), stored) << "a refused batch stores nothing";
+            if (ex.check == Check::AutoExhausted && !faulty_()) {
+                uint64_t next = 1;
+                for (const auto& [offset, a] : keyZero_) next = std::max(next, (a.assignedBase + (a.count - 1) * partitions_()) / partitions_() + 1);
+                EXPECT_EQ(r_.autoIncState()->nextN, next) << "the refusal leaves the counter";
+            }
             return;
         }
         if (ex.check == Check::DeadlineInternal && createOp_()) {   // the ids were taken: once the fold resumes the log holds the batch with them
@@ -1087,13 +1101,20 @@ private:
             for (const auto& [offset, a] : keyZero_)
                 for (std::size_t i = 0; i < a.count; ++i) rejected += model.verdicts().count(a.baseOffset + static_cast<int64_t>(i));
             EXPECT_GT(rejected, 0u);
-            if (!faulty_()) EXPECT_EQ(r_.autoIncStats().idsBurned, rejected) << "every rejected create burned its id";
+            if (!faulty_()) {
+                EXPECT_EQ(r_.autoIncStats().idsBurned, rejected) << "every rejected create burned its id";
+                const auto& later = acksByCorr_.at(sent_.back().corr);
+                uint64_t next = 0;
+                for (const auto& [offset, a] : keyZero_)
+                    if (offset < later.baseOffset) next = std::max(next, a.assignedBase + a.count * partitions_());
+                EXPECT_EQ(later.assignedBase, next) << "a later create continues after the burned ids";
+            }
         }
         if (c_.op == Op::ImportAbove && c_.timing == Timing::Single) {
             const auto resv = r_.reservations();
             const auto above = std::find_if(resv.begin(), resv.end(), [&](const auto& x) { return x.second >= importAboveId_ / partitions_(); });
             ASSERT_TRUE(above != resv.end()) << "an import above the reservation reserves through its n";
-            EXPECT_LT(above->first, opAck(0).baseOffset);
+            EXPECT_EQ(above->first, opAck(0).baseOffset - 1) << "the reservation sits right below the import";
             EXPECT_EQ(r_.autoIncState()->nextN, importAboveId_ / partitions_() + 1);
         }
         if (c_.op == Op::ImportBelow && c_.timing == Timing::Single) EXPECT_EQ(r_.autoIncState()->nextN, ids_.back() / partitions_() + 1) << "the counter is unchanged";
@@ -1251,8 +1272,8 @@ TEST(CheckedWritesModel, AutoIncPredicatesCatchHandMadeViolations) {
     EXPECT_TRUE(one.counterAboveEveryId(clean, AutoIncReady{4, 8}));
 
     Log twice = clean;
-    twice.data.push_back(rec(4, 2));
-    EXPECT_FALSE(one.noIdTwiceNoReuse(twice, {{1, 1, 2}, {3, 3, 1}, {4, 2, 1}})) << "an id in two key-0 records";
+    twice.data[2] = rec(3, 2);
+    EXPECT_FALSE(one.noIdTwiceNoReuse(twice, acks)) << "an id in two key-0 records";
     EXPECT_FALSE(one.noIdTwiceNoReuse(clean, {{1, 1, 2}, {3, 2, 1}})) << "an id in two acks";
 
     Log above = clean;

@@ -167,8 +167,8 @@ inline void checkViews(VerdictRig& r, const CheckedWritesModel& model, const Ver
 /// are further log records the subscription delivers (a Raw one gets an aborted transaction's).
 inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64_t sub, bool filtered, const std::set<int64_t>* present = nullptr,
                            const std::vector<VerdictRig::RigLogRec>* alsoDelivered = nullptr) {
-    for (int i = 0; i < VerdictRig::kMaxPass && r.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) r.pass();   // nothing is delivered while the leadership scan runs
-    ASSERT_EQ(r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
+    for (int i = 0; i < VerdictRig::kMaxPass && r.worker->rcStatusForTest(VerdictRig::kSrc, r.partition()) != Worker::kRcReady; ++i) r.pass();   // nothing is delivered while the leadership scan runs
+    ASSERT_EQ(r.worker->rcStatusForTest(VerdictRig::kSrc, r.partition()), Worker::kRcReady);
     const auto& box = r.collect(sub);
     std::vector<std::tuple<int64_t, uint64_t, uint16_t, uint8_t>> got, want;
     for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.tag, d.intent);

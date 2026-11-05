@@ -144,6 +144,7 @@ public:
         ASSERT_TRUE(autoIncState().has_value()) << "the first scan never made the counter Ready";
         ASSERT_TRUE(keyIndexLogged_()) << "the key index never became the logged set's member";
     }
+    [[nodiscard]] int32_t partition() const { return tuning_.partition; }
     [[nodiscard]] std::optional<AutoIncReady> autoIncState() const { return worker->autoIncStateForTest(kSrc, tuning_.partition); }
     [[nodiscard]] const AutoIncStats& autoIncStats() const { return *worker->autoIncStatsForTest(kSrc, tuning_.partition); }
     /// The reservation records (type 16) in the log as (offset, reserved-through n), in offset order.
