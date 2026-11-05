@@ -66,9 +66,15 @@ TEST(CheckedWritesTimeline, MarkerLedgerIsIdempotentAndFullRefuses) {
     MarkerLedger m;
     EXPECT_TRUE(m.onMarker(15, 12));
     EXPECT_TRUE(m.onMarker(15, 12));
+    EXPECT_EQ(m.appendedThrough(), 12) << "the duplicate changes nothing";
     for (int64_t i = 1; i < static_cast<int64_t>(MarkerLedger::kCapacity); ++i) EXPECT_TRUE(m.onMarker(15 + i, 12 + i));
     EXPECT_TRUE(m.full());
+    constexpr int64_t kRingThrough = 12 + static_cast<int64_t>(MarkerLedger::kCapacity) - 1;
+    EXPECT_EQ(m.appendedThrough(), kRingThrough);
     EXPECT_FALSE(m.onMarker(100000, 1));
+    EXPECT_EQ(m.appendedThrough(), kRingThrough) << "a left-out marker below the coverage does not lower it";
+    EXPECT_TRUE(m.onMarker(100000, 1)) << "the left-out marker is remembered";
+    EXPECT_EQ(m.appendedThrough(), kRingThrough);
 }
 
 // A marker the full ring leaves out is in the log all the same: appendedThrough counts it until a cut removes it.
