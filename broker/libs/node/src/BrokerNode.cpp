@@ -5610,32 +5610,51 @@ void BrokerNode::anchorFixedEndpoints_(const std::shared_ptr<aeron::Aeron>& clie
                                  "inside the kernel's ephemeral range can be taken first: see the startup WARN; "
                                  "reserve it with sysctl net.ipv4.ip_local_reserved_ports)");
     };
-    for (const auto& ch : subs) {
+    // Every add goes to the driver first, then each is resolved: the driver answers them in one pass instead of one
+    // conductor round trip (and the pump's 1 ms sleeps) per endpoint (#883).  A refusal still names the first failing
+    // channel in declaration order, as before.
+    struct Pending { int64_t reg = -1; std::string err; };
+    std::vector<Pending> subRegs(subs.size()), pubRegs(pubs.size());
+    for (std::size_t i = 0; i < subs.size(); ++i) {
+        try { subRegs[i].reg = client->addSubscription(subs[i], kBindAnchorStreamId); }
+        catch (const std::exception& e) { subRegs[i].err = e.what(); }
+    }
+    for (std::size_t i = 0; i < pubs.size(); ++i) {
+        try { pubRegs[i].reg = client->addExclusivePublication(pubs[i], kBindAnchorStreamId); }
+        catch (const std::exception& e) { pubRegs[i].err = e.what(); }
+    }
+    for (std::size_t i = 0; i < subs.size(); ++i) {
+        const std::string& ch = subs[i];
         bool failed = false;
-        std::string err;
+        std::string err = subRegs[i].err;
         std::shared_ptr<aeron::Subscription> s;
-        try {
-            const int64_t reg = client->addSubscription(ch, kBindAnchorStreamId);
-            s = pump.resolve([&]() -> std::shared_ptr<aeron::Subscription> {
-                try { return client->findSubscription(reg); }
-                catch (const std::exception& e) { err = e.what(); failed = true; return nullptr; }
-            }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
-        } catch (const std::exception& e) { err = e.what(); }
+        if (err.empty()) {
+            try {
+                const int64_t reg = subRegs[i].reg;
+                s = pump.resolve([&]() -> std::shared_ptr<aeron::Subscription> {
+                    try { return client->findSubscription(reg); }
+                    catch (const std::exception& e) { err = e.what(); failed = true; return nullptr; }
+                }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
+            } catch (const std::exception& e) { err = e.what(); }
+        }
         if (!s) refuse(ch, err.empty() ? std::string("not resolved") : err);
         bindAnchorSubs_.push_back(std::move(s));
         bindAnchorChannels_.push_back(ch);
     }
-    for (const auto& ch : pubs) {
+    for (std::size_t i = 0; i < pubs.size(); ++i) {
+        const std::string& ch = pubs[i];
         bool failed = false;
-        std::string err;
+        std::string err = pubRegs[i].err;
         std::shared_ptr<aeron::ExclusivePublication> p;
-        try {
-            const int64_t reg = client->addExclusivePublication(ch, kBindAnchorStreamId);
-            p = pump.resolve([&]() -> std::shared_ptr<aeron::ExclusivePublication> {
-                try { return client->findExclusivePublication(reg); }
-                catch (const std::exception& e) { err = e.what(); failed = true; return nullptr; }
-            }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
-        } catch (const std::exception& e) { err = e.what(); }
+        if (err.empty()) {
+            try {
+                const int64_t reg = pubRegs[i].reg;
+                p = pump.resolve([&]() -> std::shared_ptr<aeron::ExclusivePublication> {
+                    try { return client->findExclusivePublication(reg); }
+                    catch (const std::exception& e) { err = e.what(); failed = true; return nullptr; }
+                }, rune::aeronutil::AeronPump::kUntilAnswered, &failed);
+            } catch (const std::exception& e) { err = e.what(); }
+        }
         if (!p) refuse(ch, err.empty() ? std::string("not resolved") : err);
         bindAnchorPubs_.push_back(std::move(p));
         bindAnchorChannels_.push_back(ch);
