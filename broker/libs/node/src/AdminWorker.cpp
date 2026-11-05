@@ -419,6 +419,7 @@ void AdminWorker::attachSecurity(SecurityApplier booted, rune::replication::Part
     // Namespaces Task 8: `applier_` is a member (move-assigned in place by adoptBootedApplier), so its state's address
     // is stable for this worker's life.
     securityAdmin_->bindCatalog(&applier_.state());
+    securityAdmin_->bindFeatureLevel(&clusterFeatureLevel_);
     if (replica != nullptr)
         // Authentication Task 10: `__security` reads ride a second CatalogReadServer on the same egress; its ids carry
         // the security id bit so one id names one server.
@@ -1394,19 +1395,42 @@ AdminWorker::Built AdminWorker::buildEvent_(const DdlRequest& req, const cat::Ca
 
 namespace {
 
-// Checked writes Part 05 (P5-6): the leader-only rules for a new definition's key features.  `keyWidth` is the key
-// field's encoded width (0 = no such field, which stays the applier's precondition).
+constexpr const char* kAutoIncRetentionDetail = "autoincrement topics keep every record: retention.ms and retention.bytes must be -1";
+
+// Checked writes (Part 05 P5-6, Part 06 P6-5): the leader-only rules for a new definition's key features, on the
+// normalized features.  `keyWidth` and `keyType` describe the key field (0 / Int32 = no such field, which stays the
+// applier's precondition).
 std::optional<DdlRejection> keyFeaturesRefusal(const rune::protocol::TopicKeyFeatures& f, const TopicShape& shape,
-                                               uint32_t keyWidth, int16_t level) {
-    if (f == rune::protocol::TopicKeyFeatures{}) return std::nullopt;
+                                               uint32_t keyWidth, rune::codec::PrimType keyType, int32_t partitionCount,
+                                               const rune::protocol::TopicConfig& config, bool adoption, int16_t level) {
+    namespace rp = rune::protocol;
+    if (f == rp::TopicKeyFeatures{}) return std::nullopt;
+    const bool autoIncFamily = f.autoIncrement || f.partitioner != rp::Partitioner::Fnv1a ||
+                               f.autoIncrementMax != rp::kAutoIncrementMaxDefault ||
+                               f.autoIncrementReserve != rp::kAutoIncrementReserveDefault;
     if (level < rune::replication::MetadataFeature::kCheckedWrites)
-        return reject(kInvalidRequest, "key.index needs every broker at feature level 5");
+        return reject(kInvalidRequest, autoIncFamily ? "autoincrement needs every broker at feature level 5"
+                                                      : "key.index needs every broker at feature level 5");
+    if (!f.autoIncrement) {
+        if (f.autoIncrementMax != rp::kAutoIncrementMaxDefault || f.autoIncrementReserve != rp::kAutoIncrementReserveDefault)
+            return reject(kInvalidRequest, "autoincrement.max and autoincrement.reserve need autoincrement");
+        if (f.partitioner == rp::Partitioner::Modulo) return reject(kInvalidRequest, "the modulo partitioner needs autoincrement");
+    } else {
+        if (const auto why = featureRefusal(DbFeature::AutoIncrement, shape)) return reject(kInvalidRequest, std::string(*why));
+        if (adoption) return reject(kInvalidRequest, "autoincrement needs a new topic");
+        if (keyType != rune::codec::PrimType::UInt64 && keyType != rune::codec::PrimType::Int64 && keyType != rune::codec::PrimType::UInt32)
+            return reject(kInvalidRequest, "autoincrement needs a uint64, int64 or uint32 key");
+        if (config.cleanupPolicy != 1) return reject(kInvalidRequest, "autoincrement needs cleanup.policy = compact");
+        if (config.retentionMs != -1 || config.retentionBytes != -1) return reject(kInvalidRequest, kAutoIncRetentionDetail);
+        if (f.autoIncrementReserve < 1 || f.autoIncrementReserve > rp::kAutoIncrementReserveMax)
+            return reject(kInvalidRequest, "autoincrement.reserve must be between 1 and " + std::to_string(rp::kAutoIncrementReserveMax));
+        const uint64_t cap = keyType == rune::codec::PrimType::UInt32 ? 0xFFFF'FFFFull : rp::kAutoIncrementMaxDefault;
+        const uint64_t low = 2 * static_cast<uint64_t>(partitionCount) - 1;
+        if (f.autoIncrementMax < low || f.autoIncrementMax > cap)
+            return reject(kInvalidRequest, "autoincrement.max must be between " + std::to_string(low) + " and " + std::to_string(cap));
+    }
     if (const auto why = featureRefusal(DbFeature::KeyIndex, shape)) return reject(kInvalidRequest, std::string(*why));
     if (keyWidth > 8) return reject(kInvalidRequest, "key.index needs a key of at most 8 bytes");
-    if (f.autoIncrement || f.partitioner != rune::protocol::Partitioner::Fnv1a ||
-        f.autoIncrementMax != rune::protocol::kAutoIncrementMaxDefault ||
-        f.autoIncrementReserve != rune::protocol::kAutoIncrementReserveDefault)
-        return reject(kInvalidRequest, "autoincrement is not supported by this broker yet");
     return std::nullopt;
 }
 
@@ -1422,6 +1446,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     uint16_t nextTag = 0;
     std::optional<DdlRejection> keyRefusal;   // P4: judges a new definition only, after the existing-name answers below
     uint32_t keyWidth = 0;
+    rune::codec::PrimType keyType = rune::codec::PrimType::Int32;
     if (!m.blob.empty()) {
         try {
             const rune::codec::Descriptor d =
@@ -1435,6 +1460,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
             if (!m.keyField.empty())
                 if (const rune::codec::FieldDescriptor* k = d.find(m.keyField); k != nullptr) {
                     keyWidth = rune::codec::fieldWidth(*k);
+                    keyType  = k->type;
                     if (!rune::codec::isTopicKeyType(k->type, keyWidth))
                         keyRefusal = reject(kInvalidSchema, "key field '" + m.keyField + "' is " + keyTypeSpelling(*k) +
                                                                 ": a topic key is an integer or string(N) with N <= 16");
@@ -1448,6 +1474,15 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         }
     }
 
+    // P6-1: autoincrement implies key.index and the modulo partitioner, and a uint32 key takes the type's own cap.
+    rune::protocol::TopicKeyFeatures features = m.keyFeatures;
+    if (features.autoIncrement) {
+        features.keyIndex    = true;
+        features.partitioner = rune::protocol::Partitioner::Modulo;
+        if (keyType == rune::codec::PrimType::UInt32 && features.autoIncrementMax == rune::protocol::kAutoIncrementMaxDefault)
+            features.autoIncrementMax = 0xFFFF'FFFFull;
+    }
+
     cat::CatalogEvent e;
     e.nsId       = m.nsId;
     e.objectName = m.name;
@@ -1455,8 +1490,8 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         if (t->schema) return Rejected(reject(kTopicExists, {}, t->topicId, t->schema->schemaVersion));
         if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
         if (keyRefusal) return Rejected(std::move(*keyRefusal));
-        if (auto why = keyFeaturesRefusal(m.keyFeatures, TopicShape{true, !m.keyField.empty(), t->persistence == cat::Persistence::Transient},
-                                          keyWidth, clusterFeatureLevel_))
+        if (auto why = keyFeaturesRefusal(features, TopicShape{true, !m.keyField.empty(), t->persistence == cat::Persistence::Transient},
+                                          keyWidth, keyType, m.partitionCount, m.config, /*adoption=*/true, clusterFeatureLevel_))
             return Rejected(std::move(*why));
         // Issue #129: adopting a schema is a new version of a LIVE topic (every other producer's records are then
         // validated against it), so it needs ALTER on the topic - the gateway's verdict - not CREATE alone.
@@ -1470,7 +1505,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         e.objectId    = t->objectId;
         e.prevVersion = t->version;
         e.newVersion  = t->version + 1;
-        e.ops = cat::CreateSchemaOps{cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag, m.keyFeatures}};
+        e.ops = cat::CreateSchemaOps{cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag, features}};
         return e;
     }
     if (const cat::ViewObject* v = s.viewByName(m.nsId, m.name)) {
@@ -1479,8 +1514,8 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     }
     if (auto fold = foldCollision(s, m.nsId, m.name)) return Rejected(std::move(*fold));
     if (keyRefusal) return Rejected(std::move(*keyRefusal));
-    if (auto why = keyFeaturesRefusal(m.keyFeatures, TopicShape{!m.blob.empty(), !m.keyField.empty(), m.persistence == 1},
-                                      keyWidth, clusterFeatureLevel_))
+    if (auto why = keyFeaturesRefusal(features, TopicShape{!m.blob.empty(), !m.keyField.empty(), m.persistence == 1},
+                                      keyWidth, keyType, m.partitionCount, m.config, /*adoption=*/false, clusterFeatureLevel_))
         return Rejected(std::move(*why));
 
     // Spec §8: the replication factor is bounded by the brokers and the minIsr.
@@ -1516,7 +1551,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     op.replicationFactor = m.replicationFactor;
     op.persistence       = m.persistence == 1 ? cat::Persistence::Transient : cat::Persistence::Disk;
     op.config            = m.config;
-    if (!m.blob.empty()) op.schema = cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag, m.keyFeatures};
+    if (!m.blob.empty()) op.schema = cat::SchemaDef{m.keyField, m.validate, m.blob, nextTag, features};
     e.ops = std::move(op);
     return e;
 }
@@ -1706,6 +1741,11 @@ AdminWorker::Built AdminWorker::buildAlterConfig_(const AlterTopicConfigMsg& m, 
                                t->topicId));
     // Empty / duplicate keys / out-of-range values: the dry run answers with the
     // library's reason (one validator — the resulting config's topicConfigError).
+    if (t->schema && t->schema->keyFeatures.autoIncrement) {
+        rune::protocol::TopicConfig next = t->config;
+        cat::applyConfigChanges(next, cat::AlterTopicConfigOps{m.changes});
+        if (next.retentionMs != -1 || next.retentionBytes != -1) return Rejected(reject(kInvalidRequest, kAutoIncRetentionDetail));
+    }
     cat::CatalogEvent e;
     e.nsId        = m.nsId;
     e.objectName  = t->name;

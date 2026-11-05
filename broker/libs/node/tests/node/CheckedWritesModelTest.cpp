@@ -645,3 +645,506 @@ TEST(CheckedWritesRigRegression, CompactQueuesMoreSegmentsThanTheSwapRingHoldsRe
     ASSERT_EQ(data.size(), 1u);
     EXPECT_EQ(data[0].v, 300);
 }
+
+
+// ---- Checked writes Part 06 Task 12: the same check on an autoincrement topic -----------------------------------------------------
+// Two idempotent All | View producers send key-0 batches of 1-8 creates and explicit-id batches (imports below and above the counter,
+// update / removeExisting / remove of ids the run knows) at P = 1 or 3 on the partition seed % P, a TestReject{TagEquals{9}} member is
+// installed, replaced and dropped, a batch is sent again before and after the judge, after a leadership change and past the window,
+// and the leader fails over, is demoted, restarts, loses its tail, compacts and commits or aborts a transaction of key-0 creates.  On top of
+// 05's checks the ids are held to NoIdTwiceNoReuse, IdsFollowTheStride, ReservationCoversEveryId, AckedIdsMatchTheLog and, after every
+// activation, CounterAboveEveryId.
+namespace {
+using rune::protocol::client::ErrorCode;
+constexpr int kAiSteps = 250;
+constexpr int64_t kAiTailPid = 700, kAiTxnPidBase = 900;
+constexpr int32_t kAiRejBase = 0x40000800;
+constexpr int kRetryWindow = 33;   // batches past the producer's window of 32
+constexpr int16_t kDuplicateSequenceCode = static_cast<int16_t>(ErrorCode::DuplicateSequence);
+
+enum class AiAction : uint8_t { Creates, Explicit, RetryBeforeJudge, RetryAfterJudge, RetryLast, RetryAfterWindow, RejectMember, Failover, DemotePromote, Restart, TruncateTail, Compact, Transaction };
+const char* nameOf(AiAction a) {
+    switch (a) {
+    case AiAction::Creates: return "Creates";
+    case AiAction::Explicit: return "Explicit";
+    case AiAction::RetryBeforeJudge: return "RetryBeforeJudge";
+    case AiAction::RetryAfterJudge: return "RetryAfterJudge";
+    case AiAction::RetryLast: return "RetryLast";
+    case AiAction::RetryAfterWindow: return "RetryAfterWindow";
+    case AiAction::RejectMember: return "RejectMember";
+    case AiAction::Failover: return "Failover";
+    case AiAction::DemotePromote: return "DemotePromote";
+    case AiAction::Restart: return "Restart";
+    case AiAction::TruncateTail: return "TruncateTail";
+    case AiAction::Compact: return "Compact";
+    case AiAction::Transaction: return "Transaction";
+    }
+    return "";
+}
+
+struct AiProducer {
+    int64_t pid = 0;
+    int32_t seq = 0;
+    std::vector<Rec> lastRecs;
+    int32_t lastSeq = -1;
+    std::optional<VerdictRig::Ack> lastAck;
+};
+
+AutoIncShape aiShapeOf(uint64_t seed) { return AutoIncShape{.partitions = seed % 2 == 0 ? 3 : 1, .reserve = static_cast<uint32_t>(4 + seed % 13)}; }
+
+class AiRun {
+public:
+    explicit AiRun(uint64_t seed)
+        : rng_(seed), shape_(aiShapeOf(seed)), partition_(static_cast<int32_t>(seed % static_cast<uint64_t>(shape_.partitions))),
+          rig_(/*follower=*/true, kModelRollBytes, RigTuning{.partition = partition_}) {
+        rig_.createAutoIncTopic(shape_);
+        installTag_();
+        rig_.installProjection(kProj);
+        rig_.installCountById(kCnt);
+        rig_.enableAcks();
+        rig_.passes(60);
+        rig_.followerFetch();
+        rig_.passes(10);
+        waitReady_();
+        idModel_.addAutoIncRule(shape_, partition_);
+        for (int p = 0; p < 2; ++p) producers_[p].pid = 500 + p;
+    }
+
+    std::string trace;
+    std::size_t markersRemoved = 0, tombstonesRemoved = 0;   ///< by the compactions: the 8.5 marker drop and the tombstone horizon ran
+
+    AiAction pick() {
+        const unsigned r = static_cast<unsigned>(rng_() % 100);
+        if (r < 30) return AiAction::Creates;
+        if (r < 50) return AiAction::Explicit;
+        if (r < 54) return AiAction::RetryBeforeJudge;
+        if (r < 58) return AiAction::RetryAfterJudge;
+        if (r < 63) return AiAction::RetryLast;
+        if (r < 65) return AiAction::RetryAfterWindow;
+        if (r < 71) return AiAction::RejectMember;
+        if (r < 76) return AiAction::Failover;
+        if (r < 80) return AiAction::DemotePromote;
+        if (r < 84) return AiAction::Restart;
+        if (r < 88) return AiAction::TruncateTail;
+        if (r < 94) return AiAction::Compact;
+        return AiAction::Transaction;
+    }
+
+    void step(AiAction action) {
+        switch (action) {
+        case AiAction::Creates: trace += "c"; (void)sendIdem_(producers_[rng_() % 2], createBatch_(1 + rng_() % 8)); break;
+        case AiAction::Explicit: trace += "e"; explicit_(); break;
+        case AiAction::RetryBeforeJudge: trace += "b"; retry_(false); break;
+        case AiAction::RetryAfterJudge: trace += "a"; retry_(true); break;
+        case AiAction::RetryLast: trace += "l"; retryLast_(); break;
+        case AiAction::RetryAfterWindow: trace += "w"; retryAfterWindow_(); break;
+        case AiAction::RejectMember: rejectMember_(); break;
+        case AiAction::Failover:
+            trace += "F";
+            settle_();
+            rig_.failover();
+            activated_(true);
+            break;
+        case AiAction::DemotePromote:
+            trace += "D";
+            settle_();
+            rig_.demotePromote();
+            activated_(false);
+            break;
+        case AiAction::Restart:
+            trace += "S";
+            settle_();
+            rig_.restart(true);
+            activated_(true);
+            break;
+        case AiAction::TruncateTail:
+            trace += "T";
+            settle_();
+            (void)rig_.produceFrame(createBatch_(1 + rng_() % 3), kAcksViewAll, kAiTailPid, 0);   // an unacked tail the cut removes, with the ids it took
+            rig_.passes(5);
+            rig_.truncateTo(rig_.replica->highWatermark());
+            rig_.demotePromote();
+            activated_(false);
+            break;
+        case AiAction::Compact: trace += "C"; compact_ = true; break;
+        case AiAction::Transaction: transaction_(); break;
+        }
+        if (!::testing::Test::HasFatalFailure()) verify_();
+    }
+
+private:
+    static constexpr uint8_t kAcksAll = rune::protocol::client::kAcksWireAll;
+    static constexpr uint8_t kAcksViewAll = rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll;
+    struct Pending { VerdictRig::Ack ack; std::size_t n; int64_t corr; };
+
+    uint64_t partitions_() const { return static_cast<uint64_t>(shape_.partitions); }
+    uint64_t idOf_(uint64_t n) const { return n * partitions_() + static_cast<uint64_t>(partition_); }
+    uint64_t nextN_() { return rig_.autoIncState()->nextN; }
+
+    void waitReady_() {
+        for (int i = 0; i < VerdictRig::kMaxPass; ++i) {
+            if (rig_.autoIncState() && rig_.worker->rcStatusForTest(VerdictRig::kSrc, partition_) == Worker::kRcReady) return;
+            if (i % 8 == 0) rig_.followerFetch();
+            rig_.pass();
+        }
+        FAIL() << "the counter was not ready after " << trace;
+    }
+    // A leadership (a failover, a restart, a demotion): the counter resumes above everything the log holds before the first write.
+    void activated_(bool rebuilt) {
+        waitReady_();
+        if (::testing::Test::HasFatalFailure()) return;
+        absorb_(rig_.readLog(rig_.replica->highWatermark()));
+        const AutoIncReady counter = *rig_.autoIncState();
+        EXPECT_TRUE(idModel_.counterAboveEveryId(history_(true), counter)) << "CounterAboveEveryId: nextN " << counter.nextN << " reserved " << counter.reservedThroughN;
+        if (rebuilt) EXPECT_EQ(counter.nextN, counter.reservedThroughN + 1) << "a rebuilt counter resumes above the reservation";
+        (void)sendIdem_(producers_[rng_() % 2], createBatch_(1 + rng_() % 4));   // the first batch after an activation takes its ids from the rebuilt counter
+    }
+
+    void installTag_() {
+        rejTopic_ = kAiRejBase + (++rejSeq_);
+        rig_.installRejectView(rejTopic_, kObjTag, tagRule(9));
+    }
+    // A dropped or replaced member's change must be passed by a marker before the next restart, and before a member of the same object
+    // is installed again: a fresh write is acked and marked past it.
+    void settle_() {
+        if (!setChanged_) return;
+        const auto a = sendIdem_(producers_[0], createBatch_(1));
+        ASSERT_TRUE(a) << "no write was acked after a constraint-set change";
+        setChanged_ = false;
+        if (judged_()) rig_.passes(4);   // the retired member leaves on the pass after the marker commits
+    }
+    void rejectMember_() {
+        trace += "M";
+        const unsigned r = static_cast<unsigned>(rng_() % 3);
+        if (rejTopic_ == 0) {
+            settle_();
+            installTag_();
+        } else if (r == 0) {
+            rig_.dropRejectView(rejTopic_);
+            rejTopic_ = 0;
+            setChanged_ = true;
+        } else {
+            settle_();
+            const int32_t next = kAiRejBase + (++rejSeq_);
+            rig_.replaceRejectView(rejTopic_, next, kObjTag, tagRule(9));
+            rejTopic_ = next;
+            setChanged_ = true;
+        }
+    }
+
+    // One past the last record that gets a verdict: the judge skips an aborted transaction's records and emits no marker for a
+    // trailing range of them.
+    int64_t judgedEnd_(const VerdictRig::RigLog& log) const {
+        int64_t end = 0;
+        for (const auto& d : log.data)
+            if (aborted_.count(d.offset) == 0) end = d.offset + 1;
+        return end;
+    }
+    bool judged_() { return rig_.driveUntilJudged(judgedEnd_(rig_.readLog())); }
+
+    uint8_t tag_() { return rng_() % 5 == 0 ? 9 : static_cast<uint8_t>(1 + rng_() % 2); }
+    std::vector<Rec> createBatch_(uint64_t n) {
+        std::vector<Rec> recs;
+        for (uint64_t i = 0; i < n; ++i) recs.push_back({0, ++vSeq_, tag_(), false, 1});
+        return recs;
+    }
+    // Imports below and above the counter, update / removeExisting / remove of ids the run has been given (or, before any, an import).
+    std::vector<Rec> explicitBatch_() {
+        std::vector<Rec> recs;
+        const uint64_t n = 1 + rng_() % 4;
+        for (uint64_t i = 0; i < n; ++i) {
+            const unsigned k = static_cast<unsigned>(rng_() % 100);
+            if (assigned_.empty() || k < 30) {
+                const bool below = !assigned_.empty() && rng_() % 2 == 0;
+                const uint64_t id = below ? assigned_[rng_() % assigned_.size()] : idOf_(nextN_() + rng_() % 8);
+                recs.push_back({id, ++vSeq_, tag_(), false, 1});
+                continue;
+            }
+            const uint64_t id = assigned_[rng_() % assigned_.size()];
+            if (k < 60) recs.push_back({id, ++vSeq_, tag_(), false, 2});
+            else if (k < 85) recs.push_back({id, 0, 0, true, 2});
+            else recs.push_back({id, 0, 0, true, 0});
+        }
+        return recs;
+    }
+    void explicit_() { (void)sendIdem_(producers_[rng_() % 2], explicitBatch_()); }
+
+    // What an OK ack of `recs` tells: a key-0 batch answers its ids, the others answer 0.
+    void note_(const VerdictRig::Ack& ack, const std::vector<Rec>& recs, int64_t corr) {
+        pending_.push_back({ack, recs.size(), corr});
+        const bool keyZero = recs.front().id == 0;
+        EXPECT_EQ(ack.assignedBase != 0, keyZero) << "only a key-0 batch answers its ids, corr " << corr;
+        if (!keyZero) return;
+        keyZero_[ack.baseOffset] = {ack.baseOffset, ack.assignedBase, recs.size()};
+        for (std::size_t i = 0; i < recs.size(); ++i) assigned_.push_back(ack.assignedBase + i * partitions_());
+    }
+
+    // NotLeader until the counter is active; nothing was appended then, so the same sequence is sent again.
+    std::optional<VerdictRig::Ack> sendIdem_(AiProducer& p, const std::vector<Rec>& recs) {
+        waitReady_();
+        if (::testing::Test::HasFatalFailure()) return std::nullopt;
+        for (int tries = 0; tries < 100; ++tries) {
+            const int64_t c = rig_.produceFrame(recs, kAcksViewAll, p.pid, p.seq);
+            const auto a = rig_.ackFetching(c, 60000);
+            if (!a) { ADD_FAILURE() << "the produce was never answered, corr " << c; return std::nullopt; }
+            if (a->code == static_cast<int16_t>(ErrorCode::NotLeader)) { rig_.passes(5); continue; }
+            if (a->code != 0) { ADD_FAILURE() << "ack code " << a->code << " corr " << c; return std::nullopt; }
+            p.lastRecs = recs;
+            p.lastSeq = p.seq;
+            p.lastAck = *a;
+            p.seq += static_cast<int32_t>(recs.size());
+            note_(*a, recs, c);
+            return a;
+        }
+        ADD_FAILURE() << "NotLeader for 100 sends in a row";
+        return std::nullopt;
+    }
+
+    // The same batch is sent twice with one pid and sequence: before the judge caught up, or after.  The answer is the original's, ids included.
+    void retry_(bool judgeFirst) {
+        waitReady_();
+        if (::testing::Test::HasFatalFailure()) return;
+        AiProducer& p = producers_[rng_() % 2];
+        const auto recs = rng_() % 4 == 0 ? explicitBatch_() : createBatch_(1 + rng_() % 8);
+        const int32_t seq = p.seq;
+        int64_t origCorr = 0, dupCorr = 0;
+        ASSERT_TRUE(executeRetry(rig_, judgeFirst, false,
+                                 [&] { origCorr = rig_.produceFrame(recs, kAcksViewAll, p.pid, seq); },
+                                 [](uint64_t) {},
+                                 [&] { dupCorr = rig_.produceFrame(recs, kAcksViewAll, p.pid, seq); }));
+        const auto orig = rig_.ackFetching(origCorr, 60000);
+        const auto dup = rig_.ackFetching(dupCorr, 60000);
+        ASSERT_TRUE(orig && dup) << "a send was never answered";
+        ASSERT_EQ(orig->code, 0);
+        p.lastRecs = recs;
+        p.lastSeq = seq;
+        p.lastAck = *orig;
+        p.seq += static_cast<int32_t>(recs.size());
+        note_(*orig, recs, origCorr);
+        checkSameAck_(*orig, *dup);
+    }
+    // The producer's last acked batch again, however many faults ago: its ack comes from the rebuilt window.
+    void retryLast_() {
+        AiProducer& p = producers_[rng_() % 2];
+        if (!p.lastAck) return;
+        waitReady_();
+        if (::testing::Test::HasFatalFailure()) return;
+        const auto dup = rig_.ackFetching(rig_.produceFrame(p.lastRecs, kAcksViewAll, p.pid, p.lastSeq), 60000);
+        ASSERT_TRUE(dup) << "the send was never answered";
+        checkSameAck_(*p.lastAck, *dup);
+    }
+    void checkSameAck_(const VerdictRig::Ack& orig, const VerdictRig::Ack& dup) {
+        EXPECT_EQ(dup.code, 0);
+        EXPECT_EQ(dup.baseOffset, orig.baseOffset);
+        EXPECT_EQ(dup.assignedBase, orig.assignedBase) << "a retry in the window answers the original's ids";
+        EXPECT_EQ(dup.verdicts, orig.verdicts) << "a retry in the window replays the original verdicts";
+        EXPECT_EQ(dup.frameLen, orig.frameLen);
+    }
+    // 33 more batches push the first out of the producer's window: its retry meets DuplicateSequence and carries no ids.
+    void retryAfterWindow_() {
+        AiProducer& p = producers_[rng_() % 2];
+        const auto recs = createBatch_(1 + rng_() % 3);
+        const int32_t seq = p.seq;
+        if (!sendIdem_(p, recs)) return;
+        for (int i = 0; i < kRetryWindow && !::testing::Test::HasFatalFailure(); ++i) (void)sendIdem_(p, createBatch_(1));
+        if (::testing::Test::HasFatalFailure()) return;
+        ASSERT_TRUE(judged_());
+        rig_.settle(150);
+        const auto dup = rig_.ackFetching(rig_.produceFrame(recs, kAcksViewAll, p.pid, seq), 60000);
+        ASSERT_TRUE(dup) << "the send was never answered";
+        EXPECT_EQ(dup->code, kDuplicateSequenceCode);
+        EXPECT_EQ(dup->assignedBase, 0u) << "an answer outside the window carries no ids";
+        EXPECT_FALSE(dup->hasVerdicts);
+    }
+    // An open transaction of key-0 creates, committed or aborted; the judge is held behind it.  A source with a TestReject member refuses
+    // transactions (InvalidRequest), so the member is dropped and its change logged first.
+    void transaction_() {
+        if (rejTopic_ != 0) {
+            rig_.dropRejectView(rejTopic_);
+            rejTopic_ = 0;
+            setChanged_ = true;
+        }
+        settle_();
+        if (::testing::Test::HasFatalFailure()) return;
+        const int64_t pid = kAiTxnPidBase + ++txns_;
+        const auto recs = createBatch_(1 + rng_() % 3);
+        const auto a = rig_.ackFetching(rig_.produceFrame(recs, kAcksAll, pid, 0, /*txn=*/true), 60000);
+        ASSERT_TRUE(a) << "the transactional produce was never answered";
+        ASSERT_EQ(a->code, 0);
+        keyZero_[a->baseOffset] = {a->baseOffset, a->assignedBase, recs.size()};
+        for (std::size_t i = 0; i < recs.size(); ++i) assigned_.push_back(a->assignedBase + i * partitions_());
+        const bool commit = rng_() % 2 == 0;
+        trace += commit ? "X" : "Z";
+        rig_.marker(pid, commit);
+        rig_.followerFetch();   // a failover or a cut must not lose the marker: the transaction would be open again
+        rig_.passes(4);
+        if (!commit)
+            for (std::size_t i = 0; i < recs.size(); ++i) aborted_.insert(a->baseOffset + static_cast<int64_t>(i));
+    }
+
+    // Everything committed that was ever read: a compaction may remove records from the log later, the checks still judge them.
+    void absorb_(const VerdictRig::RigLog& log) {
+        for (const auto& d : log.data) data_[d.offset] = d;
+        for (const auto& ch : log.changes) changes_[ch.offset] = ch;
+        for (const auto& [off, through] : log.reservations) reservations_[off] = through;
+    }
+    VerdictRig::RigLog history_(bool withAborted) const {
+        VerdictRig::RigLog out;
+        for (const auto& kv : data_)
+            if (withAborted || aborted_.count(kv.first) == 0) out.data.push_back(kv.second);
+        for (const auto& kv : changes_) out.changes.push_back(kv.second);
+        for (const auto& kv : reservations_) out.reservations.emplace_back(kv.first, kv.second);
+        return out;
+    }
+
+    // What a raw and a push-read subscription from 0 deliver: the accepted records with their intents, and the aborted transactions' (they are in the log).
+    void checkDelivered_(const CheckedWritesModel& model, const std::set<int64_t>& present) {
+        std::vector<VerdictRig::RigLogRec> aborted;
+        for (const int64_t off : aborted_)
+            if (const auto it = data_.find(off); it != data_.end()) aborted.push_back(it->second);
+        checkDelivered(rig_, model, rig_.subscribe(SubKind::Raw, 0), false, &present, &aborted);
+        checkDelivered(rig_, model, rig_.subscribe(SubKind::PushRead, 0), false, &present, &aborted);
+    }
+
+    // IntentVerdictsExact: every 56 / 57 ever reported (an ack, the index or a marker) is the model's, and a record an ack reported as
+    // accepted never gets a verdict.  KeyIndexEqualsLiveKeys: the key index holds the model's live keys.
+    void checkIntentVerdicts_(const CheckedWritesModel& model, const VerdictRig::RigLog& log, int64_t hw) {
+        const auto note = [&](int64_t off, uint16_t code, uint32_t cid, const char* from) {
+            if (code != CheckedWritesModel::kKeyExists && code != CheckedWritesModel::kKeyNotFound) return;
+            const auto it = reported_.emplace(off, ModelVerdict{code, cid}).first;
+            EXPECT_EQ(it->second, (ModelVerdict{code, cid})) << "IntentVerdictsExact: " << from << " reported another verdict for offset " << off << " than before";
+        };
+        rig_.writeState()->rejected.forEachIn(0, INT64_MAX, [&](const rune::storage::RejectedOffsetIndex::Entry& e) { if (e.offset < hw) note(e.offset, e.code, e.constraintId, "the index"); });
+        for (const auto& m : log.markers)
+            for (const auto& [off, code, cid] : m.entries) note(off, code, cid, "a marker");
+        for (const Pending& p : pending_) {
+            std::set<std::size_t> rejected;
+            for (const auto& [i, code, cid] : p.ack.verdicts) {
+                note(p.ack.baseOffset + i, code, cid, "an ack");
+                rejected.insert(i);
+            }
+            for (std::size_t i = 0; i < p.n; ++i)
+                if (rejected.count(i) == 0) acceptedByAck_.insert(p.ack.baseOffset + static_cast<int64_t>(i));
+        }
+        for (const auto& [off, verdict] : reported_) {
+            const auto it = model.verdicts().find(off);
+            EXPECT_TRUE(it != model.verdicts().end() && it->second == verdict) << "IntentVerdictsExact: the reported " << verdict.code << " at offset " << off << " is not the model's verdict";
+        }
+        for (const int64_t off : acceptedByAck_)
+            EXPECT_EQ(model.verdicts().count(off), 0u) << "IntentVerdictsExact: the record at " << off << " was acked as accepted but the model rejects it";
+        std::set<std::string> live;
+        for (const auto& [id, row] : model.projection()) live.insert(std::to_string(id));
+        EXPECT_EQ(rig_.keyIndexKeys(), live) << "KeyIndexEqualsLiveKeys";
+        EXPECT_EQ(rig_.stats()->keyIndexSkippedMalformed, 0u);
+    }
+
+    // The ids: NoIdTwiceNoReuse, IdsFollowTheStride, ReservationCoversEveryId and AckedIdsMatchTheLog over everything committed, and the side
+    // window and the assigned ids of the live worker.
+    void checkIds_() {
+        const VerdictRig::RigLog full = history_(true);
+        std::vector<CheckedWritesModel::AutoIncAck> acks;
+        for (const auto& [offset, a] : keyZero_) acks.push_back(a);
+        EXPECT_TRUE(idModel_.noIdTwiceNoReuse(full, acks)) << "NoIdTwiceNoReuse";
+        EXPECT_TRUE(idModel_.idsFollowTheStride(full, acks)) << "IdsFollowTheStride";
+        EXPECT_TRUE(idModel_.reservationCoversEveryId(full)) << "ReservationCoversEveryId";
+        EXPECT_TRUE(idModel_.ackedIdsMatchTheLog(full, acks)) << "AckedIdsMatchTheLog";
+        EXPECT_EQ(rig_.autoIncStats().windowMisses, 0u) << "AckedIdsMatchTheLog: a retry missed the side window";
+        EXPECT_EQ(rig_.autoIncStats().assignedKeyExists, 0u) << "NoIdTwiceNoReuse: an assigned id met a stored key";
+    }
+
+    void verify_() {
+        ASSERT_TRUE(judged_()) << " after " << trace;
+        const int64_t hw = rig_.replica->highWatermark();
+        const VerdictRig::RigLog log = rig_.readLog(hw);
+        absorb_(log);
+        const VerdictRig::RigLog all = history_(false);
+        CheckedWritesModel model;
+        model.declareRule(kObjTag, tagRule(9).fingerprint(), CheckedWritesModel::tagEquals(9));
+        model.addAutoIncRule(shape_, partition_);
+        model.reset(all);
+        std::set<int64_t> present;
+        for (const auto& d : log.data) present.insert(d.offset);
+
+        const int64_t dataEnd = log.data.empty() ? 0 : log.data.back().offset + 1;
+        rig_.driveUntilFolded(kProj, dataEnd);
+        rig_.driveUntilFolded(kCnt, dataEnd);
+        checkIndex(rig_, model, &present);
+        if (!log.data.empty() && !log.markers.empty() && !log.changes.empty()) checkMarkers(model, log, judgedEnd_(log), compacted_);
+        for (const Pending& p : pending_) checkModelTrailer(model, p.ack, p.n, p.corr);
+        checkIntentVerdicts_(model, log, hw);
+        pending_.clear();
+        checkIds_();
+        checkViews(rig_, model, all, kProj, kCnt);
+        checkDelivered_(model, present);
+        if (compact_) {
+            compact_ = false;
+            compacted_ = true;
+            const auto reservedBefore = rig_.reservations();
+            checkCompaction(rig_, model, log, 1'000'000 + 2'000 * ++compactions_);   // past the last pass's horizon (retention 1 s)
+            const auto reservedAfter = rig_.reservations();
+            const auto after = rig_.readLog();
+            std::set<int64_t> kept;
+            for (const auto& d : after.data) kept.insert(d.offset);
+            for (const auto& m : after.markers) kept.insert(m.offset);
+            for (const auto& m : log.markers) markersRemoved += kept.count(m.offset) == 0 ? 1 : 0;
+            for (const auto& d : log.data) tombstonesRemoved += d.del && kept.count(d.offset) == 0 ? 1 : 0;
+            if (!reservedBefore.empty()) {
+                ASSERT_FALSE(reservedAfter.empty()) << "the compaction removed every reservation";
+                EXPECT_EQ(reservedAfter.back().second, reservedBefore.back().second) << "the latest reservation is kept";
+            }
+        }
+        trace += "[" + std::to_string(model.acceptedRecords().size()) + "/" + std::to_string(model.verdicts().size()) + "]";
+    }
+
+    std::mt19937_64 rng_;
+    AutoIncShape shape_;
+    int32_t partition_;
+    VerdictRig rig_;
+    CheckedWritesModel idModel_;
+    AiProducer producers_[2];
+    std::vector<Pending> pending_;
+    std::vector<uint64_t> assigned_;
+    std::map<int64_t, CheckedWritesModel::AutoIncAck> keyZero_;
+    std::map<int64_t, VerdictRig::RigLogRec> data_;
+    std::map<int64_t, VerdictRig::RigChange> changes_;
+    std::map<int64_t, uint64_t> reservations_;
+    std::map<int64_t, ModelVerdict> reported_;
+    std::set<int64_t> acceptedByAck_, aborted_;
+    int32_t rejTopic_ = 0, rejSeq_ = 0;
+    int64_t vSeq_ = 0, txns_ = 0;
+    bool compact_ = false, compacted_ = false, setChanged_ = false;
+    int64_t compactions_ = 0;
+};
+
+std::string runAiSeed(uint64_t seed, std::size_t* markersRemoved = nullptr, std::size_t* tombstonesRemoved = nullptr) {
+    AiRun run(seed);
+    for (int step = 0; step < kAiSteps && !::testing::Test::HasFatalFailure(); ++step) {
+        const AiAction action = run.pick();
+        SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step) + " action=" + nameOf(action) + " trace=" + run.trace);
+        run.step(action);
+    }
+    if (markersRemoved != nullptr) *markersRemoved = run.markersRemoved;
+    if (tombstonesRemoved != nullptr) *tombstonesRemoved = run.tombstonesRemoved;
+    return run.trace;
+}
+}  // namespace
+
+class CheckedWritesAutoIncModelRegression : public ::testing::TestWithParam<uint64_t> {};
+
+TEST_P(CheckedWritesAutoIncModelRegression, SeededRigMatchesTheModel) {
+    std::size_t markers = 0, tombstones = 0;
+    const std::string trace = runAiSeed(GetParam(), &markers, &tombstones);
+    EXPECT_FALSE(trace.empty());
+    EXPECT_GT(markers, 0u) << "no compaction removed a marker (8.5)";
+    EXPECT_GT(tombstones, 0u) << "no compaction removed a tombstone";
+}
+
+// The history is a function of the seed: seeds 1-8 run twice make the same choices, the same ids and the same verdicts.
+TEST_P(CheckedWritesAutoIncModelRegression, SameSeedSameTrace) {
+    if (GetParam() > 8) GTEST_SKIP() << "seeds 1-8 only";
+    const std::string first = runAiSeed(GetParam());
+    const std::string second = runAiSeed(GetParam());
+    EXPECT_EQ(first, second);
+}
+
+INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesAutoIncModelRegression, ::testing::Range<uint64_t>(1, 101));

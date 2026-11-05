@@ -84,12 +84,12 @@ TEST(NamespaceSecurityV2Regression, TruncatedAtEveryOffsetRegression) {
 }
 
 TEST(NamespaceSecurityV2Regression, EnumRangesByFormatVerRegression) {
-    // Truncate (op 7) and Namespace (type 5) exist from formatVer 2 only; 8 and 6 never.
+    // Truncate (op 7) and Namespace (type 5) exist from formatVer 2 only; 9 and 6 never.
     for (const uint16_t fv : {rs::kFormatV1, rs::kFormatV2}) {
         for (const auto [op, type, okV2] : {std::tuple{Operation::Truncate, ResourceType::Topic, true},
                                             std::tuple{Operation::Read, ResourceType::Namespace, true},
                                             std::tuple{Operation::Admin, ResourceType::TransactionalId, true},
-                                            std::tuple{static_cast<Operation>(8), ResourceType::Topic, false},
+                                            std::tuple{static_cast<Operation>(9), ResourceType::Topic, false},
                                             std::tuple{Operation::Read, static_cast<ResourceType>(6), false}}) {
             rs::SecurityEvent e;
             e.formatVer = fv; e.kind = rs::EventKind::Grant; e.objectName = "r";

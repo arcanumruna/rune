@@ -22,6 +22,7 @@
 //
 // Checked writes Part 02 adds BM_CheckedWriteHook/*: the write hook's check alone (the <= 1 us p50 budget gate) and the
 // whole produce path for an untyped topic, a typed topic below the feature level and a typed topic at it.
+// Part 06 adds BM_CheckedWriteHook/autoinc_*: check + stage + onAppended of a key-0 create batch on an autoincrement topic.
 //
 // Uses a disk-backed Log + PartitionReplica (same pattern as
 // WorkerProduceLatencyBench.cpp / AsyncDurabilityTest.cpp).
@@ -33,6 +34,7 @@
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/CheckedWriteHook.h>
+#include <rune/node/VerdictSource.h>
 #include <rune/node/WriteState.h>
 #include "BenchGate.h"
 #include <rune/replication/PartitionReplica.h>
@@ -45,12 +47,17 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
 #include <unistd.h>
+
+// Defined once in benchmark/BenchmarkMain.cpp (see ViewFoldBench.cpp).
+extern std::atomic<int64_t> g_allocCount;
+extern std::atomic<bool>    g_allocEnabled;
 
 namespace {
 
@@ -379,6 +386,111 @@ static void BM_CheckedWriteHook_HookCheck64(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * 64);
 }
 
+// ---------------------------------------------------------------------------
+// BM_CheckedWriteHook/autoinc_{1,16,4k} — checked writes Part 06: check() + stage() + onAppended() of one key-0 create batch
+// of 1, 16 and 64 (<= 4096 B) records on a spec-02 autoincrement topic, over a log whose append returns at once.  The
+// reservation block is 64 x the batch's records, so one batch in 64 appends a reservation record.
+//   hook_p50_ns / hook_p99_ns: the three calls per batch, the scratch copy and id patch included.
+//   steady_alloc: heap allocations over the measured batches (GATE: == 0).
+//   autoinc_4k p50 is a hard budget gate (spec 14: 2 us, the copy included; owner 2026-11-05).
+// ---------------------------------------------------------------------------
+struct NullLog {
+    int64_t next = 0;
+    int64_t appendNoSyncRestamp(const uint8_t*, std::size_t, int32_t lastOffsetDelta, int64_t& base) {
+        base = next;
+        next += lastOffsetDelta + 1;
+        return base;
+    }
+};
+
+static void autoIncHookBench(benchmark::State& state, int records) {
+    const auto desc = DescriptorBuilder("a", 1).add("id", PrimType::UInt64).add("v", PrimType::Int64).add("tag", PrimType::UInt16).build();
+    rune::node::TopicWriteSpec spec;
+    spec.installVersion(1, desc);
+    rune::node::TopicWriteSpecWire wire;
+    wire.topicId = kTopicId;
+    wire.keyFieldId = 0;
+    wire.keyType = PrimType::UInt64;
+    wire.keyWidth = 8;
+    wire.keyIndex = true;
+    wire.autoIncrement = true;
+    wire.autoIncrementMax = rune::node::effectiveAutoIncMax(PrimType::UInt64, rune::protocol::kAutoIncrementMaxDefault);
+    wire.autoIncrementReserve = 64u * static_cast<uint32_t>(records);
+    wire.partitionCount = 1;
+    spec.setFacts(wire);
+
+    rune::node::PartitionWriteState ws;
+    ws.spec = &spec;
+    rune::node::ConstraintSet set;
+    set.id = 1;
+    set.count = 1;
+    set.members[0] = rune::node::ConstraintSetMember{0, rune::view::VerdictViewKind::KeyIndex, rune::node::kKeyIndexPlanFingerprint};
+    ws.constraintSets.onChange(7, set);
+    ws.assignedBases.reserve(64);
+    ws.autoInc.configure(0, 1, spec.autoIncrementMax, wire.autoIncrementReserve);
+    ws.autoInc.beginScan();
+    (void)ws.autoInc.finishScan();
+
+    rune::node::WriteFacts facts;
+    facts.acks = 3;
+    facts.idempotent = true;
+    facts.levelCheckedWrites = true;
+    facts.importGranted = true;
+    facts.producerId = 42;
+
+    // {id u64, v int64, tag u16}: [blockLength u16][version u16][id][v][tag], one key-0 create per record
+    const auto le = [](uint64_t v, std::size_t n) { std::string r(n, '\0'); for (std::size_t i = 0; i < n; ++i) r[i] = static_cast<char>(v >> (8 * i)); return r; };
+    const std::string key = le(0, 8), value = le(18, 2) + le(1, 2) + le(0, 8) + le(7, 8) + le(3, 2);
+    RecordBatchBuilder b(0, 1000);
+    for (int i = 0; i < records; ++i) b.append(key, value, 1000, 1);
+    const auto batch = b.build();
+    std::vector<uint8_t> scratch(64 * 1024);
+    NullLog log;
+
+    const auto once = [&] {
+        rune::node::CheckedWriteHook hook(ws, facts, scratch);
+        const auto verdict = hook.check(batch.data(), batch.size(), records);
+        const auto staged = hook.stage(log, batch.data(), batch.size());
+        int64_t base = 0;
+        (void)log.appendNoSyncRestamp(staged.batch, staged.len, records - 1, base);
+        hook.onAppended(base, base + records - 1);
+        benchmark::DoNotOptimize(verdict);
+        benchmark::DoNotOptimize(staged);
+    };
+
+    constexpr int kWarmup = 4096, kCalls = 65536;
+    std::vector<double> ns(kCalls);
+    int64_t steadyAlloc = 0;
+    for (auto _ : state) {
+        for (int i = 0; i < kWarmup; ++i) once();
+        g_allocCount.store(0, std::memory_order_relaxed);
+        g_allocEnabled.store(true, std::memory_order_relaxed);
+        for (int i = 0; i < kCalls; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            once();
+            const auto t1 = std::chrono::steady_clock::now();
+            ns[static_cast<std::size_t>(i)] = std::chrono::duration<double, std::nano>(t1 - t0).count();
+        }
+        g_allocEnabled.store(false, std::memory_order_relaxed);
+        steadyAlloc = g_allocCount.load(std::memory_order_relaxed);
+    }
+    std::sort(ns.begin(), ns.end());
+    const double p50 = ns[kCalls / 2], p99 = ns[kCalls * 99 / 100];
+    state.counters["hook_p50_ns"] = p50;
+    state.counters["hook_p99_ns"] = p99;
+    state.counters["steady_alloc"] = static_cast<double>(steadyAlloc);
+    state.SetItemsProcessed(state.iterations() * kCalls);
+    const bool gated = records == 64;
+    const bool pass = steadyAlloc == 0 && (!gated || p50 < 2000.0);
+    rune::bench::gateCheck(state, pass, "an autoincrement batch allocates in steady state or the hook p50 reaches 2000 ns (spec 14)");
+    if (gated)
+        std::fprintf(stderr, "[CheckedWriteHook autoinc gate] p50=%.0f ns (budget 2000) => %s\n", p50, pass ? "PASS" : "FAIL");
+}
+
+static void BM_CheckedWriteHook_AutoInc1(benchmark::State& state) { autoIncHookBench(state, 1); }
+static void BM_CheckedWriteHook_AutoInc16(benchmark::State& state) { autoIncHookBench(state, 16); }
+static void BM_CheckedWriteHook_AutoInc4k(benchmark::State& state) { autoIncHookBench(state, 64); }
+
 static void BM_CheckedWriteHook_UntypedPath(benchmark::State& state) { produceLoop(state); }
 static void BM_CheckedWriteHook_TypedLegacyPath(benchmark::State& state) { produceLoop(state); }
 static void BM_CheckedWriteHook_TypedProduce1(benchmark::State& state) { produceLoop(state); }
@@ -423,5 +535,8 @@ BENCHMARK(BM_CheckedWriteHook_TypedLegacyPath)
 BENCHMARK(BM_CheckedWriteHook_TypedProduce1)
     ->Name("BM_CheckedWriteHook/typed_produce/1")
     ->Setup(SetupChecked)->Teardown(Teardown)->Repetitions(15)->ReportAggregatesOnly(false)->Unit(benchmark::kNanosecond);
+BENCHMARK(BM_CheckedWriteHook_AutoInc1)->Name("BM_CheckedWriteHook/autoinc_1")->Iterations(1)->UseRealTime()->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_CheckedWriteHook_AutoInc16)->Name("BM_CheckedWriteHook/autoinc_16")->Iterations(1)->UseRealTime()->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_CheckedWriteHook_AutoInc4k)->Name("BM_CheckedWriteHook/autoinc_4k")->Iterations(1)->UseRealTime()->Unit(benchmark::kMicrosecond);
 
 } // namespace

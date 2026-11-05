@@ -20,9 +20,12 @@ namespace {
 constexpr ErrorCode OK  = ErrorCode::OK;
 constexpr ErrorCode IR  = ErrorCode::InvalidRequest;
 constexpr ErrorCode NL  = ErrorCode::NotLeader;
+constexpr ErrorCode NA  = ErrorCode::NotAuthorized;
+constexpr ErrorCode EXH = ErrorCode::AutoIncrementExhausted;
 using H = HookRefusal;
 
-enum Shape { Plain, Reserved, InsertExplicit, Update, RemoveExisting, KeyZero, KeyZeroMixed, ManyPlain, ManyPlainOver };
+enum Shape { Plain, Reserved, InsertExplicit, Update, RemoveExisting, KeyZero, KeyZeroMixed, ManyPlain, ManyPlainOver,
+             PlainUpsert, Import, ImportBadKey, KeyZeroExhausted, KeyZeroWindowFull };
 
 constexpr BatchIntents intentsOf(Shape s) {
     BatchIntents b;
@@ -37,6 +40,11 @@ constexpr BatchIntents intentsOf(Shape s) {
     case KeyZeroMixed: b.anyIntent = b.keyZeroCreate = b.mixedKeyZero = true; b.records = 2; break;
     case ManyPlain: b.records = 4096; break;
     case ManyPlainOver: b.records = 4097; break;
+    case PlainUpsert: b.plainUpsert = true; break;
+    case Import: b.anyIntent = b.explicitKeyIntent = b.explicitInsert = true; break;
+    case ImportBadKey: b.anyIntent = b.explicitKeyIntent = b.explicitInsert = b.importBadKey = true; break;
+    case KeyZeroExhausted: b.anyIntent = b.keyZeroCreate = b.autoIncExhausted = true; break;
+    case KeyZeroWindowFull: b.anyIntent = b.keyZeroCreate = b.autoIncWindowFull = true; break;
     }
     return b;
 }
@@ -47,11 +55,12 @@ constexpr WriteFacts F(uint8_t acks, bool idem, bool txn, bool atomic, bool lega
     return f;
 }
 // `active` defaults to `keyIndex`: the 03 rows describe a key-index topic whose logged set already holds it.
-constexpr TopicHookFacts T(bool keyIndex, bool autoInc, bool constrained, bool verdict, int active = -1) { return {keyIndex, autoInc, constrained, verdict, active < 0 ? keyIndex : active != 0}; }
+constexpr TopicHookFacts T(bool keyIndex, bool autoInc, bool constrained, bool verdict, int active = -1, int ready = -1) { return {keyIndex, autoInc, constrained, verdict, active < 0 ? keyIndex : active != 0, ready < 0 ? autoInc : ready != 0}; }
 
 struct Row { const char* why; Shape shape; WriteFacts f; TopicHookFacts t; ErrorCode code; H refusal; };
 
 constexpr WriteFacts kIdemView = F(3, true, false, false, false, true);
+constexpr WriteFacts withImport(WriteFacts f) { f.importGranted = true; return f; }
 
 const std::vector<Row>& rows() {
     static const std::vector<Row> r = {
@@ -127,6 +136,20 @@ const std::vector<Row>& rows() {
         {"68 plain, acks 1, key index not active: plain writes never wait (P5-12)", Plain, F(1, false, false, false, false, true), T(1,0,0,0,0), OK, H::None},
         {"69 key-0 creates, definite refusal before the wait", KeyZero, F(0, true, false, false, false, true), T(1,1,0,0,0), IR, H::KeyZeroCreateNeedsIdempotentAll},
         {"70 key-0 creates, key index not active", KeyZero, kIdemView, T(1,1,0,0,0), NL, H::KeyIndexActivating},
+        // Part 06: autoincrement topics (key index and a ready counter unless noted)
+        {"71 plain upsert on an autoincrement topic", PlainUpsert, F(1, true, false, false, false, true), T(1,1,0,0), IR, H::UpsertOnAutoIncrement},
+        {"72 plain tombstone on an autoincrement topic", Plain, F(1, true, false, false, false, true), T(1,1,0,0), OK, H::None},
+        {"73 import without the grant", Import, kIdemView, T(1,1,0,0), NA, H::ImportNotGranted},
+        {"74 import with the grant", Import, withImport(kIdemView), T(1,1,0,0), OK, H::None},
+        {"75 import with a bad key", ImportBadKey, withImport(kIdemView), T(1,1,0,0), IR, H::ImportOutOfRange},
+        {"76 key-0 creates, counter not ready", KeyZero, F(1, true, false, false, false, true), T(1,1,0,0,-1,0), NL, H::AutoIncActivating},
+        {"77 key-0 creates, exhausted", KeyZeroExhausted, F(1, true, false, false, false, true), T(1,1,0,0), EXH, H::AutoIncExhausted},
+        {"78 key-0 creates, window full", KeyZeroWindowFull, F(1, true, false, false, false, true), T(1,1,0,0), NL, H::AutoIncWindowFull},
+        {"79 key-0 creates, exhausted, not idempotent: definite rules first", KeyZeroExhausted, F(1, false, false, false, false, true), T(1,1,0,0), IR, H::KeyZeroCreateNeedsIdempotentAll},
+        {"80 import, acks 1: the explicit-key rule first", Import, [] { auto f = F(1, true, false, false, false, true); f.importGranted = true; return f; }(), T(1,1,0,0), IR, H::ExplicitKeyNeedsIdempotentAndView},
+        {"81 update on an autoincrement topic", Update, F(3, true, false, false, false, true), T(1,1,0,0), OK, H::None},
+        {"82 key-0 creates in legacy mode", KeyZero, F(1, true, false, false, true, true), T(1,1,0,0), IR, H::LegacyMode},
+        {"83 key-0 creates, counter not ready, exhausted never evaluated", KeyZeroWindowFull, F(1, true, false, false, false, true), T(1,1,0,0,-1,0), NL, H::AutoIncActivating},
     };
     return r;
 }
@@ -146,7 +169,7 @@ static_assert(isRow(InsertExplicit, kIdemView, T(1,0,0,0,1), OK, H::None));
 }  // namespace
 
 TEST(CheckedWritesRequirementTable, PinnedRows) {
-    ASSERT_EQ(rows().size(), 70u);
+    ASSERT_EQ(rows().size(), 83u);
     for (const Row& r : rows()) {
         const auto v = evaluateRequirements(intentsOf(r.shape), r.f, r.t);
         EXPECT_EQ(v.code, r.code) << r.why;
@@ -163,25 +186,30 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         case 1: return h == H::ExplicitKeyNeedsIdempotentAndView || h == H::KeyZeroCreateNeedsIdempotentAll;                      // idempotent
         case 2: return h == H::IntentInTxnOrAtomicBatch || h == H::TxnOnConstrainedSource;                                         // transactional
         case 3: return h == H::IntentInTxnOrAtomicBatch || h == H::TxnOnConstrainedSource;                                         // atomic
-        case 4: return false;                                                                                                      // import
+        case 4: return h == H::ImportNotGranted;                                                                                   // import
         case 5: return h == H::LegacyMode;                                                                                         // legacy
         case 6: return h == H::LevelTooLow;                                                                                        // level
         case 7: return h == H::NoKeyIndex || h == H::KeyIndexActivating;                                                           // keyIndex
-        case 8: return false;                                                                                                      // autoIncrement
+        case 8: return h == H::UpsertOnAutoIncrement || h == H::ImportNotGranted || h == H::ImportOutOfRange || h == H::AutoIncExhausted ||
+                       h == H::AutoIncWindowFull || h == H::AutoIncActivating;                                                     // autoIncrement
         case 9: return h == H::TxnOnConstrainedSource || h == H::KeyZeroCreateNeedsView;                                           // constrained
         case 10: return h == H::ViewBatchTooLarge;                                                                                 // verdict source
-        default: return h == H::KeyIndexActivating;                                                                                // keyIndexActive
+        case 11: return h == H::KeyIndexActivating;                                                                                // keyIndexActive
+        case 12: return h == H::AutoIncActivating;                                                                                 // autoIncReady
+        case 13: return h == H::AutoIncExhausted;                                                                                  // exhausted
+        default: return h == H::AutoIncWindowFull;                                                                                 // window full
         }
     };
-    const auto build = [](uint32_t m, WriteFacts& f, TopicHookFacts& t) {
+    const auto build = [](uint32_t m, BatchIntents& b, WriteFacts& f, TopicHookFacts& t) {
+        b.autoIncExhausted = m & 16384; b.autoIncWindowFull = m & 32768;
         f = {};
         f.acks = m & 3; f.idempotent = m & 4; f.transactional = m & 8; f.atomicBatch = m & 16; f.importGranted = m & 32;
         f.legacyMode = m & 64; f.levelCheckedWrites = m & 128;
         t = {};
-        t.keyIndex = m & 256; t.autoIncrement = m & 512; t.constrainedSource = m & 1024; t.verdictSource = m & 2048; t.keyIndexActive = m & 4096;
+        t.keyIndex = m & 256; t.autoIncrement = m & 512; t.constrainedSource = m & 1024; t.verdictSource = m & 2048; t.keyIndexActive = m & 4096; t.autoIncReady = m & 8192;
     };
-    // Matrix B: every intent shape x reserved bits on / off x records {1, 4096, 4097} x the 12 facts (import included).
-    const Shape shapes[] = {Plain, InsertExplicit, Update, RemoveExisting, KeyZero, KeyZeroMixed};
+    // Matrix B: every intent shape x reserved bits on / off x records {1, 4096, 4097} x the 15 facts (import and the three autoincrement ones included).
+    const Shape shapes[] = {Plain, InsertExplicit, Update, RemoveExisting, KeyZero, KeyZeroMixed, PlainUpsert};
     const auto flip = [](uint32_t m, int fact) {
         switch (fact) {
         case 0: return m ^ 1u;
@@ -195,7 +223,10 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         case 8: return m ^ 512u;
         case 9: return m ^ 1024u;
         case 10: return m ^ 2048u;
-        default: return m ^ 4096u;
+        case 11: return m ^ 4096u;
+        case 12: return m ^ 8192u;
+        case 13: return m ^ 16384u;
+        default: return m ^ 32768u;
         }
     };
     int cells = 0;
@@ -205,27 +236,30 @@ TEST(CheckedWritesRequirementTable, SweepInvariants) {
         BatchIntents b = intentsOf(s);
         b.reservedBits = reserved;
         b.records = records;
-        for (uint32_t m = 0; m < 8192; ++m) {
-            WriteFacts f; TopicHookFacts t;
-            build(m, f, t);
-            const auto v = evaluateRequirements(b, f, t);
+        for (uint32_t m = 0; m < 65536; ++m) {
+            BatchIntents bm = b; WriteFacts f; TopicHookFacts t;
+            build(m, bm, f, t);
+            const auto v = evaluateRequirements(bm, f, t);
             ++cells;
             const bool view = f.acks & 2;
-            if (!b.anyIntent && !b.reservedBits && !view && !((f.transactional || f.atomicBatch) && t.constrainedSource)) {
+            if (!b.anyIntent && !(b.plainUpsert && t.autoIncrement) && !b.reservedBits && !view && !((f.transactional || f.atomicBatch) && t.constrainedSource)) {
                 ASSERT_EQ(v.code, OK) << "(i) shape " << s << " records " << records << " m " << m;
             }
             if (b.reservedBits) ASSERT_EQ(v.why, H::ReservedBits) << "(ii)";
             if (!b.reservedBits && f.legacyMode && (b.anyIntent || view)) ASSERT_EQ(v.why, H::LegacyMode) << "(iii)";
-            if (v.code != OK) ASSERT_EQ(v.code, v.why == H::KeyIndexActivating ? NL : IR) << "(iv)";
-            for (int fact = 0; fact < 12; ++fact) {
-                WriteFacts f2; TopicHookFacts t2;
-                build(flip(m, fact), f2, t2);
-                const auto w = evaluateRequirements(b, f2, t2);
+            if (v.code != OK) {
+                const bool retriable = v.why == H::KeyIndexActivating || v.why == H::AutoIncActivating || v.why == H::AutoIncWindowFull;
+                ASSERT_EQ(v.code, retriable ? NL : v.why == H::ImportNotGranted ? NA : v.why == H::AutoIncExhausted ? EXH : IR) << "(iv)";
+            }
+            for (int fact = 0; fact < 15; ++fact) {
+                BatchIntents b2 = b; WriteFacts f2; TopicHookFacts t2;
+                build(flip(m, fact), b2, f2, t2);
+                const auto w = evaluateRequirements(b2, f2, t2);
                 if (w.why != v.why) ASSERT_TRUE(feeds(fact, v.why) || feeds(fact, w.why)) << "(v) fact " << fact << " shape " << s << " reserved " << reserved << " records " << records << " m " << m;
             }
         }
     }
-    EXPECT_EQ(cells, 6 * 2 * 3 * 8192);
+    EXPECT_EQ(cells, 7 * 2 * 3 * 65536);
 }
 
 namespace {
@@ -404,7 +438,7 @@ TEST(CheckedWritesHook, StageIsIdentityAndAssignedBaseIsZero) {
     Hooked h;
     CheckedWriteHook hook(h.state, h.facts, {});
     const uint8_t bytes[4] = {1, 2, 3, 4};
-    int log = 0;
+    rune::storage::InMemoryLog log(1024, 4);
     const auto s = hook.stage(log, bytes, sizeof bytes);
     EXPECT_EQ(s.error, OK);
     EXPECT_EQ(s.batch, bytes);

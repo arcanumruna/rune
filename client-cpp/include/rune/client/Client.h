@@ -172,6 +172,9 @@ struct TopicSchemaResult {
     /// (TopicSchemaResponse trailing field); <= 0 = not reported (pre-2b broker)
     /// — typed topics then route over 1 partition (typedPartitionCount).
     int32_t              partitionCount = 0;
+    /// Checked writes: the topic's key features when the broker sent them (it does iff they are not the defaults);
+    bool                             hasKeyFeatures = false;
+    rune::protocol::TopicKeyFeatures keyFeatures{};
 };
 
 // ---------------------------------------------------------------------------
@@ -617,6 +620,9 @@ public:
     /// Test hook: fill the agent command ring so the next registration finds it full.
     /// Issue #60: how many Rejected-route sweeps ran (edge-triggered: one per Rejected edge / refused routing).
     [[nodiscard]] uint64_t routedBrokerSweeps() const noexcept { return routedBrokerSweeps_; }
+    /// Test seams: producers send partitionKnown = 0; the next `n` ProduceResponses are discarded.
+    void producePartitionUnknownForTest(bool on) noexcept { producerHub_.setPartitionUnknownForTest(on); }
+    void dropProduceAcksForTest(int n) noexcept { agent_.dropProduceAcksForTest(n); }
     [[nodiscard]] uint32_t rejectedLeaderSessionsForTest() const noexcept { return agent_.rejectedLeaderSessions(); }
     [[nodiscard]] std::string_view testAgentSecret() const noexcept { return agent_.secretForTest().view(); }
     /// The command ring's record area (not the position trailer): a consumed record must be zeroed.
@@ -846,8 +852,9 @@ public:
     //   Ping           payload = the echo bytes.
     //   DefineTopic    value = topicId, aux = version; a broker errorCode in the
     //                  response -> BrokerError (errorCode, value/aux kept).
-    //   GetTopicSchema value = topicId, aux = version, payload = descriptor
-    //                  blob (polled form: up to maxResultBytes, else
+    //   GetTopicSchema value = topicId, aux = version (+ a key-features flag, see schemaAuxOf), payload = descriptor
+    //                  blob, then the 14-byte key-features block when the aux flag says so (schemaBlobOf strips it)
+    //                  (polled form: up to maxResultBytes, else
     //                  ResultTooLarge with value = the real size),
     //                  reserved0 = the topic's partitionCount (Phase 2b; <= 0
     //                  = not reported, e.g. a pre-2b broker).
@@ -1197,7 +1204,9 @@ public:
         const TopicSchemaResult r = openTypedSchema_<T>(name, timeout);
         // Phase 2b Part C: route over the topic's partitions (broker-reported;
         // a pre-2b broker reports 0 -> 1, the pre-2b partition-0 behaviour).
-        return TypedTopic<T>(producer(), TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)}, r.version);
+        return TypedTopic<T>(producer(),
+                             TopicHandle{r.topicId, typedPartitionCount(r.partitionCount), TopicKind::Typed, r.keyFeatures.partitioner},
+                             r.version);
     }
 
     /// The handle of an UNTYPED (raw) topic, for Producer::send with a hand-built Key.  Checked writes: a raw handle
@@ -1250,7 +1259,9 @@ public:
         }
         const TopicSchemaResult r = openTypedSchema_<T>(name, timeout);
         return TypedTopic<T, ProducerRef>(ProducerRef(shared),
-                                          TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)}, r.version);
+                                          TopicHandle{r.topicId, typedPartitionCount(r.partitionCount), TopicKind::Typed,
+                                                      r.keyFeatures.partitioner},
+                                          r.version);
     }
 
     /// Test hooks (duty thread only, or after close): completions addressed to

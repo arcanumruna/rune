@@ -892,7 +892,7 @@ static void BM_Coalescing_GroupBySize(benchmark::State& state) {
 
     for (auto _ : state) {
         auto groups = rune::storage::LogCleaner::groupSegmentsBySize(
-            bases, sizes, kRollBytes);
+            bases, sizes, static_cast<int64_t>(numSegs) * 100, kRollBytes);
         benchmark::DoNotOptimize(groups.size());
         benchmark::ClobberMemory();
     }

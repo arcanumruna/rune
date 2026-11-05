@@ -56,6 +56,7 @@
 #include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/group/GroupMetadata.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -119,6 +120,17 @@ enum class Acks : uint8_t {
 // ---------------------------------------------------------------------------
 enum class WriteIntent : uint8_t { Upsert = 0, Insert = 1, Update = 2 };
 [[nodiscard]] constexpr uint8_t intentBits(WriteIntent i) noexcept { return static_cast<uint8_t>(i); }
+
+/// Autoincrement: key-0 creates on a Modulo handle take their id from the broker.  They route to one partition for a run of
+/// kKeyZeroStickyRun records per topic, then the next, so a partition batch fills with them.
+inline constexpr int32_t kKeyZeroStickyRun = 64;
+[[nodiscard]] inline bool isKeyZeroCreate(const TopicHandle& h, const Key& k, WriteIntent i) noexcept {
+    if (h.partitioner != rune::protocol::Partitioner::Modulo || i != WriteIntent::Insert || k.empty()) return false;
+    for (const uint8_t b : k.bytes()) {
+        if (b != 0) return false;
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // TopicPartitionKey - (topicId, partition) pair.
@@ -665,6 +677,8 @@ public:
     /// reserved, with SendResult::WriteNotAllowed (the blocking forms throw std::invalid_argument naming the
     /// rule): on a raw handle, without View in the producer's acks, in a transaction, or Insert with an empty value.
     /// A View producer also refuses every send on a raw handle.
+    /// On a Modulo (autoincrement) handle a live Upsert is refused too, and so is a key-0 create from a producer that is not
+    /// idempotent or whose acks lack All; a key-0 create needs neither View nor Part G.
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                      WriteIntent intent = WriteIntent::Upsert) noexcept;
 
@@ -1107,12 +1121,23 @@ private:
                                           std::span<const uint8_t> value, WriteIntent intent) noexcept;
     /// P5-9: the local refusal text for a send, or nullptr when it is allowed.  An Upsert on a non-raw handle of a
     /// producer without View pays one branch.
-    [[nodiscard]] const char* intentRefusal_(TopicHandle topic, std::span<const uint8_t> value,
+    [[nodiscard]] const char* intentRefusal_(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                              WriteIntent intent) const noexcept;
-    /// True when a send needs intentRefusal_: a non-Upsert intent, or View acks on a raw handle.  Branchless, so the
-    /// caller's single [[unlikely]] test is the only branch an Upsert pays.
+    /// The partition a send routes to: the topic's partitioner, except a key-0 create, which goes to its topic's current
+    /// sticky partition.  A key-0 create that was accepted then counts toward the run (stickyAdvance_).
+    [[nodiscard]] int32_t partitionOf_(TopicHandle topic, const Key& key, WriteIntent intent) noexcept;
+    void stickyAdvance_(TopicHandle topic) noexcept;
+    /// trySendPart_'s `part` when the key routes the send.
+    static constexpr int32_t kRouteByKey = -1;
+    /// True when a send needs intentRefusal_: a non-Upsert intent, View acks on a raw handle, or a Modulo handle.
+    /// Branchless, so the caller's single [[unlikely]] test is the only branch an Upsert on a hashed handle pays.
     [[nodiscard]] bool needsIntentCheck_(TopicHandle topic, WriteIntent intent) const noexcept {
-        return (intentBits(intent) | (viewByte_ & static_cast<uint8_t>(topic.kind == TopicKind::Raw))) != 0;
+        return (intentBits(intent) | (viewByte_ & static_cast<uint8_t>(topic.kind == TopicKind::Raw)) |
+                static_cast<uint8_t>(topic.partitioner)) != 0;
+    }
+    /// The topic's partition count when the send is a key-0 create (its batch's idStride), else 0.
+    [[nodiscard]] static uint32_t idStrideOf_(TopicHandle topic, const Key& key, WriteIntent intent) noexcept {
+        return isKeyZeroCreate(topic, key, intent) ? static_cast<uint32_t>(topic.partitionCount) : 0u;
     }
     /// 2b-B: the one claim body; `part` computed once by the caller, the
     /// per-record ack credit (cq) already reserved by the caller.
@@ -1127,6 +1152,10 @@ private:
 
     producer::ProducerImpl* impl_ = nullptr;  // the handle's share (§3.3): ONE load per send
     uint8_t viewByte_ = 0;                    // 1 when the acks include View (constant from construction)
+    struct StickyRun { int32_t topicId; int32_t partition; int32_t sent; };
+    static constexpr std::size_t kStickyTopics = 16;
+    std::array<StickyRun, kStickyTopics> sticky_{};   // app thread: the key-0 run of the first kStickyTopics Modulo topics
+    std::size_t stickyUsed_ = 0;
 };
 
 } // namespace rune::client

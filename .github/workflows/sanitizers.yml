@@ -138,7 +138,7 @@ jobs:
       - name: Install dependencies
         run: |
           conan profile detect --force
-          conan export conan/aeron --version=1.51.0-rune.2
+          conan export conan/aeron --version=1.51.0-rune.3
           conan install . -of "build-${{ matrix.id }}" -s build_type=Debug --build=missing
           conan install client-cpp -of "build-client-${{ matrix.id }}" -s build_type=Debug --build=missing
 

@@ -79,6 +79,27 @@ A value outside its range is answered `InvalidRequest` (39) with a detail such a
 `tier` setting is the durability tier of an acknowledged write: `leader` acks on the leader's append, `majority` once a
 majority of the in-sync replicas hold it, `strict` also after an fsync.
 
+### Autoincrement
+
+- `autoincrement` on a `uint64`, `int64` or `uint32` key field makes the broker assign the key of every record written
+  with key 0 (a create). It implies `key.index` and modulo routing (`id mod partitions`), needs
+  `cleanup.policy = compact` and no retention (`retention.ms` and `retention.bytes` stay -1), and needs a new, persisted
+  topic and every broker at feature level 5. The key field, its type, `autoincrement` and the partition count never change.
+- The ids of partition `p` of `P` are `n * P + p` for `n = 1, 2, ...`: dense per partition, never reused, with gaps after a
+  failover, a rejected record or an aborted transaction.
+- `autoincrement.reserve` (default 4096, 1 to 1048576) is how many ids the leader reserves in the log at a time.
+  `autoincrement.max` (default 2^53 - 1, 2^32 - 1 for `uint32`; at least `2 * partitions - 1`) is the last id; past it a create is
+  refused with `AutoIncrementExhausted` (58). Both need `autoincrement`.
+- A record with an explicit key is an import: an `insert` the broker stores as sent, after the counter is moved above it.
+  It needs the `IMPORT` grant (below) and a key that is at most `autoincrement.max` and belongs to its partition. A plain
+  upsert is refused; `update`, `removeExisting` and deletes behave as on any key-index topic.
+
+```sql
+grant import on topic 'user' to user backfill;
+```
+
+`IMPORT` is a topic operation that nothing implies, and it needs every broker at feature level 5.
+
 ## Changing and dropping
 
 ```sql
@@ -164,11 +185,11 @@ dropStmt   := "drop" ( "topic" | "view" ) IDENT ";"  |  "drop" ( "user" | "role"
 grantStmt  := "grant"  ( OPERATION "on" resource "to"   ( "user" | "role" ) NAME | "role" NAME "to"   "user" NAME ) ";"
 revokeStmt := "revoke" ( OPERATION "on" resource "from" ( "user" | "role" ) NAME | "role" NAME "from" "user" NAME ) ";"
 resource   := "cluster" | ( "topic" | "view" | "group" | "transactional_id" ) ( "prefix" STRING | NAME )
-OPERATION  := "read" | "write" | "create" | "alter" | "drop" | "describe" | "admin"
+OPERATION  := "read" | "write" | "create" | "alter" | "drop" | "describe" | "admin" | "import"
 NAME       := IDENT | STRING
 ```
 
-Valid operation and resource pairs (anything else is refused): `TOPIC` takes `READ WRITE CREATE ALTER DROP DESCRIBE`;
+Valid operation and resource pairs (anything else is refused): `TOPIC` takes `READ WRITE CREATE ALTER DROP DESCRIBE IMPORT`;
 `VIEW` takes `READ CREATE ALTER DROP DESCRIBE`; `GROUP` takes `READ DESCRIBE`; `TRANSACTIONAL_ID` takes `WRITE DESCRIBE`;
 `CLUSTER` takes `CREATE ALTER DROP DESCRIBE ADMIN`. User and role names are `[A-Za-z0-9._@-]`, 1 to 128 characters,
 not starting with `__`.

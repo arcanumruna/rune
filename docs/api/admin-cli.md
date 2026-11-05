@@ -48,6 +48,17 @@ The statement text is recorded in the catalog. The grammar and examples are in [
 
 `rune ql` exits `1` on any failure; it does not map a broker refusal to its wire code (`rune console -f` does).
 
+**Back-filling an autoincrement topic.** Importing rows with their old ids needs the `IMPORT` grant
+([ql.md](ql.md#autoincrement)), which nothing else implies:
+
+```bash
+rune ql -e "grant import on topic 'user' to user backfill" --broker rune-1:40200
+```
+
+The back-fill job writes every row with its id kept (`insert`, `Acks::All | Acks::View`, an idempotent producer). The broker
+moves the counter above the highest imported id, so live inserts that follow with key 0 get fresh ids. Revoke the grant
+when the import is done: `revoke import on topic 'user' from user backfill`.
+
 ## `rune console`
 
 The interactive Rune QL shell, and the way to run a `.rql` script (topic DDL included). It replaces the former

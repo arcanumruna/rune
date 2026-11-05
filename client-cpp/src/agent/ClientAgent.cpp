@@ -1203,11 +1203,16 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // known-old duplicate carries baseOffset -1; the old -errorCode sentinel
         // read it as error 1).
         if (auto opt = codec::decodeProduceResponse(buf, len)) {
+            if (dropProduceAcks_ > 0) {
+                --dropProduceAcks_;
+                break;
+            }
             const int64_t off = opt->errorCode == 0 ? opt->baseOffset : -1;
             if (produceResponseFn_) {
                 produceResponseFn_(opt->correlationId, off, opt->errorCode);  // test-harness hook
             } else {
                 ProduceAck ack{opt->correlationId, off, opt->errorCode, opt->logStartOffset};
+                ack.assignedBase = opt->assignedBase;
                 if (opt->hasVerdicts) {
                     ack.hasVerdicts   = true;
                     ack.verdictCount  = opt->verdictCount;

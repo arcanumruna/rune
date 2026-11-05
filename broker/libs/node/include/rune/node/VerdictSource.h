@@ -7,10 +7,14 @@
 #include <rune/node/VerdictState.h>
 #include <rune/node/ViewInstance.h>
 #include <rune/node/WriteState.h>
+#include <rune/protocol/BatchRebuild.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/ControlRecordLayout.h>
+#include <rune/storage/ProducerBatchWindow.h>
 #include <rune/view/Verdict.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <span>
@@ -29,8 +33,7 @@ struct KeyIndexFold {
     uint8_t                keyWidth = 0;
 };
 
-/// The wire key's bytes packed little-endian; the caller checked the width (at most 8).
-[[nodiscard]] uint64_t keyIndexWord(std::string_view wireKey) noexcept;
+using rune::storage::keyIndexWord;
 [[nodiscard]] rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold&, const rune::view::SourceRecord&, rune::view::Prospect&) noexcept;
 /// The intent table (P5-3) over the key state the prospect holds; a Malformed prospect is accepted.
 [[nodiscard]] rune::view::Verdict evaluateIntent(const rune::view::SourceRecord&, const rune::view::Prospect&) noexcept;
@@ -154,6 +157,8 @@ private:
     void   waitForInstall_() noexcept;
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
+    /// P6-13: a rejected record of a key-0 batch burns its id; a KeyExists on one is a reused id (counted and logged).
+    void   noteKeyZeroRejection_(const rune::view::Verdict& v, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     /// Retention may have trimmed the log below a member's cursor: an empty member starts at the log start, one with rows is
     /// discarded (BelowLogStart).  False when it was discarded.
@@ -223,7 +228,7 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
         });
         if (!s.markers.onMarker(base, m->header.finalThrough)) {   // full: the slots below the HW are committed (the scan read them in order)
             s.markers.onHw(std::min(base, s.scanHw));
-            (void)s.markers.onMarker(base, m->header.finalThrough);   // still full: 1024 uncommitted markers above the HW, the leader re-marks
+            (void)s.markers.onMarker(base, m->header.finalThrough);   // still full: 1024 uncommitted markers above the HW, counted in appendedThrough
         }
     } else if (c->type == cr::kConstraintSetChange) {
         std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
@@ -236,7 +241,43 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
         for (uint16_t i = 0; i < count; ++i)
             set.members[i] = ConstraintSetMember{wire[i].viewObjectId, static_cast<rune::view::VerdictViewKind>(wire[i].kind), wire[i].planFingerprint};
         s.constraintSets.onChange(base, set);
+    } else if (c->type == cr::kReservation) {
+        if (const auto r = cr::parseReservation(*c)) s.autoInc.onReservation(*r);
     }
+}
+
+/// verdictFeedBegin for an autoincrement source: the counter and the side window are rebuilt by the same scan.
+inline void autoIncFeedBegin(void* state, int64_t logStart, int64_t target) noexcept {
+    verdictFeedBegin(state, logStart, target);
+    auto& s = *static_cast<PartitionWriteState*>(state);
+    s.autoInc.beginScan();
+    s.assignedBases.clear();
+}
+
+/// Autoincrement (P6-3): every insert in an idempotent data batch raises the highest n assigned; a batch whose first record is
+/// an insert also refills its producer's window entry with the first key as the base (a key-0 batch and an import look the
+/// same in the log).
+inline void autoIncFeedDataBatch(void* state, const uint8_t* b, std::size_t len, int64_t base) noexcept {
+    auto& s = *static_cast<PartitionWriteState*>(state);
+    const rune::protocol::RecordBatchReader r(b, len);
+    if (r.baseSequence() < 0) return;
+    const auto partitions = static_cast<uint64_t>(s.autoInc.partitions());
+    bool insertFirst = false;
+    uint64_t firstKey = 0, maxN = 0;
+    (void)rune::protocol::forEachRecordSpan(b, len, [&](const rune::protocol::RecordSpan& rec) {
+        if (rune::protocol::record::intentOf(rec.attributes) != static_cast<uint8_t>(rune::protocol::record::Intent::Insert) ||
+            rec.key.size() > sizeof(uint64_t)) return;
+        const uint64_t key = keyIndexWord(rec.key);
+        if (rec.index == 0) { insertFirst = true; firstKey = key; }
+        maxN = std::max(maxN, key / partitions);
+    });
+    s.autoInc.onAssignedThrough(maxN);
+    if (insertFirst) s.assignedBases.recordScanned(r.producerId(), base, firstKey);
+}
+/// The scan ended: the counter resumes above the latest reservation, and the reserved ids nothing took are burned.
+inline void autoIncFeedEnd(void* state) noexcept {
+    auto& s = *static_cast<PartitionWriteState*>(state);
+    s.autoIncStats.idsBurned += s.autoInc.finishScan();
 }
 /// The HW moved: markers below it are committed, and the committed coverage W follows.
 void verdictOnHw(PartitionWriteState& state, int64_t hw) noexcept;

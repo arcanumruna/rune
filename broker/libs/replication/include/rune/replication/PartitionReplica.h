@@ -203,6 +203,9 @@ struct PartitionConfig {
     /// (it refuses and reports instead).  true restores the Kafka behaviour (log and truncate) - the broker sets
     /// it from RUNE_SURVIVOR_LEADER_ELECTION for user topics, where an unclean election is a configured choice.
     bool allowUncleanTruncation = false;
+    /// Checked writes Part 06: producer-state batches kept per producer; an autoincrement topic keeps the whole
+    /// retry window, any other topic only the latest batch.
+    int  producerTailDepth = 1;
 };
 
 // ---------------------------------------------------------------------------
@@ -978,6 +981,7 @@ public:
         if (gen == cleanerRewindAck_.load(std::memory_order_relaxed)) return;
         const Offset to = cleanerRewindTo_.load(std::memory_order_relaxed);
         if (to < lastCleanOffset()) setLastCleanOffset(to);
+        else if (to < cleanerProgress()) setCleanerProgress(to);
         cleanerRewindAck_.store(gen, std::memory_order_release);
     }
     // Task #13: gatewayIsrSize() — acquire-load of the published ISR size snapshot.
@@ -1050,6 +1054,7 @@ public:
     [[nodiscard]] int64_t     fileDeleteDelayMs()      const noexcept { return cfg_.fileDeleteDelayMs; }
     /// Log-start-offset: segments entirely below this are deleted. 0 = disabled.
     [[nodiscard]] int64_t     logStartOffset()         const noexcept { return cfg_.logStartOffset; }
+    [[nodiscard]] int         producerTailDepth()      const noexcept { return cfg_.producerTailDepth; }
     /// CP-2: offset up to which the log has already been compacted (cleaned watermark).
     /// Initially 0; advanced by runBoundedCompaction after each segment is cleaned.
     /// Atomic so test threads can poll without a TSan race (cleaner/duty threads write it).
@@ -1059,7 +1064,12 @@ public:
     /// CP-2: advance the cleaned watermark (called by NodeRuntimeAgent after each segment).
     void setLastCleanOffset(Offset o) noexcept {
         lastCleanOffset_.store(o, std::memory_order_relaxed);
+        cleanerProgress_.store(o, std::memory_order_relaxed);
     }
+    /// Part 06: where the cleaner's last pass ended, at or above lastCleanOffset (a producer's retry window can hold the
+    /// watermark below it - LogCleaner::setPreviousPassEnd).  Selection measures dirtiness from here; a rewind lowers it too.
+    [[nodiscard]] Offset cleanerProgress() const noexcept { return cleanerProgress_.load(std::memory_order_relaxed); }
+    void setCleanerProgress(Offset o) noexcept { cleanerProgress_.store(o, std::memory_order_relaxed); }
 
     /// True if this partition is backed by an in-memory ring (InMemoryLog);
     /// false if backed by an on-disk Log.  Fixed at construction — a partition's
@@ -1807,6 +1817,7 @@ private:
     // never re-scanned or re-rewritten on the next duty-cycle call.
     // Atomic: cleaner/duty threads write; test threads may poll it concurrently.
     std::atomic<Offset> lastCleanOffset_{0};
+    std::atomic<Offset> cleanerProgress_{0};     ///< cleaner-written (cleanerProgress)
     std::atomic<uint64_t> cleanerRewindGen_{0};      ///< owner-written (fix round 3)
     std::atomic<Offset>   cleanerRewindTo_{0};       ///< owner-written
     std::atomic<uint64_t> cleanerRewindAck_{0};      ///< cleaner-written

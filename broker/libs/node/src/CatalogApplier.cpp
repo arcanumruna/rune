@@ -55,8 +55,12 @@ TopicSchema topicSchemaOf(const cat::TopicObject& t) {
     return ts;
 }
 
-SinkSpec sinkSpecOf(const cat::ViewObject& v) {
-    return SinkSpec{v.def.viewTopicId, v.name, v.def.sinkPartitions, v.def.persistence, v.def.keyField, v.nsId};
+SinkSpec sinkSpecOf(const cat::ViewObject& v, const cat::CatalogState& state) {
+    SinkSpec s{v.def.viewTopicId, v.name, v.def.sinkPartitions, v.def.persistence, v.def.keyField, v.nsId};
+    if (!v.def.sourceNames.empty())
+        if (const cat::TopicObject* src = state.topicByName(v.nsId, v.def.sourceNames.front()); src && src->schema)
+            s.sourceKeyFeatures = src->schema->keyFeatures;
+    return s;
 }
 
 cat::ApplyError decodeFailure(int64_t offset, cat::DecodeError e) {
@@ -198,7 +202,7 @@ void CatalogApplier::postBootStash(const CatalogEffects& sink) const {
         }
         for (const cat::ViewObject* v : state_.views()) {
             if (maxFrame != 0 && viewEffectFramesError(*v, state_, maxFrame)) continue;
-            if (sink.sinkApplied) sink.sinkApplied(sinkSpecOf(*v));
+            if (sink.sinkApplied) sink.sinkApplied(sinkSpecOf(*v, state_));
             if (sink.viewInstalled) sink.viewInstalled(*v);
         }
         if (sink.applied) sink.applied(lastApplied_.offset, state_.digest());
@@ -234,7 +238,7 @@ void CatalogApplier::emitFinalState_() {
     for (const cat::ViewObject* v : state_.views()) {
         if (maxFrame != 0)
             if (auto err = viewEffectFramesError(*v, state_, maxFrame)) { refuse(std::move(*err)); continue; }
-        if (sink->sinkApplied) sink->sinkApplied(sinkSpecOf(*v));
+        if (sink->sinkApplied) sink->sinkApplied(sinkSpecOf(*v, state_));
         if (sink->viewInstalled) sink->viewInstalled(*v);
     }
     if (sink->applied) sink->applied(lastApplied_.offset, state_.digest());
@@ -552,7 +556,7 @@ void CatalogApplier::effects_(const CatalogEffects& sink, const cat::CatalogEven
         if (v == nullptr) return;
         // Install before uninstall: the new sink exists before the new plan, and
         // the old plan stops before its sink is retired (F27).
-        if (sink.sinkApplied) sink.sinkApplied(sinkSpecOf(*v));
+        if (sink.sinkApplied) sink.sinkApplied(sinkSpecOf(*v, state_));
         if (sink.viewInstalled) sink.viewInstalled(*v);
         if (e.kind == cat::EventKind::AlterView) {
             if (sink.viewUninstalled) sink.viewUninstalled(a.droppedTopicId);

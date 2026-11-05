@@ -103,15 +103,17 @@ public:
         return acquire(std::move(grants), 0, index);
     }
 
-    /// A topic / view appeared / disappeared: every LIVE table once.  `f(id, table, beforeWrite, afterWrite)` sees
-    /// each table's WRITE bit of `objectId` before and after (the shipping hook patches the ones that changed).
+    /// A topic / view appeared / disappeared: every LIVE table once.  `f(id, table, beforeWrite, afterWrite,
+    /// beforeImport, afterImport)` sees each table's WRITE and IMPORT bits of `objectId` before and after (the shipping
+    /// hook patches the ones that changed).
     template <class F> void onObjectCreated(int32_t objectId, const ObjectEntry& e, F&& f) {
         for (uint32_t i = 0; i < entries_.size(); ++i) {
             Entry& en = *entries_[i];
             if (en.refs == 0) continue;
             const bool before = en.table.allows(objectId, kWriteBit);
+            const bool beforeImport = en.table.allowsImport(objectId);
             en.table.onObjectCreated(objectId, e);
-            f(i, en.table, before, en.table.allows(objectId, kWriteBit));
+            f(i, en.table, before, en.table.allows(objectId, kWriteBit), beforeImport, en.table.allowsImport(objectId));
         }
     }
     template <class F> void onObjectDropped(int32_t objectId, F&& f) {
@@ -119,8 +121,9 @@ public:
             Entry& en = *entries_[i];
             if (en.refs == 0) continue;
             const bool before = en.table.allows(objectId, kWriteBit);
+            const bool beforeImport = en.table.allowsImport(objectId);
             en.table.onObjectDropped(objectId);
-            f(i, en.table, before, false);
+            f(i, en.table, before, false, beforeImport, false);
         }
     }
 

@@ -19,7 +19,8 @@
 // their tombstone expired).
 //
 // Expiry (I1, Kafka producer.id.expiration.ms): a producer whose last batch's
-// maxTimestamp is older than nowMs - expirationMs is no longer retained (the
+// broker append time (its segment file's last write - never the client's
+// maxTimestamp) is older than nowMs - expirationMs is no longer retained (the
 // rebuild then forgets it — see the UNKNOWN_PRODUCER_ID ticket).  nowMs < 0
 // (legacy passes without a wall clock) never expires.
 //
@@ -52,22 +53,22 @@ public:
     void setCapacity(std::size_t capacity) noexcept { capacity_ = capacity; }
     [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
 
-    /// Record an idempotent DATA batch of `producerId` ending at `lastOffset`
-    /// with batch maxTimestamp `maxTimestampMs`.
-    void note(int64_t producerId, int64_t lastOffset, int64_t maxTimestampMs) {
+    /// Record an idempotent DATA batch of `producerId` ending at `lastOffset`,
+    /// appended at `appendMs`.
+    void note(int64_t producerId, int64_t lastOffset, int64_t appendMs) {
         auto it = tails_.find(producerId);
         if (it == tails_.end()) {
             if (tails_.size() >= capacity_) { overflowed_ = true; return; }
-            tails_.emplace(producerId, Tail{lastOffset, maxTimestampMs});
+            tails_.emplace(producerId, Tail{lastOffset, appendMs});
             return;
         }
-        if (lastOffset > it->second.lastOffset) it->second = Tail{lastOffset, maxTimestampMs};
+        if (lastOffset > it->second.lastOffset) it->second = Tail{lastOffset, appendMs};
     }
-    /// Must the data batch of `producerId` ending at `lastOffset` (maxTimestamp
-    /// `maxTimestampMs`) keep its producer metadata?
-    [[nodiscard]] bool mustRetain(int64_t producerId, int64_t lastOffset, int64_t maxTimestampMs,
+    /// Must the data batch of `producerId` ending at `lastOffset` (appended at
+    /// `appendMs`) keep its producer metadata?
+    [[nodiscard]] bool mustRetain(int64_t producerId, int64_t lastOffset, int64_t appendMs,
                                   int64_t nowMs, int64_t expirationMs) const noexcept {
-        if (nowMs >= 0 && expirationMs >= 0 && toEpochMs(maxTimestampMs) < nowMs - expirationMs) return false;   // expired (ns or ms stamps)
+        if (nowMs >= 0 && expirationMs >= 0 && toEpochMs(appendMs) < nowMs - expirationMs) return false;   // expired (ns or ms stamps)
         const auto it = tails_.find(producerId);
         if (it != tails_.end()) return it->second.lastOffset == lastOffset;
         return overflowed_;   // unrecorded (map full): keep it, conservatively
@@ -83,7 +84,7 @@ public:
 private:
     struct Tail {
         int64_t lastOffset;
-        int64_t maxTimestampMs;
+        int64_t appendMs;
     };
     std::unordered_map<int64_t, Tail> tails_;
     std::size_t capacity_   = kUnbounded;

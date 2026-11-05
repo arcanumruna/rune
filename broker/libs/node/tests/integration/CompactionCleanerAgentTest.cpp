@@ -44,6 +44,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
 #include <rune/storage/CleanerOffsetCheckpoint.h>
+#include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/OffsetMap.h>
@@ -1306,6 +1307,82 @@ TEST(CompactionCleanerAgentRegression, ADamagedLogIsNeverSelectedAgainUntilResta
     fs::remove_all(dir);
 }
 
+// A checked-writes log is cleanable only up to the coverage of the verdict markers in its sealed segments; the marker over the
+// newest records is still in the active segment.  Such a log stays dirty but a pass over it ends where it started, and it won
+// the filthiest-first selection every cycle: the cleaner thread spun on it and never reached another log.  The agent runs one
+// such pass, then leaves the log until its inputs change.
+TEST(CompactionCleanerAgentRegression, ALogHeldAtItsVerdictCoverageIsNotRescannedEveryCycleRegression) {
+    namespace cr = rune::storage::control_record;
+    auto dir = cp6TempDir("cp_verdict_held");
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(1841, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->becomeLeader(1, {1});
+
+    const auto control = [&](std::vector<uint8_t> b, int64_t offset) {
+        for (int i = 0; i < 8; ++i) b[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(offset) >> (8 * i));
+        log.append(b, offset);
+    };
+    const auto change = [&](int64_t offset) {
+        const std::vector<cr::ChangeMember> members{cr::ChangeMember{7, 3, 99}};
+        std::vector<uint8_t> b(cr::changeBatchBytes(static_cast<uint16_t>(members.size())));
+        (void)cr::buildConstraintSetChange(b, 1, members);
+        control(std::move(b), offset);
+    };
+    const auto marker = [&](int64_t offset, int64_t from, int64_t through) {
+        std::vector<uint8_t> b(cr::markerBatchBytes(0));
+        (void)cr::buildVerdictMarker(b, cr::MarkerHeader{from, through, 1, 0}, {});
+        control(std::move(b), offset);
+    };
+    const auto data = [&](int64_t from, int64_t to) {
+        for (int64_t o = from; o < to; ++o) log.append(cp6Batch(o, "k" + std::to_string(o), "v"), o);
+    };
+    change(0);
+    data(1, 4);
+    marker(4, 1, 4);   // the verdicts known: [1, 4)
+    data(5, 17);       // sealed, no verdict marker over them yet
+    replica->onLeaderLogAppended();
+    ASSERT_GE(log.segmentBaseOffsets().size(), 4u);
+
+    // A second, plainly dirty log registered after it: the one the held log used to starve.
+    auto dirB = cp6TempDir("cp_verdict_held_other");
+    Log logB(dirB.string(), /*rollBytes=*/128);
+    auto replicaB = std::make_unique<PartitionReplica>(
+        makeCompactConfig(1842, 0.0), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &logB, &transport);
+    replicaB->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    replicaB->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    replicaB->becomeLeader(1, {1});
+    for (int v = 0; v < 60; ++v) logB.append(cp6Batch(v, "k" + std::to_string(v % 5), "v" + std::to_string(v)), v);
+    replicaB->onLeaderLogAppended();
+
+    rune::node::ReplicaRegistry registry;
+    PartitionReplica* raw = replica.get();
+    PartitionReplica* rawB = replicaB.get();
+    registry.add(1841, 0, std::move(replica));
+    registry.add(1842, 0, std::move(replicaB));
+    rune::node::LogCleanerAgent agent(&registry, /*cycleBudgetBytes=*/0);
+    int64_t now = 1'000'000;
+    for (int i = 0; i < 40; ++i, now += 1'000'000) agent.doWork(now);
+    EXPECT_GT(rawB->lastCleanOffset(), 0) << "the log held at its verdict coverage starved the other log";
+    EXPECT_LE(agent.passesStartedForTest(), 12u) << "the log held at its verdict coverage was scanned again every cycle";
+    EXPECT_EQ(raw->lastCleanOffset(), 4) << "the pass cleans up to the marker's coverage, not beyond";
+
+    marker(17, 5, 17);   // the verdicts for the rest arrive
+    data(18, 30);
+    raw->onLeaderLogAppended();
+    const uint64_t before = agent.passesStartedForTest();
+    for (int i = 0; i < 5; ++i, now += 1'000'000) agent.doWork(now);
+    EXPECT_GT(agent.passesStartedForTest(), before) << "the log was not cleaned again once its inputs changed";
+    EXPECT_GT(raw->lastCleanOffset(), 4);
+    fs::remove_all(dir);
+    fs::remove_all(dirB);
+}
+
 // PR #851 review re-attack (edf94a73, #840): the uncleanable mark outlives the damage it was set for.  The log is
 // truncated below the damaged segment (an unclean-election / divergent-follower truncation; a namespace TRUNCATE takes the
 // same in-place path), so every remaining and every new segment is intact, yet the agent never selects the log again until
@@ -1890,7 +1967,7 @@ TEST(CompactionCleanerAgent, SegmentsCoalesceIntoFewerGroups) {
 
     // With rollBytes=4096: 20×100B=2000B < 4096B → all coalesce into 1 group.
     auto groups4096 = rune::storage::LogCleaner::groupSegmentsBySize(
-        bases, sizes, /*segmentRollBytes=*/4096);
+        bases, sizes, /*endOffset=*/N * 10, /*segmentRollBytes=*/4096);
 
     EXPECT_EQ(groups4096.size(), 1u)
         << "With rollBytes=4096 and 20×100B segments (total=2000B < 4096B), "
@@ -1906,7 +1983,7 @@ TEST(CompactionCleanerAgent, SegmentsCoalesceIntoFewerGroups) {
     // With rollBytes=300: each group holds at most 3 segments (3×100=300).
     // ceil(20/3) = 7 groups.
     auto groups300 = rune::storage::LogCleaner::groupSegmentsBySize(
-        bases, sizes, /*segmentRollBytes=*/300);
+        bases, sizes, /*endOffset=*/N * 10, /*segmentRollBytes=*/300);
 
     const std::size_t expectedGroups300 = static_cast<std::size_t>((N + 2) / 3);
     EXPECT_EQ(groups300.size(), expectedGroups300)
@@ -2872,6 +2949,72 @@ std::vector<uint8_t> r1BatchAt(Log& log, int64_t off) {
 }
 } // namespace
 
+// A held log can turn productive with the clock alone: a COMMIT marker stamped with a delete horizon is removed once the horizon
+// passes, with nothing else about the log changing.  The agent must look again after the retention period.
+TEST(CompactionCleanerAgentRegression, AHeldLogIsCleanedAgainWhenAMarkerHorizonPassesRegression) {
+    namespace cr = rune::storage::control_record;
+    auto dir = cp6TempDir("cp_verdict_held_horizon");
+    Log log(dir.string(), /*rollBytes=*/128);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(1843, 0.0);
+    cfg.deleteRetentionMs = 200;
+    auto owned = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    owned->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    owned->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    owned->becomeLeader(1, {1});
+    PartitionReplica* raw = owned.get();
+    const auto control = [&](std::vector<uint8_t> b, int64_t offset) {
+        for (int i = 0; i < 8; ++i) b[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(offset) >> (8 * i));
+        log.append(b, offset);
+    };
+    const std::vector<cr::ChangeMember> members{cr::ChangeMember{7, 3, 99}};
+    std::vector<uint8_t> change(cr::changeBatchBytes(static_cast<uint16_t>(members.size())));
+    (void)cr::buildConstraintSetChange(change, 1, members);
+    control(std::move(change), 0);
+    constexpr int64_t kPid = 9;
+    log.append(r1Txn(1, "a", "1", kPid, 0, 0), 1);
+    log.append(r1Marker(2, kPid, 0, true), 2);
+    log.append(r1Txn(3, "a", "2", kPid, 0, 1), 3);
+    log.append(r1Marker(4, kPid, 0, true), 4);   // the producer's last batch
+    std::vector<uint8_t> verdict(cr::markerBatchBytes(0));
+    (void)cr::buildVerdictMarker(verdict, cr::MarkerHeader{1, 5, 1, 0}, {});
+    control(std::move(verdict), 5);
+    for (int64_t o = 6; o < 18; ++o) log.append(cp6Batch(o, "k" + std::to_string(o), "v"), o);   // sealed, past the coverage
+    raw->onLeaderLogAppended();
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(1843, 0, std::move(owned));
+    Cp6MinimalConsensusAgent consensus;
+    rune::node::NodeRuntimeAgent duty(consensus, nullptr, nullptr, nullptr, &registry, nullptr);   // installs the cleaner's outputs
+    rune::node::LogCleanerAgent agent(&registry, /*cycleBudgetBytes=*/0);
+    int64_t wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    agent.setNowForTest([&] { return wallMs; });
+    int64_t now = 2'000'000;
+    const auto cycles = [&](int n) {
+        for (int i = 0; i < n; ++i, now += 1'000'000) {
+            duty.doWork(now);
+            raw->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+            raw->publishCleanerVerdictBound(PartitionReplica::kNoCleanerLso);
+            agent.doWork(now);
+            duty.doWork(now);
+        }
+        log.reloadSegments();
+    };
+    const auto markerState = [&] {
+        const auto b = r1BatchAt(log, 2);
+        if (b.empty()) return std::string("gone");
+        return std::string(RecordBatchReader(b.data(), b.size()).hasDeleteHorizon() ? "stamped" : "plain");
+    };
+    cycles(12);
+    EXPECT_EQ(markerState(), "stamped") << "the superseded COMMIT marker is stamped with its delete horizon first";
+    wallMs += 400;
+    cycles(12);
+    EXPECT_EQ(markerState(), "gone") << "the expired COMMIT marker was never removed";
+    fs::remove_all(dir);
+}
+
 // ===========================================================================
 // D3b fix round 1 (1): a marker is removed only once EVERY assigned replica —
 // not just the ISR — has fetched past it.  A replica outside the ISR that holds
@@ -3618,6 +3761,126 @@ TEST(CompactionCleanerAgentRegression, TruncateOfOtherLogCompletesDuringThrottle
     EXPECT_EQ(logB.logEndOffset(), 5);
     fs::remove_all(dirA);
     fs::remove_all(dirB);
+}
+
+// Part 06 Task 10 (fix round 2): an idle producer's batch on an autoincrement log holds that log's watermark for as long as the
+// producer lives, but selection measures the log from where its last pass ended - with nothing new it is not dirty, and another
+// log gets the next cycles.  RED: the held log's ratio stayed 1.0 and won every cycle.
+TEST(CompactionCleanerAgentRegression, HeldAutoIncWatermarkDoesNotStarveAnotherLogRegression) {
+    auto dirA = cp6TempDir("cw06_held_a");
+    auto dirB = cp6TempDir("cw06_held_b");
+    Log logA(dirA.string(), /*rollBytes=*/128);
+    Log logB(dirB.string(), /*rollBytes=*/128);
+    Cp6NullTransport transport;
+    {
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        RecordBatchBuilder b(0, nowMs);   // a live idempotent producer's only batch: protected
+        b.setProducerId(77);
+        b.setProducerEpoch(0);
+        b.setBaseSequence(0);
+        b.append("idle", "v", nowMs);
+        logA.append(b.build(), 0);
+    }
+    for (int v = 1; v < 200; ++v) logA.append(cp6Batch(v, "hot", "v" + std::to_string(v)), v);
+    for (int v = 0; v < 200; ++v) logB.append(cp6Batch(v, "hot", "v" + std::to_string(v)), v);
+
+    auto cfgA = makeCompactConfig(611, 0.0);
+    cfgA.producerTailDepth = rune::storage::kRetryWindowSize;
+    auto cfgB = makeCompactConfig(612, 0.0);
+    PartitionReplica* raw[2] = {};
+    rune::node::ReplicaRegistry registry;
+    for (auto [cfg, log] : {std::pair{cfgA, &logA}, std::pair{cfgB, &logB}}) {
+        auto rep = std::make_unique<PartitionReplica>(cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, log, &transport);
+        rep->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+        rep->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+        rep->becomeLeader(1, {1});
+        rep->onLeaderLogAppended();
+        raw[log == &logA ? 0 : 1] = rep.get();
+        registry.add(cfg.topicId, 0, std::move(rep));
+    }
+    const auto basesB = logB.segmentBaseOffsets();
+    ASSERT_GE(basesB.size(), 3u);
+    raw[1]->setLastCleanOffset(basesB[basesB.size() / 2]);   // B is half clean: A (all dirty) is the filthier
+
+    rune::node::LogCleanerAgent cleaner(&registry);
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    const int beforeA = cp6CountLiveRecords(logA);
+    const int beforeB = cp6CountLiveRecords(logB);
+    for (int i = 0; i < 4; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        for (int j = 0; j < 1000 && (logA.cleanerSwapsPending() || logB.cleanerSwapsPending()); ++j)   // the owner installs one group per pass
+            dutyCycleAgent.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+    }
+    logA.reloadSegments();
+    logB.reloadSegments();
+    EXPECT_EQ(raw[0]->lastCleanOffset(), 0) << "the idle producer's batch holds A's watermark";
+    EXPECT_GT(raw[0]->cleanerProgress(), 0) << "A's pass ended above it";
+    EXPECT_LT(cp6CountLiveRecords(logA), beforeA) << "A was compacted";
+    EXPECT_LT(cp6CountLiveRecords(logB), beforeB) << "B was cleaned in a later cycle";
+    EXPECT_GT(raw[1]->lastCleanOffset(), basesB[basesB.size() / 2]);
+
+    fs::remove_all(dirA);
+    fs::remove_all(dirB);
+}
+
+// Part 06 Task 10 (fix round 3): a held log whose passes reached the cleaner's own limit (an open transaction here) is still
+// selected while the agent's bound lies above it; the pass then redoes a map from the held watermark, and where the passes ended
+// stays where it was.  RED: progress fell back to that map's end and the log was swept again from the watermark.
+TEST(CompactionCleanerAgentRegression, HeldAutoIncProgressNeverMovesBackRegression) {
+    auto dir = cp6TempDir("cw06_held_progress");
+    Log log(dir.string(), /*rollBytes=*/128);
+    Cp6NullTransport transport;
+    {
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        RecordBatchBuilder b(0, nowMs);   // a live idempotent producer's only batch: holds the watermark at 0
+        b.setProducerId(77);
+        b.setProducerEpoch(0);
+        b.setBaseSequence(0);
+        b.append("idle", "v", nowMs);
+        log.append(b.build(), 0);
+    }
+    constexpr int64_t kOpenTxn = 41;
+    for (int v = 1; v < kOpenTxn; ++v) log.append(cp6Batch(v, "key_" + std::to_string(v), "v"), v);
+    {
+        RecordBatchBuilder b(kOpenTxn, 1000);   // never committed: the cleaner's limit
+        b.setProducerId(88);
+        b.setProducerEpoch(0);
+        b.setBaseSequence(0);
+        b.setTransactional(true);
+        b.append("txn", "v", 1000);
+        log.append(b.build(), kOpenTxn);
+    }
+    for (int v = kOpenTxn + 1; v < kOpenTxn + 20; ++v) log.append(cp6Batch(v, "after", "v"), v);
+
+    auto cfg = makeCompactConfig(613, 0.0);
+    cfg.producerTailDepth = rune::storage::kRetryWindowSize;
+    auto rep = std::make_unique<PartitionReplica>(cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    rep->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // the agent's bound lies above the open txn
+    rep->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    rep->becomeLeader(1, {1});
+    rep->onLeaderLogAppended();
+    PartitionReplica* raw = rep.get();
+    rune::node::ReplicaRegistry registry;
+    registry.add(cfg.topicId, 0, std::move(rep));
+
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0,
+                                        /*dedupeBufferBytes=*/4 * static_cast<int64_t>(SkimpyOffsetMap::kEntryBytes));
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    int64_t prev = raw->cleanerProgress();
+    for (int i = 0; i < 60; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        for (int j = 0; j < 1000 && log.cleanerSwapsPending(); ++j) dutyCycleAgent.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        ASSERT_EQ(raw->lastCleanOffset(), 0) << "the idle producer holds the watermark";
+        EXPECT_GE(raw->cleanerProgress(), prev) << "cycle " << i;
+        prev = raw->cleanerProgress();
+    }
+    EXPECT_EQ(prev, kOpenTxn) << "the passes reached the open transaction";
+
+    fs::remove_all(dir);
 }
 
 // A log whose pass cannot advance must not starve the others (TypedRemoveRoutesAsSendForEveryKeyWidthShardRegression on CI:

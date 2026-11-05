@@ -13,6 +13,8 @@
 //
 // No std::function, no virtual call, no allocation on any of these types.
 
+#include <rune/protocol/CatalogTypes.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -73,7 +75,7 @@ enum class OpStatus : uint8_t {
     InvalidArgument, ///< the duty thread refused the op as malformed before sending it (payload = why)
     BrokerTooOld,    ///< checked writes: the seed broker is below kBrokerVersionCheckedWrites, so a View send was
                      ///< failed locally (nothing was sent)
-    StoredIdUnknown, ///< 13: reserved for key-0 creates (Part 06 documents and first returns it); keeps the enum without a hole
+    StoredIdUnknown, ///< 13: stored; its id is unknown (the retry fell outside the dedupe window)
     VerdictUnknown,  ///< 14: stored, but its verdicts are unknown (a View retry fell outside the broker's dedupe window)
     RecordsRejected, ///< 15: checked writes: a BATCH (a claimBatch of >= 2 records, a Tier-2 batch of >= 2, or a BatchAck of >= 2)
                      ///< was stored and judged, and one or more of its records was rejected.  value = the batch's base offset
@@ -138,6 +140,26 @@ static_assert(sizeof(Completion) == 40);
 [[nodiscard]] constexpr uint32_t constraintIdOf(const Completion& c) noexcept { return c.reserved0; }
 /// Checked writes: the broker-assigned id of a Send (aux), 0 = none.
 [[nodiscard]] constexpr uint64_t assignedKeyOf(const Completion& c) noexcept { return static_cast<uint64_t>(c.aux); }
+
+/// GetTopicSchema: aux = the schema version (bits 0-15); bit 16 set when the broker sent a key-features block, which then
+/// follows the descriptor blob in the payload as its 14 wire bytes (putTopicKeyFeatures).
+[[nodiscard]] constexpr int64_t schemaAuxOf(uint16_t version, bool hasKeyFeatures) noexcept {
+    return static_cast<int64_t>(version) | (hasKeyFeatures ? int64_t{1} << 16 : 0);
+}
+[[nodiscard]] constexpr bool schemaHasKeyFeatures(const Completion& c) noexcept { return ((c.aux >> 16) & 1) != 0; }
+/// The descriptor blob of a GetTopicSchema payload, without the key-features block.
+[[nodiscard]] constexpr std::span<const uint8_t> schemaBlobOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
+    return schemaHasKeyFeatures(c) && payload.size() >= rune::protocol::kTopicKeyFeaturesWireLen
+               ? payload.first(payload.size() - rune::protocol::kTopicKeyFeaturesWireLen) : payload;
+}
+/// The key features of a GetTopicSchema completion (the defaults when the broker sent none).
+[[nodiscard]] inline rune::protocol::TopicKeyFeatures schemaKeyFeaturesOf(const Completion& c, std::span<const uint8_t> payload) noexcept {
+    rune::protocol::TopicKeyFeatures f;
+    if (schemaHasKeyFeatures(c) && payload.size() >= rune::protocol::kTopicKeyFeaturesWireLen)
+        (void)rune::protocol::getTopicKeyFeatures(payload.data() + payload.size() - rune::protocol::kTopicKeyFeaturesWireLen,
+                                                  rune::protocol::kTopicKeyFeaturesWireLen, f);
+    return f;
+}
 
 /// One rejected record of a judged batch, decoded from its 8-byte wire entry (u16 record index, u16 code, u32 constraintId, LE).
 struct RecordVerdict {

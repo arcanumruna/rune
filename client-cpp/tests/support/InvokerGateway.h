@@ -70,6 +70,7 @@ struct InvokerGateway {
         int32_t baseSequence;
         int     endpoint;  // index of the endpoint that received it (0 = node)
         int16_t producerEpoch = -1;  // the frame's producer epoch (Task 16 fix round 1)
+        uint8_t partitionKnown = 1;  // the frame's partitionKnown
     };
     struct Endpoint {
         std::string channel;
@@ -470,6 +471,7 @@ struct InvokerGateway {
     uint16_t schemaVersion  = 1;
     uint16_t schemaErrorCode = 0;
     std::vector<uint8_t> schemaBlob;  // the GetTopicSchema descriptor blob
+    std::optional<rune::protocol::TopicKeyFeatures> schemaKeyFeatures;  // the GetTopicSchema reply's key-features block
     int defines = 0;
     int schemaGets = 0;
     std::vector<int64_t> subscribeCorrIds;  // correlationIds of the Subscribes received
@@ -2033,6 +2035,7 @@ private:
             Produced pr{pv->topicId, pv->partition, pv->sessionId, pv->correlationId,
                         r.recordCount(), r.baseSequence(), endpoint};
             pr.producerEpoch = pv->producerEpoch;
+            pr.partitionKnown = pv->partitionKnown;
             produced.push_back(pr);
             if (keepValues) {
                 auto& vs = values[pv->partition];
@@ -2197,6 +2200,8 @@ private:
             r.errorCode      = schemaErrorCode;
             r.descriptorBlob = schemaBlob.data();
             r.descriptorLen  = static_cast<uint32_t>(schemaBlob.size());
+            r.hasKeyFeatures = schemaKeyFeatures.has_value();
+            if (schemaKeyFeatures) r.keyFeatures = *schemaKeyFeatures;
             // Task 19: a nonzero requestedFingerprint selects by fingerprint
             // (the real broker's Task 13/18 behavior).  This stub only knows
             // one materialized version (schemaBlob/schemaVersion), so a

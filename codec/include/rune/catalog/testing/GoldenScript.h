@@ -487,4 +487,50 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
     return std::move(b).take();
 }
 
+/// The 5 formatVer-3 autoincrement golden events, offsets 0..4, all in the default namespace
+/// (tests/catalog/golden/v3/autoinc.rcat):
+///    0 CreateTopic user (uint64 key, autoincrement)   1 CreateTopic character (uint64 key, autoincrement, reserve 128)
+///    2 AlterSchema ADD on character   3 AlterTopicConfig delete.retention.ms on user
+///    4 CreateTopic ai32 (uint32 key, autoincrement, 3 partitions: the stored max is the type's)
+[[nodiscard]] inline std::vector<CatalogEvent> goldenScriptV3AutoInc() {
+    namespace cd = rune::codec;
+    golden_detail::ScriptBuilder b(kFormatV3);
+    auto topic = [](cd::DescriptorBuilder d, int32_t partitions, uint64_t max, uint32_t reserve) {
+        CreateTopicOps o;
+        o.partitions = partitions;
+        o.config.cleanupPolicy = 1;
+        const cd::Descriptor desc = d.build();
+        SchemaDef def{.keyField = desc.fields.front().name, .validate = true, .descriptorBlob = cd::serialize(desc),
+                      .nextTag = static_cast<uint16_t>(desc.fields.size())};
+        def.keyFeatures = {.keyIndex = true, .autoIncrement = true, .partitioner = rune::protocol::Partitioner::Modulo,
+                           .autoIncrementMax = max, .autoIncrementReserve = reserve};
+        o.schema = std::move(def);
+        return o;
+    };
+    constexpr uint64_t kMax53 = rune::protocol::kAutoIncrementMaxDefault;
+    {
+        cd::DescriptorBuilder d("user");
+        d.add("userId", cd::PrimType::UInt64, 1, /*isKey=*/true).add("provider", cd::PrimType::UInt16)
+            .addFixedStr("subject", 64).add("createdAt", cd::PrimType::Int64);
+        b.createTopic("user", topic(std::move(d), 1, kMax53, rune::protocol::kAutoIncrementReserveDefault),
+                      "CREATE TOPIC user (userId UINT64 KEY, provider UINT16, subject STRING(64), createdAt INT64) WITH (autoincrement=true, cleanup.policy=compact)");
+    }
+    {
+        cd::DescriptorBuilder d("character");
+        d.add("characterId", cd::PrimType::UInt64, 1, /*isKey=*/true).add("userId", cd::PrimType::UInt64)
+            .addFixedStr("name", 16).add("createdAt", cd::PrimType::Int64);
+        b.createTopic("character", topic(std::move(d), 1, kMax53, 128),
+                      "CREATE TOPIC character (characterId UINT64 KEY, userId UINT64, name STRING(16), createdAt INT64) WITH (autoincrement=true, autoincrement.reserve=128, cleanup.policy=compact)");
+    }
+    b.alterSchema("character", {golden_detail::addOp("level", cd::PrimType::Int32)}, "ALTER TOPIC character ADD level INT32");
+    b.alterConfig("user", {{ConfigKey::DeleteRetentionMs, 3'600'000}}, "ALTER TOPIC user SET (delete.retention.ms=3600000)");
+    {
+        cd::DescriptorBuilder d("ai32");
+        d.add("id", cd::PrimType::UInt32, 1, /*isKey=*/true);
+        b.createTopic("ai32", topic(std::move(d), 3, 0xFFFF'FFFFull, rune::protocol::kAutoIncrementReserveDefault),
+                      "CREATE TOPIC ai32 (id UINT32 KEY) PARTITIONS 3 WITH (autoincrement=true, cleanup.policy=compact)");
+    }
+    return std::move(b).take();
+}
+
 } // namespace rune::catalog::testing

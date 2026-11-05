@@ -938,11 +938,18 @@ public:
     /// Words [first, first + n) of table `tableId`, the table resized to `total` words (a created / dropped object).
     /// Cold (DDL rate); a grown table allocates here, on the lifecycle ring, never on the produce path.
     bool patchWriteTable(int64_t tableId, uint64_t first, uint64_t total, const uint8_t* words, std::size_t n) {
-        if (static_cast<uint64_t>(tableId) >= kMaxWritePermTables || first > total || n > total - first) return false;
-        WritePermTable& t = permTables_[static_cast<std::size_t>(tableId)];
-        if (t.bits.size() != total) t.bits.resize(static_cast<std::size_t>(total), 0);
-        if (n != 0) std::memcpy(t.bits.data() + first, words, n * 8);   // little-endian hosts only
+        if (static_cast<uint64_t>(tableId) >= kMaxWritePermTables) return false;
+        return patchBits_(permTables_[static_cast<std::size_t>(tableId)].bits, first, total, words, n);
+    }
+    /// The IMPORT bitmap of table `tableId`: swapped in whole / patched like the WRITE one.
+    bool installImportGrants(int64_t tableId, std::vector<uint64_t>& words) noexcept {
+        if (static_cast<uint64_t>(tableId) >= kMaxWritePermTables) return false;
+        permTables_[static_cast<std::size_t>(tableId)].importBits.swap(words);
         return true;
+    }
+    bool patchImportTable(int64_t tableId, uint64_t first, uint64_t total, const uint8_t* words, std::size_t n) {
+        if (static_cast<uint64_t>(tableId) >= kMaxWritePermTables) return false;
+        return patchBits_(permTables_[static_cast<std::size_t>(tableId)].importBits, first, total, words, n);
     }
     /// Session `sessionId` now uses table `tableId` (-2: suspended ReadOnly, other < 0: deny everything).  False =
     /// unknown session / bad id.
@@ -965,6 +972,7 @@ public:
         for (std::size_t i = 0; i < kMaxSessions; ++i)
             if (grants_[i].table == t) grants_[i].table = denyWriteTable();
         t->bits.clear();
+        t->importBits.clear();
         t->grantAll = false;
         return true;
     }
@@ -1006,6 +1014,12 @@ private:
             if (keys_[i] == sid) return i;
         }
         return kNone;
+    }
+    static bool patchBits_(std::vector<uint64_t>& bits, uint64_t first, uint64_t total, const uint8_t* words, std::size_t n) {
+        if (first > total || n > total - first) return false;
+        if (bits.size() != total) bits.resize(static_cast<std::size_t>(total), 0);
+        if (n != 0) std::memcpy(bits.data() + first, words, n * 8);   // little-endian hosts only
+        return true;
     }
     static void resetGrants_(WriteGrantSlot& g) noexcept { g.table = denyWriteTable(); g.epoch = 0; g.ownerTag = 0; }
     std::size_t insert_(int64_t sid) noexcept {

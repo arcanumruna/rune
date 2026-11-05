@@ -7,9 +7,11 @@
 #include <rune/client/producer/BatchBuilder.h>
 #include <rune/client/Completions.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -61,7 +63,7 @@ Producer::Producer(producer::ProducerImpl* impl) noexcept
 {}
 
 Producer::Producer(Producer&& o) noexcept
-    : impl_(std::exchange(o.impl_, nullptr)), viewByte_(o.viewByte_)
+    : impl_(std::exchange(o.impl_, nullptr)), viewByte_(o.viewByte_), sticky_(o.sticky_), stickyUsed_(o.stickyUsed_)
 {}
 
 Producer& Producer::operator=(Producer&& o) noexcept {
@@ -69,6 +71,8 @@ Producer& Producer::operator=(Producer&& o) noexcept {
         release_();  // the current producer: closeImmediately + released
         impl_ = std::exchange(o.impl_, nullptr);
         viewByte_ = o.viewByte_;
+        sticky_     = o.sticky_;
+        stickyUsed_ = o.stickyUsed_;
     }
     return *this;
 }
@@ -142,9 +146,18 @@ namespace {
 } // namespace
 
 // The one send body (T15b M3): the partition is computed by the caller, once.
-const char* Producer::intentRefusal_(TopicHandle topic, std::span<const uint8_t> value,
+const char* Producer::intentRefusal_(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                      WriteIntent intent) const noexcept {
     const bool viewAcks = impl_->viewAcks();
+    if (topic.partitioner == rune::protocol::Partitioner::Modulo) {
+        if (isKeyZeroCreate(topic, key, intent)) {
+            const Acks acks = impl_->config().acks;
+            if (acks == Acks::None) return "autoincrement creates need an idempotent producer";
+            if (!has(acks, Acks::All)) return "autoincrement creates need acks All";
+            return value.empty() ? "an insert needs a value" : nullptr;
+        }
+        if (intent == WriteIntent::Upsert && !value.empty()) return "an autoincrement topic takes no plain upserts";
+    }
     if (intent == WriteIntent::Upsert) {
         return viewAcks && topic.kind == TopicKind::Raw ? "acks View needs a typed topic" : nullptr;
     }
@@ -155,20 +168,48 @@ const char* Producer::intentRefusal_(TopicHandle topic, std::span<const uint8_t>
     return nullptr;
 }
 
+int32_t Producer::partitionOf_(TopicHandle topic, const Key& key, WriteIntent intent) noexcept {
+    if (!isKeyZeroCreate(topic, key, intent)) [[likely]] return key.partition(topic.partitionCount, topic.partitioner);
+    for (const StickyRun& r : std::span(sticky_.data(), stickyUsed_)) {
+        if (r.topicId == topic.topicId) return r.partition % std::max(topic.partitionCount, 1);
+    }
+    return 0;
+}
+
+void Producer::stickyAdvance_(TopicHandle topic) noexcept {
+    const int32_t count = std::max(topic.partitionCount, 1);
+    for (StickyRun& r : std::span(sticky_.data(), stickyUsed_)) {
+        if (r.topicId != topic.topicId) continue;
+        if (++r.sent >= kKeyZeroStickyRun) {
+            r.sent      = 0;
+            r.partition = (r.partition % count + 1) % count;
+        }
+        return;
+    }
+    // Topics past kStickyTopics keep partition 0 (valid, just not spread).
+    if (stickyUsed_ < kStickyTopics) sticky_[stickyUsed_++] = StickyRun{topic.topicId, 0, 1};
+}
+
 SendResult Producer::trySendPart_(TopicHandle topic, int32_t part, const Key& key,
                                   std::span<const uint8_t> value, WriteIntent intent) noexcept {
     producer::ProducerImpl* impl = impl_;
     if (needsIntentCheck_(topic, intent)) [[unlikely]] {
-        if (intentRefusal_(topic, value, intent) != nullptr) return SendResult::WriteNotAllowed;
+        if (intentRefusal_(topic, key, value, intent) != nullptr) return SendResult::WriteNotAllowed;
     }
+    const uint32_t idStride = idStrideOf_(topic, key, intent);
+    const bool routed = part == kRouteByKey;
+    if (routed) part = partitionOf_(topic, key, intent);
     Completions* bq = impl->batchAckCq();
     if (bq == nullptr) [[likely]] {
-        return impl->trySubmit(topic.topicId, part, key, value, 0, nullptr, intentBits(intent));
+        const SendResult r = impl->trySubmit(topic.topicId, part, key, value, 0, nullptr, intentBits(intent), idStride);
+        if (r == SendResult::Ok && routed && idStride != 0) [[unlikely]] stickyAdvance_(topic);
+        return r;
     }
     if (impl->gateRefusesBeforeCredit()) [[unlikely]] return SendResult::NotInTransaction;  // #339: before any credit
     const SendResult u = reserveBatchUnit(*bq);
     if (u != SendResult::Ok) return u;
-    const SendResult r = impl->trySubmit(topic.topicId, part, key, value, 0, nullptr, intentBits(intent));
+    const SendResult r = impl->trySubmit(topic.topicId, part, key, value, 0, nullptr, intentBits(intent), idStride);
+    if (r == SendResult::Ok && routed && idStride != 0) [[unlikely]] stickyAdvance_(topic);
     if (r == SendResult::Ok) {
         ++bq->producerIssued_;
     } else {
@@ -183,7 +224,7 @@ SendResult Producer::trySend(TopicHandle            topic,
                              WriteIntent            intent) noexcept
 {
     if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
-    return trySendPart_(topic, key.partition(topic.partitionCount), key, value, intent);
+    return trySendPart_(topic, kRouteByKey, key, value, intent);
 }
 
 SendResult Producer::trySendTo(TopicHandle topic, int32_t partition, const Key& key,
@@ -201,7 +242,11 @@ void Producer::send(TopicHandle            topic,
     if (!impl_ || !topic.valid()) {
         throw std::invalid_argument("Producer::send: invalid topic handle");
     }
-    sendTo(topic, key.partition(topic.partitionCount), key, value, intent);
+    if (needsIntentCheck_(topic, intent)) [[unlikely]] {
+        if (const char* why = intentRefusal_(topic, key, value, intent)) throw std::invalid_argument(why);
+    }
+    sendTo(topic, partitionOf_(topic, key, intent), key, value, intent);
+    if (isKeyZeroCreate(topic, key, intent)) [[unlikely]] stickyAdvance_(topic);
 }
 
 void Producer::sendTo(TopicHandle topic, int32_t part, const Key& key, std::span<const uint8_t> value,
@@ -213,7 +258,7 @@ void Producer::sendTo(TopicHandle topic, int32_t part, const Key& key, std::span
         throw std::invalid_argument("Producer::sendTo: partition out of range");
     }
     if (needsIntentCheck_(topic, intent)) [[unlikely]] {
-        if (const char* why = intentRefusal_(topic, value, intent)) throw std::invalid_argument(why);
+        if (const char* why = intentRefusal_(topic, key, value, intent)) throw std::invalid_argument(why);
     }
     if (impl_->batchAckCq() != nullptr) [[unlikely]] {
         // Credit-reserving path: retry back-pressure only (QueueFull is the
@@ -226,9 +271,10 @@ void Producer::sendTo(TopicHandle topic, int32_t part, const Key& key, std::span
             impl_->blockingWaitStep(w);
         }
     }
-    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, 0, nullptr, intentBits(intent));
+    const uint32_t idStride = idStrideOf_(topic, key, intent);
+    const SendResult r = impl_->trySubmit(topic.topicId, part, key, value, 0, nullptr, intentBits(intent), idStride);
     if (r == SendResult::Ok) [[likely]] return;
-    impl_->sendBlocking(r, topic.topicId, part, key, value, intentBits(intent));
+    impl_->sendBlocking(r, topic.topicId, part, key, value, intentBits(intent), idStride);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +285,7 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
                              Completions& cq, Token token, WriteIntent intent) noexcept {
     if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
     if (needsIntentCheck_(topic, intent)) [[unlikely]] {
-        if (intentRefusal_(topic, value, intent) != nullptr) return SendResult::WriteNotAllowed;
+        if (intentRefusal_(topic, key, value, intent) != nullptr) return SendResult::WriteNotAllowed;
     }
     if (token > kMaxToken || cq.client_ == nullptr || cq.client_ != impl_->hooks().ctx ||
         cq.ring_ == nullptr) {
@@ -260,9 +306,11 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
         }
     }
     const uint64_t h = producer::ackhandle::forCq(cq.cqRef_, token);
-    const SendResult r = impl_->trySubmit(topic.topicId, key.partition(topic.partitionCount), key, value,
-                                          static_cast<int64_t>(h), nullptr, intentBits(intent));
+    const uint32_t idStride = idStrideOf_(topic, key, intent);
+    const SendResult r = impl_->trySubmit(topic.topicId, partitionOf_(topic, key, intent), key, value,
+                                          static_cast<int64_t>(h), nullptr, intentBits(intent), idStride);
     if (r == SendResult::Ok) [[likely]] {
+        if (idStride != 0) [[unlikely]] stickyAdvance_(topic);
         ++cq.producerIssued_;
         if (bq != nullptr) ++bq->producerIssued_;
         return r;
@@ -277,7 +325,7 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
                              AckToken token, WriteIntent intent) noexcept {
     if (!impl_ || !topic.valid()) return SendResult::InvalidTopic;
     if (needsIntentCheck_(topic, intent)) [[unlikely]] {
-        if (intentRefusal_(topic, value, intent) != nullptr) return SendResult::WriteNotAllowed;
+        if (intentRefusal_(topic, key, value, intent) != nullptr) return SendResult::WriteNotAllowed;
     }
     if (token.token > kMaxToken) return SendResult::InvalidArgument;
     Completions* bq = impl_->batchAckCq();
@@ -287,8 +335,10 @@ SendResult Producer::trySend(TopicHandle topic, const Key& key, std::span<const 
         if (u != SendResult::Ok) return u;
     }
     const uint64_t h = producer::ackhandle::forHandler(token.token);
-    const SendResult r = impl_->trySubmit(topic.topicId, key.partition(topic.partitionCount), key, value,
-                                          static_cast<int64_t>(h), nullptr, intentBits(intent));
+    const uint32_t idStride = idStrideOf_(topic, key, intent);
+    const SendResult r = impl_->trySubmit(topic.topicId, partitionOf_(topic, key, intent), key, value,
+                                          static_cast<int64_t>(h), nullptr, intentBits(intent), idStride);
+    if (r == SendResult::Ok && idStride != 0) [[unlikely]] stickyAdvance_(topic);
     if (bq != nullptr) {
         if (r == SendResult::Ok) ++bq->producerIssued_;
         else bq->unreserve(producer::kAckRecordBytes);
@@ -314,21 +364,21 @@ void sendRetrying(producer::ProducerImpl& impl, Try&& attempt) {
 void Producer::send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, Completions& cq,
                     Token token, WriteIntent intent) {
     if (!impl_ || !topic.valid()) throw std::invalid_argument("Producer::send: invalid topic handle");
-    if (const char* why = intentRefusal_(topic, value, intent)) throw std::invalid_argument(why);
+    if (const char* why = intentRefusal_(topic, key, value, intent)) throw std::invalid_argument(why);
     sendRetrying(*impl_, [&] { return trySend(topic, key, value, cq, token, intent); });
 }
 
 void Producer::send(TopicHandle topic, const Key& key, std::span<const uint8_t> value, AckToken token,
                     WriteIntent intent) {
     if (!impl_ || !topic.valid()) throw std::invalid_argument("Producer::send: invalid topic handle");
-    if (const char* why = intentRefusal_(topic, value, intent)) throw std::invalid_argument(why);
+    if (const char* why = intentRefusal_(topic, key, value, intent)) throw std::invalid_argument(why);
     sendRetrying(*impl_, [&] { return trySend(topic, key, value, token, intent); });
 }
 
 Completion Producer::sendAndWait(TopicHandle topic, const Key& key, std::span<const uint8_t> value, WriteIntent intent,
                                  std::chrono::nanoseconds timeout) {
     if (!impl_ || !topic.valid()) throw std::invalid_argument("Producer::sendAndWait: invalid topic handle");
-    if (const char* why = intentRefusal_(topic, value, intent)) throw std::invalid_argument(why);
+    if (const char* why = intentRefusal_(topic, key, value, intent)) throw std::invalid_argument(why);
     const auto& hk = impl_->hooks();
     if (hk.sendAndWait == nullptr) {
         throw std::logic_error("Producer::sendAndWait: no Client to wait on (use the token form)");
@@ -406,7 +456,7 @@ Claim Producer::claimPart_(TopicHandle topic, int32_t part, const Key& key, uint
 
 Claim Producer::tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen) noexcept {
     if (!impl_ || !topic.valid()) return Claim(SendResult::InvalidTopic);
-    return claimPart_(topic, key.partition(topic.partitionCount), key, valueLen, 0, nullptr);
+    return claimPart_(topic, key.partition(topic.partitionCount, topic.partitioner), key, valueLen, 0, nullptr);
 }
 
 Claim Producer::tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, Completions& cq,
@@ -419,14 +469,14 @@ Claim Producer::tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, C
     if (impl_->gateRefusesBeforeCredit()) [[unlikely]] return Claim(SendResult::NotInTransaction);  // #339
     const OpResult rr = cq.reserve(producer::kAckRecordBytes);
     if (rr != OpResult::Accepted) return Claim(mapReserve(rr));
-    return claimPart_(topic, key.partition(topic.partitionCount), key, valueLen,
+    return claimPart_(topic, key.partition(topic.partitionCount, topic.partitioner), key, valueLen,
                       producer::ackhandle::forCq(cq.cqRef_, token), &cq);
 }
 
 Claim Producer::tryClaim(TopicHandle topic, const Key& key, uint32_t valueLen, AckToken token) noexcept {
     if (!impl_ || !topic.valid()) return Claim(SendResult::InvalidTopic);
     if (token.token > kMaxToken) return Claim(SendResult::InvalidArgument);
-    return claimPart_(topic, key.partition(topic.partitionCount), key, valueLen,
+    return claimPart_(topic, key.partition(topic.partitionCount, topic.partitioner), key, valueLen,
                       producer::ackhandle::forHandler(token.token), nullptr);
 }
 
@@ -461,7 +511,7 @@ BatchClaim Producer::claimBatchPart_(TopicHandle topic, int32_t part, const Key&
 
 BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen) noexcept {
     if (!impl_ || !topic.valid()) return BatchClaim(SendResult::InvalidTopic);
-    return claimBatchPart_(topic, key.partition(topic.partitionCount), key, n, recLen, 0, nullptr);
+    return claimBatchPart_(topic, key.partition(topic.partitionCount, topic.partitioner), key, n, recLen, 0, nullptr);
 }
 
 BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen, Completions& cq,
@@ -481,7 +531,7 @@ BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, u
     if (!impl_->batchCompletionFits(cq, n)) return BatchClaim(SendResult::MessageTooLarge);
     const OpResult rr = cq.reserve(cqBytes);
     if (rr != OpResult::Accepted) return BatchClaim(mapReserve(rr));
-    return claimBatchPart_(topic, key.partition(topic.partitionCount), key, n, recLen,
+    return claimBatchPart_(topic, key.partition(topic.partitionCount, topic.partitioner), key, n, recLen,
                            producer::ackhandle::forCq(cq.cqRef_, token), &cq);
 }
 
@@ -489,7 +539,7 @@ BatchClaim Producer::claimBatch(TopicHandle topic, const Key& key, uint32_t n, u
                                 AckToken token) noexcept {
     if (!impl_ || !topic.valid()) return BatchClaim(SendResult::InvalidTopic);
     if (token.token > kMaxToken) return BatchClaim(SendResult::InvalidArgument);
-    return claimBatchPart_(topic, key.partition(topic.partitionCount), key, n, recLen,
+    return claimBatchPart_(topic, key.partition(topic.partitionCount, topic.partitioner), key, n, recLen,
                            producer::ackhandle::forHandler(token.token), nullptr);
 }
 
@@ -509,7 +559,7 @@ BatchBuilder Producer::batch(TopicHandle topic, const Key& key) {
         // Best: throw here so the caller knows immediately.
         throw std::invalid_argument("Producer::batch: invalid topic handle");
     }
-    const int32_t part = key.partition(topic.partitionCount);
+    const int32_t part = key.partition(topic.partitionCount, topic.partitioner);
     return BatchBuilder(impl_, topic.topicId, part);  // borrows: must not outlive this Producer
 }
 

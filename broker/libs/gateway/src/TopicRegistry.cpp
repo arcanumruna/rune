@@ -346,7 +346,7 @@ TopicRegistry::partitionForKey(int32_t topicId,
     const rune::node::TopicSpec* spec = topic(topicId);
     if (spec == nullptr) spec = viewSinkSpec(topicId);   // GetViewRow's key -> partition (VLS B.2)
     if (spec == nullptr) return -1;   // not served here
-    return rune::protocol::partitionForKey(key, spec->partitionCount);
+    return rune::protocol::partitionFor(key, spec->partitionCount, spec->partitioner);
 }
 
 // ---------------------------------------------------------------------------

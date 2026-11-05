@@ -67,6 +67,32 @@ TEST_P(CheckedWritesStressRegression, KeyIndexSeededClusterHoldsTheInvariants) {
     std::printf("seed %d: %s\n", seed, d.keyIndexTally().c_str());
 }
 
+TEST_P(CheckedWritesStressRegression, AutoIncSeededClusterHoldsTheInvariants) {
+    const int seed = GetParam();
+    if (seed > 8) GTEST_SKIP() << "the autoincrement run covers seeds 1-8";
+    // The cleaner keeps a live producer's last 32 batches whole (spec 6.6), and no writer here reaches 32: only expired producers leave
+    // anything to compact.  Writers are rebuilt after every fault, so old pids expire and are compacted mid-run, the last ones at rest.
+    // Only the cleaner reads this expiry; the producer state still dedupes those pids.
+    ThreeNodes cluster = ThreeNodes::startWith("cw06_" + std::to_string(seed), [](rune::node::NodeConfig& cfg) {
+        cfg.verdictIntervalMs = 20;
+        cfg.producerIdExpirationMs = 3'000;
+    });
+    CheckedWritesStressDriver d(cluster, static_cast<uint64_t>(seed), false, true);
+    d.setUp();
+    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    for (int step = 0; step < stepsPerSeed() && !HasFatalFailure(); ++step) {
+        SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step));
+        d.step();
+    }
+    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    d.quiesce();
+    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    std::string failed;
+    EXPECT_TRUE(d.checkAll(&failed)) << failed;
+    EXPECT_EQ(d.autoIncWorkShortfall(), "") << "seed " << seed;
+    std::printf("seed %d: %s\n", seed, d.autoIncTally().c_str());
+}
+
 INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesStressRegression, ::testing::Range(1, 13));
 
 // Only a leader compacts, and it may drop a committed rejected record before the history reads its log: the record is still on the

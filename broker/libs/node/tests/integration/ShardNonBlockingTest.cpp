@@ -1367,6 +1367,9 @@ TEST(StorageFailStopRegression, NamespaceDiskScanSkipsAReplicaMovedByAQueuedSetO
     w.applyNsSlotAssignDirect(3, 7, lim);
     w.applyNsSlotAssignDirect(4, 8, lim);
     w.setOwnedDirect(Worker::OwnedSet{&moved, &kept});
+    const rune::protocol::NamespaceLimits limits;
+    w.applyNsSlotAssignDirect(3, 7, limits);   // #724: the scan counts a log only while its slot holds its nsId
+    w.applyNsSlotAssignDirect(4, 8, limits);
     WorkerOp own;
     own.type = WorkerOp::Type::SetOwnership;
     own.ownedSet = {&kept};

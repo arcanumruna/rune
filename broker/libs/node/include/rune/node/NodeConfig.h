@@ -61,6 +61,7 @@
 #include <rune/node/StorageFormat.h>
 #include <rune/node/IdleShape.h>
 #include <rune/node/PersistenceMode.h>
+#include <rune/protocol/CatalogTypes.h>
 #include <rune/protocol/NamespaceLimits.h>
 #include <rune/node/PemFile.h>   // Task 9: loadPemFile() — re-exported here for config callers
 
@@ -156,6 +157,11 @@ struct TopicSpec {
     // registered schema for this topic before appending.  Default false (no validation)
     // so all existing topics are parity-unchanged until the caller opts in.
     bool            validate = false;
+
+    /// Checked writes Part 06: the topic's key -> partition function, and whether the broker mints its keys.
+    /// A view sink carries its source's partitioner.
+    rune::protocol::Partitioner partitioner   = rune::protocol::Partitioner::Fnv1a;
+    bool                        autoIncrement = false;
 };
 
 struct PeerConfig {

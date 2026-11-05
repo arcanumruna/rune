@@ -226,6 +226,9 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   (thousands of rejections, up to 32,824 bytes) is offered rather than claimed; ack publications have a term of at least 512 KiB.
 - **Control records 16 to 19** are control batches with producer id -1 in the log: 16 reservation, 17 verdict marker,
   18 constraint-set change, 19 transaction judge. Consumers never receive them and the transaction readers ignore them.
+- **Reservation record** (type 16): the payload is `[version u8][reservedThroughN u64]`. An autoincrement leader appends
+  it before it hands out ids above the last reserved `n`; a new leader starts above the highest one it reads. Every reader
+  skips it, so it never reaches a consumer.
 - **Limits and refusals**: the client sends at most 4096 records in a `View` batch (a verdict source refuses more). A `View` produce is answered `InvalidRequest` on the
   legacy gateway stream, while the cluster feature level is below checked writes, or without a replica to fold from. A
   `View` bit on a transactional batch is ignored. Error codes 55 to 61 are sent only to sessions at 17 or above.
@@ -237,6 +240,16 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   the broker answers `NotLeader` (retriable). Plain upserts and deletes need none of this and are never rejected by the
   key index.
 - On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
+- **Autoincrement.** A record with intent `Insert` and a key of the key field's width in zero bytes is a key-0 create; the
+  broker patches the assigned id into its key and into the key field of its value. On a topic with `autoIncrement` a record
+  routes to partition `id mod partitionCount` (`Modulo`: the little-endian `uint64` of a key of 1 to 8 bytes; an empty or wider
+  key is partition 0). A batch with key-0 creates holds only key-0 creates, and needs an idempotent producer id and `All`
+  (and `View` when the topic's views can reject the create). `ProduceResponse.assignedBase` is the id of the batch's first
+  record, record `i` having `assignedBase + i * partitionCount`. It is `0` for every other batch, an import (a batch of
+  explicit-key inserts) included, and a duplicate's answer repeats the original's. A key-0 batch from a producer the leader
+  cannot track yet is `NotLeader` (retriable); a mixed batch, a non-idempotent or non-`All` batch, and a plain upsert are
+  `InvalidRequest`. An explicit key without the `IMPORT` grant is `NotAuthorized` (45); one above the maximum or outside
+  the partition is `InvalidRequest`. The counter reaching `autoincrement.max` is `AutoIncrementExhausted` (58).
 - **Key features** (`DefineTopic`, `TopicSchemaResponse`): a 14-byte block, little-endian
   ([`CatalogTypes.h`](../../protocol/include/rune/protocol/CatalogTypes.h)). On `DefineTopic` it follows the DDL
   extension and needs it; on `TopicSchemaResponse` it follows `partitionCount` and is sent only for a topic whose
@@ -248,6 +261,10 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   | 1 | `partitioner`: 0 `Fnv1a`, 1 `Modulo`; above 1 is undecodable | u8 |
   | 2 | `autoIncrementMax` (default 2^53 - 1) | u64 |
   | 10 | `autoIncrementReserve` (default 4096) | u32 |
+
+  `autoIncrement` implies `keyIndex` and `partitioner` 1; the broker stores both whatever the request carried, and the
+  features never change after the topic is created. `autoIncrementMax` is the last assignable id and `autoIncrementReserve` the
+  ids reserved per reservation record. `DefineTopic` with `partitioner` 1 and no `autoIncrement` is refused.
 
 ## Encrypted frames (TLS 1.3 / AEAD)
 
@@ -319,7 +336,7 @@ senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 | 55 | `ConstraintViolation` | Client 17: the record broke a view rule when it was folded; the constraint id is `viewObjectId << 16 \| ordinal` (ordinal 0 = `unique`). Never visible. | per-record verdict of a `View` ack |
 | 56 | `KeyExists` | Client 17: `insert` on a key that exists. Never visible. | per-record verdict of a `View` ack |
 | 57 | `KeyNotFound` | Client 17: `update` or delete-existing on a key that is absent. Never visible. | per-record verdict of a `View` ack |
-| 58 | `AutoIncrementExhausted` | Client 17: the counter reached `autoincrement.max`. The batch is not stored. | not retried |
+| 58 | `AutoIncrementExhausted` | Client 17: the counter reached `autoincrement.max`. Nothing is stored and the counter is unchanged. | not retried |
 | 59 | `ViewKeyExpressionInvalid` | Client 17: a view key expression does not compile. | DDL compile error |
 | 60 | `ViewConstraintInvalid` | Client 17: a `unique` or `check` constraint does not compile. | DDL compile error |
 | 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. | DDL compile error |

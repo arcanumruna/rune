@@ -17,7 +17,7 @@ using wire::Writer;
 enum class Violation : uint8_t { UnknownFormatVer, UnknownKind, KindOpsMismatch, BadEnum, BadVerifier };
 
 // formatVer 1 knows operations Read..Admin and resource types Cluster..TransactionalId (frozen); formatVer 2 adds
-// Truncate and Namespace (the protocol's validators are the formatVer-2 ranges).
+// Truncate, Import and Namespace (the protocol's validators are the formatVer-2 ranges).
 constexpr bool validOperation(uint16_t fv, Operation o) noexcept {
     return fv == kFormatV1 ? static_cast<uint8_t>(o) <= static_cast<uint8_t>(Operation::Admin)
                            : rune::protocol::validSecurityOperation(static_cast<uint8_t>(o));
@@ -284,6 +284,7 @@ std::string_view operationName(Operation o) noexcept {
     case Operation::Read: return "READ"; case Operation::Write: return "WRITE"; case Operation::Create: return "CREATE";
     case Operation::Alter: return "ALTER"; case Operation::Drop: return "DROP"; case Operation::Describe: return "DESCRIBE";
     case Operation::Admin: return "ADMIN"; case Operation::Truncate: return "TRUNCATE";
+    case Operation::Import: return "IMPORT";
     }
     return "?";
 }

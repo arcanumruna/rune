@@ -94,9 +94,6 @@ const RefusalRow kRefusals[] = {
     {"Transient", 5, true, true, 1, PrimType::UInt64, 0, false, rp::Partitioner::Fnv1a, kReserve, "key.index needs a persisted topic"},
     {"String9", 5, true, true, 0, PrimType::FixedStr, 9, false, rp::Partitioner::Fnv1a, kReserve, "key.index needs a key of at most 8 bytes"},
     {"String16", 5, true, true, 0, PrimType::FixedStr, 16, false, rp::Partitioner::Fnv1a, kReserve, "key.index needs a key of at most 8 bytes"},
-    {"AutoIncrement", 5, true, true, 0, PrimType::UInt64, 0, true, rp::Partitioner::Fnv1a, kReserve, "autoincrement is not supported by this broker yet"},
-    {"Modulo", 5, true, true, 0, PrimType::UInt64, 0, false, rp::Partitioner::Modulo, kReserve, "autoincrement is not supported by this broker yet"},
-    {"Reserve", 5, true, true, 0, PrimType::UInt64, 0, false, rp::Partitioner::Fnv1a, 1, "autoincrement is not supported by this broker yet"},
 };
 
 }  // namespace
@@ -209,28 +206,6 @@ TEST(CheckedWritesKeyIndexDdlRegression, AlterKeepsTheKeyIndexRegression) {
     const auto w = writeSpecWireOf(*t);
     ASSERT_TRUE(w);
     EXPECT_TRUE(w->keyIndex);
-}
-
-TEST(CheckedWritesKeyIndexDdl, ANonDefaultAutoIncrementMaxIsRefused) {
-    CatalogDdlRig rig("cwkimax");
-    atLevel5(rig);
-    rp::TopicKeyFeatures f = keyIndex();
-    f.autoIncrementMax     = 100;
-    const auto a = defineKeyed(rig, "ki", keyedBlob(PrimType::UInt64), f);
-    EXPECT_EQ(a.code, kInvalidRequest);
-    EXPECT_EQ(a.detail, "autoincrement is not supported by this broker yet");
-}
-
-TEST(CheckedWritesKeyIndexDdl, AutoIncrementBelowCheckedWritesIsRefusedAtDdl) {
-    CatalogDdlRig rig("cwkiautolow");
-    rig.becomeServingLeader();
-    rig.admin().setClusterFeatureLevel(4);
-    rp::TopicKeyFeatures f;
-    f.autoIncrement = true;
-    const auto a = defineKeyed(rig, "ai", keyedBlob(PrimType::UInt64), f);
-    EXPECT_EQ(a.code, kInvalidRequest) << "refused at DDL, never an encode failure";
-    EXPECT_EQ(a.detail, "key.index needs every broker at feature level 5");
-    EXPECT_EQ(topicOf(rig, "ai"), nullptr);
 }
 
 TEST(CheckedWritesKeyIndexDdl, AdoptionRefusals) {

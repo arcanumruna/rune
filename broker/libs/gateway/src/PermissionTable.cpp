@@ -22,7 +22,7 @@ PermissionTable PermissionTable::compile(std::span<const rsec::GrantSpec> effect
     t.clusterOps_ = rsec::clusterOps(t.grants_);
     for (const rsec::GrantSpec& g : t.grants_) {   // #211: hasAnyGrant
         const auto type = static_cast<std::size_t>(g.resource.type);
-        if (type < t.anyOps_.size()) t.anyOps_[type] = static_cast<uint8_t>(t.anyOps_[type] | rsec::opBit(g.op));
+        if (g.op != rsec::Operation::Import && type < t.anyOps_.size()) t.anyOps_[type] = static_cast<uint8_t>(t.anyOps_[type] | rsec::opBit(g.op));
     }
     t.root_ = (t.clusterOps_ & rsec::opBit(rsec::Operation::Admin)) != 0;
     // D11: ADMIN ON NAMESPACE "<the session's own namespace>" (a grant naming any other namespace implies nothing).
@@ -42,7 +42,8 @@ PermissionTable PermissionTable::compile(std::span<const rsec::GrantSpec> effect
     const auto limit = static_cast<std::size_t>(index.idLimit());
     t.ops_.assign(limit, 0);
     t.writeBits_.assign((limit + 63) / 64, 0);
-    index.forEach([&](int32_t id, const ObjectEntry& e) { t.setOps_(id, t.opsOf_(e)); });
+    t.importBits_.assign((limit + 63) / 64, 0);
+    index.forEach([&](int32_t id, const ObjectEntry& e) { t.setOps_(id, t.opsOf_(e), t.importOf_(e)); });
     return t;
 }
 
@@ -53,6 +54,13 @@ uint8_t PermissionTable::opsOf_(const ObjectEntry& e) const noexcept {
     return static_cast<uint8_t>(bits | nsAdminOps_);
 }
 
+bool PermissionTable::importOf_(const ObjectEntry& e) const noexcept {
+    if (e.type != rsec::ResourceType::Topic || (e.nsId != nsId_ && !root_)) return false;
+    for (const rsec::GrantSpec& g : grants_)
+        if (g.op == rsec::Operation::Import && rsec::matches(g.resource, e.type, e.name)) return true;
+    return false;
+}
+
 bool PermissionTable::allowsName(rsec::ResourceType type, std::string_view name, uint8_t opBits) const noexcept {
     if (allowAll_) return true;
     uint8_t bits = rsec::opsOn(grants_, type, name);
@@ -60,19 +68,22 @@ bool PermissionTable::allowsName(rsec::ResourceType type, std::string_view name,
     return (bits & opBits) == opBits;
 }
 
-void PermissionTable::setOps_(int32_t id, uint8_t ops) {
+void PermissionTable::setOps_(int32_t id, uint8_t ops, bool import) {
     const auto i = static_cast<std::size_t>(id);
     if (i >= ops_.size()) ops_.resize(i + 1, 0);
     if (writeBits_.size() < (ops_.size() + 63) / 64) writeBits_.resize((ops_.size() + 63) / 64, 0);
+    if (importBits_.size() < writeBits_.size()) importBits_.resize(writeBits_.size(), 0);
     ops_[i] = ops;
     const uint64_t bit = uint64_t{1} << (i % 64);
     if ((ops & rsec::opBit(rsec::Operation::Write)) != 0) writeBits_[i / 64] |= bit;
     else                                                   writeBits_[i / 64] &= ~bit;
+    if (import) importBits_[i / 64] |= bit;
+    else        importBits_[i / 64] &= ~bit;
 }
 
 void PermissionTable::onObjectCreated(int32_t id, const ObjectEntry& entry) {
     if (allowAll_ || id < 0) return;
-    setOps_(id, opsOf_(entry));
+    setOps_(id, opsOf_(entry), importOf_(entry));
 }
 
 void PermissionTable::onObjectDropped(int32_t id) noexcept {
@@ -80,6 +91,7 @@ void PermissionTable::onObjectDropped(int32_t id) noexcept {
     const auto i = static_cast<std::size_t>(id);
     ops_[i] = 0;
     writeBits_[i / 64] &= ~(uint64_t{1} << (i % 64));
+    importBits_[i / 64] &= ~(uint64_t{1} << (i % 64));
 }
 
 } // namespace rune::gateway

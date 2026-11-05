@@ -556,9 +556,11 @@ TEST(BrokerMetricsRegression, SystemMetricsSampleOnTheAdminAgentRegression) {
     const std::int64_t baseline = readFds();
     std::vector<int> fds;
     for (int i = 0; i < 64; ++i) fds.push_back(::dup(0));
-    const bool moved = await([&] { return readFds() >= baseline + 64; });
+    // The baseline sample may have counted readFds()'s own transient fd (one open of the metrics file per read).
+    std::int64_t last = -1;
+    const bool moved = await([&] { return (last = readFds()) >= baseline + 64 - 1; });
     for (const int fd : fds) if (fd >= 0) ::close(fd);
-    EXPECT_TRUE(moved) << "process_open_fds follows 64 new fds (baseline " << baseline << ")";
+    EXPECT_TRUE(moved) << "process_open_fds follows 64 new fds (baseline " << baseline << ", last " << last << ")";
     EXPECT_TRUE(await([&] { return node.adminSystemMetricsSamplesForTest() >= 2; }))
         << "the admin agent took the samples: " << node.adminSystemMetricsSamplesForTest();
     node.stop();

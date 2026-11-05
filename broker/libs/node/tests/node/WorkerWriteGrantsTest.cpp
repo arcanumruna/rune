@@ -138,6 +138,19 @@ struct Fixture {
         o.isolation = kPermFlagPatch | kPermFlagLast; o.permWords = words.data(); o.permWordCount = words.size();
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
     }
+    void importChunk(int64_t table, uint64_t first, uint64_t total, const std::vector<uint64_t>& words, bool last) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = table; o.topicId = kPermBitmapImport;
+        o.nextOffset = static_cast<int64_t>(first); o.hwBound = static_cast<int64_t>(total);
+        o.isolation = static_cast<uint8_t>(kPermFlagTable | (last ? kPermFlagLast : 0u));
+        o.permWords = words.data(); o.permWordCount = words.size();
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
+    void importPatch(int64_t table, uint64_t first, uint64_t total, const std::vector<uint64_t>& words) {
+        WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = table; o.topicId = kPermBitmapImport;
+        o.nextOffset = static_cast<int64_t>(first); o.hwBound = static_cast<int64_t>(total);
+        o.isolation = kPermFlagPatch | kPermFlagLast; o.permWords = words.data(); o.permWordCount = words.size();
+        ASSERT_TRUE(worker->tryEnqueueOp(std::move(o)));
+    }
     void dropTable(int64_t table) {
         WorkerOp o; o.type = WorkerOp::Type::SessionPermissions; o.sessionId = table;
         o.isolation = kPermFlagDrop | kPermFlagLast;
@@ -321,12 +334,13 @@ TEST(WorkerWriteGrantRegression, PermissionStagerReusesItsBuffersAfterTheFirstUp
     struct FakeSink {
         std::vector<uint64_t> bits;
         bool installWriteGrants(int64_t, std::vector<uint64_t>& w, bool, uint64_t, uint64_t) noexcept { bits.swap(w); return true; }
+        bool installImportGrants(int64_t, std::vector<uint64_t>&) noexcept { return true; }
     } sink;
     PermissionStager st;
     std::vector<uint64_t> chunkWords(512, 7);
     auto update = [&] {
-        EXPECT_EQ(st.apply(sink, 1, 0, 1024, 0, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7), PermissionChunkResult::Staged);
-        EXPECT_EQ(st.apply(sink, 1, 512, 1024, kPermFlagLast, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7),
+        EXPECT_EQ(st.apply(sink, 1, 0, 1024, 0, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7, kPermBitmapWrite), PermissionChunkResult::Staged);
+        EXPECT_EQ(st.apply(sink, 1, 512, 1024, kPermFlagLast, 1, reinterpret_cast<const uint8_t*>(chunkWords.data()), 4096, /*owner=*/7, kPermBitmapWrite),
                   PermissionChunkResult::Installed);
     };
     update();
@@ -526,4 +540,49 @@ TEST(WorkerWriteGrantRegression, ABehindFlagLandingMidStreamStopsTheStreamAtOnce
     }
     EXPECT_EQ(leoAtFirstRefusal, 19);
     EXPECT_EQ(f.log->logEndOffset(), 19) << "never appended after the first refusal";
+}
+
+TEST(CheckedWritesImportGrant, StagerInstallsTheImportBitmapSeparately) {
+    Fixture f;
+    f.announce(5, false);
+    f.tableChunk(3, 0, 1, bitsFor({5}, 1), true);
+    f.importChunk(3, 0, 1, bitsFor({5}, 1), true);
+    f.bind(5, 3, 1);
+    f.steps(8);
+    EXPECT_TRUE(allowsWrite(*f.slot(5), 5));
+    EXPECT_TRUE(allowsImport(*f.slot(5), 5));
+    EXPECT_FALSE(allowsImport(*f.slot(5), 6));
+}
+
+TEST(CheckedWritesImportGrant, TableWithoutImportItemDeniesImport) {
+    Fixture f;
+    f.announce(5, false);
+    f.tableChunk(3, 0, 1, bitsFor({1, 5}, 1), true);
+    f.bind(5, 3, 1);
+    f.steps(8);
+    ASSERT_TRUE(allowsWrite(*f.slot(5), 5));
+    for (int32_t id = 0; id < 130; ++id) EXPECT_FALSE(allowsImport(*f.slot(5), id)) << id;
+}
+
+TEST(CheckedWritesImportGrant, GrantAllAllowsImport) {
+    EXPECT_TRUE(allowsImport(WriteGrantSlot{allowAllWriteTable()}, 77));
+    EXPECT_FALSE(allowsImport(WriteGrantSlot{denyWriteTable()}, 77));
+}
+
+TEST(CheckedWritesImportGrant, ImportPatchFlipsOneBit) {
+    Fixture f;
+    f.announce(5, false);
+    f.tableChunk(3, 0, 1, bitsFor({1}, 1), true);
+    f.importChunk(3, 0, 1, bitsFor({1}, 1), true);
+    f.bind(5, 3, 1);
+    f.steps(8);
+    constexpr int32_t kNew = 130 * 64 + 5;
+    f.importPatch(3, 130, 131, bitsFor({5}, 1));
+    f.steps(8);
+    EXPECT_TRUE(allowsImport(*f.slot(5), kNew));
+    EXPECT_TRUE(allowsImport(*f.slot(5), 1)) << "the patch keeps the other words";
+    EXPECT_FALSE(allowsWrite(*f.slot(5), kNew)) << "the WRITE bitmap is untouched";
+    f.importPatch(3, 130, 131, bitsFor({}, 1));
+    f.steps(8);
+    EXPECT_FALSE(allowsImport(*f.slot(5), kNew));
 }

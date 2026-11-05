@@ -681,6 +681,41 @@ TEST(SchemaGatewayRegression, CatalogTopicAppliedCarriesTheAuthoritativeSpecThro
     EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m));
 }
 
+// Checked writes Part 06: the key features (autoincrement, the partitioner) ride the frame after nsId; a frame
+// from before them (no feature bytes) still decodes, as Fnv1a with no autoincrement.
+TEST(CheckedWritesAutoIncRouting, CatalogTopicAppliedCarriesTheKeyFeatures) {
+    const rune::protocol::TopicConfig c;
+    const rune::protocol::TopicKeyFeatures kf{.autoIncrement = true, .partitioner = rune::protocol::Partitioner::Modulo};
+    std::vector<uint8_t> f(catalogTopicAppliedWireLen("x", c));
+    writeCatalogTopicApplied(f.data(), 1, "x", 2, 0, /*persistence=*/0, c, /*nsId=*/7, kf);
+    CatalogTopicAppliedMsg m;
+    ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+    EXPECT_EQ(m.nsId, 7u);
+    EXPECT_TRUE(m.keyFeatures.autoIncrement);
+    EXPECT_EQ(m.keyFeatures.partitioner, rune::protocol::Partitioner::Modulo);
+
+    std::vector<uint8_t> extra = f;
+    extra.push_back(0);
+    EXPECT_FALSE(decodeCatalogTopicApplied(extra.data(), extra.size(), m)) << "one extra byte";
+    std::vector<uint8_t> badPartitioner = f;
+    badPartitioner.back() = 2;
+    EXPECT_FALSE(decodeCatalogTopicApplied(badPartitioner.data(), badPartitioner.size(), m));
+}
+
+TEST(CheckedWritesAutoIncRoutingRegression, CatalogTopicAppliedWithoutFeatureBytesStillDecodesRegression) {
+    const rune::protocol::TopicConfig c;
+    std::vector<uint8_t> f(catalogTopicAppliedWireLen("x", c));
+    writeCatalogTopicApplied(f.data(), 1, "x", 2, 0, /*persistence=*/0, c, /*nsId=*/7,
+                             {.autoIncrement = true, .partitioner = rune::protocol::Partitioner::Modulo});
+    f.resize(f.size() - kCatalogTopicAppliedFeatureBytes);   // the frame an older broker posted
+    CatalogTopicAppliedMsg m;
+    ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+    EXPECT_EQ(m.nsId, 7u);
+    EXPECT_EQ(m.keyFeatures, rune::protocol::TopicKeyFeatures{});
+    f.pop_back();
+    EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m)) << "a torn nsId";
+}
+
 // ---------------------------------------------------------------------------
 // SchemaGatewayRegression.AlterTopicRoundTripThroughGatewayRings
 //

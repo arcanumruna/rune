@@ -1221,11 +1221,12 @@ private:
 
     void postCatalogTopicApplied_(int32_t topicId, std::string_view name, int32_t partitions, int16_t rf,
                                   rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c,
-                                  uint32_t nsId, int32_t typeId = kA2cCatalogTopicApplied) {
+                                  uint32_t nsId, const rune::protocol::TopicKeyFeatures& kf,
+                                  int32_t typeId = kA2cCatalogTopicApplied) {
         const std::size_t len = catalogTopicAppliedWireLen(name, c);
         const uint8_t pers = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
         postCatalog_(typeId, len, [&](uint8_t* p) {
-            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId);
+            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c, nsId, kf);
         });
     }
 
@@ -1256,8 +1257,8 @@ private:
     void postCatalogWriteSpec_(const rune::catalog::TopicObject& t) {
         const auto w = writeSpecWireOf(t);
         if (!w) return;
-        postCatalog_(kA2cWriteSpec, kTopicWriteSpecWireLen, [&](uint8_t* p) {
-            (void)encodeTopicWriteSpec(*w, std::span<uint8_t>(p, kTopicWriteSpecWireLen));
+        postCatalog_(kA2cWriteSpec, topicWriteSpecWireLen(*w), [&](uint8_t* p) {
+            (void)encodeTopicWriteSpec(*w, std::span<uint8_t>(p, topicWriteSpecWireLen(*w)));
         });
     }
 
@@ -1281,14 +1282,15 @@ private:
             postCatalogFilterSchema_(t);
             postCatalogValidator_(t, 1);
             postCatalogWriteSpec_(t);
-            postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config, t.nsId);
+            postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config, t.nsId,
+                                     t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{});
         };
         fx.sinkApplied = [this](const SinkSpec& s) {
             // A view sink is a keyed, compacted table (Task 19's sink spec), every broker (rf 0).
             rune::protocol::TopicConfig c;
             c.cleanupPolicy = 1;   // Compact
             c.partitionKey  = s.keyField;
-            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c, s.nsId,
+            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf*/0, s.persistence, c, s.nsId, s.sourceKeyFeatures,
                                      kA2cCatalogSinkApplied);   // Task 12 (N5)
         };
         fx.namespaceUpserted = [this](const rune::catalog::NamespaceRecord& r) {   // namespaces Task 9: login mirror

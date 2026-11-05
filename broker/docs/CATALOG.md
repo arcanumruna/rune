@@ -65,8 +65,32 @@ features are hashed after it, so every v1 and v2 digest replays as before.
 1. "key.index needs every broker at feature level 5"
 2. "key.index needs a typed topic", "key.index needs a key", "key.index needs a persisted topic"
 3. "key.index needs a key of at most 8 bytes" (until wide keys ship)
-4. "autoincrement is not supported by this broker yet" (`autoIncrement`, a partitioner other than `Fnv1a`, or a
-   non-default `autoIncrementMax` / `autoIncrementReserve`)
+
+**`autoincrement` DDL.** A definition with `autoIncrement`, a non-default `partitioner`, `autoIncrementMax` or
+`autoIncrementReserve` is checked first, in this order, each an `InvalidRequest` (39) with this detail:
+
+1. "autoincrement needs every broker at feature level 5"
+2. "autoincrement needs a typed topic", "autoincrement needs a key", "autoincrement needs a persisted topic"
+3. "autoincrement needs a new topic" (an adoption of an existing untyped topic)
+4. "autoincrement needs a uint64, int64 or uint32 key"
+5. "autoincrement needs cleanup.policy = compact"
+6. "autoincrement topics keep every record: retention.ms and retention.bytes must be -1" (an `AlterTopicConfig` that
+   leaves either other than -1 gets the same)
+7. "autoincrement.reserve must be between 1 and 1048576"
+8. "autoincrement.max must be between <2P - 1> and <cap>" (cap 2^53 - 1, or 2^32 - 1 for `uint32`)
+9. "autoincrement.max and autoincrement.reserve need autoincrement"
+10. "the modulo partitioner needs autoincrement"
+
+The request is then normalized, and the `key.index` rules above run on the result: `autoIncrement` stores `keyIndex = true` and `partitioner = Modulo` whatever the request
+carried, and a `uint32` key's default max is stored as `2^32 - 1`. The key features never change after the topic is
+created, and there is no way to alter the partition count, so the key field, its type, `autoincrement` and P are fixed.
+
+**`formatVer` 3 apply rules for `autoIncrement`** (replayed, so a hand-made catalog cannot bypass the DDL; each failure is
+`Precondition`): a `CreateTopic` only (never a `CreateSchema` adoption) with a `UInt64`, `Int64` or `UInt32` key,
+`Persistence::Disk`, `keyIndex`, `Modulo`, `cleanup.policy = compact`, retention -1, and the reserve and max ranges above.
+`Modulo` needs `autoIncrement`, and an `AlterTopicConfig` on an autoincrement topic keeps retention at -1. The golden
+`codec/tests/catalog/golden/v3/autoinc.rcat` pins five events (two creates, an `AlterSchema`, an `AlterTopicConfig`, and a
+three-partition `uint32` create).
 
 **`formatVer` rules.** The apply rules of a `formatVer` are frozen and never edited. A rule change
 ships under a new `formatVer`, and old events keep replaying under their own rules. A reader that

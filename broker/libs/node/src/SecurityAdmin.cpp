@@ -510,6 +510,12 @@ void SecurityAdmin::startDdl_(const SecurityDdlMsg& m, int64_t nowNs, SecurityRe
         spec = sec::GrantSpec{static_cast<sec::Operation>(m.op),
                               {static_cast<sec::ResourceType>(m.resourceType),
                                static_cast<sec::PatternKind>(m.patternKind), m.pattern}};
+        // The op value is persisted in `__security` events: a broker below the level cannot read it.
+        if (opKind == pc::SecurityOpKind::Grant && spec->op == sec::Operation::Import && featureLevel_ != nullptr &&
+            *featureLevel_ < rune::replication::MetadataFeature::kCheckedWrites) {
+            answer_(req, kInvalidRequest, "the IMPORT grant needs every broker at feature level 5");
+            return;
+        }
         const auto grantee = static_cast<sec::GranteeKind>(m.granteeKind);
         if (opKind == pc::SecurityOpKind::Grant) ops = sec::GrantOps{grantee, *spec};
         else ops = sec::RevokeOps{grantee, *spec};

@@ -1,6 +1,8 @@
 // Part 04 Task 3: control record types 16-19 (C10).
 #include <gtest/gtest.h>
 
+#include <cstring>
+#include <optional>
 #include <vector>
 
 #include <rune/storage/ControlRecordLayout.h>
@@ -177,4 +179,20 @@ TEST(CheckedWritesControlRecordRegression, ParseControlOnceGivesTypeAndViewsRegr
     for (const std::vector<uint8_t>* whole : {&marker1, static_cast<const std::vector<uint8_t>*>(&change)})
         for (std::size_t n = 0; n < whole->size(); ++n)
             EXPECT_FALSE(cr::parseControl(whole->data(), n).has_value()) << "truncated at " << n;
+}
+
+TEST(CheckedWritesControlRecord, ReservationRoundTrips) {
+    std::vector<uint8_t> b(cr::reservationBatchBytes());
+    ASSERT_EQ(cr::buildReservation(b, 8192), b.size());
+    EXPECT_EQ(cr::recordType(b.data(), b.size()), cr::kReservation);
+    EXPECT_EQ(cr::parseReservation(b.data(), b.size()), std::optional<uint64_t>(8192));
+    int64_t producerId = 0;
+    std::memcpy(&producerId, b.data() + 43, 8);
+    EXPECT_EQ(producerId, -1);
+
+    std::vector<uint8_t> shortOut(b.size() - 1);
+    EXPECT_EQ(cr::buildReservation(shortOut, 8192), 0u);
+
+    const auto m = marker(0, 10, 1, {});
+    EXPECT_FALSE(cr::parseReservation(m.data(), m.size()).has_value());
 }

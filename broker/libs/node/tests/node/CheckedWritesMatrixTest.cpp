@@ -1,5 +1,6 @@
 // Checked writes Part 04 Task 10: the shared interaction matrix (5 ops x 8 entities x 15 timings) on a real Worker, judged against
-// the independent reference model, plus the pins of both parts' cell counts.  Part 05 adds 5 intent ops x 6 key states x 21 timings.
+// the independent reference model, plus the pins of both parts' cell counts.  Part 05 adds 5 intent ops x 6 key states x 21 timings,
+// Part 06 6 autoincrement ops x 7 topics x 21 timings.
 #include "CheckedWritesMatrixExpectations.h"
 #include "CheckedWritesChecks.h"
 #include "CheckedWritesModel.h"
@@ -691,13 +692,471 @@ private:
 
 }  // namespace
 
+// ---- Part 06: autoincrement.  Every op is sent by an idempotent producer with All | View, import-granted. ----
+namespace {
+
+constexpr int64_t kFillPid = 502;
+constexpr int16_t kInvalidRequest = static_cast<int16_t>(ErrorCode::InvalidRequest);
+constexpr int16_t kExhausted = static_cast<int16_t>(ErrorCode::AutoIncrementExhausted);
+constexpr int16_t kDuplicateSequence = static_cast<int16_t>(ErrorCode::DuplicateSequence);
+
+/// The topic and the rig's partition of an entity, and the creates acked in setup.
+struct AutoIncSetup { AutoIncShape shape; int32_t partition = 0; int creates = 3; };
+
+AutoIncSetup setupOf(Entity e) {
+    switch (e) {
+    case Entity::P4U64: return {AutoIncShape{.partitions = 4}, 2};
+    case Entity::P1U32: return {AutoIncShape{.keyType = rune::codec::PrimType::UInt32}, 0};
+    case Entity::P2I64: return {AutoIncShape{.partitions = 2, .keyType = rune::codec::PrimType::Int64}, 1};
+    case Entity::AtReservationEdge: return {AutoIncShape{.reserve = 8}, 0, 6};
+    case Entity::NearMax: return {AutoIncShape{.max = 10}, 0, 7};
+    default: return {};
+    }
+}
+
+Rec createRec(uint8_t tag) { return Rec{0, 100, tag, false, 1}; }
+
+class AutoIncCellRun {
+public:
+    explicit AutoIncCellRun(const Cell& c) : c_(c), setup_(setupOf(c.entity)), r_(/*follower=*/true, /*rollBytes=*/1, tuningWith_(c, setup_.partition)) {}
+
+    void run() {
+        const Expected ex = expect(c_);
+        refusal_ = ex.check == Check::AutoExhausted ? kExhausted : ex.check == Check::ImportOutOfRange ? kInvalidRequest : int16_t{0};
+        r_.createAutoIncTopic(setup_.shape);
+        if (::testing::Test::HasFatalFailure()) return;
+        if (constrained_() && c_.timing != Timing::CreateOnNonEmpty) r_.installRejectView(kRej, kObj, tagRule(9));
+        r_.enableAcks();
+        r_.passes(60);
+        r_.followerFetch();
+        r_.passes(10);
+        setupCreates_();
+        if (::testing::Test::HasFatalFailure()) return;
+        importAboveId_ = (r_.autoIncState()->reservedThroughN + 100) * partitions_() + static_cast<uint64_t>(setup_.partition);
+        execute_();
+        if (::testing::Test::HasFatalFailure()) return;
+
+        const auto judgeAll = [&] {
+            waitCommitted_();
+            const auto appended = withoutAbortedTxn_(r_.readLog());   // an aborted transaction at the tail needs no verdicts
+            const int64_t reach = std::max(appended.data.empty() ? 0 : appended.data.back().offset + 1, appended.changes.empty() ? 0 : appended.changes.back().offset + 1);
+            EXPECT_TRUE(r_.driveUntilJudged(reach, VerdictRig::kMaxPass * strictFactor_()));
+            r_.passes(60);
+            return reach;
+        };
+        int64_t target = judgeAll();
+        if (::testing::Test::HasFatalFailure()) return;
+        if (ex.check == Check::Burned && !faulty_()) {   // a create after the judge: the burned ids are not given back
+            sendOpRecs_(kOpPid, {createRec(1)});
+            target = judgeAll();
+        }
+        const auto log = r_.readLog();
+        const auto judged = withoutAbortedTxn_(log);
+        CheckedWritesModel model;
+        model.declareRule(kObj, tagRule(9).fingerprint(), modelRule(tagRule(9)));
+        model.declareRule(kObj, tagRule(1).fingerprint(), modelRule(tagRule(1)));
+        model.addAutoIncRule(setup_.shape, setup_.partition);
+        model.reset(judged);
+        collectAcks_();
+
+        checkIndex(r_, model);                                                           // (a)
+        checkMarkers(model, log, target);
+        const std::vector<CheckedWritesModel::AutoIncAck> acks = ackList_();
+        EXPECT_TRUE(model.ackedIdsMatchTheLog(log, acks)) << "(b) an ack's assignedBase is the first key of its batch, each value carries its key";
+        EXPECT_TRUE(model.idsFollowTheStride(log, acks)) << "(b) the keys are base + i * P";
+        EXPECT_TRUE(model.noIdTwiceNoReuse(log, acks)) << "(c) no id twice";
+        EXPECT_TRUE(model.reservationCoversEveryId(log)) << "(d) every id is under a reservation below it";
+        checkAcks_(ex, model, log);
+        checkStats_();                                                                   // (g)
+
+        const auto reservedBefore = r_.reservations();
+        checkCompaction(r_, model, log);
+        const auto reservedAfter = r_.reservations();                                    // (f)
+        ASSERT_FALSE(reservedBefore.empty());
+        ASSERT_FALSE(reservedAfter.empty()) << "(f) the compaction removed every reservation";
+        EXPECT_EQ(reservedAfter.back().second, reservedBefore.back().second) << "(f) the latest reservation is kept";
+        (void)r_.compact(2'000'000);   // the first pass stamped the delete horizon of what it found removable; the second drops it
+        const auto reservedLater = r_.reservations();
+        ASSERT_FALSE(reservedLater.empty()) << "(f) the second compaction removed every reservation";
+        EXPECT_EQ(reservedLater.back().second, reservedBefore.back().second) << "(f) the latest reservation is kept by a second pass";
+
+        std::set<int64_t> present;
+        for (const auto& d : r_.readLog().data) present.insert(d.offset);
+        r_.restart();
+        const auto compacted = withoutAbortedTxn_(r_.readLog());
+        ASSERT_TRUE(r_.driveUntilJudged(compacted.data.empty() ? 0 : compacted.data.back().offset + 1));
+        r_.passes(60);
+        checkIndex(r_, model, &present);
+        ASSERT_TRUE(waitReady_());
+        EXPECT_TRUE(model.counterAboveEveryId(log, *r_.autoIncState())) << "(e) nextN " << r_.autoIncState()->nextN << " reserved " << r_.autoIncState()->reservedThroughN;
+        EXPECT_EQ(r_.autoIncState()->nextN, r_.autoIncState()->reservedThroughN + 1) << "(e) a rebuilt counter resumes above the reservation";
+        checkStats_();
+    }
+
+private:
+    struct Sent { int64_t corr; int64_t pid; int32_t seq; std::vector<Rec> recs; bool op = false; };
+
+    static RigTuning tuningWith_(const Cell& c, int32_t partition) {
+        RigTuning t = tuningOf(c);
+        t.partition = partition;
+        return t;
+    }
+    bool constrained_() const { return c_.entity == Entity::Constrained; }
+    uint64_t partitions_() const { return static_cast<uint64_t>(setup_.shape.partitions); }
+    bool refused_() const { return refusal_ != 0; }
+    bool createOp_() const { return isCreate06(c_.op); }
+    int strictFactor_() const { return c_.timing == Timing::StrictTier ? 50 : 1; }
+    int ackPasses_() const { return 3000 * strictFactor_(); }
+
+    Sent send_(int64_t pid, const std::vector<Rec>& recs, uint8_t acks = kAcksViewAll, bool txn = false, bool routed = false) {
+        const int32_t seq = seqs_[pid];
+        seqs_[pid] += static_cast<int32_t>(recs.size());
+        const int64_t corr = routed ? r_.routedFrame(recs, acks, pid, seq) : r_.produceFrame(recs, acks, pid, seq, txn);
+        return {corr, pid, seq, recs};
+    }
+    // A refused batch appends nothing: the producer's sequence stays.
+    void sendOpRecs_(int64_t pid, const std::vector<Rec>& recs) {
+        const int32_t before = seqs_[pid];
+        sent_.push_back(send_(pid, recs, kAcksViewAll, false, c_.timing == Timing::GatewayRouted));
+        sent_.back().op = true;
+        if (refused_()) seqs_[pid] = before;
+    }
+    void sendOp_(int64_t pid = kOpPid) { sendOpRecs_(pid, opBatch_()); }
+    void resend_(Sent s) {
+        sent_.push_back({r_.produceFrame(s.recs, kAcksViewAll, s.pid, s.seq), s.pid, s.seq, s.recs, s.op});
+        dups_.emplace_back(s.corr, sent_.back().corr);
+    }
+
+    void setupCreates_() {
+        for (int i = 0; i < setup_.creates; ++i) {
+            const Sent s = send_(kSetupPid, {createRec(1)});
+            const auto a = r_.ackFetching(s.corr, ackPasses_());
+            ASSERT_TRUE(a);
+            ASSERT_EQ(a->code, 0);
+            EXPECT_TRUE(a->verdicts.empty());
+            ids_.push_back(a->assignedBase);
+            batches_[a->baseOffset] = 1;
+            keyZero_[a->baseOffset] = {a->baseOffset, a->assignedBase, 1};
+        }
+    }
+
+    std::vector<Rec> opRecs_() const {
+        switch (c_.op) {
+        case Op::AutoCreate1: return {createRec(1)};
+        case Op::AutoCreate8: {
+            std::vector<Rec> b;
+            for (int i = 0; i < 8; ++i) b.push_back(createRec(i % 2 == 0 ? 1 : 9));
+            return b;
+        }
+        case Op::ImportBelow: return {Rec{ids_.back(), 100, 1, false, 1}};
+        case Op::ImportAbove: return {Rec{importAboveId_, 100, 1, false, 1}};
+        case Op::UpdateAssigned: return {Rec{ids_.front(), 100, 9, false, 2}};
+        default: return {Rec{ids_.front(), 0, 0, true, 2}};   // RemoveExistingAssigned
+        }
+    }
+    std::vector<Rec> opBatch_() const {
+        std::vector<Rec> b = opRecs_();
+        if (c_.timing == Timing::SelfCollidingBatch) { const auto again = opRecs_(); b.insert(b.end(), again.begin(), again.end()); }
+        return b;
+    }
+
+    void waitCommitted_() {
+        r_.passes(10);
+        for (int i = 0; i < VerdictRig::kMaxPass * strictFactor_() && r_.replica->highWatermark() < r_.leo(); ++i) {
+            if (i % 8 == 0) r_.followerFetch();
+            r_.pass();
+        }
+        EXPECT_EQ(r_.replica->highWatermark(), r_.leo());
+    }
+    bool waitReady_() {
+        for (int i = 0; i < VerdictRig::kMaxPass; ++i) {
+            if (r_.autoIncState() && r_.worker->rcStatusForTest(VerdictRig::kSrc, setup_.partition) == Worker::kRcReady) return true;
+            if (i % 8 == 0) r_.followerFetch();
+            r_.pass();
+        }
+        ADD_FAILURE() << "the counter never became ready";
+        return false;
+    }
+
+    void change_() {
+        r_.passes(5);
+        if (c_.timing == Timing::CreateOnNonEmpty) r_.installRejectView(kRej, kObj, tagRule(9));
+        else if (c_.timing == Timing::ReplaceDuringWrites) r_.replaceRejectView(kRej, kRejNew, kObj, tagRule(1));
+        else r_.dropRejectView(kRej);
+        r_.passes(5);
+    }
+
+    void execute_() {
+        switch (c_.timing) {
+        case Timing::BackToBack:   // two batches in flight before the first ack
+            sendOp_();
+            sendOp_();
+            return;
+        case Timing::Racing:
+            sendOp_(kOpPid);
+            sendOp_(kOtherPid);
+            return;
+        case Timing::RetryBeforeJudge: case Timing::RetryAfterJudge: case Timing::RetryAfterWindow: {
+            const int64_t fillPid = refused_() ? kFillPid : kOpPid;   // a refused batch is in no window
+            const Rec fill{ids_[1], 100, 1, false, 2};
+            ASSERT_TRUE(executeRetry(r_, c_.timing != Timing::RetryBeforeJudge, c_.timing == Timing::RetryAfterWindow, [&] { sendOp_(); },
+                                     [&](uint64_t) { sent_.push_back(send_(fillPid, {fill})); }, [&] { resend_(sent_[0]); }));
+            return;
+        }
+        case Timing::CreateOnNonEmpty: case Timing::ReplaceDuringWrites: case Timing::DropDuringWrites:
+            sendOp_();
+            change_();
+            sendOp_();
+            return;
+        case Timing::FailoverAppendHw:
+            sendOp_();
+            r_.passes(5);
+            lostAndResend_([&] { cutTo_ = r_.replica->highWatermark(); r_.demote(); }, [&] { r_.restart(true, cutTo_); });   // a demoted replica forgets its HW: the cut is the leader's
+            return;
+        case Timing::TruncateTail:
+            sendOp_();
+            r_.passes(5);
+            lostAndResend_([&] { r_.truncateTo(r_.replica->highWatermark()); r_.demotePromote(); }, [] {});
+            return;
+        case Timing::FailoverHwFold:
+            sendOp_();
+            ASSERT_TRUE(r_.driveUntilJudged());
+            ASSERT_TRUE(r_.ackFetching(sent_[0].corr, ackPasses_()));
+            r_.followerFetch();
+            r_.failover();
+            return;
+        case Timing::FailoverFoldMarker:
+            sendOp_();
+            r_.passes(5);
+            r_.followerFetch();
+            for (int i = 0; i < VerdictRig::kMaxPass && r_.leo() <= r_.replica->highWatermark(); ++i) r_.pass();   // the marker sits above the HW
+            ASSERT_GT(r_.leo(), r_.replica->highWatermark());
+            r_.failover();
+            return;
+        case Timing::RestartDuringRebuild:
+            sendOp_();
+            ASSERT_TRUE(r_.driveUntilJudged());
+            ASSERT_TRUE(r_.ackFetching(sent_[0].corr, ackPasses_()));
+            r_.restart();
+            r_.passes(2);
+            r_.restart();
+            return;
+        case Timing::TxnCommitBehind: case Timing::TxnAbortBehind: {
+            const Sent txn = send_(kTxnPid, {createRec(1), createRec(1)}, kAcksAll, /*txn=*/true);   // a third producer's open transaction
+            const auto ta = r_.ackFetching(txn.corr, ackPasses_());
+            ASSERT_TRUE(ta);
+            EXPECT_EQ(ta->code, 0);
+            txnOffset_ = ta->baseOffset;
+            batches_[ta->baseOffset] = 2;
+            keyZero_[ta->baseOffset] = {ta->baseOffset, ta->assignedBase, 2};
+            sendOp_();
+            for (int i = 0; i < 300; ++i) {
+                if (i % 8 == 0) r_.followerFetch();
+                r_.pass();
+            }
+            if (!refused_()) ASSERT_FALSE(r_.acked(sent_[0].corr)) << "behind an open transaction the judge is held";
+            r_.marker(kTxnPid, c_.timing == Timing::TxnCommitBehind);
+            return;
+        }
+        case Timing::LeaderLossParked:
+            sendOp_();
+            r_.passes(5);
+            if (!refused_()) ASSERT_FALSE(r_.acked(sent_[0].corr)) << "parked until the HW moves";
+            r_.demote();
+            ASSERT_TRUE(r_.ack(sent_[0].corr));
+            firstAckCode_ = r_.ack(sent_[0].corr)->code;
+            r_.promote();
+            return;
+        case Timing::AckDeadline: {   // the follower does not fetch: the parked View ack times out
+            const int64_t sentStep = r_.passNo();
+            sendOp_();
+            const auto a = r_.ack(sent_[0].corr);
+            ASSERT_TRUE(a);
+            if (!refused_()) {
+                EXPECT_GE(a->step - sentStep, kAckDeadlineNs / 1'000'000) << "never earlier than the deadline (a pass is 1 ms)";
+                EXPECT_LE(a->step - sentStep, kAckDeadlineNs / 1'000'000 + 20);
+            }
+            return;
+        }
+        default:   // Single, SelfCollidingBatch, StrictTier, GatewayRouted
+            sendOp_();
+            return;
+        }
+    }
+
+    // The op is sent, the leader loses it (`lose`), the node is leader again and the op is sent once more from a fresh sequence.
+    template <class Lose, class Back>
+    void lostAndResend_(Lose lose, Back back) {
+        const int64_t first = sent_.front().corr;
+        lose();
+        const auto a = r_.ack(first);
+        ASSERT_TRUE(a);
+        firstAckCode_ = a->code;
+        back();
+        if (expect(c_).check == Check::NotLeaderThenExhausted) refusal_ = kExhausted;   // the rebuilt counter resumes above the capped reservation
+        sent_.clear();
+        seqs_.erase(kOpPid);
+        ASSERT_TRUE(waitReady_());
+        r_.passes(10);
+        sendOp_();
+    }
+
+    VerdictRig::RigLog withoutAbortedTxn_(VerdictRig::RigLog log) const {
+        if (c_.timing == Timing::TxnAbortBehind)
+            std::erase_if(log.data, [&](const VerdictRig::RigLogRec& d) { return d.offset == txnOffset_ || d.offset == txnOffset_ + 1; });
+        return log;
+    }
+
+    // Every OK ack of a batch: the batches stored (a retry's ack names the original's offset) and the key-0 ones among them.
+    void collectAcks_() {
+        for (const Sent& s : sent_) {
+            const auto a = r_.ackFetching(s.corr, ackPasses_());
+            ASSERT_TRUE(a) << "corr " << s.corr;
+            acksByCorr_[s.corr] = *a;
+            if (a->code != 0 || (s.op && refused_())) continue;
+            batches_[a->baseOffset] = s.recs.size();
+            if (s.recs.front().id == 0) keyZero_[a->baseOffset] = {a->baseOffset, a->assignedBase, s.recs.size()};
+        }
+    }
+    std::vector<CheckedWritesModel::AutoIncAck> ackList_() const {
+        std::vector<CheckedWritesModel::AutoIncAck> out;
+        for (const auto& [offset, a] : keyZero_) out.push_back(a);
+        return out;
+    }
+
+    static Trailer want_(std::size_t at, uint16_t code) {
+        return code == 0 ? Trailer{} : Trailer{{static_cast<uint16_t>(at), code, code == 55 ? kConstraintId06 : 0u}};
+    }
+
+    void checkAcks_(const Expected& ex, const CheckedWritesModel& model, const VerdictRig::RigLog& log) {
+        if (ex.check == Check::NotLeaderFirst || ex.check == Check::NotLeaderThenExhausted) EXPECT_EQ(firstAckCode_, kNotLeader);
+        for (const Sent& s : sent_) {
+            const VerdictRig::Ack& a = acksByCorr_.at(s.corr);
+            if (s.op && refused_()) { EXPECT_EQ(a.code, refusal_) << "corr " << s.corr; EXPECT_EQ(a.assignedBase, 0u); continue; }
+            if (ex.check == Check::NotLeaderParked) { EXPECT_EQ(a.code, kNotLeader); EXPECT_EQ(firstAckCode_, kNotLeader); continue; }
+            if (ex.check == Check::DeadlineInternal) { EXPECT_EQ(a.code, kInternal); continue; }
+            if (a.code != 0) {
+                EXPECT_EQ(ex.check, Check::RetryOutsideWindow);
+                EXPECT_EQ(a.code, kDuplicateSequence);
+                EXPECT_EQ(a.assignedBase, 0u) << "an answer outside the window carries no ids";
+                continue;
+            }
+            checkModelTrailer(model, a, s.recs.size(), s.corr);
+            EXPECT_EQ(a.assignedBase != 0, s.recs.front().id == 0) << "only a key-0 batch answers its ids";
+        }
+        for (const auto& [orig, dup] : dups_) {
+            if (refused_()) break;   // nothing was stored: the re-send is refused again
+            const auto& o = acksByCorr_.at(orig);
+            const auto& d = acksByCorr_.at(dup);
+            checkDupAck(r_, o, d, ex.check == Check::RetryOutsideWindow);
+            if (ex.check == Check::RetryReplays) {
+                EXPECT_EQ(d.assignedBase, o.assignedBase) << "the duplicate answers the original's ids";
+                EXPECT_EQ(d.frameLen, o.frameLen);
+            }
+        }
+        if (ex.check == Check::RetryReplays) {
+            std::size_t stored = 0;
+            for (const auto& [offset, n] : batches_) stored += n;
+            EXPECT_EQ(log.data.size(), stored) << "a retry is stored once";
+        }
+        if (refused_()) {
+            std::size_t stored = 0;
+            for (const auto& [offset, n] : batches_) stored += n;
+            EXPECT_EQ(log.data.size(), stored) << "a refused batch stores nothing";
+            if (ex.check == Check::AutoExhausted && !faulty_()) {
+                uint64_t next = 1;
+                for (const auto& [offset, a] : keyZero_) next = std::max(next, (a.assignedBase + (a.count - 1) * partitions_()) / partitions_() + 1);
+                EXPECT_EQ(r_.autoIncState()->nextN, next) << "the refusal leaves the counter";
+            }
+            return;
+        }
+        if (ex.check == Check::DeadlineInternal && createOp_()) {   // the ids were taken: once the fold resumes the log holds the batch with them
+            const std::size_t at = static_cast<std::size_t>(setup_.creates);
+            ASSERT_GE(log.data.size(), at + opRecs_().size());
+            for (std::size_t i = 0; i < opRecs_().size(); ++i) EXPECT_EQ(log.data[at + i].id, ids_.back() + (i + 1) * partitions_());
+        }
+        const auto opAck = [&](std::size_t k) -> const VerdictRig::Ack& { return acksByCorr_.at(sent_[k].corr); };
+        if (ex.check == Check::AutoVerdict) {
+            // the first batch meets the constraint set the Single timing has; CreateOnNonEmpty adds the member after it
+            const bool constrained = constrained_() && c_.timing != Timing::CreateOnNonEmpty;
+            EXPECT_EQ(opAck(0).verdicts, want_(0, verdict06(c_.op, constrained))) << "the verdict of the op";
+        } else if (ex.check == Check::CollidingPair) {
+            const auto [first, second] = collidingCodes06(c_.op, c_.entity);
+            if (c_.timing == Timing::SelfCollidingBatch) {
+                Trailer w = want_(0, first);
+                for (const auto& e : want_(1, second)) w.push_back(e);
+                EXPECT_EQ(opAck(0).verdicts, w);
+            } else {   // Racing: the batch at the lower offset meets the first state
+                const bool aFirst = opAck(0).baseOffset < opAck(1).baseOffset;
+                EXPECT_EQ(opAck(aFirst ? 0 : 1).verdicts, want_(0, first));
+                EXPECT_EQ(opAck(aFirst ? 1 : 0).verdicts, want_(0, second));
+            }
+        } else if (ex.check == Check::RacingIds) {
+            const bool aFirst = opAck(0).baseOffset < opAck(1).baseOffset;
+            const auto& lo = opAck(aFirst ? 0 : 1);
+            const auto& hi = opAck(aFirst ? 1 : 0);
+            EXPECT_EQ(hi.assignedBase, lo.assignedBase + opRecs_().size() * partitions_()) << "the second batch continues the first";
+        } else if (ex.check == Check::Burned) {
+            std::size_t rejected = 0;
+            for (const auto& [offset, a] : keyZero_)
+                for (std::size_t i = 0; i < a.count; ++i) rejected += model.verdicts().count(a.baseOffset + static_cast<int64_t>(i));
+            EXPECT_GT(rejected, 0u);
+            if (!faulty_()) {
+                EXPECT_EQ(r_.autoIncStats().idsBurned, rejected) << "every rejected create burned its id";
+                const auto& later = acksByCorr_.at(sent_.back().corr);
+                uint64_t next = 0;
+                for (const auto& [offset, a] : keyZero_)
+                    if (offset < later.baseOffset) next = std::max(next, a.assignedBase + a.count * partitions_());
+                EXPECT_EQ(later.assignedBase, next) << "a later create continues after the burned ids";
+            }
+        }
+        if (c_.op == Op::ImportAbove && c_.timing == Timing::Single) {
+            const auto resv = r_.reservations();
+            const auto above = std::find_if(resv.begin(), resv.end(), [&](const auto& x) { return x.second >= importAboveId_ / partitions_(); });
+            ASSERT_TRUE(above != resv.end()) << "an import above the reservation reserves through its n";
+            EXPECT_EQ(above->first, opAck(0).baseOffset - 1) << "the reservation sits right below the import";
+            EXPECT_EQ(r_.autoIncState()->nextN, importAboveId_ / partitions_() + 1);
+        }
+        if (c_.op == Op::ImportBelow && c_.timing == Timing::Single) EXPECT_EQ(r_.autoIncState()->nextN, ids_.back() / partitions_() + 1) << "the counter is unchanged";
+    }
+    bool faulty_() const {
+        return c_.timing == Timing::FailoverAppendHw || c_.timing == Timing::FailoverHwFold || c_.timing == Timing::FailoverFoldMarker ||
+               c_.timing == Timing::TruncateTail || c_.timing == Timing::RestartDuringRebuild || c_.timing == Timing::LeaderLossParked;
+    }
+
+    // (g) the side window never missed, no assigned id met a stored key, the rejected index agrees with the log
+    void checkStats_() {
+        EXPECT_EQ(r_.autoIncStats().windowMisses, 0u);
+        EXPECT_EQ(r_.autoIncStats().assignedKeyExists, 0u);
+        EXPECT_EQ(r_.writeState()->rejected.mismatches(), 0u);
+    }
+
+    Cell c_;
+    AutoIncSetup setup_;
+    VerdictRig r_;
+    int16_t refusal_ = 0;
+    uint64_t importAboveId_ = 0;
+    std::vector<uint64_t> ids_;
+    std::vector<Sent> sent_;
+    std::vector<std::pair<int64_t, int64_t>> dups_;
+    std::map<int64_t, int32_t> seqs_;
+    std::map<int64_t, VerdictRig::Ack> acksByCorr_;
+    std::map<int64_t, std::size_t> batches_;
+    std::map<int64_t, CheckedWritesModel::AutoIncAck> keyZero_;
+    int16_t firstAckCode_ = 0;
+    int64_t txnOffset_ = -1, cutTo_ = 0;
+};
+
+}  // namespace
+
 class CheckedWritesMatrix : public ::testing::TestWithParam<Cell> {};
 
 TEST_P(CheckedWritesMatrix, Holds) {
     const Cell c = GetParam();
     const Expected ex = expect(c);
     if (!ex.applicable) GTEST_SKIP() << ex.naReason;
-    if (isP05(c)) KeyIndexCellRun(c).run();
+    if (isP06(c)) AutoIncCellRun(c).run();
+    else if (isP05(c)) KeyIndexCellRun(c).run();
     else CellRun(c).run();
 }
 
@@ -711,6 +1170,11 @@ INSTANTIATE_TEST_SUITE_P(Cell05, CheckedWritesMatrix, ::testing::ValuesIn(cellsF
         return std::string(nameOf(i.param.op)) + "_" + nameOf(i.param.entity) + "_" + nameOf(i.param.timing);
     });
 
+INSTANTIATE_TEST_SUITE_P(Cell06, CheckedWritesMatrix, ::testing::ValuesIn(cellsFor(Part::P06)),
+    [](const ::testing::TestParamInfo<Cell>& i) {
+        return std::string(nameOf(i.param.op)) + "_" + nameOf(i.param.entity) + "_" + nameOf(i.param.timing);
+    });
+
 TEST(CheckedWritesMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(applicable(cellsFor(Part::P03)), 78u);
     EXPECT_EQ(skipped(cellsFor(Part::P03)), 2u);
@@ -718,6 +1182,8 @@ TEST(CheckedWritesMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(skipped(cellsFor(Part::P04)), 15u);
     EXPECT_EQ(applicable(cellsFor(Part::P05)), 560u);
     EXPECT_EQ(skipped(cellsFor(Part::P05)), 70u);
+    EXPECT_EQ(applicable(cellsFor(Part::P06)), 798u);
+    EXPECT_EQ(skipped(cellsFor(Part::P06)), 84u);
 }
 
 // The model's key index rule against the Single-timing table, all 30 op x entity pairs, on hand-built logs.
@@ -781,4 +1247,52 @@ TEST(CheckedWritesModel, ReferenceJudgeIsIndependent) {
     EXPECT_EQ(m.latestAcceptedByKey().at(2).offset, 9);
     EXPECT_EQ(m.projection(), (std::map<uint64_t, std::pair<int64_t, uint8_t>>{{2, {21, 3}}, {6, {60, 1}}}));
     EXPECT_EQ(m.countByTag(), (std::map<uint8_t, int64_t>{{1, 1}, {3, 1}}));
+}
+
+// The id predicates against hand-made logs: each fails on the one violation it names and holds on the clean log.
+TEST(CheckedWritesModel, AutoIncPredicatesCatchHandMadeViolations) {
+    using Log = VerdictRig::RigLog;
+    using LogRec = VerdictRig::RigLogRec;
+    using Ack = CheckedWritesModel::AutoIncAck;
+    const auto rec = [](int64_t offset, uint64_t id) { return LogRec{offset, id, 1, 1, false, 1, id}; };
+    const auto model = [](int32_t partitions, int32_t partition) {
+        CheckedWritesModel m;
+        m.addAutoIncRule(AutoIncShape{.partitions = partitions}, partition);
+        return m;
+    };
+    Log clean;
+    clean.reservations = {{0, 8}};
+    clean.data = {rec(1, 1), rec(2, 2), rec(3, 3)};
+    const std::vector<Ack> acks{{1, 1, 2}, {3, 3, 1}};
+    const CheckedWritesModel one = model(1, 0);
+    EXPECT_TRUE(one.noIdTwiceNoReuse(clean, acks));
+    EXPECT_TRUE(one.idsFollowTheStride(clean, acks));
+    EXPECT_TRUE(one.reservationCoversEveryId(clean));
+    EXPECT_TRUE(one.ackedIdsMatchTheLog(clean, acks));
+    EXPECT_TRUE(one.counterAboveEveryId(clean, AutoIncReady{4, 8}));
+
+    Log twice = clean;
+    twice.data[2] = rec(3, 2);
+    EXPECT_FALSE(one.noIdTwiceNoReuse(twice, acks)) << "an id in two key-0 records";
+    EXPECT_FALSE(one.noIdTwiceNoReuse(clean, {{1, 1, 2}, {3, 2, 1}})) << "an id in two acks";
+
+    Log above = clean;
+    above.data.push_back(rec(4, 9));
+    EXPECT_FALSE(one.reservationCoversEveryId(above)) << "an id above the latest reservation";
+    Log early = clean;
+    early.reservations = {{2, 8}};
+    EXPECT_FALSE(one.reservationCoversEveryId(early)) << "the reservation sits above the first id";
+
+    Log skipped = clean;
+    skipped.data = {rec(1, 1), rec(2, 3)};
+    EXPECT_FALSE(one.idsFollowTheStride(skipped, {{1, 1, 2}})) << "keys 1, 3 at P 1";
+    EXPECT_FALSE(model(4, 2).idsFollowTheStride(clean, {{1, 1, 1}})) << "a base on another partition";
+
+    Log valueKey = clean;
+    valueKey.data[0].valueId = 7;
+    EXPECT_FALSE(one.ackedIdsMatchTheLog(valueKey, acks)) << "a value carrying another key";
+    EXPECT_FALSE(one.ackedIdsMatchTheLog(clean, {{1, 2, 1}})) << "assignedBase is not the first key";
+
+    EXPECT_FALSE(one.counterAboveEveryId(clean, AutoIncReady{3, 8})) << "the counter is not above id 3";
+    EXPECT_FALSE(one.counterAboveEveryId(clean, AutoIncReady{9, 7})) << "the reservation does not reach nextN - 1";
 }

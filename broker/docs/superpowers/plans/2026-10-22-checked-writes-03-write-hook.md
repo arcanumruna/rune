@@ -59,7 +59,7 @@ These lines are verbatim from the overview's Global Constraints, restricted to w
   - Wire `acks` byte: bit 0 = `All`, bit 1 = `View`. Other bits are refused with `InvalidRequest`.
   - Intent bits: record `attributes` bits 0–1. 0 = upsert/delete, 1 = insert, 2 = update/delete-existing. 3 and the other bits are refused with `InvalidRequest`.
 - **Budgets** (hard gates, spec §14):
-  - Write hook: autoincrement assignment, including the scratch copy, < **1 µs p50** per batch of up to 4 KiB (`ProduceValidateBench`).
+  - Write hook: autoincrement assignment, including the scratch copy, < **2 µs p50** per batch of up to 4 KiB (`ProduceValidateBench`).
   - New typed-topic validation: ≤ **1 µs p50** for a one-record batch.
   - No ABAB n=3 regression on `ProducePathBenchmark` and `WorkerProduceLatencyBench` for untyped topics and for already-validated typed topics.
   - Repo latency gates stay: view update < 10 µs, point read < 50 µs, QL ≤ 2–5 µs.

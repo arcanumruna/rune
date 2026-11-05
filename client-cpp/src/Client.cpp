@@ -3041,7 +3041,12 @@ TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t 
                  result.version        = static_cast<uint16_t>(c.aux);
                  result.errorCode      = c.errorCode;
                  result.partitionCount = static_cast<int32_t>(c.reserved0);  // Phase 2b C
-                 if (c.status == OpStatus::Ok) result.descriptorBlob.assign(p.begin(), p.end());
+                result.hasKeyFeatures = schemaHasKeyFeatures(c);
+                if (result.hasKeyFeatures) result.keyFeatures = schemaKeyFeaturesOf(c, p);
+                 if (c.status == OpStatus::Ok) {
+                    const auto blob = schemaBlobOf(c, p);
+                    result.descriptorBlob.assign(blob.begin(), blob.end());
+                }
              });
     return result;
 }
@@ -3745,7 +3750,7 @@ int Client::routeBufferedAcks_() {
     bool notLeader = false;
     for (const auto& a : acks) {
         producerHub_.onProduceResponse(a.correlationId, a.baseOffset, a.errorCode, a.logStartOffset, a.hasVerdicts,
-                                       agent_.verdictBytes(a));
+                                       agent_.verdictBytes(a), a.assignedBase);
         notLeader |= a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
     }
     agent_.clearProduceAcks();
@@ -4880,10 +4885,16 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 topicSchemaCache_.put(opt->topicId,
                     metadata::TopicSchemaEntry{opt->version, /*validate=*/false, /*keyField=*/""});
             }
-            const std::span<const uint8_t> blob(
-                opt->descriptorBlob, (opt->descriptorBlob != nullptr) ? opt->descriptorLen : 0u);
+            std::vector<uint8_t> payload;   // cold path: the descriptor blob, then the key-features block when sent
+            if (opt->descriptorBlob != nullptr) payload.assign(opt->descriptorBlob, opt->descriptorBlob + opt->descriptorLen);
+            if (opt->hasKeyFeatures) {
+                payload.resize(payload.size() + rune::protocol::kTopicKeyFeaturesWireLen);
+                rune::protocol::putTopicKeyFeatures(payload.data() + payload.size() - rune::protocol::kTopicKeyFeaturesWireLen,
+                                                    opt->keyFeatures);
+            }
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
-                         opt->topicId, opt->version, opt->errorCode, blob,
+                         opt->topicId, schemaAuxOf(opt->version, opt->hasKeyFeatures),
+                         opt->errorCode, payload,
                          detail::CompletionRing::Overflow::TooLarge,
                          static_cast<uint32_t>(opt->partitionCount));  // Phase 2b C (<=0 = not reported)
         }
@@ -5632,7 +5643,7 @@ Subscription Client::subscribe(TopicHandle      topic,
                                 SubscribeOptions opts,
                                 RecordHandler    handler)
 {
-    const int32_t partition = key.partition(topic.partitionCount);
+    const int32_t partition = key.partition(topic.partitionCount, topic.partitioner);
     return subscribeImpl(topic, partition, /*partitionKnown=*/0,
                          key.bytes(), opts, std::move(handler));
 }

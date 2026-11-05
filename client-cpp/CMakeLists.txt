@@ -270,7 +270,8 @@ set(RUNE_CLAIM_GEN_HEADERS
     "${RUNE_CLAIM_GEN_DIR}/gen/short_key.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/eos_out.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/player_event.gen.h"
-    "${RUNE_CLAIM_GEN_DIR}/gen/ki_account.gen.h")
+    "${RUNE_CLAIM_GEN_DIR}/gen/ki_account.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/ai_user.gen.h")
 add_custom_command(
     OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
     COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"
@@ -781,7 +782,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
 
     # ── Checked writes Part 05 — key index probe (broker/docker/checked-writes-e2e.sh) ──
     #
-    # checked_writes_probe.cpp includes the build-time generated ki_account.gen.h (tests/support/GenClaimSchemas.cpp),
+    # checked_writes_probe.cpp includes the build-time generated ki_account.gen.h and ai_user.gen.h (tests/support/GenClaimSchemas.cpp),
     # so the probe image needs tests/ in its context.
     if(TARGET generate_claim_schema_headers)
         add_executable(checked_writes_probe examples/checked_writes_probe.cpp)
@@ -1142,6 +1143,7 @@ if(BUILD_TESTING)
         tests/client/TypedTopicRoutingRegressionTest.cpp   # Phase 2b C
         tests/client/KeyRoutingRegressionTest.cpp          # Phase 2b C: Key == protocol hash
         tests/client/CheckedWritesTypedTopicTest.cpp       # checked writes: TypedTopic ops + WriteResult
+        tests/client/CheckedWritesAutoIncTypedTest.cpp     # checked writes Part 06: WriteResult::key()
         tests/support/AllocCounter.cpp                     # zero-alloc send check
     )
     add_dependencies(rune_open_topic_tests generate_characters_header)
@@ -1594,6 +1596,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerAckPathTest.cpp
             tests/producer/ProducerAcksFlagsTest.cpp
             tests/producer/CheckedWritesIntentsTest.cpp
+            tests/producer/CheckedWritesAutoIncClientTest.cpp
             tests/producer/ProducerVerdictsTest.cpp
             tests/producer/ProducerTier2PoolTest.cpp
             tests/producer/ProducerSendTest.cpp

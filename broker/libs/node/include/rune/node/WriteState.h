@@ -12,6 +12,8 @@
 #include <rune/codec/Serialize.h>
 #include <rune/codec/Validator.h>
 #include <rune/protocol/BatchRebuild.h>
+#include <rune/protocol/CatalogTypes.h>
+#include <rune/node/AutoInc.h>
 #include <rune/node/VerdictState.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/RejectedOffsetIndex.h>
@@ -29,7 +31,9 @@ namespace rune::node {
 inline constexpr uint16_t kNoKeyField  = 0xFFFF;
 inline constexpr uint32_t kNoKeyOffset = 0xFFFFFFFF;
 
-/// The WriteSpecUpdate tail: [topicId i32][keyFieldId u16][keyType u8][keyWidth u8][flags u8: bit0 legacyValidate, bit1 keyIndex].
+/// The WriteSpecUpdate tail: [topicId i32][keyFieldId u16][keyType u8][keyWidth u8][flags u8: bit0 legacyValidate, bit1 keyIndex,
+/// bit2 autoIncrement], then, with autoIncrement only, [partitioner u8][autoIncrementMax u64][autoIncrementReserve u32]
+/// [partitionCount i32] (26 bytes in all).
 struct TopicWriteSpecWire {
     int32_t              topicId        = -1;
     uint16_t             keyFieldId     = kNoKeyField;   ///< the key field's durable tag; kNoKeyField = a keyless topic
@@ -37,23 +41,42 @@ struct TopicWriteSpecWire {
     uint8_t              keyWidth       = 0;             ///< 0 = the key cannot be checked (a key type from before the topic key rule)
     bool                 legacyValidate = false;         ///< the catalog's SchemaDef::validate: validates below kCheckedWrites
     bool                 keyIndex       = false;         ///< the topic's key.index feature
+    bool                 autoIncrement  = false;         ///< the topic's autoincrement feature; the fields below ride the wire only with it
+    rune::protocol::Partitioner partitioner = rune::protocol::Partitioner::Fnv1a;
+    uint64_t             autoIncrementMax     = rune::protocol::kAutoIncrementMaxDefault;       ///< the effective cap
+    uint32_t             autoIncrementReserve = rune::protocol::kAutoIncrementReserveDefault;
+    int32_t              partitionCount = 0;
     bool operator==(const TopicWriteSpecWire&) const = default;
 };
 inline constexpr std::size_t kTopicWriteSpecWireLen = 9;
+inline constexpr std::size_t kTopicWriteSpecAutoIncWireLen = 26;
 
-/// Writes kTopicWriteSpecWireLen bytes; 0 when `out` is too small.
+[[nodiscard]] constexpr std::size_t topicWriteSpecWireLen(const TopicWriteSpecWire& w) noexcept {
+    return w.autoIncrement ? kTopicWriteSpecAutoIncWireLen : kTopicWriteSpecWireLen;
+}
+
+/// Writes topicWriteSpecWireLen(w) bytes; 0 when `out` is too small.
 inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<uint8_t> out) noexcept {
-    if (out.size() < kTopicWriteSpecWireLen) return 0;
+    const std::size_t len = topicWriteSpecWireLen(w);
+    if (out.size() < len) return 0;
     std::memcpy(out.data(), &w.topicId, 4);
     std::memcpy(out.data() + 4, &w.keyFieldId, 2);
     out[6] = static_cast<uint8_t>(w.keyType);
     out[7] = w.keyWidth;
-    out[8] = static_cast<uint8_t>((w.legacyValidate ? 1 : 0) | (w.keyIndex ? 2 : 0));
-    return kTopicWriteSpecWireLen;
+    out[8] = static_cast<uint8_t>((w.legacyValidate ? 1 : 0) | (w.keyIndex ? 2 : 0) | (w.autoIncrement ? 4 : 0));
+    if (w.autoIncrement) {
+        out[9] = static_cast<uint8_t>(w.partitioner);
+        std::memcpy(out.data() + 10, &w.autoIncrementMax, 8);
+        std::memcpy(out.data() + 18, &w.autoIncrementReserve, 4);
+        std::memcpy(out.data() + 22, &w.partitionCount, 4);
+    }
+    return len;
 }
 
 [[nodiscard]] inline std::optional<TopicWriteSpecWire> decodeTopicWriteSpec(std::span<const uint8_t> in) noexcept {
-    if (in.size() != kTopicWriteSpecWireLen || (in[8] & 0xFC) != 0) return std::nullopt;
+    if (in.size() != kTopicWriteSpecWireLen && in.size() != kTopicWriteSpecAutoIncWireLen) return std::nullopt;
+    const bool autoInc = (in[8] & 4) != 0;
+    if ((in[8] & 0xF8) != 0 || autoInc != (in.size() == kTopicWriteSpecAutoIncWireLen)) return std::nullopt;
     TopicWriteSpecWire w;
     std::memcpy(&w.topicId, in.data(), 4);
     std::memcpy(&w.keyFieldId, in.data() + 4, 2);
@@ -61,6 +84,14 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
     w.keyWidth       = in[7];
     w.legacyValidate = (in[8] & 1) != 0;
     w.keyIndex       = (in[8] & 2) != 0;
+    if (autoInc) {
+        if (in[9] > static_cast<uint8_t>(rune::protocol::Partitioner::Modulo)) return std::nullopt;
+        w.autoIncrement = true;
+        w.partitioner   = static_cast<rune::protocol::Partitioner>(in[9]);
+        std::memcpy(&w.autoIncrementMax, in.data() + 10, 8);
+        std::memcpy(&w.autoIncrementReserve, in.data() + 18, 4);
+        std::memcpy(&w.partitionCount, in.data() + 22, 4);
+    }
     return w;
 }
 
@@ -71,6 +102,13 @@ inline std::size_t encodeTopicWriteSpec(const TopicWriteSpecWire& w, std::span<u
     w.topicId        = t.topicId;
     w.legacyValidate = t.schema->validate;
     w.keyIndex       = t.schema->keyFeatures.keyIndex;
+    if (const auto& f = t.schema->keyFeatures; f.autoIncrement) {
+        w.autoIncrement        = true;
+        w.partitioner          = f.partitioner;
+        w.autoIncrementMax     = f.autoIncrementMax;
+        w.autoIncrementReserve = f.autoIncrementReserve;
+        w.partitionCount       = t.partitions;
+    }
     if (t.schema->keyField.empty()) return w;
     const rune::codec::Descriptor d = rune::codec::deserialize(t.schema->evolvingBlob);
     for (const auto& f : d.fields) {
@@ -97,6 +135,11 @@ public:
     uint8_t               keyWidth       = 0;
     bool                  legacyValidate = false;
     bool                  keyIndex       = false;
+    bool                  autoIncrement  = false;
+    rune::protocol::Partitioner partitioner = rune::protocol::Partitioner::Fnv1a;
+    uint64_t              autoIncrementMax     = rune::protocol::kAutoIncrementMaxDefault;
+    uint32_t              autoIncrementReserve = rune::protocol::kAutoIncrementReserveDefault;
+    int32_t               partitionCount = 0;
     /// The topic's evolving descriptor (every field ever declared), from the FilterSchema op; the key index decodes each writer version through it.
     std::optional<rune::codec::Descriptor> evolving;
 
@@ -131,6 +174,11 @@ public:
         keyWidth       = w.keyWidth;
         legacyValidate = w.legacyValidate;
         keyIndex       = w.keyIndex;
+        autoIncrement  = w.autoIncrement;
+        partitioner    = w.partitioner;
+        autoIncrementMax     = w.autoIncrementMax;
+        autoIncrementReserve = w.autoIncrementReserve;
+        partitionCount = w.partitionCount;
         hasFacts_      = true;
         for (auto& sv : versions_)
             if (sv) setKeyOffset_(*sv);
@@ -163,6 +211,9 @@ struct PartitionWriteState {
     uint64_t                           seenLogGeneration = UINT64_MAX;   ///< the replica's log generation the timeline and ledger are in step with
     int64_t                            scanHw = 0;           ///< the replica HW at the start of this pass: the scan feed commits ledger slots below it
     bool                               growOwed = false;     ///< the judge saw the rejected index cross 75 %: the worker's cold maintenance grows it
+    AutoIncState                       autoInc;              ///< the partition's id counter (an autoincrement topic only)
+    AssignedBaseWindow                 assignedBases;        ///< the last assigned bases per producer, for retried key-0 batches
+    AutoIncStats                       autoIncStats;
 
     /// A judge is attached or the latest logged set is non-empty.
     [[nodiscard]] bool isVerdictSource() const noexcept;

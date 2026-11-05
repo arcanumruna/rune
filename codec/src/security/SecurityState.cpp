@@ -176,7 +176,8 @@ bool validGrant(uint32_t roleNsId, std::string_view roleNsName, const GrantSpec&
         }
         break;
     }
-    if (!(allowed & opBit(g.op))) return false;
+    // IMPORT has no opBit (it lives outside the uint8 masks): valid on TOPIC only
+    if (g.op == Operation::Import ? p.type != ResourceType::Topic : !(allowed & opBit(g.op))) return false;
     // I6: internal objects ("__…": __security, __catalog, __consumer_offsets, …) are never grantable by pattern;
     // and a pattern is bounded like the names it matches (the protocol's kSecurityPatternMax).
     if (p.type != ResourceType::Cluster && (p.name.starts_with("__") || p.name.size() > 249)) return false;

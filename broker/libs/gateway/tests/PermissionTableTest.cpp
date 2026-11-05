@@ -251,7 +251,7 @@ TEST(PermissionPoolRegression, AnObjectCreatedUpdatesEachLiveTableOnceRegression
     const auto stranger = pool.acquire(roleSet("other"), idx);
     idx.onTopic(10, "worldw.new");
     int calls = 0, writeGained = 0;
-    pool.onObjectCreated(10, *idx.at(10), [&](uint32_t, const rg::PermissionTable&, bool before, bool after) {
+    pool.onObjectCreated(10, *idx.at(10), [&](uint32_t, const rg::PermissionTable&, bool before, bool after, bool, bool) {
         ++calls;
         writeGained += !before && after ? 1 : 0;
     });
@@ -363,10 +363,10 @@ TEST(PermissionPoolAdversarialRegression, ADroppedTopicIdReusedOutsideThePrefixI
     const auto r = pool.acquire(roleSet("world"), idx);
     ASSERT_TRUE(r->allows(3, rs::opBit(Operation::Write)));
     idx.onDropped(3);
-    pool.onObjectDropped(3, [](uint32_t, const rg::PermissionTable&, bool, bool) {});
+    pool.onObjectDropped(3, [](uint32_t, const rg::PermissionTable&, bool, bool, bool, bool) {});
     EXPECT_FALSE(r->allows(3, rs::opBit(Operation::Write)));
     idx.onTopic(3, "elsewhere.3");
-    pool.onObjectCreated(3, *idx.at(3), [](uint32_t, const rg::PermissionTable&, bool, bool) {});
+    pool.onObjectCreated(3, *idx.at(3), [](uint32_t, const rg::PermissionTable&, bool, bool, bool, bool) {});
     EXPECT_FALSE(r->allows(3, rs::opBit(Operation::Write))) << "the reused id is a different topic";
     EXPECT_FALSE(r->allows(3, rs::opBit(Operation::Read)));
 }
@@ -500,4 +500,51 @@ TEST(PermissionTableRegression, NamespaceAdminHoldsDdlInItsOwnNamespaceRegressio
     EXPECT_FALSE(describeOnly.allowsName(ResourceType::Topic, "x", rs::opBit(Operation::Create))) << "DESCRIBE is not admin";
     const auto unnamed = rg::PermissionTable::compile(adm, 1, idx);
     EXPECT_FALSE(unnamed.allows(0, rs::opBit(Operation::Describe))) << "no namespace name: nothing implied";
+}
+
+TEST(CheckedWritesImportGrant, TableMirrorsImportBits) {
+    rg::ObjectIndex idx; idx.onTopic(3, "user"); idx.onTopic(4, "char");
+    const std::vector<rs::GrantSpec> grants = {g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "user"),
+                                               g(Operation::Import, ResourceType::Topic, PatternKind::Exact, "user")};
+    auto t = rg::PermissionTable::compile(grants, idx);
+    ASSERT_FALSE(t.importBits().empty());
+    EXPECT_EQ(t.importBits()[0], uint64_t{1} << 3);
+    EXPECT_TRUE(t.allowsImport(3));
+    EXPECT_FALSE(t.allowsImport(4));
+    EXPECT_TRUE(t.allows(3, rs::opBit(Operation::Write)));
+    t.onObjectDropped(3);
+    EXPECT_EQ(t.importBits()[0], 0u);
+    EXPECT_TRUE(rg::PermissionTable::allowAll().allowsImport(3));
+    EXPECT_FALSE(rg::PermissionTable::denyAll().allowsImport(3));
+}
+
+TEST(CheckedWritesImportGrant, NothingImpliesImport) {
+    rg::ObjectIndex idx; idx.onTopic(3, "user");
+    const std::vector<rs::GrantSpec> topicOps = {
+        g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "user"), g(Operation::Alter, ResourceType::Topic, PatternKind::Exact, "user"),
+        g(Operation::Create, ResourceType::Topic, PatternKind::Exact, "user"), g(Operation::Drop, ResourceType::Topic, PatternKind::Exact, "user")};
+    auto t = rg::PermissionTable::compile(topicOps, idx);
+    EXPECT_FALSE(t.allowsImport(3));
+    std::vector<rs::GrantSpec> root = topicOps;
+    root.push_back(g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, ""));
+    root.push_back(g(Operation::Create, ResourceType::Cluster, PatternKind::Exact, ""));
+    root.push_back(g(Operation::Alter, ResourceType::Cluster, PatternKind::Exact, ""));
+    t = rg::PermissionTable::compile(root, idx);
+    EXPECT_TRUE(t.isRoot());
+    EXPECT_FALSE(t.allowsImport(3)) << "a compiled root grant set does not imply IMPORT (an allow-all table does)";
+    EXPECT_TRUE(t.importBits().empty() || t.importBits()[0] == 0);
+}
+
+TEST(CheckedWritesImportGrantRegression, TheOpMaskEntryPointsNeverAuthorizeImportRegression) {
+    rg::ObjectIndex idx; idx.onTopic(3, "user");
+    const std::vector<rs::GrantSpec> plain = {g(Operation::Write, ResourceType::Topic, PatternKind::Exact, "user")};
+    const std::vector<rs::GrantSpec> root = {g(Operation::Admin, ResourceType::Cluster, PatternKind::Exact, "")};
+    for (const auto& grants : {plain, root}) {
+        const auto t = rg::PermissionTable::compile(grants, idx);
+        EXPECT_TRUE(rg::authorizeTopicId(t, 3, Operation::Import, idx).has_value());
+        EXPECT_TRUE(rg::authorizeName(t, ResourceType::Topic, "user", Operation::Import, 0).has_value());
+        EXPECT_TRUE(rg::authorizeTopicOrViewName(t, "user", Operation::Import, idx, 0).has_value());
+        EXPECT_TRUE(rg::authorizeCluster(t, Operation::Import).has_value());
+        EXPECT_TRUE(rg::authorizeAnyGrant(t, ResourceType::Topic, Operation::Import).has_value());
+    }
 }

@@ -16,7 +16,14 @@
 #                 again over the grown log (the key index was rebuilt from the log);
 #   6. REFUSALS:  key.index on a transient topic, an untyped topic, a keyless topic and a string(9) key give InvalidRequest with
 #                 the four exact messages;
-#   7. print CHECKED-WRITES-E2E: OK.
+#   7. AUTOINC:   ai_user (1 partition, replicas 3, compact, autoincrement); the `backfill` user (write + import) imports ids 1-4999
+#                 in steps of 2 (ids kept); 4 `app` probes (write) create key-0 x 5,000 each, the partition leader `docker kill`ed at
+#                 ~30 % and restarted once progress resumes.  Check: every returned id is unique and above 4,999, none is StoredIdUnknown /
+#                 VerdictUnknown / Timeout, a subscription from 0 holds exactly the imported and the returned ids.  Bounded at 600 s.
+#                 Then the highest returned id is removed, all three nodes are restarted and one more create gives an id above it.
+#                 Refusals: `app` importing id 2 gives 45; autoincrement on a cleanup.policy = delete topic and an IMPORT grant on a
+#                 view are refused.  Prints AUTOINC: OK;
+#   8. print CHECKED-WRITES-E2E: OK.
 #
 # Usage (on the VM, under the host lock):
 #   ssh root@$RUNE_VM_HOST 'flock -w 7200 /root/vm.lock bash broker/docker/checked-writes-e2e.sh'
@@ -25,6 +32,7 @@
 #   ARCANUM_METRICS_DIR     the arcanum-metrics checkout (default: <monorepo>/../arcanum-metrics)
 #   KI_E2E_IDS              ids the racers insert (default 20000)       KI_E2E_WORKERS   racing containers (default 4)
 #   KI_E2E_THREADS          writer threads per container (default 16)
+#   AI_E2E_CREATES          key-0 creates per racing container in leg 7 (default 5000)
 #   E2E_LOG_DIR             when set, the brokers' and the probes' logs are kept there at teardown
 #
 # House style: bounded waits, trap teardown (`docker compose down -v` on every exit path), every failure names its step.
@@ -49,6 +57,8 @@ mkdir -p "${SHARED}"
 IDS="${KI_E2E_IDS:-20000}"
 WORKERS="${KI_E2E_WORKERS:-4}"
 THREADS="${KI_E2E_THREADS:-16}"
+AI_CREATES="${AI_E2E_CREATES:-5000}"
+AI_IMPORT_MAX=5000     # the back-fill imports the odd ids below it; every id the creators are answered with is above 4999
 LIFECYCLE_IDS=2000     # the probe's KI_E2E_LIFECYCLE_IDS default; the restart leg's removed set is derived from it
 PARTS=4
 BROKER_PORT=40200
@@ -151,7 +161,8 @@ partition_leader() {
     echo "${best_n}"
 }
 
-kill_node() { docker kill "$(cname $(( $1 + 1 )))" >/dev/null || fail "docker kill of rune-$(( $1 + 1 )) failed"; }
+KILLED_AT=0
+kill_node() { docker kill "$(cname $(( $1 + 1 )))" >/dev/null || fail "docker kill of rune-$(( $1 + 1 )) failed"; KILLED_AT="$(now_s)"; }
 SINCE=""
 links_since() {
     local n="$1" id c
@@ -163,6 +174,8 @@ links_since() {
 }
 restart_node() {
     local n=$(( $1 + 1 ))
+    # a restart inside the driver dir lock's 1 s heartbeat window of the kill is refused (same pid 1): wait it out
+    [ "$(( $(now_s) - KILLED_AT ))" -ge 3 ] || sleep 3
     SINCE="$(date +%s)"   # epoch seconds: no timezone ambiguity
     docker start "$(cname "${n}")" >/dev/null || fail "docker start of rune-${n} failed"
     wait_until "${LINK_WAIT_S}" "rune-${n}'s peer links" links_since "${n}" \
@@ -192,13 +205,13 @@ restart_all() {   # docker restart of all three nodes at once, then both peer li
 
 # ---- probe runs (checked_writes_probe in its own container on the compose network) -----------------------------------
 SEED_NODE=1            # the broker the probes connect to (1-3); moved off the partition-0 leader after setup
-# probe_args <container name> : the docker-run arguments (one per line).
+# probe_args <container name> : the docker-run arguments (one per line).  PROBE_USER / PROBE_PW (a file in the work dir) name another user.
 probe_args() {
     local name="$1"
     printf -- '--name\n%s\n--hostname\n%s\n--network\n%s\n--platform\nlinux/amd64\n--shm-size=256m\n--security-opt\nseccomp=unconfined\n' "${name}" "${name}" "${NETWORK}"
     printf -- '-e\nRUNE_TARGET=aeron:udp?endpoint=rune-%s:%s\n-e\nRUNE_EGRESS_HOST=%s\n-e\nRUNE_EGRESS_PORT=40500\n' "${SEED_NODE}" "${BROKER_PORT}" "${name}"
     printf -- '-e\nRUNE_DATA_DIR=/tmp/fp\n-e\nRUNE_TIMEOUT_MS=30000\n-e\nKI_E2E_SHARED=/shared\n-e\nKI_E2E_THREADS=%s\n-v\n%s:/shared\n' "${THREADS}" "${SHARED}"
-    printf -- '-e\nRUNE_USER=%s\n-e\nRUNE_PASSWORD_FILE=/work/e2e.pw\n-e\nRUNE_TLS_CA_FILE=/work/ca.pem\n-v\n%s:/work:ro\n' "${RUNE_AUTH_E2E_USER}" "${RUNE_AUTH_WORK_DIR}"
+    printf -- '-e\nRUNE_USER=%s\n-e\nRUNE_PASSWORD_FILE=/work/%s\n-e\nRUNE_TLS_CA_FILE=/work/ca.pem\n-v\n%s:/work:ro\n' "${PROBE_USER:-${RUNE_AUTH_E2E_USER}}" "${PROBE_PW:-e2e.pw}" "${RUNE_AUTH_WORK_DIR}"
 }
 # probe_run <tag> <timeout_s> <mode> [flags...] : foreground; sets PROBE_RC; files ${WORK_DIR}/<tag>.out|.err.
 PROBE_RC=0
@@ -242,9 +255,9 @@ leg() {
     [ "${PROBE_RC}" -eq 0 ] || { out_of "${tag}" | tail -30 >&2; fail "${tag} exited ${PROBE_RC}"; }
     out_has "${tag}" "${marker}" || { out_of "${tag}" | tail -30 >&2; fail "no ${marker} from ${tag}"; }
 }
-race_progress() {
+race_progress() {   # [tag]: the completed writes of the tag's workers (default race)
     local s=0 f v
-    for f in "${SHARED}"/race-progress-w*; do
+    for f in "${SHARED}/${1:-race}"-progress-w*; do
         [ -f "${f}" ] || continue
         case "${f}" in *.tmp) continue ;; esac
         v=$(cat "${f}" 2>/dev/null) || v=0
@@ -252,7 +265,7 @@ race_progress() {
     done
     echo "${s}"
 }
-progress_at_least() { [ "$(race_progress)" -ge "$1" ]; }
+progress_at_least() { [ "$(race_progress "${2:-race}")" -ge "$1" ]; }
 
 # ---------------------------------------------------------------------------
 # Leg 1: images, the key, the cluster, bootstrap, ki_account.
@@ -388,5 +401,101 @@ LEG="leg 6"
 log "Leg 6: REFUSALS: key.index on a transient, an untyped, a keyless and a string(9)-keyed topic..."
 leg refusals "${LEG_S}" "CHECKED-WRITES-REFUSALS: OK" refusals
 log "Leg 6 OK"
+
+# ---------------------------------------------------------------------------
+# Leg 7: AUTOINC.
+# ---------------------------------------------------------------------------
+LEG="leg 7"
+log "Leg 7a: AI-SETUP: ai_user (1 partition, replicas 3, compact, autoincrement); users backfill (write, import) and app (write)..."
+leg ai-setup 300 "CHECKED-WRITES-AI-SETUP: OK" ai-setup
+AI_TOPIC_ID=$(grep -oE '^AI_TOPIC_ID=[0-9]+' "${WORK_DIR}/ai-setup.out" | cut -d= -f2) || true
+[ -n "${AI_TOPIC_ID}" ] || fail "ai-setup printed no topic id"
+for u in backfill app; do rune_auth_gen_password "${RUNE_AUTH_WORK_DIR}/${u}.pw" || fail "no password for ${u}"; done
+(
+    umask 077
+    for u in backfill app; do
+        printf "CREATE USER %s WITH PASSWORD '%s';\n" "${u}" "$(cat "${RUNE_AUTH_WORK_DIR}/${u}.pw")"
+        echo "GRANT WRITE ON TOPIC 'ai_user' TO USER ${u};"
+    done
+    echo "GRANT IMPORT ON TOPIC 'ai_user' TO USER backfill;"
+) > "${RUNE_AUTH_WORK_DIR}/ai-users.rql"
+set +e
+out=$(rune_auth_cli_admin "${RUNE_AUTH_NETWORK}" ql -f /work/ai-users.rql --broker "rune-1:${BROKER_PORT}" 2>&1); rc=$?
+set -e
+rm -f "${RUNE_AUTH_WORK_DIR}/ai-users.rql"
+[ "${rc}" -eq 0 ] || { echo "${out}" >&2; fail "creating the backfill and app users failed (exit ${rc})"; }
+wait_until 120 "the ai_user leader" partition_leader "${AI_TOPIC_ID}" 0 || fail "ai_user partition 0 has no leader"
+AI_LEADER=$(partition_leader "${AI_TOPIC_ID}" 0) || fail "no leader of ai_user partition 0"
+if [ "${AI_LEADER}" = "0" ]; then SEED_NODE=2; else SEED_NODE=1; fi   # the probes never connect through the node the race kills
+
+log "Leg 7b: AI-BACKFILL: backfill imports ids 1-$(( AI_IMPORT_MAX - 1 )) in steps of 2..."
+PROBE_USER=backfill PROBE_PW=backfill.pw leg ai-backfill "${LEG_S}" "CHECKED-WRITES-AI-BACKFILL: DONE" ai-backfill --ids "1-${AI_IMPORT_MAX}" --step 2
+# An explicit-id import is answered ok with key 0 (spec P6-10): the ids are proven kept by the verify below.
+awk -v rows=$(( AI_IMPORT_MAX / 2 )) '
+    { n++; if ($3 != 0) { if (shown++ < 10) printf "id %d: code %d\n", $1, $3; bad = 1 } }
+    END { if (n != rows) { printf "%d results, want %d\n", n, rows; bad = 1 } exit bad }' "${SHARED}/ai-backfill-w0.txt" > "${WORK_DIR}/ai-backfill-check.txt" \
+    || { cat "${WORK_DIR}/ai-backfill-check.txt" >&2; fail "the back-fill was not all ok"; }
+
+AI_TOTAL=$(( WORKERS * AI_CREATES ))
+log "Leg 7c: AI-RACE: ${WORKERS} app containers create ${AI_CREATES} ids each (${AI_TOTAL}); the ai_user leader is killed at ~30 %..."
+AI_START=$(now_s)
+for i in $(seq 0 $(( WORKERS - 1 ))); do
+    PROBE_USER=app PROBE_PW=app.pw probe_start "ai-create-${i}" "${RACE_S}" ai-create --worker "${i}" --count "${AI_CREATES}"
+done
+wait_until "${RACE_S}" "30 % of the creates" progress_at_least $(( AI_TOTAL * 30 / 100 )) ai-create \
+    || { out_of ai-create-0 | tail -20 >&2; fail "the creates never reached 30 % within ${RACE_S}s (at $(race_progress ai-create) of ${AI_TOTAL})"; }
+AI_LEADER=$(partition_leader "${AI_TOPIC_ID}" 0) || fail "no leader of ai_user partition 0 at the kill"
+BASE=$(race_progress ai-create)
+log "Leg 7: killing node ${AI_LEADER}, the ai_user leader, at ${BASE} of ${AI_TOTAL} creates"
+kill_node "${AI_LEADER}"
+RESUME_AT=$(( BASE + RESUME_WRITES ))
+[ "${RESUME_AT}" -le "${AI_TOTAL}" ] || RESUME_AT="${AI_TOTAL}"
+wait_until "${RESUME_WAIT_S}" "the creates resuming" progress_at_least "${RESUME_AT}" ai-create \
+    || { out_of ai-create-0 | tail -20 >&2; fail "no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the kill (at $(race_progress ai-create))"; }
+restart_node "${AI_LEADER}"
+log "Leg 7: node ${AI_LEADER} restarted; waiting for the creators..."
+for i in $(seq 0 $(( WORKERS - 1 ))); do
+    left=$(( RACE_S - ($(now_s) - AI_START) ))
+    [ "${left}" -gt 0 ] || left=1
+    wait_until "${left}" "creator ${i}" bg_done "ai-create-${i}" || fail "creator ${i} did not finish within ${RACE_S}s of the start"
+    [ "$(bg_rc "ai-create-${i}")" = "0" ] || { out_of "ai-create-${i}" | tail -20 >&2; fail "creator ${i} exited $(bg_rc "ai-create-${i}")"; }
+done
+ai_files=("${SHARED}"/ai-create-w*.txt)
+[ "${#ai_files[@]}" -eq "${WORKERS}" ] || fail "${#ai_files[@]} create result files, want ${WORKERS}"
+awk -v total="${AI_TOTAL}" -v top=$(( AI_IMPORT_MAX - 1 )) '
+    { n++
+      if ($3 != 0) { other[$3]++; next }
+      if ($1 <= top) { if (low++ < 10) printf "id %d is not above %d\n", $1, top; bad = 1 }
+      if (seen[$1]++) { if (dup++ < 10) printf "id %d was returned twice\n", $1; bad = 1 } }
+    END {
+        for (c in other) { printf "result code %s x%d\n", c, other[c]; bad = 1 }
+        if (n != total) { printf "%d results, want %d\n", n, total; bad = 1 }
+        exit bad
+    }' "${ai_files[@]}" > "${WORK_DIR}/ai-create-check.txt" \
+    || { cat "${WORK_DIR}/ai-create-check.txt" >&2; fail "the creators broke 'unique ids above ${AI_IMPORT_MAX}, all ok' (codes 10013 = StoredIdUnknown, 10014 = VerdictUnknown, 10002 = Timeout)"; }
+AI_TOP=$(awk '$1 > max { max = $1 } END { print max }' "${ai_files[@]}")
+log "Leg 7: ${AI_TOTAL} unique ids above $(( AI_IMPORT_MAX - 1 )), highest ${AI_TOP}; $(( $(now_s) - AI_START )) s"
+leg ai-verify "${LEG_S}" "CHECKED-WRITES-AI-VERIFY: OK" ai-verify
+
+log "Leg 7d: AI-DELETE-TOP: removing id ${AI_TOP}, restarting all three nodes, one more create..."
+PROBE_USER=app PROBE_PW=app.pw leg ai-remove "${LEG_S}" "CHECKED-WRITES-AI-REMOVE: OK" ai-remove --ids "${AI_TOP}-${AI_TOP}"
+restart_all
+PROBE_USER=app PROBE_PW=app.pw leg ai-after "${LEG_S}" "CHECKED-WRITES-AI-CREATE: DONE" ai-create --worker 0 --count 1 --tag ai-after
+AI_AFTER=$(awk 'NR == 1 && $3 == 0 { print $1 }' "${SHARED}/ai-after-w0.txt")
+[ -n "${AI_AFTER}" ] || { cat "${SHARED}/ai-after-w0.txt" >&2; fail "the create after the restart was not ok"; }
+[ "${AI_AFTER}" -gt "${AI_TOP}" ] || fail "the create after the restart gave id ${AI_AFTER}, not above the removed ${AI_TOP}"
+log "Leg 7: the create after the restart gave ${AI_AFTER}, above the removed ${AI_TOP}"
+
+log "Leg 7e: AI-REFUSALS: a non-granted import, autoincrement on a delete topic, IMPORT on a view..."
+PROBE_USER=app PROBE_PW=app.pw leg ai-denied "${LEG_S}" "CHECKED-WRITES-AI-BACKFILL: DONE" ai-backfill --ids 2-2 --tag ai-denied
+[ "$(awk '{ print $3 }' "${SHARED}/ai-denied-w0.txt")" = "45" ] || { cat "${SHARED}/ai-denied-w0.txt" >&2; fail "app importing id 2 did not give 45"; }
+leg ai-refusals "${LEG_S}" "CHECKED-WRITES-AI-REFUSALS: OK" ai-refusals
+set +e
+out=$(rune_auth_cli_admin "${RUNE_AUTH_NETWORK}" ql -e "grant import on view 'ai_view' to user app;" --broker "rune-${SEED_NODE}:${BROKER_PORT}" 2>&1); rc=$?
+set -e
+[ "${rc}" -ne 0 ] || fail "GRANT IMPORT ON VIEW was accepted"
+[[ "${out}" == *InvalidGrant* ]] || { echo "${out}" >&2; fail "GRANT IMPORT ON VIEW was refused, but not as InvalidGrant"; }
+log "Leg 7 OK"
+echo "AUTOINC: OK"
 
 echo "CHECKED-WRITES-E2E: OK"

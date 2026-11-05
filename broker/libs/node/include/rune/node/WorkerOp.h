@@ -381,6 +381,10 @@ struct WorkerOp {
     // wire `deferAck` byte (kOpFlagCrcValidated) — no protocol change.
     bool crcValidated = false;
 
+    // The session may IMPORT into this topic (Produce only; set by ClientGateway::handleProduce from the session's
+    // PermissionTable).  Carried over the ring as kOpFlagImportGranted of the wire `deferAck` byte.
+    bool importGranted = false;
+
     // durabilityTier: controls when the ProduceResult ack is emitted.
     //   0 = Leader  — ack immediately after appendNoSync (today's default).
     //   1 = Majority — ack after HW advance (gateway-side gate, same as today).
@@ -716,6 +720,7 @@ inline constexpr uint8_t kOpFlagFreshCursor  = 0x04;   ///< WorkerOp::freshCurso
 inline constexpr uint8_t kOpFlagKeyPending   = 0x10;   ///< WorkerOp::keyPending (SessionAnnounce only)
 inline constexpr uint8_t kOpFlagResponseBind = 0x20;   ///< WorkerOp::responseBind (SessionAnnounce only; NAT-safe egress)
 inline constexpr uint8_t kOpFlagSessionEgress = 0x40;  ///< WorkerOp::sessionEgress (Subscribe only; NAT-safe egress)
+inline constexpr uint8_t kOpFlagImportGranted = 0x80;  ///< WorkerOp::importGranted (Produce only)
 
 // ---------------------------------------------------------------------------
 // workerOpFrameBytes — the encoded size of one WorkerOp ring frame carrying a

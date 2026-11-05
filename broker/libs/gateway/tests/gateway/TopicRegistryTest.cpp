@@ -4,6 +4,7 @@
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -194,6 +195,20 @@ TEST(TopicRegistry, PartitionForKeyInRange) {
     EXPECT_EQ(p, 4);
     EXPECT_GE(p, 0);
     EXPECT_LT(p, 8);
+}
+
+TEST(CheckedWritesAutoIncRouting, RegistryRoutesByTheTopicsPartitioner) {
+    auto dir = makeTempDir("pfkmod");
+    std::filesystem::create_directories(dir);
+    TopicSpec modulo = makeSpec("ids", 4, 0);
+    modulo.partitioner = rune::protocol::Partitioner::Modulo;
+    TopicSpec fnv = makeSpec("hashed", 4, 1);
+    std::vector<TopicSpec> specs = {modulo, fnv};
+    TopicRegistry reg(specs, dir.string());
+
+    const std::array<uint8_t, 8> id10{10, 0, 0, 0, 0, 0, 0, 0};
+    EXPECT_EQ(reg.partitionForKey(0, id10), 2);
+    EXPECT_EQ(reg.partitionForKey(1, id10), rune::protocol::partitionForKey(id10, 4));
 }
 
 TEST(TopicRegistry, PartitionForKeySinglePartitionAlwaysZero) {

@@ -24,12 +24,6 @@ uint16_t writerVersionOf(std::string_view value, uint16_t fallback) noexcept {
 
 }  // namespace
 
-uint64_t keyIndexWord(std::string_view wireKey) noexcept {
-    uint64_t w = 0;
-    for (std::size_t i = 0; i < wireKey.size(); ++i) w |= static_cast<uint64_t>(static_cast<uint8_t>(wireKey[i])) << (8 * i);
-    return w;
-}
-
 rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold& f, const rune::view::SourceRecord& rec, rune::view::Prospect& p) noexcept {
     p.clear();
     if (rec.key.size() != f.keyWidth) {
@@ -267,7 +261,9 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     needsActivation_ = false;
     if (state.rejected.capacity() == 0) state.rejected.reserve(kIndexReserve);
     judgeCursor_ = std::max(extendOverEmptySets_(state.rejected.coveredThrough()), logStart_);
-    emitFrom_    = std::max(extendOverEmptySets_(state.markers.committedThrough()), logStart_);
+    // §8.5: the markers in this leader's log commit with it (a leader never truncates), so it marks only above them.  Not from
+    // W: a lagging HW puts W below ranges the cleaner may already have compacted, and a re-mark from this index would disagree.
+    emitFrom_    = std::max(extendOverEmptySets_(state.markers.appendedThrough()), logStart_);
     state.rejected.noteCovered(judgeCursor_);
     for (Member& m : members_) discardCheckpointAhead_(m);
     activeSet_ = *state.constraintSets.setAt(judgeCursor_);
@@ -404,6 +400,15 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
     return {};
 }
 
+void VerdictSource::noteKeyZeroRejection_(const Verdict& v, const rune::view::SourceRecord& rec) noexcept {
+    if (v.code != static_cast<uint16_t>(rune::protocol::client::ErrorCode::KeyExists)) {
+        ++state_->autoIncStats.idsBurned;
+        return;
+    }
+    ++state_->autoIncStats.assignedKeyExists;   // an assigned id the key index already holds: the counter reused it
+    spdlog::critical("AUTOINC-ID-REUSE topic={} partition={} id={}", srcTopicId_, partition_, keyIndexWord(rec.key));
+}
+
 int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted) {
     ViewInstance& inst = *m.inst;
     const rune::view::FoldSkip skip{.aborted = aborted, .rejected = &state_->rejected};
@@ -447,9 +452,14 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
             pos += static_cast<std::size_t>(r.totalLength());
             continue;
         }
+        // P6-13: a key-0 batch this leadership appended (record() wrote its window entry); an import or a rebuilt entry is not one.
+        // Coverage gap: a producer more than 32 key-0 batches ahead of a lagging or held judge has evicted the entry, so that
+        // batch's rejected ids go uncounted in idsBurned and a KeyExists on it raises no AUTOINC-ID-REUSE.
+        const bool keyZero = state_->assignedBases.producers() != 0 && r.producerId() >= 0 && state_->assignedBases.isKeyZeroBatch(r.producerId(), r.baseOffset());
         const bool skipBatch = (attrs & proto::batch::kAttrControl) != 0 || aborted.skips(r, attrs);
         if (skipBatch) {
             if (last >= limit) break;
+            if (keyZero && (attrs & proto::batch::kAttrControl) == 0) [[unlikely]] state_->autoIncStats.idsBurned += static_cast<uint64_t>(r.lastOffsetDelta()) + 1;   // aborted
             judgeCursor_ = last + 1;
             pos += static_cast<std::size_t>(r.totalLength());
             ++work;
@@ -464,8 +474,9 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
             rune::view::SourceRecord rec{span.key, span.value, span.offset, rune::protocol::record::intentOf(span.attributes), nullptr};
             if (!span.value.empty()) rec.writer = &first.vdc.materializedFor(writerVersionOf(span.value, first.vdc.defaultVersion()));
             lastIntent_ = rec.intent;
-            (void)judge(rec);
+            const Verdict v = judge(rec);
             if (stalled_) return;
+            if (keyZero && !v.accepted()) [[unlikely]] noteKeyZeroRejection_(v, rec);
             judgeCursor_ = span.offset + 1;
             judgedRecord_ = true;
             ++work;

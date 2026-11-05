@@ -569,3 +569,21 @@ TEST(SecurityWritePathRegression, AQuoteInAGrantPatternCannotForgeASecondStateme
     EXPECT_EQ(outsideLiterals(events[1].event.statement), "GRANT READ ON GROUP PREFIX  TO ROLE r;");
     EXPECT_EQ(outsideLiterals(events[2].event.statement), "GRANT READ ON GROUP  TO ROLE r;");
 }
+
+TEST(CheckedWritesImportGrant, GrantImportBelowLevelFiveIsRefused) {
+    SecurityDdlRig rig("import_level");
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.ddl(rig.createRole("importer")).code, 0);
+    const uint64_t appended = rig.admin().eventsAppended();
+    rig.setFeatureLevel(rune::replication::MetadataFeature::kCheckedWrites - 1);
+    auto a = rig.ddl(rig.grant(false, sec::GranteeKind::Role, "importer", sec::Operation::Import, sec::ResourceType::Topic,
+                               sec::PatternKind::Exact, "user"));
+    EXPECT_EQ(a.code, kInvalidRequest);
+    EXPECT_EQ(a.detail, "the IMPORT grant needs every broker at feature level 5");
+    EXPECT_EQ(rig.admin().eventsAppended(), appended) << "nothing appended";
+    rig.setFeatureLevel(rune::replication::MetadataFeature::kCheckedWrites);
+    a = rig.ddl(rig.grant(false, sec::GranteeKind::Role, "importer", sec::Operation::Import, sec::ResourceType::Topic,
+                          sec::PatternKind::Exact, "user"));
+    EXPECT_EQ(a.code, 0) << a.detail;
+    EXPECT_EQ(rig.admin().eventsAppended(), appended + 1);
+}

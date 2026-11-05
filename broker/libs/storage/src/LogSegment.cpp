@@ -1004,8 +1004,8 @@ int64_t LogSegment::recover(bool syncIndex, RecoverMode mode, std::optional<int6
     const bool keepDamage = mode == RecoverMode::KeepDamage && validBytes < static_cast<int64_t>(buf.size());
     if (keepDamage) {
         damage_ = SegmentDamage{validBytes, next, fileSize};
-    } else {
-        // Truncate torn tail.
+    } else if (validBytes < fileSize) {
+        // Truncate torn tail (only then: a no-op ftruncate still bumps the file's mtime, the cleaner's producer-expiry clock).
         // D20: through the segment's own fd (its inode), never by path.
         if (::ftruncate(fd_, static_cast<off_t>(validBytes)) != 0) {
             // State known (validBytes / next); the torn tail stays on disk behind a

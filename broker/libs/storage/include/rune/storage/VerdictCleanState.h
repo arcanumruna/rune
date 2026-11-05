@@ -6,7 +6,8 @@
 //   - never cleans at or above the offset every verdict is known to (cleanLimit): the coverage of the markers it saw, capped by
 //     the bound the owning worker published (the committed watermark W),
 //   - drops a verdict marker once it is superseded and every record it lists is gone (markerRemovable).
-// Constraint-set changes (type 18) are always kept; reservations (16) and the txn judge (19) are kept until their parts say otherwise.
+// Constraint-set changes (type 18) are always kept; of the reservations (16) only the highest seen and any above it (Part 06); the
+// txn judge (19) is kept until its part says otherwise.
 //
 // Cleaner thread only (cold).  clear() keeps the capacity for reuse across passes.
 #include "rune/storage/ControlRecordLayout.h"
@@ -32,6 +33,8 @@ public:
         cleanLimit_ = kNone;
         rejectedInPass_ = false;
         removalsBelow_ = std::numeric_limits<int64_t>::min();
+        listed_.clear();
+        highestReservation_ = std::numeric_limits<int64_t>::min();
     }
 
     // ---- pre-pass feed (offset order) -------------------------------------
@@ -39,11 +42,12 @@ public:
         for (const auto& e : entries)
             if (rejected_.empty() || e.offset > rejected_.back()) rejected_.push_back(e.offset);
             else if (!std::binary_search(rejected_.begin(), rejected_.end(), e.offset)) rejected_.insert(std::lower_bound(rejected_.begin(), rejected_.end(), e.offset), e.offset);
-        markers_.push_back(Marker{markerOffset, finalThrough, entries.empty() ? -1 : entries.back().offset});
+        markers_.push_back(Marker{markerOffset, finalThrough, entries.empty() ? -1 : entries.back().offset, listed_.size(), entries.size()});
+        for (const auto& e : entries) listed_.push_back(e.offset);
         events_.push_back(Event{markerOffset, fromOffset, finalThrough, true});
     }
     void onConstraintSetChange(int64_t offset, bool nonEmpty) { events_.push_back(Event{offset, nonEmpty ? 1 : 0, 0, false}); }
-    void onReservation(int64_t) noexcept {}   // part 06 gives it meaning
+    void onReservation(int64_t offset) noexcept { highestReservation_ = std::max(highestReservation_, offset); }
 
     /// End of the pre-pass: the coverage, whether a rejected record lies in the pass [dirtyStart, cleanLimit), and the
     /// markers a pass may remove (only below `markerRemovalBound`, the minimum fetch position over every assigned replica).
@@ -94,7 +98,18 @@ public:
     /// A rewrite has work even when no key was indexed: a rejected record in the pass to drop or a superseded marker to remove.
     /// Rejections below the dirty start were compacted by an earlier pass and are not work.
     [[nodiscard]] bool hasWork() const noexcept { return rejectedInPass_ || !removable_.empty(); }
-    [[nodiscard]] bool keepsReservation(int64_t) const noexcept { return true; }
+    /// Part 06: the counter resumes from the latest reservation, every earlier one is superseded.  The pre-pass reads only the
+    /// sealed segments, so one above the highest it saw (the active segment) is kept too.
+    [[nodiscard]] bool keepsReservation(int64_t offset) const noexcept { return offset >= highestReservation_; }
+    /// Does the marker at `markerOffset` list an offset `pred` holds?
+    template <class Pred>
+    [[nodiscard]] bool listsAny(int64_t markerOffset, Pred&& pred) const {
+        for (const Marker& m : markers_)
+            if (m.offset == markerOffset)
+                return std::any_of(listed_.begin() + static_cast<std::ptrdiff_t>(m.listedAt),
+                                   listed_.begin() + static_cast<std::ptrdiff_t>(m.listedAt + m.listedCount), pred);
+        return false;
+    }
     /// Type 18 and 19 are always kept; 16 follows keepsReservation; a verdict marker (17) only goes through markerRemovable.
     [[nodiscard]] bool keepsControlRecord(int64_t offset, int16_t type) const noexcept {
         namespace cr = control_record;
@@ -104,15 +119,17 @@ public:
     }
 
 private:
-    struct Marker { int64_t offset, finalThrough, lastListed; };
+    struct Marker { int64_t offset, finalThrough, lastListed; std::size_t listedAt, listedCount; };   // listed_[listedAt, +listedCount)
     struct Event { int64_t at, a, b; bool marker; };   // marker: a = fromOffset, b = finalThrough; change: a = nonEmpty
     std::vector<int64_t> rejected_;                    // ascending
     std::vector<Marker> markers_;
     std::vector<std::size_t> removable_;
     std::vector<Event> events_;
+    std::vector<int64_t> listed_;                      // every marker's listed offsets, in marker order
     int64_t cleanLimit_ = kNone;
     bool rejectedInPass_ = false;
     int64_t removalsBelow_ = std::numeric_limits<int64_t>::min();
+    int64_t highestReservation_ = std::numeric_limits<int64_t>::min();
 };
 
 }  // namespace rune::storage

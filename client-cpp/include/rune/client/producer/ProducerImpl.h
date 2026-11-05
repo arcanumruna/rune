@@ -24,11 +24,12 @@
 //   [4..7]   partition : int32 LE
 //   [8]      keyLen    : uint8  (≤16)
 //   [9..24]  keyBytes  : uint8[keyLen] (inline)
-//   [25]     flags     : uint8  (bit0=wantAck, bits1-2=write intent)
+//   [25]     flags     : uint8  (bit0=wantAck, bits1-2=write intent, bit3=key-0 create)
 //   [26..33] ackHandle : int64 LE ackhandle:: tagged token (only meaningful
 //                        when wantAck)
 //   [34..37] valueLen  : uint32 LE
 //   [38..]   valueBytes
+//   [..+4]   idStride  : uint32 LE, only when the key-0 flag is set (the topic's partition count)
 //
 // SEND_FLUSH payload: zero bytes (kMsgFlush typeId).
 //
@@ -130,7 +131,7 @@ inline constexpr int kRecTopicIdOff  = 0;   // int32 LE
 inline constexpr int kRecPartOff     = 4;   // int32 LE
 inline constexpr int kRecKeyLenOff   = 8;   // uint8
 inline constexpr int kRecKeyBytesOff = 9;   // uint8[keyLen] (≤16)
-inline constexpr int kRecFlagsOff    = 25;  // uint8 (bit0=wantAck, bits1-2=intent)
+inline constexpr int kRecFlagsOff    = 25;  // uint8 (bit0=wantAck, bits1-2=intent, bit3=key-0 create)
 inline constexpr int kRecCorrIdOff   = 26;  // int64 LE (only when wantAck)
 inline constexpr int kRecValLenOff   = 34;  // uint32 LE
 inline constexpr int kRecValBytesOff = 38;  // value bytes
@@ -210,6 +211,10 @@ inline constexpr uint32_t kNoTier2Slot = 0xFFFF'FFFFu;
 inline constexpr uint8_t kFlagWantAck    = 0x01;
 inline constexpr uint8_t kFlagIntentShift = 1;
 inline constexpr uint8_t kFlagIntentMask  = 0x06;  ///< the record's WriteIntent, which becomes its attributes
+/// An autoincrement create (key 0 on a Modulo handle): its ring message ends with the topic's partition count (uint32 LE).
+/// A partition batch holds only key-0 creates or only other records.
+inline constexpr uint8_t kFlagKeyZero     = 0x08;
+inline constexpr std::size_t kKeyZeroTrailerBytes = 4;
 
 // Default ring capacity for a producer (per-producer, separate from agent ring).
 // This is the app→agent handoff buffer (Kafka's buffer.memory analogue): sized to
@@ -330,6 +335,11 @@ struct PartitionState {
 
     // Force-flush flag (set by flush() call from app thread, read here).
     bool flushRequested = false;
+
+    // Autoincrement: what the open builder holds (1 = key-0 creates, 0 = anything else; meaningful while it holds
+    // records) and the partition count the key-0 creates carried (their batch's idStride).
+    uint8_t  openKind      = 0;
+    uint32_t keyZeroStride = 0;
 
     // F12: this partition is on its producer's dirty list (ProducerImpl::dirty_)
     // — it has (or recently had) builder records / queued Tier-2 batches, so
@@ -662,7 +672,7 @@ public:
                           const Key& key,
                           std::span<const uint8_t> value,
                           bool wantAck,
-                          int64_t correlationId, uint8_t intent = 0) noexcept;
+                          int64_t correlationId, uint8_t intent = 0, uint32_t idStride = 0) noexcept;
 
     // ---- Phase 2b F: the handle gate (issuing-thread state) -------------------
     //
@@ -696,7 +706,8 @@ public:
     /// return (None when accepted).
     [[nodiscard]] SendResult trySubmit(int32_t topicId, int32_t partition, const Key& key,
                                        std::span<const uint8_t> value, int64_t ackHandle,
-                                       RejectReason* why = nullptr, uint8_t intent = 0) noexcept;
+                                       RejectReason* why = nullptr, uint8_t intent = 0,
+                                       uint32_t idStride = 0) noexcept;
 
     // ---- Phase 2b Part B: zero-copy claims (Producer::tryClaim / claimBatch) ----
 
@@ -778,7 +789,7 @@ public:
     /// concurrent close() is decided immediately — never by waiting out the
     /// timeout (fix1 C2/I3).
     void sendBlocking(SendResult first, int32_t topicId, int32_t partition, const Key& key,
-                      std::span<const uint8_t> value, uint8_t intent = 0);
+                      std::span<const uint8_t> value, uint8_t intent = 0, uint32_t idStride = 0);
 
     /// F8c C6: the pieces of sendBlocking() for the token forms (Producer.cpp):
     /// one back-pressure wait step (pump on the duty thread / heartbeat-bounded
@@ -943,6 +954,8 @@ public:
     // bindBatchThread().  Every Tier-2 entry compares against it BEFORE touching the pool.
     /// SD11: the seed broker's version (0 = unknown: sends).  Set from the duty thread on every seed connect.
     void setBrokerVersion(int32_t v) noexcept { brokerVersion_ = v; }
+    /// Test seam: the Produce frames carry partitionKnown = 0 (the broker routes by key).
+    void setPartitionUnknownForTest(bool on) noexcept { partitionKnownWire_ = on ? 0 : 1; }
     [[nodiscard]] bool viewAcks() const noexcept { return has(cfg_.acks, Acks::View); }
     /// The reservation of ONE completion covering `n` records (a claimBatch / Tier-2 batch) on this producer.
     [[nodiscard]] uint32_t batchCompletionBytes(uint32_t n) const noexcept {
@@ -1154,8 +1167,10 @@ public:
     /// once the older batches resolve (Kafka parity).  D6: `logStartOffset` is
     /// the partition's log start carried with UnknownProducerId (-1 = not
     /// carried) — rule U decides retention (re-sequence) from loss (unknown).
+    /// Client 17: `assignedBase` = the first broker-assigned id of a key-0 batch; record i gets assignedBase + i * idStride.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
-                           int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {});
+                           int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {},
+                           uint64_t assignedBase = 0);
 
     /// Called on redirect-reconnect failure (SessionLost) and by the close paths
     /// (duty-cycle thread, or after it stopped): fails AND drops every accepted
@@ -1522,6 +1537,17 @@ public:
         ps.lastAckedSeq     = seq - 1;
     }
 
+    /// Test-only seam: the idStride of the n-th live batch (oldest = 0) of a partition (0 = not a key-0 batch).
+    uint32_t debugIdStrideForTest(int32_t topicId, int32_t partition, int n) {
+        PartitionState& ps = getOrCreatePartition(topicId, partition);
+        uint32_t stride = 0;
+        int i = 0;
+        ps.inflight.forEachLive([&](InFlightBatch& b) {
+            if (i++ == n) stride = b.idStride;
+        });
+        return stride;
+    }
+
     /// Test-only seam (re-review 1 N-a): make the stored frame of the n-th live
     /// batch (oldest = 0) of a partition undecodable (truncated).  Never called
     /// from production code.
@@ -1596,10 +1622,11 @@ private:
     /// Task 14: trySubmit's Direct path (owner thread; no ring, no atomic).
     /// Ring-mode body of trySubmit (unchanged hot path).
     SendResult trySubmitRing_(int32_t topicId, int32_t partition, const Key& key,
-                              std::span<const uint8_t> value, int64_t ackHandle, uint8_t intent) noexcept;
+                              std::span<const uint8_t> value, int64_t ackHandle, uint8_t intent,
+                              uint32_t idStride) noexcept;
     SendResult tryAppendDirect_(int32_t topicId, int32_t partition, const Key& key,
                                 std::span<const uint8_t> value, int64_t ackHandle,
-                                RejectReason& why, uint8_t intent) noexcept;
+                                RejectReason& why, uint8_t intent, uint32_t idStride) noexcept;
 
     /// One record into its partition builder — the single append path shared by
     /// the ring drain (Ring) and trySubmit (Direct).  Owner/duty thread only.
@@ -1609,7 +1636,7 @@ private:
     /// handle passes to the producer only on CONTINUE.
     rune::client::detail::ControlledAction appendRecord_(int32_t topicId, int32_t partition,
         const uint8_t* keyBytes, uint8_t keyLen, const uint8_t* valBytes, uint32_t valueLen,
-        uint8_t flags, uint64_t ackHandle, int64_t nowNs);
+        uint8_t flags, uint64_t ackHandle, int64_t nowNs, uint32_t idStride = 0);
     // [[gnu::always_inline]] members are DEFINED only in ProducerImpl.cpp: they may be called only from that
     // translation unit (appendRecord_, the claim paths, the drain), never from another TU or a header.
     // Task 10 (perf): the per-record helpers below are force-inlined into the
@@ -1701,7 +1728,7 @@ private:
     }
     /// One record's ring-message size rules (B6 per-record cap, then the ring's own maxMsgLength): Ok,
     /// MessageTooLarge or ValueTooLarge.  Shared by a send and a claim.
-    [[nodiscard]] SendResult ringRecordFits_(std::size_t keySize, std::size_t valueLen) const noexcept;
+    [[nodiscard]] SendResult ringRecordFits_(std::size_t keySize, std::size_t valueLen, std::size_t trailer = 0) const noexcept;
     [[nodiscard]] bool commitDirectClaim_(uint64_t gen) noexcept;
     void abortDirectClaim_(uint64_t gen) noexcept;
     /// #655/#656: a Direct producer's ring carries only off-owner settle messages (kMsgTier2Discard,
@@ -1787,14 +1814,18 @@ private:
                                           uint64_t& h) noexcept;
     /// completeSlice_ for an Ok batch whose View ack carried a verdict trailer: a rejected record completes BrokerError
     /// (code, constraintId); a Tier-2 batch completes once, with its first rejection.
+    /// A key-0 batch (`idStride` != 0): an accepted record's aux is its id, assignedBase + i * idStride (no base: StoredIdUnknown).
     void completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset, bool tier2,
-                               int32_t recordCount, std::span<const uint8_t> verdicts) noexcept;
+                               int32_t recordCount, std::span<const uint8_t> verdicts, uint64_t assignedBase, uint32_t idStride) noexcept;
     /// Completes the handles of slice [ackStart, ackStart+ackCount): record i ->
     /// baseOffset + i (Ok), or -1 with `st` / `errorCode`.  `tier2`: the slice
     /// is one Tier-2 batch (op Tier2Batch, aux = recordCount).  Zeroes each
     /// slot so nothing completes twice.
+    /// A key-0 batch (`idStride` != 0) completing Ok: the aux of record i is assignedBase + i * idStride.
+    /// StoredIdUnknown keeps the offset when it is known.
     void completeSlice_(PartitionState& ps, uint64_t ackStart, int32_t ackCount, int64_t baseOffset,
-                        OpStatus st, uint16_t errorCode, bool tier2, int32_t recordCount) noexcept;
+                        OpStatus st, uint16_t errorCode, bool tier2, int32_t recordCount,
+                        uint64_t assignedBase = 0, uint32_t idStride = 0) noexcept;
     /// acks=None: completes the just-sent builder slice with -1 ("sent, offset
     /// unknown") and reclaims it — nothing waits for a response.
     void completeSentUnacked_(PartitionState& ps) noexcept;
@@ -1887,7 +1918,12 @@ private:
     [[nodiscard]] bool viewRefused_() const noexcept {
         return viewSent_() && brokerVersion_ >= 1 && brokerVersion_ < rune::protocol::client::kBrokerVersionCheckedWrites;
     }
+    /// SD11: the batch `ps` holds is key-0 creates and the seed broker is known and below the checked-writes version.
+    [[nodiscard]] bool keyZeroRefused_(const PartitionState& ps) const noexcept {
+        return ps.openKind != 0 && brokerVersion_ >= 1 && brokerVersion_ < rune::protocol::client::kBrokerVersionCheckedWrites;
+    }
     int32_t brokerVersion_ = 0;
+    uint8_t partitionKnownWire_ = 1;
     /// Draining: every accepted record completed and the ring consumed to the
     /// closed tail.
     [[nodiscard]] bool fullyDrained_() const noexcept;
@@ -2344,7 +2380,7 @@ private:
     /// partition first (an unaddressable one is InvalidTopic at send time).
     SendResult deferRecord_(int32_t topicId, int32_t partition, std::span<const uint8_t> key,
                             std::span<const uint8_t> value, uint8_t flags, int64_t ackHandle,
-                            RejectReason& why) noexcept;
+                            RejectReason& why, uint32_t idStride) noexcept;
     RejectReason deferTier2_(uint32_t slot) noexcept;
     void tier2Collect_() noexcept;
     // ---- Tier-2 partition FIFO + pool return (duty side) -----------------------

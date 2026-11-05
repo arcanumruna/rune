@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+
 using namespace rune::node;
 using namespace rune::node::cw;
 
@@ -244,6 +246,75 @@ TEST(CheckedWritesAllocRegression, SteadyStateIntentJudgingAllocatesNothingRegre
     EXPECT_GT(after.rejectionsKeyNotFound - before.rejectionsKeyNotFound, 1000u);
     EXPECT_GT(after.markersWritten - before.markersWritten, 100u) << "markers were emitted in the window";
     EXPECT_EQ(r.ackOrder().size() - acksBefore, 5000u) << "every batch was acked";
+    EXPECT_GT(r.worker->subscriptionPositionForTest(raw), 10'000) << "the Raw subscription was served";
+    EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
+}
+
+// Part 06 (hard rule): key-0 creates, imports above the counter and updates from 8 idempotent producers allocate nothing in steady
+// state - the reservations (every 64 ids), the in-place patching of the ids and the side-window records included.  A batch holds
+// only key-0 creates, or only imports, or only updates.  Every create is a new id, so the warm-up runs until the
+// counter passes the key index's second 64 KiB chunk (131,072 ids); the measured batches stay inside the third chunk and the
+// table's 262,144 slots.  It also fills every producer's window.
+TEST(CheckedWritesAllocRegression, SteadyStateAutoIncCreatesAllocateNothingRegression) {
+    VerdictRig r;
+    r.createAutoIncTopic({.reserve = 64});
+    r.installProjection(0x40000602);
+    r.enableAcks();
+    r.worker->setVerdictIntervalNs(20'000'000);
+    r.passes(60);
+    const int64_t raw = r.subscribe(SubKind::Raw);
+    r.passes(60);
+
+    constexpr int kProducers = 8;
+    constexpr uint64_t kWarmupIds = 131'100;
+    uint64_t lcg = 0x9E3779B97F4A7C15ull;
+    const auto next = [&] { lcg = lcg * 6364136223846793005ull + 1442695040888963407ull; return lcg >> 33; };
+    std::array<int32_t, kProducers> seq{};
+    const auto recordsOf = [&](int records, int round) {
+        std::vector<Rec> recs;
+        const uint64_t counter = r.autoIncState()->nextN, pick = counter < 2 ? 0 : next() % 10;
+        for (int i = 0; i < records; ++i) {
+            if (pick < 6) recs.push_back({0, round, 1, false, 1});                                        // key-0 create
+            else if (pick < 8) recs.push_back({counter + static_cast<uint64_t>(i), round, 1, false, 1});  // import above the counter
+            else recs.push_back({next() % (counter - 1) + 1, round, 1, false, 2});                        // update
+        }
+        return recs;
+    };
+    const auto drive = [&](int round) -> uint64_t {
+        const int records = round % 2 == 0 ? 1 : 16, producer = round % kProducers;
+        (void)r.produceFrame(recordsOf(records, round), kAllView, 100 + producer, seq[producer]);
+        seq[producer] += records;
+        uint64_t allocs = 0;
+        {
+            rune::testing::AllocWindow w;
+            for (int i = 0; i < 3; ++i) {
+                r.now += 1'000'000;
+                r.worker->doWork(r.now);
+                r.worker->drainReturnView([](WorkerReturn&&) {});
+            }
+            allocs = w.count();
+        }
+        r.passes(1);
+        if (round % 50 == 0) (void)r.collect(raw);
+        return allocs;
+    };
+
+    int round = 0;
+    while (r.autoIncState()->nextN < kWarmupIds) (void)drive(round++);
+    r.passes(100);
+    const std::size_t acksBefore = r.ackOrder().size();
+    EXPECT_EQ(acksBefore, static_cast<std::size_t>(round)) << "every warm-up batch was acked";
+    const std::size_t reservationsBefore = r.reservations().size();
+
+    uint64_t worst = 0, total = 0;
+    for (const int end = round + 5000; round < end; ++round) {
+        const uint64_t a = drive(round);
+        total += a;
+        worst = std::max(worst, a);
+    }
+    r.passes(100);
+    EXPECT_EQ(r.ackOrder().size() - acksBefore, 5000u) << "every batch was acked";
+    EXPECT_GT(r.reservations().size() - reservationsBefore, 100u) << "the measured batches crossed reservations";
     EXPECT_GT(r.worker->subscriptionPositionForTest(raw), 10'000) << "the Raw subscription was served";
     EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
 }

@@ -716,9 +716,11 @@ public:
     /// `prebuilt` (fix round 4, ownership transferred on success): the output
     /// opened by openCleanedOutput — the owner switches to it without any
     /// filesystem operation.  nullptr with hasOutput = the owner rejects.
+    /// `pass` (non-zero): the cleaner pass the group belongs to.  Once the owner rejects a group of a pass it rejects every
+    /// later group of that pass: a pass removes a marker once the records it lists are below its boundary, in any group.
     bool enqueueCleanedGroup(const CleanedMember* members, std::size_t n, uint64_t seq,
                              bool hasOutput, int64_t nextOffset = 0,
-                             LogSegment* prebuilt = nullptr) noexcept;
+                             LogSegment* prebuilt = nullptr, uint32_t pass = 0) noexcept;
     /// LEGACY / tests only (no production caller since fix round 2): reload
     /// `base` in place from a file a synchronous caller already replaced —
     /// reloadSegment + recover() (re-read, CRC, index rebuild, fsync) on the
@@ -1272,9 +1274,11 @@ private:
         uint16_t groupSize = 0;   ///< 0 = legacy Reload entry; >0 on a group's first slot
         bool     hasOutput = false;
         LogSegment* prebuilt = nullptr;   ///< group head + hasOutput: the cleaner-opened output (fix round 4)
-    };   // 40 bytes
+        uint32_t pass = 0;        ///< group head: the cleaner pass (0 = none)
+    };   // 48 bytes
     uint64_t cleanerGroupsRejected_ = 0;
     int64_t  cleanerRejectLowWater_ = INT64_MAX;   ///< see takeCleanerRejectLowWater()
+    uint32_t cleanerRejectedPass_ = 0;             ///< owner: the last pass a group was rejected from (0 = none)
     /// Validate + install one deferred group (slots [first, first+n)).  Owner thread.
     bool applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBound);
     /// Construction: delete uncommitted .cleaned outputs, complete committed .swap files.
@@ -1365,7 +1369,7 @@ private:
     int rejectLogBudget_ = 64;   ///< cleaner thread: rejection log lines per Log (rate limit)
     /// Why the owner rejected a cleaner output (logged by the cleaner).
     enum class RejectReason : uint8_t { FrontGone = 1, NotContiguous, Active, Lineage, AboveBound,
-                                        RenamePending, FlushInFlight, RecoveryPoint, BadOutput };
+                                        RenamePending, FlushInFlight, RecoveryPoint, BadOutput, PassRejected };
     /// Owner: may a cold path run now?  true = every posted operation is done
     /// (and coldPathWanted_ is cleared); false = deferred (posting paused).
     bool beginColdPath_(int64_t touchFrom) noexcept;   ///< touchFrom: lowest segment base touched

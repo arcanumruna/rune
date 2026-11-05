@@ -99,7 +99,8 @@ public:
     [[nodiscard]] SendResult trySend(TopicHandle topic, const Key& key, std::span<const uint8_t> value,
                                      WriteIntent intent = WriteIntent::Upsert) noexcept {
         if (!topic.valid()) return SendResult::InvalidTopic;
-        return trySendTo(topic, key.partition(topic.partitionCount), key, value, intent);
+        // A key-0 create on a Modulo handle goes to partition 0 here: the sticky spread lives in Producer::trySend.
+        return trySendTo(topic, key.partition(topic.partitionCount, topic.partitioner), key, value, intent);
     }
     /// Router form: `partition` is the caller's key.partition(partitionCount)
     /// (ShardGroup computed it to route) — used as is, never re-hashed.
@@ -341,7 +342,8 @@ private:
     void teardown_(uint32_t i, bool drained = false) noexcept;
     [[nodiscard]] int32_t partitionOf_(TopicHandle topic, const Key& key) const noexcept {
         if (cfg_.testPartitioner != nullptr) [[unlikely]] return cfg_.testPartitioner(key, topic.partitionCount);
-        return key.partition(topic.partitionCount);
+        // ShardGroup sends are Upserts only: no key-0 creates and no sticky spread on this path.
+        return key.partition(topic.partitionCount, topic.partitioner);
     }
 
     ShardGroupConfig                          cfg_;

@@ -3,6 +3,11 @@
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/protocol/SecurityTypes.h>
 #include <gtest/gtest.h>
+#include <rune/security/SecurityFile.h>
+#include <rune/security/SecurityReplayer.h>
+#include "SecurityGoldenPins.h"
+#include <fstream>
+#include <iterator>
 #include <type_traits>
 
 namespace rs = rune::security;
@@ -164,4 +169,34 @@ TEST(SecurityEventRegression, EnumsAreTheProtocolEnumsRegression) {
     EXPECT_EQ(static_cast<int>(rs::Operation::Admin), 6); EXPECT_EQ(static_cast<int>(rs::Operation::Describe), 5);
     EXPECT_EQ(static_cast<int>(rs::ResourceType::TransactionalId), 4); EXPECT_EQ(static_cast<int>(rs::ResourceType::Cluster), 0);
     EXPECT_EQ(static_cast<int>(rs::PatternKind::Prefix), 1); EXPECT_EQ(static_cast<int>(rs::GranteeKind::Role), 1);
+}
+
+TEST(CheckedWritesImportGrant, EventRoundTrips) {
+    rs::GrantSpec spec{.op = rs::Operation::Import, .resource = {rs::ResourceType::Topic, rs::PatternKind::Exact, "user"}};
+    const rs::Ops ops = rs::GrantOps{rs::GranteeKind::User, spec};
+    rs::SecurityEvent e = baseEvent(ops);
+    e.formatVer = rs::kFormatV2; e.nsId = 0;
+    auto b = rs::encode(e).value();
+    auto d = rs::decode(b).value();
+    const auto& got = std::get<rs::GrantOps>(d.ops);
+    EXPECT_EQ(got.grant.op, rs::Operation::Import);
+    EXPECT_EQ(got.grant.resource.name, "user");
+    const std::size_t body = b.size() - rs::detail_testing::opsBodySize(ops);
+    b[body + 1] = 8;
+    EXPECT_TRUE(rs::decode(b).has_value());
+    b[body + 1] = 9;
+    EXPECT_EQ(rs::decode(b).error(), rs::DecodeError::BadEnum);
+}
+
+TEST(CheckedWritesImportGrantRegression, ExistingGoldenLogsReplayUnchangedRegression) {
+    std::ifstream in(RUNE_SECURITY_GOLDEN_DIR "/v1/basic.rsec", std::ios::binary);
+    ASSERT_TRUE(in);
+    auto records = rs::readRsec(in);
+    ASSERT_TRUE(records.has_value());
+    ASSERT_EQ(records->size(), std::size(rs::golden::kBasicV1Digests));
+    rs::SecurityReplayer r;
+    for (std::size_t i = 0; i < records->size(); ++i) {
+        ASSERT_TRUE(r.feed((*records)[i].first, (*records)[i].second).has_value()) << i;
+        EXPECT_EQ(r.state().digest(), rs::golden::kBasicV1Digests[i]) << "offset " << i;
+    }
 }

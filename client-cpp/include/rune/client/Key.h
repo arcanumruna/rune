@@ -105,6 +105,10 @@ public:
     [[nodiscard]] int32_t partition(int32_t partitionCount) const noexcept {
         return rune::protocol::partitionForKey(bytes(), partitionCount);
     }
+    /// The partition under the topic's partitioner (Fnv1a is the form above; Modulo reads the key as an id).
+    [[nodiscard]] int32_t partition(int32_t partitionCount, rune::protocol::Partitioner partitioner) const noexcept {
+        return rune::protocol::partitionFor(bytes(), partitionCount, partitioner);
+    }
 
 private:
     static constexpr uint8_t kTooLongLen = 0xFF;

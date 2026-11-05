@@ -10,6 +10,7 @@
 //   eos_out      id Int64 KEY, v Int64 (examples/eos_probe.cpp's local build; the e2e image uses the
 //                header `rune schema generate eos_out` writes from the broker's stored schema)
 //   ki_account   id UInt64 KEY, name string(16), n Int64 (examples/checked_writes_probe.cpp: the key index e2e)
+//   ai_user      userId UInt64 KEY, provider UInt16, subject string(64), createdAt Int64 (the same probe: the autoincrement e2e)
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Generator.h>
 
@@ -72,12 +73,19 @@ int main(int argc, char** argv) {
                                .addFixedStr("name", 16)
                                .add("n", PrimType::Int64)
                                .build();
+    const auto aiUser = DescriptorBuilder("ai_user")
+                            .add("userId", PrimType::UInt64, 1, true)
+                            .add("provider", PrimType::UInt16)
+                            .addFixedStr("subject", 64)
+                            .add("createdAt", PrimType::Int64)
+                            .build();
     const std::string dir = argv[1];
     return write(dir + "/position.gen.h", position) && write(dir + "/tick_sample.gen.h", tick) &&
                    write(dir + "/long_key.gen.h", longKey) &&
                    write(dir + "/short_key.gen.h", shortKey) &&
                    write(dir + "/eos_out.gen.h", eosOut) &&
                    write(dir + "/ki_account.gen.h", kiAccount) &&
+                   write(dir + "/ai_user.gen.h", aiUser) &&
                    write(dir + "/player_event.gen.h", rune::examples::playerEventDescriptor())
                ? 0
                : 1;

@@ -66,7 +66,39 @@ TEST(CheckedWritesTimeline, MarkerLedgerIsIdempotentAndFullRefuses) {
     MarkerLedger m;
     EXPECT_TRUE(m.onMarker(15, 12));
     EXPECT_TRUE(m.onMarker(15, 12));
+    EXPECT_EQ(m.appendedThrough(), 12) << "the duplicate changes nothing";
     for (int64_t i = 1; i < static_cast<int64_t>(MarkerLedger::kCapacity); ++i) EXPECT_TRUE(m.onMarker(15 + i, 12 + i));
     EXPECT_TRUE(m.full());
+    constexpr int64_t kRingThrough = 12 + static_cast<int64_t>(MarkerLedger::kCapacity) - 1;
+    EXPECT_EQ(m.appendedThrough(), kRingThrough);
     EXPECT_FALSE(m.onMarker(100000, 1));
+    EXPECT_EQ(m.appendedThrough(), kRingThrough) << "a left-out marker below the coverage does not lower it";
+    EXPECT_TRUE(m.onMarker(100000, 1)) << "the left-out marker is remembered";
+    EXPECT_EQ(m.appendedThrough(), kRingThrough);
+}
+
+// A marker the full ring leaves out is in the log all the same: appendedThrough counts it until a cut removes it.
+TEST(CheckedWritesTimelineRegression, MarkerLedgerCountsAMarkerLeftOutWhenFullRegression) {
+    MarkerLedger m;
+    for (int64_t i = 1; i <= static_cast<int64_t>(MarkerLedger::kCapacity); ++i) ASSERT_TRUE(m.onMarker(i, i));
+    EXPECT_FALSE(m.onMarker(2000, 3000));
+    EXPECT_EQ(m.appendedThrough(), 3000);
+    m.truncateFrom(2001);
+    EXPECT_EQ(m.appendedThrough(), 3000) << "the cut is above it";
+    m.truncateFrom(2000);
+    EXPECT_EQ(m.appendedThrough(), static_cast<int64_t>(MarkerLedger::kCapacity));
+}
+
+// Fix pass 2 (B): a scan re-feed of a left-out marker below the last one must not move left_ back.  RED: left_ became {2000, 4000},
+// so a cut that removed the marker at 2001 kept its coverage and appendedThrough came out too high (4000).  The cut forgets every
+// left-out marker (left_ holds the last one only), so the value is the ring's coverage: too low only re-marks more.
+TEST(CheckedWritesTimelineRegression, MarkerLedgerReFeedBelowTheLastLeftOutMarkerIsIgnoredRegression) {
+    MarkerLedger m;
+    for (int64_t i = 0; i < static_cast<int64_t>(MarkerLedger::kCapacity); ++i) ASSERT_TRUE(m.onMarker(i, i));
+    EXPECT_FALSE(m.onMarker(2000, 3000));
+    EXPECT_FALSE(m.onMarker(2001, 4000));
+    EXPECT_TRUE(m.onMarker(2000, 3000)) << "already seen";
+    m.truncateFrom(2001);
+    EXPECT_LE(m.appendedThrough(), 3000) << "never above the coverage still in the log";
+    EXPECT_EQ(m.appendedThrough(), static_cast<int64_t>(MarkerLedger::kCapacity) - 1);
 }

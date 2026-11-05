@@ -76,6 +76,7 @@ TEST(CheckedWritesBrokerRegression, DroppedWhileAwaitingSpecNeverBuildsRegressio
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/ProducerStateManager.h>
 
 #include <filesystem>
 #include <sstream>
@@ -1484,6 +1485,15 @@ public:
     void subscribeAll(rc::Client& c, rc::TopicHandle topic) {
         for (int32_t p = 0; p < topic.partitionCount; ++p) subscribe(c, topic, p);
     }
+    /// The partition is the one the topic's partitioner gives `key`.
+    void subscribe(rc::Client& c, rc::TopicHandle topic, const rc::Key& key) {
+        rc::SubscribeOptions o;
+        o.from = rc::From::earliest();
+        subs_.push_back(c.subscribe(topic, key, o, [this](const rc::Record& r) {
+            std::lock_guard<std::mutex> g(mu_);
+            seen_.push_back({r.partition, r.offset, r.op(), r.attributes, std::string(reinterpret_cast<const char*>(r.key.data()), r.key.size()), r.value.empty()});
+        }));
+    }
     std::vector<Seen> seen() {
         std::lock_guard<std::mutex> g(mu_);
         return seen_;
@@ -1583,7 +1593,7 @@ TEST(CheckedWritesBrokerRegression, KeyIndexDdlRefusalsShardRegression) {
                   "key.index needs a key of at most 8 bytes");
     rc::TopicOptions autoInc = keyIndex;
     autoInc.keyFeatures.autoIncrement = true;
-    expectRefused(c.defineTopicAndWait("autoinc", 1, "id", blob, rc::Persistence::Disk, autoInc, {}, 30s), "autoincrement is not supported by this broker yet");
+    expectRefused(c.defineTopicAndWait("autoinc", 1, "id", blob, rc::Persistence::Disk, autoInc, {}, 30s), "autoincrement needs cleanup.policy = compact");
 
     // A key-feature block with an unknown flag bit does not decode: the gateway rejects the frame as InvalidSchema ("DefineTopic body undecodable" in its log).
     // The ErrorResponse carries no message (encodeRejection has none), so only the code is asserted.
@@ -1716,11 +1726,17 @@ void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& na
         prod.flush();
     }
 
-    ASSERT_TRUE(waitFor([&] { return col.count() >= 2 * kRecords; }, 10s)) << "delivered " << col.count();
+    // The cleaner may drop a send its remove superseded before a late subscription fetches it; the removes are never dropped.
     std::multiset<std::pair<int32_t, std::string>> got;
-    for (const Seen& s : col.seen())
-        if (s.tombstone) got.emplace(s.partition, s.key);
+    ASSERT_TRUE(waitFor([&] {
+        got.clear();
+        for (const Seen& s : col.seen())
+            if (s.tombstone) got.emplace(s.partition, s.key);
+        return got.size() >= kRecords;
+    }, 10s)) << "delivered " << got.size() << " of " << kRecords << " removes";
     EXPECT_TRUE(got == tombstones) << "every tombstone sits on the partition of its record with the same key bytes";
+    for (const Seen& s : col.seen())
+        if (!s.tombstone) EXPECT_EQ(tombstones.count({s.partition, s.key}), 1u) << "a delivered send sits on the partition of its record";
     releaseHold();   // the cleaner passes below need its thread
 
     // The cleaner skips the active segment: one tombstone per partition for a key that was never written (the segment is
@@ -2001,4 +2017,541 @@ TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesIntentsRegression) {
     EXPECT_EQ(r.code(), kInvalidRequest);
     KiWriter plain(c, "ki", rc::Acks::All);
     EXPECT_TRUE(plain.topic.upsertAndWait(acct(1)).ok());
+}
+
+// Part 06 Task 10 (fix round 1): a restarted broker builds its autoincrement topic's replicas from the catalog with the whole
+// producer retry window, the depth the cleaner keeps (a runtime create is CatalogEffectsTest's).
+TEST(CheckedWritesBrokerRegression, AutoIncTopicKeepsTheRetryWindowDepthAcrossARestartRegression) {
+    OneBroker b("cw-ai-depth", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    rc::TopicOptions to;
+    to.config.cleanupPolicy = 1;   // compact
+    to.keyFeatures.autoIncrement = true;
+    const auto t = c.defineTopicAndWait("ai", 1, "id", rune::codec::serialize(kiAccountDescriptor()), rc::Persistence::Disk, to, {}, 60s);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const auto depth = [&] {
+        return b.node().onOwnerThreadForTest(t.topicId, 0, [](rune::replication::PartitionReplica& r) { return r.producerTailDepth(); });
+    };
+    EXPECT_EQ(depth(), rune::storage::kRetryWindowSize);
+    b.restart();
+    int got = 0;
+    for (int i = 0; i < 400 && got != rune::storage::kRetryWindowSize; ++i) {
+        try { got = depth(); } catch (const std::runtime_error&) {}   // the replica is rebuilt after the boot
+        if (got != rune::storage::kRetryWindowSize) std::this_thread::sleep_for(25ms);
+    }
+    EXPECT_EQ(got, rune::storage::kRetryWindowSize) << "the boot path keeps the retry window";
+}
+
+// ===========================================================================================================
+// Part 06: autoincrement on real brokers.
+// ===========================================================================================================
+#include "client/support/AutoIncRecords.h"
+#include "support/AuthBroker.h"
+
+namespace {
+
+using SO = rune::protocol::SecurityOperation;
+using ST = rune::protocol::SecurityResourceType;
+using SP = rune::protocol::SecurityPatternKind;
+
+constexpr uint16_t kNotAuthorized = 45;
+constexpr const char* kAiPassword = "ai-user-password-1";
+constexpr const char* kRetentionDetail = "autoincrement topics keep every record: retention.ms and retention.bytes must be -1";
+
+rc::DefineTopicResult defineAi(rc::Client& c, const std::string& name, const rune::codec::Descriptor& d, const std::string& key,
+                               uint32_t parts = 1, int16_t replicas = 0) {
+    rc::TopicOptions to;
+    to.replicationFactor         = replicas;
+    to.config.cleanupPolicy      = 1;   // compact
+    to.keyFeatures.autoIncrement = true;
+    return c.defineTopicAndWait(name, parts, key, rune::codec::serialize(d), rc::Persistence::Disk, to, {}, 60s);
+}
+
+/// A producer with `acks` and the typed topic `name` of record type T written through it.
+template <class T>
+struct AiWriter {
+    rc::Producer                              prod;
+    rc::TypedTopic<T, rc::ProducerRef>        topic;
+
+    AiWriter(rc::Client& c, const std::string& name, rc::Acks acks = kAllView)
+        : prod(c.producer(KiWriter::config(acks))), topic(c.openTopicAndWait<T>(name, prod, 30s)) {}
+    ~AiWriter() { prod.closeImmediately(); }
+};
+
+std::vector<uint8_t> aiViewPlan(int32_t srcTopicId) {
+    namespace rv = rune::view;
+    rv::ViewPlan p;
+    p.viewName = "ai_by_id";
+    p.key      = "id";
+    p.sources.push_back(rv::SourceSpec{srcTopicId, "id"});
+    p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::UInt64, 0, "id", rv::MergeRule::Replace});
+    p.output.push_back(rv::AuthoredField{"n", rune::codec::PrimType::Int64, 0, "n", rv::MergeRule::Replace});
+    return rv::serializeAuthored(p);
+}
+
+/// The `n` of view row `id` ([bitmap][id][n]); nullopt = absent.  Retries only what a moving leader or a building view answers.
+std::optional<int64_t> aiRowN(rc::Client& reader, int32_t viewTopicId, uint64_t id) {
+    rc::ViewRowResult row;
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline; std::this_thread::sleep_for(100ms)) {
+        try { row = reader.getViewRowAndWait(viewTopicId, id, 0, 10s); } catch (const std::exception&) { continue; }
+        if (row.status == rc::ViewRowResult::kOk || row.status == rc::ViewRowResult::kAbsentKey) break;
+    }
+    if (row.status != rc::ViewRowResult::kOk) {
+        EXPECT_EQ(row.status, rc::ViewRowResult::kAbsentKey) << "row " << id;
+        return std::nullopt;
+    }
+    int64_t n = 0;
+    for (int i = 0; i < 8; ++i) n |= static_cast<int64_t>(row.rowBytes[9 + static_cast<std::size_t>(i)]) << (8 * i);
+    return n;
+}
+
+uint64_t idOf(const std::string& keyBytes) {
+    uint64_t id = 0;
+    std::memcpy(&id, keyBytes.data(), std::min<std::size_t>(sizeof id, keyBytes.size()));
+    return id;
+}
+
+int64_t leoOf(BrokerNode& n, int32_t topicId, int32_t partition) {
+    return n.onOwnerThreadForTest(topicId, partition, [](rune::replication::PartitionReplica& r) { return r.log()->logEndOffset(); });
+}
+
+/// A connected admin session on the controller of a started cluster, the level raised on every node (a failure is a gtest failure and null).
+std::unique_ptr<rc::Client> clusterAdmin(rune::node::test::catalog_cluster::ThreeNodes& c) {
+    using namespace rune::node::test::catalog_cluster;
+    if (!c.awaitCatalogLeader(30s)) { ADD_FAILURE() << "no catalog leader"; return nullptr; }
+    const int32_t ctl = awaitController(c);
+    if (ctl <= 0) { ADD_FAILURE() << "no controller"; return nullptr; }
+    for (const int id : c.runningNodes()) awaitLevel(c.node(id));
+    if (::testing::Test::HasFatalFailure()) return nullptr;
+    return connectClient(c, ctl);
+}
+
+rc::ClientConfig patientConfig(rune::node::test::catalog_cluster::ThreeNodes& c, int seed) {
+    rc::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c, seed);
+    cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
+    return cfg;
+}
+
+std::optional<rune::node::AutoIncReady> counterOf(BrokerNode& n, int32_t topicId) {
+    const int32_t w = rune::metadata::ShardRouter(n.workerCountForTest()).workerForPartition(topicId, 0);
+    return n.onWorkerThreadForTest(w, [topicId](Worker& wk) { return wk.autoIncStateForTest(topicId, 0); });
+}
+
+/// The `i`-th id of a back-filled history: dense runs with gaps.
+uint64_t backfillId(uint64_t i) { return i + i / 7 * 3; }
+
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, AutoIncEndToEndShardRegression) {
+    OneBroker b("cw-ai-e2e", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineAi(c, "user", aiUserDescriptor(), "userId");
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    AiWriter<AiUser> w(c, "user");
+    Collector col;
+    col.subscribeAll(c, w.topic.handle());
+
+    for (uint64_t i = 1; i <= 100; ++i) {
+        const auto r = w.topic.insertAndWait(AiUser{.provider = 1, .subject = "subject" + std::to_string(i)}, 10s);
+        ASSERT_TRUE(r.ok()) << "insert " << i << " code " << r.code();
+        ASSERT_EQ(r.key(), i);
+    }
+    EXPECT_TRUE(w.topic.removeExistingAndWait(uint64_t{50}, 10s).ok());
+    const auto after = w.topic.insertAndWait(AiUser{.provider = 1, .subject = "after"}, 10s);
+    EXPECT_TRUE(after.ok());
+    EXPECT_EQ(after.key(), 101u) << "a deleted id is not reused";
+
+    ASSERT_TRUE(waitFor([&] { return col.count() >= 102; }, 10s)) << "delivered " << col.count();
+    const std::vector<Seen> seen = col.seen();
+    ASSERT_EQ(seen.size(), 102u);
+    for (std::size_t i = 0; i < 100; ++i) {
+        EXPECT_EQ(seen[i].op, rc::RecordOp::Insert) << "record " << i;
+        EXPECT_EQ(idOf(seen[i].key), i + 1);
+    }
+    EXPECT_EQ(seen[100].op, rc::RecordOp::Delete);
+    EXPECT_EQ(idOf(seen[100].key), 50u);
+    EXPECT_EQ(seen[101].op, rc::RecordOp::Insert);
+    EXPECT_EQ(idOf(seen[101].key), 101u);
+
+    AiWriter<AiUser> allOnly(c, "user", rc::Acks::All);
+    const auto plain = allOnly.topic.insertAndWait(AiUser{.provider = 1, .subject = "plain"}, 10s);
+    EXPECT_TRUE(plain.ok());
+    EXPECT_EQ(plain.key(), 102u);
+}
+
+TEST(CheckedWritesBrokerRegression, ModuloRoutingIsTheSameOnEveryPathShardRegression) {
+    constexpr int32_t kParts = 4;
+    OneBroker b("cw-ai-mod", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineAi(c, "ai", aiDescriptor(), "id", kParts);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const auto view = c.createViewAndWait("ai_by_id", "id", 0, aiViewPlan(t.topicId), {}, 60s);
+    ASSERT_EQ(view.errorCode, 0) << view.detail;
+    AiWriter<Ai> w(c, "ai");
+    Collector col;
+    col.subscribeAll(c, w.topic.handle());
+
+    std::vector<uint64_t> ids;
+    for (int64_t i = 1; i <= 400; ++i) {
+        const auto r = w.topic.insertAndWait(Ai{.n = i}, 10s);
+        ASSERT_TRUE(r.ok()) << "insert " << i << " code " << r.code();
+        ids.push_back(r.key());
+    }
+    ASSERT_TRUE(waitFor([&] { return col.count() >= ids.size(); }, 10s)) << "delivered " << col.count();
+    std::map<uint64_t, int32_t> partitionOf;
+    std::array<std::vector<uint64_t>, kParts> perPartition;
+    for (const Seen& s : col.seen()) {
+        partitionOf[idOf(s.key)] = s.partition;
+        perPartition[static_cast<std::size_t>(s.partition)].push_back(idOf(s.key));
+    }
+    for (const uint64_t id : ids) {
+        ASSERT_EQ(partitionOf.count(id), 1u) << "id " << id;
+        EXPECT_EQ(static_cast<int32_t>(id % kParts), partitionOf[id]) << "id " << id;
+    }
+    for (const auto& run : perPartition) {
+        EXPECT_FALSE(run.empty());
+        for (std::size_t i = 1; i < run.size(); ++i) EXPECT_EQ(run[i], run[i - 1] + kParts);
+    }
+
+    const std::vector<uint64_t> probes(ids.begin(), ids.begin() + 40);
+    for (std::size_t i = 0; i < probes.size(); ++i) {
+        const rc::WriteResult up = w.topic.updateAndWait(Ai{.id = probes[i], .n = 7}, 10s);
+        EXPECT_TRUE(up.ok()) << "update " << probes[i] << " code " << up.code();
+        if (i % 2 == 1) {
+            const rc::WriteResult rm = w.topic.removeExistingAndWait(probes[i], 10s);
+            EXPECT_TRUE(rm.ok()) << "remove " << probes[i] << " code " << rm.code();
+        }
+    }
+    for (std::size_t i = 0; i < probes.size(); ++i) {
+        const std::optional<int64_t> n = aiRowN(c, view.viewTopicId, probes[i]);
+        EXPECT_EQ(n.has_value(), i % 2 == 0) << "view row " << probes[i];
+        if (n) EXPECT_EQ(*n, 7);
+    }
+
+    std::vector<std::unique_ptr<Collector>> keyed;
+    for (const uint64_t id : probes) {
+        keyed.push_back(std::make_unique<Collector>());
+        keyed.back()->subscribe(c, w.topic.handle(), rc::Key(id));
+    }
+    for (std::size_t i = 0; i < probes.size(); ++i) {
+        Collector& k = *keyed[i];
+        ASSERT_TRUE(waitFor([&] { return k.count() > 0; }, 10s)) << "keyed subscription of " << probes[i];
+        for (const Seen& s : k.seen()) EXPECT_EQ(s.partition, static_cast<int32_t>(probes[i] % kParts)) << "keyed subscription of " << probes[i];
+    }
+
+    // The gateway resolves the partition of an explicit update (partitionKnown = 0).
+    rc::Client& blind = *b.connectClient();
+    blind.producePartitionUnknownForTest(true);
+    AiWriter<Ai> viaGateway(blind, "ai");
+    for (std::size_t i = 0; i < probes.size(); i += 2) {
+        const rc::WriteResult up = viaGateway.topic.updateAndWait(Ai{.id = probes[i], .n = 99}, 10s);
+        EXPECT_TRUE(up.ok()) << "update " << probes[i] << " code " << up.code();
+        const std::optional<int64_t> n = aiRowN(c, view.viewTopicId, probes[i]);
+        ASSERT_TRUE(n.has_value());
+        EXPECT_EQ(*n, 99);
+    }
+}
+
+TEST(CheckedWritesBrokerRegression, ImportNeedsTheGrantShardRegression) {
+    AuthBroker b("ai-import", {.shard = true});
+    b.bootstrapAdmin();
+    b.createUser("app", kAiPassword, {AuthGrant{SO::Write, ST::Topic, SP::Exact, "user"}});
+    b.createUser("backfill", kAiPassword, {AuthGrant{SO::Write, ST::Topic, SP::Exact, "user"}, AuthGrant{SO::Import, ST::Topic, SP::Exact, "user"}});
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    const auto connect = [&](const std::string& user, const std::string& password, bool partitionUnknown) {
+        rc::ClientConfig cfg;
+        cfg.gatewayChannel  = b.channel();
+        cfg.gatewayStreamId = 1;
+        cfg.egressChannel   = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+        cfg.egressStreamId  = 2;
+        cfg.dataDir         = b.clientDir().string();
+        cfg.username        = user;
+        cfg.password        = password;
+        cfg.offerCrypto     = true;
+        cfg.tlsTrustPem     = AuthBroker::tlsCaPem();
+        auto client = std::make_unique<rc::Client>(cfg);
+        client->connectAndWait(30s);
+        client->producePartitionUnknownForTest(partitionUnknown);
+        return client;
+    };
+    auto admin = connect("admin", AuthBroker::kAdminPassword, false);
+    const auto t = defineAi(*admin, "user", aiUserDescriptor(), "userId");
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    admin->close();
+
+    // The second round has the gateway resolve the partition; the answers are the same.  Verdict markers are appended on their own
+    // schedule, so what a refused import must not change is the data records, not the log end.
+    std::size_t stored = storedValues(b.node(), t.topicId, 0).size();
+    uint64_t explicitId = 500;
+    for (const bool partitionUnknown : {false, true}) {
+        auto app      = connect("app", kAiPassword, partitionUnknown);
+        auto backfill = connect("backfill", kAiPassword, partitionUnknown);
+        AiWriter<AiUser> appW(*app, "user"), backfillW(*backfill, "user");
+        const auto denied = appW.topic.insertAndWait(AiUser{.userId = explicitId, .provider = 1, .subject = "denied"}, 10s);
+        EXPECT_EQ(denied.status(), rc::OpStatus::BrokerError);
+        EXPECT_EQ(denied.code(), kNotAuthorized);
+        EXPECT_EQ(storedValues(b.node(), t.topicId, 0).size(), stored) << "a refused import appends nothing";
+        const auto granted = backfillW.topic.insertAndWait(AiUser{.userId = explicitId, .provider = 1, .subject = "imported"}, 10s);
+        EXPECT_TRUE(granted.ok()) << "code " << granted.code();
+        EXPECT_EQ(granted.key(), 0u) << "only a key-0 create is answered with an id (P6-10)";
+        EXPECT_EQ(backfillW.topic.insertAndWait(AiUser{.userId = explicitId, .provider = 1, .subject = "again"}, 10s).code(), kKeyExists);
+        const auto next = appW.topic.insertAndWait(AiUser{.provider = 1, .subject = "next"}, 10s);
+        EXPECT_TRUE(next.ok()) << "code " << next.code();
+        EXPECT_EQ(next.key(), explicitId + 1) << "the counter moved past the import";
+        stored = storedValues(b.node(), t.topicId, 0).size();
+        explicitId = 600;
+        app->close();
+        backfill->close();
+    }
+
+    AuthBroker old("ai-import-lvl4", {.shard = true, .configure = [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; }});
+    old.bootstrapAdmin();
+    old.createUser("backfill", kAiPassword);
+    const auto grant = old.admin().grant(old.channel(), old.adminSession(), "backfill", false, SO::Import, ST::Topic, SP::Exact, "user");
+    EXPECT_EQ(grant.errorCode, kInvalidRequest);
+    EXPECT_EQ(grant.detail, "the IMPORT grant needs every broker at feature level 5");
+}
+
+TEST(CheckedWritesBrokerRegression, RegressorsPathBackFillThenInsertsNeverCollideThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    constexpr int kUsers = 3000, kCharacters = 6000;
+    ThreeNodes c = ThreeNodes::start("cw06");
+    int32_t userTopic = -1, characterTopic = -1;
+    {
+        auto admin = clusterAdmin(c);
+        ASSERT_TRUE(admin != nullptr);
+        const auto u = defineAi(*admin, "user", aiUserDescriptor(), "userId", 1, 3);
+        ASSERT_EQ(u.errorCode, 0) << u.detail;
+        const auto ch = defineAi(*admin, "character", aiCharacterDescriptor(), "characterId", 1, 3);
+        ASSERT_EQ(ch.errorCode, 0) << ch.detail;
+        userTopic      = u.topicId;
+        characterTopic = ch.topicId;
+        admin->close();
+    }
+    std::vector<int32_t> userLeader, characterLeader;
+    ASSERT_TRUE(awaitLeaders(c, userTopic, 1, userLeader, 30s));
+    ASSERT_TRUE(awaitLeaders(c, characterTopic, 1, characterLeader, 30s));
+
+    std::set<uint64_t> userIds, characterIds;   // every id any insert was ever answered with
+    const auto expectFresh = [](std::set<uint64_t>& answered, const rc::WriteResult& r, const char* topic, uint64_t above) {
+        EXPECT_TRUE(r.ok()) << topic << " code " << r.code();
+        EXPECT_GT(r.key(), above) << topic;
+        EXPECT_NE(r.key(), 52u) << topic;
+        EXPECT_TRUE(answered.insert(r.key()).second) << topic << " id " << r.key() << " answered twice";
+    };
+    {
+        auto client = connectClient(c, patientConfig(c, 1));
+        AiWriter<AiUser> users(*client, "user");
+        for (uint64_t i = 1; i <= kUsers; ++i) {
+            const auto r = users.topic.insertAndWait(AiUser{.userId = backfillId(i), .provider = 1, .subject = "user" + std::to_string(i)}, 60s);
+            ASSERT_TRUE(r.ok()) << "user " << i << " code " << r.code();
+            userIds.insert(backfillId(i));
+        }
+        AiWriter<AiCharacter> characters(*client, "character");
+        for (uint64_t i = 1; i <= kCharacters; ++i) {
+            const auto r = characters.topic.insertAndWait(
+                AiCharacter{.characterId = backfillId(i), .userId = backfillId(i % kUsers + 1), .name = "c" + std::to_string(i)}, 60s);
+            ASSERT_TRUE(r.ok()) << "character " << i << " code " << r.code();
+            characterIds.insert(backfillId(i));
+        }
+    }
+    const uint64_t userMax = *userIds.rbegin(), characterMax = *characterIds.rbegin();
+
+    const auto insertLive = [&](int seed, int users, int characters, uint64_t userAbove, uint64_t characterAbove) {
+        auto client = connectClient(c, patientConfig(c, seed));
+        AiWriter<AiUser> u(*client, "user");
+        for (int i = 0; i < users; ++i) expectFresh(userIds, u.topic.insertAndWait(AiUser{.provider = 2, .subject = "live" + std::to_string(i)}, 60s), "user", userAbove);
+        AiWriter<AiCharacter> ch(*client, "character");
+        for (int i = 0; i < characters; ++i) expectFresh(characterIds, ch.topic.insertAndWait(AiCharacter{.userId = 1, .name = "live" + std::to_string(i)}, 60s), "character", characterAbove);
+    };
+
+    const int first = userLeader[0];
+    c.crash(first);
+    ASSERT_TRUE(awaitLeaders(c, userTopic, 1, userLeader, 60s));
+    ASSERT_TRUE(awaitLeaders(c, characterTopic, 1, characterLeader, 60s));
+    insertLive(c.runningNodes().front(), 500, 1000, userMax, characterMax);
+    ASSERT_FALSE(HasFatalFailure());
+    const auto userCounter = counterOf(c.node(userLeader[0]), userTopic);
+    const auto characterCounter = counterOf(c.node(characterLeader[0]), characterTopic);
+    ASSERT_TRUE(userCounter && characterCounter);
+    EXPECT_GT(userCounter->nextN, userMax);
+    EXPECT_GT(characterCounter->nextN, characterMax);
+
+    c.startNode(first);
+    ASSERT_TRUE(awaitLeaders(c, userTopic, 1, userLeader, 60s));
+    c.crash(userLeader[0]);
+    ASSERT_TRUE(awaitLeaders(c, userTopic, 1, userLeader, 60s));
+    ASSERT_TRUE(awaitLeaders(c, characterTopic, 1, characterLeader, 60s));
+    const uint64_t userSoFar = *userIds.rbegin(), characterSoFar = *characterIds.rbegin();
+    insertLive(c.runningNodes().front(), 100, 100, userSoFar, characterSoFar);
+    EXPECT_EQ(userIds.size(), static_cast<std::size_t>(kUsers) + 600);
+    EXPECT_EQ(characterIds.size(), static_cast<std::size_t>(kCharacters) + 1100);
+}
+
+TEST(CheckedWritesBrokerRegression, AutoIncDdlRefusalsShardRegression) {
+    OneBroker b("cw-ai-ddl", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto blob = rune::codec::serialize(aiUserDescriptor());
+    const auto expectRefused = [&](const rc::DefineTopicResult& r, const char* detail) {
+        EXPECT_EQ(r.errorCode, kInvalidRequest) << detail;
+        EXPECT_EQ(r.detail, detail);
+    };
+    rc::TopicOptions ai;
+    ai.config.cleanupPolicy      = 1;
+    ai.keyFeatures.autoIncrement = true;
+    const auto define = [&](const char* name, const char* key, std::span<const uint8_t> descriptor, rc::Persistence persistence, const rc::TopicOptions& to) {
+        return c.defineTopicAndWait(name, 1, key, descriptor, persistence, to, {}, 30s);
+    };
+    expectRefused(define("untyped", "", {}, rc::Persistence::Disk, ai), "autoincrement needs a typed topic");
+    expectRefused(define("keyless", "", blob, rc::Persistence::Disk, ai), "autoincrement needs a key");
+    expectRefused(define("transient", "userId", blob, rc::Persistence::Transient, ai), "autoincrement needs a persisted topic");
+    const auto narrow = rune::codec::serialize(KeyRec<uint16_t>::descriptor());
+    expectRefused(define("narrow", "k", narrow, rc::Persistence::Disk, ai), "autoincrement needs a uint64, int64 or uint32 key");
+    for (const int16_t policy : {0, 2}) {
+        rc::TopicOptions to = ai;
+        to.config.cleanupPolicy = policy;
+        expectRefused(define("policy", "userId", blob, rc::Persistence::Disk, to), "autoincrement needs cleanup.policy = compact");
+    }
+    rc::TopicOptions retention = ai;
+    retention.config.retentionMs = 1000;
+    expectRefused(define("retention", "userId", blob, rc::Persistence::Disk, retention), kRetentionDetail);
+    ASSERT_EQ(define("adopted", "", {}, rc::Persistence::Disk, {}).errorCode, 0);
+    expectRefused(define("adopted", "userId", blob, rc::Persistence::Disk, ai), "autoincrement needs a new topic");
+
+    const auto t = define("user", "userId", blob, rc::Persistence::Disk, ai);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const rune::protocol::client::ConfigChangeWire retentionBytes{static_cast<uint8_t>(rune::protocol::ConfigKey::RetentionBytes), 1};
+    const auto alter = c.alterTopicConfigAndWait("user", 0, std::span(&retentionBytes, 1), {}, 30s);
+    EXPECT_EQ(alter.errorCode, kInvalidRequest);
+    EXPECT_EQ(alter.detail, kRetentionDetail);
+}
+
+TEST(CheckedWritesBrokerRegression, LegacyRuntimeRefusesKeyZeroCreatesRegression) {
+    OneBroker b("cw-ai-legacy", OneBroker::Runtime::Legacy);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineAi(c, "user", aiUserDescriptor(), "userId");
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    AiWriter<AiUser> w(c, "user", rc::Acks::All);
+    const auto create = w.topic.insertAndWait(AiUser{.provider = 1, .subject = "new"}, 10s);
+    EXPECT_EQ(create.status(), rc::OpStatus::BrokerError);
+    EXPECT_EQ(create.code(), kInvalidRequest);
+    const auto remove = w.topic.removeAndWait(uint64_t{1}, 10s);
+    EXPECT_TRUE(remove.ok()) << "a plain tombstone is not an intent; code " << remove.code();
+}
+
+TEST(CheckedWritesBrokerRegression, KeyZeroCreatesToAnOlderClusterShardRegression) {
+    {
+        OneBroker b("cw-ai-lvl4", OneBroker::Runtime::Shard, [](NodeConfig& cfg) { cfg.testSupportedFeatureLevel = 4; });
+        rc::Client& c = *b.connectClient();
+        ASSERT_TRUE(waitFor([&] { return b.node().onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) == 4; }, 10s));
+        const auto ddl = defineAi(c, "user", aiUserDescriptor(), "userId");
+        EXPECT_EQ(ddl.errorCode, kInvalidRequest);
+        EXPECT_EQ(ddl.detail, "autoincrement needs every broker at feature level 5");
+        rc::TopicOptions plain;
+        plain.config.cleanupPolicy = 1;
+        const auto t = c.defineTopicAndWait("plain", 1, "userId", rune::codec::serialize(aiUserDescriptor()), rc::Persistence::Disk, plain, {}, 30s);
+        ASSERT_EQ(t.errorCode, 0) << t.detail;
+        // A key-0 create sent as an autoincrement client sends it, to a topic that already exists.
+        rc::Producer prod = c.producer(KiWriter::config(rc::Acks::All));
+        const rc::TopicHandle handle{t.topicId, 1, rc::TopicKind::Typed, rune::protocol::Partitioner::Modulo};
+        const AiUser rec{.provider = 1, .subject = "new"};
+        std::vector<uint8_t> bytes(rec.encodedSize());
+        (void)rec.encode(bytes.data());
+        const rc::Completion r = prod.sendAndWait(handle, rc::Key(uint64_t{0}), bytes, rc::WriteIntent::Insert, 10s);
+        EXPECT_EQ(r.status, rc::OpStatus::BrokerError);
+        EXPECT_EQ(r.errorCode, kInvalidRequest);
+        EXPECT_EQ(leoOf(b.node(), t.topicId, 0), 0);
+        prod.closeImmediately();
+    }
+    int32_t advertised = 0;
+    OneBroker old("cw-ai-v9", OneBroker::Runtime::Shard, [&advertised](NodeConfig& cfg) { cfg.testAdvertisedBrokerVersion = advertised; });
+    awaitLevel(old.node());
+    ASSERT_FALSE(HasFatalFailure());
+    const auto t = defineAi(*old.connectClient(), "user", aiUserDescriptor(), "userId");
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    advertised = 9;   // the client cannot define key features below 10, so the topic is made first
+    old.restart();
+    awaitLevel(old.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *old.connectClient();
+    rc::Producer prod = c.producer(KiWriter::config(kAllView));
+    const rc::TopicHandle handle{t.topicId, 1, rc::TopicKind::Typed, rune::protocol::Partitioner::Modulo};
+    const AiUser rec{.provider = 1, .subject = "new"};
+    std::vector<uint8_t> bytes(rec.encodedSize());
+    (void)rec.encode(bytes.data());
+    EXPECT_EQ(prod.sendAndWait(handle, rc::Key(uint64_t{0}), bytes, rc::WriteIntent::Insert, 10s).status, rc::OpStatus::BrokerTooOld);
+    EXPECT_TRUE(storedValues(old.node(), t.topicId, 0).empty()) << "nothing was sent";
+    prod.closeImmediately();
+}
+
+TEST(CheckedWritesBrokerRegression, LostAckRetryAcrossFailoverReturnsTheSameIdsThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    ThreeNodes c = ThreeNodes::start("cw06la");
+    int32_t topicId = -1, viewTopic = -1;
+    {
+        auto admin = clusterAdmin(c);
+        ASSERT_TRUE(admin != nullptr);
+        const auto t = defineAi(*admin, "ai", aiDescriptor(), "id", 1, 3);
+        ASSERT_EQ(t.errorCode, 0) << t.detail;
+        const auto v = admin->createViewAndWait("ai_by_id", "id", 0, aiViewPlan(t.topicId), {}, 60s);
+        ASSERT_EQ(v.errorCode, 0) << v.detail;
+        topicId   = t.topicId;
+        viewTopic = v.viewTopicId;
+        admin->close();
+    }
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, topicId, 1, leaders, 30s));
+    const int victim = leaders[0];
+    std::vector<int> others;
+    for (const int id : c.runningNodes()) if (id != victim) others.push_back(id);
+    ASSERT_EQ(others.size(), 2u);
+    const int seed = others[0], follower = others[1];
+
+    auto client = connectClient(c, patientConfig(c, seed));
+    AiWriter<Ai> w(*client, "ai");
+    for (int64_t i = 1; i <= 3; ++i) {
+        const auto r = w.topic.insertAndWait(Ai{.n = i}, 60s);
+        ASSERT_TRUE(r.ok());
+        ASSERT_EQ(r.key(), static_cast<uint64_t>(i));
+    }
+    client->dropProduceAcksForTest(1);
+    constexpr int64_t kMarker = 4242;
+    std::optional<rc::WriteResult> retried;
+    std::thread inserter([&] { retried.emplace(w.topic.insertAndWait(Ai{.n = kMarker}, 90s)); });
+
+    // The follower holds the record, so it is committed: the ack that was dropped had been sent.
+    uint64_t assigned = 0;
+    ASSERT_TRUE(waitFor([&] {
+        for (const std::string& v : storedValues(c.node(follower), topicId, 0)) {
+            int64_t n = 0;
+            if (v.size() == 20 && (std::memcpy(&n, v.data() + 12, 8), n == kMarker)) { std::memcpy(&assigned, v.data() + 4, 8); return true; }
+        }
+        return false;
+    }, 10s));
+    c.crash(victim);
+    inserter.join();
+    ASSERT_TRUE(retried.has_value());
+    EXPECT_TRUE(retried->ok()) << "status " << static_cast<int>(retried->status()) << " code " << retried->code();
+    EXPECT_NE(retried->status(), rc::OpStatus::StoredIdUnknown);
+    EXPECT_EQ(retried->key(), assigned) << "the retry on the new leader answers the id the old leader assigned";
+    EXPECT_EQ(assigned, 4u);
+
+    ASSERT_TRUE(awaitLeaders(c, topicId, 1, leaders, 60s));
+    auto reader = connectClient(c, patientConfig(c, seed));
+    const std::optional<int64_t> row = aiRowN(*reader, viewTopic, assigned);
+    ASSERT_TRUE(row.has_value());
+    EXPECT_EQ(*row, kMarker);
+    EXPECT_EQ(storedValues(c.node(leaders[0]), topicId, 0).size(), 4u) << "the retry stored nothing twice";
+    reader->close();
 }

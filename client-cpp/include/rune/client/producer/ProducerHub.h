@@ -77,6 +77,12 @@ public:
         forEach([v](ProducerImpl& p) { p.setBrokerVersion(v); });
     }
 
+    /// Test seam: every producer held and every later one sends partitionKnown = 0.
+    void setPartitionUnknownForTest(bool on) noexcept {
+        partitionUnknownForTest_ = on;
+        forEach([on](ProducerImpl& p) { p.setPartitionUnknownForTest(on); });
+    }
+
     /// F8c C7: forget a released, quiescent producer (its slot becomes a
     /// tombstone; the ordinal is reused only once every fresh one is taken,
     /// oldest first).  The caller detaches the duty share.
@@ -152,7 +158,8 @@ public:
     /// D6: logStartOffset = ProduceResponse.logStartOffset (-1 = not carried).
     /// Client 17: `hasVerdicts` + the trailer entries of a View ack of a verdict source.
     void onProduceResponse(int64_t correlationId, int64_t baseOffset, int16_t errorCode,
-                           int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {});
+                           int64_t logStartOffset = -1, bool hasVerdicts = false, std::span<const uint8_t> verdicts = {},
+                           uint64_t assignedBase = 0);
 
     // ---- Phase 2b F Task 2: coordinator answers, routed by producer ordinal ----
 
@@ -328,6 +335,7 @@ private:
     std::vector<uint32_t> freeOrdinals_;  // F8c C7: released ordinals, FIFO (reused once fresh run out)
     std::size_t freeHead_ = 0;            // next freeOrdinals_ entry to reuse
     std::vector<uint32_t> nextCoordSeq_;  // per ordinal: the next incarnation's coordinator request sequence
+    bool    partitionUnknownForTest_ = false;
     int32_t brokerVersion_ = 0;           // SD11: the seed broker's version (0 = unknown)
     std::vector<uint64_t> nextBase_;      // per ordinal: the next incarnation's sequence base (F2)
 };

@@ -793,6 +793,42 @@ std::vector<cat::CatalogEvent> wideScript(int fields, bool validate, bool withVi
 
 } // namespace
 
+// Checked writes Part 06 (C-12): a view's sink spec carries its SOURCE topic's key features, so the sink routes a key
+// the way its source does.
+TEST(CheckedWritesAutoIncRouting, SinkSpecCarriesTheSourcesKeyFeatures) {
+    gd::ScriptBuilder b(cat::kFormatV3);
+    cat::CreateTopicOps o;
+    o.partitions = 2;
+    o.config.cleanupPolicy = 1;
+    rune::codec::DescriptorBuilder d("ids");
+    d.add("id", rune::codec::PrimType::UInt64, 1, /*isKey=*/true).add("v", rune::codec::PrimType::Int64);
+    o.schema = cat::SchemaDef{.keyField = "id", .validate = true, .descriptorBlob = rune::codec::serialize(d.build()), .nextTag = 2};
+    o.schema->keyFeatures = {.keyIndex = true, .autoIncrement = true, .partitioner = rune::protocol::Partitioner::Modulo};
+    b.createTopic("ids", std::move(o), "CREATE TOPIC ids (...)");
+    cat::ViewDef v;
+    v.sinkPartitions = 2;
+    v.keyField = "f0_xxxxx";
+    v.sourceNames = {"ids"};
+    v.normalizedPlanBlob = {0x01, 0x00, 0x00, 0x00, 0x00};
+    v.compiledPlanBlob = {0xC0, 0x00, 0x00, 0x00, 0x00};
+    v.outputDescriptorBlob = wideDescriptor("idv", 2, 8, true);
+    b.createView("idv", std::move(v), "CREATE VIEW idv AS SELECT * FROM ids");
+    const auto events = std::move(b).take();
+
+    CatalogRig rig("ap_sinkfeat");
+    for (const auto& e : events) rig.appendEventCommitted(e);
+    rig.applier.applyCommitted(rig.replica());
+    ASSERT_FALSE(rig.applier.halted());
+    rig.restart();
+    rune::node::CatalogEffects collect;
+    std::vector<rune::node::SinkSpec> sinks;
+    collect.sinkApplied = [&](const rune::node::SinkSpec& s) { sinks.push_back(s); };
+    ASSERT_GT(rig.applier.replayLocal(rig.replica(), rune::node::BootEffects{std::move(collect)}), 0);
+    ASSERT_EQ(sinks.size(), 1u);
+    EXPECT_TRUE(sinks[0].sourceKeyFeatures.autoIncrement);
+    EXPECT_EQ(sinks[0].sourceKeyFeatures.partitioner, rune::protocol::Partitioner::Modulo);
+}
+
 // C1 — follower side: an oversize effect HALTS apply at its offset; nothing aborts.
 TEST(CatalogApplierRegression, OversizeViewEffectHaltsAtItsOffsetAndNeverAbortsRegression) {
     using namespace rune::node;

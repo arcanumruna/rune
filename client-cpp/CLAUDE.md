@@ -118,6 +118,9 @@ alloc-free handoff). The agent drains, accumulates records into per-
   RecordBatch.  Acked `claimBatch(..., cq, token)` / `claimBatch(..., AckToken)` complete once
   with the batch's base offset; an aborted one never completes.  Zero allocation (gates: `ProducerClaimAllocRegression`,
   `TypedClaimAllocRegression`, `rune_producer_claim_bench`).
+- Autoincrement (checked writes Part 06): key-0 creates ride `kFlagKeyZero`, never share a batch with other records, route
+  sticky (`kKeyZeroStickyRun` = 64 records per partition, then the next); their completions carry the id in `aux`
+  (`assignedKeyOf`), and a batch whose ids are unknown completes `StoredIdUnknown`.
 - `ProducerHub` holds the producers the duty thread owns (registered through
   the agent command ring — no lock, no atomic); `onProduceResponse` routes acks
   back by the batch id's ordinal.

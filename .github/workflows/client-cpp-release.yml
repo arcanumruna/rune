@@ -96,9 +96,9 @@ jobs:
           conan remote add artifactory "$CONAN_REMOTE_URL"
           conan remote login artifactory
 
-      # aeron/1.51.0-rune.2: 1.51.0 + fork fixes (recipe in conan/aeron).
+      # aeron/1.51.0-rune.3: 1.51.0 + fork fixes (recipe in conan/aeron).
       - name: Export the aeron recipe
-        run: conan export conan/aeron --version=1.51.0-rune.2
+        run: conan export conan/aeron --version=1.51.0-rune.3
 
       # Builds the package and runs test_package (a consumer linking the library). The test suites run on the
       # checkpoint hosts, not in the release.

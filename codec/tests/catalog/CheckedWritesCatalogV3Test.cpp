@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <string>
 #include <utility>
@@ -69,6 +70,24 @@ std::vector<uint8_t> blockBytes(const rp::TopicKeyFeatures& f) {
 }
 std::vector<uint8_t> tail(const std::vector<uint8_t>& b) {
     return {b.end() - static_cast<std::ptrdiff_t>(rp::kTopicKeyFeaturesWireLen), b.end()};
+}
+
+rp::TopicKeyFeatures autoInc(uint32_t reserve = 4096, uint64_t max = rp::kAutoIncrementMaxDefault) {
+    rp::TopicKeyFeatures f;
+    f.keyIndex = true; f.autoIncrement = true; f.partitioner = rp::Partitioner::Modulo;
+    f.autoIncrementMax = max; f.autoIncrementReserve = reserve;
+    return f;
+}
+rc::SchemaDef typedSchema(cd::PrimType keyType, const rp::TopicKeyFeatures& f) {
+    cd::DescriptorBuilder b("t");
+    b.add("id", keyType, 1, /*isKey=*/true).add("v", cd::PrimType::Int32);
+    return rc::SchemaDef{.keyField = "id", .validate = true, .descriptorBlob = cd::serialize(b.build()), .nextTag = 2, .keyFeatures = f};
+}
+rc::CreateTopicOps autoIncOps(cd::PrimType keyType, const rp::TopicKeyFeatures& f) {
+    rc::CreateTopicOps o;
+    o.topicId = 0; o.partitions = 2; o.config.cleanupPolicy = 1;
+    o.schema = typedSchema(keyType, f);
+    return o;
 }
 
 } // namespace
@@ -244,6 +263,101 @@ TEST(CatalogV3GoldenRegression, TheGoldenLogDecodesToTheScriptEventByEvent) {
     auto records = rc::readRcat(in);
     ASSERT_TRUE(records.has_value());
     const auto script = rc::testing::goldenScriptV3();
+    ASSERT_EQ(records->size(), script.size());
+    for (std::size_t i = 0; i < script.size(); ++i) {
+        auto e = rc::decode((*records)[i].second);
+        ASSERT_TRUE(e.has_value()) << "offset " << i;
+        EXPECT_EQ(*e, script[i]) << "offset " << i;
+        EXPECT_EQ(e->formatVer, rc::kFormatV3);
+    }
+}
+
+struct AutoIncRuleCase { const char* name; std::function<rc::CatalogEvent()> make; };
+
+class CheckedWritesCatalogV3AutoIncRules : public ::testing::TestWithParam<AutoIncRuleCase> {};
+
+TEST_P(CheckedWritesCatalogV3AutoIncRules, AutoIncrementApplyRules) {
+    rc::CatalogState s;
+    const auto e = GetParam().make();
+    if (e.kind == rc::EventKind::CreateSchema) ASSERT_TRUE(put(s, event(rc::kFormatV3, rc::CreateTopicOps{.topicId = 0}, "raw", 1, 0)).has_value());
+    const auto r = rc::previewFingerprint(s, e);
+    ASSERT_FALSE(r.has_value()) << GetParam().name;
+    EXPECT_EQ(r.error().code, rc::ApplyError::Code::Precondition) << r.error().detail;
+}
+
+INSTANTIATE_TEST_SUITE_P(Rules, CheckedWritesCatalogV3AutoIncRules, ::testing::Values(
+    AutoIncRuleCase{"NoKeyIndex", [] { auto f = autoInc(); f.keyIndex = false; return event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt64, f), "t", 1, 0); }},
+    AutoIncRuleCase{"Fnv1a", [] { auto f = autoInc(); f.partitioner = rp::Partitioner::Fnv1a; return event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt64, f), "t", 1, 0); }},
+    AutoIncRuleCase{"PolicyDelete", [] { auto o = autoIncOps(cd::PrimType::UInt64, autoInc()); o.config.cleanupPolicy = 0; return event(rc::kFormatV3, o, "t", 1, 0); }},
+    AutoIncRuleCase{"Retention", [] { auto o = autoIncOps(cd::PrimType::UInt64, autoInc()); o.config.retentionMs = 1; return event(rc::kFormatV3, o, "t", 1, 0); }},
+    AutoIncRuleCase{"RetentionBytes", [] { auto o = autoIncOps(cd::PrimType::UInt64, autoInc()); o.config.retentionBytes = 1; return event(rc::kFormatV3, o, "t", 1, 0); }},
+    AutoIncRuleCase{"Uint16Key", [] { return event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt16, autoInc()), "t", 1, 0); }},
+    AutoIncRuleCase{"Transient", [] { auto o = autoIncOps(cd::PrimType::UInt64, autoInc()); o.persistence = rc::Persistence::Transient; return event(rc::kFormatV3, o, "t", 1, 0); }},
+    AutoIncRuleCase{"ReserveZero", [] { return event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt64, autoInc(0)), "t", 1, 0); }},
+    AutoIncRuleCase{"ReserveTooBig", [] { return event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt64, autoInc(1'048'577)), "t", 1, 0); }},
+    AutoIncRuleCase{"MaxBelowTwoPMinusOne", [] { return event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt64, autoInc(4096, 2)), "t", 1, 0); }},
+    AutoIncRuleCase{"MaxAboveCap", [] { return event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt64, autoInc(4096, rp::kAutoIncrementMaxDefault + 1)), "t", 1, 0); }},
+    AutoIncRuleCase{"Uint32MaxAboveCap", [] { return event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt32, autoInc(4096, uint64_t{1} << 32)), "t", 1, 0); }},
+    AutoIncRuleCase{"CreateSchemaAdoption", [] { return event(rc::kFormatV3, rc::CreateSchemaOps{typedSchema(cd::PrimType::UInt64, autoInc())}, "raw", 1, 1); }},
+    AutoIncRuleCase{"ModuloWithoutAutoIncrement", [] { rp::TopicKeyFeatures f; f.keyIndex = true; f.partitioner = rp::Partitioner::Modulo; return event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt64, f), "t", 1, 0); }}),
+    [](const auto& i) { return std::string(i.param.name); });
+
+TEST(CheckedWritesCatalogV3, AutoIncrementTopicAppliesAndFingerprints) {
+    rc::CatalogState s, plain;
+    const auto e = event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt64, autoInc()), "user", 1, 0);
+    ASSERT_TRUE(put(s, e).has_value());
+    ASSERT_TRUE(put(plain, event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt64, {}), "user", 1, 0)).has_value());
+    EXPECT_TRUE(s.topicByName(rc::kDefaultNsId, "user")->schema->keyFeatures.autoIncrement);
+    EXPECT_NE(s.digest(), plain.digest());
+}
+
+TEST(CheckedWritesCatalogV3, AlterTopicConfigCannotAddRetentionToAnAutoIncrementTopic) {
+    rc::CatalogState s;
+    ASSERT_TRUE(put(s, event(rc::kFormatV3, autoIncOps(cd::PrimType::UInt64, autoInc()), "user", 1, 0)).has_value());
+    const auto bad = event(rc::kFormatV3, rc::AlterTopicConfigOps{{{rc::ConfigKey::RetentionMs, 60'000}}}, "user", 1, 1);
+    const auto r = rc::previewFingerprint(s, bad);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().code, rc::ApplyError::Code::Precondition);
+    const auto ok = event(rc::kFormatV3, rc::AlterTopicConfigOps{{{rc::ConfigKey::DeleteRetentionMs, 0}}}, "user", 1, 1);
+    EXPECT_TRUE(rc::previewFingerprint(s, ok).has_value());
+}
+
+TEST(CatalogV3AutoIncGoldenRegression, LogReplaysToPinnedFingerprints) {
+    std::ifstream in(RUNE_CATALOG_GOLDEN_DIR "/v3/autoinc.rcat", std::ios::binary);
+    ASSERT_TRUE(in) << "missing golden log";
+    auto records = rc::readRcat(in);
+    ASSERT_TRUE(records.has_value()) << records.error();
+    ASSERT_EQ(records->size(), std::size(rc::golden::kAutoIncV3Digests));
+    rc::CatalogReplayer r;
+    for (std::size_t i = 0; i < records->size(); ++i) {
+        auto a = r.feed((*records)[i].first, (*records)[i].second);
+        ASSERT_TRUE(a.has_value()) << rc::describe(a.error());
+        EXPECT_EQ(r.state().digest(), rc::golden::kAutoIncV3Digests[i]) << "offset " << i;
+    }
+    const auto* user = r.state().topicByName(rc::kDefaultNsId, "user");
+    const auto* ch   = r.state().topicByName(rc::kDefaultNsId, "character");
+    ASSERT_NE(user, nullptr);
+    ASSERT_NE(ch, nullptr);
+    EXPECT_TRUE(user->schema->keyFeatures.autoIncrement);
+    EXPECT_EQ(ch->schema->keyFeatures.autoIncrementReserve, 128u) << "kept across the AlterSchema";
+    EXPECT_EQ(r.state().topicByName(rc::kDefaultNsId, "ai32")->schema->keyFeatures.autoIncrementMax, 4'294'967'295u);
+}
+
+TEST(CatalogV3AutoIncGoldenRegression, TheGoldenScriptStillProducesTheCheckedInBytesRegression) {
+    std::ifstream in(RUNE_CATALOG_GOLDEN_DIR "/v3/autoinc.rcat", std::ios::binary);
+    auto records = rc::readRcat(in);
+    ASSERT_TRUE(records.has_value());
+    const auto script = rc::testing::goldenScriptV3AutoInc();
+    ASSERT_EQ(records->size(), script.size());
+    for (std::size_t i = 0; i < script.size(); ++i)
+        EXPECT_EQ((*records)[i].second, rc::encode(script[i]).value()) << "offset " << i;
+}
+
+TEST(CatalogV3AutoIncGoldenRegression, TheGoldenLogDecodesToTheScriptEventByEvent) {
+    std::ifstream in(RUNE_CATALOG_GOLDEN_DIR "/v3/autoinc.rcat", std::ios::binary);
+    auto records = rc::readRcat(in);
+    ASSERT_TRUE(records.has_value());
+    const auto script = rc::testing::goldenScriptV3AutoInc();
     ASSERT_EQ(records->size(), script.size());
     for (std::size_t i = 0; i < script.size(); ++i) {
         auto e = rc::decode((*records)[i].second);

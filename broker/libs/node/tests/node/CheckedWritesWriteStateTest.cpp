@@ -65,6 +65,76 @@ TEST(CheckedWritesWriteState, KeyIndexFlagRoundTrips) {
     }
 }
 
+TEST(CheckedWritesWriteState, AutoIncFieldsRoundTrip) {
+    TopicWriteSpecWire w;
+    w.topicId = 4; w.keyFieldId = 1; w.keyType = PrimType::UInt64; w.keyWidth = 8; w.keyIndex = true;
+    w.autoIncrement = true; w.partitioner = rune::protocol::Partitioner::Modulo;
+    w.autoIncrementMax = 0x0102030405060708ull; w.autoIncrementReserve = 77; w.partitionCount = 3;
+    uint8_t buf[kTopicWriteSpecAutoIncWireLen];
+    ASSERT_EQ(topicWriteSpecWireLen(w), 26u);
+    ASSERT_EQ(encodeTopicWriteSpec(w, buf), 26u);
+    EXPECT_EQ(buf[8], 6) << "keyIndex | autoIncrement";
+    const auto back = decodeTopicWriteSpec(buf);
+    ASSERT_TRUE(back);
+    EXPECT_EQ(*back, w);
+    EXPECT_EQ(encodeTopicWriteSpec(w, std::span<uint8_t>(buf, 25)), 0u);
+    EXPECT_FALSE(decodeTopicWriteSpec(std::span<const uint8_t>(buf, 25))) << "a 25-byte tail";
+    EXPECT_FALSE(decodeTopicWriteSpec(std::span<const uint8_t>(buf, 9))) << "autoincrement needs the long form";
+    uint8_t bad[26];
+    std::memcpy(bad, buf, 26);
+    bad[9] = 2;
+    EXPECT_FALSE(decodeTopicWriteSpec(bad)) << "partitioner 2";
+    std::memcpy(bad, buf, 26);
+    bad[8] = 2;
+    EXPECT_FALSE(decodeTopicWriteSpec(bad)) << "the long form without autoincrement";
+    std::memcpy(bad, buf, 26);
+    bad[8] = 0x0E;
+    EXPECT_FALSE(decodeTopicWriteSpec(bad)) << "flag bit 3";
+}
+
+TEST(CheckedWritesWriteState, TheNineByteFormStillRoundTrips) {
+    TopicWriteSpecWire w;
+    w.topicId = 4; w.keyFieldId = 1; w.keyType = PrimType::UInt64; w.keyWidth = 8; w.keyIndex = true;
+    uint8_t buf[kTopicWriteSpecAutoIncWireLen];
+    ASSERT_EQ(topicWriteSpecWireLen(w), 9u);
+    ASSERT_EQ(encodeTopicWriteSpec(w, buf), 9u);
+    const auto back = decodeTopicWriteSpec(std::span<const uint8_t>(buf, 9));
+    ASSERT_TRUE(back);
+    EXPECT_EQ(*back, w);
+    EXPECT_FALSE(back->autoIncrement);
+    EXPECT_EQ(back->partitioner, rune::protocol::Partitioner::Fnv1a);
+}
+
+TEST(CheckedWritesWriteState, SetFactsCopiesTheAutoIncrementFacts) {
+    TopicWriteSpecWire w;
+    w.topicId = 4; w.keyIndex = true; w.autoIncrement = true; w.partitioner = rune::protocol::Partitioner::Modulo;
+    w.autoIncrementMax = 99; w.autoIncrementReserve = 5; w.partitionCount = 2;
+    TopicWriteSpec s;
+    EXPECT_FALSE(s.autoIncrement);
+    s.setFacts(w);
+    EXPECT_TRUE(s.autoIncrement);
+    EXPECT_EQ(s.partitioner, rune::protocol::Partitioner::Modulo);
+    EXPECT_EQ(s.autoIncrementMax, 99u);
+    EXPECT_EQ(s.autoIncrementReserve, 5u);
+    EXPECT_EQ(s.partitionCount, 2);
+}
+
+TEST(CheckedWritesWriteState, SpecOfAnAutoIncrementCatalogTopic) {
+    auto t = topicOf(matrixDescriptor(), "id", true);
+    t.partitions = 4;
+    t.schema->keyFeatures = {.keyIndex = true, .autoIncrement = true, .partitioner = rune::protocol::Partitioner::Modulo,
+                             .autoIncrementMax = 1000, .autoIncrementReserve = 128};
+    const auto w = writeSpecWireOf(t);
+    ASSERT_TRUE(w);
+    EXPECT_TRUE(w->autoIncrement);
+    EXPECT_TRUE(w->keyIndex);
+    EXPECT_EQ(w->partitioner, rune::protocol::Partitioner::Modulo);
+    EXPECT_EQ(w->autoIncrementMax, 1000u);
+    EXPECT_EQ(w->autoIncrementReserve, 128u);
+    EXPECT_EQ(w->partitionCount, 4);
+    EXPECT_EQ(topicWriteSpecWireLen(*w), 26u);
+}
+
 TEST(CheckedWritesWriteState, SetFactsCopiesTheKeyIndex) {
     TopicWriteSpecWire w;
     w.topicId = 4; w.keyIndex = true;

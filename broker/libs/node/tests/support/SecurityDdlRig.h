@@ -255,6 +255,7 @@ public:
         return out;
     }
     [[nodiscard]] SecurityAdmin& admin() { return *admin_; }
+    void setFeatureLevel(int16_t level) noexcept { featureLevel_ = level; }
     [[nodiscard]] SecurityApplier& applier() { return applier_; }
     [[nodiscard]] rune::replication::PartitionReplica& replica() { return *replica_; }
     [[nodiscard]] const rune::security::SecurityState& state() const { return applier_.state(); }
@@ -282,6 +283,7 @@ private:
                 answers_[corr] = Answer{corr, code, objectId, version, gateOffset, std::string{detail}};
             },
             kSelf);
+        admin_->bindFeatureLevel(&featureLevel_);
     }
     void fetch_(int32_t follower) {
         rune::replication::FetchRequestMsg f{};
@@ -305,6 +307,7 @@ private:
     std::vector<int32_t> isr_;
     std::set<int32_t> silent_;
     std::map<int64_t, Answer> answers_;
+    int16_t featureLevel_ = rune::replication::MetadataFeature::kLatest;
     int32_t epoch_ = 0;
     int64_t now_ = 1'000'000, corr_ = 0;
     uint64_t ridCounter_ = 0;

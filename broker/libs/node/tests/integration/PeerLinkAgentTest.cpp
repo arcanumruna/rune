@@ -16,6 +16,7 @@ extern "C" {
 }
 
 #include <Aeron.h>
+#include <functional>
 #include <Context.h>
 
 #include <gtest/gtest.h>
@@ -76,6 +77,7 @@ struct AgentRig {
     std::map<int32_t, std::unique_ptr<PeerLinkAgent>> agents;
     struct Got { int32_t peer; pl::LinkKeys keys; };
     std::map<int32_t, std::vector<Got>>          established;   // by agent id
+    std::function<void(int32_t, const pl::LinkKeys&)> duringInstall;   // runs inside an agent's established sink
 
     AgentRig() {
         aeron::Context ctx; ctx.aeronDir(driver.aeronDir());
@@ -87,6 +89,7 @@ struct AgentRig {
     static uint64_t onEstablished(void* ctx, int32_t peer, const pl::LinkKeys& k, int64_t) {
         auto* me = static_cast<std::pair<AgentRig*, int32_t>*>(ctx);
         me->first->established[me->second].push_back({peer, k});
+        if (me->first->duringInstall) me->first->duringInstall(me->second, k);
         return 0;   // no other plane: the go-ahead leaves at once
     }
     std::map<int32_t, std::unique_ptr<std::pair<AgentRig*, int32_t>>> ctxs;
@@ -210,6 +213,30 @@ TEST(PeerLinkAgentRegression, ARestartedResponderIsReestablishedWithNewKeys) {
     pl::LinkKeys after;
     for (auto& g : rig.established[1]) if (g.peer == 3) after = g.keys;
     EXPECT_NE(after.sendMaster, before.sendMaster) << "new keys replace the old ones everywhere";
+}
+
+// Issue #241 / #275: a re-handshake's responder hands its receive-only keys to the sink (which fans them out to every
+// worker and the admin thread) BEFORE the Accept leaves; the initiator seals under the new epoch the moment it has the
+// Accept, and no ring or stream orders that frame against the workers' key install.
+TEST(PeerLinkAgentRegression, TheKeysAreInstalledBeforeTheAcceptLeavesRegression) {
+    AgentRig rig;
+    for (int32_t id = 1; id <= 3; ++id) rig.start(id, keysOf('k'), 100 + static_cast<uint64_t>(id));
+    ASSERT_TRUE(rig.runUntil(3000ms, [&] {
+        for (auto& [id, a] : rig.agents) if (a->establishedPeers() != 2) return false;
+        return true;
+    }));
+    rig.established.clear();
+    bool acceptArrivedFirst = false, hooked = false;
+    rig.duringInstall = [&](int32_t id, const pl::LinkKeys& k) {
+        if (id != 2 || k.install != pl::LinkInstall::ReceiveOnly || hooked) return;
+        hooked = true;
+        const auto until = std::chrono::steady_clock::now() + 200ms;
+        while (std::chrono::steady_clock::now() < until) rig.agents[1]->doWork(AgentRig::nowNs());
+        for (auto& g : rig.established[1]) if (g.peer == 2) acceptArrivedFirst = true;
+    };
+    ASSERT_TRUE(rig.agents[1]->forceRekeyForTest(2, AgentRig::nowNs()));
+    ASSERT_TRUE(rig.runUntil(3000ms, [&] { return hooked; })) << "the responder installed the new epoch receive-only";
+    EXPECT_FALSE(acceptArrivedFirst) << "the initiator had the Accept before the responder's sink returned";
 }
 
 TEST(PeerLinkAgentRegression, AnAgentWithNoPeersTicksQuietly) {

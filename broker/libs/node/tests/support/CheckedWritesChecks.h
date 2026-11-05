@@ -140,6 +140,10 @@ inline void checkMarkers(const CheckedWritesModel& model, const VerdictRig::RigL
         const auto it = model.verdicts().find(off);
         EXPECT_TRUE(it != model.verdicts().end() && it->second == verdict) << "(b) marker entry " << off << " is not the model's verdict";
     }
+    // 8.5: a marker goes only once every record it lists is gone, so a rejected record the log still holds is listed by a survivor.
+    for (const auto& d : log.data)
+        if (d.offset < reach && model.verdicts().count(d.offset) != 0)
+            EXPECT_TRUE(union_.count(d.offset) != 0) << "(b) rejected offset " << d.offset << " is in the log but no marker lists it";
 }
 
 /// (c)(d) The projection and the count views hold the model's live keys.
@@ -167,8 +171,8 @@ inline void checkViews(VerdictRig& r, const CheckedWritesModel& model, const Ver
 /// are further log records the subscription delivers (a Raw one gets an aborted transaction's).
 inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64_t sub, bool filtered, const std::set<int64_t>* present = nullptr,
                            const std::vector<VerdictRig::RigLogRec>* alsoDelivered = nullptr) {
-    for (int i = 0; i < VerdictRig::kMaxPass && r.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) r.pass();   // nothing is delivered while the leadership scan runs
-    ASSERT_EQ(r.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
+    for (int i = 0; i < VerdictRig::kMaxPass && r.worker->rcStatusForTest(VerdictRig::kSrc, r.partition()) != Worker::kRcReady; ++i) r.pass();   // nothing is delivered while the leadership scan runs
+    ASSERT_EQ(r.worker->rcStatusForTest(VerdictRig::kSrc, r.partition()), Worker::kRcReady);
     const auto& box = r.collect(sub);
     std::vector<std::tuple<int64_t, uint64_t, uint16_t, uint8_t>> got, want;
     for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.tag, d.intent);
@@ -186,8 +190,9 @@ inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64
 }
 
 /// (e)(g) One cleaner pass keeps everything at or above the verdict bound and every key's latest accepted record.
-inline void checkCompaction(VerdictRig& r, const CheckedWritesModel& model, const VerdictRig::RigLog& before) {
-    const auto cp = r.compact();
+/// `nowMs`: the cleaner's clock; a later one than the last pass's horizon removes what that pass stamped.
+inline void checkCompaction(VerdictRig& r, const CheckedWritesModel& model, const VerdictRig::RigLog& before, int64_t nowMs = 1'000'000) {
+    const auto cp = r.compact(nowMs);
     const auto after = r.readLog();
     std::set<int64_t> kept;
     for (const auto& d : after.data) kept.insert(d.offset);

@@ -337,7 +337,10 @@ TEST(CheckedWritesKeyIndexRegression, EveryActivationRebuildsFromTheLocalLogRegr
     r.passes(20);
     EXPECT_EQ(r.keyIndexKeys(), idSet(11, 50));
 
-    for (int i = 0; i < 6 && hasTombstone(r); ++i) (void)r.compact(1'000'000 + i * 5'000);
+    for (int i = 0; i < 6 && hasTombstone(r); ++i) {
+        r.replica->setLastCleanOffset(0);   // nothing new is dirty: the drop needs a pass from the log start (a leader without a checkpoint)
+        (void)r.compact(1'000'000 + i * 5'000);
+    }
     ASSERT_FALSE(hasTombstone(r)) << "the tombstones of 1..10 are gone from the log";
     r.demotePromote();
     r.passes(30);

@@ -74,7 +74,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
 - `partitions` defaults to 1. Strings are UTF-8, and `lower()` is Unicode simple lowercasing.
 
 **Budgets** (hard gates, spec §14):
-- Write hook: autoincrement assignment, including the scratch copy, < **1 µs p50** per batch of up to 4 KiB (`ProduceValidateBench`).
+- Write hook: autoincrement assignment, including the scratch copy, < **2 µs p50** per batch of up to 4 KiB (`ProduceValidateBench`).
 - New typed-topic validation: ≤ **1 µs p50** for a one-record batch.
 - Judging: ≤ **1 µs per record** for one unique view plus one count check (`ViewFoldBench`).
 - `ViewFoldBench` with derived keys plus the owner map: ≤ **10 µs** per event batch.

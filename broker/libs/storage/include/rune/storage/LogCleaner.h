@@ -1,6 +1,7 @@
 #pragma once
 #include <rune/storage/Log.h>
 #include <rune/storage/OffsetMap.h>
+#include <rune/storage/ProducerBatchWindow.h>
 #include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/storage/Throttler.h>
 #include <cstdint>
@@ -50,6 +51,10 @@ struct CleanedGroup {
 struct RangeCleanResult {
     bool                 compacted = false;
     Offset               passEnd   = -1;
+    /// Where the pass's rewrite ended: passEnd, or above it when a producer's retry window held the watermark back
+    /// (setProducerTailDepth).  The owner keeps the max of this and the previous value (progress never moves back on a
+    /// pass that stops short); the next pass's setPreviousPassEnd takes that max.
+    Offset               cleanedThrough = -1;
     std::vector<int64_t> rewrittenBases;
     /// Deferred-install mode only (setDeferredInstall): the outputs to hand to
     /// the owner thread (Log::enqueueCleanedGroup).  rewrittenBases still lists
@@ -85,6 +90,20 @@ public:
     /// compaction (ProducerTails.h).  Default 7 days; < 0 = never expire.
     void setProducerIdExpirationMs(int64_t ms) noexcept { producerIdExpirationMs_ = ms; }
     [[nodiscard]] int64_t producerIdExpirationMs() const noexcept { return producerIdExpirationMs_; }
+    /// Part 06 (P6-9): producer-state batches the partition keeps per producer (PartitionReplica::producerTailDepth).  Above 1
+    /// (an autoincrement topic) a live producer's last `depth` batches are kept whole and their keys' tombstones pinned
+    /// (ProducerBatchWindow.h), and produceCleanedRangeBounded's passEnd stops at the oldest protected batch; 1 builds no window
+    /// and cleans as ProducerTails alone dictates.
+    void setProducerTailDepth(int depth) {
+        if (depth <= 1) window_.reset();
+        else if (!window_ || window_->depth() != depth) window_.emplace(depth);
+    }
+    /// Part 06: the previous pass's cleanedThrough.  When the watermark is held and a map built from it fills below this offset
+    /// (the pass would redo the last one), produceCleanedRangeBounded maps the keys from here instead: the pass still compacts
+    /// above it, the watermark stays, and a tombstone at or above the watermark whose key that map lacks is kept (its insert may
+    /// be one the window just released).  Window only.
+    void setPreviousPassEnd(Offset offset) noexcept { previousPassEnd_ = offset; }
+    [[nodiscard]] const ProducerBatchWindow* producerBatchWindowForTest() const noexcept { return window_ ? &*window_ : nullptr; }
     /// M3: bytes the last offset-map build read from clean-prefix segments
     /// (producer tails) — throttled by the bounded passes.
     [[nodiscard]] int64_t lastPrefixBytesRead() const noexcept { return prefixBytesRead_; }
@@ -309,7 +328,7 @@ public:
     ///   - Accumulate consecutive sealed segments into a group while:
     ///       (a) combined data ≤ segmentRollBytes (output fits in one segment)
     ///       (b) combined index entries ≤ maxIndexEntries (index size limit)
-    ///       (c) offset span ≤ INT32_MAX (4-byte relative offset in OffsetIndex)
+    ///       (c) offset span ≤ INT32_MAX (4-byte relative offset in OffsetIndex), up to the candidate's END
     ///   - Each group produces ONE cleaned output segment in the cleaner.
     ///   - Segments in [firstUncleanableIdx .. end) are excluded.
     ///
@@ -317,6 +336,7 @@ public:
     ///                         (i.e. those with base < firstUncleanable and within
     ///                          the dirty range).
     /// @param sealedSizes      Parallel vector of file sizes (bytes) for each base.
+    /// @param endOffset        Base of the segment after the last one (bounds its offsets).
     /// @param segmentRollBytes Max combined output bytes per group.
     /// @param maxIndexEntries  Max offset-index entries per output segment.
     ///                         Default: 4096*1024/8 = 524288 (~4 MiB index at 8 B/entry).
@@ -327,6 +347,7 @@ public:
     static std::vector<SegmentGroup>
     groupSegmentsBySize(const std::vector<int64_t>& sealedBases,
                         const std::vector<int64_t>& sealedSizes,
+                        int64_t endOffset,
                         int64_t segmentRollBytes,
                         int32_t maxIndexEntries = 524288);
 
@@ -435,6 +456,11 @@ private:
                            Throttler* throttler, bool* changed,
                            std::optional<int64_t> afterGroupBase = std::nullopt);
     int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
+    std::optional<ProducerBatchWindow> window_{};   ///< depth > 1 only
+    int64_t windowNowMs_ = -1;                       ///< the window's expiry clock: the last produceCleanedRangeBounded's nowMs
+    bool windowOverflowLogged_ = false;              ///< the window went over its budget once (logged once)
+    Offset previousPassEnd_ = -1;                    ///< setPreviousPassEnd
+    Offset heldFrom_ = std::numeric_limits<Offset>::max();   ///< a forward pass's watermark (setPreviousPassEnd); max otherwise
     int64_t prefixBytesRead_        = 0;
     Offset  markerRemovalBound_     = 0;
     Offset  verdictBound_           = std::numeric_limits<Offset>::max();

@@ -82,6 +82,8 @@ struct SinkSpec {
     rune::catalog::Persistence   persistence = rune::catalog::Persistence::Disk;
     std::string                  keyField;
     uint32_t                     nsId       = 0;   // the namespace that owns the view (and so its sink)
+    /// The source topic's key features: the sink routes a key like its source (partitioner).
+    rune::protocol::TopicKeyFeatures sourceKeyFeatures{};
 };
 
 /// The admin-thread effect sink.  Production = ring encoders (AdminWorkerAgent);
