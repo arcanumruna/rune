@@ -114,9 +114,12 @@ public:
                     const EnqueueResult r = pool->worker(w).enqueueOp(op);
                     scrub_(op.peerKeys.data(), op.peerKeys.size());
                     if (r == EnqueueResult::Full) break;   // back-pressure: this worker again next cycle
-                    if (r == EnqueueResult::TooLarge) [[unlikely]]
+                    if (r == EnqueueResult::TooLarge) [[unlikely]] {
+                        // Never delivered, so never acknowledged: book it applied so a held go-ahead is not held forever
+                        // (that worker drops the peer's frames under the epoch - loud, never a silent hang).
                         spdlog::error("PeerLinkFanout: keys of node {} cannot be enqueued on worker {} (TooLarge)", p.peer, w);
-                    else { ++delivered_; ++work; }
+                        onWorkerApplied(w, p.peer, p.seq);
+                    } else { ++delivered_; ++work; }
                     ++p.workersDone;
                 }
             }

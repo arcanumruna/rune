@@ -423,3 +423,56 @@ TEST(PeerLinkFanoutRegression, EnqueueOpNeverCopiesAKeyCarryingOpRegression) {
     drainAll(*p);
     EXPECT_TRUE(workerHolds(*p, 0, 2, 3)) << "the keys still reached the worker";
 }
+
+// Review of 8d726892, adversarial: the promotion of an epoch supersedes its receive-only install after that install
+// reached only SOME workers (worker 1 back-pressured).  Worker 0 then runs both (acks s1, then s2), worker 1 only the
+// promotion (acks s2).  `applied(s1)` must wait for worker 1's s2 (it holds the epoch only then) and never answer from
+// worker 0's acks alone; `applied(s2)` likewise.  Every op carries its own entry's sequence number.
+namespace {
+struct SeqWorker {
+    std::vector<std::pair<uint8_t, uint64_t>> ops;   // (install, seq)
+    int fullBudget = 0;
+    EnqueueResult enqueueOp(const WorkerOp& op) {
+        if (fullBudget > 0) { --fullBudget; return EnqueueResult::Full; }
+        ops.emplace_back(op.isolation, static_cast<uint64_t>(op.correlationId));
+        return EnqueueResult::Enqueued;
+    }
+};
+struct SeqPool {
+    SeqWorker workers[2];
+    int32_t workerCount() const { return 2; }
+    SeqWorker& worker(int32_t w) { return workers[w]; }
+};
+} // namespace
+
+TEST(PeerLinkFanoutRegression, APromotionSupersedingAPartlyDeliveredInstallIsAckedPerPlaneAdversarialRegression) {
+    using rune::peerlink::LinkInstall;
+    SeqPool pool;
+    pool.workers[1].fullBudget = 1;
+    PeerLinkFanout f;
+    const uint64_t s1 = f.post(2, keysAt(4, 1, LinkInstall::ReceiveOnly));
+    (void)f.pumpWith(&pool, nullptr);
+    ASSERT_EQ(pool.workers[0].ops.size(), 1u);
+    ASSERT_TRUE(pool.workers[1].ops.empty());
+    const uint64_t s2 = f.post(2, keysAt(4, 1, LinkInstall::SendAndReceive));   // same epoch: supersedes the entry
+    ASSERT_GT(s2, s1);
+    (void)f.pumpWith(&pool, nullptr);
+    EXPECT_EQ(f.pendingForTest(), 0u);
+    ASSERT_EQ(pool.workers[0].ops.size(), 2u);
+    ASSERT_EQ(pool.workers[1].ops.size(), 1u);
+    EXPECT_EQ(pool.workers[0].ops[0].second, s1);
+    EXPECT_EQ(pool.workers[0].ops[1].second, s2) << "the superseding entry carries its own sequence number";
+    EXPECT_EQ(pool.workers[1].ops[0].second, s2);
+    // The workers run them and ack, worker 0 first.
+    f.onWorkerApplied(0, 2, s1);
+    f.onWorkerApplied(0, 2, s2);
+    EXPECT_FALSE(f.applied(2, s1, 2, false)) << "worker 1 holds nothing of the epoch yet";
+    f.onWorkerApplied(1, 2, s2);
+    EXPECT_TRUE(f.applied(2, s1, 2, false));
+    EXPECT_TRUE(f.applied(2, s2, 2, false));
+    // An ack for another peer, or a stale one, never satisfies this peer.
+    EXPECT_FALSE(f.applied(2, s2 + 1, 2, false));
+    f.onWorkerApplied(0, 3, s2 + 5);
+    f.onWorkerApplied(1, 3, s2 + 5);
+    EXPECT_FALSE(f.applied(2, s2 + 1, 2, false));
+}

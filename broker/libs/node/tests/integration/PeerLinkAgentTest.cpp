@@ -437,3 +437,150 @@ TEST(PeerLinkAgentRegression, InProcessUnauthenticatedBuildsNoAgent) {
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     for (BrokerNode* n : c.live()) EXPECT_FALSE(n->peerLinksForTest().present);
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Review of the go-ahead hold (8d726892), adversarial: the agents are driven on an INJECTED clock (the handshake's
+// kRetryNs / kAwaitNs run on it), the frames travel over real Aeron UDP.  The sink models the other planes: while
+// `hold` is set it answers a sequence number (the install is still running on a worker / the admin thread) and the
+// test plays BrokerNode::servicePeerLinks_ by calling releaseHeldAt when it decides every plane acknowledged.
+namespace {
+struct GatedSink {
+    struct Call { int32_t peer; pl::LinkKeys keys; uint64_t seq; };
+    std::vector<Call> calls;
+    bool     hold = false;
+    uint64_t next = 0;
+    static uint64_t fn(void* ctx, int32_t peer, const pl::LinkKeys& k, int64_t) {
+        auto* s = static_cast<GatedSink*>(ctx);
+        const uint64_t seq = s->hold ? ++s->next : 0;
+        s->calls.push_back({peer, k, seq});
+        return seq;
+    }
+    [[nodiscard]] bool sawInstall(int32_t peer, uint32_t epoch, pl::LinkInstall mode) const {
+        for (const auto& c : calls) if (c.peer == peer && c.keys.epoch == epoch && c.keys.install == mode) return true;
+        return false;
+    }
+};
+std::size_t slotOf(const PeerLinkAgent& a, int32_t peer) {
+    for (std::size_t i = 0; i < a.peerCount(); ++i) if (a.peerIdAt(i) == peer) return i;
+    return SIZE_MAX;
+}
+const pl::Established* establishedOf(const PeerLinkAgent& a, int32_t peer) {
+    const auto* st = a.stateOf(peer);
+    return st != nullptr ? std::get_if<pl::Established>(st) : nullptr;
+}
+/// Agents 1 (initiator) and 2 (responder) only, each with a GatedSink, on an injected clock `t` advanced `stepNs` per
+/// pass (one real ms per pass lets the UDP frames land).  Every drive is capped and fails rather than hangs.
+struct GatedPair {
+    AgentRig  rig;
+    GatedSink s1, s2;
+    int64_t   t = 5'000'000'000'000;
+    GatedPair() {
+        rig.start(1, keysOf('k'), 101);
+        rig.start(2, keysOf('k'), 102);
+        rig.agents[1]->setEstablishedSink(&GatedSink::fn, &s1);
+        rig.agents[2]->setEstablishedSink(&GatedSink::fn, &s2);
+    }
+    PeerLinkAgent& a1() { return *rig.agents[1]; }
+    PeerLinkAgent& a2() { return *rig.agents[2]; }
+    void pass(int64_t stepNs) {
+        t += stepNs;
+        a1().doWork(t);
+        a2().doWork(t);
+        std::this_thread::sleep_for(1ms);
+    }
+    template <class Pred> bool driveUntil(int maxPasses, int64_t stepNs, Pred&& done) {
+        for (int i = 0; i < maxPasses; ++i) { pass(stepNs); if (done()) return true; }
+        return false;
+    }
+};
+} // namespace
+
+// The initiator's planes are slow: its Confirm (the responder's promotion trigger) is held although the responder
+// re-sends its Accept every kRetryNs for kAwaitNs and each re-send is answered with the Confirm again (#584).  Every
+// one of those answers must be held too; the responder stays receive-only until the initiator releases, then promotes.
+// Mutation: PeerLinkAgent::absorb_ sending a re-sent Confirm at once while awaitSeq != 0 -> the responder promotes
+// before the release -> red.
+TEST(PeerLinkAgentRegression, AHeldConfirmStaysHeldThroughEveryAcceptResendAdversarialRegression) {
+    GatedPair g;
+    ASSERT_TRUE(g.driveUntil(5000, 1'000'000, [&] { return establishedOf(g.a1(), 2) && establishedOf(g.a2(), 1); }))
+        << "the first link";
+    const uint32_t e1 = establishedOf(g.a1(), 2)->keys.epoch;
+    g.s1.hold = true;
+    ASSERT_TRUE(g.a1().forceRekeyForTest(2, g.t));
+    // The new epoch reaches the initiator (Accept); its planes have not acknowledged the receive-only install.
+    ASSERT_TRUE(g.driveUntil(3000, 1'000'000, [&] {
+        const auto* e = establishedOf(g.a1(), 2);
+        return e != nullptr && e->keys.epoch != e1;
+    })) << "the initiator took the Accept";
+    const uint32_t e2 = establishedOf(g.a1(), 2)->keys.epoch;
+    const std::size_t i1 = slotOf(g.a1(), 2);
+    ASSERT_NE(g.a1().awaitedInstallAt(i1), 0u) << "the Confirm awaits the initiator's planes";
+    EXPECT_TRUE(g.s1.sawInstall(2, e2, pl::LinkInstall::ReceiveOnly));
+    // Past the responder's whole re-send window (kAwaitNs) plus slack: several Accept re-sends, each answered and held.
+    for (int i = 0; i < 1500; ++i) {
+        g.pass(1'000'000);
+        const auto* r = establishedOf(g.a2(), 1);
+        ASSERT_NE(r, nullptr);
+        ASSERT_EQ(r->keys.epoch, e2);
+        ASSERT_TRUE(r->unconfirmedAccept.has_value()) << "the responder promoted at pass " << i << " while the initiator's planes could not open " << e2;
+    }
+    EXPECT_FALSE(g.s1.sawInstall(2, e2, pl::LinkInstall::SendAndReceive)) << "the initiator switched send before its planes acked";
+    EXPECT_FALSE(g.s2.sawInstall(1, e2, pl::LinkInstall::SendAndReceive));
+    // Every plane acknowledged: the send side switches and the Confirm (its newest copy) leaves; the responder promotes.
+    g.a1().releaseHeldAt(i1);
+    EXPECT_EQ(g.a1().awaitedInstallAt(i1), 0u);
+    EXPECT_TRUE(g.s1.sawInstall(2, e2, pl::LinkInstall::SendAndReceive));
+    ASSERT_TRUE(g.driveUntil(2000, 1'000'000, [&] { return g.s2.sawInstall(1, e2, pl::LinkInstall::SendAndReceive); }))
+        << "the released Confirm promotes the responder (even past kAwaitNs)";
+    EXPECT_FALSE(establishedOf(g.a2(), 1)->unconfirmedAccept.has_value());
+}
+
+// The responder's planes are slow: its Accept is held (the initiator must not seal under the epoch), and so is its own
+// promotion on the Confirm (a second receive-only install, then send-and-receive only on the release).
+// Mutation: absorb_ sending the Accept at once -> the initiator reaches the new epoch before the release -> red.
+TEST(PeerLinkAgentRegression, AHeldAcceptAndAHeldPromotionOnTheResponderAdversarialRegression) {
+    GatedPair g;
+    ASSERT_TRUE(g.driveUntil(5000, 1'000'000, [&] { return establishedOf(g.a1(), 2) && establishedOf(g.a2(), 1); }));
+    const uint32_t e1 = establishedOf(g.a1(), 2)->keys.epoch;
+    g.s2.hold = true;
+    ASSERT_TRUE(g.a1().forceRekeyForTest(2, g.t));
+    const std::size_t i2 = slotOf(g.a2(), 1);
+    ASSERT_TRUE(g.driveUntil(2000, 1'000'000, [&] { return g.a2().awaitedInstallAt(i2) != 0; })) << "the responder established";
+    const uint32_t e2 = establishedOf(g.a2(), 1)->keys.epoch;
+    ASSERT_NE(e2, e1);
+    for (int i = 0; i < 400; ++i) {   // less than kAwaitNs: the initiator still waits for the Accept
+        g.pass(1'000'000);
+        const auto* e = establishedOf(g.a1(), 2);
+        ASSERT_TRUE(e == nullptr || e->keys.epoch == e1) << "the initiator reached " << e2 << " while the responder's planes could not open it";
+    }
+    g.a2().releaseHeldAt(i2);
+    ASSERT_TRUE(g.driveUntil(2000, 1'000'000, [&] { return g.a2().awaitedInstallAt(i2) != 0; }))
+        << "the Confirm arrives and the responder's promotion awaits its planes in turn";
+    EXPECT_TRUE(establishedOf(g.a1(), 2) && establishedOf(g.a1(), 2)->keys.epoch == e2);
+    EXPECT_FALSE(g.s2.sawInstall(1, e2, pl::LinkInstall::SendAndReceive)) << "the responder switched send before its planes acked";
+    g.a2().releaseHeldAt(i2);
+    EXPECT_TRUE(g.s2.sawInstall(1, e2, pl::LinkInstall::SendAndReceive));
+    EXPECT_EQ(g.a2().awaitedInstallAt(i2), 0u);
+}
+
+// Liveness (rule 16): a FIRST link must establish whatever the responder's planes' acknowledgement latency.  The
+// responder's planes ack every install kAwaitNs + 100 ms after it was posted (a worker / the admin thread busy for that
+// long).  A held first-link Accept leaves after the initiator's ChallengeSent gave up (kAwaitNs), every retry is a new
+// epoch held as long, and the link never establishes while the latency lasts; so a responder's send-and-receive Accept
+// is never held.  Mutation: absorb_ holding that Accept too (as 8d726892 did) -> no link in 15 s -> red.
+TEST(PeerLinkAgentRegression, AFirstLinkEstablishesWhateverTheResponderPlanesAckLatencyAdversarialRegression) {
+    GatedPair g;
+    g.s2.hold = true;
+    constexpr int64_t kAckLatencyNs = pl::PeerHandshake::kAwaitNs + 100'000'000;
+    const std::size_t i2 = slotOf(g.a2(), 1);
+    uint64_t awaited = 0;
+    int64_t  since = 0;
+    const bool linked = g.driveUntil(3000, 5'000'000, [&] {   // 15 s of injected time
+        const uint64_t s = g.a2().awaitedInstallAt(i2);
+        if (s != awaited) { awaited = s; since = g.t; }
+        if (s != 0 && g.t - since >= kAckLatencyNs) { g.a2().releaseHeldAt(i2); awaited = 0; }
+        const auto* e1 = establishedOf(g.a1(), 2);
+        return e1 != nullptr && establishedOf(g.a2(), 1) != nullptr && e1->keys.epoch == establishedOf(g.a2(), 1)->keys.epoch;
+    });
+    EXPECT_TRUE(linked) << "1 -> 2 never established; responder installs: " << g.s2.calls.size();
+}
