@@ -152,6 +152,12 @@ public:
     [[nodiscard]] static Verdict classify(ReqKind kind, int16_t errorCode) noexcept;
     /// Severity of a code for `kind` (fenced 5 > fatal 4 > abortable/reject 3 > rediscover 2 > retry 1 > ok 0).
     [[nodiscard]] static int rank(ReqKind kind, int16_t errorCode) noexcept;
+    /// True when a per-entry result answers (topicId, partition): it names that entry, or it is the gateway's
+    /// whole-request rejection {topicId -1, partition -1, code} (RequestRejection.h), which answers every entry.
+    [[nodiscard]] static constexpr bool answers(int32_t resultTopicId, int32_t resultPartition, int32_t topicId,
+                                                int32_t partition) noexcept {
+        return (resultTopicId == topicId && resultPartition == partition) || (resultTopicId == -1 && resultPartition == -1);
+    }
     /// #737/#738: the answer's verdict over the entries the REQUEST named: per requested entry the worst of its
     /// results (duplicates included); an entry the answer omits counts as an error; results for entries never asked
     /// for are ignored.  The request is the matching slot's frame.  Falls back to `a.errorCode` for an ErrorResponse,

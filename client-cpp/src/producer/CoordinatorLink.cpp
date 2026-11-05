@@ -84,14 +84,15 @@ int CoordinatorLink::rank(ReqKind kind, int16_t ec) noexcept {
 }
 
 namespace {
-/// The worst code among `results` naming (topicId, partition); `missing` when none does.
+/// The worst code among `results` answering (topicId, partition) - naming it, or a whole-request rejection;
+/// `missing` when none does.
 template <class Results>
 int16_t worstFor(ReqKind kind, const Results& results, int32_t topicId, int32_t partition, int16_t missing) noexcept {
     int16_t worst = 0;
     int     best  = -1;
     for (std::size_t i = 0; i < results.size(); ++i) {
         const auto r = results[i];
-        if (r.topicId != topicId || r.partition != partition) continue;
+        if (!CoordinatorLink::answers(r.topicId, r.partition, topicId, partition)) continue;
         const int k = CoordinatorLink::rank(kind, r.errorCode);
         if (k > best) { best = k; worst = r.errorCode; }
     }

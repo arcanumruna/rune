@@ -2364,6 +2364,43 @@ TEST(ProducerTxnDataRegression, AddPartitionsRetriesConcurrentTransactionsRegres
     EXPECT_EQ(r.wire.size(), 1u) << "the record after its AddPartitions OK";
 }
 
+// main CI after #737/#738: the gateway rejects a whole AddPartitionsToTxn with ONE result {topicId -1, partition -1, code}
+// (gateway/RequestRejection.h).  That result answers every requested partition: a retriable code is retried and the
+// transaction stays open; it is never read as "the answer omitted the partition" (InvalidRequest -> abort, and the next
+// send threw "produce outside a transaction" in EosBrokerRegression.AbortRewindRedoOutputEqualsInputRegression).
+// RED (mutation): CoordinatorLink::answers matches the named entry only - the rejection aborts the transaction.
+TEST(ProducerTxnDataRegression, AGatewayRejectionOfAddPartitionsAnswersEveryPartitionRegression) {
+    for (const rpc::ErrorCode code : {rpc::ErrorCode::AuthUnavailable, rpc::ErrorCode::Throttled,
+                                      rpc::ErrorCode::ConcurrentTransactions, rpc::ErrorCode::NotLeader}) {
+        SCOPED_TRACE(static_cast<int>(code));
+        Rig r;
+        r.initOk();
+        r.begin();
+        ASSERT_EQ(r.send(0, 1), SendResult::Ok);
+        ASSERT_EQ(r.send(1, 2), SendResult::Ok);
+        r.ticks(3);
+        ASSERT_EQ(r.adds().size(), 1u);
+        ASSERT_EQ(Rig::named(*r.adds()[0]).size(), 2u) << "one request names both partitions";
+        const int64_t corr = r.adds()[0]->corrId;
+        const rpc::TxnPartitionResult whole{-1, -1, ec(code)};
+        test_support::AnswerFrame a;
+        rpc::AddPartitionsToTxnResponse m;
+        m.correlationId = corr;
+        a.len        = m.encode(a.buf.data(), std::span<const rpc::TxnPartitionResult>(&whole, 1));
+        a.templateId = rpc::AddPartitionsToTxnResponse::TEMPLATE_ID;
+        r.answer(a);
+        r.tick(5 * kMs);
+        EXPECT_EQ(r.state(), TxnState::InTransaction) << "a retriable gateway rejection ended the transaction";
+        ASSERT_EQ(r.adds().size(), 2u) << "the rejected AddPartitions was not re-sent";
+        EXPECT_EQ(r.adds()[1]->corrId, corr) << "the retained frame";
+        EXPECT_EQ(r.send(0, 3), SendResult::Ok) << "the transaction still takes records";
+        r.answer(r.fake.answerAdd(corr, 0));   // names both requested partitions
+        r.ticks(2);
+        EXPECT_TRUE(std::holds_alternative<rp::Added>(r.membership(0)));
+        EXPECT_TRUE(std::holds_alternative<rp::Added>(r.membership(1)));
+    }
+}
+
 // An InvalidRequest answer (the broker could not decode it) poisons the transaction at once - never a silent retry.
 TEST(ProducerTxnDataRegression, AddPartitionsInvalidRequestPoisonsNotRetriedRegression) {
     Rig r;
