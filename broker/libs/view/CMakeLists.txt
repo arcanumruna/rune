@@ -27,6 +27,7 @@ if(BUILD_TESTING)
         tests/view/AggFoldTest.cpp
         tests/view/AggRetractableTest.cpp
         tests/view/PlanSourcesTest.cpp
+        tests/view/CheckedWritesPlanV2Test.cpp
         tests/view/LegacyFoldReference.cpp
         tests/view/CheckedWritesPrepareApplyTest.cpp
         tests/view/CheckedWritesAbortedFoldMatrixTest.cpp)
