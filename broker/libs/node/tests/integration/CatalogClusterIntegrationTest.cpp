@@ -1929,13 +1929,22 @@ TEST(CatalogClusterRegression, EarlyNotLeaderInThePlacementWindowNeedsAStallRegr
         // and ack the DDL first: it committed (no below-minIsr NotLeader) and its OK aged in the gate through the freeze.
         std::vector<std::thread> th;
         std::atomic<int> frozen{0};
+        // #883: the freeze lasts until the leader has answered the DDL (the below-minIsr NotLeader, or whatever it answers),
+        // not a fixed 4 s: the evidence is inside the freeze either way, and the freeze never outlasts the old 4 s.
+        std::atomic<bool> thaw{false};
         int followers = 0;
         seams.beforeLeaderSend = [&](ThreeNodes& c, Rig& rig, int lead) {
             for (int f : c.runningNodes())
                 if (f != lead) {
                     ++followers;
-                    th.emplace_back([&c, &frozen, f] {
-                        try { c.node(f).onAdminThreadForTest([&frozen] { frozen.fetch_add(1); std::this_thread::sleep_for(4s); return 0; }, 15s); }
+                    th.emplace_back([&c, &frozen, &thaw, f] {
+                        try {
+                            c.node(f).onAdminThreadForTest([&frozen, &thaw] {
+                                frozen.fetch_add(1);
+                                for (const auto until = Clock::now() + 4s; Clock::now() < until && !thaw.load();) std::this_thread::sleep_for(1ms);
+                                return 0;
+                            }, 15s);
+                        }
                         catch (...) {}
                     });
                 }
@@ -1948,6 +1957,8 @@ TEST(CatalogClusterRegression, EarlyNotLeaderInThePlacementWindowNeedsAStallRegr
             rig.pumping([&] {
                 for (const auto until = Clock::now() + 10s; Clock::now() < until && c.catalogIsrSizeOn(lead) != 1;) std::this_thread::sleep_for(50ms);
             });
+            (void)rig.await(rig.lastCorr(), 4s);   // non-consuming: the cell's own await still reads the answer
+            thaw.store(true);
             rig.pumping([&] { for (auto& t : th) t.join(); });
             th.clear();
         };
