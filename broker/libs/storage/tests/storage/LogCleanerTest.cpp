@@ -2408,3 +2408,38 @@ TEST(LogCleanerRegression, ExceptionMidPassRemovesItsCleanedOutputsRegression) {
     }
     std::filesystem::remove_all(dir);
 }
+
+// Fix pass 2 (S2): coalescing bounds a group's offset span by the candidate's END (the next segment's base), not its base.  RED: the
+// span check used the base of segment 1, so segments 0 and 1 merged although segment 1 holds a batch 2.2e9 offsets above the
+// group's base; the merged index entry for it wrapped negative and the batch could no longer be found.
+TEST(LogCleanerRegression, CoalescedGroupOffsetSpanCountsTheLastMemberEndRegression) {
+    constexpr int64_t kMid = 1'000'000'000, kFar = 2'200'000'000;
+    auto dir = makeTempDir("lc_span_end");
+    std::filesystem::create_directories(dir);
+    {
+        Log log(dir.string(), /*segmentBytes=*/1 << 20); log.recover();
+        log.append(makeBatch(0, "a", std::string(3000, 'a'), 1000), 0);
+        log.append(makeBatch(kMid - 1, "x", "x", 1000), kMid - 1);
+    }
+    {
+        Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+        log.append(makeBatch(kMid, "dup", "old", 1001), kMid);
+    }
+    {
+        Log log(dir.string(), /*segmentBytes=*/1 << 20); log.recover();
+        log.append(makeBatch(kMid + 1, "b", std::string(2000, 'b'), 1002), kMid + 1);
+        log.append(makeBatch(kFar, "c", "far", 1003), kFar);
+    }
+    {
+        Log log(dir.string(), /*segmentBytes=*/1); log.recover();
+        log.append(makeBatch(kFar + 1, "dup", "new", 1004), kFar + 1);
+        log.append(makeBatch(kFar + 2, "z", "z", 1005), kFar + 2);
+        ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, kMid, kFar + 1, kFar + 2})) << "precondition";
+        ASSERT_FALSE(batchAt(log, kFar).empty()) << "precondition";
+        cleanOnce(log, CleanPath::RangeCoalesce);
+        EXPECT_FALSE(batchAt(log, kFar).empty()) << "the batch past the int32 span is lost";
+        EXPECT_FALSE(batchAt(log, kMid + 1).empty());
+        EXPECT_TRUE(batchAt(log, kMid).empty()) << "the superseded record was cleaned";
+    }
+    std::filesystem::remove_all(dir);
+}

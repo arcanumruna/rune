@@ -328,7 +328,7 @@ public:
     ///   - Accumulate consecutive sealed segments into a group while:
     ///       (a) combined data ≤ segmentRollBytes (output fits in one segment)
     ///       (b) combined index entries ≤ maxIndexEntries (index size limit)
-    ///       (c) offset span ≤ INT32_MAX (4-byte relative offset in OffsetIndex)
+    ///       (c) offset span ≤ INT32_MAX (4-byte relative offset in OffsetIndex), up to the candidate's END
     ///   - Each group produces ONE cleaned output segment in the cleaner.
     ///   - Segments in [firstUncleanableIdx .. end) are excluded.
     ///
@@ -336,6 +336,7 @@ public:
     ///                         (i.e. those with base < firstUncleanable and within
     ///                          the dirty range).
     /// @param sealedSizes      Parallel vector of file sizes (bytes) for each base.
+    /// @param endOffset        Base of the segment after the last one (bounds its offsets).
     /// @param segmentRollBytes Max combined output bytes per group.
     /// @param maxIndexEntries  Max offset-index entries per output segment.
     ///                         Default: 4096*1024/8 = 524288 (~4 MiB index at 8 B/entry).
@@ -346,6 +347,7 @@ public:
     static std::vector<SegmentGroup>
     groupSegmentsBySize(const std::vector<int64_t>& sealedBases,
                         const std::vector<int64_t>& sealedSizes,
+                        int64_t endOffset,
                         int64_t segmentRollBytes,
                         int32_t maxIndexEntries = 524288);
 

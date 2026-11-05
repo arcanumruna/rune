@@ -1966,7 +1966,7 @@ TEST(CompactionCleanerAgent, SegmentsCoalesceIntoFewerGroups) {
 
     // With rollBytes=4096: 20×100B=2000B < 4096B → all coalesce into 1 group.
     auto groups4096 = rune::storage::LogCleaner::groupSegmentsBySize(
-        bases, sizes, /*segmentRollBytes=*/4096);
+        bases, sizes, /*endOffset=*/N * 10, /*segmentRollBytes=*/4096);
 
     EXPECT_EQ(groups4096.size(), 1u)
         << "With rollBytes=4096 and 20×100B segments (total=2000B < 4096B), "
@@ -1982,7 +1982,7 @@ TEST(CompactionCleanerAgent, SegmentsCoalesceIntoFewerGroups) {
     // With rollBytes=300: each group holds at most 3 segments (3×100=300).
     // ceil(20/3) = 7 groups.
     auto groups300 = rune::storage::LogCleaner::groupSegmentsBySize(
-        bases, sizes, /*segmentRollBytes=*/300);
+        bases, sizes, /*endOffset=*/N * 10, /*segmentRollBytes=*/300);
 
     const std::size_t expectedGroups300 = static_cast<std::size_t>((N + 2) / 3);
     EXPECT_EQ(groups300.size(), expectedGroups300)

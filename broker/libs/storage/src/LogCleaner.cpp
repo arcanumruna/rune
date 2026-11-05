@@ -1420,11 +1420,13 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
     // beyond passEnd are preserved verbatim for the next pass.
     std::vector<int64_t> inPassBases;
     std::vector<int64_t> inPassSizes;
-    for (std::size_t i = 0; i < sealedBases.size(); ++i) {
+    std::size_t i = 0;
+    for (; i < sealedBases.size(); ++i) {
         if (sealedBases[i] >= passEnd) break;
         inPassBases.push_back(sealedBases[i]);
         inPassSizes.push_back(i < sealedSizes.size() ? sealedSizes[i] : 0);
     }
+    const Offset inPassEnd = i < sealedBases.size() ? sealedBases[i] : activeBase;
     if (inPassBases.empty()) return result;
 
     if (useCoalescing && inPassBases.size() > 1) {
@@ -1435,7 +1437,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
         // segment that straddles/exceeds passEnd.
         const int64_t roll = (groupRollBytes > 0) ? groupRollBytes
                                                    : (64LL * 1024 * 1024);
-        auto groups = groupSegmentsBySize(inPassBases, inPassSizes, roll);
+        auto groups = groupSegmentsBySize(inPassBases, inPassSizes, inPassEnd, roll);
         if (deferredOut_ != nullptr) {
             // Bound each group so the owner's ring claim always fits.
             std::vector<SegmentGroup> split;
@@ -1563,6 +1565,7 @@ void LogCleaner::deferInstall_(const std::string& dir, const std::vector<int64_t
 std::vector<SegmentGroup> LogCleaner::groupSegmentsBySize(
     const std::vector<int64_t>& sealedBases,
     const std::vector<int64_t>& sealedSizes,
+    int64_t endOffset,
     int64_t segmentRollBytes,
     int32_t maxIndexEntries)
 {
@@ -1581,9 +1584,7 @@ std::vector<SegmentGroup> LogCleaner::groupSegmentsBySize(
     cur.bases.push_back(sealedBases[0]);
     cur.combinedBytes = sealedSizes[0];
     int64_t curIndexEntries = estimateIndexEntries(sealedSizes[0]);
-    // Offset span: last-offset-in-group - first-offset-in-group.
-    // first offset of a segment = its baseOffset.
-    // last offset of a segment ≈ next segment's base - 1 (we use the base as span proxy).
+    // Offset span: the candidate's last offset (the next segment's base - 1) minus the group's first base (Kafka).
     int64_t groupFirstBase = sealedBases[0];
 
     for (std::size_t i = 1; i < sealedBases.size(); ++i) {
@@ -1592,10 +1593,8 @@ std::vector<SegmentGroup> LogCleaner::groupSegmentsBySize(
         int64_t addedIdx  = estimateIndexEntries(nextSize);
         int64_t newBytes  = cur.combinedBytes + nextSize;
         int64_t newIdx    = curIndexEntries + addedIdx;
-        // Offset span = (next segment's last offset - groupFirstBase).
-        // We approximate with nextBase - groupFirstBase (the span of base offsets).
-        // The actual span can be slightly larger but this is conservative enough.
-        int64_t offsetSpan = nextBase - groupFirstBase;
+        const int64_t nextEnd = i + 1 < sealedBases.size() ? sealedBases[i + 1] : endOffset;
+        int64_t offsetSpan = nextEnd - 1 - groupFirstBase;
         // Check all three coalescing bounds:
         bool fitsBytes  = (newBytes <= segmentRollBytes);
         bool fitsIndex  = (newIdx   <= static_cast<int64_t>(maxIndexEntries));
