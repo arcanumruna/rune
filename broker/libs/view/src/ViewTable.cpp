@@ -487,8 +487,9 @@ uint32_t ViewTable::findSet(std::span<const uint8_t> prefix) const noexcept {
 
 void ViewTable::appendPoolChunk(uint8_t cls) {
     const size_t blockSlots = size_t{16} << cls;
-    size_t slots = std::max(chunkBytes_ / 8, blockSlots);
+    size_t slots = chunkBytes_ / 8 / kSlotBytes;
     slots -= slots % blockSlots;
+    if (slots == 0) slots = blockSlots;
     PoolChunk chunk{std::unique_ptr<uint8_t[]>(new uint8_t[slots]()), std::unique_ptr<uint64_t[]>(new uint64_t[slots]),
                     std::unique_ptr<uint32_t[]>(new uint32_t[slots])};
     const size_t count = slots / blockSlots;
@@ -501,6 +502,7 @@ void ViewTable::appendPoolChunk(uint8_t cls) {
         blockClass_.push_back(cls);
     }
     for (size_t b = count; b-- > 0;) blockFree_[cls].push_back(first + static_cast<uint32_t>(b));
+    poolBytes_ += slots * kSlotBytes;
     poolChunks_.push_back(std::move(chunk));
 }
 
@@ -520,12 +522,11 @@ void ViewTable::startSetMigration(PrefixSet& s, uint8_t cls) {
 
 // Drains up to kSetMigrate slots of the set's old block into its new one.  The old block stays a valid hash table
 // (each moved entry is backshift-deleted), so lookups can probe it until it is empty and freed.
-void ViewTable::migrateSet(PrefixSet& s) noexcept {
+void ViewTable::migrateSet(PrefixSet& s, size_t& budget, uint32_t& moved) noexcept {
     const SetBlock nb = blockOf(s.block);
     const SetBlock ob = blockOf(s.oldBlock);
     const auto home = [this](uint64_t w) { return hashOfWord(w); };
-    uint32_t moved = 0;
-    for (size_t budget = kSetMigrate; budget && s.cursor < ob.cap; --budget) {
+    for (; budget && s.cursor < ob.cap; --budget) {
         const size_t c = s.cursor;
         if (ob.tags[c] == kEmpty) {
             ++s.cursor;
@@ -539,7 +540,6 @@ void ViewTable::migrateSet(PrefixSet& s) noexcept {
         ++moved;
         backshiftDelete(ob.tags, ob.words, ob.rids, ob.cap - 1, c, home);
     }
-    maxSetMoved_ = std::max(maxSetMoved_, moved);
     if (s.cursor >= ob.cap) {
         freeBlock(s.oldBlock);
         s.migrating = false;
@@ -574,12 +574,15 @@ void ViewTable::prefixInsert(const Probe& p, uint32_t rid) {
     }
 
     PrefixSet& s = sets_[id];
+    size_t budget = kSetMigrate;
+    uint32_t moved = 0;
     if (s.migrating) {
-        migrateSet(s);
+        migrateSet(s, budget, moved);
     } else if (s.size + 1 > static_cast<size_t>(blockOf(s.block).cap * kGrowLoad)) {
         startSetMigration(s, static_cast<uint8_t>(blockClass_[s.block] + 1));
-        migrateSet(s);
+        migrateSet(s, budget, moved);
     }
+    maxSetMoved_ = std::max(maxSetMoved_, moved);
     const SetBlock b = blockOf(s.block);
     size_t i = p.h & (b.cap - 1);
     while (b.tags[i] != kEmpty) i = (i + 1) & (b.cap - 1);
@@ -596,7 +599,9 @@ void ViewTable::prefixErase(const Probe& p, uint32_t rid) noexcept {
     const uint32_t id = findSetHashed(ph, prefix);
     assert(id != kNoSet && "ViewTable: row without a prefix set");
     PrefixSet& s = sets_[id];
-    if (s.migrating) migrateSet(s);
+    size_t budget = kSetMigrate;
+    uint32_t moved = 0;
+    if (s.migrating) migrateSet(s, budget, moved);
 
     const uint8_t ft = fullTag(p.h);
     const auto home = [this](uint64_t w) { return hashOfWord(w); };
@@ -638,8 +643,9 @@ void ViewTable::prefixErase(const Probe& p, uint32_t rid) noexcept {
         setFree_.push_back(id);
     } else if (!s.migrating && blockClass_[s.block] > 0 && size_t{s.size} * 8 < b.cap) {
         startSetMigration(s, static_cast<uint8_t>(blockClass_[s.block] - 1));
-        migrateSet(s);
+        migrateSet(s, budget, moved);
     }
+    maxSetMoved_ = std::max(maxSetMoved_, moved);
 }
 
 } // namespace rune::view

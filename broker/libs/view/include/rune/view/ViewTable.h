@@ -204,7 +204,9 @@ public:
 
     // Namespaces Phase 2 Task 12 (D26): the row-slab memory, chunkCount x bytes per chunk.  O(1) and incremental by
     // construction (chunks only ever append), so the view set charges it without scanning.
-    size_t memoryBytes() const noexcept { return chunks_.size() * rowsPerChunk_ * rowStride_; }
+    size_t memoryBytes() const noexcept {
+        return chunks_.size() * rowsPerChunk_ * rowStride_ + poolBytes_ + (outer_.cap + outer_.ocap) * kSlotBytes;
+    }
 
     // Task 5 test/bench hooks (Task 7's benchmark depends on these):
     //
@@ -427,6 +429,7 @@ private:
     struct BlockRef { uint8_t* tags; uint64_t* words; uint32_t* rids; };
 
     static constexpr uint32_t kNoSet = UINT32_MAX;
+    static constexpr size_t kSlotBytes = 13;   // tag + word + rid
 
     SetBlock blockOf(uint32_t id) const noexcept {
         const BlockRef& r = blocks_[id];
@@ -443,7 +446,8 @@ private:
     uint32_t allocBlock(uint8_t cls);
     void     freeBlock(uint32_t id) { blockFree_[blockClass_[id]].push_back(id); }
     void     startSetMigration(PrefixSet& s, uint8_t cls);
-    void     migrateSet(PrefixSet& s) noexcept;
+    // Spends from `budget` (the op's remaining kSetMigrate) and adds the entries moved to `moved`.
+    void     migrateSet(PrefixSet& s, size_t& budget, uint32_t& moved) noexcept;
     void     prefixInsert(const Probe& p, uint32_t rid);
     void     prefixErase(const Probe& p, uint32_t rid) noexcept;
 
@@ -511,6 +515,7 @@ private:
     std::vector<std::vector<uint32_t>> blockFree_;   // per class
     size_t   chunkBytes_ = 0;
     uint64_t versionClock_ = 0;                // set versions; seeded from std::random_device
+    size_t   poolBytes_ = 0;                   // bytes of poolChunks_
     uint32_t maxSetMoved_ = 0;
 
     // --- Task 6: row-sized dirty tracking -------------------------------

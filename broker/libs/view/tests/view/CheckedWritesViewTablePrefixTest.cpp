@@ -328,3 +328,36 @@ TEST(CheckedWritesViewTableModelRegression, RandomOpsWithPrefixMatchAMapModel) {
         for (uint64_t p = 0; p < prefixes; ++p) f.expectExact(p);
     }
 }
+
+TEST(CheckedWritesViewTablePrefixRegression, PoolChunkIsAnEighthOfChunkBytesRegression) {
+    const RowLayout L = hpLayout();
+    ViewTable t(L, 16, size_t{32} << 20, ViewTableKeys{.keyWidth = 16, .prefixWidth = 8, .hashSeed = 1});
+    ViewTable plain(L, 16, size_t{32} << 20, ViewTableKeys{.keyWidth = 16, .hashSeed = 1});
+    const size_t before = t.memoryBytes();
+    t.put(mkKey(16, 8, 1, 1));
+    plain.put(mkKey(16, 8, 1, 1));
+    EXPECT_LE(t.memoryBytes() - before, (size_t{4} << 20) + 16 * 13);
+    EXPECT_GT(t.memoryBytes(), plain.memoryBytes());
+}
+
+TEST(CheckedWritesViewTablePrefixRegression, MemoryBytesCountsThePrefixIndexRegression) {
+    const RowLayout L = hpLayout();
+    ViewTable t(L, 4096, 4096, ViewTableKeys{.keyWidth = 16, .prefixWidth = 8, .hashSeed = 1});
+    ViewTable plain(L, 4096, 4096, ViewTableKeys{.keyWidth = 16, .hashSeed = 1});
+    for (uint64_t i = 0; i < 20; ++i) {
+        t.put(mkKey(16, 8, i, 1));
+        plain.put(mkKey(16, 8, i, 1));
+    }
+    EXPECT_GT(t.memoryBytes(), plain.memoryBytes());
+    size_t last = t.memoryBytes();
+    size_t chunks = t.prefixPoolChunksForTest();
+    for (uint64_t i = 20; i < 2000; ++i) {
+        t.put(mkKey(16, 8, i, 1));
+        if (t.prefixPoolChunksForTest() != chunks) {
+            chunks = t.prefixPoolChunksForTest();
+            EXPECT_GT(t.memoryBytes(), last);
+        }
+        last = t.memoryBytes();
+    }
+    EXPECT_GE(chunks, 2u);
+}
