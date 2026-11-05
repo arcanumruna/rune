@@ -488,7 +488,7 @@ Names can't contain NUL, so padding can't make two names collide. In general, a 
 - **Refold** (restart, view rebuild, new leader):
   - Below `W`, records are applied without being judged, skipping the ones the bitmap marks. A constraint change can therefore never overturn an old verdict.
   - At and above `W`, records are judged as on the live fold. The view state at `W` is exact, because the cleaner never compacts above `W`.
-- **Failover.** A record is judged only after it is committed, so it survives any failover. A new leader that inherits records judged after `W` judges them again, reaches the same verdicts (deterministic, §8.4) and writes the markers itself. This is why the writer can be answered before its marker commits (§11.3).
+- **Failover.** A record is judged only after it is committed, so it survives any failover. A new leader that inherits records judged after `W` judges them again, reaches the same verdicts (deterministic, §8.4) and writes the markers itself. This is why the writer can be answered before its marker commits (§11.3). The markers already in its own log count as its own, committed or not: they commit with that log. So it starts marking above their coverage (`appendedThrough`), not at `W`, and never re-marks a range from an index that compaction may have thinned.
 - **Truncation** cuts only uncommitted records, which no fold has judged, so verdicts are unaffected.
 
 **8.6 Readers**

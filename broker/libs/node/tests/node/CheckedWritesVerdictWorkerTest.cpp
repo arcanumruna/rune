@@ -292,7 +292,7 @@ TEST(CheckedWritesVerdictWorkerRegression, ActivationWithAnUncommittedMarkerMark
     ASSERT_GE(log.markers.size(), 2u);
     const auto& second = log.markers[1];
     // Spec §8.5 ruling (06 re-mark fix): the uncommitted marker commits with the new leader's log, so it marks only above it.
-    EXPECT_GE(second.header.fromOffset, first.header.finalThrough) << "the new activation re-marked below its log's marker";
+    EXPECT_EQ(second.header.fromOffset, first.header.finalThrough) << "the new activation marks from its log's marker coverage";
     EXPECT_GT(second.header.finalThrough, first.header.finalThrough);
     for (const auto& e : second.entries) EXPECT_GE(std::get<0>(e), first.header.finalThrough) << "entry at " << std::get<0>(e);
     EXPECT_EQ(r.writeState()->rejected.mismatches(), 0u);

@@ -839,7 +839,7 @@ TEST(CheckedWritesVerdictSourceRegression, NewLeaderWithALaggingHwDoesNotRemarkB
     ASSERT_EQ(r.vs.appendedForTest().size(), 1u);
     const auto h = cr::parseMarkerHeader(r.vs.appendedForTest()[0].data(), r.vs.appendedForTest()[0].size());
     ASSERT_TRUE(h.has_value());
-    EXPECT_GE(h->fromOffset, 14);
+    EXPECT_EQ(h->fromOffset, 14) << "marks from the coverage of the marker at 14, no gap";
     EXPECT_EQ(h->finalThrough, 16);
     verdictOnHw(r.st, 1'000'000);
     EXPECT_EQ(r.st.markers.committedThrough(), 16);
