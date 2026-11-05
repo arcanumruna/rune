@@ -11,6 +11,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/ControlRecordLayout.h>
+#include <rune/storage/ProducerBatchWindow.h>
 #include <rune/view/Verdict.h>
 
 #include <algorithm>
@@ -32,8 +33,7 @@ struct KeyIndexFold {
     uint8_t                keyWidth = 0;
 };
 
-/// The wire key's bytes packed little-endian; the caller checked the width (at most 8).
-[[nodiscard]] uint64_t keyIndexWord(std::string_view wireKey) noexcept;
+using rune::storage::keyIndexWord;
 [[nodiscard]] rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold&, const rune::view::SourceRecord&, rune::view::Prospect&) noexcept;
 /// The intent table (P5-3) over the key state the prospect holds; a Malformed prospect is accepted.
 [[nodiscard]] rune::view::Verdict evaluateIntent(const rune::view::SourceRecord&, const rune::view::Prospect&) noexcept;

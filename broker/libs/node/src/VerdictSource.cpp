@@ -24,12 +24,6 @@ uint16_t writerVersionOf(std::string_view value, uint16_t fallback) noexcept {
 
 }  // namespace
 
-uint64_t keyIndexWord(std::string_view wireKey) noexcept {
-    uint64_t w = 0;
-    for (std::size_t i = 0; i < wireKey.size(); ++i) w |= static_cast<uint64_t>(static_cast<uint8_t>(wireKey[i])) << (8 * i);
-    return w;
-}
-
 rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold& f, const rune::view::SourceRecord& rec, rune::view::Prospect& p) noexcept {
     p.clear();
     if (rec.key.size() != f.keyWidth) {

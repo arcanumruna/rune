@@ -6,8 +6,8 @@
 // A leader rebuilt from the log answers a retried key-0 batch with the ids its stored batch carries, and dedupes against the
 // producer's last `depth` batches.  So the cleaner keeps those batches of a live producer WHOLE (protects): no record rule runs on
 // them, a superseded or rejected record in one stays.  A superseded insert kept that way would come back once the tombstone of its
-// key expired, so the tombstone of every key such a batch holds is pinned (pinsTombstone) while the batch is protected.  Keys are
-// read as LE uint64 (the autoincrement key); a key of another width is not recorded.
+// key expired, so the tombstone of every key such a batch holds is pinned (pinsTombstone) while the batch is protected.  A key of
+// 1..8 bytes (every autoincrement key width) is recorded as its keyIndexWord; a wider or null key is not.
 //
 // Expiry is ProducerTails': a producer whose last batch's maxTimestamp is older than nowMs - expirationMs is not protected (nowMs < 0
 // never expires); finish() drops it.  The ring holds each batch's position only, and finish() reads the keys of the batches it
@@ -35,6 +35,13 @@
 #include <vector>
 
 namespace rune::storage {
+
+/// The wire key's bytes packed little-endian; the caller checked the width (at most 8).  The key index keys its table by it too.
+[[nodiscard]] inline uint64_t keyIndexWord(std::string_view wireKey) noexcept {
+    uint64_t w = 0;
+    for (std::size_t i = 0; i < wireKey.size(); ++i) w |= static_cast<uint64_t>(static_cast<uint8_t>(wireKey[i])) << (8 * i);
+    return w;
+}
 
 class ProducerBatchWindow {
 public:
@@ -90,7 +97,7 @@ public:
         p.lastMaxTs = maxTimestampMs;
     }
     /// End of the pre-pass: drops the expired producers and reads the keys of the batches kept.  `readKeys(segBase, pos, keys)`
-    /// appends the LE uint64 keys of the batch at byte `pos` of segment `segBase` (called in offset order) and returns false if it
+    /// appends the keyIndexWord of every 1..8-byte key of the batch at byte `pos` of segment `segBase` (called in offset order) and returns false if it
     /// cannot read it (the window then overflows).
     template <class ReadKeys>
     void finish(ReadKeys&& readKeys) {
@@ -134,10 +141,8 @@ public:
     /// Must the tombstone of `key` outlive its delete horizon (a protected batch holds the key)?
     [[nodiscard]] bool pinsTombstone(std::string_view key) const noexcept {
         if (overflowed_) return true;
-        if (key.size() != sizeof(uint64_t)) return false;
-        uint64_t k = 0;
-        for (std::size_t i = 0; i < sizeof(uint64_t); ++i) k |= uint64_t{static_cast<uint8_t>(key[i])} << (8 * i);
-        return std::binary_search(keys_.begin(), keys_.end(), k);
+        if (key.empty() || key.size() > sizeof(uint64_t)) return false;
+        return std::binary_search(keys_.begin(), keys_.end(), keyIndexWord(key));
     }
     /// The watermark bound: the base of the oldest protected batch (max when none; min when overflowed).
     [[nodiscard]] int64_t lowestProtectedBase() const noexcept {

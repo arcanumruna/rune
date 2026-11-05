@@ -287,6 +287,42 @@ TEST(CheckedWritesAutoIncCleaner, PinnedTombstoneOutlivesDeleteRetention) {
     }
 }
 
+// Fix pass 2 (A): a uint32 autoincrement key is 4 bytes on the wire.  RED: the window recorded and pinned 8-byte keys only, so the
+// tombstone of a protected 4-byte insert was dropped past its horizon and the insert came back once the batch left the window.
+TEST(CheckedWritesAutoIncCleanerRegression, PinnedTombstoneOfAFourByteKeyOutlivesDeleteRetentionRegression) {
+    const auto rec32 = [](Log& log, int64_t off, int64_t pid, int32_t seq, uint32_t id, const std::string& val) {
+        rune::protocol::RecordBatchBuilder b(off, 2000 + off);
+        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+        std::string k(4, '\0');
+        for (int i = 0; i < 4; ++i) k[std::size_t(i)] = static_cast<char>(id >> (8 * i));
+        b.append(k, val, 2000 + off);
+        log.append(b.build(), off);
+    };
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            rec32(log, 0, 7, 0, 5, "insert");
+            rec32(log, 1, -1, -1, 5, "");
+            pad(log, 2);
+            (void)clean(log, Pass{.retentionMs = 0, .coalesce = coalesce});                   // stamps the horizon
+            (void)clean(log, Pass{.nowMs = 1'000'001, .retentionMs = 0, .coalesce = coalesce});   // past it
+            auto offs = dataOffsets(log);
+            EXPECT_TRUE(offs.count(0)) << "the protected insert stays";
+            EXPECT_TRUE(offs.count(1)) << "its key's tombstone is pinned past the horizon";
+            for (int i = 0; i < 32; ++i) rec32(log, 3 + i, 7, 1 + i, 100 + uint32_t(i), "later");
+            pad(log, 35);
+            (void)clean(log, Pass{.nowMs = 1'000'002, .retentionMs = 0, .coalesce = coalesce});
+            offs = dataOffsets(log);
+            EXPECT_FALSE(offs.count(0)) << "32 later batches unprotect the insert: superseded";
+            EXPECT_FALSE(offs.count(1)) << "and the tombstone is no longer pinned";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
 TEST(CheckedWritesAutoIncCleaner, RejectedRecordInAProtectedBatchIsKept) {
     for (const bool coalesce : {false, true}) {
         SCOPED_TRACE(name(coalesce));

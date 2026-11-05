@@ -343,7 +343,7 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             rune::protocol::RecordBatchReader r(seg.data() + pos, seg.size() - pos);
             if (!r.ensureValid()) return false;
             r.forEachRecord([&](std::string_view key, std::string_view, int64_t, int64_t) {
-                if (key.size() == sizeof(uint64_t)) keys.push_back(rune::protocol::detail::getLE64(reinterpret_cast<const uint8_t*>(key.data())));
+                if (!key.empty() && key.size() <= sizeof(uint64_t)) keys.push_back(keyIndexWord(key));
             });
             return true;
         });
