@@ -8,11 +8,14 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/ReplicationMessages.h>
+#include <rune/node/AutoInc.h>
+#include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducePath.h>
 #include <rune/storage/WriteHookPolicy.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -20,6 +23,8 @@
 namespace rune::node {
 
 inline constexpr int32_t kMaxJudgedBatchRecords = rune::protocol::client::kMaxJudgedBatchRecords;
+inline constexpr std::size_t kReservationScratch = 80;
+static_assert(rune::storage::control_record::reservationBatchBytes() <= kReservationScratch);
 
 /// What the produce frame and the worker say about one write.
 struct WriteFacts {
@@ -40,10 +45,13 @@ struct TopicHookFacts {
     bool constrainedSource = false;
     bool verdictSource     = false;
     bool keyIndexActive    = false;   ///< the partition's logged constraint set has the key index as member 0 (P5-4)
+    bool autoIncReady      = false;   ///< the partition's id counter is Ready
 };
 [[nodiscard]] inline TopicHookFacts topicHookFactsOf(const PartitionWriteState& state) noexcept {
     TopicHookFacts f;
     f.keyIndex          = state.spec->keyIndex;
+    f.autoIncrement     = state.spec->autoIncrement;
+    f.autoIncReady      = state.autoInc.ready();
     f.verdictSource     = state.isVerdictSource();
     f.constrainedSource = state.isConstrainedSource();
     const ConstraintSet& logged = state.constraintSets.latest();
@@ -59,13 +67,21 @@ struct BatchIntents {
     bool    mixedKeyZero      = false;   ///< keyZeroCreate and at least one record that is not one
     bool    anyIntent         = false;   ///< any record with intent != 0
     int32_t records           = 0;
+    bool    plainUpsert       = false;   ///< a live record with intent 0 on an autoIncrement topic
+    bool    explicitInsert    = false;   ///< insert with a non-key-0 key on an autoIncrement topic (an import)
+    bool    importBadKey      = false;   ///< an import whose id is negative, above the cap, or not this partition's
+    bool    autoIncExhausted  = false;   ///< the key-0 batch would pass the counter's cap
+    bool    autoIncWindowFull = false;   ///< the key-0 batch's producer cannot be recorded in the assigned-base window
+    uint32_t keyZeroCount     = 0;
+    uint64_t importMaxN       = 0;       ///< the highest counter value an import carries (0 = none)
 };
 
 enum class HookRefusal : uint8_t {
     None, ReservedBits, ValidationFailed, VersionAhead, LegacyMode, LevelTooLow, NoKeyIndex,
     ExplicitKeyNeedsIdempotentAndView, IntentInTxnOrAtomicBatch, TxnOnConstrainedSource,
     KeyZeroCreateNeedsIdempotentAll, KeyZeroCreateNeedsView, MixedKeyZeroBatch, ViewBatchTooLarge,
-    ViewWithoutReplica, KeyIndexActivating, Count_
+    ViewWithoutReplica, KeyIndexActivating, UpsertOnAutoIncrement, ImportNotGranted, ImportOutOfRange,
+    AutoIncExhausted, AutoIncWindowFull, AutoIncActivating, Count_
 };
 
 struct RequirementVerdict {
@@ -92,7 +108,17 @@ struct RequirementVerdict {
         if (!f.idempotent || !acksAll(f.acks)) return refuse(HookRefusal::KeyZeroCreateNeedsIdempotentAll);
         if (t.constrainedSource && !view) return refuse(HookRefusal::KeyZeroCreateNeedsView);
     }
+    if (t.autoIncrement) {
+        if (b.plainUpsert) return refuse(HookRefusal::UpsertOnAutoIncrement);
+        if (b.explicitInsert && !f.importGranted) return {ErrorCode::NotAuthorized, HookRefusal::ImportNotGranted};
+        if (b.importBadKey) return refuse(HookRefusal::ImportOutOfRange);
+        if (b.keyZeroCreate && b.autoIncExhausted) return {ErrorCode::AutoIncrementExhausted, HookRefusal::AutoIncExhausted};
+    }
     if (view && b.records > kMaxJudgedBatchRecords && t.verdictSource) return refuse(HookRefusal::ViewBatchTooLarge);
+    if (t.autoIncrement) {
+        if ((b.keyZeroCreate || b.explicitInsert) && !t.autoIncReady) return {ErrorCode::NotLeader, HookRefusal::AutoIncActivating};
+        if (b.keyZeroCreate && b.autoIncWindowFull) return {ErrorCode::NotLeader, HookRefusal::AutoIncWindowFull};
+    }
     if (b.anyIntent && !t.keyIndexActive) return {ErrorCode::NotLeader, HookRefusal::KeyIndexActivating};   // P5-4: never applied unjudged; after every definite refusal
     return {};
 }
@@ -107,22 +133,54 @@ public:
 
     [[nodiscard]] rune::protocol::client::ErrorCode check(const uint8_t* batch, std::size_t len, int32_t recordCount) noexcept;
 
+    /// Autoincrement only: appends a due reservation record, then patches the assigned ids and the CRC into a copy of the
+    /// key-0 batch in the scratch; an import-only batch just moves the counter.  Any other batch passes through.
     template <class LogT>
-    [[nodiscard]] rune::storage::HookStaged stage(LogT&, const uint8_t* batch, std::size_t len) noexcept {
-        return {rune::protocol::client::ErrorCode::OK, batch, len};
-    }
-    void onAppended(int64_t, int64_t) noexcept {}
-    [[nodiscard]] uint64_t assignedBase() const noexcept { return 0; }
+    [[nodiscard]] rune::storage::HookStaged stage(LogT& log, const uint8_t* batch, std::size_t len) noexcept;
+    void onAppended(int64_t base, int64_t last) noexcept;
+    [[nodiscard]] uint64_t assignedBase() const noexcept { return assignedBase_; }
     [[nodiscard]] HookRefusal refusal() const noexcept { return refusal_; }
     [[nodiscard]] bool checked() const noexcept { return checked_; }
 
 private:
+    [[nodiscard]] rune::storage::HookStaged patchKeyZeroIds_(const uint8_t* batch, std::size_t len) noexcept;
+
     PartitionWriteState& state_;
     WriteFacts           facts_;
-    std::span<uint8_t>   scratch_;   // 06 stages rewritten batches here
+    std::span<uint8_t>   scratch_;   // key-0 batches are copied here to patch their ids
     HookRefusal          refusal_ = HookRefusal::None;
     bool                 checked_ = false;
+    AutoIncPlan          plan_;
+    uint32_t             keyZeroCount_ = 0;
+    uint64_t             importMaxN_   = 0;
+    uint64_t             assignedBase_ = 0;
+    std::array<uint8_t, kReservationScratch> resv_;
 };
+
+template <class LogT>
+rune::storage::HookStaged CheckedWriteHook::stage(LogT& log, const uint8_t* batch, std::size_t len) noexcept {
+    using rune::protocol::client::ErrorCode;
+    if (keyZeroCount_ == 0 && importMaxN_ == 0) return {ErrorCode::OK, batch, len};
+    if (plan_.reserve) {
+        const std::size_t n = rune::storage::control_record::buildReservation(resv_, plan_.reserveThroughN);
+        try {
+            int64_t at = 0;
+            if (log.appendNoSyncRestamp(resv_.data(), n, 0, at) < 0) return {ErrorCode::TransientLogFull, nullptr, 0};
+        } catch (...) {
+            return {ErrorCode::Internal, nullptr, 0};
+        }
+        state_.autoInc.commitReservation(plan_.reserveThroughN);
+        ++state_.autoIncStats.reservationsAppended;
+    }
+    if (keyZeroCount_ == 0) {
+        if (plan_.newNextN > state_.autoInc.nextN()) ++state_.autoIncStats.importsMovedCounter;
+        state_.autoInc.commitNext(plan_.newNextN);
+        return {ErrorCode::OK, batch, len};
+    }
+    const rune::storage::HookStaged patched = patchKeyZeroIds_(batch, len);
+    if (patched.error == ErrorCode::OK) state_.autoInc.commitNext(plan_.newNextN);
+    return patched;
+}
 
 }  // namespace rune::node
 

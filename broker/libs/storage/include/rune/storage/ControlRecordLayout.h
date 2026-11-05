@@ -44,7 +44,7 @@ namespace detail {
 
 namespace b = rune::protocol::batch;
 
-inline std::size_t zigzagLen(int64_t v) noexcept {
+constexpr std::size_t zigzagLen(int64_t v) noexcept {
     uint64_t u = (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63);
     std::size_t n = 1;
     while (u >= 0x80) { u >>= 7; ++n; }
@@ -71,10 +71,10 @@ template <class T> inline void put(uint8_t* p, T v) noexcept { std::memcpy(p, &v
 template <class T> inline T get(const uint8_t* p) noexcept { T v; std::memcpy(&v, p, sizeof v); return v; }
 
 // bodyLen of the one record: attributes, tsDelta, offsetDelta, keyLen, key(2), valueLen, value, headerCount
-inline std::size_t bodyBytes(std::size_t valueLen) noexcept {
+constexpr std::size_t bodyBytes(std::size_t valueLen) noexcept {
     return 1 + 1 + 1 + 1 + 2 + zigzagLen(static_cast<int64_t>(valueLen)) + valueLen + 1;
 }
-inline std::size_t batchBytes(std::size_t valueLen) noexcept {
+constexpr std::size_t batchBytes(std::size_t valueLen) noexcept {
     const std::size_t body = bodyBytes(valueLen);
     return static_cast<std::size_t>(b::kRecordBatchOverhead) + zigzagLen(static_cast<int64_t>(body)) + body;
 }
@@ -141,7 +141,7 @@ inline std::optional<std::span<const uint8_t>> valueOf(const uint8_t* batch, std
     return detail::batchBytes(kChangeFixedBytes + count * kChangeMemberBytes);
 }
 
-[[nodiscard]] inline std::size_t reservationBatchBytes() noexcept { return detail::batchBytes(kReservationBytes); }
+[[nodiscard]] constexpr std::size_t reservationBatchBytes() noexcept { return detail::batchBytes(kReservationBytes); }
 
 /// 0 = `out` too small.
 inline std::size_t buildReservation(std::span<uint8_t> out, uint64_t reservedThroughN) noexcept {
