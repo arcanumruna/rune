@@ -10,6 +10,7 @@
 
 #include <rune/aeronutil/testing/FreePort.h>
 #include <rune/client/Client.h>
+#include <rune/client/transport/TransportConfig.h>
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +30,7 @@ inline rune::client::ClientConfig clientConfigFor(ThreeNodes& c, int id) {
     cfg.egressChannel   = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
     cfg.egressStreamId  = 2;
     cfg.dataDir         = (c.clientsDir->path / ("client" + std::to_string(id) + "_" + std::to_string(seq++))).string();
+    cfg.driverCountersBytes = rune::client::transport::kMinDriverCountersBytes;   // a client's few counters: a small CnC (#883)
     return cfg;
 }
 
