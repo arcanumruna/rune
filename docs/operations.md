@@ -103,7 +103,7 @@ Never delete or copy `storage.meta` on its own. Details, refusal table and the m
 Two fixed costs set the resident floor of a node, before any topic or view:
 
 - Per node: the cleaner's dedupe map, `RUNE_CLEANER_DEDUPE_BUFFER_BYTES` (default 128 MiB, written whole at start and on every cleaner pass). The offset table stays within that budget; the producer tails add up to 25% of it (minimum 1024 x 64 B) on top, so the total is at most about 1.25 times the budget.
-- Per embedded Aeron driver: 3 x 128 MiB command rings, resident from the start. That is the Aeron default; the `aeron/1.51.0-rune.2` build honours the `AERON_DRIVER_COMMAND_QUEUE_CAPACITY` environment variable (bytes per ring), which the broker does not set (see #658).
+- Per embedded Aeron driver: 3 x 128 MiB command rings, resident from the start. That is the Aeron default; the `aeron/1.51.0-rune.3` build honours the `AERON_DRIVER_COMMAND_QUEUE_CAPACITY` environment variable (bytes per ring), which the broker does not set (see #658).
 
 ## Health and failure
 

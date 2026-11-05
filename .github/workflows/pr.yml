@@ -114,7 +114,7 @@ jobs:
       - name: Install dependencies
         run: |
           conan profile detect --force
-          conan export conan/aeron --version=1.51.0-rune.2
+          conan export conan/aeron --version=1.51.0-rune.3
           conan install client-cpp -of build-client -s build_type=Debug --build=missing
 
       - uses: actions/cache/save@v5
@@ -256,7 +256,7 @@ jobs:
       - name: Install dependencies
         run: |
           conan profile detect --force
-          conan export conan/aeron --version=1.51.0-rune.2
+          conan export conan/aeron --version=1.51.0-rune.3
           conan install . -of build-broker -s build_type=Debug --build=missing
 
       - uses: actions/cache/save@v5
