@@ -576,8 +576,11 @@ public:
             }
             if (tid == kMsgPeerLinkKeys) {   // Authentication Task 15 (D33)
                 PeerLinkKeysMsg m;
-                if (decodePeerLinkKeys(p, n, m)) worker_.onPeerLinkKeys(m);
-                else if (badControlFrames_++ % 1024 == 0)
+                if (decodePeerLinkKeys(p, n, m)) {
+                    worker_.onPeerLinkKeys(m);
+                    pendingKeyAcks_.push_back({m.peer, m.seq});   // the control thread holds the peer's go-ahead on it
+                    (void)flushKeyAcks_();
+                } else if (badControlFrames_++ % 1024 == 0)
                     spdlog::error("AdminWorkerAgent: malformed kMsgPeerLinkKeys (len={}) refused", n);
                 // Issue #546: the decoded masters die here - scrubbed (the installed copy lives in the plane's slot).
                 rune::crypto::secureZero({m.sendMaster.data(), m.sendMaster.size()});
@@ -699,6 +702,7 @@ public:
                     storageFailureSignalled_ = true;
             }
         }
+        work += flushKeyAcks_();   // a full failure ring: the acks of the keys this plane ran, again every pass
         // Authentication Task 16: the admin plane's dropped inter-broker frames, paced (<= 1 per second) and only on a
         // change, to the control thread (counter 1'000'235).  This thread owns the plane's crypto - nothing is shared.
         if (nowNs >= nextPeerDropReportNs_) {
@@ -1103,6 +1107,20 @@ private:
     rune::consensus::ControlRing<4096> testTaskRing_;   // test threads → admin (test-only)
     uint64_t         badRoleFrames_ = 0;
     bool             storageFailureSignalled_ = false;
+    // The kMsgPeerLinkKeys this plane ran and the control thread has not been told yet (kA2cPeerLinkKeysApplied, in
+    // order).  Cold: one per link establishment.
+    struct KeyAck { int32_t peer; uint64_t seq; };
+    std::vector<KeyAck> pendingKeyAcks_;
+    int flushKeyAcks_() {
+        std::size_t sent = 0;
+        for (; sent < pendingKeyAcks_.size(); ++sent) {
+            uint8_t b[kPeerLinkKeysAppliedWireLen];
+            writePeerLinkKeysApplied(b, pendingKeyAcks_[sent].peer, pendingKeyAcks_[sent].seq);
+            if (!failureRing_.write(b, sizeof b, kA2cPeerLinkKeysApplied)) break;
+        }
+        pendingKeyAcks_.erase(pendingKeyAcks_.begin(), pendingKeyAcks_.begin() + static_cast<std::ptrdiff_t>(sent));
+        return static_cast<int>(sent);
+    }
     int64_t          nextPeerDropReportNs_ = 0;   // Task 16: paced report of the admin plane's dropped peer frames
     uint64_t         reportedPeerDrops_    = 0;
 #if defined(__linux__)
@@ -2459,8 +2477,8 @@ private:
     int  servicePeerLinks_(int64_t nowNs);
     int  serviceClusterFeatureLevel_();   // control thread, every duty cycle: post a changed metadata feature level, pump the fanout
     void publishPeerLinkMetrics_() noexcept;
-    static void onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
-    void onPeerLinkEstablished_(int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
+    static uint64_t onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
+    uint64_t onPeerLinkEstablished_(int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs);
     // Catalog history Task 6 (control thread): a kA2cCatalogAlterIsr frame →
     // the controller channel; the controller's (-6, 0) answer → the admin role ring.
     void forwardCatalogAlterIsr_(const uint8_t* p, std::size_t n);
@@ -2762,6 +2780,7 @@ private:
     }
     [[nodiscard]] uint64_t peerFrameDropsTotal_() const noexcept;   // control thread: own transports + reported ones
     static void onWorkerPeerFrameDropsThunk_(void* self, int32_t worker, uint64_t drops);
+    static void onWorkerPeerLinkKeysAppliedThunk_(void* self, int32_t worker, int32_t peer, uint64_t seq);
     std::vector<uint64_t>            workerPeerDrops_;             // control thread: the workers' last reports
     uint64_t                         adminPeerDrops_ = 0;          // control thread: the admin plane's last report
     // Catalog history Task 16 — the boot from __catalog (startup thread; immutable after start()).

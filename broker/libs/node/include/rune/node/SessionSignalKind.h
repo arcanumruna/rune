@@ -48,6 +48,11 @@ enum class SessionSignalKind : int64_t {
     /// ::baseOffset = the value (a cumulative counter for the rates, the current bytes for disk / view memory),
     /// ::partition = the worker.  Paced; sent only when the value changed.
     NsUsage = 12,
+    /// NOT a session signal - the worker ran a PeerLinkKeys op (installed, or refused as malformed): WorkerReturn::
+    /// baseOffset = the op's install sequence number (PeerLinkFanout), ::sessionId = the peer, ::partition = the worker.
+    /// The control thread holds the handshake frame that lets the peer seal under the epoch until every plane sent it.
+    /// Never dropped (enqueueSignal_).
+    PeerLinkKeysApplied = 13,
 };
 
 } // namespace rune::node

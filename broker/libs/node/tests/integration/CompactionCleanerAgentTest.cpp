@@ -58,6 +58,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -3880,4 +3881,80 @@ TEST(CompactionCleanerAgentRegression, HeldAutoIncProgressNeverMovesBackRegressi
     EXPECT_EQ(prev, kOpenTxn) << "the passes reached the open transaction";
 
     fs::remove_all(dir);
+}
+
+// A log whose pass cannot advance must not starve the others (TypedRemoveRoutesAsSendForEveryKeyWidthShardRegression on CI:
+// a verdict source whose markers were still in the active segment kept its dirty ratio at 1.0, filthiest-first picked it
+// every cycle, and no other topic on the broker was compacted again).  Log S holds an open transaction from offset 0 and no
+// published LSO, so the pass's own txn scan stops it at its dirty start; log N needs several passes (more keys than the
+// dedupe map holds).  Expected: N converges to one record per key while S is held out; once S's transaction commits and
+// its segment seals, S is cleaned again.  RED: without the stall check S wins every cycle and N never converges.
+TEST(CompactionCleanerAgentRegression, ALogWhosePassCannotAdvanceNeverStarvesTheOthersRegression) {
+    auto dirS = cp6TempDir("stall_s");
+    auto dirN = cp6TempDir("stall_n");
+    Log logS(dirS.string(), /*rollBytes=*/128);
+    Log logN(dirN.string(), /*rollBytes=*/128);
+    Cp6NullTransport transport;
+    constexpr int64_t kPid = 7;
+    constexpr int kTxnRecords = 100;
+    for (int i = 0; i < kTxnRecords; ++i)
+        logS.append(r1Txn(i, "s" + std::to_string(i % 10), "v" + std::to_string(i), kPid, 0, i), i);
+    constexpr int kKeys = 150;
+    for (int i = 0; i < 2 * kKeys; ++i) logN.append(cp6Batch(i, "n" + std::to_string(i % kKeys), "v" + std::to_string(i)), i);
+    constexpr int kTails = 4;   // unique keys last: the active segment shadows no older copy, so converged = kKeys + kTails
+    for (int i = 2 * kKeys; i < 2 * kKeys + kTails; ++i) logN.append(cp6Batch(i, "tail" + std::to_string(i), "v"), i);
+
+    auto make = [&](int32_t topic, Log& log) {
+        auto r = std::make_unique<PartitionReplica>(makeCompactConfig(topic), Role::Leader, 1, std::vector<NodeId>{1},
+                                                    std::vector<NodeId>{1}, &log, &transport);
+        r->publishCleanerLso(PartitionReplica::kNoCleanerLso);   // no Worker RcState in this rig: the scan is the only txn bound
+        r->publishCleanerVerdictBound(PartitionReplica::kNoCleanerLso);
+        r->becomeLeader(1, {1});
+        r->onLeaderLogAppended();
+        return r;
+    };
+    auto ownedS = make(711, logS);
+    auto ownedN = make(712, logN);
+    PartitionReplica* repS = ownedS.get();
+    PartitionReplica* repN = ownedN.get();
+    rune::node::ReplicaRegistry registry;
+    registry.add(711, 0, std::move(ownedS));
+    registry.add(712, 0, std::move(ownedN));
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent duty(dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0, /*dedupeBufferBytes=*/1024);
+    ASSERT_LT(rune::storage::SkimpyOffsetMap::sizingForBudget(1024).maxSlots, static_cast<std::size_t>(kKeys))
+        << "precondition: N needs more than one pass";
+
+    int64_t nowNs = 0;
+    const auto drive = [&](int cap, const std::function<bool()>& done) {
+        for (int i = 0; i < cap; ++i) {
+            if (i % 16 == 0) {
+                logN.reloadSegments();
+                logS.reloadSegments();
+                if (done()) return true;
+            }
+            nowNs += 1'000'000;
+            cleaner.doWork(nowNs);
+            duty.doWork(nowNs);
+        }
+        logN.reloadSegments();
+        logS.reloadSegments();
+        return done();
+    };
+    EXPECT_TRUE(drive(4000, [&] { return cp6CountLiveRecords(logN) == kKeys + kTails; }))
+        << "N still holds " << cp6CountLiveRecords(logN) << " records (" << kKeys + kTails << " keys): the stuck log starved it";
+    EXPECT_EQ(repS->lastCleanOffset(), 0) << "S cannot advance past its open transaction";
+    EXPECT_EQ(cp6CountLiveRecords(logS), kTxnRecords) << "the open transaction is untouched";
+    EXPECT_EQ(cleaner.stalledLogsForTest(), 1u) << "non-vacuity: S's pass ran and could not advance";
+
+    // The transaction commits and the marker's segment seals: S's inputs changed, so it is selected and cleaned again.
+    logS.append(r1Marker(kTxnRecords, kPid, 0, /*commit=*/true), kTxnRecords);
+    for (int i = kTxnRecords + 1; i < kTxnRecords + 4; ++i) logS.append(cp6Batch(i, "tail" + std::to_string(i), "v"), i);
+    repS->onLeaderLogAppended();
+    EXPECT_TRUE(drive(4000, [&] { return repS->lastCleanOffset() > kTxnRecords; }))
+        << "S was never selected again after its transaction committed (clean offset " << repS->lastCleanOffset() << ")";
+    EXPECT_LT(cp6CountLiveRecords(logS), kTxnRecords) << "S's superseded transactional records were compacted";
+    fs::remove_all(dirS);
+    fs::remove_all(dirN);
 }

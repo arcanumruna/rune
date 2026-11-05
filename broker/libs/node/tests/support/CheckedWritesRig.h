@@ -485,6 +485,7 @@ public:
         rune::node::EmbeddedDriverConfig dc;
         dc.dir = (std::filesystem::temp_directory_path() / ("rune_cwv_aeron_" + std::to_string(::getpid()) + "_" + std::to_string(rigSeq()++))).string();
         dc.termBufferBytes = 64 * 1024;
+        dc.countersValuesBytes = rune::node::kTestClientCountersBytes;
         driver_ = std::make_unique<rune::node::EmbeddedDriver>(dc, rune::node::DriverMode::Invoker);
         aeron::Context ctx; ctx.aeronDir(dc.dir); ctx.useConductorAgentInvoker(true);
         aeron_ = aeron::Aeron::connect(ctx);

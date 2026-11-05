@@ -741,6 +741,11 @@ struct GroupCluster {
         return defineTt(std::move(up), PersistenceMode::Transient, rf, partitions);
     }
     void stop(int i) { if (nodes[i]) { nodes[i]->stop(); nodes[i].reset(); } }
+    /// End every live controller's user-decision hold now (MetadataService::releaseUserDecisionHoldForTest).
+    void releaseHold() {
+        for (auto& n : nodes)
+            if (n) (void)n->onControlThreadForTest([&n] { n->metadataServiceForTest()->releaseUserDecisionHoldForTest(); return 0; });
+    }
     int liveNode() const { for (int i = 0; i < 3; ++i) if (nodes[i]) return i; return -1; }
     /// The consensus leader (the group coordinator) as a live node sees it.
     int coordinator() {
@@ -813,7 +818,7 @@ TEST(TransientLineageClusterRegression, FullClusterRestartAnswersAGroupsOffsetAs
     ASSERT_GE(leader, 0);
     const int64_t sidL = c.connect(gatewayChannel(g.ports, leader), kClientStream);
     for (int b = 0; b < 5; ++b)
-        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4)));
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4))) << c.lastProduceFailure();
     ASSERT_TRUE(commitOffset(g, c, "lg-full", 20)) << "the group never committed its offset";
     ASSERT_EQ(settledFetch(g, c, "lg-full", nullptr), 20) << "precondition: the committed offset is served";
 
@@ -862,7 +867,7 @@ TEST(TransientLineageClusterRegression, RollingRestartKeepsAGroupsOffsetValidReg
     ASSERT_GE(leader, 0);
     const int64_t sidL = c.connect(gatewayChannel(g.ports, leader), kClientStream);
     for (int b = 0; b < 5; ++b)
-        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4)));
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4))) << c.lastProduceFailure();
     ASSERT_TRUE(commitOffset(g, c, "lg-rolling", 20));
     ASSERT_EQ(settledFetch(g, c, "lg-rolling", nullptr), 20);
 
@@ -912,7 +917,7 @@ TEST(TransientLineageClusterRegression, SubscribeWhileTheLineageIsUnknownIsAnswe
     ASSERT_EQ(defineTt({&node}), 0);
     const int64_t sid = c.connect(gw, kClientStream);
     for (int b = 0; b < 3; ++b)
-        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0), kClientStream, sid, 0, 0, 1, makeBatch(4)));
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0), kClientStream, sid, 0, 0, 1, makeBatch(4))) << c.lastProduceFailure();
     node.holdTransientLineageForTest(true);
     const uint64_t awaiting0 =
         node.onControlThreadForTest([&] { return node.gatewayForTest()->subscribesAwaitingLineageForTest(); });
@@ -961,7 +966,7 @@ TEST(TransientLineageClusterRegression, SingleNodeRestartAnswersAGroupsOffsetAsN
         ASSERT_EQ(defineTt({&node}), 0);
         const int64_t sid = c.connect(gw, kClientStream);
         for (int b = 0; b < 3; ++b)
-            ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0), kClientStream, sid, 0, 0, 1, makeBatch(4)));
+            ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0), kClientStream, sid, 0, 0, 1, makeBatch(4))) << c.lastProduceFailure();
         bool committed = false;
         for (int k = 0; k < 400 && !committed; ++k) {
             const int64_t s = c.connect(gw, kClientStream);
@@ -1010,7 +1015,7 @@ TEST(TransientLineageClusterRegression, StaggeredFullRestartWithTheOldLeaderLast
     ASSERT_GE(leader, 0);
     const int64_t sidL = c.connect(gatewayChannel(g.ports, leader), kClientStream);
     for (int b = 0; b < 5; ++b)
-        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4)));
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4))) << c.lastProduceFailure();
     ASSERT_TRUE(commitOffset(g, c, "lg-stagger", 20));
     ASSERT_EQ(settledFetch(g, c, "lg-stagger", nullptr), 20);
 
@@ -1021,32 +1026,25 @@ TEST(TransientLineageClusterRegression, StaggeredFullRestartWithTheOldLeaderLast
     // The restarted controller decides no USER partition for a while (test
     // hold): P's committed leadership stays the dead (L, E), exactly as when
     // its failover / bump is decided on a later tick.
-    // Isolation fix (2026-10-15, found once the suite ran in parallel): the hold starts when each restarted
-    // controller boots, so it lasts until at least holdStart + holdMs.  The sampling below must stay inside
-    // that window — before, a loaded host (ctest -j) took longer than the 6 s hold to collect 150 answers and
-    // the last few, served after the hold legitimately decided P, read as "an answer other than NotLeader".
-    // The window is now explicit (sampling ends 500 ms before the earliest possible hold end) and 10 s wide
-    // so >= 100 answers fit even under load.
-    // TSan (#622): restarting the two nodes alone took ~9.6 s, so a 10 s hold left no window at all (0 answers).
-    // 30 s covers the restart plus >= 100 answers at sanitizer speed; the final settledFetch (>= 30 s of retries)
-    // absorbs whatever hold is left once the old leader returns.
-    g.holdMs = 30'000;
-    const auto holdStart = std::chrono::steady_clock::now();
-    const auto sampleUntil = holdStart + std::chrono::milliseconds{g.holdMs} - 500ms;
+    // History: a wall-clock hold made the sampling race the hold's end on a loaded host (2026-10-15) and under TSan
+    // (#622, a 30 s hold).  #883: the hold now lasts until the test releases it (releaseHold, after the old leader is
+    // back), so every sampled answer is served inside the hold by construction and nothing waits a window out.
+    // 10 min is "until released" (a hard cap only).
+    g.holdMs = 600'000;
+    const auto sampleCap = std::chrono::steady_clock::now() + 120s;   // fail, never hang
     for (int i = 0; i < 3; ++i) if (i != leader) g.start(i);   // the old partition leader stays down
     // The window: P's committed leadership is still the dead (L, E) — no clean
     // leader exists while L is down.  Ask repeatedly (as a rejoining member does).
     std::vector<std::pair<int64_t, int16_t>> answers;   // the coordinator's served answers (OK / NotLeader)
-    for (int k = 0; k < 4000 && answers.size() < 150 && std::chrono::steady_clock::now() < sampleUntil; ++k) {
+    for (int k = 0; k < 4000 && answers.size() < 150 && std::chrono::steady_clock::now() < sampleCap; ++k) {
         const int coord = g.coordinator();
         if (coord < 0) continue;
         const int64_t sid = c.connect(gatewayChannel(g.ports, coord), kClientStream);
         if (sid <= 0) { std::this_thread::sleep_for(25ms); continue; }
         const auto r = c.offsetFetch(gatewayChannel(g.ports, coord), kClientStream, sid, "lg-stagger", 0, 0);
-        if (std::chrono::steady_clock::now() >= sampleUntil) break;   // answered past the guaranteed window
         // NotCoordinator: the coordinator is not ready yet (it does not answer offsets).
         if (r && (r->second == kOffsetOk || r->second == kOffsetNotLeader)) answers.push_back(*r);
-        std::this_thread::sleep_for(25ms);   // the client's retry pacing (poll interval)
+        std::this_thread::sleep_for(5ms);   // sampling pace: every sample is inside the hold, none needs spacing
     }
     ASSERT_GE(answers.size(), 100u) << "the coordinator answered too rarely to cover the window";
     int pendingN = 0;
@@ -1062,6 +1060,7 @@ TEST(TransientLineageClusterRegression, StaggeredFullRestartWithTheOldLeaderLast
     // a NEW lineage -> -1 (never the old offset).
     g.holdMs = 0;
     g.start(leader);
+    g.releaseHold();   // as when the old wall-clock hold ran out after the old leader returned
     EXPECT_EQ(settledFetch(g, c, "lg-stagger", nullptr), -1)
         << "after the old leader returned, the offset of the ring's previous life was not answered as none";
     std::printf("[lineage staggered restart] %zu answer(s) while the old leader was down, %d pending\n",
@@ -1113,7 +1112,7 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     // 20 records on P, a member commits 20.
     const int64_t sidL = c.connect(gatewayChannel(g.ports, L), kClientStream);
     for (int b = 0; b < 5; ++b)
-        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL, 0, P, 1, makeBatch(4)));
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL, 0, P, 1, makeBatch(4))) << c.lastProduceFailure();
     const int64_t sidC = c.connect(gwC, kClientStream);
     std::string member;
     bool committed = false;
@@ -1181,7 +1180,7 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     ASSERT_GT(sidL2, 0);
     for (int64_t want = 0; want < 6; ++want) {
         const auto ack = c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL2, 0, P, 1, makeBatch(1));
-        ASSERT_TRUE(ack.has_value());
+        ASSERT_TRUE(ack.has_value()) << c.lastProduceFailure();
         ASSERT_EQ(ack->baseOffset, want) << "precondition: the ring restarted empty";
     }
     const std::size_t before = c.records().size();
@@ -1219,7 +1218,7 @@ TEST(TransientLineageClusterRegression, IdentityRotationReconfirmsTheLineageWith
     ASSERT_GE(leader, 0);
     const int64_t sidL = c.connect(gatewayChannel(g.ports, leader), kClientStream);
     for (int b = 0; b < 5; ++b)
-        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4)));
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4))) << c.lastProduceFailure();
     ASSERT_TRUE(commitOffset(g, c, "lg-rotate", 20));
     ASSERT_EQ(settledFetch(g, c, "lg-rotate", nullptr), 20);
 
@@ -1271,7 +1270,7 @@ TEST(TransientLineageClusterRegression, ShardModeLeaderSeesItsLineageConfirmatio
     const int leader = g.partitionLeader(c);
     ASSERT_GE(leader, 0);
     const int64_t sidL = c.connect(gatewayChannel(g.ports, leader), kClientStream);
-    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4)));
+    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4))) << c.lastProduceFailure();
     ASSERT_TRUE(commitOffset(g, c, "lg-ack", 4));   // committable: the lineage is confirmed
     bool pending = true;
     for (int k = 0; k < 100 && pending; ++k) {
@@ -1331,7 +1330,7 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     int32_t gen = j->generation;
     const int64_t sidL = c.connect(gatewayChannel(g.ports, L), kClientStream);
     for (int b = 0; b < 5; ++b)
-        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL, 0, P, 1, makeBatch(4)));
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL, 0, P, 1, makeBatch(4))) << c.lastProduceFailure();
     ASSERT_TRUE(c.subscribeUntilBound(gatewayChannel(g.ports, L), kClientStream, sidL, 0, P, 0,
                                       std::chrono::steady_clock::now() + 5s))
         << "the Subscribe was never bound (re-check I5: a gated Subscribe is answered NotLeader, re-sent)";
@@ -1404,7 +1403,7 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     const int64_t sidL2 = c.connect(gatewayChannel(g.ports, L), kClientStream);
     for (int64_t want = 0; want < 6; ++want) {
         const auto ack = c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL2, 0, P, 1, makeBatch(1));
-        ASSERT_TRUE(ack.has_value());
+        ASSERT_TRUE(ack.has_value()) << c.lastProduceFailure();
         ASSERT_EQ(ack->baseOffset, want) << "precondition: the ring restarted empty";
     }
     const std::size_t before = c.records().size();
@@ -1457,7 +1456,7 @@ TEST(TransientLineageClusterRegression, Rf1PlainSubscriptionResumeAcrossANewLine
     const std::string gwL = gatewayChannel(g.ports, L);
     const int64_t sidL = c.connect(gwL, kClientStream);
     for (int b = 0; b < 5; ++b)
-        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL, 0, P, 1, makeBatch(4)));
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL, 0, P, 1, makeBatch(4))) << c.lastProduceFailure();
     ASSERT_TRUE(c.subscribeUntilBound(gwL, kClientStream, sidL, 0, P, 0,
                                       std::chrono::steady_clock::now() + 5s))
         << "the Subscribe was never bound (re-check I5: a gated Subscribe is answered NotLeader, re-sent)";
@@ -1495,7 +1494,7 @@ TEST(TransientLineageClusterRegression, Rf1PlainSubscriptionResumeAcrossANewLine
     const int64_t sid2 = c.connect(gwL2, kClientStream);
     for (int64_t want = 0; want < 6; ++want) {
         const auto ack = c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sid2, 0, P, 1, makeBatch(1));
-        ASSERT_TRUE(ack.has_value());
+        ASSERT_TRUE(ack.has_value()) << c.lastProduceFailure();
         ASSERT_EQ(ack->baseOffset, want);
     }
     const std::size_t before = c.records().size();

@@ -569,11 +569,21 @@ TEST(ConsensusCandidacyElectionRegression, WipedMemberNeverConsensusLeader_Commi
     const int X = (L + 1) % 3, Y = (L + 2) % 3;
     const int64_t hw = c.meta(L).hw;
 
+    // #391: the fence is the consensus leader's liveness verdict (no AppendPosition for 3 heartbeat timeouts), so it
+    // lands only while X is DOWN; a restart faster than that window (a fast host) left X live and never fenced.  Wait
+    // for the fence with X stopped - a condition, not the restart's duration - then wipe and restart it: fenced, its
+    // slot is unvalidated and its fetches are held, so it cannot re-enter.
     c.stop(X);
+    ASSERT_TRUE(until([&] { return !c.knowledge(L).contains(X) && !c.knowledge(Y).contains(X); }, 5s))
+        << "a stopped member is fenced out of the committed metadata ISR";
     c.wipe(X);
     c.startWith(X, [](NodeConfig& k) { k.testHoldFollowerFetchesMs = 60'000; });
-    ASSERT_TRUE(until([&] { return !c.knowledge(L).contains(X) && !c.knowledge(Y).contains(X); }, 5s))
-        << "a wiped, unconfirmed member is fenced out of the committed metadata ISR";
+    // Restarted wiped and unconfirmed (it cannot fetch, so it never proves a validated position): it stays out.
+    for (int i = 0; i < 10; ++i) {
+        std::this_thread::sleep_for(100ms);
+        ASSERT_FALSE(c.knowledge(L).contains(X) || c.knowledge(Y).contains(X))
+            << "the wiped, unconfirmed member re-entered the committed metadata ISR after its restart";
+    }
     EXPECT_TRUE(c.knowledge(L).contains(Y)) << "precondition: L still lists Y in the metadata ISR";
 
     // Hold both members that can lead (X is fenced out) BEFORE choosing whom to resign: the consensus leader can

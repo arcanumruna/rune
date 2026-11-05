@@ -37,9 +37,11 @@ struct Behind {
             return b().admin().revoke(ch(), b().adminSession(), who, false, op, t, SP::Exact, name).errorCode;
         });
     }
-    std::future<int> grantAsync(const std::string& who, SO op, ST t, const std::string& name) {
-        return std::async(std::launch::async, [this, who, op, t, name]() -> int {
-            return b().admin().grant(ch(), b().adminSession(), who, false, op, t, SP::Exact, name).errorCode;
+    /// `within` bounds the DDL's own answer wait (the future's destructor waits for it).
+    std::future<int> grantAsync(const std::string& who, SO op, ST t, const std::string& name,
+                                std::chrono::milliseconds within = 30s) {
+        return std::async(std::launch::async, [this, who, op, t, name, within]() -> int {
+            return b().admin().grant(ch(), b().adminSession(), who, false, op, t, SP::Exact, name, within).errorCode;
         });
     }
     static int await(std::future<int>& f, std::chrono::seconds within = 30s) {
@@ -320,17 +322,30 @@ TEST(AuthSecurityBehindRegression, AHaltedApplierStaysBehindForGoodAdversarialRe
         n.adminWorkerAgentForTest()->worker().securityApplierForTest()->tamperNextFingerprintForTest();
         return 0;
     });
-    auto ddl = t.grantAsync(writer, SO::Write, ST::Topic, "secret");
+    auto ddl = t.grantAsync(writer, SO::Write, ST::Topic, "secret", 2s);
     ASSERT_TRUE(t.r.c().pollFor(20s, [&] { return n.adminSecurityBehindForTest().behind; })) << "the halt sets it";
-    EXPECT_NE(Behind::await(ddl), 0) << "a halted apply never claims enforcement";
+    // #883: the halt is already observed, so an OK the applier could still send would come within its apply latency
+    // (milliseconds); 2 s bounds it without waiting out the 30 s default for an answer a halted applier never sends.
+    EXPECT_NE(Behind::await(ddl, 3s), 0) << "a halted apply never claims enforcement";
     ASSERT_TRUE(t.gatewayBehind(true));
     const int64_t leo = t.r.logEnd(t.r.orders);
+    // Every attempt, routed and worker, is sent back to back and each must stay unanswered or be refused; one 1 s
+    // window covers all ten (an append is acked in milliseconds) instead of a full answer timeout per attempt.
+    std::vector<std::pair<int64_t, const char*>> sent;
     for (int i = 0; i < 5; ++i) {
-        EXPECT_NE(t.r.produce(ws, t.r.orders), 0) << "routed, halted, attempt " << i;
-        EXPECT_NE(t.shardProduce(ws, t.r.orders), 0) << "worker, halted, attempt " << i;
+        const int64_t routed = t.r.c().nextCorrelationId();
+        if (t.r.c().produce(t.ch(), AuthRig::stream(), ws, routed, t.r.orders, 0, 1, makeCharBatch(1))) sent.emplace_back(routed, "routed");
+        const int64_t worker = t.r.c().nextCorrelationId();
+        if (t.r.c().produce(t.b().workerIngressChannel(), AuthRig::stream(), ws, worker, t.r.orders, 0, 1, makeCharBatch(1)))
+            sent.emplace_back(worker, "worker");
     }
-    auto more = t.grantAsync(writer, SO::Write, ST::Topic, "other");
-    (void)Behind::await(more);
+    (void)t.r.c().pollFor(1s, [] { return false; });
+    for (const auto& [corr, path] : sent) {
+        const auto a = t.r.c().ackFor(corr);
+        EXPECT_TRUE(!a || a->errorCode != 0) << path << " produce " << corr << " was appended while halted";
+    }
+    auto more = t.grantAsync(writer, SO::Write, ST::Topic, "other", 2s);
+    (void)Behind::await(more, 3s);
     EXPECT_TRUE(n.adminSecurityBehindForTest().behind) << "a halted applier never reads as caught up";
     EXPECT_TRUE(n.securityBehindForTest().gateway);
     EXPECT_EQ(n.adminSecurityBehindForTest().edges, 1u) << "set once, never cleared";

@@ -194,6 +194,9 @@ enum : int32_t {
     // Checked writes Part 02: a typed topic's write spec, the encodeTopicWriteSpec bytes (WriteState.h).  Posted after the
     // topic's kA2cSchemaUpdate frames and before its kA2cCatalogTopicApplied; the control thread fans it out behind them.
     kA2cWriteSpec           = 29,
+    // The admin plane ran a kMsgPeerLinkKeys (installed or refused): [peer:i32][seq:u64] (layout below).  The control
+    // thread holds the handshake frame that lets the peer seal under the epoch until every plane acknowledged it.
+    kA2cPeerLinkKeysApplied = 30,
 };
 
 // ---------------------------------------------------------------------------
@@ -1686,13 +1689,15 @@ inline void writePlacementView(uint8_t* p, const PlacementViewMsg& m) noexcept {
 }
 
 /// kMsgPeerLinkKeys (Task 15, control -> admin on controlToAdminRing): the keys of an established inter-broker link,
-/// [peer:i32][epoch:u32][sendMaster 32][recvMaster 32][install:u8] (issue #241: LinkInstall, receive-only or
-/// send-and-receive; an unknown value is a malformed message).  Cold: one per link establishment / promotion.
-inline constexpr std::size_t kPeerLinkKeysWireLen = 4 + 4 + 32 + 32 + 1;
+/// [peer:i32][epoch:u32][sendMaster 32][recvMaster 32][seq:u64][install:u8] (issue #241: LinkInstall, receive-only or
+/// send-and-receive; an unknown value is a malformed message).  `seq` is PeerLinkFanout's install sequence number, sent
+/// back in kA2cPeerLinkKeysApplied once the admin plane ran the message.  Cold: one per link establishment / promotion.
+inline constexpr std::size_t kPeerLinkKeysWireLen = 4 + 4 + 32 + 32 + 8 + 1;
 struct PeerLinkKeysMsg {
     int32_t  peer  = -1;
     uint32_t epoch = 0;
     std::array<uint8_t, 32> sendMaster{}, recvMaster{};
+    uint64_t seq = 0;
     rune::peerlink::LinkInstall install = rune::peerlink::LinkInstall::SendAndReceive;
 };
 inline void writePeerLinkKeys(uint8_t* p, const PeerLinkKeysMsg& m) noexcept {
@@ -1700,7 +1705,8 @@ inline void writePeerLinkKeys(uint8_t* p, const PeerLinkKeysMsg& m) noexcept {
     admin_wire::putI32(p + 4, static_cast<int32_t>(m.epoch));
     std::memcpy(p + 8, m.sendMaster.data(), 32);
     std::memcpy(p + 40, m.recvMaster.data(), 32);
-    p[72] = static_cast<uint8_t>(m.install);
+    admin_wire::putI64(p + 72, static_cast<int64_t>(m.seq));
+    p[80] = static_cast<uint8_t>(m.install);
 }
 [[nodiscard]] inline bool decodePeerLinkKeys(const uint8_t* buf, std::size_t len, PeerLinkKeysMsg& m) noexcept {
     if (len != kPeerLinkKeysWireLen) return false;
@@ -1708,10 +1714,25 @@ inline void writePeerLinkKeys(uint8_t* p, const PeerLinkKeysMsg& m) noexcept {
     m.epoch = static_cast<uint32_t>(admin_wire::getI32(buf + 4));
     std::memcpy(m.sendMaster.data(), buf + 8, 32);
     std::memcpy(m.recvMaster.data(), buf + 40, 32);
-    if (buf[72] != static_cast<uint8_t>(rune::peerlink::LinkInstall::ReceiveOnly) &&
-        buf[72] != static_cast<uint8_t>(rune::peerlink::LinkInstall::SendAndReceive)) return false;
-    m.install = static_cast<rune::peerlink::LinkInstall>(buf[72]);
+    m.seq = static_cast<uint64_t>(admin_wire::getI64(buf + 72));
+    if (buf[80] != static_cast<uint8_t>(rune::peerlink::LinkInstall::ReceiveOnly) &&
+        buf[80] != static_cast<uint8_t>(rune::peerlink::LinkInstall::SendAndReceive)) return false;
+    m.install = static_cast<rune::peerlink::LinkInstall>(buf[80]);
     return m.peer >= 0 && m.epoch != 0;
+}
+
+/// kA2cPeerLinkKeysApplied (admin -> control on the failure ring): the admin plane ran the kMsgPeerLinkKeys of install
+/// sequence number `seq` for `peer` (installed or refused), [peer:i32][seq:u64].
+inline constexpr std::size_t kPeerLinkKeysAppliedWireLen = 4 + 8;
+inline void writePeerLinkKeysApplied(uint8_t* p, int32_t peer, uint64_t seq) noexcept {
+    admin_wire::putI32(p, peer);
+    admin_wire::putI64(p + 4, static_cast<int64_t>(seq));
+}
+[[nodiscard]] inline bool decodePeerLinkKeysApplied(const uint8_t* buf, std::size_t len, int32_t& peer, uint64_t& seq) noexcept {
+    if (len != kPeerLinkKeysAppliedWireLen) return false;
+    peer = admin_wire::getI32(buf);
+    seq  = static_cast<uint64_t>(admin_wire::getI64(buf + 4));
+    return peer >= 0;
 }
 
 inline constexpr std::size_t kViewUninstallWireLen = 4;

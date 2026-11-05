@@ -42,6 +42,9 @@ extern "C" {
 
 namespace rune::node {
 
+/// Aeron's minimum counter-values buffer: what a test client's driver sets (EmbeddedDriverConfig::countersValuesBytes).
+inline constexpr int32_t kTestClientCountersBytes = 1024 * 1024;
+
 struct EmbeddedDriverConfig {
     std::string dir;
     // Defaults = NodeConfig's (the findings §4 config).  mtu / window / socket
@@ -69,6 +72,10 @@ struct EmbeddedDriverConfig {
     /// (AERON_*_IDLE_STRATEGY_INIT_ARGS env or built-in defaults).  Threaded mode only (invoker: no idle loop).
     std::string idleStrategyArgs;
     bool        deleteDirOnShutdown = true;
+    /// 0 = Aeron default (8 MiB of counter values + 32 MiB of counter metadata, zero-filled into the CnC at start).
+    /// Test clients that own a handful of publications set Aeron's 1 MiB minimum: the CnC drops from ~46 MiB to ~11 MiB
+    /// and the driver starts that much faster (#883).  Never set for a broker's own driver.
+    int32_t     countersValuesBytes = 0;
     /// 0 = Aeron default (10 s).  Also the invoker client's inter-service timeout
     /// (read from CnC).  Must exceed the driver timer interval (1 s).  Test-only
     /// override (shard startup-gap regression); never set in production.

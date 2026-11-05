@@ -132,7 +132,9 @@ struct WorkerOp {
         // established inter-broker link.  topicId = peer node id, partition = link epoch, tail (TailKind = PEER_KEYS) =
         // [sendMaster 32][recvMaster 32] (WorkerOp::peerKeys), isolation = the rune::peerlink::LinkInstall (issue
         // #241: receive-only / send-and-receive; an unknown value is refused).  Cold (one per link establishment or
-        // promotion); never ownership-gated.  (21 = SESSION_PERMISSIONS, Task 12.)
+        // promotion); never ownership-gated.  correlationId = the fanout's install sequence number: the worker answers
+        // SessionSignal PeerLinkKeysApplied with it once the op ran, the proof the peer may now seal under the epoch.
+        // (21 = SESSION_PERMISSIONS, Task 12.)
         PeerLinkKeys              = 22, ///< control → worker: install an established peer link's keys
         // Issues #109 / #196: control → ONE worker on its OP ring (cold, one per security event): an enforcement
         // fence.  correlationId = the fence sequence number.  The worker answers SessionSignal FenceAck (sessionId 0 =

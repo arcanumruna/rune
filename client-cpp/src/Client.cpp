@@ -201,6 +201,7 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c, const detail::ClientTest
     acfg.transport.gatewayResponseControlPort = c.gatewayResponseControlPort;
     acfg.transport.dataDir         = c.dataDir;
     acfg.transport.termBufferLength = c.termBufferBytes;
+    acfg.transport.driverCountersBytes = c.driverCountersBytes;
 
     // Session egress config (for ConnectRequest body).
     acfg.session.egressChannel  = opts.declaredEgressChannel.empty() ? c.egressChannel : opts.declaredEgressChannel;

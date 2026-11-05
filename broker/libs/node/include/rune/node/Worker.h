@@ -2836,6 +2836,7 @@ private:
             break;
         case WorkerOp::Type::PeerLinkKeys:
             executePeerLinkKeysWire_(op);
+            ackPeerLinkKeys_(op.topicId(), op.correlationId());   // installed or refused: the hold must not outlive it
             break;
         case WorkerOp::Type::SessionClose:
             ++sessionClosesSeen_;
@@ -2870,6 +2871,18 @@ private:
         ack.sessionId  = lifecycleRing ? 1 : 0;
         ack.partition  = workerId_;
         ack.lastOffset = static_cast<int64_t>(SessionSignalKind::FenceAck);
+        ack.baseOffset = seq;
+        enqueueSignal_(ack);
+    }
+
+    // The control thread holds the handshake frame that lets `peer` seal under the new epoch until every plane ran its
+    // keys (a frame under an epoch this worker does not hold yet is dropped).  Cold: one per link establishment.
+    [[gnu::cold]] void ackPeerLinkKeys_(int32_t peer, int64_t seq) {
+        WorkerReturn ack;
+        ack.type       = WorkerReturn::Type::SessionSignal;
+        ack.sessionId  = peer;
+        ack.partition  = workerId_;
+        ack.lastOffset = static_cast<int64_t>(SessionSignalKind::PeerLinkKeysApplied);
         ack.baseOffset = seq;
         enqueueSignal_(ack);
     }

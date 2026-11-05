@@ -1054,6 +1054,41 @@ TEST(ProducerTxnOffsetsRegression, TxnOffsetCommitAnswerOmittingAnEntryFailsTheC
     EXPECT_NE(r.d(t).status, OpStatus::Ok) << "an entry the broker never answered counted as committed";
 }
 
+// main CI after #737/#738: the gateway's whole-request rejection {topicId -1, partition -1, code}
+// (gateway/RequestRejection.h) answers every requested entry - a retriable code is retried, never read as "an entry
+// was omitted" (InvalidRequest, which fails the call and aborts the transaction).
+// RED (mutation): CoordinatorLink::answers matches the named entry only - the call fails.
+TEST(ProducerTxnOffsetsRegression, AGatewayRejectionOfTxnOffsetCommitAnswersEveryEntryRegression) {
+    for (const rpc::ErrorCode code : {rpc::ErrorCode::AuthUnavailable, rpc::ErrorCode::Throttled,
+                                      rpc::ErrorCode::ConcurrentTransactions, rpc::ErrorCode::NotLeader}) {
+        SCOPED_TRACE(static_cast<int>(code));
+        Rig r;
+        r.inTxn();
+        const Token t = r.sendOffsets(offsetsOf(3));
+        r.tick();
+        r.answerFrame(r.lastOf(rpc::AddOffsetsToTxn::TEMPLATE_ID), rp::ReqKind::AddOffsets, 0);
+        r.tick();
+        const auto oc = r.lastOf(rpc::TxnOffsetCommit::TEMPLATE_ID);
+        ASSERT_NE(oc.corrId, 0);
+        const rpc::TxnPartitionResult whole{-1, -1, ec(code)};
+        test_support::AnswerFrame a;
+        rpc::TxnOffsetCommitResponse m;
+        m.correlationId = oc.corrId;
+        a.len        = m.encode(a.buf.data(), std::span<const rpc::TxnPartitionResult>(&whole, 1));
+        a.templateId = rpc::TxnOffsetCommitResponse::TEMPLATE_ID;
+        r.answer(a);
+        EXPECT_EQ(r.d(t).times, 0) << "a retriable gateway rejection completed the call";
+        EXPECT_EQ(r.impl->txnStateDuty(), TxnState::InTransaction);
+        r.tick(5 * kMs);   // past the backoff
+        const auto commits = r.cap.of(rpc::TxnOffsetCommit::TEMPLATE_ID);
+        ASSERT_EQ(commits.size(), 2u) << "the rejected TxnOffsetCommit was not re-sent";
+        EXPECT_EQ(commits[1].corrId, oc.corrId);
+        r.answerFrame(commits[1], rp::ReqKind::TxnOffsetCommit, 0);
+        ASSERT_EQ(r.d(t).times, 1);
+        EXPECT_EQ(r.d(t).status, OpStatus::Ok);
+    }
+}
+
 // sendOffsets is two-phase (AddOffsetsToTxn -> TxnOffsetCommit) and completes exactly once - never at phase 1,
 // never twice on duplicates; a commit waits for the offsets (they are part of the transaction).
 TEST(ProducerTxnOffsetsRegression, SendOffsetsTwoPhaseCompletesOnceRegression) {

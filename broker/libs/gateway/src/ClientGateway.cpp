@@ -1970,6 +1970,11 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
         if (peerDropFn_ != nullptr) peerDropFn_(peerDropCtx_, ret.partition, static_cast<uint64_t>(ret.baseOffset));
         return;
     }
+    if (kind == K::PeerLinkKeysApplied) [[unlikely]] {   // not a session signal - the worker ran a peer-link install
+        if (peerKeysFn_ != nullptr)
+            peerKeysFn_(peerKeysCtx_, ret.partition, static_cast<int32_t>(ret.sessionId), static_cast<uint64_t>(ret.baseOffset));
+        return;
+    }
     if (kind == K::NsSlotMismatch) [[unlikely]] {   // namespaces Phase 2 Task 8: a worker's cumulative count
         if (ret.partition >= 0 && ret.partition < 4096) {
             if (workerNsSlotMismatches_.size() <= static_cast<std::size_t>(ret.partition))

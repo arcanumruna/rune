@@ -10,8 +10,8 @@
 // record-egress resolve, issue #5), and no Record at all for it 200 ms after its end is seen, whatever the offset (issue
 // #188); (3) every request is answered within 5 s; (4) convergence: with all
 // changes answered, a probe of every session x topic answers exactly what the model says.
-// RUNE_AUTH_STRESS_SEEDS / RUNE_AUTH_STRESS_STEPS override the 64 seeds x 300 steps.  A failure prints the seed and the
-// step list.
+// 64 seeds x 300 steps, in 16 blocks of 4 (see AuthStressSeedsRegression for the replay knobs).  A failure prints the
+// seed and the step list.
 #include "support/AuthRig.h"
 #include "support/PermissionModel.h"
 
@@ -363,7 +363,12 @@ private:
                             ++tally_.forcedRaceEnded;
                         }
                     }
-                } else if (revokedFrame_(se, s.sid)) { s.st = Sub::St::Ended; s.endCode = 46; s.bound = logEndBound_(s); }
+                } else if (revokedFrame_(se, s.sid)) {
+                    s.st = Sub::St::Ended; s.endCode = 46; s.bound = logEndBound_(s);
+                    // The session-level SessionRevoked (corr 0) is terminal: it ends every request of the session, the
+                    // forced Subscribe too, and can be read before (or instead of) that Subscribe's own answer.
+                    if (s.forced) ++tally_.forcedRaceEnded;
+                }
                 else if (now - s.sentAt_ > 5s) failWith_("unanswered subscribe (step " + std::to_string(s.sentSteps) + ")");
             }
             // invariant 2, the revoke that RACED the Subscribe: it was authorised at some applied prefix <= estSent; once the
@@ -385,6 +390,10 @@ private:
                     if (s.st == Sub::St::MustEnd) {
                         ++tally_.mustEndMet; tally_.mustEndRacing += s.racing ? 1 : 0;
                     }
+                    // A forced race whose Subscribe won (answered 0 before the revoke applied: the egress-resolve hold
+                    // does not gate a session whose egress is resolved already) ends here, by the revoke - invariant 2
+                    // above bounds it.  Either order ends the race.
+                    if (s.forced) ++tally_.forcedRaceEnded;
                     s.st = Sub::St::Ended; s.bound = logEndBound_(s);
                     s.endObservedAt = now; s.pushesAtEnd = pushes_(se, s.subId);
                     break;
@@ -750,20 +759,25 @@ private:
             }
             ++tally_.disabledLoginsRefused;
         }
-        // probes: EVERY alive session x existing topic x BOTH produce paths (worker ingress, gateway-routed) + Subscribe
+        // probes: EVERY alive session x existing topic x BOTH produce paths (worker ingress, gateway-routed) + Subscribe.
+        // Plus the rig's `secret` topic, outside every grant this test can issue (all are under P()): every seed with a
+        // live session probes a denial on both paths, whatever its final model grants.
         step_ = static_cast<std::size_t>(steps_) + 1;
+        std::vector<std::pair<std::string, int32_t>> probed;
+        for (const std::string& t : existing_()) probed.emplace_back(t, exists_[t]);
+        probed.emplace_back("secret", static_cast<int32_t>(rig_.secret));
         for (std::size_t i = 0; i < sess_.size() && fail_.empty(); ++i) {
             Sess& s = sess_[i];
             if (!s.alive) continue;
             ++tally_.sessionsProbed;
-            for (const std::string& t : existing_()) {
+            for (const auto& [t, topicId] : probed) {
                 const bool wantW = fin.allowed(user_(s.user), pm::Op::Write, t), wantR = fin.allowed(user_(s.user), pm::Op::Read, t);
                 for (const bool routed : {false, true}) {
                     int code = kNoAnswer;
                     for (int a = 0; a < 80; ++a) {   // transient answers (NotLeader / UnknownTopic while a topic settles) are retried
                         const int64_t corr = s.c->nextCorrelationId();
                         const std::string& chan = routed ? rig_.ch() : rig_.broker().workerIngressChannel();
-                        if (!s.c->produce(chan, AuthRig::stream(), s.sid, corr, exists_[t], 0, 1, makeCharBatch(1))) break;
+                        if (!s.c->produce(chan, AuthRig::stream(), s.sid, corr, topicId, 0, 1, makeCharBatch(1))) break;
                         const auto ack = s.c->awaitProduceResponseUntil(corr, Clock::now() + 5s);
                         keepRigAlive_();
                         code = ack ? ack->errorCode : kNoAnswer;
@@ -779,7 +793,7 @@ private:
                 }
                 int sc = kNoAnswer;
                 for (int a = 0; a < 80; ++a) {
-                    sc = s.c->awaitSubscribeCode(s.c->sendSubscribe(rig_.ch(), AuthRig::stream(), s.sid, exists_[t], 0), Clock::now() + 5s).value_or(kNoAnswer);
+                    sc = s.c->awaitSubscribeCode(s.c->sendSubscribe(rig_.ch(), AuthRig::stream(), s.sid, topicId, 0), Clock::now() + 5s).value_or(kNoAnswer);
                     keepRigAlive_();
                     if (sc != static_cast<int>(pc::ErrorCode::NotLeader)) break;
                     std::this_thread::sleep_for(25ms);
@@ -819,10 +833,21 @@ private:
 
 }  // namespace
 
-TEST(AuthStressRegression, SeededRandomGrantRevokeTrafficHoldsEveryInvariant) {
-    const int seeds = envInt("RUNE_AUTH_STRESS_SEEDS", 64);
+// #883: the 64 seeds run as 16 blocks of 4 (one ctest entry each, under 20 s), on one rig per block.  The run's
+// traffic floors (review I6) hold per block, scaled to its seed count and rounded up; the model-driven ones hold as
+// "reached at all" (see below - 4 seeds per block so each block reaches them; 2 did not).
+// Replay: RUNE_AUTH_STRESS_FIRST_SEED=N RUNE_AUTH_STRESS_SEEDS=M runs exactly seeds [N, N+M) in block 0 (the other
+// blocks skip); RUNE_AUTH_STRESS_STEPS overrides the 300 steps.
+constexpr int kStressSeeds = 64;
+constexpr int kStressBlockSeeds = 4;
+class AuthStressSeedsRegression : public ::testing::TestWithParam<int> {};
+
+TEST_P(AuthStressSeedsRegression, SeededRandomGrantRevokeTrafficHoldsEveryInvariant) {
+    const bool replay = std::getenv("RUNE_AUTH_STRESS_SEEDS") != nullptr || std::getenv("RUNE_AUTH_STRESS_FIRST_SEED") != nullptr;
+    if (replay && GetParam() != 0) GTEST_SKIP() << "replay runs in block 0";
+    const int seeds = replay ? envInt("RUNE_AUTH_STRESS_SEEDS", kStressSeeds) : kStressBlockSeeds;
     const int steps = envInt("RUNE_AUTH_STRESS_STEPS", 300);
-    const int first = envInt("RUNE_AUTH_STRESS_FIRST_SEED", 0);   // replay: FIRST_SEED=N SEEDS=1
+    const int first = replay ? envInt("RUNE_AUTH_STRESS_FIRST_SEED", 0) : GetParam() * kStressBlockSeeds;
     AuthBroker::Options o;
     o.shard = true;
     AuthRig rig("stress", o);
@@ -845,27 +870,34 @@ TEST(AuthStressRegression, SeededRandomGrantRevokeTrafficHoldsEveryInvariant) {
         ASSERT_TRUE(failure.empty()) << failure;
         tally.add(t);
     }
-    std::cout << "[auth-stress] " << seeds << " seeds x " << steps << " steps in "
+    std::cout << "[auth-stress] seeds [" << first << ", " << first + seeds << ") x " << steps << " steps in "
               << std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - t0).count() << " s\n[auth-stress] " << tally.str() << "\n";
-    if (seeds >= 64 && steps >= 300) {   // non-vacuity floors of a full run (review I6)
-        EXPECT_GE(tally.shardOk, 100u);
-        EXPECT_GE(tally.routedOk, 100u);
-        EXPECT_GE(tally.subOk, 100u);
-        EXPECT_GE(tally.createOk, 1u);
-        EXPECT_GE(tally.mustEndMet, 20u);
-        EXPECT_GE(tally.recordsChecked, 1u);
-        EXPECT_GE(tally.shardDeniedProbes, 50u);
-        EXPECT_GE(tally.routedDeniedProbes, 50u);
-        EXPECT_GE(tally.shardOkProbes, 50u);
-        EXPECT_GE(tally.routedOkProbes, 50u);
-        EXPECT_GE(tally.epochsChecked, 100u);
+    if (steps >= 300) {   // non-vacuity floors of a full run (review I6), per kStressSeeds seeds, scaled to this block
+        const auto floorFor = [seeds](uint64_t perRun) { return (perRun * static_cast<uint64_t>(seeds) + kStressSeeds - 1) / kStressSeeds; };
+        EXPECT_GE(tally.shardOk, floorFor(100));
+        EXPECT_GE(tally.routedOk, floorFor(100));
+        EXPECT_GE(tally.subOk, floorFor(100));
+        EXPECT_GE(tally.createOk, floorFor(1));
+        EXPECT_GE(tally.mustEndMet, floorFor(20));
+        EXPECT_GE(tally.recordsChecked, floorFor(1));
+        // The denied probes: every live session of every seed probes `secret` (never granted) on both paths, so each
+        // block has at least one per live session; the model's own denials come on top.  The checked epochs follow the
+        // seeds' live sessions (6 to 24 per block seen): a block must reach them at all.
+        EXPECT_GE(tally.shardDeniedProbes, tally.sessionsProbed);
+        EXPECT_GE(tally.routedDeniedProbes, tally.sessionsProbed);
+        EXPECT_GE(tally.sessionsProbed, 1u);
+        EXPECT_GE(tally.shardOkProbes, floorFor(50));
+        EXPECT_GE(tally.routedOkProbes, floorFor(50));
+        EXPECT_GE(tally.epochsChecked, 1u);
     }
     // issue #189: every disabled user of every seed was probed and definitely refused (no sampling)
     EXPECT_EQ(tally.disabledLoginsRefused, tally.disabledUsersAtEnd);
-    // issue #5: every seed forced the revoke-races-the-Subscribe path, and every forced race ended
+    // issue #5: every seed forced the revoke-races-the-Subscribe path, and every forced race ended (its Subscribe answered
+    // 45/46, the session revoked, or - the Subscribe won - its subscription ended by the revoke)
     EXPECT_EQ(tally.forcedRaces, static_cast<uint64_t>(seeds));
     EXPECT_EQ(tally.forcedRaceEnded, static_cast<uint64_t>(seeds));
 }
+INSTANTIATE_TEST_SUITE_P(Blocks, AuthStressSeedsRegression, ::testing::Range(0, kStressSeeds / kStressBlockSeeds));
 
 // Issue #189, the deterministic shape: DISABLE, a probe that is definitely refused (AuthenticationFailed, no retry hint),
 // ENABLE, and a login that must succeed on its FIRST try (no retry may mask a wrongful refusal after the ENABLE).

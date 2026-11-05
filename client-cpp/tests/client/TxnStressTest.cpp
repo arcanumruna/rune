@@ -1112,9 +1112,12 @@ INSTANTIATE_TEST_SUITE_P(TxnStress, TxnStressRegression, ::testing::ValuesIn(see
 TEST(TxnStressRegression, SeedsReachEpochBumpAndOffsetCommitInjectionRegression) {
     int gaps = 0, bumps = 0, restarts = 0, tocs = 0;
     const std::vector<uint32_t> all = seeds();
-    const std::size_t           n   = std::min<std::size_t>(all.size(), 16);
-    for (std::size_t i = 0; i < n; ++i) {
-        Stress s(all[i]);
+    const std::size_t           cap = std::min<std::size_t>(all.size(), 16);
+    // #883: every expectation is "at least one over the first 16 seeds", so the walk stops at the first seed by which
+    // all four are reached (each seed is also its own TxnStress test; re-running the rest proved nothing more).
+    std::size_t n = 0;
+    for (; n < cap && (gaps == 0 || bumps == 0 || restarts == 0 || tocs == 0); ++n) {
+        Stress s(all[n]);
         s.run();
         if (::testing::Test::HasFatalFailure()) return;
         gaps += s.seqGaps();

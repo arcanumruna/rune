@@ -1361,6 +1361,11 @@ TEST(StorageFailStopRegression, NamespaceDiskScanSkipsAReplicaMovedByAQueuedSetO
     moved.setRegistryHandle(1, 11);
     kept.setRegistryHandle(2, 12);
     Worker w(0, 1 << 16, 1 << 16, 64, 64);
+    // #724: the scan charges a log only while the worker's slot holds the log's nsId, so both namespaces are assigned:
+    // the moved log's slot is live too, and only the ownership drain keeps it out of the count.
+    const rune::protocol::NamespaceLimits lim;
+    w.applyNsSlotAssignDirect(3, 7, lim);
+    w.applyNsSlotAssignDirect(4, 8, lim);
     w.setOwnedDirect(Worker::OwnedSet{&moved, &kept});
     const rune::protocol::NamespaceLimits limits;
     w.applyNsSlotAssignDirect(3, 7, limits);   // #724: the scan counts a log only while its slot holds its nsId

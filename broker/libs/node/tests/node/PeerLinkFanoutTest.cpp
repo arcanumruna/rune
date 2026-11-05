@@ -279,17 +279,90 @@ TEST(PeerLinkFanoutRegression, ASendAndReceiveSupersedesAnUndeliveredReceiveOnly
 }
 
 TEST(PeerLinkFanoutRegression, TheAdminWireCarriesTheModeAndRefusesAnUnknownOneRegression) {
-    EXPECT_EQ(kPeerLinkKeysWireLen, 73u);
-    PeerLinkKeysMsg m; m.peer = 3; m.epoch = 2; m.sendMaster.fill(4); m.recvMaster.fill(5);
+    EXPECT_EQ(kPeerLinkKeysWireLen, 81u);
+    PeerLinkKeysMsg m; m.peer = 3; m.epoch = 2; m.sendMaster.fill(4); m.recvMaster.fill(5); m.seq = 0x0102030405060708ULL;
     m.install = rune::peerlink::LinkInstall::ReceiveOnly;
     uint8_t buf[kPeerLinkKeysWireLen];
     writePeerLinkKeys(buf, m);
     PeerLinkKeysMsg d;
     ASSERT_TRUE(decodePeerLinkKeys(buf, sizeof buf, d));
     EXPECT_EQ(d.install, rune::peerlink::LinkInstall::ReceiveOnly);
+    EXPECT_EQ(d.seq, 0x0102030405060708ULL);
     buf[kPeerLinkKeysWireLen - 1] = 2;
     EXPECT_FALSE(decodePeerLinkKeys(buf, sizeof buf, d)) << "an unknown install mode is a malformed message";
-    EXPECT_FALSE(decodePeerLinkKeys(buf, sizeof buf - 1, d)) << "the old 72-byte layout";
+    EXPECT_FALSE(decodePeerLinkKeys(buf, sizeof buf - 1, d)) << "the old 80-byte layout";
+    EXPECT_FALSE(decodePeerLinkKeys(buf, 73, d)) << "the pre-sequence 73-byte layout";
+}
+
+// The handshake frame that lets a peer seal under a new epoch is held until every plane RAN its keys (a worker drains
+// its lifecycle ring once per pass, so an enqueue proves nothing).  Each install carries a sequence number every
+// destination sends back; `applied` is true only once every worker and the admin thread acknowledged it or a later one.
+// Mutation: `applied` answering from the deliveries (pump) instead of the acknowledgements -> red.
+TEST(PeerLinkFanoutRegression, AnInstallIsAppliedOnlyOnceEveryPlaneRanItRegression) {
+    auto p = pool(3);
+    OneToOneByteRing admin(1 << 12);
+    PeerLinkFanout f;
+    const uint64_t s1 = f.post(2, keysAt(4, 10, rune::peerlink::LinkInstall::ReceiveOnly));
+    EXPECT_GT(f.pump(p.get(), &admin), 0);
+    EXPECT_EQ(f.pendingForTest(), 0u) << "delivered to every ring";
+    EXPECT_FALSE(f.applied(2, s1, 3, true)) << "delivered is not run: no plane acknowledged yet";
+    drainAll(*p);   // every worker runs the op and answers PeerLinkKeysApplied
+    std::vector<std::pair<int32_t, uint64_t>> acks;
+    p->drainAllReturns([&](const WorkerReturn& r) {
+        if (r.type == WorkerReturn::Type::SessionSignal &&
+            static_cast<SessionSignalKind>(r.lastOffset) == SessionSignalKind::PeerLinkKeysApplied) {
+            EXPECT_EQ(r.sessionId, 2) << "the peer";
+            acks.emplace_back(r.partition, static_cast<uint64_t>(r.baseOffset));
+        }
+    });
+    ASSERT_EQ(acks.size(), 3u) << "one acknowledgement per worker";
+    for (std::size_t i = 0; i < 2; ++i) f.onWorkerApplied(acks[i].first, 2, acks[i].second);
+    EXPECT_FALSE(f.applied(2, s1, 3, true)) << "worker " << acks[2].first << " has not acknowledged";
+    f.onWorkerApplied(acks[2].first, 2, acks[2].second);
+    EXPECT_FALSE(f.applied(2, s1, 3, true)) << "the admin thread has not acknowledged";
+    EXPECT_TRUE(f.applied(2, s1, 3, false)) << "no admin thread: the workers are every plane";
+    const auto msgs = adminMsgs(admin);
+    ASSERT_EQ(msgs.size(), 1u);
+    EXPECT_EQ(msgs[0].seq, s1) << "the admin message carries the install's sequence number";
+    f.onAdminApplied(2, msgs[0].seq);
+    EXPECT_TRUE(f.applied(2, s1, 3, true));
+    EXPECT_FALSE(f.applied(3, s1, 3, true)) << "another peer's installs are its own";
+    EXPECT_TRUE(f.applied(3, s1, 0, false)) << "no plane to wait for";
+
+    // The promotion of the same epoch is a new install (a new number): the old acknowledgements do not cover it.
+    const uint64_t s2 = f.post(2, keysAt(4, 10, rune::peerlink::LinkInstall::SendAndReceive));
+    EXPECT_GT(s2, s1);
+    EXPECT_FALSE(f.applied(2, s2, 3, true));
+    // A later acknowledgement covers an earlier install (each plane runs a peer's installs in post order).
+    for (int32_t w = 0; w < 3; ++w) f.onWorkerApplied(w, 2, s2 + 1);
+    f.onAdminApplied(2, s2 + 1);
+    EXPECT_TRUE(f.applied(2, s2, 3, true));
+    // An older acknowledgement arriving late never moves a plane back.
+    f.onWorkerApplied(1, 2, s1);
+    EXPECT_TRUE(f.applied(2, s2, 3, true));
+}
+
+// A worker acknowledges a PeerLinkKeys op it refused too (malformed install mode): the go-ahead must not wait forever.
+TEST(PeerLinkFanoutRegression, ARefusedInstallIsStillAcknowledgedRegression) {
+    auto p = pool(1);
+    WorkerOp op;
+    op.type          = WorkerOp::Type::PeerLinkKeys;
+    op.topicId       = 2;
+    op.partition     = 5;
+    op.isolation     = 9;   // no such LinkInstall
+    op.correlationId = 77;
+    ASSERT_EQ(p->worker(0).enqueueOp(op), EnqueueResult::Enqueued);
+    drainAll(*p);
+    EXPECT_EQ(p->worker(0).peerLinkEpochForTest(2), 0u) << "refused: nothing installed";
+    int acks = 0;
+    p->drainAllReturns([&](const WorkerReturn& r) {
+        if (r.type == WorkerReturn::Type::SessionSignal &&
+            static_cast<SessionSignalKind>(r.lastOffset) == SessionSignalKind::PeerLinkKeysApplied) {
+            ++acks;
+            EXPECT_EQ(r.baseOffset, 77);
+        }
+    });
+    EXPECT_EQ(acks, 1);
 }
 
 TEST(PeerLinkFanoutRegression, AWorkerRefusesAnUnknownInstallModeRegression) {
@@ -349,4 +422,57 @@ TEST(PeerLinkFanoutRegression, EnqueueOpNeverCopiesAKeyCarryingOpRegression) {
     std::memset(op.peerKeys.data(), 0, op.peerKeys.size());
     drainAll(*p);
     EXPECT_TRUE(workerHolds(*p, 0, 2, 3)) << "the keys still reached the worker";
+}
+
+// Review of 8d726892, adversarial: the promotion of an epoch supersedes its receive-only install after that install
+// reached only SOME workers (worker 1 back-pressured).  Worker 0 then runs both (acks s1, then s2), worker 1 only the
+// promotion (acks s2).  `applied(s1)` must wait for worker 1's s2 (it holds the epoch only then) and never answer from
+// worker 0's acks alone; `applied(s2)` likewise.  Every op carries its own entry's sequence number.
+namespace {
+struct SeqWorker {
+    std::vector<std::pair<uint8_t, uint64_t>> ops;   // (install, seq)
+    int fullBudget = 0;
+    EnqueueResult enqueueOp(const WorkerOp& op) {
+        if (fullBudget > 0) { --fullBudget; return EnqueueResult::Full; }
+        ops.emplace_back(op.isolation, static_cast<uint64_t>(op.correlationId));
+        return EnqueueResult::Enqueued;
+    }
+};
+struct SeqPool {
+    SeqWorker workers[2];
+    int32_t workerCount() const { return 2; }
+    SeqWorker& worker(int32_t w) { return workers[w]; }
+};
+} // namespace
+
+TEST(PeerLinkFanoutRegression, APromotionSupersedingAPartlyDeliveredInstallIsAckedPerPlaneAdversarialRegression) {
+    using rune::peerlink::LinkInstall;
+    SeqPool pool;
+    pool.workers[1].fullBudget = 1;
+    PeerLinkFanout f;
+    const uint64_t s1 = f.post(2, keysAt(4, 1, LinkInstall::ReceiveOnly));
+    (void)f.pumpWith(&pool, nullptr);
+    ASSERT_EQ(pool.workers[0].ops.size(), 1u);
+    ASSERT_TRUE(pool.workers[1].ops.empty());
+    const uint64_t s2 = f.post(2, keysAt(4, 1, LinkInstall::SendAndReceive));   // same epoch: supersedes the entry
+    ASSERT_GT(s2, s1);
+    (void)f.pumpWith(&pool, nullptr);
+    EXPECT_EQ(f.pendingForTest(), 0u);
+    ASSERT_EQ(pool.workers[0].ops.size(), 2u);
+    ASSERT_EQ(pool.workers[1].ops.size(), 1u);
+    EXPECT_EQ(pool.workers[0].ops[0].second, s1);
+    EXPECT_EQ(pool.workers[0].ops[1].second, s2) << "the superseding entry carries its own sequence number";
+    EXPECT_EQ(pool.workers[1].ops[0].second, s2);
+    // The workers run them and ack, worker 0 first.
+    f.onWorkerApplied(0, 2, s1);
+    f.onWorkerApplied(0, 2, s2);
+    EXPECT_FALSE(f.applied(2, s1, 2, false)) << "worker 1 holds nothing of the epoch yet";
+    f.onWorkerApplied(1, 2, s2);
+    EXPECT_TRUE(f.applied(2, s1, 2, false));
+    EXPECT_TRUE(f.applied(2, s2, 2, false));
+    // An ack for another peer, or a stale one, never satisfies this peer.
+    EXPECT_FALSE(f.applied(2, s2 + 1, 2, false));
+    f.onWorkerApplied(0, 3, s2 + 5);
+    f.onWorkerApplied(1, 3, s2 + 5);
+    EXPECT_FALSE(f.applied(2, s2 + 1, 2, false));
 }

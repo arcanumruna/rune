@@ -276,6 +276,8 @@ public:
     }
     /// Test-only: CP-7 checkpoint entries held (one per compacted Log).
     [[nodiscard]] std::size_t checkpointCountForTest() const noexcept { return checkpoints_.size(); }
+    /// Logs out of selection because their last pass could not advance (cleaner thread).
+    [[nodiscard]] std::size_t stalledLogsForTest() const noexcept { return stalledPasses_.size(); }
     /// #840: logs whose cleaner met a damaged batch; each stays out of selection until the broker restarts
     /// (Kafka: LogCleanerManager.uncleanablePartitions).  Cleaner-thread-owned; cold.
     [[nodiscard]] std::size_t uncleanableLogCountForTest() const noexcept { return uncleanable_.size(); }
@@ -710,7 +712,8 @@ public:
         cleaner.setProducerIdExpirationMs(producerIdExpirationMs_);
         // D3b fix round 1: a txn marker is removed only below the minimum fetch
         // position of EVERY assigned replica (a lagging replica must still get it).
-        cleaner.setMarkerRemovalBound(best.replica->cleanerMarkerRemovalBound());
+        const int64_t markerRemovalBound = best.replica->cleanerMarkerRemovalBound();
+        cleaner.setMarkerRemovalBound(markerRemovalBound);
         const int64_t verdictBound = best.replica->cleanerVerdictBound();   // the bound first, then the marker end that carries it
         cleaner.setVerdictBounds(verdictBound, best.replica->cleanerVerdictMarkerEnd());
         // Part 06: an autoincrement partition keeps each live producer's whole retry window (ProducerBatchWindow.h).
