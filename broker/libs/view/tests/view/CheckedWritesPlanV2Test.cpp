@@ -431,3 +431,39 @@ TEST(CheckedWritesPlanV2, V1BlobDecodesWithSynthesizedComponent) {
     trailing.push_back(0);
     EXPECT_FALSE(deserializeCompiledViewPlan(trailing).has_value());
 }
+
+TEST(CheckedWritesPlanV2, CompiledDecodeRefusesAnUnknownKeyFunctionRegression) {
+    CompiledViewPlan p;
+    p.viewName = "v";
+    p.keyFieldId = {1};
+    p.sourceTopicId = {5};
+    p.output = {{0, PrimType::UInt64, 0, 1, MergeRule::Replace}, {1, PrimType::UInt64, 0, 2, MergeRule::Replace}};
+    p.keyComponents = {{1, 0, 8, 0, PrimType::UInt64}, {2, 0, 8, 1, PrimType::UInt64}};
+    p.keyWidth = 16;
+    p.unique = true;
+    auto bytes = serialize(p);
+    ASSERT_EQ(bytes[0], 0x02);
+    ASSERT_TRUE(deserializeCompiledViewPlan(bytes).has_value());
+
+    // tail after the components: keyWidth u16, unique u8, constraint count u32, unicodeVersion u32, viewObjectId u64
+    const size_t firstComponent = bytes.size() - (2 + 1 + 4 + 4 + 8) - 2 * 8;
+    for (uint8_t fn : {uint8_t{2}, uint8_t{3}, uint8_t{255}}) {
+        auto patched = bytes;
+        patched[firstComponent + 2] = fn;
+        EXPECT_FALSE(deserializeCompiledViewPlan(patched).has_value()) << "keyFunction " << int(fn);
+    }
+    auto zeroWidth = bytes;
+    zeroWidth[firstComponent + 3] = 0;
+    zeroWidth[firstComponent + 4] = 0;
+    EXPECT_FALSE(deserializeCompiledViewPlan(zeroWidth).has_value());
+    auto wrongWidth = bytes;
+    wrongWidth[firstComponent + 3] = 4;
+    EXPECT_FALSE(deserializeCompiledViewPlan(wrongWidth).has_value());
+}
+
+TEST(CheckedWritesPlanCompile, GroupByWithoutAnAggregateColumnRegression) {
+    const auto d = deviceSource();
+    auto v = aggregate({{"userId", 0, "userId"}});
+    v.output = {replaceOf(d, "lastSeen")};
+    expectRefused(compileOver(v, d), Kind::KeyInvalid, "group by needs an aggregate column");
+}

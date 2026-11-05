@@ -8,6 +8,7 @@
 #include <rune/view/ViewPlan.h>
 #include <algorithm>
 #include <cstring>
+#include <rune/codec/ViewKeyEncoding.h>
 
 namespace rune::view {
 namespace {
@@ -123,6 +124,13 @@ bool isValidPrimType(uint8_t v) {
 
 bool isValidPredicateOp(uint8_t v) {
     return v >= static_cast<uint8_t>(PredicateOp::Column) && v <= static_cast<uint8_t>(PredicateOp::Not);
+}
+
+// A lowered component only knows its encoded width, so for lower() the width is checked for being non-zero, not recomputed.
+bool validKeyComponent(const CompiledKeyComponent& c) {
+    if (c.keyFunction > rune::codec::kKeyFunctionLower || c.width == 0) return false;
+    if (c.keyFunction == rune::codec::kKeyFunctionLower) return c.type == rune::codec::PrimType::FixedStr;
+    return rune::codec::viewKeyComponentWidth(c.type, c.width, c.keyFunction) == c.width;
 }
 
 bool isValidMergeRule(uint8_t v) {
@@ -312,6 +320,7 @@ std::optional<CompiledViewPlan> deserializeCompiledViewPlan(std::span<const uint
             if (!readU16LE(buf, pos, c.width))       return std::nullopt;
             if (!readU16LE(buf, pos, c.outSlot))     return std::nullopt;
             if (!readPrimType(buf, pos, c.type))     return std::nullopt;
+            if (!validKeyComponent(c))               return std::nullopt;
             p.keyComponents.push_back(c);
         }
         uint8_t unique = 0;
