@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -52,6 +54,19 @@ void recs(Log& log, int64_t off, int64_t pid, int32_t seq, const std::vector<uin
 }
 void rec(Log& log, int64_t off, int64_t pid, int32_t seq, uint64_t id, const std::string& val, int64_t ts = -1) {
     recs(log, off, pid, seq, {id}, val, ts);
+}
+int64_t wallNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+/// Back-dates the segment files based in [from, to) by `ageMs`: producer expiry runs on the broker's append time (the file's).
+void ageSegments(Log& log, int64_t from, int64_t to, int64_t ageMs) {
+    for (const int64_t b : log.segmentBaseOffsets()) {
+        if (b < from || b >= to) continue;
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(b));
+        const auto path = std::filesystem::path(log.dir()) / name;
+        std::filesystem::last_write_time(path, std::filesystem::last_write_time(path) - std::chrono::milliseconds(ageMs));
+    }
 }
 void pad(Log& log, int64_t off) { rec(log, off, -1, -1, 1'000'000 + uint64_t(off), "pad"); }
 void reservation(Log& log, int64_t off, uint64_t n) {
@@ -254,10 +269,57 @@ TEST(CheckedWritesAutoIncCleaner, ExpiredProducerIsNotProtected) {
             Log log(dir.string(), /*segmentBytes=*/1);
             log.recover();
             insertsThenUpdates(log);
-            (void)clean(log, Pass{.nowMs = 1'000'000 + rune::storage::ProducerTails::kDefaultExpirationMs, .coalesce = coalesce});
+            ageSegments(log, 0, 40, rune::storage::ProducerTails::kDefaultExpirationMs + 60'000);   // producer 7's inserts
+            (void)clean(log, Pass{.nowMs = wallNowMs(), .coalesce = coalesce});
             const auto offs = dataOffsets(log);
             for (int64_t o = 0; o < 40; ++o) EXPECT_FALSE(offs.count(o)) << "the superseded insert at " << o << " is gone";
             for (int64_t o = 40; o < 80; ++o) EXPECT_TRUE(offs.count(o)) << "update at " << o;
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix pass 2 (C): expiry runs on the broker's clock, not the client's batch timestamps.  RED: a live producer writing with an old
+// client timestamp (a back-fill) looked expired, so its superseded insert was dropped out of its protected batch.
+TEST(CheckedWritesAutoIncCleanerRegression, LiveProducerWithOldClientTimestampsIsProtectedRegression) {
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            for (int i = 0; i < 3; ++i) rec(log, i, 7, i, uint64_t(i) + 1, "insert", /*ts=*/1);
+            rec(log, 3, -1, -1, 1, "update");
+            pad(log, 4);
+            const auto before = batches(log);
+            ASSERT_TRUE(before.count(0));
+            (void)clean(log, Pass{.nowMs = 1'000'000'000'000, .coalesce = coalesce});
+            const auto after = batches(log);
+            EXPECT_TRUE(after.count(0) && after.at(0) == before.at(0)) << "the live producer's batch is kept byte for byte";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix pass 2 (C): a rewrite keeps its input's append time.  RED: the rewritten file was new, so an expired producer whose batch
+// shared a segment with a superseded record looked live again for another expiry period.
+TEST(CheckedWritesAutoIncCleanerRegression, RewriteKeepsTheSegmentAppendTimeRegression) {
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            recs(log, 0, 7, 0, {1, 2}, "insert");
+            rec(log, 2, -1, -1, 1, "update");
+            pad(log, 3);
+            const int64_t age = rune::storage::ProducerTails::kDefaultExpirationMs + 60'000;
+            ageSegments(log, 0, 3, age);
+            const auto mtime = [&] { return std::filesystem::last_write_time(std::filesystem::path(log.dir()) / "00000000000000000000.log"); };
+            const auto before = mtime();
+            (void)clean(log, Pass{.nowMs = wallNowMs(), .coalesce = coalesce});
+            ASSERT_FALSE(dataOffsets(log).count(0)) << "the expired producer's superseded insert is gone (the file was rewritten)";
+            EXPECT_LE(mtime(), before + std::chrono::milliseconds(age / 2)) << "and the file keeps its append time";
         }
         std::filesystem::remove_all(dir);
     }
@@ -691,8 +753,9 @@ TEST(CheckedWritesAutoIncCleanerRegression, ManyExpiredProducersDoNotOverflowThe
             for (int i = 0; i < 10; ++i) rec(log, kExpired + i, -1, -1, uint64_t(i), "update");
             rec(log, kExpired + 10, 7, 0, 999'999, "live", now);
             pad(log, kExpired + 11);
+            ageSegments(log, 0, kExpired + 10, exp + 60'000);
             int64_t dirty = 0, progress = 0;
-            ASSERT_TRUE(clean(log, Pass{.nowMs = now, .coalesce = coalesce, .mapSlots = 4096, .dirty = &dirty, .progress = &progress}));
+            ASSERT_TRUE(clean(log, Pass{.nowMs = wallNowMs(), .coalesce = coalesce, .mapSlots = 4096, .dirty = &dirty, .progress = &progress}));
             EXPECT_EQ(dirty, kExpired + 10) << "the watermark moves up to the live producer's batch";
             const auto offs = dataOffsets(log);
             for (int64_t o = 0; o < 10; ++o) EXPECT_FALSE(offs.count(o)) << "superseded insert at " << o;
@@ -760,8 +823,9 @@ TEST(CheckedWritesAutoIncCleanerRegression, EvictedProducerWritingAgainIsTakenBa
             int32_t seq7 = 1;
             for (int i = 0; i < 32; ++i, ++off) rec(log, off, 7, seq7++, 6000 + uint64_t(i), "live", now);
             pad(log, off++);
+            ageSegments(log, 0, 1 + 2 * kN, exp + 60'000);
             int64_t dirty = 0, progress = 0;
-            const Pass pass{.nowMs = now, .coalesce = coalesce, .mapSlots = 4096, .dirty = &dirty, .progress = &progress};
+            const Pass pass{.nowMs = wallNowMs(), .coalesce = coalesce, .mapSlots = 4096, .dirty = &dirty, .progress = &progress};
             ASSERT_TRUE(clean(log, pass));
             EXPECT_EQ(dirty, 1 + 2 * kN) << "the watermark moves up to the live producer's last 32";
             auto offs = dataOffsets(log);
@@ -770,6 +834,7 @@ TEST(CheckedWritesAutoIncCleanerRegression, EvictedProducerWritingAgainIsTakenBa
             for (int i = 0; i < 32; ++i, ++off) rec(log, off, 7, seq7++, 7000 + uint64_t(i), "live", now);
             for (int i = 0; i < 10; ++i, ++off) rec(log, off, -1, -1, 6000 + uint64_t(i), "update");
             pad(log, off++);
+            ageSegments(log, 0, second, exp + 60'000);   // a merged file holds producer 7's batches too: one append time per file
             (void)clean(log, pass);
             EXPECT_EQ(dirty, second) << "and on with it on the next pass";
             offs = dataOffsets(log);

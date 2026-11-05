@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <climits>
 #include <filesystem>
 #include <fstream>
@@ -52,6 +53,24 @@ std::vector<uint8_t> readFile(const std::string& path) {
     f.seekg(0, std::ios::beg);
     f.read(reinterpret_cast<char*>(buf.data()), sz);
     return buf;
+}
+
+// Fix pass 2: the broker-clock append time of every batch in a segment is at or before the file's last write (epoch ms).  Producer
+// expiry (tails, window) runs on it, never on the client's maxTimestamp: an old or skewed one would expire a live producer.  A
+// rewrite keeps it (keepAppendTime); a merge takes its members' latest, which only delays expiry.
+int64_t segmentAppendMs(const std::string& path) {
+    std::error_code ec;
+    const auto t = std::filesystem::last_write_time(path, ec);
+    if (ec) return std::numeric_limits<int64_t>::max();   // unknown: never expires
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::file_clock::to_sys(t).time_since_epoch()).count();
+}
+
+// A rewrite's output keeps its inputs' latest last-write time, so a rewrite never restarts producer expiry (segmentAppendMs).
+void keepAppendTime(const std::string& out, const std::string& dir, const std::vector<int64_t>& bases) {
+    std::error_code ec;
+    auto t = std::filesystem::file_time_type::min();
+    for (const int64_t b : bases) t = std::max(t, std::filesystem::last_write_time(segmentLogPath(dir, b), ec));
+    if (t != std::filesystem::file_time_type::min()) std::filesystem::last_write_time(out, t, ec);
 }
 
 // Write bytes to path (overwrite) and fsync the fd before returning.
@@ -172,14 +191,12 @@ bool isTransactionalBatch(const rune::protocol::RecordBatchReader& r) {
 }
 // Kafka LogCleaner parity (ProducerTails.h): note the batch if it is an
 // idempotent DATA batch starting below `toOffset`.
-void noteProducerTail(const uint8_t* batch, const rune::protocol::RecordBatchReader& r, Offset toOffset,
-                      ProducerTails& tails) {
+void noteProducerTail(const rune::protocol::RecordBatchReader& r, Offset toOffset, int64_t appendMs, ProducerTails& tails) {
     if (r.producerId() < 0 || r.baseSequence() < 0) return;
     if ((static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0)
         return;
     if (r.baseOffset() >= toOffset) return;
-    tails.note(r.producerId(), r.baseOffset() + r.lastOffsetDelta(),
-               static_cast<int64_t>(rune::protocol::detail::getLE64(batch + rune::protocol::batch::kMaxTimestampOffset)));
+    tails.note(r.producerId(), r.baseOffset() + r.lastOffsetDelta(), appendMs);
 }
 // C2 (Kafka BatchRetention.RETAIN_EMPTY): the RECORD-LESS producer-tail batch —
 // covers `lastOffset`, carries the producer id / epoch / the batch's last
@@ -283,6 +300,7 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
         if (segBase >= scanEnd) break;
         hook();   // fix round 6: segment boundary
         const auto buf = readFile(segmentLogPath(dir, segBase));
+        const int64_t appendMs = segmentAppendMs(segmentLogPath(dir, segBase));
         bytes += static_cast<int64_t>(buf.size());
         std::size_t pos = 0;
         BatchHeaderCursor hdr(segBase, BatchHeaderCursor::upperFor(segBase, successorInList(bases, bi)));
@@ -323,12 +341,10 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
                 }
             }
             if (base >= toOffset) { pos += static_cast<std::size_t>(total); continue; }   // above it only the control records above are read
-            noteProducerTail(buf.data() + pos, r, toOffset, tails);
+            noteProducerTail(r, toOffset, appendMs, tails);
             const int64_t last = base + r.lastOffsetDelta();
             if (window != nullptr && pid >= 0 && r.baseSequence() >= 0 && !isControlBatch(r))   // Part 06: an idempotent data batch
-                window->noteBatch(pid, base, last,
-                                  static_cast<int64_t>(rune::protocol::detail::getLE64(buf.data() + pos + rune::protocol::batch::kMaxTimestampOffset)),
-                                  segBase, pos);
+                window->noteBatch(pid, base, last, appendMs, segBase, pos);
             if (pid >= 0) {
                 if (isControlBatch(r)) {
                     const int type = markerControlType(buf.data() + pos, static_cast<std::size_t>(total), r);
@@ -629,6 +645,7 @@ bool LogCleaner::rewriteSegmentImpl(
     hook_();   // fix round 6: segment boundary
     auto buf = readFile(logPath);
     if (buf.empty()) return false;
+    const int64_t appendMs = segmentAppendMs(logPath);
 
     std::vector<uint8_t> outBuf;
     outBuf.reserve(buf.size());
@@ -699,7 +716,7 @@ bool LogCleaner::rewriteSegmentImpl(
         // isBatchLastRecordOfProducer, unexpired)?  Then it is never removed
         // whole: kept records carry it, else a record-less batch does.
         const bool tailNeeded = batchIsData && tails != nullptr && batchLastOffset < cleanBoundaryOffset &&
-            tails->mustRetain(origProducerId, batchLastOffset, batchMaxTs, nowMs, producerIdExpirationMs_);
+            tails->mustRetain(origProducerId, batchLastOffset, appendMs, nowMs, producerIdExpirationMs_);
         // Part 06: a live producer's last `depth` batches are kept whole, before any record rule (aborted data still goes).  A
         // batch at or past the clean boundary is kept whole whatever its producer: re-framing its records one per batch would
         // split the batch a leader rebuilt from the log dedupes a retry against.
@@ -987,6 +1004,7 @@ bool LogCleaner::rewriteSegmentImpl(
     // .new file.  On next startup, LogCleaner::compact() will clean it up
     // (see compact() preamble).
     writeFileDurable(newPath, outBuf);
+    keepAppendTime(newPath, dir, {segBase});
 
     // 3. Atomic rename: .new → .log.
     std::filesystem::rename(newPath, logPath);
@@ -1520,6 +1538,7 @@ void LogCleaner::deferInstall_(const std::string& dir, const std::vector<int64_t
         const std::string idxOut = Log::cleanedIndexPath(dir, outBase, g.seq);
         deferredWritten_.push_back(logOut);
         writeFileDurable(logOut, out);
+        keepAppendTime(logOut, dir, bases);
         deferredWritten_.push_back(idxOut);
         writeFileDurable(idxOut, idx);
     }
@@ -1652,6 +1671,7 @@ void LogCleaner::mergeGroupWithMap(
         hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
+        const int64_t appendMs = segmentAppendMs(segmentLogPath(dir, segBase));
         outBuf.reserve(outBuf.size() + buf.size());
 
         std::size_t pos = 0;
@@ -1684,7 +1704,7 @@ void LogCleaner::mergeGroupWithMap(
                 rune::protocol::detail::getLE64(buf.data() + pos + rune::protocol::batch::kMaxTimestampOffset));
             // C2 / I1 (see rewriteSegmentImpl): producer-tail metadata retention.
             const bool tailNeeded = batchIsData && batchLastOffset < passEnd &&
-                map.producerTails().mustRetain(origProducerId, batchLastOffset, batchMaxTs, nowMs,
+                map.producerTails().mustRetain(origProducerId, batchLastOffset, appendMs, nowMs,
                                                producerIdExpirationMs_);
             // Part 06 (see rewriteSegmentImpl): a protected batch, or one at or past the pass boundary, is kept whole.
             if (batchBaseOffset >= passEnd ||
@@ -1839,6 +1859,7 @@ void LogCleaner::mergeGroupWithMap(
     // Durable write of the merged output to the group's lowest base, then delete
     // the absorbed members.
     writeFileDurable(outNewPath, outBuf);
+    keepAppendTime(outNewPath, dir, groupInPass);
     std::filesystem::rename(outNewPath, outLogPath);
     fsyncDir(dir);
     std::filesystem::remove(outIdxPath);

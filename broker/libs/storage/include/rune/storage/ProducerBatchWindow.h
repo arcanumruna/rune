@@ -9,8 +9,8 @@
 // key expired, so the tombstone of every key such a batch holds is pinned (pinsTombstone) while the batch is protected.  A key of
 // 1..8 bytes (every autoincrement key width) is recorded as its keyIndexWord; a wider or null key is not.
 //
-// Expiry is ProducerTails': a producer whose last batch's maxTimestamp is older than nowMs - expirationMs is not protected (nowMs < 0
-// never expires); finish() drops it.  The ring holds each batch's position only, and finish() reads the keys of the batches it
+// Expiry is ProducerTails': a producer whose last batch's broker append time (its segment file's last write, never the client's
+// maxTimestamp) is older than nowMs - expirationMs is not protected (nowMs < 0 never expires); finish() drops it.  The ring holds each batch's position only, and finish() reads the keys of the batches it
 // keeps.  Memory is bounded by a byte budget (the cleaner gives it the share of its dedupe budget ProducerTails gets).  A charge past
 // it first evicts the producers that look expired so far in the scan, keeping only their ids (8 bytes each).  One of them seen again
 // later is taken back with a fresh, PARTIAL ring: at finish() it is dropped if expired, exact once its ring holds `depth` batches
@@ -69,9 +69,9 @@ public:
     }
 
     // ---- pre-pass feed (offset order) -------------------------------------
-    /// An idempotent DATA batch of `producerId` over [baseOffset, lastOffset], batch maxTimestamp `maxTimestampMs`, at byte `pos`
-    /// of segment `segBase`.
-    void noteBatch(int64_t producerId, int64_t baseOffset, int64_t lastOffset, int64_t maxTimestampMs, int64_t segBase, std::size_t pos) {
+    /// An idempotent DATA batch of `producerId` over [baseOffset, lastOffset], appended at `appendMs`, at byte `pos` of segment
+    /// `segBase`.
+    void noteBatch(int64_t producerId, int64_t baseOffset, int64_t lastOffset, int64_t appendMs, int64_t segBase, std::size_t pos) {
         if (overflowed_) return;
         auto it = producers_.find(producerId);
         if (it == producers_.end()) {
@@ -94,7 +94,7 @@ public:
             p.ring[p.head] = b;
             p.head = (p.head + 1) % depth_;
         }
-        p.lastMaxTs = maxTimestampMs;
+        p.lastAppendMs = appendMs;
     }
     /// End of the pre-pass: drops the expired producers and reads the keys of the batches kept.  `readKeys(segBase, pos, keys)`
     /// appends the keyIndexWord of every 1..8-byte key of the batch at byte `pos` of segment `segBase` (called in offset order) and returns false if it
@@ -103,7 +103,7 @@ public:
     void finish(ReadKeys&& readKeys) {
         bool unrecorded = false;   // a live producer taken back short of `depth` batches
         for (const auto& [pid, p] : producers_) {
-            if (expired(p.lastMaxTs)) continue;
+            if (expired(p.lastAppendMs)) continue;
             if (p.partial && p.ring.size() < depth_) { unrecorded = true; break; }
             batches_.insert(batches_.end(), p.ring.begin(), p.ring.end());
         }
@@ -155,16 +155,16 @@ public:
 
 private:
     struct Batch { int64_t base, last, segBase; std::size_t pos; };
-    struct Producer { std::vector<Batch> ring; std::size_t head = 0; int64_t lastMaxTs = 0; bool partial = false; };
+    struct Producer { std::vector<Batch> ring; std::size_t head = 0; int64_t lastAppendMs = 0; bool partial = false; };
 
-    bool expired(int64_t maxTimestampMs) const noexcept {
-        return nowMs_ >= 0 && expirationMs_ >= 0 && toEpochMs(maxTimestampMs) < nowMs_ - expirationMs_;
+    bool expired(int64_t appendMs) const noexcept {
+        return nowMs_ >= 0 && expirationMs_ >= 0 && toEpochMs(appendMs) < nowMs_ - expirationMs_;
     }
     /// Charges `n` bytes for `producerId`, evicting the other expired producers first when they do not fit.
     bool charge(std::size_t n, int64_t producerId) {
         if (bytes() + n > budget_) {
             for (auto it = producers_.begin(); it != producers_.end();) {
-                if (it->first == producerId || !expired(it->second.lastMaxTs)) { ++it; continue; }
+                if (it->first == producerId || !expired(it->second.lastAppendMs)) { ++it; continue; }
                 bytes_ -= kBytesPerProducer + it->second.ring.size() * sizeof(Batch) - sizeof(int64_t);
                 evicted_.push_back(it->first);
                 it = producers_.erase(it);

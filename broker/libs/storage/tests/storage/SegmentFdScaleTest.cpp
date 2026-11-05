@@ -19,6 +19,7 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
@@ -311,13 +312,27 @@ TEST(SegmentFdScaleRegression, RecoverTruncateErrorFailsTheLogRegression) {
     seg.setStorageState(&st);
     const auto b = batchAt(0);
     seg.append(b, 0);
-    // The segment's fd now names a read-only file: ftruncate fails.
-    const int ro = ::open("/dev/null", O_RDONLY);
+    { std::ofstream(seg.logPath(), std::ios::binary | std::ios::app) << "torn"; }   // a torn tail: recover truncates
+    // The segment's fd now names the file read-only: ftruncate fails.
+    const int ro = ::open(seg.logPath().c_str(), O_RDONLY);
     ASSERT_GE(ro, 0);
     ASSERT_EQ(::dup2(ro, seg.logFd()), seg.logFd());
     ::close(ro);
     EXPECT_NO_THROW(seg.recover()) << "the valid prefix is known: fail-stop, no exception";
     EXPECT_NE(st.failedErrno, 0) << "the log is failed (sticky)";
+    fs::remove_all(dir);
+}
+
+// Fix pass 2 (C): the file's mtime is the cleaner's producer-expiry clock.  RED: recover ftruncated an intact segment to its own
+// size, which bumped the mtime, so every reload made every producer look live again.
+TEST(SegmentFdScaleRegression, RecoverOfAnIntactSegmentKeepsItsMtimeRegression) {
+    const fs::path dir = freshDir("rune_cw06_mtime");
+    LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+    seg.append(batchAt(0), 0);
+    const auto old = fs::last_write_time(seg.logPath()) - std::chrono::hours(24 * 8);
+    fs::last_write_time(seg.logPath(), old);
+    seg.recover();
+    EXPECT_EQ(fs::last_write_time(seg.logPath()), old);
     fs::remove_all(dir);
 }
 

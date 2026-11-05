@@ -5931,9 +5931,13 @@ TEST(PsmLogConsistencyRegression, CompactionExpiresProducerTailsLikeKafka) {
     std::vector<int64_t> sizes(bases.size(), 1);
     rune::storage::LogCleaner cleaner;
     EXPECT_EQ(cleaner.producerIdExpirationMs(), 7LL * 24 * 3600 * 1000) << "the default (Kafka-style) expiry";
+    // Expiry runs on the broker's append time (the segment file's last write): back-date producer 7's segment 8 days.
+    const auto seg0 = d.path / "00000000000000000000.log";
+    std::filesystem::last_write_time(seg0, std::filesystem::last_write_time(seg0) - std::chrono::hours(8 * 24));
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     rune::storage::SkimpyOffsetMap map(1024);
     (void)cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 100, map, false, 1 << 20,
-                                             nullptr, /*nowMs=*/kT0 + 8LL * 24 * 3600 * 1000);
+                                             nullptr, nowMs);
     log.reloadSegments();
     const auto raw = log.read(0, 1 << 24);
     std::size_t pos = 0;
