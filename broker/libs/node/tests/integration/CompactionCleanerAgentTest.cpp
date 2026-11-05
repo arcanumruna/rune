@@ -2987,6 +2987,9 @@ TEST(CompactionCleanerAgentRegression, AHeldLogIsCleanedAgainWhenAMarkerHorizonP
     Cp6MinimalConsensusAgent consensus;
     rune::node::NodeRuntimeAgent duty(consensus, nullptr, nullptr, nullptr, &registry, nullptr);   // installs the cleaner's outputs
     rune::node::LogCleanerAgent agent(&registry, /*cycleBudgetBytes=*/0);
+    int64_t wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    agent.setNowForTest([&] { return wallMs; });
     int64_t now = 2'000'000;
     const auto cycles = [&](int n) {
         for (int i = 0; i < n; ++i, now += 1'000'000) {
@@ -3005,7 +3008,7 @@ TEST(CompactionCleanerAgentRegression, AHeldLogIsCleanedAgainWhenAMarkerHorizonP
     };
     cycles(12);
     EXPECT_EQ(markerState(), "stamped") << "the superseded COMMIT marker is stamped with its delete horizon first";
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    wallMs += 400;
     cycles(12);
     EXPECT_EQ(markerState(), "gone") << "the expired COMMIT marker was never removed";
     fs::remove_all(dir);

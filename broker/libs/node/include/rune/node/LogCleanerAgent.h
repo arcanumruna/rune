@@ -98,6 +98,7 @@
 #include <cstring>
 #include <array>
 #include <filesystem>
+#include <functional>
 #include <spdlog/spdlog.h>
 #include <iomanip>
 #include <limits>
@@ -315,6 +316,9 @@ public:
     /// of doWork, so an owner accept can land right before a compaction pass.
     void setSkipCycleFileOpsForTest(bool v) noexcept { skipCycleFileOpsForTest_ = v; }
 
+    /// Test seam: the cycle's wall-clock epoch-ms comes from `fn` instead of system_clock.
+    void setNowForTest(std::function<int64_t()> fn) { nowForTest_ = std::move(fn); }
+
     /// Completed doWork cycles (D25: tests wait on cleaner progress, never on
     /// wall-clock sleeps).  Read from any thread (CLEANER-category atomic).
     [[nodiscard]] uint64_t cyclesDoneForTest() const noexcept { return cyclesDone_.load(std::memory_order_acquire); }
@@ -360,7 +364,7 @@ public:
         }
 
         // CP-8: sample wall-clock epoch-ms ONCE per cycle (deterministic horizon).
-        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        const int64_t nowMs = nowForTest_ ? nowForTest_() : std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
 
         // Fix round 4: perform the file operations the OWNER posted (it never
@@ -1195,6 +1199,7 @@ private:
     rune::storage::SkimpyOffsetMap dedupeMap_;
     std::vector<int64_t> scratchBases_;
     bool skipCycleFileOpsForTest_ = false;   ///< test seam: skip the top-of-cycle file ops
+    std::function<int64_t()> nowForTest_;    ///< test seam: the cycle clock (empty = system_clock)
     std::atomic<uint64_t> cyclesDone_{0};    ///< D25: completed cycles (cyclesDoneForTest)
     bool externalProvisioner_ = false;       ///< hotpath-A F2: see setExternalProvisioner
     rune::storage::Log* boundaryExclude_ = nullptr;   ///< the log a pass is compacting (fix round 6)
