@@ -243,6 +243,26 @@ std::optional<int64_t> successorOf(const std::vector<int64_t>& sealedBases, int6
     return it != sealedBases.end() ? std::optional<int64_t>(*it) : std::nullopt;
 }
 
+// Fix pass 2: a bounded pass never ends inside a batch - the records of one past the boundary would be re-framed and a marker
+// listing its records below it could go.  Returns the base of the batch `passEnd` splits, or `passEnd` when none does or that base
+// is at or below `dirtyStart` (the pass must progress).  The map scan validated these batches.
+Offset batchAlignedPassEnd(const std::string& dir, const std::vector<int64_t>& sealedBases, Offset activeBase, Offset dirtyStart,
+                           Offset passEnd) {
+    const auto it = std::upper_bound(sealedBases.begin(), sealedBases.end(), passEnd - 1);
+    if (it == sealedBases.begin() || (it != sealedBases.end() ? *it : activeBase) == passEnd) return passEnd;
+    const auto buf = readFile(segmentLogPath(dir, *std::prev(it)));
+    for (std::size_t pos = 0; pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size();) {
+        rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+        const int32_t total = r.totalLength();
+        if (total < rune::protocol::batch::kRecordBatchOverhead || pos + static_cast<std::size_t>(total) > buf.size()) break;
+        const int64_t base = r.baseOffset();
+        if (base >= passEnd) break;
+        if (base + r.lastOffsetDelta() >= passEnd) return base > dirtyStart ? base : passEnd;
+        pos += static_cast<std::size_t>(total);
+    }
+    return passEnd;
+}
+
 int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, Offset fromOffset, Offset toOffset,
                      Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails,
                      const BoundaryHook& hook, VerdictCleanState& verdicts, Offset verdictBound, Offset verdictMarkerEnd,
@@ -814,7 +834,8 @@ bool LogCleaner::rewriteSegmentImpl(
 
             // Records at/past the clean boundary (HW / passEnd) are always kept, for
             // the next pass.  Only a batch the boundary splits gets here with such a
-            // record (a batch starting past it was copied whole above), and its kept
+            // record (a batch starting past it was copied whole above; a bounded pass
+            // splits one only when its base is at or below the dirty start), and its kept
             // records are re-framed one per batch unless the window protects it.
             if (offset >= cleanBoundaryOffset) { keep(); return; }
 
@@ -1196,6 +1217,7 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
     // whole range up to the limit.
     Offset passEnd = (latestMapped >= 0 && map.isFull()) ? latestMapped + 1 : limit;
     if (passEnd > limit) passEnd = limit;
+    passEnd = batchAlignedPassEnd(dir, sealedBases, activeBase, globalDirtyStart, passEnd);
     result.passEnd = passEnd;
 
     // Only rewrite the segment if its base is within [globalDirtyStart, passEnd).
@@ -1358,6 +1380,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
     // unkeyed, markers or aborted data — the rewrite handles them this pass).
     Offset passEnd = map.isFull() ? latestMapped + 1 : limit;
     if (passEnd > limit) passEnd = limit;
+    passEnd = batchAlignedPassEnd(dir, sealedBases, activeBase, globalDirtyStart, passEnd);
     result.passEnd = passEnd;
 
     // The in-pass segments are those whose byte range overlaps [logStart, passEnd),
@@ -1602,11 +1625,10 @@ void LogCleaner::mergeGroupWithMap(
     if (changed) *changed = false;
     if (groupInPass.empty()) return;
     if (damaged_.has_value()) return;   // uncleanable: nothing read, nothing changed
-    // D3b: never at/after the first unresolved transaction (LSO).
+    // D3b: passEnd is never at/after the first unresolved transaction (LSO) or the verdict bound (both callers cap it there).
     const TxnCleanState* txn = &map.txnState();
     VerdictCleanState* verdicts = &map.verdictState();
     const ProducerBatchWindow* window = window_ ? &*window_ : nullptr;
-    passEnd = std::min({passEnd, txn->cleanLimit(), verdicts->cleanLimit()});
     verdicts->markRemovalsBelow(passEnd);
 
     const int64_t outBase = groupInPass.front();
@@ -1746,7 +1768,8 @@ void LogCleaner::mergeGroupWithMap(
                 };
                 auto keep2 = [&]() { keepWithHorizon2(-1); };
 
-                // Records at/past the pass boundary are kept, re-framed (only a batch the boundary splits gets here).
+                // Records at/past the pass boundary are kept, re-framed (only a batch the boundary splits gets here: one
+                // whose base is at or below the dirty start, see batchAlignedPassEnd).
                 if (offset >= passEnd) { keep2(); return; }
                 if (verdicts->isRejected(offset)) { modified = true; return; }   // Part 04: a rejected record is dropped
                 if (key.empty())       { keep2(); return; }
@@ -1878,6 +1901,7 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
 
     Offset passEnd = (latestMapped >= 0 && map.isFull()) ? latestMapped + 1 : limit;
     if (passEnd > limit) passEnd = limit;
+    passEnd = batchAlignedPassEnd(dir, sealedBases, activeBase, globalDirtyStart, passEnd);
     result.passEnd = passEnd;
 
     // Determine which segments in the group fall within [globalDirtyStart, passEnd).

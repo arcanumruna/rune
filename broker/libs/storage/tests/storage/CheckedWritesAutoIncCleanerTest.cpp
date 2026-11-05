@@ -462,6 +462,31 @@ TEST(CheckedWritesAutoIncCleanerRegression, IncrementalPassesCompactWhatTheWindo
     }
 }
 
+// Fix pass 2 (known case 1): a verdict bound inside an idempotent batch no window protects (depth 1) ends the pass at the batch's
+// base.  RED: the pass ended at finalThrough 3, so the records of the batch past it were re-framed one per batch.
+TEST(CheckedWritesAutoIncCleanerRegression, BatchSplitByTheVerdictBoundIsKeptWholeRegression) {
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            change(log, 0);
+            recs(log, 1, 7, 0, {1, 2, 3, 4}, "v");   // offsets 1-4
+            marker(log, 5, 1, 3, {2});                // finalThrough 3 splits the batch
+            pad(log, 6);
+            const auto before = batches(log);
+            ASSERT_TRUE(before.count(1));
+            (void)clean(log, Pass{.depth = 1, .coalesce = coalesce});
+            const auto after = batches(log);
+            EXPECT_TRUE(after.count(1) && after.at(1) == before.at(1)) << "the split batch is kept byte for byte";
+            EXPECT_TRUE(dataOffsets(log).count(2)) << "its rejected record waits for the batch";
+            EXPECT_TRUE(after.count(5)) << "and so does the marker listing it";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
 // Fix round 1 (finding 2): the map fills inside a protected batch, so the pass boundary splits it.  RED: the batch was protected
 // only when it ended below the boundary, so the record rules ran on it and dropped its superseded first record.
 TEST(CheckedWritesAutoIncCleanerRegression, ProtectedBatchSplitByAFullMapIsKeptWholeRegression) {
