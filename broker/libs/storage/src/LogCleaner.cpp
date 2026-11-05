@@ -680,11 +680,13 @@ bool LogCleaner::rewriteSegmentImpl(
         // whole: kept records carry it, else a record-less batch does.
         const bool tailNeeded = batchIsData && tails != nullptr && batchLastOffset < cleanBoundaryOffset &&
             tails->mustRetain(origProducerId, batchLastOffset, batchMaxTs, nowMs, producerIdExpirationMs_);
-        // Part 06: a live producer's last `depth` batches are kept whole, before any record rule (aborted data still goes).
-        // A batch the boundary splits is protected too: its records at or past the boundary are kept verbatim anyway.
-        if (batchIsData && window != nullptr && batchBaseOffset < cleanBoundaryOffset &&
-            !(isTransactionalBatch(r) && txn != nullptr && txn->isAborted(origProducerId, batchBaseOffset)) &&
-            window->protects(batchBaseOffset)) {
+        // Part 06: a live producer's last `depth` batches are kept whole, before any record rule (aborted data still goes).  A
+        // batch at or past the clean boundary is kept whole whatever its producer: re-framing its records one per batch would
+        // split the batch a leader rebuilt from the log dedupes a retry against.
+        if (batchBaseOffset >= cleanBoundaryOffset ||
+            (batchIsData && window != nullptr &&
+             !(isTransactionalBatch(r) && txn != nullptr && txn->isAborted(origProducerId, batchBaseOffset)) &&
+             window->protects(batchBaseOffset))) {
             outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
                           buf.begin() + static_cast<std::ptrdiff_t>(pos + static_cast<size_t>(total)));
             pos += static_cast<size_t>(total);
@@ -1662,10 +1664,10 @@ void LogCleaner::mergeGroupWithMap(
             const bool tailNeeded = batchIsData && batchLastOffset < passEnd &&
                 map.producerTails().mustRetain(origProducerId, batchLastOffset, batchMaxTs, nowMs,
                                                producerIdExpirationMs_);
-            // Part 06 (see rewriteSegmentImpl): a protected batch is kept whole.
-            if (batchIsData && window != nullptr && batchBaseOffset < passEnd &&
-                !(isTransactionalBatch(r) && txn->isAborted(origProducerId, batchBaseOffset)) &&
-                window->protects(batchBaseOffset)) {
+            // Part 06 (see rewriteSegmentImpl): a protected batch, or one at or past the pass boundary, is kept whole.
+            if (batchBaseOffset >= passEnd ||
+                (batchIsData && window != nullptr && !(isTransactionalBatch(r) && txn->isAborted(origProducerId, batchBaseOffset)) &&
+                 window->protects(batchBaseOffset))) {
                 outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
                               buf.begin() + static_cast<std::ptrdiff_t>(pos + static_cast<size_t>(total)));
                 pos += static_cast<size_t>(total);

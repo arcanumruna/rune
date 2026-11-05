@@ -448,6 +448,35 @@ TEST(CheckedWritesAutoIncCleanerRegression, ProtectedBatchSplitByAFullMapIsKeptW
     }
 }
 
+// The verdict coverage ends inside a segment the pass rewrites, and a live producer's newest batch lies just above it.  RED: a batch
+// starting at or past the clean boundary was not protected and its records were re-framed one per batch, so a leader rebuilt from
+// the log answered the batch's retry with DuplicateSequence instead of its ack (AutoIncModel seed 10).
+TEST(CheckedWritesAutoIncCleanerRegression, LiveProducersBatchAboveTheVerdictCoverageIsKeptWholeRegression) {
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/4096);
+            log.recover();
+            change(log, 0);
+            rec(log, 1, -1, -1, 1, "old");
+            rec(log, 2, -1, -1, 1, "new");
+            marker(log, 3, 1, 3, {});                      // the verdicts cover [.., 3): the pass cleans below 3
+            recs(log, 4, 7, 0, {10, 11, 12, 13}, "v");     // offsets 4-7, producer 7's newest batch
+            rec(log, 8, -1, -1, 99, std::string(4096, 'x'));   // fills the segment
+            pad(log, 9);
+            ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 9}));
+            const auto before = batches(log);
+            ASSERT_TRUE(before.count(4));
+            (void)clean(log, Pass{.coalesce = coalesce});
+            ASSERT_FALSE(dataOffsets(log).count(1)) << "the segment was rewritten";
+            const auto after = batches(log);
+            EXPECT_TRUE(after.count(4) && after.at(4) == before.at(4)) << "the batch is kept byte for byte";
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
 // Fix round 1 (finding 4): past its budget the window records no more producers, and every batch is then protected whatever its own
 // timestamp.  RED: an unrecorded producer's batch expired on its own maxTimestamp although the producer's last batch was recent.
 TEST(CheckedWritesAutoIncCleanerRegression, OverflowedWindowProtectsAnUnrecordedProducerRegression) {
