@@ -3,7 +3,7 @@
 #
 # A test that hangs in CI is killed at its ctest timeout with nothing past its last log line: no stack, no hint of the
 # wait that never ended.  This watcher runs beside ctest and, once per process, attaches gdb to every gtest process
-# (a `--gtest_filter=` command line) older than LIMIT seconds and writes `thread apply all bt` to OUT_DIR/hang-<pid>.txt.
+# (argv[1] `--gtest_filter=...`) older than LIMIT seconds and writes `thread apply all bt` to OUT_DIR/hang-<pid>.txt.
 # The test keeps running (gdb detaches); ctest still times it out.  Print the dumps after ctest with
 #   hang-watch.sh --print OUT_DIR
 #
@@ -27,7 +27,9 @@ mkdir -p "$out"
 while true; do
     # pid, elapsed seconds, full command line of every process.
     while read -r pid secs args; do
-        case "$args" in *--gtest_filter=*) ;; *) continue ;; esac
+        # ctest runs each discovered gtest as `<binary> --gtest_filter=<name> ...`: the filter is argv[1].
+        read -r _ arg1 _ <<< "$args"
+        case "$arg1" in --gtest_filter=*) ;; *) continue ;; esac
         [ "$secs" -ge "$limit" ] || continue
         f="$out/hang-$pid.txt"
         [ -e "$f" ] && continue
