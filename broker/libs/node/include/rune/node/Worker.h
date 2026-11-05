@@ -6720,6 +6720,7 @@ private:
     /// The namespace tag of a subscription's source (its disk log, else the owned replica's ring).
     [[nodiscard]] NsTag subNsTag_(const WorkerSubscription& s) noexcept {
         auto* const rep = subReplica_(s);
+        if (rep == nullptr && s.incarnation != 0) return NsTag{};   // not owned: the op's log may already be destroyed
         return nsTagOfLog_(s.logPtr, rep != nullptr ? rep->memoryLog() : nullptr);
     }
     /// The one read-metering predicate: the hot counters of the slot a USER topic's read is charged to and paced by, or
