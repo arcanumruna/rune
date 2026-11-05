@@ -1066,17 +1066,21 @@ bool tlsTopic(ThreeNodes& c, TlsCluster& t, bool require) {
     t.spec = rc::TopicSpec{"events", def.topicId, kPartitions};
     return awaitLeaders(c, def.topicId, t.leaders, 30s);
 }
-ThreeNodes tlsNodes(const char* tag, bool require) {
+ThreeNodes tlsNodes(const char* tag, bool require, int64_t lease = 0) {
     const std::string dir = RUNE_CRYPTO_TESTDATA_DIR;
     return ThreeNodes::startWith(tag, [&](rune::node::NodeConfig& n) {
         n.tlsCertFile = dir + "/server.pem";
         n.tlsKeyFile  = dir + "/server.key";
         n.clientTransport = require ? rune::node::ClientTransport::RequireTls : rune::node::ClientTransport::TlsOptional;
+        n.testSessionTimeoutMs = lease;
     });
 }
 
 void tlsShardStallPastTheLease(const char* tag, bool require) {
-    ThreeNodes c = tlsNodes(tag, require);
+    // A 3 s broker session lease (NodeConfig::testSessionTimeoutMs) instead of the 10 s default, so
+    // the stall below outlasts it — and the client's ping timeout — in 6 s, not 13 s.
+    constexpr int64_t kLeaseMs = 3'000;   // 3× the client's 1 s keepalive: no live session lapses under load
+    ThreeNodes c = tlsNodes(tag, require, kLeaseMs);
     TlsCluster t;
     ASSERT_TRUE(tlsTopic(c, t, require));
     // An Invoker-mode shard client: its duty cycle runs only when this thread pumps it, so a
@@ -1086,7 +1090,7 @@ void tlsShardStallPastTheLease(const char* tag, bool require) {
     cfg.runnerMode = rc::RunnerMode::Invoker;
     cfg.reconnectForeverAfterLive = true;
     cfg.aeronClientLivenessTimeoutNs = 60'000'000'000LL;   // a shard client's Aeron survives the stall (it runs 1 h)
-    cfg.connectTimeoutMs = 5'000; cfg.pingTimeoutMs = 3'000;
+    cfg.connectTimeoutMs = 5'000; cfg.pingTimeoutMs = kLeaseMs;
     auto client = connectClient(c, cfg);
     rc::ProducerConfig pcfg;
     pcfg.acks = rc::Acks::All; pcfg.lingerUs = 1; pcfg.batchBytes = 1;
@@ -1126,9 +1130,9 @@ void tlsShardStallPastTheLease(const char* tag, bool require) {
     ASSERT_EQ(done.size(), 9u) << "precondition: encrypted produce works";
     for (const auto& [tk, st] : done) ASSERT_EQ(st, rc::OpStatus::Ok);
 
-    // The stall: no duty cycle for longer than the broker's session lease (10 s) — the broker reaps
+    // The stall: no duty cycle for longer than the broker's session lease (kLeaseMs) — the broker reaps
     // every session of this client and the client's own ping timeout fires on its next cycle.
-    std::this_thread::sleep_for(13s);
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseMs * 2));
     const auto tWake = Clock::now();
 
     constexpr int kAfter = 30;

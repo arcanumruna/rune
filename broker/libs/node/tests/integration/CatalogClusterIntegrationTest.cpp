@@ -234,8 +234,10 @@ struct Hooks {
 class Rig {
 public:
     /// reconnectSilent = false: the F-A guard is off (T-P2 only: it must see the broker's own expiry notice).
-    explicit Rig(ThreeNodes& c, bool reconnectSilent = true)
-        : c_(c), cl_(c.clientsDir->path / "wire"), reconnectSilent_(reconnectSilent) {
+    /// leaseNs: the brokers' session lease (NodeConfig::testSessionTimeoutMs when the cluster sets it).
+    explicit Rig(ThreeNodes& c, bool reconnectSilent = true,
+                 int64_t leaseNs = rune::gateway::ClientGateway::kDefaultSessionTimeoutNs)
+        : c_(c), cl_(c.clientsDir->path / "wire"), reconnectSilent_(reconnectSilent), leaseMargin_(leaseNs / 2) {
         cl_.keepSessionsAlive(true);
         cl_.setClientVersion(pc::kClientVersion);   // a v8 session: DDL Redirects are followed
     }
@@ -243,10 +245,10 @@ public:
 
     /// A session on broker `n` (connected once, retried while its client endpoint warms up).
     int64_t session(int n) {
-        // F-A: the gateway reaps a session silent for kDefaultSessionTimeoutNs (10 s).  A sid THIS harness left silent
-        // for half of that (a harness-observed cause, never product evidence) or that the broker said expired is
-        // reconnected - like the real client's stale-session Resuming - and counted.
-        constexpr auto kLeaseMargin = std::chrono::nanoseconds(rune::gateway::ClientGateway::kDefaultSessionTimeoutNs / 2);
+        // F-A: the gateway reaps a session silent for its lease (kDefaultSessionTimeoutNs, 10 s, unless the test sets
+        // one).  A sid THIS harness left silent for half of that (a harness-observed cause, never product evidence) or
+        // that the broker said expired is reconnected - like the real client's stale-session Resuming - and counted.
+        const std::chrono::nanoseconds kLeaseMargin = leaseMargin_;
         if (auto it = sid_.find(n); it != sid_.end()) {
             const auto silent  = cl_.silentFor(it->second);
             const bool expired = cl_.sessionExpired(it->second);
@@ -712,6 +714,7 @@ private:
     int64_t                   lastCorr_ = 0;
     bool                      placementHeld_ = false;
     bool                      reconnectSilent_ = true;   ///< F-A guard (Rig::session)
+    std::chrono::nanoseconds  leaseMargin_;              ///< half the brokers' session lease (Rig::session)
     int                       silentReconnects_ = 0;
     std::chrono::nanoseconds  silentAtSend_{0};
 };
@@ -2419,10 +2422,13 @@ struct LeaseRig {
     std::unique_ptr<Rig> rig;
     int via = -1;
     int64_t sid0 = 0;
-    explicit LeaseRig(const std::string& tag) : c(ThreeNodes::start(tag)) {}
+    // A 4 s session lease (4x the 1 s Keepalive) instead of the 10 s default: the waits below outlast it in 6 s.
+    static constexpr int64_t kLeaseMs = 4'000;
+    explicit LeaseRig(const std::string& tag)
+        : c(ThreeNodes::startWith(tag, [](NodeConfig& cfg) { cfg.testSessionTimeoutMs = kLeaseMs; })) {}
     void setUp(bool reconnectSilent = true) {
         ASSERT_TRUE(c.awaitCatalogLeader(60s));
-        rig = std::make_unique<Rig>(c, reconnectSilent);
+        rig = std::make_unique<Rig>(c, reconnectSilent, kLeaseMs * 1'000'000LL);
         const int L = c.settledLeader();
         ASSERT_GT(L, 0);
         ASSERT_NO_FATAL_FAILURE(rig->must(defineSender("ready", 1, true), "define", L));
@@ -2449,7 +2455,7 @@ TEST(CatalogClusterRegression, RigReconnectsASessionItLeftSilentPastTheLeaseRegr
     LeaseRig g("silentlease");
     ASSERT_NO_FATAL_FAILURE(g.setUp());
     const uint64_t u0 = g.unanswerable();
-    std::this_thread::sleep_for(11s);   // like an unpumped ISR wait: no Keepalive leaves this client
+    std::this_thread::sleep_for(6s);   // like an unpumped ISR wait: no Keepalive leaves this client (past the 4 s lease)
     const Answer a = g.rig->await(g.rig->sendOnly(g.via, dropSender("no_such"), g.rig->freshRid_()), 10s);
     ASSERT_TRUE(a.got) << "the probe after a silent wait was never answered (sent on the reaped session)";
     EXPECT_TRUE(a.code == cRedirect || a.code == cUnknown) << a.code;
@@ -2474,7 +2480,7 @@ TEST(CatalogClusterRegression, RigFailsWhenTheBrokerExpiresAKeptAliveSessionRegr
 TEST(CatalogClusterRegression, RigKeepsAPumpedSessionAcrossALongWaitRegression) {
     LeaseRig g("pumpedlease");
     ASSERT_NO_FATAL_FAILURE(g.setUp());
-    g.rig->pumping([] { std::this_thread::sleep_for(11s); });
+    g.rig->pumping([] { std::this_thread::sleep_for(6s); });   // past the 4 s lease
     const Answer a = g.rig->await(g.rig->sendOnly(g.via, dropSender("no_such"), g.rig->freshRid_()), 10s);
     ASSERT_TRUE(a.got);
     EXPECT_TRUE(a.code == cRedirect || a.code == cUnknown) << a.code;
@@ -2488,7 +2494,7 @@ TEST(CatalogClusterRegression, ReapedSessionIsToldSessionExpiredOnTheWireRegress
     LeaseRig g("toldexpired");
     ASSERT_NO_FATAL_FAILURE(g.setUp(/*reconnectSilent=*/false));
     g.rig->cl().keepSessionsAlive(false);   // quiet: no Keepalive - the Aeron runtime and the egress poll keep running
-    g.rig->pumping([] { std::this_thread::sleep_for(12s); });
+    g.rig->pumping([] { std::this_thread::sleep_for(6s); });   // past the 4 s lease
     EXPECT_TRUE(g.rig->cl().pollUntil([&] { return g.rig->cl().sessionExpired(g.sid0); }))
         << "the lease reap closed the session silently";
 }

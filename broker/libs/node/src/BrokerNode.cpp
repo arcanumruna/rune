@@ -2141,7 +2141,8 @@ void BrokerNode::buildGateway() {
             clientChannel,
             clientStreamId,
             nodeId,
-            rune::gateway::ClientGateway::kDefaultSessionTimeoutNs,
+            config_.testSessionTimeoutMs > 0 ? config_.testSessionTimeoutMs * 1'000'000LL   // TEST-ONLY (see NodeConfig)
+                                             : rune::gateway::ClientGateway::kDefaultSessionTimeoutNs,
             std::move(leaderViewFn),
             rune::gateway::ClientGateway::kDefaultConnectResolveTimeoutNs,
             rune::aeronutil::AeronPump{},

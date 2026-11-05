@@ -481,6 +481,7 @@ public:
     [[nodiscard]] bool securityBehind() const noexcept { return securityBehind_; }
     /// Test probe (#603): the value last shipped to the workers.
     [[nodiscard]] bool workersSecurityBehindForTest() const noexcept { return workersBehind_; }
+    [[nodiscard]] int64_t sessionTimeoutNsForTest() const noexcept { return sessionTimeoutNs_; }
     [[nodiscard]] uint64_t securityBehindRefusals() const noexcept { return securityBehindRefusals_; }
     /// Issues #15 / #111: this broker stayed stale longer than R - every authenticated / must-change-password session
     /// is told AuthUnavailable at session level (corr 0) and closed; its client reconnects to a current broker.
