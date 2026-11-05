@@ -222,8 +222,9 @@ public:
         return send(channel, stream, buf.data(), encodedLen);
     }
 
-    std::optional<pc::ProduceResponse> awaitProduceResponse(int64_t corr) {
-        for (int i = 0; i < kMaxIters; ++i) {
+    std::optional<pc::ProduceResponse> awaitProduceResponse(
+        int64_t corr, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+        for (int i = 0; i < kMaxIters && std::chrono::steady_clock::now() < deadline; ++i) {
             poll_();
             if (auto it = acks_.find(corr); it != acks_.end()) return it->second;
             pause_();
@@ -243,15 +244,29 @@ public:
                                                       int32_t partition, uint8_t acks,
                                                       const std::vector<uint8_t>& batch,
                                                       int maxAttempts = 100) {
-        for (int a = 0; a < maxAttempts; ++a) {
+        // One wall-clock cap for the whole retry loop (each attempt's own waits are capped at 5 s, so 100 attempts
+        // could outlast the ctest timeout and fail as a bare Timeout).  On failure, lastProduceFailure() names the hop.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+        lastProduceFailure_.clear();
+        for (int a = 0; a < maxAttempts && std::chrono::steady_clock::now() < deadline; ++a) {
             const int64_t c = ++corr_;
-            if (!produce(channel, stream, sessionId, c, topicId, partition, acks, batch)) continue;
-            auto ack = awaitProduceResponse(c);
+            if (!produce(channel, stream, sessionId, c, topicId, partition, acks, batch)) {
+                lastProduceFailure_ = "attempt " + std::to_string(a) + ": the Produce was never offered (" +
+                                      publicationState_(channel, stream) + ")";
+                continue;
+            }
+            auto ack = awaitProduceResponse(c, deadline);
             if (ack && ack->errorCode == 0) return ack;
+            lastProduceFailure_ = "attempt " + std::to_string(a) + ": " +
+                                  (ack ? "answered error " + std::to_string(ack->errorCode)
+                                       : "no ack (" + publicationState_(channel, stream) + ", egress images " +
+                                             std::to_string(egress_ ? egress_->imageCount() : -1) + ")");
             std::this_thread::sleep_for(std::chrono::milliseconds{20});   // leadership settling
         }
         return std::nullopt;
     }
+    /// Why the last produceUntilOk gave up (empty after a success).
+    [[nodiscard]] const std::string& lastProduceFailure() const noexcept { return lastProduceFailure_; }
 
     std::vector<PartitionInfo> metadata(const std::string& gatewayChannel, int32_t stream, int64_t sessionId) {
         pc::MetadataRequest req;
@@ -992,6 +1007,15 @@ private:
         }
     }
 
+    /// The cached publication's state for a failure message: connected or not, and its position / limit.
+    std::string publicationState_(const std::string& channel, int32_t stream) const {
+        const auto it = pubs_.find({channel, stream});
+        if (it == pubs_.end() || !it->second) return "no publication";
+        const auto& p = *it->second;
+        return std::string("publication ") + (p.isConnected() ? "connected" : "NOT connected") + ", session " +
+               std::to_string(p.sessionId()) + ", position " + std::to_string(p.position()) + ", limit " +
+               std::to_string(p.publicationLimit());
+    }
     void poll_() {
         if (!egress_) return;
         egress_->poll(assembler_.handler(), 64);
@@ -1107,6 +1131,7 @@ private:
     std::vector<ConnectedSession>                    sessions_;
     std::chrono::steady_clock::time_point            nextKeepalive_{};
     std::shared_ptr<aeron::Subscription>             egress_;
+    std::string                                      lastProduceFailure_;
     std::map<std::pair<std::string, int32_t>, std::shared_ptr<aeron::Publication>> pubs_;
     std::map<int, std::shared_ptr<aeron::ExclusivePublication>> exclusivePubs_;   // D8d: offerUntilPausedExclusive
     aeron::FragmentAssembler assembler_{[this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
