@@ -1360,3 +1360,68 @@ TEST(CheckedWritesVerdictCleanerRegression, UpwardBaseOffsetRotNeverDropsTheNewe
     }
     EXPECT_GT(lastInSegmentCases, 0) << "premise: some victim is the last batch of its segment";
 }
+
+// Fix pass 2 (S1): the owner validates each group of a pass on its own, but a pass removes a marker once the records it lists
+// are below the pass boundary, in an earlier group too.  Retention drops the front segment while group {0,1,2} is queued:
+// that group is rejected (FrontGone), so the rejected record at 2 stays.  RED: group {3,4} still installed and removed the
+// marker at 3 listing it, so the record lost its rejection.
+TEST(CheckedWritesVerdictCleanerRegression, AGroupBehindARejectedGroupOfItsPassIsRejectedRegression) {
+    namespace b = rune::protocol::batch;
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        data(log, 0, "pad0", "p");
+        change(log, 1, true);
+        data(log, 2, "k", "rejected");
+        {   // the marker over [2, 3) listing 2, already stamped with an expired delete horizon
+            const std::vector<cr::MarkerEntry> es{cr::MarkerEntry{0, 55, 1}};
+            std::vector<uint8_t> m(cr::markerBatchBytes(es.size()));
+            (void)cr::buildVerdictMarker(m, cr::MarkerHeader{2, 3, 1, 1}, es);
+            stampBase(m, 3);
+            m[b::kAttributesOffset] = uint8_t(m[b::kAttributesOffset] | b::kAttrDeleteHorizon);
+            for (int i = 0; i < 8; ++i) m[std::size_t(b::kBaseTimestampOffset + i)] = 0;
+            const uint32_t crc = rune::protocol::crc32c(m.data() + b::kAttributesOffset, m.size() - std::size_t(b::kAttributesOffset));
+            for (int i = 0; i < 4; ++i) m[std::size_t(b::kCrcOffset + i)] = uint8_t(crc >> (i * 8));
+            log.append(m, 3);
+        }
+        data(log, 4, "pad4", "p");
+        marker(log, 5, 3, 5, {});
+        for (int64_t o = 6; o < 9; ++o) data(log, o, "pad" + std::to_string(o), "p");
+        auto bases = log.segmentBaseOffsets();
+        const int64_t active = bases.back();
+        bases.pop_back();
+        uint64_t seq = 0;
+        LogCleaner cleaner;
+        cleaner.setMarkerRemovalBound(kMax);
+        cleaner.setVerdictBounds(kMax, 9);
+        cleaner.setDeferredInstall(&seq);
+        SkimpyOffsetMap map(1024);
+        const std::vector<int64_t> sizes(bases.size(), 1);
+        const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, 0, 0, 1000, map, /*coalesce=*/true,
+                                                            /*groupRollBytes=*/3, nullptr, 1'000'000);
+        ASSERT_EQ(res.groups.size(), 2u) << "precondition";
+        ASSERT_EQ(res.groups[0].bases, (std::vector<int64_t>{0, 1, 2})) << "precondition";
+        ASSERT_EQ(res.groups[1].bases, (std::vector<int64_t>{3, 4})) << "precondition";
+        const auto snap = log.ownerSealedSnapshot();
+        for (const auto& g : res.groups) {
+            std::vector<Log::CleanedMember> members;
+            for (const int64_t gb : g.bases)
+                for (const auto& si : *snap) if (si.baseOffset == gb) members.push_back({gb, si.lineage});
+            ASSERT_TRUE(log.enqueueCleanedGroup(members.data(), members.size(), g.seq, g.hasOutput, g.nextOffset,
+                                                g.hasOutput ? log.openCleanedOutput(g.bases.front(), g.seq, g.nextOffset).release() : nullptr,
+                                                uint32_t(res.groups.front().seq)));
+        }
+        ASSERT_TRUE(log.enqueueDeletedSegment(0));
+        ASSERT_EQ(log.drainRetentionDeletes(), 1) << "precondition";
+        log.runCleanerFileOps(0);
+        for (int i = 0; i < 2; ++i) {   // one group per drain
+            log.drainCleanerSwaps();
+            log.runCleanerFileOps(0);
+        }
+        EXPECT_EQ(log.cleanerGroupsRejected(), 2u) << "the group behind the rejected one is rejected too";
+        EXPECT_TRUE(dataOffsets(log).count(2)) << "precondition: the rejected record stays";
+        EXPECT_TRUE(hasBatchAt(log, 3)) << "the marker listing the rejected record was removed";
+    }
+    std::filesystem::remove_all(dir);
+}

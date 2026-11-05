@@ -800,7 +800,8 @@ public:
             }
             const bool opened = !g.hasOutput || prebuilt != nullptr;
             if (!opened || !best.log->enqueueCleanedGroup(scratchMembers_.data(), n, g.seq, g.hasOutput,
-                                                          g.nextOffset, prebuilt.get())) {
+                                                          g.nextOffset, prebuilt.get(),
+                                                          static_cast<uint32_t>(passResult.groups.front().seq))) {
                 // Ring full: discard this and every later output (the originals are
                 // untouched) — the segments stay dirty and are redone next cycle.
                 for (std::size_t gj = gi; gj < passResult.groups.size(); ++gj) {

@@ -819,7 +819,8 @@ public:
             auto prebuilt = g.hasOutput ? log->openCleanedOutput(g.bases.front(), g.seq, g.nextOffset) : nullptr;
             bool queued = false;
             for (int tries = 0; !queued && tries < kMaxPass; ++tries) {   // a full swap ring (256 slots) is drained by the owner, one group per call
-                queued = log->enqueueCleanedGroup(members.data(), members.size(), g.seq, g.hasOutput, g.nextOffset, prebuilt.get());
+                queued = log->enqueueCleanedGroup(members.data(), members.size(), g.seq, g.hasOutput, g.nextOffset, prebuilt.get(),
+                                                  static_cast<uint32_t>(res.groups.front().seq));
                 if (!queued) out.installed += replica->drainCleanerSwapsOnOwner();
             }
             EXPECT_TRUE(queued);

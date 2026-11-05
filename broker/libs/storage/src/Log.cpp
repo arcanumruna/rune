@@ -2461,6 +2461,7 @@ bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBo
     auto reject = [&](RejectReason why) {
         ++cleanerGroupsRejected_;
         if (b1 < cleanerRejectLowWater_) cleanerRejectLowWater_ = b1;
+        if (head.pass != 0) cleanerRejectedPass_ = head.pass;
         // N4-LOW-3: no logging on the duty pass — the reason travels with the
         // rejection and the cleaner logs it (cold, its own thread).
         CleanerMsg m;
@@ -2470,6 +2471,7 @@ bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBo
         return false;
     };
     // ---- validate (metadata only)
+    if (head.pass != 0 && head.pass == cleanerRejectedPass_) return reject(RejectReason::PassRejected);
     auto it = segments_.find(b1);
     if (it == segments_.end()) return reject(RejectReason::FrontGone);
     auto cur = it;
@@ -2858,7 +2860,7 @@ bool Log::enqueueCleanedSegment(int64_t base, uint64_t lineage) noexcept {
 }
 
 bool Log::enqueueCleanedGroup(const CleanedMember* members, std::size_t n, uint64_t seq,
-                              bool hasOutput, int64_t nextOffset, LogSegment* prebuilt) noexcept {
+                              bool hasOutput, int64_t nextOffset, LogSegment* prebuilt, uint32_t pass) noexcept {
     // Fix round 2: a deferred compaction output.  Bounded by the cleaner
     // (LogCleaner::kMaxDeferredGroupMembers); the slots live in a fixed scratch
     // array — no allocation on the cleaner side either.
@@ -2868,7 +2870,7 @@ bool Log::enqueueCleanedGroup(const CleanedMember* members, std::size_t n, uint6
     for (std::size_t k = 0; k < n; ++k)
         refs[k] = SegRef{members[k].base, members[k].lineage, k == 0 ? nextOffset : 0,
                          static_cast<uint32_t>(seq), static_cast<uint16_t>(k == 0 ? n : 0), hasOutput,
-                         k == 0 ? prebuilt : nullptr};
+                         k == 0 ? prebuilt : nullptr, k == 0 ? pass : 0};
     // groupSize 0 marks a legacy entry: non-first members are never read alone
     // (the drain consumes the whole group from its first slot).
     return enqueueSwapSlots_(refs.data(), n);
