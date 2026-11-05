@@ -5,6 +5,8 @@
 #include <memory>
 #include <span>
 #include <vector>
+#include <cassert>
+#include <rune/view/ViewKey.h>
 #include <rune/view/ViewRow.h>
 
 namespace rune::view {
@@ -79,6 +81,20 @@ namespace rune::view {
 // ARE the growth path. get() never allocates. The row-id free-list only
 // grows (via erase()) so its own push_back() never (re)allocates once
 // reserve()'d.
+//
+// Wide keys (Part 07): a key of keyWidth > 8 bytes is stored in a header in front of its row
+// (`[key][payload]`, the payload is the RowLayout row) and the index slot word is its seeded wyhash, so the
+// 13-byte slot (tag, word, rid) is the same as the narrow one.  A probe matches tag, then word, then the header
+// key; backshift and migration take the home from the stored word and never read the arena.  A narrow key
+// (keyWidth <= 8) is the slot word itself, as before; `hashSeed` is XORed in before `mix()` (seed 0 = the
+// original index).
+struct ViewTableKeys {
+    uint8_t  keyWidth = 8;
+    uint8_t  prefixWidth = 0;
+    uint64_t hashSeed = 0;
+    uint64_t hashMaskForTest = ~uint64_t{0};   // AND-ed into every hash; 0 makes every key collide
+};
+
 class ViewTable {
 public:
     // `initialIndexSlots` must be a power of two (capacity of the
@@ -87,20 +103,40 @@ public:
     // `floor_pow2(chunkBytes / layout.rowLen)`, clamped to a minimum of 1
     // row per chunk (e.g. when a single row is wider than `chunkBytes`).
     explicit ViewTable(RowLayout layout, size_t initialIndexSlots = 4096,
-                        size_t chunkBytes = 32u << 20);
+                        size_t chunkBytes = 32u << 20, ViewTableKeys keys = {});
 
     // Returns a writable pointer to the row for `key`. Inserts a zeroed row
     // on first use. Idempotent: calling put() again for an existing key
     // returns that same row's pointer without creating a duplicate entry.
+    // The uint64_t API needs keyWidth <= 8 and no prefix (a prefix table takes the prefix from the key bytes).
     uint8_t* put(uint64_t key);
+    uint8_t* put(const ViewKey& key);   // key.len == keyWidth
 
     // Returns a pointer to the row for `key`, or nullptr if absent.
     const uint8_t* get(uint64_t key) const noexcept;
+    const uint8_t* get(const ViewKey& key) const noexcept;
 
     // Removes `key`. Returns false if `key` was not present. O(1):
     // backward-shift in the index, the row-id returned to the free-list;
     // the row payload itself is left untouched (no tombstone, no move).
     bool erase(uint64_t key) noexcept;
+    bool erase(const ViewKey& key) noexcept;
+
+    [[nodiscard]] uint8_t keyWidth() const noexcept { return keyWidth_; }
+    [[nodiscard]] uint8_t prefixWidth() const noexcept { return prefixWidth_; }
+
+    // The key stored in front of a wide row; empty for a narrow table (its key is the slot word).
+    [[nodiscard]] std::span<const uint8_t> keyOfRow(const uint8_t* payload) const noexcept {
+        return {payload - headerLen_, headerLen_};
+    }
+
+    // Header-key compares since construction, and the rids in primary-slot order.  Tests only.
+    uint64_t arenaKeyReadsForTest() const noexcept { return arenaKeyReads_; }
+    std::vector<uint32_t> slotOrderForTest() const {
+        std::vector<uint32_t> order;
+        for (size_t i = 0; i < cap_; ++i) if (tags_[i] != kEmpty) order.push_back(rid_[i]);
+        return order;
+    }
 
     size_t size() const noexcept { return sz_; }
 
@@ -113,7 +149,7 @@ public:
 
     // Namespaces Phase 2 Task 12 (D26): the row-slab memory, chunkCount x bytes per chunk.  O(1) and incremental by
     // construction (chunks only ever append), so the view set charges it without scanning.
-    size_t memoryBytes() const noexcept { return chunks_.size() * rowsPerChunk_ * static_cast<size_t>(layout_.rowLen); }
+    size_t memoryBytes() const noexcept { return chunks_.size() * rowsPerChunk_ * rowStride_; }
 
     // Task 5 test/bench hooks (Task 7's benchmark depends on these):
     //
@@ -170,10 +206,12 @@ public:
     // DeleteThenReinsertSameKeyWithinIntervalReplaysCorrectly.)
     template<class Fn>
     void drainDirty(Fn&& emit) {
+        assert(keyWidth_ <= 8 && prefixWidth_ == 0);
         for (const auto& d : deleted_) {
             emit(d.rid, nullptr, /*deleted*/true, d.key);
         }
         deleted_.clear();
+        deletedKeyBytes_.clear();
         for (uint32_t rid : dirtyList_) {
             // dirty_[rid] may have been cleared by an intervening erase()
             // (the row no longer exists) -- skip it then; the deleted_
@@ -181,6 +219,30 @@ public:
             if (!dirty_[rid]) continue;
             dirty_[rid] = 0;
             emit(rid, rowAddr(rid), /*deleted*/false, dirtyKeys_[rid]);
+        }
+        dirtyList_.clear();
+    }
+
+    // As drainDirty, but `emit(rid, payload, deleted, key)` gets the keyWidth key bytes (a narrow key is the first
+    // keyWidth little-endian bytes of the slot word).  Same order: deletes, then upserts.
+    template<class Fn>
+    void drainDirtyKeyed(Fn&& emit) {
+        for (size_t n = 0; n < deleted_.size(); ++n) {
+            const DeletedEntry& d = deleted_[n];
+            if (headerLen_) {
+                emit(d.rid, nullptr, /*deleted*/true, std::span<const uint8_t>(deletedKeyBytes_.data() + n * keyWidth_, keyWidth_));
+            } else {
+                emit(d.rid, nullptr, /*deleted*/true, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&d.key), keyWidth_));
+            }
+        }
+        deleted_.clear();
+        deletedKeyBytes_.clear();
+        for (uint32_t rid : dirtyList_) {
+            if (!dirty_[rid]) continue;
+            dirty_[rid] = 0;
+            const uint8_t* payload = rowAddr(rid);
+            emit(rid, payload, /*deleted*/false,
+                 headerLen_ ? keyOfRow(payload) : std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&dirtyKeys_[rid]), keyWidth_));
         }
         dirtyList_.clear();
     }
@@ -221,12 +283,29 @@ private:
     static uint64_t mix(uint64_t x) noexcept;
     static uint8_t  fullTag(uint64_t h) noexcept;
 
-    // Returns the PRIMARY (NEW) index slot holding `key`, or SIZE_MAX if absent.
-    size_t findP(uint64_t key) const noexcept;
+    // The hash a stored slot word was placed by: a wide word is already the hash; a narrow word is the key.
+    uint64_t hashOfWord(uint64_t word) const noexcept {
+        return headerLen_ ? word : (mix(word ^ hashSeed_) & hashMask_);
+    }
 
-    // Returns the OLD index slot holding `key`, or SIZE_MAX if absent or
+    // What an index probe looks for: the slot word, its hash, and (wide only) the key bytes to compare in the row header.
+    struct Probe { uint64_t word; uint64_t h; const uint8_t* wideKey; };
+    Probe probeOf(uint64_t narrowKey) const noexcept { return {narrowKey, hashOfWord(narrowKey), nullptr}; }
+    Probe probeOf(const ViewKey& key) const noexcept;
+
+    uint8_t*       putImpl(const Probe& p);
+    const uint8_t* getImpl(const Probe& p) const noexcept;
+    bool           eraseImpl(const Probe& p) noexcept;
+
+    // Returns the PRIMARY (NEW) index slot holding the probe's key, or SIZE_MAX if absent.
+    size_t findP(const Probe& p) const noexcept;
+
+    // Returns the OLD index slot holding the probe's key, or SIZE_MAX if absent or
     // not currently migrating. Only ever non-empty while `migrating_`.
-    size_t findO(uint64_t key) const noexcept;
+    size_t findO(const Probe& p) const noexcept;
+
+    // True if the row `rid`'s header key equals `key`.
+    bool headerKeyEquals(uint32_t rid, const uint8_t* key) const noexcept;
 
     // Backward-shift deletion (see erase()'s doc) over the PRIMARY index
     // arrays only, starting at the already-found slot `i`.
@@ -270,15 +349,22 @@ private:
     uint8_t* rowAddr(uint32_t rid) noexcept {
         auto& chunk = chunks_[static_cast<size_t>(rid) >> chunkShift_];
         const size_t inChunk = static_cast<size_t>(rid) & chunkMask_;
-        return chunk.get() + inChunk * layout_.rowLen;
+        return chunk.get() + inChunk * rowStride_ + headerLen_;
     }
     const uint8_t* rowAddr(uint32_t rid) const noexcept {
         const auto& chunk = chunks_[static_cast<size_t>(rid) >> chunkShift_];
         const size_t inChunk = static_cast<size_t>(rid) & chunkMask_;
-        return chunk.get() + inChunk * layout_.rowLen;
+        return chunk.get() + inChunk * rowStride_ + headerLen_;
     }
 
     RowLayout layout_;
+    uint8_t   keyWidth_    = 8;
+    uint8_t   prefixWidth_ = 0;
+    uint64_t  hashSeed_    = 0;
+    uint64_t  hashMask_    = ~uint64_t{0};
+    uint32_t  headerLen_   = 0;  // keyWidth_ when wide (> 8), else 0
+    size_t    rowStride_   = 0;  // headerLen_ + layout_.rowLen
+    mutable uint64_t arenaKeyReads_ = 0;
 
     std::vector<uint8_t>  tags_;   // 1-byte Swiss/F14-style tag per index slot
     std::vector<uint64_t> keys_;   // exact 8-byte key per index slot
@@ -347,6 +433,7 @@ private:
 
     struct DeletedEntry { uint32_t rid; uint64_t key; };
     std::vector<DeletedEntry> deleted_; // erase()'d {rid,key} pairs pending drainDirty()
+    std::vector<uint8_t> deletedKeyBytes_; // wide tables: keyWidth_ bytes per deleted_ entry, in the same order
 };
 
 } // namespace rune::view

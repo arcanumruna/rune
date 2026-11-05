@@ -30,7 +30,8 @@ if(BUILD_TESTING)
         tests/view/CheckedWritesPlanV2Test.cpp
         tests/view/LegacyFoldReference.cpp
         tests/view/CheckedWritesPrepareApplyTest.cpp
-        tests/view/CheckedWritesAbortedFoldMatrixTest.cpp)
+        tests/view/CheckedWritesAbortedFoldMatrixTest.cpp
+        tests/view/CheckedWritesViewTableTest.cpp)
     target_link_libraries(rune_view_tests PRIVATE rune_view rune_codec GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_view_tests)

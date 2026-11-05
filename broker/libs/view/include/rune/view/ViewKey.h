@@ -7,10 +7,12 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <cassert>
+#include <rune/codec/ViewKeyEncoding.h>
 
 namespace rune::view {
 
-inline constexpr std::size_t kMaxViewKeyBytes = 128;
+inline constexpr std::size_t kMaxViewKeyBytes = rune::codec::kMaxViewKeyBytes;
 
 struct ViewKey {
     std::array<uint8_t, kMaxViewKeyBytes> bytes{};
@@ -21,6 +23,16 @@ struct ViewKey {
         std::memcpy(k.bytes.data(), &v, 8);   // little-endian host, like every row slot
         k.len = 8;
         return k;
+    }
+    [[nodiscard]] static ViewKey fromBytes(std::span<const uint8_t> b) noexcept {
+        assert(b.size() <= kMaxViewKeyBytes);
+        ViewKey k;
+        std::memcpy(k.bytes.data(), b.data(), b.size());
+        k.len = static_cast<uint8_t>(b.size());
+        return k;
+    }
+    [[nodiscard]] bool operator==(const ViewKey& o) const noexcept {
+        return len == o.len && std::memcmp(bytes.data(), o.bytes.data(), len) == 0;
     }
     [[nodiscard]] std::span<const uint8_t> span() const noexcept { return {bytes.data(), len}; }
     // Requires len <= 8: the zero-extended little-endian load of bytes[0, len).
