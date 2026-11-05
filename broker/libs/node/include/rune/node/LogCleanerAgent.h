@@ -416,6 +416,7 @@ public:
             std::shared_ptr<const rune::storage::SealedSegmentSnapshot> snap;
             std::string                          dir;
             int64_t                              firstUncleanable = 0;
+            StalledPass                          inputs{};
         };
         Candidate best;
 
@@ -532,6 +533,11 @@ public:
                 }
             }
 
+            // A pass that ended where it started stays pointless until one of its inputs moves.
+            const StalledPass inputs{firstDirtyOffset, firstUncleanable, snap->size(), replica->cleanerVerdictBound(),
+                                     replica->cleanerVerdictMarkerEnd(), replica->cleanerMarkerRemovalBound()};
+            if (const auto stalled = stalledPasses_.find(log); stalled != stalledPasses_.end() && stalled->second == inputs) continue;
+
             // Compute byte-based dirty ratio (Kafka-exact formula §3.2).
             //
             // CP-7 bounded-range-per-pass amendment: after a partial pass,
@@ -621,6 +627,7 @@ public:
                 best.snap             = snap;
                 best.dir              = log->dir();
                 best.firstUncleanable = firstUncleanable;
+                best.inputs           = inputs;
             }
         }
 
@@ -818,6 +825,8 @@ public:
         // Advance lastCleanOffset to passEnd (MONOTONIC: forward-only, leader-only).
         // The guard also covers the ensureCheckpoint ordering hazard (a restored
         // checkpoint may already have bumped the watermark past passEnd).
+        if (leader && !damagedLog && !advance && !held && passResult.groups.empty()) stalledPasses_[best.log] = best.inputs;
+        else stalledPasses_.erase(best.log);
         if (advance) best.replica->setLastCleanOffset(passEnd);
         if (held) best.replica->setCleanerProgress(progress);
         if (advance || held) {
@@ -1102,6 +1111,11 @@ private:
             for (auto* r : view_) live = live || (r && r->isDiskBacked() && r->log() == it->first);
             it = live ? std::next(it) : checkpoints_.erase(it);
         }
+        for (auto it = stalledPasses_.begin(); it != stalledPasses_.end();) {
+            bool live = false;
+            for (auto* r : view_) live = live || (r && r->isDiskBacked() && r->log() == it->first);
+            it = live ? std::next(it) : stalledPasses_.erase(it);
+        }
         // #840: forget an uncleanable log when it is deleted or unassigned (its dir leaves the view).
         for (auto it = uncleanable_.begin(); it != uncleanable_.end();) {
             bool live = false;
@@ -1154,7 +1168,7 @@ private:
                 building_.clear();
                 viewGen_    = gen;
                 ackPending_ = true;
-                if (!checkpoints_.empty() || !uncleanable_.empty()) pruneCheckpoints_();   // Task 8 (cold)
+                if (!checkpoints_.empty() || !uncleanable_.empty() || !stalledPasses_.empty()) pruneCheckpoints_();   // Task 8 (cold)
             }
         }, 64);
         if (ackPending_ && !holdViewAckForTest_ && channel_->ack.write(reinterpret_cast<const uint8_t*>(&viewGen_), 8,
@@ -1191,6 +1205,14 @@ private:
             (void)l->runCleanerFileOps(boundaryNowMs_, r->fileDeleteDelayMs());
         }
     }
+    /// What a selected pass saw; equal to the next cycle's view of a log whose pass changed nothing, the log is left alone.
+    struct StalledPass {
+        int64_t firstDirtyOffset, firstUncleanable;
+        std::size_t sealedSegments;
+        int64_t verdictBound, verdictMarkerEnd, markerRemovalBound;
+        bool operator==(const StalledPass&) const = default;
+    };
+    std::unordered_map<const rune::storage::Log*, StalledPass> stalledPasses_;   ///< cleaner thread; one entry per stalled log
     std::unordered_set<std::string> uncleanable_;   ///< #840: dirs of damaged logs (cleaner thread; cold)
     uint64_t passesStarted_ = 0;                    ///< test seam (cleaner thread)
     uint64_t cleanedSeq_ = 0;   ///< fix round 2: unique .cleaned output names (cleaner thread)

@@ -44,6 +44,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
 #include <rune/storage/CleanerOffsetCheckpoint.h>
+#include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/OffsetMap.h>
@@ -1302,6 +1303,67 @@ TEST(CompactionCleanerAgentRegression, ADamagedLogIsNeverSelectedAgainUntilResta
         EXPECT_EQ(restarted.uncleanableLogCountForTest(), 1u);
         EXPECT_EQ(raw->lastCleanOffset(), 0);
     }
+    fs::remove_all(dir);
+}
+
+// A checked-writes log is cleanable only up to the coverage of the verdict markers in its sealed segments; the marker over the
+// newest records is still in the active segment.  Such a log stays dirty but a pass over it ends where it started, and it won
+// the filthiest-first selection every cycle: the cleaner thread spun on it and never reached another log.  The agent runs one
+// such pass, then leaves the log until its inputs change.
+TEST(CompactionCleanerAgentRegression, ALogHeldAtItsVerdictCoverageIsNotRescannedEveryCycleRegression) {
+    namespace cr = rune::storage::control_record;
+    auto dir = cp6TempDir("cp_verdict_held");
+    Log log(dir.string(), /*rollBytes=*/128);
+
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(1841, 0.0);
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    replica->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    replica->becomeLeader(1, {1});
+
+    const auto control = [&](std::vector<uint8_t> b, int64_t offset) {
+        for (int i = 0; i < 8; ++i) b[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(offset) >> (8 * i));
+        log.append(b, offset);
+    };
+    const auto change = [&](int64_t offset) {
+        const std::vector<cr::ChangeMember> members{cr::ChangeMember{7, 3, 99}};
+        std::vector<uint8_t> b(cr::changeBatchBytes(static_cast<uint16_t>(members.size())));
+        (void)cr::buildConstraintSetChange(b, 1, members);
+        control(std::move(b), offset);
+    };
+    const auto marker = [&](int64_t offset, int64_t from, int64_t through) {
+        std::vector<uint8_t> b(cr::markerBatchBytes(0));
+        (void)cr::buildVerdictMarker(b, cr::MarkerHeader{from, through, 1, 0}, {});
+        control(std::move(b), offset);
+    };
+    const auto data = [&](int64_t from, int64_t to) {
+        for (int64_t o = from; o < to; ++o) log.append(cp6Batch(o, "k" + std::to_string(o), "v"), o);
+    };
+    change(0);
+    data(1, 4);
+    marker(4, 1, 4);   // the verdicts known: [1, 4)
+    data(5, 17);       // sealed, no verdict marker over them yet
+    replica->onLeaderLogAppended();
+    ASSERT_GE(log.segmentBaseOffsets().size(), 4u);
+
+    rune::node::ReplicaRegistry registry;
+    PartitionReplica* raw = replica.get();
+    registry.add(1841, 0, std::move(replica));
+    rune::node::LogCleanerAgent agent(&registry, /*cycleBudgetBytes=*/0);
+    int64_t now = 1'000'000;
+    for (int i = 0; i < 40; ++i, now += 1'000'000) agent.doWork(now);
+    EXPECT_LE(agent.passesStartedForTest(), 2u) << "the log held at its verdict coverage was scanned again every cycle";
+    EXPECT_EQ(raw->lastCleanOffset(), 4) << "the pass cleans up to the marker's coverage, not beyond";
+
+    marker(17, 5, 17);   // the verdicts for the rest arrive
+    data(18, 30);
+    raw->onLeaderLogAppended();
+    const uint64_t before = agent.passesStartedForTest();
+    for (int i = 0; i < 5; ++i, now += 1'000'000) agent.doWork(now);
+    EXPECT_GT(agent.passesStartedForTest(), before) << "the log was not cleaned again once its inputs changed";
+    EXPECT_GT(raw->lastCleanOffset(), 4);
     fs::remove_all(dir);
 }
 

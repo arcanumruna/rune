@@ -1701,10 +1701,14 @@ void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& na
         prod.flush();
     }
 
-    ASSERT_TRUE(waitFor([&] { return col.count() >= 2 * kRecords; }, 10s)) << "delivered " << col.count();
+    // The cleaner may drop a send its remove superseded before a late subscription fetches it; the removes are never dropped.
     std::multiset<std::pair<int32_t, std::string>> got;
-    for (const Seen& s : col.seen())
-        if (s.tombstone) got.emplace(s.partition, s.key);
+    ASSERT_TRUE(waitFor([&] {
+        got.clear();
+        for (const Seen& s : col.seen())
+            if (s.tombstone) got.emplace(s.partition, s.key);
+        return got.size() >= kRecords;
+    }, 10s)) << "delivered " << got.size() << " of " << kRecords << " removes";
     EXPECT_TRUE(got == tombstones) << "every tombstone sits on the partition of its record with the same key bytes";
 
     // The cleaner skips the active segment: one tombstone per partition for a key that was never written (the segment is
