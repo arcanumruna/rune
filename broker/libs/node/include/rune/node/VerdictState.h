@@ -75,9 +75,9 @@ public:
     static constexpr std::size_t kCapacity = 1024;
 
     /// False: the ledger is full (emission waits) - the marker is in the log all the same, so appendedThrough counts it.  A marker
-    /// at or below an offset already seen is ignored (idempotent).
+    /// at or below an offset already seen, a left-out one included, is ignored (idempotent: a scan re-feed never moves left_ back).
     [[nodiscard]] bool onMarker(int64_t markerOffset, int64_t finalThrough) noexcept {
-        if (markerOffset < committedEnd_ || (count_ != 0 && markerOffset <= at_(count_ - 1).offset)) return true;
+        if (markerOffset < committedEnd_ || markerOffset <= left_.offset || (count_ != 0 && markerOffset <= at_(count_ - 1).offset)) return true;
         appended_ = std::max(appended_, finalThrough);
         if (count_ == kCapacity) {
             left_ = Slot{markerOffset, std::max(left_.finalThrough, finalThrough)};
@@ -100,7 +100,7 @@ public:
     [[nodiscard]] int64_t appendedThrough() const noexcept { return appended_; }
     void truncateFrom(int64_t offset) noexcept {
         while (count_ != 0 && at_(count_ - 1).offset >= offset) --count_;
-        if (left_.offset >= offset) left_ = Slot{};   // a cut at or below the last marker left out: forget them all (re-marks more)
+        if (left_.offset >= offset) left_ = Slot{-1, 0};   // a cut at or below the last marker left out: forget them all (re-marks more)
         appended_ = std::max(committed_, left_.finalThrough);
         for (std::size_t i = 0; i < count_; ++i) appended_ = std::max(appended_, at_(i).finalThrough);
     }
@@ -111,7 +111,7 @@ private:
     std::array<Slot, kCapacity> ring_{};
     std::size_t head_ = 0, count_ = 0;
     int64_t committed_ = 0, committedEnd_ = 0, appended_ = 0;
-    Slot left_;   // the markers a full ring left out: the last one's offset, the highest finalThrough
+    Slot left_{-1, 0};   // the markers a full ring left out: the last one's offset (-1 = none), the highest finalThrough
 };
 
 struct VerdictSourceStats {
