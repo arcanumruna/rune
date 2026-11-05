@@ -225,10 +225,17 @@ TEST(ClientResponseEgressRegression, SeedConnectRidesTheResponsePublication) {
 TEST(ClientResponseEgressRegression, WorkerBindIsTheFirstFrameOnEveryWorker) {
     Options o;
     o.partitions = 2;
+    o.fakeClock  = true;
     Rig r(4110, 4111, o);
     const auto w0 = r.addWorker(0, 4112);
     const auto w1 = r.addWorker(1, 4113);
+    // The duty clock is frozen before the binds go out: an ack slower than kBindRetryNs (a loaded host) must not show up
+    // as a lost-datagram resend among the frames this test counts (CI: a third bind, frames[i] == 86).
+    r.client.testHoldWorkerBinds(true);
     ASSERT_TRUE(r.connect());
+    g_fakeNowNs   = steadyNs() + g_clockOffsetNs;
+    g_clockFrozen = true;
+    r.client.testHoldWorkerBinds(false);
     ASSERT_TRUE(r.drive([&] { return r.gw.binds.size() == 2; })) << "binds sent: " << r.gw.binds.size();
     const int64_t sid = r.gw.binds[0].sessionId;
     ASSERT_NE(r.gw.bindTokens.count(sid), 0u);
