@@ -954,21 +954,30 @@ int ackOrErrorCode(ShardTestClient& c, int64_t corr, std::chrono::milliseconds w
 }
 
 /// Produce (Op::ProduceRouted): the legacy gateway-routed path - a Produce frame to broker `node`'s gateway client channel.
-int gatewayProduce(AuthTrio& t, UserSessions& u, int node, int32_t topic, int32_t part) {
+/// Send only: its correlation id, or -1 when the frame could not be offered.
+int64_t sendGatewayProduce(AuthTrio& t, UserSessions& u, int node, int32_t topic, int32_t part) {
     auto& c = u.w->raw();
     const int64_t corr = c.nextCorrelationId();
     if (!c.produce(t.channel(node), AuthWireClient::kClientStream, u.sid[static_cast<std::size_t>(node - 1)], corr, topic, part, 1, makeCharBatch(1)))
-        return kNoAnswer;
-    return ackOrErrorCode(c, corr, 5s);
+        return -1;
+    return corr;
+}
+int gatewayProduce(AuthTrio& t, UserSessions& u, int node, int32_t topic, int32_t part) {
+    const int64_t corr = sendGatewayProduce(t, u, node, topic, part);
+    return corr < 0 ? kNoAnswer : ackOrErrorCode(u.w->raw(), corr, 5s);
 }
 /// Produce (Op::Produce): the shard-mode path - straight to the owning worker's ingress (the endpoint / stream the
 /// broker advertises in its metadata), bypassing the gateway; the worker's WRITE bitmap decides.
-int shardProduce(UserSessions& u, int node, const PartitionInfo& pi, int32_t topic) {
+int64_t sendShardProduce(UserSessions& u, int node, const PartitionInfo& pi, int32_t topic) {
     auto& c = u.w->raw();
     const int64_t corr = c.nextCorrelationId();
     if (!c.produce("aeron:udp?endpoint=" + pi.ingressEndpoint, pi.ingressStreamId, u.sid[static_cast<std::size_t>(node - 1)], corr, topic, pi.partition, 1, makeCharBatch(1)))
-        return kNoAnswer;
-    return ackOrErrorCode(c, corr, 5s);
+        return -1;
+    return corr;
+}
+int shardProduce(UserSessions& u, int node, const PartitionInfo& pi, int32_t topic) {
+    const int64_t corr = sendShardProduce(u, node, pi, topic);
+    return corr < 0 ? kNoAnswer : ackOrErrorCode(u.w->raw(), corr, 5s);
 }
 
 /// DDL ops as the user: sent to `via`, the other brokers on Redirect / NotLeader.  `seq` makes every attempt's object new.
@@ -1710,8 +1719,17 @@ TEST(AuthClusterRegression, AFollowerStuckBehindARevokeEndsTheSessionWithinTheSt
                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - revokedAt).count()));
     EXPECT_FALSE(t.node(s.f).gatewayHasSessionForTest(live.sid));
     const int64_t leo = partitionLeo(&t.node(s.f), s.led.id, s.part);
-    EXPECT_NE(gatewayProduce(t, s.u, s.f, s.led.id, s.part), 0) << "the ended session's produce (routed)";
-    EXPECT_NE(shardProduce(s.u, s.f, s.ingress, s.led.id), 0) << "the ended session's produce (worker ingress)";
+    {   // #883: both produces in flight at once - each gets its full 5 s answer window, the windows overlap.
+        const auto sentAt = Clock3::now();
+        const int64_t routed = sendGatewayProduce(t, s.u, s.f, s.led.id, s.part);
+        const int64_t direct = sendShardProduce(s.u, s.f, s.ingress, s.led.id);
+        auto& c = s.u.w->raw();
+        const int routedCode = routed < 0 ? kNoAnswer : ackOrErrorCode(c, routed, 5s);
+        const auto rest = std::chrono::duration_cast<std::chrono::milliseconds>(sentAt + 5s - Clock3::now());
+        const int directCode = direct < 0 ? kNoAnswer : ackOrErrorCode(c, direct, std::max(rest, std::chrono::milliseconds(1)));
+        EXPECT_NE(routedCode, 0) << "the ended session's produce (routed)";
+        EXPECT_NE(directCode, 0) << "the ended session's produce (worker ingress)";
+    }
     EXPECT_EQ(partitionLeo(&t.node(s.f), s.led.id, s.part), leo) << "F appended for the ended session";
     EXPECT_EQ(loginCode(t, s.f, "lagw"), kAuthUnavailable) << "a lagging F serves no login";
     EXPECT_EQ(t.node(s.f).securityViewForTest().appliedOffset, s.appliedBefore) << "the hold held for the whole window";
