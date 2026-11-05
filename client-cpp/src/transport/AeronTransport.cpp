@@ -1019,6 +1019,8 @@ void AeronTransport::startEmbeddedDriver() {
     aeron_driver_context_set_term_buffer_length(
         driverCtx_, static_cast<uint64_t>(cfg_.termBufferLength));
     aeron_driver_context_set_mtu_length(driverCtx_, cfg_.mtuLength);
+    if (cfg_.driverCountersBytes != 0)
+        aeron_driver_context_set_counters_buffer_length(driverCtx_, cfg_.driverCountersBytes);
     if (cfg_.udpGso) {
         gso_ = rune_gso_bindings_create(1, 1);   // NULL off Linux / unsupported kernel -> stock Aeron
         if (gso_ != nullptr && gsoInjectCount_ > 0) rune_gso_bindings_test_inject(gso_, gsoInjectErr_, gsoInjectCount_);
