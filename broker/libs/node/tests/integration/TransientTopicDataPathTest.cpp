@@ -741,6 +741,11 @@ struct GroupCluster {
         return defineTt(std::move(up), PersistenceMode::Transient, rf, partitions);
     }
     void stop(int i) { if (nodes[i]) { nodes[i]->stop(); nodes[i].reset(); } }
+    /// End every live controller's user-decision hold now (MetadataService::releaseUserDecisionHoldForTest).
+    void releaseHold() {
+        for (auto& n : nodes)
+            if (n) (void)n->onControlThreadForTest([&n] { n->metadataServiceForTest()->releaseUserDecisionHoldForTest(); return 0; });
+    }
     int liveNode() const { for (int i = 0; i < 3; ++i) if (nodes[i]) return i; return -1; }
     /// The consensus leader (the group coordinator) as a live node sees it.
     int coordinator() {
@@ -1021,32 +1026,25 @@ TEST(TransientLineageClusterRegression, StaggeredFullRestartWithTheOldLeaderLast
     // The restarted controller decides no USER partition for a while (test
     // hold): P's committed leadership stays the dead (L, E), exactly as when
     // its failover / bump is decided on a later tick.
-    // Isolation fix (2026-10-15, found once the suite ran in parallel): the hold starts when each restarted
-    // controller boots, so it lasts until at least holdStart + holdMs.  The sampling below must stay inside
-    // that window — before, a loaded host (ctest -j) took longer than the 6 s hold to collect 150 answers and
-    // the last few, served after the hold legitimately decided P, read as "an answer other than NotLeader".
-    // The window is now explicit (sampling ends 500 ms before the earliest possible hold end) and 10 s wide
-    // so >= 100 answers fit even under load.
-    // TSan (#622): restarting the two nodes alone took ~9.6 s, so a 10 s hold left no window at all (0 answers).
-    // 30 s covers the restart plus >= 100 answers at sanitizer speed; the final settledFetch (>= 30 s of retries)
-    // absorbs whatever hold is left once the old leader returns.
-    g.holdMs = 30'000;
-    const auto holdStart = std::chrono::steady_clock::now();
-    const auto sampleUntil = holdStart + std::chrono::milliseconds{g.holdMs} - 500ms;
+    // History: a wall-clock hold made the sampling race the hold's end on a loaded host (2026-10-15) and under TSan
+    // (#622, a 30 s hold).  #883: the hold now lasts until the test releases it (releaseHold, after the old leader is
+    // back), so every sampled answer is served inside the hold by construction and nothing waits a window out.
+    // 10 min is "until released" (a hard cap only).
+    g.holdMs = 600'000;
+    const auto sampleCap = std::chrono::steady_clock::now() + 120s;   // fail, never hang
     for (int i = 0; i < 3; ++i) if (i != leader) g.start(i);   // the old partition leader stays down
     // The window: P's committed leadership is still the dead (L, E) — no clean
     // leader exists while L is down.  Ask repeatedly (as a rejoining member does).
     std::vector<std::pair<int64_t, int16_t>> answers;   // the coordinator's served answers (OK / NotLeader)
-    for (int k = 0; k < 4000 && answers.size() < 150 && std::chrono::steady_clock::now() < sampleUntil; ++k) {
+    for (int k = 0; k < 4000 && answers.size() < 150 && std::chrono::steady_clock::now() < sampleCap; ++k) {
         const int coord = g.coordinator();
         if (coord < 0) continue;
         const int64_t sid = c.connect(gatewayChannel(g.ports, coord), kClientStream);
         if (sid <= 0) { std::this_thread::sleep_for(25ms); continue; }
         const auto r = c.offsetFetch(gatewayChannel(g.ports, coord), kClientStream, sid, "lg-stagger", 0, 0);
-        if (std::chrono::steady_clock::now() >= sampleUntil) break;   // answered past the guaranteed window
         // NotCoordinator: the coordinator is not ready yet (it does not answer offsets).
         if (r && (r->second == kOffsetOk || r->second == kOffsetNotLeader)) answers.push_back(*r);
-        std::this_thread::sleep_for(25ms);   // the client's retry pacing (poll interval)
+        std::this_thread::sleep_for(5ms);   // sampling pace: every sample is inside the hold, none needs spacing
     }
     ASSERT_GE(answers.size(), 100u) << "the coordinator answered too rarely to cover the window";
     int pendingN = 0;
@@ -1062,6 +1060,7 @@ TEST(TransientLineageClusterRegression, StaggeredFullRestartWithTheOldLeaderLast
     // a NEW lineage -> -1 (never the old offset).
     g.holdMs = 0;
     g.start(leader);
+    g.releaseHold();   // as when the old wall-clock hold ran out after the old leader returned
     EXPECT_EQ(settledFetch(g, c, "lg-stagger", nullptr), -1)
         << "after the old leader returned, the offset of the ring's previous life was not answered as none";
     std::printf("[lineage staggered restart] %zu answer(s) while the old leader was down, %d pending\n",
