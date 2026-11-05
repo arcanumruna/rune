@@ -12,9 +12,11 @@
 // Expiry is ProducerTails': a producer whose last batch's maxTimestamp is older than nowMs - expirationMs is not protected (nowMs < 0
 // never expires); finish() drops it.  The ring holds each batch's position only, and finish() reads the keys of the batches it
 // keeps.  Memory is bounded by a byte budget (the cleaner gives it the share of its dedupe budget ProducerTails gets).  A charge past
-// it first evicts the producers already expired at the pass's clock, keeping only their ids (8 bytes each): one of them seen again
-// later in the scan could be live, so that overflows.  Past the budget the window is OVERFLOWED and conservative - every data batch
-// protected, every tombstone pinned, the watermark held (lowestProtectedBase).
+// it first evicts the producers that look expired so far in the scan, keeping only their ids (8 bytes each).  One of them seen again
+// later is taken back with a fresh, PARTIAL ring: at finish() it is dropped if expired, exact once its ring holds `depth` batches
+// (the evicted ones are older than its window), and only a live one short of `depth` overflows - an evicted batch may be in its
+// window.  Past the budget the window is OVERFLOWED and conservative - every data batch protected, every tombstone pinned, the
+// watermark held (lowestProtectedBase).
 //
 // The cleaner keeps its watermark at or below lowestProtectedBase(): a protected batch and the records superseding it stay in the
 // dirty range until the pass that releases it, so a protected insert and its tombstone go in the same pass.
@@ -66,9 +68,15 @@ public:
         if (overflowed_) return;
         auto it = producers_.find(producerId);
         if (it == producers_.end()) {
-            if (std::binary_search(evicted_.begin(), evicted_.end(), producerId)) { overflow(); return; }
+            const auto ev = std::lower_bound(evicted_.begin(), evicted_.end(), producerId);
+            const bool partial = ev != evicted_.end() && *ev == producerId;
+            if (partial) {
+                evicted_.erase(ev);
+                bytes_ -= sizeof(int64_t);
+            }
             if (!charge(kBytesPerProducer, producerId)) return;
             it = producers_.emplace(producerId, Producer{}).first;
+            it->second.partial = partial;
         }
         Producer& p = it->second;
         const Batch b{baseOffset, lastOffset, segBase, pos};
@@ -86,8 +94,16 @@ public:
     /// cannot read it (the window then overflows).
     template <class ReadKeys>
     void finish(ReadKeys&& readKeys) {
-        for (const auto& [pid, p] : producers_)
-            if (!expired(p.lastMaxTs)) batches_.insert(batches_.end(), p.ring.begin(), p.ring.end());
+        bool unrecorded = false;   // a live producer taken back short of `depth` batches
+        for (const auto& [pid, p] : producers_) {
+            if (expired(p.lastMaxTs)) continue;
+            if (p.partial && p.ring.size() < depth_) { unrecorded = true; break; }
+            batches_.insert(batches_.end(), p.ring.begin(), p.ring.end());
+        }
+        if (unrecorded) {
+            overflow();
+            return;
+        }
         producers_.clear();
         evicted_.clear();
         std::sort(batches_.begin(), batches_.end(), [](const Batch& a, const Batch& b) { return a.base < b.base; });
@@ -134,7 +150,7 @@ public:
 
 private:
     struct Batch { int64_t base, last, segBase; std::size_t pos; };
-    struct Producer { std::vector<Batch> ring; std::size_t head = 0; int64_t lastMaxTs = 0; };
+    struct Producer { std::vector<Batch> ring; std::size_t head = 0; int64_t lastMaxTs = 0; bool partial = false; };
 
     bool expired(int64_t maxTimestampMs) const noexcept {
         return nowMs_ >= 0 && expirationMs_ >= 0 && toEpochMs(maxTimestampMs) < nowMs_ - expirationMs_;

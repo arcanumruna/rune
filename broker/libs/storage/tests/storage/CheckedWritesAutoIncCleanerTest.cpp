@@ -100,11 +100,12 @@ bool clean(Log& log, const Pass& p) {
     SkimpyOffsetMap map(p.mapSlots);
     const auto res = cleaner.produceCleanedRangeBounded(log.dir(), bases, sizes, active, p.dirty ? *p.dirty : 0, 0, p.retentionMs, map, p.coalesce,
                                                         1 << 20, nullptr, p.nowMs);
+    const int64_t progress = p.progress ? std::max(*p.progress, res.cleanedThrough) : res.cleanedThrough;
     if (p.dirty && res.passEnd > *p.dirty) {
         *p.dirty = res.passEnd;
         if (p.progress) *p.progress = res.passEnd;
     }
-    if (p.progress && res.cleanedThrough > std::max(res.passEnd, *p.dirty)) *p.progress = res.cleanedThrough;
+    if (p.progress && progress > std::max(res.passEnd, *p.dirty)) *p.progress = progress;
     log.reloadSegments();
     return cleaner.producerBatchWindowForTest() != nullptr;
 }
@@ -586,15 +587,6 @@ TEST(CheckedWritesAutoIncCleanerRegression, ManyExpiredProducersDoNotOverflowThe
         EXPECT_FALSE(w.protects(0));
         EXPECT_LE(w.bytes(), 64u * 1024);
     }
-    {
-        using rune::storage::ProducerBatchWindow;
-        ProducerBatchWindow w(32);
-        w.begin(ProducerBatchWindow::kBytesPerProducer + 64, now, exp);
-        w.noteBatch(8, 0, 0, 2000, 0, 0);   // expired
-        w.noteBatch(7, 1, 1, now, 1, 0);    // evicts 8
-        w.noteBatch(8, 2, 2, now, 2, 0);    // 8 again: it may be live
-        EXPECT_TRUE(w.overflowed()) << "an evicted producer seen again overflows";
-    }
     for (const bool coalesce : {false, true}) {
         SCOPED_TRACE(name(coalesce));
         const auto dir = tempDir();
@@ -612,6 +604,83 @@ TEST(CheckedWritesAutoIncCleanerRegression, ManyExpiredProducersDoNotOverflowThe
             const auto offs = dataOffsets(log);
             for (int64_t o = 0; o < 10; ++o) EXPECT_FALSE(offs.count(o)) << "superseded insert at " << o;
             EXPECT_TRUE(offs.count(kExpired + 10));
+        }
+        std::filesystem::remove_all(dir);
+    }
+}
+
+// Fix round 3 (N1): a producer evicted while it only looked expired is taken back when it writes again - dropped at finish() if it
+// expired after all, exact once it has `depth` batches since, and overflowing only while live and short of them.  RED: the next
+// batch of any evicted producer overflowed the window, so long-lived or interleaved producers froze compaction on every pass.
+TEST(CheckedWritesAutoIncCleanerRegression, EvictedProducerWritingAgainIsTakenBackRegression) {
+    using rune::storage::ProducerBatchWindow;
+    const int64_t exp = rune::storage::ProducerTails::kDefaultExpirationMs;
+    const int64_t now = 10'000 + exp;
+    const auto keys = [](int64_t, std::size_t, std::vector<uint64_t>& k) { k.push_back(1); return true; };
+    // Depth 2.  8 and 9 (one batch each) leave no room for 7 and only look expired so far, so both are evicted; 7 and 8 with two
+    // batches each then fit the budget exactly.
+    ASSERT_EQ(ProducerBatchWindow::kBytesPerProducer, 64u);
+    const auto feed = [&](ProducerBatchWindow& w) {
+        w.begin(232, now, exp);
+        w.noteBatch(8, 0, 0, 2000, 0, 0);
+        w.noteBatch(9, 1, 1, 2000, 1, 0);
+        w.noteBatch(7, 2, 2, now, 2, 0);
+    };
+    {
+        ProducerBatchWindow w(2);
+        feed(w);
+        w.noteBatch(8, 3, 3, now, 3, 0);
+        w.noteBatch(8, 4, 4, now, 4, 0);
+        EXPECT_FALSE(w.overflowed()) << "8 is taken back";
+        w.finish(keys);
+        EXPECT_FALSE(w.overflowed()) << "8's last two batches are both since it was taken back";
+        EXPECT_TRUE(w.protects(3) && w.protects(4) && w.protects(2));
+        EXPECT_FALSE(w.protects(0));
+    }
+    {
+        ProducerBatchWindow w(2);
+        feed(w);
+        w.noteBatch(8, 3, 3, 2500, 3, 0);
+        w.finish(keys);
+        EXPECT_FALSE(w.overflowed()) << "8 expired after all: dropped";
+        EXPECT_FALSE(w.protects(3));
+    }
+    {
+        ProducerBatchWindow w(2);
+        feed(w);
+        w.noteBatch(8, 3, 3, now, 3, 0);
+        EXPECT_FALSE(w.overflowed());
+        w.finish(keys);
+        EXPECT_TRUE(w.overflowed()) << "8 is live with one batch since: its evicted batch may be in its window";
+    }
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);
+            log.recover();
+            constexpr int kN = 800;   // 800 producers: past the 64 KiB window
+            rec(log, 0, 7, 0, 5000, "old");   // the live producer's first batch, long before the rest
+            for (int i = 0; i < kN; ++i) rec(log, 1 + i, 1000 + i, 0, uint64_t(i), "insert");
+            for (int i = 0; i < kN; ++i) rec(log, 1 + kN + i, 1000 + i, 1, uint64_t(i), "again");   // each writes again, interleaved
+            int64_t off = 1 + 2 * kN;
+            int32_t seq7 = 1;
+            for (int i = 0; i < 32; ++i, ++off) rec(log, off, 7, seq7++, 6000 + uint64_t(i), "live", now);
+            pad(log, off++);
+            int64_t dirty = 0, progress = 0;
+            const Pass pass{.nowMs = now, .coalesce = coalesce, .mapSlots = 4096, .dirty = &dirty, .progress = &progress};
+            ASSERT_TRUE(clean(log, pass));
+            EXPECT_EQ(dirty, 1 + 2 * kN) << "the watermark moves up to the live producer's last 32";
+            auto offs = dataOffsets(log);
+            for (int64_t o = 1; o <= kN; ++o) EXPECT_FALSE(offs.count(o)) << "superseded insert at " << o;
+            const int64_t second = off;
+            for (int i = 0; i < 32; ++i, ++off) rec(log, off, 7, seq7++, 7000 + uint64_t(i), "live", now);
+            for (int i = 0; i < 10; ++i, ++off) rec(log, off, -1, -1, 6000 + uint64_t(i), "update");
+            pad(log, off++);
+            (void)clean(log, pass);
+            EXPECT_EQ(dirty, second) << "and on with it on the next pass";
+            offs = dataOffsets(log);
+            for (int64_t o = 1 + 2 * kN; o < 1 + 2 * kN + 10; ++o) EXPECT_FALSE(offs.count(o)) << "released, superseded batch at " << o;
         }
         std::filesystem::remove_all(dir);
     }

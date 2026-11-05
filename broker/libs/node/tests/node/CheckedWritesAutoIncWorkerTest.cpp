@@ -860,8 +860,6 @@ TEST(CheckedWritesAutoIncCleanerRegression, HighestIdDeletedAndCompactedIsNeverR
     EXPECT_TRUE(r.hasRow(kProj, 45));
 }
 
-// Task 10 (section 15): the ack of a key-0 batch is lost, its ids are updated, the log is compacted and the leader fails over: the
-// retry still answers the original ids, because the protected batch kept its records.
 // Fix round 2 (M1): a restart reloads the watermark the window held (the cleaner checkpoint), and cleaning on from it never brings
 // a deleted id back.  RED (restoring where the last pass ended instead): the next passes started above id 50's insert and tombstone,
 // so the tombstone went past its horizon once the window released the insert, and the insert stayed.
@@ -899,6 +897,9 @@ TEST(CheckedWritesAutoIncCleanerRegression, RestartFromAHeldWatermarkNeverResurr
     r.driveUntilFolded(kProj, r.leo());
     EXPECT_FALSE(r.hasRow(kProj, 50)) << "a fresh projection has no row 50";
 }
+
+// Task 10 (section 15): the ack of a key-0 batch is lost, its ids are updated, the log is compacted and the leader fails over: the
+// retry still answers the original ids, because the protected batch kept its records.
 TEST(CheckedWritesAutoIncCleanerRegression, RetryAfterFailoverAndCompactionStillReturnsItsIdsRegression) {
     AutoInc g({}, false, /*rollBytes=*/1);
     VerdictRig& r = g.r;

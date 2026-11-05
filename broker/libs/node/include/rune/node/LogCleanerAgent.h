@@ -703,7 +703,8 @@ public:
         cleaner.setVerdictBounds(verdictBound, best.replica->cleanerVerdictMarkerEnd());
         // Part 06: an autoincrement partition keeps each live producer's whole retry window (ProducerBatchWindow.h).
         cleaner.setProducerTailDepth(best.replica->producerTailDepth());
-        cleaner.setPreviousPassEnd(best.replica->cleanerProgress());
+        const int64_t previousPassEnd = best.replica->cleanerProgress();
+        cleaner.setPreviousPassEnd(previousPassEnd);
         // Fix round 2 (Kafka-style): the cleaner NEVER replaces / deletes a
         // segment file — outputs go to unique .cleaned files the owner thread
         // validates and installs (Log::drainCleanerSwaps).
@@ -756,8 +757,10 @@ public:
         // ---------------------------------------------------------------
         const bool leader  = best.replica->cleanerRole() == rune::replication::Role::Leader;
         const bool advance = !damagedLog && passEnd > globalDirtyStart && leader;
-        // Part 06: the pass cleaned past the watermark a retry window held.
-        const bool held    = !damagedLog && leader && passResult.cleanedThrough > std::max(passEnd, globalDirtyStart);
+        // Part 06: the passes cleaned past the watermark a retry window held (never backwards: a pass that redid less than the last
+        // one, below a limit it reached, leaves its end).
+        const int64_t progress = std::max(previousPassEnd, passResult.cleanedThrough);
+        const bool held    = !damagedLog && leader && progress > std::max(passEnd, globalDirtyStart);
         bool allEnqueued = true;
         for (std::size_t gi = 0; gi < passResult.groups.size(); ++gi) {
             const auto& g = passResult.groups[gi];
@@ -816,7 +819,7 @@ public:
         // The guard also covers the ensureCheckpoint ordering hazard (a restored
         // checkpoint may already have bumped the watermark past passEnd).
         if (advance) best.replica->setLastCleanOffset(passEnd);
-        if (held) best.replica->setCleanerProgress(passResult.cleanedThrough);
+        if (held) best.replica->setCleanerProgress(progress);
         if (advance || held) {
             // The cleaner is the ONLY writer of the clean watermark (N-MEDIUM-1);
             // a rewind the owner published meanwhile is folded in right after,

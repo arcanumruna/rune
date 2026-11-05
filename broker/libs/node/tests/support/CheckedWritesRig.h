@@ -817,7 +817,8 @@ public:
         cleaner.setMarkerRemovalBound(replica->cleanerMarkerRemovalBound());
         cleaner.setVerdictBounds(out.bound, markerEnd);
         cleaner.setProducerTailDepth(autoInc_ ? rune::storage::kRetryWindowSize : 1);   // what BrokerNode configures the partition with
-        cleaner.setPreviousPassEnd(replica->cleanerProgress());
+        const int64_t previousPassEnd = replica->cleanerProgress();
+        cleaner.setPreviousPassEnd(previousPassEnd);
         cleaner.setDeferredInstall(&cleanedSeq_);
         rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::sizingForBudget(1 << 22));
         auto res = cleaner.produceCleanedRangeBounded(log->dir(), bases, sizes, uncleanable, dirtyStart, nowMs * 1'000'000, 1000, map, false, 1 << 20, nullptr, nowMs);
@@ -840,7 +841,8 @@ public:
             if (queued) (void)prebuilt.release();   // the owner owns it now
         }
         if (res.passEnd > dirtyStart && !cleaner.uncleanable()) replica->setLastCleanOffset(res.passEnd);
-        if (res.cleanedThrough > std::max(res.passEnd, dirtyStart) && !cleaner.uncleanable()) replica->setCleanerProgress(res.cleanedThrough);
+        const int64_t progress = std::max(previousPassEnd, res.cleanedThrough);
+        if (progress > std::max(res.passEnd, dirtyStart) && !cleaner.uncleanable()) replica->setCleanerProgress(progress);
         replica->applyCleanerRewind();
         if (drain) out.installed += drainSwaps();
         return out;

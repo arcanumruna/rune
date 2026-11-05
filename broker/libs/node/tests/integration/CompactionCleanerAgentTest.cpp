@@ -3680,3 +3680,61 @@ TEST(CompactionCleanerAgentRegression, HeldAutoIncWatermarkDoesNotStarveAnotherL
     fs::remove_all(dirA);
     fs::remove_all(dirB);
 }
+
+// Part 06 Task 10 (fix round 3): a held log whose passes reached the cleaner's own limit (an open transaction here) is still
+// selected while the agent's bound lies above it; the pass then redoes a map from the held watermark, and where the passes ended
+// stays where it was.  RED: progress fell back to that map's end and the log was swept again from the watermark.
+TEST(CompactionCleanerAgentRegression, HeldAutoIncProgressNeverMovesBackRegression) {
+    auto dir = cp6TempDir("cw06_held_progress");
+    Log log(dir.string(), /*rollBytes=*/128);
+    Cp6NullTransport transport;
+    {
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        RecordBatchBuilder b(0, nowMs);   // a live idempotent producer's only batch: holds the watermark at 0
+        b.setProducerId(77);
+        b.setProducerEpoch(0);
+        b.setBaseSequence(0);
+        b.append("idle", "v", nowMs);
+        log.append(b.build(), 0);
+    }
+    constexpr int64_t kOpenTxn = 41;
+    for (int v = 1; v < kOpenTxn; ++v) log.append(cp6Batch(v, "key_" + std::to_string(v), "v"), v);
+    {
+        RecordBatchBuilder b(kOpenTxn, 1000);   // never committed: the cleaner's limit
+        b.setProducerId(88);
+        b.setProducerEpoch(0);
+        b.setBaseSequence(0);
+        b.setTransactional(true);
+        b.append("txn", "v", 1000);
+        log.append(b.build(), kOpenTxn);
+    }
+    for (int v = kOpenTxn + 1; v < kOpenTxn + 20; ++v) log.append(cp6Batch(v, "after", "v"), v);
+
+    auto cfg = makeCompactConfig(613, 0.0);
+    cfg.producerTailDepth = rune::storage::kRetryWindowSize;
+    auto rep = std::make_unique<PartitionReplica>(cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    rep->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);   // the agent's bound lies above the open txn
+    rep->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    rep->becomeLeader(1, {1});
+    rep->onLeaderLogAppended();
+    PartitionReplica* raw = rep.get();
+    rune::node::ReplicaRegistry registry;
+    registry.add(cfg.topicId, 0, std::move(rep));
+
+    rune::node::LogCleanerAgent cleaner(&registry, /*cycleBudgetBytes=*/0,
+                                        /*dedupeBufferBytes=*/4 * static_cast<int64_t>(SkimpyOffsetMap::kEntryBytes));
+    Cp6MinimalConsensusAgent dummyAgent;
+    rune::node::NodeRuntimeAgent dutyCycleAgent(dummyAgent, nullptr, nullptr, nullptr, &registry, nullptr);
+    int64_t prev = raw->cleanerProgress();
+    for (int i = 0; i < 60; ++i) {
+        cleaner.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        for (int j = 0; j < 1000 && log.cleanerSwapsPending(); ++j) dutyCycleAgent.doWork(static_cast<int64_t>(i + 1) * 1'000'000LL);
+        ASSERT_EQ(raw->lastCleanOffset(), 0) << "the idle producer holds the watermark";
+        EXPECT_GE(raw->cleanerProgress(), prev) << "cycle " << i;
+        prev = raw->cleanerProgress();
+    }
+    EXPECT_EQ(prev, kOpenTxn) << "the passes reached the open transaction";
+
+    fs::remove_all(dir);
+}
