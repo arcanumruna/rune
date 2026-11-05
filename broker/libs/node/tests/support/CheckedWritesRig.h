@@ -452,13 +452,13 @@ public:
 
     [[nodiscard]] const uint8_t* row(int32_t viewTopicId, uint64_t key) const {
         const rune::view::RowLayout* L = nullptr;
-        return vs->getRow(viewTopicId, 0, key, L);
+        return vs->getRow(viewTopicId, tuning_.partition, key, L);
     }
     [[nodiscard]] bool hasRow(int32_t viewTopicId, uint64_t key) const { return row(viewTopicId, key) != nullptr; }
     /// A row of the projection / verdict view: (v, tag); the verdict views have no tag column (tag = 0).  nullopt = absent.
     [[nodiscard]] std::optional<std::pair<int64_t, uint16_t>> idRow(int32_t viewTopicId, uint64_t key) const {
         const rune::view::RowLayout* L = nullptr;
-        const uint8_t* r = vs->getRow(viewTopicId, 0, key, L);
+        const uint8_t* r = vs->getRow(viewTopicId, tuning_.partition, key, L);
         if (r == nullptr) return std::nullopt;
         const auto v = rune::view::readSlot(r, *L, 1);
         const uint16_t tag = L->slotOffset.size() > 2 ? static_cast<uint16_t>(rune::view::readSlot(r, *L, 2).u) : uint16_t{0};
@@ -467,7 +467,7 @@ public:
     /// The count(*) view's n for an id; nullopt = no row.
     [[nodiscard]] std::optional<int64_t> countRow(int32_t viewTopicId, uint64_t id) const {
         const rune::view::RowLayout* L = nullptr;
-        const uint8_t* r = vs->getRow(viewTopicId, 0, id, L);
+        const uint8_t* r = vs->getRow(viewTopicId, tuning_.partition, id, L);
         if (r == nullptr) return std::nullopt;
         return rune::view::readSlot(r, *L, 1).i;
     }
@@ -751,7 +751,7 @@ public:
     /// Drives until the view's instance folded through `target` (and serves).
     void driveUntilFolded(int32_t viewTopicId, int64_t target) {
         for (int iter = 0; iter < kCollectMaxPasses; ++iter) {
-            const auto st = vs->instanceServeState(viewTopicId, 0);
+            const auto st = vs->instanceServeState(viewTopicId, tuning_.partition);
             if (st.hosted && st.ready && st.foldCursor >= target) return;
             pass();
         }
@@ -1052,7 +1052,7 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
                     uint64_t x = 0, valueId = 0;
                     for (int i = 0; i < 8; ++i) x |= uint64_t(val[4 + kw + i]) << (8 * i);
                     for (std::size_t i = 0; i < std::min<std::size_t>(kw, 8); ++i) valueId |= uint64_t(val[4 + i]) << (8 * i);
-                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(val[4 + kw + 8]), false, intent, valueId});
+                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(rs.value.size() > 4 + kw + 8 ? val[4 + kw + 8] : 0), false, intent, valueId});   // a topic with no tag field ends after the int64
                 });
             } else if (r.baseOffset() < through) {
                 if (const auto c = crl::parseControl(b, total); c && c->type == crl::kConstraintSetChange) {

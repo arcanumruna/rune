@@ -7,9 +7,13 @@
 // Key-index mode (plan 05): the source is the compacted `ki` topic {id uint64 key, name string(16), n int64} with two partitions and
 // key.index on, no TestReject members; three typed clients send insert / update / removeExisting / remove on 64 ids, one write at a
 // time, and IntentVerdictsExact and KeyIndexEqualsLiveKeys join the invariants above, which then run on both partitions.
+// Autoincrement mode (plan 06): the source is the compacted `ai` topic {id uint64 key autoincrement, n int64} with two partitions and
+// delete retention 0; three typed clients create (key 0), update and removeExisting, one write at a time, a fourth imports ids below and above
+// the counter, and NoIdTwiceNoReuse joins the invariants (the view and KeyIndexEqualsLiveKeys do not run: the ids grow without a bound).
 #include "CheckedWritesChecks.h"
 #include "CheckedWritesModel.h"
 #include "client/ClusterClient.h"
+#include "client/support/AutoIncRecords.h"
 #include "client/support/KeyIndexRecords.h"
 
 #include <rune/client/Client.h>
@@ -46,13 +50,13 @@ public:
     using Clock = std::chrono::steady_clock;
     using Invariant = std::function<bool(CheckedWritesStressDriver&, std::string*)>;
     static constexpr uint64_t kObjTag = 7, kObjCap = 8;
-    static constexpr int kTagKeys = 12, kKiKeys = 64, kKiParts = 2;
+    static constexpr int kTagKeys = 12, kKiKeys = 64, kKiParts = 2, kAiParts = 2;
     enum class Op : uint8_t { Insert, Update, RemoveExisting, Remove, Upsert };
 
     /// What a node holds of one partition, read on its own threads.
     struct NodeSnap {
         int id = 0, part = 0;
-        int64_t leo = 0, hw = 0, logStart = 0;
+        int64_t leo = 0, hw = 0, logStart = 0, cleanedThrough = 0, verdictBound = 0, lso = 0;
         bool leader = false;                                 ///< the replica led when it was read
         VerdictRig::RigLog log;                              ///< below the HW
         std::map<int64_t, ModelVerdict> index;               ///< the node's RejectedOffsetIndex
@@ -60,6 +64,8 @@ public:
         int64_t committedThrough = 0, covered = 0;
         std::set<uint64_t> keys;                             ///< key-index mode: the ids the node's key index holds
         std::size_t keyCount = 0;
+        std::optional<AutoIncReady> counter;                 ///< autoincrement mode: the partition's counter once its scan finished
+        uint64_t windowMisses = 0, assignedKeyExists = 0;
     };
     /// One send and what the writer was told.  Key-index mode: `v` is the record's token (what readLogOf reads of its name; 0 for
     /// a tombstone), `code` the broker's 56 / 57, `hwBefore` / `hwAfter` the partition's high watermark around the write.
@@ -72,15 +78,17 @@ public:
         uint16_t code = 0;
         int64_t offset = -1, hwBefore = 0, hwAfter = 0;
         bool windowKnown = false;                            ///< hwBefore / hwAfter bracket the write alone (no node went down during it)
+        bool keyZero = false;                                ///< autoincrement mode: a create, `id` is the assigned one once it was acked
         enum class Result : uint8_t { Ok, Violation, Unknown } result = Result::Unknown;
     };
 
-    CheckedWritesStressDriver(rune::node::test::catalog_cluster::ThreeNodes& cluster, uint64_t seed, bool keyIndex = false)
-        : c_(cluster), rng_(seed), seed_(seed), keyIndex_(keyIndex), parts_(keyIndex ? kKiParts : 1), keys_(keyIndex ? kKiKeys : kTagKeys),
-          seen_(static_cast<std::size_t>(parts_)), data_(static_cast<std::size_t>(parts_)), changes_(static_cast<std::size_t>(parts_)), models_(static_cast<std::size_t>(parts_)),
+    CheckedWritesStressDriver(rune::node::test::catalog_cluster::ThreeNodes& cluster, uint64_t seed, bool keyIndex = false, bool autoInc = false)
+        : c_(cluster), rng_(seed), seed_(seed), autoInc_(autoInc), keyIndex_(keyIndex || autoInc), parts_(autoInc ? kAiParts : keyIndex ? kKiParts : 1), keys_(keyIndex ? kKiKeys : kTagKeys),
+          seen_(static_cast<std::size_t>(parts_)), data_(static_cast<std::size_t>(parts_)), changes_(static_cast<std::size_t>(parts_)), reservations_(static_cast<std::size_t>(parts_)), models_(static_cast<std::size_t>(parts_)),
           deliveredOffsets_(static_cast<std::size_t>(parts_)), rawIntents_(static_cast<std::size_t>(parts_)), groupOffsets_(static_cast<std::size_t>(parts_)) {
         registerDefaults_();
         if (keyIndex_) registerKeyIndexInvariants_();
+        if (autoInc_) registerAutoIncInvariants_();
     }
     ~CheckedWritesStressDriver() {
         group_.reset();
@@ -89,6 +97,7 @@ public:
         reader_.reset();
         writers_.clear();
         kiWriters_.clear();
+        aiWriters_.clear();
     }
 
     /// The typed topic (replicas 3), the projection view, TestReject on every node (not in key-index mode) and three clients.
@@ -101,18 +110,26 @@ public:
         rune::client::TopicOptions to;
         to.replicationFactor = 3;
         to.config.cleanupPolicy = 1;
-        to.config.segmentRollBytes = 64 * 1024;
+        to.config.segmentRollBytes = autoInc_ ? 4 * 1024 : 64 * 1024;   // sealed segments to compact in a few hundred writes
+        if (autoInc_) to.config.deleteRetentionMs = 0;
         to.config.minCompactionLagMs = 100;
         to.config.minCleanableDirtyRatioPpm = 1;
         to.config.fileDeleteDelayMs = 50;
-        to.keyFeatures.keyIndex = keyIndex_;
-        const auto desc = keyIndex_ ? rune::codec::serialize(rune::node::test::kiAccountDescriptor()) : rune::codec::serialize(verdictSourceDescriptor());
+        if (autoInc_) {
+            to.keyFeatures.autoIncrement = true;   // the broker adds the key index and the modulo partitioner
+        } else {
+            to.keyFeatures.keyIndex = keyIndex_;
+        }
+        const auto desc = autoInc_ ? rune::codec::serialize(rune::node::test::aiDescriptor())
+                        : keyIndex_ ? rune::codec::serialize(rune::node::test::kiAccountDescriptor()) : rune::codec::serialize(verdictSourceDescriptor());
         const auto src = admin->defineTopicAndWait(topicName_(), static_cast<uint32_t>(parts_), "id", desc, rune::client::Persistence::Disk, to, {}, 60s);
         ASSERT_EQ(src.errorCode, 0) << src.detail;
         topicId_ = src.topicId;
-        const auto view = admin->createViewAndWait(viewName_(), "id", 0, viewPlan_(topicId_), {}, 60s);
-        ASSERT_EQ(view.errorCode, 0) << view.detail;
-        viewTopicId_ = view.viewTopicId;
+        if (!autoInc_) {
+            const auto view = admin->createViewAndWait(viewName_(), "id", 0, viewPlan_(topicId_), {}, 60s);
+            ASSERT_EQ(view.errorCode, 0) << view.detail;
+            viewTopicId_ = view.viewTopicId;
+        }
         admin->close();
         admin.reset();
         std::vector<int32_t> leaders;
@@ -122,6 +139,17 @@ public:
         rebuildWriters_(-1);
     }
 
+    [[nodiscard]] std::string autoIncTally() const {
+        std::size_t creates = 0, imports = 0;
+        std::size_t updates = 0, removes = 0;
+        for (const Sent& s : sent_) {
+            if (s.result != Sent::Result::Ok) continue;
+            if (s.op == Op::Insert) ++(s.keyZero ? creates : imports);
+            else if (s.op == Op::Update) ++updates;
+            else ++removes;
+        }
+        return std::to_string(creates) + " creates, " + std::to_string(updates) + " updates, " + std::to_string(removes) + " removes and " + std::to_string(imports) + " imports acked, " + std::to_string(keyExists_) + " KeyExists and " + std::to_string(keyNotFound_) + " KeyNotFound answered, " + std::to_string(sent_.size()) + " writes";
+    }
     [[nodiscard]] std::string keyIndexTally() const { return std::to_string(pinned56_) + " KeyExists and " + std::to_string(pinned57_) + " KeyNotFound pinned to their record, " + std::to_string(provenCompacted_) + " rejections proven compacted away, " + std::to_string(sent_.size()) + " writes"; }
 
     /// One seeded action.
@@ -185,7 +213,9 @@ public:
         }
         for (int p = 0; p < parts_; ++p) {
             models_[p] = CheckedWritesModel();
-            if (keyIndex_) {
+            if (autoInc_) {
+                models_[p].addAutoIncRule(AutoIncShape{.partitions = kAiParts}, p);
+            } else if (keyIndex_) {
                 models_[p].addKeyIndexRule();
             } else {
                 models_[p].declareRule(kObjTag, tagRule_().fingerprint(), CheckedWritesModel::tagEquals(9));
@@ -322,6 +352,27 @@ private:
         }
     };
 
+    /// Autoincrement mode: a client with a typed topic over its All|View producer (key-0 creates need an idempotent All producer).
+    struct AiWriter {
+        std::unique_ptr<rune::client::Client> client;
+        std::optional<rune::client::Producer> prod;
+        std::optional<rune::client::TypedTopic<rune::node::test::Ai, rune::client::ProducerRef>> topic;
+
+        explicit AiWriter(rune::client::ClientConfig cfg) {
+            client = std::make_unique<rune::client::Client>(cfg);
+            rune::client::ProducerConfig pc;
+            pc.acks = rune::client::Acks::All | rune::client::Acks::View;
+            pc.lingerUs = 1;
+            prod.emplace(client->producer(pc));
+            client->connectAndWait(30s);
+            topic.emplace(client->openTopicAndWait<rune::node::test::Ai>("ai", *prod, 30s));
+        }
+        ~AiWriter() {
+            if (prod) prod->closeImmediately();
+            if (client) client->close();
+        }
+    };
+
     static std::string value_(uint64_t id, int64_t v, uint16_t tag) {
         std::string val;
         const auto le16 = [&](uint16_t x) { val.push_back(static_cast<char>(x)); val.push_back(static_cast<char>(x >> 8)); };
@@ -331,7 +382,7 @@ private:
         le16(tag);
         return val;
     }
-    const char* topicName_() const { return keyIndex_ ? "ki" : "vt"; }
+    const char* topicName_() const { return autoInc_ ? "ai" : keyIndex_ ? "ki" : "vt"; }
     const char* viewName_() const { return keyIndex_ ? "ki_v" : "vt_v"; }
     /// The projection: id, v, tag; of the key.index topic id and its name, whose first 8 bytes are the write's token (the row's v).
     std::vector<uint8_t> viewPlan_(int32_t src) const {
@@ -447,6 +498,8 @@ private:
             EXPECT_EQ(s.mismatches, 0u) << "seed " << seed_ << ": node " << id << " partition " << p << " before stopping";
             EXPECT_EQ(s.unknownDuplicates, 0u) << "seed " << seed_ << ": node " << id << " partition " << p << " before stopping";
             EXPECT_EQ(s.skippedMalformed, 0u) << "seed " << seed_ << ": node " << id << " partition " << p << " before stopping";
+            EXPECT_EQ(s.windowMisses, 0u) << "seed " << seed_ << ": node " << id << " partition " << p << " before stopping";
+            EXPECT_EQ(s.assignedKeyExists, 0u) << "seed " << seed_ << ": node " << id << " partition " << p << " before stopping";
         }
     }
     void restartNode_(int id, bool bounce) {
@@ -485,19 +538,22 @@ private:
     void rebuildWriters_(int avoid) {
         writers_.clear();
         kiWriters_.clear();
+        aiWriters_.clear();
         std::vector<int> seeds;
         for (const int id : c_.runningNodes()) if (id != avoid) seeds.push_back(id);
         for (std::size_t i = 0; i < 3; ++i) {
             rune::client::ClientConfig cfg = rune::node::test::catalog_cluster::clientConfigFor(c_, seeds[i % seeds.size()]);
             cfg.connectTimeoutMs = 30'000;
             cfg.pingTimeoutMs = 30'000;
-            if (keyIndex_) kiWriters_.push_back(std::make_unique<KiWriter>(cfg));
+            if (autoInc_) aiWriters_.push_back(std::make_unique<AiWriter>(cfg));
+            else if (keyIndex_) kiWriters_.push_back(std::make_unique<KiWriter>(cfg));
             else writers_.push_back(std::make_unique<Writer>(cfg, topicId_));
         }
         writersStale_ = false;
     }
     void sendBurst_(int victim) {
         if (writersStale_ || victim > 0) rebuildWriters_(victim);
+        if (autoInc_) return aiBurst_(victim);
         if (keyIndex_) return kiBurst_(victim);
         Writer& w = *writers_[rng_() % writers_.size()];
         const int n = 1 + static_cast<int>(rng_() % 80);
@@ -548,6 +604,72 @@ private:
         if (killer.joinable()) killer.join();
         recordHistory_();
     }
+    /// Autoincrement mode: 1 to 6 typed writes through one client, each waited for.  A create (key 0) is answered with its id; an import of an id
+    /// a live record holds is KeyExists, an update or removeExisting of a removed id KeyNotFound; a write the answer of which is lost may or may not
+    /// be in the log.
+    void aiBurst_(int victim) {
+        AiWriter& w = *aiWriters_[rng_() % aiWriters_.size()];
+        const int n = 1 + static_cast<int>(rng_() % 6);
+        std::jthread killer;   // joined on unwind too: a send that throws mid-crash must not destroy it joinable
+        for (int i = 0; i < n && !::testing::Test::HasFatalFailure(); ++i) {
+            Sent s;
+            const bool importBelow = aiPick_(&s);
+            s.windowKnown = !s.keyZero && !killer.joinable() && (victim <= 0 || i < n / 2);
+            if (s.windowKnown) s.hwBefore = highWatermark_(s.part);
+            if (victim > 0 && i == n / 2) { checkCounters_(victim); killer = std::jthread([this, victim] { c_.crash(victim); }); }
+            aiSend_(w, &s);
+            if (s.windowKnown) s.hwAfter = highWatermark_(s.part);
+            else if (s.result == Sent::Result::Violation && s.op == Op::RemoveExisting) s.result = Sent::Result::Unknown;   // see kiBurst_
+            if (importBelow) EXPECT_NE(s.result, Sent::Result::Ok) << "seed " << seed_ << ": an import of the live id " << s.id << " was accepted";
+            if (s.result == Sent::Result::Ok && s.op == Op::Insert) {
+                known_.push_back(s.id);
+                maxN_ = std::max(maxN_, s.id / kAiParts);
+            }
+            if (s.result == Sent::Result::Unknown) writersStale_ = true;   // no answer: the write may or may not be in the log
+            sent_.push_back(s);
+        }
+        if (killer.joinable()) killer.join();
+        recordHistory_();
+    }
+    /// The next write: mostly creates; an import of an id above everything seen, or of a live id; an update or removeExisting of an id the
+    /// run was given.  Returns whether it is an import of a live id.
+    bool aiPick_(Sent* s) {
+        const unsigned o = static_cast<unsigned>(rng_() % 100);
+        s->op = Op::Insert;
+        if (o >= 45 && o < 60 && !known_.empty()) {
+            std::vector<uint64_t> live;
+            for (const uint64_t id : known_) if (maybeRemoved_.count(id) == 0) live.push_back(id);
+            if (!live.empty() && rng_() % 2 == 0) {
+                s->id = live[rng_() % live.size()];
+                s->part = static_cast<int>(s->id % kAiParts);
+                return true;
+            }
+            maxN_ += 1 + rng_() % 8;
+            s->part = randomPart_();
+            s->id = maxN_ * kAiParts + static_cast<uint64_t>(s->part);
+        } else if (o >= 45 && !known_.empty()) {
+            s->op = o < 80 ? Op::Update : Op::RemoveExisting;
+            s->id = known_[rng_() % known_.size()];
+            s->part = static_cast<int>(s->id % kAiParts);
+            if (s->op == Op::RemoveExisting) maybeRemoved_.insert(s->id);
+        } else {
+            s->keyZero = true;
+        }
+        return false;
+    }
+    void aiSend_(AiWriter& w, Sent* s) {
+        const rune::node::test::Ai rec{s->keyZero ? 0 : s->id, ++vSeq_};
+        if (s->op == Op::Insert || s->op == Op::Update) s->v = rec.n;
+        const rune::client::WriteResult r = s->op == Op::Insert ? w.topic->insertAndWait(rec, 10s)
+                                          : s->op == Op::Update ? w.topic->updateAndWait(rec, 10s)
+                                          : w.topic->removeExistingAndWait(s->id, 10s);
+        classify_(r, s);
+        if (s->keyZero && r.ok()) {
+            s->id = r.key();
+            s->part = static_cast<int>(s->id % kAiParts);
+            EXPECT_NE(s->id, 0u) << "seed " << seed_ << ": a create was acked without its id";
+        }
+    }
     /// Sends `s` (its id and op) through `w`: its token is the new record's name, its result the answer.
     void kiSend_(KiWriter& w, Sent* s) {
         if (kiSendHook_) kiSendHook_(*s);
@@ -564,6 +686,10 @@ private:
     void classify_(const rune::client::WriteResult& r, Sent* s) {
         using Status = rune::client::OpStatus;
         namespace pc = rune::protocol::client;
+        if (s->keyZero && (r.status() == Status::StoredIdUnknown || r.status() == Status::VerdictUnknown)) {   // stored, but its id or verdicts are not known
+            ++indefiniteCreates_;
+            return;
+        }
         switch (r.status()) {
         case Status::Ok:
             s->result = Sent::Result::Ok;
@@ -571,7 +697,7 @@ private:
             return;
         case Status::BrokerError:
             s->code = r.code();
-            if ((s->op == Op::Insert && s->code == static_cast<uint16_t>(pc::ErrorCode::KeyExists)) ||
+            if ((s->op == Op::Insert && !s->keyZero && s->code == static_cast<uint16_t>(pc::ErrorCode::KeyExists)) ||
                 ((s->op == Op::Update || s->op == Op::RemoveExisting) && s->code == static_cast<uint16_t>(pc::ErrorCode::KeyNotFound))) {
                 s->result = Sent::Result::Violation;
                 ++(s->code == static_cast<uint16_t>(pc::ErrorCode::KeyExists) ? keyExists_ : keyNotFound_);
@@ -607,6 +733,7 @@ private:
             s.leo = r.logEndOffset();
             s.hw = r.highWatermark();
             s.logStart = r.log()->logStartOffset();
+            s.cleanedThrough = r.lastCleanOffset(); s.verdictBound = r.cleanerVerdictBound(); s.lso = r.cleanerLastStableOffset();
             s.leader = r.role() == rune::replication::Role::Leader;
             s.log = readLogOf(*r.log(), s.hw);
             return 0;
@@ -621,6 +748,13 @@ private:
             if (const VerdictSourceStats* st = wk.verdictStatsForTest(topicId_, s.part)) {
                 s.unknownDuplicates = st->verdictUnknownDuplicates;
                 s.skippedMalformed = st->keyIndexSkippedMalformed;
+            }
+            if (autoInc_) {
+                s.counter = wk.autoIncStateForTest(topicId_, s.part);
+                if (const AutoIncStats* st = wk.autoIncStatsForTest(topicId_, s.part)) {
+                    s.windowMisses = st->windowMisses;
+                    s.assignedKeyExists = st->assignedKeyExists;
+                }
             }
             if (keyIndex_) {
                 s.keyCount = wk.viewSet()->keyIndexSizeForTest(topicId_, s.part);
@@ -680,6 +814,7 @@ private:
                 seen_[static_cast<std::size_t>(part)].insert(ch.offset);
             }
             for (const auto& m : log.markers) seen_[static_cast<std::size_t>(part)].insert(m.offset);
+            for (const auto& [off, through] : log.reservations) reservations_[static_cast<std::size_t>(part)][off] = through;
         };
         if (given != nullptr) {
             for (const NodeSnap& s : *given) record(s.part, s.log);
@@ -699,6 +834,7 @@ private:
         VerdictRig::RigLog out;
         for (const auto& kv : data_[static_cast<std::size_t>(part)]) out.data.push_back(kv.second);
         for (const auto& kv : changes_[static_cast<std::size_t>(part)]) out.changes.push_back(kv.second);
+        for (const auto& kv : reservations_[static_cast<std::size_t>(part)]) out.reservations.emplace_back(kv.first, kv.second);
         return out;
     }
 
@@ -713,6 +849,7 @@ private:
             ok = ok && lead != nullptr && lead->leader && lead->hw == lead->leo;
             for (const NodeSnap& s : snaps_) ok = ok && (s.part != p || lead == nullptr || (s.leo == lead->leo && s.hw == lead->hw && (&s == lead || !s.leader)));
             ok = ok && lead != nullptr && lead->committedThrough >= end && lead->covered >= end;
+            ok = ok && (!autoInc_ || (lead != nullptr && lead->counter));   // the leader's scan rebuilt the counter
             *last += lead == nullptr ? "no leader" : "p" + std::to_string(p) + " leo " + std::to_string(lead->leo) + " hw " + std::to_string(lead->hw) + " committed " + std::to_string(lead->committedThrough) + " end " + std::to_string(end);
             *last += " ";
         }
@@ -739,6 +876,7 @@ private:
             if (!atRest_(&last)) continue;
             for (const NodeSnap& s : snaps_) if (s.log.data.size() < data_[static_cast<std::size_t>(s.part)].size()) return;
             last = "at rest, nothing compacted";
+            for (const NodeSnap& s : snaps_) last += " | n" + std::to_string(s.id) + "p" + std::to_string(s.part) + (s.leader ? "L" : "") + " clean " + std::to_string(s.cleanedThrough) + " bound " + std::to_string(s.verdictBound) + " lso " + std::to_string(s.lso) + " hw " + std::to_string(s.hw) + " leo " + std::to_string(s.leo);
         }
         std::size_t committed = 0;
         for (const auto& d : data_) committed += d.size();
@@ -910,8 +1048,25 @@ private:
                     }
                 }
                 if (!s.log.markers.empty() && !s.log.changes.empty()) {
-                    const std::string problem = markerUnionProblem(s.log.markers, s.log.changes.front().offset);
-                    if (!problem.empty()) { *why = at + problem; return false; }
+                    // With deleteRetentionMs 0 (autoincrement mode) the cleaner drops a marker once every offset it lists is gone and a later
+                    // marker reaches higher (spec 8.5): each run of overlapping markers must agree, and a gap between runs holds no rejected
+                    // record the log still has.
+                    std::vector<std::pair<int64_t, std::vector<VerdictRig::RigMarker>>> runs{{s.log.changes.front().offset, {}}};
+                    int64_t reach = s.log.changes.front().offset + 1;
+                    std::set<int64_t> listed;
+                    for (const auto& m : s.log.markers) {
+                        if (d.autoInc_ && m.header.fromOffset > reach) runs.emplace_back(m.header.fromOffset - 1, std::vector<VerdictRig::RigMarker>{});
+                        runs.back().second.push_back(m);
+                        reach = std::max(reach, m.header.finalThrough);
+                        for (const auto& [off, code, cid] : m.entries) listed.insert(off);
+                    }
+                    for (const auto& [firstChange, run] : runs) {
+                        const std::string problem = markerUnionProblem(run, firstChange);
+                        if (!problem.empty()) { *why = at + problem; return false; }
+                    }
+                    for (const auto& [off, verdict] : d.models_[i].verdicts()) {
+                        if (off < reach && present.count(off) != 0 && listed.count(off) == 0) { *why = at + "rejected offset " + std::to_string(off) + " is in the log below " + std::to_string(reach) + " but no marker lists it"; return false; }
+                    }
                 }
                 for (const auto& m : s.log.markers) {
                     for (const auto& [off, code, cid] : m.entries) {
@@ -928,26 +1083,28 @@ private:
             }
             return true;
         });
-        registerInvariant("ViewEqualsFreshRefold", [](CheckedWritesStressDriver& d, std::string* why) {
-            if (!d.reader_) (void)d.delivered_(std::vector<std::set<int64_t>>(static_cast<std::size_t>(d.parts_)));
-            if (!d.awaitViewFolded_()) { *why = "the view never folded the leader's committed records"; return false; }
-            std::map<uint64_t, std::pair<int64_t, uint8_t>> proj;   // a key lives on one partition
-            for (int p = 0; p < d.parts_; ++p) proj.merge(d.models_[static_cast<std::size_t>(p)].projection());
-            for (uint64_t id = 1; id <= static_cast<uint64_t>(d.keys_); ++id) {
-                const auto it = proj.find(id);
-                std::pair<int64_t, uint16_t> row;
-                int tries = 0;
-                const Lookup got = d.viewRow_(id, &row, &tries);
-                if (got == Lookup::Failed) { *why = "key " + std::to_string(id) + ": the lookup failed after " + std::to_string(tries) + " tries"; return false; }
-                if (it == proj.end()) {
-                    if (got == Lookup::Present) { *why = "key " + std::to_string(id) + " has a row but no live accepted record"; return false; }
-                    continue;
+        if (!autoInc_) {   // an autoincrement source has no projection view: its ids grow without a bound
+            registerInvariant("ViewEqualsFreshRefold", [](CheckedWritesStressDriver& d, std::string* why) {
+                if (!d.reader_) (void)d.delivered_(std::vector<std::set<int64_t>>(static_cast<std::size_t>(d.parts_)));
+                if (!d.awaitViewFolded_()) { *why = "the view never folded the leader's committed records"; return false; }
+                std::map<uint64_t, std::pair<int64_t, uint8_t>> proj;   // a key lives on one partition
+                for (int p = 0; p < d.parts_; ++p) proj.merge(d.models_[static_cast<std::size_t>(p)].projection());
+                for (uint64_t id = 1; id <= static_cast<uint64_t>(d.keys_); ++id) {
+                    const auto it = proj.find(id);
+                    std::pair<int64_t, uint16_t> row;
+                    int tries = 0;
+                    const Lookup got = d.viewRow_(id, &row, &tries);
+                    if (got == Lookup::Failed) { *why = "key " + std::to_string(id) + ": the lookup failed after " + std::to_string(tries) + " tries"; return false; }
+                    if (it == proj.end()) {
+                        if (got == Lookup::Present) { *why = "key " + std::to_string(id) + " has a row but no live accepted record"; return false; }
+                        continue;
+                    }
+                    if (got == Lookup::Absent) { *why = "key " + std::to_string(id) + " has no row"; return false; }
+                    if (row.first != it->second.first || row.second != it->second.second) { *why = "key " + std::to_string(id) + " row (" + std::to_string(row.first) + ", " + std::to_string(row.second) + ") != model"; return false; }
                 }
-                if (got == Lookup::Absent) { *why = "key " + std::to_string(id) + " has no row"; return false; }
-                if (row.first != it->second.first || row.second != it->second.second) { *why = "key " + std::to_string(id) + " row (" + std::to_string(row.first) + ", " + std::to_string(row.second) + ") != model"; return false; }
-            }
-            return true;
-        });
+                return true;
+            });
+        }
         registerInvariant("CompactionKeepsAcceptedValue", [](CheckedWritesStressDriver& d, std::string* why) {
             for (const NodeSnap& s : d.snaps_) {
                 std::set<int64_t> present;
@@ -1019,6 +1176,7 @@ private:
             if (d.pinned56_ == 0 || d.pinned57_ == 0) { *why = "the run pinned " + std::to_string(d.pinned56_) + " KeyExists and " + std::to_string(d.pinned57_) + " KeyNotFound answers to a record (" + std::to_string(d.keyExists_) + " / " + std::to_string(d.keyNotFound_) + " answered): it did no real work"; return false; }
             return true;
         });
+        if (autoInc_) return;   // the ids are not in 1..kKiKeys
         registerInvariant("KeyIndexEqualsLiveKeys", [](CheckedWritesStressDriver& d, std::string* why) {
             for (int p = 0; p < d.parts_; ++p) {
                 const NodeSnap* lead = d.leaderOf_(d.snaps_, p);
@@ -1031,10 +1189,56 @@ private:
         });
     }
 
+    /// The invariant of plan 06 (matrix D): no id is handed out twice, an id is never given back, a leader's counter is above every id acked on
+    /// its partition, and every create answered with a definite id and verdicts.  The same ids are held to the log: they sit at their record's
+    /// offset, follow the stride, and a reservation covers each.
+    void registerAutoIncInvariants_() {
+        registerInvariant("NoIdTwiceNoReuse", [](CheckedWritesStressDriver& d, std::string* why) {
+            std::map<uint64_t, int> acked;
+            std::set<uint64_t> removed;
+            std::array<uint64_t, kAiParts> highest{};
+            std::array<std::vector<CheckedWritesModel::AutoIncAck>, kAiParts> acks;
+            for (const Sent& s : d.sent_) {
+                if (s.result != Sent::Result::Ok) continue;
+                if (s.op == Op::RemoveExisting) removed.insert(s.id);
+                if (s.op != Op::Insert) continue;
+                if (++acked[s.id] > 1) { *why = "id " + std::to_string(s.id) + " is in two Ok results"; return false; }
+                if (removed.count(s.id) != 0) { *why = "id " + std::to_string(s.id) + " was acked again after it was removed"; return false; }
+                const std::size_t part = s.id % kAiParts;
+                highest[part] = std::max(highest[part], s.id);
+                if (s.keyZero && d.data_[part].count(s.offset) != 0) acks[part].push_back({s.offset, s.id, 1});
+            }
+            if (d.indefiniteCreates_ != 0) { *why = std::to_string(d.indefiniteCreates_) + " creates were answered StoredIdUnknown or VerdictUnknown"; return false; }
+            for (const NodeSnap& s : d.snaps_) {
+                const std::string at = "node " + std::to_string(s.id) + " partition " + std::to_string(s.part) + ": ";
+                if (s.windowMisses != 0) { *why = at + "windowMisses " + std::to_string(s.windowMisses); return false; }
+                if (s.assignedKeyExists != 0) { *why = at + "assignedKeyExists " + std::to_string(s.assignedKeyExists); return false; }
+                if (!s.leader) continue;
+                if (!s.counter) { *why = at + "the leader's counter is not ready"; return false; }
+                const uint64_t next = autoIncId(s.counter->nextN, kAiParts, s.part);
+                if (next <= highest[static_cast<std::size_t>(s.part)]) { *why = at + "the counter hands out " + std::to_string(next) + ", not above the acked " + std::to_string(highest[static_cast<std::size_t>(s.part)]); return false; }
+                CheckedWritesModel m;
+                m.addAutoIncRule(AutoIncShape{.partitions = kAiParts}, s.part);
+                if (!m.counterAboveEveryId(d.history_(s.part), *s.counter)) { *why = at + "the counter (nextN " + std::to_string(s.counter->nextN) + ", reserved " + std::to_string(s.counter->reservedThroughN) + ") is not above every id in the log"; return false; }
+            }
+            for (int p = 0; p < kAiParts; ++p) {
+                CheckedWritesModel m;
+                m.addAutoIncRule(AutoIncShape{.partitions = kAiParts}, p);
+                const VerdictRig::RigLog history = d.history_(p);
+                const auto& a = acks[static_cast<std::size_t>(p)];
+                if (!m.noIdTwiceNoReuse(history, a)) { *why = "partition " + std::to_string(p) + ": an id is in two records of the log"; return false; }
+                if (!m.idsFollowTheStride(history, a)) { *why = "partition " + std::to_string(p) + ": an acked id is off the stride"; return false; }
+                if (!m.ackedIdsMatchTheLog(history, a)) { *why = "partition " + std::to_string(p) + ": an acked id is not the key of its record"; return false; }
+                if (!m.reservationCoversEveryId(history)) { *why = "partition " + std::to_string(p) + ": a record's id is above the reservation below it"; return false; }
+            }
+            return true;
+        });
+    }
+
     rune::node::test::catalog_cluster::ThreeNodes& c_;
     std::mt19937_64 rng_;
     uint64_t seed_;
-    bool keyIndex_;
+    bool autoInc_, keyIndex_;
     int parts_, keys_;
     int32_t topicId_ = -1, viewTopicId_ = -1;
     int32_t capTopic_ = kCapTopicBase, capSeq_ = 0;   // the installed CapLiveKeys view's topic (0 = dropped)
@@ -1047,12 +1251,18 @@ private:
     bool writersStale_ = false;
     std::vector<std::unique_ptr<Writer>> writers_;
     std::vector<std::unique_ptr<KiWriter>> kiWriters_;
+    std::vector<std::unique_ptr<AiWriter>> aiWriters_;
+    std::vector<uint64_t> known_;           ///< autoincrement mode: the ids an Ok create or import was acked
+    std::set<uint64_t> maybeRemoved_;       ///< ... that a removeExisting was sent for (whatever it answered)
+    uint64_t maxN_ = 0;                     ///< ... the highest counter value among them and the imports sent
+    int indefiniteCreates_ = 0;             ///< ... creates answered StoredIdUnknown or VerdictUnknown
     std::function<void(const Sent&)> kiSendHook_;
     std::function<void()> viewLookupHook_;
     std::vector<Sent> sent_;
     std::vector<std::set<int64_t>> seen_;   ///< per partition: every offset any replica showed as a data record, change record or marker
     std::vector<std::map<int64_t, VerdictRig::RigLogRec>> data_;   ///< per partition
     std::vector<std::map<int64_t, VerdictRig::RigChange>> changes_;
+    std::vector<std::map<int64_t, uint64_t>> reservations_;        ///< per partition: (offset, reserved-through n) of every reservation record any replica showed
     std::vector<NodeSnap> snaps_;
     std::vector<CheckedWritesModel> models_;
     std::vector<std::pair<std::string, Invariant>> invariants_;
