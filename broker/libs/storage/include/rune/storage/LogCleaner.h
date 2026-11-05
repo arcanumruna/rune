@@ -52,7 +52,8 @@ struct RangeCleanResult {
     bool                 compacted = false;
     Offset               passEnd   = -1;
     /// Where the pass's rewrite ended: passEnd, or above it when a producer's retry window held the watermark back
-    /// (setProducerTailDepth).  What the next pass's setPreviousPassEnd takes.
+    /// (setProducerTailDepth).  The owner keeps the max of this and the previous value (progress never moves back on a
+    /// pass that stops short); the next pass's setPreviousPassEnd takes that max.
     Offset               cleanedThrough = -1;
     std::vector<int64_t> rewrittenBases;
     /// Deferred-install mode only (setDeferredInstall): the outputs to hand to
