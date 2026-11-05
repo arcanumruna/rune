@@ -392,7 +392,7 @@ static void BM_CheckedWriteHook_HookCheck64(benchmark::State& state) {
 // reservation block is 64 x the batch's records, so one batch in 64 appends a reservation record.
 //   hook_p50_ns / hook_p99_ns: the three calls per batch, the scratch copy and id patch included.
 //   steady_alloc: heap allocations over the measured batches (GATE: == 0).
-//   autoinc_4k p50 is a hard budget gate (spec 14: 1 us, the copy included).
+//   autoinc_4k p50 is a hard budget gate (spec 14: 2 us, the copy included; owner 2026-11-05).
 // ---------------------------------------------------------------------------
 struct NullLog {
     int64_t next = 0;
@@ -481,10 +481,10 @@ static void autoIncHookBench(benchmark::State& state, int records) {
     state.counters["steady_alloc"] = static_cast<double>(steadyAlloc);
     state.SetItemsProcessed(state.iterations() * kCalls);
     const bool gated = records == 64;
-    const bool pass = steadyAlloc == 0 && (!gated || p50 < 1000.0);
-    rune::bench::gateCheck(state, pass, "an autoincrement batch allocates in steady state or the hook p50 reaches 1000 ns (spec 14)");
+    const bool pass = steadyAlloc == 0 && (!gated || p50 < 2000.0);
+    rune::bench::gateCheck(state, pass, "an autoincrement batch allocates in steady state or the hook p50 reaches 2000 ns (spec 14)");
     if (gated)
-        std::fprintf(stderr, "[CheckedWriteHook autoinc gate] p50=%.0f ns (budget 1000) => %s\n", p50, pass ? "PASS" : "FAIL");
+        std::fprintf(stderr, "[CheckedWriteHook autoinc gate] p50=%.0f ns (budget 2000) => %s\n", p50, pass ? "PASS" : "FAIL");
 }
 
 static void BM_CheckedWriteHook_AutoInc1(benchmark::State& state) { autoIncHookBench(state, 1); }
