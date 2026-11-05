@@ -1,7 +1,7 @@
 // libs/view/src/ViewPlan.cpp
 //
-// Flat little-endian (de)serialization for ViewPlan (authored) and
-// CompiledViewPlan (resolved). Both forms lead with a 1-byte VERSION for
+// Flat little-endian (de)serialization for
+// CompiledViewPlan (resolved; the authored form lives in the codec). Leads with a 1-byte VERSION for
 // forward-compat; strings and vectors are length-prefixed with a u32 count.
 // Every read is bounds-checked; any truncation/overrun/bad-version yields
 // std::nullopt rather than reading out of bounds.
@@ -12,7 +12,6 @@ namespace rune::view {
 namespace {
 
 constexpr uint8_t kCompiledVersion = 1;
-constexpr uint8_t kAuthoredVersion = 1;
 
 // ---------------------------------------------------------------------------
 // Little-endian write helpers (no heap beyond the destination buffer itself,
@@ -235,85 +234,6 @@ std::optional<CompiledViewPlan> deserializeCompiledViewPlan(std::span<const uint
 
     if (!readU8(buf, pos, p.persistence))    return std::nullopt;
     if (!readSizing(buf, pos, p.sizing))     return std::nullopt;
-
-    return p;
-}
-
-// ---------------------------------------------------------------------------
-// ViewPlan (authored)
-//
-// Layout: version:u8, viewName:str, key:str,
-//         sources: u32 count + { topicId:i32, keyField:str } each,
-//         output: u32 count + { name:str, type:u8, sourceIdx:u16,
-//                                srcField:str, rule:u8 } each,
-//         persistence:u8, sizing:{chunkBytes:u32, capacity:u32, maxRows:u64}
-// ---------------------------------------------------------------------------
-std::vector<uint8_t> serializeAuthored(const ViewPlan& plan) {
-    std::vector<uint8_t> buf;
-    buf.reserve(64 + plan.viewName.size() + plan.key.size());
-
-    writeU8(buf, kAuthoredVersion);
-    writeString(buf, plan.viewName);
-    writeString(buf, plan.key);
-
-    writeU32LE(buf, static_cast<uint32_t>(plan.sources.size()));
-    for (const SourceSpec& s : plan.sources) {
-        writeI32LE(buf, s.topicId);
-        writeString(buf, s.keyField);
-    }
-
-    writeU32LE(buf, static_cast<uint32_t>(plan.output.size()));
-    for (const AuthoredField& f : plan.output) {
-        writeString(buf, f.name);
-        writeU8(buf, static_cast<uint8_t>(f.type));
-        writeU16LE(buf, f.sourceIdx);
-        writeString(buf, f.srcField);
-        writeU8(buf, static_cast<uint8_t>(f.rule));
-    }
-
-    writeU8(buf, plan.persistence);
-    writeSizing(buf, plan.sizing);
-
-    return buf;
-}
-
-std::optional<ViewPlan> deserializeAuthored(std::span<const uint8_t> buf) {
-    size_t pos = 0;
-    ViewPlan p;
-
-    uint8_t version = 0;
-    if (!readU8(buf, pos, version))        return std::nullopt;
-    if (version != kAuthoredVersion)       return std::nullopt;
-
-    if (!readString(buf, pos, p.viewName)) return std::nullopt;
-    if (!readString(buf, pos, p.key))      return std::nullopt;
-
-    // NOTE: see the matching NOTE in deserializeCompiledViewPlan above --
-    // these counts are untrusted wire data (deserializeAuthored decodes the
-    // client-supplied CreateView planBlob), so no .reserve(count) here.
-    uint32_t srcCount = 0;
-    if (!readU32LE(buf, pos, srcCount))    return std::nullopt;
-    for (uint32_t i = 0; i < srcCount; ++i) {
-        SourceSpec s{};
-        if (!readI32LE(buf, pos, s.topicId))   return std::nullopt;
-        if (!readString(buf, pos, s.keyField)) return std::nullopt;
-        p.sources.push_back(std::move(s));
-    }
-
-    uint32_t outCount = 0;
-    if (!readU32LE(buf, pos, outCount))    return std::nullopt;
-    for (uint32_t i = 0; i < outCount; ++i) {
-        AuthoredField f{};
-        if (!readString(buf, pos, f.name))       return std::nullopt;
-        if (!readPrimType(buf, pos, f.type))      return std::nullopt;
-        if (!readU16LE(buf, pos, f.sourceIdx))    return std::nullopt;
-        if (!readString(buf, pos, f.srcField))    return std::nullopt;
-        if (!readMergeRule(buf, pos, f.rule))     return std::nullopt;
-        p.output.push_back(std::move(f));
-    }
-
-    if (!readU8(buf, pos, p.persistence))  return std::nullopt;
-    if (!readSizing(buf, pos, p.sizing))   return std::nullopt;
 
     return p;
 }

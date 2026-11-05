@@ -13,7 +13,8 @@ add_library(rune_codec STATIC
     src/Lineage.cpp
     src/FilterSchema.cpp
     src/FilterBuilder.cpp
-    src/UnicodeLower.cpp)
+    src/UnicodeLower.cpp
+    src/ViewPlanAuthored.cpp)
 target_include_directories(rune_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # ── rune_catalog — the shared catalog-history library (spec §6): event model,
@@ -249,7 +250,8 @@ add_executable(rune_codec_tests
     tests/GeneratedLocalNamesTest.cpp
     tests/LineageDecodeTest.cpp
     tests/CheckedWritesUnicodeLowerTest.cpp
-    tests/CheckedWritesViewKeyEncodingTest.cpp)
+    tests/CheckedWritesViewKeyEncodingTest.cpp
+    tests/CheckedWritesViewPlanAuthoredTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
 target_compile_definitions(rune_codec_tests PRIVATE
