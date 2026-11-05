@@ -2245,9 +2245,14 @@ public:
     /// (WorkerReturn SessionSignal kind PeerFrameDrops) is handed to the runtime (counter 1'000'235) - control thread.
     using PeerFrameDropSinkFn = void (*)(void* ctx, int32_t worker, uint64_t cumulativeDrops);
     void setPeerFrameDropSink(PeerFrameDropSinkFn fn, void* ctx) noexcept { peerDropFn_ = fn; peerDropCtx_ = ctx; }
+    /// A worker ran the peer-link install `seq` of `peer` (SessionSignal PeerLinkKeysApplied) - control thread.
+    using PeerLinkKeysAppliedSinkFn = void (*)(void* ctx, int32_t worker, int32_t peer, uint64_t seq);
+    void setPeerLinkKeysAppliedSink(PeerLinkKeysAppliedSinkFn fn, void* ctx) noexcept { peerKeysFn_ = fn; peerKeysCtx_ = ctx; }
 private:
     PeerFrameDropSinkFn peerDropFn_  = nullptr;
     void*               peerDropCtx_ = nullptr;
+    PeerLinkKeysAppliedSinkFn peerKeysFn_  = nullptr;
+    void*                     peerKeysCtx_ = nullptr;
     void sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid);
     /// Evict the oldest pending connect (the kMaxPendingConnects cap).
     void evictOldestPendingConnect_(std::string_view incomingHost = {});

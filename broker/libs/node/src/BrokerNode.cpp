@@ -2159,6 +2159,7 @@ void BrokerNode::buildGateway() {
         // Authentication Task 16: the workers' paced reports of dropped inter-broker frames -> counter 1'000'235.
         workerPeerDrops_.assign(static_cast<std::size_t>(config_.workerCount >= 1 ? config_.workerCount : 1), 0);
         gateway_->setPeerFrameDropSink(&BrokerNode::onWorkerPeerFrameDropsThunk_, this);
+        gateway_->setPeerLinkKeysAppliedSink(&BrokerNode::onWorkerPeerLinkKeysAppliedThunk_, this);   // the go-ahead hold
         // Authentication Task 10 (D11/D13): how sessions authenticate + the bootstrap window's view (the control thread's
         // own SecurityView - the gateway runs on this same thread).
         gateway_->setAuthTimeoutNs(config_.authTimeoutMs * 1'000'000LL);   // D13: RUNE_AUTH_TIMEOUT_MS
@@ -3647,11 +3648,11 @@ void BrokerNode::buildPeerLinks_() {
                  clusterKeys_->next ? ", next key held" : "");
 }
 
-void BrokerNode::onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs) {
-    static_cast<BrokerNode*>(self)->onPeerLinkEstablished_(peer, k, nowNs);
+uint64_t BrokerNode::onPeerLinkEstablishedThunk_(void* self, int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs) {
+    return static_cast<BrokerNode*>(self)->onPeerLinkEstablished_(peer, k, nowNs);
 }
 
-void BrokerNode::onPeerLinkEstablished_(int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs) {
+uint64_t BrokerNode::onPeerLinkEstablished_(int32_t peer, const rune::peerlink::LinkKeys& k, int64_t nowNs) {
     (void)nowNs;
     // The transports this (control) thread owns, directly; every worker and the admin thread over their rings.  A
     // transport that cannot take the keys keeps dropping its frames to that peer (counted) - never sends in the clear.
@@ -3662,11 +3663,12 @@ void BrokerNode::onPeerLinkEstablished_(int32_t peer, const rune::peerlink::Link
     if (!ok) spdlog::error("BrokerNode[{}]: the link keys of node {} (epoch {}) could not be installed on every "
                            "control-thread transport - its frames are dropped until the next handshake",
                            config_.nodeId, peer, k.epoch);
-    peerLinkFanout_.post(peer, k);
+    const uint64_t seq = peerLinkFanout_.post(peer, k);
     // Issue #241: a re-handshake's responder installs receive-only (it keeps sealing under the old epoch) and promotes on
     // the Confirm; every transport keeps its older epochs in slots, so no frame in flight under either one is dropped.
     spdlog::debug("BrokerNode[{}]: peer link with node {} installed (epoch {}, {})", config_.nodeId, peer, k.epoch,
                   k.install == rune::peerlink::LinkInstall::ReceiveOnly ? "receive-only" : "send-and-receive");
+    return seq;   // the agent holds the peer's go-ahead (Accept / Confirm) until every plane ran it (servicePeerLinks_)
 }
 
 int BrokerNode::servicePeerLinks_(int64_t nowNs) {
@@ -3697,6 +3699,16 @@ int BrokerNode::servicePeerLinks_(int64_t nowNs) {
     }
     int work = peerLinkAgent_->doWork(nowNs);
     work += peerLinkFanout_.pump(workerPool_.get(), adminWorkerAgent_ ? &adminWorkerAgent_->controlToAdminRing() : nullptr);
+    // A held Accept / Confirm leaves once every worker and the admin thread acknowledged running its install: before
+    // that the peer's frames under the new epoch would meet a plane that cannot open them.
+    for (std::size_t i = 0; i < peerLinkAgent_->peerCount(); ++i) {
+        const uint64_t seq = peerLinkAgent_->awaitedInstallAt(i);
+        if (seq != 0 && peerLinkFanout_.applied(peerLinkAgent_->peerIdAt(i), seq, workerPool_ ? workerPool_->workerCount() : 0,
+                                                adminWorkerAgent_ != nullptr)) {
+            peerLinkAgent_->releaseHeldAt(i);
+            ++work;
+        }
+    }
     publishPeerLinkMetrics_();
     return work;
 }
@@ -3727,6 +3739,10 @@ uint64_t BrokerNode::peerFrameDropsTotal_() const noexcept {
     if (replTransport_) n += replTransport_->peerFrameDrops();
     for (const uint64_t w : workerPeerDrops_) n += w;
     return n;
+}
+
+void BrokerNode::onWorkerPeerLinkKeysAppliedThunk_(void* self, int32_t worker, int32_t peer, uint64_t seq) {
+    static_cast<BrokerNode*>(self)->peerLinkFanout_.onWorkerApplied(worker, peer, seq);
 }
 
 void BrokerNode::onWorkerPeerFrameDropsThunk_(void* self, int32_t worker, uint64_t drops) {
@@ -5176,6 +5192,13 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             if (tid == kA2cSecurityApplied)  { onSecurityApplied_(p, n); return; }
             if (tid == kA2cSecurityHalted)   { onSecurityHalted_(p, n); return; }
             if (tid == kA2cSecurityServing)  { onSecurityServing_(p, n); return; }
+            if (tid == kA2cPeerLinkKeysApplied) {   // the admin plane ran an install (PeerLinkFanout::applied)
+                int32_t peer = -1; uint64_t seq = 0;
+                if (decodePeerLinkKeysApplied(p, n, peer, seq)) peerLinkFanout_.onAdminApplied(peer, seq);
+                else if (adminToControlRejects_++ % 1024 == 0)
+                    spdlog::error("BrokerNode[{}]: malformed kA2cPeerLinkKeysApplied (len={}) skipped", config_.nodeId, n);
+                return;
+            }
             if (tid == kA2cPeerFrameDrops) {   // Authentication Task 16: the admin plane's dropped inter-broker frames
                 if (n == 8) std::memcpy(&adminPeerDrops_, p, 8);
                 else if (adminToControlRejects_++ % 1024 == 0)

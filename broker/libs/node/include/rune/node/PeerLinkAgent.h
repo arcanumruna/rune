@@ -31,6 +31,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,12 +48,15 @@ public:
         std::vector<PeerEndpoint>    peers;                // every OTHER node
         rune::peerlink::ClusterKeys  keys;                 // a COPY: the file is never re-read here
     };
-    /// (peer, keys, nowNs) of a link just established — a new epoch included.  Control thread.
-    using EstablishedFn = void (*)(void* ctx, int32_t peer, const rune::peerlink::LinkKeys& keys, int64_t nowNs);
+    /// (peer, keys, nowNs): install these keys on every plane - a new epoch (always receive-only first, see absorb_) or
+    /// its send-and-receive promotion.  Control thread.  Returns the install's sequence number when other threads must
+    /// still run it (0: every plane holds it already).
+    using EstablishedFn = uint64_t (*)(void* ctx, int32_t peer, const rune::peerlink::LinkKeys& keys, int64_t nowNs);
 
     /// Startup thread.  Throws std::runtime_error when the subscription does not resolve (the broker does not start).
     PeerLinkAgent(std::shared_ptr<aeron::Aeron> aeron, Params params,
                   rune::consensus::PeerResolutionSource resolution = {}, rune::aeronutil::AeronPump pump = {});
+    ~PeerLinkAgent() { for (auto& p : peers_) scrubPromote_(p); }
     PeerLinkAgent(const PeerLinkAgent&) = delete;
     PeerLinkAgent& operator=(const PeerLinkAgent&) = delete;
 
@@ -87,6 +91,11 @@ public:
         for (const auto& p : peers_) if (p.id == peer) return p.helloShed;
         return 0;
     }
+    /// The install sequence number peer `i`'s go-ahead waits for (0: none), and its release once every plane ran that
+    /// receive-only install: the send side switches (if the handshake granted it) and the held Accept / Confirm (if
+    /// any) is sent now.  Control thread.
+    [[nodiscard]] uint64_t awaitedInstallAt(std::size_t i) const noexcept { return peers_[i].awaitSeq; }
+    void releaseHeldAt(std::size_t i);
     static constexpr uint8_t kHelloAnswersPerPeerPerCycle = 1;
     [[nodiscard]] const rune::peerlink::LinkState* stateOf(int32_t peer) const noexcept;
 
@@ -98,7 +107,11 @@ private:
         uint64_t                        refusals = 0;   // this peer's: the log is rate-limited (first, then every 64th ~ 13 s)
         uint8_t                         helloBudget = 0;   // crypto-costing Hellos still answerable this cycle (#554)
         uint64_t                        helloShed = 0;     // this peer's Hellos dropped over the budget (#554)
+        uint64_t                        awaitSeq = 0;      // the install every plane must run before `held` leaves
+        std::optional<rune::peerlink::PeerHandshake::FrameBuf> held;   // the newest Accept / Confirm awaiting it
+        std::optional<rune::peerlink::LinkKeys> promote;   // the send-and-receive install awaiting it (scrubbed)
     };
+    void scrubPromote_(PeerSlot& p) noexcept;
 
     void onFrame_(const uint8_t* b, std::size_t len, int64_t nowNs);
     [[nodiscard]] bool admitHello_(PeerSlot& p, int32_t from, int32_t to, uint64_t keyId) noexcept;

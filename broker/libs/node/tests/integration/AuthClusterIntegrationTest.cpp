@@ -853,6 +853,128 @@ TEST(AuthClusterRegression, RehandshakeWhileWorkersSealIsRaceFreeRegression) {
     for (const auto& [o, n] : cons.deliveries) EXPECT_EQ(n, 1) << "offset " << o << " delivered " << n << " times";
 }
 
+// A re-handshake while one node's WORKERS are slow to install the new keys drops nothing.  A peer used to seal under a
+// new epoch as soon as this node's CONTROL thread had its keys (the responder's Accept; the initiator's Confirm and its
+// own sealed frames, either of which promotes the responder), while every worker got them later over its lifecycle
+// ring: a worker then met frames under an epoch it did not hold yet and dropped them (UnknownEpoch; seen on CI in
+// RehandshakeWhileWorkersSealIsRaceFreeRegression).  Now a new epoch is installed receive-only on every plane first,
+// and the send switch and the Accept / Confirm wait until every plane acknowledged it.
+// Cells: the responder's or the initiator's workers held, on the pair that carries the partition's replication
+// traffic; a hold shorter than the handshake's kAwaitNs (the rekey completes once they release) and a longer one (the
+// initiator abandons the rekey and keeps its link; a second rekey then completes).  Expected in every cell: while the
+// workers are held the initiator does not send under the new epoch, the pair ends on one newer epoch on every plane, no
+// plane drops a frame as UnknownEpoch, and an ack lands afterwards.  Mutation: PeerLinkAgent::absorb_ installing the
+// handshake's keys as given (send-and-receive at once) and sending the frame at once -> red.
+TEST(AuthClusterRegression, RehandshakeWithWorkersSlowToInstallDropsNothingRegression) {
+    struct Cell { bool holdResponder; int64_t holdNs; const char* name; };
+    constexpr int64_t kShortHoldNs = rune::peerlink::PeerHandshake::kAwaitNs * 2 / 5;
+    constexpr int64_t kLongHoldNs  = rune::peerlink::PeerHandshake::kAwaitNs * 3;
+    for (const Cell cell : {Cell{true, kShortHoldNs, "rksrs"}, Cell{false, kShortHoldNs, "rksis"},
+                            Cell{true, kLongHoldNs, "rksrl"}, Cell{false, kLongHoldNs, "rksil"}}) {
+        SCOPED_TRACE(std::string(cell.holdResponder ? "responder's" : "initiator's") + " workers held " +
+                     std::to_string(cell.holdNs / 1'000'000) + " ms");
+        AuthTrio t(cell.name);
+        t.start();
+        t.bootstrapAdmin();
+        createBuilder(t);
+        t.createUser(1, "prod");
+        t.grant(1, "prod", SO::Write, ST::Topic, SP::Prefix, "rks.");
+        t.createUser(1, "cons");
+        t.grant(1, "cons", SO::Read, ST::Topic, SP::Prefix, "rks.");
+        const std::vector<AuthTrio::Session> bs = sessionsOnEveryBroker(t, "builder");
+        ASSERT_EQ(bs.size(), 3u) << "a builder session on every broker";
+        const int32_t topic = defineTopicAnywhere(t, bs, "rks.t", 1);
+        ASSERT_GE(topic, 0);
+        int32_t leader = -1;
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { leader = leaderOf(t, bs[0], topic, 0); return leader >= 1 && leader <= 3; }));
+        const std::size_t batchBytes = makeCharBatch(1).size();
+        const std::array<std::string, 3> channels{t.channel(1), t.channel(2), t.channel(3)};
+
+        std::promise<int64_t> target;
+        std::promise<ProducerResult> pOut;
+        std::promise<ConsumerResult> cOut;
+        auto pFut = pOut.get_future();
+        auto cFut = cOut.get_future();
+        const std::filesystem::path prodDir = t.cluster().clientsDir->path / "rks_prod", consDir = t.cluster().clientsDir->path / "rks_cons";
+        LastAck lastAck{0};
+        std::jthread producer([&pOut, &lastAck, ch = channels, prodDir, topic](std::stop_token st) {
+            try { pOut.set_value(runProducer(st, ch, prodDir, topic, &lastAck)); }
+            catch (...) { pOut.set_exception(std::current_exception()); }
+        });
+        std::jthread consumer([&cOut, ch = channels, consDir, topic, batchBytes, fut = target.get_future()](std::stop_token st) mutable {
+            try { cOut.set_value(runConsumer(st, std::move(fut), ch, consDir, topic, batchBytes)); }
+            catch (...) { cOut.set_exception(std::current_exception()); }
+        });
+        ASSERT_TRUE(AuthTrio::until(60s, [&] {
+            for (int id : {1, 2, 3}) if (t.counter(id, typeIdOf(RuneMetric::PeerLinksEstablished)).value_or(0) != 2) return false;
+            return lastAck.load(std::memory_order_acquire) > 0;
+        })) << "links established and traffic flowing";
+
+        auto unknownEpochDrops = [&](BrokerNode& n) {
+            uint64_t d = n.peerLinksForTest().unknownEpochDrops + n.adminPeerUnknownEpochDropsForTest();
+            for (int32_t w = 0; w < n.workerCountForTest(); ++w) d += n.workerPeerUnknownEpochDropsForTest(w);
+            return d;
+        };
+        auto keysSeen = [&](int n) {
+            uint64_t k = 0;
+            for (int32_t w = 0; w < t.node(n).workerCountForTest(); ++w)
+                k += t.node(n).onWorkerThreadForTest(w, [](Worker& wk) { return wk.peerLinkKeysSeenForTest(); });
+            return k;
+        };
+        auto workersOn = [&](int n, int peer, uint32_t want) {
+            for (int32_t w = 0; w < t.node(n).workerCountForTest(); ++w)
+                if (t.node(n).onWorkerThreadForTest(w, [peer](Worker& wk) { return wk.peerLinkEpochForTest(peer); }) != want) return false;
+            return true;
+        };
+        // The pair that carries the replication traffic: the leader and one follower; the lower id initiates.
+        const int other = leader == 1 ? 2 : 1;
+        const int a = std::min(leader, other), b = std::max(leader, other);
+        const int held = cell.holdResponder ? b : a;
+        std::map<int, uint64_t> dropsBefore;
+        for (int id : {1, 2, 3}) dropsBefore[id] = unknownEpochDrops(t.node(id));
+        const uint32_t was = t.node(a).peerLinksForTest().epochOf[b];
+        const uint64_t keysBefore = keysSeen(held);
+
+        // Every worker of `held` stops draining its session-lifecycle ring (the keys' ring) for the hold, its own clock.
+        for (int32_t w = 0; w < t.node(held).workerCountForTest(); ++w)
+            (void)t.node(held).onWorkerThreadForTest(w, [ns = cell.holdNs](Worker& wk) { wk.holdSessionOpsForTest(ns); return 0; });
+        ASSERT_TRUE(t.node(a).forcePeerRekeyForTest(b));
+        // While the workers are held, the initiator's send epoch stays: neither end may seal under the new one yet.
+        for (int i = 0; i < 20 && keysSeen(held) == keysBefore; ++i) {
+            EXPECT_EQ(t.node(a).peerLinksForTest().epochOf[b], was) << "the initiator sends under the new epoch while " << held << "'s workers cannot open it";
+            EXPECT_EQ(t.node(b).peerLinksForTest().epochOf[a], was) << "the responder sends under the new epoch while " << held << "'s workers cannot open it";
+            std::this_thread::sleep_for(10ms);
+        }
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { return keysSeen(held) > keysBefore; })) << "the held workers ran the keys";
+        if (cell.holdNs > rune::peerlink::PeerHandshake::kAwaitNs) {
+            // The initiator abandoned the rekey (its Accept or Confirm came after kAwaitNs) and kept its link: rekey again.
+            ASSERT_TRUE(AuthTrio::until(60s, [&] { return t.node(a).forcePeerRekeyForTest(b); })) << "a second rekey starts";
+        }
+        uint32_t ea = 0, eb = 0;
+        ASSERT_TRUE(AuthTrio::until(60s, [&] {
+            ea = t.node(a).peerLinksForTest().epochOf[b];
+            eb = t.node(b).peerLinksForTest().epochOf[a];
+            return ea > was && ea == eb;
+        })) << a << "<->" << b << ": " << ea << " / " << eb << " (was " << was << ")";
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { return workersOn(a, b, ea) && workersOn(b, a, ea); }))
+            << "a worker plane did not reach epoch " << ea;
+        const int64_t mark = lastAck.load(std::memory_order_acquire);
+        ASSERT_TRUE(AuthTrio::until(60s, [&] { return lastAck.load(std::memory_order_acquire) > mark; })) << "no ack after the re-handshake";
+        for (int id : {1, 2, 3})
+            EXPECT_EQ(unknownEpochDrops(t.node(id)) - dropsBefore[id], 0u) << "node " << id << " dropped frames as UnknownEpoch";
+
+        producer.request_stop();
+        producer.join();
+        const ProducerResult prod = pFut.get();
+        ASSERT_FALSE(prod.acked.empty());
+        target.set_value(*std::max_element(prod.acked.begin(), prod.acked.end()));
+        consumer.join();
+        const ConsumerResult cons = cFut.get();
+        EXPECT_TRUE(cons.complete) << "the consumer reached the last acknowledged offset";
+        for (const auto& [o, n] : cons.deliveries) EXPECT_EQ(n, 1) << "offset " << o << " delivered " << n << " times";
+    }
+}
+
 // D8: AuthServerFirst for an unknown user carries the same fake salt and iteration count from every broker (derived from
 // the replicated fake-salt seed), so a client cannot tell the brokers apart or an absent user from a present one.
 TEST(AuthClusterRegression, UnknownUserSaltIsTheSameOnEveryBrokerRegression) {

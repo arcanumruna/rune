@@ -84,9 +84,10 @@ struct AgentRig {
     }
     ~AgentRig() { agents.clear(); }
 
-    static void onEstablished(void* ctx, int32_t peer, const pl::LinkKeys& k, int64_t) {
+    static uint64_t onEstablished(void* ctx, int32_t peer, const pl::LinkKeys& k, int64_t) {
         auto* me = static_cast<std::pair<AgentRig*, int32_t>*>(ctx);
         me->first->established[me->second].push_back({peer, k});
+        return 0;   // no other plane: the go-ahead leaves at once
     }
     std::map<int32_t, std::unique_ptr<std::pair<AgentRig*, int32_t>>> ctxs;
 

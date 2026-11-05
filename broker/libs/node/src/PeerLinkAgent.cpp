@@ -1,6 +1,8 @@
 // PeerLinkAgent.cpp — see PeerLinkAgent.h (authentication plan Task 15).
 #include <rune/node/PeerLinkAgent.h>
 
+#include <rune/crypto/Kdf.h>
+
 #include <spdlog/spdlog.h>
 
 #include <stdexcept>
@@ -61,8 +63,50 @@ void PeerLinkAgent::absorb_(PeerSlot& p, pl::PeerHandshake::Out&& o, int64_t now
             spdlog::info("BrokerNode[{}]: {}", self_, o.log->view());
         }
     }
-    if (o.frame) sink_.send(static_cast<rune::consensus::NodeId>(p.id), o.frame->data(), o.frame->size());
-    if (o.established && sinkFn_ != nullptr) sinkFn_(sinkCtx_, p.id, *o.established, nowNs);
+    // A peer may seal under an epoch towards this node only once EVERY plane here can open it: the control-thread
+    // transports, every worker and the admin thread (the last two get the keys over rings and drain them once per pass,
+    // so the order of the calls proves nothing).  What lets the peer seal under it: our Accept (responder), our
+    // Confirm and any frame we seal under it (initiator: the responder promotes on either).  So a new epoch is
+    // installed RECEIVE-ONLY on every plane first; once every plane acknowledged that install (BrokerNode::
+    // servicePeerLinks_ -> releaseHeldAt) the send side switches if the handshake granted it, and the held Accept /
+    // Confirm (or its newest re-send) leaves.  Without other planes (the sink answers 0) the keys apply at once.
+    if (o.established && sinkFn_ != nullptr) {
+        pl::LinkKeys ro = *o.established;
+        ro.install = pl::LinkInstall::ReceiveOnly;
+        const uint64_t seq = sinkFn_(sinkCtx_, p.id, ro, nowNs);
+        rune::crypto::secureZero({ro.sendMaster.data(), ro.sendMaster.size()});
+        rune::crypto::secureZero({ro.recvMaster.data(), ro.recvMaster.size()});
+        if (seq == 0) {
+            if (o.established->install == pl::LinkInstall::SendAndReceive) (void)sinkFn_(sinkCtx_, p.id, *o.established, nowNs);
+        } else {
+            p.awaitSeq = seq;
+            scrubPromote_(p);   // a newer epoch supersedes a promotion still waiting: only the newest switches send
+            if (o.established->install == pl::LinkInstall::SendAndReceive) p.promote = *o.established;
+        }
+    }
+    if (o.frame) {
+        const auto tag = static_cast<pl::PeerMsg>(pl::peekPeerMsg(o.frame->data(), o.frame->size()));
+        if (p.awaitSeq != 0 && (tag == pl::PeerMsg::Accept || tag == pl::PeerMsg::Confirm)) p.held = std::move(o.frame);
+        else sink_.send(static_cast<rune::consensus::NodeId>(p.id), o.frame->data(), o.frame->size());
+    }
+}
+
+void PeerLinkAgent::scrubPromote_(PeerSlot& p) noexcept {
+    if (!p.promote) return;
+    rune::crypto::secureZero({p.promote->sendMaster.data(), p.promote->sendMaster.size()});
+    rune::crypto::secureZero({p.promote->recvMaster.data(), p.promote->recvMaster.size()});
+    p.promote.reset();
+}
+
+void PeerLinkAgent::releaseHeldAt(std::size_t i) {
+    PeerSlot& p = peers_[i];
+    p.awaitSeq = 0;
+    // Every plane opens the epoch now: switch the send side (its acknowledgement is not awaited - the peer holds the
+    // epoch already, it is the one that offered it), then let the peer seal under it.
+    if (p.promote && sinkFn_ != nullptr) (void)sinkFn_(sinkCtx_, p.id, *p.promote, lastNowNs_);
+    scrubPromote_(p);
+    if (p.held) sink_.send(static_cast<rune::consensus::NodeId>(p.id), p.held->data(), p.held->size());
+    p.held.reset();
 }
 
 // Issue #554 / #683: charged AFTER decode and the crypto-free checks, per peer.  A Hello that fails the cheap checks is
