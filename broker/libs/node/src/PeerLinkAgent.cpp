@@ -61,8 +61,10 @@ void PeerLinkAgent::absorb_(PeerSlot& p, pl::PeerHandshake::Out&& o, int64_t now
             spdlog::info("BrokerNode[{}]: {}", self_, o.log->view());
         }
     }
-    if (o.frame) sink_.send(static_cast<rune::consensus::NodeId>(p.id), o.frame->data(), o.frame->size());
+    // The keys reach every owner before the frame that lets the peer seal under them leaves (the transports are not
+    // ordered against the handshake stream).
     if (o.established && sinkFn_ != nullptr) sinkFn_(sinkCtx_, p.id, *o.established, nowNs);
+    if (o.frame) sink_.send(static_cast<rune::consensus::NodeId>(p.id), o.frame->data(), o.frame->size());
 }
 
 // Issue #554 / #683: charged AFTER decode and the crypto-free checks, per peer.  A Hello that fails the cheap checks is

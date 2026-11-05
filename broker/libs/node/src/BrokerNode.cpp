@@ -3664,6 +3664,7 @@ void BrokerNode::onPeerLinkEstablished_(int32_t peer, const rune::peerlink::Link
                            "control-thread transport - its frames are dropped until the next handshake",
                            config_.nodeId, peer, k.epoch);
     peerLinkFanout_.post(peer, k);
+    peerLinkFanout_.pump(workerPool_.get(), adminWorkerAgent_ ? &adminWorkerAgent_->controlToAdminRing() : nullptr);   // before the Accept / Confirm leaves
     // Issue #241: a re-handshake's responder installs receive-only (it keeps sealing under the old epoch) and promotes on
     // the Confirm; every transport keeps its older epochs in slots, so no frame in flight under either one is dropped.
     spdlog::debug("BrokerNode[{}]: peer link with node {} installed (epoch {}, {})", config_.nodeId, peer, k.epoch,
