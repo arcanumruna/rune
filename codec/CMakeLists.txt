@@ -12,7 +12,8 @@ add_library(rune_codec STATIC
     src/AlterOps.cpp
     src/Lineage.cpp
     src/FilterSchema.cpp
-    src/FilterBuilder.cpp)
+    src/FilterBuilder.cpp
+    src/UnicodeLower.cpp)
 target_include_directories(rune_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # ── rune_catalog — the shared catalog-history library (spec §6): event model,
@@ -56,6 +57,9 @@ target_link_libraries(make_catalog_golden PRIVATE rune_catalog)
 #    per-offset digests for tests/security/SecurityGoldenPins.h).  Run ONCE per formatVer.
 add_executable(make_security_golden tools/make_security_golden.cpp)
 target_link_libraries(make_security_golden PRIVATE rune_security)
+
+# ── Helper: gen_unicode_lower (UnicodeData.txt -> src/UnicodeLowerTable.inc).  Run ONCE per Unicode version.
+add_executable(gen_unicode_lower tools/gen_unicode_lower.cpp)
 
 # ── CLI tool: rune_codec_gen ─────────────────────────────────────────────────
 add_executable(rune_codec_gen tools/rune_codec_gen_main.cpp)
@@ -243,9 +247,12 @@ add_executable(rune_codec_tests
     tests/FilterBuilderTest.cpp
     tests/FilterGeneratedTest.cpp
     tests/GeneratedLocalNamesTest.cpp
-    tests/LineageDecodeTest.cpp)
+    tests/LineageDecodeTest.cpp
+    tests/CheckedWritesUnicodeLowerTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
+target_compile_definitions(rune_codec_tests PRIVATE
+    RUNE_UNICODE_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data/UnicodeData-16.0.0.txt")
 target_link_libraries(rune_codec_tests PRIVATE rune_codec GTest::gtest_main)
 add_dependencies(rune_codec_tests generate_characters_header generate_fixedstr_sample_header
                  generate_str_keyed_header generate_allfixed_sample_header generate_filter_fixture_headers generate_lineage_headers)
