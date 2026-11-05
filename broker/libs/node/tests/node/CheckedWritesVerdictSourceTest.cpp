@@ -846,6 +846,34 @@ TEST(CheckedWritesVerdictSourceRegression, NewLeaderWithALaggingHwDoesNotRemarkB
     EXPECT_EQ(r.st.rejected.mismatches(), 0u);
 }
 
+// The leadership scan meets more markers above its HW than the ledger holds.  They are in the log all the same, so the new leader
+// re-marks nothing they cover.  RED: a marker the full ledger left out did not raise appendedThrough, and the leader re-marked
+// [the 1024th marker's coverage, judgeCursor) from its own index.
+TEST(CheckedWritesVerdictSourceRegression, NewLeaderPastAFullMarkerLedgerDoesNotRemarkRegression) {
+    Rig r;
+    auto& m = r.install(7, tagEquals(9));
+    r.st.constraintSets.onChange(0, setOf(1, {m.ident()}));
+    r.log.control();
+    int64_t from = 1;
+    for (int64_t k = 1; k <= int64_t(MarkerLedger::kCapacity) + 8; ++k) {
+        r.log.data({{k, 1}});
+        const int64_t at = r.log.next;
+        r.log.control();   // the marker at `at` covering [from, at)
+        std::vector<uint8_t> marker(cr::markerBatchBytes(0));
+        ASSERT_NE(cr::buildVerdictMarker(marker, cr::MarkerHeader{from, at, 1, 0}, {}), 0u);
+        verdictFeedBatch(&r.st, marker.data(), marker.size(), at);
+        from = at;
+    }
+    ASSERT_TRUE(r.st.markers.full()) << "no HW yet: every marker is above it";
+    EXPECT_EQ(r.st.markers.appendedThrough(), from);
+    r.start();
+    r.drive(1'000'000'000);
+    verdictOnHw(r.st, r.log.next);   // the scanned markers commit: the ledger drains and emission may go on
+    r.drive(2'000'000'000);
+    EXPECT_TRUE(r.vs.appendedForTest().empty()) << "re-marked what the markers past the full ledger cover";
+    EXPECT_EQ(r.st.rejected.mismatches(), 0u);
+}
+
 TEST(CheckedWritesVerdictSourceRegression, RequestChangeAboveTwoToTheThirtyOneReturnsTheOffsetRegression) {
     constexpr int64_t kOffset = (int64_t{1} << 31) + 5;
     Rig r;

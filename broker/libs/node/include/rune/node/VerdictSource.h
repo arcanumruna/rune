@@ -228,7 +228,7 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
         });
         if (!s.markers.onMarker(base, m->header.finalThrough)) {   // full: the slots below the HW are committed (the scan read them in order)
             s.markers.onHw(std::min(base, s.scanHw));
-            (void)s.markers.onMarker(base, m->header.finalThrough);   // still full: 1024 uncommitted markers above the HW, the leader re-marks
+            (void)s.markers.onMarker(base, m->header.finalThrough);   // still full: 1024 uncommitted markers above the HW, counted in appendedThrough
         }
     } else if (c->type == cr::kConstraintSetChange) {
         std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};

@@ -74,12 +74,16 @@ class MarkerLedger {
 public:
     static constexpr std::size_t kCapacity = 1024;
 
-    /// False: the ledger is full (emission waits).  A marker at or below an offset already seen is ignored (idempotent).
+    /// False: the ledger is full (emission waits) - the marker is in the log all the same, so appendedThrough counts it.  A marker
+    /// at or below an offset already seen is ignored (idempotent).
     [[nodiscard]] bool onMarker(int64_t markerOffset, int64_t finalThrough) noexcept {
         if (markerOffset < committedEnd_ || (count_ != 0 && markerOffset <= at_(count_ - 1).offset)) return true;
-        if (count_ == kCapacity) return false;
-        at_(count_++) = Slot{markerOffset, finalThrough};
         appended_ = std::max(appended_, finalThrough);
+        if (count_ == kCapacity) {
+            left_ = Slot{markerOffset, std::max(left_.finalThrough, finalThrough)};
+            return false;
+        }
+        at_(count_++) = Slot{markerOffset, finalThrough};
         return true;
     }
     void onHw(int64_t hw) noexcept {
@@ -96,7 +100,8 @@ public:
     [[nodiscard]] int64_t appendedThrough() const noexcept { return appended_; }
     void truncateFrom(int64_t offset) noexcept {
         while (count_ != 0 && at_(count_ - 1).offset >= offset) --count_;
-        appended_ = committed_;
+        if (left_.offset >= offset) left_ = Slot{};   // a cut at or below the last marker left out: forget them all (re-marks more)
+        appended_ = std::max(committed_, left_.finalThrough);
         for (std::size_t i = 0; i < count_; ++i) appended_ = std::max(appended_, at_(i).finalThrough);
     }
 
@@ -106,6 +111,7 @@ private:
     std::array<Slot, kCapacity> ring_{};
     std::size_t head_ = 0, count_ = 0;
     int64_t committed_ = 0, committedEnd_ = 0, appended_ = 0;
+    Slot left_;   // the markers a full ring left out: the last one's offset, the highest finalThrough
 };
 
 struct VerdictSourceStats {

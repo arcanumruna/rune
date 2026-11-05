@@ -70,3 +70,15 @@ TEST(CheckedWritesTimeline, MarkerLedgerIsIdempotentAndFullRefuses) {
     EXPECT_TRUE(m.full());
     EXPECT_FALSE(m.onMarker(100000, 1));
 }
+
+// A marker the full ring leaves out is in the log all the same: appendedThrough counts it until a cut removes it.
+TEST(CheckedWritesTimelineRegression, MarkerLedgerCountsAMarkerLeftOutWhenFullRegression) {
+    MarkerLedger m;
+    for (int64_t i = 1; i <= static_cast<int64_t>(MarkerLedger::kCapacity); ++i) ASSERT_TRUE(m.onMarker(i, i));
+    EXPECT_FALSE(m.onMarker(2000, 3000));
+    EXPECT_EQ(m.appendedThrough(), 3000);
+    m.truncateFrom(2001);
+    EXPECT_EQ(m.appendedThrough(), 3000) << "the cut is above it";
+    m.truncateFrom(2000);
+    EXPECT_EQ(m.appendedThrough(), static_cast<int64_t>(MarkerLedger::kCapacity));
+}
