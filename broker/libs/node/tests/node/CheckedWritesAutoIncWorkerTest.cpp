@@ -27,7 +27,7 @@ constexpr int16_t kSchemaValidationFailed = static_cast<int16_t>(ErrorCode::Sche
 constexpr int16_t kNotAuthorized = static_cast<int16_t>(ErrorCode::NotAuthorized);
 constexpr int16_t kDuplicateSequence = static_cast<int16_t>(ErrorCode::DuplicateSequence);
 constexpr uint16_t kConstraintViolation = 55, kKeyExists = 56;
-constexpr int32_t kRej = 0x40000601;
+constexpr int32_t kRej = 0x40000601, kProj = 0x40000602;
 constexpr uint64_t kRejObj = 77;
 using V = std::vector<std::tuple<uint16_t, uint16_t, uint32_t>>;
 
@@ -70,10 +70,10 @@ struct Producer {
     }
 };
 
-/// An autoincrement topic of `shape` with acks to a v17 session.
+/// An autoincrement topic of `shape` with acks to a v17 session.  `rollBytes`: the log's segment size (compact() needs small ones).
 struct AutoInc {
     VerdictRig r;
-    explicit AutoInc(AutoIncShape shape = {}, bool follower = false) : r(follower) {
+    explicit AutoInc(AutoIncShape shape = {}, bool follower = false, int64_t rollBytes = 64LL * 1024 * 1024) : r(follower, rollBytes) {
         r.createAutoIncTopic(shape);
         r.enableAcks();
         r.passes(20);
@@ -820,4 +820,95 @@ TEST(CheckedWritesAutoIncRegression, RingScanRestartBeginsTheFeedAgainRegression
     EXPECT_EQ(feed.begins, 2) << "the restart began the feed again";
     EXPECT_EQ(feed.lastBeginStart, mem.logStartOffset());
     EXPECT_EQ(feed.ends, 1);
+}
+
+// Task 10 (Review Focus 3): the highest id, removed and compacted away with its tombstone, is never assigned again (the cleaner
+// kept the latest reservation) and never comes back (its insert went with the tombstone).
+TEST(CheckedWritesAutoIncCleanerRegression, HighestIdDeletedAndCompactedIsNeverReusedNorResurrectedRegression) {
+    AutoInc g({}, false, /*rollBytes=*/1);
+    VerdictRig& r = g.r;
+    Producer a{r, 42};
+    ASSERT_EQ(a.createIds(50).back(), 50u);
+    for (uint64_t id = 1; id <= 40; ++id) ASSERT_TRUE(a.sendAck({upd(id)}));   // id 50's batch leaves A's last 32
+    const auto rm = a.sendAck({rmEx(50)});
+    ASSERT_TRUE(rm && rm->code == 0);
+    for (uint64_t id = 1; id <= 32; ++id) ASSERT_TRUE(a.sendAck({upd(id)}));   // and so does the remove's own batch
+    ASSERT_TRUE(r.driveUntilJudged());
+    const auto has50 = [&] {
+        for (const auto& d : r.readLog().data) if (d.id == 50) return true;
+        return false;
+    };
+    for (int i = 0; i < 6 && has50(); ++i) (void)r.compact(1'000'000 + i * 5'000);
+    ASSERT_FALSE(has50()) << "neither id 50's insert nor its tombstone is in the log";
+    EXPECT_FALSE(r.reservations().empty()) << "the latest reservation is kept";
+    r.restart(/*reinstall=*/false);
+    for (int i = 0; i < VerdictRig::kMaxPass && !r.autoIncState(); ++i) r.pass();
+    const auto ids = a.createIds(1);
+    ASSERT_EQ(ids.size(), 1u);
+    EXPECT_GT(ids[0], 50u) << "from the kept reservation, never a reuse";
+    const int64_t sub = r.subscribe(SubKind::Raw, r.log->logStartOffset());
+    for (const auto& d : r.collect(sub).records) EXPECT_FALSE(d.id == 50 && d.tag != kTombstoneTag) << "id 50 delivered live at " << d.offset;
+    r.installProjection(kProj);
+    r.driveUntilFolded(kProj, r.leo());
+    EXPECT_FALSE(r.hasRow(kProj, 50)) << "a fresh projection has no row 50";
+    EXPECT_TRUE(r.hasRow(kProj, 45));
+}
+
+// Task 10 (section 15): the ack of a key-0 batch is lost, its ids are updated, the log is compacted and the leader fails over: the
+// retry still answers the original ids, because the protected batch kept its records.
+TEST(CheckedWritesAutoIncCleanerRegression, RetryAfterFailoverAndCompactionStillReturnsItsIdsRegression) {
+    AutoInc g({}, false, /*rollBytes=*/1);
+    VerdictRig& r = g.r;
+    Producer p{r, 42};
+    ASSERT_EQ(p.createIds(1).back(), 1u);
+    const int32_t seq = p.seq;
+    const auto orig = p.sendAck(creates(4));   // the client never sees this ack
+    ASSERT_TRUE(orig);
+    ASSERT_EQ(orig->assignedBase, 2u);
+    for (int i = 0; i < 10; ++i) ASSERT_TRUE(p.sendAck({upd(2 + static_cast<uint64_t>(i % 4))}));
+    ASSERT_TRUE(r.driveUntilJudged());
+    (void)r.compact();
+    (void)r.compact(1'005'000);
+    r.failover();
+    for (int i = 0; i < VerdictRig::kMaxPass && !r.autoIncState(); ++i) r.pass();
+    ASSERT_TRUE(r.autoIncState()) << "the leadership scan over the compacted log ends";
+    const auto a = p.ackOf(p.resend(creates(4), seq));
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    EXPECT_EQ(a->baseOffset, orig->baseOffset);
+    EXPECT_EQ(a->assignedBase, 2u) << "the original ids";
+    EXPECT_EQ(r.autoIncStats().windowMisses, 0u);
+    EXPECT_EQ(loggedIds(r).size(), 15u) << "the retry appended nothing and the protected batch kept all four";
+}
+
+// Task 10 (ruling D-6): the cleaner reads only the sealed segments, so the latest reservation may lie in the active one.  The older
+// sealed reservations go, the highest sealed one and the active one stay, and a restart resumes above the active one.
+TEST(CheckedWritesAutoIncCleanerRegression, LatestReservationInTheActiveSegmentSurvivesACleanRegression) {
+    AutoInc g(AutoIncShape{.reserve = 8}, false, /*rollBytes=*/2048);
+    VerdictRig& r = g.r;
+    Producer p{r, 42};
+    const auto latestIsActive = [&] {
+        const auto resv = r.reservations();
+        return resv.size() >= 4 && resv.back().first >= r.log->segmentBaseOffsets().back() && resv[resv.size() - 2].first < r.log->segmentBaseOffsets().back();
+    };
+    uint64_t maxId = 0;
+    for (int i = 0; i < 2000 && !latestIsActive(); ++i) {
+        maxId = p.createIds(1).back();
+        ASSERT_TRUE(r.driveUntilJudged());   // the markers covering the sealed segments are in them
+    }
+    ASSERT_TRUE(latestIsActive()) << "precondition: the latest reservation is in the active segment";
+    const auto before = r.reservations();
+    const int64_t activeBase = r.log->segmentBaseOffsets().back();
+    (void)r.compact(1'000'000, /*seal=*/false);
+    (void)r.compact(1'005'000, /*seal=*/false);
+    ASSERT_EQ(r.log->segmentBaseOffsets().back(), activeBase) << "precondition: nothing rolled";
+    std::vector<std::pair<int64_t, uint64_t>> want;
+    for (std::size_t i = 0; i < before.size(); ++i)
+        if (before[i].first >= activeBase || (i + 1 < before.size() && before[i + 1].first >= activeBase)) want.push_back(before[i]);
+    EXPECT_EQ(r.reservations(), want) << "the highest sealed reservation and the active one stay, the older ones go";
+    r.restart();
+    const auto ids = p.createIds(1);
+    ASSERT_EQ(ids.size(), 1u);
+    EXPECT_GT(ids[0], maxId) << "no id reuse";
+    EXPECT_EQ(ids[0], before.back().second + 1) << "the counter resumes above the active reservation";
 }

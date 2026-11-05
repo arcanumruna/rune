@@ -811,6 +811,7 @@ public:
         rune::storage::LogCleaner cleaner;
         cleaner.setMarkerRemovalBound(replica->cleanerMarkerRemovalBound());
         cleaner.setVerdictBounds(out.bound, markerEnd);
+        cleaner.setProducerTailDepth(autoInc_ ? rune::storage::kRetryWindowSize : 1);   // what BrokerNode configures the partition with
         cleaner.setDeferredInstall(&cleanedSeq_);
         rune::storage::SkimpyOffsetMap map(rune::storage::SkimpyOffsetMap::sizingForBudget(1 << 22));
         auto res = cleaner.produceCleanedRangeBounded(log->dir(), bases, sizes, uncleanable, 0, nowMs * 1'000'000, 1000, map, false, 1 << 20, nullptr, nowMs);

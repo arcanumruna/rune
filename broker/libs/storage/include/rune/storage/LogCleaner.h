@@ -1,6 +1,7 @@
 #pragma once
 #include <rune/storage/Log.h>
 #include <rune/storage/OffsetMap.h>
+#include <rune/storage/ProducerBatchWindow.h>
 #include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/storage/Throttler.h>
 #include <cstdint>
@@ -85,6 +86,14 @@ public:
     /// compaction (ProducerTails.h).  Default 7 days; < 0 = never expire.
     void setProducerIdExpirationMs(int64_t ms) noexcept { producerIdExpirationMs_ = ms; }
     [[nodiscard]] int64_t producerIdExpirationMs() const noexcept { return producerIdExpirationMs_; }
+    /// Part 06 (P6-9): producer-state batches the partition keeps per producer (PartitionReplica::producerTailDepth).  Above 1
+    /// (an autoincrement topic) a live producer's last `depth` batches are kept whole and their keys' tombstones pinned
+    /// (ProducerBatchWindow.h); 1 builds no window and cleans as ProducerTails alone dictates.
+    void setProducerTailDepth(int depth) {
+        if (depth <= 1) window_.reset();
+        else if (!window_ || window_->depth() != depth) window_.emplace(depth);
+    }
+    [[nodiscard]] const ProducerBatchWindow* producerBatchWindowForTest() const noexcept { return window_ ? &*window_ : nullptr; }
     /// M3: bytes the last offset-map build read from clean-prefix segments
     /// (producer tails) — throttled by the bounded passes.
     [[nodiscard]] int64_t lastPrefixBytesRead() const noexcept { return prefixBytesRead_; }
@@ -435,6 +444,7 @@ private:
                            Throttler* throttler, bool* changed,
                            std::optional<int64_t> afterGroupBase = std::nullopt);
     int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
+    std::optional<ProducerBatchWindow> window_{};   ///< depth > 1 only
     int64_t prefixBytesRead_        = 0;
     Offset  markerRemovalBound_     = 0;
     Offset  verdictBound_           = std::numeric_limits<Offset>::max();

@@ -246,10 +246,12 @@ std::optional<int64_t> successorOf(const std::vector<int64_t>& sealedBases, int6
 int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, Offset fromOffset, Offset toOffset,
                      Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails,
                      const BoundaryHook& hook, VerdictCleanState& verdicts, Offset verdictBound, Offset verdictMarkerEnd,
-                     std::optional<LogCleaner::Damaged>& damage) {
+                     ProducerBatchWindow* window, std::optional<LogCleaner::Damaged>& damage) {
     namespace cr = rune::storage::control_record;
     int64_t bytes = 0;
     std::vector<RejectedOffsetIndex::Entry> verdictEntries;
+    std::vector<uint64_t> windowKeys;
+    if (window != nullptr) { window->clear(); window->setCapacity(tails.capacity()); }
     // Markers above toOffset are read too, but only in `bases` (sealed segments): the marker carrying W in the active
     // segment is never read, so cleanLimit trails W by up to the active segment (cleans less, never more).
     const Offset scanEnd = std::max(toOffset, verdictMarkerEnd);
@@ -298,6 +300,15 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             if (base >= toOffset) { pos += static_cast<std::size_t>(total); continue; }   // above it only the control records above are read
             noteProducerTail(buf.data() + pos, r, toOffset, tails);
             const int64_t last = base + r.lastOffsetDelta();
+            if (window != nullptr && pid >= 0 && r.baseSequence() >= 0 && !isControlBatch(r)) {   // Part 06: an idempotent data batch
+                windowKeys.clear();
+                r.forEachRecord([&](std::string_view key, std::string_view, int64_t, int64_t) {
+                    if (key.size() == sizeof(uint64_t)) windowKeys.push_back(rune::protocol::detail::getLE64(reinterpret_cast<const uint8_t*>(key.data())));
+                });
+                window->noteBatch(pid, base, last,
+                                  static_cast<int64_t>(rune::protocol::detail::getLE64(buf.data() + pos + rune::protocol::batch::kMaxTimestampOffset)),
+                                  windowKeys);
+            }
             if (pid >= 0) {
                 if (isControlBatch(r)) {
                     const int type = markerControlType(buf.data() + pos, static_cast<std::size_t>(total), r);
@@ -319,6 +330,7 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
     }
     txn.finish(toOffset, markerRemovalBound);
     verdicts.finish(fromOffset, verdictBound, markerRemovalBound);
+    if (window != nullptr) window->finish();
     return bytes;
 }
 
@@ -329,12 +341,16 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
 enum class MarkerAction { Keep, Stamp, Drop };
 MarkerAction markerAction(const rune::protocol::RecordBatchReader& r, const std::optional<rune::storage::control_record::ControlRecord>& c,
                           int64_t batchLastOffset, Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts,
-                          int64_t nowMs) {
+                          const ProducerBatchWindow* window, int64_t nowMs, int64_t expirationMs) {
     if (nowMs < 0 || batchLastOffset >= cleanBoundaryOffset) return MarkerAction::Keep;
     if (r.producerId() < 0) {   // a checked-writes control record (16-19): its own rules
         const int type = c ? c->type : rune::storage::control_record::kUnparseable;
         if (type == rune::storage::control_record::kUnparseable || verdicts == nullptr ||
             verdicts->keepsControlRecord(r.baseOffset(), static_cast<int16_t>(type)))
+            return MarkerAction::Keep;
+        // Part 06: a protected batch keeps its rejected records, so the marker listing one stays.
+        if (type == rune::storage::control_record::kVerdictMarker && window != nullptr &&
+            verdicts->listsAny(r.baseOffset(), [&](int64_t o) { return window->protectsOffset(o, nowMs, expirationMs); }))
             return MarkerAction::Keep;
     } else if (txn == nullptr || !txn->markerRemovable(r.baseOffset())) {
         return MarkerAction::Keep;
@@ -363,9 +379,9 @@ void appendStampedControlBatch(std::vector<uint8_t>& out, const uint8_t* batch, 
 bool rewriteControlBatch(std::vector<uint8_t>& out, const uint8_t* batch, std::size_t len,
                          const rune::protocol::RecordBatchReader& r,
                          const std::optional<rune::storage::control_record::ControlRecord>& ctl, int64_t batchLastOffset,
-                         Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts, int64_t nowMs,
-                         int64_t deleteRetentionMs) {
-    switch (markerAction(r, ctl, batchLastOffset, cleanBoundaryOffset, txn, verdicts, nowMs)) {
+                         Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts,
+                         const ProducerBatchWindow* window, int64_t nowMs, int64_t expirationMs, int64_t deleteRetentionMs) {
+    switch (markerAction(r, ctl, batchLastOffset, cleanBoundaryOffset, txn, verdicts, window, nowMs, expirationMs)) {
         case MarkerAction::Drop:  return true;
         case MarkerAction::Stamp: appendStampedControlBatch(out, batch, len, nowMs + deleteRetentionMs); return true;
         case MarkerAction::Keep:  break;
@@ -396,14 +412,14 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     prefixBytesRead_ = 0;
     TxnCleanState& txn = map.txnState();
     txn.clear();
-    if (fromOffset >= toOffset) { txn.finish(toOffset, markerRemovalBound_); map.verdictState().clear(); return -1; }
+    if (fromOffset >= toOffset) { txn.finish(toOffset, markerRemovalBound_); map.verdictState().clear(); if (window_) window_->clear(); return -1; }
     // D3b: transaction pre-pass (+ producer tails) over the whole log below
     // toOffset; the map never indexes at/after the first unresolved txn (LSO) nor
     // aborted txn data.  M3: these reads are throttled by the caller.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
     std::optional<Damaged> scanDamage;
-    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, scanDamage);
+    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, window_ ? &*window_ : nullptr, scanDamage);
     if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return -1; }   // incomplete state: no map
     toOffset = std::min(txn.cleanLimit(), verdicts.cleanLimit());
 
@@ -462,12 +478,12 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     prefixBytesRead_ = 0;
     TxnCleanState& txn = map.txnState();
     txn.clear();
-    if (fromOffset >= toOffset) { txn.finish(toOffset, markerRemovalBound_); map.verdictState().clear(); return; }
+    if (fromOffset >= toOffset) { txn.finish(toOffset, markerRemovalBound_); map.verdictState().clear(); if (window_) window_->clear(); return; }
     // D3b: transaction pre-pass (+ producer tails) — see the bounded overload.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
     std::optional<Damaged> scanDamage;
-    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, scanDamage);
+    prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, window_ ? &*window_ : nullptr, scanDamage);
     if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return; }   // incomplete state: no map
     toOffset = std::min(txn.cleanLimit(), verdicts.cleanLimit());
 
@@ -544,6 +560,7 @@ bool LogCleaner::rewriteSegmentImpl(
 {
     if (changed) *changed = false;
     if (damaged_.has_value()) return false;   // uncleanable: nothing read, nothing changed
+    const ProducerBatchWindow* window = window_ ? &*window_ : nullptr;
     // D3b: never clean at/after the pass's first unresolved transaction (LSO).
     if (txn != nullptr) cleanBoundaryOffset = std::min(cleanBoundaryOffset, txn->cleanLimit());
     if (verdicts != nullptr) {
@@ -633,6 +650,15 @@ bool LogCleaner::rewriteSegmentImpl(
         // whole: kept records carry it, else a record-less batch does.
         const bool tailNeeded = batchIsData && tails != nullptr && batchLastOffset < cleanBoundaryOffset &&
             tails->mustRetain(origProducerId, batchLastOffset, batchMaxTs, nowMs, producerIdExpirationMs_);
+        // Part 06: a live producer's last `depth` batches are kept whole, before any record rule (aborted data still goes).
+        if (batchIsData && window != nullptr && batchLastOffset < cleanBoundaryOffset &&
+            !(isTransactionalBatch(r) && txn != nullptr && txn->isAborted(origProducerId, batchBaseOffset)) &&
+            window->protects(origProducerId, batchBaseOffset, batchMaxTs, nowMs, producerIdExpirationMs_)) {
+            outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
+                          buf.begin() + static_cast<std::ptrdiff_t>(pos + static_cast<size_t>(total)));
+            pos += static_cast<size_t>(total);
+            continue;
+        }
         if (batchIsData && r.recordCount() == 0) {
             // A record-less producer-tail batch of an earlier pass: kept while
             // it is still the (unexpired) tail, dropped once superseded.
@@ -646,7 +672,7 @@ bool LogCleaner::rewriteSegmentImpl(
         }
         if (isControlBatch(r)) {   // D3: markers are never key-compacted; D3b: removed once empty + past horizon
             if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, ctl, batchLastOffset,
-                                    cleanBoundaryOffset, txn, verdicts, nowMs, deleteRetentionMs))
+                                    cleanBoundaryOffset, txn, verdicts, window, nowMs, producerIdExpirationMs_, deleteRetentionMs))
                 modified = true;
             pos += static_cast<size_t>(total);
             continue;
@@ -802,8 +828,10 @@ bool LogCleaner::rewriteSegmentImpl(
                 // Case B: batch does NOT have a horizon stamp (first time we see this tombstone).
                 //   - If nowMs is available: stamp a horizon (nowMs + deleteRetentionMs).
                 //   - Otherwise: fall back to legacy nowNs retention.
+                // Part 06: a protected batch holds the key - dropping the tombstone would bring its insert back.
+                const bool pinned = window != nullptr && window->pinsTombstone(key, nowMs, producerIdExpirationMs_);
                 if (batchHasHorizon) {
-                    if (horizonExpired) {
+                    if (horizonExpired && !pinned) {
                         modified = true;
                         return; // horizon passed — fully remove key + tombstone (CP-8)
                     }
@@ -826,7 +854,7 @@ bool LogCleaner::rewriteSegmentImpl(
 
                 // Legacy nowNs-only path (nowMs not provided — backward compat).
                 int64_t tombstoneTs = timestamp; // timestamp in the record (nanoseconds)
-                if ((nowNs - tombstoneTs) > deleteRetentionNs) {
+                if ((nowNs - tombstoneTs) > deleteRetentionNs && !pinned) {
                     modified = true;
                     return; // past retention — fully remove key + tombstone
                 }
@@ -1534,6 +1562,7 @@ void LogCleaner::mergeGroupWithMap(
     // D3b: never at/after the first unresolved transaction (LSO).
     const TxnCleanState* txn = &map.txnState();
     VerdictCleanState* verdicts = &map.verdictState();
+    const ProducerBatchWindow* window = window_ ? &*window_ : nullptr;
     passEnd = std::min({passEnd, txn->cleanLimit(), verdicts->cleanLimit()});
     verdicts->markRemovalsBelow(passEnd);
 
@@ -1592,6 +1621,15 @@ void LogCleaner::mergeGroupWithMap(
             const bool tailNeeded = batchIsData && batchLastOffset < passEnd &&
                 map.producerTails().mustRetain(origProducerId, batchLastOffset, batchMaxTs, nowMs,
                                                producerIdExpirationMs_);
+            // Part 06 (see rewriteSegmentImpl): a protected batch is kept whole.
+            if (batchIsData && window != nullptr && batchLastOffset < passEnd &&
+                !(isTransactionalBatch(r) && txn->isAborted(origProducerId, batchBaseOffset)) &&
+                window->protects(origProducerId, batchBaseOffset, batchMaxTs, nowMs, producerIdExpirationMs_)) {
+                outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
+                              buf.begin() + static_cast<std::ptrdiff_t>(pos + static_cast<size_t>(total)));
+                pos += static_cast<size_t>(total);
+                continue;
+            }
             if (batchIsData && r.recordCount() == 0) {
                 if (batchLastOffset >= passEnd || tailNeeded)
                     outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
@@ -1603,7 +1641,7 @@ void LogCleaner::mergeGroupWithMap(
             }
             if (isControlBatch(r)) {   // D3: never key-compacted; D3b: removed once empty + past horizon
                 if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, ctl, batchLastOffset,
-                                        passEnd, txn, verdicts, nowMs, deleteRetentionMs))
+                                        passEnd, txn, verdicts, window, nowMs, producerIdExpirationMs_, deleteRetentionMs))
                     modified = true;
                 pos += static_cast<size_t>(total);
                 continue;
@@ -1679,15 +1717,16 @@ void LogCleaner::mergeGroupWithMap(
                 if (latest.has_value() && offset < *latest) { modified = true; return; }
 
                 if (isTombstone(val)) {
+                    const bool pinned = window != nullptr && window->pinsTombstone(key, nowMs, producerIdExpirationMs_);   // Part 06
                     if (batchHasHorizon) {
-                        if (horizonExpired) { modified = true; return; }
+                        if (horizonExpired && !pinned) { modified = true; return; }
                         keepWithHorizon2(batchHorizonMs); return;
                     }
                     if (nowMs >= 0) {
                         modified = true;
                         keepWithHorizon2(nowMs + deleteRetentionMs); return;
                     }
-                    if ((nowNs - timestamp) > deleteRetentionNs) { modified = true; return; }
+                    if ((nowNs - timestamp) > deleteRetentionNs && !pinned) { modified = true; return; }
                 }
                 keep2();
             });

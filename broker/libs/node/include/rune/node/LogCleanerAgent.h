@@ -700,6 +700,8 @@ public:
         cleaner.setMarkerRemovalBound(best.replica->cleanerMarkerRemovalBound());
         const int64_t verdictBound = best.replica->cleanerVerdictBound();   // the bound first, then the marker end that carries it
         cleaner.setVerdictBounds(verdictBound, best.replica->cleanerVerdictMarkerEnd());
+        // Part 06: an autoincrement partition keeps each live producer's whole retry window (ProducerBatchWindow.h).
+        cleaner.setProducerTailDepth(best.replica->producerTailDepth());
         // Fix round 2 (Kafka-style): the cleaner NEVER replaces / deletes a
         // segment file — outputs go to unique .cleaned files the owner thread
         // validates and installs (Log::drainCleanerSwaps).
