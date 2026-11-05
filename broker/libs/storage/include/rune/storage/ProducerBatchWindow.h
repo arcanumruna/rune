@@ -11,12 +11,12 @@
 //
 // Expiry is ProducerTails': a producer whose last batch's broker append time (its segment file's last write, never the client's
 // maxTimestamp) is older than nowMs - expirationMs is not protected (nowMs < 0 never expires); finish() drops it.  The ring holds each batch's position only, and finish() reads the keys of the batches it
-// keeps.  Memory is bounded by a byte budget (the cleaner gives it the share of its dedupe budget ProducerTails gets).  A charge past
-// it first evicts the producers that look expired so far in the scan, keeping only their ids (8 bytes each).  One of them seen again
-// later is taken back with a fresh, PARTIAL ring: at finish() it is dropped if expired, exact once its ring holds `depth` batches
-// (the evicted ones are older than its window), and only a live one short of `depth` overflows - an evicted batch may be in its
-// window.  Past the budget the window is OVERFLOWED and conservative - every data batch protected, every tombstone pinned, the
-// watermark held (lowestProtectedBase).
+// keeps.  Memory is bounded by a byte budget (the cleaner sizes it with budgetFor: every producer ProducerTails can track, at full
+// depth).  A charge past it first evicts the producers that look expired so far in the scan, keeping only their ids (8 bytes each).
+// One of them seen again later is taken back with a fresh, PARTIAL ring: at finish() it is dropped if expired, exact once its ring
+// holds `depth` batches (the evicted ones are older than its window), and only a live one short of `depth` overflows - an evicted
+// batch may be in its window.  Past the budget the window is OVERFLOWED and protects nothing: the pass runs as ProducerTails alone
+// dictates (depth 1), so compaction keeps progressing; a retry of a batch past a producer's tail may then be answered unknown.
 //
 // The cleaner keeps its watermark at or below lowestProtectedBase(): a protected batch and the records superseding it stay in the
 // dirty range until the pass that releases it, so a protected insert and its tombstone go in the same pass.
@@ -51,6 +51,10 @@ public:
     explicit ProducerBatchWindow(int depth) : depth_(static_cast<std::size_t>(depth)) {}
 
     [[nodiscard]] int depth() const noexcept { return static_cast<int>(depth_); }
+    /// The budget of `producers` producers of `depth` batches holding one key each.
+    [[nodiscard]] std::size_t budgetFor(std::size_t producers) const noexcept {
+        return producers * (kBytesPerProducer + depth_ * (sizeof(Batch) + sizeof(uint64_t)));
+    }
 
     void clear() noexcept {
         producers_.clear();
@@ -128,25 +132,21 @@ public:
     // ---- queries ------------------------------------------------------------
     /// Is the data batch starting at `baseOffset` kept whole?
     [[nodiscard]] bool protects(int64_t baseOffset) const noexcept {
-        if (overflowed_) return true;
         const auto it = std::lower_bound(batches_.begin(), batches_.end(), baseOffset, [](const Batch& b, int64_t o) { return b.base < o; });
         return it != batches_.end() && it->base == baseOffset;
     }
     /// Does a protected batch hold `offset`?  (A verdict marker listing it must stay.)
     [[nodiscard]] bool protectsOffset(int64_t offset) const noexcept {
-        if (overflowed_) return true;
         auto it = std::upper_bound(batches_.begin(), batches_.end(), offset, [](int64_t o, const Batch& b) { return o < b.base; });
         return it != batches_.begin() && offset <= (--it)->last;
     }
     /// Must the tombstone of `key` outlive its delete horizon (a protected batch holds the key)?
     [[nodiscard]] bool pinsTombstone(std::string_view key) const noexcept {
-        if (overflowed_) return true;
         if (key.empty() || key.size() > sizeof(uint64_t)) return false;
         return std::binary_search(keys_.begin(), keys_.end(), keyIndexWord(key));
     }
-    /// The watermark bound: the base of the oldest protected batch (max when none; min when overflowed).
+    /// The watermark bound: the base of the oldest protected batch (max when none).
     [[nodiscard]] int64_t lowestProtectedBase() const noexcept {
-        if (overflowed_) return std::numeric_limits<int64_t>::min();
         return batches_.empty() ? std::numeric_limits<int64_t>::max() : batches_.front().base;
     }
     [[nodiscard]] bool overflowed() const noexcept { return overflowed_; }

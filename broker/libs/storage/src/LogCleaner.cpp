@@ -287,9 +287,8 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
     namespace cr = rune::storage::control_record;
     int64_t bytes = 0;
     std::vector<RejectedOffsetIndex::Entry> verdictEntries;
-    if (window != nullptr) {   // the share of the dedupe budget the producer tails get
-        window->begin(tails.capacity() == ProducerTails::kUnbounded ? ProducerTails::kUnbounded
-                                                                     : tails.capacity() * ProducerTails::kBytesPerProducer,
+    if (window != nullptr) {   // every producer the tails can track, at full depth
+        window->begin(tails.capacity() == ProducerTails::kUnbounded ? ProducerTails::kUnbounded : window->budgetFor(tails.capacity()),
                       windowNowMs, expirationMs);
     }
     // Markers above toOffset are read too, but only in `bases` (sealed segments): the marker carrying W in the active
@@ -474,6 +473,10 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     std::optional<Damaged> scanDamage;
     prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, window_ ? &*window_ : nullptr, windowNowMs_, producerIdExpirationMs_, scanDamage);
     if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return -1; }   // incomplete state: no map
+    if (window_ && window_->overflowed() && !windowOverflowLogged_) {
+        windowOverflowLogged_ = true;
+        spdlog::warn("LogCleaner: the producer batch window of {} is over its budget: only producer tails are kept (raise the cleaner dedupe buffer)", dir);
+    }
     toOffset = std::min(txn.cleanLimit(), verdicts.cleanLimit());
 
     // Maps the keys in [from, toOffset); true when the map filled.

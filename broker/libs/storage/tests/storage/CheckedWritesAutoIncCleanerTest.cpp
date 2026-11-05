@@ -603,9 +603,9 @@ TEST(CheckedWritesAutoIncCleanerRegression, LiveProducersBatchAboveTheVerdictCov
     }
 }
 
-// Fix round 1 (finding 4): past its budget the window records no more producers, and every batch is then protected whatever its own
-// timestamp.  RED: an unrecorded producer's batch expired on its own maxTimestamp although the producer's last batch was recent.
-TEST(CheckedWritesAutoIncCleanerRegression, OverflowedWindowProtectsAnUnrecordedProducerRegression) {
+// Fix round 1 (finding 4), revised in fix pass 2 (M2): past its budget the window records no more producers and protects nothing -
+// the pass runs on the producer tails alone instead of holding every batch and the watermark.
+TEST(CheckedWritesAutoIncCleanerRegression, OverflowedWindowFallsBackToTheTailsRegression) {
     using rune::storage::ProducerBatchWindow;
     const int64_t exp = rune::storage::ProducerTails::kDefaultExpirationMs;
     const int64_t now = 10'000 + exp;
@@ -616,9 +616,37 @@ TEST(CheckedWritesAutoIncCleanerRegression, OverflowedWindowProtectsAnUnrecorded
     w.noteBatch(8, 2, 2, now, 2, 0);
     w.finish([](int64_t, std::size_t, std::vector<uint64_t>& keys) { keys.push_back(1); return true; });
     ASSERT_TRUE(w.overflowed());
-    EXPECT_TRUE(w.protects(1)) << "the unrecorded producer's superseded insert is kept";
-    EXPECT_TRUE(w.pinsTombstone(idKey(5))) << "and its key's tombstone is pinned";
-    EXPECT_EQ(w.lowestProtectedBase(), std::numeric_limits<int64_t>::min()) << "and the watermark is held";
+    EXPECT_FALSE(w.protects(0) || w.protects(1) || w.protects(2)) << "nothing is protected";
+    EXPECT_FALSE(w.protectsOffset(2));
+    EXPECT_FALSE(w.pinsTombstone(idKey(1))) << "nor pinned";
+    EXPECT_EQ(w.lowestProtectedBase(), std::numeric_limits<int64_t>::max()) << "and the watermark is not held";
+}
+
+// Fix pass 2 (M2): the window's budget holds every producer the tails can track at full depth, and past it the pass falls back
+// to the tails alone.  RED: the window got the tails' share (64 bytes a producer), so 60 live producers overflowed it - every batch
+// protected, the watermark held at the dirty start, nothing compacted on any pass.
+TEST(CheckedWritesAutoIncCleanerRegression, ManyLiveProducersStillCompactRegression) {
+    constexpr int kProducers = 60;
+    for (const bool coalesce : {false, true}) {
+        SCOPED_TRACE(name(coalesce));
+        const auto dir = tempDir();
+        {
+            Log log(dir.string(), /*segmentBytes=*/4096);
+            log.recover();
+            int64_t off = 0;
+            for (int p = 0; p < kProducers; ++p, ++off) rec(log, off, 100 + p, 0, uint64_t(p) + 1, "insert");
+            for (int i = 0; i < 32; ++i)
+                for (int p = 0; p < kProducers; ++p, ++off) rec(log, off, 100 + p, 1 + i, 1000 + uint64_t(off), "later");
+            for (int p = 0; p < kProducers; ++p, ++off) rec(log, off, -1, -1, uint64_t(p) + 1, "update");
+            for (int i = 0; i < 64; ++i, ++off) pad(log, off);
+            int64_t dirty = 0;
+            ASSERT_TRUE(clean(log, Pass{.coalesce = coalesce, .mapSlots = 4096, .dirty = &dirty}));   // tails: 1024 producers
+            EXPECT_EQ(dirty, kProducers) << "the watermark moves up to the oldest protected batch";
+            const auto offs = dataOffsets(log);
+            for (int64_t o = 0; o < kProducers; ++o) EXPECT_FALSE(offs.count(o)) << "superseded insert at " << o;
+        }
+        std::filesystem::remove_all(dir);
+    }
 }
 
 // Fix round 1 (finding 3): the window costs its budget at most - rings grow per batch, an expired producer is dropped at finish(),
@@ -659,7 +687,7 @@ TEST(CheckedWritesAutoIncCleanerRegression, WindowStaysWithinItsBudgetRegression
         EXPECT_TRUE(w.overflowed()) << "4096 producers of 32 batches do not fit 64 KiB";
         EXPECT_LE(w.bytes(), budget);
         w.finish(keysOf);
-        EXPECT_TRUE(w.protects(off - 1)) << "overflowed: conservative";
+        EXPECT_FALSE(w.protects(off - 1)) << "overflowed: the tails alone";
     }
 }
 
