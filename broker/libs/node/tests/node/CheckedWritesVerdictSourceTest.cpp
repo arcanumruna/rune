@@ -814,6 +814,38 @@ TEST(CheckedWritesVerdictSourceRegression, LeaderCutLosingMarkerStillCoversJudge
     EXPECT_EQ(r.vs.appendedForTest().size(), 2u);
 }
 
+// A new leader whose HW lags its log's markers (a restart, retention 0): it re-marks nothing those markers cover (spec §8.5,
+// it writes markers only for what it judges after them).  The re-mark came from its own index, which compaction had thinned.
+TEST(CheckedWritesVerdictSourceRegression, NewLeaderWithALaggingHwDoesNotRemarkBelowItsLogsMarkersRegression) {
+    Rig r;
+    auto& m = r.install(7, tagEquals(9));
+    r.st.constraintSets.onChange(0, setOf(1, {m.ident()}));
+    r.log.control();
+    std::vector<Rec> recs;
+    for (int64_t id = 1; id <= 13; ++id) recs.push_back({id, id == 5 ? 9 : 1});
+    r.log.data(recs);
+    r.log.control();   // the marker at 14 covering [1,14)
+    std::vector<uint8_t> marker(cr::markerBatchBytes(1));
+    const cr::MarkerEntry me{4, kViolation, rune::view::constraintIdOf(7, 1)};
+    ASSERT_NE(cr::buildVerdictMarker(marker, cr::MarkerHeader{1, 14, 1, 1}, std::span<const cr::MarkerEntry>(&me, 1)), 0u);
+    verdictFeedBatch(&r.st, marker.data(), marker.size(), 14);
+    ASSERT_EQ(r.st.markers.committedThrough(), 0) << "no HW yet";
+    r.start();
+    r.drive(1'000'000'000);
+    EXPECT_TRUE(r.vs.appendedForTest().empty()) << "re-marked what the marker at 14 covers";
+    EXPECT_EQ(r.vs.judgedThrough(), 15);
+    r.log.data({{20, 9}});
+    r.drive(2'000'000'000);
+    ASSERT_EQ(r.vs.appendedForTest().size(), 1u);
+    const auto h = cr::parseMarkerHeader(r.vs.appendedForTest()[0].data(), r.vs.appendedForTest()[0].size());
+    ASSERT_TRUE(h.has_value());
+    EXPECT_GE(h->fromOffset, 14);
+    EXPECT_EQ(h->finalThrough, 16);
+    verdictOnHw(r.st, 1'000'000);
+    EXPECT_EQ(r.st.markers.committedThrough(), 16);
+    EXPECT_EQ(r.st.rejected.mismatches(), 0u);
+}
+
 TEST(CheckedWritesVerdictSourceRegression, RequestChangeAboveTwoToTheThirtyOneReturnsTheOffsetRegression) {
     constexpr int64_t kOffset = (int64_t{1} << 31) + 5;
     Rig r;

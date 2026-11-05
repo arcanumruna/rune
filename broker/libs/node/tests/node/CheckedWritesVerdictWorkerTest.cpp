@@ -271,7 +271,7 @@ TEST(CheckedWritesVerdictWorkerRegression, CleanerVerdictBoundStartsClosedRegres
     EXPECT_NE(r.replica->cleanerVerdictBound(), rune::replication::PartitionReplica::kNoCleanerLso);
 }
 
-TEST(CheckedWritesVerdictWorkerRegression, ActivationWithAnUncommittedMarkerRemarksFromWRegression) {
+TEST(CheckedWritesVerdictWorkerRegression, ActivationWithAnUncommittedMarkerMarksAboveItRegression) {
     VerdictRig r(/*follower=*/true);
     r.typed();
     r.installRejectView(kRej, kObj, tagRule(9));
@@ -291,11 +291,10 @@ TEST(CheckedWritesVerdictWorkerRegression, ActivationWithAnUncommittedMarkerRema
     const auto log = r.readLog();
     ASSERT_GE(log.markers.size(), 2u);
     const auto& second = log.markers[1];
-    EXPECT_EQ(second.header.fromOffset, first.header.fromOffset) << "the new activation marks again from W, the committed watermark";
-    EXPECT_GE(second.header.finalThrough, first.header.finalThrough);
-    for (const auto& e : second.entries)
-        if (std::get<0>(e) < first.header.finalThrough) EXPECT_NE(std::find(first.entries.begin(), first.entries.end(), e), first.entries.end()) << "entry at " << std::get<0>(e);
-    for (const auto& e : first.entries) EXPECT_NE(std::find(second.entries.begin(), second.entries.end(), e), second.entries.end()) << "entry at " << std::get<0>(e);
+    // Spec §8.5 ruling (06 re-mark fix): the uncommitted marker commits with the new leader's log, so it marks only above it.
+    EXPECT_GE(second.header.fromOffset, first.header.finalThrough) << "the new activation re-marked below its log's marker";
+    EXPECT_GT(second.header.finalThrough, first.header.finalThrough);
+    for (const auto& e : second.entries) EXPECT_GE(std::get<0>(e), first.header.finalThrough) << "entry at " << std::get<0>(e);
     EXPECT_EQ(r.writeState()->rejected.mismatches(), 0u);
 }
 
