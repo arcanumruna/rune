@@ -534,9 +534,10 @@ public:
             }
 
             // A pass that ended where it started stays pointless until one of its inputs moves.
-            const StalledPass inputs{firstDirtyOffset, firstUncleanable, snap->size(), replica->cleanerVerdictBound(),
-                                     replica->cleanerVerdictMarkerEnd(), replica->cleanerMarkerRemovalBound()};
-            if (const auto stalled = stalledPasses_.find(log); stalled != stalledPasses_.end() && stalled->second == inputs) continue;
+            const StalledPass inputs{firstDirtyOffset, firstUncleanable, snap->front().baseOffset, snap->back().endOffset,
+                                     replica->cleanerVerdictBound(), replica->cleanerVerdictMarkerEnd(), replica->cleanerMarkerRemovalBound()};
+            if (const auto stalled = stalledPasses_.find(log);
+                stalled != stalledPasses_.end() && stalled->second.inputs == inputs && nowMs < stalled->second.retryAtMs) continue;
 
             // Compute byte-based dirty ratio (Kafka-exact formula §3.2).
             //
@@ -825,7 +826,9 @@ public:
         // Advance lastCleanOffset to passEnd (MONOTONIC: forward-only, leader-only).
         // The guard also covers the ensureCheckpoint ordering hazard (a restored
         // checkpoint may already have bumped the watermark past passEnd).
-        if (leader && !damagedLog && !advance && !held && passResult.groups.empty()) stalledPasses_[best.log] = best.inputs;
+        // A stamped marker or a producer tail turns removable with the clock alone: look again once the shorter of the two has passed.
+        if (leader && !damagedLog && !advance && !held && passResult.groups.empty())
+            stalledPasses_[best.log] = {best.inputs, nowMs + std::min(effectiveDeleteRetentionMs_(*best.replica), producerIdExpirationMs_)};
         else stalledPasses_.erase(best.log);
         if (advance) best.replica->setLastCleanOffset(passEnd);
         if (held) best.replica->setCleanerProgress(progress);
@@ -1208,11 +1211,12 @@ private:
     /// What a selected pass saw; equal to the next cycle's view of a log whose pass changed nothing, the log is left alone.
     struct StalledPass {
         int64_t firstDirtyOffset, firstUncleanable;
-        std::size_t sealedSegments;
+        int64_t frontBase, sealedEnd;
         int64_t verdictBound, verdictMarkerEnd, markerRemovalBound;
         bool operator==(const StalledPass&) const = default;
     };
-    std::unordered_map<const rune::storage::Log*, StalledPass> stalledPasses_;   ///< cleaner thread; one entry per stalled log
+    struct Stalled { StalledPass inputs; int64_t retryAtMs; };
+    std::unordered_map<const rune::storage::Log*, Stalled> stalledPasses_;   ///< cleaner thread; one entry per stalled log
     std::unordered_set<std::string> uncleanable_;   ///< #840: dirs of damaged logs (cleaner thread; cold)
     uint64_t passesStarted_ = 0;                    ///< test seam (cleaner thread)
     uint64_t cleanedSeq_ = 0;   ///< fix round 2: unique .cleaned output names (cleaner thread)

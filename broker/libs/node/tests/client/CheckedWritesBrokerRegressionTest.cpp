@@ -1710,6 +1710,8 @@ void expectRemoveRoutesAsSend(OneBroker& b, rc::Client& c, const std::string& na
         return got.size() >= kRecords;
     }, 10s)) << "delivered " << got.size() << " of " << kRecords << " removes";
     EXPECT_TRUE(got == tombstones) << "every tombstone sits on the partition of its record with the same key bytes";
+    for (const Seen& s : col.seen())
+        if (!s.tombstone) EXPECT_EQ(tombstones.count({s.partition, s.key}), 1u) << "a delivered send sits on the partition of its record";
 
     // The cleaner skips the active segment: one tombstone per partition for a key that was never written (the segment is
     // past its 256 bytes, so the next append rolls it once the provisioner has a segment ready) seals the real tombstones.

@@ -1348,13 +1348,27 @@ TEST(CompactionCleanerAgentRegression, ALogHeldAtItsVerdictCoverageIsNotRescanne
     replica->onLeaderLogAppended();
     ASSERT_GE(log.segmentBaseOffsets().size(), 4u);
 
+    // A second, plainly dirty log registered after it: the one the held log used to starve.
+    auto dirB = cp6TempDir("cp_verdict_held_other");
+    Log logB(dirB.string(), /*rollBytes=*/128);
+    auto replicaB = std::make_unique<PartitionReplica>(
+        makeCompactConfig(1842, 0.0), Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &logB, &transport);
+    replicaB->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    replicaB->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    replicaB->becomeLeader(1, {1});
+    for (int v = 0; v < 60; ++v) logB.append(cp6Batch(v, "k" + std::to_string(v % 5), "v" + std::to_string(v)), v);
+    replicaB->onLeaderLogAppended();
+
     rune::node::ReplicaRegistry registry;
     PartitionReplica* raw = replica.get();
+    PartitionReplica* rawB = replicaB.get();
     registry.add(1841, 0, std::move(replica));
+    registry.add(1842, 0, std::move(replicaB));
     rune::node::LogCleanerAgent agent(&registry, /*cycleBudgetBytes=*/0);
     int64_t now = 1'000'000;
     for (int i = 0; i < 40; ++i, now += 1'000'000) agent.doWork(now);
-    EXPECT_LE(agent.passesStartedForTest(), 2u) << "the log held at its verdict coverage was scanned again every cycle";
+    EXPECT_GT(rawB->lastCleanOffset(), 0) << "the log held at its verdict coverage starved the other log";
+    EXPECT_LE(agent.passesStartedForTest(), 12u) << "the log held at its verdict coverage was scanned again every cycle";
     EXPECT_EQ(raw->lastCleanOffset(), 4) << "the pass cleans up to the marker's coverage, not beyond";
 
     marker(17, 5, 17);   // the verdicts for the rest arrive
@@ -1365,6 +1379,7 @@ TEST(CompactionCleanerAgentRegression, ALogHeldAtItsVerdictCoverageIsNotRescanne
     EXPECT_GT(agent.passesStartedForTest(), before) << "the log was not cleaned again once its inputs changed";
     EXPECT_GT(raw->lastCleanOffset(), 4);
     fs::remove_all(dir);
+    fs::remove_all(dirB);
 }
 
 // PR #851 review re-attack (edf94a73, #840): the uncleanable mark outlives the damage it was set for.  The log is
@@ -2932,6 +2947,69 @@ std::vector<uint8_t> r1BatchAt(Log& log, int64_t off) {
     return {bytes.begin(), bytes.begin() + r.totalLength()};
 }
 } // namespace
+
+// A held log can turn productive with the clock alone: a COMMIT marker stamped with a delete horizon is removed once the horizon
+// passes, with nothing else about the log changing.  The agent must look again after the retention period.
+TEST(CompactionCleanerAgentRegression, AHeldLogIsCleanedAgainWhenAMarkerHorizonPassesRegression) {
+    namespace cr = rune::storage::control_record;
+    auto dir = cp6TempDir("cp_verdict_held_horizon");
+    Log log(dir.string(), /*rollBytes=*/128);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(1843, 0.0);
+    cfg.deleteRetentionMs = 200;
+    auto owned = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, &transport);
+    owned->publishCleanerLso(rune::replication::PartitionReplica::kNoCleanerLso);
+    owned->publishCleanerVerdictBound(rune::replication::PartitionReplica::kNoCleanerLso);
+    owned->becomeLeader(1, {1});
+    PartitionReplica* raw = owned.get();
+    const auto control = [&](std::vector<uint8_t> b, int64_t offset) {
+        for (int i = 0; i < 8; ++i) b[static_cast<std::size_t>(i)] = static_cast<uint8_t>(static_cast<uint64_t>(offset) >> (8 * i));
+        log.append(b, offset);
+    };
+    const std::vector<cr::ChangeMember> members{cr::ChangeMember{7, 3, 99}};
+    std::vector<uint8_t> change(cr::changeBatchBytes(static_cast<uint16_t>(members.size())));
+    (void)cr::buildConstraintSetChange(change, 1, members);
+    control(std::move(change), 0);
+    constexpr int64_t kPid = 9;
+    log.append(r1Txn(1, "a", "1", kPid, 0, 0), 1);
+    log.append(r1Marker(2, kPid, 0, true), 2);
+    log.append(r1Txn(3, "a", "2", kPid, 0, 1), 3);
+    log.append(r1Marker(4, kPid, 0, true), 4);   // the producer's last batch
+    std::vector<uint8_t> verdict(cr::markerBatchBytes(0));
+    (void)cr::buildVerdictMarker(verdict, cr::MarkerHeader{1, 5, 1, 0}, {});
+    control(std::move(verdict), 5);
+    for (int64_t o = 6; o < 18; ++o) log.append(cp6Batch(o, "k" + std::to_string(o), "v"), o);   // sealed, past the coverage
+    raw->onLeaderLogAppended();
+
+    rune::node::ReplicaRegistry registry;
+    registry.add(1843, 0, std::move(owned));
+    Cp6MinimalConsensusAgent consensus;
+    rune::node::NodeRuntimeAgent duty(consensus, nullptr, nullptr, nullptr, &registry, nullptr);   // installs the cleaner's outputs
+    rune::node::LogCleanerAgent agent(&registry, /*cycleBudgetBytes=*/0);
+    int64_t now = 2'000'000;
+    const auto cycles = [&](int n) {
+        for (int i = 0; i < n; ++i, now += 1'000'000) {
+            duty.doWork(now);
+            raw->publishCleanerLso(PartitionReplica::kNoCleanerLso);
+            raw->publishCleanerVerdictBound(PartitionReplica::kNoCleanerLso);
+            agent.doWork(now);
+            duty.doWork(now);
+        }
+        log.reloadSegments();
+    };
+    const auto markerState = [&] {
+        const auto b = r1BatchAt(log, 2);
+        if (b.empty()) return std::string("gone");
+        return std::string(RecordBatchReader(b.data(), b.size()).hasDeleteHorizon() ? "stamped" : "plain");
+    };
+    cycles(12);
+    EXPECT_EQ(markerState(), "stamped") << "the superseded COMMIT marker is stamped with its delete horizon first";
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    cycles(12);
+    EXPECT_EQ(markerState(), "gone") << "the expired COMMIT marker was never removed";
+    fs::remove_all(dir);
+}
 
 // ===========================================================================
 // D3b fix round 1 (1): a marker is removed only once EVERY assigned replica —
