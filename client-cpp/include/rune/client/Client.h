@@ -935,7 +935,8 @@ public:
                          CompletionTarget target, Token token);
     /// Wide view keys: ScanViewRows (wire 89) - one page of the rows whose key starts with `prefix` (ViewKeyBuilder::prefix()),
     /// at most `limit` (capped by the broker).  Completion: OpKind::ScanViewRows, value = the row count, payload = the response's
-    /// next-token and rows fields verbatim (rune::client::view::decodeScanPayload).  Same BrokerTooOld gate as getViewRowK.
+    /// next-token and rows fields verbatim (rune::client::view::decodeScanPayload); a Completions polling it needs
+    /// maxResultBytes >= 64 KiB for a full page, else ResultTooLarge.  Same BrokerTooOld gate as getViewRowK.
     OpResult scanView(int32_t viewTopicId, std::span<const uint8_t> prefix, uint16_t limit, const ViewScanOptions& opts,
                       CompletionTarget target, Token token);
 

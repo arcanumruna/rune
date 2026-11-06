@@ -25,6 +25,8 @@
 #include <rune/client/detail/SecureZero.h>
 #include <rune/client/detail/OneToOneRingBuffer.h>
 #include <rune/client/producer/ProducerImpl.h>
+#include <rune/client/view/ViewPlanAuthor.h>
+#include <rune/client/view/ViewRowCodec.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/client/AuthMessages.h>
 #include <rune/protocol/client/GroupMessages.h>

@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <string_view>
 #include <type_traits>
 
 namespace rune::client {
@@ -62,6 +63,20 @@ public:
         }
         len_ = static_cast<uint8_t>(bytes.size());
         std::memcpy(buf_.data(), bytes.data(), len_);
+    }
+
+    /// The record key of a string(`fieldWidth`) key field holding `value` (at most `fieldWidth` bytes): for a field up to
+    /// kMaxInline wide the zero-padded field; for a wider one (send cannot route it) the value without trailing NULs, so
+    /// "abc" and "abc\0" route the same.  TypedTopic::claim and ViewKeyBuilder::partition() both key with it.
+    [[nodiscard]] static Key forStringField(std::string_view value, std::size_t fieldWidth) noexcept {
+        if (fieldWidth > kMaxInline) {
+            std::size_t len = value.size();
+            while (len > 0 && value[len - 1] == '\0') --len;
+            return Key(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), len));
+        }
+        std::array<uint8_t, kMaxInline> field{};
+        std::memcpy(field.data(), value.data(), value.size() < fieldWidth ? value.size() : fieldWidth);
+        return Key(std::span<const uint8_t>(field.data(), fieldWidth));
     }
 
     /// Construct from a trivially-copyable POD by treating its raw bytes as the

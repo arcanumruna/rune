@@ -1,6 +1,7 @@
 // src/view/ViewKeyBuilder.cpp
 #include <rune/client/view/ViewKeyBuilder.h>
 
+#include <rune/client/Key.h>
 #include <rune/codec/Record.h>
 #include <rune/codec/Serialize.h>
 #include <rune/codec/Utf8.h>
@@ -180,17 +181,17 @@ std::expected<std::vector<uint8_t>, std::string> ViewKeyBuilder::prefix() const 
 
 int32_t ViewKeyBuilder::partition() const noexcept {
     if (sourcePartitions_ <= 1 || !sourceKeyed_ || values_[0].kind == Kind::Unset) return -1;
-    // The wire key the producer routes: the column's bytes, little-endian at its width; a string's N bytes, zero padded.
-    uint8_t wire[128] = {};
     const Component& c = components_[0];
     const Value& v     = values_[0];
     if (c.type == PrimType::FixedStr) {
         if (v.kind != Kind::Str || v.s.size() > c.srcWidth) return -1;
-        std::copy(v.s.begin(), v.s.end(), wire);
-    } else {
-        const uint64_t raw = v.kind == Kind::Int ? static_cast<uint64_t>(v.i) : v.u;
-        for (uint16_t k = 0; k < wireKeyWidth_ && k < 8; ++k) wire[k] = static_cast<uint8_t>(raw >> (8 * k));
+        const Key k = Key::forStringField(v.s, c.srcWidth);   // the producer's own record key
+        return k.tooLong() ? -1 : k.partition(sourcePartitions_);
     }
+    // The wire key the producer routes: the column's bytes, little-endian at its width.
+    uint8_t wire[8] = {};
+    const uint64_t raw = v.kind == Kind::Int ? static_cast<uint64_t>(v.i) : v.u;
+    for (uint16_t k = 0; k < wireKeyWidth_ && k < 8; ++k) wire[k] = static_cast<uint8_t>(raw >> (8 * k));
     return rune::protocol::partitionFor(std::span<const uint8_t>(wire, wireKeyWidth_), sourcePartitions_, partitioner_);
 }
 

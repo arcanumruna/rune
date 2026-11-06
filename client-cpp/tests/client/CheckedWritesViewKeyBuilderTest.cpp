@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <rune/catalog/testing/GoldenScript.h>
+#include <rune/client/Key.h>
 #include <rune/client/view/ViewKeyBuilder.h>
 #include <rune/client/view/ViewRowCodec.h>
 #include <rune/codec/ViewKeyEncoding.h>
@@ -190,4 +191,17 @@ TEST(CheckedWritesViewKeyBuilder, DecodeScanPayload) {
     EXPECT_TRUE(empty.nextToken.empty());
     empty.status = 0;   // ViewRowResult::kOk
     EXPECT_TRUE(empty.complete());
+}
+
+TEST(CheckedWritesViewKeyBuilderRegression, LongStringKeyRoutesLikeTheProducerRegression) {
+    cd::DescriptorBuilder d("s32");
+    d.addFixedStr("name", 32, 1, true);
+    auto b = rcv::ViewKeyBuilder::fromPlan(planOf({}, "name"), d.build(), 4, Partitioner::Fnv1a);
+    ASSERT_TRUE(b.has_value()) << b.error();
+    for (const std::string_view v : {"a", "abc", "alice", "bob", "carol", "dave", "eve"}) {
+        b->setString("name", v);
+        // TypedTopic::claim keys a string field wider than Key::kMaxInline with the value, trailing NULs stripped.
+        const rune::client::Key producer(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(v.data()), v.size()));
+        EXPECT_EQ(b->partition(), producer.partition(4)) << v;
+    }
 }
