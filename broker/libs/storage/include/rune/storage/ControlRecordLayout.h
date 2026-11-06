@@ -29,6 +29,7 @@ inline constexpr int16_t     kTxnJudge            = 19;
 inline constexpr int         kUnparseable         = -1;
 inline constexpr uint8_t     kPayloadVersion      = 1;
 inline constexpr std::size_t kMaxMarkerEntries    = 4096;
+inline constexpr std::size_t kMaxVerdictPlanBytes = 65536;
 
 struct MarkerEntry  { uint32_t offsetDelta; uint16_t code; uint32_t constraintId; };
 struct MarkerHeader { int64_t fromOffset; int64_t finalThrough; uint32_t constraintSetId; uint32_t count; };
@@ -142,6 +143,11 @@ inline std::optional<std::span<const uint8_t>> valueOf(const uint8_t* batch, std
 }
 
 [[nodiscard]] constexpr std::size_t reservationBatchBytes() noexcept { return detail::batchBytes(kReservationBytes); }
+
+/// The whole type-20 value: [version u8][viewObjectId u64][planFingerprint u64][kind u8] then three u32-prefixed blobs.
+[[nodiscard]] constexpr std::size_t verdictPlanPayloadBytes(std::size_t planLen, std::size_t outLen, std::size_t srcLen) noexcept {
+    return 1 + 8 + 8 + 1 + 3 * 4 + planLen + outLen + srcLen;
+}
 
 /// 0 = `out` too small.
 inline std::size_t buildReservation(std::span<uint8_t> out, uint64_t reservedThroughN) noexcept {
