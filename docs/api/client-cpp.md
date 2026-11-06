@@ -694,12 +694,14 @@ if (st.status == StatsResult::kOk) {
 ```
 
 - `StatsResult::status`: `kOk`, `kUnknownObject`, `kInvalidRequest`, `kBusy`, `kNotAuthorized`, and the client-side `kNotLeader` (the leader was not
-  reached within `ddlRetryBudget`; a `Redirect` or `NotLeader` from the broker is followed as for `getViewRow`).
+  reached within `ddlRetryBudget`; a `Redirect` or `NotLeader` from the broker is followed as for `getViewRow`) and `kBrokerTooOld`
+  (nothing was sent; see below).
 - `stats` holds `(id, value)` in ascending id order; `get(id)` returns `std::nullopt` for an id the broker did not report (a stat of the other
   scope, or a counter the partition does not have). `constraints` holds the per-constraint rejection counts of a topic.
 - The token form `getStats(scope, objectId, partition, target, token)` completes with `OpKind::GetStats`; `value` is the stat count and
   the payload goes to `decodeStatsPayload`.
-- It ends `BrokerTooOld` without sending when the seed's `brokerVersion` is below `kBrokerVersionCheckedWrites` (10), and the gateway
+- When the seed's `brokerVersion` is below `kBrokerVersionCheckedWrites` (10) nothing is sent: `getStatsAndWait` returns
+  `StatsResult::kBrokerTooOld` and the token form completes `OpStatus::BrokerTooOld`. The gateway
   answers a session below `kClientVersionCheckedWrites` with `InvalidRequest`. `rune stats` and `show topic` / `show view` are built on it.
 
 ## Catalog and security reads

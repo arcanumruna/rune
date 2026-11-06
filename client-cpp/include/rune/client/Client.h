@@ -266,7 +266,7 @@ struct ViewScanOptions {
 };
 
 /// Result of GetStats (wire 91/92).  `status` is StatsResponse's (0 OK, 4 unknown object, 5 invalid request, 6 busy,
-/// 45 not authorized) or kNotLeader; `stats` (ascending id) and `constraints` are empty unless status == kOk.
+/// 45 not authorized), kNotLeader or kBrokerTooOld; `stats` (ascending id) and `constraints` are empty unless status == kOk.
 struct StatsResult {
     static constexpr uint16_t kOk              = rune::protocol::client::StatsResponse::kOk;
     static constexpr uint16_t kUnknownObject   = rune::protocol::client::StatsResponse::kUnknownObject;

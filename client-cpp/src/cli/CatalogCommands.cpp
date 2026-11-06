@@ -462,7 +462,9 @@ std::string formatStatsJson(std::string_view objectKind, std::string_view name, 
         for (std::size_t k = 0; k < p.result.constraints.size(); ++k)
             o << (k == 0 ? "" : ", ") << "{\"constraintId\": " << p.result.constraints[k].constraintId << ", \"label\": "
               << jsonString(constraintName(p, k)) << ", \"rejections\": " << p.result.constraints[k].rejections << "}";
-        o << "]}";
+        o << "]";
+        if (!p.constraintsNote.empty()) o << ", \"constraintsNote\": " << jsonString(p.constraintsNote);
+        o << "}";
     }
     o << "]}";
     return o.str();

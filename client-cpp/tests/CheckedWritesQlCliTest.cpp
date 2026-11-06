@@ -490,6 +490,9 @@ TEST(CheckedWritesQlCli, UnauthorizedSourceNotesTheConstraintRows) {
     const std::string text = rune::cli::formatStatsText(std::vector<rune::cli::PartitionStats>{p});
     EXPECT_NE(text.find("    constraints (not authorized on source 'character')\n"), std::string::npos) << text;
     EXPECT_EQ(text.find("(no counters)"), std::string::npos) << text;
+    EXPECT_EQ(rune::cli::formatStatsJson("view", "v", std::vector<rune::cli::PartitionStats>{p}),
+              "{\"view\": \"v\", \"partitions\": [{\"partition\": 0, \"stats\": {\"rejectionsKeyExists\": 4}, \"constraints\": [], "
+              "\"constraintsNote\": \"not authorized on source 'character'\"}]}");
 }
 
 TEST(CheckedWritesQlCli, ShowStatsTextNotesAnOldBrokerAndFailsOnOtherRefusals) {
