@@ -73,6 +73,7 @@
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/NamespaceMessages.h>
 #include <rune/protocol/client/NamespaceUsageMessages.h>
+#include <rune/protocol/client/StatsMessages.h>
 #include <rune/client/NamespaceLimitFields.h>
 
 #include <chrono>
@@ -263,6 +264,56 @@ struct ViewScanOptions {
     uint64_t             requestedFingerprint = 0;
     int64_t              minOffset            = -1;
 };
+
+/// Result of GetStats (wire 91/92).  `status` is StatsResponse's (0 OK, 4 unknown object, 5 invalid request, 6 busy,
+/// 45 not authorized) or kNotLeader; `stats` (ascending id) and `constraints` are empty unless status == kOk.
+struct StatsResult {
+    static constexpr uint16_t kOk              = rune::protocol::client::StatsResponse::kOk;
+    static constexpr uint16_t kUnknownObject   = rune::protocol::client::StatsResponse::kUnknownObject;
+    static constexpr uint16_t kInvalidRequest  = rune::protocol::client::StatsResponse::kInvalidRequest;
+    static constexpr uint16_t kBusy            = rune::protocol::client::StatsResponse::kBusy;
+    static constexpr uint16_t kNotAuthorized   = rune::protocol::client::StatsResponse::kNotAuthorized;
+    /// Client-side only, as ViewRowResult::kNotLeader: the partition's leader was not reached within the retry budget.
+    static constexpr uint16_t kNotLeader       = ViewRowResult::kNotLeader;
+
+    struct Constraint {
+        uint32_t constraintId = 0;
+        uint64_t rejections   = 0;
+    };
+
+    uint16_t                                      status = kUnknownObject;
+    std::vector<std::pair<uint16_t, int64_t>>     stats;
+    std::vector<Constraint>                       constraints;
+
+    /// nullopt when the broker did not report `id` (a stat of the other scope, or one it does not have).
+    [[nodiscard]] std::optional<int64_t> get(rune::protocol::client::StatId id) const noexcept {
+        for (const auto& [statId, value] : stats)
+            if (statId == static_cast<uint16_t>(id)) return value;
+        return std::nullopt;
+    }
+};
+
+/// Parses a GetStats completion's payload - [count x {statId u16, value i64}][nConstraints u16][n x {constraintId u32,
+/// rejections u64}] - where `count` is the completion's value.  False on a truncation or trailing bytes.
+[[nodiscard]] inline bool decodeStatsPayload(std::span<const uint8_t> payload, uint16_t count, StatsResult& out) {
+    namespace rpc = rune::protocol::client;
+    const std::size_t statLen = count * rpc::StatsResponse::kStatBytes;
+    if (payload.size() < statLen + 2) return false;
+    const uint16_t n = rpc::detail::getLE16(payload.data(), static_cast<int>(statLen));
+    if (payload.size() != statLen + 2 + n * rpc::StatsResponse::kConstraintBytes) return false;
+    out.stats.clear();
+    out.constraints.clear();
+    for (uint16_t i = 0; i < count; ++i) {
+        const int at = static_cast<int>(i * rpc::StatsResponse::kStatBytes);
+        out.stats.emplace_back(rpc::detail::getLE16(payload.data(), at), rpc::detail::getLE64(payload.data(), at + 2));
+    }
+    for (uint16_t i = 0; i < n; ++i) {
+        const int at = static_cast<int>(statLen + 2 + i * rpc::StatsResponse::kConstraintBytes);
+        out.constraints.push_back({static_cast<uint32_t>(rpc::detail::getLE32(payload.data(), at)),
+                                   static_cast<uint64_t>(rpc::detail::getLE64(payload.data(), at + 4))});
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // IdleMode — controls the runner-thread idle strategy.
@@ -940,6 +991,14 @@ public:
     OpResult scanView(int32_t viewTopicId, std::span<const uint8_t> prefix, uint16_t limit, const ViewScanOptions& opts,
                       CompletionTarget target, Token token);
 
+    /// GetStats (wire 91) - the counters of one topic partition (scope TopicPartition, objectId = the topic id) or one view
+    /// partition (scope ViewPartition, objectId = the view topic id), served by the partition leader.  Completion:
+    /// OpKind::GetStats, value = the stat count, payload = decodeStatsPayload's input; status != OK -> BrokerError / errorCode =
+    /// the StatsResponse status.  A Redirect / NotLeader is followed as getViewRow does.  A seed whose brokerVersion is known and
+    /// below kBrokerVersionCheckedWrites ends it BrokerTooOld, nothing sent.
+    OpResult getStats(rune::protocol::client::StatsScope scope, int32_t objectId, int32_t partition,
+                      CompletionTarget target, Token token);
+
     // ---- Catalog history (Task 5): DDL with the DDL extension ---------------
     // Every DDL (the overloads above included, with default DdlOptions) carries
     // the DDL extension: statement, clientName, a 128-bit requestId (F14) and
@@ -1066,6 +1125,10 @@ public:
     /// scanView(), blocking (64 KiB reservation: a page is at most 61,576 bytes).
     ViewScanResult scanViewAndWait(int32_t viewTopicId, std::span<const uint8_t> prefix, uint16_t limit,
                                    const ViewScanOptions& opts = {}, std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+
+    /// getStats(), blocking.  A non-OK status is returned in the result; routing as getViewRowAndWait.
+    StatsResult getStatsAndWait(rune::protocol::client::StatsScope scope, int32_t objectId, int32_t partition,
+                                std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
 
     // ---- Catalog history (Task 5): blocking DDL conveniences ----------------
     // Pump-until-done wrappers over the token forms above.  A broker errorCode
@@ -1510,7 +1573,8 @@ private:
     /// re-sent on the named node's session within the retry budget: the DDLs and
     /// GetViewRow (a view row is served only by its source partition's leader).
     [[nodiscard]] static constexpr bool isRoutedCtlOp(OpKind op) noexcept {
-        return isDdlOp(op) || op == OpKind::GetViewRow || op == OpKind::GetViewRowK || op == OpKind::ScanViewRows;
+        return isDdlOp(op) || op == OpKind::GetViewRow || op == OpKind::GetViewRowK || op == OpKind::ScanViewRows ||
+               op == OpKind::GetStats;
     }
     /// A DDL that is not in flight (its frame waits for the resend pump).
     [[nodiscard]] static bool ddlWaitsForResend(const DdlRetry& r) noexcept {

@@ -42,6 +42,7 @@
 
 #include <rune/client/Completion.h>
 #include <rune/client/detail/CompletionRing.h>
+#include <rune/protocol/client/StatsMessages.h>
 
 #include <concurrent/BackOffIdleStrategy.h>
 
@@ -172,6 +173,8 @@ public:
         case OpKind::ListNamespaces:  // Namespaces (Task 11): the raw ListNamespacesResponse frame
         case OpKind::NamespaceUsage:  // Phase 2 Task 16: the raw NamespaceUsageResponse frame
             return detail::CompletionRing::completionRecordBytes(cfg_.maxResultBytes);
+        case OpKind::GetStats:
+            return detail::CompletionRing::completionRecordBytes(rune::protocol::client::StatsResponse::kMaxEncodedSize);
         default:
             return detail::CompletionRing::completionRecordBytes(cfg_.maxErrorText);
         }

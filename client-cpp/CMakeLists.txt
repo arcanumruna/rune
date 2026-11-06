@@ -1632,6 +1632,7 @@ if(BUILD_TESTING)
             tests/client/ClaimClientTest.cpp
             tests/client/TypedClaimTest.cpp
             tests/client/CheckedWritesTypedTopicCqTest.cpp   # checked writes: TypedTopic cq forms, ProducerRef
+            tests/client/CheckedWritesClientStatsTest.cpp    # checked writes Part 08: getStats over GetStats 91
             tests/client/IngressEndpointRoutingTest.cpp
             tests/client/ClientResponseEgressRegressionTest.cpp   # NAT egress Task 7
             tests/producer/ProducerRouteParkTest.cpp

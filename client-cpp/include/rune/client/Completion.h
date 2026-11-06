@@ -59,6 +59,7 @@ enum class OpKind : uint8_t {
     NamespaceDdl,       ///< Client::namespaceDdl() / createNamespace() / setNamespaceLimits()
     ListNamespaces,     ///< Client::listNamespaces(afterNsId, max, target, token) / listNamespaces(timeout)
     NamespaceUsage,     ///< Phase 2 Task 16: Client::namespaceUsage(name, target, token) / namespaceUsage(name, timeout)
+    GetStats,           ///< Client::getStats() / getStatsAndWait(); value = the stat count, payload = decodeStatsPayload's input
 };
 
 enum class OpStatus : uint8_t {
