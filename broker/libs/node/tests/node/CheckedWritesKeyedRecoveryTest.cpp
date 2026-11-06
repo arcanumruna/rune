@@ -498,3 +498,29 @@ TEST(CheckedWritesKeyedRecoveryRegression, UniqueClaimsSurviveRestartRegression)
     fresh.foldAll();
     expectSameClaims(*fresh.vs.instanceForTest(kViewTopic, 0), inst);
 }
+
+// One record dirties at most 5 extras rows (removeExtra: itself and both neighbours; addExtra: the new row and the old head), and the
+// pass bound must cover them: every single-record delta of a heavily colliding unique view stays within the bound it was sized for.
+TEST(CheckedWritesKeyedRecoveryRegression, UniqueClaimsDeltaFitsTheBoundRegression) {
+    Writer w(uniqueNames(), "unique-bound");
+    const int64_t K = w.comp.plan.keyWidth, W = 8, rowLen = w.comp.rowLayout.rowLen;
+    const int64_t perRecord = 2 * (5 + K) + rowLen + (5 + W + K) + 2 * (5 + K + 2 * W + 5) + 5 * (5 + W + K + 2 * W + 1 + rowLen);
+    const int64_t fixed = rune::node::ViewSnapshotChannel::kDeltaHeaderBytes + rune::view::kCheckpointCrcBytes + rune::view::kCheckpointV3HeaderBytes +
+                          4 * rune::view::kCheckpointV3TableHeaderBytes;
+    w.vs.driveFolds(kSrcTopic, 0, [&](int64_t, int64_t) { return rune::storage::LogReadView{}; }, 0, rune::view::kNoSkip, 0);
+    EXPECT_EQ(w.vs.maxRecordsPerPassForTest(kViewTopic, 0), (w.ch.deltas.maxMsgLength() - fixed) / perRecord);
+
+    // "a" owned by c1 with extras c10, c11, c12 (list head c12); "b" owned by c30 with extras c40, c41. The middle extra c11
+    // renames to "b" and takes it over from c30: it leaves a's list (c11, c12, c10), c30 joins b's list (c30, c41).
+    const std::pair<uint64_t, const char*> setup[] = {{1, "a"}, {10, "a"}, {11, "a"}, {12, "a"}, {30, "b"}, {40, "b"}, {41, "b"}};
+    for (const auto& [id, name] : setup) w.log.append({Rec{id, 1, name, 0}});
+    w.foldAll();
+    const std::size_t before = w.file.size();
+    w.log.append({Rec{11, 1, "b", 0}});
+    w.foldAll();
+    const int64_t frame = static_cast<int64_t>(w.file.size() - before) + rune::node::ViewSnapshotChannel::kDeltaHeaderBytes;
+    const int64_t oldBound = 2 * (5 + K) + rowLen + (5 + W + K) + 2 * (5 + K + 2 * W + 5) + 2 * (5 + W + K + 2 * W + 1 + rowLen);
+    EXPECT_GT(frame - fixed, oldBound);
+    EXPECT_LE(frame - fixed, perRecord);
+    EXPECT_LE(fixed + w.vs.maxRecordsPerPassForTest(kViewTopic, 0) * (frame - fixed), w.ch.deltas.maxMsgLength()) << "a full pass of such records overflows the ring";
+}

@@ -18,6 +18,9 @@ namespace rune::view {
 // Orders two source wire keys of `keyType` by value: <0, 0, >0.
 [[nodiscard]] int compareSourceKeys(rune::codec::PrimType keyType, std::string_view a, std::string_view b) noexcept;
 
+// Most extras rows one source record can dirty: removeExtra touches the row and both list neighbours, addExtra the new row and the old head.
+inline constexpr std::size_t kMaxExtrasRowsPerRecord = 5;
+
 class UniqueClaims {
 public:
     UniqueClaims(uint16_t keyWidth, uint8_t wireWidth, uint32_t rowLen, rune::codec::PrimType sourceKeyType, uint64_t hashSeed,

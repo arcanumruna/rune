@@ -3,6 +3,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <cstring>
@@ -10,7 +12,13 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include <rune/codec/Descriptor.h>
+#include <rune/node/AdminChannels.h>
+#include <rune/node/ViewCheckpointScan.h>
+#include <rune/node/ViewSnapshotChannel.h>
+#include <rune/node/WorkerViewSet.h>
 #include <rune/node/VerdictSource.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/ql/Backends.h>
@@ -375,23 +383,46 @@ TEST(CheckedWritesConstraintVerdict, SeveralVerdictViewsOneRejectsNoViewChanges)
     r.put(creates(r, 7, 11, 100));
     r.put({r.character(50, 1, "Foo")});
     r.start();
-    const auto dump = [&] {
-        std::string s;
-        for (const char* n : {"foo", "u7n0", "u7n10"}) {
-            rv::ViewKey k;
-            std::copy(n, n + std::strlen(n), k.bytes.begin());
-            k.len = 24;
-            const uint8_t* row = names.inst->table.get(k);
-            s += row == nullptr ? "-" : std::string(reinterpret_cast<const char*>(row), names.comp.rowLayout.rowLen);
-        }
-        return s + std::to_string(names.inst->table.size());
+    const auto nameKeyOf = [&](const char* n) {
+        rv::ViewKey k;
+        std::copy(n, n + std::strlen(n), k.bytes.begin());
+        k.len = uint8_t(names.inst->keyed->keyWidth);
+        return k;
     };
-    const std::string before = dump();
+    const auto bytesOf = [](const rv::ViewTable& t, const rv::ViewKey& k, std::size_t len) {
+        const uint8_t* p = t.get(k);
+        return p == nullptr ? std::string("-") : std::string(reinterpret_cast<const char*>(p), len);
+    };
+    // The unique view's rows, owner map and both claims tables, sizes and the affected keys.
+    const auto dump = [&](std::initializer_list<const char*> taken, std::initializer_list<uint64_t> ids) {
+        const rv::UniqueClaims& cl = *names.inst->claims;
+        const std::size_t K = names.inst->keyed->keyWidth, W = names.inst->keyed->wireKeyWidth;
+        std::string s;
+        for (const char* n : {"foo", "u7n0", "u7n10"}) s += bytesOf(names.inst->table, nameKeyOf(n), names.comp.rowLayout.rowLen);
+        for (const char* n : taken) s += bytesOf(cl.indexTable(), nameKeyOf(n), 2 * W + 5);
+        for (const uint64_t id : ids) {
+            const std::string wire = wireOf(id);
+            const auto wk = rv::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(wire.data()), wire.size()});
+            s += bytesOf(*names.inst->owners, wk, K) + bytesOf(cl.extrasTable(), wk, K + 2 * W + 1 + names.comp.rowLayout.rowLen);
+        }
+        return s + std::to_string(names.inst->table.size()) + "/" + std::to_string(names.inst->owners->size()) + "/" +
+               std::to_string(cl.indexTable().size()) + "/" + std::to_string(cl.extrasTable().size());
+    };
+    const std::string before = dump({"foo", "fresh"}, {50, 900, 901});
     EXPECT_EQ(r.put1(r.character(900, 7, "Foo")), (V{kViolation, kUniqueId}));
     EXPECT_EQ(stats.value(7, "characters"), 11);
     EXPECT_FALSE(r.indexHas(900));
-    EXPECT_EQ(dump(), before);
+    EXPECT_EQ(dump({"foo", "fresh"}, {50, 900, 901}), before);
     EXPECT_EQ(r.put1(r.character(50, 1, "other", 0, 0, kInsert)), (V{kExists, 0}));   // the key index is first
+
+    // The unique member prepares a new name before the stats member rejects the 13th create of user 7: that name stays unclaimed.
+    EXPECT_EQ(r.put1(r.character(901, 7, "fresh")), (V{0, 0}));   // the 12th
+    const std::string full = dump({"foo", "fresh"}, {50, 901, 902});
+    EXPECT_EQ(r.put1(r.character(902, 7, "Fresh2")), (V{kViolation, kStatsId}));
+    EXPECT_EQ(dump({"foo", "fresh"}, {50, 901, 902}), full);
+    EXPECT_EQ(names.inst->claims->ownerOf(nameKeyOf("fresh2")), nullptr);
+    EXPECT_EQ(names.inst->table.get(nameKeyOf("fresh2")), nullptr);
+    EXPECT_FALSE(r.indexHas(902));
 }
 
 TEST(CheckedWritesConstraintVerdict, UniqueBeforeItsChecksInsideOneMember) {
@@ -461,4 +492,108 @@ TEST(CheckedWritesConstraintVerdict, UnjudgedReplayBelowKNeverRejects) {
     EXPECT_EQ(names.inst->claims->extras(), 20u);
     EXPECT_EQ(names.inst->counters.uniqueConflicts, 20u);
     EXPECT_EQ(stats.value(7, "characters"), 14);
+}
+
+// A judged unique member (the verdict-source path: the judge folds it and the member checkpoint hook pushes it) keeps its claims
+// through a restart: tables 0, 1, 6 and 7 of the recovered instance equal the judged one's.
+TEST(CheckedWritesConstraintVerdictRegression, JudgedUniqueClaimsSurviveRestartRegression) {
+    Rig r;
+    const rv::CompileResult comp = r.view(kUniqueName, 7).comp;
+    const std::string dir = (std::filesystem::temp_directory_path() / ("rune-cw-judged-unique-" + std::to_string(::getpid()))).string();
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    struct Cleanup { std::string d; ~Cleanup() { std::error_code ec; std::filesystem::remove_all(d, ec); } } cleanup{dir};
+    const auto installOn = [&](ViewSnapshotChannel& ch, WorkerViewSet& vs, bool recovery) {
+        ViewPlanUpdateMsg m;
+        m.viewTopicId = comp.plan.viewTopicId;
+        m.recovery    = recovery;
+        m.planBlob    = rv::serialize(comp.plan);
+        m.outDescBlob = rune::codec::serialize(comp.outputDescriptor);
+        m.srcDescBlob = rune::codec::serialize(r.src);
+        EXPECT_TRUE(encodeViewPlanUpdate(ch.install, ViewSnapshotChannel::kInstallMsgType, m));
+        EXPECT_EQ(vs.drainInstalls(), 1);
+        return m.planBlob;
+    };
+    ViewSnapshotChannel ch;
+    WorkerViewSet vs(ch, dir, 12345);
+    const auto blob = installOn(ch, vs, false);
+
+    // 30 characters over 10 names, folded before the member joined: 20 extras.
+    std::vector<Rec> early;
+    for (uint64_t id = 1; id <= 30; ++id) early.push_back(r.character(id, 1, "n" + std::to_string(id % 10)));
+    r.log.data(early);
+    r.log.control();
+    ConstraintSet set;
+    set.id = 1;
+    set.members[set.count++] = {7, VerdictViewKind::Unique, rv::verdictPlanFingerprint(blob)};
+    PartitionWriteState st;
+    TopicWriteSpec spec;
+    st.spec = &spec;
+    st.constraintSets.onChange(r.log.next - 1, set);
+    vs.ensureVerdictSource(kSrc, 0, st)->bindLeader(nullptr, 1, 0);
+
+    std::vector<uint8_t> file;
+    const auto drive = [&] {
+        for (int i = 0; i < 6; ++i) {
+            vs.driveFolds(kSrc, 0, [&](int64_t from, int64_t) { return r.log.read(from); }, r.log.next, rv::kNoSkip, 200'000'000, nullptr, 1, true, {}, &st,
+                          vs.ensureVerdictSource(kSrc, 0, st));
+            verdictOnHw(st, 1'000'000);
+            ch.deltas.drain([&](int32_t type, aeron::concurrent::AtomicBuffer& b, OneToOneByteRing::index_t off, OneToOneByteRing::index_t len) {
+                if (type != ViewSnapshotChannel::kDeltaMsgType) return;
+                const uint8_t* p = b.buffer() + off + ViewSnapshotChannel::kDeltaHeaderBytes;
+                file.insert(file.end(), p, p + len - ViewSnapshotChannel::kDeltaHeaderBytes);
+            });
+        }
+    };
+    drive();
+    // Judged: owners 1..3 leave (promotions), a duplicate name is refused, a new name and a rename are taken.
+    const int64_t refused = r.log.data({Rig::tombstone(1), Rig::tombstone(2), Rig::tombstone(3), r.character(31, 2, "N5"), r.character(32, 2, "fresh"),
+                                         r.character(14, 1, "renamed")}) + 3;
+    drive();
+    ASSERT_TRUE(st.rejected.isRejected(refused));
+    const ViewInstance* judged = vs.instanceForTest(comp.plan.viewTopicId, 0);
+    ASSERT_NE(judged, nullptr);
+    ASSERT_TRUE(judged->claims.has_value());
+    ASSERT_GE(judged->counters.uniquePromotions, 3u);
+    ASSERT_GT(judged->claims->extras(), 0u);
+    ASSERT_FALSE(file.empty()) << "the member checkpoint hook pushed nothing";
+    {
+        std::ofstream f(viewCheckpointFilePath(dir, comp.plan.viewTopicId, 0), std::ios::binary);
+        f.write(reinterpret_cast<const char*>(file.data()), std::streamsize(file.size()));
+    }
+
+    ViewSnapshotChannel ch2;
+    WorkerViewSet vs2(ch2, dir, 99);
+    (void)installOn(ch2, vs2, true);
+    vs2.materializeRecoveryInstancesFor(kSrc, 0, r.log.next);
+    const ViewInstance* back = vs2.instanceForTest(comp.plan.viewTopicId, 0);
+    ASSERT_NE(back, nullptr);
+    ASSERT_TRUE(back->claims.has_value());
+
+    const std::size_t K = judged->keyed->keyWidth, W = judged->keyed->wireKeyWidth, rowLen = judged->layout.rowLen;
+    const auto bytesAt = [](const rv::ViewTable& t, const rv::ViewKey& k, std::size_t len) {
+        const uint8_t* p = t.get(k);
+        return p == nullptr ? std::vector<uint8_t>{} : std::vector<uint8_t>(p, p + len);
+    };
+    EXPECT_EQ(back->table.size(), judged->table.size());
+    EXPECT_EQ(back->owners->size(), judged->owners->size());
+    EXPECT_EQ(back->claims->indexTable().size(), judged->claims->indexTable().size());
+    EXPECT_EQ(back->claims->extrasTable().size(), judged->claims->extrasTable().size());
+    EXPECT_EQ(back->claims->extras(), judged->claims->extras());
+    EXPECT_EQ(back->counters.uniqueConflicts, judged->counters.uniqueConflicts);
+    std::vector<std::string> names{"fresh", "renamed", "n5"};
+    for (int i = 0; i < 10; ++i) names.push_back("n" + std::to_string(i));
+    for (const std::string& n : names) {
+        rv::ViewKey k;
+        std::copy(n.begin(), n.end(), k.bytes.begin());
+        k.len = uint8_t(K);
+        EXPECT_EQ(bytesAt(back->table, k, rowLen), bytesAt(judged->table, k, rowLen)) << n;
+        EXPECT_EQ(bytesAt(back->claims->indexTable(), k, 2 * W + 5), bytesAt(judged->claims->indexTable(), k, 2 * W + 5)) << n;
+    }
+    for (uint64_t id = 1; id <= 40; ++id) {
+        const std::string wire = wireOf(id);
+        const auto wk = rv::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(wire.data()), wire.size()});
+        EXPECT_EQ(bytesAt(*back->owners, wk, K), bytesAt(*judged->owners, wk, K)) << id;
+        EXPECT_EQ(bytesAt(back->claims->extrasTable(), wk, K + 2 * W + 1 + rowLen), bytesAt(judged->claims->extrasTable(), wk, K + 2 * W + 1 + rowLen)) << id;
+    }
 }

@@ -242,10 +242,10 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
         // A move: the old row's delete, the new row's upsert and, with an owner map, the owner's upsert.
         perRecord = checkpointV3EntryHeaderBytes(static_cast<uint8_t>(k.keyWidth)) * 2 + inst.layout.rowLen;
         if (k.ownerMapped) perRecord += checkpointV3EntryHeaderBytes(k.wireKeyWidth) + k.keyWidth;
-        // Claims: a move touches two index entries and two extras.
+        // Claims: a move touches two index entries and up to kMaxExtrasRowsPerRecord extras.
         if (inst.claims) {
             const ClaimsRowLens c = claimsRowLensOf(inst);
-            perRecord += 2 * (checkpointV3EntryHeaderBytes(static_cast<uint8_t>(k.keyWidth)) + c.index) + 2 * (checkpointV3EntryHeaderBytes(k.wireKeyWidth) + c.extras);
+            perRecord += 2 * (checkpointV3EntryHeaderBytes(static_cast<uint8_t>(k.keyWidth)) + c.index) + kMaxExtrasRowsPerRecord * (checkpointV3EntryHeaderBytes(k.wireKeyWidth) + c.extras);
         }
     } else if (inst.agg) {
         const AggLayout& a = inst.agg->layout;
@@ -1374,6 +1374,7 @@ void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) 
     inst.lastEncodedO = -1;
     inst.transientCursor = CursorFresh{};
     inst.readiness = ViewReadiness::RebuildingViews;
+    inst.counters.uniqueConflicts = 0;
     ++inst.counters.checkpointDiscards;
     chargeMem_(inst);
     spdlog::info("VIEW-DISCARD view={} partition={} reason={}", inst.plan.viewTopicId, inst.partition, viewDiscardReasonName(reason));
