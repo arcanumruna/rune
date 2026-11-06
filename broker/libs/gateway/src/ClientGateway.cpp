@@ -7490,10 +7490,17 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             resp.correlationId    = ret.correlationId;
             resp.status           = static_cast<uint16_t>(ret.errorCode);
             resp.count            = static_cast<uint16_t>(ret.recordCount);
-            const std::size_t statLen = resp.count * pc::StatsResponse::kStatBytes;
-            resp.statBytes        = chunk.first(statLen);
-            resp.constraintCount  = pc::detail::getLE16(chunk.data(), static_cast<int>(statLen));
-            resp.constraintBytes  = chunk.subspan(statLen + 2, resp.constraintCount * pc::StatsResponse::kConstraintBytes);
+            const std::size_t statLen = static_cast<std::size_t>(resp.count) * pc::StatsResponse::kStatBytes;
+            const std::size_t nConstraints = chunk.size() >= statLen + 2 ? pc::detail::getLE16(chunk.data(), static_cast<int>(statLen)) : 0;
+            if (resp.count > pc::StatsResponse::kMaxStats || nConstraints > pc::StatsResponse::kMaxConstraintEntries ||
+                chunk.size() != statLen + 2 + nConstraints * pc::StatsResponse::kConstraintBytes) [[unlikely]] {
+                resp.status = pc::StatsResponse::kInvalidRequest;
+                resp.count  = 0;
+            } else {
+                resp.statBytes       = chunk.first(statLen);
+                resp.constraintCount = static_cast<uint16_t>(nConstraints);
+                resp.constraintBytes = chunk.subspan(statLen + 2);
+            }
             sendReliable_(*session, scratch_.data(), resp.encode(scratch_.data()));
             return;
         }
@@ -10766,22 +10773,27 @@ void ClientGateway::handleGetStats(const uint8_t* buf, std::size_t len)
         (void)rejectRequest_(buf, len, SR::kUnknownObject, "GetStats: object not served here");
         return;
     }
-    int32_t routeTopic = m->objectId;
-    if (viewScope) {
-        if (const uint16_t gate = viewRowGate_(m->objectId, m->partition); gate != kViewRowNoGate) {
-            (void)rejectRequest_(buf, len, gate, "GetStats: view not served here (C1)");
-            return;
-        }
-        routeTopic = viewSourceOf_(m->objectId);
-    }
-    const rune::node::TopicSpec* spec = viewScope ? topicRegistry_->viewSinkSpec(m->objectId) : topicRegistry_->topic(m->objectId);
-    if (spec == nullptr || routeTopic < 0) {
+    const int32_t routeTopic = viewScope ? viewSourceOf_(m->objectId) : m->objectId;
+    const rune::node::TopicSpec* spec = routeTopic >= 0 ? topicRegistry_->topic(routeTopic) : nullptr;
+    if (spec == nullptr) {
         (void)rejectRequest_(buf, len, SR::kUnknownObject, "GetStats: unknown object");
         return;
     }
     if (m->partition < 0 || m->partition >= spec->partitionCount) {
         (void)rejectRequest_(buf, len, SR::kInvalidRequest, "GetStats: partition out of range");
         return;
+    }
+    if (viewScope) {
+        // The gate speaks ViewRowResponse codes; a StatsResponse has its own (2 is not one of them).
+        const uint16_t gate = viewRowGate_(m->objectId, m->partition);
+        if (gate == pc::ViewRowResponse::kNotReady) {
+            sendRouteRefusal_(*session, m->sessionId, m->correlationId, {});
+            return;
+        }
+        if (gate != kViewRowNoGate) {
+            (void)rejectRequest_(buf, len, SR::kUnknownObject, "GetStats: view not served here (C1)");
+            return;
+        }
     }
     if (std::string_view ep; partitionLedElsewhere_(routeTopic, m->partition, ep)) {
         sendRouteRefusal_(*session, m->sessionId, m->correlationId, ep);

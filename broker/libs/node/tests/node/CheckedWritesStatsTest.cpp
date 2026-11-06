@@ -261,3 +261,48 @@ TEST(CheckedWritesStatsRegression, FollowerNeverAnswersStaleCountersRegression) 
     EXPECT_TRUE(after.stats.empty());
     EXPECT_TRUE(after.constraints.empty());
 }
+
+namespace {
+/// Installs account_characters over the rig's source (typed by characterSource()) without folding anything.
+void installAccountView(VerdictRig& r, const rune::codec::Descriptor& d) {
+    rune::view::ViewPlan plan;
+    plan.viewName = "account_characters";
+    plan.persistence = 1;
+    plan.sources = {{VerdictRig::kSrc, "characterId"}};
+    plan.keyComponents = {{"userId", 0, "userId"}, {"characterId", 0, "characterId"}};
+    plan.output = {{"gender", rune::codec::PrimType::UInt16, 0, "gender", rune::view::MergeRule::Replace}};
+    const rune::codec::Descriptor* srcs[] = {&d};
+    auto comp = rune::view::compileView(plan, srcs, cwkeyed::kViewTopic);
+    ASSERT_TRUE(comp.has_value());
+    r.installKeyedView(*comp);
+}
+}  // namespace
+
+TEST(CheckedWritesStatsRegression, ViewNotYetHostedAnswersTheSentinelRegression) {
+    VerdictRig r;
+    const rune::codec::Descriptor d = cwkeyed::characterSource();
+    r.useSource(d, KeyShape{});
+    r.passes(50);
+    installAccountView(r, d);
+    if (r.vs->instanceServeState(cwkeyed::kViewTopic, 0).hosted) GTEST_SKIP() << "the instance is hosted by the install";
+    const auto reply = r.getStats(pc::StatsScope::ViewPartition, cwkeyed::kViewTopic, 0);
+    EXPECT_TRUE(reply.notLeader) << "an unmaterialized instance has no counters to serve";
+    EXPECT_TRUE(reply.stats.empty());
+}
+
+TEST(CheckedWritesStatsRegression, ExpiredReadLeaseAnswersTheSentinelRegression) {
+    VerdictRig r;
+    const rune::codec::Descriptor d = cwkeyed::characterSource();
+    r.useSource(d, KeyShape{});
+    r.passes(50);
+    installAccountView(r, d);
+    r.driveUntilFolded(cwkeyed::kViewTopic, r.leo());
+    ASSERT_FALSE(r.getStats(pc::StatsScope::TopicPartition, VerdictRig::kSrc, 0).notLeader);
+    ASSERT_FALSE(r.getStats(pc::StatsScope::ViewPartition, cwkeyed::kViewTopic, 0).notLeader);
+    r.worker->requireViewReadLease();
+    for (const auto scope : {pc::StatsScope::TopicPartition, pc::StatsScope::ViewPartition}) {
+        const auto reply = r.getStats(scope, scope == pc::StatsScope::TopicPartition ? VerdictRig::kSrc : cwkeyed::kViewTopic, 0);
+        EXPECT_TRUE(reply.notLeader) << "no lease, no counters, scope " << static_cast<int>(scope);
+        EXPECT_TRUE(reply.stats.empty());
+    }
+}

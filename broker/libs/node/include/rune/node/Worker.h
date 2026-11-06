@@ -4673,7 +4673,9 @@ private:
             } else if (const auto* srcRep = findOwnedReplica_(viewSet_->viewSourceTopic(objectId), partition);
                        srcRep == nullptr || srcRep->role() != rune::replication::Role::Leader || leaseExpired) {
                 ret.errorCode = kViewRowNotLeaderInternal;
-            } else if (const ViewFoldCounters* counters = viewSet_->foldCounters(objectId, partition)) {
+            } else if (const ViewFoldCounters* counters = viewSet_->foldCounters(objectId, partition); counters == nullptr) {
+                ret.errorCode = kViewRowNotLeaderInternal;   // the plan is installed but the instance is not materialized yet
+            } else {
                 collectViewPartitionStats(*counters, sink);
             }
         }

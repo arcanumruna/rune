@@ -81,6 +81,7 @@ TEST(CheckedWritesStatsGateway, RoutesToTheOwner) {
     EXPECT_EQ(resp->status, SR::kOk);
     EXPECT_EQ(g.servedTotal(), 2u);
     EXPECT_EQ(g.served(owner), 2u) << "scope 2 lands on the source's worker";
+    EXPECT_EQ(resp->count, 4u) << "the four view counters survive the encode";
 }
 
 TEST(CheckedWritesStatsGateway, RefusalsInOrder) {
@@ -186,4 +187,42 @@ TEST(CheckedWritesStatsGateway, NotLeaderSentinelRedirectsByScope) {
         EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::Redirect)) << static_cast<int>(scope);
         EXPECT_EQ(err->message, kOtherEndpoint) << static_cast<int>(scope);
     }
+}
+
+TEST(CheckedWritesStatsGatewayRegression, ScopeTwoRefusalsAreStatsStatusesRegression) {
+    StatsGatewayRig g(4, 2);
+    g.send(g.frame(1, pc::StatsScope::ViewPartition, kView, 7));
+    EXPECT_EQ(g.lastStatus(), SR::kInvalidRequest) << "a view partition past the source's count is not retriable";
+    g.send(g.frame(2, pc::StatsScope::ViewPartition, 99, 0));
+    EXPECT_EQ(g.lastStatus(), SR::kUnknownObject);
+
+    // The source's placement is not committed: the gate's NotReady is a bare NotLeader, never StatsResponse status 2.
+    std::vector<rune::metadata::RoutingImage::BuildEntry> img;
+    for (int32_t p = 0; p < 4; ++p) img.push_back({rune::metadata::gpidOf(kSrc, p), CwViewReadGatewayRig::kSelf, 1});
+    g.rig.gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Static));
+    g.send(g.frame(3, pc::StatsScope::ViewPartition, kView, 0));
+    const auto err = pc::ErrorResponse::decode(g.rig.lastFrame.data(), g.rig.lastFrame.size());
+    ASSERT_TRUE(err.has_value());
+    EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_EQ(g.servedTotal(), 0u);
+}
+
+TEST(CheckedWritesStatsGatewayRegression, MalformedWorkerChunkIsRefusedRegression) {
+    StatsGatewayRig g;
+    rune::node::WorkerReturn ret;
+    ret.type = rune::node::WorkerReturn::Type::StatsResult;
+    ret.sessionId = g.rig.sid; ret.correlationId = 9; ret.readTopicId = kSrc; ret.readPartition = 0;
+    ret.isolation = static_cast<uint8_t>(pc::StatsScope::TopicPartition);
+    ret.recordCount = 3;
+    ret.chunk.assign(3 * SR::kStatBytes - 1, 0);   // truncated mid-entry
+    g.rig.gw.handleWorkerReturnForTest(ret);
+    ASSERT_TRUE(g.lastStats().has_value());
+    EXPECT_EQ(g.lastStats()->status, SR::kInvalidRequest);
+    EXPECT_EQ(g.lastStats()->count, 0u);
+
+    ret.recordCount = 0;
+    ret.chunk = {1, 0};   // claims one constraint, carries none
+    g.rig.gw.handleWorkerReturnForTest(ret);
+    ASSERT_TRUE(g.lastStats().has_value());
+    EXPECT_EQ(g.lastStats()->status, SR::kInvalidRequest);
 }
