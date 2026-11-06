@@ -112,6 +112,13 @@ public:
     [[nodiscard]] int64_t logStart() const noexcept { return logStart_; }
 
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);
+    /// P9-5: a replacement plan of a logged member.  It replays the log below judgedThrough() without judging, and joins the set
+    /// when a change record names it (the owner asks for one once candidateCaughtUp()).
+    void addCandidate(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint);
+    void removeCandidate(uint64_t viewObjectId, uint64_t planFingerprint);
+    [[nodiscard]] bool hasCandidate(uint64_t viewObjectId, uint64_t planFingerprint) const noexcept;
+    [[nodiscard]] bool hasCandidates() const noexcept;
+    [[nodiscard]] bool candidateCaughtUp(uint64_t viewObjectId, uint64_t planFingerprint) const noexcept;
     void removeVerdictView(int32_t viewTopicId);
     /// The view was dropped: a member with the same plan installed since judges in its place (#786).
     void markLeaving(int32_t viewTopicId) noexcept;
@@ -138,6 +145,9 @@ public:
     void holdJudgeForTest(bool hold) noexcept { held_ = hold; }
     [[nodiscard]] uint8_t lastIntentForTest() const noexcept { return lastIntent_; }
     [[nodiscard]] bool retiringForTest(uint64_t viewObjectId) const noexcept;
+    [[nodiscard]] bool candidateForTest(uint64_t viewObjectId) const noexcept {
+        return std::any_of(members_.begin(), members_.end(), [&](const Member& m) { return m.candidate && m.objectId == viewObjectId; });
+    }
     [[nodiscard]] std::size_t memberCountForTest() const noexcept { return members_.size(); }
 
 private:
@@ -148,10 +158,13 @@ private:
         TestRejectRule              rule;
         rune::view::Prospect        prospect;
         uint8_t                     keyWidth = 0;   // KeyIndex: the wire key width of the source's key field
-        bool                        retiring = false, leaving = false;
+        bool                        retiring = false, leaving = false, candidate = false;
         int64_t                     leaveOffset = -1;
     };
 
+    void   addMember_(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint, bool candidate);
+    template <class ReadRangeFn>
+    int    replayCandidates_(ReadRangeFn& readRange, int64_t bound, const rune::view::AbortedTxnFilter& aborted);
     void   activate_(PartitionWriteState& state);
     int    replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted);
     int    judgeBatches_(const rune::storage::LogReadView& view, int64_t limit, const rune::view::AbortedTxnFilter& aborted);
@@ -319,10 +332,28 @@ bool VerdictSource::switchSet_(int64_t A, ReadRangeFn& readRange, const rune::vi
         members_[i].leaveOffset = A;
     }
     active_.swap(scratchIdx_);
+    for (const std::size_t i : active_) {
+        if (!members_[i].candidate) continue;
+        members_[i].candidate = false;
+        ++stats_.candidateSwaps;
+    }
     activeSet_ = next;
     setFrom_ = A + 1;
     if (next.empty()) sawEmptyChange_ = true;
     return true;
+}
+
+// The candidates fold what the judge has judged, after its pass, so a candidate that was caught up at the start of a pass still is at
+// the next one while writes keep flowing.
+template <class ReadRangeFn>
+int VerdictSource::replayCandidates_(ReadRangeFn& readRange, int64_t bound, const rune::view::AbortedTxnFilter& aborted) {
+    int work = 0;
+    for (Member& m : members_) {
+        if (!m.candidate || !checkpointSettled(*m.inst) || !clampToLogStart_(m) || m.inst->foldCursor >= judgeCursor_) continue;
+        const rune::storage::LogReadView v = readRange(m.inst->foldCursor, std::max(bound, judgeCursor_ + 1));
+        if (!v.empty()) work += replay_(m, v, judgeCursor_, aborted);
+    }
+    return work;
 }
 
 template <class ReadRangeFn>
@@ -373,6 +404,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
         }
         state.rejected.noteCovered(judgeCursor_);
     }
+    work += replayCandidates_(readRange, bound, aborted);
     state.judgedThrough = judgeCursor_;
     work += emitMarkers_(state, nowNs);
     work += pushCheckpoints_(state);

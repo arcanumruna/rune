@@ -374,6 +374,10 @@ public:
     /// Test seam: this worker's catalog position is at least `through` (a cluster test cannot hold one node's catalog back).
     void raiseCatalogThroughForTest(int64_t through) noexcept { catalogThrough_ = std::max(catalogThrough_, through); }
     [[nodiscard]] int64_t catalogThroughForTest() const noexcept { return catalogThrough_; }
+    /// A replacement plan of this object builds as a candidate in some judge.
+    [[nodiscard]] bool candidateForTest(uint64_t viewObjectId) const noexcept {
+        return std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& kv) { return kv.second->candidateForTest(viewObjectId); });
+    }
     /// Test seam: every judge, existing and later created, is held (nothing activates, replays or judges).
     void holdJudgesForTest(bool hold) noexcept {
         holdJudges_ = hold;
@@ -602,6 +606,12 @@ public:
                                                        int32_t partition) const {
         auto it = views_.find(instKey(viewTopicId, partition));
         return it == views_.end() ? nullptr : &it->second.counters;
+    }
+
+    // True when the (view, partition) instance is a unique view with a claims index (stat 32 is served).
+    [[nodiscard]] bool hasUniqueClaims(int32_t viewTopicId, int32_t partition) const {
+        auto it = views_.find(instKey(viewTopicId, partition));
+        return it != views_.end() && it->second.claims.has_value();
     }
 
     // Count of live per-(view, partition) instances.

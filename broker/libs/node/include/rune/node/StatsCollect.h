@@ -85,9 +85,10 @@ inline void collectTopicPartitionStats(const PartitionWriteState* state, const r
     }
 }
 
-/// Ids 33-36 of one led view partition.
-inline void collectViewPartitionStats(const ViewFoldCounters& counters, StatsSink& sink) noexcept {
+/// Ids 32-36 of one led view partition; 32 only for a unique view.
+inline void collectViewPartitionStats(const ViewFoldCounters& counters, StatsSink& sink, bool uniqueView = false) noexcept {
     using rune::protocol::client::StatId;
+    if (uniqueView) sink.add(StatId::uniqueConflicts, static_cast<int64_t>(counters.uniqueConflicts));
     sink.add(StatId::scanRows, static_cast<int64_t>(counters.scanRows));
     sink.add(StatId::scanPages, static_cast<int64_t>(counters.scanPages));
     sink.add(StatId::transientRecordsEvicted, static_cast<int64_t>(counters.transientRecordsEvicted));

@@ -159,7 +159,36 @@ VerdictSource::VerdictSource(int32_t srcTopicId, int32_t partition) : srcTopicId
 }
 
 void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint) {
+    addMember_(inst, kind, viewObjectId, planFingerprint, false);
+}
+
+void VerdictSource::addCandidate(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint) {
+    addMember_(inst, kind, viewObjectId, planFingerprint, true);
+}
+
+void VerdictSource::removeCandidate(uint64_t viewObjectId, uint64_t planFingerprint) {
+    if (std::erase_if(members_, [&](const Member& m) { return m.candidate && m.objectId == viewObjectId && m.fingerprint == planFingerprint; }) == 0) return;
+    reindex_();
+    recomputeCap_();
+}
+
+bool VerdictSource::hasCandidate(uint64_t viewObjectId, uint64_t planFingerprint) const noexcept {
+    return std::any_of(members_.begin(), members_.end(), [&](const Member& m) { return m.candidate && m.objectId == viewObjectId && m.fingerprint == planFingerprint; });
+}
+
+bool VerdictSource::hasCandidates() const noexcept {
+    return std::any_of(members_.begin(), members_.end(), [](const Member& m) { return m.candidate; });
+}
+
+bool VerdictSource::candidateCaughtUp(uint64_t viewObjectId, uint64_t planFingerprint) const noexcept {
+    return activated() && std::any_of(members_.begin(), members_.end(), [&](const Member& m) {
+        return m.candidate && m.objectId == viewObjectId && m.fingerprint == planFingerprint && checkpointSettled(*m.inst) && m.inst->foldCursor >= judgeCursor_;
+    });
+}
+
+void VerdictSource::addMember_(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint, bool candidate) {
     Member m;
+    m.candidate = candidate;
     m.inst = inst;
     m.kind = kind;
     m.objectId = viewObjectId;

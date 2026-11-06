@@ -4676,7 +4676,7 @@ private:
             } else if (const ViewFoldCounters* counters = viewSet_->foldCounters(objectId, partition); counters == nullptr) {
                 ret.errorCode = kViewRowNotLeaderInternal;   // the plan is installed but the instance is not materialized yet
             } else {
-                collectViewPartitionStats(*counters, sink);
+                collectViewPartitionStats(*counters, sink, viewSet_->hasUniqueClaims(objectId, partition));
             }
         }
         ret.recordCount = sink.count();

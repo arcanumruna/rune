@@ -181,6 +181,88 @@ public:
         keyIndexOn_ = true;
         ASSERT_TRUE(worker->tryEnqueueOp(specOp_(true)));
     }
+    /// Part 09: a typed source of schema `d` (its first field the uint64 key), key-indexed, with autoincrement or without; returns once the
+    /// first leadership scan made it ready.  A restart brings the topic back the same way.
+    void createSourceTopic(rune::codec::Descriptor d, bool autoIncrement) {
+        customSrc_ = std::move(d);
+        if (autoIncrement) { createAutoIncTopic(); return; }
+        createKeyIndex(KeyShape{}, true);
+        for (int i = 0; i < kMaxPass && !keyIndexLogged_(); ++i) pass();
+        ASSERT_TRUE(keyIndexLogged_()) << "the key index never became the logged set's member";
+    }
+    /// Part 09: topic 1 of the spec's character examples, as the rig's source.
+    struct Char { uint64_t id = 0; uint64_t userId = 0; std::string name; uint16_t gender = 0; int64_t lastPlayed = 0; uint8_t intent = 0; bool tombstone = false; };
+    static rune::codec::Descriptor characterDescriptor() {
+        using rune::codec::PrimType;
+        return rune::codec::DescriptorBuilder("character", 1).add("characterId", PrimType::UInt64, 1, true).add("userId", PrimType::UInt64)
+            .addFixedStr("name", 16).add("gender", PrimType::UInt16).add("lastPlayed", PrimType::Int64).build();
+    }
+    void createCharacterTopic(bool autoIncrement = true) { createSourceTopic(characterDescriptor(), autoIncrement); }
+    /// One record of the current source: the wire key and the key field are `key`; `ints` / `strs` set the other fields by name.
+    struct SrcRecord {
+        uint64_t key = 0; uint8_t intent = 0; bool tombstone = false;
+        std::vector<std::pair<std::string, uint64_t>> ints;
+        std::vector<std::pair<std::string, std::string>> strs;
+    };
+    [[nodiscard]] std::vector<uint8_t> sourceBatch(std::span<const SrcRecord> recs, int64_t pid = -1, int32_t seq = -1, bool txn = false) const {
+        const rune::codec::Descriptor& d = *customSrc_;
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+        b.setTransactional(txn);
+        const auto put = [&](std::vector<uint8_t>& val, const char* field, uint64_t v) {
+            const auto* f = d.find(field);
+            for (uint32_t i = 0; i < rune::codec::fieldWidth(*f); ++i) val[4 + f->offset + i] = static_cast<uint8_t>(v >> (8 * i));
+        };
+        for (const SrcRecord& r : recs) {
+            std::string key(8, '\0');
+            for (int i = 0; i < 8; ++i) key[static_cast<std::size_t>(i)] = static_cast<char>(r.key >> (8 * i));
+            if (r.tombstone) { b.append(key, {}, 1000, r.intent); continue; }
+            std::vector<uint8_t> val(4 + d.blockLength, 0);
+            val[0] = static_cast<uint8_t>(d.blockLength); val[1] = static_cast<uint8_t>(d.blockLength >> 8);
+            val[2] = static_cast<uint8_t>(d.version); val[3] = static_cast<uint8_t>(d.version >> 8);
+            put(val, d.fields[0].name.c_str(), r.key);
+            for (const auto& [name, v] : r.ints) put(val, name.c_str(), v);
+            for (const auto& [name, text] : r.strs) {
+                const auto* f = d.find(name.c_str());
+                std::copy(text.begin(), text.end(), val.begin() + 4 + f->offset);
+            }
+            b.append(key, {reinterpret_cast<const char*>(val.data()), val.size()}, 1000, r.intent);
+        }
+        return b.build();
+    }
+    /// A Produce frame of source records (enableAcks() first); returns its correlation id.
+    int64_t appendRecords(std::span<const SrcRecord> recs, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1, bool txn = false) {
+        return produceBytes(sourceBatch(recs, pid, seq, txn), wireAcks, pid, seq);
+    }
+    [[nodiscard]] static SrcRecord srcOf(const Char& c) {
+        return SrcRecord{c.id, c.intent, c.tombstone, {{"userId", c.userId}, {"gender", c.gender}, {"lastPlayed", static_cast<uint64_t>(c.lastPlayed)}}, {{"name", c.name}}};
+    }
+    int64_t appendCharacters(std::span<const Char> chars, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1) {
+        std::vector<SrcRecord> recs;
+        for (const Char& c : chars) recs.push_back(srcOf(c));
+        return appendRecords(recs, wireAcks, pid, seq);
+    }
+    /// The control thread's install frame of a compiled view, then the catalog mark of the event.  `persisted` views need the IO agent.
+    void installCompiledView(rune::view::CompileResult c, uint64_t objectId, bool persisted = false) {
+        c.plan.viewObjectId = objectId;
+        c.plan.persistence = persisted ? 0 : 1;
+        if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0, backupPolicy);
+        installs_.emplace_back(c.plan.viewTopicId, [=, this, src = *customSrc_] { sendInstall_(c, src, persisted); });
+        installs_.back().second();
+        catalogMark(++catalogPos_);
+    }
+    /// A replace or drop event: the new plan is installed (if any) and the old view uninstalled before the one mark of the event.
+    void replaceCompiledView(int32_t oldTopic, std::optional<std::pair<rune::view::CompileResult, uint64_t>> next, bool persisted = false) {
+        std::erase_if(installs_, [&](const auto& i) { return i.first == oldTopic; });
+        if (next) {
+            next->first.plan.viewObjectId = next->second;
+            next->first.plan.persistence = persisted ? 0 : 1;
+            installs_.emplace_back(next->first.plan.viewTopicId, [=, this, c = next->first, src = *customSrc_] { sendInstall_(c, src, persisted); });
+            installs_.back().second();
+        }
+        ASSERT_TRUE(uninstallEncoded_(oldTopic));
+        catalogMark(++catalogPos_);
+    }
     /// Schema version 2 drops the source's v field: its SchemaUpdate (materialized as of 2) and its FilterSchema (the evolving blob).  Default key only.
     void dropValueField() {
         using rune::codec::PrimType;
@@ -268,6 +350,7 @@ public:
         typedWith_(5, keyShape_, keyIndexOn_ && specDelayPasses == 0);
         recovering_ = true;
         if (reinstall) reinstallAll();
+        if (catalogPos_ >= 0) catalogMark(catalogPos_);
         passes(3);
         delayedSpecIn_ = keyIndexOn_ ? specDelayPasses : 0;
     }
@@ -349,6 +432,25 @@ public:
     }
 
 private:
+    void sendInstall_(const rune::view::CompileResult& c, const rune::codec::Descriptor& src, bool persisted) {
+        rune::node::ViewPlanUpdateMsg m;
+        m.viewTopicId = c.plan.viewTopicId;
+        m.persistence = persisted ? 0 : 1;
+        m.recovery    = recovering_;
+        m.planBlob    = rune::view::serialize(c.plan);
+        m.outDescBlob = rune::codec::serialize(c.outputDescriptor);
+        m.srcDescBlob = rune::codec::serialize(src);
+        EXPECT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m));
+        passes(3);
+    }
+    bool uninstallEncoded_(int32_t viewTopicId) {
+        rune::node::ViewPlanUpdateMsg m;
+        m.viewTopicId = viewTopicId;
+        m.uninstall = true;
+        const bool ok = encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m);
+        passes(3);
+        return ok;
+    }
     [[nodiscard]] WorkerOp specOp_(bool keyIndex) const {
         TopicWriteSpecWire w;
         w.topicId = kSrc; w.keyFieldId = 0; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
@@ -1161,6 +1263,7 @@ private:
     }
     std::optional<AutoIncShape> autoInc_;
     uint64_t grantEpoch_ = 0;
+    int64_t catalogPos_ = -1;   ///< the catalog position of the last view event the rig sent a mark for
     int64_t rollBytes_;
     RigTuning tuning_;
     uint64_t cleanedSeq_ = 0;
