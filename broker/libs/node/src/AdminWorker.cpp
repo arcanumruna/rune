@@ -65,6 +65,9 @@ constexpr uint16_t kInvalidRequest       = 39;
 constexpr uint16_t kInvalidTopicName     = 40;
 constexpr uint16_t kViewSourceIsView     = 41;
 constexpr uint16_t kNotAuthorized        = 45;
+constexpr uint16_t kViewKeyExpressionInvalid = 59;   // only to clients >= kClientVersionCheckedWrites; older get 39
+constexpr uint16_t kViewConstraintInvalid    = 60;
+constexpr uint16_t kViewUniqueInvalid        = 61;
 constexpr uint16_t kNamespaceLimitExceeded = 52;   // only to clients >= kClientVersionNamespaces; older get 39
 
 /// A malformed request carries no meta: it is treated as id-less (pre-v8) — it is
@@ -1290,11 +1293,12 @@ void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
         return;
     }
     // A detail rides an ErrorResponse for the pre-v8 response types (their own
-    // frames have no detail field) — InvalidRequest (spec §9), and (checked writes) the schema and view-source
+    // frames have no detail field) — InvalidRequest (spec §9), and (checked writes) the schema and view
     // refusals whose reason names what to change.
     const bool viaError = !r.detail.empty() && deps_.respondError &&
                           (r.code == kInvalidRequest || r.code == kInvalidSchema || r.code == kViewSourceNotFound ||
-                           r.code == kViewKeyInvalid);
+                           r.code == kViewKeyInvalid || r.code == kViewNotCoPartitioned || r.code == kViewKeyExpressionInvalid ||
+                           r.code == kViewConstraintInvalid || r.code == kViewUniqueInvalid);
     auto byTemplate = [&](uint16_t tid, int64_t session, int64_t corr) {
         switch (tid) {
         case kTidDefineTopic:
@@ -1596,7 +1600,7 @@ AdminWorker::Built AdminWorker::buildAlter_(const AlterTopicMsg& m, const cat::C
 
 std::expected<cat::ViewDef, DdlRejection>
 AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint8_t persistence,
-                      const std::vector<uint8_t>& planBlob, int32_t viewTopicId, uint32_t nsId,
+                      const std::vector<uint8_t>& planBlob, int32_t viewTopicId, uint64_t viewObjectId, uint32_t nsId,
                       const cat::CatalogState& s) const {
     namespace rv = rune::view;
     std::optional<rv::ViewPlan> authored =
@@ -1633,11 +1637,25 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
         srcDescs.push_back(&e->descriptor);
         sourceNames.push_back(t->name);
     }
+    if (rv::needsV2(*authored) && clusterFeatureLevel_ < rune::replication::MetadataFeature::kCheckedWrites)
+        return Rejected(reject(kInvalidRequest, "plan v2 needs the checked-writes feature level"));
+    // TODO(checked writes Part 09): unique and check constraints.
+    if (authored->unique) return Rejected(reject(kViewUniqueInvalid, "unique views are not available yet"));
+    if (!authored->constraints.empty()) return Rejected(reject(kViewConstraintInvalid, "check constraints are not available yet"));
     auto compiled = rv::compileView(*authored,
                                     std::span<const rune::codec::Descriptor* const>(srcDescs.data(), srcDescs.size()),
                                     viewTopicId);
     if (!compiled) {
-        // CompileError is a message, not an enum: key-related → KeyInvalid, else FieldUnresolved.
+        switch (compiled.error().kind) {
+            case rv::CompileErrorKind::FieldUnresolved:      return Rejected(reject(kViewFieldUnresolved, compiled.error().message));
+            case rv::CompileErrorKind::KeyInvalid:           return Rejected(reject(kViewKeyInvalid, compiled.error().message));
+            case rv::CompileErrorKind::KeyExpressionInvalid: return Rejected(reject(kViewKeyExpressionInvalid, compiled.error().message));
+            case rv::CompileErrorKind::ConstraintInvalid:    return Rejected(reject(kViewConstraintInvalid, compiled.error().message));
+            case rv::CompileErrorKind::UniqueInvalid:        return Rejected(reject(kViewUniqueInvalid, compiled.error().message));
+            case rv::CompileErrorKind::NotCoPartitioned:     return Rejected(reject(kViewNotCoPartitioned, compiled.error().message));
+            case rv::CompileErrorKind::Generic:              break;
+        }
+        // Generic: the message decides — key-related → KeyInvalid, else FieldUnresolved.
         std::string lc = compiled.error().message;
         std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return Rejected(reject(lc.find("key") != std::string::npos ? kViewKeyInvalid : kViewFieldUnresolved));
@@ -1645,6 +1663,8 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
     // Phase 2a co-partitioning: an aggregate view over a multi-partition source is refused.
     const cat::TopicObject* first = s.topicByTopicId(authored->sources[0].topicId);
     if (rv::isAggregateView(compiled->plan) && first->partitions > 1) return Rejected(reject(kViewNotCoPartitioned));
+    if (rv::ownerMappedOf(compiled->plan) && first->partitions > 1)
+        return Rejected(reject(kViewNotCoPartitioned, "a view keyed on anything but the source key needs a source with one partition"));
 
     cat::ViewDef def;
     def.viewTopicId    = viewTopicId;
@@ -1657,6 +1677,7 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
     for (std::size_t i = 0; i < normalized.sources.size(); ++i) normalized.sources[i].topicId = static_cast<int32_t>(i);
     def.normalizedPlanBlob   = rv::serializeAuthored(normalized);
     compiled->plan.viewTopicId = viewTopicId;
+    compiled->plan.viewObjectId = viewObjectId;
     def.compiledPlanBlob     = rv::serialize(compiled->plan);
     def.outputDescriptorBlob = rune::codec::serialize(compiled->outputDescriptor);
     (void)name;
@@ -1671,7 +1692,7 @@ AdminWorker::Built AdminWorker::buildCreateView_(const CreateViewMsg& m, const c
         return Rejected(reject(kViewExists, {}, v->def.viewTopicId));
     if (const cat::TopicObject* t = s.topicByName(m.nsId, m.viewName)) return Rejected(reject(kTopicExists, {}, t->topicId));
     if (auto fold = foldCollision(s, m.nsId, m.viewName)) return Rejected(std::move(*fold));
-    auto def = viewDef_(m.viewName, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), m.nsId, s);
+    auto def = viewDef_(m.viewName, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), s.nextObjectId(), m.nsId, s);
     if (!def) return Rejected(std::move(def.error()));
     cat::CatalogEvent e;
     e.nsId        = m.nsId;
@@ -1691,7 +1712,7 @@ AdminWorker::Built AdminWorker::buildAlterView_(const AlterViewMsg& m, const cat
         return Rejected(reject(kSchemaConflict, "view " + quotedName(m.name) + " is at version " + std::to_string(v->version),
                                v->def.viewTopicId, static_cast<uint16_t>(std::min<uint32_t>(v->version, 0xFFFF))));
     // Ruling 4: a FRESH sink under the same objectId.
-    auto def = viewDef_(m.name, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), m.nsId, s);
+    auto def = viewDef_(m.name, m.keyField, m.persistence, m.planBlob, s.nextTopicId(), v->objectId, m.nsId, s);
     if (!def) return Rejected(std::move(def.error()));
     cat::CatalogEvent e;
     e.nsId        = m.nsId;
