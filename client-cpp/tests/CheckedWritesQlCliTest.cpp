@@ -536,3 +536,10 @@ TEST(CheckedWritesQlCli, ConstraintLabelOfAStatsResponseNamesTheOwningView) {
 TEST(CheckedWritesQlCli, StatsJsonEscapesControlCharacters) {
     EXPECT_NE(rune::cli::formatStatsJson("topic", std::string("a\n\t\x01\"b"), {}).find(R"("a\u000a\u0009\u0001\"b")"), std::string::npos);
 }
+
+TEST(CheckedWritesQlCli, LimitZeroIsRefusedBeforeAnythingRuns) {
+    std::string out, err;
+    const std::string script = writeTemp("limit0.rql", "select * from v limit 0;");
+    EXPECT_EQ(runCli({"ql", "--dry-run", "-f", script}, &out, &err), 1);
+    EXPECT_NE(err.find("limit must be >= 1"), std::string::npos) << err;
+}

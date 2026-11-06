@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 namespace rune::ql {
 
@@ -325,11 +326,11 @@ std::string constText(const PredicateNode& n) {
 
 bool isGroup(PredicateOp op) { return op == PredicateOp::And || op == PredicateOp::Or; }
 
+// Children precede their parent (the checked-write predicate wire form), so every child index is below its node's own.
 void renderNode(std::span<const PredicateNode> nodes, std::size_t i, std::string& out) {
-    if (i >= nodes.size()) { out += '?'; return; }
     const auto& n = nodes[i];
     auto child = [&](std::size_t c, bool parenGroups) {
-        const bool paren = parenGroups && c < nodes.size() && isGroup(nodes[c].op);
+        const bool paren = parenGroups && isGroup(nodes[c].op);
         if (paren) out += '(';
         renderNode(nodes, c, out);
         if (paren) out += ')';
@@ -338,8 +339,20 @@ void renderNode(std::span<const PredicateNode> nodes, std::size_t i, std::string
         case PredicateOp::Column: out += n.column; return;
         case PredicateOp::Const:  out += constText(n); return;
         case PredicateOp::Not:    out += "not ("; renderNode(nodes, n.a, out); out += ')'; return;
-        case PredicateOp::And: case PredicateOp::Or:
-            child(n.a, true); out += n.op == PredicateOp::And ? " and " : " or "; child(n.b, true); return;
+        case PredicateOp::And: case PredicateOp::Or: {
+            // A chain of 65535 terms is left-deep: walk its spine instead of recursing down it.
+            std::vector<std::size_t> spine{i};
+            while (isGroup(nodes[nodes[spine.back()].a].op)) spine.push_back(nodes[spine.back()].a);
+            out.append(spine.size() - 1, '(');
+            renderNode(nodes, nodes[spine.back()].a, out);
+            for (std::size_t k = spine.size(); k-- > 0;) {
+                const auto& g = nodes[spine[k]];
+                out += g.op == PredicateOp::And ? " and " : " or ";
+                child(g.b, true);
+                if (k != 0) out += ')';
+            }
+            return;
+        }
         default: break;
     }
     const char* op = "=";
@@ -359,6 +372,11 @@ ParseError planError(std::string msg) { return ParseError{0, 0, std::move(msg)};
 } // namespace
 
 std::string predicateText(std::span<const rune::view::PredicateNode> nodes) {
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        const auto& n = nodes[i];
+        if (n.op == PredicateOp::Column || n.op == PredicateOp::Const) continue;
+        if (n.a >= i || (n.op != PredicateOp::Not && n.b >= i)) return "<invalid predicate>";
+    }
     std::string out;
     if (!nodes.empty()) renderNode(nodes, nodes.size() - 1, out);
     return out;

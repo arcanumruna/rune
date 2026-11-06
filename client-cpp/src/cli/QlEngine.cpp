@@ -1065,7 +1065,7 @@ std::expected<SelectRead, std::string> planSelect(const ql::SelectDef& def, cons
         return std::unexpected("where must name every key column (" + columns(n) + ") for a point read, or the leading (" + columns(n - 1) + ") for a scan");
     }
     if (def.limit && read.kind == SelectRead::Kind::Point) return std::unexpected("limit is only valid on a scan");
-    read.limit = def.limit.value_or(0);
+    read.limit = def.limit.value_or(0);   // the parser refuses `limit 0`, so 0 only ever means no limit
 
     for (std::size_t i = 0; i < n; ++i) {
         if (named[i] == nullptr) continue;

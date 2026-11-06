@@ -320,3 +320,31 @@ TEST(CheckedWritesQlPlanRegression, V2AggregateNamesTheSourceKeyRegression) {
     EXPECT_EQ(v2->sources[0].keyField, "id");
     expectComponents(v2->groupBy, {{"userId", 0, "userId"}});
 }
+
+TEST(CheckedWritesQlPlanRegression, PredicateTextOfASelfReferencingPlanIsInvalidRegression) {
+    namespace v = rune::view;
+    const std::vector<v::PredicateNode> selfRef = {
+        {v::PredicateOp::Column, 0, 0, "n", rune::codec::PrimType{}, {}},
+        {v::PredicateOp::And, 1, 0, "", rune::codec::PrimType{}, {}}};
+    EXPECT_EQ(ql::predicateText(selfRef), "<invalid predicate>");
+    const std::vector<v::PredicateNode> forward = {
+        {v::PredicateOp::Not, 5, 0, "", rune::codec::PrimType{}, {}}};
+    EXPECT_EQ(ql::predicateText(forward), "<invalid predicate>");
+}
+
+TEST(CheckedWritesQlPlanRegression, PredicateTextOfALongAndChainRendersRegression) {
+    namespace v = rune::view;
+    constexpr uint16_t kTerms = 30000;
+    std::vector<v::PredicateNode> nodes = {{v::PredicateOp::Column, 0, 0, "n", rune::codec::PrimType{}, {}}};
+    uint16_t chain = 0;
+    std::string want(kTerms - 2, '(');
+    want += 'n';
+    for (uint16_t t = 1; t < kTerms; ++t) {
+        nodes.push_back({v::PredicateOp::Column, 0, 0, "n", rune::codec::PrimType{}, {}});
+        nodes.push_back({v::PredicateOp::And, chain, static_cast<uint16_t>(nodes.size() - 1), "", rune::codec::PrimType{}, {}});
+        chain = static_cast<uint16_t>(nodes.size() - 1);
+        want += " and n";
+        if (t != kTerms - 1) want += ')';
+    }
+    EXPECT_EQ(ql::predicateText(nodes), want);
+}
