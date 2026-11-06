@@ -1,7 +1,7 @@
 // Checked writes Part 09 Task 6: the two-phase drop and the retained plan record (R04a).  A dropped or replaced plan keeps judging
 // until W passes its change record; the plan record (type 20) in the log lets a leader whose catalog no longer has the plan judge
 // [K, L) all the same.  A rig node's catalog is its recorded installs, so a view dropped or replaced is not installed again by a
-// restart or a failover (what 04's skipReinstall models).
+// restart or a failover (what a node whose catalog dropped the plan models: failover()/restart() reinstall only live views).
 #include "CheckedWritesRig.h"
 
 #include <rune/codec/Serialize.h>
@@ -338,4 +338,74 @@ TEST(CheckedWritesConstraintChange, RetainedPlansArePrunedAfterW) {
     EXPECT_EQ(w->retainedPlans.find(kNameObj, nameFingerprint), nullptr);
     EXPECT_NE(w->retainedPlans.find(kStatsObj, c.r.fingerprintOf(CV::AccountStats, false)), nullptr);
     EXPECT_EQ(c.r.readLog().plans.size(), 2u) << "the log still holds the record";
+}
+
+// P9-8: a replacement plan joins at the swap, and its record is in the log for a later drop or failover.
+TEST(CheckedWritesConstraintChange, ReplaceAppendsTheNewPlanBeforeTheSwap) {
+    Cw c;
+    c.create(CV::AccountStats, 12);
+    c.r.replaceConstrainedView(CV::AccountStats, 2);
+    const uint64_t fp2 = c.r.fingerprintOf(CV::AccountStats, false);
+    const auto swapped = [&] {
+        const auto l = c.r.readLog();
+        return std::any_of(l.plans.begin(), l.plans.end(), [&](const auto& p) { return p.header.planFingerprint == fp2; });
+    };
+    ASSERT_TRUE(c.passesUntil(swapped)) << "no plan record for the replacement";
+    const auto l = c.r.readLog();
+    const auto plan = std::find_if(l.plans.begin(), l.plans.end(), [&](const auto& p) { return p.header.planFingerprint == fp2; });
+    const auto change = std::find_if(l.changes.begin(), l.changes.end(), [&](const auto& ch) { return ch.offset == plan->offset + 1; });
+    ASSERT_NE(change, l.changes.end()) << "the record sits right below the swap";
+    EXPECT_EQ(plan->plan, rv::serialize(c.r.constrained.at(CV::AccountStats).comp.plan));
+}
+
+// A view that was replaced and then dropped: the node that leads next has neither plan in its catalog.
+TEST(CheckedWritesConstraintChangeRegression, FailoverDuringDropAfterReplaceRegression) {
+    Cw c;
+    c.create(CV::AccountStats, 12);
+    c.append({ch(1, 6, "a"), ch(2, 6, "b")});
+    ASSERT_TRUE(c.r.driveUntilJudged());
+    c.r.replaceConstrainedView(CV::AccountStats, 2);
+    const uint64_t fp2 = c.r.fingerprintOf(CV::AccountStats, false);
+    ASSERT_TRUE(c.passesUntil([&] {
+        const auto l = c.r.readLog();
+        return std::any_of(l.plans.begin(), l.plans.end(), [&](const auto& p) { return p.header.planFingerprint == fp2; });
+    }));
+    c.r.holdJudge(true);
+    c.append({ch(3, 6, "c")});
+    c.drop(CV::AccountStats);
+    c.append(kTail);
+    c.r.followerFetch();
+    c.r.holdJudge(false);
+    c.r.failover();
+    const int64_t end = c.r.dataEnd();
+    ASSERT_TRUE(c.r.driveUntilJudged(end)) << "the judge waits for a plan only the log has";
+    EXPECT_GE(c.r.stats()->retainedPlanInstalls, 1u);
+    EXPECT_FALSE(c.judge()->waitingForInstall());
+}
+
+// A plan this node refused to install is never installed from the log instead: the judge waits and no change drops the member.
+TEST(CheckedWritesConstraintChangeRegression, RefusedInstallIsNeverOverruledByTheLogRegression) {
+    Cw c;
+    c.create(CV::CharacterName);
+    c.append(kFirst);
+    ASSERT_TRUE(c.r.driveUntilJudged());
+    const std::size_t changes = c.r.readLog().changes.size();
+    c.r.refuseInstalls = true;
+    c.r.failover();
+    c.r.passes(200);
+    EXPECT_EQ(c.r.stats()->retainedPlanInstalls, 0u);
+    EXPECT_TRUE(c.judge()->waitingForInstall());
+    EXPECT_EQ(c.r.readLog().changes.size(), changes) << "no change may drop a live constraint this node cannot judge with";
+    EXPECT_EQ(c.dropOf(kNameObj), -1);
+}
+
+// P9-6: a judge that goes away takes the retired views it held with it.
+TEST(CheckedWritesConstraintChangeRegression, DroppingTheJudgeErasesItsRetainedTemplatesRegression) {
+    Cw c;
+    dropInFlight(c);
+    c.r.failover();
+    ASSERT_TRUE(c.r.driveUntilJudgeReaches(c.r.dataEnd()));
+    ASSERT_EQ(c.r.vs->retiringVerdictTemplatesForTest(), 1u);
+    c.r.vs->dropVerdictSource(VerdictRig::kSrc, c.r.partition());
+    EXPECT_EQ(c.r.vs->retiringVerdictTemplatesForTest(), 0u);
 }

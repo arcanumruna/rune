@@ -163,8 +163,9 @@ void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKi
     addMember_(inst, kind, viewObjectId, planFingerprint, false, planRecordPayload);
 }
 
-void VerdictSource::addCandidate(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint) {
-    addMember_(inst, kind, viewObjectId, planFingerprint, true);
+void VerdictSource::addCandidate(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint,
+                                 std::span<const uint8_t> planRecordPayload) {
+    addMember_(inst, kind, viewObjectId, planFingerprint, true, planRecordPayload);
 }
 
 void VerdictSource::removeCandidate(uint64_t viewObjectId, uint64_t planFingerprint) {

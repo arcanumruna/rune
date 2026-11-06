@@ -453,6 +453,8 @@ public:
     /// The replica cuts its log (a follower meeting a new leader's history): the log generation moves.
     void truncateReplicaTo(int64_t offset) { replica->truncateLogForTest(offset); passes(5); }
     /// Another replica takes over: this node's tail above the HW is gone and no memory survives.
+    /// From now on every install frame the rig sends carries a descriptor the worker refuses.
+    bool refuseInstalls = false;
     void failover(bool reinstall = true) { restart(reinstall, replica->highWatermark()); }
     void reinstallAll() { for (auto& i : installs_) i.second(); }
     void demote() {
@@ -535,6 +537,7 @@ private:
         m.planBlob    = rune::view::serialize(c.plan);
         m.outDescBlob = rune::codec::serialize(c.outputDescriptor);
         m.srcDescBlob = rune::codec::serialize(src);
+        if (refuseInstalls) m.outDescBlob = {1, 2, 3};   // the worker refuses a plan whose descriptor does not decode
         EXPECT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m));
         passes(3);
     }

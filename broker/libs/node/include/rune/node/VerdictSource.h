@@ -118,7 +118,8 @@ public:
                         std::span<const uint8_t> planRecordPayload = {});
     /// P9-5: a replacement plan of a logged member.  It replays the log below judgedThrough() without judging, and joins the set
     /// when a change record names it (the owner asks for one once candidateCaughtUp()).
-    void addCandidate(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint);
+    void addCandidate(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint,
+                      std::span<const uint8_t> planRecordPayload = {});
     void removeCandidate(uint64_t viewObjectId, uint64_t planFingerprint);
     [[nodiscard]] bool hasCandidate(uint64_t viewObjectId, uint64_t planFingerprint) const noexcept;
     [[nodiscard]] bool hasCandidates() const noexcept;
