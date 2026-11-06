@@ -467,3 +467,33 @@ TEST(CheckedWritesPlanCompile, GroupByWithoutAnAggregateColumnRegression) {
     v.output = {replaceOf(d, "lastSeen")};
     expectRefused(compileOver(v, d), Kind::KeyInvalid, "group by needs an aggregate column");
 }
+
+TEST(CheckedWritesPlanCompile, AliasedV1KeyColumnCompilesAsBeforeRegression) {
+    const auto d = characterSource();
+    ViewPlan v;
+    v.viewName = "char_alias";
+    v.key = "id";
+    v.sources = {{5, "characterId"}};
+    v.output = {{"id", PrimType::UInt64, 0, "characterId", MergeRule::Replace}, replaceOf(d, "name")};
+    const auto r = compileOver(v, d);
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    EXPECT_EQ(keyModeOf(r->plan), ViewKeyMode::LegacyU64);
+    EXPECT_FALSE(needsV2(r->plan));
+    EXPECT_EQ(slotName(*r, 0), "id");
+    EXPECT_TRUE(r->outputDescriptor.fields[0].isKey);
+    EXPECT_EQ(r->plan.keyFieldId[0], d.find("characterId")->id);
+    EXPECT_EQ(r->plan.output[0].srcFieldId, d.find("characterId")->id);
+    EXPECT_EQ(serialize(r->plan)[0], 0x01);
+
+    const auto e = deviceSource();
+    ViewPlan g;
+    g.viewName = "device_alias";
+    g.key = "user";
+    g.sources = {{5, "userId"}};
+    g.output = {{"user", PrimType::UInt64, 0, "userId", MergeRule::Replace}, {"n", PrimType::Int64, 0, "", MergeRule::CountAll}};
+    const auto agg = compileOver(g, e);
+    ASSERT_TRUE(agg.has_value()) << agg.error().message;
+    EXPECT_EQ(keyModeOf(agg->plan), ViewKeyMode::LegacyU64);
+    EXPECT_FALSE(needsV2(agg->plan));
+    EXPECT_EQ(slotName(*agg, 0), "user");
+}

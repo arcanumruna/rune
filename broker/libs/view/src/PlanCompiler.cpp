@@ -286,9 +286,12 @@ std::expected<CompileResult, CompileError> compileView(
     // --- 3. The key components: resolve each against the source, check its type and encoded width. ---
     const rune::codec::Descriptor& srcDesc = *sourceDescriptors[0];
     const bool v1Shaped = !needsV2(authored);
-    const std::vector<KeyComponent> components = authored.keyComponents.empty()
-        ? std::vector<KeyComponent>{{authored.key, 0, authored.key}}
-        : authored.keyComponents;
+    // A v1 plan names its key by output column; that column projects the source field it is keyed on.
+    const auto v1Key = std::find_if(authored.output.begin(), authored.output.end(),
+                                    [&](const AuthoredField& af) { return af.name == authored.key && af.rule == MergeRule::Replace; });
+    const std::vector<KeyComponent> components = !authored.keyComponents.empty()
+        ? authored.keyComponents
+        : std::vector<KeyComponent>{{v1Key != authored.output.end() ? v1Key->srcField : authored.key, 0, authored.key}};
 
     struct ResolvedKey {
         const rune::codec::FieldDescriptor* fd;
