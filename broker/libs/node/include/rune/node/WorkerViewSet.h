@@ -379,6 +379,9 @@ public:
         return std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& kv) { return kv.second->candidateForTest(viewObjectId); });
     }
     /// Test seam: every judge, existing and later created, is held (nothing activates, replays or judges).
+    [[nodiscard]] std::size_t retiringVerdictTemplatesForTest() const noexcept {
+        return static_cast<std::size_t>(std::count_if(templates_.begin(), templates_.end(), [](const auto& kv) { return kv.second.isVerdict && kv.second.retiring; }));
+    }
     void holdJudgesForTest(bool hold) noexcept {
         holdJudges_ = hold;
         for (auto& kv : verdictSources_) kv.second->holdJudgeForTest(hold);
@@ -668,6 +671,7 @@ private:
         uint64_t                     verdictFingerprint = 0;
         TestRejectRule               testRule{};
         bool                         retiring = false;
+        std::vector<uint8_t>         planRecordPayload;   // P9-8: the type-20 value a judge appends when this unique or check view joins its set
     };
 
     [[nodiscard]] bool isVerdictTemplate_(int32_t viewTopicId) const noexcept {
@@ -693,6 +697,9 @@ private:
         }
     }
     int finishRetired_();
+    /// P9-8: the plan a judge waits for, installed from the type-20 record of its log when the catalog does not have it: retiring and in
+    /// memory, it judges up to its drop.  Cold.
+    void installRetainedPlan_(VerdictSource& judge, const PartitionWriteState& write);
     int pushVerdictCheckpoint_(ViewInstance& inst);
     void beginDiscard_(ViewInstance& inst, ViewDiscardReason reason);
     [[nodiscard]] bool tryPushDiscard_(ViewInstance& inst);
@@ -712,6 +719,7 @@ private:
     struct Retired { int32_t viewTopicId, partition; };
     bool installsSinceMark_ = false;   // a verdict plan install or uninstall was drained whose catalog mark has not been: the gate stays closed
     int64_t catalogThrough_ = -1;   // the latest catalog position this node's control thread marked here; never moves back (#788)
+    uint64_t unreadablePlanFingerprint_ = 0;   // the retained plan whose decode failure was logged
     uint64_t verdictEpoch_ = 0;   // bumped by every verdict template install, retire and erase; syncConstraintSet_ reruns on a change
     std::vector<Retired> retiredQueue_;   // the members the judges dropped, per partition
     std::vector<ConstraintSetMember> constraintWant_;   // syncConstraintSet_ scratch: grows once, never per pass

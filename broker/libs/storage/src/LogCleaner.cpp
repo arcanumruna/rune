@@ -327,7 +327,7 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
             const int64_t base = r.baseOffset();
             if (base >= scanEnd) { pos = buf.size(); break; }   // the intended end of the scan, not damage
             const int64_t pid  = r.producerId();
-            if (pid < 0 && isControlBatch(r)) {   // a checked-writes control record (16-19)
+            if (pid < 0 && isControlBatch(r)) {   // a checked-writes control record (16-20)
                 if (const auto& c = ctl) {
                     switch (c->type) {
                     case cr::kVerdictMarker:
@@ -409,7 +409,7 @@ MarkerAction markerAction(const rune::protocol::RecordBatchReader& r, const std:
                           int64_t batchLastOffset, Offset cleanBoundaryOffset, const TxnCleanState* txn, const VerdictCleanState* verdicts,
                           const ProducerBatchWindow* window, int64_t nowMs) {
     if (nowMs < 0 || batchLastOffset >= cleanBoundaryOffset) return MarkerAction::Keep;
-    if (r.producerId() < 0) {   // a checked-writes control record (16-19): its own rules
+    if (r.producerId() < 0) {   // a checked-writes control record (16-20): its own rules
         const int type = c ? c->type : rune::storage::control_record::kUnparseable;
         if (type == rune::storage::control_record::kUnparseable || verdicts == nullptr ||
             verdicts->keepsControlRecord(r.baseOffset(), static_cast<int16_t>(type)))

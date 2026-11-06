@@ -158,8 +158,9 @@ VerdictSource::VerdictSource(int32_t srcTopicId, int32_t partition) : srcTopicId
     entryScratch_.reserve(cr::kMaxMarkerEntries);
 }
 
-void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint) {
-    addMember_(inst, kind, viewObjectId, planFingerprint, false);
+void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint,
+                                   std::span<const uint8_t> planRecordPayload) {
+    addMember_(inst, kind, viewObjectId, planFingerprint, false, planRecordPayload);
 }
 
 void VerdictSource::addCandidate(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint) {
@@ -186,9 +187,12 @@ bool VerdictSource::candidateCaughtUp(uint64_t viewObjectId, uint64_t planFinger
     });
 }
 
-void VerdictSource::addMember_(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint, bool candidate) {
+void VerdictSource::addMember_(ViewInstance* inst, rune::view::VerdictViewKind kind, uint64_t viewObjectId, uint64_t planFingerprint, bool candidate,
+                              std::span<const uint8_t> planRecordPayload) {
     Member m;
     m.candidate = candidate;
+    m.planRecordPayload.assign(planRecordPayload.begin(), planRecordPayload.end());
+    if (scratch_.size() < cr::verdictPlanBatchBytes(planRecordPayload.size())) scratch_.resize(cr::verdictPlanBatchBytes(planRecordPayload.size()));
     m.inst = inst;
     m.kind = kind;
     m.objectId = viewObjectId;
@@ -312,6 +316,7 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     // W: a lagging HW puts W below ranges the cleaner may already have compacted, and a re-mark from this index would disagree.
     emitFrom_    = std::max(extendOverEmptySets_(state.markers.appendedThrough()), logStart_);
     state.rejected.noteCovered(judgeCursor_);
+    state.retainedPlans.pruneLeftBelow(state.rejected.watermark(), state.constraintSets);   // the members that left below W judge nothing more
     for (Member& m : members_) discardCheckpointAhead_(m);
     activeSet_ = *state.constraintSets.setAt(judgeCursor_);
     setFrom_   = judgeCursor_;
@@ -330,23 +335,24 @@ void VerdictSource::stall_(StallReason reason) noexcept {
                   reason == StallReason::Full ? "rejected index full" : reason == StallReason::OutOfOrder ? "rejection out of order" : "view capacity exhausted");
 }
 
-void VerdictSource::waitForInstall_() noexcept {
-    if (waitingForInstall_) return;
-    waitingForInstall_ = true;
-    ++stats_.judgeWaitsForInstall;
-    // #791 diagnostics (cold, once per wait): the first member of the active set no installed view matches, and where that set starts.
-    uint64_t missingObject = 0, missingFingerprint = 0;
-    for (uint8_t i = 0; i < activeSet_.count; ++i) {
-        const ConstraintSetMember& want = activeSet_.members[i];
+void VerdictSource::waitForInstall_(const ConstraintSet& set) noexcept {
+    // The first member of the set no installed view matches: the owner may install it from the log (P9-8).
+    waitingFor_ = ConstraintSetMember{};
+    for (uint8_t i = 0; i < set.count; ++i) {
+        const ConstraintSetMember& want = set.members[i];
         const bool have = std::any_of(members_.begin(), members_.end(), [&](const Member& m) {
             return !m.retiring && m.objectId == want.viewObjectId && m.fingerprint == want.planFingerprint;
         });
-        if (!have) { missingObject = want.viewObjectId; missingFingerprint = want.planFingerprint; break; }
+        if (!have) { waitingFor_ = want; break; }
     }
+    if (waitingForInstall_) return;
+    waitingForInstall_ = true;
+    ++stats_.judgeWaitsForInstall;
+    // #791 diagnostics (cold, once per wait): where the set starts.
     spdlog::warn("verdict judge waits for a view install: topic {} partition {}: missing member (object {}, fingerprint {}) of set {} "
                  "(change at offset {}), judged through {}, {} members installed, {} of {} active",
-                 srcTopicId_, partition_, missingObject, missingFingerprint, activeSet_.id, setFrom_, judgeCursor_, members_.size(),
-                 active_.size(), activeSet_.count);
+                 srcTopicId_, partition_, waitingFor_.viewObjectId, waitingFor_.planFingerprint, set.id, setFrom_, judgeCursor_, members_.size(),
+                 active_.size(), set.count);
 }
 
 rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept {
@@ -638,16 +644,25 @@ int64_t VerdictSource::requestChange(const ConstraintSet& next, bool refresh) {
     std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
     for (uint8_t i = 0; i < logged.count; ++i)
         wire[i] = cr::ChangeMember{logged.members[i].viewObjectId, static_cast<uint8_t>(logged.members[i].kind), logged.members[i].planFingerprint};
-    const std::size_t n = cr::buildConstraintSetChange(scratch_, logged.id, logged.catalogThrough, std::span<const cr::ChangeMember>(wire.data(), logged.count));
-    const std::span<const uint8_t> batch(scratch_.data(), n);
-    int64_t base;
-    if (replica_ != nullptr) {
-        base = replica_->appendControlBatch(batch, false);
-    } else {
-        base = std::max(testNextOffset_, judgeCursor_);
-        testNextOffset_ = base + 1;
+    const auto append = [&](std::span<const uint8_t> batch) {
+        if (replica_ != nullptr) return replica_->appendControlBatch(batch, false);
+        const int64_t at = std::max(testNextOffset_, judgeCursor_);
+        testNextOffset_ = at + 1;
         if (captureAppended_) appended_.emplace_back(batch.begin(), batch.end());
+        return at;
+    };
+    // P9-8: a joining Unique or Check member's plan goes into the log just below the change that names it.
+    const ConstraintSet& latest = state_->constraintSets.latest();
+    for (uint8_t i = 0; i < logged.count; ++i) {
+        const ConstraintSetMember& want = logged.members[i];
+        if (std::find(latest.members.begin(), latest.members.begin() + latest.count, want) != latest.members.begin() + latest.count) continue;
+        const auto m = std::find_if(members_.begin(), members_.end(), [&](const Member& x) { return x.objectId == want.viewObjectId && x.fingerprint == want.planFingerprint && !x.planRecordPayload.empty(); });
+        if (m == members_.end()) continue;
+        const std::size_t pn = cr::wrapVerdictPlan(scratch_, m->planRecordPayload);
+        if (append(std::span<const uint8_t>(scratch_.data(), pn)) < 0) return kChangeDeferred;
     }
+    const std::size_t n = cr::buildConstraintSetChange(scratch_, logged.id, logged.catalogThrough, std::span<const cr::ChangeMember>(wire.data(), logged.count));
+    const int64_t base = append(std::span<const uint8_t>(scratch_.data(), n));
     if (base < 0) return kChangeDeferred;
     state_->constraintSets.onChange(base, logged);
     return base;

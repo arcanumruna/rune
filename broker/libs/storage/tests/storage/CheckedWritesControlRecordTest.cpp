@@ -1,4 +1,4 @@
-// Part 04 Task 3: control record types 16-19 (C10).
+// Part 04 Task 3: control record types 16-19 (C10); Part 09 Task 6: type 20 (kVerdictPlan).
 #include <gtest/gtest.h>
 
 #include <cstring>
@@ -54,6 +54,48 @@ TEST(CheckedWritesControlRecord, ChangeRoundTrips) {
     EXPECT_FALSE(cr::parseConstraintSetChange(b.data(), b.size(), setId, catalogThrough, std::span<cr::ChangeMember>(out.data(), 1), count));
 }
 
+TEST(CheckedWritesControlRecord, VerdictPlanRoundTrips) {
+    const std::vector<uint8_t> plan(300, 0xA1), out(120, 0xB2), src(90, 0xC3);
+    const cr::VerdictPlanHeader h{7, 0xF00D, 2};
+    std::vector<uint8_t> b(cr::verdictPlanBatchBytes(cr::verdictPlanPayloadBytes(plan.size(), out.size(), src.size())));
+    ASSERT_EQ(cr::buildVerdictPlan(b, h, plan, out, src), b.size());
+    EXPECT_EQ(cr::recordType(b.data(), b.size()), cr::kVerdictPlan);
+    EXPECT_EQ(cr::kVerdictPlan, 20);
+    cr::VerdictPlanHeader got{};
+    std::span<const uint8_t> gotPlan, gotOut, gotSrc;
+    ASSERT_TRUE(cr::parseVerdictPlan(b.data(), b.size(), got, gotPlan, gotOut, gotSrc));
+    EXPECT_EQ(got.viewObjectId, 7u);
+    EXPECT_EQ(got.planFingerprint, 0xF00Du);
+    EXPECT_EQ(got.kind, 2);
+    EXPECT_EQ(std::vector<uint8_t>(gotPlan.begin(), gotPlan.end()), plan);
+    EXPECT_EQ(std::vector<uint8_t>(gotOut.begin(), gotOut.end()), out);
+    EXPECT_EQ(std::vector<uint8_t>(gotSrc.begin(), gotSrc.end()), src);
+    const auto c = cr::parseControl(b.data(), b.size());
+    ASSERT_TRUE(c.has_value());
+    EXPECT_FALSE(cr::parseMarkerHeader(*c).has_value()) << "a view of another type";
+    for (std::size_t n = 0; n < b.size(); ++n) EXPECT_FALSE(cr::parseControl(b.data(), n).has_value()) << "truncated at " << n;
+    auto flipped = b;
+    flipped[flipped.size() - 5] ^= 0x01;
+    EXPECT_FALSE(cr::parseVerdictPlan(flipped.data(), flipped.size(), got, gotPlan, gotOut, gotSrc));
+}
+
+TEST(CheckedWritesControlRecord, VerdictPlanOverTheCapIsRefused) {
+    const cr::VerdictPlanHeader h{7, 0xF00D, 2};
+    const std::size_t fixed = cr::verdictPlanPayloadBytes(0, 0, 0);
+    const std::vector<uint8_t> big(cr::kMaxVerdictPlanBytes, 0x5A), none;
+    std::vector<uint8_t> b(cr::verdictPlanBatchBytes(cr::kMaxVerdictPlanBytes + 1));
+    EXPECT_EQ(cr::buildVerdictPlan(b, h, std::span<const uint8_t>(big.data(), cr::kMaxVerdictPlanBytes + 1 - fixed), none, none), 0u) << "65,537 bytes";
+    ASSERT_EQ(cr::verdictPlanPayloadBytes(cr::kMaxVerdictPlanBytes - fixed, 0, 0), cr::kMaxVerdictPlanBytes);
+    const std::size_t n = cr::buildVerdictPlan(b, h, std::span<const uint8_t>(big.data(), cr::kMaxVerdictPlanBytes - fixed), none, none);
+    EXPECT_EQ(n, cr::verdictPlanBatchBytes(cr::kMaxVerdictPlanBytes)) << "65,536 bytes builds";
+    cr::VerdictPlanHeader got{};
+    std::span<const uint8_t> gotPlan, gotOut, gotSrc;
+    EXPECT_TRUE(cr::parseVerdictPlan(b.data(), n, got, gotPlan, gotOut, gotSrc));
+    EXPECT_EQ(gotPlan.size(), cr::kMaxVerdictPlanBytes - fixed);
+    std::vector<uint8_t> small(10);
+    EXPECT_EQ(cr::buildVerdictPlan(small, h, none, none, none), 0u) << "too small";
+}
+
 TEST(CheckedWritesControlRecordRegression, VersionOneChangeIsUnparseableRegression) {
     // Type 18 was never released at version 1 (#788): a v1 payload, CRC-valid or not, is not a change record.
     std::vector<uint8_t> b(cr::changeBatchBytes(0));
@@ -103,10 +145,10 @@ TEST(CheckedWritesControlRecord, RecordTypeRefusesLookalikes) {
     EXPECT_EQ(cr::recordType(reseal(withPid).data(), good.size()), cr::kUnparseable);
     auto flipped = good; flipped[30] ^= 0x01;                            // CRC no longer matches
     EXPECT_EQ(cr::recordType(flipped.data(), flipped.size()), cr::kUnparseable);
-    auto type20 = good;
-    for (std::size_t i = 61; i + 1 < type20.size(); ++i)
-        if (type20[i] == 17 && type20[i + 1] == 0 && type20[i - 1] == 0x04) { type20[i] = 20; break; }
-    EXPECT_EQ(cr::recordType(reseal(type20).data(), type20.size()), cr::kUnparseable);
+    auto type21 = good;
+    for (std::size_t i = 61; i + 1 < type21.size(); ++i)
+        if (type21[i] == 17 && type21[i + 1] == 0 && type21[i - 1] == 0x04) { type21[i] = 21; break; }
+    EXPECT_EQ(cr::recordType(reseal(type21).data(), type21.size()), cr::kUnparseable);
     auto type19 = good;
     for (std::size_t i = 61; i + 1 < type19.size(); ++i)
         if (type19[i] == 17 && type19[i + 1] == 0 && type19[i - 1] == 0x04) { type19[i] = 19; break; }
@@ -176,12 +218,12 @@ TEST(CheckedWritesControlRecordRegression, ParseControlOnceGivesTypeAndViewsRegr
         EXPECT_FALSE(cr::parseMarkerHeader(*c).has_value()) << "a view of another type";
     }
 
-    // type 20 is not a control record of this family
-    auto type20 = marker(0, 10, 1, {});
-    for (std::size_t i = 61; i + 1 < type20.size(); ++i)
-        if (type20[i] == 17 && type20[i + 1] == 0 && type20[i - 1] == 0x04) { type20[i] = 20; break; }
-    { const uint32_t crc = rune::protocol::crc32c(type20.data() + 21, type20.size() - 21); std::memcpy(type20.data() + 17, &crc, 4); }
-    EXPECT_FALSE(cr::parseControl(type20.data(), type20.size()).has_value());
+    // type 21 is not a control record of this family
+    auto type21 = marker(0, 10, 1, {});
+    for (std::size_t i = 61; i + 1 < type21.size(); ++i)
+        if (type21[i] == 17 && type21[i + 1] == 0 && type21[i - 1] == 0x04) { type21[i] = 21; break; }
+    { const uint32_t crc = rune::protocol::crc32c(type21.data() + 21, type21.size() - 21); std::memcpy(type21.data() + 17, &crc, 4); }
+    EXPECT_FALSE(cr::parseControl(type21.data(), type21.size()).has_value());
 
     // one flipped value byte: the CRC refuses it
     auto flipped = marker1;

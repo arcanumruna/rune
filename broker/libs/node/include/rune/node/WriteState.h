@@ -205,6 +205,7 @@ struct PartitionWriteState {
     rune::storage::RejectedOffsetIndex rejected;       ///< reserved when the partition becomes a verdict source (VerdictSource.cpp)
     ConstraintSetTimeline              constraintSets;
     MarkerLedger                       markers;
+    RetainedVerdictPlans               retainedPlans;        ///< the type-20 records of the log (P9-8)
     VerdictSource*                     verdicts = nullptr;   ///< the judge, once this worker leads and hosts verdict views
     int64_t                            judgedThrough = 0;    ///< the judge's cursor, published at the end of each of its passes
     uint64_t                           mismatchesLogged = 0; ///< rejected-index determinism alarms already reported

@@ -1066,7 +1066,8 @@ public:
     struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; uint64_t valueId = 0; };   ///< valueId: the value's own key field
     struct RigChange { int64_t offset; std::vector<rune::storage::control_record::ChangeMember> members; int64_t catalogThrough = -1; };
     struct RigMarker { int64_t offset; rune::storage::control_record::MarkerHeader header; std::vector<std::tuple<int64_t, uint16_t, uint32_t>> entries; bool horizon = false; };
-    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; std::vector<std::pair<int64_t, uint64_t>> reservations; };   ///< reservations: (offset, reserved-through n)
+    struct RigPlan { int64_t offset; rune::storage::control_record::VerdictPlanHeader header; std::vector<uint8_t> plan, outputDescriptor, sourceDescriptor; };   ///< a type-20 record
+    struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; std::vector<std::pair<int64_t, uint64_t>> reservations; std::vector<RigPlan> plans; };   ///< reservations: (offset, reserved-through n)
 
     /// Every data record, change record and marker below `through`, in offset order, straight from the segments.
     [[nodiscard]] RigLog readLog(int64_t through = INT64_MAX) const;
@@ -1430,6 +1431,15 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
                     std::array<crl::ChangeMember, 32> ms{};
                     uint32_t setId = 0; int64_t catalogThrough = -1; uint16_t n = 0;
                     if (crl::parseConstraintSetChange(*c, setId, catalogThrough, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n), catalogThrough});
+                } else if (c && c->type == crl::kVerdictPlan) {
+                    VerdictRig::RigPlan pl{r.baseOffset(), {}, {}, {}, {}};
+                    std::span<const uint8_t> planBlob, outBlob, srcBlob;
+                    if (crl::parseVerdictPlan(b, total, pl.header, planBlob, outBlob, srcBlob)) {
+                        pl.plan.assign(planBlob.begin(), planBlob.end());
+                        pl.outputDescriptor.assign(outBlob.begin(), outBlob.end());
+                        pl.sourceDescriptor.assign(srcBlob.begin(), srcBlob.end());
+                        out.plans.push_back(std::move(pl));
+                    }
                 } else if (const auto reserved = crl::parseReservation(b, total)) {
                     out.reservations.emplace_back(r.baseOffset(), *reserved);
                 } else if (c && c->type == crl::kVerdictMarker) {

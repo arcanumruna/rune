@@ -386,6 +386,32 @@ TEST(CheckedWritesVerdictCleaner, ChangeRecordsAreAlwaysKept) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(CheckedWritesVerdictCleaner, VerdictPlanRecordsAreAlwaysKept) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        const std::vector<uint8_t> blob(40, 0x11);
+        std::vector<uint8_t> plan(cr::verdictPlanBatchBytes(cr::verdictPlanPayloadBytes(blob.size(), blob.size(), blob.size())));
+        ASSERT_EQ(cr::buildVerdictPlan(plan, cr::VerdictPlanHeader{7, 99, 2}, blob, blob, blob), plan.size());
+        stampBase(plan, 0);
+        log.append(plan, 0);
+        change(log, 1, true);
+        for (int64_t o = 2; o < 5; ++o) data(log, o, "pad" + std::to_string(o), "p");
+        change(log, 5, false);   // the member left here, long below W
+        marker(log, 6, 2, 6, {});
+        for (int64_t o = 7; o < 12; ++o) data(log, o, "pad" + std::to_string(o), "p");
+        marker(log, 12, 6, 12, {});
+        VerdictCleanState s;
+        EXPECT_TRUE(s.keepsControlRecord(0, cr::kVerdictPlan));
+        for (int pass = 0; pass < 4; ++pass) clean(log, Path::Range, kMax, 13, kMax, 1'000'000 + pass * 2000);
+        EXPECT_TRUE(hasBatchAt(log, 0));
+        EXPECT_TRUE(hasBatchAt(log, 1));
+        EXPECT_TRUE(hasBatchAt(log, 5));
+    }
+    std::filesystem::remove_all(dir);
+}
+
 TEST(CheckedWritesVerdictCleanerRegression, MarkerKeptUntilEveryReplicaFetchedItRegression) {
     const auto dir = tempDir();
     {

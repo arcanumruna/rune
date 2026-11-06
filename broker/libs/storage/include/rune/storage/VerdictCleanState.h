@@ -110,7 +110,7 @@ public:
                                    listed_.begin() + static_cast<std::ptrdiff_t>(m.listedAt + m.listedCount), pred);
         return false;
     }
-    /// Type 18 and 19 are always kept; 16 follows keepsReservation; a verdict marker (17) only goes through markerRemovable.
+    /// Type 18, 19 and 20 are always kept; 16 follows keepsReservation; a verdict marker (17) only goes through markerRemovable.
     [[nodiscard]] bool keepsControlRecord(int64_t offset, int16_t type) const noexcept {
         namespace cr = control_record;
         if (type == cr::kReservation) return keepsReservation(offset);

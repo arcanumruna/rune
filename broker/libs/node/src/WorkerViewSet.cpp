@@ -406,6 +406,9 @@ int WorkerViewSet::drainInstalls() {
                 tpl.verdictKind = *kind;
                 tpl.verdictObjectId = objectId;
                 tpl.verdictFingerprint = rune::view::verdictPlanFingerprint(m.planBlob);
+                tpl.planRecordPayload.resize(rune::storage::control_record::verdictPlanPayloadBytes(m.planBlob.size(), m.outDescBlob.size(), m.srcDescBlob.size()));
+                if (rune::storage::control_record::writeVerdictPlanPayload(tpl.planRecordPayload, {objectId, tpl.verdictFingerprint, static_cast<uint8_t>(*kind)}, m.planBlob, m.outDescBlob, m.srcDescBlob) == 0)
+                    tpl.planRecordPayload.clear();   // over the cap: AdminWorker refuses such a view (P9-9)
             }
             // Task 19b: a RESTART-recovery install registers the template here
             // but defers the per-(view, partition) instance to
@@ -1220,7 +1223,10 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     if (!anyTemplate && !write.spec->keyIndex && write.constraintSets.latest().empty()) {
         if (vit == verdictSources_.end()) return nullptr;
         // The set was dropped: the judge stays until it has passed the drop and holds no member.
-        if (vit->second->hasMembers() || vit->second->judgedThrough() <= write.constraintSets.lastChangeOffset()) return vit->second.get();
+        if (vit->second->hasMembers() || vit->second->judgedThrough() <= write.constraintSets.lastChangeOffset()) {
+            installRetainedPlan_(*vit->second, write);
+            return vit->second.get();
+        }
         write.verdicts = nullptr;
         verdictSources_.erase(vit);
         eraseKeyIndex_(key);
@@ -1243,10 +1249,14 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
             judge->addVerdictView(&inst, rune::view::VerdictViewKind::KeyIndex, 0, kKeyIndexPlanFingerprint);
         }
     }
-    if (sit == subscriptionIndex_.end()) return judge;
-    for (const int32_t id : sit->second) {
+    installRetainedPlan_(*judge, write);
+    const auto sit2 = subscriptionIndex_.find(srcTopicId);   // the install may have added the source
+    if (sit2 == subscriptionIndex_.end()) return judge;
+    for (const int32_t id : sit2->second) {
         const ViewTemplate& tpl = templates_.at(id);
-        if (!tpl.isVerdict || tpl.retiring || judge->hasView(id)) continue;
+        if (!tpl.isVerdict || judge->hasView(id)) continue;
+        // A retiring view still judges the records below its drop, on the partitions whose log names it.
+        if (tpl.retiring && !namedFrom(write, judge->judgedThrough(), tpl.verdictObjectId, tpl.verdictFingerprint)) continue;
         // P9-5: the plan of a logged member's object under another fingerprint builds as a candidate (the member keeps judging), unless a
         // logged set the judge has yet to judge with names it: that is a member of record.  While this worker's catalog is behind the
         // logged set a plan is a stale one or not yet known to be a replacement: nothing is built.
@@ -1260,9 +1270,46 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
         if (inst == nullptr) continue;
         if (tpl.verdictKind == rune::view::VerdictViewKind::TestReject) judge->installTestVerdictViewForTest(inst, tpl.verdictObjectId, tpl.testRule);
         else if (candidate) judge->addCandidate(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint);
-        else judge->addVerdictView(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint);
+        else judge->addVerdictView(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint, tpl.planRecordPayload);
     }
     return judge;
+}
+
+void WorkerViewSet::installRetainedPlan_(VerdictSource& judge, const PartitionWriteState& write) {
+    if (!judge.waitingForInstall()) return;
+    const ConstraintSetMember& want = judge.waitingFor();
+    const RetainedVerdictPlan* r = write.retainedPlans.find(want.viewObjectId, want.planFingerprint);
+    if (r == nullptr) return;
+    std::optional<rune::view::CompiledViewPlan> plan = rune::view::deserializeCompiledViewPlan(r->plan);
+    rune::codec::Descriptor outDesc, srcDesc;
+    rune::view::RowLayout layout;
+    if (plan) {
+        try {
+            outDesc = rune::codec::deserialize(r->outputDescriptor);
+            srcDesc = rune::codec::deserialize(r->sourceDescriptor);
+            layout = rune::view::buildRowLayout(outDesc);
+        } catch (const std::exception&) {
+            plan.reset();
+        }
+    }
+    if (!plan) {
+        if (unreadablePlanFingerprint_ != r->planFingerprint) {
+            unreadablePlanFingerprint_ = r->planFingerprint;
+            spdlog::critical("VERDICT-PLAN-UNREADABLE view={} fp={:#x}", r->viewObjectId, r->planFingerprint);
+        }
+        return;
+    }
+    if (templates_.contains(plan->viewTopicId)) return;   // the catalog's own template names it: the attach below judges with that one
+    const int32_t viewTopicId = plan->viewTopicId;
+    installView(std::move(*plan), std::move(layout), std::move(srcDesc), /*persisted=*/false);
+    ViewTemplate& tpl = templates_.at(viewTopicId);
+    tpl.isVerdict = true;
+    tpl.retiring = true;
+    tpl.verdictKind = r->kind;
+    tpl.verdictObjectId = r->viewObjectId;
+    tpl.verdictFingerprint = r->planFingerprint;
+    ++verdictEpoch_;
+    ++judge.statsMut().retainedPlanInstalls;
 }
 
 bool WorkerViewSet::catalogBehind_(int32_t srcTopicId, VerdictSource& judge, const PartitionWriteState& write) {

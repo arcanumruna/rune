@@ -411,7 +411,7 @@ TEST(CheckedWritesVerdictSource, JudgeSeesTheRecordIntent) {
 
 namespace {
 
-// Types 16 and 19 have no builder yet: a value of exactly six bytes ([version][5 bytes]) is what the old txn-marker
+// Types 16 and 19 have no builder: a value of exactly six bytes ([version][5 bytes]) is what the old txn-marker
 // reader accepted, so a reader without the hardening mistakes it for a marker.
 std::vector<uint8_t> controlOfType(int16_t type, int64_t base) {
     std::vector<uint8_t> b;
@@ -421,6 +421,10 @@ std::vector<uint8_t> controlOfType(int16_t type, int64_t base) {
     } else if (type == cr::kConstraintSetChange) {
         b.resize(cr::changeBatchBytes(0));
         (void)cr::buildConstraintSetChange(b, 1, -1, {});
+    } else if (type == cr::kVerdictPlan) {
+        const std::vector<uint8_t> blob(24, 0x42);
+        b.resize(cr::verdictPlanBatchBytes(cr::verdictPlanPayloadBytes(blob.size(), blob.size(), blob.size())));
+        (void)cr::buildVerdictPlan(b, cr::VerdictPlanHeader{7, 0xF00D, 2}, blob, blob, blob);
     } else {
         b.resize(cr::detail::batchBytes(6));
         std::size_t p = cr::detail::beginBatch(b.data(), type, 6);
@@ -473,9 +477,9 @@ struct TmpDir {
 
 }  // namespace
 
-TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To19Regression) {
+TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To20Regression) {
     namespace tx = rune::transaction;
-    for (const auto& lookalike : {txnFramedLookalike(-1, 0), txnFramedLookalike(5, cr::kVerdictMarker), txnFramedLookalike(-1, cr::kTxnJudge)}) {
+    for (const auto& lookalike : {txnFramedLookalike(-1, 0), txnFramedLookalike(5, cr::kVerdictMarker), txnFramedLookalike(-1, cr::kTxnJudge), txnFramedLookalike(-1, cr::kVerdictPlan)}) {
         tx::LsoTracker tracker(8);
         tx::AbortedTxnIndex aborted;
         tx::RcBuilder builder(&tracker, &aborted);
@@ -483,7 +487,7 @@ TEST(CheckedWritesControlRecordRegression, EveryLogReaderSkipsTypes16To19Regress
         tx::ControlMarkerPayload payload{};
         EXPECT_FALSE(tx::ControlMarker::extract(lookalike.data(), 0, payload, lookalike.size()));
     }
-    for (const int16_t type : {cr::kReservation, cr::kVerdictMarker, cr::kConstraintSetChange, cr::kTxnJudge}) {
+    for (const int16_t type : {cr::kReservation, cr::kVerdictMarker, cr::kConstraintSetChange, cr::kTxnJudge, cr::kVerdictPlan}) {
         SCOPED_TRACE("control record type " + std::to_string(type));
         const std::vector<uint8_t> ctl = controlOfType(type, 0);
 

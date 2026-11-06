@@ -98,6 +98,8 @@ public:
         if (stallReason_ == StallReason::Full && state_ != nullptr && state_->rejected.size() < state_->rejected.capacity()) stalled_ = false;
     }
     [[nodiscard]] bool waitingForInstall() const noexcept { return waitingForInstall_; }
+    /// While waitingForInstall(): the member whose view is not installed.
+    [[nodiscard]] const ConstraintSetMember& waitingFor() const noexcept { return waitingFor_; }
     /// Cold (#791 diagnostics, read on a View ack timeout): the judge's state in one snapshot.
     struct DiagSnapshot {
         int64_t judgedThrough; bool stalled; int stallReason; bool waitingForInstall; bool needsActivation;
@@ -111,7 +113,9 @@ public:
     [[nodiscard]] bool activated() const noexcept { return generation_ != kUnbound && !needsActivation_; }
     [[nodiscard]] int64_t logStart() const noexcept { return logStart_; }
 
-    void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);
+    /// `planRecordPayload` (P9-8, a Unique or Check member): the type-20 value requestChange appends when the member joins.
+    void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0,
+                        std::span<const uint8_t> planRecordPayload = {});
     /// P9-5: a replacement plan of a logged member.  It replays the log below judgedThrough() without judging, and joins the set
     /// when a change record names it (the owner asks for one once candidateCaughtUp()).
     void addCandidate(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint);
@@ -160,9 +164,11 @@ private:
         uint8_t                     keyWidth = 0;   // KeyIndex: the wire key width of the source's key field
         bool                        retiring = false, leaving = false, candidate = false;
         int64_t                     leaveOffset = -1;
+        std::vector<uint8_t>        planRecordPayload;   // the type-20 value requestChange appends when the member joins
     };
 
-    void   addMember_(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint, bool candidate);
+    void   addMember_(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint, bool candidate,
+                      std::span<const uint8_t> planRecordPayload = {});
     template <class ReadRangeFn>
     int    replayCandidates_(ReadRangeFn& readRange, int64_t bound, const rune::view::AbortedTxnFilter& aborted);
     void   activate_(PartitionWriteState& state);
@@ -177,7 +183,7 @@ private:
     void   discardCheckpointAhead_(Member& m);
     enum class StallReason : uint8_t { None, Full, OutOfOrder, Capacity };
     void   stall_(StallReason reason) noexcept;
-    void   waitForInstall_() noexcept;
+    void   waitForInstall_(const ConstraintSet& set) noexcept;
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     /// P6-13: a rejected record of a key-0 batch burns its id; a KeyExists on one is a reused id (counted and logged).
@@ -210,6 +216,7 @@ private:
     bool                        needsActivation_ = false;
     bool                        stalled_ = false, waitingForInstall_ = false, held_ = false;
     StallReason                 stallReason_ = StallReason::None;
+    ConstraintSetMember         waitingFor_;
     int64_t                     judgeCursor_ = 0, emitFrom_ = 0, setFrom_ = 0;
     int64_t                     checkpointCap_ = INT64_MAX;
     int64_t                     intervalNs_ = 100'000'000, lastMarkerNs_ = 0;
@@ -234,6 +241,7 @@ inline constexpr std::size_t kIndexReserve = 65536;
 inline void verdictFeedBegin(void* state, int64_t, int64_t target) noexcept {
     auto& s = *static_cast<PartitionWriteState*>(state);
     s.constraintSets.truncateFrom(target);
+    s.retainedPlans.truncateFrom(target);
     s.markers.truncateFrom(target);
     s.rejected.truncateFrom(target);
 }
@@ -268,6 +276,10 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
         s.constraintSets.onChange(base, set);
     } else if (c->type == cr::kReservation) {
         if (const auto r = cr::parseReservation(*c)) s.autoInc.onReservation(*r);
+    } else if (c->type == cr::kVerdictPlan) {
+        cr::VerdictPlanHeader h{};
+        std::span<const uint8_t> plan, out, src;
+        if (cr::parseVerdictPlan(*c, h, plan, out, src)) s.retainedPlans.onRecord(base, h.viewObjectId, h.planFingerprint, static_cast<rune::view::VerdictViewKind>(h.kind), plan, out, src);
     }
 }
 
@@ -311,7 +323,7 @@ template <class ReadRangeFn>
 bool VerdictSource::switchSet_(int64_t A, ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted, int& work) {
     const ConstraintSet& next = *state_->constraintSets.setAt(A + 1);
     if (!resolveSet_(next, scratchIdx_)) {
-        waitForInstall_();
+        waitForInstall_(next);
         return false;
     }
     waitingForInstall_ = false;
@@ -379,7 +391,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     for (const std::size_t i : active_) behind = behind || !checkpointSettled(*members_[i].inst) || members_[i].inst->foldCursor < judgeCursor_;
     const bool ready = activeSet_.count == active_.size() || reindex_();
     if (!ready) {
-        waitForInstall_();
+        waitForInstall_(activeSet_);
     } else if (!behind) {
         const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX ? INT64_MAX : emitFrom_ + checkpointCap_);
         while (!stalled_) {

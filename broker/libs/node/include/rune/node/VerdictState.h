@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace rune::node {
@@ -63,11 +64,61 @@ public:
         while (!changes_.empty() && changes_.back().offset >= offset) changes_.pop_back();
     }
     [[nodiscard]] std::size_t size() const noexcept { return changes_.size(); }
+    /// The offset of the first change after the member's latest join whose set lacks it; INT64_MAX while it is in latest() or never was.
+    [[nodiscard]] int64_t leaveOffsetOf(const ConstraintSetMember& member) const noexcept {
+        int64_t leave = INT64_MAX;
+        bool in = false;
+        for (const Change& c : changes_) {
+            const bool has = std::find(c.set.members.begin(), c.set.members.begin() + c.set.count, member) != c.set.members.begin() + c.set.count;
+            if (has && !in) leave = INT64_MAX;
+            else if (!has && in) leave = c.offset;
+            in = has;
+        }
+        return leave;
+    }
 
 private:
     struct Change { int64_t offset; ConstraintSet set; };
     static inline const ConstraintSet kEmpty{};
     std::vector<Change> changes_;
+};
+
+struct RetainedVerdictPlan {
+    uint64_t                    viewObjectId = 0, planFingerprint = 0;
+    rune::view::VerdictViewKind kind{};
+    int64_t                     offset = -1;
+    std::vector<uint8_t>        plan, outputDescriptor, sourceDescriptor;
+};
+
+/// The type-20 plan records of the local log (P9-8): what a leader judging under a member that left its catalog installs the plan from.
+/// Cold: the leadership scan and activation only.
+class RetainedVerdictPlans {
+public:
+    /// Idempotent per offset.
+    void onRecord(int64_t offset, uint64_t viewObjectId, uint64_t planFingerprint, rune::view::VerdictViewKind kind,
+                  std::span<const uint8_t> plan, std::span<const uint8_t> out, std::span<const uint8_t> src) {
+        auto it = std::lower_bound(plans_.begin(), plans_.end(), offset, [](const RetainedVerdictPlan& p, int64_t o) { return p.offset < o; });
+        if (it != plans_.end() && it->offset == offset) return;
+        plans_.insert(it, RetainedVerdictPlan{viewObjectId, planFingerprint, kind, offset, {plan.begin(), plan.end()}, {out.begin(), out.end()}, {src.begin(), src.end()}});
+    }
+    /// The latest record of the member.
+    [[nodiscard]] const RetainedVerdictPlan* find(uint64_t viewObjectId, uint64_t planFingerprint) const noexcept {
+        const auto it = std::find_if(plans_.rbegin(), plans_.rend(), [&](const RetainedVerdictPlan& p) { return p.viewObjectId == viewObjectId && p.planFingerprint == planFingerprint; });
+        return it == plans_.rend() ? nullptr : &*it;
+    }
+    void truncateFrom(int64_t offset) noexcept {
+        while (!plans_.empty() && plans_.back().offset >= offset) plans_.pop_back();
+    }
+    /// Drops the records of members that left at an offset below `watermark`: nothing judges under them any more.
+    void pruneLeftBelow(int64_t watermark, const ConstraintSetTimeline& timeline) noexcept {
+        std::erase_if(plans_, [&](const RetainedVerdictPlan& p) {
+            return timeline.leaveOffsetOf(ConstraintSetMember{p.viewObjectId, p.kind, p.planFingerprint}) < watermark;
+        });
+    }
+    [[nodiscard]] std::size_t size() const noexcept { return plans_.size(); }
+
+private:
+    std::vector<RetainedVerdictPlan> plans_;
 };
 
 /// The verdict markers of the local log that are not yet below the HW (a fixed ring), and what the committed ones cover.
@@ -118,7 +169,7 @@ private:
 struct VerdictSourceStats {
     uint64_t rejectionsConstraint = 0, markersWritten = 0, markerAppendRetries = 0, judgeWaitsForInstall = 0, verdictStalls = 0,
              verdictCheckpointsDiscarded = 0, verdictUnknownDuplicates = 0, verdictReplays = 0,
-             rejectionsKeyExists = 0, rejectionsKeyNotFound = 0, keyIndexRebuilds = 0, keyIndexSkippedMalformed = 0, candidateSwaps = 0;
+             rejectionsKeyExists = 0, rejectionsKeyNotFound = 0, keyIndexRebuilds = 0, keyIndexSkippedMalformed = 0, candidateSwaps = 0, retainedPlanInstalls = 0;
     struct PerConstraint { uint32_t constraintId = 0; uint64_t rejections = 0; };
     std::array<PerConstraint, 256> perConstraint{};
     uint16_t perConstraintCount = 0;

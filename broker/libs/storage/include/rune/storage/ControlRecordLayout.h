@@ -1,5 +1,5 @@
 #pragma once
-// ControlRecordLayout.h -- control records of the checked-writes pipeline (types 16-19; 20 is Part 09's).
+// ControlRecordLayout.h -- control records of the checked-writes pipeline (types 16-20).
 //
 // A control batch with attributes = kAttrControl ONLY (0x0020, transactional clear), producerId / producerEpoch /
 // baseSequence = -1 and one record in standard record framing.  The record key is the int16 LE type, the value is
@@ -11,6 +11,8 @@
 //   kConstraintSetChange [constraintSetId u32][catalogThrough i64][count u16] count x [viewObjectId u64][kind u8][planFingerprint u64]
 //                        (version byte 2: the catalog position the set was computed at, #788; a version-1 change is unparseable)
 //   kReservation         [reservedThroughN u64]
+//   kVerdictPlan         [viewObjectId u64][planFingerprint u64][kind u8][planLen u32][plan][outLen u32][output descriptor][srcLen u32][source descriptor]
+//                        (the plan of a joining unique or check member, appended just below its change record; at most kMaxVerdictPlanBytes in all)
 //   kTxnJudge (11) is recognised and skipped by every reader; its payload is that part's.
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
@@ -27,6 +29,7 @@ inline constexpr int16_t     kReservation         = 16;
 inline constexpr int16_t     kVerdictMarker       = 17;
 inline constexpr int16_t     kConstraintSetChange = 18;
 inline constexpr int16_t     kTxnJudge            = 19;
+inline constexpr int16_t     kVerdictPlan         = 20;
 inline constexpr int         kUnparseable         = -1;
 inline constexpr uint8_t     kPayloadVersion      = 1;
 inline constexpr uint8_t     kChangePayloadVersion = 2;
@@ -36,6 +39,7 @@ inline constexpr std::size_t kMaxVerdictPlanBytes = 65536;
 struct MarkerEntry  { uint32_t offsetDelta; uint16_t code; uint32_t constraintId; };
 struct MarkerHeader { int64_t fromOffset; int64_t finalThrough; uint32_t constraintSetId; uint32_t count; };
 struct ChangeMember { uint64_t viewObjectId; uint8_t kind; uint64_t planFingerprint; };
+struct VerdictPlanHeader { uint64_t viewObjectId; uint64_t planFingerprint; uint8_t kind; };
 
 inline constexpr std::size_t kMarkerFixedBytes = 1 + 8 + 8 + 4 + 4;
 inline constexpr std::size_t kMarkerEntryBytes = 4 + 2 + 4;
@@ -151,6 +155,28 @@ inline std::optional<std::span<const uint8_t>> valueOf(const uint8_t* batch, std
     return 1 + 8 + 8 + 1 + 3 * 4 + planLen + outLen + srcLen;
 }
 
+/// The whole type-20 batch around a payload of `payloadBytes`.
+[[nodiscard]] constexpr std::size_t verdictPlanBatchBytes(std::size_t payloadBytes) noexcept { return detail::batchBytes(payloadBytes); }
+
+/// Writes the type-20 value (verdictPlanPayloadBytes of the blobs) into `out`; 0 = `out` too small or over kMaxVerdictPlanBytes.
+inline std::size_t writeVerdictPlanPayload(std::span<uint8_t> out, const VerdictPlanHeader& h, std::span<const uint8_t> plan,
+                                           std::span<const uint8_t> outDesc, std::span<const uint8_t> srcDesc) noexcept {
+    const std::size_t total = verdictPlanPayloadBytes(plan.size(), outDesc.size(), srcDesc.size());
+    if (total > kMaxVerdictPlanBytes || out.size() < total) return 0;
+    uint8_t* d = out.data();
+    std::size_t p = 0;
+    d[p++] = kPayloadVersion;
+    detail::put<uint64_t>(d + p, h.viewObjectId); p += 8;
+    detail::put<uint64_t>(d + p, h.planFingerprint); p += 8;
+    d[p++] = h.kind;
+    for (const std::span<const uint8_t> blob : {plan, outDesc, srcDesc}) {
+        detail::put<uint32_t>(d + p, static_cast<uint32_t>(blob.size())); p += 4;
+        if (!blob.empty()) std::memcpy(d + p, blob.data(), blob.size());
+        p += blob.size();
+    }
+    return total;
+}
+
 /// 0 = `out` too small.
 inline std::size_t buildReservation(std::span<uint8_t> out, uint64_t reservedThroughN) noexcept {
     const std::size_t total = reservationBatchBytes();
@@ -205,7 +231,27 @@ inline std::size_t buildConstraintSetChange(std::span<uint8_t> out, uint32_t con
     return total;
 }
 
-/// A validated checked-writes control batch (type 16-19): the type and the value view into the batch bytes.  Obtain one only from
+/// 0 = `out` too small, or the payload is over kMaxVerdictPlanBytes.
+inline std::size_t buildVerdictPlan(std::span<uint8_t> out, const VerdictPlanHeader& h, std::span<const uint8_t> plan,
+                                    std::span<const uint8_t> outDesc, std::span<const uint8_t> srcDesc) noexcept {
+    const std::size_t valueLen = verdictPlanPayloadBytes(plan.size(), outDesc.size(), srcDesc.size());
+    if (valueLen > kMaxVerdictPlanBytes || out.size() < verdictPlanBatchBytes(valueLen)) return 0;
+    const std::size_t p = detail::beginBatch(out.data(), kVerdictPlan, valueLen);
+    (void)writeVerdictPlanPayload(out.subspan(p), h, plan, outDesc, srcDesc);
+    detail::sealBatch(out.data(), p + valueLen);
+    return verdictPlanBatchBytes(valueLen);
+}
+
+/// The type-20 batch around a payload writeVerdictPlanPayload built; 0 = `out` too small.
+inline std::size_t wrapVerdictPlan(std::span<uint8_t> out, std::span<const uint8_t> payload) noexcept {
+    if (out.size() < verdictPlanBatchBytes(payload.size())) return 0;
+    const std::size_t p = detail::beginBatch(out.data(), kVerdictPlan, payload.size());
+    std::memcpy(out.data() + p, payload.data(), payload.size());
+    detail::sealBatch(out.data(), p + payload.size());
+    return verdictPlanBatchBytes(payload.size());
+}
+
+/// A validated checked-writes control batch (type 16-20): the type and the value view into the batch bytes.  Obtain one only from
 /// parseControl, which runs the framing and the CRC once; the view overloads below do no CRC and trust it.
 struct ControlRecord {
     int16_t                  type;
@@ -213,15 +259,15 @@ struct ControlRecord {
 };
 
 /// Validates `batch` once (framing + CRC32C) and returns its type and value; nullopt for anything that is not a well-formed control
-/// batch of type 16-19 (a transaction marker, a data batch, a damaged or truncated batch, type 20 and above).
+/// batch of type 16-20 (a transaction marker, a data batch, a damaged or truncated batch, type 21 and above).
 [[nodiscard]] inline std::optional<ControlRecord> parseControl(const uint8_t* batch, std::size_t len) noexcept {
     int16_t type = 0;
     const auto v = detail::valueOf(batch, len, type);
-    if (!v || type < kReservation || type > kTxnJudge) return std::nullopt;
+    if (!v || type < kReservation || type > kVerdictPlan) return std::nullopt;
     return ControlRecord{type, *v};
 }
 
-/// The type (16-19) of a well-formed checked-writes control batch, else kUnparseable.
+/// The type (16-20) of a well-formed checked-writes control batch, else kUnparseable.
 [[nodiscard]] inline int recordType(const uint8_t* batch, std::size_t len) noexcept {
     const auto c = parseControl(batch, len);
     return c ? c->type : kUnparseable;
@@ -291,6 +337,37 @@ bool forEachMarkerEntry(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept
                                                    std::span<ChangeMember> out, uint16_t& count) noexcept {
     const auto c = parseControl(batch, len);
     return c && parseConstraintSetChange(*c, setId, catalogThrough, out, count);
+}
+
+/// false when `c` is not a plan record or its blob lengths do not add up.  The spans view into the batch bytes.
+[[nodiscard]] inline bool parseVerdictPlan(const ControlRecord& c, VerdictPlanHeader& h, std::span<const uint8_t>& plan,
+                                           std::span<const uint8_t>& outDesc, std::span<const uint8_t>& srcDesc) noexcept {
+    constexpr std::size_t kFixed = verdictPlanPayloadBytes(0, 0, 0);
+    if (c.type != kVerdictPlan || c.value.size() < kFixed || c.value.size() > kMaxVerdictPlanBytes) return false;
+    const uint8_t* d = c.value.data();
+    const std::size_t end = c.value.size();
+    VerdictPlanHeader got{detail::get<uint64_t>(d + 1), detail::get<uint64_t>(d + 9), d[17]};
+    std::size_t p = 18;
+    std::span<const uint8_t> blobs[3];
+    for (std::span<const uint8_t>& blob : blobs) {
+        if (p + 4 > end) return false;
+        const std::size_t n = detail::get<uint32_t>(d + p);
+        p += 4;
+        if (n > end - p) return false;
+        blob = std::span<const uint8_t>(d + p, n);
+        p += n;
+    }
+    if (p != end) return false;
+    h = got;
+    plan = blobs[0];
+    outDesc = blobs[1];
+    srcDesc = blobs[2];
+    return true;
+}
+[[nodiscard]] inline bool parseVerdictPlan(const uint8_t* batch, std::size_t len, VerdictPlanHeader& h, std::span<const uint8_t>& plan,
+                                           std::span<const uint8_t>& outDesc, std::span<const uint8_t>& srcDesc) noexcept {
+    const auto c = parseControl(batch, len);
+    return c && parseVerdictPlan(*c, h, plan, outDesc, srcDesc);
 }
 
 [[nodiscard]] inline std::optional<uint64_t> parseReservation(const ControlRecord& c) noexcept {
