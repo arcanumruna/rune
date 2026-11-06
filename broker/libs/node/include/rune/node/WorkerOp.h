@@ -173,6 +173,11 @@ struct WorkerOp {
         // the topic; the encodeTopicWriteSpec bytes ride schemaUpdateBlob (TailKind = WRITE_SPEC).  Follows the topic's
         // SchemaUpdate ops on the same ring.  Never ownership-gated.
         WriteSpecUpdate           = 32, ///< control → worker: install a typed topic's write spec
+        // Checked writes Part 07: gateway → the view source's owner: a wide-key point read / one prefix-scan page.  The
+        // scalars are GetViewRow's (topicId = viewTopicId, hwBound = requestedFingerprint) plus nextOffset = minOffset
+        // (-1 none) and recordCount = limit; viewReadTail (TailKind = VIEW_READ) carries the key or prefix and the token.
+        GetViewRowK               = 33, ///< gateway → worker: point read of a view row by its key bytes
+        ScanViewRows              = 34, ///< gateway → worker: one page of the rows under a key prefix
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -481,6 +486,10 @@ struct WorkerOp {
     // for the synchronous tryEnqueueOp call (copied once into the ring slot); empty = an unfiltered subscription.
     std::span<const uint8_t> filterBytes;
 
+    // Checked writes Part 07: a GetViewRowK / ScanViewRows op's [keyOrPrefixLen u8][bytes][tokenLen u8][token], TailKind::VIEW_READ.
+    // A view valid only for the synchronous tryEnqueueOp call, like filterBytes.
+    std::span<const uint8_t> viewReadTail;
+
     // Authentication Task 15: a PeerLinkKeys op's key material, [sendMaster 32][recvMaster 32] (the tail on the wire).
     // topicId = the peer node id, partition = the link epoch.
     static constexpr std::size_t kPeerKeysBytes = 64;
@@ -588,6 +597,9 @@ struct WorkerReturn {
         /// exactly once (the coordinator's code, or a retriable NotCoordinator when it cannot be asked or a
         /// remote ask is lost to a reconnect / coordinator change).  Rides sbe ReturnType::TXN_VERIFY_REQUEST.
         TxnVerifyRequest = 8,
+        /// Checked writes Part 07: the answer to a ScanViewRows op.  errorCode = ViewRowResponse status, recordCount =
+        /// rows in the page, readTopicId = viewTopicId; the chunk is [nextTokenLen u32][token][rowsLen u32][rows].
+        ViewScanResult = 9,
     };
 
     Type    type = Type::ProduceResult;

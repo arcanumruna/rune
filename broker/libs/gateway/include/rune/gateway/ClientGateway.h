@@ -1505,6 +1505,8 @@ public:
     // every handler) and the reject / unanswerable counters.
     bool applyClientFrameForTest(const uint8_t* buf, std::size_t len) { return onClientFrame_(buf, len); }
     void applyGetViewRowForTest(const uint8_t* buf, std::size_t len) { handleGetViewRow(buf, len); }
+    void applyGetViewRowKForTest(const uint8_t* buf, std::size_t len) { handleGetViewRowK(buf, len); }
+    void applyScanViewRowsForTest(const uint8_t* buf, std::size_t len) { handleScanViewRows(buf, len); }
     [[nodiscard]] uint64_t rejectedRequestsForTest() const noexcept { return rejectedRequests_; }
     // No-hang fix round 2: inject a session with a NON-NULL placeholder egress
     // (never dereferenced: makeForTest's TestEgressFn intercepts every offer of
@@ -2092,6 +2094,13 @@ private:
     // owning worker (same op/return plumbing as PushRead); the worker's
     // ViewRowResult is encoded as a ViewRowResponse (73) in drainWorkerReturns_.
     void handleGetViewRow   (const uint8_t* buf, std::size_t len);
+    // Checked writes Part 07: GetViewRowK (88) / ScanViewRows (89) - the same pipeline; the worker answers a
+    // ViewRowResult / ViewScanResult (ScanViewRowsResponse 90).
+    void handleGetViewRowK  (const uint8_t* buf, std::size_t len);
+    void handleScanViewRows (const uint8_t* buf, std::size_t len);
+    [[nodiscard]] Session* checkedViewReadSession_(const uint8_t* buf, std::size_t len, int64_t sessionId,
+                                                   int32_t viewTopicId, const char* what);
+    void enqueueViewRead_(const uint8_t* buf, std::size_t len, Session& session, rune::node::WorkerOp& op);
     // GB-3: Push delivery — called from doWork after ingress poll.
     void pushSubscriptions  ();
     void pushSubscriptionsPass_();   ///< N2: the pass body (pushSubscriptions logs the summary after it)

@@ -66,6 +66,8 @@ public:
         NS_VIEW_MEM_OVER = static_cast<std::uint8_t>(30),
         CLUSTER_FEATURE_LEVEL = static_cast<std::uint8_t>(31),
         WRITE_SPEC_UPDATE = static_cast<std::uint8_t>(32),
+        GET_VIEW_ROW_K = static_cast<std::uint8_t>(33),
+        SCAN_VIEW_ROWS = static_cast<std::uint8_t>(34),
         TEST_TASK = static_cast<std::uint8_t>(200),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
@@ -107,6 +109,8 @@ public:
             case static_cast<std::uint8_t>(30): return NS_VIEW_MEM_OVER;
             case static_cast<std::uint8_t>(31): return CLUSTER_FEATURE_LEVEL;
             case static_cast<std::uint8_t>(32): return WRITE_SPEC_UPDATE;
+            case static_cast<std::uint8_t>(33): return GET_VIEW_ROW_K;
+            case static_cast<std::uint8_t>(34): return SCAN_VIEW_ROWS;
             case static_cast<std::uint8_t>(200): return TEST_TASK;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
@@ -151,6 +155,8 @@ public:
             case NS_VIEW_MEM_OVER: return "NS_VIEW_MEM_OVER";
             case CLUSTER_FEATURE_LEVEL: return "CLUSTER_FEATURE_LEVEL";
             case WRITE_SPEC_UPDATE: return "WRITE_SPEC_UPDATE";
+            case GET_VIEW_ROW_K: return "GET_VIEW_ROW_K";
+            case SCAN_VIEW_ROWS: return "SCAN_VIEW_ROWS";
             case TEST_TASK: return "TEST_TASK";
             case NULL_VALUE: return "NULL_VALUE";
         }

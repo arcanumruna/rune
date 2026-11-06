@@ -133,6 +133,11 @@
            (the key facts).  topicId = the topic, tail (TailKind = WRITE_SPEC) = the encoded TopicWriteSpecWire.  Follows
            the topic's SCHEMA_UPDATE ops on the same ring.  Never ownership-gated. -->
       <validValue name="WRITE_SPEC_UPDATE">32</validValue>
+      <!-- Checked writes Part 07: gateway -> source owner: a wide-key point read / a prefix scan page of a view.  tail
+           (TailKind = VIEW_READ) = [keyOrPrefixLen u8][bytes][tokenLen u8][token]; answered with VIEW_ROW_RESULT /
+           VIEW_SCAN_RESULT. -->
+      <validValue name="GET_VIEW_ROW_K">33</validValue>
+      <validValue name="SCAN_VIEW_ROWS">34</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -164,6 +169,8 @@
       <validValue name="FILTER">11</validValue>
       <!-- Checked writes Part 02: a WRITE_SPEC_UPDATE op's encoded TopicWriteSpecWire. -->
       <validValue name="WRITE_SPEC">12</validValue>
+      <!-- Checked writes Part 07: a GET_VIEW_ROW_K / SCAN_VIEW_ROWS op's key-or-prefix and page token. -->
+      <validValue name="VIEW_READ">13</validValue>
     </enum>
 
     <!-- WorkerReturn::Type -->
@@ -202,6 +209,9 @@
            (producerId, producerEpoch) may open a transaction on topicId / partition.  correlationId = the worker's
            request id (echoed by TXN_VERIFY_RESULT); targetReplicaId / incarnation = the partition replica. -->
       <validValue name="TXN_VERIFY_REQUEST">8</validValue>
+      <!-- Checked writes Part 07: the answer to a SCAN_VIEW_ROWS op.  errorCode = status, recordCount = rows in the page;
+           the chunk is [nextTokenLen u32][token][rowsLen u32][rows]. -->
+      <validValue name="VIEW_SCAN_RESULT">9</validValue>
     </enum>
 
     <!-- F15: TxnReturn::kind -->

@@ -46,6 +46,7 @@ public:
         END_DETAIL = static_cast<std::uint8_t>(10),
         FILTER = static_cast<std::uint8_t>(11),
         WRITE_SPEC = static_cast<std::uint8_t>(12),
+        VIEW_READ = static_cast<std::uint8_t>(13),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -66,6 +67,7 @@ public:
             case static_cast<std::uint8_t>(10): return END_DETAIL;
             case static_cast<std::uint8_t>(11): return FILTER;
             case static_cast<std::uint8_t>(12): return WRITE_SPEC;
+            case static_cast<std::uint8_t>(13): return VIEW_READ;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -89,6 +91,7 @@ public:
             case END_DETAIL: return "END_DETAIL";
             case FILTER: return "FILTER";
             case WRITE_SPEC: return "WRITE_SPEC";
+            case VIEW_READ: return "VIEW_READ";
             case NULL_VALUE: return "NULL_VALUE";
         }
 

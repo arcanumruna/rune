@@ -168,6 +168,16 @@ inline constexpr std::size_t kMaxRejectionBytes = 64;
         r.sessionId = sessionId; r.correlationId = correlationId; r.status = code;
         return r.encode(out);
     }
+    case T::GetViewRowK: {
+        pc::ViewRowResponse r;
+        r.sessionId = sessionId; r.correlationId = correlationId; r.status = code;
+        return r.encode(out);
+    }
+    case T::ScanViewRows: {
+        pc::ScanViewRowsResponse r;
+        r.sessionId = sessionId; r.correlationId = correlationId; r.status = code;
+        return r.encode(out);
+    }
     case T::Ping:
     case T::MetadataRequest:
     case T::ListNamespaces:       // ListNamespacesResponse (83) has no error field
