@@ -617,9 +617,9 @@ inline const rune::codec::Descriptor& writerOf(VersionDescriptorCache& vdc, std:
 template <class T>
 StepOut aggStep(Ctx<T>& cx, VersionDescriptorCache& vdc, const rune::codec::Descriptor* writer,
                 std::string_view key, std::string_view value) noexcept {
-    if (key.size() != 8) { ++cx.stats.skippedMalformed; return {StepKind::Malformed}; }
+    if (key.size() != cx.agg.sourceKeyWidth) { ++cx.stats.skippedMalformed; return {StepKind::Malformed}; }
     uint64_t c = 0;
-    std::memcpy(&c, key.data(), 8);   // little-endian identity bytes
+    std::memcpy(&c, key.data(), key.size());   // little-endian identity bytes; a narrower integer key zero-extends
     // A linked view's lists end in kNoContributor: that key cannot be linked.
     if (cx.agg.linked && c == kNoContributor) { ++cx.stats.skippedMalformed; return {StepKind::Malformed}; }
 

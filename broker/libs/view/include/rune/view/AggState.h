@@ -117,6 +117,7 @@ struct AggLayout {
     rune::codec::PrimType keyType       = rune::codec::PrimType::Int64;
     std::vector<AggField> fields;              // one per non-key output column
     uint16_t              numInputs     = 0;   // fields with a source input
+    uint8_t               sourceKeyWidth = 8;  // wire key bytes of the source record (its integer key field)
     RowLayout             contributorRow;      // only rowLen is meaningful
     uint32_t              contribNullOff = 8;
     uint32_t              contribValOff  = 8;  // == inputOff[0] when numInputs > 0

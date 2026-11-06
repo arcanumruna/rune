@@ -39,6 +39,9 @@ bool needsContributorList(MergeRule r) noexcept { return isExtremeRule(r) || isL
 std::optional<AggLayout> buildAggLayout(const CompiledViewPlan& plan,
                                         const rune::codec::Descriptor& evolvingSrc) {
     AggLayout a;
+    for (const auto& sk : evolvingSrc.fields) {
+        if (sk.isKey && isIntegerKeyType(sk.type)) a.sourceKeyWidth = static_cast<uint8_t>(rune::codec::fixedSize(sk.type));
+    }
     for (const auto& f : plan.output) {
         if (f.rule == MergeRule::Replace) {   // compiler: exactly the group-by column
             a.keyOutSlot    = f.outSlot;

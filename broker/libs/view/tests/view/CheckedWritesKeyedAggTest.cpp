@@ -83,9 +83,10 @@ struct Log {
     rune::codec::Descriptor src = deviceSource();
     std::vector<uint8_t> bytes;
     int64_t next = 0;
+    size_t keyBytes = 8;   // the wire key width of the source key
     void batch(const std::vector<Ev>& evs) {
         rune::protocol::RecordBatchBuilder b(next, 0);
-        for (const Ev& e : evs) b.append(wireKey(e.id), e.tombstone ? std::string() : valueOf(src, e), 0);
+        for (const Ev& e : evs) b.append(wireKey(e.id).substr(0, keyBytes), e.tombstone ? std::string() : valueOf(src, e), 0);
         const auto out = b.build();
         bytes.insert(bytes.end(), out.begin(), out.end());
         next += int64_t(evs.size());
@@ -148,7 +149,7 @@ const std::vector<uint8_t> kLegacyGroupGolden = {
 
 // The tables of a keyed aggregate view, the fold's inputs and a prospect (what WorkerViewSet holds per instance).
 struct Rig {
-    rune::codec::Descriptor src = deviceSource();
+    rune::codec::Descriptor src;
     CompileResult comp;
     AggLayout agg;
     KeyedFoldSpec spec;
@@ -165,8 +166,8 @@ struct Rig {
     }
     static RowLayout idRow() { RowLayout r; r.rowLen = 8; return r; }
 
-    explicit Rig(const ViewPlan& v, uint64_t seed = kNoSeed)
-        : comp(compile(v, src)), agg(buildAggLayout(comp.plan, src).value()), spec(buildKeyedFoldSpec(comp.plan, src).value()),
+    explicit Rig(const ViewPlan& v, uint64_t seed = kNoSeed, rune::codec::Descriptor source = deviceSource())
+        : src(std::move(source)), comp(compile(v, src)), agg(buildAggLayout(comp.plan, src).value()), spec(buildKeyedFoldSpec(comp.plan, src).value()),
           view(comp.rowLayout, 256, 1u << 16, ViewTableKeys{uint8_t(spec.keyWidth), uint8_t(spec.prefixWidth), seed}),
           contributors(agg.contributorRow, 256, 1u << 16, ViewTableKeys{8, 0, seed}), groups(agg.groupRow, 256, 1u << 16, ViewTableKeys{8, 0, seed}),
           blocks(agg.blockRow, 256, 1u << 16, ViewTableKeys{8, 0, seed}), groupIds(idRow(), 256, 1u << 16, ViewTableKeys{uint8_t(spec.keyWidth), 0, seed}) {
@@ -333,6 +334,28 @@ TEST(CheckedWritesKeyedAgg, LowerGroupKey) {
     EXPECT_EQ(std::string(key.bytes.substr(0, 3)), "fpa");
     EXPECT_EQ(key.bytes.size(), size_t(rune::codec::maxLoweredWidth(32)));
     EXPECT_TRUE(std::all_of(key.bytes.begin() + 3, key.bytes.end(), [](char c) { return c == 0; }));
+}
+
+TEST(CheckedWritesKeyedAggRegression, NarrowIntegerSourceKeyFoldsRegression) {
+    const auto narrow = rune::codec::DescriptorBuilder("device", 2)
+        .add("eventId", PrimType::UInt32, 1, true).add("userId", PrimType::UInt64).addFixedStr("deviceFp", 32).addFixedStr("model", 16)
+        .add("platform", PrimType::Enum).add("region", PrimType::UInt16).add("shard", PrimType::UInt64, 2)
+        .add("lastSeen", PrimType::Int64, 2).add("bytes", PrimType::UInt64, 2).build();
+    Rig r(deviceHistory(), kNoSeed, narrow);
+    Log log;
+    log.src = narrow;
+    log.keyBytes = 4;
+    log.batch({ev(1, 1, "fpA", 100, 10), ev(0xFFFFFFFFu, 1, "fpA", 300, 20), ev(3, 2, "fpB", 50, 5)});
+    const FoldStats st = r.foldLog(log);
+    EXPECT_EQ(st.skippedMalformed, 0u);
+    EXPECT_EQ(st.applied, 3u);
+    EXPECT_EQ(r.view.size(), 2u);
+    EXPECT_EQ(r.col(userFp(1, "fpA"), "uses").i, 2);
+    EXPECT_EQ(r.col(userFp(1, "fpA"), "total").u, 30u);
+
+    log.batch({gone(0xFFFFFFFFu)});
+    r.foldLog(log);
+    EXPECT_EQ(r.col(userFp(1, "fpA"), "uses").i, 1);
 }
 
 TEST(CheckedWritesKeyedAgg, EnumAndNarrowGroupKeys) {
