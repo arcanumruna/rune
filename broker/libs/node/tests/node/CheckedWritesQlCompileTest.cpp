@@ -183,6 +183,18 @@ TEST(CheckedWritesQlCompile, GroupByOrderIsTheCompilersRule) {
     EXPECT_EQ(a.detail, "view 'v': group by (deviceFp, userId) must equal the key (userId, deviceFp)");
 }
 
+TEST(CheckedWritesQlCompileRegression, GroupColumnOtherThanTheKeyNamesTheCompilersDetailRegression) {
+    const ql::TopicDef topic = topicOf("topic src { id uint64, userId uint64, gender uint16 } partitions 1 key id;");
+    const auto plan = ql::applyViewPlan(viewOf("create view v key userId as select count(*) as n from src group by gender;"), ql::viewSourceOf(topic));
+    ASSERT_TRUE(plan.has_value()) << plan.error().message;
+    CatalogDdlRig rig("cwqk");
+    serving(rig);
+    ASSERT_EQ(defineTopic(rig, topic).code, 0);
+    const auto a = submitView(rig, *plan, "src");
+    EXPECT_EQ(a.code, codeOf(ErrorCode::ViewKeyInvalid));
+    EXPECT_EQ(a.detail, "view 'v': group by (gender) must equal the key (userId)");
+}
+
 TEST(CheckedWritesQlCompile, RegressorsPathCompilesWithTheBrokerCompiler) {
     std::ifstream in(std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql");
     ASSERT_TRUE(in.good());

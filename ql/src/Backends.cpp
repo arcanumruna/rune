@@ -432,7 +432,7 @@ std::expected<rune::view::ViewPlan, ParseError> applyViewPlan(const CreateViewDe
             plan.groupBy.push_back(std::move(c));
         }
     }
-    plan.sources.push_back({src.topicId, aggregate && !v2 ? def.groupBy[0].column : src.keyField});
+    plan.sources.push_back({src.topicId, aggregate && !v2 && plan.groupBy.empty() ? def.groupBy[0].column : src.keyField});
 
     std::vector<ColType> types;   // parallel to plan.output
     auto addReplace = [&](const std::string& name, const rune::codec::FieldDescriptor& f) {
