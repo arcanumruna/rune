@@ -13,6 +13,7 @@
 #include <rune/view/FoldStats.h>
 #include <rune/view/KeyedFold.h>
 #include <rune/view/RecordFold.h>
+#include <rune/view/UniqueClaims.h>
 #include <rune/view/ViewPlan.h>
 #include <rune/view/ViewRow.h>
 #include <rune/view/ViewTable.h>
@@ -84,6 +85,7 @@ struct ProjectionFold {
     rune::codec::PrimType    keyType;
     const KeyedFoldSpec*     keyed  = nullptr;   // null for a LegacyU64 plan
     ViewTable*               owners = nullptr;   // keyed and owner-mapped: wire key -> current view key
+    UniqueClaims*            claims = nullptr;   // unique and owner-mapped: owner and extra claimants per view key
 };
 
 // The view key column's type, for building a ProjectionFold / AggregateFold.

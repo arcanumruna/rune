@@ -19,6 +19,7 @@
 #include <rune/view/ViewCheckpoint.h>
 #include <rune/view/KeyedFold.h>
 #include <rune/view/RecordFold.h>
+#include <rune/view/UniqueClaims.h>
 #include <rune/view/ViewFold.h>
 #include <rune/view/ViewPlan.h>
 #include <rune/view/ViewRow.h>
@@ -130,6 +131,8 @@ struct ViewFoldCounters {
     uint64_t skippedNoKey            = 0;   // keyed projection: a live record with an absent key component
     uint64_t keyConflicts            = 0;   // keyed projection: a unique key already owned by another source key
     uint64_t ownerMoves              = 0;   // keyed projection: a row moved to another key
+    uint64_t uniqueConflicts         = 0;   // unique view gauge: the current number of extra claimants
+    uint64_t uniquePromotions        = 0;   // unique view: an extra claimant became the owner of a key
     uint64_t scanRows                = 0;   // rows served by scanPage
     uint64_t scanPages               = 0;   // pages served by scanPage
 };
@@ -209,6 +212,7 @@ struct ViewInstance {
     // key; only when the key is not the source key) and the fixed prospect the fold prepares each record into.
     std::optional<rune::view::KeyedFoldSpec> keyed;
     std::optional<rune::view::ViewTable>     owners;
+    std::optional<rune::view::UniqueClaims>  claims;   // engaged iff the view is unique and owner-mapped
     rune::view::Prospect                     prospect;
     int32_t                            partition       = 0;
     int64_t                            foldCursor      = 0;

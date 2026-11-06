@@ -35,6 +35,7 @@ struct FoldStats {
     uint64_t skippedNoKey     = 0;
     uint64_t keyConflicts     = 0;
     uint64_t ownerMoves       = 0;
+    uint64_t uniquePromotions = 0;   // unique views: an extra claimant became the owner of a key
 };
 
 } // namespace rune::view

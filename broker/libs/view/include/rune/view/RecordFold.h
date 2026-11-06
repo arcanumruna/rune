@@ -98,6 +98,8 @@ struct ProspectRow {
     uint8_t* image   = nullptr;   // the prospective view-row image; valid until the Prospect is cleared
     bool     removed = false;     // the row is gone after apply
     bool     existed = false;     // the row exists in the table now
+    bool     ownedByOther = false;   // unique: the key is owned by another source key
+    bool     promoted = false;       // unique: the owner leaves and an extra takes the row (computed by apply)
 };
 
 // Reserved once per ViewInstance at install; never grows.
@@ -117,6 +119,10 @@ struct Prospect {
         rowCount = 0;
         ownerOp  = OwnerOp::None;
         stats    = {};
+        for (ProspectRow& r : rows) {
+            r.image = nullptr;
+            r.removed = r.existed = r.ownedByOther = r.promoted = false;
+        }
         overlay.clear();
     }
 };
