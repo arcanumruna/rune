@@ -7,7 +7,8 @@ add_library(rune_view STATIC
     src/ViewCheckpoint.cpp
     src/AggState.cpp
     src/AggFold.cpp
-    src/PlanSources.cpp)
+    src/PlanSources.cpp
+    src/KeyedFold.cpp)
 target_include_directories(rune_view PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${RUNE_PROTOCOL_INCLUDE}
@@ -33,7 +34,8 @@ if(BUILD_TESTING)
         tests/view/CheckedWritesAbortedFoldMatrixTest.cpp
         tests/view/CheckedWritesViewTableTest.cpp
         tests/view/CheckedWritesViewTablePrefixTest.cpp
-        tests/view/CheckedWritesViewCheckpointV3Test.cpp)
+        tests/view/CheckedWritesViewCheckpointV3Test.cpp
+        tests/view/CheckedWritesKeyedFoldTest.cpp)
     target_link_libraries(rune_view_tests PRIVATE rune_view rune_codec GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_view_tests)
