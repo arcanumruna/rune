@@ -301,6 +301,14 @@ TEST(CheckedWritesQlPlanRegression, CheckConstantEdgesRegression) {
     EXPECT_EQ(ql::predicateText(b->constraints[0].predicate), "lb = true");
 }
 
+TEST(CheckedWritesQlPlanRegression, NegativeZeroFloatConstantIsPositiveZeroRegression) {
+    const std::string t = "topic c { id uint64, f float64 } key id;";
+    auto p = planOne(t, "create view v key id as select last(f) as lf from c group by id constraint k check (lf > -0);");
+    ASSERT_TRUE(p.has_value()) << p.error().message;
+    EXPECT_EQ(p->constraints[0].predicate[1].constBytes, bytes16({}));
+    EXPECT_EQ(ql::predicateText(p->constraints[0].predicate), "lf > 0");
+}
+
 TEST(CheckedWritesQlPlan, PredicateTextShapes) {
     const std::string t = "topic c { id uint64, u uint64 } key id;";
     auto p = planOne(t, "create view v key id as select count(*) as n, max(u) as m from c group by id "

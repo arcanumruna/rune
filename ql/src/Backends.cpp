@@ -282,7 +282,8 @@ std::optional<std::array<uint8_t, 16>> constBytesOf(const Literal& l, const ColT
         }
         case PrimType::Float64: {
             if (l.kind != Literal::Kind::Integer) return std::nullopt;
-            const double d = l.negative ? -static_cast<double>(l.magnitude) : static_cast<double>(l.magnitude);
+            // A magnitude above 2^53 rounds to the nearest double; -0 is +0.
+            const double d = l.negative && l.magnitude != 0 ? -static_cast<double>(l.magnitude) : static_cast<double>(l.magnitude);
             std::memcpy(out.data(), &d, sizeof d);
             return out;
         }
