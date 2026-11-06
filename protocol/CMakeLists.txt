@@ -52,6 +52,7 @@ if(BUILD_TESTING)
             tests/protocol/client/SecurityMessagesTest.cpp
             tests/protocol/client/NamespaceMessagesTest.cpp
             tests/protocol/client/CheckedWritesViewReadMessagesTest.cpp
+            tests/protocol/client/CheckedWritesStatsMessagesTest.cpp
             tests/protocol/ReplicationSchemaV4Test.cpp
             tests/protocol/ReplicationSchemaV5Test.cpp
             tests/protocol/internal/RingSbeTest.cpp

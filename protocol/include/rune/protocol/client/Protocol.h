@@ -114,6 +114,9 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     GetViewRowK             = 88,
     ScanViewRows            = 89,
     ScanViewRowsResponse    = 90,
+    // stats (client version 17): sent only to a session >= kClientVersionCheckedWrites
+    GetStats                = 91,
+    StatsResponse           = 92,
 };
 
 enum class ErrorCode : uint16_t {

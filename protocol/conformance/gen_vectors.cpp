@@ -22,6 +22,7 @@
 #include "rune/protocol/client/DataMessages.h"
 #include "rune/protocol/client/PingMessages.h"
 #include "rune/protocol/client/SchemaMessages.h"
+#include "rune/protocol/client/StatsMessages.h"
 
 namespace rpc = rune::protocol::client;
 
@@ -647,6 +648,26 @@ int main(int argc, char** argv) {
         write_vec(dir, "scan_view_rows_response.bin", buf, n);
     }
 
-    std::printf("Done. 33 vectors written to %s/\n", dir);
+    // Stats (templates 91-92, client version 17): see manifest.md.
+    {
+        rpc::GetStats g;
+        g.sessionId = kSessionId; g.correlationId = kCorrelationId;
+        g.scope = rpc::StatsScope::ViewPartition; g.objectId = 7; g.partition = 3;
+        n = g.encode(buf);
+        write_vec(dir, "get_stats.bin", buf, n);
+
+        std::vector<uint8_t> stats, cons;
+        auto le = [](std::vector<uint8_t>& v, uint64_t x, int bytes) { for (int i = 0; i < bytes; ++i) v.push_back(uint8_t(x >> (8 * i))); };
+        const uint16_t ids[] = {4, 32, 36};
+        for (int i = 0; i < 3; ++i) { le(stats, ids[i], 2); le(stats, 1000 + i, 8); }
+        for (int i = 0; i < 2; ++i) { le(cons, 100 + i, 4); le(cons, 5000 + i, 8); }
+        rpc::StatsResponse r;
+        r.sessionId = kSessionId; r.correlationId = kCorrelationId;
+        r.status = 0; r.count = 3; r.statBytes = stats; r.constraintCount = 2; r.constraintBytes = cons;
+        n = r.encode(buf);
+        write_vec(dir, "stats_response.bin", buf, n);
+    }
+
+    std::printf("Done. 35 vectors written to %s/\n", dir);
     return 0;
 }

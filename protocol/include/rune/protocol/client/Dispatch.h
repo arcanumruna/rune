@@ -67,7 +67,7 @@ struct FrameCheck {
 //                            AlterView=77, DdlResponse=78; SecurityDdl=79, SecurityBootstrap=80;
 //                            namespaces NamespaceDdl=81..NamespaceUsageResponse=85; WorkerBind=86 (WorkerBindAck=87 is
 //                            broker -> client only, unknown here); GetViewRowK=88, ScanViewRows=89,
-//                            ScanViewRowsResponse=90; 91-95 gap → UnknownTemplate)
+//                            ScanViewRowsResponse=90; GetStats=91, StatsResponse=92; 93-95 gap → UnknownTemplate)
 //
 // Extend this function when future tickets add template ids.
 // ---------------------------------------------------------------------------
@@ -120,9 +120,9 @@ struct FrameCheck {
     // NAT-safe egress (client version 16): WorkerBind = 86.
     // WorkerBindAck = 87 is broker -> client only: it stays UNKNOWN here (ingress), the client recognizes it by id.
     if (tid == static_cast<uint16_t>(TemplateId::WorkerBind)) return true;
-    // checked writes (client version 17): GetViewRowK = 88 .. ScanViewRowsResponse = 90 (91-95 gap -> UnknownTemplate)
+    // checked writes (client version 17): GetViewRowK = 88 .. StatsResponse = 92 (93-95 gap -> UnknownTemplate)
     if (tid >= static_cast<uint16_t>(TemplateId::GetViewRowK) &&
-        tid <= static_cast<uint16_t>(TemplateId::ScanViewRowsResponse)) {
+        tid <= static_cast<uint16_t>(TemplateId::StatsResponse)) {
         return true;
     }
     return false;
