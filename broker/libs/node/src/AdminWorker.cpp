@@ -1402,10 +1402,10 @@ namespace {
 constexpr const char* kAutoIncRetentionDetail = "autoincrement topics keep every record: retention.ms and retention.bytes must be -1";
 
 // Checked writes (Part 05 P5-6, Part 06 P6-5): the leader-only rules for a new definition's key features, on the
-// normalized features.  `keyWidth` and `keyType` describe the key field (0 / Int32 = no such field, which stays the
+// normalized features.  `keyType` describes the key field (Int32 = no such field, which stays the
 // applier's precondition).
 std::optional<DdlRejection> keyFeaturesRefusal(const rune::protocol::TopicKeyFeatures& f, const TopicShape& shape,
-                                               uint32_t keyWidth, rune::codec::PrimType keyType, int32_t partitionCount,
+                                               rune::codec::PrimType keyType, int32_t partitionCount,
                                                const rune::protocol::TopicConfig& config, bool adoption, int16_t level) {
     namespace rp = rune::protocol;
     if (f == rp::TopicKeyFeatures{}) return std::nullopt;
@@ -1434,7 +1434,6 @@ std::optional<DdlRejection> keyFeaturesRefusal(const rune::protocol::TopicKeyFea
             return reject(kInvalidRequest, "autoincrement.max must be between " + std::to_string(low) + " and " + std::to_string(cap));
     }
     if (const auto why = featureRefusal(DbFeature::KeyIndex, shape)) return reject(kInvalidRequest, std::string(*why));
-    if (keyWidth > 8) return reject(kInvalidRequest, "key.index needs a key of at most 8 bytes");
     return std::nullopt;
 }
 
@@ -1495,7 +1494,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         if (m.blob.empty()) return Rejected(reject(kTopicExists, {}, t->topicId, 0));   // untyped, nothing to adopt
         if (keyRefusal) return Rejected(std::move(*keyRefusal));
         if (auto why = keyFeaturesRefusal(features, TopicShape{true, !m.keyField.empty(), t->persistence == cat::Persistence::Transient},
-                                          keyWidth, keyType, m.partitionCount, m.config, /*adoption=*/true, clusterFeatureLevel_))
+                                          keyType, m.partitionCount, m.config, /*adoption=*/true, clusterFeatureLevel_))
             return Rejected(std::move(*why));
         // Issue #129: adopting a schema is a new version of a LIVE topic (every other producer's records are then
         // validated against it), so it needs ALTER on the topic - the gateway's verdict - not CREATE alone.
@@ -1519,7 +1518,7 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     if (auto fold = foldCollision(s, m.nsId, m.name)) return Rejected(std::move(*fold));
     if (keyRefusal) return Rejected(std::move(*keyRefusal));
     if (auto why = keyFeaturesRefusal(features, TopicShape{!m.blob.empty(), !m.keyField.empty(), m.persistence == 1},
-                                      keyWidth, keyType, m.partitionCount, m.config, /*adoption=*/false, clusterFeatureLevel_))
+                                      keyType, m.partitionCount, m.config, /*adoption=*/false, clusterFeatureLevel_))
         return Rejected(std::move(*why));
 
     // Spec §8: the replication factor is bounded by the brokers and the minIsr.

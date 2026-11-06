@@ -31,8 +31,8 @@ rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold& f, const rune::vie
         return rune::view::PrepareStatus::Malformed;
     }
     rune::view::ProspectRow& r = p.rows[0];
-    r.key      = rune::view::ViewKey::fromU64(keyIndexWord(rec.key));
-    r.existed  = f.table.get(r.key.asU64()) != nullptr;
+    r.key      = rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(rec.key.data()), rec.key.size()});
+    r.existed  = f.table.get(r.key) != nullptr;
     r.removed  = rec.value.empty();
     r.image    = nullptr;
     p.rowCount = 1;
@@ -52,8 +52,8 @@ Verdict evaluateIntent(const rune::view::SourceRecord& rec, const rune::view::Pr
 }
 
 void applyKeyIndex(KeyIndexFold& f, const rune::view::SourceRecord&, const rune::view::Prospect& p) noexcept {
-    if (p.op == rune::view::ProspectOp::Upsert) *f.table.put(p.rows[0].key.asU64()) = 1;
-    else if (p.op == rune::view::ProspectOp::Erase) f.table.erase(p.rows[0].key.asU64());
+    if (p.op == rune::view::ProspectOp::Upsert) *f.table.put(p.rows[0].key) = 1;
+    else if (p.op == rune::view::ProspectOp::Erase) f.table.erase(p.rows[0].key);
 }
 
 rune::view::FoldStats foldKeyIndexBatch(KeyIndexFold& f, const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
@@ -152,7 +152,7 @@ void VerdictSource::addVerdictView(ViewInstance* inst, rune::view::VerdictViewKi
         const uint16_t keyField = inst->plan.keyFieldId[0];
         const auto it = std::find_if(inst->evolvingSrc.fields.begin(), inst->evolvingSrc.fields.end(), [&](const auto& f) { return f.id == keyField; });
         const uint32_t width = it == inst->evolvingSrc.fields.end() ? 0 : rune::codec::fieldWidth(*it);
-        if (width == 0 || width > 8) throw std::invalid_argument("key index: the source key field must be fixed-width, 1 to 8 bytes");
+        if (width == 0 || width > rune::codec::kMaxTopicKeyBytes) throw std::invalid_argument("key index: the source key field must be fixed-width, 1 to 16 bytes");
         m.keyWidth = static_cast<uint8_t>(width);
     }
     auto at = std::lower_bound(members_.begin(), members_.end(), viewObjectId, [](const Member& x, uint64_t id) { return x.objectId < id; });
@@ -342,7 +342,7 @@ void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexc
 
 // The key index is never checkpointed: nothing will encode its dirty rows, so they are dropped (WorkerViewSet::discardDirty_'s rule).
 void VerdictSource::discardKeyIndexDirty_(ViewInstance& inst) noexcept {
-    inst.table.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) noexcept {});
+    inst.table.drainDirtyKeyed([](uint32_t, const uint8_t*, bool, std::span<const uint8_t>) noexcept {});
 }
 
 Verdict VerdictSource::verdictOf_(const Member& m, const rune::view::SourceRecord& rec) const noexcept {

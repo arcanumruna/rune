@@ -1588,9 +1588,6 @@ TEST(CheckedWritesBrokerRegression, KeyIndexDdlRefusalsShardRegression) {
     expectRefused(c.defineTopicAndWait("untyped", 1, "", {}, rc::Persistence::Disk, keyIndex, {}, 30s), "key.index needs a typed topic");
     expectRefused(c.defineTopicAndWait("keyless", 1, "", blob, rc::Persistence::Disk, keyIndex, {}, 30s), "key.index needs a key");
     expectRefused(c.defineTopicAndWait("transient", 1, "id", blob, rc::Persistence::Transient, keyIndex, {}, 30s), "key.index needs a persisted topic");
-    const auto wide = rune::codec::DescriptorBuilder("wide", 1).addFixedStr("k", 9, 1, true).add("n", rune::codec::PrimType::Int64).build();
-    expectRefused(c.defineTopicAndWait("wide", 1, "k", rune::codec::serialize(wide), rc::Persistence::Disk, keyIndex, {}, 30s),
-                  "key.index needs a key of at most 8 bytes");
     rc::TopicOptions autoInc = keyIndex;
     autoInc.keyFeatures.autoIncrement = true;
     expectRefused(c.defineTopicAndWait("autoinc", 1, "id", blob, rc::Persistence::Disk, autoInc, {}, 30s), "autoincrement needs cleanup.policy = compact");
@@ -2554,4 +2551,49 @@ TEST(CheckedWritesBrokerRegression, LostAckRetryAcrossFailoverReturnsTheSameIdsT
     EXPECT_EQ(*row, kMarker);
     EXPECT_EQ(storedValues(c.node(leaders[0]), topicId, 0).size(), 4u) << "the retry stored nothing twice";
     reader->close();
+}
+
+TEST(CheckedWritesBrokerRegression, WideKeyIndexSurvivesFailoverThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    using Wide = KeyRec<std::array<uint8_t, 16>>;
+    ThreeNodes c = ThreeNodes::start("cw07wk");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t ctl = awaitController(c);
+    ASSERT_GT(ctl, 0);
+    for (const int id : c.runningNodes()) awaitLevel(c.node(id));
+    ASSERT_FALSE(HasFatalFailure());
+    rc::TopicOptions to;
+    to.replicationFactor    = 3;
+    to.config.cleanupPolicy = 1;
+    to.keyFeatures.keyIndex = true;
+    auto admin = connectClient(c, ctl);
+    const auto t = admin->defineTopicAndWait("wide", kKiParts, "k", rune::codec::serialize(Wide::descriptor()), rc::Persistence::Disk, to, {}, 60s);
+    admin->close();
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, t.topicId, kKiParts, leaders, 30s));
+
+    const auto insertAll = [&](int seed, int first, int last, uint16_t want) {
+        rc::ClientConfig cfg = clientConfigFor(c, seed);
+        cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
+        rc::Client client(cfg);
+        client.connectAndWait(30s);
+        rc::Producer prod = client.producer(KiWriter::config(kAllView));
+        rc::TypedTopic<Wide, rc::ProducerRef> topic = client.openTopicAndWait<Wide>("wide", prod, 30s);
+        for (int i = first; i <= last; ++i) {
+            const auto r = topic.insertAndWait(Wide::make(i), 60s);
+            if (want == 0) EXPECT_TRUE(r.ok()) << "insert " << i << " code " << r.code();
+            else EXPECT_EQ(r.code(), want) << "insert " << i;
+        }
+        prod.closeImmediately();
+        client.close();
+    };
+    insertAll(1, 0, 99, 0);
+    ASSERT_FALSE(HasFatalFailure());
+
+    c.crash(leaders[0]);
+    ASSERT_TRUE(awaitLeaders(c, t.topicId, kKiParts, leaders, 60s)) << "a new leader after the crash";
+    const int seed = c.runningNodes().front();
+    insertAll(seed, 0, 99, kKeyExists);
+    insertAll(seed, 100, 100, 0);
 }

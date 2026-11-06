@@ -375,7 +375,7 @@ public:
     }
     [[nodiscard]] bool keyIndexContainsForTest(int32_t src, int32_t partition, std::string_view wireKey) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
-        return it != keyIndexes_.end() && it->second.table.get(rune::view::ViewKey::fromU64(keyIndexWord(wireKey)).asU64()) != nullptr;
+        return it != keyIndexes_.end() && it->second.table.get(rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(wireKey.data()), wireKey.size()})) != nullptr;
     }
     [[nodiscard]] std::size_t keyIndexSizeForTest(int32_t src, int32_t partition) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
@@ -911,9 +911,9 @@ private:
     // re-sending them would be a needless, possibly oversized delta).  No
     // allocation.
     static void discardDirty_(ViewInstance& inst) noexcept {
+        auto dropKeyed = [](uint32_t, const uint8_t*, bool, std::span<const uint8_t>) noexcept {};
+        inst.table.drainDirtyKeyed(dropKeyed);   // also a key index: its table is as wide as the wire key
         if (inst.keyed) {
-            auto dropKeyed = [](uint32_t, const uint8_t*, bool, std::span<const uint8_t>) noexcept {};
-            inst.table.drainDirtyKeyed(dropKeyed);
             if (inst.owners) inst.owners->drainDirtyKeyed(dropKeyed);
             if (inst.agg) {
                 inst.agg->contributors.drainDirtyKeyed(dropKeyed);
@@ -924,7 +924,6 @@ private:
             return;
         }
         auto drop = [](uint32_t, const uint8_t*, bool, uint64_t) noexcept {};
-        inst.table.drainDirty(drop);
         if (inst.agg) {
             inst.agg->contributors.drainDirty(drop);
             inst.agg->groups.drainDirty(drop);

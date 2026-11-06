@@ -1103,9 +1103,9 @@ void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
 }
 
 // Cold.  The key index is built over the source's evolving schema, as every view is: the judge decodes each writer version through it.
-// nullptr until the schema has landed on this worker, or when the key cannot be indexed (the wire key is packed into 8 bytes).
+// nullptr until the schema has landed on this worker, or when the key cannot be indexed (the topic has no key).
 static const rune::codec::Descriptor* keyIndexSource(const TopicWriteSpec& spec) {
-    if (!spec.evolving || spec.keyWidth == 0 || spec.keyWidth > 8) return nullptr;
+    if (!spec.evolving || spec.keyWidth == 0) return nullptr;
     const bool hasKey = std::any_of(spec.evolving->fields.begin(), spec.evolving->fields.end(), [&](const auto& f) { return f.id == spec.keyFieldId; });
     return hasKey ? &*spec.evolving : nullptr;
 }
@@ -1136,7 +1136,7 @@ void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, Verd
             return;
         }
         releaseMem_(it->second);
-        it->second = freshKeyIndex(srcTopicId, partition, spec, *src, rune::view::ViewTableKeys{8, 0, hashSeed_, hashMask_});
+        it->second = freshKeyIndex(srcTopicId, partition, spec, *src, rune::view::ViewTableKeys{spec.keyWidth, 0, hashSeed_, hashMask_});
         ++judge.statsMut().keyIndexRebuilds;
     }
     it->second.foldCursor = judge.logStart();
@@ -1171,7 +1171,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     write.verdicts = judge;
     if (write.spec->keyIndex && !judge->hasMember(0, kKeyIndexPlanFingerprint)) {
         if (const rune::codec::Descriptor* src = keyIndexSource(*write.spec)) {
-            ViewInstance& inst = keyIndexes_.try_emplace(key, freshKeyIndex(srcTopicId, partition, *write.spec, *src, rune::view::ViewTableKeys{8, 0, hashSeed_, hashMask_})).first->second;
+            ViewInstance& inst = keyIndexes_.try_emplace(key, freshKeyIndex(srcTopicId, partition, *write.spec, *src, rune::view::ViewTableKeys{write.spec->keyWidth, 0, hashSeed_, hashMask_})).first->second;
             if (judge->activated()) inst.foldLeadership = kAdoptedLive;
             judge->addVerdictView(&inst, rune::view::VerdictViewKind::KeyIndex, 0, kKeyIndexPlanFingerprint);
         }

@@ -92,8 +92,6 @@ const RefusalRow kRefusals[] = {
     {"Untyped", 5, false, false, 0, PrimType::UInt64, 0, false, rp::Partitioner::Fnv1a, kReserve, "key.index needs a typed topic"},
     {"Keyless", 5, true, false, 0, PrimType::UInt64, 0, false, rp::Partitioner::Fnv1a, kReserve, "key.index needs a key"},
     {"Transient", 5, true, true, 1, PrimType::UInt64, 0, false, rp::Partitioner::Fnv1a, kReserve, "key.index needs a persisted topic"},
-    {"String9", 5, true, true, 0, PrimType::FixedStr, 9, false, rp::Partitioner::Fnv1a, kReserve, "key.index needs a key of at most 8 bytes"},
-    {"String16", 5, true, true, 0, PrimType::FixedStr, 16, false, rp::Partitioner::Fnv1a, kReserve, "key.index needs a key of at most 8 bytes"},
 };
 
 }  // namespace
@@ -124,12 +122,13 @@ namespace {
 struct WidthRow { const char* name; PrimType type; uint16_t width; };
 const WidthRow kWidths[] = {{"uint16", PrimType::UInt16, 0}, {"int32", PrimType::Int32, 0},  {"uint32", PrimType::UInt32, 0},
                             {"int64", PrimType::Int64, 0},   {"uint64", PrimType::UInt64, 0}, {"string1", PrimType::FixedStr, 1},
-                            {"string8", PrimType::FixedStr, 8}};
+                            {"string8", PrimType::FixedStr, 8},
+                            {"string9", PrimType::FixedStr, 9},  {"string16", PrimType::FixedStr, 16}};
 }  // namespace
 
 class CheckedWritesKeyIndexDdlWidth : public ::testing::TestWithParam<int> {};
 
-TEST_P(CheckedWritesKeyIndexDdlWidth, EveryKeyWidthUpToEightIsAccepted) {
+TEST_P(CheckedWritesKeyIndexDdlWidth, EveryKeyWidthUpToSixteenIsAccepted) {
     const WidthRow& row = kWidths[GetParam()];
     CatalogDdlRig rig("cwkiw");
     atLevel5(rig);
@@ -222,8 +221,5 @@ TEST(CheckedWritesKeyIndexDdl, AdoptionRefusals) {
     atLevel5(rig);
     ASSERT_EQ(rig.define(raw).code, kOk);
     a = defineKeyed(rig, "a", keyedBlob(PrimType::FixedStr, 9), keyIndex());
-    EXPECT_EQ(a.code, kInvalidRequest);
-    EXPECT_EQ(a.detail, "key.index needs a key of at most 8 bytes");
-    ASSERT_NE(topicOf(rig, "a"), nullptr);
-    EXPECT_FALSE(topicOf(rig, "a")->schema) << "the topic stays untyped";
+    EXPECT_EQ(a.code, kOk) << a.detail;
 }
