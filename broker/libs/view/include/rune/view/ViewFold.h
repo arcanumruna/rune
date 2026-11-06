@@ -11,6 +11,7 @@
 #include <rune/storage/LogReadView.h>
 #include <rune/view/FoldSkip.h>
 #include <rune/view/FoldStats.h>
+#include <rune/view/KeyedFold.h>
 #include <rune/view/RecordFold.h>
 #include <rune/view/ViewPlan.h>
 #include <rune/view/ViewRow.h>
@@ -81,6 +82,8 @@ struct ProjectionFold {
     VersionDescriptorCache&  vdc;
     ViewTable&               table;
     rune::codec::PrimType    keyType;
+    const KeyedFoldSpec*     keyed  = nullptr;   // null for a LegacyU64 plan
+    ViewTable*               owners = nullptr;   // keyed and owner-mapped: wire key -> current view key
 };
 
 // The view key column's type, for building a ProjectionFold / AggregateFold.

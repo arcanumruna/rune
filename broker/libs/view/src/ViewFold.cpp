@@ -128,12 +128,121 @@ inline void writeProjectionRow(const CompiledViewPlan& plan, const RowLayout& la
     }
 }
 
+// Keyed rows: a lower() key column is written from the encoded key bytes, every other column from the value.
+inline void writeKeyedRow(const CompiledViewPlan& plan, const KeyedFoldSpec& ks, const RowLayout& layout, const Descriptor& d,
+                          std::string_view value, const ViewKey& key, uint8_t* row) noexcept {
+    for (const auto& f : plan.output) {
+        if (f.srcFieldId != kDerivedKeyField) {
+            writeSlot(row, layout, f.outSlot, readField(d, asBytes(value), f.srcFieldId));
+            continue;
+        }
+        for (const auto& c : ks.components) {
+            if (c.outSlot != f.outSlot) continue;
+            FieldValue v;
+            v.type = PrimType::FixedStr;
+            v.present = true;
+            v.bytes = std::string_view(reinterpret_cast<const char*>(key.bytes.data()) + c.offset, c.width);
+            writeSlot(row, layout, f.outSlot, v);
+        }
+    }
+}
+
+PrepareStatus prepareKeyed(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept {
+    const KeyedFoldSpec& ks = *f.keyed;
+    if (rec.key.size() != ks.wireKeyWidth) {
+        p.stats.skippedMalformed = 1;
+        return PrepareStatus::Malformed;
+    }
+    const ViewKey wire = ViewKey::fromBytes(asBytes(rec.key));
+    const uint8_t* owner = ks.ownerMapped ? f.owners->get(wire) : nullptr;
+    ProspectRow& n = p.rows[0];
+
+    // Erases the row of the source key: through the owner map, or at the wire key itself.
+    const auto eraseCurrent = [&]() noexcept {
+        if (ks.ownerMapped) {
+            if (owner == nullptr) return false;
+            n.key = ViewKey::fromBytes({owner, ks.keyWidth});
+            p.ownerOp = OwnerOp::Erase;
+        } else {
+            n.key = wire;
+            if (f.table.get(n.key) == nullptr) return false;
+        }
+        p.op = ProspectOp::Erase;
+        p.rowCount = 1;
+        n.existed = true;
+        n.removed = true;
+        return true;
+    };
+
+    if (rec.value.empty()) {
+        if (eraseCurrent()) p.stats.deleted = 1;
+        return PrepareStatus::Ok;
+    }
+    const Descriptor& d = rec.writer != nullptr ? *rec.writer : writerOf(f.vdc, rec.value);
+    if (ks.sourceKeyed) {
+        n.key = wire;
+    } else {
+        switch (deriveViewKey(ks, d, asBytes(rec.value), n.key)) {
+            case DeriveKey::Ok: break;
+            case DeriveKey::Absent:
+                p.stats.skippedNoKey = 1;
+                eraseCurrent();
+                return PrepareStatus::Ok;
+            case DeriveKey::Malformed:
+                p.stats.skippedMalformed = 1;
+                return PrepareStatus::Malformed;
+        }
+    }
+
+    const uint8_t* cur = f.table.get(n.key);
+    const bool mine = owner != nullptr && std::memcmp(owner, n.key.bytes.data(), ks.keyWidth) == 0;
+    if (ks.ownerMapped) {
+        if (cur != nullptr && !mine) {
+            p.stats.keyConflicts = 1;
+            return PrepareStatus::Ok;
+        }
+        if (!mine) p.ownerOp = OwnerOp::Put;
+        if (owner != nullptr && !mine) {
+            ProspectRow& old = p.rows[1];
+            old.key = ViewKey::fromBytes({owner, ks.keyWidth});
+            old.existed = true;
+            old.removed = true;
+            old.image = nullptr;
+            p.stats.ownerMoves = 1;
+        }
+    }
+    p.op = p.stats.ownerMoves != 0 ? ProspectOp::Move : ProspectOp::Upsert;
+    p.rowCount = p.op == ProspectOp::Move ? 2 : 1;
+    p.stats.applied = 1;
+    n.existed = cur != nullptr;
+    n.removed = false;
+    n.image = p.scratch.data();
+    if (cur != nullptr) std::memcpy(n.image, cur, p.rowLen); else std::memset(n.image, 0, p.rowLen);
+    writeKeyedRow(f.plan, ks, f.layout, d, rec.value, n.key, n.image);
+    return PrepareStatus::Ok;
+}
+
+void applyKeyed(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept {
+    const ProspectRow& n = p.rows[0];
+    switch (p.op) {
+        case ProspectOp::None: break;
+        case ProspectOp::Erase: f.table.erase(n.key); break;
+        case ProspectOp::Move: f.table.erase(p.rows[1].key); [[fallthrough]];
+        case ProspectOp::Upsert: std::memcpy(f.table.put(n.key), n.image, p.rowLen); break;
+    }
+    if (p.ownerOp == OwnerOp::None) return;
+    const ViewKey wire = ViewKey::fromBytes(asBytes(rec.key));
+    if (p.ownerOp == OwnerOp::Erase) f.owners->erase(wire);
+    else std::memcpy(f.owners->put(wire), n.key.bytes.data(), f.keyed->keyWidth);
+}
+
 } // namespace
 
 PrimType viewKeyType(const CompiledViewPlan& plan) noexcept { return resolveKeyType(plan); }
 
 PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept {
     p.clear();
+    if (f.keyed != nullptr) return prepareKeyed(f, rec, p);
     uint64_t k = 0;
     if (!decodeWireKey(rec.key, f.keyType, k)) {
         p.stats.skippedMalformed = 1;
@@ -161,7 +270,8 @@ PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Pros
     return PrepareStatus::Ok;
 }
 
-void applyProjection(ProjectionFold& f, const SourceRecord&, const Prospect& p) noexcept {
+void applyProjection(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept {
+    if (f.keyed != nullptr) return applyKeyed(f, rec, p);
     if (p.op == ProspectOp::None) return;
     const uint64_t k = p.rows[0].key.asU64();
     if (p.op == ProspectOp::Erase) f.table.erase(k);
