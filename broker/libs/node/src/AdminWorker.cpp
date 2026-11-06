@@ -65,7 +65,7 @@ constexpr uint16_t kInvalidRequest       = 39;
 constexpr uint16_t kInvalidTopicName     = 40;
 constexpr uint16_t kViewSourceIsView     = 41;
 constexpr uint16_t kNotAuthorized        = 45;
-constexpr uint16_t kViewKeyExpressionInvalid = 59;   // only a v2 plan raises 59-61, and only clients >= kClientVersionCheckedWrites author one
+constexpr uint16_t kViewKeyExpressionInvalid = 59;   // only to clients >= kClientVersionCheckedWrites; the gateway answers older ones 39
 constexpr uint16_t kViewConstraintInvalid    = 60;
 constexpr uint16_t kViewUniqueInvalid        = 61;
 constexpr uint16_t kNamespaceLimitExceeded = 52;   // only to clients >= kClientVersionNamespaces; older get 39

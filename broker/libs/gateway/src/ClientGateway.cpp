@@ -10945,6 +10945,26 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
             buf = ddlDowngradeScratch_.data();
         }
     }
+    // Checked writes: a view DDL refusal 59-61 reaches a client below v17 as InvalidRequest (39), on whichever frame carries it.
+    if (session->clientVersion < pc::kClientVersionCheckedWrites && len > pc::MessageHeader::ENCODED_SIZE + 2) [[unlikely]] {
+        if (const auto h = pc::MessageHeader::decode(buf, len)) {
+            std::size_t at = 0;   // where the frame holds its u16 error code
+            if (h->templateId == static_cast<uint16_t>(pc::TemplateId::ErrorResponse) ||
+                h->templateId == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
+                at = pc::MessageHeader::ENCODED_SIZE;
+            else if (h->templateId == static_cast<uint16_t>(pc::TemplateId::CreateViewResponse))
+                at = pc::MessageHeader::ENCODED_SIZE + 12;   // after viewTopicId and outputFingerprint
+            if (at != 0 && len >= at + 2) {
+                const int code = buf[at] | (buf[at + 1] << 8);
+                if (code >= static_cast<int>(pc::ErrorCode::ViewKeyExpressionInvalid) && code <= static_cast<int>(pc::ErrorCode::ViewUniqueInvalid)) {
+                    ddlDowngradeScratch_.assign(buf, buf + len);
+                    ddlDowngradeScratch_[at]     = static_cast<uint8_t>(pc::ErrorCode::InvalidRequest);
+                    ddlDowngradeScratch_[at + 1] = 0;
+                    buf = ddlDowngradeScratch_.data();
+                }
+            }
+        }
+    }
     // No-hang (R2): every answer delivered through here (DDL responses from the
     // admin thread, deferred EndTxn answers, Assign) is queued and retried under
     // back-pressure — a best-effort sendTo lost it and left the client waiting.
