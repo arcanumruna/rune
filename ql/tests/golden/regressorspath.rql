@@ -1,0 +1,9 @@
+topic user { userId uint64 autoincrement, provider uint16, subject string(64), createdAt int64 } partitions 1 replicas 3 key userId with (cleanup.policy = compact);
+create unique view user_identity key (provider, subject) as select userId from user;
+topic device_login { loginId uint64 autoincrement, userId uint64, deviceFp string(64), platform uint16, ts int64 } partitions 1 replicas 3 key loginId with (cleanup.policy = compact);
+create view device_history key (userId, deviceFp) as select min(ts) as firstSeen, max(ts) as lastSeen, count(*) as logins, last(platform) as platform from device_login group by userId, deviceFp;
+-- spec section 1's character topic (the appearance fields reduced to the three it names)
+topic character { characterId uint64 autoincrement, userId uint64, name string(16), gender uint16, hairSkin uint16, hairSheet uint16, headSkin uint16, createdAt int64, lastPlayed int64 } partitions 1 replicas 3 key characterId with (cleanup.policy = compact);
+-- unique and check: parsed and authored here; refused by the broker (58 / 57) until Part 09 lands
+create unique view character_name key lower(name) as nameKey as select characterId from character;
+create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= 12);

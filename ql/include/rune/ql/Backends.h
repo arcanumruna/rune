@@ -9,6 +9,9 @@
 #include "rune/ql/Ast.h"
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/AlterOps.h>
+#include <rune/codec/ViewPlanAuthored.h>
+#include <span>
+#include <string_view>
 
 namespace rune::ql {
 
@@ -64,5 +67,24 @@ struct SecurityPlan {
 
 /// Only the DDL statements are plans; SHOW statements (client-side replays) and catalog statements are not.
 [[nodiscard]] std::expected<SecurityPlan, ParseError> applySecurityPlan(const Statement&);
+
+/// The topic a `create view` reads, as the planner needs it.  An empty `descriptor` is an untyped topic.
+struct ViewSource {
+    std::string name;
+    int32_t topicId = -1;              // -1: defined earlier in a script that has not run (--dry-run only)
+    std::string keyField;
+    rune::codec::Descriptor descriptor;
+    int32_t partitions = 1;
+    bool transient = false;
+};
+
+[[nodiscard]] ViewSource viewSourceOf(const TopicDef&);
+
+/// A `create view` as the authored ViewPlan (P8-4); `orReplace` is the caller's.  Refusals that only the broker can
+/// judge (identity, widths, partitions, keyless sources) are not made here.
+[[nodiscard]] std::expected<rune::view::ViewPlan, ParseError> applyViewPlan(const CreateViewDef&, const ViewSource&);
+
+/// "characters <= 12": the text of a plan predicate.
+[[nodiscard]] std::string predicateText(std::span<const rune::view::PredicateNode> nodes);
 
 } // namespace rune::ql

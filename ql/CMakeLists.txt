@@ -13,7 +13,9 @@ add_library(rune_codec_dep STATIC
     ${RUNE_CODEC_ROOT}/src/Generator.cpp
     ${RUNE_CODEC_ROOT}/src/AlterOps.cpp
     ${RUNE_CODEC_ROOT}/src/Evolve.cpp
-    ${RUNE_CODEC_ROOT}/src/Lineage.cpp)
+    ${RUNE_CODEC_ROOT}/src/Lineage.cpp
+    ${RUNE_CODEC_ROOT}/src/ViewPlanAuthored.cpp
+    ${RUNE_CODEC_ROOT}/src/UnicodeLower.cpp)
 target_include_directories(rune_codec_dep PUBLIC ${RUNE_CODEC_ROOT}/include)
 
 # ── rune_ql library ──────────────────────────────────────────────────────────
@@ -41,9 +43,11 @@ if(BUILD_TESTING)
         tests/CheckedWritesQlViewTest.cpp
         tests/CheckedWritesQlSelectTest.cpp
         tests/CheckedWritesQlFuzzTest.cpp
+        tests/CheckedWritesQlPlanTest.cpp
         # std-only: the leader-side statement renderer, checked against redactedText (issue #228)
         ${RUNE_CODEC_ROOT}/src/security/SecurityStatementText.cpp)
     target_link_libraries(rune_ql_tests PRIVATE rune_ql GTest::gtest_main)
+    target_compile_definitions(rune_ql_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden")
     include(GoogleTest)
     gtest_discover_tests(rune_ql_tests)
 endif()

@@ -73,31 +73,6 @@ const char* primName(rune::codec::PrimType t) {
     return "an unknown type";
 }
 
-// The output type an aggregate rule produces from a source field of type `src`
-// (Global Constraints: fixed by rule, never cast). nullopt = not aggregatable.
-// Callers have already rejected var-len sources and non-numeric Min/Max.
-std::optional<rune::codec::PrimType> aggregateOutputType(MergeRule r, rune::codec::PrimType src) {
-    using P = rune::codec::PrimType;
-    switch (r) {
-        case MergeRule::Count:
-        case MergeRule::CountAll: return P::Int64;
-        case MergeRule::Avg:      return isNumeric(src) ? std::optional<P>(P::Float64) : std::nullopt;
-        case MergeRule::Sum:
-            switch (src) {
-                case P::Int32: case P::Int64:                    return P::Int64;
-                case P::UInt16: case P::UInt32: case P::UInt64:  return P::UInt64;
-                case P::Float64:                                 return P::Float64;
-                default:                                         return std::nullopt;
-            }
-        case MergeRule::Min:
-        case MergeRule::Max:      return isNumeric(src) ? std::optional<P>(src) : std::nullopt;
-        case MergeRule::Last:
-        case MergeRule::LastNonNull: return src;
-        case MergeRule::Replace:  return std::nullopt;
-    }
-    return std::nullopt;
-}
-
 // Per-output-field resolution result, carried between the resolve pass and
 // the output-descriptor/CompiledField build pass below.
 struct ResolvedOutputField {

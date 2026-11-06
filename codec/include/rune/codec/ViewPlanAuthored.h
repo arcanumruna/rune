@@ -96,6 +96,10 @@ inline constexpr uint8_t kAuthoredVersionV1 = 1, kAuthoredVersion = 2;
 // True when the plan cannot be expressed in the v1 layout.
 [[nodiscard]] bool needsV2(const ViewPlan& p) noexcept;
 
+// The output type an aggregate rule produces from a source field of type `src` (fixed by rule,
+// never cast). nullopt = not aggregatable. Callers have already rejected var-len sources.
+[[nodiscard]] std::optional<rune::codec::PrimType> aggregateOutputType(MergeRule rule, rune::codec::PrimType src) noexcept;
+
 // "a,b" of the key components' outNames; `key` for a v1-shaped plan.
 [[nodiscard]] std::string keyDisplayName(const ViewPlan& p);
 
