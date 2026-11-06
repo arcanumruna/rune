@@ -98,6 +98,8 @@ struct ShowSecurityHistoryDef { std::optional<Grantee> who; std::string name; st
 // groupItem  := IDENT | "lower" "(" IDENT ")"
 // orExpr := andExpr ("or" andExpr)*   andExpr := notExpr ("and" notExpr)*   notExpr := "not" notExpr | "(" orExpr ")" | IDENT CMP literal
 // CMP := "=" | "<>" | "<" | "<=" | ">" | ">="          literal := ["-"] INT | STRING | "true" | "false"
+// select := "select" ("*" | IDENT ("," IDENT)*) "from" IDENT "where" IDENT "=" selLit ("and" IDENT "=" selLit)* ["limit" INT] ";"
+// selLit := literal | "lower" "(" STRING ")"            show := "show" ("topic" | "view") IDENT ";"
 enum class KeyFunction : uint8_t { None = 0, Lower = 1 };          // the plan's keyFunction byte
 struct KeyItem { std::string column; KeyFunction fn = KeyFunction::None; std::string outName; };   // outName = column when None
 enum class ItemKind : uint8_t { Star, Column, CountAll, Count, Sum, Avg, Min, Max, Last };
@@ -113,12 +115,18 @@ struct CreateViewDef { std::string name; bool orReplace = false; bool transient 
                        std::vector<KeyItem> key; std::vector<SelectItem> items; std::string source;
                        std::vector<KeyItem> groupBy; std::vector<ConstraintDef> constraints; };
 
-// Security statements, then CreateViewDef, are APPENDED: the existing indices never move.
+struct WhereTerm { std::string column; Literal value; };
+struct SelectDef { std::vector<std::string> columns; /* empty = * */ std::string view; std::vector<WhereTerm> where;
+                   std::optional<uint32_t> limit; };
+struct ShowTopicDef { std::string name; };
+struct ShowViewDef  { std::string name; };
+
+// Security statements, then CreateViewDef, SelectDef, ShowTopicDef, ShowViewDef, are APPENDED: the existing indices never move.
 using Statement = std::variant<TopicDef, AlterTopicDef, AlterTopicConfigDef, DropTopicDef, DropViewDef,
                                ShowHistoryDef, ShowAsOfDef, DiffDef,
                                CreateUserDef, AlterUserDef, DropUserDef, CreateRoleDef, DropRoleDef, GrantDef, RevokeDef,
                                GrantRoleDef, RevokeRoleDef, ShowUsersDef, ShowRolesDef, ShowGrantsDef,
-                               ShowSecurityHistoryDef, CreateViewDef>;
+                               ShowSecurityHistoryDef, CreateViewDef, SelectDef, ShowTopicDef, ShowViewDef>;
 
 /// The canonical text of `s` with every password literal replaced by '<redacted>' (D10) — the ONLY statement
 /// text a client sends for a security statement.  Keywords upper-case, names quoted when not a plain IDENT.

@@ -1529,6 +1529,12 @@ struct Parser {
         advance();
         auto nameToken = expect(TK::Ident, "object name");
         if (!nameToken) return std::unexpected(std::move(nameToken.error()));
+        if (cur.kind == TK::Semi && *kind != ObjectKind::Schema) {
+            advance();
+            std::string n(nameToken->text);
+            if (*kind == ObjectKind::Topic) return Statement(std::in_place_type<ShowTopicDef>, ShowTopicDef{std::move(n)});
+            return Statement(std::in_place_type<ShowViewDef>, ShowViewDef{std::move(n)});
+        }
         ShowAsOfDef sa;
         sa.kind = *kind;
         sa.name = std::string(nameToken->text);
@@ -1556,6 +1562,67 @@ struct Parser {
         auto semi = expect(TK::Semi, ";");
         if (!semi) return std::unexpected(std::move(semi.error()));
         return Statement(std::in_place_type<ShowAsOfDef>, std::move(sa));
+    }
+
+    // selLit := literal | "lower" "(" STRING ")"
+    std::expected<Literal, ParseError> parseSelectLiteral() noexcept {
+        if (!isKw("lower")) return parseLiteral();
+        advance();
+        if (cur.kind != TK::LParen) return std::unexpected(err("expected a constant, got " + got()));
+        advance();
+        if (cur.kind != TK::String) return std::unexpected(err("lower() takes a string literal"));
+        Literal v;
+        v.kind = Literal::Kind::String;
+        v.text = std::string(cur.text);
+        v.lowered = true;
+        advance();
+        if (auto rp = expect(TK::RParen, ")"); !rp) return std::unexpected(std::move(rp.error()));
+        return v;
+    }
+
+    std::expected<Statement, ParseError> parseSelect() noexcept {
+        advance();   // "select"
+        SelectDef s;
+        if (cur.kind == TK::Star) {
+            advance();
+        } else {
+            for (;;) {
+                auto c = expect(TK::Ident, "column name");
+                if (!c) return std::unexpected(std::move(c.error()));
+                s.columns.emplace_back(c->text);
+                if (cur.kind != TK::Comma) break;
+                advance();
+            }
+        }
+        if (auto k = expectKeyword("from"); !k) return std::unexpected(std::move(k.error()));
+        auto v = parseName("view name");
+        if (!v) return std::unexpected(std::move(v.error()));
+        s.view = std::move(*v);
+        if (!isKw("where")) return std::unexpected(err("a select needs 'where', got " + got()));
+        do {
+            advance();   // "where" | "and"
+            auto c = expect(TK::Ident, "where column");
+            if (!c) return std::unexpected(std::move(c.error()));
+            for (const auto& t : s.where) {
+                if (t.column == c->text) return std::unexpected(err("duplicate where column '" + t.column + "'"));
+            }
+            if (auto eq = expect(TK::Eq, "'='"); !eq) return std::unexpected(std::move(eq.error()));
+            auto lit = parseSelectLiteral();
+            if (!lit) return std::unexpected(std::move(lit.error()));
+            s.where.push_back(WhereTerm{std::string(c->text), std::move(*lit)});
+        } while (isKw("and"));
+        if (isKw("limit")) {
+            advance();
+            if (cur.kind != TK::Int) return std::unexpected(err("expected integer for limit, got " + got()));
+            uint64_t n = 0;
+            const auto [ptr, ec] = std::from_chars(cur.text.data(), cur.text.data() + cur.text.size(), n);
+            if (ec != std::errc{} || n > std::numeric_limits<uint32_t>::max()) return std::unexpected(err("limit must be <= 4294967295"));
+            if (n < 1) return std::unexpected(err("limit must be >= 1"));
+            advance();
+            s.limit = static_cast<uint32_t>(n);
+        }
+        if (auto semi = expect(TK::Semi, ";"); !semi) return std::unexpected(std::move(semi.error()));
+        return Statement(std::in_place_type<SelectDef>, std::move(s));
     }
 
     std::expected<Statement, ParseError> parseDiffStatement() noexcept {
@@ -1594,7 +1661,7 @@ struct Parser {
 
     // ---- statement dispatch (parse() and parseScript() share this) ----
     std::expected<Statement, ParseError> parseStatement() noexcept {
-        constexpr const char* kExpected = "expected 'topic', 'transient', 'alter', 'drop', 'show', 'diff', 'create', 'grant' or 'revoke'";
+        constexpr const char* kExpected = "expected 'topic', 'transient', 'alter', 'drop', 'show', 'diff', 'create', 'select', 'grant' or 'revoke'";
         if (cur.kind != TK::Ident) {
             return std::unexpected(err(std::string(kExpected) + ", got " + got()));
         }
@@ -1618,6 +1685,7 @@ struct Parser {
         if (isKw("show"))  return parseShowStatement();
         if (isKw("diff"))  return parseDiffStatement();
         if (isKw("create")) return parseCreateStatement();
+        if (isKw("select")) return parseSelect();
         if (isKw("grant"))  return parseGrantRevoke(true);
         if (isKw("revoke")) return parseGrantRevoke(false);
         return std::unexpected(err(std::string(kExpected) + ", got " + got()));
