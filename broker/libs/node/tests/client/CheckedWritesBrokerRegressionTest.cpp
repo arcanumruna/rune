@@ -2597,3 +2597,567 @@ TEST(CheckedWritesBrokerRegression, WideKeyIndexSurvivesFailoverThreeNodesRegres
     insertAll(seed, 0, 99, kKeyExists);
     insertAll(seed, 100, 100, 0);
 }
+
+// ===========================================================================================================
+// Part 07: wide view keys on a real broker - composite, lower(), pages, restart, failover and routing.
+// ===========================================================================================================
+#include <rune/client/view/ViewKeyBuilder.h>
+#include <rune/codec/ViewKeyEncoding.h>
+
+namespace {
+
+namespace rv = rune::view;
+namespace rcv = rune::client::view;
+using rune::codec::DescriptorBuilder;
+using rune::codec::PrimType;
+
+constexpr uint16_t kViewAbsentKey = rc::ViewRowResult::kAbsentKey, kViewInvalidRequest = rc::ViewRowResult::kInvalidRequest;
+
+rune::codec::Descriptor characterDescriptor() {
+    return DescriptorBuilder("character", 1).add("characterId", PrimType::UInt64, 1, true).add("userId", PrimType::UInt64).addFixedStr("name", 16)
+        .add("gender", PrimType::UInt16).add("lastPlayed", PrimType::Int64).build();
+}
+
+std::string characterValue(uint64_t id, uint64_t user, const std::string& name) {
+    std::string padded = name;
+    padded.resize(16, '\0');
+    return le(42, 2) + le(1, 2) + le(id, 8) + le(user, 8) + padded + le(1, 2) + le(id, 8);
+}
+
+rc::DefineTopicResult defineCharacters(rc::Client& c, int16_t replicas = 0) {
+    rc::TopicOptions to;
+    to.replicationFactor = replicas;
+    return c.defineTopicAndWait("character", 1, "characterId", rune::codec::serialize(characterDescriptor()), rc::Persistence::Disk, to, {}, 60s);
+}
+
+/// A view over `character` keyed on `key`, carrying the columns `columns`.
+rv::ViewPlan characterPlan(const std::string& name, int32_t sourceTopicId, std::vector<rv::KeyComponent> key, std::initializer_list<const char*> columns) {
+    rv::ViewPlan p;
+    p.viewName = name;
+    p.sources.push_back(rv::SourceSpec{sourceTopicId, "characterId"});
+    p.keyComponents = std::move(key);
+    for (const rv::KeyComponent& k : p.keyComponents)
+        if (k.keyFunction == rune::codec::kKeyFunctionLower) p.unicodeVersion = rune::codec::kUnicodeVersion;
+    const rune::codec::Descriptor d = characterDescriptor();
+    for (const char* n : columns) p.output.push_back(rv::AuthoredField{n, d.find(n)->type, 0, n, rv::MergeRule::Replace});
+    return p;
+}
+
+int32_t createView(rc::Client& c, const rv::ViewPlan& p, const std::string& keyField) {
+    const auto v = c.createViewAndWait(p.viewName, rcv::viewKeyField(p, keyField), 0, rv::serializeAuthored(p), {}, 60s);
+    EXPECT_EQ(v.errorCode, 0) << v.detail;
+    return v.viewTopicId;
+}
+
+rv::ViewPlan accountCharactersPlan(int32_t sourceTopicId) {
+    return characterPlan("account_characters", sourceTopicId, {{"userId", 0, "userId"}, {"characterId", 0, "characterId"}}, {"name", "gender"});
+}
+
+rv::ViewPlan nameKeyPlan(int32_t sourceTopicId) {
+    return characterPlan("name_key", sourceTopicId, {{"name", rune::codec::kKeyFunctionLower, "nameKey"}, {"characterId", 0, "characterId"}}, {"name"});
+}
+
+rcv::ViewKeyBuilder keyBuilder(BrokerNode& n, const std::string& view) {
+    auto b = n.onAdminThreadForTest([&n, &view] { return rcv::ViewKeyBuilder::fromCatalog(n.adminWorkerAgentForTest()->worker().applier().state(), view); });
+    if (!b) throw std::runtime_error(b.error());
+    return std::move(*b);
+}
+
+std::vector<uint8_t> bytesOf(std::expected<std::vector<uint8_t>, std::string> k) {
+    if (!k) throw std::runtime_error(k.error());
+    return std::move(*k);
+}
+
+/// The columns of a view's rows by name, from the output descriptor the catalog holds.
+struct ViewColumns {
+    rcv::RowLayout           layout;
+    std::vector<std::string> names;
+
+    ViewColumns(BrokerNode& n, const std::string& view) {
+        const auto blob = n.onAdminThreadForTest([&n, &view] {
+            return n.adminWorkerAgentForTest()->worker().applier().state().viewByName(rune::catalog::kDefaultNsId, view)->def.outputDescriptorBlob;
+        });
+        std::vector<PrimType> types;
+        std::vector<uint16_t> widths;
+        for (const auto& f : rune::codec::deserialize(blob).fields) {
+            names.push_back(f.name);
+            types.push_back(f.type);
+            widths.push_back(f.type == PrimType::FixedStr ? f.fixedLen : uint16_t{0});
+        }
+        layout = rcv::buildRowLayout(types, widths);
+    }
+    [[nodiscard]] rcv::FieldValue at(std::span<const uint8_t> row, const std::string& column) const {
+        const auto slot = std::find(names.begin(), names.end(), column) - names.begin();
+        return rcv::readSlot(row, layout, static_cast<uint16_t>(slot));
+    }
+    [[nodiscard]] uint64_t u(std::span<const uint8_t> row, const std::string& column) const {
+        const rcv::FieldValue f = at(row, column);
+        return f.type == PrimType::Int64 ? static_cast<uint64_t>(f.i) : f.u;
+    }
+    [[nodiscard]] std::string str(std::span<const uint8_t> row, const std::string& column) const {
+        std::string s(at(row, column).bytes);
+        s.resize(s.find('\0') == std::string::npos ? s.size() : s.find('\0'));
+        return s;
+    }
+};
+
+/// A sender that keys each record itself.
+struct KeyedSender : Sender {
+    using Sender::Sender;
+
+    std::optional<rc::Completion> write(const rc::Key& key, const std::string& value) { return await(put(key, value), 30s); }
+    uint64_t put(const rc::Key& key, const std::string& value) {
+        const uint64_t tok  = next++;
+        rc::SendResult r = rc::SendResult::BackPressured;
+        while (r == rc::SendResult::BackPressured)
+            r = prod->trySend(*topic, key, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(value.data()), value.size()), *cq, tok);
+        EXPECT_EQ(r, rc::SendResult::Ok);
+        prod->flush();
+        return tok;
+    }
+    bool writeAll(const std::vector<std::pair<rc::Key, std::string>>& records) {
+        std::vector<uint64_t> tokens;
+        for (const auto& [key, value] : records) tokens.push_back(put(key, value));
+        bool ok = true;
+        for (const uint64_t tok : tokens) ok = isOk(await(tok, 60s)) && ok;
+        return ok;
+    }
+};
+
+/// The row of `key`, asked again until it is Ok when `within` allows (a view that is still rebuilding or a leader that moved).
+rc::ViewRowResult readRow(rc::Client& c, int32_t view, std::span<const uint8_t> key, rc::ViewReadOptions opts = {}, std::chrono::seconds within = 0s) {
+    rc::ViewRowResult row;
+    const auto deadline = Clock::now() + within;
+    do {
+        try { row = c.getViewRowAndWait(view, key, opts, 10s); } catch (const std::exception&) {}
+        if (row.status == rc::ViewRowResult::kOk) break;
+        std::this_thread::sleep_for(50ms);
+    } while (Clock::now() < deadline);
+    return row;
+}
+
+/// Every page of the scan of `prefix`; nullopt when a page does not come back Ok within `within`.
+std::optional<std::vector<std::vector<uint8_t>>> scanRows(rc::Client& c, int32_t view, std::span<const uint8_t> prefix, uint16_t limit = 0, std::chrono::seconds within = 0s) {
+    const auto deadline = Clock::now() + within;
+    do {
+        std::vector<std::vector<uint8_t>> rows;
+        rc::ViewScanOptions opts;
+        bool ok = true;
+        for (int page = 0; page < 10'000 && ok; ++page) {
+            rc::ViewScanResult r;
+            try { r = c.scanViewAndWait(view, prefix, limit, opts, 10s); } catch (const std::exception&) {}
+            ok = r.status == rc::ViewRowResult::kOk;
+            if (!ok) break;
+            for (auto& row : r.rows) rows.push_back(std::move(row));
+            if (r.nextToken.empty()) return rows;
+            opts.resumeToken = std::move(r.nextToken);
+        }
+        std::this_thread::sleep_for(50ms);
+    } while (Clock::now() < deadline);
+    return std::nullopt;
+}
+
+std::set<uint64_t> idsOf(const ViewColumns& cols, const std::vector<std::vector<uint8_t>>& rows) {
+    std::set<uint64_t> ids;
+    for (const auto& r : rows) ids.insert(cols.u(r, "characterId"));
+    return ids;
+}
+
+}  // namespace
+
+TEST(CheckedWritesBrokerRegression, CompositeViewPointAndPrefixReadsRightAfterTheAckShardRegression) {
+    OneBroker b("cw07-comp", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineCharacters(c);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const int32_t view = createView(c, accountCharactersPlan(t.topicId), "characterId");
+    ASSERT_GE(view, 0);
+    const ViewColumns cols(b.node(), "account_characters");
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "account_characters");
+    KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
+
+    std::set<uint64_t> acked42;
+    const std::array<std::array<uint64_t, 2>, 4> sends = {{{1, 42}, {2, 42}, {3, 43}, {4, 42}}};
+    for (const auto& [id, user] : sends) {
+        const std::string name = "char" + std::to_string(id);
+        ASSERT_TRUE(isOk(w.write(rc::Key(id), characterValue(id, user, name))));
+        if (user == 42) acked42.insert(id);
+
+        builder.clear();
+        const auto row = readRow(c, view, bytesOf(builder.setUInt("userId", user).setUInt("characterId", id).key()));
+        ASSERT_EQ(row.status, rc::ViewRowResult::kOk) << "character " << id;
+        EXPECT_EQ(cols.str(row.rowBytes, "name"), name);
+
+        builder.clear();
+        const auto scan = c.scanViewAndWait(view, bytesOf(builder.setUInt("userId", 42).prefix()), 0, {}, 10s);
+        EXPECT_TRUE(scan.complete());
+        EXPECT_EQ(idsOf(cols, scan.rows), acked42) << "after character " << id;
+        EXPECT_EQ(scan.rows.size(), acked42.size());
+    }
+}
+
+TEST(CheckedWritesBrokerRegression, LowerKeyReadWithTheKeyBuilderShardRegression) {
+    OneBroker b("cw07-lower", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineCharacters(c);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const int32_t view = createView(c, nameKeyPlan(t.topicId), "characterId");
+    ASSERT_GE(view, 0);
+    const ViewColumns cols(b.node(), "name_key");
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "name_key");
+    KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
+
+    ASSERT_TRUE(isOk(w.write(rc::Key(uint64_t{9}), characterValue(9, 42, "FoO"))));
+    const auto row = readRow(c, view, bytesOf(builder.setString("name", "foo").setUInt("characterId", 9).key()));
+    ASSERT_EQ(row.status, rc::ViewRowResult::kOk);
+    EXPECT_EQ(cols.str(row.rowBytes, "nameKey"), "foo");
+    EXPECT_EQ(cols.str(row.rowBytes, "name"), "FoO");
+}
+
+TEST(CheckedWritesBrokerRegression, RenameMovesTheRowShardRegression) {
+    OneBroker b("cw07-rename", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineCharacters(c);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const int32_t view = createView(c, nameKeyPlan(t.topicId), "characterId");
+    ASSERT_GE(view, 0);
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "name_key");
+    KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
+
+    const auto keyOf = [&](const char* name) { builder.clear(); return bytesOf(builder.setString("name", name).setUInt("characterId", 7).key()); };
+    ASSERT_TRUE(isOk(w.write(rc::Key(uint64_t{7}), characterValue(7, 42, "Alpha"))));
+    EXPECT_EQ(readRow(c, view, keyOf("alpha")).status, rc::ViewRowResult::kOk);
+    ASSERT_TRUE(isOk(w.write(rc::Key(uint64_t{7}), characterValue(7, 42, "Bravo"))));
+    EXPECT_EQ(readRow(c, view, keyOf("alpha")).status, kViewAbsentKey) << "the old key is gone right after the ack";
+    EXPECT_EQ(readRow(c, view, keyOf("bravo")).status, rc::ViewRowResult::kOk);
+}
+
+TEST(CheckedWritesBrokerRegression, ScanAcrossPagesThenCursorInvalidatedShardRegression) {
+    OneBroker b("cw07-pages", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineCharacters(c);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const int32_t view = createView(c, accountCharactersPlan(t.topicId), "characterId");
+    ASSERT_GE(view, 0);
+    const ViewColumns cols(b.node(), "account_characters");
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "account_characters");
+    KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
+
+    constexpr uint64_t kTotal = 300;
+    std::vector<std::pair<rc::Key, std::string>> records;
+    for (uint64_t id = 1; id <= kTotal; ++id) records.emplace_back(rc::Key(id), characterValue(id, 42, "c" + std::to_string(id)));
+    ASSERT_TRUE(w.writeAll(records));
+    const std::vector<uint8_t> prefix = bytesOf(builder.setUInt("userId", 42).prefix());
+
+    std::vector<std::size_t> sizes;
+    std::set<uint64_t> seen;
+    rc::ViewScanOptions opts;
+    rc::ViewScanResult page;
+    for (int i = 0; i < 10; ++i) {
+        page = c.scanViewAndWait(view, prefix, 100, opts, 10s);
+        ASSERT_EQ(page.status, rc::ViewRowResult::kOk);
+        sizes.push_back(page.rows.size());
+        for (const uint64_t id : idsOf(cols, page.rows)) seen.insert(id);
+        if (page.complete()) break;
+        opts.resumeToken = page.nextToken;
+    }
+    ASSERT_TRUE(page.complete());
+    ASSERT_GE(sizes.size(), 3u);
+    EXPECT_EQ(sizes[0], 100u);
+    EXPECT_EQ(sizes[1], 100u);
+    EXPECT_EQ(sizes[2], 100u);
+    EXPECT_EQ(seen.size(), kTotal) << "the pages together hold every character once";
+
+    const auto first = c.scanViewAndWait(view, prefix, 100, {}, 10s);
+    ASSERT_EQ(first.status, rc::ViewRowResult::kOk);
+    ASSERT_FALSE(first.nextToken.empty());
+    const uint64_t lastOnPage = cols.u(first.rows.back(), "characterId");
+    ASSERT_TRUE(isOk(w.write(rc::Key(lastOnPage), {})));
+    rc::ViewScanOptions resume;
+    resume.resumeToken = first.nextToken;
+    const auto stale = c.scanViewAndWait(view, prefix, 100, resume, 10s);
+    EXPECT_EQ(stale.status, rc::ViewRowResult::kCursorInvalidated);
+
+    const auto again = scanRows(c, view, prefix, 100);
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(again->size(), kTotal - 1);
+}
+
+TEST(CheckedWritesBrokerRegression, MinOffsetReadSeesTheWriteShardRegression) {
+    OneBroker b("cw07-minoff", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineCharacters(c);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const int32_t view = createView(c, accountCharactersPlan(t.topicId), "characterId");
+    ASSERT_GE(view, 0);
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "account_characters");
+    KeyedSender w(b.clientConfig(), "character", t.topicId, 1, rc::Acks::All);
+
+    for (uint64_t id = 1; id <= 20; ++id) {
+        const auto ack = w.write(rc::Key(id), characterValue(id, 42, "c" + std::to_string(id)));
+        ASSERT_TRUE(isOk(ack));
+        builder.clear();
+        const auto row = readRow(c, view, bytesOf(builder.setUInt("userId", 42).setUInt("characterId", id).key()), {.minOffset = ack->value});
+        EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "character " << id << " at offset " << ack->value;
+    }
+}
+
+TEST(CheckedWritesBrokerRegression, WideViewSurvivesRestartShardRegression) {
+    LogCapture log;
+    OneBroker b("cw07-restart", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client* c = b.connectClient();
+    const auto t  = defineCharacters(*c);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    const int32_t view     = createView(*c, nameKeyPlan(t.topicId), "characterId");
+    const int32_t byUser   = createView(*c, accountCharactersPlan(t.topicId), "characterId");
+    ASSERT_GE(view, 0);
+    ASSERT_GE(byUser, 0);
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "name_key");
+    rcv::ViewKeyBuilder users   = keyBuilder(b.node(), "account_characters");
+
+    constexpr uint64_t kTotal = 1000;
+    std::vector<std::string> names(kTotal);
+    {
+        KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
+        std::vector<std::pair<rc::Key, std::string>> records;
+        for (uint64_t id = 0; id < kTotal; ++id) {
+            names[id] = "Char" + std::to_string(id);
+            records.emplace_back(rc::Key(id), characterValue(id, id % 10, names[id]));
+        }
+        ASSERT_TRUE(w.writeAll(records));
+        records.clear();
+        for (uint64_t id = 0; id < kTotal; id += 5) {
+            names[id] = "Moved" + std::to_string(id);
+            records.emplace_back(rc::Key(id), characterValue(id, id % 10, names[id]));
+        }
+        ASSERT_TRUE(w.writeAll(records));
+    }
+
+    const auto keyOf = [&](uint64_t id) { builder.clear(); return bytesOf(builder.setString("name", names[id]).setUInt("characterId", id).key()); };
+    const auto snapshot = [&](rc::Client& client) {
+        std::map<uint64_t, std::vector<uint8_t>> rows;
+        for (uint64_t id = 0; id < kTotal; ++id) {
+            const auto row = readRow(client, view, keyOf(id), {}, 30s);
+            EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "character " << id;
+            rows[id] = row.rowBytes;
+        }
+        std::vector<std::vector<uint8_t>> scanned;
+        for (uint64_t user = 0; user < 10; ++user) {
+            users.clear();
+            auto page = scanRows(client, byUser, bytesOf(users.setUInt("userId", user).prefix()), 0, 30s);
+            EXPECT_TRUE(page.has_value()) << "user " << user;
+            for (auto& row : page.value_or(std::vector<std::vector<uint8_t>>{})) scanned.push_back(std::move(row));
+        }
+        std::sort(scanned.begin(), scanned.end());
+        return std::make_pair(rows, scanned);
+    };
+    const auto before = snapshot(*c);
+    EXPECT_EQ(before.second.size(), kTotal);
+
+    b.restart();
+    c = b.connectClient();
+    const auto after = snapshot(*c);
+    EXPECT_TRUE(after.first == before.first) << "every point read is the same after the restart";
+    EXPECT_TRUE(after.second == before.second) << "the scan is the same after the restart";
+
+    const std::string text = log.all();
+    const std::string needle = "VIEW-RECOVERED view=" + std::to_string(view) + " partition=0";
+    const auto at = text.find(needle);
+    ASSERT_NE(at, std::string::npos) << "the view was recovered from its checkpoint";
+    EXPECT_NE(text.substr(at, text.find('\n', at) - at).find("format=v3"), std::string::npos);
+}
+
+TEST(CheckedWritesBrokerRegression, WideViewReadsAfterLeaderCrashThreeNodesRegression) {
+    using namespace rune::node::test::catalog_cluster;
+    ThreeNodes c = ThreeNodes::start("cw07");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t ctl = awaitController(c);
+    ASSERT_GT(ctl, 0);
+    for (const int id : c.runningNodes()) awaitLevel(c.node(id));
+    ASSERT_FALSE(HasFatalFailure());
+    auto admin = connectClient(c, ctl);
+    const auto src = defineCharacters(*admin, 3);
+    ASSERT_EQ(src.errorCode, 0) << src.detail;
+    const int32_t view = createView(*admin, accountCharactersPlan(src.topicId), "characterId");
+    ASSERT_GE(view, 0);
+    admin->close();
+    admin.reset();
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 30s));
+    const int32_t victim = leaders[0];
+    int32_t seed = 0;
+    for (const int id : c.runningNodes()) if (id != victim) { seed = id; break; }
+    ASSERT_GT(seed, 0);
+    const ViewColumns cols(c.node(seed), "account_characters");
+    rcv::ViewKeyBuilder builder = keyBuilder(c.node(seed), "account_characters");
+
+    constexpr uint64_t kTotal = 200;
+    rc::ClientConfig cfg = clientConfigFor(c, seed);
+    cfg.connectTimeoutMs = cfg.pingTimeoutMs = 30'000;
+    {
+        KeyedSender w(cfg, "character", src.topicId, 1, kAllView);
+        std::vector<std::pair<rc::Key, std::string>> records;
+        for (uint64_t id = 0; id < kTotal; ++id) records.emplace_back(rc::Key(id), characterValue(id, id % 4, "c" + std::to_string(id)));
+        ASSERT_TRUE(w.writeAll(records));
+    }
+
+    c.crash(victim);
+    ASSERT_TRUE(awaitLeaders(c, src.topicId, 1, leaders, 60s));
+    auto reader = connectClient(c, cfg);
+    for (uint64_t id = 0; id < kTotal; ++id) {
+        builder.clear();
+        const auto row = readRow(*reader, view, bytesOf(builder.setUInt("userId", id % 4).setUInt("characterId", id).key()), {}, 60s);
+        EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "character " << id;
+    }
+    for (uint64_t user = 0; user < 4; ++user) {
+        builder.clear();
+        const auto rows = scanRows(*reader, view, bytesOf(builder.setUInt("userId", user).prefix()), 0, 60s);
+        ASSERT_TRUE(rows.has_value()) << "user " << user;
+        EXPECT_EQ(rows->size(), kTotal / 4) << "user " << user;
+        EXPECT_EQ(idsOf(cols, *rows).size(), kTotal / 4);
+    }
+    reader->close();
+}
+
+TEST(CheckedWritesBrokerRegression, MultiPartitionNarrowKeyViewReadsWithThePartitionShardRegression) {
+    using Rec = KeyRec<uint16_t>;
+    OneBroker b("cw07-parts", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = c.defineTopicAndWait("narrow", kKiParts, "k", rune::codec::serialize(Rec::descriptor()), rc::Persistence::Disk, {}, {}, 60s);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    rv::ViewPlan plan;
+    plan.viewName = "narrow_v";
+    plan.sources.push_back(rv::SourceSpec{t.topicId, "k"});
+    plan.keyComponents = {{"k", 0, "k"}};
+    plan.output.push_back(rv::AuthoredField{"n", PrimType::Int64, 0, "n", rv::MergeRule::Replace});
+    const int32_t view = createView(c, plan, "k");
+    ASSERT_GE(view, 0);
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "narrow_v");
+    KeyedSender w(b.clientConfig(), "narrow", t.topicId, kKiParts, kAllView);
+
+    constexpr int kTotal = 64;
+    std::vector<std::pair<rc::Key, std::string>> records;
+    std::vector<uint16_t> keys;
+    for (int i = 1; i <= kTotal; ++i) {
+        const Rec rec = Rec::make(i);
+        keys.push_back(rec.k);
+        std::string value(rec.encodedSize(), '\0');
+        (void)rec.encode(reinterpret_cast<uint8_t*>(value.data()));
+        records.emplace_back(rec.routeKey(), std::move(value));
+    }
+    ASSERT_TRUE(w.writeAll(records));
+
+    for (const uint16_t k : keys) {
+        builder.clear();
+        const std::vector<uint8_t> key = bytesOf(builder.setUInt("k", k).key());
+        const auto row = readRow(c, view, key, {.partition = builder.partition()});
+        EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "key " << k << " on partition " << builder.partition();
+        EXPECT_EQ(c.getViewRowAndWait(view, uint64_t{k}, 0, 10s).status, kViewInvalidRequest) << "op 72 on a multi-partition view";
+    }
+}
+
+TEST(CheckedWritesBrokerRegression, OldGetViewRowOnALegacyViewUnchangedShardRegression) {
+    OneBroker b("cw07-legacy", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    const auto t  = defineCharacters(c);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    rv::ViewPlan plan = characterPlan("legacy_v", t.topicId, {}, {"characterId", "userId", "gender", "lastPlayed"});
+    plan.key = "characterId";
+    const int32_t view = createView(c, plan, "characterId");
+    ASSERT_GE(view, 0);
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "legacy_v");
+    KeyedSender w(b.clientConfig(), "character", t.topicId, 1, kAllView);
+
+    ASSERT_TRUE(isOk(w.write(rc::Key(uint64_t{42}), characterValue(42, 7, "legacy"))));
+    const auto old = c.getViewRowAndWait(view, uint64_t{42}, 0, 10s);
+    ASSERT_EQ(old.status, rc::ViewRowResult::kOk);
+    const auto keyed = readRow(c, view, bytesOf(builder.setUInt("characterId", 42).key()));
+    ASSERT_EQ(keyed.status, rc::ViewRowResult::kOk);
+    EXPECT_TRUE(keyed.rowBytes == old.rowBytes) << "op 88 and op 72 answer the same row bytes";
+}
+
+TEST(CheckedWritesBrokerRegression, DeviceHistoryGroupByPrefixReadShardRegression) {
+    OneBroker b("cw07-device", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client* c = b.connectClient();
+    const auto device = DescriptorBuilder("device", 1).add("eventId", PrimType::UInt64, 1, true).add("userId", PrimType::UInt64)
+                            .addFixedStr("deviceFp", 32).add("lastSeen", PrimType::Int64).build();
+    const auto t = c->defineTopicAndWait("device", 1, "eventId", rune::codec::serialize(device), rc::Persistence::Disk, {}, {}, 60s);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    rv::ViewPlan plan;
+    plan.viewName = "device_history";
+    plan.sources.push_back(rv::SourceSpec{t.topicId, "eventId"});
+    plan.keyComponents = plan.groupBy = {{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}};
+    plan.output.push_back(rv::AuthoredField{"uses", PrimType::Int64, 0, "", rv::MergeRule::CountAll});
+    plan.output.push_back(rv::AuthoredField{"lastSeen", PrimType::Int64, 0, "lastSeen", rv::MergeRule::Max});
+    const int32_t view = createView(*c, plan, "userId");
+    ASSERT_GE(view, 0);
+    const ViewColumns cols(b.node(), "device_history");
+    rcv::ViewKeyBuilder builder = keyBuilder(b.node(), "device_history");
+
+    const std::array<std::array<uint64_t, 3>, 4> devices = {{{42, 'A', 5}, {42, 'B', 2}, {42, 'C', 1}, {43, 'A', 1}}};
+    {
+        KeyedSender w(b.clientConfig(), "device", t.topicId, 1, kAllView);
+        std::vector<std::pair<rc::Key, std::string>> records;
+        uint64_t event = 0;
+        for (const auto& [user, fp, events] : devices)
+            for (uint64_t i = 0; i < events; ++i) {
+                std::string padded = "fp" + std::string(1, static_cast<char>(fp));
+                padded.resize(32, '\0');
+                records.emplace_back(rc::Key(++event), le(56, 2) + le(1, 2) + le(event, 8) + le(user, 8) + padded + le(event, 8));
+            }
+        ASSERT_TRUE(w.writeAll(records));
+    }
+
+    const auto uses = [&](rc::Client& client) {
+        builder.clear();
+        const auto rows = scanRows(client, view, bytesOf(builder.setUInt("userId", 42).prefix()), 0, 30s);
+        std::map<std::string, uint64_t> out;
+        if (!rows) { ADD_FAILURE() << "the prefix scan"; return out; }
+        for (const auto& r : *rows) out[cols.str(r, "deviceFp")] = cols.u(r, "uses");
+        return out;
+    };
+    const std::map<std::string, uint64_t> want = {{"fpA", 5}, {"fpB", 2}, {"fpC", 1}};
+    EXPECT_EQ(uses(*c), want);
+    b.restart();
+    c = b.connectClient();
+    EXPECT_EQ(uses(*c), want) << "after the restart";
+}
+
+TEST(CheckedWritesBrokerRegression, KeyIndexOnASixteenByteKeyShardRegression) {
+    using Wide = KeyRec<std::array<uint8_t, 16>>;
+    OneBroker b("cw07-ki16", OneBroker::Runtime::Shard);
+    awaitLevel(b.node());
+    ASSERT_FALSE(HasFatalFailure());
+    rc::Client& c = *b.connectClient();
+    rc::TopicOptions to;
+    to.config.cleanupPolicy = 1;
+    to.keyFeatures.keyIndex = true;
+    const auto t = c.defineTopicAndWait("topic16", kKiParts, "k", rune::codec::serialize(Wide::descriptor()), rc::Persistence::Disk, to, {}, 60s);
+    ASSERT_EQ(t.errorCode, 0) << t.detail;
+    rc::Producer prod = c.producer(KiWriter::config(kAllView));
+    rc::TypedTopic<Wide, rc::ProducerRef> topic = c.openTopicAndWait<Wide>("topic16", prod, 30s);
+
+    EXPECT_TRUE(topic.insertAndWait(Wide::make(1)).ok());
+    const auto again = topic.insertAndWait(Wide::make(1));
+    EXPECT_EQ(again.status(), rc::OpStatus::BrokerError);
+    EXPECT_EQ(again.code(), static_cast<uint16_t>(rune::protocol::client::ErrorCode::KeyExists));
+    prod.closeImmediately();
+}

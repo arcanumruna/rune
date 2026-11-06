@@ -1936,7 +1936,7 @@ if(BUILD_TESTING)
         target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
                                    ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
-                              rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
+                              rune_client_view rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         # The two login-timing measurements (the 5 ms median gate and the #136 first-leg parity) are latency gates:
         # RUN_SERIAL + LABELS latency (CLAUDE.md §3: they run on an idle host, stage b of scripts/run-regression.sh); the
         # rest of the binary is functional and runs in parallel.
