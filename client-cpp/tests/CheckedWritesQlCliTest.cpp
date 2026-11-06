@@ -539,7 +539,7 @@ TEST(CheckedWritesQlCli, StatsJsonEscapesControlCharacters) {
 
 TEST(CheckedWritesQlCli, LimitZeroIsRefusedBeforeAnythingRuns) {
     std::string out, err;
-    const std::string script = writeTemp("limit0.rql", "select * from v limit 0;");
+    const std::string script = writeTemp("limit0.rql", "select * from v where k = 1 limit 0;");
     EXPECT_EQ(runCli({"ql", "--dry-run", "-f", script}, &out, &err), 1);
     EXPECT_NE(err.find("limit must be >= 1"), std::string::npos) << err;
 }
