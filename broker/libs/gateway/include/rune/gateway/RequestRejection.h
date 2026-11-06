@@ -24,6 +24,7 @@
 // ---------------------------------------------------------------------------
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/StatsMessages.h>
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/OffsetMessages.h>
@@ -175,6 +176,11 @@ inline constexpr std::size_t kMaxRejectionBytes = 64;
     }
     case T::ScanViewRows: {
         pc::ScanViewRowsResponse r;
+        r.sessionId = sessionId; r.correlationId = correlationId; r.status = code;
+        return r.encode(out);
+    }
+    case T::GetStats: {
+        pc::StatsResponse r;
         r.sessionId = sessionId; r.correlationId = correlationId; r.status = code;
         return r.encode(out);
     }

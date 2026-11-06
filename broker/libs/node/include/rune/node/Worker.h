@@ -71,6 +71,7 @@
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/OrderedWaitQueue.h>
 #include <rune/node/RcState.h>
+#include <rune/node/StatsCollect.h>
 #include <rune/node/NsLimitAggregator.h>
 #include <rune/node/NsRingMessages.h>
 #include <rune/node/NsSlotTable.h>
@@ -577,6 +578,7 @@ public:
     /// PushRead ops executed by this worker (both answers and refusals).
     [[nodiscard]] uint64_t pushReadsForTest() const noexcept { return pushReads_; }
     [[nodiscard]] uint64_t getViewRowsForTest() const noexcept { return getViewRows_; }
+    [[nodiscard]] uint64_t getStatsForTest() const noexcept { return getStats_; }
     [[nodiscard]] uint64_t getViewRowKsForTest() const noexcept { return getViewRowKs_; }
     [[nodiscard]] uint64_t scanViewRowsForTest() const noexcept { return scanViewRows_; }
 
@@ -2737,6 +2739,9 @@ private:
             ++scanViewRows_;
             executeViewReadWire_(op, ViewReadReq::Kind::Scan);
             break;
+        case WorkerOp::Type::GetStats:
+            executeGetStats_(op);
+            break;
         case WorkerOp::Type::ApplyReplicated:
             // Worker-clock: dequeued a routed apply op.  corr=runSeq pairs 1:1 (FIFO)
             // with the control thread's ReplFragRecv → EXACT control→worker handoff.
@@ -4633,6 +4638,54 @@ private:
         return ViewServe::Answered;
     }
 
+    // Checked writes Part 08: a GetStats op (cold).  Only the leader under a read lease answers counters; anyone else the
+    // not-leader sentinel (the gateway redirects), so a demoted partition's frozen values are never served.  The entries are
+    // collected into statsScratch_ and gathered into the return ring.
+    void executeGetStats_(sbe::WorkerOp& op) {
+        using SR = rune::protocol::client::StatsResponse;
+        ++getStats_;
+        const int32_t objectId  = op.topicId();
+        const int32_t partition = op.partition();
+        const int32_t scope     = op.recordCount();
+        WorkerReturn ret;
+        ret.type          = WorkerReturn::Type::StatsResult;
+        ret.sessionId     = op.sessionId();
+        ret.correlationId = op.correlationId();
+        ret.readTopicId   = objectId;
+        ret.readPartition = partition;
+        ret.isolation     = static_cast<uint8_t>(scope);
+        constexpr std::size_t statRegion = SR::kMaxStats * SR::kStatBytes;
+        StatsSink sink(std::span<uint8_t>(statsScratch_.data(), statRegion),
+                       std::span<uint8_t>(statsScratch_.data() + statRegion, statsScratch_.size() - statRegion));
+        const bool leaseExpired = viewLeaseEndNs_ != kViewLeaseUnbounded && leaseNow_() >= viewLeaseEndNs_;
+        if (scope == static_cast<int32_t>(rune::protocol::client::StatsScope::TopicPartition)) {
+            const rune::replication::PartitionReplica* rep = findOwnedReplica_(objectId, partition);
+            if (rep == nullptr || rep->role() != rune::replication::Role::Leader || leaseExpired) {
+                ret.errorCode = kViewRowNotLeaderInternal;
+            } else {
+                collectTopicPartitionStats(writeOf_(rep), *rep, sink);
+            }
+        } else {
+            uint64_t outputFp = 0;
+            if (viewSet_ != nullptr && !viewSet_->viewOutputFingerprint(objectId, outputFp)) (void)viewSet_->drainInstalls();   // as serveViewRead_
+            if (viewSet_ == nullptr || !viewSet_->viewOutputFingerprint(objectId, outputFp)) {
+                ret.errorCode = static_cast<int16_t>(SR::kUnknownObject);
+            } else if (const auto* srcRep = findOwnedReplica_(viewSet_->viewSourceTopic(objectId), partition);
+                       srcRep == nullptr || srcRep->role() != rune::replication::Role::Leader || leaseExpired) {
+                ret.errorCode = kViewRowNotLeaderInternal;
+            } else if (const ViewFoldCounters* counters = viewSet_->foldCounters(objectId, partition)) {
+                collectViewPartitionStats(*counters, sink);
+            }
+        }
+        ret.recordCount = sink.count();
+        const std::array<uint8_t, 2> constraintCount = {static_cast<uint8_t>(sink.constraintCount()), static_cast<uint8_t>(sink.constraintCount() >> 8)};
+        const auto stats = sink.statBytes();
+        const auto constraints = sink.constraintBytes();
+        const ChunkRun runs[3] = {{stats.data(), static_cast<uint32_t>(stats.size())}, {constraintCount.data(), 2},
+                                  {constraints.data(), static_cast<uint32_t>(constraints.size())}};
+        enqueueViewResult_(ret, runs, 3, static_cast<uint32_t>(stats.size() + 2 + constraints.size()));
+    }
+
     // Issue #82 (VLS A.5.5): per pass, after the view folds: serve the held reads whose fold reached their target;
     // answer NotReady the ones past their deadline (never held forever: a fold that stopped - back-pressure, a lost
     // leadership - ends in a retriable answer).  Every re-serve re-runs every check (role, lease, leadership).
@@ -6451,6 +6504,8 @@ private:
     uint64_t    pushReadOversize_ = 0;
     uint64_t    pushReads_ = 0;            // F15 S4: PushRead ops executed (R-1 / R-3 tests)
     uint64_t    getViewRows_ = 0;          // Task 20: GetViewRow ops executed
+    uint64_t    getStats_ = 0;             // checked writes Part 08: GetStats ops executed
+    std::array<uint8_t, rune::protocol::client::StatsResponse::kMaxEncodedSize> statsScratch_{};   // one GetStats answer: the stat entries, then the constraint entries
     uint64_t    getViewRowKs_ = 0;         // checked writes Part 07: GetViewRowK ops executed
     uint64_t    scanViewRows_ = 0;         // checked writes Part 07: ScanViewRows ops executed
     std::array<uint8_t, kMaxScanPageBytes> scanScratch_{};   // one ScanViewRows page, gathered into the return ring

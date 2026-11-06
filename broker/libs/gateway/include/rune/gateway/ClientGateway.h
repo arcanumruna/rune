@@ -1507,6 +1507,7 @@ public:
     void applyGetViewRowForTest(const uint8_t* buf, std::size_t len) { handleGetViewRow(buf, len); }
     void applyGetViewRowKForTest(const uint8_t* buf, std::size_t len) { handleGetViewRowK(buf, len); }
     void applyScanViewRowsForTest(const uint8_t* buf, std::size_t len) { handleScanViewRows(buf, len); }
+    void applyGetStatsForTest(const uint8_t* buf, std::size_t len) { handleGetStats(buf, len); }
     [[nodiscard]] uint64_t rejectedRequestsForTest() const noexcept { return rejectedRequests_; }
     // No-hang fix round 2: inject a session with a NON-NULL placeholder egress
     // (never dereferenced: makeForTest's TestEgressFn intercepts every offer of
@@ -2098,6 +2099,8 @@ private:
     // ViewRowResult / ViewScanResult (ScanViewRowsResponse 90).
     void handleGetViewRowK  (const uint8_t* buf, std::size_t len);
     void handleScanViewRows (const uint8_t* buf, std::size_t len);
+    // Checked writes Part 08: GetStats (91) - the same route; the worker answers a StatsResult (StatsResponse 92).
+    void handleGetStats     (const uint8_t* buf, std::size_t len);
     [[nodiscard]] Session* checkedViewReadSession_(const uint8_t* buf, std::size_t len, int64_t sessionId,
                                                    int32_t viewTopicId, const char* what);
     void enqueueViewRead_(const uint8_t* buf, std::size_t len, Session& session, rune::node::WorkerOp& op);
@@ -2854,6 +2857,8 @@ private:
     /// view's source is unknown here, or there is no image — the worker decides.
     [[nodiscard]] bool viewSourceLedElsewhere_(int32_t viewTopicId, int32_t partition,
                                                std::string_view& endpoint) const noexcept;
+    /// The same for a partition of `topicId` itself.
+    [[nodiscard]] bool partitionLedElsewhere_(int32_t topicId, int32_t partition, std::string_view& endpoint) const noexcept;
     int64_t catalogBackPressureForTest_ = 0;   // setCatalogBackPressureForTest (0 = none)
 
     // E5.1.3 (e): per-worker ingress active flag.

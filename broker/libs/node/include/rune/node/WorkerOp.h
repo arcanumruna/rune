@@ -178,6 +178,9 @@ struct WorkerOp {
         // (-1 none) and recordCount = limit; viewReadTail (TailKind = VIEW_READ) carries the key or prefix and the token.
         GetViewRowK               = 33, ///< gateway → worker: point read of a view row by its key bytes
         ScanViewRows              = 34, ///< gateway → worker: one page of the rows under a key prefix
+        // Checked writes Part 08: gateway → the partition leader's worker: the counters of a topic partition (recordCount =
+        // StatsScope 1, topicId = the topic) or of a view partition (scope 2, topicId = the view).  No tail.  Not ownership-gated.
+        GetStats                  = 35, ///< gateway → worker: the stats of one topic or view partition
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -600,6 +603,10 @@ struct WorkerReturn {
         /// Checked writes Part 07: the answer to a ScanViewRows op.  errorCode = ViewRowResponse status, recordCount =
         /// rows in the page, readTopicId = viewTopicId; the chunk is [nextTokenLen u32][token][rowsLen u32][rows].
         ViewScanResult = 9,
+        /// Checked writes Part 08: the answer to a GetStats op.  errorCode = StatsResponse status (or kViewRowNotLeaderInternal),
+        /// recordCount = stat entries, readTopicId / readPartition = the object, isolation = the StatsScope; the chunk is
+        /// [count x 10 B][nConstraints u16][n x 12 B].
+        StatsResult = 10,
     };
 
     Type    type = Type::ProduceResult;

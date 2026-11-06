@@ -138,6 +138,10 @@
            VIEW_SCAN_RESULT. -->
       <validValue name="GET_VIEW_ROW_K">33</validValue>
       <validValue name="SCAN_VIEW_ROWS">34</validValue>
+      <!-- Checked writes Part 08: gateway -> the partition leader's worker: the stats of a topic partition (recordCount =
+           scope 1) or of a view partition (scope 2).  topicId = the topic / view, partition; no tail.  Answered with
+           STATS_RESULT. -->
+      <validValue name="GET_STATS">35</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -212,6 +216,9 @@
       <!-- Checked writes Part 07: the answer to a SCAN_VIEW_ROWS op.  errorCode = status, recordCount = rows in the page;
            the chunk is [nextTokenLen u32][token][rowsLen u32][rows]. -->
       <validValue name="VIEW_SCAN_RESULT">9</validValue>
+      <!-- Checked writes Part 08: the answer to a GET_STATS op.  errorCode = StatsResponse status, recordCount = stat
+           entries; the chunk is [count x 10 B][nConstraints u16][n x 12 B]. -->
+      <validValue name="STATS_RESULT">10</validValue>
     </enum>
 
     <!-- F15: TxnReturn::kind -->

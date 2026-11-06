@@ -861,6 +861,8 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesAdminViewDdlTest.cpp
         tests/node/CheckedWritesViewReadTest.cpp
         tests/node/CheckedWritesViewReadGatewayTest.cpp
+        tests/node/CheckedWritesStatsTest.cpp
+        tests/node/CheckedWritesStatsGatewayTest.cpp
         tests/node/CheckedWritesQlCompileTest.cpp
         ${RUNE_BROKER_DIR}/../ql/tests/CheckedWritesQlFuzzTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
