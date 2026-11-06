@@ -1,0 +1,40 @@
+topic user partitions 1 replicas 3 persistence disk key userId autoincrement
+schema user fp=0x2C083AE245583FFA block=82 version=1 {
+  userId    uint64  @0    key
+  provider  uint16  @8
+  subject   string(64)@10
+  createdAt int64   @74
+}
+create unique view user_identity source user key (provider, subject)
+  output provider uint16 replace(provider), subject string(64) replace(subject), userId uint64 replace(userId)
+  plan authored v2
+topic device_login partitions 1 replicas 3 persistence disk key loginId autoincrement
+schema device_login fp=0xDF911DB78C3260E3 block=90 version=1 {
+  loginId   uint64  @0    key
+  userId    uint64  @8
+  deviceFp  string(64)@16
+  platform  uint16  @80
+  ts        int64   @82
+}
+create view device_history source device_login key (userId, deviceFp) group by (userId, deviceFp)
+  output userId uint64 replace(userId), deviceFp string(64) replace(deviceFp), firstSeen int64 min(ts), lastSeen int64 max(ts), logins int64 count(*), platform uint16 last(platform)
+  plan authored v2
+topic character partitions 1 replicas 3 persistence disk key characterId autoincrement
+schema character fp=0xE9B55AB582EBB6DA block=56 version=1 {
+  characterIduint64  @0    key
+  userId    uint64  @8
+  name      string(16)@16
+  gender    uint16  @32
+  hairSkin  uint16  @34
+  hairSheet uint16  @36
+  headSkin  uint16  @38
+  createdAt int64   @40
+  lastPlayedint64   @48
+}
+create unique view character_name source character key lower(name) as nameKey unicode 16.0.0
+  output characterId uint64 replace(characterId)
+  plan authored v2
+create view account_stats source character key userId group by (userId)
+  output userId uint64 replace(userId), characters int64 count(*)
+  constraint max_characters check (characters <= 12)
+  plan authored v2

@@ -9,17 +9,20 @@
 
 #include <rune/catalog/CatalogFile.h>
 #include <rune/client/detail/SecureZero.h>
+#include "rune/cli/CatalogCommands.h"
 #include "rune/cli/SecurityCommands.h"
 #include <rune/codec/AlterOps.h>
 
 #include <array>
 #include <cstddef>
+#include <expected>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <istream>
 #include <ostream>
 #include <string>
+#include <span>
 #include <string_view>
 #include <variant>
 #include <vector>
@@ -85,7 +88,20 @@ struct PSecShow {
 };
 struct PAsOf        { rune::catalog::ObjectType kind = rune::catalog::ObjectType::Topic; std::string name; rune::catalog::AsOf at; std::string text; };
 struct PDiff        { rune::catalog::AsOf a, b; std::string onlyTopic; bool restrictToTopic = false; std::string text; };
-using Prepared = std::variant<PDefine, PAlter, PAlterConfig, PDropTopic, PDropView, PHistory, PAsOf, PDiff, PSecurity, PSecShow>;
+/// The topics prepared so far in this run: a `create view` over one of them is authored while preparing (P8-7).
+struct PrepareScope { std::vector<rune::ql::TopicDef> topics; };
+/// `scriptPlan` is empty when the source is not in the scope (the view is authored when the statement runs);
+/// `outputTypes` is parallel to its output fields.
+struct PCreateView {
+    rune::ql::CreateViewDef def;
+    std::optional<rune::view::ViewPlan> scriptPlan;
+    std::vector<std::string> outputTypes;
+};
+struct PSelect     { rune::ql::SelectDef def; };
+struct PShowTopic  { std::string name; };
+struct PShowView   { std::string name; };
+using Prepared = std::variant<PDefine, PAlter, PAlterConfig, PDropTopic, PDropView, PHistory, PAsOf, PDiff, PSecurity, PSecShow,
+                              PCreateView, PSelect, PShowTopic, PShowView>;
 
 /// Statement `n` of a script (1-based) sees this id: {hi, lo + n - 1}.
 struct IdSeq {
@@ -99,6 +115,8 @@ struct PrepareOptions {
 
 /// Parse-and-plan one statement.  nullopt + `why` when it is refused (versions beyond u16, a bad
 /// setting, an undecodable time).
+[[nodiscard]] std::optional<Prepared> prepare(const rune::ql::Statement&, const PrepareOptions&, PrepareScope&, std::string& why);
+/// As above, for a statement on its own.
 [[nodiscard]] std::optional<Prepared> prepare(const rune::ql::Statement&, const PrepareOptions&, std::string& why);
 
 void printPlan(const Prepared& p, const std::optional<rune::catalog::RequestId>& rid, std::ostream& out);
@@ -115,6 +133,28 @@ void printPlan(const Prepared& p, const std::optional<rune::catalog::RequestId>&
 // ═══════════════════════════════════════════════════════════════════════════
 #ifdef RUNE_CLI_LIVE_ENABLED
 
+/// A `select` planned against its view: one key read, or a scan by the leading key columns.
+struct SelectRead {
+    enum class Kind : uint8_t { Point, Scan } kind = Kind::Point;
+    std::vector<uint8_t> keyOrPrefix;
+    int32_t              partition = -1;   // a point read's source partition (-1: one partition)
+    std::vector<uint16_t> slots;           // output slots to print, in order
+    uint32_t             limit = 0;        // 0 = every row
+};
+/// Which key columns `where` names decides the read (P8-6); a literal that does not fit its column is refused, never truncated.
+[[nodiscard]] std::expected<SelectRead, std::string> planSelect(const rune::ql::SelectDef&, const rune::view::ViewPlan& authored,
+                                                                const rune::codec::Descriptor& source,
+                                                                const rune::codec::Descriptor& output, int32_t sourcePartitions,
+                                                                rune::protocol::Partitioner partitioner);
+/// A header of the selected columns, a line per row, `(<n> rows)`.
+[[nodiscard]] std::string formatRows(const rune::codec::Descriptor& output, std::span<const uint16_t> slots,
+                                     std::span<const std::vector<uint8_t>> rows);
+
+/// The counters of every partition of a topic / view (`only` >= 0: that partition alone); the message when one is refused.
+/// A view's constraint rejections come from its source partition and carry `<view>.<constraint>` labels.
+[[nodiscard]] std::expected<std::vector<PartitionStats>, std::string> topicStats(rune::client::Client&, const rune::catalog::TopicObject&, int32_t only);
+[[nodiscard]] std::expected<std::vector<PartitionStats>, std::string> viewStats(rune::client::Client&, const rune::catalog::CatalogState&,
+                                                                                const rune::catalog::ViewObject&, int32_t only);
 
 [[nodiscard]] std::string catalogReadFailure(const rune::client::CatalogReadError& e);
 [[nodiscard]] std::string securityReadFailure(const rune::client::CatalogReadError& e);
@@ -203,8 +243,14 @@ struct QlRun {
     bool run(const PHistory& s, const rune::client::DdlOptions&);
     bool run(const PAsOf& s, const rune::client::DdlOptions&);
     bool run(const PDiff& s, const rune::client::DdlOptions&);
+    bool run(const PCreateView& s, const rune::client::DdlOptions& ddl);
+    bool run(const PSelect& s, const rune::client::DdlOptions&);
+    bool run(const PShowTopic& s, const rune::client::DdlOptions&);
+    bool run(const PShowView& s, const rune::client::DdlOptions&);
 
 private:
+    /// Waits for this run's last DDL, then reads the catalog tail: the state the next statement plans against.
+    bool refreshCatalog();
     bool awaitLastDdl();
     bool awaitLastSecurityDdl();
     template <class F>

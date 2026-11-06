@@ -10,6 +10,7 @@
 #include <rune/codec/Serialize.h>
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
 #include <exception>
 #include <fstream>
@@ -26,7 +27,11 @@
 #include <rune/client/detail/SecureZero.h>
 
 #ifdef RUNE_CLI_LIVE_ENABLED
+#include <rune/client/view/ViewKeyBuilder.h>
 #include <rune/client/view/ViewPlanAuthor.h>
+#include <rune/client/view/ViewRowCodec.h>
+#include <rune/codec/UnicodeLower.h>
+#include <rune/codec/ViewKeyEncoding.h>
 #include <rune/protocol/client/SchemaMessages.h>
 
 #include <chrono>
@@ -102,6 +107,44 @@ std::optional<int64_t> parseIsoMs(std::string_view s) noexcept {
     };
     return (daysFromCivil(num(0, 4), num(5, 2), num(8, 2)) * 86400 + num(11, 2) * 3600 + num(14, 2) * 60 + num(17, 2)) *
            1000;
+}
+
+/// `uint16`, `string(16)`: how QL writes a column type.
+std::string typeWord(rune::codec::PrimType t, uint16_t width) {
+    using rune::codec::PrimType;
+    switch (t) {
+        case PrimType::Int32:    return "int32";
+        case PrimType::Int64:    return "int64";
+        case PrimType::UInt16:   return "uint16";
+        case PrimType::UInt32:   return "uint32";
+        case PrimType::UInt64:   return "uint64";
+        case PrimType::Float64:  return "float64";
+        case PrimType::Bool:     return "bool";
+        case PrimType::Enum:     return "enum";
+        case PrimType::String:   return "string";
+        case PrimType::Bytes:    return "bytes";
+        case PrimType::FixedStr: return "string(" + std::to_string(width) + ")";
+    }
+    return "unknown";
+}
+
+std::string joined(const std::vector<std::string>& parts) {
+    std::string out;
+    for (std::size_t i = 0; i < parts.size(); ++i) out += (i == 0 ? "" : ", ") + parts[i];
+    return out;
+}
+
+std::string literalText(const ql::Literal& l) {
+    switch (l.kind) {
+        case ql::Literal::Kind::Integer: return (l.negative && l.magnitude != 0 ? "-" : "") + std::to_string(l.magnitude);
+        case ql::Literal::Kind::Bool:    return l.boolean ? "true" : "false";
+        case ql::Literal::Kind::String:  return l.lowered ? "lower('" + l.text + "')" : "'" + l.text + "'";
+    }
+    return {};
+}
+
+std::string keyItemText(const ql::KeyItem& k) {
+    return k.fn == ql::KeyFunction::Lower ? "lower(" + k.column + ") as " + k.outName : k.column;
 }
 
 std::string oneLine(std::string s) {
@@ -247,6 +290,11 @@ std::optional<Prepared> prepareSecurity(const ql::Statement& st, std::string& wh
 } // namespace
 
 std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& opts, std::string& why) {
+    PrepareScope scope;
+    return prepare(st, opts, scope, why);
+}
+
+std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& opts, PrepareScope& scope, std::string& why) {
     auto checkVersion = [&](int64_t v, std::string_view kind, uint64_t max) {
         if (v < 0 || static_cast<uint64_t>(v) > max) {
             why = "version " + std::to_string(v) + " is out of range: versions of a " + std::string(kind) + " are 0.." +
@@ -260,7 +308,9 @@ std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& o
             [&](const auto& s) -> std::optional<Prepared> {
                 using T = std::decay_t<decltype(s)>;
                 if constexpr (std::is_same_v<T, ql::TopicDef>) {
-                    return Prepared{PDefine{ql::applyPlan(s)}};
+                    PDefine p{ql::applyPlan(s)};
+                    scope.topics.push_back(s);
+                    return Prepared{std::move(p)};
                 } else if constexpr (std::is_same_v<T, ql::AlterTopicDef>) {
                     return Prepared{PAlter{ql::applyAlterPlan(s, opts.expectedVersion)}};
                 } else if constexpr (std::is_same_v<T, ql::AlterTopicConfigDef>) {
@@ -274,6 +324,29 @@ std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& o
                     return Prepared{PDropTopic{s.name}};
                 } else if constexpr (std::is_same_v<T, ql::DropViewDef>) {
                     return Prepared{PDropView{s.name}};
+                } else if constexpr (std::is_same_v<T, ql::CreateViewDef>) {
+                    PCreateView p{s, {}, {}};
+                    const auto source = std::find_if(scope.topics.rbegin(), scope.topics.rend(), [&](const ql::TopicDef& t) { return t.name == s.source; });
+                    if (source != scope.topics.rend()) {
+                        const ql::ViewSource src = ql::viewSourceOf(*source);
+                        auto plan = ql::applyViewPlan(s, src);
+                        if (!plan) {
+                            why = plan.error().message;
+                            return std::nullopt;
+                        }
+                        for (const auto& f : plan->output) {
+                            const auto* column = src.descriptor.find(f.srcField);
+                            p.outputTypes.push_back(typeWord(f.type, column != nullptr ? column->fixedLen : uint16_t{0}));
+                        }
+                        p.scriptPlan = std::move(*plan);
+                    }
+                    return Prepared{std::move(p)};
+                } else if constexpr (std::is_same_v<T, ql::SelectDef>) {
+                    return Prepared{PSelect{s}};
+                } else if constexpr (std::is_same_v<T, ql::ShowTopicDef>) {
+                    return Prepared{PShowTopic{s.name}};
+                } else if constexpr (std::is_same_v<T, ql::ShowViewDef>) {
+                    return Prepared{PShowView{s.name}};
                 } else if constexpr (std::is_same_v<T, ql::ShowHistoryDef>) {
                     PHistory p;
                     p.text = "show history";
@@ -361,6 +434,11 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
                 out << "topic " << d.name << " partitions " << d.partitions << " replicas " << d.replicas << " persistence "
                     << (d.persistence == ql::Persistence::Transient ? "transient" : "disk");
                 if (!d.keyField.empty()) out << " key " << d.keyField;
+                const auto& kf = d.keyFeatures;
+                if (kf.autoIncrement) out << " autoincrement";
+                if (kf.keyIndex) out << " key.index";
+                if (kf.autoIncrementReserve != rune::protocol::kAutoIncrementReserveDefault) out << " autoincrement.reserve " << kf.autoIncrementReserve;
+                if (kf.autoIncrementMax != rune::protocol::kAutoIncrementMaxDefault) out << " autoincrement.max " << kf.autoIncrementMax;
                 if (d.descriptorBlob.empty()) out << " raw\n";
                 else out << "\n" << descriptorText(d.descriptorBlob);
             } else if constexpr (std::is_same_v<T, PAlter>) {
@@ -392,6 +470,48 @@ void printPlan(const Prepared& p, const std::optional<cat::RequestId>& rid, std:
                 out << "drop topic " << s.name << "\n";
             } else if constexpr (std::is_same_v<T, PDropView>) {
                 out << "drop view " << s.name << "\n";
+            } else if constexpr (std::is_same_v<T, PCreateView>) {
+                const auto& d = s.def;
+                const bool usesLower = std::any_of(d.key.begin(), d.key.end(), [](const ql::KeyItem& k) { return k.fn == ql::KeyFunction::Lower; }) ||
+                                       std::any_of(d.groupBy.begin(), d.groupBy.end(), [](const ql::KeyItem& k) { return k.fn == ql::KeyFunction::Lower; });
+                std::vector<std::string> key, groupBy;
+                for (const auto& k : d.key) key.push_back(keyItemText(k));
+                for (const auto& g : d.groupBy) groupBy.push_back(g.fn == ql::KeyFunction::Lower ? "lower(" + g.column + ")" : g.column);
+                out << "create " << (d.orReplace ? "or replace " : "") << (d.unique ? "unique " : "") << (d.transient ? "transient " : "")
+                    << "view " << d.name << " source " << d.source << " key " << (key.size() == 1 ? key[0] : "(" + joined(key) + ")");
+                if (!groupBy.empty()) out << " group by (" << joined(groupBy) << ")";
+                if (usesLower) {
+                    const uint32_t v = rune::codec::kUnicodeVersion;
+                    out << " unicode " << (v >> 16) << "." << ((v >> 8) & 0xFF) << "." << (v & 0xFF);
+                }
+                out << "\n";
+                if (!s.scriptPlan) {
+                    out << "  (source resolved when the statement runs)\n";
+                } else {
+                    const auto& plan = *s.scriptPlan;
+                    std::vector<std::string> output;
+                    for (std::size_t i = 0; i < plan.output.size(); ++i) {
+                        const auto& f = plan.output[i];
+                        static constexpr const char* kRules[] = {"replace", "count", "sum", "avg", "min", "max", "last", "count", "lastnonnull"};
+                        const std::string rule = f.rule == rune::view::MergeRule::CountAll ? "count(*)" : std::string(kRules[static_cast<std::size_t>(f.rule)]) + "(" + f.srcField + ")";
+                        output.push_back(f.name + " " + s.outputTypes[i] + " " + rule);
+                    }
+                    out << "  output " << joined(output) << "\n";
+                    for (const auto& c : plan.constraints) out << "  constraint " << c.name << " check (" << ql::predicateText(c.predicate) << ")\n";
+                    out << "  plan authored v" << (rune::view::needsV2(plan) ? 2 : 1) << "\n";
+                }
+            } else if constexpr (std::is_same_v<T, PSelect>) {
+                const auto& d = s.def;
+                std::vector<std::string> where;
+                for (const auto& w : d.where) where.push_back(w.column + " = " + literalText(w.value));
+                out << "select " << (d.columns.empty() ? "*" : joined(d.columns)) << " from " << d.view << " where ";
+                for (std::size_t i = 0; i < where.size(); ++i) out << (i == 0 ? "" : " and ") << where[i];
+                if (d.limit) out << " limit " << *d.limit;
+                out << "\n";
+            } else if constexpr (std::is_same_v<T, PShowTopic>) {
+                out << "show topic " << s.name << "\n";
+            } else if constexpr (std::is_same_v<T, PShowView>) {
+                out << "show view " << s.name << "\n";
             } else if constexpr (std::is_same_v<T, PSecurity>) {
                 out << s.plan.statement << "\n";   // the REDACTED statement (D10): a password literal never prints
             } else {
@@ -724,6 +844,7 @@ bool QlRun::run(const PDefine& s, const rc::DdlOptions& ddl) {
     rc::TopicOptions topic;
     topic.replicationFactor = d.replicas;
     topic.config = d.config;   // F32: the whole struct, never field by field
+    topic.keyFeatures = d.keyFeatures;
     const auto r = broker.client().defineTopicAndWait(
         d.name, d.partitions, d.keyField, std::span<const uint8_t>(d.descriptorBlob.data(), d.descriptorBlob.size()),
         d.persistence == ql::Persistence::Transient ? rc::Persistence::Transient : rc::Persistence::Disk, topic,
@@ -893,6 +1014,351 @@ bool QlRun::run(const PDiff& s, const rc::DdlOptions&) {
         ++shown;
     }
     if (shown == 0) out << "(no differences)\n";
+    return true;
+}
+
+// ---- select: planning and printing ----------------------------------------------------------------------------------
+
+std::expected<SelectRead, std::string> planSelect(const ql::SelectDef& def, const rune::view::ViewPlan& authored,
+                                                  const rune::codec::Descriptor& source, const rune::codec::Descriptor& output,
+                                                  int32_t sourcePartitions, rune::protocol::Partitioner partitioner) {
+    using rune::codec::PrimType;
+    auto builder = rc::view::ViewKeyBuilder::fromPlan(authored, source, sourcePartitions, partitioner);
+    if (!builder) return std::unexpected(std::move(builder.error()));
+    const auto key = builder->components();
+    const std::size_t n = key.size();
+
+    std::vector<const ql::WhereTerm*> named(n, nullptr);
+    bool foreign = false;
+    for (const auto& w : def.where) {
+        const auto c = std::find_if(key.begin(), key.end(), [&](const auto& k) { return k.outName == w.column; });
+        if (c == key.end()) {
+            foreign = true;
+            continue;
+        }
+        named[static_cast<std::size_t>(c - key.begin())] = &w;   // the parser refuses a column named twice
+    }
+    std::size_t leading = 0, count = 0;
+    while (leading < n && named[leading] != nullptr) ++leading;
+    for (const auto* t : named) count += t != nullptr;
+    auto columns = [&](std::size_t k) {
+        std::vector<std::string> names;
+        for (std::size_t i = 0; i < k; ++i) names.push_back(key[i].outName);
+        return joined(names);
+    };
+
+    SelectRead read;
+    if (!foreign && count == n) {
+        read.kind = SelectRead::Kind::Point;
+    } else if (!foreign && leading == count && n >= 2 && count == n - 1) {
+        read.kind = SelectRead::Kind::Scan;
+    } else if (!foreign && leading == count && count >= 1 && count < n - 1) {
+        return std::unexpected("where names only the leading (" + columns(count) + "); a read by a shorter prefix needs an ordered index");
+    } else if (n == 1) {
+        return std::unexpected("where must name the key column (" + columns(1) + ")");
+    } else {
+        return std::unexpected("where must name every key column (" + columns(n) + ") for a point read, or the leading (" + columns(n - 1) + ") for a scan");
+    }
+    if (def.limit && read.kind == SelectRead::Kind::Point) return std::unexpected("limit is only valid on a scan");
+    read.limit = def.limit.value_or(0);
+
+    for (std::size_t i = 0; i < n; ++i) {
+        if (named[i] == nullptr) continue;
+        const auto& c   = key[i];
+        const auto& lit = named[i]->value;
+        const std::string doesNotFit = literalText(lit) + " does not fit " + typeWord(c.type, c.srcWidth) + " column '" + c.outName + "'";
+        switch (c.type) {
+            case PrimType::Int32:
+            case PrimType::Int64: {
+                const uint64_t limit = c.type == PrimType::Int32 ? uint64_t{1} << 31 : uint64_t{1} << 63;
+                if (lit.kind != ql::Literal::Kind::Integer || lit.magnitude > (lit.negative ? limit : limit - 1)) return std::unexpected(doesNotFit);
+                builder->setInt(c.outName, static_cast<int64_t>(lit.negative ? 0 - lit.magnitude : lit.magnitude));
+                break;
+            }
+            case PrimType::UInt16:
+            case PrimType::UInt32:
+            case PrimType::UInt64:
+            case PrimType::Enum: {
+                const uint64_t max = c.type == PrimType::UInt16 ? 0xFFFF : c.type == PrimType::UInt64 ? ~uint64_t{0} : 0xFFFF'FFFF;
+                if (lit.kind != ql::Literal::Kind::Integer || (lit.negative && lit.magnitude != 0) || lit.magnitude > max) return std::unexpected(doesNotFit);
+                builder->setUInt(c.outName, lit.magnitude);
+                break;
+            }
+            case PrimType::Bool:
+                if (lit.kind != ql::Literal::Kind::Bool) return std::unexpected(doesNotFit);
+                builder->setBool(c.outName, lit.boolean);
+                break;
+            case PrimType::FixedStr: {
+                if (lit.kind != ql::Literal::Kind::String) return std::unexpected(doesNotFit);
+                std::string text = lit.text;
+                if (lit.lowered && c.keyFunction == rune::codec::kKeyFunctionNone) {   // a lower() key component lowers it in the builder
+                    std::vector<uint8_t> lowered(rune::codec::maxLoweredWidth(static_cast<uint32_t>(text.size())));
+                    const auto r = rune::codec::lowerUtf8(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size()), lowered);
+                    if (!r.ok) return std::unexpected(literalText(lit) + " is not valid UTF-8");
+                    text.assign(reinterpret_cast<const char*>(lowered.data()), r.len);
+                }
+                if (text.size() > c.srcWidth)
+                    return std::unexpected(literalText(lit) + " is " + std::to_string(text.size()) + " bytes; column '" + c.outName + "' is " + typeWord(c.type, c.srcWidth));
+                builder->setString(c.outName, text);
+                break;
+            }
+            default:
+                return std::unexpected(doesNotFit);
+        }
+    }
+
+    auto bytes = read.kind == SelectRead::Kind::Point ? builder->key() : builder->prefix();
+    if (!bytes) return std::unexpected(std::move(bytes.error()));
+    read.keyOrPrefix = std::move(*bytes);
+    if (read.kind == SelectRead::Kind::Point) read.partition = builder->partition();
+
+    if (def.columns.empty()) {
+        for (std::size_t i = 0; i < output.fields.size(); ++i) read.slots.push_back(static_cast<uint16_t>(i));
+    } else {
+        for (const auto& name : def.columns) {
+            const auto f = std::find_if(output.fields.begin(), output.fields.end(), [&](const auto& d) { return d.name == name; });
+            if (f == output.fields.end()) return std::unexpected("column '" + name + "' is not a column of view '" + authored.viewName + "'");
+            read.slots.push_back(static_cast<uint16_t>(f - output.fields.begin()));
+        }
+    }
+    return read;
+}
+
+std::string formatRows(const rune::codec::Descriptor& output, std::span<const uint16_t> slots, std::span<const std::vector<uint8_t>> rows) {
+    using rune::codec::PrimType;
+    std::vector<PrimType> types;
+    std::vector<uint16_t> widths;
+    for (const auto& f : output.fields) {
+        types.push_back(f.type);
+        widths.push_back(f.fixedLen);
+    }
+    const auto layout = rc::view::buildRowLayout(types, widths);
+
+    std::vector<std::vector<std::string>> table(1);
+    for (const uint16_t slot : slots) table[0].push_back(output.fields[slot].name);
+    for (const auto& row : rows) {
+        auto& line = table.emplace_back();
+        for (const uint16_t slot : slots) {
+            const auto v = rc::view::readSlot(row, layout, slot);
+            if (!v.valid) throw std::runtime_error("a row does not fit the view's output layout");
+            if (!v.present) { line.push_back("NULL"); continue; }
+            switch (v.type) {
+                case PrimType::Int32:
+                case PrimType::Int64:    line.push_back(std::to_string(v.i)); break;
+                case PrimType::Float64: {
+                    char buf[64];
+                    line.emplace_back(buf, std::to_chars(buf, buf + sizeof buf, v.f).ptr);
+                    break;
+                }
+                case PrimType::Bool:     line.push_back(v.b ? "true" : "false"); break;
+                case PrimType::FixedStr: line.emplace_back(v.bytes.substr(0, v.bytes.find('\0'))); break;
+                default:                 line.push_back(std::to_string(v.u)); break;
+            }
+        }
+    }
+    std::vector<std::size_t> width(slots.size(), 0);
+    for (const auto& line : table)
+        for (std::size_t c = 0; c < line.size(); ++c) width[c] = std::max(width[c], line[c].size());
+    std::string out;
+    for (const auto& line : table) {
+        for (std::size_t c = 0; c < line.size(); ++c) {
+            out += line[c];
+            if (c + 1 != line.size()) out += std::string(width[c] - line[c].size() + 2, ' ');
+        }
+        out += "\n";
+    }
+    return out + "(" + std::to_string(rows.size()) + " rows)\n";
+}
+
+// ---- stats -------------------------------------------------------------------------------------------------------
+
+namespace {
+
+std::string statsRefusal(int32_t partition, uint16_t status) {
+    std::string why;
+    switch (status) {
+        case rc::StatsResult::kUnknownObject:  why = "unknown object"; break;
+        case rc::StatsResult::kInvalidRequest: why = "invalid request"; break;
+        case rc::StatsResult::kBusy:           why = "the partition is busy, try again"; break;
+        case rc::StatsResult::kNotAuthorized:  why = "not authorized"; break;
+        case rc::StatsResult::kNotLeader:      why = "the partition's leader was not reached"; break;
+        default:                               why = "status " + std::to_string(status); break;
+    }
+    return "stats of partition " + std::to_string(partition) + ": " + why;
+}
+
+std::string viewReadRefusal(uint16_t status) {
+    switch (status) {
+        case rc::ViewRowResult::kNotReady:       return "the view is not ready yet";
+        case rc::ViewRowResult::kSchemaMismatch: return "the view's output changed; run it again";
+        case rc::ViewRowResult::kUnknownView:    return "unknown view";
+        case rc::ViewRowResult::kInvalidRequest: return "invalid request";
+        case rc::ViewRowResult::kBusy:           return "the partition is busy, try again";
+        case rc::ViewRowResult::kRowTooLarge:    return "the row is too large to send";
+        case rc::ViewRowResult::kNotAuthorized:  return "not authorized";
+        case rc::ViewRowResult::kNotLeader:      return "the partition's leader was not reached";
+        case rc::ViewRowResult::kViewPaused:     return "the view is paused over its namespace's memory limit";
+        case rc::ViewRowResult::kThrottled:      return "throttled";
+        default:                                 return "view read status " + std::to_string(status);
+    }
+}
+
+std::expected<void, std::string> partitionRange(int32_t partitions, int32_t only, int32_t& from, int32_t& to) {
+    from = 0;
+    to   = partitions;
+    if (only < 0) return {};
+    if (only >= partitions) return std::unexpected("--partition " + std::to_string(only) + " is out of range: 0.." + std::to_string(partitions - 1));
+    from = only;
+    to   = only + 1;
+    return {};
+}
+
+}  // namespace
+
+std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c, const cat::TopicObject& t, int32_t only) {
+    int32_t from = 0, to = 0;
+    if (auto r = partitionRange(t.partitions, only, from, to); !r) return std::unexpected(std::move(r.error()));
+    std::vector<PartitionStats> out;
+    for (int32_t p = from; p < to; ++p) {
+        auto r = c.getStatsAndWait(rpc::StatsScope::TopicPartition, t.topicId, p, kCatalogWait);
+        if (r.status != rc::StatsResult::kOk) return std::unexpected(statsRefusal(p, r.status));
+        out.push_back({p, std::move(r), {}});
+    }
+    return out;
+}
+
+std::expected<std::vector<PartitionStats>, std::string> viewStats(rc::Client& c, const cat::CatalogState& state, const cat::ViewObject& v, int32_t only) {
+    const auto plan = rune::view::deserializeAuthored(v.def.normalizedPlanBlob);
+    if (!plan) return std::unexpected("the plan of view '" + v.name + "' does not decode");
+    const cat::TopicObject* source = v.def.sourceNames.empty() ? nullptr : state.topicByName(v.nsId, v.def.sourceNames[0]);
+    if (source == nullptr) return std::unexpected("the source of view '" + v.name + "' is not in the catalog");
+    int32_t from = 0, to = 0;
+    if (auto r = partitionRange(v.def.sinkPartitions, only, from, to); !r) return std::unexpected(std::move(r.error()));
+    std::vector<PartitionStats> out;
+    for (int32_t p = from; p < to; ++p) {
+        auto r = c.getStatsAndWait(rpc::StatsScope::ViewPartition, v.def.viewTopicId, p, kCatalogWait);
+        if (r.status != rc::StatsResult::kOk) return std::unexpected(statsRefusal(p, r.status));
+        PartitionStats ps{p, std::move(r), {}};
+        if (plan->unique || !plan->constraints.empty()) {   // the rejections are counted where the verdicts are: the source partition
+            const auto src = c.getStatsAndWait(rpc::StatsScope::TopicPartition, source->topicId, p, kCatalogWait);
+            if (src.status != rc::StatsResult::kOk) return std::unexpected(statsRefusal(p, src.status));
+            for (const auto& k : src.constraints) {
+                if ((k.constraintId >> 16) != (v.objectId & 0xFFFF)) continue;
+                const uint16_t ordinal = k.constraintId & 0xFFFF;
+                ps.result.constraints.push_back(k);
+                ps.constraintLabels.push_back(v.name + "." + (ordinal == 0 ? "unique" : plan->constraints.at(ordinal - 1).name));
+            }
+        }
+        out.push_back(std::move(ps));
+    }
+    return out;
+}
+
+// ---- views, select, show ------------------------------------------------------------------------------------------
+
+bool QlRun::refreshCatalog() {
+    if (!awaitLastDdl()) return false;
+    if (auto r = broker.client().catalogReader().refresh(kCatalogWait); !r) return failRead(catalogReadFailure(r.error()), r.error());
+    return true;
+}
+
+bool QlRun::run(const PCreateView& s, const rc::DdlOptions& ddl) {
+    if (!refreshCatalog()) return false;
+    const cat::CatalogState& state = broker.client().catalogReader().state();
+    const cat::TopicObject* source = state.topicByName(cat::kDefaultNsId, s.def.source);
+    if (source == nullptr) return fail("no topic '" + s.def.source + "'");
+    if (!source->schema) return fail("view source must be a typed topic");
+    ql::ViewSource src;
+    src.name       = source->name;
+    src.topicId    = source->topicId;
+    src.keyField   = source->schema->keyField;
+    src.descriptor = rune::codec::deserialize(source->schema->evolvingBlob);
+    src.partitions = source->partitions;
+    src.transient  = source->persistence == cat::Persistence::Transient;
+    auto plan = ql::applyViewPlan(s.def, src);
+    if (!plan) return fail(plan.error().message);
+
+    const std::vector<uint8_t> blob = rune::view::serializeAuthored(*plan);
+    const std::string keyField = rc::view::viewKeyField(*plan, plan->key);
+    const cat::ViewObject* existing = state.viewByName(cat::kDefaultNsId, s.def.name);
+    if (existing != nullptr && s.def.orReplace) {
+        const auto r = broker.client().alterViewAndWait(s.def.name, keyField, plan->persistence, existing->version, blob, ddl, broker.ddlTimeout());
+        broker.flushVerbose(err);
+        if (r.errorCode != 0) return failBroker(r.errorCode, r.detail);
+        lastDdl = r.requestId;
+        if (style == OutputStyle::Console) out << "ok view " << s.def.name << "\n";
+        else out << "altered view '" << s.def.name << "' version=" << r.newVersion << "\n";
+        return true;
+    }
+    const auto r = broker.client().createViewAndWait(s.def.name, keyField, plan->persistence, blob, ddl, broker.ddlTimeout());
+    broker.flushVerbose(err);
+    if (r.errorCode != 0) return failBroker(r.errorCode, r.detail);
+    lastDdl = r.requestId;
+    if (style == OutputStyle::Console) out << "ok view " << s.def.name << "\n";
+    else out << "created view '" << s.def.name << "' viewTopicId=" << r.viewTopicId << "\n";
+    return true;
+}
+
+bool QlRun::run(const PSelect& s, const rc::DdlOptions&) {
+    if (!refreshCatalog()) return false;
+    const cat::CatalogState& state = broker.client().catalogReader().state();
+    const cat::ViewObject* view = state.viewByName(cat::kDefaultNsId, s.def.view);
+    if (view == nullptr) return fail("no view '" + s.def.view + "'");
+    const auto plan = rune::view::deserializeAuthored(view->def.normalizedPlanBlob);
+    if (!plan) return fail("the plan of view '" + view->name + "' does not decode");
+    const cat::TopicObject* source = view->def.sourceNames.empty() ? nullptr : state.topicByName(view->nsId, view->def.sourceNames[0]);
+    if (source == nullptr || !source->schema) return fail("the source of view '" + view->name + "' is not a typed topic in the catalog");
+    const rune::codec::Descriptor output = rune::codec::deserialize(view->def.outputDescriptorBlob);
+    const auto read = planSelect(s.def, *plan, rune::codec::deserialize(source->schema->evolvingBlob), output, source->partitions,
+                                 source->schema->keyFeatures.partitioner);
+    if (!read) return fail(read.error());
+
+    std::vector<std::vector<uint8_t>> rows;
+    if (read->kind == SelectRead::Kind::Point) {
+        const auto r = broker.client().getViewRowAndWait(view->def.viewTopicId, read->keyOrPrefix, rc::ViewReadOptions{.partition = read->partition}, kCatalogWait);
+        if (r.status == rc::ViewRowResult::kAbsentKey) {
+            out << "(no row)\n";
+            return true;
+        }
+        if (r.status != rc::ViewRowResult::kOk) return fail(viewReadRefusal(r.status));
+        rows.push_back(r.rowBytes);
+    } else {
+        rc::ViewScanOptions page;
+        for (;;) {
+            const uint32_t want = read->limit == 0 ? 256 : std::min<uint32_t>(read->limit - static_cast<uint32_t>(rows.size()), 256);
+            auto r = broker.client().scanViewAndWait(view->def.viewTopicId, read->keyOrPrefix, static_cast<uint16_t>(want), page, kCatalogWait);
+            if (r.status != rc::ViewRowResult::kOk) return fail(r.status == rc::ViewRowResult::kCursorInvalidated
+                                                                    ? "the scan was invalidated by a concurrent change; run it again"
+                                                                    : viewReadRefusal(r.status));
+            for (auto& row : r.rows) rows.push_back(std::move(row));
+            if (r.complete() || (read->limit != 0 && rows.size() >= read->limit)) break;
+            page.resumeToken = std::move(r.nextToken);
+        }
+    }
+    out << formatRows(output, read->slots, rows);
+    return true;
+}
+
+bool QlRun::run(const PShowTopic& s, const rc::DdlOptions&) {
+    if (!refreshCatalog()) return false;
+    const cat::TopicObject* t = broker.client().catalogReader().state().topicByName(cat::kDefaultNsId, s.name);
+    if (t == nullptr) return fail("no topic '" + s.name + "'");
+    out << formatTopicDefinition(*t);
+    const auto stats = topicStats(broker.client(), *t, -1);
+    if (!stats) return fail(stats.error());
+    out << formatStatsText(*stats);
+    return true;
+}
+
+bool QlRun::run(const PShowView& s, const rc::DdlOptions&) {
+    if (!refreshCatalog()) return false;
+    const cat::CatalogState& state = broker.client().catalogReader().state();
+    const cat::ViewObject* v = state.viewByName(cat::kDefaultNsId, s.name);
+    if (v == nullptr) return fail("no view '" + s.name + "'");
+    out << formatViewDefinition(*v);
+    const auto stats = viewStats(broker.client(), state, *v, -1);
+    if (!stats) return fail(stats.error());
+    out << formatStatsText(*stats);
     return true;
 }
 

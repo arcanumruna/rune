@@ -19,6 +19,9 @@
 #include <rune/catalog/CatalogFile.h>
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Serialize.h>
+#include <rune/codec/UnicodeLower.h>
+#include <rune/codec/ViewKeyEncoding.h>
+#include <rune/codec/ViewPlanAuthored.h>
 
 #include <algorithm>
 #include <array>
@@ -155,7 +158,14 @@ std::string formatTopicDefinition(const cat::TopicObject& t) {
       << "  partitions " << t.partitions << "\n"
       << "  replicationFactor " << t.replicationFactor << (t.replicationFactor == 0 ? " (every broker)" : "") << "\n"
       << "  persistence " << persistenceName(t.persistence) << "\n"
-      << "  kind " << (t.schema ? "typed" : "raw") << "\n"
+      << "  kind " << (t.schema ? "typed" : "raw") << "\n";
+    if (t.schema) {
+        const rune::protocol::TopicKeyFeatures& kf = t.schema->keyFeatures;
+        o << "  key.index " << (kf.keyIndex ? "on" : "off") << "\n"
+          << "  autoincrement " << (kf.autoIncrement ? "on (reserve " + std::to_string(kf.autoIncrementReserve) + ", max " + std::to_string(kf.autoIncrementMax) + ")" : "off") << "\n"
+          << "  partitioner " << (kf.partitioner == rune::protocol::Partitioner::Modulo ? "modulo" : "fnv1a") << "\n";
+    }
+    o
       << "  config.cleanupPolicy " << int{c.cleanupPolicy} << "\n"
       << "  config.retentionMs " << c.retentionMs << "\n"
       << "  config.retentionBytes " << c.retentionBytes << "\n"
@@ -184,6 +194,30 @@ std::string formatViewDefinition(const cat::ViewObject& v) {
       << "  persistence " << persistenceName(v.def.persistence) << "\n"
       << "  output\n"
       << descriptorText(v.def.outputDescriptorBlob);
+    const auto plan = rune::view::deserializeAuthored(v.def.normalizedPlanBlob);
+    if (!plan) {
+        o << "  (undecodable plan)\n";
+        return o.str();
+    }
+    std::vector<std::string> key, groupBy;
+    for (const auto& k : plan->keyComponents) key.push_back(k.keyFunction == rune::codec::kKeyFunctionLower ? "lower(" + k.column + ") as " + k.outName : k.column);
+    if (key.empty()) key.push_back(plan->key);
+    const bool aggregate = std::any_of(plan->output.begin(), plan->output.end(), [](const rune::view::AuthoredField& f) { return f.rule != rune::view::MergeRule::Replace; });
+    for (const auto& g : plan->groupBy) groupBy.push_back(g.outName);
+    if (aggregate && groupBy.empty()) groupBy.push_back(plan->key);   // a v1-shaped aggregate groups by its key column
+    auto list = [](const std::vector<std::string>& v) {
+        std::string out;
+        for (std::size_t i = 0; i < v.size(); ++i) out += (i == 0 ? "" : ", ") + v[i];
+        return out;
+    };
+    o << "  keyspec " << (key.size() == 1 ? key[0] : "(" + list(key) + ")") << "\n"
+      << "  unique " << (plan->unique ? "yes" : "no") << "\n";
+    if (aggregate) o << "  group by (" << list(groupBy) << ")\n";
+    for (const auto& c : plan->constraints) o << "  constraint " << c.name << " check (" << rune::ql::predicateText(c.predicate) << ")\n";
+    if (plan->unicodeVersion != 0) {
+        const uint32_t u = plan->unicodeVersion;
+        o << "  unicode " << (u >> 16) << "." << ((u >> 8) & 0xFF) << "." << (u & 0xFF) << "\n";
+    }
     return o.str();
 }
 
@@ -203,8 +237,8 @@ void printCatalogUsage(std::ostream& err) {
     err << "  rune ql (-e \"<statement>\" | -f <file|->) [--dry-run] [--verbose] [--request-id <32 hex digits>]\n"
           "          [--expected-version N]\n"
         << "          --broker host:port\n"
-        << "      Execute DDL (the statement text is recorded in the catalog) and reads (SHOW HISTORY,\n"
-        << "      SHOW ... AS OF, DIFF). --dry-run parses and prints the plan without a broker.\n"
+        << "      Execute DDL (the statement text is recorded in the catalog) and reads (SELECT, SHOW TOPIC / VIEW,\n"
+        << "      SHOW HISTORY, SHOW ... AS OF, DIFF). --dry-run parses and prints the plan without a broker.\n"
         << "      -f runs EVERY statement in order and stops at the first error (\"statement N: ...\").\n"
         << "      --request-id fixes the DDL's id (with -f, statement N uses lo + N - 1): re-running a\n"
         << "      DDL that already applied returns its original result.\n"
@@ -213,7 +247,10 @@ void printCatalogUsage(std::ostream& err) {
         << "  rune catalog replay --from <file.rcat|host:port> --into host:port [--up-to <offset>]\n"
         << "          [--cluster-id <id>]    (--cluster-id defaults to the --from argument verbatim)\n"
         << "  rune catalog diff --from <file.rcat|host:port> --to <file.rcat|host:port>\n"
-        << "      Exit 0: no differences; 3: differences (printed); 1: error; 2: usage.\n";
+        << "      Exit 0: no differences; 3: differences (printed); 1: error; 2: usage.\n"
+        << "  rune stats (topic | view) <name> [--partition N] [--json] --broker host:port\n"
+        << "      The counters of every partition (or of N): rejections, verdict lag, autoincrement, scans,\n"
+        << "      and a view's per-constraint rejections. --json prints one object.\n";
 }
 
 // (argument parsing and the live broker connection moved to CliSupport.h: shared with SecurityCommands.cpp)
@@ -309,9 +346,10 @@ int cmdQl(const std::vector<std::string>& args, std::istream& in, std::ostream& 
     }
 
     std::vector<Prepared> prepared;
+    PrepareScope scope;
     for (std::size_t i = 0; i < statements.size(); ++i) {
         std::string why;
-        auto p = prepare(statements[i], popts, why);
+        auto p = prepare(statements[i], popts, scope, why);
         if (!p) {
             if (script) err << "statement " << (i + 1) << ": " << why << "\n";
             else err << "rune: " << why << "\n";
@@ -361,6 +399,119 @@ int cmdQl(const std::vector<std::string>& args, std::istream& in, std::ostream& 
     return 0;
 #else
     err << "rune ql: live mode requires RUNE_CLI_LIVE_ENABLED and a real Aeron build. Use --dry-run.\n";
+    return 1;
+#endif
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// rune stats
+// ═══════════════════════════════════════════════════════════════════════════
+#ifdef RUNE_CLI_LIVE_ENABLED
+namespace {
+
+std::string_view statLabel(uint16_t id) { return rune::protocol::client::statName(static_cast<rune::protocol::client::StatId>(id)); }
+
+std::string jsonString(std::string_view s) {
+    std::string out = "\"";
+    for (const char c : s) out += (c == '"' || c == '\\' ? std::string{'\\', c} : std::string{c});
+    return out + "\"";
+}
+
+}  // namespace
+
+std::string formatStatsText(std::span<const PartitionStats> partitions) {
+    std::ostringstream o;
+    for (const PartitionStats& p : partitions) {
+        o << "  partition " << p.partition << "\n";
+        for (const auto& [id, value] : p.result.stats) o << "    " << statLabel(id) << " " << value << "\n";
+        for (std::size_t i = 0; i < p.result.constraints.size(); ++i)
+            o << "    constraint " << p.constraintLabels[i] << " " << p.result.constraints[i].rejections << "\n";
+        if (p.result.stats.empty() && p.result.constraints.empty()) o << "    (no counters)\n";
+    }
+    return o.str();
+}
+
+std::string formatStatsJson(std::string_view objectKind, std::string_view name, std::span<const PartitionStats> partitions) {
+    std::ostringstream o;
+    o << "{" << jsonString(objectKind) << ": " << jsonString(name) << ", \"partitions\": [";
+    for (std::size_t i = 0; i < partitions.size(); ++i) {
+        const PartitionStats& p = partitions[i];
+        o << (i == 0 ? "" : ", ") << "{\"partition\": " << p.partition << ", \"stats\": {";
+        for (std::size_t k = 0; k < p.result.stats.size(); ++k)
+            o << (k == 0 ? "" : ", ") << jsonString(statLabel(p.result.stats[k].first)) << ": " << p.result.stats[k].second;
+        o << "}, \"constraints\": [";
+        for (std::size_t k = 0; k < p.result.constraints.size(); ++k)
+            o << (k == 0 ? "" : ", ") << "{\"constraintId\": " << p.result.constraints[k].constraintId << ", \"label\": "
+              << jsonString(p.constraintLabels[k]) << ", \"rejections\": " << p.result.constraints[k].rejections << "}";
+        o << "]}";
+    }
+    o << "]}";
+    return o.str();
+}
+#endif   // RUNE_CLI_LIVE_ENABLED
+
+int cmdStats(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
+    if (args.size() < 2 || args[0].rfind('-', 0) == 0 || args[1].rfind('-', 0) == 0)
+        return usageError("stats", err, "'topic' or 'view' and a name are required");
+    const std::string& kind = args[0];
+    const std::string& name = args[1];
+    if (kind != "topic" && kind != "view") return usageError("stats", err, "'" + kind + "' is not 'topic' or 'view'");
+    ParsedArgs a;
+    if (!parseArgs("stats", std::vector<std::string>(args.begin() + 2, args.end()), {"--partition", "--broker"}, {"--json"}, a, err)) {
+        printCatalogUsage(err);
+        return 2;
+    }
+    int32_t only = -1;
+    if (a.has("--partition")) {
+        const auto n = parseOffset(a.value("--partition"));
+        if (!n || *n > std::numeric_limits<int32_t>::max()) return usageError("stats", err, "--partition must be a non-negative integer");
+        only = static_cast<int32_t>(*n);
+    }
+#ifdef RUNE_CLI_LIVE_ENABLED
+    std::string endpoint = a.value("--broker");
+    if (endpoint.empty()) {
+        if (const char* env = std::getenv("RUNE_BROKER"); env != nullptr) endpoint = env;
+    }
+    if (endpoint.empty()) return usageError("stats", err, "--broker host:port is required");
+
+    LiveBroker broker;
+    if (!broker.open(liveOptionsOf(a, endpoint, false), err)) return 1;
+    try {
+        auto& reader = broker.client().catalogReader();
+        if (auto r = reader.refresh(kCatalogWait); !r) {
+            err << "rune: " << catalogReadFailure(r.error()) << "\n";
+            return 1;
+        }
+        const cat::CatalogState& state = reader.state();
+        std::expected<std::vector<PartitionStats>, std::string> stats;
+        if (kind == "topic") {
+            const cat::TopicObject* t = state.topicByName(cat::kDefaultNsId, name);
+            if (t == nullptr) {
+                err << "rune: no topic '" << name << "'\n";
+                return 1;
+            }
+            stats = topicStats(broker.client(), *t, only);
+        } else {
+            const cat::ViewObject* v = state.viewByName(cat::kDefaultNsId, name);
+            if (v == nullptr) {
+                err << "rune: no view '" << name << "'\n";
+                return 1;
+            }
+            stats = viewStats(broker.client(), state, *v, only);
+        }
+        if (!stats) {
+            err << "rune: " << stats.error() << "\n";
+            return 1;
+        }
+        if (a.has("--json")) out << formatStatsJson(kind, name, *stats) << "\n";
+        else out << formatStatsText(*stats);
+        return 0;
+    } catch (const std::exception& e) {
+        err << "rune: " << e.what() << "\n";
+        return 1;
+    }
+#else
+    err << "rune stats: live mode requires RUNE_CLI_LIVE_ENABLED and a real Aeron build.\n";
     return 1;
 #endif
 }

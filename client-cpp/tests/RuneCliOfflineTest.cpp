@@ -98,3 +98,14 @@ TEST(CheckedWritesCliRegression, ErrorCodeNamesCoverEveryCodeThroughViewUniqueIn
     EXPECT_EQ(errorCodeName(61), "ViewUniqueInvalid");
     EXPECT_EQ(errorCodeName(62), "UnknownErrorCode");
 }
+
+// Checked writes Part 08: `rune stats (topic | view) <name> [--partition N] [--json] --broker host:port`.
+TEST(CheckedWritesCli, StatsUsage) {
+    std::ostringstream out, err;
+    EXPECT_EQ(rune::cli::run({"stats"}, out, err), 2);
+    EXPECT_NE(err.str().find("rune stats (topic | view) <name>"), std::string::npos) << err.str();
+
+    std::ostringstream out2, err2;
+    EXPECT_EQ(rune::cli::run({"stats", "topic", "t"}, out2, err2), 2);
+    EXPECT_NE(err2.str().find("--broker host:port is required"), std::string::npos) << err2.str();
+}
