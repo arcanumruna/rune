@@ -30,6 +30,7 @@
 #include <rune/protocol/client/GroupMessages.h>
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/codec/PrimType.h>
+#include <rune/codec/ViewPlanAuthored.h>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/NamespaceMessages.h>
 
@@ -1486,6 +1487,16 @@ OpResult Client::listTopics(CompletionTarget target, Token token) {
     return issueControl_(OpKind::ListTopics, target, token, {}, 0);
 }
 
+namespace {
+// A v2 plan names its key by its components: the broker stores whatever keyField the client sends, so send the display name.
+std::string keyFieldOf(std::string_view keyField, std::span<const uint8_t> planBlob) {
+    if (!planBlob.empty() && planBlob[0] == rune::view::kAuthoredVersion) {
+        if (const auto plan = rune::view::deserializeAuthored(planBlob)) return rune::view::keyDisplayName(*plan);
+    }
+    return std::string(keyField);
+}
+} // namespace
+
 OpResult Client::createView(std::string_view viewName, std::string_view keyField, uint8_t persistence,
                             std::span<const uint8_t> planBlob, CompletionTarget target, Token token) {
     return createView(viewName, keyField, persistence, planBlob, DdlOptions{}, target, token);
@@ -1496,10 +1507,11 @@ OpResult Client::createView(std::string_view viewName, std::string_view keyField
                             Token token) {
     namespace rpc = rune::protocol::client;
     rpc::CreateView msg;
+    const std::string keyFieldName = keyFieldOf(keyField, planBlob);
     msg.sessionId     = 0;
     msg.correlationId = 0;
     msg.viewName      = viewName;
-    msg.keyField      = keyField;
+    msg.keyField      = keyFieldName;
     msg.persistence   = persistence;
     msg.planBlob      = planBlob.data();
     msg.planLen       = static_cast<uint32_t>(planBlob.size());
@@ -1547,6 +1559,12 @@ bool defineKeyFeaturesTooOld(std::span<const uint8_t> frame, int32_t brokerVersi
     if (brokerVersion < 1 || brokerVersion >= rpc::kBrokerVersionCheckedWrites) return false;
     const auto d = rpc::DefineTopic::decode(frame.data(), frame.size());
     return d && d->hasKeyFeatures;
+}
+
+// SD11: GetViewRowK / ScanViewRows are served from broker v10 on.  `brokerVersion` 0 = unknown: sent.
+bool viewReadTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
+    return (op == rune::client::OpKind::GetViewRowK || op == rune::client::OpKind::ScanViewRows) && brokerVersion >= 1 &&
+           brokerVersion < rune::protocol::client::kBrokerVersionCheckedWrites;
 }
 }  // namespace
 
@@ -1668,8 +1686,9 @@ OpResult Client::alterView(std::string_view name, std::string_view keyField, uin
                            CompletionTarget target, Token token) {
     namespace rpc = rune::protocol::client;
     rpc::AlterView msg;
+    const std::string keyFieldName = keyFieldOf(keyField, planBlob);
     msg.viewName        = name;
-    msg.keyField        = keyField;
+    msg.keyField        = keyFieldName;
     msg.persistence     = persistence;
     msg.expectedVersion = expectedVersion;
     msg.planBlob        = planBlob.data();
@@ -1763,6 +1782,35 @@ OpResult Client::getViewRow(int32_t viewTopicId, uint64_t keyU64, uint64_t reque
     uint8_t frame[rpc::GetViewRow::ENCODED_SIZE];
     const std::size_t n = msg.encode(frame);
     return issueControl_(OpKind::GetViewRow, target, token, std::span<const uint8_t>(frame, n), 0);
+}
+
+OpResult Client::getViewRowK(int32_t viewTopicId, std::span<const uint8_t> key, const ViewReadOptions& opts,
+                             CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::GetViewRowK msg;
+    msg.viewTopicId          = viewTopicId;
+    msg.partition            = opts.partition;
+    msg.requestedFingerprint = opts.requestedFingerprint;
+    msg.minOffset            = opts.minOffset;
+    msg.key                  = key;
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    return issueControl_(OpKind::GetViewRowK, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+}
+
+OpResult Client::scanView(int32_t viewTopicId, std::span<const uint8_t> prefix, uint16_t limit,
+                          const ViewScanOptions& opts, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::ScanViewRows msg;
+    msg.viewTopicId          = viewTopicId;
+    msg.limit                = limit;
+    msg.requestedFingerprint = opts.requestedFingerprint;
+    msg.minOffset            = opts.minOffset;
+    msg.prefix               = prefix;
+    msg.resumeToken          = opts.resumeToken;
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    return issueControl_(OpKind::ScanViewRows, target, token, std::span<const uint8_t>(frame.data(), n), 0);
 }
 
 std::vector<std::pair<std::string, int32_t>> Client::decodeTopicList(std::span<const uint8_t> p) {
@@ -1878,6 +1926,10 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
                 return;
             }
         }
+    }
+    if (viewReadTooOld(h.op, agent_.sessionBrokerVersion(0))) {
+        completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
+        return;
     }
     ctlScratch_.assign(frame.begin(), frame.end());
     rpc::detail::putLE64(ctlScratch_.data(), 8, machine.sessionId());
@@ -2092,7 +2144,7 @@ void Client::failDdl_(std::size_t i, uint16_t code, std::string_view detail, int
     // #687: a routing failure of a GetViewRow also names the route it died on and the broker's own code (the
     // errorCode the caller reads is the client-side kNotLeader).  Cold path: one small string.
     std::string routed;
-    if (p.op == OpKind::GetViewRow && (code == 2 || code == 3)) {
+    if ((p.op == OpKind::GetViewRow || p.op == OpKind::GetViewRowK || p.op == OpKind::ScanViewRows) && (code == 2 || code == 3)) {
         const auto* rp = std::get_if<RoutedCtlPending>(&p.ddl);
         routed.reserve(detail.size() + 64);
         routed.append(detail);
@@ -2361,7 +2413,8 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
             heldRedirects   = hld->redirects;
             heldBudgetEndNs = hld->budgetEndNs;
         } else if (!std::holds_alternative<DdlUnsentOnSeed>(d->retry)) { ++i; continue; }
-        if (p.op == OpKind::DefineTopic && defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0))) {
+        if ((p.op == OpKind::DefineTopic && defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0))) ||
+            viewReadTooOld(p.op, agent_.sessionBrokerVersion(0))) {
             PendingCtl dead = takeCtl_(i);   // queued before the seed connected: the version is known now
             completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
             ++work;
@@ -3232,6 +3285,39 @@ ViewRowResult Client::getViewRowAndWait(int32_t viewTopicId, uint64_t keyU64, ui
                  if (result.status == ViewRowResult::kOk || result.status == ViewRowResult::kViewPaused ||
                      result.status == ViewRowResult::kThrottled)
                      result.rowBytes.assign(p.begin(), p.end());   // kViewPaused: the paused offset, 8 LE bytes
+             });
+    return result;
+}
+
+ViewRowResult Client::getViewRowAndWait(int32_t viewTopicId, std::span<const uint8_t> key, const ViewReadOptions& opts,
+                                        std::chrono::nanoseconds timeout) {
+    ViewRowResult result;
+    andWait_("getViewRowK()", timeout, 64u << 10,
+             [&](Completions& q, Token t) { return getViewRowK(viewTopicId, key, opts, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("getViewRowK()", c, p);
+                 result.status = c.errorCode;
+                 if (result.status == ViewRowResult::kOk || result.status == ViewRowResult::kViewPaused ||
+                     result.status == ViewRowResult::kThrottled)
+                     result.rowBytes.assign(p.begin(), p.end());
+             });
+    return result;
+}
+
+ViewScanResult Client::scanViewAndWait(int32_t viewTopicId, std::span<const uint8_t> prefix, uint16_t limit,
+                                       const ViewScanOptions& opts, std::chrono::nanoseconds timeout) {
+    ViewScanResult result;
+    andWait_("scanView()", timeout, 64u << 10,
+             [&](Completions& q, Token t) { return scanView(viewTopicId, prefix, limit, opts, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status == OpStatus::Ok) {
+                     if (!view::decodeScanPayload(p, result)) throw std::runtime_error("scanView(): undecodable page");
+                     result.status = ViewRowResult::kOk;
+                 } else if (c.status == OpStatus::BrokerError) {
+                     result.status = c.errorCode;
+                 } else {
+                     throwForStatus_("scanView()", c, p);
+                 }
              });
     return result;
 }
@@ -5015,7 +5101,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if (!opt) break;
 
         if (const std::size_t i = findCtl_(opt->correlationId);
-            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::GetViewRow) {
+            i < pendingCtl_.size() && (pendingCtl_[i].op == OpKind::GetViewRow || pendingCtl_[i].op == OpKind::GetViewRowK)) {
             if (opt->status == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607: retried
                 onDdlNotLeader_(i, {}, now(), static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable));
                 break;
@@ -5033,6 +5119,25 @@ void Client::onEgressFrame(codec::TemplateId tid,
             completeCtl_(p, opt->status == 0 ? OpStatus::Ok : OpStatus::BrokerError,
                          opt->rowLen, 0, opt->status, row,
                          detail::CompletionRing::Overflow::TooLarge);
+        }
+        break;
+    }
+
+    // ---- Wide view keys: ScanViewRowsResponse (90) - the payload is the frame's two var fields, verbatim.
+    case codec::TemplateId::ScanViewRowsResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::ScanViewRowsResponse::decode(buf, len);
+        if (!opt) break;
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::ScanViewRows) {
+            if (opt->status == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607: retried
+                onDdlNotLeader_(i, {}, now(), static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable));
+                break;
+            }
+            PendingCtl p = takeCtl_(i);
+            constexpr std::size_t kVarAt = rpc::MessageHeader::ENCODED_SIZE + rpc::ScanViewRowsResponse::BODY_FIXED;
+            completeCtl_(p, opt->status == 0 ? OpStatus::Ok : OpStatus::BrokerError, opt->rowCount, 0, opt->status,
+                         std::span<const uint8_t>(buf + kVarAt, len - kVarAt), detail::CompletionRing::Overflow::TooLarge);
         }
         break;
     }

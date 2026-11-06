@@ -52,6 +52,9 @@ enum class OpKind : uint8_t {
     // Phase 2b F (Task 10): GroupConsumer rewind.
     SeekToCommitted,    ///< GroupConsumer::seekToCommitted() / seekToCommittedAndWait()
     Seek,               ///< GroupConsumer::seek(tp, offset, target, token) / seekAndWait()
+    // Checked writes (wide view keys): the key-bytes view reads (wire 88 -> ViewRowResponse 73, 89 -> ScanViewRowsResponse 90).
+    GetViewRowK,        ///< Client::getViewRowK() / getViewRowAndWait(key bytes); payload = the row
+    ScanViewRows,       ///< Client::scanView() / scanViewAndWait(); payload = the response's token and rows fields, verbatim
     // Namespaces (Task 11): namespace DDL (wire 81, answered by DdlResponse 78) and ListNamespaces (82 -> 83).
     NamespaceDdl,       ///< Client::namespaceDdl() / createNamespace() / setNamespaceLimits()
     ListNamespaces,     ///< Client::listNamespaces(afterNsId, max, target, token) / listNamespaces(timeout)

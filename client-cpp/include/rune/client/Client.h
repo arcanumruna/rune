@@ -48,6 +48,7 @@
 #include <rune/client/metadata/MetadataCache.h>
 #include <rune/client/metadata/PartitionRouter.h>
 #include <rune/client/TopicHandle.h>
+#include <rune/client/view/ViewRowCodec.h>   // ViewScanResult
 #include <rune/client/producer/Producer.h>
 #include <rune/client/producer/ProducerHub.h>
 #include <rune/client/subscriber/Subscription.h>
@@ -240,9 +241,27 @@ struct ViewRowResult {
     /// with the defaults (5 s each) a read that is never routed ends as kNotLeader or
     /// as a Timeout (the *AndWait form throws), whichever bound is hit first.
     static constexpr uint16_t kNotLeader       = 8;
+    /// A scan's resume token no longer matches its prefix: restart the scan (the broker's ViewRowResponse::kCursorInvalidated).
+    /// Shares the value 8 with kNotLeader: a routing failure of a scan reads the same, and restarting is right for both.
+    static constexpr uint16_t kCursorInvalidated = 8;
 
     uint16_t              status = kUnknownView;
     std::vector<uint8_t>  rowBytes;
+};
+
+/// Options of a view read by key bytes (getViewRowK).  `partition` -1 = the sink has one partition; else the key's
+/// partition (ViewKeyBuilder::partition()).  `minOffset` -1 = no read-your-writes barrier.
+struct ViewReadOptions {
+    uint64_t requestedFingerprint = 0;
+    int64_t  minOffset            = -1;
+    int32_t  partition            = -1;
+};
+
+/// Options of a view scan (scanView): `resumeToken` is the previous page's nextToken (empty = the first page).
+struct ViewScanOptions {
+    std::vector<uint8_t> resumeToken;
+    uint64_t             requestedFingerprint = 0;
+    int64_t              minOffset            = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -909,6 +928,16 @@ public:
     /// -> BrokerError), payload = rowBytes (empty unless status == OK).
     OpResult getViewRow(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
                         CompletionTarget target, Token token);
+    /// Wide view keys: GetViewRowK (wire 88) - a point lookup by the view key's bytes (ViewKeyBuilder::key()).
+    /// Completion: OpKind::GetViewRowK, payload = the row; status != OK -> BrokerError / errorCode = the ViewRowResponse status.
+    /// A seed whose brokerVersion is known and below kBrokerVersionCheckedWrites ends it BrokerTooOld, nothing sent.
+    OpResult getViewRowK(int32_t viewTopicId, std::span<const uint8_t> key, const ViewReadOptions& opts,
+                         CompletionTarget target, Token token);
+    /// Wide view keys: ScanViewRows (wire 89) - one page of the rows whose key starts with `prefix` (ViewKeyBuilder::prefix()),
+    /// at most `limit` (capped by the broker).  Completion: OpKind::ScanViewRows, value = the row count, payload = the response's
+    /// next-token and rows fields verbatim (rune::client::view::decodeScanPayload).  Same BrokerTooOld gate as getViewRowK.
+    OpResult scanView(int32_t viewTopicId, std::span<const uint8_t> prefix, uint16_t limit, const ViewScanOptions& opts,
+                      CompletionTarget target, Token token);
 
     // ---- Catalog history (Task 5): DDL with the DDL extension ---------------
     // Every DDL (the overloads above included, with default DdlOptions) carries
@@ -1030,6 +1059,12 @@ public:
     /// throws.
     ViewRowResult getViewRowAndWait(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
                                     std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    /// getViewRowK(), blocking; status handling as getViewRowAndWait above.  BrokerTooOld throws like any local refusal.
+    ViewRowResult getViewRowAndWait(int32_t viewTopicId, std::span<const uint8_t> key, const ViewReadOptions& opts = {},
+                                    std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    /// scanView(), blocking (64 KiB reservation: a page is at most 61,576 bytes).
+    ViewScanResult scanViewAndWait(int32_t viewTopicId, std::span<const uint8_t> prefix, uint16_t limit,
+                                   const ViewScanOptions& opts = {}, std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
 
     // ---- Catalog history (Task 5): blocking DDL conveniences ----------------
     // Pump-until-done wrappers over the token forms above.  A broker errorCode
@@ -1474,7 +1509,7 @@ private:
     /// re-sent on the named node's session within the retry budget: the DDLs and
     /// GetViewRow (a view row is served only by its source partition's leader).
     [[nodiscard]] static constexpr bool isRoutedCtlOp(OpKind op) noexcept {
-        return isDdlOp(op) || op == OpKind::GetViewRow;
+        return isDdlOp(op) || op == OpKind::GetViewRow || op == OpKind::GetViewRowK || op == OpKind::ScanViewRows;
     }
     /// A DDL that is not in flight (its frame waits for the resend pump).
     [[nodiscard]] static bool ddlWaitsForResend(const DdlRetry& r) noexcept {

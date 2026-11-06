@@ -299,6 +299,14 @@ target_include_directories(rune_client_scram PUBLIC
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(rune_client_scram PUBLIC rune_crypto)
 target_link_libraries(rune_client INTERFACE rune_client_scram)
+# Wide view keys: ViewKeyBuilder (the broker's key encoding + the catalog's view and source schema).
+add_library(rune_client_view STATIC src/view/ViewKeyBuilder.cpp)
+target_include_directories(rune_client_view PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>
+    $<INSTALL_INTERFACE:include>)
+target_link_libraries(rune_client_view PUBLIC rune_codec rune_catalog)
+target_link_libraries(rune_client INTERFACE rune_client_view)
 if(aeron_FOUND)
     target_link_libraries(rune_client INTERFACE aeron::aeron)
 endif()
@@ -1129,13 +1137,14 @@ if(BUILD_TESTING)
         tests/SchemaCodecSmokeTest.cpp
         tests/client/ViewPlanAuthorTest.cpp
         tests/client/ViewRowCodecTest.cpp
+        tests/client/CheckedWritesViewKeyBuilderTest.cpp   # checked writes Part 07
         tests/client/PlayerEventSchemaTest.cpp   # Phase 2c Task 4
     )
     target_include_directories(rune_schema_codec_smoke_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include "${RUNE_CLAIM_GEN_DIR}/gen")
     if(TARGET generate_claim_schema_headers)   # #377: guarded like the generator itself
         add_dependencies(rune_schema_codec_smoke_tests generate_claim_schema_headers)
     endif()
-    target_link_libraries(rune_schema_codec_smoke_tests PRIVATE rune_codec GTest::gtest_main)
+    target_link_libraries(rune_schema_codec_smoke_tests PRIVATE rune_codec rune_catalog rune_client_view GTest::gtest_main)
     gtest_discover_tests(rune_schema_codec_smoke_tests)
 
     # ── Task 11: TypedTopic unit tests (schemaMatches) — no Aeron dependency ───

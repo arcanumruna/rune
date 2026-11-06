@@ -39,6 +39,19 @@
 #include <string_view>
 #include <vector>
 
+namespace rune::client {
+
+/// One page of a view scan.  Pages come in table order, not key order.  `status` is a ViewRowResult status; `nextToken`
+/// is empty on the last page.
+struct ViewScanResult {
+    uint16_t                          status = 0;
+    std::vector<std::vector<uint8_t>> rows;
+    std::vector<uint8_t>              nextToken;
+    [[nodiscard]] bool complete() const noexcept { return status == 0 /* ViewRowResult::kOk */ && nextToken.empty(); }
+};
+
+} // namespace rune::client
+
 namespace rune::client::view {
 
 // Fixed-width row layout mirroring rune::view::RowLayout.
@@ -108,6 +121,34 @@ inline RowLayout buildRowLayout(std::span<const rune::codec::PrimType> fieldType
     }
     layout.rowLen = offset;
     return layout;
+}
+
+/// Decodes a ScanViewRows completion's payload - [u32 tokenLen][token][u32 rowsLen][rows: each u32 len + bytes] - into
+/// `out.nextToken` and `out.rows` (`out.status` is untouched).  False on a truncated or inconsistent payload.
+[[nodiscard]] inline bool decodeScanPayload(std::span<const uint8_t> payload, ViewScanResult& out) {
+    const auto u32At = [&](std::size_t at) {
+        uint32_t v = 0;
+        std::memcpy(&v, payload.data() + at, 4);
+        return v;
+    };
+    if (payload.size() < 4) return false;
+    const std::size_t tokenLen = u32At(0);
+    if (payload.size() - 4 < tokenLen || payload.size() - 4 - tokenLen < 4) return false;
+    const std::size_t rowsLenAt = 4 + tokenLen;
+    const std::size_t rowsLen   = u32At(rowsLenAt);
+    if (payload.size() - rowsLenAt - 4 != rowsLen) return false;
+    std::vector<std::vector<uint8_t>> rows;
+    for (std::size_t at = rowsLenAt + 4; at < payload.size();) {
+        if (payload.size() - at < 4) return false;
+        const std::size_t len = u32At(at);
+        at += 4;
+        if (payload.size() - at < len) return false;
+        rows.emplace_back(payload.begin() + static_cast<std::ptrdiff_t>(at), payload.begin() + static_cast<std::ptrdiff_t>(at + len));
+        at += len;
+    }
+    out.rows      = std::move(rows);
+    out.nextToken.assign(payload.begin() + 4, payload.begin() + static_cast<std::ptrdiff_t>(4 + tokenLen));
+    return true;
 }
 
 inline bool isNullSlot(std::span<const uint8_t> row, uint16_t slot) noexcept {
