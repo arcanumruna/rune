@@ -7,6 +7,7 @@
 // off the hot path) -- not performance-sensitive, but still allocation-shape
 // disciplined: no shared mutable state, no throws out of compileView.
 #include <rune/view/PlanCompiler.h>
+#include <rune/view/CheckEval.h>
 
 #include <algorithm>
 #include <optional>
@@ -520,6 +521,10 @@ std::expected<CompileResult, CompileError> compileView(
     } catch (const std::exception& e) {
         return std::unexpected(CompileError{
             "view '" + authored.viewName + "': failed to build output schema: " + e.what(), CompileErrorKind::FieldUnresolved});
+    }
+
+    for (const CompiledConstraint& cc : constraints) {
+        if (auto why = constraintShapeError(cc, rowLayout, outputDescriptor)) return fail(CompileErrorKind::ConstraintInvalid, *why);
     }
 
     CompiledViewPlan plan;
