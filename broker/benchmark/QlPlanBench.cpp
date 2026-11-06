@@ -70,8 +70,10 @@ void textToPlan(benchmark::State& state, const Stmt* s) {
     for (auto _ : state) {
         for (int i = 0; i < kCalls; ++i) {
             const auto t0 = std::chrono::steady_clock::now();
-            auto st   = ql::parse(s->text);
+            auto st = ql::parse(s->text);
+            if (!st) { state.SkipWithError(st.error().message.c_str()); return; }
             auto plan = ql::applyViewPlan(std::get<ql::CreateViewDef>(*st), src);
+            if (!plan) { state.SkipWithError(plan.error().message.c_str()); return; }
             auto wire = rune::view::serializeAuthored(*plan);
             const auto t1 = std::chrono::steady_clock::now();
             benchmark::DoNotOptimize(wire);

@@ -98,6 +98,7 @@ TEST(CheckedWritesStatsGateway, RefusalsInOrder) {
     expectStatus(g.frame(2, pc::StatsScope::TopicPartition, 99, 0), SR::kUnknownObject, "an unknown topic");
     expectStatus(g.frame(3, pc::StatsScope::TopicPartition, kSrc, 4), SR::kInvalidRequest, "partition 4 of 4");
     expectStatus(g.frame(4, pc::StatsScope::TopicPartition, kSrc, -1), SR::kInvalidRequest, "partition -1");
+    expectStatus(g.frame(5, pc::StatsScope::TopicPartition, 99, 9), SR::kUnknownObject, "an unknown topic and a partition out of range");
     EXPECT_EQ(g.servedTotal(), 0u) << "a refused request never reaches a worker";
 
     g.leaderElsewhere(1, kOther, 4);

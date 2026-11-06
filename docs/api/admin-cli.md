@@ -60,7 +60,7 @@ rune ql -e "show topic character;" --broker rune-1:40200
 
 `show topic NAME` and `show view NAME` print the definition (the same text as `show ... as of` prints for the current version),
 then the partition counters exactly as `rune stats` prints them. `--dry-run` prints a `create view` with its key, output
-columns, constraints and plan version (`v2` for a wide key), and a `select` as parsed, without a broker.
+columns, constraints and plan version (`v2` when the plan needs it), and a `select` as parsed, without a broker.
 
 **Back-filling an autoincrement topic.** Importing rows with their old ids needs the `IMPORT` grant
 ([ql.md](ql.md#autoincrement)), which nothing else implies:
