@@ -298,3 +298,74 @@ TEST(CheckedWritesAdminViewDdl, AlterViewKeepsTheObjectId) {
     EXPECT_EQ(compiledOf(e).viewObjectId, objectId);
     EXPECT_EQ(e.objectId, objectId);
 }
+
+TEST(CheckedWritesAdminViewDdlRegression, CompiledPlanNeedingTheLevelIsGatedRegression) {
+    CatalogDdlRig rig("cwavg");
+    atLevel(rig, kCheckedWrites - 1);
+    ASSERT_EQ(define(rig, "session", "name", sessionDescriptor()).code, kOk);
+    const auto metric = rune::codec::DescriptorBuilder("metric", 1).add("id", PrimType::UInt64).add("level", PrimType::Int32).build();
+    ASSERT_EQ(define(rig, "metric", "id", metric).code, kOk);
+    const auto tick = rune::codec::DescriptorBuilder("tick", 1).add("tickId", PrimType::UInt32).add("userId", PrimType::UInt64).build();
+    ASSERT_EQ(define(rig, "tick", "tickId", tick).code, kOk);
+
+    // v1 shapes that compile Keyed: a string source key, and an aggregate grouped by an Int32 column.
+    rv::ViewPlan byName;
+    byName.viewName = "by_name";
+    byName.key = "name";
+    byName.sources = {{topicIdOf(rig, "session"), "name"}};
+    byName.output = {replaceOf(sessionDescriptor(), "name"), replaceOf(sessionDescriptor(), "score")};
+    rv::ViewPlan byLevel;
+    byLevel.viewName = "by_level";
+    byLevel.key = "level";
+    byLevel.sources = {{topicIdOf(rig, "metric"), "level"}};
+    byLevel.output = {replaceOf(metric, "level"), {"n", PrimType::Int64, 0, "", rv::MergeRule::CountAll}};
+    // A v1 aggregate over a 4-byte source key: an old broker would drop every record.
+    rv::ViewPlan perUser;
+    perUser.viewName = "per_user";
+    perUser.key = "userId";
+    perUser.sources = {{topicIdOf(rig, "tick"), "userId"}};
+    perUser.output = {replaceOf(tick, "userId"), {"n", PrimType::Int64, 0, "", rv::MergeRule::CountAll}};
+    for (const rv::ViewPlan* p : {&byName, &byLevel, &perUser}) {
+        const auto a = createView(rig, *p, p->key);
+        EXPECT_EQ(a.code, codeOf(ErrorCode::InvalidRequest)) << p->viewName << ": " << a.detail;
+        EXPECT_EQ(a.detail, "plan v2 needs the checked-writes feature level") << p->viewName;
+    }
+
+    atLevel(rig);
+    const auto ok = createView(rig, byName, "name");
+    EXPECT_EQ(ok.code, kOk) << ok.detail;
+}
+
+TEST(CheckedWritesAdminViewDdlRegression, SourceKeyFieldMustBeTheTopicKeyRegression) {
+    CatalogDdlRig rig("cwavw");
+    atLevel(rig);
+    ASSERT_EQ(define(rig, "character", "characterId", characterDescriptor()).code, kOk);
+    const auto keyedDevice = rune::codec::DescriptorBuilder("device", 1)
+        .add("userId", PrimType::UInt64, 1, true).addFixedStr("deviceFp", 32).add("platform", PrimType::Enum).add("lastSeen", PrimType::Int64).build();
+    ASSERT_EQ(define(rig, "device", "userId", keyedDevice).code, kOk);
+
+    // A composite view that names another column as the source key.
+    auto composite = accountCharacters(rig);
+    composite.sources[0].keyField = "userId";
+    const auto a = createView(rig, composite);
+    EXPECT_EQ(a.code, codeOf(ErrorCode::ViewKeyInvalid)) << a.detail;
+    EXPECT_NE(a.detail.find("characterId"), std::string::npos) << a.detail;
+
+    // A keyed aggregate.
+    rv::ViewPlan grouped;
+    grouped.viewName = "by_platform";
+    grouped.sources = {{topicIdOf(rig, "device"), "platform"}};
+    grouped.keyComponents = grouped.groupBy = {{"platform", 0, "platform"}};
+    grouped.output = {{"n", PrimType::Int64, 0, "", rv::MergeRule::CountAll}};
+    const auto c = createView(rig, grouped, "platform");
+    EXPECT_EQ(c.code, codeOf(ErrorCode::ViewKeyInvalid)) << c.detail;
+    grouped.sources[0].keyField = "userId";
+    const auto d = createView(rig, grouped, "platform");
+    EXPECT_EQ(d.code, kOk) << d.detail;
+
+    // A plan that compiles to the legacy shape keeps the answer it always had.
+    auto legacy = projection(rig, "character", characterDescriptor(), "userId", {}, {"userId", "name"}, "legacy_user");
+    legacy.key = "userId";
+    const auto e = createView(rig, legacy, "userId");
+    EXPECT_EQ(e.code, kOk) << e.detail;
+}

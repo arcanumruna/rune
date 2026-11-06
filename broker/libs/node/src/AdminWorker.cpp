@@ -1610,6 +1610,7 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
     // registry the applier projects).
     std::vector<const rune::codec::Descriptor*> srcDescs;
     std::vector<std::string> sourceNames;
+    std::string sourceKeyField;   // the first source topic's real key field
     srcDescs.reserve(authored->sources.size());
     for (const auto& src : authored->sources) {
         // B9 / D3b: a view's output carries no change events — a view over it
@@ -1635,9 +1636,20 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
         // Checked writes Part 10 (spec 9a): any view may read a transient topic (a keyless source is refused above, spec 4).
         srcDescs.push_back(&e->descriptor);
         sourceNames.push_back(t->name);
+        if (sourceNames.size() == 1) sourceKeyField = t->schema->keyField;
     }
-    if (rv::needsV2(*authored) && clusterFeatureLevel_ < rune::replication::MetadataFeature::kCheckedWrites)
-        return Rejected(reject(kInvalidRequest, "plan v2 needs the checked-writes feature level"));
+    // The plan classifies the view (key mode, owner mapping, identity rule, fold key width) by sources[0].keyField, so
+    // a plan that needs the wide key machinery must name the topic's real key.  A plan that compiles as it always did keeps
+    // its answer.
+    const auto wrongKeyField = [&]() {
+        return Rejected(reject(kViewKeyInvalid, "source key field '" + authored->sources[0].keyField + "' is not the key of '" +
+                                                    sourceNames[0] + "' ('" + sourceKeyField + "')"));
+    };
+    const bool atLevel = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kCheckedWrites;
+    if (rv::needsV2(*authored)) {
+        if (!atLevel) return Rejected(reject(kInvalidRequest, "plan v2 needs the checked-writes feature level"));
+        if (authored->sources[0].keyField != sourceKeyField) return wrongKeyField();
+    }
     // TODO(checked writes Part 09): unique and check constraints.
     if (authored->unique) return Rejected(reject(kViewUniqueInvalid, "unique views are not available yet"));
     if (!authored->constraints.empty()) return Rejected(reject(kViewConstraintInvalid, "check constraints are not available yet"));
@@ -1659,6 +1671,13 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
         std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return Rejected(reject(lc.find("key") != std::string::npos ? kViewKeyInvalid : kViewFieldUnresolved));
     }
+    // An old broker cannot host what the authored plan hid: a Keyed or v2 compiled plan, or an aggregate over a source key that is
+    // not 8 bytes (its fold drops every record).
+    const rune::codec::FieldDescriptor* sourceKey = srcDescs[0]->find(sourceKeyField);
+    if (!atLevel && (rv::keyModeOf(compiled->plan) == rv::ViewKeyMode::Keyed || rv::needsV2(compiled->plan) ||
+                     (rv::isAggregateView(compiled->plan) && sourceKey != nullptr && rune::codec::fixedSize(sourceKey->type) != 8)))
+        return Rejected(reject(kInvalidRequest, "plan v2 needs the checked-writes feature level"));
+    if (rv::keyModeOf(compiled->plan) == rv::ViewKeyMode::Keyed && authored->sources[0].keyField != sourceKeyField) return wrongKeyField();
     // Phase 2a co-partitioning: an aggregate view over a multi-partition source is refused.
     const cat::TopicObject* first = s.topicByTopicId(authored->sources[0].topicId);
     if (rv::isAggregateView(compiled->plan) && first->partitions > 1) return Rejected(reject(kViewNotCoPartitioned));
