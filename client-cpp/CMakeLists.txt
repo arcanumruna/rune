@@ -767,6 +767,21 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         endif()
     endif()
 
+    # meadow_view_bench.cpp includes the meadow_*.gen.h headers `rune schema generate` writes from the broker's stored
+    # schemas (-DMEADOW_GEN_DIR=<dir>).
+    set(MEADOW_GEN_DIR "" CACHE PATH "Directory holding meadow_positions/meadow_gold/meadow_characters .gen.h for meadow_view_bench")
+    if(MEADOW_GEN_DIR)
+        add_executable(meadow_view_bench examples/meadow_view_bench.cpp)
+        target_include_directories(meadow_view_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE} "${MEADOW_GEN_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+        target_link_libraries(meadow_view_bench PRIVATE rune_client_api rune_client_producer rune_codec)
+        if(UNIX AND NOT APPLE)
+            find_library(UUID_LIB_MEADOW_BENCH uuid)
+            if(UUID_LIB_MEADOW_BENCH)
+                target_link_libraries(meadow_view_bench PRIVATE ${UUID_LIB_MEADOW_BENCH})
+            endif()
+        endif()
+    endif()
+
     # ── Phase 2c Task 17 — subscription-filter probe (docker/filter-e2e.sh) ──
     #
     # filter_probe.cpp includes the build-time generated player_event.gen.h (rune::gen::PlayerEvent with its Filter,
