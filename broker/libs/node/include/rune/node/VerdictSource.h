@@ -41,6 +41,15 @@ void applyKeyIndex(KeyIndexFold&, const rune::view::SourceRecord&, const rune::v
 /// foldBatch's contract (batch, bound, cursor, corrupt tail) over the accepted records: nothing is judged.
 rune::view::FoldStats foldKeyIndexBatch(KeyIndexFold&, const rune::storage::LogReadView&, int64_t bound, int64_t& cursor,
                                         const rune::view::FoldSkip&) noexcept;
+/// What a unique or check member is evaluated against: its plan, row layout and current table.
+struct ConstraintFold {
+    const rune::view::CompiledViewPlan& plan;
+    const rune::view::RowLayout&        layout;
+    const rune::view::ViewTable&        table;
+};
+/// P9-2..P9-4 over the member's prepared prospect: a tombstone passes; a key owned by another source key is ordinal 0; then each
+/// check, in ordinal order, that is False on a row its record changed.
+[[nodiscard]] rune::view::Verdict evaluateConstraints(const ConstraintFold&, const rune::view::SourceRecord&, const rune::view::Prospect&) noexcept;
 [[nodiscard]] rune::view::CompiledViewPlan keyIndexPlan(int32_t srcTopicId, uint16_t keyFieldId);   // cold
 [[nodiscard]] rune::view::RowLayout keyIndexRowLayout();                                           // rowLen 1
 

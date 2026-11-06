@@ -456,3 +456,49 @@ TEST(CheckedWritesViewSetRegression, FixedSeedHookReachesEveryAggregateTableRegr
     EXPECT_EQ(inst->agg->blocks->hashSeedForTest(), 7u);
     EXPECT_EQ(inst->agg->groupIds->hashSeedForTest(), 7u);
 }
+
+TEST(CheckedWritesViewSet, ConstrainedTemplatesCarryKindObjectIdAndFingerprint) {
+    KeyedRig r;
+    auto uniq = namedCharacters(r.src);
+    uniq.plan.unique       = true;
+    uniq.plan.viewObjectId = 7;
+    auto chk = accountCharacters(r.src);
+    chk.plan.viewTopicId  = kViewTopic + 1;
+    chk.plan.viewObjectId = 8;
+    chk.plan.constraints  = {{1, "c", {}}};
+    auto plain = accountCharacters(r.src);
+    plain.plan.viewTopicId = kViewTopic + 2;
+
+    const auto install = [&](const rune::view::CompileResult& c) {
+        rune::node::ViewPlanUpdateMsg m;
+        m.viewTopicId = c.plan.viewTopicId;
+        m.planBlob    = rune::view::serialize(c.plan);
+        m.outDescBlob = rune::codec::serialize(c.outputDescriptor);
+        m.srcDescBlob = rune::codec::serialize(r.src);
+        EXPECT_TRUE(rune::node::encodeViewPlanUpdate(r.ch.install, rune::node::ViewSnapshotChannel::kInstallMsgType, m));
+        (void)r.vs.drainInstalls();
+        return m.planBlob;
+    };
+    const auto uniqBlob = install(uniq);
+    const auto chkBlob  = install(chk);
+    (void)install(plain);
+    ASSERT_EQ(r.vs.viewCount(), 3u);
+
+    const auto u = r.vs.verdictIdentityForTest(uniq.plan.viewTopicId);
+    ASSERT_TRUE(u.has_value());
+    EXPECT_EQ(u->kind, VerdictViewKind::Unique);
+    EXPECT_EQ(u->objectId, 7u);
+    EXPECT_EQ(u->fingerprint, verdictPlanFingerprint(uniqBlob));
+    const auto c = r.vs.verdictIdentityForTest(chk.plan.viewTopicId);
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->kind, VerdictViewKind::Check);
+    EXPECT_EQ(c->objectId, 8u);
+    EXPECT_EQ(c->fingerprint, verdictPlanFingerprint(chkBlob));
+    EXPECT_FALSE(r.vs.verdictIdentityForTest(plain.plan.viewTopicId).has_value());
+
+    uniq.plan.viewTopicId = kViewTopic + 3;
+    (void)install(uniq);
+    const auto replaced = r.vs.verdictIdentityForTest(kViewTopic + 3);
+    ASSERT_TRUE(replaced.has_value());
+    EXPECT_NE(replaced->fingerprint, u->fingerprint);
+}

@@ -76,6 +76,14 @@ public:
         return it == views_.end() ? nullptr : &it->second;
     }
 
+    struct VerdictIdentity { rune::view::VerdictViewKind kind; uint64_t objectId; uint64_t fingerprint; };
+    /// Test seam: how the installed view joins a judge's constraint set; nullopt for a view no judge drives.
+    [[nodiscard]] std::optional<VerdictIdentity> verdictIdentityForTest(int32_t viewTopicId) const {
+        const auto it = templates_.find(viewTopicId);
+        if (it == templates_.end() || !it->second.isVerdict) return std::nullopt;
+        return VerdictIdentity{it->second.verdictKind, it->second.verdictObjectId, it->second.verdictFingerprint};
+    }
+
     // Register a view's plan/layout/source-descriptor/persistence and index it
     // in the reactor `subscriptionIndex_` for each of the plan's source topics.
     // Per-partition ViewInstances are created LAZILY on the first driveFolds
@@ -522,6 +530,7 @@ private:
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
         std::size_t m = inst.table.memoryBytes();
         if (inst.owners) m += inst.owners->memoryBytes();
+        if (inst.claims) m += inst.claims->indexTable().memoryBytes() + inst.claims->extrasTable().memoryBytes();
         if (inst.agg) {
             m += inst.agg->contributors.memoryBytes() + inst.agg->groups.memoryBytes();
             if (inst.agg->blocks) m += inst.agg->blocks->memoryBytes();
@@ -610,6 +619,7 @@ public:
         };
         std::size_t n = pending(inst.table);
         if (inst.owners) n += pending(*inst.owners);
+        if (inst.claims) n += pending(inst.claims->indexTable()) + pending(inst.claims->extrasTable());
         if (inst.agg) {
             n += pending(inst.agg->contributors) + pending(inst.agg->groups);
             if (inst.agg->blocks) n += pending(*inst.agg->blocks);
@@ -857,6 +867,8 @@ private:
         inst.counters.skippedNoKey     += st.skippedNoKey;
         inst.counters.keyConflicts     += st.keyConflicts;
         inst.counters.ownerMoves       += st.ownerMoves;
+        inst.counters.uniquePromotions += st.uniquePromotions;
+        if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
 
         // Bug A: this pass's OWN fold may be what just caught the instance up
         // to `bound` — flip it here too (see 1b's doc comment for why this
@@ -896,12 +908,10 @@ private:
     static rune::view::FoldStats foldKeyed_(ViewInstance& inst, const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
                                             const rune::view::FoldSkip& skip) {
         if (inst.agg) {
-            rune::view::AggregateFold f{inst.plan, inst.layout, inst.agg->layout, inst.vdc, inst.table, inst.agg->contributors, inst.agg->groups,
-                                        inst.agg->blocksOrNull(), &*inst.keyed, &*inst.agg->groupIds, &inst.agg->nextGroupId};
+            rune::view::AggregateFold f = aggregateFoldOf(inst);
             return rune::view::foldKeyedAggregateBatch(f, inst.prospect, view, bound, cursor, skip);
         }
-        rune::view::ProjectionFold f{inst.plan, inst.layout, inst.vdc, inst.table, rune::view::viewKeyType(inst.plan), &*inst.keyed,
-                                     inst.owners ? &*inst.owners : nullptr};
+        rune::view::ProjectionFold f = projectionFoldOf(inst);
         return rune::view::foldProjectionBatch(f, inst.prospect, view, bound, cursor, skip);
     }
 
@@ -915,6 +925,10 @@ private:
         inst.table.drainDirtyKeyed(dropKeyed);   // also a key index: its table is as wide as the wire key
         if (inst.keyed) {
             if (inst.owners) inst.owners->drainDirtyKeyed(dropKeyed);
+            if (inst.claims) {
+                inst.claims->indexTable().drainDirtyKeyed(dropKeyed);
+                inst.claims->extrasTable().drainDirtyKeyed(dropKeyed);
+            }
             if (inst.agg) {
                 inst.agg->contributors.drainDirtyKeyed(dropKeyed);
                 inst.agg->groups.drainDirtyKeyed(dropKeyed);

@@ -81,15 +81,12 @@ RecoveredCheckpoint readCheckpointFile(const std::string& dir, int32_t viewTopic
 
 const char* checkpointFormat(const ViewInstance& inst) noexcept { return inst.keyed ? "v3" : inst.agg ? "v2" : "v1"; }
 
-// The owner map of a keyed projection: wire key -> the view key of its current row (a row of keyWidth bytes).
-void buildKeyedTables(ViewInstance& inst, std::size_t indexSlots, std::size_t chunkBytes) {
-    if (inst.keyed->ownerMapped) {
-        rune::view::RowLayout ownerRow;
-        ownerRow.rowLen = inst.keyed->keyWidth;
-        inst.owners.emplace(std::move(ownerRow), indexSlots, chunkBytes,
-                            rune::view::ViewTableKeys{inst.keyed->wireKeyWidth, 0, inst.tableKeys.hashSeed, inst.tableKeys.hashMaskForTest});
-    }
-    inst.prospect.reserve(inst.layout, inst.agg ? &inst.agg->layout : nullptr);
+// The row lengths of UniqueClaims' two tables (UniqueClaims.h): index [owner W][extraCount u32][head W][flags u8] and
+// extras [N K][prev W][next W][links u8][image].
+struct ClaimsRowLens { uint32_t index, extras; };
+ClaimsRowLens claimsRowLensOf(const ViewInstance& inst) noexcept {
+    const uint32_t K = inst.keyed->keyWidth, W = inst.keyed->wireKeyWidth;
+    return {2 * W + 5, K + 2 * W + 1 + inst.layout.rowLen};
 }
 
 // Replays checkpoint records into one instance: v1 into the output table for a
@@ -105,9 +102,9 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
                        std::span<const std::span<const uint8_t>> deltas,
                        std::size_t& appliedOut) {
     appliedOut = 0;
-    rune::view::ViewTable* tables[6] = {};
-    uint32_t lens[6];
-    uint8_t keyLens[6];
+    rune::view::ViewTable* tables[8] = {};
+    uint32_t lens[8] = {};
+    uint8_t keyLens[8] = {};
     std::size_t nTables = 0;
     if (inst.keyed && inst.agg) {
         using namespace rune::view;
@@ -135,6 +132,16 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
             lens[rune::view::kKeyedTableOwners]    = inst.keyed->keyWidth;
             keyLens[rune::view::kKeyedTableOwners] = inst.keyed->wireKeyWidth;
             nTables = 2;
+        }
+        if (inst.claims) {
+            tables[rune::view::kKeyedTableUniqueIndex]  = &inst.claims->indexTable();
+            tables[rune::view::kKeyedTableUniqueExtras] = &inst.claims->extrasTable();
+            const ClaimsRowLens c = claimsRowLensOf(inst);
+            lens[rune::view::kKeyedTableUniqueIndex]  = c.index;
+            lens[rune::view::kKeyedTableUniqueExtras] = c.extras;
+            keyLens[rune::view::kKeyedTableUniqueIndex]  = static_cast<uint8_t>(inst.keyed->keyWidth);
+            keyLens[rune::view::kKeyedTableUniqueExtras] = inst.keyed->wireKeyWidth;
+            nTables = 8;
         }
     } else if (inst.agg) {
         tables[rune::view::kAggTableView]         = &inst.table;
@@ -192,6 +199,10 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
         ++appliedOut;
     }
     gidsDone();
+    if (inst.claims) {
+        inst.claims->recountAfterReplay();
+        inst.counters.uniqueConflicts = inst.claims->extras();
+    }
     return last;
 }
 
@@ -227,10 +238,15 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
                     b.viewRows * (wide + inst.layout.rowLen) + b.blockRows * (aux + a.blockRow.rowLen) + b.groupIdRows * (wide + 8);
     } else if (inst.keyed) {
         const KeyedFoldSpec& k = *inst.keyed;
-        fixed += kCheckpointV3HeaderBytes + (k.ownerMapped ? 2 : 1) * kCheckpointV3TableHeaderBytes;
+        fixed += kCheckpointV3HeaderBytes + (inst.claims ? 4 : k.ownerMapped ? 2 : 1) * kCheckpointV3TableHeaderBytes;
         // A move: the old row's delete, the new row's upsert and, with an owner map, the owner's upsert.
         perRecord = checkpointV3EntryHeaderBytes(static_cast<uint8_t>(k.keyWidth)) * 2 + inst.layout.rowLen;
         if (k.ownerMapped) perRecord += checkpointV3EntryHeaderBytes(k.wireKeyWidth) + k.keyWidth;
+        // Claims: a move touches two index entries and two extras.
+        if (inst.claims) {
+            const ClaimsRowLens c = claimsRowLensOf(inst);
+            perRecord += 2 * (checkpointV3EntryHeaderBytes(static_cast<uint8_t>(k.keyWidth)) + c.index) + 2 * (checkpointV3EntryHeaderBytes(k.wireKeyWidth) + c.extras);
+        }
     } else if (inst.agg) {
         const AggLayout& a = inst.agg->layout;
         const std::size_t nTables = a.numBlockCols > 0 ? 4 : 3;
@@ -370,8 +386,18 @@ int WorkerViewSet::drainInstalls() {
                 return;
             }
             const int32_t viewTopicId = plan->viewTopicId;
+            const std::optional<rune::view::VerdictViewKind> kind = rune::view::verdictKindOf(*plan);
+            const uint64_t objectId = plan->viewObjectId;
             installView(std::move(*plan), std::move(layout), std::move(srcDesc),
                         /*persisted=*/m.persistence == 0, /*underRecovery=*/m.recovery);
+            if (kind) {   // a unique or check view: its source's judge drives it
+                ViewTemplate& tpl = templates_.at(viewTopicId);
+                ++verdictEpoch_;
+                tpl.isVerdict = true;
+                tpl.verdictKind = *kind;
+                tpl.verdictObjectId = objectId;
+                tpl.verdictFingerprint = rune::view::verdictPlanFingerprint(m.planBlob);
+            }
             // Task 19b: a RESTART-recovery install registers the template here
             // but defers the per-(view, partition) instance to
             // materializeRecoveryInstancesFor (checkpoint load + serve-guard),
@@ -940,7 +966,7 @@ int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
     };
     // The record's tables in id order: the view, then the owner map (a projection) or contributors, groups, blocks and groupIds.
     struct Part { rune::view::ViewTable* table; uint8_t id; uint8_t keyLen; uint32_t rowLen; };
-    Part parts[5];
+    Part parts[7];
     std::size_t nParts = 0;
     const rune::view::KeyedFoldSpec& k = *inst.keyed;
     if (inst.agg) {
@@ -954,8 +980,13 @@ int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
     } else {
         parts[nParts++] = {&inst.table, rune::view::kKeyedTableView, static_cast<uint8_t>(k.keyWidth), inst.layout.rowLen};
         if (inst.owners) parts[nParts++] = {&*inst.owners, rune::view::kKeyedTableOwners, k.wireKeyWidth, k.keyWidth};
+        if (inst.claims) {   // in the same record as tables 0 and 1: a recovery never sees the rows without their claims
+            const ClaimsRowLens c = claimsRowLensOf(inst);
+            parts[nParts++] = {&inst.claims->indexTable(), rune::view::kKeyedTableUniqueIndex, static_cast<uint8_t>(k.keyWidth), c.index};
+            parts[nParts++] = {&inst.claims->extrasTable(), rune::view::kKeyedTableUniqueExtras, k.wireKeyWidth, c.extras};
+        }
     }
-    std::size_t b[6] = {};
+    std::size_t b[8] = {};
     for (std::size_t t = 0; t < nParts; ++t) {
         drainInto(*parts[t].table, parts[t].rowLen);
         b[t + 1] = keyedEntries_.size();
@@ -970,7 +1001,7 @@ int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
             if (rowOffsets_[i] != SIZE_MAX) keyedEntries_[i].row = rowScratch_.data() + rowOffsets_[i];
         }
     }
-    rune::view::KeyedTableDelta tds[5];
+    rune::view::KeyedTableDelta tds[7];
     for (std::size_t t = 0; t < nParts; ++t) {
         tds[t] = {parts[t].id, parts[t].keyLen, parts[t].rowLen, std::span<const rune::view::KeyedDirtyEntry>(keyedEntries_.data() + b[t], b[t + 1] - b[t])};
     }
@@ -1182,7 +1213,8 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
         if (!tpl.isVerdict || tpl.retiring || judge->hasView(id)) continue;
         ViewInstance* inst = getOrCreate_(id, partition, INT64_MAX);
         if (inst == nullptr) continue;
-        judge->installTestVerdictViewForTest(inst, tpl.verdictObjectId, tpl.testRule);
+        if (tpl.verdictKind == rune::view::VerdictViewKind::TestReject) judge->installTestVerdictViewForTest(inst, tpl.verdictObjectId, tpl.testRule);
+        else judge->addVerdictView(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint);
     }
     return judge;
 }

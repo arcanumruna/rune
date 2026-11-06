@@ -39,6 +39,8 @@ public:
 
     ViewTable& indexTable() noexcept { return index_; }     // checkpoint v3 table 6
     ViewTable& extrasTable() noexcept { return extrasTable_; }   // checkpoint v3 table 7
+    [[nodiscard]] const ViewTable& indexTable() const noexcept { return index_; }
+    [[nodiscard]] const ViewTable& extrasTable() const noexcept { return extrasTable_; }
     void recountAfterReplay() noexcept { extras_ = extrasTable_.size(); }   // cold
 
 private:

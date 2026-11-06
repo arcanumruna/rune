@@ -281,6 +281,34 @@ struct ViewInstance {
           persisted(persist) {}
 };
 
+/// The tables a keyed instance adds to its view table (also a discard's rebuild): the owner map of an owner-mapped projection, the
+/// claims of a unique one, and the prospect its fold prepares each record into.
+inline void buildKeyedTables(ViewInstance& inst, std::size_t indexSlots, std::size_t chunkBytes) {
+    const rune::view::KeyedFoldSpec& k = *inst.keyed;
+    if (k.ownerMapped) {
+        rune::view::RowLayout ownerRow;
+        ownerRow.rowLen = k.keyWidth;
+        inst.owners.emplace(std::move(ownerRow), indexSlots, chunkBytes,
+                            rune::view::ViewTableKeys{k.wireKeyWidth, 0, inst.tableKeys.hashSeed, inst.tableKeys.hashMaskForTest});
+        if (inst.plan.unique) {
+            const auto key = std::find_if(inst.evolvingSrc.fields.begin(), inst.evolvingSrc.fields.end(), [&](const auto& f) { return f.id == inst.plan.keyFieldId[0]; });
+            inst.claims.emplace(k.keyWidth, k.wireKeyWidth, inst.layout.rowLen, key->type, inst.tableKeys.hashSeed, indexSlots, chunkBytes);
+        }
+    }
+    inst.prospect.reserve(inst.layout, inst.agg ? &inst.agg->layout : nullptr);
+}
+
+/// The instance's fold inputs: a keyed instance adds its spec, owner map and claims, or its group ids.
+[[nodiscard]] inline rune::view::ProjectionFold projectionFoldOf(ViewInstance& i) noexcept {
+    return {i.plan, i.layout, i.vdc, i.table, rune::view::viewKeyType(i.plan), i.keyed ? &*i.keyed : nullptr,
+            i.owners ? &*i.owners : nullptr, i.claims ? &*i.claims : nullptr};
+}
+[[nodiscard]] inline rune::view::AggregateFold aggregateFoldOf(ViewInstance& i) noexcept {
+    AggInstance& a = *i.agg;
+    return {i.plan, i.layout, a.layout, i.vdc, i.table, a.contributors, a.groups, a.blocksOrNull(),
+            i.keyed ? &*i.keyed : nullptr, i.keyed ? &*a.groupIds : nullptr, i.keyed ? &a.nextGroupId : nullptr};
+}
+
 /// True while the instance's checkpoint file and tables agree (no discard in flight).  An index compare.
 [[nodiscard]] inline bool checkpointSettled(const ViewInstance& i) noexcept { return i.checkpoint.index() == 0; }
 

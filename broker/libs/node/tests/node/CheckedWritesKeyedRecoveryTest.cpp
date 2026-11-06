@@ -384,3 +384,117 @@ TEST(CheckedWritesKeyedRecoveryRegression, KeyedAggregateRestartEqualsRefoldRegr
     fresh.foldAll(w.log);
     expectSameView(*fresh.vs.instanceForTest(kViewTopic, 0), *rec.instanceForTest(kViewTopic, 0));
 }
+
+namespace {
+
+std::vector<uint8_t> bytesAt(const rune::view::ViewTable& t, const rune::view::ViewKey& k, size_t len) {
+    const uint8_t* p = t.get(k);
+    return p == nullptr ? std::vector<uint8_t>{} : std::vector<uint8_t>(p, p + len);
+}
+
+constexpr int kUniqueNames = 30;
+constexpr uint64_t kUniqueIds = 200;
+
+std::string uniqueName(int i, bool upper) { return (upper ? "N" : "n") + std::to_string(i); }
+
+// Tables 0, 1, 6 and 7 of two unique instances hold the same bytes (probed over every name and id that can exist).
+void expectSameClaims(const rune::node::ViewInstance& a, const rune::node::ViewInstance& b) {
+    ASSERT_TRUE(a.claims && b.claims);
+    const size_t K = a.keyed->keyWidth;
+    const size_t W = a.keyed->wireKeyWidth;
+    EXPECT_EQ(a.table.size(), b.table.size());
+    EXPECT_EQ(a.owners->size(), b.owners->size());
+    EXPECT_EQ(a.claims->indexTable().size(), b.claims->indexTable().size());
+    EXPECT_EQ(a.claims->extrasTable().size(), b.claims->extrasTable().size());
+    EXPECT_EQ(a.claims->extras(), b.claims->extras());
+    for (int i = 0; i < kUniqueNames; ++i) {
+        std::vector<uint8_t> n(K, 0);
+        const std::string name = uniqueName(i, false);
+        std::copy(name.begin(), name.end(), n.begin());
+        const auto nk = rune::view::ViewKey::fromBytes(n);
+        EXPECT_EQ(bytesAt(a.table, nk, a.layout.rowLen), bytesAt(b.table, nk, b.layout.rowLen)) << name;
+        EXPECT_EQ(bytesAt(a.claims->indexTable(), nk, 2 * W + 5), bytesAt(b.claims->indexTable(), nk, 2 * W + 5)) << name;
+    }
+    for (uint64_t id = 1; id <= kUniqueIds; ++id) {
+        const std::string wire = wireKey(id);
+        const auto wk = rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(wire.data()), wire.size()});
+        EXPECT_EQ(bytesAt(*a.owners, wk, K), bytesAt(*b.owners, wk, K)) << id;
+        EXPECT_EQ(bytesAt(a.claims->extrasTable(), wk, K + 2 * W + 1 + a.layout.rowLen),
+                  bytesAt(b.claims->extrasTable(), wk, K + 2 * W + 1 + b.layout.rowLen)) << id;
+    }
+}
+
+rune::view::CompileResult uniqueNames() {
+    const auto d = characterSource();
+    rune::view::ViewPlan v;
+    v.viewName       = "unique_names";
+    v.sources        = {{kSrcTopic, "characterId"}};
+    v.unique         = true;
+    v.unicodeVersion = rune::codec::kUnicodeVersion;
+    v.keyComponents  = {{"name", 1, "nameKey"}};
+    v.output.push_back({"gender", d.find("gender")->type, 0, "gender", rune::view::MergeRule::Replace});
+    const rune::codec::Descriptor* srcs[] = {&d};
+    auto r = rune::view::compileView(v, srcs, kViewTopic);
+    if (!r) throw std::runtime_error(r.error().message);
+    return std::move(*r);
+}
+
+}  // namespace
+
+TEST(CheckedWritesKeyedRecoveryRegression, UniqueClaimsSurviveRestartRegression) {
+    Writer w(uniqueNames(), "unique", 12345);
+    std::mt19937 rng(7);
+    std::vector<std::vector<Rec>> batches;
+    for (int batch = 0; batch < 10; ++batch) {
+        std::vector<Rec> recs;
+        for (int i = 0; i < 100; ++i) {
+            Rec r;
+            r.characterId = 1 + rng() % kUniqueIds;
+            r.userId      = 1 + rng() % 5;
+            r.name        = uniqueName(static_cast<int>(rng() % kUniqueNames), rng() % 2 == 0);
+            r.gender      = static_cast<uint16_t>(rng() % 4);
+            r.tombstone   = rng() % 100 < 15;
+            recs.push_back(r);
+        }
+        w.log.append(recs);
+        w.foldAll();
+        batches.push_back(std::move(recs));
+    }
+    w.writeFile();
+    const auto* wi = w.vs.instanceForTest(kViewTopic, 0);
+    ASSERT_NE(wi, nullptr);
+    ASSERT_TRUE(wi->claims.has_value());
+    ASSERT_GT(wi->counters.uniqueConflicts, 0u);
+
+    Recovered r(w, 99);
+    const auto* ri = r.vs.instanceForTest(kViewTopic, 0);
+    ASSERT_NE(ri, nullptr);
+    expectSameClaims(*wi, *ri);
+    EXPECT_EQ(ri->counters.uniqueConflicts, wi->counters.uniqueConflicts);
+
+    // The owner of a name that has extras leaves after the restart: the same extra takes over as in a fresh refold of the whole log.
+    uint64_t leaver = 0;
+    for (int i = 0; i < kUniqueNames && leaver == 0; ++i) {
+        std::vector<uint8_t> n(wi->keyed->keyWidth, 0);
+        const std::string name = uniqueName(i, false);
+        std::copy(name.begin(), name.end(), n.begin());
+        const auto nk = rune::view::ViewKey::fromBytes(n);
+        if (!wi->claims->hasExtras(nk)) continue;
+        const uint8_t* o = wi->claims->ownerOf(nk);
+        std::memcpy(&leaver, o, 8);
+    }
+    ASSERT_NE(leaver, 0u);
+    batches.push_back({Rec{leaver, 0, "", 0, true}});
+    w.log.append(batches.back());
+    auto& inst = const_cast<rune::node::ViewInstance&>(*ri);
+    auto fold = rune::node::projectionFoldOf(inst);
+    int64_t cursor = inst.foldCursor;
+    const auto st = rune::view::foldProjectionBatch(fold, inst.prospect, w.log.read(cursor, w.log.end()), w.log.end(), cursor, rune::view::kNoSkip);
+    EXPECT_EQ(st.uniquePromotions, 1u);
+    inst.counters.uniqueConflicts = inst.claims->extras();
+
+    Writer fresh(uniqueNames(), "unique-fresh", 5);
+    for (const auto& b : batches) fresh.log.append(b);
+    fresh.foldAll();
+    expectSameClaims(*fresh.vs.instanceForTest(kViewTopic, 0), inst);
+}

@@ -1,6 +1,7 @@
 #include <rune/node/VerdictSource.h>
 
 #include <rune/codec/Record.h>
+#include <rune/view/CheckEval.h>
 #include <rune/protocol/BatchRebuild.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
@@ -102,6 +103,22 @@ rune::view::FoldStats foldKeyIndexBatch(KeyIndexFold& f, const rune::storage::Lo
     }
     cursor = std::max(from, corrupt ? walkedUpto : std::min(view.nextOffset, bound));
     return stats;
+}
+
+Verdict evaluateConstraints(const ConstraintFold& f, const rune::view::SourceRecord& rec, const rune::view::Prospect& p) noexcept {
+    using rune::protocol::client::ErrorCode;
+    if (rec.value.empty()) return {};
+    const auto violation = [&](uint16_t ordinal) { return Verdict{static_cast<uint16_t>(ErrorCode::ConstraintViolation), rune::view::constraintIdOf(f.plan.viewObjectId, ordinal)}; };
+    if (f.plan.unique && p.rowCount > 0 && p.rows[0].ownedByOther) return violation(0);
+    for (const rune::view::CompiledConstraint& c : f.plan.constraints) {
+        for (std::size_t i = 0; i < p.rowCount; ++i) {
+            const rune::view::ProspectRow& row = p.rows[i];
+            if (row.removed || row.promoted) continue;
+            if (rune::view::evaluatePredicate(c.predicate, f.layout, row.image) != rune::view::PredicateResult::False) continue;
+            if (rune::view::predicateReadsChanged(c.predicate, f.layout, row.existed ? f.table.get(row.key) : nullptr, row.image)) return violation(c.ordinal);
+        }
+    }
+    return {};
 }
 
 rune::view::CompiledViewPlan keyIndexPlan(int32_t srcTopicId, uint16_t keyFieldId) {
@@ -309,10 +326,10 @@ rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::S
         return prepareKeyIndex(f, rec, m.prospect);
     }
     if (i.agg) {
-        rune::view::AggregateFold f{i.plan, i.layout, i.agg->layout, i.vdc, i.table, i.agg->contributors, i.agg->groups, i.agg->blocksOrNull()};
+        rune::view::AggregateFold f = aggregateFoldOf(i);
         return rune::view::prepareAggregate(f, rec, m.prospect);
     }
-    rune::view::ProjectionFold f{i.plan, i.layout, i.vdc, i.table, rune::view::viewKeyType(i.plan)};
+    rune::view::ProjectionFold f = projectionFoldOf(i);
     return rune::view::prepareProjection(f, rec, m.prospect);
 }
 
@@ -325,10 +342,10 @@ void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexc
         return;
     }
     if (i.agg) {
-        rune::view::AggregateFold f{i.plan, i.layout, i.agg->layout, i.vdc, i.table, i.agg->contributors, i.agg->groups, i.agg->blocksOrNull()};
+        rune::view::AggregateFold f = aggregateFoldOf(i);
         rune::view::applyAggregate(f, rec, m.prospect);
     } else {
-        rune::view::ProjectionFold f{i.plan, i.layout, i.vdc, i.table, rune::view::viewKeyType(i.plan)};
+        rune::view::ProjectionFold f = projectionFoldOf(i);
         rune::view::applyProjection(f, rec, m.prospect);
     }
     const rune::view::FoldStats& st = m.prospect.stats;
@@ -338,6 +355,9 @@ void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexc
     i.counters.aggNonFinite     += st.aggNonFinite;
     i.counters.aggInconsistent  += st.aggInconsistent;
     i.counters.aggRescans       += st.aggRescans;
+    i.counters.skippedNoKey     += st.skippedNoKey;
+    i.counters.ownerMoves       += st.ownerMoves;
+    i.counters.uniquePromotions += st.uniquePromotions;
 }
 
 // The key index is never checkpointed: nothing will encode its dirty rows, so they are dropped (WorkerViewSet::discardDirty_'s rule).
@@ -347,6 +367,8 @@ void VerdictSource::discardKeyIndexDirty_(ViewInstance& inst) noexcept {
 
 Verdict VerdictSource::verdictOf_(const Member& m, const rune::view::SourceRecord& rec) const noexcept {
     if (m.kind == rune::view::VerdictViewKind::KeyIndex) return evaluateIntent(rec, m.prospect);
+    if (m.kind == rune::view::VerdictViewKind::Unique || m.kind == rune::view::VerdictViewKind::Check)
+        return evaluateConstraints(ConstraintFold{m.inst->plan, m.inst->layout, m.inst->table}, rec, m.prospect);
     if (m.kind != rune::view::VerdictViewKind::TestReject || rec.value.empty()) return {};   // tombstones are never rejected
     const Verdict reject{static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation), rune::view::constraintIdOf(m.objectId, 1)};
     switch (m.rule.mode) {
@@ -422,10 +444,18 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
         discardKeyIndexDirty_(inst);
         return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedRejected);
     }
-    const rune::view::FoldStats st =
-        inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout, inst.vdc, inst.table, inst.agg->contributors,
-                                                  inst.agg->groups, inst.agg->blocksOrNull(), view, bound, cursor, skip)
-                 : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view, bound, cursor, skip);
+    rune::view::FoldStats st;
+    if (inst.keyed && inst.agg) {
+        rune::view::AggregateFold f = aggregateFoldOf(inst);
+        st = rune::view::foldKeyedAggregateBatch(f, inst.prospect, view, bound, cursor, skip);
+    } else if (inst.keyed) {
+        rune::view::ProjectionFold f = projectionFoldOf(inst);
+        st = rune::view::foldProjectionBatch(f, inst.prospect, view, bound, cursor, skip);
+    } else {
+        st = inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout, inst.vdc, inst.table, inst.agg->contributors,
+                                                       inst.agg->groups, inst.agg->blocksOrNull(), view, bound, cursor, skip)
+                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view, bound, cursor, skip);
+    }
     inst.foldCursor = cursor;
     inst.counters.skippedAborted   += st.skippedAborted;
     inst.counters.skippedMalformed += st.skippedMalformed;
@@ -434,7 +464,11 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
     inst.counters.aggNonFinite     += st.aggNonFinite;
     inst.counters.aggInconsistent  += st.aggInconsistent;
     inst.counters.aggRescans       += st.aggRescans;
-    return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedNoGroup + st.skippedRejected);
+    inst.counters.skippedNoKey     += st.skippedNoKey;
+    inst.counters.ownerMoves       += st.ownerMoves;
+    inst.counters.uniquePromotions += st.uniquePromotions;
+    if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
+    return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedNoGroup + st.skippedNoKey + st.skippedRejected);
 }
 
 int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t limit, const rune::view::AbortedTxnFilter& aborted) {
@@ -487,8 +521,10 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
         pos += static_cast<std::size_t>(r.totalLength());
     }
     for (const std::size_t i : active_) {
-        members_[i].inst->foldCursor = judgeCursor_;
-        if (members_[i].kind == rune::view::VerdictViewKind::KeyIndex) discardKeyIndexDirty_(*members_[i].inst);
+        ViewInstance& inst = *members_[i].inst;
+        inst.foldCursor = judgeCursor_;
+        if (members_[i].kind == rune::view::VerdictViewKind::KeyIndex) discardKeyIndexDirty_(inst);
+        if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
     }
     return work;
 }
