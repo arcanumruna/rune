@@ -628,7 +628,7 @@ BENCHMARK(BM_ViewFoldReplace)
 
 // Wide view keys (Part 07 §14): the BM_ViewFoldReplace event batches through keyed views.  Case "lower" is
 // (lower(name), characterId), "composite" is account_characters (userId, characterId); both are owner-mapped, so every
-// record also reads and writes the owner table.  About 10% of the records are renames of a live character (a Move for
+// record also reads and writes the owner table.  An update of a live character renames it 40% of the time (a Move for
 // `lower`, an in-place update for `composite`).  Gate: us_per_batch <= 10.
 namespace {
 constexpr uint64_t kKeyedUsers = 50'000;

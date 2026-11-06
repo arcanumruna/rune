@@ -327,6 +327,7 @@ TEST(CheckedWritesAllocRegression, SteadyStateAutoIncCreatesAllocateNothingRegre
 // reads.  The key space (240 characters, at most 8 under a user) is fully inserted and churned in the warm-up, so the tables and
 // prefix sets are at their steady size.
 TEST(CheckedWritesAllocRegression, KeyedFoldAndViewReadsAllocateNothingRegression) {
+    namespace pc = rune::protocol::client;
     constexpr int32_t kAccountView = cwkeyed::kViewTopic, kLowerView = cwkeyed::kViewTopic + 1;
     constexpr uint64_t kCharacters = 240, kUsers = 60;
     constexpr std::array<const char*, 8> kNames = {"Alice", "BOB", "carol", "DaVe", "\xC3\x84RGER", "eve", "Mallory", "TRENT"};
@@ -356,11 +357,17 @@ TEST(CheckedWritesAllocRegression, KeyedFoldAndViewReadsAllocateNothingRegressio
         const int64_t hw = r.srcRep.replica->highWatermark();
         return r.vs.foldCursorForTest(kAccountView, 0) >= hw && r.vs.foldCursorForTest(kLowerView, 0) >= hw;
     };
-    uint64_t answered = 0, rows = 0;
+    uint64_t answered = 0, rows = 0, notReady = 0, lowerAnswers = 0, lowerOk = 0;   // answered: ViewRowResult and ViewScanResult only
     const auto drain = [&] {
         r.w.drainReturnView([&](WorkerReturn&& ret) {
+            if (ret.type != WorkerReturn::Type::ViewRowResult && ret.type != WorkerReturn::Type::ViewScanResult) return;
             ++answered;
             if (ret.type == WorkerReturn::Type::ViewScanResult) rows += static_cast<uint64_t>(ret.recordCount);
+            if (ret.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kNotReady)) ++notReady;
+            if (ret.readTopicId == kLowerView) {
+                ++lowerAnswers;
+                lowerOk += ret.errorCode == 0 ? 1 : 0;
+            }
         });
     };
     const auto foldToEnd = [&] {
@@ -388,7 +395,9 @@ TEST(CheckedWritesAllocRegression, KeyedFoldAndViewReadsAllocateNothingRegressio
         }
         return plan;
     };
+    uint64_t posted = 0;
     const auto reads = [&](const std::vector<Read>& plan, int64_t minOffset = -1) {
+        posted += plan.size();
         for (std::size_t i = 0; i < plan.size(); ++i) {
             if (!rune::node::test::postViewRead(r.w, plan[i].type, plan[i].key, {}, plan[i].view, plan[i].limit, minOffset)) ADD_FAILURE() << "op ring full";
             if (i % 8 == 7 || i + 1 == plan.size()) {
@@ -411,9 +420,11 @@ TEST(CheckedWritesAllocRegression, KeyedFoldAndViewReadsAllocateNothingRegressio
         ASSERT_TRUE(foldToEnd());
     }
     reads(planReads(500));
-    ASSERT_GT(answered, 0u);
+    ASSERT_EQ(answered, posted);
 
-    const uint64_t answeredBefore = answered, rowsBefore = rows;
+    // The gate relies on the prefix-set pool being at its steady size class before the window opens (the warm-up above):
+    // a pool chunk is allocated only when a class free list runs dry, which is amortised growth, not a per-op allocation.
+    const uint64_t postedBefore = posted, rowsBefore = rows, lowerBefore = lowerAnswers, lowerOkBefore = lowerOk;
     uint64_t allocs = 0;
     const auto timed = [&](auto&& body) {
         rune::testing::AllocWindow w;
@@ -438,6 +449,7 @@ TEST(CheckedWritesAllocRegression, KeyedFoldAndViewReadsAllocateNothingRegressio
     timed([&] { reads(held, wanted); });
     EXPECT_EQ(r.w.heldViewReadsForTest(), 100u);
     const uint64_t heldAnswered = answered;
+    EXPECT_EQ(heldAnswered, postedBefore + 5000u) << "no held read has been answered yet";
     rune::node::test::appendRecords(*r.srcRep.replica, r.src, churn(1));
     timed([&] {
         EXPECT_TRUE(foldToEnd());
@@ -445,8 +457,10 @@ TEST(CheckedWritesAllocRegression, KeyedFoldAndViewReadsAllocateNothingRegressio
         drain();
     });
     EXPECT_EQ(r.w.heldViewReadsForTest(), 0u);
-    EXPECT_GE(answered - heldAnswered, 100u) << "every held read was released";
-    EXPECT_GE(answered - answeredBefore, 3100u);
+    EXPECT_EQ(answered - heldAnswered, 100u) << "every held read was answered exactly once";
+    EXPECT_EQ(answered, posted) << "one answer per read";
+    EXPECT_EQ(notReady, 0u) << "no held read expired";
+    EXPECT_GT((lowerOk - lowerOkBefore) * 20, lowerAnswers - lowerBefore) << "at least 5% of the lower-view reads hit a row";
     EXPECT_GT(rows - rowsBefore, 0u) << "the scans returned rows";
     EXPECT_EQ(allocs, 0u);
 }

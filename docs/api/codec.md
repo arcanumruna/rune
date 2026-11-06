@@ -200,7 +200,7 @@ keys with them, so a key built by a client is byte-identical to the broker's.
 
 ### Authored plan v2
 
-The authored plan ([`ViewPlan.h`](../../broker/libs/view/include/rune/view/ViewPlan.h), what `CreateView` carries as `planBlob`) has
+The authored plan ([`ViewPlanAuthored.h`](../../codec/include/rune/codec/ViewPlanAuthored.h), what `CreateView` carries as `planBlob`) has
 two versions. Version 1 is the original layout. Version 2 is version 1 with the version byte `2`, then:
 `keyComponents` (u32 count x `{column str, keyFunction u8, outName str}`), `unique` (u8, 0 or 1), `constraints` (u32 count x
 `{name str, nodes}`), `unicodeVersion` (u32) and `groupBy` (u32 count x `{column str, keyFunction u8, outName str}`), all little-endian.

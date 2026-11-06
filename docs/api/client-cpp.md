@@ -643,9 +643,9 @@ ViewRowResult row = client.getViewRowAndWait(viewTopicId, *kb->key(), ro, 5s);  
 kb->clear();
 kb->setUInt("userId", 42);
 ViewScanOptions so;
-for (;;) {                                                                               // every character of user 42
+for (int restarts = 0;;) {                                                               // every character of user 42
     ViewScanResult page = client.scanViewAndWait(viewTopicId, *kb->prefix(), /*limit=*/0, so, 5s);
-    if (page.status == ViewRowResult::kCursorInvalidated) { so.resumeToken.clear(); continue; }   // restart the scan
+    if (page.status == ViewRowResult::kCursorInvalidated && ++restarts <= 3) { so.resumeToken.clear(); continue; }   // 8 is also kNotLeader
     if (page.status != ViewRowResult::kOk) break;
     for (const auto& r : page.rows) { /* decode like a getViewRow row */ }
     if (page.complete()) break;

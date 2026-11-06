@@ -123,7 +123,7 @@ Notes:
   `SetPassword`=2, `Disable`=3, `Enable`=4. A `verifier` is `(salt, iterations, StoredKey, ServerKey)`; the plaintext
   password never reaches a broker, and the statement text is sent with the password replaced by `'<redacted>'`.
 - **`ViewRowResponse.status`**: 0 OK, 1 AbsentKey, 2 NotReady, 3 SchemaMismatch, 4 UnknownView, 5 InvalidRequest,
-  6 Busy, 7 RowTooLarge, 8 CursorInvalidated (a scan's resume token no longer matches its prefix), 45 NotAuthorized. A `GetViewRow` on a broker that does not lead the view's source partition, or
+  6 Busy, 7 RowTooLarge, 8 CursorInvalidated (scans, see below), 45 NotAuthorized. A `GetViewRow` on a broker that does not lead the view's source partition, or
   leads it without the controller's read lease, is answered `ErrorResponse` `Redirect` (3, the leader's endpoint) or
   `NotLeader` (2); both are retriable.
 - **Internal logs** are read by subscribing to a negative topic id: `__catalog` is `-6` (`kCatalogTopicId`), `__security`
