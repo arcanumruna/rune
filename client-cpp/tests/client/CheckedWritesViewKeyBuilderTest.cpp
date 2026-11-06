@@ -143,7 +143,7 @@ TEST(CheckedWritesViewKeyBuilder, FromCatalogFindsTheView) {
     out.add("userId", cd::PrimType::UInt64, 1, true).add("characterId", cd::PrimType::UInt64);
     cat::ViewDef view;
     view.sinkPartitions = 1;
-    view.keyField = "userId";   // apply wants a live output field
+    view.keyField = rcv::viewKeyField(plan, "");   // as createView sends it; "userId,characterId" fails apply
     view.sourceNames = {"character"};
     view.normalizedPlanBlob = rune::view::serializeAuthored(plan);
     view.compiledPlanBlob = {0xC0};
@@ -155,6 +155,7 @@ TEST(CheckedWritesViewKeyBuilder, FromCatalogFindsTheView) {
     EXPECT_EQ(b->components().size(), 2u);
     EXPECT_EQ(b->components()[0].column, "userId");
     EXPECT_EQ(b->keyWidth(), 16u);
+    EXPECT_EQ(rcv::viewKeyField(plan, ""), "userId");
     EXPECT_FALSE(rcv::ViewKeyBuilder::fromCatalog(script.state(), "nope").has_value());
 }
 

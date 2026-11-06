@@ -14,6 +14,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
+#include <string_view>
 
 namespace rune::client::view {
 
@@ -28,6 +30,12 @@ using AuthoredConstraint = rune::view::AuthoredConstraint;
 using ViewPlan = rune::view::ViewPlan;
 using rune::view::serializeAuthored;
 using rune::view::deserializeAuthored;
+
+// The ViewDef.keyField a v2 plan is sent with: its first key component's outName, always a live output field (the
+// catalog apply rule requires one); the whole key lives in the plan.  Any other plan keeps `keyField`.
+inline std::string viewKeyField(const ViewPlan& plan, std::string_view keyField) {
+    return plan.keyComponents.empty() ? std::string(keyField) : plan.keyComponents[0].outName;
+}
 
 // The v1 version byte: a plan with no v2 fields serializes to it (rune::view::kAuthoredVersion
 // is the current, v2 byte).

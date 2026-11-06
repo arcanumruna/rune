@@ -1488,10 +1488,10 @@ OpResult Client::listTopics(CompletionTarget target, Token token) {
 }
 
 namespace {
-// A v2 plan names its key by its components: the broker stores whatever keyField the client sends, so send the display name.
+// The broker stores whatever keyField the client sends and the catalog wants a live output field: a v2 plan sends its first key component.
 std::string keyFieldOf(std::string_view keyField, std::span<const uint8_t> planBlob) {
     if (!planBlob.empty() && planBlob[0] == rune::view::kAuthoredVersion) {
-        if (const auto plan = rune::view::deserializeAuthored(planBlob)) return rune::view::keyDisplayName(*plan);
+        if (const auto plan = rune::view::deserializeAuthored(planBlob)) return view::viewKeyField(*plan, keyField);
     }
     return std::string(keyField);
 }
