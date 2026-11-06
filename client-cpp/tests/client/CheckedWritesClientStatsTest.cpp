@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -260,7 +261,7 @@ TEST(CheckedWritesClientStats, BlockingFormReportsBrokerTooOldAsAStatus) {
     r.gw.advertisedBrokerVersion = rpc::kBrokerVersionCheckedWrites - 1;
     r.connect();
     rc::StatsResult res;
-    bool done = false;
+    std::atomic<bool> done{false};
     // The blocking form pumps the client itself; the fake gateway must keep running beside it.
     std::thread pump([&] { while (!done) r.gw.pump(); });
     res = r.client->getStatsAndWait(rpc::StatsScope::TopicPartition, 3, 0, std::chrono::seconds(5));
