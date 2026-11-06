@@ -1180,6 +1180,7 @@ std::string formatRows(const rune::codec::Descriptor& output, std::span<const ui
 namespace {
 
 std::string statsRefusal(int32_t partition, uint16_t status) {
+    if (status == rc::StatsResult::kBrokerTooOld) return std::string(kStatsBrokerTooOld);
     std::string why;
     switch (status) {
         case rc::StatsResult::kUnknownObject:  why = "unknown object"; break;
@@ -1255,13 +1256,21 @@ std::expected<std::vector<PartitionStats>, std::string> viewStats(rc::Client& c,
     int32_t from = 0, to = 0;
     if (auto r = partitionRange(v.def.sinkPartitions, only, from, to); !r) return std::unexpected(std::move(r.error()));
     std::vector<PartitionStats> out;
+    bool sourceReadable = true;
     for (int32_t p = from; p < to; ++p) {
         auto r = c.getStatsAndWait(rpc::StatsScope::ViewPartition, v.def.viewTopicId, p, kCatalogWait);
         if (r.status != rc::StatsResult::kOk) return std::unexpected(statsRefusal(p, r.status));
         PartitionStats ps{p, std::move(r), {}};
         if (plan->unique || !plan->constraints.empty()) {   // the rejections are counted where the verdicts are: the source partition
-            const auto src = c.getStatsAndWait(rpc::StatsScope::TopicPartition, source->topicId, p, kCatalogWait);
-            if (src.status != rc::StatsResult::kOk) return std::unexpected(statsRefusal(p, src.status));
+            rc::StatsResult src;
+            src.status = rc::StatsResult::kNotAuthorized;
+            if (sourceReadable) src = c.getStatsAndWait(rpc::StatsScope::TopicPartition, source->topicId, p, kCatalogWait);
+            if (src.status == rc::StatsResult::kNotAuthorized) {   // the view's counters are readable without the source's
+                sourceReadable = false;
+                ps.constraintsNote = "not authorized on source '" + source->name + "'";
+            } else if (src.status != rc::StatsResult::kOk) {
+                return std::unexpected(statsRefusal(p, src.status));
+            }
             for (const auto& k : src.constraints) {
                 if ((k.constraintId >> 16) != (v.objectId & 0xFFFF)) continue;
                 ps.result.constraints.push_back(k);
@@ -1271,6 +1280,12 @@ std::expected<std::vector<PartitionStats>, std::string> viewStats(rc::Client& c,
         out.push_back(std::move(ps));
     }
     return out;
+}
+
+std::expected<std::string, std::string> showStatsText(const std::expected<std::vector<PartitionStats>, std::string>& stats) {
+    if (stats) return formatStatsText(*stats);
+    if (stats.error() == kStatsBrokerTooOld) return "  (" + std::string(kStatsBrokerTooOld) + ")\n";
+    return std::unexpected(stats.error());
 }
 
 // ---- views, select, show ------------------------------------------------------------------------------------------
@@ -1363,9 +1378,9 @@ bool QlRun::run(const PShowTopic& s, const rc::DdlOptions&) {
     const cat::TopicObject* t = broker.client().catalogReader().state().topicByName(cat::kDefaultNsId, s.name);
     if (t == nullptr) return fail("no topic '" + s.name + "'");
     out << formatTopicDefinition(*t);
-    const auto stats = topicStats(broker.client(), broker.client().catalogReader().state(), *t, -1);
+    const auto stats = showStatsText(topicStats(broker.client(), broker.client().catalogReader().state(), *t, -1));
     if (!stats) return fail(stats.error());
-    out << formatStatsText(*stats);
+    out << *stats;
     return true;
 }
 
@@ -1375,9 +1390,9 @@ bool QlRun::run(const PShowView& s, const rc::DdlOptions&) {
     const cat::ViewObject* v = state.viewByName(cat::kDefaultNsId, s.name);
     if (v == nullptr) return fail("no view '" + s.name + "'");
     out << formatViewDefinition(*v);
-    const auto stats = viewStats(broker.client(), state, *v, -1);
+    const auto stats = showStatsText(viewStats(broker.client(), state, *v, -1));
     if (!stats) return fail(stats.error());
-    out << formatStatsText(*stats);
+    out << *stats;
     return true;
 }
 

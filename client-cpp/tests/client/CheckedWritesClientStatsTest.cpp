@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -252,4 +253,18 @@ TEST(CheckedWritesClientStatsRegression, StatusTwoIsRoutedLikeNotLeaderRegressio
     ASSERT_TRUE(r.drive([&] { return get.ready(); }));
     EXPECT_EQ(get.outcome().c.errorCode, rc::StatsResult::kNotLeader);
     EXPECT_GT(sent, 1) << "status 2 is retried, not delivered as a status";
+}
+
+TEST(CheckedWritesClientStats, BlockingFormReportsBrokerTooOldAsAStatus) {
+    Rig r(invokerCfg(4713, 4714));
+    r.gw.advertisedBrokerVersion = rpc::kBrokerVersionCheckedWrites - 1;
+    r.connect();
+    rc::StatsResult res;
+    bool done = false;
+    // The blocking form pumps the client itself; the fake gateway must keep running beside it.
+    std::thread pump([&] { while (!done) r.gw.pump(); });
+    res = r.client->getStatsAndWait(rpc::StatsScope::TopicPartition, 3, 0, std::chrono::seconds(5));
+    done = true;
+    pump.join();
+    EXPECT_EQ(res.status, rc::StatsResult::kBrokerTooOld);
 }

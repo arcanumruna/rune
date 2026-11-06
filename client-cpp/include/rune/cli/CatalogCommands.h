@@ -81,6 +81,7 @@ struct PartitionStats {
     int32_t                   partition = 0;
     rune::client::StatsResult result;
     std::vector<std::string>  constraintLabels;
+    std::string               constraintsNote;   // why `result.constraints` is empty when the caller may not read them
 };
 
 /// Per partition `  partition <p>`, `    <stat> <value>` in id order, `    constraint <label> <rejections>`; `    (no counters)` for none.

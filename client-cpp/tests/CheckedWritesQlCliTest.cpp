@@ -7,6 +7,7 @@
 #include "rune/cli/Cli.h"
 #include "rune/cli/CatalogCommands.h"
 
+#include <rune/catalog/CatalogFingerprint.h>
 #include <rune/catalog/CatalogState.h>
 #include <rune/client/view/ViewKeyBuilder.h>
 #include <rune/client/view/ViewRowCodec.h>
@@ -19,6 +20,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -478,4 +480,59 @@ TEST(CheckedWritesQlCliRegression, ConstraintLabelsComeFromTheOwningViewsPlanReg
     EXPECT_EQ(eng::constraintLabel(v, 0), "account_stats.unique");
     EXPECT_EQ(eng::constraintLabel(v, 7), "account_stats.#7");   // an ordinal the current plan lacks never throws
     EXPECT_EQ(eng::constraintLabel(cat::CatalogState{}, (5u << 16) | 1u), "constraint#327681");   // no view owns it
+}
+
+TEST(CheckedWritesQlCli, UnauthorizedSourceNotesTheConstraintRows) {
+    rune::cli::PartitionStats p;
+    p.partition = 0;
+    p.result.stats.emplace_back(1, 4);
+    p.constraintsNote = "not authorized on source 'character'";
+    const std::string text = rune::cli::formatStatsText(std::vector<rune::cli::PartitionStats>{p});
+    EXPECT_NE(text.find("    constraints (not authorized on source 'character')\n"), std::string::npos) << text;
+    EXPECT_EQ(text.find("(no counters)"), std::string::npos) << text;
+}
+
+TEST(CheckedWritesQlCli, ShowStatsTextNotesAnOldBrokerAndFailsOnOtherRefusals) {
+    using Parts = std::expected<std::vector<rune::cli::PartitionStats>, std::string>;
+    const auto old = eng::showStatsText(Parts{std::unexpected(std::string(eng::kStatsBrokerTooOld))});
+    ASSERT_TRUE(old.has_value());
+    EXPECT_EQ(*old, "  (counters need broker v10)\n");
+    const auto refused = eng::showStatsText(Parts{std::unexpected(std::string("stats of partition 0: not authorized"))});
+    ASSERT_FALSE(refused.has_value());
+    EXPECT_EQ(refused.error(), "stats of partition 0: not authorized");
+    const auto ok = eng::showStatsText(Parts{std::vector<rune::cli::PartitionStats>{rune::cli::PartitionStats{2, {}, {}, {}}}});
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(*ok, "  partition 2\n    (no counters)\n");
+}
+
+TEST(CheckedWritesQlCli, ConstraintLabelOfAStatsResponseNamesTheOwningView) {
+    cat::CatalogState state;
+    const auto stamped = [&](cat::Ops ops, const std::string& name, uint64_t objectId) {
+        cat::CatalogEvent e{.formatVer = cat::kFormatV1};
+        e.kind = cat::kindOf(ops); e.ops = std::move(ops); e.objectName = name; e.objectId = objectId; e.prevVersion = 0; e.newVersion = 1;
+        const auto fp = cat::previewFingerprint(state, e);
+        EXPECT_TRUE(fp.has_value()) << (fp ? "" : fp.error().detail);
+        e.fingerprint = fp.value_or(0);
+        return e;
+    };
+    const ql::TopicDef topic = topicOf(kCharacter);
+    cat::CreateTopicOps t;
+    t.topicId = 0; t.partitions = 1; t.replicationFactor = 1;
+    t.schema = cat::SchemaDef{.keyField = "characterId", .validate = true, .descriptorBlob = rune::codec::serialize(ql::viewSourceOf(topic).descriptor), .nextTag = 5};
+    ASSERT_TRUE(cat::apply(state, stamped(t, "character", 1), 0));
+    for (int32_t i = 1; i <= 3; ++i) {   // objectIds are dense: the view is the fifth object
+        cat::CreateTopicOps filler;
+        filler.topicId = i; filler.partitions = 1; filler.replicationFactor = 1;
+        ASSERT_TRUE(cat::apply(state, stamped(filler, "filler" + std::to_string(i), static_cast<uint64_t>(i) + 1), i));
+    }
+    cat::ViewDef def = viewObjectOf(
+        "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= 12);").def;
+    def.viewTopicId = 4; def.sinkPartitions = 1;
+    ASSERT_TRUE(cat::apply(state, stamped(cat::CreateViewOps{def}, "account_stats", 5), 4));
+    EXPECT_EQ(eng::constraintLabel(state, (5u << 16) | 1u), "account_stats.max_characters");
+    EXPECT_EQ(eng::constraintLabel(state, (6u << 16) | 1u), "constraint#393217");
+}
+
+TEST(CheckedWritesQlCli, StatsJsonEscapesControlCharacters) {
+    EXPECT_NE(rune::cli::formatStatsJson("topic", std::string("a\n\t\x01\"b"), {}).find(R"("a\u000a\u0009\u0001\"b")"), std::string::npos);
 }

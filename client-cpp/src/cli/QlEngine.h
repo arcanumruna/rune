@@ -157,6 +157,11 @@ struct SelectRead {
 [[nodiscard]] std::expected<std::vector<PartitionStats>, std::string> viewStats(rune::client::Client&, const rune::catalog::CatalogState&,
                                                                                 const rune::catalog::ViewObject&, int32_t only);
 
+/// The message of a stats read refused because the seed broker predates GetStats.
+inline constexpr std::string_view kStatsBrokerTooOld = "counters need broker v10";
+/// What `show` prints under the definition: the counters; that note, which does not fail the show; else the refusal.
+[[nodiscard]] std::expected<std::string, std::string> showStatsText(const std::expected<std::vector<PartitionStats>, std::string>&);
+
 /// `<view>.<constraint>` of the view's constraint `ordinal` (0 = `unique`; one its plan lacks reads `<view>.#<ordinal>`).
 [[nodiscard]] std::string constraintLabel(const rune::catalog::ViewObject&, uint16_t ordinal);
 /// The label of a stats response's constraint id (`objectId & 0xFFFF` << 16 | ordinal); `constraint#<id>` when no view owns it.

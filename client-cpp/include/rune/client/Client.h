@@ -275,6 +275,8 @@ struct StatsResult {
     static constexpr uint16_t kNotAuthorized   = rune::protocol::client::StatsResponse::kNotAuthorized;
     /// Client-side only, as ViewRowResult::kNotLeader: the partition's leader was not reached within the retry budget.
     static constexpr uint16_t kNotLeader       = ViewRowResult::kNotLeader;
+    /// Client-side only: the seed broker predates GetStats (below kBrokerVersionCheckedWrites); nothing was sent.
+    static constexpr uint16_t kBrokerTooOld    = 9;
 
     struct Constraint {
         uint32_t constraintId = 0;

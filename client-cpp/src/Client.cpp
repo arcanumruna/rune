@@ -3349,6 +3349,8 @@ StatsResult Client::getStatsAndWait(rune::protocol::client::StatsScope scope, in
                      result.status = StatsResult::kOk;
                  } else if (c.status == OpStatus::BrokerError) {
                      result.status = c.errorCode;
+                 } else if (c.status == OpStatus::BrokerTooOld) {
+                     result.status = StatsResult::kBrokerTooOld;
                  } else {
                      throwForStatus_("getStats()", c, p);
                  }

@@ -420,7 +420,18 @@ std::string constraintName(const PartitionStats& p, std::size_t k) {
 
 std::string jsonString(std::string_view s) {
     std::string out = "\"";
-    for (const char c : s) out += (c == '"' || c == '\\' ? std::string{'\\', c} : std::string{c});
+    for (const char c : s) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            char esc[7];
+            std::snprintf(esc, sizeof esc, "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(c)));
+            out += esc;
+        } else {
+            out += c;
+        }
+    }
     return out + "\"";
 }
 
@@ -433,7 +444,8 @@ std::string formatStatsText(std::span<const PartitionStats> partitions) {
         for (const auto& [id, value] : p.result.stats) o << "    " << statLabel(id) << " " << value << "\n";
         for (std::size_t i = 0; i < p.result.constraints.size(); ++i)
             o << "    constraint " << constraintName(p, i) << " " << p.result.constraints[i].rejections << "\n";
-        if (p.result.stats.empty() && p.result.constraints.empty()) o << "    (no counters)\n";
+        if (!p.constraintsNote.empty()) o << "    constraints (" << p.constraintsNote << ")\n";
+        if (p.result.stats.empty() && p.result.constraints.empty() && p.constraintsNote.empty()) o << "    (no counters)\n";
     }
     return o.str();
 }
