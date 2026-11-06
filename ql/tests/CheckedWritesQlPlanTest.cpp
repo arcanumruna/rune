@@ -139,7 +139,7 @@ TEST(CheckedWritesQlGolden, RegressorsPathAuthorsPlanV2) {
     {
         const auto& p = *all[1].plan;
         EXPECT_EQ(p.key, "");
-        EXPECT_EQ(p.sources[0].keyField, "userId");
+        EXPECT_EQ(p.sources[0].keyField, "loginId");
         expectOutput(p, {F("userId", PrimType::UInt64, "userId", MergeRule::Replace),
                          F("deviceFp", PrimType::FixedStr, "deviceFp", MergeRule::Replace),
                          F("firstSeen", PrimType::Int64, "ts", MergeRule::Min),
@@ -164,11 +164,11 @@ TEST(CheckedWritesQlGolden, RegressorsPathAuthorsPlanV2) {
     {
         const auto& p = *all[3].plan;
         EXPECT_EQ(p.key, "userId");
-        EXPECT_EQ(p.sources[0].keyField, "userId");
+        EXPECT_EQ(p.sources[0].keyField, "characterId");
         expectOutput(p, {F("userId", PrimType::UInt64, "userId", MergeRule::Replace),
                          F("characters", PrimType::Int64, "", MergeRule::CountAll)});
         EXPECT_TRUE(p.keyComponents.empty());
-        EXPECT_TRUE(p.groupBy.empty());
+        expectComponents(p.groupBy, {{"userId", 0, "userId"}});
         ASSERT_EQ(p.constraints.size(), 1u);
         EXPECT_EQ(p.constraints[0].name, "max_characters");
         const std::vector<v::PredicateNode> want = {
@@ -262,7 +262,7 @@ TEST(CheckedWritesQlPlan, GroupByIsWrittenAsTyped) {
     expectComponents(q->keyComponents, {{"deviceFp", 1, "fp"}});
     EXPECT_EQ(q->unicodeVersion, 0x00100000u);
     expectOutput(*q, {F("n", PrimType::Int64, "", MergeRule::CountAll)});
-    EXPECT_EQ(q->sources[0].keyField, "deviceFp");
+    EXPECT_EQ(q->sources[0].keyField, "id");
 }
 
 TEST(CheckedWritesQlPlan, TransientAndReplace) {
@@ -307,4 +307,16 @@ TEST(CheckedWritesQlPlan, PredicateTextShapes) {
                         "constraint k check (not (n < 3) and (m = 1 or m <> 2) or n >= 7);");
     ASSERT_TRUE(p.has_value()) << p.error().message;
     EXPECT_EQ(ql::predicateText(p->constraints[0].predicate), "(not (n < 3) and (m = 1 or m <> 2)) or n >= 7");
+}
+
+TEST(CheckedWritesQlPlanRegression, V2AggregateNamesTheSourceKeyRegression) {
+    const std::string t = "topic d { id uint64, userId uint64, ts int64 } key id;";
+    auto v1 = planOne(t, "create view a key userId as select count(*) as n from d group by userId;");
+    ASSERT_TRUE(v1.has_value()) << v1.error().message;
+    EXPECT_EQ(v1->sources[0].keyField, "userId");
+    EXPECT_TRUE(v1->groupBy.empty());
+    auto v2 = planOne(t, "create view b key userId as select count(*) as n from d group by userId constraint c check (n <= 1);");
+    ASSERT_TRUE(v2.has_value()) << v2.error().message;
+    EXPECT_EQ(v2->sources[0].keyField, "id");
+    expectComponents(v2->groupBy, {{"userId", 0, "userId"}});
 }

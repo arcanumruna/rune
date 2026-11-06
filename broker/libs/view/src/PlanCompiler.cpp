@@ -89,7 +89,7 @@ std::expected<CompileResult, CompileError> compileView(
 
     if (authored.sources.empty()) {
         return std::unexpected(CompileError{"view '" + authored.viewName +
-                                             "' must declare at least one source"});
+                                             "' must declare at least one source", CompileErrorKind::FieldUnresolved});
     }
     // Whole-branch review Bug C: the rest of the Phase 1 pipeline is
     // single-source only (fold uses source[0], co-location uses
@@ -102,21 +102,21 @@ std::expected<CompileResult, CompileError> compileView(
         return std::unexpected(CompileError{
             "view '" + authored.viewName + "' must declare exactly one source " +
             "(Phase 1 views are single-source; got " +
-            std::to_string(authored.sources.size()) + ")"});
+            std::to_string(authored.sources.size()) + ")", CompileErrorKind::FieldUnresolved});
     }
     if (authored.output.empty()) {
         return std::unexpected(CompileError{"view '" + authored.viewName +
-                                             "' must declare at least one output field"});
+                                             "' must declare at least one output field", CompileErrorKind::FieldUnresolved});
     }
     if (sourceDescriptors.size() != authored.sources.size()) {
         return std::unexpected(CompileError{
             "view '" + authored.viewName +
-            "': sourceDescriptors count does not match sources count"});
+            "': sourceDescriptors count does not match sources count", CompileErrorKind::FieldUnresolved});
     }
     for (const auto* d : sourceDescriptors) {
         if (d == nullptr) {
             return std::unexpected(CompileError{
-                "view '" + authored.viewName + "': null source descriptor"});
+                "view '" + authored.viewName + "': null source descriptor", CompileErrorKind::FieldUnresolved});
         }
     }
 
@@ -129,12 +129,12 @@ std::expected<CompileResult, CompileError> compileView(
             if (!af.srcField.empty()) {
                 return std::unexpected(CompileError{
                     "view '" + authored.viewName + "': output field '" + af.name +
-                    "' is Count(*), which takes no source field"});
+                    "' is Count(*), which takes no source field", CompileErrorKind::FieldUnresolved});
             }
             if (af.type != rune::codec::PrimType::Int64) {
                 return std::unexpected(CompileError{
                     "view '" + authored.viewName + "': output field '" + af.name +
-                    "' is Count(*), which produces Int64; declare output type Int64"});
+                    "' is Count(*), which produces Int64; declare output type Int64", CompileErrorKind::FieldUnresolved});
             }
             ResolvedOutputField rof;
             rof.srcFieldId = kNoSourceField;
@@ -144,7 +144,7 @@ std::expected<CompileResult, CompileError> compileView(
         if (af.sourceIdx >= sourceDescriptors.size()) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': output field '" + af.name +
-                "' references out-of-range sourceIdx " + std::to_string(af.sourceIdx)});
+                "' references out-of-range sourceIdx " + std::to_string(af.sourceIdx), CompileErrorKind::FieldUnresolved});
         }
         const rune::codec::Descriptor& srcDesc = *sourceDescriptors[af.sourceIdx];
 
@@ -153,27 +153,27 @@ std::expected<CompileResult, CompileError> compileView(
         if (matches == 0) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': output field '" + af.name +
-                "' references unknown source field '" + af.srcField + "'"});
+                "' references unknown source field '" + af.srcField + "'", CompileErrorKind::FieldUnresolved});
         }
         if (matches > 1) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': output field '" + af.name +
                 "' source field name '" + af.srcField +
-                "' resolves ambiguously (duplicate name in source schema)"});
+                "' resolves ambiguously (duplicate name in source schema)", CompileErrorKind::FieldUnresolved});
         }
 
         if (!isFixedWidthColumn(fd->type)) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': output field '" + af.name +
                 "' source field '" + af.srcField +
-                "' is var-len; Phase 1 views support fixed-width columns only"});
+                "' is var-len; Phase 1 views support fixed-width columns only", CompileErrorKind::FieldUnresolved});
         }
 
         if (requiresNumeric(af.rule) && !isNumeric(fd->type)) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': output field '" + af.name +
                 "' merge rule requires a numeric source field, but '" + af.srcField +
-                "' is not numeric"});
+                "' is not numeric", CompileErrorKind::FieldUnresolved});
         }
 
         if (isAggregateRule(af.rule)) {
@@ -182,19 +182,19 @@ std::expected<CompileResult, CompileError> compileView(
                 return std::unexpected(CompileError{
                     "view '" + authored.viewName + "': output field '" + af.name +
                     "' cannot aggregate source field '" + af.srcField + "' of " +
-                    primName(fd->type)});
+                    primName(fd->type), CompileErrorKind::FieldUnresolved});
             }
             if (af.type != *out) {
                 return std::unexpected(CompileError{
                     "view '" + authored.viewName + "': output field '" + af.name +
                     "' aggregates " + primName(fd->type) + ", which produces " +
-                    primName(*out) + "; declare output type " + primName(*out)});
+                    primName(*out) + "; declare output type " + primName(*out), CompileErrorKind::FieldUnresolved});
             }
         } else if (af.type != fd->type) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': output field '" + af.name +
                 "' declared type does not match resolved source field '" + af.srcField +
-                "' type (Replace does not cast)"});
+                "' type (Replace does not cast)", CompileErrorKind::FieldUnresolved});
         }
 
         ResolvedOutputField rof;
@@ -211,7 +211,7 @@ std::expected<CompileResult, CompileError> compileView(
             if (authored.output[i].name == authored.output[j].name) {
                 return std::unexpected(CompileError{
                     "view '" + authored.viewName + "': duplicate output field name '" +
-                    authored.output[i].name + "'"});
+                    authored.output[i].name + "'", CompileErrorKind::FieldUnresolved});
             }
         }
     }
@@ -229,18 +229,18 @@ std::expected<CompileResult, CompileError> compileView(
         if (matches == 0) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': source " + std::to_string(i) +
-                " key field '" + src.keyField + "' not found"});
+                " key field '" + src.keyField + "' not found", CompileErrorKind::KeyInvalid});
         }
         if (matches > 1) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': source " + std::to_string(i) +
                 " key field '" + src.keyField +
-                "' resolves ambiguously (duplicate name in source schema)"});
+                "' resolves ambiguously (duplicate name in source schema)", CompileErrorKind::KeyInvalid});
         }
         if (!isFixedWidthColumn(fd->type)) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': source " + std::to_string(i) +
-                " key field '" + src.keyField + "' is var-len; keys must be fixed-width"});
+                " key field '" + src.keyField + "' is var-len; keys must be fixed-width", CompileErrorKind::KeyInvalid});
         }
 
         keyFieldIds.push_back(fd->id);
@@ -342,17 +342,17 @@ std::expected<CompileResult, CompileError> compileView(
     const bool aggregate = std::any_of(authored.output.begin(), authored.output.end(),
                                        [](const AuthoredField& af) { return af.rule != MergeRule::Replace; });
     const auto nonAggregateColumn = [&](const std::string& name) {
-        return fail(CompileErrorKind::Generic, "column '" + name + "' in an aggregate view must be an aggregate (Count, Count(*), Sum, Avg, "
+        return fail(CompileErrorKind::FieldUnresolved, "column '" + name + "' in an aggregate view must be an aggregate (Count, Count(*), Sum, Avg, "
                                                "Min, Max, Last, LastNonNull); only the group-by column may use Replace");
     };
     if (aggregate && v1Shaped) {
         const auto keyIt = std::find_if(authored.output.begin(), authored.output.end(),
                                         [&](const AuthoredField& af) { return af.name == components[0].outName; });
         if (keyIt == authored.output.end()) {
-            return fail(CompileErrorKind::Generic, "key field '" + authored.key + "' does not appear in output");
+            return fail(CompileErrorKind::KeyInvalid, "key field '" + authored.key + "' does not appear in output");
         }
         if (keyIt->rule != MergeRule::Replace || keyIt->srcField != authored.sources[0].keyField) {
-            return fail(CompileErrorKind::Generic, "the group-by column '" + authored.key + "' must use Replace and project the group-by source field '" +
+            return fail(CompileErrorKind::FieldUnresolved, "the group-by column '" + authored.key + "' must use Replace and project the group-by source field '" +
                                                    authored.sources[0].keyField + "'");
         }
         for (const AuthoredField& af : authored.output) {
@@ -497,7 +497,7 @@ std::expected<CompileResult, CompileError> compileView(
                 builder.addFixedStr(af.name, rof.fixedLen, /*sinceVersion*/ 1, isKeyField);
             } catch (const std::exception& e) {   // zero-width FixedStr (#667): a DDL refusal, never a throw
                 return std::unexpected(CompileError{
-                    "view '" + authored.viewName + "': failed to build output schema: " + e.what()});
+                    "view '" + authored.viewName + "': failed to build output schema: " + e.what(), CompileErrorKind::FieldUnresolved});
             }
         } else {
             builder.add(af.name, af.type, /*sinceVersion*/ 1, isKeyField);
@@ -519,7 +519,7 @@ std::expected<CompileResult, CompileError> compileView(
         rowLayout         = buildRowLayout(outputDescriptor);
     } catch (const std::exception& e) {
         return std::unexpected(CompileError{
-            "view '" + authored.viewName + "': failed to build output schema: " + e.what()});
+            "view '" + authored.viewName + "': failed to build output schema: " + e.what(), CompileErrorKind::FieldUnresolved});
     }
 
     CompiledViewPlan plan;

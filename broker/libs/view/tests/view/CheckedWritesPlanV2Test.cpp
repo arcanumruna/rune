@@ -497,3 +497,103 @@ TEST(CheckedWritesPlanCompile, AliasedV1KeyColumnCompilesAsBeforeRegression) {
     EXPECT_FALSE(needsV2(agg->plan));
     EXPECT_EQ(slotName(*agg, 0), "user");
 }
+
+namespace {
+
+// A source with a var-len column, a duplicated name and a numeric / non-numeric pair for the older compile sites.
+rune::codec::Descriptor siteSource() {
+    return rune::codec::DescriptorBuilder("src", 1)
+        .add("id", PrimType::UInt64, 1, true).add("userId", PrimType::UInt64).add("n", PrimType::Int64)
+        .add("bio", PrimType::String).add("dup", PrimType::UInt64).add("dup", PrimType::UInt64).addFixedStr("label", 16).build();
+}
+
+ViewPlan sitePlan(std::initializer_list<AuthoredField> output, const char* key = "id", const char* sourceKey = "id") {
+    ViewPlan v;
+    v.viewName = "v";
+    v.key = key;
+    v.sources = {{5, sourceKey}};
+    v.output = output;
+    return v;
+}
+
+struct Site {
+    const char* label;
+    ViewPlan plan;
+    Kind kind;
+    std::string message;   // the start of the compiler's message
+};
+
+}  // namespace
+
+TEST(CheckedWritesPlanCompile, NoSiteIsGeneric) {
+    const auto d = siteSource();
+    const AuthoredField id{"id", PrimType::UInt64, 0, "id", MergeRule::Replace};
+    const auto withId = [&](AuthoredField f) { return sitePlan({id, std::move(f)}); };
+    const auto sum = [](const char* src) { return AuthoredField{"x", PrimType::Int64, 0, src, MergeRule::Sum}; };
+
+    std::vector<Site> sites;
+    sites.push_back({"two sources", sitePlan({id}), Kind::FieldUnresolved, "view 'v' must declare exactly one source (Phase 1 views are single-source; got 2)"});
+    sites.back().plan.sources.push_back({6, "id"});
+    sites.push_back({"no output", sitePlan({}), Kind::FieldUnresolved, "view 'v' must declare at least one output field"});
+    sites.push_back({"count(*) with a field", withId({"x", PrimType::Int64, 0, "n", MergeRule::CountAll}), Kind::FieldUnresolved,
+                     "view 'v': output field 'x' is Count(*), which takes no source field"});
+    sites.push_back({"count(*) type", withId({"x", PrimType::Int32, 0, "", MergeRule::CountAll}), Kind::FieldUnresolved,
+                     "view 'v': output field 'x' is Count(*), which produces Int64; declare output type Int64"});
+    sites.push_back({"sourceIdx", withId({"x", PrimType::Int64, 1, "n", MergeRule::Replace}), Kind::FieldUnresolved,
+                     "view 'v': output field 'x' references out-of-range sourceIdx 1"});
+    sites.push_back({"unknown field", withId({"x", PrimType::Int64, 0, "nope", MergeRule::Replace}), Kind::FieldUnresolved,
+                     "view 'v': output field 'x' references unknown source field 'nope'"});
+    sites.push_back({"ambiguous field", withId({"x", PrimType::UInt64, 0, "dup", MergeRule::Replace}), Kind::FieldUnresolved,
+                     "view 'v': output field 'x' source field name 'dup' resolves ambiguously"});
+    sites.push_back({"var-len field", withId({"x", PrimType::String, 0, "bio", MergeRule::Replace}), Kind::FieldUnresolved,
+                     "view 'v': output field 'x' source field 'bio' is var-len; Phase 1 views support fixed-width columns only"});
+    sites.push_back({"not numeric", withId(sum("label")), Kind::FieldUnresolved,
+                     "view 'v': output field 'x' merge rule requires a numeric source field, but 'label' is not numeric"});
+    sites.push_back({"aggregate type", withId({"x", PrimType::Int32, 0, "n", MergeRule::Max}), Kind::FieldUnresolved,
+                     "view 'v': output field 'x' aggregates"});
+    sites.push_back({"replace type", withId({"x", PrimType::Int32, 0, "n", MergeRule::Replace}), Kind::FieldUnresolved,
+                     "view 'v': output field 'x' declared type does not match resolved source field 'n' type (Replace does not cast)"});
+    sites.push_back({"duplicate output", withId({"id", PrimType::Int64, 0, "n", MergeRule::Replace}), Kind::FieldUnresolved,
+                     "view 'v': duplicate output field name 'id'"});
+    sites.push_back({"key not found", sitePlan({id}, "id", "nope"), Kind::KeyInvalid, "view 'v': source 0 key field 'nope' not found"});
+    sites.push_back({"key ambiguous", sitePlan({id}, "id", "dup"), Kind::KeyInvalid, "view 'v': source 0 key field 'dup' resolves ambiguously"});
+    sites.push_back({"key var-len", sitePlan({id}, "id", "bio"), Kind::KeyInvalid, "view 'v': source 0 key field 'bio' is var-len; keys must be fixed-width"});
+    sites.push_back({"non-aggregate column", sitePlan({{"userId", PrimType::UInt64, 0, "userId", MergeRule::Replace},
+                                                       {"n", PrimType::Int64, 0, "n", MergeRule::Replace},
+                                                       {"c", PrimType::Int64, 0, "", MergeRule::CountAll}}, "userId", "userId"),
+                     Kind::FieldUnresolved, "view 'v': column 'n' in an aggregate view must be an aggregate"});
+    sites.push_back({"key not in output", sitePlan({{"c", PrimType::Int64, 0, "", MergeRule::CountAll}}, "userId", "userId"), Kind::KeyInvalid,
+                     "view 'v': key field 'userId' does not appear in output"});
+    sites.push_back({"group-by column rule", sitePlan({{"userId", PrimType::UInt64, 0, "userId", MergeRule::Max},
+                                                       {"c", PrimType::Int64, 0, "", MergeRule::CountAll}}, "userId", "userId"),
+                     Kind::FieldUnresolved, "view 'v': the group-by column 'userId' must use Replace and project the group-by source field 'userId'"});
+
+    for (const Site& s : sites) {
+        const rune::codec::Descriptor* srcs[] = {&d, &d};
+        const auto r = compileView(s.plan, std::span(srcs, s.plan.sources.size()), kViewTopic);
+        ASSERT_FALSE(r.has_value()) << s.label;
+        EXPECT_NE(r.error().kind, Kind::Generic) << s.label << ": " << r.error().message;
+        EXPECT_EQ(r.error().kind, s.kind) << s.label << ": " << r.error().message;
+        EXPECT_EQ(r.error().message.rfind(s.message, 0), 0u) << s.label << ": " << r.error().message;
+    }
+
+    // The sites no authored plan reaches: the caller's own descriptor mistakes.
+    ViewPlan none = sitePlan({id});
+    none.sources.clear();
+    const rune::codec::Descriptor* one[] = {&d};
+    const rune::codec::Descriptor* nullSource[] = {nullptr};
+    for (const auto& r : {compileView(none, one, kViewTopic), compileView(sitePlan({id}), std::span<const rune::codec::Descriptor* const>{}, kViewTopic),
+                          compileView(sitePlan({id}), nullSource, kViewTopic)}) {
+        ASSERT_FALSE(r.has_value());
+        EXPECT_EQ(r.error().kind, Kind::FieldUnresolved) << r.error().message;
+    }
+
+    // A zero-width FixedStr column cannot be built into the output schema (#667).
+    auto zero = rune::codec::DescriptorBuilder("zero", 1).add("id", PrimType::UInt64, 1, true).addFixedStr("label", 4).build();
+    zero.fields[1].fixedLen = 0;
+    const rune::codec::Descriptor* zeroSrc[] = {&zero};
+    const auto built = compileView(sitePlan({id, {"label", PrimType::FixedStr, 0, "label", MergeRule::Replace}}), zeroSrc, kViewTopic);
+    ASSERT_FALSE(built.has_value());
+    EXPECT_EQ(built.error().kind, Kind::FieldUnresolved) << built.error().message;
+    EXPECT_NE(built.error().message.find("failed to build output schema"), std::string::npos);
+}

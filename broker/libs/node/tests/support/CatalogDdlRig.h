@@ -95,6 +95,7 @@ public:
         bool                        preV8       = false;   // no DDL extension (requestId {0,0})
         uint32_t                    nsId        = 0;       // namespaces Task 7: the topic's namespace
         rune::protocol::TopicKeyFeatures keyFeatures{};
+        std::vector<uint8_t>        descriptorBlob;        // non-empty replaces the rig's fixed descriptor
     };
 
     /// `fdLimit` / `fdReadySegments` (issue #296): AdminDeps::fdLimit / readySegmentsPerPartition (0 = unknown limit).
@@ -196,7 +197,7 @@ public:
         m.session = kSession; m.corr = ++corr_;
         m.name = a.name; m.partitionCount = a.partitions; m.validate = a.validate;
         m.keyField = a.typed ? a.keyField : std::string{};
-        if (a.typed) m.blob = descriptor(a.name);
+        if (a.typed) m.blob = a.descriptorBlob.empty() ? descriptor(a.name) : std::move(a.descriptorBlob);
         m.persistence = a.persistence; m.replicationFactor = a.rf; m.config = a.config;
         m.meta = meta_(a.statement, a.clientName, a.requestId, a.preV8);
         m.nsId = a.nsId;
@@ -277,6 +278,13 @@ public:
         m.nsId = nsId;
         m.session = kSession; m.corr = ++corr_; m.viewName = view; m.keyField = "id"; m.persistence = persistence;
         m.planBlob = plan(view, source, extraColumn, nsId);
+        m.meta = meta_("", "rig", {}, false);
+        return await_(submit_(DdlRequest{std::move(m)}));
+    }
+    Answer createViewWithPlan(const std::string& view, const std::string& keyField, uint8_t persistence, std::vector<uint8_t> planBlob) {
+        CreateViewMsg m;
+        m.session = kSession; m.corr = ++corr_; m.viewName = view; m.keyField = keyField; m.persistence = persistence;
+        m.planBlob = std::move(planBlob);
         m.meta = meta_("", "rig", {}, false);
         return await_(submit_(DdlRequest{std::move(m)}));
     }

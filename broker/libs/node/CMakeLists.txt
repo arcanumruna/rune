@@ -860,7 +860,9 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesKeyedRecoveryTest.cpp
         tests/node/CheckedWritesAdminViewDdlTest.cpp
         tests/node/CheckedWritesViewReadTest.cpp
-        tests/node/CheckedWritesViewReadGatewayTest.cpp)
+        tests/node/CheckedWritesViewReadGatewayTest.cpp
+        tests/node/CheckedWritesQlCompileTest.cpp
+        ${RUNE_BROKER_DIR}/../ql/tests/CheckedWritesQlFuzzTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -869,7 +871,9 @@ if(BUILD_TESTING)
         rune_view
         rune_replication
         rune_codec
+        rune_ql
         GTest::gtest_main)
+    target_compile_definitions(rune_checked_writes_tests PRIVATE RUNE_QL_GOLDEN_DIR="${RUNE_BROKER_DIR}/../ql/tests/golden")
     gtest_discover_tests(rune_checked_writes_tests
         PROPERTIES TIMEOUT 120)
 

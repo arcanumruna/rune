@@ -401,8 +401,10 @@ std::expected<rune::view::ViewPlan, ParseError> applyViewPlan(const CreateViewDe
     for (const auto& g : def.groupBy) usesLower |= g.fn == KeyFunction::Lower;
     if (usesLower) plan.unicodeVersion = rune::codec::kUnicodeVersion;
 
-    if (!def.groupBy.empty() && !(plainKey && def.groupBy.size() == 1 && def.groupBy[0].fn == KeyFunction::None &&
-                                  def.groupBy[0].column == def.key[0].column)) {
+    // A plan that needs no v2 field is the v1 shape: its group column rides as the source key field and `group by` is implied.
+    const bool v2 = def.unique || !def.constraints.empty() || usesLower || !plainKey;
+    if (!def.groupBy.empty() && (v2 || !(def.groupBy.size() == 1 && def.groupBy[0].fn == KeyFunction::None &&
+                                         def.groupBy[0].column == def.key[0].column))) {
         for (const auto& g : def.groupBy) {
             KeyComponent c{g.column, static_cast<uint8_t>(g.fn), g.column};
             for (const auto& k : def.key) {
@@ -411,7 +413,7 @@ std::expected<rune::view::ViewPlan, ParseError> applyViewPlan(const CreateViewDe
             plan.groupBy.push_back(std::move(c));
         }
     }
-    plan.sources.push_back({src.topicId, aggregate ? def.groupBy[0].column : src.keyField});
+    plan.sources.push_back({src.topicId, aggregate && !v2 ? def.groupBy[0].column : src.keyField});
 
     std::vector<ColType> types;   // parallel to plan.output
     auto addReplace = [&](const std::string& name, const rune::codec::FieldDescriptor& f) {
