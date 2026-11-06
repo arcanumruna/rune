@@ -470,6 +470,9 @@ int run(std::vector<std::string> args, std::istream& in, std::ostream& out, std:
     if (cmd == "ql") {
         return cmdQl(std::vector<std::string>(args.begin() + 1, args.end()), in, out, err);
     }
+    if (cmd == "stats") {
+        return cmdStats(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
+    }
     if (cmd == "catalog") {
         return cmdCatalog(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
     }

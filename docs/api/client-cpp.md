@@ -582,7 +582,9 @@ players.send(p);                                                       // routed
 
 ## Materialized views
 
-Views are created from code with a plan and read by key. (Rune QL has no `create view` yet; `drop view` exists.)
+A view is created with Rune QL (`create view`, see [ql.md](ql.md#views)) or from code with a plan; both end in the same authored
+`ViewPlan` and `Client::createViewAndWait`. `rune::ql::applyViewPlan` turns a parsed `create view` into that plan, and a view is read
+with `select` or `getViewRow`. The code path:
 
 ```cpp
 namespace v = rune::client::view;
@@ -629,7 +631,11 @@ if (row.status == ViewRowResult::kOk) {
 A view keyed by up to 128 bytes of typed columns (a plan v2) is authored with `plan.keyComponents`, each `{column, keyFunction, outName}`;
 `keyFunction` 1 is `lower()` (a `string(N)` column only) and then `plan.unicodeVersion` must be `rune::codec::kUnicodeVersion`.
 `group by` columns go in `plan.groupBy` and must equal the key. Send the view's first key component as the `keyField`
-(`v::viewKeyField(plan, keyField)`). The key encoding is in [View keys](codec.md#view-keys).
+(`v::viewKeyField(plan, keyField)`).
+
+Aggregate views are authored two ways. A **v2** aggregate (key components or `group by`) names the topic's key as
+`sources[0].keyField` and always writes `groupBy`; the broker refuses it with `ViewKeyInvalid` if `sources[0].keyField` is not the
+topic's real key. A **v1-shaped** aggregate (a single `key` field, no key components) keeps its group column as before. The key encoding is in [View keys](codec.md#view-keys).
 
 ```cpp
 plan.keyComponents = {{"userId", 0, "userId"}, {"characterId", 0, "characterId"}};   // account_characters
@@ -669,8 +675,34 @@ for (int restarts = 0;;) {                                                      
 - With the token form (`scanView`), a `Completions` that polls the result needs `maxResultBytes` of at least 64 KiB, else the page is `ResultTooLarge`.
   The completion's `OpKind` is `GetViewRowK` or `ScanViewRows`; decode a scan's payload with `rune::client::view::decodeScanPayload`.
 - Both calls end `BrokerTooOld` without sending when the seed's `brokerVersion` is below `kBrokerVersionCheckedWrites` (10).
-- The refusals at create time are error codes 59 (`ViewKeyExpressionInvalid`), 60 and 61 (constraints and `unique`, not yet available).
+- The refusals at create time are error codes 59 (`ViewKeyExpressionInvalid`), 60 (`ViewConstraintInvalid`) and 61 (`ViewUniqueInvalid`);
+  the broker refuses a plan with `unique` (61) or `check` constraints (60) until the view-constraint engine ships.
   A view whose key is not exactly the source key needs a one-partition source.
+
+### Stats
+
+`getStats` / `getStatsAndWait` read the counters of one topic or view partition from its leader (wire frames 91 and 92, ids in
+[wire-protocol.md](wire-protocol.md#stats-client-version-17)).
+
+```cpp
+namespace rpc = rune::protocol::client;
+StatsResult st = client.getStatsAndWait(rpc::StatsScope::TopicPartition, topicId, /*partition=*/0, 5s);
+if (st.status == StatsResult::kOk) {
+    if (auto lag = st.get(rpc::StatId::verdictLag)) { /* *lag records not yet judged */ }
+    for (const auto& c : st.constraints) { /* c.constraintId, c.rejections */ }
+}
+```
+
+- `StatsResult::status`: `kOk`, `kUnknownObject`, `kInvalidRequest`, `kBusy`, `kNotAuthorized`, and the client-side `kNotLeader` (the leader was not
+  reached within `ddlRetryBudget`; a `Redirect` or `NotLeader` from the broker is followed as for `getViewRow`) and `kBrokerTooOld`
+  (nothing was sent; see below).
+- `stats` holds `(id, value)` in ascending id order; `get(id)` returns `std::nullopt` for an id the broker did not report (a stat of the other
+  scope, or a counter the partition does not have). `constraints` holds the per-constraint rejection counts of a topic.
+- The token form `getStats(scope, objectId, partition, target, token)` completes with `OpKind::GetStats`; `value` is the stat count and
+  the payload goes to `decodeStatsPayload`.
+- When the seed's `brokerVersion` is below `kBrokerVersionCheckedWrites` (10) nothing is sent: `getStatsAndWait` returns
+  `StatsResult::kBrokerTooOld` and the token form completes `OpStatus::BrokerTooOld`. The gateway
+  answers a session below `kClientVersionCheckedWrites` with `InvalidRequest`. `rune stats` and `show topic` / `show view` are built on it.
 
 ## Catalog and security reads
 

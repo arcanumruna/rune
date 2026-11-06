@@ -8,6 +8,31 @@
 #include <cstring>
 
 namespace rune::view {
+
+std::optional<rune::codec::PrimType> aggregateOutputType(MergeRule r, rune::codec::PrimType src) noexcept {
+    using P = rune::codec::PrimType;
+    const bool numeric = src == P::Int32 || src == P::Int64 || src == P::UInt16 || src == P::UInt32 ||
+                         src == P::UInt64 || src == P::Float64;
+    switch (r) {
+        case MergeRule::Count:
+        case MergeRule::CountAll: return P::Int64;
+        case MergeRule::Avg:      return numeric ? std::optional<P>(P::Float64) : std::nullopt;
+        case MergeRule::Sum:
+            switch (src) {
+                case P::Int32: case P::Int64:                    return P::Int64;
+                case P::UInt16: case P::UInt32: case P::UInt64:  return P::UInt64;
+                case P::Float64:                                 return P::Float64;
+                default:                                         return std::nullopt;
+            }
+        case MergeRule::Min:
+        case MergeRule::Max:      return numeric ? std::optional<P>(src) : std::nullopt;
+        case MergeRule::Last:
+        case MergeRule::LastNonNull: return src;
+        case MergeRule::Replace:  return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 namespace {
 
 // ---------------------------------------------------------------------------

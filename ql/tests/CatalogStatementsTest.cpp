@@ -30,8 +30,8 @@ TEST(QlCatalogStatementsRegression, WithClauseCarriesEveryCreationSetting) {
     EXPECT_EQ(plan.config.coPartitionGroup, "g");
     EXPECT_FALSE(ql::parse("topic c partitions 1 with (tier = fast);").has_value());
 }
-TEST(QlCatalogStatementsRegression, TypedTopicStillRequiresKey) {
-    EXPECT_FALSE(ql::parse("topic t { id int64 } partitions 1;").has_value());
+TEST(QlCatalogStatementsRegression, TypedTopicKeyIsOptional) {   // R02d: a typed topic may be keyless
+    EXPECT_TRUE(ql::parse("topic t { id int64 } partitions 1;").has_value());
     EXPECT_TRUE(ql::parse("topic t { id int64 } partitions 1 replicas 3 key id;").has_value());
 }
 TEST(QlCatalogStatementsRegression, DropTopicAndView) {
@@ -247,10 +247,10 @@ TEST(QlCatalogStatementsRegression, DottedKeyWithSpacesIsNotTheDottedKey) {
 }
 
 // 7. untyped vs typed
-TEST(QlCatalogStatementsRegression, TypedNeedsBothBracesAndKey) {
+TEST(QlCatalogStatementsRegression, KeyNeedsBraces) {
     auto braceNoKey = ql::parse("topic t { id int64 } partitions 1 replicas 2;");
-    ASSERT_FALSE(braceNoKey.has_value());
-    EXPECT_TRUE(mentions(braceNoKey.error().message, "key"));
+    ASSERT_TRUE(braceNoKey.has_value());
+    EXPECT_TRUE(std::get<ql::TopicDef>(*braceNoKey).keyField.empty());
     auto keyNoBrace = ql::parse("topic t partitions 1 key id;");
     ASSERT_FALSE(keyNoBrace.has_value());
     EXPECT_TRUE(mentions(keyNoBrace.error().message, "key"));

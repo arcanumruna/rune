@@ -29,9 +29,9 @@ struct SuspendRow {
 
 inline constexpr uint16_t kSuspendTableSpan = 96;   // template ids 0..95
 
-inline constexpr std::array<uint16_t, 38> kDispatchedTemplates = {
+inline constexpr std::array<uint16_t, 39> kDispatchedTemplates = {
     1, 3, 4, 6, 8, 10, 12, 14, 16, 18, 21, 32, 34, 36, 38, 40, 42, 45, 47, 49, 51, 53,
-    64, 66, 68, 70, 72, 74, 75, 76, 77, 79, 80, 81, 82, 84, 88, 89};
+    64, 66, 68, 70, 72, 74, 75, 76, 77, 79, 80, 81, 82, 84, 88, 89, 91};
 
 namespace detail {
 constexpr SuspendRow row(uint16_t tid) noexcept {

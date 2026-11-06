@@ -356,9 +356,10 @@ bool prepareAll(std::string_view origin, std::string_view src, const engine::Pre
             << parsed->size() << "; nothing was executed\n";
         return false;
     }
+    engine::PrepareScope scope;
     for (std::size_t i = 0; i < parsed->size(); ++i) {
         std::string why;
-        auto p = engine::prepare((*parsed)[i], opts, why);
+        auto p = engine::prepare((*parsed)[i], opts, scope, why);
         if (!p) {
             prefix(i + 1);
             err << why << "\n";

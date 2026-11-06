@@ -280,6 +280,13 @@ public:
         m.meta = meta_("", "rig", {}, false);
         return await_(submit_(DdlRequest{std::move(m)}));
     }
+    Answer createViewWithPlan(const std::string& view, const std::string& keyField, uint8_t persistence, std::vector<uint8_t> planBlob) {
+        CreateViewMsg m;
+        m.session = kSession; m.corr = ++corr_; m.viewName = view; m.keyField = keyField; m.persistence = persistence;
+        m.planBlob = std::move(planBlob);
+        m.meta = meta_("", "rig", {}, false);
+        return await_(submit_(DdlRequest{std::move(m)}));
+    }
     Answer alterView(const std::string& view, const std::string& source, bool extraColumn,
                      uint32_t expectedVersion = 0) {
         AlterViewMsg m;

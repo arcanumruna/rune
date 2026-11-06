@@ -1563,9 +1563,10 @@ bool defineKeyFeaturesTooOld(std::span<const uint8_t> frame, int32_t brokerVersi
     return d && d->hasKeyFeatures;
 }
 
-// SD11: GetViewRowK / ScanViewRows are served from broker v10 on.  `brokerVersion` 0 = unknown: sent.
-bool viewReadTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
-    return (op == rune::client::OpKind::GetViewRowK || op == rune::client::OpKind::ScanViewRows) && brokerVersion >= 1 &&
+// SD11: GetViewRowK / ScanViewRows / GetStats are served from broker v10 on.  `brokerVersion` 0 = unknown: sent.
+bool checkedWritesReadTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
+    return (op == rune::client::OpKind::GetViewRowK || op == rune::client::OpKind::ScanViewRows || op == rune::client::OpKind::GetStats) &&
+           brokerVersion >= 1 &&
            brokerVersion < rune::protocol::client::kBrokerVersionCheckedWrites;
 }
 }  // namespace
@@ -1815,6 +1816,18 @@ OpResult Client::scanView(int32_t viewTopicId, std::span<const uint8_t> prefix, 
     return issueControl_(OpKind::ScanViewRows, target, token, std::span<const uint8_t>(frame.data(), n), 0);
 }
 
+OpResult Client::getStats(rune::protocol::client::StatsScope scope, int32_t objectId, int32_t partition,
+                          CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::GetStats msg;
+    msg.scope     = scope;
+    msg.objectId  = objectId;
+    msg.partition = partition;
+    uint8_t frame[rpc::MessageHeader::ENCODED_SIZE + rpc::GetStats::BODY_FIXED];
+    const std::size_t n = msg.encode(frame);
+    return issueControl_(OpKind::GetStats, target, token, std::span<const uint8_t>(frame, n), 0);
+}
+
 std::vector<std::pair<std::string, int32_t>> Client::decodeTopicList(std::span<const uint8_t> p) {
     std::vector<std::pair<std::string, int32_t>> out;
     std::size_t at = 0;
@@ -1929,7 +1942,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             }
         }
     }
-    if (viewReadTooOld(h.op, agent_.sessionBrokerVersion(0))) {
+    if (checkedWritesReadTooOld(h.op, agent_.sessionBrokerVersion(0))) {
         completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
         return;
     }
@@ -2146,7 +2159,8 @@ void Client::failDdl_(std::size_t i, uint16_t code, std::string_view detail, int
     // #687: a routing failure of a GetViewRow also names the route it died on and the broker's own code (the
     // errorCode the caller reads is the client-side kNotLeader).  Cold path: one small string.
     std::string routed;
-    if ((p.op == OpKind::GetViewRow || p.op == OpKind::GetViewRowK || p.op == OpKind::ScanViewRows) && (code == 2 || code == 3)) {
+    if ((p.op == OpKind::GetViewRow || p.op == OpKind::GetViewRowK || p.op == OpKind::ScanViewRows || p.op == OpKind::GetStats) &&
+        (code == 2 || code == 3)) {
         const auto* rp = std::get_if<RoutedCtlPending>(&p.ddl);
         routed.reserve(detail.size() + 64);
         routed.append(detail);
@@ -2416,7 +2430,7 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
             heldBudgetEndNs = hld->budgetEndNs;
         } else if (!std::holds_alternative<DdlUnsentOnSeed>(d->retry)) { ++i; continue; }
         if ((p.op == OpKind::DefineTopic && defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0))) ||
-            viewReadTooOld(p.op, agent_.sessionBrokerVersion(0))) {
+            checkedWritesReadTooOld(p.op, agent_.sessionBrokerVersion(0))) {
             PendingCtl dead = takeCtl_(i);   // queued before the seed connected: the version is known now
             completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
             ++work;
@@ -3319,6 +3333,26 @@ ViewScanResult Client::scanViewAndWait(int32_t viewTopicId, std::span<const uint
                      result.status = c.errorCode;
                  } else {
                      throwForStatus_("scanView()", c, p);
+                 }
+             });
+    return result;
+}
+
+StatsResult Client::getStatsAndWait(rune::protocol::client::StatsScope scope, int32_t objectId, int32_t partition,
+                                    std::chrono::nanoseconds timeout) {
+    StatsResult result;
+    andWait_("getStats()", timeout, rune::protocol::client::StatsResponse::kMaxEncodedSize,
+             [&](Completions& q, Token t) { return getStats(scope, objectId, partition, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status == OpStatus::Ok) {
+                     if (!decodeStatsPayload(p, static_cast<uint16_t>(c.value), result)) throw std::runtime_error("getStats(): undecodable response");
+                     result.status = StatsResult::kOk;
+                 } else if (c.status == OpStatus::BrokerError) {
+                     result.status = c.errorCode;
+                 } else if (c.status == OpStatus::BrokerTooOld) {
+                     result.status = StatsResult::kBrokerTooOld;
+                 } else {
+                     throwForStatus_("getStats()", c, p);
                  }
              });
     return result;
@@ -5139,6 +5173,29 @@ void Client::onEgressFrame(codec::TemplateId tid,
             PendingCtl p = takeCtl_(i);
             constexpr std::size_t kVarAt = rpc::MessageHeader::ENCODED_SIZE + rpc::ScanViewRowsResponse::BODY_FIXED;
             completeCtl_(p, opt->status == 0 ? OpStatus::Ok : OpStatus::BrokerError, opt->rowCount, 0, opt->status,
+                         std::span<const uint8_t>(buf + kVarAt, len - kVarAt), detail::CompletionRing::Overflow::TooLarge);
+        }
+        break;
+    }
+
+    // ---- StatsResponse (92): the payload is everything after count; value = count ----
+    case codec::TemplateId::StatsResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::StatsResponse::decode(buf, len);
+        if (!opt) break;
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::GetStats) {
+            if (opt->status == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607: retried
+                onDdlNotLeader_(i, {}, now(), static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable));
+                break;
+            }
+            if (opt->status == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {   // a broker never sends it; routed like the ErrorResponse
+                onDdlNotLeader_(i, {}, now());
+                break;
+            }
+            PendingCtl p = takeCtl_(i);
+            constexpr std::size_t kVarAt = rpc::MessageHeader::ENCODED_SIZE + rpc::StatsResponse::BODY_FIXED;
+            completeCtl_(p, opt->status == 0 ? OpStatus::Ok : OpStatus::BrokerError, opt->count, 0, opt->status,
                          std::span<const uint8_t>(buf + kVarAt, len - kVarAt), detail::CompletionRing::Overflow::TooLarge);
         }
         break;

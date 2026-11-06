@@ -112,6 +112,8 @@ security 64 to 95.
 | 88 | `GetViewRowK` | C→B | `viewTopicId`, `partition`, `requestedFingerprint`, `minOffset`, `key` (1 to 128 bytes) |
 | 89 | `ScanViewRows` | C→B | `viewTopicId`, `limit`, `requestedFingerprint`, `minOffset`, `prefix` (1 to 127 bytes), `resumeToken` (0 or 12 bytes) |
 | 90 | `ScanViewRowsResponse` | B→C | `status`, `rowCount`, `nextToken`, `rows` |
+| 91 | `GetStats` | C→B | `scope` u8 (1 topic partition, 2 view partition), `objectId` i32, `partition` i32 |
+| 92 | `StatsResponse` | B→C | `status` u16, `count` u16, `count` x `(statId u16, value i64)`, `nConstraints` u16, `nConstraints` x `(constraintId u32, rejections u64)` |
 
 Notes:
 
@@ -300,7 +302,7 @@ while the cluster is below the checked-writes feature level.
 - Error codes 59 to 61 are `CreateView` refusals sent to sessions at 17 or above: 59 `ViewKeyExpressionInvalid` (a key
   component that does not compile: a type that is not an integer, enum, bool or `string(N)`, `lower()` on a type other than
   `string(N)`, a duplicate component, a key wider than 128 bytes), 60 `ViewConstraintInvalid` and 61 `ViewUniqueInvalid`. `check` and `unique`
-  clauses are refused until they ship.
+  clauses are refused (60 and 61) until the view-constraint engine ships.
 - A view whose key is not exactly the source key needs a source with one partition (`ViewNotCoPartitioned`).
 
 ## Encrypted frames (TLS 1.3 / AEAD)
@@ -311,6 +313,47 @@ carry the TLS handshake. Afterwards each frame is
 36 bytes of header plus subheader are the AEAD associated data. The subheader is `version u8, cipher u8, epoch u8,
 senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 ([`CryptoEnvelope.h`](../../protocol/include/rune/protocol/client/CryptoEnvelope.h)).
+
+## Stats (client version 17)
+
+`GetStats` (91) reads the counters of one partition of a topic or a view from the partition's leader. It is sent only to a session at
+client version 17 or above (a lower session is answered `StatsResponse` status 5), and the C++ client ends the call `BrokerTooOld`
+without sending when the seed's `brokerVersion` is below `kBrokerVersionCheckedWrites` (10). The caller needs `DESCRIBE` on the
+topic or view. The leader's owning worker answers, so a read costs about as much as a `GetViewRow`.
+
+- **Request** (body 9 bytes): `scope` (1 `TopicPartition`, `objectId` is the topic id; 2 `ViewPartition`, `objectId` is the view's
+  topic id), `objectId`, `partition`. A partition is served by the broker that leads the source topic's partition (for a view,
+  the source's).
+- **Response** (92, body 4 bytes, then the variable part): `status`, `count`, the stats in **strictly ascending** `statId`
+  order (at most 64), then `nConstraints` and the per-constraint entries (at most 256). A decoder requires the exact frame length.
+- **Statuses**: 0 OK, 4 unknown object (an unknown id, a view not served here), 5 invalid request (an undecodable body, a partition
+  out of range, a client below 17), 6 busy (the worker ring is full), 45 not authorized. Status 2 is never sent: a broker that does
+  not lead the partition, or leads a view that is not ready yet, answers an `ErrorResponse` `Redirect` (3) or `NotLeader` (2) and the
+  client follows it as it does for `GetViewRow`.
+- **An id is present only when the counter exists** on the partition: a topic without a judge reports none of ids 1 to 7, one
+  without `autoincrement` none of 8 to 10, so a client asks `StatsResult::get(id)` and treats an absent id as "not applicable".
+
+| Id | Name | Scope | Meaning |
+|---|---|---|---|
+| 1 | `rejectionsKeyExists` | topic | Records the judge rejected as `KeyExists` (56). |
+| 2 | `rejectionsKeyNotFound` | topic | Records rejected as `KeyNotFound` (57). |
+| 3 | `rejectionsConstraint` | topic | Records rejected as `ConstraintViolation` (55). |
+| 4 | `verdictLag` | topic | Log end offset minus the offset the judge has passed. |
+| 5 | `verdictWatermark` | topic | The committed watermark `W` below which every record's verdict is final. |
+| 6 | `verdictMarkersWritten` | topic | Verdict markers (control record 17) the judge appended. |
+| 7 | `rejectedNotCompacted` | topic | Rejected records at or after the last cleaned offset, not yet compacted away. |
+| 8 | `autoIncrementCounter` | topic | The next id the partition would assign. |
+| 9 | `autoIncrementReservedThrough` | topic | The highest id reserved in the log (0 = none). |
+| 10 | `autoIncrementIdsBurned` | topic | Ids taken and never stored: a refused or failed batch, a reservation a failover left unused. |
+| 11 to 20 | transaction vote counters | topic | Defined, not reported yet (the transaction judge, Part 09). |
+| 32 | `uniqueConflicts` | view | Defined, not reported yet (the view-constraint engine, Part 09). |
+| 33 | `scanRows` | view | Rows returned by scans. |
+| 34 | `scanPages` | view | `ScanViewRows` pages served. |
+| 35 | `transientRecordsEvicted` | view | Records a transient source dropped before the view folded them. |
+| 36 | `transientSourceResets` | view | Times the source ring was recreated or cut under the view's cursor. |
+
+Ids 1 to 31 are topic scope and 32 and up are view scope; new ids are appended. The constraint entries are the per-constraint
+rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16 | ordinal`.
 
 ## Error codes
 
@@ -353,9 +396,9 @@ senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 | 31 | `SchemaConflict` | `expectedVersion` is stale. | re-read the schema, then retry |
 | 32 | `ViewExists` |  |  |
 | 33 | `ViewSourceNotFound` |  |  |
-| 34 | `ViewFieldUnresolved` | A plan names a field the source does not have. |  |
+| 34 | `ViewFieldUnresolved` | A plan names a field the source does not have, or an aggregate view's non-key column is not an aggregate. |  |
 | 35 | `ViewKeyInvalid` | `keyU64` does not resolve under the view's key type. |  |
-| 36 | `ViewNotCoPartitioned` | An aggregate view over a source with more than one partition. |  |
+| 36 | `ViewNotCoPartitioned` | An aggregate view, or a view keyed by anything but the source key, over a source with more than one partition. |  |
 | 37 | `ViewSourceTransient` | Reserved; no longer sent. A persisted view may read a transient source. |  |
 | 38 | `ViewNotAlterable` | `alter topic` on a view's output topic. |  |
 | 39 | `InvalidRequest` | The body did not decode, or a DDL argument is out of range (the detail names it). | not retried |
@@ -374,9 +417,9 @@ senderId u8` (0 = gateway, `i+1` = worker `i`) and a `seq u64`
 | 56 | `KeyExists` | Client 17: `insert` on a key that exists. Never visible. | per-record verdict of a `View` ack |
 | 57 | `KeyNotFound` | Client 17: `update` or delete-existing on a key that is absent. Never visible. | per-record verdict of a `View` ack |
 | 58 | `AutoIncrementExhausted` | Client 17: the counter reached `autoincrement.max`. Nothing is stored and the counter is unchanged. | not retried |
-| 59 | `ViewKeyExpressionInvalid` | Client 17: a view key expression does not compile. | DDL compile error |
-| 60 | `ViewConstraintInvalid` | Client 17: a `unique` or `check` constraint does not compile. | DDL compile error |
-| 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. | DDL compile error |
+| 59 | `ViewKeyExpressionInvalid` | Client 17: a view key expression does not compile (a bad type, `lower()` on a non-string, a duplicate or over-wide key, the identity rule). | DDL compile error |
+| 60 | `ViewConstraintInvalid` | Client 17: a `check` constraint does not compile. Until the view-constraint engine ships, any view with a `check`. | DDL compile error |
+| 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. Until the view-constraint engine ships, any `unique` view. | DDL compile error |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,

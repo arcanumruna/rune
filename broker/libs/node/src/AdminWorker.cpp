@@ -1297,7 +1297,7 @@ void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
     // refusals whose reason names what to change.
     const bool viaError = !r.detail.empty() && deps_.respondError &&
                           (r.code == kInvalidRequest || r.code == kInvalidSchema || r.code == kViewSourceNotFound ||
-                           r.code == kViewKeyInvalid || r.code == kViewNotCoPartitioned || r.code == kViewKeyExpressionInvalid ||
+                           r.code == kViewFieldUnresolved || r.code == kViewKeyInvalid || r.code == kViewNotCoPartitioned || r.code == kViewKeyExpressionInvalid ||
                            r.code == kViewConstraintInvalid || r.code == kViewUniqueInvalid);
     auto byTemplate = [&](uint16_t tid, int64_t session, int64_t corr) {
         switch (tid) {
@@ -1658,18 +1658,15 @@ AdminWorker::viewDef_(const std::string& name, const std::string& keyField, uint
                                     viewTopicId);
     if (!compiled) {
         switch (compiled.error().kind) {
+            case rv::CompileErrorKind::Generic:   // unreachable: every compile site names its kind
             case rv::CompileErrorKind::FieldUnresolved:      return Rejected(reject(kViewFieldUnresolved, compiled.error().message));
             case rv::CompileErrorKind::KeyInvalid:           return Rejected(reject(kViewKeyInvalid, compiled.error().message));
             case rv::CompileErrorKind::KeyExpressionInvalid: return Rejected(reject(kViewKeyExpressionInvalid, compiled.error().message));
             case rv::CompileErrorKind::ConstraintInvalid:    return Rejected(reject(kViewConstraintInvalid, compiled.error().message));
             case rv::CompileErrorKind::UniqueInvalid:        return Rejected(reject(kViewUniqueInvalid, compiled.error().message));
             case rv::CompileErrorKind::NotCoPartitioned:     return Rejected(reject(kViewNotCoPartitioned, compiled.error().message));
-            case rv::CompileErrorKind::Generic:              break;
         }
-        // Generic: the message decides — key-related → KeyInvalid, else FieldUnresolved.
-        std::string lc = compiled.error().message;
-        std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return Rejected(reject(lc.find("key") != std::string::npos ? kViewKeyInvalid : kViewFieldUnresolved));
+        return Rejected(reject(kViewFieldUnresolved, compiled.error().message));
     }
     // An old broker cannot host what the authored plan hid: a Keyed or v2 compiled plan, or an aggregate over a source key that is
     // not 8 bytes (its fold drops every record).

@@ -14,10 +14,15 @@
 #include <rune/catalog/CatalogReplayer.h>
 #include <rune/catalog/CatalogState.h>
 
+#ifdef RUNE_CLI_LIVE_ENABLED
+#include <rune/client/Client.h>
+#endif
+
 #include <cstdint>
 #include <istream>
 #include <optional>
 #include <ostream>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -70,11 +75,28 @@ template <class RefreshFn, class LookupFn, class NowFn, class PauseFn>
 /// `+ topic NAME` | `- view NAME` | `~ topic NAME: field, field`  (no newline)
 [[nodiscard]] std::string formatDiffEntry(const rune::catalog::DiffEntry&);
 
+#ifdef RUNE_CLI_LIVE_ENABLED
+/// One partition's counters, and the label of each of `result.constraints` (`<view>.<constraint>`, `<view>.unique`).
+struct PartitionStats {
+    int32_t                   partition = 0;
+    rune::client::StatsResult result;
+    std::vector<std::string>  constraintLabels;
+    std::string               constraintsNote;   // why `result.constraints` is empty when the caller may not read them
+};
+
+/// Per partition `  partition <p>`, `    <stat> <value>` in id order, `    constraint <label> <rejections>`; `    (no counters)` for none.
+[[nodiscard]] std::string formatStatsText(std::span<const PartitionStats>);
+/// `{"<objectKind>": "<name>", "partitions": [{"partition": 0, "stats": {...}, "constraints": [...]}]}` on one line, no newline.
+[[nodiscard]] std::string formatStatsJson(std::string_view objectKind, std::string_view name, std::span<const PartitionStats>);
+#endif
+
 /// Prints the `rune ql` / `rune catalog` usage lines.
 void printCatalogUsage(std::ostream& err);
 
 /// `rune ql …`: args are everything after "ql".
 int cmdQl(const std::vector<std::string>& args, std::istream& in, std::ostream& out, std::ostream& err);
+/// `rune stats (topic | view) <name> …`: args are everything after "stats".
+int cmdStats(const std::vector<std::string>& args, std::ostream& out, std::ostream& err);
 /// `rune catalog export|replay|diff …`: args are everything after "catalog".
 int cmdCatalog(const std::vector<std::string>& args, std::ostream& out, std::ostream& err);
 

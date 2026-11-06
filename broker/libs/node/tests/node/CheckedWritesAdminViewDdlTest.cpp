@@ -6,6 +6,7 @@
 #include <rune/codec/UnicodeLower.h>
 #include <rune/codec/ViewKeyEncoding.h>
 #include <rune/replication/ReplicationMessages.h>
+#include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewPlan.h>
 
 #include "support/CatalogDdlRig.h"
@@ -368,4 +369,91 @@ TEST(CheckedWritesAdminViewDdlRegression, SourceKeyFieldMustBeTheTopicKeyRegress
     legacy.key = "userId";
     const auto e = createView(rig, legacy, "userId");
     EXPECT_EQ(e.code, kOk) << e.detail;
+}
+
+namespace {
+
+rune::codec::Descriptor siteDescriptor() {
+    return rune::codec::DescriptorBuilder("src", 1)
+        .add("id", PrimType::UInt64, 1, true).add("userId", PrimType::UInt64).add("n", PrimType::Int64)
+        .add("bio", PrimType::String).add("apiKey", PrimType::String).addFixedStr("label", 16).build();
+}
+
+rv::ViewPlan sitePlan(CatalogDdlRig& rig, const char* view, std::initializer_list<rv::AuthoredField> output, const char* key = "id",
+                      const char* sourceKey = "id") {
+    rv::ViewPlan v;
+    v.viewName = view;
+    v.key = key;
+    v.sources = {{topicIdOf(rig, "src"), sourceKey}};
+    v.output = output;
+    return v;
+}
+
+}  // namespace
+
+TEST(CheckedWritesAdminViewDdlRegression, NamesContainingKeyKeepTheirCodeRegression) {
+    CatalogDdlRig rig("cwavm");
+    atLevel(rig);
+    ASSERT_EQ(define(rig, "src", "id", siteDescriptor()).code, kOk);
+    const rv::AuthoredField id{"id", PrimType::UInt64, 0, "id", rv::MergeRule::Replace};
+
+    // The view's name has "key" in it; the refusal is about a field, 34.
+    const auto monkey = createView(rig, sitePlan(rig, "monkey", {id, {"n", PrimType::Int64, 0, "nope", rv::MergeRule::Replace}}), "id");
+    EXPECT_EQ(monkey.code, codeOf(ErrorCode::ViewFieldUnresolved));
+    EXPECT_EQ(monkey.detail, "view 'monkey': output field 'n' references unknown source field 'nope'");
+
+    // So does a column called apiKey.
+    const auto api = createView(rig, sitePlan(rig, "v", {id, {"x", PrimType::String, 0, "apiKey", rv::MergeRule::Replace}}), "id");
+    EXPECT_EQ(api.code, codeOf(ErrorCode::ViewFieldUnresolved));
+    EXPECT_EQ(api.detail, "view 'v': output field 'x' source field 'apiKey' is var-len; Phase 1 views support fixed-width columns only");
+
+    // A var-len source key field is about the key, 35.
+    const auto key = createView(rig, sitePlan(rig, "v", {id}, "id", "bio"), "id");
+    EXPECT_EQ(key.code, codeOf(ErrorCode::ViewKeyInvalid));
+    EXPECT_EQ(key.detail, "view 'v': source 0 key field 'bio' is var-len; keys must be fixed-width");
+}
+
+TEST(CheckedWritesAdminViewDdlRegression, EveryCompileRefusalCarriesTheCompilerMessageRegression) {
+    CatalogDdlRig rig("cwavs");
+    atLevel(rig);
+    const auto d = siteDescriptor();
+    ASSERT_EQ(define(rig, "src", "id", d).code, kOk);
+    const rv::AuthoredField id{"id", PrimType::UInt64, 0, "id", rv::MergeRule::Replace};
+    const auto withId = [&](rv::AuthoredField f) { return sitePlan(rig, "v", {id, std::move(f)}); };
+
+    struct Site { const char* label; rv::ViewPlan plan; ErrorCode code; };
+    std::vector<Site> sites;
+    sites.push_back({"two sources", sitePlan(rig, "v", {id}), ErrorCode::ViewFieldUnresolved});
+    sites.back().plan.sources.push_back(sites.back().plan.sources[0]);
+    sites.push_back({"no output", sitePlan(rig, "v", {}), ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"count(*) with a field", withId({"x", PrimType::Int64, 0, "n", rv::MergeRule::CountAll}), ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"count(*) type", withId({"x", PrimType::Int32, 0, "", rv::MergeRule::CountAll}), ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"sourceIdx", withId({"x", PrimType::Int64, 1, "n", rv::MergeRule::Replace}), ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"unknown field", withId({"x", PrimType::Int64, 0, "nope", rv::MergeRule::Replace}), ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"var-len field", withId({"x", PrimType::String, 0, "bio", rv::MergeRule::Replace}), ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"not numeric", withId({"x", PrimType::Int64, 0, "label", rv::MergeRule::Sum}), ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"aggregate type", withId({"x", PrimType::Int32, 0, "n", rv::MergeRule::Max}), ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"replace type", withId({"x", PrimType::Int32, 0, "n", rv::MergeRule::Replace}), ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"duplicate output", withId({"id", PrimType::Int64, 0, "n", rv::MergeRule::Replace}), ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"key not found", sitePlan(rig, "v", {id}, "id", "nope"), ErrorCode::ViewKeyInvalid});
+    sites.push_back({"key var-len", sitePlan(rig, "v", {id}, "id", "bio"), ErrorCode::ViewKeyInvalid});
+    sites.push_back({"non-aggregate column", sitePlan(rig, "v", {{"userId", PrimType::UInt64, 0, "userId", rv::MergeRule::Replace},
+                                                                  {"n", PrimType::Int64, 0, "n", rv::MergeRule::Replace},
+                                                                  {"c", PrimType::Int64, 0, "", rv::MergeRule::CountAll}}, "userId", "userId"),
+                     ErrorCode::ViewFieldUnresolved});
+    sites.push_back({"key not in output", sitePlan(rig, "v", {{"c", PrimType::Int64, 0, "", rv::MergeRule::CountAll}}, "userId", "userId"),
+                     ErrorCode::ViewKeyInvalid});
+    sites.push_back({"group-by column rule", sitePlan(rig, "v", {{"userId", PrimType::UInt64, 0, "userId", rv::MergeRule::Max},
+                                                                  {"c", PrimType::Int64, 0, "", rv::MergeRule::CountAll}}, "userId", "userId"),
+                     ErrorCode::ViewFieldUnresolved});
+
+    for (const Site& s : sites) {
+        const rune::codec::Descriptor* srcs[] = {&d, &d};
+        const auto direct = rv::compileView(s.plan, std::span(srcs, s.plan.sources.size()), 0);
+        ASSERT_FALSE(direct.has_value()) << s.label;
+        const auto a = createView(rig, s.plan, "id");
+        EXPECT_EQ(a.code, codeOf(s.code)) << s.label << ": " << a.detail;
+        EXPECT_EQ(a.detail, direct.error().message) << s.label;
+        EXPECT_FALSE(a.detail.empty()) << s.label;
+    }
 }

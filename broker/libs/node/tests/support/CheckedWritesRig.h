@@ -17,6 +17,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/StatsMessages.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/Log.h>
@@ -440,6 +441,7 @@ public:
         worker->drainReturn([&](WorkerReturn r) {
             if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
             else if (r.type == WorkerReturn::Type::ViewRowResult || r.type == WorkerReturn::Type::ViewScanResult) viewAnswers_.push_back(std::move(r));
+            else if (r.type == WorkerReturn::Type::StatsResult) statsAnswers_.push_back(std::move(r));
         }, [](const TxnReturn&) {});
         if (agent) { if (!pauseAgent) (void)agent->doWork(now); }
         else channel.deltas.drain([this](int32_t, aeron::concurrent::AtomicBuffer& buf, OneToOneByteRing::index_t off, OneToOneByteRing::index_t) {
@@ -514,6 +516,39 @@ public:
         }
         ADD_FAILURE() << "the view stayed NotReady";
         return {};
+    }
+    /// One answer to a GetStats: the status (the worker's internal not-leader sentinel sets notLeader), the stat entries and the constraint entries.
+    struct StatsReply {
+        uint16_t status = 0;
+        std::vector<std::pair<uint16_t, int64_t>> stats;
+        std::vector<std::pair<uint32_t, uint64_t>> constraints;
+        bool notLeader = false;
+    };
+    /// A GetStats through the worker's op path.
+    StatsReply getStats(rune::protocol::client::StatsScope scope, int32_t objectId, int32_t partition) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::GetStats; op.topicId = objectId; op.partition = partition; op.sessionId = 1; op.correlationId = ++corr;
+        op.recordCount = static_cast<int32_t>(scope);
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+        statsAnswers_.clear();
+        for (int i = 0; i < 20 && statsAnswers_.empty(); ++i) pass();
+        if (statsAnswers_.empty()) { ADD_FAILURE() << "no answer to a GetStats"; return {}; }
+        const WorkerReturn r = std::move(statsAnswers_.front());
+        StatsReply out;
+        out.notLeader = r.errorCode == kViewRowNotLeaderInternal;
+        out.status = static_cast<uint16_t>(r.errorCode);
+        const std::span<const uint8_t> c = r.chunkBytes();
+        const std::size_t count = static_cast<std::size_t>(r.recordCount);
+        EXPECT_GE(c.size(), count * 10 + 2);
+        for (std::size_t i = 0; i < count; ++i)
+            out.stats.emplace_back(rune::protocol::client::detail::getLE16(c.data(), static_cast<int>(i * 10)),
+                                   rune::protocol::client::detail::getLE64(c.data(), static_cast<int>(i * 10 + 2)));
+        const std::size_t nc = rune::protocol::client::detail::getLE16(c.data(), static_cast<int>(count * 10));
+        EXPECT_EQ(c.size(), count * 10 + 2 + nc * 12);
+        for (std::size_t i = 0; i < nc; ++i)
+            out.constraints.emplace_back(static_cast<uint32_t>(rune::protocol::client::detail::getLE32(c.data(), static_cast<int>(count * 10 + 2 + i * 12))),
+                                         static_cast<uint64_t>(rune::protocol::client::detail::getLE64(c.data(), static_cast<int>(count * 10 + 2 + i * 12 + 4))));
+        return out;
     }
     ViewRead getViewRowK(int32_t view, std::span<const uint8_t> key, int64_t minOffset = -1) { return viewRead(WorkerOp::Type::GetViewRowK, view, key, {}, 0, minOffset); }
     /// Every row under `prefix`, `limit` rows a page.  A page comes in table order: compare the result as a set.
@@ -1121,6 +1156,7 @@ private:
     KeyShape keyShape_;
     std::optional<rune::codec::Descriptor> customSrc_;   ///< useSource(): the source's schema
     std::vector<WorkerReturn> viewAnswers_;
+    std::vector<WorkerReturn> statsAnswers_;
     bool keyIndexOn_ = false, holdJudge_ = false;
     int delayedSpecIn_ = 0;
     std::filesystem::path viewDir_, logDir_;

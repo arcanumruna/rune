@@ -211,3 +211,11 @@ TEST(CheckedWritesViewPlanAuthored, KeyDisplayName) {
     p.keyComponents = {{"id", 0, "id"}};
     EXPECT_EQ(keyDisplayName(p), "id");
 }
+
+TEST(CheckedWritesViewPlanAuthored, AggregateOutputTypes) {
+    using rune::codec::PrimType;
+    EXPECT_EQ(aggregateOutputType(MergeRule::Max, PrimType::UInt16), PrimType::UInt16);
+    EXPECT_EQ(aggregateOutputType(MergeRule::Max, PrimType::Bool), std::nullopt);
+    EXPECT_EQ(aggregateOutputType(MergeRule::LastNonNull, PrimType::FixedStr), PrimType::FixedStr);
+    EXPECT_EQ(aggregateOutputType(MergeRule::Replace, PrimType::Int64), std::nullopt);
+}

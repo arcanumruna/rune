@@ -1304,6 +1304,7 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::GetViewRow:
         case pc::TemplateId::GetViewRowK:
         case pc::TemplateId::ScanViewRows:
+        case pc::TemplateId::GetStats:
             if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
                 sessions_.touch(hdr->sessionId, nowNs_);
             }
@@ -1433,6 +1434,9 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::ScanViewRows:
             handleScanViewRows(buf, len);
+            break;
+        case pc::TemplateId::GetStats:
+            handleGetStats(buf, len);
             break;
         default:
             // ConnectResponse, ErrorResponse, Pong, MetadataResponse (broker→client),
@@ -5963,10 +5967,16 @@ bool ClientGateway::viewSourceLedElsewhere_(int32_t viewTopicId, int32_t partiti
                                             std::string_view& endpoint) const noexcept
 {
     endpoint = {};
-    if (!routingImage_) return false;
     const int32_t src = viewSourceOf_(viewTopicId);
-    if (src < 0) return false;
-    const auto& e = routingImage_.get()->lookup(rune::metadata::gpidOf(src, partition));
+    return src >= 0 && partitionLedElsewhere_(src, partition, endpoint);
+}
+
+bool ClientGateway::partitionLedElsewhere_(int32_t topicId, int32_t partition,
+                                           std::string_view& endpoint) const noexcept
+{
+    endpoint = {};
+    if (!routingImage_) return false;
+    const auto& e = routingImage_.get()->lookup(rune::metadata::gpidOf(topicId, partition));
     if (e.leaderNodeId == thisNodeId_) return false;
     if (e.leaderNodeId != rune::metadata::RoutingImage::NO_LEADER_NODE_ID)
         if (const auto it = nodeEndpointMap_.find(e.leaderNodeId); it != nodeEndpointMap_.end())
@@ -7459,6 +7469,39 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             }
             const std::size_t encoded = resp.encode(scratch_.data());
             sendReliable_(*session, scratch_.data(), encoded);
+            return;
+        }
+
+        // Checked writes Part 08: StatsResult - a worker's GetStats answer.  The chunk is [count x 10 B][nConstraints u16]
+        // [n x 12 B]; the entries go out verbatim.
+        if (ret.type == rune::node::WorkerReturn::Type::StatsResult) {
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+            if (ret.errorCode == rune::node::kViewRowNotLeaderInternal) [[unlikely]] {
+                std::string_view ep;
+                if (ret.isolation == static_cast<uint8_t>(pc::StatsScope::TopicPartition)) (void)partitionLedElsewhere_(ret.readTopicId, ret.readPartition, ep);
+                else (void)viewSourceLedElsewhere_(ret.readTopicId, ret.readPartition, ep);
+                sendRouteRefusal_(*session, ret.sessionId, ret.correlationId, ep);
+                return;
+            }
+            const std::span<const uint8_t> chunk = ret.chunkBytes();
+            pc::StatsResponse resp;
+            resp.sessionId        = ret.sessionId;
+            resp.correlationId    = ret.correlationId;
+            resp.status           = static_cast<uint16_t>(ret.errorCode);
+            resp.count            = static_cast<uint16_t>(ret.recordCount);
+            const std::size_t statLen = static_cast<std::size_t>(resp.count) * pc::StatsResponse::kStatBytes;
+            const std::size_t nConstraints = chunk.size() >= statLen + 2 ? pc::detail::getLE16(chunk.data(), static_cast<int>(statLen)) : 0;
+            if (resp.count > pc::StatsResponse::kMaxStats || nConstraints > pc::StatsResponse::kMaxConstraintEntries ||
+                chunk.size() != statLen + 2 + nConstraints * pc::StatsResponse::kConstraintBytes) [[unlikely]] {
+                resp.status = pc::StatsResponse::kInvalidRequest;
+                resp.count  = 0;
+            } else {
+                resp.statBytes       = chunk.first(statLen);
+                resp.constraintCount = static_cast<uint16_t>(nConstraints);
+                resp.constraintBytes = chunk.subspan(statLen + 2);
+            }
+            sendReliable_(*session, scratch_.data(), resp.encode(scratch_.data()));
             return;
         }
 
@@ -10700,6 +10743,78 @@ void ClientGateway::enqueueViewRead_(const uint8_t* buf, std::size_t len, Sessio
     const int32_t routeTopic = viewSrc >= 0 ? viewSrc : op.topicId;
     if (!workerPool_->tryEnqueueOp(routeTopic, op.partition, std::move(op)))
         (void)rejectRequest_(buf, len, pc::ViewRowResponse::kBusy, "view read: worker ring full");
+}
+
+// Checked writes Part 08: GetStats (91).  Every refusal is a status-only StatsResponse; the stats of a partition come from its
+// leader's owning worker only, routed like GetViewRow (a scope 2 object routes by its source).
+void ClientGateway::handleGetStats(const uint8_t* buf, std::size_t len)
+{
+    using SR = pc::StatsResponse;
+    const auto m = pc::GetStats::decode(buf, len);
+    if (!m) {
+        (void)rejectRequest_(buf, len, SR::kInvalidRequest, "GetStats body undecodable");
+        return;
+    }
+    Session* session = sessions_.find(m->sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, "GetStats for unknown session");
+        return;
+    }
+    if (session->clientVersion < pc::kClientVersionCheckedWrites) {
+        (void)rejectRequest_(buf, len, SR::kInvalidRequest, "GetStats: client version below checked writes");
+        return;
+    }
+    const bool viewScope = m->scope == pc::StatsScope::ViewPartition;
+    if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
+        if (const auto denial = authorizeTopicIdHere_(perms, m->objectId, m->partition, rune::security::Operation::Describe,
+                                                      viewScope ? rune::security::ResourceType::View : rune::security::ResourceType::Topic)) {
+            if (denial->code != static_cast<uint16_t>(pc::ErrorCode::NotAuthorized)) {   // not applied here yet: retriable, a StatsResponse has no status for it
+                sendRouteRefusal_(*session, m->sessionId, m->correlationId, {});
+                return;
+            }
+            (void)deny_(*session, denial, buf, len);
+            return;
+        }
+    if (!workerPool_ || topicRegistry_ == nullptr || inDeletingNs_(m->objectId)) {
+        (void)rejectRequest_(buf, len, SR::kUnknownObject, "GetStats: object not served here");
+        return;
+    }
+    const int32_t routeTopic = viewScope ? viewSourceOf_(m->objectId) : m->objectId;
+    const rune::node::TopicSpec* spec = routeTopic >= 0 ? topicRegistry_->topic(routeTopic) : nullptr;
+    if (spec == nullptr) {
+        (void)rejectRequest_(buf, len, SR::kUnknownObject, "GetStats: unknown object");
+        return;
+    }
+    if (m->partition < 0 || m->partition >= spec->partitionCount) {
+        (void)rejectRequest_(buf, len, SR::kInvalidRequest, "GetStats: partition out of range");
+        return;
+    }
+    if (viewScope) {
+        // The gate speaks ViewRowResponse codes; a StatsResponse has its own (2 is not one of them).
+        const uint16_t gate = viewRowGate_(m->objectId, m->partition);
+        if (gate == pc::ViewRowResponse::kNotReady) {
+            sendRouteRefusal_(*session, m->sessionId, m->correlationId, {});
+            return;
+        }
+        if (gate != kViewRowNoGate) {
+            (void)rejectRequest_(buf, len, SR::kUnknownObject, "GetStats: view not served here (C1)");
+            return;
+        }
+    }
+    if (std::string_view ep; partitionLedElsewhere_(routeTopic, m->partition, ep)) {
+        sendRouteRefusal_(*session, m->sessionId, m->correlationId, ep);
+        return;
+    }
+
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::GetStats;
+    op.topicId       = m->objectId;
+    op.partition     = m->partition;
+    op.sessionId     = m->sessionId;
+    op.correlationId = m->correlationId;
+    op.recordCount   = static_cast<int32_t>(m->scope);
+    if (!workerPool_->tryEnqueueOp(routeTopic, m->partition, std::move(op)))
+        (void)rejectRequest_(buf, len, SR::kBusy, "GetStats: worker ring full");
 }
 
 void ClientGateway::handleGetViewRowK(const uint8_t* buf, std::size_t len)

@@ -203,7 +203,7 @@ TEST(CheckedWritesViewReadMessages, KnownTemplates) {
     EXPECT_TRUE(pc::isKnownTemplate(88));
     EXPECT_TRUE(pc::isKnownTemplate(89));
     EXPECT_TRUE(pc::isKnownTemplate(90));
-    EXPECT_FALSE(pc::isKnownTemplate(91));
+    EXPECT_FALSE(pc::isKnownTemplate(93));
 }
 
 TEST(CheckedWritesViewReadMessages, ConformanceVectors) {

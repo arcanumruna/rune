@@ -44,6 +44,10 @@ static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::TxnVerifyRequest) ==
 static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::ViewScanResult) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::VIEW_SCAN_RESULT),
               "WorkerReturn::ViewScanResult must stay on sbe ReturnType::VIEW_SCAN_RESULT");
+// Checked writes Part 08: StatsResult rides sbe ReturnType::STATS_RESULT (value 10).
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::StatsResult) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::STATS_RESULT),
+              "WorkerReturn::StatsResult must stay on sbe ReturnType::STATS_RESULT");
 
 // ---------------------------------------------------------------------------
 // WorkerReturn (template id 2)

@@ -1,6 +1,6 @@
 # The `rune` command line
 
-One executable, five command groups: `rune console`, `rune schema`, `rune ql`, `rune catalog` and `rune security`. It is built from
+One executable, six command groups: `rune console`, `rune schema`, `rune ql`, `rune stats`, `rune catalog` and `rune security`. It is built from
 `client-cpp/tools/rune_cli.cpp` and `client-cpp/src/cli/`, and talks to a broker with the C++ client in invoker mode.
 Run it with no arguments to print the usage.
 
@@ -34,8 +34,8 @@ rune ql (-e "<statement>" | -f <file|->) [--dry-run] [--verbose] [--request-id <
         [--expected-version N] --broker host:port
 ```
 
-Executes Rune QL: DDL (topics, drops, security) and reads (`SHOW HISTORY`, `SHOW ... AS OF`, `DIFF`, `SHOW USERS`, ...).
-The statement text is recorded in the catalog. The grammar and examples are in [ql.md](ql.md).
+Executes Rune QL: DDL (topics, views, drops, security) and reads (`SELECT`, `SHOW TOPIC`, `SHOW VIEW`, `SHOW HISTORY`,
+`SHOW ... AS OF`, `DIFF`, `SHOW USERS`, ...). The statement text is recorded in the catalog. The grammar and examples are in [ql.md](ql.md).
 
 | Flag | Meaning |
 |---|---|
@@ -48,6 +48,20 @@ The statement text is recorded in the catalog. The grammar and examples are in [
 
 `rune ql` exits `1` on any failure; it does not map a broker refusal to its wire code (`rune console -f` does).
 
+**`select` and `show`.** `select` prints a table: a header line of column names, one line per row, then `(N rows)`; a point read that
+finds nothing prints `(no row)`; a `NULL` aggregate prints `NULL`. Columns are padded to the widest cell. Point and scan rules are in
+[ql.md](ql.md#reads).
+
+```bash
+rune ql -e "select * from account_stats where userId = 42;" --broker rune-1:40200
+rune ql -e "show view account_stats;" --broker rune-1:40200
+rune ql -e "show topic character;" --broker rune-1:40200
+```
+
+`show topic NAME` and `show view NAME` print the definition (the same text as `show ... as of` prints for the current version),
+then the partition counters exactly as `rune stats` prints them. `--dry-run` prints a `create view` with its key, output
+columns, constraints and plan version (`v2` when the plan needs it), and a `select` as parsed, without a broker.
+
 **Back-filling an autoincrement topic.** Importing rows with their old ids needs the `IMPORT` grant
 ([ql.md](ql.md#autoincrement)), which nothing else implies:
 
@@ -58,6 +72,52 @@ rune ql -e "grant import on topic 'user' to user backfill" --broker rune-1:40200
 The back-fill job writes every row with its id kept (`insert`, `Acks::All | Acks::View`, an idempotent producer). The broker
 moves the counter above the highest imported id, so live inserts that follow with key 0 get fresh ids. Revoke the grant
 when the import is done: `revoke import on topic 'user' from user backfill`.
+
+## `rune stats`
+
+```text
+rune stats (topic | view) <name> [--partition N] [--json] --broker host:port
+```
+
+Prints the counters of every partition of a topic or view, each read from the partition's leader with `GetStats`
+([wire-protocol.md](wire-protocol.md#stats-client-version-17)). It needs `DESCRIBE` on the object and a broker at version
+`kBrokerVersionCheckedWrites` (10) or above; the connection flags above apply.
+
+| Flag | Meaning |
+|---|---|
+| `--partition N` | Only partition `N` (default: all). |
+| `--json` | One line of JSON instead of text. |
+| `--broker host:port` | Any broker (or `RUNE_BROKER`). |
+
+Text: a `partition N` line, then one `<name> <value>` line per reported counter in id order and one `constraint <name> <rejections>`
+line per constraint, labelled `<view>.unique` or `<view>.<constraint name>`. A view's constraint counts are the rejections its source
+partition's judge recorded, so `rune stats view` reads the source partition too. A counter the partition does not have is not printed,
+and a partition with none prints `(no counters)`.
+
+```text
+$ rune stats topic character --broker rune-1:40200
+  partition 0
+    rejectionsKeyExists 0
+    rejectionsKeyNotFound 0
+    rejectionsConstraint 0
+    verdictLag 0
+    verdictWatermark 1048
+    verdictMarkersWritten 11
+    rejectedNotCompacted 0
+    autoIncrementCounter 1049
+    autoIncrementReservedThrough 4097
+    autoIncrementIdsBurned 0
+```
+
+JSON, with the same names and the constraints as `{constraintId, label, rejections}`:
+
+```text
+$ rune stats view account_stats --partition 0 --json --broker rune-1:40200
+{"view": "account_stats", "partitions": [{"partition": 0, "stats": {"scanRows": 0, "scanPages": 0, "transientRecordsEvicted": 0, "transientSourceResets": 0}, "constraints": []}]}
+```
+
+Exit codes: `0` success, `1` an unknown topic or view or a stats read that failed (the first failing partition ends the command with
+`stats of partition N: <reason>`, such as `not authorized` or `the partition's leader was not reached`), `2` usage.
 
 ## `rune console`
 

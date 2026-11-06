@@ -1632,6 +1632,7 @@ if(BUILD_TESTING)
             tests/client/ClaimClientTest.cpp
             tests/client/TypedClaimTest.cpp
             tests/client/CheckedWritesTypedTopicCqTest.cpp   # checked writes: TypedTopic cq forms, ProducerRef
+            tests/client/CheckedWritesClientStatsTest.cpp    # checked writes Part 08: getStats over GetStats 91
             tests/client/IngressEndpointRoutingTest.cpp
             tests/client/ClientResponseEgressRegressionTest.cpp   # NAT egress Task 7
             tests/producer/ProducerRouteParkTest.cpp
@@ -1818,7 +1819,7 @@ if(aeron_FOUND)
     target_include_directories(rune_cli_lib PUBLIC
         ${RUNE_PROTOCOL_INCLUDE}
     )
-    target_link_libraries(rune_cli_lib PUBLIC rune_client_api)
+    target_link_libraries(rune_cli_lib PUBLIC rune_client_api rune_client_view)
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB_RUNE uuid)
         if(UUID_LIB_RUNE)
@@ -1854,8 +1855,12 @@ endif()
 if(BUILD_TESTING)
     add_executable(rune_cli_catalog_tests
         tests/RuneCliCatalogTest.cpp
+        tests/CheckedWritesQlCliTest.cpp
     )
-    target_include_directories(rune_cli_catalog_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_include_directories(rune_cli_catalog_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)   # QlEngine.h (internal)
+    target_compile_definitions(rune_cli_catalog_tests PRIVATE
+        RUNE_QL_GOLDEN_DIR="${RUNE_QL_ROOT}/tests/golden"
+        RUNE_CLI_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/golden")
     target_link_libraries(rune_cli_catalog_tests PRIVATE rune_cli_lib rune_catalog GTest::gtest_main)
     target_compile_features(rune_cli_catalog_tests PRIVATE cxx_std_23)
     gtest_discover_tests(rune_cli_catalog_tests)

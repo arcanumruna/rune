@@ -464,3 +464,78 @@ TEST(CheckedWritesAllocRegression, KeyedFoldAndViewReadsAllocateNothingRegressio
     EXPECT_GT(rows - rowsBefore, 0u) << "the scans returned rows";
     EXPECT_EQ(allocs, 0u);
 }
+
+// Part 08 (hard rule): GetStats allocates nothing - the worker collects into its scratch and gathers into the return ring; the
+// gateway routes it and encodes the answer into its scratch.  Both scopes, 1,000 of each, through the worker alone and through
+// the gateway.
+TEST(CheckedWritesAllocRegression, StatsServingAllocatesNothingRegression) {
+    namespace pc = rune::protocol::client;
+    {
+        VerdictRig r;
+        r.createAutoIncTopic({});
+        r.installProjection(0x40000602);
+        r.enableAcks();
+        r.passes(60);
+        ASSERT_TRUE(r.ack(r.produceFrame({Rec{0, 1, 0, false, 1}, Rec{0, 2, 0, false, 1}}, kAllView, 100, 0)));
+        ASSERT_TRUE(r.driveUntilJudged());
+
+        uint64_t answered = 0;
+        const auto ask = [&](pc::StatsScope scope, int32_t id) {
+            WorkerOp op;
+            op.type = WorkerOp::Type::GetStats; op.topicId = id; op.partition = 0; op.sessionId = 1; op.correlationId = 1;
+            op.recordCount = static_cast<int32_t>(scope);
+            const bool queued = r.worker->tryEnqueueOp(std::move(op));
+            r.now += 1'000'000;
+            r.worker->doWork(r.now);
+            r.worker->drainReturnView([&](WorkerReturn&& ret) { answered += ret.type == WorkerReturn::Type::StatsResult && ret.errorCode == 0 ? 1 : 0; });
+            return queued;
+        };
+        for (int i = 0; i < 4; ++i) { (void)ask(pc::StatsScope::TopicPartition, VerdictRig::kSrc); (void)ask(pc::StatsScope::ViewPartition, 0x40000602); }
+        answered = 0;
+        bool queued = true;
+        {
+            rune::testing::AllocWindow w;
+            for (int i = 0; i < 1000; ++i) queued &= ask(pc::StatsScope::TopicPartition, VerdictRig::kSrc);
+            EXPECT_EQ(w.count(), 0u) << "1000 topic GetStats on the worker";
+        }
+        {
+            rune::testing::AllocWindow w;
+            for (int i = 0; i < 1000; ++i) queued &= ask(pc::StatsScope::ViewPartition, 0x40000602);
+            EXPECT_EQ(w.count(), 0u) << "1000 view GetStats on the worker";
+        }
+        EXPECT_TRUE(queued);
+        EXPECT_EQ(answered, 2000u);
+    }
+    {
+        using rune::node::test::CwViewReadGatewayRig;
+        CwViewReadGatewayRig rig;
+        rune::node::TopicSpec src;
+        src.name = "character";
+        ASSERT_EQ(rig.registry->createTopicAt(CwViewReadGatewayRig::kSrcTopic, src), CwViewReadGatewayRig::kSrcTopic);
+        const auto frameOf = [&](pc::StatsScope scope, int32_t id) {
+            pc::GetStats m;
+            m.sessionId = rig.sid; m.correlationId = 1; m.scope = scope; m.objectId = id; m.partition = 0;
+            std::vector<uint8_t> f(m.encodedSize());
+            m.encode(f.data());
+            return f;
+        };
+        const auto topicFrame = frameOf(pc::StatsScope::TopicPartition, CwViewReadGatewayRig::kSrcTopic);
+        const auto viewFrame = frameOf(pc::StatsScope::ViewPartition, CwViewReadGatewayRig::kViewTopic);
+        for (int i = 0; i < 4; ++i) {
+            rig.gw.applyGetStatsForTest(topicFrame.data(), topicFrame.size());
+            ASSERT_TRUE(rig.awaitFrame());
+            rig.gw.applyGetStatsForTest(viewFrame.data(), viewFrame.size());
+            ASSERT_TRUE(rig.awaitFrame());
+        }
+        uint64_t answered = 0;
+        for (const auto* frame : {&topicFrame, &viewFrame}) {
+            rune::testing::AllocWindow w;
+            for (int i = 0; i < 1000; ++i) {
+                rig.gw.applyGetStatsForTest(frame->data(), frame->size());
+                answered += rig.awaitFrame() ? 1 : 0;
+            }
+            EXPECT_EQ(w.count(), 0u) << (frame == &topicFrame ? "1000 topic GetStats through the gateway" : "1000 view GetStats through the gateway");
+        }
+        EXPECT_EQ(answered, 2000u);
+    }
+}
