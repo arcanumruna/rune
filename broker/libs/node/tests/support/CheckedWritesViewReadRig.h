@@ -106,9 +106,9 @@ inline bool postViewRead(Worker& w, WorkerOp::Type type, std::span<const uint8_t
                          int32_t viewTopic, uint16_t limit = 0, int64_t minOffset = -1, int64_t corr = 1) {
     std::array<uint8_t, 2 + 128 + 12> tail{};
     tail[0] = static_cast<uint8_t>(keyOrPrefix.size());
-    std::memcpy(tail.data() + 1, keyOrPrefix.data(), keyOrPrefix.size());
+    if (!keyOrPrefix.empty()) std::memcpy(tail.data() + 1, keyOrPrefix.data(), keyOrPrefix.size());
     tail[1 + keyOrPrefix.size()] = static_cast<uint8_t>(token.size());
-    std::memcpy(tail.data() + 2 + keyOrPrefix.size(), token.data(), token.size());
+    if (!token.empty()) std::memcpy(tail.data() + 2 + keyOrPrefix.size(), token.data(), token.size());
     WorkerOp op;
     op.type          = type;
     op.topicId       = viewTopic;

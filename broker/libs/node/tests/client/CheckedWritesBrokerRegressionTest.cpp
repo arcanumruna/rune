@@ -3121,7 +3121,8 @@ TEST(CheckedWritesBrokerRegression, DeviceHistoryGroupByPrefixReadShardRegressio
             for (uint64_t i = 0; i < events; ++i) {
                 std::string padded = "fp" + std::string(1, static_cast<char>(fp));
                 padded.resize(32, '\0');
-                records.emplace_back(rc::Key(++event), le(56, 2) + le(1, 2) + le(event, 8) + le(user, 8) + padded + le(event, 8));
+                ++event;
+                records.emplace_back(rc::Key(event), le(56, 2) + le(1, 2) + le(event, 8) + le(user, 8) + padded + le(event, 8));
             }
         ASSERT_TRUE(w.writeAll(records));
     }
