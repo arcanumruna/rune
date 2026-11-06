@@ -19,7 +19,6 @@
 #include <rune/catalog/CatalogFile.h>
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Serialize.h>
-#include <rune/codec/UnicodeLower.h>
 #include <rune/codec/ViewKeyEncoding.h>
 #include <rune/codec/ViewPlanAuthored.h>
 
@@ -409,7 +408,15 @@ int cmdQl(const std::vector<std::string>& args, std::istream& in, std::ostream& 
 #ifdef RUNE_CLI_LIVE_ENABLED
 namespace {
 
-std::string_view statLabel(uint16_t id) { return rune::protocol::client::statName(static_cast<rune::protocol::client::StatId>(id)); }
+std::string statLabel(uint16_t id) {
+    const std::string_view name = rune::protocol::client::statName(static_cast<rune::protocol::client::StatId>(id));
+    return name == "unknown" ? "stat" + std::to_string(id) : std::string(name);
+}
+
+/// The label of constraint `k`; one the producer did not label keeps a name of its own.
+std::string constraintName(const PartitionStats& p, std::size_t k) {
+    return k < p.constraintLabels.size() ? p.constraintLabels[k] : "constraint#" + std::to_string(p.result.constraints[k].constraintId);
+}
 
 std::string jsonString(std::string_view s) {
     std::string out = "\"";
@@ -425,7 +432,7 @@ std::string formatStatsText(std::span<const PartitionStats> partitions) {
         o << "  partition " << p.partition << "\n";
         for (const auto& [id, value] : p.result.stats) o << "    " << statLabel(id) << " " << value << "\n";
         for (std::size_t i = 0; i < p.result.constraints.size(); ++i)
-            o << "    constraint " << p.constraintLabels[i] << " " << p.result.constraints[i].rejections << "\n";
+            o << "    constraint " << constraintName(p, i) << " " << p.result.constraints[i].rejections << "\n";
         if (p.result.stats.empty() && p.result.constraints.empty()) o << "    (no counters)\n";
     }
     return o.str();
@@ -442,7 +449,7 @@ std::string formatStatsJson(std::string_view objectKind, std::string_view name, 
         o << "}, \"constraints\": [";
         for (std::size_t k = 0; k < p.result.constraints.size(); ++k)
             o << (k == 0 ? "" : ", ") << "{\"constraintId\": " << p.result.constraints[k].constraintId << ", \"label\": "
-              << jsonString(p.constraintLabels[k]) << ", \"rejections\": " << p.result.constraints[k].rejections << "}";
+              << jsonString(constraintName(p, k)) << ", \"rejections\": " << p.result.constraints[k].rejections << "}";
         o << "]}";
     }
     o << "]}";
@@ -490,7 +497,7 @@ int cmdStats(const std::vector<std::string>& args, std::ostream& out, std::ostre
                 err << "rune: no topic '" << name << "'\n";
                 return 1;
             }
-            stats = topicStats(broker.client(), *t, only);
+            stats = topicStats(broker.client(), state, *t, only);
         } else {
             const cat::ViewObject* v = state.viewByName(cat::kDefaultNsId, name);
             if (v == nullptr) {

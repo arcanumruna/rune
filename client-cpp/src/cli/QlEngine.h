@@ -152,9 +152,15 @@ struct SelectRead {
 
 /// The counters of every partition of a topic / view (`only` >= 0: that partition alone); the message when one is refused.
 /// A view's constraint rejections come from its source partition and carry `<view>.<constraint>` labels.
-[[nodiscard]] std::expected<std::vector<PartitionStats>, std::string> topicStats(rune::client::Client&, const rune::catalog::TopicObject&, int32_t only);
+[[nodiscard]] std::expected<std::vector<PartitionStats>, std::string> topicStats(rune::client::Client&, const rune::catalog::CatalogState&,
+                                                                                 const rune::catalog::TopicObject&, int32_t only);
 [[nodiscard]] std::expected<std::vector<PartitionStats>, std::string> viewStats(rune::client::Client&, const rune::catalog::CatalogState&,
                                                                                 const rune::catalog::ViewObject&, int32_t only);
+
+/// `<view>.<constraint>` of the view's constraint `ordinal` (0 = `unique`; one its plan lacks reads `<view>.#<ordinal>`).
+[[nodiscard]] std::string constraintLabel(const rune::catalog::ViewObject&, uint16_t ordinal);
+/// The label of a stats response's constraint id (`objectId & 0xFFFF` << 16 | ordinal); `constraint#<id>` when no view owns it.
+[[nodiscard]] std::string constraintLabel(const rune::catalog::CatalogState&, uint32_t constraintId);
 
 [[nodiscard]] std::string catalogReadFailure(const rune::client::CatalogReadError& e);
 [[nodiscard]] std::string securityReadFailure(const rune::client::CatalogReadError& e);

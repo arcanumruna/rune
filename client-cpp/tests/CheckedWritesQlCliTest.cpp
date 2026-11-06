@@ -428,3 +428,54 @@ TEST(CheckedWritesQlCli, ShowViewFormatsConstraints) {
         "create unique view u key (userId, name) as select characterId from character;"));
     EXPECT_NE(wide.find("  keyspec (userId, name)\n  unique yes\n"), std::string::npos) << wide;
 }
+
+// ---- fix round 1 --------------------------------------------------------------------------------------------------
+
+TEST(CheckedWritesQlCliRegression, StatsFormattersTolerateAMissingConstraintLabelRegression) {
+    rune::cli::PartitionStats p;
+    p.result.constraints.push_back({(5u << 16) | 1u, 3});
+    const std::vector<rune::cli::PartitionStats> parts{p};
+    EXPECT_NE(rune::cli::formatStatsText(parts).find("    constraint constraint#327681 3\n"), std::string::npos);
+    EXPECT_NE(rune::cli::formatStatsJson("topic", "t", parts).find(R"("label": "constraint#327681")"), std::string::npos);
+}
+
+TEST(CheckedWritesQlCliRegression, UnknownStatIdsKeepDistinctJsonKeysRegression) {
+    rune::cli::PartitionStats p;
+    p.result.stats = {{98, 1}, {99, 2}};
+    const std::vector<rune::cli::PartitionStats> parts{p};
+    EXPECT_NE(rune::cli::formatStatsJson("topic", "t", parts).find(R"({"stat98": 1, "stat99": 2})"), std::string::npos);
+    EXPECT_NE(rune::cli::formatStatsText(parts).find("    stat98 1\n    stat99 2\n"), std::string::npos);
+}
+
+TEST(CheckedWritesQlCliRegression, AlterTopicDropsTheTopicFromTheScriptScopeRegression) {
+    std::string out, err;
+    const std::string script = writeTemp("alter.rql", "topic t { id uint64, a int64 } key id; alter topic t add column b int64; create view v key id as select b from t;");
+    ASSERT_EQ(runCli({"ql", "--dry-run", "-f", script}, &out, &err), 0) << err;
+    EXPECT_NE(out.find("create view v source t key id\n  (source resolved when the statement runs)\n"), std::string::npos) << out;
+}
+
+TEST(CheckedWritesQlCli, ShowViewPrintsTheKeyColumnForAV1ShapedAggregate) {
+    rune::view::ViewPlan plan;
+    plan.viewName = "by_user";
+    plan.key      = "userId";
+    plan.sources.push_back({-1, "userId"});
+    plan.output.push_back({"userId", PrimType::UInt64, 0, "userId", rune::view::MergeRule::Replace});
+    plan.output.push_back({"characters", PrimType::Int64, 0, "", rune::view::MergeRule::CountAll});
+    ASSERT_TRUE(plan.groupBy.empty());
+    cat::ViewObject v;
+    v.name                     = "by_user";
+    v.def.normalizedPlanBlob   = rune::view::serializeAuthored(plan);
+    v.def.outputDescriptorBlob = rune::codec::serialize(rune::codec::DescriptorBuilder("out").add("userId", PrimType::UInt64).add("characters", PrimType::Int64).build());
+    const std::string text = rune::cli::formatViewDefinition(v);
+    EXPECT_NE(text.find("  keyspec userId\n  unique no\n  group by (userId)\n"), std::string::npos) << text;
+}
+
+TEST(CheckedWritesQlCliRegression, ConstraintLabelsComeFromTheOwningViewsPlanRegression) {
+    cat::ViewObject v = viewObjectOf(
+        "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= 12);");
+    v.objectId = 5;
+    EXPECT_EQ(eng::constraintLabel(v, 1), "account_stats.max_characters");
+    EXPECT_EQ(eng::constraintLabel(v, 0), "account_stats.unique");
+    EXPECT_EQ(eng::constraintLabel(v, 7), "account_stats.#7");   // an ordinal the current plan lacks never throws
+    EXPECT_EQ(eng::constraintLabel(cat::CatalogState{}, (5u << 16) | 1u), "constraint#327681");   // no view owns it
+}

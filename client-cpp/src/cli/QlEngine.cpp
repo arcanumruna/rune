@@ -303,6 +303,9 @@ std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& o
         }
         return true;
     };
+    auto forget = [&](const std::string& topic) {
+        std::erase_if(scope.topics, [&](const ql::TopicDef& t) { return t.name == topic; });
+    };
     try {
         return std::visit(
             [&](const auto& s) -> std::optional<Prepared> {
@@ -312,6 +315,7 @@ std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& o
                     scope.topics.push_back(s);
                     return Prepared{std::move(p)};
                 } else if constexpr (std::is_same_v<T, ql::AlterTopicDef>) {
+                    forget(s.name);   // its fields may have changed: a view over it is authored when it runs
                     return Prepared{PAlter{ql::applyAlterPlan(s, opts.expectedVersion)}};
                 } else if constexpr (std::is_same_v<T, ql::AlterTopicConfigDef>) {
                     auto plan = ql::applyConfigPlan(s);
@@ -321,6 +325,7 @@ std::optional<Prepared> prepare(const ql::Statement& st, const PrepareOptions& o
                     }
                     return Prepared{PAlterConfig{std::move(*plan)}};
                 } else if constexpr (std::is_same_v<T, ql::DropTopicDef>) {
+                    forget(s.name);
                     return Prepared{PDropTopic{s.name}};
                 } else if constexpr (std::is_same_v<T, ql::DropViewDef>) {
                     return Prepared{PDropView{s.name}};
@@ -1215,14 +1220,29 @@ std::expected<void, std::string> partitionRange(int32_t partitions, int32_t only
 
 }  // namespace
 
-std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c, const cat::TopicObject& t, int32_t only) {
+std::string constraintLabel(const cat::ViewObject& v, uint16_t ordinal) {
+    if (ordinal == 0) return v.name + ".unique";
+    const auto plan = rune::view::deserializeAuthored(v.def.normalizedPlanBlob);
+    if (!plan || ordinal > plan->constraints.size()) return v.name + ".#" + std::to_string(ordinal);
+    return v.name + "." + plan->constraints[ordinal - 1].name;
+}
+
+std::string constraintLabel(const cat::CatalogState& state, uint32_t constraintId) {
+    for (const cat::ViewObject* v : state.views())
+        if ((v->objectId & 0xFFFF) == (constraintId >> 16)) return constraintLabel(*v, static_cast<uint16_t>(constraintId & 0xFFFF));
+    return "constraint#" + std::to_string(constraintId);
+}
+
+std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c, const cat::CatalogState& state, const cat::TopicObject& t, int32_t only) {
     int32_t from = 0, to = 0;
     if (auto r = partitionRange(t.partitions, only, from, to); !r) return std::unexpected(std::move(r.error()));
     std::vector<PartitionStats> out;
     for (int32_t p = from; p < to; ++p) {
         auto r = c.getStatsAndWait(rpc::StatsScope::TopicPartition, t.topicId, p, kCatalogWait);
         if (r.status != rc::StatsResult::kOk) return std::unexpected(statsRefusal(p, r.status));
-        out.push_back({p, std::move(r), {}});
+        PartitionStats ps{p, std::move(r), {}};
+        for (const auto& k : ps.result.constraints) ps.constraintLabels.push_back(constraintLabel(state, k.constraintId));
+        out.push_back(std::move(ps));
     }
     return out;
 }
@@ -1244,9 +1264,8 @@ std::expected<std::vector<PartitionStats>, std::string> viewStats(rc::Client& c,
             if (src.status != rc::StatsResult::kOk) return std::unexpected(statsRefusal(p, src.status));
             for (const auto& k : src.constraints) {
                 if ((k.constraintId >> 16) != (v.objectId & 0xFFFF)) continue;
-                const uint16_t ordinal = k.constraintId & 0xFFFF;
                 ps.result.constraints.push_back(k);
-                ps.constraintLabels.push_back(v.name + "." + (ordinal == 0 ? "unique" : plan->constraints.at(ordinal - 1).name));
+                ps.constraintLabels.push_back(constraintLabel(v, static_cast<uint16_t>(k.constraintId & 0xFFFF)));
             }
         }
         out.push_back(std::move(ps));
@@ -1344,7 +1363,7 @@ bool QlRun::run(const PShowTopic& s, const rc::DdlOptions&) {
     const cat::TopicObject* t = broker.client().catalogReader().state().topicByName(cat::kDefaultNsId, s.name);
     if (t == nullptr) return fail("no topic '" + s.name + "'");
     out << formatTopicDefinition(*t);
-    const auto stats = topicStats(broker.client(), *t, -1);
+    const auto stats = topicStats(broker.client(), broker.client().catalogReader().state(), *t, -1);
     if (!stats) return fail(stats.error());
     out << formatStatsText(*stats);
     return true;
