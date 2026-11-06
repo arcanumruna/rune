@@ -10,6 +10,7 @@
 #include <rune/view/Verdict.h>
 #include <rune/view/ViewPlan.h>
 
+#include "support/AuthRig.h"
 #include "support/CatalogDdlRig.h"
 
 #include <gtest/gtest.h>
@@ -265,4 +266,60 @@ TEST(CheckedWritesConstraintDdl, BelowTheLevelIsInvalidRequest) {
     const auto a = submitView(rig, planOf(rig, topic, "create unique view u key lower(name) as k as select id from src;"));
     EXPECT_EQ(a.code, codeOf(ErrorCode::InvalidRequest));
     EXPECT_EQ(a.detail, "plan v2 needs the checked-writes feature level");
+}
+
+namespace {
+
+enum class ViewKind : uint8_t { Plain, Check, Unique };
+
+std::vector<uint8_t> foreignPlan(const std::string& view, int32_t source, ViewKind kind) {
+    rv::ViewPlan p;
+    p.viewName = view;
+    p.key = "id";
+    p.sizing.chunkBytes = 64u << 10;
+    p.sources.push_back(rv::SourceSpec{source, "id"});
+    p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
+    p.output.push_back(rv::AuthoredField{"hp", rune::codec::PrimType::Int64, 0, "hp", rv::MergeRule::Replace});
+    p.unique = kind == ViewKind::Unique;
+    if (kind == ViewKind::Check)
+        p.constraints = {{"c1", {{rv::PredicateOp::Column, 0, 0, "hp"}, {rv::PredicateOp::Const, 0, 0, "", rune::codec::PrimType::Int64, {}}, {rv::PredicateOp::Ge, 0, 1, ""}}}};
+    return rv::serializeAuthored(p);
+}
+
+}  // namespace
+
+// #640: foreign names are hidden before authorizeName, so a user of namespace a gets the plain-view answer for b's constrained view.
+TEST(CheckedWritesConstraintDdl, ForeignNamespaceConstraintDdlMatchesThePlainViewAnswers) {
+    AuthRig rig("cwcdn");
+    rig.createNamespace("a");
+    rig.createNamespace("b");
+    namespace pc = rune::protocol::client;
+    const int64_t root = rig.login("admin", AuthBroker::kAdminPassword, pc::kClientVersionNamespaces);
+    const int32_t src = rig.defineTopic(root, "b/src");
+    ASSERT_GE(src, 0);
+    for (const char* v : {"b/pv", "b/pd", "b/cv", "b/cd"})
+        ASSERT_EQ(rig.ddlCode(rig.c().sendCreateView(rig.ch(), rig.stream(), root, v, "id", 0, foreignPlan(v + 2, src, v[2] == 'p' ? ViewKind::Plain : ViewKind::Check))), 0) << v;
+    using namespace grants;
+    std::vector<AuthGrant> g;
+    for (const auto op : {SO::Create, SO::Alter, SO::Drop}) g.push_back(prefix(op, ST::View, ""));
+    g.push_back(prefix(SO::Read, ST::Topic, ""));
+    rig.broker().createUser("a/u", AuthRig::kPw, g);
+    const int64_t user = rig.login("a/u", AuthRig::kPw, pc::kClientVersionNamespaces);
+    auto create = [&](const char* name, ViewKind k) {
+        return rig.ddlCode(rig.c().sendCreateView(rig.ch(), rig.stream(), user, name, "id", 0, foreignPlan(name + 2, src, k)));
+    };
+    auto replace = [&](const char* name, ViewKind k) {
+        return rig.ddlCode(rig.c().sendAlterView(rig.ch(), rig.stream(), user, name, "id", 0, 0, foreignPlan(name + 2, src, k)));
+    };
+    const int plainCreate = create("b/n1", ViewKind::Plain);
+    EXPECT_EQ(plainCreate, kNotAuthorized);
+    EXPECT_EQ(create("b/n2", ViewKind::Unique), plainCreate) << "create unique";
+    EXPECT_EQ(create("b/n3", ViewKind::Check), plainCreate) << "create check";
+    const int plainReplace = replace("b/pv", ViewKind::Plain);
+    EXPECT_EQ(plainReplace, kNotAuthorized);
+    EXPECT_EQ(replace("b/cv", ViewKind::Check), plainReplace) << "replace check";
+    EXPECT_EQ(replace("b/cv", ViewKind::Unique), plainReplace) << "replace unique";
+    const int plainDrop = rig.ddlCode(rig.c().sendDropView(rig.ch(), rig.stream(), user, "b/pd"));
+    EXPECT_EQ(plainDrop, 7);
+    EXPECT_EQ(rig.ddlCode(rig.c().sendDropView(rig.ch(), rig.stream(), user, "b/cd")), plainDrop) << "drop constrained";
 }
