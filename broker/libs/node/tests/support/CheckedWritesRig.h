@@ -77,6 +77,9 @@ inline rune::codec::Descriptor verdictSourceDescriptor() { return keyedSourceDes
 /// del: a tombstone of `id` (empty value).  intent: the record's attribute bits 0-1 (0 upsert, 1 insert, 2 update / removeExisting).
 struct Rec { uint64_t id; int64_t v; uint8_t tag = 0; bool del = false; uint8_t intent = 0; };
 
+/// A record of any source schema: the wire key and the value block (empty = a tombstone).
+struct RawRec { std::string key; std::vector<uint8_t> value; };
+
 /// What a consumer received: one record of a delivered batch.
 inline constexpr uint16_t kTombstoneTag = 0xFFFF;   ///< Delivered::tag of a tombstone
 struct Delivered { int64_t offset; uint64_t id; uint16_t tag; uint8_t intent = 0; };
@@ -225,9 +228,20 @@ public:
         installs_.back().second();
     }
     /// The verdict view goes away (its object leaves the constraint set).
-    void dropRejectView(int32_t viewTopic) {
+    void dropRejectView(int32_t viewTopic) { dropView(viewTopic); }
+    void dropView(int32_t viewTopic) {
         vs->uninstallView(viewTopic);
         std::erase_if(installs_, [&](const auto& i) { return i.first == viewTopic; });
+    }
+    /// A compiled view over the source set by useSource().
+    void installKeyedView(const rune::view::CompileResult& c) {
+        installs_.emplace_back(c.plan.viewTopicId, [=, this, src = *customSrc_] { vs->installView(c.plan, c.rowLayout, src, false); });
+        installs_.back().second();
+    }
+    /// The source topic's schema is `d` (its first field the key, of shape `key`) instead of {id, v, tag}.  A restart keeps it.
+    void useSource(rune::codec::Descriptor d, KeyShape key) {
+        customSrc_ = std::move(d);
+        typedWith_(5, key, false);
     }
     /// The reject view `oldTopic` is replaced by `newTopic` (same object, another rule): the old one retires.
     void replaceRejectView(int32_t oldTopic, int32_t newTopic, uint64_t objectId, TestRejectRule rule) {
@@ -339,13 +353,16 @@ private:
         WorkerOp l;
         l.type = WorkerOp::Type::ClusterFeatureLevel; l.nextOffset = level;
         send(std::move(l));
-        const auto blob = rune::codec::serialize(keyedSourceDescriptor(shape));
-        WorkerOp v;
-        v.type = WorkerOp::Type::SchemaUpdate; v.topicId = kSrc; v.clientVersion = 1;
-        v.schemaUpdateBlob = blob;
-        send(std::move(v));
+        const auto blob = rune::codec::serialize(customSrc_ ? *customSrc_ : keyedSourceDescriptor(shape));
+        const int32_t version = customSrc_ ? customSrc_->version : 1;
+        for (int32_t at = 1; at <= version; ++at) {   // every version up to the current one validates its own records
+            WorkerOp v;
+            v.type = WorkerOp::Type::SchemaUpdate; v.topicId = kSrc; v.clientVersion = at;
+            v.schemaUpdateBlob = customSrc_ ? rune::codec::serialize(rune::codec::materializeAsOf(*customSrc_, static_cast<uint16_t>(at))) : blob;
+            send(std::move(v));
+        }
         WorkerOp f;
-        f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = 1;
+        f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = version;
         f.schemaUpdateBlob = blob;
         send(std::move(f));
         send(specOp_(keyIndex));
@@ -422,6 +439,7 @@ public:
         pollAcks_();
         worker->drainReturn([&](WorkerReturn r) {
             if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
+            else if (r.type == WorkerReturn::Type::ViewRowResult || r.type == WorkerReturn::Type::ViewScanResult) viewAnswers_.push_back(std::move(r));
         }, [](const TxnReturn&) {});
         if (agent) { if (!pauseAgent) (void)agent->doWork(now); }
         else channel.deltas.drain([this](int32_t, aeron::concurrent::AtomicBuffer& buf, OneToOneByteRing::index_t off, OneToOneByteRing::index_t) {
@@ -434,8 +452,9 @@ public:
     void passes(int n) { for (int i = 0; i < n; ++i) pass(); }
 
     /// A produce through the worker's op path, re-sent while the partition is still building (NotLeader).
-    int16_t produce(const std::vector<Rec>& recs) {
-        const auto bytes = batch(recs, -1, -1, keyShape_);
+    int16_t produce(const std::vector<Rec>& recs) { return produceBatch(batch(recs, -1, -1, keyShape_)); }
+    int16_t produceRaw(const std::vector<RawRec>& recs) { return produceBatch(rawBatch(recs)); }
+    int16_t produceBatch(const std::vector<uint8_t>& bytes) {
         for (int i = 0; i < kMaxPass; ++i) {
             WorkerOp op;
             op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = tuning_.partition;
@@ -448,6 +467,91 @@ public:
             if (produceAnswers.back() != static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader)) return produceAnswers.back();
         }
         return -2;
+    }
+    static std::vector<uint8_t> rawBatch(const std::vector<RawRec>& recs, int64_t pid = -1, int32_t seq = -1) {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+        for (const auto& r : recs) b.append(r.key, {reinterpret_cast<const char*>(r.value.data()), r.value.size()}, 1000, 0);
+        return b.build();
+    }
+
+    /// One answer to a GetViewRowK (row) or a ScanViewRows page (rows, token).  code = the ViewRowResponse status.
+    struct ViewRead { int16_t code = -1; std::vector<uint8_t> row; std::vector<uint8_t> token; std::vector<std::vector<uint8_t>> rows; };
+    /// A view read through the worker's op path; a NotReady answer (a rebuilding view) is asked again.
+    ViewRead viewRead(WorkerOp::Type type, int32_t view, std::span<const uint8_t> keyOrPrefix, std::span<const uint8_t> token = {}, uint16_t limit = 0, int64_t minOffset = -1) {
+        std::vector<uint8_t> tail;
+        tail.push_back(static_cast<uint8_t>(keyOrPrefix.size()));
+        tail.insert(tail.end(), keyOrPrefix.begin(), keyOrPrefix.end());
+        tail.push_back(static_cast<uint8_t>(token.size()));
+        tail.insert(tail.end(), token.begin(), token.end());
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            WorkerOp op;
+            op.type = type; op.topicId = view; op.partition = tuning_.partition; op.sessionId = 1; op.correlationId = ++corr;
+            op.nextOffset = minOffset; op.recordCount = limit; op.viewReadTail = tail;
+            EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+            viewAnswers_.clear();
+            for (int i = 0; i < 20 && viewAnswers_.empty(); ++i) pass();
+            if (viewAnswers_.empty()) { ADD_FAILURE() << "no answer to a view read"; return {}; }
+            WorkerReturn r = std::move(viewAnswers_.front());
+            if (r.errorCode == rune::protocol::client::ViewRowResponse::kNotReady) { pass(); continue; }
+            ViewRead out;
+            out.code = r.errorCode;
+            const std::span<const uint8_t> c = r.chunkBytes();
+            if (type == WorkerOp::Type::GetViewRowK) { out.row.assign(c.begin(), c.end()); return out; }
+            if (c.empty()) return out;
+            uint32_t tl = 0, rl = 0;
+            std::memcpy(&tl, c.data(), 4);
+            out.token.assign(c.begin() + 4, c.begin() + 4 + tl);
+            std::memcpy(&rl, c.data() + 4 + tl, 4);
+            std::size_t pos = 8 + tl;
+            for (const std::size_t end = pos + rl; pos < end;) {
+                uint32_t n = 0;
+                std::memcpy(&n, c.data() + pos, 4);
+                out.rows.emplace_back(c.begin() + pos + 4, c.begin() + pos + 4 + n);
+                pos += 4 + n;
+            }
+            return out;
+        }
+        ADD_FAILURE() << "the view stayed NotReady";
+        return {};
+    }
+    ViewRead getViewRowK(int32_t view, std::span<const uint8_t> key, int64_t minOffset = -1) { return viewRead(WorkerOp::Type::GetViewRowK, view, key, {}, 0, minOffset); }
+    /// Every row under `prefix`, `limit` rows a page.  A page comes in table order: compare the result as a set.
+    std::vector<std::vector<uint8_t>> scanAll(int32_t view, std::span<const uint8_t> prefix, uint16_t limit = 2) {
+        std::vector<std::vector<uint8_t>> rows;
+        std::vector<uint8_t> token;
+        for (int page = 0; page < 10'000; ++page) {
+            ViewRead p = viewRead(WorkerOp::Type::ScanViewRows, view, prefix, token, limit);
+            EXPECT_EQ(p.code, rune::protocol::client::ViewRowResponse::kOk);
+            if (p.code != rune::protocol::client::ViewRowResponse::kOk) break;
+            for (auto& r : p.rows) rows.push_back(std::move(r));
+            if (p.token.empty()) break;
+            token = std::move(p.token);
+        }
+        return rows;
+    }
+    /// Every data record of the log, in offset order: the wire key and the value block.
+    [[nodiscard]] std::vector<RawRec> readRaw() const {
+        std::vector<RawRec> out;
+        for (int64_t off = log->logStartOffset(); off < log->logEndOffset();) {
+            const auto v = log->readView(off, 1 << 20);
+            if (v.empty()) break;
+            for (std::size_t p = 0; p + 12 <= v.len;) {
+                int32_t blen = 0;
+                std::memcpy(&blen, v.data + p + 8, 4);
+                const std::size_t total = 12 + static_cast<std::size_t>(blen);
+                if (p + total > v.len) break;
+                rune::protocol::RecordBatchReader r(v.data + p, total);
+                if ((r.attributes() & rune::protocol::batch::kAttrControl) == 0)
+                    (void)rune::protocol::forEachRecordSpan(v.data + p, total, [&](const rune::protocol::RecordSpan& rs) {
+                        const auto* val = reinterpret_cast<const uint8_t*>(rs.value.data());
+                        out.push_back({std::string(rs.key), std::vector<uint8_t>(val, val + rs.value.size())});
+                    });
+                p += total;
+            }
+            off = v.nextOffset;
+        }
+        return out;
     }
 
     [[nodiscard]] const uint8_t* row(int32_t viewTopicId, uint64_t key) const {
@@ -1015,6 +1119,8 @@ private:
     int64_t epoch_ = 1;
     bool recovering_ = false;   ///< the views of a restarted node load their checkpoints
     KeyShape keyShape_;
+    std::optional<rune::codec::Descriptor> customSrc_;   ///< useSource(): the source's schema
+    std::vector<WorkerReturn> viewAnswers_;
     bool keyIndexOn_ = false, holdJudge_ = false;
     int delayedSpecIn_ = 0;
     std::filesystem::path viewDir_, logDir_;

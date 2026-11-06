@@ -5,11 +5,16 @@
 #include "CheckedWritesChecks.h"
 #include "CheckedWritesModel.h"
 
+#include <rune/codec/UnicodeLower.h>
 #include <rune/view/Verdict.h>
+#include <rune/view/ViewKey.h>
+#include <rune/view/ViewRow.h>
 
 #include <algorithm>
+#include <initializer_list>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 
 using namespace rune::node;
@@ -1175,6 +1180,413 @@ INSTANTIATE_TEST_SUITE_P(Cell06, CheckedWritesMatrix, ::testing::ValuesIn(cellsF
         return std::string(nameOf(i.param.op)) + "_" + nameOf(i.param.entity) + "_" + nameOf(i.param.timing);
     });
 
+// ---- Part 07: keyed views.  Every cell drives the real worker over a source of the shape's schema, folds a keyed view of it and compares the
+// view table, the owner map, point reads and prefix scans with CheckedWritesModel::refoldKeyedView (a group-by view: refoldKeyedAggregate). ----
+namespace {
+
+namespace k07 {
+
+using rune::codec::Descriptor;
+using rune::codec::DescriptorBuilder;
+using rune::codec::PrimType;
+using rune::view::MergeRule;
+using Cols = std::map<uint16_t, std::string>;
+
+constexpr int32_t kViewA = 0x40000010, kViewB = 0x40000011;
+constexpr int64_t kDupPid = 600;
+constexpr uint8_t kViewAllAcks = rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll;
+
+struct Fields { uint64_t id; uint64_t lead; std::string text; uint64_t val; };
+struct Rec07 { std::map<std::string, uint64_t> nums; std::map<std::string, std::string> strs; };
+
+/// The value block of `r` under `d` and its wire key (the bytes of the first field).
+RawRec encode(const Descriptor& d, const Rec07& r) {
+    std::vector<uint8_t> v(4 + d.blockLength, 0);
+    v[0] = static_cast<uint8_t>(d.blockLength); v[1] = static_cast<uint8_t>(d.blockLength >> 8);
+    v[2] = static_cast<uint8_t>(d.version); v[3] = static_cast<uint8_t>(d.version >> 8);
+    for (const auto& f : d.fields) {
+        if (f.type == PrimType::FixedStr) {
+            if (const auto s = r.strs.find(f.name); s != r.strs.end()) std::copy(s->second.begin(), s->second.end(), v.begin() + 4 + f.offset);
+        } else if (const auto n = r.nums.find(f.name); n != r.nums.end()) {
+            for (uint32_t i = 0; i < rune::codec::fieldWidth(f); ++i) v[4 + f.offset + i] = static_cast<uint8_t>(n->second >> (8 * i));
+        }
+    }
+    const auto& k = d.fields.front();
+    return {std::string(v.begin() + 4 + k.offset, v.begin() + 4 + k.offset + rune::codec::fieldWidth(k)), std::move(v)};
+}
+RawRec tombstone(const RawRec& of) { return {of.key, {}}; }
+
+struct Scenario {
+    Descriptor src;
+    KeyShape key;
+    rune::view::ViewPlan plan;
+    std::vector<RawRec> base, op;
+};
+
+std::string repeated(const char* s, int n) { std::string out; for (int i = 0; i < n; ++i) out += s; return out; }
+
+// ---- the projection shapes ----
+Descriptor characterSource() {
+    return DescriptorBuilder("character", 1).add("characterId", PrimType::UInt64, 1, true).add("userId", PrimType::UInt64).addFixedStr("name", 16)
+        .addFixedStr("tag", 80).add("provider", PrimType::UInt16).addFixedStr("subject", 64).add("val", PrimType::UInt64).build();
+}
+
+Rec07 recOf(Entity e, const Fields& f) {
+    Rec07 r;
+    r.nums["val"] = f.val;
+    switch (e) {
+    case Entity::KeyU16: case Entity::KeyU32: case Entity::KeyU64: r.nums["k"] = f.id; break;
+    case Entity::KeyI64: r.nums["k"] = static_cast<uint64_t>(-static_cast<int64_t>(f.id)); break;
+    case Entity::KeyStr16: r.strs["k"] = "key-" + std::to_string(f.id); break;
+    case Entity::KeyComposite: r.nums["characterId"] = f.id; r.nums["userId"] = f.lead; break;
+    case Entity::KeyCompositeWide: r.nums["userId"] = f.id; r.nums["provider"] = f.lead; r.strs["subject"] = f.text; break;
+    case Entity::KeyLower: r.nums["characterId"] = f.id; r.strs["name"] = f.text; break;
+    default: r.nums["characterId"] = f.id; r.strs["tag"] = f.text; break;   // KeyMaxWidth
+    }
+    return r;
+}
+
+/// The text that fills the key's string column to its width after lower(): a grower where the key lowers.
+std::string growerOf(Entity e) {
+    return e == Entity::KeyMaxWidth ? repeated("\xC8\xBA", 40) : e == Entity::KeyLower ? repeated("\xC8\xBA", 8) : e == Entity::KeyCompositeWide ? std::string(64, 'x') : "g";
+}
+std::string renamedOf(Entity e) { return e == Entity::KeyLower ? "Qux" : e == Entity::KeyCompositeWide ? "renamed" : growerOf(e); }
+
+Scenario scenarioOf(const Cell& c) {
+    const Entity e = c.entity;
+    Scenario s;
+    s.plan.viewName = "keyed_07";
+    s.plan.persistence = 1;
+    const auto output = [&](std::initializer_list<const char*> names, const Descriptor& d) {
+        for (const char* n : names) s.plan.output.push_back({n, d.find(n)->type, 0, n, MergeRule::Replace});
+    };
+    if (e == Entity::KeyU16 || e == Entity::KeyU32 || e == Entity::KeyU64 || e == Entity::KeyI64) {
+        const PrimType t = e == Entity::KeyU16 ? PrimType::UInt16 : e == Entity::KeyU32 ? PrimType::UInt32 : e == Entity::KeyU64 ? PrimType::UInt64 : PrimType::Int64;
+        s.src = DescriptorBuilder("narrow", 1).add("k", t, 1, true).add("grp", PrimType::UInt64).add("val", PrimType::UInt64).build();
+        s.key = KeyShape{t};
+        s.plan.key = "k";
+        s.plan.sources = {{VerdictRig::kSrc, "k"}};
+        output({"k", "val"}, s.src);
+    } else if (e == Entity::KeyStr16) {
+        s.src = DescriptorBuilder("coded", 1).addFixedStr("k", 16, 1, true).add("grp", PrimType::UInt64).add("val", PrimType::UInt64).build();
+        s.key = KeyShape{PrimType::FixedStr, 16};
+        s.plan.sources = {{VerdictRig::kSrc, "k"}};
+        s.plan.keyComponents = {{"k", 0, "k"}};
+        output({"val"}, s.src);
+    } else if (e == Entity::KeyCompositeWide) {
+        s.src = DescriptorBuilder("account", 1).add("userId", PrimType::UInt64, 1, true).add("provider", PrimType::UInt16).addFixedStr("subject", 64)
+                    .add("val", PrimType::UInt64).build();
+        s.key = KeyShape{PrimType::UInt64};
+        s.plan.sources = {{VerdictRig::kSrc, "userId"}};
+        s.plan.keyComponents = {{"provider", 0, "provider"}, {"subject", 0, "subject"}, {"userId", 0, "userId"}};
+        output({"val"}, s.src);
+    } else {
+        s.src = characterSource();
+        s.key = KeyShape{PrimType::UInt64};
+        s.plan.sources = {{VerdictRig::kSrc, "characterId"}};
+        switch (e) {
+        case Entity::KeyComposite: s.plan.keyComponents = {{"userId", 0, "userId"}, {"characterId", 0, "characterId"}}; break;
+        case Entity::KeyLower: s.plan.keyComponents = {{"name", rune::codec::kKeyFunctionLower, "nameKey"}, {"characterId", 0, "characterId"}}; break;
+        default: s.plan.keyComponents = {{"tag", rune::codec::kKeyFunctionLower, "tagKey"}, {"characterId", 0, "characterId"}}; break;
+        }
+        if (e == Entity::KeyLower || e == Entity::KeyMaxWidth) s.plan.unicodeVersion = rune::codec::kUnicodeVersion;
+        output({"val"}, s.src);
+    }
+    const auto rec = [&](Fields f) { return encode(s.src, recOf(e, f)); };
+    s.base = {rec({1, 10, "Foo", 100}), rec({2, 10, "BAR", 200}), rec({3, 20, growerOf(e), 300})};
+    switch (c.op) {
+    case Op::ViewUpsertNew: case Op::ViewDuplicateRetry: s.op = {rec({4, 20, "Qux", 400})}; break;
+    case Op::ViewUpdateNonKey: s.op = {rec({2, 10, "BAR", 1200})}; break;
+    case Op::ViewRename: s.op = {rec({2, 10, renamedOf(e), 200})}; break;
+    case Op::ViewMoveGroup: s.op = {rec({2, 30, "BAR", 200})}; break;
+    case Op::ViewDelete: s.op = {tombstone(s.base[1])}; break;
+    case Op::ViewDeleteThenReuse: s.op = {tombstone(s.base[1]), rec({2, 10, "BAR", 777})}; break;
+    default: break;   // reads
+    }
+    return s;
+}
+
+// ---- the group-by shapes: device_history over the device source, one aggregate column ----
+struct Ev { uint64_t id, user, dev; std::string fp; uint64_t platform; int64_t lastSeen; uint64_t bytes; };
+
+Descriptor deviceSource() {
+    return DescriptorBuilder("device", 1).add("eventId", PrimType::UInt64, 1, true).add("userId", PrimType::UInt64).add("deviceId", PrimType::UInt64)
+        .addFixedStr("deviceFp", 16).add("platform", PrimType::Enum).add("lastSeen", PrimType::Int64).add("bytes", PrimType::UInt64).build();
+}
+
+Scenario aggScenarioOf(const Cell& c, AggRule07 rule) {
+    Scenario s;
+    s.src = deviceSource();
+    s.key = KeyShape{PrimType::UInt64};
+    s.plan.viewName = "device_history_07";
+    s.plan.persistence = 1;
+    s.plan.sources = {{VerdictRig::kSrc, "eventId"}};
+    s.plan.keyComponents = s.plan.groupBy = c.entity == Entity::KeyComposite
+        ? std::vector<rune::view::KeyComponent>{{"userId", 0, "userId"}, {"deviceId", 0, "deviceId"}}
+        : std::vector<rune::view::KeyComponent>{{"deviceFp", rune::codec::kKeyFunctionLower, "fpKey"}, {"userId", 0, "userId"}};
+    if (c.entity == Entity::KeyLower) s.plan.unicodeVersion = rune::codec::kUnicodeVersion;
+    switch (rule) {
+    case AggRule07::CountAll: s.plan.output = {{"uses", PrimType::Int64, 0, "", MergeRule::CountAll}}; break;
+    case AggRule07::SumBytes: s.plan.output = {{"total", PrimType::UInt64, 0, "bytes", MergeRule::Sum}}; break;
+    case AggRule07::MinLastSeen: s.plan.output = {{"firstSeen", PrimType::Int64, 0, "lastSeen", MergeRule::Min}}; break;
+    case AggRule07::MaxLastSeen: s.plan.output = {{"lastSeen", PrimType::Int64, 0, "lastSeen", MergeRule::Max}}; break;
+    case AggRule07::LastPlatform: s.plan.output = {{"platform", PrimType::Enum, 0, "platform", MergeRule::Last}}; break;
+    }
+    const auto rec = [&](const Ev& e) {
+        Rec07 r;
+        r.nums = {{"eventId", e.id}, {"userId", e.user}, {"deviceId", e.dev}, {"platform", e.platform}, {"lastSeen", static_cast<uint64_t>(e.lastSeen)}, {"bytes", e.bytes}};
+        r.strs["deviceFp"] = e.fp;
+        return encode(s.src, r);
+    };
+    s.base = {rec({1, 10, 1, "FpA", 1, 50, 5}), rec({2, 10, 1, "fpa", 2, 30, 7}), rec({3, 10, 2, "FpB", 3, 40, 9}), rec({4, 20, 1, "FpA", 1, 10, 11}), rec({5, 20, 1, "FPA", 2, 70, 13})};
+    switch (c.op) {
+    case Op::ViewUpsertNew: s.op = {rec({6, 10, 1, "FpA", 9, 60, 100})}; break;
+    case Op::ViewUpdateNonKey: s.op = {rec({2, 10, 1, "fpa", 5, 99, 70})}; break;
+    case Op::ViewMoveGroup: s.op = {rec({2, 20, 1, "FpA", 2, 30, 7})}; break;
+    case Op::ViewDelete: s.op = {tombstone(s.base[2]), tombstone(s.base[3])}; break;
+    default: break;   // ViewPrefixScan
+    }
+    return s;
+}
+
+std::string sigOf(const Cols& c) {
+    std::string out;
+    for (const auto& [slot, v] : c) out += std::to_string(slot) + "=" + v + ";";
+    return out;
+}
+
+class CellRun {
+public:
+    CellRun(const Cell& c, Scenario s, bool aggregate) : c_(c), s_(std::move(s)), aggregate_(aggregate), r_(/*follower=*/false) {}
+
+    void run() {
+        r_.useSource(s_.src, s_.key);
+        r_.passes(50);
+        const bool lateCreate = c_.timing == Timing::CreateOnNonEmpty;
+        if (!lateCreate) install_(kViewA);
+        r_.passes(10);
+
+        send_(s_.base, c_.timing == Timing::BackToBack);
+        if (c_.timing == Timing::ReplaceDuringWrites) {
+            r_.dropView(view_);
+            install_(kViewB);
+        } else if (c_.timing == Timing::DropDuringWrites) {
+            r_.driveUntilFolded(view_, r_.leo());
+            r_.dropView(view_);
+            EXPECT_NE(r_.getViewRowK(view_, std::vector<uint8_t>(comp_.plan.keyWidth, 0)).code, rune::protocol::client::ViewRowResponse::kOk) << "a dropped view answers nothing";
+        }
+        if (c_.op == Op::ViewDuplicateRetry) {
+            retry_();
+            if (::testing::Test::HasFatalFailure()) return;
+        } else if (!s_.op.empty()) {
+            std::vector<RawRec> op = s_.op;
+            if (c_.timing == Timing::SelfCollidingBatch) op.insert(op.end(), s_.op.begin(), s_.op.end());
+            send_(op, c_.timing == Timing::BackToBack);
+        }
+        if (lateCreate) install_(kViewA);
+        if (c_.timing == Timing::DropDuringWrites) install_(kViewB);
+
+        r_.driveUntilFolded(view_, r_.leo());
+        if (c_.timing == Timing::FailoverHwFold && c_.op != Op::ViewDuplicateRetry) {
+            r_.failover();
+            r_.driveUntilFolded(view_, r_.leo());
+        } else if (c_.timing == Timing::RestartDuringRebuild) {
+            r_.restart();
+            r_.passes(2);
+            r_.restart();
+            r_.driveUntilFolded(view_, r_.leo());
+        }
+        verify_();
+        if (c_.timing == Timing::BackToBack && isRead07(c_.op)) verify_();
+    }
+
+    std::size_t skippedNoKey = 0;   ///< the records of the log the model found without a key column (P7-16)
+
+private:
+    void install_(int32_t topic) {
+        comp_ = compile_(topic);
+        view_ = topic;
+        r_.installKeyedView(comp_);
+    }
+    rune::view::CompileResult compile_(int32_t topic) const {
+        const rune::codec::Descriptor* srcs[] = {&s_.src};
+        auto c = rune::view::compileView(s_.plan, srcs, topic);
+        if (!c) throw std::runtime_error(c.error().message);
+        return std::move(*c);
+    }
+
+    void send_(const std::vector<RawRec>& recs, bool oneEach) {
+        if (oneEach) {
+            for (const RawRec& x : recs) ASSERT_EQ(r_.produceRaw({x}), 0);
+        } else if (!recs.empty()) {
+            ASSERT_EQ(r_.produceRaw(recs), 0);
+        }
+    }
+
+    // The same producer batch twice: before the fold, after it, or after a failover.  The log holds it once.
+    void retry_() {
+        r_.enableAcks();
+        const auto bytes = VerdictRig::rawBatch(s_.op, kDupPid, 0);
+        const int64_t first = r_.produceBytes(bytes, kViewAllAcks, kDupPid, 0);
+        const auto a1 = r_.ackFetching(first);
+        ASSERT_TRUE(a1 && a1->code == 0);
+        if (c_.timing == Timing::RetryBeforeJudge) {
+            const auto a2 = r_.ackFetching(r_.produceBytes(bytes, kViewAllAcks, kDupPid, 0));
+            ASSERT_TRUE(a2 && a2->code == 0);
+            EXPECT_EQ(a2->baseOffset, a1->baseOffset);
+            return;
+        }
+        r_.driveUntilFolded(view_, r_.leo());
+        if (c_.timing == Timing::FailoverHwFold) {
+            r_.failover();
+            r_.passes(100);
+        }
+        std::optional<VerdictRig::Ack> a2;
+        for (int attempt = 0; attempt < 20 && !(a2 && a2->code == 0); ++attempt) a2 = r_.ackFetching(r_.produceBytes(bytes, kViewAllAcks, kDupPid, 0));
+        ASSERT_TRUE(a2 && a2->code == 0);
+        EXPECT_EQ(a2->baseOffset, a1->baseOffset);
+    }
+
+    Cols colsOf_(const uint8_t* row, const Cols& shape) const {
+        Cols out;
+        for (const auto& kv : shape) out[kv.first] = modelCanon(rune::view::readSlot(row, comp_.rowLayout, kv.first));
+        return out;
+    }
+
+    void verify_() {
+        const auto log = r_.readRaw();
+        const auto& plan = comp_.plan;
+        std::map<std::vector<uint8_t>, Cols> want;
+        KeyedModel keyed;
+        if (aggregate_) {
+            want = refoldKeyedAggregate(plan, s_.src, log);
+        } else {
+            keyed = refoldKeyedView(plan, s_.src, log);
+            want = keyed.rows;
+            skippedNoKey = keyed.skippedNoKey;
+        }
+        if (c_.op == Op::ViewDuplicateRetry) EXPECT_EQ(log.size(), s_.base.size() + s_.op.size()) << "a retried batch is stored once";
+        const rune::node::ViewInstance* inst = r_.vs->instanceForTest(view_, 0);
+        ASSERT_NE(inst, nullptr);
+        EXPECT_EQ(inst->table.size(), want.size());   // (a): the same number of rows, and every model row is read back below
+        if (!aggregate_) {
+            EXPECT_EQ(inst->owners.has_value(), rune::view::ownerMappedOf(plan));   // (b)
+            if (inst->owners) {
+                EXPECT_EQ(inst->owners->size(), keyed.owners.size());
+                for (const auto& [wire, viewKey] : keyed.owners) {
+                    const uint8_t* o = inst->owners->get(rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(wire.data()), wire.size()}));
+                    ASSERT_NE(o, nullptr);
+                    EXPECT_EQ(std::vector<uint8_t>(o, o + viewKey.size()), viewKey);
+                }
+            }
+        }
+        const uint16_t prefix = rune::view::prefixWidthOf(plan);
+        std::map<std::vector<uint8_t>, std::vector<std::string>> byPrefix;
+        for (const auto& [key, cols] : want) {   // (c): a point read of every model key
+            const auto got = r_.getViewRowK(view_, key);
+            ASSERT_EQ(got.code, rune::protocol::client::ViewRowResponse::kOk);
+            ASSERT_EQ(got.row.size(), comp_.rowLayout.rowLen);
+            EXPECT_EQ(colsOf_(got.row.data(), cols), cols);
+            if (prefix != 0) byPrefix[std::vector<uint8_t>(key.begin(), key.begin() + prefix)].push_back(sigOf(cols));
+            if (rune::view::keyModeOf(plan) == rune::view::ViewKeyMode::Keyed) {
+                const uint8_t* row = inst->table.get(rune::view::ViewKey::fromBytes(key));
+                ASSERT_NE(row, nullptr);
+                const auto kr = inst->table.keyOfRow(row);
+                EXPECT_EQ(std::vector<uint8_t>(kr.begin(), kr.end()), key);
+            }
+        }
+        for (auto& [p, sigs] : byPrefix) {   // (c): a full scan of every model prefix, limit 2, as a set
+            std::vector<std::string> got;
+            for (const auto& row : r_.scanAll(view_, p, 2)) got.push_back(sigOf(colsOf_(row.data(), want.begin()->second)));
+            std::sort(got.begin(), got.end());
+            std::sort(sigs.begin(), sigs.end());
+            EXPECT_EQ(got, sigs);
+        }
+        if (prefix != 0) EXPECT_TRUE(r_.scanAll(view_, std::vector<uint8_t>(prefix, 0xFF), 2).empty());
+        if (c_.op == Op::ViewPointRead) {
+            EXPECT_EQ(r_.getViewRowK(view_, std::vector<uint8_t>(plan.keyWidth, 0xFF)).code, rune::protocol::client::ViewRowResponse::kAbsentKey);
+            EXPECT_EQ(r_.getViewRowK(view_, std::vector<uint8_t>(plan.keyWidth + 1u, 0x01)).code, rune::protocol::client::ViewRowResponse::kInvalidRequest);
+        }
+    }
+
+    Cell c_;
+    Scenario s_;
+    bool aggregate_;
+    VerdictRig r_;
+    rune::view::CompileResult comp_;
+    int32_t view_ = kViewA;
+};
+
+}  // namespace k07
+
+}  // namespace
+
+class CheckedWritesMatrix07 : public ::testing::TestWithParam<Cell> {};
+class CheckedWritesMatrix07Agg : public ::testing::TestWithParam<AggCell07> {};
+
+TEST_P(CheckedWritesMatrix07, KeyedViewEqualsTheModel) {
+    const Cell c = GetParam();
+    k07::CellRun(c, k07::scenarioOf(c), /*aggregate=*/false).run();
+}
+
+TEST_P(CheckedWritesMatrix07Agg, GroupByViewEqualsTheModel) {
+    const AggCell07 c = GetParam();
+    k07::CellRun(c.cell, k07::aggScenarioOf(c.cell, c.rule), /*aggregate=*/true).run();
+}
+
+namespace {
+std::vector<Cell> applicableCells07() {
+    std::vector<Cell> out;
+    for (const Cell& c : cellsFor(Part::P07)) if (expect(c).applicable) out.push_back(c);
+    return out;
+}
+const char* nameOf(AggRule07 r) {
+    switch (r) {
+    case AggRule07::CountAll: return "CountAll"; case AggRule07::SumBytes: return "SumBytes"; case AggRule07::MinLastSeen: return "MinLastSeen";
+    case AggRule07::MaxLastSeen: return "MaxLastSeen"; case AggRule07::LastPlatform: return "LastPlatform";
+    }
+    return "?";
+}
+}  // namespace
+
+INSTANTIATE_TEST_SUITE_P(Cell, CheckedWritesMatrix07, ::testing::ValuesIn(applicableCells07()),
+    [](const ::testing::TestParamInfo<Cell>& i) {
+        return std::string(nameOf(i.param.op)) + "_" + nameOf(i.param.entity) + "_" + nameOf(i.param.timing);
+    });
+
+INSTANTIATE_TEST_SUITE_P(Cell, CheckedWritesMatrix07Agg, ::testing::ValuesIn(aggCellsFor07()),
+    [](const ::testing::TestParamInfo<AggCell07>& i) {
+        return std::string(nameOf(i.param.rule)) + "_" + nameOf(i.param.cell.op) + "_" + nameOf(i.param.cell.entity) + "_" + nameOf(i.param.cell.timing);
+    });
+
+
+// A record whose writer version has no key column erases its source key's row and owner (P7-16): the model and the worker agree on it.
+TEST(CheckedWritesMatrix07Model, AbsentKeyRecordErasesTheRowAndTheOwner) {
+    using namespace k07;
+    const Descriptor evolving = DescriptorBuilder("character", 2).add("characterId", PrimType::UInt64, 1, true).add("userId", PrimType::UInt64, 2)
+                                    .add("val", PrimType::UInt64).build();
+    const Descriptor v1 = rune::codec::materializeAsOf(evolving, 1);
+    for (const Timing t : {Timing::Single, Timing::BackToBack}) {
+        Scenario s;
+        s.src = evolving;
+        s.key = KeyShape{PrimType::UInt64};
+        s.plan.viewName = "absent_key";
+        s.plan.persistence = 1;
+        s.plan.sources = {{VerdictRig::kSrc, "characterId"}};
+        s.plan.keyComponents = {{"userId", 0, "userId"}, {"characterId", 0, "characterId"}};
+        s.plan.output = {{"val", PrimType::UInt64, 0, "val", MergeRule::Replace}};
+        const auto rec = [](const Descriptor& d, uint64_t id, uint64_t user, uint64_t val) {
+            Rec07 r;
+            r.nums = {{"characterId", id}, {"userId", user}, {"val", val}};
+            return encode(d, r);
+        };
+        s.base = {rec(evolving, 7, 42, 1), rec(evolving, 8, 42, 2), rec(v1, 7, 0, 5)};
+        k07::CellRun run({Op::ViewPointRead, Entity::KeyComposite, t}, std::move(s), /*aggregate=*/false);
+        run.run();
+        EXPECT_EQ(run.skippedNoKey, 1u);
+    }
+}
+
 TEST(CheckedWritesMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(applicable(cellsFor(Part::P03)), 78u);
     EXPECT_EQ(skipped(cellsFor(Part::P03)), 2u);
@@ -1184,6 +1596,10 @@ TEST(CheckedWritesMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(skipped(cellsFor(Part::P05)), 70u);
     EXPECT_EQ(applicable(cellsFor(Part::P06)), 798u);
     EXPECT_EQ(skipped(cellsFor(Part::P06)), 84u);
+    EXPECT_EQ(applicable(cellsFor(Part::P07)), 420u);
+    EXPECT_EQ(skipped(cellsFor(Part::P07)), 129u);
+    EXPECT_EQ(aggCellsFor07().size(), 190u);
+    EXPECT_EQ(applicable(cellsFor(Part::P07)) + aggCellsFor07().size(), 610u);
 }
 
 // The model's key index rule against the Single-timing table, all 30 op x entity pairs, on hand-built logs.
