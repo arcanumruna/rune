@@ -90,6 +90,9 @@ private:
     bool                                       full_ = false;
 };
 
+// What a keyed projection does to the owner map (wire key -> current view key).
+enum class OwnerOp : uint8_t { None, Put, Erase };
+
 struct ProspectRow {
     ViewKey  key;
     uint8_t* image   = nullptr;   // the prospective view-row image; valid until the Prospect is cleared
@@ -101,7 +104,8 @@ struct ProspectRow {
 struct Prospect {
     ProspectOp                   op       = ProspectOp::None;
     uint8_t                      rowCount = 0;
-    std::array<ProspectRow, 2>   rows{};
+    OwnerOp                      ownerOp  = OwnerOp::None;   // keyed: Put stores rows[0].key under the wire key
+    std::array<ProspectRow, 2>   rows{};   // keyed Move: rows[0] is the new row, rows[1] the erased old one
     std::vector<uint8_t>         scratch;   // projection: 2 * rowLen
     RowOverlay                   overlay;   // aggregate: every touched row of the four tables
     FoldStats                    stats;     // what the fold would have counted for this record
@@ -111,6 +115,7 @@ struct Prospect {
     void clear() noexcept {
         op       = ProspectOp::None;
         rowCount = 0;
+        ownerOp  = OwnerOp::None;
         stats    = {};
         overlay.clear();
     }

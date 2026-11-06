@@ -1302,6 +1302,8 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::AuthClientFirst:
         case pc::TemplateId::AuthClientFinal:
         case pc::TemplateId::GetViewRow:
+        case pc::TemplateId::GetViewRowK:
+        case pc::TemplateId::ScanViewRows:
             if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
                 sessions_.touch(hdr->sessionId, nowNs_);
             }
@@ -1425,6 +1427,12 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         // worker via the same op/return plumbing as PushRead.
         case pc::TemplateId::GetViewRow:
             handleGetViewRow(buf, len);
+            break;
+        case pc::TemplateId::GetViewRowK:
+            handleGetViewRowK(buf, len);
+            break;
+        case pc::TemplateId::ScanViewRows:
+            handleScanViewRows(buf, len);
             break;
         default:
             // ConnectResponse, ErrorResponse, Pong, MetadataResponse (broker→client),
@@ -7419,6 +7427,41 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             return;
         }
 
+        // Checked writes Part 07: ViewScanResult - a worker's answer to a ScanViewRows page.  The chunk is
+        // [nextTokenLen u32][token][rowsLen u32][rows] (empty for a bare status): the two var fields go out verbatim.
+        if (ret.type == rune::node::WorkerReturn::Type::ViewScanResult) {
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;
+            if (ret.errorCode == rune::node::kViewRowNotLeaderInternal) [[unlikely]] {
+                std::string_view ep;
+                (void)viewSourceLedElsewhere_(ret.readTopicId, ret.readPartition, ep);
+                sendRouteRefusal_(*session, ret.sessionId, ret.correlationId, ep);
+                return;
+            }
+            pc::ScanViewRowsResponse resp;
+            resp.sessionId     = ret.sessionId;
+            resp.correlationId = ret.correlationId;
+            resp.status        = static_cast<uint16_t>(ret.errorCode);
+            if (const std::span<const uint8_t> chunk = ret.chunkBytes(); !chunk.empty()) {
+                const auto tokenLen = static_cast<uint32_t>(rune::protocol::client::detail::getLE32(chunk.data(), 0));
+                const auto rowsLen  = static_cast<uint32_t>(rune::protocol::client::detail::getLE32(chunk.data(), static_cast<int>(4 + tokenLen)));
+                resp.rowCount  = static_cast<uint16_t>(ret.recordCount);
+                resp.nextToken = chunk.subspan(4, tokenLen);
+                resp.rowsBytes = chunk.subspan(8 + tokenLen, rowsLen);
+            }
+            if (resp.encodedSize() > kScratchSize) [[unlikely]] {
+                spdlog::error("ClientGateway: ScanViewRowsResponse {} B exceeds scratch ({} B) - answered RowTooLarge "
+                              "(viewTopicId={})", resp.encodedSize(), kScratchSize, ret.readTopicId);
+                resp.status    = pc::ViewRowResponse::kRowTooLarge;
+                resp.rowCount  = 0;
+                resp.nextToken = {};
+                resp.rowsBytes = {};
+            }
+            const std::size_t encoded = resp.encode(scratch_.data());
+            sendReliable_(*session, scratch_.data(), encoded);
+            return;
+        }
+
         // ===================================================================
         // ProduceResult
         // ===================================================================
@@ -10612,6 +10655,117 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     }
 }
 
+// Checked writes Part 07: the checks GetViewRowK and ScanViewRows share after their body decoded, as handleGetViewRow
+// runs them.  Returns the session when the read may go on; otherwise it has been answered (or noted).
+Session* ClientGateway::checkedViewReadSession_(const uint8_t* buf, std::size_t len, int64_t sessionId,
+                                                               int32_t viewTopicId, const char* what)
+{
+    Session* session = sessions_.find(sessionId);
+    if (!session) {
+        noteUnanswerable_(buf, len, what);
+        return nullptr;
+    }
+    if (session->clientVersion < pc::kClientVersionCheckedWrites) {
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kInvalidRequest, "view read: client version below checked writes");
+        return nullptr;
+    }
+    if (!workerPool_) {
+        const uint16_t gate = viewRowGate_(viewTopicId, 0);
+        (void)rejectRequest_(buf, len, gate != kViewRowNoGate ? gate : pc::ViewRowResponse::kUnknownView, "view read: no worker pool");
+        return nullptr;
+    }
+    if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
+        if (deny_(*session, authorizeTopicIdHere_(perms, viewTopicId, 0, rune::security::Operation::Read,
+                                                  rune::security::ResourceType::View), buf, len))
+            return nullptr;
+    if (inDeletingNs_(viewTopicId)) [[unlikely]] {
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "view read: namespace is being deleted");
+        return nullptr;
+    }
+    return session;
+}
+
+// The tail of both: the C1 gates, the source leader's redirect, then the worker of the source partition.
+void ClientGateway::enqueueViewRead_(const uint8_t* buf, std::size_t len, Session& session, rune::node::WorkerOp& op)
+{
+    if (const uint16_t gate = viewRowGate_(op.topicId, op.partition); gate != kViewRowNoGate) {
+        (void)rejectRequest_(buf, len, gate, "view read: view not served here (C1)");
+        return;
+    }
+    if (std::string_view ep; viewSourceLedElsewhere_(op.topicId, op.partition, ep)) {
+        sendRouteRefusal_(session, op.sessionId, op.correlationId, ep);
+        return;
+    }
+    const int32_t viewSrc    = viewSourceOf_(op.topicId);
+    const int32_t routeTopic = viewSrc >= 0 ? viewSrc : op.topicId;
+    if (!workerPool_->tryEnqueueOp(routeTopic, op.partition, std::move(op)))
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kBusy, "view read: worker ring full");
+}
+
+void ClientGateway::handleGetViewRowK(const uint8_t* buf, std::size_t len)
+{
+    const auto m = pc::GetViewRowK::decode(buf, len);
+    if (!m) {
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kInvalidRequest, "GetViewRowK body undecodable");
+        return;
+    }
+    Session* session = checkedViewReadSession_(buf, len, m->sessionId, m->viewTopicId, "GetViewRowK for unknown session");
+    if (!session) return;
+    // A one-partition sink is partition 0 (-1 names it too); a wider one needs the partition named.
+    const rune::node::TopicSpec* sink = topicRegistry_ ? topicRegistry_->viewSinkSpec(m->viewTopicId) : nullptr;
+    const int32_t partitions = sink != nullptr ? sink->partitionCount : 1;
+    if (m->partition >= partitions || m->partition < (partitions == 1 ? -1 : 0)) {
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kInvalidRequest, "GetViewRowK: partition out of range");
+        return;
+    }
+    std::array<uint8_t, 1 + pc::GetViewRowK::kMaxKeyBytes + 1> tail{};
+    tail[0] = static_cast<uint8_t>(m->key.size());
+    std::memcpy(tail.data() + 1, m->key.data(), m->key.size());   // tokenLen (the byte after the key) stays 0
+
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::GetViewRowK;
+    op.topicId       = m->viewTopicId;
+    op.partition     = std::max<int32_t>(m->partition, 0);
+    op.sessionId     = m->sessionId;
+    op.correlationId = m->correlationId;
+    op.nextOffset    = m->minOffset;
+    op.hwBound       = static_cast<int64_t>(m->requestedFingerprint);
+    op.viewReadTail  = std::span<const uint8_t>(tail.data(), 2 + m->key.size());
+    enqueueViewRead_(buf, len, *session, op);
+}
+
+void ClientGateway::handleScanViewRows(const uint8_t* buf, std::size_t len)
+{
+    const auto m = pc::ScanViewRows::decode(buf, len);
+    if (!m) {
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kInvalidRequest, "ScanViewRows body undecodable");
+        return;
+    }
+    Session* session = checkedViewReadSession_(buf, len, m->sessionId, m->viewTopicId, "ScanViewRows for unknown session");
+    if (!session) return;
+    // [prefixLen u8][prefix][tokenLen u8][token]
+    std::array<uint8_t, 1 + pc::ScanViewRows::kMaxPrefixBytes + 1 + pc::ScanViewRows::kTokenBytes> tail{};
+    std::size_t n = 0;
+    tail[n++] = static_cast<uint8_t>(m->prefix.size());
+    std::memcpy(tail.data() + n, m->prefix.data(), m->prefix.size());
+    n += m->prefix.size();
+    tail[n++] = static_cast<uint8_t>(m->resumeToken.size());
+    std::memcpy(tail.data() + n, m->resumeToken.data(), m->resumeToken.size());
+    n += m->resumeToken.size();
+
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::ScanViewRows;
+    op.topicId       = m->viewTopicId;
+    op.partition     = 0;   // a keyed view has one partition
+    op.sessionId     = m->sessionId;
+    op.correlationId = m->correlationId;
+    op.nextOffset    = m->minOffset;
+    op.hwBound       = static_cast<int64_t>(m->requestedFingerprint);
+    op.recordCount   = m->limit;
+    op.viewReadTail  = std::span<const uint8_t>(tail.data(), n);
+    enqueueViewRead_(buf, len, *session, op);
+}
+
 // ---------------------------------------------------------------------------
 // CG-4: addGroupSubscription — create an internal push subscription for a
 // group member.  Seeds nextOffset from fromOffset (the committed offset from
@@ -10789,6 +10943,26 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
             ddlDowngradeScratch_[pc::MessageHeader::ENCODED_SIZE]     = static_cast<uint8_t>(pc::ErrorCode::InvalidRequest);
             ddlDowngradeScratch_[pc::MessageHeader::ENCODED_SIZE + 1] = 0;
             buf = ddlDowngradeScratch_.data();
+        }
+    }
+    // Checked writes: a view DDL refusal 59-61 reaches a client below v17 as InvalidRequest (39), on whichever frame carries it.
+    if (session->clientVersion < pc::kClientVersionCheckedWrites && len > pc::MessageHeader::ENCODED_SIZE + 2) [[unlikely]] {
+        if (const auto h = pc::MessageHeader::decode(buf, len)) {
+            std::size_t at = 0;   // where the frame holds its u16 error code
+            if (h->templateId == static_cast<uint16_t>(pc::TemplateId::ErrorResponse) ||
+                h->templateId == static_cast<uint16_t>(pc::TemplateId::DdlResponse))
+                at = pc::MessageHeader::ENCODED_SIZE;
+            else if (h->templateId == static_cast<uint16_t>(pc::TemplateId::CreateViewResponse))
+                at = pc::MessageHeader::ENCODED_SIZE + 12;   // after viewTopicId and outputFingerprint
+            if (at != 0 && len >= at + 2) {
+                const int code = buf[at] | (buf[at + 1] << 8);
+                if (code >= static_cast<int>(pc::ErrorCode::ViewKeyExpressionInvalid) && code <= static_cast<int>(pc::ErrorCode::ViewUniqueInvalid)) {
+                    ddlDowngradeScratch_.assign(buf, buf + len);
+                    ddlDowngradeScratch_[at]     = static_cast<uint8_t>(pc::ErrorCode::InvalidRequest);
+                    ddlDowngradeScratch_[at + 1] = 0;
+                    buf = ddlDowngradeScratch_.data();
+                }
+            }
         }
     }
     // No-hang (R2): every answer delivered through here (DDL responses from the

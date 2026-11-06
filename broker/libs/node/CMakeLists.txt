@@ -855,7 +855,12 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesVerdictSourceTest.cpp
         tests/node/CheckedWritesKeyIndexTest.cpp
         tests/node/CheckedWritesAutoIncStateTest.cpp
-        tests/node/CheckedWritesAutoIncHookTest.cpp)
+        tests/node/CheckedWritesAutoIncHookTest.cpp
+        tests/node/CheckedWritesViewSetTest.cpp
+        tests/node/CheckedWritesKeyedRecoveryTest.cpp
+        tests/node/CheckedWritesAdminViewDdlTest.cpp
+        tests/node/CheckedWritesViewReadTest.cpp
+        tests/node/CheckedWritesViewReadGatewayTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -1383,7 +1388,7 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_checked_writes_ack_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 04: the verdict pipeline on a real Worker.
-            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp)
+            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
@@ -1402,7 +1407,7 @@ if(BUILD_TESTING)
 
             # Checked writes Part 03 (hard rule): the write hook and the View acks allocate nothing.  Replaces the global
             # operator new (binary-wide) - its own binary; later checked-writes parts extend it.
-            add_executable(rune_checked_writes_alloc_regression_tests tests/node/CheckedWritesAllocRegressionTest.cpp tests/node/CheckedWritesAutoIncAllocTest.cpp tests/support/AllocWindow.cpp)
+            add_executable(rune_checked_writes_alloc_regression_tests tests/node/CheckedWritesAllocRegressionTest.cpp tests/node/CheckedWritesAutoIncAllocTest.cpp tests/node/CheckedWritesViewReadAllocTest.cpp tests/support/AllocWindow.cpp)
             target_include_directories(rune_checked_writes_alloc_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
             target_link_libraries(rune_checked_writes_alloc_regression_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_alloc_regression_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
@@ -1931,7 +1936,7 @@ if(BUILD_TESTING)
         target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
                                    ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
-                              rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
+                              rune_client_view rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         # The two login-timing measurements (the 5 ms median gate and the #136 first-leg parity) are latency gates:
         # RUN_SERIAL + LABELS latency (CLAUDE.md §3: they run on an idle host, stage b of scripts/run-regression.sh); the
         # rest of the binary is functional and runs in parallel.

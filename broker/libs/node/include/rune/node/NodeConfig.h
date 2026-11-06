@@ -382,6 +382,8 @@ struct NodeConfig {
     // TEST-ONLY (ISR v3 Step 9, B-I8): every replica of this node emits no follower fetch for this long after
     // start (PartitionReplica::holdFetchesUntilForTest) - a wiped member that cannot catch up yet.  0 = off.
     int64_t testHoldFollowerFetchesMs = 0;
+    // TEST-ONLY (checked writes Part 07): worker i seeds its view tables with this + i when non-zero (0 = a random seed per worker per boot).
+    uint64_t viewHashSeedForTest = 0;
     /// Test seam (review C I4): runs on the startup thread right after validateAuth() loaded the cluster key - a test
     /// rewrites the key file here to prove the key validated is the key in use.  Cold; never set in production.
     std::function<void()> testAfterAuthValidation;

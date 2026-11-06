@@ -64,7 +64,8 @@ features are hashed after it, so every v1 and v2 digest replays as before.
 
 1. "key.index needs every broker at feature level 5"
 2. "key.index needs a typed topic", "key.index needs a key", "key.index needs a persisted topic"
-3. "key.index needs a key of at most 8 bytes" (until wide keys ship)
+
+The key index takes a key of up to 16 bytes.
 
 **`autoincrement` DDL.** A definition with `autoIncrement`, a non-default `partitioner`, `autoIncrementMax` or
 `autoIncrementReserve` is checked first, in this order, each an `InvalidRequest` (39) with this detail:

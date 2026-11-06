@@ -40,7 +40,10 @@ static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::ViewRowResult) ==
 static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::TxnVerifyRequest) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::TXN_VERIFY_REQUEST),
               "WorkerReturn::TxnVerifyRequest must stay on sbe ReturnType::TXN_VERIFY_REQUEST");
-
+// Checked writes Part 07: ViewScanResult rides sbe ReturnType::VIEW_SCAN_RESULT (value 9).
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::ViewScanResult) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::VIEW_SCAN_RESULT),
+              "WorkerReturn::ViewScanResult must stay on sbe ReturnType::VIEW_SCAN_RESULT");
 
 // ---------------------------------------------------------------------------
 // WorkerReturn (template id 2)

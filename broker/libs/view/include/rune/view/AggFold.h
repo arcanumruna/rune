@@ -4,6 +4,7 @@
 
 #include <rune/storage/LogReadView.h>
 #include <rune/view/AggState.h>
+#include <rune/view/KeyedFold.h>
 #include <rune/view/ViewFold.h>
 #include <rune/view/ViewPlan.h>
 #include <rune/view/ViewRow.h>
@@ -42,11 +43,20 @@ struct AggregateFold {
     ViewTable&               contributors;
     ViewTable&               groups;
     ViewTable*               blocks;
+    // Keyed view (agg.keyed): the spec, the group key -> gid table (row [gid u64]) and the next unused gid (apply advances it).
+    const KeyedFoldSpec*     keyed       = nullptr;
+    ViewTable*               groupIds    = nullptr;
+    uint64_t*                nextGroupId = nullptr;
 };
 
 // Computes the record's prospective group rows into `p` (rows[0] the new group, rows[1] the old group of a Move)
 // without touching a table; CapacityExhausted when the overlay's fixed slots run out.
 [[nodiscard]] PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospect& p) noexcept;
 void applyAggregate(AggregateFold& f, const SourceRecord& rec, const Prospect& p) noexcept;
+
+// The walk of foldProjectionBatch for an aggregate: each committed record prepared into p (reserved once per instance) and applied.
+// The keyed view's fold (f.keyed set); a LegacyU64 view uses foldAggregateBatch.
+FoldStats foldKeyedAggregateBatch(AggregateFold& f, Prospect& p, const rune::storage::LogReadView& lv, int64_t bound, int64_t& cursor,
+                                  const FoldSkip& skip);
 
 } // namespace rune::view

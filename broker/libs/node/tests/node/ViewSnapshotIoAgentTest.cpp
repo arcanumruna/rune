@@ -291,6 +291,35 @@ TEST(ViewSnapshotIoAgentRegression, MultiTableDeltaIsPersistedNotDropped) {
 }
 
 
+// Part 07: a v3 record (K-byte keys) is appended as-is and its O (byte 4) is reported on done.
+TEST(CheckedWritesIoAgent, V3RecordIsAppendedAndAcked) {
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/50);
+    rune::consensus::ManualNanoClock clk(0);
+
+    uint8_t row[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    uint8_t key[24] = {9};
+    const KeyedDirtyEntry e{0, false, key, row};
+    const KeyedTableDelta tds[] = {{0, 24, 8, {&e, 1}}};
+    std::vector<uint8_t> delta;
+    encodeKeyedDelta(tds, /*O=*/21, delta);
+    std::vector<uint8_t> frame(rune::node::ViewSnapshotChannel::kDeltaHeaderBytes + delta.size());
+    for (int i = 0; i < 4; ++i) frame[i]     = uint8_t(uint32_t(kViewTopicId) >> (i * 8));
+    for (int i = 0; i < 4; ++i) frame[4 + i] = uint8_t(uint32_t(kPartition) >> (i * 8));
+    std::memcpy(frame.data() + rune::node::ViewSnapshotChannel::kDeltaHeaderBytes, delta.data(), delta.size());
+    ASSERT_TRUE(ch.deltas.write(frame.data(), frame.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+
+    int it = 0;
+    for (; it < kHardCap && agent.lastDurableOffset(kViewTopicId, kPartition) < 21; ++it) {
+        agent.doWork(clk.nowNs());
+        clk.advance(60LL * 1'000'000LL);
+    }
+    ASSERT_LT(it, kHardCap) << "v3 delta was dropped: durable offset never reached 21";
+    EXPECT_EQ(readFile(agent.deltaFilePathForTest(kViewTopicId, kPartition)), delta);
+}
+
+
 // ===========================================================================
 // View checkpoint backups (batch 1, C1): the discard frame moves the live file into backup/ before anything is rebuilt.
 // ===========================================================================

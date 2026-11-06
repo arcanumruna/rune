@@ -2,9 +2,12 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <span>
 #include <vector>
+#include <cassert>
+#include <rune/view/ViewKey.h>
 #include <rune/view/ViewRow.h>
 
 namespace rune::view {
@@ -79,6 +82,23 @@ namespace rune::view {
 // ARE the growth path. get() never allocates. The row-id free-list only
 // grows (via erase()) so its own push_back() never (re)allocates once
 // reserve()'d.
+//
+// Wide keys (Part 07): a key of keyWidth > 8 bytes is stored in a header in front of its row
+// (`[key][payload]`, the payload is the RowLayout row) and the index slot word is its seeded wyhash, so the
+// 13-byte slot (tag, word, rid) is the same as the narrow one.  A probe matches tag, then word, then the header
+// key; backshift and migration take the home from the stored word and never read the arena.  A narrow key
+// (keyWidth <= 8) is the slot word itself, as before; `hashSeed` is XORed in before `mix()` (seed 0 = the
+// original index).
+struct ViewTableKeys {
+    uint8_t  keyWidth = 8;
+    uint8_t  prefixWidth = 0;
+    uint64_t hashSeed = 0;
+    uint64_t hashMaskForTest = ~uint64_t{0};   // AND-ed into every hash; 0 makes every key collide
+};
+
+enum class PrefixScan : uint8_t { End, Stopped, CursorGone };
+inline constexpr std::size_t kScanTokenBytes = 12;      // [pos u32][version u64], P7-11
+
 class ViewTable {
 public:
     // `initialIndexSlots` must be a power of two (capacity of the
@@ -87,25 +107,97 @@ public:
     // `floor_pow2(chunkBytes / layout.rowLen)`, clamped to a minimum of 1
     // row per chunk (e.g. when a single row is wider than `chunkBytes`).
     explicit ViewTable(RowLayout layout, size_t initialIndexSlots = 4096,
-                        size_t chunkBytes = 32u << 20);
+                        size_t chunkBytes = 32u << 20, ViewTableKeys keys = {});
 
     // Returns a writable pointer to the row for `key`. Inserts a zeroed row
     // on first use. Idempotent: calling put() again for an existing key
     // returns that same row's pointer without creating a duplicate entry.
+    // The uint64_t API needs keyWidth <= 8 and no prefix (a prefix table takes the prefix from the key bytes).
     uint8_t* put(uint64_t key);
+    uint8_t* put(const ViewKey& key);   // key.len == keyWidth
 
     // Returns a pointer to the row for `key`, or nullptr if absent.
     const uint8_t* get(uint64_t key) const noexcept;
+    const uint8_t* get(const ViewKey& key) const noexcept;
 
     // Removes `key`. Returns false if `key` was not present. O(1):
     // backward-shift in the index, the row-id returned to the free-list;
     // the row payload itself is left untouched (no tombstone, no move).
     bool erase(uint64_t key) noexcept;
+    bool erase(const ViewKey& key) noexcept;
+
+    // Prefix index (prefixWidth > 0): each prefix maps to a hashset of the keys of its rows.  Calls visit(key, payload)
+    // for every row under `prefix`; a false return stops BEFORE consuming that row.  `resume` is empty (start of the
+    // prefix's set) or kScanTokenBytes long: CursorGone if the prefix has no set or the token's version is not the
+    // set's current one (any insert or erase under the prefix since).  On Stopped, `next` is the token to resume from.
+    template <class Fn>
+    PrefixScan scanPrefix(std::span<const uint8_t> prefix, std::span<const uint8_t> resume,
+                          std::span<uint8_t, kScanTokenBytes> next, Fn&& visit) const noexcept {
+        const uint32_t id = findSet(prefix);
+        if (id == kNoSet) return resume.empty() ? PrefixScan::End : PrefixScan::CursorGone;
+        const PrefixSet& s = sets_[id];
+        uint32_t pos = 0;
+        if (!resume.empty()) {
+            uint64_t version;
+            if (resume.size() != kScanTokenBytes) return PrefixScan::CursorGone;
+            std::memcpy(&pos, resume.data(), 4);
+            std::memcpy(&version, resume.data() + 4, 8);
+            if (version != s.version) return PrefixScan::CursorGone;
+        }
+        const SetBlock cur = blockOf(s.block);
+        const SetBlock old = s.migrating ? blockOf(s.oldBlock) : SetBlock{};
+        for (size_t total = old.cap + cur.cap; pos < total; ++pos) {
+            const SetBlock& b = pos < old.cap ? old : cur;
+            const size_t i = pos < old.cap ? pos : pos - old.cap;
+            if (b.tags[i] == kEmpty) continue;
+            const uint64_t word = b.words[i];
+            const uint8_t* payload = rowAddr(b.rids[i]);
+            const std::span<const uint8_t> key = headerLen_ ? keyOfRow(payload)
+                                                            : std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&word), keyWidth_);
+            if (!visit(key, payload)) {
+                std::memcpy(next.data(), &pos, 4);
+                std::memcpy(next.data() + 4, &s.version, 8);
+                return PrefixScan::Stopped;
+            }
+        }
+        return PrefixScan::End;
+    }
+
+    // Tests only: the size and slot count of the set under `prefix` (0 when it has none), the most entries any one
+    // op moved between a set's blocks, and the pool chunks allocated.
+    static constexpr size_t kSetMigrate = 256;
+    [[nodiscard]] uint32_t prefixSetSizeForTest(std::span<const uint8_t> prefix) const noexcept {
+        const uint32_t id = findSet(prefix);
+        return id == kNoSet ? 0 : sets_[id].size;
+    }
+    [[nodiscard]] uint32_t prefixSetCapacityForTest(std::span<const uint8_t> prefix) const noexcept {
+        const uint32_t id = findSet(prefix);
+        return id == kNoSet ? 0 : static_cast<uint32_t>(blockOf(sets_[id].block).cap);
+    }
+    [[nodiscard]] uint32_t maxSetEntriesMovedPerOpForTest() const noexcept { return maxSetMoved_; }
+    [[nodiscard]] std::size_t prefixPoolChunksForTest() const noexcept { return poolChunks_.size(); }
+
+    [[nodiscard]] uint8_t keyWidth() const noexcept { return keyWidth_; }
+    [[nodiscard]] uint8_t prefixWidth() const noexcept { return prefixWidth_; }
+    [[nodiscard]] uint64_t hashSeedForTest() const noexcept { return hashSeed_; }
+
+    // The key stored in front of a wide row; empty for a narrow table (its key is the slot word).
+    [[nodiscard]] std::span<const uint8_t> keyOfRow(const uint8_t* payload) const noexcept {
+        return {payload - headerLen_, headerLen_};
+    }
+
+    // Header-key compares since construction, and the rids in primary-slot order.  Tests only.
+    uint64_t arenaKeyReadsForTest() const noexcept { return arenaKeyReads_; }
+    std::vector<uint32_t> slotOrderForTest() const {
+        std::vector<uint32_t> order;
+        for (size_t i = 0; i < main_.cap; ++i) if (main_.tags[i] != kEmpty) order.push_back(main_.rid[i]);
+        return order;
+    }
 
     size_t size() const noexcept { return sz_; }
 
     // Index slot count, doubled by every grow.  Tests only.
-    size_t indexSlotsForTest() const noexcept { return cap_; }
+    size_t indexSlotsForTest() const noexcept { return main_.cap; }
 
     // Number of row-slab chunks currently allocated. Grows by 1 each time
     // `put` needs a row-id beyond the current total chunk capacity.
@@ -113,7 +205,9 @@ public:
 
     // Namespaces Phase 2 Task 12 (D26): the row-slab memory, chunkCount x bytes per chunk.  O(1) and incremental by
     // construction (chunks only ever append), so the view set charges it without scanning.
-    size_t memoryBytes() const noexcept { return chunks_.size() * rowsPerChunk_ * static_cast<size_t>(layout_.rowLen); }
+    size_t memoryBytes() const noexcept {
+        return chunks_.size() * rowsPerChunk_ * rowStride_ + poolBytes_ + (outer_.cap + outer_.ocap) * kSlotBytes;
+    }
 
     // Task 5 test/bench hooks (Task 7's benchmark depends on these):
     //
@@ -122,13 +216,13 @@ public:
     // slice, migrate step, or a startGrow — including its inline fallback
     // zero-fill when pre-provisioning wasn't ready in time). 0.0 if the
     // index never grew.
-    double worstRehashTaxUs() const noexcept { return maxRehashNs_ / 1000.0; }
+    double worstRehashTaxUs() const noexcept { return main_.maxRehashNs / 1000.0; }
 
     // Number of times startGrow() had to finish the next index buffer's
     // zero-fill inline because de-amortized pre-provisioning had not
     // completed yet (a write burst outran it). 0 means every grow swapped
     // in a fully pre-zeroed buffer in O(1).
-    uint64_t rehashFallbacks() const noexcept { return fallbacks_; }
+    uint64_t rehashFallbacks() const noexcept { return main_.fallbacks; }
 
     // --- Task 6: row-sized dirty tracking for the differential checkpoint ---
     //
@@ -170,10 +264,12 @@ public:
     // DeleteThenReinsertSameKeyWithinIntervalReplaysCorrectly.)
     template<class Fn>
     void drainDirty(Fn&& emit) {
+        assert(keyWidth_ <= 8 && prefixWidth_ == 0);
         for (const auto& d : deleted_) {
             emit(d.rid, nullptr, /*deleted*/true, d.key);
         }
         deleted_.clear();
+        deletedKeyBytes_.clear();
         for (uint32_t rid : dirtyList_) {
             // dirty_[rid] may have been cleared by an intervening erase()
             // (the row no longer exists) -- skip it then; the deleted_
@@ -181,6 +277,30 @@ public:
             if (!dirty_[rid]) continue;
             dirty_[rid] = 0;
             emit(rid, rowAddr(rid), /*deleted*/false, dirtyKeys_[rid]);
+        }
+        dirtyList_.clear();
+    }
+
+    // As drainDirty, but `emit(rid, payload, deleted, key)` gets the keyWidth key bytes (a narrow key is the first
+    // keyWidth little-endian bytes of the slot word).  Same order: deletes, then upserts.
+    template<class Fn>
+    void drainDirtyKeyed(Fn&& emit) {
+        for (size_t n = 0; n < deleted_.size(); ++n) {
+            const DeletedEntry& d = deleted_[n];
+            if (headerLen_) {
+                emit(d.rid, nullptr, /*deleted*/true, std::span<const uint8_t>(deletedKeyBytes_.data() + n * keyWidth_, keyWidth_));
+            } else {
+                emit(d.rid, nullptr, /*deleted*/true, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&d.key), keyWidth_));
+            }
+        }
+        deleted_.clear();
+        deletedKeyBytes_.clear();
+        for (uint32_t rid : dirtyList_) {
+            if (!dirty_[rid]) continue;
+            dirty_[rid] = 0;
+            const uint8_t* payload = rowAddr(rid);
+            emit(rid, payload, /*deleted*/false,
+                 headerLen_ ? keyOfRow(payload) : std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&dirtyKeys_[rid]), keyWidth_));
         }
         dirtyList_.clear();
     }
@@ -221,35 +341,118 @@ private:
     static uint64_t mix(uint64_t x) noexcept;
     static uint8_t  fullTag(uint64_t h) noexcept;
 
-    // Returns the PRIMARY (NEW) index slot holding `key`, or SIZE_MAX if absent.
-    size_t findP(uint64_t key) const noexcept;
+    // The hash a stored slot word was placed by: a wide word is already the hash; a narrow word is the key.
+    uint64_t hashOfWord(uint64_t word) const noexcept {
+        return headerLen_ ? word : (mix(word ^ hashSeed_) & hashMask_);
+    }
 
-    // Returns the OLD index slot holding `key`, or SIZE_MAX if absent or
+    // What an index probe looks for: the slot word, its hash, and (wide only) the key bytes to compare in the row header.
+    struct Probe { uint64_t word; uint64_t h; const uint8_t* wideKey; };
+    Probe probeOf(uint64_t narrowKey) const noexcept { return {narrowKey, hashOfWord(narrowKey), nullptr}; }
+    Probe probeOf(const ViewKey& key) const noexcept;
+
+    uint8_t*       putImpl(const Probe& p);
+    const uint8_t* getImpl(const Probe& p) const noexcept;
+    bool           eraseImpl(const Probe& p) noexcept;
+
+    // Returns the PRIMARY (NEW) index slot holding the probe's key, or SIZE_MAX if absent.
+    size_t findP(const Probe& p) const noexcept;
+
+    // Returns the OLD index slot holding the probe's key, or SIZE_MAX if absent or
     // not currently migrating. Only ever non-empty while `migrating_`.
-    size_t findO(uint64_t key) const noexcept;
+    size_t findO(const Probe& p) const noexcept;
 
-    // Backward-shift deletion (see erase()'s doc) over the PRIMARY index
-    // arrays only, starting at the already-found slot `i`.
-    void backshiftPrimary(size_t i) noexcept;
+    // True if the row `rid`'s header key equals `key`.
+    bool headerKeyEquals(uint32_t rid, const uint8_t* key) const noexcept;
 
-    // Once the primary index's load factor crosses kPrezeroLoad (and no
-    // grow is currently in flight), zero-fills up to kPrezero more entries
-    // of the next 2x-capacity nextTags_/nextKeys_/nextRid_buf_ buffers
-    // (reserving their backing storage, a fast non-zeroing allocation, on
-    // the first call for a given target capacity). A no-op once the next
-    // buffer is fully provisioned, or while `migrating_` is true.
-    void maybePrezero() noexcept;
+    // An open-addressing index of (tag, word, rid) slots with incremental, de-amortized growth: the main key index,
+    // and the prefix -> set map.  `wordIsHash` says the word is already the hash (wide keys, prefixes); otherwise it is
+    // the exact narrow key and `home()` hashes it.  Growth: once the load crosses kPrezeroLoad `maybePrezero()` zero-fills
+    // the next 2x buffers kPrezero entries per op; at kGrowLoad `startGrow()` promotes the index to OLD (`ot`/`ok`/`orid`,
+    // drain cursor `ocur`) and `migrateStep()` moves at most kMigK OLD entries per op into the 2x NEW one.  An erase of
+    // an OLD-only entry tombstones it (kTomb) rather than shifting; OLD is draining, not steady-state.
+    struct SlotIndex {
+        std::vector<uint8_t>  tags;   // 1-byte Swiss/F14-style tag per index slot
+        std::vector<uint64_t> keys;   // the slot word
+        std::vector<uint32_t> rid;    // dense row-id (or prefix-set id) per index slot
+        size_t cap  = 0;              // index slot count (power of two)
+        size_t mask = 0;              // cap - 1
 
-    // Promotes the current primary index to OLD and installs a fresh 2x
-    // primary: swaps in the pre-provisioned next buffer in O(1) if
-    // maybePrezero() finished it in time, otherwise finishes the zero-fill
-    // inline right here (counted via fallbacks_). Sets migrating_ = true.
-    void startGrow();
+        std::vector<uint8_t>  ot;
+        std::vector<uint64_t> ok;
+        std::vector<uint32_t> orid;
+        size_t ocap      = 0;
+        size_t omask     = 0;
+        size_t ocur      = 0;
+        bool   migrating = false;
 
-    // Moves up to kMigK still-live OLD index entries into the PRIMARY
-    // index. Clears migrating_ (and frees the OLD arrays) once the OLD
-    // index has been fully drained. A no-op if not currently migrating.
-    void migrateStep() noexcept;
+        // Pre-provision buffers for the NEXT 2x index.  prezeroCap == 0: nothing in flight; otherwise the target
+        // capacity (cap * 2 of the generation that started it) and prezeroCur how much is zero-filled so far.
+        std::vector<uint8_t>  nextTags;
+        std::vector<uint64_t> nextKeys;
+        std::vector<uint32_t> nextRid;
+        size_t prezeroCap = 0;
+        size_t prezeroCur = 0;
+
+        double   maxRehashNs = 0.0;   // worst single-op rehash-upkeep cost (see worstRehashTaxUs())
+        uint64_t fallbacks   = 0;     // startGrow() calls that had to finish the zero-fill inline
+
+        bool     wordIsHash = false;
+        uint64_t seed       = 0;
+        uint64_t hashMask   = ~uint64_t{0};
+
+        void init(size_t slots, bool wordIsHash_, uint64_t seed_, uint64_t hashMask_);
+        uint64_t home(uint64_t word) const noexcept { return wordIsHash ? word : (mix(word ^ seed) & hashMask); }
+        // Backward-shift deletion over the PRIMARY arrays only, starting at the already-found slot `i`.
+        void backshift(size_t i) noexcept;
+        // `sz` is the live entry count.
+        void maybePrezero(size_t sz) noexcept;
+        void startGrow();
+        void migrateStep() noexcept;
+    };
+
+    // --- the prefix index -------------------------------------------------------------------------------------
+    // The outer SlotIndex maps the seeded hash of a prefix to a PrefixSet id.  A set is a hashset of the keys of the
+    // rows under the prefix, in one block of `16 << cls` 13-byte slots (tag | word | rid, exactly the main index's
+    // slot).  Blocks come from pool chunks and never move.  A set grows or shrinks by taking a block of the next/
+    // previous class and moving at most kSetMigrate entries per op out of the old block, which is a real hash table
+    // (backshift deletes) until it drains; lookups probe both blocks meanwhile.
+    struct SetBlock { uint8_t* tags = nullptr; uint64_t* words = nullptr; uint32_t* rids = nullptr; size_t cap = 0; };
+    struct PrefixSet {
+        uint64_t version   = 0;
+        uint32_t block     = 0;
+        uint32_t size      = 0;
+        uint32_t oldBlock  = 0;   // while migrating
+        uint32_t cursor    = 0;   // next slot of oldBlock to drain
+        bool     migrating = false;
+    };
+    struct PoolChunk { std::unique_ptr<uint8_t[]> tags; std::unique_ptr<uint64_t[]> words; std::unique_ptr<uint32_t[]> rids; };
+    struct BlockRef { uint8_t* tags; uint64_t* words; uint32_t* rids; };
+
+    static constexpr uint32_t kNoSet = UINT32_MAX;
+    static constexpr size_t kSlotBytes = 13;   // tag + word + rid
+
+    SetBlock blockOf(uint32_t id) const noexcept {
+        const BlockRef& r = blocks_[id];
+        return {r.tags, r.words, r.rids, size_t{16} << blockClass_[id]};
+    }
+    const uint8_t* setPrefix(uint32_t id) const noexcept { return setPrefixBytes_.data() + size_t{id} * prefixWidth_; }
+    // The id of the set under `prefix`, or kNoSet.
+    uint32_t findSet(std::span<const uint8_t> prefix) const noexcept;
+    uint32_t findSetHashed(uint64_t h, const uint8_t* prefix) const noexcept;
+    const uint8_t* prefixBytesOf(const Probe& p) const noexcept {
+        return p.wideKey ? p.wideKey : reinterpret_cast<const uint8_t*>(&p.word);   // little-endian, like ViewKey::asU64
+    }
+    void     appendPoolChunk(uint8_t cls);
+    uint32_t allocBlock(uint8_t cls);
+    void     freeBlock(uint32_t id) { blockFree_[blockClass_[id]].push_back(id); }
+    void     startSetMigration(PrefixSet& s, uint8_t cls);
+    // Spends from `budget` (the op's remaining kSetMigrate) and adds the entries moved to `moved`.
+    void     migrateSet(PrefixSet& s, size_t& budget, uint32_t& moved) noexcept;
+    void     prefixInsert(const Probe& p, uint32_t rid);
+    void     prefixErase(const Probe& p, uint32_t rid) noexcept;
+
+
 
     // Allocates one more chunk (rowsPerChunk_ * layout_.rowLen bytes,
     // zero-initialized) and appends it. This is the ONE deliberate
@@ -270,19 +473,24 @@ private:
     uint8_t* rowAddr(uint32_t rid) noexcept {
         auto& chunk = chunks_[static_cast<size_t>(rid) >> chunkShift_];
         const size_t inChunk = static_cast<size_t>(rid) & chunkMask_;
-        return chunk.get() + inChunk * layout_.rowLen;
+        return chunk.get() + inChunk * rowStride_ + headerLen_;
     }
     const uint8_t* rowAddr(uint32_t rid) const noexcept {
         const auto& chunk = chunks_[static_cast<size_t>(rid) >> chunkShift_];
         const size_t inChunk = static_cast<size_t>(rid) & chunkMask_;
-        return chunk.get() + inChunk * layout_.rowLen;
+        return chunk.get() + inChunk * rowStride_ + headerLen_;
     }
 
     RowLayout layout_;
+    uint8_t   keyWidth_    = 8;
+    uint8_t   prefixWidth_ = 0;
+    uint64_t  hashSeed_    = 0;
+    uint64_t  hashMask_    = ~uint64_t{0};
+    uint32_t  headerLen_   = 0;  // keyWidth_ when wide (> 8), else 0
+    size_t    rowStride_   = 0;  // headerLen_ + layout_.rowLen
+    mutable uint64_t arenaKeyReads_ = 0;
 
-    std::vector<uint8_t>  tags_;   // 1-byte Swiss/F14-style tag per index slot
-    std::vector<uint64_t> keys_;   // exact 8-byte key per index slot
-    std::vector<uint32_t> rid_;    // dense row-id per index slot
+    SlotIndex main_;   // key -> rid
     // Row-payload chunked arena; rows never move.  Each chunk is a zeroed array (one memset in appendChunk),
     // not a std::vector<uint8_t>: an unoptimized (Debug / sanitizer) build constructed and destroyed a
     // vector chunk byte by byte — ~0.1 s per view table in every test that installs a view.
@@ -291,46 +499,25 @@ private:
 
     uint32_t nextRid_ = 0;  // next never-used row-id, bumped when free_ is empty
     size_t   sz_      = 0;  // live key count
-    size_t   cap_     = 0;  // index slot count (power of two)
-    size_t   mask_    = 0;  // cap_ - 1
 
     size_t rowsPerChunk_ = 0;  // power of two: floor_pow2(chunkBytes / rowLen), min 1
     size_t chunkShift_   = 0;  // log2(rowsPerChunk_); rid >> chunkShift_ == chunk index
     size_t chunkMask_    = 0;  // rowsPerChunk_ - 1; rid & chunkMask_ == in-chunk row slot
 
-    // --- Task 5: incremental index rehash -----------------------------
-    // OLD index: the pre-grow (tags_/keys_/rid_), kept around only for the
-    // duration of the migration window (migrating_ == true). Entries with
-    // tags_[.] >= 0x80 (fullTag()'s range) at ot_[ocur_.. ) are still live
-    // and not yet migrated; kEmpty/kTomb entries are skipped by
-    // migrateStep(). ocur_ is the drain cursor: everything before it has
-    // already been visited (migrated or discarded).
-    std::vector<uint8_t>  ot_;
-    std::vector<uint64_t> ok_;
-    std::vector<uint32_t> orid_;
-    size_t ocap_      = 0;
-    size_t omask_     = 0;
-    size_t ocur_      = 0;
-    bool   migrating_ = false;
-
-    // De-amortized pre-provision buffers for the NEXT 2x primary index,
-    // filled kPrezero entries at a time by maybePrezero(). prezeroCap_ == 0
-    // means no provisioning is in flight/pending; otherwise it is the
-    // target capacity (always cap_*2 for the cap_ generation that started
-    // it) and prezeroCur_ (== nextTags_.size()) is how much of it has been
-    // zero-filled so far. Fully provisioned once prezeroCur_ == prezeroCap_.
-    std::vector<uint8_t>  nextTags_;
-    std::vector<uint64_t> nextKeys_;
-    std::vector<uint32_t> nextRid_buf_;
-    size_t prezeroCap_ = 0;
-    size_t prezeroCur_ = 0;
-
-    // Diagnostics (Task 7 benchmark hooks): worst single-op rehash-upkeep
-    // cost ever paid (ns; see worstRehashTaxUs()), and how many startGrow()
-    // calls had to finish the next buffer's zero-fill inline because
-    // pre-provisioning wasn't ready (see rehashFallbacks()).
-    double   maxRehashNs_ = 0.0;
-    uint64_t fallbacks_   = 0;
+    // The prefix index (prefixWidth_ > 0 only).
+    SlotIndex outer_;                          // prefix hash -> set id
+    size_t outerCount_ = 0;                    // live sets
+    std::vector<PrefixSet> sets_;
+    std::vector<uint8_t>   setPrefixBytes_;    // prefixWidth_ bytes per set id
+    std::vector<uint32_t>  setFree_;           // set ids to reuse
+    std::vector<PoolChunk> poolChunks_;
+    std::vector<BlockRef>  blocks_;            // block id -> its slots
+    std::vector<uint8_t>   blockClass_;        // block id -> class
+    std::vector<std::vector<uint32_t>> blockFree_;   // per class
+    size_t   chunkBytes_ = 0;
+    uint64_t versionClock_ = 0;                // set versions; seeded from std::random_device
+    size_t   poolBytes_ = 0;                   // bytes of poolChunks_
+    uint32_t maxSetMoved_ = 0;
 
     // --- Task 6: row-sized dirty tracking -------------------------------
     // `dirty_`/`dirtyKeys_` are indexed by `rid` and sized to the rid space
@@ -342,11 +529,12 @@ private:
     // markDirty() only takes a rid per its public signature) so
     // drainDirty() can emit `key` for upserts too, not just deletes.
     std::vector<uint8_t>  dirty_;
-    std::vector<uint64_t> dirtyKeys_;
+    std::vector<uint64_t> dirtyKeys_;   // TODO: on a wide table this holds the hashed slot word, not the key; do not consume it
     std::vector<uint32_t> dirtyList_; // rids marked dirty this interval, each pushed once (coalesced)
 
     struct DeletedEntry { uint32_t rid; uint64_t key; };
     std::vector<DeletedEntry> deleted_; // erase()'d {rid,key} pairs pending drainDirty()
+    std::vector<uint8_t> deletedKeyBytes_; // wide tables: keyWidth_ bytes per deleted_ entry, in the same order
 };
 
 } // namespace rune::view

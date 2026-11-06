@@ -615,7 +615,7 @@ if (row.status == ViewRowResult::kOk) {
 - Rows are fixed-width and decoded positionally against a layout built from the plan's output types. Remember
   `viewTopicId` and `outputFingerprint` from `createView`: a drifted fingerprint is answered `SchemaMismatch`.
 - `ViewRowResult::status`: `kOk`, `kAbsentKey`, `kNotReady` (nothing folded yet: retry), `kSchemaMismatch`, `kUnknownView`, `kInvalidRequest`, `kBusy` (retry), `kRowTooLarge`,
-  `kNotAuthorized`, and the client-side `kNotLeader`.
+  `kNotAuthorized`, `kCursorInvalidated` (a scan, see [Wide view keys](#wide-view-keys)), and the client-side `kNotLeader`.
 - A row is served only by the source partition's leader, under the controller's read lease, and reflects every write
   acknowledged before the read was sent. A leader that lost its lease (cut off from the controller) answers `NotLeader`;
   the client retries it within `ddlRetryBudget`.
@@ -623,6 +623,54 @@ if (row.status == ViewRowResult::kOk) {
   topic is allowed, persisted or transient (a keyless source answers `ViewKeyInvalid`); a view cannot read another view (`ViewSourceIsView`). `READ` on
   the view is needed to read a row and `READ` on each source to create it.
 - Related calls: `alterView(AndWait)`, `dropView(AndWait)`.
+
+### Wide view keys
+
+A view keyed by up to 128 bytes of typed columns (a plan v2) is authored with `plan.keyComponents`, each `{column, keyFunction, outName}`;
+`keyFunction` 1 is `lower()` (a `string(N)` column only) and then `plan.unicodeVersion` must be `rune::codec::kUnicodeVersion`.
+`group by` columns go in `plan.groupBy` and must equal the key. Send the view's first key component as the `keyField`
+(`v::viewKeyField(plan, keyField)`). The key encoding is in [View keys](codec.md#view-keys).
+
+```cpp
+plan.keyComponents = {{"userId", 0, "userId"}, {"characterId", 0, "characterId"}};   // account_characters
+// ... createViewAndWait as above, with v::viewKeyField(plan, "userId")
+
+auto kb = v::ViewKeyBuilder::fromPlan(plan, sourceDescriptor, sourcePartitions);   // or fromCatalog(state, "account_characters")
+kb->setUInt("userId", 42).setUInt("characterId", 7);
+ViewReadOptions ro{.minOffset = writeOffset, .partition = kb->partition()};
+ViewRowResult row = client.getViewRowAndWait(viewTopicId, *kb->key(), ro, 5s);          // point read
+
+kb->clear();
+kb->setUInt("userId", 42);
+ViewScanOptions so;
+for (int restarts = 0;;) {                                                               // every character of user 42
+    ViewScanResult page = client.scanViewAndWait(viewTopicId, *kb->prefix(), /*limit=*/0, so, 5s);
+    if (page.status == ViewRowResult::kCursorInvalidated && ++restarts <= 3) { so.resumeToken.clear(); continue; }   // 8 is also kNotLeader
+    if (page.status != ViewRowResult::kOk) break;
+    for (const auto& r : page.rows) { /* decode like a getViewRow row */ }
+    if (page.complete()) break;
+    so.resumeToken = page.nextToken;
+}
+```
+
+- `ViewKeyBuilder` builds the key bytes with the same `encodeKeyComponent` the broker folds with. `setInt`, `setUInt`, `setBool`
+  and `setString` name a source column; `key()` needs every component and `prefix()` the leading ones (a scan prefix is every
+  component but the last). Both return an error that names the component: unset, out of range, longer than `N` bytes, invalid UTF-8.
+  A `lower()` component is lowered by `key()`. `partition()` is the source partition of the key (the producer's routing of the
+  source key), or `-1` for a one-partition source.
+- `getViewRowK` / `getViewRowAndWait(topic, key, ViewReadOptions)` is the point read: `partition` (-1 = the sink's only
+  partition), `minOffset` (-1 = none; otherwise the read waits until the view has folded that source offset, so a client
+  reads its own write) and `requestedFingerprint`. `scanView` / `scanViewAndWait(topic, prefix, limit, ViewScanOptions)` reads
+  one page of at most `limit` rows (0 = 256; a page also stops at 61,440 row bytes).
+- `ViewScanResult`: `rows`, `nextToken` (empty on the last page; `complete()` is `status == kOk` and no token) and `status`.
+  **Pages are unordered** (table order). A row added or removed under the prefix between pages invalidates the token:
+  `status` is `ViewRowResult::kCursorInvalidated` (8, the same value as `kNotLeader`) and the scan restarts from the first page.
+  A scan sees each row of a quiet prefix once.
+- With the token form (`scanView`), a `Completions` that polls the result needs `maxResultBytes` of at least 64 KiB, else the page is `ResultTooLarge`.
+  The completion's `OpKind` is `GetViewRowK` or `ScanViewRows`; decode a scan's payload with `rune::client::view::decodeScanPayload`.
+- Both calls end `BrokerTooOld` without sending when the seed's `brokerVersion` is below `kBrokerVersionCheckedWrites` (10).
+- The refusals at create time are error codes 59 (`ViewKeyExpressionInvalid`), 60 and 61 (constraints and `unique`, not yet available).
+  A view whose key is not exactly the source key needs a one-partition source.
 
 ## Catalog and security reads
 

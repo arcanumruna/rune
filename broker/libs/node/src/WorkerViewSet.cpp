@@ -3,10 +3,13 @@
 #include <rune/node/AdminChannels.h>   // Task 19: ViewPlanUpdateMsg + decodeViewPlanUpdate
 
 #include <rune/codec/Serialize.h>      // rune::codec::deserialize
+#include <rune/codec/UnicodeLower.h>   // unicodeVersionSupported
+#include <rune/codec/ViewKeyEncoding.h>  // decodeKeyComponent
+#include <rune/protocol/client/DataMessages.h>   // ViewRowResponse::Status
 #include <rune/view/ViewPlan.h>        // rune::view::deserializeCompiledViewPlan
 #include <rune/view/ViewRow.h>         // rune::view::buildRowLayout
 #include <rune/view/AggState.h>        // isAggregateView, buildAggLayout, kAggTable*
-#include <rune/view/ViewCheckpoint.h>  // v1/v2 checkpoint magics
+#include <rune/view/ViewCheckpoint.h>  // v1/v2/v3 checkpoint magics
 
 #include <spdlog/spdlog.h>
 
@@ -76,8 +79,23 @@ RecoveredCheckpoint readCheckpointFile(const std::string& dir, int32_t viewTopic
     return rc;
 }
 
+const char* checkpointFormat(const ViewInstance& inst) noexcept { return inst.keyed ? "v3" : inst.agg ? "v2" : "v1"; }
+
+// The owner map of a keyed projection: wire key -> the view key of its current row (a row of keyWidth bytes).
+void buildKeyedTables(ViewInstance& inst, std::size_t indexSlots, std::size_t chunkBytes) {
+    if (inst.keyed->ownerMapped) {
+        rune::view::RowLayout ownerRow;
+        ownerRow.rowLen = inst.keyed->keyWidth;
+        inst.owners.emplace(std::move(ownerRow), indexSlots, chunkBytes,
+                            rune::view::ViewTableKeys{inst.keyed->wireKeyWidth, 0, inst.tableKeys.hashSeed, inst.tableKeys.hashMaskForTest});
+    }
+    inst.prospect.reserve(inst.layout, inst.agg ? &inst.agg->layout : nullptr);
+}
+
 // Replays checkpoint records into one instance: v1 into the output table for a
-// Replace view; v2 (all three tables, or four with Min/Max value blocks; offset-atomic) for an aggregate view.
+// Replace view; v2 (all three tables, or four with Min/Max value blocks; offset-atomic) for an aggregate view;
+// v3 for a keyed view: the view table and the owner map (a projection), or the view table, contributors, groups, blocks and groupIds
+// (an aggregate; nextGroupId is then 1 + the largest gid recovered).
 // Same semantics as rune::view::replay/replayMulti (a bad base => -1; stop at
 // the first bad record; return the last applied O), plus ONE warning when the
 // replay stops before the end of the supplied records — so a wrong-version
@@ -87,10 +105,38 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
                        std::span<const std::span<const uint8_t>> deltas,
                        std::size_t& appliedOut) {
     appliedOut = 0;
-    rune::view::ViewTable* tables[4];
-    uint32_t lens[4];
+    rune::view::ViewTable* tables[6] = {};
+    uint32_t lens[6];
+    uint8_t keyLens[6];
     std::size_t nTables = 0;
-    if (inst.agg) {
+    if (inst.keyed && inst.agg) {
+        using namespace rune::view;
+        const AggLayout& a = inst.agg->layout;
+        const uint8_t K = static_cast<uint8_t>(a.groupKeyWidth);
+        tables[kKeyedTableView]         = &inst.table;
+        tables[kKeyedTableContributors] = &inst.agg->contributors;
+        tables[kKeyedTableGroups]       = &inst.agg->groups;
+        tables[kKeyedTableGroupIds]     = &*inst.agg->groupIds;
+        lens[kKeyedTableView] = inst.layout.rowLen;  keyLens[kKeyedTableView] = K;
+        lens[kKeyedTableContributors] = a.contributorRow.rowLen;  keyLens[kKeyedTableContributors] = 8;
+        lens[kKeyedTableGroups] = a.groupRow.rowLen;  keyLens[kKeyedTableGroups] = 8;
+        lens[kKeyedTableGroupIds] = 8;  keyLens[kKeyedTableGroupIds] = K;
+        lens[kKeyedTableOwners] = 0;  keyLens[kKeyedTableOwners] = 0;
+        lens[kKeyedTableBlocks] = a.blockRow.rowLen;  keyLens[kKeyedTableBlocks] = 8;
+        if (inst.agg->blocks) tables[kKeyedTableBlocks] = &*inst.agg->blocks;
+        nTables = 6;
+    } else if (inst.keyed) {
+        tables[rune::view::kKeyedTableView] = &inst.table;
+        lens[rune::view::kKeyedTableView]    = inst.layout.rowLen;
+        keyLens[rune::view::kKeyedTableView] = static_cast<uint8_t>(inst.keyed->keyWidth);
+        nTables = 1;
+        if (inst.owners) {
+            tables[rune::view::kKeyedTableOwners] = &*inst.owners;
+            lens[rune::view::kKeyedTableOwners]    = inst.keyed->keyWidth;
+            keyLens[rune::view::kKeyedTableOwners] = inst.keyed->wireKeyWidth;
+            nTables = 2;
+        }
+    } else if (inst.agg) {
         tables[rune::view::kAggTableView]         = &inst.table;
         tables[rune::view::kAggTableContributors] = &inst.agg->contributors;
         tables[rune::view::kAggTableGroups]       = &inst.agg->groups;
@@ -105,10 +151,21 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
         }
     }
     auto apply = [&](std::span<const uint8_t> rec) -> std::optional<rune::view::AppliedDelta> {
+        if (inst.keyed)
+            return rune::view::applyKeyedDelta(std::span<rune::view::ViewTable* const>(tables, nTables),
+                                               std::span<const uint32_t>(lens, nTables), std::span<const uint8_t>(keyLens, nTables), rec);
         if (inst.agg)
             return rune::view::applyMultiDelta(std::span<rune::view::ViewTable* const>(tables, nTables),
                                                std::span<const uint32_t>(lens, nTables), rec);
         return rune::view::applyDelta(inst.table, inst.layout, rec);
+    };
+    // The groupIds table is empty before a replay, so every row it holds afterwards is dirty: the one cold scan for nextGroupId.
+    const auto gidsDone = [&] {
+        if (!(inst.keyed && inst.agg)) return;
+        inst.agg->nextGroupId = 0;
+        inst.agg->groupIds->drainDirtyKeyed([&](uint32_t, const uint8_t* row, bool deleted, std::span<const uint8_t>) {
+            if (!deleted) inst.agg->nextGroupId = std::max(inst.agg->nextGroupId, rune::view::loadU64(row) + 1);
+        });
     };
     int64_t last = -1;
     if (!base.empty()) {
@@ -116,7 +173,7 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
         if (!a) {
             spdlog::warn("WorkerViewSet: view {} partition {} checkpoint BASE rejected ({} "
                          "record expected) — recovering from an empty table",
-                         inst.plan.viewTopicId, inst.partition, inst.agg ? "v2" : "v1");
+                         inst.plan.viewTopicId, inst.partition, checkpointFormat(inst));
             return -1;
         }
         last = a->O;
@@ -128,12 +185,13 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
             spdlog::warn("WorkerViewSet: view {} partition {} checkpoint replay stopped at "
                          "record {} of {} ({} record expected) — recovered O {}",
                          inst.plan.viewTopicId, inst.partition, i, deltas.size(),
-                         inst.agg ? "v2" : "v1", last);
+                         checkpointFormat(inst), last);
             break;
         }
         last = a->O;
         ++appliedOut;
     }
+    gidsDone();
     return last;
 }
 
@@ -145,7 +203,7 @@ void logRecovered(const ViewInstance& inst, int64_t recoveredO, std::size_t appl
     if (applied == 0) return;
     spdlog::info("VIEW-RECOVERED view={} partition={} O={} records={} format={}",
                  inst.plan.viewTopicId, inst.partition, recoveredO, applied,
-                 inst.agg ? "v2" : "v1");
+                 checkpointFormat(inst));
 }
 
 // Most source records one fold pass may cover so the pass's checkpoint delta
@@ -159,7 +217,21 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
     using namespace rune::view;
     std::size_t fixed = ViewSnapshotChannel::kDeltaHeaderBytes + kCheckpointCrcBytes;
     std::size_t perRecord = 0;
-    if (inst.agg) {
+    if (inst.keyed && inst.agg) {
+        const AggLayout& a = inst.agg->layout;
+        const std::size_t nTables = (a.numBlockCols > 0 ? 4 : 3) + 1;   // view, contributors, groups, blocks?, groupIds
+        fixed += kCheckpointV3HeaderBytes + nTables * kCheckpointV3TableHeaderBytes;
+        const AggDirtyBound b = aggDirtyBoundPerRecord(a);
+        const std::size_t aux = checkpointV3EntryHeaderBytes(8), wide = checkpointV3EntryHeaderBytes(a.groupKeyWidth);
+        perRecord = b.contributorRows * (aux + a.contributorRow.rowLen) + b.groupRows * (aux + a.groupRow.rowLen) +
+                    b.viewRows * (wide + inst.layout.rowLen) + b.blockRows * (aux + a.blockRow.rowLen) + b.groupIdRows * (wide + 8);
+    } else if (inst.keyed) {
+        const KeyedFoldSpec& k = *inst.keyed;
+        fixed += kCheckpointV3HeaderBytes + (k.ownerMapped ? 2 : 1) * kCheckpointV3TableHeaderBytes;
+        // A move: the old row's delete, the new row's upsert and, with an owner map, the owner's upsert.
+        perRecord = checkpointV3EntryHeaderBytes(static_cast<uint8_t>(k.keyWidth)) * 2 + inst.layout.rowLen;
+        if (k.ownerMapped) perRecord += checkpointV3EntryHeaderBytes(k.wireKeyWidth) + k.keyWidth;
+    } else if (inst.agg) {
         const AggLayout& a = inst.agg->layout;
         const std::size_t nTables = a.numBlockCols > 0 ? 4 : 3;
         fixed += kCheckpointV2HeaderBytes + nTables * kCheckpointV2TableHeaderBytes;
@@ -178,8 +250,8 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
 
 } // namespace
 
-WorkerViewSet::WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataDir)
-    : channel_(channel), viewDataDir_(std::move(viewDataDir)) {}
+WorkerViewSet::WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataDir, uint64_t hashSeed)
+    : channel_(channel), viewDataDir_(std::move(viewDataDir)), hashSeed_(hashSeed) {}
 
 void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
                                 rune::view::RowLayout layout,
@@ -267,6 +339,14 @@ int WorkerViewSet::drainInstalls() {
             if (!plan) {
                 spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
                               "compiled plan failed to deserialize", m.viewTopicId);
+                return;
+            }
+            if (plan->unicodeVersion != 0 && !rune::codec::unicodeVersionSupported(plan->unicodeVersion)) {
+                ++installRefusals_;
+                const auto part = [](uint32_t v, int shift) { return (v >> shift) & 0xFFu; };
+                spdlog::critical("VIEW-UNICODE-UNSUPPORTED view={} unicode={}.{}.{} — this broker has {}.{}.{}; the view is not installed",
+                                 m.viewTopicId, part(plan->unicodeVersion, 16), part(plan->unicodeVersion, 8), part(plan->unicodeVersion, 0),
+                                 part(rune::codec::kUnicodeVersion, 16), part(rune::codec::kUnicodeVersion, 8), part(rune::codec::kUnicodeVersion, 0));
                 return;
             }
             rune::codec::Descriptor outDesc;
@@ -484,13 +564,26 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
                                        ? static_cast<std::size_t>(tpl.plan.sizing.chunkBytes)
                                        : (std::size_t{32} << 20);
 
+    // A Keyed plan's table takes the key's width and prefix; every table of every instance takes the worker's hash seed.
+    rune::view::ViewTableKeys keys{8, 0, hashSeed_, hashMask_};
+    std::optional<rune::view::KeyedFoldSpec> keyed;
+    if (rune::view::keyModeOf(tpl.plan) == rune::view::ViewKeyMode::Keyed) {
+        keyed = rune::view::buildKeyedFoldSpec(tpl.plan, tpl.evolvingSrc);
+        if (!keyed) {
+            spdlog::error("WorkerViewSet: keyed view {} partition {} not hosted — a key column is missing from its source descriptor",
+                          viewTopicId, partition);
+            return nullptr;
+        }
+        keys.keyWidth    = static_cast<uint8_t>(keyed->keyWidth);
+        keys.prefixWidth = static_cast<uint8_t>(keyed->prefixWidth);
+    }
+
     auto [ins, inserted] = views_.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(tpl.plan, tpl.layout, tpl.evolvingSrc, tpl.persisted,
-                              partition, indexSlots, chunkBytes));
+                              partition, indexSlots, chunkBytes, keys));
     (void)inserted;
     ViewInstance& inst = ins->second;
-
     // Phase 2a: an aggregate view also owns its contributor + group aux tables.
     // Built BEFORE any recovery load below, so a checkpoint (v2) restores all
     // three tables, and a transient re-fold starts from EMPTY aux tables.
@@ -503,7 +596,11 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
             views_.erase(ins);
             return nullptr;
         }
-        inst.agg.emplace(std::move(*al), indexSlots, chunkBytes);
+        inst.agg.emplace(std::move(*al), indexSlots, chunkBytes, inst.tableKeys);
+    }
+    if (keyed) {   // after the aggregate tables: a keyed aggregate's prospect holds their rows
+        inst.keyed = std::move(keyed);
+        buildKeyedTables(inst, indexSlots, chunkBytes);
     }
 
     // Persisted: bound each fold pass so its checkpoint delta always fits one
@@ -684,9 +781,8 @@ ViewReadiness WorkerViewSet::readiness(int32_t viewTopicId, int32_t partition) c
     return it->second.readiness;
 }
 
-const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, int32_t partition, uint64_t key,
-                                     const rune::view::RowLayout*& outLayout,
-                                     RowStatus* outStatus) const {
+const ViewInstance* WorkerViewSet::serveInstance_(int32_t viewTopicId, int32_t partition,
+                                                  const rune::view::RowLayout*& outLayout, RowStatus* outStatus) const {
     auto it = views_.find(instKey(viewTopicId, partition));
     if (it == views_.end()) {
         // Serve the layout from the template if the view is installed but this
@@ -723,13 +819,172 @@ const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, int32_t partition, uin
         if (outStatus != nullptr) *outStatus = RowStatus::NotReady;
         return nullptr;
     }
-    const uint8_t* row = it->second.table.get(key);
+    return &it->second;
+}
+
+const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, int32_t partition, uint64_t key,
+                                     const rune::view::RowLayout*& outLayout,
+                                     RowStatus* outStatus) const {
+    const ViewInstance* inst = serveInstance_(viewTopicId, partition, outLayout, outStatus);
+    if (inst == nullptr) return nullptr;
+    // P7-10: only a LegacyU64 view with an 8-byte key can be named by a u64.
+    if (inst->keyed || inst->plan.keyWidth != 8) {
+        if (outStatus != nullptr) *outStatus = RowStatus::BadKey;
+        return nullptr;
+    }
+    const uint8_t* row = inst->table.get(key);
     if (outStatus != nullptr) *outStatus = (row != nullptr) ? RowStatus::Ok : RowStatus::NotFound;
     return row;
 }
 
+const uint8_t* WorkerViewSet::getRowK(int32_t viewTopicId, int32_t partition, std::span<const uint8_t> key,
+                                      const rune::view::RowLayout*& outLayout, RowStatus* outStatus) const {
+    const ViewInstance* inst = serveInstance_(viewTopicId, partition, outLayout, outStatus);
+    if (inst == nullptr) return nullptr;
+    const uint8_t* row = nullptr;
+    if (inst->keyed) {
+        if (key.size() != inst->keyed->keyWidth) {
+            if (outStatus != nullptr) *outStatus = RowStatus::BadKey;
+            return nullptr;
+        }
+        row = inst->table.get(rune::view::ViewKey::fromBytes(key));
+    } else {
+        // LegacyU64: the one column in its view-key encoding, back to the u64 the table is keyed by.
+        const rune::codec::PrimType type = inst->plan.keyComponents.empty() ? rune::view::viewKeyType(inst->plan) : inst->plan.keyComponents[0].type;
+        if (key.size() != rune::codec::fixedSize(type)) {
+            if (outStatus != nullptr) *outStatus = RowStatus::BadKey;
+            return nullptr;
+        }
+        const rune::codec::FieldValue v = rune::codec::decodeKeyComponent(type, 0, key);
+        const bool isSigned = type == rune::codec::PrimType::Int32 || type == rune::codec::PrimType::Int64;
+        row = inst->table.get(isSigned ? static_cast<uint64_t>(v.i) : v.u);
+    }
+    if (outStatus != nullptr) *outStatus = (row != nullptr) ? RowStatus::Ok : RowStatus::NotFound;
+    return row;
+}
+
+WorkerViewSet::ScanPage WorkerViewSet::scanPage(int32_t viewTopicId, int32_t partition, std::span<const uint8_t> prefix,
+                                                std::span<const uint8_t> resumeToken, uint16_t limit, std::span<uint8_t> out) {
+    using Status = rune::protocol::client::ViewRowResponse;
+    ScanPage page;
+    const auto tit = templates_.find(viewTopicId);
+    if (tit == templates_.end()) {
+        page.status = Status::kUnknownView;
+        return page;
+    }
+    const rune::view::CompiledViewPlan& plan = tit->second.plan;
+    const uint16_t prefixWidth = rune::view::prefixWidthOf(plan);
+    if (rune::view::keyModeOf(plan) != rune::view::ViewKeyMode::Keyed || prefixWidth == 0 || prefix.size() != prefixWidth ||
+        (!resumeToken.empty() && resumeToken.size() != rune::view::kScanTokenBytes)) {
+        page.status = Status::kInvalidRequest;
+        return page;
+    }
+    const rune::view::RowLayout* layout = nullptr;
+    RowStatus st{};
+    if (serveInstance_(viewTopicId, partition, layout, &st) == nullptr) {
+        // As GetViewRowK: an instance this broker does not host is not an empty page.
+        page.status = st != RowStatus::NotFound ? Status::kNotReady : Status::kAbsentKey;
+        return page;
+    }
+    ViewInstance& inst = views_.find(instKey(viewTopicId, partition))->second;
+    const uint32_t rowLen = layout->rowLen;
+    const std::size_t budget = std::min<std::size_t>(out.size(), kMaxScanPageBytes);
+    const uint32_t maxRows = limit == 0 || limit > 256 ? 256 : limit;
+    std::size_t used = 0;
+    bool tooLarge = false;
+    const rune::view::PrefixScan scan = inst.table.scanPrefix(
+        prefix, resumeToken, std::span<uint8_t, rune::view::kScanTokenBytes>(page.nextToken),
+        [&](std::span<const uint8_t>, const uint8_t* payload) noexcept {
+            if (page.rows == maxRows) return false;
+            if (used + 4 + rowLen > budget) {
+                tooLarge = page.rows == 0;
+                return false;
+            }
+            std::memcpy(out.data() + used, &rowLen, 4);
+            std::memcpy(out.data() + used + 4, payload, rowLen);
+            used += 4 + rowLen;
+            ++page.rows;
+            return true;
+        });
+    page.bytes = static_cast<uint32_t>(used);
+    if (scan == rune::view::PrefixScan::CursorGone) {
+        page.status = Status::kCursorInvalidated;
+        return page;
+    }
+    if (tooLarge) {
+        page.status = Status::kRowTooLarge;
+        return page;
+    }
+    page.status       = Status::kOk;
+    page.nextTokenLen = scan == rune::view::PrefixScan::Stopped ? rune::view::kScanTokenBytes : 0;
+    ++inst.counters.scanPages;
+    inst.counters.scanRows += page.rows;
+    return page;
+}
+
+
+int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
+    keyedEntries_.clear();
+    rowOffsets_.clear();
+    rowScratch_.clear();
+    keyScratch_.clear();
+
+    // As buildAndPushCheckpoint_: drainDirtyKeyed's key and row views die with the callback, so both are copied.
+    auto drainInto = [&](rune::view::ViewTable& t, uint32_t rowLen) {
+        t.drainDirtyKeyed([&](uint32_t rid, const uint8_t* row, bool deleted, std::span<const uint8_t> key) {
+            rowOffsets_.push_back(deleted ? SIZE_MAX : rowScratch_.size());
+            if (!deleted) rowScratch_.insert(rowScratch_.end(), row, row + rowLen);
+            keyScratch_.insert(keyScratch_.end(), key.begin(), key.end());
+            keyedEntries_.push_back(rune::view::KeyedDirtyEntry{rid, deleted, {}, nullptr});
+        });
+    };
+    // The record's tables in id order: the view, then the owner map (a projection) or contributors, groups, blocks and groupIds.
+    struct Part { rune::view::ViewTable* table; uint8_t id; uint8_t keyLen; uint32_t rowLen; };
+    Part parts[5];
+    std::size_t nParts = 0;
+    const rune::view::KeyedFoldSpec& k = *inst.keyed;
+    if (inst.agg) {
+        AggInstance& a = *inst.agg;
+        const uint8_t gk = static_cast<uint8_t>(a.layout.groupKeyWidth);
+        parts[nParts++] = {&inst.table, rune::view::kKeyedTableView, gk, inst.layout.rowLen};
+        parts[nParts++] = {&a.contributors, rune::view::kKeyedTableContributors, 8, a.layout.contributorRow.rowLen};
+        parts[nParts++] = {&a.groups, rune::view::kKeyedTableGroups, 8, a.layout.groupRow.rowLen};
+        if (a.blocks) parts[nParts++] = {&*a.blocks, rune::view::kKeyedTableBlocks, 8, a.layout.blockRow.rowLen};
+        parts[nParts++] = {&*a.groupIds, rune::view::kKeyedTableGroupIds, gk, 8};
+    } else {
+        parts[nParts++] = {&inst.table, rune::view::kKeyedTableView, static_cast<uint8_t>(k.keyWidth), inst.layout.rowLen};
+        if (inst.owners) parts[nParts++] = {&*inst.owners, rune::view::kKeyedTableOwners, k.wireKeyWidth, k.keyWidth};
+    }
+    std::size_t b[6] = {};
+    for (std::size_t t = 0; t < nParts; ++t) {
+        drainInto(*parts[t].table, parts[t].rowLen);
+        b[t + 1] = keyedEntries_.size();
+    }
+    if (keyedEntries_.empty()) return 0;
+
+    std::size_t keyPos = 0;
+    for (std::size_t t = 0; t < nParts; ++t) {
+        for (std::size_t i = b[t]; i < b[t + 1]; ++i) {
+            keyedEntries_[i].key = std::span<const uint8_t>(keyScratch_.data() + keyPos, parts[t].keyLen);
+            keyPos += parts[t].keyLen;
+            if (rowOffsets_[i] != SIZE_MAX) keyedEntries_[i].row = rowScratch_.data() + rowOffsets_[i];
+        }
+    }
+    rune::view::KeyedTableDelta tds[5];
+    for (std::size_t t = 0; t < nParts; ++t) {
+        tds[t] = {parts[t].id, parts[t].keyLen, parts[t].rowLen, std::span<const rune::view::KeyedDirtyEntry>(keyedEntries_.data() + b[t], b[t + 1] - b[t])};
+    }
+    inst.pendingDelta.clear();
+    rune::view::encodeKeyedDelta(std::span<const rune::view::KeyedTableDelta>(tds, nParts), inst.foldCursor, inst.pendingDelta);
+    inst.lastEncodedO = inst.foldCursor;
+    inst.pendingValid = true;
+    (void)tryPushDelta_(inst);
+    return 1;
+}
+
 int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
     if (!checkpointSettled(inst)) return 0;   // belt and braces: driveView_ step 0a already returned
+    if (inst.keyed) return buildAndPushKeyedCheckpoint_(inst);
     dirtyEntries_.clear();
     rowOffsets_.clear();
     rowScratch_.clear();
@@ -848,9 +1103,9 @@ void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
 }
 
 // Cold.  The key index is built over the source's evolving schema, as every view is: the judge decodes each writer version through it.
-// nullptr until the schema has landed on this worker, or when the key cannot be indexed (the wire key is packed into 8 bytes).
+// nullptr until the schema has landed on this worker, or when the key cannot be indexed (the topic has no key).
 static const rune::codec::Descriptor* keyIndexSource(const TopicWriteSpec& spec) {
-    if (!spec.evolving || spec.keyWidth == 0 || spec.keyWidth > 8) return nullptr;
+    if (!spec.evolving || spec.keyWidth == 0) return nullptr;
     const bool hasKey = std::any_of(spec.evolving->fields.begin(), spec.evolving->fields.end(), [&](const auto& f) { return f.id == spec.keyFieldId; });
     return hasKey ? &*spec.evolving : nullptr;
 }
@@ -860,9 +1115,10 @@ static constexpr uint64_t kNeverActivated = UINT64_MAX;
 // A key index adopted under an active leadership: it folds that leadership's writes, so the next activation rebuilds it.
 static constexpr uint64_t kAdoptedLive = UINT64_MAX - 1;
 
-static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src) {
+static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src,
+                                  rune::view::ViewTableKeys keys) {
     ViewInstance inst(keyIndexPlan(srcTopicId, spec.keyFieldId), keyIndexRowLayout(), src, /*persist=*/false,
-                      partition, /*indexSlots=*/4096, kKeyIndexChunkBytes);
+                      partition, /*indexSlots=*/4096, kKeyIndexChunkBytes, keys);
     inst.maxRecordsPerPass = kKeyIndexReplayRecordsPerPass;
     inst.foldLeadership = kNeverActivated;
     return inst;
@@ -880,7 +1136,7 @@ void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, Verd
             return;
         }
         releaseMem_(it->second);
-        it->second = freshKeyIndex(srcTopicId, partition, spec, *src);
+        it->second = freshKeyIndex(srcTopicId, partition, spec, *src, rune::view::ViewTableKeys{spec.keyWidth, 0, hashSeed_, hashMask_});
         ++judge.statsMut().keyIndexRebuilds;
     }
     it->second.foldCursor = judge.logStart();
@@ -915,7 +1171,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     write.verdicts = judge;
     if (write.spec->keyIndex && !judge->hasMember(0, kKeyIndexPlanFingerprint)) {
         if (const rune::codec::Descriptor* src = keyIndexSource(*write.spec)) {
-            ViewInstance& inst = keyIndexes_.try_emplace(key, freshKeyIndex(srcTopicId, partition, *write.spec, *src)).first->second;
+            ViewInstance& inst = keyIndexes_.try_emplace(key, freshKeyIndex(srcTopicId, partition, *write.spec, *src, rune::view::ViewTableKeys{write.spec->keyWidth, 0, hashSeed_, hashMask_})).first->second;
             if (judge->activated()) inst.foldLeadership = kAdoptedLive;
             judge->addVerdictView(&inst, rune::view::VerdictViewKind::KeyIndex, 0, kKeyIndexPlanFingerprint);
         }
@@ -1079,8 +1335,9 @@ void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) 
     if (!checkpointSettled(inst)) return;   // idempotent: one discard at a time
     const std::size_t indexSlots = inst.plan.sizing.capacity != 0 ? ceilPow2(inst.plan.sizing.capacity) : std::size_t{4096};
     const std::size_t chunkBytes = inst.plan.sizing.chunkBytes != 0 ? static_cast<std::size_t>(inst.plan.sizing.chunkBytes) : (std::size_t{32} << 20);
-    inst.table = rune::view::ViewTable(inst.layout, indexSlots, chunkBytes);
-    if (inst.agg) inst.agg.emplace(rune::view::buildAggLayout(inst.plan, inst.evolvingSrc).value(), indexSlots, chunkBytes);
+    inst.table = rune::view::ViewTable(inst.layout, indexSlots, chunkBytes, inst.tableKeys);
+    if (inst.agg) inst.agg.emplace(rune::view::buildAggLayout(inst.plan, inst.evolvingSrc).value(), indexSlots, chunkBytes, inst.tableKeys);
+    if (inst.keyed) buildKeyedTables(inst, indexSlots, chunkBytes);
     inst.foldCursor = 0;
     inst.lastEncodedO = -1;
     inst.transientCursor = CursorFresh{};

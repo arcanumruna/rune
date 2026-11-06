@@ -88,11 +88,11 @@ struct DirectTable {
 struct OverlayTable {
     RowOverlay&        ov;
     RowOverlay::Table  which;
-    const ViewTable&   base;
+    const ViewTable*   base;   // nullptr: a keyed view's rows, found by gid here (apply maps them to their view keys); emit rewrites a whole row
 
     [[nodiscard]] const uint8_t* get(uint64_t k) noexcept {
         if (RowOverlay::Slot* s = ov.find(which, k)) return s->erased ? nullptr : ov.imageOf(which, s);
-        return base.get(k);
+        return base != nullptr ? base->get(k) : nullptr;
     }
     uint8_t* put(uint64_t k) noexcept {
         if (RowOverlay::Slot* s = ov.find(which, k)) {
@@ -102,7 +102,7 @@ struct OverlayTable {
         }
         uint8_t* img = nullptr;
         ov.add(which, k, img);
-        if (const uint8_t* cur = base.get(k)) std::memcpy(img, cur, ov.rowLen(which));
+        if (const uint8_t* cur = base != nullptr ? base->get(k) : nullptr) std::memcpy(img, cur, ov.rowLen(which));
         else std::memset(img, 0, ov.rowLen(which));
         return img;
     }
@@ -112,7 +112,7 @@ struct OverlayTable {
             s->erased = true;
             return was;
         }
-        if (base.get(k) == nullptr) return false;
+        if (base != nullptr && base->get(k) == nullptr) return false;
         uint8_t* img = nullptr;
         ov.add(which, k, img)->erased = true;
         return true;
@@ -128,6 +128,10 @@ struct Ctx {
     T  groups;
     T* blocks;   // Min/Max value blocks; nullptr iff agg.numBlockCols == 0
     FoldStats& stats;
+    // Keyed view (agg.keyed): the spec, the group key -> gid table (read only; apply writes it) and the gid a new group takes.
+    const KeyedFoldSpec* keyed = nullptr;
+    const ViewTable* groupIds = nullptr;
+    uint64_t nextGid = 0;
 
     uint8_t* acc(uint8_t* g, size_t i) const noexcept { return g + agg.groupAccOff + 16 * i; }
     uint8_t* nn(uint8_t* g, size_t i) const noexcept { return g + agg.groupNonNullOff + 8 * i; }
@@ -480,13 +484,18 @@ struct Ctx {
 
     // Rewrites the output row for group `g` from its accumulators, caches and list.
     void emit(uint64_t g, uint8_t* gr) noexcept {
-        uint8_t* row = view.put(g);
-        FieldValue k{};
-        k.type = agg.keyType;
-        k.present = true;
-        if (agg.keyType == PrimType::Int64) { int64_t s; std::memcpy(&s, &g, 8); k.i = s; }
-        else { k.u = g; }
-        writeSlot(row, layout, agg.keyOutSlot, k);
+        uint8_t* row = view.put(g);   // a keyed view's rows are found by gid here; apply maps them to the view key
+        if (keyed != nullptr) {
+            for (const KeyedFoldSpec::Component& c : keyed->components)
+                writeSlot(row, layout, c.outSlot, rune::codec::decodeKeyComponent(c.type, c.keyFunction, {gr + agg.groupKeyOff + c.offset, c.width}));
+        } else {
+            FieldValue k{};
+            k.type = agg.keyType;
+            k.present = true;
+            if (agg.keyType == PrimType::Int64) { int64_t s; std::memcpy(&s, &g, 8); k.i = s; }
+            else { k.u = g; }
+            writeSlot(row, layout, agg.keyOutSlot, k);
+        }
 
         const uint64_t contributorsN = loadU64(gr);
         for (size_t i = 0; i < agg.fields.size(); ++i) {
@@ -608,9 +617,9 @@ inline const rune::codec::Descriptor& writerOf(VersionDescriptorCache& vdc, std:
 template <class T>
 StepOut aggStep(Ctx<T>& cx, VersionDescriptorCache& vdc, const rune::codec::Descriptor* writer,
                 std::string_view key, std::string_view value) noexcept {
-    if (key.size() != 8) { ++cx.stats.skippedMalformed; return {StepKind::Malformed}; }
+    if (key.size() != cx.agg.sourceKeyWidth) { ++cx.stats.skippedMalformed; return {StepKind::Malformed}; }
     uint64_t c = 0;
-    std::memcpy(&c, key.data(), 8);   // little-endian identity bytes
+    std::memcpy(&c, key.data(), key.size());   // little-endian identity bytes; a narrower integer key zero-extends
     // A linked view's lists end in kNoContributor: that key cannot be linked.
     if (cx.agg.linked && c == kNoContributor) { ++cx.stats.skippedMalformed; return {StepKind::Malformed}; }
 
@@ -626,8 +635,25 @@ StepOut aggStep(Ctx<T>& cx, VersionDescriptorCache& vdc, const rune::codec::Desc
     }
 
     const rune::codec::Descriptor& d = writer != nullptr ? *writer : writerOf(vdc, value);
-    const FieldValue gk = rune::codec::readField(d, asBytes(value), cx.agg.keySrcFieldId);
-    if (!gk.present) {
+    uint64_t g = 0;
+    ViewKey groupKey;
+    bool hasGroup = false;
+    if (cx.keyed != nullptr) {
+        const DeriveKey dk = deriveViewKey(*cx.keyed, d, asBytes(value), groupKey);
+        if (dk == DeriveKey::Malformed) { ++cx.stats.skippedMalformed; return {StepKind::Malformed}; }
+        hasGroup = dk == DeriveKey::Ok;
+        if (hasGroup) {
+            const uint8_t* idRow = cx.groupIds->get(groupKey);
+            g = idRow != nullptr ? loadU64(idRow) : cx.nextGid;
+        }
+    } else {
+        const FieldValue gk = rune::codec::readField(d, asBytes(value), cx.agg.keySrcFieldId);
+        hasGroup = gk.present;
+        if (hasGroup) {
+            if (cx.agg.keyType == PrimType::Int64) std::memcpy(&g, &gk.i, 8); else g = gk.u;
+        }
+    }
+    if (!hasGroup) {
         if (old != nullptr) {
             oldGroup = cx.retract(c, old, RetractMode::Delete);
             cx.contributors.erase(c);
@@ -635,9 +661,6 @@ StepOut aggStep(Ctx<T>& cx, VersionDescriptorCache& vdc, const rune::codec::Desc
         ++cx.stats.skippedNoGroup;
         return old != nullptr ? StepOut{StepKind::Erased, 0, oldGroup} : StepOut{};
     }
-    uint64_t g = 0;
-    if (cx.agg.keyType == PrimType::Int64) std::memcpy(&g, &gk.i, 8); else g = gk.u;
-
     bool hadOld = false;
     if (old != nullptr) {
         hadOld = true;
@@ -667,6 +690,7 @@ StepOut aggStep(Ctx<T>& cx, VersionDescriptorCache& vdc, const rune::codec::Desc
         else                                   { storeU64(dst, 0); }   // Count(col)
     }
     uint8_t* gr = cx.applyContribution(cr, +1);
+    if (cx.keyed != nullptr) std::memcpy(gr + cx.agg.groupKeyOff, groupKey.bytes.data(), cx.agg.groupKeyWidth);
     if (cx.agg.linked) cx.linkAtHead(c, cr, gr);
     if (cx.agg.numBlockCols > 0) {          // implies linked: same group == InPlaceLinked
         if (hadOld && oldGroup == g) cx.blockWrite(c, cr, gr);
@@ -681,17 +705,10 @@ StepOut aggStep(Ctx<T>& cx, VersionDescriptorCache& vdc, const rune::codec::Desc
     return {hadOld && oldGroup != g ? StepKind::Moved : StepKind::Upserted, g, oldGroup};
 }
 
-} // namespace
-
-FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& layout,
-                             const AggLayout& agg, VersionDescriptorCache& vdc,
-                             ViewTable& view, ViewTable& contributors, ViewTable& groups,
-                             ViewTable* blocks, const rune::storage::LogReadView& lv,
-                             int64_t bound, int64_t& cursor, const FoldSkip& skip) {
-    FoldStats stats{};
-    DirectTable dBlocks{blocks != nullptr ? *blocks : view};   // unused when blocks == nullptr
-    Ctx<DirectTable> cx{layout, agg, DirectTable{view}, DirectTable{contributors}, DirectTable{groups},
-                        blocks != nullptr ? &dBlocks : nullptr, stats};
+// The batch walk both folds share: `onRecord(key, value, offset)` sees every committed, unrejected record in [cursor, bound).
+template <class OnRecord>
+FoldStats walkAggregate(const rune::storage::LogReadView& lv, int64_t bound, int64_t& cursor, const FoldSkip& skip, FoldStats& stats,
+                        OnRecord&& onRecord) {
     const FoldSkip foldSkip = skip;   // #537: by value (see AbortedTxnFilter::skips)
     const int64_t from = cursor;   // records below it were folded by a prior (mid-batch) pass
     bool stopped = false;
@@ -722,7 +739,7 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
             if (offset >= bound) { stopped = true; return; }
             if (offset < from) return;         // already folded (resume mid-batch)
             if (isRejectedRecord(foldSkip, offset)) [[unlikely]] { ++stats.skippedRejected; return; }
-            (void)aggStep(cx, vdc, nullptr, key, value);
+            onRecord(key, value, offset);
         });
         if (stopped) break;
         pos += static_cast<size_t>(r.totalLength());
@@ -731,6 +748,22 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
     // Never move the resume point backwards (a corrupt batch at/after `from`).
     cursor = std::max(from, corrupt ? walkedUpto : std::min(lv.nextOffset, bound));
     return stats;
+}
+
+} // namespace
+
+FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& layout,
+                             const AggLayout& agg, VersionDescriptorCache& vdc,
+                             ViewTable& view, ViewTable& contributors, ViewTable& groups,
+                             ViewTable* blocks, const rune::storage::LogReadView& lv,
+                             int64_t bound, int64_t& cursor, const FoldSkip& skip) {
+    FoldStats stats{};
+    DirectTable dBlocks{blocks != nullptr ? *blocks : view};   // unused when blocks == nullptr
+    Ctx<DirectTable> cx{layout, agg, DirectTable{view}, DirectTable{contributors}, DirectTable{groups},
+                        blocks != nullptr ? &dBlocks : nullptr, stats};
+    return walkAggregate(lv, bound, cursor, skip, stats, [&](std::string_view key, std::string_view value, int64_t) {
+        (void)aggStep(cx, vdc, nullptr, key, value);
+    });
 }
 
 FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layout,
@@ -742,20 +775,45 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& plan, const RowLayout& layo
                               bound, cursor, skip);
 }
 
+FoldStats foldKeyedAggregateBatch(AggregateFold& f, Prospect& p, const rune::storage::LogReadView& lv, int64_t bound, int64_t& cursor,
+                                  const FoldSkip& skip) {
+    FoldStats stats{};
+    return walkAggregate(lv, bound, cursor, skip, stats, [&](std::string_view key, std::string_view value, int64_t offset) {
+        const SourceRecord rec{key, value, offset, 0, nullptr};
+        (void)prepareAggregate(f, rec, p);   // a malformed record leaves op None: apply does nothing and the stats say why
+        applyAggregate(f, rec, p);
+        stats.applied += p.stats.applied;
+        stats.deleted += p.stats.deleted;
+        stats.skippedMalformed += p.stats.skippedMalformed;
+        stats.skippedNoGroup += p.stats.skippedNoGroup;
+        stats.aggOverflow += p.stats.aggOverflow;
+        stats.aggNonFinite += p.stats.aggNonFinite;
+        stats.aggInconsistent += p.stats.aggInconsistent;
+        stats.aggRescans += p.stats.aggRescans;
+    });
+}
+
 PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospect& p) noexcept {
     p.clear();
     RowOverlay& ov = p.overlay;
     using T = RowOverlay::Table;
-    OverlayTable blocks{ov, T::Blocks, f.blocks != nullptr ? *f.blocks : f.view};
-    Ctx<OverlayTable> cx{f.layout, f.agg, OverlayTable{ov, T::View, f.view}, OverlayTable{ov, T::Contributors, f.contributors},
-                         OverlayTable{ov, T::Groups, f.groups}, f.blocks != nullptr ? &blocks : nullptr, p.stats};
+    OverlayTable blocks{ov, T::Blocks, f.blocks};
+    Ctx<OverlayTable> cx{f.layout, f.agg, OverlayTable{ov, T::View, f.keyed != nullptr ? nullptr : &f.view}, OverlayTable{ov, T::Contributors, &f.contributors},
+                         OverlayTable{ov, T::Groups, &f.groups}, f.blocks != nullptr ? &blocks : nullptr, p.stats,
+                         f.keyed, f.groupIds, f.nextGroupId != nullptr ? *f.nextGroupId : 0};
     const StepOut o = aggStep(cx, f.vdc, rec.writer, rec.key, rec.value);
     if (ov.full()) return PrepareStatus::CapacityExhausted;
     if (o.kind == StepKind::Malformed) return PrepareStatus::Malformed;
     if (o.kind == StepKind::None) return PrepareStatus::Ok;
     const auto viewRow = [&](ProspectRow& row, uint64_t g) {
-        row.key     = ViewKey::fromU64(g);
-        row.existed = f.view.get(g) != nullptr;
+        if (f.keyed != nullptr) {   // the view key is the group row's key bytes: the overlay's image, else the stored row (a dropped group)
+            const RowOverlay::Slot* gs = ov.find(T::Groups, g);
+            const uint8_t* grow = gs != nullptr && !gs->erased ? ov.imageOf(T::Groups, gs) : f.groups.get(g);
+            row.key = grow != nullptr ? ViewKey::fromBytes({grow + f.agg.groupKeyOff, f.agg.groupKeyWidth}) : ViewKey{};
+        } else {
+            row.key = ViewKey::fromU64(g);
+        }
+        row.existed = f.view.get(row.key) != nullptr;
         const RowOverlay::Slot* s = ov.find(T::View, g);
         row.removed = s == nullptr || s->erased;
         row.image   = row.removed ? nullptr : ov.imageOf(T::View, s);
@@ -773,8 +831,52 @@ PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospe
     return PrepareStatus::Ok;
 }
 
+// A keyed record's rows: the view rows are written under their view keys, a created group registers its key in groupIds and a
+// dropped one removes it.  The view goes first -- a dropped group's key is read from its stored row.
+static void applyKeyedAggregate(AggregateFold& f, const Prospect& p) noexcept {
+    using T = RowOverlay::Table;
+    const RowOverlay& ov = p.overlay;
+    const uint32_t off = f.agg.groupKeyOff, width = f.agg.groupKeyWidth;
+    for (std::size_t i = 0; i < ov.used(T::View); ++i) {
+        const RowOverlay::Slot& s = ov.slot(T::View, i);
+        const uint8_t* keyed = f.groups.get(s.key);   // the stored group row when it is erased or untouched
+        for (std::size_t j = 0; j < ov.used(T::Groups) && !s.erased; ++j)
+            if (ov.slot(T::Groups, j).key == s.key && !ov.slot(T::Groups, j).erased) keyed = ov.image(T::Groups, j);
+        if (keyed == nullptr) continue;
+        const ViewKey k = ViewKey::fromBytes({keyed + off, width});
+        if (s.erased) f.view.erase(k);
+        else std::memcpy(f.view.put(k), ov.image(T::View, i), ov.rowLen(T::View));
+    }
+    for (std::size_t i = 0; i < ov.used(T::Contributors); ++i) {
+        const RowOverlay::Slot& s = ov.slot(T::Contributors, i);
+        if (s.erased) f.contributors.erase(s.key);
+        else std::memcpy(f.contributors.put(s.key), ov.image(T::Contributors, i), ov.rowLen(T::Contributors));
+    }
+    for (std::size_t i = 0; i < ov.used(T::Groups); ++i) {
+        const RowOverlay::Slot& s = ov.slot(T::Groups, i);
+        const uint8_t* stored = f.groups.get(s.key);
+        if (s.erased) {
+            if (stored != nullptr) f.groupIds->erase(ViewKey::fromBytes({stored + off, width}));
+            f.groups.erase(s.key);
+            continue;
+        }
+        if (stored == nullptr) {
+            std::memcpy(f.groupIds->put(ViewKey::fromBytes({ov.image(T::Groups, i) + off, width})), &s.key, 8);
+            *f.nextGroupId = std::max(*f.nextGroupId, s.key + 1);
+        }
+        std::memcpy(f.groups.put(s.key), ov.image(T::Groups, i), ov.rowLen(T::Groups));
+    }
+    if (f.blocks == nullptr) return;
+    for (std::size_t i = 0; i < ov.used(T::Blocks); ++i) {
+        const RowOverlay::Slot& s = ov.slot(T::Blocks, i);
+        if (s.erased) f.blocks->erase(s.key);
+        else std::memcpy(f.blocks->put(s.key), ov.image(T::Blocks, i), ov.rowLen(T::Blocks));
+    }
+}
+
 void applyAggregate(AggregateFold& f, const SourceRecord&, const Prospect& p) noexcept {
     using T = RowOverlay::Table;
+    if (f.keyed != nullptr) return applyKeyedAggregate(f, p);
     ViewTable* const tables[RowOverlay::kTables] = {&f.view, &f.contributors, &f.groups, f.blocks};
     // The order the direct step writes: contributors, groups, blocks, then the view.
     for (const T t : {T::Contributors, T::Groups, T::Blocks, T::View}) {

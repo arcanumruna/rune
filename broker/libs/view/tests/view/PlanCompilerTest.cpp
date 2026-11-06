@@ -36,14 +36,16 @@ TEST(PlanCompilerRejectRegression, CompileRejectsUnknownAndVarLenAndMissingKey) 
       EXPECT_FALSE(rune::view::compileView(v,srcs,1).has_value()); }       // var-len column
     { auto v=hpView(); v.key="ghostKey"; v.sources[0].keyField="ghostKey";
       EXPECT_FALSE(rune::view::compileView(v,srcs,1).has_value()); }       // missing key
-    { // non-integer key (FixedStr) rejected in Phase 1
+    { // a string(N) source key is a valid view key (P7-10); it compiles as a Keyed view
       auto d2 = rune::codec::DescriptorBuilder("c2",1)
           .addFixedStr("sid",16,1,true).add("hp",rune::codec::PrimType::Int32).build();
       const rune::codec::Descriptor* s2[]={&d2};
       rune::view::ViewPlan v; v.viewName="x"; v.key="sid"; v.sources={{6,"sid"}};
       v.output={{"sid",rune::codec::PrimType::FixedStr,0,"sid",rune::view::MergeRule::Replace},
                 {"hp",rune::codec::PrimType::Int32,0,"hp",rune::view::MergeRule::Replace}};
-      EXPECT_FALSE(rune::view::compileView(v,s2,1).has_value()); }
+      auto r = rune::view::compileView(v,s2,1);
+      ASSERT_TRUE(r.has_value()) << r.error().message;
+      EXPECT_EQ(rune::view::keyModeOf(r->plan), rune::view::ViewKeyMode::Keyed); }
 }
 
 // #667: a zero-width FixedStr output column is a compile refusal (a DDL error), never an exception.
@@ -61,16 +63,10 @@ TEST(PlanCompilerRejectRegression, ZeroWidthFixedStrOutputIsRefusedNotThrownRegr
     EXPECT_FALSE(r.has_value());
 }
 
-// Whole-branch review Bug B: ClientGateway::handleGetViewRow canonicalizes a
-// probe key into a FIXED 8-byte buffer and partitions via FNV-1a64 over that
-// exact span, but the PRODUCER partitions a narrow (<8-byte) key by its
-// NATIVE width (decodeWireKey enforces exact width) -- a narrow multi-
-// partition view key would silently route GetViewRow to the wrong partition.
-// Phase 1 rejects narrow (Int32/UInt32/UInt16) integer KEY fields at compile
-// time; Int64/UInt64 keys (8 bytes, matching the wire canonicalization) still
-// compile -- this is the single-source happy path and must not regress.
-TEST(PlanCompilerRejectRegression, RejectsNarrowIntegerKey_BugB) {
-    { // Int32 key -- narrow, must be REJECTED (RED pre-fix: this compiled).
+// The Phase 1 refusal of narrow (Int32/UInt32/UInt16) integer view keys is lifted by design (P7-10): the key
+// width is part of the compiled plan, so these compile and keep the LegacyU64 key mode at their native width.
+TEST(PlanCompilerRejectRegression, NarrowIntegerKeyCompilesAtItsNativeWidth) {
+    { // Int32 key -- narrow, compiles with a 4-byte key.
       auto d = rune::codec::DescriptorBuilder("character32", 1)
                    .add("characterId", rune::codec::PrimType::Int32, 1, /*isKey*/ true)
                    .add("hp", rune::codec::PrimType::Int32)
@@ -84,9 +80,11 @@ TEST(PlanCompilerRejectRegression, RejectsNarrowIntegerKey_BugB) {
                     rune::view::MergeRule::Replace},
                    {"hp", rune::codec::PrimType::Int32, 0, "hp", rune::view::MergeRule::Replace}};
       const auto r = rune::view::compileView(v, srcs, 1);
-      EXPECT_FALSE(r.has_value()) << "an Int32 (narrow, 4-byte) KEY field must be rejected";
+      ASSERT_TRUE(r.has_value()) << r.error().message;
+      EXPECT_EQ(rune::view::keyModeOf(r->plan), rune::view::ViewKeyMode::LegacyU64);
+      EXPECT_EQ(r->plan.keyWidth, 4u);
     }
-    { // UInt16 key -- narrow, must be REJECTED.
+    { // UInt16 key -- narrow, compiles with a 2-byte key.
       auto d = rune::codec::DescriptorBuilder("character16", 1)
                    .add("characterId", rune::codec::PrimType::UInt16, 1, /*isKey*/ true)
                    .add("hp", rune::codec::PrimType::Int32)
@@ -99,8 +97,9 @@ TEST(PlanCompilerRejectRegression, RejectsNarrowIntegerKey_BugB) {
       v.output   = {{"characterId", rune::codec::PrimType::UInt16, 0, "characterId",
                     rune::view::MergeRule::Replace},
                    {"hp", rune::codec::PrimType::Int32, 0, "hp", rune::view::MergeRule::Replace}};
-      EXPECT_FALSE(rune::view::compileView(v, srcs, 1).has_value())
-          << "a UInt16 (narrow, 2-byte) KEY field must be rejected";
+      const auto r = rune::view::compileView(v, srcs, 1);
+      ASSERT_TRUE(r.has_value()) << r.error().message;
+      EXPECT_EQ(r->plan.keyWidth, 2u);
     }
     { // Int64 key -- 8 bytes, still compiles (single-source happy path intact).
       auto d = charSource();  // characterId: Int64 key

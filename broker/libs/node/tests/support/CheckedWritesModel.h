@@ -5,11 +5,16 @@
 // start of the log unjudged), so all members' live keys are the live keys of the accepted records.
 #include "CheckedWritesRig.h"
 
+#include <rune/codec/Record.h>
+#include <rune/view/ViewPlan.h>
+
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
 #include <set>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace rune::node::cw {
@@ -189,5 +194,168 @@ private:
     std::map<uint64_t, LogRec> live_;
     uint64_t partitions_ = 1, partition_ = 0;
 };
+
+// ---- Part 07: keyed views.  The model reads the source records of the log and derives view keys with its own copy of the encoding
+// (big-endian, a signed integer's sign bit flipped, a string zero padded, lower() for ASCII and U+023A only - the matrix writes nothing else). ----
+
+/// A column as one comparable string: the model's and the table's values are both folded through this.
+[[nodiscard]] inline std::string modelCanon(const rune::codec::FieldValue& v) {
+    using rune::codec::PrimType;
+    if (!v.present) return "-";
+    switch (v.type) {
+    case PrimType::Int32: case PrimType::Int64: return "i" + std::to_string(v.i);
+    case PrimType::FixedStr: {
+        std::string s(v.bytes);
+        while (!s.empty() && s.back() == '\0') s.pop_back();
+        return "s" + s;
+    }
+    default: return "u" + std::to_string(v.u);
+    }
+}
+
+/// The column of a model row in the table's own types, so that modelCanon compares it.
+[[nodiscard]] inline std::string modelCanonOf(rune::codec::PrimType t, int64_t i, uint64_t u) {
+    using rune::codec::PrimType;
+    return (t == PrimType::Int32 || t == PrimType::Int64) ? "i" + std::to_string(i) : "u" + std::to_string(u);
+}
+
+[[nodiscard]] inline std::string modelLower(const std::string& s) {
+    std::string out;
+    for (std::size_t k = 0; k < s.size(); ++k) {
+        const auto c = static_cast<uint8_t>(s[k]);
+        if (c >= 'A' && c <= 'Z') out.push_back(static_cast<char>(c + 32));
+        else if (c == 0xC8 && k + 1 < s.size() && static_cast<uint8_t>(s[k + 1]) == 0xBA) { out += "\xE2\xB1\xA5"; ++k; }
+        else if (c < 0x80) out.push_back(static_cast<char>(c));
+        else throw std::logic_error("modelLower: a character the matrix never writes");
+    }
+    return out;
+}
+
+/// One key component of a record, `width` bytes: nullopt = the writer's version has no such column.
+[[nodiscard]] inline std::optional<std::vector<uint8_t>> modelComponent(const rune::codec::FieldValue& v, bool lower, uint16_t width, std::string& column) {
+    using rune::codec::PrimType;
+    if (!v.present) return std::nullopt;
+    std::vector<uint8_t> out(width, 0);
+    if (v.type == PrimType::FixedStr) {
+        std::string s(v.bytes);
+        if (const auto nul = s.find('\0'); nul != std::string::npos) s.resize(nul);
+        if (lower) s = modelLower(s);
+        if (s.size() > width) throw std::logic_error("modelComponent: wider than the component");
+        std::copy(s.begin(), s.end(), out.begin());
+        column = "s" + s;
+        return out;
+    }
+    const bool isSigned = v.type == PrimType::Int32 || v.type == PrimType::Int64;
+    uint64_t x = isSigned ? static_cast<uint64_t>(v.i) ^ (uint64_t{1} << (8 * width - 1)) : v.u;
+    for (std::size_t k = width; k-- > 0; x >>= 8) out[k] = static_cast<uint8_t>(x);
+    column = modelCanon(v);
+    return out;
+}
+
+/// view key -> slot -> column; for an owner-mapped view also wire key -> the key of its row.
+struct KeyedModel {
+    std::map<std::vector<uint8_t>, std::map<uint16_t, std::string>> rows;
+    std::map<std::string, std::vector<uint8_t>> owners;
+    std::size_t skippedNoKey = 0;
+};
+
+[[nodiscard]] inline const rune::codec::FieldDescriptor* modelField(const rune::codec::Descriptor& d, uint16_t id) {
+    for (const auto& f : d.fields) if (f.id == id) return &f;
+    return nullptr;
+}
+
+/// Folds the source records of `log` (offset order; an empty value is a tombstone) into the rows `plan` keeps: one row per live source key,
+/// from its last record, under the key that record derives.  A record whose writer version lacks a key column erases the source key's row.
+[[nodiscard]] inline KeyedModel refoldKeyedView(const rune::view::CompiledViewPlan& plan, const rune::codec::Descriptor& src, const std::vector<RawRec>& log) {
+    KeyedModel m;
+    std::map<std::string, std::vector<uint8_t>> current;   // wire key -> the key of its row
+    for (const RawRec& rec : log) {
+        std::optional<std::vector<uint8_t>> key;
+        std::map<uint16_t, std::string> cols;
+        if (!rec.value.empty()) {
+            key = std::vector<uint8_t>{};
+            for (const auto& c : plan.keyComponents) {
+                std::string column;
+                const auto part = modelComponent(rune::codec::readField(src, rec.value, c.srcFieldId), c.keyFunction != 0, c.width, column);
+                if (!part) { key.reset(); ++m.skippedNoKey; break; }
+                key->insert(key->end(), part->begin(), part->end());
+                cols[c.outSlot] = column;
+            }
+            if (key)
+                for (const auto& o : plan.output) cols.emplace(o.outSlot, modelCanon(rune::codec::readField(src, rec.value, o.srcFieldId)));
+        }
+        if (const auto at = current.find(rec.key); at != current.end()) {
+            if (!key || *key != at->second) m.rows.erase(at->second);
+            current.erase(at);
+        }
+        if (!key) continue;
+        m.rows[*key] = std::move(cols);
+        current[rec.key] = *key;
+    }
+    if (rune::view::ownerMappedOf(plan)) m.owners = std::move(current);
+    return m;
+}
+
+/// The rows of a group-by view: group key -> slot -> column.  A contributor is a source key; a write moves it to the head of its group
+/// (last() is the head), a tombstone or a record without a group column retracts it, a group with no contributor has no row.
+[[nodiscard]] inline std::map<std::vector<uint8_t>, std::map<uint16_t, std::string>> refoldKeyedAggregate(
+    const rune::view::CompiledViewPlan& plan, const rune::codec::Descriptor& src, const std::vector<RawRec>& log) {
+    using rune::view::MergeRule;
+    struct Contributor { std::vector<uint8_t> group; std::map<uint16_t, std::string> keyCols; std::map<uint16_t, rune::codec::FieldValue> in; std::size_t seq; };
+    std::map<std::string, Contributor> live;
+    std::size_t seq = 0;
+    for (const RawRec& rec : log) {
+        ++seq;
+        live.erase(rec.key);
+        if (rec.value.empty()) continue;
+        Contributor c{{}, {}, {}, seq};
+        bool absent = false;
+        for (const auto& k : plan.keyComponents) {
+            std::string column;
+            const auto part = modelComponent(rune::codec::readField(src, rec.value, k.srcFieldId), k.keyFunction != 0, k.width, column);
+            if (!part) { absent = true; break; }
+            c.group.insert(c.group.end(), part->begin(), part->end());
+            c.keyCols[k.outSlot] = column;
+        }
+        if (absent) continue;
+        for (const auto& o : plan.output)
+            if (o.rule != MergeRule::CountAll && o.rule != MergeRule::Replace) c.in[o.outSlot] = rune::codec::readField(src, rec.value, o.srcFieldId);
+        live.emplace(rec.key, std::move(c));
+    }
+    std::map<std::vector<uint8_t>, std::vector<const Contributor*>> groups;
+    for (const auto& kv : live) groups[kv.second.group].push_back(&kv.second);
+    std::map<std::vector<uint8_t>, std::map<uint16_t, std::string>> rows;
+    for (const auto& [group, members] : groups) {
+        std::map<uint16_t, std::string> cols = members.front()->keyCols;
+        for (const auto& o : plan.output) {
+            if (o.rule == MergeRule::Replace) continue;   // a group key column
+            const bool isSigned = o.type == rune::codec::PrimType::Int32 || o.type == rune::codec::PrimType::Int64;
+            const auto num = [&](const Contributor* c) { return c->in.at(o.outSlot); };
+            int64_t si = 0;
+            uint64_t su = 0;
+            switch (o.rule) {
+            case MergeRule::CountAll: si = static_cast<int64_t>(members.size()); su = members.size(); break;
+            case MergeRule::Sum: for (const auto* c : members) { si += num(c).i; su += num(c).u; } break;
+            case MergeRule::Min: case MergeRule::Max: {
+                const auto lt = [&](const Contributor* a, const Contributor* b) { return isSigned ? num(a).i < num(b).i : num(a).u < num(b).u; };
+                const Contributor* best = members.front();
+                for (const auto* c : members) if (o.rule == MergeRule::Min ? lt(c, best) : lt(best, c)) best = c;
+                si = num(best).i; su = num(best).u;
+                break;
+            }
+            case MergeRule::Last: {
+                const Contributor* head = members.front();
+                for (const auto* c : members) if (c->seq > head->seq) head = c;
+                si = num(head).i; su = num(head).u;
+                break;
+            }
+            default: throw std::logic_error("refoldKeyedAggregate: a rule the matrix never uses");
+            }
+            cols[o.outSlot] = modelCanonOf(o.type, si, su);
+        }
+        rows[group] = std::move(cols);
+    }
+    return rows;
+}
 
 }  // namespace rune::node::cw

@@ -379,16 +379,10 @@ public:
         K field{};  // zero padded; the field keeps at most N bytes
         const std::size_t fieldBytes = keyValue.size() < N ? keyValue.size() : N;
         std::memcpy(field.data(), keyValue.data(), fieldBytes);
-        std::array<uint8_t, Key::kMaxInline> kb{};
-        std::size_t keyLen = N;
-        if constexpr (N > Key::kMaxInline) {
-            keyLen = keyValue.size();
-            while (keyLen > 0 && keyValue[keyLen - 1] == '\0') --keyLen;  // #330: "abc" and "abc\0" are one key
-        }
-        std::memcpy(kb.data(), keyValue.data(), keyValue.size() < keyLen ? keyValue.size() : keyLen);
+        const Key recordKey = Key::forStringField(keyValue, N);
         return TypedClaim<E>(
             detail::ClaimInPlace{},
-            [&] { return producer_.tryClaim(topic_, Key(std::span<const uint8_t>(kb.data(), keyLen)), E::kEncodedLength); },
+            [&] { return producer_.tryClaim(topic_, recordKey, E::kEncodedLength); },
             claimScratch_.bytes.data(), version_, field);
     }
 

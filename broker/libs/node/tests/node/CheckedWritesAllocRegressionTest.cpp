@@ -4,6 +4,7 @@
 #include "support/AllocWindow.h"
 #include "support/CheckedWritesAckRig.h"
 #include "support/CheckedWritesRig.h"
+#include "support/CheckedWritesViewReadRig.h"
 
 #include <gtest/gtest.h>
 
@@ -317,4 +318,149 @@ TEST(CheckedWritesAllocRegression, SteadyStateAutoIncCreatesAllocateNothingRegre
     EXPECT_GT(r.reservations().size() - reservationsBefore, 100u) << "the measured batches crossed reservations";
     EXPECT_GT(r.worker->subscriptionPositionForTest(raw), 10'000) << "the Raw subscription was served";
     EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
+}
+
+// Part 07 (hard rule): the keyed fold (upserts, renames, moves, deletes through a plain-key and a lower() key view), the
+// GetViewRowK and ScanViewRows serve and the held reads allocate nothing in steady state.  The 03 rig above has no keyed
+// view, so this uses Task 14's worker rig: the test thread drives the Worker and its WorkerViewSet.  The source appends and
+// the replica bookkeeping run between windows; a window brackets the fold passes and the posting, serving and draining of
+// reads.  The key space (240 characters, at most 8 under a user) is fully inserted and churned in the warm-up, so the tables and
+// prefix sets are at their steady size.
+TEST(CheckedWritesAllocRegression, KeyedFoldAndViewReadsAllocateNothingRegression) {
+    namespace pc = rune::protocol::client;
+    constexpr int32_t kAccountView = cwkeyed::kViewTopic, kLowerView = cwkeyed::kViewTopic + 1;
+    constexpr uint64_t kCharacters = 240, kUsers = 60;
+    constexpr std::array<const char*, 8> kNames = {"Alice", "BOB", "carol", "DaVe", "\xC3\x84RGER", "eve", "Mallory", "TRENT"};
+
+    rune::node::test::CwViewReadWorkerRig r;
+    r.install(cwkeyed::accountCharacters(r.src));
+    r.install(cwkeyed::compileKeyed(r.src, {{"name", 1, "nameKey"}, {"characterId", 0, "characterId"}}, {"gender"}, kLowerView));
+
+    uint64_t lcg = 0x9E3779B97F4A7C15ull;
+    const auto next = [&] { lcg = lcg * 6364136223846793005ull + 1442695040888963407ull; return lcg >> 33; };
+    std::array<uint64_t, kCharacters + 1> userOf{};
+    std::array<const char*, kCharacters + 1> nameOf{};
+    const auto churn = [&](int n) {
+        std::vector<cwkeyed::Rec> recs;
+        for (int i = 0; i < n; ++i) {
+            const uint64_t id = next() % kCharacters + 1, pick = next() % 10;
+            if (userOf[id] == 0 || pick == 9) { userOf[id] = (id + next() % 2) % kUsers + 1; nameOf[id] = kNames[next() % kNames.size()]; }   // upsert
+            else if (pick < 4) nameOf[id] = kNames[next() % kNames.size()];                                                    // rename
+            else if (pick < 7) userOf[id] = (id + next() % 2) % kUsers + 1;                                                          // move
+            const bool erase = pick == 8;
+            recs.push_back({id, userOf[id], nameOf[id], static_cast<uint16_t>(id % 3), erase});
+            if (erase) userOf[id] = 0;
+        }
+        return recs;
+    };
+    const auto folded = [&] {
+        const int64_t hw = r.srcRep.replica->highWatermark();
+        return r.vs.foldCursorForTest(kAccountView, 0) >= hw && r.vs.foldCursorForTest(kLowerView, 0) >= hw;
+    };
+    uint64_t answered = 0, rows = 0, notReady = 0, lowerAnswers = 0, lowerOk = 0;   // answered: ViewRowResult and ViewScanResult only
+    const auto drain = [&] {
+        r.w.drainReturnView([&](WorkerReturn&& ret) {
+            if (ret.type != WorkerReturn::Type::ViewRowResult && ret.type != WorkerReturn::Type::ViewScanResult) return;
+            ++answered;
+            if (ret.type == WorkerReturn::Type::ViewScanResult) rows += static_cast<uint64_t>(ret.recordCount);
+            if (ret.errorCode == static_cast<int16_t>(pc::ViewRowResponse::kNotReady)) ++notReady;
+            if (ret.readTopicId == kLowerView) {
+                ++lowerAnswers;
+                lowerOk += ret.errorCode == 0 ? 1 : 0;
+            }
+        });
+    };
+    const auto foldToEnd = [&] {
+        for (int i = 0; i < 200 && !folded(); ++i) {
+            r.w.doWork(r.now += 1'000'000);
+            drain();
+        }
+        return folded();
+    };
+    struct Read {
+        WorkerOp::Type type;
+        std::vector<uint8_t> key;
+        int32_t view;
+        uint16_t limit;
+    };
+    const auto planReads = [&](int n) {   // the keys are built outside the window
+        std::vector<Read> plan;
+        for (int i = 0; i < n; ++i) {
+            const uint64_t id = next() % kCharacters + 1, user = userOf[id] != 0 ? userOf[id] : 1;
+            switch (i % 3) {
+                case 0: plan.push_back({WorkerOp::Type::GetViewRowK, cwkeyed::beKey({user, id}), kAccountView, 0}); break;
+                case 1: plan.push_back({WorkerOp::Type::ScanViewRows, cwkeyed::beKey({user}), kAccountView, 12}); break;
+                default: plan.push_back({WorkerOp::Type::GetViewRowK, cwkeyed::nameKey("alice", id), kLowerView, 0}); break;
+            }
+        }
+        return plan;
+    };
+    uint64_t posted = 0;
+    const auto reads = [&](const std::vector<Read>& plan, int64_t minOffset = -1) {
+        posted += plan.size();
+        for (std::size_t i = 0; i < plan.size(); ++i) {
+            if (!rune::node::test::postViewRead(r.w, plan[i].type, plan[i].key, {}, plan[i].view, plan[i].limit, minOffset)) ADD_FAILURE() << "op ring full";
+            if (i % 8 == 7 || i + 1 == plan.size()) {
+                r.w.doWork(r.now += 1'000'000);
+                drain();
+            }
+        }
+    };
+
+    std::vector<cwkeyed::Rec> seed;
+    for (uint64_t id = 1; id <= kCharacters; ++id) {
+        userOf[id] = (id + 1) % kUsers + 1;
+        nameOf[id] = kNames[id % kNames.size()];
+        seed.push_back({id, userOf[id], nameOf[id], static_cast<uint16_t>(id % 3), false});
+    }
+    rune::node::test::appendRecords(*r.srcRep.replica, r.src, seed);
+    ASSERT_TRUE(foldToEnd());
+    for (int b = 0; b < 600; ++b) {   // 9,600 records, renames included: the prefix-set blocks reach their steady classes
+        rune::node::test::appendRecords(*r.srcRep.replica, r.src, churn(16));
+        ASSERT_TRUE(foldToEnd());
+    }
+    reads(planReads(500));
+    ASSERT_EQ(answered, posted);
+
+    // The gate relies on the prefix-set pool being at its steady size class before the window opens (the warm-up above):
+    // a pool chunk is allocated only when a class free list runs dry, which is amortised growth, not a per-op allocation.
+    const uint64_t postedBefore = posted, rowsBefore = rows, lowerBefore = lowerAnswers, lowerOkBefore = lowerOk;
+    uint64_t allocs = 0;
+    const auto timed = [&](auto&& body) {
+        rune::testing::AllocWindow w;
+        body();
+        allocs += w.count();
+    };
+    for (int b = 0; b < 625; ++b) {   // 10,000 records
+        rune::node::test::appendRecords(*r.srcRep.replica, r.src, churn(16));
+        timed([&] { EXPECT_TRUE(foldToEnd()); });
+        if (b % 5 == 0) {
+            const auto plan = planReads(16);
+            timed([&] { reads(plan); });
+        }
+    }
+    const auto plan = planReads(3000);   // 2,000 GetViewRowK and 1,000 scans of pages of 12
+    timed([&] { reads(plan); });
+
+    // 100 held reads: held inside a window, released by one more record folded inside a window.
+    auto held = planReads(100);
+    for (auto& h : held) { h.type = WorkerOp::Type::GetViewRowK; h.key = cwkeyed::beKey({1, 1}); h.view = kAccountView; h.limit = 0; }
+    const int64_t wanted = r.srcRep.replica->highWatermark();
+    timed([&] { reads(held, wanted); });
+    EXPECT_EQ(r.w.heldViewReadsForTest(), 100u);
+    const uint64_t heldAnswered = answered;
+    EXPECT_EQ(heldAnswered, postedBefore + 5000u) << "no held read has been answered yet";
+    rune::node::test::appendRecords(*r.srcRep.replica, r.src, churn(1));
+    timed([&] {
+        EXPECT_TRUE(foldToEnd());
+        r.w.doWork(r.now += 1'000'000);
+        drain();
+    });
+    EXPECT_EQ(r.w.heldViewReadsForTest(), 0u);
+    EXPECT_EQ(answered - heldAnswered, 100u) << "every held read was answered exactly once";
+    EXPECT_EQ(answered, posted) << "one answer per read";
+    EXPECT_EQ(notReady, 0u) << "no held read expired";
+    EXPECT_GT((lowerOk - lowerOkBefore) * 20, lowerAnswers - lowerBefore) << "at least 5% of the lower-view reads hit a row";
+    EXPECT_GT(rows - rowsBefore, 0u) << "the scans returned rows";
+    EXPECT_EQ(allocs, 0u);
 }

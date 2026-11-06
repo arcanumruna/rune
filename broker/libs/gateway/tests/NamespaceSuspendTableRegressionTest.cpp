@@ -16,7 +16,7 @@ using rune::gateway::SuspendAction;
 
 // The broker->client response ids (not dispatched by the gateway).
 const std::set<uint16_t> kResponses = {2, 5, 7, 9, 11, 13, 15, 17, 19, 20, 33, 35, 37, 39, 41, 43, 44, 46, 48,
-                                       50, 52, 54, 65, 67, 69, 71, 73, 78, 83, 85, 87};
+                                       50, 52, 54, 65, 67, 69, 71, 73, 78, 83, 85, 87, 90};
 // Client->broker but consumed by the worker ingress (Worker.h handleWorkerBind_), never dispatched by the gateway: WorkerBind.
 const std::set<uint16_t> kWorkerConsumed = {86};
 // D21: refused while ReadOnly.

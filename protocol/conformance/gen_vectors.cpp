@@ -614,6 +614,39 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Keyed view reads (templates 88-90, client version 17): see manifest.md.
+    {
+        uint8_t key[16], token[12], tokenB[12], rows[3 * (4 + 32)];
+        for (int i = 0; i < 16; ++i) key[i] = uint8_t(0x40 + i);
+        for (int i = 0; i < 12; ++i) { token[i] = uint8_t(0xA0 + i); tokenB[i] = uint8_t(0xB0 + i); }
+        for (int r = 0; r < 3; ++r) {
+            uint8_t* p = rows + r * (4 + 32);
+            p[0] = 32; p[1] = p[2] = p[3] = 0;
+            for (int i = 0; i < 32; ++i) p[4 + i] = uint8_t(0x30 * (r + 1) + i);
+        }
+        static constexpr uint8_t prefix[] = {'a', 'c', 'c', 't', '/'};
+
+        rpc::GetViewRowK g;
+        g.sessionId = kSessionId; g.correlationId = kCorrelationId;
+        g.viewTopicId = 7; g.partition = 2; g.requestedFingerprint = 0x0102030405060708ULL; g.minOffset = 1000;
+        g.key = key;
+        n = g.encode(buf);
+        write_vec(dir, "get_view_row_k.bin", buf, n);
+
+        rpc::ScanViewRows s;
+        s.sessionId = kSessionId; s.correlationId = kCorrelationId;
+        s.viewTopicId = 7; s.limit = 100; s.requestedFingerprint = 0x0102030405060708ULL; s.minOffset = -1;
+        s.prefix = prefix; s.resumeToken = token;
+        n = s.encode(buf);
+        write_vec(dir, "scan_view_rows.bin", buf, n);
+
+        rpc::ScanViewRowsResponse r;
+        r.sessionId = kSessionId; r.correlationId = kCorrelationId;
+        r.status = 0; r.rowCount = 3; r.nextToken = tokenB; r.rowsBytes = rows;
+        n = r.encode(buf);
+        write_vec(dir, "scan_view_rows_response.bin", buf, n);
+    }
+
     std::printf("Done. 33 vectors written to %s/\n", dir);
     return 0;
 }

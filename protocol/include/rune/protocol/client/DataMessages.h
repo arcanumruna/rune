@@ -882,13 +882,13 @@ struct ViewRowResponse {
     // 6 = the owning worker's ingress ring was full this cycle (retriable —
     // the read was not performed; re-issue it); 7 = the row exists but its
     // ViewRowResponse would exceed the broker's egress frame (non-retriable;
-    // no row bytes are carried); 45 = NotAuthorized (client version 9: the session may not READ the view -
+    // no row bytes are carried); 8 = CursorInvalidated (a view scan resume token no longer matches its prefix; restart the scan); 45 = NotAuthorized (client version 9: the session may not READ the view -
     // the same value as ErrorCode::NotAuthorized, non-retriable); 54 = ViewPaused (client version 14: the view is
     // paused over its namespace's memory limit; the row bytes carry the paused fold offset as one little-endian i64;
     // a client below 14 is answered kInvalidRequest by the gateway); 53 = Throttled (the namespace is over its
     // query / request rate: the row bytes carry the retry-after in ns as one little-endian i64; same gating).
     enum Status : uint16_t { kOk = 0, kAbsentKey = 1, kNotReady = 2, kSchemaMismatch = 3, kUnknownView = 4,
-                             kInvalidRequest = 5, kBusy = 6, kRowTooLarge = 7, kNotAuthorized = 45, kThrottled = 53, kViewPaused = 54 };
+                             kInvalidRequest = 5, kBusy = 6, kRowTooLarge = 7, kCursorInvalidated = 8, kNotAuthorized = 45, kThrottled = 53, kViewPaused = 54 };
 
     /// Total encoded size accounting for the var field.
     std::size_t encodedSize() const noexcept {
@@ -940,6 +940,270 @@ struct ViewRowResponse {
         if (!getVarBytes32(buf, avail, pos, msg.rowBytes, msg.rowBytesLen)) return std::nullopt;
 
         return msg;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// GetViewRowK  (templateId 88)  client->broker — point lookup into a view by its key bytes.
+// Answered with a ViewRowResponse (73); sent only to a session >= kClientVersionCheckedWrites.
+//
+//   [24..27]  viewTopicId          : int32
+//   [28..31]  partition            : int32  (-1 = the sink's only partition)
+//   [32..39]  requestedFingerprint : uint64 (0 = latest)
+//   [40..47]  minOffset            : int64  (-1 = none)
+//   BODY_FIXED = 24; var: key (u32 length 1..128, then the bytes)
+//
+// Total = 52 + key.size()
+// ---------------------------------------------------------------------------
+struct GetViewRowK {
+    int64_t  sessionId            = 0;
+    int64_t  correlationId        = 0;
+    int32_t  viewTopicId          = -1;
+    int32_t  partition            = -1;
+    uint64_t requestedFingerprint = 0;
+    int64_t  minOffset            = -1;
+    std::span<const uint8_t> key;
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::GetViewRowK); // 88
+    static constexpr uint16_t BODY_FIXED  = 24;
+    static constexpr uint32_t kMaxKeyBytes = 128;
+
+    std::size_t encodedSize() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + key.size();
+    }
+
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE32(buf, fixedBase + 0,  viewTopicId);
+        detail::putLE32(buf, fixedBase + 4,  partition);
+        detail::putLE64(buf, fixedBase + 8,  static_cast<int64_t>(requestedFingerprint));
+        detail::putLE64(buf, fixedBase + 16, minOffset);
+
+        std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED;
+        pos += putVarBytes32(buf + pos, key.data(), static_cast<uint32_t>(key.size()));
+        return pos;
+    }
+
+    /// Zero-copy: `key` points into buf, which must outlive the result.  nullopt on a truncation, a key of length
+    /// 0 or above kMaxKeyBytes, or trailing bytes.
+    static std::optional<GetViewRowK> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId   != kSchemaId)   return std::nullopt;
+        if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+
+        constexpr std::size_t fixedBase = MessageHeader::ENCODED_SIZE;
+        if (avail < fixedBase + BODY_FIXED) return std::nullopt;
+
+        GetViewRowK msg;
+        msg.sessionId            = hdr.sessionId;
+        msg.correlationId        = hdr.correlationId;
+        msg.viewTopicId          = detail::getLE32(buf, static_cast<int>(fixedBase) + 0);
+        msg.partition            = detail::getLE32(buf, static_cast<int>(fixedBase) + 4);
+        msg.requestedFingerprint = static_cast<uint64_t>(detail::getLE64(buf, static_cast<int>(fixedBase) + 8));
+        msg.minOffset            = detail::getLE64(buf, static_cast<int>(fixedBase) + 16);
+
+        std::size_t pos = fixedBase + BODY_FIXED;
+        const uint8_t* keyData = nullptr;
+        uint32_t keyLen = 0;
+        if (!getVarBytes32(buf, avail, pos, keyData, keyLen)) return std::nullopt;
+        if (keyLen == 0 || keyLen > kMaxKeyBytes || pos != avail) return std::nullopt;
+        msg.key = {keyData, keyLen};
+        return msg;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// ScanViewRows  (templateId 89)  client->broker — one page of the rows under a key prefix, answered with a
+// ScanViewRowsResponse (90); sent only to a session >= kClientVersionCheckedWrites.
+//
+//   [24..27]  viewTopicId          : int32
+//   [28..29]  limit                : uint16 (0 = kMaxRowsPerPage)
+//   [30..31]  reserved             : uint16 (must be 0)
+//   [32..39]  requestedFingerprint : uint64 (0 = latest)
+//   [40..47]  minOffset            : int64  (-1 = none)
+//   BODY_FIXED = 24
+//   var: prefix      (u32 length 1..127, then the bytes)
+//   var: resumeToken (u32 length 0 = from the start, else kTokenBytes)
+// ---------------------------------------------------------------------------
+struct ScanViewRows {
+    int64_t  sessionId            = 0;
+    int64_t  correlationId        = 0;
+    int32_t  viewTopicId          = -1;
+    uint16_t limit                = 0;
+    uint64_t requestedFingerprint = 0;
+    int64_t  minOffset            = -1;
+    std::span<const uint8_t> prefix;
+    std::span<const uint8_t> resumeToken;
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ScanViewRows); // 89
+    static constexpr uint16_t BODY_FIXED  = 24;
+    static constexpr uint32_t kMaxPrefixBytes = 127;
+    static constexpr uint32_t kTokenBytes = 12;
+    static constexpr uint32_t kMaxRowsPerPage = 256;
+
+    std::size_t encodedSize() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + prefix.size() + 4u + resumeToken.size();
+    }
+
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE32(buf, fixedBase + 0,  viewTopicId);
+        detail::putLE16(buf, fixedBase + 4,  limit);
+        detail::putLE16(buf, fixedBase + 6,  0);
+        detail::putLE64(buf, fixedBase + 8,  static_cast<int64_t>(requestedFingerprint));
+        detail::putLE64(buf, fixedBase + 16, minOffset);
+
+        std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED;
+        pos += putVarBytes32(buf + pos, prefix.data(), static_cast<uint32_t>(prefix.size()));
+        pos += putVarBytes32(buf + pos, resumeToken.data(), static_cast<uint32_t>(resumeToken.size()));
+        return pos;
+    }
+
+    /// Zero-copy: `prefix` and `resumeToken` point into buf, which must outlive the result.  nullopt on a
+    /// truncation, a prefix of length 0 or above kMaxPrefixBytes, a token of any length but 0 or kTokenBytes,
+    /// a non-zero reserved field, or trailing bytes.
+    static std::optional<ScanViewRows> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId   != kSchemaId)   return std::nullopt;
+        if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+
+        constexpr std::size_t fixedBase = MessageHeader::ENCODED_SIZE;
+        if (avail < fixedBase + BODY_FIXED) return std::nullopt;
+        if (detail::getLE16(buf, static_cast<int>(fixedBase) + 6) != 0) return std::nullopt;
+
+        ScanViewRows msg;
+        msg.sessionId            = hdr.sessionId;
+        msg.correlationId        = hdr.correlationId;
+        msg.viewTopicId          = detail::getLE32(buf, static_cast<int>(fixedBase) + 0);
+        msg.limit                = detail::getLE16(buf, static_cast<int>(fixedBase) + 4);
+        msg.requestedFingerprint = static_cast<uint64_t>(detail::getLE64(buf, static_cast<int>(fixedBase) + 8));
+        msg.minOffset            = detail::getLE64(buf, static_cast<int>(fixedBase) + 16);
+
+        std::size_t pos = fixedBase + BODY_FIXED;
+        const uint8_t* data = nullptr;
+        uint32_t len = 0;
+        if (!getVarBytes32(buf, avail, pos, data, len)) return std::nullopt;
+        if (len == 0 || len > kMaxPrefixBytes) return std::nullopt;
+        msg.prefix = {data, len};
+        if (!getVarBytes32(buf, avail, pos, data, len)) return std::nullopt;
+        if ((len != 0 && len != kTokenBytes) || pos != avail) return std::nullopt;
+        msg.resumeToken = {data, len};
+        return msg;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// ScanViewRowsResponse  (templateId 90)  broker->client
+//
+//   [24..25]  status   : uint16 (ViewRowResponse::Status)
+//   [26..27]  rowCount : uint16
+//   BODY_FIXED = 4
+//   var: nextToken (u32 length 0 = the scan is complete, else ScanViewRows::kTokenBytes)
+//   var: rows      (u32 length; rowCount x {[len u32][len bytes]})
+// ---------------------------------------------------------------------------
+struct ScanViewRowsResponse {
+    int64_t  sessionId     = 0;
+    int64_t  correlationId = 0;
+    uint16_t status        = 0;
+    uint16_t rowCount      = 0;
+    std::span<const uint8_t> nextToken;
+    std::span<const uint8_t> rowsBytes;
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ScanViewRowsResponse); // 90
+    static constexpr uint16_t BODY_FIXED  = 4;
+    static constexpr uint32_t kMaxPageBytes = 61440;
+    static_assert(MessageHeader::ENCODED_SIZE + 4 + 4 + ScanViewRows::kTokenBytes + 4 + kMaxPageBytes <= 68 * 1024);
+
+    std::size_t encodedSize() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + nextToken.size() + 4u + rowsBytes.size();
+    }
+
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE16(buf, fixedBase + 0, status);
+        detail::putLE16(buf, fixedBase + 2, rowCount);
+
+        std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED;
+        pos += putVarBytes32(buf + pos, nextToken.data(), static_cast<uint32_t>(nextToken.size()));
+        pos += putVarBytes32(buf + pos, rowsBytes.data(), static_cast<uint32_t>(rowsBytes.size()));
+        return pos;
+    }
+
+    /// Zero-copy: `nextToken` and `rowsBytes` point into buf, which must outlive the result.  nullopt on a
+    /// truncation, a token of any length but 0 or ScanViewRows::kTokenBytes, or trailing bytes.
+    static std::optional<ScanViewRowsResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId   != kSchemaId)   return std::nullopt;
+        if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+
+        constexpr std::size_t fixedBase = MessageHeader::ENCODED_SIZE;
+        if (avail < fixedBase + BODY_FIXED) return std::nullopt;
+
+        ScanViewRowsResponse msg;
+        msg.sessionId     = hdr.sessionId;
+        msg.correlationId = hdr.correlationId;
+        msg.status        = detail::getLE16(buf, static_cast<int>(fixedBase) + 0);
+        msg.rowCount      = detail::getLE16(buf, static_cast<int>(fixedBase) + 2);
+
+        std::size_t pos = fixedBase + BODY_FIXED;
+        const uint8_t* data = nullptr;
+        uint32_t len = 0;
+        if (!getVarBytes32(buf, avail, pos, data, len)) return std::nullopt;
+        if (len != 0 && len != ScanViewRows::kTokenBytes) return std::nullopt;
+        msg.nextToken = {data, len};
+        if (!getVarBytes32(buf, avail, pos, data, len)) return std::nullopt;
+        if (pos != avail) return std::nullopt;
+        msg.rowsBytes = {data, len};
+        return msg;
+    }
+
+    /// Calls fn(std::span<const uint8_t> row) for each of rowCount rows.  False when the rows region is not
+    /// exactly rowCount length-prefixed rows.
+    template <class Fn>
+    bool forEachRow(Fn&& fn) const noexcept {
+        std::size_t pos = 0;
+        for (uint16_t i = 0; i < rowCount; ++i) {
+            if (rowsBytes.size() - pos < 4) return false;
+            const uint32_t len = static_cast<uint32_t>(detail::getLE32(rowsBytes.data(), static_cast<int>(pos)));
+            pos += 4;
+            if (len > rowsBytes.size() - pos) return false;
+            fn(rowsBytes.subspan(pos, len));
+            pos += len;
+        }
+        return pos == rowsBytes.size();
     }
 };
 

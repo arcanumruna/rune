@@ -38,12 +38,17 @@
 
 #include <memory>
 
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/node/VerdictSource.h>
 #include <rune/node/ViewInstance.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/NsSlotTable.h>
 
 namespace rune::node {
+
+/// The most row bytes (each row with its u32 length) one scanPage answers with.
+inline constexpr uint32_t kMaxScanPageBytes = rune::protocol::client::ScanViewRowsResponse::kMaxPageBytes;
+static_assert(rune::protocol::client::ScanViewRows::kTokenBytes == rune::view::kScanTokenBytes);
 
 enum class CheckpointOrigin : uint8_t { None, Committed, CommittedAndLegacy, LegacyOnly };
 
@@ -57,7 +62,19 @@ public:
     // `channel` is THIS worker's own ViewSnapshotChannel (per-worker SPSC — the
     // controller ruling).  `viewDataDir` is the per-view data directory used
     // only for naming / durability wiring (Task 19); it is stored, not opened.
-    WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataDir);
+    /// `hashSeed` seeds every table of every instance (a table's key hash, so player-chosen keys cannot target a slot); the
+    /// node draws a random one per worker, 0 reproduces the unseeded tables.
+    WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataDir, uint64_t hashSeed = 0);
+
+    [[nodiscard]] uint64_t hashSeedForTest() const noexcept { return hashSeed_; }
+    /// Plans refused at install because they pin a Unicode version this broker does not have (P7-13).
+    [[nodiscard]] uint64_t installRefusals() const noexcept { return installRefusals_; }
+    /// Test seam: tables created afterwards AND their hashes with `mask` (0 makes every key collide).
+    void setHashMaskForTest(uint64_t mask) noexcept { hashMask_ = mask; }
+    [[nodiscard]] const ViewInstance* instanceForTest(int32_t viewTopicId, int32_t partition) const {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it == views_.end() ? nullptr : &it->second;
+    }
 
     // Register a view's plan/layout/source-descriptor/persistence and index it
     // in the reactor `subscriptionIndex_` for each of the plan's source topics.
@@ -161,7 +178,7 @@ public:
     // absent key (terminal NotFound) from a view still rebuilding (RETRIABLE
     // NotReady) from a served row (Ok).  getRow returns the row pointer; this is
     // the out-of-band reason when it returns nullptr.
-    enum class RowStatus : uint8_t { Ok, NotFound, NotReady, Paused };
+    enum class RowStatus : uint8_t { Ok, NotFound, NotReady, Paused, BadKey };
 
     // Readiness of the (view, partition) instance.  Returns Ready when no such
     // instance is hosted here (nothing to gate — consistent with allViewsReady
@@ -358,7 +375,7 @@ public:
     }
     [[nodiscard]] bool keyIndexContainsForTest(int32_t src, int32_t partition, std::string_view wireKey) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
-        return it != keyIndexes_.end() && it->second.table.get(rune::view::ViewKey::fromU64(keyIndexWord(wireKey)).asU64()) != nullptr;
+        return it != keyIndexes_.end() && it->second.table.get(rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(wireKey.data()), wireKey.size()})) != nullptr;
     }
     [[nodiscard]] std::size_t keyIndexSizeForTest(int32_t src, int32_t partition) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
@@ -385,9 +402,27 @@ public:
     // GetViewRow serve path surfaces so a probe never sees a half-built row.
     // `outStatus` is optional (nullptr ignores it), keeping every existing
     // 4-arg caller unchanged.
+    // A view that is not LegacyU64 with an 8-byte key (P7-10) answers BadKey: its keys cannot be named by a u64.
     const uint8_t* getRow(int32_t viewTopicId, int32_t partition, uint64_t key,
                           const rune::view::RowLayout*& outLayout,
                           RowStatus* outStatus = nullptr) const;
+
+    // getRow by the view-key encoding (big-endian, ViewKeyEncoding.h).  A Keyed view's key.size() is its keyWidth; a LegacyU64
+    // view's is its one column's width, decoded to the table's u64.  Any other size answers BadKey.
+    const uint8_t* getRowK(int32_t viewTopicId, int32_t partition, std::span<const uint8_t> key,
+                           const rune::view::RowLayout*& outLayout, RowStatus* outStatus = nullptr) const;
+
+    struct ScanPage {
+        uint16_t status = 0;    // ViewRowResponse::Status
+        uint16_t rows = 0;
+        uint32_t bytes = 0;     // bytes written to `out`
+        uint8_t  nextTokenLen = 0;   // 0 = the scan is complete
+        std::array<uint8_t, rune::view::kScanTokenBytes> nextToken{};
+    };
+    // Writes the rows under `prefix` as [len u32][payload] into `out`, at most min(limit or 256, 256) rows and
+    // kMaxScanPageBytes bytes.  `resumeToken` is empty or the previous page's nextToken.
+    ScanPage scanPage(int32_t viewTopicId, int32_t partition, std::span<const uint8_t> prefix,
+                      std::span<const uint8_t> resumeToken, uint16_t limit, std::span<uint8_t> out);
 
     // Task 20: the output-schema fingerprint of the view `viewTopicId` (the
     // fingerprint CreateView published for the view's typed output topic, stored
@@ -486,9 +521,11 @@ private:
 
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
         std::size_t m = inst.table.memoryBytes();
+        if (inst.owners) m += inst.owners->memoryBytes();
         if (inst.agg) {
             m += inst.agg->contributors.memoryBytes() + inst.agg->groups.memoryBytes();
             if (inst.agg->blocks) m += inst.agg->blocks->memoryBytes();
+            if (inst.agg->groupIds) m += inst.agg->groupIds->memoryBytes();
         }
         return m;
     }
@@ -572,9 +609,11 @@ public:
             return t.dirtyRids().size() + t.pendingDeleteCount();
         };
         std::size_t n = pending(inst.table);
+        if (inst.owners) n += pending(*inst.owners);
         if (inst.agg) {
             n += pending(inst.agg->contributors) + pending(inst.agg->groups);
             if (inst.agg->blocks) n += pending(*inst.agg->blocks);
+            if (inst.agg->groupIds) n += pending(*inst.agg->groupIds);
         }
         return n;
     }
@@ -610,6 +649,10 @@ private:
         const auto it = templates_.find(viewTopicId);
         return it != templates_.end() && it->second.isVerdict;
     }
+    /// The instance a read is served from: nullptr (with the reason in `outStatus` and the layout set when the view is installed)
+    /// while it is absent, paused or not Ready.
+    [[nodiscard]] const ViewInstance* serveInstance_(int32_t viewTopicId, int32_t partition, const rune::view::RowLayout*& outLayout,
+                                                     RowStatus* outStatus) const;
     void onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status, ViewDiscardReason reason);
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
     int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
@@ -792,7 +835,8 @@ private:
 
         int64_t cursor = inst.foldCursor;
         const rune::view::FoldStats st =
-            inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout,
+            inst.keyed ? foldKeyed_(inst, view, passBound, cursor, skip)
+          : inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout,
                                                       inst.vdc, inst.table, inst.agg->contributors,
                                                       inst.agg->groups, inst.agg->blocksOrNull(), view,
                                                       passBound, cursor, skip)
@@ -802,7 +846,7 @@ private:
         inst.foldCursor = cursor;
         chargeMem_(inst);   // Task 12: the pass may have appended chunks
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted +
-                                 st.skippedMalformed + st.skippedNoGroup);
+                                 st.skippedMalformed + st.skippedNoGroup + st.skippedNoKey + st.keyConflicts);
         inst.counters.skippedAborted   += st.skippedAborted;
         inst.counters.skippedMalformed += st.skippedMalformed;
         inst.counters.skippedNoGroup   += st.skippedNoGroup;
@@ -810,6 +854,9 @@ private:
         inst.counters.aggNonFinite     += st.aggNonFinite;
         inst.counters.aggInconsistent  += st.aggInconsistent;
         inst.counters.aggRescans       += st.aggRescans;
+        inst.counters.skippedNoKey     += st.skippedNoKey;
+        inst.counters.keyConflicts     += st.keyConflicts;
+        inst.counters.ownerMoves       += st.ownerMoves;
 
         // Bug A: this pass's OWN fold may be what just caught the instance up
         // to `bound` — flip it here too (see 1b's doc comment for why this
@@ -842,6 +889,21 @@ private:
     // callback), encode it, and push it; holds it on ring back-pressure.
     // Returns 1 if a delta was encoded this pass (changed rows), else 0.
     int buildAndPushCheckpoint_(ViewInstance& inst);
+    /// The keyed variant: one v3 record, the view table then the owner map (a projection) or the aggregate's tables.
+    int buildAndPushKeyedCheckpoint_(ViewInstance& inst);
+
+    /// Folds [cursor, bound) of a keyed instance.
+    static rune::view::FoldStats foldKeyed_(ViewInstance& inst, const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
+                                            const rune::view::FoldSkip& skip) {
+        if (inst.agg) {
+            rune::view::AggregateFold f{inst.plan, inst.layout, inst.agg->layout, inst.vdc, inst.table, inst.agg->contributors, inst.agg->groups,
+                                        inst.agg->blocksOrNull(), &*inst.keyed, &*inst.agg->groupIds, &inst.agg->nextGroupId};
+            return rune::view::foldKeyedAggregateBatch(f, inst.prospect, view, bound, cursor, skip);
+        }
+        rune::view::ProjectionFold f{inst.plan, inst.layout, inst.vdc, inst.table, rune::view::viewKeyType(inst.plan), &*inst.keyed,
+                                     inst.owners ? &*inst.owners : nullptr};
+        return rune::view::foldProjectionBatch(f, inst.prospect, view, bound, cursor, skip);
+    }
 
     // Clear the dirty/deleted tracking of every table of an instance: every
     // pass for a transient instance (nothing will ever encode it), and once
@@ -849,8 +911,19 @@ private:
     // re-sending them would be a needless, possibly oversized delta).  No
     // allocation.
     static void discardDirty_(ViewInstance& inst) noexcept {
+        auto dropKeyed = [](uint32_t, const uint8_t*, bool, std::span<const uint8_t>) noexcept {};
+        inst.table.drainDirtyKeyed(dropKeyed);   // also a key index: its table is as wide as the wire key
+        if (inst.keyed) {
+            if (inst.owners) inst.owners->drainDirtyKeyed(dropKeyed);
+            if (inst.agg) {
+                inst.agg->contributors.drainDirtyKeyed(dropKeyed);
+                inst.agg->groups.drainDirtyKeyed(dropKeyed);
+                if (inst.agg->blocks) inst.agg->blocks->drainDirtyKeyed(dropKeyed);
+                inst.agg->groupIds->drainDirtyKeyed(dropKeyed);
+            }
+            return;
+        }
         auto drop = [](uint32_t, const uint8_t*, bool, uint64_t) noexcept {};
-        inst.table.drainDirty(drop);
         if (inst.agg) {
             inst.agg->contributors.drainDirty(drop);
             inst.agg->groups.drainDirty(drop);
@@ -869,6 +942,9 @@ private:
 
     ViewSnapshotChannel& channel_;
     std::string          viewDataDir_;
+    uint64_t             hashSeed_ = 0;
+    uint64_t             hashMask_ = ~uint64_t{0};
+    uint64_t             installRefusals_ = 0;
 
     std::unordered_map<int32_t, ViewTemplate>         templates_;        // viewTopicId -> plan template
     std::unordered_map<uint64_t, ViewInstance>        views_;            // (viewTopicId,partition) -> instance
@@ -888,6 +964,8 @@ private:
     std::vector<rune::view::DirtyEntry> dirtyEntries_;
     std::vector<std::size_t>            rowOffsets_;
     std::vector<uint8_t>                rowScratch_;
+    std::vector<rune::view::KeyedDirtyEntry> keyedEntries_;   // the v3 encoder input
+    std::vector<uint8_t>                keyScratch_;          // the entries' key bytes, copied like the rows
 
     uint64_t capacityExceeded_ = 0;
 

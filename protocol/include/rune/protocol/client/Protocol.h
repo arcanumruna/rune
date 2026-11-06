@@ -110,6 +110,10 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     WorkerBind              = 86,
     // broker -> client only: the worker's acknowledgement of a WorkerBind (never accepted on an ingress)
     WorkerBindAck           = 87,
+    // checked writes (client version 17): keyed view reads, sent only to a session >= kClientVersionCheckedWrites
+    GetViewRowK             = 88,
+    ScanViewRows            = 89,
+    ScanViewRowsResponse    = 90,
 };
 
 enum class ErrorCode : uint16_t {

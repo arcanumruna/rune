@@ -39,6 +39,9 @@ bool needsContributorList(MergeRule r) noexcept { return isExtremeRule(r) || isL
 std::optional<AggLayout> buildAggLayout(const CompiledViewPlan& plan,
                                         const rune::codec::Descriptor& evolvingSrc) {
     AggLayout a;
+    for (const auto& sk : evolvingSrc.fields) {
+        if (sk.isKey && isIntegerKeyType(sk.type)) a.sourceKeyWidth = static_cast<uint8_t>(rune::codec::fixedSize(sk.type));
+    }
     for (const auto& f : plan.output) {
         if (f.rule == MergeRule::Replace) {   // compiler: exactly the group-by column
             a.keyOutSlot    = f.outSlot;
@@ -117,12 +120,18 @@ std::optional<AggLayout> buildAggLayout(const CompiledViewPlan& plan,
         a.groupRow.rowLen   = nnEnd;
     }
     a.blockRow.rowLen = block ? kBlockEntries * (8u + 9u * a.numBlockCols) : 0u;
+    if (keyModeOf(plan) == ViewKeyMode::Keyed) {
+        a.keyed         = true;
+        a.groupKeyOff   = a.groupRow.rowLen;
+        a.groupKeyWidth = plan.keyWidth;
+        a.groupRow.rowLen += a.groupKeyWidth;
+    }
     return a;
 }
 
 AggDirtyBound aggDirtyBoundPerRecord(const AggLayout& a) noexcept {
     const bool block = a.numBlockCols > 0;   // implies linked
-    return AggDirtyBound{a.linked ? (block ? 5u : 4u) : 1u, 2u, 2u, block ? 3u : 0u};
+    return AggDirtyBound{a.linked ? (block ? 5u : 4u) : 1u, 2u, 2u, block ? 3u : 0u, a.keyed ? 2u : 0u};
 }
 
 } // namespace rune::view

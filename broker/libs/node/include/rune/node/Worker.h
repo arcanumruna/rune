@@ -577,6 +577,8 @@ public:
     /// PushRead ops executed by this worker (both answers and refusals).
     [[nodiscard]] uint64_t pushReadsForTest() const noexcept { return pushReads_; }
     [[nodiscard]] uint64_t getViewRowsForTest() const noexcept { return getViewRows_; }
+    [[nodiscard]] uint64_t getViewRowKsForTest() const noexcept { return getViewRowKs_; }
+    [[nodiscard]] uint64_t scanViewRowsForTest() const noexcept { return scanViewRows_; }
 
     // -----------------------------------------------------------------------
     // Issue #82 (VLS A.5.2): the view read lease.  A multi-node broker's worker serves a view row only while it holds a
@@ -1334,6 +1336,12 @@ public:
             tailKind = sbe::TailKind::Value::WRITE_SPEC;
             tailSrc  = op.schemaUpdateBlob.data();
             tailLen  = op.schemaUpdateBlob.size();
+            break;
+        case WorkerOp::Type::GetViewRowK:
+        case WorkerOp::Type::ScanViewRows:
+            tailKind = sbe::TailKind::Value::VIEW_READ;
+            tailSrc  = op.viewReadTail.data();
+            tailLen  = op.viewReadTail.size();
             break;
         case WorkerOp::Type::SessionAnnounce:
             tailKind = sbe::TailKind::Value::EGRESS_CHANNEL;
@@ -2720,6 +2728,14 @@ private:
         // Task 20: point read of a materialized view row (view-table owner).
         case WorkerOp::Type::GetViewRow:
             executeGetViewRowWire_(op);
+            break;
+        case WorkerOp::Type::GetViewRowK:
+            ++getViewRowKs_;
+            executeViewReadWire_(op, ViewReadReq::Kind::PointKey);
+            break;
+        case WorkerOp::Type::ScanViewRows:
+            ++scanViewRows_;
+            executeViewReadWire_(op, ViewReadReq::Kind::Scan);
             break;
         case WorkerOp::Type::ApplyReplicated:
             // Worker-clock: dequeued a routed apply op.  corr=runSeq pairs 1:1 (FIFO)
@@ -4356,6 +4372,29 @@ private:
     //                     absent, never a zero row)
     //   OK=0            — the row bytes (layout.rowLen) copied into the chunk
     // -------------------------------------------------------------------
+    // Issue #82: one GetViewRow (fresh, or held by the fold barrier).
+    struct ViewReadReq {
+        enum class Kind : uint8_t { PointU64, PointKey, Scan };
+        Kind     kind          = Kind::PointU64;
+        std::array<uint8_t, 128> keyBytes{};   ///< PointKey: the key; Scan: the prefix (fixed: a held read never allocates)
+        uint8_t  keyLen        = 0;
+        std::array<uint8_t, 12> token{};       ///< Scan: the resume token
+        uint8_t  tokenLen      = 0;
+        uint16_t limit         = 0;
+        int64_t  minOffset     = -1;           ///< the read waits for the fold to pass this source offset (-1: none)
+        int64_t  sessionId     = 0;
+        int64_t  correlationId = 0;
+        uint64_t key           = 0;
+        uint64_t fingerprint   = 0;
+        int32_t  viewTopicId   = 0;
+        int32_t  partition     = 0;
+        int64_t  target        = -1;   ///< the fold barrier: the committed bound at arrival (-1: not taken yet)
+        int64_t  deadlineNs    = 0;    ///< a held read: answered NotReady once the pass clock reaches it
+    };
+    static constexpr std::size_t kMaxHeldViewReads  = 256;
+    static constexpr int64_t     kHeldViewReadMaxNs = 100'000'000;   // 100 ms: the fold reaches a fixed target in a pass or two
+    enum class ViewServe : uint8_t { Answered, Hold };
+
     void executeGetViewRowWire_(sbe::WorkerOp& op) {
         ++getViewRows_;
         ViewReadReq r;
@@ -4365,6 +4404,37 @@ private:
         r.fingerprint   = static_cast<uint64_t>(op.hwBound());
         r.sessionId     = op.sessionId();
         r.correlationId = op.correlationId();
+        startViewRead_(r);
+    }
+
+    // Checked writes Part 07: a GetViewRowK / ScanViewRows op.  The scalars are GetViewRow's plus nextOffset = minOffset and
+    // recordCount = limit; the tail is [keyOrPrefixLen u8][bytes][tokenLen u8][token].  The gateway built it, so it is
+    // well formed: a tail that is not answers InvalidRequest.
+    void executeViewReadWire_(sbe::WorkerOp& op, ViewReadReq::Kind kind) {
+        ViewReadReq r;
+        r.kind          = kind;
+        r.viewTopicId   = op.topicId();
+        r.partition     = op.partition();
+        r.fingerprint   = static_cast<uint64_t>(op.hwBound());
+        r.minOffset     = op.nextOffset();
+        r.limit         = static_cast<uint16_t>(op.recordCount());
+        r.sessionId     = op.sessionId();
+        r.correlationId = op.correlationId();
+        const std::uint32_t tailLen = op.tailLength();
+        const auto* tail = reinterpret_cast<const uint8_t*>(op.tail());
+        if (tailLen < 2 || tail[0] > r.keyBytes.size() || tailLen < 2u + tail[0] || tail[1u + tail[0]] > r.token.size() ||
+            tailLen != 2u + tail[0] + tail[1u + tail[0]]) [[unlikely]] {
+            answerViewRead_(r, static_cast<int16_t>(rune::protocol::client::ViewRowResponse::kInvalidRequest));
+            return;
+        }
+        r.keyLen   = tail[0];
+        r.tokenLen = tail[1u + tail[0]];
+        std::memcpy(r.keyBytes.data(), tail + 1, r.keyLen);
+        std::memcpy(r.token.data(), tail + 2u + r.keyLen, r.tokenLen);
+        startViewRead_(r);
+    }
+
+    void startViewRead_(ViewReadReq& r) {
         if (serveViewRead_(r) == ViewServe::Answered) [[likely]] return;
         // Issue #82 (VLS A.5.5): the table has not folded what was committed when the read arrived - held (a fixed
         // list, reserved: never allocates; each held read owes one return, counted in reservedAckSlots_) and served
@@ -4379,24 +4449,9 @@ private:
         answerViewRead_(r, static_cast<int16_t>(rune::protocol::client::ViewRowResponse::kNotReady));
     }
 
-    // Issue #82: one GetViewRow (fresh, or held by the fold barrier).
-    struct ViewReadReq {
-        int64_t  sessionId     = 0;
-        int64_t  correlationId = 0;
-        uint64_t key           = 0;
-        uint64_t fingerprint   = 0;
-        int32_t  viewTopicId   = 0;
-        int32_t  partition     = 0;
-        int64_t  target        = -1;   ///< the fold barrier: the committed bound at arrival (-1: not taken yet)
-        int64_t  deadlineNs    = 0;    ///< a held read: answered NotReady once the pass clock reaches it
-    };
-    static constexpr std::size_t kMaxHeldViewReads  = 256;
-    static constexpr int64_t     kHeldViewReadMaxNs = 100'000'000;   // 100 ms: the fold reaches a fixed target in a pass or two
-    enum class ViewServe : uint8_t { Answered, Hold };
-
     [[gnu::cold]] void answerViewRead_(const ViewReadReq& r, int16_t code) {
         WorkerReturn ret;
-        ret.type          = WorkerReturn::Type::ViewRowResult;
+        ret.type          = r.kind == ViewReadReq::Kind::Scan ? WorkerReturn::Type::ViewScanResult : WorkerReturn::Type::ViewRowResult;
         ret.sessionId     = r.sessionId;
         ret.correlationId = r.correlationId;
         ret.readTopicId   = r.viewTopicId;
@@ -4429,11 +4484,10 @@ private:
     ViewServe serveViewReadImpl_(ViewReadReq& r) {
         const int32_t  viewTopicId = r.viewTopicId;
         const int32_t  partition   = r.partition;
-        const uint64_t keyU64      = r.key;
         const uint64_t requestedFp = r.fingerprint;
 
         WorkerReturn ret;
-        ret.type          = WorkerReturn::Type::ViewRowResult;
+        ret.type          = r.kind == ViewReadReq::Kind::Scan ? WorkerReturn::Type::ViewScanResult : WorkerReturn::Type::ViewRowResult;
         ret.sessionId     = r.sessionId;
         ret.correlationId = r.correlationId;
         ret.readTopicId   = viewTopicId;   // echoed for gateway correlation
@@ -4518,32 +4572,60 @@ private:
             // 2d. Issue #82 (VLS A.5.5): read-your-writes - an acked write is committed (at or below the HW / LSO), but
             //     the fold may lag it within a pass (a persisted view folds at most maxRecordsPerPass per pass; the ack
             //     leaves before the next pass folds).  The read waits for the fold to reach the committed bound AT ITS
-            //     ARRIVAL (fixed: bounded).  The common case is one compare.  Only a Ready table waits (one still
-            //     catching up / rebuilding answers NotReady below, at once); while the RC state is not Ready (it
-            //     rebuilds after a leadership / log change - the instance is then CatchingUp anyway) no bound is taken.
+            //     ARRIVAL (fixed: bounded), and for its minOffset (P7-12) when it names one.  The common case is one
+            //     compare.  Only a Ready table waits (one still catching up / rebuilding answers NotReady below, at
+            //     once); while the RC state is not Ready (it rebuilds after a leadership / log change - the instance is
+            //     then CatchingUp anyway) no bound is taken.
             if (r.target < 0 && st.ready) {
                 // The fold bound is the LSO <= HW: a table folded up to the HW is caught up (one load + compare); only
                 // a lagging one takes the bound from the RC state.
                 if (const int64_t hw = srcRep->highWatermark(); st.foldCursor < hw) [[unlikely]]
                     if (const RcState* rc = rcServe_(srcRep, rcOf_(srcRep)); rc != nullptr) r.target = rc->lso(hw);
+                // The fold waits for minOffset even when it is at the HW; INT64_MAX is a bound no fold reaches.
+                if (r.minOffset >= 0) r.target = std::max(r.target, std::min(r.minOffset, INT64_MAX - 1) + 1);
             }
             if (r.target >= 0 && st.foldCursor < r.target) [[unlikely]] return ViewServe::Hold;
         }
 
         // 3. Probe the view table.  getRow applies the Task 16 serve-guard
         //    (NotReady while rebuilding) and distinguishes a genuinely absent key.
+        if (r.kind == ViewReadReq::Kind::Scan) {
+            const WorkerViewSet::ScanPage page = viewSet_->scanPage(viewTopicId, partition, std::span<const uint8_t>(r.keyBytes.data(), r.keyLen),
+                                                                    std::span<const uint8_t>(r.token.data(), r.tokenLen), r.limit, scanScratch_);
+            ret.errorCode = static_cast<int16_t>(page.status);
+            if (page.status != RS::kOk) {   // a status carries no page
+                enqueueReturn_(std::move(ret));
+                return ViewServe::Answered;
+            }
+            ret.recordCount = page.rows;
+            // [nextTokenLen u32][token][rowsLen u32] then the rows: the page is gathered straight into the return ring.
+            std::array<uint8_t, 4 + rune::view::kScanTokenBytes + 4> head{};
+            const uint32_t tokenLen = page.nextTokenLen;
+            std::memcpy(head.data(), &tokenLen, 4);
+            std::memcpy(head.data() + 4, page.nextToken.data(), tokenLen);
+            std::memcpy(head.data() + 4 + tokenLen, &page.bytes, 4);
+            const uint32_t headLen = 8 + tokenLen;
+            const ChunkRun runs[2] = {{head.data(), headLen}, {scanScratch_.data(), page.bytes}};
+            enqueueViewResult_(ret, runs, 2, headLen + page.bytes);
+            return ViewServe::Answered;
+        }
         const rune::view::RowLayout*  layout = nullptr;
         WorkerViewSet::RowStatus      rs     = WorkerViewSet::RowStatus::NotFound;
-        const uint8_t* row = viewSet_->getRow(viewTopicId, partition, keyU64, layout, &rs);
+        const uint8_t* row = r.kind == ViewReadReq::Kind::PointKey
+            ? viewSet_->getRowK(viewTopicId, partition, std::span<const uint8_t>(r.keyBytes.data(), r.keyLen), layout, &rs)
+            : viewSet_->getRow(viewTopicId, partition, r.key, layout, &rs);
         if (row != nullptr && layout != nullptr) {
             ret.errorCode   = static_cast<int16_t>(RS::kOk);
             ret.recordCount = static_cast<int32_t>(layout->rowLen);
-            enqueueViewRowResult_(ret, row, layout->rowLen);   // zero-copy gather (hot path)
+            const ChunkRun run{row, layout->rowLen};
+            enqueueViewResult_(ret, &run, 1, layout->rowLen);   // zero-copy gather (hot path)
             return ViewServe::Answered;
         } else if (rs == WorkerViewSet::RowStatus::NotReady) {
             ret.errorCode = static_cast<int16_t>(RS::kNotReady);
         } else if (rs == WorkerViewSet::RowStatus::Paused) {
             ret.errorCode = static_cast<int16_t>(RS::kViewPaused);
+        } else if (rs == WorkerViewSet::RowStatus::BadKey) {   // a key the view cannot hold: its width, or a u64 on a wide-key view
+            ret.errorCode = static_cast<int16_t>(RS::kInvalidRequest);
         } else {
             ret.errorCode = static_cast<int16_t>(RS::kAbsentKey);
         }
@@ -4580,26 +4662,25 @@ private:
     // back-pressure fallback (a return already queued, or the ring momentarily
     // full) copies into the owned chunk and queues it — never dropped, never
     // reordered; the common case never allocates.
-    void enqueueViewRowResult_(WorkerReturn& ret, const uint8_t* row, uint32_t rowLen) {
+    void enqueueViewResult_(WorkerReturn& ret, const ChunkRun* runs, std::size_t nRuns, uint32_t total) {
         if (retFifo_.empty()) [[likely]] {
-            const std::size_t n = workerReturnEncodedLength(static_cast<std::size_t>(rowLen));
+            const std::size_t n = workerReturnEncodedLength(static_cast<std::size_t>(total));
             aeron::util::index_t idx = -1;
             try {
                 idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n);
             } catch (const std::exception& ex) {
-                haltInvariant_("return-ring tryClaim threw (ViewRowResult)", ex.what(), rowLen);
+                haltInvariant_("return-ring tryClaim threw (view result)", ex.what(), total);
             } catch (...) {
-                haltInvariant_("return-ring tryClaim threw (ViewRowResult)", "non-std exception", rowLen);
+                haltInvariant_("return-ring tryClaim threw (view result)", "non-std exception", total);
             }
             if (idx >= 0) {
-                const ChunkRun run{row, rowLen};
-                encodeWorkerReturnGather(reinterpret_cast<char*>(ret_.base() + idx), n, ret,
-                                         &run, 1, rowLen);
+                encodeWorkerReturnGather(reinterpret_cast<char*>(ret_.base() + idx), n, ret, runs, nRuns, total);
                 ret_.commit(idx);
                 return;
             }
         }
-        ret.chunk.assign(row, row + rowLen);   // back-pressure fallback (rare): copy + queue
+        ret.chunk.clear();   // back-pressure fallback (rare): copy + queue
+        for (std::size_t i = 0; i < nRuns; ++i) ret.chunk.insert(ret.chunk.end(), runs[i].data, runs[i].data + runs[i].len);
         enqueueReturn_(std::move(ret));
     }
 
@@ -6370,6 +6451,9 @@ private:
     uint64_t    pushReadOversize_ = 0;
     uint64_t    pushReads_ = 0;            // F15 S4: PushRead ops executed (R-1 / R-3 tests)
     uint64_t    getViewRows_ = 0;          // Task 20: GetViewRow ops executed
+    uint64_t    getViewRowKs_ = 0;         // checked writes Part 07: GetViewRowK ops executed
+    uint64_t    scanViewRows_ = 0;         // checked writes Part 07: ScanViewRows ops executed
+    std::array<uint8_t, kMaxScanPageBytes> scanScratch_{};   // one ScanViewRows page, gathered into the return ring
     // Issue #82 (VLS A.5.5): GetViewRows held by the fold barrier (reserved: never allocates).
     std::vector<ViewReadReq> heldViewReads_ = [] { std::vector<ViewReadReq> v; v.reserve(kMaxHeldViewReads); return v; }();
     uint64_t viewReadsHeld_        = 0;

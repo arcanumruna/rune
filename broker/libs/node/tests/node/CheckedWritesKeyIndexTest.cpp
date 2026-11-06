@@ -298,7 +298,7 @@ TEST(CheckedWritesKeyIndex, ActivationPendingUntilTheFirstDrive) {
     EXPECT_FALSE(r.vs.activationPending());
 }
 
-TEST(CheckedWritesKeyIndex, AMemberWithoutAFixedKeyOfOneToEightBytesIsRefused) {
+TEST(CheckedWritesKeyIndex, AMemberWithoutAFixedKeyOfOneToSixteenBytesIsRefused) {
     const auto build = [](rune::codec::Descriptor src, uint16_t keyField) {
         ViewInstance inst(keyIndexPlan(5, keyField), keyIndexRowLayout(), std::move(src), false, 0, 4096, kKeyIndexChunkBytes);
         VerdictSource vs(5, 0);
@@ -307,7 +307,9 @@ TEST(CheckedWritesKeyIndex, AMemberWithoutAFixedKeyOfOneToEightBytesIsRefused) {
     EXPECT_NO_THROW(build(tagSource(), 0));
     EXPECT_THROW(build(tagSource(), 99), std::invalid_argument);   // no such field
     const auto wide = rune::codec::DescriptorBuilder("w", 1).addFixedStr("k", 16, 1, true).build();
-    EXPECT_THROW(build(wide, 0), std::invalid_argument);
+    EXPECT_NO_THROW(build(wide, 0));
+    const auto tooWide = rune::codec::DescriptorBuilder("w", 1).addFixedStr("k", 17, 1, true).build();
+    EXPECT_THROW(build(tooWide, 0), std::invalid_argument);
     const auto text = rune::codec::DescriptorBuilder("t", 1).add("k", P::String, 1, true).build();
     EXPECT_THROW(build(text, 0), std::invalid_argument);
 }

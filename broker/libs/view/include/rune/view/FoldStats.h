@@ -30,6 +30,11 @@ struct FoldStats {
     // Phase 2b: Min/Max caches rebuilt by one scan of the group's value block
     // (the cached extreme was retracted) -- the known O(group size) path.
     uint64_t aggRescans       = 0;
+    // Keyed projections: a live record with an absent key component (its row, if any, is erased); a unique key already
+    // owned by another source key (the record is skipped); a record whose row moved to another key.
+    uint64_t skippedNoKey     = 0;
+    uint64_t keyConflicts     = 0;
+    uint64_t ownerMoves       = 0;
 };
 
 } // namespace rune::view

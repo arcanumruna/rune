@@ -10,11 +10,16 @@
 
 namespace rune::view {
 
+// What a refusal is about; the caller maps a non-Generic kind to its wire code.
+enum class CompileErrorKind : uint8_t { Generic, FieldUnresolved, KeyInvalid, KeyExpressionInvalid, ConstraintInvalid,
+                                        UniqueInvalid, NotCoPartitioned };
+
 // Control-plane (CreateView-time) compilation error. Never thrown -- always
 // returned via std::unexpected so a rejected view never produces a partial
 // plan.
 struct CompileError {
     std::string message;
+    CompileErrorKind kind = CompileErrorKind::Generic;
 };
 
 // The result of compiling an authored ViewPlan: the resolved plan (names ->

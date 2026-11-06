@@ -515,3 +515,21 @@ TEST(CheckedWritesIntents, DefineQueuedBeforeTheSeedConnectsIsBrokerTooOld) {
     EXPECT_EQ(sent, 0);
     ASSERT_TRUE(r.drive([&] { return connect.ready(); }));
 }
+
+TEST(CheckedWritesIntents, ViewReadsOnAnOldBrokerAreBrokerTooOld) {
+    namespace pc = rune::protocol::client;
+    Rig r(invokerCfg(4661, 4662));
+    r.gw.advertisedBrokerVersion = rpc::kBrokerVersionCheckedWrites - 1;
+    int sent = 0;
+    r.gw.templateHandlers[pc::GetViewRowK::TEMPLATE_ID]  = [&](int, const uint8_t*, std::size_t) { ++sent; };
+    r.gw.templateHandlers[pc::ScanViewRows::TEMPLATE_ID] = [&](int, const uint8_t*, std::size_t) { ++sent; };
+    r.connect();
+    test_support::TestCq cq(*r.client);
+    const std::vector<uint8_t> key(8, 1);
+    auto get = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client->getViewRowK(3, key, {}, q, t); });
+    auto scan = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client->scanView(3, key, 10, {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return get.ready() && scan.ready(); }));
+    EXPECT_EQ(get.status(), OpStatus::BrokerTooOld);
+    EXPECT_EQ(scan.status(), OpStatus::BrokerTooOld);
+    EXPECT_EQ(sent, 0);
+}

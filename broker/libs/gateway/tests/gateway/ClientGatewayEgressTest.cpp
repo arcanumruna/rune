@@ -1777,5 +1777,58 @@ TEST(ClientGatewayEgressRegression, StalledSpillDrainCostIsIndependentOfSpilledR
         << " ns over 8 x 1 — the drain walks the records";
 }
 
+// The admin thread answers a view DDL refusal 59-61 without knowing the session's version; a client below 17 is
+// answered InvalidRequest (39) on every frame that can carry one.
+TEST(ClientGatewayEgressRegression, ViewDdlCodesAreDowngradedForAnOldClientRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t oldSid = gw.injectReliableTestSessionForTest(0, pc::kClientVersionCheckedWrites - 1);
+    const int64_t newSid = gw.injectReliableTestSessionForTest(0, pc::kClientVersionCheckedWrites);
+    const auto code = static_cast<uint16_t>(pc::ErrorCode::ViewConstraintInvalid);
+    const auto invalid = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
+
+    const auto sendError = [&](int64_t sid) {
+        pc::ErrorResponse r;
+        r.sessionId = sid; r.correlationId = 1; r.code = static_cast<int16_t>(code); r.message = "constraint is wrong";
+        std::vector<uint8_t> f(pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + r.message.size());
+        f.resize(r.encode(f.data()));
+        ASSERT_TRUE(gw.sendControlFrame(sid, f.data(), f.size()));
+    };
+    const auto sendDdl = [&](int64_t sid) {
+        pc::DdlResponse r;
+        r.sessionId = sid; r.correlationId = 2; r.errorCode = code; r.detail = "unique";
+        std::vector<uint8_t> f(r.encodedSize());
+        f.resize(r.encode(f.data()));
+        ASSERT_TRUE(gw.sendControlFrame(sid, f.data(), f.size()));
+    };
+    const auto sendCreate = [&](int64_t sid) {
+        pc::CreateViewResponse r;
+        r.sessionId = sid; r.correlationId = 3; r.errorCode = code;
+        std::vector<uint8_t> f(r.encodedSize());
+        f.resize(r.encode(f.data()));
+        ASSERT_TRUE(gw.sendControlFrame(sid, f.data(), f.size()));
+    };
+
+    sendError(oldSid);
+    ASSERT_TRUE(cap.last<pc::ErrorResponse>().has_value());
+    EXPECT_EQ(cap.last<pc::ErrorResponse>()->code, static_cast<int16_t>(invalid));
+    EXPECT_EQ(cap.last<pc::ErrorResponse>()->message, "constraint is wrong");
+    sendDdl(oldSid);
+    ASSERT_TRUE(cap.last<pc::DdlResponse>().has_value());
+    EXPECT_EQ(cap.last<pc::DdlResponse>()->errorCode, invalid);
+    EXPECT_EQ(cap.last<pc::DdlResponse>()->detail, "unique");
+    sendCreate(oldSid);
+    ASSERT_TRUE(cap.last<pc::CreateViewResponse>().has_value());
+    EXPECT_EQ(cap.last<pc::CreateViewResponse>()->errorCode, invalid);
+
+    sendError(newSid);
+    EXPECT_EQ(cap.last<pc::ErrorResponse>()->code, static_cast<int16_t>(code));
+    sendDdl(newSid);
+    EXPECT_EQ(cap.last<pc::DdlResponse>()->errorCode, code);
+    sendCreate(newSid);
+    EXPECT_EQ(cap.last<pc::CreateViewResponse>()->errorCode, code);
+}
+
 } // namespace
 } // namespace rune::gateway

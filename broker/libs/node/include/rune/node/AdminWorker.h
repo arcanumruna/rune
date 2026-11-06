@@ -494,7 +494,7 @@ private:
     /// A view definition (CreateView / AlterView) at `viewTopicId`; every source must live in namespace `nsId`.
     [[nodiscard]] std::expected<rune::catalog::ViewDef, DdlRejection>
         viewDef_(const std::string& name, const std::string& keyField, uint8_t persistence,
-                 const std::vector<uint8_t>& planBlob, int32_t viewTopicId, uint32_t nsId,
+                 const std::vector<uint8_t>& planBlob, int32_t viewTopicId, uint64_t viewObjectId, uint32_t nsId,
                  const rune::catalog::CatalogState& s) const;
     /// Encode + append `e` (key = objectId LE) — false: answered already.
     bool appendEvent_(const DdlRequest& req, rune::catalog::CatalogEvent e, int64_t nowNs);

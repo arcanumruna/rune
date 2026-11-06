@@ -1,10 +1,12 @@
 // libs/view/src/ViewTable.cpp
 #include <cstring>
 #include <rune/view/ViewTable.h>
+#include <rune/view/ViewKeyHash.h>
 #include <algorithm>
 #include <bit>
 #include <cassert>
 #include <chrono>
+#include <random>
 #include <utility>
 
 namespace rune::view {
@@ -17,6 +19,40 @@ namespace {
 inline uint64_t nowNs() noexcept {
     using namespace std::chrono;
     return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+// Backward-shift deletion (standard open-addressing linear-probing
+// delete, e.g. Wikipedia "Open addressing" / Knuth 6.4): walk forward
+// from the freed slot `hole`, pulling back any entry at `j` whose home
+// slot does NOT lie in the open-closed cyclic interval (hole, j] — such
+// an entry's probe sequence does not depend on slot `hole` being
+// occupied, so it is safe to move it into the hole, vacating `j` as the
+// new hole. Stops at the first slot that was already EMPTY (that marks
+// the end of this probe run).
+template <class Home>
+void backshiftDelete(uint8_t* tags, uint64_t* words, uint32_t* rids, size_t mask, size_t i, Home&& home) noexcept {
+    tags[i] = 0;
+    size_t hole = i;
+    size_t j    = i;
+    for (;;) {
+        j = (j + 1) & mask;
+        if (tags[j] == 0) break;
+
+        const size_t h = home(words[j]) & mask;
+        bool pinned; // entry at j must stay put (for now) relative to hole
+        if (hole <= j) {
+            pinned = (hole < h) && (h <= j);
+        } else {
+            pinned = (hole < h) || (h <= j);
+        }
+        if (pinned) continue;
+
+        tags[hole]  = tags[j];
+        words[hole] = words[j];
+        rids[hole]  = rids[j];
+        tags[j]     = 0;
+        hole        = j;
+    }
 }
 } // namespace
 
@@ -32,27 +68,35 @@ uint8_t ViewTable::fullTag(uint64_t h) noexcept {
     return 0x80 | (t < 2 ? 2 : t); // 0/1 reserved for EMPTY/TOMB-style sentinels
 }
 
-ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkBytes)
-    : layout_(std::move(layout)) {
+void ViewTable::SlotIndex::init(size_t slots, bool wordIsHash_, uint64_t seed_, uint64_t hashMask_) {
+    cap  = slots;
+    mask = slots - 1;
+    tags.assign(cap, kEmpty);
+    keys.assign(cap, 0);
+    rid.assign(cap, 0);
+    wordIsHash = wordIsHash_;
+    seed       = seed_;
+    hashMask   = hashMask_;
+}
+
+ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkBytes, ViewTableKeys keys)
+    : layout_(std::move(layout)), keyWidth_(keys.keyWidth), prefixWidth_(keys.prefixWidth), hashSeed_(keys.hashSeed),
+      hashMask_(keys.hashMaskForTest), headerLen_(keys.keyWidth > 8 ? keys.keyWidth : 0),
+      rowStride_(headerLen_ + static_cast<size_t>(layout_.rowLen)) {
+    assert(keyWidth_ <= rune::codec::kMaxViewKeyBytes && "ViewTable: keyWidth over kMaxViewKeyBytes");
     assert(initialIndexSlots > 0 && std::has_single_bit(initialIndexSlots) &&
            "ViewTable: initialIndexSlots must be a power of two");
 
-    cap_     = initialIndexSlots;
-    mask_    = cap_ - 1;
-
     // rowsPerChunk_ = floor_pow2(chunkBytes / rowLen), clamped to >= 1 (a
     // single row wider than chunkBytes still gets its own one-row chunk).
-    const size_t rowLen = static_cast<size_t>(layout_.rowLen);
-    size_t rowsPerChunk = rowLen > 0 ? (chunkBytes / rowLen) : 0;
+    size_t rowsPerChunk = rowStride_ > 0 ? (chunkBytes / rowStride_) : 0;
     rowsPerChunk = std::bit_floor(rowsPerChunk); // 0 stays 0 (bit_floor(0) == 0)
     if (rowsPerChunk < 1) rowsPerChunk = 1;
     rowsPerChunk_ = rowsPerChunk;
     chunkShift_   = static_cast<size_t>(std::countr_zero(rowsPerChunk_));
     chunkMask_    = rowsPerChunk_ - 1;
 
-    tags_.assign(cap_, kEmpty);
-    keys_.assign(cap_, 0);
-    rid_.assign(cap_, 0);
+    main_.init(initialIndexSlots, headerLen_ != 0, hashSeed_, hashMask_);
     // free_ can never hold more than the LIVE key count, which (thanks to
     // incremental rehash) is itself unbounded over the table's lifetime —
     // but growth only ever happens via startGrow()/migrateStep(), never by
@@ -60,21 +104,30 @@ ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkByt
     // capacity up front just gives erase()'s push_back() a warm start;
     // free_ may reallocate (amortized, standard vector growth) past that
     // if the table grows far beyond its initial capacity.
-    free_.reserve(cap_);
+    free_.reserve(main_.cap);
 
     // Task 6: dirty-tracking side arrays. dirtyList_/deleted_ only ever
     // grow in steady state (a reserve() here just gives them a warm start
     // so the first interval's push_backs don't reallocate); dirty_/
     // dirtyKeys_ are sized to the rid space by appendChunk(), below.
-    dirtyList_.reserve(cap_);
+    dirtyList_.reserve(main_.cap);
     deleted_.reserve(256);
+    deletedKeyBytes_.reserve(256 * headerLen_);
+
+    if (prefixWidth_) {
+        outer_.init(initialIndexSlots, true, hashSeed_, hashMask_);
+        chunkBytes_ = chunkBytes;
+        blockFree_.resize(32);
+        std::random_device rd;
+        versionClock_ = (uint64_t{rd()} << 32) | rd();
+    }
 
     appendChunk(); // start with one chunk so rid 0 is always addressable
 }
 
 void ViewTable::appendChunk() {
     {
-        const size_t bytes = rowsPerChunk_ * static_cast<size_t>(layout_.rowLen);
+        const size_t bytes = rowsPerChunk_ * rowStride_;
         std::unique_ptr<uint8_t[]> chunk(new uint8_t[bytes]);
         std::memset(chunk.get(), 0, bytes);
         chunks_.push_back(std::move(chunk));
@@ -94,163 +147,144 @@ void ViewTable::markDirty(uint32_t rid) noexcept {
     dirtyList_.push_back(rid);
 }
 
-size_t ViewTable::findP(uint64_t key) const noexcept {
-    const uint64_t h  = mix(key);
-    const uint8_t  ft = fullTag(h);
-    size_t i = h & mask_;
-    for (size_t probes = 0; probes < cap_; ++probes) {
-        const uint8_t t = tags_[i];
+ViewTable::Probe ViewTable::probeOf(const ViewKey& key) const noexcept {
+    assert(key.len == keyWidth_);
+    if (!headerLen_) return probeOf(key.asU64());
+    const uint64_t h = viewKeyHash(key.span(), hashSeed_) & hashMask_;
+    return {h, h, key.bytes.data()};
+}
+
+bool ViewTable::headerKeyEquals(uint32_t rid, const uint8_t* key) const noexcept {
+    ++arenaKeyReads_;
+    return std::memcmp(rowAddr(rid) - headerLen_, key, headerLen_) == 0;
+}
+
+size_t ViewTable::findP(const Probe& p) const noexcept {
+    const uint8_t  ft = fullTag(p.h);
+    size_t i = p.h & main_.mask;
+    for (size_t probes = 0; probes < main_.cap; ++probes) {
+        const uint8_t t = main_.tags[i];
         if (t == kEmpty) return static_cast<size_t>(-1);
-        if (t == ft && keys_[i] == key) return i;
-        i = (i + 1) & mask_;
+        if (t == ft && main_.keys[i] == p.word && (!p.wideKey || headerKeyEquals(main_.rid[i], p.wideKey))) return i;
+        i = (i + 1) & main_.mask;
     }
     return static_cast<size_t>(-1);
 }
 
-size_t ViewTable::findO(uint64_t key) const noexcept {
-    if (!migrating_) return static_cast<size_t>(-1);
-    const uint64_t h  = mix(key);
-    const uint8_t  ft = fullTag(h);
-    size_t i = h & omask_;
-    for (size_t probes = 0; probes < ocap_; ++probes) {
-        const uint8_t t = ot_[i];
+size_t ViewTable::findO(const Probe& p) const noexcept {
+    if (!main_.migrating) return static_cast<size_t>(-1);
+    const uint8_t  ft = fullTag(p.h);
+    size_t i = p.h & main_.omask;
+    for (size_t probes = 0; probes < main_.ocap; ++probes) {
+        const uint8_t t = main_.ot[i];
         if (t == kEmpty) return static_cast<size_t>(-1);
-        if (t == ft && ok_[i] == key) return i;
-        i = (i + 1) & omask_;
+        if (t == ft && main_.ok[i] == p.word && (!p.wideKey || headerKeyEquals(main_.orid[i], p.wideKey))) return i;
+        i = (i + 1) & main_.omask;
     }
     return static_cast<size_t>(-1);
 }
 
-void ViewTable::backshiftPrimary(size_t i) noexcept {
-    // Backward-shift deletion (standard open-addressing linear-probing
-    // delete, e.g. Wikipedia "Open addressing" / Knuth 6.4): walk forward
-    // from the freed slot `hole`, pulling back any entry at `j` whose home
-    // slot does NOT lie in the open-closed cyclic interval (hole, j] — such
-    // an entry's probe sequence does not depend on slot `hole` being
-    // occupied, so it is safe to move it into the hole, vacating `j` as the
-    // new hole. Stops at the first slot that was already EMPTY (that marks
-    // the end of this probe run).
-    tags_[i] = kEmpty;
-    size_t hole = i;
-    size_t j    = i;
-    for (;;) {
-        j = (j + 1) & mask_;
-        if (tags_[j] == kEmpty) break;
-
-        const size_t home = mix(keys_[j]) & mask_;
-        bool pinned; // entry at j must stay put (for now) relative to hole
-        if (hole <= j) {
-            pinned = (hole < home) && (home <= j);
-        } else {
-            pinned = (hole < home) || (home <= j);
-        }
-        if (pinned) continue;
-
-        tags_[hole] = tags_[j];
-        keys_[hole] = keys_[j];
-        rid_[hole]  = rid_[j];
-        tags_[j]    = kEmpty;
-        hole        = j;
-    }
+void ViewTable::SlotIndex::backshift(size_t i) noexcept {
+    backshiftDelete(tags.data(), keys.data(), rid.data(), mask, i, [this](uint64_t w) { return home(w); });
 }
 
-void ViewTable::maybePrezero() noexcept {
-    if (migrating_) return; // finish the in-flight grow before provisioning the next one
-    const size_t nc = cap_ * 2;
-    if (prezeroCap_ == nc && prezeroCur_ >= prezeroCap_) return; // already fully provisioned
-    if (sz_ < static_cast<size_t>(cap_ * kPrezeroLoad)) return;  // not yet time
+void ViewTable::SlotIndex::maybePrezero(size_t sz) noexcept {
+    if (migrating) return; // finish the in-flight grow before provisioning the next one
+    const size_t nc = cap * 2;
+    if (prezeroCap == nc && prezeroCur >= prezeroCap) return; // already fully provisioned
+    if (sz < static_cast<size_t>(cap * kPrezeroLoad)) return;  // not yet time
 
     const uint64_t t0 = nowNs();
 
-    if (prezeroCap_ != nc) {
+    if (prezeroCap != nc) {
         // (Re)start provisioning for the NEXT grow generation. reserve()
         // only claims raw address space (a single fast, non-zeroing
         // allocation) — the expensive part, actually ZEROING nc entries,
         // happens incrementally below, kPrezero at a time, spread across
         // many put()/erase() calls instead of paid in one lump sum here.
-        nextTags_.clear();    nextTags_.reserve(nc);
-        nextKeys_.clear();    nextKeys_.reserve(nc);
-        nextRid_buf_.clear(); nextRid_buf_.reserve(nc);
-        prezeroCap_ = nc;
-        prezeroCur_ = 0;
+        nextTags.clear(); nextTags.reserve(nc);
+        nextKeys.clear(); nextKeys.reserve(nc);
+        nextRid.clear();  nextRid.reserve(nc);
+        prezeroCap = nc;
+        prezeroCur = 0;
     }
 
-    const size_t remain = prezeroCap_ - prezeroCur_;
+    const size_t remain = prezeroCap - prezeroCur;
     const size_t slice  = remain < kPrezero ? remain : kPrezero;
-    nextTags_.insert(nextTags_.end(), slice, kEmpty);
-    nextKeys_.insert(nextKeys_.end(), slice, uint64_t{0});
-    nextRid_buf_.insert(nextRid_buf_.end(), slice, uint32_t{0});
-    prezeroCur_ += slice;
+    nextTags.insert(nextTags.end(), slice, kEmpty);
+    nextKeys.insert(nextKeys.end(), slice, uint64_t{0});
+    nextRid.insert(nextRid.end(), slice, uint32_t{0});
+    prezeroCur += slice;
 
     const double ns = static_cast<double>(nowNs() - t0);
-    if (ns > maxRehashNs_) maxRehashNs_ = ns;
+    if (ns > maxRehashNs) maxRehashNs = ns;
 }
 
-void ViewTable::startGrow() {
+void ViewTable::SlotIndex::startGrow() {
     const uint64_t t0 = nowNs();
 
-    ot_.swap(tags_); ok_.swap(keys_); orid_.swap(rid_);
-    ocap_ = cap_; omask_ = mask_; ocur_ = 0; migrating_ = true;
+    ot.swap(tags); ok.swap(keys); orid.swap(rid);
+    ocap = cap; omask = mask; ocur = 0; migrating = true;
 
-    const size_t nc = cap_ * 2;
-    if (prezeroCap_ == nc && prezeroCur_ >= prezeroCap_) {
+    const size_t nc = cap * 2;
+    if (prezeroCap == nc && prezeroCur >= prezeroCap) {
         // Pre-provisioning finished in time: O(1) swap, no zero-fill here.
-        tags_.swap(nextTags_);
-        keys_.swap(nextKeys_);
-        rid_.swap(nextRid_buf_);
+        tags.swap(nextTags);
+        keys.swap(nextKeys);
+        rid.swap(nextRid);
     } else {
         // The write burst outran pre-provisioning: finish the zero-fill
         // inline right now (the bounded fallback) and count it.
-        tags_.assign(nc, kEmpty);
-        keys_.assign(nc, 0);
-        rid_.assign(nc, 0);
-        ++fallbacks_;
+        tags.assign(nc, kEmpty);
+        keys.assign(nc, 0);
+        rid.assign(nc, 0);
+        ++fallbacks;
     }
 
     // Whatever was (partially) provisioned belonged to this just-consumed
-    // generation. The NEXT grow (cap_ is now nc) provisions its own next
+    // generation. The NEXT grow (cap is now nc) provisions its own next
     // buffer from scratch once load crosses kPrezeroLoad again.
-    nextTags_.clear();    nextTags_.shrink_to_fit();
-    nextKeys_.clear();    nextKeys_.shrink_to_fit();
-    nextRid_buf_.clear(); nextRid_buf_.shrink_to_fit();
-    prezeroCap_ = 0;
-    prezeroCur_ = 0;
+    nextTags.clear(); nextTags.shrink_to_fit();
+    nextKeys.clear(); nextKeys.shrink_to_fit();
+    nextRid.clear();  nextRid.shrink_to_fit();
+    prezeroCap = 0;
+    prezeroCur = 0;
 
-    cap_  = nc;
-    mask_ = nc - 1;
+    cap  = nc;
+    mask = nc - 1;
 
     const double ns = static_cast<double>(nowNs() - t0);
-    if (ns > maxRehashNs_) maxRehashNs_ = ns;
+    if (ns > maxRehashNs) maxRehashNs = ns;
 }
 
-void ViewTable::migrateStep() noexcept {
-    if (!migrating_) return;
+void ViewTable::SlotIndex::migrateStep() noexcept {
+    if (!migrating) return;
     const uint64_t t0 = nowNs();
 
-    // Bounded on entries SCANNED (ocur_ advanced), not just entries MOVED:
+    // Bounded on entries SCANNED (ocur advanced), not just entries MOVED:
     // if the OLD index has been heavily churned (erase() during the
     // migration window tombstones OLD-only entries rather than moving
     // them), most slots here can be kEmpty/kTomb. Bounding only on "live
     // entries moved" would let a single call scan arbitrarily far through
-    // a mostly-dead OLD index (up to the full ocap_) looking for kMigK
+    // a mostly-dead OLD index (up to the full ocap) looking for kMigK
     // live ones to move — silently reintroducing an unbounded single-op
     // cost, which is exactly what incremental/de-amortized rehash exists
     // to prevent. Scanned-bound guarantees every call does O(kMigK) work,
-    // and the OLD index still fully drains in exactly ceil(ocap_/kMigK)
+    // and the OLD index still fully drains in exactly ceil(ocap/kMigK)
     // calls regardless of its live/dead mix.
     size_t scanned = 0;
-    while (scanned < kMigK && ocur_ < ocap_) {
-        const uint8_t t = ot_[ocur_];
+    while (scanned < kMigK && ocur < ocap) {
+        const uint8_t t = ot[ocur];
         if (t >= 0x80) { // live entry; kEmpty(0)/kTomb(1) are both < 0x80 (fullTag() is always >= 0x82)
-            const uint64_t k = ok_[ocur_];
-            size_t i = mix(k) & mask_;
-            for (size_t probes = 0; probes < cap_ && tags_[i] != kEmpty; ++probes) {
-                i = (i + 1) & mask_;
+            const uint64_t k = ok[ocur];
+            size_t i = home(k) & mask;
+            for (size_t probes = 0; probes < cap && tags[i] != kEmpty; ++probes) {
+                i = (i + 1) & mask;
             }
-            assert(tags_[i] == kEmpty && "ViewTable: migrateStep found no empty slot in NEW index");
-            tags_[i] = t;
-            keys_[i] = k;
-            rid_[i]  = orid_[ocur_];
+            assert(tags[i] == kEmpty && "ViewTable: migrateStep found no empty slot in NEW index");
+            tags[i] = t;
+            keys[i] = k;
+            rid[i]  = orid[ocur];
             // CRITICAL: tombstone the OLD slot now that this key lives in
             // NEW. findO() only stops its probe at a true kEmpty, so a
             // migrated-but-not-tombstoned OLD slot stays matchable for the
@@ -259,56 +293,74 @@ void ViewTable::migrateStep() noexcept {
             // migrating would hit this stale OLD "ghost" entry in findO()
             // and treat it as an idempotent update of an existing key,
             // silently dropping the reinsertion (no write to
-            // tags_/keys_/rid_, no ++sz_) and permanently losing the key
+            // tags/keys/rid, no ++sz_) and permanently losing the key
             // once OLD is later freed. kTomb does not terminate findO's
             // probe (so later, not-yet-migrated keys in this OLD probe
             // chain are still reachable), but it does stop this slot from
             // ever matching again.
-            ot_[ocur_] = kTomb;
+            ot[ocur] = kTomb;
         }
-        ++ocur_;
+        ++ocur;
         ++scanned;
     }
 
-    if (ocur_ >= ocap_) {
-        migrating_ = false;
-        ot_.clear();   ot_.shrink_to_fit();
-        ok_.clear();   ok_.shrink_to_fit();
-        orid_.clear(); orid_.shrink_to_fit();
-        ocap_ = 0; omask_ = 0; ocur_ = 0;
+    if (ocur >= ocap) {
+        migrating = false;
+        ot.clear();   ot.shrink_to_fit();
+        ok.clear();   ok.shrink_to_fit();
+        orid.clear(); orid.shrink_to_fit();
+        ocap = 0; omask = 0; ocur = 0;
     }
 
     const double ns = static_cast<double>(nowNs() - t0);
-    if (ns > maxRehashNs_) maxRehashNs_ = ns;
+    if (ns > maxRehashNs) maxRehashNs = ns;
 }
 
 uint8_t* ViewTable::put(uint64_t key) {
-    maybePrezero();
-    if (migrating_) {
+    assert(keyWidth_ <= 8 && prefixWidth_ == 0);
+    return putImpl(probeOf(key));
+}
+uint8_t* ViewTable::put(const ViewKey& key) { return putImpl(probeOf(key)); }
+
+const uint8_t* ViewTable::get(uint64_t key) const noexcept {
+    assert(keyWidth_ <= 8 && prefixWidth_ == 0);
+    return getImpl(probeOf(key));
+}
+const uint8_t* ViewTable::get(const ViewKey& key) const noexcept { return getImpl(probeOf(key)); }
+
+bool ViewTable::erase(uint64_t key) noexcept {
+    assert(keyWidth_ <= 8 && prefixWidth_ == 0);
+    return eraseImpl(probeOf(key));
+}
+bool ViewTable::erase(const ViewKey& key) noexcept { return eraseImpl(probeOf(key)); }
+
+uint8_t* ViewTable::putImpl(const Probe& p) {
+    main_.maybePrezero(sz_);
+    if (main_.migrating) {
         // Deferring the grow-check while already migrating is safe: NEW
         // was sized to 2x the OLD capacity that triggered this migration,
         // so even in the worst case (every op during the whole drain
         // window is a brand-new distinct key) the window closes within
-        // ceil(ocap_/kMigK) ops — far too few new keys to approach NEW's
+        // ceil(ocap/kMigK) ops — far too few new keys to approach NEW's
         // own 0.85 threshold before migrateStep() finishes draining OLD
         // and the next startGrow() becomes eligible again.
-        migrateStep();
-    } else if (sz_ + 1 > static_cast<size_t>(cap_ * kGrowLoad)) {
-        startGrow();
+        main_.migrateStep();
+    } else if (sz_ + 1 > static_cast<size_t>(main_.cap * kGrowLoad)) {
+        main_.startGrow();
     }
 
-    const size_t pi = findP(key);
+    const size_t pi = findP(p);
     if (pi != static_cast<size_t>(-1)) {
-        const uint32_t rid = rid_[pi];
-        dirtyKeys_[rid] = key;
+        const uint32_t rid = main_.rid[pi];
+        dirtyKeys_[rid] = p.word;
         markDirty(rid);
         return rowAddr(rid); // idempotent upsert: existing key in NEW/primary, no dup
     }
-    if (migrating_) {
-        const size_t oi = findO(key);
+    if (main_.migrating) {
+        const size_t oi = findO(p);
         if (oi != static_cast<size_t>(-1)) {
-            const uint32_t rid = orid_[oi];
-            dirtyKeys_[rid] = key;
+            const uint32_t rid = main_.orid[oi];
+            dirtyKeys_[rid] = p.word;
             markDirty(rid);
             return rowAddr(rid); // idempotent upsert: existing key still only in OLD
         }
@@ -329,49 +381,50 @@ uint8_t* ViewTable::put(uint64_t key) {
         rid = nextRid_++;
     }
 
-    const uint64_t h  = mix(key);
-    const uint8_t  ft = fullTag(h);
-    size_t i = h & mask_;
-    // Hard-bounded (never loops more than cap_ times, even in a release
+    const uint8_t  ft = fullTag(p.h);
+    size_t i = p.h & main_.mask;
+    // Hard-bounded (never loops more than cap times, even in a release
     // build with asserts compiled out): the load-factor policy above
     // guarantees an empty slot exists, but this guards against ever
     // spinning forever instead of just corrupting state if that invariant
     // is somehow broken.
-    for (size_t probes = 0; probes < cap_ && tags_[i] != kEmpty; ++probes) {
-        i = (i + 1) & mask_;
+    for (size_t probes = 0; probes < main_.cap && main_.tags[i] != kEmpty; ++probes) {
+        i = (i + 1) & main_.mask;
     }
-    assert(tags_[i] == kEmpty && "ViewTable: primary index unexpectedly full (load-factor invariant broken)");
-    tags_[i] = ft;
-    keys_[i] = key;
-    rid_[i]  = rid;
+    assert(main_.tags[i] == kEmpty && "ViewTable: primary index unexpectedly full (load-factor invariant broken)");
+    main_.tags[i] = ft;
+    main_.keys[i] = p.word;
+    main_.rid[i]  = rid;
 
     uint8_t* row = rowAddr(rid);
+    if (p.wideKey) std::memcpy(row - headerLen_, p.wideKey, headerLen_);
     std::fill(row, row + layout_.rowLen, uint8_t{0});
     ++sz_;
-    dirtyKeys_[rid] = key;
+    dirtyKeys_[rid] = p.word;
     markDirty(rid);
+    if (prefixWidth_) prefixInsert(p, rid);
     return row;
 }
 
-const uint8_t* ViewTable::get(uint64_t key) const noexcept {
-    const size_t pi = findP(key);
-    if (pi != static_cast<size_t>(-1)) return rowAddr(rid_[pi]);
-    if (migrating_) {
-        const size_t oi = findO(key);
-        if (oi != static_cast<size_t>(-1)) return rowAddr(orid_[oi]);
+const uint8_t* ViewTable::getImpl(const Probe& p) const noexcept {
+    const size_t pi = findP(p);
+    if (pi != static_cast<size_t>(-1)) return rowAddr(main_.rid[pi]);
+    if (main_.migrating) {
+        const size_t oi = findO(p);
+        if (oi != static_cast<size_t>(-1)) return rowAddr(main_.orid[oi]);
     }
     return nullptr;
 }
 
-bool ViewTable::erase(uint64_t key) noexcept {
-    maybePrezero();
-    if (migrating_) migrateStep();
+bool ViewTable::eraseImpl(const Probe& p) noexcept {
+    main_.maybePrezero(sz_);
+    if (main_.migrating) main_.migrateStep();
 
-    const size_t pi = findP(key);
+    const size_t pi = findP(p);
     if (pi != static_cast<size_t>(-1)) {
-        const uint32_t rid = rid_[pi];
+        const uint32_t rid = main_.rid[pi];
         free_.push_back(rid);
-        backshiftPrimary(pi);
+        main_.backshift(pi);
         --sz_;
         // The row at `rid` no longer exists: clear any pending dirty bit
         // (drainDirty()'s dirtyList_ loop guards on dirty_[rid] still being
@@ -379,26 +432,220 @@ bool ViewTable::erase(uint64_t key) noexcept {
         // skipped) and record the delete tombstone -- keyed, since a
         // delete has no row for the checkpoint fold to copy.
         dirty_[rid] = 0;
-        deleted_.push_back({rid, key});
+        deleted_.push_back({rid, p.word});
+        if (p.wideKey) deletedKeyBytes_.insert(deletedKeyBytes_.end(), p.wideKey, p.wideKey + headerLen_);
+        if (prefixWidth_) prefixErase(p, rid);
         return true;
     }
 
-    if (migrating_) {
-        const size_t oi = findO(key);
+    if (main_.migrating) {
+        const size_t oi = findO(p);
         if (oi != static_cast<size_t>(-1)) {
-            const uint32_t rid = orid_[oi];
+            const uint32_t rid = main_.orid[oi];
             free_.push_back(rid);
             // OLD is draining, not steady-state: tombstone rather than
             // backward-shift. migrateStep() skips kTomb entries (< 0x80)
             // when it later walks past this slot.
-            ot_[oi] = kTomb;
+            main_.ot[oi] = kTomb;
             --sz_;
             dirty_[rid] = 0;
-            deleted_.push_back({rid, key});
+            deleted_.push_back({rid, p.word});
+            if (p.wideKey) deletedKeyBytes_.insert(deletedKeyBytes_.end(), p.wideKey, p.wideKey + headerLen_);
+            if (prefixWidth_) prefixErase(p, rid);
             return true;
         }
     }
     return false;
+}
+
+// --- the prefix index -----------------------------------------------------------------------------------------
+
+uint32_t ViewTable::findSetHashed(uint64_t h, const uint8_t* prefix) const noexcept {
+    const uint8_t ft = fullTag(h);
+    size_t i = h & outer_.mask;
+    for (size_t probes = 0; probes < outer_.cap; ++probes) {
+        const uint8_t t = outer_.tags[i];
+        if (t == kEmpty) break;
+        if (t == ft && outer_.keys[i] == h && std::memcmp(setPrefix(outer_.rid[i]), prefix, prefixWidth_) == 0) return outer_.rid[i];
+        i = (i + 1) & outer_.mask;
+    }
+    if (!outer_.migrating) return kNoSet;
+    i = h & outer_.omask;
+    for (size_t probes = 0; probes < outer_.ocap; ++probes) {
+        const uint8_t t = outer_.ot[i];
+        if (t == kEmpty) break;
+        if (t == ft && outer_.ok[i] == h && std::memcmp(setPrefix(outer_.orid[i]), prefix, prefixWidth_) == 0) return outer_.orid[i];
+        i = (i + 1) & outer_.omask;
+    }
+    return kNoSet;
+}
+
+uint32_t ViewTable::findSet(std::span<const uint8_t> prefix) const noexcept {
+    if (prefix.size() != prefixWidth_ || outerCount_ == 0) return kNoSet;
+    return findSetHashed(viewKeyHash(prefix, hashSeed_) & hashMask_, prefix.data());
+}
+
+void ViewTable::appendPoolChunk(uint8_t cls) {
+    const size_t blockSlots = size_t{16} << cls;
+    size_t slots = chunkBytes_ / 8 / kSlotBytes;
+    slots -= slots % blockSlots;
+    if (slots == 0) slots = blockSlots;
+    PoolChunk chunk{std::unique_ptr<uint8_t[]>(new uint8_t[slots]()), std::unique_ptr<uint64_t[]>(new uint64_t[slots]),
+                    std::unique_ptr<uint32_t[]>(new uint32_t[slots])};
+    const size_t count = slots / blockSlots;
+    const uint32_t first = static_cast<uint32_t>(blocks_.size());
+    blocks_.reserve(first + count);
+    blockClass_.reserve(first + count);
+    blockFree_[cls].reserve(blockFree_[cls].size() + count);
+    for (size_t b = 0; b < count; ++b) {
+        blocks_.push_back({chunk.tags.get() + b * blockSlots, chunk.words.get() + b * blockSlots, chunk.rids.get() + b * blockSlots});
+        blockClass_.push_back(cls);
+    }
+    for (size_t b = count; b-- > 0;) blockFree_[cls].push_back(first + static_cast<uint32_t>(b));
+    poolBytes_ += slots * kSlotBytes;
+    poolChunks_.push_back(std::move(chunk));
+}
+
+uint32_t ViewTable::allocBlock(uint8_t cls) {
+    if (blockFree_[cls].empty()) appendPoolChunk(cls);
+    const uint32_t id = blockFree_[cls].back();
+    blockFree_[cls].pop_back();
+    return id;
+}
+
+void ViewTable::startSetMigration(PrefixSet& s, uint8_t cls) {
+    s.oldBlock  = s.block;
+    s.block     = allocBlock(cls);
+    s.cursor    = 0;
+    s.migrating = true;
+}
+
+// Drains up to kSetMigrate slots of the set's old block into its new one.  The old block stays a valid hash table
+// (each moved entry is backshift-deleted), so lookups can probe it until it is empty and freed.
+void ViewTable::migrateSet(PrefixSet& s, size_t& budget, uint32_t& moved) noexcept {
+    const SetBlock nb = blockOf(s.block);
+    const SetBlock ob = blockOf(s.oldBlock);
+    const auto home = [this](uint64_t w) { return hashOfWord(w); };
+    for (; budget && s.cursor < ob.cap; --budget) {
+        const size_t c = s.cursor;
+        if (ob.tags[c] == kEmpty) {
+            ++s.cursor;
+            continue;
+        }
+        size_t i = home(ob.words[c]) & (nb.cap - 1);
+        while (nb.tags[i] != kEmpty) i = (i + 1) & (nb.cap - 1);
+        nb.tags[i]  = ob.tags[c];
+        nb.words[i] = ob.words[c];
+        nb.rids[i]  = ob.rids[c];
+        ++moved;
+        backshiftDelete(ob.tags, ob.words, ob.rids, ob.cap - 1, c, home);
+    }
+    if (s.cursor >= ob.cap) {
+        freeBlock(s.oldBlock);
+        s.migrating = false;
+    }
+}
+
+void ViewTable::prefixInsert(const Probe& p, uint32_t rid) {
+    const uint8_t* prefix = prefixBytesOf(p);
+    const uint64_t ph = viewKeyHash({prefix, prefixWidth_}, hashSeed_) & hashMask_;
+    uint32_t id = findSetHashed(ph, prefix);
+    if (id == kNoSet) {
+        outer_.maybePrezero(outerCount_);
+        if (outer_.migrating) outer_.migrateStep();
+        else if (outerCount_ + 1 > static_cast<size_t>(outer_.cap * kGrowLoad)) outer_.startGrow();
+        if (!setFree_.empty()) {
+            id = setFree_.back();
+            setFree_.pop_back();
+        } else {
+            id = static_cast<uint32_t>(sets_.size());
+            sets_.emplace_back();
+            setPrefixBytes_.resize(sets_.size() * prefixWidth_);
+        }
+        std::memcpy(setPrefixBytes_.data() + size_t{id} * prefixWidth_, prefix, prefixWidth_);
+        sets_[id] = PrefixSet{};
+        sets_[id].block = allocBlock(0);
+        size_t i = ph & outer_.mask;
+        while (outer_.tags[i] != kEmpty) i = (i + 1) & outer_.mask;
+        outer_.tags[i] = fullTag(ph);
+        outer_.keys[i] = ph;
+        outer_.rid[i]  = id;
+        ++outerCount_;
+    }
+
+    PrefixSet& s = sets_[id];
+    size_t budget = kSetMigrate;
+    uint32_t moved = 0;
+    if (s.migrating) {
+        migrateSet(s, budget, moved);
+    } else if (s.size + 1 > static_cast<size_t>(blockOf(s.block).cap * kGrowLoad)) {
+        startSetMigration(s, static_cast<uint8_t>(blockClass_[s.block] + 1));
+        migrateSet(s, budget, moved);
+    }
+    maxSetMoved_ = std::max(maxSetMoved_, moved);
+    const SetBlock b = blockOf(s.block);
+    size_t i = p.h & (b.cap - 1);
+    while (b.tags[i] != kEmpty) i = (i + 1) & (b.cap - 1);
+    b.tags[i]  = fullTag(p.h);
+    b.words[i] = p.word;
+    b.rids[i]  = rid;
+    ++s.size;
+    s.version = ++versionClock_;
+}
+
+void ViewTable::prefixErase(const Probe& p, uint32_t rid) noexcept {
+    const uint8_t* prefix = prefixBytesOf(p);
+    const uint64_t ph = viewKeyHash({prefix, prefixWidth_}, hashSeed_) & hashMask_;
+    const uint32_t id = findSetHashed(ph, prefix);
+    assert(id != kNoSet && "ViewTable: row without a prefix set");
+    PrefixSet& s = sets_[id];
+    size_t budget = kSetMigrate;
+    uint32_t moved = 0;
+    if (s.migrating) migrateSet(s, budget, moved);
+
+    const uint8_t ft = fullTag(p.h);
+    const auto home = [this](uint64_t w) { return hashOfWord(w); };
+    const auto slotOf = [&](const SetBlock& b) {
+        size_t i = p.h & (b.cap - 1);
+        for (size_t probes = 0; probes < b.cap && b.tags[i] != kEmpty; ++probes) {
+            if (b.tags[i] == ft && b.words[i] == p.word && b.rids[i] == rid) return i;
+            i = (i + 1) & (b.cap - 1);
+        }
+        return static_cast<size_t>(-1);
+    };
+    const SetBlock b = blockOf(s.block);
+    if (const size_t i = slotOf(b); i != static_cast<size_t>(-1)) {
+        backshiftDelete(b.tags, b.words, b.rids, b.cap - 1, i, home);
+    } else {
+        assert(s.migrating && "ViewTable: row missing from its prefix set");
+        const SetBlock ob = blockOf(s.oldBlock);
+        backshiftDelete(ob.tags, ob.words, ob.rids, ob.cap - 1, slotOf(ob), home);
+    }
+    --s.size;
+    s.version = ++versionClock_;
+
+    if (s.size == 0) {
+        // Both blocks are empty here: a deleted entry leaves no tombstone.
+        freeBlock(s.block);
+        if (s.migrating) freeBlock(s.oldBlock);
+        outer_.maybePrezero(outerCount_);
+        if (outer_.migrating) outer_.migrateStep();
+        size_t i = ph & outer_.mask;
+        while (outer_.tags[i] != kEmpty && outer_.rid[i] != id) i = (i + 1) & outer_.mask;
+        if (outer_.tags[i] != kEmpty) {
+            outer_.backshift(i);
+        } else {
+            i = ph & outer_.omask;
+            while (outer_.ot[i] < 0x80 || outer_.orid[i] != id) i = (i + 1) & outer_.omask;
+            outer_.ot[i] = kTomb;
+        }
+        --outerCount_;
+        setFree_.push_back(id);
+    } else if (!s.migrating && blockClass_[s.block] > 0 && size_t{s.size} * 8 < b.cap) {
+        startSetMigration(s, static_cast<uint8_t>(blockClass_[s.block] - 1));
+        migrateSet(s, budget, moved);
+    }
+    maxSetMoved_ = std::max(maxSetMoved_, moved);
 }
 
 } // namespace rune::view

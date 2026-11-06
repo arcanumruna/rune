@@ -1,51 +1,16 @@
 // libs/view/include/rune/view/ViewPlan.h
 #pragma once
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
 #include <vector>
 #include <rune/codec/PrimType.h>
+#include <rune/codec/ViewPlanAuthored.h>
 #include <rune/view/ViewTypes.h>
 
 namespace rune::view {
-
-// WITH-clause sizing knobs for a materialized view (§10/§15 #24). Carried on
-// both the authored (ViewPlan) and compiled (CompiledViewPlan) forms so the
-// compiler (Task 9) can pass them through unchanged.
-struct ViewSizing {
-    uint32_t chunkBytes = 32u << 20;  // ring/table chunk size, bytes
-    uint32_t capacity    = 0;          // 0 = default pre-size
-    uint64_t maxRows     = 0;          // 0 = unbounded
-};
-
-// One output field as authored (names, not resolved ids). `sourceIdx` indexes
-// into ViewPlan::sources; `srcField` is the upstream field name to resolve.
-struct AuthoredField {
-    std::string name;
-    rune::codec::PrimType type;
-    uint16_t sourceIdx;
-    std::string srcField;
-    MergeRule rule;
-};
-
-// One upstream source topic as authored (by name/topicId plus its key field
-// name, to be resolved against that topic's schema by the compiler).
-struct SourceSpec {
-    int32_t topicId;
-    std::string keyField;
-};
-
-// The authoring form of a view definition: what a `CreateView` statement
-// produces before compilation. Carried as the wire `planBlob`.
-struct ViewPlan {
-    std::string viewName;
-    std::string key;
-    std::vector<SourceSpec> sources;
-    std::vector<AuthoredField> output;
-    uint8_t persistence = 0;  // 0 = persisted, 1 = transient
-    ViewSizing sizing;
-};
 
 // One resolved output field: field ids instead of names, output slot assigned.
 struct CompiledField {
@@ -54,6 +19,31 @@ struct CompiledField {
     uint16_t sourceIdx;
     uint16_t srcFieldId;
     MergeRule rule;
+};
+
+// One compiled key component. `type` is the source column type (FixedStr for lower()), `width` the encoded bytes,
+// `outSlot` the view's key column; a lower() key column carries kDerivedKeyField as its srcFieldId.
+struct CompiledKeyComponent {
+    uint16_t srcFieldId;
+    uint8_t keyFunction;
+    uint16_t width;
+    uint16_t outSlot;
+    rune::codec::PrimType type;
+};
+
+// One resolved predicate node: a Column node carries the output slot it reads.
+struct CompiledPredicateNode {
+    PredicateOp op;
+    uint16_t a = 0, b = 0;
+    uint16_t outSlot = 0;
+    rune::codec::PrimType constType{};
+    std::array<uint8_t, 16> constBytes{};
+};
+
+struct CompiledConstraint {
+    uint16_t ordinal;   // 1..n in declaration order
+    std::string name;
+    std::vector<CompiledPredicateNode> predicate;
 };
 
 // The compiled form of a view definition: names resolved to ids, ready for
@@ -68,16 +58,32 @@ struct CompiledViewPlan {
     std::vector<CompiledField> output;
     uint8_t persistence = 0;  // 0 = persisted, 1 = transient
     ViewSizing sizing;
+    // v2. A v1 blob decodes with one synthesized component over keyFieldId[0].
+    std::vector<CompiledKeyComponent> keyComponents;
+    uint16_t keyWidth = 8;
+    bool unique = false;
+    std::vector<CompiledConstraint> constraints;
+    uint32_t unicodeVersion = 0;
+    uint64_t viewObjectId = 0;
 };
+
+// How a view's table is keyed: the uint64_t table every view has today, or a ViewKey table of keyWidth bytes.
+enum class ViewKeyMode : uint8_t { LegacyU64, Keyed };
+
+[[nodiscard]] ViewKeyMode keyModeOf(const CompiledViewPlan& plan) noexcept;
+// A keyed projection whose key is not exactly the source key keeps an owner map.
+[[nodiscard]] bool ownerMappedOf(const CompiledViewPlan& plan) noexcept;
+// Encoded width of the first n-1 key components when n >= 2, else 0: the width of the prefix index.
+[[nodiscard]] uint16_t prefixWidthOf(const CompiledViewPlan& plan) noexcept;
+// True when the plan cannot be expressed in the v1 layout (the synthesized component does not count).
+[[nodiscard]] bool needsV2(const CompiledViewPlan& plan) noexcept;
 
 // Flat little-endian (de)serialization. Both forms lead with a 1-byte
 // VERSION for forward-compat and length-prefix strings/vectors with a u32
-// count. Deserialization bounds-checks every read and returns std::nullopt
-// on any truncation/overrun/bad-version -- never reads out of bounds.
+// count. serialize writes v1 whenever needsV2 is false. Deserialization
+// bounds-checks every read and returns std::nullopt on any truncation/
+// overrun/bad-version/trailing byte -- never reads out of bounds.
 std::vector<uint8_t> serialize(const CompiledViewPlan& plan);
 std::optional<CompiledViewPlan> deserializeCompiledViewPlan(std::span<const uint8_t> buf);
-
-std::vector<uint8_t> serializeAuthored(const ViewPlan& plan);
-std::optional<ViewPlan> deserializeAuthored(std::span<const uint8_t> buf);
 
 } // namespace rune::view

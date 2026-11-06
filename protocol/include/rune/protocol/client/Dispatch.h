@@ -64,7 +64,10 @@ struct FrameCheck {
 //   view            64-95  (DefineTopic=64..TopicSchemaResponse=67; AlterTopic=68, AlterTopicResponse=69;
 //                            CreateView=70, CreateViewResponse=71, GetViewRow=72, ViewRowResponse=73;
 //                            catalog history: DropTopic=74, AlterTopicConfig=75, DropView=76,
-//                            AlterView=77, DdlResponse=78; SecurityDdl=79, SecurityBootstrap=80; 81-95 gap → UnknownTemplate)
+//                            AlterView=77, DdlResponse=78; SecurityDdl=79, SecurityBootstrap=80;
+//                            namespaces NamespaceDdl=81..NamespaceUsageResponse=85; WorkerBind=86 (WorkerBindAck=87 is
+//                            broker -> client only, unknown here); GetViewRowK=88, ScanViewRows=89,
+//                            ScanViewRowsResponse=90; 91-95 gap → UnknownTemplate)
 //
 // Extend this function when future tickets add template ids.
 // ---------------------------------------------------------------------------
@@ -114,9 +117,14 @@ struct FrameCheck {
         tid <= static_cast<uint16_t>(TemplateId::NamespaceUsageResponse)) {
         return true;
     }
-    // NAT-safe egress (client version 16): WorkerBind = 86 (88-95 gap -> UnknownTemplate).
+    // NAT-safe egress (client version 16): WorkerBind = 86.
     // WorkerBindAck = 87 is broker -> client only: it stays UNKNOWN here (ingress), the client recognizes it by id.
     if (tid == static_cast<uint16_t>(TemplateId::WorkerBind)) return true;
+    // checked writes (client version 17): GetViewRowK = 88 .. ScanViewRowsResponse = 90 (91-95 gap -> UnknownTemplate)
+    if (tid >= static_cast<uint16_t>(TemplateId::GetViewRowK) &&
+        tid <= static_cast<uint16_t>(TemplateId::ScanViewRowsResponse)) {
+        return true;
+    }
     return false;
 }
 
