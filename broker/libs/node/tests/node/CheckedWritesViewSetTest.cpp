@@ -279,6 +279,21 @@ TEST(CheckedWritesViewSet, ScanStatuses) {
     EXPECT_EQ(legacy.scan(beKey({1})).status, Status::kInvalidRequest);
 }
 
+TEST(CheckedWritesViewSetRegression, ScanOfAnInstanceNotHostedIsNotAnEmptyPageRegression) {
+    KeyedRig r;
+    r.install(accountCharacters(r.src));
+    r.log.append(userRows(42, 1, 3));
+    r.fold();
+    const rune::view::RowLayout* layout = nullptr;
+    WorkerViewSet::RowStatus st{};
+    EXPECT_EQ(r.vs.getRowK(kViewTopic, 7, beKey({42, 1}), layout, &st), nullptr);
+    EXPECT_EQ(st, WorkerViewSet::RowStatus::NotFound);
+    EXPECT_EQ(r.vs.scanPage(kViewTopic, 7, beKey({42}), {}, 0, r.out).status, Status::kAbsentKey);
+    const std::vector<uint8_t> token(rune::view::kScanTokenBytes, 0);
+    EXPECT_EQ(r.vs.scanPage(kViewTopic, 7, beKey({42}), token, 0, r.out).status, Status::kAbsentKey);
+    EXPECT_EQ(r.scan(beKey({42})).status, Status::kOk);
+}
+
 TEST(CheckedWritesViewSetRegression, FixedSeedHookReachesEveryTableRegression) {
     KeyedRig r(7);
     EXPECT_EQ(r.vs.hashSeedForTest(), 7u);

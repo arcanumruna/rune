@@ -882,8 +882,8 @@ WorkerViewSet::ScanPage WorkerViewSet::scanPage(int32_t viewTopicId, int32_t par
     const rune::view::RowLayout* layout = nullptr;
     RowStatus st{};
     if (serveInstance_(viewTopicId, partition, layout, &st) == nullptr) {
-        // No instance yet and none coming from a recovery: nothing is stored under any prefix.
-        page.status = st != RowStatus::NotFound ? Status::kNotReady : resumeToken.empty() ? Status::kOk : Status::kCursorInvalidated;
+        // As GetViewRowK: an instance this broker does not host is not an empty page.
+        page.status = st != RowStatus::NotFound ? Status::kNotReady : Status::kAbsentKey;
         return page;
     }
     ViewInstance& inst = views_.find(instKey(viewTopicId, partition))->second;

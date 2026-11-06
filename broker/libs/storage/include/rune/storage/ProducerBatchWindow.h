@@ -36,7 +36,7 @@
 
 namespace rune::storage {
 
-/// The wire key's bytes packed little-endian; the caller checked the width (at most 8).  The key index keys its table by it too.
+/// The wire key's bytes packed little-endian; the caller checked the width (at most 8).  The key index itself keys by the full key (up to kMaxTopicKeyBytes).
 [[nodiscard]] inline uint64_t keyIndexWord(std::string_view wireKey) noexcept {
     uint64_t w = 0;
     for (std::size_t i = 0; i < wireKey.size(); ++i) w |= static_cast<uint64_t>(static_cast<uint8_t>(wireKey[i])) << (8 * i);

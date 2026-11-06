@@ -3,6 +3,7 @@
 // A view row's key as bytes.  Part 07 widens the tables; until then a key of at most 8 bytes maps to the uint64_t API.
 #pragma once
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,8 @@
 namespace rune::view {
 
 inline constexpr std::size_t kMaxViewKeyBytes = rune::codec::kMaxViewKeyBytes;
+
+static_assert(std::endian::native == std::endian::little, "narrow integer keys are copied into key bytes in memory order");
 
 struct ViewKey {
     std::array<uint8_t, kMaxViewKeyBytes> bytes{};

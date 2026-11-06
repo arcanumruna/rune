@@ -529,7 +529,7 @@ private:
     // markDirty() only takes a rid per its public signature) so
     // drainDirty() can emit `key` for upserts too, not just deletes.
     std::vector<uint8_t>  dirty_;
-    std::vector<uint64_t> dirtyKeys_;
+    std::vector<uint64_t> dirtyKeys_;   // TODO: on a wide table this holds the hashed slot word, not the key; do not consume it
     std::vector<uint32_t> dirtyList_; // rids marked dirty this interval, each pushed once (coalesced)
 
     struct DeletedEntry { uint32_t rid; uint64_t key; };
