@@ -534,6 +534,14 @@ if(BUILD_BENCHMARKS)
     target_link_libraries(NamespaceHotPathBench PRIVATE rune_storage rune_replication rune_transaction rune_node rune_view rune_codec
                           benchmark::benchmark)
 
+    # QlPlanBench: the QL planner, from the same ql/ sources the embedded client builds (which is absent without BUILD_TESTING).
+    if(NOT TARGET rune_ql)
+        file(GLOB RUNE_QL_SRCS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../ql/src/*.cpp)
+        add_library(rune_ql STATIC ${RUNE_QL_SRCS})
+        target_include_directories(rune_ql PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../ql/include ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_ql PUBLIC rune_codec)
+        target_compile_features(rune_ql PUBLIC cxx_std_23)
+    endif()
     add_executable(rune_broker_benchmark
         benchmark/BenchmarkMain.cpp
         benchmark/StorageBenchmark.cpp
@@ -579,6 +587,7 @@ if(BUILD_BENCHMARKS)
         benchmark/ViewCheckpointBench.cpp
         benchmark/ViewFoldSourceBench.cpp
         benchmark/GetViewRowServeBench.cpp
+        benchmark/QlPlanBench.cpp
         benchmark/CatalogBootReplayBench.cpp
         benchmark/CatalogHotPathBench.cpp
         benchmark/AuthCheckBench.cpp
@@ -593,7 +602,7 @@ if(BUILD_BENCHMARKS)
     target_include_directories(rune_broker_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/tests/support)
     # CatalogBootLog.h (support/) includes "support/TestNodeConfig.h".
     target_include_directories(rune_broker_benchmark PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/node/tests)
-    target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway rune_node rune_metadata_msm rune_dynamic_balancer rune_view benchmark::benchmark)
+    target_link_libraries(rune_broker_benchmark PRIVATE rune_storage rune_consensus rune_replication rune_coordination rune_transaction rune_gateway rune_node rune_metadata_msm rune_dynamic_balancer rune_view rune_ql benchmark::benchmark)
     target_include_directories(rune_broker_benchmark PRIVATE ${RUNE_NODE_INCLUDE})
     if(aeron_FOUND)
         target_link_libraries(rune_broker_benchmark PRIVATE aeron::aeron)

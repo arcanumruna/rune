@@ -222,6 +222,49 @@ static void BM_GetViewRowServe(benchmark::State& state) {
 BENCHMARK(BM_GetViewRowServe)->Unit(benchmark::kNanosecond)->MinTime(0.5);
 
 
+// Checked writes Part 08: the same worker loop with GetStats ops, a topic partition (scope 1) or a view partition (scope 2).
+// Reported (no gate beyond every answer OK); ns_per_read is the wall time per answered op.
+static void runStatsServe(benchmark::State& state, int32_t scope, int32_t objectId) {
+    ServeFixture f;
+    if (!f.warm()) { state.SkipWithError("the view never served the warm-up rows"); return; }
+    int64_t reads = 0, bad = 0;
+    g_allocCount.store(0);
+    g_allocEnabled.store(true, std::memory_order_release);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (auto _ : state) {
+        for (int i = 0; i < kBatch; ++i) {
+            WorkerOp op;
+            op.type = WorkerOp::Type::GetStats; op.topicId = objectId; op.partition = 0;
+            op.sessionId = 1; op.correlationId = ++f.corr; op.recordCount = scope;
+            while (!f.worker->tryEnqueueOp(std::move(op))) f.pass();
+        }
+        int got = 0;
+        for (int p = 0; p < 64 && got < kBatch; ++p) {
+            f.pass();
+            f.worker->drainReturnView([&](WorkerReturn&& r) {
+                ++got;
+                if (r.errorCode != 0) ++bad;
+            });
+        }
+        reads += got;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    g_allocEnabled.store(false, std::memory_order_release);
+    const int64_t allocs = g_allocCount.load(std::memory_order_acquire);
+    const double ns = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    state.SetItemsProcessed(reads);
+    state.counters["ns_per_read"]   = reads > 0 ? ns / static_cast<double>(reads) : 0.0;
+    state.counters["allocs_per_op"] = reads > 0 ? static_cast<double>(allocs) / static_cast<double>(reads) : 0.0;
+    state.counters["not_ok"]        = static_cast<double>(bad);
+    rune::bench::gateCheck(state, bad == 0, "every GetStats answers OK");
+}
+
+static const bool kStatsServeTopic = (benchmark::RegisterBenchmark("BM_GetStatsServe/topic", runStatsServe, 1, kSrc)
+    ->Unit(benchmark::kNanosecond)->MinTime(0.5), true);
+static const bool kStatsServeView = (benchmark::RegisterBenchmark("BM_GetStatsServe/view", runStatsServe, 2, kView)
+    ->Unit(benchmark::kNanosecond)->MinTime(0.5), true);
+
+
 // Wide view keys (Part 07 §9): the same worker loop with the keyed reads.  The view is account_characters-shaped: key
 // (userId, characterId) of 16 bytes, or (handle string(120), characterId) of 128 bytes.  BM_GetViewRowKServe/{16,128} point-reads
 // kBatch keys per pass (gate: well inside 50 us per read); BM_ScanViewRowsServe/12 scans the 12 characters of one user
