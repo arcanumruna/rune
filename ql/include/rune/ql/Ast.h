@@ -9,7 +9,7 @@
 #include <vector>
 #include <rune/codec/PrimType.h>
 namespace rune::ql {
-struct FieldDef { std::string name; rune::codec::PrimType type = rune::codec::PrimType::Int32; uint16_t fixedLen = 0; };
+struct FieldDef { std::string name; rune::codec::PrimType type = rune::codec::PrimType::Int32; uint16_t fixedLen = 0; bool autoIncrement = false; };
 // Topic persistence (Phase 2b E).  Values are the DefineTopic wire byte and are
 // APPEND-ONLY: Disk = durable log (default), Transient = replicated in memory,
 // never written to disk (metadata survives a restart, data does not).

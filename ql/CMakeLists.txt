@@ -37,6 +37,7 @@ if(BUILD_TESTING)
         tests/ScriptTest.cpp
         tests/SecurityStatementsTest.cpp
         tests/NamespaceQlTest.cpp
+        tests/CheckedWritesQlTopicTest.cpp
         # std-only: the leader-side statement renderer, checked against redactedText (issue #228)
         ${RUNE_CODEC_ROOT}/src/security/SecurityStatementText.cpp)
     target_link_libraries(rune_ql_tests PRIVATE rune_ql GTest::gtest_main)

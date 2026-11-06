@@ -9,10 +9,11 @@
 
 namespace rune::ql::detail {
 
-enum class Value : uint8_t { Int, Ratio, Cleanup, Durability, Tier, String };
+enum class Value : uint8_t { Int, Ratio, Cleanup, Durability, Tier, String, OnOff };
 enum class Field : uint8_t {
     RetentionMs, RetentionBytes, DeleteRetentionMs, MinCleanableRatio, MinCompactionLagMs, MaxCompactionLagMs,
     CleanupPolicy, SegmentBytes, RetentionCheckMs, FileDeleteDelayMs, Durability, Tier, CoPartitionGroup, PartitionKey,
+    KeyIndex, AutoIncrementReserve, AutoIncrementMax,
 };
 struct SettingSpec {
     std::string_view name;
@@ -23,7 +24,7 @@ struct SettingSpec {
 using protocol::ConfigKey;
 constexpr uint8_t ck(ConfigKey k) { return static_cast<uint8_t>(k); }
 
-inline constexpr std::array<SettingSpec, 14> kSettings{{
+inline constexpr std::array<SettingSpec, 17> kSettings{{
     {"retention.ms",               Value::Int,        Field::RetentionMs,        ck(ConfigKey::RetentionMs)},
     {"retention.bytes",            Value::Int,        Field::RetentionBytes,     ck(ConfigKey::RetentionBytes)},
     {"delete.retention.ms",        Value::Int,        Field::DeleteRetentionMs,  ck(ConfigKey::DeleteRetentionMs)},
@@ -38,6 +39,9 @@ inline constexpr std::array<SettingSpec, 14> kSettings{{
     {"tier",                       Value::Tier,       Field::Tier,               0},
     {"copartition.group",          Value::String,     Field::CoPartitionGroup,   0},
     {"partition.key",              Value::String,     Field::PartitionKey,       0},
+    {"key.index",                  Value::OnOff,      Field::KeyIndex,           0},
+    {"autoincrement.reserve",      Value::Int,        Field::AutoIncrementReserve, 0},
+    {"autoincrement.max",          Value::Int,        Field::AutoIncrementMax,   0},
 }};
 
 [[nodiscard]] inline const SettingSpec* findSetting(std::string_view lowerName) noexcept {

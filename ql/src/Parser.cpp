@@ -5,13 +5,15 @@
 //   transientStmt := "transient" topicStmt                 (Phase 2b E: persistence = Transient)
 //   topicStmt   := "topic" IDENT [ "{" field ("," field)* ","? "}" ] [ "partitions" INT ] [ "replicas" INT ] [ "key" IDENT ]
 //                  [ "with" "(" createSetting ("," createSetting)* ")" ] ";"
-//                  (an untyped topic has no "{…}" and no "key"; a typed topic requires both;
+//                  (an untyped topic has no "{…}" and no "key"; a typed topic's "key" is optional;
 //                   partitions defaults to 1; replicas is 0..32767, 0 = the broker's default)
+//   field       := IDENT type [ "autoincrement" ]          (only on the key field, once)
 //   createSetting := setting
 //                  | "cleanup.policy" "=" ("delete" | "compact" | "compact_delete")
 //                  | ("segment.bytes" | "retention.check.ms" | "file.delete.delay.ms") "=" SIGNED_INT
 //                  | "durability" "=" ("majority" | "all-in-sync") | "tier" "=" ("leader" | "majority" | "strict")
 //                  | ("copartition.group" | "partition.key") "=" STRING
+//                  | "key.index" "=" ("on" | "off") | ("autoincrement.reserve" | "autoincrement.max") "=" SIGNED_INT
 //                  (creation-only; a key may appear once)
 //   alterStmt   := "alter" "topic" IDENT ( alterOp ("," alterOp)* | "set" setting ("," setting)* ) ";"
 //                  ("alter transient …" and "set persistence …" are rejected:
@@ -43,7 +45,6 @@
 //                | "drop" "column" IDENT
 //                | "rename" "column" IDENT "to" IDENT
 //                | "set" "compatibility" ("backward" | "forward")
-//   field       := IDENT type
 //   type        := int32|int64|uint16|uint32|uint64|float64|bool|bytes
 //              | string
 //              | string "(" INT ")"
@@ -77,6 +78,12 @@ enum class TK : uint8_t {
     String,  // '…'   (text = the characters between the quotes)
     BadString, // ' with no closing quote
     Unknown,   // a character no token starts with, or digits glued to letters ("3replicas")
+    Star,    // *
+    Lt,      // <
+    Le,      // <=
+    Gt,      // >
+    Ge,      // >=
+    Ne,      // <>
     Eof,
 };
 
@@ -135,6 +142,19 @@ struct Lexer {
             case '.': advance(); return {TK::Dot,     src.substr(pos - 1, 1), tline, tcol};
             case '-': advance(); return {TK::Dash,    src.substr(pos - 1, 1), tline, tcol};
             case '=': advance(); return {TK::Eq,      src.substr(pos - 1, 1), tline, tcol};
+            case '*': advance(); return {TK::Star,    src.substr(pos - 1, 1), tline, tcol};
+            case '<': {
+                advance();
+                const TK k = pos < src.size() && src[pos] == '=' ? TK::Le : pos < src.size() && src[pos] == '>' ? TK::Ne : TK::Lt;
+                if (k != TK::Lt) advance();
+                return {k, src.substr(pos - (k == TK::Lt ? 1 : 2), k == TK::Lt ? 1 : 2), tline, tcol};
+            }
+            case '>': {
+                advance();
+                const bool ge = pos < src.size() && src[pos] == '=';
+                if (ge) advance();
+                return {ge ? TK::Ge : TK::Gt, src.substr(pos - (ge ? 2 : 1), ge ? 2 : 1), tline, tcol};
+            }
             case '\'': {
                 advance();
                 const std::size_t start = pos;
@@ -339,6 +359,11 @@ struct Parser {
         if (!fd) return std::unexpected(std::move(fd.error()));
 
         fd->name = std::string(nameToken->text);
+        if (isKw("autoincrement")) {
+            advance();
+            fd->autoIncrement = true;
+            if (isKw("autoincrement")) return std::unexpected(err("duplicate modifier 'autoincrement'"));
+        }
         return fd;
     }
 
@@ -507,9 +532,27 @@ struct Parser {
         cs.key = std::string(spec->name);
         switch (spec->value) {
             case detail::Value::Int: {
+                Token vt = cur;
                 auto v = parseSignedInt(spec->name);
                 if (!v) return std::unexpected(std::move(v.error()));
+                if (spec->field == detail::Field::AutoIncrementReserve && (*v < 0 || *v > std::numeric_limits<uint32_t>::max())) {
+                    return std::unexpected(errAt(vt, "autoincrement.reserve must be between 0 and 4294967295"));
+                }
+                if (spec->field == detail::Field::AutoIncrementMax && *v < 0) {
+                    return std::unexpected(errAt(vt, "autoincrement.max must be >= 0"));
+                }
                 cs.value = *v;
+                break;
+            }
+            case detail::Value::OnOff: {
+                Token wt = cur;
+                auto w = parseWord(spec->name);
+                if (!w) return std::unexpected(std::move(w.error()));
+                if (*w != "on" && *w != "off") {
+                    return std::unexpected(errAt(wt, "invalid value '" + *w + "' for " + std::string(spec->name)));
+                }
+                cs.value = *w == "on";
+                cs.text  = std::move(*w);
                 break;
             }
             case detail::Value::Ratio: {
@@ -649,8 +692,14 @@ struct Parser {
                 return std::unexpected(errAt(*keyToken,
                     std::string("key field '") + td.keyField + "' is not a declared field"));
             }
-        } else if (typed) {
-            return std::unexpected(err("expected 'key', got " + got()));
+        }
+
+        for (const auto& f : td.fields) {
+            if (!f.autoIncrement) continue;
+            if (td.keyField.empty()) return std::unexpected(err("autoincrement needs a key"));
+            if (f.name != td.keyField) {
+                return std::unexpected(err("autoincrement is allowed only on the key field; '" + f.name + "' is not the key"));
+            }
         }
 
         if (isKw("with")) {
@@ -664,7 +713,7 @@ struct Parser {
             if (!rp) return std::unexpected(std::move(rp.error()));
         }
 
-        auto semi = expect(TK::Semi, ";");
+        auto semi = expect(TK::Semi, "';'");
         if (!semi) return std::unexpected(std::move(semi.error()));
         return td;
     }
@@ -686,6 +735,9 @@ struct Parser {
 
             auto fd = parseField();
             if (!fd) return std::unexpected(std::move(fd.error()));
+            if (fd->autoIncrement) {
+                return std::unexpected(err("autoincrement is allowed only on the key field; '" + fd->name + "' is not the key"));
+            }
 
             AlterOp op;
             op.kind = AlterOpKind::Add;

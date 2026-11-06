@@ -25,6 +25,7 @@ struct DefineTopicPlan {
     Persistence          persistence = Persistence::Disk;   // Phase 2b E
     int16_t              replicas = 0;                      // 0 = broker default
     TopicCreateConfig    config;                            // from `with (…)`; defaults when absent
+    rune::protocol::TopicKeyFeatures keyFeatures{};         // `autoincrement`, key.index, autoincrement.*
 };
 
 [[nodiscard]] DefineTopicPlan applyPlan(const TopicDef&);

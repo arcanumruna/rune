@@ -20,7 +20,8 @@ rune::codec::Descriptor toDescriptor(const TopicDef& td) {
 
 namespace {
 
-void applySetting(TopicCreateConfig& c, const ConfigSetting& s) {
+void applySetting(DefineTopicPlan& plan, const ConfigSetting& s) {
+    auto& c = plan.config;
     const auto* spec = detail::findSetting(s.key);
     if (!spec) throw std::logic_error("unknown topic setting '" + s.key + "' (not produced by the parser)");
     using F = detail::Field;
@@ -39,6 +40,9 @@ void applySetting(TopicCreateConfig& c, const ConfigSetting& s) {
         case F::Tier:                c.durabilityTier = static_cast<uint8_t>(s.value); break;
         case F::CoPartitionGroup:    c.coPartitionGroup = s.text; break;
         case F::PartitionKey:        c.partitionKey = s.text; break;
+        case F::KeyIndex:            plan.keyFeatures.keyIndex = s.value != 0; break;
+        case F::AutoIncrementReserve: plan.keyFeatures.autoIncrementReserve = static_cast<uint32_t>(s.value); break;
+        case F::AutoIncrementMax:    plan.keyFeatures.autoIncrementMax = static_cast<uint64_t>(s.value); break;
     }
 }
 
@@ -52,7 +56,8 @@ DefineTopicPlan applyPlan(const TopicDef& td) {
     if (!td.fields.empty()) plan.descriptorBlob = rune::codec::serialize(toDescriptor(td));   // untyped → empty
     plan.persistence = td.persistence;
     plan.replicas = td.replicas;
-    for (const auto& s : td.with) applySetting(plan.config, s);
+    for (const auto& f : td.fields) plan.keyFeatures.autoIncrement |= f.autoIncrement;
+    for (const auto& s : td.with) applySetting(plan, s);
     return plan;
 }
 
