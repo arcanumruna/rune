@@ -15,6 +15,7 @@ using namespace cwkeyed;
 using rune::node::WorkerOp;
 using rune::node::WorkerReturn;
 using rune::node::test::CwViewReadWorkerRig;
+using rune::node::test::appendRecords;
 using Status = rune::protocol::client::ViewRowResponse;
 
 constexpr int16_t kOk = Status::kOk;
@@ -202,4 +203,30 @@ TEST(CheckedWritesViewReadRegression, WrongKeyLengthIsInvalidRequestRegression) 
     key.pop_back();
     ASSERT_EQ(key.size(), 15u);
     EXPECT_EQ(r.getK(key).errorCode, Status::kInvalidRequest);
+}
+
+TEST(CheckedWritesViewReadRegression, MaxMinOffsetIsHeldNotServedRegression) {
+    CwViewReadWorkerRig r;
+    r.install(accountCharacters(r.src));
+    r.append({{1, 42, "a", 10}});
+
+    ASSERT_TRUE(rune::node::test::postViewRead(r.w, WorkerOp::Type::GetViewRowK, beKey({42, 1}), {}, kViewTopic, 0, INT64_MAX));
+    const int64_t t0 = 4'000'000'000;
+    EXPECT_TRUE(r.pass(t0).empty()) << "minOffset + 1 must not wrap into a served read";
+    EXPECT_EQ(r.w.heldViewReadsForTest(), 1u);
+    EXPECT_TRUE(r.pass(t0 + 99'000'000).empty());
+    const auto expired = r.pass(t0 + 101'000'000);
+    ASSERT_EQ(expired.size(), 1u);
+    EXPECT_EQ(expired[0].errorCode, Status::kNotReady);
+}
+
+TEST(CheckedWritesViewReadRegression, ATableNotCaughtUpAnswersNotReadyAtOnceDespiteMinOffsetRegression) {
+    CwViewReadWorkerRig r;
+    r.install(accountCharacters(r.src));
+    appendRecords(*r.srcRep.replica, r.src, userRows(42, 1, 3));   // no pass yet: the table is not hosted
+    ASSERT_TRUE(rune::node::test::postViewRead(r.w, WorkerOp::Type::GetViewRowK, beKey({42, 1}), {}, kViewTopic, 0, 1000));
+    const auto answers = r.pass(r.now += 1'000'000);
+    ASSERT_EQ(answers.size(), 1u);
+    EXPECT_EQ(answers[0].errorCode, Status::kNotReady);
+    EXPECT_EQ(r.w.heldViewReadsForTest(), 0u);
 }

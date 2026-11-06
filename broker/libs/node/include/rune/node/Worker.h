@@ -4572,17 +4572,17 @@ private:
             // 2d. Issue #82 (VLS A.5.5): read-your-writes - an acked write is committed (at or below the HW / LSO), but
             //     the fold may lag it within a pass (a persisted view folds at most maxRecordsPerPass per pass; the ack
             //     leaves before the next pass folds).  The read waits for the fold to reach the committed bound AT ITS
-            //     ARRIVAL (fixed: bounded).  The common case is one compare.  Only a Ready table waits (one still
-            //     catching up / rebuilding answers NotReady below, at once); while the RC state is not Ready (it
-            //     rebuilds after a leadership / log change - the instance is then CatchingUp anyway) no bound is taken.
-            if (r.target < 0) {
+            //     ARRIVAL (fixed: bounded), and for its minOffset (P7-12) when it names one.  The common case is one
+            //     compare.  Only a Ready table waits (one still catching up / rebuilding answers NotReady below, at
+            //     once); while the RC state is not Ready (it rebuilds after a leadership / log change - the instance is
+            //     then CatchingUp anyway) no bound is taken.
+            if (r.target < 0 && st.ready) {
                 // The fold bound is the LSO <= HW: a table folded up to the HW is caught up (one load + compare); only
                 // a lagging one takes the bound from the RC state.
-                if (st.ready)
-                    if (const int64_t hw = srcRep->highWatermark(); st.foldCursor < hw) [[unlikely]]
-                        if (const RcState* rc = rcServe_(srcRep, rcOf_(srcRep)); rc != nullptr) r.target = rc->lso(hw);
-                // P7-12: a read after a write acked at minOffset also waits for the fold to pass it, even when the fold is at the HW.
-                if (r.minOffset >= 0) r.target = std::max(r.target, r.minOffset + 1);
+                if (const int64_t hw = srcRep->highWatermark(); st.foldCursor < hw) [[unlikely]]
+                    if (const RcState* rc = rcServe_(srcRep, rcOf_(srcRep)); rc != nullptr) r.target = rc->lso(hw);
+                // The fold waits for minOffset even when it is at the HW; INT64_MAX is a bound no fold reaches.
+                if (r.minOffset >= 0) r.target = std::max(r.target, std::min(r.minOffset, INT64_MAX - 1) + 1);
             }
             if (r.target >= 0 && st.foldCursor < r.target) [[unlikely]] return ViewServe::Hold;
         }
