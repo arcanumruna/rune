@@ -38,6 +38,7 @@
 
 #include <memory>
 
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/node/VerdictSource.h>
 #include <rune/node/ViewInstance.h>
 #include <rune/node/ViewSnapshotChannel.h>
@@ -46,7 +47,8 @@
 namespace rune::node {
 
 /// The most row bytes (each row with its u32 length) one scanPage answers with.
-inline constexpr uint32_t kMaxScanPageBytes = 61440;
+inline constexpr uint32_t kMaxScanPageBytes = rune::protocol::client::ScanViewRowsResponse::kMaxPageBytes;
+static_assert(rune::protocol::client::ScanViewRows::kTokenBytes == rune::view::kScanTokenBytes);
 
 enum class CheckpointOrigin : uint8_t { None, Committed, CommittedAndLegacy, LegacyOnly };
 
