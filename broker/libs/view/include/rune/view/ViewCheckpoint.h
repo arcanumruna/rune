@@ -136,4 +136,43 @@ std::optional<AppliedDelta> applyMultiDelta(std::span<ViewTable* const> tables,
 int64_t replayMulti(std::span<ViewTable* const> tables, std::span<const uint32_t> rowLens,
                     std::span<const std::span<const uint8_t>> recordsInOrder);
 
+// Part 07: v3 multi-table record with K-byte keys (K = keyLen of the table, up to kMaxViewKeyBytes). Layout:
+//   [magic3 u32][O i64][tableCount u8]
+//   tableCount x { [tableId u8][keyLen u8][rowLen u32][count u32]
+//                  count x { rid u32, flags u8 (0=upsert,1=delete), key[keyLen], [rowLen payload bytes iff upsert] } }
+//   [crc32c u32]   -- over every preceding byte
+// O sits at byte 4 like v1/v2. The row bytes are the payload only; prefix links are rebuilt by the replay's puts.
+inline constexpr uint32_t kViewCheckpointMagicV3 = 0x564B4333u; // "3CKV" little-endian ASCII
+inline constexpr std::size_t kCheckpointV3HeaderBytes      = 4 + 8 + 1;      // magic, O, tableCount
+inline constexpr std::size_t kCheckpointV3TableHeaderBytes = 1 + 1 + 4 + 4;  // tableId, keyLen, rowLen, count
+[[nodiscard]] constexpr std::size_t checkpointV3EntryHeaderBytes(uint8_t keyLen) noexcept { return 4 + 1 + keyLen; }
+
+inline constexpr uint8_t kKeyedTableView = 0, kKeyedTableOwners = 1;   // projections
+inline constexpr uint8_t kKeyedTableContributors = 2, kKeyedTableGroups = 3, kKeyedTableBlocks = 4, kKeyedTableGroupIds = 5;   // keyed aggregates
+
+struct KeyedDirtyEntry {
+    uint32_t                 rid;
+    bool                     deleted;
+    std::span<const uint8_t> key;  // exactly the table's keyLen bytes
+    const uint8_t*           row;  // nullptr iff deleted; otherwise exactly rowLen bytes
+};
+
+struct KeyedTableDelta {
+    uint8_t                          tableId;
+    uint8_t                          keyLen;
+    uint32_t                         rowLen;
+    std::span<const KeyedDirtyEntry> entries;
+};
+
+size_t encodeKeyedDelta(std::span<const KeyedTableDelta> tables, int64_t O, std::vector<uint8_t>& out);
+
+// `record` must be exactly one v3 record. Validates everything (bounds per entry against the real buffer, table ids
+// < tables.size() and each at most once, keyLen == keyLens[id], rowLen == rowLens[id], CRC) BEFORE mutating any table.
+std::optional<AppliedDelta> applyKeyedDelta(std::span<ViewTable* const> tables, std::span<const uint32_t> rowLens,
+                                            std::span<const uint8_t> keyLens, std::span<const uint8_t> record);
+
+// As replayMulti, for v3 records.
+int64_t replayKeyed(std::span<ViewTable* const> tables, std::span<const uint32_t> rowLens,
+                    std::span<const uint8_t> keyLens, std::span<const std::span<const uint8_t>> recordsInOrder);
+
 } // namespace rune::view

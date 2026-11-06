@@ -32,7 +32,8 @@ if(BUILD_TESTING)
         tests/view/CheckedWritesPrepareApplyTest.cpp
         tests/view/CheckedWritesAbortedFoldMatrixTest.cpp
         tests/view/CheckedWritesViewTableTest.cpp
-        tests/view/CheckedWritesViewTablePrefixTest.cpp)
+        tests/view/CheckedWritesViewTablePrefixTest.cpp
+        tests/view/CheckedWritesViewCheckpointV3Test.cpp)
     target_link_libraries(rune_view_tests PRIVATE rune_view rune_codec GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_view_tests)

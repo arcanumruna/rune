@@ -855,7 +855,8 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesVerdictSourceTest.cpp
         tests/node/CheckedWritesKeyIndexTest.cpp
         tests/node/CheckedWritesAutoIncStateTest.cpp
-        tests/node/CheckedWritesAutoIncHookTest.cpp)
+        tests/node/CheckedWritesAutoIncHookTest.cpp
+        tests/node/CheckedWritesViewSetTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)

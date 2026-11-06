@@ -47,13 +47,13 @@ constexpr std::size_t kViewCrcLen    = 4;
 constexpr std::size_t kViewHeaderLenV2 = 4 + 8 + 1; // magic,O,tableCount (multi-table v2)
 
 // Peek the O field out of a delta/base record's header: a v1 (single-table,
-// Replace views) or v2 (multi-table, aggregate views) record -- O is at byte 4
-// in both. This does NOT validate the record's CRC or per-entry bounds -- this
+// Replace views) v2 (multi-table, aggregate views) or v3 (K-byte keys) record -- O is at byte 4
+// in all three. This does NOT validate the record's CRC or per-entry bounds -- this
 // agent only appends raw bytes to the per-(view,partition) delta file; the
 // format's own CRC + bounds checks (rune::view::applyDelta / applyMultiDelta)
 // are what prove the bytes are intact, and are performed later by whichever
 // recovery path reopens and replays the file. A frame too short to hold its
-// version's header + CRC, or whose magic is neither v1 nor v2, is malformed:
+// version's header + CRC, or whose magic is none of v1, v2 and v3, is malformed:
 // returns -1 (dropped by the caller) rather than ever being misread as a real
 // offset.
 int64_t peekDeltaOffset(const uint8_t* p, std::size_t len) noexcept {
@@ -61,8 +61,8 @@ int64_t peekDeltaOffset(const uint8_t* p, std::size_t len) noexcept {
     const uint32_t magic = readLE32(p);
     if (magic == rune::view::kViewCheckpointMagic) {
         if (len < kViewHeaderLen + kViewCrcLen) return -1;
-    } else if (magic == rune::view::kViewCheckpointMagicV2) {
-        if (len < kViewHeaderLenV2 + kViewCrcLen) return -1;
+    } else if (magic == rune::view::kViewCheckpointMagicV2 || magic == rune::view::kViewCheckpointMagicV3) {
+        if (len < kViewHeaderLenV2 + kViewCrcLen) return -1;   // v3 has the same header
     } else {
         return -1;
     }

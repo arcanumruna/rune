@@ -1,6 +1,7 @@
 // libs/view/src/ViewCheckpoint.cpp
 #include <rune/view/ViewCheckpoint.h>
 #include <rune/protocol/Crc32c.h>
+#include <rune/view/ViewKey.h>
 #include <cstring>
 
 namespace rune::view {
@@ -225,6 +226,105 @@ int64_t replayMulti(std::span<ViewTable* const> tables, std::span<const uint32_t
     int64_t last = -1;
     for (const auto& rec : recordsInOrder) {
         const auto applied = applyMultiDelta(tables, rowLens, rec);
+        if (!applied) break;
+        last = applied->O;
+    }
+    return last;
+}
+
+size_t encodeKeyedDelta(std::span<const KeyedTableDelta> tables, int64_t O, std::vector<uint8_t>& out) {
+    const size_t start = out.size();
+    appendLE32(out, kViewCheckpointMagicV3);
+    appendLE64(out, static_cast<uint64_t>(O));
+    out.push_back(static_cast<uint8_t>(tables.size()));
+    for (const KeyedTableDelta& t : tables) {
+        out.push_back(t.tableId);
+        out.push_back(t.keyLen);
+        appendLE32(out, t.rowLen);
+        appendLE32(out, static_cast<uint32_t>(t.entries.size()));
+        for (const KeyedDirtyEntry& e : t.entries) {
+            appendLE32(out, e.rid);
+            out.push_back(e.deleted ? uint8_t{1} : uint8_t{0});
+            out.insert(out.end(), e.key.begin(), e.key.end());
+            if (!e.deleted) out.insert(out.end(), e.row, e.row + t.rowLen);
+        }
+    }
+    appendLE32(out, rune::protocol::crc32c(out.data() + start, out.size() - start));
+    return out.size() - start;
+}
+
+std::optional<AppliedDelta> applyKeyedDelta(std::span<ViewTable* const> tables, std::span<const uint32_t> rowLens,
+                                            std::span<const uint8_t> keyLens, std::span<const uint8_t> b) {
+    constexpr size_t kHdr = kCheckpointV3HeaderBytes, kTbl = kCheckpointV3TableHeaderBytes, kCrc = kCheckpointCrcBytes;
+    if (tables.size() != rowLens.size() || tables.size() != keyLens.size() || tables.size() > 64) return std::nullopt;
+    if (b.size() < kHdr + kCrc) return std::nullopt;
+    const uint8_t* p = b.data();
+    if (readLE32(p) != kViewCheckpointMagicV3) return std::nullopt;
+    const int64_t O = static_cast<int64_t>(readLE64(p + 4));
+    const uint8_t tableCount = p[12];
+
+    // Pass 1: validate, never mutating.
+    size_t pos = kHdr;
+    uint64_t seen = 0;
+    uint32_t total = 0;
+    for (uint8_t t = 0; t < tableCount; ++t) {
+        if (pos + kTbl > b.size()) return std::nullopt;
+        const uint8_t  id     = p[pos];
+        const uint8_t  keyLen = p[pos + 1];
+        const uint32_t rowLen = readLE32(p + pos + 2);
+        const uint32_t count  = readLE32(p + pos + 6);
+        if (id >= tables.size() || keyLens[id] != keyLen || rowLens[id] != rowLen || tables[id]->keyWidth() != keyLen ||
+            ((seen >> id) & 1u) != 0) {
+            return std::nullopt;
+        }
+        seen |= uint64_t{1} << id;
+        pos += kTbl;
+        const size_t ent = checkpointV3EntryHeaderBytes(keyLen);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (pos + ent > b.size()) return std::nullopt;
+            const uint8_t flags = p[pos + 4];
+            if (flags > 1) return std::nullopt;
+            pos += ent;
+            if (flags == 0) {
+                if (pos + rowLen > b.size()) return std::nullopt;
+                pos += rowLen;
+            }
+        }
+        total += count;
+    }
+    if (pos + kCrc != b.size()) return std::nullopt;
+    if (readLE32(p + pos) != rune::protocol::crc32c(p, pos)) return std::nullopt;
+
+    // Pass 2: apply.
+    pos = kHdr;
+    for (uint8_t t = 0; t < tableCount; ++t) {
+        const uint8_t  id     = p[pos];
+        const uint8_t  keyLen = p[pos + 1];
+        const uint32_t rowLen = readLE32(p + pos + 2);
+        const uint32_t count  = readLE32(p + pos + 6);
+        pos += kTbl;
+        ViewTable& tbl = *tables[id];
+        const size_t ent = checkpointV3EntryHeaderBytes(keyLen);
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint8_t flags = p[pos + 4];
+            const ViewKey key = ViewKey::fromBytes({p + pos + 5, keyLen});
+            pos += ent;
+            if (flags == 1) {
+                tbl.erase(key);
+            } else {
+                std::memcpy(tbl.put(key), p + pos, rowLen);
+                pos += rowLen;
+            }
+        }
+    }
+    return AppliedDelta{O, total};
+}
+
+int64_t replayKeyed(std::span<ViewTable* const> tables, std::span<const uint32_t> rowLens,
+                    std::span<const uint8_t> keyLens, std::span<const std::span<const uint8_t>> recordsInOrder) {
+    int64_t last = -1;
+    for (const auto& rec : recordsInOrder) {
+        const auto applied = applyKeyedDelta(tables, rowLens, keyLens, rec);
         if (!applied) break;
         last = applied->O;
     }
