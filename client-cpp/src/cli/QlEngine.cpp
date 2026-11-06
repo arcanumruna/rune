@@ -1359,7 +1359,7 @@ bool QlRun::run(const PSelect& s, const rc::DdlOptions&) {
     } else {
         rc::ViewScanOptions page;
         for (;;) {
-            const uint32_t want = read->limit == 0 ? 256 : std::min<uint32_t>(read->limit - static_cast<uint32_t>(rows.size()), 256);
+            const uint32_t want = read->limit == 0 ? kScanPageRows : std::min<uint32_t>(read->limit - static_cast<uint32_t>(rows.size()), kScanPageRows);
             auto r = broker.client().scanViewAndWait(view->def.viewTopicId, read->keyOrPrefix, static_cast<uint16_t>(want), page, kCatalogWait);
             if (r.status != rc::ViewRowResult::kOk) return fail(r.status == rc::ViewRowResult::kCursorInvalidated
                                                                     ? "the scan was invalidated by a concurrent change; run it again"

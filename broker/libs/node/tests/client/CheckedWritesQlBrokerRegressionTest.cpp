@@ -20,6 +20,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace std::chrono_literals;
@@ -48,13 +49,18 @@ int ql(const std::string& endpoint, const std::string& text, std::string* out = 
     return runCli({"ql", "-e", text, "--broker", endpoint}, out, err);
 }
 
+struct TmpDir {
+    fs::path path = fs::temp_directory_path() / ("rune_cwql_broker_test_" + std::to_string(::getpid()));
+    TmpDir() { fs::create_directories(path); }
+    ~TmpDir() {
+        std::error_code ec;
+        fs::remove_all(path, ec);
+    }
+};
+
 fs::path tmpDir() {
-    static const fs::path d = [] {
-        fs::path p = fs::temp_directory_path() / ("rune_cwql_broker_test_" + std::to_string(::getpid()));
-        fs::create_directories(p);
-        return p;
-    }();
-    return d;
+    static const TmpDir d;
+    return d.path;
 }
 
 std::string writeTemp(const std::string& name, const std::string& content) {
@@ -313,7 +319,8 @@ TEST(CheckedWritesQlBrokerRegression, DeviceHistoryCountsLoginsShardRegression) 
     const std::set<std::vector<std::string>> want{{"7", "a", "100", "300", "3", "2"}, {"7", "b", "400", "400", "1", "3"}};
     EXPECT_EQ(got, want) << out;
     EXPECT_EQ(rows[3], (std::vector<std::string>{"(2", "rows)"}));
-    EXPECT_EQ(out.find("8  a"), std::string::npos) << "user 8 never appears: " << out;
+    EXPECT_EQ(rows[1][0], "7") << "user 8 never appears: " << out;
+    EXPECT_EQ(rows[2][0], "7") << "user 8 never appears: " << out;
 }
 
 // §15, R07f: lower('FOO') reads the row stored under the lowered key of 'Foo'.
@@ -459,6 +466,7 @@ TEST(CheckedWritesQlBrokerRegression, PointSelectRoutesToTheRowsPartitionShardRe
 // Review of Task 9: a scan that spans several pages prints every row and the right count; limit cuts inside a page boundary.
 TEST(CheckedWritesQlBrokerRegression, ScanSelectPagesShardRegression) {
     constexpr int kRows = 300;
+    static_assert(kRows > rune::cli::engine::kScanPageRows, "the scan spans more than one page");
     OneBroker b("cw08_pages", OneBroker::Runtime::Shard);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());

@@ -146,6 +146,8 @@ struct SelectRead {
                                                                 const rune::codec::Descriptor& source,
                                                                 const rune::codec::Descriptor& output, int32_t sourcePartitions,
                                                                 rune::protocol::Partitioner partitioner);
+/// Rows asked of the broker per scan page.
+inline constexpr uint32_t kScanPageRows = 256;
 /// A header of the selected columns, a line per row, `(<n> rows)`.
 [[nodiscard]] std::string formatRows(const rune::codec::Descriptor& output, std::span<const uint16_t> slots,
                                      std::span<const std::vector<uint8_t>> rows);
