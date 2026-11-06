@@ -1404,20 +1404,20 @@ if(BUILD_TESTING)
             # The namespace fetch gate on the default consume paths (worker-owned, group, filtered subscriptions; legacy PushRead).
             add_executable(rune_ns_fetch_adv_tests tests/node/NsFetchGateAdversarialRegressionTest.cpp)
             target_include_directories(rune_ns_fetch_adv_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-            target_link_libraries(rune_ns_fetch_adv_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            target_link_libraries(rune_ns_fetch_adv_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_ns_fetch_adv_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 04: the shared interaction matrix (04 cells; the reference model).
             add_executable(rune_checked_writes_matrix_tests tests/node/CheckedWritesMatrixTest.cpp)
             target_include_directories(rune_checked_writes_matrix_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
-            target_link_libraries(rune_checked_writes_matrix_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            target_link_libraries(rune_checked_writes_matrix_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_matrix_tests PROPERTIES TIMEOUT 900 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 03 (hard rule): the write hook and the View acks allocate nothing.  Replaces the global
             # operator new (binary-wide) - its own binary; later checked-writes parts extend it.
             add_executable(rune_checked_writes_alloc_regression_tests tests/node/CheckedWritesAllocRegressionTest.cpp tests/node/CheckedWritesAutoIncAllocTest.cpp tests/node/CheckedWritesViewReadAllocTest.cpp tests/support/AllocWindow.cpp)
             target_include_directories(rune_checked_writes_alloc_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-            target_link_libraries(rune_checked_writes_alloc_regression_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
+            target_link_libraries(rune_checked_writes_alloc_regression_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_alloc_regression_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Authentication Task 13 (spec §6, D30): the shard worker's WRITE grants, a REAL invoker driver over aeron:ipc.
@@ -1968,7 +1968,7 @@ if(BUILD_TESTING)
         # Checked writes Part 09 Task 5a (#788): a lagging leader never undoes a newer constraint-set change, on three real brokers.
         add_executable(rune_checked_writes_catalog_gate_cluster_tests tests/integration/CheckedWritesCatalogGateClusterTest.cpp)
         target_include_directories(rune_checked_writes_catalog_gate_cluster_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-        target_link_libraries(rune_checked_writes_catalog_gate_cluster_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
+        target_link_libraries(rune_checked_writes_catalog_gate_cluster_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_ql rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_checked_writes_catalog_gate_cluster_tests PROPERTIES TIMEOUT 600)
 

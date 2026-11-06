@@ -7,6 +7,7 @@
 #include "client/ClusterClient.h"
 
 #include <rune/metadata/ShardRouter.h>
+#include <rune/ql/Backends.h>
 
 #include <gtest/gtest.h>
 
@@ -18,6 +19,8 @@ using namespace rune::node;
 using namespace rune::node::cw;
 using namespace std::chrono_literals;
 using rune::node::test::catalog_cluster::ThreeNodes;
+using rune::node::cw::ConstrainedView;
+using rune::node::cw::VerdictRig;
 namespace tcc = rune::node::test::catalog_cluster;
 
 namespace {
@@ -39,18 +42,25 @@ void installReject(Worker& wk, int32_t src, const char* name, int32_t viewTopic,
     wk.viewSet()->installTestVerdictViewForTest(comp->plan, comp->rowLayout, desc, false, object, rule);
 }
 
+/// The real thing: account_stats (check view, cap 12 / 13) over the character topic the cluster defined.
+void installAccountStats(Worker& wk, int32_t src, int32_t viewTopic, int64_t cap) {
+    const rune::ql::TopicDef topic = VerdictRig::parseTopic(VerdictRig::kCharacterTopic);
+    auto comp = VerdictRig::authorConstrainedView(topic, src, ConstrainedView::AccountStats, cap, viewTopic);
+    wk.viewSet()->installConstrainedViewForTest(comp.plan, comp.rowLayout, rune::ql::toDescriptor(topic), false);
+}
+
 struct Seen {
     std::size_t changes = 0;
     uint8_t     members = 0;
     int64_t     catalogThrough = -1;
     uint64_t    firstObject = 0, firstFingerprint = 0;
-    bool        activated = false, waitingForInstall = false;
+    bool        activated = false, waitingForInstall = false, candidate = false;
 };
 
 class Cluster {
 public:
-    explicit Cluster(const std::string& tag)
-        : c_(ThreeNodes::startWith(tag, [](NodeConfig& cfg) { cfg.verdictIntervalMs = 20; })) {}
+    explicit Cluster(const std::string& tag, bool constrained = false)
+        : constrained_(constrained), c_(ThreeNodes::startWith(tag, [](NodeConfig& cfg) { cfg.verdictIntervalMs = 20; })) {}
 
     void setUp() {
         ASSERT_TRUE(c_.awaitCatalogLeader(30s));
@@ -59,7 +69,8 @@ public:
         auto admin = tcc::connectClient(c_, ctl);
         rune::client::TopicOptions to;
         to.replicationFactor = 3;
-        const auto src = admin->defineTopicAndWait("gate", 1, "id", rune::codec::serialize(verdictSourceDescriptor()), rune::client::Persistence::Disk, to, {}, 60s);
+        const rune::codec::Descriptor desc = constrained_ ? rune::ql::toDescriptor(VerdictRig::parseTopic(VerdictRig::kCharacterTopic)) : verdictSourceDescriptor();
+        const auto src = admin->defineTopicAndWait("gate", 1, constrained_ ? "characterId" : "id", rune::codec::serialize(desc), rune::client::Persistence::Disk, to, {}, 60s);
         ASSERT_EQ(src.errorCode, 0) << src.detail;
         topic_ = src.topicId;
         admin->close();
@@ -80,7 +91,12 @@ public:
             marked = c_.node(id).onWorkerThreadForTest(worker(id), [](Worker& wk) { return wk.viewSet()->catalogThroughForTest() >= 0; });
         ASSERT_TRUE(marked) << "node " << id << " never received a catalog mark";
         const int32_t src = topic_;
-        c_.node(id).onWorkerThreadForTest(worker(id), [src](Worker& wk) { installReject(wk, src, "gate_old", kOld, kObj, tagRule(9)); return 0; });
+        const bool real = constrained_;
+        c_.node(id).onWorkerThreadForTest(worker(id), [src, real](Worker& wk) {
+            if (real) installAccountStats(wk, src, kOld, 12);
+            else installReject(wk, src, "gate_old", kOld, kObj, tagRule(9));
+            return 0;
+        });
     }
 
     int32_t leader() {
@@ -98,7 +114,7 @@ public:
                 s.catalogThrough = set.catalogThrough;
                 if (set.count != 0) { s.firstObject = set.members[0].viewObjectId; s.firstFingerprint = set.members[0].planFingerprint; }
             }
-            if (const VerdictSource* j = wk.viewSet()->verdictSource(topic_, 0)) { s.activated = j->activated(); s.waitingForInstall = j->waitingForInstall(); }
+            if (const VerdictSource* j = wk.viewSet()->verdictSource(topic_, 0)) { s.activated = j->activated(); s.waitingForInstall = j->waitingForInstall(); s.candidate = j->hasCandidates(); }
             return s;
         });
     }
@@ -113,10 +129,15 @@ public:
     /// The catalog applied a DDL change on this node's worker, which now holds the plans after it.
     void applyDdl(int id, int shape, int64_t catalogPosition) {
         const int32_t src = topic_;
+        const bool real = constrained_;
         c_.node(id).onWorkerThreadForTest(worker(id), [=](Worker& wk) {
             wk.viewSet()->uninstallView(kOld);
-            if (shape == kReplace) installReject(wk, src, "gate_new", kNew, kObj, tagRule(8));
-            if (shape == kCreate) installReject(wk, src, "gate_new", kNew, kObj + 1, tagRule(8));
+            if (real) {
+                if (shape == kReplace) installAccountStats(wk, src, kNew, 13);
+            } else {
+                if (shape == kReplace) installReject(wk, src, "gate_new", kNew, kObj, tagRule(8));
+                if (shape == kCreate) installReject(wk, src, "gate_new", kNew, kObj + 1, tagRule(8));
+            }
             wk.viewSet()->raiseCatalogThroughForTest(catalogPosition);
             return 0;
         });
@@ -180,9 +201,11 @@ public:
         const Seen after = seen(lead);
         EXPECT_EQ(after.changes, 2u) << "the caught-up leader changed the set again";
         EXPECT_FALSE(after.waitingForInstall) << "the judge still waits for a plan the leader installed";
+        EXPECT_FALSE(after.candidate) << "the replacement the logged change names is a member, not a candidate";
     }
 
 private:
+    bool                 constrained_;
     ThreeNodes           c_;
     int32_t              topic_ = -1;
     std::vector<int32_t> leaders_;
@@ -206,5 +229,17 @@ TEST(CheckedWritesCatalogGateClusterRegression, CreateDoneByTheOldLeaderIsNotRev
 
 TEST(CheckedWritesCatalogGateClusterRegression, RestartedFollowersBelowTheLoggedPositionDoNotRevertTheChangeRegression) {
     Cluster c("cw09_gate_restart");
+    c.run(Cluster::kReplace, true);
+}
+
+// P9-5: the same failover on real check views.  The old leader replaces the plan through a candidate; the new leader, whose catalog is
+// behind, builds no candidate for the plan it installs late and keeps the logged set.
+TEST(CheckedWritesCatalogGateClusterRegression, CandidateReplaceDoneByTheOldLeaderIsNotRevertedByTheNewOneRegression) {
+    Cluster c("cw09_gate_cand_replace", /*constrained=*/true);
+    c.run(Cluster::kReplace, false);
+}
+
+TEST(CheckedWritesCatalogGateClusterRegression, RestartedFollowersDoNotRevertACandidateSwapRegression) {
+    Cluster c("cw09_gate_cand_restart", /*constrained=*/true);
     c.run(Cluster::kReplace, true);
 }

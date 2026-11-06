@@ -255,6 +255,7 @@ bool VerdictSource::reindex_() {
         return false;
     }
     waitingForInstall_ = false;
+    for (const std::size_t i : active_) members_[i].candidate = false;   // the logged set names it: a swap another leader's markers already passed
     // A dropped view whose plan was installed again (#786): the new member took its place here and it retires, released once a
     // committed marker covers what it judged.
     for (std::size_t i = 0; i < members_.size(); ++i) {

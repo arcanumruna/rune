@@ -1115,6 +1115,20 @@ bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
     return true;
 }
 
+void WorkerViewSet::installConstrainedViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout, rune::codec::Descriptor src, bool persisted) {
+    const int32_t viewTopicId = plan.viewTopicId;
+    const rune::view::VerdictViewKind kind = *rune::view::verdictKindOf(plan);
+    const uint64_t objectId = plan.viewObjectId;
+    const uint64_t fingerprint = rune::view::verdictPlanFingerprint(rune::view::serialize(plan));
+    installView(std::move(plan), std::move(layout), std::move(src), persisted);
+    ViewTemplate& tpl = templates_.at(viewTopicId);
+    ++verdictEpoch_;
+    tpl.isVerdict = true;
+    tpl.verdictKind = kind;
+    tpl.verdictObjectId = objectId;
+    tpl.verdictFingerprint = fingerprint;
+}
+
 void WorkerViewSet::installTestVerdictViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout,
                                                   rune::codec::Descriptor src, bool persisted, uint64_t viewObjectId, TestRejectRule rule, bool underRecovery) {
     const int32_t viewTopicId = plan.viewTopicId;
@@ -1183,6 +1197,19 @@ void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, Verd
     it->second.foldLeadership = leaderGen;
 }
 
+namespace {
+/// The set in force at `from`, or a change record above it, names the plan: the judge still judges with it, or will after a switch.
+bool namedFrom(const PartitionWriteState& write, int64_t from, uint64_t viewObjectId, uint64_t planFingerprint) {
+    const auto names = [&](const ConstraintSet& set) {
+        return std::any_of(set.members.begin(), set.members.begin() + set.count, [&](const ConstraintSetMember& m) { return m.viewObjectId == viewObjectId && m.planFingerprint == planFingerprint; });
+    };
+    if (names(*write.constraintSets.setAt(from))) return true;
+    for (int64_t a = write.constraintSets.nextChangeAtOrAfter(from); a != INT64_MAX; a = write.constraintSets.nextChangeAtOrAfter(a + 1))
+        if (names(*write.constraintSets.setAt(a + 1))) return true;
+    return false;
+}
+}  // namespace
+
 VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write) {
     const auto sit = subscriptionIndex_.find(srcTopicId);
     bool anyTemplate = false;
@@ -1220,17 +1247,19 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     for (const int32_t id : sit->second) {
         const ViewTemplate& tpl = templates_.at(id);
         if (!tpl.isVerdict || tpl.retiring || judge->hasView(id)) continue;
-        // P9-5: the plan of a logged member's object under another fingerprint builds as a candidate (the member keeps judging).  While
-        // this worker's catalog is behind the logged set it is a stale plan or not yet known to be a replacement: nothing is built.
+        // P9-5: the plan of a logged member's object under another fingerprint builds as a candidate (the member keeps judging), unless a
+        // logged set the judge has yet to judge with names it: that is a member of record.  While this worker's catalog is behind the
+        // logged set a plan is a stale one or not yet known to be a replacement: nothing is built.
         const ConstraintSet& logged = write.constraintSets.latest();
-        const bool replacesLogged = tpl.verdictKind != rune::view::VerdictViewKind::TestReject &&
+        const bool candidate = tpl.verdictKind != rune::view::VerdictViewKind::TestReject &&
             std::any_of(logged.members.begin(), logged.members.begin() + logged.count,
-                        [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint != tpl.verdictFingerprint; });
-        if (replacesLogged && catalogBehind_(srcTopicId, *judge, write)) continue;
+                        [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint != tpl.verdictFingerprint; }) &&
+            !namedFrom(write, judge->judgedThrough(), tpl.verdictObjectId, tpl.verdictFingerprint);
+        if (candidate && catalogBehind_(srcTopicId, *judge, write)) continue;
         ViewInstance* inst = getOrCreate_(id, partition, INT64_MAX);
         if (inst == nullptr) continue;
         if (tpl.verdictKind == rune::view::VerdictViewKind::TestReject) judge->installTestVerdictViewForTest(inst, tpl.verdictObjectId, tpl.testRule);
-        else if (replacesLogged) judge->addCandidate(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint);
+        else if (candidate) judge->addCandidate(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint);
         else judge->addVerdictView(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint);
     }
     return judge;
@@ -1282,7 +1311,8 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
             if (tpl.retiring) {
                 const bool inLogged = std::any_of(want.begin(), want.end(), [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
                 const bool wasLogged = std::any_of(logged.members.begin(), logged.members.begin() + logged.count, [&](const ConstraintSetMember& m) { return m.viewObjectId == tpl.verdictObjectId && m.planFingerprint == tpl.verdictFingerprint; });
-                judge.removeCandidate(tpl.verdictObjectId, tpl.verdictFingerprint);   // its view went before it swapped in
+                if (!namedFrom(write, judge.judgedThrough(), tpl.verdictObjectId, tpl.verdictFingerprint))
+                    judge.removeCandidate(tpl.verdictObjectId, tpl.verdictFingerprint);   // its view went before any change named it
                 if (!inLogged && !wasLogged && !judge.hasView(id)) retiredQueue_.push_back({id, judge.partition()});   // never joined a set
                 continue;
             }

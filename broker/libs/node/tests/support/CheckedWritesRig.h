@@ -25,7 +25,10 @@
 #include <rune/storage/LogCleaner.h>
 #include <rune/storage/SkimpyOffsetMap.h>
 #include <rune/transaction/ControlMarker.h>
+#include <rune/ql/Backends.h>
+#include <rune/ql/Parser.h>
 #include <rune/view/PlanCompiler.h>
+#include <rune/view/Verdict.h>
 
 #include <Aeron.h>
 #include <FragmentAssembler.h>
@@ -43,6 +46,7 @@
 #include <set>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <string>
@@ -104,6 +108,9 @@ struct AutoIncShape {
 /// The replica and worker settings a cell may change: minIsr and durabilityTier (2 = Strict) of the partition, the acks=all commit-wait (0 = the default),
 /// and the partition of topic 6 the rig owns (an autoincrement cell at P > 1 owns another than 0).
 struct RigTuning { int minIsr = 1; uint8_t durabilityTier = 1; int64_t ackTimeoutNs = 0; int32_t partition = 0; };
+
+/// Part 09: the constrained views of the spec's examples, by their QL statements.
+enum class ConstrainedView : uint8_t { CharacterName, AccountStats, AccountCharacters, PerGender, Ledger, UserIdentity, PcName };
 
 class VerdictRig {
 public:
@@ -192,12 +199,20 @@ public:
     }
     /// Part 09: topic 1 of the spec's character examples, as the rig's source.
     struct Char { uint64_t id = 0; uint64_t userId = 0; std::string name; uint16_t gender = 0; int64_t lastPlayed = 0; uint8_t intent = 0; bool tombstone = false; };
-    static rune::codec::Descriptor characterDescriptor() {
-        using rune::codec::PrimType;
-        return rune::codec::DescriptorBuilder("character", 1).add("characterId", PrimType::UInt64, 1, true).add("userId", PrimType::UInt64)
-            .addFixedStr("name", 16).add("gender", PrimType::UInt16).add("lastPlayed", PrimType::Int64).build();
+    static constexpr const char* kCharacterTopic = "topic character { characterId uint64, userId uint64, name string(16), gender uint16, lastPlayed int64 } partitions 1 key characterId;";
+    static constexpr const char* kLedgerTopic = "topic entry { entryId uint64, account uint64, amount int64, memo string(16) } partitions 1 key entryId;";
+    /// The rig's source from a QL topic statement; the views of createConstrainedView() are authored over it.
+    void createQlTopic(const char* statement, bool autoIncrement) {
+        srcTopic_ = parseTopic(statement);
+        createSourceTopic(rune::ql::toDescriptor(srcTopic_), autoIncrement);
     }
-    void createCharacterTopic(bool autoIncrement = true) { createSourceTopic(characterDescriptor(), autoIncrement); }
+    static rune::ql::TopicDef parseTopic(const char* statement) {
+        auto parsed = rune::ql::parse(statement);
+        if (!parsed) throw std::runtime_error(parsed.error().message);
+        return std::get<rune::ql::TopicDef>(*parsed);
+    }
+    void createCharacterTopic(bool autoIncrement = true) { createQlTopic(kCharacterTopic, autoIncrement); }
+    void createLedgerTopic() { createQlTopic(kLedgerTopic, false); }
     /// One record of the current source: the wire key and the key field are `key`; `ints` / `strs` set the other fields by name.
     struct SrcRecord {
         uint64_t key = 0; uint8_t intent = 0; bool tombstone = false;
@@ -242,6 +257,80 @@ public:
         for (const Char& c : chars) recs.push_back(srcOf(c));
         return appendRecords(recs, wireAcks, pid, seq);
     }
+    struct Entry { uint64_t id = 0; uint64_t account = 0; int64_t amount = 0; std::string memo; bool tombstone = false; };
+    int64_t appendEntries(std::span<const Entry> entries, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1) {
+        std::vector<SrcRecord> recs;
+        for (const Entry& e : entries) recs.push_back(SrcRecord{e.id, 0, e.tombstone, {{"account", e.account}, {"amount", static_cast<uint64_t>(e.amount)}}, {{"memo", e.memo}}});
+        return appendRecords(recs, wireAcks, pid, seq);
+    }
+
+    struct ConstrainedLive { int32_t topicId; rune::view::CompileResult comp; };
+    std::map<ConstrainedView, ConstrainedLive> constrained;   ///< the views created and not dropped
+
+    [[nodiscard]] static uint64_t objectIdOf(ConstrainedView v) { return 7 + static_cast<uint64_t>(v); }
+    [[nodiscard]] static std::string statementOf(ConstrainedView v, int64_t cap) {
+        switch (v) {
+        case ConstrainedView::CharacterName: return "create unique view character_name key lower(name) as nameKey as select characterId from character;";
+        case ConstrainedView::AccountStats:
+            return "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= " + std::to_string(cap) + ");";
+        case ConstrainedView::AccountCharacters: return "create view account_characters key (userId, characterId) as select name, gender, lastPlayed from character;";
+        case ConstrainedView::PerGender:
+            return "create view per_gender key (userId, gender) as select count(*) as n from character group by userId, gender constraint two_per_gender check (n <= 2);";
+        case ConstrainedView::Ledger:
+            return "create view balances key account as select sum(amount) as balance from entry group by account constraint non_negative check (balance >= 0);";
+        case ConstrainedView::UserIdentity: return "create unique view user_identity key (provider, subject) as select userId from user;";
+        case ConstrainedView::PcName: return "create unique view pc_name key lower(name) as nameKey as select id from pc;";
+        }
+        return {};
+    }
+    /// The compiled plan of `v` over `topic` (the source topic srcTopicId), as the AdminWorker authors it.
+    [[nodiscard]] static rune::view::CompileResult authorConstrainedView(const rune::ql::TopicDef& topic, int32_t srcTopicId, ConstrainedView v, int64_t cap, int32_t viewTopicId) {
+        auto parsed = rune::ql::parse(statementOf(v, cap));
+        if (!parsed) throw std::runtime_error(parsed.error().message);
+        auto authored = rune::ql::applyViewPlan(std::get<rune::ql::CreateViewDef>(*parsed), rune::ql::viewSourceOf(topic));
+        if (!authored) throw std::runtime_error(authored.error().message);
+        authored->sources[0].topicId = srcTopicId;
+        const rune::codec::Descriptor src = rune::ql::toDescriptor(topic);
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto compiled = rune::view::compileView(*authored, srcs, viewTopicId);
+        if (!compiled) throw std::runtime_error(compiled.error().message);
+        compiled->plan.viewObjectId = objectIdOf(v);
+        compiled->plan.persistence = 1;
+        return std::move(*compiled);
+    }
+    /// A view topic id for the `generation`-th plan of `v`.
+    [[nodiscard]] static int32_t constrainedTopicId(ConstrainedView v, int generation) { return static_cast<int32_t>(0x40000000 + objectIdOf(v) + 0x100 * static_cast<uint64_t>(generation)); }
+    /// The view is created: its install frame and the catalog mark of the event.  Returns its view topic id.
+    int32_t createConstrainedView(ConstrainedView v, int64_t cap = 12, bool persisted = false) {
+        auto comp = authorConstrainedView(srcTopic_, kSrc, v, cap, constrainedTopicId(v, ++constrainedGen_));
+        const int32_t id = comp.plan.viewTopicId;
+        installCompiledView(comp, objectIdOf(v), persisted);
+        constrained[v] = ConstrainedLive{id, std::move(comp)};
+        return id;
+    }
+    /// The same object under a new plan: one event (install of the new plan, uninstall of the old, one mark).
+    void replaceConstrainedView(ConstrainedView v, int64_t cap, bool persisted = false) {
+        auto comp = authorConstrainedView(srcTopic_, kSrc, v, cap, constrainedTopicId(v, ++constrainedGen_));
+        const int32_t id = comp.plan.viewTopicId;
+        replaceCompiledView(constrained.at(v).topicId, std::pair{comp, objectIdOf(v)}, persisted);
+        constrained[v] = ConstrainedLive{id, std::move(comp)};
+    }
+    void dropConstrainedView(ConstrainedView v) {
+        replaceCompiledView(constrained.at(v).topicId, std::nullopt);
+        constrained.erase(v);
+    }
+    /// The plan fingerprint the judge knows `v` by.
+    [[nodiscard]] uint64_t fingerprintOf(ConstrainedView v, bool persisted) const {
+        rune::view::CompiledViewPlan plan = constrained.at(v).comp.plan;
+        plan.persistence = persisted ? 0 : 1;
+        return rune::view::verdictPlanFingerprint(rune::view::serialize(plan));
+    }
+    [[nodiscard]] const ViewInstance* constrainedInstance(ConstrainedView v) const { return vs->instanceForTest(constrained.at(v).topicId, tuning_.partition); }
+    [[nodiscard]] std::size_t uniqueConflicts(ConstrainedView v) const {
+        const ViewFoldCounters* c = vs->foldCounters(constrained.at(v).topicId, tuning_.partition);
+        return c == nullptr ? 0 : c->uniqueConflicts;
+    }
+
     /// The control thread's install frame of a compiled view, then the catalog mark of the event.  `persisted` views need the IO agent.
     void installCompiledView(rune::view::CompileResult c, uint64_t objectId, bool persisted = false) {
         c.plan.viewObjectId = objectId;
@@ -423,6 +512,12 @@ public:
         m.uninstall = true;
         ASSERT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m));
         passes(3);
+    }
+    /// A verdict marker batch without rejections (base offset 0, stamped by replicate()).
+    static std::vector<uint8_t> markerBatch(int64_t from, int64_t finalThrough, uint32_t setId) {
+        std::vector<uint8_t> b(rune::storage::control_record::markerBatchBytes(0));
+        EXPECT_EQ(rune::storage::control_record::buildVerdictMarker(b, rune::storage::control_record::MarkerHeader{from, finalThrough, setId, 0}, {}), b.size());
+        return b;
     }
     /// A constraint-set change batch (base offset 0, stamped by replicate()).
     static std::vector<uint8_t> changeBatch(uint32_t setId, std::vector<rune::storage::control_record::ChangeMember> members, int64_t catalogThrough = -1) {
@@ -1004,6 +1099,19 @@ public:
         return false;
     }
 
+    /// Passes until the judge reached `target` (default: the end of the log).  Its markers are not waited for: a stretch under no
+    /// constraint carries none, and a change to a non-empty set is marked with the next record.
+    bool driveUntilJudgeReaches(int64_t target = -1) {
+        if (target < 0) target = dataEnd();
+        for (int i = 0; i < kMaxPass; ++i) {
+            const VerdictSource* judge = vs->verdictSource(kSrc, tuning_.partition);
+            if (judge == nullptr || judge->judgedThrough() >= target) return true;
+            if (isr_.size() > 1 && i % 8 == 0) followerFetch();
+            pass();
+        }
+        return false;
+    }
+
     /// Drives until the view's instance folded through `target` (and serves).
     void driveUntilFolded(int32_t viewTopicId, int64_t target) {
         for (int iter = 0; iter < kCollectMaxPasses; ++iter) {
@@ -1263,6 +1371,8 @@ private:
     }
     std::optional<AutoIncShape> autoInc_;
     uint64_t grantEpoch_ = 0;
+    rune::ql::TopicDef srcTopic_;   ///< the QL statement of the source (createQlTopic)
+    int constrainedGen_ = 0;
     int64_t catalogPos_ = -1;   ///< the catalog position of the last view event the rig sent a mark for
     int64_t rollBytes_;
     RigTuning tuning_;

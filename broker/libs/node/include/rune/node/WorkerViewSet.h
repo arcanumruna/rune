@@ -401,6 +401,8 @@ public:
         const auto it = keyIndexes_.find(instKey(src, partition));
         return it == keyIndexes_.end() ? -1 : it->second.foldCursor;
     }
+    /// Test seam: a unique or check view as the install frame would register it.
+    void installConstrainedViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout, rune::codec::Descriptor src, bool persisted);
     /// Test seam: a TestReject verdict view (viewObjectId, rule) over the source of `plan`.
     void installTestVerdictViewForTest(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout, rune::codec::Descriptor src,
                                        bool persisted, uint64_t viewObjectId, TestRejectRule rule, bool underRecovery = false);
