@@ -1935,11 +1935,13 @@ if(BUILD_TESTING)
                        tests/client/ProducerIdBrokerRegressionTest.cpp
                        tests/client/CorruptSegmentBrokerRegressionTest.cpp
                        tests/client/CheckedWritesBrokerRegressionTest.cpp
-                       tests/client/CheckedWritesTransientViewBrokerRegressionTest.cpp)
+                       tests/client/CheckedWritesTransientViewBrokerRegressionTest.cpp
+                       tests/client/CheckedWritesQlBrokerRegressionTest.cpp)
+        target_compile_definitions(rune_client_broker_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         # Phase 2b B Task 8b: ClaimBrokerRegressionTest compiles against the client's build-time generated all-fixed
         # `position.gen.h` (rune_gen_claim_schemas); the embedded client builds it under its own binary dir.
         add_dependencies(rune_client_broker_tests generate_claim_schema_headers)
-        target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests
+        target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${RUNE_CLIENT_ROOT}/src/cli
                                    ${CMAKE_BINARY_DIR}/rune-client/claim-gen)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_view rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
