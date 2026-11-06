@@ -5010,6 +5010,15 @@ void BrokerNode::fanoutViewPlan_(ViewPlanUpdateMsg msg) {
     (void)pumpViewFanout_();
 }
 
+void BrokerNode::fanoutCatalogMark_(int64_t appliedThrough) {
+    // The mark queues behind every plan install and uninstall of the events it covers (#788); an undelivered mark ahead of nothing else is raised in place.
+    if (!viewFanoutBacklog_.empty() && viewFanoutBacklog_.back().catalogMark >= 0 && viewFanoutBacklog_.back().nextWorker == 0)
+        viewFanoutBacklog_.back().catalogMark = std::max(viewFanoutBacklog_.back().catalogMark, appliedThrough);
+    else
+        viewFanoutBacklog_.push_back(ViewFanoutPending{{}, 0, appliedThrough});
+    (void)pumpViewFanout_();
+}
+
 int BrokerNode::pumpViewFanout_() {
     int work = 0;
     std::size_t done = 0;
@@ -5017,13 +5026,14 @@ int BrokerNode::pumpViewFanout_() {
     for (auto& pend : viewFanoutBacklog_) {
         while (pend.nextWorker < n) {
             ViewSnapshotChannel* ch = viewSnapshotChannels_[pend.nextWorker].get();
-            if (ch && !encodeViewPlanUpdate(ch->install,
-                                            ViewSnapshotChannel::kInstallMsgType, pend.msg))
+            if (ch && !(pend.catalogMark >= 0 ? encodeCatalogMark(ch->install, pend.catalogMark)
+                                              : encodeViewPlanUpdate(ch->install, ViewSnapshotChannel::kInstallMsgType, pend.msg)))
                 break;   // ring full → retry next cycle (FIFO: later plans wait)
             ++pend.nextWorker;
             ++work;
         }
         if (pend.nextWorker < n) break;   // FIFO back-pressure
+        if (pend.catalogMark >= 0) { ++done; continue; }
         // Task 12 (N5): the plan is on every worker's install ring — a worker
         // drains it before answering a GetViewRow it has no plan for.
         if (gateway_ && !pend.msg.uninstall) gateway_->noteViewPlanDelivered(pend.msg.viewTopicId);
@@ -5168,6 +5178,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
                 if (decodeCatalogApplied(p, n, offset, digest)) {
                     catalogAppliedValue_ = offset;
                     publishCatalogMetrics_();
+                    fanoutCatalogMark_(offset);
                 } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
                     spdlog::error("BrokerNode[{}]: malformed kA2cCatalogApplied (len={}) skipped", config_.nodeId, n);
                 }

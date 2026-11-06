@@ -341,8 +341,14 @@ int WorkerViewSet::drainInstalls() {
     return channel_.install.drain(
         [this](int32_t tid, aeron::concurrent::AtomicBuffer& b,
                aeron::util::index_t off, aeron::util::index_t len) {
-            if (tid != ViewSnapshotChannel::kInstallMsgType) return;
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            if (tid == ViewSnapshotChannel::kCatalogMarkMsgType) {
+                int64_t appliedThrough;
+                std::memcpy(&appliedThrough, p, sizeof appliedThrough);
+                catalogThrough_ = std::max(catalogThrough_, appliedThrough);
+                return;
+            }
+            if (tid != ViewSnapshotChannel::kInstallMsgType) return;
             const ViewPlanUpdateMsg m = decodeViewPlanUpdate(p, static_cast<std::size_t>(len));
             if (m.uninstall) {   // catalog history Task 8: DropView / AlterView retired it
                 (void)uninstallView(m.viewTopicId);
@@ -1219,8 +1225,22 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     return judge;
 }
 
+bool WorkerViewSet::catalogBehind_(int32_t srcTopicId, VerdictSource& judge, const PartitionWriteState& write) {
+    const ConstraintSet& logged = write.constraintSets.latest();
+    if (catalogThrough_ >= logged.catalogThrough) return false;
+    // The logged set was computed at a catalog position this worker has not applied: any difference from the installed templates is a
+    // newer DDL change, never a stale one.  The sync reruns when a mark, an install or a new logged change moves one of its keys.
+    spdlog::debug("constraint set sync: topic {} partition {}: catalog gate closed, applied through {} < logged set {} computed at {}; keeping the logged set",
+                  srcTopicId, judge.partition(), catalogThrough_, logged.id, logged.catalogThrough);
+    judge.constraintSyncEpoch = verdictEpoch_;
+    judge.constraintSyncChange = write.constraintSets.lastChangeOffset();
+    judge.constraintSyncCatalog = catalogThrough_;
+    return true;
+}
+
 int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write) {
-    if (judge.constraintSyncEpoch == verdictEpoch_ && judge.constraintSyncChange == write.constraintSets.lastChangeOffset()) return 0;
+    if (judge.constraintSyncEpoch == verdictEpoch_ && judge.constraintSyncChange == write.constraintSets.lastChangeOffset() && judge.constraintSyncCatalog == catalogThrough_) return 0;
+    if (catalogBehind_(srcTopicId, judge, write)) return 0;
     const ConstraintSet& logged = write.constraintSets.latest();
     const auto sit = subscriptionIndex_.find(srcTopicId);
     std::vector<ConstraintSetMember>& want = constraintWant_;
@@ -1262,6 +1282,7 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
         want.push_back(ConstraintSetMember{0, rune::view::VerdictViewKind::KeyIndex, kKeyIndexPlanFingerprint});
     std::sort(want.begin(), want.end(), [](const ConstraintSetMember& a, const ConstraintSetMember& b) { return a.viewObjectId < b.viewObjectId; });
     ConstraintSet desired;
+    desired.catalogThrough = catalogThrough_;   // a change request is stamped with the position it was computed at
     desired.count = static_cast<uint8_t>(std::min(want.size(), desired.members.size()));
     std::copy_n(want.begin(), desired.count, desired.members.begin());
     int work = 0;
@@ -1274,8 +1295,8 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
         if (spdlog::should_log(spdlog::level::debug)) {
             const auto d = judge.diagSnapshot();
             spdlog::debug("constraint set sync: topic {} partition {}: logged set {} ({} members) -> wanted {} members, change at offset {} (result {}), "
-                          "leader generation {}", srcTopicId, judge.partition(), logged.id, logged.count, desired.count, write.constraintSets.lastChangeOffset(),
-                          r, d.leaderGeneration);
+                          "leader generation {}, catalog gate open: applied through {} >= logged set computed at {}", srcTopicId, judge.partition(), logged.id, logged.count,
+                          desired.count, write.constraintSets.lastChangeOffset(), r, d.leaderGeneration, catalogThrough_, logged.catalogThrough);
             for (uint8_t i = 0; i < logged.count; ++i) {
                 static constexpr const char* kWhy[] = {"live", "replaced", "gone", "kept (plan not installed here)"};
                 spdlog::debug("constraint set sync: topic {} partition {}: member object {} fingerprint {}: {}{}", srcTopicId, judge.partition(),
@@ -1286,6 +1307,7 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     }
     judge.constraintSyncEpoch = verdictEpoch_;
     judge.constraintSyncChange = write.constraintSets.lastChangeOffset();
+    judge.constraintSyncCatalog = catalogThrough_;
     return work;
 }
 

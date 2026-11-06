@@ -72,6 +72,7 @@ public:
     /// What WorkerViewSet::syncConstraintSet_ last reconciled this judge against: the template epoch and the latest logged change.
     uint64_t constraintSyncEpoch = UINT64_MAX;
     int64_t  constraintSyncChange = -2;
+    int64_t  constraintSyncCatalog = -2;   ///< WorkerViewSet::catalogThrough_ at that sync
 
     VerdictSource(int32_t srcTopicId, int32_t partition);
 
@@ -242,10 +243,12 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
     } else if (c->type == cr::kConstraintSetChange) {
         std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
         uint32_t id = 0;
+        int64_t catalogThrough = 0;
         uint16_t count = 0;
-        if (!cr::parseConstraintSetChange(*c, id, wire, count)) return;
+        if (!cr::parseConstraintSetChange(*c, id, catalogThrough, wire, count)) return;
         ConstraintSet set;
         set.id = id;
+        set.catalogThrough = catalogThrough;
         set.count = static_cast<uint8_t>(count);
         for (uint16_t i = 0; i < count; ++i)
             set.members[i] = ConstraintSetMember{wire[i].viewObjectId, static_cast<rune::view::VerdictViewKind>(wire[i].kind), wire[i].planFingerprint};

@@ -357,7 +357,7 @@ TEST(CheckedWritesVerdictSource, FeedMergesMarkersAndChanges) {
     PartitionWriteState st;
     std::vector<uint8_t> change(cr::changeBatchBytes(1));
     const cr::ChangeMember cm{7, uint8_t(VerdictViewKind::TestReject), 1234};
-    ASSERT_NE(cr::buildConstraintSetChange(change, 1, std::span<const cr::ChangeMember>(&cm, 1)), 0u);
+    ASSERT_NE(cr::buildConstraintSetChange(change, 1, -1, std::span<const cr::ChangeMember>(&cm, 1)), 0u);
     verdictFeedBatch(&st, change.data(), change.size(), 10);
     std::vector<uint8_t> marker(cr::markerBatchBytes(1));
     const cr::MarkerEntry me{2, kViolation, 0x00070001};
@@ -420,7 +420,7 @@ std::vector<uint8_t> controlOfType(int16_t type, int64_t base) {
         (void)cr::buildVerdictMarker(b, cr::MarkerHeader{0, 0, 0, 0}, {});
     } else if (type == cr::kConstraintSetChange) {
         b.resize(cr::changeBatchBytes(0));
-        (void)cr::buildConstraintSetChange(b, 1, {});
+        (void)cr::buildConstraintSetChange(b, 1, -1, {});
     } else {
         b.resize(cr::detail::batchBytes(6));
         std::size_t p = cr::detail::beginBatch(b.data(), type, 6);
@@ -909,7 +909,7 @@ TEST(CheckedWritesVerdictSourceRegression, RebuildAcrossACompactionGapBeforeTheM
     };
     std::vector<uint8_t> change(cr::changeBatchBytes(1));
     const cr::ChangeMember cm{x.objectId, uint8_t(VerdictViewKind::TestReject), x.rule.fingerprint()};
-    (void)cr::buildConstraintSetChange(change, 1, std::span<const cr::ChangeMember>(&cm, 1));
+    (void)cr::buildConstraintSetChange(change, 1, -1, std::span<const cr::ChangeMember>(&cm, 1));
     put(change, 0, 1);                                                  // 0: the set {x}
     data(1, {{1, 1}});                                                  // 1
     data(2, {{2, 9}});                                                  // 2: rejected, compacted away
@@ -984,7 +984,7 @@ void catchUpAcrossTheGapAtTheBound(const char* name, bool markerAboveHw) {
     };
     std::vector<uint8_t> change(cr::changeBatchBytes(1));
     const cr::ChangeMember cm{x.objectId, uint8_t(VerdictViewKind::TestReject), x.rule.fingerprint()};
-    (void)cr::buildConstraintSetChange(change, 1, std::span<const cr::ChangeMember>(&cm, 1));
+    (void)cr::buildConstraintSetChange(change, 1, -1, std::span<const cr::ChangeMember>(&cm, 1));
     put(change, 0, 1);
     data(1, {{1, 1}});
     data(2, {{2, 9}});

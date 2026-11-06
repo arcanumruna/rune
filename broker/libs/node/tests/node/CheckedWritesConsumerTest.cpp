@@ -271,7 +271,7 @@ TEST_P(CheckedWritesConsumer, ControlRecordsSixteenToNineteenAreNeverPushed) {
             (void)cr::buildVerdictMarker(b, cr::MarkerHeader{0, 0, 0, 0}, {});
         } else if (type == cr::kConstraintSetChange) {
             b.resize(cr::changeBatchBytes(0));
-            (void)cr::buildConstraintSetChange(b, 1, {});
+            (void)cr::buildConstraintSetChange(b, 1, -1, {});
         } else {
             b.resize(cr::detail::batchBytes(6));
             std::size_t p = cr::detail::beginBatch(b.data(), type, 6);

@@ -341,8 +341,9 @@ int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, 
                     case cr::kConstraintSetChange: {
                         std::array<cr::ChangeMember, 32> wire{};
                         uint32_t id = 0;
+                        int64_t catalogThrough = 0;
                         uint16_t count = 0;
-                        if (cr::parseConstraintSetChange(*c, id, wire, count)) verdicts.onConstraintSetChange(base, count != 0);
+                        if (cr::parseConstraintSetChange(*c, id, catalogThrough, wire, count)) verdicts.onConstraintSetChange(base, count != 0);
                         break;
                     }
                     case cr::kReservation:   // only one the leader's scan reads as a reservation (a bad payload must not outrank it)

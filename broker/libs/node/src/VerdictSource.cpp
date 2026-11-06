@@ -608,7 +608,7 @@ int64_t VerdictSource::requestChange(const ConstraintSet& next, bool refresh) {
     std::array<cr::ChangeMember, kMaxVerdictViewsPerSource> wire{};
     for (uint8_t i = 0; i < logged.count; ++i)
         wire[i] = cr::ChangeMember{logged.members[i].viewObjectId, static_cast<uint8_t>(logged.members[i].kind), logged.members[i].planFingerprint};
-    const std::size_t n = cr::buildConstraintSetChange(scratch_, logged.id, std::span<const cr::ChangeMember>(wire.data(), logged.count));
+    const std::size_t n = cr::buildConstraintSetChange(scratch_, logged.id, logged.catalogThrough, std::span<const cr::ChangeMember>(wire.data(), logged.count));
     const std::span<const uint8_t> batch(scratch_.data(), n);
     int64_t base;
     if (replica_ != nullptr) {

@@ -371,6 +371,9 @@ public:
     void dropSourceTopic(int32_t srcTopicId);
     /// Cold: a topic's write spec changed key.index, so syncConstraintSet_ must run again.
     void noteWriteSpecChange() noexcept { ++verdictEpoch_; }
+    /// Test seam: this worker's catalog position is at least `through` (a cluster test cannot hold one node's catalog back).
+    void raiseCatalogThroughForTest(int64_t through) noexcept { catalogThrough_ = std::max(catalogThrough_, through); }
+    [[nodiscard]] int64_t catalogThroughForTest() const noexcept { return catalogThrough_; }
     /// Test seam: every judge, existing and later created, is held (nothing activates, replays or judges).
     void holdJudgesForTest(bool hold) noexcept {
         holdJudges_ = hold;
@@ -664,6 +667,9 @@ private:
     [[nodiscard]] const ViewInstance* serveInstance_(int32_t viewTopicId, int32_t partition, const rune::view::RowLayout*& outLayout,
                                                      RowStatus* outStatus) const;
     void onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status, ViewDiscardReason reason);
+    /// The catalog gate every constraint-set change request passes (#788): true while this worker's catalog has not applied the
+    /// position the logged set was computed at.  The request must then be left unasked; one that goes ahead stamps `catalogThrough_`.
+    [[nodiscard]] bool catalogBehind_(int32_t srcTopicId, VerdictSource& judge, const PartitionWriteState& write);
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
     int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
     void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
@@ -692,6 +698,7 @@ private:
     std::unordered_map<uint64_t, ViewInstance> keyIndexes_;
     bool holdJudges_ = false;
     struct Retired { int32_t viewTopicId, partition; };
+    int64_t catalogThrough_ = -1;   // the latest catalog position this node's control thread marked here; never moves back (#788)
     uint64_t verdictEpoch_ = 0;   // bumped by every verdict template install, retire and erase; syncConstraintSet_ reruns on a change
     std::vector<Retired> retiredQueue_;   // the members the judges dropped, per partition
     std::vector<ConstraintSetMember> constraintWant_;   // syncConstraintSet_ scratch: grows once, never per pass

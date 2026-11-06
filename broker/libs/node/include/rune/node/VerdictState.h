@@ -22,6 +22,7 @@ inline constexpr std::size_t kMaxVerdictViewsPerSource = 32;
 
 struct ConstraintSet {
     uint32_t id    = 0;
+    int64_t  catalogThrough = -1;   ///< the catalog position the set was computed at (#788); not part of the members
     uint8_t  count = 0;
     std::array<ConstraintSetMember, kMaxVerdictViewsPerSource> members{};
 

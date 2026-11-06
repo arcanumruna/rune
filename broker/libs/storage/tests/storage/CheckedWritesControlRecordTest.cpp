@@ -38,18 +38,34 @@ TEST(CheckedWritesControlRecord, MarkerRoundTrips) {
 TEST(CheckedWritesControlRecord, ChangeRoundTrips) {
     const std::vector<cr::ChangeMember> m{{0, 1, 0}, {7, 200, 0xF00D}};
     std::vector<uint8_t> b(cr::changeBatchBytes(2));
-    ASSERT_EQ(cr::buildConstraintSetChange(b, 2, m), b.size());
+    ASSERT_EQ(cr::buildConstraintSetChange(b, 2, 41, m), b.size());
     EXPECT_EQ(cr::recordType(b.data(), b.size()), cr::kConstraintSetChange);
     uint32_t setId = 0;
+    int64_t catalogThrough = 0;
     uint16_t count = 0;
     std::vector<cr::ChangeMember> out(8);
-    ASSERT_TRUE(cr::parseConstraintSetChange(b.data(), b.size(), setId, out, count));
+    ASSERT_TRUE(cr::parseConstraintSetChange(b.data(), b.size(), setId, catalogThrough, out, count));
     EXPECT_EQ(setId, 2u);
+    EXPECT_EQ(catalogThrough, 41);
     ASSERT_EQ(count, 2);
     EXPECT_EQ(out[1].viewObjectId, 7u);
     EXPECT_EQ(out[1].kind, 200);
     EXPECT_EQ(out[1].planFingerprint, 0xF00Du);
-    EXPECT_FALSE(cr::parseConstraintSetChange(b.data(), b.size(), setId, std::span<cr::ChangeMember>(out.data(), 1), count));
+    EXPECT_FALSE(cr::parseConstraintSetChange(b.data(), b.size(), setId, catalogThrough, std::span<cr::ChangeMember>(out.data(), 1), count));
+}
+
+TEST(CheckedWritesControlRecordRegression, VersionOneChangeIsUnparseableRegression) {
+    // Type 18 was never released at version 1 (#788): a v1 payload, CRC-valid or not, is not a change record.
+    std::vector<uint8_t> b(cr::changeBatchBytes(0));
+    ASSERT_EQ(cr::buildConstraintSetChange(b, 1, 5, {}), b.size());
+    ASSERT_TRUE(cr::parseControl(b.data(), b.size()).has_value());
+    const std::size_t versionAt = b.size() - 1 - cr::kChangeFixedBytes;
+    ASSERT_EQ(b[versionAt], cr::kChangePayloadVersion);
+    b[versionAt] = 1;
+    const uint32_t crc = rune::protocol::crc32c(b.data() + rune::protocol::batch::kAttributesOffset, b.size() - rune::protocol::batch::kAttributesOffset);
+    std::memcpy(b.data() + rune::protocol::batch::kCrcOffset, &crc, 4);
+    EXPECT_FALSE(cr::parseControl(b.data(), b.size()).has_value());
+    EXPECT_EQ(cr::recordType(b.data(), b.size()), cr::kUnparseable);
 }
 
 TEST(CheckedWritesControlRecord, MaxMarkerFitsAndOneMoreIsRefused) {
@@ -102,7 +118,7 @@ TEST(CheckedWritesControlRecordRegression, ParseControlOnceGivesTypeAndViewsRegr
     const auto marker1 = marker(100, 140, 3, {{5, 55, 0x00070001}, {12, 56, 0}});
     const std::vector<cr::ChangeMember> members{{0, 1, 0}, {7, 200, 0xF00D}};
     std::vector<uint8_t> change(cr::changeBatchBytes(2));
-    ASSERT_EQ(cr::buildConstraintSetChange(change, 2, members), change.size());
+    ASSERT_EQ(cr::buildConstraintSetChange(change, 2, -1, members), change.size());
 
     // type 17 and 18: the type matches, and the view parse equals the raw parse
     const auto cm = cr::parseControl(marker1.data(), marker1.size());
@@ -130,11 +146,13 @@ TEST(CheckedWritesControlRecordRegression, ParseControlOnceGivesTypeAndViewsRegr
     ASSERT_TRUE(cc.has_value());
     EXPECT_EQ(cc->type, cr::kConstraintSetChange);
     uint32_t idV = 0, idR = 0;
+    int64_t ctV = 0, ctR = 0;
     uint16_t nV = 0, nR = 0;
     std::vector<cr::ChangeMember> outV(8), outR(8);
-    ASSERT_TRUE(cr::parseConstraintSetChange(*cc, idV, outV, nV));
-    ASSERT_TRUE(cr::parseConstraintSetChange(change.data(), change.size(), idR, outR, nR));
+    ASSERT_TRUE(cr::parseConstraintSetChange(*cc, idV, ctV, outV, nV));
+    ASSERT_TRUE(cr::parseConstraintSetChange(change.data(), change.size(), idR, ctR, outR, nR));
     EXPECT_EQ(idV, idR);
+    EXPECT_EQ(ctV, ctR);
     ASSERT_EQ(nV, nR);
     EXPECT_EQ(outV[1].planFingerprint, outR[1].planFingerprint);
     EXPECT_EQ(outV[1].viewObjectId, 7u);
@@ -143,7 +161,7 @@ TEST(CheckedWritesControlRecordRegression, ParseControlOnceGivesTypeAndViewsRegr
     EXPECT_FALSE(cr::parseMarkerHeader(*cc).has_value());
     EXPECT_FALSE(cr::parseMarker(*cc).has_value());
     EXPECT_FALSE(cr::forEachMarkerEntry(*cc, [](int64_t, uint16_t, uint32_t) {}));
-    EXPECT_FALSE(cr::parseConstraintSetChange(*cm, idV, outV, nV));
+    EXPECT_FALSE(cr::parseConstraintSetChange(*cm, idV, ctV, outV, nV));
 
     // types 16 and 19 are control records too, and parse to their type
     for (const int16_t t : {cr::kReservation, cr::kTxnJudge}) {

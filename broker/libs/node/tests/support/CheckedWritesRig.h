@@ -327,10 +327,15 @@ public:
         resp.records = std::span<const uint8_t>(bytes.data(), bytes.size());
         replica->applyReplicated(resp);
     }
+    /// The control thread's catalog mark: the node has applied the catalog through `through`, behind every install it sent before.
+    void catalogMark(int64_t through) {
+        ASSERT_TRUE(encodeCatalogMark(channel.install, through));
+        passes(3);
+    }
     /// A constraint-set change batch (base offset 0, stamped by replicate()).
-    static std::vector<uint8_t> changeBatch(uint32_t setId, std::vector<rune::storage::control_record::ChangeMember> members) {
+    static std::vector<uint8_t> changeBatch(uint32_t setId, std::vector<rune::storage::control_record::ChangeMember> members, int64_t catalogThrough = -1) {
         std::vector<uint8_t> b(rune::storage::control_record::changeBatchBytes(static_cast<uint16_t>(members.size())));
-        EXPECT_EQ(rune::storage::control_record::buildConstraintSetChange(b, setId, members), b.size());
+        EXPECT_EQ(rune::storage::control_record::buildConstraintSetChange(b, setId, catalogThrough, members), b.size());
         return b;
     }
 
@@ -853,7 +858,7 @@ public:
 
     // ---- the log, read back ----
     struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; uint64_t valueId = 0; };   ///< valueId: the value's own key field
-    struct RigChange { int64_t offset; std::vector<rune::storage::control_record::ChangeMember> members; };
+    struct RigChange { int64_t offset; std::vector<rune::storage::control_record::ChangeMember> members; int64_t catalogThrough = -1; };
     struct RigMarker { int64_t offset; rune::storage::control_record::MarkerHeader header; std::vector<std::tuple<int64_t, uint16_t, uint32_t>> entries; bool horizon = false; };
     struct RigLog { std::vector<RigLogRec> data; std::vector<RigChange> changes; std::vector<RigMarker> markers; std::vector<std::pair<int64_t, uint64_t>> reservations; };   ///< reservations: (offset, reserved-through n)
 
@@ -1201,8 +1206,8 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
             } else if (r.baseOffset() < through) {
                 if (const auto c = crl::parseControl(b, total); c && c->type == crl::kConstraintSetChange) {
                     std::array<crl::ChangeMember, 32> ms{};
-                    uint32_t setId = 0; uint16_t n = 0;
-                    if (crl::parseConstraintSetChange(*c, setId, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n)});
+                    uint32_t setId = 0; int64_t catalogThrough = -1; uint16_t n = 0;
+                    if (crl::parseConstraintSetChange(*c, setId, catalogThrough, ms, n)) out.changes.push_back({r.baseOffset(), std::vector<crl::ChangeMember>(ms.begin(), ms.begin() + n), catalogThrough});
                 } else if (const auto reserved = crl::parseReservation(b, total)) {
                     out.reservations.emplace_back(r.baseOffset(), *reserved);
                 } else if (c && c->type == crl::kVerdictMarker) {

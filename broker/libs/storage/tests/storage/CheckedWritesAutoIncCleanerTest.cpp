@@ -78,7 +78,7 @@ void reservation(Log& log, int64_t off, uint64_t n) {
 void change(Log& log, int64_t off) {
     std::vector<cr::ChangeMember> ms{cr::ChangeMember{7, 3, 99}};
     std::vector<uint8_t> b(cr::changeBatchBytes(ms.size()));
-    (void)cr::buildConstraintSetChange(b, 1, ms);
+    (void)cr::buildConstraintSetChange(b, 1, -1, ms);
     stampBase(b, off);
     log.append(b, off);
 }

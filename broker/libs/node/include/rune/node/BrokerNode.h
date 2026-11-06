@@ -2918,7 +2918,7 @@ private:
     std::unique_ptr<rune::consensus::BackoffIdleStrategy> viewSnapshotIoIdleStrategy_;
     rune::consensus::MonotonicNanoClock                   viewSnapshotIoClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         viewSnapshotIoRunner_;
-    struct ViewFanoutPending { ViewPlanUpdateMsg msg; int32_t nextWorker = 0; };
+    struct ViewFanoutPending { ViewPlanUpdateMsg msg; int32_t nextWorker = 0; int64_t catalogMark = -1; };   // catalogMark >= 0: a kCatalogMarkMsgType frame, msg unused
     std::vector<ViewFanoutPending>                        viewFanoutBacklog_;  // control-thread-owned
 
     // Catalog history Task 8 (control-thread-owned): the drop sequence's states
@@ -2975,6 +2975,7 @@ private:
     std::size_t                                           nsDirMismatchesAtBoot_ = 0;   // '*.deleting' dirs of a live namespace (fatal)
     CleanerViewChannel*                                   cleanerViewChannel_ = nullptr;   // owned by runtimeAgent_
     void fanoutViewPlan_(ViewPlanUpdateMsg msg);   // control thread
+    void fanoutCatalogMark_(int64_t appliedThrough);   // control thread: behind every queued plan frame
     int  pumpViewFanout_();                        // control thread (every cycle)
     // Restart recovery (catalog history Task 9): every live view is reinstalled
     // by the __catalog boot replay (AdminWorker::bootCatalog, the boot sink's

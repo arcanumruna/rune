@@ -1396,7 +1396,7 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_checked_writes_ack_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 04: the verdict pipeline on a real Worker.
-            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp)
+            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp tests/node/CheckedWritesCatalogGateTest.cpp)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
@@ -1964,6 +1964,13 @@ if(BUILD_TESTING)
         target_link_libraries(rune_checked_writes_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
                               rune_client_api aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_checked_writes_stress_tests PROPERTIES TIMEOUT 1800 LABELS stress)
+
+        # Checked writes Part 09 Task 5a (#788): a lagging leader never undoes a newer constraint-set change, on three real brokers.
+        add_executable(rune_checked_writes_catalog_gate_cluster_tests tests/integration/CheckedWritesCatalogGateClusterTest.cpp)
+        target_include_directories(rune_checked_writes_catalog_gate_cluster_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_checked_writes_catalog_gate_cluster_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
+                              rune_client_api aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_checked_writes_catalog_gate_cluster_tests PROPERTIES TIMEOUT 600)
 
         # Namespaces Task 11: the REAL client namespace API and the REAL `rune namespace` / `rune ql` CLI against ONE
         # real authenticating BrokerNode.

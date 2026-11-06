@@ -3,12 +3,13 @@
 //
 // A control batch with attributes = kAttrControl ONLY (0x0020, transactional clear), producerId / producerEpoch /
 // baseSequence = -1 and one record in standard record framing.  The record key is the int16 LE type, the value is
-// [version u8 = 1][payload], all little-endian.  producerId -1 keeps these out of TxnCleanState and the PSM feed.
+// [version u8 = 1 (kConstraintSetChange: 2)][payload], all little-endian.  producerId -1 keeps these out of TxnCleanState and the PSM feed.
 // Builders write into a caller buffer with baseOffset 0 (appendControlBatch restamps it, CRC-safe) and never allocate.
 //
 //   kVerdictMarker       [fromOffset i64][finalThrough i64][constraintSetId u32][count u32]
 //                        count x [offsetDelta u32][code u16][constraintId u32]
-//   kConstraintSetChange [constraintSetId u32][count u16] count x [viewObjectId u64][kind u8][planFingerprint u64]
+//   kConstraintSetChange [constraintSetId u32][catalogThrough i64][count u16] count x [viewObjectId u64][kind u8][planFingerprint u64]
+//                        (version byte 2: the catalog position the set was computed at, #788; a version-1 change is unparseable)
 //   kReservation         [reservedThroughN u64]
 //   kTxnJudge (11) is recognised and skipped by every reader; its payload is that part's.
 #include <rune/protocol/Crc32c.h>
@@ -28,6 +29,7 @@ inline constexpr int16_t     kConstraintSetChange = 18;
 inline constexpr int16_t     kTxnJudge            = 19;
 inline constexpr int         kUnparseable         = -1;
 inline constexpr uint8_t     kPayloadVersion      = 1;
+inline constexpr uint8_t     kChangePayloadVersion = 2;
 inline constexpr std::size_t kMaxMarkerEntries    = 4096;
 inline constexpr std::size_t kMaxVerdictPlanBytes = 65536;
 
@@ -37,7 +39,7 @@ struct ChangeMember { uint64_t viewObjectId; uint8_t kind; uint64_t planFingerpr
 
 inline constexpr std::size_t kMarkerFixedBytes = 1 + 8 + 8 + 4 + 4;
 inline constexpr std::size_t kMarkerEntryBytes = 4 + 2 + 4;
-inline constexpr std::size_t kChangeFixedBytes = 1 + 4 + 2;
+inline constexpr std::size_t kChangeFixedBytes = 1 + 4 + 8 + 2;
 inline constexpr std::size_t kChangeMemberBytes = 8 + 1 + 8;
 inline constexpr std::size_t kReservationBytes  = 1 + 8;
 
@@ -129,7 +131,7 @@ inline std::optional<std::span<const uint8_t>> valueOf(const uint8_t* batch, std
     type = get<int16_t>(batch + pos);
     pos += 2;
     if (!getZigzag(batch, len, pos, vlen) || vlen < 1 || pos + static_cast<std::size_t>(vlen) + 1 != len) return std::nullopt;
-    if (batch[pos] != kPayloadVersion || batch[len - 1] != 0) return std::nullopt;
+    if (batch[pos] != (type == kConstraintSetChange ? kChangePayloadVersion : kPayloadVersion) || batch[len - 1] != 0) return std::nullopt;
     return std::span<const uint8_t>(batch + pos, static_cast<std::size_t>(vlen));
 }
 
@@ -182,15 +184,17 @@ inline std::size_t buildVerdictMarker(std::span<uint8_t> out, const MarkerHeader
     return total;
 }
 
-inline std::size_t buildConstraintSetChange(std::span<uint8_t> out, uint32_t constraintSetId, std::span<const ChangeMember> members) noexcept {
+/// `catalogThrough`: the catalog position the set was computed at; a leader asks for a change only once its catalog has applied it.
+inline std::size_t buildConstraintSetChange(std::span<uint8_t> out, uint32_t constraintSetId, int64_t catalogThrough, std::span<const ChangeMember> members) noexcept {
     if (members.size() > UINT16_MAX) return 0;
     const std::size_t total = changeBatchBytes(static_cast<uint16_t>(members.size()));
     if (out.size() < total) return 0;
     const std::size_t valueLen = kChangeFixedBytes + members.size() * kChangeMemberBytes;
     std::size_t p = detail::beginBatch(out.data(), kConstraintSetChange, valueLen);
     uint8_t* d = out.data();
-    d[p++] = kPayloadVersion;
+    d[p++] = kChangePayloadVersion;
     detail::put<uint32_t>(d + p, constraintSetId); p += 4;
+    detail::put<int64_t>(d + p, catalogThrough); p += 8;
     detail::put<uint16_t>(d + p, static_cast<uint16_t>(members.size())); p += 2;
     for (const ChangeMember& m : members) {
         detail::put<uint64_t>(d + p, m.viewObjectId); p += 8;
@@ -270,22 +274,23 @@ bool forEachMarkerEntry(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept
 }
 
 /// false when `c` is not a change record or holds more members than `out`.
-[[nodiscard]] inline bool parseConstraintSetChange(const ControlRecord& c, uint32_t& setId, std::span<ChangeMember> out, uint16_t& count) noexcept {
+[[nodiscard]] inline bool parseConstraintSetChange(const ControlRecord& c, uint32_t& setId, int64_t& catalogThrough, std::span<ChangeMember> out, uint16_t& count) noexcept {
     if (c.type != kConstraintSetChange || c.value.size() < kChangeFixedBytes) return false;
     const uint8_t* p = c.value.data() + 1;
     setId = detail::get<uint32_t>(p);
-    count = detail::get<uint16_t>(p + 4);
+    catalogThrough = detail::get<int64_t>(p + 4);
+    count = detail::get<uint16_t>(p + 12);
     if (c.value.size() != kChangeFixedBytes + count * kChangeMemberBytes || count > out.size()) return false;
-    p += 6;
+    p += 14;
     for (uint16_t i = 0; i < count; ++i, p += kChangeMemberBytes)
         out[i] = ChangeMember{detail::get<uint64_t>(p), p[8], detail::get<uint64_t>(p + 9)};
     return true;
 }
 /// false when `batch` is not a change record or holds more members than `out`.
-[[nodiscard]] inline bool parseConstraintSetChange(const uint8_t* batch, std::size_t len, uint32_t& setId,
+[[nodiscard]] inline bool parseConstraintSetChange(const uint8_t* batch, std::size_t len, uint32_t& setId, int64_t& catalogThrough,
                                                    std::span<ChangeMember> out, uint16_t& count) noexcept {
     const auto c = parseControl(batch, len);
-    return c && parseConstraintSetChange(*c, setId, out, count);
+    return c && parseConstraintSetChange(*c, setId, catalogThrough, out, count);
 }
 
 [[nodiscard]] inline std::optional<uint64_t> parseReservation(const ControlRecord& c) noexcept {

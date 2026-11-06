@@ -1331,7 +1331,7 @@ TEST(CompactionCleanerAgentRegression, ALogHeldAtItsVerdictCoverageIsNotRescanne
     const auto change = [&](int64_t offset) {
         const std::vector<cr::ChangeMember> members{cr::ChangeMember{7, 3, 99}};
         std::vector<uint8_t> b(cr::changeBatchBytes(static_cast<uint16_t>(members.size())));
-        (void)cr::buildConstraintSetChange(b, 1, members);
+        (void)cr::buildConstraintSetChange(b, 1, -1, members);
         control(std::move(b), offset);
     };
     const auto marker = [&](int64_t offset, int64_t from, int64_t through) {
@@ -2970,7 +2970,7 @@ TEST(CompactionCleanerAgentRegression, AHeldLogIsCleanedAgainWhenAMarkerHorizonP
     };
     const std::vector<cr::ChangeMember> members{cr::ChangeMember{7, 3, 99}};
     std::vector<uint8_t> change(cr::changeBatchBytes(static_cast<uint16_t>(members.size())));
-    (void)cr::buildConstraintSetChange(change, 1, members);
+    (void)cr::buildConstraintSetChange(change, 1, -1, members);
     control(std::move(change), 0);
     constexpr int64_t kPid = 9;
     log.append(r1Txn(1, "a", "1", kPid, 0, 0), 1);
