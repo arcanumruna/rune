@@ -104,6 +104,26 @@ TEST(CheckedWritesCatalogGate, MarkOpensTheGateAtTheChangesPositionAndNotBefore)
     EXPECT_EQ(changes.back().catalogThrough, kAhead + 3);
 }
 
+TEST(CheckedWritesCatalogGateRegression, UninstallDrainedBeforeItsMarkIsNotStampedBelowItsEffectsRegression) {
+    // The worker drains the uninstall of event X+1 while its position is still X: the set computed without the member must not be
+    // stamped X, or a leader at exactly X (gate open, template still live) would put the member back.
+    VerdictRig r;
+    r.typed();
+    r.installRejectView(kRej, kObj, tagRule(9));
+    r.passes(50);
+    r.catalogMark(kAhead);
+    ASSERT_EQ(r.readLog().changes.size(), 1u);
+    r.uninstallFrame(kRej);
+    r.passes(100);
+    EXPECT_EQ(r.readLog().changes.size(), 1u) << "a set was stamped before the mark of the uninstall that shaped it";
+    r.catalogMark(kAhead + 1);
+    r.passes(100);
+    const auto changes = r.readLog().changes;
+    ASSERT_EQ(changes.size(), 2u) << "the mark did not reopen the gate";
+    EXPECT_TRUE(changes.back().members.empty());
+    EXPECT_EQ(changes.back().catalogThrough, kAhead + 1);
+}
+
 TEST(CheckedWritesCatalogGate, MarkNeverMovesBackAndStartsBelowEveryPosition) {
     VerdictRig r;
     EXPECT_EQ(r.vs->catalogThroughForTest(), -1);

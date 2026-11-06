@@ -346,11 +346,13 @@ int WorkerViewSet::drainInstalls() {
                 int64_t appliedThrough;
                 std::memcpy(&appliedThrough, p, sizeof appliedThrough);
                 catalogThrough_ = std::max(catalogThrough_, appliedThrough);
+                if (installsSinceMark_) { installsSinceMark_ = false; ++verdictEpoch_; }   // the sync reruns even when the position did not move
                 return;
             }
             if (tid != ViewSnapshotChannel::kInstallMsgType) return;
             const ViewPlanUpdateMsg m = decodeViewPlanUpdate(p, static_cast<std::size_t>(len));
             if (m.uninstall) {   // catalog history Task 8: DropView / AlterView retired it
+                if (isVerdictTemplate_(m.viewTopicId)) installsSinceMark_ = true;
                 (void)uninstallView(m.viewTopicId);
                 return;
             }
@@ -397,6 +399,7 @@ int WorkerViewSet::drainInstalls() {
             installView(std::move(*plan), std::move(layout), std::move(srcDesc),
                         /*persisted=*/m.persistence == 0, /*underRecovery=*/m.recovery);
             if (kind) {   // a unique or check view: its source's judge drives it
+                installsSinceMark_ = true;
                 ViewTemplate& tpl = templates_.at(viewTopicId);
                 ++verdictEpoch_;
                 tpl.isVerdict = true;
@@ -1227,20 +1230,17 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
 
 bool WorkerViewSet::catalogBehind_(int32_t srcTopicId, VerdictSource& judge, const PartitionWriteState& write) {
     const ConstraintSet& logged = write.constraintSets.latest();
-    if (catalogThrough_ >= logged.catalogThrough) return false;
-    // The logged set was computed at a catalog position this worker has not applied: any difference from the installed templates is a
-    // newer DDL change, never a stale one.  The sync reruns when a mark, an install or a new logged change moves one of its keys.
-    spdlog::debug("constraint set sync: topic {} partition {}: catalog gate closed, applied through {} < logged set {} computed at {}; keeping the logged set",
-                  srcTopicId, judge.partition(), catalogThrough_, logged.id, logged.catalogThrough);
-    judge.constraintSyncEpoch = verdictEpoch_;
-    judge.constraintSyncChange = write.constraintSets.lastChangeOffset();
-    judge.constraintSyncCatalog = catalogThrough_;
+    if (catalogThrough_ >= logged.catalogThrough && !installsSinceMark_) return false;
+    // Either the logged set was computed at a catalog position this worker has not applied, or a plan install or uninstall is
+    // drained whose mark is not: any difference from the installed templates is a newer DDL change, never a stale one.  The sync
+    // reruns when a mark, an install or a new logged change moves one of its keys.
+    spdlog::debug("constraint set sync: topic {} partition {}: catalog gate closed, applied through {} (installs since the mark: {}) < logged set {} computed at {}; keeping the logged set",
+                  srcTopicId, judge.partition(), catalogThrough_, installsSinceMark_, logged.id, logged.catalogThrough);
     return true;
 }
 
 int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write) {
     if (judge.constraintSyncEpoch == verdictEpoch_ && judge.constraintSyncChange == write.constraintSets.lastChangeOffset() && judge.constraintSyncCatalog == catalogThrough_) return 0;
-    if (catalogBehind_(srcTopicId, judge, write)) return 0;
     const ConstraintSet& logged = write.constraintSets.latest();
     const auto sit = subscriptionIndex_.find(srcTopicId);
     std::vector<ConstraintSetMember>& want = constraintWant_;
@@ -1286,7 +1286,7 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     desired.count = static_cast<uint8_t>(std::min(want.size(), desired.members.size()));
     std::copy_n(want.begin(), desired.count, desired.members.begin());
     int work = 0;
-    if (!desired.sameMembers(logged)) {
+    if (!catalogBehind_(srcTopicId, judge, write) && !desired.sameMembers(logged)) {
         const int64_t r = judge.requestChange(desired);
         if (r == VerdictSource::kChangeDeferred) return 0;   // not yet bound or activated: ask again next pass
         work = r >= 0 ? 1 : 0;

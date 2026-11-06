@@ -8,6 +8,7 @@
 #include <rune/protocol/client/CryptoEnvelope.h>
 #include <rune/codec/FilterPredicate.h>
 #include <rune/codec/Serialize.h>
+#include <rune/node/AdminChannels.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/Worker.h>
@@ -330,6 +331,14 @@ public:
     /// The control thread's catalog mark: the node has applied the catalog through `through`, behind every install it sent before.
     void catalogMark(int64_t through) {
         ASSERT_TRUE(encodeCatalogMark(channel.install, through));
+        passes(3);
+    }
+    /// The control thread's uninstall frame of a view, without the catalog mark that follows it in production.
+    void uninstallFrame(int32_t viewTopicId) {
+        rune::node::ViewPlanUpdateMsg m;
+        m.viewTopicId = viewTopicId;
+        m.uninstall = true;
+        ASSERT_TRUE(encodeViewPlanUpdate(channel.install, ViewSnapshotChannel::kInstallMsgType, m));
         passes(3);
     }
     /// A constraint-set change batch (base offset 0, stamped by replicate()).

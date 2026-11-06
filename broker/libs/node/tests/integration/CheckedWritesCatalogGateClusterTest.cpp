@@ -67,7 +67,7 @@ public:
         for (const int id : c_.runningNodes()) prepare(id);
     }
 
-    /// The node holds the cluster feature level and serves the partition; the old plan (T1, tag 9) is installed on its worker.
+    /// The node holds the cluster feature level, serves the partition and has received a catalog mark; the old plan (T1, tag 9) is installed on its worker.
     void prepare(int id) {
         bool ready = false;
         for (const auto deadline = std::chrono::steady_clock::now() + 60s; std::chrono::steady_clock::now() < deadline && !ready; std::this_thread::sleep_for(50ms))
@@ -75,6 +75,10 @@ public:
                 return wk.clusterFeatureLevelForTest() >= rune::replication::MetadataFeature::kCheckedWrites && wk.writeStateForTest(topic_, 0) != nullptr;
             });
         ASSERT_TRUE(ready) << "node " << id << " never served the partition";
+        bool marked = false;
+        for (const auto deadline = std::chrono::steady_clock::now() + 30s; std::chrono::steady_clock::now() < deadline && !marked; std::this_thread::sleep_for(20ms))
+            marked = c_.node(id).onWorkerThreadForTest(worker(id), [](Worker& wk) { return wk.viewSet()->catalogThroughForTest() >= 0; });
+        ASSERT_TRUE(marked) << "node " << id << " never received a catalog mark";
         const int32_t src = topic_;
         c_.node(id).onWorkerThreadForTest(worker(id), [src](Worker& wk) { installReject(wk, src, "gate_old", kOld, kObj, tagRule(9)); return 0; });
     }
@@ -135,12 +139,14 @@ public:
     enum Shape { kReplace, kDrop, kCreate };
 
     /// The leader logged a DDL change `shape` at a position the rest of the cluster has not reached; it crashes, and a node still on
-    /// the old plan (after `restartFollowers` stopped and started both, their old plans reinstalled and no mark seen) leads.
+    /// the old plan (after `restartFollowers` stopped and started both: their catalog replay reinstalls the old plan and marks a real
+    /// position, below the logged one) leads.
     void run(Shape shape, bool restartFollowers) {
         setUp();
         ASSERT_FALSE(::testing::Test::HasFatalFailure());
         const int old = leader();
         ASSERT_TRUE(await(old, [](const Seen& s) { return s.changes == 1 && s.members == 1; })) << "the first set was never logged";
+        EXPECT_GE(seen(old).catalogThrough, 0) << "the first set was logged without a catalog position";
         ASSERT_TRUE(replicated(old)) << "the first set never reached every replica";
         applyDdl(old, shape, kAhead);
         ASSERT_TRUE(await(old, [](const Seen& s) { return s.changes == 2 && s.catalogThrough == kAhead; })) << "the old leader never logged the DDL change";
@@ -198,7 +204,7 @@ TEST(CheckedWritesCatalogGateClusterRegression, CreateDoneByTheOldLeaderIsNotRev
     c.run(Cluster::kCreate, false);
 }
 
-TEST(CheckedWritesCatalogGateClusterRegression, RestartedFollowersBeforeTheFirstMarkDoNotRevertTheChangeRegression) {
+TEST(CheckedWritesCatalogGateClusterRegression, RestartedFollowersBelowTheLoggedPositionDoNotRevertTheChangeRegression) {
     Cluster c("cw09_gate_restart");
     c.run(Cluster::kReplace, true);
 }
