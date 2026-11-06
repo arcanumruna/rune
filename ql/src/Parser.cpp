@@ -1066,13 +1066,29 @@ struct Parser {
         return v;
     }
 
-    static uint16_t pushPred(std::vector<PredNode>& out, PredNode n) noexcept {
+    // Bounds on one check predicate: the recursive descent must not overflow the stack and a node index is a uint16_t.
+    static constexpr int         kMaxPredicateDepth = 64;
+    static constexpr std::size_t kMaxPredicateNodes = 65535;
+    int predDepth{0};
+
+    std::expected<uint16_t, ParseError> pushPred(std::vector<PredNode>& out, PredNode n) noexcept {
+        if (out.size() >= kMaxPredicateNodes) return std::unexpected(err("a check predicate is limited to 65535 nodes"));
         out.push_back(std::move(n));
         return static_cast<uint16_t>(out.size() - 1);
     }
 
-    // notExpr := "not" notExpr | "(" orExpr ")" | IDENT CMP literal.  Children are pushed before their parent.
     std::expected<uint16_t, ParseError> parseNotExpr(std::vector<PredNode>& out) noexcept {
+        if (predDepth >= kMaxPredicateDepth) {
+            return std::unexpected(err("a check predicate is nested more than " + std::to_string(kMaxPredicateDepth) + " levels deep"));
+        }
+        ++predDepth;
+        auto r = parseNotExprBody(out);
+        --predDepth;
+        return r;
+    }
+
+    // notExpr := "not" notExpr | "(" orExpr ")" | IDENT CMP literal.  Children are pushed before their parent.
+    std::expected<uint16_t, ParseError> parseNotExprBody(std::vector<PredNode>& out) noexcept {
         if (isKw("not")) {
             advance();
             auto c = parseNotExpr(out);
@@ -1105,9 +1121,11 @@ struct Parser {
         if (cur.kind == TK::Ident && !isKw("true") && !isKw("false")) return std::unexpected(err(kShape));
         auto lit = parseLiteral();
         if (!lit) return std::unexpected(std::move(lit.error()));
-        const uint16_t a = pushPred(out, PredNode{PredOp::Column, 0, 0, col, {}});
-        const uint16_t b = pushPred(out, PredNode{PredOp::Const, 0, 0, {}, std::move(*lit)});
-        return pushPred(out, PredNode{op, a, b, {}, {}});
+        auto a = pushPred(out, PredNode{PredOp::Column, 0, 0, col, {}});
+        if (!a) return a;
+        auto b = pushPred(out, PredNode{PredOp::Const, 0, 0, {}, std::move(*lit)});
+        if (!b) return b;
+        return pushPred(out, PredNode{op, *a, *b, {}, {}});
     }
 
     std::expected<uint16_t, ParseError> parseAndExpr(std::vector<PredNode>& out) noexcept {
@@ -1118,6 +1136,7 @@ struct Parser {
             auto r = parseNotExpr(out);
             if (!r) return r;
             l = pushPred(out, PredNode{PredOp::And, *l, *r, {}, {}});
+            if (!l) return l;
         }
         return l;
     }
@@ -1130,6 +1149,7 @@ struct Parser {
             auto r = parseAndExpr(out);
             if (!r) return r;
             l = pushPred(out, PredNode{PredOp::Or, *l, *r, {}, {}});
+            if (!l) return l;
         }
         return l;
     }

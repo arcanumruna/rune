@@ -182,3 +182,28 @@ TEST(CheckedWritesQlRegression, NewStatementsAreNotSecurityStatementsRegression)
         EXPECT_TRUE(ql::isSecurityStatement(ql::parse(s).value())) << s;
     EXPECT_FALSE(ql::isSecurityStatement(ql::parse("drop view v;").value()));
 }
+
+namespace {
+std::string checkSql(const std::string& pred) { return "create view v key id as select x from s constraint c check (" + pred + ");"; }
+}  // namespace
+
+TEST(CheckedWritesQlRegression, PredicateNestingIsCappedRegression) {
+    const auto nested = [](int n) { return std::string(n, '(') + "a = 1" + std::string(n, ')'); };
+    // the outer check parenthesis is not part of the predicate: n parens nest n levels of notExpr, plus the atom
+    EXPECT_TRUE(ql::parse(checkSql(nested(63))).has_value());
+    EXPECT_NE(errorOf(checkSql(nested(64))).find("nested more than 64 levels"), std::string::npos);
+    EXPECT_NE(errorOf(checkSql(nested(100000))).find("nested more than 64 levels"), std::string::npos);
+
+    std::string nots;
+    for (int i = 0; i < 63; ++i) nots += "not ";
+    EXPECT_TRUE(ql::parse(checkSql(nots + "a = 1")).has_value());
+    nots.clear();
+    for (int i = 0; i < 100000; ++i) nots += "not ";
+    EXPECT_NE(errorOf(checkSql(nots + "a = 1")).find("nested more than 64 levels"), std::string::npos);
+}
+
+TEST(CheckedWritesQlRegression, PredicateNodeCountIsCappedRegression) {
+    std::string chain = "a = 1";
+    for (int i = 0; i < 25000; ++i) chain += " and a = 1";
+    EXPECT_NE(errorOf(checkSql(chain)).find("limited to 65535 nodes"), std::string::npos);
+}
