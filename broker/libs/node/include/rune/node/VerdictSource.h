@@ -73,6 +73,7 @@ public:
     uint64_t constraintSyncEpoch = UINT64_MAX;
     int64_t  constraintSyncChange = -2;
     int64_t  constraintSyncCatalog = -2;   ///< WorkerViewSet::catalogThrough_ at that sync
+    uint64_t retainedTriedFingerprint = 0, retainedTriedEpoch = UINT64_MAX;   ///< the retained plan WorkerViewSet last tried to install for this judge, and at which template epoch
 
     VerdictSource(int32_t srcTopicId, int32_t partition);
 

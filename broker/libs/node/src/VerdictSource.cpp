@@ -324,6 +324,19 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     sawEmptyChange_ = false;
     judgedRecord_   = judgeCursor_ > std::max(emitFrom_, state.markers.committedMarkerEnd());   // the committed marker itself is no record to cover
     reindex_();
+    // A dropped view whose judge was not driven past its drop (demoted meanwhile) is no member of the sets from here on: retire it.
+    for (Member& m : members_) {
+        if (!m.leaving || m.retiring || m.candidate) continue;
+        const auto names = [&](const ConstraintSet& set) {
+            return std::any_of(set.members.begin(), set.members.begin() + set.count, [&](const ConstraintSetMember& w) { return w.viewObjectId == m.objectId && w.planFingerprint == m.fingerprint; });
+        };
+        bool named = names(activeSet_);
+        for (int64_t a = state.constraintSets.nextChangeAtOrAfter(judgeCursor_); !named && a != INT64_MAX; a = state.constraintSets.nextChangeAtOrAfter(a + 1))
+            named = names(*state.constraintSets.setAt(a + 1));
+        if (named) continue;
+        m.retiring = true;
+        m.leaveOffset = judgeCursor_ - 1;
+    }
     recomputeCap_();
 }
 

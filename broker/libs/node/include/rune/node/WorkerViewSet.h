@@ -352,8 +352,17 @@ public:
     /// Creates or erases the judge of (src, partition) as its verdict templates and logged timeline require, and registers its
     /// members.  nullptr when the partition is not a verdict source.  Cheap when nothing changed.
     VerdictSource* ensureVerdictSource(int32_t srcTopicId, int32_t partition, PartitionWriteState& write);
-    /// The partition's write state is gone: its judge goes with it, and the retiring views no judge holds any more (P9-6).
-    void dropVerdictSource(int32_t srcTopicId, int32_t partition);
+    /// The partition's write state is gone: its judge goes with it, and finishRetired_ erases the retiring views no judge holds any
+    /// more (P9-6).  A judge not yet activated holds none, so a partition promoted in the same apply recovers its plan from its own
+    /// type-20 record: that fallback is why the log keeps them.
+    // Inline: Worker.h's rebuildRcSlots_ reaches it, and that header is built into libraries that do not link rune_node.
+    void dropVerdictSource(int32_t srcTopicId, int32_t partition) {
+        verdictSources_.erase(instKey(srcTopicId, partition));
+        eraseKeyIndex_(instKey(srcTopicId, partition));
+        if (const auto sit = subscriptionIndex_.find(srcTopicId); sit != subscriptionIndex_.end())
+            for (const int32_t id : sit->second)
+                if (isVerdictTemplate_(id) && templates_.at(id).retiring) retiredQueue_.push_back({id, partition});
+    }
     [[nodiscard]] std::vector<uint64_t> verdictSourceKeysForTest() const {
         std::vector<uint64_t> keys;
         for (const auto& kv : verdictSources_) keys.push_back(kv.first);
@@ -716,9 +725,12 @@ private:
     struct Retired { int32_t viewTopicId, partition; };
     bool installsSinceMark_ = false;   // a verdict plan install or uninstall was drained whose catalog mark has not been: the gate stays closed
     int64_t catalogThrough_ = -1;   // the latest catalog position this node's control thread marked here; never moves back (#788)
-    std::vector<uint64_t> refusedPlans_;   // fingerprints of the catalog installs this worker refused: the log never installs them instead
-    struct RetainedAttempt { uint64_t fingerprint = 0; int64_t offset = -1; uint64_t epoch = UINT64_MAX; };
-    RetainedAttempt retainedAttempt_;      // the last retained plan looked at, so a waiting judge does not decode it every pass
+    struct RefusedPlan { uint64_t viewObjectId, fingerprint; };
+    std::vector<RefusedPlan> refusedPlans_;   // the catalog installs this worker refused: the log never installs them instead, and the sync keeps their object's logged member
+    std::vector<uint64_t> unreadablePlans_;   // retained plans whose decode failure was logged
+    void noteRefused_(uint64_t viewObjectId, uint64_t fingerprint) {
+        if (std::none_of(refusedPlans_.begin(), refusedPlans_.end(), [&](const RefusedPlan& r) { return r.fingerprint == fingerprint; })) refusedPlans_.push_back({viewObjectId, fingerprint});
+    }
     uint64_t verdictEpoch_ = 0;   // bumped by every verdict template install, retire and erase; syncConstraintSet_ reruns on a change
     std::vector<Retired> retiredQueue_;   // the members the judges dropped, per partition
     std::vector<ConstraintSetMember> constraintWant_;   // syncConstraintSet_ scratch: grows once, never per pass

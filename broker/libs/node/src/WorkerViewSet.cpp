@@ -363,12 +363,12 @@ int WorkerViewSet::drainInstalls() {
             if (!plan) {
                 spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
                               "compiled plan failed to deserialize", m.viewTopicId);
-                refusedPlans_.push_back(rune::view::verdictPlanFingerprint(m.planBlob));
+                noteRefused_(0, rune::view::verdictPlanFingerprint(m.planBlob));
                 return;
             }
             if (plan->unicodeVersion != 0 && !rune::codec::unicodeVersionSupported(plan->unicodeVersion)) {
                 ++installRefusals_;
-                refusedPlans_.push_back(rune::view::verdictPlanFingerprint(m.planBlob));
+                noteRefused_(plan->viewObjectId, rune::view::verdictPlanFingerprint(m.planBlob));
                 const auto part = [](uint32_t v, int shift) { return (v >> shift) & 0xFFu; };
                 spdlog::critical("VIEW-UNICODE-UNSUPPORTED view={} unicode={}.{}.{} — this broker has {}.{}.{}; the view is not installed",
                                  m.viewTopicId, part(plan->unicodeVersion, 16), part(plan->unicodeVersion, 8), part(plan->unicodeVersion, 0),
@@ -385,7 +385,7 @@ int WorkerViewSet::drainInstalls() {
             } catch (const std::exception& ex) {
                 spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
                               "descriptor deserialize failed: {}", m.viewTopicId, ex.what());
-                refusedPlans_.push_back(rune::view::verdictPlanFingerprint(m.planBlob));
+                noteRefused_(plan->viewObjectId, rune::view::verdictPlanFingerprint(m.planBlob));
                 return;
             }
             rune::view::RowLayout layout;
@@ -394,7 +394,7 @@ int WorkerViewSet::drainInstalls() {
             } catch (const std::exception& ex) {
                 spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
                               "buildRowLayout failed: {}", m.viewTopicId, ex.what());
-                refusedPlans_.push_back(rune::view::verdictPlanFingerprint(m.planBlob));
+                noteRefused_(plan->viewObjectId, rune::view::verdictPlanFingerprint(m.planBlob));
                 return;
             }
             const int32_t viewTopicId = plan->viewTopicId;
@@ -1149,20 +1149,6 @@ void WorkerViewSet::installTestVerdictViewForTest(rune::view::CompiledViewPlan p
     tpl.testRule = rule;
 }
 
-void WorkerViewSet::dropVerdictSource(int32_t srcTopicId, int32_t partition) {
-    verdictSources_.erase(instKey(srcTopicId, partition));
-    eraseKeyIndex_(instKey(srcTopicId, partition));
-    const auto sit = subscriptionIndex_.find(srcTopicId);
-    if (sit == subscriptionIndex_.end()) return;
-    const std::vector<int32_t> ids = sit->second;   // eraseView_ edits the index
-    for (const int32_t id : ids) {
-        const auto tit = templates_.find(id);
-        if (tit == templates_.end() || !tit->second.isVerdict || !tit->second.retiring) continue;
-        const bool held = std::any_of(verdictSources_.begin(), verdictSources_.end(), [&](const auto& kv) { return kv.second->hasView(id); });
-        if (!held) (void)eraseView_(id);
-    }
-}
-
 void WorkerViewSet::dropSourceTopic(int32_t srcTopicId) {
     const auto ofTopic = [&](const auto& kv) { return static_cast<int32_t>(kv.first >> 32) == srcTopicId; };
     std::erase_if(verdictSources_, [&](const auto& kv) {
@@ -1289,6 +1275,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
         if (tpl.verdictKind == rune::view::VerdictViewKind::TestReject) judge->installTestVerdictViewForTest(inst, tpl.verdictObjectId, tpl.testRule);
         else if (candidate) judge->addCandidate(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint, tpl.planRecordPayload);
         else judge->addVerdictView(inst, tpl.verdictKind, tpl.verdictObjectId, tpl.verdictFingerprint, tpl.planRecordPayload);
+        if (tpl.retiring) judge->markLeaving(id);
     }
     return judge;
 }
@@ -1298,10 +1285,11 @@ void WorkerViewSet::installRetainedPlan_(int32_t srcTopicId, VerdictSource& judg
     const ConstraintSetMember& want = judge.waitingFor();
     const RetainedVerdictPlan* r = write.retainedPlans.find(want.viewObjectId, want.planFingerprint);
     // A lagging catalog keeps the judge waiting for its own install (#788); one that refused the plan must not be overruled by the log.
-    if (r == nullptr || std::find(refusedPlans_.begin(), refusedPlans_.end(), r->planFingerprint) != refusedPlans_.end()) return;
-    if (retainedAttempt_.epoch == verdictEpoch_ && retainedAttempt_.fingerprint == r->planFingerprint && retainedAttempt_.offset == r->offset) return;
+    if (r == nullptr || std::any_of(refusedPlans_.begin(), refusedPlans_.end(), [&](const RefusedPlan& x) { return x.fingerprint == r->planFingerprint; })) return;
+    if (judge.retainedTriedEpoch == verdictEpoch_ && judge.retainedTriedFingerprint == r->planFingerprint) return;
     if (catalogBehind_(srcTopicId, judge, write)) return;
-    retainedAttempt_ = RetainedAttempt{r->planFingerprint, r->offset, verdictEpoch_};   // decoded once per template change, whatever comes of it
+    judge.retainedTriedEpoch = verdictEpoch_;   // decoded once per judge and template change, whatever comes of it
+    judge.retainedTriedFingerprint = r->planFingerprint;
     std::optional<rune::view::CompiledViewPlan> plan = rune::view::deserializeCompiledViewPlan(r->plan);
     rune::codec::Descriptor outDesc, srcDesc;
     rune::view::RowLayout layout;
@@ -1317,7 +1305,10 @@ void WorkerViewSet::installRetainedPlan_(int32_t srcTopicId, VerdictSource& judg
         plan.reset();
     }
     if (!plan) {
-        spdlog::critical("VERDICT-PLAN-UNREADABLE view={} fp={:#x}", r->viewObjectId, r->planFingerprint);
+        if (std::find(unreadablePlans_.begin(), unreadablePlans_.end(), r->planFingerprint) == unreadablePlans_.end()) {
+            unreadablePlans_.push_back(r->planFingerprint);
+            spdlog::critical("VERDICT-PLAN-UNREADABLE view={} fp={:#x}", r->viewObjectId, r->planFingerprint);
+        }
         return;
     }
     if (templates_.contains(plan->viewTopicId)) return;   // the catalog's own template names it: the attach below judges with that one
@@ -1371,7 +1362,9 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
         // P9-5: the logged member keeps judging while its replacement builds as a candidate; the swap is asked for once it caught up.
         const bool building = replacedBy[i] != 0 && judge.hasMember(m.viewObjectId, m.planFingerprint) &&
                               judge.hasCandidate(m.viewObjectId, replacedBy[i]) && !judge.candidateCaughtUp(m.viewObjectId, replacedBy[i]);
-        if (live || !gone || building) want.push_back(m);   // a retiring view's plan installed again stays (#786)
+        // A replacement this node refused leaves no template: the member stays and the judge fails closed rather than dropping a live constraint.
+        const bool refused = !live && replacedBy[i] == 0 && std::any_of(refusedPlans_.begin(), refusedPlans_.end(), [&](const RefusedPlan& r) { return r.viewObjectId == m.viewObjectId; });
+        if (live || !gone || building || refused) want.push_back(m);   // a retiring view's plan installed again stays (#786)
     }
     if (sit != subscriptionIndex_.end()) {
         for (const int32_t id : sit->second) {

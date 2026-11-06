@@ -407,5 +407,39 @@ TEST(CheckedWritesConstraintChangeRegression, DroppingTheJudgeErasesItsRetainedT
     ASSERT_TRUE(c.r.driveUntilJudgeReaches(c.r.dataEnd()));
     ASSERT_EQ(c.r.vs->retiringVerdictTemplatesForTest(), 1u);
     c.r.vs->dropVerdictSource(VerdictRig::kSrc, c.r.partition());
+    c.r.passes(3);
     EXPECT_EQ(c.r.vs->retiringVerdictTemplatesForTest(), 0u);
+}
+
+// A catalog that lags the logged set keeps the judge waiting for its own install: the log's plan does not stand in for it (#788).
+TEST(CheckedWritesConstraintChangeRegression, LaggingCatalogDoesNotInstallFromTheLogRegression) {
+    constexpr int64_t kAhead = 1000;
+    Cw c;
+    c.r.vs->raiseCatalogThroughForTest(kAhead);
+    c.create(CV::CharacterName);
+    c.append(kFirst);
+    ASSERT_TRUE(c.r.driveUntilJudged());
+    c.r.failover(/*reinstall=*/false);
+    c.r.passes(100);
+    EXPECT_EQ(c.r.stats()->retainedPlanInstalls, 0u);
+    EXPECT_TRUE(c.judge()->waitingForInstall());
+    c.r.reinstallAll();
+    c.r.catalogMark(kAhead);
+    ASSERT_TRUE(c.r.driveUntilJudged(c.r.dataEnd()));
+    EXPECT_EQ(c.r.vs->retiringVerdictTemplatesForTest(), 0u) << "the catalog's template judges, not a retiring one from the log";
+    EXPECT_FALSE(c.judge()->waitingForInstall());
+}
+
+// A replacement this node refuses leaves the old plan retiring and no new template: the logged member stays.
+TEST(CheckedWritesConstraintChangeRegression, RefusedReplacementKeepsTheLoggedMemberRegression) {
+    Cw c;
+    c.create(CV::AccountStats, 12);
+    c.append({ch(1, 6, "a")});
+    ASSERT_TRUE(c.r.driveUntilJudged());
+    const std::size_t changes = c.r.readLog().changes.size();
+    c.r.refuseInstalls = true;
+    c.r.replaceConstrainedView(CV::AccountStats, 2);
+    c.r.passes(200);
+    EXPECT_EQ(c.r.readLog().changes.size(), changes) << "no change may drop a constraint this node cannot replace";
+    EXPECT_EQ(c.dropOf(kStatsObj), -1);
 }

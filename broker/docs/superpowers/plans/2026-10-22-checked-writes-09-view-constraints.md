@@ -383,6 +383,10 @@ Issue batch 1 (`bugfix/issue-batch-1-views`) settles five things this part build
 - **`Client::constraintName` may block** for one catalog refresh (≤ 5 s) on a miss (P9-12). C15 gives it no timeout parameter, so a second overload takes one.
 - **`VerdictSourceStats::perConstraint`** (04) holds 256 entries per source. A source with more distinct constraint ids keeps the first 256 and counts the rest only in `rejectionsConstraint`. That is 04's bound, noted here, unchanged.
 
+### Recorded deviations (Task 6)
+- `retireVerdictTemplates_` and `ViewTemplate::fromRetainedPlan` were not built. A retained template is an ordinary retiring template: a judge that is activated and whose log names it attaches it, `dropRetired_` and `finishRetired_` erase it once W passes its leave offset, `dropVerdictSource` queues the retiring templates of a dropped judge for `finishRetired_`, and `activate_` retires a leaving member the sets no longer name. A separate per-pass sweep would repeat that, and `Worker.h` stays unchanged. A demoted worker whose judge object is never dropped nor re-promoted keeps its retired member until then (follow-up issue).
+- `installRetainedPlan_` takes `(srcTopicId, judge, write)`: it reads what the judge waits for, honours the #788 gate and the plans this node refused, and counts `retainedPlanInstalls`.
+
 ## Review Focus
 
 These are the five inputs or conditions the spec implies but no requirement names, most likely to bite first. Each is pinned by a test in the owning task.
