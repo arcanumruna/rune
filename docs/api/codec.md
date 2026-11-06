@@ -167,6 +167,53 @@ rune::codec::FilterBytes b = f.encode();                    // throws std::inval
 - `rune::codec::FilterSchema` and `CompiledFilter` (`FilterSchema.h`, `FilterPredicate.h`) are what the broker evaluates
   with; they are standalone in the codec so other consumers can reuse them.
 
+## View keys
+
+A materialized view can be keyed by up to 128 bytes of typed components
+([`ViewKeyEncoding.h`](../../codec/include/rune/codec/ViewKeyEncoding.h)). The broker folds with these functions and the client builds
+keys with them, so a key built by a client is byte-identical to the broker's.
+
+```cpp
+#include <rune/codec/ViewKeyEncoding.h>
+#include <rune/codec/UnicodeLower.h>
+```
+
+- **Components.** `Int32`, `Int64`, `UInt16`, `UInt32`, `UInt64`, `Enum`, `Bool` and `FixedStr` (`string(N)`); the key is their
+  concatenation in declaration order, at most `kMaxViewKeyBytes` (128). `Float64`, `String` and `Bytes` are refused.
+  `viewKeyComponentWidth(type, fixedLen, keyFunction)` returns the width, 0 for an invalid component.
+- **Encoding** (`encodeKeyComponent`), so that a byte-wise compare orders like the values: integers big-endian, `Int32` and
+  `Int64` with the sign bit flipped; `Bool` one byte, 0 or 1; `string(N)` its bytes then zero padding to `N`. `decodeKeyComponent`
+  is the inverse, used to write a group key's columns into an aggregate's output row.
+- **`lower()`** (key function 1, `string(N)` only): `lowerUtf8(in, out)` applies the Unicode `Simple_Lowercase_Mapping`
+  to the UTF-8 in `in` up to its first `0x00` byte and zero-fills `out` to its end. It uses no locale rules and no
+  normalization, so `"I"` is `"i"` in every locale and a composed and a decomposed `é` stay different keys. Invalid UTF-8, or an
+  `out` too small, is `ok == false`. The table is the generated
+  [`UnicodeLowerTable.inc`](../../codec/src/UnicodeLowerTable.inc), **Unicode 16.0.0** (`kUnicodeVersion`, 1,460 mappings); it
+  does not change with the toolchain. `lowerCodePoint(cp)` is one code point.
+- **Width of a lowered column.** A character can lower to more bytes than it has: a 2-byte character lowers to at most 3
+  bytes, a 1-byte one to 1. So a `lower()` of `string(N)` occupies `maxLoweredWidth(N)` = 3 x floor(N / 2) + (N mod 2) bytes
+  (`string(16)` is 24, `string(21)` is 31). The key function 2, `casefold`, is reserved and refused.
+- **The pin.** A plan with a `lower()` component carries `unicodeVersion`, the packed version (`packUnicodeVersion(16, 0, 0)`);
+  a plan without one carries 0. The compiler refuses a plan whose version is not `kUnicodeVersion`
+  (`unicodeVersionSupported`), and a plan with the version but no `lower()` component, so a change of the table can never
+  change a stored view's keys silently.
+
+### Authored plan v2
+
+The authored plan ([`ViewPlan.h`](../../broker/libs/view/include/rune/view/ViewPlan.h), what `CreateView` carries as `planBlob`) has
+two versions. Version 1 is the original layout. Version 2 is version 1 with the version byte `2`, then:
+`keyComponents` (u32 count x `{column str, keyFunction u8, outName str}`), `unique` (u8, 0 or 1), `constraints` (u32 count x
+`{name str, nodes}`), `unicodeVersion` (u32) and `groupBy` (u32 count x `{column str, keyFunction u8, outName str}`), all little-endian.
+
+- **Version rule (P7-7).** `serializeAuthored` writes version 1 unless the plan needs version 2, so every existing plan keeps
+  its bytes, its fingerprint and its catalog digest. A plan needs version 2 when it has `unique`, any constraint, a
+  `unicodeVersion`, a `groupBy`, or key components other than exactly one plain component named like its column (which
+  rides as `key = column`). The version byte of an existing format never changes meaning.
+- `deserializeAuthored` reads versions 1 and 2 (a version 1 blob has empty version 2 fields) and returns `nullopt` for a truncated
+  blob, an unknown version, an out-of-range `PrimType`, `MergeRule` or `PredicateOp`, `unique` above 1 and **trailing bytes**.
+  `keyFunction` is a raw byte that decodes; the compiler refuses a value it does not know.
+- A version 2 plan is sent only to a cluster at the checked-writes feature level ([wire protocol](wire-protocol.md#wide-view-keys-and-scans-client-version-17)).
+
 ## Catalog and security libraries
 
 `rune_catalog` and `rune_security` replay an append-only event log into state. Each event carries a fingerprint over the

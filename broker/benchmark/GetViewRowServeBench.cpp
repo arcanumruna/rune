@@ -23,10 +23,12 @@
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewRow.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -218,3 +220,198 @@ static void BM_GetViewRowServe(benchmark::State& state) {
     rune::bench::gateCheck(state, bad == 0 && allocs == 0, "every read answers OK with zero allocations");
 }
 BENCHMARK(BM_GetViewRowServe)->Unit(benchmark::kNanosecond)->MinTime(0.5);
+
+
+// Wide view keys (Part 07 §9): the same worker loop with the keyed reads.  The view is account_characters-shaped: key
+// (userId, characterId) of 16 bytes, or (handle string(120), characterId) of 128 bytes.  BM_GetViewRowKServe/{16,128} point-reads
+// kBatch keys per pass (gate: well inside 50 us per read); BM_ScanViewRowsServe/12 scans the 12 characters of one user
+// in one page of 12 (reported).
+namespace {
+
+constexpr int32_t  kKeyedView   = 0x40000083;
+constexpr uint64_t kPerUser     = 12;
+constexpr uint32_t kHandleBytes = 120;
+
+rune::codec::Descriptor keyedCharSrc() {
+    return rune::codec::DescriptorBuilder("character", 1)
+        .add("characterId", rune::codec::PrimType::UInt64, 1, /*isKey*/ true)
+        .add("userId", rune::codec::PrimType::UInt64)
+        .addFixedStr("handle", kHandleBytes)
+        .add("gender", rune::codec::PrimType::UInt16)
+        .build();
+}
+
+std::string handleOf(uint64_t id) { return "handle-" + std::to_string(id); }
+
+/// The view key's big-endian encoding: userId and characterId, or the zero-padded handle and characterId.
+std::vector<uint8_t> viewKeyOf(bool wide, uint64_t id) {
+    std::vector<uint8_t> k;
+    const auto be = [&](uint64_t v) { for (int i = 7; i >= 0; --i) k.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    if (wide) {
+        const std::string h = handleOf(id);
+        k.assign(kHandleBytes, 0);
+        std::memcpy(k.data(), h.data(), h.size());
+    } else {
+        be(id / kPerUser);
+    }
+    be(id);
+    return k;
+}
+
+std::vector<uint8_t> keyedCharBatch(const rune::codec::Descriptor& d, uint64_t id) {
+    std::string key(8, '\0');
+    for (int i = 0; i < 8; ++i) key[static_cast<std::size_t>(i)] = static_cast<char>(id >> (8 * i));
+    std::string value(4 + d.blockLength, '\0');
+    value[0] = static_cast<char>(d.blockLength);
+    value[1] = static_cast<char>(d.blockLength >> 8);
+    value[2] = static_cast<char>(d.version);
+    value[3] = static_cast<char>(d.version >> 8);
+    const auto put = [&](const char* field, uint64_t v) {
+        const auto* f = d.find(field);
+        for (uint32_t i = 0; i < rune::codec::fieldWidth(*f); ++i) value[4 + f->offset + i] = static_cast<char>(v >> (8 * i));
+    };
+    put("characterId", id);
+    put("userId", id / kPerUser);
+    put("gender", id % 3);
+    const std::string h = handleOf(id);
+    std::memcpy(value.data() + 4 + d.find("handle")->offset, h.data(), h.size());
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    b.append(key, value, 0);
+    return b.build();
+}
+
+struct KeyedServeFixture {
+    std::unique_ptr<rune::storage::InMemoryLog> mem;
+    NullXport                                   transport;
+    std::unique_ptr<PartitionReplica>           replica;
+    rune::node::ViewSnapshotChannel             ch;
+    std::unique_ptr<rune::node::WorkerViewSet>  vs;
+    std::unique_ptr<Worker>                     worker;
+    std::string                                 dir;
+    bool                                        wide;
+    int64_t                                     nowNs = 1;
+    int64_t                                     corr  = 0;
+
+    explicit KeyedServeFixture(bool wideKeys) : wide(wideKeys) {
+        dir = (fs::temp_directory_path() / ("rune_gvrkserve_" + std::to_string(::getpid()))).string();
+        fs::create_directories(dir);
+        PartitionConfig cfg{};
+        cfg.topicId = kSrc; cfg.partitionId = 0; cfg.selfId = 1; cfg.minIsr = 1;
+        cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
+        cfg.fetchIntervalNs = 1'000'000LL; cfg.isrCheckIntervalNs = 1'000'000LL;
+        cfg.maxFetchBytes = 1 << 20; cfg.pushOnAppend = false;
+        const std::vector<rune::replication::NodeId> one{1};
+        mem     = std::make_unique<rune::storage::InMemoryLog>(64u << 20, 1'000'000);
+        replica = std::make_unique<PartitionReplica>(cfg, rune::replication::Role::Follower, 0, one, one, mem.get(), &transport);
+        replica->becomeLeader(1, {1});
+        vs      = std::make_unique<rune::node::WorkerViewSet>(ch, dir + "/views");
+        worker  = std::make_unique<Worker>(0);
+        worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
+        const auto src = keyedCharSrc();
+        rune::view::ViewPlan v;
+        v.viewName = "keyed_serve_bench";
+        v.sources  = {{kSrc, "characterId"}};
+        v.keyComponents = wide ? std::vector<rune::view::KeyComponent>{{"handle", 0, "handle"}, {"characterId", 0, "characterId"}}
+                               : std::vector<rune::view::KeyComponent>{{"userId", 0, "userId"}, {"characterId", 0, "characterId"}};
+        v.output = {{"gender", rune::codec::PrimType::UInt16, 0, "gender", rune::view::MergeRule::Replace}};
+        v.persistence = 1;   // transient: no checkpoint IO in the measured pass
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto comp = rune::view::compileView(v, srcs, kKeyedView).value();
+        vs->installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+        worker->setViewSet(vs.get());
+        armLease_<Worker, WorkerOp>(*worker);
+    }
+    ~KeyedServeFixture() {
+        worker.reset();
+        vs.reset();
+        replica.reset();
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+    void pass() { worker->doWork(nowNs++); }
+    bool warm() {
+        const auto src = keyedCharSrc();
+        std::vector<std::vector<uint8_t>> batches;
+        for (uint64_t k = 0; k < kKeys; ++k) batches.push_back(keyedCharBatch(src, k));
+        for (uint64_t k = 0; k < kKeys; ++k) {
+            WorkerOp op;
+            op.type = WorkerOp::Type::Produce; op.topicId = kSrc; op.partition = 0;
+            op.replica = replica.get(); op.sessionId = 1; op.correlationId = ++corr;
+            op.lastOffsetDelta = 0; op.recordCount = 1; op.durabilityTier = 1;
+            op.recordBatchView = std::span<const uint8_t>(batches[k]);
+            while (!worker->tryEnqueueOp(std::move(op))) { pass(); worker->drainReturn([](WorkerReturn&&) {}); }
+            pass();   // the op holds a view of batches[k]: execute it before the vector goes
+            worker->drainReturn([](WorkerReturn&&) {});
+        }
+        for (int i = 0; i < 100'000; ++i) {
+            pass();
+            worker->drainReturn([](WorkerReturn&&) {});
+            if (vs->readiness(kKeyedView, 0) == rune::node::ViewReadiness::Ready && vs->foldCursorForTest(kKeyedView, 0) >= replica->highWatermark())
+                return true;
+        }
+        return false;
+    }
+    /// Enqueues a point read of `key` or a scan of `prefix` (the gateway's shape: the key, then an empty resume token).
+    bool post(WorkerOp::Type type, const std::vector<uint8_t>& keyOrPrefix, uint16_t limit) {
+        std::array<uint8_t, 2 + 128> tail{};
+        tail[0] = static_cast<uint8_t>(keyOrPrefix.size());
+        std::memcpy(tail.data() + 1, keyOrPrefix.data(), keyOrPrefix.size());
+        tail[1 + keyOrPrefix.size()] = 0;
+        WorkerOp op;
+        op.type = type; op.topicId = kKeyedView; op.partition = 0;
+        op.sessionId = 1; op.correlationId = ++corr;
+        op.nextOffset = -1; op.recordCount = limit;
+        op.viewReadTail = std::span<const uint8_t>(tail.data(), 2 + keyOrPrefix.size());
+        return worker->tryEnqueueOp(op);
+    }
+};
+
+void runKeyedServe(benchmark::State& state, bool wide, bool scan) {
+    KeyedServeFixture f(wide);
+    if (!f.warm()) { state.SkipWithError("the view never served the warm-up rows"); return; }
+    std::vector<std::vector<uint8_t>> keys;   // the reads' keys or prefixes, built outside the timed loop
+    for (uint64_t k = 0; k < kKeys; ++k) {
+        if (scan) { auto p = viewKeyOf(false, k * kPerUser); p.resize(8); keys.push_back(std::move(p)); }
+        else keys.push_back(viewKeyOf(wide, k));
+    }
+    const uint64_t users = kKeys / kPerUser;
+    const WorkerOp::Type type = scan ? WorkerOp::Type::ScanViewRows : WorkerOp::Type::GetViewRowK;
+    uint64_t key = 0;
+    int64_t  reads = 0, bad = 0;
+    g_allocCount.store(0);
+    g_allocEnabled.store(true, std::memory_order_release);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (auto _ : state) {
+        for (int i = 0; i < kBatch; ++i) {
+            while (!f.post(type, keys[key], scan ? static_cast<uint16_t>(kPerUser) : uint16_t{0})) f.pass();
+            key = (key + 1) % (scan ? users : kKeys);
+        }
+        int got = 0;
+        for (int p = 0; p < 64 && got < kBatch; ++p) {
+            f.pass();
+            f.worker->drainReturnView([&](WorkerReturn&& r) {
+                ++got;
+                if (r.errorCode != 0) ++bad;
+            });
+        }
+        reads += got;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    g_allocEnabled.store(false, std::memory_order_release);
+    const int64_t allocs = g_allocCount.load(std::memory_order_acquire);
+    const double ns = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    state.SetItemsProcessed(reads);
+    state.counters["ns_per_read"]   = reads > 0 ? ns / static_cast<double>(reads) : 0.0;
+    state.counters["allocs_per_op"] = reads > 0 ? static_cast<double>(allocs) / static_cast<double>(reads) : 0.0;
+    state.counters["not_ok"]        = static_cast<double>(bad);
+    rune::bench::gateCheck(state, bad == 0 && allocs == 0, "every read answers OK with zero allocations");
+}
+
+}  // namespace
+
+static const bool kGetKServe16 = (benchmark::RegisterBenchmark("BM_GetViewRowKServe/16", runKeyedServe, false, false)
+    ->Unit(benchmark::kNanosecond)->MinTime(0.5), true);
+static const bool kGetKServe128 = (benchmark::RegisterBenchmark("BM_GetViewRowKServe/128", runKeyedServe, true, false)
+    ->Unit(benchmark::kNanosecond)->MinTime(0.5), true);
+static const bool kScanServe12 = (benchmark::RegisterBenchmark("BM_ScanViewRowsServe/12", runKeyedServe, false, true)
+    ->Unit(benchmark::kNanosecond)->MinTime(0.5), true);

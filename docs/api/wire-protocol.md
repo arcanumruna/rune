@@ -109,6 +109,9 @@ security 64 to 95.
 | 78 | `DdlResponse` | B→C | `errorCode`, `objectId`, `newVersion`, `gateTopicId`, `detail` |
 | 79 | `SecurityDdl` | C→B | `ext`, `kind`, `name`, `change`, `passwordIndex`, `terminateSessions`, `verifier`, `granteeKind`, `op`, `resourceType`, `patternKind`, `pattern`, `roleName` |
 | 80 | `SecurityBootstrap` | C→B | `adminName`, `verifier` |
+| 88 | `GetViewRowK` | C→B | `viewTopicId`, `partition`, `requestedFingerprint`, `minOffset`, `key` (1 to 128 bytes) |
+| 89 | `ScanViewRows` | C→B | `viewTopicId`, `limit`, `requestedFingerprint`, `minOffset`, `prefix` (1 to 127 bytes), `resumeToken` (0 or 12 bytes) |
+| 90 | `ScanViewRowsResponse` | B→C | `status`, `rowCount`, `nextToken`, `rows` |
 
 Notes:
 
@@ -120,7 +123,7 @@ Notes:
   `SetPassword`=2, `Disable`=3, `Enable`=4. A `verifier` is `(salt, iterations, StoredKey, ServerKey)`; the plaintext
   password never reaches a broker, and the statement text is sent with the password replaced by `'<redacted>'`.
 - **`ViewRowResponse.status`**: 0 OK, 1 AbsentKey, 2 NotReady, 3 SchemaMismatch, 4 UnknownView, 5 InvalidRequest,
-  6 Busy, 7 RowTooLarge, 45 NotAuthorized. A `GetViewRow` on a broker that does not lead the view's source partition, or
+  6 Busy, 7 RowTooLarge, 8 CursorInvalidated (a scan's resume token no longer matches its prefix), 45 NotAuthorized. A `GetViewRow` on a broker that does not lead the view's source partition, or
   leads it without the controller's read lease, is answered `ErrorResponse` `Redirect` (3, the leader's endpoint) or
   `NotLeader` (2); both are retriable.
 - **Internal logs** are read by subscribing to a negative topic id: `__catalog` is `-6` (`kCatalogTopicId`), `__security`
@@ -265,6 +268,40 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   `autoIncrement` implies `keyIndex` and `partitioner` 1; the broker stores both whatever the request carried, and the
   features never change after the topic is created. `autoIncrementMax` is the last assignable id and `autoIncrementReserve` the
   ids reserved per reservation record. `DefineTopic` with `partitioner` 1 and no `autoIncrement` is refused.
+
+## Wide view keys and scans (client version 17)
+
+A view can be keyed by up to 128 bytes of typed key components instead of one `uint64` (see [View keys](codec.md#view-keys)).
+Frames 88 to 90 read such a view. They are sent only to a session at client version 17 or above; the C++ client ends the
+call `BrokerTooOld` without sending when the seed's `brokerVersion` is below 10. A plan with key components, `lower()` or
+`group by` is a plan v2 and `CreateView` refuses it with `InvalidRequest` ("plan v2 needs the checked-writes feature level")
+while the cluster is below the checked-writes feature level.
+
+- **`GetViewRowK`** (88) is a point read by the key's bytes (1 to 128, the encoding in [View keys](codec.md#view-keys)). It is
+  answered with a `ViewRowResponse` (73), the same shape as `GetViewRow`. `partition` is `-1` for a sink with one partition,
+  else the source partition that owns the key (the C++ `ViewKeyBuilder::partition()`). A key of a length other than the
+  view's key width, or a `GetViewRow` on a view with a wide key, is `InvalidRequest`.
+- **`ScanViewRows`** (89) reads one page of the rows whose key starts with `prefix`: every key component but the last,
+  so a view with a one-component key cannot be scanned (`InvalidRequest`). A keyed view has one partition and a scan reads it. `limit` 0 means 256; a page holds at most 256 rows and 61,440
+  row bytes. The answer is a `ScanViewRowsResponse` (90): `nextToken` is empty when the scan is complete, else 12 bytes to
+  send back as `resumeToken`; `rows` is `rowCount` entries of `[length u32][view row]`, each row decoded like a `GetViewRow`
+  row. A page is read in one worker step, so it is consistent.
+- **Pages are unordered**: rows come in table order, not key order, and a scan visits each row under the prefix once.
+  An insert or erase under the prefix between two pages invalidates the token: the answer is status 8
+  (`CursorInvalidated`) with no rows, and the client restarts the scan. The C++ `ViewRowResult::kCursorInvalidated` shares
+  the value 8 with the client-side `kNotLeader`; restart on both.
+- **`minOffset`** (both frames, `-1` = none) is the read-your-writes barrier for a write acknowledged with the `ProduceResponse`
+  `baseOffset`: the read waits until the view has folded that source offset. A waiting read is held for at most 100 ms and
+  is then answered `NotReady`; a worker holds at most 256 reads, and one more is answered `NotReady` at once. Without it a
+  read still waits for the fold to reach the committed high watermark it found on arrival.
+- Statuses are those of `ViewRowResponse`. A scan whose first row would not fit the page is `RowTooLarge`. An undecodable
+  body (a key of 0 or more than 128 bytes, a prefix of 0 or more than 127 bytes, a token of a length other than 0 or 12), a
+  prefix of the wrong width and a token of the wrong length are `InvalidRequest`.
+- Error codes 59 to 61 are `CreateView` refusals sent to sessions at 17 or above: 59 `ViewKeyExpressionInvalid` (a key
+  component that does not compile: a type that is not an integer, enum, bool or `string(N)`, `lower()` on a type other than
+  `string(N)`, a duplicate component, a key wider than 128 bytes), 60 `ViewConstraintInvalid` and 61 `ViewUniqueInvalid`. `check` and `unique`
+  clauses are refused until they ship.
+- A view whose key is not exactly the source key needs a source with one partition (`ViewNotCoPartitioned`).
 
 ## Encrypted frames (TLS 1.3 / AEAD)
 

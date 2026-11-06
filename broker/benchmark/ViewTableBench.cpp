@@ -66,9 +66,11 @@
 #include <rune/codec/Descriptor.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -264,3 +266,110 @@ BENCHMARK(BM_ViewTableChurn)
     ->Unit(benchmark::kMicrosecond)
     ->Iterations(1)
     ->UseRealTime();
+
+
+// Wide view keys (Part 07 §14): BM_ViewTableChurn's 60/25/15 loop with K-byte keys (seeded; the index slot word is the key's
+// wyhash and the key lives in the row header), at the 64-byte row.  Reports the mean ns of the put, get and erase calls.
+// One run is 2M ops; every put (new key or update) is followed by a get of a live key, and the clock reads are inside the means.
+static void runWideKeyChurn(benchmark::State& st, uint32_t keyBytes) {
+    constexpr uint64_t kOps = 2'000'000;
+    for (auto _ : st) {
+        RowLayout L = layoutForRowSize(64);
+        ViewTable t(L, 4096, 32u << 20, ViewTableKeys{static_cast<uint8_t>(keyBytes), 0, 0x5EEDull});
+
+        std::mt19937_64 rng(0xD00DF00Dull ^ keyBytes);
+        const auto freshKey = [&] {
+            ViewKey k;
+            k.len = static_cast<uint8_t>(keyBytes);
+            for (uint32_t i = 0; i < keyBytes; i += 8) {
+                const uint64_t w = rng();
+                std::memcpy(k.bytes.data() + i, &w, std::min<size_t>(8, keyBytes - i));
+            }
+            return k;
+        };
+        std::vector<ViewKey> alive;
+        alive.reserve(kOps);
+        std::uniform_int_distribution<int> opDist(0, 99);
+        std::uniform_int_distribution<size_t> pick;
+        uint64_t putNs = 0, getNs = 0, eraseNs = 0, puts = 0, gets = 0, erases = 0, sink = 0;
+        for (uint64_t i = 0; i < kOps; ++i) {
+            const int r = opDist(rng);
+            const bool create = r < 60 || alive.empty();
+            if (create || r < 85) {
+                ViewKey key;
+                if (create) { key = freshKey(); alive.push_back(key); }
+                else { pick.param(std::uniform_int_distribution<size_t>::param_type(0, alive.size() - 1)); key = alive[pick(rng)]; }
+                const auto t1 = std::chrono::steady_clock::now();
+                uint8_t* row = t.put(key);
+                const auto t2 = std::chrono::steady_clock::now();
+                setVal(row, L, static_cast<int32_t>(i));
+                putNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+                ++puts;
+                pick.param(std::uniform_int_distribution<size_t>::param_type(0, alive.size() - 1));
+                const ViewKey probe = alive[pick(rng)];
+                const auto t3 = std::chrono::steady_clock::now();
+                sink += reinterpret_cast<uintptr_t>(t.get(probe)) & 0xFF;
+                const auto t4 = std::chrono::steady_clock::now();
+                getNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t4 - t3).count());
+                ++gets;
+            } else {
+                pick.param(std::uniform_int_distribution<size_t>::param_type(0, alive.size() - 1));
+                const size_t pos = pick(rng);
+                const ViewKey key = alive[pos];
+                alive[pos] = alive.back();
+                alive.pop_back();
+                const auto t1 = std::chrono::steady_clock::now();
+                t.erase(key);
+                const auto t2 = std::chrono::steady_clock::now();
+                eraseNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+                ++erases;
+            }
+        }
+        benchmark::DoNotOptimize(sink);
+        st.counters["put_ns_per_op"]   = static_cast<double>(putNs) / static_cast<double>(puts);
+        st.counters["get_ns_per_op"]   = static_cast<double>(getNs) / static_cast<double>(gets);
+        st.counters["erase_ns_per_op"] = static_cast<double>(eraseNs) / static_cast<double>(erases);
+        st.counters["final_size"]      = static_cast<double>(t.size());
+    }
+}
+static const bool kWideKey16  = (benchmark::RegisterBenchmark("BM_ViewTableWideKey/16", runWideKeyChurn, 16u)->Unit(benchmark::kMillisecond)->Iterations(1)->UseRealTime(), true);
+static const bool kWideKey24  = (benchmark::RegisterBenchmark("BM_ViewTableWideKey/24", runWideKeyChurn, 24u)->Unit(benchmark::kMillisecond)->Iterations(1)->UseRealTime(), true);
+static const bool kWideKey66  = (benchmark::RegisterBenchmark("BM_ViewTableWideKey/66", runWideKeyChurn, 66u)->Unit(benchmark::kMillisecond)->Iterations(1)->UseRealTime(), true);
+static const bool kWideKey128 = (benchmark::RegisterBenchmark("BM_ViewTableWideKey/128", runWideKeyChurn, 128u)->Unit(benchmark::kMillisecond)->Iterations(1)->UseRealTime(), true);
+
+// One prefix of `rows` rows among 100,000 (the rest are spread 16 to a prefix): one full scanPrefix of it per iteration.
+static void runPrefixScan(benchmark::State& st, uint32_t rows) {
+    constexpr uint64_t kRows = 100'000;
+    constexpr uint8_t kKeyWidth = 16, kPrefixWidth = 8;
+    RowLayout L = layoutForRowSize(64);
+    ViewTable t(L, 4096, 32u << 20, ViewTableKeys{kKeyWidth, kPrefixWidth, 0x5EEDull});
+    const auto keyOf = [&](uint64_t prefix, uint64_t suffix) {
+        ViewKey k;
+        k.len = kKeyWidth;
+        for (int i = 0; i < 8; ++i) {
+            k.bytes[static_cast<size_t>(i)]     = static_cast<uint8_t>(prefix >> (8 * (7 - i)));
+            k.bytes[static_cast<size_t>(8 + i)] = static_cast<uint8_t>(suffix >> (8 * (7 - i)));
+        }
+        return k;
+    };
+    for (uint64_t i = 0; i < rows; ++i) setVal(t.put(keyOf(0, i)), L, static_cast<int32_t>(i));
+    for (uint64_t i = rows; i < kRows; ++i) setVal(t.put(keyOf(1 + (i - rows) / 16, i)), L, static_cast<int32_t>(i));
+    const ViewKey hot = keyOf(0, 0);
+    std::array<uint8_t, kScanTokenBytes> next{};
+    uint64_t scans = 0, visited = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (auto _ : st) {
+        const PrefixScan r = t.scanPrefix({hot.bytes.data(), kPrefixWidth}, {}, next, [&](std::span<const uint8_t>, const uint8_t* row) {
+            ++visited;
+            benchmark::DoNotOptimize(row);
+            return true;
+        });
+        benchmark::DoNotOptimize(r);
+        ++scans;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    st.counters["ns_per_scan"] = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()) / static_cast<double>(scans);
+    st.counters["rows_per_scan"] = static_cast<double>(visited) / static_cast<double>(scans);
+}
+static const bool kPrefixScan12  = (benchmark::RegisterBenchmark("BM_ViewTablePrefixScan/12", runPrefixScan, 12u)->Unit(benchmark::kNanosecond), true);
+static const bool kPrefixScan256 = (benchmark::RegisterBenchmark("BM_ViewTablePrefixScan/256", runPrefixScan, 256u)->Unit(benchmark::kNanosecond), true);

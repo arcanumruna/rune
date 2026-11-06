@@ -101,6 +101,7 @@
 
 #include <benchmark/benchmark.h>
 #include <rune/codec/Descriptor.h>
+#include <rune/codec/UnicodeLower.h>
 #include <rune/node/VerdictSource.h>
 #include <rune/node/WriteState.h>
 #include <rune/protocol/RecordBatch.h>
@@ -109,6 +110,8 @@
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/AggFold.h>
 #include <rune/view/AggState.h>
+#include <rune/view/KeyedFold.h>
+#include <rune/view/RecordFold.h>
 #include <rune/view/ViewFold.h>
 #include <rune/view/ViewRow.h>
 
@@ -623,6 +626,108 @@ BENCHMARK(BM_ViewFoldReplace)
     ->Iterations(1)
     ->UseRealTime();
 
+// Wide view keys (Part 07 §14): the BM_ViewFoldReplace event batches through keyed views.  Case "lower" is
+// (lower(name), characterId), "composite" is account_characters (userId, characterId); both are owner-mapped, so every
+// record also reads and writes the owner table.  About 10% of the records are renames of a live character (a Move for
+// `lower`, an in-place update for `composite`).  Gate: us_per_batch <= 10.
+namespace {
+constexpr uint64_t kKeyedUsers = 50'000;
+
+rune::codec::Descriptor namedCharacterSourceV1() {
+    return rune::codec::DescriptorBuilder("character", 1)
+        .add("characterId", PrimType::UInt64, 1, /*isKey*/ true)
+        .add("userId", PrimType::UInt64)
+        .addFixedStr("name", 16)
+        .add("gender", PrimType::UInt16)
+        .build();
+}
+
+// Mixed-case names so lower() does real work; `gen` changes on a rename.
+std::string characterName(uint64_t key, uint32_t gen) {
+    char buf[17];
+    std::snprintf(buf, sizeof buf, (gen & 1) ? "HERO%08llu" : "Hero%08llu", static_cast<unsigned long long>((key * 2654435761u + gen) % 100'000'000));
+    return buf;
+}
+
+std::vector<uint8_t> encodeNamedCharacter(const rune::codec::Descriptor& d, uint64_t key, const std::string& name) {
+    std::vector<uint8_t> rec(4 + d.blockLength, 0);
+    rec[0] = static_cast<uint8_t>(d.blockLength);
+    rec[1] = static_cast<uint8_t>(d.blockLength >> 8);
+    rec[2] = static_cast<uint8_t>(d.version);
+    rec[3] = static_cast<uint8_t>(d.version >> 8);
+    const auto put = [&](const char* field, uint64_t v) {
+        const auto* f = d.find(field);
+        for (uint32_t i = 0; i < rune::codec::fieldWidth(*f); ++i) rec[4 + f->offset + i] = static_cast<uint8_t>(v >> (8 * i));
+    };
+    put("characterId", key);
+    put("userId", key % kKeyedUsers + 1);
+    put("gender", key % 3);
+    std::memcpy(rec.data() + 4 + d.find("name")->offset, name.data(), name.size());
+    return rec;
+}
+}  // namespace
+
+static void runDerivedKeyFold(benchmark::State& st, bool lower) {
+    for (auto _ : st) {
+        auto src = namedCharacterSourceV1();
+        rune::view::ViewPlan v;
+        v.viewName = "keyed_characters";
+        v.sources  = {{5, "characterId"}};
+        v.keyComponents = lower ? std::vector<rune::view::KeyComponent>{{"name", 1, "nameKey"}, {"characterId", 0, "characterId"}}
+                                : std::vector<rune::view::KeyComponent>{{"userId", 0, "userId"}, {"characterId", 0, "characterId"}};
+        if (lower) v.unicodeVersion = rune::codec::kUnicodeVersion;
+        v.output = {{"gender", PrimType::UInt16, 0, "gender", rune::view::MergeRule::Replace}};
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto comp = compileView(v, srcs, 0x51000003).value();
+        const auto spec = buildKeyedFoldSpec(comp.plan, src).value();
+
+        constexpr uint64_t kSeed = 0x5EEDull;
+        ViewTable table(comp.rowLayout, 4096, 32u << 20, {static_cast<uint8_t>(spec.keyWidth), static_cast<uint8_t>(spec.prefixWidth), kSeed});
+        RowLayout ownerRow;
+        ownerRow.rowLen = spec.keyWidth;
+        ViewTable owners(ownerRow, 4096, 32u << 20, {spec.wireKeyWidth, 0, kSeed});
+        VersionDescriptorCache vdc(src);
+        Prospect prospect;
+        prospect.reserve(comp.rowLayout, nullptr);
+        ProjectionFold pf{comp.plan, comp.rowLayout, vdc, table, PrimType::UInt64, &spec, spec.ownerMapped ? &owners : nullptr};
+
+        const auto ops = generateChurnOps(kTotalOps);
+        std::vector<uint32_t> gen(kTotalOps + 2, 0);   // the character's name generation: updates rename 40% of the time
+        const auto stream = buildStream(ops, kBatchSizes, std::size(kBatchSizes), [&](rune::protocol::RecordBatchBuilder& bb, const Op& op) {
+            const auto kb = keyBytes(static_cast<int64_t>(op.key));
+            if (op.tombstone) {
+                bb.append(asSv(kb), std::string_view{}, 0);
+                return;
+            }
+            if (op.hp != static_cast<int32_t>(op.key) && static_cast<uint32_t>(op.hp) % 5 < 2) gen[op.key] = static_cast<uint32_t>(op.hp);
+            const auto val = encodeNamedCharacter(src, op.key, characterName(op.key, gen[op.key]));
+            bb.append(asSv(kb), asSv(val), 0);
+        });
+
+        auto foldOne = [&](size_t i) {
+            auto lv = stream.view(i);
+            int64_t cur = 0;
+            return foldProjectionBatch(pf, prospect, lv, stream.bound(i), cur, kNoSkip);
+        };
+        auto drainAll = [&] {
+            auto nop = [](uint32_t, const uint8_t*, bool, uint64_t) {};
+            table.drainDirty(nop);
+            owners.drainDirty(nop);
+        };
+        auto r = runPhases(stream, foldOne, drainAll, /*drainEvery*/ 1000);
+
+        benchmark::DoNotOptimize(table.size());
+        reportCommon(st, "", r, table.size());
+        double sum = 0;
+        for (const uint32_t ns : r.batchLatNs) sum += ns;
+        st.counters["us_per_batch"] = sum / 1000.0 / static_cast<double>(r.batchLatNs.size());   // gate: <= 10
+    }
+}
+static const bool kDerivedKeyLower = (benchmark::RegisterBenchmark("BM_ViewFoldDerivedKey/lower", runDerivedKeyFold, true)
+    ->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime(), true);
+static const bool kDerivedKeyComposite = (benchmark::RegisterBenchmark("BM_ViewFoldDerivedKey/composite", runDerivedKeyFold, false)
+    ->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime(), true);
+
 // Verdict judging (checked writes Part 04): the BM_ViewFoldReplace churn through a VerdictSource, one driveJudge per
 // committed batch.  Arg 0 = test_reject_cap (two CapLiveKeys members that never trip, so every record is accepted and
 // applied to both tables); Arg 1 = rejecting_1pct (TagEquals: every 100th key is rejected, on every touch).  The
@@ -887,6 +992,132 @@ BENCHMARK(BM_ViewFoldAggregate)
     ->Unit(benchmark::kMicrosecond)
     ->Iterations(1)
     ->UseRealTime();
+
+// Wide view keys (Part 07 §14): the BM_ViewFoldAggregate event batches through device_history, `group by userId, deviceFp`
+// (a 40-byte group key, so the keyed aggregate fold with its group-id table).  Case "count" is count(*); case "minmax" is
+// min(lastSeen) + max(lastSeen), which also keeps the Min/Max value blocks.  1,000,000 events from 50,000 users over 5
+// devices each, primed like BM_ViewFoldAggregate.  Gate: us_per_batch <= 10.
+namespace {
+rune::codec::Descriptor deviceSourceV1() {
+    return rune::codec::DescriptorBuilder("device", 1)
+        .add("eventId", PrimType::UInt64, 1, /*isKey*/ true)
+        .add("userId", PrimType::UInt64)
+        .addFixedStr("deviceFp", 32)
+        .add("lastSeen", PrimType::Int64)
+        .build();
+}
+
+std::vector<uint8_t> encodeDevice(const rune::codec::Descriptor& d, uint64_t event, int64_t lastSeen) {
+    std::vector<uint8_t> rec(4 + d.blockLength, 0);
+    rec[0] = static_cast<uint8_t>(d.blockLength);
+    rec[1] = static_cast<uint8_t>(d.blockLength >> 8);
+    rec[2] = static_cast<uint8_t>(d.version);
+    rec[3] = static_cast<uint8_t>(d.version >> 8);
+    const auto put = [&](const char* field, uint64_t v) {
+        const auto* f = d.find(field);
+        for (uint32_t i = 0; i < rune::codec::fieldWidth(*f); ++i) rec[4 + f->offset + i] = static_cast<uint8_t>(v >> (8 * i));
+    };
+    put("eventId", event);
+    put("userId", event % kKeyedUsers + 1);
+    put("lastSeen", static_cast<uint64_t>(lastSeen));
+    char fp[33];
+    const int n = std::snprintf(fp, sizeof fp, "device-fingerprint-%llu", static_cast<unsigned long long>(event / kKeyedUsers % 5));
+    std::memcpy(rec.data() + 4 + d.find("deviceFp")->offset, fp, static_cast<size_t>(n));
+    return rec;
+}
+
+struct KeyedAggRig {
+    rune::codec::Descriptor   src = deviceSourceV1();
+    rune::view::CompileResult comp;
+    rune::view::AggLayout     agg;
+    rune::view::KeyedFoldSpec spec;
+    VersionDescriptorCache    vdc{src};
+    ViewTable                 view, contributors, groups, blocks, groupIds;
+    uint64_t                  nextGroupId = 0;
+    Prospect                  prospect;
+
+    static constexpr uint64_t kSeed = 0x5EEDull;
+
+    static rune::view::CompileResult compile(const rune::codec::Descriptor& src, bool minmax) {
+        rune::view::ViewPlan v;
+        v.viewName = "device_history";
+        v.sources  = {{5, "eventId"}};
+        v.keyComponents = v.groupBy = {{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}};
+        if (minmax) {
+            v.output = {{"firstSeen", PrimType::Int64, 0, "lastSeen", rune::view::MergeRule::Min},
+                        {"lastSeen", PrimType::Int64, 0, "lastSeen", rune::view::MergeRule::Max}};
+        } else {
+            v.output = {{"uses", PrimType::Int64, 0, "", rune::view::MergeRule::CountAll}};
+        }
+        const rune::codec::Descriptor* srcs[] = {&src};
+        return compileView(v, srcs, 0x51000004).value();
+    }
+    static RowLayout idRow() { RowLayout r; r.rowLen = 8; return r; }
+
+    explicit KeyedAggRig(bool minmax)
+        : comp(compile(src, minmax)), agg(buildAggLayout(comp.plan, src).value()), spec(buildKeyedFoldSpec(comp.plan, src).value()),
+          view(comp.rowLayout, 4096, 32u << 20, {static_cast<uint8_t>(spec.keyWidth), static_cast<uint8_t>(spec.prefixWidth), kSeed}),
+          contributors(agg.contributorRow, 4096, 32u << 20, {8, 0, kSeed}), groups(agg.groupRow, 4096, 32u << 20, {8, 0, kSeed}),
+          blocks(agg.blockRow, 4096, 32u << 20, {8, 0, kSeed}),
+          groupIds(idRow(), 4096, 32u << 20, {static_cast<uint8_t>(spec.keyWidth), 0, kSeed}) {
+        prospect.reserve(comp.rowLayout, &agg);
+    }
+    static void append(const rune::codec::Descriptor& d, rune::protocol::RecordBatchBuilder& bb, const Op& op) {
+        const uint64_t event = op.key % kAggContributors;
+        const auto kb = keyBytes(static_cast<int64_t>(event));
+        if (op.tombstone) {
+            bb.append(asSv(kb), std::string_view{}, 0);
+        } else {
+            const auto val = encodeDevice(d, event, static_cast<int64_t>(op.hp));
+            bb.append(asSv(kb), asSv(val), 0);
+        }
+    }
+    rune::view::FoldStats foldStream(const BatchStream& s, size_t i) {
+        AggregateFold f{comp.plan, comp.rowLayout, agg, vdc, view, contributors, groups, agg.numBlockCols > 0 ? &blocks : nullptr,
+                        &spec, &groupIds, &nextGroupId};
+        auto lv = s.view(i);
+        int64_t cur = 0;
+        return foldKeyedAggregateBatch(f, prospect, lv, s.bound(i), cur, kNoSkip);
+    }
+    void drainAll() {
+        auto nop = [](uint32_t, const uint8_t*, bool, uint64_t) {};
+        view.drainDirty(nop);
+        contributors.drainDirty(nop);
+        groups.drainDirty(nop);
+        blocks.drainDirty(nop);
+        groupIds.drainDirty(nop);
+    }
+};
+}  // namespace
+
+static void runGroupBy2Fold(benchmark::State& st, bool minmax) {
+    for (auto _ : st) {
+        KeyedAggRig rig(minmax);
+        const auto appendOp = [&](rune::protocol::RecordBatchBuilder& bb, const Op& op) { KeyedAggRig::append(rig.src, bb, op); };
+        {   // prime: creates-only over the whole event space (NOT timed)
+            constexpr int kPrimeBatch[] = {64};
+            std::vector<Op> prime;
+            prime.reserve(kAggContributors);
+            for (uint64_t c = 0; c < kAggContributors; ++c) prime.push_back(Op{c, static_cast<int32_t>(c ^ 0x5a5a), false});
+            const auto ps = buildStream(prime, kPrimeBatch, 1, appendOp);
+            for (size_t i = 0; i < ps.size(); ++i) rig.foldStream(ps, i);
+            rig.drainAll();
+        }
+        const auto ops = generateChurnOps(kTotalOps);
+        const auto stream = buildStream(ops, kBatchSizes, std::size(kBatchSizes), appendOp);
+        auto r = runPhases(stream, [&](size_t i) { return rig.foldStream(stream, i); }, [&] { rig.drainAll(); }, /*drainEvery*/ 1000);
+
+        benchmark::DoNotOptimize(rig.view.size());
+        reportCommon(st, "", r, rig.view.size());
+        double sum = 0;
+        for (const uint32_t ns : r.batchLatNs) sum += ns;
+        st.counters["us_per_batch"] = sum / 1000.0 / static_cast<double>(r.batchLatNs.size());   // gate: <= 10
+    }
+}
+static const bool kGroupBy2Count = (benchmark::RegisterBenchmark("BM_ViewFoldGroupBy2/count", runGroupBy2Fold, false)
+    ->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime(), true);
+static const bool kGroupBy2MinMax = (benchmark::RegisterBenchmark("BM_ViewFoldGroupBy2/minmax", runGroupBy2Fold, true)
+    ->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime(), true);
 
 // Retractable aggregate gate (Phase 2b, §14.0): user_stats = Count(*), Sum,
 // Max, Min, Last, LastNonNull over amount, grouped by userId — the SAME rig,
