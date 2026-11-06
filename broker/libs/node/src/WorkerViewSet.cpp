@@ -89,12 +89,13 @@ void buildKeyedTables(ViewInstance& inst, std::size_t indexSlots, std::size_t ch
         inst.owners.emplace(std::move(ownerRow), indexSlots, chunkBytes,
                             rune::view::ViewTableKeys{inst.keyed->wireKeyWidth, 0, inst.tableKeys.hashSeed, inst.tableKeys.hashMaskForTest});
     }
-    inst.prospect.reserve(inst.layout, nullptr);
+    inst.prospect.reserve(inst.layout, inst.agg ? &inst.agg->layout : nullptr);
 }
 
 // Replays checkpoint records into one instance: v1 into the output table for a
 // Replace view; v2 (all three tables, or four with Min/Max value blocks; offset-atomic) for an aggregate view;
-// v3 (the view table, then the owner map) for a keyed projection.
+// v3 for a keyed view: the view table and the owner map (a projection), or the view table, contributors, groups, blocks and groupIds
+// (an aggregate; nextGroupId is then 1 + the largest gid recovered).
 // Same semantics as rune::view::replay/replayMulti (a bad base => -1; stop at
 // the first bad record; return the last applied O), plus ONE warning when the
 // replay stops before the end of the supplied records — so a wrong-version
@@ -104,11 +105,27 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
                        std::span<const std::span<const uint8_t>> deltas,
                        std::size_t& appliedOut) {
     appliedOut = 0;
-    rune::view::ViewTable* tables[4];
-    uint32_t lens[4];
-    uint8_t keyLens[4];
+    rune::view::ViewTable* tables[6] = {};
+    uint32_t lens[6];
+    uint8_t keyLens[6];
     std::size_t nTables = 0;
-    if (inst.keyed) {
+    if (inst.keyed && inst.agg) {
+        using namespace rune::view;
+        const AggLayout& a = inst.agg->layout;
+        const uint8_t K = static_cast<uint8_t>(a.groupKeyWidth);
+        tables[kKeyedTableView]         = &inst.table;
+        tables[kKeyedTableContributors] = &inst.agg->contributors;
+        tables[kKeyedTableGroups]       = &inst.agg->groups;
+        tables[kKeyedTableGroupIds]     = &*inst.agg->groupIds;
+        lens[kKeyedTableView] = inst.layout.rowLen;  keyLens[kKeyedTableView] = K;
+        lens[kKeyedTableContributors] = a.contributorRow.rowLen;  keyLens[kKeyedTableContributors] = 8;
+        lens[kKeyedTableGroups] = a.groupRow.rowLen;  keyLens[kKeyedTableGroups] = 8;
+        lens[kKeyedTableGroupIds] = 8;  keyLens[kKeyedTableGroupIds] = K;
+        lens[kKeyedTableOwners] = 0;  keyLens[kKeyedTableOwners] = 0;
+        lens[kKeyedTableBlocks] = a.blockRow.rowLen;  keyLens[kKeyedTableBlocks] = 8;
+        if (inst.agg->blocks) tables[kKeyedTableBlocks] = &*inst.agg->blocks;
+        nTables = 6;
+    } else if (inst.keyed) {
         tables[rune::view::kKeyedTableView] = &inst.table;
         lens[rune::view::kKeyedTableView]    = inst.layout.rowLen;
         keyLens[rune::view::kKeyedTableView] = static_cast<uint8_t>(inst.keyed->keyWidth);
@@ -142,6 +159,14 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
                                                std::span<const uint32_t>(lens, nTables), rec);
         return rune::view::applyDelta(inst.table, inst.layout, rec);
     };
+    // The groupIds table is empty before a replay, so every row it holds afterwards is dirty: the one cold scan for nextGroupId.
+    const auto gidsDone = [&] {
+        if (!(inst.keyed && inst.agg)) return;
+        inst.agg->nextGroupId = 0;
+        inst.agg->groupIds->drainDirtyKeyed([&](uint32_t, const uint8_t* row, bool deleted, std::span<const uint8_t>) {
+            if (!deleted) inst.agg->nextGroupId = std::max(inst.agg->nextGroupId, rune::view::loadU64(row) + 1);
+        });
+    };
     int64_t last = -1;
     if (!base.empty()) {
         const auto a = apply(base);
@@ -166,6 +191,7 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
         last = a->O;
         ++appliedOut;
     }
+    gidsDone();
     return last;
 }
 
@@ -191,7 +217,15 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
     using namespace rune::view;
     std::size_t fixed = ViewSnapshotChannel::kDeltaHeaderBytes + kCheckpointCrcBytes;
     std::size_t perRecord = 0;
-    if (inst.keyed) {
+    if (inst.keyed && inst.agg) {
+        const AggLayout& a = inst.agg->layout;
+        const std::size_t nTables = (a.numBlockCols > 0 ? 4 : 3) + 1;   // view, contributors, groups, blocks?, groupIds
+        fixed += kCheckpointV3HeaderBytes + nTables * kCheckpointV3TableHeaderBytes;
+        const AggDirtyBound b = aggDirtyBoundPerRecord(a);
+        const std::size_t aux = checkpointV3EntryHeaderBytes(8), wide = checkpointV3EntryHeaderBytes(a.groupKeyWidth);
+        perRecord = b.contributorRows * (aux + a.contributorRow.rowLen) + b.groupRows * (aux + a.groupRow.rowLen) +
+                    b.viewRows * (wide + inst.layout.rowLen) + b.blockRows * (aux + a.blockRow.rowLen) + b.groupIdRows * (wide + 8);
+    } else if (inst.keyed) {
         const KeyedFoldSpec& k = *inst.keyed;
         fixed += kCheckpointV3HeaderBytes + (k.ownerMapped ? 2 : 1) * kCheckpointV3TableHeaderBytes;
         // A move: the old row's delete, the new row's upsert and, with an owner map, the owner's upsert.
@@ -535,9 +569,9 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
     std::optional<rune::view::KeyedFoldSpec> keyed;
     if (rune::view::keyModeOf(tpl.plan) == rune::view::ViewKeyMode::Keyed) {
         keyed = rune::view::buildKeyedFoldSpec(tpl.plan, tpl.evolvingSrc);
-        if (!keyed || rune::view::isAggregateView(tpl.plan)) {
-            spdlog::error("WorkerViewSet: keyed view {} partition {} not hosted — {}", viewTopicId, partition,
-                          keyed ? "keyed aggregates are not available yet" : "a key column is missing from its source descriptor");
+        if (!keyed) {
+            spdlog::error("WorkerViewSet: keyed view {} partition {} not hosted — a key column is missing from its source descriptor",
+                          viewTopicId, partition);
             return nullptr;
         }
         keys.keyWidth    = static_cast<uint8_t>(keyed->keyWidth);
@@ -550,11 +584,6 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
                               partition, indexSlots, chunkBytes, keys));
     (void)inserted;
     ViewInstance& inst = ins->second;
-    if (keyed) {
-        inst.keyed = std::move(keyed);
-        buildKeyedTables(inst, indexSlots, chunkBytes);
-    }
-
     // Phase 2a: an aggregate view also owns its contributor + group aux tables.
     // Built BEFORE any recovery load below, so a checkpoint (v2) restores all
     // three tables, and a transient re-fold starts from EMPTY aux tables.
@@ -568,6 +597,10 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
             return nullptr;
         }
         inst.agg.emplace(std::move(*al), indexSlots, chunkBytes, inst.tableKeys);
+    }
+    if (keyed) {   // after the aggregate tables: a keyed aggregate's prospect holds their rows
+        inst.keyed = std::move(keyed);
+        buildKeyedTables(inst, indexSlots, chunkBytes);
     }
 
     // Persisted: bound each fold pass so its checkpoint delta always fits one
@@ -905,27 +938,44 @@ int WorkerViewSet::buildAndPushKeyedCheckpoint_(ViewInstance& inst) {
             keyedEntries_.push_back(rune::view::KeyedDirtyEntry{rid, deleted, {}, nullptr});
         });
     };
+    // The record's tables in id order: the view, then the owner map (a projection) or contributors, groups, blocks and groupIds.
+    struct Part { rune::view::ViewTable* table; uint8_t id; uint8_t keyLen; uint32_t rowLen; };
+    Part parts[5];
+    std::size_t nParts = 0;
     const rune::view::KeyedFoldSpec& k = *inst.keyed;
-    const uint8_t keyLens[2] = {static_cast<uint8_t>(k.keyWidth), k.wireKeyWidth};
-    std::size_t b[3] = {0, 0, 0};
-    drainInto(inst.table, inst.layout.rowLen);
-    b[1] = keyedEntries_.size();
-    if (inst.owners) drainInto(*inst.owners, k.keyWidth);
-    b[2] = keyedEntries_.size();
+    if (inst.agg) {
+        AggInstance& a = *inst.agg;
+        const uint8_t gk = static_cast<uint8_t>(a.layout.groupKeyWidth);
+        parts[nParts++] = {&inst.table, rune::view::kKeyedTableView, gk, inst.layout.rowLen};
+        parts[nParts++] = {&a.contributors, rune::view::kKeyedTableContributors, 8, a.layout.contributorRow.rowLen};
+        parts[nParts++] = {&a.groups, rune::view::kKeyedTableGroups, 8, a.layout.groupRow.rowLen};
+        if (a.blocks) parts[nParts++] = {&*a.blocks, rune::view::kKeyedTableBlocks, 8, a.layout.blockRow.rowLen};
+        parts[nParts++] = {&*a.groupIds, rune::view::kKeyedTableGroupIds, gk, 8};
+    } else {
+        parts[nParts++] = {&inst.table, rune::view::kKeyedTableView, static_cast<uint8_t>(k.keyWidth), inst.layout.rowLen};
+        if (inst.owners) parts[nParts++] = {&*inst.owners, rune::view::kKeyedTableOwners, k.wireKeyWidth, k.keyWidth};
+    }
+    std::size_t b[6] = {};
+    for (std::size_t t = 0; t < nParts; ++t) {
+        drainInto(*parts[t].table, parts[t].rowLen);
+        b[t + 1] = keyedEntries_.size();
+    }
     if (keyedEntries_.empty()) return 0;
 
     std::size_t keyPos = 0;
-    for (std::size_t i = 0; i < keyedEntries_.size(); ++i) {
-        const std::size_t len = keyLens[i < b[1] ? 0 : 1];
-        keyedEntries_[i].key = std::span<const uint8_t>(keyScratch_.data() + keyPos, len);
-        keyPos += len;
-        if (rowOffsets_[i] != SIZE_MAX) keyedEntries_[i].row = rowScratch_.data() + rowOffsets_[i];
+    for (std::size_t t = 0; t < nParts; ++t) {
+        for (std::size_t i = b[t]; i < b[t + 1]; ++i) {
+            keyedEntries_[i].key = std::span<const uint8_t>(keyScratch_.data() + keyPos, parts[t].keyLen);
+            keyPos += parts[t].keyLen;
+            if (rowOffsets_[i] != SIZE_MAX) keyedEntries_[i].row = rowScratch_.data() + rowOffsets_[i];
+        }
     }
-    const auto sub = [&](int i) { return std::span<const rune::view::KeyedDirtyEntry>(keyedEntries_.data() + b[i], b[i + 1] - b[i]); };
-    const rune::view::KeyedTableDelta tds[2] = {{rune::view::kKeyedTableView, keyLens[0], inst.layout.rowLen, sub(0)},
-                                                {rune::view::kKeyedTableOwners, keyLens[1], k.keyWidth, sub(1)}};
+    rune::view::KeyedTableDelta tds[5];
+    for (std::size_t t = 0; t < nParts; ++t) {
+        tds[t] = {parts[t].id, parts[t].keyLen, parts[t].rowLen, std::span<const rune::view::KeyedDirtyEntry>(keyedEntries_.data() + b[t], b[t + 1] - b[t])};
+    }
     inst.pendingDelta.clear();
-    rune::view::encodeKeyedDelta(std::span<const rune::view::KeyedTableDelta>(tds, inst.owners ? 2 : 1), inst.foldCursor, inst.pendingDelta);
+    rune::view::encodeKeyedDelta(std::span<const rune::view::KeyedTableDelta>(tds, nParts), inst.foldCursor, inst.pendingDelta);
     inst.lastEncodedO = inst.foldCursor;
     inst.pendingValid = true;
     (void)tryPushDelta_(inst);

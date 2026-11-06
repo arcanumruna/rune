@@ -23,6 +23,7 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/view/ViewCheckpoint.h>
 
+#include "CheckedWritesKeyedAggFixture.h"
 #include "CheckedWritesKeyedViewFixture.h"
 
 namespace {
@@ -225,4 +226,161 @@ TEST(CheckedWritesKeyedRecoveryRegression, RenameJustBeforeRestartRecoversOneRow
     std::copy_n("foo", 3, foo.begin());
     EXPECT_EQ(scanAll(r.vs, bar, rowLen).size(), 1u);
     EXPECT_EQ(scanAll(r.vs, foo, rowLen).size(), 0u);
+}
+
+namespace {
+
+// The device_history aggregate on one persisted worker set, mirroring Writer.
+struct AggWriter {
+    rune::codec::Descriptor src = cwagg::deviceSource();
+    rune::view::CompileResult comp = cwagg::deviceHistory(src);
+    std::string dir;
+    rune::node::ViewSnapshotChannel ch;
+    WorkerViewSet vs;
+    cwagg::Log log{src};
+    std::vector<uint8_t> file;
+
+    AggWriter(const std::string& name, uint64_t seed) : dir(freshDir(name)), vs(ch, dir, seed) {
+        vs.installView(comp.plan, comp.rowLayout, src, /*persisted=*/true);
+    }
+    // a pass is capped and the delta ring must be drained for the next one, so keep driving until the cursor reaches the end
+    void foldAll(const cwagg::Log& l) {
+        for (int guard = 0; guard < 10000 && vs.foldCursorForTest(kViewTopic, 0) < l.end(); ++guard) {
+            vs.driveFolds(kSrcTopic, 0, [&](int64_t f, int64_t t) { return l.read(f, t); }, l.end(), rune::view::kNoSkip, 0);
+            drainDeltas();
+        }
+    }
+    void drainDeltas() {
+        ch.deltas.drain([&](int32_t type, aeron::concurrent::AtomicBuffer& b, rune::node::OneToOneByteRing::index_t off,
+                            rune::node::OneToOneByteRing::index_t len) {
+            if (type != rune::node::ViewSnapshotChannel::kDeltaMsgType) return;
+            const uint8_t* p = b.buffer() + off + rune::node::ViewSnapshotChannel::kDeltaHeaderBytes;
+            file.insert(file.end(), p, p + len - rune::node::ViewSnapshotChannel::kDeltaHeaderBytes);
+        });
+    }
+    void writeFile() const {
+        std::ofstream f(rune::node::viewCheckpointFilePath(dir, kViewTopic, 0), std::ios::binary);
+        f.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+    }
+};
+
+const char* const kFps[] = {"fpA", "fpB", "fpC", "fpD", "fpE", "fpF"};
+
+// Random inserts, moves between groups, and tombstones over a pool of 200 event ids.
+void appendRandomEvents(AggWriter& w, std::mt19937& rng, int count) {
+    for (int done = 0; done < count;) {
+        std::vector<cwagg::Ev> batch;
+        const int n = std::min(count - done, 1 + static_cast<int>(rng() % 20));
+        for (int i = 0; i < n; ++i) {
+            cwagg::Ev e;
+            e.id = 1 + rng() % 200;
+            if (rng() % 6 == 0) {
+                e.tombstone = true;
+            } else {
+                e.user     = 1 + rng() % 4;
+                e.fp       = kFps[rng() % 6];
+                e.platform = static_cast<uint32_t>(rng() % 3);
+                e.lastSeen = static_cast<int64_t>(rng() % 1000);
+                e.bytes    = rng() % 100;
+            }
+            batch.push_back(e);
+        }
+        w.log.append(batch);
+        w.foldAll(w.log);
+        done += n;
+    }
+}
+
+const uint8_t* bytesOf(const rune::view::ViewTable& t, uint64_t k) { return t.get(k); }
+
+void expectSameRow(const uint8_t* a, const uint8_t* b, uint32_t len, const std::string& what) {
+    ASSERT_EQ(a == nullptr, b == nullptr) << what;
+    if (a != nullptr) EXPECT_EQ(std::vector<uint8_t>(a, a + len), std::vector<uint8_t>(b, b + len)) << what;
+}
+
+// The refold folds in another order inside blocks, so only the view rows are comparable.
+void expectSameView(const rune::node::ViewInstance& a, const rune::node::ViewInstance& b) {
+    EXPECT_EQ(a.table.size(), b.table.size());
+    for (uint64_t u = 1; u <= 4; ++u) {
+        for (const char* fp : kFps) {
+            const auto vk = rune::view::ViewKey::fromBytes(cwagg::groupKey(u, fp));
+            expectSameRow(a.table.get(vk), b.table.get(vk), a.layout.rowLen, "view user " + std::to_string(u) + " " + fp);
+        }
+    }
+}
+
+// Every table of two aggregate instances holds the same rows (the tables cannot be iterated, so probe every key that can exist).
+void expectSameTables(const rune::node::ViewInstance& a, const rune::node::ViewInstance& b) {
+    ASSERT_TRUE(a.agg && b.agg);
+    const auto& x = *a.agg;
+    const auto& y = *b.agg;
+    EXPECT_EQ(x.nextGroupId, y.nextGroupId);
+    EXPECT_EQ(a.table.size(), b.table.size());
+    EXPECT_EQ(x.contributors.size(), y.contributors.size());
+    EXPECT_EQ(x.groups.size(), y.groups.size());
+    EXPECT_EQ(x.groupIds->size(), y.groupIds->size());
+    ASSERT_EQ(x.blocks.has_value(), y.blocks.has_value());
+    if (x.blocks) EXPECT_EQ(x.blocks->size(), y.blocks->size());
+
+    for (uint64_t u = 1; u <= 4; ++u) {
+        for (const char* fp : kFps) {
+            const auto key = cwagg::groupKey(u, fp);
+            const auto vk  = rune::view::ViewKey::fromBytes(key);
+            const std::string what = "user " + std::to_string(u) + " " + fp;
+            expectSameRow(a.table.get(vk), b.table.get(vk), a.layout.rowLen, "view " + what);
+            expectSameRow(x.groupIds->get(vk), y.groupIds->get(vk), 8, "groupIds " + what);
+        }
+    }
+    for (uint64_t id = 0; id <= 201; ++id)
+        expectSameRow(bytesOf(x.contributors, id), bytesOf(y.contributors, id), x.layout.contributorRow.rowLen, "contributor " + std::to_string(id));
+    for (uint64_t g = 0; g <= x.nextGroupId + 1; ++g) {
+        expectSameRow(bytesOf(x.groups, g), bytesOf(y.groups, g), x.layout.groupRow.rowLen, "group " + std::to_string(g));
+        if (!x.blocks) continue;
+        for (uint32_t id = rune::view::blockIdCandidate(g), n = 0; n < 8; ++n, ++id)
+            for (uint32_t chunk = 0; chunk < 4; ++chunk)
+                expectSameRow(bytesOf(*x.blocks, rune::view::blockChunkKey(id, chunk)), bytesOf(*y.blocks, rune::view::blockChunkKey(id, chunk)),
+                              x.layout.blockRow.rowLen, "block of group " + std::to_string(g));
+    }
+}
+
+}  // namespace
+
+TEST(CheckedWritesKeyedRecoveryRegression, KeyedAggregateRestartEqualsRefoldRegression) {
+    AggWriter w("agg-restart", 12345);
+    std::mt19937 rng{77};
+    appendRandomEvents(w, rng, 2000);
+    w.writeFile();
+    ASSERT_FALSE(w.file.empty());
+    const auto* orig = w.vs.instanceForTest(kViewTopic, 0);
+    ASSERT_NE(orig, nullptr);
+    ASSERT_TRUE(orig->agg && orig->agg->groupIds && orig->agg->blocks);
+    const auto* counters = w.vs.foldCounters(kViewTopic, 0);
+    EXPECT_GT(counters->aggRescans, 0u) << "the run must retract Min/Max extremes";
+    EXPECT_GT(orig->agg->nextGroupId, 0u);
+
+    // recovery draws its own hash seed: the tables hash differently from the written ones
+    rune::node::ViewSnapshotChannel ch;
+    WorkerViewSet rec(ch, w.dir, 99);
+    rune::node::ViewPlanUpdateMsg m;
+    m.viewTopicId = kViewTopic;
+    m.persistence = 0;
+    m.recovery    = true;
+    m.planBlob    = rune::view::serialize(w.comp.plan);
+    m.outDescBlob = rune::codec::serialize(w.comp.outputDescriptor);
+    m.srcDescBlob = rune::codec::serialize(w.src);
+    ASSERT_TRUE(rune::node::encodeViewPlanUpdate(ch.install, rune::node::ViewSnapshotChannel::kInstallMsgType, m));
+    ASSERT_EQ(rec.drainInstalls(), 1);
+    rec.materializeRecoveryInstancesFor(kSrcTopic, 0, w.log.end());
+    ASSERT_EQ(rec.readiness(kViewTopic, 0), rune::node::ViewReadiness::Ready);
+    { SCOPED_TRACE("recovered"); expectSameTables(*orig, *rec.instanceForTest(kViewTopic, 0)); }
+
+    // 500 more events after the restart fold like a fresh refold of all 2,500: no recovered gid is handed out twice
+    appendRandomEvents(w, rng, 500);
+    for (int guard = 0; guard < 10000 && rec.foldCursorForTest(kViewTopic, 0) < w.log.end(); ++guard) {
+        rec.driveFolds(kSrcTopic, 0, [&](int64_t f, int64_t t) { return w.log.read(f, t); }, w.log.end(), rune::view::kNoSkip, 0);
+        ch.deltas.drain([](int32_t, aeron::concurrent::AtomicBuffer&, rune::node::OneToOneByteRing::index_t, rune::node::OneToOneByteRing::index_t) {});
+    }
+    AggWriter fresh("agg-restart-fresh", 5);
+    fresh.foldAll(w.log);
+    expectSameView(*fresh.vs.instanceForTest(kViewTopic, 0), *rec.instanceForTest(kViewTopic, 0));
 }

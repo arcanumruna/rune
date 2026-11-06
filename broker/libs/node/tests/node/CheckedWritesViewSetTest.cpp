@@ -17,6 +17,7 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/view/ViewCheckpoint.h>
 
+#include "CheckedWritesKeyedAggFixture.h"
 #include "CheckedWritesKeyedViewFixture.h"
 
 using namespace rune::view;
@@ -376,4 +377,67 @@ TEST(CheckedWritesViewSet, MaxRecordsPerPassBoundsAV3Delta) {
     ASSERT_EQ(frames.size(), 2u);
     EXPECT_EQ(static_cast<int64_t>(frames[1]), fixed + perPass * perMove);
     EXPECT_LE(static_cast<int64_t>(frames[1]), maxMsg);
+}
+
+namespace {
+
+struct AggRig {
+    rune::codec::Descriptor src = cwagg::deviceSource();
+    rune::view::CompileResult comp = cwagg::deviceHistory(src);
+    rune::node::ViewSnapshotChannel ch;
+    WorkerViewSet vs;
+    cwagg::Log log{src};
+    std::vector<uint8_t> out = std::vector<uint8_t>(rune::node::kMaxScanPageBytes);
+
+    explicit AggRig(uint64_t seed = 0) : vs(ch, rigDir(), seed) { vs.installView(comp.plan, comp.rowLayout, src, /*persisted=*/false); }
+    uint16_t slot(const char* name) const {
+        for (size_t i = 0; i < comp.outputDescriptor.fields.size(); ++i)
+            if (comp.outputDescriptor.fields[i].name == name) return static_cast<uint16_t>(i);
+        throw std::runtime_error(name);
+    }
+    void fold() {
+        vs.driveFolds(cwagg::kSrcTopic, 0, [&](int64_t f, int64_t t) { return log.read(f, t); }, log.end(), rune::view::kNoSkip, 0);
+    }
+};
+
+}  // namespace
+
+TEST(CheckedWritesViewSet, KeyedAggregateServesPrefixReads) {
+    AggRig r;
+    std::vector<cwagg::Ev> evs;
+    for (uint64_t i = 0; i < 12; ++i) evs.push_back({i + 1, 42, "fp" + std::string(1, static_cast<char>('A' + i)), 1, static_cast<int64_t>(100 + i), 10});
+    evs.push_back({13, 42, "fpA", 2, 500, 5});   // a second contributor of the first device
+    evs.push_back({14, 43, "fpA", 1, 100, 1});   // another user's device
+    r.log.append(evs);
+    r.fold();
+
+    const auto p = r.vs.scanPage(cwagg::kViewTopic, 0, cwkeyed::beKey({42}), {}, 0, r.out);
+    ASSERT_EQ(p.status, Status::kOk);
+    EXPECT_EQ(p.rows, 12u);
+    EXPECT_EQ(p.nextTokenLen, 0u);
+
+    const rune::view::RowLayout* layout = nullptr;
+    WorkerViewSet::RowStatus st{};
+    const uint8_t* row = r.vs.getRowK(cwagg::kViewTopic, 0, cwagg::groupKey(42, "fpA"), layout, &st);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(st, WorkerViewSet::RowStatus::Ok);
+    EXPECT_EQ(rune::view::readSlot(row, *layout, r.slot("uses")).i, 2);
+    EXPECT_EQ(rune::view::readSlot(row, *layout, r.slot("total")).u, 15u);
+    EXPECT_EQ(r.vs.getRowK(cwagg::kViewTopic, 0, cwagg::groupKey(44, "fpA"), layout, &st), nullptr);
+}
+
+TEST(CheckedWritesViewSetRegression, FixedSeedHookReachesEveryAggregateTableRegression) {
+    AggRig r(7);
+    r.log.append({{1, 42, "fpA", 1, 100, 10}});
+    r.fold();
+    const auto* inst = r.vs.instanceForTest(cwagg::kViewTopic, 0);
+    ASSERT_NE(inst, nullptr);
+    ASSERT_TRUE(inst->agg.has_value());
+    ASSERT_TRUE(inst->agg->blocks.has_value());
+    ASSERT_TRUE(inst->agg->groupIds.has_value());
+    EXPECT_EQ(inst->table.hashSeedForTest(), 7u);
+    EXPECT_EQ(inst->agg->contributors.hashSeedForTest(), 7u);
+    EXPECT_EQ(inst->agg->groups.hashSeedForTest(), 7u);
+    EXPECT_EQ(inst->agg->blocks->hashSeedForTest(), 7u);
+    EXPECT_EQ(inst->agg->groupIds->hashSeedForTest(), 7u);
 }

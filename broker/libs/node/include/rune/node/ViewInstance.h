@@ -86,11 +86,25 @@ struct AggInstance {
     rune::view::ViewTable contributors;  // contributorKey -> pre-image (retraction)
     rune::view::ViewTable groups;        // groupKey -> accumulators
     std::optional<rune::view::ViewTable> blocks;   // engaged iff layout.numBlockCols > 0
+    // Keyed views only (layout.keyed): the group key -> gid table (row [gid u64], the view's key width) and the next unused gid.
+    std::optional<rune::view::ViewTable> groupIds;
+    uint64_t nextGroupId = 0;
+    /// `keys` are the view table's: the auxiliary tables are keyed by 8-byte contributor and group values whatever the view key is.
     AggInstance(rune::view::AggLayout l, std::size_t indexSlots, std::size_t chunkBytes, rune::view::ViewTableKeys keys = {})
         : layout(std::move(l)),
-          contributors(layout.contributorRow, indexSlots, chunkBytes, keys),
-          groups(layout.groupRow, indexSlots, chunkBytes, keys) {
-        if (layout.numBlockCols > 0) blocks.emplace(layout.blockRow, indexSlots, chunkBytes, keys);
+          contributors(layout.contributorRow, indexSlots, chunkBytes, auxKeys(keys)),
+          groups(layout.groupRow, indexSlots, chunkBytes, auxKeys(keys)) {
+        if (layout.numBlockCols > 0) blocks.emplace(layout.blockRow, indexSlots, chunkBytes, auxKeys(keys));
+        if (layout.keyed) {
+            rune::view::RowLayout idRow;
+            idRow.rowLen = 8;
+            groupIds.emplace(std::move(idRow), indexSlots, chunkBytes, rune::view::ViewTableKeys{keys.keyWidth, 0, keys.hashSeed, keys.hashMaskForTest});
+        }
+    }
+    static rune::view::ViewTableKeys auxKeys(rune::view::ViewTableKeys keys) noexcept {
+        keys.keyWidth    = 8;
+        keys.prefixWidth = 0;
+        return keys;
     }
     rune::view::ViewTable* blocksOrNull() noexcept { return blocks ? &*blocks : nullptr; }
 };
@@ -270,7 +284,8 @@ struct ViewInstance {
 [[nodiscard]] inline bool viewTablesEmpty(const ViewInstance& i) noexcept {
     if (i.table.size() != 0) return false;
     if (!i.agg) return true;
-    return i.agg->contributors.size() == 0 && i.agg->groups.size() == 0 && (!i.agg->blocks || i.agg->blocks->size() == 0);
+    return i.agg->contributors.size() == 0 && i.agg->groups.size() == 0 && (!i.agg->blocks || i.agg->blocks->size() == 0) &&
+           (!i.agg->groupIds || i.agg->groupIds->size() == 0);
 }
 
 /// The log range a source partition holds: retention may have trimmed it below a cursor (logStart); logEnd bounds a checkpoint.

@@ -139,6 +139,11 @@ struct AggLayout {
     uint32_t              contribBlockPosOff = 0;   // [blockPos u32] at the end of the contributor row
     uint32_t              groupBlockOff      = 0;   // [blockId u32][blockChunks u32] after the caches
     RowLayout             blockRow;                 // only rowLen: kBlockEntries * (8 + 9 * numBlockCols)
+    // --- Part 07: composite group keys. A keyed view's group is an interned id (gid, in the places a legacy group value goes);
+    // its group row ends with the groupKeyWidth key bytes at groupKeyOff.
+    bool                  keyed         = false;
+    uint32_t              groupKeyOff   = 0;
+    uint16_t              groupKeyWidth = 0;
 };
 
 // Null-flag byte of (column, slot) in a chunk row.
@@ -166,6 +171,7 @@ struct AggDirtyBound {
     uint32_t groupRows;
     uint32_t viewRows;
     uint32_t blockRows;
+    uint32_t groupIdRows;   // keyed views: a group created and a group dropped by one move
 };
 AggDirtyBound aggDirtyBoundPerRecord(const AggLayout& a) noexcept;
 
@@ -174,6 +180,7 @@ inline constexpr uint8_t kAggTableView         = 0;
 inline constexpr uint8_t kAggTableContributors = 1;
 inline constexpr uint8_t kAggTableGroups       = 2;
 inline constexpr uint8_t kAggTableBlocks       = 3;   // only views with Min/Max (4 tables)
+// A keyed view's v3 record uses kKeyedTable* (ViewCheckpoint.h) ids instead, with its groupIds table (key = the view key, row = [gid u64]).
 
 // Fixed-width little-endian byte helpers (memcpy: alignment-free, no UB).
 inline uint64_t loadU64(const uint8_t* p) noexcept { uint64_t v; std::memcpy(&v, p, 8); return v; }

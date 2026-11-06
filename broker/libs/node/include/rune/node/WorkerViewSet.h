@@ -523,6 +523,7 @@ private:
         if (inst.agg) {
             m += inst.agg->contributors.memoryBytes() + inst.agg->groups.memoryBytes();
             if (inst.agg->blocks) m += inst.agg->blocks->memoryBytes();
+            if (inst.agg->groupIds) m += inst.agg->groupIds->memoryBytes();
         }
         return m;
     }
@@ -610,6 +611,7 @@ public:
         if (inst.agg) {
             n += pending(inst.agg->contributors) + pending(inst.agg->groups);
             if (inst.agg->blocks) n += pending(*inst.agg->blocks);
+            if (inst.agg->groupIds) n += pending(*inst.agg->groupIds);
         }
         return n;
     }
@@ -885,12 +887,17 @@ private:
     // callback), encode it, and push it; holds it on ring back-pressure.
     // Returns 1 if a delta was encoded this pass (changed rows), else 0.
     int buildAndPushCheckpoint_(ViewInstance& inst);
-    /// The keyed variant: one v3 record, the view table then the owner map.
+    /// The keyed variant: one v3 record, the view table then the owner map (a projection) or the aggregate's tables.
     int buildAndPushKeyedCheckpoint_(ViewInstance& inst);
 
-    /// Folds [cursor, bound) of a keyed projection instance.
+    /// Folds [cursor, bound) of a keyed instance.
     static rune::view::FoldStats foldKeyed_(ViewInstance& inst, const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
                                             const rune::view::FoldSkip& skip) {
+        if (inst.agg) {
+            rune::view::AggregateFold f{inst.plan, inst.layout, inst.agg->layout, inst.vdc, inst.table, inst.agg->contributors, inst.agg->groups,
+                                        inst.agg->blocksOrNull(), &*inst.keyed, &*inst.agg->groupIds, &inst.agg->nextGroupId};
+            return rune::view::foldKeyedAggregateBatch(f, inst.prospect, view, bound, cursor, skip);
+        }
         rune::view::ProjectionFold f{inst.plan, inst.layout, inst.vdc, inst.table, rune::view::viewKeyType(inst.plan), &*inst.keyed,
                                      inst.owners ? &*inst.owners : nullptr};
         return rune::view::foldProjectionBatch(f, inst.prospect, view, bound, cursor, skip);
@@ -906,6 +913,12 @@ private:
             auto dropKeyed = [](uint32_t, const uint8_t*, bool, std::span<const uint8_t>) noexcept {};
             inst.table.drainDirtyKeyed(dropKeyed);
             if (inst.owners) inst.owners->drainDirtyKeyed(dropKeyed);
+            if (inst.agg) {
+                inst.agg->contributors.drainDirtyKeyed(dropKeyed);
+                inst.agg->groups.drainDirtyKeyed(dropKeyed);
+                if (inst.agg->blocks) inst.agg->blocks->drainDirtyKeyed(dropKeyed);
+                inst.agg->groupIds->drainDirtyKeyed(dropKeyed);
+            }
             return;
         }
         auto drop = [](uint32_t, const uint8_t*, bool, uint64_t) noexcept {};

@@ -273,7 +273,7 @@ std::optional<AppliedDelta> applyKeyedDelta(std::span<ViewTable* const> tables, 
         const uint8_t  keyLen = p[pos + 1];
         const uint32_t rowLen = readLE32(p + pos + 2);
         const uint32_t count  = readLE32(p + pos + 6);
-        if (id >= tables.size() || keyLens[id] != keyLen || rowLens[id] != rowLen || tables[id]->keyWidth() != keyLen ||
+        if (id >= tables.size() || tables[id] == nullptr || keyLens[id] != keyLen || rowLens[id] != rowLen || tables[id]->keyWidth() != keyLen ||
             ((seen >> id) & 1u) != 0) {
             return std::nullopt;
         }
