@@ -205,3 +205,16 @@ TEST(CheckedWritesViewKeyBuilderRegression, LongStringKeyRoutesLikeTheProducerRe
         EXPECT_EQ(b->partition(), producer.partition(4)) << v;
     }
 }
+
+TEST(CheckedWritesViewKeyBuilderRegression, PartitionUsesTheTopicKeyNotTheAuthoredKeyFieldRegression) {
+    // The plan names userId as the source key; the topic is keyed by characterId, so the producer does not route by userId.
+    auto b = rcv::ViewKeyBuilder::fromPlan(planOf({{"userId", 0, "userId"}}, "userId"), characterDescriptor(), 4, Partitioner::Fnv1a);
+    ASSERT_TRUE(b.has_value()) << b.error();
+    b->setUInt("userId", 4097);
+    EXPECT_EQ(b->partition(), -1);
+
+    auto routed = rcv::ViewKeyBuilder::fromPlan(planOf({{"characterId", 0, "characterId"}}, "userId"), characterDescriptor(), 4, Partitioner::Fnv1a);
+    ASSERT_TRUE(routed.has_value()) << routed.error();
+    routed->setUInt("characterId", 4097);
+    EXPECT_EQ(routed->partition(), rune::protocol::partitionFor(le(4097, 8), 4, Partitioner::Fnv1a));
+}

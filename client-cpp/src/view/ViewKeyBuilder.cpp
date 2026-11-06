@@ -60,8 +60,10 @@ std::expected<ViewKeyBuilder, std::string> ViewKeyBuilder::fromPlan(const rune::
     if (width > rune::codec::kMaxViewKeyBytes) return std::unexpected("the view key is wider than 128 bytes");
     b.keyWidth_ = static_cast<uint16_t>(width);
     b.values_.resize(b.components_.size());
-    if (b.components_.size() == 1 && b.components_[0].keyFunction == rune::codec::kKeyFunctionNone && !authored.sources.empty() &&
-        b.components_[0].column == authored.sources[0].keyField) {
+    const auto sourceKey = std::find_if(sourceDescriptor.fields.begin(), sourceDescriptor.fields.end(),
+                                        [](const rune::codec::FieldDescriptor& f) { return f.isKey; });
+    if (b.components_.size() == 1 && b.components_[0].keyFunction == rune::codec::kKeyFunctionNone &&
+        sourceKey != sourceDescriptor.fields.end() && b.components_[0].column == sourceKey->name) {
         b.sourceKeyed_   = true;
         b.wireKeyWidth_ = b.components_[0].srcWidth;
     }
