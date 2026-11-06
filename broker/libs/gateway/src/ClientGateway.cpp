@@ -10766,9 +10766,15 @@ void ClientGateway::handleGetStats(const uint8_t* buf, std::size_t len)
     }
     const bool viewScope = m->scope == pc::StatsScope::ViewPartition;
     if (const PermissionTable& perms = permsOf_(*session); !perms.isAllowAll())
-        if (deny_(*session, authorizeTopicIdHere_(perms, m->objectId, m->partition, rune::security::Operation::Describe,
-                                                  viewScope ? rune::security::ResourceType::View : rune::security::ResourceType::Topic), buf, len))
+        if (const auto denial = authorizeTopicIdHere_(perms, m->objectId, m->partition, rune::security::Operation::Describe,
+                                                      viewScope ? rune::security::ResourceType::View : rune::security::ResourceType::Topic)) {
+            if (denial->code != static_cast<uint16_t>(pc::ErrorCode::NotAuthorized)) {   // not applied here yet: retriable, a StatsResponse has no status for it
+                sendRouteRefusal_(*session, m->sessionId, m->correlationId, {});
+                return;
+            }
+            (void)deny_(*session, denial, buf, len);
             return;
+        }
     if (!workerPool_ || topicRegistry_ == nullptr || inDeletingNs_(m->objectId)) {
         (void)rejectRequest_(buf, len, SR::kUnknownObject, "GetStats: object not served here");
         return;

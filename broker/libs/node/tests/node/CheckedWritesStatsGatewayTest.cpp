@@ -207,6 +207,24 @@ TEST(CheckedWritesStatsGatewayRegression, ScopeTwoRefusalsAreStatsStatusesRegres
     EXPECT_EQ(g.servedTotal(), 0u);
 }
 
+TEST(CheckedWritesStatsGatewayRegression, UnappliedTopicIsBareNotLeaderRegression) {
+    StatsGatewayRig g;
+    rune::gateway::SecurityView view{rune::security::SecurityState{}};
+    g.rig.gw.setAuthMode(rune::gateway::GatewayAuthMode::Required, &view);
+    rune::gateway::ObjectIndex idx;   // the source is placed but this node has not indexed it yet
+    g.rig.gw.setBootObjects(idx);
+    g.rig.gw.setSessionAuthForTest(g.rig.sid, rune::gateway::AuthAuthenticated{1, "nobody", rune::gateway::PermissionTable::compile({}, idx)});
+    std::vector<rune::metadata::RoutingImage::BuildEntry> img{{rune::metadata::gpidOf(kSrc, 0), CwViewReadGatewayRig::kSelf, 1}};
+    g.rig.gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build(img, rune::metadata::RoutingImage::Source::Committed));
+
+    g.send(g.frame(1, pc::StatsScope::TopicPartition, kSrc, 0));
+    EXPECT_FALSE(g.lastStats().has_value()) << "a retriable denial is never a StatsResponse status";
+    const auto err = pc::ErrorResponse::decode(g.rig.lastFrame.data(), g.rig.lastFrame.size());
+    ASSERT_TRUE(err.has_value());
+    EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_EQ(g.servedTotal(), 0u);
+}
+
 TEST(CheckedWritesStatsGatewayRegression, MalformedWorkerChunkIsRefusedRegression) {
     StatsGatewayRig g;
     rune::node::WorkerReturn ret;
