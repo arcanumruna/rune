@@ -130,18 +130,20 @@ struct Rig {
         total.skippedNoKey += s.skippedNoKey; total.keyConflicts += s.keyConflicts; total.ownerMoves += s.ownerMoves;
         total.uniquePromotions += s.uniquePromotions;
     }
-    void fold(const std::vector<Rec>& recs) {
+    // Through foldProjectionBatch; with `rng` every pass is capped at a random record bound and resumed from the cursor.
+    void fold(const std::vector<Rec>& recs, std::mt19937* rng = nullptr) {
         rune::protocol::RecordBatchBuilder b(0, 0);
         for (const auto& r : recs) b.append(r.key, std::string_view(reinterpret_cast<const char*>(r.value.data()), r.value.size()), 0);
         const auto bytes = b.build();
-        rune::protocol::RecordBatchReader r(bytes.data(), bytes.size());
-        ASSERT_TRUE(r.ensureValid());
-        r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t) {
-            SourceRecord rec{key, value, offset, 0, nullptr};
-            const auto st = prepareProjection(pf, rec, prospect);
-            add(prospect.stats);
-            if (st == PrepareStatus::Ok) applyProjection(pf, rec, prospect);
-        });
+        const int64_t n = int64_t(recs.size());
+        const rune::storage::LogReadView view{bytes.data(), bytes.size(), 0, n};
+        int64_t cursor = 0;
+        while (cursor < n) {
+            const int64_t bound = rng ? std::min<int64_t>(n, cursor + 1 + int64_t((*rng)() % 5)) : n;
+            const int64_t before = cursor;
+            add(foldProjectionBatch(pf, prospect, view, bound, cursor, kNoSkip));
+            ASSERT_GT(cursor, before);
+        }
     }
     void fold(const Rec& r) { fold(std::vector<Rec>{r}); }
     [[nodiscard]] uint16_t slotOf(const char* field) const {
@@ -163,7 +165,8 @@ struct Rig {
         if (!p) return std::nullopt;
         return ViewKey::fromBytes({p, spec.keyWidth});
     }
-    // Every table over the given universes.  `logical` leaves out the extras' list links, which depend on the arrival order.
+    // Every table over the given universes.  `logical` leaves out the index head/flags and the extras' prev/next/links bytes: the
+    // list is an O(1) head insert, so those bytes depend on the arrival order (deviation from "byte-identical", see the commit).
     [[nodiscard]] std::map<std::string, std::string> snapshot(const std::vector<std::string>& names, const std::vector<std::string>& wires,
                                                               bool logical = true) {
         std::map<std::string, std::string> out;
@@ -274,6 +277,19 @@ TEST(CheckedWritesUniqueFoldRegression, PromotionChainOfThreeClaimantsRegression
     EXPECT_EQ(rig.claims.indexTable().size(), 0u);
     EXPECT_EQ(rig.claims.extrasTable().size(), 0u);
     EXPECT_EQ(rig.total.uniquePromotions, 2u);
+}
+
+TEST(CheckedWritesUniqueFold, FoldReturnsThePromotionCount) {
+    Rig rig;
+    rig.fold({charRec(rig.src, 9, "foo", 2), charRec(rig.src, 7, "Foo", 1)});
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    const Rec t = tomb(7);
+    b.append(t.key, std::string_view{}, 0);
+    const auto bytes = b.build();
+    int64_t cursor = 0;
+    const FoldStats st = foldProjectionBatch(rig.pf, rig.prospect, {bytes.data(), bytes.size(), 0, 1}, 1, cursor, kNoSkip);
+    EXPECT_EQ(st.uniquePromotions, 1u);
+    EXPECT_EQ(st.deleted, 1u);
 }
 
 TEST(CheckedWritesUniqueFold, ExtraKeepsItsKeyAndItsLatestImageIsPromoted) {
@@ -459,7 +475,7 @@ TEST(CheckedWritesUniqueFoldModelRegression, RandomLogsFoldToTheFreshRefold) {
         }
         for (size_t at = 0; at < log.size();) {
             const size_t n = std::min<size_t>(1 + rng() % 20, log.size() - at);
-            inc.fold(std::vector<Rec>(log.begin() + at, log.begin() + at + n));
+            inc.fold(std::vector<Rec>(log.begin() + at, log.begin() + at + n), &rng);
             at += n;
         }
         Rig fresh(PrimType::UInt64, 2);
