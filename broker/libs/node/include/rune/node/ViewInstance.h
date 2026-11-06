@@ -17,6 +17,8 @@
 #include <rune/view/AggFold.h>
 #include <rune/view/AggState.h>
 #include <rune/view/ViewCheckpoint.h>
+#include <rune/view/KeyedFold.h>
+#include <rune/view/RecordFold.h>
 #include <rune/view/ViewFold.h>
 #include <rune/view/ViewPlan.h>
 #include <rune/view/ViewRow.h>
@@ -84,11 +86,11 @@ struct AggInstance {
     rune::view::ViewTable contributors;  // contributorKey -> pre-image (retraction)
     rune::view::ViewTable groups;        // groupKey -> accumulators
     std::optional<rune::view::ViewTable> blocks;   // engaged iff layout.numBlockCols > 0
-    AggInstance(rune::view::AggLayout l, std::size_t indexSlots, std::size_t chunkBytes)
+    AggInstance(rune::view::AggLayout l, std::size_t indexSlots, std::size_t chunkBytes, rune::view::ViewTableKeys keys = {})
         : layout(std::move(l)),
-          contributors(layout.contributorRow, indexSlots, chunkBytes),
-          groups(layout.groupRow, indexSlots, chunkBytes) {
-        if (layout.numBlockCols > 0) blocks.emplace(layout.blockRow, indexSlots, chunkBytes);
+          contributors(layout.contributorRow, indexSlots, chunkBytes, keys),
+          groups(layout.groupRow, indexSlots, chunkBytes, keys) {
+        if (layout.numBlockCols > 0) blocks.emplace(layout.blockRow, indexSlots, chunkBytes, keys);
     }
     rune::view::ViewTable* blocksOrNull() noexcept { return blocks ? &*blocks : nullptr; }
 };
@@ -111,6 +113,11 @@ struct ViewFoldCounters {
     uint64_t viewBackupFailures      = 0;   // a discard whose backup failed: the view stays NotReady for the rest of the boot
     uint64_t checkpointsAheadOfLog   = 0;   // #159: a recovered checkpoint above the source log end
     uint64_t sourceRecordsTrimmed    = 0;   // source records below the log start that this view never folded (retention, compaction)
+    uint64_t skippedNoKey            = 0;   // keyed projection: a live record with an absent key component
+    uint64_t keyConflicts            = 0;   // keyed projection: a unique key already owned by another source key
+    uint64_t ownerMoves              = 0;   // keyed projection: a row moved to another key
+    uint64_t scanRows                = 0;   // rows served by scanPage
+    uint64_t scanPages               = 0;   // pages served by scanPage
 };
 
 // Where the persisted checkpoint of an instance stands in a discard (one explicit state, each holding only what it needs):
@@ -179,10 +186,16 @@ struct ViewInstance {
     rune::view::RowLayout              layout;
     rune::codec::Descriptor            evolvingSrc;
     rune::view::VersionDescriptorCache vdc;
+    rune::view::ViewTableKeys          tableKeys;   // the hash seed (and test mask) every table of this instance is built with
     rune::view::ViewTable              table;
     // Engaged iff isAggregateView(plan) (Phase 2a); empty for Replace views,
     // whose fold/checkpoint/recovery paths are unchanged.
     std::optional<AggInstance>         agg;
+    // Engaged iff the plan is Keyed (Part 07): how a record derives its view key, the owner map (source key -> current view
+    // key; only when the key is not the source key) and the fixed prospect the fold prepares each record into.
+    std::optional<rune::view::KeyedFoldSpec> keyed;
+    std::optional<rune::view::ViewTable>     owners;
+    rune::view::Prospect                     prospect;
     int32_t                            partition       = 0;
     int64_t                            foldCursor      = 0;
     TransientCursor                    transientCursor{CursorFresh{}};
@@ -239,12 +252,13 @@ struct ViewInstance {
 
     ViewInstance(rune::view::CompiledViewPlan p, rune::view::RowLayout l,
                  rune::codec::Descriptor src, bool persist, int32_t part,
-                 std::size_t indexSlots, std::size_t chunkBytes)
+                 std::size_t indexSlots, std::size_t chunkBytes, rune::view::ViewTableKeys keys = {})
         : plan(std::move(p)),
           layout(std::move(l)),
           evolvingSrc(std::move(src)),
           vdc(evolvingSrc),                      // copy the already-moved member
-          table(layout, indexSlots, chunkBytes), // layout member already set
+          tableKeys(keys),
+          table(layout, indexSlots, chunkBytes, keys), // layout member already set
           partition(part),
           persisted(persist) {}
 };

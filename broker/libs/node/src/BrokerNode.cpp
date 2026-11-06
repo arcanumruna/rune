@@ -1900,11 +1900,14 @@ void BrokerNode::buildWorkerPool() {
         workerViewSets_.reserve(static_cast<std::size_t>(wc));
         std::vector<ViewSnapshotChannel*> chPtrs;
         chPtrs.reserve(static_cast<std::size_t>(wc));
+        std::random_device rd;
         for (int32_t i = 0; i < wc; ++i) {
             viewSnapshotChannels_.push_back(std::make_unique<ViewSnapshotChannel>());
             ViewSnapshotChannel* ch = viewSnapshotChannels_.back().get();
             chPtrs.push_back(ch);
-            workerViewSets_.push_back(std::make_unique<WorkerViewSet>(*ch, viewSnapDir));
+            const uint64_t hashSeed = config_.viewHashSeedForTest != 0 ? config_.viewHashSeedForTest + static_cast<uint64_t>(i)
+                                                                       : (uint64_t{rd()} << 32) | rd();
+            workerViewSets_.push_back(std::make_unique<WorkerViewSet>(*ch, viewSnapDir, hashSeed));
             workerPool_->worker(i).setViewSet(workerViewSets_.back().get());
         }
         viewSnapshotIoAgent_ = std::make_unique<ViewSnapshotIoAgent>(

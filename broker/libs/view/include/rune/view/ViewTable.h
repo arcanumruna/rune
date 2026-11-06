@@ -179,6 +179,7 @@ public:
 
     [[nodiscard]] uint8_t keyWidth() const noexcept { return keyWidth_; }
     [[nodiscard]] uint8_t prefixWidth() const noexcept { return prefixWidth_; }
+    [[nodiscard]] uint64_t hashSeedForTest() const noexcept { return hashSeed_; }
 
     // The key stored in front of a wide row; empty for a narrow table (its key is the slot word).
     [[nodiscard]] std::span<const uint8_t> keyOfRow(const uint8_t* payload) const noexcept {

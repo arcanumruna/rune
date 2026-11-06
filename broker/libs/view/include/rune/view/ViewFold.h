@@ -94,4 +94,8 @@ struct ProjectionFold {
 // Commits a prepared record.
 void applyProjection(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept;
 
+// foldBatch for a keyed projection: the same walk, each record prepared into `p` (reserved once per instance) and applied.
+FoldStats foldProjectionBatch(ProjectionFold& f, Prospect& p, const rune::storage::LogReadView& view, int64_t bound,
+                              int64_t& cursor, const FoldSkip& skip);
+
 } // namespace rune::view

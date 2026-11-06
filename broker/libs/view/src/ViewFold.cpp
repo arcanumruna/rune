@@ -236,54 +236,11 @@ void applyKeyed(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) n
     else std::memcpy(f.owners->put(wire), n.key.bytes.data(), f.keyed->keyWidth);
 }
 
-} // namespace
-
-PrimType viewKeyType(const CompiledViewPlan& plan) noexcept { return resolveKeyType(plan); }
-
-PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept {
-    p.clear();
-    if (f.keyed != nullptr) return prepareKeyed(f, rec, p);
-    uint64_t k = 0;
-    if (!decodeWireKey(rec.key, f.keyType, k)) {
-        p.stats.skippedMalformed = 1;
-        return PrepareStatus::Malformed;
-    }
-    ProspectRow& r = p.rows[0];
-    r.key     = ViewKey::fromU64(k);
-    p.rowCount = 1;
-    const uint8_t* cur = f.table.get(k);
-    r.existed = cur != nullptr;
-    r.removed = false;
-    r.image   = nullptr;
-    if (rec.value.empty()) {
-        p.op      = ProspectOp::Erase;
-        r.removed = true;
-        p.stats.deleted = 1;
-        return PrepareStatus::Ok;
-    }
-    p.op    = ProspectOp::Upsert;
-    p.stats.applied = 1;
-    r.image = p.scratch.data();
-    if (cur != nullptr) std::memcpy(r.image, cur, p.rowLen); else std::memset(r.image, 0, p.rowLen);
-    const Descriptor& d = rec.writer != nullptr ? *rec.writer : writerOf(f.vdc, rec.value);
-    writeProjectionRow(f.plan, f.layout, d, rec.value, r.image);
-    return PrepareStatus::Ok;
-}
-
-void applyProjection(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept {
-    if (f.keyed != nullptr) return applyKeyed(f, rec, p);
-    if (p.op == ProspectOp::None) return;
-    const uint64_t k = p.rows[0].key.asU64();
-    if (p.op == ProspectOp::Erase) f.table.erase(k);
-    else std::memcpy(f.table.put(k), p.rows[0].image, p.rowLen);
-}
-
-FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
-                     VersionDescriptorCache& vdc, ViewTable& table,
-                     const rune::storage::LogReadView& view, int64_t bound,
-                     int64_t& cursor, const FoldSkip& skip) {
+// The batch walk both folds share: control and aborted batches are consumed whole, `onRecord(key, value, offset, stats)` sees
+// every other record in [cursor, bound) that the judge did not reject.  `cursor` is IN/OUT exactly as foldBatch documents it.
+template <class OnRecord>
+FoldStats walkCommitted(const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor, const FoldSkip& skip, OnRecord&& onRecord) {
     FoldStats stats{};
-    const PrimType keyType = resolveKeyType(plan);
     // Resume point: a LogReadView is WHOLE batches, so when the caller's cursor
     // sits mid-batch (a capped pass stopped there) the batch's records below it
     // were already folded and must not be re-applied.
@@ -342,22 +299,7 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                 return;
             }
 
-            uint64_t k = 0;
-            if (!decodeWireKey(key, keyType, k)) {
-                ++stats.skippedMalformed;
-                return;
-            }
-
-            if (value.empty()) {
-                // Tombstone: erase by the same wire/compaction key.
-                table.erase(k);
-                ++stats.deleted;
-                return;
-            }
-
-            const Descriptor& d = writerOf(vdc, value);
-            writeProjectionRow(plan, layout, d, value, table.put(k));
-            ++stats.applied;
+            onRecord(key, value, offset, stats);
         });
 
         if (stopped) {
@@ -377,6 +319,86 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
     // Never move the resume point backwards (a corrupt batch at/after `from`).
     cursor = std::max(from, corrupt ? walkedUpto : std::min(view.nextOffset, bound));
     return stats;
+}
+
+} // namespace
+
+PrimType viewKeyType(const CompiledViewPlan& plan) noexcept { return resolveKeyType(plan); }
+
+PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept {
+    p.clear();
+    if (f.keyed != nullptr) return prepareKeyed(f, rec, p);
+    uint64_t k = 0;
+    if (!decodeWireKey(rec.key, f.keyType, k)) {
+        p.stats.skippedMalformed = 1;
+        return PrepareStatus::Malformed;
+    }
+    ProspectRow& r = p.rows[0];
+    r.key     = ViewKey::fromU64(k);
+    p.rowCount = 1;
+    const uint8_t* cur = f.table.get(k);
+    r.existed = cur != nullptr;
+    r.removed = false;
+    r.image   = nullptr;
+    if (rec.value.empty()) {
+        p.op      = ProspectOp::Erase;
+        r.removed = true;
+        p.stats.deleted = 1;
+        return PrepareStatus::Ok;
+    }
+    p.op    = ProspectOp::Upsert;
+    p.stats.applied = 1;
+    r.image = p.scratch.data();
+    if (cur != nullptr) std::memcpy(r.image, cur, p.rowLen); else std::memset(r.image, 0, p.rowLen);
+    const Descriptor& d = rec.writer != nullptr ? *rec.writer : writerOf(f.vdc, rec.value);
+    writeProjectionRow(f.plan, f.layout, d, rec.value, r.image);
+    return PrepareStatus::Ok;
+}
+
+void applyProjection(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept {
+    if (f.keyed != nullptr) return applyKeyed(f, rec, p);
+    if (p.op == ProspectOp::None) return;
+    const uint64_t k = p.rows[0].key.asU64();
+    if (p.op == ProspectOp::Erase) f.table.erase(k);
+    else std::memcpy(f.table.put(k), p.rows[0].image, p.rowLen);
+}
+
+FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
+                     VersionDescriptorCache& vdc, ViewTable& table,
+                     const rune::storage::LogReadView& view, int64_t bound,
+                     int64_t& cursor, const FoldSkip& skip) {
+    const PrimType keyType = resolveKeyType(plan);
+    return walkCommitted(view, bound, cursor, skip, [&](std::string_view key, std::string_view value, int64_t, FoldStats& stats) {
+        uint64_t k = 0;
+        if (!decodeWireKey(key, keyType, k)) {
+            ++stats.skippedMalformed;
+            return;
+        }
+        if (value.empty()) {
+            // Tombstone: erase by the same wire/compaction key.
+            table.erase(k);
+            ++stats.deleted;
+            return;
+        }
+        const Descriptor& d = writerOf(vdc, value);
+        writeProjectionRow(plan, layout, d, value, table.put(k));
+        ++stats.applied;
+    });
+}
+
+FoldStats foldProjectionBatch(ProjectionFold& f, Prospect& p, const rune::storage::LogReadView& view, int64_t bound,
+                              int64_t& cursor, const FoldSkip& skip) {
+    return walkCommitted(view, bound, cursor, skip, [&](std::string_view key, std::string_view value, int64_t offset, FoldStats& stats) {
+        const SourceRecord rec{key, value, offset, 0, nullptr};
+        (void)prepareProjection(f, rec, p);   // a malformed record leaves op None: apply does nothing and the stats say why
+        applyProjection(f, rec, p);
+        stats.applied += p.stats.applied;
+        stats.deleted += p.stats.deleted;
+        stats.skippedMalformed += p.stats.skippedMalformed;
+        stats.skippedNoKey += p.stats.skippedNoKey;
+        stats.keyConflicts += p.stats.keyConflicts;
+        stats.ownerMoves += p.stats.ownerMoves;
+    });
 }
 
 } // namespace rune::view
