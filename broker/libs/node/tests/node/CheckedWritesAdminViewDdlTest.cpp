@@ -252,10 +252,17 @@ TEST(CheckedWritesAdminViewDdl, KeyedViewsNeedOnePartition) {
     EXPECT_EQ(composite.code, codeOf(ErrorCode::ViewNotCoPartitioned));
     EXPECT_EQ(composite.detail, "a view keyed on anything but the source key needs a source with one partition");
 
-    auto sourceKeyed = projection(rig, "character", characterDescriptor(), "characterId", {{"characterId", 0, "characterId"}},
-                                  {"characterId", "provider"}, "provider_by_character");
-    const auto ok = createView(rig, sourceKeyed, "characterId");
-    EXPECT_EQ(ok.code, kOk) << ok.detail;
+    const auto tenant = rune::codec::DescriptorBuilder("tenant", 1)
+        .add("tenantId", PrimType::UInt16).add("region", PrimType::UInt16).addFixedStr("name", 16).build();
+    ASSERT_EQ(define(rig, "tenant", "tenantId", tenant, 3).code, kOk);
+    const auto sourceKeyed = createView(rig, projection(rig, "tenant", tenant, "tenantId", {{"tenantId", 0, "tenantId"}},
+                                                        {"tenantId", "region"}, "region_by_tenant"), "tenantId");
+    ASSERT_EQ(sourceKeyed.code, kOk) << sourceKeyed.detail;
+    EXPECT_EQ(rv::keyModeOf(compiledOf(rig.recordedLog().back().event)), rv::ViewKeyMode::LegacyU64);
+
+    const auto otherKey = createView(rig, projection(rig, "tenant", tenant, "tenantId", {{"region", 0, "region"}, {"tenantId", 0, "tenantId"}},
+                                                     {"region", "tenantId", "name"}, "tenant_by_region"), "region");
+    EXPECT_EQ(otherKey.code, codeOf(ErrorCode::ViewNotCoPartitioned)) << otherKey.detail;
 }
 
 TEST(CheckedWritesAdminViewDdlRegression, KeylessSourceIsRefusedBeforeTheCompileRegression) {
