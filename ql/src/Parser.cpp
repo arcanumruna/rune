@@ -145,9 +145,12 @@ struct Lexer {
             case '*': advance(); return {TK::Star,    src.substr(pos - 1, 1), tline, tcol};
             case '<': {
                 advance();
-                const TK k = pos < src.size() && src[pos] == '=' ? TK::Le : pos < src.size() && src[pos] == '>' ? TK::Ne : TK::Lt;
-                if (k != TK::Lt) advance();
-                return {k, src.substr(pos - (k == TK::Lt ? 1 : 2), k == TK::Lt ? 1 : 2), tline, tcol};
+                if (pos < src.size() && (src[pos] == '=' || src[pos] == '>')) {
+                    const TK k = src[pos] == '=' ? TK::Le : TK::Ne;
+                    advance();
+                    return {k, src.substr(pos - 2, 2), tline, tcol};
+                }
+                return {TK::Lt, src.substr(pos - 1, 1), tline, tcol};
             }
             case '>': {
                 advance();
@@ -736,7 +739,7 @@ struct Parser {
             auto fd = parseField();
             if (!fd) return std::unexpected(std::move(fd.error()));
             if (fd->autoIncrement) {
-                return std::unexpected(err("autoincrement is allowed only on the key field; '" + fd->name + "' is not the key"));
+                return std::unexpected(err("autoincrement can only be set when the topic is created"));
             }
 
             AlterOp op;
@@ -1615,7 +1618,7 @@ struct Parser {
             advance();
             if (cur.kind != TK::Int) return std::unexpected(err("expected integer for limit, got " + got()));
             uint64_t n = 0;
-            const auto [ptr, ec] = std::from_chars(cur.text.data(), cur.text.data() + cur.text.size(), n);
+            const auto ec = std::from_chars(cur.text.data(), cur.text.data() + cur.text.size(), n).ec;
             if (ec != std::errc{} || n > std::numeric_limits<uint32_t>::max()) return std::unexpected(err("limit must be <= 4294967295"));
             if (n < 1) return std::unexpected(err("limit must be >= 1"));
             advance();

@@ -91,6 +91,9 @@ TEST(CheckedWritesQlSelect, NewStatementsAreNotSecurityStatements) {
 
 TEST(CheckedWritesQlSelect, Errors) {
     EXPECT_NE(errorOf("select * from v where k = 1 limit 0;").find("limit must be >= 1"), std::string::npos);
+    EXPECT_NE(errorOf("select * from v where k = 1 limit x;").find("expected integer for limit, got"), std::string::npos);
+    EXPECT_FALSE(errorOf("select from v where k = 1;").empty());
+    EXPECT_FALSE(errorOf("select * from v where k = ;").empty());
     EXPECT_NE(errorOf("select * from v where k = 1 limit 4294967296;").find("limit must be <= 4294967295"), std::string::npos);
     EXPECT_NE(errorOf("select * from v where k = 1 and k = 2;").find("duplicate where column 'k'"), std::string::npos);
     EXPECT_NE(errorOf("select * from v where k = lower(name);").find("lower() takes a string literal"), std::string::npos);

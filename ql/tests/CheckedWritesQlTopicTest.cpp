@@ -85,6 +85,18 @@ TEST(CheckedWritesQlTopic, NewTokensLex) {
     auto r = ql::parse("topic t { a int32 } key a <");
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().message, "expected ';', got '<'");
+    for (const char* op : {"<>", ">=", "<", ">"}) {
+        r = ql::parse(std::string("topic t { a int32 } key a ") + op);
+        ASSERT_FALSE(r.has_value()) << op;
+        EXPECT_EQ(r.error().message, std::string("expected ';', got '") + op + "'") << op;
+    }
+}
+
+TEST(CheckedWritesQlTopic, KeyIndexValueIsCaseInsensitive) {
+    for (const char* v : {"ON", "Off"}) {
+        auto r = ql::parse(std::string("topic t { id uint64 } key id with (key.index = ") + v + ");");
+        EXPECT_TRUE(r.has_value()) << v << (r ? "" : r.error().message);
+    }
 }
 
 TEST(CheckedWritesQlTopic, AutoincrementSettingRanges) {
@@ -130,5 +142,5 @@ TEST(CheckedWritesQlTopic, UserTopicOfTheTargetBlock) {
 TEST(CheckedWritesQlTopicRegression, AutoincrementRefusedOnAlterAddColumnRegression) {
     auto r = ql::parse("alter topic t add column n uint64 autoincrement;");
     ASSERT_FALSE(r.has_value());
-    EXPECT_EQ(r.error().message, "autoincrement is allowed only on the key field; 'n' is not the key");
+    EXPECT_EQ(r.error().message, "autoincrement can only be set when the topic is created");
 }
