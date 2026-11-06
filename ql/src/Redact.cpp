@@ -101,7 +101,16 @@ std::string redactedText(const Statement& s) {
     }, s);
 }
 
-bool isSecurityStatement(const Statement& s) noexcept { return s.index() >= 8; }
+bool isSecurityStatement(const Statement& s) noexcept {
+    return std::visit([](const auto& d) {
+        using T = std::decay_t<decltype(d)>;
+        return std::is_same_v<T, CreateUserDef> || std::is_same_v<T, AlterUserDef> || std::is_same_v<T, DropUserDef> ||
+               std::is_same_v<T, CreateRoleDef> || std::is_same_v<T, DropRoleDef> || std::is_same_v<T, GrantDef> ||
+               std::is_same_v<T, RevokeDef> || std::is_same_v<T, GrantRoleDef> || std::is_same_v<T, RevokeRoleDef> ||
+               std::is_same_v<T, ShowUsersDef> || std::is_same_v<T, ShowRolesDef> || std::is_same_v<T, ShowGrantsDef> ||
+               std::is_same_v<T, ShowSecurityHistoryDef>;
+    }, s);
+}
 
 bool carriesPassword(const Statement& s) noexcept {
     if (std::holds_alternative<CreateUserDef>(s)) return true;

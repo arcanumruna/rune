@@ -909,6 +909,291 @@ struct Parser {
         return std::unexpected(err("expected 'user' or 'role', got " + got()));
     }
 
+    // ---- create view ----
+
+    // lower(IDENT) with `cur` on "lower" already consumed and "(" current.
+    std::expected<std::string, ParseError> parseLowerArg() noexcept {
+        advance();   // "("
+        if (cur.kind != TK::Ident) return std::unexpected(err("lower() takes a column name"));
+        std::string col(cur.text);
+        advance();
+        auto rp = expect(TK::RParen, ")");
+        if (!rp) return std::unexpected(std::move(rp.error()));
+        return col;
+    }
+
+    // keyItem := IDENT | "lower" "(" IDENT ")" "as" IDENT.  `lower` alone is a column name.
+    std::expected<KeyItem, ParseError> parseKeyItem() noexcept {
+        auto id = expect(TK::Ident, "key column");
+        if (!id) return std::unexpected(std::move(id.error()));
+        if (ieq(id->text, "lower") && cur.kind == TK::LParen) {
+            auto col = parseLowerArg();
+            if (!col) return std::unexpected(std::move(col.error()));
+            auto as = expectKeyword("as");
+            if (!as) return std::unexpected(std::move(as.error()));
+            auto out = expect(TK::Ident, "key name");
+            if (!out) return std::unexpected(std::move(out.error()));
+            return KeyItem{std::move(*col), KeyFunction::Lower, std::string(out->text)};
+        }
+        return KeyItem{std::string(id->text), KeyFunction::None, std::string(id->text)};
+    }
+
+    std::expected<std::vector<KeyItem>, ParseError> parseKeySpec() noexcept {
+        std::vector<KeyItem> key;
+        const bool paren = cur.kind == TK::LParen;
+        if (paren) advance();
+        for (;;) {
+            auto k = parseKeyItem();
+            if (!k) return std::unexpected(std::move(k.error()));
+            key.push_back(std::move(*k));
+            if (!paren || cur.kind != TK::Comma) break;
+            advance();
+        }
+        if (paren) {
+            auto rp = expect(TK::RParen, ")");
+            if (!rp) return std::unexpected(std::move(rp.error()));
+        }
+        return key;
+    }
+
+    // groupItem := IDENT | "lower" "(" IDENT ")"
+    std::expected<KeyItem, ParseError> parseGroupItem() noexcept {
+        auto id = expect(TK::Ident, "group by column");
+        if (!id) return std::unexpected(std::move(id.error()));
+        if (ieq(id->text, "lower") && cur.kind == TK::LParen) {
+            auto col = parseLowerArg();
+            if (!col) return std::unexpected(std::move(col.error()));
+            return KeyItem{std::move(*col), KeyFunction::Lower, {}};
+        }
+        return KeyItem{std::string(id->text), KeyFunction::None, std::string(id->text)};
+    }
+
+    static bool aggregateKind(std::string_view w, ItemKind& k) noexcept {
+        if (ieq(w, "count")) k = ItemKind::Count;
+        else if (ieq(w, "sum")) k = ItemKind::Sum;
+        else if (ieq(w, "avg")) k = ItemKind::Avg;
+        else if (ieq(w, "min")) k = ItemKind::Min;
+        else if (ieq(w, "max")) k = ItemKind::Max;
+        else if (ieq(w, "last")) k = ItemKind::Last;
+        else return false;
+        return true;
+    }
+
+    // item := AGG "(" ("*" | IDENT) ")" "as" IDENT | IDENT ["as" IDENT]; a word is an aggregate only before "(".
+    std::expected<SelectItem, ParseError> parseSelectItem() noexcept {
+        auto id = expect(TK::Ident, "select item");
+        if (!id) return std::unexpected(std::move(id.error()));
+        SelectItem it;
+        if (cur.kind == TK::LParen && aggregateKind(id->text, it.kind)) {
+            advance();   // "("
+            std::string fn(id->text);
+            for (auto& c : fn) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            bool all = false;
+            if (cur.kind == TK::Star) {
+                if (it.kind != ItemKind::Count) return std::unexpected(err("'*' is only valid in count(*)"));
+                it.kind = ItemKind::CountAll;
+                all = true;
+                advance();
+            } else {
+                auto col = expect(TK::Ident, "column name");
+                if (!col) return std::unexpected(std::move(col.error()));
+                it.column = std::string(col->text);
+            }
+            auto rp = expect(TK::RParen, ")");
+            if (!rp) return std::unexpected(std::move(rp.error()));
+            if (!isKw("as")) return std::unexpected(err((all ? std::string("count(*)") : fn + "(…)") + " needs 'as <name>'"));
+            advance();
+            auto al = expect(TK::Ident, "name after 'as'");
+            if (!al) return std::unexpected(std::move(al.error()));
+            it.alias = std::string(al->text);
+            return it;
+        }
+        it.kind = ItemKind::Column;
+        it.column = std::string(id->text);
+        if (isKw("as")) {
+            advance();
+            auto al = expect(TK::Ident, "name after 'as'");
+            if (!al) return std::unexpected(std::move(al.error()));
+            it.alias = std::string(al->text);
+        }
+        return it;
+    }
+
+    std::expected<std::vector<SelectItem>, ParseError> parseSelectItems() noexcept {
+        std::vector<SelectItem> items;
+        if (cur.kind == TK::Star) {
+            advance();
+            if (cur.kind == TK::Comma) return std::unexpected(err("'*' cannot be combined with other select items"));
+            items.push_back(SelectItem{ItemKind::Star, {}, {}});
+            return items;
+        }
+        for (;;) {
+            if (cur.kind == TK::Star) return std::unexpected(err("'*' cannot be combined with other select items"));
+            auto it = parseSelectItem();
+            if (!it) return std::unexpected(std::move(it.error()));
+            items.push_back(std::move(*it));
+            if (cur.kind != TK::Comma) break;
+            advance();
+        }
+        return items;
+    }
+
+    // literal := ["-"] INT | STRING | "true" | "false"
+    std::expected<Literal, ParseError> parseLiteral() noexcept {
+        Literal v;
+        if (cur.kind == TK::String) {
+            v.kind = Literal::Kind::String;
+            v.text = std::string(cur.text);
+            advance();
+            return v;
+        }
+        if (isKw("true") || isKw("false")) {
+            v.kind = Literal::Kind::Bool;
+            v.boolean = isKw("true");
+            advance();
+            return v;
+        }
+        const Token start = cur;
+        if (cur.kind == TK::Dash) {
+            v.negative = true;
+            advance();
+            if (cur.kind != TK::Int || !cur.adj) return std::unexpected(err("expected digits right after '-', got " + got()));
+        }
+        if (cur.kind != TK::Int) return std::unexpected(err("expected a constant, got " + got()));
+        auto [ptr, ec] = std::from_chars(cur.text.data(), cur.text.data() + cur.text.size(), v.magnitude);
+        if (ec != std::errc{}) return std::unexpected(errAt(start, "integer constant is outside the 64-bit range"));
+        advance();
+        return v;
+    }
+
+    static uint16_t pushPred(std::vector<PredNode>& out, PredNode n) noexcept {
+        out.push_back(std::move(n));
+        return static_cast<uint16_t>(out.size() - 1);
+    }
+
+    // notExpr := "not" notExpr | "(" orExpr ")" | IDENT CMP literal.  Children are pushed before their parent.
+    std::expected<uint16_t, ParseError> parseNotExpr(std::vector<PredNode>& out) noexcept {
+        if (isKw("not")) {
+            advance();
+            auto c = parseNotExpr(out);
+            if (!c) return c;
+            return pushPred(out, PredNode{PredOp::Not, *c, 0, {}, {}});
+        }
+        if (cur.kind == TK::LParen) {
+            advance();
+            auto e = parseOrExpr(out);
+            if (!e) return e;
+            auto rp = expect(TK::RParen, ")");
+            if (!rp) return std::unexpected(std::move(rp.error()));
+            return e;
+        }
+        constexpr const char* kShape = "a check compares a column with a constant: <column> <op> <constant>";
+        if (cur.kind != TK::Ident) return std::unexpected(err(kShape));
+        const std::string col(cur.text);
+        advance();
+        PredOp op;
+        switch (cur.kind) {
+        case TK::Eq: op = PredOp::Eq; break;
+        case TK::Ne: op = PredOp::Ne; break;
+        case TK::Lt: op = PredOp::Lt; break;
+        case TK::Le: op = PredOp::Le; break;
+        case TK::Gt: op = PredOp::Gt; break;
+        case TK::Ge: op = PredOp::Ge; break;
+        default: return std::unexpected(err(kShape));
+        }
+        advance();
+        if (cur.kind == TK::Ident && !isKw("true") && !isKw("false")) return std::unexpected(err(kShape));
+        auto lit = parseLiteral();
+        if (!lit) return std::unexpected(std::move(lit.error()));
+        const uint16_t a = pushPred(out, PredNode{PredOp::Column, 0, 0, col, {}});
+        const uint16_t b = pushPred(out, PredNode{PredOp::Const, 0, 0, {}, std::move(*lit)});
+        return pushPred(out, PredNode{op, a, b, {}, {}});
+    }
+
+    std::expected<uint16_t, ParseError> parseAndExpr(std::vector<PredNode>& out) noexcept {
+        auto l = parseNotExpr(out);
+        if (!l) return l;
+        while (isKw("and")) {
+            advance();
+            auto r = parseNotExpr(out);
+            if (!r) return r;
+            l = pushPred(out, PredNode{PredOp::And, *l, *r, {}, {}});
+        }
+        return l;
+    }
+
+    std::expected<uint16_t, ParseError> parseOrExpr(std::vector<PredNode>& out) noexcept {
+        auto l = parseAndExpr(out);
+        if (!l) return l;
+        while (isKw("or")) {
+            advance();
+            auto r = parseAndExpr(out);
+            if (!r) return r;
+            l = pushPred(out, PredNode{PredOp::Or, *l, *r, {}, {}});
+        }
+        return l;
+    }
+
+    // at "or" | "transient" | "unique" | "view" (after "create")
+    std::expected<Statement, ParseError> parseCreateView() noexcept {
+        CreateViewDef v;
+        if (isKw("or")) {
+            advance();
+            auto r = expectKeyword("replace");
+            if (!r) return std::unexpected(std::move(r.error()));
+            v.orReplace = true;
+        }
+        if (isKw("transient")) { advance(); v.transient = true; }
+        if (isKw("unique"))    { advance(); v.unique = true; }
+        if (!isKw("view")) {
+            return std::unexpected(err("expected 'view' after 'create [or replace] [transient] [unique]', got " + got()));
+        }
+        advance();
+        auto n = parseName("view name");
+        if (!n) return std::unexpected(std::move(n.error()));
+        v.name = std::move(*n);
+        if (auto k = expectKeyword("key"); !k) return std::unexpected(std::move(k.error()));
+        auto key = parseKeySpec();
+        if (!key) return std::unexpected(std::move(key.error()));
+        v.key = std::move(*key);
+        if (auto k = expectKeyword("as"); !k) return std::unexpected(std::move(k.error()));
+        if (auto k = expectKeyword("select"); !k) return std::unexpected(std::move(k.error()));
+        auto items = parseSelectItems();
+        if (!items) return std::unexpected(std::move(items.error()));
+        v.items = std::move(*items);
+        if (auto k = expectKeyword("from"); !k) return std::unexpected(std::move(k.error()));
+        auto src = parseName("source topic");
+        if (!src) return std::unexpected(std::move(src.error()));
+        v.source = std::move(*src);
+        if (isKw("group")) {
+            advance();
+            if (auto k = expectKeyword("by"); !k) return std::unexpected(std::move(k.error()));
+            for (;;) {
+                auto g = parseGroupItem();
+                if (!g) return std::unexpected(std::move(g.error()));
+                v.groupBy.push_back(std::move(*g));
+                if (cur.kind != TK::Comma) break;
+                advance();
+            }
+        }
+        while (isKw("constraint")) {
+            advance();
+            ConstraintDef c;
+            auto cn = expect(TK::Ident, "constraint name");
+            if (!cn) return std::unexpected(std::move(cn.error()));
+            c.name = std::string(cn->text);
+            if (auto k = expectKeyword("check"); !k) return std::unexpected(std::move(k.error()));
+            if (auto k = expect(TK::LParen, "("); !k) return std::unexpected(std::move(k.error()));
+            auto root = parseOrExpr(c.predicate);
+            if (!root) return std::unexpected(std::move(root.error()));
+            if (auto k = expect(TK::RParen, ")"); !k) return std::unexpected(std::move(k.error()));
+            v.constraints.push_back(std::move(c));
+        }
+        auto semi = expect(TK::Semi, ";");
+        if (!semi) return std::unexpected(std::move(semi.error()));
+        return Statement(std::in_place_type<CreateViewDef>, std::move(v));
+    }
+
     std::expected<Statement, ParseError> parseCreateStatement() noexcept {
         advance();   // "create"
         if (isKw("role")) {
@@ -919,7 +1204,8 @@ struct Parser {
             if (!semi) return std::unexpected(std::move(semi.error()));
             return Statement(std::in_place_type<CreateRoleDef>, CreateRoleDef{std::move(*n)});
         }
-        if (!isKw("user")) return std::unexpected(err("expected 'user' or 'role' after 'create', got " + got()));
+        if (isKw("or") || isKw("transient") || isKw("unique") || isKw("view")) return parseCreateView();
+        if (!isKw("user")) return std::unexpected(err("expected 'user', 'role' or 'view' after 'create', got " + got()));
         advance();
         auto n = parseName("user name");
         if (!n) return std::unexpected(std::move(n.error()));
