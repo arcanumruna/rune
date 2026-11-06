@@ -205,3 +205,51 @@ TEST(CheckedWritesClientStats, NotAuthorizedRidesAsBrokerError) {
     EXPECT_EQ(get.status(), OpStatus::BrokerError);
     EXPECT_EQ(get.outcome().c.errorCode, rpc::StatsResponse::kNotAuthorized);
 }
+
+TEST(CheckedWritesClientStats, NotLeaderUntilTheBudgetEndsIsKNotLeader) {
+    rc::ClientConfig cfg = invokerCfg(4709, 4710);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(300);
+    Rig r(cfg);
+    int sent = 0;
+    r.gw.templateHandlers[rpc::GetStats::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t n) {
+        auto m = rpc::GetStats::decode(f, n);
+        ASSERT_TRUE(m.has_value());
+        ++sent;
+        r.gw.sendError(ep, static_cast<int16_t>(rpc::ErrorCode::NotLeader), "", m->sessionId, m->correlationId);
+    };
+    r.connect();
+    test_support::TestCq cq(*r.client);
+    auto get = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client->getStats(rpc::StatsScope::TopicPartition, 3, 0, q, t);
+    });
+    ASSERT_TRUE(r.drive([&] { return get.ready(); }));
+    EXPECT_EQ(get.status(), OpStatus::BrokerError);
+    EXPECT_EQ(get.outcome().c.errorCode, rc::StatsResult::kNotLeader);
+    EXPECT_GT(sent, 1) << "the request was re-sent inside the budget";
+}
+
+TEST(CheckedWritesClientStatsRegression, StatusTwoIsRoutedLikeNotLeaderRegression) {
+    rc::ClientConfig cfg = invokerCfg(4711, 4712);
+    cfg.viewReadRetryBudget = std::chrono::milliseconds(300);
+    Rig r(cfg);
+    int sent = 0;
+    r.gw.templateHandlers[rpc::GetStats::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t n) {
+        auto m = rpc::GetStats::decode(f, n);
+        ASSERT_TRUE(m.has_value());
+        ++sent;
+        rpc::StatsResponse resp;
+        resp.sessionId     = m->sessionId;
+        resp.correlationId = m->correlationId;
+        resp.status        = 2;
+        std::vector<uint8_t> out(resp.encodedSize());
+        r.gw.send(ep, out.data(), resp.encode(out.data()));
+    };
+    r.connect();
+    test_support::TestCq cq(*r.client);
+    auto get = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client->getStats(rpc::StatsScope::TopicPartition, 3, 0, q, t);
+    });
+    ASSERT_TRUE(r.drive([&] { return get.ready(); }));
+    EXPECT_EQ(get.outcome().c.errorCode, rc::StatsResult::kNotLeader);
+    EXPECT_GT(sent, 1) << "status 2 is retried, not delivered as a status";
+}

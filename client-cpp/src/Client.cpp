@@ -1564,7 +1564,7 @@ bool defineKeyFeaturesTooOld(std::span<const uint8_t> frame, int32_t brokerVersi
 }
 
 // SD11: GetViewRowK / ScanViewRows / GetStats are served from broker v10 on.  `brokerVersion` 0 = unknown: sent.
-bool viewReadTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
+bool checkedWritesReadTooOld(rune::client::OpKind op, int32_t brokerVersion) noexcept {
     return (op == rune::client::OpKind::GetViewRowK || op == rune::client::OpKind::ScanViewRows || op == rune::client::OpKind::GetStats) &&
            brokerVersion >= 1 &&
            brokerVersion < rune::protocol::client::kBrokerVersionCheckedWrites;
@@ -1942,7 +1942,7 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
             }
         }
     }
-    if (viewReadTooOld(h.op, agent_.sessionBrokerVersion(0))) {
+    if (checkedWritesReadTooOld(h.op, agent_.sessionBrokerVersion(0))) {
         completeCtl_(p, OpStatus::BrokerTooOld, ddlNoValue(p.op));
         return;
     }
@@ -2430,7 +2430,7 @@ int Client::driveRoutedCtl_(int64_t nowNs) {
             heldBudgetEndNs = hld->budgetEndNs;
         } else if (!std::holds_alternative<DdlUnsentOnSeed>(d->retry)) { ++i; continue; }
         if ((p.op == OpKind::DefineTopic && defineKeyFeaturesTooOld(d->frame, agent_.sessionBrokerVersion(0))) ||
-            viewReadTooOld(p.op, agent_.sessionBrokerVersion(0))) {
+            checkedWritesReadTooOld(p.op, agent_.sessionBrokerVersion(0))) {
             PendingCtl dead = takeCtl_(i);   // queued before the seed connected: the version is known now
             completeCtl_(dead, OpStatus::BrokerTooOld, ddlNoValue(dead.op));
             ++work;
@@ -5185,6 +5185,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
             i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::GetStats) {
             if (opt->status == static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable)) {   // Issue #607: retried
                 onDdlNotLeader_(i, {}, now(), static_cast<uint16_t>(rpc::ErrorCode::AuthUnavailable));
+                break;
+            }
+            if (opt->status == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {   // a broker never sends it; routed like the ErrorResponse
+                onDdlNotLeader_(i, {}, now());
                 break;
             }
             PendingCtl p = takeCtl_(i);
