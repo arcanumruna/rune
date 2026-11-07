@@ -3186,7 +3186,8 @@ void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, 
             const int64_t base = baseOffset >= 0 ? baseOffset : -1;
             if (n == 0) {
                 completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::Ok, 0);
-            } else if (atomic) {   // all-or-nothing: the one entry is the first failing record, at its own offset
+            } else if (atomic && n == 1) {   // all-or-nothing: the one entry is the first failing record, at its own offset.
+                // More than one entry means the broker judged the records one by one, so report them all below.
                 completeHandle_(h, OpKind::Tier2Batch, base >= 0 ? base + le16(verdicts.data()) : -1, recordCount, OpStatus::BrokerError,
                                 le16(verdicts.data() + 2), le32(verdicts.data() + 4));
             } else if (recordCount > 1) {
