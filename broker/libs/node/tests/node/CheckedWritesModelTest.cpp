@@ -7,6 +7,7 @@
 #include "CheckedWritesRig.h"
 
 #include <rune/view/Verdict.h>
+#include <rune/view/ViewRow.h>
 
 #include <algorithm>
 #include <functional>
@@ -1148,3 +1149,482 @@ TEST_P(CheckedWritesAutoIncModelRegression, SameSeedSameTrace) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesAutoIncModelRegression, ::testing::Range<uint64_t>(1, 101));
+
+
+// ---- Checked writes Part 09 Task 9: the same check with view constraints (Interaction matrix C) ------------------------------------
+// The rig's character topic (autoincrement on odd seeds, key.index only on even ones) with character_name (unique lower(name), object 7) and account_stats (count(*) group by userId
+// check characters <= cap, object 8).  Before the views exist users 1 and 2 hold "Foo" / "foo" and user 3 holds cap + 1 characters.  Two
+// idempotent View producers create for users 1-3 with names that collide under lower() (U+023A too), rename, move, remove and removeExisting;
+// a v11 session writes plain-acks upserts and tombstones; the leader fails over, is demoted, restarts (twice, the second while the views
+// rebuild), loses its tail and compacts; account_stats is replaced (cap <-> cap + 1) and character_name dropped and created again.  After every
+// step 04's checks hold against the model, the views equal the model's live set, and AtMostCapLiveCharacters / LowerNameUnique hold over the
+// broker's own verdicts.
+namespace {
+constexpr int kCwSteps = 250;
+constexpr int64_t kCwTailPid = 760;
+constexpr uint8_t kCwLeader = 1;
+constexpr uint64_t kCwObjName = 7, kCwObjStats = 8;
+const char* const kCwNames[] = {"Foo", "foo", "FOO", "Bar", "bar", "Baz", "\xC8\xBA" "x", "\xE2\xB1\xA5" "x"};
+
+struct CwParam { uint64_t seed; int64_t cap; };
+
+enum class CwAction : uint8_t { Creates, Rename, Move, Remove, RemoveExisting, Plain, Failover, DemotePromote, Restart, RestartDuringRebuild, TruncateTail, Compact, ReplaceStats, DropCreateName };
+const char* nameOf(CwAction a) {
+    switch (a) {
+    case CwAction::Creates: return "Creates";
+    case CwAction::Rename: return "Rename";
+    case CwAction::Move: return "Move";
+    case CwAction::Remove: return "Remove";
+    case CwAction::RemoveExisting: return "RemoveExisting";
+    case CwAction::Plain: return "Plain";
+    case CwAction::Failover: return "Failover";
+    case CwAction::DemotePromote: return "DemotePromote";
+    case CwAction::Restart: return "Restart";
+    case CwAction::RestartDuringRebuild: return "RestartDuringRebuild";
+    case CwAction::TruncateTail: return "TruncateTail";
+    case CwAction::Compact: return "Compact";
+    case CwAction::ReplaceStats: return "ReplaceStats";
+    case CwAction::DropCreateName: return "DropCreateName";
+    }
+    return "";
+}
+
+class CwRun {
+public:
+    using CV = ConstrainedView;
+    using Char = VerdictRig::Char;
+
+    explicit CwRun(CwParam p) : rng_(p.seed), cap_(p.cap), statsCap_(p.cap), autoInc_(p.seed % 2 == 1), rig_(/*follower=*/true, kModelRollBytes) {
+        rig_.worker->setVerdictIntervalNs(1'000'000);
+        rig_.createCharacterTopic(autoInc_);
+        rig_.enableAcks();
+        rig_.passes(20);
+        rig_.followerFetch();
+        waitReady_();
+        for (int i = 0; i < 2; ++i) producers_[i].pid = 600 + i;
+        std::vector<Char> before{create_(1, "Foo"), create_(2, "foo")};
+        for (int64_t i = 0; i <= cap_; ++i) before.push_back(create_(3, "p" + std::to_string(i)));
+        (void)sendIdem_(producers_[0], before);
+        rig_.createConstrainedView(CV::CharacterName);
+        rig_.createConstrainedView(CV::AccountStats, cap_);
+        statsCaps_[rig_.fingerprintOf(CV::AccountStats, false)] = cap_;
+        rig_.passes(20);
+        if (!::testing::Test::HasFatalFailure()) verify_();
+    }
+
+    std::string trace;
+
+    CwAction pick() {
+        const unsigned r = static_cast<unsigned>(rng_() % 100);
+        if (r < 26) return CwAction::Creates;
+        if (r < 38) return CwAction::Rename;
+        if (r < 46) return CwAction::Move;
+        if (r < 51) return CwAction::Remove;
+        if (r < 56) return CwAction::RemoveExisting;
+        if (r < 62) return CwAction::Plain;
+        if (r < 67) return CwAction::Failover;
+        if (r < 71) return CwAction::DemotePromote;
+        if (r < 75) return CwAction::Restart;
+        if (r < 78) return CwAction::RestartDuringRebuild;
+        if (r < 82) return CwAction::TruncateTail;
+        if (r < 88) return CwAction::Compact;
+        if (r < 94) return CwAction::ReplaceStats;
+        return CwAction::DropCreateName;
+    }
+
+    void step(CwAction action) {
+        switch (action) {
+        case CwAction::Creates: trace += "c"; write_(creates_(1 + rng_() % 3)); break;
+        case CwAction::Rename: trace += "r"; write_(updates_(1 + rng_() % 2, false, 2)); break;
+        case CwAction::Move: trace += "m"; write_(updates_(1, true, 2)); break;
+        case CwAction::Remove: trace += "x"; write_(tombstones_(1 + rng_() % 2, 0)); break;
+        case CwAction::RemoveExisting: trace += "e"; write_(tombstones_(1 + rng_() % 2, 2)); break;
+        case CwAction::Plain: trace += "p"; plain_(); break;
+        case CwAction::Failover: trace += "F"; settle_(); rig_.failover(); waitReady_(); break;
+        case CwAction::DemotePromote: trace += "D"; settle_(); rig_.demotePromote(); waitReady_(); break;
+        case CwAction::Restart: trace += "S"; settle_(); rig_.restart(true); waitReady_(); break;
+        case CwAction::RestartDuringRebuild:
+            trace += "R";
+            settle_();
+            rig_.restart(true);
+            rig_.passes(1 + static_cast<int>(rng_() % 4));   // the views refold the log
+            rig_.restart(true);
+            waitReady_();
+            break;
+        case CwAction::TruncateTail: {
+            trace += "T";
+            settle_();
+            const std::vector<Char> tail = creates_(1 + rng_() % 3);
+            (void)rig_.appendCharacters(tail, kAllView, kCwTailPid, 0);   // an unacked tail the cut removes
+            rig_.passes(5);
+            rig_.truncateTo(rig_.replica->highWatermark());
+            rig_.demotePromote();
+            waitReady_();
+            break;
+        }
+        case CwAction::Compact: trace += "C"; compact_ = true; break;
+        case CwAction::ReplaceStats: replaceStats_(); break;
+        case CwAction::DropCreateName: dropCreateName_(); break;
+        }
+        if (!::testing::Test::HasFatalFailure()) verify_();
+    }
+
+private:
+    static constexpr uint8_t kAllView = rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll;
+    struct CwProducer { int64_t pid = 0; int32_t seq = 0; };
+    struct Pending { VerdictRig::Ack ack; std::size_t n; int64_t corr; };
+    struct LiveChar { uint64_t id; uint64_t userId; std::string name; };
+
+    // A key-0 create on the autoincrement topic, an insert of a fresh id on the other.
+    Char create_(uint64_t user, const std::string& name) { return Char{.id = autoInc_ ? 0 : ++lastId_, .userId = user, .name = name, .intent = 1}; }
+    std::string name_() { return kCwNames[rng_() % std::size(kCwNames)]; }
+    uint64_t user_() { return 1 + rng_() % 3; }
+
+    std::vector<Char> creates_(uint64_t n) {
+        std::vector<Char> out;
+        for (uint64_t i = 0; i < n; ++i) out.push_back(create_(user_(), name_()));
+        return out;
+    }
+    // Renames (`move` false) or moves of live characters; with none live, a create.
+    std::vector<Char> updates_(uint64_t n, bool move, uint8_t intent) {
+        std::vector<Char> out;
+        for (uint64_t i = 0; i < n; ++i) {
+            if (live_.empty()) { out.push_back(create_(user_(), name_())); continue; }
+            const LiveChar& c = live_[rng_() % live_.size()];
+            out.push_back(Char{.id = c.id, .userId = move ? user_() : c.userId, .name = move ? c.name : name_(), .intent = intent});
+        }
+        return out;
+    }
+    // Tombstones of live characters, or (one in four) of an id that was ever written: it may be gone already.
+    std::vector<Char> tombstones_(uint64_t n, uint8_t intent) {
+        std::vector<Char> out;
+        for (uint64_t i = 0; i < n; ++i) {
+            uint64_t id = 0;
+            if (!live_.empty() && rng_() % 4 != 0) id = live_[rng_() % live_.size()].id;
+            else if (!ids_.empty()) id = *std::next(ids_.begin(), static_cast<std::ptrdiff_t>(rng_() % ids_.size()));
+            if (id == 0) return creates_(1);
+            out.push_back(Char{.id = id, .intent = intent, .tombstone = true});
+        }
+        return out;
+    }
+    void write_(const std::vector<Char>& chars) { (void)sendIdem_(producers_[rng_() % 2], chars); }
+
+    void waitReady_() {
+        for (int i = 0; i < VerdictRig::kMaxPass; ++i) {
+            if ((!autoInc_ || rig_.autoIncState()) && rig_.worker->rcStatusForTest(VerdictRig::kSrc, rig_.partition()) == Worker::kRcReady) return;
+            if (i % 8 == 0) rig_.followerFetch();
+            rig_.pass();
+        }
+        FAIL() << "the partition was not ready after " << trace;
+    }
+    // NotLeader until the counter is active; nothing was appended then, so the same sequence is sent again.
+    std::optional<VerdictRig::Ack> sendIdem_(CwProducer& p, const std::vector<Char>& chars) {
+        waitReady_();
+        if (::testing::Test::HasFatalFailure()) return std::nullopt;
+        for (int tries = 0; tries < 100; ++tries) {
+            const int64_t c = rig_.appendCharacters(chars, kAllView, p.pid, p.seq);
+            const auto a = rig_.ackFetching(c, 60000);
+            if (!a) { ADD_FAILURE() << "the produce was never answered, corr " << c; return std::nullopt; }
+            if (a->code == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader)) { rig_.passes(5); continue; }
+            if (a->code != 0) { ADD_FAILURE() << "ack code " << a->code << " corr " << c; return std::nullopt; }
+            p.seq += static_cast<int32_t>(chars.size());
+            pending_.push_back({*a, chars.size(), c});
+            return a;
+        }
+        ADD_FAILURE() << "NotLeader for 100 sends in a row";
+        return std::nullopt;
+    }
+    // A v11 session, acks 1, no producer id: upserts (renames, moves) and plain tombstones, judged like any write; an autoincrement topic
+    // refuses a plain upsert, so there only tombstones.  Its acks carry no trailer.
+    void plain_() {
+        std::vector<Char> chars = autoInc_ || rng_() % 3 == 0 ? tombstones_(1, 0) : updates_(1 + rng_() % 2, rng_() % 2 == 0, 0);
+        if (chars.front().id == 0) return;   // nothing written yet: a key-0 create needs a View ack
+        for (Char& c : chars) c.intent = 0;
+        waitReady_();
+        if (::testing::Test::HasFatalFailure()) return;
+        rig_.enableAcks(16);
+        for (int tries = 0; tries < 100; ++tries) {
+            const auto a = rig_.ackFetching(rig_.appendCharacters(chars, kCwLeader), 60000);
+            ASSERT_TRUE(a) << "the plain produce was never answered";
+            if (a->code == static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader)) { rig_.passes(5); continue; }
+            EXPECT_EQ(a->code, 0);
+            EXPECT_FALSE(a->hasVerdicts) << "a v11 session's acks carry no verdicts";
+            break;
+        }
+        rig_.enableAcks(17);
+    }
+
+    // account_stats under its other cap; the swap at S writes the change record.  The model learns the new plan's cap by fingerprint.
+    void replaceStats_() {
+        trace += "A";
+        settle_();
+        if (::testing::Test::HasFatalFailure()) return;
+        statsCap_ = statsCap_ == cap_ ? cap_ + 1 : cap_;
+        rig_.replaceConstrainedView(CV::AccountStats, statsCap_);
+        swapFp_ = rig_.fingerprintOf(CV::AccountStats, false);
+        statsCaps_[swapFp_] = statsCap_;
+        setChanged_ = true;
+    }
+    void dropCreateName_() {
+        trace += "N";
+        if (rig_.constrained.count(CV::CharacterName) != 0) {
+            settle_();
+            if (::testing::Test::HasFatalFailure()) return;
+            rig_.dropConstrainedView(CV::CharacterName);
+            setChanged_ = true;
+            return;
+        }
+        settle_();
+        if (::testing::Test::HasFatalFailure()) return;
+        rig_.createConstrainedView(CV::CharacterName);
+        setChanged_ = true;
+    }
+    // A constraint-set change must be in the log and passed by a marker before a fault or the next change of the set: the replace's
+    // candidate swaps first, then a fresh write is acked and marked past the change.
+    void settle_() {
+        if (!setChanged_) return;
+        if (swapFp_ != 0) {
+            bool swapped = false;
+            for (int i = 0; i < VerdictRig::kMaxPass && !swapped; ++i) {
+                rig_.pass();
+                if (i % 8 != 0) continue;
+                rig_.followerFetch();
+                const auto changes = rig_.readLog().changes;
+                for (const auto& m : changes.empty() ? std::vector<rune::storage::control_record::ChangeMember>{} : changes.back().members)
+                    swapped = swapped || (m.viewObjectId == kCwObjStats && m.planFingerprint == swapFp_);
+            }
+            ASSERT_TRUE(swapped) << "the replacement of account_stats never swapped in";
+            swapFp_ = 0;
+        }
+        ASSERT_TRUE(sendIdem_(producers_[0], creates_(1))) << "no write was acked after a constraint-set change";
+        setChanged_ = false;
+        if (judged_()) rig_.passes(4);   // the retired member leaves on the pass after the marker commits
+    }
+
+    // One past the last data record: a trailing change record needs no marker.
+    static int64_t dataEnd_(const VerdictRig::RigLog& log) { return log.data.empty() ? 0 : log.data.back().offset + 1; }
+    bool judged_() { return rig_.driveUntilJudged(dataEnd_(rig_.readLog())); }
+
+    void absorb_(const VerdictRig::RigLog& log, int64_t hw) {
+        for (const auto& d : log.data) { data_[d.offset] = d; ids_.insert(d.id); }
+        for (const auto& ch : log.changes) changes_[ch.offset] = ch;
+        rig_.writeState()->rejected.forEachIn(0, INT64_MAX, [&](const rune::storage::RejectedOffsetIndex::Entry& e) { if (e.offset < hw) rejected_[e.offset] = {e.code, e.constraintId}; });
+    }
+    VerdictRig::RigLog history_() const {
+        VerdictRig::RigLog out;
+        for (const auto& kv : data_) out.data.push_back(kv.second);
+        for (const auto& kv : changes_) out.changes.push_back(kv.second);
+        return out;
+    }
+
+    // AtMostCapLiveCharacters and LowerNameUnique over every committed record with the broker's verdicts (the index, accumulated): under
+    // account_stats an accepted write that raises a user's count leaves it at most the cap of the plan that judged it, and a move leaves its
+    // old group empty or within that cap; under character_name an accepted live write claims no lowered name another live character holds.
+    // So a user over the cap was over before the plan judged it, and every extra of a name was written while no unique member was active.
+    void checkConstraintInvariants_(const VerdictRig::RigLog& all) {
+        std::map<uint64_t, uint64_t> members;   // object id -> plan fingerprint
+        std::map<uint64_t, std::pair<uint64_t, std::string>> live;   // id -> (userId, lowered name)
+        std::map<uint64_t, int64_t> count;
+        std::size_t next = 0;
+        for (const auto& rec : all.data) {
+            while (next < all.changes.size() && all.changes[next].offset < rec.offset) {
+                members.clear();
+                for (const auto& m : all.changes[next].members) members[m.viewObjectId] = m.planFingerprint;
+                ++next;
+            }
+            if (rejected_.count(rec.offset) != 0) continue;
+            const auto old = live.find(rec.id);
+            if (rec.del) {
+                if (old != live.end()) { --count[old->second.first]; live.erase(old); }
+                continue;
+            }
+            const uint64_t user = characterUserIdOf(rec);
+            const std::string name = modelLower(characterNameOf(rec));
+            if (const auto s = members.find(kCwObjStats); s != members.end() && (old == live.end() || old->second.first != user)) {
+                const int64_t c = statsCaps_.at(s->second);
+                EXPECT_LE(count[user] + 1, c) << "AtMostCapLiveCharacters: the write at " << rec.offset << " took user " << user << " past the cap " << c;
+                if (old != live.end()) {
+                    const int64_t left = count[old->second.first] - 1;
+                    EXPECT_TRUE(left == 0 || left <= c) << "AtMostCapLiveCharacters: the move at " << rec.offset << " left user " << old->second.first << " at " << left;
+                }
+            }
+            if (members.count(kCwObjName) != 0 && (old == live.end() || old->second.second != name))
+                for (const auto& [id, held] : live)
+                    EXPECT_FALSE(id != rec.id && held.second == name) << "LowerNameUnique: the write at " << rec.offset << " claimed '" << name << "' held by " << id;
+            if (old != live.end()) --count[old->second.first];
+            ++count[user];
+            live[rec.id] = {user, name};
+        }
+    }
+
+    // ViewEqualsFreshRefold: character_name holds one row per lowered name, owned by its smallest claimant, the gauge counts the others, and
+    // account_stats holds every user's live count.
+    void checkViews_(const CheckedWritesModel& model) {
+        const auto rowColumn = [&](CV v, const uint8_t* row, const char* col) -> int64_t {
+            if (row == nullptr) return -1;
+            const auto& comp = rig_.constrained.at(v).comp;
+            for (std::size_t i = 0; i < comp.outputDescriptor.fields.size(); ++i)
+                if (comp.outputDescriptor.fields[i].name == col) {
+                    const auto f = rune::view::readSlot(row, comp.rowLayout, static_cast<uint16_t>(i));
+                    return f.type == rune::codec::PrimType::Int64 ? f.i : static_cast<int64_t>(f.u);
+                }
+            ADD_FAILURE() << "no column " << col;
+            return -1;
+        };
+        if (rig_.constrained.count(CV::CharacterName) != 0) {
+            const ViewInstance* names = rig_.constrainedInstance(CV::CharacterName);
+            ASSERT_NE(names, nullptr);
+            const auto owners = model.uniqueOwners();
+            EXPECT_EQ(names->table.size(), owners.size()) << "ViewEqualsFreshRefold: character_name rows";
+            for (const auto& [lowered, id] : owners) {
+                std::vector<uint8_t> key(24, 0);
+                std::copy(lowered.begin(), lowered.end(), key.begin());
+                EXPECT_EQ(rowColumn(CV::CharacterName, names->table.get(rune::view::ViewKey::fromBytes(key)), "characterId"), static_cast<int64_t>(id))
+                    << "ViewEqualsFreshRefold: the owner of '" << lowered << "'";
+            }
+            EXPECT_EQ(rig_.uniqueConflicts(CV::CharacterName), model.uniqueExtras()) << "ViewEqualsFreshRefold: the uniqueConflicts gauge";
+        }
+        const ViewInstance* stats = rig_.constrainedInstance(CV::AccountStats);
+        ASSERT_NE(stats, nullptr);
+        const auto counts = model.liveCountByUser();
+        EXPECT_EQ(stats->table.size(), counts.size()) << "ViewEqualsFreshRefold: account_stats rows";
+        for (const auto& [user, n] : counts)
+            EXPECT_EQ(rowColumn(CV::AccountStats, stats->table.get(user), "characters"), n) << "ViewEqualsFreshRefold: user " << user << "'s characters";
+    }
+
+    // What a raw and a push-read subscription from 0 deliver: the accepted records still in the log, with their intents.
+    void checkDelivered_(const CheckedWritesModel& model, const std::set<int64_t>& present) {
+        std::vector<std::tuple<int64_t, uint64_t, uint8_t>> want;
+        for (const auto& a : model.acceptedRecords())
+            if (present.count(a.offset) != 0) want.emplace_back(a.offset, a.id, a.intent);
+        for (const SubKind kind : {SubKind::Raw, SubKind::PushRead}) {
+            for (int i = 0; i < VerdictRig::kMaxPass && rig_.worker->rcStatusForTest(VerdictRig::kSrc, rig_.partition()) != Worker::kRcReady; ++i) rig_.pass();
+            std::vector<std::tuple<int64_t, uint64_t, uint8_t>> got;
+            for (const auto& d : rig_.collect(rig_.subscribe(kind, 0)).records) got.emplace_back(d.offset, d.id, d.intent);
+            EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
+        }
+    }
+
+    void verify_() {
+        ASSERT_TRUE(judged_()) << " after " << trace;
+        const int64_t hw = rig_.replica->highWatermark();
+        const VerdictRig::RigLog log = rig_.readLog(hw);
+        absorb_(log, hw);
+        const VerdictRig::RigLog all = history_();
+        for (const auto& ch : all.changes)
+            for (const auto& m : ch.members)
+                ASSERT_TRUE(m.viewObjectId != kCwObjStats || statsCaps_.count(m.planFingerprint) != 0) << "a change names an account_stats plan the run never authored, at " << ch.offset;
+        CheckedWritesModel model;
+        model.addAutoIncRule(AutoIncShape{}, 0);
+        model.addLowerNameUniqueRule(kCwObjName);
+        for (const auto& [fp, c] : statsCaps_) model.addCountCheckRule(kCwObjStats, c, fp);
+        model.reset(all);
+        std::set<int64_t> present;
+        for (const auto& d : log.data) present.insert(d.offset);
+
+        for (const auto& [v, l] : rig_.constrained) rig_.driveUntilFolded(l.topicId, dataEnd_(log));
+        checkIndex(rig_, model, &present);
+        if (!log.data.empty() && !log.markers.empty() && !log.changes.empty()) checkMarkers(model, log, dataEnd_(log), compacted_);
+        for (const Pending& p : pending_) checkModelTrailer(model, p.ack, p.n, p.corr);
+        pending_.clear();
+        checkViews_(model);
+        checkConstraintInvariants_(all);
+        checkDelivered_(model, present);
+        if (compact_) {
+            compact_ = false;
+            compacted_ = true;
+            checkCompaction(rig_, model, log, 1'000'000 + 2'000 * ++compactions_);
+        }
+        live_.clear();
+        for (const auto& [id, r] : model.latestAcceptedByKey())
+            if (!r.del) live_.push_back({id, characterUserIdOf(r), characterNameOf(r)});
+        trace += "[" + std::to_string(model.acceptedRecords().size()) + "/" + std::to_string(model.verdicts().size()) + "]";
+    }
+
+    std::mt19937_64 rng_;
+    int64_t cap_, statsCap_ = 0;
+    bool autoInc_;   ///< odd seeds: the autoincrement topic (key-0 creates); even seeds: key.index only (inserts of fresh ids, plain upserts)
+    VerdictRig rig_;
+    CwProducer producers_[2];
+    std::vector<Pending> pending_;
+    std::vector<LiveChar> live_;
+    std::set<uint64_t> ids_;
+    std::map<uint64_t, int64_t> statsCaps_;   ///< account_stats plan fingerprint -> its cap
+    std::map<int64_t, VerdictRig::RigLogRec> data_;
+    std::map<int64_t, VerdictRig::RigChange> changes_;
+    std::map<int64_t, ModelVerdict> rejected_;   ///< every verdict the broker's index ever held, by offset
+    uint64_t swapFp_ = 0, lastId_ = 0;
+    bool compact_ = false, compacted_ = false, setChanged_ = false;
+    int64_t compactions_ = 0;
+};
+
+std::string runCwSeed(CwParam p) {
+    CwRun run(p);
+    for (int step = 0; step < kCwSteps && !::testing::Test::HasFatalFailure(); ++step) {
+        const CwAction action = run.pick();
+        SCOPED_TRACE("seed=" + std::to_string(p.seed) + " cap=" + std::to_string(p.cap) + " step=" + std::to_string(step) + " action=" + nameOf(action) + " trace=" + run.trace);
+        run.step(action);
+    }
+    return run.trace;
+}
+}  // namespace
+
+// A suite of its own: CheckedWritesModelRegression is 04's TEST_P over plain seeds, and a constraint run is a (seed, cap) pair.
+class CheckedWritesConstraintModelRegression : public ::testing::TestWithParam<CwParam> {};
+
+TEST_P(CheckedWritesConstraintModelRegression, SeededConstraintsMatchTheModel) {
+    EXPECT_FALSE(runCwSeed(GetParam()).empty());
+}
+
+// The history is a function of the seed: seeds 1-8 run twice make the same choices and get the same verdicts.
+TEST_P(CheckedWritesConstraintModelRegression, SameSeedSameTrace) {
+    if (GetParam().seed > 8) GTEST_SKIP() << "seeds 1-8 only";
+    const std::string first = runCwSeed(GetParam());
+    const std::string second = runCwSeed(GetParam());
+    EXPECT_EQ(first, second);
+}
+
+namespace {
+std::vector<CwParam> cwParams(int64_t cap, uint64_t seeds) {
+    std::vector<CwParam> out;
+    for (uint64_t s = 1; s <= seeds; ++s) out.push_back({s, cap});
+    return out;
+}
+std::string cwName(const ::testing::TestParamInfo<CwParam>& i) { return "cap" + std::to_string(i.param.cap) + "_seed" + std::to_string(i.param.seed); }
+}  // namespace
+
+INSTANTIATE_TEST_SUITE_P(Cap3, CheckedWritesConstraintModelRegression, ::testing::ValuesIn(cwParams(3, 200)), cwName);
+INSTANTIATE_TEST_SUITE_P(Cap12, CheckedWritesConstraintModelRegression, ::testing::ValuesIn(cwParams(12, 20)), cwName);
+
+// WIP (Task 9): the swap a replace of account_stats should make is lost after a restart - the member leaves the set instead (prints only).
+TEST(DbgReplace, Repro) {
+    using CV = ConstrainedView;
+    for (int variant = 0; variant < 16; ++variant) {
+        const bool follower = variant & 1, drop = variant & 2, restart = variant & 4, demote = variant & 8;
+        VerdictRig r(follower, kModelRollBytes);
+        r.worker->setVerdictIntervalNs(1'000'000);
+        r.createCharacterTopic(true);
+        r.enableAcks();
+        r.passes(20);
+        if (follower) r.followerFetch();
+        r.createConstrainedView(CV::CharacterName);
+        r.createConstrainedView(CV::AccountStats, 3);
+        int32_t seq = 0;
+        const auto send = [&](const std::string& n) {
+            const std::vector<VerdictRig::Char> c{VerdictRig::Char{.userId = 1, .name = n, .intent = 1}};
+            const auto a = r.ackFetching(r.appendCharacters(c, rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll, 77, seq), 6000);
+            seq += 1;
+            return a.has_value();
+        };
+        EXPECT_TRUE(send("a"));
+        if (restart) { r.restart(true); for (int i = 0; i < 400; ++i) { r.pass(); if (follower && i % 8 == 0) r.followerFetch(); } EXPECT_TRUE(send("a2")); }
+        if (demote) { r.demotePromote(); for (int i = 0; i < 400; ++i) { r.pass(); if (follower && i % 8 == 0) r.followerFetch(); } EXPECT_TRUE(send("a3")); }
+        if (drop) { r.dropConstrainedView(CV::CharacterName); EXPECT_TRUE(send("b")); r.passes(10); }
+        r.replaceConstrainedView(CV::AccountStats, 4);
+        for (int i = 0; i < 400; ++i) { r.pass(); if (follower && i % 8 == 0) r.followerFetch(); }
+        EXPECT_TRUE(send("c"));
+        std::string s;
+        for (const auto& ch : r.readLog().changes) { s += " |"; for (const auto& m : ch.members) s += " " + std::to_string(m.viewObjectId); }
+        std::printf("variant restart=%d demote=%d follower=%d drop=%d swaps=%llu changes:%s\n", restart, demote, follower, drop, (unsigned long long)r.stats()->candidateSwaps, s.c_str());
+    }
+}
