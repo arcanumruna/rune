@@ -7,6 +7,12 @@ Program: Herald on Rune (`arcanumruna/herald`, `docs/superpowers/specs/2026-11-0
 decision D5: no etcd, Redis or Postgres, so Rune is the only store and bus; §13 rows "Lease semantics" and "Leases:
 purpose and uses").
 
+**Herald consistency pass (Coordinator's call, 2026-11-07).** This revision takes the changes Herald spec 02 §12.4
+proposed. Herald serves each tenant from one active instance (Herald D16), so presence (§19.3) and auto-dissolve
+(§19.5) use no leases, and friend-request expiry is a read-time row (§19.6). `herald.idslots` gets one row per minter
+(§19.4). The discovery library may take a caller-supplied client (§13, a proposed change). §17 Q1 is settled by
+Herald 00 D12. Lease semantics are unchanged.
+
 **Sources for parity.**
 - etcd v3, read at `main`:
   - `server/lease/lessor.go` and `server/lease/lease.go`;
@@ -70,10 +76,12 @@ Herald decision D5 removes etcd, so Rune must provide what `discovery` + etcd pr
 It must match them exactly (owner).
 
 Herald also needs leases for other things (doc 00 §13):
-- presence;
+- leadership (the tenant lease and singletons);
 - worker fencing;
-- auto-dissolve;
-- deadlines that need an expiry event (friend-request expiry, sanction expiry).
+- short holds (case claims, invites, rate limits, break-glass grants);
+- deadlines that need an expiry event (sanction and strike expiry, server-API idempotency, appeal tokens).
+
+Herald's presence and auto-dissolve use no leases (§19.3, §19.5).
 
 Some of those TTLs are long (24 h, 400 days), and long TTLs use etcd-style checkpointing (owner).
 
@@ -275,8 +283,8 @@ Herald uses no etcd transactions, TimeToLive, Mutex or Election today.
 - **D1. The key is the lease (Coordinator's call).** etcd's multi-key lease deletes all its keys atomically on
   expiry. In Rune, keys of a topic live in different partitions on different leaders, and lease topics refuse
   transactions (§6.5). Rune is atomic only within a partition, so a multi-key lease would expire part by part.
-  - What Rune needs: discovery uses one key per lease (one `registerEndpoint` per Producer), and presence, worker
-    fencing and auto-dissolve each need one key per lease too.
+  - What Rune needs: discovery uses one key per lease (one `registerEndpoint` per Producer), and leadership,
+    worker fencing, short holds and one-shot deadlines each need one key per lease too.
   - A holder with many keys keeps them alive together with one `LeaseSession` (batched keepalives).
   - Multi-key leases inside one partition are later work (§18).
 - **D2. Revisions are per partition.** Rune has no cluster-wide order across partitions. A fencing token is compared
@@ -652,7 +660,7 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
   - It is skipped when the remaining time is ≤ the interval, as in etcd.
 - **Clearing.** The first keepalive after a checkpoint appends `Checkpoint(0)` and answers after it folds (§8.1).
   So a lease writes at most two records per interval: a checkpoint and a clear. That is etcd's bound.
-- **One-shot long leases** (a friend request, a sanction) are granted once and never kept alive. They write one
+- **One-shot long leases** (an idempotency key, a sanction) are granted once and never kept alive. They write one
   checkpoint per interval and are compacted to one. 1 M such leases on one partition at a 5 min interval need
   3 333 checkpoints/s, above the default rate. A lagging checkpoint only carries an older, larger remaining time, so
   a later leader arms it later, never earlier. Sizing: raise `lease.checkpoint_rate`, or add partitions.
@@ -742,9 +750,9 @@ None of these can stop expiry:
 ```sql
 show leases 'herald-sys/discovery';                                   -- ScanLeases, every partition, limit 100
 show leases 'herald-sys/discovery' where path like 'herald/eu/_shared/COORDINATOR_SERVICE/%';   -- prefix scan
-show lease 'acme/herald.presence' key 7;                              -- LeaseTimeToLive: granted, remaining, version
-revoke lease 'acme/herald.presence' key 7;                            -- reads the version, then a fenced Revoke
-show topic 'acme/herald.presence';                                    -- lease settings and the live count
+show lease 'acme/herald.safety.case-claims' key 7;                    -- LeaseTimeToLive: granted, remaining, version
+revoke lease 'acme/herald.safety.case-claims' key 7;                  -- reads the version, then a fenced Revoke
+show topic 'acme/herald.safety.case-claims';                          -- lease settings and the live count
 ```
 
 - **`revoke lease`** reads the live version and sends a fenced revoke. If the lease changed between the two, it
@@ -757,15 +765,15 @@ show topic 'acme/herald.presence';                                    -- lease s
 ### 12.1 `LeaseTopic<T>`
 
 ```cpp
-auto presence = client.openLeaseTopicAndWait<gen::Presence>("acme/herald.presence");
-LeaseOptions opts{.ttl = 30s, .holder = nodeId};                // ttl unset = the topic's lease.ttl
+auto claims = client.openLeaseTopicAndWait<gen::CaseClaim>("acme/herald.safety.case-claims");
+LeaseOptions opts{.ttl = 30min, .holder = nodeId};              // ttl unset = the topic's lease.ttl
 
-LeaseResult g = presence.grantAndWait(row, opts);               // Ok(version, ttlMs) | KeyExists | TtlTooLarge
-LeaseResult u = presence.updateAndWait(row, g.version());       // Ok | LeaseNotFound   (does not keep alive)
-LeaseResult k = presence.keepAliveOnceAndWait(key, g.version());// Ok(ttlMs) | LeaseNotFound
-LeaseTtl    t = presence.timeToLiveAndWait(key);                // granted, remaining (-1 = none), version, holder
-LeaseResult v = presence.revokeAndWait(row, g.version());       // Ok | LeaseNotFound
-std::optional<gen::PresenceLeasesRow> cur = presence.getAndWait(key, /*minOffset=*/g.offset());
+LeaseResult g = claims.grantAndWait(row, opts);                 // Ok(version, ttlMs) | KeyExists | TtlTooLarge
+LeaseResult u = claims.updateAndWait(row, g.version());         // Ok | LeaseNotFound   (does not keep alive)
+LeaseResult k = claims.keepAliveOnceAndWait(key, g.version());  // Ok(ttlMs) | LeaseNotFound
+LeaseTtl    t = claims.timeToLiveAndWait(key);                  // granted, remaining (-1 = none), version, holder
+LeaseResult v = claims.revokeAndWait(row, g.version());         // Ok | LeaseNotFound
+std::optional<gen::CaseClaimLeasesRow> cur = claims.getAndWait(key, /*minOffset=*/g.offset());
 ```
 
 - **Acks.** Writes send `Acks::All | Acks::View`. `LeaseResult` carries `version()` from the ack's `leaseVersion`,
@@ -811,7 +819,7 @@ These are client recipes over a one-partition lease topic keyed by `path string(
   - **`leader()`** returns the lowest version under `name/`.
   - **`observe()`** watches `name/` (the handoff rule) and reports each change of the lowest.
 - **A single-slot lock.** A key that is the lock itself, with no waiters (`acquire slot` → `KeyExists`), is etcd's
-  `TryLock` with no queue. Herald's fenced workers use that form (§19.3).
+  `TryLock` with no queue. Herald's fenced workers use that form (§19.4).
 
 ### 12.4 Watching and listing
 
@@ -833,12 +841,25 @@ These are client recipes over a one-partition lease topic keyed by `path string(
 - **Where it lives.** In the `discovery` repository, as a second transport beside etcd (call). Herald switches by
   build option and configuration, and the etcd transport stays until Herald's cutover is green.
   - The public types and method names are those of §3: `Producer`, `Consumer`, `ServiceCache` and the rest.
-  - Only the first constructor / `create` argument changes, `etcdUrl` → `RuneEndpoint` (DG1).
+  - Only the first constructor / `create` argument changes, `etcdUrl` → `RuneEndpoint` (DG1), plus the
+    caller-supplied client overload below.
 - **How it works.** It uses the Rune C++ client (`client-cpp`), which supplies `LeaseTopic`, `LeaseSession`,
   `LeaseWatch` and `ScanLeases`.
-  - The client runs on the library's own thread under the client's poll model.
+  - Given a `RuneEndpoint`, the library creates its own client and runs it on its own thread under the client's
+    poll model.
   - Events go to the existing `ServiceCache` through its existing `update` / `remove` calls, so the cache's
     concurrency is unchanged.
+- **Caller-supplied client (proposed change, from Herald spec 02 §12.4; Coordinator's call, for owner review).**
+  `create` also accepts an existing Rune `Client` that the caller already drives.
+  - The library then creates no client and runs no thread of its own. It exposes a `doWork(nowNs)` agent that the
+    caller polls from the loop that drives the client, and it uses that client's `LeaseSession` and subscriptions.
+  - The client must already be logged in to the discovery topic's namespace with that topic's grants (§14.1). The
+    library never logs in or out on it.
+  - Events still reach `ServiceCache` through `update` / `remove`, so the cache's concurrency is unchanged.
+  - Why: a Herald process already runs a Rune client on its RuneAgent thread, so it needs no second client, thread
+    or session for discovery. The `RuneEndpoint` form stays for processes with no Rune client (the legacy game
+    services).
+  - Tests: the `DiscoveryIntegrationTest` suite runs in both forms.
 - **Behaviour.** It implements exactly the §3 tables: the incarnation key and newest-incarnation selection (DG2),
   typed values (DG3), the `ttl/3` keepalive (DG5), `onLost` re-registration (DG6), the watchdog point read, fenced
   load-report updates, a blocking revoke in `stop()`, and re-scan on every subscription break.
@@ -1014,7 +1035,7 @@ All tests follow `docs/testing.md`:
     consumer's cache drops it within `ttl + bound`, and the producer restarts within the TTL and is visible at once
     (DG2);
   - a Rune partition-leader failover during all of this.
-- **Presence.** 10 000 leases via `LeaseSession`, the process killed, `Expired` delivered by the bound.
+- **Session scale.** 10 000 leases via `LeaseSession`, the process killed, `Expired` delivered by the bound.
 - **Election.** Two `LeaseElection` campaigners: the leader is SIGSTOPped past the TTL, the other leads with a higher
   token, and the first wakes, gets `onLost`, and its guarded write is refused.
 
@@ -1063,13 +1084,18 @@ Runs: `--repeat until-fail:20`, and once under `-j` load.
 - `ProduceBench` and the replication bench on a non-lease topic, ABAB against tip, unchanged.
 - Benchmarks are tracked as issues while there is no bench box, and the PR says so.
 
-## 17. Owner question
+## 17. Owner question (settled)
 
-**Q1. A Rune principal that works in many namespaces (Herald D12).** Rune grants never cross namespaces. A Herald
-process that serves about 1 000 tenants must reach each tenant's topics, and both options below work with lease
-topics.
+**Q1. A Rune principal that works in many namespaces (Herald D12). Settled: option A (Herald 00 D12, owner
+delegated; Coordinator's call).** Herald opens one Rune session per tenant namespace per Herald role
+(`<ns>/herald-gateway`, `<ns>/herald-moderation`, `<ns>/herald-audit`, `<ns>/herald-safety`), each holding only that
+role's grants, and `herald-sys` has the same per-role users. A process opens a tenant session only while it works
+for that tenant: a gateway for the tenants it is active for, a fenced worker for the slots it holds. Only the
+provisioning singleton holds cluster-admin credentials, for namespace DDL and users, never for data. Option B is not
+built: Rune has no account level above namespaces (namespaces spec §1, §2). Nothing in this spec changes: lease
+topics are reached through ordinary sessions, and §19.4 stands. The analysis is kept below.
 
-| | A: a per-tenant principal (`<tenant>/herald`) | B: a Rune "namespace service" role |
+| | A: a per-tenant principal (chosen; per role, as above) | B: a Rune "namespace service" role (not built) |
 |---|---|---|
 | Rune change | none | a security-model change: a cluster admin grants the role named operations on a list of namespaces, each grant audited in `__security`, with adversarial tests for escalation through the role |
 | Herald cost | about 1 000 Rune sessions per Herald process (connections, SCRAM logins, per-session memory), and credential provisioning per tenant | one session per process |
@@ -1094,14 +1120,14 @@ topics.
 | Herald use | Lease topic | Section |
 |---|---|---|
 | service registration, cache and watch, replica selection | `herald-sys/discovery` via the Rune-backed `discovery` library | §3, §19.1 |
-| leadership (singletons) | `LeaseElection` on `herald-sys/herald.elections` | §19.2 |
-| presence | `<tenant>/herald.presence`, tailed only by the home cell | §19.3 |
+| leadership (the tenant lease, singletons) | `LeaseElection` on `herald-sys/herald.elections` | §19.2 |
+| presence | none: `<tenant>/herald.presence` is a plain compacted topic fenced by the tenant epoch | §19.3 |
 | worker fencing | `herald-sys/herald.workers` single-slot locks | §19.4 |
-| auto-dissolve | a fenced worker reacting to the owner's presence end | §19.5 |
-| deadlines with an expiry event (friend requests, sanctions) | one-shot long leases with checkpoints | §19.6 |
+| auto-dissolve | none: the tenant's active instance, in memory, from `emptySinceNs` | §19.5 |
+| deadlines with an expiry event (sanction and strike expiry, idempotency, appeal tokens) | one-shot long leases with checkpoints | §19.6 |
 
-Deadlines that need only read-time enforcement may instead be `expiresAt` rows cleaned by the `retention` worker.
-Herald spec 02 chooses per object.
+Deadlines that need only read-time enforcement are instead `expiresAt` rows cleaned by Herald's `retention-sweep`
+worker; friend requests are one (§19.6). Herald spec 02 chooses per object.
 
 ### 19.1 Discovery
 
@@ -1124,27 +1150,23 @@ lease topic 'herald-sys/herald.elections' { path string(96), value string(64) }
 
 ### 19.3 Presence
 
-```sql
-lease topic 'acme/herald.presence' { sessionId uint64, actorId uint64, status uint16, cellId uint32 }
-      partitions 8 replicas 3 key sessionId with (lease.ttl = 30000);   -- sessionId: minted per connection, unique
-```
-
-- **Connect.** The gateway grants its new `sessionId` (with `actorId` as a column). The key is new per session, so no takeover is needed: a
-  reconnect is a new session key, and the old session's lease ends by revoke or expiry.
-- **Keepalive.** One `LeaseSession` per gateway keeps all its leases alive. 100 k sessions at a 10 s cadence is
-  10 k keepalive entries/s, batched to about 40 requests/s per partition. No log writes.
-- **Status change.** A fenced `update`.
-- **Who reads it.** The topic is tailed only by the actor's home cell (a subscription filtered on `cellId`), which computes the actor's aggregate state.
-  Other nodes learn of state changes from the small `herald.presence.changes` topic, which the home cell writes. So
-  Rune needs no renew-filtering subscription option, and keepalives are invisible anyway.
-- **Crash.** The leases expire within `ttl + bound`, and the home cell publishes the change.
+Herald presence uses no lease (Coordinator's call, from Herald spec 02 §12.4 and Herald 01 §11.2).
+- **Why no lease.** One active instance serves a tenant (Herald D16). It holds the presence map in memory and writes
+  a row on every change. Viewers get updates from that map, never from Rune.
+- **The topic.** `<tenant>/herald.presence` is a plain compacted topic keyed `actorId`, row
+  `{status, epoch, sinceNs, activity, attrs}`. Herald spec 02 owns the layout.
+- **Epoch fencing.** `epoch` is the tenant epoch: the `lease_version` of the tenant's election key (§19.2). A row is
+  live only if its `epoch` equals the current one, and a row from an older epoch reads as `offline`. When the active
+  instance dies, every actor it served reads as offline as soon as the standby wins.
+- **What goes away.** Per-session presence leases, their keepalives, the home cell and `herald.presence.changes`
+  (revision 3's earlier draft). Presence needs only the election from this spec.
 
 ### 19.4 Worker fencing
 
 ```sql
 lease topic 'herald-sys/herald.workers' { slot uint64, tenant string(64), role uint16, holderInfo string(64) }
       partitions 8 replicas 3 key slot with (lease.ttl = 10000);
-create topic 'herald-sys/herald.idslots' { slot uint64, highWater uint64, token int64 } key slot with (key.index = on);
+create topic 'herald-sys/herald.idslots' { slot uint64, highWater uint64, epoch int64 } key slot with (key.index = on);
 ```
 
 - **The slot and the lock.** `slot = nsId << 16 | role`. Rune never reuses an `nsId`. Each Herald process `grant`s the
@@ -1153,38 +1175,50 @@ create topic 'herald-sys/herald.idslots' { slot uint64, highWater uint64, token 
 - **Fencing writes.** The worker writes with `version` as its fencing token.
 - **Handing a slot back.** On a membership change it hands the slot back with a fenced revoke, so the next owner
   grants at once.
-- **Minted ids stay unique (doc 00 §13).**
-  - Each id slot row in `herald.idslots` keeps a high-water mark, advanced by a checked `update` that carries the
-    holder's token.
+- **Minted ids stay unique (doc 00 §13 "Minted ids"; Coordinator's call).**
+  - Each minter has its own row in `herald.idslots`, so two minters never collide.
+    - The tenant's active instance uses `slot = nsId << 16` (role 0, which no worker uses). Its `epoch` is the
+      tenant epoch (§19.2).
+    - A fenced worker that mints uses its own `herald.workers` slot (`nsId << 16 | role`). Its `epoch` is the
+      worker's `version`. Worker-minted ids set the top bit, so they never meet the active instance's ids.
+  - A row keeps a high-water mark, advanced by a checked `update` that carries the minter's `epoch`.
   - A new holder resumes above it.
   - It lives in a plain keyed topic, not in the lease row, because a lease row is deleted when the lease ends.
 - **Scale.** 4 000 slots kept alive at 3.3 s is about 1 200 keepalive entries/s.
 
 ### 19.5 Auto-dissolve
 
-- **What dissolves.** A party or temporary channel ends when its owner's presence ends.
-- **Who acts.** The fenced worker for the tenant's dissolve role (§19.4) tails the home cell's
-  `herald.presence.changes`. On the owner's `offline` it dissolves the party with a checked write carrying its
-  token.
-- **Why no lease of its own.** The party has no lease itself: its lifetime follows a lease (D1: one key per lease).
+Herald auto-dissolve uses no lease and no worker (Coordinator's call, from Herald spec 02 §12.4 and Herald 01 §6.3).
+- **What dissolves.** An owner-bound room when its owner's last session closes, and an empty channel instance of a
+  class with `autoDissolve` after its `autoDissolveAfterSec`.
+- **Who acts.** The tenant's active instance, in memory. It is the single writer of channels and memberships, so it
+  sees the last member leave or the owner's last session close, waits the delay, and writes the dissolve.
+- **Failover.** The channel row carries `emptySinceNs`. A new active instance re-arms each deadline from it at
+  attach, so a channel dissolves late, never early.
+- **Why no lease.** One writer per tenant (Herald D16), and no other process needs an event at the deadline.
 
 ### 19.6 Deadlines with an expiry event
 
 ```sql
-lease topic 'acme/herald.friend_requests' { requestId uint64, fromActor uint64, toActor uint64 }
-      partitions 8 replicas 3 key requestId with (lease.ttl = 86400000);            -- 24 h, checkpointed
-lease topic 'acme/herald.sanctions' { sanctionId uint64, actor uint64, kind uint16, reason uint16 }
-      partitions 8 replicas 3 key sanctionId with (lease.ttl = 34560000000);        -- 400 days, checkpointed
+lease topic 'acme/herald.api.idempotency' { h uint64, requestHash uint64, status uint16 }
+      partitions 2 replicas 3 key h with (lease.ttl = 86400000);                    -- 24 h, checkpointed
+lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
+      partitions 1 replicas 3 key sanctionId with (lease.ttl = 34560000000);        -- default 400 days; each grant
+                                                                                    -- passes the remaining duration
 ```
 
-- **One-shot leases.** A request or sanction is granted once and never kept alive.
-- **Ending early.** Accepting a friend request, or lifting a sanction early, is a fenced revoke.
+- **One-shot leases.** An idempotency key or a sanction's expiry is granted once and never kept alive. Herald uses
+  them for sanction and strike expiry, server-API idempotency and appeal tokens (Herald spec 02 §6).
+- **Ending early.** Lifting or superseding a sanction is a fenced revoke.
 - **Ending on time.** Otherwise the `Expire` carries the lapse to every consumer, with no sweeper.
-- **Accept versus expiry.** They race in the log, and exactly one wins (§9.3).
+- **Revoke versus expiry.** They race in the log, and exactly one wins (§9.3).
 - **Leader changes and restarts.** Checkpoints keep them on time: late by at most `extend + one interval` (§9.6).
 - **Cost.** One checkpoint per 5 min per lease, compacted to one per lease.
 - **Short holds.** Short invites and moderation holds (30 s – 30 min) are the same pattern without checkpoints (TTL ≤
   interval).
+- **Not leases (Coordinator's call, from Herald spec 02 §12.4).** Friend requests are `herald.social.requests` rows
+  with `expiresAtNs`, checked at read time and removed by `retention-sweep`: nothing needs an event when one lapses.
+  Herald's report quota is a plain compacted row, also not a lease.
 
 **Requirements from the Herald program.**
 
