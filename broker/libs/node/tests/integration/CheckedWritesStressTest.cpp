@@ -115,6 +115,8 @@ TEST_P(CheckedWritesStressRegression, SeededRegressorsPathHoldsTheInvariants) {
     ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
     std::string failed;
     EXPECT_TRUE(d.checkAll(&failed)) << failed;
+    EXPECT_GT(d.compactedAway(), 0u) << "seed " << seed << ": the cleaner never removed a committed record";
+    EXPECT_EQ(d.regressorsPathShortfall(), "") << "seed " << seed;
     const auto f = d.faults();
     std::printf("seed %d: %s, %d leader crashes, %d restarts (%d cut short), %zu committed records the most compacted log lost\n", seed, d.regressorsPathTally().c_str(), f[0], f[1], f[2], d.compactedAway());
 }

@@ -196,10 +196,18 @@ public:
         ASSERT_FALSE(::testing::Test::HasFatalFailure());
         rebuildWriters_(-1);
         ASSERT_TRUE(learnConstrainedViews_(0)) << "seed " << seed_ << ": the unique and check plans never reached the log";
+        ASSERT_EQ(catalogStatsTopic_(), statsTopic_) << "seed " << seed_ << ": the catalog and the plan record name account_stats's sink apart";
     }
     [[nodiscard]] std::string regressorsPathTally() const {
         return std::to_string(sent_.size()) + " writes, " + std::to_string(constraintViolations_) + " ConstraintViolation and " + std::to_string(keyNotFound_) + " KeyNotFound answered, " +
-               std::to_string(loginRaces_) + " login races (" + std::to_string(loginRefusals_) + " refused), " + std::to_string(statsReplaces_) + " account_stats replaces";
+               std::to_string(loginRaces_) + " login races (" + std::to_string(loginRefusals_) + " refused), " + std::to_string(statsReplaces_) + " account_stats replaces (" + std::to_string(replaceResends_) + " resent)";
+    }
+    /// RegressorsPath mode: the cap and the unique name each refused a write.  "" = they did.
+    [[nodiscard]] std::string regressorsPathShortfall() const {
+        const auto refusedBy = [this](uint64_t obj, uint32_t ordinal) { return violationsBy_.contains(static_cast<uint32_t>(obj << 16) | ordinal); };
+        if (!refusedBy(statsObj_, 1)) return "max_characters refused nothing";
+        if (!refusedBy(nameObj_, 0)) return "character_name refused nothing";
+        return {};
     }
 
     [[nodiscard]] std::string autoIncTally() const {
@@ -874,8 +882,21 @@ private:
         }
         return false;
     }
+    /// The sink topic id the catalog gives account_stats now (an applied replace moves it), or -1 when no node answers.
+    int32_t catalogStatsTopic_() {
+        for (const auto deadline = Clock::now() + 10s; Clock::now() < deadline; std::this_thread::sleep_for(100ms)) {
+            auto admin = rune::node::test::catalog_cluster::connectClient(c_, c_.runningNodes().front());
+            const bool read = admin->catalogReader().refresh(5s).has_value();
+            const rune::catalog::ViewObject* view = read ? admin->catalogReader().state().viewByName(rune::catalog::kDefaultNsId, "account_stats") : nullptr;
+            const int32_t topic = view == nullptr ? -1 : view->def.viewTopicId;
+            admin->close();
+            if (topic >= 0) return topic;
+        }
+        return -1;
+    }
     /// account_stats again with the same predicate under a new plan (an extra column every other time); its swap is waited for. A catalog
-    /// leader that moves mid-DDL answers "session lost" without saying whether the replace applied: the swap is looked for, else it is resent.
+    /// leader that moves mid-DDL answers "session lost" (the CLI exits 1 for every failure, so its message is the only status): the catalog
+    /// then says whether the replace applied.  An applied one must swap in; only one the catalog never took is sent again.
     void replaceStats_() {
         const char* extra = ++statsReplaces_ % 2 == 1 ? ", max(lastPlayed) as lastPlayed" : "";
         const std::string text = std::string("create or replace view account_stats key userId as select count(*) as characters") + extra +
@@ -885,10 +906,18 @@ private:
             const int code = qlAny_(text, &err);
             ASSERT_TRUE(code == 0 || err.find("session lost") != std::string::npos) << "seed " << seed_ << ": " << err;
             settle_();
-            if (learnConstrainedViews_(statsFp_)) return;
-            ASSERT_NE(code, 0) << "seed " << seed_ << ": the replacement of account_stats never swapped in";
+            if (code != 0) {
+                const int32_t topic = catalogStatsTopic_();
+                ASSERT_GE(topic, 0) << "seed " << seed_ << ": no node answered a catalog read";
+                if (topic == statsTopic_) {
+                    ++replaceResends_;
+                    continue;
+                }
+            }
+            ASSERT_TRUE(learnConstrainedViews_(statsFp_)) << "seed " << seed_ << ": the replacement of account_stats never swapped in";
+            return;
         }
-        FAIL() << "seed " << seed_ << ": the replacement of account_stats was never answered";
+        FAIL() << "seed " << seed_ << ": the catalog never took the replacement of account_stats";
     }
 
     std::string rpName_() { return rng_() % 2 == 0 ? std::string(kRpNames[rng_() % std::size(kRpNames)]) : "c" + std::to_string(++rpNameSeq_); }
@@ -969,16 +998,22 @@ private:
             std::jthread ta([&] { ra = a.users->insertAndWait(u, 10s); });
             std::jthread tb([&] { rb = b.users->insertAndWait(u, 10s); });
         }
-        const auto refused = [](const rune::client::WriteResult& r) { return r.status() == rune::client::OpStatus::BrokerError && r.code() == static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation); };
-        const int oks = (ra->ok() ? 1 : 0) + (rb->ok() ? 1 : 0);
-        loginRefusals_ += (refused(*ra) ? 1 : 0) + (refused(*rb) ? 1 : 0);
+        const auto answer = [this](const rune::client::WriteResult& r) {   // a create: Ok, 55, or no verdict; anything else fails the step
+            using Status = rune::client::OpStatus;
+            if (r.status() == Status::StoredIdUnknown || r.status() == Status::VerdictUnknown) return Sent::Result::Unknown;   // not a character id
+            Sent s;
+            s.op = Op::Insert;
+            s.keyZero = true;
+            classify_(r, &s);
+            if (s.result == Sent::Result::Violation) ++loginRefusals_;
+            return s.result;
+        };
+        const Sent::Result a1 = answer(*ra), b1 = answer(*rb);
+        const int oks = (a1 == Sent::Result::Ok ? 1 : 0) + (b1 == Sent::Result::Ok ? 1 : 0);
         EXPECT_LE(oks, 1) << "seed " << seed_ << ": two first logins of " << u.subject << " were both accepted";
-        if ((ra->ok() || refused(*ra)) && (rb->ok() || refused(*rb))) EXPECT_EQ(oks, 1) << "seed " << seed_ << ": both first logins of " << u.subject << " were refused";
-        if (oks == 1) {
-            const auto again = rpWriter_(2).users->insertAndWait(u, 10s);
-            EXPECT_FALSE(again.ok()) << "seed " << seed_ << ": a later login of " << u.subject << " was accepted";
-            loginRefusals_ += refused(again) ? 1 : 0;
-        }
+        if (a1 != Sent::Result::Unknown && b1 != Sent::Result::Unknown) EXPECT_EQ(oks, 1) << "seed " << seed_ << ": both first logins of " << u.subject << " were refused";
+        if (oks == 1)
+            EXPECT_NE(answer(rpWriter_(2).users->insertAndWait(u, 10s)), Sent::Result::Ok) << "seed " << seed_ << ": a later login of " << u.subject << " was accepted";
     }
 
     /// Sends `s` (its id and op) through `w`: its token is the new record's name, its result the answer.
@@ -1017,6 +1052,7 @@ private:
             if (rp_ && s->op != Op::RemoveExisting && s->code == static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation)) {
                 s->result = Sent::Result::Violation;
                 ++constraintViolations_;
+                ++violationsBy_[r.constraintId()];
                 return;
             }
             if (s->code == static_cast<uint16_t>(pc::ErrorCode::NotLeader)) return;
@@ -1747,7 +1783,8 @@ private:
     uint64_t nameObj_ = 0, statsObj_ = 0, statsFp_ = 0;   ///< RegressorsPath mode: the unique and check members (learnConstrainedViews_)
     int32_t nameTopic_ = 0, statsTopic_ = 0;
     std::map<uint64_t, std::pair<uint64_t, std::string>> rpChars_;   ///< ... what the acked writes left of the characters: id -> (user, name)
-    int constraintViolations_ = 0, loginRaces_ = 0, loginRefusals_ = 0, statsReplaces_ = 0;
+    int constraintViolations_ = 0, loginRaces_ = 0, loginRefusals_ = 0, statsReplaces_ = 0, replaceResends_ = 0;
+    std::map<uint32_t, int> violationsBy_;   ///< the ConstraintViolation answers per constraint id
     uint64_t rpNameSeq_ = 0;
     std::vector<int> writerSeeds_;   ///< each writer slot's seed node (rebuildWriters_)
     std::vector<uint64_t> known_;           ///< autoincrement mode: the ids an Ok create or import was acked
