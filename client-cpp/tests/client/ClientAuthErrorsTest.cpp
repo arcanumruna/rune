@@ -2716,7 +2716,9 @@ TEST(ClientAuthErrorsRegression, AuthErrorNamesCoverNamespaceCodesRegression) {
     EXPECT_STREQ(rc::authErrorName(54), "ViewPaused");
     EXPECT_STREQ(rc::authErrorName(55), "ConstraintViolation");
     EXPECT_STREQ(rc::authErrorName(61), "ViewUniqueInvalid");
-    EXPECT_EQ(rc::authErrorName(62), nullptr);
+    EXPECT_STREQ(rc::authErrorName(62), "TxnTooLarge");
+    EXPECT_STREQ(rc::authErrorName(63), "TxnConflict");
+    EXPECT_EQ(rc::authErrorName(64), nullptr);
 }
 
 // ---------------------------------------------------------------------------

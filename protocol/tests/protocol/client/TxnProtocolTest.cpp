@@ -4,6 +4,7 @@
 // InitProducerId/EndTxn → AddPartitions/AddOffsets/TxnOffsetCommit + Dispatch + conformance.
 
 #include <gtest/gtest.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Dispatch.h>
@@ -11,6 +12,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -1051,4 +1053,72 @@ TEST(TxnOffsetCommitMemberBlockRegression, OverclaimedMemberLengthNegativeGenera
             EXPECT_FALSE(rpc::TxnOffsetCommit::decode(b.data(), b.size())) << extra << " stray bytes accepted";
         }
     }
+}
+
+// ── Checked writes Part 11: the transaction vote on the client wire ──
+namespace {
+rpc::EndTxnResponse votedResponse() {
+    rpc::EndTxnResponse r;
+    r.sessionId = 7; r.correlationId = 9; r.errorCode = 55;
+    r.hasVote = true; r.constraintId = 0x00070000u; r.failingOffset = 123;
+    return r;
+}
+}  // namespace
+
+TEST(CheckedWritesTxnWire, EndTxnResponseV17CarriesTheVote) {
+    const auto r = votedResponse();
+    std::array<uint8_t, 64> b{};
+    ASSERT_EQ(r.encodeFor(b.data(), 17), rpc::EndTxnResponse::ENCODED_SIZE_V17);
+    ASSERT_EQ(rpc::EndTxnResponse::ENCODED_SIZE_V17, 38u);
+    const auto d = rpc::EndTxnResponse::decode(b.data(), 38);
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->errorCode, 55);
+    EXPECT_TRUE(d->hasVote);
+    EXPECT_EQ(d->constraintId, 0x00070000u);
+    EXPECT_EQ(d->failingOffset, 123);
+}
+
+TEST(CheckedWritesTxnWireRegression, EndTxnResponseBelowSeventeenIsByteIdenticalRegression) {
+    const auto r = votedResponse();
+    std::array<uint8_t, 64> v16{}, plain{};
+    ASSERT_EQ(r.encodeFor(v16.data(), 16), rpc::EndTxnResponse::ENCODED_SIZE);
+    rpc::EndTxnResponse p; p.sessionId = 7; p.correlationId = 9; p.errorCode = 55;
+    ASSERT_EQ(p.encode(plain.data()), 26u);
+    EXPECT_EQ(std::memcmp(v16.data(), plain.data(), 26), 0);
+    const auto d = rpc::EndTxnResponse::decode(v16.data(), 26);
+    ASSERT_TRUE(d);
+    EXPECT_FALSE(d->hasVote);
+    EXPECT_EQ(d->errorCode, 55);
+    // a 17 session without a vote also gets the 26-byte frame
+    EXPECT_EQ(p.encodeFor(plain.data(), 17), 26u);
+}
+
+TEST(CheckedWritesTxnWire, EndTxnResponseV17Vector) {
+    const std::string path = std::string(RUNE_CONFORMANCE_DIR) + "/vectors/end_txn_response_v17_vote.bin";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    ASSERT_NE(f, nullptr) << path;
+    std::vector<uint8_t> golden(64);
+    golden.resize(std::fread(golden.data(), 1, golden.size(), f));
+    std::fclose(f);
+    ASSERT_EQ(golden.size(), 38u);
+    auto r = votedResponse();
+    r.sessionId = 0x1122334455667788LL; r.correlationId = 0x0A0B0C0D0E0F1011LL;
+    std::array<uint8_t, 64> b{};
+    ASSERT_EQ(r.encodeFor(b.data(), 17), 38u);
+    EXPECT_EQ(std::vector<uint8_t>(b.begin(), b.begin() + 38), golden);
+    const auto d = rpc::EndTxnResponse::decode(golden.data(), golden.size());
+    ASSERT_TRUE(d);
+    EXPECT_EQ(d->constraintId, 0x00070000u);
+    EXPECT_EQ(d->failingOffset, 123);
+}
+
+TEST(CheckedWritesTxnWire, IsTxnVoteCode) {
+    for (uint16_t c : {55, 56, 57, 62, 63}) EXPECT_TRUE(rpc::isTxnVoteCode(c)) << c;
+    for (uint16_t c : {0, 39, 58, 59, 61}) EXPECT_FALSE(rpc::isTxnVoteCode(c)) << c;
+}
+
+TEST(CheckedWritesTxnWire, AtomicBitIsBitSeven) {
+    namespace b = rune::protocol::batch;
+    EXPECT_EQ(b::kAttrAtomic, 0x0080);
+    EXPECT_EQ(b::kAttrAtomic & (b::kAttrControl | b::kAttrTransactional | b::kAttrDeleteHorizon), 0);
 }

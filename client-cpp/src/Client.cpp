@@ -3039,8 +3039,8 @@ std::string_view lineageErrorName(uint16_t code) noexcept {
         "TransientLogFull", "PartitionDataReset", "", "", "", "", "" /* 44..48: authErrorName (#225) */, "RecordEgressUnavailable", "UnstableOffsetCommit",
         "NamespaceSuspended", "NamespaceLimitExceeded", "Throttled", "ViewPaused",
         "ConstraintViolation", "KeyExists", "KeyNotFound", "AutoIncrementExhausted", "ViewKeyExpressionInvalid",
-        "ViewConstraintInvalid", "ViewUniqueInvalid"};
-    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::ViewUniqueInvalid) + 1,
+        "ViewConstraintInvalid", "ViewUniqueInvalid", "TxnTooLarge", "TxnConflict"};
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::TxnConflict) + 1,
                   "lineageErrorName: one name per rune::protocol::client::ErrorCode");
     if (const char* auth = authErrorName(code)) return auth;   // #225: the one source of the 44..48 names
     return code < std::size(kNames) ? kNames[code] : std::string_view("UnknownErrorCode");

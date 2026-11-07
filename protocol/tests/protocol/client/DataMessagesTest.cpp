@@ -2221,6 +2221,13 @@ TEST(CheckedWritesProtocolRegression, OldSessionsNeverSeeCheckedWriteCodesRegres
     EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::ViewPaused, 14), rpc::ErrorCode::ViewPaused);
 }
 
+TEST(CheckedWritesProtocolRegression, OldSessionsNeverSeeTheVoteCodesRegression) {
+    for (auto c : {rpc::ErrorCode::TxnTooLarge, rpc::ErrorCode::TxnConflict}) {
+        for (int v : {0, 6, 13, 16}) EXPECT_EQ(rpc::produceErrorForClient(c, v), rpc::ErrorCode::InvalidRequest) << v;
+        EXPECT_EQ(rpc::produceErrorForClient(c, 17), c);
+    }
+}
+
 // ── Checked writes Part 03: the acks bits and ProduceResponse client 17 ──
 namespace {
 std::array<uint8_t, 16> kTwoVerdicts() {

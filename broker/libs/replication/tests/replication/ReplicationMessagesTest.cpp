@@ -1004,3 +1004,60 @@ TEST(ReplicationMessagesRegression, V4FieldsOfAV3SizedBlockAreNeverReadPastTheFr
         EXPECT_EQ(m.proposalId, 0); EXPECT_EQ(m.controllerEpoch, 0); EXPECT_EQ(m.sendSeq, 0);
     }
 }
+
+// ── Checked writes Part 11: TxnVote (15) and TxnVoteResponse (16) ──
+TEST(CheckedWritesTxnVoteMsg, RoundTrips) {
+    TxnVoteMsg m;
+    m.coordinatorNodeId = 3; m.coordinatorEpoch = 11; m.token = 0x1122334455LL; m.topicId = 41; m.partition = 5;
+    m.producerId = 9001; m.producerEpoch = 7; m.leaderEpoch = 13;
+    std::array<uint8_t, TxnVoteMsg::TOTAL_SIZE> b{};
+    ASSERT_EQ(m.encode(b.data(), b.size()), TxnVoteMsg::TOTAL_SIZE);
+    TxnVoteMsg d;
+    ASSERT_TRUE(TxnVoteMsg::decode(b.data(), b.size(), d));
+    EXPECT_EQ(d.coordinatorNodeId, 3);
+    EXPECT_EQ(d.coordinatorEpoch, 11);
+    EXPECT_EQ(d.token, 0x1122334455LL);
+    EXPECT_EQ(d.topicId, 41);
+    EXPECT_EQ(d.partition, 5);
+    EXPECT_EQ(d.producerId, 9001);
+    EXPECT_EQ(d.producerEpoch, 7);
+    EXPECT_EQ(d.leaderEpoch, 13);
+}
+
+TEST(CheckedWritesTxnVoteMsg, ResponseRoundTrips) {
+    TxnVoteResponseMsg m;
+    m.token = 0x1122334455LL; m.topicId = 41; m.partition = 5; m.producerId = 9001; m.coordinatorEpoch = 11;
+    m.producerEpoch = 7; m.errorCode = 3; m.code = 62; m.constraintId = 0x00070001u; m.failingOffset = 123456;
+    std::array<uint8_t, TxnVoteResponseMsg::TOTAL_SIZE> b{};
+    ASSERT_EQ(m.encode(b.data(), b.size()), TxnVoteResponseMsg::TOTAL_SIZE);
+    TxnVoteResponseMsg d;
+    ASSERT_TRUE(TxnVoteResponseMsg::decode(b.data(), b.size(), d));
+    EXPECT_EQ(d.token, 0x1122334455LL);
+    EXPECT_EQ(d.topicId, 41);
+    EXPECT_EQ(d.partition, 5);
+    EXPECT_EQ(d.producerId, 9001);
+    EXPECT_EQ(d.coordinatorEpoch, 11);
+    EXPECT_EQ(d.producerEpoch, 7);
+    EXPECT_EQ(d.errorCode, 3);
+    EXPECT_EQ(d.code, 62);
+    EXPECT_EQ(d.constraintId, 0x00070001u);
+    EXPECT_EQ(d.failingOffset, 123456);
+}
+
+TEST(CheckedWritesTxnVoteMsg, DecodeRefusesShortAndForeign) {
+    std::array<uint8_t, TxnVoteMsg::TOTAL_SIZE> b{};
+    TxnVoteMsg{}.encode(b.data(), b.size());
+    TxnVoteMsg d;
+    EXPECT_FALSE(TxnVoteMsg::decode(b.data(), b.size() - 1, d));
+    std::array<uint8_t, VerifyTxnPartitionMsg::TOTAL_SIZE> v{};
+    VerifyTxnPartitionMsg{}.encode(v.data(), v.size());
+    std::array<uint8_t, TxnVoteMsg::TOTAL_SIZE> padded{};
+    std::memcpy(padded.data(), v.data(), v.size());
+    EXPECT_FALSE(TxnVoteMsg::decode(padded.data(), padded.size(), d));
+
+    std::array<uint8_t, TxnVoteResponseMsg::TOTAL_SIZE> r{};
+    TxnVoteResponseMsg{}.encode(r.data(), r.size());
+    TxnVoteResponseMsg rd;
+    EXPECT_FALSE(TxnVoteResponseMsg::decode(r.data(), r.size() - 1, rd));
+    EXPECT_FALSE(TxnVoteResponseMsg::decode(b.data(), b.size(), rd));
+}

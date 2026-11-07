@@ -110,6 +110,8 @@ enum class OpStatus : uint8_t {
     case 59: return "ViewKeyExpressionInvalid";
     case 60: return "ViewConstraintInvalid";
     case 61: return "ViewUniqueInvalid";
+    case 62: return "TxnTooLarge";
+    case 63: return "TxnConflict";
     default: return nullptr;
     }
 }

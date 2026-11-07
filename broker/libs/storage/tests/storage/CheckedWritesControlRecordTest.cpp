@@ -256,3 +256,17 @@ TEST(CheckedWritesControlRecord, ReservationRoundTrips) {
     const auto m = marker(0, 10, 1, {});
     EXPECT_FALSE(cr::parseReservation(m.data(), m.size()).has_value());
 }
+
+TEST(CheckedWritesControlRecord, TxnJudgeRoundTrips) {
+    std::vector<uint8_t> b(cr::kTxnJudgeBatchBytes);
+    ASSERT_EQ(cr::buildTxnJudge(b, {77, 3, 1000}), b.size());
+    EXPECT_EQ(cr::recordType(b.data(), b.size()), 19);
+    const auto j = cr::parseTxnJudge(b.data(), b.size());
+    ASSERT_TRUE(j.has_value());
+    EXPECT_EQ(j->producerId, 77);
+    EXPECT_EQ(j->producerEpoch, 3);
+    EXPECT_EQ(j->firstOffset, 1000);
+    std::vector<uint8_t> shortBuf(b.size() - 1);
+    EXPECT_EQ(cr::buildTxnJudge(shortBuf, {77, 3, 1000}), 0u);
+    EXPECT_FALSE(cr::parseTxnJudge(b.data(), b.size() - 1).has_value());
+}
