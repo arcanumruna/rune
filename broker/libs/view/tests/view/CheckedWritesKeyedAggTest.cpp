@@ -18,6 +18,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/view/AggFold.h>
 #include <rune/view/PlanCompiler.h>
+#include <rune/view/TxnOverlay.h>
 #include <rune/view/ViewCheckpoint.h>
 
 #include "LegacyFoldReference.h"
@@ -632,4 +633,38 @@ TEST(CheckedWritesKeyedAggModelRegression, RandomLogsFoldToTheFreshRefold) {
     EXPECT_GT(seen.skippedNoGroup, 100u);
     EXPECT_GT(groupsFolded, 3000u);
     EXPECT_GT(groupsDropped, 500u);
+}
+
+// Part 11 Task 3: a keyed view's chained prepares see exactly what sequential prepares do, burn gids, and leave the tables alone.
+TEST(CheckedWritesKeyedAgg, ChainedPreparesEqualSequentialProspectsRegression) {
+    for (uint64_t seed = 1; seed <= 100; ++seed) {
+        std::mt19937_64 rng(seed);
+        const ViewPlan plan = aggregateOf({{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}}, allRules());
+        Rig chained(plan), sequential(plan);
+        TxnOverlay chain;
+        chain.reserve(512, 4096);
+        const char* fps[] = {"a", "b", "c"};
+        for (size_t i = 0, n = 1 + rng() % 40; i < n; ++i) {
+            const uint64_t id = rng() % 10;
+            const std::string key = wireKey(id);
+            const std::string value = rng() % 4 == 0 ? std::string() : valueOf(chained.src, ev(id, 1 + rng() % 3, fps[rng() % 3], int64_t(rng() % 20), rng() % 50));
+            const rune::view::SourceRecord rec{key, value, int64_t(i), 0, nullptr};
+            auto cf = chained.fold();
+            auto sf = sequential.fold();
+            ASSERT_EQ(prepareAggregate(cf, rec, chained.p, &chain), PrepareStatus::Ok) << "seed " << seed;
+            ASSERT_EQ(prepareAggregate(sf, rec, sequential.p), PrepareStatus::Ok);
+            const Prospect &c = chained.p, &s = sequential.p;
+            ASSERT_EQ(c.op, s.op) << "seed " << seed << " record " << i;
+            ASSERT_EQ(c.rowCount, s.rowCount);
+            for (uint8_t j = 0; j < s.rowCount; ++j) {
+                EXPECT_TRUE(c.rows[j].key == s.rows[j].key);
+                EXPECT_EQ(c.rows[j].removed, s.rows[j].removed);
+                EXPECT_EQ(c.rows[j].existed, s.rows[j].existed);
+                if (s.rows[j].image != nullptr) EXPECT_EQ(std::memcmp(c.rows[j].image, s.rows[j].image, chained.comp.rowLayout.rowLen), 0);
+            }
+            applyAggregate(sf, rec, sequential.p);
+        }
+        EXPECT_EQ(chained.view.size() + chained.groups.size() + chained.contributors.size() + chained.groupIds.size(), 0u);
+        EXPECT_EQ(chained.next == 0, chain.rows() == 0);
+    }
 }
