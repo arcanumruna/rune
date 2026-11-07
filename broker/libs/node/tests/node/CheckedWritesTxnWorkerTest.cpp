@@ -637,3 +637,109 @@ TEST(CheckedWritesTxnWorker, LaggingCheckpointKeepsTheTxnJudgeItNeedsRegression)
     ASSERT_GT(p.r.writeState()->markers.committedThrough(), j) << "the markers alone would let the J go";
     EXPECT_EQ(p.r.replica->cleanerTxnJudgeBound(), lagging) << "the J the lagging checkpoint backfills from is kept";
 }
+
+// P11-1 on a constrained aggregate: the yes is answered with J and nothing is applied before the marker; the commit applies the
+// transaction's records to account_stats in one step.
+TEST(CheckedWritesTxnWorker, AccountStatsVoteYesThenCommitAppliesInOneStep) {
+    VerdictRig r;
+    r.createQlTopic(VerdictRig::kCharacterTopic, false);
+    r.enableAcks();
+    r.passes(20);
+    r.createConstrainedView(ConstrainedView::AccountStats, 2);
+    r.passes(20);
+    const auto characters = [&](uint64_t user) -> int64_t {
+        const ViewInstance* i = r.constrainedInstance(ConstrainedView::AccountStats);
+        const uint8_t* row = i == nullptr ? nullptr : i->table.get(user);
+        if (row == nullptr) return -1;
+        const auto& live = r.constrained.at(ConstrainedView::AccountStats);
+        const auto& fs = live.comp.outputDescriptor.fields;
+        for (std::size_t f = 0; f < fs.size(); ++f)
+            if (fs[f].name == "characters") return rune::view::readSlot(row, live.comp.rowLayout, static_cast<uint16_t>(f)).i;
+        return -2;
+    };
+    std::vector<VerdictRig::SrcRecord> recs;
+    for (uint64_t id : {1, 2}) recs.push_back(VerdictRig::srcOf(VerdictRig::Char{.id = id, .userId = 1, .name = "c" + std::to_string(id)}));
+    (void)r.appendTxnReplicated(r.sourceBatch(recs, 31, 0, /*txn=*/true));
+    r.passes(30);
+    const int64_t tok = r.sendVote(VerdictRig::kSrc, 31, 0);
+    ASSERT_TRUE(r.driveUntilVoted(tok));
+    const auto v = r.voteReply(tok);
+    ASSERT_TRUE(v);
+    EXPECT_EQ(v->errorCode, 0);
+    EXPECT_EQ(v->code, 0);
+    EXPECT_EQ(r.txnJudgeOffsetsInLog(), std::vector<int64_t>{v->judgeOffset});
+    EXPECT_EQ(characters(1), -1) << "nothing applied before the marker";
+    r.marker(31, true);
+    ASSERT_TRUE(r.driveUntilJudged());
+    EXPECT_EQ(characters(1), 2);
+    EXPECT_EQ(r.writeState()->txn.stats.votesYes, 1u);
+}
+
+// R04a: a source dropped while a voted transaction is Locked, then a failover: the vote parked on another transaction's J is
+// answered NotLeader, and neither the overlay nor a parked vote nor a scan is left behind.
+TEST(CheckedWritesTxnWorker, DropWhileLockedThenFailoverLeaksNothing) {
+    Ki k;
+    auto& pool = k.r.vs->txnOverlaysForTest();
+    k.txn(46, {ins(1)});
+    ASSERT_EQ(k.vote(46).code, 0);
+    ASSERT_EQ(k.r.writeState()->txn.find(46)->phase, TxnPhase::Locked);
+    k.r.holdJudge(true);
+    k.txn(47, {ins(2)});
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, 47, 0);
+    k.r.passes(10);
+    ASSERT_EQ(k.r.txnJudgeOffsetsInLog().size(), 2u);
+    ASSERT_FALSE(k.r.voteReply(tok)) << "parked: the judge has not judged its J";
+    ASSERT_EQ(k.r.worker->parkedVotesForTest(), 1);
+    k.r.vs->dropSourceTopic(VerdictRig::kSrc);
+    WorkerOp d;
+    d.type = WorkerOp::Type::TopicDropped;
+    d.topicId = VerdictRig::kSrc;
+    k.r.send(std::move(d));
+    ASSERT_TRUE(k.r.voteReply(tok));
+    EXPECT_EQ(k.r.voteReply(tok)->errorCode, kNotLeader);
+    EXPECT_EQ(pool.freeCount(), rune::view::kTxnOverlaysPerWorker);
+    k.r.holdJudge(false);
+    k.r.failover();
+    k.r.passes(30);
+    EXPECT_EQ(k.r.worker->parkedVotesForTest(), 0);
+    EXPECT_EQ(k.r.worker->voteScansForTest(), 0u);
+}
+
+// A voted transaction aborted at its marker: a persisted member restarted from its checkpoint refolds to the leader's rows.
+TEST(CheckedWritesTxnWorker, VotedAbortedRefoldsEqual) {
+    Persisted p;
+    std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ins(1001), ins(1002)}, kRaPid, 0, {}, /*txn=*/true)};
+    for (auto& b : Persisted::plain(10000, 600)) batches.push_back(std::move(b));
+    (void)p.replicated(std::move(batches));
+    ASSERT_TRUE(p.r.driveUntilVoted(p.r.sendVote(VerdictRig::kSrc, kRaPid, 0)));
+    p.r.marker(kRaPid, false);
+    for (uint64_t i = 0; i < 5; ++i) (void)p.r.produceFrame({Rec{20000 + i, 1}}, kLeader);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    p.r.passes(100);
+    const auto rows = [&] {
+        std::vector<bool> out;
+        for (uint64_t k : {1001, 1002, 10000, 10599, 20000, 20004}) out.push_back(p.r.hasRow(kRej, k));
+        return std::make_pair(out, p.r.vs->instanceForTest(kRej, 0)->table.size());
+    };
+    const auto leader = rows();
+    EXPECT_EQ(leader.first, (std::vector<bool>{false, false, true, true, true, true}));
+    ASSERT_GT(p.durable(), 0);
+    p.r.restart();
+    p.r.passes(300);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    EXPECT_EQ(rows(), leader);
+}
+
+// Contract addition 19: one transaction over two topics.  Both vote yes: the commit applies it on both.  One votes no: it aborts on
+// both, and the other applies nothing.
+TEST(CheckedWritesTxnWorker, TxnPairCommitsOnBothOrNeither) {
+    TxnPair t;
+    t.write(70, {ins(1)}, {ins(2)});
+    EXPECT_TRUE(t.end(70));
+    EXPECT_EQ(t.a.keyIndexKeys(), (std::set<std::string>{"1"}));
+    EXPECT_EQ(t.b.keyIndexKeys(), (std::set<std::string>{"2"}));
+    t.write(71, {ins(1)}, {ins(3)});   // 1 exists on a: a votes KeyExists
+    EXPECT_FALSE(t.end(71));
+    EXPECT_EQ(t.a.keyIndexKeys(), (std::set<std::string>{"1"}));
+    EXPECT_EQ(t.b.keyIndexKeys(), (std::set<std::string>{"2"})) << "b's yes is aborted with a's no";
+}

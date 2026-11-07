@@ -1584,4 +1584,40 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
 
 inline VerdictRig::RigLog VerdictRig::readLog(int64_t through) const { return readLogOf(*log, through); }
 
+/// Contract addition 19 (R-2h): one transaction over two key-index topics, each led by its own rig, ended as its coordinator does:
+/// both partitions vote, and the transaction commits on both only when both voted yes.
+struct TxnPair {
+    VerdictRig a, b;
+    TxnPair() {
+        for (VerdictRig* r : {&a, &b}) {
+            r->createKeyIndex();
+            r->enableAcks();
+            r->worker->setVerdictIntervalNs(1'000'000);
+            r->passes(60);
+        }
+    }
+    /// Producer `pid`'s records on each topic, written by the previous leaders.
+    void write(int64_t pid, const std::vector<Rec>& onA, const std::vector<Rec>& onB) {
+        (void)a.appendTxnReplicated(VerdictRig::batch(onA, pid, 0, {}, /*txn=*/true));
+        (void)b.appendTxnReplicated(VerdictRig::batch(onB, pid, 0, {}, /*txn=*/true));
+        a.passes(30);
+        b.passes(30);
+    }
+    /// Both votes, then the decision's markers on both; true when it committed.
+    bool end(int64_t pid) {
+        bool commit = true;
+        for (VerdictRig* r : {&a, &b}) {
+            const int64_t tok = r->sendVote(VerdictRig::kSrc, pid, 0);
+            EXPECT_TRUE(r->driveUntilVoted(tok));
+            const auto v = r->voteReply(tok);
+            commit = commit && v && v->errorCode == 0 && v->code == 0;
+        }
+        for (VerdictRig* r : {&a, &b}) {
+            r->marker(pid, commit);
+            EXPECT_TRUE(commit ? r->driveUntilJudged() : r->driveUntilJudgeReaches());   // an abort leaves nothing to mark
+        }
+        return commit;
+    }
+};
+
 }  // namespace rune::node::cw

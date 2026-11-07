@@ -937,7 +937,7 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
     ASSERT_EQ(c2->status, rc::OpStatus::RecordsRejected) << "err=" << c2->errorCode;
     EXPECT_EQ(rc::constraintIdOf(*c2), rune::view::constraintIdOf(7, 1));
     const rc::BatchVerdicts v2(*c2, payload2);
-    // TODO(Part 11 Task 11): the ack carries one trailer entry, the first failing record's, and completes as BrokerError.
+    // TODO(Part 11 Task 12): the ack carries one trailer entry, the first failing record's, and completes as BrokerError.
     EXPECT_EQ(v2.rejectedCount(), tags.size()) << "every record of the atomic batch is rejected";
     for (uint32_t i = 0; i < tags.size(); ++i) EXPECT_EQ(v2.offsetOf(i), -1);
 
