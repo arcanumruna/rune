@@ -7766,8 +7766,9 @@ private:
         }
     }
 
-    // A TxnVote the ownership gate refused answers NotLeader (never ControlRecordRefused): the coordinator re-routes the vote.
-    void answerTxnVoteNotLeader_(sbe::WorkerOp& op) {
+    // A TxnVote answers NotLeader (never ControlRecordRefused) when gated out, and until Task 7 also when owned; the coordinator
+    // re-routes.  recordCount stays 0 here, which is not a yes vote: the vote fields count only when errorCode == 0.
+    [[gnu::cold]] [[gnu::noinline]] void answerTxnVoteNotLeader_(sbe::WorkerOp& op) {
         WorkerReturn ret;
         ret.type          = WorkerReturn::Type::TxnVoteResult;
         ret.correlationId = op.correlationId();   // the vote token
@@ -7779,7 +7780,7 @@ private:
         ret.baseOffset    = -1;
         ret.lastOffset    = -1;
         ret.errorCode     = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
-        enqueueReturn_(ret);
+        enqueueReturn_(std::move(ret));
     }
 
     LogFlushSlot* slotOf_(const rune::storage::Log* log) noexcept {

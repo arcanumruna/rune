@@ -226,7 +226,9 @@
       <validValue name="STATS_RESULT">10</validValue>
       <!-- Checked writes Part 11: the answer to a TXN_VOTE op, on existing scalars.  correlationId = the vote token,
            errorCode = transport status, recordCount = the vote code (0 = yes), newNextOffset = constraintId,
-           baseOffset = failingOffset, lastOffset = the judge offset (-1 = none), sessionId = the origin node. -->
+           baseOffset = failingOffset, lastOffset = the judge offset (-1 = none), sessionId = the origin node.
+           The vote fields mean something only when errorCode == 0: a NotLeader answer leaves recordCount 0, which is NOT a
+           yes vote. -->
       <validValue name="TXN_VOTE_RESULT">11</validValue>
     </enum>
 

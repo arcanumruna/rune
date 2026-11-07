@@ -613,7 +613,8 @@ struct WorkerReturn {
         StatsResult = 10,
         /// Checked writes Part 11: the answer to a TxnVote op, on existing scalars.  correlationId = the vote token, errorCode =
         /// transport status (NotLeader when gated out), recordCount = the vote code (0 = yes), newNextOffset = constraintId,
-        /// baseOffset = failingOffset, lastOffset = the judge offset (-1 = none), sessionId = the origin node.
+        /// baseOffset = failingOffset, lastOffset = the judge offset (-1 = none), sessionId = the origin node.  The vote fields
+        /// mean something only when errorCode == 0: a NotLeader answer leaves recordCount 0, which is NOT a yes vote.
         TxnVoteResult = 11,
     };
 

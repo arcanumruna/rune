@@ -1045,21 +1045,23 @@ TEST(CheckedWritesTxnVoteMsg, ResponseRoundTrips) {
 }
 
 TEST(CheckedWritesTxnVoteMsg, DecodeRefusesShortAndForeign) {
+    // The foreign frames are full-length, valid frames of the other message with only the templateId rewritten,
+    // so the template check is the only thing that can refuse them.
     std::array<uint8_t, TxnVoteMsg::TOTAL_SIZE> b{};
     TxnVoteMsg{}.encode(b.data(), b.size());
     TxnVoteMsg d;
+    EXPECT_TRUE(TxnVoteMsg::decode(b.data(), b.size(), d));
     EXPECT_FALSE(TxnVoteMsg::decode(b.data(), b.size() - 1, d));
-    std::array<uint8_t, VerifyTxnPartitionMsg::TOTAL_SIZE> v{};
-    VerifyTxnPartitionMsg{}.encode(v.data(), v.size());
-    std::array<uint8_t, TxnVoteMsg::TOTAL_SIZE> padded{};
-    std::memcpy(padded.data(), v.data(), v.size());
-    EXPECT_FALSE(TxnVoteMsg::decode(padded.data(), padded.size(), d));
+    std::array<uint8_t, TxnVoteMsg::TOTAL_SIZE> asResponse = b;
+    detail::write_le<uint16_t>(asResponse.data() + 2, TxnVoteResponseMsg::TEMPLATE_ID);
+    EXPECT_FALSE(TxnVoteMsg::decode(asResponse.data(), asResponse.size(), d));
 
     std::array<uint8_t, TxnVoteResponseMsg::TOTAL_SIZE> r{};
     TxnVoteResponseMsg{}.encode(r.data(), r.size());
     TxnVoteResponseMsg rd;
+    EXPECT_TRUE(TxnVoteResponseMsg::decode(r.data(), r.size(), rd));
     EXPECT_FALSE(TxnVoteResponseMsg::decode(r.data(), r.size() - 1, rd));
-    std::array<uint8_t, TxnVoteResponseMsg::TOTAL_SIZE> foreign{};
-    std::memcpy(foreign.data(), b.data(), b.size());
-    EXPECT_FALSE(TxnVoteResponseMsg::decode(foreign.data(), foreign.size(), rd));
+    std::array<uint8_t, TxnVoteResponseMsg::TOTAL_SIZE> asVote = r;
+    detail::write_le<uint16_t>(asVote.data() + 2, TxnVoteMsg::TEMPLATE_ID);
+    EXPECT_FALSE(TxnVoteResponseMsg::decode(asVote.data(), asVote.size(), rd));
 }

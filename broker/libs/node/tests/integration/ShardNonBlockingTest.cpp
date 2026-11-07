@@ -1497,29 +1497,40 @@ TEST(OwnershipGuardRegression, EveryGuardedOpTypeIsRefusedWhenNotOwned) {
         WorkerOp::Type::PushRead, WorkerOp::Type::Subscribe, WorkerOp::Type::FetchRequest,
         WorkerOp::Type::OffsetsForLeaderEpochReq, WorkerOp::Type::ReconcileFetchResp,
         WorkerOp::Type::AppendControlRecord, WorkerOp::Type::ApplyReplicated,
-        WorkerOp::Type::BecomeLeader, WorkerOp::Type::BecomeFollower};
+        WorkerOp::Type::BecomeLeader, WorkerOp::Type::BecomeFollower, WorkerOp::Type::TxnVote};
     for (auto ty : types) {
         WorkerOp op;
         op.type = ty; op.topicId = 1; op.partition = 0; op.replica = rep.get(); op.logPtr = log.get();
         op.subscriptionId = 77; op.sessionId = 1;
         if (ty == WorkerOp::Type::AppendControlRecord) op.recordBatchBytes = batchAt(0);
+        if (ty == WorkerOp::Type::TxnVote) { op.correlationId = 41; op.producerId = 77; op.producerEpoch = 3; }
         ASSERT_TRUE(w.tryEnqueueOp(stamp(std::move(op))));
     }
     rep.reset();
     log.reset();
     w.doWork(1);
-    int pushRead = 0, refusedMarkers = 0, other = 0;
+    int pushRead = 0, refusedMarkers = 0, votes = 0, other = 0;
     w.drainReturn([&](WorkerReturn r) {
         if (r.type == WorkerReturn::Type::PushReadResult) ++pushRead;
+        else if (r.type == WorkerReturn::Type::TxnVoteResult) {
+            ++votes;
+            EXPECT_EQ(r.errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+            EXPECT_EQ(r.correlationId, 41);
+            EXPECT_EQ(r.producerId, 77);
+            EXPECT_EQ(r.producerEpoch, 3);
+            EXPECT_EQ(r.sessionId, 1);
+            EXPECT_EQ(r.lastOffset, -1);
+        }
         else if (r.type == WorkerReturn::Type::ControlRecordRefused) {
             ++refusedMarkers;
             EXPECT_EQ(r.errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
             EXPECT_FALSE(r.chunk.empty()) << "the marker travels back for re-routing";
         } else ++other;
     });
-    EXPECT_EQ(w.opsRefusedNotOwnedForTest(), 9u);
+    EXPECT_EQ(w.opsRefusedNotOwnedForTest(), 10u);
     EXPECT_EQ(pushRead, 1) << "PushRead answered with an empty result (gateway re-issues)";
     EXPECT_EQ(refusedMarkers, 1) << "AppendControlRecord refusal is never silent";
+    EXPECT_EQ(votes, 1) << "TxnVote is answered NotLeader, never a silent drop or a marker refusal";
     EXPECT_EQ(other, 0);
     ASSERT_EQ(w.subscriptionsForTest().size(), 1u);
     EXPECT_FALSE(w.subscriptionsForTest()[0].active) << "Subscribe registered parked";
