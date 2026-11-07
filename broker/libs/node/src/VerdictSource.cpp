@@ -321,6 +321,7 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     state_ = &state;
     needsActivation_ = false;
     if (state.rejected.capacity() == 0) state.rejected.reserve(kIndexReserve);
+    if (!state.txn.reserved()) state.txn.reserve();
     judgeCursor_ = std::max(extendOverEmptySets_(state.rejected.coveredThrough()), logStart_);
     // §8.5: the markers in this leader's log commit with it (a leader never truncates), so it marks only above them.  Not from
     // W: a lagging HW puts W below ranges the cleaner may already have compacted, and a re-mark from this index would disagree.

@@ -16,6 +16,7 @@
 #include <rune/node/AutoInc.h>
 #include <rune/node/VerdictState.h>
 #include <rune/replication/ReplicationMessages.h>
+#include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/RejectedOffsetIndex.h>
 
 #include <cstddef>
@@ -200,11 +201,131 @@ private:
 /// One owned typed partition's write state, next to RcSlot.  Later parts append their per-partition members here.
 class VerdictSource;
 
+/// Part 11: a transaction on a checked-writes source, from its TxnJudge record to its marker.
+enum class TxnPhase : uint8_t { Scanning, AwaitJudge, Deferred, Judging, Locked, Finalized };
+struct TxnVoteAnswer { uint16_t code = 0; uint32_t constraintId = 0; int64_t failingOffset = -1; };
+struct TxnJudgeStats {
+    uint64_t votesYes = 0, votesNo = 0, votesNoConstraint = 0, votesNoKeyExists = 0, votesNoKeyNotFound = 0, votesNoTooLarge = 0,
+             votesNoConflict = 0, voteLatencyNsMax = 0, voteLatencyNsTotal = 0, foldPausedOnTxnLockNs = 0, markerWithoutVote = 0,
+             txnOverlayWaits = 0, lockPauses = 0, checkpointBackfills = 0, vetoedCheckpointPushes = 0;
+};
+struct DeferredTxn {
+    int64_t     producerId = -1;
+    int16_t     epoch = -1;
+    int64_t     firstOffset = -1, lastOffset = -1, judgeOffset = -1, markerOffset = -1;
+    bool        commit = false;
+    int32_t     records = 0;
+    bool        explicitIntent = false;
+    TxnPhase    phase = TxnPhase::Scanning;
+    TxnVoteAnswer answer{};
+    int32_t     overlay = -1;
+    int64_t     voteReceivedNs = 0;
+};
+struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; };
+
+/// The transactions of one source between their TxnJudge record and their marker, in judge-offset order.  Everything is reserved
+/// by reserve(); no call allocates after it.  A full table refuses the record (nullptr): the judge waits there, never a verdict.
+class TxnJudgeState {
+public:
+    static constexpr std::size_t kMaxTxns = 1024, kMaxParkedVotes = 256;
+
+    void reserve() {   // cold
+        txns_.reserve(kMaxTxns);
+        parked_.reserve(kMaxParkedVotes);
+    }
+    [[nodiscard]] bool reserved() const noexcept { return txns_.capacity() >= kMaxTxns; }
+
+    /// The latest entry of the producer.
+    [[nodiscard]] DeferredTxn* find(int64_t producerId) noexcept {
+        for (std::size_t i = txns_.size(); i-- > 0;)
+            if (txns_[i].producerId == producerId) return &txns_[i];
+        return nullptr;
+    }
+    /// A producer's next transaction replaces its previous entry.  nullptr: the table is full.
+    DeferredTxn* onJudgeRecord(int64_t judgeOffset, const rune::storage::control_record::TxnJudgeRecord& r) noexcept {
+        if (DeferredTxn* old = find(r.producerId)) {
+            if (old->judgeOffset == judgeOffset) return old;
+            txns_.erase(txns_.begin() + (old - txns_.data()));
+        }
+        if (txns_.size() >= kMaxTxns) return nullptr;
+        DeferredTxn& t = txns_.emplace_back();
+        t.producerId = r.producerId;
+        t.epoch = r.producerEpoch;
+        t.firstOffset = r.firstOffset;
+        t.judgeOffset = judgeOffset;
+        t.phase = TxnPhase::AwaitJudge;
+        return &t;
+    }
+    /// The marker decides the transaction.  One that holds an overlay stays Locked until the judge releases it.
+    void onMarker(int64_t producerId, int64_t offset, bool commit) noexcept {
+        DeferredTxn* t = find(producerId);
+        if (t == nullptr || t->markerOffset >= 0) {
+            ++stats.markerWithoutVote;
+            return;
+        }
+        t->markerOffset = offset;
+        t->commit = commit;
+        if (t->overlay < 0) t->phase = TxnPhase::Finalized;
+    }
+    /// Leadership scan begin: nothing at or above `offset` is known any more.
+    void truncateFrom(int64_t offset) noexcept {
+        while (!txns_.empty() && txns_.back().judgeOffset >= offset) txns_.pop_back();
+        for (DeferredTxn& t : txns_) {
+            if (t.markerOffset < offset) continue;
+            t.markerOffset = -1;
+            t.commit = false;
+            if (t.phase == TxnPhase::Finalized) t.phase = TxnPhase::AwaitJudge;
+        }
+    }
+    /// INT64_MAX = none.
+    [[nodiscard]] int64_t earliestUndecidedFirst() const noexcept {
+        int64_t first = INT64_MAX;
+        for (const DeferredTxn& t : txns_)
+            if (t.markerOffset < 0 && t.firstOffset < first) first = t.firstOffset;
+        return first;
+    }
+    /// False: full, the caller answers NotLeader.
+    [[nodiscard]] bool parkVote(const ParkedVote& v) noexcept {
+        if (parked_.size() >= kMaxParkedVotes) return false;
+        parked_.push_back(v);
+        return true;
+    }
+    /// fn(const ParkedVote&, const DeferredTxn&) for every parked vote whose transaction is Locked or Finalized; those votes leave the park.
+    template <class Fn>
+    int drainAnswered(Fn&& fn) noexcept {
+        int n = 0;
+        std::size_t kept = 0;
+        for (std::size_t i = 0; i < parked_.size(); ++i) {
+            const DeferredTxn* t = find(parked_[i].producerId);
+            if (t != nullptr && (t->phase == TxnPhase::Locked || t->phase == TxnPhase::Finalized)) {
+                fn(parked_[i], *t);
+                ++n;
+            } else {
+                parked_[kept++] = parked_[i];
+            }
+        }
+        parked_.resize(kept);
+        return n;
+    }
+    [[nodiscard]] std::size_t lockedCount() const noexcept {
+        std::size_t n = 0;
+        for (const DeferredTxn& t : txns_) n += t.phase == TxnPhase::Locked;
+        return n;
+    }
+
+    TxnJudgeStats stats;
+
+private:
+    std::vector<DeferredTxn> txns_;
+    std::vector<ParkedVote>  parked_;
+};
+
 struct PartitionWriteState {
     const TopicWriteSpec*              spec = nullptr;
     rune::storage::RejectedOffsetIndex rejected;       ///< reserved when the partition becomes a verdict source (VerdictSource.cpp)
     ConstraintSetTimeline              constraintSets;
     MarkerLedger                       markers;
+    TxnJudgeState                      txn;                  ///< Part 11: the transactions between their TxnJudge record and their marker
     RetainedVerdictPlans               retainedPlans;        ///< the type-20 records of the log (P9-8)
     VerdictSource*                     verdicts = nullptr;   ///< the judge, once this worker leads and hosts verdict views
     int64_t                            judgedThrough = 0;    ///< the judge's cursor, published at the end of each of its passes
