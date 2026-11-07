@@ -4,6 +4,7 @@
 // A verdict source owns the verdict views of its partition.  judge() prepares every active member for a record,
 // evaluates them in set order, and applies all or none; a rejection goes into PartitionWriteState::rejected.  driveJudge
 // walks the committed log, follows the logged constraint-set changes and emits durable verdict markers.
+#include <rune/codec/PrimType.h>
 #include <rune/node/VerdictState.h>
 #include <rune/node/ViewInstance.h>
 #include <rune/node/WriteState.h>
@@ -31,6 +32,8 @@ inline constexpr std::size_t kKeyIndexChunkBytes           = 64u << 10;
 inline constexpr int64_t     kKeyIndexReplayRecordsPerPass = 65536;
 /// Part 11: what the judge reads per pass looking ahead for an undecided transaction's TxnJudge or marker (P11-2).
 inline constexpr std::size_t kTxnProbeBytesPerPass = 1u << 20;
+/// Part 11: what a judgement reads per pass, for each of its two walks (the chained read of T and the P11-3 scan).
+inline constexpr std::size_t kVoteScanBytesPerPass = 1u << 20;
 
 struct KeyIndexFold {
     rune::view::ViewTable&          table;
@@ -74,7 +77,57 @@ struct VerdictViewHooks {
     void (*retired)(void* ctx, int32_t viewTopicId, int32_t partition) = nullptr;
 };
 
-/// The worker's transaction overlays.  `at(i)` is stable; an overlay is bound to one source key while it is acquired.
+/// Part 11: the source keys of one transaction with their last offsets (P11-3, P11-3a), and the other producers' markers and TxnJudge
+/// records met below its end, in offset order, with the markers past the end that decide those TxnJudges (resolve()).
+/// Open-addressed and reserved once.  A key past the reserved count overflows the set, and so does a marker or TxnJudge past the
+/// reserved count (they share the slots); a key longer than any checked topic's is not tracked (note()).  Overflow sticks until
+/// clear().
+class TxnKeySet {
+public:
+    struct Key {
+        std::array<uint8_t, rune::codec::kMaxTopicKeyBytes> bytes{};
+        uint8_t len = 0;
+        bool    used = false, superseded = false;
+        int64_t last = -1;
+    };
+    struct Marker { int64_t producerId; int64_t offset; bool commit, judge; };
+    enum class Applied : uint8_t { No, Yes, Unknown };
+
+    void reserve(std::size_t keys, std::size_t markers);   // cold
+    [[nodiscard]] std::size_t keyCapacity() const noexcept { return keyCap_; }
+    void clear() noexcept;
+    /// The key's last offset is `offset` (records come in offset order).  A key wider than kMaxTopicKeyBytes is not tracked: every
+    /// member skips a record whose key is not its key field's width (at most that), so the record changes no row and can neither
+    /// supersede nor conflict.  False: overflowed.
+    bool note(std::string_view key, int64_t offset) noexcept;
+    [[nodiscard]] Key* find(std::string_view key) noexcept;
+    void noteMarker(int64_t producerId, int64_t offset, bool commit) noexcept;
+    void noteJudge(int64_t producerId, int64_t offset) noexcept;
+    /// Whether the producer's transactional batch at `base` is applied below the end, from the log alone: the producer's first
+    /// noted marker above `base` commits, or its first noted entry above `base` is its TxnJudge (deferred, judged below the end) and
+    /// the marker after it commits.  Unknown: that marker lies past the end and is not resolved yet.
+    [[nodiscard]] Applied appliedAt(int64_t producerId, int64_t base) const noexcept;
+    /// A marker past the end: noted when it decides a noted TxnJudge that has none yet.  True: it was noted.
+    bool resolve(int64_t producerId, int64_t offset, bool commit) noexcept;
+    [[nodiscard]] bool pending() const noexcept { return !pending_.empty(); }   // a noted TxnJudge whose marker is not noted
+    [[nodiscard]] bool awaits(int64_t producerId) const noexcept;          // the producer's last noted entry is such a TxnJudge
+    [[nodiscard]] std::span<const Marker> markers() const noexcept { return markers_; }
+    [[nodiscard]] bool keysOverflowed() const noexcept { return keysOverflowed_; }
+    [[nodiscard]] bool markersOverflowed() const noexcept { return markersOverflowed_; }
+
+private:
+    [[nodiscard]] std::size_t slotOf_(std::string_view key) const noexcept;
+
+    std::vector<Key>      slots_;   // a power of two, at least twice keyCap_
+    std::vector<uint32_t> used_;
+    std::vector<Marker>   markers_;
+    std::vector<int64_t>  pending_;   // the producers whose last noted entry is a TxnJudge
+    std::size_t           keyCap_ = 0;
+    bool                  keysOverflowed_ = false, markersOverflowed_ = false;
+};
+
+/// The worker's transaction overlays.  `at(i)` is stable; an overlay is bound to one source key while it is acquired.  Each overlay
+/// has its key set (a judgement keeps both across passes); `oneStep()` is the key set of work done within one step (P11-3a).
 class TxnOverlayPool {
 public:
     /// Cold.  The caller's precondition: rows >= txnJudgedRecordsMax x the sum, over the verdict members of the source, of
@@ -98,6 +151,10 @@ public:
         inUse_[static_cast<std::size_t>(i)] = false;
     }
     [[nodiscard]] rune::view::TxnOverlay& at(int32_t i) noexcept { return overlays_[static_cast<std::size_t>(i)]; }
+    /// Cold: every key set holds at least `keys` keys (the one-step set at least `oneStepKeys`).
+    void reserveKeys(std::size_t keys, std::size_t oneStepKeys);
+    [[nodiscard]] TxnKeySet& keysAt(int32_t i) noexcept { return keys_[static_cast<std::size_t>(i)]; }
+    [[nodiscard]] TxnKeySet& oneStep() noexcept { return oneStep_; }
     /// The acquired overlays bound to `sourceKey`.
     [[nodiscard]] rune::view::TxnLockSet lockSetFor(uint64_t sourceKey) const noexcept {
         rune::view::TxnLockSet set;
@@ -109,6 +166,8 @@ public:
 private:
     std::array<rune::view::TxnOverlay, rune::view::kTxnOverlaysPerWorker> overlays_;
     std::array<bool, rune::view::kTxnOverlaysPerWorker>                    inUse_{};
+    std::array<TxnKeySet, rune::view::kTxnOverlaysPerWorker>               keys_;
+    TxnKeySet                                                              oneStep_;
 };
 
 class VerdictSource {
@@ -137,12 +196,9 @@ public:
     int driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t nowNs, PartitionWriteState& state,
                    const rune::view::AbortedTxnFilter& aborted = {});
 
-    /// Cold: the worker's overlay pool, the batch's own overlays and the knob the pool was sized for.
-    void bindTxn(TxnOverlayPool* pool, std::span<rune::view::TxnOverlay> batchOverlay, int32_t txnJudgedRecordsMax) noexcept {
-        txnPool_ = pool;
-        batchOverlay_ = batchOverlay;
-        txnJudgedRecordsMax_ = txnJudgedRecordsMax;
-    }
+    /// Cold: the worker's overlay pool, the batch's own overlays and the knob the pool was sized for.  Reserves the pool's key sets.
+    void bindTxn(TxnOverlayPool* pool, std::span<rune::view::TxnOverlay> batchOverlay, int32_t txnJudgedRecordsMax);
+    void setVoteScanBytesForTest(std::size_t bytes) noexcept { voteScanBytes_ = bytes; }
 
     /// P11-2: never past an undecided transaction, nor past an ordinary one the judge has not applied at its marker yet.  The judge's
     /// contribution to K.
@@ -154,10 +210,9 @@ public:
     }
     /// Where the judge stands; it runs ahead of deferred transactions.
     [[nodiscard]] int64_t judgeCursor() const noexcept { return judgeCursor_; }
-    /// Gives the pool every overlay `txn` holds.  The leadership scan's begin and activate_ call it before the table is reset.
-    void releaseTxnOverlays(TxnJudgeState& txn) noexcept {
-        if (txnPool_ != nullptr) txn.releaseOverlays([&](int32_t i) { txnPool_->release(i); });
-    }
+    /// Gives the pool every overlay `txn` holds, and drops the judgement in progress.  The leadership scan's begin and activate_ call
+    /// it before the table is reset.
+    void releaseTxnOverlays(TxnJudgeState& txn) noexcept;
     [[nodiscard]] int32_t partition() const noexcept { return partition_; }
     [[nodiscard]] bool stalled() const noexcept { return stalled_; }
     /// Cold, the owner after growing the index: resumes a judge that stalled on a full index.  The other stalls stay.
@@ -215,6 +270,7 @@ public:
     void captureAppendedForTest(bool on) noexcept { captureAppended_ = on; }
     [[nodiscard]] uint64_t judgeCallsForTest() const noexcept { return judgeCalls_; }
     void holdJudgeForTest(bool hold) noexcept { held_ = hold; }
+    void failCapacityAtForTest(int64_t offset) noexcept { failCapacityAt_ = offset; }   // the chained prepare of that record stalls once (Capacity)
     [[nodiscard]] uint8_t lastIntentForTest() const noexcept { return lastIntent_; }
     [[nodiscard]] bool retiringForTest(uint64_t viewObjectId) const noexcept;
     [[nodiscard]] bool candidateForTest(uint64_t viewObjectId) const noexcept {
@@ -230,6 +286,8 @@ private:
         TestRejectRule              rule;
         rune::view::Prospect        prospect;
         uint8_t                     keyWidth = 0;   // KeyIndex: the wire key width of the source's key field
+        uint8_t                     slot = 0;       // the member's id in TxnOverlay keys, stable while it is a member
+        int32_t                     chainLive = 0;  // CapLiveKeys inside a chained judgement: the rows the chain added less those it erased
         bool                        retiring = false, leaving = false, candidate = false;
         int64_t                     leaveOffset = -1;
         std::vector<uint8_t>        planRecordPayload;   // the type-20 value requestChange appends when the member joins
@@ -245,13 +303,23 @@ private:
     void   syncMemberCursors_() noexcept;
     // Part 11 (P11-2): a transaction without a committed TxnJudge or marker stops the judge at its first record (TxnStop::Probe) until a
     // look-ahead finds one; an ordinary transaction stops it at its marker (TxnStop::Marker) to be applied there.
-    struct OrdinaryTxn { int64_t producerId; int64_t first; int64_t marker; bool commit; };
+    // `vote`: P11-7, -1 until the judge classifies it at the marker.
+    struct OrdinaryTxn { int64_t producerId; int64_t first; int64_t marker; bool commit; int8_t vote = -1; };
     struct TxnProbe { int64_t producerId = -1, first = -1, from = -1, waitAt = -1; };
     struct OwedMarker { int64_t producerId; int64_t judgeOffset; int64_t from; };   // a re-offered TxnJudge's marker, searched from `from`
-    struct TxnKey { rune::view::ViewKey key; int64_t last; bool superseded; };
-    struct TxnMarkerSeen { int64_t producerId; int64_t offset; bool commit; };
-    enum class TxnStop : uint8_t { None, Probe, Marker };
+    // Judge: the judge stands at a TxnJudge to judge (judgePid_).  Locked: a record touches a row a transaction holds (P11-4).
+    enum class TxnStop : uint8_t { None, Probe, Marker, Judge, Locked };
     enum class ProbeStep : uint8_t { Next, Classified, Wait };
+    // The transaction being judged at `end`, its TxnJudge (or its marker, P11-7): the chained read of [first, end), then the P11-3
+    // scan of (first, end), each from `from` and bounded per pass.  The overlay and its key set are kept across passes.
+    struct TxnJudgement {
+        int64_t       producerId = -1, first = -1, end = -1, from = -1;
+        int32_t       overlay = -1, records = 0;
+        bool          atMarker = false, scanning = false, done = false;
+        TxnVoteAnswer answer{};
+        int64_t       resolvePid = -1, resolveFrom = -1;   // the scan waits for this producer's marker past the end, searched from here
+    };
+    enum class ChainStep : uint8_t { Ok, Failed, Locked, Stalled };
     [[nodiscard]] bool txnBatchDeferred_(int64_t producerId, int64_t base, int32_t records) noexcept;
     template <class ReadRangeFn, class Fn>
     bool   walkBatches_(ReadRangeFn& readRange, int64_t from, int64_t to, Fn&& fn) noexcept;
@@ -264,12 +332,48 @@ private:
     void   pruneOwedMarkers_() noexcept;
     template <class ReadRangeFn>
     bool   applyOrdinary_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
-    void   collectTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId) noexcept;
-    void   compactTxnKeys_() noexcept;
-    [[nodiscard]] TxnKey* findTxnKey_(std::string_view key) noexcept;
+    void   collectTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId, TxnKeySet& keys) noexcept;
     void   checkSupersede_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId,
-                           const rune::view::AbortedTxnFilter& aborted) noexcept;
-    [[nodiscard]] bool applyTxnBatch_(const uint8_t* batch, std::size_t len) noexcept;
+                           const rune::view::AbortedTxnFilter& aborted, TxnKeySet& keys, int64_t& unknownPid) noexcept;
+    template <class ReadRangeFn>
+    bool   resolveMarkers_(ReadRangeFn& readRange, TxnKeySet& keys, int64_t& from, std::size_t budget, int64_t producerId) noexcept;
+    [[nodiscard]] bool applyTxnBatch_(const uint8_t* batch, std::size_t len, TxnKeySet& keys) noexcept;
+    [[nodiscard]] TxnKeySet& oneStepKeys_() noexcept { return txnPool_ != nullptr ? txnPool_->oneStep() : ownKeys_; }
+    template <class ReadRangeFn>
+    bool   judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
+    template <class ReadRangeFn>
+    bool   judgeAtMarker_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
+    template <class ReadRangeFn>
+    int8_t shouldHaveVoted_(ReadRangeFn& readRange, const OrdinaryTxn& o) noexcept;
+    template <class ReadRangeFn>
+    bool   runJudgement_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
+    template <class ReadRangeFn>
+    bool   finalizeLocked_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
+    template <class ReadRangeFn>
+    bool   applyTxnRecords_(ReadRangeFn& readRange, int64_t producerId, int64_t first, int64_t end, const rune::view::AbortedTxnFilter& aborted,
+                            int64_t& applied) noexcept;
+    template <class ReadRangeFn>
+    bool   rejectTxnRecords_(ReadRangeFn& readRange, int64_t producerId, int64_t first, int64_t end, const rune::view::AbortedTxnFilter& aborted) noexcept;
+    [[nodiscard]] bool beginJudgement_(int64_t producerId, int64_t first, int64_t end, bool atMarker) noexcept;
+    void   endJudgement_() noexcept;
+    [[nodiscard]] bool readTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, const rune::view::AbortedTxnFilter& aborted) noexcept;
+    [[nodiscard]] bool scanTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, const rune::view::AbortedTxnFilter& aborted) noexcept;
+    [[nodiscard]] ChainStep chainRecord_(const rune::view::SourceRecord& rec, rune::view::TxnOverlay& chain, rune::view::Verdict& failed) noexcept;
+    [[nodiscard]] bool judgeAtomic_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, bool keyZero) noexcept;
+    [[nodiscard]] bool applyRecord_(const rune::view::SourceRecord& rec) noexcept;
+    void   resetChainLive_() noexcept {
+        for (Member& m : members_) m.chainLive = 0;
+    }
+    void   refreshLocks_() noexcept {
+        txnLocks_ = txnPool_ != nullptr ? txnPool_->lockSetFor(sourceKey_) : rune::view::TxnLockSet{};
+    }
+    [[nodiscard]] const rune::view::TxnLockSet* lockSet_() const noexcept { return txnLocks_.count != 0 ? &txnLocks_ : nullptr; }
+    void   notePause_(int64_t offset) noexcept;
+    void   noteSupersedeWait_(const OrdinaryTxn& o, std::size_t keyCapacity) noexcept;   // cold: counted and logged once per marker
+    void   noteMarkerWithoutVote_(const OrdinaryTxn& o, bool applied) noexcept;          // cold
+    void   countVote_(const TxnVoteAnswer& a) noexcept;
+    [[nodiscard]] bool recordRejection_(int64_t offset, const rune::view::Verdict& v) noexcept;
+    void   countRejection_(const rune::view::Verdict& v) noexcept;
     [[nodiscard]] rune::view::SourceRecord recordOf_(const rune::protocol::RecordSpan& span) noexcept;
     int    emitMarkers_(PartitionWriteState& state, int64_t nowNs);
     int    pushCheckpoints_(PartitionWriteState& state);
@@ -282,7 +386,8 @@ private:
     void   stall_(StallReason reason) noexcept;
     void   waitForInstall_(const ConstraintSet& set) noexcept;
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
-    rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
+    rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec, rune::view::TxnOverlay* chain,
+                                       const rune::view::TxnLockSet* locks) noexcept;
     /// P6-13: a rejected record of a key-0 batch burns its id; a KeyExists on one is a reused id (counted and logged).
     void   noteKeyZeroRejection_(const rune::view::Verdict& v, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
@@ -330,11 +435,23 @@ private:
     TxnStop                     txnStop_ = TxnStop::None;
     std::size_t                 markerAt_ = 0;            // TxnStop::Marker: the entry of ordinary_ whose marker the judge stands at
     int64_t                     ordinaryApplied_ = -1;    // that entry's records below it are applied (a read failed mid-way)
+    // P11-3a: while that entry waits (resolveFor_ is its marker), the markers past it resolveMarkers_ found, below resolveFrom_
+    int64_t                     resolveFor_ = -1, resolveFrom_ = -1;
+    std::vector<TxnKeySet::Marker> resolved_;
+    int64_t                     failCapacityAt_ = -1;
     TxnProbe                    probe_;
     std::vector<OrdinaryTxn>    ordinary_;
     std::vector<OwedMarker>     owedMarkers_;
-    std::vector<TxnKey>         txnKeys_;
-    std::vector<TxnMarkerSeen>  txnMarkersSeen_;
+    std::size_t                 owedStart_ = 0;           // rotates each pass: one owed marker far behind never starves the rest
+    uint64_t                    sourceKey_ = 0;           // the overlays' source key: (topic, partition)
+    TxnKeySet                   ownKeys_;                 // the one-step key set while no pool is bound
+    rune::view::TxnLockSet      txnLocks_;
+    TxnJudgement                jx_;
+    int64_t                     judgePid_ = -1;           // TxnStop::Judge: the producer whose TxnJudge the judge stands at
+    int64_t                     overlayWaitAt_ = -1, supersedeWaitAt_ = -1, lockPausedAt_ = -1;   // each wait counted once
+    int64_t                     nowNs_ = 0, lockPausedNs_ = 0;
+    int64_t                     finalizePid_ = -1, finalizeApplied_ = -1;   // a commit finalized part-way (a read failed)
+    std::size_t                 voteScanBytes_ = kVoteScanBytesPerPass;
     VerdictViewHooks            hooks_;
     VerdictSourceStats          stats_;
     std::vector<uint8_t>        scratch_;
@@ -538,26 +655,50 @@ template <class ReadRangeFn>
 bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept {
     const OrdinaryTxn o = ordinary_[markerAt_];
     if (o.commit) {
-        txnKeys_.clear();
-        txnMarkersSeen_.clear();
+        TxnKeySet& keys = oneStepKeys_();
+        keys.clear();
         if (!walkBatches_(readRange, o.first, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
-                collectTxnBatch_(r, b, len, o.producerId);
+                collectTxnBatch_(r, b, len, o.producerId, keys);
                 return true;
             })) return false;
-        compactTxnKeys_();
-        if (!walkBatches_(readRange, o.first, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
-                checkSupersede_(r, b, len, o.producerId, aborted);
+        if (keys.keysOverflowed() || keys.markersOverflowed()) {   // T5 N2: an untracked key could be superseded; the judge waits, never misapplies
+            if (supersedeWaitAt_ != o.marker) noteSupersedeWait_(o, keys.keyCapacity());
+            return false;
+        }
+        if (resolveFor_ != o.marker) {
+            resolveFor_ = resolveFrom_ = o.marker;
+            resolved_.clear();
+        }
+        for (const TxnKeySet::Marker& m : resolved_) (void)keys.resolve(m.producerId, m.offset, m.commit);
+        int64_t unknownPid = -1;
+        const auto supersede = [&] {
+            unknownPid = -1;
+            return walkBatches_(readRange, o.first, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+                checkSupersede_(r, b, len, o.producerId, aborted, keys, unknownPid);
                 return true;
-            })) return false;
+            });
+        };
+        if (!supersede()) return false;
+        if (unknownPid >= 0) {   // a deferred transaction judged below the marker decides past it: the judge waits for that marker below the HW
+            const bool found = resolveMarkers_(readRange, keys, resolveFrom_, voteScanBytes_, unknownPid);
+            resolved_.clear();
+            for (const TxnKeySet::Marker& m : keys.markers())
+                if (m.offset > o.marker) resolved_.push_back(m);
+            if (keys.markersOverflowed()) {
+                if (supersedeWaitAt_ != o.marker) noteSupersedeWait_(o, keys.keyCapacity());
+                return false;
+            }
+            if (!found || !supersede() || unknownPid >= 0) return false;
+        }
         bool applied = true;
         if (!walkBatches_(readRange, std::max(o.first, ordinaryApplied_), o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
                 if (r.producerId() != o.producerId || (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) != rune::protocol::batch::kAttrTransactional) return true;
-                applied = applyTxnBatch_(b, len);
+                applied = applyTxnBatch_(b, len, keys);
                 return applied;
             }) || !applied) return false;
     }
     ordinary_.erase(ordinary_.begin() + static_cast<std::ptrdiff_t>(markerAt_));
-    ordinaryApplied_ = -1;
+    ordinaryApplied_ = resolveFor_ = -1;
     txnStop_ = TxnStop::None;
     judgeCursor_ = o.marker + 1;
     syncMemberCursors_();
@@ -570,8 +711,10 @@ template <class ReadRangeFn>
 void VerdictSource::feedOwedMarkers_(ReadRangeFn& readRange, int64_t bound) noexcept {
     pruneOwedMarkers_();
     std::size_t budget = kTxnProbeBytesPerPass;
-    for (OwedMarker& m : owedMarkers_) {
-        if (budget == 0) return;
+    const std::size_t n = owedMarkers_.size();
+    const std::size_t start = n == 0 ? 0 : owedStart_++ % n;
+    for (std::size_t k = 0; k < n && budget > 0; ++k) {
+        OwedMarker& m = owedMarkers_[(start + k) % n];
         (void)walkBatches_(readRange, m.from, bound, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
             if (owedMarkerBatch_(m, r, b, len)) return false;
             m.from = r.baseOffset() + r.lastOffsetDelta() + 1;
@@ -582,6 +725,206 @@ void VerdictSource::feedOwedMarkers_(ReadRangeFn& readRange, int64_t bound) noex
     pruneOwedMarkers_();
 }
 
+// P11-4 / P11-7: the chained read of [first, end), then the P11-3 scan of (first, end), each at most voteScanBytes_ per pass and
+// resuming where it stopped.  True: jx_ is answered.
+template <class ReadRangeFn>
+bool VerdictSource::runJudgement_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept {
+    if (jx_.done) return true;
+    std::size_t budget = voteScanBytes_;
+    bool stop = false;   // the answer, a pause or a stall
+    const auto walk = [&](auto&& batchFn) {
+        budget = voteScanBytes_;
+        return walkBatches_(readRange, jx_.from, jx_.end, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+            if (!batchFn(r, b, len)) { stop = true; return false; }
+            jx_.from = r.baseOffset() + r.lastOffsetDelta() + 1;
+            budget -= std::min(budget, len);
+            return budget > 0;
+        });
+    };
+    if (!jx_.scanning) {
+        const bool read = walk([&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) { return readTxnBatch_(r, b, len, aborted); });
+        if (stop || !read || budget == 0) return jx_.done;
+        jx_.scanning = true;
+        jx_.from = jx_.first + 1;
+        jx_.resolveFrom = jx_.end;
+    }
+    if (jx_.resolvePid >= 0) {
+        TxnKeySet& keys = txnPool_->keysAt(jx_.overlay);
+        if (!resolveMarkers_(readRange, keys, jx_.resolveFrom, voteScanBytes_, jx_.resolvePid)) return false;
+        jx_.resolvePid = -1;
+    }
+    const bool read = walk([&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) { return scanTxnBatch_(r, b, len, aborted); });
+    if (!stop && read && budget > 0) jx_.done = true;   // no conflict: yes
+    return jx_.done;
+}
+
+// The markers past the end of a key set's range that decide its pending TxnJudges, from `from` to the HW, at most `budget` bytes.
+// True: `producerId`'s is noted (any producer's with -1: none is pending), or the marker list overflowed.
+template <class ReadRangeFn>
+bool VerdictSource::resolveMarkers_(ReadRangeFn& readRange, TxnKeySet& keys, int64_t& from, std::size_t budget, int64_t producerId) noexcept {
+    namespace cm = rune::storage::control_marker;
+    constexpr int16_t kTxnControl = rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl;
+    const auto done = [&] { return keys.markersOverflowed() || (producerId < 0 ? !keys.pending() : !keys.awaits(producerId)); };
+    if (done()) return true;
+    bool found = false;
+    (void)walkBatches_(readRange, from, passHw_, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+        if ((r.attributes() & kTxnControl) == kTxnControl)
+            if (const int type = cm::controlType(b, len); type != cm::kUnparseable && keys.resolve(r.producerId(), r.baseOffset(), type == cm::kCommit)) found = done();
+        from = r.baseOffset() + r.lastOffsetDelta() + 1;
+        budget -= std::min(budget, len);
+        return !found && budget > 0;
+    });
+    return found;
+}
+
+// P11-4: the judge stands at T's TxnJudge.  A yes locks T's rows in the overlay; a no releases it.  True: judged, the judge passed J.
+template <class ReadRangeFn>
+bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept {
+    DeferredTxn& t = *state_->txn.find(judgePid_);
+    if (jx_.atMarker || jx_.producerId != t.producerId || jx_.end != t.judgeOffset) {
+        if (!beginJudgement_(t.producerId, t.firstOffset, t.judgeOffset, false)) return false;
+        t.overlay = jx_.overlay;
+        t.phase = TxnPhase::Judging;
+    }
+    if (!runJudgement_(readRange, aborted)) return false;
+    t.answer = jx_.answer;
+    t.judged = true;
+    countVote_(t.answer);
+    if (t.answer.code == 0) {
+        t.phase = TxnPhase::Locked;
+    } else {
+        txnPool_->release(t.overlay);
+        t.overlay = -1;
+        t.phase = TxnPhase::Finalized;
+    }
+    endJudgement_();
+    judgeCursor_ = t.judgeOffset + 1;
+    txnStop_ = TxnStop::None;
+    syncMemberCursors_();
+    return true;
+}
+
+// P11-1 (a), (b) or (c) on the log: a committed transaction without a TxnJudge that should have voted (1), or not (0).  -1: the
+// intent search's read failed, the transaction stays unclassified.
+template <class ReadRangeFn>
+int8_t VerdictSource::shouldHaveVoted_(ReadRangeFn& readRange, const OrdinaryTxn& o) noexcept {
+    const auto constrained = [](const ConstraintSet& s) {
+        return std::any_of(s.members.begin(), s.members.begin() + s.count, [](const ConstraintSetMember& m) {
+            return m.kind == rune::view::VerdictViewKind::Unique || m.kind == rune::view::VerdictViewKind::Check || m.kind == rune::view::VerdictViewKind::TestReject;
+        });
+    };
+    if (constrained(*state_->constraintSets.setAt(o.first)) || state_->isConstrainedSource()) return 1;
+    bool intent = false;
+    if (!walkBatches_(readRange, o.first, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+        if (r.producerId() != o.producerId || (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) != rune::protocol::batch::kAttrTransactional) return true;
+        (void)rune::protocol::forEachRecordSpan(b, len, [&](const rune::protocol::RecordSpan& span) { intent = intent || rune::protocol::record::intentOf(span.attributes) != 0; });
+        return !intent;
+    })) return -1;
+    return intent ? 1 : 0;
+}
+
+// P11-7: T committed without a TxnJudge and should have voted.  It is judged at its marker, all or nothing: a pass applies it, a
+// failure rejects every record of it.  Either way counted and logged.
+template <class ReadRangeFn>
+bool VerdictSource::judgeAtMarker_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept {
+    const OrdinaryTxn o = ordinary_[markerAt_];
+    if (!jx_.atMarker || jx_.producerId != o.producerId || jx_.end != o.marker) {
+        if (!beginJudgement_(o.producerId, o.first, o.marker, true)) return false;
+    }
+    if (!runJudgement_(readRange, aborted)) return false;
+    if (jx_.answer.code == 0 ? !applyTxnRecords_(readRange, o.producerId, o.first, o.marker, aborted, ordinaryApplied_)
+                             : !rejectTxnRecords_(readRange, o.producerId, o.first, o.marker, aborted))
+        return false;
+    noteMarkerWithoutVote_(o, jx_.answer.code == 0);
+    txnPool_->release(jx_.overlay);
+    endJudgement_();
+    ordinary_.erase(ordinary_.begin() + static_cast<std::ptrdiff_t>(markerAt_));
+    ordinaryApplied_ = -1;
+    txnStop_ = TxnStop::None;
+    judgeCursor_ = o.marker + 1;
+    syncMemberCursors_();
+    return true;
+}
+
+// T's records in [max(first, applied), end), through every member's normal path.  `applied` keeps the progress when a read fails.
+template <class ReadRangeFn>
+bool VerdictSource::applyTxnRecords_(ReadRangeFn& readRange, int64_t producerId, int64_t first, int64_t end, const rune::view::AbortedTxnFilter& aborted,
+                                     int64_t& applied) noexcept {
+    bool ok = true;
+    return walkBatches_(readRange, std::max(first, applied), end, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+        const int16_t attrs = r.attributes();
+        if (r.producerId() != producerId || (attrs & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) != rune::protocol::batch::kAttrTransactional ||
+            aborted.skips(r, attrs)) return true;
+        (void)rune::protocol::forEachRecordSpan(b, len, [&](const rune::protocol::RecordSpan& span) {
+            if (!ok || span.offset < applied) return;
+            ok = applyRecord_(recordOf_(span));
+            if (ok) applied = span.offset + 1;
+        });
+        return ok;
+    }) && ok;
+}
+
+// P11-7's failure: every record of T in [first, end) goes into the index (cold, out of order), with the judgement's answer.
+template <class ReadRangeFn>
+bool VerdictSource::rejectTxnRecords_(ReadRangeFn& readRange, int64_t producerId, int64_t first, int64_t end, const rune::view::AbortedTxnFilter& aborted) noexcept {
+    const auto each = [&](auto&& fn) {
+        return walkBatches_(readRange, first, end, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+            const int16_t attrs = r.attributes();
+            if (r.producerId() != producerId || (attrs & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) != rune::protocol::batch::kAttrTransactional ||
+                aborted.skips(r, attrs)) return true;
+            (void)rune::protocol::forEachRecordSpan(b, len, fn);
+            return true;
+        });
+    };
+    std::size_t n = 0;
+    if (!each([&](const rune::protocol::RecordSpan&) { ++n; })) return false;
+    if (state_->rejected.size() + n > state_->rejected.capacity()) {
+        stall_(StallReason::Full);
+        return false;
+    }
+    std::array<int64_t, 256> run{};
+    std::size_t used = 0;
+    const rune::view::Verdict v{jx_.answer.code, jx_.answer.constraintId};
+    const auto flush = [&] {
+        (void)state_->rejected.insertRun(std::span<const int64_t>(run.data(), used), v.code, v.constraintId);   // fits: checked above
+        used = 0;
+    };
+    if (!each([&](const rune::protocol::RecordSpan& span) {
+            run[used++] = span.offset;
+            countRejection_(v);
+            if (used == run.size()) flush();
+        })) return false;
+    flush();
+    judgedRecord_ = true;
+    return true;
+}
+
+// P11-4: every Locked transaction whose marker is below the HW, before any further judging: a commit re-applies its records through
+// each member's normal path in this one step, an abort only gives the overlay back.  False: a read failed or the judge stalled.
+template <class ReadRangeFn>
+bool VerdictSource::finalizeLocked_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept {
+    bool any = false;
+    while (DeferredTxn* t = state_->txn.lockedDecided(passHw_)) {
+        if (t->commit) {
+            if (finalizePid_ != t->producerId) {
+                finalizePid_ = t->producerId;
+                finalizeApplied_ = -1;
+            }
+            if (!applyTxnRecords_(readRange, t->producerId, t->firstOffset, t->judgeOffset, aborted, finalizeApplied_)) return false;
+        }
+        txnPool_->release(t->overlay);
+        t->overlay = -1;
+        t->phase = TxnPhase::Finalized;
+        finalizePid_ = finalizeApplied_ = -1;
+        any = true;
+    }
+    if (any) {
+        refreshLocks_();
+        syncMemberCursors_();
+    }
+    return true;
+}
+
 template <class ReadRangeFn>
 int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t nowNs, PartitionWriteState& state,
                               const rune::view::AbortedTxnFilter& aborted) {
@@ -590,6 +933,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     int work = 0;
     if (needsActivation_) { activate_(state); ++work; }
     passHw_ = bound;
+    nowNs_ = nowNs;
     if (!owedMarkers_.empty()) feedOwedMarkers_(readRange, bound);
     state.txn.finalizeDecided(judgeCursor_, bound);
     rejectedThisPass_ = 0;
@@ -609,7 +953,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     const bool ready = activeSet_.count == active_.size() || reindex_();
     if (!ready) {
         waitForInstall_(activeSet_);
-    } else if (!behind) {
+    } else if (!behind && finalizeLocked_(readRange, aborted)) {
         const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX ? INT64_MAX : emitFrom_ + checkpointCap_);
         while (!stalled_) {
             const int64_t A = state.constraintSets.nextChangeAtOrAfter(setFrom_);
@@ -634,12 +978,20 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
                 ++work;
                 continue;
             }
-            if (txnStop_ == TxnStop::Marker) {
-                if (!applyOrdinary_(readRange, aborted)) break;
+            if (txnStop_ == TxnStop::Judge) {
+                if (!judgeTxn_(readRange, aborted)) break;
                 ++work;
                 continue;
             }
-            if (judgeCursor_ == before) break;
+            if (txnStop_ == TxnStop::Marker) {
+                OrdinaryTxn& o = ordinary_[markerAt_];
+                if (o.vote < 0) o.vote = !o.commit || txnPool_ == nullptr ? 0 : shouldHaveVoted_(readRange, o);   // TODO(Task 7): no pool, no P11-7
+                if (o.vote < 0) break;
+                if (!(o.vote == 1 ? judgeAtMarker_(readRange, aborted) : applyOrdinary_(readRange, aborted))) break;
+                ++work;
+                continue;
+            }
+            if (txnStop_ == TxnStop::Locked || judgeCursor_ == before) break;
         }
         state.rejected.noteCovered(judgedThrough());
     }

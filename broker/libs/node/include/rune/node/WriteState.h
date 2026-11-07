@@ -211,7 +211,8 @@ struct TxnJudgeStats {
              txnOverlayWaits = 0, lockPauses = 0, checkpointBackfills = 0, vetoedCheckpointPushes = 0,
              judgeRecordRefusals = 0,   ///< a TxnJudge the table refused (full, or the producer's entry holds an overlay): the judge waits
              ordinaryWaits = 0,         ///< an ordinary transaction the judge could not track (its table full): the judge waits
-             supersedeKeysOverflow = 0; ///< an ordinary transaction with more keys than the P11-3a scan tracks: the rest apply unchecked
+             supersedeKeysOverflow = 0, ///< an ordinary transaction with more keys or markers than the P11-3a scan tracks: the judge waits at its marker
+             undecidedReplaceRefusals = 0; ///< a producer's next TxnJudge refused while its previous transaction has no marker
 };
 struct DeferredTxn {
     int64_t     producerId = -1;
@@ -222,6 +223,7 @@ struct DeferredTxn {
     bool        explicitIntent = false;
     TxnPhase    phase = TxnPhase::Scanning;
     TxnVoteAnswer answer{};
+    bool        judged = false;   ///< `answer` is the judge's, not a default
     int32_t     overlay = -1;
     int64_t     voteReceivedNs = 0;
 };
@@ -246,11 +248,16 @@ public:
         return nullptr;
     }
     /// A producer's next transaction replaces its previous entry; a full table gives up its oldest Finalized one.  nullptr: the judge
-    /// waits (the previous entry holds an overlay, or every entry is live).  A record at or below the producer's entry is a re-feed.
+    /// waits (the previous entry holds an overlay or has no marker yet, or every entry is live).  A record at or below the producer's
+    /// entry is a re-feed.
     DeferredTxn* onJudgeRecord(int64_t judgeOffset, const rune::storage::control_record::TxnJudgeRecord& r) noexcept {
         if (DeferredTxn* old = find(r.producerId)) {
             if (old->judgeOffset >= judgeOffset) return old;
             if (old->overlay >= 0) return nullptr;
+            if (old->markerOffset < 0) {   // undecided: dropping it would let K pass a transaction nothing applies
+                ++stats.undecidedReplaceRefusals;
+                return nullptr;
+            }
             txns_.erase(txns_.begin() + (old - txns_.data()));
         }
         if (txns_.size() >= kMaxTxns) {
@@ -285,6 +292,7 @@ public:
             t.phase = TxnPhase::AwaitJudge;
             t.overlay = -1;
             t.answer = {};
+            t.judged = false;
             t.records = 0;
         }
     }
@@ -302,6 +310,12 @@ public:
         for (DeferredTxn& t : txns_)
             if (t.phase == TxnPhase::AwaitJudge && t.markerOffset >= 0 && t.markerOffset < hw && t.judgeOffset < judgeCursor) t.phase = TxnPhase::Finalized;
     }
+    /// The first Locked entry whose marker is below `hw`: the judge finalizes it (P11-4).
+    [[nodiscard]] DeferredTxn* lockedDecided(int64_t hw) noexcept {
+        for (DeferredTxn& t : txns_)
+            if (t.phase == TxnPhase::Locked && t.markerOffset >= 0 && t.markerOffset < hw) return &t;
+        return nullptr;
+    }
     /// INT64_MAX = none.
     [[nodiscard]] int64_t earliestUndecidedFirst() const noexcept {
         int64_t first = INT64_MAX;
@@ -315,14 +329,15 @@ public:
         parked_.push_back(v);
         return true;
     }
-    /// fn(const ParkedVote&, const DeferredTxn&) for every parked vote whose transaction is Locked or Finalized; those votes leave the park.
+    /// fn(const ParkedVote&, const DeferredTxn&) for every parked vote whose transaction the judge answered (Locked, or Finalized by a
+    /// judgement); those votes leave the park.
     template <class Fn>
     int drainAnswered(Fn&& fn) noexcept {
         int n = 0;
         std::size_t kept = 0;
         for (std::size_t i = 0; i < parked_.size(); ++i) {
             const DeferredTxn* t = find(parked_[i].producerId);
-            if (t != nullptr && (t->phase == TxnPhase::Locked || t->phase == TxnPhase::Finalized)) {
+            if (t != nullptr && t->judged && (t->phase == TxnPhase::Locked || t->phase == TxnPhase::Finalized)) {
                 fn(parked_[i], *t);
                 ++n;
             } else {

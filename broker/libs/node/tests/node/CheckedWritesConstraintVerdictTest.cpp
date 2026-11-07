@@ -597,3 +597,66 @@ TEST(CheckedWritesConstraintVerdictRegression, JudgedUniqueClaimsSurviveRestartR
         EXPECT_EQ(bytesAt(back->claims->extrasTable(), wk, K + 2 * W + 1 + rowLen), bytesAt(judged->claims->extrasTable(), wk, K + 2 * W + 1 + rowLen)) << id;
     }
 }
+
+// Part 11 F11: inside a transaction a check's grandfathering (the predicate's columns unchanged) reads the before-image through the
+// chain (what an in-order fold would hold), not the table.  Id 1 is grandfathered at -1 in the table.
+TEST(CheckedWritesConstraintVerdictRegression, ChainedCheckReadsTheBeforeImageThroughTheChainRegression) {
+    Rig r;
+    Mem& m = r.view("create view lp key characterId as select lastPlayed from character constraint nonneg check (lastPlayed >= 0);", 11);
+    (void)r.put({r.character(1, 1, "a", 0, -1)});   // replayed unjudged: grandfathered
+    r.start();
+    ASSERT_EQ(m.value(1, "lastPlayed"), -1);
+    ASSERT_EQ(r.put1(r.character(1, 1, "a", 3, -1)), (V{0, 0})) << "outside a transaction the table's -1 grandfathers";
+    rv::Prospect p;
+    p.reserve(m.inst->layout, nullptr);
+    rv::TxnOverlay chain;
+    chain.reserve(64, m.inst->table.rowLen());
+    const ConstraintFold check{m.inst->plan, m.inst->layout, m.inst->table};
+    const auto judge = [&](const Rec& rec) {
+        const rv::SourceRecord s{rec.key, sv(rec.value), 100, rec.intent, nullptr};
+        rv::ProjectionFold f = projectionFoldOf(*m.inst);
+        EXPECT_EQ(rv::prepareProjection(f, s, p, &chain), rv::PrepareStatus::Ok);
+        const rv::Verdict v = evaluateConstraints(check, s, p);
+        return V{v.code, v.constraintId};
+    };
+    // The chain repaired the row while the table holds -1: going back to -1 changes the chain's 5.
+    EXPECT_EQ(judge(r.character(1, 1, "a", 0, 5)), (V{0, 0}));
+    EXPECT_EQ(judge(r.character(1, 1, "a", 4, -1)), (V{kViolation, 0x000B0001})) << "the chain's prior image is 5, not the table's -1";
+    // The chain erased the row while the table still holds it: the recreate is no grandfathered update.
+    chain.clear();
+    EXPECT_EQ(judge(Rig::tombstone(1)), (V{0, 0}));
+    EXPECT_EQ(judge(r.character(1, 1, "a", 4, -1)), (V{kViolation, 0x000B0001})) << "no prior image in the chain";
+    // The chain created the row the table lacks: its update reads the chain's image.
+    chain.clear();
+    EXPECT_EQ(judge(r.character(2, 1, "b", 0, 5)), (V{0, 0}));
+    EXPECT_EQ(judge(r.character(2, 1, "b", 4, 5)), (V{0, 0}));
+    EXPECT_EQ(judge(r.character(2, 1, "b", 4, -1)), (V{kViolation, 0x000B0001}));
+    EXPECT_EQ(m.value(1, "lastPlayed"), -1) << "a chain changes no table";
+    EXPECT_EQ(m.row(2), nullptr);
+}
+
+// Part 11 F11 on the aggregate path: user 7 is grandfathered at 13 characters.  Inside a chain that deleted one of them, a create
+// changes the chain's 12 to 13: rejected, though the table's 13 equals the new 13.
+TEST(CheckedWritesConstraintVerdictRegression, ChainedAggregateCheckReadsTheBeforeImageThroughTheChainRegression) {
+    Rig r;
+    Mem& m = r.view(kAccountStats, 8);
+    (void)r.put(creates(r, 7, 13, 1));   // replayed unjudged: grandfathered
+    r.start();
+    ASSERT_EQ(m.value(7, "characters"), 13);
+    ASSERT_EQ(r.put1(r.character(1, 7, "renamed")), (V{0, 0})) << "outside a transaction the unchanged count grandfathers";
+    rv::Prospect p;
+    p.reserve(m.inst->layout, &m.inst->agg->layout);
+    rv::TxnOverlay chain;
+    chain.reserve(64, std::max(m.inst->table.rowLen(), 64u));
+    const ConstraintFold check{m.inst->plan, m.inst->layout, m.inst->table};
+    const auto judge = [&](const Rec& rec) {
+        const rv::SourceRecord s{rec.key, sv(rec.value), 100, rec.intent, nullptr};
+        rv::AggregateFold f = aggregateFoldOf(*m.inst);
+        EXPECT_EQ(rv::prepareAggregate(f, s, p, &chain), rv::PrepareStatus::Ok);
+        const rv::Verdict v = evaluateConstraints(check, s, p);
+        return V{v.code, v.constraintId};
+    };
+    EXPECT_EQ(judge(Rig::tombstone(2)), (V{0, 0}));
+    EXPECT_EQ(judge(r.character(100, 7, "new")), (V{kViolation, kStatsId})) << "the chain's prior image is 12, not the table's 13";
+    EXPECT_EQ(m.value(7, "characters"), 13) << "a chain changes no table";
+}

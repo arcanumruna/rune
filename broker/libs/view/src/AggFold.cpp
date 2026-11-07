@@ -861,8 +861,14 @@ PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospe
             row.key = ViewKey::fromU64(g);
         }
         bool chainErased = false;
-        const bool inChain = chain != nullptr && row.key.len != 0 && chain->get(f.member, OverlayTable::View, row.key, chainErased) != nullptr;
-        row.existed = inChain || (!chainErased && f.view.get(row.key) != nullptr);
+        const uint8_t* held = chain != nullptr && row.key.len != 0 ? chain->get(f.member, OverlayTable::View, row.key, chainErased) : nullptr;
+        const uint8_t* cur = held != nullptr ? held : chainErased ? nullptr : f.view.get(row.key);
+        row.existed = cur != nullptr;
+        if (chain != nullptr && cur != nullptr) {   // F11: chainRecord overwrites a held image in place
+            uint8_t* b = p.before.data() + static_cast<std::size_t>(&row - p.rows.data()) * p.rowLen;
+            std::memcpy(b, cur, p.rowLen);
+            row.before = b;
+        }
         const RowOverlay::Slot* s = ov.find(T::View, g);
         row.removed = s == nullptr || s->erased;
         row.image   = row.removed ? nullptr : ov.imageOf(T::View, s);
@@ -878,6 +884,7 @@ PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospe
             break;
     }
     if (chain != nullptr) {
+        p.chained = true;
         chainRecord(f, ov, groupsT, groupIdsT, *chain);
         if (x.locked) return PrepareStatus::Locked;
         if (chain->full()) return PrepareStatus::CapacityExhausted;
