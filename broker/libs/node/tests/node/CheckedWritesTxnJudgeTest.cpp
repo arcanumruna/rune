@@ -109,6 +109,40 @@ TEST(CheckedWritesTxnState, FullTableReusesAFinalizedEntryRegression) {
     EXPECT_EQ(t.onJudgeRecord(6000, {6000, 1, 5000}), nullptr) << "an overlay-holding entry is never reused";
 }
 
+// N2: a Finalized entry whose vote is still parked is not reused.
+TEST(CheckedWritesTxnState, FullTableKeepsAFinalizedEntryWithAParkedVoteRegression) {
+    auto t = reserved();
+    for (std::size_t i = 0; i < TxnJudgeState::kMaxTxns; ++i) {
+        DeferredTxn* e = t.onJudgeRecord(static_cast<int64_t>(i) + 10, {static_cast<int64_t>(i), 1, static_cast<int64_t>(i)});
+        ASSERT_NE(e, nullptr);
+        e->phase = TxnPhase::Finalized;
+    }
+    ASSERT_TRUE(t.parkVote({1, 0, 0, 1}));
+    ASSERT_NE(t.onJudgeRecord(5000, {5000, 1, 4000}), nullptr);
+    EXPECT_NE(t.find(0), nullptr);
+    EXPECT_EQ(t.find(1), nullptr) << "the next finalized entry went instead";
+    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn&) {}), 1);
+}
+
+// F6: a rescan judges the kept entries anew; a Finalized entry whose marker was cut away is undecided again.
+TEST(CheckedWritesTxnState, TruncateResetsTheKeptEntriesRegression) {
+    auto t = reserved();
+    DeferredTxn* e = t.onJudgeRecord(500, {77, 3, 400});
+    ASSERT_NE(e, nullptr);
+    t.onMarker(77, 620, true);
+    e->phase = TxnPhase::Finalized;
+    e->overlay = 3;
+    e->records = 9;
+    e->answer.code = 5;
+    t.truncateFrom(600);
+    EXPECT_EQ(e->markerOffset, -1);
+    EXPECT_EQ(e->phase, TxnPhase::AwaitJudge);
+    EXPECT_EQ(e->overlay, -1);
+    EXPECT_EQ(e->records, 0);
+    EXPECT_EQ(e->answer.code, 0);
+    EXPECT_EQ(t.earliestUndecidedFirst(), 400);
+}
+
 // F5: a producer's next J waits for the overlay of its previous transaction; a re-fed older J changes nothing.
 TEST(CheckedWritesTxnState, ReplaceNeverDropsAnOverlayHolderRegression) {
     auto t = reserved();
@@ -261,4 +295,30 @@ TEST(CheckedWritesTxnState, ReadyAppendAndScannedMarkersReachTheFeedRegression) 
     rc.onMarker(78, 7, true);
     EXPECT_EQ(s.txn.find(78)->markerOffset, 7);
     EXPECT_TRUE(s.txn.find(78)->commit);
+}
+
+// N1: a rescan that keeps the state re-feeds the earlier transaction's marker; it must not decide the producer's open newer one.
+TEST(CheckedWritesTxnState, RescanNeverGivesANewerTxnAnOlderMarkerRegression) {
+    ScanLog l;
+    l.appendJudge(77, 0);
+    l.append(rune::transaction::ControlMarker::build(77, 0, rune::transaction::ControlType::Commit, 1));
+    l.appendJudge(77, 2);
+    PartitionWriteState s;
+    RcState rc;
+    rc.reserve(8);
+    rc.setVerdictHooks(txnHooks(s));
+    RcFacts f;
+    f.leader = true; f.epoch = 1;
+    for (int i = 0; i < 16 && !rc.ready(); ++i) (void)rc.advance(f, &l.log, 1);
+    ASSERT_TRUE(rc.ready());
+    ASSERT_EQ(s.txn.earliestUndecidedFirst(), 2);
+    f.leadershipGeneration = 2;
+    (void)rc.advance(f, &l.log, 1);
+    ASSERT_TRUE(rc.scanning());
+    for (int i = 0; i < 16 && !rc.ready(); ++i) (void)rc.advance(f, &l.log, 1);
+    ASSERT_TRUE(rc.ready());
+    ASSERT_NE(s.txn.find(77), nullptr);
+    EXPECT_EQ(s.txn.find(77)->judgeOffset, 2);
+    EXPECT_EQ(s.txn.find(77)->markerOffset, -1);
+    EXPECT_EQ(s.txn.earliestUndecidedFirst(), 2);
 }

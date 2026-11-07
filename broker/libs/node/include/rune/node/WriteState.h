@@ -251,7 +251,7 @@ public:
             txns_.erase(txns_.begin() + (old - txns_.data()));
         }
         if (txns_.size() >= kMaxTxns) {
-            const auto done = std::find_if(txns_.begin(), txns_.end(), [](const DeferredTxn& t) { return t.phase == TxnPhase::Finalized && t.overlay < 0; });
+            const auto done = std::find_if(txns_.begin(), txns_.end(), [&](const DeferredTxn& t) { return t.phase == TxnPhase::Finalized && t.overlay < 0 && !hasParked_(t.producerId); });
             if (done == txns_.end()) return nullptr;
             txns_.erase(done);
         }
@@ -266,17 +266,23 @@ public:
     /// Records the marker; only the judge moves the phase.
     void onMarker(int64_t producerId, int64_t offset, bool commit) noexcept {
         DeferredTxn* t = find(producerId);
-        if (t == nullptr || t->markerOffset >= 0) return;
+        if (t == nullptr || t->markerOffset >= 0 || offset < t->judgeOffset) return;   // below the J: the producer's earlier transaction
         t->markerOffset = offset;
         t->commit = commit;
     }
-    /// Leadership scan begin: nothing at or above `offset` is known any more.  The owner released every overlay of this state first.
+    /// Leadership scan begin: nothing at or above `offset` is known any more, and the entries kept are judged anew.  The owner released
+    /// every overlay of this state first.
     void truncateFrom(int64_t offset) noexcept {
         while (!txns_.empty() && txns_.back().judgeOffset >= offset) txns_.pop_back();
         for (DeferredTxn& t : txns_) {
-            if (t.markerOffset < offset) continue;
-            t.markerOffset = -1;
-            t.commit = false;
+            if (t.markerOffset >= offset) {
+                t.markerOffset = -1;
+                t.commit = false;
+            }
+            t.phase = TxnPhase::AwaitJudge;
+            t.overlay = -1;
+            t.answer = {};
+            t.records = 0;
         }
     }
     /// INT64_MAX = none.
@@ -318,6 +324,10 @@ public:
     TxnJudgeStats stats;
 
 private:
+    [[nodiscard]] bool hasParked_(int64_t producerId) const noexcept {
+        return std::any_of(parked_.begin(), parked_.end(), [&](const ParkedVote& v) { return v.producerId == producerId; });
+    }
+
     std::vector<DeferredTxn> txns_;
     std::vector<ParkedVote>  parked_;
 };
