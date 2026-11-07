@@ -495,13 +495,11 @@ private:
             for (uint64_t i = 0; i < n; ++i) aborted_.insert(a->baseOffset + static_cast<int64_t>(i));
     }
 
-    // What a raw and a push-read subscription from 0 deliver: the accepted records with their intents, and the aborted transactions' (they are in the log).
+    // What a raw and a push-read subscription from 0 deliver: the accepted records with their intents.  Never an aborted
+    // transaction's: read_uncommitted on a verdict source is served as read_committed (P11-10).
     void checkDelivered_(const CheckedWritesModel& model, const std::set<int64_t>& present) {
-        std::vector<VerdictRig::RigLogRec> aborted;
-        for (const int64_t off : aborted_)
-            if (const auto it = data_.find(off); it != data_.end()) aborted.push_back(it->second);
-        checkDelivered(rig_, model, rig_.subscribe(SubKind::Raw, 0), false, &present, &aborted);
-        checkDelivered(rig_, model, rig_.subscribe(SubKind::PushRead, 0), false, &present, &aborted);
+        checkDelivered(rig_, model, rig_.subscribe(SubKind::Raw, 0), false, &present);
+        checkDelivered(rig_, model, rig_.subscribe(SubKind::PushRead, 0), false, &present);
     }
 
     // IntentVerdictsExact: every 56 / 57 ever reported (an ack, the index or a marker) is the model's, and a record an ack reported as
@@ -1000,13 +998,11 @@ private:
         return out;
     }
 
-    // What a raw and a push-read subscription from 0 deliver: the accepted records with their intents, and the aborted transactions' (they are in the log).
+    // What a raw and a push-read subscription from 0 deliver: the accepted records with their intents.  Never an aborted
+    // transaction's: read_uncommitted on a verdict source is served as read_committed (P11-10).
     void checkDelivered_(const CheckedWritesModel& model, const std::set<int64_t>& present) {
-        std::vector<VerdictRig::RigLogRec> aborted;
-        for (const int64_t off : aborted_)
-            if (const auto it = data_.find(off); it != data_.end()) aborted.push_back(it->second);
-        checkDelivered(rig_, model, rig_.subscribe(SubKind::Raw, 0), false, &present, &aborted);
-        checkDelivered(rig_, model, rig_.subscribe(SubKind::PushRead, 0), false, &present, &aborted);
+        checkDelivered(rig_, model, rig_.subscribe(SubKind::Raw, 0), false, &present);
+        checkDelivered(rig_, model, rig_.subscribe(SubKind::PushRead, 0), false, &present);
     }
 
     // IntentVerdictsExact: every 56 / 57 ever reported (an ack, the index or a marker) is the model's, and a record an ack reported as

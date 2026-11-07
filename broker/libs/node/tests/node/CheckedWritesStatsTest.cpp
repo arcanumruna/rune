@@ -47,6 +47,13 @@ Entries expectedTopic(VerdictRig& r, std::vector<std::pair<uint32_t, uint64_t>>*
         }
         e.emplace_back(10, static_cast<int64_t>(r.autoIncStats().idsBurned));
     }
+    if (w->verdicts != nullptr) {   // Part 11: the vote counters of a verdict source
+        const TxnJudgeStats& t = w->txn.stats;
+        for (const auto& [id, v] : {std::pair<uint16_t, uint64_t>{11, t.votesYes}, {12, t.votesNo}, {13, t.votesNoConstraint}, {14, t.votesNoKeyExists},
+                                    {15, t.votesNoKeyNotFound}, {16, t.votesNoTooLarge}, {17, t.voteLatencyNsMax}, {18, t.voteLatencyNsTotal},
+                                    {19, t.foldPausedOnTxnLockNs}, {20, t.markerWithoutVote}})
+            e.emplace_back(id, static_cast<int64_t>(v));
+    }
     return e;
 }
 
@@ -139,8 +146,8 @@ TEST_P(StatsCell, ServesExactlyTheCountersThatExist) {
     EXPECT_EQ(reply.constraints, wantConstraints);
     for (std::size_t i = 1; i < reply.stats.size(); ++i) EXPECT_LT(reply.stats[i - 1].first, reply.stats[i].first) << "ids ascend";
     switch (cell.object) {
-    case StatsObject::KeyIndex:   EXPECT_EQ(reply.stats.size(), 7u); break;
-    case StatsObject::AutoInc:    EXPECT_EQ(reply.stats.size(), 10u); break;
+    case StatsObject::KeyIndex:   EXPECT_EQ(reply.stats.size(), 17u); break;
+    case StatsObject::AutoInc:    EXPECT_EQ(reply.stats.size(), 20u); break;
     case StatsObject::Projection: EXPECT_EQ(reply.stats.size(), 4u); break;
     default:                      EXPECT_TRUE(reply.stats.empty()) << "a plain or untyped topic keeps no counter"; break;
     }
@@ -164,7 +171,7 @@ TEST(CheckedWritesStats, KeyIndexCountersAfterRejections) {
     ASSERT_TRUE(r.driveUntilJudged());
 
     const auto reply = r.getStats(pc::StatsScope::TopicPartition, VerdictRig::kSrc, 0);
-    ASSERT_EQ(reply.stats.size(), 7u);
+    ASSERT_EQ(reply.stats.size(), 17u);
     const VerdictSourceStats* st = r.worker->verdictStatsForTest(VerdictRig::kSrc, 0);
     ASSERT_NE(st, nullptr);
     EXPECT_EQ(reply.stats[0], (std::pair<uint16_t, int64_t>{1, 1}));
@@ -253,7 +260,7 @@ TEST(CheckedWritesStatsRegression, FollowerNeverAnswersStaleCountersRegression) 
     ASSERT_TRUE(r.driveUntilJudged());
     const auto before = r.getStats(pc::StatsScope::TopicPartition, VerdictRig::kSrc, 0);
     ASSERT_FALSE(before.notLeader);
-    ASSERT_EQ(before.stats.size(), 7u);
+    ASSERT_EQ(before.stats.size(), 17u);
 
     r.demote();
     const auto after = r.getStats(pc::StatsScope::TopicPartition, VerdictRig::kSrc, 0);

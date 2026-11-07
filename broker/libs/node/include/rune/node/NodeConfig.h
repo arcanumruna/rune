@@ -25,6 +25,8 @@
 // Election timing (all optional; defaults are fast-but-safe for co-located clusters):
 //   RUNE_ELECTION_TIMEOUT_MS        — int64 ms, default 150. Max wait per election round.
 //   RUNE_VERDICT_INTERVAL_MS        — int64 ms, default 100. How often a verdict source writes a marker for accepted-only progress.
+//   RUNE_TXN_JUDGED_RECORDS_MAX     — int32 in [1, 1048576], default 4096. The most records of one partition a transaction may
+//                                     have judged; a larger one is voted TxnTooLarge (62).
 //   RUNE_ELECTION_STATUS_INTERVAL_MS — int64 ms, default 20. Canvass/heartbeat cadence.
 //   RUNE_STARTUP_CANVASS_TIMEOUT_MS — int64 ms, default 100. Extended canvass on first boot.
 //   RUNE_MIN_ISR                    — int32, minimum ISR size for acks=All gate. Default:
@@ -330,6 +332,8 @@ struct NodeConfig {
     // Increase for cross-datacenter deployments.
     int64_t electionTimeoutMs        = 150;  // default 150 ms
     int64_t verdictIntervalMs        = 100;  // RUNE_VERDICT_INTERVAL_MS (checked writes SD14)
+    int32_t txnJudgedRecordsMax      = 4096; // RUNE_TXN_JUDGED_RECORDS_MAX (checked writes P11-1)
+    static constexpr int32_t kTxnJudgedRecordsMaxCeiling = 1'048'576;
     int64_t electionStatusIntervalMs =  20;  // default  20 ms
     int64_t startupCanvassTimeoutMs  = 100;  // default 100 ms
 

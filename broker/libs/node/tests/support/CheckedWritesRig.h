@@ -219,7 +219,7 @@ public:
         std::vector<std::pair<std::string, uint64_t>> ints;
         std::vector<std::pair<std::string, std::string>> strs;
     };
-    [[nodiscard]] std::vector<uint8_t> sourceBatch(std::span<const SrcRecord> recs, int64_t pid = -1, int32_t seq = -1, bool txn = false) const {
+    [[nodiscard]] std::vector<uint8_t> sourceBatch(std::span<const SrcRecord> recs, int64_t pid = -1, int32_t seq = -1, bool txn = false, bool atomic = false) const {
         const rune::codec::Descriptor& d = *customSrc_;
         rune::protocol::RecordBatchBuilder b(0, 1000);
         if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
@@ -243,25 +243,131 @@ public:
             }
             b.append(key, {reinterpret_cast<const char*>(val.data()), val.size()}, 1000, r.intent);
         }
-        return b.build();
+        std::vector<uint8_t> out = b.build();
+        if (atomic) setBatchAttribute(out, rune::protocol::batch::kAttrAtomic);
+        return out;
+    }
+    /// ORs `bit` into a built batch's attributes and re-seals its CRC.
+    static void setBatchAttribute(std::vector<uint8_t>& b, int16_t bit) {
+        namespace pb = rune::protocol::batch;
+        const auto attrs = static_cast<uint16_t>(rune::protocol::detail::getLE16(b.data() + pb::kAttributesOffset) | static_cast<uint16_t>(bit));
+        b[pb::kAttributesOffset] = static_cast<uint8_t>(attrs);
+        b[pb::kAttributesOffset + 1] = static_cast<uint8_t>(attrs >> 8);
+        const uint32_t crc = rune::protocol::crc32c(b.data() + pb::kAttributesOffset, b.size() - static_cast<std::size_t>(pb::kAttributesOffset));
+        for (int i = 0; i < 4; ++i) b[static_cast<std::size_t>(pb::kCrcOffset + i)] = static_cast<uint8_t>(crc >> (i * 8));
     }
     /// A Produce frame of source records (enableAcks() first); returns its correlation id.
-    int64_t appendRecords(std::span<const SrcRecord> recs, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1, bool txn = false) {
-        return produceBytes(sourceBatch(recs, pid, seq, txn), wireAcks, pid, seq);
+    int64_t appendRecords(std::span<const SrcRecord> recs, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1, bool txn = false, bool atomic = false) {
+        return produceBytes(sourceBatch(recs, pid, seq, txn, atomic), wireAcks, pid, seq);
     }
     [[nodiscard]] static SrcRecord srcOf(const Char& c) {
         return SrcRecord{c.id, c.intent, c.tombstone, {{"userId", c.userId}, {"gender", c.gender}, {"lastPlayed", static_cast<uint64_t>(c.lastPlayed)}}, {{"name", c.name}}};
     }
-    int64_t appendCharacters(std::span<const Char> chars, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1) {
+    int64_t appendCharacters(std::span<const Char> chars, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1, bool txn = false, bool atomic = false) {
         std::vector<SrcRecord> recs;
         for (const Char& c : chars) recs.push_back(srcOf(c));
-        return appendRecords(recs, wireAcks, pid, seq);
+        return appendRecords(recs, wireAcks, pid, seq, txn, atomic);
     }
     struct Entry { uint64_t id = 0; uint64_t account = 0; int64_t amount = 0; std::string memo; bool tombstone = false; };
-    int64_t appendEntries(std::span<const Entry> entries, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1) {
+    int64_t appendEntries(std::span<const Entry> entries, uint8_t wireAcks, int64_t pid = -1, int32_t seq = -1, bool txn = false, bool atomic = false) {
         std::vector<SrcRecord> recs;
         for (const Entry& e : entries) recs.push_back(SrcRecord{e.id, 0, e.tombstone, {{"account", e.account}, {"amount", static_cast<uint64_t>(e.amount)}}, {{"memo", e.memo}}});
-        return appendRecords(recs, wireAcks, pid, seq);
+        return appendRecords(recs, wireAcks, pid, seq, txn, atomic);
+    }
+    /// A transaction's batch the way a previous leader wrote it: this node takes it by replication and leads again (the produce
+    /// path refuses a transaction on a constrained source, and an intent in one, until Part 11 Task 12).  Returns its base offset.
+    int64_t appendTxnReplicated(std::vector<uint8_t> batch) {
+        const int64_t base = leo();
+        demote();
+        replicate({std::move(batch)});
+        promote();
+        for (int i = 0; i < kMaxPass && worker->writeStateForTest(kSrc, tuning_.partition) == nullptr; ++i) pass();
+        return base;
+    }
+
+    // ---- Part 11 (contract addition 19): votes and the ends of transactions ----
+    struct VoteReply { int16_t errorCode = 0; uint16_t code = 0; uint32_t constraintId = 0; int64_t failingOffset = -1; int64_t judgeOffset = -1; };
+    /// A coordinator's vote request for (pid, epoch) on this partition; one pass.  Returns its token.
+    int64_t sendVote(int32_t topicId, int64_t pid, int16_t epoch) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::TxnVote; op.topicId = topicId; op.partition = tuning_.partition; op.replica = replica.get();
+        op.logPtr = log.get(); op.correlationId = ++voteToken_; op.producerId = pid; op.producerEpoch = epoch; op.sessionId = -1;
+        op.targetReplicaId = replica->registryId(); op.incarnation = replica->incarnation();
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+        pass();
+        return voteToken_;
+    }
+    [[nodiscard]] std::optional<VoteReply> voteReply(int64_t token) const {
+        const auto it = voteReplies_.find(token);
+        return it == voteReplies_.end() ? std::nullopt : std::optional<VoteReply>(it->second);
+    }
+    [[nodiscard]] std::size_t voteRepliesOf(int64_t token) const { return static_cast<std::size_t>(voteReplyCount_.count(token) ? voteReplyCount_.at(token) : 0); }
+    /// Passes (the follower fetching every 8th) until the vote is answered.
+    [[nodiscard]] bool driveUntilVoted(int64_t token, int cap = 2000) {
+        for (int i = 0; i < cap; ++i) {
+            if (voteReplies_.count(token) != 0) return true;
+            if (isr_.size() > 1 && i % 8 == 0) followerFetch();
+            pass();
+        }
+        return voteReplies_.count(token) != 0;
+    }
+    struct TxnEnd { bool committed = false; std::vector<std::pair<int32_t, VoteReply>> votes; };
+    /// Votes, then writes the commit marker on a yes, the abort marker otherwise.
+    TxnEnd commitTxn(int64_t pid) {
+        TxnEnd end;
+        const int64_t tok = sendVote(kSrc, pid, 0);
+        EXPECT_TRUE(driveUntilVoted(tok)) << "the vote was never answered";
+        const auto r = voteReply(tok);
+        if (r) end.votes.emplace_back(kSrc, *r);
+        end.committed = r && r->errorCode == 0 && r->code == 0;
+        marker(pid, end.committed);
+        return end;
+    }
+    /// The base offset the ControlRecordAppended answer of `pid`'s marker carried (nullopt: not answered yet).
+    [[nodiscard]] std::optional<int64_t> markerAnswer(int64_t pid) const {
+        const auto it = markerAnswers_.find(9000 + pid);
+        return it == markerAnswers_.end() ? std::nullopt : std::optional<int64_t>(it->second);
+    }
+    void clearMarkerAnswer(int64_t pid) { markerAnswers_.erase(9000 + pid); }
+    /// Runs `fn` after every pass from now on (test only).
+    void onEveryPass(std::function<void()> fn) { everyPass_ = std::move(fn); }
+    /// The offsets of the TxnJudge records (type 19) in the log.
+    [[nodiscard]] std::vector<int64_t> txnJudgeOffsetsInLog() const {
+        std::vector<int64_t> out;
+        for (int64_t off = 0; off < leo();) {
+            const auto v = log->readView(off, 1 << 20);
+            if (v.empty()) break;
+            for (std::size_t p = 0; p + 12 <= v.len;) {
+                int32_t blen = 0;
+                std::memcpy(&blen, v.data + p + 8, 4);
+                const std::size_t total = 12 + static_cast<std::size_t>(blen);
+                if (p + total > v.len) break;
+                if (rune::storage::control_record::recordType(v.data + p, total) == rune::storage::control_record::kTxnJudge)
+                    out.push_back(rune::protocol::RecordBatchReader(v.data + p, total).baseOffset());
+                p += total;
+            }
+            off = v.nextOffset;
+        }
+        return out;
+    }
+    /// One int64 (or unsigned) output slot of a constrained view's row at `key` (nullopt: no row).
+    [[nodiscard]] std::optional<int64_t> viewInt64(int32_t viewTopicId, uint64_t key, uint16_t outSlot = 0) {
+        const auto c = std::find_if(constrained.begin(), constrained.end(), [&](const auto& kv) { return kv.second.topicId == viewTopicId; });
+        if (c == constrained.end()) { ADD_FAILURE() << "no constrained view " << viewTopicId; return std::nullopt; }
+        const ViewInstance* inst = vs->instanceForTest(viewTopicId, tuning_.partition);
+        const uint8_t* row = inst != nullptr ? inst->table.get(key) : nullptr;
+        if (row == nullptr) return std::nullopt;
+        const auto f = rune::view::readSlot(row, c->second.comp.rowLayout, outSlot);
+        return f.type == rune::codec::PrimType::Int64 ? f.i : static_cast<int64_t>(f.u);
+    }
+    /// The output slot of `column` in a constrained view's row.
+    [[nodiscard]] uint16_t outSlotOf(int32_t viewTopicId, const char* column) const {
+        for (const auto& [v, live] : constrained)
+            if (live.topicId == viewTopicId)
+                for (std::size_t i = 0; i < live.comp.outputDescriptor.fields.size(); ++i)
+                    if (live.comp.outputDescriptor.fields[i].name == column) return static_cast<uint16_t>(i);
+        ADD_FAILURE() << "no column " << column;
+        return 0;
     }
 
     struct ConstrainedLive { int32_t topicId; rune::view::CompileResult comp; };
@@ -656,7 +762,9 @@ public:
             if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
             else if (r.type == WorkerReturn::Type::ViewRowResult || r.type == WorkerReturn::Type::ViewScanResult) viewAnswers_.push_back(std::move(r));
             else if (r.type == WorkerReturn::Type::StatsResult) statsAnswers_.push_back(std::move(r));
+            else noteTxnReturn_(r);
         }, [](const TxnReturn&) {});
+        if (everyPass_) everyPass_();
         if (agent) { if (!pauseAgent) (void)agent->doWork(now); }
         else channel.deltas.drain([this](int32_t, aeron::concurrent::AtomicBuffer& buf, OneToOneByteRing::index_t off, OneToOneByteRing::index_t) {
             int32_t viewTopicId;
@@ -907,6 +1015,7 @@ public:
                 worker->drainReturn([&](WorkerReturn r) {
                     if (r.type == WorkerReturn::Type::PushReadResult) { chunk.assign(r.chunkBytes().begin(), r.chunkBytes().end()); next = r.newNextOffset; }
                     if (r.type == WorkerReturn::Type::ProduceResult) produceAnswers.push_back(r.errorCode);
+                    noteTxnReturn_(r);
                 }, [](const TxnReturn&) {});
                 absorb_(box, chunk.data(), chunk.size());
                 cursors_[subId] = next;
@@ -1388,6 +1497,19 @@ private:
     std::optional<rune::codec::Descriptor> customSrc_;   ///< useSource(): the source's schema
     std::vector<WorkerReturn> viewAnswers_;
     std::vector<WorkerReturn> statsAnswers_;
+    int64_t voteToken_ = 70'000;
+    std::map<int64_t, VoteReply> voteReplies_;
+    std::map<int64_t, int> voteReplyCount_;
+    std::map<int64_t, int64_t> markerAnswers_;   ///< ControlRecordAppended: correlation id -> base offset (or -1 - errorCode)
+    std::function<void()> everyPass_;
+    void noteTxnReturn_(const WorkerReturn& r) {
+        if (r.type == WorkerReturn::Type::TxnVoteResult) {
+            voteReplies_[r.correlationId] = VoteReply{r.errorCode, static_cast<uint16_t>(r.recordCount), static_cast<uint32_t>(r.newNextOffset), r.baseOffset, r.lastOffset};
+            ++voteReplyCount_[r.correlationId];
+        } else if (r.type == WorkerReturn::Type::ControlRecordAppended) {
+            markerAnswers_[r.correlationId] = r.errorCode == 0 ? r.baseOffset : -1 - r.errorCode;
+        }
+    }
     bool keyIndexOn_ = false, holdJudge_ = false;
     int delayedSpecIn_ = 0;
     std::filesystem::path viewDir_, logDir_;

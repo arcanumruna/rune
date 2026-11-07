@@ -68,15 +68,24 @@ void change(Log& log, int64_t off, bool nonEmpty) {
     log.append(b, off);
 }
 
+void txnJudge(Log& log, int64_t off, int64_t producerId, int64_t first) {
+    std::vector<uint8_t> b(cr::kTxnJudgeBatchBytes);
+    (void)cr::buildTxnJudge(b, cr::TxnJudgeRecord{producerId, 0, first});
+    stampBase(b, off);
+    log.append(b, off);
+}
+
 enum class Path { Range, RangeCoalesce };
 
 // One pass over the sealed region.  Returns the pass end.
-int64_t clean(Log& log, Path path, int64_t verdictBound, int64_t markerEnd, int64_t markerRemovalBound = kMax, int64_t nowMs = 1'000'000) {
+int64_t clean(Log& log, Path path, int64_t verdictBound, int64_t markerEnd, int64_t markerRemovalBound = kMax, int64_t nowMs = 1'000'000,
+              int64_t txnJudgeBound = 0) {
     auto bases = log.segmentBaseOffsets();
     const int64_t active = bases.back();
     LogCleaner cleaner;
     cleaner.setMarkerRemovalBound(markerRemovalBound);
     cleaner.setVerdictBounds(verdictBound, markerEnd);
+    cleaner.setTxnJudgeBound(txnJudgeBound);
     bases.pop_back();
     std::vector<int64_t> sizes(bases.size(), 1);
     SkimpyOffsetMap map(1024);
@@ -434,6 +443,44 @@ TEST(CheckedWritesVerdictCleanerRegression, MarkerKeptUntilEveryReplicaFetchedIt
         EXPECT_TRUE(hasBatchAt(log, 5)) << "the last marker is the coverage";
     }
     std::filesystem::remove_all(dir);
+}
+
+// Part 11: a TxnJudge is what a member checkpoint taken during run-ahead replays its transaction from; the cleaner keeps it until the
+// worker's published bound passed it, then removes it like any other control record (stamped, dropped at the horizon).
+TEST(CheckedWritesVerdictCleanerRegression, TxnJudgeKeptUntilEveryMemberCheckpointPassedItRegression) {
+    const auto dir = tempDir();
+    {
+        Log log(dir.string(), 1);
+        log.recover();
+        change(log, 0, true);
+        data(log, 1, "pad1", "p");
+        data(log, 2, "pad2", "p");
+        txnJudge(log, 3, 77, 1);
+        marker(log, 4, 1, 4, {});
+        for (int64_t o = 5; o < 9; ++o) data(log, o, "pad" + std::to_string(o), "p");
+        marker(log, 9, 4, 9, {});
+        for (int64_t o = 10; o < 13; ++o) data(log, o, "pad" + std::to_string(o), "p");
+        const int64_t t0 = 1'000'000;
+        clean(log, Path::Range, kMax, 13, kMax, t0, /*txnJudgeBound=*/3);
+        clean(log, Path::Range, kMax, 13, kMax, t0 + 5000, /*txnJudgeBound=*/3);
+        EXPECT_TRUE(hasBatchAt(log, 3)) << "a member checkpoint may still replay from J: kept";
+        clean(log, Path::Range, kMax, 13, kMax, t0, /*txnJudgeBound=*/4);
+        ASSERT_TRUE(hasBatchAt(log, 3)) << "stamped, not dropped";
+        clean(log, Path::Range, kMax, 13, kMax, t0 + 5000, /*txnJudgeBound=*/4);
+        EXPECT_FALSE(hasBatchAt(log, 3)) << "dropped at the horizon once the bound passed it";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(CheckedWritesVerdictCleaner, TxnJudgeFollowsItsBound) {
+    VerdictCleanState s;
+    EXPECT_TRUE(s.keepsControlRecord(10, cr::kTxnJudge)) << "no bound published: kept";
+    s.setTxnJudgeBound(10);
+    EXPECT_TRUE(s.keepsControlRecord(10, cr::kTxnJudge));
+    s.setTxnJudgeBound(11);
+    EXPECT_FALSE(s.keepsControlRecord(10, cr::kTxnJudge));
+    s.clear();
+    EXPECT_FALSE(s.keepsControlRecord(10, cr::kTxnJudge)) << "the bound is the cleaner's, set per pass";
 }
 
 namespace {

@@ -58,7 +58,7 @@ private:
     uint16_t           constraintCount_ = 0;
 };
 
-/// Ids 1-10 of one led topic partition; `state` is nullptr for an untyped topic.
+/// Ids 1-20 of one led topic partition; `state` is nullptr for an untyped topic.
 inline void collectTopicPartitionStats(const PartitionWriteState* state, const rune::replication::PartitionReplica& replica,
                                        StatsSink& sink) noexcept {
     using rune::protocol::client::StatId;
@@ -82,6 +82,19 @@ inline void collectTopicPartitionStats(const PartitionWriteState* state, const r
             sink.add(StatId::autoIncrementReservedThrough, reserved == 0 ? 0 : static_cast<int64_t>(autoIncId(reserved, a.partitions(), a.partition())));
         }
         sink.add(StatId::autoIncrementIdsBurned, static_cast<int64_t>(state->autoIncStats.idsBurned));
+    }
+    if (state->isVerdictSource()) {   // ids 11-20 (Part 11): the source's transaction votes
+        const TxnJudgeStats& t = state->txn.stats;
+        sink.add(StatId::txnVotesYes, static_cast<int64_t>(t.votesYes));
+        sink.add(StatId::txnVotesNo, static_cast<int64_t>(t.votesNo));
+        sink.add(StatId::txnVotesNoConstraintViolation, static_cast<int64_t>(t.votesNoConstraint));
+        sink.add(StatId::txnVotesNoKeyExists, static_cast<int64_t>(t.votesNoKeyExists));
+        sink.add(StatId::txnVotesNoKeyNotFound, static_cast<int64_t>(t.votesNoKeyNotFound));
+        sink.add(StatId::txnVotesNoTxnTooLarge, static_cast<int64_t>(t.votesNoTooLarge));
+        sink.add(StatId::txnVoteLatencyNsMax, static_cast<int64_t>(t.voteLatencyNsMax));
+        sink.add(StatId::txnVoteLatencyNsTotal, static_cast<int64_t>(t.voteLatencyNsTotal));
+        sink.add(StatId::foldPausedOnTxnLockNs, static_cast<int64_t>(t.foldPausedOnTxnLockNs));
+        sink.add(StatId::txnMarkerWithoutVote, static_cast<int64_t>(t.markerWithoutVote));
     }
 }
 
