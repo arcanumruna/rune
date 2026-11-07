@@ -698,9 +698,9 @@ TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNoth
             }
             allocs = w.count();
         }
+        windowRejections += r.stats()->rejectionsConstraint - before;
         r.passes(1);
         if (round % 50 == 0) (void)r.collect(raw);
-        windowRejections += r.stats()->rejectionsConstraint - before;
         const auto a = r.ack(c);
         EXPECT_TRUE(a && a->code == 0) << "round " << round;
         if (a) settle(sent, *a);
