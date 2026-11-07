@@ -9,8 +9,6 @@
 the transient tasks (version growth across rebirth, eviction floor and carry, follower floor, re-grant after rebirth)
 and changes those refusals. Task 1 is unaffected.
 
-**Build note (sandbox):** a full Debug build with debug info needs about 40 GB; configure with
-`-DCMAKE_CXX_FLAGS_DEBUG=-g0` (asserts stay on) and build with `-j3` (more jobs run out of memory).
 
 **Goal:** A **lease topic** is a typed, keyed, compacted topic in which every live key **is** a lease with etcd v3
 semantics: granted only when the key has no live lease (no takeover), kept alive by `LeaseKeepAlive` requests served
