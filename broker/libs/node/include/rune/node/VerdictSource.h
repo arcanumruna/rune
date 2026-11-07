@@ -245,6 +245,13 @@ public:
         for (const OrdinaryTxn& o : ordinary_) through = std::min(through, o.first);
         return through;
     }
+    /// P11-8 (c): the lowest checkpoint a persisted member restarts from; a replay from it backfills from the TxnJudges at or above it.
+    [[nodiscard]] int64_t checkpointFloor() const noexcept {
+        int64_t floor = INT64_MAX;
+        for (const Member& m : members_)
+            if (m.inst->persisted && m.inst->lastDurableO >= 0) floor = std::min(floor, m.inst->lastDurableO);
+        return floor;
+    }
     /// Where the judge stands; it runs ahead of deferred transactions.
     [[nodiscard]] int64_t judgeCursor() const noexcept { return judgeCursor_; }
     /// Gives the pool every overlay `txn` holds, and drops the judgement in progress.  The leadership scan's begin and activate_ call
@@ -333,6 +340,8 @@ private:
         int32_t                     chainLive = 0;  // CapLiveKeys inside a chained judgement: the rows the chain added less those it erased
         bool                        retiring = false, leaving = false, candidate = false;
         int64_t                     leaveOffset = -1;
+        // P11-8 (a): the cursor its replay began at, and the TxnJudge it backfilled last there; the cursor of its last push
+        int64_t                     replayFrom = -1, backfilledAt = -1, pushedAt = -1;
         std::vector<uint8_t>        planRecordPayload;   // the type-20 value requestChange appends when the member joins
     };
 
@@ -342,6 +351,13 @@ private:
     int    replayCandidates_(ReadRangeFn& readRange, int64_t bound, const rune::view::AbortedTxnFilter& aborted);
     void   activate_(PartitionWriteState& state);
     int    replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted);
+    template <class ReadRangeFn>
+    int    replayMember_(ReadRangeFn& readRange, Member& m, int64_t bound, const rune::view::AbortedTxnFilter& aborted);
+    template <class ReadRangeFn>
+    bool   backfill_(ReadRangeFn& readRange, Member& m, const rune::storage::control_record::TxnJudgeRecord& j, int64_t judgeOffset,
+                     const rune::view::AbortedTxnFilter& aborted) noexcept;
+    [[nodiscard]] bool runsAheadAt_(int64_t cursor) const noexcept;
+    [[nodiscard]] int64_t runAheadFrom_() const noexcept;
     int    judgeBatches_(const rune::storage::LogReadView& view, int64_t limit, int64_t hardLimit, const rune::view::AbortedTxnFilter& aborted);
     void   syncMemberCursors_() noexcept;
     // Part 11 (P11-2): a transaction without a committed TxnJudge or marker stops the judge at its first record (TxnStop::Probe) until a
@@ -359,7 +375,8 @@ private:
         int64_t       producerId = -1, first = -1, end = -1, from = -1;
         int32_t       overlay = -1, records = 0;
         bool          atMarker = false, scanning = false, done = false;
-        bool          ended = false;          // the producer's own marker lies in (first, end): T ended before its TxnJudge
+        int64_t       endedAt = -1;           // the producer's own marker in (first, end): T ended there, before its TxnJudge
+        bool          endedCommit = false;
         uint64_t      members = 0;            // membersEpoch_ at the start: a member change restarts the judgement
         int32_t       cap = 0;                // the record cap in effect at the start (the key set holds that many)
         TxnVoteAnswer answer{};
@@ -670,10 +687,76 @@ int VerdictSource::replayCandidates_(ReadRangeFn& readRange, int64_t bound, cons
     int work = 0;
     for (Member& m : members_) {
         if (!m.candidate || !checkpointSettled(*m.inst) || !clampToLogStart_(m) || m.inst->foldCursor >= judgeCursor_) continue;
-        const rune::storage::LogReadView v = readRange(m.inst->foldCursor, std::max(bound, judgeCursor_ + 1));
-        if (!v.empty()) work += replay_(m, v, judgeCursor_, aborted);
+        work += replayMember_(readRange, m, bound, aborted);
     }
     return work;
+}
+
+// A member's unjudged replay to the judge's cursor.  P11-8 (a): a checkpoint pushed while the judge ran ahead of a deferred
+// transaction holds none of its records, so when the replay from O meets a TxnJudge whose firstOffset < O it stops there and
+// backfills the transaction: its records below J, in order.  Every fold keeps one row or contribution per source key, so a record
+// the replay folded at or above O sets the same one again, and a key T rewrites above O ends at T's last record (P11-3 keeps other
+// writers' later records out).
+template <class ReadRangeFn>
+int VerdictSource::replayMember_(ReadRangeFn& readRange, Member& m, int64_t bound, const rune::view::AbortedTxnFilter& aborted) {
+    namespace proto = rune::protocol;
+    ViewInstance& inst = *m.inst;
+    if (m.replayFrom < 0 || inst.foldCursor < m.replayFrom) {   // a discard refolds from below: nothing there is backfilled
+        m.replayFrom = inst.foldCursor;
+        m.backfilledAt = -1;
+    }
+    // A read stops at the next segment base at or above its end: a compacted gap whose next segment starts at judgeCursor_ reads
+    // empty to judgeCursor_, and still to the bound when judgeCursor_ == bound.  So read to the bound and at least one past it.
+    const rune::storage::LogReadView v = readRange(inst.foldCursor, std::max(bound, judgeCursor_ + 1));
+    if (v.empty()) return 0;
+    int64_t upTo = judgeCursor_;
+    cr::TxnJudgeRecord j{};
+    for (std::size_t pos = 0; pos < v.len;) {
+        const proto::RecordBatchReader r(v.data + pos, v.len - pos);
+        if (!r.ensureValid() || r.baseOffset() >= upTo) break;
+        const auto len = static_cast<std::size_t>(r.totalLength());
+        if ((r.attributes() & (proto::batch::kAttrControl | proto::batch::kAttrTransactional)) == proto::batch::kAttrControl && len == cr::kTxnJudgeBatchBytes &&
+            r.baseOffset() >= inst.foldCursor && r.baseOffset() > m.backfilledAt)
+            if (const auto p = cr::parseTxnJudge(v.data + pos, len); p && p->firstOffset < m.replayFrom) {
+                upTo = r.baseOffset();
+                j = *p;
+            }
+        pos += len;
+    }
+    int work = replay_(m, v, upTo, aborted);
+    if (upTo < judgeCursor_ && inst.foldCursor == upTo && backfill_(readRange, m, j, upTo, aborted)) {
+        m.backfilledAt = upTo;
+        ++state_->txn.stats.checkpointBackfills;
+        ++work;
+    }
+    if (inst.foldCursor >= judgeCursor_) m.replayFrom = m.backfilledAt = -1;
+    return work;
+}
+
+// The backfill of j's transaction into the member, through its normal path.  An aborted one applies nothing; one not decided yet
+// waits (false), and so does a read that came back short.
+template <class ReadRangeFn>
+bool VerdictSource::backfill_(ReadRangeFn& readRange, Member& m, const cr::TxnJudgeRecord& j, int64_t judgeOffset,
+                              const rune::view::AbortedTxnFilter& aborted) noexcept {
+    namespace proto = rune::protocol;
+    if (const DeferredTxn* t = state_->txn.find(j.producerId); t != nullptr && t->judgeOffset == judgeOffset && t->phase != TxnPhase::Finalized) return false;
+    bool ok = true;
+    return walkBatches_(readRange, j.firstOffset, judgeOffset, [&](const proto::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+        const int16_t attrs = r.attributes();
+        if (r.producerId() != j.producerId || (attrs & (proto::batch::kAttrTransactional | proto::batch::kAttrControl)) != proto::batch::kAttrTransactional ||
+            aborted.skips(r, attrs)) return true;
+        (void)proto::forEachRecordSpan(b, len, [&](const proto::RecordSpan& span) {
+            if (!ok || state_->rejected.isRejected(span.offset)) return;
+            const rune::view::SourceRecord rec = recordOf_(span);
+            if (prepare_(m, rec, nullptr, nullptr) == rune::view::PrepareStatus::CapacityExhausted) {
+                stall_(StallReason::Capacity);
+                ok = false;
+                return;
+            }
+            apply_(m, rec);
+        });
+        return ok;
+    }) && ok;
 }
 
 // fn(reader, batch, len) for every batch with an offset in [from, to); fn returns false to stop.  False: a read came back short.
@@ -908,9 +991,11 @@ bool VerdictSource::judgeTxn_(ReadRangeFn& readRange, const rune::view::AbortedT
         t.phase = TxnPhase::Judging;
     }
     if (!runJudgement_(readRange, aborted)) return false;
-    if (jx_.ended) {   // T ended before its J (abort before J): decided from the log, nothing to judge; a parked vote is answered NotLeader
+    if (jx_.endedAt >= 0) {   // T ended before its J (abort before J): decided from the log, nothing to judge; a parked vote is answered NotLeader
         txnPool_->release(t.overlay);
         t.overlay = -1;
+        t.markerOffset = jx_.endedAt;   // decided, as endsBeforeJudge_ decides it: the producer's next TxnJudge is accepted
+        t.commit = jx_.endedCommit;
         t.phase = TxnPhase::Finalized;
         endJudgement_();
         judgeCursor_ = t.judgeOffset + 1;
@@ -1076,11 +1161,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
         if (!checkpointSettled(*m.inst)) continue;   // behind (below): the judge neither folds nor passes it
         if (!clampToLogStart_(m)) continue;   // below the log start with rows: discarded, unsettled until the backup is acked
         if (m.inst->foldCursor >= judgeCursor_) continue;
-        // A read stops at the next segment base at or above its end: a compacted gap whose next segment starts at
-        // judgeCursor_ reads empty to judgeCursor_, and still to the bound when judgeCursor_ == bound.  So read to the
-        // bound and at least one past judgeCursor_.
-        const rune::storage::LogReadView v = readRange(m.inst->foldCursor, std::max(bound, judgeCursor_ + 1));
-        if (!v.empty()) work += replay_(m, v, judgeCursor_, aborted);
+        work += replayMember_(readRange, m, bound, aborted);
     }
     bool behind = false;
     for (const std::size_t i : active_) behind = behind || !checkpointSettled(*members_[i].inst) || members_[i].inst->foldCursor < judgeCursor_;
@@ -1088,10 +1169,12 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     if (!ready) {
         waitForInstall_(activeSet_);
     } else if (!behind && finalizeLocked_(readRange, aborted)) {
-        // The checkpoint cap holds the judge at the markers' coverage plus the cap, except while an undecided transaction holds K:
-        // then the markers wait for it, and the judge must run ahead to its J or marker.
-        const bool held = judgedThrough() < judgeCursor_;
-        const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX || held ? INT64_MAX : emitFrom_ + checkpointCap_);
+        // The checkpoint cap holds the judge at the markers' coverage plus the cap.  While a deferred transaction holds K the markers
+        // wait for it and the judge runs ahead, the members pushing there (P11-8 (a)): the cap counts from their last push.  An
+        // ordinary one is applied at its marker, which the judge must reach.
+        const bool ordinaryHolds = std::any_of(ordinary_.begin(), ordinary_.end(), [&](const OrdinaryTxn& o) { return o.first < judgeCursor_; });
+        const int64_t capFrom = judgedThrough() < judgeCursor_ ? runAheadFrom_() : emitFrom_;
+        const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX || ordinaryHolds ? INT64_MAX : capFrom + checkpointCap_);
         while (!stalled_) {
             const int64_t A = state.constraintSets.nextChangeAtOrAfter(setFrom_);
             if (A != INT64_MAX && judgeCursor_ > A) {

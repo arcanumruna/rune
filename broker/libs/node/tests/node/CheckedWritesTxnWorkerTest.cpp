@@ -6,6 +6,8 @@
 #include <rune/protocol/client/StatsMessages.h>
 
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 
 using namespace rune::node;
 using namespace rune::node::cw;
@@ -350,7 +352,11 @@ TEST(CheckedWritesTxnWorker, JudgeLostInAFailoverIsJudgedAgainRegression) {
     ASSERT_EQ(k.r.txnJudgeOffsetsInLog().size(), 1u);
     const int64_t lost = k.r.txnJudgeOffsetsInLog()[0];
     ASSERT_FALSE(k.r.voteReply(tok));
-    k.r.failover();
+    const int64_t hw = k.r.replica->highWatermark();
+    k.r.demote();   // another replica takes over: the parked vote is answered NotLeader, not lost
+    ASSERT_TRUE(k.r.voteReply(tok));
+    EXPECT_EQ(k.r.voteReply(tok)->errorCode, kNotLeader);
+    k.r.restart(true, hw);   // the failover: the tail above the HW is gone
     k.r.passes(30);
     EXPECT_TRUE(k.r.txnJudgeOffsetsInLog().empty()) << "J was above the HW";
     const auto v = k.vote(48);
@@ -358,4 +364,276 @@ TEST(CheckedWritesTxnWorker, JudgeLostInAFailoverIsJudgedAgainRegression) {
     EXPECT_EQ(v.code, 0);
     EXPECT_EQ(k.r.txnJudgeOffsetsInLog(), std::vector<int64_t>{v.judgeOffset});
     EXPECT_EQ(v.judgeOffset, lost) << "the new J lands where the lost one was";
+}
+
+// The vote's scan appends J only once the transaction's last batch is below the HW: a J above an uncommitted batch could judge
+// records a failover drops.
+TEST(CheckedWritesTxnWorker, VoteWaitsForTheHw) {
+    Ki k(/*follower=*/true);
+    k.txn(53, {ins(1)});
+    k.r.followerFetch();
+    (void)k.r.produceFrame({ups(2)}, kLeader, 53, 1, /*txn=*/true);   // its last batch, above the HW until the follower fetches
+    k.r.passes(5);
+    const int64_t last = k.r.leo() - 1;
+    ASSERT_LE(k.r.replica->highWatermark(), last);
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, 53, 0);
+    k.r.passes(30);
+    EXPECT_TRUE(k.r.txnJudgeOffsetsInLog().empty()) << "no J while HW <= last";
+    EXPECT_FALSE(k.r.voteReply(tok));
+    ASSERT_TRUE(k.r.driveUntilVoted(tok));
+    ASSERT_EQ(k.r.txnJudgeOffsetsInLog().size(), 1u);
+    EXPECT_GT(k.r.txnJudgeOffsetsInLog()[0], last);
+    EXPECT_EQ(k.r.voteReply(tok)->errorCode, 0);
+    EXPECT_EQ(k.r.voteReply(tok)->code, 0);
+}
+
+// Task 7 (T7 review 1, F2): the coordinator's abort lands while the vote's scan waits for the HW.  The scan writes no J past the
+// marker (it would judge nothing, hold K behind the marker and wedge the producer's next J); the vote is answered, and the
+// producer's next transaction votes and applies.  K never steps back.
+TEST(CheckedWritesTxnWorker, AbortWhileTheScanWaitsForTheHwWritesNoJudgeRegression) {
+    Ki k(/*follower=*/true);
+    k.txn(49, {ins(1)});
+    k.r.followerFetch();
+    (void)k.r.produceFrame({ups(2)}, kLeader, 49, 1, /*txn=*/true);
+    k.r.passes(5);
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, 49, 0);
+    k.r.passes(30);
+    ASSERT_FALSE(k.r.voteReply(tok)) << "the scan waits for the HW";
+    k.r.marker(49, false);
+    int64_t judged = -1;
+    bool back = false;
+    k.r.onEveryPass([&] {
+        if (const VerdictSource* j = k.r.vs->verdictSource(VerdictRig::kSrc, 0)) {
+            back = back || j->judgedThrough() < judged;
+            judged = std::max(judged, j->judgedThrough());
+        }
+    });
+    k.r.followerFetch();
+    ASSERT_TRUE(k.r.driveUntilVoted(tok));
+    EXPECT_EQ(k.r.voteReply(tok)->errorCode, 0);
+    EXPECT_TRUE(k.r.txnJudgeOffsetsInLog().empty()) << "no J past the abort";
+    ASSERT_TRUE(k.r.driveUntilJudgeReaches());
+    k.txn(49, {ins(5)});
+    const auto v = k.vote(49);
+    EXPECT_EQ(v.errorCode, 0);
+    EXPECT_EQ(v.code, 0);
+    EXPECT_GE(v.judgeOffset, 0);
+    k.r.marker(49, true);
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<std::string>{"5"}));
+    EXPECT_FALSE(back) << "K stepped back";
+    k.r.onEveryPass({});
+}
+
+// Task 7 (T7 review 1, F6): a vote the full park refuses leaves no scan behind: driven by the other parked votes, it would append a J
+// nobody waits for, or sit until the next vote.
+TEST(CheckedWritesTxnWorker, RefusedParkLeavesNoScanRegression) {
+    Ki k(/*follower=*/true);
+    k.txn(54, {ins(1)});
+    k.txn(55, {ins(2)});
+    std::vector<int64_t> parked;
+    for (std::size_t i = 0; i < TxnJudgeState::kMaxParkedVotes; ++i) parked.push_back(k.r.sendVote(VerdictRig::kSrc, 54, 0));
+    k.r.passes(5);
+    ASSERT_EQ(k.r.worker->parkedVotesForTest(), int64_t(TxnJudgeState::kMaxParkedVotes)) << "J above the HW: every vote waits";
+    ASSERT_EQ(k.r.worker->voteScansForTest(), 0u);
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, 55, 0);
+    ASSERT_TRUE(k.r.voteReply(tok));
+    EXPECT_EQ(k.r.voteReply(tok)->errorCode, kNotLeader);
+    EXPECT_EQ(k.r.worker->voteScansForTest(), 0u) << "the refused vote's scan was left behind";
+    k.r.passes(30);
+    EXPECT_EQ(k.r.txnJudgeOffsetsInLog().size(), 1u) << "54's J only: none for the refused vote";
+    k.r.marker(55, false);   // the judge passes 55's records only once 55 ends, and reaches 54's J
+    for (const int64_t t : parked) ASSERT_TRUE(k.r.driveUntilVoted(t));
+    EXPECT_EQ(k.r.worker->parkedVotesForTest(), 0);
+}
+
+// Task 7 (T7 review 1, F4): an atomic batch of txnJudgedRecordsMax + 1 records is rejected whole (62) instead of stalling the judge,
+// and stays rejected across a failover; the records after it are judged.
+TEST(CheckedWritesTxnWorker, AtomicBatchPastTheKnobIsRejectedAcrossAFailoverRegression) {
+    Ki k;
+    const int32_t knob = k.r.vs->txnJudgedRecordsMax();
+    std::vector<Rec> big;
+    for (int32_t i = 0; i <= knob; ++i) big.push_back(ups(1000 + uint64_t(i)));
+    std::vector<uint8_t> bytes = VerdictRig::batch(big);
+    VerdictRig::setBatchAttribute(bytes, rune::protocol::batch::kAttrAtomic);
+    const int64_t base = k.r.leo();
+    ASSERT_TRUE(k.r.ack(k.r.produceBytes(bytes, kLeader)));
+    ASSERT_TRUE(k.r.ack(k.r.produceFrame({ups(1)}, kLeader)));
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    const auto rejectedWhole = [&] {
+        for (int64_t o = base; o <= base + knob; ++o) {
+            const auto* e = k.r.writeState()->rejected.find(o);
+            if (e == nullptr || e->code != kTooLarge) return false;
+        }
+        return true;
+    };
+    EXPECT_FALSE(k.r.vs->verdictSource(VerdictRig::kSrc, 0)->stalled());
+    EXPECT_TRUE(rejectedWhole());
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<std::string>{"1"}));
+    EXPECT_EQ(k.stats().atomicTooLarge, 1u);
+    k.r.failover();
+    ASSERT_TRUE(k.r.ack(k.r.produceFrame({ups(2)}, kLeader)));
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    EXPECT_TRUE(rejectedWhole()) << "the new leader keeps the rejection";
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<std::string>{"1", "2"}));
+}
+
+namespace {
+constexpr int32_t kRej = 0x40000611;
+constexpr uint64_t kRejObj = 78;
+constexpr int64_t kRaPid = 60;
+
+std::vector<uint8_t> slurp(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+/// A key-index source also judged by a persisted reject view (tag 9 is rejected), with acks: a transaction's inserts vote.
+struct Persisted {
+    VerdictRig r;
+    int64_t cap = 0;
+    Persisted() {
+        r.createKeyIndex();
+        r.enableAcks();
+        TestRejectRule rule;
+        rule.mode = TestRejectRule::Mode::TagEquals;
+        rule.tag = 9;
+        r.installRejectView(kRej, kRejObj, rule, "rej", /*persisted=*/true);
+        r.passes(50);
+        cap = r.vs->maxRecordsPerPassForTest(kRej, 0);
+    }
+    /// `n` plain records from id `from`, in batches of 500.
+    static std::vector<std::vector<uint8_t>> plain(uint64_t from, int64_t n) {
+        std::vector<std::vector<uint8_t>> out;
+        for (int64_t i = 0; i < n; i += 500) {
+            std::vector<Rec> recs;
+            for (int64_t k = i; k < std::min(n, i + 500); ++k) recs.push_back(Rec{from + static_cast<uint64_t>(k), 1});
+            out.push_back(VerdictRig::batch(recs));
+        }
+        return out;
+    }
+    /// The batches as the previous leader wrote them; returns the first one's base offset.
+    int64_t replicated(std::vector<std::vector<uint8_t>> batches) {
+        const int64_t base = r.leo();
+        r.demote();
+        r.replicate(std::move(batches));
+        r.promote();
+        for (int i = 0; i < 100 && r.writeState() == nullptr; ++i) r.pass();
+        r.passes(100);   // the leadership scan rebuilds the open transactions
+        return base;
+    }
+    [[nodiscard]] int64_t durable() const { return r.agent->lastDurableOffset(kRej, 0); }
+};
+}  // namespace
+
+// P11-8 (a): while the judge runs ahead of a voted transaction T to its J, the member pushes its checkpoint at O inside T (the pass
+// cap counts from its last push).  A restart from that checkpoint, after T committed, backfills T's records below O from J.
+TEST(CheckedWritesTxnWorker, RunAheadCheckpointIsBackfilledOnReplayRegression) {
+    Persisted p;
+    ASSERT_GT(p.cap, 0);
+    std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ins(1001)}, kRaPid, 0, {}, /*txn=*/true)};
+    for (auto& b : Persisted::plain(10000, 3 * p.cap)) batches.push_back(std::move(b));
+    batches.push_back(VerdictRig::batch({ins(1002)}, kRaPid, 1, {}, /*txn=*/true));
+    const int64_t first = p.replicated(std::move(batches));
+    const int64_t tok = p.r.sendVote(VerdictRig::kSrc, kRaPid, 0);
+    std::vector<uint8_t> inside;
+    int64_t insideAt = -1;
+    for (int i = 0; i < 2000 && !p.r.voteReply(tok); ++i) {
+        p.r.pass();
+        const auto js = p.r.txnJudgeOffsetsInLog();
+        if (insideAt < 0 && js.size() == 1 && p.durable() > first && p.durable() < js[0]) {
+            insideAt = p.durable();
+            inside = slurp(viewCheckpointFilePath(p.r.snapDir(), kRej, 0));
+        }
+    }
+    ASSERT_TRUE(p.r.voteReply(tok));
+    ASSERT_EQ(p.r.voteReply(tok)->code, 0);
+    ASSERT_GE(insideAt, 0) << "no checkpoint was pushed while the judge ran ahead of T";
+    p.r.marker(kRaPid, true);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    ASSERT_TRUE(p.r.hasRow(kRej, 1001));
+    ASSERT_TRUE(p.r.hasRow(kRej, 1002));
+    // The crash took every later checkpoint: the file holds the run-ahead one.
+    p.r.agent.reset();
+    {
+        std::ofstream out(viewCheckpointFilePath(p.r.snapDir(), kRej, 0), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(inside.data()), static_cast<std::streamsize>(inside.size()));
+    }
+    p.r.agent = std::make_unique<ViewSnapshotIoAgent>(p.r.channel, p.r.snapDir(), /*fsyncMs=*/0, p.r.backupPolicy);
+    p.r.restart();
+    p.r.passes(300);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    ASSERT_NE(p.r.stats(), nullptr);
+    EXPECT_EQ(p.r.stats()->verdictCheckpointsDiscarded, 0u) << "the markers cover the run-ahead checkpoint: it is kept";
+    EXPECT_EQ(p.r.writeState()->txn.stats.checkpointBackfills, 1u);
+    EXPECT_TRUE(p.r.hasRow(kRej, 1001)) << "T's record below the checkpoint is backfilled from J";
+    EXPECT_TRUE(p.r.hasRow(kRej, 1002));
+    EXPECT_TRUE(p.r.hasRow(kRej, 10000));
+    EXPECT_TRUE(p.r.hasRow(kRej, 10000 + static_cast<uint64_t>(3 * p.cap) - 1));
+}
+
+// P11-8 (b): while a voted transaction is Locked with its J below the member's cursor, no checkpoint is pushed (counted), however
+// much traffic follows; its commit lets them go again.
+TEST(CheckedWritesTxnWorker, NoCheckpointPushWhileLockedRegression) {
+    Persisted p;
+    const int64_t first = p.replicated({VerdictRig::batch({ins(1001)}, kRaPid, 0, {}, /*txn=*/true)});
+    ASSERT_TRUE(p.r.driveUntilVoted(p.r.sendVote(VerdictRig::kSrc, kRaPid, 0)));
+    ASSERT_EQ(p.r.writeState()->txn.find(kRaPid)->phase, TxnPhase::Locked);
+    const int64_t j = p.r.txnJudgeOffsetsInLog().at(0);
+    std::vector<int64_t> corrs;
+    for (uint64_t i = 0; i < 20; ++i) corrs.push_back(p.r.produceFrame({Rec{20000 + i, 1}}, kLeader));
+    p.r.passes(300);
+    EXPECT_GT(p.r.vs->verdictSource(VerdictRig::kSrc, 0)->judgedThrough(), first - 1);
+    EXPECT_TRUE(p.r.hasRow(kRej, 20019)) << "the traffic is folded";
+    EXPECT_LE(p.durable(), first) << "no checkpoint past T's first record while T is Locked";
+    EXPECT_GT(p.r.writeState()->txn.stats.vetoedCheckpointPushes, 0u);
+    p.r.marker(kRaPid, true);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    p.r.passes(50);
+    EXPECT_GT(p.durable(), j) << "the commit lets the checkpoints go";
+}
+
+// The judge runs to an ordinary transaction's marker in one go, and a member cannot checkpoint inside it (no J to backfill from):
+// a delta past one ring message is held, never claimed (a claim that large throws on the worker thread).  Until Task 8 checkpoints
+// stop there and a restart refolds from the last one.
+TEST(CheckedWritesTxnWorker, OversizedDeltaIsHeldNotClaimedRegression) {
+    Persisted p;
+    const int64_t before = p.durable();
+    std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ups(1001)}, kRaPid, 0, {}, /*txn=*/true)};
+    for (auto& b : Persisted::plain(10000, 3 * p.cap)) batches.push_back(std::move(b));
+    (void)p.replicated(std::move(batches));
+    p.r.marker(kRaPid, true);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    p.r.passes(50);
+    EXPECT_TRUE(p.r.hasRow(kRej, 1001));
+    EXPECT_TRUE(p.r.hasRow(kRej, 10000 + static_cast<uint64_t>(3 * p.cap) - 1));
+    EXPECT_TRUE(p.r.vs->instanceForTest(kRej, 0)->deltaOversized);
+    EXPECT_EQ(p.durable(), before) << "the oversized delta never left";
+    p.r.restart();
+    p.r.passes(300);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    EXPECT_TRUE(p.r.hasRow(kRej, 1001));
+    EXPECT_TRUE(p.r.hasRow(kRej, 10000 + static_cast<uint64_t>(3 * p.cap) - 1));
+}
+
+// P11-8 (c), fix round 1 F5: the cleaner keeps every TxnJudge at or above the lowest checkpoint a persisted member restarts from,
+// even once the committed markers have passed the J: a member whose checkpoint lags inside T backfills from that J.
+TEST(CheckedWritesTxnWorker, LaggingCheckpointKeepsTheTxnJudgeItNeedsRegression) {
+    Persisted p;
+    std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ins(1001)}, kRaPid, 0, {}, /*txn=*/true)};
+    for (auto& b : Persisted::plain(10000, 3 * p.cap)) batches.push_back(std::move(b));
+    batches.push_back(VerdictRig::batch({ins(1002)}, kRaPid, 1, {}, /*txn=*/true));
+    const int64_t first = p.replicated(std::move(batches));
+    const int64_t tok = p.r.sendVote(VerdictRig::kSrc, kRaPid, 0);
+    for (int i = 0; i < 2000 && !p.r.voteReply(tok) && p.durable() <= first; ++i) p.r.pass();
+    const int64_t lagging = p.durable();
+    ASSERT_GT(lagging, first) << "a run-ahead checkpoint inside T";
+    p.r.agent.reset();   // the IO agent stalls: no later checkpoint becomes durable
+    ASSERT_TRUE(p.r.driveUntilVoted(tok));
+    const int64_t j = p.r.txnJudgeOffsetsInLog().at(0);
+    ASSERT_GT(j, lagging);
+    p.r.marker(kRaPid, true);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    ASSERT_GT(p.r.writeState()->markers.committedThrough(), j) << "the markers alone would let the J go";
+    EXPECT_EQ(p.r.replica->cleanerTxnJudgeBound(), lagging) << "the J the lagging checkpoint backfills from is kept";
 }

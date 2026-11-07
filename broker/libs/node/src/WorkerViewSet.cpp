@@ -433,8 +433,14 @@ int WorkerViewSet::drainSnapshotAcks(int limit) {
     }
     return channel_.done.drain(
         [this](int32_t type, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off, aeron::util::index_t len) {
-            if (type != kDiscardDoneMsgType || len < kDiscardDoneMsgBytes) return;   // kDoneMsgType: durable-offset acks, not needed here
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            if (type == ViewSnapshotChannel::kDoneMsgType && len >= static_cast<aeron::util::index_t>(ViewSnapshotChannel::kDoneMsgBytes)) {
+                // A discard in flight: the ack is the old stream's (the agent acks in order, its discard last).
+                if (const auto it = views_.find(instKey(static_cast<int32_t>(readU32LE(p)), static_cast<int32_t>(readU32LE(p + 4)))); it != views_.end() && checkpointSettled(it->second))
+                    it->second.lastDurableO = std::max(it->second.lastDurableO, static_cast<int64_t>(readU32LE(p + 8) | (uint64_t{readU32LE(p + 12)} << 32)));
+                return;
+            }
+            if (type != kDiscardDoneMsgType || len < kDiscardDoneMsgBytes) return;
             onDiscardDone_(static_cast<int32_t>(readU32LE(p)), static_cast<int32_t>(readU32LE(p + 4)),
                            static_cast<int32_t>(readU32LE(p + 8)), static_cast<ViewDiscardReason>(p[12]));
         },
@@ -693,6 +699,7 @@ void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopi
     inst.foldCursor   = std::max<int64_t>(recoveredO, 0);
     if (recoveredO >= 0) inst.transientCursor = CursorRecoveredUnreconciled{};
     inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
+    inst.lastDurableO = recoveredO;
     inst.readiness = (inst.foldCursor >= committedTail) ? ViewReadiness::Ready
                                                         : ViewReadiness::RebuildingViews;
     applyRecoveredCheckpoint_(inst, rc, scan, applied, SourceLogBounds{});   // bounds unknown here: the first driveView_ pass repeats the check
@@ -802,6 +809,7 @@ void WorkerViewSet::installViewForRecovery(
     inst->foldCursor   = std::max<int64_t>(recoveredO, 0);
     if (recoveredO >= 0) inst->transientCursor = CursorRecoveredUnreconciled{};
     inst->lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
+    inst->lastDurableO = recoveredO;
 
     // REBUILDING_VIEWS unless the source is already caught up (then Ready now:
     // e.g. a brand-new view over an empty source, committedTail == 0).  Local
@@ -1110,6 +1118,13 @@ int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
 bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
     const std::size_t frameLen =
         ViewSnapshotChannel::kDeltaHeaderBytes + inst.pendingDelta.size();
+    if (frameLen > static_cast<std::size_t>(channel_.deltas.maxMsgLength())) [[unlikely]] {   // a claim this large throws
+        if (!inst.deltaOversized)
+            spdlog::critical("VIEW-DELTA-TOO-LARGE view={} partition={} bytes={} max={} -- checkpoints stop; a restart refolds from the last one",
+                             inst.plan.viewTopicId, inst.partition, frameLen, channel_.deltas.maxMsgLength());
+        inst.deltaOversized = true;
+        return false;
+    }
 
     const auto claim =
         channel_.deltas.tryClaim(ViewSnapshotChannel::kDeltaMsgType, frameLen);
@@ -1526,6 +1541,7 @@ void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) 
     if (inst.keyed) buildKeyedTables(inst, indexSlots, chunkBytes);
     inst.foldCursor = 0;
     inst.lastEncodedO = -1;
+    inst.lastDurableO = -1;
     inst.transientCursor = CursorFresh{};
     inst.readiness = ViewReadiness::RebuildingViews;
     inst.counters.uniqueConflicts = 0;
@@ -1550,7 +1566,10 @@ bool WorkerViewSet::startAtLogStart_(ViewInstance& inst, int64_t logStart) {
 bool WorkerViewSet::tryPushDiscard_(ViewInstance& inst) {
     const auto* owed = std::get_if<CheckpointDiscardOwed>(&inst.checkpoint);
     if (owed == nullptr) return false;
-    if (inst.pendingValid && !tryPushDelta_(inst)) return false;   // the held delta belongs to the old stream: it precedes the frame
+    if (inst.pendingValid && !tryPushDelta_(inst)) {   // the held delta belongs to the old stream: it precedes the frame
+        if (!inst.deltaOversized) return false;
+        inst.pendingValid = inst.deltaOversized = false;   // never pushed: the backup goes without it
+    }
     const auto claim = channel_.deltas.tryClaim(kDiscardMsgType, static_cast<std::size_t>(kDiscardMsgBytes));
     if (claim < 0) return false;            // ring full: retried next pass
     uint8_t* dst = channel_.deltas.base() + claim;

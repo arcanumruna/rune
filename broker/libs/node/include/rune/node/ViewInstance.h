@@ -222,6 +222,8 @@ struct ViewInstance {
     // separately by the view-snapshot IO agent's `done` ring (consumed in
     // Task 19).  Never mistake it for a durable/recoverable offset.
     int64_t                            lastEncodedO    = -1;
+    // The O of the last checkpoint the IO agent synced (its `done` ack) or recovery loaded; -1: none.  A restart replays from it.
+    int64_t                            lastDurableO    = -1;
     bool                               persisted       = true;
     // PERSISTED instances only: the most source records one fold pass may cover
     // (bound' = min(bound, foldCursor + maxRecordsPerPass)), derived at creation
@@ -264,6 +266,9 @@ struct ViewInstance {
     // dirty rows, so no delta is ever lost or double-counted.
     std::vector<uint8_t>               pendingDelta;
     bool                               pendingValid    = false;
+    // The held delta outgrew one ring message (a verdict member whose judge ran ahead of an ordinary transaction's marker): it is
+    // never pushed, so checkpoints stop and a restart refolds from the last one.
+    bool                               deltaOversized  = false;
     // Part 04 (P4-4) / view backups: where this instance's checkpoint file stands in a discard (see CheckpointState).  Anything but
     // CheckpointLive means the instance folds nothing, checkpoints nothing and serves NotReady.
     CheckpointState                    checkpoint{CheckpointLive{}};

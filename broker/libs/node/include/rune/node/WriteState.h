@@ -212,7 +212,8 @@ struct TxnJudgeStats {
              judgeRecordRefusals = 0,   ///< a TxnJudge the table refused (full, or the producer's entry holds an overlay): the judge waits
              ordinaryWaits = 0,         ///< an ordinary transaction the judge could not track (its table full): the judge waits
              supersedeKeysOverflow = 0, ///< an ordinary transaction with more keys than the one-step set holds: applied in segments, one per pass
-             undecidedReplaceRefusals = 0; ///< a producer's next TxnJudge refused while its previous transaction has no marker
+             undecidedReplaceRefusals = 0, ///< a producer's next TxnJudge refused while its previous transaction has no marker
+             atomicTooLarge = 0;        ///< an atomic batch past txnJudgedRecordsMax: every record rejected (62) until rule 10 (Task 12)
 };
 struct DeferredTxn {
     int64_t     producerId = -1;
@@ -260,12 +261,12 @@ public:
                 ++stats.undecidedReplaceRefusals;
                 return nullptr;
             }
-            txns_.erase(txns_.begin() + (old - txns_.data()));
+            giveUp_(txns_.begin() + (old - txns_.data()));
         }
         if (txns_.size() >= kMaxTxns) {
             const auto done = std::find_if(txns_.begin(), txns_.end(), [&](const DeferredTxn& t) { return t.phase == TxnPhase::Finalized && t.overlay < 0 && !hasParked_(t.producerId); });
             if (done == txns_.end()) return nullptr;
-            txns_.erase(done);
+            giveUp_(done);
         }
         DeferredTxn& t = txns_.emplace_back();
         t.producerId = r.producerId;
@@ -343,9 +344,13 @@ public:
         return std::any_of(txns_.begin(), txns_.end(), [&](const DeferredTxn& t) { return t.phase == TxnPhase::Locked && t.judgeOffset < cursor; });
     }
     /// The lowest TxnJudge a judge may still read (the cleaner keeps it and every one above): `w`, the committed markers' coverage,
-    /// or the J of an entry whose transaction is not decided below `w`.
-    [[nodiscard]] int64_t judgeRecordsNeededFrom(int64_t w) const noexcept {
-        int64_t from = w;
+    /// or the J of an entry whose transaction is not decided below `w`, including one the table gave up.
+    [[nodiscard]] int64_t judgeRecordsNeededFrom(int64_t w) noexcept {
+        if (givenUpMarker_ < w) {   // every entry given up is decided below w
+            givenUpJ_ = INT64_MAX;
+            givenUpMarker_ = -1;
+        }
+        int64_t from = std::min(w, givenUpJ_);
         for (const DeferredTxn& t : txns_)
             if (t.phase != TxnPhase::Finalized || t.markerOffset < 0 || t.markerOffset >= w) from = std::min(from, t.judgeOffset);
         return from;
@@ -417,8 +422,15 @@ private:
         return std::any_of(parked_.begin(), parked_.end(), [&](const ParkedVote& v) { return v.producerId == producerId; });
     }
 
+    void giveUp_(std::vector<DeferredTxn>::iterator t) noexcept {
+        givenUpJ_ = std::min(givenUpJ_, t->judgeOffset);
+        givenUpMarker_ = std::max(givenUpMarker_, t->markerOffset < 0 ? INT64_MAX : t->markerOffset);
+        txns_.erase(t);
+    }
+
     std::vector<DeferredTxn> txns_;
     std::vector<ParkedVote>  parked_;
+    int64_t                  givenUpJ_ = INT64_MAX, givenUpMarker_ = -1;   ///< the entries replaced or evicted: their lowest J, latest marker
 };
 
 struct PartitionWriteState {

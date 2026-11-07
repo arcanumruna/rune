@@ -99,6 +99,28 @@ TEST(CheckedWritesTxnState, MarkerDoesNotAnswerAParkedVoteRegression) {
     EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn*) {}), 1);
 }
 
+// Fix round 1 F5: an entry the table gives up (evicted when full, or replaced by its producer's next J) still holds the cleaner bound
+// at its J while its marker lies at or above the committed markers' coverage, and lets it go once that coverage passes the marker.
+TEST(CheckedWritesTxnState, GivenUpEntryStillHoldsTheCleanerBoundRegression) {
+    auto t = reserved();
+    for (std::size_t i = 0; i < TxnJudgeState::kMaxTxns; ++i) {
+        const auto o = static_cast<int64_t>(i) * 10 + 100;
+        DeferredTxn* e = t.onJudgeRecord(o, {static_cast<int64_t>(i), 1, o - 5});
+        ASSERT_NE(e, nullptr);
+        t.onMarker(static_cast<int64_t>(i), o + 20'000, true);
+        e->phase = TxnPhase::Finalized;
+    }
+    const int64_t w = 15'000;   // every marker lies above it: every J is needed
+    EXPECT_EQ(t.judgeRecordsNeededFrom(w), 100);
+    ASSERT_NE(t.onJudgeRecord(20'000, {5000, 1, 19'990}), nullptr) << "the oldest Finalized entry (J 100) is evicted";
+    EXPECT_EQ(t.find(0), nullptr);
+    EXPECT_EQ(t.judgeRecordsNeededFrom(w), 100) << "the evicted J is still needed: its marker lies above the coverage";
+    EXPECT_EQ(t.judgeRecordsNeededFrom(20'101), 110) << "past the evicted marker: the bound moves to the next J needed";
+    t.onMarker(1, 20'110, true);
+    ASSERT_NE(t.onJudgeRecord(30'000, {1, 1, 29'990}), nullptr) << "the producer's next J replaces its decided entry (J 110)";
+    EXPECT_EQ(t.judgeRecordsNeededFrom(20'101), 110) << "the replaced J is still needed";
+}
+
 // F3: decided entries make room, so the table never fills for good.
 TEST(CheckedWritesTxnState, FullTableReusesAFinalizedEntryRegression) {
     auto t = reserved();
@@ -1923,6 +1945,20 @@ TEST(CheckedWritesTxnJudgeRegression, AbortBeforeJudgeFedLateIsDecidedAtJRegress
     EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
     EXPECT_EQ(r.vs.judgedThrough(), 14);
     EXPECT_EQ(r.st.txn.stats.votesYes + r.st.txn.stats.votesNo, 0u) << "no judgement";
+    // Task 7 (T7 review 1, F2): decided at its marker, so the producer's next transaction is judged at its J.
+    EXPECT_EQ(r.st.txn.find(77)->markerOffset, 11);
+    r.log.data({{5}}, 77);        // 14
+    r.log.judge(77, 14);          // 15
+    r.log.marker(77, true);       // 16
+    for (int i = 0; i < 6 && r.vs.judgedThrough() < 17; ++i) r.drive();
+    const DeferredTxn* t = r.st.txn.find(77);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->firstOffset, 14) << "the next TxnJudge replaced the decided entry";
+    EXPECT_TRUE(t->judged);
+    EXPECT_EQ(r.st.txn.stats.votesYes, 1u);
+    EXPECT_EQ(r.st.txn.stats.undecidedReplaceRefusals, 0u);
+    EXPECT_TRUE(r.indexed(5));
+    EXPECT_EQ(r.vs.judgedThrough(), 17);
 }
 
 // A commit before its J: the records the judge passed as deferred are applied at that marker.
@@ -2091,6 +2127,9 @@ TEST(CheckedWritesTxnJudgeRegression, CommitPastTheCheckpointCapEndsItsPassRegre
     r.start();
     r.index->persisted = true;
     r.index->maxRecordsPerPass = 4;
+    VerdictViewHooks hooks;   // every checkpoint goes out: the run-ahead cap counts from the last one (P11-8 (a))
+    hooks.checkpoint = [](void*, ViewInstance&) { return 0; };
+    r.vs.setViewHooks(hooks);
     r.vs.bindLeader(nullptr, 2, 0);
     r.drive();
     std::vector<Rec> t;
@@ -2106,4 +2145,33 @@ TEST(CheckedWritesTxnJudgeRegression, CommitPastTheCheckpointCapEndsItsPassRegre
     EXPECT_FALSE(r.rowed(50)) << "nothing more in the pass that applied it";
     r.drive(INT64_MAX, 11'000'000'000);
     EXPECT_TRUE(r.rowed(50));
+}
+
+// Task 7 (T7 review 1, F4): an atomic batch one record past txnJudgedRecordsMax, the bound its overlay is sized by, is rejected whole
+// with 62 and the judge moves on; it used to stall on the overlay's capacity for good.  One at the knob is judged whole.
+TEST(CheckedWritesTxnJudgeRegression, AtomicBatchPastTheKnobIsRejectedWholeNeverStallsRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.batch[0].reserve(3 * 3, r.batch[0].maxRowLen());   // 3 records over the key index (1 row) and the tag member (2)
+    r.vs.bindTxn(&r.pool, r.batch, 3);
+    r.log.data({{1}, {2}, {3}, {4}}, -1, true);   // 10..13: knob + 1
+    r.log.data({{5}});                            // 14
+    r.drive();
+    r.drive();
+    EXPECT_FALSE(r.vs.stalled());
+    EXPECT_EQ(r.vs.judgedThrough(), 15);
+    for (int64_t o = 10; o < 14; ++o) {
+        const auto* e = r.st.rejected.find(o);
+        ASSERT_NE(e, nullptr) << o;
+        EXPECT_EQ(e->code, uint16_t(rune::protocol::client::ErrorCode::TxnTooLarge));
+    }
+    EXPECT_FALSE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(5));
+    EXPECT_EQ(r.st.txn.stats.atomicTooLarge, 1u);
+    r.log.data({{6}, {7}, {8}}, -1, true);   // 15..17: at the knob
+    r.drive();
+    EXPECT_EQ(r.vs.judgedThrough(), 18);
+    EXPECT_TRUE(r.indexed(6));
+    EXPECT_TRUE(r.indexed(8));
+    EXPECT_EQ(r.st.txn.stats.atomicTooLarge, 1u);
 }

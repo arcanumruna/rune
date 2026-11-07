@@ -642,6 +642,7 @@ public:
         egressScratch_.resize(kEgressScratchSize);
         verdictSpans_.reserve(4096);
         verdictKeep_.reserve(4096);
+        voteScans_.reserve(kMaxVoteScans);
         maxIntakeBatchBytes_ = ringBatchFit_();   // BrokerNode narrows it: setMaxBatchBytes
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
     }
@@ -724,6 +725,7 @@ public:
         return ws != nullptr ? &ws->txn.stats : nullptr;
     }
     [[nodiscard]] int64_t parkedVotesForTest() const noexcept { return parkedVotes_; }
+    [[nodiscard]] std::size_t voteScansForTest() const noexcept { return voteScans_.size(); }
     void setVerdictAckArenaEntriesForTest(uint32_t entries) { ackSink_->resizeVerdictArenaForTest(entries); }
     [[nodiscard]] const VerdictSourceStats* verdictStatsForTest(int32_t topicId, int32_t partition) const noexcept {
         const VerdictSource* v = viewSet_ != nullptr ? viewSet_->verdictSource(topicId, partition) : nullptr;
@@ -7309,8 +7311,9 @@ private:
     // Part 04 (P4-1): the leadership scan of a disk partition with a write state feeds its verdict markers and constraint-set
     // changes into that state.
     // Part 06 (P6-7): an autoincrement partition's counter and side window are rebuilt by the same scan.
-    static void bindVerdictHooks_(RcSlot& slot) noexcept {
+    static void bindVerdictHooks_(RcSlot& slot) {
         if (slot.write && slot.rc && slot.replica->isDiskBacked()) {
+            if (!slot.write->txn.reserved()) slot.write->txn.reserve();   // cold: the judge table and the parked votes, at install
             const bool autoInc = slot.write->spec->autoIncrement;
             slot.rc->setVerdictHooks(RcVerdictHooks{.begin = autoInc ? &autoIncFeedBegin : &verdictFeedBegin, .batch = &verdictFeedBatch, .ctx = slot.write.get(),
                                                     .dataBatch = autoInc ? &autoIncFeedDataBatch : nullptr,
@@ -7664,9 +7667,13 @@ private:
                             ? rune::replication::PartitionReplica::kNoCleanerLso : W;
                 end = w.markers.committedMarkerEnd();
             }
-            // Part 11: a TxnJudge goes only below the committed markers' coverage and below every transaction not decided under it.
-            const int64_t txnBound = sl.write && sl.replica->role() == rune::replication::Role::Leader && sl.write->constraintSets.size() != 0
-                ? sl.write->txn.judgeRecordsNeededFrom(sl.write->markers.committedThrough()) : 0;
+            // Part 11: a TxnJudge goes only below the committed markers' coverage, below every transaction not decided under it, and
+            // below every persisted member's last checkpoint (P11-8 (c)).  A follower keeps them all.
+            int64_t txnBound = 0;
+            if (sl.write && sl.replica->role() == rune::replication::Role::Leader && sl.write->constraintSets.size() != 0) {
+                txnBound = sl.write->txn.judgeRecordsNeededFrom(sl.write->markers.committedThrough());
+                if (sl.write->verdicts != nullptr) txnBound = std::min(txnBound, sl.write->verdicts->checkpointFloor());
+            }
             if (txnBound != sl.txnJudgeBoundPublished) {
                 sl.replica->publishCleanerTxnJudgeBound(txnBound);
                 sl.txnJudgeBoundPublished = txnBound;
@@ -7915,19 +7922,20 @@ private:
             answerTxnVoteNotLeader_(op);
             return;
         }
-        if (!ws->txn.reserved()) ws->txn.reserve();
+        bool scanned = false;
         if (const DeferredTxn* t = ws->txn.find(v.producerId); t != nullptr && t->firstOffset == first) {
             v.judgeOffset = t->judgeOffset;   // J is in the log: answered once the judge judged it
         } else if (std::none_of(voteScans_.begin(), voteScans_.end(), [&](const VoteScan& s) { return s.ws == ws && s.producerId == v.producerId; })) {
-            if (voteScans_.capacity() < kMaxVoteScans) voteScans_.reserve(kMaxVoteScans);   // cold: the first scan
             if (voteScans_.size() >= kMaxVoteScans) {
                 answerTxnVoteNotLeader_(op);
                 return;
             }
             voteScans_.push_back(VoteScan{.replica = replica, .ws = ws, .leaderGen = replica->leadershipGeneration(), .producerId = v.producerId,
                                           .epoch = v.epoch, .first = first, .cursor = first, .end = replica->logEndOffset()});
+            scanned = true;
         }
         if (!ws->txn.parkVote(v)) {
+            if (scanned) voteScans_.pop_back();   // no vote waits for it
             answerTxnVoteNotLeader_(op);
             return;
         }
@@ -7993,6 +8001,15 @@ private:
         }
         // J lands only once the transaction is committed below it, and only when the judge's table takes it.
         if (rep.highWatermark() <= s.last || !ws.txn.acceptsJudge(s.producerId)) return false;
+        // The transaction ended while the scan waited (a coordinator's abort): a J past its marker would judge nothing, and it would
+        // hold K behind the marker.  As at the vote, no open transaction answers yes.
+        if (const RcState* rc = rcServe_(&rep, rcOf_(&rep)); rc == nullptr) {
+            return false;
+        } else if (rc->tracker().firstOffsetOf(s.producerId) != s.first) {
+            ++ws.txn.stats.votesYes;
+            answerAll(0, {});
+            return true;
+        }
         const rune::storage::control_record::TxnJudgeRecord rec{s.producerId, s.epoch, s.first};
         const std::size_t n = rune::storage::control_record::buildTxnJudge(txnJudgeScratch_, rec);
         rune::replication::Offset base;

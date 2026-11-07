@@ -716,7 +716,8 @@ void VerdictSource::restartJudgement_() noexcept {
     txnPool_->keysAt(jx_.overlay).clear();
     jx_.from = jx_.first;
     jx_.records = 0;
-    jx_.scanning = jx_.done = jx_.ended = false;
+    jx_.scanning = jx_.done = jx_.endedCommit = false;
+    jx_.endedAt = -1;
     jx_.answer = {};
     jx_.resolvePid = jx_.resolveFrom = -1;
     resetChainLive_();
@@ -792,15 +793,24 @@ bool VerdictSource::applyRecord_(const rune::view::SourceRecord& rec) noexcept {
 // rejected with its verdict.  False: the judge stays at the batch (a pause, a stall, a record that does not fit).
 bool VerdictSource::judgeAtomic_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, bool keyZero) noexcept {
     rune::view::TxnOverlay& chain = batchOverlay_.front();
-    chain.clear();
-    resetChainLive_();
     Verdict failed{};
     ChainStep step = ChainStep::Ok;
-    const bool walked = rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
-        if (step == ChainStep::Ok) step = chainRecord_(recordOf_(span), chain, failed);
-    });
-    chain.clear();
-    resetChainLive_();
+    bool walked = true;
+    // More records than the overlay is sized for (the knob): rejected whole, the same on every leader, never a capacity stall.
+    // TODO(Part 11 Task 12): rule 10's answer for it.
+    const bool tooLarge = r.recordCount() > txnJudgedRecordsMax_;
+    if (tooLarge) {
+        failed = {static_cast<uint16_t>(rune::protocol::client::ErrorCode::TxnTooLarge), 0};
+        step = ChainStep::Failed;
+    } else {
+        chain.clear();
+        resetChainLive_();
+        walked = rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
+            if (step == ChainStep::Ok) step = chainRecord_(recordOf_(span), chain, failed);
+        });
+        chain.clear();
+        resetChainLive_();
+    }
     if (!walked || step == ChainStep::Stalled) return false;
     if (step == ChainStep::Locked) {
         txnStop_ = TxnStop::Locked;
@@ -819,6 +829,7 @@ bool VerdictSource::judgeAtomic_(const rune::protocol::RecordBatchReader& r, con
             if (ok && keyZero) [[unlikely]] noteKeyZeroRejection_(failed, recordOf_(span));
         });
         judgedRecord_ = true;
+        state_->txn.stats.atomicTooLarge += ok && tooLarge;
         return ok;
     }
     // The chained prepare was every member's capacity check: each record was prepared against the state its apply sees, through a
@@ -879,9 +890,11 @@ bool VerdictSource::readTxnBatch_(const rune::protocol::RecordBatchReader& r, co
     TxnKeySet& keys = txnPool_->keysAt(jx_.overlay);
     if ((attrs & proto::batch::kAttrControl) != 0) {
         // The producer's own COMMIT / ABORT inside (first, end): T ended before its TxnJudge, which judges nothing (abort before J).
-        if ((attrs & kTxnControl) == kTxnControl && r.producerId() == jx_.producerId && r.baseOffset() > jx_.first &&
-            cm::controlType(batch, len) != cm::kUnparseable) {
-            jx_.ended = jx_.done = true;
+        if (const int type = (attrs & kTxnControl) == kTxnControl && r.producerId() == jx_.producerId && r.baseOffset() > jx_.first ? cm::controlType(batch, len) : cm::kUnparseable;
+            type != cm::kUnparseable) {
+            jx_.endedAt = r.baseOffset();
+            jx_.endedCommit = type == cm::kCommit;
+            jx_.done = true;
             return false;
         }
         noteControl_(r, batch, len, jx_.producerId, keys);
@@ -1064,7 +1077,7 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
             ++work;
             continue;
         }
-        // P11-6: an atomic batch is judged whole; until Task 7 binds the batch overlay it is judged per record.
+        // P11-6: an atomic batch is judged whole (one past txnJudgedRecordsMax is rejected whole); without a batch overlay, per record.
         if ((attrs & proto::batch::kAttrAtomic) != 0 && !batchOverlay_.empty() && judgeCursor_ <= r.baseOffset()) {
             if (last >= hardLimit) break;
             judgeCursor_ = r.baseOffset();
@@ -1337,16 +1350,36 @@ int VerdictSource::pushCheckpoints_(PartitionWriteState& state) {
     int work = 0;
     for (Member& m : members_) {
         ViewInstance& inst = *m.inst;
-        // P11-8: nor while a Locked transaction judged below its cursor is not applied (its delta would stamp rows the apply changes).
-        if (inst.persisted && !inst.pendingValid && checkpointSettled(inst) && state.txn.lockedBelow(inst.foldCursor)) {
-            ++state.txn.stats.vetoedCheckpointPushes;
-            continue;
+        if (inst.persisted && !inst.pendingValid && checkpointSettled(inst)) {
+            // P4-4: a persisted member's delta leaves only once a marker in the local log covers the cursor it is stamped with, or
+            // while it runs ahead of deferred transactions (P11-8 (a)).
+            if (state.markers.appendedThrough() < inst.foldCursor && !runsAheadAt_(inst.foldCursor)) continue;
+            // P11-8 (b): nor while a Locked transaction judged below its cursor is not applied (its delta would stamp rows the apply
+            // changes).
+            if (state.txn.lockedBelow(inst.foldCursor)) {
+                ++state.txn.stats.vetoedCheckpointPushes;
+                continue;
+            }
         }
-        // P4-4: a persisted member's delta leaves only once a marker in the local log covers the cursor it is stamped with.
-        if (inst.persisted && state.markers.appendedThrough() < inst.foldCursor && !inst.pendingValid && checkpointSettled(inst)) continue;
         work += hooks_.checkpoint(hooks_.ctx, inst);
+        if (!inst.pendingValid) m.pushedAt = inst.foldCursor;
     }
     return work;
+}
+
+// P11-8 (a): K is held below `cursor` only by deferred transactions, so a checkpoint there is backfilled on replay from their J (one
+// judged below it is (b)'s veto).  An ordinary transaction's records below it have no J to backfill from.
+bool VerdictSource::runsAheadAt_(int64_t cursor) const noexcept {
+    return judgedThrough() < cursor &&
+           std::none_of(ordinary_.begin(), ordinary_.end(), [&](const OrdinaryTxn& o) { return o.first < cursor; });
+}
+
+// Where the checkpoint cap counts from while the judge runs ahead: the persisted members' last push, at least the markers' coverage.
+int64_t VerdictSource::runAheadFrom_() const noexcept {
+    int64_t from = INT64_MAX;
+    for (const Member& m : members_)
+        if (m.inst->persisted && m.inst->maxRecordsPerPass > 0) from = std::min(from, std::max(m.pushedAt, emitFrom_));
+    return from == INT64_MAX ? emitFrom_ : from;
 }
 
 int VerdictSource::dropRetired_(PartitionWriteState& state) {
