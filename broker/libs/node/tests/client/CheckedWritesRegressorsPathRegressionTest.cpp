@@ -98,13 +98,16 @@ std::string endpointOf(catalog_cluster::ThreeNodes& c, int id) {
 /// The golden script with the user and character topics on small segments and an eager cleaner (tombstones leave at once).
 std::string eagerScript() {
     std::ifstream in(std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql");
+    if (!in.good()) throw std::runtime_error("the golden script is missing");
     std::stringstream text;
     text << in.rdbuf();
     std::string script = text.str();
     const std::string plain = "with (cleanup.policy = compact)";
     const std::string eager = "with (cleanup.policy = compact, segment.bytes = 65536, delete.retention.ms = 0, min.compaction.lag.ms = 50, "
                               "min.cleanable.dirty.ratio = 0.000001, file.delete.delay.ms = 50)";
-    for (auto at = script.find(plain); at != std::string::npos; at = script.find(plain, at + eager.size())) script.replace(at, plain.size(), eager);
+    int rewritten = 0;
+    for (auto at = script.find(plain); at != std::string::npos; at = script.find(plain, at + eager.size()), ++rewritten) script.replace(at, plain.size(), eager);
+    if (rewritten != 3) throw std::runtime_error("expected the user, device_login and character topics to be compacted, found " + std::to_string(rewritten));
     const fs::path path = tmpDir() / "regressorspath.rql";
     std::ofstream(path, std::ios::binary) << script;
     return path.string();
@@ -127,8 +130,19 @@ catalog_cluster::ThreeNodes startCluster(const std::string& tag) {
     });
 }
 
+/// Every running broker agrees on a live leader of partition 0 of `topicId`.  An election after a crash or a restart of every node can
+/// outlast 10 s on a loaded host (the failure detector alone takes several seconds), so this wait is the one 10 s waitFor that is repeated,
+/// at most 3 times; the rounds beyond the first are counted and printed.
+bool leadersWithin(catalog_cluster::ThreeNodes& c, int32_t topicId, std::vector<int32_t>& leaders) {
+    for (int round = 0; round < 3; ++round) {
+        if (waitFor([&] { return catalog_cluster::awaitLeaders(c, topicId, 1, leaders, 1ms); }, 10s)) return true;
+        std::printf("leader wait for topic %d: round %d of 3 timed out\n", topicId, round + 1);
+    }
+    return false;
+}
+
 void ready(catalog_cluster::ThreeNodes& c) {
-    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    ASSERT_TRUE(waitFor([&] { return c.awaitCatalogLeader(1ms); }, 10s));
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
 }
 
@@ -230,9 +244,9 @@ struct Writer {
         pc.acks     = kAllView;
         pc.lingerUs = 1;
         prod.emplace(client->producer(pc));
-        client->connectAndWait(30s);
-        if (withUsers) users.emplace(client->openTopicAndWait<RpUser>("user", *prod, 30s));
-        characters.emplace(client->openTopicAndWait<RpCharacter>("character", *prod, 30s));
+        client->connectAndWait(10s);
+        if (withUsers) users.emplace(client->openTopicAndWait<RpUser>("user", *prod, 10s));
+        characters.emplace(client->openTopicAndWait<RpCharacter>("character", *prod, 10s));
         cq.emplace(*client);
     }
     ~Writer() {
@@ -248,9 +262,9 @@ struct Writer {
     rc::Token update(const RpCharacter& r) { characters->update(r, *cq, next); return issued(); }
     rc::Token removeExisting(uint64_t id) { characters->removeExisting(id, *cq, next); return issued(); }
 
-    rc::WriteResult await(rc::Token t) {
+    rc::WriteResult await(rc::Token t, std::chrono::nanoseconds within = 10s) {
         std::optional<rc::WriteResult> r;
-        if (cq->waitFor(t, 10s, [&](const rc::Completion& c, std::span<const uint8_t>) { r = rc::WriteResult::fromCompletion(c); }) != rc::Completions::Wait::Done)
+        if (cq->waitFor(t, within, [&](const rc::Completion& c, std::span<const uint8_t>) { r = rc::WriteResult::fromCompletion(c); }) != rc::Completions::Wait::Done)
             throw std::runtime_error("a write never completed within 10 s");
         return *r;
     }
@@ -275,14 +289,18 @@ Fleet makeFleet(catalog_cluster::ThreeNodes& c, std::size_t n) {
 struct Ledger {
     std::map<uint64_t, int64_t> latest;
     std::set<int64_t>           accepted, rejected;
+    std::set<uint64_t>          removed;   ///< keys whose newest accepted write is a tombstone
     uint64_t                    highestId = 0;
 
     /// `id` is the key written, 0 for a create (the answer carries the assigned id).
-    const rc::WriteResult& note(uint64_t id, const rc::WriteResult& r) {
+    const rc::WriteResult& note(uint64_t id, const rc::WriteResult& r, bool tombstone = false) {
         highestId = std::max({highestId, id, r.key()});
         if (r.ok()) {
             accepted.insert(r.offset());
-            latest[id != 0 ? id : r.key()] = r.offset();
+            const uint64_t key = id != 0 ? id : r.key();
+            latest[key] = r.offset();
+            if (tombstone) removed.insert(key);
+            else removed.erase(key);
         } else if (r.offset() >= 0 && (r.code() == kConstraintViolation || r.code() == kKeyNotFound)) {
             rejected.insert(r.offset());
         }
@@ -308,7 +326,7 @@ struct LeaderLog {
 LeaderLog readLeader(catalog_cluster::ThreeNodes& c, int32_t topicId) {
     std::vector<int32_t> leaders;
     LeaderLog out;
-    if (!catalog_cluster::awaitLeaders(c, topicId, 1, leaders, 10s)) return out;
+    if (!leadersWithin(c, topicId, leaders)) return out;
     out.node = leaders[0];
     c.node(out.node).onOwnerThreadForTest(topicId, 0, [&out](rune::replication::PartitionReplica& r) {
         out.cleanedThrough = r.lastCleanOffset();
@@ -322,9 +340,11 @@ LeaderLog readLeader(catalog_cluster::ThreeNodes& c, int32_t topicId) {
 template <class Rec, class Send>
 void compactPast(catalog_cluster::ThreeNodes& c, Writer& w, int32_t topicId, int64_t through, Ledger& ledger, uint64_t id, const Rec& rec, Send&& send) {
     const auto passed = [&] { return readLeader(c, topicId).cleanedThrough > through; };
-    for (int chunk = 0; chunk < 80 && !passed(); ++chunk) {
+    // 800 records of about 125 bytes roll the 64 KiB segment that holds the rejected ones.  The cleaner makes no headway while the log is
+    // being written, so the writes stop before the 10 s wait for it.
+    for (int chunk = 0; chunk < 25; ++chunk) {
         std::vector<rc::Token> tokens;
-        for (int i = 0; i < 16; ++i) tokens.push_back(send(w, rec));
+        for (int i = 0; i < 32; ++i) tokens.push_back(send(w, rec));
         for (const rc::Token t : tokens) ledger.note(id, w.await(t));
     }
     EXPECT_TRUE(waitFor(passed, 10s)) << "the leader's cleaner never passed offset " << through << " of topic " << topicId;
@@ -337,7 +357,7 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
     using namespace rune::node::test::catalog_cluster;
     ThreeNodes c = startCluster("cw09");
     ready(c);
-    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(HasFailure());
     const std::string ep = endpointOf(c, 1);
     Ledger users, chars;
 
@@ -397,12 +417,12 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
 
     // 3. Failover mid-scenario
     std::vector<int32_t> leaders;
-    ASSERT_TRUE(awaitLeaders(c, characterTopic, 1, leaders, 30s));
+    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
     const int32_t crashed = leaders[0];
     c.crash(crashed);
-    ASSERT_TRUE(awaitLeaders(c, characterTopic, 1, leaders, 30s));
+    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
     ASSERT_NE(leaders[0], crashed);
-    ASSERT_TRUE(awaitLeaders(c, userTopic, 1, leaders, 30s));
+    ASSERT_TRUE(leadersWithin(c, userTopic, leaders));
 
     // 4. Create returns its id
     Fleet fleet = makeFleet(c, 4);
@@ -432,10 +452,11 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
     std::vector<uint64_t> k3Ids;
     std::vector<std::string> k3Names;
     int accepted = 0, refused = 0;
+    int64_t refusedOffset = -1;
     for (std::size_t i = 0; i < pending.size(); ++i) {
         const rc::WriteResult r = chars.note(0, fleet[pending[i].first]->await(pending[i].second));
         if (r.ok()) { ++accepted; k3Ids.push_back(r.key()); k3Names.push_back("k3c" + std::to_string(i)); }
-        else if (isConstraint(r, *fleet[pending[i].first]->client, "account_stats", "max_characters")) ++refused;
+        else if (isConstraint(r, *fleet[pending[i].first]->client, "account_stats", "max_characters")) { ++refused; refusedOffset = r.offset(); }
         else ADD_FAILURE() << "unexpected answer " << r.code() << " status " << static_cast<int>(r.status());
     }
     EXPECT_EQ(accepted, 12);
@@ -443,22 +464,27 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
     EXPECT_EQ(statsOf(*fleet[0]->client, k3), std::optional<uint64_t>(12));
     accountCharacters.builder.clear();
     EXPECT_EQ(scanAll(*fleet[0]->client, accountCharacters, bytesOf(accountCharacters.builder.setUInt("userId", k3).prefix())).size(), 12u);
-    const uint64_t burnedBelow = chars.highestId;
+    // A refused create's answer carries no id: its id is the one of its record in the leader's log.
+    uint64_t refusedId = 0;
+    for (const auto& rec : readLeader(c, characterTopic).log.data)
+        if (rec.offset == refusedOffset) refusedId = rec.id;
+    ASSERT_GE(refusedOffset, 0);
+    ASSERT_NE(refusedId, 0u) << "the refused create's record is in the log at offset " << refusedOffset;
     const rc::WriteResult after = create(2, k2, "Bar");
     ASSERT_TRUE(after.ok()) << "code " << after.code();
-    EXPECT_GT(after.key(), burnedBelow) << "the refused create's id is burned";
-    ASSERT_FALSE(HasFatalFailure());
+    EXPECT_GT(after.key(), refusedId) << "the refused create's id is burned";
+    ASSERT_FALSE(HasFailure());
 
     // 7. Restart mid-scenario
     fleet.clear();
     for (const int id : c.runningNodes()) c.stop(id);
     for (int id = 1; id <= 3; ++id) c.startNode(id);
     ready(c);
-    ASSERT_FALSE(HasFatalFailure());
-    ASSERT_TRUE(awaitLeaders(c, characterTopic, 1, leaders, 30s));
-    ASSERT_TRUE(awaitLeaders(c, userTopic, 1, leaders, 30s));
+    ASSERT_FALSE(HasFailure());
+    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+    ASSERT_TRUE(leadersWithin(c, userTopic, leaders));
     fleet = makeFleet(c, 4);
-    EXPECT_TRUE(waitFor([&] { try { return statsOf(*fleet[0]->client, k3) == std::optional<uint64_t>(12); } catch (const std::exception&) { return false; } }, 10s)) << "k3 still has 12";
+    EXPECT_EQ(statsOf(*fleet[0]->client, k3), std::optional<uint64_t>(12)) << "k3 still has 12";
     EXPECT_TRUE(isConstraint(create(0, k3, "k3c13"), *fleet[0]->client, "account_stats", "max_characters"));
     EXPECT_TRUE(isConstraint(create(1, k2, "foo"), *fleet[1]->client, "character_name", "unique"));
     {
@@ -469,20 +495,20 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
         ASSERT_TRUE(login.has_value());
         EXPECT_EQ(userIdentity.u(*login, "userId"), k);
     }
-    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(HasFailure());
 
     // 8. Delete, reuse, count
     const uint64_t cx = k3Ids.front();
     const std::string cxName = k3Names.front();
-    const rc::WriteResult removed = chars.note(cx, fleet[0]->removeExistingAndAwait(cx));
+    const rc::WriteResult removed = chars.note(cx, fleet[0]->removeExistingAndAwait(cx), true);
     ASSERT_TRUE(removed.ok()) << "code " << removed.code();
     EXPECT_EQ(statsOf(*fleet[0]->client, k3), std::optional<uint64_t>(11));
     EXPECT_TRUE(create(1, k2, cxName).ok()) << "the name is free again";
     EXPECT_TRUE(create(2, k3, "k3again").ok());
     EXPECT_EQ(statsOf(*fleet[0]->client, k3), std::optional<uint64_t>(12));
-    const rc::WriteResult twice = chars.note(cx, fleet[0]->removeExistingAndAwait(cx));
+    const rc::WriteResult twice = chars.note(cx, fleet[0]->removeExistingAndAwait(cx), true);
     EXPECT_EQ(twice.code(), kKeyNotFound);
-    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(HasFailure());
 
     // 9. Never delivered: a raw subscription from 0 on user and on character
     const rc::WriteResult sentinelUser = users.note(0, fleet[0]->insertAndAwait(RpUser{.provider = 1, .subject = "steam:99"}));
@@ -490,11 +516,11 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
     ASSERT_TRUE(sentinelUser.ok());
     ASSERT_TRUE(sentinelChar.ok());
     const auto delivered = [&](const std::string& topic, int32_t topicId, const Ledger& ledger, int64_t sentinel) {
-        ASSERT_TRUE(awaitLeaders(c, topicId, 1, leaders, 30s));
+        ASSERT_TRUE(leadersWithin(c, topicId, leaders));
         rc::ClientConfig cfg = clientConfigFor(c, leaders[0]);
         cfg.topics.push_back(rc::TopicSpec{topic, topicId, 1});
         rc::Client reader(cfg);
-        reader.connectAndWait(30s);
+        reader.connectAndWait(10s);
         std::mutex mu;
         std::set<int64_t> got;
         rc::SubscribeOptions o;
@@ -513,7 +539,7 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
     };
     delivered("character", characterTopic, chars, sentinelChar.offset());
     delivered("user", userTopic, users, sentinelUser.offset());
-    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(HasFailure());
     EXPECT_FALSE(chars.rejected.empty());
     EXPECT_FALSE(users.rejected.empty());
 
@@ -522,7 +548,7 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
                 [](Writer& w, const RpCharacter& r) { return w.update(r); });
     compactPast(c, *fleet[0], userTopic, *users.rejected.rbegin(), users, k, RpUser{.userId = k, .provider = 1, .subject = "steam:42"},
                 [](Writer& w, const RpUser& r) { return w.update(r); });
-    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_FALSE(HasFailure());
     // Only a partition's leader compacts; a follower keeps the records it fetched.
     const auto judge = [&](const std::string& topic, int32_t topicId, const Ledger& ledger) {
         const LeaderLog l = readLeader(c, topicId);
@@ -532,10 +558,16 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
             EXPECT_FALSE(ledger.rejected.contains(rec.offset)) << topic << ": a record at the rejected offset " << rec.offset << " is still in node " << l.node << "'s log";
             last[rec.id] = rec.offset;
         }
-        for (const auto& [id, off] : last) {
-            const auto it = ledger.latest.find(id);
-            if (it == ledger.latest.end()) { ADD_FAILURE() << topic << ": key " << id << " has a record but no accepted write"; continue; }
-            EXPECT_EQ(off, it->second) << topic << ": key " << id << "'s newest record is not its newest accepted write";
+        for (const auto& [id, off] : last)
+            if (!ledger.latest.contains(id)) ADD_FAILURE() << topic << ": key " << id << " has a record but no accepted write";
+        for (const auto& [id, off] : ledger.latest) {
+            const auto it = last.find(id);
+            if (ledger.removed.contains(id)) {   // its newest accepted write is a tombstone: the key is gone, or only the tombstone is left
+                if (it != last.end()) EXPECT_EQ(it->second, off) << topic << ": deleted key " << id << " has a record newer or older than its tombstone";
+            } else {
+                ASSERT_NE(it, last.end()) << topic << ": key " << id << " has no record left, its newest accepted write is at offset " << off;
+                EXPECT_EQ(it->second, off) << topic << ": key " << id << "'s newest record is not its newest accepted write";
+            }
         }
         EXPECT_TRUE(waitFor([&] {
             return runCli({"stats", "topic", topic, "--json", "--broker", endpointOf(c, l.node)}, &out, &err) == 0 && out.find("\"rejectedNotCompacted\": 0") != std::string::npos;
@@ -556,7 +588,7 @@ TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropThr
     const int32_t characterTopic = topicIdOf(c.node(awaitController(c)), "character");
     ASSERT_GE(characterTopic, 0);
     std::vector<int32_t> leaders;
-    ASSERT_TRUE(awaitLeaders(c, characterTopic, 1, leaders, 30s));
+    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
     const int32_t leader = leaders[0];
     const int survivor = leader == 1 ? 2 : 1;
 
@@ -567,15 +599,16 @@ TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropThr
     ASSERT_EQ(ql(endpointOf(c, survivor), "drop view character_name;", &out, &err), 0) << err;
     c.crash(leader);
     c.startNode(leader);
+    const auto inFlightDeadline = std::chrono::steady_clock::now() + 10s;
     for (const rc::Token t : inFlight) {
-        const rc::WriteResult r = w->await(t);
+        const rc::WriteResult r = w->await(t, std::max(1ms, std::chrono::duration_cast<std::chrono::milliseconds>(inFlightDeadline - std::chrono::steady_clock::now())));
         EXPECT_NE(r.status(), rc::OpStatus::Timeout);
         EXPECT_NE(r.status(), rc::OpStatus::Closed);
     }
 
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
-    ASSERT_TRUE(awaitLeaders(c, characterTopic, 1, leaders, 30s));
+    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
     EXPECT_TRUE(waitFor([&] {
         for (const int id : c.runningNodes()) {
             const int32_t worker = rune::metadata::ShardRouter(c.node(id).workerCountForTest()).workerForPartition(characterTopic, 0);
@@ -636,8 +669,8 @@ struct PcWriter {
         pc.acks     = acks;
         pc.lingerUs = 1;
         prod.emplace(client->producer(pc));
-        client->connectAndWait(30s);
-        topic.emplace(client->openTopicAndWait<Pc>("pc", *prod, 30s));
+        client->connectAndWait(10s);
+        topic.emplace(client->openTopicAndWait<Pc>("pc", *prod, 10s));
         cq.emplace(*client);
     }
     ~PcWriter() {
@@ -669,6 +702,8 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
     ASSERT_EQ(ql(b.endpoint(), "create unique view pc_name key lower(name) as nameKey as select id from pc;", &out, &err), 0) << err;
     ViewHandle view(b.node(), "pc_name");
 
+    // The client has no idempotence switch: an acks=none batch is its non-idempotent wire path (producer id -1) and gets no completion, so
+    // "today's completion" is asserted for acks=leader, acks=all and the v11 session only; the pid -1 check path has model-level tests.
     struct Kind { rc::Acks acks; int32_t announce; };
     uint64_t id = 1;
     std::optional<int64_t> firstFoo;
@@ -689,7 +724,7 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
     }
     ASSERT_TRUE(firstFoo.has_value());
     ASSERT_TRUE(waitFor([&] {
-        return runCli({"stats", "topic", "pc", "--json", "--broker", b.endpoint()}, &out, &err) == 0 && out.find("\"rejectionsConstraint\": 7") != std::string::npos;
+        return runCli({"stats", "topic", "pc", "--json", "--broker", b.endpoint()}, &out, &err) == 0 && out.find("\"rejectionsConstraint\": 7,") != std::string::npos;
     }, 10s)) << out << err;
 
     rc::Client& reader = *b.connectClient();
@@ -709,7 +744,7 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
     const int32_t topicId = topicIdOf(b.node(), "pc");
     cfg.topics.push_back(rc::TopicSpec{"pc", topicId, 1});
     rc::Client consumer(cfg);
-    consumer.connectAndWait(30s);
+    consumer.connectAndWait(10s);
     std::mutex mu;
     std::set<int64_t> got;
     rc::SubscribeOptions o;
