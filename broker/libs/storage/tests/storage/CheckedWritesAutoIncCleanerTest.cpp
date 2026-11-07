@@ -863,13 +863,17 @@ TEST(CheckedWritesAutoIncCleanerRegression, EvictedProducerWritingAgainIsTakenBa
     for (const bool coalesce : {false, true}) {
         SCOPED_TRACE(name(coalesce));
         const auto dir = tempDir();
+        constexpr int kN = 800;   // 800 producers: past the 64 KiB window
         {
-            Log log(dir.string(), /*segmentBytes=*/1);
+            Log log(dir.string(), /*segmentBytes=*/1 << 20);   // the batches aged together share one segment
             log.recover();
-            constexpr int kN = 800;   // 800 producers: past the 64 KiB window
             rec(log, 0, 7, 0, 5000, "old");   // the live producer's first batch, long before the rest
             for (int i = 0; i < kN; ++i) rec(log, 1 + i, 1000 + i, 0, uint64_t(i), "insert");
             for (int i = 0; i < kN; ++i) rec(log, 1 + kN + i, 1000 + i, 1, uint64_t(i), "again");   // each writes again, interleaved
+        }
+        {
+            Log log(dir.string(), /*segmentBytes=*/1);   // from here on a segment per batch
+            log.recover();
             int64_t off = 1 + 2 * kN;
             int32_t seq7 = 1;
             for (int i = 0; i < 32; ++i, ++off) rec(log, off, 7, seq7++, 6000 + uint64_t(i), "live", now);
