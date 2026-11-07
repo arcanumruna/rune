@@ -849,7 +849,7 @@ PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospe
                          f.keyed, f.groupIds != nullptr ? &groupIdsT : nullptr, f.nextGroupId != nullptr ? *f.nextGroupId : 0};
     const StepOut o = aggStep(cx, f.vdc, rec.writer, rec.key, rec.value);
     if (x.locked) return PrepareStatus::Locked;
-    if (ov.full()) return PrepareStatus::CapacityExhausted;
+    if (ov.full() || (chain != nullptr && chain->full())) return PrepareStatus::CapacityExhausted;   // a dropped absent-read lock is as bad as a dropped write
     if (o.kind == StepKind::Malformed) return PrepareStatus::Malformed;
     if (o.kind == StepKind::None) return PrepareStatus::Ok;
     const auto viewRow = [&](ProspectRow& row, uint64_t g) {

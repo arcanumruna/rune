@@ -703,3 +703,14 @@ TEST(CheckedWritesKeyedAgg, ChainedDropThenRecreateOfAStoredGroupIsNew) {
     ASSERT_EQ(record(2, &second, &chain, false), PrepareStatus::Ok);   // and created again
     EXPECT_FALSE(r.p.rows[0].existed);
 }
+
+TEST(CheckedWritesKeyedAgg, ShortOverlayRowsNeverReachTheSpareRow) {
+    Rig r(deviceHistory());
+    TxnOverlay chain;
+    chain.reserve(512, 4);
+    const std::string key = wireKey(1), value = valueOf(r.src, ev(1, 1, "a", 5, 5));
+    const rune::view::SourceRecord rec{key, value, 0, 0, nullptr};
+    auto f = r.fold();
+    EXPECT_EQ(prepareAggregate(f, rec, r.p, &chain), PrepareStatus::CapacityExhausted);   // the group id row (8 bytes) would land in the 4-byte spare
+    for (std::size_t i = 0; i < 4; ++i) EXPECT_EQ(chain.spare()[i], 0) << i;
+}

@@ -205,6 +205,7 @@ PrepareStatus prepareKeyed(Stores& s, const SourceRecord& rec, Prospect& p) noex
     }
     const ViewKey wire = ViewKey::fromBytes(asBytes(rec.key));
     const uint8_t* owner = ks.ownerMapped ? s.owners.get(wire) : nullptr;
+    if (owner != nullptr) s.owners.pin(wire);   // every record of this source reads its owner entry first: a held one locks an outside Move or delete
     const UniqueClaims* cl = f.claims;
     ProspectRow& n = p.rows[0];
 

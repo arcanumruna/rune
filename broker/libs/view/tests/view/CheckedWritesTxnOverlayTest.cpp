@@ -299,6 +299,7 @@ TEST(CheckedWritesTxnOverlay, OverlayRowsShorterThanATableRowAreCapacityExhauste
     narrow.reserve(16, 8);
     EXPECT_EQ(u.prepare(1, "foo", &narrow), PrepareStatus::CapacityExhausted);
     EXPECT_EQ(narrow.rows(), 0u);
+    for (std::size_t i = 0; i < narrow.maxRowLen(); ++i) EXPECT_EQ(narrow.spare()[i], 0) << i;   // nothing was put into the spare row
 }
 
 TEST(CheckedWritesTxnOverlay, ARowThatDecidesAConflictIsLocked) {
@@ -323,6 +324,41 @@ TEST(CheckedWritesTxnOverlay, ARowAnotherSourceOwnsIsLockedForUniqueToo) {
     EXPECT_TRUE(u.p.rows[0].ownedByOther);
     const TxnLockSet locks = lockSetOf(u.chain);
     EXPECT_EQ(u.prepare(1, "", nullptr, false, &locks), PrepareStatus::Locked);
+}
+
+TEST(CheckedWritesTxnOverlay, OwnerMappedMineThenOutsideMoveIsLocked) {
+    UniqueRig u(false);
+    ASSERT_EQ(u.prepare(1, "foo", nullptr, true), PrepareStatus::Ok);
+    ASSERT_EQ(u.prepare(1, "foo", &u.chain), PrepareStatus::Ok);   // updated in place: the row it holds is the one it owns
+    const TxnLockSet locks = lockSetOf(u.chain);
+    EXPECT_EQ(u.prepare(1, "bar", nullptr, false, &locks), PrepareStatus::Locked);   // a Move off that row
+    EXPECT_EQ(u.prepare(1, "", nullptr, false, &locks), PrepareStatus::Locked);
+    EXPECT_EQ(u.prepare(2, "bar", nullptr, false, &locks), PrepareStatus::Ok);
+}
+
+TEST(CheckedWritesTxnOverlay, UniqueMineThenOutsideDeleteIsLocked) {
+    UniqueRig u;
+    ASSERT_EQ(u.prepare(1, "foo", nullptr, true), PrepareStatus::Ok);
+    ASSERT_EQ(u.prepare(1, "foo", &u.chain), PrepareStatus::Ok);
+    const TxnLockSet locks = lockSetOf(u.chain);
+    EXPECT_EQ(u.prepare(1, "", nullptr, false, &locks), PrepareStatus::Locked);
+}
+
+TEST(CheckedWritesTxnOverlay, UniqueMineThenOutsideMoveIsLocked) {
+    UniqueRig u;
+    ASSERT_EQ(u.prepare(1, "foo", nullptr, true), PrepareStatus::Ok);
+    ASSERT_EQ(u.prepare(1, "foo", &u.chain), PrepareStatus::Ok);
+    const TxnLockSet locks = lockSetOf(u.chain);
+    EXPECT_EQ(u.prepare(1, "bar", nullptr, false, &locks), PrepareStatus::Locked);
+    EXPECT_EQ(u.prepare(2, "bar", nullptr, false, &locks), PrepareStatus::Ok);
+}
+
+TEST(CheckedWritesTxnOverlay, AggregateAbsentTombstoneOnAFullChainIsCapacityExhausted) {
+    AggRig r(userTotals());
+    TxnOverlay none;
+    none.reserve(0, 512);   // the absent-contributor lock has no room
+    EXPECT_EQ(r.prepare(5, -1, 0, &none), PrepareStatus::CapacityExhausted);
+    EXPECT_TRUE(none.full());
 }
 
 TEST(CheckedWritesTxnOverlay, FullOverlayIsCapacityExhausted) {
