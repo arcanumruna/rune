@@ -2,6 +2,7 @@
 // the lease view that one CreateTopic creates beside its topic, the state-driven lease rules and the v4 golden log.
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogFile.h>
+#include <rune/catalog/CatalogQueries.h>
 #include <rune/catalog/CatalogReplayer.h>
 #include <rune/catalog/CatalogState.h>
 #include <rune/catalog/testing/GoldenScript.h>
@@ -19,6 +20,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -40,6 +42,19 @@ std::vector<uint8_t> leaseBlob(cd::PrimType keyType = cd::PrimType::FixedStr) {
     else b.add("id", keyType, 1, /*isKey=*/true);
     return cd::serialize(b.build());
 }
+/// A lease schema blob with the given system columns (name, type) in order, then `id` (the key), then `extra` fields.
+std::vector<uint8_t> columnsBlob(const std::vector<std::pair<const char*, cd::PrimType>>& cols,
+                                 const std::vector<const char*>& extra = {}, const char* keyName = "id") {
+    cd::DescriptorBuilder b("inst");
+    for (const auto& [n, t] : cols) b.add(n, t, 1, std::string_view(n) == keyName);
+    if (std::string_view(keyName) == "id") b.addFixedStr("id", 64, 1, /*isKey=*/true);
+    else b.addFixedStr("id", 64);
+    for (const char* e : extra) b.add(e, cd::PrimType::Int32);
+    return cd::serialize(b.build());
+}
+using Cols = std::vector<std::pair<const char*, cd::PrimType>>;
+const Cols kSysCols = {{"lease_version", cd::PrimType::Int64}, {"lease_ttl_ms", cd::PrimType::UInt64},
+                       {"lease_holder", cd::PrimType::UInt64}, {"lease_remaining_ms", cd::PrimType::UInt64}};
 rc::CreateTopicOps leaseOps(int32_t topicId, const rp::LeaseSpec& spec = {}) {
     rc::CreateTopicOps o;
     o.topicId = topicId; o.partitions = 2; o.config.cleanupPolicy = 1;
@@ -386,7 +401,25 @@ INSTANTIATE_TEST_SUITE_P(LeaseCatalogRegression, LeaseCatalogCreateRules, ::test
                "a lease topic is compacted and keeps every live lease"},
     CreateRule{"RetentionBytes", [](rc::CreateTopicOps& o, std::string&) { o.config.retentionBytes = 1000; },
                "a lease topic is compacted and keeps every live lease"},
-    CreateRule{"NameTooLong", [](rc::CreateTopicOps&, std::string& n) { n = std::string(243, 'a'); }, "is too long"}),
+    CreateRule{"NameTooLong", [](rc::CreateTopicOps&, std::string& n) { n = std::string(243, 'a'); }, "is too long"},
+    CreateRule{"SystemColumnsMissing", [](rc::CreateTopicOps& o, std::string&) { o.schema->descriptorBlob = columnsBlob({}); },
+               "a lease topic starts with the four lease system columns"},
+    CreateRule{"SystemColumnsWrongOrder", [](rc::CreateTopicOps& o, std::string&) {
+                   o.schema->descriptorBlob = columnsBlob({kSysCols[0], kSysCols[2], kSysCols[1], kSysCols[3]});
+               }, "a lease topic starts with the four lease system columns"},
+    CreateRule{"TtlColumnInt64", [](rc::CreateTopicOps& o, std::string&) {
+                   auto c = kSysCols;
+                   c[1].second = cd::PrimType::Int64;
+                   o.schema->descriptorBlob = columnsBlob(c);
+               }, "a lease topic starts with the four lease system columns"},
+    CreateRule{"ExtraLeaseFoo", [](rc::CreateTopicOps& o, std::string&) {
+                   o.schema->descriptorBlob = columnsBlob(kSysCols, {"lease_foo"});
+                   o.schema->nextTag = 6;
+               }, "lease_ field names are reserved"},
+    CreateRule{"KeyOnLeaseVersion", [](rc::CreateTopicOps& o, std::string&) {
+                   o.schema->descriptorBlob = columnsBlob(kSysCols, {}, "lease_version");
+                   o.schema->keyField = "lease_version";
+               }, "the key of a lease topic is a user field"}),
     [](const auto& i) { return std::string(i.param.name); });
 
 TEST(LeaseCatalogRegression, CreateRulesTableRegression) {
@@ -410,6 +443,33 @@ TEST(LeaseCatalogRegression, CreateRulesTableRegression) {
         ASSERT_FALSE(r.has_value());
         EXPECT_TRUE(has(r.error().detail, "objectId"));
     }
+}
+
+// 8b ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+TEST(LeaseCatalogRegression, ModuloAndAutoIncrementOnLeaseCreateRefusedByV3Regression) {
+    auto refusal = [](const std::function<void(rc::CreateTopicOps&)>& mutate) {
+        rc::CatalogState s;
+        auto o = leaseOps(0);
+        mutate(o);
+        const auto r = put(s, v4(o, "inst", 1, 0));
+        EXPECT_FALSE(r.has_value());
+        EXPECT_TRUE(s.topics().empty());
+        return r.has_value() ? std::string{} : r.error().detail;
+    };
+    // the modulo partitioner alone: ApplyV3's text, before any lease rule
+    EXPECT_TRUE(has(refusal([](rc::CreateTopicOps& o) { o.schema->keyFeatures.partitioner = rp::Partitioner::Modulo; }),
+                    "the modulo partitioner needs autoincrement"));
+    // autoincrement without key.index (a key type it accepts)
+    const std::string noIndex = refusal([](rc::CreateTopicOps& o) {
+        o.schema->descriptorBlob = leaseBlob(cd::PrimType::UInt64);
+        o.schema->keyFeatures = {.keyIndex = false, .autoIncrement = true, .partitioner = rp::Partitioner::Modulo};
+    });
+    EXPECT_TRUE(has(noIndex, "autoincrement needs key.index")) << noIndex;
+    // autoincrement over a key type it refuses
+    EXPECT_TRUE(has(refusal([](rc::CreateTopicOps& o) {
+                        o.schema->keyFeatures = {.keyIndex = true, .autoIncrement = true, .partitioner = rp::Partitioner::Modulo};
+                    }),
+                    "autoincrement needs a uint64, int64 or uint32 key"));
 }
 
 // 9 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -526,6 +586,7 @@ TEST(LeaseCatalogRegression, AlterSchemaGuardsRegression) {
         auto add = op(cd::AlterOpType::Add, 5, "lease_x");
         refuses(add, "lease_ field names are reserved");
     }
+    refuses(op(cd::AlterOpType::Rename, 4, "lease_x"), "lease_ field names are reserved");   // a rename's NEW name is reserved too
     rc::CatalogState s;
     leaseState(s);
     auto add = op(cd::AlterOpType::Add, 5, "note");
@@ -535,6 +596,15 @@ TEST(LeaseCatalogRegression, AlterSchemaGuardsRegression) {
     EXPECT_EQ(t->schema->schemaVersion, 2);
     EXPECT_EQ(t->lease, rp::LeaseSpec{}) << "carried across the AlterSchema";
     EXPECT_NE(s.viewByName(rc::kDefaultNsId, "inst.leases"), nullptr);
+    {   // renaming the user field `note` (tag 5): to lease_x is refused, to memo applies
+        const uint64_t before = s.digest();
+        const auto bad = put(s, v4(rc::AlterSchemaOps{{op(cd::AlterOpType::Rename, 5, "lease_x")}}, "inst", 1, 2));
+        ASSERT_FALSE(bad.has_value());
+        EXPECT_TRUE(has(bad.error().detail, "lease_ field names are reserved")) << bad.error().detail;
+        EXPECT_EQ(s.digest(), before);
+        const auto good = put(s, v4(rc::AlterSchemaOps{{op(cd::AlterOpType::Rename, 5, "memo")}}, "inst", 1, 2));
+        EXPECT_TRUE(good.has_value()) << good.error().detail;
+    }
     // a plain typed topic is not guarded: it may add lease_ fields and drop tag 2
     rc::CatalogState p;
     auto plain = leaseOps(0);
@@ -749,4 +819,173 @@ TEST(LeaseCatalogRegression, KeyWidthRegression) {
         EXPECT_EQ(cd::isLeaseTopicKeyType(p, 8), cd::isTopicKeyType(p, 8)) << static_cast<int>(t);
     }
     static_assert(cd::kMaxLeaseKeyBytes == rp::kMaxLeaseKeyBytes);
+}
+
+// 17 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+TEST(LeaseCatalogRegression, OldFormatLeaseKeysDecodeBadEnumRegression) {
+    for (const uint16_t f : {rc::kFormatV1, rc::kFormatV2, rc::kFormatV3}) {
+        for (uint8_t key = 7; key <= 12; ++key) {
+            auto bytes = rc::encode(v4(cfg({{static_cast<rc::ConfigKey>(key), 5000}}), "inst", 1, 1)).value();
+            // the body is the same for formatVer 1..4 (an AlterTopicConfig has no key block or lease trailer); only the
+            // header differs: formatVer 1 has no nsId after the kind
+            bytes[0] = static_cast<uint8_t>(f);
+            bytes[1] = 0;
+            if (f == rc::kFormatV1) bytes.erase(bytes.begin() + 4, bytes.begin() + 8);
+            const auto d = rc::decode(bytes);
+            ASSERT_FALSE(d.has_value()) << "formatVer " << f << " key " << int{key};
+            EXPECT_EQ(d.error(), rc::DecodeError::BadEnum) << "formatVer " << f << " key " << int{key};
+        }
+    }
+    // control: key 6 decodes at formatVer 1 through the same patching
+    auto ok = rc::encode(v4(cfg({{rc::ConfigKey::MaxCompactionLagMs, 5}}), "inst", 1, 1)).value();
+    ok[0] = static_cast<uint8_t>(rc::kFormatV1);
+    ok.erase(ok.begin() + 4, ok.begin() + 8);
+    EXPECT_TRUE(rc::decode(ok).has_value());
+}
+
+// 18 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+TEST(LeaseCatalogRegression, CatalogDiffSeesLeaseRegression) {
+    rc::CatalogState a, b;
+    rp::LeaseSpec other;
+    other.checkpointRate = 2'000;
+    leaseState(a);
+    leaseState(b, other);
+    const auto d = rc::diff(a, b);
+    ASSERT_EQ(d.size(), 1u) << "only the topic differs; the lease view is the same";
+    EXPECT_EQ(d[0].type, rc::ObjectType::Topic);
+    EXPECT_EQ(d[0].name, "inst");
+    EXPECT_EQ(d[0].change, rc::DiffEntry::Change::Changed);
+    EXPECT_NE(d[0].fingerprintA, d[0].fingerprintB);
+    EXPECT_EQ(d[0].fields, (std::vector<std::string>{"lease"}));
+    EXPECT_TRUE(rc::diff(a, a).empty());
+
+    // a lease view against a plan view of the same definition differs in the kind
+    rc::ViewObject lv = *a.viewByName(rc::kDefaultNsId, "inst.leases");
+    rc::ViewObject pv = lv;
+    pv.kind = rc::ViewKind::Plan;
+    EXPECT_EQ(rc::changedFields(lv, pv), (std::vector<std::string>{"view.kind"}));
+    EXPECT_NE(rc::layeredFingerprint(lv), rc::layeredFingerprint(pv));
+}
+
+// 19 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+TEST(LeaseCatalogRegression, StateRulesAtOldFormatsRegression) {
+    for (const uint16_t f : {rc::kFormatV2, rc::kFormatV3}) {
+        auto fresh = [&](rc::CatalogState& s) { leaseState(s); };
+        {   // DropView of the lease view
+            rc::CatalogState s;
+            fresh(s);
+            const auto r = put(s, event(f, rc::DropViewOps{1}, "inst.leases", 2, 1));
+            ASSERT_FALSE(r.has_value()) << f;
+            EXPECT_TRUE(has(r.error().detail, "drop the lease topic")) << r.error().detail;
+        }
+        {   // AlterView of the lease view
+            rc::CatalogState s;
+            fresh(s);
+            rc::ViewDef def;
+            def.viewTopicId = 2; def.sinkPartitions = 2; def.sourceNames = {"inst"};
+            const auto r = put(s, event(f, rc::AlterViewOps{def}, "inst.leases", 2, 1));
+            ASSERT_FALSE(r.has_value()) << f;
+            EXPECT_TRUE(has(r.error().detail, "a lease view cannot be altered")) << r.error().detail;
+        }
+        {   // DropTopic takes the view along
+            rc::CatalogState s;
+            fresh(s);
+            const auto r = put(s, event(f, rc::DropTopicOps{0}, "inst", 1, 1));
+            ASSERT_TRUE(r.has_value()) << f << r.error().detail;
+            EXPECT_TRUE(s.topics().empty());
+            EXPECT_TRUE(s.views().empty());
+            EXPECT_EQ(r->leaseViewObjectId, 2u);
+        }
+        {   // retention.ms on a lease topic
+            rc::CatalogState s;
+            fresh(s);
+            const auto r = put(s, event(f, cfg({{rc::ConfigKey::RetentionMs, 1000}}), "inst", 1, 1));
+            ASSERT_FALSE(r.has_value()) << f;
+            EXPECT_TRUE(has(r.error().detail, "a lease topic is compacted and keeps every live lease")) << r.error().detail;
+        }
+        {   // AlterSchema adding lease_x
+            rc::CatalogState s;
+            fresh(s);
+            const auto r = put(s, event(f, rc::AlterSchemaOps{{op(cd::AlterOpType::Add, 5, "lease_x")}}, "inst", 1, 1));
+            ASSERT_FALSE(r.has_value()) << f;
+            EXPECT_TRUE(has(r.error().detail, "lease_ field names are reserved")) << r.error().detail;
+        }
+        {   // NamespaceDeleted: pendingViews excludes the lease view
+            rc::CatalogState s;
+            ASSERT_TRUE(put(s, event(f, rc::NamespaceCreatedOps{"ns1", {}}, "ns1", 0, 0, 1)).has_value());
+            ASSERT_TRUE(put(s, v4(leaseOps(0), "inst", 1, 0, 1)).has_value());
+            const auto r = put(s, event(f, rc::NamespaceDeletedOps{}, "ns1", 0, 1, 1));
+            ASSERT_TRUE(r.has_value()) << f << r.error().detail;
+            const auto* d = std::get_if<rc::NsDeleting>(&s.namespaces().byId(1)->state);
+            ASSERT_NE(d, nullptr);
+            EXPECT_TRUE(d->pendingViews.empty()) << f;
+            EXPECT_EQ(d->pendingTopics, (std::set<uint64_t>{1})) << f;
+        }
+    }
+}
+
+// 20 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+TEST(LeaseCatalogRegression, LeaseDropCompletesNamespaceRegression) {
+    rc::CatalogState s;
+    ASSERT_TRUE(put(s, v4(rc::NamespaceCreatedOps{"ns1", {}}, "ns1", 0, 0, 1)).has_value());
+    ASSERT_TRUE(put(s, v4(leaseOps(0), "inst", 1, 0, 1)).has_value());
+    ASSERT_TRUE(put(s, v4(rc::NamespaceDeletedOps{}, "ns1", 0, 1, 1)).has_value());
+    uint32_t version = 2;
+    for (const uint8_t step : {rc::TxnsAborted, rc::GroupsTombstoned, rc::TxnStateTombstoned, rc::SecurityPurged}) {
+        auto st = put(s, v4(rc::NamespaceDeleteStepOps{step}, "ns1", 0, version++, 1));
+        ASSERT_TRUE(st.has_value()) << st.error().detail;
+        EXPECT_FALSE(st->nsErased) << "the lease topic is still to be dropped";
+    }
+    ASSERT_NE(s.namespaces().byId(1), nullptr);
+    ASSERT_NE(s.viewByName(1, "inst.leases"), nullptr);
+    const auto dt = put(s, v4(rc::DropTopicOps{0}, "inst", 1, 1, 1));
+    ASSERT_TRUE(dt.has_value()) << dt.error().detail;
+    EXPECT_TRUE(dt->nsErased);
+    EXPECT_EQ(dt->leaseViewObjectId, 2u);
+    EXPECT_EQ(s.namespaces().byId(1), nullptr);
+    EXPECT_TRUE(s.views().empty());
+    EXPECT_TRUE(s.topics().empty());
+    EXPECT_EQ(s.viewByName(1, "inst.leases"), nullptr);
+}
+
+// 21 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+TEST(LeaseCatalogRegression, LeaseOnlyAlterRequestIdRegression) {
+    auto alter = [](uint32_t prev, uint64_t lo, uint32_t nsId = 0) {
+        auto e = v4(cfg({{rc::ConfigKey::LeaseTtlMs, 5000}}), "inst", 1, prev, nsId);
+        e.principal.requestId = rp::RequestId{7, lo};
+        e.principal.requestFingerprint = 0xABCDEF0123ull;
+        return e;
+    };
+    {
+        rc::CatalogState s;
+        leaseState(s);
+        const int64_t at = s.appliedOffset() + 1;
+        ASSERT_TRUE(put(s, alter(1, 1)).has_value());
+        const auto rec = s.request(rp::RequestId{7, 1});
+        ASSERT_TRUE(rec.has_value());
+        EXPECT_EQ(rec->offset, at);
+        EXPECT_EQ(rec->kind, rc::EventKind::AlterTopicConfig);
+        EXPECT_EQ(rec->objectId, 1u);
+        EXPECT_EQ(rec->newVersion, 2u);
+        EXPECT_EQ(rec->requestFingerprint, 0xABCDEF0123ull);
+        // a second event with the same requestId
+        const auto again = put(s, alter(2, 1));
+        ASSERT_FALSE(again.has_value());
+        EXPECT_TRUE(has(again.error().detail, "already applied")) << again.error().detail;
+        EXPECT_EQ(s.topicByObjectId(1)->version, 2u);
+    }
+    {   // a DELETING namespace refuses it; a missing one is BadNsId
+        rc::CatalogState s;
+        ASSERT_TRUE(put(s, v4(rc::NamespaceCreatedOps{"ns1", {}}, "ns1", 0, 0, 1)).has_value());
+        ASSERT_TRUE(put(s, v4(leaseOps(0), "inst", 1, 0, 1)).has_value());
+        const auto missing = put(s, alter(1, 2, 9));
+        ASSERT_FALSE(missing.has_value());
+        EXPECT_EQ(missing.error().code, Code::BadNsId);
+        ASSERT_TRUE(put(s, v4(rc::NamespaceDeletedOps{}, "ns1", 0, 1, 1)).has_value());
+        const auto deleting = put(s, alter(1, 3, 1));
+        ASSERT_FALSE(deleting.has_value());
+        EXPECT_EQ(deleting.error().code, Code::Precondition);
+        EXPECT_TRUE(has(deleting.error().detail, "DELETING")) << deleting.error().detail;
+        EXPECT_FALSE(s.request(rp::RequestId{7, 3}).has_value());
+    }
 }

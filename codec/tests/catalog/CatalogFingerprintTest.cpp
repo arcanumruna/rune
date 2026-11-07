@@ -133,7 +133,7 @@ TEST(CatalogFingerprintRegression, TopicObjectEveryFieldIsCoveredAndIdsAreNot) {
         {"version", Role::Definition, [](rc::TopicObject& t) { t.version = 4; }},
         {"topicId", Role::Id, [](rc::TopicObject& t) { t.topicId = 42; }},
         {"nsId", Role::Id, [](rc::TopicObject& t) { t.nsId = 7; }},
-        {"lease", Role::Id, [](rc::TopicObject& t) { t.lease = rune::protocol::LeaseSpec{}; }},   // the v1 fingerprint is frozen; ApplyV4::leaseFingerprint layers it   // the v1 fingerprint is frozen; v2 mixes the nsId in
+        {"lease", Role::Id, [](rc::TopicObject& t) { t.lease = rune::protocol::LeaseSpec{}; }},   // the v1 fingerprint is frozen; ApplyV4::leaseFingerprint layers it
         {"partitions", Role::Definition, [](rc::TopicObject& t) { t.partitions = 5; }},
         {"replicationFactor", Role::Definition, [](rc::TopicObject& t) { t.replicationFactor = 1; }},
         {"persistence", Role::Definition, [](rc::TopicObject& t) { t.persistence = rc::Persistence::Transient; }},

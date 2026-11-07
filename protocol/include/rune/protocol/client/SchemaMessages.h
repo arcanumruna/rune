@@ -700,8 +700,9 @@ struct DropTopic {
 // are rune::protocol::ConfigKey (CatalogTypes.h, the one definition; ruling 5):
 // retention.ms 1, retention.bytes 2, delete.retention.ms 3,
 // min.cleanable.dirty.ratio (ppm) 4, min.compaction.lag.ms 5,
-// max.compaction.lag.ms 6.  Decode refuses a key outside 1..6; encode refuses a
-// block whose size does not match its count (the key is the receiver's check).
+// max.compaction.lag.ms 6; keys 7..12 are the lease keys (lease.ttl .. lease.checkpoint_rate, formatVer 4), and the
+// cleaner filters to 1..6 (lease Task 3).  Decode refuses a key outside kConfigKeyFirst..kConfigKeyLast; encode refuses
+// a block whose size does not match its count (the key is the receiver's check).
 struct ConfigChangeWire { uint8_t key; int64_t value; bool operator==(const ConfigChangeWire&) const = default; };
 
 inline constexpr uint8_t     kConfigKeyFirst      = static_cast<uint8_t>(rune::protocol::kFirstConfigKey);

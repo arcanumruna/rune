@@ -129,7 +129,9 @@ DecodeError asDecodeError(Violation v) noexcept {
     case Violation::KindOpsMismatch:  return DecodeError::KindOpsMismatch;
     case Violation::BadEnum:
     case Violation::NeedsFormatV3:    // unreachable: a v1 / v2 body has no key block
-    case Violation::NeedsFormatV4:    return DecodeError::BadEnum;   // unreachable: a v1..v3 body has no lease trailer
+    case Violation::NeedsFormatV4:    return DecodeError::BadEnum;   // reachable: a v1..v3 AlterTopicConfig with key 7..12
+                                                                     // (the lease keys) decodes into it; those keys are not
+                                                                     // in range there, so BadEnum is the right mapping
     }
     return DecodeError::BadEnum;
 }

@@ -14,8 +14,10 @@
 
 #include <rune/catalog/CatalogFingerprint.h>
 #include <rune/catalog/TopicName.h>
+#include <rune/codec/Descriptor.h>
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/PrimType.h>
+#include <rune/codec/Serialize.h>
 
 #include <iterator>
 #include <limits>
@@ -53,12 +55,32 @@ auto* stagedTopic(St& st) noexcept {
 
 std::string leaseViewName(const std::string& topicName) { return topicName + std::string(kLeaseViewSuffix); }
 
+/// The pinned layout of a lease topic's schema (a permanent replay rule): the four system columns first, in declaration
+/// order, at tags 0..3; no other lease_ field; the key is a user field (empty = fine).
+std::string leaseColumnsError(const SchemaDef& schema) {
+    using rune::codec::PrimType;
+    const rune::codec::Descriptor d = rune::codec::deserialize(schema.descriptorBlob);
+    struct Col { const char* name; PrimType type; };
+    constexpr Col kCols[] = {{"lease_version", PrimType::Int64}, {"lease_ttl_ms", PrimType::UInt64},
+                             {"lease_holder", PrimType::UInt64}, {"lease_remaining_ms", PrimType::UInt64}};
+    for (std::size_t i = 0; i < std::size(kCols); ++i) {
+        if (i >= d.fields.size() || d.fields[i].id != i || d.fields[i].name != kCols[i].name || d.fields[i].type != kCols[i].type)
+            return "a lease topic starts with the four lease system columns";
+    }
+    for (std::size_t i = std::size(kCols); i < d.fields.size(); ++i)
+        if (d.fields[i].name.starts_with("lease_")) return "lease_ field names are reserved";
+    for (const Col& c : kCols)
+        if (schema.keyField == c.name) return "the key of a lease topic is a user field";
+    return {};
+}
+
 /// The lease CreateTopic rules over the event (empty = fine).
 std::string leaseCreateError(const CatalogState& s, const CatalogEvent& e, const CreateTopicOps& o) {
     if (!o.schema || o.schema->keyField.empty()) return "a lease topic needs a typed, keyed topic";
-    const auto& f = o.schema->keyFeatures;
-    if (f.keyIndex || f.autoIncrement || f.partitioner != rp::Partitioner::Fnv1a)
-        return "a lease topic's key index is its lease view";
+    // ApplyV3 runs first and refuses a modulo partitioner without autoincrement and autoincrement without key.index,
+    // so the key index is the one key feature left to refuse here.
+    if (o.schema->keyFeatures.keyIndex) return "a lease topic's key index is its lease view";
+    if (const std::string why = leaseColumnsError(*o.schema); !why.empty()) return why;
     if (o.config.cleanupPolicy != 1 || o.config.retentionMs != -1 || o.config.retentionBytes != -1)
         return "a lease topic is compacted and keeps every live lease";
     if (e.objectName.size() + kLeaseViewSuffix.size() > kMaxTopicNameBytes)
@@ -185,7 +207,9 @@ std::optional<ApplyError> ApplyV4::guardBefore(const CatalogState& s, const Cata
         for (const ResolvedAlterOp& op : o->ops) {
             if ((op.type == rune::codec::AlterOpType::Drop || op.type == rune::codec::AlterOpType::Rename) && op.tag < kFirstUserTag)
                 return fail(offset, e, "the lease system columns cannot be dropped or renamed").error();
-            if (op.type == rune::codec::AlterOpType::Add && op.name.starts_with("lease_"))
+            // for a Rename, `name` is the NEW name
+            if ((op.type == rune::codec::AlterOpType::Add || op.type == rune::codec::AlterOpType::Rename) &&
+                op.name.starts_with("lease_"))
                 return fail(offset, e, "lease_ field names are reserved").error();
         }
     }

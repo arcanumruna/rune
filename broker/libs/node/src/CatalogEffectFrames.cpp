@@ -99,7 +99,7 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
     case cat::EventKind::CreateSchema:
     case cat::EventKind::AlterSchema:
     case cat::EventKind::SetCompatibility:
-    case cat::EventKind::AlterTopicConfig:   // its frame is fixed-size (<= 6 keys); the topic's frames are checked
+    case cat::EventKind::AlterTopicConfig:   // its frame is fixed-size (keys 1..6, plus the lease keys 7..12; the cleaner filters to 1..6, Task 3); the topic's frames are checked
         if (const cat::TopicObject* t = after.topicByObjectId(e.objectId)) return topicEffectFramesError(*t, maxFrame, t->schema ? t->schema->schemaVersion : uint16_t{1});
         return std::nullopt;
     case cat::EventKind::DropTopic:

@@ -87,19 +87,21 @@ std::optional<RequestRecord> CatalogState::request(const RequestId& requestId) c
     return it->second;
 }
 
+uint64_t layeredFingerprint(const TopicObject& t) noexcept {
+    return ApplyV4::leaseFingerprint(
+        ApplyV3::keyFeaturesFingerprint(fingerprintOf(t), t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}),
+        t.lease);
+}
+
+uint64_t layeredFingerprint(const ViewObject& v) noexcept {
+    return v.kind == ViewKind::LeaseIndex ? ApplyV4::leaseViewFingerprint(fingerprintOf(v)) : fingerprintOf(v);
+}
+
 uint64_t CatalogState::digest() const noexcept {
     // An object of a namespace other than `default` hashes with its namespace mixed in, so the same definition in
     // two namespaces is a different state; `default` objects hash exactly as they did before namespaces existed.
     auto fp = [](uint64_t objectFingerprint, uint32_t nsId) {
         return nsId == kDefaultNsId ? objectFingerprint : objectFingerprintV2(objectFingerprint, nsId);
-    };
-    auto topicFingerprint = [](const TopicObject& t) {
-        return ApplyV4::leaseFingerprint(
-            ApplyV3::keyFeaturesFingerprint(fingerprintOf(t), t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}),
-            t.lease);
-    };
-    auto viewFingerprint = [](const ViewObject& v) {
-        return v.kind == ViewKind::LeaseIndex ? ApplyV4::leaseViewFingerprint(fingerprintOf(v)) : fingerprintOf(v);
     };
     uint64_t h = rune::codec::detail::kFnvSeed;
     h = detail::fnvU64(h, static_cast<uint64_t>(appliedOffset_));
@@ -110,10 +112,10 @@ uint64_t CatalogState::digest() const noexcept {
     auto v = views_.begin();
     while (t != topics_.end() || v != views_.end()) {
         if (v == views_.end() || (t != topics_.end() && t->first < v->first)) {
-            h = detail::fnvU64(h, fp(topicFingerprint(t->second), t->second.nsId));
+            h = detail::fnvU64(h, fp(layeredFingerprint(t->second), t->second.nsId));
             ++t;
         } else {
-            h = detail::fnvU64(h, fp(viewFingerprint(v->second), v->second.nsId));
+            h = detail::fnvU64(h, fp(layeredFingerprint(v->second), v->second.nsId));
             ++v;
         }
     }

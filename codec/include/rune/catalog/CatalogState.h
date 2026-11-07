@@ -119,6 +119,11 @@ inline constexpr int64_t kMaxSegmentRollBytes = int64_t{INT32_MAX} - (int64_t{64
 /// an ALTER's open-file need with it).  Validate the result with topicConfigError.
 void applyConfigChanges(TopicConfig& c, const AlterTopicConfigOps& o) noexcept;
 
+/// The fingerprint the digest and the diff both use: fingerprintOf(), then the key features (formatVer 3), then the
+/// LeaseSpec (formatVer 4; a lease view mixes its marker instead).  A state without those hashes as before.
+[[nodiscard]] uint64_t layeredFingerprint(const TopicObject& t) noexcept;
+[[nodiscard]] uint64_t layeredFingerprint(const ViewObject& v) noexcept;
+
 struct ApplyV1;   // src/catalog/ApplyV1.h — the formatVer-1 rules (object kinds; shared with formatVer 2)
 struct ApplyV2;   // src/catalog/ApplyV2.cpp — formatVer 2: the namespace kinds and the namespace gate
 struct ApplyV4;   // src/catalog/ApplyV4.cpp — formatVer 4: lease topics (the lease view, the lease.* keys)
