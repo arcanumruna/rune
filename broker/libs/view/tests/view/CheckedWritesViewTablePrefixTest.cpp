@@ -1,5 +1,6 @@
 // Part 07 Task 6: the ViewTable prefix index (each prefix -> a hashset of the keys of its rows) and versioned scans.
 #include <gtest/gtest.h>
+#include <AllocWindow.h>
 
 #include <algorithm>
 #include <array>
@@ -360,4 +361,26 @@ TEST(CheckedWritesViewTablePrefixRegression, MemoryBytesCountsThePrefixIndexRegr
         last = t.memoryBytes();
     }
     EXPECT_GE(chunks, 2u);
+}
+
+// Emptying prefixes returns their set ids to setFree_ on the worker: the push must not allocate however many sets are free at once.
+TEST(CheckedWritesViewTablePrefix, EmptyingEveryPrefixAllocatesNothingRegression) {
+    const RowLayout L = hpLayout();
+    ViewTable t(L, 4096, 32u << 20, ViewTableKeys{.keyWidth = 16, .prefixWidth = 8, .hashSeed = 1});
+    constexpr uint64_t kPrefixes = 200;   // under deleted_'s warm reserve of 256
+    std::vector<uint64_t> order(kPrefixes);
+    for (uint64_t i = 0; i < kPrefixes; ++i) {
+        order[i] = i;
+        t.put(mkKey(16, 8, i, 1));
+    }
+    std::mt19937_64 rng(5);
+    std::shuffle(order.begin(), order.end(), rng);
+    uint64_t allocs = 0;
+    {
+        rune::testing::AllocWindow w;
+        for (const uint64_t i : order) EXPECT_TRUE(t.erase(mkKey(16, 8, i, 1)));
+        allocs = w.count();
+    }
+    EXPECT_EQ(allocs, 0u);
+    EXPECT_EQ(t.size(), 0u);
 }

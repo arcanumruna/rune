@@ -481,8 +481,8 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   - **Plan records.** The cleaner keeps control record 20; they are small and one is written per joining member. A leader whose catalog has not installed a view of the logged set waits (`judgeWaitsForInstall`) rather than
     judge without it.
   - **`uniqueConflicts`** (view stat 32, `rune stats view <unique view>`) counts the extra claimants of a `unique` view's keys: live
-    source records that share a key with its owner, from data written before the view existed. It falls as owners are deleted or
-    renamed and the next claimant is promoted, and it never rises. Remove duplicates before a back-fill.
+    source records that share a key with its owner, from data written before the view existed. It rises while the view builds, from 0 to the duplicate count; once the view has built it only falls, as owners are deleted or
+    renamed and the next claimant is promoted. Remove duplicates before a back-fill.
 
 ## Key index
 

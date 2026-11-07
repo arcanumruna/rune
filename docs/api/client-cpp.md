@@ -208,7 +208,7 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
   `BrokerError` with `errorCode` 55 to 57 and `constraintIdOf(completion)`; a `claimBatch` or Tier-2 batch of two or more records completes once and reports every
   record: `Ok` when all were accepted, else `RecordsRejected` (15) with `value` = the base offset, the first rejection's
   `errorCode`, and a payload of every rejection (`BatchVerdicts`: `rejectedCount()`, `rejection(k)`, `accepted(i)`,
-  `offsetOf(i)`); the other records were stored at base + index. A batch of one record keeps the single-record form
+  `offsetOf(i)`, an accepted record's offset, -1 for a rejected one); the other records were stored at base + index. A batch of one record keeps the single-record form
   (`BrokerError`; `value`, like a rejected single `send`, is the rejected record's own offset). The completion reserves its full size up front (`claimBatch` above the queue's record
   limit returns `MessageTooLarge`). A retry inside the broker's window replays the original verdicts; a retry outside it completes the whole batch
   with `OpStatus::VerdictUnknown` (`errorCode` 21). `OpStatus::StoredIdUnknown` (13) is the same for a key-0 create (see [Autoincrement](#autoincrement)). A transactional
@@ -287,8 +287,8 @@ broker still rejects the record, but the writer is not told.
 - **`WriteResult`**: `code()` is 55, `constraintId()` is `viewObjectId << 16 | ordinal` (ordinal 0 is the view's `unique`
   clause, `k` its `k`-th `constraint`) and `offset()` is the rejected record's own offset. A `Completion` of a single send or of
   `claimBatch(1)`, a 1-record Tier-2 batch and a 1-record `BatchAck` all carry that offset in `value`. A batch of two or more
-  records completes once with `RecordsRejected` (15) and reports every rejection with `offset = base + index`
-  (`BatchVerdicts::offsetOf(i)`).
+  records completes once with `RecordsRejected` (15) and reports every rejection; a rejected record's offset is `value + rejection(k).index`
+  (`BatchVerdicts::offsetOf(i)` gives an accepted record's offset and -1 for a rejected one).
 - **`Client::constraintName(id)`** returns the `ConstraintName{view, constraint}` an id names (`character_name` / `unique`,
   `account_stats` / `max_characters`), or `std::nullopt` for id 0 (the key index) and for an id no view ever had. A view that
   was dropped or replaced since the write still resolves. A miss is answered from one catalog refresh, bounded by

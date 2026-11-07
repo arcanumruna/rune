@@ -551,8 +551,7 @@ TEST(CheckedWritesAllocRegression, StatsServingAllocatesNothingRegression) {
 // constraints were created, so the owner of a name leaves (deleted or renamed) and the next claimant is promoted all through
 // the run.  Characters 161..244 churn through a pool of 64 names; account 41 is full, so every move into it is refused.  A
 // batch's records touch distinct characters and distinct names, and the model of the names and accounts follows the acks.
-// No account loses its last character: emptying an account's prefix set grows the keyed table's free list, which is that table's
-// amortized growth and not judging's.
+// Accounts empty and refill as characters are deleted and moved.
 // The window brackets the worker's passes of one batch; the frame, the ack wait and the model are the rig's.
 TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNothingRegression) {
     using Char = VerdictRig::Char;
@@ -568,18 +567,17 @@ TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNoth
     r.enableAcks();
     r.worker->setVerdictIntervalNs(20'000'000);
     r.passes(60);
+    const int64_t raw = r.subscribe(SubKind::Raw);
 
     std::array<std::string, 257> name;
     std::array<uint64_t, 257> user{};
     std::array<bool, 257> alive{};
-    std::array<int, kFull + 1> inUser{};      // live characters per account
     std::map<std::string, uint64_t> owner;   // lower(name) of the pool -> the character that owns it
     std::vector<Char> seed;
     for (uint64_t id = 1; id <= 256; ++id) {
         user[id] = id >= 245 ? kFull : id % 40 + 1;
         name[id] = id <= kClaimed ? (id % 3 == 0 ? "DUP" : id % 3 == 1 ? "dup" : "Dup") + std::to_string((id - 1) % 8) : "Z" + std::to_string(id);
         alive[id] = true;
-        ++inUser[user[id]];
         seed.push_back(Char{.id = id, .userId = user[id], .name = name[id]});
     }
     for (std::size_t at = 0; at < seed.size(); at += 16) {
@@ -616,14 +614,12 @@ TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNoth
         std::vector<Char> out;
         std::set<uint64_t> usedIds;
         std::set<std::string> usedNames;
-        std::array<int, kFull + 1> leaving{};
         const auto fresh = [&](uint64_t id) { return usedIds.insert(id).second; };
-        const auto leaves = [&](uint64_t id) { return inUser[user[id]] - leaving[user[id]]++ > 1; };   // an account keeps a character
         if (round % 20 == 0) {   // the owner of a claimed name leaves: deleted or renamed away, and the next claimant is promoted
             const uint64_t group = static_cast<uint64_t>(round / 20) % 8, id = ownerOfClaimed(group);
             const std::string to = freePoolName(usedNames);
             const bool erase = (round / 20) % 2 == 0 || to.empty();
-            if (id != 0 && fresh(id) && (!erase || leaves(id))) {
+            if (id != 0 && fresh(id)) {
                 if (erase) out.push_back(Char{.id = id, .tombstone = true});
                 else { usedNames.insert(lower(to)); out.push_back(Char{.id = id, .userId = user[id], .name = to}); }
             }
@@ -642,7 +638,7 @@ TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNoth
                 if (!alive[id] || !fresh(id)) continue;
                 out.push_back(Char{.id = id, .userId = kFull, .name = name[id]});
             } else if (pick < 30) {   // delete
-                if (!alive[id] || !fresh(id) || !leaves(id)) continue;
+                if (!alive[id] || !fresh(id)) continue;
                 out.push_back(Char{.id = id, .tombstone = true});
             } else if (pick < 45) {   // create
                 if (alive[id] || !fresh(id)) continue;
@@ -660,7 +656,7 @@ TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNoth
             } else {   // a move or a plain update, of any character (a claimant keeps its name)
                 const uint64_t any = 1 + next(kMobile);
                 if (!alive[any] || !fresh(any)) continue;
-                const bool moves = pick < 85 && leaves(any);
+                const bool moves = pick < 85;
                 out.push_back(Char{.id = any, .userId = moves ? next(40) + 1 : user[any], .name = name[any], .lastPlayed = static_cast<int64_t>(round)});
             }
         }
@@ -678,12 +674,10 @@ TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNoth
             if (refused.count(i) != 0) continue;
             ++accepted;
             const Char& c = sent[i];
-            if (alive[c.id]) --inUser[user[c.id]];
             if (alive[c.id] && owner.count(lower(name[c.id])) != 0 && owner[lower(name[c.id])] == c.id) owner.erase(lower(name[c.id]));
             alive[c.id] = !c.tombstone;
             if (c.tombstone) continue;
             user[c.id] = c.userId;
-            ++inUser[c.userId];
             name[c.id] = c.name;
             if (lower(c.name)[0] == 'p') owner[lower(c.name)] = c.id;
         }
@@ -704,6 +698,8 @@ TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNoth
             }
             allocs = w.count();
         }
+        r.passes(1);
+        if (round % 50 == 0) (void)r.collect(raw);
         windowRejections += r.stats()->rejectionsConstraint - before;
         const auto a = r.ack(c);
         EXPECT_TRUE(a && a->code == 0) << "round " << round;
@@ -730,5 +726,6 @@ TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNoth
     EXPECT_EQ(windowRejections, rejected) << "every rejection of the measured batches happened inside a window";
     EXPECT_LT(r.uniqueConflicts(CV::CharacterName) + 50, conflictsBefore) << "more than 50 extra claimants were promoted in the measured span";
     EXPECT_GT(accepted, static_cast<uint64_t>(kMeasured));
+    EXPECT_GT(r.worker->subscriptionPositionForTest(raw), 1000) << "the Raw subscription was served";
     EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
 }

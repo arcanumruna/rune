@@ -286,7 +286,7 @@ C++ constants are `ErrorCode` values; codes 59 to 61 reach only sessions at clie
 | 35 | `ViewKeyInvalid` | The key does not appear in the output, `group by` does not equal the key, `group by` has no aggregate column, or the source has no key (a keyless topic cannot be a view source). |
 | 36 | `ViewNotCoPartitioned` | An aggregate view, or a view keyed by anything but the source key, over a source with more than one partition. |
 | 59 | `ViewKeyExpressionInvalid` | A key component that does not compile: a type that is not an integer, enum, `bool` or `string(N)`; `lower()` on a type other than `string(N)`; a duplicate key column; a key over 128 bytes; a `lower()` pinned to another Unicode version; the identity rule above; an aggregate over a source key wider than 8 bytes. |
-| 60 | `ViewConstraintInvalid` | A `check` constraint: no name, a duplicate name, a column that is not in the view, or a comparison of different types; or a limit of [Constraints](#constraints) (more than 32 verdict views, an object id of 65536 or above, an oversized plan). |
+| 60 | `ViewConstraintInvalid` | A `check` constraint: no name, a duplicate name, a column that is not in the view, or a comparison of different types; more than 64 predicate nodes (`kMaxPredicateNodes`); or a limit of [Constraints](#constraints) (more than 32 verdict views, an object id of 65536 or above, an oversized plan). |
 | 61 | `ViewUniqueInvalid` | A `unique` clause that does not compile (`unique` on an aggregate). |
 
 ## The RegressorsPath schema

@@ -316,8 +316,7 @@ while the cluster is below the checked-writes feature level.
   prefix of the wrong width and a token of the wrong length are `InvalidRequest`.
 - Error codes 59 to 61 are `CreateView` refusals sent to sessions at 17 or above: 59 `ViewKeyExpressionInvalid` (a key
   component that does not compile: a type that is not an integer, enum, bool or `string(N)`, `lower()` on a type other than
-  `string(N)`, a duplicate component, a key wider than 128 bytes), 60 `ViewConstraintInvalid` and 61 `ViewUniqueInvalid`. `check` and `unique`
-  clauses are refused (60 and 61) until the view-constraint engine ships.
+  `string(N)`, a duplicate component, a key wider than 128 bytes), 60 `ViewConstraintInvalid` and 61 `ViewUniqueInvalid`.
 - A view whose key is not exactly the source key needs a source with one partition (`ViewNotCoPartitioned`).
 
 ## Encrypted frames (TLS 1.3 / AEAD)
@@ -433,8 +432,8 @@ rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16
 | 57 | `KeyNotFound` | Client 17: `update` or delete-existing on a key that is absent. Never visible. | per-record verdict of a `View` ack |
 | 58 | `AutoIncrementExhausted` | Client 17: the counter reached `autoincrement.max`. Nothing is stored and the counter is unchanged. | not retried |
 | 59 | `ViewKeyExpressionInvalid` | Client 17: a view key expression does not compile (a bad type, `lower()` on a non-string, a duplicate or over-wide key, the identity rule). | DDL compile error |
-| 60 | `ViewConstraintInvalid` | Client 17: a `check` constraint does not compile. Until the view-constraint engine ships, any view with a `check`. | DDL compile error |
-| 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. Until the view-constraint engine ships, any `unique` view. | DDL compile error |
+| 60 | `ViewConstraintInvalid` | Client 17: a `check` that does not compile, or a constraint limit (32 verdict views, object id 65536 or above, plan record over 65,536 bytes). | DDL compile error |
+| 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. | DDL compile error |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,

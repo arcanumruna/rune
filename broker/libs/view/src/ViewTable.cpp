@@ -560,6 +560,7 @@ void ViewTable::prefixInsert(const Probe& p, uint32_t rid) {
         } else {
             id = static_cast<uint32_t>(sets_.size());
             sets_.emplace_back();
+            setFree_.reserve(sets_.capacity());   // prefixErase pushes freed set ids on the worker
             setPrefixBytes_.resize(sets_.size() * prefixWidth_);
         }
         std::memcpy(setPrefixBytes_.data() + size_t{id} * prefixWidth_, prefix, prefixWidth_);
