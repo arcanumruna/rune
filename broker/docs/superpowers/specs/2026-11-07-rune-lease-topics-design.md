@@ -1,8 +1,42 @@
 # Lease topics: etcd-style leases in Rune, and a Rune-backed discovery library
 
-Status: DRAFT 2026-11-07, revision 3, for owner review. Revision 3 applies the owner's rulings: "mirror etcd's lease
+Status: DRAFT 2026-11-07, revision 4, for owner review. Revision 3 applied the owner's rulings: "mirror etcd's lease
 semantics exactly", "no lease simply expires … take over a lease? out of spec", and "the main purpose of lease topics
-is to replace what the `discovery` library plus etcd do today, with exact parity". Branch read: `origin/main` @ 33de61d9.
+is to replace what the `discovery` library plus etcd do today, with exact parity". Revision 4 applies the builder
+check (below). Branch read: `origin/main` @ 33de61d9; the key-width facts in §5.1 were re-read at 6f79348.
+
+**Revision 4 change log (builder-check settlements, Coordinator's call, Herald consistency pass K15 R1–R11, F3,
+B28).** Lease semantics (grant, keepalive, revoke, expiry, the etcd rows of §4) are unchanged; these fix places where
+rev 3 could not be built or could expire early.
+- **R1** Lease-topic keys are up to 128 bytes; the discovery path is `string(128)`. §5.1 lists the code that must
+  change (§3.1, §5.1).
+- **R2** `ScanLeases` walks the lease view in seeded-key-hash order: the resume token is the last hash, the prefix is
+  filtered on the broker, a page is O(n), and the handoff's rule 3 is over hash ranges (§8.3, §12.4). Recipes find
+  "the lowest version" from their shared `LeaseWatch`, not from a scan (§12.3).
+- **R3** A promoted leader arms at the lease-clock time its view enters `Ready`, not at `refoldJudgedNow` (§9.2, §9.6).
+- **R4** A new wheel state `Checkpointing{ckptOffset}`; keepalives park there. No checkpoint and no `Expire` is
+  emitted from `Clearing`, `Checkpointing` or `Emitting`. A keepalive's `Checkpoint(0)` passes the emission gate or
+  parks (§8.1, §9.5, §9.6).
+- **R5** At `onAtRisk` the client fails every pending and unsent produce of the producers bound to that lease
+  (§12.2).
+- **R6** The caller-supplied-client form of the discovery library is fully asynchronous: it owns its own
+  `LeaseSession` on that client, every operation is a state machine driven by `doWork(nowNs)`, and it has
+  `stopAsync()` / `isStopped()`; the client outlives the library (§13).
+- **R7** `LeaseSession<Capacity, OnLost, OnAtRisk>` is untyped, `add(topic, partition, keyBytes, version, ttlMs)`,
+  and learns ends from an optional shared `LeaseWatch`; recipes share one `LeaseWatch` (§12.2, §12.3).
+- **R8** `lastAppended` tracks only `Revoke` and `Update`, so contenders' grants cannot defer an `Expire` (§6.4, §9.3).
+- **R9** The broker re-encodes every `Revoke` from the lease view, so it carries the full row (§6.2, §6.3).
+- **R10** §19 describes Herald 02's real use (the `HERALD_*` producers, passive consumers, the `herald-pool`
+  sidecar), with Herald's slot formula `nsId << 16 | roleId`, `roleId = role << 8 | partition` (B28).
+- **R11** The `min_ttl` floor is a fixed catalog constant of 1 s; deadline arithmetic saturates; a discovery
+  `Producer` needs `READ` and `WRITE` (§4, §5.2, §10, §14.1).
+- **F3** `herald.idslots` is keyed `(slot, epoch)` and its value column is `fencingToken` (§19.4).
+- **F7** Herald's server-API idempotency is a plain swept topic, not a lease; it is gone from §19. Herald's tenant
+  delete grace is added (§19.6).
+- **Vague items settled:** `onAtRisk` (§12.2), the async client API (§12.1), the `Expire` / `Checkpoint` data append
+  (§9.1), the cleaner's fixed `lease_version` offset (§6.6), per-entry keepalive answers (§8.1), handoff overflow,
+  `asOfOffset` and multi-filter merge (§12.4), recipe session ids (§12.3), a local `onLost` (§12.2), known-old
+  duplicates per op (§6.3), dropping a topic with parked keepalives (§9.6).
 Program: Herald on Rune (`arcanumruna/herald`, `docs/superpowers/specs/2026-11-07-herald-00-program-overview.md`,
 decision D5: no etcd, Redis or Postgres, so Rune is the only store and bus; §13 rows "Lease semantics" and "Leases:
 purpose and uses").
@@ -79,7 +113,7 @@ Herald also needs leases for other things (doc 00 §13):
 - leadership (the tenant lease and singletons);
 - worker fencing;
 - short holds (case claims, invites, rate limits, break-glass grants);
-- deadlines that need an expiry event (sanction and strike expiry, server-API idempotency, appeal tokens).
+- deadlines that need an expiry event (sanction and strike expiry, appeal tokens, the tenant delete grace).
 
 Herald's presence and auto-dissolve use no leases (§19.3, §19.5).
 
@@ -169,7 +203,7 @@ One lease topic per deployment namespace, with one partition, so every consumer 
 
 ```sql
 lease topic 'herald-sys/discovery' {
-    path      string(192),   -- <servicePrefix>/<region>/<cluster|_shared>/<serviceName>/<replicaId>/<incarnation>
+    path      string(128),   -- <servicePrefix>/<region>/<cluster|_shared>/<serviceName>/<replicaId>/<incarnation>
     uri       string(128),
     load      uint32,        -- 0 = not reported
     mapId     uint64, clusterId uint64, regionId uint64,   -- 0 = absent (ServiceInfo's optionals)
@@ -178,7 +212,9 @@ lease topic 'herald-sys/discovery' {
 ```
 
 The key is the etcd key path, extended with an `incarnation` segment (DG2). That keeps etcd's prefix layout, so
-`ScanLeases` with a prefix is etcd's prefix `Get`.
+`ScanLeases` with a prefix is etcd's prefix `Get` (in hash order, not key order: §8.3). The path is at most 128 bytes,
+the lease-topic key limit (§5.1, Coordinator's call, R1); the incarnation takes 17 of them (`/` plus 16 hex digits),
+and the `Producer` refuses a longer path at construction.
 
 ### 3.2 Producer
 
