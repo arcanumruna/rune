@@ -1596,35 +1596,3 @@ std::string cwName(const ::testing::TestParamInfo<CwParam>& i) { return "cap" + 
 INSTANTIATE_TEST_SUITE_P(Cap3, CheckedWritesConstraintModelRegression, ::testing::ValuesIn(cwParams(3, 200)), cwName);
 INSTANTIATE_TEST_SUITE_P(Cap12, CheckedWritesConstraintModelRegression, ::testing::ValuesIn(cwParams(12, 20)), cwName);
 
-// WIP (Task 9): the swap a replace of account_stats should make is lost after a restart - the member leaves the set instead (prints only).
-TEST(DbgReplace, Repro) {
-    using CV = ConstrainedView;
-    for (int variant = 0; variant < 16; ++variant) {
-        const bool follower = variant & 1, drop = variant & 2, restart = variant & 4, demote = variant & 8;
-        VerdictRig r(follower, kModelRollBytes);
-        r.worker->setVerdictIntervalNs(1'000'000);
-        r.createCharacterTopic(true);
-        r.enableAcks();
-        r.passes(20);
-        if (follower) r.followerFetch();
-        r.createConstrainedView(CV::CharacterName);
-        r.createConstrainedView(CV::AccountStats, 3);
-        int32_t seq = 0;
-        const auto send = [&](const std::string& n) {
-            const std::vector<VerdictRig::Char> c{VerdictRig::Char{.userId = 1, .name = n, .intent = 1}};
-            const auto a = r.ackFetching(r.appendCharacters(c, rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll, 77, seq), 6000);
-            seq += 1;
-            return a.has_value();
-        };
-        EXPECT_TRUE(send("a"));
-        if (restart) { r.restart(true); for (int i = 0; i < 400; ++i) { r.pass(); if (follower && i % 8 == 0) r.followerFetch(); } EXPECT_TRUE(send("a2")); }
-        if (demote) { r.demotePromote(); for (int i = 0; i < 400; ++i) { r.pass(); if (follower && i % 8 == 0) r.followerFetch(); } EXPECT_TRUE(send("a3")); }
-        if (drop) { r.dropConstrainedView(CV::CharacterName); EXPECT_TRUE(send("b")); r.passes(10); }
-        r.replaceConstrainedView(CV::AccountStats, 4);
-        for (int i = 0; i < 400; ++i) { r.pass(); if (follower && i % 8 == 0) r.followerFetch(); }
-        EXPECT_TRUE(send("c"));
-        std::string s;
-        for (const auto& ch : r.readLog().changes) { s += " |"; for (const auto& m : ch.members) s += " " + std::to_string(m.viewObjectId); }
-        std::printf("variant restart=%d demote=%d follower=%d drop=%d swaps=%llu changes:%s\n", restart, demote, follower, drop, (unsigned long long)r.stats()->candidateSwaps, s.c_str());
-    }
-}
