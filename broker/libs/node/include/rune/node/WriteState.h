@@ -19,6 +19,7 @@
 #include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/RejectedOffsetIndex.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -241,13 +242,19 @@ public:
             if (txns_[i].producerId == producerId) return &txns_[i];
         return nullptr;
     }
-    /// A producer's next transaction replaces its previous entry.  nullptr: the table is full.
+    /// A producer's next transaction replaces its previous entry; a full table gives up its oldest Finalized one.  nullptr: the judge
+    /// waits (the previous entry holds an overlay, or every entry is live).  A record at or below the producer's entry is a re-feed.
     DeferredTxn* onJudgeRecord(int64_t judgeOffset, const rune::storage::control_record::TxnJudgeRecord& r) noexcept {
         if (DeferredTxn* old = find(r.producerId)) {
-            if (old->judgeOffset == judgeOffset) return old;
+            if (old->judgeOffset >= judgeOffset) return old;
+            if (old->overlay >= 0) return nullptr;
             txns_.erase(txns_.begin() + (old - txns_.data()));
         }
-        if (txns_.size() >= kMaxTxns) return nullptr;
+        if (txns_.size() >= kMaxTxns) {
+            const auto done = std::find_if(txns_.begin(), txns_.end(), [](const DeferredTxn& t) { return t.phase == TxnPhase::Finalized && t.overlay < 0; });
+            if (done == txns_.end()) return nullptr;
+            txns_.erase(done);
+        }
         DeferredTxn& t = txns_.emplace_back();
         t.producerId = r.producerId;
         t.epoch = r.producerEpoch;
@@ -256,25 +263,20 @@ public:
         t.phase = TxnPhase::AwaitJudge;
         return &t;
     }
-    /// The marker decides the transaction.  One that holds an overlay stays Locked until the judge releases it.
+    /// Records the marker; only the judge moves the phase.
     void onMarker(int64_t producerId, int64_t offset, bool commit) noexcept {
         DeferredTxn* t = find(producerId);
-        if (t == nullptr || t->markerOffset >= 0) {
-            ++stats.markerWithoutVote;
-            return;
-        }
+        if (t == nullptr || t->markerOffset >= 0) return;
         t->markerOffset = offset;
         t->commit = commit;
-        if (t->overlay < 0) t->phase = TxnPhase::Finalized;
     }
-    /// Leadership scan begin: nothing at or above `offset` is known any more.
+    /// Leadership scan begin: nothing at or above `offset` is known any more.  The owner released every overlay of this state first.
     void truncateFrom(int64_t offset) noexcept {
         while (!txns_.empty() && txns_.back().judgeOffset >= offset) txns_.pop_back();
         for (DeferredTxn& t : txns_) {
             if (t.markerOffset < offset) continue;
             t.markerOffset = -1;
             t.commit = false;
-            if (t.phase == TxnPhase::Finalized) t.phase = TxnPhase::AwaitJudge;
         }
     }
     /// INT64_MAX = none.

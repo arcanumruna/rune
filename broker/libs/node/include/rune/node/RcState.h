@@ -461,7 +461,6 @@ public:
             tail_.push_back(TailEvent{producerId, offset, commit});
         }
         // Unbuilt: nothing — the build starts at LEO > offset and scans it.
-        if (verdict_.marker != nullptr && !std::holds_alternative<Unbuilt>(st_)) verdict_.marker(verdict_.ctx, producerId, offset, commit);
     }
 
     // ---- F15-FU1 (#112): transaction-registration verification -------------
@@ -684,6 +683,7 @@ private:
     void applyMarker_(int64_t producerId, int64_t offset, bool commit) {
         const int64_t first = tracker_.onControlMarker(producerId, offset, commit);
         if (!commit && first >= 0) aborted_.onAbortMarker(producerId, first, offset);
+        if (verdict_.marker != nullptr) verdict_.marker(verdict_.ctx, producerId, offset, commit);
     }
     static std::size_t pageSize_() noexcept {
         static const std::size_t p = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));

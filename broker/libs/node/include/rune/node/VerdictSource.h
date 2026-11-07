@@ -85,7 +85,6 @@ public:
         for (std::size_t i = 0; i < overlays_.size(); ++i) {
             if (inUse_[i]) continue;
             inUse_[i] = true;
-            overlays_[i].clear();
             overlays_[i].bind(sourceKey);
             return static_cast<int32_t>(i);
         }

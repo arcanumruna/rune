@@ -47,6 +47,7 @@ public:
         for (const int64_t o : offsets) {
             const auto it = lowerBound(o);
             if (it == entries_.end() || it->offset != o) entries_.insert(it, Entry{o, code, constraintId});
+            else if (it->code != code || it->constraintId != constraintId) ++mismatches_;
         }
         return true;
     }
