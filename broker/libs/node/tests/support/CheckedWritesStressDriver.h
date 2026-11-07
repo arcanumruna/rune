@@ -874,14 +874,21 @@ private:
         }
         return false;
     }
-    /// account_stats again with the same predicate under a new plan (an extra column every other time); its swap is waited for.
+    /// account_stats again with the same predicate under a new plan (an extra column every other time); its swap is waited for. A catalog
+    /// leader that moves mid-DDL answers "session lost" without saying whether the replace applied: the swap is looked for, else it is resent.
     void replaceStats_() {
-        std::string err;
         const char* extra = ++statsReplaces_ % 2 == 1 ? ", max(lastPlayed) as lastPlayed" : "";
-        ASSERT_EQ(qlAny_(std::string("create or replace view account_stats key userId as select count(*) as characters") + extra +
-                         " from character group by userId constraint max_characters check (characters <= 12);", &err), 0) << "seed " << seed_ << ": " << err;
-        settle_();
-        ASSERT_TRUE(learnConstrainedViews_(statsFp_)) << "seed " << seed_ << ": the replacement of account_stats never swapped in";
+        const std::string text = std::string("create or replace view account_stats key userId as select count(*) as characters") + extra +
+                                 " from character group by userId constraint max_characters check (characters <= 12);";
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            std::string err;
+            const int code = qlAny_(text, &err);
+            ASSERT_TRUE(code == 0 || err.find("session lost") != std::string::npos) << "seed " << seed_ << ": " << err;
+            settle_();
+            if (learnConstrainedViews_(statsFp_)) return;
+            ASSERT_NE(code, 0) << "seed " << seed_ << ": the replacement of account_stats never swapped in";
+        }
+        FAIL() << "seed " << seed_ << ": the replacement of account_stats was never answered";
     }
 
     std::string rpName_() { return rng_() % 2 == 0 ? std::string(kRpNames[rng_() % std::size(kRpNames)]) : "c" + std::to_string(++rpNameSeq_); }
