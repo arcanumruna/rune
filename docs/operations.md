@@ -467,6 +467,22 @@ A whole-directory restore (see Backups and disaster recovery) is the way to get 
   while a member of the logged set is not installed on its worker.
 - After a crash that lost the marker tail a verdict view backs up and rebuilds a checkpoint ahead of its local markers
   (`verdictCheckpointsDiscarded`). When the rejected-offset index is full the judge stalls and raises `verdictStalls`.
+- **Constraint views** (`unique` and `check`, see [Constraints](api/ql.md#constraints)) join and leave the set through
+  change records in the source log, so every leader judges a record with the set that was active at its offset.
+  - **Create.** The leader appends the view's plan (control record 20) and then the change record at offset `A`. The view builds
+    from the log start: below `A` it folds records without judging them (data from before the constraint), from `A` on they are
+    judged. Delivery of records at or above `A` waits until the view has caught up, so creating a constraint on a large topic pauses
+    delivery of new records for the build. Writes are not refused.
+  - **Replace.** The old view keeps judging while the new one builds. The leader then appends the change record at `S` and swaps the two
+    in one step, so no record goes unjudged.
+  - **Drop.** The leader appends a change record without the view. The dropped plan stays installed until the committed watermark
+    W has passed that record, because a failover can still make a new leader judge the records below it. Drop followed by create
+    leaves a gap in which writes are not judged.
+  - **Plan records.** The cleaner keeps control record 20; they are small and one is written per joining member. A leader whose catalog has not installed a view of the logged set waits (`judgeWaitsForInstall`) rather than
+    judge without it.
+  - **`uniqueConflicts`** (view stat 32, `rune stats view <unique view>`) counts the extra claimants of a `unique` view's keys: live
+    source records that share a key with its owner, from data written before the view existed. It rises while the view builds, from 0 to the duplicate count; once the view has built it only falls, as owners are deleted or
+    renamed and the next claimant is promoted. Remove duplicates before a back-fill.
 
 ## Key index
 

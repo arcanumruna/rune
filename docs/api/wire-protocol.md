@@ -229,8 +229,23 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   the original `baseOffset` and the original verdicts once the committed watermark W has passed the batch; a retry outside
   the window on a verdict source is answered `DuplicateSequence` (21) with no trailer. An ack with more than one claim
   (thousands of rejections, up to 32,824 bytes) is offered rather than claimed; ack publications have a term of at least 512 KiB.
-- **Control records 16 to 19** are control batches with producer id -1 in the log: 16 reservation, 17 verdict marker,
-  18 constraint-set change, 19 transaction judge. Consumers never receive them and the transaction readers ignore them.
+- **Control records 16 to 20** are control batches with producer id -1 in the log: 16 reservation, 17 verdict marker,
+  18 constraint-set change, 19 transaction judge, 20 verdict plan. Consumers never receive them and the transaction readers ignore them.
+- **Verdict plan record** (type 20, `kVerdictPlan`): the plan of a `unique` or `check` view that joins a verdict source, appended just
+  below its constraint-set change record so that every leader judges with the same plan. The value is little-endian, at most 65,536 bytes
+  in all (a larger plan is refused at DDL):
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 1 | version, 1 |
+  | 1 | 8 | `viewObjectId` |
+  | 9 | 8 | `planFingerprint` |
+  | 17 | 1 | `kind` (2 `unique`, 3 `check`) |
+  | 18 | 4 + n | `planLen`, then the serialized plan |
+  | | 4 + n | `outLen`, then the output descriptor |
+  | | 4 + n | `srcLen`, then the source descriptor |
+
+  The cleaner keeps type-20 records. Consumers never receive them.
 - **Reservation record** (type 16): the payload is `[version u8][reservedThroughN u64]`. An autoincrement leader appends
   it before it hands out ids above the last reserved `n`; a new leader starts above the highest one it reads. Every reader
   skips it, so it never reaches a consumer.
@@ -301,8 +316,7 @@ while the cluster is below the checked-writes feature level.
   prefix of the wrong width and a token of the wrong length are `InvalidRequest`.
 - Error codes 59 to 61 are `CreateView` refusals sent to sessions at 17 or above: 59 `ViewKeyExpressionInvalid` (a key
   component that does not compile: a type that is not an integer, enum, bool or `string(N)`, `lower()` on a type other than
-  `string(N)`, a duplicate component, a key wider than 128 bytes), 60 `ViewConstraintInvalid` and 61 `ViewUniqueInvalid`. `check` and `unique`
-  clauses are refused (60 and 61) until the view-constraint engine ships.
+  `string(N)`, a duplicate component, a key wider than 128 bytes), 60 `ViewConstraintInvalid` and 61 `ViewUniqueInvalid`.
 - A view whose key is not exactly the source key needs a source with one partition (`ViewNotCoPartitioned`).
 
 ## Encrypted frames (TLS 1.3 / AEAD)
@@ -346,7 +360,7 @@ topic or view. The leader's owning worker answers, so a read costs about as much
 | 9 | `autoIncrementReservedThrough` | topic | The highest id reserved in the log (0 = none). |
 | 10 | `autoIncrementIdsBurned` | topic | Ids taken and never stored: a refused or failed batch, a reservation a failover left unused. |
 | 11 to 20 | transaction vote counters | topic | Defined, not reported yet (the transaction judge, Part 09). |
-| 32 | `uniqueConflicts` | view | Defined, not reported yet (the view-constraint engine, Part 09). |
+| 32 | `uniqueConflicts` | view | Extra claimants of a `unique` view's keys: live source records that share a key with its owner. Reported for a `unique` view only. |
 | 33 | `scanRows` | view | Rows returned by scans. |
 | 34 | `scanPages` | view | `ScanViewRows` pages served. |
 | 35 | `transientRecordsEvicted` | view | Records a transient source dropped before the view folded them. |
@@ -418,8 +432,8 @@ rejection counts of a topic's verdict source, `constraintId = viewObjectId << 16
 | 57 | `KeyNotFound` | Client 17: `update` or delete-existing on a key that is absent. Never visible. | per-record verdict of a `View` ack |
 | 58 | `AutoIncrementExhausted` | Client 17: the counter reached `autoincrement.max`. Nothing is stored and the counter is unchanged. | not retried |
 | 59 | `ViewKeyExpressionInvalid` | Client 17: a view key expression does not compile (a bad type, `lower()` on a non-string, a duplicate or over-wide key, the identity rule). | DDL compile error |
-| 60 | `ViewConstraintInvalid` | Client 17: a `check` constraint does not compile. Until the view-constraint engine ships, any view with a `check`. | DDL compile error |
-| 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. Until the view-constraint engine ships, any `unique` view. | DDL compile error |
+| 60 | `ViewConstraintInvalid` | Client 17: a `check` that does not compile, or a constraint limit (32 verdict views, object id 65536 or above, plan record over 65,536 bytes). | DDL compile error |
+| 61 | `ViewUniqueInvalid` | Client 17: a `unique` clause does not compile. | DDL compile error |
 
 The broker-internal storage errors (`rune::protocol::ErrorCode`, [`Errors.h`](../../protocol/include/rune/protocol/Errors.h))
 are a separate, small enum used inside the log: `OffsetOutOfRange`=1, `CorruptRecord`=2, `InvalidRecordBatch`=3,
