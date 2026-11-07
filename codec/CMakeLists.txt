@@ -155,25 +155,25 @@ add_custom_command(
             "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_locals.blob"
             "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_locals_fixed.blob"
             "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/shadow_locals_str_key.blob"
-    COMMAND make_player_event_blob "${CMAKE_CURRENT_BINARY_DIR}/tests/generated"
+    COMMAND $<TARGET_FILE:make_player_event_blob> "${CMAKE_CURRENT_BINARY_DIR}/tests/generated"
     DEPENDS make_player_event_blob
     COMMENT "Generating player_event.blob / nine_ints.blob (2c filter fixtures)"
 )
 add_custom_command(
     OUTPUT  "${PLAYER_EVENT_GEN_H}"
-    COMMAND rune_codec_gen "${PLAYER_EVENT_BLOB}" "${PLAYER_EVENT_GEN_H}"
+    COMMAND $<TARGET_FILE:rune_codec_gen> "${PLAYER_EVENT_BLOB}" "${PLAYER_EVENT_GEN_H}"
     DEPENDS rune_codec_gen "${PLAYER_EVENT_BLOB}"
     COMMENT "Generating player_event.gen.h from player_event.blob"
 )
 add_custom_command(
     OUTPUT  "${NINE_INTS_GEN_H}"
-    COMMAND rune_codec_gen "${NINE_INTS_BLOB}" "${NINE_INTS_GEN_H}"
+    COMMAND $<TARGET_FILE:rune_codec_gen> "${NINE_INTS_BLOB}" "${NINE_INTS_GEN_H}"
     DEPENDS rune_codec_gen "${NINE_INTS_BLOB}"
     COMMENT "Generating nine_ints.gen.h from nine_ints.blob"
 )
 add_custom_command(
     OUTPUT  "${SHADOW_NAMES_GEN_H}"
-    COMMAND rune_codec_gen "${SHADOW_NAMES_BLOB}" "${SHADOW_NAMES_GEN_H}"
+    COMMAND $<TARGET_FILE:rune_codec_gen> "${SHADOW_NAMES_BLOB}" "${SHADOW_NAMES_GEN_H}"
     DEPENDS rune_codec_gen "${SHADOW_NAMES_BLOB}"
     COMMENT "Generating shadow_names.gen.h from shadow_names.blob"
 )
@@ -182,7 +182,7 @@ set(SHADOW_LOCALS_HEADERS "")
 foreach(_n shadow_locals shadow_locals_fixed shadow_locals_str_key)
     add_custom_command(
         OUTPUT  "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/${_n}.gen.h"
-        COMMAND rune_codec_gen "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/${_n}.blob"
+        COMMAND $<TARGET_FILE:rune_codec_gen> "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/${_n}.blob"
                 "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/${_n}.gen.h"
         DEPENDS rune_codec_gen "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/${_n}.blob"
         COMMENT "Generating ${_n}.gen.h from ${_n}.blob")
