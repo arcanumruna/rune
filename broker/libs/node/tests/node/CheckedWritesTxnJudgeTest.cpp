@@ -1620,6 +1620,39 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryResolutionWalkIsBudgetedAndResumes
     EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
 }
 
+// T7 review 2, N1: the one-step set is the worker's, shared by its sources.  O's segment waits for T0's marker; another source applies
+// its own ordinary transaction meanwhile and takes the set.  O collects its keys anew, so T0's insert still supersedes O's delete.
+TEST(CheckedWritesTxnJudgeRegression, SegmentResumedAfterAnotherSourceTookTheKeySetRecollectsRegression) {
+    JudgeRig r(false);
+    JudgeRig other(false);
+    other.vs.bindTxn(&r.pool, other.batch, JudgeRig::kRecordsMax);
+    r.start();
+    other.start();
+    r.log.data({del(4)}, 55);                     // 10, O
+    r.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
+    r.log.judge(66, 11);                          // 12
+    r.log.marker(55, true);                       // 13
+    r.log.data({{20}, {21}, {22}, {23}, {24}, {25}});   // 14-19
+    r.log.marker(66, true);                       // 20
+    r.drive(20);
+    ASSERT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker below the HW";
+    other.log.data({{50}, {51}}, 88);
+    other.log.marker(88, true);
+    for (int i = 0; i < 4 && other.vs.judgeCursor() < other.log.next; ++i) other.drive();
+    ASSERT_EQ(other.vs.judgeCursor(), other.log.next);
+    ASSERT_TRUE(other.indexed(51));
+    for (int i = 0; i < 8 && r.vs.judgeCursor() < r.log.next; ++i) r.drive();
+    EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
+    JudgeRig plain(false);
+    plain.start();
+    plain.log.data({del(4)});
+    plain.log.data({{4, 1, false, kInsert}});
+    plain.log.data({{20}, {21}, {22}, {23}, {24}, {25}});
+    for (int i = 0; i < 4; ++i) plain.drive();
+    EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
+    for (int64_t id = 0; id < 200; ++id) EXPECT_EQ(r.indexed(id), plain.indexed(id)) << id;
+}
+
 // I3: accepted(r), an ordinary transaction committed below J.
 TEST(CheckedWritesTxnJudge, OrdinaryCommittedBelowJConflicts) {
     JudgeRig r(VoteMembers{100});

@@ -816,6 +816,7 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
         if (w.end < 0 || !txnPool_->holdsOneStep(oneStepClaim_)) {
             oneStepClaim_ = txnPool_->claimOneStep();
             keys.clear();
+            w.end = -1;   // another source may have taken the set mid-segment: note the keys again
             if (!walkBatches_(readRange, w.from, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
                     collectOrdinaryBatch_(r, b, len, o.producerId, keys);
                     return true;
@@ -1174,7 +1175,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
         // ordinary one is applied at its marker, which the judge must reach.
         const bool ordinaryHolds = std::any_of(ordinary_.begin(), ordinary_.end(), [&](const OrdinaryTxn& o) { return o.first < judgeCursor_; });
         const int64_t capFrom = judgedThrough() < judgeCursor_ ? runAheadFrom_() : emitFrom_;
-        const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX || ordinaryHolds ? INT64_MAX : capFrom + checkpointCap_);
+        const int64_t passBound = std::min(bound, checkpointCap_ == INT64_MAX || ordinaryHolds || capFrom == INT64_MAX ? INT64_MAX : capFrom + checkpointCap_);
         while (!stalled_) {
             const int64_t A = state.constraintSets.nextChangeAtOrAfter(setFrom_);
             if (A != INT64_MAX && judgeCursor_ > A) {

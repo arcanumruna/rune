@@ -553,6 +553,14 @@ TEST(CheckedWritesTxnWorker, RunAheadCheckpointIsBackfilledOnReplayRegression) {
     ASSERT_TRUE(p.r.driveUntilJudged());
     ASSERT_TRUE(p.r.hasRow(kRej, 1001));
     ASSERT_TRUE(p.r.hasRow(kRej, 1002));
+    const auto rows = [&] {
+        std::vector<uint64_t> out;
+        const ViewInstance* inst = p.r.vs->instanceForTest(kRej, 0);
+        for (uint64_t k = 0; k < 10000 + static_cast<uint64_t>(3 * p.cap) + 10; ++k)
+            if (inst->table.get(k) != nullptr) out.push_back(k);
+        return std::make_pair(out, inst->table.size());
+    };
+    const auto leader = rows();
     // The crash took every later checkpoint: the file holds the run-ahead one.
     p.r.agent.reset();
     {
@@ -570,6 +578,7 @@ TEST(CheckedWritesTxnWorker, RunAheadCheckpointIsBackfilledOnReplayRegression) {
     EXPECT_TRUE(p.r.hasRow(kRej, 1002));
     EXPECT_TRUE(p.r.hasRow(kRej, 10000));
     EXPECT_TRUE(p.r.hasRow(kRej, 10000 + static_cast<uint64_t>(3 * p.cap) - 1));
+    EXPECT_EQ(rows(), leader) << "the refold equals the leader's table";
 }
 
 // P11-8 (b): while a voted transaction is Locked with its J below the member's cursor, no checkpoint is pushed (counted), however
@@ -614,6 +623,32 @@ TEST(CheckedWritesTxnWorker, OversizedDeltaIsHeldNotClaimedRegression) {
     ASSERT_TRUE(p.r.driveUntilJudged());
     EXPECT_TRUE(p.r.hasRow(kRej, 1001));
     EXPECT_TRUE(p.r.hasRow(kRej, 10000 + static_cast<uint64_t>(3 * p.cap) - 1));
+}
+
+// T7 review 2, N2: a member holding an oversized delta pushes no more, so it no longer bounds the run-ahead: a voted transaction
+// whose J lies more than one cap past the markers is still judged, answered and applied without a restart.
+TEST(CheckedWritesTxnWorker, OversizedDeltaNeverHoldsTheRunAheadRegression) {
+    Persisted p;
+    std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ups(1001)}, kRaPid, 0, {}, /*txn=*/true)};
+    for (auto& b : Persisted::plain(10000, 3 * p.cap)) batches.push_back(std::move(b));
+    (void)p.replicated(std::move(batches));
+    p.r.marker(kRaPid, true);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    p.r.passes(50);
+    batches = {VerdictRig::batch({ins(2001)}, kRaPid + 1, 0, {}, /*txn=*/true)};
+    for (auto& b : Persisted::plain(30000, 2 * p.cap)) batches.push_back(std::move(b));
+    batches.push_back(VerdictRig::batch({ins(2002)}, kRaPid + 1, 1, {}, /*txn=*/true));
+    (void)p.replicated(std::move(batches));
+    ASSERT_TRUE(p.r.vs->instanceForTest(kRej, 0)->deltaOversized);
+    const int64_t tok = p.r.sendVote(VerdictRig::kSrc, kRaPid + 1, 0);
+    for (int i = 0; i < 2000 && !p.r.voteReply(tok); ++i) p.r.pass();
+    ASSERT_TRUE(p.r.voteReply(tok)) << "the judge never reached T's J";
+    EXPECT_EQ(p.r.voteReply(tok)->code, 0);
+    p.r.marker(kRaPid + 1, true);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    EXPECT_TRUE(p.r.hasRow(kRej, 2001));
+    EXPECT_TRUE(p.r.hasRow(kRej, 2002));
+    EXPECT_TRUE(p.r.hasRow(kRej, 30000 + static_cast<uint64_t>(2 * p.cap) - 1));
 }
 
 // P11-8 (c), fix round 1 F5: the cleaner keeps every TxnJudge at or above the lowest checkpoint a persisted member restarts from,
