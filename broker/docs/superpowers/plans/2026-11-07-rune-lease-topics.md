@@ -1,6 +1,8 @@
-# Rune — Lease Topics (etcd-style leases) and the Rune-backed discovery library — Implementation Plan
+# Rune — Lease Topics (etcd-style leases) — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Owner ruling 2026-11-07:** Phase 3 (discovery library on Rune) is dropped; Herald builds its pod registry on Phase 1–2.
 
 **Goal:** A **lease topic** is a typed, keyed, compacted topic in which every live key **is** a lease with etcd v3
 semantics: granted only when the key has no live lease (no takeover), kept alive by `LeaseKeepAlive` requests served
@@ -9,8 +11,7 @@ by the partition leader under the view-read lease (no log record), ended by a fe
 version and fencing token. Long TTLs survive leader changes and whole-cluster restarts through always-persisted
 `Checkpoint` records. Expiry never pauses, in any namespace state, and is never early. On top of that: the async C++
 client (`LeaseTopic<T>`, `LeaseSession`, `LeaseWatch`), the `LeaseMutex` / `LeaseElection` recipes, limits, metrics
-and QL, and a Rune transport for the `discovery` library with exact parity with today's etcd transport. Non-lease
-topics pay nothing: byte-identical behaviour and an unchanged ABAB bench.
+and QL. Non-lease topics pay nothing: byte-identical behaviour and an unchanged ABAB bench.
 
 **Architecture:**
 - **Protocol (`protocol/`).** Record attribute bits 2–3 carry the lease op on lease topics only. New header
@@ -41,15 +42,14 @@ topics pay nothing: byte-identical behaviour and an unchanged ABAB bench.
   `SEND_RECORD` form, `Record::leaseOp()`, `LeaseSession<Capacity, OnLost, OnAtRisk>` driven by `doWork(nowNs)`, the
   producer guard (R5) enforced on the client agent thread, `LeaseWatch` with the hash-range handoff, then
   `LeaseMutex` / `LeaseElection`.
-- **discovery repository.** A Rune transport beside etcd, in both the `RuneEndpoint` form and the caller-supplied-
-  client form (`doWork`, `stopAsync()`, `isStopped()`).
 
 **Tech Stack:** C++23, GoogleTest (`TEST_P` for the matrix), Google Benchmark, CMake/Ninja, real Aeron UDP for the
 in-process `BrokerNode` / `TestCluster` tests, docker compose (3 nodes) on the shared Linux test VM for e2e.
 
 **Spec:** `broker/docs/superpowers/specs/2026-11-07-rune-lease-topics-design.md`, revision 4 ("spec 03"), plus the
 Herald consistency pass settlements K15 R1–R11, F3, B28 (already folded into rev 4). This plan covers the whole spec:
-§1–§21 and Appendix A (deferred, nothing to build). The Self-review maps each section to its task.
+§1–§21 and Appendix A (deferred, nothing to build), except the discovery library (§3, §13), dropped with Phase 3 by
+the owner ruling above. The Self-review maps each section to its task.
 
 **Builds on / order:** `main` with checked writes Parts 01–10, view-read lease (VLS Part A), namespaces Phases 1–2
 and NAT egress merged. What exists today (line numbers are hints; use the quoted anchors):
@@ -106,7 +106,6 @@ and NAT egress merged. What exists today (line numbers are hints; use the quoted
 |---|---|---|
 | 1 | QL `lease topic … with (lease.*)`; wire templates and codes; broker lease semantics (grant, update, revoke, keepalive, TimeToLive, Expire, Checkpoint, ScanLeases, lease view reads); client `rune/client/lease/LeaseTopic.h` (`Client::openLeaseTopic<T>`, `grant`, `update`, `revoke`, `keepAliveOnce`, `timeToLive`, `get`, `scan`, `*AndWait`), `LeaseOptions`, `LeaseResult`, `Record::leaseOp()`, `rune/client/lease/LeaseSession.h` (`LeaseSession<Capacity, OnLost, OnAtRisk>`: `add`, `remove`, `revoke`, `update`, `observe`, `close`, `isClosed`, `doWork`), `ProducerConfig::guard`, `ErrorCode::LeaseAtRisk` (client-local), `rune/client/lease/LeaseWatch.h` (`LeaseWatch<T>`, `LeaseWatchBase`, `startFromNow`, `OpKind::LeaseWatchReady`) | `herald/docs/superpowers/plans/2026-11-07-herald-02-runtime-and-rune-integration.md` (Phase 1 / Task 5 RuneAgent's `RealRune` port, Task 10 `idslots` minting, Task 16 worker slots; Phase 2 / Task 21 tenant election keys and leader map, Task 23 invites); `…-herald-04-safety-reporting-evidence-sanctions.md` (Phase 2 / Task 21: `sanction-expiry` / `strike-expiry` one-shot checkpointed leases); `…-herald-05-moderation-console-appeals-transparency.md` (Phase A / Task 6 case claims; Phase B / Tasks 16–17 appeal tokens, Task 20 break-glass grants); `…-herald-01-core-domain-and-tenancy.md` (`onAtRisk` at Tasks 29 and 40); `…-herald-00-conformance-suite.md` (the `InProcRune` double's lease conformance against this behaviour: herald-02 Phase 1 / Tasks 4–5, used by 00's `LEASE` gate) |
 | 2 | `rune/client/lease/LeaseMutex.h`, `LeaseElection.h` (`campaign`, `proclaim`, `resign`, `leader`, `observe`, `isLeader`, `token`, `OpKind::LeaseCampaign`); namespace limit `max-leases`; the suspension matrix; metrics; `show lease(s)`, `revoke lease`; latency gates; docs | herald-02 (Phase 2 / Task 21 tenant lease `tenant/<nsId>`, Phase 1 / Task 15 singletons `singleton/<role>`, Phase 1 / Task 12 `herald-provisioner` setting `max-leases`); herald-01 (`LeaseElection` at Tasks 29 and 40) |
-| 3 | `discovery` Rune transport: `discovery::RuneEndpoint`, `Producer(RuneEndpoint, …)`, `Consumer::create(RuneEndpoint, …)`, the caller-supplied-client overloads with `doWork(nowNs)`, `stopAsync()`, `isStopped()`; the legacy chat server switched by configuration | herald-02 (Phase 1 / Task 15: every Herald process registers and watches through the caller-supplied form on its RuneAgent); `herald-pool` sidecar (herald-02 Phase 2 / Task 27, herald-06 Task 12; `RuneEndpoint` form) |
 
 ## Execution context
 
@@ -114,9 +113,6 @@ and NAT egress merged. What exists today (line numbers are hints; use the quoted
   - Phases 1–2: `feature/lease-topics` in this repo, created off the latest `main` (`git fetch origin main` first).
     Merge `main` in before each task if it moved and before review. Push after every task with
     `git push -u origin feature/lease-topics` (standing permission; never `main`, never force).
-  - Phase 3: `feature/rune-transport` in the `discovery` repository, and `feature/discovery-on-rune` in the Herald
-    repository for Task 28. Both need those repositories attached to the session (Decision L17); Phase 3 does not
-    start until they are.
 - **Builds:** see README.md#build and `docs/testing.md`.
   - `build` (Debug, `BUILD_TESTING=ON`, `BUILD_INTEGRATION_TESTING=ON`) for everything;
   - `build-asan` (ASan+UBSan) and `build-tsan` at the checkpoints (a client TSan build needs `-DBUILD_TESTING=ON`);
@@ -137,9 +133,8 @@ and NAT egress merged. What exists today (line numbers are hints; use the quoted
     - **D** after Task 16: the client (LeaseTopic, LeaseSession, LeaseWatch).
     - **E** after Task 19: Phase 1 done (matrix, 3-node, stress, e2e). Herald 02 may start building on Phase 1.
     - **F** after Task 24: Phase 2 done (recipes, limits, metrics, gates, docs). Herald P0 leadership unblocked.
-    - **G** after Task 28: Phase 3 done (discovery on Rune, e2e on the default config), before the final
-      whole-branch review.
-- **Docker e2e** (Tasks 19, 20, 27, 28) runs on the shared Linux test VM from `$RUNE_VM_HOST`: hold the shared lock
+      Before the final whole-branch review.
+- **Docker e2e** (Tasks 19, 20) runs on the shared Linux test VM from `$RUNE_VM_HOST`: hold the shared lock
   for the whole run, work only in your own directory, remove only containers and images you created (never
   `docker system prune`), check `df` before and after, never restart the machine. Never on local Mac docker. The
   host's address and login are never written into the repo, issues or commits. Long runs go in the background.
@@ -176,8 +171,7 @@ and NAT egress merged. What exists today (line numbers are hints; use the quoted
    park}` / `Clearing{clearOffset, park}` / `Emitting{emitOffset}` (one tagged layout in the 48-byte entry; the
    accessors expose only the active state's fields). Client: each `LeaseSession` entry is
    `Granted{lastOkSentNs} / AtRisk{since} / Lost{reason} / Revoking{corr}`; `LeaseWatch` is
-   `Idle / Scanning{prefixIdx, page, resumeHash} / Buffering{cursor} / Live{} / Broken{retryAtNs}`; every
-   discovery-library step is its own state. Every state handles every event; the table tests enumerate the product.
+   `Idle / Scanning{prefixIdx, page, resumeHash} / Buffering{cursor} / Live{} / Broken{retryAtNs}`. Every state handles every event; the table tests enumerate the product.
 5. **Rule 16: no convergence timeouts.** TTL is product semantics; `extend` only moves *when* a promoted leader
    proposes. Nothing waits on wall time; every drive loop has a hard iteration cap and fails instead of hanging.
 6. **Never early, never stale, never paused.** No keepalive answered `Ok` without the read lease or while a
@@ -225,7 +219,7 @@ namespace limit `max-leases`.
 4. **Expiry never pauses (G3).** Broker appends bypass the namespace-suspension refusal; `RejectAll` refuses
    keepalives; `ReadOnly` serves them. Tests: `LeaseNamespaceRegression.*` (Task 21), stress I8.
 5. **No takeover (G4).** No `upsert`, no plain delete, no force revoke, no unversioned end anywhere: wire, QL, CLI,
-   client, recipes, discovery. Tests: `LeaseWriteHookRegression.RefusalTableRegression`,
+   client, recipes. Tests: `LeaseWriteHookRegression.RefusalTableRegression`,
    `LeaseQlRegression.RevokeLeaseIsFencedRegression` (Task 22).
 6. **Fencing (§7.3).** Version = grant offset; strictly increasing per key across expiry, compaction, leader change,
    restart; a stale holder's update/keepalive/revoke is `LeaseNotFound`. Tests: `LeaseIntegrationRegression.FencingRegression`.
@@ -250,8 +244,6 @@ namespace limit `max-leases`.
     script; a `nm`-free review of every new class for `virtual`.
 14. **Vacuous tests.** Every §16.5 mutation (list M1–M20 in the Interaction matrix) turns a named test red; the
     stress invariants are checked after every step, not at the end.
-15. **Discovery parity (§3).** DG1–DG9 are the only observable differences; `DiscoveryIntegrationTest` passes
-    unchanged against Rune in both forms; the caller-supplied form never blocks. Tests: Task 27.
 
 ## Decisions
 
@@ -325,8 +317,7 @@ settlements. The items below are open points the spec leaves to the implementati
 - **L16. QL `where path like`.** Only the form `like '<prefix>%'` (one trailing `%`, no other wildcard, prefix 0–127
   bytes) maps to a `ScanLeases` prefix; any other `where` on `show leases` is refused at parse with
   `show leases filters by key prefix only`.
-- **L17. Phase 3 repositories.** The `discovery` and Herald repositories must be attached to the session before Phase
-  3 (as Herald N3 is for 04 Part A). The coordinator attaches them; implementers never do.
+- **L17, L23:** removed with Phase 3; numbers not reused.
 - **L18. Real-broker clock seam.** In-process `TestCluster` / `BrokerNode` integration tests drive the lease clock
   through the existing `Worker::setLeaseClockForTest` and a new `TestCluster::advanceLeaseClock(ns)` that advances
   every node's override and the read-lease clock together. Docker e2e uses real time with short TTLs (1–15 s) and
@@ -342,49 +333,45 @@ settlements. The items below are open points the spec leaves to the implementati
   leader change on a one-partition lease topic on the 3-node rig and pins p99 < 1.5 s as an integration assertion
   (`LeaseTrioRegression.KeepAliveOutageUnderLeaderChangeRegression`), because Herald 02 §4.3 depends on it. If it
   fails, it is an urgent blocker for Herald, fixed in this plan.
-- **L23. Discovery transport switch.** In the `discovery` repository a CMake option `DISCOVERY_WITH_RUNE` (default
-  `ON` once Phase 3 lands) builds the Rune transport beside etcd; the etcd transport stays. The legacy chat server
-  picks the transport at run time: `RUNE_BOOTSTRAP` set → Rune, else `DISCO_URL` → etcd (today's behaviour).
 
 ## Interaction matrix
 
 The single source of truth is `broker/libs/node/tests/support/LeaseMatrixExpectations.h`. It defines `enum class
 Op`, `enum class Entity`, `enum class Timing`, `bool naRule(Op, Entity)`, `std::span<const Timing>
 timingsOf(Op)`, `Outcome expect(Op, Entity, Timing)`. The unit table rig (Task 17a), the 1-node broker rig (Task 17),
-the 3-node slice (Task 17), the seeded stress test (Task 18) and the e2e scripts (Tasks 19, 27, 28) all read it.
+the 3-node slice (Task 17), the seeded stress test (Task 18) and the e2e script (Tasks 19, 20) all read it.
 
 **Cell meaning.** A lease `L = (k, v)` is live on partition 0 of lease topic `T` (with a user view `U` over `T`). The
 op is performed against the entity; the cell asserts the op's outcome **and** that every other lease, topic and
 view is unchanged (or changed exactly as `expect` says).
 
-- **Ops (26):** `Grant`, `Update`, `Revoke`, `KeepAlive1`, `KeepAliveBatch`, `TimeToLive`, `PointRead`,
+- **Ops (22):** `Grant`, `Update`, `Revoke`, `KeepAlive1`, `KeepAliveBatch`, `TimeToLive`, `PointRead`,
   `ScanLeases`, `WatchStart`, `BrokerExpire`, `BrokerCheckpoint`, `ClearCheckpoint0`, `AlterBounds`,
   `AlterCheckpoint`, `DropTopic`, `MutexLock`, `MutexTryLock`, `MutexUnlock`, `ElectCampaign`, `ElectProclaim`,
-  `ElectResign`, `ElectObserve`, `DiscRegister`, `DiscLoad`, `DiscStop`, `ConsumerRun`.
-- **Entities (10):** `SameKeyVer` (L itself), `StaleVer` (k with v′ ≠ v), `OtherKeySamePart`, `OtherPart`,
+  `ElectResign`, `ElectObserve`.
+- **Entities (9):** `SameKeyVer` (L itself), `StaleVer` (k with v′ ≠ v), `OtherKeySamePart`, `OtherPart`,
   `OtherLeaseTopic`, `NonLeaseSameWorker`, `UserView` (U), `OtherNs` (same names in another namespace),
-  `OldSession` (client version 17), `OldIncarnation` (an older live incarnation of the same `ServiceKey`).
-- **n/a rule (`naRule`), 84 cells:**
+  `OldSession` (client version 17).
+- **n/a rule (`naRule`), 48 cells:**
   - `StaleVer` applies only to ops that carry a version: `Update`, `Revoke`, `KeepAlive1`, `KeepAliveBatch`,
     `BrokerExpire`, `BrokerCheckpoint`, `ClearCheckpoint0` (broker records injected stale through the emitter test
     seam: expected defensive `StaleExpiry` / `StaleCheckpoint` and `stale_broker` + 1, which is the only place the
-    counter may move), `MutexUnlock`, `ElectProclaim`, `ElectResign`, `DiscLoad`, `DiscStop` → 12 applicable,
-    **14 n/a**.
+    counter may move), `MutexUnlock`, `ElectProclaim`, `ElectResign` → 10 applicable,
+    **12 n/a**.
   - `UserView` applies to `Grant`, `Update`, `Revoke`, `KeepAlive1`, `KeepAliveBatch`, `BrokerExpire`,
-    `BrokerCheckpoint`, `ClearCheckpoint0`, `DropTopic` → **17 n/a**.
+    `BrokerCheckpoint`, `ClearCheckpoint0`, `DropTopic` → **13 n/a**.
   - `OtherNs` applies to the 9 client-surface ops (`Grant` … `WatchStart`) plus `AlterBounds`, `AlterCheckpoint`,
-    `DropTopic` → **14 n/a**.
-  - `OldSession` applies to the 9 client-surface ops → **17 n/a**.
-  - `OldIncarnation` applies to the 4 discovery ops → **22 n/a**.
+    `DropTopic` → **10 n/a**.
+  - `OldSession` applies to the 9 client-surface ops → **13 n/a**.
   - Every other (op, entity) is applicable.
-- **Timings (29):** `Sequential`; `BackToBack` (second op before the first's ack); `AroundExpire{BeforePoll,
+- **Timings (28):** `Sequential`; `BackToBack` (second op before the first's ack); `AroundExpire{BeforePoll,
   AfterBuild, AfterCommit, AfterFold}`; `KeepAliveIn{Clearing, Checkpointing, Emitting, DueNotEmitted}`;
   `ContenderGrants`; `RevokeBehindUpdate`; `KnownOldDuplicate`; `HandoffOverflow`; `AtRiskPendingUnsent`;
   `LeaderChange{Uncommitted, CommittedNotFolded, Folded}` (of the in-flight `Expire` / `Checkpoint(0)` /
   `Checkpoint(R)`); `LeaderChangeGrantAck`; `LeaderChangeMidScan`; `Zombie` (leader partitioned, not yet deposed);
   `RestartOne`; `RestartAll` (between a checkpoint and the deadline); `CompactionMid`; `SuspendReadOnly`;
-  `SuspendRejectAll` (each followed by resume); `AlterMidLife`; `DropWithParked`; `ProducerRestartInTtl`.
-- **Timing cells (`timingsOf`, on `SameKeyVer` unless stated), 96:**
+  `SuspendRejectAll` (each followed by resume); `AlterMidLife`; `DropWithParked`.
+- **Timing cells (`timingsOf`, on `SameKeyVer` unless stated), 89:**
 
   | Op | Timings | # |
   |---|---|---|
@@ -403,10 +390,9 @@ view is unchanged (or changed exactly as `expect` says).
   | AlterBounds, AlterCheckpoint, DropTopic | AlterMidLife, AlterMidLife, DropWithParked | 3 |
   | MutexLock, MutexTryLock, MutexUnlock | {LeaderChange.Folded, KnownOldDuplicate}, {BackToBack}, {AroundExpire.AfterFold} | 4 |
   | ElectCampaign, ElectProclaim, ElectResign, ElectObserve | {Zombie, KnownOldDuplicate, AtRiskPendingUnsent}, {AroundExpire.AfterFold}, {BackToBack}, {LeaderChange.Folded} | 6 |
-  | DiscRegister, DiscLoad, DiscStop, ConsumerRun | {ProducerRestartInTtl, LeaderChange.Folded}, {AroundExpire.AfterFold}, {BackToBack}, {CompactionMid, LeaderChangeMidScan, ProducerRestartInTtl} | 7 |
 
-- **Pinned counts** (`LeaseMatrixRegression.MatrixCountRegression`): 26 × 10 = **260 sequential cells**, **84 n/a**,
-  **176 applicable**; **96 timing cells**; **272 executed**.
+- **Pinned counts** (`LeaseMatrixRegression.MatrixCountRegression`): 22 × 9 = **198 sequential cells**, **48 n/a**,
+  **150 applicable**; **89 timing cells**; **239 executed**.
 - **Expected outcomes.** `expect` encodes spec §21's table verbatim plus these rules, in order:
   1. `OldSession` × any → `InvalidRequest` (39) naming the version, before any lease state is touched; L unchanged.
   2. `OtherNs` × any → the answer of a missing object (byte-equal to a truly missing name), L unchanged.
@@ -417,15 +403,13 @@ view is unchanged (or changed exactly as `expect` says).
   5. `UserView` × `Expire`/`Revoke` → row deleted in the same fold batch as the lease view's; × `Checkpoint`,
      `Clear`, keepalive → U byte-identical.
   6. `StaleVer` × client op → `LeaseNotFound` (definite), L unchanged; × broker op → defensive stale verdict.
-  7. `OldIncarnation` × discovery op → spec §21 "discovery × …" rows (newest incarnation selected; the old one's end
-     ignored; fallback to the older live one when the newest ends).
 - **Layers per cell:**
   - every applicable sequential cell: the unit table rig (in-process worker + stub gateway, Task 17a) **and** the
     1-node real broker (`LeaseMatrixTest`, Task 17);
   - timing cells: 1-node broker, except `LeaderChange*`, `Zombie`, `RestartAll` and `LeaderChangeGrantAck`, which
     run on the 3-node trio (`LeaseTrioTest`, Task 17);
   - the seeded model-checked stress test (Task 18) draws every op × entity × timing from the same enums;
-  - e2e on the default config (Task 19 `lease-e2e.sh`, Task 20 election leg, Task 27–28 discovery legs) covers one
+  - e2e on the default config (Task 19 `lease-e2e.sh`, Task 20 election leg) covers one
     representative cell per op plus the §16.3 scenarios.
 - **Mutation checks (spec §16.5), each turning the named test red** (recorded in the task's commit):
   M1 promoted arm without `extend` → `LeasePromotionArmingRegression.ExtendAddedRegression`;
@@ -481,9 +465,6 @@ New:
   `broker/libs/storage/tests/LeaseCleanerModeTest.cpp`.
 - Benches: `broker/benchmark/Lease{Wheel,KeepAlive,ExpiryLag,Checkpoint}Bench.cpp`.
 - e2e: `broker/docker/lease-e2e.sh`, `broker/docker/docker-compose.lease.yml`.
-- discovery repository: `include/discovery/RuneEndpoint.h`, `include/discovery/rune/RuneProducerTransport.h`,
-  `RuneConsumerTransport.h`, `src/rune/*.cpp`, `test/discovery/RuneDiscoveryTest.cpp`; the existing
-  `test/discovery/DiscoveryIntegrationTest.cpp` parameterised over the transport.
 
 Modified files are listed per task.
 
@@ -1125,10 +1106,10 @@ worker, namespaces `a` and `b`, a v17 session), `LeaseTrio.h` (3-node, on `AuthT
 `LeaseTrioTest.cpp`. **Task 17a** (same task, first step): the unit table rig `broker/libs/node/tests/node/LeaseMatrixUnitTest.cpp`
 running the applicable sequential cells against the in-process worker + stub gateway.
 
-- [ ] **Step 1:** `LeaseMatrixRegression.MatrixCountRegression`: 260 / 84 / 176 / 96 / 272.
-- [ ] **Step 2:** `TEST_P` over the 176 applicable sequential cells, unit rig and 1-node broker; `OtherNs` cells
+- [ ] **Step 1:** `LeaseMatrixRegression.MatrixCountRegression`: 198 / 48 / 150 / 89 / 239.
+- [ ] **Step 2:** `TEST_P` over the 150 applicable sequential cells, unit rig and 1-node broker; `OtherNs` cells
   compare full response bytes with a truly missing name.
-- [ ] **Step 3:** `TEST_P` over the 96 timing cells on their layer (Interaction matrix). Drive loops capped; no sleeps.
+- [ ] **Step 3:** `TEST_P` over the 89 timing cells on their layer (Interaction matrix). Drive loops capped; no sleeps.
 - [ ] **Step 4:** the §16.2 scenarios as named tests: `LeaseIntegrationRegression.GrantExpiryRegression`,
   `…FencingRegression`, `…UpdateDoesNotRenewRegression` (M15), `…CompactionRestartRegression` (10 000 updates + 100
   checkpoints per key, clean, restart, identical view and remaining times), `…GatingRegression`;
@@ -1280,93 +1261,7 @@ semantics, the local-`onLost` note of §12.2), `docs/api/wire-protocol.md` (temp
 `CLAUDE.md` §8 note that lease topics exist.
 
 - [ ] Write; check every code sample compiles in `client-cpp/examples/` (one example per recipe). Commit and push.
-  **Checkpoint F** (Herald P0 leadership unblocked).
-
-## Phase 3: the Rune-backed discovery library
-
-Precondition: the `discovery` and Herald repositories are attached (L17). Phase 1–2 client headers are consumed from
-this repo's `client-cpp` package as CI publishes it (never `conan create` locally).
-
-### Task 25: `RuneEndpoint` and the Producer's Rune transport (both forms)
-
-Spec §3.1, §3.2, §3.6 (DG1–DG6), §13; R6, R11.
-
-**Files (discovery repository):** create `include/discovery/RuneEndpoint.h` (`bootstrap`, `namespace`, credentials
-from the environment only), `include/discovery/rune/RuneProducerTransport.h`, `src/rune/RuneProducerTransport.cpp`;
-modify `include/discovery/Producer.h` (constructor overloads `Producer(RuneEndpoint, servicePrefix, region, identity,
-leaseTtlSeconds)` and `Producer(rune::client::Client&, servicePrefix, region, identity, leaseTtlSeconds)`; the latter
-adds `doWork(nowNs)`, `stopAsync()`, `isStopped()`; debug assert on destruction before `isStopped()`), CMake option
-`DISCOVERY_WITH_RUNE` (L23).
-
-**Behaviour:** key `<servicePrefix>/<region>/<cluster|_shared>/<serviceName>/<replicaId>/<incarnation 16 hex>`; refuse
-a path > 128 bytes at construction; `registerEndpoint(uri)` first call grants `{path, uri}` (new random incarnation
-per grant), later calls a fenced `update` of `uri` (no renew); its own `LeaseSession` (keepalive `ttl/3`); `onLost`
-→ new incarnation + re-register; watchdog every `ttl/2` = async `get` of the lease view, absent → re-register;
-`startLoadReporting(uri, loadFn, interval)` = fenced `update` of `load`, `ttl ≥ 2 × interval` kept, `LeaseNotFound`
-sets `leaseNeedsReinit`; `stop()` (endpoint form) blocking fenced revoke; caller-supplied form: every step an async
-state (connect-retry 30× with backoff on `nowNs`, grant, re-register, load update, watchdog read, revoke).
-
-- [ ] **Step 1: failing tests** in `test/discovery/RuneDiscoveryTest.cpp`: `RuneProducerRegression.IncarnationKeyRegression`,
-  `…PathTooLongRefusedRegression`, `…UpdateDoesNotRenewRegression`, `…OnLostReRegistersRegression`,
-  `…WatchdogReRegistersRegression`, `…LoadIntervalCheckRegression`, `…StopRevokesRegression`,
-  `…CallerSuppliedNeverBlocksRegression` (stub transport that never answers, hard `doWork` cap; `stopAsync` reaches
-  `isStopped()` by timeouts), `…ProducerNeedsReadAndWriteRegression` (R11: WRITE-only → watchdog `NotAuthorized`
-  reported at construction-time check).
-- [ ] **Step 2:** implement; run the discovery repo's test target; commit and push.
-
-### Task 26: the Consumer's Rune transport
-
-Spec §3.3, §3.4, DG2, DG7, DG8.
-
-**Files (discovery repository):** create `include/discovery/rune/RuneConsumerTransport.h`, `src/rune/RuneConsumerTransport.cpp`;
-modify `include/discovery/Consumer.h` (`create(RuneEndpoint, …)` and `create(rune::client::Client&, …)` with
-`doWork`, `stopAsync`, `isStopped`).
-
-**Behaviour:** `run()` = one `LeaseWatch::startFromNow` over the discovery topic with every filter's prefix
-(`regionPrefix + filter.toWatchPath()`; empty = region); `Granted`/`Updated` → `handlePut` (typed columns →
-`ServiceInfo`; `parseRegistrationValue` kept public); `Revoked`/`Expired` → `handleDelete` for the current
-incarnation only; per `ServiceKey` the cache entry is the live incarnation with the highest `lease_version`, an older
-one's end ignored, the current one's end falls back to the next-newest live incarnation or removes; any break →
-re-initialise after 1 s with the same scan + subscribe; `ServiceCache`, selection, sending, sessions, passive mode,
-`setAuthToken`, `startBatchFlush`, `CircuitBreaker` unchanged.
-
-- [ ] **Step 1: failing tests** `RuneConsumerRegression.NewestIncarnationWinsRegression`, `…OldIncarnationEndIgnoredRegression`,
-  `…FallbackToOlderLiveRegression`, `…FilterDroppedClientSideRegression`, `…BreakRescansRegression`,
-  `…PassiveOpensNoConnectionsRegression`, `…CallerSuppliedNeverBlocksRegression`.
-- [ ] **Step 2:** implement; run; commit and push.
-
-### Task 27: `DiscoveryIntegrationTest` against a real Rune broker
-
-Spec §13 (tests), §16.3 (discovery parity, caller-supplied).
-
-**Files (discovery repository):** parameterise `test/discovery/DiscoveryIntegrationTest.cpp` over `{Etcd, RuneEndpoint,
-RuneCallerSupplied}`; a docker compose that starts a 3-node Rune with `herald-sys/discovery` provisioned by DDL
-(spec §3.1) in place of the docker etcd.
-
-- [ ] The existing suite (`ProducerKeepsLeaseAlive`, `LeaseRecovery_*`, `PassiveMode_*`, `Stress`, round-robin,
-  least-loaded) passes unchanged in all three forms.
-- [ ] New `DiscoveryRuneRegression.*`: `RestartWithinTtlVisibleAtOnceRegression` (DG2), `LostLeaseMidLoadReportRegression`,
-  `PartitionLeaderFailoverDuringRegistrationRegression`, `ConsumerFromCompactedLogRegression`,
-  `CallerSuppliedTwoThousandElectionsRegression` (a Herald-shaped agent: one client, a Producer, a passive Consumer
-  and 2 000 `LeaseElection`s on one shared watch; `stopAsync()` → `isStopped()` with no blocking call).
-- [ ] Run on the VM under the lock rules; commit and push.
-
-### Task 28: legacy Herald chat-server switch and the discovery e2e on the default config
-
-Spec §3.5, §13 (Herald cutover), §16.3 (discovery parity e2e); L23.
-
-**Files (Herald repository, branch `feature/discovery-on-rune`):** `src/main.cpp:157-195` (build a `RuneEndpoint` from
-`RUNE_BOOTSTRAP`, `RUNE_NAMESPACE` and credentials from the environment when `RUNE_BOOTSTRAP` is set; otherwise
-today's `DISCO_URL` path), `include/config/ChatConfig.h:171-180` (the new keys), `CMakeLists.txt` (the discovery
-package with `DISCOVERY_WITH_RUNE`); `ChatAsyncServerChannel.h` unchanged.
-
-- [ ] e2e on the VM, default Rune config, 3 nodes: a chat-server `Producer` and a coordinator `Consumer`;
-  `sendToSharedExact` works; SIGKILL the producer → the consumer's cache drops it within `ttl + bound`; restart within
-  the TTL → visible at once (DG2); a Rune partition-leader failover during all of this; check `df`, clean up only
-  your own containers.
-- [ ] The Herald repo's existing tests (`chat_tests`) pass with the etcd path (unchanged default) and with the Rune
-  path.
-- [ ] Commit and push both branches. **Checkpoint G**, then the final whole-branch review.
+  **Checkpoint F** (Herald P0 leadership unblocked), then the final whole-branch review.
 
 ## Spec gaps (decided here, recorded for review)
 
@@ -1392,11 +1287,10 @@ package with `DISCOVERY_WITH_RUNE`); `ChatAsyncServerChannel.h` unchanged.
   `onAtRisk`). Herald 00 §13's H2 "a new hit refreshes the `sanction-expiry` lease" works with this plan's
   `keepAliveOnce` (re-arms at the full TTL and clears a checkpoint) or a revoke + regrant; herald-04 chooses.
 - **Herald 01 phase mapping.** `herald/docs/superpowers/plans/2026-11-07-herald-01-core-domain-and-tenancy.md`
-  (Tasks 29 and 40) expects `LeaseElection` and `onAtRisk` in Phase 3 of this plan. Here `onAtRisk` is in Phase 1
-  (Task 15) and `LeaseElection` in Phase 2 (Task 20); only discovery is in Phase 3. herald-01 should depend on
-  "this plan Phase 2 / Task 20" for `LeaseElection`, "Phase 1 / Task 15" for `onAtRisk`, and "Phase 3 / Tasks 25–26"
-  for discovery. Both orders still work, because herald-01 consumes them only at Tasks 29 and 40. Resolved in
-  cross-plan pass: herald-01 now cites Phase 1 / Task 15, Phase 2 / Task 20 and Phase 3 / Tasks 25–26 (its G1).
+  (Tasks 29 and 40) needs `onAtRisk` (Phase 1 / Task 15) and `LeaseElection` (Phase 2 / Task 20). Its pod registry
+  builds on Phase 1 lease topics and `LeaseWatch`. Phase 3 (the discovery library) was dropped by owner ruling
+  2026-11-07, so herald-01's G1 should cite Phase 1 / Task 15, Phase 2 / Task 20 and Phase 1 lease topics +
+  `LeaseWatch`, not Phase 3 / Tasks 25–26. herald-01 consumes them only at Tasks 29 and 40.
 - **Decisions-file conflicts:** none found. K15 R1–R11, F3 and B28 are already in rev 4 and are followed as written;
   K16 rulings do not touch Rune.
 
@@ -1405,7 +1299,7 @@ package with `DISCOVERY_WITH_RUNE`); `ChatAsyncServerChannel.h` unchanged.
 | Spec | Task |
 |---|---|
 | §1 why, §2 goals / non-goals / anti-goals | all; anti-goals = Review Focus 2–6, 13 |
-| §3.1 discovery topic, §3.2 Producer, §3.3 Consumer, §3.4 unchanged parts, §3.5 call sites, §3.6 DG1–DG9 | 25, 26, 27, 28 (DG9 → 20) |
+| §3 discovery library (§3.1–§3.6) | not built: Phase 3 dropped by owner ruling 2026-11-07 (DG9 → 20) |
 | §4 etcd parity, D1–D4 | 5, 6, 10, 11, 12, 15, 20; Review Focus 1 |
 | §5.1 QL and key width (every row of its table) | 2, 3, 4, 14 |
 | §5.2 settings | 1, 2, 4, 12 |
@@ -1422,20 +1316,20 @@ package with `DISCOVERY_WITH_RUNE`); `ChatAsyncServerChannel.h` unchanged.
 | §10 wheels | 9 |
 | §11 QL and CLI | 4, 22 |
 | §12.1 LeaseTopic, §12.2 LeaseSession + guard, §12.3 recipes, §12.4 watching | 14, 15, 20, 16 |
-| §13 discovery library | 25, 26, 27, 28 |
-| §14.1 grants, §14.2 limits, §14.3 suspension | 11, 13, 21, 25 |
+| §13 discovery library | not built: Phase 3 dropped |
+| §14.1 grants, §14.2 limits, §14.3 suspension | 11, 13, 21 |
 | §15.1 hot path, §15.2 metrics | 7, 9, 11, 23, 22 |
 | §16.1 unit | 1–16, 20 |
 | §16.2 integration | 17, 21 |
-| §16.3 e2e | 19, 20, 27, 28 |
+| §16.3 e2e | 19, 20 |
 | §16.4 stress | 18 |
 | §16.5 mutations | M1–M20 (Interaction matrix), Tasks 5–20 |
 | §16.6 benches | 9, 11, 23 |
 | §17 Q1 (settled), §19 Herald examples | no Rune work; §19 DDLs are exercised as fixtures in 17 (`herald.elections`, `herald.workers`, `tenant-delete-grace`, `sanction-expiry`) |
 | §18 later work, Appendix A | not built |
-| §20 phases | Phase 1 = Tasks 1–19, Phase 2 = 20–24, Phase 3 = 25–28 |
+| §20 phases | Phase 1 = Tasks 1–19, Phase 2 = 20–24 (spec Phase 3 dropped) |
 | §21 interaction matrix | Interaction matrix, 17, 18 |
-| §22 review focus | Review Focus 1–15 |
+| §22 review focus | Review Focus 1–14 (discovery parity dropped with Phase 3) |
 
 Every matrix cell maps to a layer (Interaction matrix, "Layers per cell"); no step is left TBD.
 
@@ -1445,7 +1339,7 @@ Run the plan with superpowers:subagent-driven-development:
 - one implementer per task (mid-tier model) with the exact recipe above; implementers never spawn subagents and get
   no design decisions (open points are the L-decisions);
 - a task review after each task (spec compliance + code quality);
-- checkpoints A–G as listed, with the full `*Regression*` suite under plain, ASan+UBSan and TSan builds;
+- checkpoints A–F as listed, with the full `*Regression*` suite under plain, ASan+UBSan and TSan builds;
 - a final whole-branch review by the most capable model, exhaustive and adversarial against the Review Focus list,
   the Interaction matrix and every mutation M1–M20; the reviewer applies the attack classes of
   `docs/adversarial-review.md` that fit (input bounds, protocol state, version skew, concurrency, crash/restart,
@@ -1455,5 +1349,5 @@ Run the plan with superpowers:subagent-driven-development:
 
 Phase 1 (Checkpoint E) unblocks herald-02's RuneAgent and lease bindings (its Tasks 5, 10, 16, 23) and herald-04/05's
 expiry and claim leases (herald-04 Task 21, herald-05 Task 6); Phase 2 (Checkpoint F) unblocks herald-02's tenant
-election and singletons (its Tasks 21 and 15); Phase 3 (Checkpoint G) unblocks Herald
-discovery on Rune and the removal of etcd.
+election and singletons (its Tasks 21 and 15). Herald's pod registry and singletons are unblocked by Phase 1 (lease
+topics, `LeaseWatch`, the F25 bound in Task 17) and Phase 2 / Task 20 (`LeaseElection`).
