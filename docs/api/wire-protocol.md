@@ -229,8 +229,23 @@ On the internal worker ring the same feature appends `OpType::FILTER_SCHEMA` (25
   the original `baseOffset` and the original verdicts once the committed watermark W has passed the batch; a retry outside
   the window on a verdict source is answered `DuplicateSequence` (21) with no trailer. An ack with more than one claim
   (thousands of rejections, up to 32,824 bytes) is offered rather than claimed; ack publications have a term of at least 512 KiB.
-- **Control records 16 to 19** are control batches with producer id -1 in the log: 16 reservation, 17 verdict marker,
-  18 constraint-set change, 19 transaction judge. Consumers never receive them and the transaction readers ignore them.
+- **Control records 16 to 20** are control batches with producer id -1 in the log: 16 reservation, 17 verdict marker,
+  18 constraint-set change, 19 transaction judge, 20 verdict plan. Consumers never receive them and the transaction readers ignore them.
+- **Verdict plan record** (type 20, `kVerdictPlan`): the plan of a `unique` or `check` view that joins a verdict source, appended just
+  below its constraint-set change record so that every leader judges with the same plan. The value is little-endian, at most 65,536 bytes
+  in all (a larger plan is refused at DDL):
+
+  | Offset | Size | Field |
+  |---|---|---|
+  | 0 | 1 | version, 1 |
+  | 1 | 8 | `viewObjectId` |
+  | 9 | 8 | `planFingerprint` |
+  | 17 | 1 | `kind` (2 `unique`, 3 `check`) |
+  | 18 | 4 + n | `planLen`, then the serialized plan |
+  | | 4 + n | `outLen`, then the output descriptor |
+  | | 4 + n | `srcLen`, then the source descriptor |
+
+  The cleaner keeps type-20 records. Consumers never receive them.
 - **Reservation record** (type 16): the payload is `[version u8][reservedThroughN u64]`. An autoincrement leader appends
   it before it hands out ids above the last reserved `n`; a new leader starts above the highest one it reads. Every reader
   skips it, so it never reaches a consumer.
@@ -346,7 +361,7 @@ topic or view. The leader's owning worker answers, so a read costs about as much
 | 9 | `autoIncrementReservedThrough` | topic | The highest id reserved in the log (0 = none). |
 | 10 | `autoIncrementIdsBurned` | topic | Ids taken and never stored: a refused or failed batch, a reservation a failover left unused. |
 | 11 to 20 | transaction vote counters | topic | Defined, not reported yet (the transaction judge, Part 09). |
-| 32 | `uniqueConflicts` | view | Defined, not reported yet (the view-constraint engine, Part 09). |
+| 32 | `uniqueConflicts` | view | Extra claimants of a `unique` view's keys: live source records that share a key with its owner. Reported for a `unique` view only. |
 | 33 | `scanRows` | view | Rows returned by scans. |
 | 34 | `scanPages` | view | `ScanViewRows` pages served. |
 | 35 | `transientRecordsEvicted` | view | Records a transient source dropped before the view folded them. |

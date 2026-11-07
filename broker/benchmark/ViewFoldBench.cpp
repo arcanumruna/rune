@@ -105,6 +105,8 @@
 #include <rune/node/VerdictSource.h>
 #include <rune/node/WriteState.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/ql/Backends.h>
+#include <rune/ql/Parser.h>
 #include <rune/storage/LogReadView.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/view/PlanCompiler.h>
@@ -349,7 +351,7 @@ struct NoPrepare {
 // runs once per batch before its records (e.g. to mark the batch transactional).
 template <class AppendFn, class PrepareFn = NoPrepare>
 BatchStream buildStream(const std::vector<Op>& ops, const int* sizes, size_t sizesLen,
-                        AppendFn&& append, PrepareFn&& prepare = PrepareFn{}) {
+                        AppendFn&& append, PrepareFn&& prepare = PrepareFn{}, int64_t firstOffset = 0) {
     BatchStream s;
     s.bytes.reserve(ops.size() * 48);
     s.byteOffset.reserve(ops.size());
@@ -358,7 +360,7 @@ BatchStream buildStream(const std::vector<Op>& ops, const int* sizes, size_t siz
     s.baseOffset.reserve(ops.size());
 
     size_t opIdx = 0, sizeIdx = 0;
-    int64_t nextOffset = 0;
+    int64_t nextOffset = firstOffset;
     while (opIdx < ops.size()) {
         const uint32_t want = static_cast<uint32_t>(sizes[sizeIdx % sizesLen]);
         ++sizeIdx;
@@ -911,6 +913,270 @@ static void BM_ViewFoldVerdictKeyIndex(benchmark::State& st) {
     }
 }
 BENCHMARK(BM_ViewFoldVerdictKeyIndex)->Name("BM_ViewFoldVerdict/key_index")->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime();
+
+// Constraint judging (checked writes Part 09, §14): the BM_ViewFoldReplace churn on the spec's `character` shape through
+// character_name (unique lower(name)) and account_stats (count(*), characters <= 12).  Every name is the key's own and no
+// account holds more than 8 characters, so nothing is rejected.  The gate is the judging budget over the same two views
+// folded plainly: verdict_record_p50_ns - unjudged_same_views record_p50_ns <= 1000, run here first in the same process, and
+// steady_alloc == 0.  unique_with_promotions seeds pairs of characters sharing a name before the constraints exist (they
+// replay unjudged, so one of each pair is an extra claimant) and then renames the owner of a pair on 5% of the records, which
+// promotes the extra; it is reported only.
+namespace {
+const char* const kConstraintTopic = "topic character { characterId uint64, userId uint64, name string(16), gender uint16, lastPlayed int64 } partitions 1 key characterId;";
+const char* const kUniqueName = "create unique view character_name key lower(name) as nameKey as select characterId from character;";
+const char* const kAccountStats = "create view account_stats key userId as select count(*) as characters from character group by userId "
+                                  "constraint max_characters check (characters <= 12);";
+constexpr uint64_t kUniqueObjectId = 7, kStatsObjectId = 8;
+constexpr uint64_t kSeededKeyBase = 10'000'000;   // above every churn key
+constexpr int32_t kRenameOwner = -1;              // Op::hp of a promotion record
+
+struct ConstraintMember {
+    rune::view::CompileResult comp;
+    std::unique_ptr<rune::node::ViewInstance> inst;
+    rune::view::VerdictViewKind kind{};
+    uint64_t objectId = 0;
+
+    ConstraintMember(const char* statement, const rune::ql::TopicDef& topic, const rune::codec::Descriptor& src, uint64_t id) : objectId(id) {
+        auto parsed = rune::ql::parse(statement).value();
+        auto authored = rune::ql::applyViewPlan(std::get<rune::ql::CreateViewDef>(parsed), rune::ql::viewSourceOf(topic)).value();
+        authored.sources[0].topicId = 5;
+        const rune::codec::Descriptor* srcs[] = {&src};
+        comp = compileView(authored, srcs, static_cast<int32_t>(0x40000000 + id)).value();
+        comp.plan.viewObjectId = id;
+        rune::view::ViewTableKeys keys;
+        if (const auto spec = buildKeyedFoldSpec(comp.plan, src)) {
+            keys.keyWidth = static_cast<uint8_t>(spec->keyWidth);
+            keys.prefixWidth = static_cast<uint8_t>(spec->prefixWidth);
+        }
+        constexpr size_t kSlots = 1u << 21, kChunk = 32u << 20;
+        inst = std::make_unique<rune::node::ViewInstance>(comp.plan, comp.rowLayout, src, false, 0, kSlots, kChunk, keys);
+        if (isAggregateView(inst->plan)) inst->agg.emplace(buildAggLayout(inst->plan, src).value(), kSlots, kChunk, inst->tableKeys);
+        if (const auto spec = buildKeyedFoldSpec(inst->plan, src)) {
+            inst->keyed = spec;
+            rune::node::buildKeyedTables(*inst, kSlots, kChunk);
+        }
+        kind = verdictKindOf(inst->plan).value();
+    }
+
+    // The plain fold of one committed batch (what the view set runs for a view that is not judged).
+    FoldStats foldPlain(const rune::storage::LogReadView& lv, int64_t bound) {
+        int64_t cursor = 0;
+        rune::node::ViewInstance& i = *inst;
+        if (i.keyed) {
+            if (i.agg) {
+                auto f = rune::node::aggregateFoldOf(i);
+                return foldKeyedAggregateBatch(f, i.prospect, lv, bound, cursor, kNoSkip);
+            }
+            auto f = rune::node::projectionFoldOf(i);
+            return foldProjectionBatch(f, i.prospect, lv, bound, cursor, kNoSkip);
+        }
+        if (i.agg) return foldAggregateBatch(i.plan, i.layout, i.agg->layout, i.vdc, i.table, i.agg->contributors, i.agg->groups, i.agg->blocksOrNull(), lv, bound, cursor, kNoSkip);
+        return foldBatch(i.plan, i.layout, i.vdc, i.table, lv, bound, cursor, kNoSkip);
+    }
+
+    // Nothing checkpoints these members, so their dirty rows are dropped (WorkerViewSet::discardDirty_'s rule).
+    void dropDirty() {
+        rune::node::ViewInstance& i = *inst;
+        if (i.keyed) {
+            auto drop = [](uint32_t, const uint8_t*, bool, std::span<const uint8_t>) noexcept {};
+            i.table.drainDirtyKeyed(drop);
+            if (i.owners) i.owners->drainDirtyKeyed(drop);
+            if (i.claims) {
+                i.claims->indexTable().drainDirtyKeyed(drop);
+                i.claims->extrasTable().drainDirtyKeyed(drop);
+            }
+            if (i.agg) {
+                i.agg->contributors.drainDirtyKeyed(drop);
+                i.agg->groups.drainDirtyKeyed(drop);
+                if (i.agg->blocks) i.agg->blocks->drainDirtyKeyed(drop);
+                i.agg->groupIds->drainDirtyKeyed(drop);
+            }
+            return;
+        }
+        auto drop = [](uint32_t, const uint8_t*, bool, uint64_t) noexcept {};
+        i.table.drainDirty(drop);
+        if (i.agg) {
+            i.agg->contributors.drainDirty(drop);
+            i.agg->groups.drainDirty(drop);
+            if (i.agg->blocks) i.agg->blocks->drainDirty(drop);
+        }
+    }
+};
+
+struct ConstraintRig {
+    rune::ql::TopicDef topic = std::get<rune::ql::TopicDef>(rune::ql::parse(kConstraintTopic).value());
+    rune::codec::Descriptor src = rune::ql::toDescriptor(topic);
+    ConstraintMember unique{kUniqueName, topic, src, kUniqueObjectId};
+    ConstraintMember stats{kAccountStats, topic, src, kStatsObjectId};
+
+    std::vector<uint8_t> encode(uint64_t key, uint64_t user, const std::string& name, int64_t lastPlayed) const {
+        std::vector<uint8_t> rec(4 + src.blockLength, 0);
+        rec[0] = static_cast<uint8_t>(src.blockLength);
+        rec[1] = static_cast<uint8_t>(src.blockLength >> 8);
+        rec[2] = static_cast<uint8_t>(src.version);
+        rec[3] = static_cast<uint8_t>(src.version >> 8);
+        const auto put = [&](const char* field, uint64_t v) {
+            const auto* f = src.find(field);
+            for (uint32_t i = 0; i < rune::codec::fieldWidth(*f); ++i) rec[4 + f->offset + i] = static_cast<uint8_t>(v >> (8 * i));
+        };
+        put("characterId", key);
+        put("userId", user);
+        put("gender", key % 3);
+        put("lastPlayed", static_cast<uint64_t>(lastPlayed));
+        std::memcpy(rec.data() + 4 + src.find("name")->offset, name.data(), name.size());
+        return rec;
+    }
+    // A churn key owns its name and sits with at most 8 neighbours; a seeded pair (key base + 2g + 1, + 2) shares dup<g>.
+    void append(rune::protocol::RecordBatchBuilder& bb, const Op& op) const {
+        const auto kb = keyBytes(static_cast<int64_t>(op.key));
+        if (op.tombstone) {
+            bb.append(asSv(kb), std::string_view{}, 0);
+            return;
+        }
+        char name[17];
+        uint64_t user = op.key / 8 + 1;
+        if (op.key >= kSeededKeyBase) {
+            const uint64_t pair = (op.key - kSeededKeyBase - 1) / 2;
+            user = 5'000'000 + pair / 4;
+            if (op.hp == kRenameOwner) std::snprintf(name, sizeof name, "m%llu", static_cast<unsigned long long>(op.key));
+            else std::snprintf(name, sizeof name, "dup%llu", static_cast<unsigned long long>(pair));
+        } else {
+            std::snprintf(name, sizeof name, (op.key & 1) ? "n%llu" : "N%llu", static_cast<unsigned long long>(op.key));
+        }
+        const auto val = encode(op.key, user, name, op.hp);
+        bb.append(asSv(kb), asSv(val), 0);
+    }
+    void dropDirty() { unique.dropDirty(); stats.dropDirty(); }
+};
+
+// The churn of BM_ViewFoldReplace; with `pairs` > 0, 5% of its records are replaced by the rename of one seeded pair's owner.
+std::vector<Op> constraintChurn(uint64_t pairs) {
+    auto ops = generateChurnOps(kTotalOps);
+    uint64_t pair = 0;
+    for (size_t i = 0; pairs != 0 && i < ops.size() && pair < pairs; i += 20) ops[i] = Op{kSeededKeyBase + 2 * pair++ + 1, kRenameOwner, false};
+    return ops;
+}
+std::vector<Op> seededPairs(uint64_t pairs) {
+    std::vector<Op> ops;
+    for (uint64_t p = 0; p < pairs; ++p) {
+        ops.push_back(Op{kSeededKeyBase + 2 * p + 1, 0, false});
+        ops.push_back(Op{kSeededKeyBase + 2 * p + 2, 0, false});
+    }
+    return ops;
+}
+constexpr uint64_t kSeededPairs = 105'000;   // 210,000 records: a whole number of 16-record batch cycles, so the constraint change falls between batches
+
+// The two views of the rig folded plainly over the churn: the gate's baseline.
+PhaseResult runUnjudgedSameViews() {
+    ConstraintRig rig;
+    const auto stream = buildStream(constraintChurn(0), kBatchSizes, std::size(kBatchSizes), [&](rune::protocol::RecordBatchBuilder& bb, const Op& op) { rig.append(bb, op); });
+    auto foldOne = [&](size_t i) {
+        const auto lv = stream.view(i);
+        rig.stats.foldPlain(lv, stream.bound(i));
+        return rig.unique.foldPlain(lv, stream.bound(i));
+    };
+    return runPhases(stream, foldOne, [&] { rig.dropDirty(); }, /*drainEvery*/ 1000);
+}
+
+struct JudgedRun {
+    PhaseResult phases;
+    size_t rejected = 0;
+    uint64_t promotions = 0;
+    bool judgedAll = false;
+};
+
+JudgedRun runJudgedConstraints(uint64_t pairs) {
+    ConstraintRig rig;
+    const auto seed = buildStream(seededPairs(pairs), kBatchSizes, std::size(kBatchSizes), [&](rune::protocol::RecordBatchBuilder& bb, const Op& op) { rig.append(bb, op); });
+    const int64_t seedEnd = seed.size() == 0 ? 0 : seed.bound(seed.size() - 1);
+    const auto stream = buildStream(constraintChurn(pairs), kBatchSizes, std::size(kBatchSizes), [&](rune::protocol::RecordBatchBuilder& bb, const Op& op) { rig.append(bb, op); },
+                                    NoPrepare{}, seedEnd);
+    const int64_t end = stream.bound(stream.size() - 1);
+
+    rune::node::PartitionWriteState write;
+    rune::node::VerdictSource vs{5, 0};
+    vs.addVerdictView(rig.unique.inst.get(), rig.unique.kind, rig.unique.objectId, rig.unique.objectId);
+    vs.addVerdictView(rig.stats.inst.get(), rig.stats.kind, rig.stats.objectId, rig.stats.objectId);
+    rune::node::ConstraintSet set;
+    set.id = 1;
+    set.members[set.count++] = {rig.unique.objectId, rig.unique.kind, rig.unique.objectId};
+    set.members[set.count++] = {rig.stats.objectId, rig.stats.kind, rig.stats.objectId};
+    write.constraintSets.onChange(std::max<int64_t>(seedEnd - 1, 0), set);   // the seed replays unjudged; judging starts above it
+    vs.bindState(&write);
+    vs.bindLeader(nullptr, 1, 0);
+    vs.captureAppendedForTest(false);
+    int64_t nowNs = 0;
+
+    auto readRange = [&](int64_t from, int64_t) {
+        const BatchStream& s = from < seedEnd ? seed : stream;
+        const int64_t streamEnd = from < seedEnd ? seedEnd : end;
+        const size_t j = static_cast<size_t>(std::upper_bound(s.baseOffset.begin(), s.baseOffset.end(), from) - s.baseOffset.begin()) - 1;
+        return rune::storage::LogReadView{s.bytes.data() + s.byteOffset[j], s.bytes.size() - s.byteOffset[j], s.baseOffset[j], streamEnd};
+    };
+    for (int pass = 0; pass < 1000 && vs.judgedThrough() < seedEnd; ++pass) vs.driveJudge(readRange, seedEnd, nowNs += 1'000'000, write);
+    rig.dropDirty();
+    const size_t extrasBefore = rig.unique.inst->claims->extras();
+
+    auto foldOne = [&](size_t i) {
+        vs.driveJudge(readRange, stream.bound(i), nowNs += 1'000'000, write);
+        rune::node::verdictOnHw(write, stream.bound(i));
+        return FoldStats{};
+    };
+    JudgedRun out;
+    out.phases = runPhases(stream, foldOne, [&] { rig.dropDirty(); }, /*drainEvery*/ 1000);
+    out.rejected = write.rejected.size();
+    out.promotions = extrasBefore - rig.unique.inst->claims->extras();
+    out.judgedAll = vs.judgedThrough() >= end - 8;
+    return out;
+}
+}  // namespace
+
+static void BM_ViewFoldUnjudgedSameViews(benchmark::State& st) {
+    for (auto _ : st) {
+        auto r = runUnjudgedSameViews();
+        st.counters["record_p50_ns"] = percentileUs(r.trueRecordLatNs, 0.50) * 1000.0;
+        st.counters["record_p99_ns"] = percentileUs(r.trueRecordLatNs, 0.99) * 1000.0;
+        st.counters["steady_alloc"]  = static_cast<double>(r.steadyAlloc);
+    }
+}
+BENCHMARK(BM_ViewFoldUnjudgedSameViews)->Name("BM_ViewFoldVerdict/unjudged_same_views")->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime();
+
+static void BM_ViewFoldVerdictUniqueCount(benchmark::State& st) {
+    for (auto _ : st) {
+        auto base = runUnjudgedSameViews();
+        const double unjudgedP50Ns = percentileUs(base.trueRecordLatNs, 0.50) * 1000.0;
+        JudgedRun run = runJudgedConstraints(0);
+        const double p50 = percentileUs(run.phases.trueRecordLatNs, 0.50) * 1000.0;
+        st.counters["verdict_record_p50_ns"] = p50;
+        st.counters["verdict_record_p99_ns"] = percentileUs(run.phases.trueRecordLatNs, 0.99) * 1000.0;
+        st.counters["steady_alloc"]          = static_cast<double>(run.phases.steadyAlloc);
+        st.counters["unjudged_record_p50_ns"] = unjudgedP50Ns;
+        st.counters["rejected_total"]        = static_cast<double>(run.rejected);
+        const bool pass = p50 - unjudgedP50Ns <= 1000.0 && run.phases.steadyAlloc == 0 && run.judgedAll && run.rejected == 0;
+        st.counters["gate_pass"] = pass ? 1.0 : 0.0;
+        rune::bench::gateCheck(st, pass, !run.judgedAll ? "the judge did not reach the end of the stream"
+                                         : run.rejected != 0 ? "a record was rejected"
+                                                             : "judging adds more than 1000 ns per record or allocates in steady state");
+        std::fprintf(stderr,
+                     "[ViewFoldVerdict unique+count gate] verdict_record_p50_ns=%.0f unjudged_record_p50_ns=%.0f delta_ns=%.0f (<=1000) "
+                     "steady_alloc=%lld (==0) => %s\n",
+                     p50, unjudgedP50Ns, p50 - unjudgedP50Ns, static_cast<long long>(run.phases.steadyAlloc), pass ? "PASS" : "FAIL");
+    }
+}
+BENCHMARK(BM_ViewFoldVerdictUniqueCount)->Name("BM_ViewFoldVerdict/unique_lower_plus_count_check")->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime();
+
+static void BM_ViewFoldVerdictPromotions(benchmark::State& st) {
+    for (auto _ : st) {
+        JudgedRun run = runJudgedConstraints(kSeededPairs);
+        st.counters["verdict_record_p50_ns"] = percentileUs(run.phases.trueRecordLatNs, 0.50) * 1000.0;
+        st.counters["verdict_record_p99_ns"] = percentileUs(run.phases.trueRecordLatNs, 0.99) * 1000.0;
+        st.counters["steady_alloc"]          = static_cast<double>(run.phases.steadyAlloc);
+        st.counters["rejected_total"]        = static_cast<double>(run.rejected);
+        st.counters["promotions"]            = static_cast<double>(run.promotions);
+        if (!run.judgedAll) st.SkipWithError("the judge did not reach the end of the stream");
+    }
+}
+BENCHMARK(BM_ViewFoldVerdictPromotions)->Name("BM_ViewFoldVerdict/unique_with_promotions")->Unit(benchmark::kMicrosecond)->Iterations(1)->UseRealTime();
 
 // Aggregate fold gate (Phase 2a): user_totals grouped by userId over
 // 1,000,000 contributors / 10,000 groups. What is warm before timing:

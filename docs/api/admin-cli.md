@@ -90,7 +90,9 @@ Prints the counters of every partition of a topic or view, each read from the pa
 | `--broker host:port` | Any broker (or `RUNE_BROKER`). |
 
 Text: a `partition N` line, then one `<name> <value>` line per reported counter in id order and one `constraint <name> <rejections>`
-line per constraint, labelled `<view>.unique` or `<view>.<constraint name>`. A view's constraint counts are the rejections its source
+line per constraint, labelled `<view>.unique` or `<view>.<constraint name>` (`constraint character_name.unique 3`,
+`constraint account_stats.max_characters 1`), or `0x%08x` of the constraint id when no view definition names it. A view that was dropped or replaced
+still gives its name. `rune stats view <unique view>` also prints `uniqueConflicts`, the number of extra claimants that share a key with its owner. A view's constraint counts are the rejections its source
 partition's judge recorded, so `rune stats view` reads the source partition too. A counter the partition does not have is not printed,
 and a partition with none prints `(no counters)`.
 

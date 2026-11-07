@@ -278,6 +278,51 @@ completes `Ok` with `value` = the offset and `aux` = the id (`assignedKeyOf(comp
 - **Orphaned rows**: an `insertAndWait` that times out may have created the row. Look it up through a unique view before
   inserting again.
 
+### Constraint violations
+
+A write that breaks a `unique` view or a `check` constraint (see [Constraints](ql.md#constraints)) completes with
+`OpStatus::BrokerError` and `errorCode` 55 (`ConstraintViolation`). It needs `Acks::All | Acks::View`: without `View` the
+broker still rejects the record, but the writer is not told.
+
+- **`WriteResult`**: `code()` is 55, `constraintId()` is `viewObjectId << 16 | ordinal` (ordinal 0 is the view's `unique`
+  clause, `k` its `k`-th `constraint`) and `offset()` is the rejected record's own offset. A `Completion` of a single send or of
+  `claimBatch(1)`, a 1-record Tier-2 batch and a 1-record `BatchAck` all carry that offset in `value`. A batch of two or more
+  records completes once with `RecordsRejected` (15) and reports every rejection with `offset = base + index`
+  (`BatchVerdicts::offsetOf(i)`).
+- **`Client::constraintName(id)`** returns the `ConstraintName{view, constraint}` an id names (`character_name` / `unique`,
+  `account_stats` / `max_characters`), or `std::nullopt` for id 0 (the key index) and for an id no view ever had. A view that
+  was dropped or replaced since the write still resolves. A miss is answered from one catalog refresh, bounded by
+  `kConstraintNameRefreshTimeout` (5 s; the two-argument form takes another bound), so the call blocks. Call it only from the
+  thread that owns the `Client`; any other thread gets `std::logic_error`.
+- **Racing writers.** The loser of two inserts of one unique key is judged after the winner, so the winner's row is already
+  folded: read the unique view with `minOffset` set to the loser's `offset()`.
+
+```cpp
+// auth-server, login: two first logins race for one (provider, subject)
+rp::gen::User u{.provider = provider, .subject = subject, .createdAt = now};
+WriteResult r = users.insertAndWait(u);              // key 0: the broker assigns userId
+uint64_t userId = r.key();
+if (r.code() == 55) {                                // user_identity already holds this identity
+    auto kb = v::ViewKeyBuilder::fromCatalog(state, "user_identity");
+    kb->setUInt("provider", provider).setString("subject", subject);
+    ViewReadOptions ro{.minOffset = r.offset(), .partition = kb->partition()};
+    ViewRowResult row = client.getViewRowAndWait(identityViewTopicId, *kb->key(), ro, 5s);
+    userId = /* the userId column of row */;         // the winner's id
+}
+
+// character-server, POST /character (the user id comes from the verified JWT)
+WriteResult r = characters.insertAndWait(rp::gen::Character{.userId = u, .name = req.name /* ... */});
+if (r.ok()) return created(r.key());                 // the new characterId
+if (r.code() == 55) {
+    const auto c = client.constraintName(r.constraintId());
+    if (c && c->view == "character_name") return conflict();       // 409 name taken
+    if (c && c->constraint == "max_characters") return badRequest(); // 400 too many characters
+}
+
+// character-server, DELETE /character/{id}
+WriteResult d = characters.removeExistingAndWait(id);  // code() 57 (KeyNotFound) -> 404; a delete is never a 55
+```
+
 ### Acknowledgements
 
 Three zero-allocation ways to learn the outcome of a record:
@@ -568,7 +613,7 @@ players.send(p);                                                       // routed
   `(…, Completions& cq, Token token)`; `upsert(rec)` (the same as `send(rec)`) and `remove(key)` also have a
   fire-and-forget form. Each has an `…AndWait(…, timeout = kDefaultWriteWait /* 30 s */)` that returns a `WriteResult`:
   `ok()`, `status()` (`Ok`, `BrokerError`, `Timeout`, `BrokerTooOld`, `VerdictUnknown`, `DeliveryFailed`, `Closed` when
-  the client closes first), `code()` (56, 57, 39 or 24 for a `BrokerError`), `constraintId()`, `offset()` and `key()`
+  the client closes first), `code()` (55, 56, 57, 39 or 24 for a `BrokerError`; see [Constraint violations](#constraint-violations)), `constraintId()`, `offset()` and `key()`
   (the broker-assigned key of an autoincrement create, not the record's; 0 for every other write). A local refusal (see
   [Write intents](#write-intents)) or an over-long key throws `std::invalid_argument`. An oversized record throws
   `std::invalid_argument` from the `…AndWait` forms and `std::length_error` from the token forms. `remove` and
@@ -676,7 +721,7 @@ for (int restarts = 0;;) {                                                      
   The completion's `OpKind` is `GetViewRowK` or `ScanViewRows`; decode a scan's payload with `rune::client::view::decodeScanPayload`.
 - Both calls end `BrokerTooOld` without sending when the seed's `brokerVersion` is below `kBrokerVersionCheckedWrites` (10).
 - The refusals at create time are error codes 59 (`ViewKeyExpressionInvalid`), 60 (`ViewConstraintInvalid`) and 61 (`ViewUniqueInvalid`);
-  the broker refuses a plan with `unique` (61) or `check` constraints (60) until the view-constraint engine ships.
+  see [Constraints](ql.md#constraints) for what a `unique` or `check` view is refused for.
   A view whose key is not exactly the source key needs a one-partition source.
 
 ### Stats

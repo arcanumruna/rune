@@ -8,7 +8,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <cctype>
+#include <map>
+#include <set>
+#include <string>
 
 using namespace rune::node;
 using namespace rune::node::cw;
@@ -538,4 +543,192 @@ TEST(CheckedWritesAllocRegression, StatsServingAllocatesNothingRegression) {
         }
         EXPECT_EQ(answered, 2000u);
     }
+}
+
+// Part 09 (hard rule): judging with a unique view and a check view allocates nothing in steady state - the claims, the owner
+// and extras tables, the group counts, the 55 verdicts of each view, the promotions of an extra claimant and the markers.  The
+// source keeps the key index, character_name, account_stats and account_characters; 8 names had 20 claimants each before the
+// constraints were created, so the owner of a name leaves (deleted or renamed) and the next claimant is promoted all through
+// the run.  Characters 161..244 churn through a pool of 64 names; account 41 is full, so every move into it is refused.  A
+// batch's records touch distinct characters and distinct names, and the model of the names and accounts follows the acks.
+// No account loses its last character: emptying an account's prefix set grows the keyed table's free list, which is that table's
+// amortized growth and not judging's.
+// The window brackets the worker's passes of one batch; the frame, the ack wait and the model are the rig's.
+TEST(CheckedWritesAllocRegression, SteadyStateUniqueAndCheckJudgingAllocatesNothingRegression) {
+    using Char = VerdictRig::Char;
+    using CV = ConstrainedView;
+    constexpr uint8_t kLeader = 1;
+    constexpr uint16_t kViolation = 55;
+    constexpr uint64_t kClaimed = 160, kMobile = 244, kFull = 41, kPool = 64;
+    constexpr int kWarmup = 300, kMeasured = 3000;
+    const auto lower = [](std::string n) { for (char& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return n; };
+
+    VerdictRig r;
+    r.createCharacterTopic(false);
+    r.enableAcks();
+    r.worker->setVerdictIntervalNs(20'000'000);
+    r.passes(60);
+
+    std::array<std::string, 257> name;
+    std::array<uint64_t, 257> user{};
+    std::array<bool, 257> alive{};
+    std::array<int, kFull + 1> inUser{};      // live characters per account
+    std::map<std::string, uint64_t> owner;   // lower(name) of the pool -> the character that owns it
+    std::vector<Char> seed;
+    for (uint64_t id = 1; id <= 256; ++id) {
+        user[id] = id >= 245 ? kFull : id % 40 + 1;
+        name[id] = id <= kClaimed ? (id % 3 == 0 ? "DUP" : id % 3 == 1 ? "dup" : "Dup") + std::to_string((id - 1) % 8) : "Z" + std::to_string(id);
+        alive[id] = true;
+        ++inUser[user[id]];
+        seed.push_back(Char{.id = id, .userId = user[id], .name = name[id]});
+    }
+    for (std::size_t at = 0; at < seed.size(); at += 16) {
+        const std::vector<Char> chunk(seed.begin() + static_cast<std::ptrdiff_t>(at), seed.begin() + static_cast<std::ptrdiff_t>(std::min(seed.size(), at + 16)));
+        const auto a = r.ack(r.appendCharacters(chunk, kLeader));
+        ASSERT_TRUE(a && a->code == 0);
+    }
+    ASSERT_TRUE(r.driveUntilJudgeReaches());
+    for (const CV v : {CV::CharacterName, CV::AccountStats, CV::AccountCharacters}) r.createConstrainedView(v);
+    ASSERT_TRUE(r.driveUntilJudgeReaches());
+    for (const auto& [v, l] : r.constrained) r.driveUntilFolded(l.topicId, r.dataEnd());
+    ASSERT_EQ(r.uniqueConflicts(CV::CharacterName), 152u) << "8 names with 20 claimants each: 19 extras per name";
+
+    uint64_t lcg = 0x9E3779B97F4A7C15ull;
+    const auto next = [&](uint64_t n) { lcg = lcg * 6364136223846793005ull + 1442695040888963407ull; return (lcg >> 33) % n; };
+    const auto poolName = [](uint64_t p, bool upper) { return std::string(upper ? "P" : "p") + std::to_string(p); };
+    // A pool name nobody owns (starting at a random one), or "" when all 64 are taken.
+    const auto freePoolName = [&](const std::set<std::string>& usedNow) {
+        for (uint64_t i = 0, p = next(kPool); i < kPool; ++i, p = (p + 1) % kPool) {
+            const std::string n = poolName(p, next(2) == 0);
+            if (owner.count(lower(n)) == 0 && usedNow.count(lower(n)) == 0) return n;
+        }
+        return std::string();
+    };
+    const auto ownerOfClaimed = [&](uint64_t group) -> uint64_t {   // the smallest live claimant of dup<group>
+        for (uint64_t id = group + 1; id <= kClaimed; id += 8)
+            if (alive[id]) return id;
+        return 0;
+    };
+
+    int32_t seq = 0;
+    uint64_t ownedRejections = 0, countRejections = 0, accepted = 0;
+    const auto planBatch = [&](int round, int records) {
+        std::vector<Char> out;
+        std::set<uint64_t> usedIds;
+        std::set<std::string> usedNames;
+        std::array<int, kFull + 1> leaving{};
+        const auto fresh = [&](uint64_t id) { return usedIds.insert(id).second; };
+        const auto leaves = [&](uint64_t id) { return inUser[user[id]] - leaving[user[id]]++ > 1; };   // an account keeps a character
+        if (round % 20 == 0) {   // the owner of a claimed name leaves: deleted or renamed away, and the next claimant is promoted
+            const uint64_t group = static_cast<uint64_t>(round / 20) % 8, id = ownerOfClaimed(group);
+            const std::string to = freePoolName(usedNames);
+            const bool erase = (round / 20) % 2 == 0 || to.empty();
+            if (id != 0 && fresh(id) && (!erase || leaves(id))) {
+                if (erase) out.push_back(Char{.id = id, .tombstone = true});
+                else { usedNames.insert(lower(to)); out.push_back(Char{.id = id, .userId = user[id], .name = to}); }
+            }
+        }
+        while (out.size() < static_cast<std::size_t>(records)) {
+            const uint64_t pick = next(100), id = kClaimed + 1 + next(kMobile - kClaimed);
+            if (pick < 10) {   // a name another character owns
+                if (!alive[id] || !fresh(id)) continue;
+                std::string taken;
+                for (const auto& [lowered, who] : owner)
+                    if (who != id && usedNames.count(lowered) == 0 && (taken.empty() || next(4) == 0)) taken = lowered;
+                if (taken.empty()) continue;
+                usedNames.insert(taken);
+                out.push_back(Char{.id = id, .userId = user[id], .name = taken});
+            } else if (pick < 20) {   // into the full account
+                if (!alive[id] || !fresh(id)) continue;
+                out.push_back(Char{.id = id, .userId = kFull, .name = name[id]});
+            } else if (pick < 30) {   // delete
+                if (!alive[id] || !fresh(id) || !leaves(id)) continue;
+                out.push_back(Char{.id = id, .tombstone = true});
+            } else if (pick < 45) {   // create
+                if (alive[id] || !fresh(id)) continue;
+                const std::string to = freePoolName(usedNames);
+                if (to.empty()) continue;
+                usedNames.insert(lower(to));
+                out.push_back(Char{.id = id, .userId = next(40) + 1, .name = to});
+            } else if (pick < 70) {   // rename, now and then to the own name in another case
+                if (!alive[id] || !fresh(id)) continue;
+                const bool ownName = next(5) == 0 && owner.count(lower(name[id])) != 0;
+                const std::string to = ownName ? (name[id][0] == 'P' ? lower(name[id]) : "P" + name[id].substr(1)) : freePoolName(usedNames);
+                if (to.empty()) { usedIds.erase(id); continue; }
+                usedNames.insert(lower(to));
+                out.push_back(Char{.id = id, .userId = user[id], .name = to});
+            } else {   // a move or a plain update, of any character (a claimant keeps its name)
+                const uint64_t any = 1 + next(kMobile);
+                if (!alive[any] || !fresh(any)) continue;
+                const bool moves = pick < 85 && leaves(any);
+                out.push_back(Char{.id = any, .userId = moves ? next(40) + 1 : user[any], .name = name[any], .lastPlayed = static_cast<int64_t>(round)});
+            }
+        }
+        return out;
+    };
+    const auto settle = [&](const std::vector<Char>& sent, const VerdictRig::Ack& a) {
+        std::set<std::size_t> refused;
+        for (const auto& [index, code, cid] : a.verdicts) {
+            refused.insert(index);
+            ownedRejections += cid == (7u << 16);
+            countRejections += cid == ((8u << 16) | 1);
+            EXPECT_EQ(code, kViolation);
+        }
+        for (std::size_t i = 0; i < sent.size(); ++i) {
+            if (refused.count(i) != 0) continue;
+            ++accepted;
+            const Char& c = sent[i];
+            if (alive[c.id]) --inUser[user[c.id]];
+            if (alive[c.id] && owner.count(lower(name[c.id])) != 0 && owner[lower(name[c.id])] == c.id) owner.erase(lower(name[c.id]));
+            alive[c.id] = !c.tombstone;
+            if (c.tombstone) continue;
+            user[c.id] = c.userId;
+            ++inUser[c.userId];
+            name[c.id] = c.name;
+            if (lower(c.name)[0] == 'p') owner[lower(c.name)] = c.id;
+        }
+    };
+    const auto drive = [&](int round, uint64_t& windowRejections) -> uint64_t {
+        const int records = round % 2 == 0 ? 1 : 16;
+        const std::vector<Char> sent = planBatch(round, records);
+        const int64_t c = r.appendCharacters(sent, kAllView, 41, seq);
+        seq += static_cast<int32_t>(sent.size());
+        const uint64_t before = r.stats()->rejectionsConstraint;
+        uint64_t allocs = 0;
+        {
+            rune::testing::AllocWindow w;
+            for (int i = 0; i < 3; ++i) {
+                r.now += 1'000'000;
+                r.worker->doWork(r.now);
+                r.worker->drainReturnView([](WorkerReturn&&) {});
+            }
+            allocs = w.count();
+        }
+        windowRejections += r.stats()->rejectionsConstraint - before;
+        const auto a = r.ack(c);
+        EXPECT_TRUE(a && a->code == 0) << "round " << round;
+        if (a) settle(sent, *a);
+        return allocs;
+    };
+    uint64_t ignored = 0;
+    for (int round = 0; round < kWarmup; ++round) (void)drive(round, ignored);
+    r.passes(100);
+    const size_t conflictsBefore = r.uniqueConflicts(CV::CharacterName);
+    const uint64_t rejectedBefore = r.stats()->rejectionsConstraint;
+    const uint64_t ownedBefore = ownedRejections, countBefore = countRejections;
+
+    uint64_t total = 0, worst = 0, windowRejections = 0;
+    for (int round = kWarmup; round < kWarmup + kMeasured; ++round) {
+        const uint64_t a = drive(round, windowRejections);
+        total += a;
+        worst = std::max(worst, a);
+    }
+    r.passes(100);
+    const uint64_t rejected = r.stats()->rejectionsConstraint - rejectedBefore;
+    EXPECT_GT(ownedRejections - ownedBefore, 200u) << "character_name refused takes";
+    EXPECT_GT(countRejections - countBefore, 200u) << "account_stats refused moves into the full account";
+    EXPECT_EQ(windowRejections, rejected) << "every rejection of the measured batches happened inside a window";
+    EXPECT_LT(r.uniqueConflicts(CV::CharacterName) + 50, conflictsBefore) << "more than 50 extra claimants were promoted in the measured span";
+    EXPECT_GT(accepted, static_cast<uint64_t>(kMeasured));
+    EXPECT_EQ(total, 0u) << "worst batch allocated " << worst;
 }

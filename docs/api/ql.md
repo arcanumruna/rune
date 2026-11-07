@@ -172,15 +172,12 @@ A view is a materialized table that the broker keeps current from one typed, key
 - **The identity rule.** A projection view must keep each source record identifiable: its key must include the source key
   column, or the view must be declared `unique`. Otherwise the broker answers `ViewKeyExpressionInvalid` (59) with
   `key does not identify the source record; declare the view unique or include <keyField>`.
-- **`unique`.** `create unique view` declares that no two source records may produce the same view key; a second one would be
-  refused at fold time as `ConstraintViolation` (55). A unique view is a projection (an aggregate with `unique` is 61).
-- **`constraint NAME check (...)`.** A rule over the view's own output row, judged when a record is folded: `characters <= 12`
-  rejects the record that would make an aggregate row break it. A predicate compares a view column with a constant of the same type, joined by `and`,
+- **`unique`.** `create unique view` declares that no two source records may produce the same view key; a second one is
+  refused as `ConstraintViolation` (55). A unique view is a projection (an aggregate with `unique` is 61). See [Constraints](#constraints).
+- **`constraint NAME check (...)`.** A rule over the view's own output row: `characters <= 12` rejects the record that would make an
+  aggregate row break it. A predicate compares a view column with a constant of the same type, joined by `and`,
   `or`, `not` and parentheses; constraint names are unique within the view. The compared columns are fixed-width of at most 16 bytes
   (an integer, `bool`, `float64` or `string(N)` with `N` up to 16); QL refuses a wider or variable column locally.
-- **`unique` and `check` are not enforced yet.** The statements parse and are authored into the plan, but the broker refuses a plan that
-  carries `unique` with `ViewUniqueInvalid` (61) and one that carries `check` with `ViewConstraintInvalid` (60) until the
-  view-constraint engine ships. Every other view statement works.
 - **`transient`** makes the view in-memory only (no checkpoint). **`or replace`** alters a view that exists (`AlterView`, at its
   current version) and creates it when it does not; without it an existing name is `ViewExists` (32). A view cannot read another view.
 
@@ -188,10 +185,54 @@ A view is a materialized table that the broker keeps current from one typed, key
 create view character_by_id key characterId as select userId, name, gender from character;
 create view account_characters key (userId, characterId) as select name, gender from character;
 create view account_stats key userId as select count(*) as characters from character group by userId;
--- parsed and authored; the broker answers 61 until the constraint engine ships:
 create unique view character_name key lower(name) as nameKey as select characterId from character;
 drop view account_stats;
 ```
+
+## Constraints
+
+A `unique` view and a `check` constraint make the broker refuse a write that would break a rule. The rule is judged when the views
+fold the record, after it is stored; a rejected record is never visible. No view folds it, no consumer receives it, and compaction
+removes it from the log. A writer learns the verdict by adding the `View` ack (`Acks::All | Acks::View`; see
+[client-cpp.md](client-cpp.md#constraint-violations)). A write without `View` is still judged and rejected, but its writer is not told.
+
+```sql
+create unique view character_name key lower(name) as nameKey as select characterId from character;
+create view account_stats key userId as select count(*) as characters from character group by userId
+  constraint max_characters check (characters <= 12);
+```
+
+- **What is checked.**
+  - A `unique` view rejects a record whose view key is already owned by a different source key. `character_name` makes names
+    unique without regard to case, because the key is `lower(name)`.
+  - A `check` constraint is evaluated on each row the record would produce, for a projection or an aggregate view
+    (`count`, `sum`, `avg`, `min`, `max`, `last`). The record is rejected when that row fails the predicate **and** the record
+    changes a column the predicate reads.
+  - A record that touches several constrained views must pass all of them, and then changes none of them if one rejects it.
+    Records in a batch are judged one at a time, in order, each seeing the accepted records before it.
+- **The constraint id.** A rejection carries `constraintId = viewObjectId << 16 | ordinal`: ordinal 0 is the `unique` clause and
+  ordinal `k` is the `k`-th `constraint` of the view in declaration order. Id 0 is the key index (`KeyExists`, `KeyNotFound`).
+  `Client::constraintName` and `rune stats` turn an id into `<view>.<constraint>` (`unique` for ordinal 0).
+- **Deletes are never rejected.** A key can always be removed. A delete can therefore leave a row failing a predicate that a removal
+  can break, for example deleting a positive entry under `check (balance >= 0)`. Model ledgers as appended entries, not as
+  deletable ones.
+- **A group already over its limit** (rows from before the constraint, or after deletes) can shrink and never grow: a rename that does not
+  change `characters` passes, a create into the group is rejected, a delete passes, and a move of a character out of it into another
+  group is rejected.
+- **`NULL` in a check passes.** A comparison against a missing value is neither true nor false, and the record is not rejected for it.
+- **Pre-existing duplicates.** A unique view built over records that already share a key lets the record with the **smallest source key**
+  own the name; the others are extra claimants, counted in the view's `uniqueConflicts`. When the owner is deleted or renamed, the next
+  smallest is promoted. A write that claims a name with a live owner is rejected, so the conflicts can only shrink. An extra claimant's
+  own update that keeps its name is accepted. Remove duplicates before a back-fill.
+- **Creating a constraint on a large topic** pauses delivery of new records to consumers while the view builds, because their
+  verdicts are not known yet. Writes are never refused for it: they are stored, acked, and judged once the build has caught up. Rows
+  that already break a rule are not repaired.
+- **`create or replace`** keeps judging with the old definition until the new one has caught up, then swaps in one step: there is no
+  gap. **`drop view`** stops judging after the drop, and a drop followed by a create leaves a gap in which writes are not judged.
+- **Refused.** A `unique` or `check` view over a transient source (`InvalidRequest`, 39, "constraints need a persisted topic"); a topic with more than
+  32 verdict views (the key index counts as one), a view whose object id is 65536 or above, and a view whose plan record is over 65,536
+  bytes (`ViewConstraintInvalid`, 60).
+- **Transactions.** A transactional batch to a source with a constrained view is answered `InvalidRequest` (39).
 
 ## Reads
 
@@ -245,8 +286,8 @@ C++ constants are `ErrorCode` values; codes 59 to 61 reach only sessions at clie
 | 35 | `ViewKeyInvalid` | The key does not appear in the output, `group by` does not equal the key, `group by` has no aggregate column, or the source has no key (a keyless topic cannot be a view source). |
 | 36 | `ViewNotCoPartitioned` | An aggregate view, or a view keyed by anything but the source key, over a source with more than one partition. |
 | 59 | `ViewKeyExpressionInvalid` | A key component that does not compile: a type that is not an integer, enum, `bool` or `string(N)`; `lower()` on a type other than `string(N)`; a duplicate key column; a key over 128 bytes; a `lower()` pinned to another Unicode version; the identity rule above; an aggregate over a source key wider than 8 bytes. |
-| 60 | `ViewConstraintInvalid` | A `check` constraint: no name, a duplicate name, a column that is not in the view, or a comparison of different types. While the constraint engine is missing, any `check`. |
-| 61 | `ViewUniqueInvalid` | A `unique` clause that does not compile (`unique` on an aggregate). While the constraint engine is missing, any `unique`. |
+| 60 | `ViewConstraintInvalid` | A `check` constraint: no name, a duplicate name, a column that is not in the view, or a comparison of different types; or a limit of [Constraints](#constraints) (more than 32 verdict views, an object id of 65536 or above, an oversized plan). |
+| 61 | `ViewUniqueInvalid` | A `unique` clause that does not compile (`unique` on an aggregate). |
 
 ## The RegressorsPath schema
 
@@ -265,8 +306,7 @@ create view account_stats key userId as select count(*) as characters from chara
 
 - `device_login` is keyed by a per-login `loginId`, not by `userId`: an aggregate keeps the latest record per source key, so a
   per-user key would count every user's logins as 1. A login is written with key 0 and the broker assigns the `loginId`.
-- `user_identity` and `character_name` (`unique`) and `account_stats` (`check`) show the constraint statements. Against a broker
-  before the view-constraint engine they are answered 61 and 60, so a deployment creates the other views now and these later.
+- `user_identity` and `character_name` (`unique`) and `account_stats` (`check`) show the constraint statements ([Constraints](#constraints)).
 
 ## Security statements
 

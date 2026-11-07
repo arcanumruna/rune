@@ -78,6 +78,10 @@ alloc-free handoff). The agent drains, accumulates records into per-
   needs a broker of version 10 or later (`OpStatus::BrokerTooOld` locally otherwise) and sends batches of at most
   4096 records. A transactional producer never sets the `View` wire bit.
   A `View` ack on a verdict source carries per-record verdicts; no resend, no epoch bump.
+- `Client::constraintName(id)` resolves a 55's constraint id (`viewObjectId << 16 | ordinal`) from the catalog, including a
+  dropped or replaced view, with one refresh bounded by `kConstraintNameRefreshTimeout` (5 s); owner thread only. A rejected
+  record carries its own offset: a single send, `claimBatch(1)`, a 1-record Tier-2 batch and a 1-record `BatchAck`; a
+  `RecordsRejected` batch reports every rejection with `offset = base + index`.
 - Write intents (`WriteIntent` on every send, the typed `insert`/`update`/`upsert`/`remove`/`removeExisting`) ride
   record attributes bits 0-1 (ring flags `kFlagIntentMask`). The client refuses them locally
   (`SendResult::WriteNotAllowed`, no completion) without `View`, inside a transaction, or on a raw handle, and refuses
