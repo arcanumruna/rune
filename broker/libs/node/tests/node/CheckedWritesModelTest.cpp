@@ -1509,6 +1509,23 @@ private:
         }
     }
 
+    // A view created since the last fetch folds nothing until the follower fetched its change record: W stays below it.
+    void foldViews_(int64_t target) {
+        const auto folded = [&] {
+            for (const auto& [v, l] : rig_.constrained) {
+                const auto st = rig_.vs->instanceServeState(l.topicId, rig_.partition());
+                if (!st.hosted || !st.ready || st.foldCursor < target) return false;
+            }
+            return true;
+        };
+        for (int i = 0; i < VerdictRig::kMaxPass; ++i) {
+            if (folded()) return;
+            if (i % 8 == 0) rig_.followerFetch();
+            rig_.pass();
+        }
+        ADD_FAILURE() << "the constrained views never folded through " << target;
+    }
+
     void verify_() {
         ASSERT_TRUE(judged_()) << " after " << trace;
         const int64_t hw = rig_.replica->highWatermark();
@@ -1527,7 +1544,7 @@ private:
         std::set<int64_t> present;
         for (const auto& d : log.data) present.insert(d.offset);
 
-        for (const auto& [v, l] : rig_.constrained) rig_.driveUntilFolded(l.topicId, dataEnd_(log));
+        foldViews_(dataEnd_(log));
         checkIndex(rig_, model, &present);
         if (!log.data.empty() && !log.markers.empty() && !log.changes.empty()) checkMarkers(model, log, dataEnd_(log), compacted_);
         for (const Pending& p : pending_) checkModelTrailer(model, p.ack, p.n, p.corr);
