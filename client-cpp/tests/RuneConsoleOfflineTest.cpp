@@ -2112,9 +2112,9 @@ TEST(CliErrorNamesRegression, BrokerFailureLinesAndTableBoundsAdversarialRegress
                   std::string(rune::client::authErrorName(code)) + " (" + std::to_string(code) + ") d");
     }
     namespace pc = rune::protocol::client;
-    constexpr auto kLast = static_cast<uint16_t>(pc::ErrorCode::ViewUniqueInvalid);
+    constexpr auto kLast = static_cast<uint16_t>(pc::ErrorCode::LeaseTtlTooLarge);
     EXPECT_EQ(rune::cli::engine::errorCodeName(0), "OK");
-    EXPECT_EQ(rune::cli::engine::errorCodeName(kLast), "ViewUniqueInvalid");
+    EXPECT_EQ(rune::cli::engine::errorCodeName(kLast), "LeaseTtlTooLarge");
     EXPECT_EQ(rune::cli::engine::errorCodeName(kLast + 1), "UnknownErrorCode");
     EXPECT_EQ(rune::cli::engine::errorCodeName(0xFFFF), "UnknownErrorCode");
     EXPECT_EQ(rune::cli::engine::brokerFailure(0xFFFF, ""), "UnknownErrorCode (65535)");

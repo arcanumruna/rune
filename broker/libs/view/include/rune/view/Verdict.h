@@ -15,6 +15,6 @@ struct Verdict {
     return (static_cast<uint32_t>(viewObjectId) << 16) | ordinal;
 }
 
-enum class VerdictViewKind : uint8_t { KeyIndex = 1, Unique = 2, Check = 3, TestReject = 200 };
+enum class VerdictViewKind : uint8_t { KeyIndex = 1, Unique = 2, Check = 3, LeaseIndex = 4, TestReject = 200 };
 
 } // namespace rune::view

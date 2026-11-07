@@ -1048,3 +1048,12 @@ TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastTheJudgeCursorA
 TEST(CheckedWritesVerdictSourceRegression, MemberCatchUpReadsPastAJudgeCursorAtTheBoundRegression) {
     catchUpAcrossTheGapAtTheBound("cw-judge-at-bound", /*markerAboveHw=*/false);
 }
+
+TEST(LeaseNumbersRegression, VerdictViewKindLeaseIndexPinnedRegression) {
+    using rune::view::VerdictViewKind;
+    EXPECT_EQ(static_cast<int>(VerdictViewKind::KeyIndex), 1);
+    EXPECT_EQ(static_cast<int>(VerdictViewKind::Unique), 2);
+    EXPECT_EQ(static_cast<int>(VerdictViewKind::Check), 3);
+    EXPECT_EQ(static_cast<int>(VerdictViewKind::LeaseIndex), 4);
+    EXPECT_EQ(static_cast<int>(VerdictViewKind::TestReject), 200);
+}

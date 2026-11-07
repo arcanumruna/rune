@@ -110,6 +110,9 @@ enum class OpStatus : uint8_t {
     case 59: return "ViewKeyExpressionInvalid";
     case 60: return "ViewConstraintInvalid";
     case 61: return "ViewUniqueInvalid";
+    case 62: return "LeaseNotFound";
+    case 63: return "LeaseLimitExceeded";
+    case 64: return "LeaseTtlTooLarge";
     default: return nullptr;
     }
 }

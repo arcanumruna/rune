@@ -28,7 +28,7 @@ inline constexpr uint16_t kCryptoSchemaId      = 121;
 inline constexpr int32_t  kClientVersionCrypto = 4;  // minimum ConnectRequest.clientVersion offering crypto fields
 inline constexpr int32_t  kBrokerVersionCrypto = 4;  // minimum broker version choosing crypto fields
 
-enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/consume 16-31, groups/txn 32-63, view 64-95
+enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/consume 16-31, groups/txn 32-63, view 64-95, lease 96-111 (96-101 assigned; 102-111 gap -> UnknownTemplate)
     Connect          = 1,
     ConnectResponse  = 2,
     Keepalive        = 3,
@@ -117,6 +117,13 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     // stats (client version 17): sent only to a session >= kClientVersionCheckedWrites
     GetStats                = 91,
     StatsResponse           = 92,
+    // lease topics (client version 18): sent only to a session >= kClientVersionLeases (93-95 stay free: view range)
+    LeaseKeepAlive          = 96,
+    LeaseKeepAliveResponse  = 97,
+    LeaseTimeToLive         = 98,
+    LeaseTimeToLiveResponse = 99,
+    ScanLeases              = 100,
+    ScanLeasesResponse      = 101,
 };
 
 enum class ErrorCode : uint16_t {
@@ -244,6 +251,11 @@ enum class ErrorCode : uint16_t {
     ViewKeyExpressionInvalid = 59,  // DDL compile error: a view key expression
     ViewConstraintInvalid    = 60,  // DDL compile error: a unique / check constraint
     ViewUniqueInvalid        = 61,  // DDL compile error: a unique clause
+    // Lease topics (client version 18, kClientVersionLeases): sent ONLY to a session >= 18; an older client is answered
+    // InvalidRequest (39).
+    LeaseNotFound            = 62,  // no live lease for the key, or a different version.  Definite
+    LeaseLimitExceeded       = 63,  // lease.max_keys or the namespace max-leases is reached.  Definite
+    LeaseTtlTooLarge         = 64,  // the requested TTL is above lease.max_ttl.  Definite
 };
 
 // ---------------------------------------------------------------------------
@@ -401,7 +413,12 @@ inline constexpr int32_t kClientVersionResponseEgress             = 16;
 //   (produceErrorForClient answers InvalidRequest) and keeps the exact 46 / 38 byte ProduceResponse.
 //   GetViewRowK / ScanViewRows / GetStats are gated on the same constants.
 inline constexpr int32_t kClientVersionCheckedWrites              = 17;
-inline constexpr int32_t kClientVersion                           = kClientVersionCheckedWrites;  // what this protocol's client announces
+// 18 — lease topics: error codes 62-64, templates 96-101 (LeaseKeepAlive .. ScanLeasesResponse), a lease trailer on the
+//   ProduceResponse (after the verdict trailer), a lease trailer on the TopicSchemaResponse, and the optional LeaseSpec
+//   block on DefineTopic.  A broker >= 11 serves them.  A session below 18 is never sent 62-64 (produceErrorForClient
+//   answers InvalidRequest), a lease trailer or templates 96-101, and keeps byte-identical frames.
+inline constexpr int32_t kClientVersionLeases                     = 18;
+inline constexpr int32_t kClientVersion                           = kClientVersionLeases;  // what this protocol's client announces
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
@@ -445,7 +462,9 @@ inline constexpr int32_t kBrokerVersionReceiverKeys               = 7;   // per-
 inline constexpr int32_t kBrokerVersionNamespaces                 = 8;   // namespaces (client version 14)
 inline constexpr int32_t kBrokerVersionResponseEgress             = 9;   // NAT-safe egress (client version 16)
 inline constexpr int32_t kBrokerVersionCheckedWrites              = 10;  // checked writes (client version 17)
-inline constexpr int32_t kBrokerVersion                           = kBrokerVersionCheckedWrites;   // what this protocol's broker announces
+// 11 — lease topics (see client version 18)
+inline constexpr int32_t kBrokerVersionLeases                     = 11;
+inline constexpr int32_t kBrokerVersion                           = kBrokerVersionLeases;   // what this protocol's broker announces
 
 /// Issue #116: true when a session whose client announced `clientVersion` and whose broker announced
 /// `brokerVersion` binds each encrypted client->broker frame to one receiver (see client version 12).
@@ -529,6 +548,12 @@ inline constexpr int32_t kBrokerVersion                           = kBrokerVersi
     return clientVersion >= kClientVersionCheckedWrites;
 }
 
+/// True when a session that connected with `clientVersion` may be answered the lease codes 62-64, templates 96-101 and
+/// the lease trailers (version 18).
+[[nodiscard]] constexpr bool clientUnderstandsLeases(int32_t clientVersion) noexcept {
+    return clientVersion >= kClientVersionLeases;
+}
+
 /// The produce error code a session that connected with `clientVersion` is
 /// answered: UnknownProducerId becomes OutOfOrderSequence (the pre-D6 answer)
 /// for clients below kClientVersionUnknownProducerId, TransientLogFull becomes
@@ -546,6 +571,8 @@ inline constexpr int32_t kBrokerVersion                           = kBrokerVersi
         return ErrorCode::InvalidRequest;   // namespaces Phase 2 Task 11: the namespace codes (51-53) exist only for a v14+ client
     if (ec >= ErrorCode::ConstraintViolation && ec <= ErrorCode::ViewUniqueInvalid && !clientUnderstandsCheckedWrites(clientVersion)) [[unlikely]]
         return ErrorCode::InvalidRequest;   // checked writes: 55-61 exist only for a v17+ client
+    if (ec >= ErrorCode::LeaseNotFound && ec <= ErrorCode::LeaseTtlTooLarge && !clientUnderstandsLeases(clientVersion)) [[unlikely]]
+        return ErrorCode::InvalidRequest;   // lease topics: 62-64 exist only for a v18+ client
     return ec;
 }
 

@@ -479,8 +479,10 @@ inline constexpr int16_t kTxnPartitionVerify = 4;
 /// Checked writes: typed topics validate every write (a known schema version, UTF-8 strings, wire key = key field);
 /// gates the database-feature DDL and write kinds.  Topics created before it validate fully only from this level on.
 inline constexpr int16_t kCheckedWrites = 5;
+/// Lease topics: every broker serves lease DDL, the lease write hook and expiry. Lease DDL is refused below it.
+inline constexpr int16_t kLeases = 6;
 /// The level this binary supports.
-inline constexpr int16_t kLatest = kCheckedWrites;
+inline constexpr int16_t kLatest = kLeases;
 } // namespace MetadataFeature
 
 struct AlterIsrMsg {

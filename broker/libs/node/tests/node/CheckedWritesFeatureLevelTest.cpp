@@ -31,7 +31,7 @@ void sendLevel(Worker& w, int16_t level) {
 } // namespace
 
 TEST(CheckedWritesFeatureLevel, LatestIsCheckedWrites) {
-    static_assert(mf::kCheckedWrites == 5 && mf::kLatest == mf::kCheckedWrites && mf::kTxnPartitionVerify == 4);
+    static_assert(mf::kCheckedWrites == 5 && mf::kLeases == 6 && mf::kLatest == mf::kLeases && mf::kTxnPartitionVerify == 4);
     SUCCEED();
 }
 

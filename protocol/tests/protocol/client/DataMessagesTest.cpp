@@ -1910,7 +1910,7 @@ static_assert(rpc::kBrokerVersionNamespaces == rpc::kBrokerVersionReceiverKeys +
 // Issue #450: client 15 (SubscribeResponse RecordEgressUnavailable) follows.
 static_assert(rpc::kClientVersionRecordEgressUnavailable == rpc::kClientVersionNamespaces + 1);
 static_assert(rpc::kClientVersionResponseEgress == rpc::kClientVersionRecordEgressUnavailable + 1);   // NAT-safe egress: client 16
-static_assert(rpc::kClientVersion == rpc::kClientVersionCheckedWrites && rpc::kBrokerVersion == rpc::kBrokerVersionCheckedWrites);
+static_assert(rpc::kClientVersion == rpc::kClientVersionLeases && rpc::kBrokerVersion == rpc::kBrokerVersionLeases);   // v18 / v11: lease topics (v17 / v10: checked writes)
 static_assert(rpc::sessionUsesReceiverKeys(12, 7) && !rpc::sessionUsesReceiverKeys(11, 7) && !rpc::sessionUsesReceiverKeys(12, 6));
 static_assert(rpc::clientUnderstandsFilters(11) && !rpc::clientUnderstandsFilters(10));
 
@@ -2202,8 +2202,8 @@ TEST(CheckedWritesProtocol, ErrorCodesAreAppendedAfterViewPaused) {
 
 TEST(CheckedWritesProtocol, VersionsAreSeventeenAndTen) {
     static_assert(rpc::kClientVersionCheckedWrites == rpc::kClientVersionResponseEgress + 1 && rpc::kClientVersionCheckedWrites == 17 &&
-                  rpc::kClientVersion == 17);
-    static_assert(rpc::kBrokerVersionCheckedWrites == rpc::kBrokerVersionResponseEgress + 1 && rpc::kBrokerVersion == 10);
+                  rpc::kClientVersion == 18);   // v18: lease topics
+    static_assert(rpc::kBrokerVersionCheckedWrites == rpc::kBrokerVersionResponseEgress + 1 && rpc::kBrokerVersion == 11);   // v11: lease topics
     EXPECT_FALSE(rpc::clientUnderstandsCheckedWrites(16));
     EXPECT_TRUE(rpc::clientUnderstandsCheckedWrites(17));
 }
@@ -2334,7 +2334,7 @@ TEST(CheckedWritesWireRegression, TruncatedOrOversizedTrailerIsUndecodableRegres
 }
 
 TEST(CheckedWritesWire, MaxEncodedSizeIs32824) {
-    static_assert(rpc::ProduceResponse::kMaxEncodedSize == 32824);
+    static_assert(rpc::ProduceResponse::kMaxEncodedSize == 98363);   // 54 + 2 + 8 * 4096 + 3 + 16 * 4096 (lease trailer, client 18)
     static_assert(rpc::kMaxJudgedBatchRecords == rpc::ProduceResponse::kMaxVerdictEntries);
     EXPECT_EQ(rpc::ProduceResponse::encodedSizeFor(rpc::kClientVersionCheckedWrites, true, 4096), 32824u);
 }

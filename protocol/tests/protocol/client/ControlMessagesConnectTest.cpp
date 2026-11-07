@@ -822,8 +822,8 @@ TEST(HandshakeContinueResponse, TemplateIdIsEleven) {
 // kProtocolVersion (the MessageHeader wire version) stays at 3.
 // ---------------------------------------------------------------------------
 TEST(VersionGates, ClientBrokerVersionBumpedProtocolVersionUnchanged) {
-    EXPECT_EQ(rpc::kClientVersion, 17);   // v17: checked writes (acks View bit, ProduceResponse v17, codes 55-61); v16: NAT-safe response egress; v15: RecordEgressUnavailable (#450); v14: namespaces (templates 81-83, codes 51-54); v13: produce ConcurrentTransactions, issue #112; v12: per-receiver c2b keys, issue #116 (v11: subscription filters; v10: TxnOffsetCommit member fence; v9: authentication; v8: catalog history DDL, v7: transient lineage note + claim)
-    EXPECT_EQ(rpc::kBrokerVersion, 10);   // v10: checked writes (client 17); v9: NAT-safe response egress (client 16); v8: namespaces; v7: per-receiver c2b keys (#116)
+    EXPECT_EQ(rpc::kClientVersion, 18);   // v18: lease topics (codes 62-64, templates 96-101, trailers); v17: checked writes (acks View bit, ProduceResponse v17, codes 55-61); v16: NAT-safe response egress; v15: RecordEgressUnavailable (#450); v14: namespaces (templates 81-83, codes 51-54); v13: produce ConcurrentTransactions, issue #112; v12: per-receiver c2b keys, issue #116 (v11: subscription filters; v10: TxnOffsetCommit member fence; v9: authentication; v8: catalog history DDL, v7: transient lineage note + claim)
+    EXPECT_EQ(rpc::kBrokerVersion, 11);   // v11: lease topics (client 18); v10: checked writes (client 17); v9: NAT-safe response egress (client 16); v8: namespaces; v7: per-receiver c2b keys (#116)
     EXPECT_EQ(rpc::kClientVersionCrypto, 4);
     EXPECT_EQ(rpc::kBrokerVersionCrypto, 4);
     EXPECT_EQ(rpc::kProtocolVersion, 3);

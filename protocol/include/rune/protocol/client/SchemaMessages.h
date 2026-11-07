@@ -6,6 +6,7 @@
 #include <span>
 #include <string_view>
 #include "../CatalogTypes.h"
+#include "../LeaseSpec.h"
 #include "Codec.h"
 #include "MessageHeader.h"
 #include "Protocol.h"
@@ -179,6 +180,10 @@ inline bool getTopicConfig(const uint8_t* buf, std::size_t avail, std::size_t& p
 //   must decode exactly to the end of the frame (anything else => nullopt).
 //   [v17 trailer] - checked writes: when hasKeyFeatures (requires hasExt), the
 //   14-byte TopicKeyFeatures block follows the DdlExtension; nothing may follow it.
+//   [v18 trailer] - lease topics: when hasLease (requires hasExt AND hasKeyFeatures), [0x01][LeaseSpec: 39 bytes]
+//   follows the TopicKeyFeatures block; nothing may follow it.  Decode checks the marker and that the spec decodes
+//   (the checkpoint byte is 0/1); the range bounds (validateLeaseSpec) are the broker's check, not the codec's.
+//   A frame without the lease block is byte-identical to a version 17 frame.
 // encode() returns 0 (explicit failure, never a truncated field) when !fits().
 struct DefineTopic {
     int64_t sessionId = 0, correlationId = 0;
@@ -197,6 +202,9 @@ struct DefineTopic {
     // v17 (checked writes) — on the wire only when hasKeyFeatures, after the extension.
     bool hasKeyFeatures = false;
     TopicKeyFeatures keyFeatures{};
+    // v18 (lease topics) — on the wire only when hasLease, after the TopicKeyFeatures block (requires hasKeyFeatures).
+    bool hasLease = false;
+    LeaseSpec lease{};
 
     static constexpr uint8_t kPersistenceDisk      = 0;
     static constexpr uint8_t kPersistenceTransient = 1;
@@ -209,7 +217,8 @@ struct DefineTopic {
     [[nodiscard]] bool fits() const noexcept {
         if (!fitsVarLen16(topicName.size()) || !fitsVarLen16(keyField.size())) return false;
         if (persistence > kPersistenceTransient) return false;
-        if (!hasExt) return !hasKeyFeatures && replicationFactor == 0 && config == TopicConfigWire{};
+        if (!hasExt) return !hasKeyFeatures && !hasLease && replicationFactor == 0 && config == TopicConfigWire{};
+        if (hasLease && !hasKeyFeatures) return false;
         return topicConfigFits(config) && extFits(ext);
     }
     std::size_t encodedSize() const noexcept {
@@ -217,7 +226,8 @@ struct DefineTopic {
              + 2u + topicName.size()
              + 2u + keyField.size()
              + 4u + descriptorLen;
-        if (hasExt) return base + 1u + 2u + topicConfigEncodedSize(config) + extEncodedSize(ext) + (hasKeyFeatures ? kTopicKeyFeaturesWireLen : 0u);
+        if (hasExt) return base + 1u + 2u + topicConfigEncodedSize(config) + extEncodedSize(ext) + (hasKeyFeatures ? kTopicKeyFeaturesWireLen : 0u) +
+                                  (hasLease ? 1u + kLeaseSpecBytes : 0u);
         return base + (persistence != kPersistenceDisk ? 1u : 0u);
     }
     /// Where the DdlExtension starts in the encoded frame (meaningful when hasExt).
@@ -242,6 +252,7 @@ struct DefineTopic {
             pos += putTopicConfig(buf + pos, config);
             pos += putExt(buf + pos, ext);
             if (hasKeyFeatures) { putTopicKeyFeatures(buf + pos, keyFeatures); pos += kTopicKeyFeaturesWireLen; }
+            if (hasLease) { buf[pos++] = 0x01; encodeLeaseSpec(lease, buf + pos); pos += kLeaseSpecBytes; }
         } else if (persistence != kPersistenceDisk) {
             buf[pos++] = persistence;
         }
@@ -272,6 +283,12 @@ struct DefineTopic {
             if (!getTopicKeyFeatures(buf + pos, avail - pos, m.keyFeatures)) return std::nullopt;
             pos += kTopicKeyFeaturesWireLen;
             m.hasKeyFeatures = true;
+            if (pos < avail) {   // v18: exactly [0x01][LeaseSpec]
+                if (avail - pos != 1u + kLeaseSpecBytes || buf[pos] != 0x01) return std::nullopt;
+                if (!decodeLeaseSpec(buf + pos + 1, kLeaseSpecBytes, m.lease)) return std::nullopt;
+                pos += 1u + kLeaseSpecBytes;
+                m.hasLease = true;
+            }
         }
         if (pos != avail) return std::nullopt;   // the trailer decodes exactly to the end
         m.hasExt = true;
@@ -377,12 +394,22 @@ struct TopicSchemaResponse {
     // a remainder of 14 or more whose block has an unknown flag bit or partitioner is refused.
     bool hasKeyFeatures = false;
     TopicKeyFeatures keyFeatures{};
+    // v18 (lease topics): after the TopicKeyFeatures block, [isLease u8 = 1][LeaseSpec: 39 bytes].  Requires
+    // hasKeyFeatures (the broker writes the key block whenever it writes the lease block) and is sent ONLY to a session
+    // >= kClientVersionLeases.  Decode: a remainder of 0..39 bytes after the key block = no lease block; >= 40 bytes
+    // must start with 1 and hold a decodable spec, else the frame is refused.
+    bool hasLease = false;
+    LeaseSpec lease{};
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::TopicSchemaResponse);
     static constexpr uint16_t BODY_FIXED  = 8;
+    /// False when the lease block is set without the key-features block (it could not be told apart on decode).
+    [[nodiscard]] bool fits() const noexcept { return !hasLease || hasKeyFeatures; }
     std::size_t encodedSize() const noexcept {
-        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + descriptorLen + 4u + (hasKeyFeatures ? kTopicKeyFeaturesWireLen : 0u);
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + descriptorLen + 4u + (hasKeyFeatures ? kTopicKeyFeaturesWireLen : 0u) +
+               (hasLease ? 1u + kLeaseSpecBytes : 0u);
     }
     std::size_t encode(uint8_t* buf) const noexcept {
+        if (!fits()) return 0;
         MessageHeader hdr; hdr.blockLength = BODY_FIXED; hdr.templateId = TEMPLATE_ID;
         hdr.schemaId = kSchemaId; hdr.version = kProtocolVersion;
         hdr.sessionId = sessionId; hdr.correlationId = correlationId; hdr.encode(buf);
@@ -393,6 +420,7 @@ struct TopicSchemaResponse {
         pos += putVarBytes32(buf + pos, descriptorBlob, descriptorLen);
         detail::putLE32(buf, static_cast<int>(pos), partitionCount); pos += 4;
         if (hasKeyFeatures) { putTopicKeyFeatures(buf + pos, keyFeatures); pos += kTopicKeyFeaturesWireLen; }
+        if (hasLease) { buf[pos++] = 1; encodeLeaseSpec(lease, buf + pos); pos += kLeaseSpecBytes; }
         return pos;
     }
     static std::optional<TopicSchemaResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
@@ -411,6 +439,11 @@ struct TopicSchemaResponse {
             if (avail >= pos + kTopicKeyFeaturesWireLen) {
                 if (!getTopicKeyFeatures(buf + pos, avail - pos, m.keyFeatures)) return std::nullopt;
                 m.hasKeyFeatures = true;
+                pos += kTopicKeyFeaturesWireLen;
+                if (avail - pos >= 1u + kLeaseSpecBytes) {
+                    if (buf[pos] != 1 || !decodeLeaseSpec(buf + pos + 1, kLeaseSpecBytes, m.lease)) return std::nullopt;
+                    m.hasLease = true;
+                }
             }
         }
         return m;

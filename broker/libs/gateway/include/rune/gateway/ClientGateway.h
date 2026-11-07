@@ -2465,7 +2465,11 @@ private:
     // Reusable encode scratch — 68 KiB covers any Milestone-A/B frame.
     // (ConnectResponse=38 B, Pong=26+echo, max echo=65535+26 = ~65 KiB;
     //  ProduceResponse=46 B; restamp scratch = max RecordBatch = 65535 B)
-    static constexpr std::size_t kScratchSize = 68 * 1024;
+    // Lease topics (client 18): the largest ProduceResponse (verdict + lease trailers) is now ~96 KiB, so the scratch is
+    // sized from it, never hand-sized below it.
+    static constexpr std::size_t kScratchSize =
+        68 * 1024 > rune::protocol::client::ProduceResponse::kMaxEncodedSize ? std::size_t{68 * 1024}
+                                                                              : rune::protocol::client::ProduceResponse::kMaxEncodedSize;
     std::array<uint8_t, kScratchSize>    scratch_{};
     std::vector<rune::protocol::client::OffsetFetchResult> fetchFilterScratch_;   // #126: fetch-all READ filter (reserved on first use)
 

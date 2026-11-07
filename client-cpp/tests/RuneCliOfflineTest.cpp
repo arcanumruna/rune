@@ -96,7 +96,10 @@ TEST(CheckedWritesCliRegression, ErrorCodeNamesCoverEveryCodeThroughViewUniqueIn
     EXPECT_EQ(errorCodeName(59), "ViewKeyExpressionInvalid");
     EXPECT_EQ(errorCodeName(60), "ViewConstraintInvalid");
     EXPECT_EQ(errorCodeName(61), "ViewUniqueInvalid");
-    EXPECT_EQ(errorCodeName(62), "UnknownErrorCode");
+    EXPECT_EQ(errorCodeName(62), "LeaseNotFound");
+    EXPECT_EQ(errorCodeName(63), "LeaseLimitExceeded");
+    EXPECT_EQ(errorCodeName(64), "LeaseTtlTooLarge");
+    EXPECT_EQ(errorCodeName(65), "UnknownErrorCode");
 }
 
 // Checked writes Part 08: `rune stats (topic | view) <name> [--partition N] [--json] --broker host:port`.
