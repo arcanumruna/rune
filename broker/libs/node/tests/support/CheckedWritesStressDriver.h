@@ -1304,7 +1304,7 @@ private:
                     if (violation && s.offset < 0) { *why = at + ": a 55 without the record's offset"; return false; }
                     if (d.seen_[0].count(s.offset) == 0) continue;   // compacted away before any read showed it
                     const auto rec = d.data_[0].find(s.offset);
-                    if (rec == d.data_[0].end() || rec->second.id != s.id) { *why = at + ": the offset does not hold its record"; return false; }
+                    if (rec == d.data_[0].end() || (s.id != 0 && rec->second.id != s.id)) { *why = at + ": the offset does not hold its record"; return false; }   // a refused create is answered without its id
                     const auto verdict = d.models_[0].verdicts().find(s.offset);
                     if (!violation && verdict != d.models_[0].verdicts().end()) { *why = at + ": acked Ok but the model rejects it"; return false; }
                     if (violation && (verdict == d.models_[0].verdicts().end() || !(verdict->second == ModelVerdict{s.code, s.constraintId}))) { *why = at + " constraint " + std::to_string(s.constraintId) + ": not the model's verdict"; return false; }
@@ -1703,6 +1703,9 @@ private:
             if (!why->empty()) return false;
             const auto v = d.rpViewOf_(d.nameTopic_);
             if (!v) { *why = "the leader hosts no character_name"; return false; }
+            std::size_t owner = 0;   // select characterId: the one uint64 column
+            while (owner < v->plan.output.size() && v->plan.output[owner].type != rune::codec::PrimType::UInt64) ++owner;
+            if (owner == v->plan.output.size()) { *why = "character_name has no characterId column"; return false; }
             for (const auto& [id, c] : live) {
                 std::vector<uint8_t> key(v->plan.keyWidth, 0);
                 std::copy_n(c.second.begin(), std::min(c.second.size(), key.size()), key.begin());
@@ -1710,7 +1713,7 @@ private:
                 const auto row = d.rpRow_(d.nameTopic_, 0, &key, &failed);
                 const std::string at = "character " + std::to_string(id) + " ('" + c.second + "'): ";
                 if (failed) { *why = at + "the character_name lookup never answered"; return false; }
-                if (!row || rpColumn_(*row, *v, 0) != static_cast<int64_t>(id)) { *why = at + "character_name names " + (row ? std::to_string(rpColumn_(*row, *v, 0)) : std::string("no owner")); return false; }
+                if (!row || rpColumn_(*row, *v, owner) != static_cast<int64_t>(id)) { *why = at + "character_name names " + (row ? std::to_string(rpColumn_(*row, *v, owner)) : std::string("no owner")); return false; }
             }
             return true;
         });
