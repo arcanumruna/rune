@@ -619,6 +619,14 @@ std::optional<BatchPos> findBatch(const std::string& dir, int64_t off) {
     return std::nullopt;
 }
 
+// A fresh directory with the .log files of `from`: the cleaner reads only those (it writes its own .index files).
+std::filesystem::path copyLogs(const std::filesystem::path& from) {
+    const auto d = tempDir();
+    for (const auto& e : std::filesystem::directory_iterator(from))
+        if (e.path().extension() == ".log") std::filesystem::copy_file(e.path(), d / e.path().filename());
+    return d;
+}
+
 void xorByteAt(const std::filesystem::path& f, std::size_t at, uint8_t mask) {
     std::fstream io(f, std::ios::binary | std::ios::in | std::ios::out);
     io.seekg(static_cast<std::streamoff>(at));
@@ -652,20 +660,17 @@ std::set<int64_t> buildDamageLog(Log& log) {
 // the damaged byte lies outside the CRC and the framing checks, so the marker is still intact — the rejected record (6) may
 // disappear.  Every record after the marker, in its own segment and in later ones, survives.
 TEST(CheckedWritesVerdictCleanerRegression, DamagedMarkerAtEveryByteNeverDropsDataAdversarialRegression) {
-    // Find the marker's size once.
-    std::size_t markerTotal = 0;
-    {
-        const auto dir = tempDir();
-        {
-            Log log(dir.string(), /*segmentBytes=*/1 << 20);
-            log.recover();
-            (void)buildDamageLog(log);
-            const auto at = findBatch(log.dir(), 7);
-            ASSERT_TRUE(at.has_value());
-            markerTotal = at->total;
-        }
-        std::filesystem::remove_all(dir);
-    }
+    // The log every case damages is built once; each case cleans a copy of its segments.
+    const auto pristine = tempDir();
+    // ~900 B segments: the marker shares its segment with data before and after it.
+    Log log(pristine.string(), /*segmentBytes=*/900);
+    log.recover();
+    (void)buildDamageLog(log);
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 3u);
+    const auto marker = findBatch(log.dir(), 7);
+    ASSERT_TRUE(marker.has_value());
+    const std::size_t markerTotal = marker->total;
     ASSERT_GT(markerTotal, static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead));
     int cases = 0, rewrote = 0;
     for (const Path path : {Path::Range, Path::RangeCoalesce}) {
@@ -674,43 +679,35 @@ TEST(CheckedWritesVerdictCleanerRegression, DamagedMarkerAtEveryByteNeverDropsDa
         for (int mode = 0; mode < 3; ++mode) {
             for (std::size_t i = (mode == 1 ? 1 : 0); i < markerTotal; ++i) {
                 SCOPED_TRACE(std::string(path == Path::Range ? "range" : "coalesce") + (mode == 1 ? " cut " : " xor ") + std::to_string(mode) + " at " + std::to_string(i));
-                const auto dir = tempDir();
-                {
-                    // ~900 B segments: the marker shares its segment with data before and after it.
-                    Log log(dir.string(), /*segmentBytes=*/900);
-                    log.recover();
-                    const std::set<int64_t> written = buildDamageLog(log);
-                    const auto bases = log.segmentBaseOffsets();
-                    ASSERT_GE(bases.size(), 3u);
-                    const auto at = findBatch(log.dir(), 7);
-                    ASSERT_TRUE(at.has_value());
-                    if (mode != 1) {
-                        xorByteAt(at->file, at->pos + i, mode == 0 ? 0x5A : 0x01);
-                    } else {
-                        std::filesystem::resize_file(at->file, at->pos + i);   // a torn segment tail inside the marker
-                    }
-                    const std::set<int64_t> before = diskDataOffsets(log.dir());
-                    ASSERT_TRUE(before.count(39)) << "the later segments are intact";
-                    if (mode != 1 && (i < 8 || i >= 12)) ASSERT_TRUE(before.count(8)) << "the record right behind the damaged marker is on disk";
-                    cleanFilesOnly(log.dir(), bases, path, /*verdictBound=*/kMax, /*markerEnd=*/8);
-                    const std::set<int64_t> after = diskDataOffsets(log.dir());
-                    // A flip outside the CRC-covered region and the checked framing fields leaves the marker's content intact:
-                    // baseOffset [0, 8) and partitionLeaderEpoch [12, 16) are CRC-exempt by the batch format.
-                    const bool stillIntact = mode != 1 && (i < 8 || (i >= 12 && i < 16));
-                    for (const int64_t o : before) {
-                        if (o == 1) continue;                    // superseded by 5: may be compacted
-                        if (o == 6 && stillIntact) continue;     // the intact marker rejects it
-                        EXPECT_TRUE(after.count(o)) << "data offset " << o << " was on disk before the pass and is gone after it";
-                    }
-                    if (after.count(1) == 0) ++rewrote;
-                    ++cases;
+                const auto dir = copyLogs(pristine);
+                const auto file = dir / marker->file.filename();
+                if (mode != 1) {
+                    xorByteAt(file, marker->pos + i, mode == 0 ? 0x5A : 0x01);
+                } else {
+                    std::filesystem::resize_file(file, marker->pos + i);   // a torn segment tail inside the marker
                 }
+                const std::set<int64_t> before = diskDataOffsets(dir.string());
+                ASSERT_TRUE(before.count(39)) << "the later segments are intact";
+                if (mode != 1 && (i < 8 || i >= 12)) ASSERT_TRUE(before.count(8)) << "the record right behind the damaged marker is on disk";
+                cleanFilesOnly(dir.string(), bases, path, /*verdictBound=*/kMax, /*markerEnd=*/8);
+                const std::set<int64_t> after = diskDataOffsets(dir.string());
+                // A flip outside the CRC-covered region and the checked framing fields leaves the marker's content intact:
+                // baseOffset [0, 8) and partitionLeaderEpoch [12, 16) are CRC-exempt by the batch format.
+                const bool stillIntact = mode != 1 && (i < 8 || (i >= 12 && i < 16));
+                for (const int64_t o : before) {
+                    if (o == 1) continue;                    // superseded by 5: may be compacted
+                    if (o == 6 && stillIntact) continue;     // the intact marker rejects it
+                    EXPECT_TRUE(after.count(o)) << "data offset " << o << " was on disk before the pass and is gone after it";
+                }
+                if (after.count(1) == 0) ++rewrote;
+                ++cases;
                 std::filesystem::remove_all(dir);
                 if (::testing::Test::HasFailure()) return;
             }
         }
     }
     EXPECT_EQ(cases, static_cast<int>(2 * (3 * markerTotal - 1)));
+    std::filesystem::remove_all(pristine);
 }
 
 // The cleaner's walk stops at the first damaged batch (A3).  When an earlier record of the same segment IS cleaned away (no
@@ -719,7 +716,6 @@ TEST(CheckedWritesVerdictCleanerRegression, DamagedMarkerAtEveryByteNeverDropsDa
 // URGENT break found by the batch 1 adversarial pass (silent loss of intact records): every engine's walk `break`s at the
 // damaged batch and installs the prefix it walked.  Fixed: a damaged walk installs nothing.
 TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchMidSegmentNeverTruncatesTheRewriteAdversarialRegression) {
-    std::size_t victimTotal = 0;
     constexpr int64_t kVictim = 6;
     auto build = [](Log& log) {
         data(log, 0, "dup", "old");
@@ -729,16 +725,16 @@ TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchMidSegmentNeverTruncates
         data(log, kVictim, "victim", "v");
         for (int64_t o = 7; o < 40; ++o) data(log, o, "after" + std::to_string(o), "a");
     };
-    {
-        const auto dir = tempDir();
-        {
-            Log log(dir.string(), 1 << 20);
-            log.recover();
-            build(log);
-            victimTotal = findBatch(log.dir(), kVictim)->total;
-        }
-        std::filesystem::remove_all(dir);
-    }
+    // The log every case damages is built once; each case cleans a copy of its segments.
+    const auto pristine = tempDir();
+    Log log(pristine.string(), /*segmentBytes=*/900);
+    log.recover();
+    build(log);
+    const auto victim = findBatch(log.dir(), kVictim);
+    ASSERT_TRUE(victim.has_value());
+    ASSERT_EQ(std::stoll(victim->file.stem().string()), 0) << "the victim shares the first segment with the dup pair";
+    const std::size_t victimTotal = victim->total;
+    const auto allBases = log.segmentBaseOffsets();
     int cases = 0, rewrote = 0;
     std::array<int, 4> lostCases{};
     std::array<std::string, 4> firstLost{};
@@ -748,45 +744,37 @@ TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchMidSegmentNeverTruncates
         // damage too, so every flip leaves the log uncleanable; the control keeps the "the pass really rewrites" guard non-vacuous.
         for (std::size_t i = 0; i <= victimTotal; ++i) {
             SCOPED_TRACE("engine " + std::to_string(engine) + " flip " + std::to_string(i));
-            const auto dir = tempDir();
-            {
-                Log log(dir.string(), /*segmentBytes=*/900);
-                log.recover();
-                build(log);
-                const auto at = findBatch(log.dir(), kVictim);
-                ASSERT_TRUE(at.has_value());
-                ASSERT_EQ(std::stoll(at->file.stem().string()), 0) << "the victim shares the first segment with the dup pair";
-                if (i < victimTotal) xorByteAt(at->file, at->pos + i, 0x5A);
-                const std::set<int64_t> before = diskDataOffsets(log.dir());
-                if (i < 8 || i >= 12) ASSERT_TRUE(before.count(kVictim + 1)) << "the record right behind the damaged batch is on disk";
-                if (engine < 2) {
-                    cleanFilesOnly(log.dir(), log.segmentBaseOffsets(), engine == 0 ? Path::Range : Path::RangeCoalesce, kMax, kMax);
+            const auto dir = copyLogs(pristine);
+            if (i < victimTotal) xorByteAt(dir / victim->file.filename(), victim->pos + i, 0x5A);
+            const std::set<int64_t> before = diskDataOffsets(dir.string());
+            if (i < 8 || i >= 12) ASSERT_TRUE(before.count(kVictim + 1)) << "the record right behind the damaged batch is on disk";
+            if (engine < 2) {
+                cleanFilesOnly(dir.string(), allBases, engine == 0 ? Path::Range : Path::RangeCoalesce, kMax, kMax);
+            } else {
+                auto bases = allBases;
+                const int64_t active = bases.back();
+                bases.pop_back();
+                ASSERT_GE(bases.size(), 2u);
+                LogCleaner cleaner;
+                if (engine == 3) {
+                    rune::storage::SegmentGroup g;
+                    g.bases = {bases[0], bases[1]};
+                    g.combinedBytes = 1 << 20;
+                    (void)cleaner.produceCleanedGroupBounded(dir.string(), bases, g, active, 0, 0, 1000, 1 << 20, nullptr, 1'000'000);
                 } else {
-                    auto bases = log.segmentBaseOffsets();
-                    const int64_t active = bases.back();
-                    bases.pop_back();
-                    ASSERT_GE(bases.size(), 2u);
-                    LogCleaner cleaner;
-                    if (engine == 3) {
-                        rune::storage::SegmentGroup g;
-                        g.bases = {bases[0], bases[1]};
-                        g.combinedBytes = 1 << 20;
-                        (void)cleaner.produceCleanedGroupBounded(log.dir(), bases, g, active, 0, 0, 1000, 1 << 20, nullptr, 1'000'000);
-                    } else {
-                        (void)cleaner.produceCleanedFileBounded(log.dir(), bases, bases[0], active, 0, 0, 1000, 1 << 20, nullptr, 1'000'000);
-                    }
+                    (void)cleaner.produceCleanedFileBounded(dir.string(), bases, bases[0], active, 0, 0, 1000, 1 << 20, nullptr, 1'000'000);
                 }
-                const std::set<int64_t> after = diskDataOffsets(log.dir());
-                for (const int64_t o : before) {
-                    if (o == 0 || after.count(o) != 0) continue;   // 0: superseded by 4
-                    ++lostCases[engine];
-                    if (firstLost[engine].empty())
-                        firstLost[engine] = "flip at byte " + std::to_string(i) + ": offset " + std::to_string(o) + " (and every later one of the segment)";
-                    break;
-                }
-                if (after.count(0) == 0) ++rewrote;
-                ++cases;
             }
+            const std::set<int64_t> after = diskDataOffsets(dir.string());
+            for (const int64_t o : before) {
+                if (o == 0 || after.count(o) != 0) continue;   // 0: superseded by 4
+                ++lostCases[engine];
+                if (firstLost[engine].empty())
+                    firstLost[engine] = "flip at byte " + std::to_string(i) + ": offset " + std::to_string(o) + " (and every later one of the segment)";
+                break;
+            }
+            if (after.count(0) == 0) ++rewrote;
+            ++cases;
             std::filesystem::remove_all(dir);
             if (::testing::Test::HasFatalFailure()) return;
         }
@@ -795,6 +783,7 @@ TEST(CheckedWritesVerdictCleanerRegression, DamagedBatchMidSegmentNeverTruncates
     EXPECT_GT(rewrote, 0) << "the pass must really rewrite the damaged segment";
     for (int e = 0; e < 4; ++e)
         EXPECT_EQ(lostCases[e], 0) << "engine " << e << ": " << lostCases[e] << " of " << victimTotal << " damage cases lost intact data; first: " << firstLost[e];
+    std::filesystem::remove_all(pristine);
 }
 
 // A damaged segment makes the log uncleanable until restart (Kafka: a corrupt segment is never truncated by the cleaner).
