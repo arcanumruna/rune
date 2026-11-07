@@ -221,14 +221,14 @@ and the `Producer` refuses a longer path at construction.
 | `discovery` today (etcd) | Rune-backed library | Gap |
 |---|---|---|
 | `Producer(etcdUrl, servicePrefix, region, ServiceKey identity, leaseTtlSeconds)` | `Producer(RuneEndpoint, servicePrefix, region, identity, leaseTtlSeconds)`. `RuneEndpoint` = bootstrap addresses, namespace, SCRAM credentials. All other arguments are unchanged. | **DG1** |
-| ctor: `leasekeepalive(ttl)` = LeaseGrant plus a KeepAlive thread, retrying 30× with backoff | the ctor connects. The lease is granted with the key at `registerEndpoint`, because the key is the lease; the same 30× retry and backoff apply to connect and grant. | **DG4** |
+| ctor: `leasekeepalive(ttl)` = LeaseGrant plus a KeepAlive thread, retrying 30× with backoff | the ctor connects. The lease is granted with the key at `registerEndpoint`, because the key is the lease; the same 30× retry and backoff apply to connect and grant. In the caller-supplied-client form nothing blocks: connect is the caller's, and the grant with its retries is an async state machine (§13). | **DG4** |
 | keepalive every `max(ttl−1, 1)` s (etcd-cpp `KeepAlive`), errors in `eptr` with no handler | `LeaseSession` keepalive every `ttl/3` (etcd's Go client cadence). Errors reach `onLost` / `onAtRisk`, which the Producer wires to re-registration. | **DG5** (fixes a latent loss: one late keepalive lost the lease) |
 | `registerEndpoint(uri)`: `put(key, uri, leaseId)` | first call: grant (`Put`+`insert`) of row `{path, uri}`. A later call with a new uri is a fenced `Put`+`update` of `uri`, which does not refresh the lease, exactly like etcd's put. | — |
 | key `<servicePrefix>/<region>/<cluster\|_shared>/<serviceName>/<replicaId>` | the same path plus `/<incarnation>`: a 64-bit random id drawn at each grant | **DG2** |
 | restart of the same replicaId within the TTL: the new process's `put` overwrites the key and re-attaches it to the new lease | that would be a takeover, which is out of spec. The new incarnation is a new key, so the grant succeeds at once. Consumers keep the newest live incarnation per `ServiceKey` (§3.3). | **DG2** |
 | `startLoadReporting(uri, loadFn, intervalSec = 5)`: re-put `{"uri","load"}` with the lease every interval; requires `ttl ≥ 2 × interval`; a failed put sets `leaseNeedsReinit` | the same timer issues a fenced `Put`+`update` of `load`. It does not keep the lease alive (etcd: a put does not renew). The `ttl ≥ 2 × interval` check is kept. `kErrLeaseNotFound` sets `leaseNeedsReinit`. | **DG3** (typed columns, not JSON) |
 | watchdog every `ttl/2`: `get(key)`; if missing, `tryReinitializeLease` (a new lease) and `reRegister` | kept: a point read of the lease view (`getViewRowK`) every `ttl/2`; if absent, or on `onLost`, it grants a new incarnation and re-registers | — (superset: `onLost` reacts before the watchdog) |
-| `stop()`: cancel the keepalive, then a blocking `leaserevoke` | cancel the keepalive, then a blocking fenced `Revoke` (the same blocking behaviour as BUG-005) | — |
+| `stop()`: cancel the keepalive, then a blocking `leaserevoke` | cancel the keepalive, then a blocking fenced `Revoke` (the same blocking behaviour as BUG-005). The caller-supplied-client form has `stopAsync()` / `isStopped()` instead (§13). | — |
 | `~Producer()` calls `stop()` | the same | — |
 
 ### 3.3 Consumer
@@ -236,7 +236,7 @@ and the `Producer` refuses a longer path at construction.
 | `discovery` today | Rune-backed library | Gap |
 |---|---|---|
 | `Consumer::create(etcdUrl, servicePrefix, region, filters, ServiceCache&)` → `shared_ptr` | `Consumer::create(RuneEndpoint, servicePrefix, region, filters, ServiceCache&)` | **DG1** |
-| `run()`: for each filter, `ls(prefix)` (`prefix = regionPrefix + filter.toWatchPath()`; empty = the whole region), `handlePut` per entry, then `watchPrefix(prefix, index + 1)` | `run()`: `ScanLeases(prefix)` per filter (paged, with `asOfOffset`), then one subscription to the topic's partition from `min asOf`, merged by the exact handoff rule (§12.4). Events whose path does not match a filter are dropped client-side. | **DG7** |
+| `run()`: for each filter, `ls(prefix)` (`prefix = regionPrefix + filter.toWatchPath()`; empty = the whole region), `handlePut` per entry, then `watchPrefix(prefix, index + 1)` | `run()`: one `LeaseWatch::startFromNow` over the topic with every filter's prefix: a `ScanLeases(prefix)` per distinct prefix (paged, with `asOfOffset`), then one subscription to the topic's partition from the minimum `asOf`, merged by the exact handoff rule (§12.4, including the multi-prefix merge). Events whose path does not match a filter are dropped client-side. | **DG7** |
 | watch re-armed from `modified_index + 1`; empty event batches throttled by 250 ms; on error, re-initialise after 1 s | the subscription is push, so there are no empty batches and no throttle. On any break (disconnect, `NotLeader`, a resume failure), the consumer re-initialises after 1 s with the same scan + subscribe, as today. | — |
 | PUT → `handlePut`: parse the key into a `ServiceKey`, apply the filter, parse the value (a plain uri or JSON `{uri, load, mapId, clusterId, regionId}`), update the cache | `Granted` / `Updated` → the same `handlePut` path. The `ServiceInfo` fields come from typed columns. `parseRegistrationValue` stays public for compatibility and tests. | **DG3** |
 | DELETE → `handleDelete` → `cache.remove` | `Revoked` / `Expired` → `handleDelete`, for the current incarnation only (DG2) | — |
@@ -256,9 +256,12 @@ These are unchanged, because none of them touches etcd:
   `sharedService`, `matches`), `ServiceInfo`, `SendResult`;
 - `CircuitBreaker` (5 failures, 10 s), `ServiceClientProxy`, `Regions`.
 
-### 3.5 Herald's call sites
+### 3.5 The legacy Herald chat server's call sites (the parity target)
 
-| Herald today | After the switch |
+These are the call sites of today's chat server (the parity target and the first cutover). The Herald 02 runtime
+uses the library differently; §19.1 describes that use (Coordinator's call, R10).
+
+| Legacy Herald today | After the switch |
 |---|---|
 | `Producer{DISCO_URL, …, ServiceKey{serviceDomain, "CHAT_SERVICE", serviceName}, DISCO_LEASE_TTL_SECONDS}` and `registerEndpoint("ws://host:s2sPort/server")` | the same calls with a `RuneEndpoint` from `RUNE_BOOTSTRAP`, `RUNE_NAMESPACE` and credentials from the environment |
 | `Consumer::create(…, {sharedService("COORDINATOR_SERVICE")}, cache)`, `setAuthToken(serviceJwt)`, `run()` | the same |
@@ -287,7 +290,7 @@ Herald uses no etcd transactions, TimeToLive, Mutex or Election today.
 |---|---|---|
 | **LeaseGrant(TTL, ID)**: ID chosen or assigned; `ErrLeaseExists` | `Put`+`insert` of the key. The lease id is `(topic, key, version)`, and `version` = the grant's offset, so it is unique and never reused. A live key answers `KeyExists` (56). | same; the id is assigned |
 | `TTL > MaxLeaseTTL` (9 000 000 000 s) → `ErrLeaseTTLTooLarge` | `lease_ttl_ms > lease.max_ttl` → `kErrLeaseTtlTooLarge`. The `lease.max_ttl` default is 9 000 000 000 s, the hard ceiling. | same |
-| TTL below `minLeaseTTL = ⌈(3 × electionTicks / 2) × heartbeat⌉` s is **raised** to it, not refused | `lease_ttl_ms < lease.min_ttl` (including 0) is raised to `lease.min_ttl` by the write hook. The floor of `lease.min_ttl` is `1.5 × leaderHeartbeatTimeoutNs` (`Election.h:140`), rounded up to ms. | same (ms instead of s) |
+| TTL below `minLeaseTTL = ⌈(3 × electionTicks / 2) × heartbeat⌉` s is **raised** to it, not refused | `lease_ttl_ms < lease.min_ttl` (including 0) is raised to `lease.min_ttl` by the write hook. The floor of `lease.min_ttl` is the fixed catalog constant `kLeaseMinTtlFloorMs = 1000` (Coordinator's call, R11): above partition failover (`effectiveBrokerLivenessMs` = 450 ms plus the lease-view rebuild), and the same on every node, so catalog validation never depends on node config. | same (ms instead of s; a fixed floor instead of one derived from election ticks) |
 | **LeaseKeepAlive** stream → `LeaseRenew` on the leader only, not through raft; `ErrNotPrimary` elsewhere | the `LeaseKeepAlive` request, served by the partition leader only, under the view-read lease. It writes no log record. Elsewhere it answers `NotLeader`. | same |
 | renew of a missing lease → `ErrLeaseNotFound` | absent key or wrong version → `kErrLeaseNotFound` | same |
 | renew of an expired-not-yet-revoked lease waits for the revoke (`ErrLeaseNotFound`) or demotion (`ErrNotPrimary`) | a due or `Emitting` lease parks the keepalive until its `Expire` folds (`kErrLeaseNotFound`) or the leader is demoted (`NotLeader`) | same |
@@ -300,7 +303,7 @@ Herald uses no etcd transactions, TimeToLive, Mutex or Election today.
 | expiry: the leader's `runLoop` every 500 ms finds expired leases and proposes `LeaseRevoke` through raft; followers never expire | the leader's wheel (1 ms tick) finds due leases, and the leader appends `Expire` records through replication; followers never expire | same (finer tick) |
 | attached keys are deleted when the lease expires | the key is deleted: `Expire` is a tombstone for every view and for compaction | same (D1) |
 | revoke rate limit 1000/s (`leaseRevokeRate`) | `lease.expiry_batch` per duty cycle, ≥ 100 000/s per partition (§10) | timing only: never earlier, often sooner |
-| **Promote(extend = electionTimeout)**: every lease is re-armed at `now + extend + remainingTTL` (checkpointed) or `+ TTL`; if there are ≥ `leaseRevokeRate` leases, expiries are spread to 3/4 of the rate | the new leader re-arms every live lease at `refoldJudgedNow + extend + (lease_remaining_ms > 0 ? remaining : ttl)`, with `extend = leaderHeartbeatTimeoutNs`. Nothing is spread: the batch emitter already bounds the rate. | same arming; no spreading (timing only) |
+| **Promote(extend = electionTimeout)**: every lease is re-armed at `now + extend + remainingTTL` (checkpointed) or `+ TTL`; if there are ≥ `leaseRevokeRate` leases, expiries are spread to 3/4 of the rate | the new leader re-arms every live lease at `T_ready + extend + (lease_remaining_ms > 0 ? remaining : ttl)`, where `T_ready` is the lease-clock time its lease view enters `Ready` (§9.6), with `extend = leaderHeartbeatTimeoutNs`. Nothing is spread: the batch emitter already bounds the rate. | same arming; no spreading (timing only) |
 | **Demote**: every lease set to forever | on demotion the leader's wheel is discarded with its view; nothing is emitted | same |
 | **Checkpointing**: every `checkpointInterval` (5 min default), for leases with remaining TTL > interval, at most `leaseCheckpointRate` (1000/s), in batches of 1000; persisted only with `CheckpointPersist` | `Checkpoint` records (lease op 3) every `lease.checkpoint_interval_ms` (5 min default) for leases with remaining > interval, at most `lease.checkpoint_rate` (1000/s) per partition, batches of up to 1000. On by default; always persisted, being log records. | **Divergence D4** (default on; always persisted) |
 | **Put with a lease** attaches the key; it does not renew | `Put`+`update` replaces the row's columns, fenced by version; it does not renew | same |
@@ -311,7 +314,7 @@ Herald uses no etcd transactions, TimeToLive, Mutex or Election today.
 | `Get(prefix)` at revision R, then `Watch(prefix, R + 1)`: one MVCC snapshot | paged `ScanLeases` with a per-page `asOfOffset`, then a subscription from the first page's `asOf`, merged by the handoff rule | **Divergence D3** |
 | watch after compaction → `ErrCompacted`; the client re-lists | a subscription resumes on the compacted log; the discovery library re-scans on every break. Tombstones live `delete.retention.ms` (1 h default). | equivalent |
 | **Session**(TTL 60 s default, `Done()` on loss, `Close` revokes) | `LeaseSession` (`ttl` default = the topic's `lease.ttl`; `onLost` ≈ `Done()`; `close()` revokes every key) | same, per key (D1) |
-| **Mutex**: put `pfx/<leaseId>` guarded by `CreateRevision == 0`; the owner is the lowest create revision under `pfx`; `Lock` waits for predecessor deletes; `TryLock`; `IsOwner` | `LeaseMutex`: grant `name/<sessionId>`; the owner is the lowest `lease_version` under `name/`; `lock` waits for each predecessor's `Revoked` / `Expired`; `tryLock`; `isOwner` | same within a partition (D2) |
+| **Mutex**: put `pfx/<leaseId>` guarded by `CreateRevision == 0`; the owner is the lowest create revision under `pfx`; `Lock` waits for predecessor deletes; `TryLock`; `IsOwner` | `LeaseMutex`: grant `name/<sessionId>-<campaignNo>` (§12.3); the owner is the lowest `lease_version` under `name/`, read from the recipe's shared `LeaseWatch`; `lock` waits for its predecessor's `Revoked` / `Expired`; `tryLock`; `isOwner` | same within a partition (D2) |
 | **Election**: `Campaign`, `Proclaim`, `Resign`, `Leader`, `Observe` | `LeaseElection` on the same pattern (§12.3) | same |
 | fencing: the create revision of the owner's key | `lease_version` of the owner's key, strictly increasing per key and per partition | same within a partition (D2) |
 
@@ -356,13 +359,31 @@ lease topic <name> { <field> <type>, ... } [ partitions <n> ] [ replicas <r> ] k
   record must never be deleted by retention. `delete.retention.ms` defaults to 1 h (call).
 - **Key index.** The lease index is the topic's key index (§7.1); `key.index` is implied.
 - **Reserved names.** User fields named `lease_*` are refused, because the broker adds four system columns (§6.1).
+- **Key width (Coordinator's call, R1).** A lease topic's key is an integer or `string(N)` with N ≤ 128
+  (`kMaxLeaseKeyBytes = kMaxViewKeyBytes = 128`). Every other topic keeps N ≤ 16. Discovery paths and election
+  names need the width; it costs only lease-view memory, which `max-view-memory-bytes` already counts.
+
+  **What the code does today, and what must change** (read at 6f79348):
+
+  | Place | Today | Change |
+  |---|---|---|
+  | `AdminWorker.cpp:1460-1469` (`buildDefine_`) | refuses a key above `string(16)` through `isTopicKeyType` (`PrimType.h:19-26`, `kMaxTopicKeyBytes = 16`) | add `isLeaseTopicKeyType(type, width)` (N ≤ 128) and use it when `DefineTopic` carries a `LeaseSpec`; the refusal text names the lease limit |
+  | `WriteState.h:118` (`TopicWriteSpec`) | a key wider than 16 gets `keyWidth = 0`, which means "the key cannot be checked", so the record-key = row-key check (`:246-258`) would silently switch off | use the lease rule for lease topics, so `keyWidth` is the real width (it is a `uint8_t`, which holds 128) |
+  | `VerdictSource.cpp:155` (`addVerdictView`, key index) | throws above 16 bytes | accept up to 128 for `LeaseIndex` (member 0); `Member::keyWidth` is a `uint8_t`, fine |
+  | client `Key::kMaxInline = 16` (`Key.h:39`), the producer ring's `SEND_RECORD` layout (`ProducerImpl.h:132-138`: a 16-byte inline key slot, value at byte 38), `TypedTopic`'s static asserts, `Client.cpp:58` | a record key is at most 16 bytes on the client | `LeaseTopic` writes need a second, lease-only `SEND_RECORD` form whose key slot is 128 bytes (selected per topic at open; fixed-size, no heap). Non-lease sends keep today's layout and cost. |
+  | `ViewTable` (`ViewTable.cpp:86`, `keyWidth ≤ kMaxViewKeyBytes`), `kMaxViewKeyBytes = 128` (`ViewKeyEncoding.h:16`), `ViewKeyBuilder.cpp:60` | already 128 | none |
+  | `getViewRowK` `kMaxKeyBytes = 128` (`DataMessages.h:969`), the gateway's tail buffer (`ClientGateway.cpp:10836`) | already 128 | none: the watchdog's point read fits |
+  | the stored record format (varint key length, `RecordBatch`), the cleaner's `OffsetMap` (`string_view` keys), `partitionForKey(bytes)` | width-free | none |
+  | `ScanLeases` prefix | 0–127 bytes | none |
+
+  The lease view is not checkpointed (§7.1), so the v3 view-checkpoint key header is not on this path.
 
 ### 5.2 Settings
 
 | Key | Values | Default | Alterable |
 |---|---|---|---|
 | `lease.ttl` | `min_ttl`–`max_ttl` ms | 30 000 | yes (the default the client library writes into new grants) |
-| `lease.min_ttl` | from the floor `1.5 × leaderHeartbeatTimeout` up to `max_ttl` ms | the floor | yes |
+| `lease.min_ttl` | from the floor `kLeaseMinTtlFloorMs` (1 000, a catalog constant, R11) up to `max_ttl` ms | 1 000 | yes |
 | `lease.max_ttl` | `min_ttl` to 9 000 000 000 000 ms (etcd `MaxLeaseTTL`) | 9 000 000 000 000 | yes |
 | `lease.max_keys` | 1–16 777 216 live leases per partition | 1 048 576 | no |
 | `lease.checkpoint` | `on`, `off` | `on` (D4) | yes |
@@ -428,6 +449,16 @@ lease topic they carry the lease op. On every other topic they stay refused, exa
 - **Every record carries the full row**, so a filtered watcher receives the end of every lease it saw start. The
   broker copies the row from the lease view into `Expire` and `Checkpoint`, re-encoded with the latest writer
   version.
+- **The broker re-encodes every `Revoke` (Coordinator's call, R9).** A client revoke carries only the key and
+  `lease_version` that matter (`LeaseSession.close()`, `unlock()` and `resign()` hold nothing else); its other
+  columns are ignored. The write hook replaces the record with the lease view's row for that key, re-encoded with the
+  latest writer version, in the grant's scratch-copy patch (§6.3), and recomputes the CRC32C.
+  - If the lease view has no row for the key, or a different version, the record goes through unchanged and the
+    judge answers `kErrLeaseNotFound`.
+  - If a client `Update` or `Revoke` for the key is still in the unfolded tail (`lastAppended[k] > foldCursor`), the
+    lease view's row may be older than the log. The hook then answers the revoke `Throttled` (53) with a 1 ms
+    retry-after (call), and the client library resends it. Only a revoke sent back-to-back behind the holder's own
+    update meets this.
 - **Refusals.** Plain deletes (an empty value, `remove`, `removeExisting`) are refused with "use revoke". So are a
   client `Expire` or `Checkpoint`, and the `upsert` intent.
 
@@ -436,15 +467,21 @@ lease topic they carry the lease op. On every other topic they stay refused, exa
 - **Stamping.** On a grant the write hook stamps `lease_version` with the offset the record is about to get. It runs
   on the partition's single writer, immediately before `appendNoSyncRestamp` (`LogSegment.h:122`). It uses the
   autoincrement scratch-copy patch (checked-writes §6.4) and recomputes the CRC32C.
-- **Zero-copy.** Updates and revokes are not patched, so they stay zero-copy.
+- **Zero-copy.** Updates are not patched, so they stay zero-copy. Revokes are re-encoded (§6.2, R9), at the cost of
+  one grant-sized patch.
 - **Why it is safe.** Offsets strictly increase per partition. Truncation can reuse only uncommitted offsets. Lease
   writes need `acks=view`, and a verdict implies commit, so no client ever held a version that truncation took back.
 - **The client learns its version from the ack.** The `View` ack gains a per-record `leaseVersion`.
   - **In the dedupe window,** an idempotent retry returns the original base offset (`ProducePathImpl.h:205-212`), so
     the same version.
-  - **A known-old duplicate** (outside the window, `baseOffset = -1` today) is answered from the lease view. If a
-    live row's `lease_holder` matches the duplicate's, the ack carries that version. Otherwise it is
-    `kErrLeaseNotFound`, which is definite.
+  - **A known-old duplicate** (outside the window, `baseOffset = -1` today) was stored and judged long ago. It is
+    answered per op from the lease view, never by matching `lease_holder` (Coordinator's call):
+
+    | Duplicate of | `(key, version)` live now | not live | Why |
+    |---|---|---|---|
+    | grant | `VerdictUnknown` (status 14) | `VerdictUnknown` | the client never learned a version, so nothing proves the live row is its grant. The caller reads the key; `LeaseSession` and the recipes treat it as not granted and grant a new key (§12.3). |
+    | `Put`+`update` | `Ok` | `kErrLeaseNotFound` | the client learned `version` from the grant's ack, after the grant folded. Live now means live when the original was judged, so it was accepted. |
+    | `Revoke` | cannot happen | `kErrLeaseNotFound` | a version is never reused, so a judged revoke of `(k, v)` leaves `v` ended either way. For a revoke this answer means "that lease is over", and the client treats it as done. |
 
 ### 6.4 Write rules (the write hook; each refusal is definite)
 
@@ -462,8 +499,11 @@ lease topic they carry the lease op. On every other topic they stay refused, exa
 | namespace `ReadOnly` or `RejectAll` | `NamespaceSuspended` (51), as for any write |
 | transactional produce | `InvalidRequest` |
 
-After the checks, the hook stores the batch's last offset in each touched key's `lastAppended` slot (§9.3), on the
-same worker, before the append.
+After the checks, the hook stores the batch's last offset in the `lastAppended` slot (§9.3) of each key the batch
+**updates or revokes**, on the same worker, before the append. Grants do not touch it (Coordinator's call, R8). A
+grant of a live key is judged `KeyExists` and changes nothing, so it cannot make a broker record stale. If grants
+counted, contenders racing for a held slot (Herald 02 §8.3) could keep `lastAppended` ahead and defer an `Expire`
+forever, breaking G3.
 
 ### 6.5 Transactions
 
@@ -489,6 +529,21 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
   data row, and a later grant or tombstone supersedes the old checkpoint.
   - So a lease view rebuilt from a compacted log has every live lease, its row, its version and its checkpointed
     remaining time.
+  - **How the cleaner reads it (Coordinator's call).** `LogCleaner::isTombstone(string_view)` (`LogCleaner.h:401`)
+    sees only the value, so the cleaner gets a lease-topic mode and does no schema decode:
+    - The lease op is in the per-record attributes, bits 2–3 (§6.2).
+    - `lease_version` sits at a **fixed offset**: value bytes `[4, 12)`, little-endian `int64`. The broker places the
+      four system columns first in the fixed block, in §6.1's order (`lease_version`, `lease_ttl_ms`, `lease_holder`,
+      `lease_remaining_ms` at block offsets 0, 8, 16, 24), in every writer version. They can never be removed or
+      reordered (`lease_*` names are refused, §5.1). The codec recomputes offsets per version from the live fields
+      (`WriteState.h:188-193`), so fields that stay first keep offset 0. `TopicWriteSpec::installVersion` asserts the
+      layout for every version of a lease topic, and refuses a version that breaks it.
+    - In lease mode the cleaner keeps a second `OffsetMap` for checkpoints, holding the latest `Checkpoint` per key
+      and its version. A checkpoint survives only if its version equals the latest data record's version and that
+      record is not a tombstone.
+    - The tombstone delete horizon is the cleaner's own KIP-534 stamp (`LogCleaner.cpp:907-939`), never a record
+      timestamp. The legacy `nowNs` path (`:942-947`) must not run for a lease topic: broker records carry
+      timestamp 0 (§9.1). The plan asserts `nowMs ≥ 0` there.
   - A rejected record is removed as in checked writes (§8.5).
 - **Consumers.**
   - `record.op()` is `Delete` for `Revoke` and `Expire`.
@@ -555,8 +610,14 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
 
 - **Request:** `{ topicId, partition, entries[1..256] { key, version } }`, routed to the partition leader.
   `LeaseSession` batches its keys per partition.
-- **Response:** `{ entries[] { code, ttlMs } }`, where `code` is `Ok`, `kErrLeaseNotFound`, `NotLeader`,
-  `NamespaceSuspended` or `Throttled`.
+- **Response:** `{ final u8, entries[] { index u16, code, ttlMs } }`, where `code` is `Ok`, `kErrLeaseNotFound`,
+  `NotLeader`, `NamespaceSuspended`, `Throttled` or `UnknownTopic`.
+- **Answered per entry (Coordinator's call).** A request is never held for its slowest entry.
+  - The first response carries every entry decided at once. `final = 0` if any entry parked.
+  - Each parked entry is answered later, in its own response with the same correlation id and its `index`. The
+    response that answers the last parked entry has `final = 1`.
+  - The client completes each entry on its own answer. A keepalive request costs one completion per entry, from the
+    `LeaseSession`'s preallocated ring.
 - **Per entry, on the leader's worker** (it arrives through the gateway's ring, as every request does):
 
 | Lease state on the leader | Action |
@@ -566,12 +627,21 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
 | namespace `ReadOnly` | served (call): a keepalive writes nothing, like a read. A read-only tenant's services stay discoverable. |
 | row absent, or `version` ≠ the row's | `kErrLeaseNotFound` |
 | entry `Armed`, not due, `lease_remaining_ms == 0` | re-arm at `leaseNow + ttl`; `Ok(ttlMs)` |
-| entry `Armed`, not due, `lease_remaining_ms > 0` | append `Checkpoint(remaining = 0)` (etcd's synchronous checkpoint), park the entry; after that checkpoint folds, re-arm and answer `Ok`. On demotion, answer `NotLeader`. |
+| entry `Armed`, not due, `lease_remaining_ms > 0` | if the emission gate is open (§9.1: `Ready`, HW at the leadership start, `lastAppended[k] ≤ foldCursor`), append `Checkpoint(remaining = 0)` (etcd's synchronous checkpoint) and go to `Clearing`; otherwise park in `Armed` until the gate opens, then append (R4). After the checkpoint folds, re-arm and answer `Ok`. If a parked revoke folds first, answer `kErrLeaseNotFound`. |
+| entry `Clearing` | park on the same `Checkpoint(0)`; answered with the keepalive that started it |
+| entry `Checkpointing` (a scheduled `Checkpoint(R)` appended, not yet folded) | park. When `Checkpoint(R)` folds, the entry has `remaining > 0`, so it follows the row above: `Checkpoint(0)`, then `Ok` (R4). |
 | entry due (deadline passed) or `Emitting` | park until its `Expire` folds (`kErrLeaseNotFound`) or the leader is demoted (`NotLeader`), as etcd waits on `revokec` / `demotec` |
+| any parked entry, on demotion / topic drop | `NotLeader` / `UnknownTopic` |
 
 - **The park table.** It is a per-worker, preallocated, fixed table of 4096 entries (call), indexed through the wheel
-  entry. Each entry holds the session's reply slot. When it is full, the entry is answered `Throttled` (53) with a
-  1 ms retry-after. Parking lasts at most one commit + fold, or until demotion.
+  entry. Each entry holds the session's reply slot and the entry `index`. When it is full, the entry is answered
+  `Throttled` (53) with a 1 ms retry-after.
+- **How long a park lasts (corrected in rev 4).** Not "one commit + fold": a park lasts until the record it waits
+  for folds. That record is the entry's `Checkpoint(0)`, its scheduled `Checkpoint(R)`, or its `Expire`. If the
+  record is still gated (view not `Ready`, or a client update or revoke in the tail), the park also covers the gate.
+  If the partition cannot commit (min-ISR), it lasts until it can, or until demotion. The broker sets no timeout of
+  its own (rule 16). The client's keepalive deadline turns a long park into a local timeout, which counts toward
+  `onAtRisk` (§12.2); the broker's late answer is then dropped.
 - **Why it needs the view-read lease.** A deposed leader that has not noticed must not acknowledge a keepalive (§9.2).
   The read lease (`2026-10-19-view-read-lease-and-sink-plane-design.md` A.3) gives exactly that.
 - **Authorisation:** `WRITE` on the topic.
@@ -588,11 +658,26 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
 
 ### 8.3 `ScanLeases`
 
-`ScanLeases` is etcd's `LeaseLeases` plus a prefix `Get`.
-- **Request:** `{ viewId, partition, prefix (0–127 bytes; empty = all), resumeKey, maxRows (1–1024) }`.
-- **Response:** `{ asOfOffset, rows[], nextResumeKey }`.
-- **Resume.** Each page resumes at the first live key after `resumeKey`, at its own, later `asOfOffset`. Churn between
-  pages never invalidates the scan.
+`ScanLeases` is etcd's `LeaseLeases` plus a prefix `Get`, in **hash order** (Coordinator's call, R2). The lease
+view is a `ViewTable`, an open-addressing hash table (`ViewTable.h:60-90`) with no key order. Its only prefix support
+is a fixed-width `prefixWidth`, which a path prefix cannot use.
+- **Request:** `{ viewId, partition, prefix (0–127 bytes; empty = all), resumeHash u64, first u8, maxRows (1–1024) }`.
+- **Response:** `{ asOfOffset, rows[], lastHash u64, done u8 }`.
+- **The order.** `h(k) = xxh3_64(key bytes, seed = the topic id)`. It is the same on every node and for every table
+  size, so it survives a leader change and table growth. It is not the table's own probe seed, which is per node.
+- **A page.** It holds the live rows whose key starts with `prefix` (filtered on the broker) and whose `h(k)` is
+  above `resumeHash` (or any hash when `first = 1`), taking the `maxRows` smallest hashes. It always ends on a hash
+  boundary: keys with the same hash go in the same page, so a page may exceed `maxRows` by the ties. `lastHash` is
+  the largest hash in the page and is the next request's `resumeHash`. `done = 1` when no live key has a larger hash.
+- **`asOfOffset` is exclusive.** It is the fold cursor when the page was built, the first offset **not** reflected
+  in the page. The page reflects every record at offset `< asOfOffset`.
+- **Cost, stated plainly.** A page is one walk of the whole table on the leader's worker, in one duty cycle so the
+  page is a consistent snapshot: O(n) in the table's capacity, about 1–2 ns per slot. A full scan of n keys costs
+  O(n · ⌈n / maxRows⌉). That is cheap for the topics that scan (discovery: hundreds; elections: thousands; worker
+  slots: ≤ 64 k), and expensive for a 1 M-lease topic, which should be read by key. An ordered secondary index is
+  later work (§18).
+- **Resume.** Each page resumes after `resumeHash`, at its own, later `asOfOffset`. Churn between pages never
+  invalidates the scan.
 - **Leader change.** A mid-scan change answers `NotLeader`, and the client resumes on the new leader.
 - **Why it is new.** Today's `ScanViewRows` cannot serve it: it routes to partition 0, has no `asOf`, and its cursor
   is invalidated by churn (checked-writes §9).
@@ -613,6 +698,10 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
   - An accepted `Put`+`update` changes no deadline.
 
   `foldLeaseNow` is the `LeaseClock` (`CLOCK_BOOTTIME`), read once per fold batch.
+- **Saturating arithmetic (R11).** Every deadline is `min(INT64_MAX, a + b + …)`, computed with saturating adds, in
+  the deadline and checkpoint wheels, the promotion rule (§9.6), `LeaseTimeToLive` and the client margin (§12.2).
+  `max_ttl` = 9 × 10¹² ms is 9 × 10¹⁸ ns, so `BOOTTIME + ttl + extend` would overflow `int64` after about 7 years of
+  uptime. A saturated deadline is "not in this node's lifetime" and lands in wheel level 4.
 - **Followers keep no deadline state at all.** Revision 2's shadow wheel is gone, because keepalives are not in the
   log. A promoted follower arms from the etcd rule (§9.6).
 - **The emission gate.** The leader emits for a due key only while all of these hold:
@@ -622,9 +711,32 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
 
   **Namespace suspension is not in the gate (owner, G3).** Broker `Expire` and `Checkpoint` appends bypass the
   suspension refusal, which applies to client writes only.
-- **Appending.** The leader appends `Expire` batches from its duty cycle through the `PartitionReplica`, as
-  `VerdictSource::emitMarkers_` does (`VerdictSource.cpp:496-531`). It stops on `kAppendNotLeader`, so a deposed
-  leader appends nothing.
+- **The gate holds in `Armed` only (R4).** No `Expire` and no scheduled `Checkpoint` is built for an entry in
+  `Clearing`, `Checkpointing` or `Emitting`. A due entry in one of those states waits for its record to fold and is
+  re-examined in `Armed`.
+- **Appending: a data batch, not a marker (Coordinator's call; rev 3's "as `emitMarkers_` does" is withdrawn).**
+  `emitMarkers_` uses `appendControlBatch`, which consumers never see, and `PartitionReplica::append` wraps its input
+  as the value of a one-record batch (`PartitionReplica.cpp:565-590`). Neither fits. The emitter builds one whole data
+  `RecordBatch` of up to `lease.expiry_batch` records (or 1000 checkpoints). Each record has the lease key, the
+  re-encoded row (§6.2) and the lease op in attribute bits 2–3. The batch is appended through a new
+  `PartitionReplica::appendLeaseBatch(span)`, the data-batch sibling of `appendControlBatch`, with the same role
+  gate, min-ISR gate and post-append sequence.
+  - **Producer fields:** `producerId = −1`, `producerEpoch = −1`, `baseSequence = −1`, so the batch is not
+    idempotent and the dedupe window never sees it. No dedupe is needed: the emitter never retries an append. A
+    refused append wrote nothing, the entry stays `Armed` and due, and the next cycle rebuilds the record from fold
+    state. An entry leaves `Armed` only on a successful append.
+  - **Timestamps:** `firstTimestamp = maxTimestamp = 0` and every record's delta is 0, as `makeBatch_` does for broker
+    batches (`PartitionReplica.cpp:74-79`). No wall clock is read, and no lease decision reads the field (G5).
+    Consumers see timestamp 0 on `Expired` and the hidden `Checkpoint`.
+  - **CRC and epoch:** the emitter computes the CRC32C once, over attributes through the records. The replica
+    restamps the base offset in place and stamps the leader epoch (`stampLeaderEpoch`). Both precede the CRC region,
+    as in `appendControlBatch`, so the CRC stays valid.
+  - **Refusals:**
+    - `kAppendMinIsr`: nothing is appended. The entries stay due, `rune_lease_expiry_backlog` counts them, and the
+      next cycle tries again. While the partition cannot reach min-ISR, no `Expire` could become visible anyway. The
+      append uses `acksAll = true`: an `Expire` is majority-durable, like any acks=all write.
+    - `kAppendNotLeader`: the emitter stops, so a deposed leader appends nothing.
+    - `kAppendBackPressure` cannot happen, because lease topics are never transient.
 - **Rule 16.** The TTL is a product semantic, not a convergence timeout. The timer decides only when the leader
   proposes an end. The judged log decides whether it ended. `extend` (§9.6) affects only *when* a promoted leader
   proposes, never *whether* an end is accepted.
@@ -642,14 +754,26 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
 - **Steady state.** The leader acknowledged the keepalive at a time `a ≥ t`, and arms at `a + ttl` on its own clock.
   That is never early.
 - **Across a leader change.**
-  - The old leader acknowledges keepalives only while it holds the view-read lease. A new leader can serve only after
-    every read lease of the old one has run out. So its promotion time `P` comes after every acknowledgement `a` the
-    old leader gave.
-  - The new leader arms at `P + extend + R`, where `R` is the checkpointed remaining time or the full TTL.
+  - **Rev 3's premise is withdrawn (R3).** Rev 3 assumed a new leader serves only after the old leader's read lease
+    has run out. Read-lease A.8 does not wait for it on a move that keeps the old leader in the ISR. Rev 3 also armed
+    at `refoldJudgedNow`, which can come before the old leader's last keepalive ack: up to about L(1+ρ) ≈ 202 ms after
+    the `LeaderChange`, while `extend` = H ≈ 150 ms.
+  - **The new premise (Coordinator's call).** The old leader acknowledges keepalives only while it is leader under
+    its epoch and holds the view-read lease. The new leader's lease view enters `Ready` only when its HW has reached
+    its leadership start offset (`ViewInstance.h:43-50`). The HW reaches it in one of two ways:
+    - the old leader, still in the ISR, has fetched at the new epoch. It demoted before that fetch, so every
+      acknowledgement `a` it gave comes, causally, before `T_ready`;
+    - the old leader was removed from the ISR. The read-lease move fence (A.8) then waited out its read lease before
+      the new leader served, so again every `a` comes before `T_ready`.
+
+    This is causal order through messages, never a cross-node clock comparison (C3).
+  - The new leader arms at `T_ready + extend + R` on its own lease clock, where `T_ready` is the time its view entered
+    `Ready` and `R` is the checkpointed remaining time or the full TTL. Drift is absorbed by the holder's margin, as in
+    steady state.
   - **Without a checkpoint,** `R = ttl`, so the deadline is `> a + ttl`.
   - **With a checkpoint** `R = deadline_old − c` taken at time `c`: every keepalive acknowledged after `c` first
     appended and folded `Checkpoint(0)` (§8.1), which clears `R`. So if `R > 0` is the latest checkpoint the new
-    leader sees, every acknowledgement came before `c`, and `P + extend + R > c + R = deadline_old`.
+    leader sees, every acknowledgement came before `c`, and `T_ready + extend + R > c + R = deadline_old`.
   - If `Checkpoint(0)` was appended but truncated, its keepalive was never acknowledged, because it answers after the
     fold.
 
@@ -658,9 +782,12 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
 
 ### 9.3 Why a broker record is never stale
 
-- **The `lastAppended` rule.** The emitter appends an `Expire` or `Checkpoint` for `k` only if no client record for
-  `k` sits in the unfolded tail (`lastAppended[k] ≤ foldCursor`).
-- **Proof.** At emission the fold has applied every record for `k`, so the lease view row is `k`'s state at log end.
+- **The `lastAppended` rule.** The emitter appends an `Expire` or `Checkpoint` for `k`, including a keepalive's
+  `Checkpoint(0)`, only if no client update or revoke for `k` sits in the unfolded tail
+  (`lastAppended[k] ≤ foldCursor`). Grants are not tracked (R8, §6.4). A grant in the tail meets a live row, is
+  judged `KeyExists` and changes nothing.
+- **Proof.** At emission the fold has applied every update and revoke for `k`, and any unfolded grant of `k` will be
+  refused. So the lease view row is `k`'s state at log end.
   The broker record carries that row's version and folds before anything appended after it, so it is accepted. It can
   be lost only by truncation, which means it never committed.
 - **A revoke or update racing an expiry.**
@@ -671,8 +798,9 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
 - **A keepalive racing an expiry.** Keepalives and the emitter run on the same worker thread:
   - a keepalive handled before the wheel poll re-arms the key, so no `Expire` is built;
   - one handled after the `Expire` was built parks, and is answered `kErrLeaseNotFound` (§8.1).
-- **Liveness.** Only a stream of client writes to `k` arriving faster than commit + fold can defer an `Expire`
-  indefinitely. It needs `WRITE` and the version, so its writer could revoke anyway. The namespace produce-rate limits
+- **Liveness.** Only a stream of client updates or revokes of `k` arriving faster than commit + fold can defer an
+  `Expire` indefinitely. Both need `WRITE` and the version, so their writer could revoke anyway. Grants from
+  contenders, which need no version, cannot defer it (R8). The namespace produce-rate limits
   bound it, and `LeaseSession` never writes to a due key. Updates never renew (G2), so the deferral is never an
   extension: the `Expire` goes out in the first cycle where the tail holds nothing for `k`.
 
@@ -694,9 +822,15 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
   - It passes the same gate as `Expire`.
   - At most `lease.checkpoint_rate`/s and 1000 per batch are emitted, from the same scratch.
   - It is skipped when the remaining time is ≤ the interval, as in etcd.
+- **In flight (R4).** Appending a scheduled `Checkpoint(R)` moves the entry to `Checkpointing{ckptOffset}`. A
+  keepalive there parks. Without this state, a keepalive arriving after `Checkpoint(R)` is appended but before it
+  folds would still see `remaining == 0`, re-arm and answer `Ok` with no clear. `R` would then fold, and a later
+  leader would arm at `T_ready + extend + R`, which can be far earlier than `a + ttl` (a 24 h TTL with R = 10 min).
+  When `Checkpoint(R)` folds, the entry returns to `Armed` and the checkpoint wheel re-arms it. A parked keepalive
+  then sends `Checkpoint(0)`, through the gate (§8.1).
 - **Clearing.** The first keepalive after a checkpoint appends `Checkpoint(0)` and answers after it folds (§8.1).
   So a lease writes at most two records per interval: a checkpoint and a clear. That is etcd's bound.
-- **One-shot long leases** (an idempotency key, a sanction) are granted once and never kept alive. They write one
+- **One-shot long leases** (a sanction's expiry, an appeal token) are granted once and never kept alive. They write one
   checkpoint per interval and are compacted to one. 1 M such leases on one partition at a 5 min interval need
   3 333 checkpoints/s, above the default rate. A lagging checkpoint only carries an older, larger remaining time, so
   a later leader arms it later, never earlier. Sizing: raise `lease.checkpoint_rate`, or add partitions.
@@ -709,15 +843,24 @@ Transactional produce to a lease topic is refused, as checked writes refuse it o
 
 | State | Fields | Entered when | Leaves when |
 |---|---|---|---|
-| `Armed` | `deadlineNs`, `checkpointNs` | grant fold, keepalive, promotion | it falls due and passes the gate (→ `Emitting`); a keepalive with a checkpoint (→ `Clearing`) |
+| `Armed` | `deadlineNs`, `checkpointNs` | grant fold, keepalive, promotion, the end of `Checkpointing` | it falls due and passes the gate (→ `Emitting`); a checkpoint falls due and passes the gate (→ `Checkpointing`); a keepalive with a checkpoint passes the gate (→ `Clearing`) |
+| `Checkpointing` | `ckptOffset`, park index | it appended a scheduled `Checkpoint(R)` (R4) | that checkpoint folds (→ `Armed`; parked keepalives then go through the `Checkpoint(0)` row of §8.1); demotion (discarded, `NotLeader`) |
 | `Clearing` | `clearOffset`, park index | it appended `Checkpoint(0)` for a keepalive | that checkpoint folds (→ `Armed`, re-armed, the keepalive answered); demotion (discarded, `NotLeader`) |
 | `Emitting` | `emitOffset` | it appended `Expire` | the `Expire` folds (freed; parked keepalives get `kErrLeaseNotFound`); demotion (discarded, `NotLeader`) |
 
-**Arming on promotion (etcd `Promote`).** When the rebuild has judged a key's last record, the new leader arms it at:
+Only `Armed` emits (§9.1). In the other three states the entry has a record in flight. A deadline that passes there
+is acted on when the entry is `Armed` again, so it is late, never early.
 
-`refoldJudgedNow + extend + (lease_remaining_ms > 0 ? lease_remaining_ms : lease_ttl_ms)`
+**Arming on promotion (etcd `Promote`; Coordinator's call, R3).** At the lease-clock time `T_ready` when the
+lease view enters `Ready`, the new leader arms every live key at:
+
+`T_ready + extend + (lease_remaining_ms > 0 ? lease_remaining_ms : lease_ttl_ms)` (saturating, §9.1)
 
 where `extend = leaderHeartbeatTimeoutNs`, etcd's `extend = electionTimeout`. Emission starts at `Ready`.
+- **The pass.** It links the entries in chunks of 4096 per duty cycle (call), so a 1 M-lease partition never stalls
+  its worker. A key not yet linked cannot expire, which is late, never early. A keepalive for such a key is served as
+  for `Armed`, and links it.
+- **Why `T_ready`, not the refold time.** §9.2: every acknowledgement of the old leader comes before `T_ready`.
 
 | Event | Effect | Bound |
 |---|---|---|
@@ -725,7 +868,7 @@ where `extend = leaderHeartbeatTimeoutNs`, etcd's `extend = electionTimeout`. Em
 | a leader is demoted | its wheels and park table go with its view; parked keepalives get `NotLeader` | no lost expiry: the new leader arms everything |
 | a whole-cluster restart | the same rule on the first leader | the same bound. A long lease keeps its checkpointed remaining time, so a 400-day sanction is late by at most `extend + one checkpoint interval`. |
 | a follower catches up, or a divergent follower is truncated | nothing: followers hold no deadline state | — |
-| topic dropped | wheels and view released; no `Expire` | consumers get `UnknownTopic` |
+| topic dropped | wheels, park table and view released; no `Expire`. Every parked keepalive is answered `UnknownTopic` when the drop applies on the leader (Coordinator's call); `LeaseSession` reports `onLost(reason = TopicDropped)` | consumers get `UnknownTopic` |
 | namespace suspended (`ReadOnly`, `RejectAll`) | expiry and checkpoints continue. `RejectAll` refuses keepalives and writes; `ReadOnly` refuses writes and serves keepalives. | G3 |
 | namespace resumed | nothing to do: nothing paused | — |
 | namespace deleted | the topic goes with it | — |
@@ -763,12 +906,14 @@ None of these can stop expiry:
 | 3 | 12.4 days | 34.8 years |
 | 4 | 34.8 years | 35 600 years |
 
-  That covers `MaxLeaseTTL` (285 years). An entry cascades at most four times in its life.
+  That covers `MaxLeaseTTL` (285 years), and a saturated `INT64_MAX` deadline (§9.1). An entry cascades at most four
+  times in its life.
 - **Intrusive by row id.** `ViewTable` row ids are dense and stable. One 48-byte entry per live lease holds:
   - `deadlineNs`, `checkpointNs`, `lastAppended`;
   - the deadline-wheel links and the checkpoint-wheel links (`u32` each);
   - `level` ×2, `state`;
-  - `emitOffset` / `clearOffset`, and the park index.
+  - `emitOffset` / `ckptOffset` / `clearOffset` (one field: an entry is in at most one of those states), and the park
+    index.
 
   Arm and re-arm are O(1) unlink plus link. There is no hash and no allocation.
 - **Storage.** Entries are preallocated in chunks of 4096 on the cold path at 75 % use (the `growOwed` pattern), never
@@ -800,60 +945,143 @@ show topic 'acme/herald.safety.case-claims';                          -- lease s
 
 ### 12.1 `LeaseTopic<T>`
 
-```cpp
-auto claims = client.openLeaseTopicAndWait<gen::CaseClaim>("acme/herald.safety.case-claims");
-LeaseOptions opts{.ttl = 30min, .holder = nodeId};              // ttl unset = the topic's lease.ttl
+**Async first (Coordinator's call).** Every lease operation follows the client's F8c pattern (`Completion.h`). It
+takes a target (a `Completions&` queue that the owning thread polls, or a `CompletionHandler {fn, ctx}`) and a
+`Token`. It is either rejected synchronously, or accepted, and then exactly one `Completion` follows. Nothing blocks,
+nothing allocates, and there is no `std::function`. The `*AndWait` forms are thin wrappers for tools and tests, and
+an agent thread never calls them (Herald 02 §3.3).
 
-LeaseResult g = claims.grantAndWait(row, opts);                 // Ok(version, ttlMs) | KeyExists | TtlTooLarge
-LeaseResult u = claims.updateAndWait(row, g.version());         // Ok | LeaseNotFound   (does not keep alive)
-LeaseResult k = claims.keepAliveOnceAndWait(key, g.version());  // Ok(ttlMs) | LeaseNotFound
-LeaseTtl    t = claims.timeToLiveAndWait(key);                  // granted, remaining (-1 = none), version, holder
-LeaseResult v = claims.revokeAndWait(row, g.version());         // Ok | LeaseNotFound
+```cpp
+// async: open, then ops; each completes once on `done` with the token given
+client.openLeaseTopic<gen::CaseClaim>("acme/herald.safety.case-claims", done, tOpen);   // OpKind::OpenLeaseTopic
+LeaseOptions opts{.ttl = 30min, .holder = nodeId};              // ttl unset = the topic's lease.ttl
+claims.grant(row, opts, done, tGrant);        // LeaseGrant:   Ok(value = version, aux = ttlMs) | KeyExists | TtlTooLarge | VerdictUnknown
+claims.update(row, version, done, tUpd);      // LeaseUpdate:  Ok | LeaseNotFound   (does not keep alive)
+claims.revoke(key, version, done, tRev);      // LeaseRevoke:  Ok | LeaseNotFound   (row re-encoded by the broker, §6.2)
+claims.keepAliveOnce(key, version, done, t);  // LeaseKeepAlive: Ok(aux = ttlMs) | LeaseNotFound
+claims.timeToLive(key, done, t);              // LeaseTimeToLive: payload = granted, remaining (-1 = none), version, holder
+claims.get(key, minOffset, done, t);          // GetViewRowK on the lease view
+
+// blocking wrappers (tools, tests)
+auto claims = client.openLeaseTopicAndWait<gen::CaseClaim>("acme/herald.safety.case-claims");
+LeaseResult g = claims.grantAndWait(row, opts);
 std::optional<gen::CaseClaimLeasesRow> cur = claims.getAndWait(key, /*minOffset=*/g.offset());
+
+// Herald's tenant delete grace (herald-sys, §19.6): one-shot, 7 d, checkpointed; CancelDeleteTenant revokes it
+graces.grant(gen::DeleteGrace{.nsId = ns}, LeaseOptions{.ttl = 7 * 24h, .holder = provisionerId}, done, tGrace);
 ```
 
+- **New `OpKind`s:** `OpenLeaseTopic`, `LeaseGrant`, `LeaseUpdate`, `LeaseRevoke`, `LeaseKeepAlive` (one completion
+  per entry, §8.1), `LeaseTimeToLive`, `ScanLeases`, `LeaseCampaign` (`LeaseElection::campaign` / `LeaseMutex::lock`
+  reaching ownership), `LeaseWatchReady` (`startFromNow`'s scan finished and the watch is live).
+  - `value` is the version for `LeaseGrant`, and the `asOfOffset` for `ScanLeases` and `LeaseWatchReady`.
+  - `aux` is `ttlMs`.
+  - `errorCode` is the broker code.
+  - A lease op's `Timeout` is its own duty-side deadline: `LeaseOptions.opTimeout`, default `ttl/3`.
 - **Acks.** Writes send `Acks::All | Acks::View`. `LeaseResult` carries `version()` from the ack's `leaseVersion`,
   and the raised `ttlMs()`.
 - **Errors.** `kErrLeaseNotFound`, `kErrLeaseLimitExceeded` and `kErrLeaseTtlTooLarge` are typed. `KeyExists` is
-  checked-writes'. All are definite.
+  checked-writes'. All are definite. A grant's `VerdictUnknown` means a known-old duplicate (§6.3): the caller reads
+  the key.
 - **Generated helpers.** The generated `T` gets `withLease(version, ttlMs, holder)`. There is no setter for
   `lease_remaining_ms`.
 - **Gating.** The client gates on `kBrokerVersionLeases`.
 
-### 12.2 `LeaseSession<T, Capacity>` (etcd `concurrency.Session`)
+### 12.2 `LeaseSession<Capacity, OnLost, OnAtRisk>` (etcd `concurrency.Session`)
 
-A preallocated, fixed-capacity set of leases that one thread keeps alive, driven by `doWork(nowNs)` (the Invoker
-pattern).
-- **`add(key, version, ttlMs)`** takes over keepalives for a lease this process granted.
-- **Keepalive.** Each key is kept alive at `ttl/3`, batched per partition into one `LeaseKeepAlive` of up to 256
-  entries, spread rather than bursty, through a preallocated `Completions` ring.
-- **`onLost(key, version, reason)` ≈ `Session.Done()`.**
-  - It fires on `kErrLeaseNotFound`, on a delivered `Expired` / `Revoked` for a held `(key, version)`, and when the
-    local margin `t + ttl·(1 − 2ρ) − d` passes with no `Ok`.
+**Untyped and multi-topic (Coordinator's call, R7).** A preallocated, fixed-capacity set of leases on **one** client
+that one thread keeps alive, driven by `doWork(nowNs)` (the Invoker pattern). Herald keeps election keys
+(`herald.elections`, 1 partition) and worker slots (`herald.workers`, 8 partitions) in one session. A process may
+hold one session per client, for example one per tenant client for case claims (Herald F19).
+- **`add(topic, partition, keyBytes, version, ttlMs) → LeaseRef`** takes over keepalives for a lease this client
+  granted. `keyBytes` is at most 128 bytes (§5.1). `remove(ref)` stops keeping it alive without a revoke.
+  `revoke(ref)` sends a fenced revoke and then removes it.
+- **Keepalive.** Each key is kept alive at `ttl/3`, batched per `(topic, partition)` into one `LeaseKeepAlive` of up
+  to 256 entries, spread rather than bursty, through a preallocated completion ring. Answers arrive per entry (§8.1).
+- **Ends from a `LeaseWatch` (optional).** `session.observe(watch)` connects a `LeaseWatch` (§12.4) over one of the
+  session's topics. A delivered `Revoked` / `Expired` for a held `(key, version)` then fires `onLost` at once. Without
+  a watch, the session learns ends only from keepalive answers and its margin. Several sessions and recipes share one
+  watch per topic.
+- **The clock.** `nowNs` is the client's injected monotonic clock: `CLOCK_BOOTTIME` on Linux, which counts suspend
+  (C2), and `mach_continuous_time` on macOS. A holder's margin never uses a clock that stops in suspend.
+- **The margin.** For the last keepalive sent at `t` that was answered `Ok`, the lease is held until
+  `M = t + ttl·(1 − 2ρ) − d` (§9.2), computed with saturating arithmetic.
+  - `d` comes from `LeaseOptions.maxDelay`, default 100 ms (call). It bounds one-way network delay plus the broker's
+    ingress-to-append time, which is what a guarded write needs (Herald 02 states its own number).
+  - It is validated at `add`: `ttl/2 + d < ttl·(1 − 2ρ)`, otherwise `InvalidArgument`. With `min_ttl` = 1 s, that
+    allows up to d ≈ 480 ms.
+- **`onAtRisk(ref, edge)` (Coordinator's call).**
+  - **When.** `Entered` fires when `nowNs ≥ t + ttl/2` with no newer `Ok` (`LeaseOptions.atRiskFraction`, default
+    1/2; it must leave `atRisk + d < M`), or at `M − d` if that is earlier. Every cause counts: a retriable error
+    (`NotLeader`, `Throttled`, `NamespaceSuspended`), a timeout or missing reply, a disconnect, or a long park.
+  - **Not terminal.** The session keeps sending keepalives. An `Ok` before `M` fires `Cleared`, and the lease was held
+    throughout. If no `Ok` comes by `M`, `onLost` follows. `Entered` fires at most once per episode.
+  - **Produce deadline (R5).** A producer can be bound to a lease (`ProducerOptions.guard = ref`, up to 8 producers
+    per lease, on the session's client).
+    - At `Entered`, before the callback runs, the client fails every **pending** produce of the bound producers with
+      `OpStatus::DeliveryFailed` and `errorCode = LeaseAtRisk`. A pending produce was sent and is not acked, so its
+      outcome is unknown: it may still be appended within `d` of its send. The client fails every **unsent**
+      produce the same way; those were never sent.
+    - From then on the client never sends or re-sends anything for those producers (no reconnect retry) until
+      `Cleared`.
+    - So every write of a guarded producer that can reach the log was sent before `Entered`, and is appended by
+      `Entered + d < M`, which is before the key can expire. Herald 02 §4.3 relies on this.
+    - `onLost` does the same if it comes first.
+  - **Election.** `LeaseElection` does not resign at `Entered`. It suspends: `isLeader()` is false and the user's
+    callback runs. It resumes at `Cleared` if its key is still the lowest. It resigns only on `resign()` or
+    `close()`. A caller that wants stricter behaviour revokes and campaigns with a new key, as Herald F1 does.
+- **`onLost(ref, reason)` ≈ `Session.Done()`.**
+  - It fires on `kErrLeaseNotFound`, on `UnknownTopic`, on a watched `Expired` / `Revoked` for the held
+    `(key, version)`, and when `M` passes with no `Ok`.
   - The key is dropped and is not kept alive again.
-- **`onAtRisk(key)`** fires before the margin while keepalives fail with retriable errors. A leader steps down here.
-- **`close()`** revokes every held key, fenced (etcd `Session.Close`).
+- **A local `onLost` leaves the key on the broker (stated plainly).** When `M` passes, the session cannot know the
+  broker's deadline. It sends one best-effort fenced revoke if a connection is up, but the key may live on the broker
+  until its deadline:
+  - about `a + ttl` in steady state;
+  - up to about `T_ready + extend + ttl` (or `+ R`) after a promotion (§9.6).
+
+  Until then nobody else can grant it, so an election stays without a leader, and a slot without an owner, for up to
+  that long. Herald's failover time includes it.
+- **`close()`** revokes every held key, fenced (etcd `Session.Close`), as an async state machine. `isClosed()` reports
+  when every revoke has answered.
 - **No `std::function`.** The callbacks are template functor parameters.
-- **Updates are separate.** `update(key, row)` sends a fenced `Put`+`update` at once. It is a separate write and does
-  not keep the lease alive (etcd: a put does not renew).
+- **Updates are separate.** `update(ref, rowBytes)` sends a fenced `Put`+`update` at once. It is a separate write and
+  does not keep the lease alive (etcd: a put does not renew).
 
 ### 12.3 `LeaseMutex` and `LeaseElection` (etcd `concurrency.Mutex` / `Election`)
 
-These are client recipes over a one-partition lease topic keyed by `path string(...)`:
-- **`LeaseMutex(session, topic, name)`.**
-  - **`lock()`** grants `name/<sessionId>` (always granted: the key is new). It then scans `name/` for the lowest
-    `lease_version`. If it is not the lowest, it waits for the `Revoked` / `Expired` of its immediate predecessor, then
-    re-checks. This is etcd's `waitDeletes`.
-  - **`tryLock()`** grants, scans, and revokes its own key if it is not the lowest (`ErrLocked`).
+These are client recipes over a one-partition lease topic keyed by `path string(N ≤ 128)`. Every operation is async
+(§12.1), and the recipes run inside the session's `doWork`.
+- **Shared watch (Coordinator's call, R7).** Recipes take `(session, watch, name)`. Every recipe on one topic in a
+  process shares one `LeaseWatch` started with `startFromNow`, so a Herald gateway with about 2 000 elections runs one
+  subscription, not 2 000.
+  - The watch keeps, for each registered name, the live `(lease_version, key)` set under `name/`, in a preallocated
+    min-heap (`Capacity` names, `Waiters` entries per name).
+  - "The lowest version under `name/`" is read from there, never from a `ScanLeases`, which has no key order (§8.3).
+  - A recipe acts only after the watch's `LeaseWatchReady`.
+- **The key (Coordinator's call).** `name/<sessionId>-<campaignNo>`.
+  - `sessionId` is a 64-bit random id that the `LeaseSession` draws at construction, as 16 hex digits.
+  - `campaignNo` is a per-session counter of 8 hex digits, incremented at every `lock` / `campaign`.
+  - So a re-campaign after a resign or a lost lease always grants a new key (Herald F1).
+  - `name` is at most 128 − 26 = 102 bytes.
+- **`LeaseMutex(session, watch, name)`.**
+  - **`lock()`** grants its key (always granted: the key is new). After the grant's ack and the watch passing that
+    offset, the lock is held if its version is the lowest under `name/`. Otherwise it waits for the `Revoked` /
+    `Expired` of its immediate predecessor, then re-checks. This is etcd's `waitDeletes`. `OpKind::LeaseCampaign`
+    completes on ownership.
+  - A grant answered `VerdictUnknown` (§6.3): the recipe reads its key. If it is live with
+    `lease_holder == sessionId`, it adopts that version. Otherwise it grants with the next `campaignNo`.
+  - **`tryLock()`** grants, checks, and revokes its own key if it is not the lowest (`ErrLocked`).
   - **`unlock()`** is a fenced revoke.
   - **`isOwner()`** compares its version with the lowest.
   - **`token()`** returns its `lease_version`.
-- **`LeaseElection(session, topic, name)`.**
+- **`LeaseElection(session, watch, name)`.**
   - **`campaign(value)`** is a mutex `lock` with the value as the row.
   - **`proclaim(value)`** is a fenced `Put`+`update`.
   - **`resign()`** is a revoke.
-  - **`leader()`** returns the lowest version under `name/`.
-  - **`observe()`** watches `name/` (the handoff rule) and reports each change of the lowest.
+  - **`leader()`** returns the lowest version under `name/`, from the watch.
+  - **`observe()`** reports each change of the lowest, from the watch.
+  - At-risk behaviour is in §12.2.
 - **A single-slot lock.** A key that is the lock itself, with no waiters (`acquire slot` → `KeyExists`), is etcd's
   `TryLock` with no queue. Herald's fenced workers use that form (§19.4).
 
@@ -861,15 +1089,28 @@ These are client recipes over a one-partition lease topic keyed by `path string(
 
 - **Subscribing.** `client.subscribe(topic, AllPartitions{}, opts.filter(...), h)` on a lease topic delivers
   `Granted`, `Updated`, `Revoked` and `Expired`; `Checkpoint` is dropped.
-- **`LeaseWatch<T>`** dispatches those four.
-- **`LeaseWatch<T>::startFromNow()`** gives the exact handoff, per partition:
-  1. scan pages 1..n, where page *i* covers `(resume_{i−1}, resume_i]` at `asOf_i`;
-  2. subscribe from `asOf_1`;
-  3. apply a record at offset *o* on key *k* only if `o ≥ asOf(page covering k)`.
-
-  Leases are identified by `(key, lease_version)`. A `Granted` already held from the scan is the same lease, and an
-  end for an unknown `(key, version)` is ignored. Subscribed records are buffered, within the watch's preallocated
-  capacity, until the scan ends.
+- **`LeaseWatch<T>`** dispatches those four. An untyped `LeaseWatchBase` serves sessions and recipes.
+- **`LeaseWatch<T>::startFromNow(prefixes[], done, token)`** gives the exact handoff, per partition (R2):
+  1. **Scan.** For each prefix, scan pages 1..n. Page *i* covers the hash range `(h_{i−1}, h_i]` (`h_0` = below
+     every hash; the last page reaches the top), at `asOf_i`. `asOf` is exclusive (§8.3).
+  2. **Subscribe** from the minimum `asOf` over all pages of all prefixes.
+  3. **Apply** a record at offset *o* on key *k* only if *k* matches a prefix and `o ≥ asOf(page covering h(k))`, in
+     that prefix's scan. Rule 3 is over hash ranges, never key order.
+- **Several prefixes (Coordinator's call).** The watch first drops every prefix that extends another one in the list
+  (`a/b/` under `a/`). Two path prefixes are then either nested, which was removed, or disjoint, so every key is
+  covered by at most one scan. A Consumer with several filters therefore makes one scan per distinct prefix and one
+  subscription.
+- **Identity.** Leases are identified by `(key, lease_version)`. A `Granted` already held from the scan is the same
+  lease, and an end for an unknown `(key, version)` is ignored.
+- **Buffering and overflow (Coordinator's call).** Records that arrive during the scan are buffered within the
+  watch's preallocated capacity (`LeaseWatchOptions.handoffBuffer`, default 4096 records).
+  - On overflow, the watch does not drop or re-scan. It cancels the subscription and keeps its cursor, which is the
+    offset after the last buffered record.
+  - When the scan ends, it applies the buffer and re-subscribes from that cursor. The log holds the records, so
+    nothing is lost.
+  - `rune_client_lease_watch_handoff_resubscribes_total` counts these.
+- **Ready.** `LeaseWatchReady` completes once every page is scanned and the buffer is applied.
+- **Breaks.** On any later break, the watch re-runs `startFromNow` (§3.3).
 - **No op filter in v1.**
 
 ## 13. The Rune-backed discovery library (deliverable)
@@ -885,17 +1126,34 @@ These are client recipes over a one-partition lease topic keyed by `path string(
     poll model.
   - Events go to the existing `ServiceCache` through its existing `update` / `remove` calls, so the cache's
     concurrency is unchanged.
-- **Caller-supplied client (proposed change, from Herald spec 02 §12.4; Coordinator's call, for owner review).**
-  `create` also accepts an existing Rune `Client` that the caller already drives.
-  - The library then creates no client and runs no thread of its own. It exposes a `doWork(nowNs)` agent that the
-    caller polls from the loop that drives the client, and it uses that client's `LeaseSession` and subscriptions.
-  - The client must already be logged in to the discovery topic's namespace with that topic's grants (§14.1). The
-    library never logs in or out on it.
+- **Caller-supplied client (proposed change, from Herald spec 02 §12.4; Coordinator's call, for owner review;
+  made buildable in rev 4, R6).** `create` also accepts an existing Rune `Client` that the caller already drives.
+  - **No thread, no blocking.** The library creates no client and runs no thread of its own. It exposes a
+    `doWork(nowNs)` agent that the caller polls from the loop that drives the client. Today's blocking steps become
+    async state machines inside `doWork`, built on §12.1's completions:
+    - the constructor's 30× retry with backoff (now a retry state with a deadline on `nowNs`);
+    - the grant and re-registration;
+    - the load-report update;
+    - the watchdog's point read (an async `get`);
+    - the Consumer's scan and subscribe (`LeaseWatch::startFromNow`);
+    - `stop()`'s revoke.
+  - **Its own session.** The library owns its **own** `LeaseSession` and `LeaseWatch` on the supplied client, and
+    keeps no reference to any session of the caller's. The caller's other sessions on the same client are unaffected
+    (§12.2).
+  - **Stop.** `stopAsync()` starts the stop: it cancels keepalives, revokes the registration fenced, and closes the
+    subscription. `isStopped()` turns true when every step has completed or timed out. Destroying the library before
+    `isStopped()` is a precondition violation, and debug builds assert on it. The `RuneEndpoint` form keeps today's
+    blocking `stop()` and `~Producer()`.
+  - **Lifetime.** The client must outlive the library. The caller stops the library (`stopAsync()`, then poll until
+    `isStopped()`) before it closes the client.
+  - **Login and grants.** The client must already be logged in to the discovery topic's namespace with that topic's
+    grants (§14.1). The library never logs in or out on it.
   - Events still reach `ServiceCache` through `update` / `remove`, so the cache's concurrency is unchanged.
-  - Why: a Herald process already runs a Rune client on its RuneAgent thread, so it needs no second client, thread
-    or session for discovery. The `RuneEndpoint` form stays for processes with no Rune client (the legacy game
+  - **Why.** A Herald process already runs a Rune client on its RuneAgent thread, so it needs no second client,
+    thread or session for discovery. The `RuneEndpoint` form stays for processes with no Rune client (the legacy game
     services).
-  - Tests: the `DiscoveryIntegrationTest` suite runs in both forms.
+  - **Tests.** The `DiscoveryIntegrationTest` suite runs in both forms. In the caller-supplied form, a test asserts
+    that no call blocks: a stub transport that never answers, with a hard `doWork` iteration cap.
 - **Behaviour.** It implements exactly the §3 tables: the incarnation key and newest-incarnation selection (DG2),
   typed values (DG3), the `ttl/3` keepalive (DG5), `onLost` re-registration (DG6), the watchdog point read, fenced
   load-report updates, a blocking revoke in `stop()`, and re-scan on every subscription break.
@@ -906,8 +1164,10 @@ These are client recipes over a one-partition lease topic keyed by `path string(
   least-loaded.
   - New cases cover: restart within the TTL (DG2), a lost lease mid-load-report, a partition-leader failover during
     registration, and a consumer that started from a compacted log.
-- **Herald cutover.** It is a Herald task. `main.cpp` builds a `RuneEndpoint` from the environment, and nothing else
-  changes (§3.5).
+- **Herald cutover.** It is a Herald task.
+  - **The legacy chat server** (§3.5): `main.cpp` builds a `RuneEndpoint` from the environment, and nothing else
+    changes.
+  - **The Herald 02 runtime** (§19.1): it uses the caller-supplied-client form on its RuneAgent thread.
 
 ## 14. Security, namespaces and limits
 
@@ -918,6 +1178,11 @@ These are client recipes over a one-partition lease topic keyed by `path string(
 | grant, update, revoke, `LeaseKeepAlive` | `WRITE` on the topic |
 | `getViewRow`, `ScanLeases`, `LeaseTimeToLive`, `show lease(s)`, subscribe | `READ` on the topic |
 | `Expire`, `Checkpoint` | nobody: broker only |
+| a discovery `Producer` | `WRITE` **and** `READ` on the discovery topic: its watchdog reads the lease view with `getViewRowK` (R11) |
+| a discovery `Consumer` | `READ` |
+
+Herald 02 gives `herald-pool`, the Wardstone sidecar's principal, `READ` as well as `WRITE` on `herald-sys/discovery`
+(R11).
 
 - **Fencing.** It uses the version only. `lease_holder` is informational and unauthenticated.
 - **No takeover (owner).** No operation ends or replaces a live lease without its version. A principal with `WRITE`
@@ -956,7 +1221,8 @@ These are client recipes over a one-partition lease topic keyed by `path string(
   - replication is unchanged (there is no follower shadow).
 - **Keepalive.** No disk, no replication, no allocation. One ring hop in, one lookup, one re-link, one ring hop out.
 - **Grant.** One scratch-copy patch (< 1 µs p50 for ≤ 4 KiB, as checked-writes §6.4).
-- **Updates and revokes** cost a checked-writes `update` plus the `lastAppended` store, and stay zero-copy.
+- **Updates** cost a checked-writes `update` plus the `lastAppended` store, and stay zero-copy. **Revokes** add one
+  grant-sized re-encode from the lease view (R9).
 - **Expiry and checkpoints** run off the produce path, on the leader's worker, in bounded batches.
 - **Budgets (gates).**
   - keepalive request→response p99 < 50 µs end-to-end on a single node, the point-read budget;
@@ -997,7 +1263,9 @@ All tests follow `docs/testing.md`:
   - Arm, re-arm, cancel and cascade at every boundary of all five levels (0, 1, 1023, 1024, 1025 ticks per level).
   - `MaxLeaseTTL` and `+1`.
   - Poll returns exactly the due set.
-  - The entry state machine `Armed` ↔ `Clearing`, `Armed` → `Emitting`, with demotion from each state.
+  - The entry state machine `Armed` ↔ `Clearing`, `Armed` ↔ `Checkpointing`, `Armed` → `Emitting`, with demotion
+    from each state. No `Expire` or checkpoint is built outside `Armed` (R4).
+  - Saturating deadlines at `INT64_MAX − ttl` and with `max_ttl + extend` (R11).
   - Chunked growth, and zero allocations after the high-water mark.
 - **Judgment table (§7.2).** Every record kind × absent, equal, different and at-capacity, asserting the code and the
   resulting row, including `remaining`.
@@ -1007,13 +1275,18 @@ All tests follow `docs/testing.md`:
   - Version stamping over batch sizes 1, 2 and 1000, with the CRC valid after the patch.
   - The `upsert` refusal.
   - `lastAppended` for every touched key.
-  - The in-window retry and the known-old duplicate.
+  - The in-window retry, and the known-old duplicate of each op (§6.3's table).
+  - `lastAppended` is set by updates and revokes, never by grants (R8).
+  - Revoke re-encoding: the full row from the lease view, the CRC valid, `Throttled` behind an unfolded update (R9).
+  - A lease key of 17 and 128 bytes accepted; 129 refused; a non-lease topic still refuses 17 (R1).
 - **Keepalive (§8.1), table-driven over every state row.**
   - Not leader, not `Ready`, no read lease.
   - `RejectAll`, `ReadOnly`.
   - Absent, wrong version.
-  - `Armed` with and without a checkpoint.
-  - Due, `Emitting`, `Clearing`.
+  - `Armed` with and without a checkpoint; `Checkpoint(0)` behind a closed gate (not `Ready`, an update in the tail).
+  - Due, `Emitting`, `Clearing`, `Checkpointing`.
+  - A batch with entries answered at once and parked entries answered later, each by `index`, the last `final = 1`.
+  - Topic dropped with parked entries: `UnknownTopic`.
   - A full park table.
   - Parked then folded, parked then demoted.
 - **Checkpoints.**
@@ -1027,13 +1300,27 @@ All tests follow `docs/testing.md`:
 - **Predicates.**
   - `isTombstone` and `isLeaseControl` at every §6.6 site.
   - A golden corpus for non-lease topics.
-- **Cleaner.** It keeps the data row plus the latest same-version checkpoint, drops checkpoints of ended or
+- **Emitter append (§9.1).** Producer fields −1, timestamps 0, the CRC valid after the base-offset and epoch
+  restamp, nothing appended on `kAppendMinIsr` and the entry still due, the emitter stopping on `kAppendNotLeader`.
+- **Cleaner.** It reads `lease_version` at value bytes `[4, 12)` across schema versions, and keeps the data row plus
+  the latest same-version checkpoint, drops checkpoints of ended or
   re-granted leases, and a rebuild after cleaning equals one before it.
 - **`ScanLeases` and the handoff rule** over a seeded churn log: scan + subscription = a fresh fold.
+  - Hash-order pages, hash ties within one page, and resume across a leader change and a table grow.
+  - The prefix filtered on the broker.
+  - Exclusive `asOf`.
+  - Several prefixes, nested and disjoint.
+  - Handoff-buffer overflow, then re-subscribe from the cursor, with nothing lost or duplicated.
 - **QL, DDL and catalog.** Every form and setting, the refusals, and replay creating both objects.
 - **`LeaseSession`, `LeaseMutex`, `LeaseElection` with a stub transport.**
   - Cadence `ttl/3`, and batching per partition.
-  - `onLost` on each trigger, `onAtRisk` before the margin.
+  - `onLost` on each trigger; `onAtRisk(Entered)` at `t + ttl/2` for each cause (error, timeout, missing reply,
+    disconnect, park), then `Cleared` on a late `Ok`; `maxDelay` validation.
+  - The produce deadline: at `Entered`, the pending and unsent produces of bound producers fail with `LeaseAtRisk`,
+    and nothing is re-sent until `Cleared` (R5).
+  - One session over two topics and 8 partitions, batching per `(topic, partition)` (R7).
+  - Recipes sharing one `LeaseWatch`; `name/<sessionId>-<campaignNo>` keys; a `VerdictUnknown` grant adopted or
+    re-campaigned.
   - Mutex ordering by version, `waitDeletes` on the predecessor only, `tryLock` cleaning up its key.
   - Election `observe` reporting each leader change once.
 
@@ -1047,7 +1334,13 @@ All tests follow `docs/testing.md`:
 - **Checkpoint clear racing a leader kill.** `Checkpoint(0)` appended, the leader killed before it commits: the
   keepalive is not acknowledged, and the new leader arms from the old checkpoint. Then the same with the checkpoint
   committed.
-- **Promotion (3-node).** No `Expire` before `P + extend + R`, and every abandoned lease ended by the §9.6 bound. Run it
+- **Promotion keeps the old leader in the ISR (3-node, R3).** A move under read-lease A.8 with the old leader's last
+  keepalive acknowledged after the `LeaderChange` but before its fetch at the new epoch: no `Expire` before that
+  ack plus the TTL.
+- **Checkpoint in flight (R4).** A keepalive between `Checkpoint(R)`'s append and its fold parks, then clears. A later
+  leader never arms at `T_ready + extend + R` for that lease.
+- **Contending grants (R8).** A stream of `KeyExists` grants on a due key does not defer its `Expire`.
+- **Promotion (3-node).** No `Expire` before `T_ready + extend + R`, and every abandoned lease ended by the §9.6 bound. Run it
   with and without checkpoints.
 - **Whole-cluster restart.** A 24 h one-shot lease checkpointed at 5 min keeps its remaining time ±1 interval, driven
   with an injected clock. A 400-day lease ends on time after three restarts.
@@ -1072,6 +1365,10 @@ All tests follow `docs/testing.md`:
     (DG2);
   - a Rune partition-leader failover during all of this.
 - **Session scale.** 10 000 leases via `LeaseSession`, the process killed, `Expired` delivered by the bound.
+- **Caller-supplied discovery client (R6).** A Herald-shaped agent drives one client with a Producer, a passive
+  Consumer and 2 000 elections on one shared watch. `stopAsync()` reaches `isStopped()` with no blocking call.
+- **Produce deadline (R5).** A guarded producer with sends in flight, its lease's leader partitioned: after
+  `Entered`, no record of that producer is appended later than `Entered + d`.
 - **Election.** Two `LeaseElection` campaigners: the leader is SIGSTOPped past the TTL, the other leads with a higher
   token, and the first wakes, gets `onLost`, and its guarded write is refused.
 
@@ -1097,6 +1394,13 @@ Runs: `--repeat until-fail:20`, and once under `-j` load.
 ### 16.5 Mutation checks (each turns a test red)
 
 - arm a promoted key without `extend`;
+- arm a promoted key at the refold time instead of `T_ready`;
+- drop the `Checkpointing` state (a keepalive during an in-flight checkpoint answered `Ok` at once);
+- let a grant set `lastAppended`;
+- send a revoke without the broker re-encode (a filtered watcher misses the end);
+- answer a known-old update duplicate `kErrLeaseNotFound` while its version is live;
+- re-send a guarded producer's request after `onAtRisk(Entered)`;
+- order `ScanLeases` by the per-node probe seed (resume breaks across a leader change);
 - arm at `ttl` ignoring the checkpoint, or at the checkpoint ignoring a later clear;
 - answer a keepalive before `Checkpoint(0)` folds;
 - serve a keepalive without the view-read lease;
@@ -1149,6 +1453,7 @@ topics are reached through ordinary sessions, and §19.4 stands. The analysis is
 - Revoke-by-holder.
 - Binding the holder to the principal.
 - Fenced writes to other topics.
+- An ordered secondary index on the lease view, so `ScanLeases` pages cost O(page) rather than O(n) (§8.3).
 - Aggregates over multi-partition lease topics.
 
 ## 19. Herald examples (doc 00 §13, "Leases: purpose and uses")
@@ -1160,16 +1465,32 @@ topics are reached through ordinary sessions, and §19.4 stands. The analysis is
 | presence | none: `<tenant>/herald.presence` is a plain compacted topic fenced by the tenant epoch | §19.3 |
 | worker fencing | `herald-sys/herald.workers` single-slot locks | §19.4 |
 | auto-dissolve | none: the tenant's active instance, in memory, from `emptySinceNs` | §19.5 |
-| deadlines with an expiry event (sanction and strike expiry, idempotency, appeal tokens) | one-shot long leases with checkpoints | §19.6 |
+| deadlines with an expiry event (sanction and strike expiry, appeal tokens, the tenant delete grace) | one-shot long leases with checkpoints | §19.6 |
+| short holds (invites, case claims, rate limits) | short leases, no checkpoints | §19.6 |
+| server-API idempotency | none: `<tenant>/herald.api.idempotency` is a plain swept topic (Herald F7) | §19.6 |
 
 Deadlines that need only read-time enforcement are instead `expiresAt` rows cleaned by Herald's `retention-sweep`
 worker; friend requests are one (§19.6). Herald spec 02 chooses per object.
 
 ### 19.1 Discovery
 
-This is §3.5 in full: chat servers are `Producer`s on `herald-sys/discovery`, and the coordinator lookup is a
-`Consumer` with `sharedService("COORDINATOR_SERVICE")`. Load: a few hundred registrations, with keepalives at 5 s,
-which is trivial.
+Two users, both on `herald-sys/discovery` (Coordinator's call, R10):
+- **The legacy chat server** is §3.5: chat servers are `Producer`s, and the coordinator lookup is a `Consumer` with
+  `sharedService("COORDINATOR_SERVICE")`. This is the parity target.
+- **The Herald 02 runtime** (Herald 02 §8.1, §8.4):
+  - **Producers.** Every Herald process is a `Producer` at
+    `herald/<region>/_shared/<SERVICE>/<podName>/<incarnation>`. The services are `HERALD_GATEWAY` (its uri is the
+    pod's route), `HERALD_WORKER`, `HERALD_MODERATION`, `HERALD_AUDIT`, `HERALD_SAFETY` and `HERALD_PROVISIONER`.
+    Gateways report their session count as `load` every 5 s.
+  - **Consumers, all passive** (the library opens no connections):
+    - gateways watch `HERALD_GATEWAY` and the Wardstone pools of their tenants (`sharedService("wardstone-<poolId>")`);
+    - each worker-type process watches its own deployment, for rendezvous assignment.
+  - **One client.** Each process uses the caller-supplied-client form (§13) on its RuneAgent thread. It runs no
+    library thread and no second client. The library owns its own `LeaseSession` and `LeaseWatch` on that client.
+  - **The `herald-pool` sidecar.** Each Wardstone instance runs a small registration sidecar, a `Producer` as the
+    `herald-sys/herald-pool` principal, at `herald/<region>/_shared/wardstone-<poolId>/<instanceNo>/<incarnation>`. It
+    uses the `RuneEndpoint` form and holds `READ` + `WRITE` on discovery (§14.1).
+  - **Load.** A few hundred registrations, with keepalives every 5 s, which is trivial. Every path fits in 128 bytes.
 
 ### 19.2 Leadership
 
@@ -1178,9 +1499,15 @@ lease topic 'herald-sys/herald.elections' { path string(96), value string(64) }
       partitions 1 replicas 3 key path with (lease.ttl = 10000);
 ```
 
-- **Electing a leader.** `LeaseElection(session, topic, "transparency-report").campaign(myNodeId)` runs on each
-  candidate. The leader works with `token()` as its fencing token, stamped into every row it writes.
-- **Stepping down.** On `onAtRisk` it stops at once.
+- **Names.** Herald 02 uses `tenant/<nsId>` (the tenant lease: one active instance per tenant) and
+  `singleton/<role>`. Every gateway watches the whole topic with **one** `LeaseWatch` shared by all its elections
+  (§12.3), about 2 000 per gateway.
+- **Electing a leader.** `LeaseElection(session, watch, "singleton/transparency-schedule").campaign(podName)` runs on
+  each candidate. The leader works with `token()` as its fencing token, stamped into every row it writes.
+- **Stepping down.** On `onAtRisk(Entered)` it stops at once. The client fails the pending produces of its guarded
+  producers (§12.2, R5). Herald then revokes and campaigns with a new key (Herald F1).
+- **Failover time.** If the old leader died without a revoke, the standby wins only when the broker expires the old
+  key: about `a + ttl`, or `T_ready + extend + ttl` across a Rune leader change (§12.2).
 - **Rejecting a stale leader.** Readers of its output keep the highest token, so a paused ex-leader's late write is
   ignored.
 
@@ -1202,24 +1529,35 @@ Herald presence uses no lease (Coordinator's call, from Herald spec 02 §12.4 an
 ```sql
 lease topic 'herald-sys/herald.workers' { slot uint64, tenant string(64), role uint16, holderInfo string(64) }
       partitions 8 replicas 3 key slot with (lease.ttl = 10000);
-create topic 'herald-sys/herald.idslots' { slot uint64, highWater uint64, epoch int64 } key slot with (key.index = on);
+create topic 'herald-sys/herald.idslots' { id string(16), slot uint64, epoch int64, highWater uint64, fencingToken int64 }
+      partitions 1 replicas 3 key id with (key.index = on);   -- id = slot (u64 big-endian) ‖ epoch (i64 big-endian)
+create view 'herald-sys/herald.idslots_by_slot' key (slot, epoch) as select highWater, fencingToken
+      from 'herald-sys/herald.idslots';                         -- scan by slot (Herald 02 owns the name)
 ```
 
-- **The slot and the lock.** `slot = nsId << 16 | role`. Rune never reuses an `nsId`. Each Herald process `grant`s the
+- **The slot and the lock (Herald's formula, B28; Coordinator's call, R10).** `slot = nsId << 16 | roleId`, with
+  `roleId = role << 8 | partition` (up to 256 partitions per role). The `role → u8` table lives in Herald 02. Rune
+  never reuses an `nsId`. Each Herald process `grant`s the
   slots rendezvous hashing assigns it. This is a single-slot lock (etcd `TryLock`, §12.3), where `KeyExists` means
   someone holds it.
 - **Fencing writes.** The worker writes with `version` as its fencing token.
 - **Handing a slot back.** On a membership change it hands the slot back with a fenced revoke, so the next owner
   grants at once.
-- **Minted ids stay unique (doc 00 §13 "Minted ids"; Coordinator's call).**
-  - Each minter has its own row in `herald.idslots`, so two minters never collide.
-    - The tenant's active instance uses `slot = nsId << 16` (role 0, which no worker uses). Its `epoch` is the
+- **Minted ids stay unique (doc 00 §13 "Minted ids"; Coordinator's call, F3).**
+  - **One row per minter and epoch.** `herald.idslots` is keyed `(slot, epoch)`.
+    - The tenant's active instance uses `slot = nsId << 16` (roleId 0, which no worker uses). Its `epoch` is the
       tenant epoch (§19.2).
-    - A fenced worker that mints uses its own `herald.workers` slot (`nsId << 16 | role`). Its `epoch` is the
-      worker's `version`. Worker-minted ids set the top bit, so they never meet the active instance's ids.
-  - A row keeps a high-water mark, advanced by a checked `update` that carries the minter's `epoch`.
-  - A new holder resumes above it.
-  - It lives in a plain keyed topic, not in the lease row, because a lease row is deleted when the lease ends.
+    - A fenced worker that mints uses its own `herald.workers` slot (`nsId << 16 | roleId`). Its `epoch` is the
+      worker's `lease_version`. Worker-minted ids set the top bit, so they never meet the active instance's ids.
+    - The value column `fencingToken` is the epoch the row was written under, so a reader checks a row without
+      decoding the key.
+  - **Starting.** A new minter scans `idslots_by_slot` for its slot, starting above the largest `highWater` over
+    every row of that slot. It then inserts its own row `(slot, epoch)`, which is always new.
+  - **Reserving.** It advances its own row's `highWater` with checked `update`s, and never mints past it.
+  - **A stale minter** can only touch its own `(slot, oldEpoch)` row, so it can never lower or overwrite the new
+    minter's. Herald 02 §5.2 gives the argument that every id the old minter used is below the new floor.
+  - **Where it lives.** A plain keyed topic, not the lease row, because a lease row is deleted when the lease ends.
+    Old epochs' rows are swept by Herald.
 - **Scale.** 4 000 slots kept alive at 3.3 s is about 1 200 keepalive entries/s.
 
 ### 19.5 Auto-dissolve
@@ -1236,15 +1574,21 @@ Herald auto-dissolve uses no lease and no worker (Coordinator's call, from Heral
 ### 19.6 Deadlines with an expiry event
 
 ```sql
-lease topic 'acme/herald.api.idempotency' { h uint64, requestHash uint64, status uint16 }
-      partitions 2 replicas 3 key h with (lease.ttl = 86400000);                    -- 24 h, checkpointed
+lease topic 'herald-sys/herald.tenant-delete-grace' { nsId uint32 }
+      partitions 1 replicas 3 key nsId with (lease.ttl = 604800000);                -- 7 d, checkpointed
 lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
       partitions 1 replicas 3 key sanctionId with (lease.ttl = 34560000000);        -- default 400 days; each grant
                                                                                     -- passes the remaining duration
 ```
 
-- **One-shot leases.** An idempotency key or a sanction's expiry is granted once and never kept alive. Herald uses
-  them for sanction and strike expiry, server-API idempotency and appeal tokens (Herald spec 02 §6).
+- **One-shot leases.** A sanction's expiry is granted once and never kept alive. Herald uses them for sanction and
+  strike expiry, appeal tokens and the tenant delete grace (Herald spec 02 §6).
+- **The tenant delete grace (Coordinator's call).** `herald-sys/herald.tenant-delete-grace`, keyed `nsId`, is
+  written by the provisioner (`herald-provisioner`: `WRITE` + `READ`).
+  - A delete request grants it with a 7 d TTL.
+  - `CancelDeleteTenant` revokes it, fenced.
+  - Its `Expire` reaches the provisioning singleton, which re-checks holds before it deletes the namespace.
+  - It is checkpointed, so a Rune leader change makes it late by at most `extend + one interval`.
 - **Ending early.** Lifting or superseding a sanction is a fenced revoke.
 - **Ending on time.** Otherwise the `Expire` carries the lapse to every consumer, with no sweeper.
 - **Revoke versus expiry.** They race in the log, and exactly one wins (§9.3).
@@ -1252,9 +1596,13 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 - **Cost.** One checkpoint per 5 min per lease, compacted to one per lease.
 - **Short holds.** Short invites and moderation holds (30 s – 30 min) are the same pattern without checkpoints (TTL ≤
   interval).
-- **Not leases (Coordinator's call, from Herald spec 02 §12.4).** Friend requests are `herald.social.requests` rows
-  with `expiresAtNs`, checked at read time and removed by `retention-sweep`: nothing needs an event when one lapses.
-  Herald's report quota is a plain compacted row, also not a lease.
+- **Not leases (Coordinator's call, from Herald spec 02 §12.4).**
+  - Friend requests are `herald.social.requests` rows with `expiresAtNs`, checked at read time and removed by
+    `retention-sweep`: nothing needs an event when one lapses.
+  - Herald's report quota is a plain compacted row.
+  - **Server-API idempotency (Herald F7, rev 4)** is a plain swept topic `<tenant>/herald.api.idempotency` with
+    `key.index` and a view. Its row holds a response hash and the `(partition, offset)` of the stored response
+    record (≤ 8 KiB). Herald 02 §6.2 owns the columns. Rev 3's lease-based idempotency topic is removed.
 
 **Requirements from the Herald program.**
 
@@ -1264,7 +1612,7 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 | 2 | a max TTL of at least 400 days | `lease.max_ttl` up to 9 × 10⁹ s with checkpoints (§9.5, §10) |
 | 3 | tenant workers observe node-gone across namespaces | a `herald-sys` session plus tenant sessions (§17) |
 | 4 | one fenced worker per (tenant, role) at about 1 k × a few | §19.4 |
-| 5 | 1–30 s TTLs with a tight bound | 1 ms tick, the floor `1.5 × leaderHeartbeatTimeout`, ≥ 100 k expiries/s |
+| 5 | 1–30 s TTLs with a tight bound | 1 ms tick, the fixed 1 s `min_ttl` floor (R11), ≥ 100 k expiries/s |
 
 ## 20. Phases
 
@@ -1277,21 +1625,28 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
    - Tests: codec round trips; old sessions refused.
 2. **Catalog and DDL.**
    - `LeaseSpec`, the one-event topic and view, and the system columns.
-   - The settings, including the derived `min_ttl` floor.
+   - The settings, including the fixed `min_ttl` floor (R11).
+   - The 128-byte lease-key rule at every §5.1 site (R1).
    - QL.
    - Tests: the QL and DDL tables; replay.
 3. **Write hook.**
    - The refusals, the TTL raise, version stamping and `lastAppended`.
    - The known-old duplicate.
 4. **LeaseIndex judge.** The §7.2 table, member 0, partition-aligned instances, rebuild per leadership.
-5. **Predicates.** `isTombstone` and `isLeaseControl` at every site, plus the cleaner's checkpoint rule.
-6. **Wheels.** The five-level wheel, the entry state machine, chunked storage. `LeaseWheelBench`.
-7. **Expiry emitter.** The gate (with no suspension pause), `lastAppended`, the scratch, the append via
-   `PartitionReplica`.
-8. **Keepalive and TimeToLive serving.** The read-lease gate, the park table, `Checkpoint(0)` clearing, and demotion.
-9. **Checkpoints.** Scheduling, the rate and batch caps, rounding, promotion arming with `extend`.
-10. **Reads.** Point-read routing, `ScanLeases`, `READ`-on-topic.
-11. **C++ client.** `LeaseTopic`, `LeaseSession`, `LeaseWatch::startFromNow`.
+5. **Predicates.** `isTombstone` and `isLeaseControl` at every site, plus the cleaner's lease mode (the fixed
+   `lease_version` offset, the checkpoint map).
+6. **Wheels.** The five-level wheel, the four-state entry machine (with `Checkpointing`), chunked storage, saturating
+   deadlines. `LeaseWheelBench`.
+7. **Expiry emitter.** The gate (with no suspension pause, `Armed` only), `lastAppended`, the scratch, and the data
+   batch through `PartitionReplica::appendLeaseBatch` (§9.1).
+8. **Keepalive and TimeToLive serving.** The read-lease gate, the park table, per-entry answers, `Checkpoint(0)`
+   clearing through the gate, demotion and topic drop.
+9. **Checkpoints.** Scheduling, the rate and batch caps, rounding, and promotion arming at `T_ready + extend` in
+   chunks.
+10. **Reads.** Point-read routing, `ScanLeases` in hash order with broker-side prefix filtering, `READ`-on-topic.
+11. **C++ client.** The async `LeaseTopic` API and its `OpKind`s, the 128-byte lease `SEND_RECORD` form, the untyped
+    `LeaseSession` with `onAtRisk` and the produce deadline (R5), and `LeaseWatch::startFromNow` with the hash-range
+    handoff.
 12. **Integration, e2e, stress and mutation checks** (§16.2–§16.5).
 
 ### Phase 2: recipes, limits, operations
@@ -1304,8 +1659,9 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 
 ### Phase 3: the Rune-backed discovery library (deliverable)
 
-1. A `RuneEndpoint` and the Rune transport for `Producer` (incarnation keys, `LeaseSession`, the watchdog, load
-   updates, `stop()`).
+1. A `RuneEndpoint` and the Rune transport for `Producer`, in both forms (`RuneEndpoint`, and the caller-supplied client
+   with `doWork`, `stopAsync()` and `isStopped()`): incarnation keys, its own `LeaseSession`, the watchdog, load
+   updates, `stop()`.
 2. The Rune transport for `Consumer` (scan + subscribe, newest-incarnation selection, re-scan on break). The
    `ServiceCache` path is unchanged.
 3. `DiscoveryIntegrationTest` against a real Rune broker, plus the DG2 and failover cases.
@@ -1338,7 +1694,12 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 **Timings:**
 - sequential, and back-to-back before the ack;
 - a keepalive, update or revoke at each of the four points around an `Expire`;
-- a keepalive while `Clearing`, while `Emitting`, and while due-not-emitted;
+- a keepalive while `Clearing`, while `Checkpointing`, while `Emitting`, and while due-not-emitted;
+- contenders' grants on a due key;
+- a revoke back-to-back behind its own update;
+- a known-old duplicate of each op;
+- a handoff-buffer overflow mid-scan;
+- `onAtRisk` with guarded produces pending and unsent;
 - a leader change with an `Expire` or a `Checkpoint(0)` uncommitted, committed-not-folded, or folded;
 - a leader change between a grant and its ack, and mid-scan;
 - a leader partitioned but not yet deposed (a zombie);
@@ -1357,13 +1718,21 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 | `upsert` × any | `InvalidRequest` |
 | keepalive × `Armed`, checkpoint set | `Checkpoint(0)` folds before `Ok`; the deadline is `now + ttl` |
 | keepalive × due, not yet emitted | parked; `kErrLeaseNotFound` after the `Expire` folds |
+| keepalive × `Checkpointing` | parked; `Checkpoint(0)` after `Checkpoint(R)` folds; `Ok` after the clear folds |
+| keepalive batch × some entries parked | the decided entries answered at once; each parked one later by `index` |
+| drop topic × parked keepalives | `UnknownTopic`; `onLost(TopicDropped)` |
+| grant × due key, repeated | `KeyExists` each time; the `Expire` is not deferred |
+| revoke × unfolded update of the same key | `Throttled` (1 ms), then accepted with the full row |
+| known-old duplicate × grant / update / revoke | `VerdictUnknown` / `Ok` if live, else `kErrLeaseNotFound` / `kErrLeaseNotFound` |
+| `onAtRisk` × guarded producer | pending and unsent produces fail with `LeaseAtRisk`; nothing re-sent until `Cleared` |
+| local `onLost` × election | no leader until the broker's deadline (`a + ttl`, or `T_ready + extend + ttl`) |
 | keepalive × zombie leader | `NotLeader` (no read lease) |
 | keepalive × `RejectAll` | `NamespaceSuspended`; the lease ends within TTL + bound |
 | keepalive × `ReadOnly` | `Ok` |
 | update × live lease | columns replaced; the deadline unchanged; it expires on schedule if not kept alive |
 | revoke × due | blocks the `Expire` until the revoke folds; one end |
-| promotion × checkpoint set | armed at `P + extend + remaining` |
-| promotion × checkpoint cleared and the clear folded | armed at `P + extend + ttl` |
+| promotion × checkpoint set | armed at `T_ready + extend + remaining` |
+| promotion × checkpoint cleared and the clear folded | armed at `T_ready + extend + ttl` |
 | promotion × `Checkpoint(0)` truncated | armed from the old checkpoint; that keepalive was never acknowledged |
 | whole restart × 400-day lease | ends late by at most `extend + interval` |
 | TTL 0 or below `min_ttl` × grant | raised to `min_ttl`; the ack carries it |
@@ -1384,7 +1753,8 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 2. **Discovery parity.** Check every row of §3 against the library's source and tests. DG1–DG9 must be the complete
    list of observable differences.
 3. **Never early.** Keepalives are acknowledged only under the view-read lease. Promotion arms at
-   `extend + (remaining or ttl)`. A keepalive after a checkpoint is answered only after `Checkpoint(0)` folds. Nothing
+   `T_ready + extend + (remaining or ttl)`, and §9.2's causal argument covers a move under A.8. No keepalive is
+   answered `Ok` while a checkpoint is in flight (`Checkpointing`). A keepalive after a checkpoint is answered only after `Checkpoint(0)` folds. Nothing
    compares clocks across nodes.
 4. **Expiry never pauses** in any namespace state. The broker's appends bypass the suspension refusal.
 5. **No takeover.** No path ends or replaces a live lease without its version: no `upsert`, no plain delete, no force
@@ -1396,7 +1766,8 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 8. **Predicate blast radius.** `isTombstone` and `isLeaseControl` at every site, unchanged for non-lease topics.
 9. **No stall.** §9.7.
 10. **Zero alloc, no virtual calls.** The wheels, the park table, the scratch, `LeaseSession`'s functors.
-11. **Vacuous tests.** Each §16.5 mutation turns a test red, and the stress invariants are checked after every step.
+11. **Widths and orders.** Every §5.1 key-width site, and `ScanLeases`' hash order with its O(n) cost.
+12. **Vacuous tests.** Each §16.5 mutation turns a test red, and the stress invariants are checked after every step.
 
 ## Appendix A. Deferred: transient lease topics
 
