@@ -1186,6 +1186,12 @@ public:
     /// constructing thread) — e.g. for its non-blocking beginRefresh / pollRefresh.
     /// Any other thread: std::logic_error (every runner mode).
     CatalogReader& catalogReader();
+    /// The view and constraint a rejection's constraintId names (WriteResult::constraintId, BatchVerdicts), from the
+    /// cached catalog and, on a miss, from one refresh of catalogReader() bounded by `refreshTimeout` (the default is
+    /// kConstraintNameRefreshTimeout); nullopt for id 0 (the key index) and for ids no view definition ever had.
+    /// Dropped and replaced views still resolve.  Blocking like catalogHistory; owner thread only (std::logic_error).
+    std::optional<ConstraintName> constraintName(uint32_t constraintId);
+    std::optional<ConstraintName> constraintName(uint32_t constraintId, std::chrono::milliseconds refreshTimeout);
 
     // ---- Authentication (Task 8): security DDL and reads of `__security` ----------------------------------
     /// Every security DDL.  The VERIFIER is built here from the plan's password (D9: at least

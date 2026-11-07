@@ -6,6 +6,7 @@
 #include <rune/client/Client.h>
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/Key.h>
+#include <rune/client/WriteResult.h>
 #include <rune/client/codec/DataCodec.h>
 #include <rune/client/producer/ProducerHub.h>
 #include <rune/client/producer/ProducerImpl.h>
@@ -149,13 +150,26 @@ TEST(ProducerVerdictsRegression, CoalescedBatchWithOneBadRecordRegression) {
             EXPECT_EQ(c.status, OpStatus::BrokerError);
             EXPECT_EQ(c.errorCode, kViolation);
             EXPECT_EQ(rc::constraintIdOf(c), kCid);
-            EXPECT_EQ(c.value, -1);
+            EXPECT_EQ(c.value, 103);
         } else {
             EXPECT_EQ(c.status, OpStatus::Ok);
             EXPECT_EQ(c.value, 100 + int64_t(k) - 1);
         }
     }
     EXPECT_FALSE(r.impl.hasInFlight());
+}
+
+TEST(ProducerVerdicts, RejectedRecordCarriesItsOffset) {
+    Rig r;
+    r.send(8);
+    ASSERT_EQ(r.corrs.size(), 1u);
+    r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({3}));
+    const auto& c = r.cq.done[4];   // record index 3
+    EXPECT_EQ(c.value, 103);
+    const auto w = rc::WriteResult::fromCompletion(c);
+    EXPECT_EQ(w.offset(), 103);
+    EXPECT_EQ(w.code(), kViolation);
+    EXPECT_EQ(w.constraintId(), kCid);
 }
 
 // (The Tier-2 first-rejection contract changed with #802: see Tier2BatchReportsEveryRecordVerdictRegression.)
@@ -273,7 +287,7 @@ TEST(ProducerVerdictsRegression, UnhandledRejectedRecordDoesNotHideALaterRejecti
             EXPECT_EQ(c.status, OpStatus::BrokerError);
             EXPECT_EQ(c.errorCode, kViolation);
             EXPECT_EQ(rc::constraintIdOf(c), kCid);
-            EXPECT_EQ(c.value, -1);
+            EXPECT_EQ(c.value, 105);
         } else {
             EXPECT_EQ(c.status, OpStatus::Ok) << k;
         }
@@ -409,7 +423,7 @@ TEST(ProducerVerdictsRegression, OnAckCarriesConstraintIdRegression) {
     EXPECT_EQ(bad.errorCode, kViolation);
     EXPECT_EQ(rc::constraintIdOf(bad), kCid);
     EXPECT_EQ(bad.op, rc::OpKind::Send);
-    EXPECT_EQ(bad.value, -1);
+    EXPECT_EQ(bad.value, 101);
     EXPECT_EQ(cap.done[1].status, OpStatus::Ok);
     EXPECT_EQ(cap.done[1].value, 100);
     EXPECT_EQ(rc::constraintIdOf(cap.done[1]), 0u);
@@ -699,7 +713,7 @@ TEST(ProducerVerdictsRegression, OneRecordClaimAndTier2KeepSingleRecordSemantics
         r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({0}));
         const auto& c = r.cq.done[1];
         EXPECT_EQ(c.status, OpStatus::BrokerError);
-        EXPECT_EQ(c.value, -1);
+        EXPECT_EQ(c.value, 100);
         EXPECT_EQ(c.errorCode, kViolation);
         EXPECT_EQ(rc::constraintIdOf(c), kCid);
         EXPECT_EQ(c.reservedBytes, rc::producer::kAckRecordBytes);

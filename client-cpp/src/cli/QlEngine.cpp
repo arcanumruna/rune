@@ -1221,20 +1221,14 @@ std::expected<void, std::string> partitionRange(int32_t partitions, int32_t only
 
 }  // namespace
 
-std::string constraintLabel(const cat::ViewObject& v, uint16_t ordinal) {
-    if (ordinal == 0) return v.name + ".unique";
-    const auto plan = rune::view::deserializeAuthored(v.def.normalizedPlanBlob);
-    if (!plan || ordinal > plan->constraints.size()) return v.name + ".#" + std::to_string(ordinal);
-    return v.name + "." + plan->constraints[ordinal - 1].name;
+std::string constraintLabel(const std::optional<rc::ConstraintName>& name, uint32_t constraintId) {
+    if (name) return name->view + "." + name->constraint;
+    char hex[16];
+    std::snprintf(hex, sizeof hex, "0x%08x", constraintId);
+    return hex;
 }
 
-std::string constraintLabel(const cat::CatalogState& state, uint32_t constraintId) {
-    for (const cat::ViewObject* v : state.views())
-        if ((v->objectId & 0xFFFF) == (constraintId >> 16)) return constraintLabel(*v, static_cast<uint16_t>(constraintId & 0xFFFF));
-    return "constraint#" + std::to_string(constraintId);
-}
-
-std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c, const cat::CatalogState& state, const cat::TopicObject& t, int32_t only) {
+std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c, const cat::TopicObject& t, int32_t only) {
     int32_t from = 0, to = 0;
     if (auto r = partitionRange(t.partitions, only, from, to); !r) return std::unexpected(std::move(r.error()));
     std::vector<PartitionStats> out;
@@ -1242,7 +1236,7 @@ std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c
         auto r = c.getStatsAndWait(rpc::StatsScope::TopicPartition, t.topicId, p, kCatalogWait);
         if (r.status != rc::StatsResult::kOk) return std::unexpected(statsRefusal(p, r.status));
         PartitionStats ps{p, std::move(r), {}};
-        for (const auto& k : ps.result.constraints) ps.constraintLabels.push_back(constraintLabel(state, k.constraintId));
+        for (const auto& k : ps.result.constraints) ps.constraintLabels.push_back(constraintLabel(c.constraintName(k.constraintId), k.constraintId));
         out.push_back(std::move(ps));
     }
     return out;
@@ -1274,7 +1268,7 @@ std::expected<std::vector<PartitionStats>, std::string> viewStats(rc::Client& c,
             for (const auto& k : src.constraints) {
                 if ((k.constraintId >> 16) != (v.objectId & 0xFFFF)) continue;
                 ps.result.constraints.push_back(k);
-                ps.constraintLabels.push_back(constraintLabel(v, static_cast<uint16_t>(k.constraintId & 0xFFFF)));
+                ps.constraintLabels.push_back(constraintLabel(c.constraintName(k.constraintId), k.constraintId));
             }
         }
         out.push_back(std::move(ps));
@@ -1378,7 +1372,7 @@ bool QlRun::run(const PShowTopic& s, const rc::DdlOptions&) {
     const cat::TopicObject* t = broker.client().catalogReader().state().topicByName(cat::kDefaultNsId, s.name);
     if (t == nullptr) return fail("no topic '" + s.name + "'");
     out << formatTopicDefinition(*t);
-    const auto stats = showStatsText(topicStats(broker.client(), broker.client().catalogReader().state(), *t, -1));
+    const auto stats = showStatsText(topicStats(broker.client(), *t, -1));
     if (!stats) return fail(stats.error());
     out << *stats;
     return true;

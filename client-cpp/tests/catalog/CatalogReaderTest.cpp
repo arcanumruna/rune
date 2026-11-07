@@ -945,9 +945,10 @@ int foreignCalls(rc::Client& client, rc::CatalogReader& reader) {
     expectThrow([&] { (void)reader.beginRefresh(); });
     expectThrow([&] { (void)reader.pollRefresh(0, 0); });
     expectThrow([&] { (void)client.catalogHistory(rcat::HistoryFilter{}, std::chrono::milliseconds(10)); });
+    expectThrow([&] { (void)client.constraintName(0, std::chrono::milliseconds(10)); });
     return threw;
 }
-constexpr int kOwnerOnlyCalls = 9;
+constexpr int kOwnerOnlyCalls = 10;
 }   // namespace
 
 // RED (round 1): client.catalogReader(), events(), state(), stats() ran on any thread
@@ -1011,6 +1012,13 @@ TEST(CatalogReaderRegression, EveryAccessorRefusesAForeignThreadInThreadModeRegr
     expectCacheIs(reader, log);
     auto again = reader.refresh(std::chrono::seconds(5));
     EXPECT_TRUE(again.has_value()) << (again.has_value() ? "" : again.error().detail);
+}
+
+// A constraint id no view ever had misses the cache and refreshes the reader; with no answer inside the timeout it is none.
+TEST(CatalogReaderRegression, ConstraintNameMissWithoutACatalogAnswerIsNoneWithinTheTimeoutRegression) {
+    Rig r(invokerCfg(4056, 4057)); r.connect();
+    EXPECT_EQ(r.client.constraintName(0x00990001, std::chrono::milliseconds(50)), std::nullopt);
+    EXPECT_EQ(r.client.constraintName(0), std::nullopt);
 }
 
 // ---- Adversarial review of batch C9 (#600): the sink-partition rule on every view-definition entry point. ----

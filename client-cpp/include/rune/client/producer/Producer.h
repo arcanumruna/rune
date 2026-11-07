@@ -841,7 +841,7 @@ public:
     /// bytes without View, or for n == 1), so a verdict list never overflows the queue; a claim whose completion record cannot
     /// fit one queue record (an eighth of the queue's capacity), or whose reservation exceeds Completions::maxReservation(),
     /// returns MessageTooLarge with nothing reserved (4096 records fit a default queue).
-    /// A claim of ONE record keeps single-record semantics (BrokerError, value -1).
+    /// A claim of ONE record keeps single-record semantics (BrokerError, value = its offset).
     [[nodiscard]] BatchClaim claimBatch(TopicHandle topic, const Key& key, uint32_t n, uint32_t recLen,
                                         Completions& cq, Token token) noexcept;
     /// claimBatch whose single completion goes to the onAck() handler (same value rule as above).

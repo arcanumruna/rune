@@ -300,7 +300,7 @@ target_include_directories(rune_client_scram PUBLIC
 target_link_libraries(rune_client_scram PUBLIC rune_crypto)
 target_link_libraries(rune_client INTERFACE rune_client_scram)
 # Wide view keys: ViewKeyBuilder (the broker's key encoding + the catalog's view and source schema).
-add_library(rune_client_view STATIC src/view/ViewKeyBuilder.cpp)
+add_library(rune_client_view STATIC src/view/ViewKeyBuilder.cpp src/ConstraintNames.cpp)
 target_include_directories(rune_client_view PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>
@@ -515,6 +515,7 @@ if(aeron_FOUND)
         $<INSTALL_INTERFACE:include>
     )
     target_link_libraries(rune_client_api PUBLIC
+        rune_client_view
         rune_client_group
         rune_client_subscriber
         rune_client_producer
@@ -1138,6 +1139,7 @@ if(BUILD_TESTING)
         tests/SmokeTest.cpp
         tests/ConformanceTest.cpp
         tests/DataConformanceTest.cpp
+        tests/client/CheckedWritesConstraintNameTest.cpp   # checked writes Part 09
     )
     target_link_libraries(rune_client_tests PRIVATE rune_client GTest::gtest_main)
     target_include_directories(rune_client_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})

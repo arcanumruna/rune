@@ -18,6 +18,7 @@
 //     Completions back (producer-close).
 
 #include <rune/client/Client.h>
+#include <rune/client/ConstraintNames.h>
 #include <rune/client/transport/ResponseChannel.h>
 #include <rune/client/agent/AgentProduceSink.h>
 #include <rune/client/detail/CpuAffinity.h>
@@ -2850,6 +2851,18 @@ CatalogReader& Client::catalogReader() {
     static_assert(std::is_const_v<decltype(catalogReader_)>, "the catalog reader must be created eagerly and never reassigned");
     catalogReader_->checkOwner_();
     return *catalogReader_;
+}
+
+std::optional<ConstraintName> Client::constraintName(uint32_t constraintId) {
+    return constraintName(constraintId, kConstraintNameRefreshTimeout);
+}
+
+std::optional<ConstraintName> Client::constraintName(uint32_t constraintId, std::chrono::milliseconds refreshTimeout) {
+    CatalogReader& r = catalogReader();
+    if (constraintId == 0) return std::nullopt;
+    if (auto name = resolveConstraintName(r.state(), r.events(), constraintId)) return name;
+    if (!r.refresh(refreshTimeout)) return std::nullopt;
+    return resolveConstraintName(r.state(), r.events(), constraintId);
 }
 
 namespace {

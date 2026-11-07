@@ -3197,7 +3197,7 @@ void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, 
             if (next < n && le16(verdicts.data() + next * 8) == static_cast<uint16_t>(i)) {
                 const uint8_t* e = verdicts.data() + next * 8;
                 ++next;
-                completeHandle_(h, OpKind::Send, -1, 0, OpStatus::BrokerError, le16(e + 2), le32(e + 4));
+                completeHandle_(h, OpKind::Send, base, 0, OpStatus::BrokerError, le16(e + 2), le32(e + 4));
             } else {
                 completeHandle_(h, OpKind::Send, base, idOf(i), okSt, 0);
             }
