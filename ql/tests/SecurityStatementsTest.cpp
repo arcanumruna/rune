@@ -364,7 +364,8 @@ TEST(SecurityStatementTextRegression, MatchesTheClientRedactionForEveryStatement
     EXPECT_EQ(sec::securityStatementText(0, "u", 0, 0, 0, 0, 0, 0, 0, 0, "", ""), "");
     EXPECT_EQ(sec::securityStatementText(10, "u", 0, 0, 0, 0, 0, 0, 0, 0, "", ""), "");
     EXPECT_EQ(sec::securityStatementText(2, "u", 5, 0, 0, 0, 0, 0, 0, 0, "", ""), "");
-    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 8, 1, 0, "t", ""), "");
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 8, 1, 0, "t", ""), "GRANT IMPORT ON TOPIC t TO ROLE r;");
+    EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 9, 1, 0, "t", ""), "");   // past Import (8)
     EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 2, 0, 1, 0, "t", ""), "");
     EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 6, 0, "t", ""), "");
     EXPECT_EQ(sec::securityStatementText(6, "r", 0, 0, 0, 0, 1, 0, 1, 2, "t", ""), "");
