@@ -23,6 +23,13 @@ uint16_t writerVersionOf(std::string_view value, uint16_t fallback) noexcept {
     return value.size() >= 4 ? static_cast<uint16_t>(static_cast<uint8_t>(value[2]) | (static_cast<uint8_t>(value[3]) << 8)) : fallback;
 }
 
+// P11-3a's scratch: the keys of the ordinary transaction applied at its marker, and the other producers' markers below it.
+constexpr std::size_t kTxnKeysReserve = 1024, kTxnMarkersSeenReserve = 1024;
+
+bool keyLess(const rune::view::ViewKey& a, const rune::view::ViewKey& b) noexcept {
+    return a.len != b.len ? a.len < b.len : std::memcmp(a.bytes.data(), b.bytes.data(), a.len) < 0;
+}
+
 }  // namespace
 
 rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold& f, const rune::view::SourceRecord& rec, rune::view::Prospect& p,
@@ -322,7 +329,22 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     needsActivation_ = false;
     if (state.rejected.capacity() == 0) state.rejected.reserve(kIndexReserve);
     if (!state.txn.reserved()) state.txn.reserve();
+    if (ordinary_.capacity() == 0) {
+        ordinary_.reserve(TxnJudgeState::kMaxTxns);
+        txnKeys_.reserve(kTxnKeysReserve);
+        txnMarkersSeen_.reserve(kTxnMarkersSeenReserve);
+    }
+    // Part 11: the transactions are judged anew from K.  The overlays go back first; nothing is cut from the table.
+    releaseTxnOverlays(state.txn);
+    state.txn.truncateFrom(INT64_MAX);
+    ordinary_.clear();
+    probe_ = {};
+    txnStop_ = TxnStop::None;
+    ordinaryApplied_ = -1;
     judgeCursor_ = std::max(extendOverEmptySets_(state.rejected.coveredThrough()), logStart_);
+    // K never passes an undecided transaction (P11-2), so a rejection at or above it is this judge's own run-ahead, which no marker
+    // covers: it is judged again.
+    state.rejected.truncateFrom(judgeCursor_);
     // §8.5: the markers in this leader's log commit with it (a leader never truncates), so it marks only above them.  Not from
     // W: a lagging HW puts W below ranges the cleaner may already have compacted, and a re-mark from this index would disagree.
     emitFrom_    = std::max(extendOverEmptySets_(state.markers.appendedThrough()), logStart_);
@@ -534,7 +556,7 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
 int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t limit, const rune::view::AbortedTxnFilter& aborted) {
     namespace proto = rune::protocol;
     int work = 0;
-    ViewInstance& first = *members_[active_.front()].inst;
+    txnStop_ = TxnStop::None;
     std::size_t pos = 0;
     while (pos < view.len && !stalled_ && judgeCursor_ < limit) {
         proto::RecordBatchReader r(view.data + pos, view.len - pos);
@@ -550,10 +572,33 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
         // Coverage gap: a producer more than 32 key-0 batches ahead of a lagging or held judge has evicted the entry, so that
         // batch's rejected ids go uncounted in idsBurned and a KeyExists on it raises no AUTOINC-ID-REUSE.
         const bool keyZero = state_->assignedBases.producers() != 0 && r.producerId() >= 0 && state_->assignedBases.isKeyZeroBatch(r.producerId(), r.baseOffset());
-        const bool skipBatch = (attrs & proto::batch::kAttrControl) != 0 || aborted.skips(r, attrs);
+        const bool control = (attrs & proto::batch::kAttrControl) != 0;
+        const bool skipBatch = control || aborted.skips(r, attrs);
         if (skipBatch) {
             if (last >= limit) break;
+            if (control && (attrs & proto::batch::kAttrTransactional) != 0 && !ordinary_.empty()) {   // a COMMIT / ABORT
+                const auto o = std::find_if(ordinary_.begin(), ordinary_.end(), [&](const OrdinaryTxn& t) { return t.producerId == r.producerId() && t.marker == r.baseOffset(); });
+                if (o != ordinary_.end()) {
+                    judgeCursor_ = r.baseOffset();
+                    markerAt_ = static_cast<std::size_t>(o - ordinary_.begin());
+                    txnStop_ = TxnStop::Marker;
+                    break;
+                }
+            }
             if (keyZero && (attrs & proto::batch::kAttrControl) == 0) [[unlikely]] state_->autoIncStats.idsBurned += static_cast<uint64_t>(r.lastOffsetDelta()) + 1;   // aborted
+            judgeCursor_ = last + 1;
+            pos += static_cast<std::size_t>(r.totalLength());
+            ++work;
+            continue;
+        }
+        if ((attrs & proto::batch::kAttrTransactional) != 0) {   // P11-2: deferred or ordinary, skipped here; else the judge waits
+            if (last >= limit) break;
+            if (!txnBatchDeferred_(r.producerId(), r.baseOffset(), r.lastOffsetDelta() + 1)) {
+                judgeCursor_ = std::max(judgeCursor_, r.baseOffset());
+                if (probe_.producerId != r.producerId() || probe_.first != r.baseOffset()) probe_ = TxnProbe{r.producerId(), r.baseOffset(), r.baseOffset()};
+                txnStop_ = TxnStop::Probe;
+                break;
+            }
             judgeCursor_ = last + 1;
             pos += static_cast<std::size_t>(r.totalLength());
             ++work;
@@ -565,8 +610,7 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
             if (halt || stalled_) return;
             if (span.offset >= limit) { halt = true; return; }
             if (span.offset < judgeCursor_) return;
-            rune::view::SourceRecord rec{span.key, span.value, span.offset, rune::protocol::record::intentOf(span.attributes), nullptr};
-            if (!span.value.empty()) rec.writer = &first.vdc.materializedFor(writerVersionOf(span.value, first.vdc.defaultVersion()));
+            const rune::view::SourceRecord rec = recordOf_(span);
             lastIntent_ = rec.intent;
             const Verdict v = judge(rec);
             if (stalled_) return;
@@ -580,28 +624,172 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
         judgeCursor_ = halt ? limit : std::max(judgeCursor_, last + 1);
         pos += static_cast<std::size_t>(r.totalLength());
     }
+    syncMemberCursors_();
+    return work;
+}
+
+void VerdictSource::syncMemberCursors_() noexcept {
     for (const std::size_t i : active_) {
         ViewInstance& inst = *members_[i].inst;
         inst.foldCursor = judgeCursor_;
         if (members_[i].kind == rune::view::VerdictViewKind::KeyIndex) discardKeyIndexDirty_(inst);
         if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
     }
-    return work;
 }
 
+rune::view::SourceRecord VerdictSource::recordOf_(const rune::protocol::RecordSpan& span) noexcept {
+    ViewInstance& first = *members_[active_.front()].inst;
+    rune::view::SourceRecord rec{span.key, span.value, span.offset, rune::protocol::record::intentOf(span.attributes), nullptr};
+    if (!span.value.empty()) rec.writer = &first.vdc.materializedFor(writerVersionOf(span.value, first.vdc.defaultVersion()));
+    return rec;
+}
+
+// A batch of a deferred transaction (its committed TxnJudge known) or of an ordinary one (its marker found): the judge passes it.
+bool VerdictSource::txnBatchDeferred_(int64_t producerId, int64_t base, int32_t records) noexcept {
+    if (DeferredTxn* t = state_->txn.find(producerId);
+        t != nullptr && t->firstOffset <= base && (t->markerOffset < 0 || base < t->markerOffset) && t->judgeOffset < passHw_) {
+        t->records += records;
+        return true;
+    }
+    return std::any_of(ordinary_.begin(), ordinary_.end(), [&](const OrdinaryTxn& o) { return o.producerId == producerId && o.first <= base && base < o.marker; });
+}
+
+// One batch above probe_.first.  A TxnJudge the feed could not record (a full table, or the producer's entry holds an overlay) is
+// offered again here; a refusal waits, counted once.  After it, the producer's marker is fed too (the feed dropped it: no entry).
+VerdictSource::ProbeStep VerdictSource::probeBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len) noexcept {
+    namespace proto = rune::protocol;
+    namespace cm = rune::storage::control_marker;
+    const int16_t attrs = r.attributes();
+    const int64_t base = r.baseOffset();
+    if ((attrs & proto::batch::kAttrControl) == 0 || base <= probe_.first) return ProbeStep::Next;
+    if ((attrs & proto::batch::kAttrTransactional) != 0) {
+        const int type = r.producerId() == probe_.producerId ? cm::controlType(batch, len) : cm::kUnparseable;
+        if (type == cm::kUnparseable) return ProbeStep::Next;
+        if (probe_.fedJudge) {
+            state_->txn.onMarker(probe_.producerId, base, type == cm::kCommit);
+            return ProbeStep::Classified;
+        }
+        if (ordinary_.size() == ordinary_.capacity()) {
+            if (probe_.waitAt != base) { probe_.waitAt = base; ++state_->txn.stats.ordinaryWaits; }
+            return ProbeStep::Wait;
+        }
+        ordinary_.push_back(OrdinaryTxn{probe_.producerId, probe_.first, base, type == cm::kCommit});
+        return ProbeStep::Classified;
+    }
+    const auto c = cr::parseControl(batch, len);
+    if (!c || c->type != cr::kTxnJudge || probe_.fedJudge) return ProbeStep::Next;
+    const auto j = cr::parseTxnJudge(*c);
+    if (!j || j->producerId != probe_.producerId || j->firstOffset > probe_.first) return ProbeStep::Next;
+    // The producer's newer entry replaced this transaction's: it is applied at its marker like an ordinary one.
+    if (const DeferredTxn* e = state_->txn.find(j->producerId); e != nullptr && e->judgeOffset >= base) return ProbeStep::Next;
+    if (state_->txn.onJudgeRecord(base, *j) == nullptr) {
+        if (probe_.waitAt != base) { probe_.waitAt = base; ++state_->txn.stats.judgeRecordRefusals; }
+        return ProbeStep::Wait;
+    }
+    probe_.fedJudge = true;
+    return ProbeStep::Next;
+}
+
+void VerdictSource::collectTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId) noexcept {
+    namespace proto = rune::protocol;
+    namespace cm = rune::storage::control_marker;
+    const int16_t attrs = r.attributes();
+    if ((attrs & proto::batch::kAttrTransactional) == 0) return;
+    if ((attrs & proto::batch::kAttrControl) != 0) {
+        const int type = r.producerId() != producerId ? cm::controlType(batch, len) : cm::kUnparseable;
+        if (type == cm::kUnparseable) return;
+        if (txnMarkersSeen_.size() < txnMarkersSeen_.capacity()) txnMarkersSeen_.push_back({r.producerId(), r.baseOffset(), type == cm::kCommit});
+        else ++state_->txn.stats.supersedeKeysOverflow;   // that producer's records supersede nothing
+        return;
+    }
+    if (r.producerId() != producerId) return;
+    (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
+        if (span.key.size() > rune::view::kMaxViewKeyBytes) return;
+        if (txnKeys_.size() == txnKeys_.capacity()) compactTxnKeys_();
+        if (txnKeys_.size() == txnKeys_.capacity()) {   // compacted, so sorted: a known key still moves its last offset
+            if (TxnKey* k = findTxnKey_(span.key)) k->last = span.offset;
+            else ++state_->txn.stats.supersedeKeysOverflow;
+            return;
+        }
+        txnKeys_.push_back({rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(span.key.data()), span.key.size()}), span.offset, false});
+    });
+}
+
+// Sorted by key, one entry per key holding its last offset.
+void VerdictSource::compactTxnKeys_() noexcept {
+    std::sort(txnKeys_.begin(), txnKeys_.end(), [](const TxnKey& a, const TxnKey& b) { return keyLess(a.key, b.key) || (!keyLess(b.key, a.key) && a.last < b.last); });
+    std::size_t w = 0;
+    for (const TxnKey& k : txnKeys_) {
+        if (w > 0 && txnKeys_[w - 1].key == k.key) txnKeys_[w - 1] = k;
+        else txnKeys_[w++] = k;
+    }
+    txnKeys_.resize(w);
+}
+
+VerdictSource::TxnKey* VerdictSource::findTxnKey_(std::string_view key) noexcept {
+    if (key.size() > rune::view::kMaxViewKeyBytes) return nullptr;
+    const rune::view::ViewKey k = rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(key.data()), key.size()});
+    const auto it = std::lower_bound(txnKeys_.begin(), txnKeys_.end(), k, [](const TxnKey& e, const rune::view::ViewKey& x) { return keyLess(e.key, x); });
+    return it != txnKeys_.end() && it->key == k ? &*it : nullptr;
+}
+
+// P11-3a: an accepted record of another writer above the transaction's last record on its key, applied before the marker: a plain
+// record, or one of a transaction committed below the marker.
+void VerdictSource::checkSupersede_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId,
+                                    const rune::view::AbortedTxnFilter& aborted) noexcept {
+    namespace proto = rune::protocol;
+    const int16_t attrs = r.attributes();
+    if ((attrs & proto::batch::kAttrControl) != 0 || aborted.skips(r, attrs)) return;
+    if ((attrs & proto::batch::kAttrTransactional) != 0) {
+        if (r.producerId() == producerId) return;
+        const auto m = std::find_if(txnMarkersSeen_.begin(), txnMarkersSeen_.end(), [&](const TxnMarkerSeen& x) { return x.producerId == r.producerId() && x.offset > r.baseOffset(); });
+        if (m == txnMarkersSeen_.end() || !m->commit) return;
+    }
+    (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
+        TxnKey* k = findTxnKey_(span.key);
+        if (k != nullptr && span.offset > k->last && !state_->rejected.isRejected(span.offset)) k->superseded = true;
+    });
+}
+
+// The ordinary transaction's records in one batch, from ordinaryApplied_: a superseded key applies nothing (P11-3a), the rest go
+// through every member's apply path.  It has no constrained member and no intent, so nothing is evaluated.
+bool VerdictSource::applyTxnBatch_(const uint8_t* batch, std::size_t len) noexcept {
+    bool ok = true;
+    (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
+        if (!ok || span.offset < ordinaryApplied_) return;
+        if (const TxnKey* k = findTxnKey_(span.key); k == nullptr || !k->superseded) {
+            const rune::view::SourceRecord rec = recordOf_(span);
+            lastIntent_ = rec.intent;
+            for (const std::size_t i : active_) {
+                if (prepare_(members_[i], rec) == rune::view::PrepareStatus::CapacityExhausted) {
+                    stall_(StallReason::Capacity);
+                    ok = false;
+                    return;
+                }
+            }
+            for (const std::size_t i : active_) apply_(members_[i], rec);
+            judgedRecord_ = true;
+        }
+        ordinaryApplied_ = span.offset + 1;
+    });
+    return ok;
+}
+
+// P11-2: the markers cover [emitFrom, judgedThrough()); a deferred transaction holds them until it is decided.
 int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
-    if (generation_ == kUnbound || judgeCursor_ <= emitFrom_ || !(judgedRecord_ || sawEmptyChange_)) return 0;
+    const int64_t through = judgedThrough();
+    if (generation_ == kUnbound || through <= emitFrom_ || !(judgedRecord_ || sawEmptyChange_)) return 0;
     const bool due = rejectedThisPass_ > 0 || sawEmptyChange_ || nowNs - lastMarkerNs_ >= intervalNs_ ||
-                     (checkpointCap_ != INT64_MAX && judgeCursor_ - emitFrom_ >= checkpointCap_);
+                     (checkpointCap_ != INT64_MAX && through - emitFrom_ >= checkpointCap_);
     if (!due) return 0;
     int work = 0;
-    while (emitFrom_ < judgeCursor_ && !state.markers.full()) {
+    while (emitFrom_ < through && !state.markers.full()) {
         const int64_t from = emitFrom_;
-        int64_t finalThrough = judgeCursor_;
+        int64_t finalThrough = through;
         entryScratch_.clear();
         for (int64_t pos = from;;) {
             const int64_t off = state.rejected.nextRejectedAtOrAfter(pos);
-            if (off >= judgeCursor_) break;
+            if (off >= through) break;
             if (entryScratch_.size() == cr::kMaxMarkerEntries) { finalThrough = off; break; }
             const auto* e = state.rejected.find(off);
             entryScratch_.push_back(cr::MarkerEntry{static_cast<uint32_t>(off - from), e->code, e->constraintId});
@@ -627,7 +815,7 @@ int VerdictSource::emitMarkers_(PartitionWriteState& state, int64_t nowNs) {
         lastMarkerNs_ = nowNs;
         ++work;
     }
-    if (emitFrom_ >= judgeCursor_) sawEmptyChange_ = judgedRecord_ = false;
+    if (emitFrom_ >= judgeCursor_) sawEmptyChange_ = judgedRecord_ = false;   // not judgedThrough(): the run-ahead records still need a marker
     return work;
 }
 

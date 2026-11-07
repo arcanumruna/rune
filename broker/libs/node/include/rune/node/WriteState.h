@@ -208,7 +208,10 @@ struct TxnVoteAnswer { uint16_t code = 0; uint32_t constraintId = 0; int64_t fai
 struct TxnJudgeStats {
     uint64_t votesYes = 0, votesNo = 0, votesNoConstraint = 0, votesNoKeyExists = 0, votesNoKeyNotFound = 0, votesNoTooLarge = 0,
              votesNoConflict = 0, voteLatencyNsMax = 0, voteLatencyNsTotal = 0, foldPausedOnTxnLockNs = 0, markerWithoutVote = 0,
-             txnOverlayWaits = 0, lockPauses = 0, checkpointBackfills = 0, vetoedCheckpointPushes = 0;
+             txnOverlayWaits = 0, lockPauses = 0, checkpointBackfills = 0, vetoedCheckpointPushes = 0,
+             judgeRecordRefusals = 0,   ///< a TxnJudge the table refused (full, or the producer's entry holds an overlay): the judge waits
+             ordinaryWaits = 0,         ///< an ordinary transaction the judge could not track (its table full): the judge waits
+             supersedeKeysOverflow = 0; ///< an ordinary transaction with more keys than the P11-3a scan tracks: the rest apply unchecked
 };
 struct DeferredTxn {
     int64_t     producerId = -1;
@@ -284,6 +287,20 @@ public:
             t.answer = {};
             t.records = 0;
         }
+    }
+    /// The owner gives back every overlay an entry holds: before a leadership scan (truncateFrom) or a re-activation.
+    template <class Fn>
+    void releaseOverlays(Fn&& release) noexcept {
+        for (DeferredTxn& t : txns_)
+            if (t.overlay >= 0) {
+                release(t.overlay);
+                t.overlay = -1;
+            }
+    }
+    /// The judge passed J and the marker is committed: nothing is left to judge (an entry truncateFrom reset to AwaitJudge).
+    void finalizeDecided(int64_t judgeCursor, int64_t hw) noexcept {
+        for (DeferredTxn& t : txns_)
+            if (t.phase == TxnPhase::AwaitJudge && t.markerOffset >= 0 && t.markerOffset < hw && t.judgeOffset < judgeCursor) t.phase = TxnPhase::Finalized;
     }
     /// INT64_MAX = none.
     [[nodiscard]] int64_t earliestUndecidedFirst() const noexcept {
