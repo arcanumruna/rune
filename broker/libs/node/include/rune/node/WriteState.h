@@ -211,7 +211,7 @@ struct TxnJudgeStats {
              txnOverlayWaits = 0, lockPauses = 0, checkpointBackfills = 0, vetoedCheckpointPushes = 0,
              judgeRecordRefusals = 0,   ///< a TxnJudge the table refused (full, or the producer's entry holds an overlay): the judge waits
              ordinaryWaits = 0,         ///< an ordinary transaction the judge could not track (its table full): the judge waits
-             supersedeKeysOverflow = 0, ///< an ordinary transaction with more keys or markers than the P11-3a scan tracks: the judge waits at its marker
+             supersedeKeysOverflow = 0, ///< an ordinary transaction with more keys than the one-step set holds: applied in segments, one per pass
              undecidedReplaceRefusals = 0; ///< a producer's next TxnJudge refused while its previous transaction has no marker
 };
 struct DeferredTxn {

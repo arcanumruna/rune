@@ -1392,60 +1392,71 @@ TEST(CheckedWritesTxnJudgeRegression, ChainPausedMidTransactionRestartsFromTheFi
     EXPECT_EQ(r.st.txn.find(77)->phase, u.st.txn.find(77)->phase);
 }
 
-// N2: an ordinary transaction with more keys than the P11-3a scan tracks waits at its marker, counted once; it never applies a
-// record the scan could not check.
-TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheKeySetIsRefusedNeverMisappliedRegression) {
-    // Task 7 (T6 review 1): 2,048 keys, twice the fixed one-step set.  The judge refuses it, every record rejected with TxnTooLarge,
-    // the same on every leader, and moves on: a key-index-only source no longer stops for good.
-    const auto run = [](std::vector<int64_t>& rejected) {
-        JudgeRig r(false);
-        r.start();
-        ASSERT_EQ(r.pool.oneStep().keyCapacity(), 1024u);
+// N2 / Task 7 (T7 review 1, F1): an ordinary transaction with more keys than the one-step set is applied in segments, never
+// refused, and folds as the plain writes in log order would: a key another writer deletes after T's last write of it stays deleted
+// (superseded), one T writes again after the delete is indexed, whichever segment holds it.
+TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheKeySetIsAppliedEqualToAPlainFoldRegression) {
+    const auto write = [](JudgeRig& r, int64_t pid) {
         std::vector<Rec> txn;
         for (std::size_t i = 0; i < 2048; ++i) txn.push_back({20'000 + int64_t(i)});
-        r.log.data(txn, 77);   // 10..2057
-        const int64_t marker = r.log.next;
-        r.log.marker(77, true);
+        r.log.data(txn, pid);   // 10..2057
+        r.log.data({del(20'005), del(20'007), del(21'500)});
+        r.log.data({{20'005}}, pid);
+        if (pid >= 0) r.log.marker(pid, true);
         r.log.data({{5}});
-        for (int i = 0; i < 4; ++i) r.drive();
-        EXPECT_EQ(r.vs.judgeCursor(), marker + 2) << "passed the marker";
-        EXPECT_EQ(r.vs.judgedThrough(), marker + 2);
-        EXPECT_FALSE(r.indexed(20'000));
-        EXPECT_FALSE(r.indexed(20'000 + 2047));
-        EXPECT_TRUE(r.indexed(5));
-        EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 1u);
-        for (int64_t o = 10; o < marker; ++o) {
-            const auto* e = r.st.rejected.find(o);
-            ASSERT_NE(e, nullptr) << o;
-            EXPECT_EQ(e->code, uint16_t(rune::protocol::client::ErrorCode::TxnTooLarge));
-            rejected.push_back(o);
-        }
     };
-    std::vector<int64_t> a, b;
-    run(a);
-    run(b);
-    EXPECT_EQ(a, b) << "every leader refuses alike";
-}
-
-// Task 7 (T6 re-review 2): an ordinary transaction spanning more other producers' markers than the set holds is refused the same way.
-TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheMarkerListIsRefusedNeverWaitsRegression) {
+    JudgeRig plain(false);
+    plain.start();
+    write(plain, -1);
+    for (int i = 0; i < 4; ++i) plain.drive();
     JudgeRig r(false);
     r.start();
-    r.log.data({{1}}, 77);   // 10, its first record
+    ASSERT_EQ(r.pool.oneStep().keyCapacity(), 1024u);
+    write(r, 77);
+    for (int i = 0; i < 8 && r.vs.judgeCursor() < r.log.next; ++i) r.drive();
+    EXPECT_EQ(r.vs.judgeCursor(), r.log.next) << "passed the marker";
+    EXPECT_EQ(r.vs.judgedThrough(), r.log.next);
+    EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 1u);
+    EXPECT_EQ(r.st.rejected.nextRejectedAtOrAfter(0), INT64_MAX) << "nothing refused";
+    EXPECT_TRUE(r.indexed(20'005));
+    EXPECT_FALSE(r.indexed(20'007));
+    EXPECT_FALSE(r.indexed(21'500));
+    for (int64_t id = 20'000; id < 20'000 + 2048; ++id) ASSERT_EQ(r.indexed(id), plain.indexed(id)) << id;
+    EXPECT_TRUE(r.indexed(5));
+}
+
+// Task 7 (T7 review 1, F1): an ordinary transaction spanning more other producers' markers than the set holds is applied too.  The
+// markers are noted in windows, and a batch whose decision lies past a window is looked up: a delete committed far into the span
+// supersedes, one aborted far into it does not, and one committed past T's marker applies after T.
+TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheMarkerListIsAppliedEqualToAPlainFoldRegression) {
+    JudgeRig r(false);
+    r.start();
+    r.log.data({{1}, {2}, {3}, {4}}, 77);   // 10..13, its first records
     for (int64_t p = 0; p < 1100; ++p) {
+        if (p == 5) r.log.data({del(2)}, 5001);
+        if (p == 10) r.log.data({del(3)}, 5003);
+        if (p == 1050) r.log.data({del(1)}, 5000);
+        if (p == 1090) r.log.marker(5000, true);
+        if (p == 1095) r.log.marker(5001, false);
         r.log.data({{30'000 + p}}, 1000 + p);
         r.log.marker(1000 + p, true);
     }
-    r.log.data({{2}}, 77);
+    r.log.data({del(4)});   // a plain delete, then T's last write of 4
+    r.log.data({{4}}, 77);
     const int64_t marker = r.log.next;
     r.log.marker(77, true);
-    for (int i = 0; i < 6 && r.vs.judgeCursor() <= marker; ++i) r.drive();
-    EXPECT_GT(r.vs.judgeCursor(), marker);
-    EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 1u);
-    EXPECT_FALSE(r.indexed(1));
-    EXPECT_FALSE(r.indexed(2));
-    EXPECT_TRUE(r.indexed(30'000)) << "the short ones are applied at their markers";
-    EXPECT_TRUE(r.st.rejected.isRejected(10));
+    r.log.marker(5003, true);
+    for (int i = 0; i < 40 && r.vs.judgeCursor() < r.log.next; ++i) r.drive();
+    EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
+    EXPECT_GT(r.vs.judgedThrough(), marker);
+    EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 0u) << "the keys fit";
+    EXPECT_EQ(r.st.rejected.nextRejectedAtOrAfter(0), INT64_MAX) << "nothing refused";
+    EXPECT_FALSE(r.indexed(1)) << "5000's delete committed below T's marker supersedes T's insert";
+    EXPECT_TRUE(r.indexed(2)) << "5001's delete aborted";
+    EXPECT_FALSE(r.indexed(3)) << "5003's delete commits after T";
+    EXPECT_TRUE(r.indexed(4)) << "T wrote 4 again after the plain delete";
+    EXPECT_TRUE(r.indexed(30'000));
+    EXPECT_TRUE(r.indexed(30'000 + 1099));
 }
 
 // Task 7 (T6 re-review 2): on the judgement path the same overflow is a deterministic no: a marker list past its slots takes every
