@@ -79,8 +79,9 @@ struct VerdictViewHooks {
 
 /// Part 11: the source keys of one transaction with their last offsets (P11-3, P11-3a), and the other producers' markers and TxnJudge
 /// records met below its end, in offset order, with the markers past the end that decide those TxnJudges (resolve()).
-/// its end.  Open-addressed and reserved once.  A key past the reserved count, or longer than any checked topic's, overflows the set;
-/// so does a marker past the reserved count.  Overflow sticks until clear().
+/// Open-addressed and reserved once.  A key past the reserved count overflows the set, and so does a marker or TxnJudge past the
+/// reserved count (they share the slots); a key longer than any checked topic's is not tracked (note()).  Overflow sticks until
+/// clear().
 class TxnKeySet {
 public:
     struct Key {
@@ -108,8 +109,9 @@ public:
     [[nodiscard]] Applied appliedAt(int64_t producerId, int64_t base) const noexcept;
     /// A marker past the end: noted when it decides a noted TxnJudge that has none yet.  True: it was noted.
     bool resolve(int64_t producerId, int64_t offset, bool commit) noexcept;
-    [[nodiscard]] bool pending() const noexcept { return pending_ != 0; }   // a noted TxnJudge whose marker is not noted
+    [[nodiscard]] bool pending() const noexcept { return !pending_.empty(); }   // a noted TxnJudge whose marker is not noted
     [[nodiscard]] bool awaits(int64_t producerId) const noexcept;          // the producer's last noted entry is such a TxnJudge
+    [[nodiscard]] std::span<const Marker> markers() const noexcept { return markers_; }
     [[nodiscard]] bool keysOverflowed() const noexcept { return keysOverflowed_; }
     [[nodiscard]] bool markersOverflowed() const noexcept { return markersOverflowed_; }
 
@@ -119,7 +121,8 @@ private:
     std::vector<Key>      slots_;   // a power of two, at least twice keyCap_
     std::vector<uint32_t> used_;
     std::vector<Marker>   markers_;
-    std::size_t           keyCap_ = 0, pending_ = 0;
+    std::vector<int64_t>  pending_;   // the producers whose last noted entry is a TxnJudge
+    std::size_t           keyCap_ = 0;
     bool                  keysOverflowed_ = false, markersOverflowed_ = false;
 };
 
@@ -267,7 +270,7 @@ public:
     void captureAppendedForTest(bool on) noexcept { captureAppended_ = on; }
     [[nodiscard]] uint64_t judgeCallsForTest() const noexcept { return judgeCalls_; }
     void holdJudgeForTest(bool hold) noexcept { held_ = hold; }
-    void failApplyAtForTest(int64_t offset) noexcept { failApplyAt_ = offset; }   // the apply of that record stalls once (Capacity)
+    void failCapacityAtForTest(int64_t offset) noexcept { failCapacityAt_ = offset; }   // the chained prepare of that record stalls once (Capacity)
     [[nodiscard]] uint8_t lastIntentForTest() const noexcept { return lastIntent_; }
     [[nodiscard]] bool retiringForTest(uint64_t viewObjectId) const noexcept;
     [[nodiscard]] bool candidateForTest(uint64_t viewObjectId) const noexcept {
@@ -331,7 +334,7 @@ private:
     bool   applyOrdinary_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
     void   collectTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId, TxnKeySet& keys) noexcept;
     void   checkSupersede_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId,
-                           const rune::view::AbortedTxnFilter& aborted, TxnKeySet& keys, bool& unknown) noexcept;
+                           const rune::view::AbortedTxnFilter& aborted, TxnKeySet& keys, int64_t& unknownPid) noexcept;
     template <class ReadRangeFn>
     bool   resolveMarkers_(ReadRangeFn& readRange, TxnKeySet& keys, int64_t& from, std::size_t budget, int64_t producerId) noexcept;
     [[nodiscard]] bool applyTxnBatch_(const uint8_t* batch, std::size_t len, TxnKeySet& keys) noexcept;
@@ -358,7 +361,6 @@ private:
     [[nodiscard]] ChainStep chainRecord_(const rune::view::SourceRecord& rec, rune::view::TxnOverlay& chain, rune::view::Verdict& failed) noexcept;
     [[nodiscard]] bool judgeAtomic_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, bool keyZero) noexcept;
     [[nodiscard]] bool applyRecord_(const rune::view::SourceRecord& rec) noexcept;
-    [[nodiscard]] bool applyAtomic_(const uint8_t* batch, std::size_t len) noexcept;
     void   resetChainLive_() noexcept {
         for (Member& m : members_) m.chainLive = 0;
     }
@@ -433,8 +435,10 @@ private:
     TxnStop                     txnStop_ = TxnStop::None;
     std::size_t                 markerAt_ = 0;            // TxnStop::Marker: the entry of ordinary_ whose marker the judge stands at
     int64_t                     ordinaryApplied_ = -1;    // that entry's records below it are applied (a read failed mid-way)
-    int64_t                     atomicBase_ = -1, atomicApplied_ = -1;   // P11-6: the judged atomic batch being applied, applied below
-    int64_t                     failApplyAt_ = -1;
+    // P11-3a: while that entry waits (resolveFor_ is its marker), the markers past it resolveMarkers_ found, below resolveFrom_
+    int64_t                     resolveFor_ = -1, resolveFrom_ = -1;
+    std::vector<TxnKeySet::Marker> resolved_;
+    int64_t                     failCapacityAt_ = -1;
     TxnProbe                    probe_;
     std::vector<OrdinaryTxn>    ordinary_;
     std::vector<OwedMarker>     owedMarkers_;
@@ -661,23 +665,30 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
             if (supersedeWaitAt_ != o.marker) noteSupersedeWait_(o, keys.keyCapacity());
             return false;
         }
-        bool unknown = false;
+        if (resolveFor_ != o.marker) {
+            resolveFor_ = resolveFrom_ = o.marker;
+            resolved_.clear();
+        }
+        for (const TxnKeySet::Marker& m : resolved_) (void)keys.resolve(m.producerId, m.offset, m.commit);
+        int64_t unknownPid = -1;
         const auto supersede = [&] {
-            unknown = false;
+            unknownPid = -1;
             return walkBatches_(readRange, o.first, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
-                checkSupersede_(r, b, len, o.producerId, aborted, keys, unknown);
+                checkSupersede_(r, b, len, o.producerId, aborted, keys, unknownPid);
                 return true;
             });
         };
         if (!supersede()) return false;
-        if (unknown) {   // a deferred transaction judged below the marker decides past it: the judge waits for that marker below the HW
-            int64_t from = o.marker;
-            (void)resolveMarkers_(readRange, keys, from, SIZE_MAX, -1);
+        if (unknownPid >= 0) {   // a deferred transaction judged below the marker decides past it: the judge waits for that marker below the HW
+            const bool found = resolveMarkers_(readRange, keys, resolveFrom_, voteScanBytes_, unknownPid);
+            resolved_.clear();
+            for (const TxnKeySet::Marker& m : keys.markers())
+                if (m.offset > o.marker) resolved_.push_back(m);
             if (keys.markersOverflowed()) {
                 if (supersedeWaitAt_ != o.marker) noteSupersedeWait_(o, keys.keyCapacity());
                 return false;
             }
-            if (!supersede() || unknown) return false;
+            if (!found || !supersede() || unknownPid >= 0) return false;
         }
         bool applied = true;
         if (!walkBatches_(readRange, std::max(o.first, ordinaryApplied_), o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
@@ -687,7 +698,7 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
             }) || !applied) return false;
     }
     ordinary_.erase(ordinary_.begin() + static_cast<std::ptrdiff_t>(markerAt_));
-    ordinaryApplied_ = -1;
+    ordinaryApplied_ = resolveFor_ = -1;
     txnStop_ = TxnStop::None;
     judgeCursor_ = o.marker + 1;
     syncMemberCursors_();

@@ -442,6 +442,13 @@ struct TxnLog {
         bytes.insert(bytes.end(), batch.begin(), batch.end());
         next += count;
     }
+    void truncateFrom(int64_t at) {   // whole batches only
+        while (!batches.empty() && batches.back().base >= at) {
+            bytes.resize(batches.back().pos);
+            batches.pop_back();
+        }
+        next = at;
+    }
     rune::storage::LogReadView read(int64_t from, bool oneBatch = false) const {
         for (std::size_t i = 0; i < batches.size(); ++i) {
             const Span& s = batches[i];
@@ -523,8 +530,11 @@ struct JudgeRig {
     int64_t failFrom = -1, failTo = -1;
     int     failReads = 0;
     bool    oneBatch = false;
+    int64_t countFrom = INT64_MAX;   // reads from at or above it are counted in counted
+    int     counted = 0;
     int drive(int64_t hw = INT64_MAX, int64_t now = 0) {
         return vs.driveJudge([&](int64_t from, int64_t to) {
+            counted += from >= countFrom;
             if (failReads > 0 && from == failFrom && to == failTo) {
                 --failReads;
                 return rune::storage::LogReadView{};
@@ -1454,6 +1464,35 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinarySupersededByADeferredTxnCommittedP
     EXPECT_EQ(r.vs.judgeCursor(), 21);
 }
 
+// N2: while O waits for T0's marker past its own, the resolution walk resumes where it stopped and reads at most the vote scan
+// budget per pass (one-batch reads, a budget of one batch), never the backlog from O's marker again.
+TEST(CheckedWritesTxnJudgeRegression, OrdinaryResolutionWalkIsBudgetedAndResumesRegression) {
+    JudgeRig r(false);
+    r.start();
+    r.oneBatch = true;
+    r.log.data({del(4)}, 55);                     // 10, O
+    r.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
+    r.log.judge(66, 11);                          // 12
+    r.log.marker(55, true);                       // 13
+    for (int64_t id = 30; id < 50; ++id) r.log.data({{id}});   // 14-33
+    r.vs.setVoteScanBytesForTest(1);
+    for (int i = 0; i < 16 && r.st.txn.find(66)->phase != TxnPhase::Locked; ++i) r.drive();
+    ASSERT_EQ(r.st.txn.find(66)->phase, TxnPhase::Locked);
+    ASSERT_EQ(r.vs.judgeCursor(), 13);
+    r.countFrom = 14;
+    for (int i = 0; i < 24; ++i) {
+        r.counted = 0;
+        r.drive();
+        EXPECT_LE(r.counted, 1) << "pass " << i;
+    }
+    EXPECT_EQ(r.vs.judgeCursor(), 13) << "O still waits for T0's marker";
+    r.log.marker(66, true);                       // 34
+    r.countFrom = INT64_MAX;
+    for (int i = 0; i < 8 && r.vs.judgeCursor() == 13; ++i) r.drive();
+    EXPECT_GT(r.vs.judgeCursor(), 13);
+    EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
+}
+
 // I3: accepted(r), an ordinary transaction committed below J.
 TEST(CheckedWritesTxnJudge, OrdinaryCommittedBelowJConflicts) {
     JudgeRig r(VoteMembers{100});
@@ -1641,23 +1680,76 @@ TEST(CheckedWritesTxnJudge, FinalizeResumesAfterAFailedRead) {
     EXPECT_EQ(r.vs.judgeCursor(), 14);
 }
 
-// M2: a stall in the middle of an atomic batch's apply resumes there; the applied records are never judged again.
-TEST(CheckedWritesTxnJudgeRegression, AtomicApplyResumesAfterAStallRegression) {
+// M2: a capacity stall in an atomic batch applies none of it; the next leadership judges and applies it whole.
+TEST(CheckedWritesTxnJudgeRegression, AtomicStallAppliesNothingRegression) {
     JudgeRig r(VoteMembers{});
     r.start();
     r.log.data({{1, 1, false, kInsert}, {2, 1, false, kInsert}, {3, 1, false, kInsert}}, -1, true);   // 10-12
-    r.vs.failApplyAtForTest(11);
+    const auto before = r.tables();
+    r.vs.failCapacityAtForTest(11);
     r.drive();
     ASSERT_TRUE(r.vs.stalled());
-    EXPECT_TRUE(r.indexed(1));
-    EXPECT_FALSE(r.indexed(2));
+    EXPECT_EQ(r.tables(), before) << "a stall leaves no part of the batch applied";
     r.vs.bindLeader(nullptr, 2, 0);
     r.drive();
     EXPECT_FALSE(r.vs.stalled());
-    EXPECT_EQ(r.st.rejected.size(), 0u) << "the applied insert of id 1 is not judged again";
+    EXPECT_EQ(r.st.rejected.size(), 0u);
+    EXPECT_TRUE(r.rowed(1));
     EXPECT_TRUE(r.rowed(2));
     EXPECT_TRUE(r.rowed(3));
     EXPECT_EQ(r.vs.judgeCursor(), 13);
+}
+
+// N1 case 1: after a stall in atomic batch B, a rescan truncates B away and another atomic batch lands at B's base.  It is judged
+// in full: its constraint failure rejects it whole, no record of it is applied unjudged.
+TEST(CheckedWritesTxnJudgeRegression, AtomicBatchAtAReusedBaseIsJudgedAnewRegression) {
+    JudgeRig r(VoteMembers{});
+    r.start();
+    r.log.data({{1, 1, false, kInsert}, {2, 1, false, kInsert}, {3, 1, false, kInsert}}, -1, true);   // 10-12
+    r.vs.failCapacityAtForTest(11);
+    r.drive();
+    ASSERT_TRUE(r.vs.stalled());
+    r.log.truncateFrom(10);
+    verdictFeedBegin(&r.st, 0, 10);
+    r.log.data({{4, 1, false, kInsert}, {5, 9, false, kInsert}}, -1, true);   // 10-11, id 5 fails TagEquals{9}
+    r.vs.bindLeader(nullptr, 2, 0);
+    r.drive();
+    EXPECT_FALSE(r.vs.stalled());
+    EXPECT_TRUE(r.st.rejected.isRejected(10));
+    EXPECT_TRUE(r.st.rejected.isRejected(11));
+    for (const int64_t id : {1, 2, 3, 4, 5}) {
+        EXPECT_FALSE(r.indexed(id)) << id;
+        EXPECT_FALSE(r.rowed(id)) << id;
+    }
+    EXPECT_EQ(r.vs.judgeCursor(), 12);
+}
+
+// N1 case 2: an undecided 77 holds K below atomic batch B, which stalls; the next activation judges from K < B, and a member
+// rebuilt to K (simulated: B's rows removed) gets all of B, as a plain fold would.
+TEST(CheckedWritesTxnJudgeRegression, AtomicBatchAboveKAppliesWholeToARebuiltMemberRegression) {
+    JudgeRig r(VoteMembers{});
+    r.start();
+    r.log.data({{20}}, 77);                                                                              // 10
+    r.log.judge(77, 10);                                                                                 // 11
+    r.log.data({{1, 1, false, kInsert}, {2, 1, false, kInsert}, {3, 1, false, kInsert}}, -1, true);   // 12-14
+    r.vs.failCapacityAtForTest(13);
+    for (int i = 0; i < 8 && !r.vs.stalled(); ++i) r.drive();
+    ASSERT_TRUE(r.vs.stalled());
+    ASSERT_LE(r.st.rejected.coveredThrough(), 10);
+    for (const int64_t id : {1, 2, 3}) {
+        r.index->table.erase(uint64_t(id));
+        r.reject->table.erase(uint64_t(id));
+        r.capped->table.erase(uint64_t(id));
+    }
+    r.vs.bindLeader(nullptr, 2, 0);
+    r.drive();
+    EXPECT_FALSE(r.vs.stalled());
+    EXPECT_EQ(r.st.rejected.size(), 0u);
+    for (const int64_t id : {1, 2, 3}) {
+        EXPECT_TRUE(r.indexed(id)) << id;
+        EXPECT_TRUE(r.rowed(id)) << id;
+    }
+    EXPECT_EQ(r.vs.judgeCursor(), 15);
 }
 
 // M5: a key wider than any topic key changes no member row, so it never overflows the key set: no wait, no TxnTooLarge.

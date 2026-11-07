@@ -36,8 +36,9 @@ void TxnKeySet::reserve(std::size_t keys, std::size_t markers) {
     used_.reserve(keys);
     markers_.clear();
     markers_.reserve(markers);
+    pending_.clear();
+    pending_.reserve(markers);
     keyCap_ = keys;
-    pending_ = 0;
     keysOverflowed_ = markersOverflowed_ = false;
 }
 
@@ -45,7 +46,7 @@ void TxnKeySet::clear() noexcept {
     for (const uint32_t i : used_) slots_[i] = Key{};
     used_.clear();
     markers_.clear();
-    pending_ = 0;
+    pending_.clear();
     keysOverflowed_ = markersOverflowed_ = false;
 }
 
@@ -88,18 +89,15 @@ TxnKeySet::Key* TxnKeySet::find(std::string_view key) noexcept {
     return k.used ? &k : nullptr;
 }
 
-// The producer's last noted entry is a TxnJudge without its marker.
-static bool awaitsMarker(std::span<const TxnKeySet::Marker> markers, int64_t producerId) noexcept {
-    const auto last = std::find_if(markers.rbegin(), markers.rend(), [&](const TxnKeySet::Marker& x) { return x.producerId == producerId; });
-    return last != markers.rend() && last->judge;
-}
-
 void TxnKeySet::noteMarker(int64_t producerId, int64_t offset, bool commit) noexcept {
     if (markers_.size() == markers_.capacity()) {
         markersOverflowed_ = true;
         return;
     }
-    if (awaitsMarker(markers_, producerId)) --pending_;
+    if (const auto p = std::find(pending_.begin(), pending_.end(), producerId); p != pending_.end()) {
+        *p = pending_.back();
+        pending_.pop_back();
+    }
     markers_.push_back({producerId, offset, commit, false});
 }
 
@@ -108,14 +106,14 @@ void TxnKeySet::noteJudge(int64_t producerId, int64_t offset) noexcept {
         markersOverflowed_ = true;
         return;
     }
-    if (!awaitsMarker(markers_, producerId)) ++pending_;
+    if (!awaits(producerId)) pending_.push_back(producerId);
     markers_.push_back({producerId, offset, false, true});
 }
 
-bool TxnKeySet::awaits(int64_t producerId) const noexcept { return awaitsMarker(markers_, producerId); }
+bool TxnKeySet::awaits(int64_t producerId) const noexcept { return std::find(pending_.begin(), pending_.end(), producerId) != pending_.end(); }
 
 bool TxnKeySet::resolve(int64_t producerId, int64_t offset, bool commit) noexcept {
-    if (!awaitsMarker(markers_, producerId)) return false;
+    if (!awaits(producerId)) return false;
     noteMarker(producerId, offset, commit);
     return true;
 }
@@ -458,6 +456,7 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     if (ordinary_.capacity() == 0) {
         ordinary_.reserve(TxnJudgeState::kMaxTxns);
         owedMarkers_.reserve(TxnJudgeState::kMaxTxns);
+        resolved_.reserve(kTxnMarkersReserve);
     }
     // TODO(Task 7): the worker always binds a pool; then ownKeys_ goes.
     if (txnPool_ == nullptr && ownKeys_.keyCapacity() == 0) ownKeys_.reserve(kOneStepKeysReserve, kTxnMarkersReserve);
@@ -468,7 +467,7 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     ordinary_.clear();
     probe_ = {};
     txnStop_ = TxnStop::None;
-    ordinaryApplied_ = -1;
+    ordinaryApplied_ = resolveFor_ = -1;
     finalizePid_ = finalizeApplied_ = -1;
     overlayWaitAt_ = supersedeWaitAt_ = lockPausedAt_ = -1;
     judgeCursor_ = std::max(extendOverEmptySets_(state.rejected.coveredThrough()), logStart_);
@@ -700,6 +699,11 @@ void VerdictSource::countVote_(const TxnVoteAnswer& a) noexcept {
 
 // Prepares every active member for `rec` through `chain` and evaluates them in set order.  Failed: `failed` is the first rejection.
 VerdictSource::ChainStep VerdictSource::chainRecord_(const rune::view::SourceRecord& rec, rune::view::TxnOverlay& chain, Verdict& failed) noexcept {
+    if (rec.offset == failCapacityAt_) [[unlikely]] {
+        failCapacityAt_ = -1;
+        stall_(StallReason::Capacity);
+        return ChainStep::Stalled;
+    }
     lastIntent_ = rec.intent;
     for (const std::size_t i : active_) {
         const rune::view::PrepareStatus s = prepare_(members_[i], rec, &chain, lockSet_());
@@ -723,11 +727,6 @@ VerdictSource::ChainStep VerdictSource::chainRecord_(const rune::view::SourceRec
 
 // A record through every active member's normal path, no lock checked (its transaction was judged with them).  False: stalled.
 bool VerdictSource::applyRecord_(const rune::view::SourceRecord& rec) noexcept {
-    if (rec.offset == failApplyAt_) [[unlikely]] {
-        failApplyAt_ = -1;
-        stall_(StallReason::Capacity);
-        return false;
-    }
     lastIntent_ = rec.intent;
     for (const std::size_t i : active_) {
         if (prepare_(members_[i], rec, nullptr, nullptr) == rune::view::PrepareStatus::CapacityExhausted) {
@@ -743,7 +742,6 @@ bool VerdictSource::applyRecord_(const rune::view::SourceRecord& rec) noexcept {
 // P11-6: an atomic batch judged as a unit through the batch overlay.  All pass: applied in this step; one fails: every record is
 // rejected with its verdict.  False: the judge stays at the batch (a pause, a stall, a record that does not fit).
 bool VerdictSource::judgeAtomic_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, bool keyZero) noexcept {
-    if (atomicBase_ == r.baseOffset()) return applyAtomic_(batch, len);   // judged, applied below atomicApplied_
     rune::view::TxnOverlay& chain = batchOverlay_.front();
     chain.clear();
     resetChainLive_();
@@ -774,20 +772,13 @@ bool VerdictSource::judgeAtomic_(const rune::protocol::RecordBatchReader& r, con
         judgedRecord_ = true;
         return ok;
     }
-    atomicBase_ = atomicApplied_ = r.baseOffset();
-    return applyAtomic_(batch, len);
-}
-
-// A judged atomic batch through every member's normal path from atomicApplied_, so a stall in the middle resumes, never re-judges
-// or re-applies the records before it.
-bool VerdictSource::applyAtomic_(const uint8_t* batch, std::size_t len) noexcept {
+    // The chained prepare was every member's capacity check: each record was prepared against the state its apply sees, through a
+    // row overlay that holds at least what the plain prepare's does, and the tables grow.  So the batch applies whole here or not at
+    // all, and nothing of it outlives a stall, a re-activation or a rescan.
     bool ok = true;
     (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
-        if (!ok || span.offset < atomicApplied_) return;
-        ok = applyRecord_(recordOf_(span));
-        if (ok) atomicApplied_ = span.offset + 1;
+        if (ok) ok = applyRecord_(recordOf_(span));
     });
-    if (ok) atomicBase_ = atomicApplied_ = -1;
     return ok;
 }
 
@@ -815,8 +806,6 @@ void VerdictSource::endJudgement_() noexcept {
     refreshLocks_();
 }
 
-// The chained read: T's records in order, every other producer's marker noted for the scan.  False: answered (the first failing
-// record), or a pause, which restarts T from its first record with a cleared overlay (F3), or a stall.
 // Another producer's marker or TxnJudge record, noted for P11-3 and P11-3a.
 static void noteControl(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t self, TxnKeySet& keys) noexcept {
     namespace cm = rune::storage::control_marker;
@@ -829,6 +818,8 @@ static void noteControl(const rune::protocol::RecordBatchReader& r, const uint8_
     if (const auto j = cr::parseTxnJudge(batch, len); j && j->producerId != self) keys.noteJudge(j->producerId, r.baseOffset());
 }
 
+// The chained read: T's records in order, every other producer's marker and TxnJudge noted for the scan.  False: answered (the
+// first failing record), or a pause, which restarts T from its first record with a cleared overlay (F3), or a stall.
 bool VerdictSource::readTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, const rune::view::AbortedTxnFilter& aborted) noexcept {
     namespace proto = rune::protocol;
     namespace cm = rune::storage::control_marker;
@@ -869,7 +860,7 @@ bool VerdictSource::readTxnBatch_(const rune::protocol::RecordBatchReader& r, co
 
 // P11-3: an accepted record of another writer on a key of T, above T's last record on it, answers no (TxnConflict).  A record of
 // another transaction is accepted when it is applied below the end (TxnKeySet::appliedAt, from the log alone, so every leader and
-// every pass timing answers the same).  A deferred one whose marker lies past the end stops the scan until resolveMarker_ finds it.
+// every pass timing answers the same).  A deferred one whose marker lies past the end stops the scan until resolveMarkers_ finds it.
 // A marker list that overflowed takes it as applied: a spurious no, never a wrong yes.
 bool VerdictSource::scanTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, const rune::view::AbortedTxnFilter& aborted) noexcept {
     namespace proto = rune::protocol;
@@ -1139,10 +1130,10 @@ void VerdictSource::collectTxnBatch_(const rune::protocol::RecordBatchReader& r,
 }
 
 // P11-3a, the same test as P11-3 with the marker as the end: an accepted record of another writer above the transaction's last
-// record on its key, a plain record or one of a transaction applied below the marker (TxnKeySet::appliedAt).  `unknown`: a
-// deferred transaction's marker past the end decides one; resolveMarkers_ finds it and the caller checks again.
+// record on its key, a plain record or one of a transaction applied below the marker (TxnKeySet::appliedAt).  `unknownPid`: a
+// deferred transaction's marker past the end decides one of its records; resolveMarkers_ finds it and the caller checks again.
 void VerdictSource::checkSupersede_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId,
-                                    const rune::view::AbortedTxnFilter& aborted, TxnKeySet& keys, bool& unknown) noexcept {
+                                    const rune::view::AbortedTxnFilter& aborted, TxnKeySet& keys, int64_t& unknownPid) noexcept {
     namespace proto = rune::protocol;
     const int16_t attrs = r.attributes();
     if ((attrs & proto::batch::kAttrControl) != 0 || aborted.skips(r, attrs)) return;
@@ -1155,7 +1146,7 @@ void VerdictSource::checkSupersede_(const rune::protocol::RecordBatchReader& r, 
     (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
         TxnKeySet::Key* k = keys.find(span.key);
         if (k == nullptr || span.offset <= k->last || state_->rejected.isRejected(span.offset)) return;
-        if (applied == TxnKeySet::Applied::Unknown) unknown = true;
+        if (applied == TxnKeySet::Applied::Unknown) unknownPid = r.producerId();
         else k->superseded = true;
     });
 }
