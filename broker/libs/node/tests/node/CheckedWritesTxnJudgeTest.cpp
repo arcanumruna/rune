@@ -386,7 +386,7 @@ void put32(std::vector<uint8_t>& b, uint32_t v) { for (int i = 0; i < 4; ++i) b.
 void put64(std::vector<uint8_t>& b, uint64_t v) { for (int i = 0; i < 8; ++i) b.push_back(uint8_t(v >> (8 * i))); }
 std::string_view bytesOf(const std::vector<uint8_t>& b) { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
 
-struct Rec { int64_t id; int32_t tag = 1; bool tombstone = false; uint8_t intent = 0; };
+struct Rec { int64_t id; int32_t tag = 1; bool tombstone = false; uint8_t intent = 0; uint8_t keyLen = 8; };
 Rec del(int64_t id) { return {id, 1, true}; }
 
 // A committed log of whole batches; a TxnJudge or a marker reaches the feed as the RcState hooks would pass it on append.
@@ -406,6 +406,7 @@ struct TxnLog {
         for (const Rec& r : recs) {
             std::vector<uint8_t> k, v;
             put64(k, uint64_t(r.id));
+            k.resize(std::max<std::size_t>(8, r.keyLen));
             if (!r.tombstone) { put16(v, 12); put16(v, 1); put64(v, uint64_t(r.id)); put32(v, uint32_t(r.tag)); }
             b.append(bytesOf(k), bytesOf(v), 0, r.intent);
         }
@@ -441,9 +442,12 @@ struct TxnLog {
         bytes.insert(bytes.end(), batch.begin(), batch.end());
         next += count;
     }
-    rune::storage::LogReadView read(int64_t from) const {
-        for (const Span& s : batches)
-            if (s.last >= from) return {bytes.data() + s.pos, bytes.size() - s.pos, s.base, next};
+    rune::storage::LogReadView read(int64_t from, bool oneBatch = false) const {
+        for (std::size_t i = 0; i < batches.size(); ++i) {
+            const Span& s = batches[i];
+            const std::size_t end = oneBatch && i + 1 < batches.size() ? batches[i + 1].pos : bytes.size();
+            if (s.last >= from) return {bytes.data() + s.pos, end - s.pos, s.base, next};
+        }
         return {};
     }
 };
@@ -515,8 +519,26 @@ struct JudgeRig {
         drive();
         ASSERT_EQ(vs.judgeCursor(), 10);
     }
+    // A read of exactly [failFrom, failTo) comes back empty failReads times; oneBatch reads return one batch each.
+    int64_t failFrom = -1, failTo = -1;
+    int     failReads = 0;
+    bool    oneBatch = false;
     int drive(int64_t hw = INT64_MAX, int64_t now = 0) {
-        return vs.driveJudge([&](int64_t from, int64_t) { return log.read(from); }, std::min(hw, log.next), now, st);
+        return vs.driveJudge([&](int64_t from, int64_t to) {
+            if (failReads > 0 && from == failFrom && to == failTo) {
+                --failReads;
+                return rune::storage::LogReadView{};
+            }
+            return log.read(from, oneBatch);
+        }, std::min(hw, log.next), now, st);
+    }
+    // Drives until 77 is judged; false if it is not within `passes`.
+    bool judge77(int passes = 16) {
+        for (int i = 0; i < passes; ++i) {
+            if (st.txn.find(77) != nullptr && st.txn.find(77)->judged) return true;
+            drive();
+        }
+        return st.txn.find(77) != nullptr && st.txn.find(77)->judged;
     }
     [[nodiscard]] bool indexed(int64_t id) const { return index->table.get(uint64_t(id)) != nullptr; }
     [[nodiscard]] bool rowed(int64_t id) const { return reject->table.get(uint64_t(id)) != nullptr; }
@@ -1374,4 +1396,287 @@ TEST(CheckedWritesTxnJudgeRegression, OwedMarkerSearchRotatesAcrossAReactivation
     EXPECT_LT(r.st.txn.find(77)->markerOffset, 0) << "88's marker was found while 77's search was still behind";
     for (int i = 0; i < 16 && r.st.txn.find(77)->markerOffset < 0; ++i) r.drive();
     EXPECT_EQ(r.st.txn.find(77)->markerOffset, r.log.next - 1);
+}
+
+// ---- Task 6 fix round 1 ----
+
+// I1: whether a deferred q committed comes from the log, not from q's entry.  T's judgement spans passes; between them pid 66's next
+// TxnJudge replaces q's Finalized entry.  q's record at 11 is above T's last write of id 4 and q committed: no, {63, 0, 11}.
+TEST(CheckedWritesTxnJudgeRegression, DeferredQsDecisionSurvivesItsEntrysReplacementRegression) {
+    JudgeRig r(VoteMembers{100});
+    r.vs.setVoteScanBytesForTest(64u << 10);
+    r.start();
+    r.log.data({{4, 2}}, 77);   // 10
+    r.log.data({{4, 3}}, 66);   // 11
+    r.log.judge(66, 11);        // 12
+    std::vector<Rec> dels;
+    for (int64_t i = 0; i < 3000; ++i) dels.push_back(del(1'000'000 + i));
+    const std::size_t from = r.log.bytes.size();
+    while (r.log.bytes.size() - from < (1u << 20) + (64u << 10)) r.log.data(dels);
+    r.log.judge(77, 10);        // J_77
+    r.log.marker(66, true);     // q's commit, past J_77
+    bool mid = false;
+    for (int i = 0; i < 64 && !mid; ++i) {
+        r.drive();
+        mid = r.st.txn.find(66)->phase == TxnPhase::Finalized && r.st.txn.find(77)->phase == TxnPhase::Judging;
+    }
+    ASSERT_TRUE(mid) << "q finalized while T's judgement is in progress";
+    const int64_t next66 = r.log.next;
+    r.log.data({{70}}, 66);
+    r.log.judge(66, next66);    // fed: replaces q's entry
+    ASSERT_EQ(r.st.txn.find(66)->firstOffset, next66);
+    ASSERT_TRUE(r.judge77(200));
+    const TxnVoteAnswer& a = r.st.txn.find(77)->answer;
+    EXPECT_EQ(a.code, 63);
+    EXPECT_EQ(a.constraintId, 0u);
+    EXPECT_EQ(a.failingOffset, 11);
+}
+
+// I2: P11-3a counts a deferred T0 judged below O's marker and committed past it.  O's tombstone of id 4 is older than T0's insert, so
+// after both the key index holds id 4, as a plain fold (O at 13, then T0 at 20) does.
+TEST(CheckedWritesTxnJudgeRegression, OrdinarySupersededByADeferredTxnCommittedPastItsMarkerRegression) {
+    JudgeRig r(false);
+    r.start();
+    r.log.data({del(4)}, 55);                     // 10, O
+    r.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
+    r.log.judge(66, 11);                          // 12
+    r.log.marker(55, true);                       // 13
+    r.log.data({{20}, {21}, {22}, {23}, {24}, {25}});   // 14-19
+    r.log.marker(66, true);                       // 20
+    r.drive(20);
+    EXPECT_EQ(r.st.txn.find(66)->phase, TxnPhase::Locked);
+    EXPECT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker below the HW";
+    r.drive();
+    r.drive();
+    EXPECT_EQ(r.st.txn.find(66)->phase, TxnPhase::Finalized);
+    EXPECT_TRUE(r.indexed(4));
+    EXPECT_TRUE(r.indexed(25));
+    EXPECT_EQ(r.vs.judgeCursor(), 21);
+}
+
+// I3: accepted(r), an ordinary transaction committed below J.
+TEST(CheckedWritesTxnJudge, OrdinaryCommittedBelowJConflicts) {
+    JudgeRig r(VoteMembers{100});
+    r.start();
+    r.log.data({{1}, {2}});     // 10-11
+    r.log.data({{4}}, 77);      // 12
+    r.log.data({{4}}, 88);      // 13
+    r.log.marker(88, true);     // 14
+    r.log.judge(77, 12);        // 15
+    ASSERT_TRUE(r.judge77());
+    EXPECT_EQ(r.st.txn.find(77)->answer.code, 63);
+    EXPECT_EQ(r.st.txn.find(77)->answer.failingOffset, 13);
+}
+
+TEST(CheckedWritesTxnJudge, OrdinaryAbortedBelowJIsNoConflict) {
+    JudgeRig r(VoteMembers{100});
+    r.start();
+    r.log.data({{1}, {2}});
+    r.log.data({{4}}, 77);
+    r.log.data({{4}}, 88);
+    r.log.marker(88, false);
+    r.log.judge(77, 12);
+    ASSERT_TRUE(r.judge77());
+    EXPECT_EQ(r.st.txn.find(77)->answer.code, 0);
+}
+
+TEST(CheckedWritesTxnJudge, OrdinaryCommittedAboveJIsNoConflict) {
+    JudgeRig r(VoteMembers{100});
+    r.start();
+    r.log.data({{1}, {2}});     // 10-11
+    r.log.data({{4}}, 77);      // 12
+    r.log.data({{4}}, 88);      // 13
+    r.log.judge(77, 12);        // 14
+    r.log.marker(88, true);     // 15
+    ASSERT_TRUE(r.judge77());
+    EXPECT_EQ(r.st.txn.find(77)->answer.code, 0);
+}
+
+// I3: accepted(r), a deferred q judged below J whose marker lies past J.
+TEST(CheckedWritesTxnJudge, DeferredCommittedBelowJConflicts) {
+    JudgeRig r(VoteMembers{100});
+    r.start();
+    r.log.data({{4, 2}}, 77);   // 10
+    r.log.data({{4, 3}}, 66);   // 11
+    r.log.judge(66, 11);        // 12
+    r.log.judge(77, 10);        // 13
+    r.log.marker(66, true);     // 14
+    ASSERT_TRUE(r.judge77());
+    EXPECT_EQ(r.st.txn.find(77)->answer.code, 63);
+    EXPECT_EQ(r.st.txn.find(77)->answer.failingOffset, 11);
+}
+
+TEST(CheckedWritesTxnJudge, DeferredAbortedBelowJIsNoConflict) {
+    JudgeRig r(VoteMembers{100});
+    r.start();
+    r.log.data({{4, 2}}, 77);
+    r.log.data({{4, 3}}, 66);
+    r.log.judge(66, 11);
+    r.log.judge(77, 10);
+    r.log.marker(66, false);
+    ASSERT_TRUE(r.judge77());
+    EXPECT_EQ(r.st.txn.find(77)->answer.code, 0);
+}
+
+TEST(CheckedWritesTxnJudge, DeferredJudgedAboveJIsNoConflict) {
+    JudgeRig r(VoteMembers{100});
+    r.start();
+    r.log.data({{4, 2}}, 77);   // 10
+    r.log.data({{4, 3}}, 66);   // 11
+    r.log.judge(77, 10);        // 12
+    r.log.judge(66, 11);        // 13
+    r.log.marker(66, true);     // 14
+    ASSERT_TRUE(r.judge77());
+    EXPECT_EQ(r.st.txn.find(77)->answer.code, 0);
+    EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::Locked);
+}
+
+// M1: the intent search's failed read leaves the transaction unclassified; the next pass finds the intent and judges it (P11-7).
+TEST(CheckedWritesTxnJudgeRegression, IntentSearchReadFailureNeverClassifiesOrdinaryRegression) {
+    JudgeRig r(false);
+    r.start();
+    r.log.data({{1, 1, false, kInsert}, {100, 1, false, kInsert}}, 77);   // 10-11: id 100 exists
+    r.log.marker(77, true);                                               // 12
+    r.failFrom = 10;
+    r.failTo = 12;
+    r.failReads = 1;
+    r.drive();
+    r.drive();
+    EXPECT_EQ(r.failReads, 0);
+    for (const int64_t o : {10, 11}) {
+        ASSERT_NE(r.st.rejected.find(o), nullptr) << o;
+        EXPECT_EQ(r.st.rejected.find(o)->code, 56);
+    }
+    EXPECT_FALSE(r.indexed(1));
+    EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 1u);
+    EXPECT_EQ(r.vs.judgeCursor(), 13);
+}
+
+// M4: P11-7's pass path applies the transaction at its marker.
+TEST(CheckedWritesTxnJudge, CommitMarkerWithoutJudgeAppliesAPassingTxn) {
+    JudgeRig r(VoteMembers{100});
+    r.start();
+    r.log.data({{1}, {2}, {3}}, 77);   // 10-12
+    r.log.marker(77, true);            // 13
+    r.drive();
+    EXPECT_TRUE(r.rowed(1));
+    EXPECT_TRUE(r.rowed(3));
+    EXPECT_EQ(r.st.rejected.size(), 0u);
+    EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 1u);
+    EXPECT_EQ(r.vs.judgeCursor(), 14);
+    EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
+}
+
+// M4: P11-1 (b), the source is constrained (its latest set) though the set at T's first record is not.
+TEST(CheckedWritesTxnJudge, ConstrainedSourceClassifiesAMarkerWithoutVote) {
+    JudgeRig r(false);
+    r.start();
+    ConstraintSet later = r.set;
+    later.id = 2;
+    later.members[later.count++] = {7, VerdictViewKind::TestReject, JudgeRig::tagRule().fingerprint()};
+    r.st.constraintSets.onChange(1'000'000, later);
+    ASSERT_TRUE(r.st.isConstrainedSource());
+    r.log.data({{1}, {2}}, 77);
+    r.log.marker(77, true);
+    r.drive();
+    EXPECT_TRUE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(2));
+    EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 1u);
+}
+
+// M4: P11-1 (c), an intent on a source with no constrained member.
+TEST(CheckedWritesTxnJudge, IntentClassifiesAMarkerWithoutVote) {
+    JudgeRig r(false);
+    r.start();
+    r.log.data({{1}, {100, 1, false, kInsert}}, 77);   // 10-11: id 100 exists
+    r.log.marker(77, true);
+    r.drive();
+    EXPECT_TRUE(r.st.rejected.isRejected(10));
+    EXPECT_EQ(r.st.rejected.find(11)->code, 56);
+    EXPECT_FALSE(r.indexed(1));
+    EXPECT_EQ(r.st.txn.stats.markerWithoutVote, 1u);
+}
+
+// M4: an atomic batch touching a locked row pauses; after the commit it is judged against the state including 77.
+TEST(CheckedWritesTxnJudge, AtomicBatchPausesOnALockedRow) {
+    JudgeRig r(VoteMembers{});
+    r.start();
+    r.log.data({{1, 2}}, 77);                // 10
+    r.log.judge(77, 10);                     // 11
+    r.log.data({{5}, {1, 3}}, -1, true);     // 12-13
+    r.drive();
+    EXPECT_EQ(r.vs.judgeCursor(), 12);
+    EXPECT_EQ(r.st.txn.stats.lockPauses, 1u);
+    EXPECT_FALSE(r.rowed(5));
+    r.log.marker(77, true);                  // 14
+    r.drive();
+    EXPECT_TRUE(r.rowed(5));
+    EXPECT_EQ(r.tagOf(1), 3);
+    EXPECT_EQ(r.st.rejected.size(), 0u);
+    EXPECT_EQ(r.vs.judgeCursor(), 15);
+}
+
+// M4: finalizeLocked_ resumes after a failed read where it stopped.
+TEST(CheckedWritesTxnJudge, FinalizeResumesAfterAFailedRead) {
+    JudgeRig r(VoteMembers{});
+    r.oneBatch = true;
+    r.start();
+    r.log.data({{1}}, 77);      // 10
+    r.log.data({{2}}, 77);      // 11
+    r.log.judge(77, 10);        // 12
+    r.log.marker(77, true);     // 13
+    r.drive(13);
+    ASSERT_EQ(r.st.txn.find(77)->phase, TxnPhase::Locked);
+    r.failFrom = 11;
+    r.failTo = 12;
+    r.failReads = 1;
+    r.drive();
+    EXPECT_EQ(r.failReads, 0);
+    EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::Locked);
+    EXPECT_TRUE(r.rowed(1));
+    EXPECT_FALSE(r.rowed(2));
+    r.drive();
+    EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::Finalized);
+    EXPECT_TRUE(r.rowed(2));
+    EXPECT_EQ(r.vs.judgeCursor(), 14);
+}
+
+// M2: a stall in the middle of an atomic batch's apply resumes there; the applied records are never judged again.
+TEST(CheckedWritesTxnJudgeRegression, AtomicApplyResumesAfterAStallRegression) {
+    JudgeRig r(VoteMembers{});
+    r.start();
+    r.log.data({{1, 1, false, kInsert}, {2, 1, false, kInsert}, {3, 1, false, kInsert}}, -1, true);   // 10-12
+    r.vs.failApplyAtForTest(11);
+    r.drive();
+    ASSERT_TRUE(r.vs.stalled());
+    EXPECT_TRUE(r.indexed(1));
+    EXPECT_FALSE(r.indexed(2));
+    r.vs.bindLeader(nullptr, 2, 0);
+    r.drive();
+    EXPECT_FALSE(r.vs.stalled());
+    EXPECT_EQ(r.st.rejected.size(), 0u) << "the applied insert of id 1 is not judged again";
+    EXPECT_TRUE(r.rowed(2));
+    EXPECT_TRUE(r.rowed(3));
+    EXPECT_EQ(r.vs.judgeCursor(), 13);
+}
+
+// M5: a key wider than any topic key changes no member row, so it never overflows the key set: no wait, no TxnTooLarge.
+TEST(CheckedWritesTxnJudgeRegression, WideKeyNeverWedgesAnOrdinaryTxnRegression) {
+    JudgeRig r(false);
+    r.start();
+    r.log.data({{1}, {2, 1, false, 0, 20}}, 77);   // 10-11
+    r.log.marker(77, true);                        // 12
+    r.drive();
+    EXPECT_TRUE(r.indexed(1));
+    EXPECT_EQ(r.vs.judgeCursor(), 13);
+    EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 0u);
+}
+
+TEST(CheckedWritesTxnJudgeRegression, WideKeyInATxnVotesYesRegression) {
+    JudgeRig r(VoteMembers{});
+    r.start();
+    r.log.data({{1}, {2, 1, false, 0, 20}}, 77);
+    r.log.judge(77, 10);
+    ASSERT_TRUE(r.judge77());
+    EXPECT_EQ(r.st.txn.find(77)->answer.code, 0);
 }

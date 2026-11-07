@@ -634,3 +634,29 @@ TEST(CheckedWritesConstraintVerdictRegression, ChainedCheckReadsTheBeforeImageTh
     EXPECT_EQ(m.value(1, "lastPlayed"), -1) << "a chain changes no table";
     EXPECT_EQ(m.row(2), nullptr);
 }
+
+// Part 11 F11 on the aggregate path: user 7 is grandfathered at 13 characters.  Inside a chain that deleted one of them, a create
+// changes the chain's 12 to 13: rejected, though the table's 13 equals the new 13.
+TEST(CheckedWritesConstraintVerdictRegression, ChainedAggregateCheckReadsTheBeforeImageThroughTheChainRegression) {
+    Rig r;
+    Mem& m = r.view(kAccountStats, 8);
+    (void)r.put(creates(r, 7, 13, 1));   // replayed unjudged: grandfathered
+    r.start();
+    ASSERT_EQ(m.value(7, "characters"), 13);
+    ASSERT_EQ(r.put1(r.character(1, 7, "renamed")), (V{0, 0})) << "outside a transaction the unchanged count grandfathers";
+    rv::Prospect p;
+    p.reserve(m.inst->layout, &m.inst->agg->layout);
+    rv::TxnOverlay chain;
+    chain.reserve(64, std::max(m.inst->table.rowLen(), 64u));
+    const ConstraintFold check{m.inst->plan, m.inst->layout, m.inst->table};
+    const auto judge = [&](const Rec& rec) {
+        const rv::SourceRecord s{rec.key, sv(rec.value), 100, rec.intent, nullptr};
+        rv::AggregateFold f = aggregateFoldOf(*m.inst);
+        EXPECT_EQ(rv::prepareAggregate(f, s, p, &chain), rv::PrepareStatus::Ok);
+        const rv::Verdict v = evaluateConstraints(check, s, p);
+        return V{v.code, v.constraintId};
+    };
+    EXPECT_EQ(judge(Rig::tombstone(2)), (V{0, 0}));
+    EXPECT_EQ(judge(r.character(100, 7, "new")), (V{kViolation, kStatsId})) << "the chain's prior image is 12, not the table's 13";
+    EXPECT_EQ(m.value(7, "characters"), 13) << "a chain changes no table";
+}

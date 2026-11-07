@@ -37,6 +37,7 @@ void TxnKeySet::reserve(std::size_t keys, std::size_t markers) {
     markers_.clear();
     markers_.reserve(markers);
     keyCap_ = keys;
+    pending_ = 0;
     keysOverflowed_ = markersOverflowed_ = false;
 }
 
@@ -44,6 +45,7 @@ void TxnKeySet::clear() noexcept {
     for (const uint32_t i : used_) slots_[i] = Key{};
     used_.clear();
     markers_.clear();
+    pending_ = 0;
     keysOverflowed_ = markersOverflowed_ = false;
 }
 
@@ -59,7 +61,8 @@ std::size_t TxnKeySet::slotOf_(std::string_view key) const noexcept {
 }
 
 bool TxnKeySet::note(std::string_view key, int64_t offset) noexcept {
-    if (key.size() > rune::codec::kMaxTopicKeyBytes || slots_.empty()) {
+    if (key.size() > rune::codec::kMaxTopicKeyBytes) return true;
+    if (slots_.empty()) {
         keysOverflowed_ = true;
         return false;
     }
@@ -85,14 +88,45 @@ TxnKeySet::Key* TxnKeySet::find(std::string_view key) noexcept {
     return k.used ? &k : nullptr;
 }
 
-void TxnKeySet::noteMarker(int64_t producerId, int64_t offset, bool commit) noexcept {
-    if (markers_.size() == markers_.capacity()) markersOverflowed_ = true;
-    else markers_.push_back({producerId, offset, commit});
+// The producer's last noted entry is a TxnJudge without its marker.
+static bool awaitsMarker(std::span<const TxnKeySet::Marker> markers, int64_t producerId) noexcept {
+    const auto last = std::find_if(markers.rbegin(), markers.rend(), [&](const TxnKeySet::Marker& x) { return x.producerId == producerId; });
+    return last != markers.rend() && last->judge;
 }
 
-const TxnKeySet::Marker* TxnKeySet::markerAbove(int64_t producerId, int64_t offset) const noexcept {
-    const auto m = std::find_if(markers_.begin(), markers_.end(), [&](const Marker& x) { return x.producerId == producerId && x.offset > offset; });
-    return m != markers_.end() ? &*m : nullptr;
+void TxnKeySet::noteMarker(int64_t producerId, int64_t offset, bool commit) noexcept {
+    if (markers_.size() == markers_.capacity()) {
+        markersOverflowed_ = true;
+        return;
+    }
+    if (awaitsMarker(markers_, producerId)) --pending_;
+    markers_.push_back({producerId, offset, commit, false});
+}
+
+void TxnKeySet::noteJudge(int64_t producerId, int64_t offset) noexcept {
+    if (markers_.size() == markers_.capacity()) {
+        markersOverflowed_ = true;
+        return;
+    }
+    if (!awaitsMarker(markers_, producerId)) ++pending_;
+    markers_.push_back({producerId, offset, false, true});
+}
+
+bool TxnKeySet::awaits(int64_t producerId) const noexcept { return awaitsMarker(markers_, producerId); }
+
+bool TxnKeySet::resolve(int64_t producerId, int64_t offset, bool commit) noexcept {
+    if (!awaitsMarker(markers_, producerId)) return false;
+    noteMarker(producerId, offset, commit);
+    return true;
+}
+
+TxnKeySet::Applied TxnKeySet::appliedAt(int64_t producerId, int64_t base) const noexcept {
+    const auto of = [&](const Marker& x) { return x.producerId == producerId; };
+    const auto e = std::find_if(markers_.begin(), markers_.end(), [&](const Marker& x) { return of(x) && x.offset > base; });
+    if (e == markers_.end()) return Applied::No;
+    const auto m = e->judge ? std::find_if(e + 1, markers_.end(), [&](const Marker& x) { return of(x) && !x.judge; }) : e;
+    if (m == markers_.end()) return Applied::Unknown;
+    return m->commit ? Applied::Yes : Applied::No;
 }
 
 void TxnOverlayPool::reserveKeys(std::size_t keys, std::size_t oneStepKeys) {
@@ -689,6 +723,11 @@ VerdictSource::ChainStep VerdictSource::chainRecord_(const rune::view::SourceRec
 
 // A record through every active member's normal path, no lock checked (its transaction was judged with them).  False: stalled.
 bool VerdictSource::applyRecord_(const rune::view::SourceRecord& rec) noexcept {
+    if (rec.offset == failApplyAt_) [[unlikely]] {
+        failApplyAt_ = -1;
+        stall_(StallReason::Capacity);
+        return false;
+    }
     lastIntent_ = rec.intent;
     for (const std::size_t i : active_) {
         if (prepare_(members_[i], rec, nullptr, nullptr) == rune::view::PrepareStatus::CapacityExhausted) {
@@ -704,6 +743,7 @@ bool VerdictSource::applyRecord_(const rune::view::SourceRecord& rec) noexcept {
 // P11-6: an atomic batch judged as a unit through the batch overlay.  All pass: applied in this step; one fails: every record is
 // rejected with its verdict.  False: the judge stays at the batch (a pause, a stall, a record that does not fit).
 bool VerdictSource::judgeAtomic_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, bool keyZero) noexcept {
+    if (atomicBase_ == r.baseOffset()) return applyAtomic_(batch, len);   // judged, applied below atomicApplied_
     rune::view::TxnOverlay& chain = batchOverlay_.front();
     chain.clear();
     resetChainLive_();
@@ -734,8 +774,20 @@ bool VerdictSource::judgeAtomic_(const rune::protocol::RecordBatchReader& r, con
         judgedRecord_ = true;
         return ok;
     }
+    atomicBase_ = atomicApplied_ = r.baseOffset();
+    return applyAtomic_(batch, len);
+}
+
+// A judged atomic batch through every member's normal path from atomicApplied_, so a stall in the middle resumes, never re-judges
+// or re-applies the records before it.
+bool VerdictSource::applyAtomic_(const uint8_t* batch, std::size_t len) noexcept {
     bool ok = true;
-    (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) { ok = ok && applyRecord_(recordOf_(span)); });
+    (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
+        if (!ok || span.offset < atomicApplied_) return;
+        ok = applyRecord_(recordOf_(span));
+        if (ok) atomicApplied_ = span.offset + 1;
+    });
+    if (ok) atomicBase_ = atomicApplied_ = -1;
     return ok;
 }
 
@@ -765,15 +817,26 @@ void VerdictSource::endJudgement_() noexcept {
 
 // The chained read: T's records in order, every other producer's marker noted for the scan.  False: answered (the first failing
 // record), or a pause, which restarts T from its first record with a cleared overlay (F3), or a stall.
+// Another producer's marker or TxnJudge record, noted for P11-3 and P11-3a.
+static void noteControl(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t self, TxnKeySet& keys) noexcept {
+    namespace cm = rune::storage::control_marker;
+    if ((r.attributes() & rune::protocol::batch::kAttrTransactional) != 0) {
+        if (r.producerId() == self) return;
+        if (const int type = cm::controlType(batch, len); type != cm::kUnparseable) keys.noteMarker(r.producerId(), r.baseOffset(), type == cm::kCommit);
+        return;
+    }
+    if (len != cr::kTxnJudgeBatchBytes) return;
+    if (const auto j = cr::parseTxnJudge(batch, len); j && j->producerId != self) keys.noteJudge(j->producerId, r.baseOffset());
+}
+
 bool VerdictSource::readTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, const rune::view::AbortedTxnFilter& aborted) noexcept {
     namespace proto = rune::protocol;
     namespace cm = rune::storage::control_marker;
     constexpr int16_t kTxnControl = proto::batch::kAttrTransactional | proto::batch::kAttrControl;
     const int16_t attrs = r.attributes();
     TxnKeySet& keys = txnPool_->keysAt(jx_.overlay);
-    if ((attrs & kTxnControl) == kTxnControl) {
-        if (r.producerId() == jx_.producerId) return true;
-        if (const int type = cm::controlType(batch, len); type != cm::kUnparseable) keys.noteMarker(r.producerId(), r.baseOffset(), type == cm::kCommit);
+    if ((attrs & proto::batch::kAttrControl) != 0) {
+        noteControl(r, batch, len, jx_.producerId, keys);
         return true;
     }
     if ((attrs & kTxnControl) != proto::batch::kAttrTransactional || r.producerId() != jx_.producerId || aborted.skips(r, attrs)) return true;
@@ -804,31 +867,35 @@ bool VerdictSource::readTxnBatch_(const rune::protocol::RecordBatchReader& r, co
     return step == ChainStep::Ok;
 }
 
-// P11-3: an accepted record of another writer on a key of T, above T's last record on it, answers no (TxnConflict).
+// P11-3: an accepted record of another writer on a key of T, above T's last record on it, answers no (TxnConflict).  A record of
+// another transaction is accepted when it is applied below the end (TxnKeySet::appliedAt, from the log alone, so every leader and
+// every pass timing answers the same).  A deferred one whose marker lies past the end stops the scan until resolveMarker_ finds it.
+// A marker list that overflowed takes it as applied: a spurious no, never a wrong yes.
 bool VerdictSource::scanTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, const rune::view::AbortedTxnFilter& aborted) noexcept {
     namespace proto = rune::protocol;
     const int16_t attrs = r.attributes();
     if ((attrs & proto::batch::kAttrControl) != 0 || aborted.skips(r, attrs)) return true;
-    if ((attrs & proto::batch::kAttrTransactional) != 0 && (r.producerId() == jx_.producerId || !txnAccepted_(r.producerId(), r.baseOffset()))) return true;
     TxnKeySet& keys = txnPool_->keysAt(jx_.overlay);
+    TxnKeySet::Applied applied = TxnKeySet::Applied::Yes;
+    if ((attrs & proto::batch::kAttrTransactional) != 0) {
+        if (r.producerId() == jx_.producerId) return true;
+        if (!keys.markersOverflowed()) applied = keys.appliedAt(r.producerId(), r.baseOffset());
+        if (applied == TxnKeySet::Applied::No) return true;
+    }
+    int64_t hit = -1;
     (void)proto::forEachRecordSpan(batch, len, [&](const proto::RecordSpan& span) {
-        if (jx_.done) return;
+        if (hit >= 0) return;
         const TxnKeySet::Key* k = keys.find(span.key);
-        if (k == nullptr || span.offset <= k->last || state_->rejected.isRejected(span.offset)) return;
-        jx_.answer = {static_cast<uint16_t>(rune::protocol::client::ErrorCode::TxnConflict), 0, span.offset};
-        jx_.done = true;
+        if (k != nullptr && span.offset > k->last && !state_->rejected.isRejected(span.offset)) hit = span.offset;
     });
-    return !jx_.done;
-}
-
-// A batch of another transaction is applied before jx_.end: its commit marker lies below the end, or it is deferred with its TxnJudge
-// below the end and finalized as a commit.  A marker list that overflowed takes it as applied: a spurious no, never a wrong yes.
-bool VerdictSource::txnAccepted_(int64_t producerId, int64_t base) noexcept {
-    const TxnKeySet& keys = txnPool_->keysAt(jx_.overlay);
-    if (const TxnKeySet::Marker* m = keys.markerAbove(producerId, base)) return m->commit;
-    if (keys.markersOverflowed()) return true;
-    const DeferredTxn* q = state_->txn.find(producerId);
-    return q != nullptr && q->firstOffset <= base && q->judgeOffset < jx_.end && q->phase == TxnPhase::Finalized && q->commit && q->markerOffset > base;
+    if (hit < 0) return true;
+    if (applied == TxnKeySet::Applied::Unknown) {
+        jx_.resolvePid = r.producerId();
+        return false;
+    }
+    jx_.answer = {static_cast<uint16_t>(rune::protocol::client::ErrorCode::TxnConflict), 0, hit};
+    jx_.done = true;
+    return false;
 }
 
 void VerdictSource::noteKeyZeroRejection_(const Verdict& v, const rune::view::SourceRecord& rec) noexcept {
@@ -1062,33 +1129,34 @@ void VerdictSource::pruneOwedMarkers_() noexcept {
 
 void VerdictSource::collectTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId, TxnKeySet& keys) noexcept {
     namespace proto = rune::protocol;
-    namespace cm = rune::storage::control_marker;
     const int16_t attrs = r.attributes();
-    if ((attrs & proto::batch::kAttrTransactional) == 0) return;
     if ((attrs & proto::batch::kAttrControl) != 0) {
-        const int type = r.producerId() != producerId ? cm::controlType(batch, len) : cm::kUnparseable;
-        if (type != cm::kUnparseable) keys.noteMarker(r.producerId(), r.baseOffset(), type == cm::kCommit);
+        noteControl(r, batch, len, producerId, keys);
         return;
     }
-    if (r.producerId() != producerId) return;
+    if ((attrs & proto::batch::kAttrTransactional) == 0 || r.producerId() != producerId) return;
     (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) { (void)keys.note(span.key, span.offset); });
 }
 
-// P11-3a: an accepted record of another writer above the transaction's last record on its key, applied before the marker: a plain
-// record, or one of a transaction committed below the marker.
+// P11-3a, the same test as P11-3 with the marker as the end: an accepted record of another writer above the transaction's last
+// record on its key, a plain record or one of a transaction applied below the marker (TxnKeySet::appliedAt).  `unknown`: a
+// deferred transaction's marker past the end decides one; resolveMarkers_ finds it and the caller checks again.
 void VerdictSource::checkSupersede_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId,
-                                    const rune::view::AbortedTxnFilter& aborted, TxnKeySet& keys) noexcept {
+                                    const rune::view::AbortedTxnFilter& aborted, TxnKeySet& keys, bool& unknown) noexcept {
     namespace proto = rune::protocol;
     const int16_t attrs = r.attributes();
     if ((attrs & proto::batch::kAttrControl) != 0 || aborted.skips(r, attrs)) return;
+    TxnKeySet::Applied applied = TxnKeySet::Applied::Yes;
     if ((attrs & proto::batch::kAttrTransactional) != 0) {
         if (r.producerId() == producerId) return;
-        const TxnKeySet::Marker* m = keys.markerAbove(r.producerId(), r.baseOffset());
-        if (m == nullptr || !m->commit) return;
+        applied = keys.appliedAt(r.producerId(), r.baseOffset());
+        if (applied == TxnKeySet::Applied::No) return;
     }
     (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& span) {
         TxnKeySet::Key* k = keys.find(span.key);
-        if (k != nullptr && span.offset > k->last && !state_->rejected.isRejected(span.offset)) k->superseded = true;
+        if (k == nullptr || span.offset <= k->last || state_->rejected.isRejected(span.offset)) return;
+        if (applied == TxnKeySet::Applied::Unknown) unknown = true;
+        else k->superseded = true;
     });
 }
 
