@@ -706,6 +706,7 @@ TEST(CheckedWritesKeyedAgg, ChainedDropThenRecreateOfAStoredGroupIsNew) {
 
 TEST(CheckedWritesKeyedAgg, ShortOverlayRowsNeverReachTheSpareRow) {
     Rig r(deviceHistory());
+    r.next = 0x0102030405060708;   // a nonzero group id, so an overrun of the spare row shows
     TxnOverlay chain;
     chain.reserve(512, 4);
     const std::string key = wireKey(1), value = valueOf(r.src, ev(1, 1, "a", 5, 5));
