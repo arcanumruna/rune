@@ -1078,6 +1078,14 @@ TEST(CheckedWritesTxnWire, EndTxnResponseV17CarriesTheVote) {
     EXPECT_EQ(d->failingOffset, 123);
 }
 
+TEST(CheckedWritesTxnWireRegression, EndTxnResponseTruncatedVoteBodyIsRefusedRegression) {
+    const auto r = votedResponse();
+    std::array<uint8_t, 64> b{};
+    ASSERT_EQ(r.encodeFor(b.data(), 17), rpc::EndTxnResponse::ENCODED_SIZE_V17);
+    for (std::size_t avail : {26u, 30u, 37u}) EXPECT_FALSE(rpc::EndTxnResponse::decode(b.data(), avail)) << avail;
+    EXPECT_TRUE(rpc::EndTxnResponse::decode(b.data(), 38));
+}
+
 TEST(CheckedWritesTxnWireRegression, EndTxnResponseBelowSeventeenIsByteIdenticalRegression) {
     const auto r = votedResponse();
     std::array<uint8_t, 64> v16{}, plain{};

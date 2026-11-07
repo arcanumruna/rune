@@ -245,7 +245,7 @@ enum class ErrorCode : uint16_t {
     ViewConstraintInvalid    = 60,  // DDL compile error: a unique / check constraint
     ViewUniqueInvalid        = 61,  // DDL compile error: a unique clause
     TxnTooLarge              = 62,  // a transaction (or atomic batch) overran a vote window; the whole transaction aborts.  Vote, definite
-    TxnConflict              = 63,  // two transactions' writes to one key collided at the vote; the later one aborts.  Vote, definite
+    TxnConflict              = 63,  // a newer write of another writer landed before its TxnJudge; the transaction aborts.  Vote, definite
 };
 
 /// True for the codes a transaction vote can answer EndTxn(commit) with: 55, 56, 57, 62 and 63.

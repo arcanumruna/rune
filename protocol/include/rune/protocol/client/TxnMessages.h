@@ -493,7 +493,8 @@ struct EndTxnResponse {
 
         constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
         msg.errorCode = detail::getLE16s(buf, fixedBase + 0);
-        if (hdr.blockLength >= BODY_FIXED_V17 && avail >= ENCODED_SIZE_V17) {
+        if (hdr.blockLength >= BODY_FIXED_V17) {
+            if (avail < ENCODED_SIZE_V17) return std::nullopt;
             msg.constraintId  = static_cast<uint32_t>(detail::getLE32(buf, fixedBase + 2));
             msg.failingOffset = detail::getLE64(buf, fixedBase + 6);
             msg.hasVote       = true;

@@ -1059,5 +1059,7 @@ TEST(CheckedWritesTxnVoteMsg, DecodeRefusesShortAndForeign) {
     TxnVoteResponseMsg{}.encode(r.data(), r.size());
     TxnVoteResponseMsg rd;
     EXPECT_FALSE(TxnVoteResponseMsg::decode(r.data(), r.size() - 1, rd));
-    EXPECT_FALSE(TxnVoteResponseMsg::decode(b.data(), b.size(), rd));
+    std::array<uint8_t, TxnVoteResponseMsg::TOTAL_SIZE> foreign{};
+    std::memcpy(foreign.data(), b.data(), b.size());
+    EXPECT_FALSE(TxnVoteResponseMsg::decode(foreign.data(), foreign.size(), rd));
 }
