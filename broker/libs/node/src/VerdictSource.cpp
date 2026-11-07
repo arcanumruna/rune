@@ -333,8 +333,10 @@ void VerdictSource::activate_(PartitionWriteState& state) {
         ordinary_.reserve(TxnJudgeState::kMaxTxns);
         txnKeys_.reserve(kTxnKeysReserve);
         txnMarkersSeen_.reserve(kTxnMarkersSeenReserve);
+        owedMarkers_.reserve(TxnJudgeState::kMaxTxns);
     }
-    // Part 11: the transactions are judged anew from K.  The overlays go back first; nothing is cut from the table.
+    // Part 11: the transactions are judged anew from K.  The overlays go back first; nothing is cut from the table, so the owed
+    // markers stay owed.
     releaseTxnOverlays(state.txn);
     state.txn.truncateFrom(INT64_MAX);
     ordinary_.clear();
@@ -655,7 +657,7 @@ bool VerdictSource::txnBatchDeferred_(int64_t producerId, int64_t base, int32_t 
 }
 
 // One batch above probe_.first.  A TxnJudge the feed could not record (a full table, or the producer's entry holds an overlay) is
-// offered again here; a refusal waits, counted once.  After it, the producer's marker is fed too (the feed dropped it: no entry).
+// offered again here; a refusal waits, counted once.  Accepted, T is deferred and its marker is owed (feedOwedMarkers_).
 VerdictSource::ProbeStep VerdictSource::probeBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len) noexcept {
     namespace proto = rune::protocol;
     namespace cm = rune::storage::control_marker;
@@ -665,10 +667,6 @@ VerdictSource::ProbeStep VerdictSource::probeBatch_(const rune::protocol::Record
     if ((attrs & proto::batch::kAttrTransactional) != 0) {
         const int type = r.producerId() == probe_.producerId ? cm::controlType(batch, len) : cm::kUnparseable;
         if (type == cm::kUnparseable) return ProbeStep::Next;
-        if (probe_.fedJudge) {
-            state_->txn.onMarker(probe_.producerId, base, type == cm::kCommit);
-            return ProbeStep::Classified;
-        }
         if (ordinary_.size() == ordinary_.capacity()) {
             if (probe_.waitAt != base) { probe_.waitAt = base; ++state_->txn.stats.ordinaryWaits; }
             return ProbeStep::Wait;
@@ -677,7 +675,7 @@ VerdictSource::ProbeStep VerdictSource::probeBatch_(const rune::protocol::Record
         return ProbeStep::Classified;
     }
     const auto c = cr::parseControl(batch, len);
-    if (!c || c->type != cr::kTxnJudge || probe_.fedJudge) return ProbeStep::Next;
+    if (!c || c->type != cr::kTxnJudge) return ProbeStep::Next;
     const auto j = cr::parseTxnJudge(*c);
     if (!j || j->producerId != probe_.producerId || j->firstOffset > probe_.first) return ProbeStep::Next;
     // The producer's newer entry replaced this transaction's: it is applied at its marker like an ordinary one.
@@ -686,8 +684,31 @@ VerdictSource::ProbeStep VerdictSource::probeBatch_(const rune::protocol::Record
         if (probe_.waitAt != base) { probe_.waitAt = base; ++state_->txn.stats.judgeRecordRefusals; }
         return ProbeStep::Wait;
     }
-    probe_.fedJudge = true;
-    return ProbeStep::Next;
+    // The feed dropped the producer's marker if it came before this: no entry took it.  One that comes after is fed as usual.
+    std::erase_if(owedMarkers_, [&](const OwedMarker& m) { return m.producerId == j->producerId; });
+    if (owedMarkers_.size() == owedMarkers_.capacity()) pruneOwedMarkers_();   // then at most one per unpaid entry: it fits
+    owedMarkers_.push_back(OwedMarker{j->producerId, base, base + 1});
+    return ProbeStep::Classified;
+}
+
+// An owed marker's batch: the producer's first COMMIT / ABORT above its TxnJudge is that transaction's.  True: fed.
+bool VerdictSource::owedMarkerBatch_(const OwedMarker& m, const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len) noexcept {
+    namespace proto = rune::protocol;
+    namespace cm = rune::storage::control_marker;
+    constexpr int16_t kTxnControl = proto::batch::kAttrTransactional | proto::batch::kAttrControl;
+    if ((r.attributes() & kTxnControl) != kTxnControl || r.producerId() != m.producerId || r.baseOffset() <= m.judgeOffset) return false;
+    const int type = cm::controlType(batch, len);
+    if (type == cm::kUnparseable) return false;
+    state_->txn.onMarker(m.producerId, r.baseOffset(), type == cm::kCommit);
+    return true;
+}
+
+// Drops the owed markers that are paid: the entry has its marker (found here or fed since), or it is gone or replaced.
+void VerdictSource::pruneOwedMarkers_() noexcept {
+    std::erase_if(owedMarkers_, [&](const OwedMarker& m) {
+        const DeferredTxn* t = state_->txn.find(m.producerId);
+        return t == nullptr || t->judgeOffset != m.judgeOffset || t->markerOffset >= 0;
+    });
 }
 
 void VerdictSource::collectTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId) noexcept {

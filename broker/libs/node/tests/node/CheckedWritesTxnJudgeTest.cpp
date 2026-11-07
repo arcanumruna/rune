@@ -617,7 +617,7 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnAwaitingItsMarkerHoldsJudgedThr
     EXPECT_EQ(r.vs.judgedThrough(), 15);
 }
 
-TEST(CheckedWritesTxnJudge, FullTableWaitsNeverJudges) {
+TEST(CheckedWritesTxnJudge, FullTxnTableWaitsNeverJudges) {
     JudgeRig r(true);
     r.start();
     for (std::size_t i = 0; i < TxnJudgeState::kMaxTxns; ++i)
@@ -668,6 +668,87 @@ TEST(CheckedWritesTxnJudgeRegression, JudgeRecordBehindAnOverlayHolderWaitsAndIs
     EXPECT_EQ(r.vs.judgedThrough(), 12);
 }
 
+// I1: the feed drops the marker of a transaction whose TxnJudge it refused (no entry takes it).  After the re-offer, the marker is
+// still found when it reaches the HW, so judgedThrough moves on.
+TEST(CheckedWritesTxnJudgeRegression, ReofferedJudgeRecordGetsTheMarkerTheFeedDroppedRegression) {
+    JudgeRig r(true);
+    r.start();
+    for (std::size_t i = 0; i < TxnJudgeState::kMaxTxns; ++i)
+        ASSERT_NE(r.st.txn.onJudgeRecord(100'000 + int64_t(i), {1000 + int64_t(i), 0, 50'000 + int64_t(i)}), nullptr);
+    r.log.data({{1}, {2}});            // 10-11
+    r.log.data({{3}, {4}}, 77);        // 12-13
+    r.log.judge(77, 12);               // 14, refused by the feed
+    r.log.data({{5}});                 // 15
+    r.log.marker(77, false);           // 16, dropped by the feed
+    ASSERT_EQ(r.st.txn.find(77), nullptr);
+    r.drive();
+    EXPECT_EQ(r.vs.judgeCursor(), 12);
+    r.st.txn.find(1000)->phase = TxnPhase::Finalized;
+    r.drive(16);                       // the HW below the abort
+    ASSERT_NE(r.st.txn.find(77), nullptr);
+    EXPECT_LT(r.st.txn.find(77)->markerOffset, 0);
+    EXPECT_EQ(r.vs.judgeCursor(), 16) << "deferred: the judge ran ahead";
+    EXPECT_EQ(r.vs.judgedThrough(), 12);
+    r.drive();                         // the HW above the abort
+    EXPECT_EQ(r.st.txn.find(77)->markerOffset, 16);
+    EXPECT_FALSE(r.st.txn.find(77)->commit);
+    EXPECT_EQ(r.vs.judgedThrough(), 17);
+}
+
+// I1: a marker that comes after the re-offer reaches the entry through the feed; it is not fed twice.
+TEST(CheckedWritesTxnJudgeRegression, ReofferedJudgeRecordTakesALaterMarkerFromTheFeedRegression) {
+    JudgeRig r(true);
+    r.start();
+    for (std::size_t i = 0; i < TxnJudgeState::kMaxTxns; ++i)
+        ASSERT_NE(r.st.txn.onJudgeRecord(100'000 + int64_t(i), {1000 + int64_t(i), 0, 50'000 + int64_t(i)}), nullptr);
+    r.log.data({{3}, {4}}, 77);        // 10-11
+    r.log.judge(77, 10);               // 12, refused by the feed
+    r.drive();
+    r.st.txn.find(1000)->phase = TxnPhase::Finalized;
+    r.drive();
+    ASSERT_NE(r.st.txn.find(77), nullptr);
+    EXPECT_EQ(r.vs.judgedThrough(), 10);
+    r.log.marker(77, true);            // 13, fed: the entry exists now
+    EXPECT_EQ(r.st.txn.find(77)->markerOffset, 13);
+    r.drive();
+    r.drive();
+    EXPECT_EQ(r.st.txn.find(77)->markerOffset, 13);
+    EXPECT_TRUE(r.st.txn.find(77)->commit);
+    EXPECT_EQ(r.vs.judgedThrough(), 14);
+}
+
+// M4: the search for an owed marker reads at most kTxnProbeBytesPerPass per pass and resumes where it stopped.
+TEST(CheckedWritesTxnJudgeRegression, OwedMarkerSearchKeepsTheProbeBudgetRegression) {
+    JudgeRig r(false);
+    r.start();
+    for (std::size_t i = 0; i < TxnJudgeState::kMaxTxns; ++i)
+        ASSERT_NE(r.st.txn.onJudgeRecord(100'000 + int64_t(i), {1000 + int64_t(i), 0, 500'000 + int64_t(i)}), nullptr);
+    r.log.data({{3}, {4}}, 77);        // 10-11
+    r.log.judge(77, 10);               // 12, refused by the feed
+    std::vector<Rec> big;
+    for (int64_t id = 0; id < 40'000; ++id) big.push_back({1'000'000 + id});
+    r.log.data(big);
+    const std::size_t firstBig = r.log.batches.size() - 1;
+    r.log.data(big);
+    for (const std::size_t b : {firstBig, firstBig + 1}) {
+        const std::size_t end = b + 1 < r.log.batches.size() ? r.log.batches[b + 1].pos : r.log.bytes.size();
+        ASSERT_GT(end - r.log.batches[b].pos, kTxnProbeBytesPerPass);
+    }
+    r.log.marker(77, true);            // dropped by the feed
+    r.drive();
+    r.st.txn.find(1000)->phase = TxnPhase::Finalized;
+    r.drive();                         // re-offered: deferred, the marker owed
+    ASSERT_NE(r.st.txn.find(77), nullptr);
+    EXPECT_EQ(r.vs.judgedThrough(), 10);
+    r.drive();                         // the first big batch spends the budget
+    EXPECT_LT(r.st.txn.find(77)->markerOffset, 0);
+    r.drive();                         // the second
+    EXPECT_LT(r.st.txn.find(77)->markerOffset, 0);
+    r.drive();
+    EXPECT_EQ(r.st.txn.find(77)->markerOffset, r.log.next - 1);
+    EXPECT_EQ(r.vs.judgedThrough(), r.log.next);
+}
+
 // Re-review 3: a rescan resets every kept entry to AwaitJudge; the judge finalizes the ones a kept marker decided, so a full table
 // can reuse them.
 TEST(CheckedWritesTxnJudgeRegression, KeptMarkerFinalizesAfterARescanSoAFullTableReusesRegression) {
@@ -692,33 +773,42 @@ TEST(CheckedWritesTxnJudgeRegression, KeptMarkerFinalizesAfterARescanSoAFullTabl
     EXPECT_NE(r.st.txn.onJudgeRecord(60, {5000, 0, 55}), nullptr);
 }
 
-// Re-review 3: a vote parked across a rescan is never answered from the old leadership's answer.
-TEST(CheckedWritesTxnJudgeRegression, ParkedVoteIsAnsweredOnlyAfterTheRejudgeRegression) {
+// Re-review 3: a vote parked across a rescan is never answered from the old leadership's answer.  The rescan clears it, and the vote
+// waits until the entry leaves AwaitJudge.  In Task 5 that is finalizeDecided at the committed marker, so the drained answer is the
+// cleared default, not a judgement (Task 6's judgeTxn_ produces one).
+TEST(CheckedWritesTxnJudgeRegression, ParkedVoteWaitsAcrossARescanWithTheOldAnswerClearedRegression) {
     JudgeRig r(true);
     r.start();
     r.log.data({{1}, {2}});
     r.log.data({{3}, {4}}, 77);
-    r.log.judge(77, 12);
+    r.log.judge(77, 12);   // 14
     r.drive();
     DeferredTxn* t = r.st.txn.find(77);
     t->phase       = TxnPhase::Finalized;   // the old leadership's no
-    t->answer.code = 63;
+    t->answer      = {63, 7, 13};
     ASSERT_TRUE(r.st.txn.parkVote({1, 0, 77, 0}));
     verdictFeedBegin(&r.st, 0, r.log.next);
+    t = r.st.txn.find(77);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->phase, TxnPhase::AwaitJudge);
+    EXPECT_EQ(t->answer.code, 0) << "the rescan cleared the old leadership's answer";
+    EXPECT_EQ(t->answer.constraintId, 0u);
+    std::vector<TxnPhase> drainedAt;
+    std::vector<uint16_t> codes;
     const auto drain = [&] {
-        uint16_t code = 999;
-        const int n = r.st.txn.drainAnswered([&](const ParkedVote&, const DeferredTxn& d) { code = d.answer.code; });
-        return std::pair<int, uint16_t>{n, code};
+        return r.st.txn.drainAnswered([&](const ParkedVote&, const DeferredTxn& d) { drainedAt.push_back(d.phase); codes.push_back(d.answer.code); });
     };
-    EXPECT_EQ(drain().first, 0);
+    EXPECT_EQ(drain(), 0) << "AwaitJudge: the vote stays parked";
     r.vs.bindLeader(nullptr, 2, 0);
     r.drive();
-    EXPECT_EQ(drain().first, 0) << "undecided: the vote waits for the re-judge";
-    r.log.marker(77, true);
+    EXPECT_EQ(drain(), 0) << "no marker yet: still AwaitJudge";
+    r.log.marker(77, true);   // 15
+    r.drive(15);
+    EXPECT_EQ(drain(), 0) << "the marker is not below the HW yet";
     r.drive();
-    const auto [n, code] = drain();
-    EXPECT_EQ(n, 1);
-    EXPECT_EQ(code, 0) << "the answer is the new leadership's, not the old 63";
+    ASSERT_EQ(drain(), 1);
+    EXPECT_EQ(drainedAt[0], TxnPhase::Finalized) << "drained only once the entry left AwaitJudge";
+    EXPECT_NE(codes[0], 63) << "never the pre-rescan answer";
 }
 
 // F6: overlays are released before the leadership scan truncates the table, whether a rescan (new generation) or a reset

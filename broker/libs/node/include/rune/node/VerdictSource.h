@@ -246,19 +246,24 @@ private:
     // Part 11 (P11-2): a transaction without a committed TxnJudge or marker stops the judge at its first record (TxnStop::Probe) until a
     // look-ahead finds one; an ordinary transaction stops it at its marker (TxnStop::Marker) to be applied there.
     struct OrdinaryTxn { int64_t producerId; int64_t first; int64_t marker; bool commit; };
-    struct TxnProbe { int64_t producerId = -1, first = -1, from = -1, waitAt = -1; bool fedJudge = false; };
+    struct TxnProbe { int64_t producerId = -1, first = -1, from = -1, waitAt = -1; };
+    struct OwedMarker { int64_t producerId; int64_t judgeOffset; int64_t from; };   // a re-offered TxnJudge's marker, searched from `from`
     struct TxnKey { rune::view::ViewKey key; int64_t last; bool superseded; };
     struct TxnMarkerSeen { int64_t producerId; int64_t offset; bool commit; };
     enum class TxnStop : uint8_t { None, Probe, Marker };
     enum class ProbeStep : uint8_t { Next, Classified, Wait };
     [[nodiscard]] bool txnBatchDeferred_(int64_t producerId, int64_t base, int32_t records) noexcept;
     template <class ReadRangeFn, class Fn>
-    bool   walkBatches_(ReadRangeFn& readRange, int64_t from, int64_t to, Fn&& fn);
+    bool   walkBatches_(ReadRangeFn& readRange, int64_t from, int64_t to, Fn&& fn) noexcept;
     template <class ReadRangeFn>
-    bool   probeTxn_(ReadRangeFn& readRange, int64_t bound);
+    bool   probeTxn_(ReadRangeFn& readRange, int64_t bound) noexcept;
     ProbeStep probeBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len) noexcept;
     template <class ReadRangeFn>
-    bool   applyOrdinary_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted);
+    void   feedOwedMarkers_(ReadRangeFn& readRange, int64_t bound) noexcept;
+    [[nodiscard]] bool owedMarkerBatch_(const OwedMarker& m, const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len) noexcept;
+    void   pruneOwedMarkers_() noexcept;
+    template <class ReadRangeFn>
+    bool   applyOrdinary_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept;
     void   collectTxnBatch_(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, std::size_t len, int64_t producerId) noexcept;
     void   compactTxnKeys_() noexcept;
     [[nodiscard]] TxnKey* findTxnKey_(std::string_view key) noexcept;
@@ -327,6 +332,7 @@ private:
     int64_t                     ordinaryApplied_ = -1;    // that entry's records below it are applied (a read failed mid-way)
     TxnProbe                    probe_;
     std::vector<OrdinaryTxn>    ordinary_;
+    std::vector<OwedMarker>     owedMarkers_;
     std::vector<TxnKey>         txnKeys_;
     std::vector<TxnMarkerSeen>  txnMarkersSeen_;
     VerdictViewHooks            hooks_;
@@ -485,7 +491,7 @@ int VerdictSource::replayCandidates_(ReadRangeFn& readRange, int64_t bound, cons
 
 // fn(reader, batch, len) for every batch with an offset in [from, to); fn returns false to stop.  False: a read came back short.
 template <class ReadRangeFn, class Fn>
-bool VerdictSource::walkBatches_(ReadRangeFn& readRange, int64_t from, int64_t to, Fn&& fn) {
+bool VerdictSource::walkBatches_(ReadRangeFn& readRange, int64_t from, int64_t to, Fn&& fn) noexcept {
     for (int64_t at = from; at < to;) {
         const rune::storage::LogReadView v = readRange(at, to);
         if (v.empty()) return false;
@@ -510,22 +516,17 @@ bool VerdictSource::walkBatches_(ReadRangeFn& readRange, int64_t from, int64_t t
 // P11-2: the judge stands at the first record of probe_'s transaction, which has neither a committed TxnJudge it knows nor a marker.
 // Looks ahead below the HW for either, at most kTxnProbeBytesPerPass per pass, resuming where it stopped.  True: classified.
 template <class ReadRangeFn>
-bool VerdictSource::probeTxn_(ReadRangeFn& readRange, int64_t bound) {
+bool VerdictSource::probeTxn_(ReadRangeFn& readRange, int64_t bound) noexcept {
     std::size_t budget = kTxnProbeBytesPerPass;
     ProbeStep step = ProbeStep::Next;
-    bool paused = false;
     const bool read = walkBatches_(readRange, probe_.from, bound, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
         step = probeBatch_(r, b, len);
         if (step != ProbeStep::Next) return false;
         probe_.from = r.baseOffset() + r.lastOffsetDelta() + 1;
         budget -= std::min(budget, len);
-        paused = budget == 0 && !probe_.fedJudge;   // a re-offered TxnJudge lost its marker to the feed: find it whatever it costs
-        return !paused;
+        return budget > 0;
     });
-    if (step == ProbeStep::Next && read && !paused) {
-        probe_.from = std::max(probe_.from, bound);
-        if (probe_.fedJudge) step = ProbeStep::Classified;   // deferred, undecided
-    }
+    if (step == ProbeStep::Next && read && budget > 0) probe_.from = std::max(probe_.from, bound);
     if (step != ProbeStep::Classified) return false;
     probe_ = {};
     return true;
@@ -534,7 +535,7 @@ bool VerdictSource::probeTxn_(ReadRangeFn& readRange, int64_t bound) {
 // P11-2 / P11-3a: an ordinary transaction is applied at its marker, its records in offset order in this one step, each key that a
 // record of another writer applied before the marker supersedes applying nothing.  An aborted one is dropped.
 template <class ReadRangeFn>
-bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) {
+bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted) noexcept {
     const OrdinaryTxn o = ordinary_[markerAt_];
     if (o.commit) {
         txnKeys_.clear();
@@ -563,6 +564,24 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
     return true;
 }
 
+// F10: a re-offered TxnJudge's marker the feed dropped is found below the HW, kTxnProbeBytesPerPass per pass in all, resuming where it
+// stopped.  Until then T is undecided and holds judgedThrough().
+template <class ReadRangeFn>
+void VerdictSource::feedOwedMarkers_(ReadRangeFn& readRange, int64_t bound) noexcept {
+    pruneOwedMarkers_();
+    std::size_t budget = kTxnProbeBytesPerPass;
+    for (OwedMarker& m : owedMarkers_) {
+        if (budget == 0) return;
+        (void)walkBatches_(readRange, m.from, bound, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
+            if (owedMarkerBatch_(m, r, b, len)) return false;
+            m.from = r.baseOffset() + r.lastOffsetDelta() + 1;
+            budget -= std::min(budget, len);
+            return budget > 0;
+        });
+    }
+    pruneOwedMarkers_();
+}
+
 template <class ReadRangeFn>
 int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t nowNs, PartitionWriteState& state,
                               const rune::view::AbortedTxnFilter& aborted) {
@@ -571,6 +590,7 @@ int VerdictSource::driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t no
     int work = 0;
     if (needsActivation_) { activate_(state); ++work; }
     passHw_ = bound;
+    if (!owedMarkers_.empty()) feedOwedMarkers_(readRange, bound);
     state.txn.finalizeDecided(judgeCursor_, bound);
     rejectedThisPass_ = 0;
     for (const std::size_t i : active_) {
