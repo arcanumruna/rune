@@ -98,3 +98,34 @@ TEST(CheckedWritesRejectedIndex, CountAtOrAfter) {
     EXPECT_EQ(idx.countAtOrAfter(9), 2u);
     EXPECT_EQ(idx.countAtOrAfter(21), 0u);
 }
+
+TEST(CheckedWritesRejectedIndex, InsertRunOutOfOrder) {
+    auto idx = indexWith({50, 60});
+    const std::vector<int64_t> run{10, 11, 12};
+    ASSERT_TRUE(idx.insertRun(run, 55, 7));
+    EXPECT_EQ(idx.size(), 5u);
+    std::vector<int64_t> seen;
+    idx.forEachIn(0, 100, [&](const Entry& e) { seen.push_back(e.offset); });
+    EXPECT_EQ(seen, (std::vector<int64_t>{10, 11, 12, 50, 60}));
+    EXPECT_TRUE(idx.isRejected(11));
+    EXPECT_EQ(idx.find(11)->constraintId, 7u);
+}
+
+TEST(CheckedWritesRejectedIndex, InsertRunRefusedWhenFull) {
+    auto idx = indexWith({50, 60}, 3);
+    const std::vector<int64_t> run{10, 11};
+    EXPECT_FALSE(idx.insertRun(run, 55, 7));
+    EXPECT_EQ(idx.size(), 2u);
+}
+
+// F7, F9: a run over offsets the index holds keeps them, and a different verdict is a mismatch.
+TEST(CheckedWritesRejectedIndex, InsertRunKeepsAnExistingVerdictAndCountsAMismatchRegression) {
+    auto idx = indexWith({50, 60});
+    const std::vector<int64_t> run{50, 55};
+    ASSERT_TRUE(idx.insertRun(run, 99, 7));
+    EXPECT_EQ(idx.size(), 3u);
+    EXPECT_EQ(idx.find(50)->code, 55);
+    EXPECT_EQ(idx.mismatches(), 1u);
+    ASSERT_TRUE(idx.insertRun(run, 99, 7));
+    EXPECT_EQ(idx.size(), 3u);
+}

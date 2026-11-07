@@ -866,6 +866,7 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesQlCompileTest.cpp
         tests/node/CheckedWritesConstraintDdlTest.cpp
         tests/node/CheckedWritesConstraintVerdictTest.cpp
+        tests/node/CheckedWritesTxnJudgeTest.cpp
         ${RUNE_BROKER_DIR}/../ql/tests/CheckedWritesQlFuzzTest.cpp)
     target_include_directories(rune_checked_writes_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}

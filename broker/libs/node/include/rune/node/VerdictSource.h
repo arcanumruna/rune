@@ -71,6 +71,43 @@ struct VerdictViewHooks {
     void (*retired)(void* ctx, int32_t viewTopicId, int32_t partition) = nullptr;
 };
 
+/// The worker's transaction overlays.  `at(i)` is stable; an overlay is bound to one source key while it is acquired.
+class TxnOverlayPool {
+public:
+    /// Cold.  The caller's precondition: rows >= txnJudgedRecordsMax x the sum, over the verdict members of the source, of
+    /// (key index 1; aggregate 4 x kSlotsPerTable + 3; projection = its applyTo write set + 1), and maxRowLen >= the largest
+    /// member table rowLen, ClaimsExtras included.  An undersized overlay stalls the judge on a legal transaction.
+    void reserveFor(std::size_t rows, uint32_t maxRowLen) {
+        for (rune::view::TxnOverlay& o : overlays_) o.reserve(rows, maxRowLen);
+    }
+    /// A cleared overlay bound to `sourceKey`, or -1 when all are in use.
+    [[nodiscard]] int32_t acquire(uint64_t sourceKey) noexcept {
+        for (std::size_t i = 0; i < overlays_.size(); ++i) {
+            if (inUse_[i]) continue;
+            inUse_[i] = true;
+            overlays_[i].bind(sourceKey);
+            return static_cast<int32_t>(i);
+        }
+        return -1;
+    }
+    void release(int32_t i) noexcept {
+        overlays_[static_cast<std::size_t>(i)].clear();
+        inUse_[static_cast<std::size_t>(i)] = false;
+    }
+    [[nodiscard]] rune::view::TxnOverlay& at(int32_t i) noexcept { return overlays_[static_cast<std::size_t>(i)]; }
+    /// The acquired overlays bound to `sourceKey`.
+    [[nodiscard]] rune::view::TxnLockSet lockSetFor(uint64_t sourceKey) const noexcept {
+        rune::view::TxnLockSet set;
+        for (std::size_t i = 0; i < overlays_.size(); ++i)
+            if (inUse_[i] && overlays_[i].sourceKey() == sourceKey) set.locked[set.count++] = &overlays_[i];
+        return set;
+    }
+
+private:
+    std::array<rune::view::TxnOverlay, rune::view::kTxnOverlaysPerWorker> overlays_;
+    std::array<bool, rune::view::kTxnOverlaysPerWorker>                    inUse_{};
+};
+
 class VerdictSource {
 public:
     static constexpr int64_t kChangeDeferred = -1, kChangeUnchanged = -2;
@@ -96,6 +133,13 @@ public:
     template <class ReadRangeFn>
     int driveJudge(ReadRangeFn&& readRange, int64_t bound, int64_t nowNs, PartitionWriteState& state,
                    const rune::view::AbortedTxnFilter& aborted = {});
+
+    /// Cold: the worker's overlay pool, the batch's own overlays and the knob the pool was sized for.
+    void bindTxn(TxnOverlayPool* pool, std::span<rune::view::TxnOverlay> batchOverlay, int32_t txnJudgedRecordsMax) noexcept {
+        txnPool_ = pool;
+        batchOverlay_ = batchOverlay;
+        txnJudgedRecordsMax_ = txnJudgedRecordsMax;
+    }
 
     [[nodiscard]] int64_t judgedThrough() const noexcept { return judgeCursor_; }
     [[nodiscard]] int32_t partition() const noexcept { return partition_; }
@@ -234,6 +278,9 @@ private:
     uint8_t                     lastIntent_ = 0;
     int64_t                     testNextOffset_ = 0;
     bool                        captureAppended_ = true;
+    TxnOverlayPool*             txnPool_ = nullptr;
+    std::span<rune::view::TxnOverlay> batchOverlay_;
+    int32_t                     txnJudgedRecordsMax_ = 0;
     VerdictViewHooks            hooks_;
     VerdictSourceStats          stats_;
     std::vector<uint8_t>        scratch_;
@@ -252,6 +299,7 @@ inline void verdictFeedBegin(void* state, int64_t, int64_t target) noexcept {
     s.retainedPlans.truncateFrom(target);
     s.markers.truncateFrom(target);
     s.rejected.truncateFrom(target);
+    s.txn.truncateFrom(target);
 }
 
 inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int64_t base) noexcept {
@@ -282,6 +330,11 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
         for (uint16_t i = 0; i < count; ++i)
             set.members[i] = ConstraintSetMember{wire[i].viewObjectId, static_cast<rune::view::VerdictViewKind>(wire[i].kind), wire[i].planFingerprint};
         s.constraintSets.onChange(base, set);
+    } else if (c->type == cr::kTxnJudge) {
+        if (const auto j = cr::parseTxnJudge(*c)) {
+            if (!s.txn.reserved()) s.txn.reserve();
+            (void)s.txn.onJudgeRecord(base, *j);
+        }
     } else if (c->type == cr::kReservation) {
         if (const auto r = cr::parseReservation(*c)) s.autoInc.onReservation(*r);
     } else if (c->type == cr::kVerdictPlan) {
@@ -289,6 +342,11 @@ inline void verdictFeedBatch(void* state, const uint8_t* b, std::size_t len, int
         std::span<const uint8_t> plan, out, src;
         if (cr::parseVerdictPlan(*c, h, plan, out, src)) s.retainedPlans.onRecord(base, h.viewObjectId, h.planFingerprint, static_cast<rune::view::VerdictViewKind>(h.kind), plan, out, src);
     }
+}
+
+/// A COMMIT / ABORT marker (RcVerdictHooks::marker).
+inline void verdictFeedMarker(void* state, int64_t producerId, int64_t offset, bool commit) noexcept {
+    static_cast<PartitionWriteState*>(state)->txn.onMarker(producerId, offset, commit);
 }
 
 /// verdictFeedBegin for an autoincrement source: the counter and the side window are rebuilt by the same scan.

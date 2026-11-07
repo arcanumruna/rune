@@ -7263,7 +7263,7 @@ private:
             const bool autoInc = slot.write->spec->autoIncrement;
             slot.rc->setVerdictHooks(RcVerdictHooks{.begin = autoInc ? &autoIncFeedBegin : &verdictFeedBegin, .batch = &verdictFeedBatch, .ctx = slot.write.get(),
                                                     .dataBatch = autoInc ? &autoIncFeedDataBatch : nullptr,
-                                                    .end = autoInc ? &autoIncFeedEnd : nullptr});
+                                                    .end = autoInc ? &autoIncFeedEnd : nullptr, .marker = &verdictFeedMarker});
         } else if (slot.rc) {
             slot.rc->setVerdictHooks(RcVerdictHooks{});
         }

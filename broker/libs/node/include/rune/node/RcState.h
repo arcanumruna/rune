@@ -129,6 +129,7 @@ struct RcVerdictHooks {
     void* ctx = nullptr;
     void (*dataBatch)(void* ctx, const uint8_t* batch, std::size_t len, int64_t baseOffset) noexcept = nullptr;
     void (*end)(void* ctx) noexcept = nullptr;
+    void (*marker)(void* ctx, int64_t producerId, int64_t offset, bool commit) noexcept = nullptr;   ///< a COMMIT / ABORT marker, appended or scanned
 };
 
 /// A fixed-capacity open-addressing set of producer ids (>= 0): linear probing at
@@ -675,9 +676,14 @@ private:
         verify_.clear();    // #112: a new leadership verifies anew (its open txns come from the log)
         st_ = Unbuilt{};
     }
+    void feedMarker_(rune::transaction::RcBuilder::Outcome outcome, int64_t producerId, int64_t offset) noexcept {
+        using O = rune::transaction::RcBuilder::Outcome;
+        if (outcome == O::CommitMarker || outcome == O::AbortMarker) verdict_.marker(verdict_.ctx, producerId, offset, outcome == O::CommitMarker);
+    }
     void applyMarker_(int64_t producerId, int64_t offset, bool commit) {
         const int64_t first = tracker_.onControlMarker(producerId, offset, commit);
         if (!commit && first >= 0) aborted_.onAbortMarker(producerId, first, offset);
+        if (verdict_.marker != nullptr) verdict_.marker(verdict_.ctx, producerId, offset, commit);
     }
     static std::size_t pageSize_() noexcept {
         static const std::size_t p = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
@@ -875,6 +881,8 @@ private:
                     verdict_.batch(verdict_.ctx, p + pos, len, base);
                 if (verdict_.dataBatch != nullptr && r.producerId() >= 0 && (r.attributes() & rune::protocol::batch::kAttrControl) == 0) [[unlikely]]
                     verdict_.dataBatch(verdict_.ctx, p + pos, len, base);
+                if (verdict_.marker != nullptr) [[unlikely]]
+                    feedMarker_(out.outcome, r.producerId(), base);
                 s.cursor = last + 1;
             }
             pos += len;
@@ -1003,6 +1011,8 @@ private:
             if (psm_ != nullptr) feedProducerState_(r, out.outcome, v.data, v.len, /*markerFromRebuild=*/true);
             if (verdict_.dataBatch != nullptr && r.producerId() >= 0 && (r.attributes() & kAttrControl) == 0) [[unlikely]]
                 verdict_.dataBatch(verdict_.ctx, v.data, v.len, r.baseOffset());
+            if (verdict_.marker != nullptr) [[unlikely]]
+                feedMarker_(out.outcome, r.producerId(), r.baseOffset());
             bytes     += v.len;
             cur.cursor = v.nextOffset;
         }

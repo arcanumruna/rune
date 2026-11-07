@@ -41,6 +41,17 @@ public:
         return true;
     }
 
+    /// Cold, out of order: inserts a transaction's rejected offsets, all with one verdict.  False (nothing inserted) when they do not fit.
+    [[nodiscard]] bool insertRun(std::span<const int64_t> offsets, uint16_t code, uint32_t constraintId) {
+        if (entries_.size() + offsets.size() > capacity_) return false;
+        for (const int64_t o : offsets) {
+            const auto it = lowerBound(o);
+            if (it == entries_.end() || it->offset != o) entries_.insert(it, Entry{o, code, constraintId});
+            else if (it->code != code || it->constraintId != constraintId) ++mismatches_;
+        }
+        return true;
+    }
+
     /// Replica apply and recovery: merges a marker covering [fromOffset, finalThrough).  Cold; idempotent.  An entry
     /// the index holds with another verdict, and an index entry inside the range that the marker lacks, count a
     /// mismatch (a determinism alarm).
