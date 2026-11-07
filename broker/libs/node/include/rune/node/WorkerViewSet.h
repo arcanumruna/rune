@@ -160,7 +160,8 @@ public:
                                          int64_t committedTail, const SourceLogBounds& b = {});
 
     // Task 16: install a view FOR RECOVERY for ONE partition.  Registers the
-    // plan template (like installView) AND eagerly creates the (view, partition)
+    // plan template (like installView) unless one already exists, which is kept
+    // as it is, AND eagerly creates the (view, partition)
     // instance, then loads its on-disk checkpoint into the partition's table via
     // rune::view::replay(base, deltasInOrder) — setting foldCursor to the
     // recovered O (the highest applied checkpoint offset; 0 for an empty/missing

@@ -285,10 +285,9 @@ void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
     }
 
     // Bug A: insert_or_assign would otherwise RESET a previously-latched
-    // underRecovery back to its default (false) on a re-install (e.g.
-    // installViewForRecovery re-registering the same template for a second
-    // partition) unless the caller re-asserts it — every recovery call site
-    // below does.
+    // underRecovery back to its default (false) on a re-install unless the
+    // caller re-asserts it.  installViewForRecovery no longer re-installs an
+    // existing template.
     templates_.insert_or_assign(
         viewTopicId,
         ViewTemplate{std::move(plan), std::move(layout), std::move(evolvingSrc), persisted,
@@ -756,8 +755,9 @@ void WorkerViewSet::installViewForRecovery(
     const int32_t viewTopicId = plan.viewTopicId;
 
     // Register the plan template + reactor index exactly as the normal path
-    // does (moves plan/layout/evolvingSrc into templates_).  underRecovery is
-    // deliberately left FALSE on this call: this function constructs + loads
+    // does (moves plan/layout/evolvingSrc into templates_) when none exists yet.
+    // underRecovery is deliberately FALSE here (cleared on an existing
+    // template): this function constructs + loads
     // THIS (view, partition) instance explicitly below, from the CALLER-
     // supplied base/deltasInOrder (which may be synthetic test spans, not
     // necessarily this worker's on-disk file) — latching underRecovery=true
@@ -772,8 +772,7 @@ void WorkerViewSet::installViewForRecovery(
     else
         installView(std::move(plan), std::move(layout), std::move(evolvingSrc), persisted);
 
-    // Eagerly build the (view, partition) instance from the just-installed
-    // template (recovery is partition-specific; it must not wait for a lazy
+    // Eagerly build the (view, partition) instance from the template (recovery is partition-specific; it must not wait for a lazy
     // first driveFolds).  underRecovery is still false at this point, so
     // getOrCreate_ default-constructs a plain Ready instance (no auto-load);
     // its readiness is set definitively by the explicit replay() below.
