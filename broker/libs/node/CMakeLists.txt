@@ -1960,9 +1960,10 @@ if(BUILD_TESTING)
         # Checked writes Part 04 Task 11: the seeded verdict stress on three real brokers (each seed is one ctest case).
         # Labelled stress and kept out of the regular slice (-LE stress) until every seed passes.
         add_executable(rune_checked_writes_stress_tests tests/integration/CheckedWritesStressTest.cpp)
-        target_include_directories(rune_checked_writes_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_include_directories(rune_checked_writes_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests ${RUNE_CLIENT_ROOT}/src/cli)
+        target_compile_definitions(rune_checked_writes_stress_tests PRIVATE RUNE_QL_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/ql/tests/golden")
         target_link_libraries(rune_checked_writes_stress_tests PRIVATE rune_node rune_replication rune_view rune_codec rune_catalog
-                              rune_client_api aeron::aeron GTest::gtest_main)
+                              rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_checked_writes_stress_tests PROPERTIES TIMEOUT 1800 LABELS stress)
 
         # Checked writes Part 09 Task 5a (#788): a lagging leader never undoes a newer constraint-set change, on three real brokers.
