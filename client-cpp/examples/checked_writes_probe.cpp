@@ -28,18 +28,37 @@
 //   ai-verify    a subscription from 0 holds exactly the ids of the ai-backfill and ai-create result files, one insert each.
 //   ai-refusals  autoincrement on a cleanup.policy = delete topic: InvalidRequest with the exact detail.
 //
+// The RegressorsPath legs (Part 09) run against the golden script's `user` and `character` topics and its views.  Every write
+// leaves one result line `<op> <key> <code> <constraintName> <offset> <name> <id>` in <KI_E2E_SHARED>/<tag>-w<worker>.txt: op is
+// login (user topic) or create / remove (character topic), key the subject number (login) or the user, code as above (55 =
+// ConstraintViolation, 57 = KeyNotFound), constraintName `view.constraint` of a 55 (- otherwise), offset the record's offset (-1
+// none), name the subject / character name, id the assigned id (login: a loser's id is what its minOffset read of user_identity returned).
+//   rp-setup       prints RP_USER_TOPIC_ID, RP_CHARACTER_TOPIC_ID and CHECKED-WRITES-RP-SETUP: OK once the golden views exist.
+//   rp-login       --worker <i> --subjects <a>-<b>: first logins of "steam:<n>"; writes <tag> rp-login and rp-login-progress-w<i>.
+//   rp-characters  --worker <i> --users <a>-<b>: 13 creates per user (names unique per worker); workers 0 and 1 also race one
+//                  Foo<u> / foo<u> pair per odd user u on the users kRpPairBase + u and + u + 1.  Tag rp-characters.
+//   rp-restart     --users <a>-<b>: the account_stats row of each user, then a 13th create.  Tag rp-restart.
+//   rp-lifecycle   --users <a>-<b>: removeExisting one character, count, reuse its name for another user, removeExisting again.
+//   rp-verify      a subscription from 0 on user and character holds no offset a write was refused at.
+//   rp-compact     accepted updates on user and character until both leaders report rejectedNotCompacted 0.
+//
 // Environment: RUNE_TARGET, RUNE_EGRESS_HOST + RUNE_EGRESS_PORT, RUNE_DATA_DIR, RUNE_USER / RUNE_PASSWORD_FILE /
 // RUNE_TLS_CA_FILE, RUNE_TIMEOUT_MS, KI_E2E_SHARED (a writable directory shared between legs), KI_E2E_THREADS.
 
 #include "ExampleAuth.h"
 #include "ai_user.gen.h"
 #include "ki_account.gen.h"
+#include "rp_character.gen.h"
+#include "rp_user.gen.h"
 
+#include <rune/catalog/CatalogQueries.h>
 #include <rune/client/Client.h>
 #include <rune/client/Key.h>
 #include <rune/client/TypedTopic.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/subscriber/Subscription.h>
+#include <rune/client/view/ViewKeyBuilder.h>
+#include <rune/client/view/ViewRowCodec.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 
@@ -51,11 +70,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <expected>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -69,6 +92,11 @@ using Account = rune::gen::KiAccount;
 using Typed   = TypedTopic<Account, ProducerRef>;
 using AiUser  = rune::gen::AiUser;
 using AiTyped = TypedTopic<AiUser, ProducerRef>;
+namespace rcv = rune::client::view;
+using RpUser      = rune::gen::User;        // the golden script's topics (rp_user.gen.h, rp_character.gen.h)
+using RpCharacter = rune::gen::Character;
+using RpUserTyped = TypedTopic<RpUser, ProducerRef>;
+using RpCharTyped = TypedTopic<RpCharacter, ProducerRef>;
 
 namespace {
 
@@ -79,6 +107,11 @@ constexpr uint16_t    kInvalidRequest = 39;
 constexpr uint64_t    kAbsentBase = 1'000'000;   // ids no leg ever inserts
 constexpr int         kWriteWaitS = 120;         // one write's verdict, across a leader change
 constexpr int         kClientErr  = 20000;       // result code of a write that threw
+constexpr int         kConstraintViolation = 55;
+constexpr int         kKeyNotFound         = 57;
+constexpr uint64_t    kRpPairBase = 1'000'000;   // the users of the Foo / foo pairs (RP_PAIR_BASE in the script)
+constexpr uint64_t    kRpLifeBase = 2'000'000;   // the users the lifecycle's name reuse creates for
+constexpr int         kRpCharsPerUser = 13;
 
 std::string envStr(const char* name, const std::string& def = {}) {
     const char* v = std::getenv(name);
@@ -225,7 +258,7 @@ bool parseArgs(int argc, char** argv, Args& a) {
         else if (k == "--tag") a.tag = v;
         else if (k == "--step") a.step = std::strtoull(v.c_str(), nullptr, 10);
         else if (k == "--count") a.count = std::strtoull(v.c_str(), nullptr, 10);
-        else if (k == "--ids") {
+        else if (k == "--ids" || k == "--subjects" || k == "--users") {
             const auto dash = v.find('-');
             if (dash == std::string::npos) return false;
             a.lo = std::strtoull(v.c_str(), nullptr, 10);
@@ -595,6 +628,428 @@ int runAiRefusals() {
     return 0;
 }
 
+// ---- RegressorsPath --------------------------------------------------------------------------------------------------
+
+/// One thread's writer on the golden script's user and character topics.
+struct RpWriter {
+    Producer    producer;
+    RpUserTyped users;
+    RpCharTyped characters;
+    explicit RpWriter(Client& c)
+        : producer(c.producer(writerConfig())), users(c.openTopicAndWait<RpUser>("user", producer, 60s)),
+          characters(c.openTopicAndWait<RpCharacter>("character", producer, 60s)) {}
+    ~RpWriter() { producer.closeImmediately(); }
+};
+
+struct RpLine {
+    std::string op;
+    uint64_t    key = 0;
+    int         code = kClientErr;
+    uint32_t    constraintId = 0;
+    int64_t     offset = -1;
+    std::string name;
+    uint64_t    id = 0;
+};
+
+/// Runs one write; the line carries its verdict (code as write(): 0 Ok, the broker's code, 10000 + OpStatus, kClientErr when it threw).
+template <class Send>
+RpLine rpWrite(const char* op, uint64_t key, const std::string& name, Send&& send) {
+    RpLine l{op, key, kClientErr, 0, -1, name, 0};
+    try {
+        const WriteResult r = send();
+        l.code         = r.ok() ? 0 : (r.code() != 0 ? r.code() : 10000 + static_cast<int>(r.status()));
+        l.constraintId = r.constraintId();
+        l.offset       = r.offset();
+        l.id           = r.key();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s %llu threw: %s\n", op, static_cast<unsigned long long>(key), e.what());
+    }
+    return l;
+}
+
+RpLine rpCreate(RpWriter& w, uint64_t user, const std::string& name) {
+    RpCharacter ch;
+    ch.userId = user;
+    ch.gender = 1;
+    std::snprintf(ch.name.data(), ch.name.size(), "%s", name.c_str());
+    return rpWrite("create", user, name, [&] { return w.characters.insertAndWait(ch, std::chrono::seconds(kWriteWaitS)); });
+}
+
+RpLine rpRemoveExisting(RpWriter& w, uint64_t user, uint64_t characterId, const std::string& name) {
+    RpLine l = rpWrite("remove", user, name, [&] { return w.characters.removeExistingAndWait(characterId, std::chrono::seconds(kWriteWaitS)); });
+    l.id = characterId;
+    return l;
+}
+
+/// <tag>-progress-w<worker>: the writes completed so far, rewritten every 250 ms while the object lives.
+class Progress {
+public:
+    std::atomic<int64_t> done{0};
+    Progress(const std::string& tag, int worker) : path_(shared() + "/" + tag + "-progress-w" + std::to_string(worker)), reporter_([this] {
+        while (!finished_.load()) {
+            writeFileAtomic(path_, std::to_string(done.load()) + "\n");
+            std::this_thread::sleep_for(250ms);
+        }
+    }) {}
+    ~Progress() {
+        finished_ = true;
+        reporter_.join();
+        writeFileAtomic(path_, std::to_string(done.load()) + "\n");
+    }
+private:
+    std::string       path_;
+    std::atomic<bool> finished_{false};
+    std::thread       reporter_;
+};
+
+/// Runs `body(writer, thread index, thread count, lines)` on KI_E2E_THREADS threads, each with its own RpWriter.
+template <class Body>
+std::vector<RpLine> runRpThreads(Client& c, Body&& body) {
+    const int threads = static_cast<int>(envInt("KI_E2E_THREADS", 16));
+    std::vector<std::vector<RpLine>> lines(static_cast<std::size_t>(threads));
+    std::vector<std::unique_ptr<RpWriter>> writers;
+    for (int i = 0; i < threads; ++i) writers.push_back(std::make_unique<RpWriter>(c));
+    std::vector<std::thread> ts;
+    for (int i = 0; i < threads; ++i)
+        ts.emplace_back([&, i] { body(*writers[static_cast<std::size_t>(i)], i, threads, lines[static_cast<std::size_t>(i)]); });
+    for (auto& t : ts) t.join();
+    std::vector<RpLine> all;
+    for (auto& l : lines) all.insert(all.end(), l.begin(), l.end());
+    return all;
+}
+
+/// Writes the lines of <tag>-w<worker>.txt; a 55 names its constraint (resolved here: constraintName is for the Client's own thread).
+void saveRpLines(Client& c, const std::string& tag, int worker, const std::vector<RpLine>& lines) {
+    std::map<uint32_t, std::string> names;
+    std::string text;
+    for (const RpLine& l : lines) {
+        std::string constraint = "-";
+        if (l.code == kConstraintViolation && l.constraintId != 0) {
+            auto it = names.find(l.constraintId);
+            if (it == names.end()) {
+                const auto n = c.constraintName(l.constraintId);
+                it = names.emplace(l.constraintId, n ? n->view + "." + n->constraint : "unknown").first;
+            }
+            constraint = it->second;
+        }
+        text += l.op + " " + std::to_string(l.key) + " " + std::to_string(l.code) + " " + constraint + " " + std::to_string(l.offset) + " " +
+                (l.name.empty() ? "-" : l.name) + " " + std::to_string(l.id) + "\n";
+    }
+    writeFileAtomic(shared() + "/" + tag + "-w" + std::to_string(worker) + ".txt", text);
+}
+
+/// The lines of every <prefix>*.txt result file in the shared directory.
+std::vector<RpLine> readRpLines(std::initializer_list<const char*> prefixes) {
+    std::vector<RpLine> all;
+    for (const auto& e : std::filesystem::directory_iterator(shared())) {
+        const std::string name = e.path().filename().string();
+        bool wanted = name.size() > 4 && name.compare(name.size() - 4, 4, ".txt") == 0;
+        bool prefixed = false;
+        for (const char* p : prefixes) prefixed = prefixed || name.rfind(p, 0) == 0;
+        if (!wanted || !prefixed) continue;
+        std::ifstream f(e.path());
+        RpLine l;
+        std::string constraint;
+        while (f >> l.op >> l.key >> l.code >> constraint >> l.offset >> l.name >> l.id) all.push_back(l);
+    }
+    return all;
+}
+
+rune::catalog::CatalogState latestCatalog(Client& c) {
+    auto r = c.catalogAsOf(rune::catalog::AsOf{.by = rune::catalog::AsOf::By::Offset, .value = std::numeric_limits<int64_t>::max()}, 30s);
+    if (!r) throw std::runtime_error("the catalog could not be read");
+    return std::move(*r);
+}
+
+std::vector<uint8_t> keyBytes(std::expected<std::vector<uint8_t>, std::string> k) {
+    if (!k) throw std::runtime_error(k.error());
+    return std::move(*k);
+}
+
+/// A view of the golden script: its topic id, row layout and key builder, read from the catalog.
+struct RpView {
+    int32_t                  topic = -1;
+    rcv::RowLayout           layout;
+    std::vector<std::string> names;
+    rcv::ViewKeyBuilder      builder;
+
+    RpView(const rune::catalog::CatalogState& state, const std::string& view) : builder([&] {
+        auto b = rcv::ViewKeyBuilder::fromCatalog(state, view);
+        if (!b) throw std::runtime_error(view + ": " + b.error());
+        return std::move(*b);
+    }()) {
+        const auto* v = state.viewByName(rune::catalog::kDefaultNsId, view);
+        if (v == nullptr) throw std::runtime_error("no view " + view);
+        topic = v->def.viewTopicId;
+        std::vector<rune::codec::PrimType> types;
+        std::vector<uint16_t> widths;
+        for (const auto& f : rune::codec::deserialize(v->def.outputDescriptorBlob).fields) {
+            names.push_back(f.name);
+            types.push_back(f.type);
+            widths.push_back(f.type == rune::codec::PrimType::FixedStr ? f.fixedLen : uint16_t{0});
+        }
+        layout = rcv::buildRowLayout(types, widths);
+    }
+    [[nodiscard]] uint64_t u(std::span<const uint8_t> row, const std::string& column) const {
+        const auto slot = static_cast<uint16_t>(std::find(names.begin(), names.end(), column) - names.begin());
+        const rcv::FieldValue f = rcv::readSlot(row, layout, slot);
+        return f.type == rune::codec::PrimType::Int64 ? static_cast<uint64_t>(f.i) : f.u;
+    }
+};
+
+/// The row of `key` once it reads Ok at `minOffset` (a view that is not ready or a leader that moved is retried); nullopt after `within`.
+std::optional<std::vector<uint8_t>> rpRowWhenReady(Client& c, const RpView& v, std::span<const uint8_t> key, int64_t minOffset, std::chrono::seconds within) {
+    std::string last = "no answer";
+    for (const auto deadline = Clock::now() + within; Clock::now() < deadline; std::this_thread::sleep_for(100ms)) {
+        try {
+            ViewReadOptions o;
+            o.minOffset = minOffset;
+            ViewRowResult r = c.getViewRowAndWait(v.topic, key, o, 10s);
+            if (r.status == ViewRowResult::kOk) return std::move(r.rowBytes);
+            last = "status " + std::to_string(r.status);
+        } catch (const std::runtime_error& e) {
+            last = e.what();
+        }
+    }
+    std::fprintf(stderr, "view %d: no Ok row within %lld s (last: %s)\n", v.topic, static_cast<long long>(within.count()), last.c_str());
+    return std::nullopt;
+}
+
+std::string rpSubject(uint64_t n) { return "steam:" + std::to_string(n); }
+
+std::map<uint64_t, std::vector<uint8_t>> statsKeys(RpView& stats, uint64_t lo, uint64_t hi) {
+    std::map<uint64_t, std::vector<uint8_t>> keys;
+    for (uint64_t u = lo; u <= hi; ++u) {
+        stats.builder.clear();
+        keys[u] = keyBytes(stats.builder.setUInt("userId", u).key());
+    }
+    return keys;
+}
+
+int runRpSetup() {
+    Client c(makeConfig());
+    c.connectAndWait();
+    const auto state = latestCatalog(c);
+    const auto* user = state.topicByName(rune::catalog::kDefaultNsId, "user");
+    const auto* character = state.topicByName(rune::catalog::kDefaultNsId, "character");
+    if (user == nullptr || character == nullptr) { fail("CHECKED-WRITES-RP-SETUP", "the user or the character topic is missing"); return 1; }
+    for (const char* view : {"user_identity", "character_name", "account_stats"})
+        if (state.viewByName(rune::catalog::kDefaultNsId, view) == nullptr) { fail("CHECKED-WRITES-RP-SETUP", std::string("the view ") + view + " is missing"); return 1; }
+    std::printf("RP_USER_TOPIC_ID=%d\nRP_CHARACTER_TOPIC_ID=%d\nCHECKED-WRITES-RP-SETUP: OK\n", user->topicId, character->topicId);
+    std::fflush(stdout);
+    return 0;
+}
+
+int runRpLogin(const Args& a) {
+    Client c(makeConfig());
+    c.connectAndWait();
+    const auto state = latestCatalog(c);
+    RpView identity(state, "user_identity");
+    std::map<uint64_t, std::vector<uint8_t>> keys;
+    for (uint64_t n = a.lo; n <= a.hi; ++n) {
+        identity.builder.clear();
+        keys[n] = keyBytes(identity.builder.setUInt("provider", 1).setString("subject", rpSubject(n)).key());
+    }
+    std::vector<RpLine> lines;
+    {
+        Progress progress("rp-login", a.worker);
+        lines = runRpThreads(c, [&](RpWriter& w, int idx, int threads, std::vector<RpLine>& out) {
+            for (uint64_t n = a.lo + static_cast<uint64_t>(idx); n <= a.hi; n += static_cast<uint64_t>(threads)) {
+                RpUser u;
+                u.provider = 1;
+                const std::string subject = rpSubject(n);
+                std::snprintf(u.subject.data(), u.subject.size(), "%s", subject.c_str());
+                RpLine l = rpWrite("login", n, subject, [&] { return w.users.insertAndWait(u, std::chrono::seconds(kWriteWaitS)); });
+                if (l.code == kConstraintViolation && l.offset >= 0) {
+                    const auto row = rpRowWhenReady(c, identity, keys.at(n), l.offset, 30s);
+                    l.id = row ? identity.u(*row, "userId") : 0;
+                }
+                out.push_back(l);
+                ++progress.done;
+            }
+        });
+    }
+    saveRpLines(c, "rp-login", a.worker, lines);
+    std::printf("CHECKED-WRITES-RP-LOGIN: DONE worker=%d logins=%zu\n", a.worker, lines.size());
+    std::fflush(stdout);
+    return 0;
+}
+
+int runRpCharacters(const Args& a) {
+    Client c(makeConfig());
+    c.connectAndWait();
+    std::vector<RpLine> lines;
+    {
+        Progress progress("rp-characters", a.worker);
+        lines = runRpThreads(c, [&](RpWriter& w, int idx, int threads, std::vector<RpLine>& out) {
+            for (uint64_t u = a.lo + static_cast<uint64_t>(idx); u <= a.hi; u += static_cast<uint64_t>(threads)) {
+                if (a.worker < 2 && u % 2 == 1) {   // worker 0 creates Foo<u>, worker 1 foo<u>: one name, two users, at the same time
+                    out.push_back(rpCreate(w, kRpPairBase + u + static_cast<uint64_t>(a.worker), std::string(a.worker == 0 ? "Foo" : "foo") + std::to_string(u)));
+                    ++progress.done;
+                }
+                for (int i = 0; i < kRpCharsPerUser; ++i) {
+                    out.push_back(rpCreate(w, u, "w" + std::to_string(a.worker) + "u" + std::to_string(u) + "c" + std::to_string(i)));
+                    ++progress.done;
+                }
+            }
+        });
+    }
+    saveRpLines(c, "rp-characters", a.worker, lines);
+    std::printf("CHECKED-WRITES-RP-CHARACTERS: DONE worker=%d creates=%zu\n", a.worker, lines.size());
+    std::fflush(stdout);
+    return 0;
+}
+
+int runRpRestart(const Args& a) {
+    Client c(makeConfig());
+    c.connectAndWait();
+    const auto state = latestCatalog(c);
+    RpView stats(state, "account_stats");
+    const auto keys = statsKeys(stats, a.lo, a.hi);
+    const auto lines = runRpThreads(c, [&](RpWriter& w, int idx, int threads, std::vector<RpLine>& out) {
+        for (uint64_t u = a.lo + static_cast<uint64_t>(idx); u <= a.hi; u += static_cast<uint64_t>(threads)) {
+            const RpLine refused = rpCreate(w, u, "w9u" + std::to_string(u) + "c13");
+            const auto row = rpRowWhenReady(c, stats, keys.at(u), refused.offset, 120s);   // read at the refused record's offset: the fold has caught up
+            out.push_back({"stats", u, row ? 0 : kClientErr, 0, -1, "-", row ? stats.u(*row, "characters") : 0});
+            out.push_back(refused);
+        }
+    });
+    saveRpLines(c, "rp-restart", a.worker, lines);
+    std::printf("CHECKED-WRITES-RP-RESTART: DONE users=%zu\n", lines.size() / 2);
+    std::fflush(stdout);
+    return 0;
+}
+
+int runRpLifecycle(const Args& a) {
+    // The first accepted character of each user, from the rp-characters result files.
+    std::map<uint64_t, std::pair<uint64_t, std::string>> first;
+    for (const RpLine& l : readRpLines({"rp-characters-w"}))
+        if (l.op == "create" && l.code == 0 && l.key >= a.lo && l.key <= a.hi && !first.contains(l.key)) first[l.key] = {l.id, l.name};
+    Client c(makeConfig());
+    c.connectAndWait();
+    const auto state = latestCatalog(c);
+    RpView stats(state, "account_stats");
+    const auto keys = statsKeys(stats, a.lo, a.hi);
+    const auto lines = runRpThreads(c, [&](RpWriter& w, int idx, int threads, std::vector<RpLine>& out) {
+        for (uint64_t u = a.lo + static_cast<uint64_t>(idx); u <= a.hi; u += static_cast<uint64_t>(threads)) {
+            const auto it = first.find(u);
+            if (it == first.end()) { out.push_back({"remove", u, kClientErr, 0, -1, "-", 0}); continue; }
+            const auto& [characterId, name] = it->second;
+            const RpLine removed = rpRemoveExisting(w, u, characterId, name);
+            out.push_back(removed);
+            if (removed.code == 0) {
+                const auto row = rpRowWhenReady(c, stats, keys.at(u), removed.offset, 120s);
+                out.push_back({"stats", u, row ? 0 : kClientErr, 0, -1, "-", row ? stats.u(*row, "characters") : 0});
+            }
+            out.push_back(rpCreate(w, kRpLifeBase + u, name));
+            out.push_back(rpRemoveExisting(w, u, characterId, name));
+        }
+    });
+    saveRpLines(c, "rp-lifecycle", a.worker, lines);
+    std::printf("CHECKED-WRITES-RP-LIFECYCLE: DONE users=%zu\n", first.size());
+    std::fflush(stdout);
+    return 0;
+}
+
+/// The offsets the result files hold, per topic: where a write was accepted and where it was refused (55 or 57).
+struct RpOffsets {
+    std::set<int64_t> accepted, refused;
+};
+
+bool rpOffsets(RpOffsets& user, RpOffsets& character, const char* tag) {
+    for (const RpLine& l : readRpLines({"rp-login-w", "rp-characters-w", "rp-restart-w", "rp-lifecycle-w"})) {
+        if (l.op == "stats" || l.offset < 0) continue;
+        RpOffsets& o = l.op == "login" ? user : character;
+        if (l.code == 0) o.accepted.insert(l.offset);
+        else if (l.code == kConstraintViolation || l.code == kKeyNotFound) o.refused.insert(l.offset);
+        else { fail(tag, l.op + " " + std::to_string(l.key) + " gave " + std::to_string(l.code)); return false; }
+    }
+    return true;
+}
+
+int runRpVerify() {
+    RpOffsets user, character;
+    if (!rpOffsets(user, character, "CHECKED-WRITES-RP-VERIFY")) return 1;
+    if (user.accepted.empty() || character.accepted.empty() || user.refused.empty() || character.refused.empty()) {
+        fail("CHECKED-WRITES-RP-VERIFY", "the result files hold no accepted or no refused write of a topic");
+        return 1;
+    }
+    Client c(makeConfig());
+    c.connectAndWait();
+    RpWriter w(c);
+    struct Tap {
+        std::mutex        mu;
+        std::set<int64_t> got;
+    };
+    Tap userTap, characterTap;
+    SubscribeOptions so;
+    so.from = From::earliest();
+    const auto tap = [&](Tap& t) { return [&t](const Record& r) { std::lock_guard<std::mutex> g(t.mu); t.got.insert(r.offset); }; };
+    SubscriptionSet userSet      = c.subscribe(w.users.handle(), AllPartitions{}, so, tap(userTap));
+    SubscriptionSet characterSet = c.subscribe(w.characters.handle(), AllPartitions{}, so, tap(characterTap));
+    const auto reached = [](Tap& t, const RpOffsets& o) { std::lock_guard<std::mutex> g(t.mu); return t.got.contains(*o.accepted.rbegin()); };
+    const auto deadline = Clock::now() + std::chrono::seconds(envInt("KI_E2E_VERIFY_S", 300));
+    while (Clock::now() < deadline && !(reached(userTap, user) && reached(characterTap, character))) std::this_thread::sleep_for(100ms);
+    std::this_thread::sleep_for(5s);   // a quiet window: a refused record that is going to be delivered lands now
+    int bad = 0;
+    const auto judge = [&](const char* topic, Tap& t, const RpOffsets& o) {
+        std::lock_guard<std::mutex> g(t.mu);
+        if (!t.got.contains(*o.accepted.rbegin())) { ++bad; fail("CHECKED-WRITES-RP-VERIFY", std::string(topic) + ": the newest accepted record never arrived"); }
+        int shown = 0;
+        for (const int64_t off : o.refused)
+            if (t.got.contains(off) && shown++ < 10) { ++bad; fail("CHECKED-WRITES-RP-VERIFY", std::string(topic) + ": the refused write at offset " + std::to_string(off) + " was delivered"); }
+    };
+    judge("user", userTap, user);
+    judge("character", characterTap, character);
+    if (bad != 0) return 1;
+    std::printf("CHECKED-WRITES-RP-VERIFY: OK refused=%zu+%zu\n", user.refused.size(), character.refused.size());
+    std::fflush(stdout);
+    return 0;
+}
+
+int runRpCompact() {
+    // One accepted record per topic to rewrite: the first accepted login and the last accepted character of the highest user (the lifecycle removes the first of each user).
+    const RpLine* login = nullptr;
+    const RpLine* chosen = nullptr;
+    const auto logins = readRpLines({"rp-login-w"});
+    const auto creates = readRpLines({"rp-characters-w"});
+    for (const RpLine& l : logins)
+        if (l.code == 0 && login == nullptr) login = &l;
+    for (const RpLine& l : creates)
+        if (l.code == 0 && l.key < kRpPairBase && (chosen == nullptr || l.key >= chosen->key)) chosen = &l;
+    if (login == nullptr || chosen == nullptr) { fail("CHECKED-WRITES-RP-COMPACT", "the result files hold no accepted login or character"); return 1; }
+    Client c(makeConfig());
+    c.connectAndWait();
+    const auto state = latestCatalog(c);
+    const int32_t userTopic      = state.topicByName(rune::catalog::kDefaultNsId, "user")->topicId;
+    const int32_t characterTopic = state.topicByName(rune::catalog::kDefaultNsId, "character")->topicId;
+    RpWriter w(c);
+    RpUser u;
+    u.userId   = login->id;
+    u.provider = 1;
+    std::snprintf(u.subject.data(), u.subject.size(), "%s", login->name.c_str());
+    RpCharacter ch;
+    ch.characterId = chosen->id;
+    ch.userId      = chosen->key;
+    ch.gender      = 1;
+    std::snprintf(ch.name.data(), ch.name.size(), "%s", chosen->name.c_str());
+    const auto clean = [&](int32_t topic) {
+        const StatsResult r = c.getStatsAndWait(rune::protocol::client::StatsScope::TopicPartition, topic, 0, 10s);
+        return r.status == StatsResult::kOk && r.get(rune::protocol::client::StatId::rejectedNotCompacted) == std::optional<int64_t>(0);
+    };
+    const auto wait = std::chrono::seconds(kWriteWaitS);
+    const auto deadline = Clock::now() + std::chrono::seconds(envInt("KI_E2E_RP_COMPACT_S", 300));
+    while (!(clean(userTopic) && clean(characterTopic))) {
+        if (Clock::now() >= deadline) { fail("CHECKED-WRITES-RP-COMPACT", "rejectedNotCompacted never reached 0 on both topics"); return 1; }
+        for (int i = 0; i < 64; ++i) {   // accepted rewrites of one key each: the segments seal and the cleaner has something to compact
+            if (!w.users.updateAndWait(u, wait).ok() || !w.characters.updateAndWait(ch, wait).ok()) { fail("CHECKED-WRITES-RP-COMPACT", "an accepted update was refused"); return 1; }
+        }
+    }
+    std::printf("CHECKED-WRITES-RP-COMPACT: OK\n");
+    std::fflush(stdout);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -614,6 +1069,14 @@ int main(int argc, char** argv) {
         }
         if (mode == "ai-verify") return runAiVerify();
         if (mode == "ai-refusals") return runAiRefusals();
+        if (mode == "rp-setup") return runRpSetup();
+        if (mode == "rp-verify") return runRpVerify();
+        if (mode == "rp-compact") return runRpCompact();
+        if (mode == "rp-login" || mode == "rp-characters" || mode == "rp-restart" || mode == "rp-lifecycle") {
+            Args a;
+            if (!parseArgs(argc, argv, a)) { std::fprintf(stderr, "usage: rp-login --worker <i> --subjects <a>-<b> | rp-characters --worker <i> --users <a>-<b> | rp-restart --users <a>-<b> | rp-lifecycle --users <a>-<b>\n"); return 2; }
+            return mode == "rp-login" ? runRpLogin(a) : mode == "rp-characters" ? runRpCharacters(a) : mode == "rp-restart" ? runRpRestart(a) : runRpLifecycle(a);
+        }
         if (mode == "lifecycle") return runLifecycle();
         if (mode == "verify") return runVerify();
         if (mode == "refusals") return runRefusals();
@@ -621,6 +1084,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "CHECKED-WRITES-PROBE: %s threw: %s\n", mode.c_str(), e.what());
         return 1;
     }
-    std::fprintf(stderr, "CHECKED-WRITES-PROBE: mode must be setup, race, lifecycle, verify, refusals or an ai-* mode (got '%s')\n", mode.c_str());
+    std::fprintf(stderr, "CHECKED-WRITES-PROBE: mode must be setup, race, lifecycle, verify, refusals, an ai-* or an rp-* mode (got '%s')\n", mode.c_str());
     return 2;
 }

@@ -273,7 +273,9 @@ set(RUNE_CLAIM_GEN_HEADERS
     "${RUNE_CLAIM_GEN_DIR}/gen/eos_out.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/player_event.gen.h"
     "${RUNE_CLAIM_GEN_DIR}/gen/ki_account.gen.h"
-    "${RUNE_CLAIM_GEN_DIR}/gen/ai_user.gen.h")
+    "${RUNE_CLAIM_GEN_DIR}/gen/ai_user.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/rp_user.gen.h"
+    "${RUNE_CLAIM_GEN_DIR}/gen/rp_character.gen.h")
 add_custom_command(
     OUTPUT  ${RUNE_CLAIM_GEN_HEADERS}
     COMMAND $<TARGET_FILE:rune_gen_claim_schemas> "${RUNE_CLAIM_GEN_DIR}/gen"
@@ -808,7 +810,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
 
     # ── Checked writes Part 05 — key index probe (broker/docker/checked-writes-e2e.sh) ──
     #
-    # checked_writes_probe.cpp includes the build-time generated ki_account.gen.h and ai_user.gen.h (tests/support/GenClaimSchemas.cpp),
+    # checked_writes_probe.cpp includes the build-time generated ki_account.gen.h, ai_user.gen.h, rp_user.gen.h and rp_character.gen.h (tests/support/GenClaimSchemas.cpp),
     # so the probe image needs tests/ in its context.
     if(TARGET generate_claim_schema_headers)
         add_executable(checked_writes_probe examples/checked_writes_probe.cpp)

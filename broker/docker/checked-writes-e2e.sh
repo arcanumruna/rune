@@ -23,7 +23,18 @@
 #                 Then the highest returned id is removed, all three nodes are restarted and one more create gives an id above it.
 #                 Refusals: `app` importing id 2 gives 45; autoincrement on a cleanup.policy = delete topic and an IMPORT grant on a
 #                 view are refused.  Prints AUTOINC: OK;
-#   8. print CHECKED-WRITES-E2E: OK.
+#   8. REGRESSORSPATH: ql/tests/golden/regressorspath.rql through the CLI (segment.bytes = 65536 and a day-long compaction lag added to its topics), then
+#                 RP-LOGIN-RACE: 4 probes race first logins over the same 1,000 subjects, the `user` leader `docker kill`ed at ~30 %
+#                 and restarted once progress resumes (per subject exactly one Ok, every other 55 user_identity.unique, each loser's
+#                 minOffset read returned the winner's userId); RP-CHARACTERS: 200 users, 4 probes create 13 characters per user
+#                 concurrently plus a Foo<n> / foo<n> pair per user pair, the `character` leader killed at ~30 % (per user exactly 12 Ok,
+#                 the rest 55 account_stats.max_characters; per pair one Ok and one 55 character_name.unique); RP-RESTART: all three
+#                 nodes restarted, every account_stats row is 12 and a 13th create is 55; RP-LIFECYCLE: 100 users removeExisting a
+#                 character (count 11), another user reuses its name, the second removeExisting gives 57; RP-VERIFY: a subscription
+#                 from 0 on user and character holds no offset a write was refused at; after `alter topic` makes the cleaner eager,
+#                 `rune stats topic <t> --json` on the leader reports rejectedNotCompacted 0 for both.  Bounded at 600 s per race.
+#                 Prints REGRESSORSPATH: OK;
+#   9. print CHECKED-WRITES-E2E: OK.
 #
 # Usage (on the VM, under the host lock):
 #   ssh root@$RUNE_VM_HOST 'flock -w 7200 /root/vm.lock bash broker/docker/checked-writes-e2e.sh'
@@ -33,6 +44,9 @@
 #   KI_E2E_IDS              ids the racers insert (default 20000)       KI_E2E_WORKERS   racing containers (default 4)
 #   KI_E2E_THREADS          writer threads per container (default 16)
 #   AI_E2E_CREATES          key-0 creates per racing container in leg 7 (default 5000)
+#   RP_E2E_SUBJECTS         subjects the login race covers in leg 8 (default 1000)
+#   RP_E2E_USERS            users the character race covers (default 200; even: a Foo / foo pair takes two)
+#   RP_E2E_LIFECYCLE_USERS  users of the delete and name-reuse step (default 100, at most RP_E2E_USERS)
 #   E2E_LOG_DIR             when set, the brokers' and the probes' logs are kept there at teardown
 #
 # House style: bounded waits, trap teardown (`docker compose down -v` on every exit path), every failure names its step.
@@ -58,6 +72,13 @@ IDS="${KI_E2E_IDS:-20000}"
 WORKERS="${KI_E2E_WORKERS:-4}"
 THREADS="${KI_E2E_THREADS:-16}"
 AI_CREATES="${AI_E2E_CREATES:-5000}"
+RP_SUBJECTS="${RP_E2E_SUBJECTS:-1000}"
+RP_USERS="${RP_E2E_USERS:-200}"
+RP_LIFE_USERS="${RP_E2E_LIFECYCLE_USERS:-100}"
+RP_CHARS=13            # creates per user and probe (the probe's kRpCharsPerUser)
+RP_CAP=12              # account_stats.max_characters
+RP_PAIR_BASE=1000000   # the probe's kRpPairBase: the users of the Foo / foo pairs
+RP_LIFE_BASE=2000000   # the probe's kRpLifeBase: the users that reuse a removed name
 AI_IMPORT_MAX=5000     # the back-fill imports the odd ids below it; every id the creators are answered with is above 4999
 LIFECYCLE_IDS=2000     # the probe's KI_E2E_LIFECYCLE_IDS default; the restart leg's removed set is derived from it
 PARTS=4
@@ -497,5 +518,171 @@ set -e
 [[ "${out}" == *InvalidGrant* ]] || { echo "${out}" >&2; fail "GRANT IMPORT ON VIEW was refused, but not as InvalidGrant"; }
 log "Leg 7 OK"
 echo "AUTOINC: OK"
+
+# ---------------------------------------------------------------------------
+# Leg 8: REGRESSORSPATH.
+# ---------------------------------------------------------------------------
+LEG="leg 8"
+GOLDEN="${PROJECTS}/ql/tests/golden/regressorspath.rql"
+[ -f "${GOLDEN}" ] || fail "missing ../ql/tests/golden/regressorspath.rql"
+[ $(( RP_USERS % 2 )) -eq 0 ] || fail "RP_E2E_USERS must be even (${RP_USERS})"
+[ "${RP_LIFE_USERS}" -le "${RP_USERS}" ] || fail "RP_E2E_LIFECYCLE_USERS (${RP_LIFE_USERS}) is above RP_E2E_USERS (${RP_USERS})"
+[ "${WORKERS}" -ge 2 ] || fail "the Foo / foo pairs need KI_E2E_WORKERS >= 2"
+
+LEG="leg 8a RP-SETUP"
+log "Leg 8a: RP-SETUP: the golden DDL through the CLI..."
+# The brokers' default segment is far larger than the run: a small one seals the segments that hold the refused records, and a long
+# compaction lag keeps the cleaner off them until RP-VERIFY has looked (the `alter topic` below lowers it).
+rp_ddl=$(cat "${GOLDEN}")
+rp_ddl="${rp_ddl//"with (cleanup.policy = compact)"/"with (cleanup.policy = compact, segment.bytes = 65536, min.compaction.lag.ms = 86400000)"}"
+[[ "${rp_ddl}" == *"segment.bytes = 65536"* ]] || fail "the golden script has no 'with (cleanup.policy = compact)' to add segment.bytes to"
+printf '%s\n' "${rp_ddl}" > "${RUNE_AUTH_WORK_DIR}/regressorspath.rql"
+set +e
+out=$(rune_auth_cli_admin "${RUNE_AUTH_NETWORK}" ql -f /work/regressorspath.rql --broker "rune-${SEED_NODE}:${BROKER_PORT}" 2>&1); rc=$?
+set -e
+rm -f "${RUNE_AUTH_WORK_DIR}/regressorspath.rql"
+[ "${rc}" -eq 0 ] || { echo "${out}" >&2; fail "the golden regressorspath.rql failed (exit ${rc})"; }
+set +e
+out=$(rune_auth_cli_admin "${RUNE_AUTH_NETWORK}" ql -e "show view account_stats;" --broker "rune-${SEED_NODE}:${BROKER_PORT}" 2>&1); rc=$?
+set -e
+[ "${rc}" -eq 0 ] || { echo "${out}" >&2; fail "show view account_stats failed (exit ${rc})"; }
+[[ "${out}" == *max_characters* ]] || { echo "${out}" >&2; fail "show view account_stats does not list max_characters"; }
+leg rp-setup 300 "CHECKED-WRITES-RP-SETUP: OK" rp-setup
+RP_USER_TOPIC=$(grep -oE '^RP_USER_TOPIC_ID=[0-9]+' "${WORK_DIR}/rp-setup.out" | cut -d= -f2) || true
+RP_CHARACTER_TOPIC=$(grep -oE '^RP_CHARACTER_TOPIC_ID=[0-9]+' "${WORK_DIR}/rp-setup.out" | cut -d= -f2) || true
+[ -n "${RP_USER_TOPIC}" ] && [ -n "${RP_CHARACTER_TOPIC}" ] || fail "rp-setup printed no topic ids"
+wait_until 120 "the user leader" partition_leader "${RP_USER_TOPIC}" 0 || fail "user partition 0 has no leader"
+wait_until 120 "the character leader" partition_leader "${RP_CHARACTER_TOPIC}" 0 || fail "character partition 0 has no leader"
+
+# rp_race <tag> <topic id> <total writes> <probe mode> <range flag> <range> : WORKERS probes of <mode> race, the topic's leader is
+# killed at ~30 % and restarted once progress resumes; returns when every probe exited 0.
+rp_race() {
+    local tag="$1" topic="$2" total="$3" mode="$4" flag="$5" range="$6" i leader left start
+    leader=$(partition_leader "${topic}" 0) || fail "no leader of the ${tag} topic"
+    if [ "${leader}" = "0" ]; then SEED_NODE=2; else SEED_NODE=1; fi   # the probes never connect through the node the race kills
+    start=$(now_s)
+    for i in $(seq 0 $(( WORKERS - 1 ))); do probe_start "${tag}-${i}" "${RACE_S}" "${mode}" --worker "${i}" "${flag}" "${range}"; done
+    wait_until "${RACE_S}" "30 % of ${tag}" progress_at_least $(( total * 30 / 100 )) "${tag}" \
+        || { out_of "${tag}-0" | tail -20 >&2; fail "${tag} never reached 30 % within ${RACE_S}s (at $(race_progress "${tag}") of ${total})"; }
+    leader=$(partition_leader "${topic}" 0) || fail "no leader of the ${tag} topic at the kill"
+    BASE=$(race_progress "${tag}")
+    log "Leg 8: ${tag}: killing node ${leader}, the leader, at ${BASE} of ${total} writes"
+    kill_node "${leader}"
+    RESUME_AT=$(( BASE + RESUME_WRITES ))
+    [ "${RESUME_AT}" -le "${total}" ] || RESUME_AT="${total}"
+    wait_until "${RESUME_WAIT_S}" "${tag} resuming" progress_at_least "${RESUME_AT}" "${tag}" \
+        || { out_of "${tag}-0" | tail -20 >&2; fail "${tag}: no progress past ${RESUME_AT} within ${RESUME_WAIT_S}s of the kill (at $(race_progress "${tag}"))"; }
+    restart_node "${leader}"
+    for i in $(seq 0 $(( WORKERS - 1 ))); do
+        left=$(( RACE_S - ($(now_s) - start) ))
+        [ "${left}" -gt 0 ] || left=1
+        wait_until "${left}" "${tag} probe ${i}" bg_done "${tag}-${i}" || fail "${tag} probe ${i} did not finish within ${RACE_S}s of the race start"
+        [ "$(bg_rc "${tag}-${i}")" = "0" ] || { out_of "${tag}-${i}" | tail -20 >&2; fail "${tag} probe ${i} exited $(bg_rc "${tag}-${i}")"; }
+    done
+    log "Leg 8: ${tag}: done in $(( $(now_s) - start )) s"
+}
+
+LEG="leg 8b RP-LOGIN-RACE"
+log "Leg 8b: RP-LOGIN-RACE: ${WORKERS} probes race first logins over ${RP_SUBJECTS} subjects; the user leader is killed at ~30 %..."
+rp_race rp-login "${RP_USER_TOPIC}" $(( WORKERS * RP_SUBJECTS )) rp-login --subjects "1-${RP_SUBJECTS}"
+rp_files=("${SHARED}"/rp-login-w*.txt)
+[ "${#rp_files[@]}" -eq "${WORKERS}" ] || fail "${#rp_files[@]} login result files, want ${WORKERS}"
+awk -v subjects="${RP_SUBJECTS}" -v workers="${WORKERS}" '
+    { if ($3 != 0 && $3 != 55) { other[$3]++; next }
+      n[$2]++
+      if ($3 == 0) { ok[$2]++; winner[$2] = $7 }
+      else { if ($4 != "user_identity.unique") { wrong[$4]++ } lose[$2]++; losers[$2] = losers[$2] " " $7 } }
+    END {
+        for (c in other) { printf "result code %s x%d\n", c, other[c]; bad = 1 }
+        for (c in wrong) { printf "a refusal named %s x%d\n", c, wrong[c]; bad = 1 }
+        for (s = 1; s <= subjects; s++) {
+            if (n[s] != workers || ok[s] != 1 || lose[s] != workers - 1) {
+                if (shown++ < 10) printf "subject %d: %d results, %d Ok, %d refused\n", s, n[s], ok[s], lose[s]
+                bad = 1; continue
+            }
+            if (winner[s] < 1 || issued[winner[s]]++) { if (shown++ < 10) printf "subject %d: userId %s is not a fresh id\n", s, winner[s]; bad = 1 }
+            m = split(losers[s], l, " ")
+            for (j = 1; j <= m; j++) if (l[j] != winner[s]) { if (shown++ < 10) printf "subject %d: a loser read userId %s, the winner is %s\n", s, l[j], winner[s]; bad = 1 }
+        }
+        exit bad
+    }' "${rp_files[@]}" > "${WORK_DIR}/rp-login-check.txt" \
+    || { cat "${WORK_DIR}/rp-login-check.txt" >&2; fail "the login race broke 'one winner per subject, the rest 55 user_identity.unique, losers read the winner' (codes 10014 = VerdictUnknown, 10013 = StoredIdUnknown, 10002 = Timeout)"; }
+log "Leg 8b OK: every subject has one winner and ${WORKERS} - 1 refusals that read the winner's userId"
+
+LEG="leg 8c RP-CHARACTERS"
+log "Leg 8c: RP-CHARACTERS: ${RP_USERS} users, ${WORKERS} probes create ${RP_CHARS} characters per user plus the Foo / foo pairs; the character leader is killed at ~30 %..."
+rp_race rp-characters "${RP_CHARACTER_TOPIC}" $(( WORKERS * RP_CHARS * RP_USERS + RP_USERS )) rp-characters --users "1-${RP_USERS}"
+rp_files=("${SHARED}"/rp-characters-w*.txt)
+[ "${#rp_files[@]}" -eq "${WORKERS}" ] || fail "${#rp_files[@]} character result files, want ${WORKERS}"
+awk -v users="${RP_USERS}" -v workers="${WORKERS}" -v per="${RP_CHARS}" -v cap="${RP_CAP}" -v pairbase="${RP_PAIR_BASE}" '
+    { if ($3 != 0 && $3 != 55) { other[$3]++; next }
+      if ($2 >= pairbase) { g = tolower($6); pn[g]++; if ($3 == 0) pok[g]++; else if ($4 == "character_name.unique") prej[g]++; next }
+      n[$2]++
+      if ($3 == 0) ok[$2]++; else if ($4 == "account_stats.max_characters") rej[$2]++ }
+    END {
+        for (c in other) { printf "result code %s x%d\n", c, other[c]; bad = 1 }
+        for (u = 1; u <= users; u++)
+            if (n[u] != workers * per || ok[u] != cap || rej[u] != workers * per - cap) {
+                if (shown++ < 10) printf "user %d: %d results, %d Ok, %d account_stats.max_characters\n", u, n[u], ok[u], rej[u]
+                bad = 1
+            }
+        for (u = 1; u <= users; u += 2) {
+            g = "foo" u
+            if (pn[g] != 2 || pok[g] != 1 || prej[g] != 1) {
+                if (shown++ < 10) printf "pair %s: %d results, %d Ok, %d character_name.unique\n", g, pn[g], pok[g], prej[g]
+                bad = 1
+            }
+        }
+        exit bad
+    }' "${rp_files[@]}" > "${WORK_DIR}/rp-characters-check.txt" \
+    || { cat "${WORK_DIR}/rp-characters-check.txt" >&2; fail "the character race broke '12 Ok per user, the rest 55 account_stats.max_characters, one winner per Foo / foo pair'"; }
+log "Leg 8c OK: every user has ${RP_CAP} characters, every pair one winner"
+
+LEG="leg 8d RP-RESTART"
+log "Leg 8d: RP-RESTART: docker restart of all three nodes; every account_stats row is ${RP_CAP}, a 13th create is refused..."
+restart_all
+if [ "$(partition_leader "${RP_CHARACTER_TOPIC}" 0)" = "0" ]; then SEED_NODE=2; else SEED_NODE=1; fi
+leg rp-restart "${RACE_S}" "CHECKED-WRITES-RP-RESTART: DONE" rp-restart --worker 0 --users "1-${RP_USERS}"
+awk -v users="${RP_USERS}" -v cap="${RP_CAP}" '
+    { if ($1 == "stats") { st[$2]++; if ($3 != 0 || $7 != cap) { if (shown++ < 10) printf "user %d: account_stats says %s (code %d)\n", $2, $7, $3; bad = 1 } }
+      else if ($1 == "create") { cr[$2]++; if ($3 != 55 || $4 != "account_stats.max_characters") { if (shown++ < 10) printf "user %d: the 13th create gave %d %s\n", $2, $3, $4; bad = 1 } } }
+    END { for (u = 1; u <= users; u++) if (st[u] != 1 || cr[u] != 1) { if (shown++ < 10) printf "user %d: %d stats, %d creates\n", u, st[u], cr[u]; bad = 1 } exit bad }' \
+    "${SHARED}/rp-restart-w0.txt" > "${WORK_DIR}/rp-restart-check.txt" \
+    || { cat "${WORK_DIR}/rp-restart-check.txt" >&2; fail "after the restart a user did not have ${RP_CAP} characters, or a 13th create was not refused"; }
+log "Leg 8d OK"
+
+LEG="leg 8e RP-LIFECYCLE"
+log "Leg 8e: RP-LIFECYCLE: ${RP_LIFE_USERS} users remove a character, another user reuses its name, the second remove gives 57..."
+leg rp-lifecycle "${RACE_S}" "CHECKED-WRITES-RP-LIFECYCLE: DONE" rp-lifecycle --worker 0 --users "1-${RP_LIFE_USERS}"
+awk -v users="${RP_LIFE_USERS}" -v lifebase="${RP_LIFE_BASE}" '
+    { if ($1 == "remove") { if ($3 == 0) rm0[$2]++; else if ($3 == 57) rm57[$2]++; else { if (shown++ < 10) printf "user %d: remove gave %d\n", $2, $3; bad = 1 } }
+      else if ($1 == "create") { if ($3 == 0) cr[$2 - lifebase]++; else { if (shown++ < 10) printf "user %d: the name reuse gave %d\n", $2 - lifebase, $3; bad = 1 } }
+      else if ($1 == "stats") { st[$2]++; if ($3 != 0 || $7 != 11) { if (shown++ < 10) printf "user %d: account_stats says %s after the remove\n", $2, $7; bad = 1 } } }
+    END { for (u = 1; u <= users; u++) if (rm0[u] != 1 || rm57[u] != 1 || cr[u] != 1 || st[u] != 1) { if (shown++ < 10) printf "user %d: %d removes ok, %d removes 57, %d reuses, %d counts\n", u, rm0[u], rm57[u], cr[u], st[u]; bad = 1 } exit bad }' \
+    "${SHARED}/rp-lifecycle-w0.txt" > "${WORK_DIR}/rp-lifecycle-check.txt" \
+    || { cat "${WORK_DIR}/rp-lifecycle-check.txt" >&2; fail "the lifecycle broke 'remove ok, count 11, name reused, second remove 57'"; }
+log "Leg 8e OK"
+
+LEG="leg 8f RP-VERIFY"
+log "Leg 8f: RP-VERIFY: a subscription from 0 on user and character against the refused writes, then compaction..."
+leg rp-verify "${RACE_S}" "CHECKED-WRITES-RP-VERIFY: OK" rp-verify
+for t in user character; do
+    set +e
+    out=$(rune_auth_cli_admin "${RUNE_AUTH_NETWORK}" ql -e "alter topic ${t} set delete.retention.ms = 0, min.cleanable.dirty.ratio = 0.000001, min.compaction.lag.ms = 50;" --broker "rune-${SEED_NODE}:${BROKER_PORT}" 2>&1); rc=$?
+    set -e
+    [ "${rc}" -eq 0 ] || { echo "${out}" >&2; fail "alter topic ${t} failed (exit ${rc})"; }
+done
+leg rp-compact "${RACE_S}" "CHECKED-WRITES-RP-COMPACT: OK" rp-compact
+# Only a partition's leader compacts; a follower keeps what it fetched.
+rp_not_compacted_zero() {   # <topic name> <topic id>
+    local leader out
+    leader=$(partition_leader "$2" 0) || return 1
+    out=$(_rune_auth_cli "${RUNE_AUTH_NETWORK}" stats topic "$1" --json --broker "rune-$(( leader + 1 )):${BROKER_PORT}" --user "${RUNE_AUTH_ADMIN}" --password-file /work/admin.pw 2>&1) || return 1
+    [[ "${out}" == *'"rejectedNotCompacted": 0'* ]]
+}
+wait_until "${LEG_S}" "the user topic compacted" rp_not_compacted_zero user "${RP_USER_TOPIC}" || fail "user: rejectedNotCompacted is not 0 on the leader within ${LEG_S}s"
+wait_until "${LEG_S}" "the character topic compacted" rp_not_compacted_zero character "${RP_CHARACTER_TOPIC}" || fail "character: rejectedNotCompacted is not 0 on the leader within ${LEG_S}s"
+log "Leg 8 OK"
+echo "REGRESSORSPATH: OK"
 
 echo "CHECKED-WRITES-E2E: OK"
