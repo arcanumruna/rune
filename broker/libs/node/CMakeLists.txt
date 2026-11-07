@@ -1400,7 +1400,12 @@ if(BUILD_TESTING)
             add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp tests/node/CheckedWritesCatalogGateTest.cpp tests/node/CheckedWritesConstraintWorkerTest.cpp tests/node/CheckedWritesConstraintChangeTest.cpp tests/node/CheckedWritesTxnWorkerTest.cpp)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
-            gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            # The full-length determinism runs (two whole seeds, over 1 s alone) carry LABELS stress; the default runs half the steps.
+            set(RUNE_CW_VERDICT_STRESS_TESTS "*SameSeedSameTraceFullLength*")
+            gtest_discover_tests(rune_checked_writes_verdict_tests TEST_FILTER "${RUNE_CW_VERDICT_STRESS_TESTS}"
+                                 PROPERTIES TIMEOUT 300 LABELS stress ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            gtest_discover_tests(rune_checked_writes_verdict_tests TEST_FILTER "-${RUNE_CW_VERDICT_STRESS_TESTS}"
+                                 PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # The namespace fetch gate on the default consume paths (worker-owned, group, filtered subscriptions; legacy PushRead).
             add_executable(rune_ns_fetch_adv_tests tests/node/NsFetchGateAdversarialRegressionTest.cpp)

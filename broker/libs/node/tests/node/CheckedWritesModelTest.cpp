@@ -582,9 +582,9 @@ private:
     bool compact_ = false, compacted_ = false, setChanged_ = false;
 };
 
-std::string runKiSeed(uint64_t seed) {
+std::string runKiSeed(uint64_t seed, int steps = kKiSteps) {
     KiRun run(seed);
-    for (int step = 0; step < kKiSteps && !::testing::Test::HasFatalFailure(); ++step) {
+    for (int step = 0; step < steps && !::testing::Test::HasFatalFailure(); ++step) {
         const KiAction action = run.pick();
         SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step) + " action=" + nameOf(action) + " trace=" + run.trace);
         run.step(action);
@@ -600,8 +600,16 @@ TEST_P(CheckedWritesKeyIndexModelRegression, SeededRigMatchesTheModel) {
     EXPECT_FALSE(trace.empty());
 }
 
-// The history is a function of the seed: seeds 1-8 run twice make the same choices and the model judges the same verdicts.
+// The history is a function of the seed: seeds 1-8 run twice make the same choices and the model judges the same verdicts.  Over the
+// first half of the steps (two runs fit 1 s); the whole length is SameSeedSameTraceFullLength, label stress.
 TEST_P(CheckedWritesKeyIndexModelRegression, SameSeedSameTrace) {
+    if (GetParam() > 8) GTEST_SKIP() << "seeds 1-8 only";
+    const std::string first = runKiSeed(GetParam(), kKiSteps / 2);
+    const std::string second = runKiSeed(GetParam(), kKiSteps / 2);
+    EXPECT_EQ(first, second);
+}
+
+TEST_P(CheckedWritesKeyIndexModelRegression, SameSeedSameTraceFullLength) {
     if (GetParam() > 8) GTEST_SKIP() << "seeds 1-8 only";
     const std::string first = runKiSeed(GetParam());
     const std::string second = runKiSeed(GetParam());
@@ -1115,9 +1123,9 @@ private:
     int64_t compactions_ = 0;
 };
 
-std::string runAiSeed(uint64_t seed, std::size_t* markersRemoved = nullptr, std::size_t* tombstonesRemoved = nullptr) {
+std::string runAiSeed(uint64_t seed, int steps = kAiSteps, std::size_t* markersRemoved = nullptr, std::size_t* tombstonesRemoved = nullptr) {
     AiRun run(seed);
-    for (int step = 0; step < kAiSteps && !::testing::Test::HasFatalFailure(); ++step) {
+    for (int step = 0; step < steps && !::testing::Test::HasFatalFailure(); ++step) {
         const AiAction action = run.pick();
         SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step) + " action=" + nameOf(action) + " trace=" + run.trace);
         run.step(action);
@@ -1132,14 +1140,22 @@ class CheckedWritesAutoIncModelRegression : public ::testing::TestWithParam<uint
 
 TEST_P(CheckedWritesAutoIncModelRegression, SeededRigMatchesTheModel) {
     std::size_t markers = 0, tombstones = 0;
-    const std::string trace = runAiSeed(GetParam(), &markers, &tombstones);
+    const std::string trace = runAiSeed(GetParam(), kAiSteps, &markers, &tombstones);
     EXPECT_FALSE(trace.empty());
     EXPECT_GT(markers, 0u) << "no compaction removed a marker (8.5)";
     EXPECT_GT(tombstones, 0u) << "no compaction removed a tombstone";
 }
 
-// The history is a function of the seed: seeds 1-8 run twice make the same choices, the same ids and the same verdicts.
+// The history is a function of the seed: seeds 1-8 run twice make the same choices, the same ids and the same verdicts.  Over the
+// first half of the steps (two runs fit 1 s); the whole length is SameSeedSameTraceFullLength, label stress.
 TEST_P(CheckedWritesAutoIncModelRegression, SameSeedSameTrace) {
+    if (GetParam() > 8) GTEST_SKIP() << "seeds 1-8 only";
+    const std::string first = runAiSeed(GetParam(), kAiSteps / 2);
+    const std::string second = runAiSeed(GetParam(), kAiSteps / 2);
+    EXPECT_EQ(first, second);
+}
+
+TEST_P(CheckedWritesAutoIncModelRegression, SameSeedSameTraceFullLength) {
     if (GetParam() > 8) GTEST_SKIP() << "seeds 1-8 only";
     const std::string first = runAiSeed(GetParam());
     const std::string second = runAiSeed(GetParam());
@@ -1576,9 +1592,9 @@ private:
     int64_t compactions_ = 0;
 };
 
-std::string runCwSeed(CwParam p) {
+std::string runCwSeed(CwParam p, int steps = kCwSteps) {
     CwRun run(p);
-    for (int step = 0; step < kCwSteps && !::testing::Test::HasFatalFailure(); ++step) {
+    for (int step = 0; step < steps && !::testing::Test::HasFatalFailure(); ++step) {
         const CwAction action = run.pick();
         SCOPED_TRACE("seed=" + std::to_string(p.seed) + " cap=" + std::to_string(p.cap) + " step=" + std::to_string(step) + " action=" + nameOf(action) + " trace=" + run.trace);
         run.step(action);
@@ -1594,8 +1610,16 @@ TEST_P(CheckedWritesConstraintModelRegression, SeededConstraintsMatchTheModel) {
     EXPECT_FALSE(runCwSeed(GetParam()).empty());
 }
 
-// The history is a function of the seed: seeds 1-8 run twice make the same choices and get the same verdicts.
+// The history is a function of the seed: seeds 1-8 run twice make the same choices and get the same verdicts.  Over the first half
+// of the steps (two runs fit 1 s); the whole length is SameSeedSameTraceFullLength, label stress.
 TEST_P(CheckedWritesConstraintModelRegression, SameSeedSameTrace) {
+    if (GetParam().seed > 8) GTEST_SKIP() << "seeds 1-8 only";
+    const std::string first = runCwSeed(GetParam(), kCwSteps / 2);
+    const std::string second = runCwSeed(GetParam(), kCwSteps / 2);
+    EXPECT_EQ(first, second);
+}
+
+TEST_P(CheckedWritesConstraintModelRegression, SameSeedSameTraceFullLength) {
     if (GetParam().seed > 8) GTEST_SKIP() << "seeds 1-8 only";
     const std::string first = runCwSeed(GetParam());
     const std::string second = runCwSeed(GetParam());
