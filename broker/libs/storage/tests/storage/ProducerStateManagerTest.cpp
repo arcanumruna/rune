@@ -1232,8 +1232,8 @@ TEST(UnknownProducerIdRegression, RebuiltStateAfterRetentionAnswersUnknownProduc
         EXPECT_FALSE(rebuilt.validate(0, 7, 0, 0, 6, 6).isOos());
         EXPECT_TRUE(rebuilt.validate(0, 7, 0, 1, 0, 0).isAccept()) << "P re-sequenced at seq 0 (new epoch)";
         EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 0, 0).isAccept()) << "seq 0 on any epoch: trust-on-first-use";
-        // Q is known: a forward gap stays OOS, epochs unchanged.
-        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 14, 14).isOos()) << "known entry + gap";
+        // Q is known, epochs unchanged; a rebuilt entry's forward gap is an unknown producer's (#953).
+        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 14, 14).isUnknownProducerId()) << "known entry, history cut by retention";
         EXPECT_TRUE(rebuilt.validate(0, 8, 0, 2, 12, 12).isFenced()) << "lower epoch";
         EXPECT_TRUE(rebuilt.validate(0, 8, 0, 4, 5, 5).isOos()) << "higher epoch, seq != 0";
         EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 12, 12).isAccept()) << "in order";
@@ -1270,6 +1270,32 @@ TEST(UnknownProducerIdRegression, MarkerOnlyRebuiltEntryAnswersUnknownProducerId
         EXPECT_TRUE(rebuilt.validate(0, 7, 0, 1, 0, 0).isFenced()) << "the marker's epoch still fences";
         rebuilt.update(0, 7, 0, 2, 0, 0, log.logEndOffset());   // P appends again at its epoch
         EXPECT_TRUE(rebuilt.validate(0, 7, 0, 2, 5, 5).isOos()) << "a real gap after data is OOS again";
+    }
+    fs::remove_all(dir);
+}
+
+// #953: the cleaner dropped an expired producer's newest batches (seq 2..5) and kept the older ones (seq 0, 1).  A leader rebuilt
+// from that log knows P only up to seq 1: P's next batch (seq 6) is an unknown producer's, not "known entry + gap"
+// OutOfOrderSequence, which the client hands to the application as a failed write.  The same cut by retention, for every
+// rebuilt entry: its lastSequence is the last the log still holds.
+TEST(UnknownProducerIdRegression, RebuiltEntryWhoseNewestBatchesAreGoneAnswersUnknownProducerIdRegression) {
+    const std::string dir = tmpPath("psm_953");
+    fs::create_directories(dir);
+    {
+        rune::storage::Log log(dir, /*segmentRollBytes=*/1 << 20);
+        log.recover();
+        auto put = [&](const std::vector<uint8_t>& b) { ASSERT_GE(log.append(b, log.logEndOffset()), 0); };
+        for (int32_t s = 0; s < 2; ++s) put(d6Batch(/*P*/ 7, 0, s, log.logEndOffset()));   // P's sequences 2..5 were compacted away
+
+        ProducerStateManager rebuilt;
+        ASSERT_TRUE(rebuilt.rebuildFromLog(0, log, log.logEndOffset(), 0));
+        ASSERT_NE(rebuilt.entry(0, 7, 0), nullptr) << "precondition: the remnant made an entry";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 6, 6).isUnknownProducerId()) << "P's next batch past the log's last";
+        EXPECT_FALSE(rebuilt.validate(0, 7, 0, 0, 6, 6).isOos());
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 1, 0, 0).isAccept()) << "P re-sequenced at seq 0 (new epoch)";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 2, 2).isAccept()) << "the log's next sequence";
+        rebuilt.update(0, 7, 0, 0, 2, 2, log.logEndOffset());   // appended live: lastSequence is exact again
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 5, 5).isOos()) << "a real gap after a live append is OOS";
     }
     fs::remove_all(dir);
 }

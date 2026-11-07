@@ -112,10 +112,10 @@ struct ProducerStateEntry {
     uint8_t windowHead{0};       // next slot to write (oldest when full)
     uint8_t windowCount{0};      // slots filled so far (capped at kRetryWindowSize)
     int32_t lastSequence{-1};    // last seq appended (-1 = no batch yet)
-    // D6 review L1: the entry was made by a rebuild from a control MARKER only (its data batches gone) — no
-    // sequence is known in this epoch, so a first batch at seq != 0 is an UNKNOWN producer, not a gap.
-    // Cleared by the first data update().
-    bool    markerOnly{false};
+    // D6 review L1 / #953: the entry was made by a rebuild, so lastSequence is only the last the log still holds (a marker-only
+    // entry knows none; the cleaner drops an expired producer's newest batches first) — a first batch past it is an UNKNOWN
+    // producer, not a gap.  Cleared by the first live update().
+    bool    rebuilt{false};
     /// D9 review MAJOR-2 (Kafka ProducerStateEntry.coordinatorEpoch): the
     /// coordinator epoch of the last COMMIT/ABORT marker applied for this
     /// producer on this partition (-1 = none).  Raise-only; rebuilt from the
@@ -274,7 +274,8 @@ public:
                 int16_t producerEpoch,
                 int32_t baseSequence,
                 int32_t lastSequence,
-                int64_t baseOffset);
+                int64_t baseOffset,
+                bool fromRebuild = false);
 
     // -----------------------------------------------------------------------
     // fenceEpoch — F15 S5 (C1+, I3): a COMMIT/ABORT control batch of `producerId`

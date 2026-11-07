@@ -503,7 +503,7 @@ TEST(TransientDataPathRegression, RcRingRebuildIsBudgetedPerStepAndEqualsTheOneS
         if (x == nullptr) continue;
         EXPECT_EQ(x->producerEpoch, y->producerEpoch) << "producer " << pid;
         EXPECT_EQ(x->lastSequence, y->lastSequence) << "producer " << pid;
-        EXPECT_EQ(x->markerOnly, y->markerOnly) << "producer " << pid;
+        EXPECT_EQ(x->rebuilt, y->rebuilt) << "producer " << pid;
         EXPECT_EQ(x->coordinatorEpoch, y->coordinatorEpoch) << "producer " << pid;
     }
 }
