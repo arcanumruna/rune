@@ -443,3 +443,37 @@ TEST(CheckedWritesConstraintChangeRegression, RefusedReplacementKeepsTheLoggedMe
     EXPECT_EQ(c.r.readLog().changes.size(), changes) << "no change may drop a constraint this node cannot replace";
     EXPECT_EQ(c.dropOf(kStatsObj), -1);
 }
+
+// A restarted node installs its catalog's views for recovery, and the recovery pass materializes the instance of one no judge has attached
+// yet.  That re-registered the template and wiped its verdict identity, so a CREATE OR REPLACE after a restart found no replacement plan of
+// the object: the member left the set instead of swapping, and the check stopped judging.
+TEST(CheckedWritesConstraintChangeRegression, ReplaceAfterRestartSwapsAndKeepsJudgingRegression) {
+    constexpr uint8_t kAllView = rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll;
+    Cw c;
+    c.create(CV::AccountStats, 3);
+    int32_t seq = 0;
+    const auto insert = [&](uint64_t id, const char* name) {
+        const std::vector<Char> one{Char{.id = id, .userId = 1, .name = name, .intent = 1}};
+        return c.r.ackFetching(c.r.appendCharacters(one, kAllView, 41, seq++), 6000);
+    };
+    for (const auto& [id, name] : {std::pair<uint64_t, const char*>{1, "a"}, {2, "b"}, {3, "c"}}) {
+        const auto a = insert(id, name);
+        ASSERT_TRUE(a && a->code == 0 && a->verdicts.empty());
+    }
+    c.r.restart();
+    ASSERT_TRUE(c.r.driveUntilJudged());
+    c.r.replaceConstrainedView(CV::AccountStats, 4);
+    const uint64_t fp4 = c.r.fingerprintOf(CV::AccountStats, false);
+    ASSERT_TRUE(c.passesUntil([&] {
+        c.r.followerFetch();
+        const auto changes = c.r.readLog().changes;
+        return std::any_of(changes.back().members.begin(), changes.back().members.end(), [&](const cr::ChangeMember& m) { return m.viewObjectId == kStatsObj && m.planFingerprint == fp4; });
+    })) << "the replacement never swapped in";
+    EXPECT_EQ(c.r.stats()->candidateSwaps, 1u);
+    const auto fourth = insert(4, "d");
+    ASSERT_TRUE(fourth);
+    EXPECT_TRUE(fourth->verdicts.empty()) << "the new cap allows a fourth";
+    const auto fifth = insert(5, "e");
+    ASSERT_TRUE(fifth);
+    EXPECT_EQ(fifth->verdicts, (std::vector<std::tuple<uint16_t, uint16_t, uint32_t>>{{0, 55, static_cast<uint32_t>(kStatsObj << 16) | 1}})) << "the check still judges after the restart";
+}

@@ -765,7 +765,21 @@ void WorkerViewSet::installViewForRecovery(
     // re-apply viewDataDir_'s on-disk file for this SAME instance via
     // loadRecoveryCheckpoint_.  The latch is set true right after (below),
     // so it is in place before this call returns.
+    // A unique or check view materialized here before a judge attached it stays its object's plan: the re-registration must not
+    // wipe what drainInstalls learned of it, or a later replace finds no plan to swap and the member leaves the set.
+    std::optional<ViewTemplate> verdict;
+    if (const auto tit = templates_.find(viewTopicId); tit != templates_.end() && tit->second.isVerdict) verdict.emplace(std::move(tit->second));
     installView(std::move(plan), std::move(layout), std::move(evolvingSrc), persisted);
+    if (verdict) {
+        ViewTemplate& tpl = templates_.at(viewTopicId);
+        tpl.isVerdict = true;
+        tpl.verdictKind = verdict->verdictKind;
+        tpl.verdictObjectId = verdict->verdictObjectId;
+        tpl.verdictFingerprint = verdict->verdictFingerprint;
+        tpl.testRule = verdict->testRule;
+        tpl.retiring = verdict->retiring;
+        tpl.planRecordPayload = std::move(verdict->planRecordPayload);
+    }
 
     // Eagerly build the (view, partition) instance from the just-installed
     // template (recovery is partition-specific; it must not wait for a lazy
