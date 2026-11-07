@@ -33,29 +33,30 @@ UniqueClaims::UniqueClaims(uint16_t keyWidth, uint8_t wireWidth, uint32_t rowLen
       index_(payloadLayout(2u * wireWidth + 4u + 1u), indexSlots, chunkBytes, ViewTableKeys{static_cast<uint8_t>(keyWidth), 0, hashSeed}),
       extrasTable_(payloadLayout(keyWidth + 2u * wireWidth + 1u + rowLen), indexSlots, chunkBytes, ViewTableKeys{wireWidth, 0, hashSeed}) {}
 
-const uint8_t* UniqueClaims::ownerOf(const ViewKey& n) const noexcept { return index_.get(n); }
+const uint8_t* UniqueClaims::ownerOf(const ViewKey& n, TxnAccess* x) const noexcept { return index(x).get(n); }
 
-const uint8_t* UniqueClaims::extraKeyOf(std::string_view wire) const noexcept {
-    return extrasTable_.get(ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(wire.data()), wire.size()}));
+const uint8_t* UniqueClaims::extraKeyOf(std::string_view wire, TxnAccess* x) const noexcept {
+    return extrasOf(x).get(ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(wire.data()), wire.size()}));
 }
 
-bool UniqueClaims::hasExtras(const ViewKey& n) const noexcept {
-    const uint8_t* p = index_.get(n);
+bool UniqueClaims::hasExtras(const ViewKey& n, TxnAccess* x) const noexcept {
+    const uint8_t* p = index(x).get(n);
     if (p == nullptr) return false;
     uint32_t count;
     std::memcpy(&count, p + countAt(), 4);
     return count != 0;
 }
 
-void UniqueClaims::setOwner(const ViewKey& n, std::string_view wire) noexcept {
-    uint8_t* p = index_.put(n);   // a new entry is zeroed: no extras
+void UniqueClaims::setOwner(const ViewKey& n, std::string_view wire, TxnAccess* x) noexcept {
+    uint8_t* p = index(x).put(n);   // a new entry is zeroed: no extras
     std::memcpy(p, wire.data(), wireWidth_);
 }
 
-void UniqueClaims::eraseOwner(const ViewKey& n) noexcept { index_.erase(n); }
+void UniqueClaims::eraseOwner(const ViewKey& n, TxnAccess* x) noexcept { index(x).erase(n); }
 
-void UniqueClaims::addExtra(const ViewKey& n, std::string_view wire, const uint8_t* image) noexcept {
-    uint8_t* ip = index_.put(n);
+void UniqueClaims::addExtra(const ViewKey& n, std::string_view wire, const uint8_t* image, TxnAccess* x) noexcept {
+    TxnTable ext = extrasOf(x);
+    uint8_t* ip = index(x).put(n);
     uint32_t count;
     std::memcpy(&count, ip + countAt(), 4);
     ++count;
@@ -66,27 +67,28 @@ void UniqueClaims::addExtra(const ViewKey& n, std::string_view wire, const uint8
     std::memcpy(ip + headAt(), wire.data(), wireWidth_);
     ip[flagsAt()] |= kHasHead;
 
-    uint8_t* e = extrasTable_.put(wireKey(reinterpret_cast<const uint8_t*>(wire.data())));
+    uint8_t* e = ext.put(wireKey(reinterpret_cast<const uint8_t*>(wire.data())));
     std::memcpy(e, n.bytes.data(), keyWidth_);
     if (hadHead) {
         std::memcpy(e + nextAt(), oldHead, wireWidth_);
         e[linksAt()] = kHasNext;
-        uint8_t* h = extrasTable_.put(wireKey(oldHead));
+        uint8_t* h = ext.put(wireKey(oldHead));
         std::memcpy(h + prevAt(), wire.data(), wireWidth_);
         h[linksAt()] |= kHasPrev;
     }
     std::memcpy(e + imageAt(), image, rowLen_);
-    ++extras_;
+    if (x == nullptr || x->chain == nullptr) ++extras_;
 }
 
-void UniqueClaims::updateExtraImage(std::string_view wire, const uint8_t* image) noexcept {
-    uint8_t* e = extrasTable_.put(wireKey(reinterpret_cast<const uint8_t*>(wire.data())));
+void UniqueClaims::updateExtraImage(std::string_view wire, const uint8_t* image, TxnAccess* x) noexcept {
+    uint8_t* e = extrasOf(x).put(wireKey(reinterpret_cast<const uint8_t*>(wire.data())));
     std::memcpy(e + imageAt(), image, rowLen_);
 }
 
-void UniqueClaims::removeExtra(std::string_view wire) noexcept {
+void UniqueClaims::removeExtra(std::string_view wire, TxnAccess* x) noexcept {
+    TxnTable ext = extrasOf(x);
     const ViewKey self = wireKey(reinterpret_cast<const uint8_t*>(wire.data()));
-    const uint8_t* e = extrasTable_.get(self);
+    const uint8_t* e = ext.get(self);
     if (e == nullptr) return;
     const ViewKey n = ViewKey::fromBytes({e, keyWidth_});
     const uint8_t links = e[linksAt()];
@@ -94,13 +96,13 @@ void UniqueClaims::removeExtra(std::string_view wire) noexcept {
     std::memcpy(prev, e + prevAt(), wireWidth_);
     std::memcpy(next, e + nextAt(), wireWidth_);
 
-    uint8_t* ip = index_.put(n);
+    uint8_t* ip = index(x).put(n);
     uint32_t count;
     std::memcpy(&count, ip + countAt(), 4);
     --count;
     std::memcpy(ip + countAt(), &count, 4);
     if ((links & kHasPrev) != 0) {
-        uint8_t* p = extrasTable_.put(wireKey(prev));
+        uint8_t* p = ext.put(wireKey(prev));
         if ((links & kHasNext) != 0) std::memcpy(p + nextAt(), next, wireWidth_);
         else p[linksAt()] &= static_cast<uint8_t>(~kHasNext);
     } else if ((links & kHasNext) != 0) {
@@ -109,22 +111,23 @@ void UniqueClaims::removeExtra(std::string_view wire) noexcept {
         ip[flagsAt()] &= static_cast<uint8_t>(~kHasHead);
     }
     if ((links & kHasNext) != 0) {
-        uint8_t* x = extrasTable_.put(wireKey(next));
-        if ((links & kHasPrev) != 0) std::memcpy(x + prevAt(), prev, wireWidth_);
-        else x[linksAt()] &= static_cast<uint8_t>(~kHasPrev);
+        uint8_t* q = ext.put(wireKey(next));
+        if ((links & kHasPrev) != 0) std::memcpy(q + prevAt(), prev, wireWidth_);
+        else q[linksAt()] &= static_cast<uint8_t>(~kHasPrev);
     }
-    extrasTable_.erase(self);
-    --extras_;
+    ext.erase(self);
+    if (x == nullptr || x->chain == nullptr) --extras_;
 }
 
-bool UniqueClaims::smallestExtra(const ViewKey& n, std::string_view& wire, const uint8_t*& image) const noexcept {
-    const uint8_t* ip = index_.get(n);
+bool UniqueClaims::smallestExtra(const ViewKey& n, std::string_view& wire, const uint8_t*& image, TxnAccess* x) const noexcept {
+    const TxnTable ext = extrasOf(x);
+    const uint8_t* ip = index(x).get(n);
     if (ip == nullptr || (ip[flagsAt()] & kHasHead) == 0) return false;
     const uint8_t* cur = ip + headAt();
     const uint8_t* best = nullptr;
     const uint8_t* bestRow = nullptr;
     for (;;) {
-        const uint8_t* e = extrasTable_.get(wireKey(cur));
+        const uint8_t* e = ext.get(wireKey(cur));
         if (best == nullptr || compareSourceKeys(keyType_, {reinterpret_cast<const char*>(cur), wireWidth_}, {reinterpret_cast<const char*>(best), wireWidth_}) < 0) {
             best = cur;
             bestRow = e;

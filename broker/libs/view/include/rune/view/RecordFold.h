@@ -27,7 +27,8 @@ struct SourceRecord {
     const rune::codec::Descriptor* writer = nullptr;      // materialized writer version; nullptr = the fold resolves it
 };
 
-enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted };
+// Locked: the record reads or writes a row a held TxnOverlay locks; nothing was written.
+enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted, Locked };
 enum class ProspectOp : uint8_t { None, Upsert, Erase, Move };
 
 // Touched aggregate rows of one prepared record, in fixed slots (never allocates after reserve).

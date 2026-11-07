@@ -25,20 +25,28 @@ uint16_t writerVersionOf(std::string_view value, uint16_t fallback) noexcept {
 
 }  // namespace
 
-rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold& f, const rune::view::SourceRecord& rec, rune::view::Prospect& p) noexcept {
+rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold& f, const rune::view::SourceRecord& rec, rune::view::Prospect& p,
+                                          rune::view::TxnOverlay* chain) noexcept {
     p.clear();
     if (rec.key.size() != f.keyWidth) {
         p.stats.skippedMalformed = 1;
         return rune::view::PrepareStatus::Malformed;
     }
+    rune::view::TxnAccess x{chain, f.locks, f.member};
+    rune::view::TxnTable table(&f.table, rune::view::OverlayTable::KeyIndex, chain != nullptr || f.locks != nullptr ? &x : nullptr);
     rune::view::ProspectRow& r = p.rows[0];
     r.key      = rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(rec.key.data()), rec.key.size()});
-    r.existed  = f.table.get(r.key) != nullptr;
+    r.existed  = table.get(r.key) != nullptr;
     r.removed  = rec.value.empty();
     r.image    = nullptr;
     p.rowCount = 1;
     p.op       = r.removed ? rune::view::ProspectOp::Erase : rune::view::ProspectOp::Upsert;
-    return rune::view::PrepareStatus::Ok;
+    if (chain != nullptr && !x.locked) {
+        if (r.removed) table.erase(r.key);
+        else *table.put(r.key) = 1;
+    }
+    if (x.locked) return rune::view::PrepareStatus::Locked;
+    return chain != nullptr && chain->full() ? rune::view::PrepareStatus::CapacityExhausted : rune::view::PrepareStatus::Ok;
 }
 
 Verdict evaluateIntent(const rune::view::SourceRecord& rec, const rune::view::Prospect& p) noexcept {

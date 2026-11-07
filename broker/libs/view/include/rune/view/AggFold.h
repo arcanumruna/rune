@@ -47,11 +47,14 @@ struct AggregateFold {
     const KeyedFoldSpec*     keyed       = nullptr;
     ViewTable*               groupIds    = nullptr;
     uint64_t*                nextGroupId = nullptr;
+    uint8_t                  member = 0;         // this view's id within the judge's set, for TxnOverlay keys
+    const TxnLockSet*        locks  = nullptr;   // rows held by other transactions: a prepare that touches one is Locked
 };
 
 // Computes the record's prospective group rows into `p` (rows[0] the new group, rows[1] the old group of a Move)
-// without touching a table; CapacityExhausted when the overlay's fixed slots run out.
-[[nodiscard]] PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospect& p) noexcept;
+// without touching a table; CapacityExhausted when the overlay's fixed slots run out.  With `chain` the reads go chain-first and the
+// record's rows are written into the chain (a keyed view's new group burns the next gid); a Locked or CapacityExhausted result leaves it unspecified.
+[[nodiscard]] PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospect& p, TxnOverlay* chain = nullptr) noexcept;
 void applyAggregate(AggregateFold& f, const SourceRecord& rec, const Prospect& p) noexcept;
 
 // The walk of foldProjectionBatch for an aggregate: each committed record prepared into p (reserved once per instance) and applied.

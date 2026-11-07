@@ -147,16 +147,27 @@ inline void writeKeyedRow(const CompiledViewPlan& plan, const KeyedFoldSpec& ks,
     }
 }
 
+// The tables of a projection as one prepare or apply sees them: its own, or through the chain and lock set in `x`.
+struct Stores {
+    ProjectionFold& f;
+    TxnAccess*      x;
+    TxnTable        table;
+    TxnTable        owners;   // no table behind it unless the view is owner-mapped
+    Stores(ProjectionFold& fold, TxnAccess* access) noexcept
+        : f(fold), x(access), table(&fold.table, OverlayTable::View, access), owners(fold.owners, OverlayTable::Owners, access) {}
+};
+
 // A live record with the derived key rows[0].key on a unique view.  Where the record leaves another key (owner O or extra E), the release
 // itself is applyUnique's: prepare only marks it (rows[1], uniquePromotions).
-PrepareStatus prepareUniqueLive(ProjectionFold& f, const SourceRecord& rec, Prospect& p, const Descriptor& d, const uint8_t* owner, bool mine) noexcept {
+PrepareStatus prepareUniqueLive(Stores& s, const SourceRecord& rec, Prospect& p, const Descriptor& d, const uint8_t* owner, bool mine) noexcept {
+    ProjectionFold& f = s.f;
     const KeyedFoldSpec& ks = *f.keyed;
     const UniqueClaims& cl = *f.claims;
     ProspectRow& n = p.rows[0];
-    const uint8_t* extra = owner == nullptr ? cl.extraKeyOf(rec.key) : nullptr;
+    const uint8_t* extra = owner == nullptr ? cl.extraKeyOf(rec.key, s.x) : nullptr;
     const bool extraOfN = extra != nullptr && std::memcmp(extra, n.key.bytes.data(), ks.keyWidth) == 0;
-    const bool taken = !mine && !extraOfN && cl.ownerOf(n.key) != nullptr;
-    const uint8_t* cur = f.table.get(n.key);
+    const bool taken = !mine && !extraOfN && cl.ownerOf(n.key, s.x) != nullptr;
+    const uint8_t* cur = s.table.get(n.key);
 
     p.stats.applied = 1;
     n.removed = false;
@@ -173,7 +184,7 @@ PrepareStatus prepareUniqueLive(ProjectionFold& f, const SourceRecord& rec, Pros
         old.key = ViewKey::fromBytes({owner, ks.keyWidth});
         old.existed = true;
         old.image = nullptr;
-        old.promoted = cl.hasExtras(old.key);
+        old.promoted = cl.hasExtras(old.key, s.x);
         old.removed = !old.promoted;
         p.stats.ownerMoves = 1;
         p.stats.uniquePromotions = old.promoted ? 1 : 0;
@@ -185,25 +196,26 @@ PrepareStatus prepareUniqueLive(ProjectionFold& f, const SourceRecord& rec, Pros
     return PrepareStatus::Ok;
 }
 
-PrepareStatus prepareKeyed(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept {
+PrepareStatus prepareKeyed(Stores& s, const SourceRecord& rec, Prospect& p) noexcept {
+    ProjectionFold& f = s.f;
     const KeyedFoldSpec& ks = *f.keyed;
     if (rec.key.size() != ks.wireKeyWidth) {
         p.stats.skippedMalformed = 1;
         return PrepareStatus::Malformed;
     }
     const ViewKey wire = ViewKey::fromBytes(asBytes(rec.key));
-    const uint8_t* owner = ks.ownerMapped ? f.owners->get(wire) : nullptr;
+    const uint8_t* owner = ks.ownerMapped ? s.owners.get(wire) : nullptr;
     const UniqueClaims* cl = f.claims;
     ProspectRow& n = p.rows[0];
 
     // Erases the row of the source key: through the owner map, or at the wire key itself.
     const auto eraseCurrent = [&]() noexcept {
         if (cl != nullptr) {
-            if (owner == nullptr) return n.removed = cl->extraKeyOf(rec.key) != nullptr;   // an extra leaves quietly: applyUnique drops its claim
+            if (owner == nullptr) return n.removed = cl->extraKeyOf(rec.key, s.x) != nullptr;   // an extra leaves quietly: applyUnique drops its claim
             n.key = ViewKey::fromBytes({owner, ks.keyWidth});
             n.existed = true;
             p.rowCount = 1;
-            if (cl->hasExtras(n.key)) {
+            if (cl->hasExtras(n.key, s.x)) {
                 p.op = ProspectOp::Upsert;
                 n.promoted = true;
                 p.stats.uniquePromotions = 1;
@@ -219,7 +231,7 @@ PrepareStatus prepareKeyed(ProjectionFold& f, const SourceRecord& rec, Prospect&
             p.ownerOp = OwnerOp::Erase;
         } else {
             n.key = wire;
-            if (f.table.get(n.key) == nullptr) return false;
+            if (s.table.get(n.key) == nullptr) return false;
         }
         p.op = ProspectOp::Erase;
         p.rowCount = 1;
@@ -248,9 +260,9 @@ PrepareStatus prepareKeyed(ProjectionFold& f, const SourceRecord& rec, Prospect&
         }
     }
 
-    const uint8_t* cur = f.table.get(n.key);
+    const uint8_t* cur = s.table.get(n.key);
     const bool mine = owner != nullptr && std::memcmp(owner, n.key.bytes.data(), ks.keyWidth) == 0;
-    if (cl != nullptr) return prepareUniqueLive(f, rec, p, d, owner, mine);
+    if (cl != nullptr) return prepareUniqueLive(s, rec, p, d, owner, mine);
     if (ks.ownerMapped) {
         if (cur != nullptr && !mine) {
             p.stats.keyConflicts = 1;
@@ -278,76 +290,117 @@ PrepareStatus prepareKeyed(ProjectionFold& f, const SourceRecord& rec, Prospect&
 }
 
 // Row O leaves its owner w and the smallest extra takes it over.
-void promoteExtra(ProjectionFold& f, const ViewKey& o, const ViewKey& w) noexcept {
+void promoteExtra(Stores& st, const ViewKey& o, const ViewKey& w) noexcept {
+    ProjectionFold& f = st.f;
     std::string_view s;
     const uint8_t* image = nullptr;
-    (void)f.claims->smallestExtra(o, s, image);
+    (void)f.claims->smallestExtra(o, s, image, st.x);
     const ViewKey sKey = ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(s.data()), s.size()});
-    std::memcpy(f.table.put(o), image, f.layout.rowLen);
-    f.claims->setOwner(o, s);
-    f.claims->removeExtra(s);
-    f.owners->erase(w);
-    std::memcpy(f.owners->put(sKey), o.bytes.data(), f.keyed->keyWidth);
+    std::memcpy(st.table.put(o), image, f.layout.rowLen);
+    f.claims->setOwner(o, s, st.x);
+    f.claims->removeExtra(s, st.x);
+    st.owners.erase(w);
+    std::memcpy(st.owners.put(sKey), o.bytes.data(), f.keyed->keyWidth);
 }
 
 // The owner O of w gives its key up: an extra takes the row, or the row goes.
-void releaseOwner(ProjectionFold& f, const ViewKey& o, const ViewKey& w) noexcept {
-    if (f.claims->hasExtras(o)) return promoteExtra(f, o, w);
-    f.table.erase(o);
-    f.claims->eraseOwner(o);
-    f.owners->erase(w);
+void releaseOwner(Stores& st, const ViewKey& o, const ViewKey& w) noexcept {
+    if (st.f.claims->hasExtras(o, st.x)) return promoteExtra(st, o, w);
+    st.table.erase(o);
+    st.f.claims->eraseOwner(o, st.x);
+    st.owners.erase(w);
 }
 
-void applyUnique(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept {
+void applyUnique(Stores& st, const SourceRecord& rec, const Prospect& p) noexcept {
+    ProjectionFold& f = st.f;
     UniqueClaims& cl = *f.claims;
     const ProspectRow& n = p.rows[0];
     const ViewKey w = ViewKey::fromBytes(asBytes(rec.key));
     if (p.op == ProspectOp::None) {   // an extra: updates its image or leaves
-        if (n.image != nullptr) cl.updateExtraImage(rec.key, n.image);
-        else if (n.removed) cl.removeExtra(rec.key);
+        if (n.image != nullptr) cl.updateExtraImage(rec.key, n.image, st.x);
+        else if (n.removed) cl.removeExtra(rec.key, st.x);
         return;
     }
-    if (n.promoted) return promoteExtra(f, n.key, w);
-    if (p.op == ProspectOp::Erase) return releaseOwner(f, n.key, w);
+    if (n.promoted) return promoteExtra(st, n.key, w);
+    if (p.op == ProspectOp::Erase) return releaseOwner(st, n.key, w);
 
-    const uint8_t* cur = f.owners->get(w);
+    const uint8_t* cur = st.owners.get(w);
     const bool mine = cur != nullptr && std::memcmp(cur, n.key.bytes.data(), f.keyed->keyWidth) == 0;
     if (!mine) {
-        if (cur != nullptr) releaseOwner(f, ViewKey::fromBytes({cur, f.keyed->keyWidth}), w);
-        else cl.removeExtra(rec.key);
+        if (cur != nullptr) releaseOwner(st, ViewKey::fromBytes({cur, f.keyed->keyWidth}), w);
+        else cl.removeExtra(rec.key, st.x);
     }
     if (n.ownedByOther) {   // unjudged: the smaller source key owns, the other becomes an extra
-        const ViewKey o = ViewKey::fromBytes({cl.ownerOf(n.key), f.keyed->wireKeyWidth});
+        const ViewKey o = ViewKey::fromBytes({cl.ownerOf(n.key, st.x), f.keyed->wireKeyWidth});
         const std::string_view ow(reinterpret_cast<const char*>(o.bytes.data()), o.len);
         if (cl.compare(rec.key, ow) < 0) {
-            cl.addExtra(n.key, ow, f.table.get(n.key));
-            std::memcpy(f.table.put(n.key), n.image, p.rowLen);
-            cl.setOwner(n.key, rec.key);
-            f.owners->erase(o);
-            std::memcpy(f.owners->put(w), n.key.bytes.data(), f.keyed->keyWidth);
+            cl.addExtra(n.key, ow, st.table.get(n.key), st.x);
+            std::memcpy(st.table.put(n.key), n.image, p.rowLen);
+            cl.setOwner(n.key, rec.key, st.x);
+            st.owners.erase(o);
+            std::memcpy(st.owners.put(w), n.key.bytes.data(), f.keyed->keyWidth);
         } else {
-            cl.addExtra(n.key, rec.key, n.image);
+            cl.addExtra(n.key, rec.key, n.image, st.x);
         }
         return;
     }
-    std::memcpy(f.table.put(n.key), n.image, p.rowLen);
+    std::memcpy(st.table.put(n.key), n.image, p.rowLen);
     if (mine) return;
-    cl.setOwner(n.key, rec.key);
-    std::memcpy(f.owners->put(w), n.key.bytes.data(), f.keyed->keyWidth);
+    cl.setOwner(n.key, rec.key, st.x);
+    std::memcpy(st.owners.put(w), n.key.bytes.data(), f.keyed->keyWidth);
 }
 
-void applyKeyed(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept {
+void applyKeyed(Stores& st, const SourceRecord& rec, const Prospect& p) noexcept {
     const ProspectRow& n = p.rows[0];
     switch (p.op) {
         case ProspectOp::None: break;
-        case ProspectOp::Erase: f.table.erase(n.key); break;
-        case ProspectOp::Move: f.table.erase(p.rows[1].key); [[fallthrough]];
-        case ProspectOp::Upsert: std::memcpy(f.table.put(n.key), n.image, p.rowLen); break;
+        case ProspectOp::Erase: st.table.erase(n.key); break;
+        case ProspectOp::Move: st.table.erase(p.rows[1].key); [[fallthrough]];
+        case ProspectOp::Upsert: std::memcpy(st.table.put(n.key), n.image, p.rowLen); break;
     }
     if (p.ownerOp == OwnerOp::None) return;
     const ViewKey wire = ViewKey::fromBytes(asBytes(rec.key));
-    if (p.ownerOp == OwnerOp::Erase) f.owners->erase(wire);
-    else std::memcpy(f.owners->put(wire), n.key.bytes.data(), f.keyed->keyWidth);
+    if (p.ownerOp == OwnerOp::Erase) st.owners.erase(wire);
+    else std::memcpy(st.owners.put(wire), n.key.bytes.data(), st.f.keyed->keyWidth);
+}
+
+void applyTo(Stores& st, const SourceRecord& rec, const Prospect& p) noexcept {
+    if (st.f.claims != nullptr) return applyUnique(st, rec, p);
+    if (st.f.keyed != nullptr) return applyKeyed(st, rec, p);
+    if (p.op == ProspectOp::None) return;
+    const uint64_t k = p.rows[0].key.asU64();
+    if (p.op == ProspectOp::Erase) st.table.erase(k);
+    else std::memcpy(st.table.put(k), p.rows[0].image, p.rowLen);
+}
+
+PrepareStatus prepareOne(Stores& st, const SourceRecord& rec, Prospect& p) noexcept {
+    ProjectionFold& f = st.f;
+    if (f.keyed != nullptr) return prepareKeyed(st, rec, p);
+    uint64_t k = 0;
+    if (!decodeWireKey(rec.key, f.keyType, k)) {
+        p.stats.skippedMalformed = 1;
+        return PrepareStatus::Malformed;
+    }
+    ProspectRow& r = p.rows[0];
+    r.key     = ViewKey::fromU64(k);
+    p.rowCount = 1;
+    const uint8_t* cur = st.table.get(k);
+    r.existed = cur != nullptr;
+    r.removed = false;
+    r.image   = nullptr;
+    if (rec.value.empty()) {
+        p.op      = ProspectOp::Erase;
+        r.removed = true;
+        p.stats.deleted = 1;
+        return PrepareStatus::Ok;
+    }
+    p.op    = ProspectOp::Upsert;
+    p.stats.applied = 1;
+    r.image = p.scratch.data();
+    if (cur != nullptr) std::memcpy(r.image, cur, p.rowLen); else std::memset(r.image, 0, p.rowLen);
+    const Descriptor& d = rec.writer != nullptr ? *rec.writer : writerOf(f.vdc, rec.value);
+    writeProjectionRow(f.plan, f.layout, d, rec.value, r.image);
+    return PrepareStatus::Ok;
 }
 
 // The batch walk both folds share: control and aborted batches are consumed whole, `onRecord(key, value, offset, stats)` sees
@@ -439,43 +492,21 @@ FoldStats walkCommitted(const rune::storage::LogReadView& view, int64_t bound, i
 
 PrimType viewKeyType(const CompiledViewPlan& plan) noexcept { return resolveKeyType(plan); }
 
-PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept {
+PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p, TxnOverlay* chain) noexcept {
     p.clear();
-    if (f.keyed != nullptr) return prepareKeyed(f, rec, p);
-    uint64_t k = 0;
-    if (!decodeWireKey(rec.key, f.keyType, k)) {
-        p.stats.skippedMalformed = 1;
-        return PrepareStatus::Malformed;
+    TxnAccess x{chain, f.locks, f.member};
+    Stores st(f, chain != nullptr || f.locks != nullptr ? &x : nullptr);
+    PrepareStatus status = prepareOne(st, rec, p);
+    if (status == PrepareStatus::Ok && chain != nullptr && !x.locked) {
+        applyTo(st, rec, p);   // the record's effect, written into the chain instead of the tables
+        if (chain->full()) status = PrepareStatus::CapacityExhausted;
     }
-    ProspectRow& r = p.rows[0];
-    r.key     = ViewKey::fromU64(k);
-    p.rowCount = 1;
-    const uint8_t* cur = f.table.get(k);
-    r.existed = cur != nullptr;
-    r.removed = false;
-    r.image   = nullptr;
-    if (rec.value.empty()) {
-        p.op      = ProspectOp::Erase;
-        r.removed = true;
-        p.stats.deleted = 1;
-        return PrepareStatus::Ok;
-    }
-    p.op    = ProspectOp::Upsert;
-    p.stats.applied = 1;
-    r.image = p.scratch.data();
-    if (cur != nullptr) std::memcpy(r.image, cur, p.rowLen); else std::memset(r.image, 0, p.rowLen);
-    const Descriptor& d = rec.writer != nullptr ? *rec.writer : writerOf(f.vdc, rec.value);
-    writeProjectionRow(f.plan, f.layout, d, rec.value, r.image);
-    return PrepareStatus::Ok;
+    return x.locked ? PrepareStatus::Locked : status;
 }
 
 void applyProjection(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept {
-    if (f.claims != nullptr) return applyUnique(f, rec, p);
-    if (f.keyed != nullptr) return applyKeyed(f, rec, p);
-    if (p.op == ProspectOp::None) return;
-    const uint64_t k = p.rows[0].key.asU64();
-    if (p.op == ProspectOp::Erase) f.table.erase(k);
-    else std::memcpy(f.table.put(k), p.rows[0].image, p.rowLen);
+    Stores st(f, nullptr);
+    applyTo(st, rec, p);
 }
 
 FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,

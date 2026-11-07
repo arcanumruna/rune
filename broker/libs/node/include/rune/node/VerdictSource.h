@@ -12,6 +12,7 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/ProducerBatchWindow.h>
+#include <rune/view/TxnOverlay.h>
 #include <rune/view/Verdict.h>
 
 #include <algorithm>
@@ -29,12 +30,17 @@ inline constexpr std::size_t kKeyIndexChunkBytes           = 64u << 10;
 inline constexpr int64_t     kKeyIndexReplayRecordsPerPass = 65536;
 
 struct KeyIndexFold {
-    rune::view::ViewTable& table;
-    uint8_t                keyWidth = 0;
+    rune::view::ViewTable&          table;
+    uint8_t                         keyWidth = 0;
+    uint8_t                         member = 0;         // this view's id within the judge's set, for TxnOverlay keys
+    const rune::view::TxnLockSet*   locks  = nullptr;   // rows held by other transactions: a prepare that touches one is Locked
 };
 
 using rune::storage::keyIndexWord;
-[[nodiscard]] rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold&, const rune::view::SourceRecord&, rune::view::Prospect&) noexcept;
+/// With `chain` the key state is read chain-first and the record's insert or erase is written into the chain; a Locked or CapacityExhausted
+/// result leaves the chain unspecified.
+[[nodiscard]] rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold&, const rune::view::SourceRecord&, rune::view::Prospect&,
+                                                        rune::view::TxnOverlay* chain = nullptr) noexcept;
 /// The intent table (P5-3) over the key state the prospect holds; a Malformed prospect is accepted.
 [[nodiscard]] rune::view::Verdict evaluateIntent(const rune::view::SourceRecord&, const rune::view::Prospect&) noexcept;
 void applyKeyIndex(KeyIndexFold&, const rune::view::SourceRecord&, const rune::view::Prospect&) noexcept;
