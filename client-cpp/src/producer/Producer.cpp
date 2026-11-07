@@ -162,8 +162,7 @@ const char* Producer::intentRefusal_(TopicHandle topic, const Key& key, std::spa
         return viewAcks && topic.kind == TopicKind::Raw ? "acks View needs a typed topic" : nullptr;
     }
     if (topic.kind == TopicKind::Raw) return "intents need a typed topic";
-    if (!viewAcks) return "intents need acks including View";
-    if (transactional()) return "intents inside a transaction need Part G";
+    if (!viewAcks && !transactional()) return "intents need acks including View";
     if (intent == WriteIntent::Insert && value.empty()) return "an insert needs a value";
     return nullptr;
 }
@@ -692,7 +691,7 @@ void throwForTxnCompletion(const char* what, const Completion& c, const std::str
 
 void Producer::txnAndWait_(const char* what, std::chrono::nanoseconds timeout, std::uint8_t kind,
                            std::span<const OffsetEntry> offsets, std::string_view groupId,
-                           int32_t generationId, std::string_view memberId) {
+                           int32_t generationId, std::string_view memberId, TxnCommitResult* vote) {
     if (!transactional()) throwNoTransactionalId(what);
     if (impl_->clientClosed()) throw std::runtime_error(std::string(what) + ": producer closed");
     const auto& hk = impl_->hooks();
@@ -713,6 +712,10 @@ void Producer::txnAndWait_(const char* what, std::chrono::nanoseconds timeout, s
     };
     std::string      text;
     const Completion c = hk.andWait(hk.ctx, what, timeout, issue, &ctx, &text);
+    if (vote != nullptr && c.status == OpStatus::BrokerError && rune::protocol::client::isTxnVoteCode(c.errorCode)) {
+        *vote = TxnCommitResult{false, c.errorCode, constraintIdOf(c), c.value};
+        return;
+    }
     throwForTxnCompletion(what, c, text);
 }
 
@@ -731,8 +734,11 @@ void Producer::sendOffsetsToTransactionAndWait(std::span<const OffsetEntry> offs
                 offsets, group.groupId, group.generationId, group.memberId);
 }
 
-void Producer::commitTransactionAndWait(std::chrono::nanoseconds timeout) {
-    txnAndWait_("commitTransaction()", timeout, static_cast<std::uint8_t>(producer::TxnControl::Kind::Commit), {}, {});
+TxnCommitResult Producer::commitTransactionAndWait(std::chrono::nanoseconds timeout) {
+    TxnCommitResult result;
+    txnAndWait_("commitTransaction()", timeout, static_cast<std::uint8_t>(producer::TxnControl::Kind::Commit), {}, {},
+                -1, {}, &result);
+    return result;
 }
 
 void Producer::abortTransactionAndWait(std::chrono::nanoseconds timeout) {

@@ -1624,6 +1624,7 @@ if(BUILD_TESTING)
             tests/producer/ProducerAckPathTest.cpp
             tests/producer/ProducerAcksFlagsTest.cpp
             tests/producer/CheckedWritesIntentsTest.cpp
+            tests/producer/CheckedWritesTxnVoteClientTest.cpp
             tests/producer/CheckedWritesAutoIncClientTest.cpp
             tests/producer/ProducerVerdictsTest.cpp
             tests/producer/ProducerTier2PoolTest.cpp

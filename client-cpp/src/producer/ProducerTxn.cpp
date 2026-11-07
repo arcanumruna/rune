@@ -116,7 +116,7 @@ inline bool join(TxnJoiners& j, const TxnOp& op) noexcept {
 // ---------------------------------------------------------------------------------------------------------------
 
 void ProducerImpl::completeTxn_(const TxnOp& op, OpKind kind, OpStatus st, uint16_t errorCode, std::string_view text,
-                                int64_t value, int64_t aux) noexcept {
+                                int64_t value, int64_t aux, uint32_t reserved0) noexcept {
     if (internalOp(op)) {
         // The close's own abort: its outcome is the close's (closeTxnStep_ reads it), never delivered alone.
         if (auto* e = std::get_if<LifeEndingTxn>(&life_)) e->own = CloseAbortDone{st, errorCode};
@@ -129,12 +129,13 @@ void ProducerImpl::completeTxn_(const TxnOp& op, OpKind kind, OpStatus st, uint1
     c.errorCode = errorCode;
     c.value     = value;
     c.aux       = aux;
+    c.reserved0 = reserved0;
     hooks_.sink.deliver(op.target, c, textBytes(text));
 }
 
 void ProducerImpl::completeJoined_(const TxnJoiners& j, OpKind kind, OpStatus st, uint16_t errorCode,
-                                   std::string_view text) noexcept {
-    for (uint8_t i = 0; i < j.n; ++i) completeTxn_(j.ops[i], kind, st, errorCode, text);
+                                   std::string_view text, int64_t value, uint32_t reserved0) noexcept {
+    for (uint8_t i = 0; i < j.n; ++i) completeTxn_(j.ops[i], kind, st, errorCode, text, value, 0, reserved0);
 }
 
 void ProducerImpl::refuseTxn_(const TxnControl& c, OpStatus st, uint16_t errorCode, std::string_view text) noexcept {
@@ -602,6 +603,7 @@ void ProducerImpl::onTxnLegAnswer_(ReqKind kind, int16_t errorCode) noexcept {
         return;
     case Verdict::Abortable:
     case Verdict::Reject:
+    case Verdict::VotedNo:   // EndTxn only
         poison_(OpStatus::BrokerError, code, AbortKind::Plain);   // never produced: no sequence gap
         return;
     }
@@ -686,6 +688,20 @@ void ProducerImpl::finishTxn_() noexcept {
     const OpKind kind = commit ? OpKind::CommitTransaction : OpKind::AbortTransaction;
     completeTxn_(op, kind, OpStatus::Ok, 0, {});
     completeJoined_(joined, kind, OpStatus::Ok, 0, {});
+}
+
+void ProducerImpl::finishVotedNo_(const CoordAnswer& a) noexcept {
+    const auto* cm = std::get_if<Committing>(&txn_);
+    if (cm == nullptr) return;
+    const TxnOp      op     = cm->op;
+    const TxnJoiners joined = cm->joined;
+    txn_ = Ready{};   // the broker aborted the transaction: the vote is the definite answer
+    txnResetMembership_();
+    publishStatus_();
+    const uint16_t ucode = static_cast<uint16_t>(a.errorCode);
+    constexpr std::string_view kWhy = "EndTxn: a partition voted no";
+    completeTxn_(op, OpKind::CommitTransaction, OpStatus::BrokerError, ucode, kWhy, a.failingOffset, 0, a.constraintId);
+    completeJoined_(joined, OpKind::CommitTransaction, OpStatus::BrokerError, ucode, kWhy, a.failingOffset, a.constraintId);
 }
 
 void ProducerImpl::endExpired_(bool releaseSlot) noexcept {
@@ -847,6 +863,14 @@ void ProducerImpl::onEndTxnAnswer_(const CoordAnswer& a, CoordinatorLink::Slot& 
     case Verdict::Retry:
     case Verdict::Rediscover:
         return;            // the link re-sends; never handed over
+    case Verdict::VotedNo:
+        // Definite even for a re-sent commit: the first one or this one, the transaction is aborted.
+        if (cm == nullptr) {
+            enterFatal_(OpStatus::BrokerError, ucode, "EndTxn(abort) answered with a vote (fatal)");
+            return;
+        }
+        finishVotedNo_(a);
+        return;
     case Verdict::Fenced:
         enterFatal_(OpStatus::Fenced, ucode, "EndTxn: producer fenced (fatal)");
         return;
@@ -1510,6 +1534,7 @@ void ProducerImpl::onOffsetsAnswer_(const CoordAnswer& a, CoordinatorLink::Slot&
         return;
     case Verdict::Abortable:
     case Verdict::Reject:
+    case Verdict::VotedNo:   // EndTxn only
         offsetsEnd_(OpStatus::BrokerError, ucode,
                     s.kind() == ReqKind::AddOffsets ? "AddOffsetsToTxn failed" : "TxnOffsetCommit failed",
                     OffsetsEnd::Failed);

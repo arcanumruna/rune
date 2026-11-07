@@ -247,8 +247,8 @@ in offset order, against the records accepted before it:
   and `constraintIdOf(completion)` 0. A topic without a key index answers an intent `InvalidRequest`.
 - **Refused locally**: these sends return `SendResult::WriteNotAllowed` (nothing is queued and no completion follows), and
   the blocking forms throw `std::invalid_argument` with the text in quotes: an intent on a raw handle ("intents need a typed
-  topic"), any send of a `View` producer on a raw handle ("acks View needs a typed topic"), an intent without `View` ("intents
-  need acks including View"), an intent on a transactional producer ("intents inside a transaction need Part G"), and an
+  topic"), any send of a `View` producer on a raw handle ("acks View needs a typed topic"), an intent without `View` on a
+  non-transactional producer ("intents need acks including View"), and an
   `Insert` with an empty value ("an insert needs a value"). Tier-2 batches and claims carry no intent.
 - **Retries**: a lost ack is retried and replays the original verdict, so a retried `Insert` gets its own `Ok`, never
   `KeyExists` against itself. A retry outside the broker's window completes with `OpStatus::VerdictUnknown`.
