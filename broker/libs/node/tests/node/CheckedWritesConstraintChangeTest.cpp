@@ -444,9 +444,10 @@ TEST(CheckedWritesConstraintChangeRegression, RefusedReplacementKeepsTheLoggedMe
     EXPECT_EQ(c.dropOf(kStatsObj), -1);
 }
 
-// A restarted node installs its catalog's views for recovery, and the recovery pass materializes the instance of one no judge has attached
-// yet.  That re-registered the template and wiped its verdict identity, so a CREATE OR REPLACE after a restart found no replacement plan of
-// the object: the member left the set instead of swapping, and the check stopped judging.
+// A restarted node installs its catalog's views for recovery, and the recovery pass materialized the instance of one no judge had attached
+// yet: re-registering the template wiped its verdict identity, the object had no plan to swap to, and the member left the set.  In
+// production that is a restart while a replacement candidate still builds (see RestartWhileACandidateBuilds...); this test reaches the same
+// path only because the rig keeps sending recovery installs after restart() (#954).
 TEST(CheckedWritesConstraintChangeRegression, ReplaceAfterRestartSwapsAndKeepsJudgingRegression) {
     constexpr uint8_t kAllView = rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll;
     Cw c;
@@ -476,4 +477,43 @@ TEST(CheckedWritesConstraintChangeRegression, ReplaceAfterRestartSwapsAndKeepsJu
     const auto fifth = insert(5, "e");
     ASSERT_TRUE(fifth);
     EXPECT_EQ(fifth->verdicts, (std::vector<std::tuple<uint16_t, uint16_t, uint32_t>>{{0, 55, static_cast<uint32_t>(kStatsObj << 16) | 1}})) << "the check still judges after the restart";
+}
+
+// The production trigger: CREATE OR REPLACE applied live (no recovery install), then a restart before the swap is logged.  The boot
+// installs only the new plan, for recovery; its candidate must stay the object's replacement through the recovery pass and swap in.
+TEST(CheckedWritesConstraintChangeRegression, RestartWhileACandidateBuildsKeepsTheReplacementRegression) {
+    constexpr uint8_t kAllView = rune::protocol::client::kAcksWireView | rune::protocol::client::kAcksWireAll;
+    Cw c;
+    c.create(CV::AccountStats, 3);
+    int32_t seq = 0;
+    const auto insert = [&](uint64_t id, const char* name) {
+        const std::vector<Char> one{Char{.id = id, .userId = 1, .name = name, .intent = 1}};
+        return c.r.ackFetching(c.r.appendCharacters(one, kAllView, 41, seq++), 6000);
+    };
+    for (const auto& [id, name] : {std::pair<uint64_t, const char*>{1, "a"}, {2, "b"}, {3, "c"}}) {
+        const auto a = insert(id, name);
+        ASSERT_TRUE(a && a->code == 0 && a->verdicts.empty());
+    }
+    c.r.holdJudge(true);
+    c.r.replaceConstrainedView(CV::AccountStats, 4);
+    const uint64_t fp4 = c.r.fingerprintOf(CV::AccountStats, false);
+    const auto swapped = [&] {
+        const auto changes = c.r.readLog().changes;
+        return std::any_of(changes.back().members.begin(), changes.back().members.end(), [&](const cr::ChangeMember& m) { return m.viewObjectId == kStatsObj && m.planFingerprint == fp4; });
+    };
+    c.r.passes(20);
+    ASSERT_FALSE(swapped()) << "the held judge must not swap before the restart";
+    c.r.restart();
+    c.r.holdJudge(false);
+    ASSERT_TRUE(c.passesUntil([&] {
+        c.r.followerFetch();
+        return swapped();
+    })) << "the candidate lost its identity in the recovery pass and never swapped in";
+    EXPECT_EQ(c.dropOf(kStatsObj), -1) << "the check left the set";
+    const auto fourth = insert(4, "d");
+    ASSERT_TRUE(fourth);
+    EXPECT_TRUE(fourth->verdicts.empty()) << "the new cap allows a fourth";
+    const auto fifth = insert(5, "e");
+    ASSERT_TRUE(fifth);
+    EXPECT_EQ(fifth->verdicts, (std::vector<std::tuple<uint16_t, uint16_t, uint32_t>>{{0, 55, static_cast<uint32_t>(kStatsObj << 16) | 1}})) << "the new plan judges after the restart";
 }
