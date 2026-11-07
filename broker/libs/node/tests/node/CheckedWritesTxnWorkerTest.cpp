@@ -740,6 +740,25 @@ TEST(CheckedWritesTxnWorker, DropWhileLockedThenFailoverLeaksNothing) {
     EXPECT_EQ(k.r.worker->voteScansForTest(), 0u);
 }
 
+// T7 review 3, N3: an ordinary transaction whose segment waits for a voted one's marker holds the worker's one-step set; a demotion
+// gives it back (the worker no longer drives that judge), so the worker's other sources never wait for it.
+TEST(CheckedWritesTxnWorker, DemotedJudgeReleasesTheOneStepSetRegression) {
+    Ki k;
+    auto& pool = k.r.vs->txnOverlaysForTest();
+    k.txn(55, {ups(4)});
+    k.txn(66, {ins(4)});
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, 66, 0);
+    ASSERT_EQ(k.r.txnJudgeOffsetsInLog().size(), 1u);
+    k.r.marker(55, true);   // above 66's J: the judge stands at 55's first record until then
+    ASSERT_TRUE(k.r.driveUntilVoted(tok));
+    ASSERT_EQ(k.r.voteReply(tok)->code, 0);
+    k.r.passes(30);
+    ASSERT_EQ(k.r.writeState()->txn.find(66)->phase, TxnPhase::Locked);
+    ASSERT_TRUE(pool.oneStepHeld()) << "55's segment waits for 66's marker";
+    k.r.demote();
+    EXPECT_FALSE(pool.oneStepHeld());
+}
+
 // A voted transaction aborted at its marker: a persisted member restarted from its checkpoint refolds to the leader's rows.
 TEST(CheckedWritesTxnWorker, VotedAbortedRefoldsEqual) {
     Persisted p;

@@ -1620,8 +1620,9 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryResolutionWalkIsBudgetedAndResumes
     EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
 }
 
-// T7 review 2, N1: the one-step set is the worker's, shared by its sources.  O's segment waits for T0's marker; another source applies
-// its own ordinary transaction meanwhile and takes the set.  O collects its keys anew, so T0's insert still supersedes O's delete.
+// T7 review 2, N1: the one-step set is the worker's, shared by its sources.  O's segment waits for T0's marker and gives the set up
+// (as a stall does); another source applies its own ordinary transaction meanwhile and takes the set.  O collects its keys anew, so
+// T0's insert still supersedes O's delete.
 TEST(CheckedWritesTxnJudgeRegression, SegmentResumedAfterAnotherSourceTookTheKeySetRecollectsRegression) {
     JudgeRig r(false);
     JudgeRig other(false);
@@ -1636,6 +1637,7 @@ TEST(CheckedWritesTxnJudgeRegression, SegmentResumedAfterAnotherSourceTookTheKey
     r.log.marker(66, true);                       // 20
     r.drive(20);
     ASSERT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker below the HW";
+    r.vs.releaseOneStep();
     other.log.data({{50}, {51}}, 88);
     other.log.marker(88, true);
     for (int i = 0; i < 4 && other.vs.judgeCursor() < other.log.next; ++i) other.drive();
@@ -1651,6 +1653,85 @@ TEST(CheckedWritesTxnJudgeRegression, SegmentResumedAfterAnotherSourceTookTheKey
     for (int i = 0; i < 4; ++i) plain.drive();
     EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
     for (int64_t id = 0; id < 200; ++id) EXPECT_EQ(r.indexed(id), plain.indexed(id)) << id;
+}
+
+namespace {
+// An ordinary transaction 77 over 1,100 other producers' markers: 5000's delete of 1 lies past the marker window (a refill), 5001's
+// aborted delete of 2 does not supersede.
+void pastTheMarkerList(JudgeRig& r) {
+    r.log.data({{1}, {2}, {3}}, 77);
+    for (int64_t p = 0; p < 1100; ++p) {
+        if (p == 5) r.log.data({del(2)}, 5001);
+        if (p == 1050) r.log.data({del(1)}, 5000);
+        if (p == 1090) r.log.marker(5000, true);
+        if (p == 1095) r.log.marker(5001, false);
+        r.log.data({{30'000 + p}}, 1000 + p);
+        r.log.marker(1000 + p, true);
+    }
+    r.log.marker(77, true);
+    r.log.data({{5}});
+}
+}  // namespace
+
+// T7 review 3, N3: two sources of one worker, each in a segment that stops for a refill, never take the one-step set from each
+// other: the holder keeps it until its transaction ends, the other waits.  Both reach the log's end equal to a lone source's fold.
+TEST(CheckedWritesTxnJudgeRegression, TwoSourcesNeedingRefillsBothFinishRegression) {
+    JudgeRig lone(false);
+    lone.start();
+    pastTheMarkerList(lone);
+    for (int i = 0; i < 40 && lone.vs.judgeCursor() < lone.log.next; ++i) lone.drive();
+    ASSERT_EQ(lone.vs.judgeCursor(), lone.log.next);
+    ASSERT_FALSE(lone.indexed(1));
+    ASSERT_TRUE(lone.indexed(2));
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    pastTheMarkerList(a);
+    pastTheMarkerList(b);
+    for (int i = 0; i < 80 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_EQ(b.vs.judgeCursor(), b.log.next);
+    EXPECT_FALSE(a.pool.oneStepHeld()) << "released at the end of the transaction";
+    EXPECT_EQ(a.tables(), lone.tables());
+    EXPECT_EQ(b.tables(), lone.tables());
+}
+
+// T7 review 3, N3: a source dropped (or demoted: the worker releases the claim of a judge it no longer drives) mid-segment gives
+// the set back, and the source waiting for it proceeds.
+TEST(CheckedWritesTxnJudgeRegression, DroppedHolderReleasesTheOneStepSetRegression) {
+    for (const bool drop : {true, false}) {
+        SCOPED_TRACE(drop ? "dropped" : "demoted");
+        JudgeRig r(false);
+        JudgeRig other(false);
+        other.vs.bindTxn(&r.pool, other.batch, JudgeRig::kRecordsMax);
+        r.start();
+        other.start();
+        r.log.data({del(4)}, 55);                     // 10, O
+        r.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
+        r.log.judge(66, 11);                          // 12
+        r.log.marker(55, true);                       // 13
+        r.log.marker(66, true);                       // 14
+        r.drive(14);
+        ASSERT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker below the HW";
+        ASSERT_TRUE(r.pool.oneStepHeld());
+        other.log.data({{50}, {51}}, 88);
+        const int64_t marker = other.log.next;
+        other.log.marker(88, true);
+        for (int i = 0; i < 4; ++i) other.drive();
+        ASSERT_EQ(other.vs.judgeCursor(), marker) << "88 waits for the set";
+        ASSERT_FALSE(other.indexed(51));
+        if (drop) r.vs.releaseTxnOverlays(r.st.txn);
+        else r.vs.releaseOneStep();
+        EXPECT_FALSE(r.pool.oneStepHeld());
+        for (int i = 0; i < 4 && other.vs.judgeCursor() <= marker; ++i) other.drive();
+        EXPECT_GT(other.vs.judgeCursor(), marker);
+        EXPECT_TRUE(other.indexed(51));
+    }
 }
 
 // I3: accepted(r), an ordinary transaction committed below J.

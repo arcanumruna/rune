@@ -320,6 +320,7 @@ VerdictSource::OverlayNeed VerdictSource::overlayNeed() const noexcept {
 void VerdictSource::releaseTxnOverlays(TxnJudgeState& txn) noexcept {
     txn.releaseOverlays([&](int32_t i) { txnPool_->release(i); });
     if (jx_.atMarker && jx_.overlay >= 0) txnPool_->release(jx_.overlay);   // a deferred transaction's overlay is its entry's
+    releaseOneStep();
     jx_ = {};
     resetChainLive_();
     refreshLocks_();
@@ -538,6 +539,7 @@ void VerdictSource::stall_(StallReason reason) noexcept {
     if (stalled_) return;
     ++stats_.verdictStalls;
     stalled_     = true;
+    releaseOneStep();   // a stalled judge is not driven: the other sources must not wait for it
     stallReason_ = reason;
     spdlog::error("verdict judge stalled: topic {} partition {}: {}", srcTopicId_, partition_,
                   reason == StallReason::Full ? "rejected index full" : reason == StallReason::OutOfOrder ? "rejection out of order" : "view capacity exhausted");
@@ -703,6 +705,7 @@ void VerdictSource::endOrdinary_(const OrdinaryTxn& o) noexcept {
     ordinary_.erase(ordinary_.begin() + static_cast<std::ptrdiff_t>(markerAt_));
     ordinaryApplied_ = -1;
     ordinaryWalk_ = {};
+    releaseOneStep();
     txnStop_ = TxnStop::None;
     judgeCursor_ = o.marker + 1;
     syncMemberCursors_();

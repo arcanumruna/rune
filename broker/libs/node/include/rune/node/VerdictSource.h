@@ -175,10 +175,15 @@ public:
     [[nodiscard]] bool keysPending() const noexcept { return keysPending_; }
     [[nodiscard]] TxnKeySet& keysAt(int32_t i) noexcept { return keys_[static_cast<std::size_t>(i)]; }
     [[nodiscard]] TxnKeySet& oneStep() noexcept { return oneStep_; }
-    /// The one-step set is shared by the worker's sources: a source that keeps its content across passes holds a claim, which the
-    /// next claim (another source) voids.
-    [[nodiscard]] uint64_t claimOneStep() noexcept { return ++oneStepClaim_; }
-    [[nodiscard]] bool holdsOneStep(uint64_t claim) const noexcept { return claim != 0 && claim == oneStepClaim_; }
+    /// The one-step set is shared by the worker's sources: a source that keeps its content across passes holds a claim until it
+    /// releases it.  While it is held another source waits: two sources taking it from each other would never finish (T7 N3).
+    [[nodiscard]] bool oneStepHeld() const noexcept { return oneStepHeld_; }
+    [[nodiscard]] uint64_t claimOneStep() noexcept {
+        oneStepHeld_ = true;
+        return ++oneStepClaim_;
+    }
+    [[nodiscard]] bool holdsOneStep(uint64_t claim) const noexcept { return oneStepHeld_ && claim == oneStepClaim_; }
+    void releaseOneStep(uint64_t claim) noexcept { oneStepHeld_ = oneStepHeld_ && claim != oneStepClaim_; }
     /// The acquired overlays bound to `sourceKey`.
     [[nodiscard]] rune::view::TxnLockSet lockSetFor(uint64_t sourceKey) const noexcept {
         rune::view::TxnLockSet set;
@@ -199,6 +204,7 @@ private:
     bool                                                                   overlaysPending_ = false;
     std::size_t                                                            keysWanted_ = 0;
     uint64_t                                                               oneStepClaim_ = 0;
+    bool                                                                   oneStepHeld_ = false;
     bool                                                                   keysPending_ = false;
 };
 
@@ -257,6 +263,12 @@ public:
     /// Gives the pool every overlay `txn` holds, and drops the judgement in progress.  The leadership scan's begin and activate_ call
     /// it before the table is reset.
     void releaseTxnOverlays(TxnJudgeState& txn) noexcept;
+    /// Gives back the one-step set this source holds mid-segment; its walk collects anew if it claims again.  The worker calls it
+    /// for a partition it no longer drives as leader, so a demoted source never keeps the other sources waiting.
+    void releaseOneStep() noexcept {
+        if (oneStepClaim_ != 0) txnPool_->releaseOneStep(oneStepClaim_);
+        oneStepClaim_ = 0;
+    }
     /// The leadership scan's begin: the overlays go back, and the judge re-activates from K once the scan is done (the table's
     /// entries are judged anew, so a reset Locked entry gets its apply).
     void rescan(TxnJudgeState& txn) noexcept {
@@ -814,7 +826,10 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
         OrdinaryWalk& w = ordinaryWalk_;
         if (w.marker != o.marker) w = {o.marker, o.first};
         if (w.end < 0 || !txnPool_->holdsOneStep(oneStepClaim_)) {
-            oneStepClaim_ = txnPool_->claimOneStep();
+            if (!txnPool_->holdsOneStep(oneStepClaim_)) {
+                if (txnPool_->oneStepHeld()) return false;   // another source is mid-segment: wait for it
+                oneStepClaim_ = txnPool_->claimOneStep();
+            }
             keys.clear();
             w.end = -1;   // another source may have taken the set mid-segment: note the keys again
             if (!walkBatches_(readRange, w.from, o.marker, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
