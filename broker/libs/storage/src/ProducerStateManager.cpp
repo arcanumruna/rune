@@ -181,8 +181,8 @@ ProducerStateManager::validate(int32_t topicId,
     if (baseSequence > e.lastSequence) {
         // lastSequence == -1 means no batch appended yet in this epoch → expect 0.
         if (baseSequence == e.lastSequence + 1) return ValidationResult::accept();
-        // D6 L1: a rebuilt marker-only entry knows the epoch, not the producer's sequence.
-        if (e.markerOnly) return ValidationResult::unknownProducer();
+        // D6 L1 / #953: a rebuilt entry knows the log's last sequence, not the producer's.
+        if (e.rebuilt) return ValidationResult::unknownProducer();
         return ValidationResult::oos();   // forward gap
     }
 
@@ -229,7 +229,8 @@ void ProducerStateManager::update(int32_t topicId,
                                   int16_t producerEpoch,
                                   int32_t baseSequence,
                                   int32_t lastSequence,
-                                  int64_t baseOffset)
+                                  int64_t baseOffset,
+                                  bool fromRebuild)
 {
     ProducerStateEntry& e = getOrCreate(topicId, producerId, partition);
 
@@ -248,7 +249,7 @@ void ProducerStateManager::update(int32_t topicId,
     // Record the batch in the retry window (circular, evicts oldest when full).
     e.push(baseSequence, lastSequence, baseOffset);
     e.lastSequence = lastSequence;
-    e.markerOnly   = false;   // D6 L1: a sequence of this epoch is known now
+    e.rebuilt      = fromRebuild;   // a live append makes lastSequence exact
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +264,7 @@ void ProducerStateManager::fenceEpoch(int32_t topicId, int64_t producerId, int32
     if (producerEpoch <= e.producerEpoch) return;
     e.producerEpoch = producerEpoch;
     e.lastSequence  = -1;
-    e.markerOnly    = fromRebuild;   // D6 L1: no sequence of this epoch survives in the log
+    e.rebuilt       = fromRebuild;   // D6 L1: no sequence of this epoch survives in the log
     e.resetWindow();
 }
 
@@ -625,7 +626,7 @@ ProducerStateManager::rebuildStep(Rebuild& r, LogT& log, std::size_t budgetBytes
                 } else if (!isControl && pid >= 0 && reader.baseSequence() >= 0) {
                     const int32_t baseSeq = reader.baseSequence();
                     update(r.topicId, pid, r.partition, reader.producerEpoch(), baseSeq, baseSeq + lastDelta,
-                           batchBase);
+                           batchBase, /*fromRebuild=*/true);
                 }
                 r.next = batchLast + 1;
             }

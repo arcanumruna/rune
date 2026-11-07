@@ -1232,8 +1232,8 @@ TEST(UnknownProducerIdRegression, RebuiltStateAfterRetentionAnswersUnknownProduc
         EXPECT_FALSE(rebuilt.validate(0, 7, 0, 0, 6, 6).isOos());
         EXPECT_TRUE(rebuilt.validate(0, 7, 0, 1, 0, 0).isAccept()) << "P re-sequenced at seq 0 (new epoch)";
         EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 0, 0).isAccept()) << "seq 0 on any epoch: trust-on-first-use";
-        // Q is known: a forward gap stays OOS, epochs unchanged.
-        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 14, 14).isOos()) << "known entry + gap";
+        // Q is known, epochs unchanged; a rebuilt entry's forward gap is an unknown producer's (#953).
+        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 14, 14).isUnknownProducerId()) << "known entry, history cut by retention";
         EXPECT_TRUE(rebuilt.validate(0, 8, 0, 2, 12, 12).isFenced()) << "lower epoch";
         EXPECT_TRUE(rebuilt.validate(0, 8, 0, 4, 5, 5).isOos()) << "higher epoch, seq != 0";
         EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 12, 12).isAccept()) << "in order";
