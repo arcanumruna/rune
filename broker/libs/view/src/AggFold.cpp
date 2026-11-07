@@ -837,6 +837,7 @@ PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospe
     p.clear();
     RowOverlay& ov = p.overlay;
     using T = RowOverlay::Table;
+    if (chain != nullptr && !rowsFit(*chain, {&f.view, &f.contributors, &f.groups, f.blocks, f.groupIds})) return PrepareStatus::CapacityExhausted;
     TxnAccess x{chain, f.locks, f.member};
     TxnAccess* const xp = chain != nullptr || f.locks != nullptr ? &x : nullptr;
     const TxnTable groupsT(&f.groups, OverlayTable::Groups, xp);

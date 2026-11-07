@@ -133,14 +133,16 @@ ViewKey nameKey(const std::string& lowered) {
 
 struct UniqueRig {
     rune::codec::Descriptor src = charSource();
+    bool unique;
     CompileResult comp = [&] {
         ViewPlan v;
         v.viewName = "character_name";
         v.sources = {{5, "characterId"}};
         v.unicodeVersion = rune::codec::kUnicodeVersion;
-        v.unique = true;
+        v.unique = unique;
         v.keyComponents = {{"name", 1, "nameKey"}};
-        v.output.push_back({"characterId", PrimType::UInt64, 0, "characterId", MergeRule::Replace});
+        if (!unique) v.keyComponents.push_back({"characterId", 0, "characterId"});   // identifies the record: the view is owner-mapped, not unique
+        else v.output.push_back({"characterId", PrimType::UInt64, 0, "characterId", MergeRule::Replace});
         v.output.push_back({"gender", PrimType::UInt16, 0, "gender", MergeRule::Replace});
         const rune::codec::Descriptor* srcs[] = {&src};
         return compileView(v, srcs, kViewTopic).value();
@@ -152,7 +154,7 @@ struct UniqueRig {
     UniqueClaims claims{spec.keyWidth, spec.wireKeyWidth, comp.rowLayout.rowLen, PrimType::UInt64, 7, 256, 1u << 16};
     Prospect p;
     TxnOverlay chain;
-    UniqueRig() {
+    explicit UniqueRig(bool uniq = true) : unique(uniq) {
         p.reserve(comp.rowLayout, nullptr);
         chain.reserve(256, 256);
     }
@@ -160,7 +162,7 @@ struct UniqueRig {
         const auto k = keyBytes(id);
         const auto v = name.empty() ? std::vector<uint8_t>{} : character(src, id, name);
         const SourceRecord rec{sv(k), sv(v), 0, 0, nullptr};
-        ProjectionFold f{comp.plan, comp.rowLayout, vdc, table, PrimType::UInt64, &spec, &owners, &claims};
+        ProjectionFold f{comp.plan, comp.rowLayout, vdc, table, PrimType::UInt64, &spec, &owners, unique ? &claims : nullptr};
         f.locks = locks;
         const PrepareStatus st = prepareProjection(f, rec, p, ch);
         if (apply && st == PrepareStatus::Ok) applyProjection(f, rec, p);
@@ -284,6 +286,43 @@ TEST(CheckedWritesTxnOverlay, RowLongerThanTheReservationIsFullNotCorruption) {
     o.reserve(4, 8);
     EXPECT_EQ(o.put(0, OverlayTable::View, ViewKey::fromU64(1), nullptr, 16), nullptr);
     EXPECT_TRUE(o.full());
+}
+
+TEST(CheckedWritesTxnOverlay, OverlayRowsShorterThanATableRowAreCapacityExhausted) {
+    AggRig a(userTotals());
+    TxnOverlay tiny;
+    tiny.reserve(64, 1);
+    EXPECT_EQ(a.prepare(1, 100, 5, &tiny), PrepareStatus::CapacityExhausted);
+    EXPECT_EQ(tiny.rows(), 0u);
+    UniqueRig u;
+    TxnOverlay narrow;
+    narrow.reserve(16, 8);
+    EXPECT_EQ(u.prepare(1, "foo", &narrow), PrepareStatus::CapacityExhausted);
+    EXPECT_EQ(narrow.rows(), 0u);
+}
+
+TEST(CheckedWritesTxnOverlay, ARowThatDecidesAConflictIsLocked) {
+    UniqueRig u(false);   // owner-mapped, not unique
+    ASSERT_EQ(u.prepare(2, "foo", nullptr), PrepareStatus::Ok);
+    const ViewKey n = u.p.rows[0].key;
+    // A stored row at n that c2 does not own, and c5 owning n: the shape a key conflict decides on.
+    u.table.put(n);
+    std::memcpy(u.owners.put(ViewKey::fromBytes(keyBytes(5))), n.bytes.data(), u.spec.keyWidth);
+    ASSERT_EQ(u.prepare(2, "foo", &u.chain), PrepareStatus::Ok);
+    EXPECT_EQ(u.p.stats.keyConflicts, 1u);
+    const TxnLockSet locks = lockSetOf(u.chain);
+    EXPECT_EQ(u.prepare(5, "", nullptr, false, &locks), PrepareStatus::Locked);   // c5 leaving would free the row c2 lost to
+    EXPECT_EQ(u.prepare(3, "", nullptr, false, &locks), PrepareStatus::Ok);
+    EXPECT_NE(u.table.get(n), nullptr);
+}
+
+TEST(CheckedWritesTxnOverlay, ARowAnotherSourceOwnsIsLockedForUniqueToo) {
+    UniqueRig u;
+    ASSERT_EQ(u.prepare(1, "foo", nullptr, true), PrepareStatus::Ok);
+    ASSERT_EQ(u.prepare(2, "foo", &u.chain), PrepareStatus::Ok);
+    EXPECT_TRUE(u.p.rows[0].ownedByOther);
+    const TxnLockSet locks = lockSetOf(u.chain);
+    EXPECT_EQ(u.prepare(1, "", nullptr, false, &locks), PrepareStatus::Locked);
 }
 
 TEST(CheckedWritesTxnOverlay, FullOverlayIsCapacityExhausted) {

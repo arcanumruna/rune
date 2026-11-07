@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <vector>
 
 #include <rune/view/ViewKey.h>
@@ -26,6 +27,7 @@ public:
     // A put or erase found no free slot since the last clear().
     [[nodiscard]] bool full() const noexcept { return full_; }
     [[nodiscard]] std::size_t rows() const noexcept { return used_; }
+    [[nodiscard]] uint32_t maxRowLen() const noexcept { return maxRowLen_; }
 
     // True for an erased row too: erasing a row locks it as much as writing it does.
     [[nodiscard]] bool contains(uint8_t member, OverlayTable table, const ViewKey& key) const noexcept { return find(member, table, key) >= 0; }
@@ -58,6 +60,13 @@ private:
     uint64_t             sourceKey_ = 0;
     bool                 full_ = false;
 };
+
+// A chained prepare checks this before it writes: every put hands out a row of the table's length, so the overlay's rows must be at least as long.
+[[nodiscard]] inline bool rowsFit(const TxnOverlay& o, std::initializer_list<const ViewTable*> tables) noexcept {
+    for (const ViewTable* t : tables)
+        if (t != nullptr && t->rowLen() > o.maxRowLen()) return false;
+    return true;
+}
 
 inline constexpr std::size_t kTxnOverlaysPerWorker = 8;
 
@@ -117,6 +126,14 @@ public:
         touch(vk);
         if (x_->chain == nullptr) return t_->put(k);
         return chainPut(vk, t_->get(k));
+    }
+    // A present row that decides an outcome without being written: the chain holds an unchanged copy, so it locks like a write does.
+    void pin(const ViewKey& k) noexcept {
+        if (x_ == nullptr || x_->chain == nullptr || t_ == nullptr) return;
+        touch(k);
+        if (x_->chain->contains(x_->member, id_, k)) return;
+        if (const uint8_t* row = t_->get(k)) chainPut(k, row);
+        else noteAbsent(k);
     }
     bool erase(const ViewKey& k) noexcept {
         if (x_ == nullptr) return t_->erase(k);

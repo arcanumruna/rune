@@ -213,6 +213,7 @@ PrepareStatus prepareKeyed(Stores& s, const SourceRecord& rec, Prospect& p) noex
         if (cl != nullptr) {
             if (owner == nullptr) return n.removed = cl->extraKeyOf(rec.key, s.x) != nullptr;   // an extra leaves quietly: applyUnique drops its claim
             n.key = ViewKey::fromBytes({owner, ks.keyWidth});
+            (void)s.table.get(n.key);   // touches the row apply erases or hands over
             n.existed = true;
             p.rowCount = 1;
             if (cl->hasExtras(n.key, s.x)) {
@@ -228,6 +229,7 @@ PrepareStatus prepareKeyed(Stores& s, const SourceRecord& rec, Prospect& p) noex
         if (ks.ownerMapped) {
             if (owner == nullptr) return false;
             n.key = ViewKey::fromBytes({owner, ks.keyWidth});
+            (void)s.table.get(n.key);   // touches the row apply erases
             p.ownerOp = OwnerOp::Erase;
         } else {
             n.key = wire;
@@ -265,6 +267,7 @@ PrepareStatus prepareKeyed(Stores& s, const SourceRecord& rec, Prospect& p) noex
     if (cl != nullptr) return prepareUniqueLive(s, rec, p, d, owner, mine);
     if (ks.ownerMapped) {
         if (cur != nullptr && !mine) {
+            s.table.pin(n.key);   // the row that decides the conflict
             p.stats.keyConflicts = 1;
             return PrepareStatus::Ok;
         }
@@ -494,6 +497,9 @@ PrimType viewKeyType(const CompiledViewPlan& plan) noexcept { return resolveKeyT
 
 PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p, TxnOverlay* chain) noexcept {
     p.clear();
+    if (chain != nullptr && !rowsFit(*chain, {&f.table, f.owners, f.claims != nullptr ? &f.claims->indexTable() : nullptr,
+                                              f.claims != nullptr ? &f.claims->extrasTable() : nullptr}))
+        return PrepareStatus::CapacityExhausted;
     TxnAccess x{chain, f.locks, f.member};
     Stores st(f, chain != nullptr || f.locks != nullptr ? &x : nullptr);
     PrepareStatus status = prepareOne(st, rec, p);

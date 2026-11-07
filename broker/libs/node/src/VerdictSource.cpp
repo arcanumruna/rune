@@ -32,6 +32,7 @@ rune::view::PrepareStatus prepareKeyIndex(const KeyIndexFold& f, const rune::vie
         p.stats.skippedMalformed = 1;
         return rune::view::PrepareStatus::Malformed;
     }
+    if (chain != nullptr && !rune::view::rowsFit(*chain, {&f.table})) return rune::view::PrepareStatus::CapacityExhausted;
     rune::view::TxnAccess x{chain, f.locks, f.member};
     rune::view::TxnTable table(&f.table, rune::view::OverlayTable::KeyIndex, chain != nullptr || f.locks != nullptr ? &x : nullptr);
     rune::view::ProspectRow& r = p.rows[0];
