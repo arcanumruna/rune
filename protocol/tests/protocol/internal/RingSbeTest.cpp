@@ -385,9 +385,16 @@ TEST(RingSbeRegression, AuthOpTypesAndTailKindsArePinned) {
     EXPECT_EQ(sbe::OpType::get(32), sbe::OpType::Value::WRITE_SPEC_UPDATE);
     EXPECT_EQ(sbe::TailKind::get(12), sbe::TailKind::Value::WRITE_SPEC);
     EXPECT_STREQ(sbe::OpType::c_str(sbe::OpType::Value::WRITE_SPEC_UPDATE), "WRITE_SPEC_UPDATE");
-    EXPECT_THROW((void)sbe::OpType::get(33), std::runtime_error);
-    EXPECT_THROW((void)sbe::ReturnType::get(9), std::runtime_error);
-    EXPECT_THROW((void)sbe::TailKind::get(13), std::runtime_error);
+    // Checked writes Part 07: the wide-key view reads and GetStats (ops 33-35, returns 9-10, tail 13), appended.
+    EXPECT_EQ(sbe::OpType::get(33), sbe::OpType::Value::GET_VIEW_ROW_K);
+    EXPECT_EQ(sbe::OpType::get(34), sbe::OpType::Value::SCAN_VIEW_ROWS);
+    EXPECT_EQ(sbe::OpType::get(35), sbe::OpType::Value::GET_STATS);
+    EXPECT_EQ(sbe::ReturnType::get(9), sbe::ReturnType::Value::VIEW_SCAN_RESULT);
+    EXPECT_EQ(sbe::ReturnType::get(10), sbe::ReturnType::Value::STATS_RESULT);
+    EXPECT_EQ(sbe::TailKind::get(13), sbe::TailKind::Value::VIEW_READ);
+    EXPECT_THROW((void)sbe::OpType::get(36), std::runtime_error);
+    EXPECT_THROW((void)sbe::ReturnType::get(11), std::runtime_error);
+    EXPECT_THROW((void)sbe::TailKind::get(14), std::runtime_error);
 }
 
 // ---------------------------------------------------------------------------
