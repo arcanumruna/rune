@@ -3127,6 +3127,31 @@ TEST(PartitionReplicaCleanerSnapshotRegression, LsoStartsAtZeroUntilTheFirstRead
     fs::remove_all(dir2);
 }
 
+// #953: the worker's disk scan (RcState) rebuilds a leader's producer state.  A log whose producer lost its newest batches
+// to the cleaner (seq 2..5 of an expired producer) yields an entry that only knows seq 1: the producer's next batch is an
+// unknown producer's, never OutOfOrderSequence.
+TEST(LogCleanerRcRebuildRegression, DiskScanEntryPastTheLogsLastSequenceAnswersUnknownProducerIdRegression) {
+    auto dir = cp6TempDir("953_rc_scan");
+    Log log(dir.string(), 1 << 20);
+    for (int32_t seq = 0; seq < 2; ++seq) {
+        rune::protocol::RecordBatchBuilder b(log.logEndOffset(), 1000);
+        b.setProducerId(7); b.setProducerEpoch(0); b.setBaseSequence(seq);
+        b.append("k", "v", 1000);
+        ASSERT_GE(log.append(b.build(), log.logEndOffset()), 0);
+    }
+    rune::storage::ProducerStateManager psm;
+    rune::node::RcState rc;
+    rc.bindProducerState(&psm, 1, 0);
+    rune::node::RcFacts f; f.leader = true; f.logGeneration = 1;
+    f.leadershipGeneration = 1; f.epoch = 1;
+    for (int i = 0; i < 100'000 && !rc.ready(); ++i) (void)rc.advance(f, &log, 1 << 20);
+    ASSERT_TRUE(rc.ready());
+    ASSERT_NE(psm.entry(1, 7, 0), nullptr);
+    EXPECT_TRUE(psm.validate(1, 7, 0, 0, 6, 6).isUnknownProducerId());
+    EXPECT_TRUE(psm.validate(1, 7, 0, 0, 2, 2).isAccept());
+    fs::remove_all(dir);
+}
+
 // Fix round 1 (4d): end to end — the read_committed state AND the producer state
 // rebuilt from a CLEANED log (aborted data discarded, markers stamped and
 // dropped) equal those rebuilt from the original log: same committed value per
