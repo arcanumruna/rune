@@ -1620,9 +1620,9 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryResolutionWalkIsBudgetedAndResumes
     EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
 }
 
-// T7 review 2, N1: the one-step set is the worker's, shared by its sources.  O's segment waits for T0's marker and gives the set up
-// (as a stall does); another source applies its own ordinary transaction meanwhile and takes the set.  O collects its keys anew, so
-// T0's insert still supersedes O's delete.
+// T7 review 2, N1: the one-step set is the worker's, shared by its sources.  O's segment is parked on T0's marker; another source
+// applies its own ordinary transaction meanwhile and takes the set (review 4, I1).  O collects its keys anew, so T0's insert still
+// supersedes O's delete.
 TEST(CheckedWritesTxnJudgeRegression, SegmentResumedAfterAnotherSourceTookTheKeySetRecollectsRegression) {
     JudgeRig r(false);
     JudgeRig other(false);
@@ -1636,8 +1636,9 @@ TEST(CheckedWritesTxnJudgeRegression, SegmentResumedAfterAnotherSourceTookTheKey
     r.log.data({{20}, {21}, {22}, {23}, {24}, {25}});   // 14-19
     r.log.marker(66, true);                       // 20
     r.drive(20);
+    r.drive(20);   // the lookup the check stopped for scans to the HW
     ASSERT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker below the HW";
-    r.vs.releaseOneStep();
+    ASSERT_TRUE(r.pool.oneStepHeld());
     other.log.data({{50}, {51}}, 88);
     other.log.marker(88, true);
     for (int i = 0; i < 4 && other.vs.judgeCursor() < other.log.next; ++i) other.drive();
@@ -1702,10 +1703,11 @@ TEST(CheckedWritesTxnJudgeRegression, TwoSourcesNeedingRefillsBothFinishRegressi
 }
 
 // T7 review 3, N3: a source dropped (or demoted: the worker releases the claim of a judge it no longer drives) mid-segment gives
-// the set back, and the source waiting for it proceeds.
+// the set back, and the source waiting for it proceeds.  So does one whose member is removed (review 4, I2): it waits for the
+// install, not driven.  O's lookup reads one batch per pass, so it is not parked on T0's marker and keeps the set until then.
 TEST(CheckedWritesTxnJudgeRegression, DroppedHolderReleasesTheOneStepSetRegression) {
-    for (const bool drop : {true, false}) {
-        SCOPED_TRACE(drop ? "dropped" : "demoted");
+    for (const int how : {0, 1, 2}) {
+        SCOPED_TRACE(how == 0 ? "dropped" : how == 1 ? "demoted" : "view removed");
         JudgeRig r(false);
         JudgeRig other(false);
         other.vs.bindTxn(&r.pool, other.batch, JudgeRig::kRecordsMax);
@@ -1715,9 +1717,10 @@ TEST(CheckedWritesTxnJudgeRegression, DroppedHolderReleasesTheOneStepSetRegressi
         r.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
         r.log.judge(66, 11);                          // 12
         r.log.marker(55, true);                       // 13
-        r.log.marker(66, true);                       // 14
-        r.drive(14);
-        ASSERT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker below the HW";
+        for (int64_t id = 30; id < 70; ++id) r.log.data({{id}});   // 14-53
+        r.vs.setVoteScanBytesForTest(1);
+        for (int i = 0; i < 16 && r.vs.judgeCursor() < 13; ++i) r.drive();
+        ASSERT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker";
         ASSERT_TRUE(r.pool.oneStepHeld());
         other.log.data({{50}, {51}}, 88);
         const int64_t marker = other.log.next;
@@ -1725,13 +1728,93 @@ TEST(CheckedWritesTxnJudgeRegression, DroppedHolderReleasesTheOneStepSetRegressi
         for (int i = 0; i < 4; ++i) other.drive();
         ASSERT_EQ(other.vs.judgeCursor(), marker) << "88 waits for the set";
         ASSERT_FALSE(other.indexed(51));
-        if (drop) r.vs.releaseTxnOverlays(r.st.txn);
-        else r.vs.releaseOneStep();
+        if (how == 0) r.vs.releaseTxnOverlays(r.st.txn);
+        else if (how == 1) r.vs.releaseOneStep();
+        else {
+            r.vs.removeVerdictView(r.index->plan.viewTopicId);
+            r.drive();
+            ASSERT_TRUE(r.vs.waitingForInstall());
+        }
         EXPECT_FALSE(r.pool.oneStepHeld());
         for (int i = 0; i < 4 && other.vs.judgeCursor() <= marker; ++i) other.drive();
         EXPECT_GT(other.vs.judgeCursor(), marker);
         EXPECT_TRUE(other.indexed(51));
     }
+}
+
+// T7 review 4, M2: a capacity stall mid-segment gives the set back (a stalled judge is not driven), and the other source proceeds.
+// The next leadership applies O whole.
+TEST(CheckedWritesTxnJudgeRegression, StalledHolderReleasesTheOneStepSetRegression) {
+    JudgeRig r(false);
+    JudgeRig other(false);
+    other.vs.bindTxn(&r.pool, other.batch, JudgeRig::kRecordsMax);
+    r.start();
+    other.start();
+    r.log.data({{1}, {2}, {3}}, 55);              // 10-12, O
+    r.log.marker(55, true);                       // 13
+    r.vs.failCapacityAtForTest(11);
+    r.drive();
+    ASSERT_TRUE(r.vs.stalled());
+    EXPECT_FALSE(r.pool.oneStepHeld());
+    other.log.data({{50}, {51}}, 88);
+    other.log.marker(88, true);
+    for (int i = 0; i < 4 && other.vs.judgeCursor() < other.log.next; ++i) other.drive();
+    EXPECT_EQ(other.vs.judgeCursor(), other.log.next);
+    EXPECT_TRUE(other.indexed(51));
+    r.vs.bindLeader(nullptr, 2, 0);
+    for (int i = 0; i < 4 && r.vs.judgeCursor() < r.log.next; ++i) r.drive();
+    EXPECT_FALSE(r.vs.stalled());
+    EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
+    EXPECT_TRUE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(3));
+}
+
+// T7 review 4, I1: T0 writes partitions A and B of one worker.  A's O waits for T0's marker, which waits for B's vote; B's 88 needs
+// the one-step set before B's judge reaches T0's J.  B takes the set from A, parked on T0's marker, and judges the J; once T0's
+// markers land A collects anew and both reach the log's end, A equal to a plain fold.
+TEST(CheckedWritesTxnJudgeRegression, ParkedHolderLetsAnotherPartitionJudgeTheVoteItWaitsForRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    a.log.data({del(4)}, 55);                     // 10, O
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
+    a.log.judge(66, 11);                          // 12
+    a.log.marker(55, true);                       // 13
+    a.drive();
+    ASSERT_EQ(a.st.txn.find(66)->phase, TxnPhase::Locked);
+    ASSERT_EQ(a.vs.judgeCursor(), 13) << "O waits for T0's marker";
+    ASSERT_TRUE(a.pool.oneStepHeld());
+    b.log.data({{50}, {51}}, 88);                 // 10-11, 88
+    b.log.data({{60, 1, false, kInsert}}, 66);    // 12, T0
+    b.log.marker(88, true);                       // 13
+    b.log.judge(66, 12);                          // 14
+    for (int i = 0; i < 8 && (b.st.txn.find(66) == nullptr || !b.st.txn.find(66)->judged); ++i) {
+        b.drive();
+        a.drive();
+    }
+    ASSERT_NE(b.st.txn.find(66), nullptr);
+    EXPECT_TRUE(b.st.txn.find(66)->judged) << "B's vote for T0 is answerable while A waits";
+    EXPECT_TRUE(b.indexed(51));
+    EXPECT_EQ(a.vs.judgeCursor(), 13);
+    a.log.marker(66, true);
+    b.log.marker(66, true);
+    for (int i = 0; i < 8 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_EQ(b.vs.judgeCursor(), b.log.next);
+    EXPECT_TRUE(b.indexed(60));
+    EXPECT_FALSE(a.pool.oneStepHeld());
+    JudgeRig plain(false);
+    plain.start();
+    plain.log.data({del(4)});
+    plain.log.data({{4, 1, false, kInsert}});
+    for (int i = 0; i < 4; ++i) plain.drive();
+    EXPECT_TRUE(a.indexed(4)) << "T0's insert supersedes O's delete";
+    EXPECT_EQ(a.tables(), plain.tables());
 }
 
 // I3: accepted(r), an ordinary transaction committed below J.

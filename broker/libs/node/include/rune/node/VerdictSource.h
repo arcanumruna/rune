@@ -177,12 +177,17 @@ public:
     [[nodiscard]] TxnKeySet& oneStep() noexcept { return oneStep_; }
     /// The one-step set is shared by the worker's sources: a source that keeps its content across passes holds a claim until it
     /// releases it.  While it is held another source waits: two sources taking it from each other would never finish (T7 N3).
+    /// A holder parked on another transaction's marker is the exception: that marker may wait for a vote the waiter would judge
+    /// (T7 review 4, I1), so the waiter takes the set and the holder collects anew when it resumes.
     [[nodiscard]] bool oneStepHeld() const noexcept { return oneStepHeld_; }
+    [[nodiscard]] bool oneStepClaimable() const noexcept { return !oneStepHeld_ || oneStepParked_; }
     [[nodiscard]] uint64_t claimOneStep() noexcept {
         oneStepHeld_ = true;
+        oneStepParked_ = false;
         return ++oneStepClaim_;
     }
     [[nodiscard]] bool holdsOneStep(uint64_t claim) const noexcept { return oneStepHeld_ && claim == oneStepClaim_; }
+    void parkOneStep(uint64_t claim, bool parked) noexcept { oneStepParked_ = holdsOneStep(claim) ? parked : oneStepParked_; }
     void releaseOneStep(uint64_t claim) noexcept { oneStepHeld_ = oneStepHeld_ && claim != oneStepClaim_; }
     /// The acquired overlays bound to `sourceKey`.
     [[nodiscard]] rune::view::TxnLockSet lockSetFor(uint64_t sourceKey) const noexcept {
@@ -205,6 +210,7 @@ private:
     std::size_t                                                            keysWanted_ = 0;
     uint64_t                                                               oneStepClaim_ = 0;
     bool                                                                   oneStepHeld_ = false;
+    bool                                                                   oneStepParked_ = false;   // the holder waits for another transaction's marker
     bool                                                                   keysPending_ = false;
 };
 
@@ -332,7 +338,7 @@ public:
     void captureAppendedForTest(bool on) noexcept { captureAppended_ = on; }
     [[nodiscard]] uint64_t judgeCallsForTest() const noexcept { return judgeCalls_; }
     void holdJudgeForTest(bool hold) noexcept { held_ = hold; }
-    void failCapacityAtForTest(int64_t offset) noexcept { failCapacityAt_ = offset; }   // the chained prepare of that record stalls once (Capacity)
+    void failCapacityAtForTest(int64_t offset) noexcept { failCapacityAt_ = offset; }   // the prepare of that record stalls once (Capacity)
     [[nodiscard]] uint8_t lastIntentForTest() const noexcept { return lastIntent_; }
     [[nodiscard]] bool retiringForTest(uint64_t viewObjectId) const noexcept;
     [[nodiscard]] bool candidateForTest(uint64_t viewObjectId) const noexcept {
@@ -827,7 +833,7 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
         if (w.marker != o.marker) w = {o.marker, o.first};
         if (w.end < 0 || !txnPool_->holdsOneStep(oneStepClaim_)) {
             if (!txnPool_->holdsOneStep(oneStepClaim_)) {
-                if (txnPool_->oneStepHeld()) return false;   // another source is mid-segment: wait for it
+                if (!txnPool_->oneStepClaimable()) return false;   // another source is mid-segment: wait for it
                 oneStepClaim_ = txnPool_->claimOneStep();
             }
             keys.clear();
@@ -921,6 +927,7 @@ bool VerdictSource::lookupTxn_(ReadRangeFn& readRange, int64_t end) noexcept {
         budget -= std::min(budget, len);
         return !l.decided && budget > 0;
     });
+    txnPool_->parkOneStep(oneStepClaim_, !l.decided && l.from >= passHw_);   // scanned to the HW: only T's marker decides it
     return l.decided;
 }
 

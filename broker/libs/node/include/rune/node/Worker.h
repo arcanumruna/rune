@@ -7430,7 +7430,10 @@ private:
                 continue;
             }
             const RcState* rcState = rcServe_(replica, rcOf_(replica));
-            if (rcState == nullptr) continue;         // RC not Ready: fail closed, no bound
+            if (rcState == nullptr) {                 // RC not Ready: fail closed, no bound
+                if (PartitionWriteState* w = writeOf_(replica); w != nullptr && w->verdicts != nullptr) w->verdicts->releaseOneStep();   // nor driven
+                continue;
+            }
             const int64_t liveHw = replica->highWatermark();
             const int64_t bound  = rcState->lso(liveHw);
             // #537: below the LSO every transaction is decided; the fold skips the

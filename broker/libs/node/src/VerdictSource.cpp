@@ -555,6 +555,7 @@ void VerdictSource::waitForInstall_(const ConstraintSet& set) noexcept {
         });
         if (!have) { waitingFor_ = want; break; }
     }
+    releaseOneStep();   // not driven until the view is installed again
     if (waitingForInstall_) return;
     waitingForInstall_ = true;
     ++stats_.judgeWaitsForInstall;
@@ -567,6 +568,10 @@ void VerdictSource::waitForInstall_(const ConstraintSet& set) noexcept {
 
 rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::SourceRecord& rec, rune::view::TxnOverlay* chain,
                                                   const rune::view::TxnLockSet* locks) noexcept {
+    if (rec.offset == failCapacityAt_) [[unlikely]] {
+        failCapacityAt_ = -1;
+        return rune::view::PrepareStatus::CapacityExhausted;
+    }
     ViewInstance& i = *m.inst;
     if (m.kind == rune::view::VerdictViewKind::KeyIndex) {
         const KeyIndexFold f{i.table, m.keyWidth, m.slot, locks};
@@ -752,11 +757,6 @@ void VerdictSource::countVote_(const TxnVoteAnswer& a) noexcept {
 
 // Prepares every active member for `rec` through `chain` and evaluates them in set order.  Failed: `failed` is the first rejection.
 VerdictSource::ChainStep VerdictSource::chainRecord_(const rune::view::SourceRecord& rec, rune::view::TxnOverlay& chain, Verdict& failed) noexcept {
-    if (rec.offset == failCapacityAt_) [[unlikely]] {
-        failCapacityAt_ = -1;
-        stall_(StallReason::Capacity);
-        return ChainStep::Stalled;
-    }
     lastIntent_ = rec.intent;
     for (const std::size_t i : active_) {
         const rune::view::PrepareStatus s = prepare_(members_[i], rec, &chain, lockSet_());
