@@ -150,7 +150,10 @@ TEST(CheckedWritesConstraintName, EveryEntryOfARecordsRejectedCompletionResolves
     const rc::ConstraintName expected[] = {{"character_name", "unique"}, {"account_stats", "max_level"}, {"account_stats", "max_characters"}};
     for (uint32_t k = 0; k < 3; ++k) {
         const auto v = verdicts.rejection(k);
+        EXPECT_FALSE(verdicts.accepted(v.index));
+        EXPECT_EQ(verdicts.offsetOf(v.index), -1) << "a rejected record has no accepted offset";
         EXPECT_EQ(c.value + v.index, int64_t{500} + entries[k].index) << "the rejected record's own offset";
+        EXPECT_EQ(verdicts.offsetOf(v.index + 1u), int64_t{501} + entries[k].index) << "the next record was accepted";
         EXPECT_EQ(log.name(v.constraintId), expected[k]) << k;
     }
 }

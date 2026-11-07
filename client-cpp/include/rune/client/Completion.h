@@ -85,7 +85,7 @@ enum class OpStatus : uint8_t {
                      ///< was stored and judged, and one or more of its records was rejected.  value = the batch's base offset
                      ///< (record 0), or -1 if unknown; errorCode / constraintIdOf(c) = the FIRST rejection's code / constraint
                      ///< id; the payload lists every rejection (read it with BatchVerdicts).  All accepted is a plain Ok with an
-                     ///< empty payload.  A 1-record Tier-2 batch keeps single-record semantics (BrokerError, value -1); a 1-record claim's rejection carries its offset.
+                     ///< empty payload.  A 1-record claim / Tier-2 batch keeps single-record semantics (BrokerError, value = the record's offset).
 };
 
 /// Authentication (codes 44..48, client version 9): the name of an auth-related Completion::errorCode when

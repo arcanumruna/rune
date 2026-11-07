@@ -316,7 +316,7 @@ struct AckToken {
 // a builder, the Tier-2 queue or the deferred arena: baseSequence = -1,
 // errorCode = kClientFailure).  A Tier-2 batch is one BatchAck.
 // Checked writes (View): a batch of >= 2 records whose records were judged reports EVERY rejection in its BatchAck (see
-// rejectedCount / rejections below), never only the first; a 1-record batch keeps errorCode = its rejection, baseOffset -1.
+// rejectedCount / rejections below), never only the first; a 1-record batch keeps errorCode = its rejection, baseOffset = its offset.
 struct BatchAck {
     static constexpr int16_t kClientFailure = -1;  ///< delivery timeout / redirect exhausted / closed
     int32_t topicId      = 0;

@@ -1017,8 +1017,14 @@ TEST(CatalogReaderRegression, EveryAccessorRefusesAForeignThreadInThreadModeRegr
 // A constraint id no view ever had misses the cache and refreshes the reader; with no answer inside the timeout it is none.
 TEST(CatalogReaderRegression, ConstraintNameMissWithoutACatalogAnswerIsNoneWithinTheTimeoutRegression) {
     Rig r(invokerCfg(4056, 4057)); r.connect();
+    const uint64_t before = r.client.catalogReader().stats().subscribes;
+    const auto start      = std::chrono::steady_clock::now();
     EXPECT_EQ(r.client.constraintName(0x00990001, std::chrono::milliseconds(50)), std::nullopt);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+    EXPECT_GT(r.client.catalogReader().stats().subscribes, before) << "the miss attempted a refresh";
+    const uint64_t after = r.client.catalogReader().stats().subscribes;
     EXPECT_EQ(r.client.constraintName(0), std::nullopt);
+    EXPECT_EQ(r.client.catalogReader().stats().subscribes, after) << "the key index never refreshes";
 }
 
 // ---- Adversarial review of batch C9 (#600): the sink-partition rule on every view-definition entry point. ----

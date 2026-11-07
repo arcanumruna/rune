@@ -727,7 +727,7 @@ TEST(ProducerVerdictsRegression, OneRecordClaimAndTier2KeepSingleRecordSemantics
         const auto& c = r.cq.done[1];
         EXPECT_EQ(c.op, rc::OpKind::Tier2Batch);
         EXPECT_EQ(c.status, OpStatus::BrokerError);
-        EXPECT_EQ(c.value, -1);
+        EXPECT_EQ(c.value, 100);
         EXPECT_EQ(c.errorCode, kViolation);
         EXPECT_EQ(rc::constraintIdOf(c), kCid);
         EXPECT_EQ(c.reservedBytes, rc::producer::kAckRecordBytes);
@@ -801,13 +801,13 @@ TEST(ProducerVerdictsRegression, BatchAckReportsEveryRejectionRegression) {
         EXPECT_EQ(plen[0], 0u);
         EXPECT_EQ(got[0].reservedBytes, rc::kBatchAckUnitBytes);
     }
-    {   // a 1-record batch's BatchAck keeps the first-rejection form
+    {   // a 1-record batch's BatchAck: the first rejection's form, with the record's offset
         Rig r;
         r.captureBatchAcks();
         r.send(1);
         r.impl.onProduceResponse(r.corrs[0], 100, 0, -1, true, Rig::trailer({0}));
         ASSERT_EQ(r.batchAcks.size(), 1u);
-        EXPECT_EQ(r.batchAcks[0].baseOffset, -1);
+        EXPECT_EQ(r.batchAcks[0].baseOffset, 100);
         EXPECT_EQ(r.batchAcks[0].errorCode, static_cast<int16_t>(kViolation));
         EXPECT_EQ(r.batchAcks[0].rejectedCount, 0u);
     }

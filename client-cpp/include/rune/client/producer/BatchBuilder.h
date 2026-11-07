@@ -150,7 +150,7 @@ public:
     ///                          reservation is the whole completion's size, and a
     ///                          batch whose completion cannot fit one queue record is
     ///                          refused InvalidArgument with nothing reserved.  A
-    ///                          1-record batch keeps BrokerError / -1;
+    ///                          1-record batch keeps BrokerError, value = its offset;
     ///   send(AckToken{token})  the producer's onAck handler (baseOffset).
     /// Accepted: the batch is consumed (add() throws afterwards) and exactly
     /// one completion follows for the token forms.  Any other result leaves

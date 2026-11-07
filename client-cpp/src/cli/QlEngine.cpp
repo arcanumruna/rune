@@ -1228,6 +1228,16 @@ std::string constraintLabel(const std::optional<rc::ConstraintName>& name, uint3
     return hex;
 }
 
+namespace {
+
+// A miss refreshes the catalog and may free the objects the stats were read for, so this runs after the last use of them.
+void labelConstraints(rc::Client& c, std::vector<PartitionStats>& stats) {
+    for (PartitionStats& ps : stats)
+        for (const auto& k : ps.result.constraints) ps.constraintLabels.push_back(constraintLabel(c.constraintName(k.constraintId), k.constraintId));
+}
+
+}  // namespace
+
 std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c, const cat::TopicObject& t, int32_t only) {
     int32_t from = 0, to = 0;
     if (auto r = partitionRange(t.partitions, only, from, to); !r) return std::unexpected(std::move(r.error()));
@@ -1236,9 +1246,9 @@ std::expected<std::vector<PartitionStats>, std::string> topicStats(rc::Client& c
         auto r = c.getStatsAndWait(rpc::StatsScope::TopicPartition, t.topicId, p, kCatalogWait);
         if (r.status != rc::StatsResult::kOk) return std::unexpected(statsRefusal(p, r.status));
         PartitionStats ps{p, std::move(r), {}};
-        for (const auto& k : ps.result.constraints) ps.constraintLabels.push_back(constraintLabel(c.constraintName(k.constraintId), k.constraintId));
         out.push_back(std::move(ps));
     }
+    labelConstraints(c, out);
     return out;
 }
 
@@ -1265,14 +1275,12 @@ std::expected<std::vector<PartitionStats>, std::string> viewStats(rc::Client& c,
             } else if (src.status != rc::StatsResult::kOk) {
                 return std::unexpected(statsRefusal(p, src.status));
             }
-            for (const auto& k : src.constraints) {
-                if ((k.constraintId >> 16) != (v.objectId & 0xFFFF)) continue;
-                ps.result.constraints.push_back(k);
-                ps.constraintLabels.push_back(constraintLabel(c.constraintName(k.constraintId), k.constraintId));
-            }
+            for (const auto& k : src.constraints)
+                if ((k.constraintId >> 16) == (v.objectId & 0xFFFF)) ps.result.constraints.push_back(k);
         }
         out.push_back(std::move(ps));
     }
+    labelConstraints(c, out);
     return out;
 }
 

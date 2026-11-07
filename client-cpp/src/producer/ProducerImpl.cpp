@@ -2645,7 +2645,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
                 emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, firstCode,
                               OpStatus::RecordsRejected, units, b->producerEpoch, b->producerId, verdicts);
             else                      // a 1-record batch keeps single-record semantics
-                emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, -1, firstCode,
+                emitBatchAck_(ps.topicId, ps.partition, b->baseSequence, b->recordCount, off, firstCode,
                               OpStatus::BrokerError, units, b->producerEpoch, b->producerId);
         }
         else if (dupSeq && viewSent_() && !idsUnknown)
@@ -3183,7 +3183,7 @@ void ProducerImpl::completeVerdictSlice_(PartitionState& ps, uint64_t ackStart, 
                 completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::RecordsRejected, le16(verdicts.data() + 2),
                                 le32(verdicts.data() + 4), verdicts.first(n * 8));
             } else {   // a 1-record batch keeps single-record semantics
-                completeHandle_(h, OpKind::Tier2Batch, -1, recordCount, OpStatus::BrokerError, le16(verdicts.data() + 2), le32(verdicts.data() + 4));
+                completeHandle_(h, OpKind::Tier2Batch, base, recordCount, OpStatus::BrokerError, le16(verdicts.data() + 2), le32(verdicts.data() + 4));
             }
             continue;
         }
@@ -3254,7 +3254,7 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
     // first rejection's code.
     const bool stored = st == OpStatus::RecordsRejected;
     if (batchAckFn_ != nullptr) {
-        BatchAck a{topicId, partition, (errorCode == 0 || stored) ? baseOffset : -1, baseSequence,
+        BatchAck a{topicId, partition, baseOffset, baseSequence,
                    recordCount, errorCode, producerEpoch, producerId};
         a.rejectedCount = static_cast<uint32_t>(rejections.size() / 8);
         a.rejections    = rejections.empty() ? nullptr : rejections.data();
@@ -3265,7 +3265,7 @@ void ProducerImpl::emitBatchAck_(int32_t topicId, int32_t partition, int32_t bas
     Completion c;
     c.token = (static_cast<uint64_t>(static_cast<uint32_t>(topicId)) << 32) |
               static_cast<uint32_t>(partition);
-    c.value = (errorCode == 0 || stored) ? baseOffset : -1;
+    c.value = baseOffset;
     c.aux   = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(baseSequence)) << 32) |
                                    static_cast<uint32_t>(recordCount));
     c.op            = OpKind::BatchAck;

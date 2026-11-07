@@ -209,7 +209,7 @@ if (r == SendResult::BackPressured) { /* retry after the next duty cycle */ }
   record: `Ok` when all were accepted, else `RecordsRejected` (15) with `value` = the base offset, the first rejection's
   `errorCode`, and a payload of every rejection (`BatchVerdicts`: `rejectedCount()`, `rejection(k)`, `accepted(i)`,
   `offsetOf(i)`); the other records were stored at base + index. A batch of one record keeps the single-record form
-  (`BrokerError`, value -1). The completion reserves its full size up front (`claimBatch` above the queue's record
+  (`BrokerError`; `value`, like a rejected single `send`, is the rejected record's own offset). The completion reserves its full size up front (`claimBatch` above the queue's record
   limit returns `MessageTooLarge`). A retry inside the broker's window replays the original verdicts; a retry outside it completes the whole batch
   with `OpStatus::VerdictUnknown` (`errorCode` 21). `OpStatus::StoredIdUnknown` (13) is the same for a key-0 create (see [Autoincrement](#autoincrement)). A transactional
   producer never sends the `View` bit. `SendResult::WriteNotAllowed` reports a write the broker refuses for the topic. On an untyped (raw) topic the broker stores the record intent bits as sent and does not interpret them.
