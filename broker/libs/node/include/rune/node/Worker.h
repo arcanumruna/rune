@@ -2742,6 +2742,9 @@ private:
         case WorkerOp::Type::GetStats:
             executeGetStats_(op);
             break;
+        case WorkerOp::Type::TxnVote:   // TODO Task 7: the judge; until then no vote is accepted
+            answerTxnVoteNotLeader_(op);
+            break;
         case WorkerOp::Type::ApplyReplicated:
             // Worker-clock: dequeued a routed apply op.  corr=runSeq pairs 1:1 (FIFO)
             // with the control thread's ReplFragRecv → EXACT control→worker handoff.
@@ -7050,6 +7053,7 @@ private:
         case WorkerOp::Type::AlterIsrResponse:
         case WorkerOp::Type::AppendControlRecord:
         case WorkerOp::Type::TxnVerifyResult:   // #112: a stale answer is dropped (the client's retry re-verifies)
+        case WorkerOp::Type::TxnVote:
         case WorkerOp::Type::Subscribe:
             return true;
         default:
@@ -7747,6 +7751,9 @@ private:
             enqueueReturn_(ret);
             return;
         }
+        case WorkerOp::Type::TxnVote:
+            answerTxnVoteNotLeader_(op);
+            return;
         default:
             // Apply / fetch / epoch / reconcile / role / marker ops carry no
             // response: the replication protocol re-drives them against the new
@@ -7757,6 +7764,22 @@ private:
                              static_cast<int>(type), op.topicId(), op.partition(), opsRefusedNotOwned_);
             return;
         }
+    }
+
+    // A TxnVote the ownership gate refused answers NotLeader (never ControlRecordRefused): the coordinator re-routes the vote.
+    void answerTxnVoteNotLeader_(sbe::WorkerOp& op) {
+        WorkerReturn ret;
+        ret.type          = WorkerReturn::Type::TxnVoteResult;
+        ret.correlationId = op.correlationId();   // the vote token
+        ret.sessionId     = op.sessionId();       // the origin node
+        ret.topicId       = op.topicId();
+        ret.partition     = op.partition();
+        ret.producerId    = op.producerId();
+        ret.producerEpoch = op.producerEpoch();
+        ret.baseOffset    = -1;
+        ret.lastOffset    = -1;
+        ret.errorCode     = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+        enqueueReturn_(ret);
     }
 
     LogFlushSlot* slotOf_(const rune::storage::Log* log) noexcept {

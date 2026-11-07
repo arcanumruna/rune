@@ -1,12 +1,19 @@
 // WorkerOpWireRegressionTest.cpp — Phase 2c Task 5: the internal-ring wire values are append-only.
 // OpType::FILTER_SCHEMA = 25 (control -> every worker: install a typed topic's filter schema) and
 // TailKind::FILTER = 11 (the schema bytes / a Subscribe op's filter bytes) must never move.
+#include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/OpType.h>
+#include <rune_protocol_internal_sbe/ReturnType.h>
 #include <rune_protocol_internal_sbe/TailKind.h>
+#include <rune_protocol_internal_sbe/WorkerOp.h>
+#include <rune_protocol_internal_sbe/WorkerReturn.h>
 
 #include <rune/node/WorkerOp.h>
+#include <rune/node/WorkerReturnCodec.h>
 
 #include <gtest/gtest.h>
+
+#include <array>
 
 namespace sbe = rune::protocol::internal::sbe;
 
@@ -30,4 +37,55 @@ TEST(WorkerOpWireRegression, WriteSpecUpdateRoundTripsRegression) {
     EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::WRITE_SPEC), 12);
     EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::WriteSpecUpdate), 32);
     EXPECT_EQ(static_cast<int>(sbe::TailKind::Value::FILTER), 11);
+}
+
+TEST(CheckedWritesTxnRing, TxnVoteOpRoundTrips) {
+    EXPECT_EQ(static_cast<int>(rune::node::WorkerOp::Type::TxnVote), static_cast<int>(sbe::OpType::Value::TXN_VOTE));
+    std::array<char, 512> buf{};
+    sbe::WorkerOp enc;
+    enc.wrapAndApplyHeader(buf.data(), 0, buf.size());
+    enc.opType(static_cast<sbe::OpType::Value>(static_cast<std::uint8_t>(rune::node::WorkerOp::Type::TxnVote)))
+       .topicId(9).partition(1).correlationId(41).producerId(77).producerEpoch(3).roleEpoch(6).sessionId(2)
+       .tailKind(sbe::TailKind::Value::NONE);
+    enc.putTail(nullptr, 0);
+
+    sbe::MessageHeader hdr;
+    hdr.wrap(buf.data(), 0, 0, buf.size());
+    ASSERT_EQ(hdr.templateId(), sbe::WorkerOp::sbeTemplateId());
+    sbe::WorkerOp dec;
+    dec.wrapForDecode(buf.data(), sbe::MessageHeader::encodedLength(), hdr.blockLength(), hdr.version(), buf.size());
+    EXPECT_EQ(dec.opType(), sbe::OpType::Value::TXN_VOTE);
+    EXPECT_EQ(dec.topicId(), 9);
+    EXPECT_EQ(dec.partition(), 1);
+    EXPECT_EQ(dec.correlationId(), 41);
+    EXPECT_EQ(dec.producerId(), 77);
+    EXPECT_EQ(dec.producerEpoch(), 3);
+    EXPECT_EQ(dec.roleEpoch(), 6);
+    EXPECT_EQ(dec.sessionId(), 2);
+    EXPECT_EQ(dec.tailLength(), 0u);
+}
+
+TEST(CheckedWritesTxnRing, TxnVoteResultMapsTheScalars) {
+    rune::node::WorkerReturn ret;
+    ret.type          = rune::node::WorkerReturn::Type::TxnVoteResult;
+    ret.errorCode     = 0;
+    ret.recordCount   = 55;
+    ret.newNextOffset = 0x00070000;
+    ret.baseOffset    = 123;
+    ret.lastOffset    = 99;
+    std::array<char, 512> buf{};
+    ASSERT_LE(rune::node::workerReturnEncodedLength(ret), buf.size());
+    rune::node::encodeWorkerReturnSbe(buf.data(), buf.size(), ret);
+
+    sbe::MessageHeader hdr;
+    hdr.wrap(buf.data(), 0, 0, buf.size());
+    ASSERT_EQ(hdr.templateId(), sbe::WorkerReturn::sbeTemplateId());
+    sbe::WorkerReturn dec;
+    dec.wrapForDecode(buf.data(), sbe::MessageHeader::encodedLength(), hdr.blockLength(), hdr.version(), buf.size());
+    EXPECT_EQ(dec.returnType(), sbe::ReturnType::Value::TXN_VOTE_RESULT);
+    EXPECT_EQ(dec.errorCode(), 0);
+    EXPECT_EQ(dec.recordCount(), 55);
+    EXPECT_EQ(dec.newNextOffset(), 0x00070000);
+    EXPECT_EQ(dec.baseOffset(), 123);
+    EXPECT_EQ(dec.lastOffset(), 99);
 }
