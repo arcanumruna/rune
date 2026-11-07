@@ -505,6 +505,14 @@ PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Pros
     Stores st(f, chain != nullptr || f.locks != nullptr ? &x : nullptr);
     PrepareStatus status = prepareOne(st, rec, p);
     if (status == PrepareStatus::Ok && chain != nullptr && !x.locked) {
+        p.chained = true;
+        for (std::size_t i = 0; i < p.rowCount; ++i) {   // F11: applyTo overwrites a held image in place
+            ProspectRow& r = p.rows[i];
+            const uint8_t* cur = !r.existed ? nullptr : f.keyed != nullptr ? st.table.get(r.key) : st.table.get(r.key.asU64());
+            if (cur == nullptr) continue;
+            r.before = p.before.data() + i * p.rowLen;
+            std::memcpy(p.before.data() + i * p.rowLen, cur, p.rowLen);
+        }
         applyTo(st, rec, p);   // the record's effect, written into the chain instead of the tables
         if (chain->full()) status = PrepareStatus::CapacityExhausted;
     }
