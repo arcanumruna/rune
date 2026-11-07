@@ -3,6 +3,8 @@
 // Part 11 Task 3: chained prepares into a TxnOverlay, the lock set and PrepareStatus::Locked.  The key-index case is in
 // CheckedWritesKeyIndexTest.cpp (the key index lives in rune_node).
 #include <gtest/gtest.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstring>
@@ -368,6 +370,29 @@ TEST(CheckedWritesTxnOverlay, FullOverlayIsCapacityExhausted) {
     tiny.reserve(2, 512);
     EXPECT_EQ(r.prepare(1, 200, 5, &tiny), PrepareStatus::CapacityExhausted);   // a Move: contributor, two groups, two view rows
     EXPECT_TRUE(tiny.full());
+}
+
+// T7 perf: a reserve sized for the largest transaction writes none of its rows.  Filling them at every restart and member change
+// made a checked-writes model seed about 10x slower; the row pages stay unmapped until a transaction puts a row there.
+TEST(CheckedWritesTxnOverlayRegression, ReserveTouchesNoRowRegression) {
+    TxnOverlay o;
+    o.reserve(std::size_t(1) << 20, 256);   // 256 MiB of rows
+    const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    const auto resident = [&](const uint8_t* p) {
+#if defined(__APPLE__)
+        char vec = 0;
+#else
+        unsigned char vec = 0;
+#endif
+        EXPECT_EQ(mincore(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(p) & ~(page - 1)), 1, &vec), 0);
+        return (vec & 1) != 0;
+    };
+    uint8_t* last = o.spare() - 256;   // the last row
+    EXPECT_FALSE(resident(last)) << "the reserve wrote the rows";
+    uint8_t* row = o.put(1, OverlayTable::View, ViewKey::fromU64(7), nullptr, 64);
+    ASSERT_NE(row, nullptr);
+    EXPECT_TRUE(resident(row));
+    EXPECT_EQ(row[63], 0) << "a put without a base row is zeroes";
 }
 
 TEST(CheckedWritesTxnOverlay, ReservedOverlayAllocatesNothing) {

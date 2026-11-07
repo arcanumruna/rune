@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <new>
 
 namespace rune::view {
 
@@ -24,24 +25,27 @@ uint64_t hashOf(uint8_t member, OverlayTable table, const ViewKey& k) noexcept {
 void TxnOverlay::reserve(std::size_t rows, uint32_t maxRowLen) {
     capacity_ = rows;
     maxRowLen_ = maxRowLen;
-    entries_.assign(rows, Entry{});
-    std::size_t slots = 2;
-    while (slots < 2 * rows) slots <<= 1;
-    index_.assign(slots, 0);
-    arena_.assign((rows + 1) * maxRowLen, 0);
+    slots_ = 2;
+    while (slots_ < 2 * rows) slots_ <<= 1;
+    // calloc's large blocks are fresh zero pages, and malloc's are untouched: neither costs a write per byte (an assign of every
+    // overlay at every restart and member change was most of a checked-writes model seed).
+    entries_.reset(static_cast<Entry*>(std::malloc((rows + 1) * sizeof(Entry))));
+    index_.reset(static_cast<int32_t*>(std::calloc(slots_, sizeof(int32_t))));
+    arena_.reset(static_cast<uint8_t*>(std::malloc((rows + 1) * maxRowLen + 1)));
+    if (!entries_ || !index_ || !arena_) throw std::bad_alloc();
     used_ = 0;
     full_ = false;
 }
 
 void TxnOverlay::clear() noexcept {
-    std::fill(index_.begin(), index_.end(), 0);
+    std::fill_n(index_.get(), slots_, 0);
     used_ = 0;
     full_ = false;
 }
 
 int32_t TxnOverlay::find(uint8_t member, OverlayTable table, const ViewKey& key) const noexcept {
     if (used_ == 0) return -1;
-    const std::size_t mask = index_.size() - 1;
+    const std::size_t mask = slots_ - 1;
     for (std::size_t pos = hashOf(member, table, key) & mask;; pos = (pos + 1) & mask) {
         const int32_t s = index_[pos];
         if (s == 0) return -1;
@@ -55,7 +59,7 @@ int32_t TxnOverlay::insert(uint8_t member, OverlayTable table, const ViewKey& ke
         full_ = true;
         return -1;
     }
-    const std::size_t mask = index_.size() - 1;
+    const std::size_t mask = slots_ - 1;
     std::size_t pos = hashOf(member, table, key) & mask;
     while (index_[pos] != 0) pos = (pos + 1) & mask;
     const auto slot = static_cast<int32_t>(used_++);
