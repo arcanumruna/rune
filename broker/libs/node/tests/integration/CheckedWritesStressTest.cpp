@@ -93,6 +93,31 @@ TEST_P(CheckedWritesStressRegression, AutoIncSeededClusterHoldsTheInvariants) {
     std::printf("seed %d: %s\n", seed, d.autoIncTally().c_str());
 }
 
+// Plan 09 (matrix D): the RegressorsPath DDL from the golden script, logins, characters for four users near the cap, renames to
+// colliding names, moves and removes through crashes, restarts, cleaner passes and replaces of account_stats.  300 steps unless
+// RUNE_CW_STRESS_STEPS says otherwise.
+TEST_P(CheckedWritesStressRegression, SeededRegressorsPathHoldsTheInvariants) {
+    const int seed = GetParam();
+    const int steps = std::getenv("RUNE_CW_STRESS_STEPS") != nullptr ? stepsPerSeed() : 300;
+    ThreeNodes cluster = ThreeNodes::startWith("cw09_" + std::to_string(seed), [](rune::node::NodeConfig& cfg) {
+        cfg.verdictIntervalMs = 20;
+        cfg.producerIdExpirationMs = 3'000;   // as the autoincrement run: expired producers leave the cleaner something to compact
+    });
+    CheckedWritesStressDriver d(cluster, static_cast<uint64_t>(seed), false, false, true);
+    d.setUpRegressorsPath();
+    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    for (int step = 0; step < steps && !HasFatalFailure(); ++step) {
+        SCOPED_TRACE("seed=" + std::to_string(seed) + " step=" + std::to_string(step));
+        d.step();
+    }
+    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    d.quiesce();
+    ASSERT_FALSE(HasFatalFailure()) << "seed " << seed;
+    std::string failed;
+    EXPECT_TRUE(d.checkAll(&failed)) << failed;
+    std::printf("seed %d: %s\n", seed, d.regressorsPathTally().c_str());
+}
+
 INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesStressRegression, ::testing::Range(1, 13));
 
 // Only a leader compacts, and it may drop a committed rejected record before the history reads its log: the record is still on the

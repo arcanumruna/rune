@@ -92,6 +92,8 @@ public:
         int64_t offset = -1, hwBefore = 0, hwAfter = 0;
         bool windowKnown = false;                            ///< hwBefore / hwAfter bracket the write alone (no node went down during it)
         bool keyZero = false;                                ///< autoincrement mode: a create, `id` is the assigned one once it was acked
+        std::string name;                                    ///< RegressorsPath mode: the character's name (`v` is its user)
+        uint32_t constraintId = 0;                           ///< ... and the constraint a 55 names
         enum class Result : uint8_t { Ok, Violation, Unknown } result = Result::Unknown;
     };
 
@@ -296,7 +298,11 @@ public:
         }
         for (int p = 0; p < parts_; ++p) {
             models_[p] = CheckedWritesModel();
-            if (autoInc_) {
+            if (rp_) {
+                models_[p].addAutoIncRule(AutoIncShape{}, 0);
+                models_[p].addLowerNameUniqueRule(nameObj_);
+                models_[p].addCountCheckRule(statsObj_, kRpCap);
+            } else if (autoInc_) {
                 models_[p].addAutoIncRule(AutoIncShape{.partitions = kAiParts}, p);
             } else if (keyIndex_) {
                 models_[p].addKeyIndexRule();
@@ -807,6 +813,167 @@ private:
             EXPECT_NE(s->id, 0u) << "seed " << seed_ << ": a create was acked without its id";
         }
     }
+    // ---- RegressorsPath mode ----
+    static constexpr uint64_t kRpUsers = 4;
+    static constexpr int64_t kRpCap = 12;
+    static constexpr const char* kRpNames[] = {"Foo", "foo", "FOO", "Bar", "bar", "Baz", "BAZ", "Qux"};
+
+    static std::vector<uint8_t> byIdPlan_(int32_t src) {
+        namespace rv = rune::view;
+        rv::ViewPlan p;
+        p.viewName = "character_by_id";
+        p.key = "characterId";
+        p.sources.push_back(rv::SourceSpec{src, "characterId"});
+        p.output.push_back(rv::AuthoredField{"characterId", rune::codec::PrimType::UInt64, 0, "characterId", rv::MergeRule::Replace});
+        p.output.push_back(rv::AuthoredField{"userId", rune::codec::PrimType::UInt64, 0, "userId", rv::MergeRule::Replace});
+        p.output.push_back(rv::AuthoredField{"name", rune::codec::PrimType::FixedStr, 0, "name", rv::MergeRule::Replace});
+        return rv::serializeAuthored(p);
+    }
+    static std::string lowered_(const std::string& name) {
+        std::array<uint8_t, 64> out{};
+        const auto r = rune::codec::lowerUtf8({reinterpret_cast<const uint8_t*>(name.data()), name.size()}, out);
+        return std::string(reinterpret_cast<const char*>(out.data()), r.len);
+    }
+    int qlAny_(const std::string& text, std::string* err) {
+        const int id = c_.runningNodes().front();
+        std::stringstream o, e;
+        const int code = rune::cli::run({"ql", "-e", text, "--broker", "127.0.0.1:" + std::to_string(c_.ports.client[static_cast<std::size_t>(id - 1)]), "--cli-stream-in",
+                                         std::to_string(rune::node::test::catalog_cluster::kClientStream)}, o, e);
+        *err = e.str();
+        return code;
+    }
+
+    /// The unique and check members from the leader's plan records (the newest of each kind), once the leader's latest change record
+    /// names a check plan other than `notStatsFp`: a replace has swapped in.
+    bool learnConstrainedViews_(uint64_t notStatsFp) {
+        for (const auto deadline = Clock::now() + 10s; Clock::now() < deadline; std::this_thread::sleep_for(50ms)) {
+            std::vector<NodeSnap> snaps;
+            for (const int id : c_.runningNodes()) snaps.push_back(snapNode_(id, 0));
+            const NodeSnap* lead = leaderOf_(snaps, 0);
+            if (lead == nullptr || lead->log.changes.empty()) continue;
+            std::optional<rune::view::CompiledViewPlan> name, stats;
+            uint64_t nameObj = 0, statsObj = 0, statsFp = 0;
+            for (const auto& pl : lead->log.plans) {
+                auto plan = rune::view::deserializeCompiledViewPlan(pl.plan);
+                if (!plan) continue;
+                if (pl.header.kind == static_cast<uint8_t>(rune::view::VerdictViewKind::Unique)) { name = std::move(plan); nameObj = pl.header.viewObjectId; }
+                if (pl.header.kind == static_cast<uint8_t>(rune::view::VerdictViewKind::Check)) { stats = std::move(plan); statsObj = pl.header.viewObjectId; statsFp = pl.header.planFingerprint; }
+            }
+            if (!name || !stats || statsFp == notStatsFp) continue;
+            const auto& members = lead->log.changes.back().members;
+            const auto named = [&](uint64_t obj, std::optional<uint64_t> fp) {
+                return std::any_of(members.begin(), members.end(), [&](const auto& m) { return m.viewObjectId == obj && (!fp || m.planFingerprint == *fp); });
+            };
+            if (!named(nameObj, std::nullopt) || !named(statsObj, statsFp)) continue;
+            nameObj_ = nameObj;
+            statsObj_ = statsObj;
+            statsFp_ = statsFp;
+            nameTopic_ = name->viewTopicId;
+            statsTopic_ = stats->viewTopicId;
+            return true;
+        }
+        return false;
+    }
+    /// account_stats again with the same predicate under a new plan (an extra column every other time); its swap is waited for.
+    void replaceStats_() {
+        std::string err;
+        const char* extra = ++statsReplaces_ % 2 == 1 ? ", max(lastPlayed) as lastPlayed" : "";
+        ASSERT_EQ(qlAny_(std::string("create or replace view account_stats key userId as select count(*) as characters") + extra +
+                         " from character group by userId constraint max_characters check (characters <= 12);", &err), 0) << "seed " << seed_ << ": " << err;
+        settle_();
+        ASSERT_TRUE(learnConstrainedViews_(statsFp_)) << "seed " << seed_ << ": the replacement of account_stats never swapped in";
+    }
+
+    std::string rpName_() { return rng_() % 2 == 0 ? std::string(kRpNames[rng_() % std::size(kRpNames)]) : "c" + std::to_string(++rpNameSeq_); }
+    /// The next character write: a create for one of four users, a rename to a name that may collide, a move to another user, or a removeExisting.
+    Sent rpPick_() {
+        Sent s;
+        s.v = static_cast<int64_t>(1 + rng_() % kRpUsers);
+        const unsigned o = static_cast<unsigned>(rng_() % 100);
+        if (o < 50 || rpChars_.empty()) {
+            s.op = Op::Insert;
+            s.keyZero = true;
+            s.name = rpName_();
+            return s;
+        }
+        const auto at = std::next(rpChars_.begin(), static_cast<std::ptrdiff_t>(rng_() % rpChars_.size()));
+        s.id = at->first;
+        if (o < 70) { s.op = Op::Update; s.v = static_cast<int64_t>(at->second.first); s.name = rpName_(); }
+        else if (o < 88) { s.op = Op::Update; s.name = at->second.second; }
+        else s.op = Op::RemoveExisting;
+        return s;
+    }
+    rune::client::WriteResult rpWrite_(RpWriter& w, const Sent& s) {
+        const rune::node::test::RpCharacter rec{s.keyZero ? 0 : s.id, static_cast<uint64_t>(s.v), s.name, 1, 2, 3, 4, ++vSeq_, vSeq_};
+        return s.op == Op::Insert ? w.characters->insertAndWait(rec, 10s) : s.op == Op::Update ? w.characters->updateAndWait(rec, 10s) : w.characters->removeExistingAndWait(s.id, 10s);
+    }
+    /// The answer of `s`: its id, offset and constraint; what the run knows of the live characters follows the acked writes.
+    void rpNote_(const rune::client::WriteResult& r, Sent* s) {
+        classify_(r, s);
+        if (s->result == Sent::Result::Violation) s->offset = r.offset();
+        s->constraintId = r.constraintId();
+        if (s->keyZero && r.key() != 0) s->id = r.key();
+        if (s->result == Sent::Result::Unknown) writersStale_ = true;   // no answer: the write may or may not be in the log
+        if (s->result != Sent::Result::Ok) return;
+        if (s->op == Op::RemoveExisting) rpChars_.erase(s->id);
+        else rpChars_[s->id] = {static_cast<uint64_t>(s->v), s->name};
+    }
+    void rpBurst_(int victim) {
+        RpWriter& w = rpWriter_(rng_() % rpWriters_.size());
+        const int n = 1 + static_cast<int>(rng_() % 6);
+        std::jthread killer;   // joined on unwind too: a send that throws mid-crash must not destroy it joinable
+        for (int i = 0; i < n && !::testing::Test::HasFatalFailure(); ++i) {
+            Sent s = rpPick_();
+            if (victim > 0 && i == n / 2) { checkCounters_(victim); killer = std::jthread([this, victim] { c_.crash(victim); }); }
+            rpNote_(rpWrite_(w, s), &s);
+            sent_.push_back(s);
+        }
+        if (killer.joinable()) killer.join();
+        recordHistory_();
+    }
+    /// Two clients create a character for the same user at once.
+    void raceCreates_() {
+        if (writersStale_) rebuildWriters_(-1);
+        std::array<Sent, 2> s;
+        for (Sent& x : s) { x.op = Op::Insert; x.keyZero = true; x.v = static_cast<int64_t>(1 + rng_() % kRpUsers); x.name = rpName_(); }
+        s[1].v = s[0].v;
+        RpWriter& a = rpWriter_(0);
+        RpWriter& b = rpWriter_(1);
+        std::optional<rune::client::WriteResult> ra, rb;
+        {
+            std::jthread ta([&] { ra = rpWrite_(a, s[0]); });
+            std::jthread tb([&] { rb = rpWrite_(b, s[1]); });
+        }
+        rpNote_(*ra, &s[0]);
+        rpNote_(*rb, &s[1]);
+        sent_.push_back(s[0]);
+        sent_.push_back(s[1]);
+        recordHistory_();
+    }
+    /// Two clients log the same (provider, subject) in for the first time at once: user_identity lets one user through.  A third login
+    /// after both answered is refused when one of them was accepted.
+    void raceLogins_() {
+        if (writersStale_) rebuildWriters_(-1);
+        const rune::node::test::RpUser u{0, static_cast<uint16_t>(1 + rng_() % 2), "sub" + std::to_string(++loginRaces_), 0};
+        RpWriter& a = rpWriter_(0);
+        RpWriter& b = rpWriter_(1);
+        std::optional<rune::client::WriteResult> ra, rb;
+        {
+            std::jthread ta([&] { ra = a.users->insertAndWait(u, 10s); });
+            std::jthread tb([&] { rb = b.users->insertAndWait(u, 10s); });
+        }
+        const auto refused = [](const rune::client::WriteResult& r) { return r.status() == rune::client::OpStatus::BrokerError && r.code() == static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation); };
+        const int oks = (ra->ok() ? 1 : 0) + (rb->ok() ? 1 : 0);
+        loginRefusals_ += (refused(*ra) ? 1 : 0) + (refused(*rb) ? 1 : 0);
+        EXPECT_LE(oks, 1) << "seed " << seed_ << ": two first logins of " << u.subject << " were both accepted";
+        if ((ra->ok() || refused(*ra)) && (rb->ok() || refused(*rb))) EXPECT_EQ(oks, 1) << "seed " << seed_ << ": both first logins of " << u.subject << " were refused";
+        if (oks == 1) {
+            const auto again = rpWriter_(2).users->insertAndWait(u, 10s);
+            EXPECT_FALSE(again.ok()) << "seed " << seed_ << ": a later login of " << u.subject << " was accepted";
+            loginRefusals_ += refused(again) ? 1 : 0;
+        }
+    }
+
     /// Sends `s` (its id and op) through `w`: its token is the new record's name, its result the answer.
     void kiSend_(KiWriter& w, Sent* s) {
         if (kiSendHook_) kiSendHook_(*s);
@@ -838,6 +1005,11 @@ private:
                 ((s->op == Op::Update || s->op == Op::RemoveExisting) && s->code == static_cast<uint16_t>(pc::ErrorCode::KeyNotFound))) {
                 s->result = Sent::Result::Violation;
                 ++(s->code == static_cast<uint16_t>(pc::ErrorCode::KeyExists) ? keyExists_ : keyNotFound_);
+                return;
+            }
+            if (rp_ && s->op != Op::RemoveExisting && s->code == static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation)) {
+                s->result = Sent::Result::Violation;
+                ++constraintViolations_;
                 return;
             }
             if (s->code == static_cast<uint16_t>(pc::ErrorCode::NotLeader)) return;
@@ -1124,6 +1296,21 @@ private:
 
     void registerDefaults_() {
         registerInvariant("AckedVisibleUnlessRejected", [](CheckedWritesStressDriver& d, std::string* why) {
+            if (d.rp_) {   // a character's v is its user, not a token: the answer's offset finds the record (57s are SameVerdictEveryLeaderAndRefold's)
+                for (const Sent& s : d.sent_) {
+                    const bool violation = s.result == Sent::Result::Violation && s.code == static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation);
+                    if (s.result != Sent::Result::Ok && !violation) continue;
+                    const std::string at = "the write of id " + std::to_string(s.id) + " answered " + std::to_string(s.code) + " at offset " + std::to_string(s.offset);
+                    if (violation && s.offset < 0) { *why = at + ": a 55 without the record's offset"; return false; }
+                    if (d.seen_[0].count(s.offset) == 0) continue;   // compacted away before any read showed it
+                    const auto rec = d.data_[0].find(s.offset);
+                    if (rec == d.data_[0].end() || rec->second.id != s.id) { *why = at + ": the offset does not hold its record"; return false; }
+                    const auto verdict = d.models_[0].verdicts().find(s.offset);
+                    if (!violation && verdict != d.models_[0].verdicts().end()) { *why = at + ": acked Ok but the model rejects it"; return false; }
+                    if (violation && (verdict == d.models_[0].verdicts().end() || !(verdict->second == ModelVerdict{s.code, s.constraintId}))) { *why = at + " constraint " + std::to_string(s.constraintId) + ": not the model's verdict"; return false; }
+                }
+                return true;
+            }
             std::set<int64_t> accepted, rejected;   // key-index mode: tombstones carry no token (v 0) and are judged by IntentVerdictsExact
             for (int p = 0; p < d.parts_; ++p) {
                 for (const auto& rec : d.models_[static_cast<std::size_t>(p)].acceptedRecords()) accepted.insert(rec.v);
@@ -1347,10 +1534,11 @@ private:
         registerInvariant("NoIdTwiceNoReuse", [](CheckedWritesStressDriver& d, std::string* why) {
             std::map<uint64_t, int> acked;
             std::set<uint64_t> removed;
-            std::array<uint64_t, kAiParts> highest{};
-            std::array<std::vector<CheckedWritesModel::AutoIncAck>, kAiParts> acks;
-            std::map<int64_t, std::size_t> partOfValue;   // a write's value is unique: it finds the partition a create went to
-            for (int p = 0; p < kAiParts; ++p)
+            const auto parts = static_cast<std::size_t>(d.parts_);
+            std::vector<uint64_t> highest(parts);
+            std::vector<std::vector<CheckedWritesModel::AutoIncAck>> acks(parts);
+            std::map<int64_t, std::size_t> partOfValue;   // a write's value is unique: it finds the partition a create went to (one partition: the offset finds it)
+            for (int p = 0; p < d.parts_ && parts > 1; ++p)
                 for (const auto& [off, rec] : d.data_[static_cast<std::size_t>(p)]) if (!rec.del) partOfValue.emplace(rec.v, static_cast<std::size_t>(p));
             for (std::size_t n = 0; n < d.sent_.size(); ++n) {
                 const Sent& s = d.sent_[n];
@@ -1359,16 +1547,16 @@ private:
                 if (s.op != Op::Insert) continue;
                 if (++acked[s.id] > 1) { *why = "id " + std::to_string(s.id) + " is in two Ok results"; return false; }
                 if (removed.count(s.id) != 0) { *why = "id " + std::to_string(s.id) + " was acked again after it was removed"; return false; }
-                const auto found = s.keyZero ? partOfValue.find(s.v) : partOfValue.end();
-                const std::size_t part = found != partOfValue.end() ? found->second : s.id % kAiParts;
+                const bool read = s.keyZero && (parts == 1 ? d.data_[0].count(s.offset) != 0 : partOfValue.count(s.v) != 0);
+                const std::size_t part = parts == 1 ? 0 : read ? partOfValue.at(s.v) : s.id % parts;
                 highest[part] = std::max(highest[part], s.id);
                 for (const LeadCounter& lc : d.leadCounters_) {
                     if (lc.part != static_cast<int>(part) || lc.sentBefore <= n) continue;
-                    const uint64_t next = autoIncId(lc.counter.nextN, kAiParts, lc.part);
+                    const uint64_t next = autoIncId(lc.counter.nextN, d.parts_, lc.part);
                     if (next <= s.id) { *why = "node " + std::to_string(lc.id) + " partition " + std::to_string(lc.part) + " led with a counter that hands out " + std::to_string(next) + ", not above the acked " + std::to_string(s.id); return false; }
                 }
                 if (!s.keyZero) continue;
-                if (found != partOfValue.end()) {
+                if (read) {
                     acks[part].push_back({s.offset, s.id, 1});
                     continue;
                 }
@@ -1382,21 +1570,147 @@ private:
                 if (s.assignedKeyExists != 0) { *why = at + "assignedKeyExists " + std::to_string(s.assignedKeyExists); return false; }
                 if (!s.leader) continue;
                 if (!s.counter) { *why = at + "the leader's counter is not ready"; return false; }
-                const uint64_t next = autoIncId(s.counter->nextN, kAiParts, s.part);
+                const uint64_t next = autoIncId(s.counter->nextN, d.parts_, s.part);
                 if (next <= highest[static_cast<std::size_t>(s.part)]) { *why = at + "the counter hands out " + std::to_string(next) + ", not above the acked " + std::to_string(highest[static_cast<std::size_t>(s.part)]); return false; }
                 CheckedWritesModel m;
-                m.addAutoIncRule(AutoIncShape{.partitions = kAiParts}, s.part);
+                m.addAutoIncRule(AutoIncShape{.partitions = d.parts_}, s.part);
                 if (!m.counterAboveEveryId(d.history_(s.part), *s.counter)) { *why = at + "the counter (nextN " + std::to_string(s.counter->nextN) + ", reserved " + std::to_string(s.counter->reservedThroughN) + ") is not above every id in the log"; return false; }
             }
-            for (int p = 0; p < kAiParts; ++p) {
+            for (int p = 0; p < d.parts_; ++p) {
                 CheckedWritesModel m;
-                m.addAutoIncRule(AutoIncShape{.partitions = kAiParts}, p);
+                m.addAutoIncRule(AutoIncShape{.partitions = d.parts_}, p);
                 const VerdictRig::RigLog history = d.history_(p);
                 const auto& a = acks[static_cast<std::size_t>(p)];
                 if (!m.noIdTwiceNoReuse(history, a)) { *why = "partition " + std::to_string(p) + ": an id is in two records of the log"; return false; }
                 if (!m.idsFollowTheStride(history, a)) { *why = "partition " + std::to_string(p) + ": an acked id is off the stride"; return false; }
                 if (!m.ackedIdsMatchTheLog(history, a)) { *why = "partition " + std::to_string(p) + ": an acked id is not the key of its record"; return false; }
                 if (!m.reservationCoversEveryId(history)) { *why = "partition " + std::to_string(p) + ": a record's id is above the reservation below it"; return false; }
+            }
+            return true;
+        });
+    }
+
+    /// RegressorsPath mode: the layout and plan of the leader's instance of a view, to decode the rows read through getViewRowAndWait.
+    struct RpView { rune::view::RowLayout layout; rune::view::CompiledViewPlan plan; };
+    std::optional<RpView> rpViewOf_(int32_t viewTopic) {
+        const NodeSnap* lead = leaderOf_(snaps_, 0);
+        if (lead == nullptr) return std::nullopt;
+        return c_.node(lead->id).onWorkerThreadForTest(worker_(lead->id), [viewTopic](Worker& wk) -> std::optional<RpView> {
+            const ViewInstance* i = wk.viewSet()->instanceForTest(viewTopic, 0);
+            if (i == nullptr) return std::nullopt;
+            return RpView{i->layout, i->plan};
+        });
+    }
+    /// A row by its uint64 key, or by `bytes` when given: nullopt = no row; `failed` when no try answered.
+    std::optional<std::vector<uint8_t>> rpRow_(int32_t viewTopic, uint64_t key, const std::vector<uint8_t>* bytes, bool* failed) {
+        for (const auto deadline = Clock::now() + 10s; Clock::now() < deadline; std::this_thread::sleep_for(100ms)) {
+            rune::client::ViewRowResult row;
+            try {
+                row = bytes != nullptr ? reader_->getViewRowAndWait(viewTopic, std::span<const uint8_t>(*bytes), {}, 10s) : reader_->getViewRowAndWait(viewTopic, key, 0, 10s);
+            } catch (const std::exception&) { continue; }
+            if (row.status == rune::client::ViewRowResult::kAbsentKey) return std::nullopt;
+            if (row.status == rune::client::ViewRowResult::kOk) return row.rowBytes;
+        }
+        *failed = true;
+        return std::nullopt;
+    }
+    static int64_t rpColumn_(const std::vector<uint8_t>& row, const RpView& v, std::size_t output) {
+        const auto f = rune::view::readSlot(row.data(), v.layout, v.plan.output[output].outSlot);
+        return f.type == rune::codec::PrimType::Int64 ? f.i : static_cast<int64_t>(f.u);
+    }
+
+    using RpLive = std::map<uint64_t, std::pair<uint64_t, std::string>>;   ///< id -> (user, lowered name)
+    /// Replays the history with the broker's own verdicts (the leader's index and every marker a node holds) and the members its change
+    /// records name: `visit(record, the key's state before it, the live characters after it, members)` for each accepted record.  Returns
+    /// the live characters at the end.
+    template <class Visit> RpLive replayBrokerVerdicts_(Visit&& visit) const {
+        std::set<int64_t> rejected;
+        for (const NodeSnap& s : snaps_) {
+            if (s.leader) for (const auto& kv : s.index) rejected.insert(kv.first);
+            for (const auto& m : s.log.markers) for (const auto& [off, code, cid] : m.entries) rejected.insert(off);
+        }
+        RpLive live;
+        std::set<uint64_t> members;
+        auto ch = changes_[0].begin();
+        for (const auto& [off, rec] : data_[0]) {
+            for (; ch != changes_[0].end() && ch->first < off; ++ch) {
+                members.clear();
+                for (const auto& m : ch->second.members) members.insert(m.viewObjectId);
+            }
+            if (rejected.count(off) != 0) continue;
+            const auto at = live.find(rec.id);
+            const std::optional<std::pair<uint64_t, std::string>> before = at == live.end() ? std::nullopt : std::optional(at->second);
+            if (rec.del) live.erase(rec.id);
+            else live[rec.id] = {static_cast<uint64_t>(rec.v), lowered_(rec.name)};
+            visit(rec, before, live, members);
+        }
+        return live;
+    }
+
+    /// Plan 09 (matrix D): character_by_id is the model's live characters; no user ever holds more than 12 accepted live characters and
+    /// account_stats counts them; no two accepted live characters share a lowered name and character_name names each one's owner.
+    void registerRegressorsPathInvariants_() {
+        registerInvariant("ViewEqualsFreshRefold", [](CheckedWritesStressDriver& d, std::string* why) {
+            if (!d.reader_) (void)d.delivered_(std::vector<std::set<int64_t>>(1));
+            if (!d.awaitViewFolded_()) { *why = "character_by_id never folded the leader's committed records"; return false; }
+            const auto v = d.rpViewOf_(d.viewTopicId_);
+            if (!v) { *why = "the leader hosts no character_by_id"; return false; }
+            for (const auto& [id, latest] : d.models_[0].latestAcceptedByKey()) {
+                bool failed = false;
+                const auto row = d.rpRow_(d.viewTopicId_, id, nullptr, &failed);
+                const std::string at = "character " + std::to_string(id);
+                if (failed) { *why = at + ": the lookup never answered"; return false; }
+                if (latest.del) {
+                    if (row) { *why = at + " was removed but has a row"; return false; }
+                    continue;
+                }
+                if (!row) { *why = at + " has no row"; return false; }
+                const auto name = rune::view::readSlot(row->data(), v->layout, v->plan.output[2].outSlot).bytes;
+                if (rpColumn_(*row, *v, 1) != latest.v || std::string(name.data(), strnlen(name.data(), name.size())) != latest.name) { *why = at + "'s row is not the model's (user " + std::to_string(latest.v) + ", '" + latest.name + "')"; return false; }
+            }
+            return true;
+        });
+        registerInvariant("AtMostTwelveLiveCharacters", [](CheckedWritesStressDriver& d, std::string* why) {
+            const RpLive live = d.replayBrokerVerdicts_([&](const VerdictRig::RigLogRec& rec, const auto& before, const RpLive& now, const std::set<uint64_t>& members) {
+                if (!why->empty() || rec.del || members.count(d.statsObj_) == 0 || (before && before->first == static_cast<uint64_t>(rec.v))) return;
+                const auto n = std::count_if(now.begin(), now.end(), [&](const auto& kv) { return kv.second.first == static_cast<uint64_t>(rec.v); });
+                if (n > kRpCap) *why = "the write at offset " + std::to_string(rec.offset) + " gave user " + std::to_string(rec.v) + " " + std::to_string(n) + " live characters";
+            });
+            if (!why->empty()) return false;
+            const auto v = d.rpViewOf_(d.statsTopic_);
+            if (!v) { *why = "the leader hosts no account_stats"; return false; }
+            std::size_t counted = 0;
+            while (counted < v->plan.output.size() && v->plan.output[counted].rule != rune::view::MergeRule::CountAll) ++counted;
+            if (counted == v->plan.output.size()) { *why = "account_stats has no count column"; return false; }
+            for (uint64_t user = 1; user <= kRpUsers; ++user) {
+                const auto n = std::count_if(live.begin(), live.end(), [&](const auto& kv) { return kv.second.first == user; });
+                bool failed = false;
+                const auto row = d.rpRow_(d.statsTopic_, user, nullptr, &failed);
+                const std::string at = "user " + std::to_string(user) + " (" + std::to_string(n) + " live): ";
+                if (failed) { *why = at + "the account_stats lookup never answered"; return false; }
+                if ((row ? rpColumn_(*row, *v, counted) : 0) != n) { *why = at + "account_stats counts " + (row ? std::to_string(rpColumn_(*row, *v, counted)) : std::string("no row")); return false; }
+            }
+            return true;
+        });
+        registerInvariant("LowerNameUnique", [](CheckedWritesStressDriver& d, std::string* why) {
+            const RpLive live = d.replayBrokerVerdicts_([&](const VerdictRig::RigLogRec& rec, const auto& before, const RpLive& now, const std::set<uint64_t>& members) {
+                if (!why->empty() || rec.del || members.count(d.nameObj_) == 0) return;
+                const std::string& name = now.at(rec.id).second;
+                if (before && before->second == name) return;   // a move keeps its claim
+                for (const auto& [id, c] : now)
+                    if (id != rec.id && c.second == name) *why = "the write at offset " + std::to_string(rec.offset) + " claimed '" + name + "', held by character " + std::to_string(id);
+            });
+            if (!why->empty()) return false;
+            const auto v = d.rpViewOf_(d.nameTopic_);
+            if (!v) { *why = "the leader hosts no character_name"; return false; }
+            for (const auto& [id, c] : live) {
+                std::vector<uint8_t> key(v->plan.keyWidth, 0);
+                std::copy_n(c.second.begin(), std::min(c.second.size(), key.size()), key.begin());
+                bool failed = false;
+                const auto row = d.rpRow_(d.nameTopic_, 0, &key, &failed);
+                const std::string at = "character " + std::to_string(id) + " ('" + c.second + "'): ";
+                if (failed) { *why = at + "the character_name lookup never answered"; return false; }
+                if (!row || rpColumn_(*row, *v, 0) != static_cast<int64_t>(id)) { *why = at + "character_name names " + (row ? std::to_string(rpColumn_(*row, *v, 0)) : std::string("no owner")); return false; }
             }
             return true;
         });
@@ -1419,6 +1733,12 @@ private:
     std::vector<std::unique_ptr<Writer>> writers_;
     std::vector<std::unique_ptr<KiWriter>> kiWriters_;
     std::vector<std::unique_ptr<AiWriter>> aiWriters_;
+    std::vector<std::unique_ptr<RpWriter>> rpWriters_;
+    uint64_t nameObj_ = 0, statsObj_ = 0, statsFp_ = 0;   ///< RegressorsPath mode: the unique and check members (learnConstrainedViews_)
+    int32_t nameTopic_ = 0, statsTopic_ = 0;
+    std::map<uint64_t, std::pair<uint64_t, std::string>> rpChars_;   ///< ... what the acked writes left of the characters: id -> (user, name)
+    int constraintViolations_ = 0, loginRaces_ = 0, loginRefusals_ = 0, statsReplaces_ = 0;
+    uint64_t rpNameSeq_ = 0;
     std::vector<int> writerSeeds_;   ///< each writer slot's seed node (rebuildWriters_)
     std::vector<uint64_t> known_;           ///< autoincrement mode: the ids an Ok create or import was acked
     std::set<uint64_t> maybeRemoved_;       ///< ... that a removeExisting was sent for (whatever it answered)
