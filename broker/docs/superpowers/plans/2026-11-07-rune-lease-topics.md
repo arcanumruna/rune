@@ -4,6 +4,14 @@
 
 **Owner ruling 2026-11-07:** Phase 3 (discovery library on Rune) is dropped; Herald builds its pod registry on Phase 1–2.
 
+**Owner ruling 2026-11-07 (later):** transient lease topics are allowed and persist nothing across a full restart
+(spec, top note and Appendix A). Tasks 3 and 4 below still refuse `transient lease topic`; the next session designs
+the transient tasks (version growth across rebirth, eviction floor and carry, follower floor, re-grant after rebirth)
+and changes those refusals. Task 1 is unaffected.
+
+**Build note (sandbox):** a full Debug build with debug info needs about 40 GB; configure with
+`-DCMAKE_CXX_FLAGS_DEBUG=-g0` (asserts stay on) and build with `-j3` (more jobs run out of memory).
+
 **Goal:** A **lease topic** is a typed, keyed, compacted topic in which every live key **is** a lease with etcd v3
 semantics: granted only when the key has no live lease (no takeover), kept alive by `LeaseKeepAlive` requests served
 by the partition leader under the view-read lease (no log record), ended by a fenced `Revoke` or by a broker-appended

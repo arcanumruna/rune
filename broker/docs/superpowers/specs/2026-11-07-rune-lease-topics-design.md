@@ -37,6 +37,22 @@ rev 3 could not be built or could expire early.
   (§9.1), the cleaner's fixed `lease_version` offset (§6.6), per-entry keepalive answers (§8.1), handoff overflow,
   `asOfOffset` and multi-filter merge (§12.4), recipe session ids (§12.3), a local `onLost` (§12.2), known-old
   duplicates per op (§6.3), dropping a topic with parked keepalives (§9.6).
+**Owner ruling 2026-11-07 (transient lease topics are in scope).** `transient lease topic` is allowed. It persists
+nothing: a lease on a transient topic does not survive a restart of every replica of its partition. After such a
+restart the partition is empty, watchers get `PartitionDataReset` (43), and holders get `kErrLeaseNotFound` and grant
+again. While any replica stays up, the ring is replicated in memory as for every transient topic, so a minority
+failure loses no lease. Appendix A is now the design input for this, not deferred work. Points the next design pass
+settles (written down here, not decided):
+- **Versions must still only grow** across a full restart, or a new holder could reuse an old holder's version. This
+  needs no new persistence: leader epochs are already fenced durably (`leader-epoch-state`), so a reborn ring can
+  start at offset `leaderEpoch << 40` (`InMemoryLog::resetTo`), keeping "version = grant offset". To confirm with the
+  owner.
+- **Eviction must not drop a live lease's latest record** while the cluster is up: an eviction floor at the oldest
+  live lease's anchor, broker re-appends (checkpoint-style carry) to move old anchors forward, followers evicting only
+  below the leader's floor (the fetch response's `logStartOffset`), and a reserve so `Expire` can always append.
+- **Re-grant right after a full restart:** whether grants wait out `max_ttl` (so an old holder's margin has run out)
+  or are allowed at once (fencing still holds because versions grow). To confirm with the owner.
+
 Program: Herald on Rune (`arcanumruna/herald`, `docs/superpowers/specs/2026-11-07-herald-00-program-overview.md`,
 decision D5: no etcd, Redis or Postgres, so Rune is the only store and bus; §13 rows "Lease semantics" and "Leases:
 purpose and uses").
@@ -177,7 +193,6 @@ read-your-writes.
 - Fenced writes to other topics: a guarded resource checks the version itself (§18).
 - Transactions on lease topics.
 - `autoincrement` keys.
-- Transient lease topics (Appendix A).
 - The SQL, Redis and sink surfaces.
 - Wall-clock time in any form. Revision 2's wall mode is removed: long TTLs use checkpoints (§9.5).
 
@@ -354,7 +369,7 @@ lease topic <name> { <field> <type>, ... } [ partitions <n> ] [ replicas <r> ] k
 
 - **Shape.** A lease topic is typed and keyed. Without a field list and `key`, the DDL is refused with
   `lease topic needs a typed, keyed topic`.
-- **Refused forms.** `autoincrement` and `transient lease topic` are refused (Appendix A).
+- **Refused forms.** `autoincrement` is refused. `transient lease topic` is allowed (owner ruling 2026-11-07, top of this spec; design pending, Appendix A).
 - **Cleanup.** `cleanup.policy` is fixed to `compact`. Retention other than −1 is refused: a live lease's latest
   record must never be deleted by retention. `delete.retention.ms` defaults to 1 h (call).
 - **Key index.** The lease index is the topic's key index (§7.1); `key.index` is implied.
@@ -736,7 +751,7 @@ is a fixed-width `prefixWidth`, which a path prefix cannot use.
       next cycle tries again. While the partition cannot reach min-ISR, no `Expire` could become visible anyway. The
       append uses `acksAll = true`: an `Expire` is majority-durable, like any acks=all write.
     - `kAppendNotLeader`: the emitter stops, so a deposed leader appends nothing.
-    - `kAppendBackPressure` cannot happen, because lease topics are never transient.
+    - `kAppendBackPressure` cannot happen on a persisted lease topic. On a transient one it can (owner ruling 2026-11-07, top note): design pending.
 - **Rule 16.** The TTL is a product semantic, not a convergence timeout. The timer decides only when the leader
   proposes an end. The judged log decides whether it ended. `extend` (§9.6) affects only *when* a promoted leader
   proposes, never *whether* an end is accepted.
@@ -1447,7 +1462,6 @@ topics are reached through ordinary sessions, and §19.4 stands. The analysis is
 ## 18. Possible later work (not in this spec)
 
 - Multi-key leases inside one partition (D1).
-- Transient lease topics (Appendix A).
 - SQL, Redis and sink surfaces.
 - Op filter terms.
 - Revoke-by-holder.
@@ -1769,7 +1783,7 @@ lease topic 'acme/herald.safety.sanction-expiry' { sanctionId uint64 }
 11. **Widths and orders.** Every §5.1 key-width site, and `ScanLeases`' hash order with its O(n) cost.
 12. **Vacuous tests.** Each §16.5 mutation turns a test red, and the stress invariants are checked after every step.
 
-## Appendix A. Deferred: transient lease topics
+## Appendix A. Transient lease topics (in scope since the owner ruling of 2026-11-07; design pending)
 
 Transient lease topics are out of this spec (Coordinator's call). This is the analysis for a future spec.
 
