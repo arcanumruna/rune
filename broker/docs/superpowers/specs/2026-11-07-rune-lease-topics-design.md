@@ -41,17 +41,24 @@ rev 3 could not be built or could expire early.
 nothing: a lease on a transient topic does not survive a restart of every replica of its partition. After such a
 restart the partition is empty, watchers get `PartitionDataReset` (43), and holders get `kErrLeaseNotFound` and grant
 again. While any replica stays up, the ring is replicated in memory as for every transient topic, so a minority
-failure loses no lease. Appendix A is now the design input for this, not deferred work. Points the next design pass
-settles (written down here, not decided):
-- **Versions must still only grow** across a full restart, or a new holder could reuse an old holder's version. This
-  needs no new persistence: leader epochs are already fenced durably (`leader-epoch-state`), so a reborn ring can
-  start at offset `leaderEpoch << 40` (`InMemoryLog::resetTo`), keeping "version = grant offset". To confirm with the
-  owner.
-- **Eviction must not drop a live lease's latest record** while the cluster is up: an eviction floor at the oldest
-  live lease's anchor, broker re-appends (checkpoint-style carry) to move old anchors forward, followers evicting only
-  below the leader's floor (the fetch response's `logStartOffset`), and a reserve so `Expire` can always append.
-- **Re-grant right after a full restart:** whether grants wait out `max_ttl` (so an old holder's margin has run out)
-  or are allowed at once (fencing still holds because versions grow). To confirm with the owner.
+failure loses no lease. Appendix A is now the design input for this, not deferred work.
+
+**Owner rulings 2026-11-07 (transient restart):**
+- **Nothing goes to disk for a transient lease topic.** No version floor, no borrowed leader epoch, no file. After a
+  full restart the ring starts empty and versions start again from the ring's first offset.
+- **Grants wait out `max_ttl` after a full restart.** Every grant on a reborn partition is refused until `max_ttl`
+  has passed since the empty ring was created, so every old holder's lease has run out before the key can be held
+  again. `max_ttl` comes from the topic's catalog definition, which Rune keeps for every topic. Holders learn of the
+  loss earlier, at their next keepalive (`kErrLeaseNotFound` or `PartitionDataReset`).
+- **Consequence, stated plainly:** fencing by version does not hold across a full restart of a transient lease
+  topic. A writer frozen through the whole wait could come back with a version that matches a new holder's. A
+  workload that needs fencing across a full restart uses a persisted lease topic.
+- **Watchers** get `PartitionDataReset` (43), clear their state, and see each re-grant as a new key.
+
+Still for the design pass (no owner question): **eviction must not drop a live lease's latest record** while the
+cluster is up: an eviction floor at the oldest live lease's anchor, broker re-appends (checkpoint-style carry) to
+move old anchors forward, followers evicting only below the leader's floor (the fetch response's `logStartOffset`),
+and a reserve so `Expire` can always append.
 
 Program: Herald on Rune (`arcanumruna/herald`, `docs/superpowers/specs/2026-11-07-herald-00-program-overview.md`,
 decision D5: no etcd, Redis or Postgres, so Rune is the only store and bus; §13 rows "Lease semantics" and "Leases:

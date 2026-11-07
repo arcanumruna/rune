@@ -6,8 +6,9 @@
 
 **Owner ruling 2026-11-07 (later):** transient lease topics are allowed and persist nothing across a full restart
 (spec, top note and Appendix A). Tasks 3 and 4 below still refuse `transient lease topic`; the next session designs
-the transient tasks (version growth across rebirth, eviction floor and carry, follower floor, re-grant after rebirth)
-and changes those refusals. Task 1 is unaffected.
+the transient tasks (eviction floor and carry, follower floor, the `max_ttl` grant wait after rebirth) and changes
+those refusals. Settled by the owner: nothing goes to disk, versions restart with the ring, and grants wait out
+`max_ttl` after a full restart (spec top note). Task 1 is unaffected.
 
 
 **Goal:** A **lease topic** is a typed, keyed, compacted topic in which every live key **is** a lease with etcd v3
