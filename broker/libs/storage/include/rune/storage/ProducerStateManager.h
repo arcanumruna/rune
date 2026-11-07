@@ -25,14 +25,17 @@
 //                       retryBaseOffset == -1 (offset unknown).  Either way
 //                       coveredLastOffset is the log offset the answer's ack
 //                       condition must cover.
-//   OutOfOrderSequence— forward gap, or a batch partially overlapping
-//                       lastSequence (base <= lastSequence < end).
+//   OutOfOrderSequence— forward gap on a live entry, or a batch partially
+//                       overlapping lastSequence (base <= lastSequence < end).
 //   InvalidProducerEpoch — producerEpoch < tracked epoch (zombie fenced).
 //   UnknownProducerId — D6 (Kafka UNKNOWN_PRODUCER_ID): no entry for (topic,
 //                       pid, partition) and baseSequence != 0.  The state does
 //                       not know this producer (retention / compaction /
 //                       memory-ring eviction removed all its batches before a
-//                       rebuild) — NOT appended.  Answered only from a PROVEN
+//                       rebuild) — NOT appended.  Also a forward gap on a
+//                       rebuilt entry no live append has updated yet (#953:
+//                       its lastSequence is the log's, which may have lost the
+//                       producer's newest batches).  Answered only from a PROVEN
 //                       state (the callers' gates); the client tells retention
 //                       from loss with the partition's logStartOffset.
 //
@@ -157,7 +160,7 @@ struct ValidationResult {
         Duplicate,
         OutOfOrderSequence,
         InvalidProducerEpoch,
-        UnknownProducerId,     ///< D6: no entry + baseSequence != 0 (NOT appended)
+        UnknownProducerId,     ///< D6: no entry + baseSequence != 0, or a rebuilt entry's gap (NOT appended)
     };
 
     Status  status{Status::Accept};
