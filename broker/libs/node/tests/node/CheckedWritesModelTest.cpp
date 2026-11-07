@@ -6,10 +6,12 @@
 #include "CheckedWritesChecks.h"
 #include "CheckedWritesRig.h"
 
+#include <rune/codec/UnicodeLower.h>
 #include <rune/view/Verdict.h>
 #include <rune/view/ViewRow.h>
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <map>
 #include <random>
@@ -1438,8 +1440,10 @@ private:
                 if (old != live.end()) { --count[old->second.first]; live.erase(old); }
                 continue;
             }
-            const uint64_t user = characterUserIdOf(rec);
-            const std::string name = modelLower(characterNameOf(rec));
+            const auto user = static_cast<uint64_t>(rec.v);
+            std::array<uint8_t, 64> folded{};
+            const auto low = rune::codec::lowerUtf8({reinterpret_cast<const uint8_t*>(rec.name.data()), rec.name.size()}, folded);
+            const std::string name(reinterpret_cast<const char*>(folded.data()), low.len);
             if (const auto s = members.find(kCwObjStats); s != members.end() && (old == live.end() || old->second.first != user)) {
                 const int64_t c = statsCaps_.at(s->second);
                 EXPECT_LE(count[user] + 1, c) << "AtMostCapLiveCharacters: the write at " << rec.offset << " took user " << user << " past the cap " << c;
@@ -1517,7 +1521,8 @@ private:
         CheckedWritesModel model;
         model.addAutoIncRule(AutoIncShape{}, 0);
         model.addLowerNameUniqueRule(kCwObjName);
-        for (const auto& [fp, c] : statsCaps_) model.addCountCheckRule(kCwObjStats, c, fp);
+        model.addCountCheckRule(kCwObjStats, cap_);
+        for (const auto& [fp, c] : statsCaps_) model.declareCountCap(kCwObjStats, fp, c);
         model.reset(all);
         std::set<int64_t> present;
         for (const auto& d : log.data) present.insert(d.offset);
@@ -1537,7 +1542,7 @@ private:
         }
         live_.clear();
         for (const auto& [id, r] : model.latestAcceptedByKey())
-            if (!r.del) live_.push_back({id, characterUserIdOf(r), characterNameOf(r)});
+            if (!r.del) live_.push_back({id, static_cast<uint64_t>(r.v), r.name});
         trace += "[" + std::to_string(model.acceptedRecords().size()) + "/" + std::to_string(model.verdicts().size()) + "]";
     }
 

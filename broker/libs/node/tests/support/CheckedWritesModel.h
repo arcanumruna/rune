@@ -6,8 +6,10 @@
 #include "CheckedWritesRig.h"
 
 #include <rune/codec/Record.h>
+#include <rune/codec/UnicodeLower.h>
 #include <rune/view/ViewPlan.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -24,21 +26,6 @@ struct ModelVerdict {
     uint32_t constraintId = 0;
     bool operator==(const ModelVerdict&) const = default;
 };
-
-[[nodiscard]] inline std::string modelLower(const std::string& s);
-
-/// Part 09: a character record's value is {characterId, userId, name string(16), ...} (the rig's character topic and RegressorsPath's):
-/// userId is value bytes [12, 20), the name [20, 36), NUL padded.
-[[nodiscard]] inline uint64_t characterUserIdOf(const VerdictRig::RigLogRec& r) {
-    uint64_t u = 0;
-    for (int i = 0; i < 8; ++i) u |= uint64_t{r.value[12 + static_cast<std::size_t>(i)]} << (8 * i);
-    return u;
-}
-[[nodiscard]] inline std::string characterNameOf(const VerdictRig::RigLogRec& r) {
-    std::string s(reinterpret_cast<const char*>(r.value.data() + 20), 16);
-    if (const auto nul = s.find('\0'); nul != std::string::npos) s.resize(nul);
-    return s;
-}
 
 class CheckedWritesModel {
 public:
@@ -73,42 +60,6 @@ public:
             return std::nullopt;
         });
     }
-    /// Part 09, P9-3: `lower(name)` unique over the characters.  A live record is rejected (ordinal 0) when live accepted characters
-    /// claim its lowered name and it is not one of them; an extra that keeps its name claims nothing new and passes.
-    void addLowerNameUniqueRule(uint64_t viewObjectId) {
-        addRule(viewObjectId, [viewObjectId](const LogRec& rec, const CheckedWritesModel& m) -> std::optional<ModelVerdict> {
-            if (rec.del) return std::nullopt;
-            const std::string name = modelLower(characterNameOf(rec));
-            bool claimed = false;
-            for (const auto& [id, live] : m.live_) {
-                if (modelLower(characterNameOf(live)) != name) continue;
-                if (id == rec.id) return std::nullopt;
-                claimed = true;
-            }
-            if (!claimed) return std::nullopt;
-            return ModelVerdict{kConstraintViolation, static_cast<uint32_t>(viewObjectId << 16)};
-        });
-    }
-    /// Part 09, P9-4: `count(*) group by userId` with `check (characters <= cap)`.  A live record is rejected (ordinal 1) when a group whose
-    /// count it changes ends above the cap and keeps a contributor (a move out of a group already over the limit too); a record that stays
-    /// in its group changes no count.
-    void addCountCheckRule(uint64_t viewObjectId, int64_t cap) { addRule(viewObjectId, countCheck_(viewObjectId, cap)); }
-    /// The same rule for one plan of the view: a replace gives the object another cap under a new fingerprint.
-    void addCountCheckRule(uint64_t viewObjectId, int64_t cap, uint64_t planFingerprint) { planRules_[{viewObjectId, planFingerprint}] = countCheck_(viewObjectId, cap); }
-    /// Each lowered name a live character claims, and its owner: the smallest claimant (P9-3).
-    [[nodiscard]] std::map<std::string, uint64_t> uniqueOwners() const {
-        std::map<std::string, uint64_t> out;
-        for (const auto& [id, r] : live_) out.emplace(modelLower(characterNameOf(r)), id);   // live_ is in id order: the first is the smallest
-        return out;
-    }
-    /// The live claimants that own no name: the uniqueConflicts gauge.
-    [[nodiscard]] std::size_t uniqueExtras() const { return live_.size() - uniqueOwners().size(); }
-    [[nodiscard]] std::map<uint64_t, int64_t> liveCountByUser() const {
-        std::map<uint64_t, int64_t> out;
-        for (const auto& kv : live_) ++out[characterUserIdOf(kv.second)];
-        return out;
-    }
-
     /// An OK ack of a key-0 batch: its `count` records sit at baseOffset, baseOffset + 1, ... and carry the ids assignedBase + i * P.
     struct AutoIncAck { int64_t baseOffset; uint64_t assignedBase; std::size_t count; };
 
@@ -165,6 +116,31 @@ public:
         return counter.reservedThroughN + 1 >= counter.nextN;
     }
 
+    /// Part 09: the unique view over lower(name) (ordinal 0 of `viewObjectId`) and the count check over the user's characters (ordinal 1 of
+    /// `viewObjectId`, `count(*) <= cap`).  Both read the accepted records of the log only: claimants per lowered name and the live characters are
+    /// updated in offset order whether or not a member judges the record (unjudged below a member's change record, P9-3).
+    void addLowerNameUniqueRule(uint64_t viewObjectId) { uniqueView_ = viewObjectId; }
+    void addCountCheckRule(uint64_t viewObjectId, int64_t cap) { countView_ = viewObjectId; defaultCap_ = cap; }
+    /// The cap of the count member with this plan fingerprint (a replace names a new one); other fingerprints use the cap of addCountCheckRule.
+    void declareCountCap(uint64_t viewObjectId, uint64_t fingerprint, int64_t cap) { caps_[{viewObjectId, fingerprint}] = cap; }
+    /// The lowered name -> the smallest live claimant.
+    [[nodiscard]] std::map<std::string, uint64_t> uniqueOwners() const {
+        std::map<std::string, uint64_t> out;
+        for (const auto& [name, ids] : claimants_) out[name] = *ids.begin();
+        return out;
+    }
+    /// The live characters that claim a name owned by a smaller key.
+    [[nodiscard]] std::size_t uniqueExtras() const {
+        std::size_t n = 0;
+        for (const auto& [name, ids] : claimants_) n += ids.size() - 1;
+        return n;
+    }
+    [[nodiscard]] std::map<uint64_t, int64_t> liveCountByUser() const {
+        std::map<uint64_t, int64_t> out;
+        for (const auto& [id, c] : characters_) ++out[c.user];
+        return out;
+    }
+
     /// The key's state while reset() judges: every accepted record before the judged one has been applied, in offset order.
     [[nodiscard]] bool isLiveAtJudge(uint64_t id) const { return live_.count(id) != 0; }
 
@@ -172,7 +148,7 @@ public:
 
     /// Judges `log` (data records and change records, ascending offsets) from scratch.
     void reset(const VerdictRig::RigLog& log) {
-        verdicts_.clear(); accepted_.clear(); latest_.clear(); live_.clear();
+        verdicts_.clear(); accepted_.clear(); latest_.clear(); live_.clear(); claimants_.clear(); characters_.clear();
         std::vector<std::pair<uint64_t, uint64_t>> set;   // the current members, ascending object id
         std::size_t next = 0;
         for (const LogRec& rec : log.data) {
@@ -191,6 +167,7 @@ public:
             accepted_.push_back(rec);
             latest_[rec.id] = rec;
             if (rec.del) live_.erase(rec.id); else live_[rec.id] = rec;
+            if (uniqueView_ || countView_) applyCharacter_(rec);
         }
     }
 
@@ -223,26 +200,53 @@ private:
         return it != log.data.end() && it->offset == offset ? &*it : nullptr;
     }
 
-    static RuleFn countCheck_(uint64_t objectId, int64_t cap) {
-        return [objectId, cap](const LogRec& rec, const CheckedWritesModel& m) -> std::optional<ModelVerdict> {
-            if (rec.del) return std::nullopt;
-            const uint64_t to = characterUserIdOf(rec);
-            const auto old = m.live_.find(rec.id);
-            if (old != m.live_.end() && characterUserIdOf(old->second) == to) return std::nullopt;
-            const auto counts = m.liveCountByUser();
-            const auto countOf = [&counts](uint64_t u) -> int64_t { const auto it = counts.find(u); return it == counts.end() ? 0 : it->second; };
-            bool fails = countOf(to) + 1 > cap;
-            if (old != m.live_.end()) {
-                const int64_t left = countOf(characterUserIdOf(old->second)) - 1;
-                fails = fails || (left > 0 && left > cap);
+    static std::string lowered_(const std::string& name) {
+        std::array<uint8_t, 64> out{};
+        const auto r = rune::codec::lowerUtf8({reinterpret_cast<const uint8_t*>(name.data()), name.size()}, out);
+        return std::string(reinterpret_cast<const char*>(out.data()), r.len);
+    }
+    void applyCharacter_(const LogRec& rec) {
+        if (const auto at = characters_.find(rec.id); at != characters_.end()) {
+            if (auto c = claimants_.find(at->second.lowered); c != claimants_.end()) {
+                c->second.erase(rec.id);
+                if (c->second.empty()) claimants_.erase(c);
             }
-            if (!fails) return std::nullopt;
-            return ModelVerdict{kConstraintViolation, constraintIdOf(objectId)};
-        };
+            characters_.erase(at);
+        }
+        if (rec.del) return;
+        const std::string name = lowered_(rec.name);
+        characters_[rec.id] = {static_cast<uint64_t>(rec.v), name};
+        claimants_[name].insert(rec.id);
+    }
+    [[nodiscard]] std::size_t liveOf_(uint64_t user) const {
+        std::size_t n = 0;
+        for (const auto& [id, c] : characters_) n += c.user == user ? 1 : 0;
+        return n;
+    }
+    /// A live record is refused when its lowered name has an owner that is another key and the record is not already one of the claimants.
+    std::optional<ModelVerdict> judgeUnique_(uint64_t objectId, const LogRec& rec) const {
+        if (rec.del) return std::nullopt;
+        const auto at = claimants_.find(lowered_(rec.name));
+        if (at == claimants_.end() || at->second.count(rec.id) != 0) return std::nullopt;
+        return ModelVerdict{kConstraintViolation, static_cast<uint32_t>(objectId << 16)};
+    }
+    /// P9-4: the group a record joins or leaves is refused above the cap when the record changes its count; a delete is never refused.
+    std::optional<ModelVerdict> judgeCount_(uint64_t objectId, uint64_t fingerprint, const LogRec& rec) const {
+        if (rec.del) return std::nullopt;
+        const auto cap = caps_.find({objectId, fingerprint});
+        const auto limit = static_cast<std::size_t>(cap == caps_.end() ? defaultCap_ : cap->second);
+        const ModelVerdict refused{kConstraintViolation, constraintIdOf(objectId)};
+        const auto user = static_cast<uint64_t>(rec.v);
+        const auto before = characters_.find(rec.id);
+        if (before == characters_.end()) return liveOf_(user) + 1 > limit ? std::optional<ModelVerdict>(refused) : std::nullopt;
+        if (before->second.user == user) return std::nullopt;   // the count is unchanged
+        if (liveOf_(before->second.user) - 1 > limit || liveOf_(user) + 1 > limit) return refused;   // the old group's row survives when it keeps a character
+        return std::nullopt;
     }
 
     std::optional<ModelVerdict> judge_(uint64_t objectId, uint64_t fingerprint, const LogRec& rec) const {
-        if (const auto p = planRules_.find({objectId, fingerprint}); p != planRules_.end()) return p->second(rec, *this);
+        if (uniqueView_ && objectId == *uniqueView_) return judgeUnique_(objectId, rec);
+        if (countView_ && objectId == *countView_) return judgeCount_(objectId, fingerprint, rec);
         if (const auto x = extra_.find(objectId); x != extra_.end()) return x->second(rec, *this);
         const auto it = rules_.find({objectId, fingerprint});
         if (it == rules_.end() || rec.del) return std::nullopt;   // a tombstone is never rejected by a TestReject rule
@@ -258,12 +262,18 @@ private:
 
     std::map<std::pair<uint64_t, uint64_t>, Rule> rules_;
     std::map<uint64_t, RuleFn> extra_;
-    std::map<std::pair<uint64_t, uint64_t>, RuleFn> planRules_;   ///< (object id, plan fingerprint): before extra_
     std::map<int64_t, ModelVerdict> verdicts_;
     std::vector<LogRec> accepted_;
     std::map<uint64_t, LogRec> latest_;
     std::map<uint64_t, LogRec> live_;
     uint64_t partitions_ = 1, partition_ = 0;
+
+    struct Character { uint64_t user; std::string lowered; };
+    std::optional<uint64_t> uniqueView_, countView_;
+    int64_t defaultCap_ = 12;
+    std::map<std::pair<uint64_t, uint64_t>, int64_t> caps_;
+    std::map<std::string, std::set<uint64_t>> claimants_;   ///< lowered name -> the live keys that claim it
+    std::map<uint64_t, Character> characters_;              ///< live key -> user and lowered name
 };
 
 // ---- Part 07: keyed views.  The model reads the source records of the log and derives view keys with its own copy of the encoding
@@ -296,7 +306,6 @@ private:
         const auto c = static_cast<uint8_t>(s[k]);
         if (c >= 'A' && c <= 'Z') out.push_back(static_cast<char>(c + 32));
         else if (c == 0xC8 && k + 1 < s.size() && static_cast<uint8_t>(s[k + 1]) == 0xBA) { out += "\xE2\xB1\xA5"; ++k; }
-        else if (c == 0xE2 && s.compare(k, 3, "\xE2\xB1\xA5") == 0) { out += "\xE2\xB1\xA5"; k += 2; }   // U+2C65 is lower already
         else if (c < 0x80) out.push_back(static_cast<char>(c));
         else throw std::logic_error("modelLower: a character the matrix never writes");
     }

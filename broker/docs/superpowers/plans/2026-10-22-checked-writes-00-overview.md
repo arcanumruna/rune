@@ -35,7 +35,8 @@ The plans were written against `3c1ad01d` (the merge-base of the plan branch; cl
 
 ### RB1 — Scope
 
-- **Part 11 is dropped.** No part builds the transaction vote. Everything owned by 11 (C18, `TxnConflict`, `TxnTooLarge`, the cluster templates, `TxnVote` ops and return types, `kAttrAtomic`, stats 11–20, R11a–R11d, the §16.12 cross-check) is out. Part 03's refusal of a transactional batch to a constrained source (03 rule 7) is permanent until a follow-up issue reopens §9b. R03c stays: the client never sets `View` on a transactional send.
+- **Reinstated 2026-11-07 (owner decision):** Part 11 ships with Part 09 on one branch; its plan's "Refresh 2026-11-07" section supersedes this bullet and the numbering below (TxnTooLarge = 62, TxnConflict = 63).
+- ~~**Part 11 is dropped.**~~ No part builds the transaction vote. Everything owned by 11 (C18, `TxnConflict`, `TxnTooLarge`, the cluster templates, `TxnVote` ops and return types, `kAttrAtomic`, stats 11–20, R11a–R11d, the §16.12 cross-check) is out. Part 03's refusal of a transactional batch to a constrained source (03 rule 7) is permanent until a follow-up issue reopens §9b. R03c stays: the client never sets `View` on a transactional send.
 - **Part 01 is done by #589 (merge `f71596cc`).** It has no branch and no PR. RB3 says what later parts use instead.
 - **R-ORD becomes:** 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09, with 10 after 03 (beside 04–08), and 09 after 10. Autoincrement is usable after 06; `unique` and `check` after 09.
 
