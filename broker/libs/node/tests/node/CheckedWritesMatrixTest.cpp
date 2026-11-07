@@ -1154,13 +1154,395 @@ private:
 
 }  // namespace
 
+
+// ---- Part 09: view constraints.  A character source (autoincrement, key-indexed) with `character_name` (unique over lower(name), object id 7) and
+// `account_stats` (count per user, at most 12, object id 8) as verdict members.  Setup that breaks a constraint is written before the views exist
+// (unjudged below their change records).  Every op is sent by idempotent producers with All | View; the model judges the committed log. ----
+namespace {
+
+constexpr int64_t kBgPid = 502;
+
+class ConstraintCellRun {
+public:
+    using CV = ConstrainedView;
+    explicit ConstraintCellRun(const Cell& c) : c_(c), sc_(scenario09(c.op, c.entity)), r_(/*follower=*/true, /*rollBytes=*/1) {}
+
+    void run() {
+        const Expected ex = expect(c_);
+        r_.worker->setVerdictIntervalNs(1'000'000);
+        r_.createCharacterTopic(true);
+        if (::testing::Test::HasFatalFailure()) return;
+        r_.enableAcks();
+        r_.passes(60);
+        r_.followerFetch();
+        r_.passes(10);
+        writeSetup_();
+        if (::testing::Test::HasFatalFailure()) return;
+        createViews_();
+        if (::testing::Test::HasFatalFailure()) return;
+        execute_();
+        if (::testing::Test::HasFatalFailure()) return;
+
+        members_ = c_.timing == Timing::DropDuringWrites ? 2u : 3u;
+        ASSERT_TRUE(waitMembers_(members_));
+        waitCommitted_();
+        const auto written = r_.readLog();
+        target_ = written.data.back().offset + 1;
+        ASSERT_TRUE(r_.driveUntilJudged(target_));
+        r_.passes(60);
+        settleViews_();
+
+        const auto log = r_.readLog();
+        CheckedWritesModel model = modelOf_(log);
+        collectAcks_();
+
+        checkIndex(r_, model);                                              // (a)
+        checkMarkers(model, log, target_);                                  // (b)
+        checkDelivered_(model);                                             // (c)
+        checkAcks_(ex, model, log);                                         // (k)
+        checkViews_(model, log);                                            // (h) (i) (j)
+        checkStats_();                                                      // (f) (g)
+        checkCompaction(r_, model, log);                                    // (e)
+
+        std::set<int64_t> present;
+        for (const auto& d : r_.readLog().data) present.insert(d.offset);
+        r_.restart();
+        const auto compacted = r_.readLog();   // a rebuild from the compacted log gives the same owners and counts
+        ASSERT_TRUE(waitMembers_(members_));
+        ASSERT_TRUE(r_.driveUntilJudged(compacted.data.empty() ? 0 : compacted.data.back().offset + 1));
+        r_.passes(60);
+        settleViews_();
+        checkIndex(r_, model, &present);
+        checkViews_(model, log);
+        checkStats_();
+    }
+
+private:
+    struct Sent { int64_t corr; int64_t pid; int32_t seq; std::vector<Char09> recs; };
+
+    static VerdictRig::Char charOf_(const Char09& c) {
+        return VerdictRig::Char{.id = c.id, .userId = c.userId, .name = c.name, .gender = 0, .lastPlayed = c.lastPlayed, .intent = c.intent, .tombstone = c.del};
+    }
+    static constexpr int ackPasses_() { return 3000; }
+
+    Sent send_(int64_t pid, const std::vector<Char09>& recs) {
+        const int32_t seq = seqs_[pid];
+        seqs_[pid] += static_cast<int32_t>(recs.size());
+        std::vector<VerdictRig::Char> chars;
+        for (const Char09& c : recs) chars.push_back(charOf_(c));
+        stored_ += recs.size();
+        return {r_.appendCharacters(chars, kAcksViewAll, pid, seq), pid, seq, recs};
+    }
+    void resend_(Sent s) {
+        std::vector<VerdictRig::Char> chars;
+        for (const Char09& c : s.recs) chars.push_back(charOf_(c));
+        sent_.push_back({r_.appendCharacters(chars, kAcksViewAll, s.pid, s.seq), s.pid, s.seq, s.recs});
+        dups_.emplace_back(s.corr, sent_.back().corr);
+    }
+
+    // The batches of the op: a key-0 create may not share a batch with an explicit key, so a delete and a reuse are two.
+    std::vector<std::vector<Char09>> opBatches_() const {
+        std::vector<std::vector<Char09>> out;
+        if (c_.timing == Timing::BackToBack) {
+            for (const Char09& x : sc_.op) out.push_back({x});
+            return out;
+        }
+        if (c_.op == Op::CDeleteThenReuse) out = {{sc_.op[0]}, {sc_.op[1]}};
+        else out = {sc_.op};
+        if (c_.timing == Timing::SelfCollidingBatch)
+            for (auto& b : out) { const std::vector<Char09> again = b; b.insert(b.end(), again.begin(), again.end()); }
+        return out;
+    }
+    void sendOp_(int64_t pid = kOpPid) {
+        for (const auto& b : opBatches_()) {
+            opSent_.push_back(sent_.size());
+            sent_.push_back(send_(pid, b));
+        }
+    }
+
+    void writeSetup_() {
+        for (std::size_t at = 0; at < sc_.setup.size(); at += 16) {
+            const std::vector<Char09> chunk(sc_.setup.begin() + static_cast<std::ptrdiff_t>(at), sc_.setup.begin() + static_cast<std::ptrdiff_t>(std::min(at + 16, sc_.setup.size())));
+            // an explicit insert: the counter moves above the ids, and a plain upsert is refused on an autoincrement source
+            std::vector<Char09> inserts = chunk;
+            for (Char09& c : inserts) c.intent = 1;
+            const Sent s = send_(kSetupPid, inserts);
+            const auto a = r_.ackFetching(s.corr, ackPasses_());
+            ASSERT_TRUE(a);
+            ASSERT_EQ(a->code, 0);
+            ASSERT_TRUE(a->verdicts.empty());
+        }
+        ASSERT_TRUE(r_.driveUntilJudged());
+    }
+
+    void createViews_() {
+        if (c_.timing == Timing::CreateOnNonEmpty) r_.holdJudge(true);   // the op is sent while the members build
+        r_.createConstrainedView(CV::CharacterName);
+        r_.createConstrainedView(CV::AccountStats, 12);
+        fingerprint12_ = r_.fingerprintOf(CV::AccountStats, false);
+        if (c_.timing == Timing::CreateOnNonEmpty) { r_.passes(30); return; }
+        ASSERT_TRUE(waitMembers_(3));
+        settleViews_();
+    }
+
+    void settleViews_() {
+        r_.followerFetch();
+        ASSERT_TRUE(r_.driveUntilJudgeReaches());
+        for (const auto& [v, l] : r_.constrained) r_.driveUntilFolded(l.topicId, r_.dataEnd());
+    }
+
+    // The key index and both views are the logged set's members, and the leadership scan is done.
+    bool waitMembers_(uint32_t count) {
+        for (int i = 0; i < VerdictRig::kMaxPass; ++i) {
+            const PartitionWriteState* w = r_.writeState();
+            if (w != nullptr && w->constraintSets.latest().count == count && r_.worker->rcStatusForTest(VerdictRig::kSrc, 0) == Worker::kRcReady) return true;
+            if (i % 8 == 0) r_.followerFetch();
+            r_.pass();
+        }
+        ADD_FAILURE() << "the logged set never reached " << count << " members";
+        return false;
+    }
+
+    void waitCommitted_() {
+        r_.passes(10);
+        for (int i = 0; i < VerdictRig::kMaxPass && r_.replica->highWatermark() < r_.leo(); ++i) {
+            if (i % 8 == 0) r_.followerFetch();
+            r_.pass();
+        }
+        EXPECT_EQ(r_.replica->highWatermark(), r_.leo());
+    }
+
+    // A background producer writes creates for W, then the change happens right before the op's last batch.
+    void backgroundWrites_() {
+        for (uint64_t i = 0; i < 3; ++i) sent_.push_back(send_(kBgPid, {Char09{0, kUserW09, "bg" + std::to_string(i), 0, 1}}));
+        r_.passes(3);
+    }
+
+    // The op is sent, the leader loses it (`lose`), the node is leader again and the op is sent once more from a fresh sequence.
+    template <class Lose, class Back>
+    void lostAndResend_(Lose lose, Back back) {
+        lose();
+        for (const Sent& s : sent_) ASSERT_TRUE(r_.ack(s.corr));
+        back();
+        stored_ -= opRecords_();
+        sent_.clear();
+        opSent_.clear();
+        seqs_.erase(kOpPid);
+        ASSERT_TRUE(waitMembers_(3));
+        r_.passes(10);
+        sendOp_();
+    }
+    std::size_t opRecords_() const { std::size_t n = 0; for (const Sent& s : sent_) n += s.recs.size(); return n; }
+
+    void execute_() {
+        switch (c_.timing) {
+        case Timing::Racing:
+            sendOp_(kOpPid);
+            sendOp_(kOtherPid);
+            return;
+        case Timing::RetryBeforeJudge: case Timing::RetryAfterJudge: case Timing::RetryAfterWindow: {
+            const Char09& w = sc_.setup[std::find_if(sc_.setup.begin(), sc_.setup.end(), [](const Char09& x) { return x.id == kIdBase09 + 101; }) - sc_.setup.begin()];
+            ASSERT_TRUE(executeRetry(r_, c_.timing != Timing::RetryBeforeJudge, c_.timing == Timing::RetryAfterWindow, [&] { sendOp_(); },
+                                     [&](uint64_t i) { sent_.push_back(send_(kOpPid, {Char09{w.id, w.userId, w.name, static_cast<int64_t>(1000 + i), 2}})); },   // no state change: it only moves the window
+                                     [&] { resend_(sent_[opSent_.back()]); }));
+            return;
+        }
+        case Timing::CreateOnNonEmpty:
+            sendOp_();
+            r_.passes(10);
+            r_.holdJudge(false);
+            return;
+        case Timing::ReplaceDuringWrites:
+            backgroundWrites_();
+            r_.replaceConstrainedView(CV::AccountStats, 13);
+            fingerprint13_ = r_.fingerprintOf(CV::AccountStats, false);
+            r_.passes(5);
+            sendOp_();
+            return;
+        case Timing::DropDuringWrites:
+            r_.dropConstrainedView(CV::CharacterName);
+            r_.passes(5);
+            sendOp_();
+            return;
+        case Timing::FailoverAppendHw:
+            sendOp_();
+            r_.passes(5);
+            lostAndResend_([&] { r_.demote(); }, [&] { r_.failover(); });
+            return;
+        case Timing::TruncateTail:
+            sendOp_();
+            r_.passes(5);
+            lostAndResend_([&] { r_.truncateTo(r_.replica->highWatermark()); r_.demotePromote(); }, [] {});
+            return;
+        case Timing::FailoverHwFold:
+            sendOp_();
+            ASSERT_TRUE(r_.driveUntilJudged());
+            for (const Sent& s : sent_) ASSERT_TRUE(r_.ackFetching(s.corr, ackPasses_()));   // answered before the node is lost
+            r_.followerFetch();
+            r_.failover();
+            return;
+        case Timing::FailoverFoldMarker:
+            sendOp_();
+            r_.passes(5);
+            r_.followerFetch();
+            for (int i = 0; i < VerdictRig::kMaxPass && r_.leo() <= r_.replica->highWatermark(); ++i) r_.pass();   // the marker sits above the HW
+            ASSERT_GT(r_.leo(), r_.replica->highWatermark());
+            r_.failover();
+            return;
+        case Timing::RestartDuringRebuild:
+            sendOp_();
+            ASSERT_TRUE(r_.driveUntilJudged());
+            for (const Sent& s : sent_) ASSERT_TRUE(r_.ackFetching(s.corr, ackPasses_()));
+            r_.restart();
+            r_.passes(2);
+            r_.restart();
+            return;
+        default:   // Single, BackToBack, SelfCollidingBatch
+            sendOp_();
+            return;
+        }
+    }
+
+    CheckedWritesModel modelOf_(const VerdictRig::RigLog& log) const {
+        CheckedWritesModel model;
+        model.addKeyIndexRule();
+        model.addLowerNameUniqueRule(VerdictRig::objectIdOf(CV::CharacterName));
+        model.addCountCheckRule(VerdictRig::objectIdOf(CV::AccountStats), 12);
+        model.declareCountCap(VerdictRig::objectIdOf(CV::AccountStats), fingerprint12_, 12);
+        if (c_.timing == Timing::ReplaceDuringWrites) model.declareCountCap(VerdictRig::objectIdOf(CV::AccountStats), fingerprint13_, 13);
+        model.reset(log);
+        return model;
+    }
+
+    void collectAcks_() {
+        for (const Sent& s : sent_) {
+            const auto a = r_.ackFetching(s.corr, ackPasses_());
+            ASSERT_TRUE(a) << "corr " << s.corr;
+            acks_[s.corr] = *a;
+        }
+    }
+
+    // (k) every rejected completion carries the model's constraint id
+    void checkAcks_(const Expected& ex, const CheckedWritesModel& model, const VerdictRig::RigLog& log) {
+        for (const Sent& s : sent_) {
+            const VerdictRig::Ack& a = acks_.at(s.corr);
+            if (a.code != 0) {
+                EXPECT_EQ(ex.check, Check::RetryOutsideWindow);
+                continue;
+            }
+            checkModelTrailer(model, a, s.recs.size(), s.corr);
+            EXPECT_EQ(a.assignedBase != 0, s.recs.front().id == 0) << "only a key-0 batch answers its ids";
+        }
+        for (const auto& [orig, dup] : dups_) checkDupAck(r_, acks_.at(orig), acks_.at(dup), ex.check == Check::RetryOutsideWindow);
+        if (c_.timing == Timing::RetryBeforeJudge || c_.timing == Timing::RetryAfterJudge) EXPECT_EQ(log.data.size(), stored_) << "a retry is stored once";
+        if (ex.check != Check::ConstraintTable) return;
+
+        const std::vector<V09> want = single09(c_.op, c_.entity);
+        std::size_t at = 0;
+        for (const std::size_t k : opSent_) {
+            AckTrailer t;
+            for (std::size_t j = 0; j < sent_[k].recs.size(); ++j, ++at)
+                if (want[at] != V09::Ok) t.emplace_back(static_cast<uint16_t>(j), 55, want[at] == V09::N ? kNameCid09 : kStatsCid09);
+            EXPECT_EQ(acks_.at(sent_[k].corr).verdicts, t) << "the Single table";
+        }
+        EXPECT_EQ(at, want.size());
+        const auto owners = model.uniqueOwners();
+        const bool opLeaves = c_.op == Op::CRename || c_.op == Op::CRemove || c_.op == Op::CRemoveExisting || c_.op == Op::CDeleteThenReuse;
+        if (c_.entity == Entity::DupOwner && opLeaves) {
+            ASSERT_TRUE(owners.count("dup") != 0);
+            EXPECT_EQ(owners.at("dup"), kIdBase09 + 9) << "the smallest extra is promoted";
+        }
+        if (c_.entity == Entity::DupExtra && opLeaves) EXPECT_EQ(model.uniqueExtras(), 0u) << "the extra left the name";
+    }
+
+    // (c) a raw subscription from 0 receives exactly the accepted records, with their intents
+    void checkDelivered_(const CheckedWritesModel& model) {
+        for (int i = 0; i < VerdictRig::kMaxPass && r_.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) r_.pass();
+        ASSERT_EQ(r_.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
+        const auto& box = r_.collect(r_.subscribe(SubKind::Raw, 0));
+        std::vector<std::tuple<int64_t, uint64_t, uint8_t>> got, want;
+        for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.intent);
+        for (const auto& a : model.acceptedRecords()) want.emplace_back(a.offset, a.id, a.intent);
+        EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
+    }
+
+    [[nodiscard]] int64_t column_(CV v, const uint8_t* row, const char* col) const {
+        const auto& comp = r_.constrained.at(v).comp;
+        for (std::size_t i = 0; i < comp.outputDescriptor.fields.size(); ++i)
+            if (comp.outputDescriptor.fields[i].name == col) {
+                const auto f = rune::view::readSlot(row, comp.rowLayout, static_cast<uint16_t>(i));
+                return f.type == rune::codec::PrimType::Int64 ? f.i : static_cast<int64_t>(f.u);
+            }
+        throw std::logic_error(std::string("no column ") + col);
+    }
+
+    // (h) character_name holds the model's owners and its gauge the extras; (i) account_stats holds the live counts
+    void checkViews_(const CheckedWritesModel& model, const VerdictRig::RigLog& log) {
+        std::set<std::string> names;
+        std::set<uint64_t> users;
+        for (const auto& d : log.data) {
+            if (d.del) continue;
+            names.insert(modelLower(d.name));
+            users.insert(static_cast<uint64_t>(d.v));
+        }
+        if (r_.constrained.count(CV::CharacterName) != 0) {
+            const ViewInstance* inst = r_.constrainedInstance(CV::CharacterName);
+            ASSERT_NE(inst, nullptr);
+            const auto owners = model.uniqueOwners();
+            for (const std::string& name : names) {
+                std::vector<uint8_t> key(24, 0);
+                std::copy(name.begin(), name.end(), key.begin());
+                const uint8_t* row = inst->table.get(rune::view::ViewKey::fromBytes(key));
+                const auto owner = owners.find(name);
+                if (owner == owners.end()) { EXPECT_EQ(row, nullptr) << "(h) '" << name << "' has no live claimant"; continue; }
+                ASSERT_NE(row, nullptr) << "(h) '" << name << "'";
+                EXPECT_EQ(column_(CV::CharacterName, row, "characterId"), static_cast<int64_t>(owner->second)) << "(h) the owner of '" << name << "'";
+            }
+            EXPECT_EQ(r_.uniqueConflicts(CV::CharacterName), model.uniqueExtras()) << "(j) the gauge is the extras";
+        }
+        const ViewInstance* stats = r_.constrainedInstance(CV::AccountStats);
+        ASSERT_NE(stats, nullptr);
+        const auto counts = model.liveCountByUser();
+        for (const uint64_t user : users) {
+            const uint8_t* row = stats->table.get(user);
+            const auto want = counts.find(user);
+            if (want == counts.end()) { EXPECT_EQ(row, nullptr) << "(i) user " << user; continue; }
+            ASSERT_NE(row, nullptr) << "(i) user " << user;
+            EXPECT_EQ(column_(CV::AccountStats, row, "characters"), want->second) << "(i) user " << user;
+        }
+    }
+
+    // (f)(g) the side window never missed, no assigned id met a stored key, the rejected index agrees with the log
+    void checkStats_() {
+        EXPECT_EQ(r_.autoIncStats().windowMisses, 0u);
+        EXPECT_EQ(r_.autoIncStats().assignedKeyExists, 0u);
+        EXPECT_EQ(r_.writeState()->rejected.mismatches(), 0u);
+    }
+
+    Cell c_;
+    Scenario09 sc_;
+    VerdictRig r_;
+    uint32_t members_ = 3;
+    int64_t target_ = 0;
+    uint64_t fingerprint12_ = 0, fingerprint13_ = 0;
+    std::vector<Sent> sent_;
+    std::vector<std::size_t> opSent_;   ///< indexes into sent_ of the op's own batches
+    std::vector<std::pair<int64_t, int64_t>> dups_;
+    std::map<int64_t, int32_t> seqs_;
+    std::map<int64_t, VerdictRig::Ack> acks_;
+    std::size_t stored_ = 0;
+};
+
+}  // namespace
+
 class CheckedWritesMatrix : public ::testing::TestWithParam<Cell> {};
 
 TEST_P(CheckedWritesMatrix, Holds) {
     const Cell c = GetParam();
     const Expected ex = expect(c);
     if (!ex.applicable) GTEST_SKIP() << ex.naReason;
-    if (isP06(c)) AutoIncCellRun(c).run();
+    if (isP09(c)) ConstraintCellRun(c).run();
+    else if (isP06(c)) AutoIncCellRun(c).run();
     else if (isP05(c)) KeyIndexCellRun(c).run();
     else CellRun(c).run();
 }
@@ -1176,6 +1558,11 @@ INSTANTIATE_TEST_SUITE_P(Cell05, CheckedWritesMatrix, ::testing::ValuesIn(cellsF
     });
 
 INSTANTIATE_TEST_SUITE_P(Cell06, CheckedWritesMatrix, ::testing::ValuesIn(cellsFor(Part::P06)),
+    [](const ::testing::TestParamInfo<Cell>& i) {
+        return std::string(nameOf(i.param.op)) + "_" + nameOf(i.param.entity) + "_" + nameOf(i.param.timing);
+    });
+
+INSTANTIATE_TEST_SUITE_P(Cell09, CheckedWritesMatrix, ::testing::ValuesIn(cellsFor(Part::P09)),
     [](const ::testing::TestParamInfo<Cell>& i) {
         return std::string(nameOf(i.param.op)) + "_" + nameOf(i.param.entity) + "_" + nameOf(i.param.timing);
     });
@@ -1600,6 +1987,8 @@ TEST(CheckedWritesMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(skipped(cellsFor(Part::P07)), 129u);
     EXPECT_EQ(aggCellsFor07().size(), 190u);
     EXPECT_EQ(applicable(cellsFor(Part::P07)) + aggCellsFor07().size(), 610u);
+    EXPECT_EQ(applicable(cellsFor(Part::P09)), 600u);
+    EXPECT_EQ(skipped(cellsFor(Part::P09)), 555u);
 }
 
 // The model's key index rule against the Single-timing table, all 30 op x entity pairs, on hand-built logs.
@@ -1632,6 +2021,46 @@ TEST(CheckedWritesModel, KeyIndexRuleMatchesTheTable) {
             EXPECT_EQ(it == m.verdicts().end() ? 0 : it->second.code, want) << nameOf(op) << " x " << nameOf(e);
             if (it != m.verdicts().end()) EXPECT_EQ(it->second.constraintId, 0u) << nameOf(op) << " x " << nameOf(e);
         }
+}
+
+// The model's unique and count rules against the Single-timing table, all 40 op x entity pairs, on hand-built logs: no broker code runs.
+TEST(CheckedWritesModel, ConstraintRulesMatchTheTable) {
+    using Log = VerdictRig::RigLog;
+    using LogRec = VerdictRig::RigLogRec;
+    constexpr uint64_t kName = 7, kStats = 8, kFingerprint = 99;
+    std::size_t pairs = 0;
+    for (const Cell& cell : cellsFor(Part::P09)) {
+        if (cell.timing != Timing::Single || !expect(cell).applicable) continue;
+        ++pairs;
+        SCOPED_TRACE(std::string(nameOf(cell.op)) + " x " + nameOf(cell.entity));
+        const Scenario09 sc = scenario09(cell.op, cell.entity);
+        Log log;
+        int64_t off = 0;
+        uint64_t assigned = kIdBase09 + 5000;
+        const auto data = [&](const Char09& c) {
+            log.data.push_back(LogRec{off++, c.id == 0 ? ++assigned : c.id, static_cast<int64_t>(c.userId), 0, c.del, c.intent, 0, c.name});
+        };
+        for (const Char09& c : sc.setup) data(c);
+        log.changes.push_back({off++, {{0, static_cast<uint8_t>(rune::view::VerdictViewKind::KeyIndex), kKeyIndexPlanFingerprint}, {kName, 0, kFingerprint}, {kStats, 0, kFingerprint}}});
+        const int64_t opAt = off;
+        for (const Char09& c : sc.op) data(c);
+
+        CheckedWritesModel m;
+        m.addKeyIndexRule();
+        m.addLowerNameUniqueRule(kName);
+        m.addCountCheckRule(kStats, 12);
+        m.reset(log);
+        const std::vector<V09> want = single09(cell.op, cell.entity);
+        ASSERT_EQ(want.size(), sc.op.size());
+        for (std::size_t i = 0; i < want.size(); ++i) {
+            const auto it = m.verdicts().find(opAt + static_cast<int64_t>(i));
+            if (want[i] == V09::Ok) { EXPECT_TRUE(it == m.verdicts().end()) << "record " << i; continue; }
+            ASSERT_TRUE(it != m.verdicts().end()) << "record " << i;
+            EXPECT_EQ(it->second, (ModelVerdict{55, want[i] == V09::N ? kNameCid09 : kStatsCid09})) << "record " << i;
+        }
+        for (const auto& [off2, v] : m.verdicts()) EXPECT_GE(off2, opAt) << "the setup is unjudged";
+    }
+    EXPECT_EQ(pairs, 40u);
 }
 
 // A hand-built log, judged by the model alone: no broker code runs.

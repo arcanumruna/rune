@@ -6,8 +6,10 @@
 #include "CheckedWritesRig.h"
 
 #include <rune/codec/Record.h>
+#include <rune/codec/UnicodeLower.h>
 #include <rune/view/ViewPlan.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -114,6 +116,31 @@ public:
         return counter.reservedThroughN + 1 >= counter.nextN;
     }
 
+    /// Part 09: the unique view over lower(name) (ordinal 0 of `viewObjectId`) and the count check over the user's characters (ordinal 1 of
+    /// `viewObjectId`, `count(*) <= cap`).  Both read the accepted records of the log only: claimants per lowered name and the live characters are
+    /// updated in offset order whether or not a member judges the record (unjudged below a member's change record, P9-3).
+    void addLowerNameUniqueRule(uint64_t viewObjectId) { uniqueView_ = viewObjectId; }
+    void addCountCheckRule(uint64_t viewObjectId, int64_t cap) { countView_ = viewObjectId; defaultCap_ = cap; }
+    /// The cap of the count member with this plan fingerprint (a replace names a new one); other fingerprints use the cap of addCountCheckRule.
+    void declareCountCap(uint64_t viewObjectId, uint64_t fingerprint, int64_t cap) { caps_[{viewObjectId, fingerprint}] = cap; }
+    /// The lowered name -> the smallest live claimant.
+    [[nodiscard]] std::map<std::string, uint64_t> uniqueOwners() const {
+        std::map<std::string, uint64_t> out;
+        for (const auto& [name, ids] : claimants_) out[name] = *ids.begin();
+        return out;
+    }
+    /// The live characters that claim a name owned by a smaller key.
+    [[nodiscard]] std::size_t uniqueExtras() const {
+        std::size_t n = 0;
+        for (const auto& [name, ids] : claimants_) n += ids.size() - 1;
+        return n;
+    }
+    [[nodiscard]] std::map<uint64_t, int64_t> liveCountByUser() const {
+        std::map<uint64_t, int64_t> out;
+        for (const auto& [id, c] : characters_) ++out[c.user];
+        return out;
+    }
+
     /// The key's state while reset() judges: every accepted record before the judged one has been applied, in offset order.
     [[nodiscard]] bool isLiveAtJudge(uint64_t id) const { return live_.count(id) != 0; }
 
@@ -121,7 +148,7 @@ public:
 
     /// Judges `log` (data records and change records, ascending offsets) from scratch.
     void reset(const VerdictRig::RigLog& log) {
-        verdicts_.clear(); accepted_.clear(); latest_.clear(); live_.clear();
+        verdicts_.clear(); accepted_.clear(); latest_.clear(); live_.clear(); claimants_.clear(); characters_.clear();
         std::vector<std::pair<uint64_t, uint64_t>> set;   // the current members, ascending object id
         std::size_t next = 0;
         for (const LogRec& rec : log.data) {
@@ -140,6 +167,7 @@ public:
             accepted_.push_back(rec);
             latest_[rec.id] = rec;
             if (rec.del) live_.erase(rec.id); else live_[rec.id] = rec;
+            if (uniqueView_ || countView_) applyCharacter_(rec);
         }
     }
 
@@ -172,7 +200,53 @@ private:
         return it != log.data.end() && it->offset == offset ? &*it : nullptr;
     }
 
+    static std::string lowered_(const std::string& name) {
+        std::array<uint8_t, 64> out{};
+        const auto r = rune::codec::lowerUtf8({reinterpret_cast<const uint8_t*>(name.data()), name.size()}, out);
+        return std::string(reinterpret_cast<const char*>(out.data()), r.len);
+    }
+    void applyCharacter_(const LogRec& rec) {
+        if (const auto at = characters_.find(rec.id); at != characters_.end()) {
+            if (auto c = claimants_.find(at->second.lowered); c != claimants_.end()) {
+                c->second.erase(rec.id);
+                if (c->second.empty()) claimants_.erase(c);
+            }
+            characters_.erase(at);
+        }
+        if (rec.del) return;
+        const std::string name = lowered_(rec.name);
+        characters_[rec.id] = {static_cast<uint64_t>(rec.v), name};
+        claimants_[name].insert(rec.id);
+    }
+    [[nodiscard]] std::size_t liveOf_(uint64_t user) const {
+        std::size_t n = 0;
+        for (const auto& [id, c] : characters_) n += c.user == user ? 1 : 0;
+        return n;
+    }
+    /// A live record is refused when its lowered name has an owner that is another key and the record is not already one of the claimants.
+    std::optional<ModelVerdict> judgeUnique_(uint64_t objectId, const LogRec& rec) const {
+        if (rec.del) return std::nullopt;
+        const auto at = claimants_.find(lowered_(rec.name));
+        if (at == claimants_.end() || at->second.count(rec.id) != 0) return std::nullopt;
+        return ModelVerdict{kConstraintViolation, static_cast<uint32_t>(objectId << 16)};
+    }
+    /// P9-4: the group a record joins or leaves is refused above the cap when the record changes its count; a delete is never refused.
+    std::optional<ModelVerdict> judgeCount_(uint64_t objectId, uint64_t fingerprint, const LogRec& rec) const {
+        if (rec.del) return std::nullopt;
+        const auto cap = caps_.find({objectId, fingerprint});
+        const auto limit = static_cast<std::size_t>(cap == caps_.end() ? defaultCap_ : cap->second);
+        const ModelVerdict refused{kConstraintViolation, constraintIdOf(objectId)};
+        const auto user = static_cast<uint64_t>(rec.v);
+        const auto before = characters_.find(rec.id);
+        if (before == characters_.end()) return liveOf_(user) + 1 > limit ? std::optional<ModelVerdict>(refused) : std::nullopt;
+        if (before->second.user == user) return std::nullopt;   // the count is unchanged
+        if (liveOf_(before->second.user) - 1 > limit || liveOf_(user) + 1 > limit) return refused;   // the old group's row survives when it keeps a character
+        return std::nullopt;
+    }
+
     std::optional<ModelVerdict> judge_(uint64_t objectId, uint64_t fingerprint, const LogRec& rec) const {
+        if (uniqueView_ && objectId == *uniqueView_) return judgeUnique_(objectId, rec);
+        if (countView_ && objectId == *countView_) return judgeCount_(objectId, fingerprint, rec);
         if (const auto x = extra_.find(objectId); x != extra_.end()) return x->second(rec, *this);
         const auto it = rules_.find({objectId, fingerprint});
         if (it == rules_.end() || rec.del) return std::nullopt;   // a tombstone is never rejected by a TestReject rule
@@ -193,6 +267,13 @@ private:
     std::map<uint64_t, LogRec> latest_;
     std::map<uint64_t, LogRec> live_;
     uint64_t partitions_ = 1, partition_ = 0;
+
+    struct Character { uint64_t user; std::string lowered; };
+    std::optional<uint64_t> uniqueView_, countView_;
+    int64_t defaultCap_ = 12;
+    std::map<std::pair<uint64_t, uint64_t>, int64_t> caps_;
+    std::map<std::string, std::set<uint64_t>> claimants_;   ///< lowered name -> the live keys that claim it
+    std::map<uint64_t, Character> characters_;              ///< live key -> user and lowered name
 };
 
 // ---- Part 07: keyed views.  The model reads the source records of the log and derives view keys with its own copy of the encoding

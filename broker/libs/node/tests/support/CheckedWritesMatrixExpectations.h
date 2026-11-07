@@ -2,6 +2,7 @@
 // CheckedWritesMatrixExpectations.h - the checked-writes interaction matrix, shared by the parts (plan 04 P4-15, R03d).
 // Every part owns an id range of Op and Entity; Timing is append-only.  expect() chains the per-part expectNN by the op's range.
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -13,7 +14,8 @@ enum class Op : uint16_t {
     AutoCreate1 = 40, AutoCreate8 = 41, ImportBelow = 42, ImportAbove = 43, UpdateAssigned = 44, RemoveExistingAssigned = 45,   // 06: 40-59
     ViewUpsertNew = 60, ViewUpdateNonKey = 61, ViewRename = 62, ViewMoveGroup = 63, ViewDelete = 64, ViewDeleteThenReuse = 65,   // 07: 60-79
     ViewDuplicateRetry = 66, ViewPointRead = 67, ViewPrefixScan = 68,
-    /* 09: 80-99, 11: 100-119 */
+    CCreate = 80, CUpdateNonKey = 81, CRename = 82, CMove = 83, CRemove = 84, CRemoveExisting = 85, CDeleteThenReuse = 86,   // 09: 80-99
+    /* 11: 100-119 */
     ViewAckLV = 120, ViewAckAV = 121,                                                                   // 03: 120-139
 };
 enum class Entity : uint16_t {
@@ -22,6 +24,8 @@ enum class Entity : uint16_t {
     KeyNew = 20, KeyExisting = 21, KeyEarlierInBatch = 22, KeyRemovedEarlier = 23, KeyRejectedEarlier = 24, KeyBeforeIndex = 25,   // 05: 20-39
     P1U64 = 40, P4U64 = 41, P1U32 = 42, P2I64 = 43, AtReservationEdge = 44, NearMax = 45, Constrained = 46,                  // 06: 40-59
     KeyU16 = 60, KeyU32 = 61, KeyU64 = 62, KeyI64 = 63, KeyStr16 = 64, KeyComposite = 65, KeyCompositeWide = 66, KeyLower = 67, KeyMaxWidth = 68,   // 07: 60-79
+    G11Free = 80, G11Taken = 81, G12Free = 82, G12Taken = 83, OverFree = 84, OverTaken = 85, G11Self = 86, G12Self = 87, OverSelf = 88,   // 09: 80-99
+    DupOwner = 89, DupExtra = 90,
     AckNoViews = 120, AckOneView = 121, AckTwoViewsLate = 122, AckTransientSource = 123,                 // 03: 120-139
 };
 enum class Timing : uint16_t {
@@ -61,6 +65,7 @@ enum class Check : uint8_t {
     RacingIds,            ///< 06 Racing x a create: the two batches' ids are disjoint and contiguous
     CollidingPair,        ///< 06 Racing / SelfCollidingBatch x an import, update or remove: the pair of verdicts of collidingCodes06
     AutoVerdict,          ///< 06 an import, update or remove: the trailer is verdict06
+    ConstraintTable,      ///< 09 Single: the trailer is the Single table's verdicts (single09), checked against the model
 };
 
 struct Expected {
@@ -74,6 +79,7 @@ struct Expected {
 [[nodiscard]] inline bool isP05(const Cell& c) noexcept { return c.op >= Op::Insert && c.op < Op::AutoCreate1; }
 [[nodiscard]] inline bool isP06(const Cell& c) noexcept { return c.op >= Op::AutoCreate1 && c.op < static_cast<Op>(60); }
 
+[[nodiscard]] inline bool isP09(const Cell& c) noexcept { return c.op >= Op::CCreate && c.op <= Op::CDeleteThenReuse; }
 [[nodiscard]] inline bool isP07(const Cell& c) noexcept { return c.op >= Op::ViewUpsertNew && c.op <= Op::ViewPrefixScan; }
 
 [[nodiscard]] inline Expected expect03(const Cell& c) {
@@ -195,7 +201,111 @@ inline constexpr uint32_t kConstraintId06 = (7u << 16) | 1u;
     return {};
 }
 
-[[nodiscard]] inline Expected expect(const Cell& c) { return isP07(c) ? expect07(c) : isP06(c) ? expect06(c) : isP05(c) ? expect05(c) : isP03(c) ? expect03(c) : expect04(c); }
+// ---- Part 09 (view constraints): 7 ops x 11 entities x 15 timings ----
+/// A character of the Part 09 scenarios.  id 0 = a key-0 create (the broker assigns the id); intent 1 = create, 2 = update, 0 = upsert.
+struct Char09 { uint64_t id = 0; uint64_t userId = 0; std::string name; int64_t lastPlayed = 0; uint8_t intent = 0; bool del = false; };
+/// `setup` is written before the constrained views exist (unjudged below their change records); `op` is the batch the cell sends.
+struct Scenario09 { std::vector<Char09> setup; std::vector<Char09> op; };
+
+inline constexpr uint64_t kUserU09 = 1, kUserW09 = 2, kUserV09 = 3;
+/// Source keys sit above the counter's first reservation, so the first setup write moves the counter past all of them.
+inline constexpr uint64_t kIdBase09 = 100000;
+inline constexpr uint32_t kNameCid09 = 7u << 16, kStatsCid09 = (8u << 16) | 1u;   ///< character_name (ordinal 0), account_stats (ordinal 1)
+
+[[nodiscard]] inline bool isDup09(Entity e) noexcept { return e == Entity::DupOwner || e == Entity::DupExtra; }
+[[nodiscard]] inline bool isSelf09(Entity e) noexcept { return e == Entity::G11Self || e == Entity::G12Self || e == Entity::OverSelf; }
+[[nodiscard]] inline bool isTaken09(Entity e) noexcept { return e == Entity::G11Taken || e == Entity::G12Taken || e == Entity::OverTaken; }
+
+[[nodiscard]] inline Scenario09 scenario09(Op op, Entity e) {
+    const auto id = [](uint64_t k) { return kIdBase09 + k; };
+    const int n = (e == Entity::G11Free || e == Entity::G11Taken || e == Entity::G11Self) ? 11
+                : (e == Entity::G12Free || e == Entity::G12Taken || e == Entity::G12Self) ? 12
+                : isDup09(e) ? 5 : 14;
+    Scenario09 s;
+    for (int k = 1; k <= n; ++k) s.setup.push_back({id(static_cast<uint64_t>(k)), kUserU09, "u" + std::to_string(k)});
+    if (isDup09(e)) {
+        s.setup[4].name = "Dup";
+        s.setup.push_back({id(9), kUserW09, "dup"});
+        s.setup.push_back({id(101), kUserW09, "w2"});
+        s.setup.push_back({id(102), kUserW09, "w3"});
+        if (e == Entity::DupOwner) s.setup.push_back({id(12), kUserW09, "DUP"});   // a second extra, so that the promoted one is the smallest of two
+    } else {
+        s.setup.push_back({id(101), kUserW09, isTaken09(e) ? "foo" : "w1"});
+        s.setup.push_back({id(102), kUserW09, "w2"});
+        s.setup.push_back({id(103), kUserW09, "w3"});
+    }
+    if (op == Op::CMove)
+        for (uint64_t k = 1; k <= 5; ++k) s.setup.push_back({id(200 + k), kUserV09, "v" + std::to_string(k)});
+
+    const Char09 c = e == Entity::DupOwner ? s.setup[4] : e == Entity::DupExtra ? s.setup[static_cast<std::size_t>(n)] : s.setup.front();
+    const Char09 moved = s.setup.size() > static_cast<std::size_t>(n) + 3 ? s.setup[static_cast<std::size_t>(n) + 3] : c;   // CMove: the first of V's
+    std::string x = isTaken09(e) ? (e == Entity::G11Taken ? "Foo" : "foo") : "Xnew";
+    if (isSelf09(e)) x = "U1";
+    if (isDup09(e)) x = op == Op::CRename ? "Renamed" : "DUP";
+    switch (op) {
+    case Op::CCreate: s.op = {{0, kUserU09, x, 0, 1}}; break;
+    case Op::CUpdateNonKey: s.op = {{c.id, c.userId, c.name, 777, 2}}; break;
+    case Op::CRename: s.op = {{c.id, c.userId, x, 0, 2}}; break;
+    case Op::CMove: s.op = {{moved.id, kUserU09, moved.name, 0, 2}}; break;
+    case Op::CRemove: s.op = {{c.id, 0, "", 0, 0, true}}; break;
+    case Op::CRemoveExisting: s.op = {{c.id, 0, "", 0, 2, true}}; break;
+    default: s.op = {{c.id, 0, "", 0, 0, true}, {0, kUserU09, c.name, 0, 1}}; break;   // CDeleteThenReuse
+    }
+    return s;
+}
+
+/// The verdict of one op record at the Single timing: Ok, N (character_name, ordinal 0) or M (account_stats, ordinal 1).
+enum class V09 : uint8_t { Ok, N, M };
+
+/// The Single table of the plan's Interaction matrix A, one entry per record of the op's batch; empty = the pair is not applicable.
+[[nodiscard]] inline std::vector<V09> single09(Op op, Entity e) {
+    constexpr V09 O = V09::Ok, N = V09::N, M = V09::M;
+    switch (op) {
+    case Op::CCreate:
+        switch (e) {
+        case Entity::G11Free: return {O};
+        case Entity::G12Free: case Entity::OverFree: return {M};
+        case Entity::G11Taken: case Entity::G12Taken: case Entity::OverTaken: case Entity::DupOwner: return {N};
+        default: return {};
+        }
+    case Op::CUpdateNonKey:
+        return isSelf09(e) || isDup09(e) ? std::vector<V09>{O} : std::vector<V09>{};
+    case Op::CRename:
+        switch (e) {
+        case Entity::G11Taken: case Entity::G12Taken: case Entity::OverTaken: return {N};
+        default: return {O};
+        }
+    case Op::CMove:
+        switch (e) {
+        case Entity::G11Self: return {O};
+        case Entity::G12Self: case Entity::OverSelf: return {M};
+        default: return {};
+        }
+    case Op::CRemove: case Op::CRemoveExisting:
+        return isSelf09(e) || isDup09(e) ? std::vector<V09>{O} : std::vector<V09>{};
+    case Op::CDeleteThenReuse:
+        switch (e) {
+        case Entity::G11Self: case Entity::G12Self: return {O, O};
+        case Entity::OverSelf: return {O, M};
+        case Entity::DupOwner: return {O, N};
+        default: return {};
+        }
+    default: return {};
+    }
+}
+
+[[nodiscard]] inline Expected expect09(const Cell& c) {
+    if (c.op == Op::CCreate && (isSelf09(c.entity) || c.entity == Entity::DupExtra))
+        return {false, c.entity == Entity::DupExtra ? "the duplicate's name is the DupOwner cell" : "a new record owns no name yet"};
+    if ((c.op == Op::CUpdateNonKey || c.op == Op::CRemove || c.op == Op::CRemoveExisting || c.op == Op::CDeleteThenReuse) && c.entity <= Entity::OverTaken)
+        return {false, "the op keeps C's own name"};
+    if (c.op == Op::CDeleteThenReuse && c.entity == Entity::DupExtra) return {false, "covered by CRemove x DupExtra"};
+    if (c.op == Op::CMove && !isSelf09(c.entity)) return {false, "a move keeps the name; the entity names the target group"};
+    if (c.timing == Timing::RetryAfterWindow) return {true, nullptr, Check::RetryOutsideWindow};
+    return {true, nullptr, c.timing == Timing::Single ? Check::ConstraintTable : Check::Trailer};
+}
+
+[[nodiscard]] inline Expected expect(const Cell& c) { return isP09(c) ? expect09(c) : isP07(c) ? expect07(c) : isP06(c) ? expect06(c) : isP05(c) ? expect05(c) : isP03(c) ? expect03(c) : expect04(c); }
 
 [[nodiscard]] inline std::vector<Cell> cellsFor(Part part) {
     std::vector<Cell> out;
@@ -236,6 +346,13 @@ inline constexpr uint32_t kConstraintId06 = (7u << 16) | 1u;
                                                             : std::vector<Timing>(std::begin(writes), std::end(writes));
                 for (const Timing t : ts) out.push_back({o, static_cast<Entity>(e), t});
             }
+    } else if (part == Part::P09) {
+        const Timing t09[] = {Timing::Single, Timing::BackToBack, Timing::SelfCollidingBatch, Timing::Racing, Timing::RetryBeforeJudge, Timing::RetryAfterJudge,
+                              Timing::FailoverAppendHw, Timing::FailoverHwFold, Timing::FailoverFoldMarker, Timing::TruncateTail, Timing::RestartDuringRebuild,
+                              Timing::CreateOnNonEmpty, Timing::ReplaceDuringWrites, Timing::DropDuringWrites, Timing::RetryAfterWindow};
+        for (uint16_t op = static_cast<uint16_t>(Op::CCreate); op <= static_cast<uint16_t>(Op::CDeleteThenReuse); ++op)
+            for (uint16_t e = static_cast<uint16_t>(Entity::G11Free); e <= static_cast<uint16_t>(Entity::DupExtra); ++e)
+                for (const Timing t : t09) out.push_back({static_cast<Op>(op), static_cast<Entity>(e), t});
     } else if (part == Part::P04) {
         for (uint16_t op = 0; op <= static_cast<uint16_t>(Op::DeleteFreesCap); ++op)
             for (uint16_t e = 0; e <= static_cast<uint16_t>(Entity::OldWriters); ++e) {
@@ -282,7 +399,9 @@ inline const char* nameOf(Op o) {
     case Op::ViewUpsertNew: return "ViewUpsertNew"; case Op::ViewUpdateNonKey: return "ViewUpdateNonKey"; case Op::ViewRename: return "ViewRename";
     case Op::ViewMoveGroup: return "ViewMoveGroup"; case Op::ViewDelete: return "ViewDelete"; case Op::ViewDeleteThenReuse: return "ViewDeleteThenReuse";
     case Op::ViewDuplicateRetry: return "ViewDuplicateRetry"; case Op::ViewPointRead: return "ViewPointRead"; case Op::ViewPrefixScan: return "ViewPrefixScan";
-    case Op::ImportAbove: return "ImportAbove"; case Op::UpdateAssigned: return "UpdateAssigned"; case Op::RemoveExistingAssigned: return "RemoveExistingAssigned"; case Op::ViewAckLV: return "ViewAckLV"; case Op::ViewAckAV: return "ViewAckAV";
+    case Op::ImportAbove: return "ImportAbove"; case Op::UpdateAssigned: return "UpdateAssigned"; case Op::RemoveExistingAssigned: return "RemoveExistingAssigned"; case Op::CCreate: return "CCreate"; case Op::CUpdateNonKey: return "CUpdateNonKey"; case Op::CRename: return "CRename"; case Op::CMove: return "CMove";
+    case Op::CRemove: return "CRemove"; case Op::CRemoveExisting: return "CRemoveExisting"; case Op::CDeleteThenReuse: return "CDeleteThenReuse";
+    case Op::ViewAckLV: return "ViewAckLV"; case Op::ViewAckAV: return "ViewAckAV";
     }
     return "?";
 }
@@ -292,6 +411,9 @@ inline const char* nameOf(Entity e) {
     case Entity::FilteredSubscription: return "FilteredSubscription"; case Entity::ReplayFromStart: return "ReplayFromStart";
     case Entity::OtherViews: return "OtherViews"; case Entity::TwoVerdictViews: return "TwoVerdictViews";
     case Entity::ViewAckWriter: return "ViewAckWriter"; case Entity::OldWriters: return "OldWriters";
+    case Entity::G11Free: return "G11Free"; case Entity::G11Taken: return "G11Taken"; case Entity::G12Free: return "G12Free"; case Entity::G12Taken: return "G12Taken";
+    case Entity::OverFree: return "OverFree"; case Entity::OverTaken: return "OverTaken"; case Entity::G11Self: return "G11Self"; case Entity::G12Self: return "G12Self";
+    case Entity::OverSelf: return "OverSelf"; case Entity::DupOwner: return "DupOwner"; case Entity::DupExtra: return "DupExtra";
     case Entity::AckNoViews: return "AckNoViews"; case Entity::AckOneView: return "AckOneView";
     case Entity::AckTwoViewsLate: return "AckTwoViewsLate"; case Entity::AckTransientSource: return "AckTransientSource";
     case Entity::KeyNew: return "KeyNew"; case Entity::KeyExisting: return "KeyExisting"; case Entity::KeyEarlierInBatch: return "KeyEarlierInBatch";

@@ -1066,7 +1066,7 @@ public:
     }
 
     // ---- the log, read back ----
-    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; uint64_t valueId = 0; };   ///< valueId: the value's own key field
+    struct RigLogRec { int64_t offset; uint64_t id; int64_t v; uint8_t tag; bool del; uint8_t intent = 0; uint64_t valueId = 0; std::string name; };   ///< valueId: the value's own key field; name: the string(16) after the first 8-byte column (a character's name), empty if the value ends before it
     struct RigChange { int64_t offset; std::vector<rune::storage::control_record::ChangeMember> members; int64_t catalogThrough = -1; };
     struct RigMarker { int64_t offset; rune::storage::control_record::MarkerHeader header; std::vector<std::tuple<int64_t, uint16_t, uint32_t>> entries; bool horizon = false; };
     struct RigPlan { int64_t offset; rune::storage::control_record::VerdictPlanHeader header; std::vector<uint8_t> plan, outputDescriptor, sourceDescriptor; };   ///< a type-20 record
@@ -1427,7 +1427,9 @@ inline VerdictRig::RigLog readLogOf(rune::storage::Log& log, int64_t through = I
                     uint64_t x = 0, valueId = 0;
                     for (int i = 0; i < 8; ++i) x |= uint64_t(val[4 + kw + i]) << (8 * i);
                     for (std::size_t i = 0; i < std::min<std::size_t>(kw, 8); ++i) valueId |= uint64_t(val[4 + i]) << (8 * i);
-                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(rs.value.size() > 4 + kw + 8 ? val[4 + kw + 8] : 0), false, intent, valueId});   // a topic with no tag field ends after the int64
+                    std::string name;
+                    if (rs.value.size() >= 4 + kw + 8 + 16) name.assign(reinterpret_cast<const char*>(val + 4 + kw + 8), strnlen(reinterpret_cast<const char*>(val + 4 + kw + 8), 16));
+                    out.data.push_back({rs.offset, id, static_cast<int64_t>(x), static_cast<uint8_t>(rs.value.size() > 4 + kw + 8 ? val[4 + kw + 8] : 0), false, intent, valueId, std::move(name)});   // a topic with no tag field ends after the int64
                 });
             } else if (r.baseOffset() < through) {
                 if (const auto c = crl::parseControl(b, total); c && c->type == crl::kConstraintSetChange) {
