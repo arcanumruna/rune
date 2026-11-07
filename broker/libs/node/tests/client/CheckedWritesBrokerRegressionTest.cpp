@@ -2657,6 +2657,16 @@ rv::ViewPlan nameKeyPlan(int32_t sourceTopicId) {
     return characterPlan("name_key", sourceTopicId, {{"name", rune::codec::kKeyFunctionLower, "nameKey"}, {"characterId", 0, "characterId"}}, {"name"});
 }
 
+/// The view is in `n`'s applied catalog (a follower applies a create-view entry after the controller acked it).
+void awaitViewApplied(BrokerNode& n, const std::string& view) {
+    bool applied = false;
+    for (int i = 0; i < 1200 && !applied; ++i) {
+        applied = n.onAdminThreadForTest([&n, &view] { return n.adminWorkerAgentForTest()->worker().applier().state().viewByName(rune::catalog::kDefaultNsId, view) != nullptr; });
+        if (!applied) std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(applied) << "the view reaches the node's catalog: " << view;
+}
+
 rcv::ViewKeyBuilder keyBuilder(BrokerNode& n, const std::string& view) {
     auto b = n.onAdminThreadForTest([&n, &view] { return rcv::ViewKeyBuilder::fromCatalog(n.adminWorkerAgentForTest()->worker().applier().state(), view); });
     if (!b) throw std::runtime_error(b.error());
@@ -3000,6 +3010,8 @@ TEST(CheckedWritesBrokerRegression, WideViewReadsAfterLeaderCrashThreeNodesRegre
     int32_t seed = 0;
     for (const int id : c.runningNodes()) if (id != victim) { seed = id; break; }
     ASSERT_GT(seed, 0);
+    awaitViewApplied(c.node(seed), "account_characters");
+    ASSERT_FALSE(HasFatalFailure());
     const ViewColumns cols(c.node(seed), "account_characters");
     rcv::ViewKeyBuilder builder = keyBuilder(c.node(seed), "account_characters");
 
