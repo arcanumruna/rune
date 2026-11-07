@@ -11,11 +11,19 @@
 // delete retention 0; three typed clients create (key 0), update, removeExisting and import (a live id, which must be refused, or an id
 // above every one seen), one write at a time, and NoIdTwiceNoReuse joins the invariants (the view and KeyIndexEqualsLiveKeys do not run:
 // the ids grow without a bound).
+// RegressorsPath mode (plan 09): the golden regressorspath.rql through the real CLI (user, user_identity, character, character_name,
+// account_stats) and a character_by_id projection; three typed clients race first logins, creates for four users near the cap of 12,
+// renames to colliding names, moves and removeExisting on `character`, and AtMostTwelveLiveCharacters and LowerNameUnique join
+// NoIdTwiceNoReuse and 04's invariants, from the broker's verdicts and the leader's views.
 #include "CheckedWritesChecks.h"
 #include "CheckedWritesModel.h"
 #include "client/ClusterClient.h"
 #include "client/support/AutoIncRecords.h"
 #include "client/support/KeyIndexRecords.h"
+#include "client/support/RegressorsPathRecords.h"
+
+#include <QlEngine.h>
+#include <rune/cli/Cli.h>
 
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
@@ -24,20 +32,24 @@
 #include <rune/client/group/GroupConsumer.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/subscriber/Subscription.h>
+#include <rune/codec/UnicodeLower.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/Verdict.h>
+#include <rune/view/ViewRow.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -83,13 +95,14 @@ public:
         enum class Result : uint8_t { Ok, Violation, Unknown } result = Result::Unknown;
     };
 
-    CheckedWritesStressDriver(rune::node::test::catalog_cluster::ThreeNodes& cluster, uint64_t seed, bool keyIndex = false, bool autoInc = false)
-        : c_(cluster), rng_(seed), seed_(seed), autoInc_(autoInc), keyIndex_(keyIndex || autoInc), parts_(autoInc ? kAiParts : keyIndex ? kKiParts : 1), keys_(keyIndex ? kKiKeys : kTagKeys),
+    CheckedWritesStressDriver(rune::node::test::catalog_cluster::ThreeNodes& cluster, uint64_t seed, bool keyIndex = false, bool autoInc = false, bool regressorsPath = false)
+        : c_(cluster), rng_(seed), seed_(seed), rp_(regressorsPath), autoInc_(autoInc || rp_), keyIndex_(keyIndex || autoInc_), parts_(rp_ ? 1 : autoInc ? kAiParts : keyIndex ? kKiParts : 1), keys_(keyIndex ? kKiKeys : kTagKeys),
           seen_(static_cast<std::size_t>(parts_)), data_(static_cast<std::size_t>(parts_)), changes_(static_cast<std::size_t>(parts_)), reservations_(static_cast<std::size_t>(parts_)), models_(static_cast<std::size_t>(parts_)),
           deliveredOffsets_(static_cast<std::size_t>(parts_)), rawIntents_(static_cast<std::size_t>(parts_)), groupOffsets_(static_cast<std::size_t>(parts_)) {
         registerDefaults_();
-        if (keyIndex_) registerKeyIndexInvariants_();
+        if (keyIndex_ && !rp_) registerKeyIndexInvariants_();
         if (autoInc_) registerAutoIncInvariants_();
+        if (rp_) registerRegressorsPathInvariants_();
     }
     ~CheckedWritesStressDriver() {
         group_.reset();
@@ -99,6 +112,7 @@ public:
         writers_.clear();
         kiWriters_.clear();
         aiWriters_.clear();
+        rpWriters_.clear();
     }
 
     /// The typed topic (replicas 3), the projection view, TestReject on every node (not in key-index mode) and three clients.
@@ -140,6 +154,52 @@ public:
         rebuildWriters_(-1);
     }
 
+    /// RegressorsPath mode: every statement of the golden script through `rune ql -e` (the character topic gets small segments and an eager
+    /// cleaner), the character_by_id projection, and three clients.
+    void setUpRegressorsPath() {
+        namespace tcc = rune::node::test::catalog_cluster;
+        ASSERT_TRUE(c_.awaitCatalogLeader(30s));
+        const int32_t ctl = tcc::awaitController(c_);
+        ASSERT_GT(ctl, 0);
+        for (const int id : c_.runningNodes()) {   // unique and check views need the cluster at the checked-writes level
+            bool raised = false;
+            for (const auto deadline = Clock::now() + 10s; !raised && Clock::now() < deadline; std::this_thread::sleep_for(25ms))
+                raised = c_.node(id).onWorkerThreadForTest(0, [](Worker& w) { return w.clusterFeatureLevelForTest(); }) >= rune::replication::MetadataFeature::kCheckedWrites;
+            ASSERT_TRUE(raised) << "node " << id << " never reached the checked-writes feature level";
+        }
+        std::ifstream in(std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql");
+        ASSERT_TRUE(in.good());
+        std::stringstream script;
+        script << in.rdbuf();
+        const std::string ep = "127.0.0.1:" + std::to_string(c_.ports.client[static_cast<std::size_t>(ctl - 1)]);
+        for (std::string st : rune::cli::engine::splitStatements(script.str())) {
+            if (st.starts_with("topic character "))
+                st.replace(st.find("with (cleanup.policy = compact)"), std::string_view("with (cleanup.policy = compact)").size(),
+                           "with (cleanup.policy = compact, segment.bytes = 65536, min.compaction.lag.ms = 100, min.cleanable.dirty.ratio = 0.000001, file.delete.delay.ms = 50)");
+            std::stringstream o, e;
+            ASSERT_EQ(rune::cli::run({"ql", "-e", st, "--broker", ep, "--cli-stream-in", std::to_string(tcc::kClientStream)}, o, e), 0) << st << "\n" << e.str();
+        }
+        auto admin = tcc::connectClient(c_, ctl);
+        const auto character = admin->getTopicSchemaAndWait("character", 30s);
+        ASSERT_EQ(character.errorCode, 0);
+        topicId_ = character.topicId;
+        const auto view = admin->createViewAndWait("character_by_id", "characterId", 0, byIdPlan_(topicId_), {}, 60s);
+        ASSERT_EQ(view.errorCode, 0) << view.detail;
+        viewTopicId_ = view.viewTopicId;
+        admin->close();
+        admin.reset();
+        std::vector<int32_t> leaders;
+        ASSERT_TRUE(tcc::awaitLeaders(c_, topicId_, parts_, leaders, 30s));
+        for (const int id : c_.runningNodes()) prepareNode_(id);
+        ASSERT_FALSE(::testing::Test::HasFatalFailure());
+        rebuildWriters_(-1);
+        ASSERT_TRUE(learnConstrainedViews_(0)) << "seed " << seed_ << ": the unique and check plans never reached the log";
+    }
+    [[nodiscard]] std::string regressorsPathTally() const {
+        return std::to_string(sent_.size()) + " writes, " + std::to_string(constraintViolations_) + " ConstraintViolation and " + std::to_string(keyNotFound_) + " KeyNotFound answered, " +
+               std::to_string(loginRaces_) + " login races (" + std::to_string(loginRefusals_) + " refused), " + std::to_string(statsReplaces_) + " account_stats replaces";
+    }
+
     [[nodiscard]] std::string autoIncTally() const {
         std::size_t creates = 0, imports = 0;
         std::size_t updates = 0, removes = 0;
@@ -169,6 +229,16 @@ public:
     void step() {
         const unsigned r = static_cast<unsigned>(rng_() % 100);
         const int down = downNode_();
+        if (rp_) {
+            if (r < 45) sendBurst_(-1);
+            else if (r < 55) raceLogins_();
+            else if (r < 65) raceCreates_();
+            else if (r < 72 && down == 0) crashLeaderDuringSends();
+            else if (r < 84) { if (down != 0) restartNode_(down, false); else restartNonLeader_(); }
+            else if (r < 90) replaceStats_();
+            else std::this_thread::sleep_for(std::chrono::milliseconds(50 + static_cast<int>(rng_() % 150)));   // the cleaner passes
+            return;
+        }
         if (r < 55) {
             sendBurst_(-1);
         } else if (r < 65 && down == 0) {
@@ -392,6 +462,29 @@ private:
         }
     };
 
+    /// RegressorsPath mode: a client with the character and user topics over one All|View producer.
+    struct RpWriter {
+        std::unique_ptr<rune::client::Client> client;
+        std::optional<rune::client::Producer> prod;
+        std::optional<rune::client::TypedTopic<rune::node::test::RpCharacter, rune::client::ProducerRef>> characters;
+        std::optional<rune::client::TypedTopic<rune::node::test::RpUser, rune::client::ProducerRef>> users;
+
+        explicit RpWriter(rune::client::ClientConfig cfg) {
+            client = std::make_unique<rune::client::Client>(cfg);
+            rune::client::ProducerConfig pc;
+            pc.acks = rune::client::Acks::All | rune::client::Acks::View;
+            pc.lingerUs = 1;
+            prod.emplace(client->producer(pc));
+            client->connectAndWait(30s);
+            characters.emplace(client->openTopicAndWait<rune::node::test::RpCharacter>("character", *prod, 30s));
+            users.emplace(client->openTopicAndWait<rune::node::test::RpUser>("user", *prod, 30s));
+        }
+        ~RpWriter() {
+            if (prod) prod->closeImmediately();
+            if (client) client->close();
+        }
+    };
+
     static std::string value_(uint64_t id, int64_t v, uint16_t tag) {
         std::string val;
         const auto le16 = [&](uint16_t x) { val.push_back(static_cast<char>(x)); val.push_back(static_cast<char>(x >> 8)); };
@@ -560,6 +653,7 @@ private:
     void rebuildWriters_(int avoid) {
         writers_.clear();
         kiWriters_.clear();
+        rpWriters_.clear();
         writerSeeds_.clear();
         std::vector<int> seeds;
         for (const int id : c_.runningNodes()) if (id != avoid) seeds.push_back(id);
@@ -567,6 +661,7 @@ private:
         writers_.resize(3);
         kiWriters_.resize(3);
         aiWriters_.resize(3);
+        rpWriters_.resize(3);
         writersStale_ = false;
     }
     /// Built when the slot connects: the config reserves the client's egress port.
@@ -588,8 +683,13 @@ private:
         if (!aiWriters_[i]) aiWriters_[i] = std::make_unique<AiWriter>(writerCfg_(i));
         return *aiWriters_[i];
     }
+    RpWriter& rpWriter_(std::size_t i) {
+        if (!rpWriters_[i]) rpWriters_[i] = std::make_unique<RpWriter>(writerCfg_(i));
+        return *rpWriters_[i];
+    }
     void sendBurst_(int victim) {
         if (writersStale_ || victim > 0) rebuildWriters_(victim);
+        if (rp_) return rpBurst_(victim);
         if (autoInc_) return aiBurst_(victim);
         if (keyIndex_) return kiBurst_(victim);
         Writer& w = writer_(rng_() % writers_.size());
@@ -1305,7 +1405,7 @@ private:
     rune::node::test::catalog_cluster::ThreeNodes& c_;
     std::mt19937_64 rng_;
     uint64_t seed_;
-    bool autoInc_, keyIndex_;
+    bool rp_, autoInc_, keyIndex_;
     int parts_, keys_;
     int32_t topicId_ = -1, viewTopicId_ = -1;
     int32_t capTopic_ = kCapTopicBase, capSeq_ = 0;   // the installed CapLiveKeys view's topic (0 = dropped)
