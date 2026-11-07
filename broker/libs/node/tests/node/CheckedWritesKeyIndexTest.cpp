@@ -271,6 +271,53 @@ TEST(CheckedWritesKeyIndex, FoldReplaysUnjudgedAndSkips) {
     EXPECT_EQ(liveSet(torn), (std::set<int64_t>{1, 2, 3}));
 }
 
+TEST(CheckedWritesTxnOverlay, ChainedKeyIndexInsertThenUpdate) {
+    rune::view::ViewTable table(keyIndexRowLayout(), 4096, kKeyIndexChunkBytes);
+    rune::view::Prospect p;
+    p.reserve(keyIndexRowLayout(), nullptr);
+    rune::view::TxnOverlay chain;
+    chain.reserve(8, 1);
+    const std::string k(8, '\x07'), v(4, 'x');
+    const KeyIndexFold f{table, 8};
+    const auto prepare = [&](uint8_t intent, rune::view::TxnOverlay* ch, const rune::view::SourceRecord& base) {
+        rune::view::SourceRecord rec = base;
+        rec.intent = intent;
+        return prepareKeyIndex(f, rec, p, ch);
+    };
+    const rune::view::SourceRecord base{k, v, 0, 0, nullptr};
+
+    ASSERT_EQ(prepare(kInsert, &chain, base), rune::view::PrepareStatus::Ok);
+    EXPECT_FALSE(p.rows[0].existed);
+    EXPECT_TRUE(evaluateIntent(base, p).accepted());
+    ASSERT_EQ(prepare(kExisting, &chain, base), rune::view::PrepareStatus::Ok);   // the key exists in the chain
+    EXPECT_TRUE(p.rows[0].existed);
+    {
+        rune::view::SourceRecord rec = base;
+        rec.intent = kExisting;
+        EXPECT_TRUE(evaluateIntent(rec, p).accepted());
+    }
+    EXPECT_EQ(table.size(), 0u);
+
+    // Without the chain the key is absent; a second insert in the chain is KeyExists.
+    ASSERT_EQ(prepare(kExisting, nullptr, base), rune::view::PrepareStatus::Ok);
+    EXPECT_FALSE(p.rows[0].existed);
+    ASSERT_EQ(prepare(kInsert, &chain, base), rune::view::PrepareStatus::Ok);
+    EXPECT_TRUE(p.rows[0].existed);
+
+    // A held overlay locks the key for everyone else.
+    rune::view::TxnLockSet locks;
+    locks.locked[0] = &chain;
+    locks.count = 1;
+    const KeyIndexFold locked{table, 8, 0, &locks};
+    EXPECT_EQ(prepareKeyIndex(locked, base, p), rune::view::PrepareStatus::Locked);
+    // A chained delete of an absent key locks it too, so an outside insert cannot overtake the transaction's delete.
+    const std::string gone(8, '\x09');
+    ASSERT_EQ(prepareKeyIndex(f, {gone, {}, 0, 0, nullptr}, p, &chain), rune::view::PrepareStatus::Ok);
+    EXPECT_EQ(prepareKeyIndex(locked, {gone, v, 0, 0, nullptr}, p), rune::view::PrepareStatus::Locked);
+    const std::string other(8, '\x08');
+    EXPECT_EQ(prepareKeyIndex(locked, {other, v, 0, 0, nullptr}, p), rune::view::PrepareStatus::Ok);
+}
+
 TEST(CheckedWritesKeyIndex, TombstoneIsNeverRejectedByAnOffsetRule) {
     Rig r(false);
     TestRejectRule rule;

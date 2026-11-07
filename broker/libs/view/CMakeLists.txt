@@ -10,7 +10,8 @@ add_library(rune_view STATIC
     src/PlanSources.cpp
     src/KeyedFold.cpp
     src/CheckEval.cpp
-    src/UniqueClaims.cpp)
+    src/UniqueClaims.cpp
+    src/TxnOverlay.cpp)
 target_include_directories(rune_view PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${RUNE_PROTOCOL_INCLUDE}
@@ -41,6 +42,7 @@ if(BUILD_TESTING)
         tests/view/CheckedWritesKeyedAggTest.cpp
         tests/view/CheckedWritesCheckEvalTest.cpp
         tests/view/CheckedWritesUniqueFoldTest.cpp
+        tests/view/CheckedWritesTxnOverlayTest.cpp
         ../node/tests/support/AllocWindow.cpp)
     target_include_directories(rune_view_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../node/tests/support)
     target_link_libraries(rune_view_tests PRIVATE rune_view rune_codec GTest::gtest_main)

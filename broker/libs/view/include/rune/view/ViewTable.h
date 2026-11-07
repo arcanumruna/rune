@@ -178,6 +178,7 @@ public:
     [[nodiscard]] std::size_t prefixPoolChunksForTest() const noexcept { return poolChunks_.size(); }
 
     [[nodiscard]] uint8_t keyWidth() const noexcept { return keyWidth_; }
+    [[nodiscard]] uint32_t rowLen() const noexcept { return layout_.rowLen; }
     [[nodiscard]] uint8_t prefixWidth() const noexcept { return prefixWidth_; }
     [[nodiscard]] uint64_t hashSeedForTest() const noexcept { return hashSeed_; }
 

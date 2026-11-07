@@ -9,6 +9,7 @@
 #include <string_view>
 
 #include <rune/codec/PrimType.h>
+#include <rune/view/TxnOverlay.h>
 #include <rune/view/ViewKey.h>
 #include <rune/view/ViewRow.h>
 #include <rune/view/ViewTable.h>
@@ -26,19 +27,20 @@ public:
     UniqueClaims(uint16_t keyWidth, uint8_t wireWidth, uint32_t rowLen, rune::codec::PrimType sourceKeyType, uint64_t hashSeed,
                  std::size_t indexSlots = 4096, std::size_t chunkBytes = 32u << 20);   // cold
 
-    // Pointers into the tables are valid until the next mutation.
-    [[nodiscard]] const uint8_t* ownerOf(const ViewKey& n) const noexcept;               // owner wire bytes, nullptr = no row
-    [[nodiscard]] const uint8_t* extraKeyOf(std::string_view wire) const noexcept;       // N this wire is an extra of
-    [[nodiscard]] bool hasExtras(const ViewKey& n) const noexcept;
+    // Pointers into the tables are valid until the next mutation.  With `x` the tables are seen through its chain and lock set, and a chain
+    // takes the writes (the extras gauge is the tables' own and does not move).
+    [[nodiscard]] const uint8_t* ownerOf(const ViewKey& n, TxnAccess* x = nullptr) const noexcept;               // owner wire bytes, nullptr = no row
+    [[nodiscard]] const uint8_t* extraKeyOf(std::string_view wire, TxnAccess* x = nullptr) const noexcept;       // N this wire is an extra of
+    [[nodiscard]] bool hasExtras(const ViewKey& n, TxnAccess* x = nullptr) const noexcept;
     [[nodiscard]] int compare(std::string_view a, std::string_view b) const noexcept { return compareSourceKeys(keyType_, a, b); }
     [[nodiscard]] std::size_t extras() const noexcept { return extras_; }                // the uniqueConflicts gauge
 
-    void setOwner(const ViewKey& n, std::string_view wire) noexcept;
-    void eraseOwner(const ViewKey& n) noexcept;
-    void addExtra(const ViewKey& n, std::string_view wire, const uint8_t* image) noexcept;
-    void updateExtraImage(std::string_view wire, const uint8_t* image) noexcept;
-    void removeExtra(std::string_view wire) noexcept;   // no-op for a wire that is not an extra
-    [[nodiscard]] bool smallestExtra(const ViewKey& n, std::string_view& wire, const uint8_t*& image) const noexcept;
+    void setOwner(const ViewKey& n, std::string_view wire, TxnAccess* x = nullptr) noexcept;
+    void eraseOwner(const ViewKey& n, TxnAccess* x = nullptr) noexcept;
+    void addExtra(const ViewKey& n, std::string_view wire, const uint8_t* image, TxnAccess* x = nullptr) noexcept;
+    void updateExtraImage(std::string_view wire, const uint8_t* image, TxnAccess* x = nullptr) noexcept;
+    void removeExtra(std::string_view wire, TxnAccess* x = nullptr) noexcept;   // no-op for a wire that is not an extra
+    [[nodiscard]] bool smallestExtra(const ViewKey& n, std::string_view& wire, const uint8_t*& image, TxnAccess* x = nullptr) const noexcept;
 
     ViewTable& indexTable() noexcept { return index_; }     // checkpoint v3 table 6
     ViewTable& extrasTable() noexcept { return extrasTable_; }   // checkpoint v3 table 7
@@ -47,6 +49,8 @@ public:
     void recountAfterReplay() noexcept { extras_ = extrasTable_.size(); }   // cold
 
 private:
+    [[nodiscard]] TxnTable index(TxnAccess* x) const noexcept { return TxnTable(const_cast<ViewTable*>(&index_), OverlayTable::ClaimsIndex, x); }
+    [[nodiscard]] TxnTable extrasOf(TxnAccess* x) const noexcept { return TxnTable(const_cast<ViewTable*>(&extrasTable_), OverlayTable::ClaimsExtras, x); }
     // index payload:  [ownerWire W][extraCount u32][headExtra W][flags u8: bit0 = has head]
     // extras payload: [N K][prev W][next W][links u8: bit0 prev, bit1 next][image rowLen]
     [[nodiscard]] std::size_t countAt() const noexcept { return wireWidth_; }

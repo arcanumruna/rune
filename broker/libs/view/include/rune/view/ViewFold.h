@@ -13,6 +13,7 @@
 #include <rune/view/FoldStats.h>
 #include <rune/view/KeyedFold.h>
 #include <rune/view/RecordFold.h>
+#include <rune/view/TxnOverlay.h>
 #include <rune/view/UniqueClaims.h>
 #include <rune/view/ViewPlan.h>
 #include <rune/view/ViewRow.h>
@@ -86,13 +87,16 @@ struct ProjectionFold {
     const KeyedFoldSpec*     keyed  = nullptr;   // null for a LegacyU64 plan
     ViewTable*               owners = nullptr;   // keyed and owner-mapped: wire key -> current view key
     UniqueClaims*            claims = nullptr;   // unique and owner-mapped: owner and extra claimants per view key
+    uint8_t                  member = 0;         // this view's id within the judge's set, for TxnOverlay keys
+    const TxnLockSet*        locks  = nullptr;   // rows held by other transactions: a prepare that touches one is Locked
 };
 
 // The view key column's type, for building a ProjectionFold / AggregateFold.
 [[nodiscard]] rune::codec::PrimType viewKeyType(const CompiledViewPlan& plan) noexcept;
 
-// Computes the record's prospective row into `p` without touching the table.
-[[nodiscard]] PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p) noexcept;
+// Computes the record's prospective row into `p` without touching the table.  With `chain` the reads go chain-first and the record's
+// effect is written into the chain (nothing else changes); a Locked or CapacityExhausted result leaves the chain unspecified.
+[[nodiscard]] PrepareStatus prepareProjection(ProjectionFold& f, const SourceRecord& rec, Prospect& p, TxnOverlay* chain = nullptr) noexcept;
 // Commits a prepared record.
 void applyProjection(ProjectionFold& f, const SourceRecord& rec, const Prospect& p) noexcept;
 
