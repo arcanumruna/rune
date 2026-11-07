@@ -1,14 +1,17 @@
 // CheckedWritesQlBrokerRegressionTest.cpp - checked writes Part 08 Task 10: the REAL `rune` CLI (rune::cli::run) against REAL
-// brokers on the shard runtime.  The RegressorsPath DDL (unique and check refused until Part 09), select, show, stats and
+// brokers on the shard runtime.  The RegressorsPath DDL (unique and check views included), select, show, stats and
 // lower() literals.  Every wait is bounded.
 #include "client/ClusterClient.h"
 #include "client/OneBroker.h"
+#include "client/support/RegressorsPathRecords.h"
 #include "support/CatalogBrokerCluster.h"
 
 #include <QlEngine.h>
 #include <rune/cli/Cli.h>
 #include <rune/client/Client.h>
 #include <rune/client/producer/Producer.h>
+#include <rune/ql/Backends.h>
+#include <rune/ql/Parser.h>
 
 #include <gtest/gtest.h>
 
@@ -16,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -229,51 +233,67 @@ bool qlEventually(const std::string& endpoint, const std::string& text, std::str
 
 }  // namespace
 
-// The acceptance case: every statement of the RegressorsPath script, one `rune ql -e` each.  Part 09 flips the two refusal rows.
-TEST(CheckedWritesQlBrokerRegression, RegressorsPathOutcomesBeforePart09ThreeNodesRegression) {
+// The acceptance case: every statement of the RegressorsPath script, one `rune ql -e` each, then the whole script with `-f` on a fresh cluster.
+TEST(CheckedWritesQlBrokerRegression, RegressorsPathOutcomesThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    std::ifstream in(std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql");
+    const std::string golden = std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql";
+    std::ifstream in(golden);
     ASSERT_TRUE(in.good());
     std::stringstream script;
     script << in.rdbuf();
     const std::vector<std::string> statements = rune::cli::engine::splitStatements(script.str());
     ASSERT_EQ(statements.size(), 7u);
 
-    ThreeNodes c = ThreeNodes::start("cw08");
+    {
+        ThreeNodes c = ThreeNodes::start("cw09_ql");
+        ASSERT_TRUE(c.awaitCatalogLeader(30s));
+        for (const int id : c.runningNodes()) awaitLevel(c.node(id));
+        ASSERT_FALSE(HasFatalFailure());
+        const std::string ep = clusterEndpoint(c, 1);
+        for (std::size_t i = 0; i < statements.size(); ++i) {
+            std::string out, err;
+            EXPECT_EQ(ql(ep, statements[i], &out, &err), 0) << "statement " << i << ": " << statements[i] << "\n" << err;
+            EXPECT_TRUE(err.empty()) << "statement " << i << ": " << err;
+        }
+        std::string out, err;
+        ASSERT_EQ(ql(ep, "show topic user;", &out, &err), 0) << err;
+        EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
+        EXPECT_NE(out.find("key.index on"), std::string::npos) << out;
+        EXPECT_NE(out.find("autoincrement on (reserve 4096, max 9007199254740991)"), std::string::npos) << out;
+        EXPECT_NE(out.find("partitioner modulo"), std::string::npos) << out;
+        EXPECT_NE(out.find("autoIncrementCounter 1"), std::string::npos) << out;
+        ASSERT_EQ(ql(ep, "show topic character;", &out, &err), 0) << err;
+        EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
+        ASSERT_EQ(ql(ep, "show view device_history;", &out, &err), 0) << err;
+        EXPECT_NE(out.find("keyspec (userId, deviceFp)"), std::string::npos) << out;
+        EXPECT_NE(out.find("group by (userId, deviceFp)"), std::string::npos) << out;
+    }
+
+    ThreeNodes c = ThreeNodes::start("cw09_ql_f");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     for (const int id : c.runningNodes()) awaitLevel(c.node(id));
     ASSERT_FALSE(HasFatalFailure());
-    const std::string ep = clusterEndpoint(c, 1);
-
-    struct Expect { int exit; const char* err; };
-    const Expect expected[] = {
-        {0, nullptr},                                                                       // user
-        {1, "ViewUniqueInvalid (61) unique views are not available yet"},                   // user_identity
-        {0, nullptr},                                                                       // device_login
-        {0, nullptr},                                                                       // device_history
-        {0, nullptr},                                                                       // character
-        {1, "ViewUniqueInvalid (61) unique views are not available yet"},                   // character_name
-        {1, "ViewConstraintInvalid (60) check constraints are not available yet"},          // account_stats
-    };
-    for (std::size_t i = 0; i < statements.size(); ++i) {
-        std::string out, err;
-        EXPECT_EQ(ql(ep, statements[i], &out, &err), expected[i].exit) << "statement " << i << ": " << statements[i] << "\n" << err;
-        if (expected[i].err != nullptr) EXPECT_EQ(err, std::string("rune: ") + expected[i].err + "\n") << "statement " << i;
-        else EXPECT_TRUE(err.empty()) << "statement " << i << ": " << err;
-    }
-
     std::string out, err;
-    ASSERT_EQ(ql(ep, "show topic user;", &out, &err), 0) << err;
-    EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
-    EXPECT_NE(out.find("key.index on"), std::string::npos) << out;
-    EXPECT_NE(out.find("autoincrement on (reserve 4096, max 9007199254740991)"), std::string::npos) << out;
-    EXPECT_NE(out.find("partitioner modulo"), std::string::npos) << out;
-    EXPECT_NE(out.find("autoIncrementCounter 1"), std::string::npos) << out;
-    ASSERT_EQ(ql(ep, "show topic character;", &out, &err), 0) << err;
-    EXPECT_NE(out.find("partitions 1"), std::string::npos) << out;
-    ASSERT_EQ(ql(ep, "show view device_history;", &out, &err), 0) << err;
-    EXPECT_NE(out.find("keyspec (userId, deviceFp)"), std::string::npos) << out;
-    EXPECT_NE(out.find("group by (userId, deviceFp)"), std::string::npos) << out;
+    EXPECT_EQ(runCli({"ql", "-f", golden, "--broker", clusterEndpoint(c, 1)}, &out, &err), 0) << err;
+}
+
+// The record types of the RegressorsPath tests are the golden script's topics: the fingerprints match, without a broker.
+TEST(CheckedWritesQlBrokerRegression, RegressorsPathRecordFingerprintsMatchTheGoldenScript) {
+    std::ifstream in(std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql");
+    ASSERT_TRUE(in.good());
+    std::stringstream script;
+    script << in.rdbuf();
+    std::map<std::string, uint64_t> golden;
+    for (const std::string& statement : rune::cli::engine::splitStatements(script.str())) {
+        const auto parsed = rune::ql::parse(statement);
+        ASSERT_TRUE(parsed.has_value()) << statement;
+        if (const auto* topic = std::get_if<rune::ql::TopicDef>(&*parsed))
+            golden[topic->name] = rune::codec::fingerprint(rune::ql::toDescriptor(*topic));
+    }
+    ASSERT_TRUE(golden.contains("user"));
+    ASSERT_TRUE(golden.contains("character"));
+    EXPECT_EQ(golden["user"], RpUser::kFingerprint);
+    EXPECT_EQ(golden["character"], RpCharacter::kFingerprint);
 }
 
 // R08a: an aggregate over a per-login key counts every login.
