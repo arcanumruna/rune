@@ -396,7 +396,7 @@ TEST(CatalogEventRegression, OpsLengthDisagreeingWithItsBodyIsRefused) {
 
 // ── value refusals: encode refuses EXACTLY what decode refuses (one validation) ─
 TEST(CatalogEventRegression, UnknownFormatVersionIsRefusedByEncodeAndDecode) {
-    for (const uint16_t v : {uint16_t{0}, uint16_t{4}, uint16_t{0xFFFF}}) {   // 1, 2 and 3 are the known formats
+    for (const uint16_t v : {uint16_t{0}, uint16_t{5}, uint16_t{0xFFFF}}) {   // 1..4 are the known formats
         auto b = rc::encode(baseEvent(rc::DropTopicOps{.topicId = 1})).value();
         putU16(b, 0, v);
         auto d = rc::decode(b);
@@ -493,7 +493,7 @@ std::vector<BadValueCase> badValueCases() {
         {"CreateSchema.schema.validate=2 (bool)", 3, "schema.validate", 2, nullptr},
         {"hasReplayedFrom=2 (bool)", 1, "hasReplayedFrom", 2, nullptr},
         {"ConfigKey=0", 2, "change0.key", 0, [](auto& e) { opsOf<rc::AlterTopicConfigOps>(e).changes[0].key = rc::ConfigKey{0}; }},
-        {"ConfigKey=7", 2, "change5.key", 7, [](auto& e) { opsOf<rc::AlterTopicConfigOps>(e).changes[5].key = rc::ConfigKey{7}; }},
+        {"ConfigKey=13", 2, "change5.key", 13, [](auto& e) { opsOf<rc::AlterTopicConfigOps>(e).changes[5].key = rc::ConfigKey{13}; }},   // 7..12 are the lease keys (formatVer 4)
         {"AlterOpType=0", 4, "alterOp0.type", 0, [](auto& e) { opsOf<rc::AlterSchemaOps>(e).ops[0].type = AlterOpType{0}; }},
         {"AlterOpType=5", 4, "alterOp1.type", 5, [](auto& e) { opsOf<rc::AlterSchemaOps>(e).ops[1].type = AlterOpType{5}; }},
         {"PrimType=11", 4, "alterOp0.primType", 11, [](auto& e) { opsOf<rc::AlterSchemaOps>(e).ops[0].primType = PrimType{11}; }},

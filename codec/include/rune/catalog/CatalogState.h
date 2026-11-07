@@ -41,14 +41,20 @@ struct TopicObject {
     TopicConfig                config;
     std::optional<SchemaState> schema;
     uint32_t                   nsId              = 0;    // the namespace that owns this topic (names are per-namespace)
+    std::optional<rune::protocol::LeaseSpec> lease;      // formatVer 4: a lease topic (its lease view is `<name>.leases`)
     bool operator==(const TopicObject&) const = default;
 };
+/// Plan: a view made by CreateView.  LeaseIndex: the view a lease CreateTopic creates beside its topic (formatVer 4);
+/// it is dropped with that topic and refuses DropView / AlterView.
+enum class ViewKind : uint8_t { Plan = 0, LeaseIndex = 1 };
 struct ViewObject {
     uint64_t    objectId = 0;
     std::string name;
     uint32_t    version  = 0;
     ViewDef     def;
     uint32_t    nsId     = 0;
+    ViewKind    kind     = ViewKind::Plan;
+    uint64_t    leaseTopicObjectId = 0;   // kind == LeaseIndex: the lease topic that owns this view
     bool operator==(const ViewObject&) const = default;
 };
 struct Tombstone {
@@ -68,6 +74,8 @@ struct Applied {
     int32_t   droppedTopicId = -1;   // DropTopic / DropView / AlterView: the retired (sink) topic id
     uint32_t  nsId           = 0;    // the event's namespace (the subject, for a namespace kind)
     bool      nsErased       = false;   // this event completed a DELETING namespace and it left the registry
+    uint64_t  leaseViewObjectId = 0;    // a lease CreateTopic: the created lease view; a DropTopic of a lease topic: the dropped one; else 0
+    int32_t   leaseViewTopicId  = -1;   // that view's sink topic id; else -1
 };
 /// What an applied DDL answered — replayed to a retry with the same requestId (ruling 9).
 struct RequestRecord {
@@ -113,6 +121,7 @@ void applyConfigChanges(TopicConfig& c, const AlterTopicConfigOps& o) noexcept;
 
 struct ApplyV1;   // src/catalog/ApplyV1.h — the formatVer-1 rules (object kinds; shared with formatVer 2)
 struct ApplyV2;   // src/catalog/ApplyV2.cpp — formatVer 2: the namespace kinds and the namespace gate
+struct ApplyV4;   // src/catalog/ApplyV4.cpp — formatVer 4: lease topics (the lease view, the lease.* keys)
 
 class CatalogState {
 public:
@@ -135,6 +144,8 @@ public:
     /// A live topic or view name of namespace `nsId` that differs from `n` only in ASCII letter case (two such
     /// names would share one directory on a case-insensitive filesystem); nullptr: none.
     [[nodiscard]] const std::string* liveNameFoldingOnto(uint32_t nsId, std::string_view n) const;
+    /// The lease view of the lease topic `topicObjectId` (nullptr: the topic has none, or does not exist).
+    [[nodiscard]] const ViewObject* leaseViewOf(uint64_t topicObjectId) const;
     /// A live view of namespace `nsId` whose sources include `topicName` (nullptr: none).
     [[nodiscard]] const ViewObject* viewReading(uint32_t nsId, std::string_view topicName) const;
     /// The namespaces (nsId 0 `default` is predefined).  Mutated only by formatVer-2 apply.
@@ -154,7 +165,9 @@ public:
     /// object's fingerprint (CatalogFingerprint.h) in objectId order, then each tombstone's
     /// in apply order; an object or tombstone of a namespace other than 0 hashes
     /// objectFingerprintV2(fingerprint, nsId) instead (so a state that only ever used `default` keeps the digest
-    /// it had before namespaces existed).  Then, only when namespaces left a trace: nextNsId (if > 1) and each
+    /// it had before namespaces existed).  A lease topic (formatVer 4) also mixes its encoded LeaseSpec after its
+    /// fingerprint, and a lease view contributes ApplyV4::leaseViewFingerprint; a state without a lease hashes as before.
+    /// Then, only when namespaces left a trace: nextNsId (if > 1) and each
     /// namespace record's fingerprint (every namespace but a never-changed `default`).  NOT hashed: which objectId / topicId / viewTopicId each object holds,
     /// a view's compiledPlanBlob (fingerprints are id-free, ruling 11) and the request
     /// records.  So equal digests at equal offsets mean equal definitions, counters and
@@ -164,6 +177,7 @@ public:
 private:
     friend struct ApplyV1;   // src/catalog/ApplyV1.cpp — mutators (via apply())
     friend struct ApplyV2;   // src/catalog/ApplyV2.cpp — the namespace registry
+    friend struct ApplyV4;   // src/catalog/ApplyV4.cpp — the lease view
     std::map<uint64_t, TopicObject>               topics_;        // objectId → object (ordered: digest order)
     std::map<uint64_t, ViewObject>                views_;
     std::map<NsKey, uint64_t, NsKeyLess>          topicNames_;    // live (nsId, topic name) → objectId

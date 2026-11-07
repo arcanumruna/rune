@@ -15,12 +15,12 @@ using wire::Writer;
 static_assert(kMaxStr16Bytes == 0xFFFF && kMaxStr32Bytes == 0xFFFF'FFFF && kMaxListCount == 0xFFFF,
               "formatVer-1 wire widths are frozen: u16 / u32 length prefixes, u16 list counts (formatVer 2 keeps them)");
 
-// ── THE validation (formatVer 1, 2 and 3) ───────────────────────────────────────────
+// ── THE validation (formatVer 1..4) ───────────────────────────────────────────
 // One set of value rules, run by BOTH directions: encodeInto refuses exactly what decode
 // refuses, so no event the decoder would reject can ever be appended to __catalog.
 // (Byte-level refusals — Truncated, TrailingBytes, a bool byte other than 0/1 — have no
 // in-memory counterpart: the encoder cannot produce them.)
-enum class Violation : uint8_t { UnknownFormatVer, ReservedKind, UnknownKind, KindOpsMismatch, BadEnum, NeedsFormatV3 };
+enum class Violation : uint8_t { UnknownFormatVer, ReservedKind, UnknownKind, KindOpsMismatch, BadEnum, NeedsFormatV3, NeedsFormatV4 };
 
 constexpr bool validPersistence(Persistence p) noexcept { return static_cast<uint8_t>(p) <= 1; }
 constexpr bool validCleanupPolicy(uint8_t v) noexcept  { return v <= wire::kMaxCleanupPolicy; }
@@ -44,7 +44,7 @@ constexpr bool validCompatMode(rune::codec::CompatMode m) noexcept {
 constexpr bool validNsStateTag(NsStateTag t) noexcept { return static_cast<uint8_t>(t) <= static_cast<uint8_t>(NsStateTag::Deleting); }
 
 std::optional<Violation> checkFormatVer(uint16_t v) noexcept {
-    if (v != kFormatV1 && v != kFormatV2 && v != kFormatV3) return Violation::UnknownFormatVer;
+    if (v != kFormatV1 && v != kFormatV2 && v != kFormatV3 && v != kFormatV4) return Violation::UnknownFormatVer;
     return std::nullopt;
 }
 /// formatVer 1 refuses the whole reserved range 32..63; formatVer 2 accepts the namespace kinds 32..36 and
@@ -66,6 +66,19 @@ bool defaultKeyFeatures(const Ops& ops) noexcept {
     if (const auto* t = std::get_if<CreateTopicOps>(&ops)) return !t->schema || t->schema->keyFeatures == defaults;
     if (const auto* c = std::get_if<CreateSchemaOps>(&ops)) return c->schema.keyFeatures == defaults;
     return true;
+}
+/// A v1..v3 event must carry no lease and no lease.* key.
+bool leaseFree(const Ops& ops) noexcept {
+    if (const auto* t = std::get_if<CreateTopicOps>(&ops)) return !t->lease;
+    if (const auto* a = std::get_if<AlterTopicConfigOps>(&ops)) {
+        for (const auto& c : a->changes)
+            if (static_cast<uint8_t>(c.key) > static_cast<uint8_t>(rune::protocol::kLastConfigKeyV3)) return false;
+    }
+    return true;
+}
+bool validLease(const Ops& ops) noexcept {
+    const auto* t = std::get_if<CreateTopicOps>(&ops);
+    return t == nullptr || !t->lease || !rune::protocol::validateLeaseSpec(*t->lease);
 }
 bool validConfig(const TopicConfig& c) noexcept {
     return validCleanupPolicy(c.cleanupPolicy) && validDurability(c.durability) && validDurabilityTier(c.durabilityTier);
@@ -104,6 +117,8 @@ std::optional<Violation> validate(const CatalogEvent& e) noexcept {
     if (e.formatVer == kFormatV1 && e.nsId != 0) return Violation::BadEnum;   // v1 has no nsId field
     if (!validOps(e.ops)) return Violation::BadEnum;
     if (e.formatVer < kFormatV3 && !defaultKeyFeatures(e.ops)) return Violation::NeedsFormatV3;
+    if (e.formatVer < kFormatV4 && !leaseFree(e.ops)) return Violation::NeedsFormatV4;
+    if (!validLease(e.ops)) return Violation::BadEnum;   // formatVer 4 only: older formats refused above
     return std::nullopt;
 }
 DecodeError asDecodeError(Violation v) noexcept {
@@ -113,7 +128,8 @@ DecodeError asDecodeError(Violation v) noexcept {
     case Violation::UnknownKind:      return DecodeError::UnknownKind;
     case Violation::KindOpsMismatch:  return DecodeError::KindOpsMismatch;
     case Violation::BadEnum:
-    case Violation::NeedsFormatV3:    return DecodeError::BadEnum;   // unreachable: a v1 / v2 body has no key block
+    case Violation::NeedsFormatV3:    // unreachable: a v1 / v2 body has no key block
+    case Violation::NeedsFormatV4:    return DecodeError::BadEnum;   // unreachable: a v1..v3 body has no lease trailer
     }
     return DecodeError::BadEnum;
 }
@@ -125,6 +141,7 @@ EncodeError asEncodeError(Violation v) noexcept {
     case Violation::KindOpsMismatch:  return EncodeError::KindOpsMismatch;
     case Violation::BadEnum:          return EncodeError::BadEnum;
     case Violation::NeedsFormatV3:    return EncodeError::NeedsFormatV3;
+    case Violation::NeedsFormatV4:    return EncodeError::NeedsFormatV4;
     }
     return EncodeError::BadEnum;
 }
@@ -165,6 +182,14 @@ void putOps(Writer& w, const Ops& ops, uint16_t formatVer) {
             w.e8(o.persistence); putConfig(w, o.config);
             w.u8(o.schema ? 1 : 0);
             if (o.schema) putSchema(w, *o.schema, formatVer);
+            if (formatVer >= kFormatV4) {
+                w.u8(o.lease ? 1 : 0);
+                if (o.lease) {
+                    uint8_t block[rune::protocol::kLeaseSpecBytes];
+                    rune::protocol::encodeLeaseSpec(*o.lease, block);
+                    w.raw(std::span<const uint8_t>(block, sizeof block));
+                }
+            }
         } else if constexpr (std::is_same_v<T, DropTopicOps>) {
             w.i32(o.topicId);
         } else if constexpr (std::is_same_v<T, AlterTopicConfigOps>) {
@@ -255,6 +280,17 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind, uint16_t forma
         bool has = false;
         if (auto e = getBool(r, has)) return std::unexpected(*e);
         if (has) { SchemaDef s; if (auto e = getSchema(r, s, formatVer)) return std::unexpected(*e); o.schema = std::move(s); }
+        if (formatVer >= kFormatV4) {
+            bool hasLease = false;
+            if (auto e = getBool(r, hasLease)) return std::unexpected(*e);
+            if (hasLease) {
+                uint8_t block[rune::protocol::kLeaseSpecBytes];
+                if (!r.raw(block, sizeof block)) return std::unexpected(DecodeError::Truncated);
+                rune::protocol::LeaseSpec spec;
+                if (!rune::protocol::decodeLeaseSpec(block, sizeof block, spec)) return std::unexpected(DecodeError::BadEnum);
+                o.lease = spec;
+            }
+        }
         return o;
     }
     case EventKind::DropTopic: { DropTopicOps o; if (!r.i32(o.topicId)) return std::unexpected(DecodeError::Truncated); return o; }
@@ -402,6 +438,7 @@ std::string_view encodeErrorName(EncodeError e) noexcept {
     case EncodeError::UnknownKind: return "UnknownKind"; case EncodeError::KindOpsMismatch: return "KindOpsMismatch";
     case EncodeError::BadEnum: return "BadEnum";
     case EncodeError::NeedsFormatV3: return "NeedsFormatV3";
+    case EncodeError::NeedsFormatV4: return "NeedsFormatV4";
     }
     return "?";
 }

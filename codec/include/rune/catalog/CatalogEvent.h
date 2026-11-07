@@ -12,6 +12,10 @@
 // (CreateTopic with a schema, CreateSchema).  The broker writes kFormatV3 once the cluster feature level reaches 5 (kCheckedWrites),
 // else kCurrentFormatVer (formatVer 2); it never writes formatVer 1.
 //
+// formatVer 4 (lease topics) is formatVer 3 plus a trailing `u8 hasLease [39-byte rune::protocol::encodeLeaseSpec block]`
+// after the schema in every CreateTopic body (the byte is always written), and the lease.* AlterTopicConfig keys (7..12).
+// The broker picks the version by feature level; kCurrentFormatVer stays formatVer 2.
+//
 // formatVer-1 layout (all little-endian, written and read byte-wise — host-endian independent):
 //   u16 formatVer | u16 kind | u64 objectId | u32 prevVersion | u32 newVersion |
 //   i64 timestampMs | u64 fingerprint |
@@ -27,6 +31,7 @@
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/PrimType.h>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/LeaseSpec.h>
 #include <rune/protocol/NamespaceLimits.h>
 
 #include <array>
@@ -54,8 +59,9 @@ enum class EventKind : uint16_t {
 inline constexpr uint16_t kFormatV1          = 1;
 inline constexpr uint16_t kFormatV2          = 2;
 inline constexpr uint16_t kFormatV3          = 3;
+inline constexpr uint16_t kFormatV4          = 4;
 inline constexpr uint16_t kCurrentFormatVer  = kFormatV2;
-/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2 and 3 accept 32..36 and refuse 37..63.
+/// Kinds 32..63 are reserved: formatVer 1 refuses all of them, formatVer 2..4 accept 32..36 and refuse 37..63.
 inline constexpr uint16_t kReservedKindFirst = 32;
 inline constexpr uint16_t kReservedKindLast  = 63;
 inline constexpr uint16_t kLastNamespaceKind = 36;
@@ -102,6 +108,7 @@ struct CreateTopicOps {
     Persistence              persistence       = Persistence::Disk;
     TopicConfig              config;
     std::optional<SchemaDef> schema;                    // nullopt = untyped topic
+    std::optional<rune::protocol::LeaseSpec> lease;     // formatVer 4: a lease topic; v1..v3 must keep nullopt
     bool operator==(const CreateTopicOps&) const = default;
 };
 struct DropTopicOps        { int32_t topicId = -1;                bool operator==(const DropTopicOps&) const = default; };
@@ -255,19 +262,20 @@ inline constexpr std::size_t kMaxListCount  = 0xFFFF;
 enum class EncodeError : uint8_t {
     FieldTooLong,      // a string / blob (or the ops blob) exceeds its length prefix's width
     TooManyElements,   // a list exceeds its u16 count
-    UnknownFormatVer,  // formatVer not 1, 2 or 3            (decode: UnknownFormatVer)
-    ReservedKind,      // v1: kind in [32, 63]; v2, v3: [37, 63] (decode: ReservedKind)
+    UnknownFormatVer,  // formatVer not 1..4                 (decode: UnknownFormatVer)
+    ReservedKind,      // v1: kind in [32, 63]; v2..v4: [37, 63] (decode: ReservedKind)
     UnknownKind,       // kind not 1..9 and not reserved    (decode: UnknownKind)
     KindOpsMismatch,   // kind != kindOf(ops)               (decode: KindOpsMismatch)
     BadEnum,           // an enum field outside its range, or a v1 event with nsId != 0 (decode: BadEnum)
     NeedsFormatV3,     // a v1 / v2 event with non-default keyFeatures (a decoder never produces one)
+    NeedsFormatV4,     // a v1..v3 event with a lease or a lease.* config key (a decoder never produces one)
 };
 
 [[nodiscard]] EventKind kindOf(const Ops& ops) noexcept;
 /// Clears `out` and encodes into it, reusing its capacity.  On error `out` is left empty.
 [[nodiscard]] std::expected<void, EncodeError> encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out);
 [[nodiscard]] std::expected<std::vector<uint8_t>, EncodeError> encode(const CatalogEvent& e);
-/// Bounds-checked decode of one formatVer-1, -2 or -3 event; the same validation as encode, plus the
+/// Bounds-checked decode of one formatVer-1, -2, -3 or -4 event; the same validation as encode, plus the
 /// byte-level refusals (Truncated, TrailingBytes, a bool byte other than 0/1 → BadEnum).
 [[nodiscard]] std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) noexcept;
 [[nodiscard]] std::string_view kindName(EventKind k) noexcept;

@@ -81,4 +81,17 @@ inline constexpr uint64_t kAutoIncV3Digests[] = {
     0x2eb08771bce68f1cull,   // offset 3 AlterTopicConfig
     0x2c2a3ff3654c99e2ull,   // offset 4 CreateTopic
 };
+// tests/catalog/golden/v4/lease.rcat, printed by `make_catalog_golden <out> v4-lease` when formatVer 4 was introduced
+// (lease topics plan, Task 2).  FROZEN like the v1, v2 and v3 pins.
+inline constexpr uint64_t kLeaseV4Digests[] = {
+    0x25ce4d9df28271a8ull,   // offset 0 CreateTopic
+    0x0b066daf897f9ff7ull,   // offset 1 CreateTopic
+    0x237d3cae6afbbac3ull,   // offset 2 AlterTopicConfig
+    0x8ca7b5561159a06cull,   // offset 3 AlterTopicConfig
+    0x1e87ef3ec52efc7eull,   // offset 4 AlterTopicConfig
+    0x400c2fe8ce7bb89full,   // offset 5 CreateView
+    0x0d3ea854f9c27cb9ull,   // offset 6 DropView
+    0xbc6ee1effe0d5b5full,   // offset 7 DropTopic
+    0xc1a784f342d9ffa6ull,   // offset 8 CreateTopic
+};
 } // namespace rune::catalog::golden

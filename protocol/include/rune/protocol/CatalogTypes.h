@@ -55,9 +55,19 @@ template <class To, class From>
 enum class ConfigKey : uint8_t {
     RetentionMs = 1, RetentionBytes = 2, DeleteRetentionMs = 3,
     MinCleanableDirtyRatioPpm = 4, MinCompactionLagMs = 5, MaxCompactionLagMs = 6,
+    // Lease topics (catalog formatVer 4): alter the topic's LeaseSpec.  Valid only on a lease topic.  There are no keys for
+    // lease.max_keys and lease.expiry_batch: they are fixed at creation.
+    LeaseTtlMs                = 7,    ///< lease.ttl, ms (u64): the default TTL of a grant
+    LeaseMinTtlMs             = 8,    ///< lease.min_ttl, ms (u64): the floor a grant's TTL is raised to
+    LeaseMaxTtlMs             = 9,    ///< lease.max_ttl, ms (u64): the ceiling a grant's TTL is refused above
+    LeaseCheckpoint           = 10,   ///< lease.checkpoint: 0 or 1
+    LeaseCheckpointIntervalMs = 11,   ///< lease.checkpoint_interval, ms (u32)
+    LeaseCheckpointRate       = 12,   ///< lease.checkpoint_rate (u32): leases checkpointed per second
 };
 inline constexpr ConfigKey kFirstConfigKey = ConfigKey::RetentionMs;
-inline constexpr ConfigKey kLastConfigKey  = ConfigKey::MaxCompactionLagMs;
+inline constexpr ConfigKey kLastConfigKey  = ConfigKey::LeaseCheckpointRate;
+/// The last key catalog formatVer 1..3 accepts; the lease.* keys (7..12) need formatVer 4.
+inline constexpr ConfigKey kLastConfigKeyV3 = ConfigKey::MaxCompactionLagMs;
 
 /// A topic's key features (checked writes): the key index, autoincrement and the
 /// key -> partition function.  One definition for the wire (DefineTopic,

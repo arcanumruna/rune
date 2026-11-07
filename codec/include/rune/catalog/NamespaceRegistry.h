@@ -109,6 +109,7 @@ public:
 
 private:
     friend struct ApplyV2;
+    friend struct ApplyV4;   // erases a dropped lease view from a DELETING namespace's pending set
     friend class NamespaceMirror;
     std::map<uint32_t, NamespaceRecord>            byId_;
     std::map<std::string, uint32_t, std::less<>>   byName_;

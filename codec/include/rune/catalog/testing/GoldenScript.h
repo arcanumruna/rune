@@ -71,7 +71,7 @@ namespace cd = rune::codec;
 /// does not preview or apply (the script is broken — never silently emitted).
 class ScriptBuilder {
 public:
-    /// formatVer 1 (the frozen v1 script), 2 (the namespace script) or 3 (the key-features script).  Object helpers act in the namespace
+    /// formatVer 1 (the frozen v1 script), 2 (the namespace script), 3 (the key-features script) or 4 (the lease script).  Object helpers act in the namespace
     /// set by inNs() (default 0); the namespace helpers name their subject explicitly.
     explicit ScriptBuilder(uint16_t formatVer = kFormatV1) : formatVer_(formatVer) {}
     void inNs(uint32_t nsId) { ns_ = nsId; }
@@ -110,6 +110,11 @@ public:
     void createTopic(const std::string& name, CreateTopicOps o, std::string stmt) {
         o.topicId = s_.nextTopicId();
         emit(std::move(o), name, s_.nextObjectId(), 0, std::move(stmt));
+    }
+    /// A lease topic (formatVer 4): `o.lease` is set to `spec`; the commit creates `<name>.leases` beside it.
+    void createLeaseTopic(const std::string& name, CreateTopicOps o, const rune::protocol::LeaseSpec& spec, std::string stmt) {
+        o.lease = spec;
+        createTopic(name, std::move(o), std::move(stmt));
     }
     void dropTopic(const std::string& name, std::string stmt) {
         const TopicObject& t = topic(name);
@@ -530,6 +535,52 @@ inline cd::AlterOp setCompatOp(cd::CompatMode m) {
         b.createTopic("ai32", topic(std::move(d), 3, 0xFFFF'FFFFull, rune::protocol::kAutoIncrementReserveDefault),
                       "CREATE TOPIC ai32 (id UINT32 KEY) PARTITIONS 3 WITH (autoincrement=true, cleanup.policy=compact)");
     }
+    return std::move(b).take();
+}
+
+/// The 9 formatVer-4 lease golden events, offsets 0..8, all in the default namespace
+/// (tests/catalog/golden/v4/lease.rcat):
+///    0 CreateTopic plain (untyped)
+///    1 CreateTopic inst (lease topic: lease_version/ttl_ms/holder/remaining_ms, then id string(64) KEY; compacted;
+///      the default LeaseSpec) -> also creates the lease view inst.leases
+///    2 AlterTopicConfig inst lease.ttl=10000      3 AlterTopicConfig inst lease.checkpoint=0
+///    4 AlterTopicConfig inst delete.retention.ms (a non-lease key on a lease topic)
+///    5 CreateView inst_ids over inst (a user view over a lease topic)      6 DropView inst_ids
+///    7 DropTopic inst (takes inst.leases along)      8 CreateTopic inst again (new ids)
+[[nodiscard]] inline std::vector<CatalogEvent> goldenScriptV4Lease() {
+    namespace cd = rune::codec;
+    golden_detail::ScriptBuilder b(kFormatV4);
+    auto leaseTopic = [] {
+        cd::DescriptorBuilder d("inst");
+        d.add("lease_version", cd::PrimType::Int64).add("lease_ttl_ms", cd::PrimType::UInt64)
+            .add("lease_holder", cd::PrimType::UInt64).add("lease_remaining_ms", cd::PrimType::UInt64)
+            .addFixedStr("id", 64, 1, /*isKey=*/true);
+        CreateTopicOps o;
+        o.partitions = 2;
+        o.config.cleanupPolicy = 1;
+        o.schema = SchemaDef{.keyField = "id", .validate = true, .descriptorBlob = cd::serialize(d.build()), .nextTag = 5};
+        return o;
+    };
+    b.createTopic("plain", CreateTopicOps{}, "CREATE TOPIC plain");
+    b.createLeaseTopic("inst", leaseTopic(), rune::protocol::LeaseSpec{},
+                       "CREATE TOPIC inst (id STRING(64) KEY) WITH (lease=true, cleanup.policy=compact)");
+    b.alterConfig("inst", {{ConfigKey::LeaseTtlMs, 10'000}}, "ALTER TOPIC inst SET (lease.ttl=10000)");
+    b.alterConfig("inst", {{ConfigKey::LeaseCheckpoint, 0}}, "ALTER TOPIC inst SET (lease.checkpoint=false)");
+    b.alterConfig("inst", {{ConfigKey::DeleteRetentionMs, 3'600'000}}, "ALTER TOPIC inst SET (delete.retention.ms=3600000)");
+    {
+        cd::DescriptorBuilder out("inst_ids");
+        out.addFixedStr("id", 64, 1, true).add("lease_version", cd::PrimType::Int64);
+        ViewDef v;
+        v.sinkPartitions = 2; v.keyField = "id"; v.sourceNames = {"inst"};
+        v.normalizedPlanBlob = {0x04, 0x00, 0x00, 0x00, 0x00, 0x11};
+        v.compiledPlanBlob = {0xC4, 0x00, 0x00, 0x00, 0x00, 0x11};
+        v.outputDescriptorBlob = cd::serialize(out.build());
+        b.createView("inst_ids", std::move(v), "CREATE VIEW inst_ids AS SELECT id, lease_version FROM inst");
+    }
+    b.dropView("inst_ids", "DROP VIEW inst_ids");
+    b.dropTopic("inst", "DROP TOPIC inst");
+    b.createLeaseTopic("inst", leaseTopic(), rune::protocol::LeaseSpec{},
+                       "CREATE TOPIC inst (id STRING(64) KEY) WITH (lease=true, cleanup.policy=compact)");
     return std::move(b).take();
 }
 

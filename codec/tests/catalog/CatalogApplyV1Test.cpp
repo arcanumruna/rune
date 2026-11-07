@@ -473,7 +473,7 @@ TEST(CatalogApplyV1Regression, OffsetsMustAdvanceAndUnknownFormatsHaveNoRules) {
     auto stale = rc::apply(s, e, 2);
     ASSERT_FALSE(stale.has_value());
     EXPECT_EQ(stale.error().code, rc::ApplyError::Code::Precondition);
-    auto v2 = e; v2.formatVer = 4;   // 1, 2 and 3 have rules; 4 does not
+    auto v2 = e; v2.formatVer = 5;   // 1..4 have rules; 5 does not
     auto u = rc::apply(s, v2, 3);
     ASSERT_FALSE(u.has_value());
     EXPECT_EQ(u.error().code, rc::ApplyError::Code::UnsupportedFormat);

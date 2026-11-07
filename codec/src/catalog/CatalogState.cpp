@@ -10,6 +10,7 @@
 #include "ApplyV1.h"
 #include "ApplyV2.h"
 #include "ApplyV3.h"
+#include "ApplyV4.h"
 
 #include <algorithm>
 #include <exception>
@@ -54,6 +55,12 @@ const std::string* CatalogState::liveNameFoldingOnto(uint32_t nsId, std::string_
     return nullptr;
 }
 
+const ViewObject* CatalogState::leaseViewOf(uint64_t topicObjectId) const {
+    for (const auto& [id, v] : views_)
+        if (v.kind == ViewKind::LeaseIndex && v.leaseTopicObjectId == topicObjectId) return &v;
+    return nullptr;
+}
+
 const ViewObject* CatalogState::viewReading(uint32_t nsId, std::string_view topicName) const {
     for (const auto& [id, v] : views_)
         if (v.nsId == nsId &&
@@ -87,7 +94,12 @@ uint64_t CatalogState::digest() const noexcept {
         return nsId == kDefaultNsId ? objectFingerprint : objectFingerprintV2(objectFingerprint, nsId);
     };
     auto topicFingerprint = [](const TopicObject& t) {
-        return ApplyV3::keyFeaturesFingerprint(fingerprintOf(t), t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{});
+        return ApplyV4::leaseFingerprint(
+            ApplyV3::keyFeaturesFingerprint(fingerprintOf(t), t.schema ? t.schema->keyFeatures : rune::protocol::TopicKeyFeatures{}),
+            t.lease);
+    };
+    auto viewFingerprint = [](const ViewObject& v) {
+        return v.kind == ViewKind::LeaseIndex ? ApplyV4::leaseViewFingerprint(fingerprintOf(v)) : fingerprintOf(v);
     };
     uint64_t h = rune::codec::detail::kFnvSeed;
     h = detail::fnvU64(h, static_cast<uint64_t>(appliedOffset_));
@@ -101,7 +113,7 @@ uint64_t CatalogState::digest() const noexcept {
             h = detail::fnvU64(h, fp(topicFingerprint(t->second), t->second.nsId));
             ++t;
         } else {
-            h = detail::fnvU64(h, fp(fingerprintOf(v->second), v->second.nsId));
+            h = detail::fnvU64(h, fp(viewFingerprint(v->second), v->second.nsId));
             ++v;
         }
     }
@@ -125,6 +137,7 @@ namespace {
 struct Prepared { StagedV2 staged; uint64_t fingerprint; };
 
 std::expected<StagedV2, ApplyError> runRules(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
+    if (e.formatVer == kFormatV4) return ApplyV4::run(s, e, offset);
     if (e.formatVer == kFormatV3) return ApplyV3::run(s, e, offset);
     if (e.formatVer == kFormatV2) return ApplyV2::run(s, e, offset);
     auto v1 = ApplyV1::run(s, e, offset);   // formatVer 1: nsId is 0 (the event validation refuses anything else)
@@ -133,21 +146,28 @@ std::expected<StagedV2, ApplyError> runRules(const CatalogState& s, const Catalo
 }
 
 uint64_t stagedFingerprint(const CatalogEvent& e, const StagedV2& st) noexcept {
+    if (e.formatVer == kFormatV4) return ApplyV4::fingerprintOfStaged(e, st);
     if (e.formatVer == kFormatV3) return ApplyV3::fingerprintOfStaged(e, st);
     if (e.formatVer == kFormatV2) return ApplyV2::fingerprintOfStaged(e, st);
     return ApplyV1::fingerprintOfStaged(std::get<Staged>(st));
 }
 
 std::expected<Prepared, ApplyError> prepare(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
+    // The lease rules that depend on the state, not on the formatVer (no-ops on a log without a lease view).
+    if (auto err = ApplyV4::guardBefore(s, e, offset)) return std::unexpected(std::move(*err));
     auto staged = runRules(s, e, offset);
     if (!staged) return std::unexpected(std::move(staged.error()));
+    if (auto err = ApplyV4::guardStaged(e, *staged, offset)) return std::unexpected(std::move(*err));
+    ApplyV4::excludeLeaseViews(s, *staged);
     ApplyV3::carryKeyFeatures(s, *staged);
     const uint64_t base = stagedFingerprint(e, *staged);
-    return Prepared{std::move(*staged), ApplyV3::keyFeaturesFingerprint(base, ApplyV3::keyFeaturesOf(*staged))};
+    return Prepared{std::move(*staged),
+                    ApplyV4::leaseFingerprint(ApplyV3::keyFeaturesFingerprint(base, ApplyV3::keyFeaturesOf(*staged)),
+                                              ApplyV4::leaseOf(*staged))};
 }
 
 std::expected<void, ApplyError> checkFormat(const CatalogEvent& e, int64_t offset) {
-    if (e.formatVer < kFormatV1 || e.formatVer > kFormatV3)
+    if (e.formatVer < kFormatV1 || e.formatVer > kFormatV4)
         return std::unexpected(ApplyError{offset, ApplyError::Code::UnsupportedFormat, 0, 0,
                                           "formatVer " + std::to_string(e.formatVer) + " has no apply rules"});
     return {};
@@ -165,11 +185,17 @@ std::expected<Applied, ApplyError> apply(CatalogState& s, const CatalogEvent& e,
     if (prepared->fingerprint != e.fingerprint)
         return std::unexpected(ApplyError{offset, ApplyError::Code::FingerprintMismatch, e.fingerprint, prepared->fingerprint,
                                           std::string(kindName(e.kind)) + " '" + e.objectName + "'"});
-    if (e.formatVer == kFormatV3)
-        return ApplyV3::commit(s, e, offset, prepared->fingerprint, std::move(prepared->staged));
-    if (e.formatVer == kFormatV2)
-        return ApplyV2::commit(s, e, offset, prepared->fingerprint, std::move(prepared->staged));
-    return ApplyV1::commit(s, e, offset, prepared->fingerprint, std::move(std::get<Staged>(prepared->staged)));
+    Applied applied = [&] {
+        if (e.formatVer == kFormatV4)
+            return ApplyV4::commit(s, e, offset, prepared->fingerprint, std::move(prepared->staged));
+        if (e.formatVer == kFormatV3)
+            return ApplyV3::commit(s, e, offset, prepared->fingerprint, std::move(prepared->staged));
+        if (e.formatVer == kFormatV2)
+            return ApplyV2::commit(s, e, offset, prepared->fingerprint, std::move(prepared->staged));
+        return ApplyV1::commit(s, e, offset, prepared->fingerprint, std::move(std::get<Staged>(prepared->staged)));
+    }();
+    ApplyV4::commitLeaseViewDrop(s, e, applied);   // a DropTopic takes the topic's lease view along (every formatVer)
+    return applied;
 }
 
 std::expected<uint64_t, ApplyError> previewFingerprint(const CatalogState& s, const CatalogEvent& e) {

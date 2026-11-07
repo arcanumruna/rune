@@ -93,7 +93,7 @@ TEST(CatalogDdlWireRegression, EveryTruncatedTrailerIsRefused) {
 }
 
 TEST(CatalogDdlWireRegression, AlterTopicConfigRefusesAnUnknownKey) {
-    std::array<uint8_t, 9> change{7, 0, 0, 0, 0, 0, 0, 0, 0};   // key 7 does not exist
+    std::array<uint8_t, 9> change{13, 0, 0, 0, 0, 0, 0, 0, 0};   // key 13 does not exist (7..12 are the lease keys)
     std::array<uint8_t, 11> changes{1, 0};
     std::copy(change.begin(), change.end(), changes.begin() + 2);
     pc::AlterTopicConfig m; m.topicName = "t"; m.changes = changes;
@@ -555,8 +555,15 @@ TEST(CatalogDdlWireRegression, ConfigKeyIsTheOneDefinitionAndItsValuesArePinnedR
     EXPECT_EQ(static_cast<uint8_t>(K::MinCleanableDirtyRatioPpm), 4);
     EXPECT_EQ(static_cast<uint8_t>(K::MinCompactionLagMs), 5);
     EXPECT_EQ(static_cast<uint8_t>(K::MaxCompactionLagMs), 6);
+    EXPECT_EQ(static_cast<uint8_t>(K::LeaseTtlMs), 7);
+    EXPECT_EQ(static_cast<uint8_t>(K::LeaseMinTtlMs), 8);
+    EXPECT_EQ(static_cast<uint8_t>(K::LeaseMaxTtlMs), 9);
+    EXPECT_EQ(static_cast<uint8_t>(K::LeaseCheckpoint), 10);
+    EXPECT_EQ(static_cast<uint8_t>(K::LeaseCheckpointIntervalMs), 11);
+    EXPECT_EQ(static_cast<uint8_t>(K::LeaseCheckpointRate), 12);
     EXPECT_EQ(pc::kConfigKeyFirst, static_cast<uint8_t>(K::RetentionMs));
-    EXPECT_EQ(pc::kConfigKeyLast, static_cast<uint8_t>(K::MaxCompactionLagMs));
+    EXPECT_EQ(pc::kConfigKeyLast, static_cast<uint8_t>(K::LeaseCheckpointRate));
+    EXPECT_EQ(static_cast<uint8_t>(rune::protocol::kLastConfigKeyV3), 6);
 }
 
 // Catalog history (Task 5 fix round 1, M2): every DDL encoder exposes where its
