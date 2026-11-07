@@ -705,7 +705,7 @@ StepOut aggStep(Ctx<T>& cx, VersionDescriptorCache& vdc, const rune::codec::Desc
     return {hadOld && oldGroup != g ? StepKind::Moved : StepKind::Upserted, g, oldGroup};
 }
 
-// The record's touched rows into the chain, keyed the way the Prospect keys them.  A keyed view's new group takes the next gid (burned when
+// The record's touched rows into the chain, keyed the way apply keys them.  TODO: merge with applyAggregate over a table accessor, as Stores does for projections.  A keyed view's new group takes the next gid (burned when
 // the chain is released) and its key goes into the chain's groupIds; a dropped group's key leaves them.
 void chainRecord(AggregateFold& f, const RowOverlay& ov, const TxnTable& groups, const TxnTable& groupIds, TxnOverlay& chain) noexcept {
     using T = RowOverlay::Table;
@@ -723,15 +723,26 @@ void chainRecord(AggregateFold& f, const RowOverlay& ov, const TxnTable& groups,
             }
         }
     }
-    constexpr OverlayTable ids[RowOverlay::kTables] = {OverlayTable::View, OverlayTable::Contributors, OverlayTable::Groups, OverlayTable::Blocks};
-    for (const T t : {T::Contributors, T::Groups, T::Blocks, T::View}) {
-        for (std::size_t i = 0; i < ov.used(t); ++i) {
-            const RowOverlay::Slot& s = ov.slot(t, i);
-            const ViewKey key = ViewKey::fromU64(s.key);
-            if (s.erased) chain.erase(f.member, ids[static_cast<std::size_t>(t)], key);
-            else if (uint8_t* dst = chain.put(f.member, ids[static_cast<std::size_t>(t)], key, nullptr, ov.rowLen(t))) std::memcpy(dst, ov.image(t, i), ov.rowLen(t));
+    const auto publish = [&](T t, OverlayTable table, std::size_t i, const ViewKey& key) {
+        const RowOverlay::Slot& s = ov.slot(t, i);
+        if (s.erased) chain.erase(f.member, table, key);
+        else if (uint8_t* dst = chain.put(f.member, table, key, nullptr, ov.rowLen(t))) std::memcpy(dst, ov.image(t, i), ov.rowLen(t));
+    };
+    // The view rows go first, under their view keys (a keyed view's slots are gids): a dropped group's key is read from its stored row.
+    for (std::size_t i = 0; i < ov.used(T::View); ++i) {
+        const RowOverlay::Slot& s = ov.slot(T::View, i);
+        if (f.keyed == nullptr) {
+            publish(T::View, OverlayTable::View, i, ViewKey::fromU64(s.key));
+            continue;
         }
+        const uint8_t* keyed = groups.get(s.key);
+        for (std::size_t j = 0; j < ov.used(T::Groups) && !s.erased; ++j)
+            if (ov.slot(T::Groups, j).key == s.key && !ov.slot(T::Groups, j).erased) keyed = ov.image(T::Groups, j);
+        if (keyed != nullptr) publish(T::View, OverlayTable::View, i, ViewKey::fromBytes({keyed + off, width}));
     }
+    for (std::size_t i = 0; i < ov.used(T::Contributors); ++i) publish(T::Contributors, OverlayTable::Contributors, i, ViewKey::fromU64(ov.slot(T::Contributors, i).key));
+    for (std::size_t i = 0; i < ov.used(T::Groups); ++i) publish(T::Groups, OverlayTable::Groups, i, ViewKey::fromU64(ov.slot(T::Groups, i).key));
+    for (std::size_t i = 0; i < ov.used(T::Blocks); ++i) publish(T::Blocks, OverlayTable::Blocks, i, ViewKey::fromU64(ov.slot(T::Blocks, i).key));
 }
 
 // The batch walk both folds share: `onRecord(key, value, offset)` sees every committed, unrejected record in [cursor, bound).
@@ -831,7 +842,7 @@ PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospe
     const TxnTable groupsT(&f.groups, OverlayTable::Groups, xp);
     const TxnTable groupIdsT(f.groupIds, OverlayTable::GroupIds, xp);
     ProspectTable blocks{ov, T::Blocks, TxnTable(f.blocks, OverlayTable::Blocks, xp)};
-    Ctx<ProspectTable> cx{f.layout, f.agg, ProspectTable{ov, T::View, TxnTable(f.keyed != nullptr ? nullptr : &f.view, OverlayTable::View, xp)},
+    Ctx<ProspectTable> cx{f.layout, f.agg, ProspectTable{ov, T::View, TxnTable(f.keyed != nullptr ? nullptr : &f.view, OverlayTable::View, f.keyed != nullptr ? nullptr : xp)},
                          ProspectTable{ov, T::Contributors, TxnTable(&f.contributors, OverlayTable::Contributors, xp)},
                          ProspectTable{ov, T::Groups, groupsT}, f.blocks != nullptr ? &blocks : nullptr, p.stats,
                          f.keyed, f.groupIds != nullptr ? &groupIdsT : nullptr, f.nextGroupId != nullptr ? *f.nextGroupId : 0};
@@ -849,7 +860,7 @@ PrepareStatus prepareAggregate(AggregateFold& f, const SourceRecord& rec, Prospe
             row.key = ViewKey::fromU64(g);
         }
         bool chainErased = false;
-        const bool inChain = chain != nullptr && chain->get(f.member, OverlayTable::View, ViewKey::fromU64(g), chainErased) != nullptr;
+        const bool inChain = chain != nullptr && row.key.len != 0 && chain->get(f.member, OverlayTable::View, row.key, chainErased) != nullptr;
         row.existed = inChain || (!chainErased && f.view.get(row.key) != nullptr);
         const RowOverlay::Slot* s = ov.find(T::View, g);
         row.removed = s == nullptr || s->erased;

@@ -644,6 +644,19 @@ TEST(CheckedWritesKeyedAgg, ChainedPreparesEqualSequentialProspectsRegression) {
         TxnOverlay chain;
         chain.reserve(512, 4096);
         const char* fps[] = {"a", "b", "c"};
+        // Both rigs start from the same stored rows, so the chain reads through to non-empty tables.
+        for (size_t i = 0, n = rng() % 12; i < n; ++i) {
+            const uint64_t id = rng() % 10;
+            const std::string key = wireKey(id);
+            const std::string value = rng() % 4 == 0 ? std::string() : valueOf(chained.src, ev(id, 1 + rng() % 3, fps[rng() % 3], int64_t(rng() % 20), rng() % 50));
+            const rune::view::SourceRecord rec{key, value, int64_t(i), 0, nullptr};
+            for (Rig* g : {&chained, &sequential}) {
+                auto f = g->fold();
+                ASSERT_EQ(prepareAggregate(f, rec, g->p), PrepareStatus::Ok);
+                applyAggregate(f, rec, g->p);
+            }
+        }
+        const size_t storedRows = chained.view.size() + chained.groups.size() + chained.contributors.size() + chained.groupIds.size();
         for (size_t i = 0, n = 1 + rng() % 40; i < n; ++i) {
             const uint64_t id = rng() % 10;
             const std::string key = wireKey(id);
@@ -664,7 +677,29 @@ TEST(CheckedWritesKeyedAgg, ChainedPreparesEqualSequentialProspectsRegression) {
             }
             applyAggregate(sf, rec, sequential.p);
         }
-        EXPECT_EQ(chained.view.size() + chained.groups.size() + chained.contributors.size() + chained.groupIds.size(), 0u);
+        EXPECT_EQ(chained.view.size() + chained.groups.size() + chained.contributors.size() + chained.groupIds.size(), storedRows);
         EXPECT_EQ(chained.next == 0, chain.rows() == 0);
     }
+}
+
+TEST(CheckedWritesKeyedAgg, ChainedDropThenRecreateOfAStoredGroupIsNew) {
+    const ViewPlan plan = aggregateOf({{"userId", 0, "userId"}, {"deviceFp", 0, "deviceFp"}}, allRules());
+    Rig r(plan);
+    TxnOverlay chain;
+    chain.reserve(512, 4096);
+    const auto record = [&](uint64_t id, const Ev* e, TxnOverlay* ch, bool apply) {
+        const std::string key = wireKey(id);
+        const std::string value = e != nullptr ? valueOf(r.src, *e) : std::string();
+        const rune::view::SourceRecord rec{key, value, 0, 0, nullptr};
+        auto f = r.fold();
+        const PrepareStatus st = prepareAggregate(f, rec, r.p, ch);
+        if (apply) applyAggregate(f, rec, r.p);
+        return st;
+    };
+    const Ev first = ev(1, 1, "a", 5, 5), second = ev(2, 1, "a", 6, 6);
+    ASSERT_EQ(record(1, &first, nullptr, true), PrepareStatus::Ok);
+    ASSERT_EQ(record(1, nullptr, &chain, false), PrepareStatus::Ok);   // the group is dropped in the chain
+    EXPECT_TRUE(r.p.rows[0].removed);
+    ASSERT_EQ(record(2, &second, &chain, false), PrepareStatus::Ok);   // and created again
+    EXPECT_FALSE(r.p.rows[0].existed);
 }

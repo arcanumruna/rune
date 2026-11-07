@@ -65,9 +65,10 @@ inline constexpr std::size_t kTxnOverlaysPerWorker = 8;
 struct TxnLockSet {
     std::array<const TxnOverlay*, kTxnOverlaysPerWorker> locked{};
     uint8_t                                              count = 0;
-    [[nodiscard]] bool contains(uint8_t member, OverlayTable table, const ViewKey& key) const noexcept {
+    // `except` is the overlay being chained: a transaction never locks itself.
+    [[nodiscard]] bool contains(uint8_t member, OverlayTable table, const ViewKey& key, const TxnOverlay* except = nullptr) const noexcept {
         for (uint8_t i = 0; i < count; ++i)
-            if (locked[i]->contains(member, table, key)) return true;
+            if (locked[i] != except && locked[i]->contains(member, table, key)) return true;
         return false;
     }
 };
@@ -80,7 +81,8 @@ struct TxnAccess {
     bool              locked = false;
 };
 
-// A ViewTable seen through a TxnAccess.  With x == nullptr every call is the table's own; t may be nullptr (a keyed view's rows by gid).
+// A ViewTable seen through a TxnAccess.  With x == nullptr every call is the table's own; t may be nullptr (no stored rows).
+// With a chain every read, write and erase leaves an entry (an absent row as an erased one), so the overlay's rows are the transaction's locks.
 class TxnTable {
 public:
     TxnTable(ViewTable* t, OverlayTable id, TxnAccess* x) noexcept : t_(t), id_(id), x_(x) {}
@@ -90,12 +92,18 @@ public:
     [[nodiscard]] const uint8_t* get(const ViewKey& k) const noexcept {
         const uint8_t* r = nullptr;
         if (x_ != nullptr && probe(k, r)) return r;
-        return t_ != nullptr ? t_->get(k) : nullptr;
+        r = t_ != nullptr ? t_->get(k) : nullptr;
+        if (r == nullptr) noteAbsent(k);
+        return r;
     }
     [[nodiscard]] const uint8_t* get(uint64_t k) const noexcept {
         const uint8_t* r = nullptr;
-        if (x_ != nullptr && probe(ViewKey::fromU64(k), r)) return r;
-        return t_ != nullptr ? t_->get(k) : nullptr;
+        if (x_ == nullptr) return t_ != nullptr ? t_->get(k) : nullptr;
+        const ViewKey vk = ViewKey::fromU64(k);
+        if (probe(vk, r)) return r;
+        r = t_ != nullptr ? t_->get(k) : nullptr;
+        if (r == nullptr) noteAbsent(vk);
+        return r;
     }
     uint8_t* put(const ViewKey& k) noexcept {
         if (x_ == nullptr) return t_->put(k);
@@ -114,19 +122,19 @@ public:
         if (x_ == nullptr) return t_->erase(k);
         touch(k);
         if (x_->chain == nullptr) return t_->erase(k);
-        return chainErase(k, get(k) != nullptr);
+        return chainErase(k, exists(k, t_ != nullptr && t_->get(k) != nullptr));
     }
     bool erase(uint64_t k) noexcept {
         if (x_ == nullptr) return t_->erase(k);
         const ViewKey vk = ViewKey::fromU64(k);
         touch(vk);
         if (x_->chain == nullptr) return t_->erase(k);
-        return chainErase(vk, get(k) != nullptr);
+        return chainErase(vk, exists(vk, t_ != nullptr && t_->get(k) != nullptr));
     }
 
 private:
     void touch(const ViewKey& k) const noexcept {
-        if (x_->locks != nullptr && x_->locks->contains(x_->member, id_, k)) x_->locked = true;
+        if (x_->locks != nullptr && x_->locks->contains(x_->member, id_, k, x_->chain)) x_->locked = true;
     }
     // True when the chain decides the row: `r` is its image, or nullptr when the chain erased it.
     bool probe(const ViewKey& k, const uint8_t*& r) const noexcept {
@@ -140,8 +148,16 @@ private:
         uint8_t* r = x_->chain->put(x_->member, id_, k, base, t_->rowLen());
         return r != nullptr ? r : x_->chain->spare();
     }
+    bool exists(const ViewKey& k, bool inTable) const noexcept {
+        const uint8_t* r = nullptr;
+        return probe(k, r) ? r != nullptr : inTable;
+    }
+    // A read that found the row absent still locks it: the chain's erased entry reads back as absent.
+    void noteAbsent(const ViewKey& k) const noexcept {
+        if (x_ != nullptr && x_->chain != nullptr && t_ != nullptr) x_->chain->erase(x_->member, id_, k);
+    }
     bool chainErase(const ViewKey& k, bool existed) noexcept {
-        if (existed) x_->chain->erase(x_->member, id_, k);
+        x_->chain->erase(x_->member, id_, k);
         return existed;
     }
 

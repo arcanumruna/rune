@@ -251,6 +251,41 @@ TEST(CheckedWritesTxnOverlay, UniqueClaimsAreLockedToo) {
     EXPECT_EQ(r.table.size(), 0u);
 }
 
+TEST(CheckedWritesTxnOverlay, ErasingAnAbsentRowLocksIt) {
+    ViewTable t(RowLayout{.rowLen = 8}, 64, 1u << 12);
+    TxnOverlay chain;
+    chain.reserve(4, 8);
+    TxnAccess x{&chain, nullptr, 0};
+    TxnTable table(&t, OverlayTable::View, &x);
+    EXPECT_FALSE(table.erase(ViewKey::fromU64(5)));
+    EXPECT_FALSE(table.erase(uint64_t{6}));
+    EXPECT_TRUE(chain.contains(0, OverlayTable::View, ViewKey::fromU64(5)));
+    EXPECT_TRUE(chain.contains(0, OverlayTable::View, ViewKey::fromU64(6)));
+    EXPECT_EQ(t.size(), 0u);
+}
+
+TEST(CheckedWritesTxnOverlay, ReadingAnAbsentRowLocksIt) {
+    AggRig r(userTotals());
+    ASSERT_EQ(r.prepare(5, -1, 0, &r.chain), PrepareStatus::Ok);   // a tombstone of an unknown contributor
+    const TxnLockSet locks = lockSetOf(r.chain);
+    EXPECT_EQ(r.prepare(5, 100, 1, nullptr, false, &locks), PrepareStatus::Locked);
+    EXPECT_EQ(r.prepare(6, 100, 1, nullptr, false, &locks), PrepareStatus::Ok);
+}
+
+TEST(CheckedWritesTxnOverlay, AChainDoesNotLockItself) {
+    AggRig r(userTotals());
+    ASSERT_EQ(r.prepare(1, 100, 1, &r.chain), PrepareStatus::Ok);
+    const TxnLockSet locks = lockSetOf(r.chain);
+    EXPECT_EQ(r.prepare(2, 100, 1, &r.chain, false, &locks), PrepareStatus::Ok);
+}
+
+TEST(CheckedWritesTxnOverlay, RowLongerThanTheReservationIsFullNotCorruption) {
+    TxnOverlay o;
+    o.reserve(4, 8);
+    EXPECT_EQ(o.put(0, OverlayTable::View, ViewKey::fromU64(1), nullptr, 16), nullptr);
+    EXPECT_TRUE(o.full());
+}
+
 TEST(CheckedWritesTxnOverlay, FullOverlayIsCapacityExhausted) {
     AggRig r(userTotals());
     ASSERT_EQ(r.prepare(1, 100, 5, nullptr, true), PrepareStatus::Ok);
@@ -279,7 +314,13 @@ TEST(CheckedWritesTxnOverlay, ReservedOverlayAllocatesNothing) {
         return std::pair{sa, prepareProjection(pf, c, u.p, &u.chain)};
     };
     ASSERT_EQ(prepareBoth(0), (std::pair{PrepareStatus::Ok, PrepareStatus::Ok}));   // first sight of the writer version allocates
+    TxnLockSet locks = lockSetOf(r.chain);
     rune::testing::AllocWindow w;
+    for (int i = 0; i < 4096; ++i) {
+        AggregateFold lf = r.fold(&locks);
+        const SourceRecord lr{sv(keys[i % 16]), sv(orders[i % 16]), 0, 0, nullptr};
+        (void)prepareAggregate(lf, lr, r.p);   // Ok or Locked, never an allocation
+    }
     for (int i = 0; i < 4096; ++i) ASSERT_EQ(prepareBoth(i), (std::pair{PrepareStatus::Ok, PrepareStatus::Ok}));
     EXPECT_EQ(w.count(), 0u);
 }

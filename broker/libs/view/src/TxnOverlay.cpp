@@ -2,7 +2,6 @@
 #include <rune/view/TxnOverlay.h>
 
 #include <algorithm>
-#include <cassert>
 #include <cstring>
 
 namespace rune::view {
@@ -72,7 +71,10 @@ const uint8_t* TxnOverlay::get(uint8_t member, OverlayTable table, const ViewKey
 }
 
 uint8_t* TxnOverlay::put(uint8_t member, OverlayTable table, const ViewKey& key, const uint8_t* base, uint32_t rowLen) noexcept {
-    assert(rowLen <= maxRowLen_);
+    if (rowLen > maxRowLen_) {
+        full_ = true;
+        return nullptr;
+    }
     int32_t s = find(member, table, key);
     if (s >= 0) {
         Entry& e = entries_[static_cast<std::size_t>(s)];

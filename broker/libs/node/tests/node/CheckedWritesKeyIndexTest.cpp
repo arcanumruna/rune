@@ -310,6 +310,10 @@ TEST(CheckedWritesTxnOverlay, ChainedKeyIndexInsertThenUpdate) {
     locks.count = 1;
     const KeyIndexFold locked{table, 8, 0, &locks};
     EXPECT_EQ(prepareKeyIndex(locked, base, p), rune::view::PrepareStatus::Locked);
+    // A chained delete of an absent key locks it too, so an outside insert cannot overtake the transaction's delete.
+    const std::string gone(8, '\x09');
+    ASSERT_EQ(prepareKeyIndex(f, {gone, {}, 0, 0, nullptr}, p, &chain), rune::view::PrepareStatus::Ok);
+    EXPECT_EQ(prepareKeyIndex(locked, {gone, v, 0, 0, nullptr}, p), rune::view::PrepareStatus::Locked);
     const std::string other(8, '\x08');
     EXPECT_EQ(prepareKeyIndex(locked, {other, v, 0, 0, nullptr}, p), rune::view::PrepareStatus::Ok);
 }
