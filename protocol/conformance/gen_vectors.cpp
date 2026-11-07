@@ -23,6 +23,7 @@
 #include "rune/protocol/client/PingMessages.h"
 #include "rune/protocol/client/SchemaMessages.h"
 #include "rune/protocol/client/StatsMessages.h"
+#include "rune/protocol/client/TxnMessages.h"
 
 namespace rpc = rune::protocol::client;
 
@@ -668,6 +669,15 @@ int main(int argc, char** argv) {
         write_vec(dir, "stats_response.bin", buf, n);
     }
 
-    std::printf("Done. 35 vectors written to %s/\n", dir);
+    // EndTxnResponse (template 54), client version 17 vote trailer: see manifest.md.
+    {
+        rpc::EndTxnResponse r;
+        r.sessionId = kSessionId; r.correlationId = kCorrelationId; r.errorCode = 55;
+        r.hasVote = true; r.constraintId = 0x00070000u; r.failingOffset = 123;
+        n = r.encodeFor(buf, 17);
+        write_vec(dir, "end_txn_response_v17_vote.bin", buf, n);
+    }
+
+    std::printf("Done. 36 vectors written to %s/\n", dir);
     return 0;
 }

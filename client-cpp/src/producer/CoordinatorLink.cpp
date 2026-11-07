@@ -33,6 +33,7 @@ constexpr int16_t kThrottled              = static_cast<int16_t>(rpc::ErrorCode:
 
 Verdict CoordinatorLink::classify(ReqKind kind, int16_t ec) noexcept {
     if (ec == kOk) return Verdict::Ok;
+    if (kind == ReqKind::EndTxn && rpc::isTxnVoteCode(static_cast<uint16_t>(ec))) return Verdict::VotedNo;   // final: never retried
     if (ec == kConcurrentTransactions) return Verdict::Retry;         // retriable everywhere
     // #607 class: AuthUnavailable (48) = the broker cannot check security yet (booting / behind): transient on every
     // leg, retried with backoff until the request's deadline - never fatal, never an abort.
@@ -75,7 +76,8 @@ int CoordinatorLink::rank(ReqKind kind, int16_t ec) noexcept {
     case Verdict::Fenced:     return 5;
     case Verdict::Fatal:      return 4;
     case Verdict::Abortable:
-    case Verdict::Reject:     return 3;
+    case Verdict::Reject:
+    case Verdict::VotedNo:    return 3;
     case Verdict::Rediscover: return 2;
     case Verdict::Retry:      return 1;
     case Verdict::Ok:         return 0;

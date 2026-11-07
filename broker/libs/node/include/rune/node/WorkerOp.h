@@ -181,6 +181,10 @@ struct WorkerOp {
         // Checked writes Part 08: gateway → the partition leader's worker: the counters of a topic partition (recordCount =
         // StatsScope 1, topicId = the topic) or of a view partition (scope 2, topicId = the view).  No tail.  Not ownership-gated.
         GetStats                  = 35, ///< gateway → worker: the stats of one topic or view partition
+        // Checked writes Part 11: coordinator → the partition leader's worker: vote on a transaction's commit.  correlationId =
+        // the vote token, producerId / producerEpoch = the transaction, roleEpoch = the target leader epoch + 1 (0 = unchecked),
+        // sessionId = the origin node (-1 = local).  No tail.  Ownership-gated like AppendControlRecord; answered with TxnVoteResult.
+        TxnVote                   = 36, ///< coordinator → worker: vote on a transaction's commit
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -607,6 +611,11 @@ struct WorkerReturn {
         /// recordCount = stat entries, readTopicId / readPartition = the object, isolation = the StatsScope; the chunk is
         /// [count x 10 B][nConstraints u16][n x 12 B].
         StatsResult = 10,
+        /// Checked writes Part 11: the answer to a TxnVote op, on existing scalars.  correlationId = the vote token, errorCode =
+        /// transport status (NotLeader when gated out), recordCount = the vote code (0 = yes), newNextOffset = constraintId,
+        /// baseOffset = failingOffset, lastOffset = the judge offset (-1 = none), sessionId = the origin node.  The vote fields
+        /// mean something only when errorCode == 0: a NotLeader answer leaves recordCount 0, which is NOT a yes vote.
+        TxnVoteResult = 11,
     };
 
     Type    type = Type::ProduceResult;

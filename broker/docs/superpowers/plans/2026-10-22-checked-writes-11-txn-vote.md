@@ -419,7 +419,7 @@ Copied verbatim from the overview (Plan 00). Every task implicitly includes this
     - `struct TxnCommitResult { bool ok = true; uint16_t code = 0; uint32_t constraintId = 0; int64_t failingOffset = -1; };` in `Producer.h`;
     - `TxnCommitResult Producer::commitTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);` (was `void`);
     - `Verdict::VotedNo` (`TxnTypes.h`, `enum class Verdict`);
-    - `void ProduceFrameBuilder::setAtomic(bool) noexcept;`;
+    - `kAttrAtomic` stamped at send time on every Tier-2 batch (ProducerImpl `orBatchAttributes` or the idempotent restamp), no `ProduceFrameBuilder::setAtomic` (ruling 11);
     - the commit and Tier-2 completion fields of P11-6 and P11-13.
 19. **Test support:**
     - **`VerdictRig`** (`broker/libs/node/tests/support/CheckedWritesRig.h`):
@@ -1435,3 +1435,4 @@ This task merges with Part 09 Task 12 (R-3): one alloc gate binary, one bench se
 8. TxnTooLarge keeps its own code (62).
 9. `RingSbeRegression.AuthOpTypesAndTailKindsArePinned` (#948): Task 2 adds ring ops and re-pins the bounds, which fixes #948.
 10. Parallel worktrees build with `-j5`, not `-j18`, while other tracks share the machine.
+11. Task 11: no `ProduceFrameBuilder::setAtomic`. Tier-2 batches are built by `RecordBatchBuilder`, so ProducerImpl stamps `kAttrAtomic` at send time on every Tier-2 batch, and contract 18 is amended to say so. `finishVotedNo_` leaves the #345 sequence-bump check to the next commit or abort, a deviation from the plan text that is accepted. The Tier-2 `RecordsRejected` path and the `atomic` flag are revisited in Task 12 or 15. Task 15's bench covers the extra 2-byte CRC patch per Tier-2 batch, and its docs pass fixes the stale intents sentence in client-cpp.md.

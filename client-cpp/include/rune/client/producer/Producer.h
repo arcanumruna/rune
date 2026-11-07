@@ -591,6 +591,16 @@ private:
     std::variant<Refused, Open, Settled> state_{Refused{}};
 };
 
+/// commitTransactionAndWait()'s outcome.  `ok` false: a partition voted no and the transaction is aborted - `code` is
+/// the vote (55 / 56 / 57 / 62 / 63), `constraintId` the constraint (0 when none), `failingOffset` the record's offset (-1: none).
+struct TxnCommitResult {
+    bool     ok            = true;
+    uint16_t code          = 0;
+    uint32_t constraintId  = 0;
+    int64_t  failingOffset = -1;
+};
+
+
 // ---------------------------------------------------------------------------
 // Producer
 //
@@ -1008,7 +1018,8 @@ public:
                                          std::chrono::nanoseconds timeout = kDefaultTxnWait);
     void sendOffsetsToTransactionAndWait(std::span<const OffsetEntry> offsets, const GroupMetadata& group,
                                          std::chrono::nanoseconds timeout = kDefaultTxnWait);
-    void commitTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
+    /// Throws for every failure except a no vote, which comes back in the result (the transaction is aborted).
+    TxnCommitResult commitTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
     void abortTransactionAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
     void flushAndWait(std::chrono::nanoseconds timeout = kDefaultTxnWait);
 
@@ -1113,10 +1124,11 @@ private:
     OpResult issueTxn_(std::uint8_t kind, const CompletionTarget& target, Token token,
                        std::span<const OffsetEntry> offsets, std::string_view groupId,
                        int32_t generationId = -1, std::string_view memberId = {});
-    /// The *AndWait body: issue + wait + map the completion to an exception.
+    /// The *AndWait body: issue + wait + map the completion to an exception.  `vote` (a commit): a no vote fills it and
+    /// does not throw.
     void txnAndWait_(const char* what, std::chrono::nanoseconds timeout, std::uint8_t kind,
                      std::span<const OffsetEntry> offsets, std::string_view groupId,
-                     int32_t generationId = -1, std::string_view memberId = {});
+                     int32_t generationId = -1, std::string_view memberId = {}, TxnCommitResult* vote = nullptr);
     /// T15b M3: the one send body; `part` computed once by the caller.
     [[nodiscard]] SendResult trySendPart_(TopicHandle topic, int32_t part, const Key& key,
                                           std::span<const uint8_t> value, WriteIntent intent) noexcept;

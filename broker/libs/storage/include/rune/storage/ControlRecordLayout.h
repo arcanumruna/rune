@@ -13,7 +13,8 @@
 //   kReservation         [reservedThroughN u64]
 //   kVerdictPlan         [viewObjectId u64][planFingerprint u64][kind u8][planLen u32][plan][outLen u32][output descriptor][srcLen u32][source descriptor]
 //                        (the plan of a joining unique or check member, appended just below its change record; at most kMaxVerdictPlanBytes in all)
-//   kTxnJudge (11) is recognised and skipped by every reader; its payload is that part's.
+//   kTxnJudge            [producerId i64][producerEpoch i16][firstOffset i64]
+//                        (the leader's vote record for the transaction of producerId whose first batch on this partition is at firstOffset)
 #include <rune/protocol/Crc32c.h>
 #include <rune/protocol/RecordBatch.h>
 
@@ -46,6 +47,9 @@ inline constexpr std::size_t kMarkerEntryBytes = 4 + 2 + 4;
 inline constexpr std::size_t kChangeFixedBytes = 1 + 4 + 8 + 2;
 inline constexpr std::size_t kChangeMemberBytes = 8 + 1 + 8;
 inline constexpr std::size_t kReservationBytes  = 1 + 8;
+inline constexpr std::size_t kTxnJudgeBytes     = 1 + 8 + 2 + 8;
+
+struct TxnJudgeRecord { int64_t producerId; int16_t producerEpoch; int64_t firstOffset; };
 
 namespace detail {
 
@@ -150,6 +154,8 @@ inline std::optional<std::span<const uint8_t>> valueOf(const uint8_t* batch, std
 
 [[nodiscard]] constexpr std::size_t reservationBatchBytes() noexcept { return detail::batchBytes(kReservationBytes); }
 
+inline constexpr std::size_t kTxnJudgeBatchBytes = detail::batchBytes(kTxnJudgeBytes);
+
 /// The whole type-20 value: [version u8][viewObjectId u64][planFingerprint u64][kind u8] then three u32-prefixed blobs.
 [[nodiscard]] constexpr std::size_t verdictPlanPayloadBytes(std::size_t planLen, std::size_t outLen, std::size_t srcLen) noexcept {
     return 1 + 8 + 8 + 1 + 3 * 4 + planLen + outLen + srcLen;
@@ -186,6 +192,18 @@ inline std::size_t buildReservation(std::span<uint8_t> out, uint64_t reservedThr
     detail::put<uint64_t>(out.data() + p, reservedThroughN); p += 8;
     detail::sealBatch(out.data(), p);
     return total;
+}
+
+/// 0 = `out` too small.
+inline std::size_t buildTxnJudge(std::span<uint8_t> out, const TxnJudgeRecord& r) noexcept {
+    if (out.size() < kTxnJudgeBatchBytes) return 0;
+    std::size_t p = detail::beginBatch(out.data(), kTxnJudge, kTxnJudgeBytes);
+    out[p++] = kPayloadVersion;
+    detail::put<int64_t>(out.data() + p, r.producerId); p += 8;
+    detail::put<int16_t>(out.data() + p, r.producerEpoch); p += 2;
+    detail::put<int64_t>(out.data() + p, r.firstOffset); p += 8;
+    detail::sealBatch(out.data(), p);
+    return kTxnJudgeBatchBytes;
 }
 
 /// 0 = `out` too small, or `entries.size() != h.count`, or more than kMaxMarkerEntries.
@@ -377,6 +395,16 @@ bool forEachMarkerEntry(const uint8_t* batch, std::size_t len, Fn&& fn) noexcept
 [[nodiscard]] inline std::optional<uint64_t> parseReservation(const uint8_t* batch, std::size_t len) noexcept {
     const auto c = parseControl(batch, len);
     return c ? parseReservation(*c) : std::nullopt;
+}
+
+[[nodiscard]] inline std::optional<TxnJudgeRecord> parseTxnJudge(const ControlRecord& c) noexcept {
+    if (c.type != kTxnJudge || c.value.size() != kTxnJudgeBytes) return std::nullopt;
+    const uint8_t* p = c.value.data() + 1;
+    return TxnJudgeRecord{detail::get<int64_t>(p), detail::get<int16_t>(p + 8), detail::get<int64_t>(p + 10)};
+}
+[[nodiscard]] inline std::optional<TxnJudgeRecord> parseTxnJudge(const uint8_t* batch, std::size_t len) noexcept {
+    const auto c = parseControl(batch, len);
+    return c ? parseTxnJudge(*c) : std::nullopt;
 }
 
 }  // namespace rune::storage::control_record
