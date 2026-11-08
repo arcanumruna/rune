@@ -5915,6 +5915,9 @@ bool BrokerNode::catalogTopicServesForTest(int32_t topicId) {
 void BrokerNode::holdCleanerViewAckForTest(bool on) {
     onCleanerThreadForTest([this, on]() { cleanerAgent_->setHoldViewAckForTest(on); });
 }
+void BrokerNode::setCleanerNowForTest(std::function<int64_t()> nowMs) {
+    onCleanerThreadForTest([this, f = std::move(nowMs)]() mutable { cleanerAgent_->setNowForTest(std::move(f)); });
+}
 void BrokerNode::holdDroppedDirPurgeForTest(bool on) {
     onAdminThreadForTest([this, on]() { adminWorkerAgent_->setHoldDroppedDirPurgeForTest(on); });
 }

@@ -2022,6 +2022,8 @@ public:
     /// Fix round 1 (I2): the cleaner keeps swapping replica views but holds its
     /// ACK — the retire gate (a dropped topic's Logs, collectRetired) must hold.
     void holdCleanerViewAckForTest(bool on);
+    /// TEST-ONLY (#953): the cleaner's cycle clock (epoch ms; drives producer-id expiry) - the next cycles see `nowMs`.
+    void setCleanerNowForTest(std::function<int64_t()> nowMs);
     /// Fix round 1 (M6): run `f()` on the CLEANER (LogCleanerAgent) thread —
     /// test reads of cleaner-owned state (its policy overrides).  Same contract
     /// as onAdminThreadForTest.
