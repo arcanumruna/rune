@@ -565,3 +565,27 @@ TEST(WorkerViewSetRegression, SteadyChurnWithIdlePassesKeepsItsDirtySetUntilQuie
     EXPECT_EQ(inst->table.dirtyBytes(), 0u) << "a second of quiet gives it back";
     EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes());
 }
+
+// REGRESSION (review 7 I-2): a view paused by the namespace gate returns before the caught-up check, so a kept window was never
+// given back: the reclaimable charge kept the namespace over its limit and every view on it paused for good.
+TEST(WorkerViewSetRegression, PausedViewGivesBackItsKeptWindowRegression) {
+    Rig rig(/*limit chunks*/ 0);
+    SimLog log;
+    log.append(1, 2000);
+    rig.driveA(log);
+    const ViewInstance* inst = rig.vs.instanceForTest(kViewA, 0);
+    for (int rounds : {1, 1, 1, 1, 1, 1, 10, 10}) {
+        log.appendRewrites(1, 2000, rounds);
+        rig.driveA(log);
+    }
+    const size_t kept = inst->table.dirtyBytes();
+    ASSERT_GT(kept, 0u) << "the second long window is kept at its push";
+    rig.assign(kSlotA, kNsA, inst->table.memoryBytes() + kept / 2);
+    ASSERT_TRUE(rig.vs.nsViewMemOver(kSlotA));
+    rig.driveA(log, 0, 1);   // well under a second of quiet
+    EXPECT_TRUE(std::holds_alternative<ViewPaused>(inst->pause));
+    EXPECT_EQ(inst->table.dirtyBytes(), 0u) << "the paused view gives its kept window back";
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes());
+    rig.driveA(log, 0, 2);
+    EXPECT_TRUE(std::holds_alternative<ViewRunning>(inst->pause)) << "the pause it caused is lifted";
+}

@@ -571,6 +571,7 @@ private:
     // pushed window gives a long span's growth back (releaseWindow_; ViewTable::trimDirty).  Churn past the reserve keeps its
     // dirty sets, charged, while windows come less than kQuietGiveBackNs apart, and allocates nothing per drain; a caught-up pass
     // after that long quiet gives them back (quietPass_), so a view quiet for kQuietGiveBackNs carries no charge past its tables.
+    // A paused view gives them back on its first paused pass.
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
         std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + (inst.pendingValid ? inst.pendingDelta.capacity() : 0);
         if (inst.owners) m += inst.owners->memoryBytes() + inst.owners->dirtyBytes();
@@ -892,8 +893,12 @@ private:
             return 1;
         }
         // 00. Task 12 (D26): the namespace is over its view-memory limit -> pause at foldCursor (reads answer
-        //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.
-        if (inst.nsSlot != kNoNsSlot && !nsViewGate_(inst)) return work;
+        //     ViewPaused); back under it -> resume from that same foldCursor.  Untagged instances skip this.  A paused view folds
+        //     nothing, so a kept dirty window is given back at once: it is reclaimable charge that would hold the pause.
+        if (inst.nsSlot != kNoNsSlot && !nsViewGate_(inst)) {
+            if (inst.windowKept) releaseQuiet_(inst);
+            return work;
+        }
         // 0. Phase 2b E: a TRANSIENT source — reconcile THIS instance's cursor
         //    against the source's live range (no extra hash lookups: the caller
         //    already holds the instance).  Disk sources pass nullptr.
