@@ -376,6 +376,20 @@ public:
         return static_cast<AeronPartitionTransport*>(self)->sendVerifyTxnPartitionResponse(static_cast<NodeId>(to),
                                                                                            msg);
     }
+    /// Checked writes Part 11: the coordinator's vote and the partition leader's answer, same plane and rules.
+    bool sendTxnVote(NodeId to, const TxnVoteMsg& msg);
+    bool sendTxnVoteResponse(NodeId to, const TxnVoteResponseMsg& msg);
+    using TxnVoteHandler         = void (*)(void* ctx, const TxnVoteMsg& msg);
+    using TxnVoteResponseHandler = void (*)(void* ctx, const TxnVoteResponseMsg& msg);
+    void setTxnVoteHandlers(TxnVoteHandler onVote, TxnVoteResponseHandler onResponse, void* ctx) noexcept {
+        txnVoteHandler_ = onVote; txnVoteRespHandler_ = onResponse; txnVoteCtx_ = ctx;
+    }
+    static bool sendTxnVoteThunk(void* self, int32_t to, const TxnVoteMsg& msg) {
+        return static_cast<AeronPartitionTransport*>(self)->sendTxnVote(static_cast<NodeId>(to), msg);
+    }
+    static bool sendTxnVoteResponseThunk(void* self, int32_t to, const TxnVoteResponseMsg& msg) {
+        return static_cast<AeronPartitionTransport*>(self)->sendTxnVoteResponse(static_cast<NodeId>(to), msg);
+    }
     /// D9 review MAJOR-1: the plane-reconnect event, CONTROL thread (poll):
     /// `peer` >= 0 = this node's link to that peer went down→up (its hold-router
     /// connection generation was bumped — frames to it may have been dropped
@@ -700,6 +714,9 @@ private:
     VerifyTxnPartitionHandler              txnVerifyHandler_     = nullptr;  ///< control thread (#112)
     VerifyTxnPartitionResponseHandler      txnVerifyRespHandler_ = nullptr;
     void*                                  txnVerifyCtx_         = nullptr;
+    TxnVoteHandler                         txnVoteHandler_       = nullptr;  ///< control thread (Part 11)
+    TxnVoteResponseHandler                 txnVoteRespHandler_   = nullptr;
+    void*                                  txnVoteCtx_           = nullptr;
     PlaneReconnectHandler                  reconnectHandler_     = nullptr;  ///< control thread (D9)
     void*                                  reconnectCtx_         = nullptr;
     uint64_t                               lastUpEdges_          = 0;

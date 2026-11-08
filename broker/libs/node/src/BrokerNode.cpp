@@ -2610,12 +2610,16 @@ void BrokerNode::buildGateway() {
                 replTransport_->setTxnVerifyHandlers(
                     &rune::gateway::ClientGateway::onVerifyTxnPartitionThunk,
                     &rune::gateway::ClientGateway::onVerifyTxnPartitionResponseThunk, gateway_.get());
+                replTransport_->setTxnVoteHandlers(&rune::gateway::ClientGateway::onTxnVoteThunk,
+                                                   &rune::gateway::ClientGateway::onTxnVoteResponseThunk, gateway_.get());
                 gateway_->setTxnMarkerChannel(rune::gateway::ClientGateway::TxnMarkerChannel{
                     &rune::replication::AeronPartitionTransport::sendWriteTxnMarkerThunk,
                     &rune::replication::AeronPartitionTransport::sendWriteTxnMarkerResponseThunk,
                     replTransport_.get(),
                     &rune::replication::AeronPartitionTransport::sendVerifyTxnPartitionThunk,
-                    &rune::replication::AeronPartitionTransport::sendVerifyTxnPartitionResponseThunk});
+                    &rune::replication::AeronPartitionTransport::sendVerifyTxnPartitionResponseThunk,
+                    &rune::replication::AeronPartitionTransport::sendTxnVoteThunk,
+                    &rune::replication::AeronPartitionTransport::sendTxnVoteResponseThunk});
             }
 
             spdlog::info("BrokerNode[{}]: TransactionCoordinationService wired (txn state at {})",
@@ -4871,6 +4875,7 @@ void BrokerNode::stop() {
     if (replTransport_) {
         replTransport_->setTxnMarkerHandlers(nullptr, nullptr, nullptr);
         replTransport_->setTxnVerifyHandlers(nullptr, nullptr, nullptr);   // #112
+        replTransport_->setTxnVoteHandlers(nullptr, nullptr, nullptr);
         replTransport_->setPlaneReconnectHandler(nullptr, nullptr);
     }
     gateway_.reset();         // ClientGateway: deregisters Subscription + ExclusivePubs
