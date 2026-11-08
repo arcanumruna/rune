@@ -109,8 +109,8 @@ TEST(LeaderObserverRegression, BoundObserverIsReplacedOnlyByTheTestSeam) {
     }, ::testing::KilledBySignal(SIGABRT), "") << "any other thread is refused";
 }
 
-// A thread that was never bound is refused on its first observe(): it is not adopted as the observer.
-TEST(LeaderObserverRegression, UnboundWrongThreadIsRefusedNotAdoptedRegression) {
+// A foreign observe() is refused without taking the observer role over: the bound thread stays the observer.
+TEST(LeaderObserverRegression, TheBoundThreadStaysTheObserverAfterAForeignObserveIsRefusedRegression) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     LeaderObserver o{1};
     o.bindObserver();
