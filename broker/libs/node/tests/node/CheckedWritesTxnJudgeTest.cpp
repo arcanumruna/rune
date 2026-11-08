@@ -239,6 +239,20 @@ TEST(CheckedWritesTxnState, DrainNeverAnswersWithAnUnjudgedDefaultRegression) {
     EXPECT_NE(got, nullptr);
 }
 
+// REGRESSION (Task 8 review 3, m-1): a rescan's reset drops an entry's hold below an applied ordinary span.  A Finalized, unjudged
+// entry kept it and held K at the old span's first record, not its own, until finalizeDecided ran past its marker.
+TEST(CheckedWritesTxnState, TruncateDropsTheHoldBelowASpanRegression) {
+    auto t = reserved();
+    ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
+    t.holdBelowSpan(300, 450);   // an ordinary span [300, 450] applied around 400
+    ASSERT_EQ(t.earliestUndecidedFirst(), 300);
+    t.onMarker(77, 520, true);
+    t.find(77)->phase = TxnPhase::Finalized;
+    t.truncateFrom(510);   // the marker is cut: judged anew
+    ASSERT_EQ(t.find(77)->phase, TxnPhase::AwaitJudge);
+    EXPECT_EQ(t.earliestUndecidedFirst(), 400) << "K is held at T's own first record";
+}
+
 // Task 7: a vote bound to an older J is never answered from the producer's next transaction; a scanning vote is the worker's.
 TEST(CheckedWritesTxnState, VoteBoundToAReplacedJudgeIsAnsweredWithNoneRegression) {
     auto t = reserved();

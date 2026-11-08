@@ -301,6 +301,7 @@ public:
             t.answer = {};
             t.judged = false;
             t.records = 0;
+            t.holdFrom = INT64_MAX;   // the old span's hold: the judge sets it again if it applies the span again
         }
     }
     /// The owner gives back every overlay an entry holds: before a leadership scan (truncateFrom) or a re-activation.
