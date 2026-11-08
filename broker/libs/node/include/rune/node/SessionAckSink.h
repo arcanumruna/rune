@@ -142,6 +142,10 @@ struct AckEntry {
     uint32_t verdictRun    = kNoVerdictRun;
     uint16_t verdictCount  = 0;
     uint8_t  hasVerdicts   = 0;
+    /// Client 18 (lease topics): the lease trailer, 2 x leaseCount units at leaseRun (kNoVerdictRun = none).
+    uint32_t leaseRun      = kNoVerdictRun;
+    uint16_t leaseCount    = 0;
+    uint8_t  hasLease      = 0;
 };
 
 inline constexpr uint32_t kVerdictAckArenaEntries = 65536;
@@ -501,6 +505,8 @@ public:
     /// Part 04: the verdict trailer of a View ack lives in the sink until the ack is claimed, dropped or failed.
     [[nodiscard]] bool reserveVerdicts(uint16_t n, uint32_t& run) noexcept { return verdicts_.reserveVerdicts(n, run); }
     [[nodiscard]] std::span<uint8_t> verdictEntries(uint32_t run) noexcept { return verdicts_.entries(run); }
+    /// Frees a run whose ack turned into an error before it was enqueued (an error ack never carries a trailer).
+    void freeVerdictRun(uint32_t run) noexcept { verdicts_.free(run); }
     [[nodiscard]] std::size_t verdictsUsedForTest() const noexcept { return verdicts_.used(); }
     void resizeVerdictArenaForTest(uint32_t entries) { verdicts_ = VerdictAckArena(entries); }
     /// Acks claimed whole / offered because they exceed one claim (test visibility).
@@ -606,7 +612,7 @@ private:
                         // 19/23) — ++*sendSeq happens inside sealRecordsFrame,
                         // so acks and Records draw from one monotonic
                         // sequence under the one b2c key, never two.
-                        const std::size_t plainLen = rune::protocol::client::ProduceResponse::encodedSizeFor(ver, a.hasVerdicts != 0, a.verdictCount);
+                        const std::size_t plainLen = rune::protocol::client::ProduceResponse::encodedSizeFor(ver, a.hasVerdicts != 0, a.verdictCount, a.hasLease != 0, a.leaseCount);
                         encode_(a, ver, ackPlainScratch_.data());
                         const std::size_t n = sealRecordsFrame(*sealCtx, ackPlainScratch_.data(), plainLen,
                                                                ackSealedScratch_.data(), ackSealedScratch_.size());
@@ -628,7 +634,7 @@ private:
                         pos = policy_.claim(r->pub, n,
                                             [&](uint8_t* dst) { std::memcpy(dst, ackSealedScratch_.data(), n); });
                     } else {
-                        pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver, a.hasVerdicts != 0, a.verdictCount),
+                        pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver, a.hasVerdicts != 0, a.verdictCount, a.hasLease != 0, a.leaseCount),
                                             [&](uint8_t* dst) { encode_(a, ver, dst); });
                     }
                     if (pos > 0) [[likely]] {
@@ -1379,6 +1385,9 @@ private:
         r.hasVerdicts    = a.hasVerdicts != 0;
         r.verdictCount   = a.verdictCount;
         if (a.verdictCount != 0) r.verdictBytes = verdicts_.entries(a.verdictRun);
+        r.hasLease       = a.hasLease != 0;
+        r.leaseCount     = a.leaseCount;
+        if (a.hasLease != 0) r.leaseBytes = verdicts_.entries(a.leaseRun);
         // Task 14 (D28): a Throttled retry-after only to a v14+ client (encodeFor answers it InvalidRequest), as the
         // gateway path does.
         if (a.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled) &&
@@ -1391,6 +1400,7 @@ private:
 
     void freeVerdicts_(const AckEntry& a) noexcept {
         if (a.verdictCount != 0) [[unlikely]] verdicts_.free(a.verdictRun);
+        if (a.hasLease != 0) [[unlikely]] verdicts_.free(a.leaseRun);
     }
 
     PubPolicy                                                        policy_;

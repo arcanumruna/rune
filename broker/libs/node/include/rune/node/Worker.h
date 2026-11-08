@@ -2299,9 +2299,19 @@ private:
         else if (ret.errorCode == static_cast<int16_t>(rune::protocol::client::ErrorCode::Throttled))
             a.logStartOffset = ret.lastOffset;
         a.assignedBase = ret.assignedBase;
-        a.hasVerdicts  = ret.hasVerdicts;
-        a.verdictCount = ret.verdictCount;
-        a.verdictRun   = ret.hasVerdicts != 0 ? ret.verdictRun : kNoVerdictRun;
+        if (ok) {
+            a.hasVerdicts  = ret.hasVerdicts;
+            a.verdictCount = ret.verdictCount;
+            a.verdictRun   = ret.hasVerdicts != 0 ? ret.verdictRun : kNoVerdictRun;
+            a.hasLease     = ret.hasLease;
+            a.leaseCount   = ret.leaseCount;
+            a.leaseRun     = ret.hasLease != 0 ? ret.leaseRun : kNoVerdictRun;
+        } else [[unlikely]] {
+            // An error ack never carries a trailer: release the runs a return that turned into an error (NotLeader,
+            // timeout, fsync failure, purge) still holds.  The single place such a run is freed.
+            if (ret.hasVerdicts != 0 && ret.verdictCount != 0) ackSink_->freeVerdictRun(ret.verdictRun);
+            if (ret.hasLease != 0) ackSink_->freeVerdictRun(ret.leaseRun);
+        }
         if (!ackSink_->enqueue(a)) [[unlikely]]
             haltInvariant_("session ack queue full (beyond its static bound)", "Task 13 G-A6 bound exceeded", 0);
         WorkerReturn n = ret;
@@ -8800,12 +8810,15 @@ private:
                 ws->rejected.forEachIn(entry.ret.baseOffset, entry.lastOffset + 1,
                                        [&](const rune::storage::RejectedOffsetIndex::Entry&) { fills = true; });
             }
-            if (code == 0 && fills) {
+            if (code == 0 && entry.replay == 3) [[unlikely]] {
+                // A known-old duplicate of a lease batch: answered at append (answerLeaseKnownOld_), its trailers are filled.
+                if (ws != nullptr && ws->verdicts != nullptr) ++ws->verdicts->statsMut().verdictUnknownDuplicates;
+            } else if (code == 0 && fills) {
                 if (entry.replay == 2) {   // outside the dedupe window: stored, its verdicts are gone
                     code = static_cast<int16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
                     if (ws->verdicts != nullptr) ++ws->verdicts->statsMut().verdictUnknownDuplicates;
                 } else {
-                    const VerdictFill fill = fillVerdicts_(entry, *ws);
+                    const VerdictFill fill = source && ws->spec->lease ? fillLeaseAck_(entry, *ws, *rep) : fillVerdicts_(entry, *ws);
                     if (fill == VerdictFill::TooMany) {
                         code = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
                     } else if (fill == VerdictFill::Deferred) {
@@ -8832,26 +8845,188 @@ private:
     enum class VerdictFill : uint8_t { Done, Deferred, TooMany };
     [[nodiscard]] VerdictFill fillVerdicts_(PendingAcksView& entry, const PartitionWriteState& ws) {
         const int64_t base = entry.ret.baseOffset;
-        std::size_t count = 0;
-        ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry&) { ++count; });
+        const std::size_t count = countRejections_(ws, base, entry.lastOffset);
         if (count > static_cast<std::size_t>(kMaxJudgedBatchRecords)) [[unlikely]] return VerdictFill::TooMany;
         const uint16_t n = static_cast<uint16_t>(count);
         uint32_t run = kNoVerdictRun;
         if (n != 0) {
             if (!ackSink_->reserveVerdicts(n, run)) return VerdictFill::Deferred;
-            uint8_t* out = ackSink_->verdictEntries(run).data();
-            ws.rejected.forEachIn(base, entry.lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry& e) {
-                const uint16_t idx = static_cast<uint16_t>(e.offset - base);
-                out[0] = static_cast<uint8_t>(idx); out[1] = static_cast<uint8_t>(idx >> 8);
-                out[2] = static_cast<uint8_t>(e.code); out[3] = static_cast<uint8_t>(e.code >> 8);
-                for (int i = 0; i < 4; ++i) out[4 + i] = static_cast<uint8_t>(e.constraintId >> (8 * i));
-                out += 8;
-            });
+            writeRejections_(ws, base, entry.lastOffset, ackSink_->verdictEntries(run).data());
         }
         if (entry.replay == 1 && ws.verdicts != nullptr) ++ws.verdicts->statsMut().verdictReplays;
         entry.ret.hasVerdicts = 1;
         entry.ret.verdictCount = n;
         entry.ret.verdictRun = run;
+        return VerdictFill::Done;
+    }
+    [[nodiscard]] static std::size_t countRejections_(const PartitionWriteState& ws, int64_t base, int64_t lastOffset) noexcept {
+        std::size_t count = 0;
+        ws.rejected.forEachIn(base, lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry&) { ++count; });
+        return count;
+    }
+    // The rejection entries of [base, lastOffset] as {offset - base u16, code u16, constraintId u32}, 8 bytes each.
+    static void writeRejections_(const PartitionWriteState& ws, int64_t base, int64_t lastOffset, uint8_t* out) noexcept {
+        ws.rejected.forEachIn(base, lastOffset + 1, [&](const rune::storage::RejectedOffsetIndex::Entry& e) {
+            const uint16_t idx = static_cast<uint16_t>(e.offset - base);
+            out[0] = static_cast<uint8_t>(idx); out[1] = static_cast<uint8_t>(idx >> 8);
+            out[2] = static_cast<uint8_t>(e.code); out[3] = static_cast<uint8_t>(e.code >> 8);
+            for (int i = 0; i < 4; ++i) out[4 + i] = static_cast<uint8_t>(e.constraintId >> (8 * i));
+            out += 8;
+        });
+    }
+    static void putLeaseEntry_(uint8_t* out, int64_t leaseVersion, uint64_t ttlMs) noexcept {
+        for (int b = 0; b < 8; ++b) {
+            out[b]     = static_cast<uint8_t>(static_cast<uint64_t>(leaseVersion) >> (8 * b));
+            out[8 + b] = static_cast<uint8_t>(ttlMs >> (8 * b));
+        }
+    }
+
+    // Lease topics (spec 6.3): a KNOWN-OLD duplicate (outside the dedupe window; nothing appended) of a lease batch is answered
+    // per record from the lease index: a grant {DuplicateSequence} (the client maps it to VerdictUnknown), an update live at its
+    // version (no verdict), an update not live or a revoke {LeaseNotFound}; every lease entry {-1, 0}.  Never from lease_holder.
+    // Index not ready (or the arena full): Throttled with the retry-after; nothing was appended, the retry is the same sequence.
+    // The answer still waits on the original's fire condition (replay 3).  A batch that cannot be walked stays replay 2.
+    struct LeaseDupAnswer {
+        uint32_t verdictRun = kNoVerdictRun, leaseRun = kNoVerdictRun;
+        uint16_t verdictCount = 0, leaseCount = 0;
+        bool     filled = false;
+    };
+    [[gnu::cold]] [[gnu::noinline]] void answerLeaseKnownOld_(const WriteFacts& facts, std::span<const uint8_t> rbSpan,
+                                                             rune::storage::ProduceOutcome& outcome, LeaseDupAnswer& out) {
+        namespace rec = rune::protocol::record;
+        if (ackSink_ == nullptr || rbSpan.size() < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) return;
+        const int32_t count = rune::protocol::RecordBatchReader(rbSpan.data(), rbSpan.size()).recordCount();
+        if (count <= 0 || count > static_cast<int32_t>(rec::kMaxLeaseBatchRecords)) return;
+        auto throttle = [&]() noexcept {
+            outcome.error        = rune::protocol::client::ErrorCode::Throttled;
+            outcome.retryAfterNs = kLeaseRetryAfterNs;
+        };
+        if (!facts.leaseIndexReady || facts.leaseIndex.table == nullptr || facts.leaseIndex.layout == nullptr) { throttle(); return; }
+        const uint16_t n = static_cast<uint16_t>(count);
+        constexpr auto kExisting = static_cast<uint8_t>(rec::Intent::Existing);
+        // The verdict code of one record: 0 = none.
+        auto codeOf = [&](const rune::protocol::RecordSpan& s) noexcept -> uint16_t {
+            const rec::LeaseOp op = rec::leaseOpOf(s.attributes);
+            const bool existing = rec::intentOf(s.attributes) == kExisting;
+            if (op == rec::LeaseOp::Put && !existing)
+                return static_cast<uint16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
+            if (op == rec::LeaseOp::Put) {
+                uint32_t rid = 0;
+                const uint8_t* row = facts.leaseIndex.table->find(rune::view::ViewKey::fromBytes(
+                    {reinterpret_cast<const uint8_t*>(s.key.data()), s.key.size()}), rid);
+                if (row != nullptr && leaseRowVersion(row, *facts.leaseIndex.layout) == leaseRecordVersion(s.value)) return 0;
+            }
+            return static_cast<uint16_t>(rune::protocol::client::ErrorCode::LeaseNotFound);   // a revoke, or an update not live
+        };
+        uint32_t verdicts = 0;
+        if (!rune::protocol::forEachRecordSpan(rbSpan.data(), rbSpan.size(), [&](const rune::protocol::RecordSpan& s) {
+                if (codeOf(s) != 0) ++verdicts;
+            })) return;
+        uint32_t leaseRun = kNoVerdictRun, verdictRun = kNoVerdictRun;
+        if (!ackSink_->reserveVerdicts(static_cast<uint16_t>(2 * n), leaseRun)) { throttle(); return; }
+        if (verdicts != 0 && !ackSink_->reserveVerdicts(static_cast<uint16_t>(verdicts), verdictRun)) {
+            ackSink_->freeVerdictRun(leaseRun);
+            throttle();
+            return;
+        }
+        uint8_t* const lease = ackSink_->verdictEntries(leaseRun).data();
+        for (uint16_t i = 0; i < n; ++i) putLeaseEntry_(lease + 16 * std::size_t{i}, -1, 0);
+        if (verdicts != 0) {
+            uint8_t* vo = ackSink_->verdictEntries(verdictRun).data();
+            (void)rune::protocol::forEachRecordSpan(rbSpan.data(), rbSpan.size(), [&](const rune::protocol::RecordSpan& s) {
+                const uint16_t code = codeOf(s);
+                if (code == 0) return;
+                const uint16_t idx = static_cast<uint16_t>(s.index);
+                vo[0] = static_cast<uint8_t>(idx); vo[1] = static_cast<uint8_t>(idx >> 8);
+                vo[2] = static_cast<uint8_t>(code); vo[3] = static_cast<uint8_t>(code >> 8);
+                vo[4] = vo[5] = vo[6] = vo[7] = 0;
+                vo += 8;
+            });
+        }
+        out = LeaseDupAnswer{verdictRun, leaseRun, static_cast<uint16_t>(verdicts), n, true};
+    }
+
+    // Lease topics (client 18): the lease trailer AND the verdict trailer of a fresh or in-window View ack.  One lease entry
+    // {leaseVersion, ttlMs} per record of the batch, read back from the STORED batch (the grant's version is its offset, the
+    // revoke was re-encoded from the row); a rejected record is {-1, 0}.  Reserves the lease run first, then the verdict run;
+    // Deferred = either did not fit (nothing stays reserved).  TooMany = the batch is beyond a trailer or the stored batch
+    // could not be read back: the ack is Internal, the write stands.
+    [[nodiscard]] VerdictFill fillLeaseAck_(PendingAcksView& entry, const PartitionWriteState& ws, rune::replication::PartitionReplica& rep) {
+        namespace rec = rune::protocol::record;
+        const int64_t base = entry.ret.baseOffset;
+        const int64_t span = entry.lastOffset - base + 1;
+        if (span <= 0 || span > static_cast<int64_t>(rec::kMaxLeaseBatchRecords)) [[unlikely]] return VerdictFill::TooMany;
+        const uint16_t n = static_cast<uint16_t>(span);
+        const std::size_t rejections = countRejections_(ws, base, entry.lastOffset);
+        if (rejections > static_cast<std::size_t>(kMaxJudgedBatchRecords)) [[unlikely]] return VerdictFill::TooMany;
+        uint32_t leaseRun = kNoVerdictRun, verdictRun = kNoVerdictRun;
+        if (!ackSink_->reserveVerdicts(static_cast<uint16_t>(2 * n), leaseRun)) return VerdictFill::Deferred;
+        if (rejections != 0 && !ackSink_->reserveVerdicts(static_cast<uint16_t>(rejections), verdictRun)) {
+            ackSink_->freeVerdictRun(leaseRun);
+            return VerdictFill::Deferred;
+        }
+        auto fail = [&]() noexcept {
+            ackSink_->freeVerdictRun(leaseRun);
+            if (verdictRun != kNoVerdictRun) ackSink_->freeVerdictRun(verdictRun);
+            if (ws.verdicts != nullptr) ++ws.verdicts->statsMut().leaseAckReadFailures;
+            return VerdictFill::TooMany;
+        };
+        rune::storage::Log* log = rep.log();
+        if (log == nullptr) [[unlikely]] return fail();
+        rune::storage::ReadIntoStatus st = rune::storage::ReadIntoStatus::Ok;
+        const rune::storage::LogReadView v = readNoFault_(log, base, pushScratch_.size(), entry.lastOffset + 1, st);
+        if (st != rune::storage::ReadIntoStatus::Ok) [[unlikely]] return fail();
+        const LeaseIndexRef ix = viewSet_ != nullptr
+            ? viewSet_->leaseIndexFor(rep.topicId(), rep.partitionId(), rep.leadershipGeneration(),
+                                      rep.role() == rune::replication::Role::Leader,
+                                      rep.highWatermark() >= rep.leadershipStartOffset()).ref
+            : LeaseIndexRef{};
+        uint8_t* const out = ackSink_->verdictEntries(leaseRun).data();
+        bool found = false, ok = false;
+        std::size_t rd = 0;
+        while (rd + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= v.len) {
+            const rune::protocol::RecordBatchReader r(v.data + rd, v.len - rd);
+            const int32_t t = r.totalLength();
+            if (t <= 0 || rd + static_cast<std::size_t>(t) > v.len) break;
+            if (r.baseOffset() > base) break;
+            if (r.baseOffset() == base) {
+                found = true;
+                if (r.recordCount() != static_cast<int32_t>(n)) break;
+                uint32_t seen = 0;
+                const bool walked = rune::protocol::forEachRecordSpan(v.data + rd, static_cast<std::size_t>(t),
+                                                                      [&](const rune::protocol::RecordSpan& s) {
+                    if (s.index >= n) return;
+                    ++seen;
+                    uint8_t* e = out + 16 * std::size_t{s.index};
+                    if (ws.rejected.find(base + static_cast<int64_t>(s.index)) != nullptr) { putLeaseEntry_(e, -1, 0); return; }
+                    const int64_t version = leaseRecordVersion(s.value);
+                    uint64_t ttl = 0;
+                    if (s.value.size() >= 20) std::memcpy(&ttl, s.value.data() + 12, sizeof(ttl));
+                    const bool update = rec::leaseOpOf(s.attributes) == rec::LeaseOp::Put &&
+                                        rec::intentOf(s.attributes) == static_cast<uint8_t>(rec::Intent::Existing);
+                    if (update && ix.table != nullptr && ix.layout != nullptr) {
+                        // The judge keeps the row's TTL on an update: the row is the truth while the lease lives.
+                        uint32_t rid = 0;
+                        const uint8_t* row = ix.table->find(rune::view::ViewKey::fromBytes(
+                            {reinterpret_cast<const uint8_t*>(s.key.data()), s.key.size()}), rid);
+                        if (row != nullptr && leaseRowVersion(row, *ix.layout) == version) ttl = leaseRowTtl(row, *ix.layout);
+                    }
+                    putLeaseEntry_(e, version, ttl);
+                });
+                ok = walked && seen == n;
+                break;
+            }
+            rd += static_cast<std::size_t>(t);
+        }
+        if (!found || !ok) [[unlikely]] return fail();
+        if (rejections != 0) writeRejections_(ws, base, entry.lastOffset, ackSink_->verdictEntries(verdictRun).data());
+        if (entry.replay == 1 && ws.verdicts != nullptr) ++ws.verdicts->statsMut().verdictReplays;
+        entry.ret.hasVerdicts = 1;
+        entry.ret.verdictCount = static_cast<uint16_t>(rejections);
+        entry.ret.verdictRun = verdictRun;
+        entry.ret.hasLease = 1;
+        entry.ret.leaseCount = n;
+        entry.ret.leaseRun = leaseRun;
         return VerdictFill::Done;
     }
 
@@ -10072,6 +10247,7 @@ private:
         // validated these exact bytes (the gateway, right after ensureValid).
         const bool crcPreverified = f.fromOp && f.crcValidated;
         rune::storage::ProduceOutcome outcome;
+        LeaseDupAnswer leaseDup;   // a known-old duplicate of a lease batch, answered with its trailers (spec 6.3)
         if (ws != nullptr) [[unlikely]] {
             const WriteFacts factsBase{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = false,
                                    .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_()};
@@ -10114,6 +10290,8 @@ private:
                 outcome.assignedBase = ws->assignedBases.find(f.producerId, outcome.baseOffset);
                 if (outcome.assignedBase == 0) ++ws->autoIncStats.windowMisses;
             }
+            if (ws->spec->lease && outcome.isDuplicate && outcome.baseOffset < 0) [[unlikely]]
+                answerLeaseKnownOld_(facts, rbSpan, outcome, leaseDup);
         } else if (log != nullptr) {
             outcome = rune::storage::handleProduceBatch(
                 rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
@@ -10204,7 +10382,15 @@ private:
         // once" for data that is not durable / not on the ISR yet.  (Kafka
         // DelayedProduce waits on the duplicate's original offsets too.)
         const int64_t lastOff = ret.lastOffset;
-        const uint8_t replay = !outcome.isDuplicate ? 0 : outcome.baseOffset < 0 ? 2 : 1;
+        if (leaseDup.filled) [[unlikely]] {
+            ret.hasVerdicts = 1;
+            ret.verdictCount = leaseDup.verdictCount;
+            ret.verdictRun = leaseDup.verdictRun;
+            ret.hasLease = 1;
+            ret.leaseCount = leaseDup.leaseCount;
+            ret.leaseRun = leaseDup.leaseRun;
+        }
+        const uint8_t replay = !outcome.isDuplicate ? 0 : leaseDup.filled ? 3 : outcome.baseOffset < 0 ? 2 : 1;
 
         if (asyncStrict) {
             // Park on the coalesced fsync (submitRound_ stamps the token

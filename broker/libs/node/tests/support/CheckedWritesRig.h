@@ -785,6 +785,8 @@ public:
         uint64_t assignedBase = 0;
         bool    hasVerdicts = false;
         std::vector<std::tuple<uint16_t, uint16_t, uint32_t>> verdicts;
+        std::vector<std::pair<int64_t, uint64_t>> leases;   ///< client 18: {leaseVersion, ttlMs} per record
+        bool    hasLease = false;
         std::size_t frameLen = 0;
         int64_t step = 0;
         int64_t retryAfter = -1;   ///< a Throttled answer's retry-after (ns), from the response's logStartOffset field
@@ -1146,6 +1148,8 @@ private:
             Ack a;
             a.code = r->errorCode; a.baseOffset = r->baseOffset; a.assignedBase = r->assignedBase; a.hasVerdicts = r->hasVerdicts; a.frameLen = static_cast<std::size_t>(l) - (ackEncrypted_ ? rune::protocol::client::kCryptoOverhead : 0); a.step = passNo_; a.retryAfter = r->logStartOffset;
             r->forEachVerdict([&](uint16_t i, uint16_t code, uint32_t cid) { a.verdicts.emplace_back(i, code, cid); });
+            a.hasLease = r->hasLease;
+            r->forEachLease([&](uint32_t, int64_t v, uint64_t ttl) { a.leases.emplace_back(v, ttl); });
             if (acksSeen_.emplace(r->correlationId, std::move(a)).second) ackOrder_.push_back(r->correlationId);
         }).handler(), 64);
     }

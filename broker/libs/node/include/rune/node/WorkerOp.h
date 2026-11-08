@@ -652,6 +652,11 @@ struct WorkerReturn {
     uint32_t verdictRun    = 0;
     uint16_t verdictCount  = 0;
     uint8_t  hasVerdicts   = 0;
+    // Client 18 (lease topics): the lease trailer of a View ack (hasLease with leaseCount x {leaseVersion, ttlMs} = 2 x
+    // leaseCount arena units at leaseRun).  Worker-local only: NOT encoded.
+    uint32_t leaseRun      = 0;
+    uint16_t leaseCount    = 0;
+    uint8_t  hasLease      = 0;
 
     // Non-owning pointer to the replica.  Task 10 round 4: the runtime never
     // dereferences it — it refers to the replica by (targetReplicaId,

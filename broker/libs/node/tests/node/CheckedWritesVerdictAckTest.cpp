@@ -228,6 +228,29 @@ TEST_F(CheckedWritesVerdictAckRegression, ViewRetryOutsideTheWindowIsDuplicateSe
     EXPECT_EQ(r.leo(), leoBefore);
 }
 
+// Lease topics Task 5c: a session below 18 never sees a lease trailer, and a non-lease topic never carries one to any session.
+TEST_F(CheckedWritesVerdictAckRegression, LeaseAckTrailerSessionBelow18Regression) {
+    const int64_t c = r.produceFrame({{1, 1, 1}, {2, 2, 9}, {3, 3, 1}, {4, 4, 9}}, kAcksView);
+    const auto a = r.ack(c);
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    EXPECT_TRUE(a->hasVerdicts);
+    EXPECT_FALSE(a->hasLease);
+    EXPECT_TRUE(a->leases.empty());
+    EXPECT_EQ(a->frameLen, 54u + 2 + 8 * 2) << "the v17 frame is unchanged";
+    // an 18 session on the same non-lease topic: still no lease trailer
+    VerdictRig o;
+    o.typed();
+    o.installRejectView(kRej, kObj, tagRule(9));
+    o.enableAcks(rune::protocol::client::kClientVersionLeases);
+    o.passes(60);
+    const auto b = o.ack(o.produceFrame({{1, 1, 1}, {2, 2, 9}, {3, 3, 1}, {4, 4, 9}}, kAcksView));
+    ASSERT_TRUE(b);
+    EXPECT_EQ(b->code, 0);
+    EXPECT_FALSE(b->hasLease) << "a non-lease topic's ack has no lease trailer";
+    EXPECT_EQ(b->frameLen, 54u + 2 + 8 * 2);
+}
+
 // A replay waits for the marker that commits its verdicts; an ack of the same partition behind it waits too, so the acks of a
 // connection leave in the order the batches were written.
 TEST(CheckedWritesVerdictAckRigRegression, ReplayNotYetCommittedKeepsTheAcksBehindItInOrderRegression) {

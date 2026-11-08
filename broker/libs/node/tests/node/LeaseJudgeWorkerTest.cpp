@@ -48,7 +48,7 @@ RawRec updateRec(uint64_t id, int64_t ver, const std::string& addr, uint32_t por
 /// replicate, promote): the produce hook's lease rules belong to the hook, this suite is about the judge's rebuilds.
 struct Ready {
     VerdictRig r;
-    explicit Ready(int64_t rollBytes = 64LL * 1024 * 1024, std::optional<rune::codec::Descriptor> src = std::nullopt, uint32_t maxKeys = 1000) : r(false, rollBytes) {
+    explicit Ready(int64_t rollBytes = 64LL * 1024 * 1024, std::optional<rune::codec::Descriptor> src = std::nullopt, uint32_t maxKeys = 1000, RigTuning tuning = {}) : r(false, rollBytes, tuning) {
         r.createLeaseTopic(maxKeys, std::move(src));
         r.passes(30);
     }
@@ -638,11 +638,11 @@ struct Leased {
     Ready g;
     VerdictRig& r = g.r;
     int32_t seq = 0;
-    explicit Leased(uint32_t maxKeys = 1000) : g(64LL * 1024 * 1024, std::nullopt, maxKeys) {
+    explicit Leased(uint32_t maxKeys = 1000, uint32_t arenaEntries = 0, RigTuning tuning = {}) : g(64LL * 1024 * 1024, std::nullopt, maxKeys, tuning) {
         WorkerOp level;
         level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;
         r.send(std::move(level));
-        r.enableAcks(rune::protocol::client::kClientVersionLeases);
+        r.enableAcks(rune::protocol::client::kClientVersionLeases, arenaEntries);
         r.passes(30);
     }
     std::optional<VerdictRig::Ack> produce(const std::vector<RawRec>& recs) {
@@ -1101,4 +1101,226 @@ TEST(LeaseWriteHookWorkerRegression, UpdateAfterActivationWhileReplayTrailsRegre
     ASSERT_GT(r.leo(), r.vs->keyIndexFoldCursorForTest(VerdictRig::kSrc, 0)) << "vacuity guard: appended, the replay has not reached it";
     ASSERT_FALSE(r.leaseReady());
     expectRevokeThrottledThenCarriesUpdate(l, ver);
+}
+
+// ── Task 5c: the View ack's lease trailer (L2) and known-old duplicates (L6) ──
+
+namespace {
+using Lease = std::vector<std::pair<int64_t, uint64_t>>;
+using Verd = std::vector<std::tuple<uint16_t, uint16_t, uint32_t>>;
+constexpr int16_t kDupSeq = int16_t(rune::protocol::client::ErrorCode::DuplicateSequence);
+constexpr uint8_t kUpdateAttr = 2;   // Put | existing
+RawRec grantTtl(uint64_t id, uint64_t ttl) { return RawRec{keyOf(id), leaseValue(id, 0, "g", 1, 0, 1, ttl), 1}; }
+RawRec updateTtl(uint64_t id, int64_t ver, uint64_t ttl) { return RawRec{keyOf(id), leaseValue(id, ver, "u", 1, 0, 1, ttl), kUpdateAttr}; }
+RawRec revokeOf(uint64_t id, int64_t ver) { return RawRec{keyOf(id), leaseValue(id, ver, "", 1), kRevokeAttr}; }
+}  // namespace
+
+TEST(LeaseWriteHookWorkerRegression, LeaseAckTrailerRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const auto g = l.produce({grantTtl(3, 4000), grantTtl(4, 6000), grantTtl(5, 7000)});
+    ASSERT_TRUE(g);
+    ASSERT_EQ(g->code, 0);
+    r.passes(30);
+    const int64_t v3 = g->baseOffset, v4 = g->baseOffset + 1, v5 = g->baseOffset + 2;
+    const auto a = l.produce({grantTtl(1, 0), grantTtl(2, 3000), updateTtl(3, v3, 1), revokeOf(4, v4), updateTtl(5, v5 + 99, 1)});
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    ASSERT_TRUE(a->hasLease);
+    ASSERT_EQ(a->leases.size(), 5u);
+    EXPECT_EQ(a->leases[0], (std::pair<int64_t, uint64_t>{a->baseOffset + 0, 1000})) << "ttl 0 raised to min_ttl";
+    EXPECT_EQ(a->leases[1], (std::pair<int64_t, uint64_t>{a->baseOffset + 1, 3000}));
+    EXPECT_EQ(a->leases[2], (std::pair<int64_t, uint64_t>{v3, 4000})) << "an update keeps the row's ttl, not the record's 1";
+    EXPECT_EQ(a->leases[3], (std::pair<int64_t, uint64_t>{v4, 6000})) << "the revoke carries the row's version and ttl";
+    EXPECT_EQ(a->leases[4], (std::pair<int64_t, uint64_t>{-1, 0})) << "a rejected record";
+    ASSERT_EQ(a->verdicts.size(), 1u);
+    EXPECT_EQ(std::get<0>(a->verdicts[0]), 4);
+    EXPECT_EQ(std::get<1>(a->verdicts[0]), 62);
+    EXPECT_EQ(a->frameLen, 54u + 2 + 8 * 1 + 3 + 16 * 5);
+}
+
+TEST(LeaseWriteHookWorkerRegression, LeaseInWindowRetryRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const int32_t at = l.seq;
+    const auto a = l.produce({grantTtl(1, 3000)});
+    ASSERT_TRUE(a);
+    ASSERT_EQ(a->code, 0);
+    ASSERT_TRUE(a->hasLease);
+    ASSERT_EQ(a->leases.size(), 1u);
+    r.passes(30);
+    const int64_t leo = r.leo();
+    const int64_t c = r.produceBytes(VerdictRig::rawBatch({grantTtl(1, 3000)}, 11, at), rune::protocol::client::kAcksWireView, 11, at);
+    const auto b = r.ack(c, 3000);
+    ASSERT_TRUE(b);
+    EXPECT_EQ(b->code, 0);
+    EXPECT_EQ(b->baseOffset, a->baseOffset);
+    EXPECT_TRUE(b->hasLease);
+    EXPECT_EQ(b->leases, a->leases);
+    EXPECT_EQ(r.leo(), leo) << "nothing was appended again";
+}
+
+namespace {
+// Producer 11 writes six lease batches (one record each), then `fillers` more grants so the first six are known-old, and
+// resends nothing: the caller resends.  Returns the six batches with their sequences.
+struct DupBatches {
+    std::vector<std::vector<RawRec>> batches;
+    std::vector<int32_t> seqs;
+    int64_t v1 = 0;
+};
+DupBatches writeDupBatches(Leased& l, int fillers) {
+    DupBatches d;
+    const auto send = [&](std::vector<RawRec> recs) {
+        d.seqs.push_back(l.seq);
+        const auto a = l.produce(recs);
+        EXPECT_TRUE(a);
+        EXPECT_EQ(a ? a->code : -1, 0);
+        l.r.passes(30);
+        d.batches.push_back(std::move(recs));
+        return a;
+    };
+    const auto g1 = send({grantTtl(1, 3000)});                   // 0: grant k1 (stays live)
+    d.v1 = g1->baseOffset;
+    const auto g2 = send({grantTtl(2, 3000)});                   // 1: grant k2
+    send({revokeOf(2, g2->baseOffset)});                         // 2: revoke k2 (k2 ends)
+    send({updateTtl(1, d.v1, 3000)});                            // 3: update of live k1
+    send({updateTtl(2, g2->baseOffset, 3000)});                  // 4: update of k2, refused (no row), stored
+    send({revokeOf(1, d.v1 + 50)});                              // 5: revoke of k1 at another version, refused, stored
+    for (int i = 0; i < fillers; ++i) {
+        const auto f = l.produce({grantTtl(100 + uint64_t(i), 3000)});
+        EXPECT_TRUE(f);
+        l.r.passes(30);
+    }
+    return d;
+}
+}  // namespace
+
+TEST(LeaseWriteHookWorkerRegression, LeaseKnownOldDuplicateTableRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const DupBatches d = writeDupBatches(l, 40);
+    r.settle(150);
+    const int64_t leo = r.leo();
+    const uint64_t unknown = r.stats()->verdictUnknownDuplicates;
+    const std::vector<Verd> expect = {
+        Verd{{0, 21, 0}},   // grant k1: the client maps it to VerdictUnknown
+        Verd{{0, 21, 0}},   // grant k2
+        Verd{{0, 62, 0}},   // revoke k2
+        Verd{},             // update of live k1: Ok
+        Verd{{0, 62, 0}},   // update of k2, not live
+        Verd{{0, 62, 0}},   // revoke of k1 at another version
+    };
+    for (std::size_t i = 0; i < d.batches.size(); ++i) {
+        const auto a = l.produceNoSeq(d.batches[i], d.seqs[i]);
+        ASSERT_TRUE(a) << "batch " << i;
+        EXPECT_EQ(a->code, 0) << "batch " << i;
+        EXPECT_EQ(a->baseOffset, -1) << "batch " << i << ": a known-old duplicate has no offset";
+        ASSERT_TRUE(a->hasLease) << "batch " << i;
+        EXPECT_EQ(a->leases, (Lease{{-1, 0}})) << "batch " << i;
+        EXPECT_EQ(a->verdicts, expect[i]) << "batch " << i;
+        EXPECT_EQ(r.leo(), leo) << "batch " << i << ": nothing appended";
+    }
+    EXPECT_EQ(r.stats()->verdictUnknownDuplicates, unknown + 6);
+}
+
+TEST(LeaseWriteHookWorkerRegression, LeaseKnownOldDuplicateIndexNotReadyThrottledRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const DupBatches d = writeDupBatches(l, 40);
+    r.settle(150);
+    const int64_t leo = r.leo();
+    r.demote();
+    r.holdJudge(true);
+    r.promote();
+    r.passes(30);
+    ASSERT_FALSE(r.leaseReady()) << "vacuity guard: the judge has not activated under the new leadership";
+    const auto th = l.produceNoSeq(d.batches[3], d.seqs[3]);   // the update of live k1
+    ASSERT_TRUE(th);
+    EXPECT_EQ(th->code, int16_t(rune::protocol::client::ErrorCode::Throttled));
+    EXPECT_EQ(th->retryAfter, 1'000'000);
+    EXPECT_EQ(r.leo(), leo) << "nothing appended";
+    r.holdJudge(false);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(60);
+    ASSERT_TRUE(r.leaseReady());
+    const auto ok = l.produceNoSeq(d.batches[3], d.seqs[3]);
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(ok->code, 0);
+    EXPECT_EQ(ok->baseOffset, -1);
+    EXPECT_TRUE(ok->hasLease);
+    EXPECT_TRUE(ok->verdicts.empty()) << "the update is live";
+    EXPECT_EQ(r.leo(), leo);
+}
+
+TEST(LeaseWriteHookWorkerRegression, LeaseAckArenaFullDefersRegression) {
+    RigTuning tuning;
+    tuning.ackTimeoutNs = 50'000'000;
+    Leased l(1000, /*arenaEntries=*/8, tuning);
+    VerdictRig& r = l.r;
+    // 5 records need 10 lease units: the 8-unit arena can never hold them.
+    const auto big = l.produce({grantTtl(1, 0), grantTtl(2, 0), grantTtl(3, 0), grantTtl(4, 0), grantTtl(5, 0)});
+    ASSERT_TRUE(big) << "answered at the deadline";
+    EXPECT_EQ(big->code, int16_t(rune::protocol::client::ErrorCode::Internal)) << "the trailer never fit: deferred until the deadline";
+    EXPECT_FALSE(big->hasLease);
+    // nothing leaked: 4-record batches (8 units) and a single one still fit, over and over
+    for (uint64_t i = 0; i < 3; ++i) {
+        const auto four = l.produce({grantTtl(10 + 4 * i, 0), grantTtl(11 + 4 * i, 0), grantTtl(12 + 4 * i, 0), grantTtl(13 + 4 * i, 0)});
+        ASSERT_TRUE(four) << i;
+        EXPECT_EQ(four->code, 0);
+        EXPECT_EQ(four->leases.size(), 4u);
+    }
+    const auto one = l.produce({grantTtl(99, 0)});
+    ASSERT_TRUE(one);
+    EXPECT_EQ(one->code, 0);
+    EXPECT_EQ(one->leases.size(), 1u);
+}
+
+// An error ack never carries a trailer, and the runs a known-old duplicate reserved at append are released when its ack turns
+// into an error (here NotLeader: demoted while the duplicate waits on its fsync).  The arena holds 21 duplicates' runs (3 units
+// each); 21 of them parked and failed, then 21 more answered, only works when every failed one released its runs.
+TEST(LeaseWriteHookWorkerRegression, LeaseAckRunsFreedOnErrorRegression) {
+    RigTuning tuning;
+    tuning.durabilityTier = 2;
+    Leased l(1000, /*arenaEntries=*/64, tuning);
+    VerdictRig& r = l.r;
+    constexpr int kDups = 21;
+    std::vector<std::vector<RawRec>> batches;
+    std::vector<int32_t> seqs;
+    for (int i = 0; i < kDups; ++i) {
+        batches.push_back({grantTtl(1 + uint64_t(i), 3000)});
+        seqs.push_back(l.seq);
+        const auto a = l.produce(batches.back());
+        ASSERT_TRUE(a) << i;
+        ASSERT_EQ(a->code, 0);
+    }
+    for (int i = 0; i < 40; ++i) ASSERT_TRUE(l.produce({grantTtl(1000 + uint64_t(i), 3000)})) << "filler " << i;
+    r.settle(150);
+    const int64_t leo = r.leo();
+    std::vector<int64_t> corrs;
+    for (int i = 0; i < kDups; ++i)
+        corrs.push_back(r.produceBytes(VerdictRig::rawBatch(batches[std::size_t(i)], 11, seqs[std::size_t(i)]), rune::protocol::client::kAcksWireView, 11, seqs[std::size_t(i)]));
+    r.pass();      // every duplicate is appended-and-parked on its fsync
+    r.demote();    // ... and fails NotLeader before it fires
+    int notLeader = 0;
+    for (const int64_t c : corrs) {
+        const auto a = r.ack(c, 600);
+        ASSERT_TRUE(a);
+        EXPECT_NE(a->code, 0);
+        EXPECT_FALSE(a->hasLease) << "an error ack never carries a trailer";
+        if (a->code == int16_t(rune::protocol::client::ErrorCode::NotLeader)) ++notLeader;
+    }
+    EXPECT_EQ(notLeader, kDups) << "vacuity guard: every duplicate was parked with its runs, then failed";
+    r.promote();
+    r.passes(60);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(60);
+    ASSERT_TRUE(r.leaseReady());
+    for (int i = 0; i < kDups; ++i) {
+        const auto a = l.produceNoSeq(batches[std::size_t(i)], seqs[std::size_t(i)]);
+        ASSERT_TRUE(a) << i;
+        EXPECT_EQ(a->code, 0) << i;
+        EXPECT_TRUE(a->hasLease) << i;
+        EXPECT_EQ(a->verdicts, (Verd{{0, 21, 0}})) << i;
+    }
+    EXPECT_EQ(r.leo(), leo);
 }
