@@ -585,7 +585,7 @@ void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexc
 }
 
 // The key index is never checkpointed: nothing will encode its dirty rows, so they are dropped (WorkerViewSet::discardDirty_'s rule).
-void VerdictSource::discardKeyIndexDirty_(ViewInstance& inst) {
+void VerdictSource::discardKeyIndexDirty_(ViewInstance& inst) noexcept {
     if (!inst.table.hasDirty()) return;
     inst.table.drainDirtyKeyed([](uint32_t, const uint8_t*, bool, std::span<const uint8_t>) noexcept {});
     // No checkpoint: the drain ends the window, so its growth is trimmed here and a kept one waits for the quiet rule

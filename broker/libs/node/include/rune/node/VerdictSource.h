@@ -493,7 +493,7 @@ private:
         if (hooks_.discard != nullptr) hooks_.discard(hooks_.ctx, *m.inst, ViewDiscardReason::BelowLogStart);
         return false;
     }
-    static void discardKeyIndexDirty_(ViewInstance& inst);
+    static void discardKeyIndexDirty_(ViewInstance& inst) noexcept;
     [[nodiscard]] rune::view::Verdict verdictOf_(const Member& m, const rune::view::SourceRecord& rec) const noexcept;
     template <class ReadRangeFn>
     bool   switchSet_(int64_t changeOffset, ReadRangeFn& readRange, const rune::view::AbortedTxnFilter& aborted, int& work);
