@@ -482,7 +482,7 @@ public:
     [[nodiscard]] TxnAdmission admitTxnBatch(int64_t producerId, int16_t epoch, uint64_t& nextReqId,
                                              bool canRequest = true) noexcept {
         using K = TxnAdmission::Kind;
-        if (tracker_.firstOffsetOf(producerId) >= 0) [[likely]] return {};
+        if (tracker_.openVerified(producerId)) [[likely]] return {};   // a transaction rebuilt from the log is verified again first
         TxnVerifySet::Entry* e = verify_.find(producerId);
         if (e != nullptr && e->epoch == epoch) {
             switch (e->state) {
@@ -1035,6 +1035,7 @@ private:
             // The tail lies wholly at or above target: replayed in order (§2.2).
             for (const TailEvent& e : tail_) applyMarker_(e.producerId, e.offset, e.commit);
             tail_.clear();
+            tracker_.markInherited();
             st_ = Ready{cur.epoch, cur.logGen, cur.leadGen};
             if (verdict_.end != nullptr) verdict_.end(verdict_.ctx);
         }
@@ -1045,6 +1046,7 @@ private:
         // keeps the FIFO / range order (§2.2).
         for (const TailEvent& e : tail_) applyMarker_(e.producerId, e.offset, e.commit);
         tail_.clear();
+        tracker_.markInherited();
         st_ = Ready{s.epoch, s.logGen, s.leadGen};
         if (verdict_.end != nullptr) verdict_.end(verdict_.ctx);
     }

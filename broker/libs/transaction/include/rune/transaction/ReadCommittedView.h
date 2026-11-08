@@ -162,8 +162,14 @@ public:
     /// Part 11: this partition answered a vote (or holds a TxnJudge) for the producer's open transaction of `epoch`; the transaction
     /// takes no more batches until its marker.  No effect when the producer has no open transaction.
     void markVoted(ProducerId producerId, int16_t epoch) noexcept;
+    /// The mark never goes down: a stale vote of an older epoch lifts nothing.
     /// The open transaction of `producerId` was voted on at exactly `epoch` (O(1)).
     [[nodiscard]] bool votedAt(ProducerId producerId, int16_t epoch) const noexcept;
+
+    /// Every open transaction now present was inherited from the log: it needs a fresh verification before its next batch.
+    void markInherited() noexcept;
+    /// The producer has an open transaction that no leadership change has left unverified (O(1)).
+    [[nodiscard]] bool openVerified(ProducerId producerId) const noexcept;
 
     /// Forget every open transaction: BOTH the pid table and the first-offset
     /// FIFO (N4).  Capacity is kept.
@@ -182,6 +188,7 @@ private:
         ProducerId producerId  = -1;
         bool       live        = false;
         int16_t    votedEpoch  = -1;   ///< Part 11: the epoch this partition voted at (-1 = not voted)
+        bool       inherited   = false; ///< Part 11: open since before this leadership; verified again by the next batch
     };
     struct Slot {
         ProducerId producerId = kEmptyPid;   ///< kEmptyPid = free

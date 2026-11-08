@@ -187,7 +187,10 @@ void LsoTracker::popDeadFront_() noexcept
 void LsoTracker::onProduceBatch(ProducerId producerId, int64_t batchBaseOffset)
 {
     if (producerId < 0) return;               // non-transactional batch; no effect on LSO
-    if (find_(producerId) != nullptr) return; // already open: keep the earlier firstOffset
+    if (Slot* s = find_(producerId)) {         // already open: keep the earlier firstOffset
+        fifo_[s->pos & fifoMask_].inherited = false;
+        return;
+    }
 
     ensureRoom_();
     uint64_t pos = tail_;
@@ -243,7 +246,10 @@ int64_t LsoTracker::firstOffsetOf(ProducerId producerId) const noexcept
 void LsoTracker::markVoted(ProducerId producerId, int16_t epoch) noexcept
 {
     if (producerId < 0) return;
-    if (Slot* s = find_(producerId)) fifo_[s->pos & fifoMask_].votedEpoch = epoch;
+    if (Slot* s = find_(producerId)) {
+        int16_t& voted = fifo_[s->pos & fifoMask_].votedEpoch;
+        voted = std::max(voted, epoch);
+    }
 }
 
 bool LsoTracker::votedAt(ProducerId producerId, int16_t epoch) const noexcept
@@ -251,6 +257,18 @@ bool LsoTracker::votedAt(ProducerId producerId, int16_t epoch) const noexcept
     if (producerId < 0) return false;
     const Slot* s = find_(producerId);
     return s != nullptr && fifo_[s->pos & fifoMask_].votedEpoch == epoch;
+}
+
+void LsoTracker::markInherited() noexcept
+{
+    for (uint64_t p = head_; p != tail_; ++p) fifo_[p & fifoMask_].inherited = true;
+}
+
+bool LsoTracker::openVerified(ProducerId producerId) const noexcept
+{
+    if (producerId < 0) return false;
+    const Slot* s = find_(producerId);
+    return s != nullptr && !fifo_[s->pos & fifoMask_].inherited;
 }
 
 void LsoTracker::clear() noexcept

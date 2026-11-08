@@ -925,6 +925,7 @@ TEST(CheckedWritesTxnWorker, TxnPairCommitsOnBothOrNeither) {
 // transaction until the marker lands; the judge's yes or no covers only the rows below its TxnJudge.
 namespace {
 constexpr int16_t kInvalidTxnState = static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
+constexpr int16_t kZombieCode = static_cast<int16_t>(pc::ErrorCode::InvalidProducerEpoch);
 
 int16_t txnProduce(Ki& k, int64_t pid, uint64_t id, int32_t seq, int16_t epoch = 0) {
     const auto a = k.r.ack(k.r.produceFrame({ups(id)}, kLeader, pid, seq, /*txn=*/true, epoch));
@@ -1009,7 +1010,9 @@ TEST(CheckedWritesTxnVoteFreezeRegression, FreezeComesFromTheLogNotFromTheJudgeT
     k.r.failover();
     k.r.passes(60);
     ASSERT_EQ(k.r.txnJudgeOffsetsInLog().size(), 1u);
-    const_cast<PartitionWriteState*>(k.r.writeState())->txn.truncateFrom(0);   // as if the table had refused J
+        PartitionWriteState* ws = const_cast<PartitionWriteState*>(k.r.writeState());
+    ws->txn.releaseOverlays([](int32_t) {});   // truncateFrom's precondition; the pool slot stays with the finished test
+    ws->txn.truncateFrom(0);   // as if the table had refused J
     ASSERT_EQ(k.r.writeState()->txn.find(67), nullptr);
     EXPECT_EQ(txnProduce(k, 67, 7, 1), kInvalidTxnState);
 }
@@ -1024,6 +1027,34 @@ TEST(CheckedWritesTxnVoteFreezeRegression, OlderEpochIsFencedNotFrozen) {
     ASSERT_EQ(k.r.voteReply(tok)->errorCode, 0);
     EXPECT_EQ(txnProduce(k, 68, 7, 1, /*epoch=*/1), kInvalidTxnState) << "the voted epoch";
     const int16_t zombie = txnProduce(k, 68, 8, 1, /*epoch=*/0);
-    EXPECT_NE(zombie, kInvalidTxnState);
-    EXPECT_NE(zombie, 0) << "fenced";
+    EXPECT_EQ(zombie, kZombieCode) << "fenced as before";
+}
+
+// A vote of an older epoch (a zombie coordinator's resend) answers, but it does not lift the freeze of the newer epoch.
+TEST(CheckedWritesTxnVoteFreezeRegression, StaleVoteOfAnOlderEpochKeepsTheFreeze) {
+    Ki k;
+    (void)k.r.appendTxnReplicated(VerdictRig::batch({ins(1)}, 69, 0, {}, /*txn=*/true, /*epoch=*/1));
+    k.r.passes(30);
+    const int64_t fresh = k.r.sendVote(VerdictRig::kSrc, 69, 1);
+    ASSERT_TRUE(k.r.driveUntilVoted(fresh));
+    const int64_t stale = k.r.sendVote(VerdictRig::kSrc, 69, 0);
+    ASSERT_TRUE(k.r.driveUntilVoted(stale));
+    const int64_t leo = k.r.replica->logEndOffset();
+    EXPECT_EQ(txnProduce(k, 69, 7, 1, /*epoch=*/1), kInvalidTxnState);
+    EXPECT_EQ(k.r.replica->logEndOffset(), leo);
+}
+
+// A vote that wrote no TxnJudge leaves nothing in the log for a new leader to see: the open transaction it inherits is verified
+// again by the producer's next batch (answered ConcurrentTransactions while the ask is out) instead of being admitted.
+TEST(CheckedWritesTxnVoteFreezeRegression, NewLeaderVerifiesAgainAfterAVoteWithoutAJudgeRecord) {
+    Ki k;
+    ASSERT_EQ(txnProduce(k, 70, 4, 0), 0);
+    ASSERT_EQ(k.vote(70).judgeOffset, -1) << "a non-voting yes";
+    k.r.failover();
+    k.r.passes(60);
+    k.r.worker->setTxnVerification(true);
+    const int64_t leo = k.r.replica->logEndOffset();
+    EXPECT_EQ(txnProduce(k, 70, 5, 1), static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+    EXPECT_EQ(k.r.replica->logEndOffset(), leo);
+    EXPECT_EQ(k.r.worker->txnVerifyRequestsSentForTest(), 1u);
 }
