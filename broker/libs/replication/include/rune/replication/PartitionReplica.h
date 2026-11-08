@@ -907,6 +907,10 @@ public:
     void publishCleanerVerdictBound(Offset bound) noexcept { publishedVerdictBound_.store(bound, std::memory_order_release); }
     [[nodiscard]] Offset cleanerVerdictBound() const noexcept { return publishedVerdictBound_.load(std::memory_order_acquire); }
     [[nodiscard]] Offset cleanerVerdictMarkerEnd() const noexcept { return publishedVerdictMarkerEnd_.load(std::memory_order_acquire); }
+    // Part 11: the cleaner may remove a TxnJudge (type 19) only below this offset (the owning worker's judge: every member checkpoint
+    // is past it).  0 (the default) = keep every one.
+    void publishCleanerTxnJudgeBound(Offset bound) noexcept { publishedTxnJudgeBound_.store(bound, std::memory_order_release); }
+    [[nodiscard]] Offset cleanerTxnJudgeBound() const noexcept { return publishedTxnJudgeBound_.load(std::memory_order_acquire); }
     // D3b fix round 1: the minimum fetch position over EVERY assigned replica (not
     // just the ISR), published by the duty/owning thread in publishCleanerState().
     // A txn marker below it is held by every replica, so the cleaner may remove it;
@@ -2148,6 +2152,7 @@ private:
     // D3b: first unstable offset (LSO) for the cleaner — see publishCleanerLso().
     std::atomic<Offset> publishedLsoForCleaner_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
     std::atomic<Offset> publishedVerdictBound_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
+    std::atomic<Offset> publishedTxnJudgeBound_{0};   // Part 11: until the worker publishes, no TxnJudge is removed
     Offset retentionHold_ = std::numeric_limits<Offset>::max();   // owner thread only
     std::atomic<Offset> publishedVerdictMarkerEnd_{0};
     // D3b fix round 1: min fetch position over every assigned replica — see

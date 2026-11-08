@@ -920,7 +920,7 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
     EXPECT_EQ(v.offsetOf(1), -1);
     EXPECT_EQ(v.offsetOf(3), base + 3);
 
-    // ---- the Tier-2 batch: the same tags, one completion, the same per-record verdicts ----
+    // ---- the Tier-2 batch: the same tags, one completion.  A Tier-2 batch is atomic (P11-6): one bad record rejects all of it ----
     const uint64_t tok2 = s.next++;
     rc::BatchBuilder bb = s.prod->batch(*s.topic, rc::Key(uint64_t{1}));
     const std::string recKey = std::string("\x01\0\0\0\0\0\0\0", 8);   // the typed record key: id 1, 8 bytes LE
@@ -937,14 +937,9 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
     ASSERT_EQ(c2->status, rc::OpStatus::RecordsRejected) << "err=" << c2->errorCode;
     EXPECT_EQ(rc::constraintIdOf(*c2), rune::view::constraintIdOf(7, 1));
     const rc::BatchVerdicts v2(*c2, payload2);
-    ASSERT_EQ(v2.rejectedCount(), 3u);
-    EXPECT_EQ(v2.rejection(0).index, 1);
-    EXPECT_EQ(v2.rejection(1).index, 4);
-    EXPECT_EQ(v2.rejection(2).index, 5);
-    const int64_t base2 = c2->value;
-    ASSERT_GE(base2, 0);
-    EXPECT_EQ(v2.offsetOf(0), base2);
-    EXPECT_EQ(v2.offsetOf(4), -1);
+    // TODO(Part 11 Task 12): the ack carries one trailer entry, the first failing record's, and completes as BrokerError.
+    EXPECT_EQ(v2.rejectedCount(), tags.size()) << "every record of the atomic batch is rejected";
+    for (uint32_t i = 0; i < tags.size(); ++i) EXPECT_EQ(v2.offsetOf(i), -1);
 
     // ---- the Raw subscriber gets exactly the accepted records: a capped poll ending on a sentinel accepted send ----
     const std::string sentinelVal = verdictValue(100, 1, 1);
@@ -963,7 +958,7 @@ TEST(CheckedWritesBrokerRegression, ClaimAndTier2ReportEveryRecordVerdictShardRe
     ASSERT_TRUE(seen) << "the sentinel never reached the subscriber";
     sub.unsubscribe();
     std::lock_guard<std::mutex> g(mu);
-    EXPECT_EQ(got, (std::set<int64_t>{base + 0, base + 2, base + 3, base2 + 0, base2 + 2, base2 + 3, sentinelOff}));
+    EXPECT_EQ(got, (std::set<int64_t>{base + 0, base + 2, base + 3, sentinelOff})) << "nothing of the rejected atomic batch";
 }
 
 // A batch whose every record is rejected is skipped by the group fetch path too: the group consumer sees exactly the accepted

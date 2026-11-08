@@ -1388,7 +1388,11 @@ if(BUILD_TESTING)
             # publication, REAL invoker driver over aeron:ipc.
             add_executable(rune_shard_worker_ack_tests tests/node/ShardWorkerAckTest.cpp)
             target_link_libraries(rune_shard_worker_ack_tests PRIVATE rune_node rune_replication rune_codec aeron::aeron GTest::gtest_main)
-            gtest_discover_tests(rune_shard_worker_ack_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            # The stalled-thread variant sleeps 1.5 s, so it carries LABELS stress; the default runs without the stall.
+            gtest_discover_tests(rune_shard_worker_ack_tests TEST_FILTER "*StressRegression*"
+                                 PROPERTIES TIMEOUT 120 LABELS stress ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            gtest_discover_tests(rune_shard_worker_ack_tests TEST_FILTER "-*StressRegression*"
+                                 PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 03: the write hook and the View acks on a real Worker over an IPC driver.
             add_executable(rune_checked_writes_ack_tests tests/node/CheckedWritesWorkerHookTest.cpp tests/node/CheckedWritesViewAckTest.cpp tests/node/CheckedWritesViewAckMatrixTest.cpp)
@@ -1397,10 +1401,15 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_checked_writes_ack_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 04: the verdict pipeline on a real Worker.
-            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp tests/node/CheckedWritesCatalogGateTest.cpp tests/node/CheckedWritesConstraintWorkerTest.cpp tests/node/CheckedWritesConstraintChangeTest.cpp)
+            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp tests/node/CheckedWritesCatalogGateTest.cpp tests/node/CheckedWritesConstraintWorkerTest.cpp tests/node/CheckedWritesConstraintChangeTest.cpp tests/node/CheckedWritesTxnWorkerTest.cpp)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view rune_ql aeron::aeron GTest::gtest_main)
-            gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            # The full-length determinism runs (two whole seeds, over 1 s alone) carry LABELS stress; the default runs half the steps.
+            set(RUNE_CW_VERDICT_STRESS_TESTS "*SameSeedSameTraceFullLength*")
+            gtest_discover_tests(rune_checked_writes_verdict_tests TEST_FILTER "${RUNE_CW_VERDICT_STRESS_TESTS}"
+                                 PROPERTIES TIMEOUT 300 LABELS stress ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            gtest_discover_tests(rune_checked_writes_verdict_tests TEST_FILTER "-${RUNE_CW_VERDICT_STRESS_TESTS}"
+                                 PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # The namespace fetch gate on the default consume paths (worker-owned, group, filtered subscriptions; legacy PushRead).
             add_executable(rune_ns_fetch_adv_tests tests/node/NsFetchGateAdversarialRegressionTest.cpp)

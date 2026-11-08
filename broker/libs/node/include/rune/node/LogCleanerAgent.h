@@ -716,6 +716,7 @@ public:
         cleaner.setMarkerRemovalBound(markerRemovalBound);
         const int64_t verdictBound = best.replica->cleanerVerdictBound();   // the bound first, then the marker end that carries it
         cleaner.setVerdictBounds(verdictBound, best.replica->cleanerVerdictMarkerEnd());
+        cleaner.setTxnJudgeBound(best.replica->cleanerTxnJudgeBound());   // Part 11: the TxnJudges no member checkpoint needs
         // Part 06: an autoincrement partition keeps each live producer's whole retry window (ProducerBatchWindow.h).
         cleaner.setProducerTailDepth(best.replica->producerTailDepth());
         const int64_t previousPassEnd = best.replica->cleanerProgress();

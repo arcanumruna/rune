@@ -363,8 +363,8 @@ public:
 
         checkIndex(r_, model);                                              // (a)
         checkMarkers(model, log, target);
-        std::set<std::string> live;                                         // (b)
-        for (const auto& [id, row] : model.projection()) live.insert(std::to_string(id));
+        std::set<uint64_t> live;                                            // (b)
+        for (const auto& [id, row] : model.projection()) live.insert(live.end(), id);
         EXPECT_EQ(r_.keyIndexKeys(), live) << "(b) the key index holds the live keys of the accepted records";
         checkDelivered_(model);                                             // (c)
         checkViews(r_, model, log, kProj, kCnt);                            // (d)
@@ -620,7 +620,7 @@ private:
         EXPECT_EQ(r_.stats()->rejectionsKeyNotFound, judgedNothing ? 0u : count_(model, 57));
     }
 
-    // (c) a raw subscription from 0 receives exactly the accepted records (and the aborted transaction's, which is in the log), each with its intent as op()
+    // (c) a raw subscription from 0 receives exactly the accepted records, each with its intent as op(); never the aborted transaction's (P11-10)
     void checkDelivered_(const CheckedWritesModel& model) {
         for (int i = 0; i < VerdictRig::kMaxPass && r_.worker->rcStatusForTest(VerdictRig::kSrc, 0) != Worker::kRcReady; ++i) r_.pass();
         ASSERT_EQ(r_.worker->rcStatusForTest(VerdictRig::kSrc, 0), Worker::kRcReady);
@@ -628,10 +628,6 @@ private:
         std::vector<std::tuple<int64_t, uint64_t, uint16_t, uint8_t>> got, want;
         for (const auto& d : box.records) got.emplace_back(d.offset, d.id, d.tag, d.intent);
         for (const auto& a : model.acceptedRecords()) want.emplace_back(a.offset, a.id, a.del ? kTombstoneTag : a.tag, a.intent);
-        if (c_.timing == Timing::TxnAbortBehind) {
-            want.emplace_back(txnOffset_, kKey, uint16_t{1}, uint8_t{0});
-            std::sort(want.begin(), want.end());
-        }
         EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
     }
 

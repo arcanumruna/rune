@@ -484,6 +484,7 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // aborted txn data.  M3: these reads are throttled by the caller.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
+    verdicts.setTxnJudgeBound(txnJudgeBound_);
     std::optional<Damaged> scanDamage;
     prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, window_ ? &*window_ : nullptr, windowNowMs_, producerIdExpirationMs_, scanDamage);
     if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return -1; }   // incomplete state: no map
@@ -565,6 +566,7 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
     // D3b: transaction pre-pass (+ producer tails) — see the bounded overload.
     VerdictCleanState& verdicts = map.verdictState();
     verdicts.clear();
+    verdicts.setTxnJudgeBound(txnJudgeBound_);
     std::optional<Damaged> scanDamage;
     prefixBytesRead_ = scanTxnState(dir, bases, fromOffset, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_, verdicts, verdictBound_, verdictMarkerEnd_, window_ ? &*window_ : nullptr, windowNowMs_, producerIdExpirationMs_, scanDamage);
     if (scanDamage) { noteDamage_(dir, scanDamage->segBase, scanDamage->byteOffset); return; }   // incomplete state: no map

@@ -23,6 +23,7 @@
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/catalog/CatalogReplayer.h>
 #include <rune/client/Client.h>
+#include <rune/client/transport/TransportConfig.h>
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
@@ -106,6 +107,7 @@ public:
         c.egressChannel   = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
         c.egressStreamId  = 2;
         c.dataDir         = (dir_ / ("client" + std::to_string(clients_.size()))).string();
+        c.driverCountersBytes = rune::client::transport::kMinDriverCountersBytes;   // a client's few counters: a small CnC (#883)
         auto client = std::make_unique<rune::client::Client>(c);
         client->connectAndWait(std::chrono::seconds(20));
         clients_.push_back(std::move(client));

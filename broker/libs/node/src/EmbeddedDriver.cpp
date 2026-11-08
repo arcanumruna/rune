@@ -205,6 +205,7 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
         if (aeron_driver_context_get_publication_unblock_timeout_ns(ctx_) <= livenessNs)
             aeron_driver_context_set_publication_unblock_timeout_ns(ctx_, livenessNs + livenessNs / 2);
     }
+    if (cfg_.timerIntervalNs > 0) aeron_driver_context_set_timer_interval_ns(ctx_, static_cast<uint64_t>(cfg_.timerIntervalNs));
     aeron_driver_context_set_dir_delete_on_start(ctx_, true);
     aeron_driver_context_set_dir_delete_on_shutdown(ctx_, cfg_.deleteDirOnShutdown);
     if (cfg_.countersValuesBytes > 0)

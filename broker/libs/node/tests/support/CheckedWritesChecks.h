@@ -167,10 +167,8 @@ inline void checkViews(VerdictRig& r, const CheckedWritesModel& model, const Ver
     }
 }
 
-/// (c) A subscription delivered exactly the accepted records (Filtered: the live tag-1 ones), with their intents; `alsoDelivered`
-/// are further log records the subscription delivers (a Raw one gets an aborted transaction's).
-inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64_t sub, bool filtered, const std::set<int64_t>* present = nullptr,
-                           const std::vector<VerdictRig::RigLogRec>* alsoDelivered = nullptr) {
+/// (c) A subscription delivered exactly the accepted records (Filtered: the live tag-1 ones), with their intents.
+inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64_t sub, bool filtered, const std::set<int64_t>* present = nullptr) {
     for (int i = 0; i < VerdictRig::kMaxPass && r.worker->rcStatusForTest(VerdictRig::kSrc, r.partition()) != Worker::kRcReady; ++i) r.pass();   // nothing is delivered while the leadership scan runs
     ASSERT_EQ(r.worker->rcStatusForTest(VerdictRig::kSrc, r.partition()), Worker::kRcReady);
     const auto& box = r.collect(sub);
@@ -184,7 +182,6 @@ inline void checkDelivered(VerdictRig& r, const CheckedWritesModel& model, int64
         if (filtered && (a.del || a.tag != 1)) continue;
         addWant(a);
     }
-    if (alsoDelivered != nullptr) for (const auto& a : *alsoDelivered) addWant(a);
     std::sort(want.begin(), want.end());
     EXPECT_EQ(got, want) << "(c) the delivered records are the accepted ones, with their intents";
 }

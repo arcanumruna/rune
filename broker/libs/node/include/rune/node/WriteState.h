@@ -211,8 +211,9 @@ struct TxnJudgeStats {
              txnOverlayWaits = 0, lockPauses = 0, checkpointBackfills = 0, vetoedCheckpointPushes = 0,
              judgeRecordRefusals = 0,   ///< a TxnJudge the table refused (full, or the producer's entry holds an overlay): the judge waits
              ordinaryWaits = 0,         ///< an ordinary transaction the judge could not track (its table full): the judge waits
-             supersedeKeysOverflow = 0, ///< an ordinary transaction with more keys or markers than the P11-3a scan tracks: the judge waits at its marker
-             undecidedReplaceRefusals = 0; ///< a producer's next TxnJudge refused while its previous transaction has no marker
+             supersedeKeysOverflow = 0, ///< an ordinary transaction with more keys than the one-step set holds: applied in segments, one per pass
+             undecidedReplaceRefusals = 0, ///< a producer's next TxnJudge refused while its previous transaction has no marker
+             atomicTooLarge = 0;        ///< an atomic batch past txnJudgedRecordsMax: every record rejected (62) until rule 10 (Task 12)
 };
 struct DeferredTxn {
     int64_t     producerId = -1;
@@ -227,7 +228,8 @@ struct DeferredTxn {
     int32_t     overlay = -1;
     int64_t     voteReceivedNs = 0;
 };
-struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; };
+/// `judgeOffset`: the J the vote waits for; -1 while the worker's vote-time scan runs (only the worker answers those).
+struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; int64_t judgeOffset = -1; int64_t receivedNs = 0; };
 
 /// The transactions of one source between their TxnJudge record and their marker, in judge-offset order.  Everything is reserved
 /// by reserve(); no call allocates after it.  A full table refuses the record (nullptr): the judge waits there, never a verdict.
@@ -247,6 +249,7 @@ public:
             if (txns_[i].producerId == producerId) return &txns_[i];
         return nullptr;
     }
+    [[nodiscard]] const DeferredTxn* find(int64_t producerId) const noexcept { return const_cast<TxnJudgeState*>(this)->find(producerId); }
     /// A producer's next transaction replaces its previous entry; a full table gives up its oldest Finalized one.  nullptr: the judge
     /// waits (the previous entry holds an overlay or has no marker yet, or every entry is live).  A record at or below the producer's
     /// entry is a re-feed.
@@ -258,12 +261,12 @@ public:
                 ++stats.undecidedReplaceRefusals;
                 return nullptr;
             }
-            txns_.erase(txns_.begin() + (old - txns_.data()));
+            giveUp_(txns_.begin() + (old - txns_.data()));
         }
         if (txns_.size() >= kMaxTxns) {
             const auto done = std::find_if(txns_.begin(), txns_.end(), [&](const DeferredTxn& t) { return t.phase == TxnPhase::Finalized && t.overlay < 0 && !hasParked_(t.producerId); });
             if (done == txns_.end()) return nullptr;
-            txns_.erase(done);
+            giveUp_(done);
         }
         DeferredTxn& t = txns_.emplace_back();
         t.producerId = r.producerId;
@@ -285,6 +288,8 @@ public:
     void truncateFrom(int64_t offset) noexcept {
         while (!txns_.empty() && txns_.back().judgeOffset >= offset) txns_.pop_back();
         for (DeferredTxn& t : txns_) {
+            // Judged and decided below the cut: the judgement is the log's (deterministic), so a vote parked on it keeps its answer.
+            if (t.phase == TxnPhase::Finalized && t.judged && t.markerOffset >= 0 && t.markerOffset < offset) continue;
             if (t.markerOffset >= offset) {
                 t.markerOffset = -1;
                 t.commit = false;
@@ -305,10 +310,12 @@ public:
                 t.overlay = -1;
             }
     }
-    /// The judge passed J and the marker is committed: nothing is left to judge (an entry truncateFrom reset to AwaitJudge).
-    void finalizeDecided(int64_t judgeCursor, int64_t hw) noexcept {
+    /// An entry truncateFrom reset whose transaction lies below `covered`, the markers' coverage, with its marker committed: a judge
+    /// before this one applied it (K never passes a transaction that is not Finalized), so nothing is left to do.  Not from the
+    /// judge's cursor: a reset Locked entry with J < cursor <= M still owes its apply (T5 N1).
+    void finalizeDecided(int64_t covered, int64_t hw) noexcept {
         for (DeferredTxn& t : txns_)
-            if (t.phase == TxnPhase::AwaitJudge && t.markerOffset >= 0 && t.markerOffset < hw && t.judgeOffset < judgeCursor) t.phase = TxnPhase::Finalized;
+            if (t.phase == TxnPhase::AwaitJudge && t.markerOffset >= 0 && t.markerOffset < hw && t.firstOffset < covered) t.phase = TxnPhase::Finalized;
     }
     /// The first Locked entry whose marker is below `hw`: the judge finalizes it (P11-4).
     [[nodiscard]] DeferredTxn* lockedDecided(int64_t hw) noexcept {
@@ -316,12 +323,37 @@ public:
             if (t.phase == TxnPhase::Locked && t.markerOffset >= 0 && t.markerOffset < hw) return &t;
         return nullptr;
     }
-    /// INT64_MAX = none.
+    /// The first offset of the earliest entry not Finalized (INT64_MAX = none): K stays below it.  A Locked entry with its marker
+    /// is not applied yet, so a marker alone decides nothing here.
     [[nodiscard]] int64_t earliestUndecidedFirst() const noexcept {
         int64_t first = INT64_MAX;
         for (const DeferredTxn& t : txns_)
-            if (t.markerOffset < 0 && t.firstOffset < first) first = t.firstOffset;
+            if (t.phase != TxnPhase::Finalized && t.firstOffset < first) first = t.firstOffset;
         return first;
+    }
+    /// onJudgeRecord would take a new record of the producer now: its entry (if any) holds no overlay and has its marker, and the
+    /// table has room.  The worker appends a TxnJudge only then, so the judge never waits on a record the worker wrote.
+    [[nodiscard]] bool acceptsJudge(int64_t producerId) const noexcept {
+        for (std::size_t i = txns_.size(); i-- > 0;)
+            if (txns_[i].producerId == producerId) return txns_[i].overlay < 0 && txns_[i].markerOffset >= 0;
+        return txns_.size() < kMaxTxns ||
+               std::any_of(txns_.begin(), txns_.end(), [&](const DeferredTxn& t) { return t.phase == TxnPhase::Finalized && t.overlay < 0 && !hasParked_(t.producerId); });
+    }
+    /// A Locked transaction judged below `cursor`: a member folded past it holds rows its apply has not changed yet (P11-8).
+    [[nodiscard]] bool lockedBelow(int64_t cursor) const noexcept {
+        return std::any_of(txns_.begin(), txns_.end(), [&](const DeferredTxn& t) { return t.phase == TxnPhase::Locked && t.judgeOffset < cursor; });
+    }
+    /// The lowest TxnJudge a judge may still read (the cleaner keeps it and every one above): `w`, the committed markers' coverage,
+    /// or the J of an entry whose transaction is not decided below `w`, including one the table gave up.
+    [[nodiscard]] int64_t judgeRecordsNeededFrom(int64_t w) noexcept {
+        if (givenUpMarker_ < w) {   // every entry given up is decided below w
+            givenUpJ_ = INT64_MAX;
+            givenUpMarker_ = -1;
+        }
+        int64_t from = std::min(w, givenUpJ_);
+        for (const DeferredTxn& t : txns_)
+            if (t.phase != TxnPhase::Finalized || t.markerOffset < 0 || t.markerOffset >= w) from = std::min(from, t.judgeOffset);
+        return from;
     }
     /// False: full, the caller answers NotLeader.
     [[nodiscard]] bool parkVote(const ParkedVote& v) noexcept {
@@ -329,24 +361,54 @@ public:
         parked_.push_back(v);
         return true;
     }
-    /// fn(const ParkedVote&, const DeferredTxn&) for every parked vote whose transaction the judge answered (Locked, or Finalized by a
-    /// judgement); those votes leave the park.
+    /// fn(const ParkedVote&, const DeferredTxn*) for every parked vote bound to a J that has an answer: the judge's (Locked, or
+    /// Finalized by a judgement), or none (nullptr: the entry of that J is gone, replaced, or Finalized without a judgement), which
+    /// the caller answers NotLeader, never with an unjudged default.  Those votes leave the park; a scanning vote (J -1) stays.
     template <class Fn>
     int drainAnswered(Fn&& fn) noexcept {
         int n = 0;
         std::size_t kept = 0;
         for (std::size_t i = 0; i < parked_.size(); ++i) {
-            const DeferredTxn* t = find(parked_[i].producerId);
-            if (t != nullptr && t->judged && (t->phase == TxnPhase::Locked || t->phase == TxnPhase::Finalized)) {
-                fn(parked_[i], *t);
+            const ParkedVote& v = parked_[i];
+            const DeferredTxn* t = v.judgeOffset < 0 ? nullptr : find(v.producerId);
+            const bool gone = v.judgeOffset >= 0 && (t == nullptr || t->judgeOffset != v.judgeOffset || (t->phase == TxnPhase::Finalized && !t->judged));
+            if (gone) {
+                fn(v, static_cast<const DeferredTxn*>(nullptr));
+                ++n;
+            } else if (t != nullptr && t->judged && (t->phase == TxnPhase::Locked || t->phase == TxnPhase::Finalized)) {
+                fn(v, t);
                 ++n;
             } else {
-                parked_[kept++] = parked_[i];
+                parked_[kept++] = v;
             }
         }
         parked_.resize(kept);
         return n;
     }
+    /// fn(const ParkedVote&) for the producer's scanning votes (J -1), which leave the park; `bindTo` >= 0 binds them to that J instead.
+    template <class Fn>
+    int takeScanning(int64_t producerId, int64_t bindTo, Fn&& fn) noexcept {
+        int n = 0;
+        std::size_t kept = 0;
+        for (std::size_t i = 0; i < parked_.size(); ++i) {
+            ParkedVote& v = parked_[i];
+            if (v.producerId == producerId && v.judgeOffset < 0) {
+                ++n;
+                if (bindTo >= 0) v.judgeOffset = bindTo;
+                else { fn(v); continue; }
+            }
+            parked_[kept++] = v;
+        }
+        parked_.resize(kept);
+        return n;
+    }
+    /// Demotion: fn(const ParkedVote&) for every parked vote, and the park empties.
+    template <class Fn>
+    void dropParked(Fn&& fn) noexcept {
+        for (const ParkedVote& v : parked_) fn(v);
+        parked_.clear();
+    }
+    [[nodiscard]] std::size_t parkedCount() const noexcept { return parked_.size(); }
     [[nodiscard]] std::size_t lockedCount() const noexcept {
         std::size_t n = 0;
         for (const DeferredTxn& t : txns_) n += t.phase == TxnPhase::Locked;
@@ -360,12 +422,20 @@ private:
         return std::any_of(parked_.begin(), parked_.end(), [&](const ParkedVote& v) { return v.producerId == producerId; });
     }
 
+    void giveUp_(std::vector<DeferredTxn>::iterator t) noexcept {
+        givenUpJ_ = std::min(givenUpJ_, t->judgeOffset);
+        givenUpMarker_ = std::max(givenUpMarker_, t->markerOffset < 0 ? INT64_MAX : t->markerOffset);
+        txns_.erase(t);
+    }
+
     std::vector<DeferredTxn> txns_;
     std::vector<ParkedVote>  parked_;
+    int64_t                  givenUpJ_ = INT64_MAX, givenUpMarker_ = -1;   ///< the entries replaced or evicted: their lowest J, latest marker
 };
 
 struct PartitionWriteState {
     const TopicWriteSpec*              spec = nullptr;
+    int32_t                            partition = -1;       ///< the partition this state is of (its replica may be gone first)
     rune::storage::RejectedOffsetIndex rejected;       ///< reserved when the partition becomes a verdict source (VerdictSource.cpp)
     ConstraintSetTimeline              constraintSets;
     MarkerLedger                       markers;

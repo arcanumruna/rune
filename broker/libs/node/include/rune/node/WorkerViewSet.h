@@ -310,7 +310,7 @@ public:
                    int64_t bound, const rune::view::FoldSkip& skip, int64_t nowNs,
                    const TransientBounds* transientSrc = nullptr, uint64_t leaderGen = 0,
                      bool leaderHwConfirmed = true, NsTag ns = {}, PartitionWriteState* write = nullptr, VerdictSource* judge = nullptr,
-                   SourceLogBounds b = {}) {
+                   SourceLogBounds b = {}, int64_t judgeBound = -1) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end() && judge == nullptr) return 0;
@@ -325,7 +325,8 @@ public:
             if (judge != nullptr) {
                 work += syncConstraintSet_(srcTopicId, *judge, *write);
                 if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
-                work += judge->driveJudge(readRange, bound, nowNs, *write, skip.aborted);
+                // P11-2: the judge reads to the HW (`judgeBound`, -1 = `bound`); the other views still fold below the LSO and K.
+                work += judge->driveJudge(readRange, judgeBound < 0 ? bound : judgeBound, nowNs, *write, skip.aborted, bound);
                 viewBound = std::min(bound, judge->judgedThrough());
                 work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns);
             } else {
@@ -358,6 +359,7 @@ public:
     /// type-20 record: that fallback is why the log keeps them.
     // Inline: Worker.h's rebuildRcSlots_ reaches it, and that header is built into libraries that do not link rune_node.
     void dropVerdictSource(int32_t srcTopicId, int32_t partition) {
+        if (const auto it = verdictSources_.find(instKey(srcTopicId, partition)); it != verdictSources_.end()) releaseJudge_(*it->second);
         verdictSources_.erase(instKey(srcTopicId, partition));
         eraseKeyIndex_(instKey(srcTopicId, partition));
         if (const auto sit = subscriptionIndex_.find(srcTopicId); sit != subscriptionIndex_.end())
@@ -374,6 +376,17 @@ public:
         verdictIntervalNs_ = ns;
         for (auto& kv : verdictSources_) kv.second->setVerdictIntervalNs(ns);
     }
+    /// Cold: the records a transaction may have to be judged (P11-1); every judge is bound again and the overlays re-reserved.  An
+    /// overlay or key set in use keeps its size until it is free (TxnOverlayPool).
+    void setTxnJudgedRecordsMax(int32_t n) {
+        txnJudgedRecordsMax_ = n;
+        for (auto& kv : verdictSources_) {
+            kv.second->bindTxn(&txnOverlays_, batchOverlay_, n);
+            reserveTxnOverlays_(*kv.second);
+        }
+    }
+    [[nodiscard]] int32_t txnJudgedRecordsMax() const noexcept { return txnJudgedRecordsMax_; }
+    [[nodiscard]] TxnOverlayPool& txnOverlaysForTest() noexcept { return txnOverlays_; }
     /// Cold: the source topic is gone; its judges and key indexes go with it.
     void dropSourceTopic(int32_t srcTopicId);
     /// Cold: a topic's write spec changed key.index, so syncConstraintSet_ must run again.
@@ -719,6 +732,17 @@ private:
     }
 
     std::unordered_map<uint64_t, std::unique_ptr<VerdictSource>> verdictSources_;   // (srcTopicId, partition) -> judge
+    // Part 11: the worker's transaction overlays, shared by its judges, and the atomic batch's (P11-6).  Reserved at member install.
+    TxnOverlayPool txnOverlays_;
+    std::array<rune::view::TxnOverlay, 1> batchOverlay_;
+    std::size_t batchOverlayRows_ = 0;
+    uint32_t batchOverlayRowLen_ = 0;
+    int32_t txnJudgedRecordsMax_ = 4096;
+    void reserveTxnOverlays_(const VerdictSource& judge);   // cold
+    /// A judge about to go: the overlays it or its state's entries hold go back to the pool.
+    void releaseJudge_(VerdictSource& judge) noexcept {
+        if (PartitionWriteState* s = judge.boundState()) judge.releaseTxnOverlays(s->txn);
+    }
     // The key index of a key.index partition: a verdict member of its judge that is in neither views_ nor templates_.  Rebuilt from the
     // local log at every activation; never persisted.  unordered_map keeps the node's address across the move-assign that rebuilds it.
     std::unordered_map<uint64_t, ViewInstance> keyIndexes_;

@@ -6,8 +6,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
-#include <vector>
+#include <memory>
 
 #include <rune/view/ViewKey.h>
 #include <rune/view/ViewTable.h>
@@ -17,7 +18,9 @@ namespace rune::view {
 enum class OverlayTable : uint8_t { View = 0, Owners = 1, Contributors = 2, Groups = 3, Blocks = 4, GroupIds = 5,
                                     ClaimsIndex = 6, ClaimsExtras = 7, KeyIndex = 8 };   // 0-7 = checkpoint v3 table ids (07, 09)
 
-// A fixed slot arena with an open-addressed index over (member, table, ViewKey).  Reserved once; never allocates afterwards.
+// A fixed slot arena with an open-addressed index over (member, table, ViewKey).  Reserved once; never allocates afterwards.  The
+// reserve writes nothing but the index: an entry and its row are written by the insert that takes them, so a reserve sized for the
+// largest transaction costs no more than the rows a transaction uses.
 class TxnOverlay {
 public:
     void reserve(std::size_t rows, uint32_t maxRowLen);   // cold
@@ -37,23 +40,30 @@ public:
     uint8_t* put(uint8_t member, OverlayTable table, const ViewKey& key, const uint8_t* base, uint32_t rowLen) noexcept;
     void erase(uint8_t member, OverlayTable table, const ViewKey& key) noexcept;
     // Scratch row handed out in place of a full put, so a caller that is about to report CapacityExhausted still has memory to write.
-    [[nodiscard]] uint8_t* spare() noexcept { return arena_.data() + capacity_ * maxRowLen_; }
+    [[nodiscard]] uint8_t* spare() noexcept { return arena_.get() + capacity_ * maxRowLen_; }
+    // The index and the last reserved entry, for residency checks.
+    [[nodiscard]] const int32_t* indexForTest() const noexcept { return index_.get(); }
+    [[nodiscard]] std::size_t slotsForTest() const noexcept { return slots_; }
+    [[nodiscard]] const void* lastEntryForTest() const noexcept { return entries_.get() + capacity_; }
 
 private:
     struct Entry {
         ViewKey      key;
+        uint32_t     pos = 0;   // its index slot, which clear() empties
         uint8_t      member = 0;
         OverlayTable table  = OverlayTable::View;
         bool         erased = false;
     };
     [[nodiscard]] int32_t find(uint8_t member, OverlayTable table, const ViewKey& key) const noexcept;
-    [[nodiscard]] uint8_t* image(int32_t slot) noexcept { return arena_.data() + static_cast<std::size_t>(slot) * maxRowLen_; }
-    [[nodiscard]] const uint8_t* image(int32_t slot) const noexcept { return arena_.data() + static_cast<std::size_t>(slot) * maxRowLen_; }
+    [[nodiscard]] uint8_t* image(int32_t slot) noexcept { return arena_.get() + static_cast<std::size_t>(slot) * maxRowLen_; }
+    [[nodiscard]] const uint8_t* image(int32_t slot) const noexcept { return arena_.get() + static_cast<std::size_t>(slot) * maxRowLen_; }
     int32_t insert(uint8_t member, OverlayTable table, const ViewKey& key) noexcept;   // -1 = full
 
-    std::vector<Entry>   entries_;
-    std::vector<int32_t> index_;   // slot + 1; 0 = empty
-    std::vector<uint8_t> arena_;   // capacity_ rows plus the spare
+    struct Free { void operator()(void* p) const noexcept { std::free(p); } };
+    std::unique_ptr<Entry[], Free>   entries_;
+    std::unique_ptr<int32_t[], Free> index_;   // slot + 1; 0 = empty
+    std::unique_ptr<uint8_t[], Free> arena_;   // capacity_ rows plus the spare
+    std::size_t          slots_ = 0;
     std::size_t          capacity_ = 0;
     std::size_t          used_ = 0;
     uint32_t             maxRowLen_ = 0;

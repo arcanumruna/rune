@@ -3,8 +3,11 @@
 // Part 11 Task 3: chained prepares into a TxnOverlay, the lock set and PrepareStatus::Locked.  The key-index case is in
 // CheckedWritesKeyIndexTest.cpp (the key index lives in rune_node).
 #include <gtest/gtest.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <random>
@@ -368,6 +371,82 @@ TEST(CheckedWritesTxnOverlay, FullOverlayIsCapacityExhausted) {
     tiny.reserve(2, 512);
     EXPECT_EQ(r.prepare(1, 200, 5, &tiny), PrepareStatus::CapacityExhausted);   // a Move: contributor, two groups, two view rows
     EXPECT_TRUE(tiny.full());
+}
+
+// Sanitizer allocators fill or prefault blocks their own way, so page residency and malloc scribbles prove nothing there.
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define RUNE_OVERLAY_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define RUNE_OVERLAY_SANITIZED 1
+#endif
+#ifndef RUNE_OVERLAY_SANITIZED
+#define RUNE_OVERLAY_SANITIZED 0
+#endif
+
+// The resident pages among those holding [p, p + bytes).
+static std::size_t residentPages(const void* p, std::size_t bytes) {
+    const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t from = reinterpret_cast<uintptr_t>(p) & ~(page - 1);
+    const std::size_t len = reinterpret_cast<uintptr_t>(p) + bytes - from;
+#if defined(__APPLE__)
+    std::vector<char> vec((len + page - 1) / page);
+#else
+    std::vector<unsigned char> vec((len + page - 1) / page);
+#endif
+    EXPECT_EQ(mincore(reinterpret_cast<void*>(from), len, vec.data()), 0);
+    return static_cast<std::size_t>(std::count_if(vec.begin(), vec.end(), [](auto v) { return (v & 1) != 0; }));
+}
+
+// T7 perf: a reserve sized for the largest transaction writes none of its rows.  Filling them at every restart and member change
+// made a checked-writes model seed about 10x slower; the row pages stay unmapped until a transaction puts a row there.  The same holds
+// for the entries (review 5, M4).
+TEST(CheckedWritesTxnOverlayRegression, ReserveTouchesNoRowRegression) {
+    TxnOverlay o;
+    o.reserve(std::size_t(1) << 20, 256);   // 256 MiB of rows
+    uint8_t* last = o.spare() - 256;   // the last row
+    if (!RUNE_OVERLAY_SANITIZED) {
+        EXPECT_EQ(residentPages(last, 1), 0u) << "the reserve wrote the rows";
+        EXPECT_EQ(residentPages(o.lastEntryForTest(), 1), 0u) << "the reserve wrote the entries";
+    }
+    uint8_t* row = o.put(1, OverlayTable::View, ViewKey::fromU64(7), nullptr, 64);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(residentPages(row, 1), 1u);
+    EXPECT_EQ(row[63], 0) << "a put without a base row is zeroes";
+}
+
+// A calloc'd arena was zeroed again whenever the allocator handed back a freed block: a fifth of a constraint model seed.  Run under
+// a scribbling malloc (CheckedWritesTxnOverlaySpareRowUnderScribbleRegression), the rows keep the scribble and only the spare row is zeroed.
+TEST(CheckedWritesTxnOverlayRegression, ReserveZeroesOnlyTheSpareRowRegression) {
+    if (std::getenv("MallocScribble") == nullptr && std::getenv("MALLOC_PERTURB_") == nullptr) GTEST_SKIP() << "needs a scribbling malloc";
+    constexpr std::size_t kRows = std::size_t(1) << 14;
+    constexpr uint32_t kLen = 256;
+    TxnOverlay o;
+    o.reserve(kRows, kLen);
+    const uint8_t* rows = o.spare() - kRows * kLen;
+    if (!RUNE_OVERLAY_SANITIZED) {
+        EXPECT_NE(rows[0], 0) << "the reserve zeroed the rows";
+        EXPECT_NE(rows[kRows * kLen - 1], 0) << "the reserve zeroed the rows";
+    }
+    for (uint32_t i = 0; i < kLen; ++i) ASSERT_EQ(o.spare()[i], 0) << i;
+}
+
+// T7 review 5, N3: clear() empties only the index slots its rows took.  An atomic batch clears its overlay twice, and the index is
+// sized for the largest transaction (8 MiB for one aggregate member), so a whole-index clear put that memset on the duty pass.
+TEST(CheckedWritesTxnOverlayRegression, ClearTouchesOnlyTheSlotsItsRowsTookRegression) {
+    TxnOverlay o;
+    o.reserve(std::size_t(1) << 23, 1);   // a 64 MiB index: calloc maps it fresh on every allocator
+    const std::size_t bytes = o.slotsForTest() * sizeof(int32_t);
+    ASSERT_NE(o.put(1, OverlayTable::KeyIndex, ViewKey::fromU64(7), nullptr, 1), nullptr);
+    o.clear();
+    const std::size_t pages = bytes / static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    if (!RUNE_OVERLAY_SANITIZED) EXPECT_LT(residentPages(o.indexForTest(), bytes), pages / 4) << "the clear wrote the whole index";
+    EXPECT_FALSE(o.contains(1, OverlayTable::KeyIndex, ViewKey::fromU64(7)));
+    ASSERT_NE(o.put(1, OverlayTable::KeyIndex, ViewKey::fromU64(8), nullptr, 1), nullptr);
+    EXPECT_TRUE(o.contains(1, OverlayTable::KeyIndex, ViewKey::fromU64(8)));
+    EXPECT_FALSE(o.contains(1, OverlayTable::KeyIndex, ViewKey::fromU64(7)));
 }
 
 TEST(CheckedWritesTxnOverlay, ReservedOverlayAllocatesNothing) {

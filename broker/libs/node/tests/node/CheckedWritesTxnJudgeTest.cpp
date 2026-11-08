@@ -38,6 +38,8 @@ TEST(CheckedWritesTxnState, JudgeRecordThenMarkerDecides) {
     EXPECT_EQ(t.find(77)->markerOffset, 520);
     EXPECT_TRUE(t.find(77)->commit);
     EXPECT_EQ(t.find(77)->phase, TxnPhase::AwaitJudge) << "only the judge finalizes";
+    EXPECT_EQ(t.earliestUndecidedFirst(), 400) << "Task 7 (T5 N1): K waits for the judge's finalize, not for the marker";
+    t.find(77)->phase = TxnPhase::Finalized;
     EXPECT_EQ(t.earliestUndecidedFirst(), INT64_MAX);
 }
 
@@ -89,12 +91,34 @@ TEST(CheckedWritesTxnState, FullTableRefusesTheRecord) {
 TEST(CheckedWritesTxnState, MarkerDoesNotAnswerAParkedVoteRegression) {
     auto t = reserved();
     ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
-    ASSERT_TRUE(t.parkVote({1, 0, 77, 3}));
+    ASSERT_TRUE(t.parkVote({1, 0, 77, 3, 500}));
     t.onMarker(77, 520, false);
-    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn&) {}), 0);
+    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn*) {}), 0);
     t.find(77)->phase = TxnPhase::Finalized;
     t.find(77)->judged = true;
-    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn&) {}), 1);
+    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn*) {}), 1);
+}
+
+// Fix round 1 F5: an entry the table gives up (evicted when full, or replaced by its producer's next J) still holds the cleaner bound
+// at its J while its marker lies at or above the committed markers' coverage, and lets it go once that coverage passes the marker.
+TEST(CheckedWritesTxnState, GivenUpEntryStillHoldsTheCleanerBoundRegression) {
+    auto t = reserved();
+    for (std::size_t i = 0; i < TxnJudgeState::kMaxTxns; ++i) {
+        const auto o = static_cast<int64_t>(i) * 10 + 100;
+        DeferredTxn* e = t.onJudgeRecord(o, {static_cast<int64_t>(i), 1, o - 5});
+        ASSERT_NE(e, nullptr);
+        t.onMarker(static_cast<int64_t>(i), o + 20'000, true);
+        e->phase = TxnPhase::Finalized;
+    }
+    const int64_t w = 15'000;   // every marker lies above it: every J is needed
+    EXPECT_EQ(t.judgeRecordsNeededFrom(w), 100);
+    ASSERT_NE(t.onJudgeRecord(20'000, {5000, 1, 19'990}), nullptr) << "the oldest Finalized entry (J 100) is evicted";
+    EXPECT_EQ(t.find(0), nullptr);
+    EXPECT_EQ(t.judgeRecordsNeededFrom(w), 100) << "the evicted J is still needed: its marker lies above the coverage";
+    EXPECT_EQ(t.judgeRecordsNeededFrom(20'101), 110) << "past the evicted marker: the bound moves to the next J needed";
+    t.onMarker(1, 20'110, true);
+    ASSERT_NE(t.onJudgeRecord(30'000, {1, 1, 29'990}), nullptr) << "the producer's next J replaces its decided entry (J 110)";
+    EXPECT_EQ(t.judgeRecordsNeededFrom(20'101), 110) << "the replaced J is still needed";
 }
 
 // F3: decided entries make room, so the table never fills for good.
@@ -122,11 +146,11 @@ TEST(CheckedWritesTxnState, FullTableKeepsAFinalizedEntryWithAParkedVoteRegressi
         e->phase = TxnPhase::Finalized;
         e->judged = true;
     }
-    ASSERT_TRUE(t.parkVote({1, 0, 0, 1}));
+    ASSERT_TRUE(t.parkVote({1, 0, 0, 1, 10}));
     ASSERT_NE(t.onJudgeRecord(5000, {5000, 1, 4000}), nullptr);
     EXPECT_NE(t.find(0), nullptr);
     EXPECT_EQ(t.find(1), nullptr) << "the next finalized entry went instead";
-    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn&) {}), 1);
+    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn*) {}), 1);
 }
 
 // F6: a rescan judges the kept entries anew; a Finalized entry whose marker was cut away is undecided again.
@@ -188,37 +212,67 @@ TEST(CheckedWritesTxnState, ReplaceNeverDropsAnUndecidedEntryRegression) {
     EXPECT_EQ(t.find(77)->firstOffset, 850);
 }
 
-// T5 fix-1 M2: a vote is drained only with the judge's answer; an entry finalized without a judgement keeps it parked.
+// T5 fix-1 M2 / Task 7: a vote is drained only with the judge's answer; an entry finalized without a judgement answers it with
+// none (the worker says NotLeader, never an unjudged default), and a rescan keeps a judged decided entry's answer.
 TEST(CheckedWritesTxnState, DrainNeverAnswersWithAnUnjudgedDefaultRegression) {
     auto t = reserved();
     ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
     t.onMarker(77, 520, true);
-    ASSERT_TRUE(t.parkVote({1, 0, 77, 3}));
+    ASSERT_TRUE(t.parkVote({1, 0, 77, 3, 500}));
     t.finalizeDecided(600, 600);
     ASSERT_EQ(t.find(77)->phase, TxnPhase::Finalized);
-    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn&) {}), 0);
+    int none = 0;
+    EXPECT_EQ(t.drainAnswered([&](const ParkedVote&, const DeferredTxn* d) { none += d == nullptr; }), 1);
+    EXPECT_EQ(none, 1);
+    ASSERT_TRUE(t.parkVote({2, 0, 77, 3, 500}));
     t.find(77)->judged = true;
-    t.truncateFrom(510);   // a rescan judges the entry anew
+    t.truncateFrom(510);   // the marker is cut: judged anew
     EXPECT_FALSE(t.find(77)->judged);
+    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn*) {}), 0);
     t.find(77)->phase = TxnPhase::Finalized;
-    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn&) {}), 0);
     t.find(77)->judged = true;
-    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn&) {}), 1);
+    t.find(77)->markerOffset = 505;
+    t.truncateFrom(510);   // decided below the cut: the judgement stands
+    EXPECT_TRUE(t.find(77)->judged);
+    const DeferredTxn* got = nullptr;
+    EXPECT_EQ(t.drainAnswered([&](const ParkedVote&, const DeferredTxn* d) { got = d; }), 1);
+    EXPECT_NE(got, nullptr);
+}
+
+// Task 7: a vote bound to an older J is never answered from the producer's next transaction; a scanning vote is the worker's.
+TEST(CheckedWritesTxnState, VoteBoundToAReplacedJudgeIsAnsweredWithNoneRegression) {
+    auto t = reserved();
+    ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
+    ASSERT_TRUE(t.parkVote({1, 0, 77, 3, 500}));
+    ASSERT_TRUE(t.parkVote({2, 0, 77, 3, -1}));
+    t.onMarker(77, 520, false);
+    t.find(77)->phase = TxnPhase::Finalized;
+    ASSERT_NE(t.onJudgeRecord(900, {77, 3, 850}), nullptr);
+    t.find(77)->phase = TxnPhase::Locked;
+    t.find(77)->judged = true;
+    std::vector<std::pair<int64_t, bool>> seen;
+    EXPECT_EQ(t.drainAnswered([&](const ParkedVote& v, const DeferredTxn* d) { seen.emplace_back(v.token, d != nullptr); }), 1);
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0], std::make_pair(int64_t(1), false));
+    EXPECT_EQ(t.parkedCount(), 1u);
+    EXPECT_EQ(t.takeScanning(77, 900, [](const ParkedVote&) {}), 1);
+    EXPECT_EQ(t.drainAnswered([&](const ParkedVote& v, const DeferredTxn* d) { seen.emplace_back(v.token, d != nullptr); }), 1);
+    EXPECT_EQ(seen[1], std::make_pair(int64_t(2), true));
 }
 
 TEST(CheckedWritesTxnState, DrainAnsweredTakesLockedAndFinalized) {
     auto t = reserved();
     ASSERT_NE(t.onJudgeRecord(500, {77, 3, 400}), nullptr);
     ASSERT_NE(t.onJudgeRecord(600, {78, 3, 450}), nullptr);
-    ASSERT_TRUE(t.parkVote({1, 0, 77, 3}));
-    ASSERT_TRUE(t.parkVote({2, 0, 78, 3}));
+    ASSERT_TRUE(t.parkVote({1, 0, 77, 3, 500}));
+    ASSERT_TRUE(t.parkVote({2, 0, 78, 3, 600}));
     t.find(77)->phase = TxnPhase::Locked;
     t.find(77)->judged = true;
     EXPECT_EQ(t.lockedCount(), 1u);
     int64_t seen = 0;
-    EXPECT_EQ(t.drainAnswered([&](const ParkedVote& v, const DeferredTxn&) { seen = v.token; }), 1);
+    EXPECT_EQ(t.drainAnswered([&](const ParkedVote& v, const DeferredTxn*) { seen = v.token; }), 1);
     EXPECT_EQ(seen, 1);
-    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn&) {}), 0);
+    EXPECT_EQ(t.drainAnswered([](const ParkedVote&, const DeferredTxn*) {}), 0);
 }
 
 TEST(CheckedWritesTxnState, FeedHandlesType19AndMarkers) {
@@ -232,7 +286,7 @@ TEST(CheckedWritesTxnState, FeedHandlesType19AndMarkers) {
     EXPECT_EQ(s.txn.earliestUndecidedFirst(), 400);
     verdictFeedMarker(&s, 77, 520, true);
     EXPECT_EQ(s.txn.find(77)->markerOffset, 520);
-    EXPECT_EQ(s.txn.earliestUndecidedFirst(), INT64_MAX);
+    EXPECT_EQ(s.txn.earliestUndecidedFirst(), 400) << "undecided until the judge finalizes it";
     std::array<uint8_t, cr::reservationBatchBytes()> other{};
     ASSERT_EQ(cr::buildReservation(other, 10), other.size());
     verdictFeedBatch(&s, other.data(), other.size(), 600);
@@ -402,6 +456,7 @@ struct TxnLog {
         if (txnPid >= 0) {
             b.setTransactional(true);
             b.setProducerId(txnPid);
+            b.setProducerEpoch(0);
         }
         for (const Rec& r : recs) {
             std::vector<uint8_t> k, v;
@@ -532,9 +587,12 @@ struct JudgeRig {
     bool    oneBatch = false;
     int64_t countFrom = INT64_MAX;   // reads from at or above it are counted in counted
     int     counted = 0;
+    int64_t countAt = -1;            // reads from exactly it are counted in countedAt
+    int     countedAt = 0;
     int drive(int64_t hw = INT64_MAX, int64_t now = 0) {
         return vs.driveJudge([&](int64_t from, int64_t to) {
             counted += from >= countFrom;
+            countedAt += from == countAt;
             if (failReads > 0 && from == failFrom && to == failTo) {
                 --failReads;
                 return rune::storage::LogReadView{};
@@ -928,7 +986,7 @@ TEST(CheckedWritesTxnJudgeRegression, ParkedVoteWaitsAcrossARescanWithTheOldAnsw
     r.vs.releaseTxnOverlays(r.st.txn);
     t->phase  = TxnPhase::Finalized;   // the old leadership's no
     t->answer = {63, 7, 13};
-    ASSERT_TRUE(r.st.txn.parkVote({1, 0, 77, 0}));
+    ASSERT_TRUE(r.st.txn.parkVote({1, 0, 77, 0, 14}));
     verdictFeedBegin(&r.st, 0, r.log.next);
     t = r.st.txn.find(77);
     ASSERT_NE(t, nullptr);
@@ -938,7 +996,7 @@ TEST(CheckedWritesTxnJudgeRegression, ParkedVoteWaitsAcrossARescanWithTheOldAnsw
     std::vector<TxnPhase> drainedAt;
     std::vector<uint16_t> codes;
     const auto drain = [&] {
-        return r.st.txn.drainAnswered([&](const ParkedVote&, const DeferredTxn& d) { drainedAt.push_back(d.phase); codes.push_back(d.answer.code); });
+        return r.st.txn.drainAnswered([&](const ParkedVote&, const DeferredTxn* d) { drainedAt.push_back(d->phase); codes.push_back(d->answer.code); });
     };
     EXPECT_EQ(drain(), 0) << "AwaitJudge: the vote stays parked";
     r.vs.bindLeader(nullptr, 2, 0);
@@ -1356,24 +1414,93 @@ TEST(CheckedWritesTxnJudgeRegression, ChainPausedMidTransactionRestartsFromTheFi
     EXPECT_EQ(r.st.txn.find(77)->phase, u.st.txn.find(77)->phase);
 }
 
-// N2: an ordinary transaction with more keys than the P11-3a scan tracks waits at its marker, counted once; it never applies a
-// record the scan could not check.
-TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheKeySetWaitsNeverMisappliesRegression) {
+// N2 / Task 7 (T7 review 1, F1): an ordinary transaction with more keys than the one-step set is applied in segments, never
+// refused, and folds as the plain writes in log order would: a key another writer deletes after T's last write of it stays deleted
+// (superseded), one T writes again after the delete is indexed, whichever segment holds it.
+TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheKeySetIsAppliedEqualToAPlainFoldRegression) {
+    const auto write = [](JudgeRig& r, int64_t pid) {
+        std::vector<Rec> txn;
+        for (std::size_t i = 0; i < 2048; ++i) txn.push_back({20'000 + int64_t(i)});
+        r.log.data(txn, pid);   // 10..2057
+        r.log.data({del(20'005), del(20'007), del(21'500)});
+        r.log.data({{20'005}}, pid);
+        if (pid >= 0) r.log.marker(pid, true);
+        r.log.data({{5}});
+    };
+    JudgeRig plain(false);
+    plain.start();
+    write(plain, -1);
+    for (int i = 0; i < 4; ++i) plain.drive();
     JudgeRig r(false);
     r.start();
-    const std::size_t n = r.pool.oneStep().keyCapacity() + 1;
-    std::vector<Rec> txn;
-    for (std::size_t i = 0; i < n; ++i) txn.push_back({20'000 + int64_t(i)});
-    r.log.data(txn, 77);   // 10..
+    ASSERT_EQ(r.pool.oneStep().keyCapacity(), 1024u);
+    write(r, 77);
+    for (int i = 0; i < 8 && r.vs.judgeCursor() < r.log.next; ++i) r.drive();
+    EXPECT_EQ(r.vs.judgeCursor(), r.log.next) << "passed the marker";
+    EXPECT_EQ(r.vs.judgedThrough(), r.log.next);
+    EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 1u);
+    EXPECT_EQ(r.st.rejected.nextRejectedAtOrAfter(0), INT64_MAX) << "nothing refused";
+    EXPECT_TRUE(r.indexed(20'005));
+    EXPECT_FALSE(r.indexed(20'007));
+    EXPECT_FALSE(r.indexed(21'500));
+    for (int64_t id = 20'000; id < 20'000 + 2048; ++id) ASSERT_EQ(r.indexed(id), plain.indexed(id)) << id;
+    EXPECT_TRUE(r.indexed(5));
+}
+
+// Task 7 (T7 review 1, F1): an ordinary transaction spanning more other producers' markers than the set holds is applied too.  The
+// markers are noted in windows, and a batch whose decision lies past a window is looked up: a delete committed far into the span
+// supersedes, one aborted far into it does not, and one committed past T's marker applies after T.
+TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnPastTheMarkerListIsAppliedEqualToAPlainFoldRegression) {
+    JudgeRig r(false);
+    r.start();
+    r.log.data({{1}, {2}, {3}, {4}}, 77);   // 10..13, its first records
+    for (int64_t p = 0; p < 1100; ++p) {
+        if (p == 5) r.log.data({del(2)}, 5001);
+        if (p == 10) r.log.data({del(3)}, 5003);
+        if (p == 1050) r.log.data({del(1)}, 5000);
+        if (p == 1090) r.log.marker(5000, true);
+        if (p == 1095) r.log.marker(5001, false);
+        r.log.data({{30'000 + p}}, 1000 + p);
+        r.log.marker(1000 + p, true);
+    }
+    r.log.data({del(4)});   // a plain delete, then T's last write of 4
+    r.log.data({{4}}, 77);
     const int64_t marker = r.log.next;
     r.log.marker(77, true);
-    r.drive();
-    r.drive();
-    EXPECT_EQ(r.vs.judgeCursor(), marker) << "waits at the marker";
-    EXPECT_EQ(r.vs.judgedThrough(), 10);
-    EXPECT_FALSE(r.indexed(20'000));
-    EXPECT_FALSE(r.indexed(20'000 + int64_t(n) - 1));
-    EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 1u);
+    r.log.marker(5003, true);
+    for (int i = 0; i < 40 && r.vs.judgeCursor() < r.log.next; ++i) r.drive();
+    EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
+    EXPECT_GT(r.vs.judgedThrough(), marker);
+    EXPECT_EQ(r.st.txn.stats.supersedeKeysOverflow, 0u) << "the keys fit";
+    EXPECT_EQ(r.st.rejected.nextRejectedAtOrAfter(0), INT64_MAX) << "nothing refused";
+    EXPECT_FALSE(r.indexed(1)) << "5000's delete committed below T's marker supersedes T's insert";
+    EXPECT_TRUE(r.indexed(2)) << "5001's delete aborted";
+    EXPECT_FALSE(r.indexed(3)) << "5003's delete commits after T";
+    EXPECT_TRUE(r.indexed(4)) << "T wrote 4 again after the plain delete";
+    EXPECT_TRUE(r.indexed(30'000));
+    EXPECT_TRUE(r.indexed(30'000 + 1099));
+}
+
+// Task 7 (T6 re-review 2): on the judgement path the same overflow is a deterministic no: a marker list past its slots takes every
+// other transaction as applied, so a record of one on T's key above T's last write answers TxnConflict.
+TEST(CheckedWritesTxnJudgeRegression, JudgementPastTheMarkerListVotesADeterministicConflictRegression) {
+    const auto run = [] {
+        JudgeRig r(true);
+        r.start();
+        r.log.data({{1}}, 77);   // 10
+        for (int64_t p = 0; p < 1100; ++p) {
+            r.log.data({{30'000 + p}}, 1000 + p);
+            r.log.marker(1000 + p, false);   // aborted: no conflict, were they tracked
+        }
+        r.log.data({{1}}, 999);   // an aborted writer of T's key, past the list
+        r.log.marker(999, false);
+        r.log.judge(77, 10);
+        EXPECT_TRUE(r.judge77(64));
+        return r.st.txn.find(77)->answer.code;
+    };
+    const uint16_t a = run();
+    EXPECT_EQ(a, uint16_t(rune::protocol::client::ErrorCode::TxnConflict));
+    EXPECT_EQ(run(), a);
 }
 
 // Re-review 2: the owed-marker search rotates its start each pass, so a marker far behind never starves another; across a
@@ -1491,6 +1618,251 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryResolutionWalkIsBudgetedAndResumes
     for (int i = 0; i < 8 && r.vs.judgeCursor() == 13; ++i) r.drive();
     EXPECT_GT(r.vs.judgeCursor(), 13);
     EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
+}
+
+// T7 review 2, N1: the one-step set is the worker's, shared by its sources.  O's segment is parked on T0's marker; another source
+// applies its own ordinary transaction meanwhile and takes the set (review 4, I1).  O collects its keys anew, so T0's insert still
+// supersedes O's delete.
+TEST(CheckedWritesTxnJudgeRegression, SegmentResumedAfterAnotherSourceTookTheKeySetRecollectsRegression) {
+    JudgeRig r(false);
+    JudgeRig other(false);
+    other.vs.bindTxn(&r.pool, other.batch, JudgeRig::kRecordsMax);
+    r.start();
+    other.start();
+    r.log.data({del(4)}, 55);                     // 10, O
+    r.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
+    r.log.judge(66, 11);                          // 12
+    r.log.marker(55, true);                       // 13
+    r.log.data({{20}, {21}, {22}, {23}, {24}, {25}});   // 14-19
+    r.log.marker(66, true);                       // 20
+    r.drive(20);
+    r.drive(20);   // the lookup the check stopped for scans to the HW
+    ASSERT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker below the HW";
+    ASSERT_TRUE(r.pool.oneStepHeld());
+    other.log.data({{50}, {51}}, 88);
+    other.log.marker(88, true);
+    for (int i = 0; i < 4 && other.vs.judgeCursor() < other.log.next; ++i) other.drive();
+    ASSERT_EQ(other.vs.judgeCursor(), other.log.next);
+    ASSERT_TRUE(other.indexed(51));
+    for (int i = 0; i < 8 && r.vs.judgeCursor() < r.log.next; ++i) r.drive();
+    EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
+    JudgeRig plain(false);
+    plain.start();
+    plain.log.data({del(4)});
+    plain.log.data({{4, 1, false, kInsert}});
+    plain.log.data({{20}, {21}, {22}, {23}, {24}, {25}});
+    for (int i = 0; i < 4; ++i) plain.drive();
+    EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
+    for (int64_t id = 0; id < 200; ++id) EXPECT_EQ(r.indexed(id), plain.indexed(id)) << id;
+}
+
+namespace {
+// An ordinary transaction 77 over 1,100 other producers' markers: 5000's delete of 1 lies past the marker window (a refill), 5001's
+// aborted delete of 2 does not supersede.
+void pastTheMarkerList(JudgeRig& r) {
+    r.log.data({{1}, {2}, {3}}, 77);
+    for (int64_t p = 0; p < 1100; ++p) {
+        if (p == 5) r.log.data({del(2)}, 5001);
+        if (p == 1050) r.log.data({del(1)}, 5000);
+        if (p == 1090) r.log.marker(5000, true);
+        if (p == 1095) r.log.marker(5001, false);
+        r.log.data({{30'000 + p}}, 1000 + p);
+        r.log.marker(1000 + p, true);
+    }
+    r.log.marker(77, true);
+    r.log.data({{5}});
+}
+}  // namespace
+
+// T7 review 3, N3: two sources of one worker, each in a segment that stops for a refill, never take the one-step set from each
+// other: the holder keeps it until its transaction ends, the other waits.  Both reach the log's end equal to a lone source's fold.
+TEST(CheckedWritesTxnJudgeRegression, TwoSourcesNeedingRefillsBothFinishRegression) {
+    JudgeRig lone(false);
+    lone.start();
+    pastTheMarkerList(lone);
+    for (int i = 0; i < 40 && lone.vs.judgeCursor() < lone.log.next; ++i) lone.drive();
+    ASSERT_EQ(lone.vs.judgeCursor(), lone.log.next);
+    ASSERT_FALSE(lone.indexed(1));
+    ASSERT_TRUE(lone.indexed(2));
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    pastTheMarkerList(a);
+    pastTheMarkerList(b);
+    for (int i = 0; i < 80 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_EQ(b.vs.judgeCursor(), b.log.next);
+    EXPECT_FALSE(a.pool.oneStepHeld()) << "released at the end of the transaction";
+    EXPECT_EQ(a.tables(), lone.tables());
+    EXPECT_EQ(b.tables(), lone.tables());
+}
+
+// T7 review 3, N3: a source dropped (or demoted: the worker releases the claim of a judge it no longer drives) mid-segment gives
+// the set back, and the source waiting for it proceeds.  So does one whose member is removed (review 4, I2): it waits for the
+// install, not driven.  O's lookup reads one batch per pass, so it is not parked on T0's marker and keeps the set until then.
+TEST(CheckedWritesTxnJudgeRegression, DroppedHolderReleasesTheOneStepSetRegression) {
+    for (const int how : {0, 1, 2}) {
+        SCOPED_TRACE(how == 0 ? "dropped" : how == 1 ? "demoted" : "view removed");
+        JudgeRig r(false);
+        JudgeRig other(false);
+        other.vs.bindTxn(&r.pool, other.batch, JudgeRig::kRecordsMax);
+        r.start();
+        other.start();
+        r.log.data({del(4)}, 55);                     // 10, O
+        r.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
+        r.log.judge(66, 11);                          // 12
+        r.log.marker(55, true);                       // 13
+        for (int64_t id = 30; id < 70; ++id) r.log.data({{id}});   // 14-53
+        r.vs.setVoteScanBytesForTest(1);
+        for (int i = 0; i < 16 && r.vs.judgeCursor() < 13; ++i) r.drive();
+        ASSERT_EQ(r.vs.judgeCursor(), 13) << "O waits for T0's marker";
+        ASSERT_TRUE(r.pool.oneStepHeld());
+        other.log.data({{50}, {51}}, 88);
+        const int64_t marker = other.log.next;
+        other.log.marker(88, true);
+        for (int i = 0; i < 4; ++i) other.drive();
+        ASSERT_EQ(other.vs.judgeCursor(), marker) << "88 waits for the set";
+        ASSERT_FALSE(other.indexed(51));
+        if (how == 0) r.vs.releaseTxnOverlays(r.st.txn);
+        else if (how == 1) r.vs.releaseOneStep();
+        else {
+            r.vs.removeVerdictView(r.index->plan.viewTopicId);
+            r.drive();
+            ASSERT_TRUE(r.vs.waitingForInstall());
+        }
+        EXPECT_FALSE(r.pool.oneStepHeld());
+        for (int i = 0; i < 4 && other.vs.judgeCursor() <= marker; ++i) other.drive();
+        EXPECT_GT(other.vs.judgeCursor(), marker);
+        EXPECT_TRUE(other.indexed(51));
+    }
+}
+
+// T7 review 4, M2: a capacity stall mid-segment gives the set back (a stalled judge is not driven), and the other source proceeds.
+// The next leadership applies O whole.
+TEST(CheckedWritesTxnJudgeRegression, StalledHolderReleasesTheOneStepSetRegression) {
+    JudgeRig r(false);
+    JudgeRig other(false);
+    other.vs.bindTxn(&r.pool, other.batch, JudgeRig::kRecordsMax);
+    r.start();
+    other.start();
+    r.log.data({{1}, {2}, {3}}, 55);              // 10-12, O
+    r.log.marker(55, true);                       // 13
+    r.vs.failCapacityAtForTest(11);
+    r.drive();
+    ASSERT_TRUE(r.vs.stalled());
+    EXPECT_FALSE(r.pool.oneStepHeld());
+    other.log.data({{50}, {51}}, 88);
+    other.log.marker(88, true);
+    for (int i = 0; i < 4 && other.vs.judgeCursor() < other.log.next; ++i) other.drive();
+    EXPECT_EQ(other.vs.judgeCursor(), other.log.next);
+    EXPECT_TRUE(other.indexed(51));
+    r.vs.bindLeader(nullptr, 2, 0);
+    for (int i = 0; i < 4 && r.vs.judgeCursor() < r.log.next; ++i) r.drive();
+    EXPECT_FALSE(r.vs.stalled());
+    EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
+    EXPECT_TRUE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(3));
+}
+
+// T7 review 4, I1: T0 writes partitions A and B of one worker.  A's O waits for T0's marker, which waits for B's vote; B's 88 needs
+// the one-step set before B's judge reaches T0's J.  B takes the set from A, parked on T0's marker, and judges the J; once T0's
+// markers land A collects anew and both reach the log's end, A equal to a plain fold.
+TEST(CheckedWritesTxnJudgeRegression, ParkedHolderLetsAnotherPartitionJudgeTheVoteItWaitsForRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    a.log.data({del(4)}, 55);                     // 10, O
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 11, T0
+    a.log.judge(66, 11);                          // 12
+    a.log.marker(55, true);                       // 13
+    a.drive();
+    ASSERT_EQ(a.st.txn.find(66)->phase, TxnPhase::Locked);
+    ASSERT_EQ(a.vs.judgeCursor(), 13) << "O waits for T0's marker";
+    ASSERT_TRUE(a.pool.oneStepHeld());
+    b.log.data({{50}, {51}}, 88);                 // 10-11, 88
+    b.log.data({{60, 1, false, kInsert}}, 66);    // 12, T0
+    b.log.marker(88, true);                       // 13
+    b.log.judge(66, 12);                          // 14
+    for (int i = 0; i < 8 && (b.st.txn.find(66) == nullptr || !b.st.txn.find(66)->judged); ++i) {
+        b.drive();
+        a.drive();
+    }
+    ASSERT_NE(b.st.txn.find(66), nullptr);
+    EXPECT_TRUE(b.st.txn.find(66)->judged) << "B's vote for T0 is answerable while A waits";
+    EXPECT_TRUE(b.indexed(51));
+    EXPECT_EQ(a.vs.judgeCursor(), 13);
+    a.log.marker(66, true);
+    b.log.marker(66, true);
+    for (int i = 0; i < 8 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_EQ(b.vs.judgeCursor(), b.log.next);
+    EXPECT_TRUE(b.indexed(60));
+    EXPECT_FALSE(a.pool.oneStepHeld());
+    JudgeRig plain(false);
+    plain.start();
+    plain.log.data({del(4)});
+    plain.log.data({{4, 1, false, kInsert}});
+    for (int i = 0; i < 4; ++i) plain.drive();
+    EXPECT_TRUE(a.indexed(4)) << "T0's insert supersedes O's delete";
+    EXPECT_EQ(a.tables(), plain.tables());
+}
+
+// T7 review 5, N1: the same cycle through a lock pause.  T0's judged write of key 4 lies below A's O, so O's apply pauses on T0's
+// held row; the lock clears at T0's marker, which waits for B's vote.  B takes the set from the paused A and judges the J.
+TEST(CheckedWritesTxnJudgeRegression, LockPausedHolderLetsAnotherPartitionJudgeTheVoteItWaitsForRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 10, T0
+    a.log.judge(66, 10);                          // 11
+    a.log.data({del(4)}, 55);                     // 12, O
+    a.log.marker(55, true);                       // 13
+    for (int i = 0; i < 4 && a.st.txn.stats.lockPauses == 0; ++i) a.drive();
+    ASSERT_EQ(a.st.txn.find(66)->phase, TxnPhase::Locked);
+    ASSERT_EQ(a.st.txn.stats.lockPauses, 1u) << "O's delete pauses on T0's row";
+    ASSERT_EQ(a.vs.judgeCursor(), 13);
+    ASSERT_TRUE(a.pool.oneStepHeld());
+    b.log.data({{50}, {51}}, 88);                 // 10-11, 88
+    b.log.data({{60, 1, false, kInsert}}, 66);    // 12, T0
+    b.log.marker(88, true);                       // 13
+    b.log.judge(66, 12);                          // 14
+    for (int i = 0; i < 8 && (b.st.txn.find(66) == nullptr || !b.st.txn.find(66)->judged); ++i) {
+        b.drive();
+        a.drive();
+    }
+    ASSERT_NE(b.st.txn.find(66), nullptr);
+    EXPECT_TRUE(b.st.txn.find(66)->judged) << "B's vote for T0 is answerable while A is paused";
+    EXPECT_TRUE(b.indexed(51));
+    EXPECT_EQ(a.vs.judgeCursor(), 13);
+    a.log.marker(66, true);
+    b.log.marker(66, true);
+    for (int i = 0; i < 8 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_EQ(b.vs.judgeCursor(), b.log.next);
+    EXPECT_TRUE(b.indexed(60));
+    EXPECT_FALSE(a.pool.oneStepHeld());
+    JudgeRig plain(false);
+    plain.start();
+    plain.log.data({{4, 1, false, kInsert}});
+    plain.log.data({del(4)});
+    for (int i = 0; i < 4; ++i) plain.drive();
+    EXPECT_FALSE(a.indexed(4)) << "O's delete applies after T0's insert";
+    EXPECT_EQ(a.tables(), plain.tables());
 }
 
 // I3: accepted(r), an ordinary transaction committed below J.
@@ -1771,4 +2143,280 @@ TEST(CheckedWritesTxnJudgeRegression, WideKeyInATxnVotesYesRegression) {
     r.log.judge(77, 10);
     ASSERT_TRUE(r.judge77());
     EXPECT_EQ(r.st.txn.find(77)->answer.code, 0);
+}
+
+// ---- Task 7: the carried judge fixes ----
+
+// T6 review 1: an abort before J decides the entry from the log at once (the judge meets the marker first): no overlay is taken,
+// nothing is applied, K passes it, and the producer's next J is judged.
+TEST(CheckedWritesTxnJudgeRegression, AbortBeforeJudgeIsDecidedAtTheMarkerRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.log.data({{1}, {2}}, 77);   // 10, 11
+    r.log.marker(77, false);      // 12
+    r.log.judge(77, 10);          // 13: late
+    r.log.data({{3}});            // 14
+    r.drive();
+    r.drive();
+    const DeferredTxn* t = r.st.txn.find(77);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->phase, TxnPhase::Finalized);
+    EXPECT_EQ(t->markerOffset, 12);
+    EXPECT_FALSE(t->judged);
+    EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
+    EXPECT_FALSE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(3));
+    EXPECT_EQ(r.vs.judgedThrough(), 15);
+    r.log.data({{4}}, 77);        // 15: the producer's next transaction
+    r.log.judge(77, 15);          // 16
+    ASSERT_TRUE(r.judge77());
+    EXPECT_EQ(r.st.txn.find(77)->judgeOffset, 16);
+    EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::Locked);
+}
+
+// The same with the J fed after the judge passed the marker: judged at J, the chained read meets the producer's own marker first.
+TEST(CheckedWritesTxnJudgeRegression, AbortBeforeJudgeFedLateIsDecidedAtJRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.log.data({{1}}, 77);        // 10
+    r.log.marker(77, false);      // 11
+    r.log.data({{3}});            // 12
+    r.drive();
+    ASSERT_EQ(r.vs.judgeCursor(), 13);
+    r.log.judge(77, 10);          // 13
+    r.drive();
+    r.drive();
+    EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::Finalized);
+    EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
+    EXPECT_EQ(r.vs.judgedThrough(), 14);
+    EXPECT_EQ(r.st.txn.stats.votesYes + r.st.txn.stats.votesNo, 0u) << "no judgement";
+    // Task 7 (T7 review 1, F2): decided at its marker, so the producer's next transaction is judged at its J.
+    EXPECT_EQ(r.st.txn.find(77)->markerOffset, 11);
+    r.log.data({{5}}, 77);        // 14
+    r.log.judge(77, 14);          // 15
+    r.log.marker(77, true);       // 16
+    for (int i = 0; i < 6 && r.vs.judgedThrough() < 17; ++i) r.drive();
+    const DeferredTxn* t = r.st.txn.find(77);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->firstOffset, 14) << "the next TxnJudge replaced the decided entry";
+    EXPECT_TRUE(t->judged);
+    EXPECT_EQ(r.st.txn.stats.votesYes, 1u);
+    EXPECT_EQ(r.st.txn.stats.undecidedReplaceRefusals, 0u);
+    EXPECT_TRUE(r.indexed(5));
+    EXPECT_EQ(r.vs.judgedThrough(), 17);
+}
+
+// A commit before its J: the records the judge passed as deferred are applied at that marker.
+TEST(CheckedWritesTxnJudgeRegression, CommitBeforeJudgeAppliesAtTheMarkerRegression) {
+    JudgeRig r(false);
+    r.start();
+    r.log.data({{1}, {2}}, 77);
+    r.log.marker(77, true);
+    r.log.judge(77, 10);
+    r.drive();
+    r.drive();
+    EXPECT_TRUE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(2));
+    EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::Finalized);
+    EXPECT_EQ(r.vs.judgedThrough(), 14);
+}
+
+// T6 re-review 2: a TxnJudge decides a batch only for the batch's own transaction (its epoch, first <= base).
+TEST(CheckedWritesTxnKeySet, AJudgeOfAnotherTransactionDecidesNothingRegression) {
+    TxnKeySet k;
+    k.reserve(8, 8);
+    k.noteJudge(5, 0, 160, 200);   // a later transaction's J (first 160 > base 150)
+    EXPECT_EQ(k.appliedAt(5, 0, 150), TxnKeySet::Applied::No) << "not the batch's J: no marker of its own is noted";
+    k.clear();
+    k.noteJudge(5, 1, 100, 200);   // another epoch's
+    EXPECT_EQ(k.appliedAt(5, 0, 150), TxnKeySet::Applied::No);
+    k.clear();
+    k.noteJudge(5, 0, 100, 200);   // its own
+    EXPECT_EQ(k.appliedAt(5, 0, 150), TxnKeySet::Applied::Unknown);
+    k.noteMarker(5, 300, true);
+    EXPECT_EQ(k.appliedAt(5, 0, 150), TxnKeySet::Applied::Yes);
+}
+
+// T6 review 1: bindTxn with a larger cap never wipes a key set a judgement is using; it grows once free.
+TEST(CheckedWritesTxnPoolRegression, ReserveKeysNeverWipesASetInUseRegression) {
+    TxnOverlayPool pool;
+    pool.reserveFor(4, 8);
+    pool.reserveKeys(16);
+    const int32_t o = pool.acquire(1);
+    ASSERT_GE(o, 0);
+    ASSERT_TRUE(pool.keysAt(o).note("abc", 7));
+    pool.reserveKeys(4096);
+    EXPECT_TRUE(pool.keysPending());
+    ASSERT_NE(pool.keysAt(o).find("abc"), nullptr) << "kept";
+    EXPECT_EQ(pool.keysAt(o).keyCapacity(), 16u);
+    EXPECT_EQ(pool.keysAt(o == 0 ? 1 : 0).keyCapacity(), 4096u) << "a free one grew";
+    pool.release(o);
+    pool.reserveKeys(0);
+    EXPECT_FALSE(pool.keysPending());
+    EXPECT_EQ(pool.keysAt(o).keyCapacity(), 4096u);
+}
+
+// Key sets deferred while in use grow at the next cold bindTxn once free (a judgement on a smaller set caps at what it holds).
+TEST(CheckedWritesTxnJudgeRegression, BindTxnGrowsDeferredKeySetsOnceFreeRegression) {
+    JudgeRig r(true);
+    r.start();
+    std::array<int32_t, rune::view::kTxnOverlaysPerWorker> held{};
+    for (auto& h : held) h = r.pool.acquire(9);
+    r.pool.reserveKeys(8192);   // all in use: deferred
+    for (const int32_t h : held) r.pool.release(h);
+    r.vs.bindTxn(&r.pool, r.batch, 8192);
+    EXPECT_FALSE(r.pool.keysPending()) << "grown at the next cold call";
+}
+
+// T6 review 1: a member joining mid-judgement restarts it from T's first record.
+TEST(CheckedWritesTxnJudgeRegression, MemberChangeRestartsTheJudgementRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.oneBatch = true;
+    r.vs.setVoteScanBytesForTest(1);
+    r.log.data({{1}}, 77);
+    r.log.data({{2}}, 77);
+    r.log.data({{3}}, 77);   // 10..12
+    r.log.judge(77, 10);     // 13
+    r.drive();
+    r.drive();
+    r.drive();
+    r.countAt = 10;
+    rune::view::CompileResult c;
+    TestRejectRule rule;
+    rule.mode = TestRejectRule::Mode::TagEquals;
+    rule.tag = 7;
+    auto extra = r.tagMember(c, 9, rule);   // not in the logged set: it changes the members, not the verdicts
+    ASSERT_TRUE(r.judge77(32));
+    EXPECT_EQ(r.st.txn.find(77)->answer.code, 0);
+    EXPECT_GT(r.countedAt, 0) << "read again from T's first record";
+}
+
+// Task 5 carry: a re-activation without a rescan discards a transient member that folded the run-ahead past K.
+TEST(CheckedWritesTxnJudgeRegression, ReactivationDiscardsATransientMembersRunAheadRegression) {
+    JudgeRig r(true);
+    r.start();
+    int discards = 0;
+    r.vs.setViewHooks({&discards, nullptr, [](void* ctx, ViewInstance& inst, ViewDiscardReason) {
+                           ++*static_cast<int*>(ctx);
+                           inst.foldCursor = 0;
+                       }, nullptr});
+    r.log.data({{1}}, 77);   // 10
+    r.log.judge(77, 10);     // 11
+    r.log.data({{5}});       // 12
+    r.drive();
+    ASSERT_EQ(r.vs.judgeCursor(), 13);
+    ASSERT_EQ(r.vs.judgedThrough(), 10);
+    ASSERT_TRUE(r.indexed(5)) << "run-ahead";
+    r.vs.bindLeader(nullptr, 2, 0);
+    r.drive();
+    EXPECT_EQ(discards, 2) << "both members held run-ahead rows";
+}
+
+// T5 N1 / Task 5 carry: a Locked entry reset by a rescan before its finalize keeps its apply.
+TEST(CheckedWritesTxnJudgeRegression, ResetLockedEntryIsAppliedAfterARescanRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.log.data({{1}, {2}}, 77);   // 10, 11
+    r.log.judge(77, 10);          // 12
+    r.log.data({{5}});            // 13
+    r.log.marker(77, true);       // 14
+    r.drive(14);                  // the marker is not committed yet
+    ASSERT_EQ(r.st.txn.find(77)->phase, TxnPhase::Locked);
+    ASSERT_GT(r.vs.judgeCursor(), 12);
+    verdictFeedBegin(&r.st, 0, r.log.next);   // a rescan that keeps everything
+    verdictFeedMarker(&r.st, 77, 14, true);
+    EXPECT_EQ(r.freeOverlays(), rune::view::kTxnOverlaysPerWorker);
+    for (int i = 0; i < 6; ++i) r.drive();
+    EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::Finalized);
+    EXPECT_TRUE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(2));
+    EXPECT_EQ(r.vs.judgedThrough(), 15);
+}
+
+// Task 5 carry: with the HW as the bound, an empty set is passed only below the LSO.
+TEST(CheckedWritesTxnJudgeRegression, EmptySetIsPassedOnlyBelowTheLsoRegression) {
+    JudgeRig r(true);
+    r.start();
+    ConstraintSet empty;
+    empty.id = 2;
+    r.log.control();   // 10: the change to the empty set
+    r.st.constraintSets.onChange(10, empty);
+    r.log.data({{1}}, 77);   // 11: open
+    r.log.data({{2}});       // 12
+    r.vs.driveJudge([&](int64_t from, int64_t) { return r.log.read(from); }, r.log.next, 0, r.st, {}, 11);
+    EXPECT_EQ(r.vs.judgeCursor(), 11) << "the open transaction holds an empty set's pass";
+    r.vs.driveJudge([&](int64_t from, int64_t) { return r.log.read(from); }, r.log.next, 0, r.st, {}, r.log.next);
+    EXPECT_EQ(r.vs.judgeCursor(), 13);
+}
+
+// T6 review 1: an atomic batch longer than a persisted member's cap is judged (it waited at the cap forever), and a commit at least
+// the cap long ends its pass.
+TEST(CheckedWritesTxnJudgeRegression, AtomicBatchPastTheCheckpointCapIsJudgedRegression) {
+    JudgeRig r(VoteMembers{20});
+    r.start();
+    r.index->persisted = true;
+    r.index->maxRecordsPerPass = 4;
+    r.vs.bindLeader(nullptr, 2, 0);
+    r.drive();
+    std::vector<Rec> big;
+    for (int64_t id = 1; id <= 10; ++id) big.push_back({id});
+    r.log.data(big, -1, true);   // 10..19
+    for (int i = 0; i < 4; ++i) r.drive(INT64_MAX, int64_t(i + 1) * 1'000'000'000);
+    EXPECT_EQ(r.vs.judgeCursor(), 20);
+    EXPECT_TRUE(r.rowed(10));
+}
+
+TEST(CheckedWritesTxnJudgeRegression, CommitPastTheCheckpointCapEndsItsPassRegression) {
+    JudgeRig r(VoteMembers{20});
+    r.start();
+    r.index->persisted = true;
+    r.index->maxRecordsPerPass = 4;
+    VerdictViewHooks hooks;   // every checkpoint goes out: the run-ahead cap counts from the last one (P11-8 (a))
+    hooks.checkpoint = [](void*, ViewInstance&) { return 0; };
+    r.vs.setViewHooks(hooks);
+    r.vs.bindLeader(nullptr, 2, 0);
+    r.drive();
+    std::vector<Rec> t;
+    for (int64_t id = 1; id <= 6; ++id) t.push_back({id});
+    r.log.data(t, 77);       // 10..15
+    r.log.judge(77, 10);     // 16
+    r.log.marker(77, true);  // 17
+    r.log.data({{50}});      // 18
+    for (int i = 0; i < 6 && r.vs.judgeCursor() < 17; ++i) r.drive(17, int64_t(i + 1) * 1'000'000'000);
+    ASSERT_EQ(r.st.txn.find(77)->phase, TxnPhase::Locked);
+    r.drive(INT64_MAX, 10'000'000'000);
+    EXPECT_EQ(r.st.txn.find(77)->phase, TxnPhase::Finalized);
+    EXPECT_FALSE(r.rowed(50)) << "nothing more in the pass that applied it";
+    r.drive(INT64_MAX, 11'000'000'000);
+    EXPECT_TRUE(r.rowed(50));
+}
+
+// Task 7 (T7 review 1, F4): an atomic batch one record past txnJudgedRecordsMax, the bound its overlay is sized by, is rejected whole
+// with 62 and the judge moves on; it used to stall on the overlay's capacity for good.  One at the knob is judged whole.
+TEST(CheckedWritesTxnJudgeRegression, AtomicBatchPastTheKnobIsRejectedWholeNeverStallsRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.batch[0].reserve(3 * 3, r.batch[0].maxRowLen());   // 3 records over the key index (1 row) and the tag member (2)
+    r.vs.bindTxn(&r.pool, r.batch, 3);
+    r.log.data({{1}, {2}, {3}, {4}}, -1, true);   // 10..13: knob + 1
+    r.log.data({{5}});                            // 14
+    r.drive();
+    r.drive();
+    EXPECT_FALSE(r.vs.stalled());
+    EXPECT_EQ(r.vs.judgedThrough(), 15);
+    for (int64_t o = 10; o < 14; ++o) {
+        const auto* e = r.st.rejected.find(o);
+        ASSERT_NE(e, nullptr) << o;
+        EXPECT_EQ(e->code, uint16_t(rune::protocol::client::ErrorCode::TxnTooLarge));
+    }
+    EXPECT_FALSE(r.indexed(1));
+    EXPECT_TRUE(r.indexed(5));
+    EXPECT_EQ(r.st.txn.stats.atomicTooLarge, 1u);
+    r.log.data({{6}, {7}, {8}}, -1, true);   // 15..17: at the knob
+    r.drive();
+    EXPECT_EQ(r.vs.judgedThrough(), 18);
+    EXPECT_TRUE(r.indexed(6));
+    EXPECT_TRUE(r.indexed(8));
+    EXPECT_EQ(r.st.txn.stats.atomicTooLarge, 1u);
 }

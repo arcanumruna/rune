@@ -6,8 +6,8 @@
 //   - never cleans at or above the offset every verdict is known to (cleanLimit): the coverage of the markers it saw, capped by
 //     the bound the owning worker published (the committed watermark W),
 //   - drops a verdict marker once it is superseded and every record it lists is gone (markerRemovable).
-// Constraint-set changes (type 18) are always kept; of the reservations (16) only the highest seen and any above it (Part 06); the
-// txn judge (19) is kept until its part says otherwise.
+// Constraint-set changes (type 18) are always kept; of the reservations (16) only the highest seen and any above it (Part 06); a
+// txn judge (19) only at or above the bound the owning worker published (Part 11: no member checkpoint may need it any more below).
 //
 // Cleaner thread only (cold).  clear() keeps the capacity for reuse across passes.
 #include "rune/storage/ControlRecordLayout.h"
@@ -110,10 +110,15 @@ public:
                                    listed_.begin() + static_cast<std::ptrdiff_t>(m.listedAt + m.listedCount), pred);
         return false;
     }
-    /// Type 18, 19 and 20 are always kept; 16 follows keepsReservation; a verdict marker (17) only goes through markerRemovable.
+    /// Part 11: a TxnJudge below `bound` is judged and finalized under every member's checkpoint (0, the default: keep every one).
+    /// Not reset by clear(): the cleaner sets it per pass.
+    void setTxnJudgeBound(int64_t bound) noexcept { txnJudgeBound_ = bound; }
+    /// Type 18 and 20 are always kept; 16 follows keepsReservation, 19 the txn judge bound; a verdict marker (17) only goes through
+    /// markerRemovable.
     [[nodiscard]] bool keepsControlRecord(int64_t offset, int16_t type) const noexcept {
         namespace cr = control_record;
         if (type == cr::kReservation) return keepsReservation(offset);
+        if (type == cr::kTxnJudge) return offset >= txnJudgeBound_;
         if (type == cr::kVerdictMarker) return !markerRemovable(offset);
         return true;
     }
@@ -130,6 +135,7 @@ private:
     bool rejectedInPass_ = false;
     int64_t removalsBelow_ = std::numeric_limits<int64_t>::min();
     int64_t highestReservation_ = std::numeric_limits<int64_t>::min();
+    int64_t txnJudgeBound_ = 0;
 };
 
 }  // namespace rune::storage
