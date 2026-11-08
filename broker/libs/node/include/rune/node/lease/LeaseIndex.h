@@ -28,6 +28,7 @@
 #include <cstring>
 #include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace rune::node {
 
@@ -75,9 +76,27 @@ inline constexpr std::string_view kLeaseUpdatedOffsetColumn = "lease_updated_off
 /// layout.slotType.size() - kLeaseOffsetSlots fields are read.  Malformed: the value is shorter than the writer's block,
 /// or a field's type / width differs between writer and layout (evolution never changes a type: AlterOpType is
 /// Add | Drop | Rename | SetCompatibility).
-/// `coveredKnown`: the caller already proved every writer field id is in the layout (LeaseCoverCache); skips the scan.
+/// `slotOf` (nullptr: scan the layout per field, O(fields^2)): the writer's slot map from leaseSlotMapFor, which already proved
+/// every writer field covered and type-compatible; the projection is then O(fields) and byte-for-byte the same.
 [[nodiscard]] rune::view::PrepareStatus projectLeaseRow(uint8_t* row, const rune::view::RowLayout& layout, const rune::codec::Descriptor& outDesc,
-                                                        const rune::codec::Descriptor& writer, std::string_view value, bool coveredKnown = false) noexcept;
+                                                        const rune::codec::Descriptor& writer, std::string_view value, const uint16_t* slotOf = nullptr) noexcept;
+
+/// Cold.  Builds `slotOf` (slotOf[k] = the layout slot of writer.fields[k]).  Ok; Pending: a writer field id the layout lacks (the
+/// layout is older than the writer's schema); Malformed: a field's type / width differs from its slot, or it lies outside the
+/// writer's block.  `slotOf` is untouched unless Ok.
+[[nodiscard]] rune::view::PrepareStatus buildLeaseSlotMap(const rune::view::RowLayout& layout, const rune::codec::Descriptor& outDesc,
+                                                          const rune::codec::Descriptor& writer, std::vector<uint16_t>& slotOf);
+/// The writer's slot map from the cache, filling the entry (cold, once per `installSeq`) when it is missing or stale.  nullptr when
+/// `installSeq` is 0, the version is past the cache, or the map cannot be built (`status` then says Pending or Malformed; Ok otherwise).
+[[nodiscard]] const uint16_t* leaseSlotMapFor(LeaseCoverCache& cache, uint16_t version, uint32_t installSeq, const rune::view::RowLayout& layout,
+                                              const rune::codec::Descriptor& outDesc, const rune::codec::Descriptor& writer,
+                                              rune::view::PrepareStatus* status = nullptr);
+/// The spec's install sequence number of the record's writer version (0: not installed).
+[[nodiscard]] inline uint32_t leaseInstallSeqOf(const TopicWriteSpec& spec, std::string_view value) noexcept {
+    if (value.size() < 4) return 0;
+    const SpecVersion* sv = spec.versionFor(static_cast<uint16_t>(static_cast<uint8_t>(value[2]) | (static_cast<uint8_t>(value[3]) << 8)));
+    return sv != nullptr ? sv->installSeq : 0;
+}
 
 struct LeaseRowState {
     bool     present = false;
@@ -129,15 +148,20 @@ struct LeaseIndexRef {
     rune::view::ViewTable*         table   = nullptr;
     const rune::view::RowLayout*   layout  = nullptr;
     const rune::codec::Descriptor* outDesc = nullptr;
+    LeaseCoverCache*               cover   = nullptr;   ///< the instance's slot maps (nullptr: encode scans)
 };
 
 /// The exact inverse of projectLeaseRow: writes a lease record value for `writer` (version `writerVersion`) from a row image:
 /// [u16 blockLength][u16 version], then the writer's fixed block, each field copied from the row slot with the same field id
-/// (system columns included).  A field whose slot is null is written as zeros (what projectLeaseRow reads back as a present
-/// zero; the record format has no null).  Returns the bytes written; 0 when `cap` is too small or a writer field has no slot in
+/// (system columns included).  A field whose slot is null is written as zeros, except an Enum's first whitelisted value (see below;
+/// projectLeaseRow reads either back as a present value; the record format has no null).  Returns the bytes written; 0 when `cap` is too small or a writer field has no slot in
 /// the layout (cannot happen after a layout bump).  No allocation.
+/// A null slot of an Enum field is written as the field's first whitelisted value (a zero would fail the version's Validator;
+/// the null bit stays set in the row, the record format has no null), every other null as zeros.
+/// `slotOf` (nullptr: scan): the writer's slot map (leaseSlotMapFor).
 [[nodiscard]] std::size_t encodeLeaseValue(const uint8_t* row, const rune::view::RowLayout& layout, const rune::codec::Descriptor& outDesc,
-                                           const rune::codec::Descriptor& writer, uint16_t writerVersion, uint8_t* out, std::size_t cap) noexcept;
+                                           const rune::codec::Descriptor& writer, uint16_t writerVersion, uint8_t* out, std::size_t cap,
+                                           const uint16_t* slotOf = nullptr) noexcept;
 
 /// What the fold needs of the lease index: its table and layout, the descriptor the layout was built from and the wire
 /// key width.
@@ -146,7 +170,7 @@ struct LeaseIndexFold {
     const rune::view::RowLayout&      layout;
     const rune::codec::Descriptor&    outDesc;
     uint8_t                           keyWidth = 0;
-    /// Optional (nullptr: always scan): the instance's cache of writer descriptors already proven covered by `layout`.
+    /// Optional (nullptr: always scan): the instance's cache of per-version slot maps (proven covered by `layout`).
     LeaseCoverCache*                  cover = nullptr;
 };
 
@@ -157,8 +181,9 @@ struct LeaseIndexFold {
 /// Pending: the writer descriptor is not installed (null) or has a field id the layout lacks; nothing is judged.  When the
 /// writer is null because the version was REFUSED by the spec (`refusedVersion`), the answer is definite: Malformed (the judge
 /// answers InvalidRequest and moves on).  A Checkpoint's image is projected only when its row is absent (a compacted-log replay).
+/// `installSeq`: the spec's install sequence number of the record's version (leaseInstallSeqOf; 0 = do not use the cover cache).
 [[nodiscard]] rune::view::PrepareStatus prepareLeaseIndex(const LeaseIndexFold& f, const rune::view::SourceRecord& rec, rune::view::Prospect& p,
-                                                          bool refusedVersion = false) noexcept;
+                                                          bool refusedVersion = false, uint32_t installSeq = 0) noexcept;
 
 /// Applies one ACCEPTED record (the prospect `p` was prepared for it).  Fills `ev` and returns true when the record
 /// changed a row; false for a record that does not apply (a replay of a log that disagrees with the table).  Every accepted

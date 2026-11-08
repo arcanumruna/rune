@@ -74,6 +74,7 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
     }
     const uint8_t reservedMask = lease ? static_cast<uint8_t>(rec::kAttrReservedMask & ~rec::kAttrLeaseOpMask) : rec::kAttrReservedMask;
 
+    // The first failing record decides; batch-wide rules (version, View, transaction, record count) come first.
     const bool walked = rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& r) {
         if (stopped != pc::ErrorCode::OK) return;
         const uint8_t intent = rec::intentOf(r.attributes);
@@ -221,17 +222,35 @@ pc::ErrorCode CheckedWriteHook::checkLeaseBatch_(const uint8_t* batch, std::size
             return pc::ErrorCode::Throttled;
         }
         pc::ErrorCode result = pc::ErrorCode::OK;
+        // The size of the batch once every revoke with a row at the matching version is re-encoded at the latest installed version
+        // (exact: the value length and both varints), so stage() never meets a batch the scratch cannot hold.
+        const SpecVersionRef latest = latestInstalled_();
+        const std::size_t newValueLen = latest.descriptor != nullptr ? 4u + latest.descriptor->blockLength : 0;
+        std::size_t rebuilt = len;
         (void)rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& r) {
             if (result != pc::ErrorCode::OK || rec::leaseOpOf(r.attributes) != rec::LeaseOp::Revoke) return;
             const auto key = rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(r.key.data()), r.key.size()});
             uint32_t rid = 0;
+            const uint8_t* row = ix.table->find(key, rid);
+            if (row == nullptr) return;
             // An update or revoke of this key is appended but not yet applied to the row: the re-encode would miss it.
-            if (ix.table->ridOf(key, rid) && leaseLastAppended(*ix.table, rid) >= state_.judgedThrough) {
+            if (leaseLastAppended(*ix.table, rid) >= state_.judgedThrough) {
                 refusal_ = HookRefusal::LeaseRevokeBehindUpdate;
                 retryAfterNs_ = kLeaseRetryAfterNs;
                 result = pc::ErrorCode::Throttled;
+                return;
+            }
+            if (newValueLen != 0 && leaseRowVersion(row, *ix.layout) == leaseRecordVersion(r.value)) {
+                const std::size_t bytes = rune::protocol::replacedRecordBytes(std::span<const uint8_t>(batch, len), r, newValueLen);
+                if (bytes != 0) rebuilt = rebuilt - r.len + bytes;
             }
         });
+        // The client splits the batch (LeaseSession sends small revoke batches): a revoke grows to the widest fixed block, so a
+        // large batch of minimal revokes can outgrow the scratch.  Definite, nothing stored.
+        if (result == pc::ErrorCode::OK && rebuilt > scratch_.size()) {
+            refusal_ = HookRefusal::LeaseRevokeBatchTooLarge;
+            return pc::ErrorCode::InvalidRequest;
+        }
         return result;
     }
     return pc::ErrorCode::OK;

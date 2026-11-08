@@ -324,11 +324,14 @@ public:
                 // under the same leadership: the rebuild below replaces it, the activation replays the log into it.
                 if (write->spec->lease && leaseLayoutStale_(srcTopicId, partition, *write->spec)) judge->requestReactivation();
                 // Every fresh lease table starts with lastAppended = -1 for rows whose updates in [judgedThrough, LEO) are unjudged.
-                if (write->spec->lease && judge->activationPending()) write->leaseUntrackedThrough = std::max(write->leaseUntrackedThrough, b.logEnd - 1);
+                // ASSIGNED, not max'ed: a leader never truncates within its leadership, and everything appended before this activation
+                // is <= LEO - 1, so a value left by an earlier leadership (an untracked update at 100, a demote, a truncation to 80,
+                // a re-promotion) must not outlive it: it would hold readiness false until unrelated records push the judge past 100.
+                if (write->spec->lease && judge->activationPending()) write->leaseUntrackedThrough = b.logEnd - 1;
                 if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
                 work += judge->driveJudge(readRange, bound, nowNs, *write, skip.aborted);
                 viewBound = std::min(bound, judge->judgedThrough());
-                work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns);
+                work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns, write->leaseEvents.reservedBytes());
                 // Task 9 (the wheels) consumes these; until then they are discarded.
                 if (write->spec->lease) write->leaseEvents.buf.clear();
             } else {
@@ -395,10 +398,18 @@ public:
     }
     /// The produce path's window on the lease index of (src, partition): its table, layout and layout descriptor.  Null table when
     /// the partition has none.  Non-const: the produce hook writes the table's per-row lastAppended.
-    [[nodiscard]] LeaseIndexRef leaseIndexOf(int32_t src, int32_t partition) noexcept {
-        const auto it = keyIndexes_.find(instKey(src, partition));
+    [[nodiscard]] LeaseIndexRef leaseIndexOf(int32_t src, int32_t partition) noexcept { return leaseIndexFor(src, partition, 0, false, false).ref; }
+    /// The produce path's ONE lookup: the lease index window and whether it is ready (leaseIndexReady's rule with the caller's facts).
+    struct LeaseIndexLookup {
+        LeaseIndexRef ref;
+        bool          ready = false;
+    };
+    [[nodiscard]] LeaseIndexLookup leaseIndexFor(int32_t src, int32_t partition, uint64_t currentLeaderGen, bool isLeader, bool hwConfirmed) noexcept {
+        const uint64_t key = instKey(src, partition);
+        const auto it = keyIndexes_.find(key);
         if (it == keyIndexes_.end()) return {};
-        return LeaseIndexRef{&it->second.table, &it->second.layout, &it->second.evolvingSrc};
+        ViewInstance& inst = it->second;
+        return LeaseIndexLookup{LeaseIndexRef{&inst.table, &inst.layout, &inst.evolvingSrc, &inst.leaseCover}, leaseReady_(inst, key, currentLeaderGen, isLeader, hwConfirmed)};
     }
     /// A lease index row's column `slot` (up to 8 bytes, little-endian) for the 8-byte wire key `key`; nullopt: no such row, or the column is null.
     /// `slots` (if given) receives the layout's column count.
@@ -429,15 +440,34 @@ public:
         if (!isLeader || !hwConfirmed) return false;
         const uint64_t key = instKey(src, partition);
         const auto kit = keyIndexes_.find(key);
+        return kit != keyIndexes_.end() && leaseReady_(kit->second, key, currentLeaderGen, isLeader, hwConfirmed);
+    }
+private:
+    [[nodiscard]] bool leaseReady_(const ViewInstance& inst, uint64_t key, uint64_t currentLeaderGen, bool isLeader, bool hwConfirmed) const noexcept {
+        if (!isLeader || !hwConfirmed) return false;
         const auto vit = verdictSources_.find(key);
-        if (kit == keyIndexes_.end() || vit == verdictSources_.end()) return false;
+        if (vit == verdictSources_.end()) return false;
         const VerdictSource& judge = *vit->second;
         const PartitionWriteState* w = judge.boundState();
         if (w == nullptr || w->spec == nullptr || !w->spec->lease) return false;
-        const ViewInstance& inst = kit->second;
         return judge.activated() && judge.leadershipGeneration() == currentLeaderGen && inst.foldLeadership == currentLeaderGen &&
                inst.layoutGen == w->spec->leaseLayoutGen && inst.foldCursor >= judge.judgedThrough() &&
                judge.judgedThrough() > w->leaseUntrackedThrough;   // updates appended before the table tracked them are judged
+    }
+public:
+    /// The partition stopped leading: its lease event buffer (~320 KiB) is released and no longer counted in the lease view's
+    /// memory.  The next leader pass re-reserves it (ensureVerdictSource, cold).  Cold; idempotent.
+    void releaseLeaseEvents(int32_t src, int32_t partition, PartitionWriteState& write) {
+        write.leaseEvents.release();
+        if (const auto it = keyIndexes_.find(instKey(src, partition)); it != keyIndexes_.end()) {
+            it->second.extraMemBytes = 0;
+            chargeMem_(it->second);
+        }
+    }
+    /// Test seam: the memory the lease view of (src, partition) is accounted with (table plus the event buffer), 0 when none.
+    [[nodiscard]] std::size_t leaseViewMemoryForTest(int32_t src, int32_t partition) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? 0 : instanceMemory_(it->second);
     }
     /// -1: the partition has no key index.
     [[nodiscard]] int64_t keyIndexFoldCursorForTest(int32_t src, int32_t partition) const {
@@ -578,7 +608,7 @@ private:
     uint64_t viewPauses_ = 0, viewResumes_ = 0;
 
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
-        std::size_t m = inst.table.memoryBytes();
+        std::size_t m = inst.table.memoryBytes() + inst.extraMemBytes;
         if (inst.owners) m += inst.owners->memoryBytes();
         if (inst.agg) {
             m += inst.agg->contributors.memoryBytes() + inst.agg->groups.memoryBytes();
@@ -713,7 +743,7 @@ private:
                                                      RowStatus* outStatus) const;
     void onDiscardDone_(int32_t viewTopicId, int32_t partition, int32_t status, ViewDiscardReason reason);
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
-    int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
+    int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns, std::size_t leaseEventBytes);
     void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
     int64_t leaseReplayCap_ = kLeaseIndexReplayRecordsPerPass;   // the records one replay pass of a lease index covers
     [[nodiscard]] bool leaseLayoutStale_(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec) const noexcept {

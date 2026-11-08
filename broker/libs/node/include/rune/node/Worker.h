@@ -3413,7 +3413,7 @@ private:
                               "layout; validator not installed", workerId_, topicId, version);
                 return;
             }
-            if (const TopicWriteSpec& installed = writeSpecOf_(topicId); installed.lease) sizeLeaseScratch_(installed);   // the widest fixed block may have grown
+            if (const TopicWriteSpec& installed = writeSpecOf_(topicId); installed.lease) sizeLeaseScratch_(installed);
             spdlog::debug("Worker {}: SchemaUpdate installed validator for topicId={} version={}",
                           workerId_, topicId, version);
         } catch (const std::exception& ex) {
@@ -3517,9 +3517,10 @@ private:
             // TopicWriteSpec::leaseLayoutSource() (evolving merged with every installed version): a field id that source lacked
             // (an AddField that SchemaUpdate has not delivered yet) makes the layout stale and the index is rebuilt from the log
             // (WorkerViewSet::rebuildKeyIndex_).  Sufficient: a Drop or Rename keeps every id in the layout.
-            {
-                TopicWriteSpec& wspec = writeSpecOf_(topicId);
-                if (wspec.lease && wspec.layoutLacks(desc)) ++wspec.leaseLayoutGen;
+            // A NON-lease topic keeps the original order: its evolving descriptor is updated only after a successful build.
+            TopicWriteSpec& wspec = writeSpecOf_(topicId);
+            if (wspec.lease) {
+                if (wspec.layoutLacks(desc)) ++wspec.leaseLayoutGen;
                 wspec.evolving = desc;
             }
             rune::codec::FilterSchema built = rune::codec::FilterSchema::build(desc, version);
@@ -3533,6 +3534,7 @@ private:
                 ++filterSchemaReplacements_;
                 recompileFilters_(topicId);
             }
+            if (!wspec.lease) wspec.evolving = std::move(desc);
             spdlog::debug("Worker {}: FilterSchema installed for topicId={} version={}", workerId_, topicId, version);
         } catch (const std::exception& ex) {
             ++filterSchemaErrors_;
@@ -7297,16 +7299,12 @@ private:
         w.assignedBases.reserve(assignedBaseReserve_);
         if (autoIncScratch_.size() < maxIntakeBatchBytes_) autoIncScratch_.resize(maxIntakeBatchBytes_);
     }
-    // Cold: the lease hook's scratch holds a rebuilt batch (grants stamped, revokes re-encoded at the widest installed version, so
-    // a revoke can grow by its value) and its work area.  Called when a lease partition's state is created and when a schema
-    // version installs (the widest fixed block can change).
+    // Cold: the lease hook's scratch holds a rebuilt batch (grants stamped, revokes re-encoded at the latest installed version).
+    // Its size is leaseScratchBytes(intake limit); the hook's check() refuses a revoke batch that would outgrow it.
     void sizeLeaseScratch_(const TopicWriteSpec& spec) {
         if (!leaseHookWork_) leaseHookWork_ = std::make_unique<LeaseHookWork>();
-        std::size_t maxFixed = 0;
-        for (int v = spec.maxVersion(); v >= 0; --v)
-            if (const auto* d = spec.descriptorFor(static_cast<uint16_t>(v))) maxFixed = std::max<std::size_t>(maxFixed, d->blockLength);
-        const std::size_t want = maxIntakeBatchBytes_ + rune::protocol::record::kMaxLeaseBatchRecords *
-                                                           (rune::protocol::kMaxRecordFramingBytes + 4 + maxFixed);
+        (void)spec;
+        const std::size_t want = leaseScratchBytes(maxIntakeBatchBytes_);   // check() refuses a revoke batch whose re-encoding exceeds it
         if (autoIncScratch_.size() < want) autoIncScratch_.resize(want);
     }
     // P6-8: a side window at or above 75 % load doubles, up to kAssignedBaseProducersMax producers; cold.
@@ -7400,7 +7398,12 @@ private:
                 const PartitionWriteState* w = writeOf_(replica);
                 if (w == nullptr || (w->verdicts == nullptr && w->constraintSets.latest().empty() && !w->spec->keyIndex && !w->spec->lease)) continue;   // a verdict source without its views still judges nothing, but is driven (it waits); a key index needs no view; a live judge is driven until ensureVerdictSource erases it (#807)
             }
-            if (replica->role() != rune::replication::Role::Leader) continue;
+            if (replica->role() != rune::replication::Role::Leader) {
+                // A lease partition that stopped leading gives its event buffer back (re-reserved on the next leader pass).
+                if (PartitionWriteState* w = writeOf_(replica); w != nullptr && w->leaseEvents.buf.capacity() != 0) [[unlikely]]
+                    viewSet_->releaseLeaseEvents(topicId, static_cast<int32_t>(replica->partitionId()), *w);
+                continue;
+            }
             const RcState* rcState = rcServe_(replica, rcOf_(replica));
             if (rcState == nullptr) continue;         // RC not Ready: fail closed, no bound
             const int64_t liveHw = replica->highWatermark();
@@ -10079,11 +10082,11 @@ private:
                 facts.viewMemOver   = viewSet_ != nullptr && viewSet_->nsViewMemOver(nsTag.slot);
                 facts.leaseWork     = leaseHookWork_.get();
                 if (viewSet_ != nullptr && replica != nullptr) {
-                    facts.leaseIndex = viewSet_->leaseIndexOf(f.topicId, f.partition);
                     const bool hwConfirmed = replica->highWatermark() >= replica->leadershipStartOffset();
-                    facts.leaseIndexReady = facts.leaseIndex.table != nullptr &&
-                        viewSet_->leaseIndexReady(f.topicId, f.partition, replica->leadershipGeneration(),
-                                                  replica->role() == rune::replication::Role::Leader, hwConfirmed);
+                    const auto lookup = viewSet_->leaseIndexFor(f.topicId, f.partition, replica->leadershipGeneration(),
+                                                                replica->role() == rune::replication::Role::Leader, hwConfirmed);   // one lookup
+                    facts.leaseIndex      = lookup.ref;
+                    facts.leaseIndexReady = lookup.ready;
                 }
             }
             lastWriteFacts_ = facts;

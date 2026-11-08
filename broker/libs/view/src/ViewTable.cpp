@@ -328,6 +328,18 @@ uint8_t* ViewTable::put(uint64_t key) {
     return putImpl(probeOf(key));
 }
 uint8_t* ViewTable::put(const ViewKey& key) { return putImpl(probeOf(key)); }
+uint8_t* ViewTable::put(const ViewKey& key, uint32_t& rid) { return putImpl(probeOf(key), &rid); }
+
+const uint8_t* ViewTable::find(const ViewKey& key, uint32_t& rid) const noexcept {
+    const Probe p = probeOf(key);
+    const size_t pi = findP(p);
+    if (pi != static_cast<size_t>(-1)) { rid = main_.rid[pi]; return rowAddr(rid); }
+    if (main_.migrating) {
+        const size_t oi = findO(p);
+        if (oi != static_cast<size_t>(-1)) { rid = main_.orid[oi]; return rowAddr(rid); }
+    }
+    return nullptr;
+}
 
 const uint8_t* ViewTable::get(uint64_t key) const noexcept {
     assert(keyWidth_ <= 8 && prefixWidth_ == 0);
@@ -352,7 +364,7 @@ bool ViewTable::erase(uint64_t key) noexcept {
 }
 bool ViewTable::erase(const ViewKey& key) noexcept { return eraseImpl(probeOf(key)); }
 
-uint8_t* ViewTable::putImpl(const Probe& p) {
+uint8_t* ViewTable::putImpl(const Probe& p, uint32_t* ridOut) {
     main_.maybePrezero(sz_);
     if (main_.migrating) {
         // Deferring the grow-check while already migrating is safe: NEW
@@ -372,6 +384,7 @@ uint8_t* ViewTable::putImpl(const Probe& p) {
         const uint32_t rid = main_.rid[pi];
         dirtyKeys_[rid] = p.word;
         markDirty(rid);
+        if (ridOut != nullptr) *ridOut = rid;
         return rowAddr(rid); // idempotent upsert: existing key in NEW/primary, no dup
     }
     if (main_.migrating) {
@@ -380,6 +393,7 @@ uint8_t* ViewTable::putImpl(const Probe& p) {
             const uint32_t rid = main_.orid[oi];
             dirtyKeys_[rid] = p.word;
             markDirty(rid);
+            if (ridOut != nullptr) *ridOut = rid;
             return rowAddr(rid); // idempotent upsert: existing key still only in OLD
         }
     }
@@ -421,6 +435,7 @@ uint8_t* ViewTable::putImpl(const Probe& p) {
     dirtyKeys_[rid] = p.word;
     markDirty(rid);
     if (prefixWidth_) prefixInsert(p, rid);
+    if (ridOut != nullptr) *ridOut = rid;
     return row;
 }
 

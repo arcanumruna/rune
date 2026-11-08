@@ -163,6 +163,7 @@ struct SpecVersion {
     rune::codec::Validator  validator;
     rune::codec::Descriptor descriptor;
     uint32_t                keyValueOffset = kNoKeyOffset;   ///< record byte offset of the key field's value (4 + its block offset)
+    uint32_t                installSeq = 0;   ///< TopicWriteSpec::installSeq_ at this install (never 0, never reused): the lease cover cache's key
 };
 
 class TopicWriteSpec {
@@ -217,7 +218,7 @@ public:
         // makes its layout stale.  This is the single bump for SchemaUpdate (FilterSchema bumps through the same test).
         if (lease && layoutLacks(materialized)) ++leaseLayoutGen;
         if (versions_.size() <= version) versions_.resize(static_cast<std::size_t>(version) + 1);
-        auto sv = std::make_unique<SpecVersion>(SpecVersion{rune::codec::Validator(materialized), std::move(materialized), kNoKeyOffset});
+        auto sv = std::make_unique<SpecVersion>(SpecVersion{rune::codec::Validator(materialized), std::move(materialized), kNoKeyOffset, ++installSeq_});
         setKeyOffset_(*sv);
         versions_[version] = std::move(sv);
         if (version > maxVersion_) maxVersion_ = version;
@@ -304,6 +305,7 @@ private:
     std::vector<std::unique_ptr<SpecVersion>> versions_;   // index = schema version; grown only by installVersion
     std::vector<uint8_t> refused_;   // index = schema version; 1 = installVersion / setFacts refused it (cold-grown)
     uint16_t maxVersion_ = 0;
+    uint32_t installSeq_ = 0;   // bumped by every successful installVersion (a replaced version gets a new number)
     bool     hasFacts_   = false;
 };
 

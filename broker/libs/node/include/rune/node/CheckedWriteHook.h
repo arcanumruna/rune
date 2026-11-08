@@ -48,6 +48,11 @@ struct LeaseHookWork {
     std::array<uint8_t, 4 + 65535 + 1>                                valueTmp{};    ///< one re-encoded revoke value (u16 block length)
 };
 
+/// The lease hook's scratch bytes for a worker whose intake limit is `maxIntake`: a rebuilt batch (grants stamped, revokes
+/// re-encoded at the widest installed version) is refused by check() when it would exceed it, so this is a bound, not a worst-case
+/// sum.  The ONE definition: the worker and the test rig both size the scratch with it.
+[[nodiscard]] constexpr std::size_t leaseScratchBytes(std::size_t maxIntake) noexcept { return 2 * maxIntake; }
+
 /// What the produce frame and the worker say about one write.
 struct WriteFacts {
     uint8_t acks               = 0;       ///< the Produce.acks wire byte (bit 0 All, bit 1 View)
@@ -122,7 +127,7 @@ enum class HookRefusal : uint8_t {
     KeyZeroCreateNeedsIdempotentAll, KeyZeroCreateNeedsView, MixedKeyZeroBatch, ViewBatchTooLarge,
     ViewWithoutReplica, KeyIndexActivating, UpsertOnAutoIncrement, ImportNotGranted, ImportOutOfRange,
     AutoIncExhausted, AutoIncWindowFull, AutoIncActivating,
-    LeaseSessionUnannounced, LeaseUpdateThenRevoke, LeaseRevokeIndexNotReady, LeaseRevokeBehindUpdate,
+    LeaseSessionUnannounced, LeaseUpdateThenRevoke, LeaseRevokeIndexNotReady, LeaseRevokeBehindUpdate, LeaseRevokeBatchTooLarge,
     LeaseClientVersion, LeaseNeedsView, LeaseInTxn, LeaseBatchTooLarge, LeaseBadRecord, LeaseTtlTooLarge, LeaseViewMemOver,
     Count_
 };
@@ -196,11 +201,11 @@ public:
     [[nodiscard]] bool checked() const noexcept { return checked_; }
 
 private:
-    struct SpecVersionRef { const rune::codec::Descriptor* descriptor = nullptr; uint16_t version = 0; };
+    struct SpecVersionRef { const rune::codec::Descriptor* descriptor = nullptr; uint16_t version = 0; uint32_t installSeq = 0; };
     /// The highest INSTALLED version (a refused version has no descriptor; maxVersion() counts it).
     [[nodiscard]] SpecVersionRef latestInstalled_() const noexcept {
         for (int v = state_.spec->maxVersion(); v >= 0; --v)
-            if (const auto* d = state_.spec->descriptorFor(static_cast<uint16_t>(v))) return {d, static_cast<uint16_t>(v)};
+            if (const SpecVersion* sv = state_.spec->versionFor(static_cast<uint16_t>(v))) return {&sv->descriptor, static_cast<uint16_t>(v), sv->installSeq};
         return {};
     }
     [[nodiscard]] rune::storage::HookStaged patchKeyZeroIds_(const uint8_t* batch, std::size_t len) noexcept;
@@ -288,13 +293,13 @@ rune::storage::HookStaged CheckedWriteHook::stageLease_(LogT& log, const uint8_t
             if (op != rec::LeaseOp::Put && op != rec::LeaseOp::Revoke) return;
             const auto key = rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(r.key.data()), r.key.size()});
             uint32_t rid = 0;
-            if (!ix.table->ridOf(key, rid)) {
+            const uint8_t* row = ix.table->find(key, rid);   // one probe: the row and its id
+            if (row == nullptr) {
                 leaseUntracked_ = true;   // nothing is recorded for a key without a row
             } else {
                 work->rids[leaseTouched_++] = rid;
                 if (op == rec::LeaseOp::Revoke) {
-                    const uint8_t* row = ix.table->get(key);
-                    if (row != nullptr && leaseRowVersion(row, *ix.layout) == leaseRecordVersion(r.value)) {
+                    if (leaseRowVersion(row, *ix.layout) == leaseRecordVersion(r.value)) {
                         work->replace[r.index] = 1;
                         ++replacements;
                     }
@@ -321,6 +326,9 @@ rune::storage::HookStaged CheckedWriteHook::stageLease_(LogT& log, const uint8_t
         });
         if (!ok || count > work->spans.size()) [[unlikely]] return {ErrorCode::Internal, nullptr, 0};
         bool encodeFailed = false;
+        // The latest version's slot map (cold fill once per install, then a lookup): re-encoding is O(fields), not O(fields^2).
+        const uint16_t* const slotOf = ix.cover != nullptr
+            ? leaseSlotMapFor(*ix.cover, latest.version, latest.installSeq, *ix.layout, *ix.outDesc, *latest.descriptor) : nullptr;
         const std::size_t n = rune::protocol::rebuildBatchReplacingValues(
             std::span<const uint8_t>(batch, len), std::span<const rune::protocol::RecordSpan>(work->spans.data(), count),
             [&](std::size_t i) -> std::span<const uint8_t> {
@@ -329,7 +337,7 @@ rune::storage::HookStaged CheckedWriteHook::stageLease_(LogT& log, const uint8_t
                 const auto key = rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(r.key.data()), r.key.size()});
                 const uint8_t* row = ix.table->get(key);
                 const std::size_t m = row == nullptr ? 0 : encodeLeaseValue(row, *ix.layout, *ix.outDesc, *latest.descriptor, latest.version,
-                                                                              work->valueTmp.data(), work->valueTmp.size());
+                                                                              work->valueTmp.data(), work->valueTmp.size(), slotOf);
                 if (m == 0) { encodeFailed = true; return {}; }
                 return std::span<const uint8_t>(work->valueTmp.data(), m);
             },

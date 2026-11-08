@@ -35,13 +35,25 @@ struct LeaseFoldEvents {
     void reserveOnce() {
         if (buf.capacity() < kLeaseFoldEventCap) buf.reserve(kLeaseFoldEventCap);
     }
+    [[nodiscard]] std::size_t reservedBytes() const noexcept { return buf.capacity() * sizeof(LeaseEvent); }
+    /// Cold: gives the storage back (the partition stopped leading); reserveOnce() takes it again on the next activation.
+    void release() noexcept { std::vector<LeaseEvent>().swap(buf); }
 };
 
-/// Per writer version: the descriptor already proven to have every field id in the layout.  Lives in the lease ViewInstance, so a
-/// rebuilt layout starts empty.  A version past the array scans (correct, just not cached).
+/// Per writer version, keyed on the spec's per-install sequence number (SpecVersion::installSeq: a reinstalled version, even one with
+/// an identical descriptor, is a new entry): the writer was proven to have every field id in the layout and type-compatible, and
+/// `slotOf[k]` is the layout slot of the writer's k-th field.  Built once (cold) when the entry is filled, so projecting a record
+/// and re-encoding a row are O(fields), not O(fields^2).  Lives in the lease ViewInstance, so a rebuilt layout starts empty.  A
+/// version past the array scans (correct, just not cached).
 inline constexpr uint16_t kLeaseCoverCacheVersions = 32;
+struct LeaseCoverEntry {
+    uint32_t              installSeq = 0;   ///< 0 = empty
+    std::vector<uint16_t> slotOf;
+};
 struct LeaseCoverCache {
-    std::array<const rune::codec::Descriptor*, kLeaseCoverCacheVersions> proven{};
+    std::array<LeaseCoverEntry, kLeaseCoverCacheVersions> entries{};
+    uint64_t fills = 0;   ///< entries built (observability / tests)
+    [[nodiscard]] uint64_t coverCacheFillsForTest() const noexcept { return fills; }
 };
 
 }  // namespace rune::node

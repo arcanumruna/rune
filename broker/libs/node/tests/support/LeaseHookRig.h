@@ -106,7 +106,8 @@ struct Rig {
     std::unique_ptr<IndexBox>      index;
     PartitionWriteState  state;
     WriteFacts           facts;
-    std::vector<uint8_t> scratch = std::vector<uint8_t>(1 << 20);
+    static constexpr std::size_t kMaxIntake = 512u << 10;   ///< the intake limit the rig's scratch is sized from
+    std::vector<uint8_t> scratch = std::vector<uint8_t>(leaseScratchBytes(kMaxIntake));
     LeaseLog             tlog;
 
     explicit Rig(rune::protocol::LeaseSpec ls = {}) {
@@ -137,6 +138,18 @@ struct Rig {
             .add("lease_holder", rune::codec::PrimType::UInt64).add("lease_remaining_ms", rune::codec::PrimType::UInt64)
             .add("id", rune::codec::PrimType::UInt64, 1, true).addFixedStr("addr", 16).add("port", rune::codec::PrimType::UInt32, 2);
         spec.installVersion(2, d.build());
+    }
+    /// Installs schema version 2 with a wide fixed block: v1 plus `blob` sized so the block is `blockLength` bytes.
+    void installWide(uint16_t blockLength) {
+        const auto build = [&](uint16_t blobLen) {
+            rune::codec::DescriptorBuilder d("inst", 2);
+            d.add("lease_version", rune::codec::PrimType::Int64).add("lease_ttl_ms", rune::codec::PrimType::UInt64)
+                .add("lease_holder", rune::codec::PrimType::UInt64).add("lease_remaining_ms", rune::codec::PrimType::UInt64)
+                .add("id", rune::codec::PrimType::UInt64, 1, true).addFixedStr("addr", 16).addFixedStr("blob", blobLen, 2);
+            return d.build();
+        };
+        const uint16_t probe = build(1).blockLength;
+        spec.installVersion(2, build(uint16_t(blockLength - (probe - 1))));
     }
     /// Builds the lease index from the installed versions and points the hook's facts at it (ready).
     void withIndex() {

@@ -5,6 +5,10 @@
 
 #include <gtest/gtest.h>
 
+#include <rune/storage/ProducePath.h>
+#include <rune/storage/ProducePathImpl.h>
+#include <rune/storage/ProducerStateManager.h>
+
 #include <functional>
 #include <string>
 #include <vector>
@@ -46,6 +50,40 @@ std::vector<uint8_t> manyUpdates(int n) {
     return batchOf(recs);
 }
 
+// A single-record batch whose value length is -1 (a null value).  Built from a record with a 1-byte value: the value-length
+// varint becomes zigzag(-1) = 1, the value byte goes, and the record length, batch length and CRC follow.
+std::vector<uint8_t> nullValueBatch(uint8_t attrs) {
+    rune::protocol::RecordBatchBuilder b(0, 1'000'000);
+    b.append(keyOf(1), "x", 1'000'000, attrs);
+    auto v = b.build();
+    namespace pb = rune::protocol::batch;
+    const std::size_t rec0 = pb::kRecordBatchOverhead;
+    // [len][attrs][tsDelta][offsetDelta][keyLen][key 8][valueLen][value][headerCount]
+    const std::size_t vlen = rec0 + 1 + 1 + 1 + 1 + 1 + 8;
+    EXPECT_EQ(v[vlen], 0x02) << "valueLen 1, zigzag";
+    v[vlen] = 0x01;                                  // valueLen -1
+    v.erase(v.begin() + std::ptrdiff_t(vlen + 1));   // no value byte
+    v[rec0] = uint8_t(v[rec0] - 2);                  // record length 15 -> 14 (zigzag 30 -> 28)
+    putLe(v, 8, uint64_t(v.size() - 12), 4);
+    putLe(v, pb::kCrcOffset, rune::protocol::crc32c(v.data() + pb::kAttributesOffset, v.size() - pb::kAttributesOffset), 4);
+    return v;
+}
+
+struct Produced {
+    ErrorCode   code = ErrorCode::OK;
+    H           why  = H::None;
+    int64_t     base = -1;
+};
+
+// The real produce core with the hook: dedupe, check, stage, append, onAppended.
+Produced produce(Rig& r, const std::vector<uint8_t>& batch) {
+    rune::storage::ProducerStateManager psm;
+    CheckedWriteHook hook(r.state, r.facts, r.scratch);
+    const auto out = rune::storage::handleProduceBatch<rune::storage::InMemoryLog, CheckedWriteHook>(
+        batch.data(), batch.size(), 1, 0, -1, 0, -1, r.tlog.log, psm, false, 0, 1, 1, false, hook);
+    return {out.error, hook.refusal(), out.baseOffset};
+}
+
 }  // namespace
 
 TEST(LeaseWriteHookRegression, RefusalTableRegression) {
@@ -68,6 +106,9 @@ TEST(LeaseWriteHookRegression, RefusalTableRegression) {
         {"revoke insert", none, [&] { return one(withAttrs(revokeOf(1, 5), kRevokeInsert)); }, IR, H::LeaseBadRecord},
         {"client expire", none, [&] { return one(withAttrs(updateOf(1, 5), kExpireC)); }, IR, H::LeaseBadRecord},
         {"client checkpoint", none, [&] { return one(withAttrs(updateOf(1, 5), kCheckptC)); }, IR, H::LeaseBadRecord},
+        {"non-idempotent write", [](Rig& r) { r.facts.idempotent = false; }, [] { return one(grantOf(1)); }, IR, H::ExplicitKeyNeedsIdempotentAndView},
+        {"null value (grant)", none, [] { return nullValueBatch(kGrantA); }, IR, H::None},
+        {"null value (update)", none, [] { return nullValueBatch(kUpdateA); }, IR, H::LeaseBadRecord},
         {"empty value", none, [&] { return one(withValue(grantOf(1), {})); }, IR, H::None},
         {"empty value (update)", none, [&] { return one(withValue(updateOf(1, 5), {})); }, IR, H::LeaseBadRecord},
         {"35-byte value", none, [&] { auto v = leaseValue(1, 0, 5000); v.resize(35); return one(withValue(grantOf(1), v)); }, IR, H::LeaseBadRecord},
@@ -101,6 +142,9 @@ TEST(LeaseWriteHookRegression, RefusalTableRegression) {
          }, IR, H::LeaseBatchTooLarge},
         {"remaining 1 AND ttl max+1", none, [] { return one({1, kGrantA, leaseValue(1, 0, maxTtl() + 1, 1)}); }, IR, H::LeaseBadRecord},
         {"ttl max+1 AND viewMemOver", [](Rig& r) { r.facts.viewMemOver = true; }, [] { return one(grantOf(1, maxTtl() + 1)); }, TTL, H::LeaseTtlTooLarge},
+        // the first failing record decides; batch-wide rules (version, View, transaction, count) come before the record walk
+        {"grant ttl max+1 THEN update remaining 1", none, [] { return batchOf({grantOf(1, maxTtl() + 1), {2, kUpdateA, leaseValue(2, 5, 5000, 1)}}); }, TTL, H::LeaseTtlTooLarge},
+        {"update remaining 1 THEN grant ttl max+1", none, [] { return batchOf({{2, kUpdateA, leaseValue(2, 5, 5000, 1)}, grantOf(1, maxTtl() + 1)}); }, IR, H::LeaseBadRecord},
         {"bad update AND grant while viewMemOver", [](Rig& r) { r.facts.viewMemOver = true; }, [] { return batchOf({grantOf(1), updateOf(2, -1)}); }, IR, H::LeaseBadRecord},
     };
     for (const Row& row : rows) {
@@ -109,12 +153,25 @@ TEST(LeaseWriteHookRegression, RefusalTableRegression) {
         row.setup(r);
         const auto batch = row.batch();
         const int64_t endBefore = r.tlog.logEndOffset();
-        const Outcome o = r.write(batch, /*keepCopy=*/false);
+        const Produced o = produce(r, batch);   // through handleProduceBatch: a refusal must leave the log untouched
         EXPECT_EQ(o.code, row.code);
         if (row.why != H::None) EXPECT_EQ(o.why, row.why);
         if (row.code != OKC) EXPECT_EQ(r.tlog.logEndOffset(), endBefore) << "a refused batch is not stored";
         else EXPECT_GT(r.tlog.logEndOffset(), endBefore);
     }
+}
+
+TEST(LeaseWriteHookRegression, BatchLargerThanScratchIsInternalRegression) {
+    Rig r;
+    r.scratch.resize(200);   // a grant batch is copied to the scratch to be stamped: 5 grants do not fit
+    const auto batch = manyGrants(5);
+    ASSERT_GT(batch.size(), r.scratch.size());
+    const Outcome o = r.write(batch, false);
+    EXPECT_EQ(o.code, ErrorCode::Internal);
+    EXPECT_EQ(r.tlog.logEndOffset(), 0) << "nothing stored";
+    const Produced p = produce(r, batch);
+    EXPECT_EQ(p.code, ErrorCode::Internal);
+    EXPECT_EQ(r.tlog.logEndOffset(), 0);
 }
 
 TEST(LeaseWriteHookRegression, TtlRaisedNotRefusedRegression) {
@@ -460,7 +517,7 @@ TEST(LeaseWriteHookRegression, RevokeWhileIndexNotReadyThrottledRegression) {
     EXPECT_EQ(r.write(one(revokeOf(1, 5)), false).code, ErrorCode::Throttled) << "no index at all";
 }
 
-TEST(LeaseWriteHookRegression, RevokeBatchFitsScratchRegression) {
+TEST(LeaseWriteHookRegression, RevokeManyRowsReencodedRegression) {
     Rig r;
     r.installV2();
     r.withIndex();
@@ -478,5 +535,50 @@ TEST(LeaseWriteHookRegression, RevokeBatchFitsScratchRegression) {
     for (std::size_t i = 0; i < sp.size(); ++i) {
         ASSERT_EQ(schemaOf(valueOfSpan(sp[i])), 2) << i;
         ASSERT_EQ(getLe(valueOfSpan(sp[i]) + 60, 4), i + 1) << "the port column (v2 only) comes from the row";
+    }
+}
+
+// ONE bound (leaseScratchBytes): a revoke grows to the widest fixed block, so a batch of minimal client revokes is refused
+// (39, nothing stored) as soon as its re-encoding outgrows the scratch.
+TEST(LeaseWriteHookRegression, RevokeBatchFitsScratchRegression) {
+    constexpr std::size_t kIntake = 100'000;
+    constexpr std::size_t kScratch = leaseScratchBytes(kIntake);
+    static_assert(kScratch == 2 * kIntake);
+    const auto revokes = [](int n) {
+        std::vector<LRec> recs;
+        for (int i = 1; i <= n; ++i) recs.push_back(revokeOf(uint64_t(i), int64_t(i)));
+        return batchOf(recs);
+    };
+    const auto fresh = [&](Rig& r) {
+        r.scratch.assign(kScratch, 0);
+        r.installWide(65535);
+        r.withIndex();
+        for (uint64_t id = 1; id <= 4; ++id) r.addRow(id, int64_t(id), 7000);
+    };
+    {   // 3 revokes re-encode to 3 * 65539 bytes + framing: they fit
+        Rig r;
+        fresh(r);
+        const Outcome o = r.write(revokes(3));
+        ASSERT_EQ(o.code, OKC);
+        ASSERT_LE(o.copy.size(), kScratch);
+        ASSERT_TRUE(crcOk(o.copy));
+        const auto sp = spansOf(o.copy);
+        ASSERT_EQ(sp.size(), 3u);
+        for (const auto& s : sp) {
+            EXPECT_EQ(schemaOf(valueOfSpan(s)), 2);
+            EXPECT_EQ(s.value.size(), 4u + 65535u) << "re-encoded at the widest block";
+        }
+    }
+    {   // one record more does not: refused, nothing stored
+        Rig r;
+        fresh(r);
+        const int64_t end = r.tlog.logEndOffset();
+        const auto batch = revokes(4);
+        ASSERT_LT(batch.size(), kScratch) << "the client's batch itself is small";
+        const Produced p = produce(r, batch);
+        EXPECT_EQ(p.code, IR);
+        EXPECT_EQ(p.why, H::LeaseRevokeBatchTooLarge);
+        EXPECT_EQ(r.tlog.logEndOffset(), end) << "nothing stored";
+        for (uint64_t id = 1; id <= 4; ++id) EXPECT_EQ(r.lastAppendedOf(id), -1);
     }
 }

@@ -141,6 +141,24 @@ inline std::size_t varintSize(int64_t v) noexcept {
 }
 }  // namespace detail
 
+/// The exact bytes record `r` of `src` takes once its value is replaced by one of `newValueLen` bytes (the same arithmetic as
+/// rebuildBatchReplacingValues: the value-length varint and the record-length varint are re-encoded).  0 when the record cannot be
+/// replaced (null value, or spans that do not match `src`).
+inline std::size_t replacedRecordBytes(std::span<const uint8_t> src, const RecordSpan& r, std::size_t newValueLen) noexcept {
+    if (r.value.empty() || r.pos + r.len > src.size()) return 0;
+    const std::size_t valuePos = static_cast<std::size_t>(reinterpret_cast<const uint8_t*>(r.value.data()) - src.data());
+    const std::size_t valueEnd = valuePos + r.value.size();
+    const std::size_t recEnd   = r.pos + r.len;
+    std::size_t bodyStart = r.pos;
+    int64_t oldBody = 0;
+    if (!detail::readVarintBounded(src.data(), recEnd, bodyStart, oldBody)) return 0;
+    if (r.valueLenPos < bodyStart || valuePos < r.valueLenPos || valueEnd > recEnd) return 0;
+    const std::size_t head = r.valueLenPos - bodyStart;
+    const std::size_t tail = recEnd - valueEnd;
+    const int64_t newBody = static_cast<int64_t>(head + detail::varintSize(static_cast<int64_t>(newValueLen)) + newValueLen + tail);
+    return detail::varintSize(newBody) + static_cast<std::size_t>(newBody);
+}
+
 /// Rebuild `src` with some records' VALUES replaced (every record kept, offsets unchanged).  `records` are the spans
 /// forEachRecordSpan produced for `src`; `replacementFor(i)` (called once per record, in order) returns the new value of record
 /// i, or an empty span to copy the record verbatim.  A replaced record gets its value-length and record-length varints

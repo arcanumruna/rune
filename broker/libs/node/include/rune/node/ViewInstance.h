@@ -246,6 +246,9 @@ struct ViewInstance {
     uint16_t                           nsSlot          = kNoNsSlot;
     uint32_t                           nsId            = 0;
     std::size_t                        memCharged      = 0;
+    // A lease index: the reserved bytes of the partition's lease event buffer (PartitionWriteState::leaseEvents), counted with the
+    // table in the memory charged to the namespace (WorkerViewSet::instanceMemory_).
+    std::size_t                        extraMemBytes   = 0;
 
     // C1 (Task 22 fix round 1): the source replica's leadershipGeneration() this
     // table is caught up under; 0 = never driven by a leader.  A read is served

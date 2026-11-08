@@ -101,6 +101,7 @@ struct ProspectRow {
     uint8_t* image   = nullptr;   // the prospective view-row image; valid until the Prospect is cleared
     bool     removed = false;     // the row is gone after apply
     bool     existed = false;     // the row exists in the table now
+    uint32_t rid     = UINT32_MAX;  // lease index: the existing row's id (valid when existed), found once by prepare
 };
 
 // Reserved once per ViewInstance at install; never grows.

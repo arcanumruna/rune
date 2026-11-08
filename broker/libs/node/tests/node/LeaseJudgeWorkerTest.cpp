@@ -1,6 +1,7 @@
 // Lease topics Task 6: the lease index inside a real worker (the leadership and layout rebuilds, the hook facts).
 #include "CheckedWritesRig.h"
 
+#include <rune/codec/Validator.h>
 #include <rune/protocol/LeaseRecord.h>
 
 #include <cstring>
@@ -560,6 +561,12 @@ TEST(LeaseJudgeWorkerRegression, LeaseAdoptedUnderActiveJudgeBecomesReadyRegress
     const VerdictSource* judge = r.vs->verdictSource(VerdictRig::kSrc, 0);
     ASSERT_NE(judge, nullptr);
     ASSERT_TRUE(judge->activated()) << "the judge is already active when the lease spec arrives";
+    const PartitionWriteState* w = r.writeState();
+    ASSERT_NE(w, nullptr);
+    const int64_t otherCursor = r.vs->foldCursorForTest(0x40000001, 0);
+    const std::size_t otherRejected = w->rejected.size();
+    const ViewInstance* other = r.vs->instanceForTest(0x40000001, 0);
+    ASSERT_NE(other, nullptr);
     r.createLeaseTopic();   // the WRITE_SPEC with the lease block, after the activation
     bool ready = false;
     for (int i = 0; i < 400 && !ready; ++i) {
@@ -567,6 +574,11 @@ TEST(LeaseJudgeWorkerRegression, LeaseAdoptedUnderActiveJudgeBecomesReadyRegress
         ready = r.leaseReady();
     }
     EXPECT_TRUE(ready) << "the adopted lease index never became ready";
+    // adopting the lease index does not touch the other member: its view state and the rejected index are as they were
+    EXPECT_EQ(r.vs->instanceForTest(0x40000001, 0), other) << "the other member's view is the same instance, not rebuilt";
+    EXPECT_GE(r.vs->foldCursorForTest(0x40000001, 0), otherCursor) << "its fold only moved forward";
+    EXPECT_EQ(w->rejected.size(), otherRejected);
+    EXPECT_EQ(w->rejected.nextRejectedAtOrAfter(0), INT64_MAX) << "nothing was rejected";
 }
 
 // Task 5a: a lease grant produced through the worker's real produce path (the ack sink knows the session's client version,
@@ -775,7 +787,7 @@ void releaseUntilReadyWithTailUnjudged(VerdictRig& r) {
     ASSERT_GE(r.vs->keyIndexFoldCursorForTest(VerdictRig::kSrc, 0), judge->judgedThrough()) << "vacuity guard: the index replayed up to the judge, so only leaseUntrackedThrough keeps it not ready";
     ASSERT_LT(judge->judgedThrough(), r.leo()) << "vacuity guard: the update is still unjudged";
 }
-void expectRevokeThrottledThenCarriesUpdate(Leased& l, int64_t ver) {
+void expectRevokeThrottledThenCarriesUpdate(Leased& l, int64_t ver, bool releaseHold = false) {
     VerdictRig& r = l.r;
     const int64_t leo = r.leo();
     const auto th = l.produceNoSeq({RawRec{keyOf(1), leaseValue(1, ver, "", 1), kRevokeAttr}}, l.seq);
@@ -783,6 +795,7 @@ void expectRevokeThrottledThenCarriesUpdate(Leased& l, int64_t ver) {
     EXPECT_EQ(th->code, int16_t(rune::protocol::client::ErrorCode::Throttled)) << "the update is not judged yet";
     EXPECT_EQ(th->retryAfter, 1'000'000);
     EXPECT_EQ(r.leo(), leo) << "nothing stored";
+    if (releaseHold) r.holdJudge(false);
     ASSERT_TRUE(r.driveUntilJudged());
     r.passes(30);
     ASSERT_TRUE(r.leaseReady());
@@ -883,4 +896,207 @@ TEST(LeaseWriteHookWorkerRegression, RevokeWhileIndexNotReadyThrottledRegression
     const auto ok = l.produceNoSeq({RawRec{keyOf(1), leaseValue(1, g->baseOffset, "", 1), kRevokeAttr}}, l.seq);
     ASSERT_TRUE(ok);
     EXPECT_EQ(ok->code, 0);
+}
+
+// ── lease sweep 1 ──
+
+// Item 2: the fold event buffer (~320 KiB) is a leader's; a demoted partition gives it back and stops counting it.
+TEST(LeaseJudgeWorkerRegression, LeaseEventBufferReleasedOnDemoteRegression) {
+    Ready g;
+    VerdictRig& r = g.r;
+    ASSERT_TRUE(g.send({grantRec(1, "a1")}));
+    r.passes(30);
+    ASSERT_TRUE(r.leaseReady());
+    const PartitionWriteState* w = r.writeState();
+    ASSERT_NE(w, nullptr);
+    const std::size_t reserved = w->leaseEvents.reservedBytes();
+    ASSERT_GT(reserved, 0u);
+    const std::size_t counted = r.vs->leaseViewMemoryForTest(VerdictRig::kSrc, 0);
+    EXPECT_GE(counted, reserved) << "the buffer is part of the lease view's memory";
+
+    r.demote();
+    r.passes(10);
+    EXPECT_EQ(w->leaseEvents.reservedBytes(), 0u) << "released when the partition stops leading";
+    const std::size_t after = r.vs->leaseViewMemoryForTest(VerdictRig::kSrc, 0);
+    EXPECT_EQ(counted - after, reserved) << "and no longer counted";
+
+    r.promote();
+    r.passes(30);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(30);
+    EXPECT_EQ(w->leaseEvents.reservedBytes(), reserved) << "reserved again on the next leadership";
+    EXPECT_GE(r.vs->leaseViewMemoryForTest(VerdictRig::kSrc, 0), reserved);
+    EXPECT_TRUE(r.leaseReady());
+}
+
+// Item 4: AddField is a SchemaUpdate plus a FilterSchema; whichever arrives first, the index is rebuilt ONCE.
+TEST(LeaseJudgeWorkerRegression, LeaseSchemaOpsRebuildOnceRegression) {
+    for (const bool updateFirst : {true, false}) {
+        SCOPED_TRACE(updateFirst ? "SchemaUpdate first" : "FilterSchema first");
+        Ready g;
+        VerdictRig& r = g.r;
+        ASSERT_TRUE(g.send({grantRec(1, "a1")}));
+        r.passes(60);
+        ASSERT_NE(r.stats(), nullptr);
+        const uint64_t before = r.stats()->keyIndexRebuilds;
+        const rune::codec::Descriptor v2 = VerdictRig::leaseSourceDescriptor(2);
+        if (updateFirst) { r.leaseSchemaUpdate(v2, 2); r.passes(30); r.leaseFilterSchema(v2, 2); }
+        else             { r.leaseFilterSchema(v2, 2); r.passes(30); r.leaseSchemaUpdate(v2, 2); }
+        r.passes(60);
+        ASSERT_TRUE(r.driveUntilJudged());
+        r.passes(30);
+        EXPECT_EQ(r.stats()->keyIndexRebuilds - before, 1u);
+        EXPECT_EQ(colsOf(r, 1, kV2Columns).slots, kV2Columns) << "vacuity guard: the layout did change";
+    }
+}
+
+// Item 5: a FilterSchema whose build throws (client version 0). A non-lease topic keeps its evolving descriptor; a lease topic
+// still gets the layout bump (the index must not stay on a layout the SchemaUpdate already outgrew).
+TEST(LeaseJudgeWorkerRegression, FilterSchemaThrowKeepsEvolvingForNonLeaseRegression) {
+    VerdictRig r;
+    r.typed();
+    r.passes(30);
+    const PartitionWriteState* w = r.writeState();
+    ASSERT_NE(w, nullptr);
+    ASSERT_FALSE(w->spec->lease);
+    ASSERT_TRUE(w->spec->evolving.has_value());
+    const std::size_t fields = w->spec->evolving->fields.size();
+    rune::codec::DescriptorBuilder b("t", 2);
+    b.add("id", rune::codec::PrimType::UInt64, 1, true).add("v", rune::codec::PrimType::Int64).add("tag", rune::codec::PrimType::UInt16)
+        .add("extra", rune::codec::PrimType::UInt32, 2);
+    WorkerOp f;
+    f.type = WorkerOp::Type::FilterSchema; f.topicId = VerdictRig::kSrc; f.clientVersion = 0;   // FilterSchema::build refuses version 0
+    f.schemaUpdateBlob = rune::codec::serialize(b.build());
+    r.send(std::move(f));
+    r.passes(10);
+    ASSERT_NE(r.worker, nullptr);
+    EXPECT_GE(r.worker->filterSchemaErrorsForTest(), 1u) << "vacuity guard: the build did throw";
+    EXPECT_EQ(w->spec->evolving->fields.size(), fields) << "a refused FilterSchema leaves the evolving descriptor as it was";
+}
+
+TEST(LeaseJudgeWorkerRegression, FilterSchemaThrowLeaseLayoutBumpedRegression) {
+    Ready g;
+    VerdictRig& r = g.r;
+    const PartitionWriteState* w = r.writeState();
+    ASSERT_NE(w, nullptr);
+    const uint32_t gen = w->spec->leaseLayoutGen;
+    r.leaseFilterSchema(VerdictRig::leaseSourceDescriptor(2), 0);   // a new field id, and a build that throws
+    r.passes(10);
+    ASSERT_GE(r.worker->filterSchemaErrorsForTest(), 1u) << "vacuity guard: the build did throw";
+    EXPECT_EQ(w->spec->leaseLayoutGen, gen + 1) << "the layout bump does not depend on the build";
+    ASSERT_TRUE(w->spec->evolving.has_value());
+    EXPECT_EQ(w->spec->evolving->fields.size(), 7u) << "the lease topic's evolving descriptor has the new field";
+}
+
+// Item 9: a v2 Enum whose whitelist excludes 0, never set by the v1 grant.  The revoke is re-encoded at v2 from the row: the Enum
+// must hold a whitelisted value or the stored record fails the v2 Validator.
+TEST(LeaseWriteHookWorkerRegression, RevokeNullEnumPassesValidatorRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const auto ack = l.produce({RawRec{keyOf(1), leaseValue(1, 0, "a1"), 1}});
+    ASSERT_TRUE(ack);
+    ASSERT_EQ(ack->code, 0);
+    r.passes(30);
+    rune::codec::DescriptorBuilder b("inst", 2);
+    b.add("lease_version", PrimType::Int64).add("lease_ttl_ms", PrimType::UInt64).add("lease_holder", PrimType::UInt64)
+        .add("lease_remaining_ms", PrimType::UInt64).add("id", PrimType::UInt64, 1, true).addFixedStr("addr", 16)
+        .add("kind", PrimType::Enum, 2, false, {5, 6});
+    const rune::codec::Descriptor v2 = b.build();
+    r.leaseSchemaUpdate(v2, 2);
+    r.leaseFilterSchema(v2, 2);
+    r.passes(60);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(30);
+    ASSERT_TRUE(r.leaseReady());
+    const int64_t before = r.leo();
+    const auto rack = l.produce({RawRec{keyOf(1), leaseValue(1, ack->baseOffset, "", 1), kRevokeAttr}});
+    ASSERT_TRUE(rack);
+    ASSERT_EQ(rack->code, 0);
+    EXPECT_TRUE(rack->verdicts.empty());
+    r.passes(30);
+    const rune::codec::Descriptor w2 = rune::codec::materializeAsOf(v2, 2);
+    const rune::codec::Validator validator(w2);
+    int revokes = 0;
+    for (const auto& s : storedRecords(r))
+        if (s.offset >= before && s.attrs == kRevokeAttr) {
+            ++revokes;
+            EXPECT_EQ(le(s.value, 2, 2), 2u);
+            const auto res = validator.validate(s.value);
+            EXPECT_TRUE(res.ok) << (res.reason != nullptr ? res.reason : "");
+        }
+    EXPECT_EQ(revokes, 1);
+}
+
+// Item 12: leaseUntrackedThrough belongs to one activation. A value left by an earlier leadership (an untracked update at an
+// offset a truncation later removed) is overwritten, not kept by a max.
+TEST(LeaseJudgeWorkerRegression, LeaseUntrackedResetOnActivationRegression) {
+    Ready g;
+    VerdictRig& r = g.r;
+    ASSERT_TRUE(g.send({grantRec(1, "a1")}));
+    r.passes(30);
+    PartitionWriteState* w = const_cast<PartitionWriteState*>(r.writeState());
+    ASSERT_NE(w, nullptr);
+    ASSERT_TRUE(r.leaseReady());
+    w->leaseUntrackedThrough = r.leo() + 500;   // a stale mark above anything the log will hold soon
+    EXPECT_FALSE(r.leaseReady());
+    r.demote();
+    r.promote();
+    r.passes(30);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(30);
+    EXPECT_LT(w->leaseUntrackedThrough, r.leo()) << "the stale mark did not survive the activation";
+    EXPECT_EQ(w->leaseUntrackedThrough, w->judgedThrough - 1) << "assigned LEO - 1 at activation";
+    EXPECT_TRUE(r.leaseReady()) << "ready once the judge is past LEO";
+}
+
+// Item 13 (b): an update of a key with no row, while the index is ready, still raises the mark to the batch's last offset (the
+// hook cannot track it in the row, so readiness waits for the judge to pass it).
+TEST(LeaseWriteHookWorkerRegression, UpdateOfKeyWithoutRowRaisesUntrackedRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    ASSERT_TRUE(r.leaseReady());
+    const PartitionWriteState* w = r.writeState();
+    ASSERT_NE(w, nullptr);
+    const int64_t mark = w->leaseUntrackedThrough;
+    r.holdJudge(true);
+    const int64_t c = r.produceBytes(VerdictRig::rawBatch({RawRec{keyOf(99), leaseValue(99, 5, "zz"), 2}}, 11, l.seq), rune::protocol::client::kAcksWireView, 11, l.seq);
+    ++l.seq;
+    (void)c;
+    r.passes(5);
+    EXPECT_EQ(w->leaseUntrackedThrough, r.leo() - 1) << "the appended update's offset";
+    EXPECT_GT(w->leaseUntrackedThrough, mark);
+    EXPECT_FALSE(r.leaseReady()) << "not ready until the judge has passed it";
+    r.holdJudge(false);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(30);
+    EXPECT_TRUE(r.leaseReady());
+}
+
+// Item 13 (a): activation has COMPLETED, the replay still trails the judge (one batch a pass), and an update is appended.  The
+// revoke must wait (the index is not ready, and the update is not judged yet), then carry the update's columns.
+TEST(LeaseWriteHookWorkerRegression, UpdateAfterActivationWhileReplayTrailsRegression) {
+    Leased l(10000);
+    VerdictRig& r = l.r;
+    const auto g = l.produce({RawRec{keyOf(1), leaseValue(1, 0, "a1"), 1}});
+    ASSERT_TRUE(g);
+    r.passes(30);
+    const int64_t ver = g->baseOffset;
+    r.vs->setLeaseReplayCapForTest(1);   // every index built from here on replays one batch a pass
+    r.demote();
+    r.holdJudge(true);
+    r.promote();
+    r.passes(30);
+    appendBulkGrants(l);
+    r.holdJudge(false);
+    const VerdictSource* judge = r.vs->verdictSource(VerdictRig::kSrc, 0);
+    ASSERT_NE(judge, nullptr);
+    for (int i = 0; i < 20 && !judge->activated(); ++i) r.pass();
+    ASSERT_TRUE(judge->activated());
+    ASSERT_LT(r.vs->keyIndexFoldCursorForTest(VerdictRig::kSrc, 0), judge->judgedThrough()) << "vacuity guard: activation completed, the replay trails the judge";
+    (void)r.produceBytes(VerdictRig::rawBatch({RawRec{keyOf(1), leaseValue(1, ver, "zz"), 2}}, 11, l.seq), rune::protocol::client::kAcksWireView, 11, l.seq);
+    ++l.seq;
+    r.pass();   // the worker appends the update
+    ASSERT_GT(r.leo(), r.vs->keyIndexFoldCursorForTest(VerdictRig::kSrc, 0)) << "vacuity guard: appended, the replay has not reached it";
+    ASSERT_FALSE(r.leaseReady());
+    expectRevokeThrottledThenCarriesUpdate(l, ver);
 }

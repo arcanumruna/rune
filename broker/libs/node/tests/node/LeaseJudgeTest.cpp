@@ -10,6 +10,7 @@
 
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Evolve.h>
+#include <rune/codec/Validator.h>
 #include <rune/node/VerdictSource.h>
 #include <rune/node/lease/LeaseIndex.h>
 #include <rune/protocol/LeaseRecord.h>
@@ -249,9 +250,6 @@ TEST(LeaseJudgeTableRegression, JudgeLeaseExactTtlAndRemainingRegression) {
     EXPECT_EQ(judgeLease(row, updateA, 7, 1, 1, 10), 0);
     EXPECT_EQ(judgeLease(row, revokeA, 7, 1, 1, 10), 0);
     EXPECT_EQ(judgeLease(row, updateA, 7, 0, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, updateA, 7, 0, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, updateA, 7, 0, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, revokeA, 7, 0, 1, 10), 0);
     EXPECT_EQ(judgeLease(row, revokeA, 7, 0, 1, 10), 0);
     // Precedence: the not-found / version answers come first, then KeyExists / the limit.
     EXPECT_EQ(judgeLease(none, updateA, 7, 1, 0, 10), kNotFound);
@@ -261,7 +259,6 @@ TEST(LeaseJudgeTableRegression, JudgeLeaseExactTtlAndRemainingRegression) {
     EXPECT_EQ(judgeLease(row, grantA, 0, 1, 1, 10), kKeyExists);
     EXPECT_EQ(judgeLease(none, grantA, 0, 1, 10, 10), kLimit);
     // A grant takes its TTL as written (any value); broker records are not checked for either column.
-    EXPECT_EQ(judgeLease(none, grantA, 0, 0, 0, 10), 0);
     EXPECT_EQ(judgeLease(none, grantA, 0, 0, 0, 10), 0);
     EXPECT_EQ(judgeLease(row, at(rec::LeaseOp::Expire, 0), 7, 9, 1, 10), 0);
     EXPECT_EQ(judgeLease(row, at(rec::LeaseOp::Checkpoint, 0), 7, 9, 1, 10), 0);
@@ -531,6 +528,34 @@ TEST(LeaseJudgeTableRegression, BrokerRecordsNeverStallRegression) {
     (void)r.judgeOne(checkpoint(1, g + 100, 5), &second);
     EXPECT_TRUE(r.vs.stalled());
     EXPECT_EQ(r.vs.judgedThrough(), second);
+}
+
+// A broker Expire / Checkpoint whose key has no row and whose projection is malformed is a stale broker record like any other:
+// it takes the reserved stale-broker slot (never stalls the judge); a malformed CLIENT record is still InvalidRequest.
+TEST(LeaseJudgeTableRegression, MalformedStaleBrokerRecordRegression) {
+    {
+        Rig c;
+        c.start();
+        LRec truncatedGrant = grant(7);
+        truncatedGrant.value.resize(40);   // shorter than the writer's block: malformed projection
+        EXPECT_EQ(c.judgeOne(truncatedGrant), kInvalid) << "a malformed client record keeps the normal answer";
+    }
+    Rig r;
+    r.st.rejected.reserve(1);
+    r.start();
+    int64_t g = 0;
+    ASSERT_EQ(r.judgeOne(grant(1), &g), 0);
+    EXPECT_EQ(r.judgeOne(grant(1)), kKeyExists);   // a client rejection fills the one-slot index
+    EXPECT_EQ(r.st.rejected.size(), 1u);
+
+    LRec badCheckpoint = checkpoint(9, 5, 5);   // no row for key 9
+    badCheckpoint.value.resize(40);
+    int64_t at = 0;
+    EXPECT_EQ(r.judgeOne(badCheckpoint, &at), kStale) << "the reserved stale-broker slot, not InvalidRequest";
+    EXPECT_FALSE(r.vs.stalled());
+    EXPECT_EQ(r.vs.stats().leaseRejectedStaleBroker, 1u);
+    EXPECT_EQ(r.vs.judgedThrough(), at + 1);
+    EXPECT_EQ(r.row(9), nullptr);
 }
 
 TEST(LeaseJudgeTableRegression, TokensOnlyGrowRegression) {
@@ -983,25 +1008,108 @@ TEST(LeaseJudgeTableRegression, LeaseCoverCacheAndCheckpointImageRegression) {
     std::vector<uint8_t> key(8, 0);
     key[0] = 1;
     rune::view::SourceRecord put{sv(key), sv(b1), 5, rec::intentOf(kGrantA), &w1, kGrantA};
-    ASSERT_EQ(prepareLeaseIndex(f, put, prospect), rune::view::PrepareStatus::Ok);
-    EXPECT_EQ(cache.proven[1], &w1) << "the proof is cached per writer version";
-    ASSERT_EQ(prepareLeaseIndex(f, put, prospect), rune::view::PrepareStatus::Ok);
-    // A different descriptor object at the same version is not covered by the cache: it is scanned (and here lacks nothing).
+    ASSERT_EQ(prepareLeaseIndex(f, put, prospect, false, /*installSeq=*/7), rune::view::PrepareStatus::Ok);
+    EXPECT_EQ(cache.entries[1].installSeq, 7u) << "the proof is cached per writer version, keyed on its install sequence";
+    EXPECT_EQ(cache.coverCacheFillsForTest(), 1u);
+    ASSERT_EQ(prepareLeaseIndex(f, put, prospect, false, 7), rune::view::PrepareStatus::Ok);
+    EXPECT_EQ(cache.coverCacheFillsForTest(), 1u) << "the same install: no rebuild";
+    // Another install of the same version (a new descriptor object with identical ids) is a new entry, even at the same address.
     const rune::codec::Descriptor w1b = w1;
     put.writer = &w1b;
-    ASSERT_EQ(prepareLeaseIndex(f, put, prospect), rune::view::PrepareStatus::Ok);
-    EXPECT_EQ(cache.proven[1], &w1b);
+    ASSERT_EQ(prepareLeaseIndex(f, put, prospect, false, 8), rune::view::PrepareStatus::Ok);
+    EXPECT_EQ(cache.entries[1].installSeq, 8u);
+    EXPECT_EQ(cache.coverCacheFillsForTest(), 2u);
+    // installSeq 0 never uses the cache.
+    ASSERT_EQ(prepareLeaseIndex(f, put, prospect, false, 0), rune::view::PrepareStatus::Ok);
+    EXPECT_EQ(cache.coverCacheFillsForTest(), 2u);
 
     // A Checkpoint's image is built only for an absent row.
     rune::view::SourceRecord cp{sv(key), sv(b1), 6, 0, &w1, kCheckptA};
-    ASSERT_EQ(prepareLeaseIndex(f, cp, prospect), rune::view::PrepareStatus::Ok);
+    ASSERT_EQ(prepareLeaseIndex(f, cp, prospect, false, 8), rune::view::PrepareStatus::Ok);
     EXPECT_NE(prospect.rows[0].image, nullptr) << "absent row: the checkpoint carries the image a compacted-log replay creates it from";
     LeaseEvent ev1;
-    ASSERT_EQ(prepareLeaseIndex(f, put, prospect), rune::view::PrepareStatus::Ok);
+    ASSERT_EQ(prepareLeaseIndex(f, put, prospect, false, 8), rune::view::PrepareStatus::Ok);
     LeaseIndexFold fm{table, layout, ev, 8, &cache};
     ASSERT_TRUE(applyLeaseRecord(fm, put, prospect, ev1));
-    ASSERT_EQ(prepareLeaseIndex(f, cp, prospect), rune::view::PrepareStatus::Ok);
+    ASSERT_EQ(prepareLeaseIndex(f, cp, prospect, false, 8), rune::view::PrepareStatus::Ok);
     EXPECT_EQ(prospect.rows[0].image, nullptr) << "present row: no image is projected on the live path";
+}
+
+// A spec that reinstalls a version (identical field ids, a new descriptor object) gives it a new install sequence, and the judge's
+// cover cache refills (it was keyed on the descriptor pointer before, which a reused address can alias).
+TEST(LeaseJudgeTableRegression, LeaseCoverCacheKeyedOnInstallRegression) {
+    Rig r;
+    r.start();
+    const uint32_t seq1 = r.spec.versionFor(1)->installSeq;
+    ASSERT_NE(seq1, 0u);
+    int64_t g = 0;
+    ASSERT_EQ(r.judgeOne(grant(1), &g), 0);
+    const uint64_t fills = r.index->leaseCover.coverCacheFillsForTest();
+    EXPECT_GE(fills, 1u);
+    ASSERT_EQ(r.judgeOne(update(1, g)), 0);
+    EXPECT_EQ(r.index->leaseCover.coverCacheFillsForTest(), fills) << "same install: the entry is reused";
+    ASSERT_TRUE(r.spec.installVersion(1, rune::codec::materializeAsOf(r.evolving, 1)));   // a new object, identical ids
+    EXPECT_GT(r.spec.versionFor(1)->installSeq, seq1);
+    ASSERT_EQ(r.judgeOne(update(1, g)), 0);
+    EXPECT_EQ(r.index->leaseCover.coverCacheFillsForTest(), fills + 1) << "a reinstall rebuilds the entry";
+}
+
+// The writer's slot map (built once, cold) projects and re-encodes exactly like the per-field scan.
+TEST(LeaseJudgeTableRegression, LeaseProjectionSlotMapRegression) {
+    // evolving: system 0..3, id (key), addr (v1-v2, dropped at v3), port (since v2), flags (v1+), note (since v3)
+    rune::codec::DescriptorBuilder b("inst", 3);
+    b.add("lease_version", P::Int64).add("lease_ttl_ms", P::UInt64).add("lease_holder", P::UInt64).add("lease_remaining_ms", P::UInt64)
+        .add("id", P::UInt64, 1, /*isKey=*/true)
+        .addFixedStrTagged("addr", 5, 16, 1, 3, false)
+        .addTagged("port", 6, P::UInt32, 2, 0xFFFF, false, {})
+        .addTagged("flags", 7, P::UInt16, 1, 0xFFFF, false, {})
+        .addFixedStrTagged("note", 8, 5, 3, 0xFFFF, false);
+    const rune::codec::Descriptor ev = b.build();
+    const rune::view::RowLayout layout = leaseIndexRowLayout(ev);
+    LeaseCoverCache cache;
+    std::mt19937_64 rng(0x510700F);
+    std::vector<uint8_t> viaMap(layout.rowLen), viaScan(layout.rowLen), value(70000), enc1(70000), enc2(70000);
+    std::vector<uint8_t> row(layout.rowLen);
+    for (int iter = 0; iter < 500; ++iter) {
+        const uint16_t v = static_cast<uint16_t>(1 + iter % 3);
+        const rune::codec::Descriptor w = rune::codec::materializeAsOf(ev, v);
+        SCOPED_TRACE("iter " + std::to_string(iter) + " writer v" + std::to_string(v));
+        rune::view::PrepareStatus st{};
+        const uint16_t* map = leaseSlotMapFor(cache, v, /*installSeq=*/v, layout, ev, w, &st);
+        ASSERT_EQ(st, rune::view::PrepareStatus::Ok);
+        ASSERT_NE(map, nullptr);
+        const std::size_t len = 4u + w.blockLength;
+        for (std::size_t k = 0; k < len; ++k) value[k] = uint8_t(rng());
+        const std::string_view sv2(reinterpret_cast<const char*>(value.data()), len);
+        std::fill(viaMap.begin(), viaMap.end(), uint8_t{0xAA});
+        std::fill(viaScan.begin(), viaScan.end(), uint8_t{0x55});
+        ASSERT_EQ(projectLeaseRow(viaMap.data(), layout, ev, w, sv2, map), rune::view::PrepareStatus::Ok);
+        ASSERT_EQ(projectLeaseRow(viaScan.data(), layout, ev, w, sv2, nullptr), rune::view::PrepareStatus::Ok);
+        ASSERT_EQ(viaMap, viaScan) << "the slot-map projection is the scan's, byte for byte (null bits included)";
+        // Re-encoding a random row (garbage under null slots) through the map equals the scan's.
+        for (uint8_t& x : row) x = uint8_t(rng());
+        const uint16_t n = static_cast<uint16_t>(layout.slotType.size() - kLeaseOffsetSlots);
+        for (uint16_t s = 0; s < layout.slotType.size(); ++s) rune::view::clearNull(row.data(), layout, s);
+        for (uint16_t s = kLeaseSystemSlots; s < n; ++s)
+            if (rng() % 3 == 0) rune::view::setNull(row.data(), layout, s);
+        const std::size_t m1 = encodeLeaseValue(row.data(), layout, ev, w, v, enc1.data(), enc1.size(), map);
+        const std::size_t m2 = encodeLeaseValue(row.data(), layout, ev, w, v, enc2.data(), enc2.size(), nullptr);
+        ASSERT_EQ(m1, len);
+        ASSERT_EQ(m1, m2);
+        ASSERT_EQ(std::memcmp(enc1.data(), enc2.data(), m1), 0);
+    }
+    EXPECT_EQ(cache.coverCacheFillsForTest(), 3u) << "one build per writer version, not per record";
+    // A writer field the layout lacks is Pending, a type mismatch is Malformed; neither is cached.
+    rune::codec::DescriptorBuilder small("inst", 1);
+    small.add("lease_version", P::Int64).add("lease_ttl_ms", P::UInt64).add("lease_holder", P::UInt64).add("lease_remaining_ms", P::UInt64)
+        .add("id", P::UInt64, 1, true);
+    const rune::codec::Descriptor smallEv = small.build();
+    const rune::view::RowLayout smallLayout = leaseIndexRowLayout(smallEv);
+    LeaseCoverCache c2;
+    rune::view::PrepareStatus st{};
+    EXPECT_EQ(leaseSlotMapFor(c2, 3, 9, smallLayout, smallEv, rune::codec::materializeAsOf(ev, 3), &st), nullptr);
+    EXPECT_EQ(st, rune::view::PrepareStatus::Pending);
+    EXPECT_EQ(c2.coverCacheFillsForTest(), 0u);
 }
 
 // ═══ encodeLeaseValue: the exact inverse of projectLeaseRow (lease topics Task 5b) ═══
@@ -1051,4 +1159,35 @@ TEST(LeaseEncodeRoundTripRegression, EncodeRoundTripRegression) {
             EXPECT_EQ(encodeLeaseValue(row.data(), layout, ev, w, v, value.data(), m - 1), 0u);
         }
     }
+}
+
+// A null Enum slot (a column the row never had) is re-encoded as the field's first whitelisted value, not zero: zero may not be in
+// this version's whitelist and the stored revoke must pass the Validator.  Every other null stays zeros.
+TEST(LeaseEncodeRoundTripRegression, NullEnumEncodesFirstWhitelistedValueRegression) {
+    rune::codec::DescriptorBuilder b("inst", 2);
+    b.add("lease_version", P::Int64).add("lease_ttl_ms", P::UInt64).add("lease_holder", P::UInt64).add("lease_remaining_ms", P::UInt64)
+        .add("id", P::UInt64, 1, /*isKey=*/true)
+        .add("kind", P::Enum, 2, false, {3, 7})
+        .add("flags", P::UInt16, 2);
+    const rune::codec::Descriptor ev = b.build();
+    const rune::view::RowLayout layout = leaseIndexRowLayout(ev);
+    const rune::codec::Descriptor w = rune::codec::materializeAsOf(ev, 2);
+    std::vector<uint8_t> row(layout.rowLen, 0), value(4096);
+    for (uint16_t s = 0; s < layout.slotType.size(); ++s) rune::view::clearNull(row.data(), layout, s);
+    rune::view::setNull(row.data(), layout, 5);   // kind
+    rune::view::setNull(row.data(), layout, 6);   // flags
+    const std::size_t m = encodeLeaseValue(row.data(), layout, ev, w, 2, value.data(), value.size());
+    ASSERT_EQ(m, 4u + w.blockLength);
+    const auto& kind = *std::find_if(w.fields.begin(), w.fields.end(), [](const auto& f) { return f.name == "kind"; });
+    const auto& flags = *std::find_if(w.fields.begin(), w.fields.end(), [](const auto& f) { return f.name == "flags"; });
+    EXPECT_EQ(value[4 + kind.offset], 3) << "the first whitelisted value";
+    EXPECT_EQ(value[4 + flags.offset], 0) << "any other null is zeros";
+    const rune::codec::ValResult ok = rune::codec::Validator(w).validate({value.data(), m});
+    EXPECT_TRUE(ok.ok) << (ok.reason != nullptr ? ok.reason : "");
+    // a non-null Enum is copied as it is
+    rune::view::clearNull(row.data(), layout, 5);
+    const uint32_t seven = 7;
+    std::memcpy(row.data() + layout.slotOffset[5], &seven, 4);
+    ASSERT_EQ(encodeLeaseValue(row.data(), layout, ev, w, 2, value.data(), value.size()), m);
+    EXPECT_EQ(value[4 + kind.offset], 7);
 }

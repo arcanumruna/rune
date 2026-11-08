@@ -127,6 +127,15 @@ public:
     // consumers that track rows by id (the lease wheels).
     bool ridOf(const ViewKey& key, uint32_t& rid) const noexcept;
 
+    // One probe instead of get() + ridOf(): the row of `key` and its row id (rid untouched when absent -> nullptr).
+    const uint8_t* find(const ViewKey& key, uint32_t& rid) const noexcept;
+    // put() that also reports the row id (one probe instead of put() + ridOf()).
+    uint8_t* put(const ViewKey& key, uint32_t& rid);
+    // The row at a live row id (from find / put): no probe.  Writing through it does NOT mark the row dirty (the owner of a
+    // table whose dirty set is discarded, the lease index, uses it for in-place updates).
+    uint8_t* rowOf(uint32_t rid) noexcept { return rowAddr(rid); }
+    const uint8_t* rowOf(uint32_t rid) const noexcept { return rowAddr(rid); }
+
     // The auxiliary area of row `rid` (ViewTableKeys::auxBytesPerRow bytes, zero-filled when its chunk was allocated; a row id
     // reused after erase() keeps its old bytes, the owner resets them).  Stable address (chunked).  Requires auxBytesPerRow > 0.
     uint8_t* aux(uint32_t rid) noexcept {
@@ -372,7 +381,7 @@ private:
     Probe probeOf(uint64_t narrowKey) const noexcept { return {narrowKey, hashOfWord(narrowKey), nullptr}; }
     Probe probeOf(const ViewKey& key) const noexcept;
 
-    uint8_t*       putImpl(const Probe& p);
+    uint8_t*       putImpl(const Probe& p, uint32_t* ridOut = nullptr);
     const uint8_t* getImpl(const Probe& p) const noexcept;
     bool           eraseImpl(const Probe& p) noexcept;
 

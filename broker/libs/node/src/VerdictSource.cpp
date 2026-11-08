@@ -338,7 +338,7 @@ rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::S
         const LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth, &i.leaseCover};
         const bool refused = r.writer == nullptr && state_ != nullptr && state_->spec != nullptr && r.value.size() >= 4 &&
                              state_->spec->versionRefused(detail::le16(r.value.data() + 2));   // a refused version is a definite answer
-        return prepareLeaseIndex(f, r, m.prospect, refused);
+        return prepareLeaseIndex(f, r, m.prospect, refused, state_ != nullptr && state_->spec != nullptr ? leaseInstallSeqOf(*state_->spec, r.value) : 0u);
     }
     if (i.agg) {
         rune::view::AggregateFold f{i.plan, i.layout, i.agg->layout, i.vdc, i.table, i.agg->contributors, i.agg->groups, i.agg->blocksOrNull()};
@@ -391,10 +391,18 @@ Verdict VerdictSource::verdictOf_(const Member& m, const rune::view::SourceRecor
         // A malformed lease record (a wrong key width, a value shorter than the system columns, a projection that does not fit)
         // is refused, never accepted without an apply: an accepted record the index never saw would let a second grant through.
         // The replay skips rejected offsets, so the log stays deterministic.
-        if (m.prospect.op == rune::view::ProspectOp::None) return {static_cast<uint16_t>(ErrorCode::InvalidRequest), 0};
+        if (m.prospect.op == rune::view::ProspectOp::None) {
+            // A broker Expire / Checkpoint whose key has no row is a stale broker record, even when its projection is malformed:
+            // it has no producer to retry, so it takes the reserved stale-broker slot like any other (judge()).
+            namespace lr = rune::protocol::record;
+            const lr::LeaseOp op = lr::leaseOpOf(rec.attributes);
+            if ((op == lr::LeaseOp::Expire || op == lr::LeaseOp::Checkpoint) && lr::intentOf(rec.attributes) == 0 && !m.prospect.rows[0].existed)
+                return {rune::view::kVerdictStaleBroker, 0};
+            return {static_cast<uint16_t>(ErrorCode::InvalidRequest), 0};
+        }
         if (rec.value.empty()) return {static_cast<uint16_t>(ErrorCode::InvalidRequest), 0};   // a lease record carries its full row
         const ViewInstance& i = *m.inst;
-        const uint8_t* row = i.table.get(m.prospect.rows[0].key);
+        const uint8_t* row = m.prospect.rows[0].existed ? i.table.rowOf(m.prospect.rows[0].rid) : nullptr;   // found once, by prepare_
         const LeaseRowState st{row != nullptr, row != nullptr ? leaseRowVersion(row, i.layout) : 0, row != nullptr ? leaseRowTtl(row, i.layout) : 0};
         const uint32_t maxKeys = state_ != nullptr && state_->spec != nullptr && state_->spec->lease ? state_->spec->lease->maxKeys : UINT32_MAX;
         return {judgeLease(st, rec.attributes, leaseRecordVersion(rec.value), leaseRecordRemaining(rec.value), i.table.size(), maxKeys), 0};
@@ -436,6 +444,7 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
         // reserved slot, so a broker record never stalls the judge.  Everything else stalls on a full index, as before.
         const bool stale = v.code == rune::view::kVerdictStaleBroker;
         const uint64_t outOfOrder = stale ? state_->rejected.outOfOrder() : 0;
+        assert(!v.isHeld() && "a held verdict is never recorded");
         bool added = state_->rejected.add(rec.offset, v.code, v.constraintId);
         if (!added && stale && state_->rejected.outOfOrder() == outOfOrder) added = state_->rejected.add(rec.offset, v.code, v.constraintId, /*reserved=*/true);
         if (!added) {
@@ -575,7 +584,6 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
                 noteLayoutWait_(span.offset, writerVersionOf(span.value, 0));
                 return;
             }
-            assert(v.code != rune::view::kVerdictHeld && "a held verdict is never recorded");
             layoutWaitVersion_ = -1;
             if (stalled_) return;
             if (keyZero && !v.accepted()) [[unlikely]] noteKeyZeroRejection_(v, rec);
