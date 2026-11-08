@@ -59,10 +59,11 @@ public:
     bool sendFetchResponse(rep::NodeId, const rep::FetchResponseMsg&) override { return true; }
 };
 
-rune::node::TopicSpec topicSpec(std::string name, int32_t partitions) {
+rune::node::TopicSpec topicSpec(std::string name, int32_t partitions, uint32_t nsId = 0) {
     rune::node::TopicSpec ts;
     ts.name           = std::move(name);
     ts.partitionCount = partitions;
+    ts.nsId           = nsId;
     return ts;
 }
 
@@ -85,7 +86,8 @@ struct SentVote {
     int16_t     producerEpoch;
 };
 
-constexpr int32_t kCw = 0, kPlain = 1;   // topic ids: the registry numbers topics in order
+constexpr int32_t kCw = 0, kPlain = 1, kCwNs = 2, kPlainNs = 3;   // topic ids: the registry numbers topics in order
+constexpr uint32_t kNs = 7;   // the namespace of the last two topics
 
 }  // namespace
 
@@ -93,7 +95,7 @@ class CheckedWritesTxnCoordinatorTest : public ::testing::Test {
 protected:
     CheckedWritesTxnCoordinatorTest()
         : topicDir_(), logDir_(), log_(logDir_.path),
-          topics_({topicSpec("cw", 2), topicSpec("plain", 2)}, topicDir_.path) {}
+          topics_({topicSpec("cw", 2), topicSpec("plain", 2), topicSpec("cwn", 2, kNs), topicSpec("plainn", 2, kNs)}, topicDir_.path) {}
 
     void SetUp() override {
         rep::PartitionConfig cfg;
@@ -108,14 +110,14 @@ protected:
             store_.get(), &topics_, [this] { return isLeader_; }, [] { return rune::node::NodeId{1}; });
         svc_->setTxnOffsetSink(&appliedSink, nullptr);
         svc_->setAnswerSinkForTest(&Answers::sink, &answers_);
-        svc_->setVoteCandidateFn([this](int32_t topicId) { return topicId == kCw && cwIsCandidate_; });
+        svc_->setVoteCandidateFn([this](int32_t topicId) { return (topicId == kCw || topicId == kCwNs) && cwIsCandidate_; });
         svc_->setVoteFnOverride([this](std::string_view topic, int32_t partition, int64_t pid, int16_t epoch) {
             votes_.push_back({std::string(topic), partition, pid, epoch});
             return voteAccepted_;
         });
         svc_->setAppendFnOverride([this](std::string_view, int32_t, std::span<const uint8_t>) -> int64_t {
             ++markerAppends_;
-            return 0;
+            return appendResult_;
         });
         svc_->setSessionVersionFn(&versionOf, this);
         (void)svc_->doWork(now_);   // loads; requests the first pid block ceiling
@@ -140,7 +142,7 @@ protected:
         m.sessionId = 1; m.correlationId = ++corr_; m.transactionTimeoutMs = 30'000;
         m.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
         const std::size_t n = m.encode(reqBuf_.data());
-        EXPECT_EQ(svc_->handleInitProducerId(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size()), 0u);
+        EXPECT_EQ(svc_->handleInitProducerId(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size(), ctx_), 0u);
         followerFetches();
         (void)svc_->doWork(now_);
         EXPECT_EQ(answers_.frames.size(), 1u);
@@ -157,7 +159,7 @@ protected:
         m.sessionId = 1; m.correlationId = ++corr_; m.producerId = pid; m.producerEpoch = epoch;
         m.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
         const std::size_t n = m.encode(reqBuf_.data(), parts);
-        const std::size_t sync = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size());
+        const std::size_t sync = svc_->handleAddPartitions(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size(), ctx_);
         if (sync != 0) {   // refused at once (nothing persisted)
             const auto r = pc::AddPartitionsToTxnResponse::decode(outBuf_.data(), sync);
             return r && r->results.size() > 0 ? r->results[0].errorCode : int16_t{-1};
@@ -175,7 +177,7 @@ protected:
         m.sessionId = 1; m.correlationId = ++corr_; m.producerId = pid; m.producerEpoch = epoch; m.commit = commit ? 1u : 0u;
         m.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
         const std::size_t n = m.encode(reqBuf_.data());
-        return svc_->handleEndTxn(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size());
+        return svc_->handleEndTxn(reqBuf_.data(), n, now_, outBuf_.data(), outBuf_.size(), ctx_);
     }
 
     /// The EndTxn answer sent synchronously (outBuf_) or deferred (the last answer frame).
@@ -204,9 +206,9 @@ protected:
     }
 
     /// A transaction on `parts` (txn id "tx"), ready for EndTxn.
-    int64_t beginTxn(const std::vector<pc::TxnTopicPartition>& parts, int16_t& epoch) {
-        const int64_t pid = initPid("tx", epoch);
-        EXPECT_EQ(addPartitions("tx", pid, epoch, parts), 0);
+    int64_t beginTxn(const std::vector<pc::TxnTopicPartition>& parts, int16_t& epoch, const std::string& txn = "tx") {
+        const int64_t pid = initPid(txn, epoch);
+        EXPECT_EQ(addPartitions(txn, pid, epoch, parts), 0);
         votes_.clear();
         return pid;
     }
@@ -221,6 +223,8 @@ protected:
     Answers answers_;
     std::vector<SentVote> votes_;
     int markerAppends_ = 0;
+    int64_t appendResult_ = 0;   // negative: the partition takes no marker
+    rune::coordination::NsRequestContext ctx_{};
     bool    voteAccepted_  = true;
     bool    cwIsCandidate_ = true;
     bool    isLeader_      = true;
@@ -458,4 +462,135 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, UnloadAnswersAVoteGateAndACommitWa
     EXPECT_EQ(svc_->awaitingMarkerTxnsForTest(), 0u);
     ASSERT_EQ(answers_.frames.size(), 1u) << "never a hang: the client re-discovers the coordinator";
     EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, NoAfterTimeoutAbortCompletedIsNeverCommitOkRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    const auto asked = votes_;
+    now_ += 31'000'000'000;   // past the 30 s transaction timeout: the sweep aborts it with the votes still out
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::PrepareAbort);
+    EXPECT_EQ(svc_->voteGatesForTest(), 0u);
+    ASSERT_EQ(answers_.frames.size(), 1u) << "the gate is stale: answered at once, not at the votes";
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState));
+    followerFetches();
+    (void)svc_->doWork(now_);
+    landMarkers(pid, {{kCw, 0}});
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    vote(asked[0], static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation), 0x70000, 5);   // the late no
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(answers_.frames.size(), 1u) << "the late no answers nothing (and never a commit OK)";
+    EXPECT_EQ(lastAnswer().errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState));
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, OldSessionConcurrentIsNotLeaderRegression) {
+    clientVersion_ = pc::kClientVersionTxnVerify - 1;   // does not know ConcurrentTransactions (27)
+    int16_t ep = 0;
+    int64_t pid = beginTxn({{kPlain, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);   // plain path, parked until PrepareCommit commits
+    std::size_t n = endTxn("tx", pid, ep, true);   // the markers are not out: 27 for this retry
+    ASSERT_GT(n, 0u);
+    EXPECT_EQ(syncAnswer(n).errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "the retriable code it knows";
+
+    followerFetches();   // the plain commit's parked answer
+    (void)svc_->doWork(now_);
+    answers_.frames.clear();
+    int16_t ep2 = 0;
+    const int64_t pid2 = beginTxn({{kCw, 0}}, ep2, "tx2");
+    ASSERT_EQ(endTxn("tx2", pid2, ep2, true), 0u);
+    n = endTxn("tx2", pid2, ep2, true);   // a gated commit: 27 as well
+    ASSERT_GT(n, 0u);
+    EXPECT_EQ(syncAnswer(n).errorCode, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, CommitWithNoMarkerPartitionsIsAnsweredWhenTheVotesAreInRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    appendResult_ = -1;   // every partition is gone: nothing in flight, the transaction completes at dispatch
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    vote(votes_[0]);
+    (void)svc_->doWork(now_);
+    followerFetches();
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteCommit);
+    ASSERT_EQ(answers_.frames.size(), 1u) << "the responder is stored before the dispatch completes the transaction";
+    EXPECT_EQ(lastAnswer().errorCode, 0);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, TxnOffsetCommitDuringTheVoteIsConcurrentRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    const std::string txn = "tx", group = "g";
+    pc::TxnOffsetCommit m;
+    m.sessionId = 1; m.correlationId = ++corr_; m.producerId = pid; m.producerEpoch = ep;
+    m.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
+    m.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    const std::vector<pc::TxnOffsetCommitEntry> entries = {{kPlain, 0, 5, {}}};
+    const std::size_t len = m.encode(reqBuf_.data(), entries);
+    const std::size_t n = svc_->handleTxnOffsetCommit(reqBuf_.data(), len, now_, outBuf_.data(), outBuf_.size(), ctx_);
+    ASSERT_GT(n, 0u);
+    const auto r = pc::TxnOffsetCommitResponse::decode(outBuf_.data(), n);
+    ASSERT_TRUE(r);
+    ASSERT_EQ(r->results.size(), 1u);
+    EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, AResultForAVoteNeverSentIsNotCountedRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    voteAccepted_ = false;   // the vote could not be sent: no answer is awaited
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    ASSERT_EQ(votes_.size(), 1u);
+    vote(votes_[0]);   // a stray yes
+    (void)svc_->doWork(now_);
+    EXPECT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing);
+    EXPECT_EQ(svc_->voteGatesForTest(), 1u);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, CandidatesAreForgottenWhenTheTransactionCompletesRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    EXPECT_EQ(svc_->voteCandidateTxnsForTest(), 1u);
+    now_ += 31'000'000'000;   // the sweep aborts it (no commit was asked)
+    (void)svc_->doWork(now_);
+    followerFetches();
+    (void)svc_->doWork(now_);
+    landMarkers(pid, {{kCw, 0}});
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    EXPECT_EQ(svc_->voteCandidateTxnsForTest(), 0u);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, AProducerThatIsNotTheGatedOneIsAnsweredByTheCoordinatorRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    const int16_t zombie = addPartitions("tx", pid + 1000, ep, {{kCw, 1}});
+    EXPECT_NE(zombie, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions)) << "fenced, not retriable";
+    EXPECT_NE(zombie, 0);
+    const std::size_t n = endTxn("tx", pid, static_cast<int16_t>(ep + 1), true);
+    ASSERT_GT(n, 0u);
+    const auto a = syncAnswer(n);
+    EXPECT_NE(a.errorCode, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
+    EXPECT_NE(a.errorCode, 0);
+    EXPECT_EQ(svc_->voteGatesForTest(), 1u) << "the gate is untouched";
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, VoteCandidatesAndGatesOfANamespaceAreCountedInMemoryRegression) {
+    ctx_.sessionNsId = kNs;
+    int16_t ep = 0;
+    (void)beginTxn({{kPlainNs, 0}}, ep, "a");
+    const std::size_t n1 = svc_->inMemoryEntriesOfNamespaceForTest(kNs);
+    int16_t epB = 0;
+    const int64_t pidB = beginTxn({{kCwNs, 0}}, epB, "b");
+    const std::size_t n2 = svc_->inMemoryEntriesOfNamespaceForTest(kNs);
+    int16_t epC = 0;
+    (void)beginTxn({{kPlainNs, 1}}, epC, "c");
+    const std::size_t n3 = svc_->inMemoryEntriesOfNamespaceForTest(kNs);
+    EXPECT_EQ(n2 - n1, n3 - n2 + 1) << "the candidate of b is an entry of the namespace";
+    ASSERT_EQ(endTxn("b", pidB, epB, true), 0u);
+    ASSERT_EQ(svc_->voteGatesForTest(), 1u);
+    EXPECT_EQ(svc_->inMemoryEntriesOfNamespaceForTest(kNs), n3) << "the candidate became a gate: still one entry";
 }

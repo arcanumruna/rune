@@ -59,7 +59,6 @@
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/protocol/client/TxnMessages.h>
 #include <rune/coordination/TxnOffsetApply.h>
-#include <rune/node/WriteState.h>
 
 #include <cstddef>
 #include <deque>
@@ -135,7 +134,8 @@ public:
     // -----------------------------------------------------------------------
     // setAppendFnOverride — TEST SEAM ONLY.
     // When gateway_ is null, doWork uses this function to resolve pending
-    // markers.  The fn maps (TopicPartition, markerBytes) to a log append.
+    // markers.  The fn maps (TopicPartition, markerBytes) to a log append; a negative
+    // result is a partition that takes no marker (gone, like an unknown topic).
     // Allows testing the doWork→resolvePendingMarkers path without Aeron.
     // Set to nullptr to clear (production: never call this).
     // Single-writer: call only on the duty-cycle thread.
@@ -269,6 +269,7 @@ public:
     void onTxnVoteResult(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
                          int32_t coordinatorEpoch, const rune::gateway::TxnVoteResult& r) noexcept;
     [[nodiscard]] std::size_t voteGatesForTest() const noexcept { return voteGates_.size(); }
+    [[nodiscard]] std::size_t voteCandidateTxnsForTest() const noexcept { return voteCandidatesAtAdd_.size(); }
     /// Task 10 round 5: an asynchronously appended marker landed.
     void onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,
                                int32_t coordinatorEpoch) override;
@@ -402,6 +403,11 @@ private:
     /// take it for the current state's: a gate appends again (kNeedsPut), a registration is not committed, a hold
     /// floor / stand-in is never this value.  Cleared by the next successful put of the id (or a load).
     static constexpr int64_t kUnpersisted = -4;
+    struct VoteNo {   ///< the partition leader's no: the answer's code, constraint id and failing offset
+        uint16_t code          = 0;
+        uint32_t constraintId  = 0;
+        int64_t  failingOffset = -1;
+    };
     struct PrepareGate {
         rune::transaction::TransactionalId          txnId;
         int64_t                                     producerId       = -1;
@@ -415,7 +421,7 @@ private:
         int64_t                                     recordOffset     = kNeedsPut;
         bool                                        answerAtMarkers  = false;   ///< a voted EndTxn: answered when its markers landed, not here
         bool                                        hasVote          = false;
-        TxnVoteAnswer                               vote{};                     ///< the no the answer carries
+        VoteNo                                      vote{};                     ///< the no the answer carries
     };
     std::vector<PrepareGate> prepareGates_;
 
@@ -443,11 +449,12 @@ private:
         rune::transaction::TransactionalId txnId;
         int64_t                 producerId       = -1;
         int16_t                 producerEpoch    = 0;
+        int64_t                 txnStartNs       = 0;   ///< the transaction the votes were asked for (L5 staleness)
         int32_t                 coordinatorEpoch = -1;
         int64_t                 sessionId = 0, correlationId = 0;
         std::vector<VoteTarget> targets;
         bool                    hasNo = false;
-        TxnVoteAnswer           no{};
+        VoteNo                  no{};
     };
     std::vector<VoteGate> voteGates_;
     std::map<rune::transaction::TransactionalId, VoteCandidates, std::less<>> voteCandidatesAtAdd_;
@@ -456,7 +463,12 @@ private:
     SessionVersionFn sessionVersionFn_  = nullptr;
     void*            sessionVersionCtx_ = nullptr;
     [[nodiscard]] bool votesEnabled_() const;
-    [[nodiscard]] bool voteGated_(const rune::transaction::TransactionalId& txnId) const;
+    /// True while a vote gate holds `txnId` for this producer id and epoch (another producer's request is answered
+    /// by the coordinator: fenced, wrong id).
+    [[nodiscard]] bool voteGated_(const rune::transaction::TransactionalId& txnId, int64_t producerId,
+                                  int16_t producerEpoch) const;
+    /// 0 while the gate's transaction is still the Ongoing one the votes were asked for, else the EndTxn(commit) answer.
+    [[nodiscard]] int16_t staleVoteCode_(const VoteGate& g);
     void noteVoteCandidates_(const rune::protocol::client::TxnTopicPartitionView& parts);
     /// True when EndTxn(commit) of txnIdScratch_ opened a vote gate (the answer is deferred).
     bool startVoteGate_(const rune::protocol::client::EndTxn& msg, int64_t nowNs);
@@ -517,7 +529,7 @@ private:
     /// The handler's answer `n`, sent now when every record it depends on is committed, else parked (returns 0).
     size_t finishRequest_(const uint8_t* buf, size_t len, uint8_t* out, size_t outCap, size_t n);
     void sendDeferred_(int64_t sessionId, const uint8_t* frame, std::size_t n);
-    void sendEndTxnAnswer_(int64_t sessionId, int64_t correlationId, int16_t errorCode, const TxnVoteAnswer* vote = nullptr);
+    void sendEndTxnAnswer_(int64_t sessionId, int64_t correlationId, int16_t errorCode, const VoteNo* vote = nullptr);
     int  releaseParked_();
     /// The gate for `meta`'s markers (respond: the EndTxn is answered OK once it opens).
     [[nodiscard]] PrepareGate makeGate_(const rune::transaction::TransactionMetadata& meta, bool commit,
@@ -659,7 +671,7 @@ private:
         bool    respond = false;            // a voted EndTxn waits for these markers
         int64_t sessionId = 0, correlationId = 0;
         bool    hasVote = false;
-        TxnVoteAnswer vote{};
+        VoteNo  vote{};
     };
     static constexpr int64_t kMarkerRetryMinNs = 10'000'000;      // 10 ms
     static constexpr int64_t kMarkerRetryMaxNs = 1'000'000'000;   // 1 s
