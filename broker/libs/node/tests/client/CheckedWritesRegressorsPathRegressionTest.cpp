@@ -52,7 +52,7 @@ constexpr uint16_t kKeyNotFound         = static_cast<uint16_t>(rune::protocol::
 constexpr rc::Acks kAllView             = rc::Acks::All | rc::Acks::View;
 
 template <class Pred>
-bool waitFor(Pred&& pred, std::chrono::seconds within) {
+bool waitFor(Pred&& pred, std::chrono::milliseconds within) {
     for (const auto deadline = std::chrono::steady_clock::now() + within; std::chrono::steady_clock::now() < deadline; std::this_thread::sleep_for(20ms))
         if (pred()) return true;
     return pred();
@@ -84,6 +84,20 @@ struct TmpDir {
 fs::path tmpDir() {
     static const TmpDir d;
     return d.path;
+}
+
+/// `st` as a statement of a script.
+std::string stmt(std::string st) {
+    if (st.empty() || st.back() != ';') st += ';';
+    return st + "\n";
+}
+
+/// A script through one `rune ql -f` (one client and driver for all its statements); its output is every statement's.
+int qlScript(const std::string& endpoint, const std::string& text, std::string* out, std::string* err) {
+    static int seq = 0;
+    const fs::path path = tmpDir() / ("cut" + std::to_string(seq++) + ".rql");
+    std::ofstream(path, std::ios::binary) << text;
+    return runCli({"ql", "-f", path.string(), "--broker", endpoint}, out, err);
 }
 
 void awaitLevel(BrokerNode& n) {
@@ -123,12 +137,14 @@ std::string goldenTopic(const std::string& name) {
     return {};
 }
 
-void fastWarmup(NodeConfig& cfg) { cfg.unservableWarmupMs = 50; }
+void fastWarmup(NodeConfig& cfg) { cfg.unservableWarmupMs = 50; cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused; }
 
 catalog_cluster::ThreeNodes startCluster(const std::string& tag) {
     return catalog_cluster::ThreeNodes::startWith(tag, [](NodeConfig& cfg) {
         cfg.verdictIntervalMs      = 20;
         cfg.unservableWarmupMs     = 50;
+        cfg.runtimePlacement       = NodeConfig::RuntimePlacement::Fused;
+        cfg.electionTimeoutMs      = 100;   // a crashed node's partitions fail over after 3 x this
         cfg.producerIdExpirationMs = 2'000;   // a stopped writer's last batches leave the cleaner something to compact
     });
 }
@@ -701,8 +717,8 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(ql(b.endpoint(), "topic pc { id uint64, userId uint64, name string(16) } key id with (cleanup.policy = compact);", &out, &err), 0) << err;
-    ASSERT_EQ(ql(b.endpoint(), "create unique view pc_name key lower(name) as nameKey as select id from pc;", &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(b.endpoint(), stmt("topic pc { id uint64, userId uint64, name string(16) } key id with (cleanup.policy = compact)") +
+                       stmt("create unique view pc_name key lower(name) as nameKey as select id from pc"), &out, &err), 0) << err;
     ViewHandle view(b.node(), "pc_name");
 
     // The client has no idempotence switch: an acks=none batch is its non-idempotent wire path (producer id -1) and gets no completion, so
@@ -856,12 +872,6 @@ TEST(CheckedWritesRegressorsPathRegression, ReplaceWhileWritingShardRegression) 
 // ============================================================================
 namespace {
 
-/// `st` as a statement of a script.
-std::string stmt(std::string st) {
-    if (st.empty() || st.back() != ';') st += ';';
-    return st + "\n";
-}
-
 const std::string kUserIdentity   = "create unique view user_identity key (provider, subject) as select userId from user;\n";
 const std::string kCharacterName  = "create unique view character_name key lower(name) as nameKey as select characterId from character;\n";
 const std::string kCharacterById  = "create view character_by_id key characterId as select userId, name from character;\n";
@@ -883,14 +893,6 @@ std::string topicDdl(const std::string& name, bool eager = false) {
     return stmt(st);
 }
 
-/// A script through one `rune ql -f` (one client and driver for all its statements); its output is every statement's.
-int qlScript(const std::string& endpoint, const std::string& text, std::string* out, std::string* err) {
-    static int seq = 0;
-    const fs::path path = tmpDir() / ("cut" + std::to_string(seq++) + ".rql");
-    std::ofstream(path, std::ios::binary) << text;
-    return runCli({"ql", "-f", path.string(), "--broker", endpoint}, out, err);
-}
-
 /// The newest records of topic `topicId` on the single broker, read below the high watermark on the replica's thread.
 LeaderLog readOwner(BrokerNode& n, int32_t topicId) {
     LeaderLog out;
@@ -903,10 +905,11 @@ LeaderLog readOwner(BrokerNode& n, int32_t topicId) {
     return out;
 }
 
-/// The topic's accepted updates until its cleaner has passed `through` (32 records per chunk).
+/// 256 accepted updates of the topic, enough to roll its 4 KiB segments past the one that holds the rejected records.  The cleaner makes no
+/// headway while the log is being written, so the writes stop before the wait for it.
 template <class Rec, class Send>
 void compactOwner(BrokerNode& n, Writer& w, int32_t topicId, int64_t through, Ledger& ledger, uint64_t id, const Rec& rec, Send&& send) {
-    for (int chunk = 0; chunk < 4; ++chunk) {
+    for (int chunk = 0; chunk < 8; ++chunk) {
         std::vector<rc::Token> tokens;
         for (int i = 0; i < 32; ++i) tokens.push_back(send(w, rec));
         for (const rc::Token t : tokens) ledger.note(id, w.await(t));
