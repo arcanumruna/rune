@@ -401,6 +401,29 @@ TEST(TransientDataPathRegression, RcRingRebuildPinsAnOpenTxnWhoseFirstBatchWasEv
     EXPECT_EQ(rc.lso(INT64_MAX), INT64_MAX) << "nothing open";
 }
 
+// #953: the RC build feeds the producer state from a scan; an entry it rebuilds may carry a stale lastSequence (the
+// newer batches were compacted away), so a forward gap on it answers UnknownProducerId, never OutOfOrderSequence.
+TEST(UnknownProducerIdRegression, RcBuildProducerStateRebuildUnvouchedRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);
+    constexpr int64_t kP = 13;
+    ringPut(mem, batchOf(1, 50, kP, 0, 0));   // seq 0 survives; seq 2..5 are "compacted away"
+    ringPut(mem, batchOf(1, 50, kP, 0, 1));
+    rune::storage::ProducerStateManager psm;
+    rune::node::RcState rc;
+    rc.reserve(64);
+    rc.reserveRingRebuild();
+    rc.bindProducerState(&psm, 7, 0);
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1;
+    (void)rc.advance(f, nullptr, rune::node::RcState::kDefaultScanBytesPerPass, &mem);
+    ASSERT_TRUE(rc.ready());
+    ASSERT_NE(psm.entry(7, kP, 0), nullptr);
+    EXPECT_EQ(psm.entry(7, kP, 0)->lastSequence, 1);
+    EXPECT_TRUE(psm.entry(7, kP, 0)->unvouched);
+    EXPECT_TRUE(psm.validate(7, kP, 0, 0, 6, 6).isUnknownProducerId()) << "a forward gap on a rebuilt entry";
+    EXPECT_TRUE(psm.validate(7, kP, 0, 0, 2, 2).isAccept()) << "the next in order";
+}
+
 // ---------------------------------------------------------------------------
 // E2 final fix wave (final review I3): the memory-backed read_committed (and
 // producer-state) rebuild walked the WHOLE ring in one worker pass — up to
@@ -504,6 +527,7 @@ TEST(TransientDataPathRegression, RcRingRebuildIsBudgetedPerStepAndEqualsTheOneS
         EXPECT_EQ(x->producerEpoch, y->producerEpoch) << "producer " << pid;
         EXPECT_EQ(x->lastSequence, y->lastSequence) << "producer " << pid;
         EXPECT_EQ(x->markerOnly, y->markerOnly) << "producer " << pid;
+        EXPECT_EQ(x->unvouched, y->unvouched) << "producer " << pid;
         EXPECT_EQ(x->coordinatorEpoch, y->coordinatorEpoch) << "producer " << pid;
     }
 }

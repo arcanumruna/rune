@@ -116,6 +116,11 @@ struct ProducerStateEntry {
     // sequence is known in this epoch, so a first batch at seq != 0 is an UNKNOWN producer, not a gap.
     // Cleared by the first data update().
     bool    markerOnly{false};
+    // #953: the entry was made or advanced by a REBUILD scan.  Compaction can drop a producer's newest batches
+    // (and the cleaner its ProducerTails) while an older batch survives, so the rebuilt lastSequence may be stale:
+    // the broker cannot vouch that a forward gap is real.  A forward gap on it answers UnknownProducerId (the client
+    // re-sequences), never OutOfOrderSequence.  Cleared by the next live update().
+    bool    unvouched{false};
     /// D9 review MAJOR-2 (Kafka ProducerStateEntry.coordinatorEpoch): the
     /// coordinator epoch of the last COMMIT/ABORT marker applied for this
     /// producer on this partition (-1 = none).  Raise-only; rebuilt from the
@@ -274,7 +279,8 @@ public:
                 int16_t producerEpoch,
                 int32_t baseSequence,
                 int32_t lastSequence,
-                int64_t baseOffset);
+                int64_t baseOffset,
+                bool fromRebuild = false);
 
     // -----------------------------------------------------------------------
     // fenceEpoch — F15 S5 (C1+, I3): a COMMIT/ABORT control batch of `producerId`

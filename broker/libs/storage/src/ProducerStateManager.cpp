@@ -182,7 +182,7 @@ ProducerStateManager::validate(int32_t topicId,
         // lastSequence == -1 means no batch appended yet in this epoch → expect 0.
         if (baseSequence == e.lastSequence + 1) return ValidationResult::accept();
         // D6 L1: a rebuilt marker-only entry knows the epoch, not the producer's sequence.
-        if (e.markerOnly) return ValidationResult::unknownProducer();
+        if (e.markerOnly || e.unvouched) return ValidationResult::unknownProducer();
         return ValidationResult::oos();   // forward gap
     }
 
@@ -229,7 +229,8 @@ void ProducerStateManager::update(int32_t topicId,
                                   int16_t producerEpoch,
                                   int32_t baseSequence,
                                   int32_t lastSequence,
-                                  int64_t baseOffset)
+                                  int64_t baseOffset,
+                                  bool fromRebuild)
 {
     ProducerStateEntry& e = getOrCreate(topicId, producerId, partition);
 
@@ -249,6 +250,7 @@ void ProducerStateManager::update(int32_t topicId,
     e.push(baseSequence, lastSequence, baseOffset);
     e.lastSequence = lastSequence;
     e.markerOnly   = false;   // D6 L1: a sequence of this epoch is known now
+    e.unvouched    = fromRebuild;   // #953: a rebuilt lastSequence may be stale; a live append vouches again
 }
 
 // ---------------------------------------------------------------------------
@@ -625,7 +627,7 @@ ProducerStateManager::rebuildStep(Rebuild& r, LogT& log, std::size_t budgetBytes
                 } else if (!isControl && pid >= 0 && reader.baseSequence() >= 0) {
                     const int32_t baseSeq = reader.baseSequence();
                     update(r.topicId, pid, r.partition, reader.producerEpoch(), baseSeq, baseSeq + lastDelta,
-                           batchBase);
+                           batchBase, /*fromRebuild=*/true);
                 }
                 r.next = batchLast + 1;
             }

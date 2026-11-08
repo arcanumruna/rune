@@ -906,7 +906,7 @@ private:
         const int32_t baseSeq = r.baseSequence();
         if (baseSeq < 0) return;
         psm_->update(psmTopic_, pid, psmPartition_, r.producerEpoch(), baseSeq, baseSeq + r.lastOffsetDelta(),
-                     r.baseOffset());
+                     r.baseOffset(), /*fromRebuild=*/true);   // #953: both callers are build scans
     }
     // E2 Task 11 fix round 1: the memory-backed build — every batch of the ring
     // [ringStart, LEO) through the same RcBuilder the disk scan uses (tracker +

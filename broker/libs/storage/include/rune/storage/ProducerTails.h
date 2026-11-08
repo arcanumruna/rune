@@ -20,8 +20,9 @@
 //
 // Expiry (I1, Kafka producer.id.expiration.ms): a producer whose last batch's
 // broker append time (its segment file's last write - never the client's
-// maxTimestamp) is older than nowMs - expirationMs is no longer retained (the
-// rebuild then forgets it — see the UNKNOWN_PRODUCER_ID ticket).  nowMs < 0
+// maxTimestamp) is older than nowMs - expirationMs is no longer retained (a
+// producer-state rebuild may resurrect it from an older batch that survived compaction; such an entry is
+// unvouched and a forward gap on it answers UnknownProducerId, the client re-sequences - #953).  nowMs < 0
 // (legacy passes without a wall clock) never expires.
 //
 // Bounded (I1): at most `capacity` producers (the cleaner sizes it from its

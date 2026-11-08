@@ -6240,8 +6240,8 @@ TEST(UnknownProducerIdRegression, InlineFailoverAfterRetentionAnswersUnknownProd
     EXPECT_EQ(u.base, leo);
     EXPECT_EQ(u.lso, -1);
     EXPECT_EQ(R.produce(7, 1, 1).base, leo + 1);
-    // Known producer Q: gap -> OOS, lower epoch -> fenced, in order -> OK.
-    EXPECT_EQ(R.produce(8, 2, 20).err, kOosD6);
+    // Rebuilt producer Q (#953): gap -> UnknownProducerId (unvouched), lower epoch -> fenced, in order -> OK.
+    EXPECT_EQ(R.produce(8, 2, 20).err, kUnknownPid);
     EXPECT_EQ(R.produce(8, 1, 12).err, kInvalidProducerEpoch);
     EXPECT_EQ(R.produce(8, 2, 12).err, 0);
 }
@@ -6315,7 +6315,7 @@ TEST(UnknownProducerIdRegression, WorkerRebuildAfterRetentionAnswersUnknownProdu
     EXPECT_EQ(unknown.errorCode, kUnknownPid);
     EXPECT_EQ(unknown.baseOffset, logStart) << "the ProduceResult carries the log start in baseOffset";
     EXPECT_EQ(log.logEndOffset(), leo);
-    EXPECT_EQ(run(8, 2, 20, 2).errorCode, kOosD6) << "known entry + gap";
+    EXPECT_EQ(run(8, 2, 20, 2).errorCode, kUnknownPid) << "rebuilt entry + gap (#953)";
     EXPECT_EQ(run(8, 1, 12, 3).errorCode, kInvalidProducerEpoch);
     const WorkerReturn ok = run(7, 1, 0, 4);
     EXPECT_EQ(ok.errorCode, 0);
