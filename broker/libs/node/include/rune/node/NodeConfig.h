@@ -337,8 +337,10 @@ struct NodeConfig {
     int64_t electionStatusIntervalMs =  20;  // default  20 ms
     int64_t startupCanvassTimeoutMs  = 100;  // default 100 ms
     /// A young controller process decides no user-partition leadership until it has held the replicas' "cannot serve" reports
-    /// this long (one report TTL).  Test clusters shorten it; production keeps the TTL.
-    int64_t unservableWarmupMs       = 2'000;
+    /// this long (one report TTL).  Test clusters shorten it; production keeps the TTL.  A value below BrokerNode::kUnservableReportPeriodNs
+    /// (500 ms) disables the guard: no replica has reported "cannot serve" yet when it ends.
+    static constexpr int64_t kDefaultUnservableWarmupMs = 2'000;
+    int64_t unservableWarmupMs       = kDefaultUnservableWarmupMs;
 
     // Controlled shutdown (RUNE_CONTROLLED_SHUTDOWN_MS): on a graceful stop
     // signal main() hands this node's partition leadership (and, on the
