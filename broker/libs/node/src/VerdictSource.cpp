@@ -1023,10 +1023,12 @@ rune::view::JudgeDecision VerdictSource::judgeStep_(Member& m, const uint8_t* ba
         }
         if (!t->commit) return {rune::view::JudgeStep::Drop, j->producerId};
     }
-    const bool backfill = j->firstOffset < m.replayFrom;
+    // Retention may have taken T's first batches: those records are gone, as on any refold from the log start (I-B).
+    const int64_t from = std::max(j->firstOffset, logStart_);
+    const bool backfill = from < m.replayFrom;
     const rune::view::TxnSpan* open = m.inst->spanFence.find(j->producerId);
-    if (backfill && (open == nullptr || open->first > j->firstOffset)) ++state_->txn.stats.checkpointBackfills;   // once: a re-visit finds it lowered
-    return {rune::view::JudgeStep::Apply, j->producerId, backfill ? j->firstOffset : -1};
+    if (backfill && (open == nullptr || open->first > from)) ++state_->txn.stats.checkpointBackfills;   // once: a re-visit finds it lowered
+    return {rune::view::JudgeStep::Apply, j->producerId, backfill ? from : -1};
 }
 
 // The judge applied (or dropped) a transaction to every active member: a span a member's replay opened for it is closed.

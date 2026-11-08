@@ -606,11 +606,13 @@ struct JudgeRig {
     int     countedAt = 0;
     int64_t countTo = -1;            // reads up to exactly it are counted in countedTo
     int     countedTo = 0;
+    int64_t logStart = 0;            // a read from below it comes back empty, as the log's below its start
     int drive(int64_t hw = INT64_MAX, int64_t now = 0) {
         return vs.driveJudge([&](int64_t from, int64_t to) {
             counted += from >= countFrom;
             countedAt += from == countAt;
             countedTo += to == countTo;
+            if (from < logStart) return rune::storage::LogReadView{};
             if (failReads > 0 && from == failFrom && (to == failTo || failTo == INT64_MAX)) {
                 --failReads;
                 return rune::storage::LogReadView{};
@@ -2672,6 +2674,48 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryApplicationClosesAReplayedSpanRegr
     EXPECT_EQ(r.index->foldCursor, 15);
     EXPECT_EQ(r.index->spanFence.count, 0);
     EXPECT_FALSE(r.index->spanFence.straddles(r.index->foldCursor));
+}
+
+// REGRESSION (Task 8 review 4, N-1; review 2 I-B, member half): retention cut a committed T's first batch (T.first < log start <= J).
+// A member below the log start with rows is discarded once and refolds from the log start; at J its backfill starts at the log
+// start, so T's retained records apply and the member catches up.  The backfill from T.first read below the log start, failed, and
+// the open span straddling the log start discarded the member again at every J, for as long as J was retained.
+TEST(CheckedWritesTxnJudgeRegression, BackfillBelowTheLogStartRefoldsOnceRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.log.data({{50}}, 77);   // 10: T, cut by retention
+    r.log.data({{51}}, 77);   // 11: T
+    r.log.data({{60}});       // 12
+    r.log.judge(77, 10);      // 13: J
+    r.log.marker(77, true);   // 14
+    r.log.data({{61}});       // 15
+    for (int i = 0; i < 8; ++i) r.drive();
+    ASSERT_EQ(r.vs.judgeCursor(), 16);
+    int discards = 0;
+    r.vs.setViewHooks({&discards, nullptr, [](void* ctx, ViewInstance& inst, ViewDiscardReason why) {
+                           EXPECT_EQ(why, ViewDiscardReason::BelowLogStart);
+                           ++*static_cast<int*>(ctx);
+                           for (uint64_t id = 0; id < 200; ++id) (void)inst.table.erase(id);
+                           inst.spanFence.clear();
+                           inst.foldCursor = 0;
+                       }, nullptr});
+    const rune::codec::Descriptor* s[] = {&r.src};
+    const rune::view::CompileResult candComp = rune::view::compileView(tagView(), s, 9).value();
+    ViewInstance cand(candComp.plan, candComp.rowLayout, r.src, false, 0, 8192, 1u << 16);
+    (void)cand.table.put(uint64_t(5));   // folded from records retention has since removed
+    cand.foldCursor = 6;
+    r.logStart = 11;
+    r.vs.bindLeader(nullptr, 1, 11);
+    r.vs.addCandidate(&cand, VerdictViewKind::TestReject, 9, 0x5eed);
+    for (int i = 0; i < 16; ++i) r.drive();
+    EXPECT_EQ(discards, 1) << "one discard, no repeated refold";
+    EXPECT_EQ(cand.foldCursor, 16);
+    EXPECT_EQ(cand.spanFence.count, 0);
+    EXPECT_EQ(cand.counters.txnReadFailed, 0u);
+    EXPECT_TRUE(cand.table.get(50) == nullptr) << "below the log start: gone";
+    EXPECT_TRUE(cand.table.get(51) != nullptr) << "T's retained record applies at J";
+    EXPECT_TRUE(cand.table.get(60) != nullptr && cand.table.get(61) != nullptr);
+    r.vs.removeCandidate(9, 0x5eed);
 }
 
 // REGRESSION (Task 8 review 1, m1): a checkpoint push the span fence vetoes leaves nothing durable, so the run-ahead cap (P11-8 (a))
