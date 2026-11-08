@@ -162,6 +162,7 @@ PLAIN_RE = [(re.compile(p), label, lits) for p, label, lits in PLAIN_FAMILIES]
 # re-checks each candidate line with the exact family regex, so this only decides which lines are looked at.
 PLAIN_SCAN_RE = re.compile("|".join(lit for _, _, lits in PLAIN_FAMILIES for lit in lits))
 STD_LITERALS_RE = re.compile("|".join(STD_LITERALS))
+DECLTYPE_RE = re.compile("decltype")
 
 USING_STD_RE = re.compile(r"\busing\s+namespace\s+(?:::)?std\s*;")
 ALIAS_RE = re.compile(r"\bnamespace\s+(\w+)\s*=\s*(?:::)?std\s*;")
@@ -270,7 +271,9 @@ def find_hits(raw: str, clean: str, atomic_names, rel: str = ""):
     hits = []
     scans = [(STD_SCAN_RE, STD_LITERALS_RE)] + [(rx, STD_LITERALS_RE) for rx in std_rx[1:]]   # [1:]: bare names
     scans.append((PLAIN_SCAN_RE, None))
-    scans += [(rx, None) for rx in (aeron_rx, member_rx, decl_rx, use_rx) if rx is not None]
+    scans += [(rx, None) for rx in (aeron_rx, member_rx, use_rx) if rx is not None]
+    if decl_rx is not None:
+        scans.append((decl_rx, DECLTYPE_RE))
     for i in candidate_lines(clean, scans):
         line = lines[i - 1]
         label = None
