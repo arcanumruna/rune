@@ -1871,6 +1871,7 @@ if(BUILD_TESTING)
     add_executable(rune_cli_catalog_tests
         tests/RuneCliCatalogTest.cpp
         tests/CheckedWritesQlCliTest.cpp
+        tests/LeaseQlCliTest.cpp
     )
     target_include_directories(rune_cli_catalog_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/src/cli)   # QlEngine.h (internal)
     target_compile_definitions(rune_cli_catalog_tests PRIVATE

@@ -222,6 +222,15 @@ std::string formatTopicDefinition(const cat::TopicObject& t) {
 
 std::string formatViewDefinition(const cat::ViewObject& v) {
     std::ostringstream o;
+    if (v.kind == cat::ViewKind::LeaseIndex) {   // a plan-less sink the broker made beside its lease topic (named `<topic>.leases`)
+        static constexpr std::string_view kSuffix = ".leases";
+        const std::string_view topic = std::string_view(v.name).ends_with(kSuffix)
+                                           ? std::string_view(v.name).substr(0, v.name.size() - kSuffix.size())
+                                           : std::string_view(v.name);
+        o << "view " << v.name << " (objectId " << v.objectId << ", version " << v.version << ")\n"
+          << "  lease view of topic " << topic << "\n";
+        return o.str();
+    }
     o << "view " << v.name << " (objectId " << v.objectId << ", version " << v.version << ")\n"
       << "  sources";
     for (const auto& s : v.def.sourceNames) o << " " << s;

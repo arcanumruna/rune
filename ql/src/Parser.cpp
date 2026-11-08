@@ -2,7 +2,12 @@
 // Grammar:
 //   statement   := topicStmt | transientStmt | alterStmt | dropStmt | showStmt | diffStmt
 //                | createStmt | grantStmt | revokeStmt                       (authentication: users / roles / grants)
-//   transientStmt := "transient" topicStmt                 (Phase 2b E: persistence = Transient)
+//   transientStmt := "transient" ["lease"] topicStmt       (Phase 2b E: persistence = Transient)
+//   leaseTopicStmt := "lease" topicStmt                    (a lease topic: needs a typed, keyed topic; lease.* settings)
+//   showLeases  := "show" "leases" NAME [ "where" IDENT "like" STRING ] [ "limit" INT ] ";"
+//                  (the STRING is a key prefix: exactly one '%', the last character; '_' is a literal; prefix <= 127 bytes)
+//   showLease   := "show" "lease" NAME "key" KEYLIT ";"     revokeLease := "revoke" "lease" NAME "key" KEYLIT ";"
+//   KEYLIT      := ["-"] INT | STRING
 //   topicStmt   := "topic" IDENT [ "{" field ("," field)* ","? "}" ] [ "partitions" INT ] [ "replicas" INT ] [ "key" IDENT ]
 //                  [ "with" "(" createSetting ("," createSetting)* ")" ] ";"
 //                  (an untyped topic has no "{…}" and no "key"; a typed topic's "key" is optional;
@@ -14,6 +19,8 @@
 //                  | "durability" "=" ("majority" | "all-in-sync") | "tier" "=" ("leader" | "majority" | "strict")
 //                  | ("copartition.group" | "partition.key") "=" STRING
 //                  | "key.index" "=" ("on" | "off") | ("autoincrement.reserve" | "autoincrement.max") "=" SIGNED_INT
+//                  | lease topics only: ("lease.ttl" | "lease.min_ttl" | "lease.max_ttl" | "lease.max_keys" | "lease.expiry_batch"
+//                    | "lease.checkpoint_interval" | "lease.checkpoint_rate") "=" SIGNED_INT | "lease.checkpoint" "=" ("on" | "off")
 //                  (creation-only; a key may appear once)
 //   alterStmt   := "alter" "topic" IDENT ( alterOp ("," alterOp)* | "set" setting ("," setting)* ) ";"
 //                  ("alter transient …" and "set persistence …" are rejected:
@@ -596,12 +603,14 @@ struct Parser {
     }
 
     // setting ("," setting)*  — a key may appear once.
-    std::expected<std::vector<ConfigSetting>, ParseError> parseSettings(bool alterOnly) noexcept {
+    // `keyToks`, when given, receives each setting's key token (parallel to the result) for positioned errors.
+    std::expected<std::vector<ConfigSetting>, ParseError> parseSettings(bool alterOnly, std::vector<Token>* keyToks = nullptr) noexcept {
         std::vector<ConfigSetting> out;
         while (true) {
             Token at = cur;
             auto s = parseSetting(alterOnly);
             if (!s) return std::unexpected(std::move(s.error()));
+            if (keyToks != nullptr) keyToks->push_back(at);
             for (const auto& e : out) {
                 if (e.key == s->key) return std::unexpected(errAt(at, "duplicate setting '" + s->key + "'"));
             }
@@ -615,16 +624,19 @@ struct Parser {
     // ---- top-level statement: "topic" ----
     // The statement ends at its ';'; what may follow is the caller's concern
     // (parse(): nothing; parseScript(): the next statement).
-    std::expected<TopicDef, ParseError> parseTopicStatement() noexcept {
+    // `lease` = `lease topic …`: `start` is the statement's first token (the `lease` keyword) for the statement-level errors.
+    std::expected<TopicDef, ParseError> parseTopicStatement(bool lease = false, std::optional<Token> start = std::nullopt) noexcept {
         if (!isKw("topic")) {
             return std::unexpected(err("expected 'topic'"));
         }
+        const Token stmtStart = start.value_or(cur);
         advance();
 
         auto nameToken = expect(TK::Ident, "topic name");
         if (!nameToken) return std::unexpected(std::move(nameToken.error()));
         TopicDef td;
         td.name = std::string(nameToken->text);
+        std::vector<Token> fieldToks, settingToks;
 
         // optional "{" fields "}" — absent = an untyped topic
         const bool typed = (cur.kind == TK::LBrace);
@@ -634,8 +646,10 @@ struct Parser {
             while (true) {
                 if (cur.kind == TK::RBrace) break;   // trailing comma / empty
 
+                const Token fieldTok = cur;
                 auto fd = parseField();
                 if (!fd) return std::unexpected(std::move(fd.error()));
+                fieldToks.push_back(fieldTok);
                 for (const auto& existing : td.fields) {
                     if (existing.name == fd->name) {
                         return std::unexpected(err(
@@ -709,7 +723,7 @@ struct Parser {
             advance();
             auto lp = expect(TK::LParen, "'('");
             if (!lp) return std::unexpected(std::move(lp.error()));
-            auto ss = parseSettings(false);
+            auto ss = parseSettings(false, &settingToks);
             if (!ss) return std::unexpected(std::move(ss.error()));
             td.with = std::move(*ss);
             auto rp = expect(TK::RParen, "')'");
@@ -718,7 +732,48 @@ struct Parser {
 
         auto semi = expect(TK::Semi, "';'");
         if (!semi) return std::unexpected(std::move(semi.error()));
+        td.lease = lease;
+        if (auto e = checkLeaseTopic(td, lease, stmtStart, fieldToks, settingToks)) return std::unexpected(std::move(*e));
         return td;
+    }
+
+    // Lease topic checks (spec 5.1), after the plain-topic checks; the texts are the broker's, verbatim.  On a plain topic
+    // only the `lease.*` settings are refused.
+    [[nodiscard]] std::optional<ParseError> checkLeaseTopic(const TopicDef& td, bool lease, const Token& stmtStart,
+                                                            const std::vector<Token>& fieldToks,
+                                                            const std::vector<Token>& settingToks) const {
+        const auto leaseSettingAt = [&](std::size_t i) {
+            const auto* spec = detail::findSetting(td.with[i].key);
+            return spec != nullptr && detail::isLeaseField(spec->field);
+        };
+        if (!lease) {
+            for (std::size_t i = 0; i < td.with.size(); ++i)
+                if (leaseSettingAt(i)) return errAt(settingToks[i], "lease.* settings need a lease topic");
+            return std::nullopt;
+        }
+        if (td.fields.empty() || td.keyField.empty()) return errAt(stmtStart, "a lease topic needs a typed, keyed topic");
+        for (std::size_t i = 0; i < td.fields.size(); ++i)
+            if (td.fields[i].autoIncrement) return errAt(fieldToks[i], "a lease topic cannot use autoincrement");
+        for (std::size_t i = 0; i < td.fields.size(); ++i)
+            if (td.fields[i].name.starts_with("lease_")) return errAt(fieldToks[i], "lease_ field names are reserved");
+        for (std::size_t i = 0; i < td.with.size(); ++i) {
+            const auto& w = td.with[i];
+            if (w.key == "key.index" && w.value != 0) return errAt(settingToks[i], "a lease topic's key index is its lease view");
+            if (w.key == "autoincrement.reserve" || w.key == "autoincrement.max")
+                return errAt(settingToks[i], "autoincrement.max and autoincrement.reserve need autoincrement");
+            if ((w.key == "cleanup.policy" && w.value != 1) || (w.key == "retention.ms" && w.value != -1) ||
+                (w.key == "retention.bytes" && w.value != -1))
+                return errAt(settingToks[i], "a lease topic is compacted and keeps every live lease");
+        }
+        protocol::LeaseSpec spec{};
+        for (std::size_t i = 0; i < td.with.size(); ++i) {
+            const auto* ss = detail::findSetting(td.with[i].key);
+            if (ss == nullptr || !detail::isLeaseField(ss->field)) continue;
+            if (const auto refusal = detail::applyLeaseSetting(spec, ss->field, td.with[i].value))
+                return errAt(settingToks[i], std::string(*refusal));
+        }
+        if (const auto refusal = protocol::validateLeaseSpec(spec)) return errAt(stmtStart, std::string(*refusal));
+        return std::nullopt;
     }
 
     // ---- alter operations ----
@@ -1485,6 +1540,66 @@ struct Parser {
         return Statement(std::in_place_type<DropViewDef>, DropViewDef{std::string(nameToken->text)});
     }
 
+    // KEYLIT := ["-"] INT | STRING  - a lease key, stored as parseLiteral builds a literal.
+    std::expected<Literal, ParseError> parseLeaseKey() noexcept {
+        if (cur.kind != TK::String && cur.kind != TK::Int && cur.kind != TK::Dash)
+            return std::unexpected(err("a lease key is an integer or a string"));
+        return parseLiteral();
+    }
+
+    // The leading `show` is consumed; cur is "leases".
+    std::expected<Statement, ParseError> parseShowLeases() noexcept {
+        advance();   // "leases"
+        ShowLeasesDef d;
+        auto n = parseName("topic name");
+        if (!n) return std::unexpected(std::move(n.error()));
+        d.topic = std::move(*n);
+        if (isKw("where")) {
+            constexpr const char* kPrefixOnly = "show leases filters by key prefix only";
+            advance();
+            if (cur.kind != TK::Ident) return std::unexpected(err("expected a key column name, got " + got()));
+            d.keyColumn = std::string(cur.text);
+            advance();
+            if (!isKw("like")) return std::unexpected(err(kPrefixOnly));
+            advance();
+            if (cur.kind == TK::BadString) return std::unexpected(err("unterminated string literal"));
+            if (cur.kind != TK::String) return std::unexpected(err(kPrefixOnly));
+            const std::string_view pattern = cur.text;
+            // Exactly one '%', the last character; '_' is a literal character (discovery paths contain it).
+            if (pattern.empty() || pattern.back() != '%' || std::count(pattern.begin(), pattern.end(), '%') != 1)
+                return std::unexpected(err(kPrefixOnly));
+            if (pattern.size() - 1 > 127) return std::unexpected(err("a lease key prefix is at most 127 bytes"));
+            d.prefix = std::string(pattern.substr(0, pattern.size() - 1));
+            advance();
+            if (isKw("and") || isKw("or")) return std::unexpected(err(kPrefixOnly));
+        }
+        if (isKw("limit")) {
+            advance();
+            if (cur.kind != TK::Int) return std::unexpected(err("expected integer for limit, got " + got()));
+            uint64_t v = 0;
+            const auto ec = std::from_chars(cur.text.data(), cur.text.data() + cur.text.size(), v).ec;
+            if (ec != std::errc{} || v > std::numeric_limits<uint32_t>::max()) return std::unexpected(err("limit must be <= 4294967295"));
+            if (v < 1) return std::unexpected(err("limit must be >= 1"));
+            advance();
+            d.limit = static_cast<uint32_t>(v);
+        }
+        if (auto semi = expect(TK::Semi, ";"); !semi) return std::unexpected(std::move(semi.error()));
+        return Statement(std::in_place_type<ShowLeasesDef>, std::move(d));
+    }
+
+    // "show lease" / "revoke lease" NAME "key" KEYLIT ";" - cur is "lease".
+    std::expected<Statement, ParseError> parseLeaseKeyStatement(bool revoke) noexcept {
+        advance();   // "lease"
+        auto n = parseName("topic name");
+        if (!n) return std::unexpected(std::move(n.error()));
+        if (auto k = expectKeyword("key"); !k) return std::unexpected(std::move(k.error()));
+        auto key = parseLeaseKey();
+        if (!key) return std::unexpected(std::move(key.error()));
+        if (auto semi = expect(TK::Semi, ";"); !semi) return std::unexpected(std::move(semi.error()));
+        if (revoke) return Statement(std::in_place_type<RevokeLeaseDef>, RevokeLeaseDef{std::move(*n), std::move(*key)});
+        return Statement(std::in_place_type<ShowLeaseDef>, ShowLeaseDef{std::move(*n), std::move(*key)});
+    }
+
     // "topic" | "view" | "schema" at cur, if any (not consumed).
     [[nodiscard]] std::optional<ObjectKind> objectKindHere() const noexcept {
         if (isKw("topic")) return ObjectKind::Topic;
@@ -1503,6 +1618,8 @@ struct Parser {
             if (users) return Statement(std::in_place_type<ShowUsersDef>);
             return Statement(std::in_place_type<ShowRolesDef>);
         }
+        if (isKw("leases")) return parseShowLeases();
+        if (isKw("lease")) return parseLeaseKeyStatement(false);
         if (isKw("grants")) return parseShowGrants();
         if (isKw("security")) return parseShowSecurityHistory();
         if (isKw("history")) {
@@ -1527,7 +1644,7 @@ struct Parser {
         }
         auto kind = objectKindHere();
         if (!kind) {
-            return std::unexpected(err("expected 'history', 'schema', 'view', 'topic', 'users', 'roles', 'grants' or 'security' after 'show', got " + got()));
+            return std::unexpected(err("expected 'history', 'schema', 'view', 'topic', 'users', 'roles', 'grants', 'security', 'leases' or 'lease' after 'show', got " + got()));
         }
         advance();
         auto nameToken = expect(TK::Ident, "object name");
@@ -1664,7 +1781,7 @@ struct Parser {
 
     // ---- statement dispatch (parse() and parseScript() share this) ----
     std::expected<Statement, ParseError> parseStatement() noexcept {
-        constexpr const char* kExpected = "expected 'topic', 'transient', 'alter', 'drop', 'show', 'diff', 'create', 'select', 'grant' or 'revoke'";
+        constexpr const char* kExpected = "expected 'topic', 'lease', 'transient', 'alter', 'drop', 'show', 'diff', 'create', 'select', 'grant' or 'revoke'";
         if (cur.kind != TK::Ident) {
             return std::unexpected(err(std::string(kExpected) + ", got " + got()));
         }
@@ -1673,12 +1790,23 @@ struct Parser {
             if (!r) return std::unexpected(std::move(r.error()));
             return Statement(std::in_place_type<TopicDef>, std::move(*r));
         }
-        if (isKw("transient")) {
+        if (isKw("lease")) {
+            const Token start = cur;
             advance();
+            if (!isKw("topic")) return std::unexpected(err("expected 'topic' after 'lease', got " + got()));
+            auto r = parseTopicStatement(true, start);
+            if (!r) return std::unexpected(std::move(r.error()));
+            return Statement(std::in_place_type<TopicDef>, std::move(*r));
+        }
+        if (isKw("transient")) {
+            const Token start = cur;
+            advance();
+            const bool lease = isKw("lease");
+            if (lease) advance();
             if (!isKw("topic")) {
-                return std::unexpected(err("expected 'topic' after 'transient', got " + got()));
+                return std::unexpected(err(std::string("expected 'topic' after 'transient") + (lease ? " lease" : "") + "', got " + got()));
             }
-            auto r = parseTopicStatement();
+            auto r = parseTopicStatement(lease, start);
             if (!r) return std::unexpected(std::move(r.error()));
             r->persistence = Persistence::Transient;
             return Statement(std::in_place_type<TopicDef>, std::move(*r));
@@ -1690,7 +1818,13 @@ struct Parser {
         if (isKw("create")) return parseCreateStatement();
         if (isKw("select")) return parseSelect();
         if (isKw("grant"))  return parseGrantRevoke(true);
-        if (isKw("revoke")) return parseGrantRevoke(false);
+        if (isKw("revoke")) {
+            // `revoke lease …` is the lease statement; any other `revoke …` is the security grammar, unchanged.
+            Parser look = *this;
+            look.advance();
+            if (look.isKw("lease")) { advance(); return parseLeaseKeyStatement(true); }
+            return parseGrantRevoke(false);
+        }
         return std::unexpected(err(std::string(kExpected) + ", got " + got()));
     }
 };

@@ -71,24 +71,26 @@ inline bool decodeLeaseSpec(const uint8_t* in, std::size_t len, LeaseSpec& out) 
     return true;
 }
 
+/// The detail texts of validateLeaseSpec - the ONE spelling, shared by the broker, the client and rune-ql.
+inline constexpr std::string_view kLeaseMinTtlRangeText   = "lease.min_ttl must be between 1000 and lease.max_ttl ms";
+inline constexpr std::string_view kLeaseMaxTtlRangeText   = "lease.max_ttl must be between lease.min_ttl and 9000000000000 ms";
+inline constexpr std::string_view kLeaseTtlRangeText      = "lease.ttl must be between lease.min_ttl and lease.max_ttl ms";
+inline constexpr std::string_view kLeaseMaxKeysRangeText  = "lease.max_keys must be between 1 and 16777216";
+inline constexpr std::string_view kLeaseCheckpointText    = "lease.checkpoint must be 0 or 1";
+inline constexpr std::string_view kLeaseCheckpointIntervalRangeText = "lease.checkpoint_interval must be between 1000 and 86400000 ms";
+inline constexpr std::string_view kLeaseCheckpointRateRangeText     = "lease.checkpoint_rate must be between 1 and 100000";
+inline constexpr std::string_view kLeaseExpiryBatchRangeText        = "lease.expiry_batch must be between 1 and 4096";
+
 /// nullopt = valid; otherwise a static detail string naming the offending key.
 [[nodiscard]] inline std::optional<std::string_view> validateLeaseSpec(const LeaseSpec& s) noexcept {
-    if (s.minTtlMs < kLeaseMinTtlFloorMs || s.minTtlMs > s.maxTtlMs)
-        return "lease.min_ttl must be between 1000 and lease.max_ttl ms";
-    if (s.maxTtlMs < s.minTtlMs || s.maxTtlMs > kLeaseMaxTtlMs)
-        return "lease.max_ttl must be between lease.min_ttl and 9000000000000 ms";
-    if (s.ttlMs < s.minTtlMs || s.ttlMs > s.maxTtlMs)
-        return "lease.ttl must be between lease.min_ttl and lease.max_ttl ms";
-    if (s.maxKeys < 1 || s.maxKeys > 16'777'216)
-        return "lease.max_keys must be between 1 and 16777216";
-    if (s.checkpoint > 1)
-        return "lease.checkpoint must be 0 or 1";
-    if (s.checkpointIntervalMs < 1000 || s.checkpointIntervalMs > 86'400'000)
-        return "lease.checkpoint_interval must be between 1000 and 86400000 ms";
-    if (s.checkpointRate < 1 || s.checkpointRate > 100'000)
-        return "lease.checkpoint_rate must be between 1 and 100000";
-    if (s.expiryBatch < 1 || s.expiryBatch > 4096)
-        return "lease.expiry_batch must be between 1 and 4096";
+    if (s.minTtlMs < kLeaseMinTtlFloorMs || s.minTtlMs > s.maxTtlMs) return kLeaseMinTtlRangeText;
+    if (s.maxTtlMs < s.minTtlMs || s.maxTtlMs > kLeaseMaxTtlMs) return kLeaseMaxTtlRangeText;
+    if (s.ttlMs < s.minTtlMs || s.ttlMs > s.maxTtlMs) return kLeaseTtlRangeText;
+    if (s.maxKeys < 1 || s.maxKeys > 16'777'216) return kLeaseMaxKeysRangeText;
+    if (s.checkpoint > 1) return kLeaseCheckpointText;
+    if (s.checkpointIntervalMs < 1000 || s.checkpointIntervalMs > 86'400'000) return kLeaseCheckpointIntervalRangeText;
+    if (s.checkpointRate < 1 || s.checkpointRate > 100'000) return kLeaseCheckpointRateRangeText;
+    if (s.expiryBatch < 1 || s.expiryBatch > 4096) return kLeaseExpiryBatchRangeText;
     return std::nullopt;
 }
 
