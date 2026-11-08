@@ -594,6 +594,12 @@ struct R11 {
 // REGRESSION (R11b, D5): with transactions of 3 producers interleaved with plain writes on the same keys and groups, the live fold, a
 // refold from 0 after a restart without checkpoints, copies installed after the writes, and a failover's leadership scan with
 // activation replay agree on every table and every rejected verdict.  One seed per instance, 1-100.
+//
+// Deviation (Task 8 review 3, m-3): the "live" fold is not an undisturbed leader.  Every transactional append, and every plain batch
+// with a null v, goes through appendTxnReplicated, which demotes the leader, replicates the batch and promotes it again: the produce
+// path refuses transactional writes on a checked source until Phase 3 (and a value block cut before v always).  So the live image has
+// been through about ten activations per seed.  The comparisons stay meaningful, as the copies and the refold from 0 are independent
+// paths, but reference (1) of the spec is weaker than an undisturbed leader.
 class CheckedWritesTxnDeterminismRegression : public ::testing::TestWithParam<uint32_t> {};
 
 TEST_P(CheckedWritesTxnDeterminismRegression, LiveEqualsRefoldEqualsRebuildUnderInterleavedTxnsRegression) {
