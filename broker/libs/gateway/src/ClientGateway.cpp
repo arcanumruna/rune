@@ -7092,6 +7092,43 @@ int32_t ClientGateway::verifyCoordinatorNode_() const noexcept
     return (n < 0 || n == thisNodeId_) ? -1 : n;
 }
 
+int64_t ClientGateway::sendTxnVote(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
+                                   int32_t coordinatorEpoch)
+{
+    if (!routesToWorker_(topicId) || votesInFlight_.size() >= kMaxTxnVotesInFlight) return -1;
+    const int64_t token = nextVoteToken_++;
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::TxnVote;
+    op.topicId       = topicId;
+    op.partition     = partition;
+    op.correlationId = token;
+    op.producerId    = producerId;
+    op.producerEpoch = producerEpoch;
+    op.sessionId     = -1;   // local origin
+    if (!workerPool_->tryEnqueueOp(topicId, partition, std::move(op))) return -1;
+    votesInFlight_.emplace(token, VoteInFlight{topicId, partition, producerId, producerEpoch, coordinatorEpoch});
+    return token;
+}
+
+void ClientGateway::onTxnVoteResult_(const rune::node::WorkerReturn& ret)
+{
+    auto it = votesInFlight_.find(ret.correlationId);
+    if (it == votesInFlight_.end()) {   // answered already, or a stale incarnation's token
+        spdlog::debug("ClientGateway: TxnVoteResult for unknown token={} topic={} partition={}", ret.correlationId,
+                      ret.topicId, ret.partition);
+        return;
+    }
+    const VoteInFlight v = it->second;
+    votesInFlight_.erase(it);   // erased before the sink runs: it may send again
+    if (voteSink_ == nullptr) return;
+    TxnVoteResult r;
+    r.errorCode     = ret.errorCode;
+    r.code          = static_cast<uint16_t>(ret.recordCount);
+    r.constraintId  = static_cast<uint32_t>(ret.newNextOffset);
+    r.failingOffset = ret.baseOffset;
+    voteSink_(voteSinkCtx_, v.topicId, v.partition, v.producerId, v.producerEpoch, v.coordinatorEpoch, r);
+}
+
 void ClientGateway::onTxnVerifyRequest_(const rune::node::WorkerReturn& ret)
 {
     namespace pcl = rune::protocol::client;
@@ -7376,6 +7413,10 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
         // F15-FU1 (#112): a partition's owning worker asks the transaction coordinator.
         if (ret.type == rune::node::WorkerReturn::Type::TxnVerifyRequest) [[unlikely]] {
             onTxnVerifyRequest_(ret);
+            return;
+        }
+        if (ret.type == rune::node::WorkerReturn::Type::TxnVoteResult) [[unlikely]] {
+            onTxnVoteResult_(ret);
             return;
         }
 
