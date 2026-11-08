@@ -1963,9 +1963,14 @@ if(BUILD_TESTING)
         # rest of the binary is functional and runs in parallel.
         set(RUNE_CLIENT_BROKER_LATENCY_TESTS
             "AuthGatesRegression.FullScramLoginMedianUnder5msRegression:AuthGatesRegression.FirstLegTimingDoesNotRevealUserExistenceRegression")
+        # The two whole scenarios of the regressors path stay as stress; their default cuts are the tests around them.
+        set(RUNE_CLIENT_BROKER_STRESS_TESTS
+            "CheckedWritesRegressorsPathRegression.TheWholeScenarioThreeNodesRegression:CheckedWritesRegressorsPathRegression.FailoverDuringDropFinishesTheDropThreeNodesRegression")
         gtest_discover_tests(rune_client_broker_tests TEST_FILTER "${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
                              PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE LABELS latency)
-        gtest_discover_tests(rune_client_broker_tests TEST_FILTER "-${RUNE_CLIENT_BROKER_LATENCY_TESTS}"
+        gtest_discover_tests(rune_client_broker_tests TEST_FILTER "${RUNE_CLIENT_BROKER_STRESS_TESTS}"
+                             PROPERTIES TIMEOUT 600 LABELS stress)
+        gtest_discover_tests(rune_client_broker_tests TEST_FILTER "-${RUNE_CLIENT_BROKER_LATENCY_TESTS}:${RUNE_CLIENT_BROKER_STRESS_TESTS}"
                              PROPERTIES TIMEOUT 600)
 
         # Checked writes Part 04 Task 11: the seeded verdict stress on three real brokers (each seed is one ctest case).
