@@ -296,7 +296,7 @@ public:
         pass();
         return voteToken_;
     }
-    /// The coordinator's answer `code` to the worker's last verification request for (pid, epoch); one pass.
+    /// The coordinator's answer `code`, as (pid, epoch), to the worker's most recent verification request of any producer; one pass.
     void answerVerify(int64_t pid, int16_t epoch, int16_t code) {
         WorkerOp op;
         op.type = WorkerOp::Type::TxnVerifyResult; op.topicId = kSrc; op.partition = tuning_.partition; op.replica = replica.get();
