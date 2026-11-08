@@ -50,6 +50,6 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_view_tests)
     # T7 review 5, N2: the overlay's spare row reads as zeroes when malloc scribbles fresh blocks, as ASan does.
     add_test(NAME CheckedWritesTxnOverlaySpareRowUnderScribbleRegression
-             COMMAND rune_view_tests --gtest_filter=*.ShortOverlayRowsNeverReachTheSpareRow:*.OverlayRowsShorterThanATableRowAreCapacityExhausted)
+             COMMAND rune_view_tests --gtest_filter=*.ShortOverlayRowsNeverReachTheSpareRow:*.OverlayRowsShorterThanATableRowAreCapacityExhausted:*.ReserveZeroesOnlyTheSpareRowRegression)
     set_tests_properties(CheckedWritesTxnOverlaySpareRowUnderScribbleRegression PROPERTIES ENVIRONMENT "MallocScribble=1;MallocPreScribble=1;MALLOC_PERTURB_=170")
 endif()

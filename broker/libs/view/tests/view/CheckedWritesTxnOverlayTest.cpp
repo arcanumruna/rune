@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <random>
@@ -399,6 +400,20 @@ TEST(CheckedWritesTxnOverlayRegression, ReserveTouchesNoRowRegression) {
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(residentPages(row, 1), 1u);
     EXPECT_EQ(row[63], 0) << "a put without a base row is zeroes";
+}
+
+// A calloc'd arena was zeroed again whenever the allocator handed back a freed block: a fifth of a constraint model seed.  Run under
+// a scribbling malloc (CheckedWritesTxnOverlaySpareRowUnderScribbleRegression), the rows keep the scribble and only the spare row is zeroed.
+TEST(CheckedWritesTxnOverlayRegression, ReserveZeroesOnlyTheSpareRowRegression) {
+    if (std::getenv("MallocScribble") == nullptr && std::getenv("MALLOC_PERTURB_") == nullptr) GTEST_SKIP() << "needs a scribbling malloc";
+    constexpr std::size_t kRows = std::size_t(1) << 14;
+    constexpr uint32_t kLen = 256;
+    TxnOverlay o;
+    o.reserve(kRows, kLen);
+    const uint8_t* rows = o.spare() - kRows * kLen;
+    EXPECT_NE(rows[0], 0) << "the reserve zeroed the rows";
+    EXPECT_NE(rows[kRows * kLen - 1], 0) << "the reserve zeroed the rows";
+    for (uint32_t i = 0; i < kLen; ++i) ASSERT_EQ(o.spare()[i], 0) << i;
 }
 
 // T7 review 5, N3: clear() empties only the index slots its rows took.  An atomic batch clears its overlay twice, and the index is
