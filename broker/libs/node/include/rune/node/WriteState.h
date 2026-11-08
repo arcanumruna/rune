@@ -213,6 +213,7 @@ struct TxnJudgeStats {
              ordinaryWaits = 0,         ///< an ordinary transaction the judge could not track (its table full): the judge waits
              supersedeKeysOverflow = 0, ///< an ordinary transaction with more keys than the one-step set holds: applied in segments, one per pass
              undecidedReplaceRefusals = 0, ///< a producer's next TxnJudge refused while its previous transaction has no marker
+             joinerTxnWaits = 0,        ///< a joiner's set switch waits at an undecided J (D3; bounded by the transaction timeout)
              atomicTooLarge = 0;        ///< an atomic batch past txnJudgedRecordsMax: every record rejected (62) until rule 10 (Task 12)
 };
 struct DeferredTxn {

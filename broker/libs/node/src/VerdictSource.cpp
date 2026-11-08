@@ -1005,6 +1005,7 @@ rune::view::JudgeDecision VerdictSource::judgeStep_(Member& m, const uint8_t* ba
     if (t != nullptr && t->judgeOffset == at) {
         if (t->phase != TxnPhase::Finalized) {
             const bool active = std::find(active_.begin(), active_.end(), static_cast<std::size_t>(&m - members_.data())) != active_.end();
+            if (!active && !m.candidate) ++state_->txn.stats.joinerTxnWaits;
             return {active ? rune::view::JudgeStep::Drop : rune::view::JudgeStep::Wait, j->producerId};
         }
         if (!t->commit) return {rune::view::JudgeStep::Drop, j->producerId};

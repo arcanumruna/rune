@@ -2505,6 +2505,7 @@ TEST(CheckedWritesTxnJudgeRegression, SwitchSetJoinerNeverAppliesPastTheLsoRegre
         ASSERT_TRUE(r.st.txn.find(77) != nullptr && r.st.txn.find(77)->judged) << commit;
         EXPECT_TRUE(joiner->table.get(50) == nullptr) << commit << ": T is undecided";
         EXPECT_TRUE(joiner->table.get(51) == nullptr) << commit << ": T is undecided";
+        EXPECT_GT(r.st.txn.stats.joinerTxnWaits, 0u) << commit << ": the wait is counted (review 2 m-d)";
         r.log.marker(77, commit);       // 16
         for (int i = 0; i < 8; ++i) r.drive();
         EXPECT_EQ(r.vs.judgeCursor(), 17) << commit;
@@ -2541,6 +2542,7 @@ TEST(CheckedWritesTxnJudgeRegression, CandidateInsideAnUndecidedTxnWaitsAtItsJud
         for (int i = 0; i < 8; ++i) r.drive();
         EXPECT_TRUE(cand.table.get(51) == nullptr) << commit << ": T is undecided";
         EXPECT_LE(cand.foldCursor, 13) << commit << ": the candidate waits at J";
+        EXPECT_EQ(r.st.txn.stats.joinerTxnWaits, 0u) << commit << ": a candidate's wait is not a joiner's";
         r.log.marker(77, commit);  // 15
         for (int i = 0; i < 8; ++i) r.drive();
         EXPECT_EQ(cand.table.get(50) != nullptr, commit) << commit;
