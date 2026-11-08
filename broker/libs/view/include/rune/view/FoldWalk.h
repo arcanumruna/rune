@@ -25,6 +25,7 @@
 #include <rune/view/FoldSkip.h>
 #include <rune/view/FoldStats.h>
 #include <rune/view/TxnSpanFence.h>
+#include <rune/view/TxnSupersede.h>
 
 namespace rune::view {
 
@@ -40,13 +41,14 @@ template <class ReadRangeFn>
     return {&readRange, [](void* c, int64_t from, int64_t to) { return (*static_cast<ReadRangeFn*>(c))(from, to); }};
 }
 
-/// One fold call's transactional state: the instance's fence, its reader, and the call's budget in units (offsets the walk covers
+/// One fold call's transactional state: the instance's fence, the worker's supersede keys, its reader, and the call's budget in units (offsets the walk covers
 /// plus records a marker application applies; 0 = no cap).  A fold without one (a transient source, D6) applies transactional
 /// batches at their own offsets.
 struct TxnFold {
-    TxnSpanFence& fence;
-    SpanReader    reader;
-    int64_t       budget = 0;
+    TxnSpanFence&  fence;
+    SupersedeKeys& keys;
+    SpanReader     reader;
+    int64_t        budget = 0;
 };
 
 /// The bytes one call may read back for a marker application (as kVoteScanBytesPerPass); the rest continues next call.
@@ -140,8 +142,51 @@ WalkOut walkView(const rune::storage::LogReadView& view, int64_t from, int64_t b
     return {WalkEnd::Done, walkedUpto};
 }
 
-// Applies the span of `pid` (open in the fence) at its marker: its batches in [first, marker), resuming above applyingThrough.  At
-// most `left` records and kTxnReadBackBytesPerPass bytes; false when either ran out first (applyingThrough says where it stopped).
+// The supersede notes of the segment of `pid`'s span from `from` (D1): T's keys up to the first that does not fit, and per key the last
+// offset below the marker of another writer's record applied before it - plain and not rejected, or of a transaction not open in the
+// fence at its offset (it closed below the marker; an aborted one is skipped by the partition's aborted index, which every fold path
+// is handed).  Returns the segment's end.
+inline int64_t noteSupersede(TxnFold& txn, int64_t pid, int64_t from, int64_t marker, const FoldSkip& skip) {
+    namespace b = rune::protocol::batch;
+    txn.keys.clear();
+    int64_t segEnd = marker;
+    for (int64_t at = from; at < marker;) {
+        const rune::storage::LogReadView v = txn.reader.read(at, marker);
+        if (v.empty()) break;
+        const int64_t start = at;
+        for (std::size_t pos = 0; pos < v.len;) {
+            rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
+            if (!r.ensureValid() || r.baseOffset() >= marker) return segEnd;
+            pos += static_cast<std::size_t>(r.totalLength());
+            const int16_t attrs = r.attributes();
+            const int64_t last  = r.baseOffset() + r.lastOffsetDelta();
+            if (last < at) continue;
+            at = last + 1;
+            if ((attrs & b::kAttrControl) != 0) continue;
+            if ((attrs & b::kAttrTransactional) != 0 && r.producerId() == pid) {
+                if (segEnd != marker) continue;
+                r.forEachRecord([&](std::string_view key, std::string_view, int64_t offset, int64_t) {
+                    if (segEnd == marker && offset >= from && !txn.keys.insert(key)) segEnd = offset;
+                });
+                continue;
+            }
+            if (isAbortedBatch(skip, r, attrs)) continue;
+            if ((attrs & b::kAttrTransactional) != 0) {
+                const TxnSpan* open = txn.fence.find(r.producerId());
+                if (open != nullptr && open->first <= r.baseOffset()) continue;   // applied at its own marker, above this one
+            }
+            r.forEachRecord([&](std::string_view key, std::string_view, int64_t offset, int64_t) {
+                if (offset >= from && offset < marker && !isRejectedRecord(skip, offset)) txn.keys.noteOther(key, offset);
+            });
+        }
+        if (at == start) break;
+    }
+    return segEnd;
+}
+
+// Applies the span of `pid` (open in the fence) at its marker: its batches in [first, marker), resuming above applyingThrough, a
+// segment of noted keys at a time, a record another writer superseded skipped.  At most `left` records and kTxnReadBackBytesPerPass
+// bytes; false when either ran out first (applyingThrough says where it stopped).
 template <class OnRecord>
 bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const FoldSkip& skip, FoldStats& stats, OnRecord& onRecord,
                int64_t& applied) {
@@ -150,42 +195,58 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
     int64_t at = fence.applyingThrough >= 0 ? fence.applyingThrough + 1 : fence.find(pid)->first;
     std::size_t bytes = 0;
     while (at < marker) {
-        const rune::storage::LogReadView v = txn.reader.read(at, marker);
-        if (v.empty()) return true;   // nothing left below the marker
-        const int64_t start = at;
-        for (std::size_t pos = 0; pos < v.len;) {
-            rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
-            if (!r.ensureValid() || r.baseOffset() >= marker) return true;
-            const auto len = static_cast<std::size_t>(r.totalLength());
-            const int64_t last = r.baseOffset() + r.lastOffsetDelta();
-            pos += len;
-            if (last < at) continue;
-            bytes += len;
-            if (r.producerId() == pid && (r.attributes() & (b::kAttrControl | b::kAttrTransactional)) == b::kAttrTransactional) {
-                bool out = false;
-                r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t) {
-                    if (out || offset < at) return;
-                    if (isRejectedRecord(skip, offset)) {
-                        ++stats.skippedRejected;
-                        return;
+        const int64_t segEnd = noteSupersede(txn, pid, at, marker, skip);
+        while (at < segEnd) {
+            const rune::storage::LogReadView v = txn.reader.read(at, segEnd);
+            if (v.empty()) return true;   // nothing left below the marker
+            const int64_t start = at;
+            for (std::size_t pos = 0; pos < v.len && at < segEnd;) {
+                rune::protocol::RecordBatchReader r(v.data + pos, v.len - pos);
+                if (!r.ensureValid() || r.baseOffset() >= marker) return true;
+                const auto len = static_cast<std::size_t>(r.totalLength());
+                const int64_t last = r.baseOffset() + r.lastOffsetDelta();
+                pos += len;
+                if (last < at) continue;
+                bytes += len;
+                if (r.producerId() == pid && (r.attributes() & (b::kAttrControl | b::kAttrTransactional)) == b::kAttrTransactional) {
+                    enum class Out : uint8_t { No, Segment, Budget } out = Out::No;
+                    r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t) {
+                        if (out != Out::No || offset < at) return;
+                        if (offset >= segEnd) {
+                            out = Out::Segment;
+                            return;
+                        }
+                        if (applied == left) {
+                            out = Out::Budget;
+                            fence.applyingThrough = offset - 1;
+                            return;
+                        }
+                        if (isRejectedRecord(skip, offset)) {
+                            ++stats.skippedRejected;
+                            return;
+                        }
+                        if (txn.keys.superseded(key, offset)) {
+                            ++stats.txnSuperseded;
+                            return;
+                        }
+                        onRecord(key, value, offset);
+                        ++applied;
+                    });
+                    if (out == Out::Budget) return false;
+                    if (out == Out::Segment) {   // the segment ends inside this batch
+                        at = segEnd;
+                        break;
                     }
-                    if (applied == left) {
-                        out = true;
-                        fence.applyingThrough = offset - 1;
-                        return;
-                    }
-                    onRecord(key, value, offset);
-                    ++applied;
-                });
-                if (out) return false;
+                }
+                at = last + 1;
+                if (at < marker && bytes >= kTxnReadBackBytesPerPass) {
+                    fence.applyingThrough = std::min(at, segEnd) - 1;
+                    return false;
+                }
             }
-            at = last + 1;
-            if (at < marker && bytes >= kTxnReadBackBytesPerPass) {
-                fence.applyingThrough = at - 1;
-                return false;
-            }
+            if (at == start) return true;
         }
-        if (at == start) return true;
+        at = std::max(at, segEnd);
     }
     return true;
 }

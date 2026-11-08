@@ -181,6 +181,7 @@ struct Folder {
     rune::view::VersionDescriptorCache vdc{src};
     std::unique_ptr<rune::view::ViewTable> view, contributors, groups;
     TxnSpanFence fence;
+    rune::view::SupersedeKeys keys;
     int64_t cursor = 0;
 
     explicit Folder(bool aggregateView, bool fenced = true) : aggregate(aggregateView), withFence(fenced) {
@@ -210,7 +211,7 @@ struct Folder {
         const rune::storage::LogReadView lv = log.read(cursor, passBound);
         if (lv.empty()) return {};
         auto rd = [&log](int64_t f, int64_t t) { return log.read(f, t); };
-        rune::view::TxnFold tf{fence, rune::view::spanReaderOf(rd), cap};
+        rune::view::TxnFold tf{fence, keys, rune::view::spanReaderOf(rd), cap};
         rune::view::TxnFold* txn = withFence ? &tf : nullptr;
         if (aggregate)
             return rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, *agg, vdc, *view, *contributors, *groups, lv, passBound, cursor, skip, txn);
@@ -381,6 +382,94 @@ TEST(CheckedWritesTxnVisibility, MarkerOverTheBudgetWaitsForTheNextPassUnfenced)
     f.pass(log, log.end, 2);
     EXPECT_TRUE(f.has(1));
     EXPECT_EQ(f.cursor, log.end);
+}
+
+// D1 (P11-3a on every fold path): T writes key 2 at 0, a plain record writes it at 1, T commits at 2.  The plain record was applied
+// before the marker, so T's record is superseded: the row is the plain one, and the aggregate counts only it.  That is also what the
+// log keeps once the cleaner drops T's record.
+TEST(CheckedWritesTxnVisibility, RecordAppliedBeforeTheMarkerSupersedesTheTransactions) {
+    TxnLog log;
+    log.data({{2, 1, 10}, {4, 1, 40}}, 7);
+    log.data({{2, 1, 20}});
+    log.marker(7, true);
+    Folder p(false), a(true);
+    const rune::view::FoldStats st = p.pass(log, log.end, 0);
+    a.pass(log, log.end, 0);
+    EXPECT_EQ(st.txnSuperseded, 1u);
+    EXPECT_EQ(p.slot(2, 1), 20) << "the plain record supersedes T's on key 2";
+    EXPECT_EQ(p.slot(4, 1), 40) << "T's record on a key nobody else wrote applies";
+    EXPECT_EQ(a.slot(1, 1), 2) << "count(*): the plain record and T's key-4 record";
+    EXPECT_EQ(a.slot(1, 2), 40);
+}
+
+// Only a write applied before the marker supersedes: a transaction that commits before T's marker does, one still open at it (it
+// applies after T), an aborted one and a record above T's never do.
+TEST(CheckedWritesTxnVisibility, OnlyAWriteAppliedBeforeTheMarkerSupersedes) {
+    {
+        TxnLog log;   // T8 commits below M7: superseded
+        log.data({{2, 1, 10}}, 7);
+        log.data({{2, 1, 20}}, 8);
+        log.marker(8, true);
+        log.marker(7, true);
+        Folder p(false);
+        p.pass(log, log.end, 0);
+        EXPECT_EQ(p.slot(2, 1), 20);
+    }
+    {
+        TxnLog log;   // T8 still open at M7: T7 applies, then T8 at its marker
+        log.data({{2, 1, 10}}, 7);
+        log.data({{2, 1, 20}}, 8);
+        log.marker(7, true);
+        const int64_t m8 = log.marker(8, true);
+        Folder a(true);
+        a.pass(log, m8, 0);
+        EXPECT_EQ(a.slot(1, 1), 1);
+        EXPECT_EQ(a.slot(1, 2), 10) << "T7 applied, not superseded";
+        a.pass(log, log.end, 0);
+        EXPECT_EQ(a.slot(1, 1), 1) << "T8 replaces key 2's contribution";
+        EXPECT_EQ(a.slot(1, 2), 20);
+    }
+    {
+        TxnLog log;   // T8 aborted (the partition's aborted index, as every fold path is handed): never supersedes
+        log.data({{2, 1, 10}}, 7);
+        const int64_t t8 = log.data({{2, 1, 20}}, 8);
+        const int64_t a8 = log.marker(8, false);
+        log.marker(7, true);
+        rune::transaction::AbortedTxnIndex idx;
+        idx.onAbortMarker(8, t8, a8);
+        const rune::view::FoldSkip skip{.aborted = {&idx}};
+        Folder p(false);
+        p.pass(log, log.end, 0, skip);
+        EXPECT_EQ(p.slot(2, 1), 10);
+    }
+    {
+        TxnLog log;   // the plain record lies below T's: T's is the later write
+        log.data({{2, 1, 20}});
+        log.data({{2, 1, 10}}, 7);
+        log.marker(7, true);
+        Folder p(false);
+        p.pass(log, log.end, 0);
+        EXPECT_EQ(p.slot(2, 1), 10);
+    }
+}
+
+// A transaction with more keys than one segment notes applies in segments, each superseded by the writes above it; with a pass cap
+// of 3 the result equals the uncapped fold.
+TEST(CheckedWritesTxnVisibility, SegmentsOfManyKeysSupersedeLikeOne) {
+    TxnLog log;
+    std::vector<Rec> t;
+    for (int64_t k = 0; k < int64_t(rune::view::SupersedeKeys::kMaxKeys) + 40; ++k) t.push_back({k, k % 3, k});
+    log.data(t, 7);
+    log.data({{5, 0, 1000}, {int64_t(rune::view::SupersedeKeys::kMaxKeys) + 7, 1, 2000}});
+    log.marker(7, true);
+    Folder whole(false), capped(false);
+    const rune::view::FoldStats st = whole.pass(log, log.end, 0);
+    EXPECT_EQ(st.txnSuperseded, 2u) << "one superseded key in each segment";
+    EXPECT_EQ(whole.slot(5, 1), 1000);
+    EXPECT_EQ(whole.slot(int64_t(rune::view::SupersedeKeys::kMaxKeys) + 7, 1), 2000);
+    for (int i = 0; i < 2000 && capped.cursor < log.end; ++i) capped.pass(log, log.end, 3);
+    EXPECT_EQ(capped.cursor, log.end);
+    EXPECT_TRUE(capped.sameRows(whole, int64_t(rune::view::SupersedeKeys::kMaxKeys) + 40));
 }
 
 } // namespace
