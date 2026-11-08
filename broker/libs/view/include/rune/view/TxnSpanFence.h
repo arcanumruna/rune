@@ -4,7 +4,7 @@
 // A fold that meets a transactional batch records {pid, first} and skips it; at the pid's commit marker it reads the pid's
 // batches back from [first, M) and applies them, at its abort marker it drops them.  Everything below the fold cursor is
 // therefore applied or held in an open span, and a checkpoint at O is valid only while no span straddles O.
-// Worker-owned, no allocation: 64 fixed slots, a full table makes the fold wait (never skip).
+// Worker-owned, no allocation: 64 fixed slots; a transaction that finds the table full applies at its own offsets (FoldWalk.h).
 #pragma once
 #include <array>
 #include <cstdint>
@@ -26,7 +26,7 @@ struct TxnSpanFence {
     // An atomic batch the pass cap cut ends here: its records at or below the cursor are applied, the rest are not yet.
     int64_t atomicThrough = -1;
 
-    /// False when every slot is taken: the fold waits at the batch until a span closes.
+    /// False when every slot is taken.
     [[nodiscard]] bool add(int64_t pid, int64_t first) noexcept {
         if (count == kSlots) return false;
         open[count++] = TxnSpan{pid, first};

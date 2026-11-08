@@ -1540,6 +1540,7 @@ void WorkerViewSet::beginDiscard_(ViewInstance& inst, ViewDiscardReason reason) 
     if (inst.agg) inst.agg.emplace(rune::view::buildAggLayout(inst.plan, inst.evolvingSrc).value(), indexSlots, chunkBytes, inst.tableKeys);
     if (inst.keyed) buildKeyedTables(inst, indexSlots, chunkBytes);
     inst.foldCursor = 0;
+    inst.spanFence.clear();
     inst.lastEncodedO = -1;
     inst.lastDurableO = -1;
     inst.transientCursor = CursorFresh{};

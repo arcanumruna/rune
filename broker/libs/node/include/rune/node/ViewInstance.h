@@ -135,6 +135,7 @@ struct ViewFoldCounters {
     uint64_t uniquePromotions        = 0;   // unique view: an extra claimant became the owner of a key
     uint64_t scanRows                = 0;   // rows served by scanPage
     uint64_t scanPages               = 0;   // pages served by scanPage
+    uint64_t txnSpanTableFull        = 0;   // P11-9: a transactional batch found the span fence full and applied at its offsets
 };
 
 // Where the persisted checkpoint of an instance stands in a discard (one explicit state, each holding only what it needs):
@@ -269,6 +270,9 @@ struct ViewInstance {
     // The held delta outgrew one ring message (a verdict member whose judge ran ahead of an ordinary transaction's marker): it is
     // never pushed, so checkpoints stop and a restart refolds from the last one.
     bool                               deltaOversized  = false;
+    // P11-0 / P11-9 (contract addition 13): the transactions this instance's fold met and has not applied yet, and whether an
+    // application is in progress (reads held).  Consistent with foldCursor: every reset of the cursor clears it.
+    rune::view::TxnSpanFence           spanFence;
     // Part 04 (P4-4) / view backups: where this instance's checkpoint file stands in a discard (see CheckpointState).  Anything but
     // CheckpointLive means the instance folds nothing, checkpoints nothing and serves NotReady.
     CheckpointState                    checkpoint{CheckpointLive{}};
@@ -338,6 +342,7 @@ struct SourceLogBounds {
     if (!viewTablesEmpty(i)) return false;
     i.counters.sourceRecordsTrimmed += static_cast<uint64_t>(logStart - i.foldCursor);
     i.foldCursor   = logStart;
+    i.spanFence.clear();   // every open span started below the old cursor: its records are gone
     i.lastEncodedO = logStart - 1;
     return true;
 }

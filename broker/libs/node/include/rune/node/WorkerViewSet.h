@@ -411,6 +411,9 @@ public:
         const auto it = views_.find(instKey(viewTopicId, partition));
         return it == views_.end() ? -1 : it->second.maxRecordsPerPass;
     }
+    void setMaxRecordsPerPassForTest(int32_t viewTopicId, int32_t partition, int64_t n) {
+        if (const auto it = views_.find(instKey(viewTopicId, partition)); it != views_.end()) it->second.maxRecordsPerPass = n;
+    }
     [[nodiscard]] bool keyIndexContainsForTest(int32_t src, int32_t partition, std::string_view wireKey) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
         return it != keyIndexes_.end() && it->second.table.get(rune::view::ViewKey::fromBytes({reinterpret_cast<const uint8_t*>(wireKey.data()), wireKey.size()})) != nullptr;
@@ -487,13 +490,19 @@ public:
     /// The serve path's view of one hosted instance (one lookup): the leadership it is caught up under and how far it
     /// folded (issue #82, the read-your-writes barrier).  nullptr leadership = not hosted.
     struct InstanceServeState { uint64_t leadership = 0; int64_t foldCursor = 0; bool hosted = false; bool ready = false;
-                                bool paused = false; int64_t pausedOffset = 0; };
+                                bool paused = false; int64_t pausedOffset = 0; bool fenced = false; };
     [[nodiscard]] InstanceServeState instanceServeState(int32_t viewTopicId, int32_t partition) const noexcept {
         const auto it = views_.find(instKey(viewTopicId, partition));
         if (it == views_.end()) return {};
         const ViewPaused* pz = std::get_if<ViewPaused>(&it->second.pause);
         return InstanceServeState{it->second.foldLeadership, it->second.foldCursor, true,
-                                  it->second.readiness == ViewReadiness::Ready, pz != nullptr, pz ? pz->offset : 0};
+                                  it->second.readiness == ViewReadiness::Ready, pz != nullptr, pz ? pz->offset : 0,
+                                  it->second.spanFence.fenced()};
+    }
+    /// P11-9 (contract addition 13): a transaction's or an atomic batch's application spans passes; its reads are held meanwhile.
+    [[nodiscard]] bool readFenced(int32_t viewTopicId, int32_t partition) const noexcept {
+        const auto it = views_.find(instKey(viewTopicId, partition));
+        return it != views_.end() && it->second.spanFence.fenced();
     }
 
     /// The (view, partition) instance's fold cursor, -1 when it is not hosted.  Tests only.
@@ -908,19 +917,24 @@ private:
         if (view.empty()) return work;
 
         int64_t cursor = inst.foldCursor;
+        // P11-0: a transaction applies at its commit marker, read back through readRange, within the pass cap.  A transient
+        // source keeps offset order (D6): its ring may have evicted a span's first batch and its read ignores the end.
+        rune::view::TxnFold txnFold{inst.spanFence, rune::view::spanReaderOf(readRange), inst.maxRecordsPerPass};
+        rune::view::TxnFold* const txn = transientSrc == nullptr ? &txnFold : nullptr;
         const rune::view::FoldStats st =
-            inst.keyed ? foldKeyed_(inst, view, passBound, cursor, skip)
+            inst.keyed ? foldKeyed_(inst, view, passBound, cursor, skip, txn)
           : inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout,
                                                       inst.vdc, inst.table, inst.agg->contributors,
                                                       inst.agg->groups, inst.agg->blocksOrNull(), view,
-                                                      passBound, cursor, skip)
+                                                      passBound, cursor, skip, txn)
                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view,
-                                             passBound, cursor, skip);
+                                             passBound, cursor, skip, txn);
         work += cursor != inst.foldCursor;   // a pass across a compacted gap folds nothing but moves the cursor
         inst.foldCursor = cursor;
         chargeMem_(inst);   // Task 12: the pass may have appended chunks
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted +
-                                 st.skippedMalformed + st.skippedNoGroup + st.skippedNoKey + st.keyConflicts);
+                                 st.skippedMalformed + st.skippedNoGroup + st.skippedNoKey + st.keyConflicts) +
+                (inst.spanFence.fenced() ? 1 : 0);   // an application in progress keeps the worker hot
         inst.counters.skippedAborted   += st.skippedAborted;
         inst.counters.skippedMalformed += st.skippedMalformed;
         inst.counters.skippedNoGroup   += st.skippedNoGroup;
@@ -932,6 +946,7 @@ private:
         inst.counters.keyConflicts     += st.keyConflicts;
         inst.counters.ownerMoves       += st.ownerMoves;
         inst.counters.uniquePromotions += st.uniquePromotions;
+        inst.counters.txnSpanTableFull += st.txnSpanTableFull;
         if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
 
         // Bug A: this pass's OWN fold may be what just caught the instance up
@@ -970,13 +985,13 @@ private:
 
     /// Folds [cursor, bound) of a keyed instance.
     static rune::view::FoldStats foldKeyed_(ViewInstance& inst, const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
-                                            const rune::view::FoldSkip& skip) {
+                                            const rune::view::FoldSkip& skip, rune::view::TxnFold* txn) {
         if (inst.agg) {
             rune::view::AggregateFold f = aggregateFoldOf(inst);
-            return rune::view::foldKeyedAggregateBatch(f, inst.prospect, view, bound, cursor, skip);
+            return rune::view::foldKeyedAggregateBatch(f, inst.prospect, view, bound, cursor, skip, txn);
         }
         rune::view::ProjectionFold f = projectionFoldOf(inst);
-        return rune::view::foldProjectionBatch(f, inst.prospect, view, bound, cursor, skip);
+        return rune::view::foldProjectionBatch(f, inst.prospect, view, bound, cursor, skip, txn);
     }
 
     // Clear the dirty/deleted tracking of every table of an instance: every
