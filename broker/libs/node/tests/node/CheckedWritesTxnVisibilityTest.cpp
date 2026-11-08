@@ -4,6 +4,8 @@
 #include "CheckedWritesRig.h"
 
 #include <array>
+#include <filesystem>
+#include <random>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -338,3 +340,181 @@ TEST(CheckedWritesTxnVisibilityRegression, CheckpointNeverInsideAnOpenSpanRegres
         EXPECT_EQ(c.image(), want) << "crash after pass " << k;
     }
 }
+
+namespace {
+// R11b: a source {id, g, v} under count(*), last(v), lastNonNull(v) by g, once as a verdict member with check (lv >= 0) and once
+// as an ordinary view; each again as a copy installed after the writes.
+constexpr const char* kR11Topic = "topic r11 { id uint64, g uint64, v int64 } partitions 1 key id;";
+constexpr int32_t kChk = 0x40000701, kOrd = 0x40000702, kChkCopy = 0x40000703, kOrdCopy = 0x40000704;
+
+rune::view::CompileResult r11View(int32_t viewTopicId, bool checked) {
+    const std::string stmt = std::string("create view r11v key g as select count(*) as n, last(v) as lv, last(v) as lnn from r11 group by g") +
+                             (checked ? " constraint nonneg check (lv >= 0);" : ";");
+    const rune::ql::TopicDef topic = VerdictRig::parseTopic(kR11Topic);
+    auto parsed = rune::ql::parse(stmt);
+    EXPECT_TRUE(parsed.has_value());
+    auto authored = rune::ql::applyViewPlan(std::get<rune::ql::CreateViewDef>(*parsed), rune::ql::viewSourceOf(topic));
+    EXPECT_TRUE(authored.has_value());
+    authored->sources[0].topicId = VerdictRig::kSrc;
+    for (auto& f : authored->output)
+        if (f.name == "lnn") f.rule = rune::view::MergeRule::LastNonNull;   // QL has no lastNonNull: the plan says it
+    const rune::codec::Descriptor src = rune::ql::toDescriptor(topic);
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto compiled = rune::view::compileView(*authored, srcs, viewTopicId);
+    EXPECT_TRUE(compiled.has_value());
+    compiled->plan.sizing.chunkBytes = 1u << 16;
+    return std::move(*compiled);
+}
+
+struct R11Rec { uint64_t id; uint64_t g; std::optional<int64_t> v; };
+
+/// A batch of {id, g, v} records; a null v is a value block that ends before v.
+std::vector<uint8_t> r11Batch(const std::vector<R11Rec>& recs, int64_t pid, int32_t seq, bool txn) {
+    static const rune::codec::Descriptor d = rune::ql::toDescriptor(VerdictRig::parseTopic(kR11Topic));
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+    b.setTransactional(txn);
+    const auto put = [&](std::vector<uint8_t>& val, const char* field, uint64_t x) {
+        const auto* f = d.find(field);
+        for (uint32_t i = 0; i < rune::codec::fieldWidth(*f); ++i) val[4 + f->offset + i] = static_cast<uint8_t>(x >> (8 * i));
+    };
+    for (const R11Rec& r : recs) {
+        std::string key(8, '\0');
+        for (int i = 0; i < 8; ++i) key[static_cast<std::size_t>(i)] = static_cast<char>(r.id >> (8 * i));
+        const uint16_t block = r.v ? d.blockLength : d.find("v")->offset;
+        std::vector<uint8_t> val(4 + block, 0);
+        val[0] = static_cast<uint8_t>(block); val[1] = static_cast<uint8_t>(block >> 8);
+        val[2] = static_cast<uint8_t>(d.version); val[3] = static_cast<uint8_t>(d.version >> 8);
+        put(val, "id", r.id);
+        put(val, "g", r.g);
+        if (r.v) put(val, "v", static_cast<uint64_t>(*r.v));
+        b.append(key, {reinterpret_cast<const char*>(val.data()), val.size()}, 1000, 0);
+    }
+    return b.build();
+}
+
+/// What D5 compares: each view's rows by group (logical, no row or group ids) and the source's rejected verdicts.
+struct R11Image {
+    std::vector<std::vector<uint8_t>> rows;
+    std::vector<std::tuple<int64_t, uint16_t, uint32_t>> rejected;
+    bool operator==(const R11Image&) const = default;
+    friend void PrintTo(const R11Image& im, std::ostream* os) {
+        for (const auto& row : im.rows) {
+            *os << "\n  row";
+            for (const uint8_t b : row) *os << ' ' << int(b);
+        }
+        for (const auto& [o, code, cid] : im.rejected) *os << "\n  rejected " << o << " code " << code << " constraint " << cid;
+    }
+};
+
+struct R11 {
+    VerdictRig r;
+    int64_t writesEnd = 0;
+    explicit R11(uint32_t seed) {
+        r.createQlTopic(kR11Topic, false);
+        r.setViewPassCap(2);
+        r.installCompiledView(r11View(kChk, true), 0x5701, /*persisted=*/true);
+        r.installCompiledView(r11View(kOrd, false), 0x5702, /*persisted=*/true);
+        r.passes(20);
+        write(seed);
+    }
+    /// 3 producers' transactions (1-8 records, commit or abort) interleaved with plain writes on the same 6 keys and 3 groups.
+    void write(uint32_t seed) {
+        std::mt19937 rng(seed);
+        const auto pick = [&](uint32_t n) { return static_cast<uint32_t>(rng() % n); };
+        const auto rec = [&] { return R11Rec{1 + pick(6), 1 + pick(3), pick(6) == 0 ? std::nullopt : std::optional<int64_t>(int64_t(pick(8)) - 1)}; };
+        std::array<int, 3> open{};   // records written in each producer's open transaction
+        std::array<int32_t, 3> seq{};
+        for (int step = 0; step < 14; ++step) {
+            const uint32_t p = pick(3), what = pick(4);
+            const int64_t pid = 41 + p;
+            if (what == 0) {
+                std::vector<R11Rec> recs{rec()};
+                if (pick(2) == 0) recs.push_back(rec());
+                // The produce path refuses a value block cut before v: a previous leader wrote it (an older schema version).
+                if (std::all_of(recs.begin(), recs.end(), [](const R11Rec& x) { return x.v.has_value(); })) ASSERT_EQ(r.produceBatch(r11Batch(recs, -1, -1, false)), 0);
+                else (void)r.appendTxnReplicated(r11Batch(recs, -1, -1, false));
+            } else if (what == 3 && open[p] > 0) {
+                r.marker(pid, pick(3) != 0);
+                open[p] = 0;
+            } else if (open[p] < 8) {
+                std::vector<R11Rec> recs{rec()};
+                if (open[p] < 7 && pick(2) == 0) recs.push_back(rec());
+                (void)r.appendTxnReplicated(r11Batch(recs, pid, seq[p], true));
+                seq[p] += static_cast<int32_t>(recs.size());
+                open[p] += static_cast<int>(recs.size());
+            }
+        }
+        for (uint32_t p = 0; p < 3; ++p)
+            if (open[p] > 0) r.marker(41 + p, pick(3) != 0);
+        // A judged record last, in its own group: a stretch with nothing judged (an aborted transaction) gets its marker with it.
+        ASSERT_EQ(r.produceBatch(r11Batch({{99, 4, 0}}, -1, -1, false)), 0);
+        writesEnd = r.leo();
+    }
+    /// Every record judged (and, live, its markers committed: a later change record is marked only with the next record), and
+    /// every instance of `views` folded past the writes' last marker and not fenced.
+    void settle(std::initializer_list<int32_t> views, bool live = false) {
+        ASSERT_TRUE(live ? r.driveUntilJudged() : r.driveUntilJudgeReaches());
+        const auto done = [&] {
+            for (const int32_t v : views)
+                if (const ViewInstance* inst = r.vs->instanceForTest(v, 0); inst == nullptr || inst->foldCursor < writesEnd || inst->spanFence.fenced()) return false;
+            return true;
+        };
+        for (int i = 0; i < 2000 && !done(); ++i) r.pass();
+        ASSERT_TRUE(done());
+    }
+    [[nodiscard]] R11Image image(int32_t chk, int32_t ord) const {
+        R11Image out;
+        for (const int32_t v : {chk, ord}) {
+            const ViewInstance* inst = r.vs->instanceForTest(v, 0);
+            out.rows.push_back({static_cast<uint8_t>(inst->table.size())});
+            for (uint64_t g = 1; g <= 3; ++g) {
+                const uint8_t* row = inst->table.get(g);
+                out.rows.push_back(row == nullptr ? std::vector<uint8_t>{} : std::vector<uint8_t>(row, row + inst->table.rowLen()));
+            }
+        }
+        const auto& rej = r.writeState()->rejected;
+        for (int64_t o = rej.nextRejectedAtOrAfter(0); o != INT64_MAX; o = rej.nextRejectedAtOrAfter(o + 1)) {
+            const auto* e = rej.find(o);
+            out.rejected.emplace_back(o, e->code, e->constraintId);
+        }
+        return out;
+    }
+    [[nodiscard]] uint64_t mismatches() const { return r.writeState()->rejected.mismatches(); }
+};
+}  // namespace
+
+// REGRESSION (R11b, D5): with transactions of 3 producers interleaved with plain writes on the same keys and groups, the live fold, a
+// refold from 0 after a restart without checkpoints, copies installed after the writes, and a failover's leadership scan with
+// activation replay agree on every table and every rejected verdict.  One seed per instance, 1-100.
+class CheckedWritesTxnDeterminismRegression : public ::testing::TestWithParam<uint32_t> {};
+
+TEST_P(CheckedWritesTxnDeterminismRegression, LiveEqualsRefoldEqualsRebuildUnderInterleavedTxnsRegression) {
+    R11 w(GetParam());
+    w.settle({kChk, kOrd}, /*live=*/true);
+    const R11Image live = w.image(kChk, kOrd);
+    EXPECT_EQ(w.mismatches(), 0u);
+
+    w.r.installCompiledView(r11View(kChkCopy, true), 0x5703, /*persisted=*/true);
+    w.r.installCompiledView(r11View(kOrdCopy, false), 0x5704, /*persisted=*/true);
+    w.settle({kChk, kOrd, kChkCopy, kOrdCopy});
+    EXPECT_EQ(w.image(kChkCopy, kOrdCopy), live) << "the copies installed after the writes";
+    EXPECT_EQ(w.image(kChk, kOrd), live);
+
+    w.r.agent.reset();
+    for (const int32_t v : {kChk, kOrd, kChkCopy, kOrdCopy}) std::filesystem::remove(viewCheckpointFilePath(w.r.snapDir(), v, 0));
+    w.r.agent = std::make_unique<ViewSnapshotIoAgent>(w.r.channel, w.r.snapDir(), /*fsyncMs=*/0, w.r.backupPolicy);
+    w.r.restart();
+    w.settle({kChk, kOrd, kChkCopy, kOrdCopy});
+    EXPECT_EQ(w.image(kChk, kOrd), live) << "the refold from 0";
+    EXPECT_EQ(w.image(kChkCopy, kOrdCopy), live) << "the copies' refold from 0";
+    EXPECT_EQ(w.mismatches(), 0u);
+
+    w.r.failover();
+    w.settle({kChk, kOrd, kChkCopy, kOrdCopy});
+    EXPECT_EQ(w.image(kChk, kOrd), live) << "the failover";
+    EXPECT_EQ(w.image(kChkCopy, kOrdCopy), live) << "the copies after the failover";
+    EXPECT_EQ(w.mismatches(), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(Seeds, CheckedWritesTxnDeterminismRegression, ::testing::Range(1u, 101u));
