@@ -781,3 +781,29 @@ TEST(CheckedWritesAllocRegression, LongWindowAfterSteadyChurnIsGivenBackRegressi
     window(10);   // the long span's window, pushed; then the view goes quiet
     EXPECT_LE(t.dirtyBytes(), steady) << "no standing charge past the steady window's";
 }
+
+// Review 7 m-3: an empty drain (a member's quiet judge pass, a pass of only control records) counted as a window of 0, so the next
+// real window was more than twice it and was given back at its push: an allocation per window again.
+TEST(CheckedWritesAllocRegression, EmptyDrainsBetweenWindowsAllocateNothingRegression) {
+    const rune::view::RowLayout layout = rune::view::buildRowLayout(
+        rune::codec::DescriptorBuilder("v", 1).add("id", rune::codec::PrimType::Int64, 1, true).add("hp", rune::codec::PrimType::Int32).build());
+    rune::view::ViewTable t(layout, 64, layout.rowLen * 256);
+    for (uint64_t k = 0; k < 2000; ++k) (void)t.put(k);
+    const auto window = [&] {
+        for (uint64_t k = 0; k < 2000; ++k) (void)t.erase(k);
+        for (uint64_t k = 0; k < 2000; ++k) (void)t.put(k);
+        t.drainDirtyKeyed([](auto&&...) {});
+        t.trimDirty();
+        t.drainDirtyKeyed([](auto&&...) {});   // an empty drain, then its trim
+        t.trimDirty();
+    };
+    for (int w = 0; w < 4; ++w) window();   // warm-up
+    uint64_t allocs = 0;
+    {
+        rune::testing::AllocWindow aw;
+        for (int w = 0; w < 20; ++w) window();
+        allocs = aw.count();
+    }
+    EXPECT_EQ(allocs, 0u) << "an empty drain is not a window";
+    EXPECT_GT(t.dirtyBytes(), 0u);
+}

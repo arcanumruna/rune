@@ -567,8 +567,10 @@ private:
     std::vector<DeletedEntry> deleted_; // erase()'d {rid,key} pairs pending drainDirty()
     std::vector<uint8_t> deletedKeyBytes_; // wide tables: keyWidth_ bytes per deleted_ entry, in the same order
     void noteWindow_() noexcept {
+        const size_t w = dirtyList_.size() * sizeof(uint32_t) + deleted_.size() * sizeof(DeletedEntry) + deletedKeyBytes_.size();
+        if (w == 0) return;   // an empty drain is not a window: trimDirty judges the last real one
         lastWindow_ = window_;
-        window_ = dirtyList_.size() * sizeof(uint32_t) + deleted_.size() * sizeof(DeletedEntry) + deletedKeyBytes_.size();
+        window_ = w;
     }
     void giveBackDirty_() {
         std::vector<uint32_t>().swap(dirtyList_);
