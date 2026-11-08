@@ -330,7 +330,7 @@ public:
                 // P11-2: the judge reads to the HW (`judgeBound`, -1 = `bound`); the other views still fold below the LSO and K.
                 work += judge->driveJudge(readRange, judgeBound < 0 ? bound : judgeBound, nowNs, *write, skip.aborted, bound);
                 viewBound = std::min(bound, judge->judgedThrough());
-                work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns);
+                work += flipVerdictMembers_(srcTopicId, partition, bound, nowNs, leaderGen, leaderHwConfirmed, ns);
             } else {
                 viewBound = std::min(bound, write->verdictKnownThrough());
             }
@@ -758,7 +758,7 @@ private:
     /// position the logged set was computed at, or while a drained plan install or uninstall has no mark yet.  The request must then be left unasked; one that goes ahead stamps `catalogThrough_`.
     [[nodiscard]] bool catalogBehind_(int32_t srcTopicId, VerdictSource& judge, const PartitionWriteState& write);
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
-    int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
+    int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, int64_t nowNs, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
     void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
     // Inline: Worker.h's rebuildRcSlots_ reaches it, and that header is built into libraries that do not link rune_node.
     void eraseKeyIndex_(uint64_t key) {

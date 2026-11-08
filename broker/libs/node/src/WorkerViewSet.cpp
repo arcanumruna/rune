@@ -1486,7 +1486,7 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
     return work;
 }
 
-int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {
+int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, int64_t nowNs, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {
     if (const auto kit = keyIndexes_.find(instKey(srcTopicId, partition)); kit != keyIndexes_.end()) {
         adoptNs_(kit->second, ns);
         chargeMem_(kit->second);
@@ -1499,6 +1499,7 @@ int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, in
         if (vit == views_.end()) continue;
         ViewInstance& inst = vit->second;
         adoptNs_(inst, ns);
+        if (inst.foldCursor >= bound) quietPass_(inst, nowNs);   // a member's caught-up pass is the judge's (driveView_ step 2)
         chargeMem_(inst);
         if (inst.foldLeadership != leaderGen) {
             inst.foldLeadership = leaderGen;
