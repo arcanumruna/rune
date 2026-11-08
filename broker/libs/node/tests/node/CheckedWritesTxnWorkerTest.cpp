@@ -605,6 +605,70 @@ TEST(CheckedWritesTxnWorkerRegression, UnjudgedStretchPastTheCapNeverHoldsTheJud
     EXPECT_FALSE(r.hasRow(kRej, 3));
 }
 
+// REGRESSION (found by R11b; design 3.1): the judge applies an ordinary transaction T at its marker M while a later one B, opened
+// inside T's span, still waits for its own: the markers' coverage stops at B's first record, inside (first, M].  A failover then
+// restarted the judge there, below M but above every record of T, so T's marker matched nothing and T was lost from the rebuilt
+// member.  The coverage never lies inside an applied ordinary span: a hold inside one counts from the span's first record.
+TEST(CheckedWritesTxnWorkerRegression, CoverageNeverInsideAnAppliedOrdinaryTxnRegression) {
+    VerdictRig r;
+    r.createKeyIndex();
+    r.setViewPassCap(3);
+    TestRejectRule rule;
+    rule.mode = TestRejectRule::Mode::TagEquals;
+    rule.tag = 9;
+    r.installRejectView(kRej, kRejObj, rule, "rej", /*persisted=*/true);
+    r.passes(50);
+    ASSERT_EQ(r.produceBatch(VerdictRig::batch({ups(1)})), 0);
+    ASSERT_TRUE(r.driveUntilJudged());
+    // Written by a previous leader, so the judge meets them all at once: T [first, M], B opened inside it, then B's marker far past M.
+    namespace tx = rune::transaction;
+    const int64_t first = r.leo();
+    std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ups(2), ups(3)}, kRaPid, 0, {}, /*txn=*/true),
+                                              VerdictRig::batch({ups(4)}, kRaPid + 1, 0, {}, /*txn=*/true),
+                                              tx::ControlMarker::build(kRaPid, 0, tx::ControlType::Commit, 0)};
+    for (uint64_t k = 10; k < 30; ++k) batches.push_back(VerdictRig::batch({ups(k)}));
+    batches.push_back(tx::ControlMarker::build(kRaPid + 1, 0, tx::ControlType::Commit, 0));
+    r.demote();
+    r.replicate(std::move(batches));
+    r.promoteWithoutPass();
+    const int64_t marker = first + 3, bMarker = marker + 21;
+    const ViewInstance* member = r.vs->instanceForTest(kRej, 0);
+    for (int i = 0; i < 200 && member->foldCursor <= marker; ++i) r.pass();
+    ASSERT_GT(member->foldCursor, marker) << "T is applied at its marker";
+    ASSERT_LE(member->foldCursor, bMarker) << "while B still waits for its own";
+    const int64_t covered = r.vs->verdictSource(VerdictRig::kSrc, 0)->judgedThrough();
+    EXPECT_TRUE(covered <= first || covered > marker) << "the coverage " << covered << " is not inside T's span";
+    r.demotePromote();
+    EXPECT_TRUE(r.driveUntilJudged());
+    EXPECT_TRUE(r.hasRow(kRej, 2)) << "the member rebuilt after the failover holds T";
+    EXPECT_TRUE(r.hasRow(kRej, 3));
+    EXPECT_TRUE(r.hasRow(kRej, 4));
+    EXPECT_TRUE(r.hasRow(kRej, 29));
+}
+
+// REGRESSION (design 3.1): as above with the later transaction D voted: its TxnJudge defers it, so the judge passes D and applies T
+// at M while D holds the coverage at its first record, inside T's span.
+TEST(CheckedWritesTxnWorkerRegression, CoverageNeverInsideAnAppliedOrdinaryTxnUnderAVotedTxnRegression) {
+    Ki k;
+    const int64_t first = k.r.leo();
+    k.r.demote();
+    k.r.replicate({VerdictRig::batch({ups(2), ups(3)}, kRaPid, 0, {}, /*txn=*/true), VerdictRig::batch({ins(4)}, kRaPid + 1, 0, {}, /*txn=*/true)});
+    k.r.promote();
+    const int64_t tok = k.r.sendVote(VerdictRig::kSrc, kRaPid + 1, 0);
+    k.r.marker(kRaPid, true);
+    ASSERT_TRUE(k.r.driveUntilVoted(tok));
+    ASSERT_EQ(k.r.voteReply(tok)->code, 0);
+    for (int i = 0; i < 200 && !k.r.keyIndexKeys().contains(2); ++i) k.r.pass();
+    ASSERT_TRUE(k.r.keyIndexKeys().contains(2)) << "T is applied at its marker";
+    ASSERT_FALSE(k.r.keyIndexKeys().contains(4)) << "while D waits for its own";
+    const int64_t covered = k.r.vs->verdictSource(VerdictRig::kSrc, 0)->judgedThrough();
+    EXPECT_LE(covered, first) << "the coverage is not inside T's span";
+    k.r.demotePromote();
+    k.r.marker(kRaPid + 1, true);
+    EXPECT_TRUE(k.r.driveUntilJudged());
+    EXPECT_EQ(k.r.keyIndexKeys(), (std::set<uint64_t>{2, 3, 4})) << "the member rebuilt after the failover holds T";
+}
+
 // REGRESSION (Task 8 step 6, design 3.1, the activation invariant): an ordinary transaction (no vote, so no J to backfill from)
 // holds every member checkpoint at or below its first record until its marker.  (Its traffic stays within one delta frame; more is
 // step 7's multi-frame delta.)  So a recovered K

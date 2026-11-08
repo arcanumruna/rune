@@ -259,7 +259,7 @@ public:
     [[nodiscard]] int64_t judgedThrough() const noexcept {
         int64_t through = judgeCursor_;
         if (state_ != nullptr) through = std::min(through, state_->txn.earliestUndecidedFirst());
-        for (const OrdinaryTxn& o : ordinary_) through = std::min(through, o.first);
+        for (const OrdinaryTxn& o : ordinary_) through = std::min({through, o.first, o.holdFrom});
         return through;
     }
     /// P11-8 (c): the lowest checkpoint a persisted member restarts from; a replay from it backfills from the TxnJudges at or above it.
@@ -386,7 +386,7 @@ private:
     // Part 11 (P11-2): a transaction without a committed TxnJudge or marker stops the judge at its first record (TxnStop::Probe) until a
     // look-ahead finds one; an ordinary transaction stops it at its marker (TxnStop::Marker) to be applied there.
     // `vote`: P11-7, -1 until the judge classifies it at the marker.
-    struct OrdinaryTxn { int64_t producerId; int64_t first; int64_t marker; bool commit; int8_t vote = -1; int64_t intentFrom = -1; };
+    struct OrdinaryTxn { int64_t producerId; int64_t first; int64_t marker; bool commit; int8_t vote = -1; int64_t intentFrom = -1; int64_t holdFrom = INT64_MAX; };
     struct TxnProbe { int64_t producerId = -1, first = -1, from = -1, waitAt = -1; };
     struct OwedMarker { int64_t producerId; int64_t judgeOffset; int64_t from; };   // a re-offered TxnJudge's marker, searched from `from`
     // Judge: the judge stands at a TxnJudge to judge (judgePid_).  Locked: a record touches a row a transaction holds (P11-4).

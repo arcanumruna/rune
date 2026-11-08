@@ -674,8 +674,13 @@ void VerdictSource::notePause_(int64_t offset) noexcept {
     lockPausedNs_ = nowNs_;
 }
 
+// Design 3.1: the coverage never lies inside (first, M] of an applied span, or a restart there would meet M with none of T's records
+// ahead of it.  A hold inside the span counts from its first record.
 void VerdictSource::endOrdinary_(const OrdinaryTxn& o) noexcept {
     closeSpan_(o.producerId);
+    for (OrdinaryTxn& x : ordinary_)
+        if (const int64_t at = std::min(x.first, x.holdFrom); o.first < at && at <= o.marker) x.holdFrom = o.first;
+    state_->txn.holdBelowSpan(o.first, o.marker);
     ordinary_.erase(ordinary_.begin() + static_cast<std::ptrdiff_t>(markerAt_));
     ordinaryApplied_ = -1;
     ordinaryWalk_ = {};

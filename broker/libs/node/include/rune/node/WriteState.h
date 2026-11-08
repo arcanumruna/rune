@@ -227,6 +227,7 @@ struct DeferredTxn {
     bool        judged = false;   ///< `answer` is the judge's, not a default
     int32_t     overlay = -1;
     int64_t     voteReceivedNs = 0;
+    int64_t     holdFrom = INT64_MAX;   ///< below firstOffset: an applied ordinary span holds it (the coverage never splits that span)
 };
 /// `judgeOffset`: the J the vote waits for; -1 while the worker's vote-time scan runs (only the worker answers those).
 struct ParkedVote { int64_t token = 0; int32_t originNode = -1; int64_t producerId = -1; int16_t epoch = -1; int64_t judgeOffset = -1; int64_t receivedNs = 0; };
@@ -328,8 +329,13 @@ public:
     [[nodiscard]] int64_t earliestUndecidedFirst() const noexcept {
         int64_t first = INT64_MAX;
         for (const DeferredTxn& t : txns_)
-            if (t.phase != TxnPhase::Finalized && t.firstOffset < first) first = t.firstOffset;
+            if (t.phase != TxnPhase::Finalized) first = std::min({first, t.firstOffset, t.holdFrom});
         return first;
+    }
+    /// An ordinary transaction [first, marker] was applied: an undecided entry holding K inside (first, marker] holds it at `first`.
+    void holdBelowSpan(int64_t first, int64_t marker) noexcept {
+        for (DeferredTxn& t : txns_)
+            if (const int64_t at = std::min(t.firstOffset, t.holdFrom); t.phase != TxnPhase::Finalized && first < at && at <= marker) t.holdFrom = first;
     }
     /// onJudgeRecord would take a new record of the producer now: its entry (if any) holds no overlay and has its marker, and the
     /// table has room.  The worker appends a TxnJudge only then, so the judge never waits on a record the worker wrote.
