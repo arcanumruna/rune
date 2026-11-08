@@ -298,3 +298,30 @@ TEST(PartitionApi, ConsumeContinuesPastASegmentCompactionEmptiedRegression) {
     }
     std::filesystem::remove_all(dir);
 }
+
+// Torn bytes in an earlier segment end the read there: it must not skip to the next segment.
+TEST(PartitionApi, ConsumeStopsAtATornBatchRegression) {
+    auto dir = makeTempDir("rune_api_torn");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    const auto put = [&dir](int64_t base, const std::vector<uint8_t>& bytes) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(dir / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    const auto batch = [](int64_t base) {
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        b.append("k", "v", 1000);
+        return b.build();
+    };
+    const auto first = batch(0);
+    put(0, first);
+    put(10, batch(10));
+    {
+        PartitionApi api(dir.string());
+        ASSERT_EQ(api.highWatermark(), 11);
+        put(0, std::vector<uint8_t>(first.size(), 0xFF));
+        EXPECT_TRUE(api.consume(0).empty());
+    }
+    std::filesystem::remove_all(dir);
+}

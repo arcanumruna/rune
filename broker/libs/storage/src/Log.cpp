@@ -1954,6 +1954,16 @@ void Log::unpinSegmentFlush(LogSegment* seg) noexcept {
         }
     }
 }
+std::vector<uint8_t> Log::readPastEmptied(int64_t startOffset, int32_t maxBytes, int64_t boundOffset) {
+    std::vector<uint8_t> raw = read(startOffset, maxBytes);
+    if (!raw.empty()) return raw;
+    std::vector<uint8_t> buf(static_cast<std::size_t>(maxBytes));
+    ReadIntoStatus st;
+    const LogReadView v = readInto(startOffset, maxBytes, buf.data(), buf.size(), st, boundOffset);
+    if (st != ReadIntoStatus::Ok) return {};
+    buf.resize(v.len);
+    return buf;
+}
 int64_t Log::nextSegmentBaseAfter(int64_t offset) const noexcept {
     const auto it = segments_.upper_bound(offset);
     return it == segments_.end() ? -1 : it->first;

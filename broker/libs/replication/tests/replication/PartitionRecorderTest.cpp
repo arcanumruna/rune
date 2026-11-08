@@ -423,6 +423,33 @@ TEST_F(PartitionRecorderTest, OnCommitted_ContinuesPastASegmentCompactionEmptied
     EXPECT_EQ(recorder.getRecordingPosition(), 12);
 }
 
+// Torn bytes in an earlier segment stop the recording there: it must not skip to the next segment.
+TEST_F(PartitionRecorderTest, OnCommitted_StopsAtATornBatchRegression)
+{
+    TempDir dir("recorder_torn");
+    const auto put = [&dir](int64_t base, const std::vector<uint8_t>& bytes) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(std::filesystem::path(dir.path) / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    const auto first = makeBatch(0, 0xAA);
+    put(0, first);
+    put(10, makeBatch(10, 0xBB));
+    rune::storage::Log torn(dir.path);
+    torn.recover();
+    ASSERT_EQ(torn.logEndOffset(), 11);
+    put(0, std::vector<uint8_t>(first.size(), 0xFF));
+
+    FileRecordingStore store(storeFile.path);
+    PartitionRecorder recorder(0, &torn, &store);
+    recorder.startRecording(0);
+    recorder.onCommitted(0, 11);
+
+    EXPECT_EQ(store.batchCount(), 0);
+    EXPECT_EQ(recorder.getRecordingPosition(), 0);
+}
+
 TEST_F(PartitionRecorderTest, InitiallyNotRecording)
 {
     FileRecordingStore store(storeFile.path);

@@ -202,6 +202,9 @@ public:
     [[nodiscard]] int32_t leaderEpochStamp() const noexcept { return leaderEpochStamp_; }
 
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
+    /// read(), but a segment compaction emptied continues at the next segment below boundOffset.
+    /// Torn, unreadable or damaged bytes still answer empty: the reader stops there.
+    std::vector<uint8_t> readPastEmptied(int64_t startOffset, int32_t maxBytes, int64_t boundOffset);
 
     /// Zero-copy read: locate the segment containing startOffset and return a
     /// span into its read-only mmap covering whole record batches (see
