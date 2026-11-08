@@ -1805,7 +1805,9 @@ TEST(D9BrokerNodeWiringRegression, MarkerForARemotelyLedPartitionLandsThroughThe
 // side goes away and comes back while node 1 sends nothing to it.
 TEST(D9CrossNodeMarkerIntegrationRegression, IdleOneWayOutageIsReportedWhenTheLinkReturns) {
     TmpDir dd;
-    rune::node::EmbeddedDriver driver{driverConfig(dd), rune::node::DriverMode::Threaded};
+    auto dc = driverConfig(dd);
+    dc.timerIntervalNs = 50'000'000;   // the driver notices the gone receiver at its next timer (default 1 s)
+    rune::node::EmbeddedDriver driver{dc, rune::node::DriverMode::Threaded};
     aeron::Context ctx;
     ctx.aeronDir(driver.dir());
     auto client = aeron::Aeron::connect(ctx);
