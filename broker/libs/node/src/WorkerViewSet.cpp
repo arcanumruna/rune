@@ -1500,7 +1500,7 @@ int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, in
         if (vit == views_.end()) continue;
         ViewInstance& inst = vit->second;
         adoptNs_(inst, ns);
-        if (inst.foldCursor >= bound) quietPass_(inst, nowNs);   // a member's caught-up pass is the judge's (driveView_ step 2)
+        quietPass_(inst, nowNs);   // as the key index: a push restarts the clock, so a member whose judge stopped (stall, install wait, Locked) gives back too
         chargeMem_(inst);
         if (inst.foldLeadership != leaderGen) {
             inst.foldLeadership = leaderGen;

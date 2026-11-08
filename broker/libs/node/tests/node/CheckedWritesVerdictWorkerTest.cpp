@@ -982,20 +982,19 @@ TEST(CheckedWritesVerdictWorkerRegression, LaggingReplicaLeadsAndDeliversNoRejec
     EXPECT_FALSE(b.hasRow(kRej, 4));
 }
 
-// REGRESSION (review 7 I-3): a verdict member is driven by the judge, never through driveView_, so a dirty window it kept (steady
-// churn, two long windows in a row) was never given back once the source went quiet: the growth stayed charged for good.
-TEST(CheckedWritesVerdictWorkerRegression, QuietMemberGivesBackItsKeptWindowRegression) {
-    VerdictRig r;
+namespace {
+// A persisted TestReject member over 2000 rows, then two produces of five rewrites of every row (a tombstone, then the upsert),
+// pushed a pass's worth at a time: the member's churn keeps its dirty set.
+const ViewInstance* memberWithAKeptWindow(VerdictRig& r) {
     r.typed();
     r.installRejectView(kRej, kObj, tagRule(9), "rej", /*persisted=*/true);
     r.passes(50);
     std::vector<Rec> rows;
     for (uint64_t id = 1; id <= 2000; ++id) rows.push_back(Rec{id, static_cast<int64_t>(id), 0});
-    ASSERT_EQ(r.produce(rows), 0);
+    EXPECT_EQ(r.produce(rows), 0);
     r.passes(150);
     const ViewInstance* inst = r.vs->instanceForTest(kRej, 0);
-    ASSERT_NE(inst, nullptr);
-    for (int w = 0; w < 2; ++w) {   // five rewrites of every row (a tombstone, then the upsert): pushed a pass's worth at a time
+    for (int w = 0; w < 2; ++w) {
         std::vector<Rec> b;
         for (int round = 0; round < 5; ++round) {
             for (uint64_t id = 1; id <= 2000; ++id) {
@@ -1003,17 +1002,45 @@ TEST(CheckedWritesVerdictWorkerRegression, QuietMemberGivesBackItsKeptWindowRegr
                 b.push_back(Rec{id, static_cast<int64_t>(id), 0});
             }
         }
-        ASSERT_EQ(r.produce(b), 0);
+        EXPECT_EQ(r.produce(b), 0);
         const int64_t leo = r.leo();
         for (int i = 0; i < 400 && r.agent->lastDurableOffset(kRej, 0) < leo; ++i) r.pass();
-        ASSERT_GE(r.agent->lastDurableOffset(kRej, 0), leo);
+        EXPECT_GE(r.agent->lastDurableOffset(kRej, 0), leo);
     }
+    return inst;
+}
+}  // namespace
+
+// REGRESSION (review 7 I-3): a verdict member is driven by the judge, never through driveView_, so a dirty window it kept (steady
+// churn, two long windows in a row) was never given back once the source went quiet: the growth stayed charged for good.
+TEST(CheckedWritesVerdictWorkerRegression, QuietMemberGivesBackItsKeptWindowRegression) {
+    VerdictRig r;
+    const ViewInstance* inst = memberWithAKeptWindow(r);
+    ASSERT_NE(inst, nullptr);
     ASSERT_GT(inst->table.dirtyBytes(), 0u) << "the member's churn keeps its dirty set";
     r.passes(5);   // quiet
     EXPECT_GT(inst->table.dirtyBytes(), 0u) << "kept while quiet for less than a second";
     r.now += 1'000'000'000;
     r.passes(2);
     EXPECT_EQ(inst->table.dirtyBytes(), 0u) << "a second of quiet gives it back";
+    EXPECT_EQ(inst->memCharged, inst->table.memoryBytes()) << "and the charge follows";
+}
+
+// REGRESSION (review 8 I-1): the member's quiet rule ran only while its cursor (the judge's) was at the bound, so a judge stopped
+// below it (a stall, an install wait, a Locked transaction) kept the member's window charged for the whole stop.
+TEST(CheckedWritesVerdictWorkerRegression, StoppedJudgeMemberGivesBackItsKeptWindowRegression) {
+    VerdictRig r;
+    const ViewInstance* inst = memberWithAKeptWindow(r);
+    ASSERT_NE(inst, nullptr);
+    ASSERT_GT(inst->table.dirtyBytes(), 0u) << "the member's churn keeps its dirty set";
+    r.holdJudge(true);
+    (void)r.produce({{1, 1, 0}});
+    ASSERT_LT(r.vs->verdictSource(VerdictRig::kSrc, 0)->judgedThrough(), r.leo()) << "the judge is stopped below the bound";
+    r.passes(5);
+    EXPECT_GT(inst->table.dirtyBytes(), 0u) << "kept for less than a second";
+    r.now += 1'000'000'000;
+    r.passes(2);
+    EXPECT_EQ(inst->table.dirtyBytes(), 0u) << "a second without a push gives it back";
     EXPECT_EQ(inst->memCharged, inst->table.memoryBytes()) << "and the charge follows";
 }
 
