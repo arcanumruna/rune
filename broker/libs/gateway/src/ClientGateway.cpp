@@ -7096,7 +7096,7 @@ int64_t ClientGateway::sendTxnVote(int32_t topicId, int32_t partition, int64_t p
                                    int32_t coordinatorEpoch)
 {
     if (!routesToWorker_(topicId) || votesInFlight_.size() >= kMaxTxnVotesInFlight) return -1;
-    const int64_t token = nextVoteToken_++;
+    const int64_t token = nextVoteToken_;
     rune::node::WorkerOp op;
     op.type          = rune::node::WorkerOp::Type::TxnVote;
     op.topicId       = topicId;
@@ -7106,6 +7106,7 @@ int64_t ClientGateway::sendTxnVote(int32_t topicId, int32_t partition, int64_t p
     op.producerEpoch = producerEpoch;
     op.sessionId     = -1;   // local origin
     if (!workerPool_->tryEnqueueOp(topicId, partition, std::move(op))) return -1;
+    ++nextVoteToken_;
     votesInFlight_.emplace(token, VoteInFlight{topicId, partition, producerId, producerEpoch, coordinatorEpoch});
     return token;
 }

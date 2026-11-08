@@ -1187,7 +1187,7 @@ public:
     //
     // sendTxnVote asks the partition's leader whether the transaction (producerId, producerEpoch) may commit there.  It
     // returns a token >= 0, and that token gets EXACTLY ONE sink call: the worker's vote, or errorCode NotLeader when the
-    // worker could not answer.  -1 means no call follows (no worker pool, a full ring, a full table): a transport error,
+    // worker could not answer.  -1 means no call follows (no worker route, a full ring, a full table): a transport error,
     // retried by the caller with backoff.  A result is never delivered from inside sendTxnVote; the sink may call
     // sendTxnVote again.  `coordinatorEpoch` rides back to the sink unchanged.  Runtime thread, cold.
     // -----------------------------------------------------------------------
