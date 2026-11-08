@@ -1817,6 +1817,54 @@ TEST(CheckedWritesTxnJudgeRegression, ParkedHolderLetsAnotherPartitionJudgeTheVo
     EXPECT_EQ(a.tables(), plain.tables());
 }
 
+// T7 review 5, N1: the same cycle through a lock pause.  T0's judged write of key 4 lies below A's O, so O's apply pauses on T0's
+// held row; the lock clears at T0's marker, which waits for B's vote.  B takes the set from the paused A and judges the J.
+TEST(CheckedWritesTxnJudgeRegression, LockPausedHolderLetsAnotherPartitionJudgeTheVoteItWaitsForRegression) {
+    JudgeRig a(false);
+    JudgeRig b(false);
+    b.vs.bindTxn(&a.pool, b.batch, JudgeRig::kRecordsMax);
+    a.start();
+    b.start();
+    a.log.data({{4, 1, false, kInsert}}, 66);     // 10, T0
+    a.log.judge(66, 10);                          // 11
+    a.log.data({del(4)}, 55);                     // 12, O
+    a.log.marker(55, true);                       // 13
+    for (int i = 0; i < 4 && a.st.txn.stats.lockPauses == 0; ++i) a.drive();
+    ASSERT_EQ(a.st.txn.find(66)->phase, TxnPhase::Locked);
+    ASSERT_EQ(a.st.txn.stats.lockPauses, 1u) << "O's delete pauses on T0's row";
+    ASSERT_EQ(a.vs.judgeCursor(), 13);
+    ASSERT_TRUE(a.pool.oneStepHeld());
+    b.log.data({{50}, {51}}, 88);                 // 10-11, 88
+    b.log.data({{60, 1, false, kInsert}}, 66);    // 12, T0
+    b.log.marker(88, true);                       // 13
+    b.log.judge(66, 12);                          // 14
+    for (int i = 0; i < 8 && (b.st.txn.find(66) == nullptr || !b.st.txn.find(66)->judged); ++i) {
+        b.drive();
+        a.drive();
+    }
+    ASSERT_NE(b.st.txn.find(66), nullptr);
+    EXPECT_TRUE(b.st.txn.find(66)->judged) << "B's vote for T0 is answerable while A is paused";
+    EXPECT_TRUE(b.indexed(51));
+    EXPECT_EQ(a.vs.judgeCursor(), 13);
+    a.log.marker(66, true);
+    b.log.marker(66, true);
+    for (int i = 0; i < 8 && (a.vs.judgeCursor() < a.log.next || b.vs.judgeCursor() < b.log.next); ++i) {
+        a.drive();
+        b.drive();
+    }
+    EXPECT_EQ(a.vs.judgeCursor(), a.log.next);
+    EXPECT_EQ(b.vs.judgeCursor(), b.log.next);
+    EXPECT_TRUE(b.indexed(60));
+    EXPECT_FALSE(a.pool.oneStepHeld());
+    JudgeRig plain(false);
+    plain.start();
+    plain.log.data({{4, 1, false, kInsert}});
+    plain.log.data({del(4)});
+    for (int i = 0; i < 4; ++i) plain.drive();
+    EXPECT_FALSE(a.indexed(4)) << "O's delete applies after T0's insert";
+    EXPECT_EQ(a.tables(), plain.tables());
+}
+
 // I3: accepted(r), an ordinary transaction committed below J.
 TEST(CheckedWritesTxnJudge, OrdinaryCommittedBelowJConflicts) {
     JudgeRig r(VoteMembers{100});

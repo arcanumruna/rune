@@ -178,7 +178,8 @@ public:
     /// The one-step set is shared by the worker's sources: a source that keeps its content across passes holds a claim until it
     /// releases it.  While it is held another source waits: two sources taking it from each other would never finish (T7 N3).
     /// A holder parked on another transaction's marker is the exception: that marker may wait for a vote the waiter would judge
-    /// (T7 review 4, I1), so the waiter takes the set and the holder collects anew when it resumes.
+    /// (T7 review 4, I1), so the waiter takes the set and the holder collects anew when it resumes.  A holder paused on a row a
+    /// judged transaction holds is parked too: only that transaction's marker clears the lock (review 5, N1).
     [[nodiscard]] bool oneStepHeld() const noexcept { return oneStepHeld_; }
     [[nodiscard]] bool oneStepClaimable() const noexcept { return !oneStepHeld_ || oneStepParked_; }
     [[nodiscard]] uint64_t claimOneStep() noexcept {
@@ -850,6 +851,7 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
             w.checked = w.refill = false;
         }
         if (!w.checked && !checkOrdinary_(readRange, o, aborted, keys)) return false;
+        txnPool_->parkOneStep(oneStepClaim_, false);   // applyTxnBatch_ parks it again on a row a judged transaction holds
         bool applied = true;
         if (!walkBatches_(readRange, std::max(w.from, ordinaryApplied_), w.end, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
                 if (r.producerId() != o.producerId || (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) != rune::protocol::batch::kAttrTransactional) return true;

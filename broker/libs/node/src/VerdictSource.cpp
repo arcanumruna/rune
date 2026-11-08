@@ -1290,7 +1290,10 @@ bool VerdictSource::applyTxnBatch_(const uint8_t* batch, std::size_t len, TxnKey
             for (const std::size_t i : active_) {
                 const rune::view::PrepareStatus s = prepare_(members_[i], rec, nullptr, lockSet_());
                 if (s == rune::view::PrepareStatus::CapacityExhausted) stall_(StallReason::Capacity);
-                if (s == rune::view::PrepareStatus::Locked) notePause_(span.offset);
+                if (s == rune::view::PrepareStatus::Locked) {
+                    notePause_(span.offset);
+                    txnPool_->parkOneStep(oneStepClaim_, true);   // the lock clears at the holder's marker, which may wait for a vote the waiter judges
+                }
                 if (s == rune::view::PrepareStatus::CapacityExhausted || s == rune::view::PrepareStatus::Locked) {
                     ok = false;
                     return;
