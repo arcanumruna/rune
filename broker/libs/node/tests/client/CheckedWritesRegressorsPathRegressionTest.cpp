@@ -126,6 +126,7 @@ std::string goldenTopic(const std::string& name) {
 catalog_cluster::ThreeNodes startCluster(const std::string& tag) {
     return catalog_cluster::ThreeNodes::startWith(tag, [](NodeConfig& cfg) {
         cfg.verdictIntervalMs      = 20;
+        cfg.unservableWarmupMs     = 50;
         cfg.producerIdExpirationMs = 2'000;   // a stopped writer's last batches leave the cleaner something to compact
     });
 }

@@ -2816,7 +2816,7 @@ void BrokerNode::buildGateway() {
                 metadataService_->setAllowSurvivorElection(config_.survivorLeaderElection);
                 // Task 11 fix round 5 (I1): a young controller process waits one
                 // report TTL before deciding user-partition leadership.
-                metadataService_->setUnservableReportWarmup(MetadataService::kUnservableReportTtlNs);
+                metadataService_->setUnservableReportWarmup(config_.unservableWarmupMs * 1'000'000);
                 // D15: the metadata feature level is raised only once every
                 // member advertised it (its node-control registration).
                 metadataService_->setClusterMembers(balancerNodes);

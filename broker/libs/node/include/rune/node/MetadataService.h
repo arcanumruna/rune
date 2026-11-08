@@ -436,7 +436,7 @@ public:
     [[nodiscard]] std::size_t unplaceableTopicCount() const noexcept { return unplaceable_.size(); }
     /// I1 (round 5): a controller whose PROCESS has held the broadcast reports for
     /// less than `ns` defers user-partition leader elections until it has (it may
-    /// lack a fresh "cannot serve" report).  BrokerNode sets kUnservableReportTtlNs
+    /// lack a fresh "cannot serve" report).  BrokerNode sets NodeConfig::unservableWarmupMs (one TTL by default)
     /// multi-node; 0 (unit rigs) = off.
     void setUnservableReportWarmup(int64_t ns) noexcept { unservableWarmupNs_ = ns; }
     [[nodiscard]] bool unservableWarmingUp() const noexcept {
