@@ -1308,7 +1308,7 @@ void AdminWorker::respond_(const DdlRequest& req, const Response& r) {
     // frames have no detail field) — InvalidRequest (spec §9), and (checked writes) the schema and view
     // refusals whose reason names what to change.
     const bool viaError = !r.detail.empty() && deps_.respondError &&
-                          (r.code == kInvalidRequest || r.code == kInvalidSchema || r.code == kViewSourceNotFound ||
+                          (r.code == kInvalidRequest || r.code == kInvalidSchema || r.code == kInvalidTopicName || r.code == kViewSourceNotFound ||
                            r.code == kViewFieldUnresolved || r.code == kViewKeyInvalid || r.code == kViewNotCoPartitioned || r.code == kViewKeyExpressionInvalid ||
                            r.code == kViewConstraintInvalid || r.code == kViewUniqueInvalid);
     auto byTemplate = [&](uint16_t tid, int64_t session, int64_t corr) {
@@ -1468,6 +1468,9 @@ std::optional<DdlRejection> leaseDefineRefusal(const DefineTopicMsg& m, const ru
         return reject(kInvalidRequest, "a lease topic is compacted and keeps every live lease");
     for (const auto& f : d->fields)
         if (f.name.starts_with("lease_")) return reject(kInvalidRequest, "lease_ field names are reserved");
+    // Any other key feature (autoincrement.max / .reserve without autoincrement) is the non-lease answer.
+    if (m.keyFeatures != rp::TopicKeyFeatures{})
+        return reject(kInvalidRequest, "autoincrement.max and autoincrement.reserve need autoincrement");
     return std::nullopt;
 }
 
@@ -1580,6 +1583,21 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
         return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
     }
     if (auto fold = foldCollision(s, m.nsId, m.name)) return Rejected(std::move(*fold));
+    if (m.lease) {
+        // L15: the lease view '<name>.leases' is created with the topic, so its name is judged here (the apply rule is the
+        // replay half).  The codec keeps the suffix private: ".leases" is 7 bytes.
+        constexpr std::string_view kLeaseViewSuffix = ".leases";
+        const std::string viewName = m.name + std::string(kLeaseViewSuffix);
+        if (viewName.size() > cat::kMaxTopicNameBytes)
+            return Rejected(reject(kInvalidTopicName, "the lease view name '" + viewName + "' is too long"));
+        if (const cat::TopicObject* t = s.topicByName(m.nsId, viewName))
+            return Rejected(reject(kTopicExists, {}, t->topicId, t->schema ? t->schema->schemaVersion : uint16_t{0}));
+        if (const cat::ViewObject* v = s.viewByName(m.nsId, viewName)) {
+            const RegistryEntry* out = reg_.byId(v->def.viewTopicId);
+            return Rejected(reject(kTopicExists, {}, v->def.viewTopicId, out ? out->version : uint16_t{0}));
+        }
+        if (auto fold = foldCollision(s, m.nsId, viewName)) return Rejected(std::move(*fold));
+    }
     if (keyRefusal) return Rejected(std::move(*keyRefusal));
     std::optional<rune::codec::Descriptor> userDesc;   // set for a typed define (already known to deserialize)
     if (!m.blob.empty()) userDesc = rune::codec::deserialize(std::span<const uint8_t>(m.blob.data(), m.blob.size()));
@@ -1628,10 +1646,11 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     if (m.lease) {
         // L5: the system columns lead the stored descriptor; the user's key field stays marked as it was.
         rune::codec::Descriptor d = std::move(*userDesc);
-        if (!prependLeaseColumns(d)) return Rejected(reject(kInvalidSchema));
+        constexpr const char* kTagsExhausted = "field tags are exhausted after the 4 lease system columns";
+        if (!prependLeaseColumns(d)) return Rejected(reject(kInvalidSchema, kTagsExhausted));
         uint32_t past = 0;
         for (const auto& f : d.fields) past = std::max<uint32_t>(past, uint32_t{f.id} + 1);
-        if (past > 0xFFFF) return Rejected(reject(kInvalidSchema));
+        if (past > 0xFFFF) return Rejected(reject(kInvalidSchema, kTagsExhausted));
         op.schema = cat::SchemaDef{m.keyField, m.validate, rune::codec::serialize(d), static_cast<uint16_t>(past), features};
         op.lease  = *m.lease;
     } else if (!m.blob.empty()) {

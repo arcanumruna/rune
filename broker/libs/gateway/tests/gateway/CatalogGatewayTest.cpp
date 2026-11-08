@@ -69,7 +69,10 @@ struct CountingAdminSink final : IAdminRequestSink {
     AdminSubmit submitDefineTopic(int64_t, int64_t, std::string_view, uint32_t, std::string_view, bool,
                                   const uint8_t*, uint32_t, uint8_t, int16_t, const rune::protocol::TopicConfigView&,
                                   const DdlMetaView&, std::string_view, const rune::protocol::TopicKeyFeatures&,
-                                  const std::optional<rune::protocol::LeaseSpec>&) override { ++submits; return AdminSubmit::Accepted; }
+                                  const std::optional<rune::protocol::LeaseSpec>& lease) override {
+        ++submits; lastLease = lease; return AdminSubmit::Accepted;
+    }
+    std::optional<rune::protocol::LeaseSpec> lastLease;   // the lease argument of the last DefineTopic
     bool submitGetSchema(int64_t, int64_t, std::string_view, uint64_t, uint32_t) override { ++gets; return true; }
     AdminSubmit submitAlterTopic(int64_t, int64_t, std::string_view, uint16_t, const uint8_t*, uint32_t,
                                  const DdlMetaView&) override { ++submits; return AdminSubmit::Accepted; }
@@ -194,6 +197,7 @@ struct GatewayRig {
         }
     }
     /// One well-formed DDL frame of `t` (v8 extension unless the session is pre-v8).
+    std::optional<rune::protocol::LeaseSpec> defineLease;   // set: the DefineTopic frame carries this lease (v18)
     std::vector<uint8_t> ddlFrame(pc::TemplateId t, int64_t c, bool withExt) {
         static const std::vector<uint8_t> blob{1, 2, 3};
         pc::DdlExtension ext;
@@ -204,7 +208,9 @@ struct GatewayRig {
         switch (t) {
         case pc::TemplateId::DefineTopic: {
             pc::DefineTopic m; m.sessionId = sid; m.correlationId = c; m.topicName = "t"; m.partitionCount = 1;
-            m.hasExt = withExt; m.ext = ext; enc(m); break;
+            m.hasExt = withExt; m.ext = ext;
+            if (defineLease) { m.hasKeyFeatures = true; m.hasLease = true; m.lease = *defineLease; }
+            enc(m); break;
         }
         case pc::TemplateId::AlterTopic: {
             pc::AlterTopic m; m.sessionId = sid; m.correlationId = c; m.topicName = "t";
@@ -662,6 +668,24 @@ TEST(CatalogGatewayRegression, LocalLeaderSubmitsEveryDdlToTheAdmin) {
     for (auto tmpl : g.allDdlTemplates()) EXPECT_FALSE(g.sendDdl(tmpl).answered) << "the admin answers later";
     EXPECT_EQ(g.adminSubmits(), g.allDdlTemplates().size());
     EXPECT_EQ(g.gateway().ddlRoutedAway(), 0u);
+}
+
+TEST(CatalogGatewayRegression, LeaseDefineReachesAdminRegression) {
+    rune::protocol::LeaseSpec spec;
+    spec.ttlMs = 10'000; spec.minTtlMs = 1'000; spec.maxTtlMs = 60'000; spec.maxKeys = 7; spec.expiryBatch = 64;
+    spec.checkpoint = 1; spec.checkpointIntervalMs = 2'000; spec.checkpointRate = 3;
+    GatewayRig g;
+    g.gateway().setCatalogRoute(rune::gateway::RouteLocalLeader{});
+    g.defineLease = spec;
+    (void)g.sendDdl(pc::TemplateId::DefineTopic);
+    EXPECT_EQ(g.adminSubmits(), 1u);
+    ASSERT_TRUE(g.admin.lastLease.has_value());
+    EXPECT_EQ(*g.admin.lastLease, spec);
+    g.defineLease.reset();
+    g.admin.lastLease = spec;   // a stale value must be overwritten by nullopt
+    (void)g.sendDdl(pc::TemplateId::DefineTopic);
+    EXPECT_EQ(g.adminSubmits(), 2u);
+    EXPECT_FALSE(g.admin.lastLease.has_value());
 }
 
 TEST(CatalogGatewayRegression, SchemaReadsAreServedLocallyOnAFollower) {

@@ -11,6 +11,7 @@
 
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminWorker.h>
+#include <rune/node/BrokerNode.h>   // AdminWorkerAgent (the production submit)
 #include <rune/node/FdBudget.h>
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/SchemaRegistry.h>
@@ -468,6 +469,37 @@ TEST(AdminWorkerRegression, CatalogDdlRingFramesRoundTripEveryRequestRegression)
         }
     }, 8);
     EXPECT_EQ(types, (std::vector<int32_t>{kMsgDefineTopic, kMsgAlterTopicConfig, kMsgAlterView, kMsgDropTopic}));
+}
+
+// A lease reaches the admin ring through the production submit (AdminWorkerAgent::submitDefineTopic) and decodes equal;
+// no lease stays no lease.
+TEST(AdminWorkerRegression, LeaseDefineSubmitReachesTheRingRegression) {
+    rune::protocol::LeaseSpec spec;
+    spec.ttlMs = 10'000; spec.minTtlMs = 1'000; spec.maxTtlMs = 60'000; spec.maxKeys = 9; spec.expiryBatch = 64;
+    spec.checkpoint = 1; spec.checkpointIntervalMs = 2'000; spec.checkpointRate = 3;
+    rune::node::SchemaRegistry schemas;
+    AdminWorkerAgent agent(schemas, /*selfId=*/1, AdminDeps{});
+    const rune::protocol::TopicConfigView cfg{};
+    const rune::gateway::DdlMetaView meta{};
+    const rune::protocol::TopicKeyFeatures kf{};
+    const uint8_t blob[2] = {1, 2};
+    int seen = 0;
+    for (const bool withLease : {true, false}) {
+        const std::optional<rune::protocol::LeaseSpec> lease = withLease ? std::optional(spec) : std::nullopt;
+        ASSERT_EQ(agent.submitDefineTopic(7, 8, "p", 1, "id", false, blob, 2, 0, 0, cfg, meta, "", kf, lease),
+                  rune::gateway::AdminSubmit::Accepted);
+        agent.requestRing().drain([&](int32_t tid, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                                      aeron::util::index_t len) {
+            ASSERT_EQ(tid, kMsgDefineTopic);
+            const DdlRequest r = decodeDefineTopic(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len));
+            const auto* got = std::get_if<DefineTopicMsg>(&r);
+            ASSERT_NE(got, nullptr);
+            EXPECT_EQ(got->lease.has_value(), withLease);
+            if (withLease) EXPECT_EQ(*got->lease, spec);
+            ++seen;
+        }, 8);
+    }
+    EXPECT_EQ(seen, 2);
 }
 
 // Task 9 fix round 1 (I1, hard rule 3): a frame that does not decode is its own

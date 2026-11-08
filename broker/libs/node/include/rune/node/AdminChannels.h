@@ -849,6 +849,7 @@ inline DdlRequest decodeDefineTopic(const uint8_t* buf, std::size_t len) {
         if (r.need(rune::protocol::kLeaseSpecBytes)) {
             rune::protocol::LeaseSpec ls;
             if (rune::protocol::decodeLeaseSpec(r.b + r.pos, rune::protocol::kLeaseSpecBytes, ls)) m.lease = ls;
+            else r.fail("a malformed lease spec");   // never a plain define
             r.pos += rune::protocol::kLeaseSpecBytes;
         }
     }
@@ -1913,13 +1914,16 @@ template <typename Write>
     return true;
 }
 
-// ---- F3 round 7, item 4: descriptor size is bounded BY CONSTRUCTION ----
+// ---- F3 round 7, item 4: descriptor size is bounded by the request ring ----
 // A descriptor reaches the admin thread only inside a DefineTopic on the request
 // ring (O2O ring: maxMsgLength = capacity / 8), whose fixed framing (catalog
 // history Task 9 layout) is session + corr + partitions + validate + the three
 // length prefixes + persistence + rf + the config block + the meta's fixed part.
 // The SchemaUpdate that re-posts it on the admin→control ring carries only a
-// 6-byte header in front, so every committed descriptor fits.
+// 6-byte header in front, so every descriptor the REQUEST carries fits.  A lease define's STORED descriptor is larger than
+// the request's (it gains the four lease system columns, and an RCD1 blob is re-serialized); that growth is not bounded
+// here but by the append-time catalogEventEffectsRefusal.  The static_assert below keeps >= 128 bytes of margin for the
+// four columns (4 x ~30 B) under the SchemaUpdate bound.
 // statement(4) + clientName(2) + sourceAddress(2) + authenticated(2, auth Task 10) + sessionId + requestId hi/lo + flag.
 inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 + 1;
 // The trailing adoptDenial length prefix (2, issue #129), the nsId (4, namespaces), then the
@@ -1933,6 +1937,9 @@ static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=
                   static_cast<std::size_t>(kAdminToControlRingBytes) / 8,
               "every descriptor the admin request ring can deliver must fit one "
               "SchemaUpdate on the admin->control ring");
+static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing + 128) <=
+                  static_cast<std::size_t>(kAdminToControlRingBytes) / 8,
+              "the SchemaUpdate bound must keep 128 bytes of margin for a lease topic's four system columns");
 
 // A FilterSchema carries the same descriptor a SchemaUpdate does, so it fits the ring by the same bound.
 static_assert(filterSchemaWireLen(kMaxDescriptorViaRequestRing) <=

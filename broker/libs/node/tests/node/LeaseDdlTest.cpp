@@ -15,6 +15,9 @@
 //   | request fingerprint            | lease / key features / none                | DedupeFingerprintRegression
 //   | admin wire                     | with/without lease, bad byte, every cut    | AdminWireRoundTripRegression
 //   | lease objects                  | every DDL naming the lease topic or view   | LeaseObjectDdlRegression
+//   | lease view name                | too long / topic / view / case-fold       | LeaseViewNameRegression
+//   | rule order                     | two broken rules per row                   | RuleOrderRegression
+//   | tag exhaustion                 | user tag 0xFFFA / 0xFFFB                   | TagExhaustionRegression
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/codec/Serialize.h>
 #include <rune/protocol/LeaseSpec.h>
@@ -24,7 +27,6 @@
 
 #include <gtest/gtest.h>
 
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -38,7 +40,7 @@ namespace {
 
 constexpr uint16_t kOk = 0, kTopicExists = 25, kInvalidRequest = 39;
 constexpr uint16_t kInternal = 6;
-constexpr uint16_t kInvalidSchema = 23, kNamespaceLimitExceeded = 52;
+constexpr uint16_t kInvalidSchema = 23, kNamespaceLimitExceeded = 52, kInvalidTopicName = 40;
 
 rp::LeaseSpec validSpec() {
     rp::LeaseSpec s;
@@ -120,6 +122,10 @@ const Row kRows[] = {
      [](DefineTopicMsg& m) { m.keyFeatures.keyIndex = true; }, false},
     {"ModuloPartitioner", 6, kInvalidRequest, "the modulo partitioner needs autoincrement",
      [](DefineTopicMsg& m) { m.keyFeatures.partitioner = rp::Partitioner::Modulo; }, false},
+    {"LeftoverAutoIncMax", 6, kInvalidRequest, "autoincrement.max and autoincrement.reserve need autoincrement",
+     [](DefineTopicMsg& m) { m.keyFeatures.autoIncrementMax = 5; }, false},
+    {"LeftoverAutoIncReserve", 6, kInvalidRequest, "autoincrement.max and autoincrement.reserve need autoincrement",
+     [](DefineTopicMsg& m) { m.keyFeatures.autoIncrementReserve = 7; }, false},
     {"Transient", 6, kInvalidRequest, "transient lease topics are not supported yet", [](DefineTopicMsg& m) { m.persistence = 1; }, true},
     {"CleanupDelete", 6, kInvalidRequest, "a lease topic is compacted and keeps every live lease",
      [](DefineTopicMsg& m) { m.config.cleanupPolicy = 0; }, true},
@@ -300,6 +306,21 @@ TEST(LeaseDdlRegression, FeatureLevelGateRegression) {
     p6.lease.reset(); p6.config = {};
     ASSERT_EQ(submit(rig, p6).code, kOk);
     EXPECT_EQ(lastEvent(rig).formatVer, cat::kFormatV4);
+
+    // The same non-lease define built at level 5 (V3) and at level 6 (V4, fresh rig, same ids) has the same fingerprints.
+    CatalogDdlRig rigA("leasefp5");
+    serve(rigA, 5);
+    DefineTopicMsg a = leaseMsg(rigA, "plainfp"); a.lease.reset(); a.config = {}; a.meta.requestId = {1, 2};
+    ASSERT_EQ(submit(rigA, a).code, kOk);
+    EXPECT_EQ(lastEvent(rigA).formatVer, cat::kFormatV3);
+    CatalogDdlRig rigB("leasefp6");
+    serve(rigB, 6);
+    DefineTopicMsg b = leaseMsg(rigB, "plainfp"); b.lease.reset(); b.config = {}; b.meta.requestId = {1, 2};
+    ASSERT_EQ(submit(rigB, b).code, kOk);
+    EXPECT_EQ(lastEvent(rigB).formatVer, cat::kFormatV4);
+    EXPECT_EQ(lastEvent(rigA).fingerprint, lastEvent(rigB).fingerprint);
+    EXPECT_EQ(lastEvent(rigA).principal.requestFingerprint, lastEvent(rigB).principal.requestFingerprint);
+    EXPECT_NE(lastEvent(rigA).fingerprint, 0u);
 }
 
 // ── namespace accounting ─────────────────────────────────────────────────────
@@ -419,6 +440,135 @@ TEST(LeaseDdlRegression, AdminWireRoundTripRegression) {
     }
 }
 
+// ── the lease view's name (L15) ──────────────────────────────────────────────
+TEST(LeaseDdlRegression, LeaseViewNameRegression) {
+    {   // 249 bytes with the suffix is the longest accepted; one more is too long.
+        CatalogDdlRig rig("leasename");
+        serve(rig);
+        const std::string fits(242, 'a'), over(243, 'b');
+        const auto ok = submit(rig, leaseMsg(rig, fits));
+        EXPECT_EQ(ok.code, kOk) << ok.detail;
+        const auto a = submit(rig, leaseMsg(rig, over));
+        EXPECT_EQ(a.code, kInvalidTopicName);
+        EXPECT_EQ(a.detail, "the lease view name '" + over + ".leases' is too long");
+        EXPECT_EQ(topicOf(rig, over), nullptr);
+        // A non-lease topic of the long name is fine.
+        DefineTopicMsg plain = leaseMsg(rig, over); plain.lease.reset(); plain.config = {};
+        EXPECT_EQ(submit(rig, plain).code, kOk);
+    }
+    {   // a TOPIC holds '<name>.leases'
+        CatalogDdlRig rig("leasenametopic");
+        serve(rig);
+        CatalogDdlRig::DefineArgs held; held.name = "inst.leases"; held.typed = true;
+        const auto h = rig.define(held);
+        ASSERT_EQ(h.code, kOk);
+        const auto a = submit(rig, leaseMsg(rig, "inst"));
+        EXPECT_EQ(a.code, kTopicExists);
+        EXPECT_EQ(a.topicId, h.topicId);
+        EXPECT_EQ(a.version, h.version);
+        EXPECT_EQ(a.detail, "");
+        EXPECT_EQ(topicOf(rig, "inst"), nullptr);
+    }
+    {   // a VIEW holds '<name>.leases'
+        CatalogDdlRig rig("leasenameview");
+        serve(rig);
+        CatalogDdlRig::DefineArgs src; src.name = "src"; src.typed = true;
+        ASSERT_EQ(rig.define(src).code, kOk);
+        const auto v = rig.createView("inst.leases", "src");
+        ASSERT_EQ(v.code, kOk) << v.detail;
+        const cat::ViewObject* vo = viewOf(rig, "inst.leases");
+        ASSERT_NE(vo, nullptr);
+        const auto a = submit(rig, leaseMsg(rig, "inst"));
+        EXPECT_EQ(a.code, kTopicExists);
+        EXPECT_EQ(a.topicId, vo->def.viewTopicId);
+        EXPECT_EQ(a.version, 1u);   // the view topic's registry version (the createView answer carries 0)
+        EXPECT_EQ(a.detail, "");
+        EXPECT_EQ(topicOf(rig, "inst"), nullptr);
+    }
+    {   // a name that differs only in case from '<name>.leases' (the fold answer: TopicExists with the
+        // holder's id; a DefineTopic response frame carries no detail for it)
+        CatalogDdlRig rig("leasenamefold");
+        serve(rig);
+        CatalogDdlRig::DefineArgs held; held.name = "Inst.Leases"; held.typed = true;
+        const auto h = rig.define(held);
+        ASSERT_EQ(h.code, kOk);
+        const auto a = submit(rig, leaseMsg(rig, "inst"));
+        EXPECT_EQ(a.code, kTopicExists);
+        EXPECT_EQ(a.topicId, h.topicId);
+        EXPECT_EQ(a.version, 0u);
+        EXPECT_EQ(a.detail, "");
+        EXPECT_EQ(topicOf(rig, "inst"), nullptr);
+    }
+}
+
+// ── rule order: two broken rules, the documented winner ──────────────────────
+TEST(LeaseDdlRegression, RuleOrderRegression) {
+    struct Case {
+        const char* name; int16_t level; uint16_t code; std::string detail;
+        void (*mutate)(CatalogDdlRig&, DefineTopicMsg&);
+    };
+    const Case cases[] = {
+        {"LevelBeforeSpec", 5, kInvalidRequest, "cluster below lease feature level",
+         [](CatalogDdlRig&, DefineTopicMsg& m) { m.lease->minTtlMs = 70'000; }},
+        {"TransientBeforeRetention", 6, kInvalidRequest, "transient lease topics are not supported yet",
+         [](CatalogDdlRig&, DefineTopicMsg& m) { m.persistence = 1; m.config.retentionMs = 1000; }},
+        {"AutoIncrementBeforeReservedName", 6, kInvalidRequest, "a lease topic cannot use autoincrement",
+         [](CatalogDdlRig&, DefineTopicMsg& m) {
+             m.blob = blobOf(PrimType::UInt64, 0, "id", {"lease_x"}); m.keyFeatures.autoIncrement = true;
+         }},
+        {"KeyWidthBeforeLevel", 5, kInvalidSchema,
+         "key field 'id' is string(129): a lease topic key is an integer or string(N) with N <= 128",
+         [](CatalogDdlRig&, DefineTopicMsg& m) { m.blob = blobOf(PrimType::FixedStr, 129); }},
+    };
+    for (const Case& c : cases) {
+        CatalogDdlRig rig("leaseorder");
+        serve(rig, c.level);
+        DefineTopicMsg m = leaseMsg(rig, "inst");
+        c.mutate(rig, m);
+        const auto a = submit(rig, m);
+        EXPECT_EQ(a.code, c.code) << c.name << ": " << a.detail;
+        EXPECT_EQ(a.detail, c.detail) << c.name;
+        EXPECT_EQ(topicOf(rig, "inst"), nullptr) << c.name;
+    }
+    {   // an existing name at level 5: TopicExists, not the level text
+        CatalogDdlRig rig("leaseorderexists");
+        serve(rig, 5);
+        CatalogDdlRig::DefineArgs plain; plain.name = "inst"; plain.typed = true;
+        const auto p = rig.define(plain);
+        ASSERT_EQ(p.code, kOk);
+        const auto a = submit(rig, leaseMsg(rig, "inst"));
+        EXPECT_EQ(a.code, kTopicExists);
+        EXPECT_EQ(a.topicId, p.topicId);
+        EXPECT_EQ(a.detail, "");
+    }
+}
+
+// ── tag exhaustion (the four system columns shift every user tag by 4) ───────
+TEST(LeaseDdlRegression, TagExhaustionRegression) {
+    auto blobWithTag = [](uint16_t tag) {
+        rune::codec::DescriptorBuilder b("t", 1);
+        b.add("id", PrimType::UInt64, 1, true);
+        b.add("note", PrimType::String);
+        rune::codec::Descriptor d = b.build();
+        d.fields[1].id = tag;
+        return rune::codec::serialize(d);
+    };
+    CatalogDdlRig rig("leasetags");
+    serve(rig);
+    DefineTopicMsg over = leaseMsg(rig, "over");
+    over.blob = blobWithTag(0xFFFB);
+    const auto a = submit(rig, over);
+    EXPECT_EQ(a.code, kInvalidSchema);
+    EXPECT_EQ(a.detail, "field tags are exhausted after the 4 lease system columns");
+    EXPECT_EQ(topicOf(rig, "over"), nullptr);
+    DefineTopicMsg fits = leaseMsg(rig, "fits");
+    fits.blob = blobWithTag(0xFFFA);
+    const auto b = submit(rig, fits);
+    EXPECT_EQ(b.code, kOk) << b.detail;
+    ASSERT_NE(topicOf(rig, "fits"), nullptr);
+    EXPECT_EQ(topicOf(rig, "fits")->schema->nextTag, 0xFFFF);
+}
+
 // ── the lease objects through every DDL ──────────────────────────────────────
 TEST(LeaseDdlRegression, LeaseObjectDdlRegression) {
     CatalogDdlRig rig("leaseobj");
@@ -427,25 +577,35 @@ TEST(LeaseDdlRegression, LeaseObjectDdlRegression) {
     CatalogDdlRig::DefineArgs plain; plain.name = "plain"; plain.typed = true;
     ASSERT_EQ(rig.define(plain).code, kOk);
 
-    auto show = [](const char* what, const CatalogDdlRig::Answer& a) {
-        std::cout << "[LeaseObjectDdl] " << what << " -> " << a.code << " \"" << a.detail << "\"\n";
-    };
-    const auto dropView = rig.dropView("inst.leases");        show("DropView inst.leases", dropView);
-    const auto dropLeaseTopic = rig.dropTopic("inst.leases"); show("DropTopic inst.leases", dropLeaseTopic);
-    const auto alterView = rig.alterView("inst.leases", "plain", false); show("AlterView inst.leases", alterView);
-    const auto createView = rig.createView("inst.leases", "plain");      show("CreateView inst.leases", createView);
+    const auto dropView = rig.dropView("inst.leases");
+    const auto dropLeaseTopic = rig.dropTopic("inst.leases");
+    const auto alterView = rig.alterView("inst.leases", "plain", false);
+    const auto createView = rig.createView("inst.leases", "plain");
     DefineTopicMsg defLease = leaseMsg(rig, "inst.leases"); defLease.lease.reset(); defLease.config = {};
-    const auto defineView = submit(rig, defLease);                        show("DefineTopic inst.leases", defineView);
-    const auto retention = rig.alterConfig("inst", {{rp::ConfigKey::RetentionMs, 1000}}); show("AlterTopicConfig retention.ms", retention);
-    const auto badTtl = rig.alterConfig("inst", {{rp::ConfigKey::LeaseTtlMs, 20'000}});  show("AlterTopicConfig lease.ttl", badTtl);
-    const auto plainTtl = rig.alterConfig("plain", {{rp::ConfigKey::LeaseTtlMs, 20'000}}); show("AlterTopicConfig lease.ttl on plain", plainTtl);
-    const auto alterAdd = rig.alterAdd("inst", "lease_x"); show("AlterTopic add lease_x", alterAdd);
+    const auto defineView = submit(rig, defLease);
+    const auto retention = rig.alterConfig("inst", {{rp::ConfigKey::RetentionMs, 1000}});
+    const auto badTtl = rig.alterConfig("inst", {{rp::ConfigKey::LeaseTtlMs, 20'000}});
+    const auto plainTtl = rig.alterConfig("plain", {{rp::ConfigKey::LeaseTtlMs, 20'000}});
+    const auto alterAdd = rig.alterAdd("inst", "lease_x");
 
-    // The outcomes the task pins (the kInternal code is 1 more than a refusal we can name; none may be it).
-    for (const auto* a : {&dropView, &dropLeaseTopic, &alterView, &createView, &defineView, &retention, &plainTtl, &alterAdd})
-        EXPECT_NE(a->code, kOk) << a->detail;
-    for (const auto* a : {&dropView, &dropLeaseTopic, &alterView, &createView, &defineView, &retention, &badTtl, &plainTtl, &alterAdd})
-        EXPECT_NE(a->code, kInternal) << a->detail;
+    constexpr uint16_t kAlterViewCode = 38, kViewExists = 32, kInvalidSchemaCode = 23;
+    EXPECT_EQ(dropView.code, kInvalidRequest);
+    EXPECT_EQ(dropView.detail, "'inst.leases' is a lease view; drop its lease topic");
+    EXPECT_EQ(dropLeaseTopic.code, kInvalidRequest);
+    EXPECT_EQ(dropLeaseTopic.detail, "'inst.leases' is a lease view; drop its lease topic");
+    EXPECT_EQ(alterView.code, kAlterViewCode);
+    EXPECT_EQ(alterView.detail, "");
+    EXPECT_EQ(createView.code, kViewExists);
+    EXPECT_EQ(createView.detail, "");
+    EXPECT_EQ(defineView.code, kTopicExists);
+    EXPECT_EQ(defineView.detail, "");
+    EXPECT_EQ(retention.code, kInvalidRequest);
+    EXPECT_EQ(retention.detail, "AlterTopicConfig: a lease topic is compacted and keeps every live lease");
+    EXPECT_EQ(plainTtl.code, kInvalidRequest);
+    EXPECT_EQ(plainTtl.detail, "AlterTopicConfig: lease.* keys need a lease topic");
+    EXPECT_EQ(alterAdd.code, kInvalidSchemaCode);
+    EXPECT_EQ(alterAdd.detail, "AlterSchema: lease_ field names are reserved");
+    EXPECT_EQ(badTtl.detail, "");
     EXPECT_EQ(badTtl.code, kOk) << badTtl.detail;
     EXPECT_EQ(topicOf(rig, "inst")->lease->ttlMs, 20'000u);
     EXPECT_EQ(topicOf(rig, "inst")->config.retentionMs, -1);
@@ -457,7 +617,6 @@ TEST(LeaseDdlRegression, LeaseObjectDdlRegression) {
     rig.admin().setClusterFeatureLevel(5);
     ASSERT_NE(topicOf(rig, "inst"), nullptr);
     const auto lvl5 = rig.alterConfig("inst", {{rp::ConfigKey::LeaseTtlMs, 30'000}});
-    show("AlterTopicConfig lease.ttl at level 5", lvl5);
     EXPECT_EQ(lvl5.code, kInvalidRequest);
     EXPECT_EQ(lvl5.detail, "lease.* keys need every broker at feature level 6");
     EXPECT_EQ(topicOf(rig, "inst")->lease->ttlMs, 20'000u);
@@ -468,7 +627,9 @@ TEST(LeaseDdlRegression, LeaseObjectDdlRegression) {
     rig.admin().setClusterFeatureLevel(6);
 
     // Dropping the topic drops its lease view.
-    ASSERT_EQ(rig.dropTopic("inst").code, kOk);
+    const auto dropInst = rig.dropTopic("inst");
+    EXPECT_EQ(dropInst.code, kOk);
+    EXPECT_EQ(dropInst.detail, "");
     EXPECT_EQ(topicOf(rig, "inst"), nullptr);
     EXPECT_EQ(viewOf(rig, "inst.leases"), nullptr);
 }

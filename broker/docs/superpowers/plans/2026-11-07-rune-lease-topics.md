@@ -318,8 +318,8 @@ settlements. The items below are open points the spec leaves to the implementati
 - **L14. Numbering.** Task 1 assigns the values listed in Global Constraints. If checked-writes Part 11 (or any other
   branch) merges first and takes one, Task 1 is rebased to the next free values and
   `LeaseProtocolRegression.NumbersPinnedRegression` pins the result; every other task refers to the symbols only.
-- **L15. Lease view name.** `<topic>.leases`. Creating any object of that name while the lease topic exists is
-  refused `TopicExists` (25); defining a lease topic whose `.leases` name is taken is refused `TopicExists`.
+- **L15. Lease view name.** `<topic>.leases`. While the lease topic exists, creating a TOPIC of that name
+  is refused `TopicExists` (25) and creating a VIEW of that name is refused `ViewExists` (32); defining a lease topic whose `.leases` name is taken is refused `TopicExists`.
   `drop view <topic>.leases` is refused `InvalidRequest` ("drop the lease topic").
 - **L16. QL `where path like`.** Only the form `like '<prefix>%'` (one trailing `%`, no other wildcard, prefix 0–127
   bytes) maps to a `ScanLeases` prefix; any other `where` on `show leases` is refused at parse with
