@@ -1,7 +1,7 @@
 #pragma once
-// TxnVoteWiring.h - checked writes Part 11: BrokerNode's half of the coordinator vote.  VoteCandidates is the
+// TxnVoteWiring.h - checked writes Part 11: BrokerNode's half of the coordinator vote.  VoteCandidateTopics is the
 // CONTROL-thread set behind TransactionCoordinationService::VoteCandidateFn; wireTxnVote / releaseTxnCoordinator
-// attach and detach the coordinator, the vote sink and the candidate predicate on the gateway.
+// attach and detach the coordinator, its vote sink and its candidate predicate on the gateway.
 //
 // The set is a superset of the topics whose partition leader judges a commit (keyed topics, every source of a view):
 // a false positive costs one yes round trip, a false negative would commit past a no.  It is never read from the
@@ -16,7 +16,7 @@
 
 namespace rune::node {
 
-class VoteCandidates {
+class VoteCandidateTopics {
 public:
     void noteWriteSpec(int32_t topicId, bool keyIndex) { if (keyIndex) topics_.insert(topicId); }
     void noteViewSources(std::span<const int32_t> sourceTopicIds) { topics_.insert(sourceTopicIds.begin(), sourceTopicIds.end()); }
@@ -27,7 +27,8 @@ private:
     std::unordered_set<int32_t> topics_;
 };
 
-inline void wireTxnVote(rune::gateway::ClientGateway& gateway, TransactionCoordinationService& txn, const VoteCandidates& candidates) {
+inline void wireTxnVote(rune::gateway::ClientGateway& gateway, TransactionCoordinationService& txn, const VoteCandidateTopics& candidates) {
+    gateway.setTxnService(&txn);
     txn.setVoteCandidateFn([&candidates](int32_t topicId) { return candidates.contains(topicId); });
     gateway.setTxnVoteSink([](void* self, int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
                               int32_t coordinatorEpoch, const rune::gateway::TxnVoteResult& r) noexcept {

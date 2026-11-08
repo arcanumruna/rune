@@ -349,6 +349,17 @@ TEST_F(CheckedWritesTxnCoordinatorTest, CandidateAtAddPartitionsIsAskedAfterItsC
     EXPECT_EQ(svc_->voteGatesForTest(), 1u);
 }
 
+TEST_F(CheckedWritesTxnCoordinatorRegression, CandidateAtCommitIsAskedThoughNotAtAddPartitions) {
+    cwIsCandidate_ = false;   // no view sources the topic yet
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}, {kPlain, 0}}, ep);
+    cwIsCandidate_ = true;    // a view was created meanwhile: the commit must be judged
+    EXPECT_EQ(endTxn("tx", pid, ep, true), 0u);
+    ASSERT_EQ(votes_.size(), 1u);
+    EXPECT_EQ(votes_[0].topic, "cw");
+    EXPECT_EQ(svc_->voteGatesForTest(), 1u);
+}
+
 TEST_F(CheckedWritesTxnCoordinatorTest, NotLeaderVoteIsResentWithBackoff) {
     int16_t ep = 0;
     const int64_t pid = beginTxn({{kCw, 0}}, ep);

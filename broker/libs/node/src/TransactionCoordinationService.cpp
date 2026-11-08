@@ -1015,6 +1015,21 @@ bool TransactionCoordinationService::startVoteGate_(const pc::EndTxn& msg, int64
             t.partition = tp.partition;
             c.targets.push_back(std::move(t));
         }
+    } else {   // a candidate now (a view created after AddPartitions) votes too
+        const uint32_t nsId = rune::coordination::parseScopedId(m->txnId).nsId;
+        for (const tx::TopicPartition& tp : m->partitions) {
+            const auto topicId = topics_->topicIdForName(nsId, tp.topic);
+            if (!topicId.has_value() || !voteCandidate_(*topicId)) continue;
+            const bool known = std::any_of(c.targets.begin(), c.targets.end(), [&](const VoteTarget& t) {
+                return t.partition == tp.partition && t.topic == tp.topic;
+            });
+            if (known) continue;
+            VoteTarget t;
+            t.topic     = tp.topic;
+            t.topicId   = *topicId;
+            t.partition = tp.partition;
+            c.targets.push_back(std::move(t));
+        }
     }
     if (c.targets.empty()) return false;
     VoteGate g;

@@ -578,91 +578,9 @@ TEST(CheckedWritesTxnVoteRoutingRegression, PurgeDropsVotesOfOlderCoordinatorEpo
     EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u);
 }
 
-// The coordinator's load and unload purge the gateway's votes.  A store-backed coordinator behind the real gateway: an
-// unload and reload at the SAME coordinator epoch (a lost coordinator check) must not let the old load's vote count
-// for the retried commit, and a vote of an older epoch is dropped by the load.
-TEST(CheckedWritesTxnVoteRoutingRegression, LoadAndUnloadPurgeTheGatewaysVotesRegression) {
-    namespace pc = rune::protocol::client;
-    VoteRig R;
-    VoteTmpDir logDir;
-    rune::storage::Log txnLog(logDir.path.string());
-    PartitionConfig c; c.topicId = 0; c.partitionId = 0; c.selfId = 1; c.minIsr = 1; c.durabilityTier = 1;
-    c.fetchIntervalNs = 1'000'000LL; c.isrCheckIntervalNs = 1'000'000LL; c.pushOnAppend = false; c.replicaLagMaxMs = 1'000'000;
-    PartitionReplica txnReplica(c, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &txnLog, &R.t);
-    rune::transaction::ReplicatedTxnStateStore store(&txnReplica);
-    bool leader = true;
-    rune::node::TransactionCoordinationService tcs(&store, &R.topics, [&] { return leader; }, [] { return NodeId{1}; });
-    tcs.setGateway(&R.gw);
-    tcs.setVoteCandidateFn([](int32_t topicId) { return topicId == 0; });
-    R.gw.setTxnVoteSink([](void* self, int32_t t, int32_t p, int64_t pid, int16_t ep, int32_t ce, const TxnVoteResult& r) noexcept {
-        static_cast<rune::node::TransactionCoordinationService*>(self)->onTxnVoteResult(t, p, pid, ep, ce, r);
-    }, &tcs);
-    std::vector<std::vector<uint8_t>> frames;
-    R.gw.setOnControlFrame([&](int64_t, const uint8_t* f, std::size_t n) { frames.emplace_back(f, f + n); });
-
-    int64_t now = 1'000'000'000;
-    const auto step = [&] { now += 1'000'000; txnReplica.doWork(now); (void)tcs.doWork(now); };
-    for (int i = 0; i < 20 && !tcs.isLoaded(); ++i) step();
-    ASSERT_TRUE(tcs.isLoaded());
-    rune::coordination::NsRequestContext ctx{};
-    std::array<uint8_t, 1024> req{}, out{};
-    const std::string txn = "tx";
-    const std::span<const uint8_t> txnBytes(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
-    pc::InitProducerId init;
-    init.sessionId = 1; init.correlationId = 1; init.transactionTimeoutMs = 600'000; init.transactionalId = txnBytes;
-    const std::size_t initN = tcs.handleInitProducerId(req.data(), init.encode(req.data()), now, out.data(), out.size(), ctx);
-    step(); step();
-    ASSERT_TRUE(initN != 0 || !frames.empty());
-    const auto ip = initN != 0 ? pc::InitProducerIdResponse::decode(out.data(), initN)
-                               : pc::InitProducerIdResponse::decode(frames.back().data(), frames.back().size());
-    ASSERT_TRUE(ip && ip->errorCode == 0);
-    const int64_t pid = ip->producerId;
-    const int16_t ep = ip->producerEpoch;
-    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
-    pc::AddPartitionsToTxn add;
-    add.sessionId = 1; add.correlationId = 2; add.producerId = pid; add.producerEpoch = ep; add.transactionalId = txnBytes;
-    (void)tcs.handleAddPartitions(req.data(), add.encode(req.data(), parts), now, out.data(), out.size(), ctx);
-    step(); step();
-    pc::EndTxn end;
-    end.sessionId = 1; end.correlationId = 3; end.producerId = pid; end.producerEpoch = ep; end.commit = 1; end.transactionalId = txnBytes;
-    ASSERT_EQ(tcs.handleEndTxn(req.data(), end.encode(req.data()), now, out.data(), out.size(), ctx), 0u);
-    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
-    const int64_t oldToken = R.gw.lastVoteTokenForTest();
-    const int32_t epochBefore = tcs.coordinatorEpoch();
-
-    leader = false;   // the coordinator check is lost: unload
-    step();
-    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u) << "the unload purges the gateway's votes of this load";
-    // A vote of an older coordinator epoch is still out while unloaded: the next load drops it.
-    ASSERT_GE(R.gw.sendTxnVote(0, 0, pid + 1, ep, epochBefore - 1), 0);
-    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
-    leader = true;
-    step(); step();
-    ASSERT_TRUE(tcs.isLoaded());
-    ASSERT_EQ(tcs.coordinatorEpoch(), epochBefore) << "a reload at the same epoch";
-    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u) << "the load purges the older epochs' votes";
-    ASSERT_EQ(tcs.txnStateForTest("tx"), rune::transaction::TxnState::Ongoing);
-
-    end.correlationId = 4;   // the client's retry asks every partition again
-    ASSERT_EQ(tcs.handleEndTxn(req.data(), end.encode(req.data()), now, out.data(), out.size(), ctx), 0u);
-    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
-    WorkerReturn late;   // the old load's vote answers a no
-    late.type = WorkerReturn::Type::TxnVoteResult;
-    late.correlationId = oldToken;
-    late.sessionId = -1;
-    late.recordCount = 55;
-    late.newNextOffset = 0x00070000;
-    late.baseOffset = 123;
-    R.gw.handleWorkerReturnForTest(late);
-    step();
-    EXPECT_EQ(tcs.txnStateForTest("tx"), rune::transaction::TxnState::Ongoing) << "the old load's answer does not count for the retried gate";
-    EXPECT_EQ(tcs.voteGatesForTest(), 1u);
-    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
-}
-
 // BrokerNode's wiring (TxnVoteWiring.h): the candidate set, and the vote sink / predicate on the real gateway.
 TEST(CheckedWritesTxnVoteRouting, CandidateSetHoldsKeyedTopicsAndEveryViewSource) {
-    VoteCandidates c;
+    VoteCandidateTopics c;
     c.noteWriteSpec(1, true);
     c.noteWriteSpec(2, false);   // a typed topic without key.index
     const std::vector<int32_t> sources = {4, 5, 6};
@@ -682,7 +600,7 @@ TEST(CheckedWritesTxnVoteRouting, CandidateSetHoldsKeyedTopicsAndEveryViewSource
 namespace {
 namespace pc = rune::protocol::client;
 // A store-backed coordinator wired to the rig's gateway the way BrokerNode does, with one open transaction on topic 0.
-struct WiredCoordinator {
+struct CheckedWritesTxnVoteRoutingWired : ::testing::Test {
     VoteRig R;
     VoteTmpDir logDir;
     rune::storage::Log txnLog{logDir.path.string()};
@@ -693,69 +611,127 @@ struct WiredCoordinator {
     }();
     PartitionReplica txnReplica{c, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &txnLog, &R.t};
     rune::transaction::ReplicatedTxnStateStore store{&txnReplica};
+    bool leader = true;
     std::unique_ptr<TransactionCoordinationService> tcs = std::make_unique<TransactionCoordinationService>(
-        &store, &R.topics, [] { return true; }, [] { return NodeId{1}; });
-    VoteCandidates candidates;
+        &store, &R.topics, [this] { return leader; }, [] { return NodeId{1}; });
+    VoteCandidateTopics candidates;
     int64_t now = 1'000'000'000;
     std::array<uint8_t, 1024> req{}, out{};
     rune::coordination::NsRequestContext ctx{};
     pc::EndTxn end;
     std::vector<std::vector<uint8_t>> frames;
     const std::string txn = "tx";
+    int64_t pid = 0;
+    int16_t ep = 0;
 
-    explicit WiredCoordinator(bool keyed) {   // the candidates are judged when the partition is added
+    // The candidates are judged when the partition is added, so a keyed topic is noted before.
+    void begin(bool keyed) {
         if (keyed) candidates.noteWriteSpec(0, true);
         R.gw.setOnControlFrame([this](int64_t, const uint8_t* f, std::size_t n) { frames.emplace_back(f, f + n); });
         tcs->setGateway(&R.gw);
-        R.gw.setTxnService(tcs.get());
         wireTxnVote(R.gw, *tcs, candidates);
         for (int i = 0; i < 20 && !tcs->isLoaded(); ++i) step();
+        ASSERT_TRUE(tcs->isLoaded());
         const std::span<const uint8_t> txnBytes(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
         pc::InitProducerId init;
         init.sessionId = 1; init.correlationId = 1; init.transactionTimeoutMs = 600'000; init.transactionalId = txnBytes;
         const std::size_t initN = tcs->handleInitProducerId(req.data(), init.encode(req.data()), now, out.data(), out.size(), ctx);
         step(); step();
+        ASSERT_TRUE(initN != 0 || !frames.empty());
         const auto ip = initN != 0 ? pc::InitProducerIdResponse::decode(out.data(), initN)
                                    : pc::InitProducerIdResponse::decode(frames.back().data(), frames.back().size());
+        ASSERT_TRUE(ip && ip->errorCode == 0);
+        pid = ip->producerId;
+        ep = ip->producerEpoch;
         pc::AddPartitionsToTxn add;
-        add.sessionId = 1; add.correlationId = 2; add.producerId = ip->producerId; add.producerEpoch = ip->producerEpoch; add.transactionalId = txnBytes;
+        add.sessionId = 1; add.correlationId = 2; add.producerId = pid; add.producerEpoch = ep; add.transactionalId = txnBytes;
         const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
-        (void)tcs->handleAddPartitions(req.data(), add.encode(req.data(), parts), now, out.data(), out.size(), ctx);
+        const std::size_t addN = tcs->handleAddPartitions(req.data(), add.encode(req.data(), parts), now, out.data(), out.size(), ctx);
         step(); step();
-        end.sessionId = 1; end.correlationId = 3; end.producerId = ip->producerId; end.producerEpoch = ip->producerEpoch; end.commit = 1; end.transactionalId = txnBytes;
+        ASSERT_TRUE(addN != 0 || !frames.empty());
+        const auto ar = addN != 0 ? pc::AddPartitionsToTxnResponse::decode(out.data(), addN)
+                                  : pc::AddPartitionsToTxnResponse::decode(frames.back().data(), frames.back().size());
+        ASSERT_TRUE(ar && ar->results.size() == 1 && ar->results[0].errorCode == 0);
+        end.sessionId = 1; end.correlationId = 3; end.producerId = pid; end.producerEpoch = ep; end.commit = 1; end.transactionalId = txnBytes;
     }
     void step() { now += 1'000'000; txnReplica.doWork(now); if (tcs) (void)tcs->doWork(now); }
     std::size_t endTxn() { return tcs->handleEndTxn(req.data(), end.encode(req.data()), now, out.data(), out.size(), ctx); }
 };
 } // namespace
 
-TEST(CheckedWritesTxnVoteRouting, CommitOnACandidateSendsAVoteThroughTheGatewayAndTheSinkAnswersIt) {
-    WiredCoordinator W(true);
-    ASSERT_EQ(W.endTxn(), 0u);
-    ASSERT_EQ(W.R.gw.txnVotesInFlightForTest(), 1u);
-    W.R.runWorker(2);   // the leader answers yes into the coordinator, through the gateway's sink
-    EXPECT_EQ(W.R.gw.txnVotesInFlightForTest(), 0u);
-    for (int i = 0; i < 4; ++i) W.step();
-    EXPECT_EQ(W.tcs->txnStateForTest("tx"), rune::transaction::TxnState::PrepareCommit) << "the yes reached the gate";
+// The coordinator's load and unload purge the gateway's votes.  An unload and reload at the SAME coordinator epoch (a
+// lost coordinator check) must not let the old load's vote count for the retried commit, and a vote of an older epoch
+// is dropped by the load.
+TEST_F(CheckedWritesTxnVoteRoutingWired, LoadAndUnloadPurgeTheGatewaysVotesRegression) {
+    ASSERT_NO_FATAL_FAILURE(begin(true));
+    ASSERT_EQ(endTxn(), 0u);
+    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
+    const int64_t oldToken = R.gw.lastVoteTokenForTest();
+    const int32_t epochBefore = tcs->coordinatorEpoch();
+
+    leader = false;   // the coordinator check is lost: unload
+    step();
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u) << "the unload purges the gateway's votes of this load";
+    // A vote of an older coordinator epoch is still out while unloaded: the next load drops it.
+    ASSERT_GE(R.gw.sendTxnVote(0, 0, pid + 1, ep, epochBefore - 1), 0);
+    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
+    leader = true;
+    step(); step();
+    ASSERT_TRUE(tcs->isLoaded());
+    ASSERT_EQ(tcs->coordinatorEpoch(), epochBefore) << "a reload at the same epoch";
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u) << "the load purges the older epochs' votes";
+    ASSERT_EQ(tcs->txnStateForTest("tx"), rune::transaction::TxnState::Ongoing);
+
+    end.correlationId = 4;   // the client's retry asks every partition again
+    ASSERT_EQ(endTxn(), 0u);
+    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
+    WorkerReturn late;   // the old load's vote answers a no
+    late.type = WorkerReturn::Type::TxnVoteResult;
+    late.correlationId = oldToken;
+    late.sessionId = -1;
+    late.recordCount = 55;
+    late.newNextOffset = 0x00070000;
+    late.baseOffset = 123;
+    R.gw.handleWorkerReturnForTest(late);
+    step();
+    EXPECT_EQ(tcs->txnStateForTest("tx"), rune::transaction::TxnState::Ongoing) << "the old load's answer does not count for the retried gate";
+    EXPECT_EQ(tcs->voteGatesForTest(), 1u);
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
 }
 
-TEST(CheckedWritesTxnVoteRouting, CommitOnAPlainTopicAsksNoVote) {
-    WiredCoordinator W(false);
-    EXPECT_NE(W.endTxn(), 0u) << "answered at once";
-    EXPECT_EQ(W.R.gw.txnVotesInFlightForTest(), 0u);
-    EXPECT_EQ(W.tcs->voteGatesForTest(), 0u);
+TEST_F(CheckedWritesTxnVoteRoutingWired, CommitOnACandidateSendsAVoteThroughTheGatewayAndTheSinkAnswersIt) {
+    ASSERT_NO_FATAL_FAILURE(begin(true));
+    ASSERT_EQ(endTxn(), 0u);
+    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
+    R.runWorker(2);   // the leader answers yes into the coordinator, through the gateway's sink
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u);
+    for (int i = 0; i < 4; ++i) step();
+    EXPECT_EQ(tcs->txnStateForTest("tx"), rune::transaction::TxnState::PrepareCommit) << "the yes reached the gate";
+}
+
+TEST_F(CheckedWritesTxnVoteRoutingWired, CommitOnAPlainTopicAsksNoVote) {
+    ASSERT_NO_FATAL_FAILURE(begin(false));
+    const std::size_t n = endTxn();
+    ASSERT_NE(n, 0u) << "answered at once";
+    const auto r = pc::EndTxnResponse::decode(out.data(), n);
+    ASSERT_TRUE(r);
+    EXPECT_EQ(r->errorCode, 0);
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u);
+    EXPECT_EQ(tcs->voteGatesForTest(), 0u);
+    EXPECT_EQ(tcs->txnStateForTest("tx"), rune::transaction::TxnState::PrepareCommit);
 }
 
 // The setup-failure path and the teardown both release through releaseTxnCoordinator: the gateway must not keep the dead coordinator.
-TEST(CheckedWritesTxnVoteRoutingRegression, ReleaseDetachesTheGatewayFromTheCoordinatorRegression) {
-    WiredCoordinator W(true);
-    ASSERT_EQ(W.endTxn(), 0u);
-    ASSERT_EQ(W.R.gw.txnVotesInFlightForTest(), 1u);
-    ASSERT_TRUE(W.R.gw.txnVoteSinkSetForTest());
-    releaseTxnCoordinator(&W.R.gw, W.tcs);
-    EXPECT_EQ(W.tcs, nullptr);
-    EXPECT_EQ(W.R.gw.txnService(), nullptr) << "no dangling handler";
-    EXPECT_FALSE(W.R.gw.txnVoteSinkSetForTest()) << "no dangling sink";
-    W.R.runWorker(2);   // the late answer of an in-flight vote reaches no one
-    EXPECT_EQ(W.R.gw.txnVotesInFlightForTest(), 0u);
+TEST_F(CheckedWritesTxnVoteRoutingWired, ReleaseDetachesTheGatewayFromTheCoordinatorRegression) {
+    ASSERT_NO_FATAL_FAILURE(begin(true));
+    ASSERT_EQ(endTxn(), 0u);
+    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
+    ASSERT_TRUE(R.gw.txnVoteSinkSetForTest());
+    ASSERT_NE(R.gw.txnService(), nullptr);
+    releaseTxnCoordinator(&R.gw, tcs);
+    EXPECT_EQ(tcs, nullptr);
+    EXPECT_EQ(R.gw.txnService(), nullptr) << "no dangling handler";
+    EXPECT_FALSE(R.gw.txnVoteSinkSetForTest()) << "no dangling sink";
+    R.runWorker(2);   // the late answer of an in-flight vote reaches no one
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u);
 }

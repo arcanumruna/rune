@@ -2562,8 +2562,7 @@ void BrokerNode::buildGateway() {
             txnCoordService_->setStuckMarkersSink(&BrokerNode::publishStuckMarkers_, this);
             txnCoordService_->setStuckTxnOffsetsSink(&BrokerNode::publishStuckTxnOffsets_, this);   // #359
 
-            gateway_->setTxnService(txnCoordService_.get());
-            wireTxnVote(*gateway_, *txnCoordService_, voteCandidates_);
+            wireTxnVote(*gateway_, *txnCoordService_, voteCandidateTopics_);
             // Phase 2b F Task 11: a committed transaction's consumer-group offsets (TxnOffsetCommit) are applied to
             // the group coordinator's offset store - without this they were accepted and silently dropped.
             if (groupCoordService_) {
@@ -5012,7 +5011,7 @@ void BrokerNode::fanoutViewPlan_(ViewPlanUpdateMsg msg) {
     } else if (auto plan = rune::view::deserializeCompiledViewPlan(msg.planBlob);
                plan && !plan->sourceTopicId.empty()) {
         if (gateway_) gateway_->noteViewSource(msg.viewTopicId, plan->sourceTopicId[0]);
-        voteCandidates_.noteViewSources(plan->sourceTopicId);
+        voteCandidateTopics_.noteViewSources(plan->sourceTopicId);
     }
     viewFanoutBacklog_.push_back(ViewFanoutPending{std::move(msg), 0});
     (void)pumpViewFanout_();
@@ -5292,7 +5291,7 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             }
             if (tid == kA2cWriteSpec) {   // checked writes: a typed topic's write spec -> every worker, behind its schema versions
                 if (const auto w = decodeTopicWriteSpec(std::span<const uint8_t>(p, n))) {
-                    voteCandidates_.noteWriteSpec(w->topicId, w->keyIndex);
+                    voteCandidateTopics_.noteWriteSpec(w->topicId, w->keyIndex);
                     schemaFanout_.postWriteSpec(w->topicId, std::vector<uint8_t>(p, p + n));
                 }
                 else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
@@ -6059,7 +6058,7 @@ void BrokerNode::dropRuntimeTopic_(int32_t topicId, uint32_t nsId, const std::st
     // posted on every path below (pending create, gap id, live topic): the id is dropped on this broker.
     if (workerPool_) topicDroppedFanout_.post(topicId);
     schemaFanout_.forgetTopic(topicId);
-    voteCandidates_.forget(topicId);
+    voteCandidateTopics_.forget(topicId);
     // A typed create still waiting for its spec never ran: forget it, like one waiting behind a drop (below).
     const auto awaitingSpec = pendingCreatesAwaitingSpec_.size();
     std::erase_if(pendingCreatesAwaitingSpec_, [topicId](const TopicSpec& s) { return s.topicId == topicId; });

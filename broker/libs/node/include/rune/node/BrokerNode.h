@@ -2706,7 +2706,7 @@ private:
     std::unique_ptr<rune::replication::PartitionReplica>            txnReplica_;
     std::unique_ptr<rune::transaction::ReplicatedTxnStateStore>     txnState_;
     std::unique_ptr<TransactionCoordinationService>                 txnCoordService_;
-    VoteCandidates                                                  voteCandidates_;   // control-thread-owned; the coordinator's vote predicate reads it
+    VoteCandidateTopics                                             voteCandidateTopics_;   // control-thread-owned; the coordinator's vote predicate reads it
 
     // -----------------------------------------------------------------------
     // Cluster metadata (MD1 wiring — created in buildGateway()).
