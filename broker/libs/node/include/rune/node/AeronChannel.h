@@ -5,6 +5,9 @@
 #include <string>
 #include <string_view>
 
+#include <rune/protocol/client/CryptoEnvelope.h>
+#include <rune/protocol/client/DataMessages.h>
+
 namespace rune::node {
 
 /// `channel` with a per-publication `term-length` (bytes) appended, unless the channel already sets
@@ -20,8 +23,10 @@ namespace rune::node {
     return ch;
 }
 
-/// Smallest term of an ack publication: a 4096-verdict ack (32,824 B) is offered, and Aeron caps one message at term / 8.
+/// Smallest term of an ack publication: the largest ack (49,211 B: 4096 verdicts, or 2048 verdicts and 2048 leases) is offered, and Aeron caps one message at term / 8.
 inline constexpr int32_t kMinAckTermBytes = 512 * 1024;
+static_assert(kMinAckTermBytes / 8 >= rune::protocol::client::ProduceResponse::kMaxEncodedSize + rune::protocol::client::kCryptoOverhead,
+              "the largest sealed ack must fit one Aeron message");
 
 /// withTermLength for an ack channel: a `term-length` below kMinAckTermBytes (the channel's own or termBytes) is raised to it.
 /// termBytes <= 0 with no explicit value gets the floor.  Cold path (publication setup).

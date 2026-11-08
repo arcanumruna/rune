@@ -53,10 +53,11 @@ inline void encodeLeaseSpec(const LeaseSpec& s, uint8_t* out) noexcept {
     put(out + 35, s.checkpointRate, 4);
 }
 
-/// Reads exactly kLeaseSpecBytes bytes; false when len is shorter or the checkpoint byte is not 0/1.
+/// Reads exactly kLeaseSpecBytes bytes; false only when len is shorter.  The checkpoint byte is NOT checked here:
+/// validateLeaseSpec refuses it ("lease.checkpoint must be 0 or 1") so a bad byte answers InvalidRequest, not InvalidSchema.
 inline bool decodeLeaseSpec(const uint8_t* in, std::size_t len, LeaseSpec& out) noexcept {
     using lease_detail::get;
-    if (len < kLeaseSpecBytes || in[30] > 1) return false;
+    if (len < kLeaseSpecBytes) return false;
     LeaseSpec s;
     s.ttlMs                = get(in + 0, 8);
     s.minTtlMs             = get(in + 8, 8);

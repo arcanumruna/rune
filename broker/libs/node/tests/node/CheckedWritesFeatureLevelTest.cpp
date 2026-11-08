@@ -30,7 +30,7 @@ void sendLevel(Worker& w, int16_t level) {
 }
 } // namespace
 
-TEST(CheckedWritesFeatureLevel, LatestIsCheckedWrites) {
+TEST(CheckedWritesFeatureLevel, LatestIsLeases) {
     static_assert(mf::kCheckedWrites == 5 && mf::kLeases == 6 && mf::kLatest == mf::kLeases && mf::kTxnPartitionVerify == 4);
     SUCCEED();
 }

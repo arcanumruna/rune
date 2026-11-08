@@ -1,10 +1,13 @@
 #pragma once
+#include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
 #include <span>
 #include <string_view>
+#include "../LeaseRecord.h"
 #include "Codec.h"
 #include "MessageHeader.h"
 #include "Protocol.h"
@@ -207,6 +210,9 @@ struct Produce {
 // [hasLease u8 = 1][count u16][count x {leaseVersion i64, ttlMs u64}].  A lease trailer REQUIRES the verdict trailer
 // (so decode is unambiguous): encodeFor writes the verdict trailer (count 0 when there are no verdicts) whenever it
 // writes a lease trailer.  A session below 18 is never sent a lease trailer; its frame is byte-identical to version 17.
+// {hasVerdicts=false, hasLease=true} therefore decodes as hasVerdicts=true with count 0; a v18 reader treats an empty
+// verdict trailer as "no verdicts".  A lease trailer holds at most record::kMaxLeaseBatchRecords entries (so does the
+// verdict trailer that precedes it), which keeps the largest ack inside one Aeron message.
 // ---------------------------------------------------------------------------
 struct ProduceResponse {
     int64_t sessionId      = 0;
@@ -232,8 +238,11 @@ struct ProduceResponse {
     static constexpr std::size_t ENCODED_SIZE    = MessageHeader::ENCODED_SIZE + BODY_FIXED;    // 46
     static constexpr std::size_t ENCODED_SIZE_V0 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V0; // 38
     static constexpr std::size_t ENCODED_SIZE_V17 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V17; // 54
-    static constexpr std::size_t kMaxEncodedSize = ENCODED_SIZE_V17 + 2 + 8 * std::size_t{kMaxVerdictEntries} +
-                                                   3 + 16 * std::size_t{kMaxVerdictEntries};   // 98,363
+    // Either a verdict-only ack (4096 entries) or a lease ack (verdict + lease trailers, each at most
+    // kMaxLeaseBatchRecords): the larger of the two, 49,211 B.
+    static constexpr std::size_t kMaxEncodedSize = std::max(
+        ENCODED_SIZE_V17 + 2 + 8 * std::size_t{kMaxVerdictEntries},
+        ENCODED_SIZE_V17 + 2 + 8 * record::kMaxLeaseBatchRecords + 3 + 16 * record::kMaxLeaseBatchRecords);
 
     /// Encode the full frame (46 bytes) into buf.  Returns 46.
     std::size_t encode(uint8_t* buf) const noexcept {
@@ -312,6 +321,11 @@ struct ProduceResponse {
     std::size_t encodeFor(uint8_t* buf, int32_t clientVersion) const noexcept {
         const bool full = clientUnderstandsUnknownProducerId(clientVersion);
         const bool v17  = clientUnderstandsCheckedWrites(clientVersion);
+        // Precondition: verdictCount <= kMaxVerdictEntries; with a lease trailer also leaseCount and verdictCount
+        // <= record::kMaxLeaseBatchRecords (the decoder refuses anything larger).
+        assert(verdictCount <= kMaxVerdictEntries);
+        assert(!(hasLease && clientUnderstandsLeases(clientVersion)) ||
+               (leaseCount <= record::kMaxLeaseBatchRecords && verdictCount <= record::kMaxLeaseBatchRecords));
         MessageHeader hdr;
         hdr.blockLength   = v17 ? BODY_FIXED_V17 : full ? BODY_FIXED : BODY_FIXED_V0;
         hdr.templateId    = TEMPLATE_ID;
@@ -384,7 +398,8 @@ struct ProduceResponse {
         // The lease trailer (client 18): exactly [1][count u16] + count x 16 bytes after the verdict trailer.
         if (avail < verdictEnd + 3 || buf[verdictEnd] != 1) return std::nullopt;
         const uint16_t lc = detail::getLE16(buf, static_cast<int>(verdictEnd + 1));
-        if (lc > kMaxVerdictEntries || avail != verdictEnd + 3 + 16 * std::size_t{lc}) return std::nullopt;
+        if (lc > record::kMaxLeaseBatchRecords || count > record::kMaxLeaseBatchRecords ||
+            avail != verdictEnd + 3 + 16 * std::size_t{lc}) return std::nullopt;
         msg.hasLease   = true;
         msg.leaseCount = lc;
         msg.leaseBytes = std::span<const uint8_t>(buf + verdictEnd + 3, 16 * std::size_t{lc});
@@ -393,6 +408,7 @@ struct ProduceResponse {
 };
 
 static_assert(kMaxJudgedBatchRecords == ProduceResponse::kMaxVerdictEntries);
+static_assert(ProduceResponse::kMaxEncodedSize == 49211);
 
 // ---------------------------------------------------------------------------
 // Subscribe  (templateId 18)  client→broker

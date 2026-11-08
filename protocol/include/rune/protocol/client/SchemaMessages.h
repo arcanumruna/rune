@@ -434,6 +434,9 @@ struct TopicSchemaResponse {
         m.errorCode = detail::getLE16(buf, static_cast<int>(pos)); pos += 2;
         if (!getVarBytes32(buf, avail, pos, m.descriptorBlob, m.descriptorLen)) return std::nullopt;
         // Trailing (Phase 2b): absent / cut short on a pre-2b frame -> 0.
+        // After keyFeatures, the remainder means: under 1 + kLeaseSpecBytes (40) bytes = no lease; 40 or more starting
+        // with 1 = a lease; 40 or more starting with anything else = refused.  Bytes after the lease block are ignored
+        // (forward compatibility).
         if (avail >= pos + 4) {
             m.partitionCount = detail::getLE32(buf, static_cast<int>(pos)); pos += 4;
             if (avail >= pos + kTopicKeyFeaturesWireLen) {

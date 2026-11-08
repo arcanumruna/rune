@@ -2,6 +2,7 @@
 // ProduceResponse / DefineTopic / TopicSchemaResponse lease trailers, and the pinned numbers.
 #include <rune/protocol/LeaseRecord.h>
 #include <rune/protocol/LeaseSpec.h>
+#include <rune/protocol/client/CryptoEnvelope.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/LeaseMessages.h>
@@ -383,7 +384,7 @@ rc::ProduceResponse baseResponse() {
 TEST(LeaseProtocolRegression, ProduceLeaseTrailerRegression) {
     Bytes verdicts(16);
     for (std::size_t i = 0; i < verdicts.size(); ++i) verdicts[i] = static_cast<uint8_t>(i + 1);
-    for (const uint16_t lc : {uint16_t{1}, uint16_t{4096}}) {
+    for (const uint16_t lc : {uint16_t{1}, uint16_t{2048}}) {
         Bytes leases(16u * lc);
         for (std::size_t i = 0; i < leases.size(); ++i) leases[i] = static_cast<uint8_t>(i * 31 + 3);
         auto r = baseResponse();
@@ -447,7 +448,7 @@ TEST(LeaseProtocolRegression, ProduceLeaseTrailerRegression) {
         bad[57] = 0; bad[58] = 0;   // count 0 but 16 stray bytes
         EXPECT_FALSE(rc::ProduceResponse::decode(bad.data(), bad.size()).has_value());
         Bytes big(bad.begin(), bad.begin() + 57);
-        big.insert(big.end(), {0x01, 0x10});   // count 4097 with no data
+        big.insert(big.end(), {0x01, 0x08});   // count 2049 with no data
         EXPECT_FALSE(rc::ProduceResponse::decode(big.data(), big.size()).has_value());
     }
     // (c) a session below 18 is never sent the trailer: byte-identical to hasLease=false
@@ -471,7 +472,7 @@ TEST(LeaseProtocolRegression, ProduceLeaseTrailerRegression) {
     EXPECT_EQ(rc::ProduceResponse::encodedSizeFor(16, true, 3), 46u);
     EXPECT_EQ(rc::ProduceResponse::encodedSizeFor(17, true, 3, true, 5), 54u + 2 + 24);
     EXPECT_EQ(rc::ProduceResponse::encodedSizeFor(18, false, 0, false, 0), 54u);
-    EXPECT_EQ(rc::ProduceResponse::kMaxEncodedSize, 54u + 2 + 8 * 4096 + 3 + 16 * 4096);
+    EXPECT_EQ(rc::ProduceResponse::kMaxEncodedSize, 49211u);
 }
 
 // ---------------------------------------------------------------------------
@@ -550,11 +551,14 @@ TEST(LeaseProtocolRegression, DefineTopicLeaseSpecRegression) {
         Bytes g = lf; g.push_back(0);
         EXPECT_FALSE(rc::DefineTopic::decode(g.data(), g.size()).has_value());
     }
-    // an undecodable spec (checkpoint byte 2) is refused by decode
+    // a checkpoint byte of 2 still decodes (validateLeaseSpec refuses it, so the broker answers InvalidRequest)
     {
         Bytes f = lf;
         f[pf.size() + 1 + 30] = 2;
-        EXPECT_FALSE(rc::DefineTopic::decode(f.data(), f.size()).has_value());
+        const auto cd2 = rc::DefineTopic::decode(f.data(), f.size());
+        ASSERT_TRUE(cd2.has_value());
+        EXPECT_EQ(cd2->lease.checkpoint, 2);
+        EXPECT_TRUE(rp::validateLeaseSpec(cd2->lease).has_value());
     }
     // decode does NOT range-check (validateLeaseSpec is the broker's): an out-of-range spec still decodes
     {
@@ -602,14 +606,17 @@ TEST(LeaseProtocolRegression, SchemaLeaseTrailerRegression) {
         ASSERT_TRUE(d.has_value()) << extra;
         EXPECT_FALSE(d->hasLease) << extra;
     }
-    // marker 2 with 40 bytes; an undecodable spec
+    // marker 2 with 40 bytes; a checkpoint byte of 2
     {
         Bytes f = lf;
         f[noLease.size()] = 2;
         EXPECT_FALSE(rc::TopicSchemaResponse::decode(f.data(), f.size()).has_value());
         Bytes g = lf;
-        g[noLease.size() + 1 + 30] = 2;
-        EXPECT_FALSE(rc::TopicSchemaResponse::decode(g.data(), g.size()).has_value());
+        g[noLease.size() + 1 + 30] = 2;   // decode checks the length only; validateLeaseSpec refuses the byte (M3)
+        const auto gd = rc::TopicSchemaResponse::decode(g.data(), g.size());
+        ASSERT_TRUE(gd.has_value());
+        EXPECT_EQ(gd->lease.checkpoint, 2);
+        EXPECT_TRUE(rp::validateLeaseSpec(gd->lease).has_value());
     }
     // hasLease without hasKeyFeatures is refused at encode
     {
@@ -669,7 +676,9 @@ TEST(LeaseProtocolRegression, LeaseSpecValidateRegression) {
     uint8_t cp[rp::kLeaseSpecBytes];
     std::memcpy(cp, buf, sizeof cp);
     cp[30] = 2;
-    EXPECT_FALSE(rp::decodeLeaseSpec(cp, sizeof cp, out));
+    ASSERT_TRUE(rp::decodeLeaseSpec(cp, sizeof cp, out));   // decode checks the length only (M3)
+    EXPECT_EQ(out.checkpoint, 2);
+    EXPECT_TRUE(rp::validateLeaseSpec(out).has_value());
     uint8_t def[rp::kLeaseSpecBytes];
     rp::encodeLeaseSpec(S{}, def);
     EXPECT_EQ(hexOf(def, 39), kDefaultSpecHex);
@@ -728,4 +737,135 @@ TEST(LeaseProtocolRegression, NumbersPinnedRegression) {
     EXPECT_EQ(rc::kLeaseKeepAliveMaxEntries, 256u);
     EXPECT_EQ(rc::kScanLeasesMaxRows, 1024u);
     EXPECT_EQ(rc::kScanLeasesMaxPrefixBytes, 127u);
+}
+
+// ---------------------------------------------------------------------------
+// review fixes: the largest ack, the checkpoint byte, truncation at every offset, v17 identity, pinned bounds
+// ---------------------------------------------------------------------------
+TEST(LeaseProtocolRegression, MaxLeaseAckFitsOneAeronMessageRegression) {
+    static_assert(rr::kMaxLeaseBatchRecords == 2048);
+    EXPECT_EQ(rc::ProduceResponse::kMaxEncodedSize, 49211u);
+    EXPECT_LE(rc::ProduceResponse::kMaxEncodedSize + rc::kCryptoOverhead, 65536u);   // term 512 KiB / 8
+    // the largest lease ack encodes within kMaxEncodedSize and decodes back
+    Bytes verdicts(8u * 2048, 5), leases(16u * 2048, 7);
+    auto r = baseResponse();
+    r.hasVerdicts = true; r.verdictCount = 2048; r.verdictBytes = sp(verdicts);
+    r.hasLease = true; r.leaseCount = 2048; r.leaseBytes = sp(leases);
+    Bytes buf(rc::ProduceResponse::kMaxEncodedSize);
+    const std::size_t n = r.encodeFor(buf.data(), rc::kClientVersionLeases);
+    EXPECT_EQ(n, rc::ProduceResponse::kMaxEncodedSize);
+    const auto d = rc::ProduceResponse::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->leaseCount, 2048u);
+    // 2049 lease entries, or 2049 verdicts before a lease trailer, are refused by decode
+    for (const bool leaseOver : {true, false}) {
+        Bytes f(54 + 2 + 8u * 2049 + 3 + 16u * 2049, 0);
+        const uint16_t vc = leaseOver ? 0 : 2049, lc = leaseOver ? 2049 : 0;
+        const std::size_t len = 54 + 2 + 8u * vc + 3 + 16u * lc;
+        std::memcpy(f.data(), buf.data(), 54);
+        f[54] = static_cast<uint8_t>(vc & 0xff); f[55] = static_cast<uint8_t>(vc >> 8);
+        const std::size_t lp = 56 + 8u * vc;
+        f[lp] = 1; f[lp + 1] = static_cast<uint8_t>(lc & 0xff); f[lp + 2] = static_cast<uint8_t>(lc >> 8);
+        EXPECT_FALSE(rc::ProduceResponse::decode(f.data(), len).has_value()) << leaseOver;
+    }
+}
+
+TEST(LeaseProtocolRegression, CheckpointByteTwoDecodesAndValidateRefusesRegression) {
+    rp::LeaseSpec s;
+    uint8_t buf[rp::kLeaseSpecBytes];
+    rp::encodeLeaseSpec(s, buf);
+    buf[30] = 2;
+    rp::LeaseSpec out;
+    ASSERT_TRUE(rp::decodeLeaseSpec(buf, sizeof buf, out));
+    EXPECT_EQ(out.checkpoint, 2);
+    const auto why = rp::validateLeaseSpec(out);
+    ASSERT_TRUE(why.has_value());
+    EXPECT_EQ(*why, "lease.checkpoint must be 0 or 1");
+    EXPECT_FALSE(rp::decodeLeaseSpec(buf, rp::kLeaseSpecBytes - 1, out));
+}
+
+TEST(LeaseProtocolRegression, LeaseTrailersTruncatedAtEveryOffsetRegression) {
+    // ProduceResponse (verdicts + lease): every cut from the start of the verdict trailer (54) to full-1.  Cut at 54
+    // is the v17 54-byte frame = a response with no trailer (decodes); every other cut is refused (a trailer is
+    // exact-length).
+    {
+        Bytes verdicts(16, 1), leases(32, 2);
+        auto r = baseResponse();
+        r.hasVerdicts = true; r.verdictCount = 2; r.verdictBytes = sp(verdicts);
+        r.hasLease = true; r.leaseCount = 2; r.leaseBytes = sp(leases);
+        Bytes buf(rc::ProduceResponse::kMaxEncodedSize);
+        const std::size_t n = r.encodeFor(buf.data(), 18);
+        ASSERT_EQ(n, 54u + 2 + 16 + 3 + 32);
+        for (std::size_t cut = 54; cut < n; ++cut) {
+            const auto d = rc::ProduceResponse::decode(buf.data(), cut);
+            if (cut == 54) {
+                ASSERT_TRUE(d.has_value()) << cut;
+                EXPECT_FALSE(d->hasVerdicts);
+                EXPECT_FALSE(d->hasLease);
+            } else if (cut == 54u + 2 + 16) {   // exactly the verdict trailer: a verdict-only ack
+                ASSERT_TRUE(d.has_value()) << cut;
+                EXPECT_TRUE(d->hasVerdicts);
+                EXPECT_FALSE(d->hasLease);
+            } else {
+                EXPECT_FALSE(d.has_value()) << cut;
+            }
+        }
+    }
+    // DefineTopic with a lease: cuts inside [marker + 39-byte spec] are refused (the frame must end exactly at the
+    // lease block, or before it where the format defines "no lease": cut == start of the block is the no-lease frame).
+    {
+        const auto lease = leaseDefine(true);
+        const Bytes lf = encodeVec(lease);
+        const Bytes pf = encodeVec(leaseDefine(false));
+        for (std::size_t cut = pf.size(); cut < lf.size(); ++cut) {
+            const auto d = rc::DefineTopic::decode(lf.data(), cut);
+            if (cut == pf.size()) {
+                ASSERT_TRUE(d.has_value()) << cut;
+                EXPECT_FALSE(d->hasLease);
+            } else {
+                EXPECT_FALSE(d.has_value()) << cut;
+            }
+        }
+    }
+    // TopicSchemaResponse with a lease: a remainder under 40 bytes is "no lease" (decodes); only the full 40 is a lease.
+    {
+        const uint8_t desc[2] = {9, 8};
+        rc::TopicSchemaResponse m;
+        m.sessionId = 1; m.correlationId = 2; m.topicId = 5; m.version = 3; m.descriptorBlob = desc; m.descriptorLen = 2;
+        m.partitionCount = 6; m.hasKeyFeatures = true; m.hasLease = true;
+        const Bytes lf = encodeVec(m);
+        const std::size_t start = lf.size() - 40;
+        for (std::size_t cut = start; cut < lf.size(); ++cut) {
+            const auto d = rc::TopicSchemaResponse::decode(lf.data(), cut);
+            ASSERT_TRUE(d.has_value()) << cut;
+            EXPECT_FALSE(d->hasLease) << cut;
+        }
+        const auto full = rc::TopicSchemaResponse::decode(lf.data(), lf.size());
+        ASSERT_TRUE(full.has_value());
+        EXPECT_TRUE(full->hasLease);
+    }
+}
+
+TEST(LeaseProtocolRegression, V17FrameWithLeaseInputIsByteIdenticalRegression) {
+    Bytes verdicts(16, 4), leases(32, 6);
+    auto both = baseResponse();
+    both.hasVerdicts = true; both.verdictCount = 2; both.verdictBytes = sp(verdicts);
+    both.hasLease = true; both.leaseCount = 2; both.leaseBytes = sp(leases);
+    auto only = baseResponse();
+    only.hasVerdicts = true; only.verdictCount = 2; only.verdictBytes = sp(verdicts);
+    Bytes a(rc::ProduceResponse::kMaxEncodedSize), b(rc::ProduceResponse::kMaxEncodedSize);
+    const std::size_t na = both.encodeFor(a.data(), 17), nb = only.encodeFor(b.data(), 17);
+    ASSERT_EQ(na, nb);
+    EXPECT_EQ(na, 54u + 2 + 16);
+    EXPECT_EQ(std::memcmp(a.data(), b.data(), na), 0);
+}
+
+TEST(LeaseProtocolRegression, LeaseBoundsPinnedRegression) {
+    static_assert(rp::kLeaseMinTtlFloorMs == 1000);
+    static_assert(rp::kLeaseMaxTtlMs == 9'000'000'000'000);
+    static_assert(rr::kMaxLeaseBatchRecords == 2048);
+    EXPECT_EQ(rp::kLeaseMinTtlFloorMs, 1000u);
+    EXPECT_EQ(rp::kLeaseMaxTtlMs, 9'000'000'000'000u);
+    EXPECT_EQ(rr::kMaxLeaseBatchRecords, 2048u);
+    // MetadataFeature::kLeases == 6 is pinned in broker/libs/node/tests/node/CheckedWritesFeatureLevelTest.cpp
 }

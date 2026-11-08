@@ -35,6 +35,10 @@ inline constexpr std::size_t kLeaseHolderValueOffset    = 20;
 inline constexpr std::size_t kLeaseRemainingValueOffset = 28;
 inline constexpr std::size_t kLeaseSystemBytes          = 32;
 
+/// Most records in one lease-topic batch.  The write hook refuses larger lease-topic batches (Task 5); this bound keeps
+/// the largest ProduceResponse (verdict + lease trailers) inside one Aeron message (term / 8 = 64 KiB).
+inline constexpr std::size_t kMaxLeaseBatchRecords = 2048;
+
 struct TopicTraits {
     bool lease = false;
 };

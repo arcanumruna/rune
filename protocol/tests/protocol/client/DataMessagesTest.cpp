@@ -2333,8 +2333,8 @@ TEST(CheckedWritesWireRegression, TruncatedOrOversizedTrailerIsUndecodableRegres
     EXPECT_FALSE(rpc::ProduceResponse::decode(stray.data(), stray.size()).has_value());
 }
 
-TEST(CheckedWritesWire, MaxEncodedSizeIs32824) {
-    static_assert(rpc::ProduceResponse::kMaxEncodedSize == 98363);   // 54 + 2 + 8 * 4096 + 3 + 16 * 4096 (lease trailer, client 18)
+TEST(CheckedWritesWire, MaxEncodedSizeIsPinned) {
+    static_assert(rpc::ProduceResponse::kMaxEncodedSize == 49211);   // 54 + 2 + 8 * 2048 + 3 + 16 * 2048 (lease ack, client 18); a verdict-only ack is 32,824
     static_assert(rpc::kMaxJudgedBatchRecords == rpc::ProduceResponse::kMaxVerdictEntries);
     EXPECT_EQ(rpc::ProduceResponse::encodedSizeFor(rpc::kClientVersionCheckedWrites, true, 4096), 32824u);
 }
