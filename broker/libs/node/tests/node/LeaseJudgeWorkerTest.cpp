@@ -1073,7 +1073,9 @@ TEST(LeaseWriteHookWorkerRegression, UpdateOfKeyWithoutRowRaisesUntrackedRegress
 }
 
 // Item 13 (a): activation has COMPLETED, the replay still trails the judge (one batch a pass), and an update is appended.  The
-// revoke must wait (the index is not ready, and the update is not judged yet), then carry the update's columns.
+// revoke must wait, then carry the update's columns.  Key 1's row is already replayed, so lastAppended is what holds the revoke
+// here; the leaseUntrackedThrough raise for an unrecordable update is pinned at the hook (UpdateUntrackedRaisesMarkRegression):
+// in a worker the replay is gated on the judge, so it cannot catch up while an update with no row is still unjudged.
 TEST(LeaseWriteHookWorkerRegression, UpdateAfterActivationWhileReplayTrailsRegression) {
     Leased l(10000);
     VerdictRig& r = l.r;

@@ -472,6 +472,42 @@ TEST(LeaseWriteHookRegression, LastAppendedRegression) {
     EXPECT_EQ(r.lastAppendedOf(3), -1);
 }
 
+// Item 13: an update the index cannot record raises leaseUntrackedThrough to the batch's last offset in onAppended, so readiness
+// waits for the judge to pass it.  The index cannot record it when there is no index yet (null table) or when the key has no row;
+// a not-ready index with a row records it in lastAppended (and the not-ready raise is kept as well).
+TEST(LeaseWriteHookRegression, UpdateUntrackedRaisesMarkRegression) {
+    {   // no index: the hook records nothing anywhere but the mark
+        Rig bare;
+        bare.preload(4);
+        bare.state.leaseUntrackedThrough = -1;
+        const Outcome o = bare.write(batchOf({updateOf(1, 5), updateOf(2, 5)}), false);
+        ASSERT_EQ(o.code, OKC);
+        EXPECT_EQ(bare.state.leaseUntrackedThrough, o.base + 1) << "the batch's last offset";
+        const Outcome failed = bare.write(one(updateOf(1, 5)), false, /*append=*/false);
+        EXPECT_EQ(failed.code, ErrorCode::TransientLogFull);
+        EXPECT_EQ(bare.state.leaseUntrackedThrough, o.base + 1) << "raised only after a successful append";
+        const Outcome g = bare.write(one(grantOf(9)), false);
+        ASSERT_EQ(g.code, OKC);
+        EXPECT_EQ(bare.state.leaseUntrackedThrough, o.base + 1) << "a grant is never untracked";
+    }
+    {   // a ready index, the key has a row: tracked in lastAppended, the mark stays
+        Rig r;
+        r.withIndex();
+        r.preload(4);
+        r.addRow(1, 5);
+        r.state.leaseUntrackedThrough = -1;
+        const Outcome o = r.write(one(updateOf(1, 5)), false);
+        ASSERT_EQ(o.code, OKC);
+        EXPECT_EQ(r.lastAppendedOf(1), o.base);
+        EXPECT_EQ(r.state.leaseUntrackedThrough, -1);
+        r.facts.leaseIndexReady = false;   // not ready: recorded in the row and the mark
+        const Outcome n = r.write(one(updateOf(1, 5)), false);
+        ASSERT_EQ(n.code, OKC);
+        EXPECT_EQ(r.lastAppendedOf(1), n.base);
+        EXPECT_EQ(r.state.leaseUntrackedThrough, n.base);
+    }
+}
+
 TEST(LeaseWriteHookRegression, RevokeBehindUpdateThrottledRegression) {
     Rig r;
     r.installV2();
