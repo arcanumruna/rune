@@ -137,15 +137,17 @@ std::string goldenTopic(const std::string& name) {
     return {};
 }
 
-void fastWarmup(NodeConfig& cfg) { cfg.unservableWarmupMs = 50; cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused; }
+void fastBroker(NodeConfig& cfg) { cfg.unservableWarmupMs = 50; cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused; }
 
-catalog_cluster::ThreeNodes startCluster(const std::string& tag) {
-    return catalog_cluster::ThreeNodes::startWith(tag, [](NodeConfig& cfg) {
+/// `fast`: the short warm-up, fused workers and a 100 ms election of the default cuts; the stress tests keep the product's.
+catalog_cluster::ThreeNodes startCluster(const std::string& tag, bool fast) {
+    return catalog_cluster::ThreeNodes::startWith(tag, [fast](NodeConfig& cfg) {
         cfg.verdictIntervalMs      = 20;
+        cfg.producerIdExpirationMs = 2'000;   // a stopped writer's last batches leave the cleaner something to compact
+        if (!fast) return;
         cfg.unservableWarmupMs     = 50;
         cfg.runtimePlacement       = NodeConfig::RuntimePlacement::Fused;
         cfg.electionTimeoutMs      = 100;   // a crashed node's partitions fail over after 3 x this
-        cfg.producerIdExpirationMs = 2'000;   // a stopped writer's last batches leave the cleaner something to compact
     });
 }
 
@@ -374,7 +376,7 @@ void compactPast(catalog_cluster::ThreeNodes& c, Writer& w, int32_t topicId, int
 // The acceptance case: the scenario of the spec, step by step.
 TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = startCluster("cw09");
+    ThreeNodes c = startCluster("cw09", false);
     ready(c);
     ASSERT_FALSE(HasFailure());
     const std::string ep = endpointOf(c, 1);
@@ -497,7 +499,7 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
     // 7. Restart mid-scenario
     fleet.clear();
     for (const int id : c.runningNodes()) c.stop(id);
-    c.startNodes({1, 2, 3});
+    for (const int id : {1, 2, 3}) c.startNode(id);
     ready(c);
     ASSERT_FALSE(HasFailure());
     ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
@@ -599,7 +601,7 @@ TEST(CheckedWritesRegressorsPathRegression, TheWholeScenarioThreeNodesRegression
 // R04a on real brokers: the leader fails right after `drop view`; the drop finishes on the new leader and nothing hangs.
 TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = startCluster("cw09_drop");
+    ThreeNodes c = startCluster("cw09_drop", false);
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -713,7 +715,7 @@ struct PcWriter {
 
 // §11.2: a write that asks for no verdict is judged all the same; its answer is today's and a rejected record is simply never visible.
 TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardRegression) {
-    OneBroker b("cw09_old", OneBroker::Runtime::Shard, fastWarmup);
+    OneBroker b("cw09_old", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -781,7 +783,7 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
 
 // R07c: a composite group-by check.
 TEST(CheckedWritesRegressorsPathRegression, CompositeGroupByCheckShardRegression) {
-    OneBroker b("cw09_pg", OneBroker::Runtime::Shard, fastWarmup);
+    OneBroker b("cw09_pg", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -800,7 +802,7 @@ TEST(CheckedWritesRegressorsPathRegression, CompositeGroupByCheckShardRegression
 // A replace of the check view while creates are running: nothing times out, the old cap holds up to the change record, the new one after it.
 TEST(CheckedWritesRegressorsPathRegression, ReplaceWhileWritingShardRegression) {
     constexpr uint64_t kUsers = 20;
-    OneBroker b("cw09_rep", OneBroker::Runtime::Shard, fastWarmup);
+    OneBroker b("cw09_rep", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -968,7 +970,7 @@ void expectDelivery(rc::ClientConfig cfg, const std::string& topic, int32_t topi
 
 // Whole step 2: two logins of one subject race; the unique view lets exactly one win.
 TEST(CheckedWritesRegressorsPathRegression, LoginRaceAdmitsOneWinnerShardRegression) {
-    OneBroker b("cw09_race", OneBroker::Runtime::Shard, fastWarmup);
+    OneBroker b("cw09_race", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -996,7 +998,7 @@ TEST(CheckedWritesRegressorsPathRegression, LoginRaceAdmitsOneWinnerShardRegress
 
 // Whole steps 1 (the shown views), 4 and 5.
 TEST(CheckedWritesRegressorsPathRegression, ViewsAreShownAndCreatesReturnTheirIdsShardRegression) {
-    OneBroker b("cw09_names", OneBroker::Runtime::Shard, fastWarmup);
+    OneBroker b("cw09_names", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -1019,7 +1021,7 @@ TEST(CheckedWritesRegressorsPathRegression, ViewsAreShownAndCreatesReturnTheirId
 
 // Whole step 6: the 13th character of an account is refused, its id is burned.
 TEST(CheckedWritesRegressorsPathRegression, ThirteenthCharacterIsRefusedAndItsIdBurnedShardRegression) {
-    OneBroker b("cw09_slot", OneBroker::Runtime::Shard, fastWarmup);
+    OneBroker b("cw09_slot", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -1063,7 +1065,7 @@ TEST(CheckedWritesRegressorsPathRegression, ThirteenthCharacterIsRefusedAndItsId
 
 // Whole step 7 on one broker: a restart keeps the rows, the limit and the names.
 TEST(CheckedWritesRegressorsPathRegression, RestartKeepsTheLimitsAndTheNamesShardRegression) {
-    OneBroker b("cw09_restart", OneBroker::Runtime::Shard, fastWarmup);
+    OneBroker b("cw09_restart", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -1102,7 +1104,7 @@ TEST(CheckedWritesRegressorsPathRegression, RestartKeepsTheLimitsAndTheNamesShar
 
 // Whole step 8: a delete frees the name and the slot; deleting twice is KeyNotFound.
 TEST(CheckedWritesRegressorsPathRegression, DeleteFreesTheNameAndTheSlotShardRegression) {
-    OneBroker b("cw09_delete", OneBroker::Runtime::Shard, fastWarmup);
+    OneBroker b("cw09_delete", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -1131,7 +1133,7 @@ TEST(CheckedWritesRegressorsPathRegression, DeleteFreesTheNameAndTheSlotShardReg
 
 // Whole steps 9 and 10: a rejected record is never delivered, and compaction removes it from the log.
 TEST(CheckedWritesRegressorsPathRegression, RejectedRecordsAreNeverDeliveredAndCompactedAwayShardRegression) {
-    OneBroker b("cw09_gone", OneBroker::Runtime::Shard, fastWarmup);
+    OneBroker b("cw09_gone", OneBroker::Runtime::Shard, fastBroker);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -1168,28 +1170,46 @@ TEST(CheckedWritesRegressorsPathRegression, RejectedRecordsAreNeverDeliveredAndC
 // Whole step 3: the leader of a partition crashes and another node takes over.
 TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderIsReplacedThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = startCluster("cw09_lead");
+    ThreeNodes c = startCluster("cw09_lead", true);
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("user")) + stmt(goldenTopic("character")), &out, &err), 0) << err;
+    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("user")) + stmt(goldenTopic("character")) + kCharacterName, &out, &err), 0) << err;
     BrokerNode& admin = c.node(awaitController(c));
     const int32_t userTopic = topicIdOf(admin, "user"), characterTopic = topicIdOf(admin, "character");
     ASSERT_GE(userTopic, 0);
     ASSERT_GE(characterTopic, 0);
+    ViewHandle characterName(admin, "character_name");
     std::vector<int32_t> leaders;
     ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
     const int32_t crashed = leaders[0];
+    const int first = crashed == 1 ? 2 : 1, second = crashed == 3 ? 2 : 3;
+    uint64_t fooId = 0;
+    {
+        Writer w(clientConfigFor(c, first), false);
+        const rc::WriteResult foo = w.insertAndAwait(character(1, "Foo"));
+        ASSERT_TRUE(foo.ok()) << "code " << foo.code();
+        fooId = foo.key();
+    }
     c.crash(crashed);
     ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
     ASSERT_NE(leaders[0], crashed);
     ASSERT_TRUE(leadersWithin(c, userTopic, leaders));
+    Writer loser(clientConfigFor(c, first), false), winner(clientConfigFor(c, second), false);
+    const rc::WriteResult refused = loser.insertAndAwait(character(2, "foo"));
+    EXPECT_TRUE(isConstraint(refused, *loser.client, "character_name", "unique")) << "code " << refused.code();
+    const rc::WriteResult bar = winner.insertAndAwait(character(3, "Bar"));
+    ASSERT_TRUE(bar.ok()) << "code " << bar.code();
+    EXPECT_GT(bar.key(), fooId) << "the new leader must not reuse an id";
+    characterName.builder.clear();
+    const auto row = readRow(*loser.client, characterName, bytesOf(characterName.builder.setString("name", "foo").key()), refused.offset());
+    EXPECT_EQ(row.status, rc::ViewRowResult::kOk) << "the loser reads the winner's row on the first try";
 }
 
 // Whole step 7 across nodes: every broker restarts and the limit still holds.
 TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = startCluster("cw09_all");
+    ThreeNodes c = startCluster("cw09_all", true);
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -1203,7 +1223,18 @@ TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThree
         ASSERT_TRUE(w.insertAndAwait(character(kFull, "Bar")).ok());
     }
     for (const int id : c.runningNodes()) c.stop(id);
+    c.configTweak = [prior = std::move(c.configTweak)](NodeConfig& cfg) {
+        prior(cfg);
+        cfg.unservableWarmupMs = 550;   // from 500 ms (BrokerNode::kUnservableReportPeriodNs) on, the restarted controller really waits for the reports
+    };
     c.startNodes({1, 2, 3});
+    bool warming = false;
+    for (const int id : c.runningNodes())
+        warming |= c.node(id).onControlThreadForTest([&c, id] {
+            const auto* ms = c.node(id).metadataServiceForTest();
+            return ms != nullptr && ms->unservableWarmingUp();
+        });
+    EXPECT_TRUE(warming) << "no restarted controller defers its elections while it waits for the replicas' reports";
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::vector<int32_t> leaders;
@@ -1221,7 +1252,7 @@ TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThree
 // FailoverDuringDrop with the fewest records: the drop finishes on the new leader and the dropped unique view no longer refuses.
 TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropMinimalThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = startCluster("cw09_dropmin");
+    ThreeNodes c = startCluster("cw09_dropmin", true);
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
