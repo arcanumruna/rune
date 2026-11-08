@@ -371,7 +371,7 @@ TEST(CheckedWritesTxnVoteRouting, OlderLeaderEpochIsRefusedNotLeader) {
 }
 
 // An answer completes a vote only when every field matches and the vote went to a remote leader.
-TEST(CheckedWritesTxnVoteRoutingRegression, AnswerThatMatchesNoFieldIsIgnoredRegression) {
+TEST(CheckedWritesTxnVoteRoutingRegression, AnswerDifferingInAnyFieldIsIgnoredRegression) {
     VoteRig C(0);
     C.gw.setRoutingImageSnapshot(voteImage(1, 1));
     const int64_t token = C.gw.sendTxnVote(0, 0, 77, 2, 9);
