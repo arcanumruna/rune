@@ -2036,7 +2036,8 @@ private:
     /// no session is Connected (the caller arms the backoff refresh).
     bool sendMetadataRequestAnywhere_() noexcept;
     std::vector<uint64_t> routeConnectFailuresSeen_;  // DR-7: per session, last seen connectFailures()
-    std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass
+    static constexpr uint8_t kRouteSessionUp = 1, kRouteSessionLost = 2;
+    std::vector<uint8_t>  routeSessionUp_;            // DR-7 review M1: per session, Connected last pass (kRouteSessionUp) or dropped since (kRouteSessionLost)
     uint64_t              heldOffersSeen_ = 0;        // DR-7: last seen agent_.heldOffers()
     uint64_t              rejectedEpochSeen_ = 0;     // issue #60: agent_.rejectedEpoch() at the last route sweep
     uint64_t              routedBrokerSweeps_ = 0;    // issue #60: failRoutedBroker sweeps run (test-visible)

@@ -6102,9 +6102,9 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
         const auto     st = agent_.sessionStateAt(i);
         const uint8_t  up = st == session::SessionState::Connected ? 1 : 0;
         const bool failed = f != routeConnectFailuresSeen_[i];
-        const bool lost   = routeSessionUp_[i] != 0 && up == 0;  // review MEDIUM-1: a Connected leader dropped
+        const bool lost   = routeSessionUp_[i] == kRouteSessionUp && up == 0;  // review MEDIUM-1: a Connected leader dropped
         routeConnectFailuresSeen_[i] = f;
-        routeSessionUp_[i]           = up;
+        routeSessionUp_[i]           = up != 0 ? kRouteSessionUp : lost || routeSessionUp_[i] == kRouteSessionLost ? kRouteSessionLost : uint8_t{0};
         if (i == 0) {
             // The seed has its own reconnect path (and the seed failover).  DR client
             // bug 1: its broker may lead partitions routed through it — a seed
@@ -6112,6 +6112,8 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
             if ((failed || lost) && agent_.multiNodeRouting()) ask = true;
             continue;
         }
+        if (routeSessionUp_[i] == kRouteSessionLost && agent_.routesUseSession(i))
+            scheduleMetadataRefresh();   // level: a leader that was live and is down keeps being asked about (backoff-paced) until an answer moves the route
         if (!failed && !lost && st != session::SessionState::Disconnected) [[likely]] continue;
         if (!agent_.routesUseSession(i)) continue;
         ask = ask || failed || lost;
