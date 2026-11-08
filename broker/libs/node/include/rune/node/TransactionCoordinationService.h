@@ -65,9 +65,11 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -269,6 +271,7 @@ public:
     void onTxnVoteResult(int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
                          int32_t coordinatorEpoch, const rune::gateway::TxnVoteResult& r) noexcept;
     [[nodiscard]] std::size_t voteGatesForTest() const noexcept { return voteGates_.size(); }
+    [[nodiscard]] std::size_t voteOrphansForTest() const noexcept { return voteOrphans_.size(); }
     [[nodiscard]] std::size_t voteCandidateTxnsForTest() const noexcept { return voteCandidatesAtAdd_.size(); }
     /// Task 10 round 5: an asynchronously appended marker landed.
     void onControlMarkerLanded(int32_t topicId, int32_t partition, int64_t producerId,
@@ -429,7 +432,8 @@ private:
     // EndTxn(commit) of a transaction with candidate partitions persists nothing and answers nothing until every
     // candidate voted yes (then the usual PrepareCommit path) or one voted no (PrepareAbort; the no is the answer).
     // Either way the answer is sent when the markers landed ("commit OK" means the rows are final), see AwaitingMarkers.
-    // The transaction is frozen meanwhile: the other txn requests of its id answer ConcurrentTransactions.
+    // The transaction is frozen meanwhile: AddPartitions / AddOffsets / TxnOffsetCommit of its id answer ConcurrentTransactions;
+    // a repeated EndTxn takes the gate over (the earlier request is told the same), an abort cancels it.
     struct VoteTarget {
         std::string topic;
         int32_t     topicId   = 0;
@@ -443,7 +447,13 @@ private:
         int64_t                 producerId    = -1;
         int16_t                 producerEpoch = 0;
         int64_t                 txnStartNs    = 0;
+        bool                    all           = false;   ///< noted while votes were off (a level bump mid-transaction): every partition votes
         std::vector<VoteTarget> targets;
+    };
+    struct RememberedNo {   ///< the no of the last voted abort of an id: a late EndTxn(commit) retry gets it again
+        int64_t producerId    = -1;
+        int16_t producerEpoch = 0;
+        VoteNo  no{};
     };
     struct VoteGate {
         rune::transaction::TransactionalId txnId;
@@ -458,18 +468,32 @@ private:
     };
     std::vector<VoteGate> voteGates_;
     std::map<rune::transaction::TransactionalId, VoteCandidates, std::less<>> voteCandidatesAtAdd_;
+    /// Memory only: a failover loses it (the retry then gets InvalidTxnState and the client aborts).
+    std::map<rune::transaction::TransactionalId, RememberedNo, std::less<>> lastVoteNo_;
+    /// Votes still out in the gateway whose gate is gone (first no, timeout, takeover by an abort), by (topic id,
+    /// partition, pid, epoch).  The gateway answers each exactly once; a new gate for the key waits for that answer
+    /// and drops it, else a late yes would count for the producer's next transaction (same pid and epoch).
+    std::set<std::tuple<int32_t, int32_t, int64_t, int16_t>> voteOrphans_;
+    /// A transaction recovered by a load started at or before this time: its candidates are not known (R11c).
+    int64_t          recoveredAtNs_ = -1;
     VoteCandidateFn  voteCandidate_;
     VoteFnOverride   voteFnOverride_;
     SessionVersionFn sessionVersionFn_  = nullptr;
     void*            sessionVersionCtx_ = nullptr;
+    /// Wired to vote (predicate, topics, a way to ask and to write markers), whatever the feature level.
+    [[nodiscard]] bool votesWired_() const;
     [[nodiscard]] bool votesEnabled_() const;
-    /// True while a vote gate holds `txnId` for this producer id and epoch (another producer's request is answered
+    /// The gate holding `txnId` for this producer id and epoch, else end() (another producer's request is answered
     /// by the coordinator: fenced, wrong id).
+    [[nodiscard]] std::vector<VoteGate>::iterator findVoteGate_(const rune::transaction::TransactionalId& txnId,
+                                                                int64_t producerId, int16_t producerEpoch);
     [[nodiscard]] bool voteGated_(const rune::transaction::TransactionalId& txnId, int64_t producerId,
-                                  int16_t producerEpoch) const;
+                                  int16_t producerEpoch);
+    /// The gate is leaving with votes still out: their answers are dropped, not counted for a later gate.
+    void orphanVotes_(const VoteGate& g);
     /// 0 while the gate's transaction is still the Ongoing one the votes were asked for, else the EndTxn(commit) answer.
     [[nodiscard]] int16_t staleVoteCode_(const VoteGate& g);
-    void noteVoteCandidates_(const rune::protocol::client::TxnTopicPartitionView& parts);
+    void noteVoteCandidates_(const rune::protocol::client::TxnTopicPartitionView& parts, bool votesOn);
     /// True when EndTxn(commit) of txnIdScratch_ opened a vote gate (the answer is deferred).
     bool startVoteGate_(const rune::protocol::client::EndTxn& msg, int64_t nowNs);
     void sendVote_(const VoteGate& g, VoteTarget& t, int64_t nowNs);
