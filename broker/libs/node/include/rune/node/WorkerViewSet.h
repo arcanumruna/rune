@@ -570,7 +570,8 @@ private:
     uint64_t viewPauses_ = 0, viewResumes_ = 0;
 
     // The tables, their dirty sets' growth and a held delta: a long window between checkpoints (P11-9) is view memory too.  A
-    // pushed window gives its growth back (releaseWindow_), so a view with nothing held carries no charge past its tables.
+    // pushed window gives its growth back (releaseWindow_; ViewTable::trimDirty), so after a long span a view with nothing held
+    // carries no charge past its tables.  Steady churn past the reserve keeps its dirty sets, charged, and allocates nothing.
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
         std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + (inst.pendingValid ? inst.pendingDelta.capacity() : 0);
         if (inst.owners) m += inst.owners->memoryBytes() + inst.owners->dirtyBytes();
