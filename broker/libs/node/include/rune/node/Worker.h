@@ -9918,6 +9918,17 @@ private:
         enqueueReturn_(ret);
         return true;
     }
+    // Part 11 (design L6): a transaction whose TxnJudge is in the log and whose marker has not landed has had its vote on this
+    // partition; a later batch of the same producer and epoch would commit unjudged.  The refusal is derived from the log (the
+    // judge state is rebuilt from it by a failover): the producer's entry in the judge table, still the open transaction.
+    [[nodiscard]] bool txnVotedAlready_(const RcState& rc, const PartitionWriteState& ws, std::span<const uint8_t> rbSpan) const noexcept {
+        const rune::protocol::RecordBatchReader r(rbSpan.data(), rbSpan.size());
+        if ((static_cast<uint16_t>(r.attributes()) & kTxnAttrBit) == 0 || r.producerId() < 0) [[likely]] return false;
+        const int64_t first = rc.tracker().firstOffsetOf(r.producerId());
+        if (first < 0) return false;
+        const DeferredTxn* t = ws.txn.find(r.producerId());
+        return t != nullptr && t->firstOffset == first && t->epoch == r.producerEpoch();
+    }
     // F15-FU1 (#112): the verify outbox → the return ring, oldest first, only while the
     // return FIFO is empty (flushRetFifo_); stops at the first refused claim.
     int flushTxnVerifyOutbox_() {
@@ -10341,6 +10352,11 @@ private:
         // produce never gets here: rc is set only for producerId >= 0).
         if (rc != nullptr && rbSpan.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
             [[unlikely]] {
+            if (ws != nullptr && txnVotedAlready_(*rc, *ws, rbSpan)) {
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
+                enqueueReturn_(ret);
+                return 1;
+            }
             if (txnAdmissionRefuses_(*rc, replica, rbSpan, ret)) return 1;
         }
 

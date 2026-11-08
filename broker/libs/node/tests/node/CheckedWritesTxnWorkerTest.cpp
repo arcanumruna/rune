@@ -920,3 +920,65 @@ TEST(CheckedWritesTxnWorker, TxnPairCommitsOnBothOrNeither) {
     EXPECT_EQ(t.a.keyIndexKeys(), (std::set<uint64_t>{1}));
     EXPECT_EQ(t.b.keyIndexKeys(), (std::set<uint64_t>{2})) << "b's yes is aborted with a's no";
 }
+
+// Design L6: after the partition's vote, a producer (and epoch) that cached the partition as verified may not append to its
+// transaction until the marker lands; the judge's yes or no covers only the rows below its TxnJudge.
+namespace {
+constexpr int16_t kInvalidTxnState = static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
+
+int16_t txnProduce(Ki& k, int64_t pid, uint64_t id, int32_t seq) {
+    const auto a = k.r.ack(k.r.produceFrame({ups(id)}, kLeader, pid, seq, /*txn=*/true));
+    EXPECT_TRUE(a.has_value());
+    return a ? a->code : int16_t{-1};
+}
+}  // namespace
+
+TEST(CheckedWritesTxnVoteFreezeRegression, AppendAfterYesVoteIsRefusedUntilTheMarker) {
+    Ki k;
+    k.txn(61, {ins(1)});
+    ASSERT_EQ(k.vote(61).errorCode, 0);
+    const int64_t leo = k.r.replica->logEndOffset();
+    EXPECT_EQ(txnProduce(k, 61, 7, 1), kInvalidTxnState);
+    EXPECT_EQ(k.r.replica->logEndOffset(), leo) << "the refused row is not in the log";
+    k.r.marker(61, true);
+    ASSERT_TRUE(k.r.driveUntilJudged());
+    EXPECT_EQ(txnProduce(k, 61, 8, 1), 0) << "the next transaction appends once the marker landed";
+    EXPECT_GT(k.r.replica->logEndOffset(), leo);
+    EXPECT_EQ(txnProduce(k, 61, 9, 2), 0) << "the judged transaction's entry does not freeze the next one";
+}
+
+TEST(CheckedWritesTxnVoteFreezeRegression, AppendAfterNoVoteIsRefused) {
+    Ki k;
+    k.txn(62, {ins(1), ins(1)});   // the second insert of the key: KeyExists
+    const auto v = k.vote(62);
+    ASSERT_EQ(v.errorCode, 0);
+    ASSERT_EQ(v.code, kKeyExists);
+    const int64_t leo = k.r.replica->logEndOffset();
+    EXPECT_EQ(txnProduce(k, 62, 7, 1), kInvalidTxnState);
+    EXPECT_EQ(k.r.replica->logEndOffset(), leo);
+    k.r.marker(62, false);
+    ASSERT_TRUE(k.r.driveUntilJudgeReaches());
+    EXPECT_EQ(txnProduce(k, 62, 8, 1), 0);
+}
+
+TEST(CheckedWritesTxnVoteFreezeRegression, OtherProducerAppendsDuringAVote) {
+    Ki k;
+    k.txn(63, {ins(1)});
+    ASSERT_EQ(k.vote(63).errorCode, 0);
+    EXPECT_EQ(txnProduce(k, 64, 7, 0), 0) << "another producer's transaction";
+    const auto plain = k.r.ack(k.r.produceFrame({ups(9)}, kLeader));
+    ASSERT_TRUE(plain.has_value());
+    EXPECT_EQ(plain->code, 0) << "a non-transactional append";
+    EXPECT_EQ(txnProduce(k, 63, 8, 1), kInvalidTxnState);
+}
+
+TEST(CheckedWritesTxnVoteFreezeRegression, NewLeaderRefusesAppendAfterVoteInLog) {
+    Ki k(/*follower=*/true);
+    k.txn(65, {ins(1)});
+    ASSERT_EQ(k.vote(65).errorCode, 0);
+    k.r.followerFetch();
+    k.r.failover();   // another replica takes over with the log up to the HW: J is in it, the marker is not
+    k.r.passes(60);
+    ASSERT_EQ(k.r.txnJudgeOffsetsInLog().size(), 1u);
+    EXPECT_EQ(txnProduce(k, 65, 7, 1), kInvalidTxnState);
+}
