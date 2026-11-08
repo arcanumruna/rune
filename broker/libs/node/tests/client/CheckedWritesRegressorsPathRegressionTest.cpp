@@ -153,7 +153,7 @@ std::string goldenView(const std::string& name) { return stmt(goldenStatement("v
 
 void fastBroker(NodeConfig& cfg) { cfg.unservableWarmupMs = 50; cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused; }
 
-/// `fast`: the short warm-up, fused workers and a 100 ms election of the default cuts; the stress tests keep the product's.
+/// `fast`: the short warm-up, fused workers and a 40 ms election of the default cuts; the stress tests keep the product's.
 catalog_cluster::ThreeNodes startCluster(const std::string& tag, bool fast) {
     return catalog_cluster::ThreeNodes::startWith(tag, [fast](NodeConfig& cfg) {
         cfg.verdictIntervalMs      = 20;
@@ -161,7 +161,7 @@ catalog_cluster::ThreeNodes startCluster(const std::string& tag, bool fast) {
         if (!fast) return;
         cfg.unservableWarmupMs     = 50;
         cfg.runtimePlacement       = NodeConfig::RuntimePlacement::Fused;
-        cfg.electionTimeoutMs      = 100;
+        cfg.electionTimeoutMs      = 40;
         cfg.brokerLivenessTimeoutMs = 150;   // a crashed node's partitions fail over after this, not after 3 x the election timeout
     });
 }
@@ -1201,45 +1201,70 @@ TEST(CheckedWritesRegressorsPathRegression, RejectedRecordsAreNeverDeliveredAndC
     judgeOwner(b.node(), b.endpoint(), "user", userTopic, users);
 }
 
-// Whole step 3: the leader of a partition crashes and another node takes over.
-TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderIsReplacedThreeNodesRegression) {
-    using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = startCluster("cw09_lead", true);
-    SharedClientDriver clientDriver;
-    ready(c);
-    ASSERT_FALSE(HasFatalFailure());
-    std::string out, err;
-    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("user")) + stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
-    BrokerNode& admin = c.node(awaitController(c));
-    const int32_t userTopic = topicIdOf(admin, "user"), characterTopic = topicIdOf(admin, "character");
-    ASSERT_GE(userTopic, 0);
-    ASSERT_GE(characterTopic, 0);
-    ViewHandle characterName(admin, "character_name");
-    std::vector<int32_t> leaders;
-    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
-    const int32_t crashed = leaders[0];
-    const int first = crashed == 1 ? 2 : 1, second = crashed == 3 ? 2 : 3;
-    uint64_t fooId = 0;
-    {
-        Writer w(clientDriver.attach(clientConfigFor(c, first)), false);
-        const rc::WriteResult foo = w.insertAndAwait(character(1, "Foo"));
-        ASSERT_TRUE(foo.ok()) << "code " << foo.code();
-        fooId = foo.key();
+/// The first write of the regressors-path scenario (Foo) is acked, then the leader of the character partition crashes and a survivor takes over.
+struct CrashedLeader {
+    catalog_cluster::ThreeNodes c;
+    SharedClientDriver          clientDriver;
+    int32_t                     userTopic = -1, characterTopic = -1;
+    int                         first = 0, second = 0;
+    uint64_t                    fooId = 0;
+
+    explicit CrashedLeader(const std::string& tag) : c(startCluster(tag, true)) {}
+
+    void run(bool withUsers) {
+        ready(c);
+        if (testing::Test::HasFatalFailure()) return;
+        std::string out, err;
+        ASSERT_EQ(qlScript(endpointOf(c, 1), (withUsers ? stmt(goldenTopic("user")) : std::string()) + stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
+        BrokerNode& admin = c.node(awaitController(c));
+        characterTopic = topicIdOf(admin, "character");
+        ASSERT_GE(characterTopic, 0);
+        if (withUsers) {
+            userTopic = topicIdOf(admin, "user");
+            ASSERT_GE(userTopic, 0);
+        }
+        std::vector<int32_t> leaders;
+        ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+        const int32_t crashed = leaders[0];
+        first  = crashed == 1 ? 2 : 1;
+        second = crashed == 3 ? 2 : 3;
+        {
+            Writer w(clientDriver.attach(clientConfigFor(c, first)), false);
+            const rc::WriteResult foo = w.insertAndAwait(character(1, "Foo"));
+            ASSERT_TRUE(foo.ok()) << "code " << foo.code();
+            fooId = foo.key();
+        }
+        c.crash(crashed);
+        ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+        ASSERT_NE(leaders[0], crashed);
+        if (withUsers) ASSERT_TRUE(leadersWithin(c, userTopic, leaders));
     }
-    c.crash(crashed);
-    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
-    ASSERT_NE(leaders[0], crashed);
-    ASSERT_TRUE(leadersWithin(c, userTopic, leaders));
-    Writer loser(clientDriver.attach(clientConfigFor(c, first)), false), winner(clientDriver.attach(clientConfigFor(c, second)), false);
-    const rc::WriteResult refused = loser.insertAndAwait(character(2, "foo"));
-    EXPECT_TRUE(isConstraint(refused, *loser.client, "character_name", "unique")) << "code " << refused.code();
+};
+
+// Whole step 3: the leader of a partition crashes and another node takes over.  The new leader does not reuse an id.
+TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderIsReplacedThreeNodesRegression) {
+    CrashedLeader s("cw09_lead");
+    s.run(true);
+    ASSERT_FALSE(HasFatalFailure());
+    Writer winner(s.clientDriver.attach(clientConfigFor(s.c, s.second)), false);
     const rc::WriteResult bar = winner.insertAndAwait(character(3, "Bar"));
     ASSERT_TRUE(bar.ok()) << "code " << bar.code();
-    EXPECT_GT(bar.key(), fooId) << "the new leader must not reuse an id";
+    EXPECT_GT(bar.key(), s.fooId) << "the new leader must not reuse an id";
+}
+
+// Whole step 3, the other half: the replacement still refuses a duplicate name, and the refused writer reads Foo's row on the first try.
+TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderStillRefusesADuplicateNameThreeNodesRegression) {
+    CrashedLeader s("cw09_dup");
+    s.run(false);
+    ASSERT_FALSE(HasFatalFailure());
+    ViewHandle characterName(s.c.node(awaitController(s.c)), "character_name");
+    Writer loser(s.clientDriver.attach(clientConfigFor(s.c, s.first)), false);
+    const rc::WriteResult refused = loser.insertAndAwait(character(2, "foo"));
+    EXPECT_TRUE(isConstraint(refused, *loser.client, "character_name", "unique")) << "code " << refused.code();
     characterName.builder.clear();
     const auto row = readRow(*loser.client, characterName, bytesOf(characterName.builder.setString("name", "foo").key()), refused.offset());
     ASSERT_EQ(row.status, rc::ViewRowResult::kOk) << "the loser reads Foo's row on the first try";
-    EXPECT_EQ(characterName.u(row.rowBytes, "characterId"), fooId);
+    EXPECT_EQ(characterName.u(row.rowBytes, "characterId"), s.fooId);
 }
 
 // Whole step 7, the wait the three-broker restart test skips (it runs on a 50 ms warm-up): a restarted controller defers its partition
@@ -1256,6 +1281,16 @@ TEST(CheckedWritesRegressorsPathRegression, ARestartedControllerDefersItsElectio
     })) << "the restarted controller does not defer its elections while it waits for the replicas' reports";
 }
 
+/// Every broker stops and starts again, and the character partition has a leader.
+void restartEveryNode(catalog_cluster::ThreeNodes& c, int32_t characterTopic) {
+    for (const int id : c.runningNodes()) c.stop(id);
+    c.startNodes({1, 2, 3});
+    ready(c);
+    if (testing::Test::HasFatalFailure()) return;
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+}
+
 // Whole step 7 across nodes: every broker restarts and the limit still holds.
 TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
@@ -1264,7 +1299,7 @@ TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThree
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
-    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName() + accountStats(2), &out, &err, clientDriver.dir()), 0) << err;
+    ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + accountStats(2), &out, &err, clientDriver.dir()), 0) << err;
     const int32_t characterTopic = topicIdOf(c.node(awaitController(c)), "character");
     ASSERT_GE(characterTopic, 0);
     constexpr uint64_t kFull = 3;
@@ -1273,26 +1308,20 @@ TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThree
         ASSERT_TRUE(w.insertAndAwait(character(kFull, "Foo")).ok());
         ASSERT_TRUE(w.insertAndAwait(character(kFull, "Bar")).ok());
     }
-    for (const int id : c.runningNodes()) c.stop(id);
-    c.startNodes({1, 2, 3});
-    ready(c);
+    restartEveryNode(c, characterTopic);
     ASSERT_FALSE(HasFatalFailure());
-    std::vector<int32_t> leaders;
-    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
-    BrokerNode& admin = c.node(awaitController(c));
-    ViewHandle accountStats(admin, "account_stats");
+    ViewHandle accountStats(c.node(awaitController(c)), "account_stats");
     Writer w(clientDriver.attach(clientConfigFor(c, 1)), false);
     const auto stats = rowWhenReady(*w.client, accountStats, accountStats.keyOf(kFull));
     ASSERT_TRUE(stats.has_value());
     EXPECT_EQ(accountStats.u(*stats, "characters"), 2u) << "the account still has 2";
     EXPECT_TRUE(isConstraint(w.insertAndAwait(character(kFull, "Baz")), *w.client, "account_stats", "max_characters"));
-    EXPECT_TRUE(isConstraint(w.insertAndAwait(character(9, "foo")), *w.client, "character_name", "unique"));
 }
 
-// FailoverDuringDrop with the fewest records: the drop finishes on the new leader and the dropped unique view no longer refuses.
-TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropMinimalThreeNodesRegression) {
+// Whole step 7 across nodes, the other half: every broker restarts and a name still refuses its duplicate.
+TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheNameUniqueThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
-    ThreeNodes c = startCluster("cw09_dropmin", true);
+    ThreeNodes c = startCluster("cw09_uniq", true);
     SharedClientDriver clientDriver;
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
@@ -1300,38 +1329,82 @@ TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropMin
     ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
     const int32_t characterTopic = topicIdOf(c.node(awaitController(c)), "character");
     ASSERT_GE(characterTopic, 0);
-    std::vector<int32_t> leaders;
-    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
-    const int32_t leader = leaders[0];
-    const int survivor = leader == 1 ? 2 : 1;
-    auto w = std::make_unique<Writer>(clientDriver.attach(clientConfigFor(c, survivor)), false);
-    ASSERT_TRUE(w->insertAndAwait(character(1, "Foo")).ok());
-    std::vector<rc::Token> inFlight;
-    for (int i = 0; i < 3; ++i) inFlight.push_back(w->insert(character(2 + static_cast<uint64_t>(i), "f" + std::to_string(i))));
-    ASSERT_EQ(ql(endpointOf(c, survivor), "drop view character_name;", &out, &err), 0) << err;
-    c.crash(leader);
-    c.startNode(leader);
-    for (const rc::Token t : inFlight) {
-        const rc::WriteResult r = w->await(t);
+    {
+        Writer w(clientDriver.attach(clientConfigFor(c, 1)), false);
+        ASSERT_TRUE(w.insertAndAwait(character(3, "Foo")).ok());
+    }
+    restartEveryNode(c, characterTopic);
+    ASSERT_FALSE(HasFatalFailure());
+    Writer w(clientDriver.attach(clientConfigFor(c, 1)), false);
+    EXPECT_TRUE(isConstraint(w.insertAndAwait(character(9, "foo")), *w.client, "character_name", "unique"));
+}
+
+/// A character writer with three writes in flight while the unique view is dropped, the character leader crashing, and that node restarting.
+struct DropWithFailover {
+    catalog_cluster::ThreeNodes c;
+    SharedClientDriver          clientDriver;
+    int32_t                     characterTopic = -1;
+    int                         survivor = 0;
+    std::unique_ptr<Writer>     w;
+    std::vector<rc::Token>      inFlight;
+
+    explicit DropWithFailover(const std::string& tag) : c(startCluster(tag, true)) {}
+
+    void run() {
+        ready(c);
+        if (testing::Test::HasFatalFailure()) return;
+        std::string out, err;
+        ASSERT_EQ(qlScript(endpointOf(c, 1), stmt(goldenTopic("character")) + ddlCharacterName(), &out, &err, clientDriver.dir()), 0) << err;
+        characterTopic = topicIdOf(c.node(awaitController(c)), "character");
+        ASSERT_GE(characterTopic, 0);
+        std::vector<int32_t> leaders;
+        ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+        const int32_t leader = leaders[0];
+        survivor = leader == 1 ? 2 : 1;
+        w = std::make_unique<Writer>(clientDriver.attach(clientConfigFor(c, survivor)), false);
+        ASSERT_TRUE(w->insertAndAwait(character(1, "Foo")).ok());
+        for (int i = 0; i < 3; ++i) inFlight.push_back(w->insert(character(2 + static_cast<uint64_t>(i), "f" + std::to_string(i))));
+        ASSERT_EQ(ql(endpointOf(c, survivor), "drop view character_name;", &out, &err), 0) << err;
+        c.crash(leader);
+        c.startNode(leader);
+    }
+};
+
+// FailoverDuringDrop with the fewest records: the writes in flight across the drop and the failover end in neither a timeout nor a close.
+TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropFinishesTheDropMinimalThreeNodesRegression) {
+    DropWithFailover s("cw09_dropmin");
+    s.run();
+    ASSERT_FALSE(HasFatalFailure());
+    for (const rc::Token t : s.inFlight) {
+        const rc::WriteResult r = s.w->await(t);
         EXPECT_NE(r.status(), rc::OpStatus::Timeout);
         EXPECT_NE(r.status(), rc::OpStatus::Closed);
     }
-    ready(c);
+}
+
+// The same, the other half: the drop finishes on the new leader and the dropped unique view no longer refuses.
+TEST(CheckedWritesRegressorsPathRegression, FailoverDuringDropUninstallsTheUniqueRuleMinimalThreeNodesRegression) {
+    DropWithFailover s("cw09_dropuniq");
+    s.run();
     ASSERT_FALSE(HasFatalFailure());
-    ASSERT_TRUE(leadersWithin(c, characterTopic, leaders));
+    for (const rc::Token t : s.inFlight) (void)s.w->await(t);
+    ready(s.c);
+    ASSERT_FALSE(HasFatalFailure());
+    std::vector<int32_t> leaders;
+    ASSERT_TRUE(leadersWithin(s.c, s.characterTopic, leaders));
     EXPECT_TRUE(waitFor([&] {
-        for (const int id : c.runningNodes()) {
-            const int32_t worker = rune::metadata::ShardRouter(c.node(id).workerCountForTest()).workerForPartition(characterTopic, 0);
-            const bool waiting = c.node(id).onWorkerThreadForTest(worker, [characterTopic](Worker& wk) {
-                const VerdictSource* j = wk.viewSet()->verdictSource(characterTopic, 0);
+        for (const int id : s.c.runningNodes()) {
+            const int32_t worker = rune::metadata::ShardRouter(s.c.node(id).workerCountForTest()).workerForPartition(s.characterTopic, 0);
+            const bool waiting = s.c.node(id).onWorkerThreadForTest(worker, [topic = s.characterTopic](Worker& wk) {
+                const VerdictSource* j = wk.viewSet()->verdictSource(topic, 0);
                 return j != nullptr && j->waitingForInstall();
             });
             if (waiting) return false;
         }
         return true;
     }, 10s)) << "a verdict source still waits for an install";
-    w.reset();
-    w = std::make_unique<Writer>(clientDriver.attach(clientConfigFor(c, survivor)), false);
-    const rc::WriteResult dup = w->insertAndAwait(character(9, "foo"));
+    s.w.reset();
+    s.w = std::make_unique<Writer>(s.clientDriver.attach(clientConfigFor(s.c, s.survivor)), false);
+    const rc::WriteResult dup = s.w->insertAndAwait(character(9, "foo"));
     EXPECT_TRUE(dup.ok()) << "the dropped unique view no longer refuses a duplicate: code " << dup.code();
 }
