@@ -127,15 +127,25 @@ std::string eagerScript() {
     return path.string();
 }
 
-/// The statement of the golden script that defines topic `name`, on one broker.
-std::string goldenTopic(const std::string& name) {
+/// The statement of the golden script that holds `marker`.
+std::string goldenStatement(const std::string& marker) {
     std::ifstream in(std::string(RUNE_QL_GOLDEN_DIR) + "/regressorspath.rql");
     std::stringstream text;
     text << in.rdbuf();
     for (std::string st : rune::cli::engine::splitStatements(text.str()))
-        if (st.find("topic " + name + " {") != std::string::npos) return st.replace(st.find(" replicas 3"), std::string_view(" replicas 3").size(), "");
+        if (st.find(marker) != std::string::npos) return st;
     return {};
 }
+
+/// The statement of the golden script that defines topic `name`, on one broker.
+std::string goldenTopic(const std::string& name) {
+    std::string st = goldenStatement("topic " + name + " {");
+    st.replace(st.find(" replicas 3"), std::string_view(" replicas 3").size(), "");
+    return st;
+}
+
+/// The statement of the golden script that defines view `name`.
+std::string goldenView(const std::string& name) { return stmt(goldenStatement("view " + name + " key")); }
 
 void fastBroker(NodeConfig& cfg) { cfg.unservableWarmupMs = 50; cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused; }
 
@@ -874,13 +884,15 @@ TEST(CheckedWritesRegressorsPathRegression, ReplaceWhileWritingShardRegression) 
 // ============================================================================
 namespace {
 
-const std::string kUserIdentity   = "create unique view user_identity key (provider, subject) as select userId from user;\n";
-const std::string kCharacterName  = "create unique view character_name key lower(name) as nameKey as select characterId from character;\n";
+const std::string kUserIdentity   = goldenView("user_identity");
+const std::string kCharacterName  = goldenView("character_name");
 const std::string kCharacterById  = "create view character_by_id key characterId as select userId, name from character;\n";
 const std::string kAccountChars   = "create view account_characters key (userId, characterId) as select name from character;\n";
+/// The golden account_stats view with its limit set to `cap`.
 std::string accountStats(int cap) {
-    return "create view account_stats key userId as select count(*) as characters from character group by userId constraint max_characters check (characters <= " +
-           std::to_string(cap) + ");\n";
+    std::string st = goldenView("account_stats");
+    st.replace(st.find("<= 12"), 5, "<= " + std::to_string(cap));
+    return st;
 }
 
 /// The golden topic `name` on one broker; `eager`: small segments and a cleaner that drops tombstones and old records at once.
@@ -916,7 +928,7 @@ void compactOwner(BrokerNode& n, Writer& w, int32_t topicId, int64_t through, Le
         for (int i = 0; i < 32; ++i) tokens.push_back(send(w, rec));
         for (const rc::Token t : tokens) ledger.note(id, w.await(t));
     }
-    EXPECT_TRUE(waitFor([&] { return readOwner(n, topicId).cleanedThrough > through; }, 10s)) << "the cleaner never passed offset " << through << " of topic " << topicId;
+    EXPECT_TRUE(waitFor([&] { return n.onOwnerThreadForTest(topicId, 0, [](rune::replication::PartitionReplica& r) { return r.lastCleanOffset(); }) > through; }, 10s)) << "the cleaner never passed offset " << through << " of topic " << topicId;
 }
 
 /// What compaction must have left of `topic`: no rejected record, the newest accepted record of every key, and the stats saying so.
