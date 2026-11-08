@@ -373,6 +373,19 @@ TEST(CheckedWritesTxnOverlay, FullOverlayIsCapacityExhausted) {
     EXPECT_TRUE(tiny.full());
 }
 
+// Sanitizer allocators fill or prefault blocks their own way, so page residency and malloc scribbles prove nothing there.
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define RUNE_OVERLAY_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define RUNE_OVERLAY_SANITIZED 1
+#endif
+#ifndef RUNE_OVERLAY_SANITIZED
+#define RUNE_OVERLAY_SANITIZED 0
+#endif
+
 // The resident pages among those holding [p, p + bytes).
 static std::size_t residentPages(const void* p, std::size_t bytes) {
     const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
@@ -394,8 +407,10 @@ TEST(CheckedWritesTxnOverlayRegression, ReserveTouchesNoRowRegression) {
     TxnOverlay o;
     o.reserve(std::size_t(1) << 20, 256);   // 256 MiB of rows
     uint8_t* last = o.spare() - 256;   // the last row
-    EXPECT_EQ(residentPages(last, 1), 0u) << "the reserve wrote the rows";
-    EXPECT_EQ(residentPages(o.lastEntryForTest(), 1), 0u) << "the reserve wrote the entries";
+    if (!RUNE_OVERLAY_SANITIZED) {
+        EXPECT_EQ(residentPages(last, 1), 0u) << "the reserve wrote the rows";
+        EXPECT_EQ(residentPages(o.lastEntryForTest(), 1), 0u) << "the reserve wrote the entries";
+    }
     uint8_t* row = o.put(1, OverlayTable::View, ViewKey::fromU64(7), nullptr, 64);
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(residentPages(row, 1), 1u);
@@ -411,8 +426,10 @@ TEST(CheckedWritesTxnOverlayRegression, ReserveZeroesOnlyTheSpareRowRegression) 
     TxnOverlay o;
     o.reserve(kRows, kLen);
     const uint8_t* rows = o.spare() - kRows * kLen;
-    EXPECT_NE(rows[0], 0) << "the reserve zeroed the rows";
-    EXPECT_NE(rows[kRows * kLen - 1], 0) << "the reserve zeroed the rows";
+    if (!RUNE_OVERLAY_SANITIZED) {
+        EXPECT_NE(rows[0], 0) << "the reserve zeroed the rows";
+        EXPECT_NE(rows[kRows * kLen - 1], 0) << "the reserve zeroed the rows";
+    }
     for (uint32_t i = 0; i < kLen; ++i) ASSERT_EQ(o.spare()[i], 0) << i;
 }
 
@@ -425,7 +442,7 @@ TEST(CheckedWritesTxnOverlayRegression, ClearTouchesOnlyTheSlotsItsRowsTookRegre
     ASSERT_NE(o.put(1, OverlayTable::KeyIndex, ViewKey::fromU64(7), nullptr, 1), nullptr);
     o.clear();
     const std::size_t pages = bytes / static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
-    EXPECT_LT(residentPages(o.indexForTest(), bytes), pages / 4) << "the clear wrote the whole index";
+    if (!RUNE_OVERLAY_SANITIZED) EXPECT_LT(residentPages(o.indexForTest(), bytes), pages / 4) << "the clear wrote the whole index";
     EXPECT_FALSE(o.contains(1, OverlayTable::KeyIndex, ViewKey::fromU64(7)));
     ASSERT_NE(o.put(1, OverlayTable::KeyIndex, ViewKey::fromU64(8), nullptr, 1), nullptr);
     EXPECT_TRUE(o.contains(1, OverlayTable::KeyIndex, ViewKey::fromU64(8)));
