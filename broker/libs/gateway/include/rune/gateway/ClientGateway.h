@@ -1214,6 +1214,7 @@ public:
         static_cast<ClientGateway*>(self)->onRemoteTxnVoteResponse(r);
     }
     [[nodiscard]] std::size_t txnVotesInFlightForTest() const noexcept { return votesInFlight_.size(); }
+    [[nodiscard]] bool txnVoteSinkSetForTest() const noexcept { return voteSink_ != nullptr; }
     [[nodiscard]] std::size_t remoteTxnVotesForTest() const noexcept { return remoteVotes_.size(); }
     [[nodiscard]] std::size_t txnVoteResponsesQueuedForTest() const noexcept { return pendingVoteResponses_.size(); }
     /// Test-only: the token of the last vote issued.

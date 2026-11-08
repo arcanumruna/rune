@@ -51,6 +51,7 @@
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/TransactionCoordinationService.h>
+#include <rune/node/TxnVoteWiring.h>
 #include <rune/node/MetadataService.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/node/Worker.h>
@@ -2705,6 +2706,7 @@ private:
     std::unique_ptr<rune::replication::PartitionReplica>            txnReplica_;
     std::unique_ptr<rune::transaction::ReplicatedTxnStateStore>     txnState_;
     std::unique_ptr<TransactionCoordinationService>                 txnCoordService_;
+    VoteCandidateTopics                                             voteCandidateTopics_;   // control-thread-owned; the coordinator's vote predicate reads it
 
     // -----------------------------------------------------------------------
     // Cluster metadata (MD1 wiring — created in buildGateway()).
