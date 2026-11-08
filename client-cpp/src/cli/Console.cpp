@@ -262,6 +262,7 @@ void setLive([[maybe_unused]] ConsoleOptions& o, [[maybe_unused]] std::string_vi
     else if (flag == "--cli-stream-in") o.live.streamIn = v;
     else if (flag == "--cli-stream-out") o.live.streamOut = v;
     else if (flag == "--cli-data-dir") o.live.dataDir = v;
+    else if (flag == "--cli-aeron-dir") o.live.aeronDir = v;
 #endif
 }
 
@@ -270,8 +271,8 @@ void setLive([[maybe_unused]] ConsoleOptions& o, [[maybe_unused]] std::string_vi
 int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o, std::ostream& err) {
     static constexpr std::string_view kValue[] = {"-f", "--broker", "--cli-egress", "--expected-version", "--request-id",
                                                   "--user", "--password-file", "--tls-ca", "--tls-host",
-                                                  "--cli-stream-in", "--cli-stream-out", "--cli-data-dir",
-                                                  "--gateway-response-port"};   // last 4 hidden
+                                                  "--cli-stream-in", "--cli-stream-out", "--cli-data-dir", "--cli-aeron-dir",
+                                                  "--gateway-response-port"};   // last 5 hidden
     static constexpr std::string_view kBool[]  = {"--dry-run", "--verbose", "--insecure-plaintext"};
     auto in = [](std::string_view a, auto& set) {
         for (const auto s : set) if (s == a) return true;
@@ -294,7 +295,7 @@ int parseConsoleOptions(const std::vector<std::string>& args, ConsoleOptions& o,
         else if (a == "--expected-version") expected = v;
         else if (a == "--request-id") requestId = v;
         else if (a == "--broker" || a == "--cli-egress" || a == "--user" || a == "--password-file" || a == "--cli-stream-in" ||
-                 a == "--cli-stream-out" || a == "--cli-data-dir" || a == "--tls-ca" || a == "--tls-host" ||
+                 a == "--cli-stream-out" || a == "--cli-data-dir" || a == "--cli-aeron-dir" || a == "--tls-ca" || a == "--tls-host" ||
                  a == "--gateway-response-port") setLive(o, a, v);
     }
     if (!expected.empty()) {
