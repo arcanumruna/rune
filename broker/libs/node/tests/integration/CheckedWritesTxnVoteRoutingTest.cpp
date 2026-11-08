@@ -318,6 +318,18 @@ TEST(CheckedWritesTxnVoteRouting, RemoteVoteRoundTripsOverThePlane) {
     EXPECT_EQ(C.got[2].r.errorCode, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader));
     EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 0u);
 
+    // The transport's own sends: a peer is accepted, this node is refused, and the thunks keep (self, to, msg) order.
+    rune::replication::TxnVoteResponseMsg ans{};
+    ASSERT_TRUE(rune::replication::TxnVoteResponseMsg::decode(answer.second.data(), answer.second.size(), ans));
+    EXPECT_TRUE(tr0.sendTxnVote(1, wire));
+    EXPECT_FALSE(tr0.sendTxnVote(0, wire));
+    EXPECT_TRUE(tr0.sendTxnVoteResponse(1, ans));
+    EXPECT_FALSE(tr0.sendTxnVoteResponse(0, ans));
+    EXPECT_TRUE(rune::replication::AeronPartitionTransport::sendTxnVoteThunk(&tr0, 1, wire));
+    EXPECT_FALSE(rune::replication::AeronPartitionTransport::sendTxnVoteThunk(&tr0, 0, wire));
+    EXPECT_TRUE(rune::replication::AeronPartitionTransport::sendTxnVoteResponseThunk(&tr0, 1, ans));
+    EXPECT_FALSE(rune::replication::AeronPartitionTransport::sendTxnVoteResponseThunk(&tr0, 0, ans));
+
     // The plane refuses the vote: -1, nothing kept, no token drawn.
     C.acceptVotes = false;
     const int64_t last = C.gw.lastVoteTokenForTest();
