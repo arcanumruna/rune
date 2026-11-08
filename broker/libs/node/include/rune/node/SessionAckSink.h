@@ -150,64 +150,90 @@ struct AckEntry {
 
 inline constexpr uint32_t kVerdictAckArenaEntries = 65536;
 
-/// The verdict trailers of the acks queued in a sink: 8-byte entries {recordIndex u16, code u16, constraintId u32} in a ring,
-/// plus a ring of run records.  A run never wraps (one that does not fit before the end starts at 0 when the head allows) and
-/// is freed when its ack is claimed, dropped or failed; the head advances over freed runs, so the arena frees in allocation
-/// order.  Both tables are allocated once, at construction.
+/// The verdict and lease trailers of the acks queued in a sink: 8-byte units in a binary buddy allocator over a power-of-two
+/// table.  A run is the block at its first unit (the run id); it is freed when its ack is claimed, dropped or failed, in ANY
+/// order, and a freed block merges with its free buddy, so one ack held for a long time (a parked duplicate, a Lost session)
+/// never blocks the space freed after it.  A request of n units takes the 2^ceil(log2 n) block; reserve and free are
+/// O(log capacity).  Every table is allocated once, at construction.
 class VerdictAckArena {
 public:
-    explicit VerdictAckArena(uint32_t entries = kVerdictAckArenaEntries, uint32_t maxRuns = 32768)
-        : bytes_(std::size_t{entries} * 8), runs_(maxRuns), capacity_(entries) {}
+    explicit VerdictAckArena(uint32_t entries = kVerdictAckArenaEntries)
+        : bytes_(std::size_t{entries} * 8), next_(entries), prev_(entries), count_(entries), order_(entries), state_(entries, kInterior),
+          capacity_(entries) {
+        assert(entries != 0 && (entries & (entries - 1)) == 0 && "the arena is a power of two");
+        while ((1u << maxOrder_) < entries) ++maxOrder_;
+        heads_.fill(kNone);
+        push_(0, maxOrder_);
+    }
 
-    /// False = full: the caller defers the release.
+    /// False = no free block of the size: the caller defers the release.
     [[nodiscard]] bool reserveVerdicts(uint16_t n, uint32_t& run) noexcept {
-        if (runCount_ == runs_.size() || n > capacity_) return false;
-        uint32_t start;
-        if (runCount_ == 0) {
-            head_ = tail_ = start = 0;
-            wrapped_ = false;
-        } else if (!wrapped_) {
-            if (tail_ + n <= capacity_) start = tail_;
-            else if (n <= head_) { start = 0; wrapped_ = true; }
-            else return false;
-        } else {
-            if (tail_ + n > head_) return false;
-            start = tail_;
+        const uint32_t want = n == 0 ? 1u : n;
+        if (want > capacity_) return false;
+        uint8_t k = 0;
+        while ((1u << k) < want) ++k;
+        uint8_t j = k;
+        while (j <= maxOrder_ && heads_[j] == kNone) ++j;
+        if (j > maxOrder_) return false;
+        const uint32_t start = heads_[j];
+        unlink_(start, j);
+        while (j > k) {   // split: the upper half stays free
+            --j;
+            push_(start + (1u << j), j);
         }
-        const uint32_t slot = (runHead_ + runCount_) % static_cast<uint32_t>(runs_.size());
-        runs_[slot] = Run{start, n, false};
-        ++runCount_;
-        tail_ = start + n;
+        order_[start] = k;
+        state_[start] = kUsed;
+        count_[start] = n;
         used_ += n;
-        run = slot;
+        run = start;
         return true;
     }
     [[nodiscard]] std::span<uint8_t> entries(uint32_t run) noexcept {
-        return {bytes_.data() + std::size_t{runs_[run].start} * 8, std::size_t{runs_[run].count} * 8};
+        return {bytes_.data() + std::size_t{run} * 8, std::size_t{count_[run]} * 8};
     }
+    /// Idempotent: a run already freed (or never reserved) is a no-op.
     void free(uint32_t run) noexcept {
-        Run& r = runs_[run];
-        if (r.freed) return;
-        r.freed = true;
-        used_ -= r.count;
-        while (runCount_ != 0 && runs_[runHead_].freed) {
-            runHead_ = (runHead_ + 1) % static_cast<uint32_t>(runs_.size());
-            --runCount_;
+        if (run >= capacity_ || state_[run] != kUsed) return;
+        used_ -= count_[run];
+        uint32_t start = run;
+        uint8_t k = order_[run];
+        state_[run] = kInterior;
+        while (k < maxOrder_) {
+            const uint32_t buddy = start ^ (1u << k);
+            if (state_[buddy] != kFree || order_[buddy] != k) break;
+            unlink_(buddy, k);
+            state_[buddy] = kInterior;
+            start = std::min(start, buddy);
+            ++k;
         }
-        if (runCount_ == 0) { head_ = tail_ = 0; wrapped_ = false; return; }
-        const uint32_t h = runs_[runHead_].start;
-        if (h < head_) wrapped_ = false;
-        head_ = h;
+        push_(start, k);
     }
     [[nodiscard]] std::size_t used() const noexcept { return used_; }
 
 private:
-    struct Run { uint32_t start, count; bool freed; };
-    std::vector<uint8_t> bytes_;
-    std::vector<Run>     runs_;
+    static constexpr uint32_t kNone = 0xFFFF'FFFFu;
+    static constexpr uint8_t  kInterior = 0, kFree = 1, kUsed = 2;   // state of a block's first unit
+    void push_(uint32_t start, uint8_t k) noexcept {
+        state_[start] = kFree;
+        order_[start] = k;
+        prev_[start] = kNone;
+        next_[start] = heads_[k];
+        if (heads_[k] != kNone) prev_[heads_[k]] = start;
+        heads_[k] = start;
+    }
+    void unlink_(uint32_t start, uint8_t k) noexcept {
+        if (prev_[start] != kNone) next_[prev_[start]] = next_[start];
+        else heads_[k] = next_[start];
+        if (next_[start] != kNone) prev_[next_[start]] = prev_[start];
+    }
+    std::vector<uint8_t>     bytes_;
+    std::vector<uint32_t>    next_, prev_;   // free-list links, indexed by a free block's first unit
+    std::vector<uint16_t>    count_;         // a used block's requested units
+    std::vector<uint8_t>     order_, state_;
+    std::array<uint32_t, 33> heads_{};
     uint32_t capacity_;
-    uint32_t head_ = 0, tail_ = 0, runHead_ = 0, runCount_ = 0, used_ = 0;
-    bool     wrapped_ = false;
+    uint8_t  maxOrder_ = 0;
+    uint32_t used_ = 0;
 };
 
 enum class PubFind : uint8_t { Pending, Ready, Error };

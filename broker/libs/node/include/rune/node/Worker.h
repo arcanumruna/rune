@@ -8884,6 +8884,10 @@ private:
     // Lease topics (spec 6.3): a KNOWN-OLD duplicate (outside the dedupe window; nothing appended) of a lease batch is answered
     // per record from the lease index: a grant {DuplicateSequence} (the client maps it to VerdictUnknown), an update live at its
     // version (no verdict), an update not live or a revoke {LeaseNotFound}; every lease entry {-1, 0}.  Never from lease_holder.
+    // The batch never met the hook (the duplicate is found before it), so nothing in it is trusted: a key that is not the topic's
+    // key width or a value shorter than the system columns is "not live".  An update is answered live only when the version
+    // compare is the only judgment it can have met (no constraint member besides the lease index was ever logged); otherwise it
+    // is {DuplicateSequence}, like a grant.  Only a View ack is answered here: any other acks keep the plain duplicate answer.
     // Index not ready (or the arena full): Throttled with the retry-after; nothing was appended, the retry is the same sequence.
     // The answer still waits on the original's fire condition (replay 3).  A batch that cannot be walked stays replay 2.
     struct LeaseDupAnswer {
@@ -8891,9 +8895,10 @@ private:
         uint16_t verdictCount = 0, leaseCount = 0;
         bool     filled = false;
     };
-    [[gnu::cold]] [[gnu::noinline]] void answerLeaseKnownOld_(const WriteFacts& facts, std::span<const uint8_t> rbSpan,
+    [[gnu::cold]] [[gnu::noinline]] void answerLeaseKnownOld_(const WriteFacts& facts, const PartitionWriteState& ws, std::span<const uint8_t> rbSpan,
                                                              rune::storage::ProduceOutcome& outcome, LeaseDupAnswer& out) {
         namespace rec = rune::protocol::record;
+        if (!rune::protocol::client::acksView(facts.acks)) return;
         if (ackSink_ == nullptr || rbSpan.size() < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) return;
         const int32_t count = rune::protocol::RecordBatchReader(rbSpan.data(), rbSpan.size()).recordCount();
         if (count <= 0 || count > static_cast<int32_t>(rec::kMaxLeaseBatchRecords)) return;
@@ -8904,13 +8909,18 @@ private:
         if (!facts.leaseIndexReady || facts.leaseIndex.table == nullptr || facts.leaseIndex.layout == nullptr) { throttle(); return; }
         const uint16_t n = static_cast<uint16_t>(count);
         constexpr auto kExisting = static_cast<uint8_t>(rec::Intent::Existing);
+        const std::size_t keyWidth = ws.spec->keyWidth;
+        const bool versionOnly = ws.constraintSets.onlyLeaseIndexEver();
         // The verdict code of one record: 0 = none.
         auto codeOf = [&](const rune::protocol::RecordSpan& s) noexcept -> uint16_t {
             const rec::LeaseOp op = rec::leaseOpOf(s.attributes);
             const bool existing = rec::intentOf(s.attributes) == kExisting;
             if (op == rec::LeaseOp::Put && !existing)
                 return static_cast<uint16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
-            if (op == rec::LeaseOp::Put) {
+            if (op == rec::LeaseOp::Put && !versionOnly)
+                return static_cast<uint16_t>(rune::protocol::client::ErrorCode::DuplicateSequence);
+            if (op == rec::LeaseOp::Put && s.key.size() == keyWidth && keyWidth != 0 && keyWidth <= rune::view::kMaxViewKeyBytes &&
+                s.value.size() >= 4 + rec::kLeaseSystemBytes) {
                 uint32_t rid = 0;
                 const uint8_t* row = facts.leaseIndex.table->find(rune::view::ViewKey::fromBytes(
                     {reinterpret_cast<const uint8_t*>(s.key.data()), s.key.size()}), rid);
@@ -9000,8 +9010,7 @@ private:
                     uint8_t* e = out + 16 * std::size_t{s.index};
                     if (ws.rejected.find(base + static_cast<int64_t>(s.index)) != nullptr) { putLeaseEntry_(e, -1, 0); return; }
                     const int64_t version = leaseRecordVersion(s.value);
-                    uint64_t ttl = 0;
-                    if (s.value.size() >= 20) std::memcpy(&ttl, s.value.data() + 12, sizeof(ttl));
+                    uint64_t ttl = leaseRecordTtl(s.value);
                     const bool update = rec::leaseOpOf(s.attributes) == rec::LeaseOp::Put &&
                                         rec::intentOf(s.attributes) == static_cast<uint8_t>(rec::Intent::Existing);
                     if (update && ix.table != nullptr && ix.layout != nullptr) {
@@ -10291,7 +10300,7 @@ private:
                 if (outcome.assignedBase == 0) ++ws->autoIncStats.windowMisses;
             }
             if (ws->spec->lease && outcome.isDuplicate && outcome.baseOffset < 0) [[unlikely]]
-                answerLeaseKnownOld_(facts, rbSpan, outcome, leaseDup);
+                answerLeaseKnownOld_(facts, *ws, rbSpan, outcome, leaseDup);
         } else if (log != nullptr) {
             outcome = rune::storage::handleProduceBatch(
                 rbSpan.data(), rbSpan.size(), f.topicId, f.partition,

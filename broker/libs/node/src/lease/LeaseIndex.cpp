@@ -233,6 +233,11 @@ int64_t leaseRecordVersion(std::string_view value) noexcept {
     return static_cast<int64_t>(loadU64(reinterpret_cast<const uint8_t*>(value.data()) + lr::kLeaseVersionValueOffset));
 }
 
+uint64_t leaseRecordTtl(std::string_view value) noexcept {
+    if (value.size() < lr::kLeaseTtlValueOffset + 8) return 0;
+    return loadU64(reinterpret_cast<const uint8_t*>(value.data()) + lr::kLeaseTtlValueOffset);
+}
+
 PrepareStatus prepareLeaseIndex(const LeaseIndexFold& f, const rune::view::SourceRecord& r, rune::view::Prospect& p, bool refusedVersion,
                                 uint32_t installSeq) noexcept {
     p.clear();

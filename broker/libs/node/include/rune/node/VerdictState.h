@@ -62,6 +62,14 @@ public:
         while (!changes_.empty() && changes_.back().offset >= offset) changes_.pop_back();
     }
     [[nodiscard]] std::size_t size() const noexcept { return changes_.size(); }
+    /// Lease topics (spec 6.3, a known-old duplicate update): true when no set this partition logged has a member other than the
+    /// lease index, so the version compare was the only judgment an update ever met.  Cold.
+    [[nodiscard]] bool onlyLeaseIndexEver() const noexcept {
+        return std::all_of(changes_.begin(), changes_.end(), [](const Change& c) {
+            return std::all_of(c.set.members.begin(), c.set.members.begin() + c.set.count,
+                               [](const ConstraintSetMember& m) { return m.kind == rune::view::VerdictViewKind::LeaseIndex; });
+        });
+    }
 
 private:
     struct Change { int64_t offset; ConstraintSet set; };

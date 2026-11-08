@@ -1252,6 +1252,72 @@ TEST(LeaseWriteHookWorkerRegression, LeaseKnownOldDuplicateIndexNotReadyThrottle
     EXPECT_EQ(r.leo(), leo);
 }
 
+// Review C1 (lease Task 5c): a known-old duplicate is found before the hook, so its key and value were never checked.  A 4 KiB
+// key on an update was copied into a 128-byte ViewKey on the worker's stack; a short value was read as version 0.  Each one
+// is now answered "not live" (62).
+TEST(LeaseWriteHookWorkerRegression, LeaseKnownOldDuplicateOversizedKeyAdversarialRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const DupBatches d = writeDupBatches(l, 40);
+    r.settle(150);
+    const int64_t leo = r.leo();
+    const int32_t seq = d.seqs[3];   // the slot of the update of live k1
+    const std::vector<RawRec> bad[] = {
+        {RawRec{std::string(4096, 'k'), leaseValue(1, d.v1, "u", 1, 0, 1, 3000), kUpdateAttr}},   // far wider than any view key
+        {RawRec{std::string(7, 'k'), leaseValue(1, d.v1, "u", 1, 0, 1, 3000), kUpdateAttr}},      // not the key width
+        {RawRec{keyOf(1), std::vector<uint8_t>(6, 0), kUpdateAttr}},                               // too short for the system columns
+    };
+    for (std::size_t i = 0; i < std::size(bad); ++i) {
+        const auto a = l.produceNoSeq(bad[i], seq);
+        ASSERT_TRUE(a) << i;
+        EXPECT_EQ(a->code, 0) << i;
+        EXPECT_EQ(a->baseOffset, -1) << i;
+        ASSERT_TRUE(a->hasLease) << i;
+        EXPECT_EQ(a->leases, (Lease{{-1, 0}})) << i;
+        EXPECT_EQ(a->verdicts, (Verd{{0, 62, 0}})) << i;
+        EXPECT_EQ(r.leo(), leo) << i;
+    }
+    const auto live = l.produceNoSeq(d.batches[3], seq);   // the real duplicate is still answered live
+    ASSERT_TRUE(live);
+    EXPECT_TRUE(live->verdicts.empty());
+}
+
+// Review I2 (lease Task 5c): a known-old update live at its version was answered Ok because the version compare was assumed to
+// be its only judgment.  Once any other constraint member was logged for the partition, the original may have been rejected by
+// it, so the duplicate is {DuplicateSequence} (the client's VerdictUnknown), never Ok.
+TEST(LeaseWriteHookWorkerRegression, LeaseKnownOldUpdateWithOtherMemberIsUnknownRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const DupBatches d = writeDupBatches(l, 40);
+    r.settle(150);
+    TestRejectRule none;
+    none.mode = TestRejectRule::Mode::OffsetSet;   // rejects nothing
+    r.installRejectView(/*viewTopicId=*/77, /*objectId=*/0x77, none);
+    for (int i = 0; i < 200 && r.writeState()->constraintSets.latest().count < 2; ++i) r.pass();
+    ASSERT_EQ(r.writeState()->constraintSets.latest().count, 2) << "vacuity guard: the reject view joined the lease index's set";
+    r.passes(60);
+    ASSERT_TRUE(r.leaseReady());
+    const auto a = l.produceNoSeq(d.batches[3], d.seqs[3]);   // the update of live k1
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    EXPECT_EQ(a->baseOffset, -1);
+    EXPECT_EQ(a->verdicts, (Verd{{0, 21, 0}})) << "another member may have rejected the original";
+}
+
+// Review minor (lease Task 5c): a known-old lease duplicate without View acks gets the plain duplicate answer, no trailer.
+TEST(LeaseWriteHookWorkerRegression, LeaseKnownOldDuplicateWithoutViewHasNoTrailerRegression) {
+    Leased l;
+    VerdictRig& r = l.r;
+    const DupBatches d = writeDupBatches(l, 40);
+    r.settle(150);
+    const int64_t c = r.produceBytes(VerdictRig::rawBatch(d.batches[3], 11, d.seqs[3]), rune::protocol::client::kAcksWireAll, 11, d.seqs[3]);
+    const auto a = r.ack(c);
+    ASSERT_TRUE(a);
+    EXPECT_EQ(a->code, 0);
+    EXPECT_FALSE(a->hasLease);
+    EXPECT_TRUE(a->verdicts.empty());
+}
+
 TEST(LeaseWriteHookWorkerRegression, LeaseAckArenaFullDefersRegression) {
     RigTuning tuning;
     tuning.ackTimeoutNs = 50'000'000;
