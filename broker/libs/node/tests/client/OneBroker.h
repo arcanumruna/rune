@@ -123,6 +123,7 @@ public:
         c.egressChannel   = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
         c.egressStreamId  = 2;
         c.dataDir         = (dir_ / ("own_client" + std::to_string(ownClients_++))).string();
+        c.driverCountersBytes = rune::client::transport::kMinDriverCountersBytes;   // a client's few counters: a small CnC (#883)
         return c;
     }
 

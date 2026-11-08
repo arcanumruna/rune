@@ -123,6 +123,8 @@ std::string goldenTopic(const std::string& name) {
     return {};
 }
 
+void fastWarmup(NodeConfig& cfg) { cfg.unservableWarmupMs = 50; }
+
 catalog_cluster::ThreeNodes startCluster(const std::string& tag) {
     return catalog_cluster::ThreeNodes::startWith(tag, [](NodeConfig& cfg) {
         cfg.verdictIntervalMs      = 20;
@@ -695,7 +697,7 @@ struct PcWriter {
 
 // §11.2: a write that asks for no verdict is judged all the same; its answer is today's and a rejected record is simply never visible.
 TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardRegression) {
-    OneBroker b("cw09_old", OneBroker::Runtime::Shard);
+    OneBroker b("cw09_old", OneBroker::Runtime::Shard, fastWarmup);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -763,7 +765,7 @@ TEST(CheckedWritesRegressorsPathRegression, OldWritersOnAConstrainedSourceShardR
 
 // R07c: a composite group-by check.
 TEST(CheckedWritesRegressorsPathRegression, CompositeGroupByCheckShardRegression) {
-    OneBroker b("cw09_pg", OneBroker::Runtime::Shard);
+    OneBroker b("cw09_pg", OneBroker::Runtime::Shard, fastWarmup);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
@@ -782,7 +784,7 @@ TEST(CheckedWritesRegressorsPathRegression, CompositeGroupByCheckShardRegression
 // A replace of the check view while creates are running: nothing times out, the old cap holds up to the change record, the new one after it.
 TEST(CheckedWritesRegressorsPathRegression, ReplaceWhileWritingShardRegression) {
     constexpr uint64_t kUsers = 20;
-    OneBroker b("cw09_rep", OneBroker::Runtime::Shard);
+    OneBroker b("cw09_rep", OneBroker::Runtime::Shard, fastWarmup);
     awaitLevel(b.node());
     ASSERT_FALSE(HasFatalFailure());
     std::string out, err;
