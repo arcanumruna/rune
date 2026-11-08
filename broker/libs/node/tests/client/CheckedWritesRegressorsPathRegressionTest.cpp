@@ -161,7 +161,8 @@ catalog_cluster::ThreeNodes startCluster(const std::string& tag, bool fast) {
         if (!fast) return;
         cfg.unservableWarmupMs     = 50;
         cfg.runtimePlacement       = NodeConfig::RuntimePlacement::Fused;
-        cfg.electionTimeoutMs      = 100;   // a crashed node's partitions fail over after 3 x this
+        cfg.electionTimeoutMs      = 100;
+        cfg.brokerLivenessTimeoutMs = 150;   // a crashed node's partitions fail over after this, not after 3 x the election timeout
     });
 }
 
@@ -1241,6 +1242,20 @@ TEST(CheckedWritesRegressorsPathRegression, ACrashedLeaderIsReplacedThreeNodesRe
     EXPECT_EQ(characterName.u(row.rowBytes, "characterId"), fooId);
 }
 
+// Whole step 7, the wait the three-broker restart test skips (it runs on a 50 ms warm-up): a restarted controller defers its partition
+// elections until it has held the replicas' reports for unservableWarmupMs.  Mutation: setUnservableReportWarmup not applied -> red.
+TEST(CheckedWritesRegressorsPathRegression, ARestartedControllerDefersItsElectionsWhileItWaitsForReportsShardRegression) {
+    OneBroker b("cw09_warm", OneBroker::Runtime::Shard, [](NodeConfig& cfg) {
+        cfg.unservableWarmupMs = 60'000;   // from 500 ms (BrokerNode::kUnservableReportPeriodNs) on, a restarted controller really waits for the reports
+        cfg.runtimePlacement   = NodeConfig::RuntimePlacement::Fused;
+    });
+    b.restart();
+    EXPECT_TRUE(b.node().onControlThreadForTest([&b] {
+        const auto* ms = b.node().metadataServiceForTest();
+        return ms != nullptr && ms->unservableWarmingUp();
+    })) << "the restarted controller does not defer its elections while it waits for the replicas' reports";
+}
+
 // Whole step 7 across nodes: every broker restarts and the limit still holds.
 TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThreeNodesRegression) {
     using namespace rune::node::test::catalog_cluster;
@@ -1259,18 +1274,7 @@ TEST(CheckedWritesRegressorsPathRegression, RestartOfEveryNodeKeepsTheLimitThree
         ASSERT_TRUE(w.insertAndAwait(character(kFull, "Bar")).ok());
     }
     for (const int id : c.runningNodes()) c.stop(id);
-    c.configTweak = [prior = std::move(c.configTweak)](NodeConfig& cfg) {
-        prior(cfg);
-        cfg.unservableWarmupMs = 550;   // from 500 ms (BrokerNode::kUnservableReportPeriodNs) on, the restarted controller really waits for the reports
-    };
     c.startNodes({1, 2, 3});
-    bool warming = false;
-    for (const int id : c.runningNodes())
-        warming |= c.node(id).onControlThreadForTest([&c, id] {
-            const auto* ms = c.node(id).metadataServiceForTest();
-            return ms != nullptr && ms->unservableWarmingUp();
-        });
-    EXPECT_TRUE(warming) << "no restarted controller defers its elections while it waits for the replicas' reports";
     ready(c);
     ASSERT_FALSE(HasFatalFailure());
     std::vector<int32_t> leaders;
