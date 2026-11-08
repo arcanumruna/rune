@@ -225,6 +225,18 @@ TEST(TransportConfigRegression, DriverCountersBytesIsZeroOrWithinAeronBoundsRegr
     }
 }
 
+// An attached driver is not the client's: its counters size cannot be set from here.  Mutation: the aeronDir check removed -> red.
+TEST(TransportConfigRegression, DriverCountersBytesWithAnAttachedDriverIsRefusedRegression) {
+    TransportConfig c;
+    c.aeronDir = "/some/running/driver/aeron";
+    EXPECT_FALSE(validate(c).has_value());
+    c.driverCountersBytes = rune::client::transport::kMinDriverCountersBytes;
+    ASSERT_TRUE(validate(c).has_value());
+    EXPECT_NE(validate(c)->find("aeronDir"), std::string::npos);
+    c.aeronDir.clear();
+    EXPECT_FALSE(validate(c).has_value());
+}
+
 // UDP GSO/GRO (rune-broker spec 2026-10-03-aeron-udp-gso-gro): default on; env forces it off / sets batching.
 TEST(TransportConfig, UdpGsoDefaultsOnEnvTurnsOffAndSetsMsgsPerSend) {
     EXPECT_TRUE(TransportConfig{}.udpGso);

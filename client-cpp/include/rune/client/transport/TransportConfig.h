@@ -181,6 +181,9 @@ struct TransportConfig {
         return "driverCountersBytes must be 0 (Aeron default) or in [1048576, 524288000]: " +
                std::to_string(c.driverCountersBytes);
     }
+    if (!c.aeronDir.empty() && c.driverCountersBytes != 0) {
+        return "driverCountersBytes sizes the client's own embedded driver: it cannot be set together with aeronDir";
+    }
     if (c.clientLivenessTimeoutNs > kMaxClientLivenessTimeoutNs) {
         return "clientLivenessTimeoutNs must be <= 3600000000000 (1 hour): " +
                std::to_string(c.clientLivenessTimeoutNs);

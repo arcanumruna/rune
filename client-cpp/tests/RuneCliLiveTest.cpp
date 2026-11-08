@@ -494,6 +494,49 @@ TEST(CliLive, SchemaGetLive) {
 }
 
 // ===========================================================================
+// --cli-aeron-dir attaches the CLI to a media driver that is already running: the gateway below is reachable only through
+// the first client's driver, so a CLI that started a driver of its own (the flag ignored) could never reach it.
+// Mutation: the flag not read in buildClientConfig -> the CLI times out (rc != 0, no GetTopicSchema seen).
+// ===========================================================================
+TEST(CliLive, AeronDirFlagAttachesToARunningDriver) {
+    static constexpr int32_t kIn = 1210, kOut = 1211;
+    const std::string driverDir = cliUniqueDir();
+    const std::string cliDir    = cliUniqueDir();
+
+    rune::client::ClientConfig cfg;
+    cfg.gatewayChannel  = "aeron:ipc";
+    cfg.gatewayStreamId = kIn;
+    cfg.egressStreamId  = kOut;
+    cfg.dataDir         = driverDir;
+    rune::client::Client driverOwner(cfg);
+
+    CliTestGateway gw(driverDir + "/aeron", kIn, kOut);
+    gw.getTopicId   = 0x40000001;
+    gw.getVersion   = 1;
+    gw.getErrorCode = static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic);
+    gw.start();
+
+    std::ostringstream out, err;
+    int rc = -1;
+    auto fut = std::async(std::launch::async, [&] {
+        rc = rune::cli::run({"schema", "get", "characters", "--cli-data-dir", cliDir, "--cli-aeron-dir", driverDir + "/aeron",
+                             "--cli-stream-in", std::to_string(kIn), "--cli-stream-out", std::to_string(kOut)}, out, err);
+    });
+    for (const auto deadline = std::chrono::steady_clock::now() + kCliTimeout;
+         fut.wait_for(kPollSleep) != std::future_status::ready && std::chrono::steady_clock::now() < deadline; )
+        gw.poll(16);
+    fut.wait();
+
+    EXPECT_EQ(gw.getsSeen.load(), 1) << "the CLI reached the gateway through the running driver; err=" << err.str();
+    EXPECT_EQ(rc, static_cast<int>(rpc::ErrorCode::UnknownTopic)) << err.str();
+    EXPECT_FALSE(std::filesystem::exists(cliDir + "/aeron")) << "the CLI started no driver of its own";
+    EXPECT_FALSE(std::filesystem::exists(cliDir + "/aeron.lock"));
+
+    gw.stop();
+    try { std::filesystem::remove_all(driverDir); std::filesystem::remove_all(cliDir); } catch (...) {}
+}
+
+// ===========================================================================
 // Test 4: SchemaGetUnknownTopic — UnknownTopic(7) → CLI returns 7, err message
 // ===========================================================================
 TEST(CliLive, SchemaGetUnknownTopic) {

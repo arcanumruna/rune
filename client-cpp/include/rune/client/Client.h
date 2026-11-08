@@ -388,6 +388,7 @@ struct ClientConfig {
 
     /// Empty = the client starts its own embedded driver under dataDir.  Else the aeron dir of a media driver that is already running
     /// (a test fixture shares one among its clients): the client starts none, attaches to it and leaves it running at close.
+    /// The attached driver's settings apply; the client's driver knobs are ignored, and driverCountersBytes is refused.
     std::string aeronDir;
 
     // Explicit Aeron knobs (spec §4.1/§4.3).  Env overrides (RUNE_CLIENT_AERON_MTU,
