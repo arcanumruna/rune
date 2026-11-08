@@ -95,6 +95,7 @@ public:
         bool                        preV8       = false;   // no DDL extension (requestId {0,0})
         uint32_t                    nsId        = 0;       // namespaces Task 7: the topic's namespace
         rune::protocol::TopicKeyFeatures keyFeatures{};
+        std::optional<rune::protocol::LeaseSpec> lease;
     };
 
     /// `fdLimit` / `fdReadySegments` (issue #296): AdminDeps::fdLimit / readySegmentsPerPartition (0 = unknown limit).
@@ -201,6 +202,7 @@ public:
         m.meta = meta_(a.statement, a.clientName, a.requestId, a.preV8);
         m.nsId = a.nsId;
         m.keyFeatures = a.keyFeatures;
+        m.lease = a.lease;
         return submit_(DdlRequest{std::move(m)});
     }
 

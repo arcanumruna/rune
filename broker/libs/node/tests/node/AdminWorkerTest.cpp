@@ -427,8 +427,9 @@ TEST(AdminWorkerRegression, CatalogDdlRingFramesRoundTripEveryRequestRegression)
             EXPECT_EQ(got.blob, d.blob); EXPECT_EQ(got.persistence, 1u); EXPECT_EQ(got.replicationFactor, 3);
             EXPECT_EQ(got.config, d.config); EXPECT_EQ(got.meta, meta);
             EXPECT_EQ(got.keyFeatures, d.keyFeatures);
-            // The 14-byte key features block is the frame's tail: an unknown flag bit or partitioner is malformed, never cast.
-            for (const auto& [at, value] : {std::pair{n - 14, uint8_t{0x04}}, std::pair{n - 13, uint8_t{2}}}) {
+            // The 14-byte key features block is followed by the hasLease byte (no lease here): an unknown flag bit or
+            // partitioner is malformed, never cast.
+            for (const auto& [at, value] : {std::pair{n - 15, uint8_t{0x04}}, std::pair{n - 14, uint8_t{2}}}) {
                 std::vector<uint8_t> badFeatures(p, p + n);
                 badFeatures[at] = value;
                 const DdlRequest r2 = decodeDefineTopic(badFeatures.data(), badFeatures.size());

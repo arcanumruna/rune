@@ -35,7 +35,9 @@ struct NsObjectCounts {
         c.partitions += static_cast<uint64_t>(t->partitions > 0 ? t->partitions : 0);
         if (t->schema) ++c.schemas;
     }
-    for (const rune::catalog::ViewObject* v : s.views()) if (v->nsId == nsId) ++c.views;
+    // A lease topic's own lease view is part of the topic, not a view the namespace limit counts.
+    for (const rune::catalog::ViewObject* v : s.views())
+        if (v->nsId == nsId && v->kind != rune::catalog::ViewKind::LeaseIndex) ++c.views;
     return c;
 }
 

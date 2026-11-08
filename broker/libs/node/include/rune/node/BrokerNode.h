@@ -267,7 +267,8 @@ public:
                                                  const rune::protocol::TopicConfigView& config,
                                                  const rune::gateway::DdlMetaView& meta,
                                                  std::string_view adoptDenial,
-                                                 const rune::protocol::TopicKeyFeatures& keyFeatures) override {
+                                                 const rune::protocol::TopicKeyFeatures& keyFeatures,
+                                                 const std::optional<rune::protocol::LeaseSpec>& lease) override {
         DefineTopicMsg m;
         m.session        = sessionId;
         m.corr           = correlationId;
@@ -283,6 +284,7 @@ public:
         m.nsId = meta.targetNsId;   // namespaces Task 10: the gateway-resolved namespace
         m.adoptDenial.assign(adoptDenial);
         m.keyFeatures = keyFeatures;
+        m.lease       = lease;
         return submitDdl_(m);
     }
 

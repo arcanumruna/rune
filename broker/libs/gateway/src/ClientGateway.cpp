@@ -8545,7 +8545,8 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
                                                      m.persistence, m.replicationFactor, m.config,
                                                      ddlMetaOf_(m.hasExt ? &m.ext : nullptr, m.sessionId, *session, res.nsId),
                                                      adopt ? std::string_view(adopt->detail) : std::string_view{},
-                                                     m.hasKeyFeatures ? m.keyFeatures : rune::protocol::TopicKeyFeatures{}),
+                                                     m.hasKeyFeatures ? m.keyFeatures : rune::protocol::TopicKeyFeatures{},
+                                                     m.hasLease ? std::optional<rune::protocol::LeaseSpec>(m.lease) : std::nullopt),
                        "DefineTopic: admin ring full", "DefineTopic: request larger than the admin ring message");
 }
 

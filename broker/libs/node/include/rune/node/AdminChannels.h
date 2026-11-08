@@ -23,6 +23,7 @@
 
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/LeaseSpec.h>
 #include <rune/protocol/NamespaceLimits.h>   // NamespaceDdlMsg (namespaces Task 7)
 #include <rune/catalog/CatalogEvent.h>   // rune::catalog::ConfigChange (AlterTopicConfig)
 #include <rune/catalog/NamespaceRegistry.h>   // NamespaceRecord (kA2cNamespaceUpserted, namespaces Task 9)
@@ -285,6 +286,7 @@ struct DefineTopicMsg {
     std::string                 adoptDenial;
     uint32_t                    nsId = 0;   // namespaces Task 7: the namespace the object lives in (0 = default)
     rune::protocol::TopicKeyFeatures keyFeatures{};   // checked writes Part 05: key.index at create / adoption
+    std::optional<rune::protocol::LeaseSpec> lease;   // lease topics: the spec of a lease topic's CreateTopic
 };
 
 /// AlterTopic: the client's CAS expectation (expectedVersion = the topic's SCHEMA
@@ -542,6 +544,7 @@ struct Sizer {
         n += 4 + b.size();
     }
     void str32(std::string_view s) noexcept { bytes32({reinterpret_cast<const uint8_t*>(s.data()), s.size()}); }
+    void raw(std::span<const uint8_t> b) noexcept { n += b.size(); }
 };
 
 struct Writer {
@@ -564,6 +567,10 @@ struct Writer {
         p += b.size();
     }
     void str32(std::string_view s) noexcept { bytes32({reinterpret_cast<const uint8_t*>(s.data()), s.size()}); }
+    void raw(std::span<const uint8_t> b) noexcept {
+        if (!b.empty()) std::memcpy(p, b.data(), b.size());
+        p += b.size();
+    }
 };
 
 /// Checked reader: every short read clears `ok` (and reads nothing further).
@@ -692,6 +699,13 @@ template <class W> void layout(W& w, const DefineTopicMsg& m) {
     w.u8((m.keyFeatures.keyIndex ? 1 : 0) | (m.keyFeatures.autoIncrement ? 2 : 0));
     w.u8(static_cast<uint8_t>(m.keyFeatures.partitioner));
     w.u64(m.keyFeatures.autoIncrementMax); w.u32(m.keyFeatures.autoIncrementReserve);
+    // lease topics: ALWAYS [hasLease u8], then (when 1) the 39 bytes of encodeLeaseSpec.
+    w.u8(m.lease ? 1 : 0);
+    if (m.lease) {
+        std::array<uint8_t, rune::protocol::kLeaseSpecBytes> lb{};
+        rune::protocol::encodeLeaseSpec(*m.lease, lb.data());
+        w.raw({lb.data(), lb.size()});
+    }
 }
 template <class W> void layout(W& w, const AlterTopicMsg& m) {
     w.i64(m.session); w.i64(m.corr); w.u16(m.expectedVersion); w.str16(m.topicName);
@@ -829,6 +843,15 @@ inline DdlRequest decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     m.keyFeatures.partitioner          = static_cast<rune::protocol::Partitioner>(r.ok ? partitioner : 0);
     m.keyFeatures.autoIncrementMax     = r.u64();
     m.keyFeatures.autoIncrementReserve = r.u32();
+    const uint8_t hasLease = r.u8();
+    if (r.ok && hasLease > 1) r.fail("an unknown hasLease byte");
+    if (r.ok && hasLease == 1) {
+        if (r.need(rune::protocol::kLeaseSpecBytes)) {
+            rune::protocol::LeaseSpec ls;
+            if (rune::protocol::decodeLeaseSpec(r.b + r.pos, rune::protocol::kLeaseSpecBytes, ls)) m.lease = ls;
+            r.pos += rune::protocol::kLeaseSpecBytes;
+        }
+    }
     return admin_wire::finish(r, std::move(m), kTidDefineTopic);
 }
 inline DdlRequest decodeAlterTopic(const uint8_t* buf, std::size_t len) {
@@ -1879,7 +1902,8 @@ inline constexpr std::size_t kDdlMetaFixedBytes     = 4 + 2 + 2 + 2 + 8 + 8 + 8 
 // The trailing adoptDenial length prefix (2, issue #129), the nsId (4, namespaces), then the
 // key features (checked writes Part 05).
 inline constexpr std::size_t kDefineTopicFixedBytes =
-    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2 + 4 + rune::protocol::kTopicKeyFeaturesWireLen;
+    8 + 8 + 4 + 1 + 2 + 2 + 4 + 1 + 2 + kTopicConfigFixedBytes + 2 + 2 + kDdlMetaFixedBytes + 2 + 4 + rune::protocol::kTopicKeyFeaturesWireLen +
+    1 + rune::protocol::kLeaseSpecBytes;   // lease topics: [hasLease u8][LeaseSpec]
 inline constexpr std::size_t kMaxDescriptorViaRequestRing =
     static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
 static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=
