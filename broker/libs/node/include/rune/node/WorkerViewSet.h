@@ -920,7 +920,7 @@ private:
         int64_t cursor = inst.foldCursor;
         // P11-0: a transaction applies at its commit marker, read back through readRange, within the pass cap.  A transient
         // source keeps offset order (D6): its ring may have evicted a span's first batch and its read ignores the end.
-        rune::view::TxnFold txnFold{inst.spanFence, supersedeKeys_, rune::view::spanReaderOf(readRange), inst.maxRecordsPerPass};
+        rune::view::TxnFold txnFold{inst.spanFence, txnOverlays_.supersedeKeys, rune::view::spanReaderOf(readRange), inst.maxRecordsPerPass};
         rune::view::TxnFold* const txn = transientSrc == nullptr ? &txnFold : nullptr;
         const rune::view::FoldStats st =
             inst.keyed ? foldKeyed_(inst, view, passBound, cursor, skip, txn)
@@ -1044,7 +1044,6 @@ private:
     uint64_t             hashSeed_ = 0;
     uint64_t             hashMask_ = ~uint64_t{0};
     int64_t              passCapForTest_ = 0;
-    rune::view::SupersedeKeys supersedeKeys_;   // D1: one marker application's noted keys at a time (every instance of the worker)
     uint64_t             installRefusals_ = 0;
 
     std::unordered_map<int32_t, ViewTemplate>         templates_;        // viewTopicId -> plan template

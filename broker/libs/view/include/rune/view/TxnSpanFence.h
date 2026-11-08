@@ -36,11 +36,12 @@ struct TxnSpanFence {
         open[count++] = TxnSpan{pid, first};
         return true;
     }
-    [[nodiscard]] const TxnSpan* find(int64_t pid) const noexcept {
+    [[nodiscard]] TxnSpan* find(int64_t pid) noexcept {
         for (uint8_t i = 0; i < count; ++i)
             if (open[i].pid == pid) return &open[i];
         return nullptr;
     }
+    [[nodiscard]] const TxnSpan* find(int64_t pid) const noexcept { return const_cast<TxnSpanFence*>(this)->find(pid); }
     void close(int64_t pid) noexcept {
         for (uint8_t i = 0; i < count; ++i) {
             if (open[i].pid != pid) continue;

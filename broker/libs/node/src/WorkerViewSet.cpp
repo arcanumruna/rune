@@ -268,7 +268,7 @@ int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
 
 WorkerViewSet::WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataDir, uint64_t hashSeed)
     : channel_(channel), viewDataDir_(std::move(viewDataDir)), hashSeed_(hashSeed) {
-    supersedeKeys_.seed(hashSeed);
+    txnOverlays_.supersedeKeys.seed(hashSeed);
 }
 
 void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,

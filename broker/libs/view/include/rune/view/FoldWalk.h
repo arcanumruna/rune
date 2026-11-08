@@ -38,8 +38,23 @@ struct SpanReader {
 };
 template <class ReadRangeFn>
 [[nodiscard]] SpanReader spanReaderOf(ReadRangeFn& readRange) noexcept {
-    return {&readRange, [](void* c, int64_t from, int64_t to) { return (*static_cast<ReadRangeFn*>(c))(from, to); }};
+    return {const_cast<void*>(static_cast<const void*>(&readRange)), [](void* c, int64_t from, int64_t to) { return (*static_cast<ReadRangeFn*>(c))(from, to); }};
 }
+
+/// A verdict source's decision point (D2): a transaction with a TxnJudge is applied at it, not at its marker.  The source decides each
+/// non-transactional control batch: None (not a TxnJudge, or nothing to do), Apply (the span of `pid`, from `first` too when it is
+/// not -1: a checkpoint inside the span holds none of its records), Drop (another path applies it: the span closes) or Wait (the fold
+/// stops before the batch until the transaction is decided).  Called only for control batches (cold).
+enum class JudgeStep : uint8_t { None, Apply, Drop, Wait };
+struct JudgeDecision {
+    JudgeStep step  = JudgeStep::None;
+    int64_t   pid   = -1;
+    int64_t   first = -1;
+};
+struct JudgeHook {
+    void* ctx = nullptr;
+    JudgeDecision (*fn)(void* ctx, const uint8_t* batch, std::size_t len, int64_t at) = nullptr;
+};
 
 /// One fold call's transactional state: the instance's fence, the worker's supersede keys, its reader, and the call's budget in units (offsets the walk covers
 /// plus records a marker application applies; 0 = no cap).  A fold without one (a transient source, D6) applies transactional
@@ -49,6 +64,7 @@ struct TxnFold {
     SupersedeKeys& keys;
     SpanReader     reader;
     int64_t        budget = 0;
+    JudgeHook      judge{};   // a verdict source's replay; path A leaves it empty and applies at the marker
 };
 
 /// The bytes one call may read back for a marker application (as kVoteScanBytesPerPass); the rest continues next call.
@@ -56,7 +72,7 @@ inline constexpr std::size_t kTxnReadBackBytesPerPass = std::size_t{1} << 20;
 
 namespace detail {
 
-enum class WalkEnd : uint8_t { Done, Corrupt, Marker };
+enum class WalkEnd : uint8_t { Done, Corrupt, Marker, Wait };
 struct WalkOut {
     WalkEnd end;
     int64_t walkedUpto;   // every batch below it was folded, skipped or held in a span
@@ -64,21 +80,37 @@ struct WalkOut {
     int64_t at  = -1;     // Marker: the marker's offset
 };
 
-enum class TxnStep : uint8_t { Skip, Apply, Stop, Marker };
+enum class TxnStep : uint8_t { Skip, Apply, Stop, Marker, Wait };
 
 // A control or transactional batch.  Control: a commit marker of an open span hands the walk back to apply it, an abort marker
 // closes it, anything else is skipped.  Data: an aborted transaction's batch is skipped; with a fence, every other one opens (or
 // extends) its producer's span and is skipped; without one, or with a full one, it is applied here (offset order).
 inline TxnStep txnStep(const rune::protocol::RecordBatchReader& r, const uint8_t* batch, int16_t attrs, int64_t last, int64_t bound,
-                       const FoldSkip& skip, TxnSpanFence* fence, FoldStats& stats) noexcept {
+                       const FoldSkip& skip, TxnFold* txn, FoldStats& stats, int64_t& pid) noexcept {
     namespace b = rune::protocol::batch;
     namespace cm = rune::storage::control_marker;
+    TxnSpanFence* fence = txn != nullptr ? &txn->fence : nullptr;
     const int64_t base = r.baseOffset();
     if ((attrs & b::kAttrControl) != 0) {
         if (fence != nullptr && (attrs & b::kAttrTransactional) != 0 && base < bound && fence->count != 0 && fence->find(r.producerId()) != nullptr) {
             const int type = cm::controlType(batch, static_cast<std::size_t>(r.totalLength()));
-            if (type == cm::kCommit) return TxnStep::Marker;
+            if (type == cm::kCommit) {
+                pid = r.producerId();
+                return TxnStep::Marker;
+            }
             if (type == cm::kAbort) fence->close(r.producerId());
+        } else if (fence != nullptr && txn->judge.fn != nullptr && (attrs & b::kAttrTransactional) == 0 && base < bound) {
+            const JudgeDecision d = txn->judge.fn(txn->judge.ctx, batch, static_cast<std::size_t>(r.totalLength()), base);
+            if (d.step == JudgeStep::Wait) return TxnStep::Wait;
+            if (d.step == JudgeStep::Drop) fence->close(d.pid);
+            if (d.step == JudgeStep::Apply) {
+                TxnSpan* open = fence->find(d.pid);
+                if (open != nullptr && d.first >= 0) open->first = std::min(open->first, d.first);
+                if (open != nullptr || (d.first >= 0 && fence->add(d.pid, d.first))) {
+                    pid = d.pid;
+                    return TxnStep::Marker;
+                }
+            }
         }
         ++stats.skippedControl;
         return TxnStep::Skip;
@@ -99,9 +131,10 @@ inline TxnStep txnStep(const rune::protocol::RecordBatchReader& r, const uint8_t
 }
 
 template <class OnRecord>
-WalkOut walkView(const rune::storage::LogReadView& view, int64_t from, int64_t bound, const FoldSkip& skip, TxnSpanFence* fence,
+WalkOut walkView(const rune::storage::LogReadView& view, int64_t from, int64_t bound, const FoldSkip& skip, TxnFold* txn,
                  FoldStats& stats, OnRecord& onRecord) {
     namespace b = rune::protocol::batch;
+    TxnSpanFence* fence = txn != nullptr ? &txn->fence : nullptr;
     int64_t walkedUpto = view.baseOffset;
     std::size_t pos = 0;
     while (pos < view.len) {
@@ -110,13 +143,15 @@ WalkOut walkView(const rune::storage::LogReadView& view, int64_t from, int64_t b
         const int16_t attrs = r.attributes();
         const int64_t last  = r.baseOffset() + r.lastOffsetDelta();
         if ((attrs & (b::kAttrControl | b::kAttrTransactional)) != 0) [[unlikely]] {
-            switch (txnStep(r, view.data + pos, attrs, last, bound, skip, fence, stats)) {
+            int64_t pid = -1;
+            switch (txnStep(r, view.data + pos, attrs, last, bound, skip, txn, stats, pid)) {
                 case TxnStep::Skip:
                     pos += static_cast<std::size_t>(r.totalLength());
                     walkedUpto = last + 1;
                     continue;
                 case TxnStep::Stop:   return {WalkEnd::Done, walkedUpto};
-                case TxnStep::Marker: return {WalkEnd::Marker, walkedUpto, r.producerId(), r.baseOffset()};
+                case TxnStep::Marker: return {WalkEnd::Marker, walkedUpto, pid, r.baseOffset()};
+                case TxnStep::Wait:   return {WalkEnd::Wait, walkedUpto};
                 case TxnStep::Apply:  break;
             }
         }
@@ -261,7 +296,9 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
                 pos += len;
                 if (last < at) continue;
                 bytes += len;
-                if (r.producerId() == pid && (r.attributes() & (b::kAttrControl | b::kAttrTransactional)) == b::kAttrTransactional) {
+                // An aborted batch is skipped: a span opened at a TxnJudge from its firstOffset (JudgeHook) was never filtered by the walk.
+                if (r.producerId() == pid && (r.attributes() & (b::kAttrControl | b::kAttrTransactional)) == b::kAttrTransactional &&
+                    !isAbortedBatch(skip, r, r.attributes())) {
                     enum class Out : uint8_t { No, Segment, Budget } out = Out::No;
                     r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t) {
                         if (out != Out::No || offset < at) return;
@@ -319,12 +356,12 @@ void walkFold(const rune::storage::LogReadView& first, int64_t bound, int64_t& c
     int64_t units = 0;   // records applied at markers this call
     rune::storage::LogReadView view = first;
     for (;;) {
-        const detail::WalkOut w = detail::walkView(view, from, bound, skip, fence, stats, onRecord);
+        const detail::WalkOut w = detail::walkView(view, from, bound, skip, txn, stats, onRecord);
         if (w.end == detail::WalkEnd::Done) {
             cursor = std::max(from, std::min(view.nextOffset, bound));
             break;
         }
-        if (w.end == detail::WalkEnd::Corrupt) {
+        if (w.end == detail::WalkEnd::Corrupt || w.end == detail::WalkEnd::Wait) {
             // Never advance past the last fully-walked batch (view.nextOffset describes bytes never validated), nor move back.
             cursor = std::max(from, w.walkedUpto);
             break;

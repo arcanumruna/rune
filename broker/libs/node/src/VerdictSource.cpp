@@ -179,50 +179,18 @@ void applyKeyIndex(KeyIndexFold& f, const rune::view::SourceRecord&, const rune:
 }
 
 rune::view::FoldStats foldKeyIndexBatch(KeyIndexFold& f, const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
-                                        const rune::view::FoldSkip& skipRef) noexcept {
-    const rune::view::FoldSkip skip = skipRef;   // #537: by value (see AbortedTxnFilter::skips)
+                                        const rune::view::FoldSkip& skip, rune::view::TxnFold* txn) {
     rune::view::FoldStats stats{};
     rune::view::Prospect  p;
-    const int64_t from = cursor;
-    bool stopped = false, corrupt = false;
-    int64_t walkedUpto = view.baseOffset;
-    std::size_t pos = 0;
-    while (pos < view.len) {
-        rune::protocol::RecordBatchReader r(view.data + pos, view.len - pos);
-        if (!r.ensureValid()) {
-            corrupt = true;
-            break;
+    rune::view::walkFold(view, bound, cursor, skip, txn, stats, [&](std::string_view key, std::string_view value, int64_t offset) {
+        const rune::view::SourceRecord rec{key, value, offset, 0, nullptr};
+        if (prepareKeyIndex(f, rec, p) == rune::view::PrepareStatus::Malformed) {
+            ++stats.skippedMalformed;
+            return;
         }
-        const int16_t attrs = r.attributes();
-        const int64_t end   = r.baseOffset() + r.lastOffsetDelta() + 1;
-        if ((attrs & rune::protocol::batch::kAttrControl) != 0) {
-            ++stats.skippedControl;
-        } else if (rune::view::isAbortedBatch(skip, r, attrs)) [[unlikely]] {
-            if (end > bound) { stopped = true; break; }
-            ++stats.skippedAborted;
-        } else {
-            r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t) {
-                if (stopped) return;
-                if (offset >= bound) { stopped = true; return; }
-                if (offset < from) return;
-                if (rune::view::isRejectedRecord(skip, offset)) [[unlikely]] {
-                    ++stats.skippedRejected;
-                    return;
-                }
-                const rune::view::SourceRecord rec{key, value, offset, 0, nullptr};
-                if (prepareKeyIndex(f, rec, p) == rune::view::PrepareStatus::Malformed) {
-                    ++stats.skippedMalformed;
-                    return;
-                }
-                applyKeyIndex(f, rec, p);
-                ++(value.empty() ? stats.deleted : stats.applied);
-            });
-            if (stopped) break;
-        }
-        pos += static_cast<std::size_t>(r.totalLength());
-        walkedUpto = end;
-    }
-    cursor = std::max(from, corrupt ? walkedUpto : std::min(view.nextOffset, bound));
+        applyKeyIndex(f, rec, p);
+        ++(value.empty() ? stats.deleted : stats.applied);
+    });
     return stats;
 }
 
@@ -707,6 +675,7 @@ void VerdictSource::notePause_(int64_t offset) noexcept {
 }
 
 void VerdictSource::endOrdinary_(const OrdinaryTxn& o) noexcept {
+    closeSpan_(o.producerId);
     ordinary_.erase(ordinary_.begin() + static_cast<std::ptrdiff_t>(markerAt_));
     ordinaryApplied_ = -1;
     ordinaryWalk_ = {};
@@ -971,14 +940,22 @@ void VerdictSource::noteKeyZeroRejection_(const Verdict& v, const rune::view::So
     spdlog::critical("AUTOINC-ID-REUSE topic={} partition={} id={}", srcTopicId_, partition_, keyIndexWord(rec.key));
 }
 
-int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted) {
+int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted,
+                           rune::view::SpanReader reader) {
     ViewInstance& inst = *m.inst;
     const rune::view::FoldSkip skip{.aborted = aborted, .rejected = &state_->rejected};
     int64_t cursor = inst.foldCursor;
     const int64_t bound = inst.maxRecordsPerPass > 0 ? std::min(upTo, cursor + inst.maxRecordsPerPass) : upTo;
+    struct JudgeCtx { VerdictSource* self; Member* m; } jc{this, &m};
+    rune::view::TxnFold txnFold{inst.spanFence, txnPool_->supersedeKeys, reader, inst.maxRecordsPerPass,
+                                {&jc, [](void* c, const uint8_t* b, std::size_t len, int64_t at) {
+                                     auto* j = static_cast<JudgeCtx*>(c);
+                                     return j->self->judgeStep_(*j->m, b, len, at);
+                                 }}};
+    rune::view::TxnFold* const txn = &txnFold;
     if (m.kind == rune::view::VerdictViewKind::KeyIndex) {
         KeyIndexFold f{inst.table, m.keyWidth};
-        const rune::view::FoldStats st = foldKeyIndexBatch(f, view, bound, cursor, skip);
+        const rune::view::FoldStats st = foldKeyIndexBatch(f, view, bound, cursor, skip, txn);
         inst.foldCursor = cursor;
         inst.counters.skippedAborted += st.skippedAborted;
         discardKeyIndexDirty_(inst);
@@ -987,14 +964,14 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
     rune::view::FoldStats st;
     if (inst.keyed && inst.agg) {
         rune::view::AggregateFold f = aggregateFoldOf(inst);
-        st = rune::view::foldKeyedAggregateBatch(f, inst.prospect, view, bound, cursor, skip);
+        st = rune::view::foldKeyedAggregateBatch(f, inst.prospect, view, bound, cursor, skip, txn);
     } else if (inst.keyed) {
         rune::view::ProjectionFold f = projectionFoldOf(inst);
-        st = rune::view::foldProjectionBatch(f, inst.prospect, view, bound, cursor, skip);
+        st = rune::view::foldProjectionBatch(f, inst.prospect, view, bound, cursor, skip, txn);
     } else {
         st = inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout, inst.vdc, inst.table, inst.agg->contributors,
-                                                       inst.agg->groups, inst.agg->blocksOrNull(), view, bound, cursor, skip)
-                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view, bound, cursor, skip);
+                                                       inst.agg->groups, inst.agg->blocksOrNull(), view, bound, cursor, skip, txn)
+                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view, bound, cursor, skip, txn);
     }
     inst.foldCursor = cursor;
     inst.counters.skippedAborted   += st.skippedAborted;
@@ -1007,8 +984,34 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
     inst.counters.skippedNoKey     += st.skippedNoKey;
     inst.counters.ownerMoves       += st.ownerMoves;
     inst.counters.uniquePromotions += st.uniquePromotions;
+    inst.counters.txnSuperseded    += st.txnSuperseded;
     if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
     return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedNoGroup + st.skippedNoKey + st.skippedRejected);
+}
+
+// D2/D3: a TxnJudge in a member's replay.  Decided (its entry Finalized, or replaced by the producer's next transaction): a
+// committed transaction applies here, an aborted one is dropped (a replaced entry's aborted batches are skipped by the filter).  Undecided: an active member drops the span, and finalizeLocked_ applies it
+// to every active member; any other member (a candidate, a joiner) waits here until it is decided.
+rune::view::JudgeDecision VerdictSource::judgeStep_(Member& m, const uint8_t* batch, std::size_t len, int64_t at) noexcept {
+    if (len != cr::kTxnJudgeBatchBytes) return {};
+    const auto j = cr::parseTxnJudge(batch, len);
+    if (!j) return {};
+    const DeferredTxn* t = state_->txn.find(j->producerId);
+    if (t != nullptr && t->judgeOffset == at) {
+        if (t->phase != TxnPhase::Finalized) {
+            const bool active = std::find(active_.begin(), active_.end(), static_cast<std::size_t>(&m - members_.data())) != active_.end();
+            return {active ? rune::view::JudgeStep::Drop : rune::view::JudgeStep::Wait, j->producerId};
+        }
+        if (!t->commit) return {rune::view::JudgeStep::Drop, j->producerId};
+    }
+    const bool backfill = j->firstOffset < m.replayFrom;
+    if (backfill) ++state_->txn.stats.checkpointBackfills;
+    return {rune::view::JudgeStep::Apply, j->producerId, backfill ? j->firstOffset : -1};
+}
+
+// The judge applied (or dropped) a transaction to every active member: a span a member's replay opened for it is closed.
+void VerdictSource::closeSpan_(int64_t producerId) noexcept {
+    for (const std::size_t i : active_) members_[i].inst->spanFence.close(producerId);
 }
 
 int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t limit, int64_t hardLimit, const rune::view::AbortedTxnFilter& aborted) {
@@ -1367,8 +1370,10 @@ int VerdictSource::pushCheckpoints_(PartitionWriteState& state) {
                 continue;
             }
         }
+        // A push the span fence vetoes (P11-0) leaves nothing durable at the cursor: the run-ahead cap still counts from the last one.
+        const bool vetoed = inst.spanFence.fenced() || inst.spanFence.straddles(inst.foldCursor);
         work += hooks_.checkpoint(hooks_.ctx, inst);
-        if (!inst.pendingValid) m.pushedAt = inst.foldCursor;
+        if (!inst.pendingValid && !vetoed) m.pushedAt = inst.foldCursor;
     }
     return work;
 }

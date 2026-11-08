@@ -527,7 +527,8 @@ struct Persisted {
 }  // namespace
 
 // P11-8 (a): while the judge runs ahead of a voted transaction T to its J, the member pushes its checkpoint at O inside T (the pass
-// cap counts from its last push).  A restart from that checkpoint, after T committed, backfills T's records below O from J.
+// cap counts from its last push).  A restart from that checkpoint, after T committed, backfills T's records below O from J: the
+// replay applies T at its TxnJudge from firstOffset (D2; re-pinned in Task 8, the separate backfill pass is gone).
 TEST(CheckedWritesTxnWorker, RunAheadCheckpointIsBackfilledOnReplayRegression) {
     Persisted p;
     ASSERT_GT(p.cap, 0);
@@ -579,6 +580,35 @@ TEST(CheckedWritesTxnWorker, RunAheadCheckpointIsBackfilledOnReplayRegression) {
     EXPECT_TRUE(p.r.hasRow(kRej, 10000));
     EXPECT_TRUE(p.r.hasRow(kRej, 10000 + static_cast<uint64_t>(3 * p.cap) - 1));
     EXPECT_EQ(rows(), leader) << "the refold equals the leader's table";
+}
+
+// REGRESSION (Task 8 step 6, design 3.1, the activation invariant): an ordinary transaction (no vote, so no J to backfill from)
+// holds every member checkpoint at or below its first record until its marker.  (Its traffic stays within one delta frame; more is
+// step 7's multi-frame delta.)  So a recovered K
+// never lies in an ordinary span (first, M], and a recovering member starts with an empty fence.
+TEST(CheckedWritesTxnWorkerRegression, MemberCheckpointNeverInsideAnOrdinaryTxnRegression) {
+    Persisted p;
+    ASSERT_GT(p.cap, 0);
+    std::vector<std::vector<uint8_t>> batches{VerdictRig::batch({ups(1001)}, kRaPid, 0, {}, /*txn=*/true)};
+    for (auto& b : Persisted::plain(10000, p.cap / 4)) batches.push_back(std::move(b));
+    batches.push_back(VerdictRig::batch({ups(1002)}, kRaPid, 1, {}, /*txn=*/true));
+    const int64_t first = p.replicated(std::move(batches));
+    std::vector<int64_t> durable;
+    const auto watch = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            p.r.pass();
+            if (durable.empty() || durable.back() != p.durable()) durable.push_back(p.durable());
+        }
+    };
+    watch(300);
+    const int64_t m = p.r.leo();
+    p.r.marker(kRaPid, true);
+    watch(300);
+    ASSERT_TRUE(p.r.driveUntilJudged());
+    EXPECT_TRUE(p.r.hasRow(kRej, 1001));
+    EXPECT_TRUE(p.r.hasRow(kRej, 1002));
+    ASSERT_GT(durable.back(), m) << "checkpoints resume past the marker (the vacuity guard)";
+    for (const int64_t k : durable) EXPECT_FALSE(k > first && k <= m) << k << " lies in the ordinary span (" << first << ", " << m << "]";
 }
 
 // P11-8 (b): while a voted transaction is Locked with its J below the member's cursor, no checkpoint is pushed (counted), however
