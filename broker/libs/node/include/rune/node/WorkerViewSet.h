@@ -973,6 +973,7 @@ private:
         if (st.txnReadFailed != 0 && inst.counters.txnReadFailed == st.txnReadFailed)
             spdlog::warn("WorkerViewSet: view {} partition {}: a transaction's read-back below offset {} failed; its marker is retried each pass",
                          inst.plan.viewName, inst.partition, inst.foldCursor);
+        inst.counters.txnNoteWaits     += st.txnNoteWaits;
         if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
 
         // Bug A: this pass's OWN fold may be what just caught the instance up

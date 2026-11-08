@@ -581,7 +581,8 @@ struct JudgeRig {
         drive();
         ASSERT_EQ(vs.judgeCursor(), 10);
     }
-    // A read of exactly [failFrom, failTo) comes back empty failReads times; oneBatch reads return one batch each.
+    // A read of exactly [failFrom, failTo) (any end when failTo is INT64_MAX) comes back empty failReads times; oneBatch reads return
+    // one batch each.
     int64_t failFrom = -1, failTo = -1;
     int     failReads = 0;
     bool    oneBatch = false;
@@ -596,7 +597,7 @@ struct JudgeRig {
             counted += from >= countFrom;
             countedAt += from == countAt;
             countedTo += to == countTo;
-            if (failReads > 0 && from == failFrom && to == failTo) {
+            if (failReads > 0 && from == failFrom && (to == failTo || failTo == INT64_MAX)) {
                 --failReads;
                 return rune::storage::LogReadView{};
             }
@@ -2576,6 +2577,35 @@ TEST(CheckedWritesTxnJudgeRegression, BackfillAppliedOverSeveralPassesCountsOnce
     for (int i = 0; i < 16 && cand.foldCursor < 16; ++i) r.drive();
     EXPECT_TRUE(cand.table.get(50) != nullptr && cand.table.get(51) != nullptr && cand.table.get(52) != nullptr);
     EXPECT_EQ(r.st.txn.stats.checkpointBackfills, 1u);
+    r.vs.removeCandidate(9, 0x5eed);
+}
+
+// REGRESSION (Task 8 review 2, m-e): a member replay's fold stats reach the member's counters.  A failed read-back of a span at J
+// was counted by the worker's fold only; path B dropped it, and never warned.
+TEST(CheckedWritesTxnJudgeRegression, ReplayReadFailureIsCountedOnTheMemberRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.log.data({{50}}, 77);   // 10: T
+    r.log.data({{51}}, 77);   // 11: T
+    r.log.data({{60}});       // 12
+    r.log.judge(77, 10);      // 13: J
+    r.log.marker(77, true);   // 14
+    for (int i = 0; i < 8; ++i) r.drive();
+    ASSERT_EQ(r.vs.judgeCursor(), 15);
+    const rune::codec::Descriptor* s[] = {&r.src};
+    const rune::view::CompileResult candComp = rune::view::compileView(tagView(), s, 9).value();
+    ViewInstance cand(candComp.plan, candComp.rowLayout, r.src, false, 0, 8192, 1u << 16);
+    cand.foldCursor = 11;     // recovered inside T: J reads T back from 10
+    r.failFrom = 10;
+    r.failTo = INT64_MAX;
+    r.failReads = 2;          // the read and its retry to past J
+    r.vs.addCandidate(&cand, VerdictViewKind::TestReject, 9, 0x5eed);
+    r.drive();
+    EXPECT_EQ(cand.counters.txnReadFailed, 1u);
+    EXPECT_TRUE(cand.table.get(51) == nullptr);
+    for (int i = 0; i < 8 && cand.foldCursor < 15; ++i) r.drive();
+    EXPECT_TRUE(cand.table.get(50) != nullptr && cand.table.get(51) != nullptr) << "the next pass retries";
+    EXPECT_EQ(cand.counters.txnReadFailed, 1u);
     r.vs.removeCandidate(9, 0x5eed);
 }
 

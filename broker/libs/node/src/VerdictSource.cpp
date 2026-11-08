@@ -958,11 +958,23 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
                                      return j->self->judgeStep_(*j->m, b, len, at);
                                  }}};
     rune::view::TxnFold* const txn = &txnFold;
+    const auto txnStats = [&inst, this](const rune::view::FoldStats& st) {
+        inst.counters.txnSpanTableFull += st.txnSpanTableFull;
+        if (st.txnSpanTableFull != 0 && inst.counters.txnSpanTableFull == st.txnSpanTableFull)
+            spdlog::warn("verdict replay: view {} topic {} partition {}: more than {} transactions open at once; the excess apply at their own offsets (P11-9)",
+                         inst.plan.viewName, srcTopicId_, partition_, rune::view::TxnSpanFence::kSlots);
+        inst.counters.txnReadFailed += st.txnReadFailed;
+        if (st.txnReadFailed != 0 && inst.counters.txnReadFailed == st.txnReadFailed)
+            spdlog::warn("verdict replay: view {} topic {} partition {}: a transaction's read-back below offset {} failed; its J or marker is retried each pass",
+                         inst.plan.viewName, srcTopicId_, partition_, inst.foldCursor);
+        inst.counters.txnNoteWaits += st.txnNoteWaits;
+    };
     if (m.kind == rune::view::VerdictViewKind::KeyIndex) {
         KeyIndexFold f{inst.table, m.keyWidth};
         const rune::view::FoldStats st = foldKeyIndexBatch(f, view, bound, cursor, skip, txn);
         inst.foldCursor = cursor;
         inst.counters.skippedAborted += st.skippedAborted;
+        txnStats(st);
         discardKeyIndexDirty_(inst);
         return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedRejected);
     }
@@ -990,6 +1002,7 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
     inst.counters.ownerMoves       += st.ownerMoves;
     inst.counters.uniquePromotions += st.uniquePromotions;
     inst.counters.txnSuperseded    += st.txnSuperseded;
+    txnStats(st);
     if (inst.claims) inst.counters.uniqueConflicts = inst.claims->extras();
     return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedNoGroup + st.skippedNoKey + st.skippedRejected);
 }
