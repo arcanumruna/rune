@@ -421,6 +421,10 @@ public:
         const auto it = keyIndexes_.find(instKey(src, partition));
         return it == keyIndexes_.end() ? 0 : it->second.table.size();
     }
+    [[nodiscard]] const ViewInstance* keyIndexForTest(int32_t src, int32_t partition) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? nullptr : &it->second;
+    }
     /// -1: the partition has no key index.
     [[nodiscard]] int64_t keyIndexFoldCursorForTest(int32_t src, int32_t partition) const {
         const auto it = keyIndexes_.find(instKey(src, partition));

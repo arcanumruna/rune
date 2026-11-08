@@ -1489,6 +1489,7 @@ int WorkerViewSet::syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, 
 int WorkerViewSet::flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, int64_t nowNs, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns) {
     if (const auto kit = keyIndexes_.find(instKey(srcTopicId, partition)); kit != keyIndexes_.end()) {
         adoptNs_(kit->second, ns);
+        quietPass_(kit->second, nowNs);   // a pass that applied to it restarted the clock (discardKeyIndexDirty_)
         chargeMem_(kit->second);
     }
     const auto sit = subscriptionIndex_.find(srcTopicId);

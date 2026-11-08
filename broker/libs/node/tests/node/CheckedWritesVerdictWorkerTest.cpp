@@ -1016,3 +1016,35 @@ TEST(CheckedWritesVerdictWorkerRegression, QuietMemberGivesBackItsKeptWindowRegr
     EXPECT_EQ(inst->table.dirtyBytes(), 0u) << "a second of quiet gives it back";
     EXPECT_EQ(inst->memCharged, inst->table.memoryBytes()) << "and the charge follows";
 }
+
+// REGRESSION (review 7 m-2): the key index's dirty set is drained on every pass but was never trimmed, so a pass of many tombstones
+// left its growth charged for good.  It is trimmed at the drain, and a kept one is given back after a second of quiet.
+TEST(CheckedWritesVerdictWorkerRegression, KeyIndexGivesBackItsDirtyGrowthRegression) {
+    VerdictRig r;
+    r.createKeyIndex();
+    r.passes(60);
+    std::vector<Rec> rows;
+    for (uint64_t id = 1; id <= 2000; ++id) rows.push_back(Rec{id, static_cast<int64_t>(id), 0});
+    ASSERT_EQ(r.produce(rows), 0);
+    const auto drive = [&] {
+        for (int i = 0; i < 200 && r.vs->keyIndexFoldCursorForTest(VerdictRig::kSrc, 0) < r.leo(); ++i) r.pass();
+        ASSERT_GE(r.vs->keyIndexFoldCursorForTest(VerdictRig::kSrc, 0), r.leo());
+    };
+    drive();
+    const ViewInstance* ki = r.vs->keyIndexForTest(VerdictRig::kSrc, 0);
+    ASSERT_NE(ki, nullptr);
+    for (int w = 0; w < 3; ++w) {   // a rewrite of every row: a tombstone, then the upsert
+        std::vector<Rec> b;
+        for (uint64_t id = 1; id <= 2000; ++id) {
+            b.push_back(Rec{id, 0, 0, /*del=*/true});
+            b.push_back(Rec{id, static_cast<int64_t>(id), 0});
+        }
+        ASSERT_EQ(r.produce(b), 0);
+        drive();
+    }
+    r.passes(5);   // quiet
+    r.now += 1'000'000'000;
+    r.passes(2);
+    EXPECT_EQ(ki->table.dirtyBytes(), 0u) << "the key index's dirty growth is given back";
+    EXPECT_EQ(ki->memCharged, ki->table.memoryBytes()) << "and the charge follows";
+}
