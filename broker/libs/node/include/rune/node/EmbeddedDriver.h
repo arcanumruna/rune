@@ -80,6 +80,9 @@ struct EmbeddedDriverConfig {
     /// (read from CnC).  Must exceed the driver timer interval (1 s).  Test-only
     /// override (shard startup-gap regression); never set in production.
     int64_t     clientLivenessTimeoutNs = 0;
+    /// 0 = Aeron default (1 s, or a tenth of a shorter clientLivenessTimeoutNs).  Test-only: the driver closes a lingering
+    /// image at its next timer, so a shorter timer lets a test wait less without shortening the client liveness.
+    int64_t     timerIntervalNs = 0;
     /// DR-15 fix round 1: when valid, this driver's Aeron name resolver answers
     /// the managed peer hostnames from this (off-thread fed) cache ONLY — its
     /// conductor never calls getaddrinfo for a peer.  Invalid = Aeron default.

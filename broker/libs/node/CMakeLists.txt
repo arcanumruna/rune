@@ -1388,7 +1388,11 @@ if(BUILD_TESTING)
             # publication, REAL invoker driver over aeron:ipc.
             add_executable(rune_shard_worker_ack_tests tests/node/ShardWorkerAckTest.cpp)
             target_link_libraries(rune_shard_worker_ack_tests PRIVATE rune_node rune_replication rune_codec aeron::aeron GTest::gtest_main)
-            gtest_discover_tests(rune_shard_worker_ack_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            # The stalled-thread variant sleeps 1.5 s, so it carries LABELS stress; the default runs without the stall.
+            gtest_discover_tests(rune_shard_worker_ack_tests TEST_FILTER "*StressRegression*"
+                                 PROPERTIES TIMEOUT 120 LABELS stress ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+            gtest_discover_tests(rune_shard_worker_ack_tests TEST_FILTER "-*StressRegression*"
+                                 PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 03: the write hook and the View acks on a real Worker over an IPC driver.
             add_executable(rune_checked_writes_ack_tests tests/node/CheckedWritesWorkerHookTest.cpp tests/node/CheckedWritesViewAckTest.cpp tests/node/CheckedWritesViewAckMatrixTest.cpp)

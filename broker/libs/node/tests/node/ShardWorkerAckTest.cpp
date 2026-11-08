@@ -24,10 +24,12 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <span>
+#include <thread>
 #include <unistd.h>
 
 using namespace rune::node;
@@ -96,12 +98,12 @@ struct Fixture {
     /// it (data replicated or recovered before this leader's state was built);
     /// `rollBytes`: segment roll (small = retention can delete segments);
     /// `session5Version`: session 5's ConnectRequest.clientVersion, carried by
-    /// its WorkerOp::SessionAnnounce.  `driverLivenessNs`: the driver's client liveness (0 = Aeron's 10 s); 1 s also
-    /// drops its timer to 100 ms, so a closed image goes within that instead of the default second.
+    /// its WorkerOp::SessionAnnounce.  `driverTimerNs`: the driver's timer (0 = Aeron's 1 s), so a closed image goes within
+    /// that instead of the default second.  The client liveness stays Aeron's 10 s: the test thread pumps the client.
     explicit Fixture(std::vector<rune::replication::NodeId> replicas, int minIsr,
                      const std::function<void(rune::storage::Log&)>& preload = {},
                      int64_t rollBytes = 64LL * 1024 * 1024, int32_t session5Version = 0,
-                     std::size_t ringBytes = 1 << 16, int64_t driverLivenessNs = 0) {
+                     std::size_t ringBytes = 1 << 16, int64_t driverTimerNs = 0) {
         // `ringBytes` (D8d): the op / return ring sizes (production: 32 MiB each).
         worker = std::make_unique<Worker>(0, ringBytes, ringBytes, 64, 64);
         static std::atomic<int> seq{0};
@@ -116,7 +118,7 @@ struct Fixture {
         c.fetchIntervalNs = 1'000'000'000; c.isrCheckIntervalNs = 1'000'000'000'000LL;
         c.replicaLagMaxMs = 600'000; c.pushOnAppend = false;
         replica = std::make_unique<PartitionReplica>(c, Role::Leader, 1, replicas, replicas, log.get(), &t);
-        EmbeddedDriverConfig dc; dc.dir = adir.string(); dc.termBufferBytes = 64 * 1024; dc.clientLivenessTimeoutNs = driverLivenessNs;
+        EmbeddedDriverConfig dc; dc.dir = adir.string(); dc.termBufferBytes = 64 * 1024; dc.timerIntervalNs = driverTimerNs;
         drv = std::make_unique<EmbeddedDriver>(dc, DriverMode::Invoker);
         aeron::Context ctx; ctx.aeronDir(adir.string()); ctx.useConductorAgentInvoker(true);
         client = aeron::Aeron::connect(ctx);
@@ -1239,8 +1241,9 @@ TEST(ShardWorkerAckRegression, MalformedFramesAndPurgedParkedDirectAcksReturnThe
 // image count is the SAME (1 -> 1) at the worker's next drain: drainUnavailable sees no change.  Only B's WorkerBind,
 // handled on the first poll after that, can reveal A's lost image - handleWorkerBind_ requests the rescan on Bound.
 // The invoker driver + client conductor are pumped by the test only, so the swap is atomic w.r.t. the drain.
-TEST(ShardWorkerAckRegression, RebindAfterMaskedImageLossUnbindsTheDeadImageRegression) {
-    Fixture f({1}, 1, {}, 64LL * 1024 * 1024, 0, 1 << 16, /*driverLivenessNs=*/1'000'000'000);
+// `stall`: the test thread stops pumping the client that long once A is bound (a loaded host, a lid-closed sleep).
+static void rebindAfterMaskedImageLoss(std::chrono::milliseconds stall) {
+    Fixture f({1}, 1, {}, 64LL * 1024 * 1024, 0, 1 << 16, /*driverTimerNs=*/100'000'000);
     f.worker->setResponseControl("127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort()));
     const std::array<uint8_t, 16> tokA = [] { std::array<uint8_t, 16> t{}; t.fill(0xA1); return t; }();
     const std::array<uint8_t, 16> tokB = [] { std::array<uint8_t, 16> t{}; t.fill(0xB2); return t; }();
@@ -1268,6 +1271,7 @@ TEST(ShardWorkerAckRegression, RebindAfterMaskedImageLossUnbindsTheDeadImageRegr
     for (int i = 0; i < 50; ++i) f.step();                 // several drains: the worker has settled its image count (1)
     ASSERT_TRUE(f.worker->ingressImageAliveForTest(imageA));
     ASSERT_EQ(f.worker->imageUnbindsForTest(), 0u);
+    std::this_thread::sleep_for(stall);
 
     // The swap, with NO worker duty pass in between: image 1 goes away, image 2 arrives.
     f.producePub.reset();
@@ -1293,4 +1297,13 @@ TEST(ShardWorkerAckRegression, RebindAfterMaskedImageLossUnbindsTheDeadImageRegr
     EXPECT_EQ(f.worker->imageUnbindsForTest(), 0u) << "precondition: the masked loss was NOT noticed by the count compare";
     for (int i = 0; i < 200 && f.worker->imageUnbindsForTest() < 1; ++i) f.step();
     EXPECT_GE(f.worker->imageUnbindsForTest(), 1u) << "A's dead image was never unbound: the rescan on a successful bind is missing";
+}
+
+TEST(ShardWorkerAckRegression, RebindAfterMaskedImageLossUnbindsTheDeadImageRegression) {
+    rebindAfterMaskedImageLoss(std::chrono::milliseconds(0));
+}
+
+// T7 review 5, M2: a 1 s client liveness dropped the client when the test thread paused for a second.
+TEST(ShardWorkerAckRegression, RebindAfterMaskedImageLossSurvivesAStalledTestThreadStressRegression) {
+    rebindAfterMaskedImageLoss(std::chrono::milliseconds(1500));
 }
