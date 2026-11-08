@@ -78,9 +78,10 @@ struct WalkOut {
     int64_t walkedUpto;   // every batch below it was folded, skipped or held in a span
     int64_t pid = -1;     // Marker: the producer
     int64_t at  = -1;     // Marker: the marker's offset
+    bool judged = false;  // Marker: a TxnJudge, applied with no supersede notes (D2: P11-3 voted no on any superseder)
 };
 
-enum class TxnStep : uint8_t { Skip, Apply, Stop, Marker, Wait };
+enum class TxnStep : uint8_t { Skip, Apply, Stop, Marker, Judged, Wait };
 
 // A control or transactional batch.  Control: a commit marker of an open span hands the walk back to apply it, an abort marker
 // closes it, anything else is skipped.  Data: an aborted transaction's batch is skipped; with a fence, every other one opens (or
@@ -108,7 +109,7 @@ inline TxnStep txnStep(const rune::protocol::RecordBatchReader& r, const uint8_t
                 if (open != nullptr && d.first >= 0) open->first = std::min(open->first, d.first);
                 if (open != nullptr || (d.first >= 0 && fence->add(d.pid, d.first))) {
                     pid = d.pid;
-                    return TxnStep::Marker;
+                    return TxnStep::Judged;
                 }
             }
         }
@@ -151,6 +152,7 @@ WalkOut walkView(const rune::storage::LogReadView& view, int64_t from, int64_t b
                     continue;
                 case TxnStep::Stop:   return {WalkEnd::Done, walkedUpto};
                 case TxnStep::Marker: return {WalkEnd::Marker, walkedUpto, pid, r.baseOffset()};
+                case TxnStep::Judged: return {WalkEnd::Marker, walkedUpto, pid, r.baseOffset(), true};
                 case TxnStep::Wait:   return {WalkEnd::Wait, walkedUpto};
                 case TxnStep::Apply:  break;
             }
@@ -255,12 +257,12 @@ inline NoteEnd noteSegment(TxnFold& txn, int64_t pid, int64_t at, int64_t marker
 
 // Applies the span of `pid` (open in the fence) at its marker: its batches in [first, marker), resuming above applyingThrough, a
 // segment of noted keys at a time, a record another writer superseded skipped.  The last segment ends after T's last record, not
-// at the marker.  At most `left` records, and `bytes` (the call's read-back, notes included) up to kTxnReadBackBytesPerPass; false
+// at the marker.  At a TxnJudge (`judged`) the span is one segment with no notes, up to the judge.  At most `left` records, and `bytes` (the call's read-back, notes included) up to kTxnReadBackBytesPerPass; false
 // when either ran out first, the key set is another span's, or a read failed (applyingThrough says where it stopped once a record
 // is applied).
 template <class OnRecord>
 bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const FoldSkip& skip, FoldStats& stats, OnRecord& onRecord,
-               int64_t& applied, std::size_t& bytes) {
+               int64_t& applied, std::size_t& bytes, bool judged) {
     namespace b = rune::protocol::batch;
     TxnSpanFence& fence = txn.fence;
     int64_t at = fence.applyingThrough >= 0 ? fence.applyingThrough + 1 : fence.find(pid)->first;
@@ -273,7 +275,7 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
         return false;
     };
     const auto release = [&] {
-        txn.keys.release();
+        if (fence.noteToken != 0 && txn.keys.owner == fence.noteToken) txn.keys.release();
         fence.noteToken = 0;
     };
     const auto failed = [&] {
@@ -286,11 +288,11 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
         return true;
     };
     while (at < marker) {
-        const NoteEnd n = noteSegment(txn, pid, at, marker, skip, bytes, stats);
+        const NoteEnd n = judged ? NoteEnd::Ready : noteSegment(txn, pid, at, marker, skip, bytes, stats);
         if (n == NoteEnd::Failed) return failed();
         if (n == NoteEnd::Paused) return paused();
-        const int64_t segEnd = txn.keys.segEnd;
-        const int64_t end = segEnd == marker ? std::min(marker, txn.keys.lastT + 1) : segEnd;
+        const int64_t segEnd = judged ? marker : txn.keys.segEnd;
+        const int64_t end = judged || segEnd != marker ? segEnd : std::min(marker, txn.keys.lastT + 1);
         while (at < end) {
             const rune::storage::LogReadView v = readSpan(txn, at, end, marker);
             if (v.empty()) return failed();
@@ -323,7 +325,7 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
                             ++stats.skippedRejected;
                             return;
                         }
-                        if (txn.keys.superseded(key)) {
+                        if (!judged && txn.keys.superseded(key)) {
                             ++stats.txnSuperseded;
                             return;
                         }
@@ -379,7 +381,7 @@ void walkFold(const rune::storage::LogReadView& first, int64_t bound, int64_t& c
         const int64_t left = txn->budget > 0 ? txn->budget - (w.at - start) - units : INT64_MAX;
         if (left <= 0) break;   // the marker is applied next call, with that call's whole budget
         int64_t applied = 0;
-        const bool done = detail::applySpan(*txn, w.pid, w.at, left, skip, stats, onRecord, applied, bytes);
+        const bool done = detail::applySpan(*txn, w.pid, w.at, left, skip, stats, onRecord, applied, bytes, w.judged);
         units += applied;
         if (!done) break;
         fence->close(w.pid);

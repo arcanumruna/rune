@@ -2552,6 +2552,31 @@ TEST(CheckedWritesTxnJudgeRegression, CandidateInsideAnUndecidedTxnWaitsAtItsJud
     }
 }
 
+// REGRESSION (Task 8 review 2, m-c): a backfill is counted once per transaction.  A candidate with a per-pass cap of 1 applies T at
+// J over several passes, and every re-visit of J counted another backfill.
+TEST(CheckedWritesTxnJudgeRegression, BackfillAppliedOverSeveralPassesCountsOnceRegression) {
+    JudgeRig r(true);
+    r.start();
+    r.log.data({{50}}, 77);   // 10: T
+    r.log.data({{51}}, 77);   // 11: T
+    r.log.data({{52}}, 77);   // 12: T
+    r.log.data({{60}});       // 13
+    r.log.judge(77, 10);      // 14: J
+    r.log.marker(77, true);   // 15
+    for (int i = 0; i < 8; ++i) r.drive();
+    ASSERT_EQ(r.vs.judgeCursor(), 16);
+    const rune::codec::Descriptor* s[] = {&r.src};
+    const rune::view::CompileResult candComp = rune::view::compileView(tagView(), s, 9).value();
+    ViewInstance cand(candComp.plan, candComp.rowLayout, r.src, false, 0, 8192, 1u << 16);
+    cand.foldCursor = 11;      // recovered inside T
+    cand.maxRecordsPerPass = 1;
+    r.vs.addCandidate(&cand, VerdictViewKind::TestReject, 9, 0x5eed);
+    for (int i = 0; i < 16 && cand.foldCursor < 16; ++i) r.drive();
+    EXPECT_TRUE(cand.table.get(50) != nullptr && cand.table.get(51) != nullptr && cand.table.get(52) != nullptr);
+    EXPECT_EQ(r.st.txn.stats.checkpointBackfills, 1u);
+    r.vs.removeCandidate(9, 0x5eed);
+}
+
 // REGRESSION (Task 8 review 1, m1): a checkpoint push the span fence vetoes leaves nothing durable, so the run-ahead cap (P11-8 (a))
 // still counts from the member's last real push.  A persisted candidate waiting at J inside T has every push vetoed; recording
 // them as pushes let the judge run a further cap past a checkpoint that was never written.

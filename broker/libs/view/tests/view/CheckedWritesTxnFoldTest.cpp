@@ -161,7 +161,8 @@ struct TxnLog {
         return base;
     }
     // A commit (type 0) or abort (type 1) marker, laid out as ControlMarker::build writes it.
-    int64_t marker(int64_t pid, bool commit) {
+    // control: a non-transactional control batch of `pid` (a TxnJudge stand-in, for a JudgeHook).
+    int64_t marker(int64_t pid, bool commit, bool transactional = true) {
         const int64_t base = end;
         std::vector<uint8_t> b;
         le64(b, uint64_t(base));
@@ -169,7 +170,7 @@ struct TxnLog {
         for (int i = 0; i < 4; ++i) b.push_back(0xFF);
         b.push_back(2);
         for (int i = 0; i < 4; ++i) b.push_back(0);
-        le16(b, 0x0030);
+        le16(b, transactional ? 0x0030 : 0x0020);
         for (int i = 0; i < 4; ++i) b.push_back(0);
         le64(b, 0); le64(b, 0); le64(b, uint64_t(pid));
         le16(b, 0);
@@ -217,6 +218,7 @@ struct Folder {
     TxnSpanFence fence;
     rune::view::SupersedeKeys ownKeys;
     rune::view::SupersedeKeys* keys = &ownKeys;   // a test may hand two folders one set, as a worker's instances share it
+    rune::view::JudgeHook judge{};
     int64_t cursor = 0;
 
     explicit Folder(bool aggregateView, bool fenced = true) : aggregate(aggregateView), withFence(fenced) {
@@ -246,7 +248,7 @@ struct Folder {
         const rune::storage::LogReadView lv = log.read(cursor, passBound);
         if (lv.empty()) return {};
         auto rd = [&log](int64_t f, int64_t t) { return log.read(f, t); };
-        rune::view::TxnFold tf{fence, *keys, rune::view::spanReaderOf(rd), cap};
+        rune::view::TxnFold tf{fence, *keys, rune::view::spanReaderOf(rd), cap, judge};
         rune::view::TxnFold* txn = withFence ? &tf : nullptr;
         if (aggregate)
             return rune::view::foldAggregateBatch(comp.plan, comp.rowLayout, *agg, vdc, *view, *contributors, *groups, lv, passBound, cursor, skip, txn);
@@ -614,6 +616,25 @@ TEST(CheckedWritesTxnVisibilityRegression, ReadBackBudgetIsSharedByTheCallsMarke
     EXPECT_EQ(p.cursor, m8);
     for (int i = 0; i < 4 && p.cursor <= m8; ++i) p.pass(log, log.end, 0);
     EXPECT_EQ(p.slot(2, 1), 20);
+}
+
+// REGRESSION (Task 8 review 2, m-c): a transaction applied at its TxnJudge reads its span back once.  It was also read for supersede
+// notes D2 does not need (P11-3 voted no on every superseder), so a span of 0.7 MiB took two passes of the 1 MiB read-back.
+TEST(CheckedWritesTxnVisibilityRegression, JudgedSpanIsReadBackOnceWithoutNotesRegression) {
+    TxnLog log;
+    log.data({{1, 1, 10}}, 7);
+    plainTraffic(log, rune::view::kTxnReadBackBytesPerPass * 7 / 10);
+    log.data({{2, 1, 20}}, 7);
+    const int64_t j = log.marker(7, true, false);
+    log.data({{3, 1, 30}});
+    Folder p(false);
+    p.judge = {nullptr, [](void*, const uint8_t*, std::size_t, int64_t) { return rune::view::JudgeDecision{rune::view::JudgeStep::Apply, 7}; }};
+    const rune::view::FoldStats st = p.pass(log, log.end, 0);
+    EXPECT_GT(p.cursor, j) << "J is applied in the pass that reaches it";
+    EXPECT_EQ(p.slot(1, 1), 10);
+    EXPECT_EQ(p.slot(2, 1), 20);
+    EXPECT_EQ(p.fence.count, 0);
+    EXPECT_EQ(st.txnNoteWaits, 0u);
 }
 
 // Two instances of a worker share its key set.  While one notes, the other's marker waits; a holder that is not driven for a whole
