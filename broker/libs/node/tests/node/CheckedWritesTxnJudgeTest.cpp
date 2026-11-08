@@ -1631,13 +1631,14 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryResolutionWalkIsBudgetedAndResumes
     EXPECT_EQ(r.vs.judgeCursor(), 13) << "O still waits for T0's marker";
     r.log.marker(66, true);                       // 34
     r.countFrom = INT64_MAX;
-    for (int i = 0; i < 8 && r.vs.judgeCursor() == 13; ++i) r.drive();
+    for (int i = 0; i < 16 && r.vs.judgeCursor() == 13; ++i) r.drive();   // one batch a walk a pass, the apply walk included
     EXPECT_GT(r.vs.judgeCursor(), 13);
     EXPECT_TRUE(r.indexed(4)) << "T0's insert supersedes O's delete";
 }
 
-// REGRESSION (T7 re-review 2 carry): the collect and supersede walks of an ordinary transaction resume and share one byte budget per
-// pass; only the apply walk reads the segment in one step.  A pass once read the span three times, unbudgeted.
+// REGRESSION (T7 re-review 2 carry; Task 8 review 3, I-1): the intent, collect, supersede and apply walks of an ordinary transaction
+// resume and share one byte budget per pass.  A pass once read the span three times, unbudgeted, and the apply walk read the whole
+// segment, plain traffic included, in the pass that applied it.
 TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnSpanReadIsBudgetedPerPassRegression) {
     const auto write = [](JudgeRig& r, int64_t pid) {
         r.log.data({{1000}, {1001}, {1002}}, pid);   // 10..12
@@ -1665,7 +1666,7 @@ TEST(CheckedWritesTxnJudgeRegression, OrdinaryTxnSpanReadIsBudgetedPerPassRegres
     for (; drives < 4 * span && r.vs.judgeCursor() < r.log.next; ++drives) {
         r.countedTo = 0;
         r.drive();
-        EXPECT_LE(r.countedTo, r.vs.judgeCursor() <= marker ? 2 : span) << "drive " << drives << ": one batch a walk, or the segment's apply";
+        EXPECT_LE(r.countedTo, 2) << "drive " << drives << ": one batch a walk";
     }
     EXPECT_EQ(r.vs.judgeCursor(), r.log.next);
     EXPECT_GT(drives, span) << "the collect and supersede walks resumed over passes";

@@ -529,7 +529,7 @@ private:
     uint64_t                    membersEpoch_ = 0;        // bumped by every change of the members or of the active set
     TxnStop                     txnStop_ = TxnStop::None;
     std::size_t                 markerAt_ = 0;            // TxnStop::Marker: the entry of ordinary_ whose marker the judge stands at
-    int64_t                     ordinaryApplied_ = -1;    // that entry's records below it are applied (a read failed mid-way)
+    int64_t                     ordinaryApplied_ = -1;    // that entry's apply walk resumes here: its records below it are applied
     // P11-3a: the decision of a producer's batches of `epoch` in [base, to) (decided), searched from `from`; judged: the TxnJudge of
     // their transaction is at `to`, its marker still searched
     struct TxnLookup {
@@ -562,7 +562,7 @@ private:
     int64_t                     nowNs_ = 0, lockPausedNs_ = 0;
     int64_t                     finalizePid_ = -1, finalizeApplied_ = -1;   // a commit finalized part-way (a read failed)
     std::size_t                 voteScanBytes_ = kVoteScanBytesPerPass;
-    std::size_t                 spanBytes_ = 0;           // what an ordinary transaction's intent, collect and supersede walks may still read this pass
+    std::size_t                 spanBytes_ = 0;           // what an ordinary transaction's intent, collect, supersede and apply walks may still read this pass
     VerdictViewHooks            hooks_;
     VerdictSourceStats          stats_;
     std::vector<uint8_t>        scratch_;
@@ -814,12 +814,19 @@ bool VerdictSource::applyOrdinary_(ReadRangeFn& readRange, const rune::view::Abo
         }
         if (!w.checked && !checkOrdinary_(readRange, o, aborted, keys)) return false;
         txnPool_->parkOneStep(oneStepClaim_, false);   // applyTxnBatch_ parks it again on a row a judged transaction holds
-        bool applied = true;
+        // The apply walk shares the pass's budget too: it resumes past every batch it walked, plain ones included, as a Locked stop
+        // resumes past the last record it applied.
+        bool applied = true, more = false;
         if (!walkBatches_(readRange, std::max(w.from, ordinaryApplied_), w.end, [&](const rune::protocol::RecordBatchReader& r, const uint8_t* b, std::size_t len) {
-                if (r.producerId() != o.producerId || (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) != rune::protocol::batch::kAttrTransactional) return true;
-                applied = applyTxnBatch_(b, len, keys, w.end);
-                return applied;
-            }) || !applied) return false;
+                if (r.producerId() == o.producerId && (r.attributes() & (rune::protocol::batch::kAttrTransactional | rune::protocol::batch::kAttrControl)) == rune::protocol::batch::kAttrTransactional) {
+                    applied = applyTxnBatch_(b, len, keys, w.end);
+                    if (!applied) return false;
+                }
+                ordinaryApplied_ = std::max(ordinaryApplied_, std::min(r.baseOffset() + r.lastOffsetDelta() + 1, w.end));
+                spanBytes_ -= std::min(spanBytes_, len);
+                more = spanBytes_ == 0;
+                return !more;
+            }) || !applied || more) return false;
         if (w.end < o.marker) {
             if (w.from == o.first) ++state_->txn.stats.supersedeKeysOverflow;
             ordinaryApplied_ = std::max(ordinaryApplied_, w.end);
