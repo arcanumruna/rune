@@ -23,7 +23,8 @@ public:
 
     /// `cfg` attached to this driver: the caller's clients must be destroyed before it.
     [[nodiscard]] rune::client::ClientConfig attach(rune::client::ClientConfig cfg) const {
-        cfg.aeronDir = driver_.dir();
+        cfg.aeronDir            = driver_.dir();
+        cfg.driverCountersBytes = 0;   // sizes a driver of the client's own, which this one has none of
         return cfg;
     }
 
@@ -33,6 +34,7 @@ private:
         c.dir                 = dir.string();
         c.termBufferBytes     = 4 * 1024 * 1024;
         c.countersValuesBytes = kTestClientCountersBytes;   // a client's few counters: a small CnC
+        c.statusMessageTimeoutNs = 20'000'000;              // a client's egress subscription connects within 20 ms, not Aeron's 200
         return c;
     }
     static std::atomic<uint64_t>& seq_() { static std::atomic<uint64_t> s{0}; return s; }
