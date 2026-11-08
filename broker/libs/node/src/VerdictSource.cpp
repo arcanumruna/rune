@@ -1,3 +1,4 @@
+#include <cassert>
 #include <rune/node/VerdictSource.h>
 
 #include <rune/codec/Record.h>
@@ -296,8 +297,8 @@ void VerdictSource::stall_(StallReason reason) noexcept {
 
 // Cold (once per wait): the judge or a replay holds at a lease record whose writer layout is not installed on this worker yet.
 void VerdictSource::noteLayoutWait_(int64_t offset, uint16_t version) noexcept {
-    if (layoutWaiting_) return;
-    layoutWaiting_ = true;
+    if (layoutWaitVersion_ == version) return;   // once per (topic, partition, version): this source is the (topic, partition)
+    layoutWaitVersion_ = version;
     ++stats_.leaseLayoutWaits;
     spdlog::warn("lease index waits for a schema layout: topic {} partition {}: the record at offset {} is written at version {}, which is "
                  "not installed (or has a field the index layout lacks); held until it is",
@@ -334,8 +335,10 @@ rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::S
         // instance's own evolving copy: that lags the spec after a Drop and when the schema ops arrive in either order.
         rune::view::SourceRecord r = rec;
         r.writer = state_ != nullptr && state_->spec != nullptr ? leaseWriterOf(*state_->spec, r.value) : nullptr;
-        const LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth};
-        return prepareLeaseIndex(f, r, m.prospect);
+        const LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth, &i.leaseCover};
+        const bool refused = r.writer == nullptr && state_ != nullptr && state_->spec != nullptr && r.value.size() >= 4 &&
+                             state_->spec->versionRefused(detail::le16(r.value.data() + 2));   // a refused version is a definite answer
+        return prepareLeaseIndex(f, r, m.prospect, refused);
     }
     if (i.agg) {
         rune::view::AggregateFold f{i.plan, i.layout, i.agg->layout, i.vdc, i.table, i.agg->contributors, i.agg->groups, i.agg->blocksOrNull()};
@@ -355,7 +358,7 @@ void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexc
     }
     if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
         stats_.keyIndexSkippedMalformed += m.prospect.stats.skippedMalformed;
-        LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth};
+        LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth, &i.leaseCover};
         LeaseEvent ev;
         if (applyLeaseRecord(f, rec, m.prospect, ev)) state_->leaseEvents.buf.push_back(ev);   // grows only past kLeaseFoldEventCap (judgeBatches_ counts it)
         return;
@@ -392,9 +395,9 @@ Verdict VerdictSource::verdictOf_(const Member& m, const rune::view::SourceRecor
         if (rec.value.empty()) return {static_cast<uint16_t>(ErrorCode::InvalidRequest), 0};   // a lease record carries its full row
         const ViewInstance& i = *m.inst;
         const uint8_t* row = i.table.get(m.prospect.rows[0].key);
-        const LeaseRowState st{row != nullptr, row != nullptr ? leaseRowVersion(row, i.layout) : 0};
+        const LeaseRowState st{row != nullptr, row != nullptr ? leaseRowVersion(row, i.layout) : 0, row != nullptr ? leaseRowTtl(row, i.layout) : 0};
         const uint32_t maxKeys = state_ != nullptr && state_->spec != nullptr && state_->spec->lease ? state_->spec->lease->maxKeys : UINT32_MAX;
-        return {judgeLease(st, rec.attributes, leaseRecordVersion(rec.value), i.table.size(), maxKeys), 0};
+        return {judgeLease(st, rec.attributes, leaseRecordVersion(rec.value), leaseRecordTtl(rec.value), leaseRecordRemaining(rec.value), i.table.size(), maxKeys), 0};
     }
     if (m.kind != rune::view::VerdictViewKind::TestReject || rec.value.empty()) return {};   // tombstones are never rejected
     const Verdict reject{static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation), rune::view::constraintIdOf(m.objectId, 1)};
@@ -424,10 +427,7 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
             stall_(StallReason::Capacity);
             return {};
         }
-        if (ps == rune::view::PrepareStatus::Pending) {   // the record's layout is not installed yet: no verdict, the caller holds
-            layoutPending_ = true;
-            return {};
-        }
+        if (ps == rune::view::PrepareStatus::Pending) return Verdict::held();   // the record's layout is not installed yet: no verdict, the caller holds
     }
     for (const std::size_t i : active_) {
         const Verdict v = verdictOf_(members_[i], rec);
@@ -495,12 +495,13 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
         return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedRejected);
     }
     if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
-        LeaseIndexFold f{inst.table, inst.layout, inst.evolvingSrc, m.keyWidth};
+        LeaseIndexFold f{inst.table, inst.layout, inst.evolvingSrc, m.keyWidth, &inst.leaseCover};
         bool held = false;
-        const rune::view::FoldStats st = foldLeaseIndexBatch(f, *state_->spec, m.prospect, view, bound, cursor, skip, &held);
+        uint16_t heldVersion = 0;
+        const rune::view::FoldStats st = foldLeaseIndexBatch(f, *state_->spec, m.prospect, view, bound, cursor, skip, &held, &heldVersion);
         inst.foldCursor = cursor;
-        if (held) noteLayoutWait_(cursor, 0);   // the replay stops AT the record; the next duty cycle retries
-        else layoutWaiting_ = false;
+        if (held) noteLayoutWait_(cursor, heldVersion);   // the replay stops AT the record; the next duty cycle retries
+        else layoutWaitVersion_ = -1;
         inst.counters.skippedAborted += st.skippedAborted;
         discardKeyIndexDirty_(inst);
         return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedRejected);
@@ -568,14 +569,14 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
                 rec.writer = leaseSource ? leaseWriterOf(*state_->spec, span.value)
                                          : &first.vdc.materializedFor(writerVersionOf(span.value, first.vdc.defaultVersion()));
             lastIntent_ = rec.intent;
-            layoutPending_ = false;
             const Verdict v = judge(rec);
-            if (layoutPending_) {   // hold AT this record: no verdict, no advance (like back-pressure); the next duty cycle retries
+            if (v.isHeld()) {   // hold AT this record: no verdict, no advance (like back-pressure); the next duty cycle retries
                 hold = true;
                 noteLayoutWait_(span.offset, writerVersionOf(span.value, 0));
                 return;
             }
-            layoutWaiting_ = false;
+            assert(v.code != rune::view::kVerdictHeld && "a held verdict is never recorded");
+            layoutWaitVersion_ = -1;
             if (stalled_) return;
             if (keyZero && !v.accepted()) [[unlikely]] noteKeyZeroRejection_(v, rec);
             judgeCursor_ = span.offset + 1;

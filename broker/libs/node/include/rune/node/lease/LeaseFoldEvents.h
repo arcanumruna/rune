@@ -7,9 +7,12 @@
 // drains it and the next duty cycle resumes).  Only a single batch larger than the whole cap, judged into an empty buffer,
 // grows it (counted in VerdictSourceStats::leaseEventOverflows).  Replay and rebuild push nothing and clear the buffer:
 // row ids change on a rebuild.
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+namespace rune::codec { struct Descriptor; }
 
 namespace rune::node {
 
@@ -32,6 +35,13 @@ struct LeaseFoldEvents {
     void reserveOnce() {
         if (buf.capacity() < kLeaseFoldEventCap) buf.reserve(kLeaseFoldEventCap);
     }
+};
+
+/// Per writer version: the descriptor already proven to have every field id in the layout.  Lives in the lease ViewInstance, so a
+/// rebuilt layout starts empty.  A version past the array scans (correct, just not cached).
+inline constexpr uint16_t kLeaseCoverCacheVersions = 32;
+struct LeaseCoverCache {
+    std::array<const rune::codec::Descriptor*, kLeaseCoverCacheVersions> proven{};
 };
 
 }  // namespace rune::node

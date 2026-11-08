@@ -20,6 +20,7 @@
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/RejectedOffsetIndex.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -178,8 +179,9 @@ public:
     uint32_t              autoIncrementReserve = rune::protocol::kAutoIncrementReserveDefault;
     int32_t               partitionCount = 0;
     std::optional<rune::protocol::LeaseSpec> lease;   ///< a lease topic's spec (set by setFacts)
-    /// A lease topic: bumped when the evolving descriptor gains a field id (an AddField), so the lease index, whose row
-    /// layout has one column per evolving field, is rebuilt from the log (WorkerViewSet::rebuildKeyIndex_).  That is
+    /// A lease topic: bumped when leaseLayoutSource() gains a field id (an AddField, through installVersion or FilterSchema,
+    /// whichever delivers the id first), so the lease index, whose row layout has one column per source field, is rebuilt
+    /// from the log (WorkerViewSet::rebuildKeyIndex_).  That is
     /// sufficient: a Drop or a Rename keeps every field id in the layout (a dropped column just projects null), and the
     /// judge and the replay take each record's writer from this spec (leaseWriterOf), holding (PrepareStatus::Pending)
     /// while a version or a field id of the layout is not there yet, never accepting a record they cannot apply.
@@ -207,14 +209,58 @@ public:
     bool installVersion(uint16_t version, rune::codec::Descriptor materialized) {
         if (lease && !leaseLayoutOk(materialized)) {
             if (version > maxVersion_) maxVersion_ = version;
+            markRefused_(version, true);
             return false;
         }
+        markRefused_(version, false);
+        // A lease index has one row column per field id of leaseLayoutSource(): a version holding an id the merged source lacks
+        // makes its layout stale.  This is the single bump for SchemaUpdate (FilterSchema bumps through the same test).
+        if (lease && layoutLacks(materialized)) ++leaseLayoutGen;
         if (versions_.size() <= version) versions_.resize(static_cast<std::size_t>(version) + 1);
         auto sv = std::make_unique<SpecVersion>(SpecVersion{rune::codec::Validator(materialized), std::move(materialized), kNoKeyOffset});
         setKeyOffset_(*sv);
         versions_[version] = std::move(sv);
         if (version > maxVersion_) maxVersion_ = version;
         return true;
+    }
+
+    /// A lease topic: the version was refused by installVersion / setFacts (its system columns are wrong).  A definite answer:
+    /// the judge refuses its records (InvalidRequest) instead of waiting for an install that will never come.
+    [[nodiscard]] bool versionRefused(uint16_t version) const noexcept { return version < refused_.size() && refused_[version] != 0; }
+
+    /// Cold.  True when `d` holds a field id the lease layout source (leaseLayoutSource) does not have yet.
+    [[nodiscard]] bool layoutLacks(const rune::codec::Descriptor& d) const noexcept {
+        for (const auto& f : d.fields) {
+            if (evolving && std::any_of(evolving->fields.begin(), evolving->fields.end(), [&](const auto& o) { return o.id == f.id; })) continue;
+            bool known = false;
+            for (const auto& sv : versions_)
+                if (sv && std::any_of(sv->descriptor.fields.begin(), sv->descriptor.fields.end(), [&](const auto& o) { return o.id == f.id; })) { known = true; break; }
+            if (!known) return true;
+        }
+        return false;
+    }
+
+    /// Cold.  The descriptor a lease index's row layout is built from: the MERGE, by field id, of `evolving` (when present)
+    /// and every installed version's materialized descriptor.  Fields absent from `evolving` are appended in id order, each
+    /// with the type / width of a version that declares it.  The layout therefore depends on SchemaUpdate alone (the writer
+    /// versions) as well as on FilterSchema, and a lease write can never be held for a FilterSchema that never comes.
+    /// nullopt while neither is present.
+    [[nodiscard]] std::optional<rune::codec::Descriptor> leaseLayoutSource() const {
+        std::optional<rune::codec::Descriptor> out;
+        if (evolving) out = *evolving;
+        std::vector<const rune::codec::FieldDescriptor*> extra;
+        for (const auto& sv : versions_) {
+            if (!sv) continue;
+            if (!out) { out = rune::codec::Descriptor{}; out->name = sv->descriptor.name; out->version = sv->descriptor.version; out->blockLength = sv->descriptor.blockLength; }
+            for (const auto& f : sv->descriptor.fields) {
+                const bool inOut = std::any_of(out->fields.begin(), out->fields.end(), [&](const auto& o) { return o.id == f.id; });
+                if (!inOut && std::none_of(extra.begin(), extra.end(), [&](const auto* o) { return o->id == f.id; })) extra.push_back(&f);
+            }
+        }
+        if (!out) return out;
+        std::sort(extra.begin(), extra.end(), [](const auto* a, const auto* b) { return a->id < b->id; });
+        for (const auto* f : extra) out->fields.push_back(*f);
+        return out;
     }
 
     /// Cold.  Takes the key facts and recomputes every installed version's key offset.  With a lease, every installed
@@ -236,13 +282,18 @@ public:
         uint32_t erased = 0;
         for (auto& sv : versions_) {
             if (!sv) continue;
-            if (lease && !leaseLayoutOk(sv->descriptor)) { sv.reset(); ++erased; continue; }
+            if (lease && !leaseLayoutOk(sv->descriptor)) { sv.reset(); ++erased; markRefused_(static_cast<uint16_t>(&sv - versions_.data()), true); continue; }
             setKeyOffset_(*sv);
         }
         return erased;
     }
 
 private:
+    void markRefused_(uint16_t version, bool refused) {
+        if (!refused && version >= refused_.size()) return;
+        if (refused_.size() <= version) refused_.resize(static_cast<std::size_t>(version) + 1, 0);
+        refused_[version] = refused ? 1 : 0;
+    }
     void setKeyOffset_(SpecVersion& sv) const noexcept {
         sv.keyValueOffset = kNoKeyOffset;
         if (!hasFacts_ || keyFieldId == kNoKeyField) return;
@@ -251,6 +302,7 @@ private:
     }
 
     std::vector<std::unique_ptr<SpecVersion>> versions_;   // index = schema version; grown only by installVersion
+    std::vector<uint8_t> refused_;   // index = schema version; 1 = installVersion / setFacts refused it (cold-grown)
     uint16_t maxVersion_ = 0;
     bool     hasFacts_   = false;
 };

@@ -73,6 +73,8 @@ public:
 
     /// Prepares every member of the active set for `rec`, evaluates them in set order, applies all or none.  A rejection
     /// is added to the index and returned.  A full index or an exhausted prospect sets stalled() and applies nothing.
+    /// Returns Verdict::held() (isHeld(), never recorded) when a lease record's layout is not installed yet: nothing was judged.
+    /// Public for the unit rigs (CheckedWritesKeyIndexTest drives it directly).
     [[nodiscard]] rune::view::Verdict judge(const rune::view::SourceRecord& rec) noexcept;
 
     /// One duty-pass of the judge over the committed range below `bound`.  `readRange(from, to)` returns whole batches
@@ -193,8 +195,7 @@ private:
     int64_t                     logStart_ = 0;
     bool                        needsActivation_ = false;
     bool                        stalled_ = false, waitingForInstall_ = false, held_ = false;
-    bool                        layoutPending_ = false;   // judge(): the record's lease layout is not installed (no verdict was given)
-    bool                        layoutWaiting_ = false;   // a layout wait is in progress (counted and logged once)
+    int32_t                     layoutWaitVersion_ = -1;   // the writer version a layout wait is in progress for (counted and logged once); -1 none
     StallReason                 stallReason_ = StallReason::None;
     int64_t                     judgeCursor_ = 0, emitFrom_ = 0, setFrom_ = 0;
     int64_t                     checkpointCap_ = INT64_MAX;

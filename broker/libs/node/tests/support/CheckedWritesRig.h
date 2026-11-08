@@ -250,6 +250,13 @@ public:
         f.schemaUpdateBlob = rune::codec::serialize(evolving);
         send(std::move(f));
     }
+    /// The source schema a restart() reinstalls (a restarted node knows fewer versions than its log holds until their SchemaUpdates re-arrive).
+    void setSourceForRestart(rune::codec::Descriptor d) { customSrc_ = std::move(d); }
+    /// WorkerViewSet::leaseIndexReady with the replica's current facts (what Task 9 passes).
+    [[nodiscard]] bool leaseReady() const {
+        return vs->leaseIndexReady(kSrc, tuning_.partition, replica->leadershipGeneration(), replica->role() == rune::replication::Role::Leader,
+                                   replica->highWatermark() >= replica->leadershipStartOffset());
+    }
     /// The judges of this rig (created later ones too) do not run: nothing is activated, replayed or judged.
     void holdJudge(bool on) {
         holdJudge_ = on;

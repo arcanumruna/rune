@@ -1110,6 +1110,15 @@ static const rune::codec::Descriptor* keyIndexSource(const TopicWriteSpec& spec)
     return hasKey ? &*spec.evolving : nullptr;
 }
 
+// A lease index's row layout source: the spec's merge of the evolving descriptor and every installed version
+// (TopicWriteSpec::leaseLayoutSource); nullopt until a schema has landed, or when the key cannot be indexed.
+static std::optional<rune::codec::Descriptor> leaseIndexSource(const TopicWriteSpec& spec) {
+    if (spec.keyWidth == 0) return std::nullopt;
+    std::optional<rune::codec::Descriptor> src = spec.leaseLayoutSource();
+    if (!src || std::none_of(src->fields.begin(), src->fields.end(), [&](const auto& f) { return f.id == spec.keyFieldId; })) return std::nullopt;
+    return src;
+}
+
 // A key index no leadership has activated yet: its first activation keeps it (it holds nothing), a later one rebuilds it.
 static constexpr uint64_t kNeverActivated = UINT64_MAX;
 // A key index adopted under an active leadership: it folds that leadership's writes, so the next activation rebuilds it.
@@ -1144,7 +1153,8 @@ void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, Verd
     const bool staleLayout = spec.lease && it->second.layoutGen != spec.leaseLayoutGen;
     if (it->second.foldLeadership == leaderGen && !staleLayout) return;   // already fresh for this leadership and layout (the judge may be held)
     if (it->second.foldLeadership != kNeverActivated || staleLayout) {
-        const rune::codec::Descriptor* src = keyIndexSource(spec);
+        const std::optional<rune::codec::Descriptor> leaseSrc = spec.lease ? leaseIndexSource(spec) : std::nullopt;
+        const rune::codec::Descriptor* src = spec.lease ? (leaseSrc ? &*leaseSrc : nullptr) : keyIndexSource(spec);
         if (src == nullptr) {   // the spec can no longer be indexed: nothing stale stays behind
             judge.removeVerdictView(it->second.plan.viewTopicId);
             eraseKeyIndex_(it->first);
@@ -1189,7 +1199,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     write.verdicts = judge;
     if (write.spec->lease) write.leaseEvents.reserveOnce();
     if (write.spec->lease && !judge->hasMember(0, kLeaseIndexPlanFingerprint)) {
-        if (const rune::codec::Descriptor* src = keyIndexSource(*write.spec)) {
+        if (const std::optional<rune::codec::Descriptor> src = leaseIndexSource(*write.spec)) {
             ViewInstance& inst = keyIndexes_.try_emplace(key, freshLeaseIndex(srcTopicId, partition, *write.spec, *src, rune::view::ViewTableKeys{write.spec->keyWidth, 0, hashSeed_, hashMask_}, leaseReplayCap_)).first->second;
             if (judge->activated()) inst.foldLeadership = kAdoptedLive;
             judge->addVerdictView(&inst, rune::view::VerdictViewKind::LeaseIndex, 0, kLeaseIndexPlanFingerprint);

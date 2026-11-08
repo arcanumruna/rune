@@ -25,6 +25,7 @@
 #include <rune/view/ViewTable.h>
 
 #include <rune/node/NsSlotTable.h>
+#include <rune/node/lease/LeaseFoldEvents.h>   // LeaseCoverCache
 #include <rune/node/ViewCheckpointScan.h>
 #include <rune/node/ViewSnapshotChannel.h>   // ViewDiscardReason
 
@@ -258,6 +259,9 @@ struct ViewInstance {
     // A lease index: bumped by every activation of its judge (the lease events are cleared and the rows may have been rebuilt,
     // so row ids changed).  Carried over a rebuild.  The wheels (Task 9) re-arm from the table when it changes.
     uint32_t                           rebuildEpoch    = 0;
+    // A lease index: the writer descriptors already proven covered by this instance's layout (a rebuilt layout is a new instance,
+    // so it starts empty).
+    LeaseCoverCache                    leaseCover;
 
     // Cumulative fold-anomaly counters (see ViewFoldCounters).
     ViewFoldCounters                   counters;

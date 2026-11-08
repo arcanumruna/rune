@@ -4,10 +4,16 @@
 
 namespace rune::view {
 
+// Internal, never stored, never sent: the judge holds at a record (a lease record whose layout is not installed yet): no
+// verdict was given.  Not accepted, and never recorded in the rejected index or a marker.
+inline constexpr uint16_t kVerdictHeld = 0xFFFF;
+
 struct Verdict {
     uint16_t code         = 0;
     uint32_t constraintId = 0;
     [[nodiscard]] bool accepted() const noexcept { return code == 0; }
+    [[nodiscard]] bool isHeld() const noexcept { return code == kVerdictHeld; }
+    [[nodiscard]] static constexpr Verdict held() noexcept { return Verdict{kVerdictHeld, 0}; }
 };
 
 // viewObjectId << 16 | ordinal; ordinal 0 is `unique`.

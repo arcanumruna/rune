@@ -69,13 +69,15 @@ rune::view::CompiledViewPlan leaseIndexPlan(int32_t srcTopicId, uint16_t keyFiel
 }
 
 PrepareStatus projectLeaseRow(uint8_t* row, const rune::view::RowLayout& layout, const rune::codec::Descriptor& outDesc,
-                              const rune::codec::Descriptor& writer, std::string_view value) noexcept {
+                              const rune::codec::Descriptor& writer, std::string_view value, bool coveredKnown) noexcept {
     if (layout.slotType.size() < kLeaseSystemSlots + kLeaseOffsetSlots || outDesc.fields.size() < userSlots(layout)) return PrepareStatus::Malformed;
     const uint16_t n = userSlots(layout);
-    for (const auto& w : writer.fields) {   // a field id the layout lacks: the layout is older than the writer's schema
-        bool known = false;
-        for (uint16_t i = 0; i < n && !known; ++i) known = outDesc.fields[i].id == w.id;
-        if (!known) return PrepareStatus::Pending;
+    if (!coveredKnown) {
+        for (const auto& w : writer.fields) {   // a field id the layout lacks: the layout is older than the writer's schema
+            bool known = false;
+            for (uint16_t i = 0; i < n && !known; ++i) known = outDesc.fields[i].id == w.id;
+            if (!known) return PrepareStatus::Pending;
+        }
     }
     if (value.size() < 4u + writer.blockLength) return PrepareStatus::Malformed;
     std::memset(row, 0, layout.rowLen);
@@ -95,8 +97,10 @@ PrepareStatus projectLeaseRow(uint8_t* row, const rune::view::RowLayout& layout,
     return PrepareStatus::Ok;
 }
 
-uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion, uint64_t liveCount, uint32_t maxKeys) noexcept {
+uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion, uint64_t recordTtlMs, uint64_t recordRemainingMs,
+                    uint64_t liveCount, uint32_t maxKeys) noexcept {
     using rune::protocol::client::ErrorCode;
+    constexpr auto kInvalid = static_cast<uint16_t>(ErrorCode::InvalidRequest);
     const lr::LeaseOp op = lr::leaseOpOf(attributes);
     const uint8_t intent = lr::intentOf(attributes);
     constexpr auto kInsert = static_cast<uint8_t>(lr::Intent::Insert), kExisting = static_cast<uint8_t>(lr::Intent::Existing);
@@ -105,31 +109,50 @@ uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion
     case lr::LeaseOp::Put:
         if (intent == kInsert) {
             if (row.present) return static_cast<uint16_t>(ErrorCode::KeyExists);
-            return liveCount < maxKeys ? 0 : static_cast<uint16_t>(ErrorCode::LeaseLimitExceeded);
+            if (liveCount >= maxKeys) return static_cast<uint16_t>(ErrorCode::LeaseLimitExceeded);
+            return recordRemainingMs == 0 ? 0 : kInvalid;
         }
-        if (intent == kExisting) return sameVersion ? 0 : static_cast<uint16_t>(ErrorCode::LeaseNotFound);
+        if (intent == kExisting) {
+            if (!sameVersion) return static_cast<uint16_t>(ErrorCode::LeaseNotFound);
+            return recordRemainingMs == 0 && recordTtlMs == row.ttlMs ? 0 : kInvalid;
+        }
         break;
     case lr::LeaseOp::Revoke:
-        if (intent == kExisting) return sameVersion ? 0 : static_cast<uint16_t>(ErrorCode::LeaseNotFound);
+        if (intent == kExisting) {
+            if (!sameVersion) return static_cast<uint16_t>(ErrorCode::LeaseNotFound);
+            return recordRemainingMs == 0 && recordTtlMs == row.ttlMs ? 0 : kInvalid;
+        }
         break;
     case lr::LeaseOp::Expire:
     case lr::LeaseOp::Checkpoint:
         if (intent == 0) return sameVersion ? 0 : rune::view::kVerdictStaleBroker;
         break;
     }
-    return static_cast<uint16_t>(ErrorCode::InvalidRequest);
+    return kInvalid;
+}
+
+uint64_t leaseRecordTtl(std::string_view value) noexcept {
+    if (value.size() < lr::kLeaseTtlValueOffset + 8) return 0;
+    return loadU64(reinterpret_cast<const uint8_t*>(value.data()) + lr::kLeaseTtlValueOffset);
+}
+
+uint64_t leaseRecordRemaining(std::string_view value) noexcept {
+    if (value.size() < lr::kLeaseRemainingValueOffset + 8) return 0;
+    return loadU64(reinterpret_cast<const uint8_t*>(value.data()) + lr::kLeaseRemainingValueOffset);
 }
 
 int64_t leaseRowVersion(const uint8_t* row, const rune::view::RowLayout& layout) noexcept {
     return static_cast<int64_t>(slotU64(row, layout, kLeaseVersionSlot));
 }
 
+uint64_t leaseRowTtl(const uint8_t* row, const rune::view::RowLayout& layout) noexcept { return slotU64(row, layout, kLeaseTtlSlot); }
+
 int64_t leaseRecordVersion(std::string_view value) noexcept {
     if (value.size() < lr::kLeaseVersionValueOffset + 8) return 0;
     return static_cast<int64_t>(loadU64(reinterpret_cast<const uint8_t*>(value.data()) + lr::kLeaseVersionValueOffset));
 }
 
-PrepareStatus prepareLeaseIndex(const LeaseIndexFold& f, const rune::view::SourceRecord& r, rune::view::Prospect& p) noexcept {
+PrepareStatus prepareLeaseIndex(const LeaseIndexFold& f, const rune::view::SourceRecord& r, rune::view::Prospect& p, bool refusedVersion) noexcept {
     p.clear();
     if (r.key.size() != f.keyWidth) {
         p.stats.skippedMalformed = 1;
@@ -146,14 +169,22 @@ PrepareStatus prepareLeaseIndex(const LeaseIndexFold& f, const rune::view::Sourc
             p.stats.skippedMalformed = 1;
             return PrepareStatus::Malformed;
         }
-        if (r.writer == nullptr) return PrepareStatus::Pending;   // the record's version is not installed yet: hold, never accept
-        if (op == lr::LeaseOp::Put || op == lr::LeaseOp::Checkpoint) {
+        if (r.writer == nullptr) {
+            if (!refusedVersion) return PrepareStatus::Pending;   // the record's version is not installed yet: hold, never accept
+            p.stats.skippedMalformed = 1;                         // a version the spec refused is a definite answer
+            return PrepareStatus::Malformed;
+        }
+        // A Checkpoint's image is only needed to create an ABSENT row (a replay of a compacted log); the live path never builds it.
+        if (op == lr::LeaseOp::Put || (op == lr::LeaseOp::Checkpoint && !row.existed)) {
             if (p.scratch.size() < f.layout.rowLen) {
                 p.stats.skippedMalformed = 1;
                 return PrepareStatus::Malformed;
             }
-            const PrepareStatus ps = projectLeaseRow(p.scratch.data(), f.layout, f.outDesc, *r.writer, r.value);
+            const uint16_t ver = static_cast<uint16_t>(static_cast<uint8_t>(r.value[2]) | (static_cast<uint8_t>(r.value[3]) << 8));
+            const bool cached = f.cover != nullptr && ver < kLeaseCoverCacheVersions && f.cover->proven[ver] == r.writer;
+            const PrepareStatus ps = projectLeaseRow(p.scratch.data(), f.layout, f.outDesc, *r.writer, r.value, cached);
             if (ps == PrepareStatus::Pending) return ps;
+            if (ps == PrepareStatus::Ok && f.cover != nullptr && ver < kLeaseCoverCacheVersions) f.cover->proven[ver] = r.writer;
             if (ps != PrepareStatus::Ok) {
                 p.stats.skippedMalformed = 1;
                 return PrepareStatus::Malformed;
@@ -265,12 +296,13 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& r, cons
 
 rune::view::FoldStats foldLeaseIndexBatch(LeaseIndexFold& f, const TopicWriteSpec& spec, rune::view::Prospect& prospect,
                                           const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
-                                          const rune::view::FoldSkip& skipRef, bool* held) noexcept {
+                                          const rune::view::FoldSkip& skipRef, bool* held, uint16_t* heldVersion) noexcept {
     const rune::view::FoldSkip skip = skipRef;   // #537: by value (see AbortedTxnFilter::skips)
     rune::view::FoldStats stats{};
     const int64_t from = cursor;
     bool stopped = false, corrupt = false;
     int64_t pendingAt = -1;   // a record whose layout is not installed: the fold stops AT it
+    uint16_t pendingVersion = 0;
     int64_t walkedUpto = view.baseOffset;
     std::size_t pos = 0;
     while (pos < view.len) {
@@ -297,9 +329,11 @@ rune::view::FoldStats foldLeaseIndexBatch(LeaseIndexFold& f, const TopicWriteSpe
                 }
                 rune::view::SourceRecord rec{span.key, span.value, span.offset, lr::intentOf(span.attributes), nullptr, span.attributes};
                 if (!span.value.empty()) rec.writer = leaseWriterOf(spec, span.value);
-                const PrepareStatus ps = prepareLeaseIndex(f, rec, prospect);
+                const bool refused = rec.writer == nullptr && span.value.size() >= 4 && spec.versionRefused(detail::le16(span.value.data() + 2));
+                const PrepareStatus ps = prepareLeaseIndex(f, rec, prospect, refused);
                 if (ps == PrepareStatus::Pending) {
                     pendingAt = span.offset;
+                    pendingVersion = span.value.size() >= 4 ? detail::le16(span.value.data() + 2) : 0;
                     stopped   = true;
                     return;
                 }
@@ -319,6 +353,7 @@ rune::view::FoldStats foldLeaseIndexBatch(LeaseIndexFold& f, const TopicWriteSpe
     }
     if (pendingAt >= 0) {
         if (held != nullptr) *held = true;
+        if (heldVersion != nullptr) *heldVersion = pendingVersion;
         cursor = std::max(from, pendingAt);
         return stats;
     }

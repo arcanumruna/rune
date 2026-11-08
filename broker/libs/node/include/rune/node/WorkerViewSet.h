@@ -410,10 +410,14 @@ public:
         const auto it = keyIndexes_.find(instKey(src, partition));
         return it == keyIndexes_.end() ? 0 : it->second.rebuildEpoch;
     }
-    /// True when the lease index of (src, partition) reflects every judged record of the CURRENT leadership: its judge is
-    /// activated, the index was built under this leadership and the current row layout, and it has folded through the judge's
-    /// cursor (a replay bounded by maxRecordsPerPass is still behind).  The wheels (Task 9) arm only from a ready index.
-    [[nodiscard]] bool leaseIndexReady(int32_t src, int32_t partition) const noexcept {
+    /// True when the lease index of (src, partition) reflects every judged record of the replica's CURRENT leadership.  The
+    /// caller (Task 9) passes the replica's facts: its current leadership generation, whether it is the leader and whether its
+    /// HW is confirmed for that leadership.  True only when all hold: the judge is bound to `currentLeaderGen` and activated, the
+    /// index was folded under `currentLeaderGen`, its fold cursor has reached the judge's, and its layout is current.  After a
+    /// demote or a new leadership it is false until the judge activates under the new generation (a stale-leader index is never
+    /// ready).  The wheels (Task 9) arm only from a ready index.
+    [[nodiscard]] bool leaseIndexReady(int32_t src, int32_t partition, uint64_t currentLeaderGen, bool isLeader, bool hwConfirmed) const noexcept {
+        if (!isLeader || !hwConfirmed) return false;
         const uint64_t key = instKey(src, partition);
         const auto kit = keyIndexes_.find(key);
         const auto vit = verdictSources_.find(key);
@@ -422,7 +426,7 @@ public:
         const PartitionWriteState* w = judge.boundState();
         if (w == nullptr || w->spec == nullptr || !w->spec->lease) return false;
         const ViewInstance& inst = kit->second;
-        return judge.activated() && inst.foldLeadership == judge.leadershipGeneration() &&
+        return judge.activated() && judge.leadershipGeneration() == currentLeaderGen && inst.foldLeadership == currentLeaderGen &&
                inst.layoutGen == w->spec->leaseLayoutGen && inst.foldCursor >= judge.judgedThrough();
     }
     /// -1: the partition has no key index.

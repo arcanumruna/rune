@@ -23,6 +23,7 @@
 #include <rune/view/ViewRow.h>
 #include <rune/view/ViewTable.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -68,21 +69,40 @@ inline constexpr std::string_view kLeaseUpdatedOffsetColumn = "lease_updated_off
 /// layout.slotType.size() - kLeaseOffsetSlots fields are read.  Malformed: the value is shorter than the writer's block,
 /// or a field's type / width differs between writer and layout (evolution never changes a type: AlterOpType is
 /// Add | Drop | Rename | SetCompatibility).
+/// `coveredKnown`: the caller already proved every writer field id is in the layout (LeaseCoverCache); skips the scan.
 [[nodiscard]] rune::view::PrepareStatus projectLeaseRow(uint8_t* row, const rune::view::RowLayout& layout, const rune::codec::Descriptor& outDesc,
-                                                        const rune::codec::Descriptor& writer, std::string_view value) noexcept;
+                                                        const rune::codec::Descriptor& writer, std::string_view value, bool coveredKnown = false) noexcept;
 
 struct LeaseRowState {
-    bool    present = false;
-    int64_t version = 0;
+    bool     present = false;
+    int64_t  version = 0;
+    uint64_t ttlMs   = 0;   ///< the row's lease_ttl_ms
 };
 
 /// The judgment of spec 7.2.  0 = accept; else the verdict code (KeyExists, LeaseNotFound, LeaseLimitExceeded,
 /// InvalidRequest, or kVerdictStaleBroker for an Expire / Checkpoint whose lease moved on).  `recordVersion` is the
-/// record's lease_version (value bytes [4,12)); a grant ignores it.
-[[nodiscard]] uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion, uint64_t liveCount, uint32_t maxKeys) noexcept;
+/// record's lease_version (value bytes [4,12)); a grant ignores it.  `recordTtlMs` / `recordRemainingMs` are the record's
+/// lease_ttl_ms / lease_remaining_ms (bytes [12,20) / [28,36)).
+///
+/// Exact order, per record kind (the first match answers):
+///   Put + Insert:    row present -> KeyExists (56); liveCount >= maxKeys -> LeaseLimitExceeded (63); remaining != 0 -> 39; accept.
+///                    The grant's TTL is taken as written (the produce hook clamps it before append).
+///   Put + Existing:  row absent or version differs -> LeaseNotFound (62); remaining != 0 -> 39; ttl != the row's ttl -> 39; accept.
+///   Revoke+Existing: row absent or version differs -> LeaseNotFound (62); remaining != 0 -> 39; ttl != the row's ttl -> 39; accept.
+///   Expire / Checkpoint (intent 0): row absent or version differs -> kVerdictStaleBroker; accept (the broker copies the row).
+///   anything else -> InvalidRequest (39).
+/// So every accepted client record carries the row's TTL and remaining 0: the log is self-describing, and a replay of a
+/// compacted log (which rebuilds a row from the update image alone) equals the live row.
+[[nodiscard]] uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion, uint64_t recordTtlMs, uint64_t recordRemainingMs,
+                                  uint64_t liveCount, uint32_t maxKeys) noexcept;
+/// The record's lease_ttl_ms / lease_remaining_ms; 0 for a value too short to carry them.
+[[nodiscard]] uint64_t leaseRecordTtl(std::string_view value) noexcept;
+[[nodiscard]] uint64_t leaseRecordRemaining(std::string_view value) noexcept;
 
 /// The lease_version slot of a lease row image.
 [[nodiscard]] int64_t leaseRowVersion(const uint8_t* row, const rune::view::RowLayout& layout) noexcept;
+/// The lease_ttl_ms slot of a lease row image.
+[[nodiscard]] uint64_t leaseRowTtl(const uint8_t* row, const rune::view::RowLayout& layout) noexcept;
 /// The record's lease_version (value bytes [4,12), little-endian); 0 for a value too short to carry one.
 [[nodiscard]] int64_t leaseRecordVersion(std::string_view value) noexcept;
 
@@ -93,14 +113,19 @@ struct LeaseIndexFold {
     const rune::view::RowLayout&      layout;
     const rune::codec::Descriptor&    outDesc;
     uint8_t                           keyWidth = 0;
+    /// Optional (nullptr: always scan): the instance's cache of writer descriptors already proven covered by `layout`.
+    LeaseCoverCache*                  cover = nullptr;
 };
 
 /// Prepares one record: the key (width checked), whether its row exists, and for a Put or Checkpoint the projected row image
 /// in `p.scratch`.  `rec.writer` is the spec's descriptor of the record's version (leaseWriterOf).  An empty value is
 /// prepared as an Upsert (the judge answers InvalidRequest).  Malformed: a wrong key width, a value shorter than the system
 /// columns, or a projection that does not fit; the prospect then holds no operation and the judge answers InvalidRequest.
-/// Pending: the writer descriptor is not installed (null) or has a field id the layout lacks; nothing is judged.
-[[nodiscard]] rune::view::PrepareStatus prepareLeaseIndex(const LeaseIndexFold& f, const rune::view::SourceRecord& rec, rune::view::Prospect& p) noexcept;
+/// Pending: the writer descriptor is not installed (null) or has a field id the layout lacks; nothing is judged.  When the
+/// writer is null because the version was REFUSED by the spec (`refusedVersion`), the answer is definite: Malformed (the judge
+/// answers InvalidRequest and moves on).  A Checkpoint's image is projected only when its row is absent (a compacted-log replay).
+[[nodiscard]] rune::view::PrepareStatus prepareLeaseIndex(const LeaseIndexFold& f, const rune::view::SourceRecord& rec, rune::view::Prospect& p,
+                                                          bool refusedVersion = false) noexcept;
 
 /// Applies one ACCEPTED record (the prospect `p` was prepared for it).  Fills `ev` and returns true when the record
 /// changed a row; false for a record that does not apply (a replay of a log that disagrees with the table).  Every accepted
@@ -114,6 +139,6 @@ bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& rec, co
 /// AT that record (cursor = its offset, `*held` set); the caller retries.  `scratch` is the prospect's (2 * rowLen).
 rune::view::FoldStats foldLeaseIndexBatch(LeaseIndexFold& f, const TopicWriteSpec& spec, rune::view::Prospect& prospect,
                                           const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
-                                          const rune::view::FoldSkip& skip, bool* held = nullptr) noexcept;
+                                          const rune::view::FoldSkip& skip, bool* held = nullptr, uint16_t* heldVersion = nullptr) noexcept;
 
 }  // namespace rune::node

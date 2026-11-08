@@ -3511,6 +3511,16 @@ private:
         const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
         try {
             rune::codec::Descriptor desc = rune::codec::deserialize(std::span<const uint8_t>(tail, tailLen));
+            // The lease part comes BEFORE the build: a throw in FilterSchema::build (the old schema is kept) must not skip the
+            // lease layout bump or the evolving update.  A lease index has one row column per field id of
+            // TopicWriteSpec::leaseLayoutSource() (evolving merged with every installed version): a field id that source lacked
+            // (an AddField that SchemaUpdate has not delivered yet) makes the layout stale and the index is rebuilt from the log
+            // (WorkerViewSet::rebuildKeyIndex_).  Sufficient: a Drop or Rename keeps every id in the layout.
+            {
+                TopicWriteSpec& wspec = writeSpecOf_(topicId);
+                if (wspec.lease && wspec.layoutLacks(desc)) ++wspec.leaseLayoutGen;
+                wspec.evolving = desc;
+            }
             rune::codec::FilterSchema built = rune::codec::FilterSchema::build(desc, version);
             auto it = filterSchemas_.find(topicId);
             if (it == filterSchemas_.end()) {
@@ -3522,17 +3532,6 @@ private:
                 ++filterSchemaReplacements_;
                 recompileFilters_(topicId);
             }
-            TopicWriteSpec& wspec = writeSpecOf_(topicId);
-            // A lease index has one row column per evolving field: a field id the previous descriptor lacked (an AddField)
-            // makes its layout stale, and the index is rebuilt from the log (WorkerViewSet::rebuildKeyIndex_).  Sufficient:
-            // a Drop or Rename keeps every id in the layout, and the judge takes writers from the spec and holds on a layout
-            // it lacks (PrepareStatus::Pending), whatever the order of SchemaUpdate and FilterSchema.
-            if (wspec.lease && wspec.evolving &&
-                std::any_of(desc.fields.begin(), desc.fields.end(), [&](const auto& f) {
-                    return std::none_of(wspec.evolving->fields.begin(), wspec.evolving->fields.end(), [&](const auto& o) { return o.id == f.id; });
-                }))
-                ++wspec.leaseLayoutGen;
-            wspec.evolving = std::move(desc);
             spdlog::debug("Worker {}: FilterSchema installed for topicId={} version={}", workerId_, topicId, version);
         } catch (const std::exception& ex) {
             ++filterSchemaErrors_;
