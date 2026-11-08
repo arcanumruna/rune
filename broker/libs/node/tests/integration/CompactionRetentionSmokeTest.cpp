@@ -1726,6 +1726,17 @@ TEST(CompactionRetentionSmoke, RetentionAfterRestart) {
 // node.start(); reads happen AFTER node.stop() (no duty/cleaner thread running).
 // ===========================================================================
 
+// The first batch at/after `cursor`, hopping to the next segment base while the cursor sits in a segment compaction
+// emptied (Log::read stops at the end of one segment; the serve path, Log::readInto, continues — D26).
+static std::vector<uint8_t> readHopping(Log& log, int64_t cursor, int64_t hwBound) {
+    auto bytes = log.read(cursor, 1 << 20);
+    for (const int64_t base : log.segmentBaseOffsets()) {
+        if (!bytes.empty() || base >= hwBound) break;
+        if (base > cursor) bytes = log.read(base, 1 << 20);
+    }
+    return bytes;
+}
+
 // Scan the ENTIRE committed log up to `hwBound` (single-node: HW == LEO after
 // becomeLeader), returning latest-value-per-key and total live count.  Reading
 // [0, LEO) on a stopped single-node log is the exact set the HW-bounded serve
@@ -1741,7 +1752,7 @@ static void serveScanLatestPerKey(
     // Gateway resolves "Earliest" to logStartOffset (bug-1 fix 0ec0592), NOT 0.
     int64_t cursor = log.logStartOffset();
     while (cursor < hwBound) {
-        auto bytes = log.read(cursor, 1 << 20);
+        auto bytes = readHopping(log, cursor, hwBound);
         if (bytes.empty()) break;
         RecordBatchReader r(bytes.data(), bytes.size());
         if (!r.ensureValid()) break;
@@ -1884,7 +1895,7 @@ TEST(CompactionRetentionSmoke, NewLeaderRecompactsAndServesTail) {
         int64_t c = finalLog2.logStartOffset();
         const int64_t hw = finalLog2.logEndOffset();
         while (c < hw) {
-            auto by = finalLog2.read(c, 1 << 20);
+            auto by = readHopping(finalLog2, c, hw);
             if (by.empty()) break;
             RecordBatchReader r(by.data(), by.size());
             if (!r.ensureValid()) break;
