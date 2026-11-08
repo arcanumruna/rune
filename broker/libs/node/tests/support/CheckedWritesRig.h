@@ -296,6 +296,16 @@ public:
         pass();
         return voteToken_;
     }
+    /// The coordinator's answer `code`, as (pid, epoch), to the worker's most recent verification request of any producer; one pass.
+    void answerVerify(int64_t pid, int16_t epoch, int16_t code) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::TxnVerifyResult; op.topicId = kSrc; op.partition = tuning_.partition; op.replica = replica.get();
+        op.logPtr = log.get(); op.correlationId = lastVerifyReqId_; op.producerId = pid; op.producerEpoch = epoch;
+        op.replicatedPayload.errorCode = code;
+        op.targetReplicaId = replica->registryId(); op.incarnation = replica->incarnation();
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+        pass();
+    }
     [[nodiscard]] std::optional<VoteReply> voteReply(int64_t token) const {
         const auto it = voteReplies_.find(token);
         return it == voteReplies_.end() ? std::nullopt : std::optional<VoteReply>(it->second);
@@ -743,11 +753,11 @@ private:
 public:
 
     /// `shape`: the source's key; the wire key and the value's id field are that wide (the id's little-endian bytes, zero padded).
-    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1, const KeyShape& shape = {}, bool txn = false) {
+    static std::vector<uint8_t> batch(const std::vector<Rec>& recs, int64_t pid = -1, int32_t seq = -1, const KeyShape& shape = {}, bool txn = false, int16_t epoch = 0) {
         const uint32_t kw = keyWidthOf(shape);
         const auto idByte = [](uint64_t id, uint32_t i) { return static_cast<uint8_t>(i < 8 ? id >> (8 * i) : 0); };
         rune::protocol::RecordBatchBuilder b(0, 1000);
-        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+        if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq); }
         b.setTransactional(txn);
         for (const auto& r : recs) {
             std::vector<uint8_t> key(kw), val;
@@ -1092,15 +1102,15 @@ public:
         wireAcks_();
     }
     /// A Produce frame on the worker's ingress; returns its correlation id.  `recs` is one batch.
-    int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool txn = false) {
-        return produceBytes(batch(recs, pid, seq, keyShape_, txn), acks, pid, seq);
+    int64_t produceFrame(const std::vector<Rec>& recs, uint8_t acks, int64_t pid = -1, int32_t seq = -1, bool txn = false, int16_t epoch = 0) {
+        return produceBytes(batch(recs, pid, seq, keyShape_, txn, epoch), acks, pid, seq, epoch);
     }
     /// A Produce frame carrying `bytes` as its batch (a hand-made one); returns its correlation id.
-    int64_t produceBytes(const std::vector<uint8_t>& bytes, uint8_t acks, int64_t pid = -1, int32_t seq = -1) {
+    int64_t produceBytes(const std::vector<uint8_t>& bytes, uint8_t acks, int64_t pid = -1, int32_t seq = -1, int16_t epoch = 0) {
         const int64_t c = ++corr;
         rune::protocol::client::Produce m;
         m.sessionId = kAckSession; m.correlationId = c; m.topicId = kSrc; m.partition = tuning_.partition; m.partitionKnown = 1;
-        m.acks = acks; m.producerId = pid; m.producerEpoch = 0; m.baseSequence = seq;
+        m.acks = acks; m.producerId = pid; m.producerEpoch = epoch; m.baseSequence = seq;
         m.recordBatch = std::span<const uint8_t>(bytes);
         std::vector<uint8_t> f(m.encodedSize()); m.encode(f.data());
         if (ackEncrypted_) f = sealC2b_(f);
@@ -1518,11 +1528,14 @@ private:
         if (r.type == WorkerReturn::Type::TxnVoteResult) {
             voteReplies_[r.correlationId] = VoteReply{r.errorCode, static_cast<uint16_t>(r.recordCount), static_cast<uint32_t>(r.newNextOffset), r.baseOffset, r.lastOffset};
             ++voteReplyCount_[r.correlationId];
+        } else if (r.type == WorkerReturn::Type::TxnVerifyRequest) {
+            lastVerifyReqId_ = r.correlationId;
         } else if (r.type == WorkerReturn::Type::ControlRecordAppended) {
             markerAnswers_[r.correlationId] = r.errorCode == 0 ? r.baseOffset : -1 - r.errorCode;
         }
     }
     bool keyIndexOn_ = false, holdJudge_ = false;
+    int64_t lastVerifyReqId_ = 0;
     int64_t viewPassCap_ = 0;
     int delayedSpecIn_ = 0;
     std::filesystem::path viewDir_, logDir_;

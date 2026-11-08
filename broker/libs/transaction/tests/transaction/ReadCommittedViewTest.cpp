@@ -1336,3 +1336,61 @@ TEST(ReadCommittedEdgeTest, SamePidAbortThenCommitRebuildMatchesIncremental)
 
     fs::remove_all(tmpDir);
 }
+
+// Part 11: the vote mark lives with the open transaction and follows it through every move of its entry.
+TEST(LsoTrackerVoteMarkRegression, MarkIsPerEpochNeverLowersAndTheMarkerClearsIt)
+{
+    LsoTracker tracker(4);
+    tracker.onProduceBatch(1, 0);
+    EXPECT_FALSE(tracker.votedAt(1, 1));
+    tracker.markVoted(1, 1);
+    tracker.markVoted(1, 0);   // a stale vote of an older epoch
+    EXPECT_TRUE(tracker.votedAt(1, 1));
+    EXPECT_FALSE(tracker.votedAt(1, 0));
+    EXPECT_FALSE(tracker.votedAt(2, 1)) << "another producer";
+    tracker.onControlMarker(1, 5, true);
+    EXPECT_FALSE(tracker.votedAt(1, 1));
+    tracker.onProduceBatch(1, 10);   // the next transaction reuses the slot
+    EXPECT_FALSE(tracker.votedAt(1, 1)) << "starts unvoted";
+}
+
+TEST(LsoTrackerVoteMarkRegression, MarkSurvivesTheOutOfOrderShift)
+{
+    LsoTracker tracker(4);
+    tracker.onProduceBatch(1, 10);
+    tracker.markVoted(1, 3);
+    tracker.onProduceBatch(2, 5);   // below the newest first offset: pid 1's entry shifts
+    EXPECT_TRUE(tracker.votedAt(1, 3));
+    EXPECT_FALSE(tracker.votedAt(2, 3));
+    EXPECT_EQ(tracker.outOfOrderInserts(), 1u);
+}
+
+TEST(LsoTrackerVoteMarkRegression, MarkSurvivesCompactionAndGrowth)
+{
+    LsoTracker tracker(4);
+    for (int64_t pid : {1, 10, 11, 12}) tracker.onProduceBatch(pid, pid);
+    tracker.markVoted(11, 2);
+    tracker.onControlMarker(10, 100, true);
+    tracker.onControlMarker(12, 101, true);
+    tracker.onProduceBatch(20, 20);   // the ring is full with dead entries before pid 11: compacted in place, pid 11 moves
+    EXPECT_EQ(tracker.growths(), 0u);
+    EXPECT_TRUE(tracker.votedAt(11, 2));
+    EXPECT_FALSE(tracker.votedAt(1, 2));
+    EXPECT_FALSE(tracker.votedAt(20, 2));
+    for (int64_t pid = 30; pid < 36; ++pid) tracker.onProduceBatch(pid, pid);   // all live: the ring doubles
+    EXPECT_GT(tracker.growths(), 0u);
+    EXPECT_TRUE(tracker.votedAt(11, 2));
+    EXPECT_FALSE(tracker.votedAt(30, 2));
+}
+
+TEST(LsoTrackerVoteMarkRegression, InheritedTransactionIsVerifiedAgainUntilItsNextBatch)
+{
+    LsoTracker tracker(4);
+    tracker.onProduceBatch(1, 0);
+    EXPECT_TRUE(tracker.openVerified(1));
+    tracker.markInherited();
+    EXPECT_FALSE(tracker.openVerified(1));
+    EXPECT_FALSE(tracker.openVerified(2)) << "no open transaction";
+    tracker.onProduceBatch(1, 8);   // its next batch, admitted after the verification
+    EXPECT_TRUE(tracker.openVerified(1));
+}

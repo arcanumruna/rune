@@ -63,6 +63,7 @@
 // paths (onTxnBatch, lso, isAborted, ready) never allocate once reserve()d.
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/ControlMarkerLayout.h>
+#include <rune/storage/ControlRecordLayout.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/LogReadView.h>
@@ -463,6 +464,13 @@ public:
         // Unbuilt: nothing — the build starts at LEO > offset and scans it.
     }
 
+    /// Part 11: this partition answers a vote for (producerId, epoch).  An open transaction of the producer takes no more batches until its
+    /// marker; without one, a verification the producer cached is dropped, so a late batch asks the coordinator again.
+    void onVote(int64_t producerId, int16_t epoch) noexcept {
+        if (tracker_.firstOffsetOf(producerId) >= 0) tracker_.markVoted(producerId, epoch);
+        else if (verify_.size() != 0) verify_.erase(producerId);
+    }
+
     // ---- F15-FU1 (#112): transaction-registration verification -------------
     /// The produce gate for a TRANSACTIONAL data batch of (producerId, epoch), Ready
     /// only.  An open transaction of the producer here admits it (it was verified, or
@@ -474,7 +482,7 @@ public:
     [[nodiscard]] TxnAdmission admitTxnBatch(int64_t producerId, int16_t epoch, uint64_t& nextReqId,
                                              bool canRequest = true) noexcept {
         using K = TxnAdmission::Kind;
-        if (tracker_.firstOffsetOf(producerId) >= 0) [[likely]] return {};
+        if (tracker_.openVerified(producerId)) [[likely]] return {};   // a transaction rebuilt from the log is verified again first
         TxnVerifySet::Entry* e = verify_.find(producerId);
         if (e != nullptr && e->epoch == epoch) {
             switch (e->state) {
@@ -876,6 +884,11 @@ private:
                 if (out.outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
                     haltInvariant_("RcBuilder refused a whole batch inside the log's written bytes");
                 if (psm_ != nullptr) feedProducerState_(r, out.outcome, p + pos, len);
+                if (out.outcome == rune::transaction::RcBuilder::Outcome::Ignored && (r.attributes() & rune::protocol::batch::kAttrControl) != 0 &&
+                    r.producerId() < 0) [[unlikely]] {   // a TxnJudge in the log: its open transaction is voted, whether or not the judge takes the record
+                    if (const auto j = rune::storage::control_record::parseTxnJudge(p + pos, len); j && tracker_.firstOffsetOf(j->producerId) == j->firstOffset)
+                        tracker_.markVoted(j->producerId, j->producerEpoch);
+                }
                 if (verdict_.batch != nullptr && out.outcome == rune::transaction::RcBuilder::Outcome::Ignored &&
                     (r.attributes() & rune::protocol::batch::kAttrControl) != 0 && r.producerId() < 0) [[unlikely]]
                     verdict_.batch(verdict_.ctx, p + pos, len, base);
@@ -1022,6 +1035,7 @@ private:
             // The tail lies wholly at or above target: replayed in order (§2.2).
             for (const TailEvent& e : tail_) applyMarker_(e.producerId, e.offset, e.commit);
             tail_.clear();
+            tracker_.markInherited();
             st_ = Ready{cur.epoch, cur.logGen, cur.leadGen};
             if (verdict_.end != nullptr) verdict_.end(verdict_.ctx);
         }
@@ -1032,6 +1046,7 @@ private:
         // keeps the FIFO / range order (§2.2).
         for (const TailEvent& e : tail_) applyMarker_(e.producerId, e.offset, e.commit);
         tail_.clear();
+        tracker_.markInherited();
         st_ = Ready{s.epoch, s.logGen, s.leadGen};
         if (verdict_.end != nullptr) verdict_.end(verdict_.ctx);
     }
