@@ -401,6 +401,22 @@ TEST(CheckedWritesTxnOverlayRegression, ReserveTouchesNoRowRegression) {
     EXPECT_EQ(row[63], 0) << "a put without a base row is zeroes";
 }
 
+// T7 review 5, N3: clear() empties only the index slots its rows took.  An atomic batch clears its overlay twice, and the index is
+// sized for the largest transaction (8 MiB for one aggregate member), so a whole-index clear put that memset on the duty pass.
+TEST(CheckedWritesTxnOverlayRegression, ClearTouchesOnlyTheSlotsItsRowsTookRegression) {
+    TxnOverlay o;
+    o.reserve(std::size_t(1) << 23, 1);   // a 64 MiB index: calloc maps it fresh on every allocator
+    const std::size_t bytes = o.slotsForTest() * sizeof(int32_t);
+    ASSERT_NE(o.put(1, OverlayTable::KeyIndex, ViewKey::fromU64(7), nullptr, 1), nullptr);
+    o.clear();
+    const std::size_t pages = bytes / static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    EXPECT_LT(residentPages(o.indexForTest(), bytes), pages / 4) << "the clear wrote the whole index";
+    EXPECT_FALSE(o.contains(1, OverlayTable::KeyIndex, ViewKey::fromU64(7)));
+    ASSERT_NE(o.put(1, OverlayTable::KeyIndex, ViewKey::fromU64(8), nullptr, 1), nullptr);
+    EXPECT_TRUE(o.contains(1, OverlayTable::KeyIndex, ViewKey::fromU64(8)));
+    EXPECT_FALSE(o.contains(1, OverlayTable::KeyIndex, ViewKey::fromU64(7)));
+}
+
 TEST(CheckedWritesTxnOverlay, ReservedOverlayAllocatesNothing) {
     AggRig r(userMax());
     UniqueRig u;

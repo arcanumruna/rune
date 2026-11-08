@@ -41,12 +41,15 @@ public:
     void erase(uint8_t member, OverlayTable table, const ViewKey& key) noexcept;
     // Scratch row handed out in place of a full put, so a caller that is about to report CapacityExhausted still has memory to write.
     [[nodiscard]] uint8_t* spare() noexcept { return arena_.get() + capacity_ * maxRowLen_; }
-    // The last reserved entry, for residency checks.
+    // The index and the last reserved entry, for residency checks.
+    [[nodiscard]] const int32_t* indexForTest() const noexcept { return index_.get(); }
+    [[nodiscard]] std::size_t slotsForTest() const noexcept { return slots_; }
     [[nodiscard]] const void* lastEntryForTest() const noexcept { return entries_.get() + capacity_; }
 
 private:
     struct Entry {
         ViewKey      key;
+        uint32_t     pos = 0;   // its index slot, which clear() empties
         uint8_t      member = 0;
         OverlayTable table  = OverlayTable::View;
         bool         erased = false;

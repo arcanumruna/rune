@@ -38,8 +38,9 @@ void TxnOverlay::reserve(std::size_t rows, uint32_t maxRowLen) {
     full_ = false;
 }
 
+// O(rows held): the index is sized for the largest transaction, and an atomic batch clears its overlay twice.
 void TxnOverlay::clear() noexcept {
-    std::fill_n(index_.get(), slots_, 0);
+    for (std::size_t s = 0; s < used_; ++s) index_[entries_[s].pos] = 0;
     used_ = 0;
     full_ = false;
 }
@@ -64,7 +65,7 @@ int32_t TxnOverlay::insert(uint8_t member, OverlayTable table, const ViewKey& ke
     std::size_t pos = hashOf(member, table, key) & mask;
     while (index_[pos] != 0) pos = (pos + 1) & mask;
     const auto slot = static_cast<int32_t>(used_++);
-    entries_[static_cast<std::size_t>(slot)] = Entry{key, member, table, false};
+    entries_[static_cast<std::size_t>(slot)] = Entry{key, static_cast<uint32_t>(pos), member, table, false};
     index_[pos] = slot + 1;
     return slot;
 }
