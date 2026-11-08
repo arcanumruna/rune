@@ -256,6 +256,7 @@ struct ViewInstance {
     uint16_t                           nsSlot          = kNoNsSlot;
     uint32_t                           nsId            = 0;
     std::size_t                        memCharged      = 0;
+    bool                               windowKept      = false;   // a drain left dirty capacity kept (WorkerViewSet::releaseWindow_)
 
     // C1 (Task 22 fix round 1): the source replica's leadershipGeneration() this
     // table is caught up under; 0 = never driven by a leader.  A read is served

@@ -253,16 +253,20 @@ public:
     }
     // After a drain: a dirty set grown past twice its reserve is reallocated at the reserve, which follows the index (a grown
     // table's warm start).  Hysteresis: a window that used at least a quarter of the capacity and is at most twice the window
-    // before it is steady churn and keeps it (no allocation per drain).  A window much larger than the one before (a long span's)
-    // or a small one gives it back, so the capacity kept after a push is at most what the steady window justifies.
+    // before it is churn and keeps it (no allocation per drain); a much larger window (a long span's) or a small one gives it back.
+    // A kept capacity is at most about four times the last window, which may itself be long (two long spans in a row, a ramp):
+    // trimQuiet gives it back once the view goes quiet.
     void trimDirty() {
         if (hasDirty() || dirtyBytes() == 0) return;
         const size_t cap = dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity();
         if (4 * window_ >= cap && window_ <= 2 * lastWindow_) return;
-        std::vector<uint32_t>().swap(dirtyList_);
-        std::vector<DeletedEntry>().swap(deleted_);
-        std::vector<uint8_t>().swap(deletedKeyBytes_);
-        reserveDirty_();
+        giveBackDirty_();
+    }
+    // A pass with nothing to drain: a kept capacity is given back, so a view gone quiet carries no charge for its last windows.
+    void trimQuiet() {
+        if (hasDirty()) return;
+        window_ = lastWindow_ = 0;
+        if (dirtyBytes() != 0) giveBackDirty_();
     }
 
     // Calls `emit(rid, row, deleted, key)` once for every row dirtied (an
@@ -565,6 +569,12 @@ private:
     void noteWindow_() noexcept {
         lastWindow_ = window_;
         window_ = dirtyList_.size() * sizeof(uint32_t) + deleted_.size() * sizeof(DeletedEntry) + deletedKeyBytes_.size();
+    }
+    void giveBackDirty_() {
+        std::vector<uint32_t>().swap(dirtyList_);
+        std::vector<DeletedEntry>().swap(deleted_);
+        std::vector<uint8_t>().swap(deletedKeyBytes_);
+        reserveDirty_();
     }
     void reserveDirty_() {
         dirtyList_.reserve(main_.cap);

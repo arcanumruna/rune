@@ -109,6 +109,20 @@ struct SimLog {
         batches.push_back({b.build(), end, n});
         end += n;
     }
+    /// Appends `rounds` rewrites of keys firstKey .. firstKey+n-1 (a tombstone, then the upsert, per key) as ONE batch.
+    void appendRewrites(int64_t firstKey, int n, int rounds) {
+        rune::protocol::RecordBatchBuilder b(end, 0);
+        for (int r = 0; r < rounds; ++r) {
+            for (int i = 0; i < n; ++i) {
+                const auto kb = le(static_cast<uint64_t>(firstKey + i), 8);
+                b.append(sv(kb), {}, 0);
+                const auto vb = character(firstKey + i, static_cast<int32_t>((firstKey + i) * 10));
+                b.append(sv(kb), sv(vb), 0);
+            }
+        }
+        batches.push_back({b.build(), end, 2 * n * rounds});
+        end += 2 * n * rounds;
+    }
     rune::storage::LogReadView read(int64_t from, int64_t /*to*/) const {
         if (from < start) return {};
         for (const B& b : batches)
@@ -469,4 +483,46 @@ TEST(WorkerViewSetRegression, TransientDirtyGrowthIsGivenBackAfterThePassRegress
     ASSERT_NE(inst, nullptr);
     EXPECT_EQ(inst->table.dirtyBytes(), 0u);
     EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes());
+}
+
+// REGRESSION (review 6 I-1): the hysteresis keeps a window's dirty capacity when the window before was at least half its size, so
+// two long spans in a row, or a ramp of at most 2x per window, were kept at their push, and a view gone quiet never drained again:
+// the growth stayed charged for good.  The first caught-up pass gives it back.
+namespace {
+size_t churnThenQuiet(std::initializer_list<int> longWindows, size_t& steady, size_t& kept) {
+    Rig rig(/*limit chunks*/ 0);
+    SimLog log;
+    log.append(1, 2000);
+    rig.driveA(log);
+    const ViewInstance* inst = rig.vs.instanceForTest(kViewA, 0);
+    for (int w = 0; w < 6; ++w) {   // steady churn: one rewrite of every row per window
+        log.appendRewrites(1, 2000, 1);
+        rig.driveA(log);
+    }
+    steady = inst->table.dirtyBytes();
+    for (int rounds : longWindows) {
+        log.appendRewrites(1, 2000, rounds);
+        rig.driveA(log);
+    }
+    kept = inst->table.dirtyBytes();
+    rig.driveA(log);   // quiet: nothing new
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes() + inst->table.dirtyBytes());
+    return inst->table.dirtyBytes();
+}
+}  // namespace
+
+TEST(WorkerViewSetRegression, TwoLongWindowsThenQuietGiveBackTheirChargeRegression) {
+    size_t steady = 0, kept = 0;
+    const size_t quiet = churnThenQuiet({10, 10}, steady, kept);
+    ASSERT_GT(steady, 0u) << "steady churn keeps its dirty set";
+    ASSERT_GT(kept, steady) << "the second long window is kept at its push";
+    EXPECT_LE(quiet, steady) << "the quiet pass gives the long windows' growth back";
+}
+
+TEST(WorkerViewSetRegression, RampThenQuietGivesBackItsChargeRegression) {
+    size_t steady = 0, kept = 0;
+    const size_t quiet = churnThenQuiet({2, 4, 8, 16}, steady, kept);
+    ASSERT_GT(steady, 0u) << "steady churn keeps its dirty set";
+    ASSERT_GT(kept, steady) << "a ramp of at most 2x per window is kept at its push";
+    EXPECT_LE(quiet, steady) << "the quiet pass gives the ramp's growth back";
 }

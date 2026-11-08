@@ -570,8 +570,9 @@ private:
     uint64_t viewPauses_ = 0, viewResumes_ = 0;
 
     // The tables, their dirty sets' growth and a held delta: a long window between checkpoints (P11-9) is view memory too.  A
-    // pushed window gives its growth back (releaseWindow_; ViewTable::trimDirty), so after a long span a view with nothing held
-    // carries no charge past its tables.  Steady churn past the reserve keeps its dirty sets, charged, and allocates nothing.
+    // pushed window gives a long span's growth back (releaseWindow_; ViewTable::trimDirty).  Churn past the reserve keeps its
+    // dirty sets, charged, and allocates nothing; the first quiet pass gives them back (releaseQuiet_), so a view gone quiet
+    // carries no charge past its tables.
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
         std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + (inst.pendingValid ? inst.pendingDelta.capacity() : 0);
         if (inst.owners) m += inst.owners->memoryBytes() + inst.owners->dirtyBytes();
@@ -595,15 +596,30 @@ private:
     }
     /// A window drained (pushed, or discarded by a transient view): the dirty sets give back their growth and the charge follows.
     void releaseWindow_(ViewInstance& inst) {
-        inst.table.trimDirty();
-        if (inst.owners) inst.owners->trimDirty();
-        if (inst.agg) {
-            inst.agg->contributors.trimDirty();
-            inst.agg->groups.trimDirty();
-            if (inst.agg->blocks) inst.agg->blocks->trimDirty();
-            if (inst.agg->groupIds) inst.agg->groupIds->trimDirty();
-        }
+        std::size_t kept = 0;
+        eachDirtySet_(inst, [&kept](rune::view::ViewTable& t) {
+            t.trimDirty();
+            kept += t.dirtyBytes();
+        });
+        inst.windowKept = kept != 0;
         chargeMem_(inst);
+    }
+    /// A caught-up pass after a drain that kept dirty capacity: give it back (ViewTable::trimQuiet) and the charge follows.
+    void releaseQuiet_(ViewInstance& inst) {
+        eachDirtySet_(inst, [](rune::view::ViewTable& t) { t.trimQuiet(); });
+        chargeMem_(inst);
+        inst.windowKept = false;
+    }
+    template <class F>
+    static void eachDirtySet_(ViewInstance& inst, F&& f) {
+        f(inst.table);
+        if (inst.owners) f(*inst.owners);
+        if (inst.agg) {
+            f(inst.agg->contributors);
+            f(inst.agg->groups);
+            if (inst.agg->blocks) f(*inst.agg->blocks);
+            if (inst.agg->groupIds) f(*inst.agg->groupIds);
+        }
     }
     void releaseMem_(ViewInstance& inst) noexcept {
         if (inst.nsSlot == kNoNsSlot || inst.memCharged == 0) return;
@@ -906,7 +922,10 @@ private:
         // 2. Nothing new committed for this partition — caught up (checked before
         //    the capacity event so capacityExceeded_ counts folds that actually
         //    crossed the ceiling, not idle passes).
-        if (inst.foldCursor >= bound) return work;
+        if (inst.foldCursor >= bound) {
+            if (inst.windowKept) releaseQuiet_(inst);
+            return work;
+        }
         // 3. §15 #24: maxRows is an OBSERVABLE capacity-exceeded EVENT, NOT a
         //    fold-stop.  Crossing it increments capacityExceeded_ (the metric) but
         //    MUST NOT refuse the fold or freeze foldCursor — the table grows on
