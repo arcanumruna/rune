@@ -760,3 +760,24 @@ TEST(CheckedWritesAllocRegression, HighChurnDirtyDrainAllocatesNothingRegression
     window(0, 10);
     EXPECT_EQ(t.dirtyBytes(), 0u) << "a small window gives it back";
 }
+
+// Review 5 N-3: a long span's window after steady churn was kept at its push, and a view gone quiet kept it charged for good.
+TEST(CheckedWritesAllocRegression, LongWindowAfterSteadyChurnIsGivenBackRegression) {
+    const rune::view::RowLayout layout = rune::view::buildRowLayout(
+        rune::codec::DescriptorBuilder("v", 1).add("id", rune::codec::PrimType::Int64, 1, true).add("hp", rune::codec::PrimType::Int32).build());
+    rune::view::ViewTable t(layout, 64, layout.rowLen * 256);
+    for (uint64_t k = 0; k < 2000; ++k) (void)t.put(k);
+    const auto window = [&](int rounds) {   // every round rewrites the whole table: a deleted entry per erase
+        for (int r = 0; r < rounds; ++r) {
+            for (uint64_t k = 0; k < 2000; ++k) (void)t.erase(k);
+            for (uint64_t k = 0; k < 2000; ++k) (void)t.put(k);
+        }
+        t.drainDirtyKeyed([](auto&&...) {});
+        t.trimDirty();
+    };
+    for (int w = 0; w < 6; ++w) window(1);
+    const size_t steady = t.dirtyBytes();
+    ASSERT_GT(steady, 0u) << "steady churn keeps its dirty set";
+    window(10);   // the long span's window, pushed; then the view goes quiet
+    EXPECT_LE(t.dirtyBytes(), steady) << "no standing charge past the steady window's";
+}

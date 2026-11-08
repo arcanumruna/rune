@@ -252,19 +252,13 @@ public:
         return b > 2 * dirtyReserved_ ? b - 2 * dirtyReserved_ : 0;
     }
     // After a drain: a dirty set grown past twice its reserve is reallocated at the reserve, which follows the index (a grown
-    // table's warm start).  Hysteresis: the first large window (one that used at least a quarter of the capacity, a long span's) is
-    // given back, a second in a row is steady churn and keeps it (no allocation per drain), and a small window gives a kept
-    // capacity back.  Cold: one allocation after a change of the window's size, none in a steady state.
+    // table's warm start).  Hysteresis: a window that used at least a quarter of the capacity and is at most twice the window
+    // before it is steady churn and keeps it (no allocation per drain).  A window much larger than the one before (a long span's)
+    // or a small one gives it back, so the capacity kept after a push is at most what the steady window justifies.
     void trimDirty() {
-        if (hasDirty()) return;
-        if (dirtyBytes() == 0) {
-            largeWindow_ = false;
-            return;
-        }
+        if (hasDirty() || dirtyBytes() == 0) return;
         const size_t cap = dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity();
-        const bool large = 4 * window_ >= cap;
-        if (large && largeWindow_) return;
-        largeWindow_ = large;
+        if (4 * window_ >= cap && window_ <= 2 * lastWindow_) return;
         std::vector<uint32_t>().swap(dirtyList_);
         std::vector<DeletedEntry>().swap(deleted_);
         std::vector<uint8_t>().swap(deletedKeyBytes_);
@@ -563,12 +557,13 @@ private:
     std::vector<uint32_t> dirtyList_; // rids marked dirty this interval, each pushed once (coalesced)
     size_t                dirtyReserved_ = 0;   // the dirty set's bytes after its reserve (reserveDirty_)
     size_t                window_ = 0;          // the bytes the last drained window used (trimDirty's hysteresis)
-    bool                  largeWindow_ = false; // the last trimDirty gave back a large window's growth
+    size_t                lastWindow_ = 0;      // the bytes the window before it used
 
     struct DeletedEntry { uint32_t rid; uint64_t key; };
     std::vector<DeletedEntry> deleted_; // erase()'d {rid,key} pairs pending drainDirty()
     std::vector<uint8_t> deletedKeyBytes_; // wide tables: keyWidth_ bytes per deleted_ entry, in the same order
     void noteWindow_() noexcept {
+        lastWindow_ = window_;
         window_ = dirtyList_.size() * sizeof(uint32_t) + deleted_.size() * sizeof(DeletedEntry) + deletedKeyBytes_.size();
     }
     void reserveDirty_() {
