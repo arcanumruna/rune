@@ -441,6 +441,9 @@ TEST(LeaseQlRegression, RuleOrderRegression) {
          "autoincrement.max and autoincrement.reserve need autoincrement"},
         {"lease topic t { id uint64 } key id with (autoincrement.reserve = 5);",
          "autoincrement.max and autoincrement.reserve need autoincrement"},
+        // the fixed-width rule is the LAST lease rule: autoincrement.max/.reserve beat it
+        {"lease topic t { id uint64, name string } key id with (autoincrement.max = 10);",
+         "autoincrement.max and autoincrement.reserve need autoincrement"},
         // each rule is a whole pass: a later setting of an EARLIER rule beats an earlier setting of a later rule
         {"lease topic t { id uint64 } key id with (retention.ms = 5, key.index = on);", "a lease topic's key index is its lease view"},
         {"lease topic t { id uint64 } key id with (autoincrement.max = 5, retention.ms = 5);",

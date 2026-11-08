@@ -120,7 +120,8 @@ struct VerdictSourceStats {
              rejectionsKeyExists = 0, rejectionsKeyNotFound = 0, keyIndexRebuilds = 0, keyIndexSkippedMalformed = 0,
              rejectionsLeaseNotFound = 0, rejectionsLeaseLimit = 0,
              leaseRejectedStaleBroker = 0,   // a broker Expire / Checkpoint whose lease moved on (kVerdictStaleBroker)
-             leaseEventOverflows = 0;        // one batch larger than the whole fold-event buffer, judged into an empty one
+             leaseEventOverflows = 0,        // one batch larger than the whole fold-event buffer, judged into an empty one
+             leaseLayoutWaits = 0;           // the judge (or a replay) held at a lease record whose writer layout is not installed yet
     struct PerConstraint { uint32_t constraintId = 0; uint64_t rejections = 0; };
     std::array<PerConstraint, 256> perConstraint{};
     uint16_t perConstraintCount = 0;

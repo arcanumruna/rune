@@ -1126,10 +1126,10 @@ static ViewInstance freshKeyIndex(int32_t srcTopicId, int32_t partition, const T
 
 // A lease topic's index: the same instance, over the lease row layout (one column per evolving field, plus the offsets).
 static ViewInstance freshLeaseIndex(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec, const rune::codec::Descriptor& src,
-                                    rune::view::ViewTableKeys keys) {
+                                    rune::view::ViewTableKeys keys, int64_t replayCap) {
     ViewInstance inst(leaseIndexPlan(srcTopicId, spec.keyFieldId), leaseIndexRowLayout(src), src, /*persist=*/false,
                       partition, /*indexSlots=*/4096, kLeaseIndexChunkBytes, keys);
-    inst.maxRecordsPerPass = kLeaseIndexReplayRecordsPerPass;
+    inst.maxRecordsPerPass = replayCap;
     inst.foldLeadership = kNeverActivated;
     inst.layoutGen = spec.leaseLayoutGen;
     return inst;
@@ -1152,7 +1152,9 @@ void WorkerViewSet::rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, Verd
         }
         releaseMem_(it->second);
         const rune::view::ViewTableKeys keys{spec.keyWidth, 0, hashSeed_, hashMask_};
-        it->second = spec.lease ? freshLeaseIndex(srcTopicId, partition, spec, *src, keys) : freshKeyIndex(srcTopicId, partition, spec, *src, keys);
+        const uint32_t epoch = it->second.rebuildEpoch;
+        it->second = spec.lease ? freshLeaseIndex(srcTopicId, partition, spec, *src, keys, leaseReplayCap_) : freshKeyIndex(srcTopicId, partition, spec, *src, keys);
+        it->second.rebuildEpoch = epoch;   // the activation that follows bumps it
         ++judge.statsMut().keyIndexRebuilds;
     }
     it->second.foldCursor = judge.logStart();
@@ -1188,7 +1190,7 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     if (write.spec->lease) write.leaseEvents.reserveOnce();
     if (write.spec->lease && !judge->hasMember(0, kLeaseIndexPlanFingerprint)) {
         if (const rune::codec::Descriptor* src = keyIndexSource(*write.spec)) {
-            ViewInstance& inst = keyIndexes_.try_emplace(key, freshLeaseIndex(srcTopicId, partition, *write.spec, *src, rune::view::ViewTableKeys{write.spec->keyWidth, 0, hashSeed_, hashMask_})).first->second;
+            ViewInstance& inst = keyIndexes_.try_emplace(key, freshLeaseIndex(srcTopicId, partition, *write.spec, *src, rune::view::ViewTableKeys{write.spec->keyWidth, 0, hashSeed_, hashMask_}, leaseReplayCap_)).first->second;
             if (judge->activated()) inst.foldLeadership = kAdoptedLive;
             judge->addVerdictView(&inst, rune::view::VerdictViewKind::LeaseIndex, 0, kLeaseIndexPlanFingerprint);
         }

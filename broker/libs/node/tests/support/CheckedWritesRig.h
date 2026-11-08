@@ -206,12 +206,12 @@ public:
         return d.build();
     }
     /// A lease topic (spec with max_keys) on the source; returns once the lease index is member 0 of the logged set.
-    void createLeaseTopic(uint32_t maxKeys = 1000) {
+    void createLeaseTopic(uint32_t maxKeys = 1000, std::optional<rune::codec::Descriptor> src = std::nullopt) {
         rune::protocol::LeaseSpec ls;
         ls.maxKeys = maxKeys;
         lease_ = ls;
         keyFieldId_ = 4;
-        useSource(leaseSourceDescriptor(), KeyShape{rune::codec::PrimType::UInt64});
+        useSource(src ? std::move(*src) : leaseSourceDescriptor(), KeyShape{rune::codec::PrimType::UInt64});
         for (int i = 0; i < kMaxPass && !leaseIndexLogged(); ++i) pass();
         ASSERT_TRUE(leaseIndexLogged()) << "the lease index never became the logged set's member";
     }
@@ -231,6 +231,23 @@ public:
         WorkerOp f;
         f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = 2;
         f.schemaUpdateBlob = rune::codec::serialize(*customSrc_);
+        send(std::move(f));
+    }
+    /// One half of a lease topic's schema change, so a test can deliver the two in either order: the SchemaUpdate (the
+    /// descriptor materialized as of `version`) installs the writer version; the FilterSchema (the evolving blob) is what
+    /// moves the lease index's row layout.
+    void leaseSchemaUpdate(const rune::codec::Descriptor& evolving, uint16_t version) {
+        customSrc_ = evolving;
+        WorkerOp v;
+        v.type = WorkerOp::Type::SchemaUpdate; v.topicId = kSrc; v.clientVersion = version;
+        v.schemaUpdateBlob = rune::codec::serialize(rune::codec::materializeAsOf(evolving, version));
+        send(std::move(v));
+    }
+    void leaseFilterSchema(const rune::codec::Descriptor& evolving, uint16_t version) {
+        customSrc_ = evolving;
+        WorkerOp f;
+        f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = version;
+        f.schemaUpdateBlob = rune::codec::serialize(evolving);
         send(std::move(f));
     }
     /// The judges of this rig (created later ones too) do not run: nothing is activated, replayed or judged.

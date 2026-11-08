@@ -76,12 +76,13 @@ struct LRec {
     uint64_t             id;
     uint8_t              attrs;
     std::vector<uint8_t> value;
+    std::size_t          keyLen = 8;   // the wire key's width (a wrong one is malformed)
 };
 LRec grant(uint64_t id, LV v = {}) { v.id = id; return {id, kGrantA, valueOf(v)}; }
 LRec update(uint64_t id, int64_t ver, LV v = {}) { v.id = id; v.ver = ver; return {id, kUpdateA, valueOf(v)}; }
 LRec revoke(uint64_t id, int64_t ver) { LV v; v.id = id; v.ver = ver; return {id, kRevokeA, valueOf(v)}; }
 LRec expire(uint64_t id, int64_t ver) { LV v; v.id = id; v.ver = ver; return {id, kExpireA, valueOf(v)}; }
-LRec checkpoint(uint64_t id, int64_t ver, uint64_t rem) { LV v; v.id = id; v.ver = ver; v.rem = rem; return {id, kCheckptA, valueOf(v)}; }
+LRec checkpoint(uint64_t id, int64_t ver, uint64_t rem, LV v = {}) { v.id = id; v.ver = ver; v.rem = rem; return {id, kCheckptA, valueOf(v)}; }
 
 std::string_view sv(const std::vector<uint8_t>& b) { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
 
@@ -99,8 +100,8 @@ struct Log {
             b.setProducerId(abortedPid);
         }
         for (const LRec& r : recs) {
-            std::vector<uint8_t> k(8);
-            putLe(k, 0, r.id, 8);
+            std::vector<uint8_t> k(r.keyLen);
+            putLe(k, 0, r.id, int(std::min<std::size_t>(8, r.keyLen)));
             b.append(sv(k), sv(r.value), 0, r.attrs);
         }
         push(b.build(), int64_t(recs.size()));
@@ -133,12 +134,15 @@ struct Rig {
     std::unique_ptr<ViewInstance> index;
     ConstraintSet                 set;
 
-    explicit Rig(uint32_t maxKeys = 100, rune::codec::Descriptor ev = evolvingDesc()) : evolving(std::move(ev)) {
+    /// `installedThrough`: the schema versions the spec has installed (0 = all of the evolving descriptor's).
+    explicit Rig(uint32_t maxKeys = 100, rune::codec::Descriptor ev = evolvingDesc(), uint16_t installedThrough = 0) : evolving(std::move(ev)) {
         spec.topicId    = 5;
         spec.keyFieldId = 4;
         spec.keyWidth   = 8;
         spec.lease      = rune::protocol::LeaseSpec{};
         spec.lease->maxKeys = maxKeys;
+        for (uint16_t v = 1; v <= (installedThrough != 0 ? installedThrough : evolving.version); ++v) spec.installVersion(v, rune::codec::materializeAsOf(evolving, v));   // the writers' descriptors come from the spec
+        spec.evolving = evolving;
         st.spec = &spec;
         st.leaseEvents.reserveOnce();
         index = std::make_unique<ViewInstance>(leaseIndexPlan(5, 4), leaseIndexRowLayout(evolving), evolving, false, 0, 4096, kLeaseIndexChunkBytes);
@@ -312,6 +316,17 @@ TEST(LeaseJudgeTableRegression, TableRegression) {
     EXPECT_EQ(r.judgeOne({1, kGrantA, {}}), kInvalid);                                                  // empty value
     EXPECT_EQ(r.index->table.size(), 2u);
 
+    // malformed records are refused (39), never silently accepted: a short value, a key of the wrong width
+    const uint64_t malformed = r.vs.stats().keyIndexSkippedMalformed;
+    EXPECT_EQ(r.judgeOne({9, kGrantA, std::vector<uint8_t>(4 + 31, 0)}), kInvalid);                      // < 4 + 32 bytes
+    EXPECT_EQ(r.judgeOne({9, kGrantA, valueOf({}), 4}), kInvalid);                                       // a 4-byte key on an 8-byte index
+    EXPECT_EQ(r.judgeOne({9, kGrantA, valueOf({}), 9}), kInvalid);                                       // a 9-byte key
+    EXPECT_EQ(r.judgeOne({9, kUpdateA, std::vector<uint8_t>(5, 0)}), kInvalid);
+    EXPECT_EQ(r.vs.stats().keyIndexSkippedMalformed, malformed + 4);
+    EXPECT_EQ(r.row(9), nullptr);
+    EXPECT_EQ(r.index->table.size(), 2u);
+    EXPECT_FALSE(r.vs.stalled());
+
     // revoke / expire with the live version end the lease; a freed slot admits a grant again
     EXPECT_EQ(r.judgeOne(revoke(2, g2 + 1)), kNotFound);
     ASSERT_EQ(r.judgeOne(revoke(2, g2)), 0);
@@ -414,13 +429,12 @@ TEST(LeaseJudgeTableRegression, CapacityVerdictDeterministicRegression) {
 
     // A replay of the log (a rebuild) skips the rejected record: the same rows.
     rune::view::ViewTable table(a.index->layout, 4096, kLeaseIndexChunkBytes);
-    rune::view::VersionDescriptorCache vdc(a.evolving);
     rune::view::Prospect prospect;
     prospect.reserve(a.index->layout, nullptr);
     LeaseIndexFold f{table, a.index->layout, a.evolving, 8};
     const rune::view::FoldSkip skip{.aborted = {}, .rejected = &a.st.rejected};
     int64_t cursor = 0;
-    (void)foldLeaseIndexBatch(f, vdc, prospect, a.log.read(0), a.log.next, cursor, skip);
+    (void)foldLeaseIndexBatch(f, a.spec, prospect, a.log.read(0), a.log.next, cursor, skip);
     EXPECT_EQ(cursor, a.log.next);
     EXPECT_EQ(table.size(), 2u);
     EXPECT_EQ(table.get(uint64_t(3)), nullptr);
@@ -560,4 +574,230 @@ TEST(LeaseJudgeTableRegression, ProjectLeaseRowRegression) {
     std::vector<uint8_t> big = b2;
     big.resize(big.size() + 8, 0);
     EXPECT_EQ(projectLeaseRow(row.data(), layout, ev, ww, sv(big)), rune::view::PrepareStatus::Malformed);
+}
+
+// ═══ Fix round: Pending (the layout is not there yet) ═══
+
+TEST(LeaseJudgeTableRegression, PendingWhenTheLayoutIsMissingRegression) {
+    // The layout is the v1 evolving descriptor (no port); the writer is v2 (has port, field id 6).
+    const rune::codec::Descriptor ev1 = evolvingDesc(1, /*portSince=*/9);   // port is not live at v1: the layout still has its column
+    const rune::codec::Descriptor ev2 = evolvingDesc(2, 2);
+    rune::codec::DescriptorBuilder noPort("inst", 1);
+    noPort.add("lease_version", P::Int64).add("lease_ttl_ms", P::UInt64).add("lease_holder", P::UInt64).add("lease_remaining_ms", P::UInt64)
+        .add("id", P::UInt64, 1, true).addFixedStr("addr", 16);
+    const rune::codec::Descriptor oldLayoutSrc = noPort.build();
+    const rune::view::RowLayout oldLayout = leaseIndexRowLayout(oldLayoutSrc);
+    const rune::codec::Descriptor w2 = rune::codec::materializeAsOf(ev2, 2);
+    LV v; v.schema = 2; v.port = 5;
+    const auto b2 = valueOf(v);
+    std::vector<uint8_t> row(oldLayout.rowLen, 0);
+
+    // a writer holding a field id the layout lacks
+    EXPECT_EQ(projectLeaseRow(row.data(), oldLayout, oldLayoutSrc, w2, sv(b2)), rune::view::PrepareStatus::Pending);
+    // ...and through the prepare: no verdict, no operation
+    rune::view::ViewTable table(oldLayout, 4096, kLeaseIndexChunkBytes);
+    rune::view::Prospect prospect;
+    prospect.reserve(oldLayout, nullptr);
+    const LeaseIndexFold f{table, oldLayout, oldLayoutSrc, 8};
+    std::vector<uint8_t> key(8, 0);
+    key[0] = 1;
+    rune::view::SourceRecord rec{sv(key), sv(b2), 5, rec::intentOf(kGrantA), &w2, kGrantA};
+    EXPECT_EQ(prepareLeaseIndex(f, rec, prospect), rune::view::PrepareStatus::Pending);
+    EXPECT_EQ(prospect.op, rune::view::ProspectOp::None);
+
+    // a null writer descriptor (the version is not installed): Pending, for a long enough value
+    rec.writer = nullptr;
+    EXPECT_EQ(prepareLeaseIndex(f, rec, prospect), rune::view::PrepareStatus::Pending);
+    // ...but a value too short to be a lease record is Malformed whatever the writer
+    const std::vector<uint8_t> shortValue(10, 0);
+    rec.value = sv(shortValue);
+    EXPECT_EQ(prepareLeaseIndex(f, rec, prospect), rune::view::PrepareStatus::Malformed);
+    // a matching writer is Ok
+    const rune::codec::Descriptor w1 = rune::codec::materializeAsOf(oldLayoutSrc, 1);
+    LV v1; v1.schema = 1; v1.withPort = false;
+    const auto b1 = valueOf(v1);
+    rec.value = sv(b1);
+    rec.writer = &w1;
+    EXPECT_EQ(prepareLeaseIndex(f, rec, prospect), rune::view::PrepareStatus::Ok);
+    (void)ev1;
+}
+
+TEST(LeaseJudgeTableRegression, JudgeHoldsOnAnUninstalledVersionRegression) {
+    Rig r(100, evolvingDesc(2, 2), /*installedThrough=*/1);   // the spec knows v1 only
+    r.start();
+    const int64_t before = r.vs.judgedThrough();
+    int64_t g1 = 0;
+    ASSERT_EQ(r.judgeOne(grant(1), &g1), 0) << "a v1 record is judged";
+    LV v2; v2.schema = 2; v2.port = 11;
+    const int64_t pendingAt = r.append({grant(2, v2), grant(3)});
+    EXPECT_EQ(r.vs.judgedThrough(), pendingAt) << "held AT the v2 record: nothing judged, nothing past it";
+    EXPECT_EQ(r.st.rejected.find(pendingAt), nullptr);
+    EXPECT_EQ(r.row(2), nullptr);
+    EXPECT_EQ(r.row(3), nullptr);
+    EXPECT_FALSE(r.vs.stalled());
+    EXPECT_EQ(r.vs.stats().leaseLayoutWaits, 1u);
+    r.drive();
+    r.drive();
+    EXPECT_EQ(r.vs.stats().leaseLayoutWaits, 1u) << "counted once per wait, not once per retry";
+    EXPECT_EQ(r.vs.judgedThrough(), pendingAt);
+    EXPECT_GT(pendingAt, before);
+
+    // the version arrives: the next duty cycle judges the held record and the rest
+    ASSERT_TRUE(r.spec.installVersion(2, rune::codec::materializeAsOf(r.evolving, 2)));
+    r.drive();
+    EXPECT_EQ(r.vs.judgedThrough(), pendingAt + 2);
+    ASSERT_NE(r.row(2), nullptr);
+    EXPECT_EQ(r.col32(2, kPortSlot), 11u);
+    EXPECT_NE(r.row(3), nullptr);
+    EXPECT_TRUE(r.isNull(3, kPortSlot)) << "grant(3) is a v1 record: no port";
+}
+
+TEST(LeaseJudgeTableRegression, ReplayStopsAtAnUninstalledVersionRegression) {
+    Rig r(100, evolvingDesc(2, 2), /*installedThrough=*/1);
+    Log log;
+    log.control();
+    LV v2; v2.schema = 2; v2.port = 11;
+    const int64_t first = log.data({grant(1), grant(2, v2), grant(3)});   // one batch: the stop is mid-batch
+
+    rune::view::ViewTable table(r.index->layout, 4096, kLeaseIndexChunkBytes);
+    rune::view::Prospect prospect;
+    prospect.reserve(r.index->layout, nullptr);
+    LeaseIndexFold f{table, r.index->layout, r.evolving, 8};
+    const rune::view::FoldSkip skip{.aborted = {}, .rejected = &r.st.rejected};
+    int64_t cursor = 0;
+    bool held = false;
+    (void)foldLeaseIndexBatch(f, r.spec, prospect, log.read(0), log.next, cursor, skip, &held);
+    EXPECT_TRUE(held);
+    EXPECT_EQ(cursor, first + 1) << "the fold stops AT the record whose version is not installed";
+    EXPECT_NE(table.get(uint64_t(1)), nullptr);
+    EXPECT_EQ(table.get(uint64_t(2)), nullptr);
+    EXPECT_EQ(table.get(uint64_t(3)), nullptr);
+
+    ASSERT_TRUE(r.spec.installVersion(2, rune::codec::materializeAsOf(r.evolving, 2)));
+    held = false;
+    (void)foldLeaseIndexBatch(f, r.spec, prospect, log.read(cursor), log.next, cursor, skip, &held);
+    EXPECT_FALSE(held);
+    EXPECT_EQ(cursor, log.next);
+    EXPECT_NE(table.get(uint64_t(2)), nullptr);
+    EXPECT_NE(table.get(uint64_t(3)), nullptr);
+}
+
+// ═══ Fix round: replay of a compacted log keeps every live lease ═══
+
+namespace {
+
+struct Replayed {
+    std::unique_ptr<rune::view::ViewTable> table;
+    rune::view::RowLayout                  layout;
+    int64_t                                cursor = 0;
+};
+Replayed replayLog(Rig& r, const Log& log) {
+    Replayed out;
+    out.layout = r.index->layout;
+    out.table = std::make_unique<rune::view::ViewTable>(out.layout, 4096, kLeaseIndexChunkBytes);
+    rune::view::Prospect prospect;
+    prospect.reserve(out.layout, nullptr);
+    LeaseIndexFold f{*out.table, out.layout, r.evolving, 8};
+    const rune::view::FoldSkip skip{.aborted = {}, .rejected = &r.st.rejected};
+    (void)foldLeaseIndexBatch(f, r.spec, prospect, log.read(0), log.next, out.cursor, skip);
+    return out;
+}
+uint64_t colOf(const Replayed& x, uint64_t id, uint16_t slot) {
+    const uint8_t* row = x.table->get(id);
+    uint64_t v = 0;
+    if (row != nullptr) std::memcpy(&v, row + x.layout.slotOffset[slot], 8);
+    return v;
+}
+std::string addrOf(const Replayed& x, uint64_t id) {
+    const uint8_t* row = x.table->get(id);
+    if (row == nullptr) return "<absent>";
+    std::string s(reinterpret_cast<const char*>(row + x.layout.slotOffset[kAddrSlot]), 16);
+    return s.substr(0, s.find('\0'));
+}
+
+}  // namespace
+
+TEST(LeaseJudgeTableRegression, LeaseReplayCompactedLogRegression) {
+    Rig r;
+    constexpr int64_t V = 1;   // the grant's offset, carried by every later record of the lease
+    LV up; up.holder = 8; up.addr = "u4"; up.port = 9; up.ttl = 7000;
+    LV ck; ck.holder = 3; ck.addr = "c3"; ck.port = 2; ck.ttl = 7000;
+
+    // (f) the full, uncompacted log: grant at offset 1, update at 2
+    Log full;
+    full.control();
+    LV gv; gv.ttl = 7000;   // the grant's TTL: an update keeps it, a replay without the grant takes it from the update's image
+    const int64_t g = full.data({grant(1, gv)});
+    ASSERT_EQ(g, V);
+    const int64_t uFull = full.data({update(1, V, up)});
+    const Replayed f = replayLog(r, full);
+    ASSERT_EQ(f.table->size(), 1u);
+
+    // (a) update only: the grant was compacted away (offset 1 is a control batch, the update stays at offset 2)
+    Log a;
+    a.control();
+    a.control();
+    const int64_t uA = a.data({update(1, V, up)});
+    ASSERT_EQ(uA, uFull);
+    const Replayed ra = replayLog(r, a);
+    ASSERT_EQ(ra.table->size(), 1u) << "the lease survives a replay that sees no grant";
+    EXPECT_EQ(int64_t(colOf(ra, 1, 0)), V);
+    EXPECT_EQ(colOf(ra, 1, 1), 7000u);
+    EXPECT_EQ(colOf(ra, 1, 2), 8u);
+    EXPECT_EQ(colOf(ra, 1, 3), 0u);
+    EXPECT_EQ(addrOf(ra, 1), "u4");
+    EXPECT_EQ(uint32_t(colOf(ra, 1, kPortSlot) & 0xFFFFFFFFu), 9u);
+    EXPECT_EQ(int64_t(colOf(ra, 1, kGrantedSlot)), V);
+    EXPECT_EQ(int64_t(colOf(ra, 1, kUpdatedSlot)), uA);
+    // (f) = (a), column by column (the grant's own columns equal the update's where the update replaced them)
+    ASSERT_EQ(std::memcmp(f.table->get(uint64_t(1)), ra.table->get(uint64_t(1)), f.layout.rowLen), 0) << "full log and compacted log agree";
+
+    // (b) Checkpoint(o3), then Update(o4): remaining from the checkpoint, user columns from the update
+    Log b;
+    b.control();
+    b.control();
+    const int64_t cB = b.data({checkpoint(1, V, 555, ck)});
+    const int64_t uB = b.data({update(1, V, up)});
+    const Replayed rb = replayLog(r, b);
+    ASSERT_EQ(rb.table->size(), 1u);
+    EXPECT_EQ(int64_t(colOf(rb, 1, 0)), V);
+    EXPECT_EQ(colOf(rb, 1, 3), 555u);
+    EXPECT_EQ(colOf(rb, 1, 2), 8u);
+    EXPECT_EQ(addrOf(rb, 1), "u4");
+    EXPECT_EQ(int64_t(colOf(rb, 1, kGrantedSlot)), V);
+    EXPECT_EQ(int64_t(colOf(rb, 1, kUpdatedSlot)), uB);
+    (void)cB;
+
+    // (c) Update(o2), then Checkpoint(o3): the same values (the checkpoint changes only remaining and updated)
+    Log c;
+    c.control();
+    c.control();
+    c.data({update(1, V, up)});
+    const int64_t cC = c.data({checkpoint(1, V, 555, ck)});
+    const Replayed rc = replayLog(r, c);
+    ASSERT_EQ(rc.table->size(), 1u);
+    for (const uint16_t s : {0, 1, 2, 3, 4, 5, 6, 7}) EXPECT_EQ(colOf(rc, 1, s), colOf(rb, 1, s)) << "slot " << s;
+    EXPECT_EQ(int64_t(colOf(rc, 1, kUpdatedSlot)), cC);
+
+    // (d) a Checkpoint alone: the row, with the remaining
+    Log d;
+    d.control();
+    d.control();
+    const int64_t cD = d.data({checkpoint(1, V, 555, ck)});
+    const Replayed rd = replayLog(r, d);
+    ASSERT_EQ(rd.table->size(), 1u);
+    EXPECT_EQ(int64_t(colOf(rd, 1, 0)), V);
+    EXPECT_EQ(colOf(rd, 1, 3), 555u);
+    EXPECT_EQ(colOf(rd, 1, 2), 3u);
+    EXPECT_EQ(addrOf(rd, 1), "c3");
+    EXPECT_EQ(int64_t(colOf(rd, 1, kGrantedSlot)), V);
+    EXPECT_EQ(int64_t(colOf(rd, 1, kUpdatedSlot)), cD);
+
+    // (e) update, then Revoke: no row
+    Log e;
+    e.control();
+    e.control();
+    e.data({update(1, V, up)});
+    e.data({revoke(1, V)});
+    EXPECT_EQ(replayLog(r, e).table->size(), 0u);
 }

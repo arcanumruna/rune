@@ -179,7 +179,10 @@ public:
     int32_t               partitionCount = 0;
     std::optional<rune::protocol::LeaseSpec> lease;   ///< a lease topic's spec (set by setFacts)
     /// A lease topic: bumped when the evolving descriptor gains a field id (an AddField), so the lease index, whose row
-    /// layout has one column per evolving field, is rebuilt from the log (WorkerViewSet::rebuildKeyIndex_).
+    /// layout has one column per evolving field, is rebuilt from the log (WorkerViewSet::rebuildKeyIndex_).  That is
+    /// sufficient: a Drop or a Rename keeps every field id in the layout (a dropped column just projects null), and the
+    /// judge and the replay take each record's writer from this spec (leaseWriterOf), holding (PrepareStatus::Pending)
+    /// while a version or a field id of the layout is not there yet, never accepting a record they cannot apply.
     uint32_t              leaseLayoutGen = 0;
     /// The topic's evolving descriptor (every field ever declared), from the FilterSchema op; the key index decodes each writer version through it.
     std::optional<rune::codec::Descriptor> evolving;

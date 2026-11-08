@@ -28,7 +28,9 @@ struct SourceRecord {
     uint8_t                        attributes = 0;        // the record's full attributes byte (lease topics: the lease op, bits 2-3)
 };
 
-enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted };
+// Pending: the record cannot be prepared YET (a lease record whose writer layout the worker has not installed): the caller
+// holds at this record and retries on the next duty cycle; it is neither accepted nor rejected.
+enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted, Pending };
 enum class ProspectOp : uint8_t { None, Upsert, Erase, Move };
 
 // Touched aggregate rows of one prepared record, in fixed slots (never allocates after reserve).

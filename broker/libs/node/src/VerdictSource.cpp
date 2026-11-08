@@ -272,7 +272,10 @@ void VerdictSource::activate_(PartitionWriteState& state) {
     // A lease index may have been rebuilt with another row layout (a new column) since the prospect was reserved; its rows
     // change ids with the rebuild, so the events of the old table are void.
     for (Member& m : members_)
-        if (m.kind == rune::view::VerdictViewKind::LeaseIndex) m.prospect.reserve(m.inst->layout, nullptr);
+        if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
+            m.prospect.reserve(m.inst->layout, nullptr);
+            ++m.inst->rebuildEpoch;
+        }
     state.leaseEvents.buf.clear();
     activeSet_ = *state.constraintSets.setAt(judgeCursor_);
     setFrom_   = judgeCursor_;
@@ -289,6 +292,16 @@ void VerdictSource::stall_(StallReason reason) noexcept {
     stallReason_ = reason;
     spdlog::error("verdict judge stalled: topic {} partition {}: {}", srcTopicId_, partition_,
                   reason == StallReason::Full ? "rejected index full" : reason == StallReason::OutOfOrder ? "rejection out of order" : "view capacity exhausted");
+}
+
+// Cold (once per wait): the judge or a replay holds at a lease record whose writer layout is not installed on this worker yet.
+void VerdictSource::noteLayoutWait_(int64_t offset, uint16_t version) noexcept {
+    if (layoutWaiting_) return;
+    layoutWaiting_ = true;
+    ++stats_.leaseLayoutWaits;
+    spdlog::warn("lease index waits for a schema layout: topic {} partition {}: the record at offset {} is written at version {}, which is "
+                 "not installed (or has a field the index layout lacks); held until it is",
+                 srcTopicId_, partition_, offset, version);
 }
 
 void VerdictSource::waitForInstall_() noexcept {
@@ -317,8 +330,10 @@ rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::S
         return prepareKeyIndex(f, rec, m.prospect);
     }
     if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
+        // The writer is the spec's descriptor of the record's version (the one the produce hook validated against), never the
+        // instance's own evolving copy: that lags the spec after a Drop and when the schema ops arrive in either order.
         rune::view::SourceRecord r = rec;
-        if (r.writer == nullptr && !r.value.empty()) r.writer = &i.vdc.materializedFor(writerVersionOf(r.value, i.vdc.defaultVersion()));
+        r.writer = state_ != nullptr && state_->spec != nullptr ? leaseWriterOf(*state_->spec, r.value) : nullptr;
         const LeaseIndexFold f{i.table, i.layout, i.evolvingSrc, m.keyWidth};
         return prepareLeaseIndex(f, r, m.prospect);
     }
@@ -370,7 +385,10 @@ Verdict VerdictSource::verdictOf_(const Member& m, const rune::view::SourceRecor
     if (m.kind == rune::view::VerdictViewKind::KeyIndex) return evaluateIntent(rec, m.prospect);
     if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
         using rune::protocol::client::ErrorCode;
-        if (m.prospect.op == rune::view::ProspectOp::None) return {};   // malformed: ignored, as the key index does
+        // A malformed lease record (a wrong key width, a value shorter than the system columns, a projection that does not fit)
+        // is refused, never accepted without an apply: an accepted record the index never saw would let a second grant through.
+        // The replay skips rejected offsets, so the log stays deterministic.
+        if (m.prospect.op == rune::view::ProspectOp::None) return {static_cast<uint16_t>(ErrorCode::InvalidRequest), 0};
         if (rec.value.empty()) return {static_cast<uint16_t>(ErrorCode::InvalidRequest), 0};   // a lease record carries its full row
         const ViewInstance& i = *m.inst;
         const uint8_t* row = i.table.get(m.prospect.rows[0].key);
@@ -401,8 +419,13 @@ Verdict VerdictSource::verdictOf_(const Member& m, const rune::view::SourceRecor
 Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
     ++judgeCalls_;
     for (const std::size_t i : active_) {
-        if (prepare_(members_[i], rec) == rune::view::PrepareStatus::CapacityExhausted) {
+        const rune::view::PrepareStatus ps = prepare_(members_[i], rec);
+        if (ps == rune::view::PrepareStatus::CapacityExhausted) {
             stall_(StallReason::Capacity);
+            return {};
+        }
+        if (ps == rune::view::PrepareStatus::Pending) {   // the record's layout is not installed yet: no verdict, the caller holds
+            layoutPending_ = true;
             return {};
         }
     }
@@ -434,6 +457,8 @@ Verdict VerdictSource::judge(const rune::view::SourceRecord& rec) noexcept {
             }
         }
         else ++stats_.rejectionsConstraint;
+        if (members_[i].kind == rune::view::VerdictViewKind::LeaseIndex && members_[i].prospect.op == rune::view::ProspectOp::None)
+            stats_.keyIndexSkippedMalformed += members_[i].prospect.stats.skippedMalformed;
         ++rejectedThisPass_;
         // 56 and 57 file under constraintId 0 here; rejectionsKeyExists / rejectionsKeyNotFound tell them apart.
         auto* pc = std::find_if(stats_.perConstraint.begin(), stats_.perConstraint.begin() + stats_.perConstraintCount,
@@ -471,8 +496,11 @@ int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, in
     }
     if (m.kind == rune::view::VerdictViewKind::LeaseIndex) {
         LeaseIndexFold f{inst.table, inst.layout, inst.evolvingSrc, m.keyWidth};
-        const rune::view::FoldStats st = foldLeaseIndexBatch(f, inst.vdc, m.prospect, view, bound, cursor, skip);
+        bool held = false;
+        const rune::view::FoldStats st = foldLeaseIndexBatch(f, *state_->spec, m.prospect, view, bound, cursor, skip, &held);
         inst.foldCursor = cursor;
+        if (held) noteLayoutWait_(cursor, 0);   // the replay stops AT the record; the next duty cycle retries
+        else layoutWaiting_ = false;
         inst.counters.skippedAborted += st.skippedAborted;
         discardKeyIndexDirty_(inst);
         return static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedAborted + st.skippedMalformed + st.skippedRejected);
@@ -530,21 +558,31 @@ int VerdictSource::judgeBatches_(const rune::storage::LogReadView& view, int64_t
             if (held == 0 && records > kLeaseFoldEventCap) ++stats_.leaseEventOverflows;
         }
         judgeCursor_ = std::max(judgeCursor_, r.baseOffset());
-        bool halt = false;
+        bool halt = false, hold = false;
         const bool walked = rune::protocol::forEachRecordSpan(view.data + pos, view.len - pos, [&](const rune::protocol::RecordSpan& span) {
-            if (halt || stalled_) return;
+            if (halt || hold || stalled_) return;
             if (span.offset >= limit) { halt = true; return; }
             if (span.offset < judgeCursor_) return;
             rune::view::SourceRecord rec{span.key, span.value, span.offset, rune::protocol::record::intentOf(span.attributes), nullptr, span.attributes};
-            if (!span.value.empty()) rec.writer = &first.vdc.materializedFor(writerVersionOf(span.value, first.vdc.defaultVersion()));
+            if (!span.value.empty())
+                rec.writer = leaseSource ? leaseWriterOf(*state_->spec, span.value)
+                                         : &first.vdc.materializedFor(writerVersionOf(span.value, first.vdc.defaultVersion()));
             lastIntent_ = rec.intent;
+            layoutPending_ = false;
             const Verdict v = judge(rec);
+            if (layoutPending_) {   // hold AT this record: no verdict, no advance (like back-pressure); the next duty cycle retries
+                hold = true;
+                noteLayoutWait_(span.offset, writerVersionOf(span.value, 0));
+                return;
+            }
+            layoutWaiting_ = false;
             if (stalled_) return;
             if (keyZero && !v.accepted()) [[unlikely]] noteKeyZeroRejection_(v, rec);
             judgeCursor_ = span.offset + 1;
             judgedRecord_ = true;
             ++work;
         });
+        if (hold) break;   // judgeCursor_ is the held record's offset
         if (!walked && !halt && !stalled_) break;   // a record that does not fit its batch: stop, never advance past it
         if (stalled_) break;
         judgeCursor_ = halt ? limit : std::max(judgeCursor_, last + 1);

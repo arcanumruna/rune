@@ -43,6 +43,7 @@
 
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/node/VerdictSource.h>
+#include <rune/node/lease/LeaseIndex.h>
 #include <rune/node/ViewInstance.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/NsSlotTable.h>
@@ -402,6 +403,28 @@ public:
         std::memcpy(&v, row + it->second.layout.slotOffset[slot], std::min<std::size_t>(8, it->second.layout.slotWidth[slot]));
         return v;
     }
+    /// Test seam: the records one replay pass of a lease index covers (applies to indexes built after the call).
+    void setLeaseReplayCapForTest(int64_t records) noexcept { leaseReplayCap_ = records; }
+    /// A lease index's rebuild epoch (see ViewInstance::rebuildEpoch); 0: none.
+    [[nodiscard]] uint32_t leaseRebuildEpoch(int32_t src, int32_t partition) const noexcept {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        return it == keyIndexes_.end() ? 0 : it->second.rebuildEpoch;
+    }
+    /// True when the lease index of (src, partition) reflects every judged record of the CURRENT leadership: its judge is
+    /// activated, the index was built under this leadership and the current row layout, and it has folded through the judge's
+    /// cursor (a replay bounded by maxRecordsPerPass is still behind).  The wheels (Task 9) arm only from a ready index.
+    [[nodiscard]] bool leaseIndexReady(int32_t src, int32_t partition) const noexcept {
+        const uint64_t key = instKey(src, partition);
+        const auto kit = keyIndexes_.find(key);
+        const auto vit = verdictSources_.find(key);
+        if (kit == keyIndexes_.end() || vit == verdictSources_.end()) return false;
+        const VerdictSource& judge = *vit->second;
+        const PartitionWriteState* w = judge.boundState();
+        if (w == nullptr || w->spec == nullptr || !w->spec->lease) return false;
+        const ViewInstance& inst = kit->second;
+        return judge.activated() && inst.foldLeadership == judge.leadershipGeneration() &&
+               inst.layoutGen == w->spec->leaseLayoutGen && inst.foldCursor >= judge.judgedThrough();
+    }
     /// -1: the partition has no key index.
     [[nodiscard]] int64_t keyIndexFoldCursorForTest(int32_t src, int32_t partition) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
@@ -678,6 +701,7 @@ private:
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
     int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
     void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
+    int64_t leaseReplayCap_ = kLeaseIndexReplayRecordsPerPass;   // the records one replay pass of a lease index covers
     [[nodiscard]] bool leaseLayoutStale_(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec) const noexcept {
         const auto it = keyIndexes_.find(instKey(srcTopicId, partition));
         return it != keyIndexes_.end() && it->second.layoutGen != spec.leaseLayoutGen;

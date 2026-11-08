@@ -12,6 +12,7 @@
 // ViewTable's chunk growth).  A lease record's value is [u16 blockLength][u16 version][fixed block]; the fixed block
 // starts with the four u64 system columns (rune::protocol::record::kLease*ValueOffset).
 #include <rune/codec/Descriptor.h>
+#include <rune/node/WriteState.h>
 #include <rune/node/lease/LeaseFoldEvents.h>
 #include <rune/protocol/LeaseRecord.h>
 #include <rune/storage/LogReadView.h>
@@ -52,6 +53,15 @@ inline constexpr std::string_view kLeaseUpdatedOffsetColumn = "lease_updated_off
 /// keyIndexPlan's twin: name __lease_index, no view topic, 64 KiB chunks.  Cold.
 [[nodiscard]] rune::view::CompiledViewPlan leaseIndexPlan(int32_t srcTopicId, uint16_t keyFieldId);
 
+/// The writer descriptor of a lease record, from the TOPIC'S SPEC: the materialized descriptor the produce hook validated the
+/// record against (system columns at ids 0..3, the evolving field ids).  The lease index's own copy of the evolving descriptor
+/// is never the source: it lags the spec after a Drop, and when SchemaUpdate and FilterSchema arrive in either order.  nullptr
+/// while that version is not installed on this worker (the caller holds, see PrepareStatus::Pending).
+[[nodiscard]] inline const rune::codec::Descriptor* leaseWriterOf(const TopicWriteSpec& spec, std::string_view value) noexcept {
+    if (value.size() < 4) return nullptr;
+    return spec.descriptorFor(static_cast<uint16_t>(static_cast<uint8_t>(value[2]) | (static_cast<uint8_t>(value[3]) << 8)));
+}
+
 /// Projects a record value into a row image: each out slot whose field id is live in `writer` gets the field's bytes
 /// (a raw copy of the value's fixed block at `4 + writer offset`, no FieldValue decode) and a clear null bit; every other
 /// slot is null.  The offset columns stay zero.  `outDesc` is the out descriptor or the evolving one: only its first
@@ -85,20 +95,25 @@ struct LeaseIndexFold {
     uint8_t                           keyWidth = 0;
 };
 
-/// Prepares one record: the key (width checked), whether its row exists, and for a Put the projected row image in
-/// `p.scratch`.  `rec.writer` must be resolved for a non-empty value.  An empty value is prepared as an Upsert (the judge
-/// answers InvalidRequest).  Malformed: a wrong key width, a value shorter than the system columns, or a projection that
-/// does not fit; the prospect then holds no operation.
+/// Prepares one record: the key (width checked), whether its row exists, and for a Put or Checkpoint the projected row image
+/// in `p.scratch`.  `rec.writer` is the spec's descriptor of the record's version (leaseWriterOf).  An empty value is
+/// prepared as an Upsert (the judge answers InvalidRequest).  Malformed: a wrong key width, a value shorter than the system
+/// columns, or a projection that does not fit; the prospect then holds no operation and the judge answers InvalidRequest.
+/// Pending: the writer descriptor is not installed (null) or has a field id the layout lacks; nothing is judged.
 [[nodiscard]] rune::view::PrepareStatus prepareLeaseIndex(const LeaseIndexFold& f, const rune::view::SourceRecord& rec, rune::view::Prospect& p) noexcept;
 
 /// Applies one ACCEPTED record (the prospect `p` was prepared for it).  Fills `ev` and returns true when the record
-/// changed a row; false for a record that does not apply (a replay of a log that disagrees with the table).
+/// changed a row; false for a record that does not apply (a replay of a log that disagrees with the table).  Every accepted
+/// Put and Checkpoint carries the full row (spec 6.4), so an update or checkpoint whose row is ABSENT creates it from the
+/// image: after compaction kept only the latest record of a key, a replay sees no grant.  The live judge never reaches that
+/// branch (it refuses an update or checkpoint of an absent key).
 bool applyLeaseRecord(LeaseIndexFold& f, const rune::view::SourceRecord& rec, const rune::view::Prospect& p, LeaseEvent& ev) noexcept;
 
 /// foldBatch's contract (batch, bound, cursor, corrupt tail) over the accepted records of a lease partition: nothing is
-/// judged and no event is pushed.  `scratch` is the prospect's (2 * rowLen).
-rune::view::FoldStats foldLeaseIndexBatch(LeaseIndexFold& f, rune::view::VersionDescriptorCache& vdc, rune::view::Prospect& prospect,
+/// judged and no event is pushed.  Writers come from `spec`.  A record whose layout is not there yet (Pending) stops the fold
+/// AT that record (cursor = its offset, `*held` set); the caller retries.  `scratch` is the prospect's (2 * rowLen).
+rune::view::FoldStats foldLeaseIndexBatch(LeaseIndexFold& f, const TopicWriteSpec& spec, rune::view::Prospect& prospect,
                                           const rune::storage::LogReadView& view, int64_t bound, int64_t& cursor,
-                                          const rune::view::FoldSkip& skip) noexcept;
+                                          const rune::view::FoldSkip& skip, bool* held = nullptr) noexcept;
 
 }  // namespace rune::node

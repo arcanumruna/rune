@@ -255,6 +255,9 @@ struct ViewInstance {
     // A lease index: the TopicWriteSpec::leaseLayoutGen its row layout was built under.  A newer one means the evolving
     // descriptor gained a column, so the index is rebuilt (WorkerViewSet::rebuildKeyIndex_).
     uint32_t                           layoutGen       = 0;
+    // A lease index: bumped by every activation of its judge (the lease events are cleared and the rows may have been rebuilt,
+    // so row ids changed).  Carried over a rebuild.  The wheels (Task 9) re-arm from the table when it changes.
+    uint32_t                           rebuildEpoch    = 0;
 
     // Cumulative fold-anomaly counters (see ViewFoldCounters).
     ViewFoldCounters                   counters;

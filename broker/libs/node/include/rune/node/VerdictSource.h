@@ -101,6 +101,8 @@ public:
     /// A leadership has activated this judge and no new one is pending: what it folds now belongs to that leadership.
     [[nodiscard]] bool activated() const noexcept { return generation_ != kUnbound && !needsActivation_; }
     [[nodiscard]] int64_t logStart() const noexcept { return logStart_; }
+    /// The leadership generation this judge is bound to (kUnbound-equivalent ~0 until bindLeader).
+    [[nodiscard]] uint64_t leadershipGeneration() const noexcept { return generation_; }
     /// Cold: activate again under the same leadership (bindLeader's new-generation path, without a new generation): a lease
     /// index whose row layout changed is rebuilt by the owner, then replayed from the log by the activation.
     void requestReactivation() noexcept { needsActivation_ = true; }
@@ -159,6 +161,7 @@ private:
     enum class StallReason : uint8_t { None, Full, OutOfOrder, Capacity };
     void   stall_(StallReason reason) noexcept;
     void   waitForInstall_() noexcept;
+    void   noteLayoutWait_(int64_t offset, uint16_t version) noexcept;
     int64_t extendOverEmptySets_(int64_t offset) const noexcept;
     rune::view::PrepareStatus prepare_(Member& m, const rune::view::SourceRecord& rec) noexcept;
     /// P6-13: a rejected record of a key-0 batch burns its id; a KeyExists on one is a reused id (counted and logged).
@@ -190,6 +193,8 @@ private:
     int64_t                     logStart_ = 0;
     bool                        needsActivation_ = false;
     bool                        stalled_ = false, waitingForInstall_ = false, held_ = false;
+    bool                        layoutPending_ = false;   // judge(): the record's lease layout is not installed (no verdict was given)
+    bool                        layoutWaiting_ = false;   // a layout wait is in progress (counted and logged once)
     StallReason                 stallReason_ = StallReason::None;
     int64_t                     judgeCursor_ = 0, emitFrom_ = 0, setFrom_ = 0;
     int64_t                     checkpointCap_ = INT64_MAX;

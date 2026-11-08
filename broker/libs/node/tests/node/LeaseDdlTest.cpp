@@ -531,6 +531,9 @@ TEST(LeaseDdlRegression, RuleOrderRegression) {
          [](CatalogDdlRig&, DefineTopicMsg& m) {
              m.blob = blobOf(PrimType::UInt64, 0, "id", {"lease_x"}); m.keyFeatures.autoIncrement = true;
          }},
+        // the fixed-width rule is the LAST lease rule (QL's order): autoincrement.max/.reserve beat it
+        {"AutoIncMaxBeforeFixedWidth", 6, kInvalidRequest, "autoincrement.max and autoincrement.reserve need autoincrement",
+         [](CatalogDdlRig&, DefineTopicMsg& m) { m.blob = varLenBlob(PrimType::String); m.keyFeatures.autoIncrementMax = 10; }},
         {"KeyWidthBeforeLevel", 5, kInvalidSchema,
          "key field 'id' is string(129): a lease topic key is an integer or string(N) with N <= 128",
          [](CatalogDdlRig&, DefineTopicMsg& m) { m.blob = blobOf(PrimType::FixedStr, 129); }},

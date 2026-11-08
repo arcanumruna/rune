@@ -1475,11 +1475,12 @@ std::optional<DdlRejection> leaseDefineRefusal(const DefineTopicMsg& m, const ru
         return reject(kInvalidRequest, "a lease topic is compacted and keeps every live lease");
     for (const auto& f : d->fields)
         if (f.name.starts_with("lease_")) return reject(kInvalidRequest, "lease_ field names are reserved");
-    for (const auto& f : d->fields)
-        if (rune::codec::isVarLen(f.type)) return reject(kInvalidSchema, leaseFixedWidthDetail(f.name, f.type));
     // Any other key feature (autoincrement.max / .reserve without autoincrement) is the non-lease answer.
     if (m.keyFeatures != rp::TopicKeyFeatures{})
         return reject(kInvalidRequest, "autoincrement.max and autoincrement.reserve need autoincrement");
+    // The last lease rule, as in QL's parser.
+    for (const auto& f : d->fields)
+        if (rune::codec::isVarLen(f.type)) return reject(kInvalidSchema, leaseFixedWidthDetail(f.name, f.type));
     return std::nullopt;
 }
 
