@@ -10,6 +10,10 @@
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/TransactionCoordinationService.h>
+#include <rune/protocol/client/TxnMessages.h>
+#include <rune/storage/Log.h>
+#include <rune/transaction/ReplicatedTxnStateStore.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
@@ -568,4 +572,86 @@ TEST(CheckedWritesTxnVoteRoutingRegression, PurgeDropsVotesOfOlderCoordinatorEpo
     C.runWorker(2);   // the purged local vote's answer is dropped too
     EXPECT_TRUE(C.got.empty()) << "a purged vote produces no result";
     EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u);
+}
+
+// The coordinator's load and unload purge the gateway's votes.  A store-backed coordinator behind the real gateway: an
+// unload and reload at the SAME coordinator epoch (a lost coordinator check) must not let the old load's vote count
+// for the retried commit, and a vote of an older epoch is dropped by the load.
+TEST(CheckedWritesTxnVoteRoutingRegression, LoadAndUnloadPurgeTheGatewaysVotesRegression) {
+    namespace pc = rune::protocol::client;
+    VoteRig R;
+    VoteTmpDir logDir;
+    rune::storage::Log txnLog(logDir.path.string());
+    PartitionConfig c; c.topicId = 0; c.partitionId = 0; c.selfId = 1; c.minIsr = 1; c.durabilityTier = 1;
+    c.fetchIntervalNs = 1'000'000LL; c.isrCheckIntervalNs = 1'000'000LL; c.pushOnAppend = false; c.replicaLagMaxMs = 1'000'000;
+    PartitionReplica txnReplica(c, Role::Leader, 1, std::vector<NodeId>{1}, std::vector<NodeId>{1}, &txnLog, &R.t);
+    rune::transaction::ReplicatedTxnStateStore store(&txnReplica);
+    bool leader = true;
+    rune::node::TransactionCoordinationService tcs(&store, &R.topics, [&] { return leader; }, [] { return NodeId{1}; });
+    tcs.setGateway(&R.gw);
+    tcs.setVoteCandidateFn([](int32_t topicId) { return topicId == 0; });
+    R.gw.setTxnVoteSink([](void* self, int32_t t, int32_t p, int64_t pid, int16_t ep, int32_t ce, const TxnVoteResult& r) noexcept {
+        static_cast<rune::node::TransactionCoordinationService*>(self)->onTxnVoteResult(t, p, pid, ep, ce, r);
+    }, &tcs);
+    std::vector<std::vector<uint8_t>> frames;
+    R.gw.setOnControlFrame([&](int64_t, const uint8_t* f, std::size_t n) { frames.emplace_back(f, f + n); });
+
+    int64_t now = 1'000'000'000;
+    const auto step = [&] { now += 1'000'000; txnReplica.doWork(now); (void)tcs.doWork(now); };
+    for (int i = 0; i < 20 && !tcs.isLoaded(); ++i) step();
+    ASSERT_TRUE(tcs.isLoaded());
+    rune::coordination::NsRequestContext ctx{};
+    std::array<uint8_t, 1024> req{}, out{};
+    const std::string txn = "tx";
+    const std::span<const uint8_t> txnBytes(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
+    pc::InitProducerId init;
+    init.sessionId = 1; init.correlationId = 1; init.transactionTimeoutMs = 600'000; init.transactionalId = txnBytes;
+    const std::size_t initN = tcs.handleInitProducerId(req.data(), init.encode(req.data()), now, out.data(), out.size(), ctx);
+    step(); step();
+    ASSERT_TRUE(initN != 0 || !frames.empty());
+    const auto ip = initN != 0 ? pc::InitProducerIdResponse::decode(out.data(), initN)
+                               : pc::InitProducerIdResponse::decode(frames.back().data(), frames.back().size());
+    ASSERT_TRUE(ip && ip->errorCode == 0);
+    const int64_t pid = ip->producerId;
+    const int16_t ep = ip->producerEpoch;
+    const std::vector<pc::TxnTopicPartition> parts = {{0, 0}};
+    pc::AddPartitionsToTxn add;
+    add.sessionId = 1; add.correlationId = 2; add.producerId = pid; add.producerEpoch = ep; add.transactionalId = txnBytes;
+    (void)tcs.handleAddPartitions(req.data(), add.encode(req.data(), parts), now, out.data(), out.size(), ctx);
+    step(); step();
+    pc::EndTxn end;
+    end.sessionId = 1; end.correlationId = 3; end.producerId = pid; end.producerEpoch = ep; end.commit = 1; end.transactionalId = txnBytes;
+    ASSERT_EQ(tcs.handleEndTxn(req.data(), end.encode(req.data()), now, out.data(), out.size(), ctx), 0u);
+    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
+    const int64_t oldToken = R.gw.lastVoteTokenForTest();
+    const int32_t epochBefore = tcs.coordinatorEpoch();
+
+    leader = false;   // the coordinator check is lost: unload
+    step();
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u) << "the unload purges the gateway's votes of this load";
+    // A vote of an older coordinator epoch is still out while unloaded: the next load drops it.
+    ASSERT_GE(R.gw.sendTxnVote(0, 0, pid + 1, ep, epochBefore - 1), 0);
+    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
+    leader = true;
+    step(); step();
+    ASSERT_TRUE(tcs.isLoaded());
+    ASSERT_EQ(tcs.coordinatorEpoch(), epochBefore) << "a reload at the same epoch";
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u) << "the load purges the older epochs' votes";
+    ASSERT_EQ(tcs.txnStateForTest("tx"), rune::transaction::TxnState::Ongoing);
+
+    end.correlationId = 4;   // the client's retry asks every partition again
+    ASSERT_EQ(tcs.handleEndTxn(req.data(), end.encode(req.data()), now, out.data(), out.size(), ctx), 0u);
+    ASSERT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
+    WorkerReturn late;   // the old load's vote answers a no
+    late.type = WorkerReturn::Type::TxnVoteResult;
+    late.correlationId = oldToken;
+    late.sessionId = -1;
+    late.recordCount = 55;
+    late.newNextOffset = 0x00070000;
+    late.baseOffset = 123;
+    R.gw.handleWorkerReturnForTest(late);
+    step();
+    EXPECT_EQ(tcs.txnStateForTest("tx"), rune::transaction::TxnState::Ongoing) << "the old load's answer does not count for the retried gate";
+    EXPECT_EQ(tcs.voteGatesForTest(), 1u);
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 1u);
 }

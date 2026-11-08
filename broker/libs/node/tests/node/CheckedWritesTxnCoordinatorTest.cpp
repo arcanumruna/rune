@@ -864,21 +864,57 @@ TEST_F(CheckedWritesTxnCoordinatorRegression, RememberedNoBelowVersionSeventeenH
 
 TEST_F(CheckedWritesTxnCoordinatorRegression, RememberedNoOfANamespaceIsForgottenWithItRegression) {
     ctx_.sessionNsId = kNs;
-    int16_t ep = 0;
-    const int64_t pid = beginTxn({{kCwNs, 0}}, ep);
-    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
-    rune::gateway::TxnVoteResult no;
+    int16_t epA = 0;
+    const int64_t pidA = beginTxn({{kCwNs, 0}}, epA, "a");
+    ASSERT_EQ(endTxn("a", pidA, epA, true), 0u);
+    rune::gateway::TxnVoteResult yes, no;
     no.code = static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation);
-    svc_->onTxnVoteResult(kCwNs, 0, pid, ep, svc_->coordinatorEpoch(), no);
+    svc_->onTxnVoteResult(kCwNs, 0, pidA, epA, svc_->coordinatorEpoch(), yes);
     (void)svc_->doWork(now_);
-    completeWithMarkers(pid, {{kCwNs, 0}});
+    completeWithMarkers(pidA, {{kCwNs, 0}});
+    ASSERT_EQ(answers_.frames.size(), 1u);
+    const std::size_t afterYes = svc_->inMemoryEntriesOfNamespaceForTest(kNs);
+    answers_.frames.clear();
+    int16_t epB = 0;
+    const int64_t pidB = beginTxn({{kCwNs, 0}}, epB, "b");
+    ASSERT_EQ(endTxn("b", pidB, epB, true), 0u);
+    svc_->onTxnVoteResult(kCwNs, 0, pidB, epB, svc_->coordinatorEpoch(), no);
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pidB, {{kCwNs, 0}});
     ASSERT_EQ(answers_.frames.size(), 1u) << "the no was answered: the transaction is complete";
-    EXPECT_GT(svc_->inMemoryEntriesOfNamespaceForTest(kNs), 1u) << "the transaction, its last put and the remembered no";
+    EXPECT_EQ(svc_->inMemoryEntriesOfNamespaceForTest(kNs), 2 * afterYes + 1) << "b has the entries of a, plus its remembered no";
     for (int i = 0; i < 8 && svc_->tombstoneNamespace(kNs, 64, now_) != rune::node::ReapStatus::Done; ++i) {
         followerFetches();
         (void)svc_->doWork(now_);
     }
     EXPECT_EQ(svc_->inMemoryEntriesOfNamespaceForTest(kNs), 0u);
+}
+
+TEST_F(CheckedWritesTxnCoordinatorRegression, AddOffsetsOnlyNextTransactionForgetsTheRememberedNoRegression) {
+    int16_t ep = 0;
+    const int64_t pid = beginTxn({{kCw, 0}}, ep);
+    ASSERT_EQ(endTxn("tx", pid, ep, true), 0u);
+    vote(votes_[0], static_cast<uint16_t>(pc::ErrorCode::ConstraintViolation), 0x00070000, 123);
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {{kCw, 0}});
+    answers_.frames.clear();
+    pc::AddOffsetsToTxn off;   // the next transaction opens with offsets only (consume-transform)
+    off.sessionId = 1; off.correlationId = ++corr_; off.producerId = pid; off.producerEpoch = ep;
+    const std::string txn = "tx", group = "g";
+    off.transactionalId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(txn.data()), txn.size());
+    off.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    std::size_t n = svc_->handleAddOffsets(reqBuf_.data(), off.encode(reqBuf_.data()), now_, outBuf_.data(), outBuf_.size());
+    if (n == 0) { followerFetches(); (void)svc_->doWork(now_); }
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::Ongoing);
+    now_ += 31'000'000'000;   // it times out and aborts
+    (void)svc_->doWork(now_);
+    completeWithMarkers(pid, {});
+    ASSERT_EQ(svc_->txnStateForTest("tx"), tx::TxnState::CompleteAbort);
+    n = endTxn("tx", pid, ep, true);
+    ASSERT_GT(n, 0u);
+    const auto a = syncAnswer(n);
+    EXPECT_EQ(a.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState)) << "not the previous transaction's no";
+    EXPECT_FALSE(a.hasVote);
 }
 
 TEST_F(CheckedWritesTxnCoordinatorRegression, AllYesAndTheTimeoutInOnePassIsNeverACommitRegression) {
