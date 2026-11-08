@@ -1057,4 +1057,9 @@ TEST(CheckedWritesTxnVoteFreezeRegression, NewLeaderVerifiesAgainAfterAVoteWitho
     EXPECT_EQ(txnProduce(k, 70, 5, 1), static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions));
     EXPECT_EQ(k.r.replica->logEndOffset(), leo);
     EXPECT_EQ(k.r.worker->txnVerifyRequestsSentForTest(), 1u);
+    k.r.answerVerify(70, 0, 0);
+    EXPECT_EQ(txnProduce(k, 70, 5, 1), 0) << "the retry is admitted once the coordinator confirmed";
+    EXPECT_GT(k.r.replica->logEndOffset(), leo);
+    EXPECT_EQ(txnProduce(k, 70, 6, 2), 0) << "the open transaction is verified for good";
+    EXPECT_EQ(k.r.worker->txnVerifyRequestsSentForTest(), 1u);
 }

@@ -296,6 +296,16 @@ public:
         pass();
         return voteToken_;
     }
+    /// The coordinator's answer `code` to the worker's last verification request for (pid, epoch); one pass.
+    void answerVerify(int64_t pid, int16_t epoch, int16_t code) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::TxnVerifyResult; op.topicId = kSrc; op.partition = tuning_.partition; op.replica = replica.get();
+        op.logPtr = log.get(); op.correlationId = lastVerifyReqId_; op.producerId = pid; op.producerEpoch = epoch;
+        op.replicatedPayload.errorCode = code;
+        op.targetReplicaId = replica->registryId(); op.incarnation = replica->incarnation();
+        EXPECT_TRUE(worker->tryEnqueueOp(std::move(op)));
+        pass();
+    }
     [[nodiscard]] std::optional<VoteReply> voteReply(int64_t token) const {
         const auto it = voteReplies_.find(token);
         return it == voteReplies_.end() ? std::nullopt : std::optional<VoteReply>(it->second);
@@ -1518,11 +1528,14 @@ private:
         if (r.type == WorkerReturn::Type::TxnVoteResult) {
             voteReplies_[r.correlationId] = VoteReply{r.errorCode, static_cast<uint16_t>(r.recordCount), static_cast<uint32_t>(r.newNextOffset), r.baseOffset, r.lastOffset};
             ++voteReplyCount_[r.correlationId];
+        } else if (r.type == WorkerReturn::Type::TxnVerifyRequest) {
+            lastVerifyReqId_ = r.correlationId;
         } else if (r.type == WorkerReturn::Type::ControlRecordAppended) {
             markerAnswers_[r.correlationId] = r.errorCode == 0 ? r.baseOffset : -1 - r.errorCode;
         }
     }
     bool keyIndexOn_ = false, holdJudge_ = false;
+    int64_t lastVerifyReqId_ = 0;
     int64_t viewPassCap_ = 0;
     int delayedSpecIn_ = 0;
     std::filesystem::path viewDir_, logDir_;
