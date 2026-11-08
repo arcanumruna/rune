@@ -357,3 +357,32 @@ TEST(CheckedWritesTxnVoteRouting, OlderLeaderEpochIsRefusedNotLeader) {
     EXPECT_EQ(r.code, 0u);
     EXPECT_EQ(L.gw.remoteTxnVotesForTest(), 0u);
 }
+
+// An answer completes a vote only when every field matches and the vote went to a remote leader.
+TEST(CheckedWritesTxnVoteRoutingRegression, AnswerThatMatchesNoFieldIsIgnoredRegression) {
+    VoteRig C(0);
+    C.gw.setRoutingImageSnapshot(voteImage(1, 1));
+    const int64_t token = C.gw.sendTxnVote(0, 0, 77, 2, 9);
+    ASSERT_GE(token, 0);
+    rune::replication::TxnVoteResponseMsg r{};
+    r.token = token; r.topicId = 0; r.partition = 0; r.producerId = 77; r.producerEpoch = 2; r.coordinatorEpoch = 9;
+    auto stale = r; stale.coordinatorEpoch = 8;
+    C.gw.onRemoteTxnVoteResponse(stale);
+    stale = r; stale.producerEpoch = 3;
+    C.gw.onRemoteTxnVoteResponse(stale);
+    EXPECT_TRUE(C.got.empty()) << "a mismatched answer completed the vote";
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 1u);
+    C.gw.onRemoteTxnVoteResponse(r);
+    EXPECT_EQ(C.got.size(), 1u);
+    EXPECT_EQ(C.gw.txnVotesInFlightForTest(), 0u);
+
+    VoteRig N(0);   // no image: the vote goes to the local worker, and a plane answer naming its token is not its answer
+    const int64_t local = N.gw.sendTxnVote(0, 0, 77, 2, 9);
+    ASSERT_GE(local, 0);
+    r.token = local;
+    N.gw.onRemoteTxnVoteResponse(r);
+    EXPECT_TRUE(N.got.empty());
+    EXPECT_EQ(N.gw.txnVotesInFlightForTest(), 1u);
+    N.runWorker(2);
+    EXPECT_EQ(N.got.size(), 1u);
+}
