@@ -372,26 +372,32 @@ TEST(CheckedWritesTxnOverlay, FullOverlayIsCapacityExhausted) {
     EXPECT_TRUE(tiny.full());
 }
 
+// The resident pages among those holding [p, p + bytes).
+static std::size_t residentPages(const void* p, std::size_t bytes) {
+    const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t from = reinterpret_cast<uintptr_t>(p) & ~(page - 1);
+    const std::size_t len = reinterpret_cast<uintptr_t>(p) + bytes - from;
+#if defined(__APPLE__)
+    std::vector<char> vec((len + page - 1) / page);
+#else
+    std::vector<unsigned char> vec((len + page - 1) / page);
+#endif
+    EXPECT_EQ(mincore(reinterpret_cast<void*>(from), len, vec.data()), 0);
+    return static_cast<std::size_t>(std::count_if(vec.begin(), vec.end(), [](auto v) { return (v & 1) != 0; }));
+}
+
 // T7 perf: a reserve sized for the largest transaction writes none of its rows.  Filling them at every restart and member change
-// made a checked-writes model seed about 10x slower; the row pages stay unmapped until a transaction puts a row there.
+// made a checked-writes model seed about 10x slower; the row pages stay unmapped until a transaction puts a row there.  The same holds
+// for the entries (review 5, M4).
 TEST(CheckedWritesTxnOverlayRegression, ReserveTouchesNoRowRegression) {
     TxnOverlay o;
     o.reserve(std::size_t(1) << 20, 256);   // 256 MiB of rows
-    const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
-    const auto resident = [&](const uint8_t* p) {
-#if defined(__APPLE__)
-        char vec = 0;
-#else
-        unsigned char vec = 0;
-#endif
-        EXPECT_EQ(mincore(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(p) & ~(page - 1)), 1, &vec), 0);
-        return (vec & 1) != 0;
-    };
     uint8_t* last = o.spare() - 256;   // the last row
-    EXPECT_FALSE(resident(last)) << "the reserve wrote the rows";
+    EXPECT_EQ(residentPages(last, 1), 0u) << "the reserve wrote the rows";
+    EXPECT_EQ(residentPages(o.lastEntryForTest(), 1), 0u) << "the reserve wrote the entries";
     uint8_t* row = o.put(1, OverlayTable::View, ViewKey::fromU64(7), nullptr, 64);
     ASSERT_NE(row, nullptr);
-    EXPECT_TRUE(resident(row));
+    EXPECT_EQ(residentPages(row, 1), 1u);
     EXPECT_EQ(row[63], 0) << "a put without a base row is zeroes";
 }
 

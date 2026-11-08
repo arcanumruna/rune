@@ -41,6 +41,8 @@ public:
     void erase(uint8_t member, OverlayTable table, const ViewKey& key) noexcept;
     // Scratch row handed out in place of a full put, so a caller that is about to report CapacityExhausted still has memory to write.
     [[nodiscard]] uint8_t* spare() noexcept { return arena_.get() + capacity_ * maxRowLen_; }
+    // The last reserved entry, for residency checks.
+    [[nodiscard]] const void* lastEntryForTest() const noexcept { return entries_.get() + capacity_; }
 
 private:
     struct Entry {
