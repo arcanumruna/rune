@@ -6,6 +6,7 @@
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
 #include <gtest/gtest.h>
 
@@ -52,6 +53,9 @@ struct VoteRig {
     rune::gateway::ClientGateway gw = rune::gateway::ClientGateway::makeForTest(
         [](const uint8_t*, std::size_t) -> int64_t { return 1; });
     std::vector<Got> got;
+    bool resendInSink = false;
+    std::vector<int64_t> reentrantTokens;
+    std::size_t inFlightAtSink = 99;
     VoteRig() {
         PartitionConfig c; c.topicId = 0; c.partitionId = 0; c.selfId = 0; c.minIsr = 1; c.durabilityTier = 1;
         c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL; c.pushOnAppend = false;
@@ -70,7 +74,14 @@ struct VoteRig {
     }
     static void sink(void* self, int32_t topicId, int32_t partition, int64_t producerId, int16_t producerEpoch,
                      int32_t coordinatorEpoch, const TxnVoteResult& r) noexcept {
-        static_cast<VoteRig*>(self)->got.push_back({topicId, partition, producerId, producerEpoch, coordinatorEpoch, r});
+        auto* rig = static_cast<VoteRig*>(self);
+        rig->got.push_back({topicId, partition, producerId, producerEpoch, coordinatorEpoch, r});
+        rig->inFlightAtSink = rig->gw.txnVotesInFlightForTest();
+        if (rig->resendInSink) {   // enough emplaces to rehash the table while the gateway is inside the drain
+            rig->resendInSink = false;
+            for (int i = 0; i < 8; ++i)
+                rig->reentrantTokens.push_back(rig->gw.sendTxnVote(topicId, partition, producerId + 100, producerEpoch, coordinatorEpoch));
+        }
     }
     void runWorker(int64_t now) {
         pool.worker(0).doWork(now);
@@ -99,6 +110,14 @@ TEST(CheckedWritesTxnVoteRouting, LocalVoteReachesTheWorkerAndAnswers) {
     EXPECT_EQ(R.got[0].r.failingOffset, -1);
     EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u);
 
+    // A partition with no registered replica: the worker answers NotLeader, which must not read as a yes vote.
+    ASSERT_GE(R.gw.sendTxnVote(0, 1, 79, 1, 9), 0);
+    R.runWorker(3);
+    ASSERT_EQ(R.got.size(), 2u);
+    EXPECT_EQ(R.got[1].partition, 1);
+    EXPECT_EQ(R.got[1].r.errorCode, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader));
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u);
+
     // A no vote: the worker's fields map onto the result.  The op stays on the ring; the answer is injected.
     ASSERT_GE(R.gw.sendTxnVote(0, 0, 78, 1, 9), 0);
     WorkerReturn ret;
@@ -110,15 +129,53 @@ TEST(CheckedWritesTxnVoteRouting, LocalVoteReachesTheWorkerAndAnswers) {
     ret.newNextOffset = 0x00070000;
     ret.baseOffset = 123;
     R.gw.handleWorkerReturnForTest(ret);
-    ASSERT_EQ(R.got.size(), 2u);
-    EXPECT_EQ(R.got[1].producerId, 78);
-    EXPECT_EQ(R.got[1].r.errorCode, 0);
-    EXPECT_EQ(R.got[1].r.code, 55u);
-    EXPECT_EQ(R.got[1].r.constraintId, 0x00070000u);
-    EXPECT_EQ(R.got[1].r.failingOffset, 123);
+    ASSERT_EQ(R.got.size(), 3u);
+    EXPECT_EQ(R.got[2].producerId, 78);
+    EXPECT_EQ(R.got[2].r.errorCode, 0);
+    EXPECT_EQ(R.got[2].r.code, 55u);
+    EXPECT_EQ(R.got[2].r.constraintId, 0x00070000u);
+    EXPECT_EQ(R.got[2].r.failingOffset, 123);
     EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u);
 
     // A duplicate answer matches no token: dropped.
     R.gw.handleWorkerReturnForTest(ret);
-    EXPECT_EQ(R.got.size(), 2u);
+    EXPECT_EQ(R.got.size(), 3u);
+}
+
+// The sink may send again from inside the drain: the answered entry is gone before it runs.
+TEST(CheckedWritesTxnVoteRouting, SinkMaySendAgainReentrantly) {
+    VoteRig R;
+    R.resendInSink = true;
+    ASSERT_GE(R.gw.sendTxnVote(0, 0, 77, 2, 9), 0);
+    R.runWorker(2);
+    ASSERT_EQ(R.got.size(), 1u);
+    EXPECT_EQ(R.inFlightAtSink, 0u) << "the answered entry is erased before the sink runs";
+    ASSERT_EQ(R.reentrantTokens.size(), 8u);
+    for (const int64_t t : R.reentrantTokens) EXPECT_GE(t, 0);
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 8u);
+    R.runWorker(3);
+    ASSERT_EQ(R.got.size(), 9u);
+    EXPECT_EQ(R.got[1].producerId, 177);
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u);
+}
+
+// A refused send returns -1, leaves no entry behind and is never answered.
+TEST(CheckedWritesTxnVoteRouting, RefusedVoteReturnsMinusOneAndIsNeverAnswered) {
+    {   // no worker pool
+        VoteRig R;
+        auto gw = rune::gateway::ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; });
+        gw.setTxnVoteSink(&VoteRig::sink, &R);
+        EXPECT_EQ(gw.sendTxnVote(0, 0, 77, 1, 9), -1);
+        EXPECT_EQ(gw.txnVotesInFlightForTest(), 0u);
+        EXPECT_TRUE(R.got.empty());
+    }
+    VoteRig R;   // full op ring
+    std::size_t sent = 0;
+    while (sent < 100000 && R.gw.sendTxnVote(0, 0, 77 + static_cast<int64_t>(sent), 1, 9) >= 0) ++sent;
+    ASSERT_LT(sent, 100000u) << "the ring never filled";
+    ASSERT_GT(sent, 0u);
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), sent);
+    for (int pass = 0; pass < 1000 && R.gw.txnVotesInFlightForTest() > 0; ++pass) R.runWorker(2 + pass);
+    EXPECT_EQ(R.got.size(), sent);
+    EXPECT_EQ(R.gw.txnVotesInFlightForTest(), 0u);
 }
