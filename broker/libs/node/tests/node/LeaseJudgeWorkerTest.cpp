@@ -638,7 +638,11 @@ struct Leased {
     Ready g;
     VerdictRig& r = g.r;
     int32_t seq = 0;
-    explicit Leased(uint32_t maxKeys = 1000, uint32_t arenaEntries = 0, RigTuning tuning = {}) : g(64LL * 1024 * 1024, std::nullopt, maxKeys, tuning) {
+    // A Strict (durabilityTier 2) ack waits on a real fsync that takes wall time: the pass budget grows the way the
+    // checked-writes matrix's strictFactor does, and a wait still ends as soon as the ack is in.
+    int ackPasses = 600;
+    explicit Leased(uint32_t maxKeys = 1000, uint32_t arenaEntries = 0, RigTuning tuning = {})
+        : g(64LL * 1024 * 1024, std::nullopt, maxKeys, tuning), ackPasses(tuning.durabilityTier == 2 ? 600 * 50 : 600) {
         WorkerOp level;
         level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;
         r.send(std::move(level));
@@ -648,11 +652,11 @@ struct Leased {
     std::optional<VerdictRig::Ack> produce(const std::vector<RawRec>& recs) {
         const int64_t c = r.produceBytes(VerdictRig::rawBatch(recs, 11, seq), rune::protocol::client::kAcksWireView, 11, seq);
         seq += int32_t(recs.size());
-        return r.ack(c);
+        return r.ack(c, ackPasses);
     }
     std::optional<VerdictRig::Ack> produceNoSeq(const std::vector<RawRec>& recs, int32_t at) {   // a refused batch does not consume its sequence
         const int64_t c = r.produceBytes(VerdictRig::rawBatch(recs, 11, at), rune::protocol::client::kAcksWireView, 11, at);
-        return r.ack(c);
+        return r.ack(c, ackPasses);
     }
 };
 }  // namespace
@@ -1369,7 +1373,7 @@ TEST(LeaseWriteHookWorkerRegression, LeaseAckRunsFreedOnErrorRegression) {
     r.demote();    // ... and fails NotLeader before it fires
     int notLeader = 0;
     for (const int64_t c : corrs) {
-        const auto a = r.ack(c, 600);
+        const auto a = r.ack(c, l.ackPasses);
         ASSERT_TRUE(a);
         EXPECT_NE(a->code, 0);
         EXPECT_FALSE(a->hasLease) << "an error ack never carries a trailer";
@@ -1378,7 +1382,7 @@ TEST(LeaseWriteHookWorkerRegression, LeaseAckRunsFreedOnErrorRegression) {
     EXPECT_EQ(notLeader, kDups) << "vacuity guard: every duplicate was parked with its runs, then failed";
     r.promote();
     r.passes(60);
-    ASSERT_TRUE(r.driveUntilJudged());
+    ASSERT_TRUE(r.driveUntilJudged(-1, VerdictRig::kMaxPass * 50));   // Strict: the markers commit after their fsync
     r.passes(60);
     ASSERT_TRUE(r.leaseReady());
     for (int i = 0; i < kDups; ++i) {

@@ -9016,7 +9016,8 @@ private:
                     uint64_t ttl = leaseRecordTtl(s.value);
                     const bool update = rec::leaseOpOf(s.attributes) == rec::LeaseOp::Put &&
                                         rec::intentOf(s.attributes) == static_cast<uint8_t>(rec::Intent::Existing);
-                    if (update && ix.table != nullptr && ix.layout != nullptr) {
+                    if (update && ix.table != nullptr && ix.layout != nullptr && s.key.size() == ws.spec->keyWidth &&
+                        s.key.size() <= rune::view::kMaxViewKeyBytes) {   // a refused oversized key never reaches here; ViewKey asserts
                         // The judge keeps the row's TTL on an update: the row is the truth while the lease lives.
                         uint32_t rid = 0;
                         const uint8_t* row = ix.table->find(rune::view::ViewKey::fromBytes(

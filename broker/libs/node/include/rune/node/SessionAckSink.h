@@ -100,6 +100,7 @@
 #include <array>
 #include <cassert>
 #include <bit>
+#include <stdexcept>
 #include <cstdint>
 #include <limits>
 #include <cstring>
@@ -149,6 +150,7 @@ struct AckEntry {
 };
 
 inline constexpr uint32_t kVerdictAckArenaEntries = 65536;
+static_assert(std::has_single_bit(kVerdictAckArenaEntries), "the arena is a power of two");
 
 /// The verdict and lease trailers of the acks queued in a sink: 8-byte units in a binary buddy allocator over a power-of-two
 /// table.  A run is the block at its first unit (the run id); it is freed when its ack is claimed, dropped or failed, in ANY
@@ -534,7 +536,10 @@ public:
     /// Frees a run whose ack turned into an error before it was enqueued (an error ack never carries a trailer).
     void freeVerdictRun(uint32_t run) noexcept { verdicts_.free(run); }
     [[nodiscard]] std::size_t verdictsUsedForTest() const noexcept { return verdicts_.used(); }
-    void resizeVerdictArenaForTest(uint32_t entries) { verdicts_ = VerdictAckArena(entries); }
+    void resizeVerdictArenaForTest(uint32_t entries) {
+        if (!std::has_single_bit(entries)) throw std::invalid_argument("resizeVerdictArenaForTest: the arena is a power of two");
+        verdicts_ = VerdictAckArena(entries);
+    }
     /// Acks claimed whole / offered because they exceed one claim (test visibility).
     [[nodiscard]] uint64_t claimFramesForTest() const noexcept { return claimedFrames_ - offerFramesForTest(); }
     [[nodiscard]] uint64_t offerFramesForTest() const noexcept {
