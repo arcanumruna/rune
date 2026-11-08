@@ -20,6 +20,7 @@ EmbeddedDriverConfig EmbeddedDriverConfig::fromNode(const NodeConfig& c, std::st
     e.rcvWindowBytes    = c.aeronRcvWindowBytes;
     e.socketBufferBytes = c.aeronSocketBufferBytes;
     e.termBufferSparse  = c.aeronTermBufferSparse;
+    e.countersValuesBytes = c.aeronCountersValuesBytes;
     e.maxMessagesPerSend = c.aeronMaxMessagesPerSend;
     e.udpGso             = c.aeronUdpGso;
     e.epollPoll          = c.aeronEpollPoll;

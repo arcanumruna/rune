@@ -823,6 +823,9 @@ struct NodeConfig {
     // 1 MiB (measured 2026-10-03, 3-node acks=all: >= 16 MiB throughput, no 100+ ms term-rotation stalls,
     // 16x less /dev/shm).  Max Aeron message = term/8 = 128 KiB -> the batch limit (batchLimitFormula).
     int32_t aeronTermBufferBytes         = 1024 * 1024;
+    /// Counter-values buffer of each embedded driver's CnC (EmbeddedDriverConfig::countersValuesBytes).  0 = Aeron's default
+    /// (8 MiB of values + 32 MiB of metadata, zero-filled when the driver starts).  Test brokers set Aeron's 1 MiB minimum.
+    int32_t aeronCountersValuesBytes     = 0;
     /// RUNE_AERON_CONTROL_TERM_BYTES: term of the worker's per-session ACK publications only — small so a
     /// term rotation never cleans 16 MiB inside the worker pass.  NOT the gateway egress publications:
     /// consumer record pushes travel there (max message = term/8 must cover the largest batch).
