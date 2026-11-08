@@ -569,14 +569,16 @@ private:
     std::vector<uint8_t>  nsViewMemOver_ = std::vector<uint8_t>(NsSlotTable::kDefaultCapacity, 0);
     uint64_t viewPauses_ = 0, viewResumes_ = 0;
 
+    // The tables, their dirty sets and the held delta: a long window between checkpoints (P11-9) is view memory too.
     [[nodiscard]] static std::size_t instanceMemory_(const ViewInstance& inst) noexcept {
-        std::size_t m = inst.table.memoryBytes();
-        if (inst.owners) m += inst.owners->memoryBytes();
+        std::size_t m = inst.table.memoryBytes() + inst.table.dirtyBytes() + inst.pendingDelta.capacity();
+        if (inst.owners) m += inst.owners->memoryBytes() + inst.owners->dirtyBytes();
         if (inst.claims) m += inst.claims->indexTable().memoryBytes() + inst.claims->extrasTable().memoryBytes();
         if (inst.agg) {
             m += inst.agg->contributors.memoryBytes() + inst.agg->groups.memoryBytes();
-            if (inst.agg->blocks) m += inst.agg->blocks->memoryBytes();
-            if (inst.agg->groupIds) m += inst.agg->groupIds->memoryBytes();
+            m += inst.agg->contributors.dirtyBytes() + inst.agg->groups.dirtyBytes();
+            if (inst.agg->blocks) m += inst.agg->blocks->memoryBytes() + inst.agg->blocks->dirtyBytes();
+            if (inst.agg->groupIds) m += inst.agg->groupIds->memoryBytes() + inst.agg->groupIds->dirtyBytes();
         }
         return m;
     }

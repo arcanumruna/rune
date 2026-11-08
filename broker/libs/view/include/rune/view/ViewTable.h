@@ -245,6 +245,11 @@ public:
     void markDirty(uint32_t rid) noexcept;
     // A row was dirtied or deleted since the last drainDirty(): a checkpoint now would carry a delta.
     [[nodiscard]] bool hasDirty() const noexcept { return !dirtyList_.empty() || !deleted_.empty(); }
+    // The dirty set's growth past its warm-start reserve (P11-9): it grows with the window between two checkpoints, which an
+    // ordinary transaction's span can make long, so the view set charges it as view memory.
+    [[nodiscard]] size_t dirtyBytes() const noexcept {
+        return dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity() - dirtyReserved_;
+    }
 
     // Calls `emit(rid, row, deleted, key)` once for every row dirtied (an
     // upsert: `row` is the live row pointer, `deleted` is false) or deleted
@@ -534,6 +539,7 @@ private:
     std::vector<uint8_t>  dirty_;
     std::vector<uint64_t> dirtyKeys_;   // TODO: on a wide table this holds the hashed slot word, not the key; do not consume it
     std::vector<uint32_t> dirtyList_; // rids marked dirty this interval, each pushed once (coalesced)
+    size_t                dirtyReserved_ = 0;   // the dirty set's bytes after the constructor's reserve
 
     struct DeletedEntry { uint32_t rid; uint64_t key; };
     std::vector<DeletedEntry> deleted_; // erase()'d {rid,key} pairs pending drainDirty()

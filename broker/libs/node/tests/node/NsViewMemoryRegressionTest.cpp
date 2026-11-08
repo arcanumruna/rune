@@ -456,3 +456,17 @@ TEST(NsViewMemoryRegression, SetViewSetReplaysBootSlotsRegression) {
     vs.driveFolds(kSrcA, 0, rd, log.end, rv::kNoSkip, 0, nullptr, 0, true, NsTag{3, 7});
     EXPECT_GT(vs.nsViewMemBytes(3), 0u);
 }
+
+// REGRESSION (P11-9, Task 8 step 7; T7 re-review 3): the dirty set grows with the window between two checkpoints, which an
+// ordinary transaction's span can make long.  Its growth past the warm-start reserve is view memory: charged to the namespace,
+// so a long window meets the memory limit instead of growing unaccounted.
+TEST(NsViewMemoryRegression, DirtySetGrowthIsChargedRegression) {
+    Rig rig(/*limit chunks*/ 0);
+    SimLog log;
+    log.append(1, 20000);   // one pass dirties every row: past the dirty list's reserve
+    rig.driveA(log);
+    const ViewInstance* inst = rig.vs.instanceForTest(kViewA, 0);
+    ASSERT_NE(inst, nullptr);
+    ASSERT_GT(inst->table.dirtyBytes(), 0u);
+    EXPECT_EQ(rig.vs.nsViewMemBytes(kSlotA), inst->table.memoryBytes() + inst->table.dirtyBytes());
+}

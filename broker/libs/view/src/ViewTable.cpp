@@ -113,6 +113,7 @@ ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkByt
     dirtyList_.reserve(main_.cap);
     deleted_.reserve(256);
     deletedKeyBytes_.reserve(256 * headerLen_);
+    dirtyReserved_ = dirtyList_.capacity() * sizeof(uint32_t) + deleted_.capacity() * sizeof(DeletedEntry) + deletedKeyBytes_.capacity();
 
     if (prefixWidth_) {
         outer_.init(initialIndexSlots, true, hashSeed_, hashMask_);
