@@ -202,22 +202,27 @@ struct ThreeNodes {
     /// the pre-start test seams (holdCatalogApplyAtBootForTest).
     std::function<void(int, BrokerNode&)> beforeStart;
 
-    void startNode(int id) {
+    /// Builds node `id` (config, tweak, constructor, beforeStart) on the calling thread; it is not started.
+    void prepareNode(int id) {
         NodeConfig cfg = makeConfig(id, dirs[static_cast<std::size_t>(id - 1)]->path, ports, 3, mode);
         if (configTweak) configTweak(cfg);
         if (const auto f = storageFormatFor_[static_cast<std::size_t>(id - 1)]) cfg.storageFormat = *f;   // wipeRaw
         nodes[static_cast<std::size_t>(id - 1)] = std::make_unique<BrokerNode>(cfg);
         if (beforeStart) beforeStart(id, *nodes[static_cast<std::size_t>(id - 1)]);
+    }
+    void startNode(int id) {
+        prepareNode(id);
         nodes[static_cast<std::size_t>(id - 1)]->start();
     }
-    /// Starts the nodes on one thread each and returns when all are up (joining the starters; a node's start() does not wait
-    /// for its peers).
+    /// Builds the nodes one after the other on the calling thread (the tweak and beforeStart hooks never run concurrently), then runs
+    /// their start() on one thread each and returns when all are up (joining the starters; a node's start() does not wait for its peers).
     void startNodes(const std::vector<int>& ids) {
+        for (const int id : ids) prepareNode(id);
         std::vector<std::exception_ptr> failed(ids.size());
         std::vector<std::thread> starters;
         for (std::size_t i = 0; i < ids.size(); ++i)
             starters.emplace_back([this, &ids, &failed, i] {
-                try { startNode(ids[i]); } catch (...) { failed[i] = std::current_exception(); }
+                try { nodes[static_cast<std::size_t>(ids[i] - 1)]->start(); } catch (...) { failed[i] = std::current_exception(); }
             });
         for (auto& t : starters) t.join();
         for (const auto& e : failed)
