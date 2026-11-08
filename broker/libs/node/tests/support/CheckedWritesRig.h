@@ -79,7 +79,7 @@ inline rune::codec::Descriptor verdictSourceDescriptor() { return keyedSourceDes
 struct Rec { uint64_t id; int64_t v; uint8_t tag = 0; bool del = false; uint8_t intent = 0; };
 
 /// A record of any source schema: the wire key and the value block (empty = a tombstone).
-struct RawRec { std::string key; std::vector<uint8_t> value; };
+struct RawRec { std::string key; std::vector<uint8_t> value; uint8_t attrs = 0; };   // attrs: the record attribute byte (a lease topic's op and intent)
 
 /// What a consumer received: one record of a delivered batch.
 inline constexpr uint16_t kTombstoneTag = 0xFFFF;   ///< Delivered::tag of a tombstone
@@ -193,6 +193,44 @@ public:
         WorkerOp f;
         f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = 2;
         f.schemaUpdateBlob = rune::codec::serialize(evolving);
+        send(std::move(f));
+    }
+    /// A lease topic's source schema: the four lease system columns, then id (key, field 4) and addr string(16); version 2 adds port uint32.
+    /// Rows are [u16 blockLength][u16 version][block].
+    static rune::codec::Descriptor leaseSourceDescriptor(uint16_t latest = 1) {
+        using rune::codec::PrimType;
+        rune::codec::DescriptorBuilder d("inst", latest);
+        d.add("lease_version", PrimType::Int64).add("lease_ttl_ms", PrimType::UInt64).add("lease_holder", PrimType::UInt64)
+            .add("lease_remaining_ms", PrimType::UInt64).add("id", PrimType::UInt64, 1, true).addFixedStr("addr", 16);
+        if (latest >= 2) d.add("port", PrimType::UInt32, 2);
+        return d.build();
+    }
+    /// A lease topic (spec with max_keys) on the source; returns once the lease index is member 0 of the logged set.
+    void createLeaseTopic(uint32_t maxKeys = 1000) {
+        rune::protocol::LeaseSpec ls;
+        ls.maxKeys = maxKeys;
+        lease_ = ls;
+        keyFieldId_ = 4;
+        useSource(leaseSourceDescriptor(), KeyShape{rune::codec::PrimType::UInt64});
+        for (int i = 0; i < kMaxPass && !leaseIndexLogged(); ++i) pass();
+        ASSERT_TRUE(leaseIndexLogged()) << "the lease index never became the logged set's member";
+    }
+    [[nodiscard]] bool leaseIndexLogged() const {
+        const PartitionWriteState* w = writeState();
+        if (w == nullptr) return false;
+        const ConstraintSet& set = w->constraintSets.latest();
+        return set.count > 0 && set.members[0].kind == rune::view::VerdictViewKind::LeaseIndex;
+    }
+    /// Schema version 2 adds `port` (SchemaUpdate materialized as of 2, then the FilterSchema evolving blob): a layout change of the lease index.
+    void addLeasePort() {
+        customSrc_ = leaseSourceDescriptor(2);
+        WorkerOp v;
+        v.type = WorkerOp::Type::SchemaUpdate; v.topicId = kSrc; v.clientVersion = 2;
+        v.schemaUpdateBlob = rune::codec::serialize(rune::codec::materializeAsOf(*customSrc_, 2));
+        send(std::move(v));
+        WorkerOp f;
+        f.type = WorkerOp::Type::FilterSchema; f.topicId = kSrc; f.clientVersion = 2;
+        f.schemaUpdateBlob = rune::codec::serialize(*customSrc_);
         send(std::move(f));
     }
     /// The judges of this rig (created later ones too) do not run: nothing is activated, replayed or judged.
@@ -337,7 +375,7 @@ public:
 private:
     [[nodiscard]] WorkerOp specOp_(bool keyIndex) const {
         TopicWriteSpecWire w;
-        w.topicId = kSrc; w.keyFieldId = 0; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
+        w.topicId = kSrc; w.keyFieldId = keyFieldId_; w.lease = lease_; w.keyType = keyShape_.type; w.legacyValidate = false; w.keyIndex = keyIndex;
         w.keyWidth = static_cast<uint8_t>(keyWidthOf(keyShape_));
         if (autoInc_) {
             w.autoIncrement = true; w.partitioner = rune::protocol::Partitioner::Modulo;
@@ -473,7 +511,7 @@ public:
     static std::vector<uint8_t> rawBatch(const std::vector<RawRec>& recs, int64_t pid = -1, int32_t seq = -1) {
         rune::protocol::RecordBatchBuilder b(0, 1000);
         if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
-        for (const auto& r : recs) b.append(r.key, {reinterpret_cast<const char*>(r.value.data()), r.value.size()}, 1000, 0);
+        for (const auto& r : recs) b.append(r.key, {reinterpret_cast<const char*>(r.value.data()), r.value.size()}, 1000, r.attrs);
         return b.build();
     }
 
@@ -1146,6 +1184,8 @@ private:
         return set.count > 0 && set.members[0].kind == rune::view::VerdictViewKind::KeyIndex;
     }
     std::optional<AutoIncShape> autoInc_;
+    std::optional<rune::protocol::LeaseSpec> lease_;   ///< createLeaseTopic(): the write spec's lease block
+    uint16_t keyFieldId_ = 0;
     uint64_t grantEpoch_ = 0;
     int64_t rollBytes_;
     RigTuning tuning_;

@@ -252,6 +252,10 @@ struct ViewInstance {
     // table, or a new leader's not-yet-folded one, is never served).
     uint64_t                           foldLeadership  = 0;
 
+    // A lease index: the TopicWriteSpec::leaseLayoutGen its row layout was built under.  A newer one means the evolving
+    // descriptor gained a column, so the index is rebuilt (WorkerViewSet::rebuildKeyIndex_).
+    uint32_t                           layoutGen       = 0;
+
     // Cumulative fold-anomaly counters (see ViewFoldCounters).
     ViewFoldCounters                   counters;
 

@@ -328,6 +328,17 @@ const uint8_t* ViewTable::get(uint64_t key) const noexcept {
 }
 const uint8_t* ViewTable::get(const ViewKey& key) const noexcept { return getImpl(probeOf(key)); }
 
+bool ViewTable::ridOf(const ViewKey& key, uint32_t& rid) const noexcept {
+    const Probe p = probeOf(key);
+    const size_t pi = findP(p);
+    if (pi != static_cast<size_t>(-1)) { rid = main_.rid[pi]; return true; }
+    if (main_.migrating) {
+        const size_t oi = findO(p);
+        if (oi != static_cast<size_t>(-1)) { rid = main_.orid[oi]; return true; }
+    }
+    return false;
+}
+
 bool ViewTable::erase(uint64_t key) noexcept {
     assert(keyWidth_ <= 8 && prefixWidth_ == 0);
     return eraseImpl(probeOf(key));

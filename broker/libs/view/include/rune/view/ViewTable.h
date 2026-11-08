@@ -120,6 +120,10 @@ public:
     const uint8_t* get(uint64_t key) const noexcept;
     const uint8_t* get(const ViewKey& key) const noexcept;
 
+    // The dense row id of `key`'s row (stable while the row lives), or false when absent.  Cold-path identity for
+    // consumers that track rows by id (the lease wheels).
+    bool ridOf(const ViewKey& key, uint32_t& rid) const noexcept;
+
     // Removes `key`. Returns false if `key` was not present. O(1):
     // backward-shift in the index, the row-id returned to the free-list;
     // the row payload itself is left untouched (no tombstone, no move).

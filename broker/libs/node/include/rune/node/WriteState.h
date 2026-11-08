@@ -15,6 +15,7 @@
 #include <rune/protocol/CatalogTypes.h>
 #include <rune/protocol/LeaseSpec.h>
 #include <rune/node/AutoInc.h>
+#include <rune/node/lease/LeaseFoldEvents.h>
 #include <rune/node/VerdictState.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/RejectedOffsetIndex.h>
@@ -177,6 +178,9 @@ public:
     uint32_t              autoIncrementReserve = rune::protocol::kAutoIncrementReserveDefault;
     int32_t               partitionCount = 0;
     std::optional<rune::protocol::LeaseSpec> lease;   ///< a lease topic's spec (set by setFacts)
+    /// A lease topic: bumped when the evolving descriptor gains a field id (an AddField), so the lease index, whose row
+    /// layout has one column per evolving field, is rebuilt from the log (WorkerViewSet::rebuildKeyIndex_).
+    uint32_t              leaseLayoutGen = 0;
     /// The topic's evolving descriptor (every field ever declared), from the FilterSchema op; the key index decodes each writer version through it.
     std::optional<rune::codec::Descriptor> evolving;
 
@@ -265,6 +269,8 @@ struct PartitionWriteState {
     AutoIncState                       autoInc;              ///< the partition's id counter (an autoincrement topic only)
     AssignedBaseWindow                 assignedBases;        ///< the last assigned bases per producer, for retried key-0 batches
     AutoIncStats                       autoIncStats;
+    LeaseFoldEvents                    leaseEvents;          ///< a lease topic: one event per accepted record, until the wheels consume them
+    bool                               staleBrokerLogged = false;   ///< the stale-broker-record warning was logged for this partition
 
     /// A judge is attached or the latest logged set is non-empty.
     [[nodiscard]] bool isVerdictSource() const noexcept;

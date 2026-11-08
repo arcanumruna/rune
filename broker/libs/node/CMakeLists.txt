@@ -38,7 +38,8 @@ add_library(rune_node
 # cycle (VerdictSource appends through PartitionReplica), which CMake resolves by repeating the archives.
 add_library(rune_checked_write
     src/CheckedWriteHook.cpp
-    src/VerdictSource.cpp)
+    src/VerdictSource.cpp
+    src/lease/LeaseIndex.cpp)
 target_include_directories(rune_checked_write PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${RUNE_PROTOCOL_INCLUDE})
@@ -851,6 +852,7 @@ if(BUILD_TESTING)
         tests/node/CheckedWritesDdlTest.cpp
         tests/node/CheckedWritesKeyIndexDdlTest.cpp
         tests/node/LeaseDdlTest.cpp
+        tests/node/LeaseJudgeTest.cpp
         tests/node/CheckedWritesAutoIncDdlTest.cpp
         tests/node/CheckedWritesTimelineTest.cpp
         tests/node/CheckedWritesVerdictSourceTest.cpp
@@ -1413,7 +1415,7 @@ if(BUILD_TESTING)
             gtest_discover_tests(rune_checked_writes_ack_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # Checked writes Part 04: the verdict pipeline on a real Worker.
-            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp)
+            add_executable(rune_checked_writes_verdict_tests tests/node/CheckedWritesVerdictWorkerTest.cpp tests/node/CheckedWritesConsumerTest.cpp tests/node/CheckedWritesVerdictAckTest.cpp tests/node/CheckedWritesModelTest.cpp tests/node/CheckedWritesKeyIndexWorkerTest.cpp tests/node/CheckedWritesKeyIndexWideTest.cpp tests/node/CheckedWritesAutoIncWorkerTest.cpp tests/node/LeaseJudgeWorkerTest.cpp)
             target_include_directories(rune_checked_writes_verdict_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/support)
             target_link_libraries(rune_checked_writes_verdict_tests PRIVATE rune_node rune_replication rune_codec rune_view aeron::aeron GTest::gtest_main)
             gtest_discover_tests(rune_checked_writes_verdict_tests PROPERTIES TIMEOUT 300 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")

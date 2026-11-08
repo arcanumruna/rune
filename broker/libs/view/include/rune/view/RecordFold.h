@@ -25,6 +25,7 @@ struct SourceRecord {
     int64_t                        offset = 0;
     uint8_t                        intent = 0;            // rune::protocol::record::intentOf(attributes)
     const rune::codec::Descriptor* writer = nullptr;      // materialized writer version; nullptr = the fold resolves it
+    uint8_t                        attributes = 0;        // the record's full attributes byte (lease topics: the lease op, bits 2-3)
 };
 
 enum class PrepareStatus : uint8_t { Ok, Malformed, CapacityExhausted };

@@ -3437,7 +3437,7 @@ private:
             return;
         }
         TopicWriteSpec& spec = writeSpecOf_(w->topicId);
-        if (viewSet_ != nullptr && spec.keyIndex != w->keyIndex) viewSet_->noteWriteSpecChange();
+        if (viewSet_ != nullptr && (spec.keyIndex != w->keyIndex || spec.lease.has_value() != w->lease.has_value())) viewSet_->noteWriteSpecChange();
         if (const uint32_t erased = spec.setFacts(*w); erased != 0) {
             leaseLayoutRefused_ += erased;
             spdlog::error("Worker {}: lease topicId={} — {} installed version(s) break the lease system-column layout; erased",
@@ -3522,7 +3522,15 @@ private:
                 ++filterSchemaReplacements_;
                 recompileFilters_(topicId);
             }
-            writeSpecOf_(topicId).evolving = std::move(desc);
+            TopicWriteSpec& wspec = writeSpecOf_(topicId);
+            // A lease index has one row column per evolving field: a field id the previous descriptor lacked (an AddField)
+            // makes its layout stale, and the index is rebuilt from the log (WorkerViewSet::rebuildKeyIndex_).
+            if (wspec.lease && wspec.evolving &&
+                std::any_of(desc.fields.begin(), desc.fields.end(), [&](const auto& f) {
+                    return std::none_of(wspec.evolving->fields.begin(), wspec.evolving->fields.end(), [&](const auto& o) { return o.id == f.id; });
+                }))
+                ++wspec.leaseLayoutGen;
+            wspec.evolving = std::move(desc);
             spdlog::debug("Worker {}: FilterSchema installed for topicId={} version={}", workerId_, topicId, version);
         } catch (const std::exception& ex) {
             ++filterSchemaErrors_;
@@ -7374,7 +7382,7 @@ private:
             // partition no installed view is interested in.
             if (!viewSet_->interestedIn(topicId)) {
                 const PartitionWriteState* w = writeOf_(replica);
-                if (w == nullptr || (w->verdicts == nullptr && w->constraintSets.latest().empty() && !w->spec->keyIndex)) continue;   // a verdict source without its views still judges nothing, but is driven (it waits); a key index needs no view; a live judge is driven until ensureVerdictSource erases it (#807)
+                if (w == nullptr || (w->verdicts == nullptr && w->constraintSets.latest().empty() && !w->spec->keyIndex && !w->spec->lease)) continue;   // a verdict source without its views still judges nothing, but is driven (it waits); a key index needs no view; a live judge is driven until ensureVerdictSource erases it (#807)
             }
             if (replica->role() != rune::replication::Role::Leader) continue;
             const RcState* rcState = rcServe_(replica, rcOf_(replica));

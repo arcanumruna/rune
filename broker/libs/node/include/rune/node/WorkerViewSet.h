@@ -36,13 +36,17 @@
 // return a real progress count (records folded + deltas pushed/held) so the
 // node's idle strategy never backs off while view work is pending.
 
+#include <algorithm>
+#include <cstring>
 #include <memory>
+#include <optional>
 
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/node/VerdictSource.h>
 #include <rune/node/ViewInstance.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/NsSlotTable.h>
+#include <rune/view/ViewRow.h>
 
 namespace rune::node {
 
@@ -315,10 +319,15 @@ public:
             viewSkip.rejected = &write->rejected;
             if (judge != nullptr) {
                 work += syncConstraintSet_(srcTopicId, *judge, *write);
+                // A lease index whose row layout is out of date (an AddField reached the evolving descriptor) activates again
+                // under the same leadership: the rebuild below replaces it, the activation replays the log into it.
+                if (write->spec->lease && leaseLayoutStale_(srcTopicId, partition, *write->spec)) judge->requestReactivation();
                 if (judge->activationPending()) rebuildKeyIndex_(srcTopicId, partition, *judge, *write->spec, leaderGen);
                 work += judge->driveJudge(readRange, bound, nowNs, *write, skip.aborted);
                 viewBound = std::min(bound, judge->judgedThrough());
                 work += flipVerdictMembers_(srcTopicId, partition, bound, leaderGen, leaderHwConfirmed, ns);
+                // Task 9 (the wheels) consumes these; until then they are discarded.
+                if (write->spec->lease) write->leaseEvents.buf.clear();
             } else {
                 viewBound = std::min(bound, write->verdictKnownThrough());
             }
@@ -380,6 +389,18 @@ public:
     [[nodiscard]] std::size_t keyIndexSizeForTest(int32_t src, int32_t partition) const {
         const auto it = keyIndexes_.find(instKey(src, partition));
         return it == keyIndexes_.end() ? 0 : it->second.table.size();
+    }
+    /// A lease index row's column `slot` (up to 8 bytes, little-endian) for the 8-byte wire key `key`; nullopt: no such row, or the column is null.
+    /// `slots` (if given) receives the layout's column count.
+    [[nodiscard]] std::optional<uint64_t> leaseColumnForTest(int32_t src, int32_t partition, uint64_t key, uint16_t slot, std::size_t* slots = nullptr) const {
+        const auto it = keyIndexes_.find(instKey(src, partition));
+        if (it == keyIndexes_.end()) return std::nullopt;
+        if (slots != nullptr) *slots = it->second.layout.slotType.size();
+        const uint8_t* row = it->second.table.get(key);
+        if (row == nullptr || slot >= it->second.layout.slotType.size() || rune::view::isNull(row, it->second.layout, slot)) return std::nullopt;
+        uint64_t v = 0;
+        std::memcpy(&v, row + it->second.layout.slotOffset[slot], std::min<std::size_t>(8, it->second.layout.slotWidth[slot]));
+        return v;
     }
     /// -1: the partition has no key index.
     [[nodiscard]] int64_t keyIndexFoldCursorForTest(int32_t src, int32_t partition) const {
@@ -657,6 +678,10 @@ private:
     int syncConstraintSet_(int32_t srcTopicId, VerdictSource& judge, PartitionWriteState& write);
     int flipVerdictMembers_(int32_t srcTopicId, int32_t partition, int64_t bound, uint64_t leaderGen, bool leaderHwConfirmed, NsTag ns);
     void rebuildKeyIndex_(int32_t srcTopicId, int32_t partition, VerdictSource& judge, const TopicWriteSpec& spec, uint64_t leaderGen);
+    [[nodiscard]] bool leaseLayoutStale_(int32_t srcTopicId, int32_t partition, const TopicWriteSpec& spec) const noexcept {
+        const auto it = keyIndexes_.find(instKey(srcTopicId, partition));
+        return it != keyIndexes_.end() && it->second.layoutGen != spec.leaseLayoutGen;
+    }
     // Inline: Worker.h's rebuildRcSlots_ reaches it, and that header is built into libraries that do not link rune_node.
     void eraseKeyIndex_(uint64_t key) {
         if (const auto it = keyIndexes_.find(key); it != keyIndexes_.end()) {

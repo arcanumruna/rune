@@ -5,6 +5,7 @@
 // evaluates them in set order, and applies all or none; a rejection goes into PartitionWriteState::rejected.  driveJudge
 // walks the committed log, follows the logged constraint-set changes and emits durable verdict markers.
 #include <rune/node/VerdictState.h>
+#include <rune/node/lease/LeaseIndex.h>
 #include <rune/node/ViewInstance.h>
 #include <rune/node/WriteState.h>
 #include <rune/protocol/BatchRebuild.h>
@@ -100,6 +101,9 @@ public:
     /// A leadership has activated this judge and no new one is pending: what it folds now belongs to that leadership.
     [[nodiscard]] bool activated() const noexcept { return generation_ != kUnbound && !needsActivation_; }
     [[nodiscard]] int64_t logStart() const noexcept { return logStart_; }
+    /// Cold: activate again under the same leadership (bindLeader's new-generation path, without a new generation): a lease
+    /// index whose row layout changed is rebuilt by the owner, then replayed from the log by the activation.
+    void requestReactivation() noexcept { needsActivation_ = true; }
 
     void addVerdictView(ViewInstance*, rune::view::VerdictViewKind, uint64_t viewObjectId, uint64_t planFingerprint = 0);
     void removeVerdictView(int32_t viewTopicId);
