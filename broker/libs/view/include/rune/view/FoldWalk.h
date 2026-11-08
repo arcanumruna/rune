@@ -142,8 +142,8 @@ WalkOut walkView(const rune::storage::LogReadView& view, int64_t from, int64_t b
     return {WalkEnd::Done, walkedUpto};
 }
 
-// The supersede notes of the segment of `pid`'s span from `from` (D1): T's keys up to the first that does not fit, and per key the last
-// offset below the marker of another writer's record applied before it - plain and not rejected, or of a transaction not open in the
+// The supersede notes of the segment of `pid`'s span from `from` (P11-3a): T's keys up to the first that does not fit, each with
+// last_T over the rest of the span, and per key the last offset below the marker of another writer's record applied before it - plain and not rejected, or of a transaction not open in the
 // fence at its offset (it closed below the marker; an aborted one is skipped by the partition's aborted index, which every fold path
 // is handed).  Returns the segment's end.
 inline int64_t noteSupersede(TxnFold& txn, int64_t pid, int64_t from, int64_t marker, const FoldSkip& skip) {
@@ -164,9 +164,8 @@ inline int64_t noteSupersede(TxnFold& txn, int64_t pid, int64_t from, int64_t ma
             at = last + 1;
             if ((attrs & b::kAttrControl) != 0) continue;
             if ((attrs & b::kAttrTransactional) != 0 && r.producerId() == pid) {
-                if (segEnd != marker) continue;
                 r.forEachRecord([&](std::string_view key, std::string_view, int64_t offset, int64_t) {
-                    if (segEnd == marker && offset >= from && !txn.keys.insert(key)) segEnd = offset;
+                    if (offset >= from && !txn.keys.noteT(key, offset, segEnd == marker)) segEnd = offset;
                 });
                 continue;
             }
@@ -225,7 +224,7 @@ bool applySpan(TxnFold& txn, int64_t pid, int64_t marker, int64_t left, const Fo
                             ++stats.skippedRejected;
                             return;
                         }
-                        if (txn.keys.superseded(key, offset)) {
+                        if (txn.keys.superseded(key)) {
                             ++stats.txnSuperseded;
                             return;
                         }

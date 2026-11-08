@@ -453,6 +453,26 @@ TEST(CheckedWritesTxnVisibility, OnlyAWriteAppliedBeforeTheMarkerSupersedes) {
     }
 }
 
+// P11-3a is per key, as the live judge decides it: T writes x into g1, a plain record moves x to g2, T moves x to g3.  The plain
+// record lies below last_T(x), so neither of T's records is superseded (a per-record rule skipped x@10).  This fold's last()
+// retracts, so the rows agree either way here; the decision is what a member's replay must share with the judge.
+TEST(CheckedWritesTxnVisibilityRegression, SupersedeIsPerKeyAboveTheTransactionsLastRecordRegression) {
+    TxnLog log;
+    log.data({{9, 1, 5}});
+    log.data({{2, 1, 10}}, 7);
+    log.data({{2, 2, 20}});
+    log.data({{2, 3, 30}}, 7);
+    log.marker(7, true);
+    Folder a(true), p(false);
+    const rune::view::FoldStats st = a.pass(log, log.end, 0);
+    p.pass(log, log.end, 0);
+    EXPECT_EQ(st.txnSuperseded, 0u);
+    EXPECT_EQ(a.slot(1, 1), 1);
+    EXPECT_EQ(a.slot(1, 2), 5) << "x passed through g1 and left it";
+    EXPECT_EQ(a.slot(3, 2), 30);
+    EXPECT_EQ(p.slot(2, 1), 30);
+}
+
 // A transaction with more keys than one segment notes applies in segments, each superseded by the writes above it; with a pass cap
 // of 3 the result equals the uncapped fold.
 TEST(CheckedWritesTxnVisibility, SegmentsOfManyKeysSupersedeLikeOne) {
