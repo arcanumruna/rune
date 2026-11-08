@@ -234,7 +234,7 @@ TEST(LeaseJudgeTableRegression, JudgeLeaseTableRegression) {
     EXPECT_EQ(judgeLease({true, 7, kTtl}, at(rec::LeaseOp::Expire, 0), 7, kTtl, 0, 10, 10), 0);
 }
 
-// R1: every accepted client lease record carries the row's TTL and remaining 0.  Not-found / version answers keep precedence.
+// A grant with remaining != 0 is refused; an update or revoke's TTL and remaining are not checked (spec 6.4).  Not-found / version answers keep precedence.
 TEST(LeaseJudgeTableRegression, JudgeLeaseExactTtlAndRemainingRegression) {
     const auto at = [](rec::LeaseOp op, uint8_t intent) { return rec::withLeaseOp(intent, op); };
     const uint8_t grantA = at(rec::LeaseOp::Put, 1), updateA = at(rec::LeaseOp::Put, 2), revokeA = at(rec::LeaseOp::Revoke, 2);
@@ -242,14 +242,14 @@ TEST(LeaseJudgeTableRegression, JudgeLeaseExactTtlAndRemainingRegression) {
     const LeaseRowState none{false, 0, 0};
     // A Put with remaining != 0 is refused, whatever the intent.
     EXPECT_EQ(judgeLease(none, grantA, 0, 100, 1, 0, 10), kInvalid);
-    EXPECT_EQ(judgeLease(row, updateA, 7, 100, 1, 1, 10), kInvalid);
-    // A Revoke with remaining != 0 is refused.
-    EXPECT_EQ(judgeLease(row, revokeA, 7, 100, 1, 1, 10), kInvalid);
-    // A Put update / a Revoke whose TTL differs from the row's is refused; the row's TTL is accepted.
-    EXPECT_EQ(judgeLease(row, updateA, 7, 99, 0, 1, 10), kInvalid);
-    EXPECT_EQ(judgeLease(row, updateA, 7, 0, 0, 1, 10), kInvalid);
+    // Spec 6.4: an update or revoke's TTL and remaining are NOT checked (the write hook refuses a client remaining != 0; the
+    // judge keeps the row's TTL and remaining), so every one of these is accepted.
+    EXPECT_EQ(judgeLease(row, updateA, 7, 100, 1, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, revokeA, 7, 100, 1, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, updateA, 7, 99, 0, 1, 10), 0);
+    EXPECT_EQ(judgeLease(row, updateA, 7, 0, 0, 1, 10), 0);
     EXPECT_EQ(judgeLease(row, updateA, 7, 100, 0, 1, 10), 0);
-    EXPECT_EQ(judgeLease(row, revokeA, 7, 99, 0, 1, 10), kInvalid);
+    EXPECT_EQ(judgeLease(row, revokeA, 7, 99, 0, 1, 10), 0);
     EXPECT_EQ(judgeLease(row, revokeA, 7, 100, 0, 1, 10), 0);
     // Precedence: the not-found / version answers come first, then KeyExists / the limit.
     EXPECT_EQ(judgeLease(none, updateA, 7, 99, 1, 0, 10), kNotFound);
@@ -303,12 +303,16 @@ TEST(LeaseJudgeTableRegression, TableRegression) {
     EXPECT_EQ(r.judgeOne(grant(1, other)), kKeyExists);
     EXPECT_EQ(r.addr(1), "a1");
 
-    // an update that changes the TTL or carries remaining != 0 is refused; the row's TTL is accepted
+    // an update that carries another TTL or remaining != 0 is ACCEPTED (spec 6.4: not checked); the row keeps its own TTL and remaining
     LV wrongTtl; wrongTtl.ttl = 9999; wrongTtl.addr = "t";
-    EXPECT_EQ(r.judgeOne(update(1, g1, wrongTtl)), kInvalid);
+    EXPECT_EQ(r.judgeOne(update(1, g1, wrongTtl)), 0);
+    EXPECT_EQ(r.addr(1), "t");
+    EXPECT_EQ(r.col(1, 1), 1000u);
     LV withRem; withRem.rem = 777; withRem.addr = "r";
-    EXPECT_EQ(r.judgeOne(update(1, g1, withRem)), kInvalid);
-    EXPECT_EQ(r.addr(1), "a1");
+    EXPECT_EQ(r.judgeOne(update(1, g1, withRem)), 0);
+    EXPECT_EQ(r.addr(1), "r");
+    EXPECT_EQ(r.col(1, 1), 1000u);
+    EXPECT_EQ(r.col(1, 3), 0u);
 
     // update with the live version: replaces addr, port and the holder only
     LV b; b.ttl = 1000; b.holder = 8; b.addr = "b2"; b.port = 9;
@@ -854,34 +858,40 @@ std::vector<uint8_t> rowBytes(const uint8_t* row, const rune::view::RowLayout& l
 
 }  // namespace
 
-TEST(LeaseJudgeTableRegression, LeaseReplayTtlFromGrantRegression) {
-    // Live: grant (ttl 1000), an update carrying ttl 500 (REFUSED by the judge, so never in the replayed set), an update carrying
-    // 1000 (accepted).
+TEST(LeaseJudgeTableRegression, LeaseReplayGrantKeptEqualsLiveRegression) {
+    // Spec 6.4: an update's TTL is not checked; the judge keeps the row's TTL.  The Task 8 cleaner keeps each live key's grant
+    // record, so a replay is of [grant, update] or [grant, checkpoint, update] and builds the row from the grant: it equals the
+    // live row byte for byte (every slot, the null bits, the offsets).  (Update-only replay equality is Task 8's contract.)
     Rig r;
     r.start();
     LV gv; gv.ttl = 1000; gv.holder = 1; gv.addr = "g1";
-    int64_t g = 0, bad = 0, good = 0;
+    int64_t g = 0, up = 0;
     ASSERT_EQ(r.judgeOne(grant(1, gv), &g), 0);
-    LV u500; u500.ttl = 500; u500.holder = 8; u500.addr = "x";
-    EXPECT_EQ(r.judgeOne(update(1, g, u500), &bad), kInvalid) << "an update with another TTL never gets into the log's accepted set";
-    EXPECT_EQ(r.col(1, 1), 1000u);
-    LV u; u.ttl = 1000; u.holder = 8; u.addr = "u4"; u.port = 9;
-    ASSERT_EQ(r.judgeOne(update(1, g, u), &good), 0);
+    LV u500; u500.ttl = 500; u500.holder = 8; u500.addr = "u4"; u500.port = 9;
+    ASSERT_EQ(r.judgeOne(update(1, g, u500), &up), 0) << "an update carrying another TTL is accepted";
+    EXPECT_EQ(r.col(1, 1), 1000u) << "the live row keeps the grant's TTL";
+    EXPECT_EQ(r.col(1, 3), 0u);
     const std::vector<uint8_t> live = rowBytes(r.row(1), r.index->layout);
-
-    // Replay of the whole log, skipping the rejected offset: the same row byte for byte (every slot, the null bits, the offsets).
     const Replayed whole = replayLog(r, r.log);
     ASSERT_EQ(whole.table->size(), 1u);
     EXPECT_EQ(rowBytes(whole.table->get(uint64_t(1)), whole.layout), live);
+    EXPECT_EQ(colOf(whole, 1, 1), 1000u);
 
-    // Replay of a log holding only the accepted update (the grant compacted away; the controls keep the offsets): equal too.
-    Log only;
-    for (int64_t i = 0; i < good; ++i) only.control();
-    ASSERT_EQ(only.data({update(1, g, u)}), good);
-    const Replayed fromUpdate = replayLog(r, only);
-    ASSERT_EQ(fromUpdate.table->size(), 1u);
-    EXPECT_EQ(rowBytes(fromUpdate.table->get(uint64_t(1)), fromUpdate.layout), live) << "the TTL comes from the update, which carries the grant's";
-    EXPECT_EQ(colOf(fromUpdate, 1, 1), 1000u);
+    // [grant, checkpoint, update]
+    Rig r2;
+    r2.start();
+    int64_t g2 = 0, cp2 = 0, up2 = 0;
+    ASSERT_EQ(r2.judgeOne(grant(1, gv), &g2), 0);
+    ASSERT_EQ(r2.judgeOne(checkpoint(1, g2, 555, gv), &cp2), 0);
+    ASSERT_EQ(r2.judgeOne(update(1, g2, u500), &up2), 0);
+    ASSERT_EQ(r2.col(1, 3), 555u);
+    EXPECT_EQ(r2.col(1, 1), 1000u);
+    const std::vector<uint8_t> live2 = rowBytes(r2.row(1), r2.index->layout);
+    const Replayed whole2 = replayLog(r2, r2.log);
+    ASSERT_EQ(whole2.table->size(), 1u);
+    EXPECT_EQ(rowBytes(whole2.table->get(uint64_t(1)), whole2.layout), live2);
+    EXPECT_EQ(colOf(whole2, 1, 1), 1000u);
+    EXPECT_EQ(colOf(whole2, 1, 3), 555u);
 }
 
 TEST(LeaseJudgeTableRegression, LeaseReplayTtlCheckpointThenUpdateRegression) {

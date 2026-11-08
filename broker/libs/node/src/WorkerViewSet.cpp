@@ -1201,7 +1201,9 @@ VerdictSource* WorkerViewSet::ensureVerdictSource(int32_t srcTopicId, int32_t pa
     if (write.spec->lease && !judge->hasMember(0, kLeaseIndexPlanFingerprint)) {
         if (const std::optional<rune::codec::Descriptor> src = leaseIndexSource(*write.spec)) {
             ViewInstance& inst = keyIndexes_.try_emplace(key, freshLeaseIndex(srcTopicId, partition, *write.spec, *src, rune::view::ViewTableKeys{write.spec->keyWidth, 0, hashSeed_, hashMask_}, leaseReplayCap_)).first->second;
-            if (judge->activated()) inst.foldLeadership = kAdoptedLive;
+            // Adopted under an already-activated judge: the lease index must replay the log under that leadership (it holds a
+            // row layout, not a fold), so the judge activates again instead of treating the fresh index as live.
+            if (judge->activated()) judge->requestReactivation();
             judge->addVerdictView(&inst, rune::view::VerdictViewKind::LeaseIndex, 0, kLeaseIndexPlanFingerprint);
         }
     }

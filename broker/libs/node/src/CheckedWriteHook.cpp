@@ -29,6 +29,12 @@ std::optional<uint64_t> importN(const TopicWriteSpec& spec, const AutoIncState& 
     return id / partitions;
 }
 
+uint64_t loadLe64(std::string_view v, std::size_t off) noexcept {
+    uint64_t x = 0;
+    std::memcpy(&x, v.data() + off, sizeof(x));   // little-endian host, like the rest of the wire
+    return x;
+}
+
 void putLe(uint8_t* p, uint64_t v, std::size_t width) noexcept {
     for (std::size_t i = 0; i < width; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
 }
@@ -47,15 +53,45 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
     const bool autoInc = spec.autoIncrement;
     const bool autoIncReady = autoInc && state_.autoInc.ready();
     pc::ErrorCode stopped = pc::ErrorCode::OK;
+    leaseGrants_ = 0;
+
+    // Lease topic (spec 6.4, in the spec's order; each refusal is definite and nothing is stored).  Namespace suspension
+    // is refused before the produce core (refuseSuspended_), so there is no row for it here.
+    const bool lease = topic.lease;
+    if (lease) [[unlikely]] {
+        const auto refuseLease = [&](HookRefusal why) { refusal_ = why; return pc::ErrorCode::InvalidRequest; };
+        if (facts_.clientVersion < pc::kClientVersionLeases || !facts_.levelLeases) return refuseLease(HookRefusal::LeaseClientVersion);
+        if (!pc::acksView(facts_.acks)) return refuseLease(HookRefusal::LeaseNeedsView);
+        if (facts_.transactional) return refuseLease(HookRefusal::LeaseInTxn);   // explicit: the View bit is cleared for a transaction, but the rule must not depend on that
+        if (recordCount < 0 || static_cast<std::size_t>(recordCount) > rec::kMaxLeaseBatchRecords) return refuseLease(HookRefusal::LeaseBatchTooLarge);
+    }
+    const uint8_t reservedMask = lease ? static_cast<uint8_t>(rec::kAttrReservedMask & ~rec::kAttrLeaseOpMask) : rec::kAttrReservedMask;
 
     const bool walked = rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& r) {
         if (stopped != pc::ErrorCode::OK) return;
         const uint8_t intent = rec::intentOf(r.attributes);
-        if ((r.attributes & rec::kAttrReservedMask) != 0 || intent == 3 || (intent == static_cast<uint8_t>(rec::Intent::Insert) && r.value.empty())) {   // an insert needs a value (P5-5)
+        if ((r.attributes & reservedMask) != 0 || (!lease && intent == 3) || (intent == static_cast<uint8_t>(rec::Intent::Insert) && r.value.empty())) {   // an insert needs a value (P5-5)
             intents.reservedBits = true;
             stopped = pc::ErrorCode::InvalidRequest;
             refusal_ = HookRefusal::ReservedBits;
             return;
+        }
+        if (lease) [[unlikely]] {
+            const auto bad = [&](pc::ErrorCode code, HookRefusal why) { stopped = code; refusal_ = why; };
+            const rec::LeaseOp op = rec::leaseOpOf(r.attributes);
+            constexpr auto kInsert = static_cast<uint8_t>(rec::Intent::Insert), kExisting = static_cast<uint8_t>(rec::Intent::Existing);
+            const bool grant = op == rec::LeaseOp::Put && intent == kInsert;
+            const bool update = op == rec::LeaseOp::Put && intent == kExisting;
+            const bool revoke = op == rec::LeaseOp::Revoke && intent == kExisting;
+            if (!grant && !update && !revoke) return bad(pc::ErrorCode::InvalidRequest, HookRefusal::LeaseBadRecord);   // upsert, intent 3, revoke+insert, client Expire / Checkpoint
+            if (r.value.size() < 4 + rec::kLeaseSystemBytes) return bad(pc::ErrorCode::InvalidRequest, HookRefusal::LeaseBadRecord);
+            if (loadLe64(r.value, rec::kLeaseRemainingValueOffset) != 0) return bad(pc::ErrorCode::InvalidRequest, HookRefusal::LeaseBadRecord);
+            // A version of 0 is a live lease id (a partition's first grant has offset 0), so only a negative one is refused; the spec's "<= 0" is relaxed by the coordinator.
+            if (!grant && static_cast<int64_t>(loadLe64(r.value, rec::kLeaseVersionValueOffset)) < 0) return bad(pc::ErrorCode::InvalidRequest, HookRefusal::LeaseBadRecord);
+            if (grant) {
+                if (loadLe64(r.value, rec::kLeaseTtlValueOffset) > topic.leaseSpec->maxTtlMs) return bad(pc::ErrorCode::LeaseTtlTooLarge, HookRefusal::LeaseTtlTooLarge);
+                ++intents.leaseGrants;
+            }
         }
         switch (checkTypedRecord(spec, r, level)) {
         case TypedCheck::Accept: break;
@@ -93,6 +129,12 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
         refusal_ = HookRefusal::ValidationFailed;
         return pc::ErrorCode::SchemaValidationFailed;
     }
+    // Every grant is refused while the namespace's view memory is over its limit (the hook has no index lookup; a grant
+    // of a live key would be KeyExists anyway).  The max-leases limit is Task 21.
+    if (intents.leaseGrants > 0 && facts_.viewMemOver) [[unlikely]] {
+        refusal_ = HookRefusal::LeaseViewMemOver;
+        return pc::ErrorCode::NamespaceLimitExceeded;
+    }
     intents.keyZeroCreate = keyZeroCreates > 0;
     intents.mixedKeyZero  = keyZeroCreates > 0 && keyZeroCreates < recordCount;
     if (autoInc) [[unlikely]] {
@@ -108,6 +150,7 @@ pc::ErrorCode CheckedWriteHook::check(const uint8_t* batch, std::size_t len, int
 
     const RequirementVerdict v = evaluateRequirements(intents, facts_, topic);
     refusal_ = v.why;
+    if (v.code == pc::ErrorCode::OK) leaseGrants_ = intents.leaseGrants;
     return v.code;
 }
 

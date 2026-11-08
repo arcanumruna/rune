@@ -15,7 +15,12 @@
 #include <rune/storage/ProducePath.h>
 #include <rune/storage/WriteHookPolicy.h>
 
+#include <rune/protocol/Crc32c.h>
+#include <rune/protocol/LeaseRecord.h>
+
 #include <array>
+#include <cassert>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -36,6 +41,10 @@ struct WriteFacts {
     int64_t producerId         = -1;
     bool    legacyMode         = false;
     bool    levelCheckedWrites = false;
+    // Lease topics only (Task 5a); the worker computes them only for a lease topic, so another topic pays nothing.
+    int32_t clientVersion      = 0;       ///< the producing session's announced client version (0 = not announced)
+    bool    levelLeases        = false;   ///< the cluster feature level is at least MetadataFeature::kLeases
+    bool    viewMemOver        = false;   ///< the namespace's view memory is over its limit (nsViewMemOver)
 };
 
 /// Whether a verdict view of this kind provides the key index (member 0 of a logged set): a lease index is a key index
@@ -52,12 +61,16 @@ struct TopicHookFacts {
     bool verdictSource     = false;
     bool keyIndexActive    = false;   ///< the partition's logged constraint set has the key index as member 0 (P5-4)
     bool autoIncReady      = false;   ///< the partition's id counter is Ready
+    bool lease             = false;   ///< a lease topic (spec->lease)
+    const rune::protocol::LeaseSpec* leaseSpec = nullptr;   ///< the lease topic's spec; null otherwise
 };
 [[nodiscard]] inline TopicHookFacts topicHookFactsOf(const PartitionWriteState& state) noexcept {
     TopicHookFacts f;
     f.keyIndex          = state.spec->keyIndex;
     f.autoIncrement     = state.spec->autoIncrement;
     f.autoIncReady      = state.autoInc.ready();
+    f.lease             = state.spec->lease.has_value();
+    f.leaseSpec         = f.lease ? &*state.spec->lease : nullptr;
     f.verdictSource     = state.isVerdictSource();
     f.constrainedSource = state.isConstrainedSource();
     const ConstraintSet& logged = state.constraintSets.latest();
@@ -80,6 +93,7 @@ struct BatchIntents {
     bool    autoIncWindowFull = false;   ///< the key-0 batch's producer cannot be recorded in the assigned-base window
     uint32_t keyZeroCount     = 0;
     uint64_t importMaxN       = 0;       ///< the highest counter value an import carries (0 = none)
+    uint32_t leaseGrants      = 0;       ///< lease topic: records that are grants (Put + insert)
 };
 
 enum class HookRefusal : uint8_t {
@@ -87,7 +101,9 @@ enum class HookRefusal : uint8_t {
     ExplicitKeyNeedsIdempotentAndView, IntentInTxnOrAtomicBatch, TxnOnConstrainedSource,
     KeyZeroCreateNeedsIdempotentAll, KeyZeroCreateNeedsView, MixedKeyZeroBatch, ViewBatchTooLarge,
     ViewWithoutReplica, KeyIndexActivating, UpsertOnAutoIncrement, ImportNotGranted, ImportOutOfRange,
-    AutoIncExhausted, AutoIncWindowFull, AutoIncActivating, Count_
+    AutoIncExhausted, AutoIncWindowFull, AutoIncActivating,
+    LeaseClientVersion, LeaseNeedsView, LeaseInTxn, LeaseBatchTooLarge, LeaseBadRecord, LeaseTtlTooLarge, LeaseViewMemOver,
+    Count_
 };
 
 struct RequirementVerdict {
@@ -105,7 +121,7 @@ struct RequirementVerdict {
     if (b.reservedBits) return refuse(HookRefusal::ReservedBits);
     if (f.legacyMode && (b.anyIntent || view)) return refuse(HookRefusal::LegacyMode);
     if (!f.levelCheckedWrites && (b.anyIntent || view)) return refuse(HookRefusal::LevelTooLow);
-    if (b.anyIntent && !t.keyIndex) return refuse(HookRefusal::NoKeyIndex);
+    if (b.anyIntent && !t.keyIndex && !t.lease) return refuse(HookRefusal::NoKeyIndex);
     if (b.explicitKeyIntent && (!f.idempotent || !view)) return refuse(HookRefusal::ExplicitKeyNeedsIdempotentAndView);
     if (b.explicitKeyIntent && (f.transactional || f.atomicBatch)) return refuse(HookRefusal::IntentInTxnOrAtomicBatch);
     if ((f.transactional || f.atomicBatch) && t.constrainedSource) return refuse(HookRefusal::TxnOnConstrainedSource);
@@ -158,6 +174,8 @@ public:
 
 private:
     [[nodiscard]] rune::storage::HookStaged patchKeyZeroIds_(const uint8_t* batch, std::size_t len) noexcept;
+    template <class LogT>
+    [[nodiscard]] rune::storage::HookStaged stampLeaseGrants_(LogT& log, const uint8_t* batch, std::size_t len) noexcept;
 
     PartitionWriteState& state_;
     WriteFacts           facts_;
@@ -166,6 +184,7 @@ private:
     bool                 checked_ = false;
     AutoIncPlan          plan_;
     uint32_t             keyZeroCount_ = 0;
+    uint32_t             leaseGrants_  = 0;   // lease topic: the grants check() found (stage() stamps them)
     uint64_t             importMaxN_   = 0;
     uint64_t             assignedBase_ = 0;
     bool                 idsTaken_     = false;   // stage() committed the key-0 ids and onAppended has not run
@@ -175,6 +194,7 @@ private:
 template <class LogT>
 rune::storage::HookStaged CheckedWriteHook::stage(LogT& log, const uint8_t* batch, std::size_t len) noexcept {
     using rune::protocol::client::ErrorCode;
+    if (leaseGrants_ != 0) [[unlikely]] return stampLeaseGrants_(log, batch, len);
     if (keyZeroCount_ == 0 && importMaxN_ == 0) return {ErrorCode::OK, batch, len};
     if (plan_.reserve) {
         const std::size_t n = rune::storage::control_record::buildReservation(resv_, plan_.reserveThroughN);
@@ -198,6 +218,38 @@ rune::storage::HookStaged CheckedWriteHook::stage(LogT& log, const uint8_t* batc
         idsTaken_ = true;
     }
     return patched;
+}
+
+/// Lease topic with at least one grant: copies the batch into the scratch and stamps each grant's lease_version with
+/// the offset the append will assign (the log's end offset plus the record's offset delta; this is the partition's single
+/// writer, and appendNoSyncRestamp takes base = logEndOffset()), raises a grant's TTL below minTtlMs to minTtlMs, and
+/// recomputes the CRC once.  Updates and revokes are not patched in 5a.
+template <class LogT>
+rune::storage::HookStaged CheckedWriteHook::stampLeaseGrants_(LogT& log, const uint8_t* batch, std::size_t len) noexcept {
+    namespace b   = rune::protocol::batch;
+    namespace rec = rune::protocol::record;
+    using rune::protocol::client::ErrorCode;
+    assert(!state_.spec->autoIncrement && "a lease topic has no autoincrement");
+    if (len > scratch_.size()) [[unlikely]] return {ErrorCode::Internal, nullptr, 0};
+    uint8_t* out = scratch_.data();
+    std::memcpy(out, batch, len);
+    const int64_t base   = log.logEndOffset();
+    const int64_t hdrBase = rune::protocol::RecordBatchReader(batch, len).baseOffset();
+    const uint64_t minTtl = state_.spec->lease->minTtlMs;
+    const bool ok = rune::protocol::forEachRecordSpan(batch, len, [&](const rune::protocol::RecordSpan& r) {
+        if (rec::leaseOpOf(r.attributes) != rec::LeaseOp::Put || rec::intentOf(r.attributes) != static_cast<uint8_t>(rec::Intent::Insert)) return;
+        uint8_t* v = out + (r.value.data() - reinterpret_cast<const char*>(batch));
+        const uint64_t version = static_cast<uint64_t>(base + (r.offset - hdrBase));
+        for (std::size_t i = 0; i < 8; ++i) v[rec::kLeaseVersionValueOffset + i] = static_cast<uint8_t>(version >> (8 * i));
+        uint64_t ttl = 0;
+        for (std::size_t i = 0; i < 8; ++i) ttl |= static_cast<uint64_t>(v[rec::kLeaseTtlValueOffset + i]) << (8 * i);
+        if (ttl < minTtl)
+            for (std::size_t i = 0; i < 8; ++i) v[rec::kLeaseTtlValueOffset + i] = static_cast<uint8_t>(minTtl >> (8 * i));
+    });
+    if (!ok) [[unlikely]] return {ErrorCode::Internal, nullptr, 0};
+    const uint32_t crc = rune::protocol::crc32c(out + b::kAttributesOffset, len - b::kAttributesOffset);
+    for (std::size_t i = 0; i < 4; ++i) out[b::kCrcOffset + i] = static_cast<uint8_t>(crc >> (8 * i));
+    return {ErrorCode::OK, out, len};
 }
 
 }  // namespace rune::node

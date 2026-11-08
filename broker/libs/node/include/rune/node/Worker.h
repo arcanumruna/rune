@@ -7288,6 +7288,7 @@ private:
     // Cold: an autoincrement partition's counter facts, its side window and the worker's patch scratch (sized once).
     void installAutoInc_(PartitionWriteState& w, int32_t partition) {
         const TopicWriteSpec& spec = *w.spec;
+        if (spec.lease && autoIncScratch_.size() < maxIntakeBatchBytes_) autoIncScratch_.resize(maxIntakeBatchBytes_);   // the grant-stamping scratch
         if (!spec.autoIncrement) return;
         w.autoInc.configure(partition, std::max(spec.partitionCount, 1), effectiveAutoIncMax(spec.keyType, spec.autoIncrementMax),
                             spec.autoIncrementReserve);
@@ -10055,10 +10056,16 @@ private:
         const bool crcPreverified = f.fromOp && f.crcValidated;
         rune::storage::ProduceOutcome outcome;
         if (ws != nullptr) [[unlikely]] {
-            const WriteFacts facts{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = false,
+            const WriteFacts factsBase{.acks = acks, .idempotent = f.producerId >= 0, .transactional = txn, .atomicBatch = false,
                                    .importGranted = f.importGranted, .producerId = f.producerId, .legacyMode = !workerSideAcks(), .levelCheckedWrites = checkedWritesEnabled_()};
+            WriteFacts facts = factsBase;
+            if (ws->spec->lease) [[unlikely]] {   // computed for a lease topic only
+                facts.clientVersion = ackSink_ ? ackSink_->clientVersionOf(f.sessionId) : 0;
+                facts.levelLeases   = clusterFeatureLevel_ >= rune::replication::MetadataFeature::kLeases;
+                facts.viewMemOver   = viewSet_ != nullptr && viewSet_->nsViewMemOver(nsTag.slot);
+            }
             lastWriteFacts_ = facts;
-            CheckedWriteHook hook(*ws, facts, ws->spec->autoIncrement ? std::span<uint8_t>(autoIncScratch_) : std::span<uint8_t>{});
+            CheckedWriteHook hook(*ws, facts, (ws->spec->autoIncrement || ws->spec->lease) ? std::span<uint8_t>(autoIncScratch_) : std::span<uint8_t>{});
             if (log != nullptr) {
                 outcome = rune::storage::handleProduceBatch(
                     rbSpan.data(), rbSpan.size(), f.topicId, f.partition,

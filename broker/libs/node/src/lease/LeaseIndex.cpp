@@ -114,13 +114,13 @@ uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion
         }
         if (intent == kExisting) {
             if (!sameVersion) return static_cast<uint16_t>(ErrorCode::LeaseNotFound);
-            return recordRemainingMs == 0 && recordTtlMs == row.ttlMs ? 0 : kInvalid;
+            return 0;   // the record's TTL and remaining are not checked (spec 6.4); apply keeps the row's
         }
         break;
     case lr::LeaseOp::Revoke:
         if (intent == kExisting) {
             if (!sameVersion) return static_cast<uint16_t>(ErrorCode::LeaseNotFound);
-            return recordRemainingMs == 0 && recordTtlMs == row.ttlMs ? 0 : kInvalid;
+            return 0;   // the record's TTL and remaining are not checked (spec 6.4); apply keeps the row's
         }
         break;
     case lr::LeaseOp::Expire:

@@ -345,6 +345,13 @@ public:
         return true;
     }
 
+    /// The client version a session announced (D6), or 0 when it is unknown / not announced.  Read by the lease write hook.
+    [[nodiscard]] int32_t clientVersionOf(int64_t sessionId) const noexcept {
+        if (sessionId <= 0) return 0;
+        const std::size_t idx = find_(sessionId);
+        return idx == kNone ? 0 : clientVersion_[idx];
+    }
+
     /// NAT-safe egress (Task 6, cold): announce a RESPONSE-MODE session.  Like announce(), but no channel and no
     /// channel slot: the session enters PubAwaitingBind and is NOT listed in unresolved_ (nothing to add yet).
     /// Idempotent for the second (crypto-key) announce wave: a session already awaiting its bind keeps its state

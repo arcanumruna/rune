@@ -87,12 +87,13 @@ struct LeaseRowState {
 /// Exact order, per record kind (the first match answers):
 ///   Put + Insert:    row present -> KeyExists (56); liveCount >= maxKeys -> LeaseLimitExceeded (63); remaining != 0 -> 39; accept.
 ///                    The grant's TTL is taken as written (the produce hook clamps it before append).
-///   Put + Existing:  row absent or version differs -> LeaseNotFound (62); remaining != 0 -> 39; ttl != the row's ttl -> 39; accept.
-///   Revoke+Existing: row absent or version differs -> LeaseNotFound (62); remaining != 0 -> 39; ttl != the row's ttl -> 39; accept.
+///   Put + Existing:  row absent or version differs -> LeaseNotFound (62); accept.
+///   Revoke+Existing: row absent or version differs -> LeaseNotFound (62); accept.
 ///   Expire / Checkpoint (intent 0): row absent or version differs -> kVerdictStaleBroker; accept (the broker copies the row).
 ///   anything else -> InvalidRequest (39).
-/// So every accepted client record carries the row's TTL and remaining 0: the log is self-describing, and a replay of a
-/// compacted log (which rebuilds a row from the update image alone) equals the live row.
+/// An update or revoke's TTL and remaining are NOT checked (spec 6.4: the judge keeps the row's TTL and remaining; the
+/// write hook already refused a client remaining != 0).  Reason: the Task 8 cleaner keeps each live key's grant record, so a
+/// replay never builds a row from an update image, and the grant's TTL is the row's TTL on replay as well as live.
 [[nodiscard]] uint16_t judgeLease(LeaseRowState row, uint8_t attributes, int64_t recordVersion, uint64_t recordTtlMs, uint64_t recordRemainingMs,
                                   uint64_t liveCount, uint32_t maxKeys) noexcept;
 /// The record's lease_ttl_ms / lease_remaining_ms; 0 for a value too short to carry them.

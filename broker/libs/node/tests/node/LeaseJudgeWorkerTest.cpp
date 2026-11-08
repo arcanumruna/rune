@@ -501,3 +501,66 @@ TEST(LeaseJudgeWorkerRegression, LeaseReplayHoldsOnUninstalledVersionRegression)
     EXPECT_EQ(firstRejection(r), nullptr);
     EXPECT_TRUE(r.leaseReady());
 }
+
+// Fix-2 carry-in: a lease index adopted under an already-activated judge must replay the log under that leadership (it holds a
+// row layout, not a fold), so the judge activates again; marking it live (kAdoptedLive) left it never ready.
+TEST(LeaseJudgeWorkerRegression, LeaseAdoptedUnderActiveJudgeBecomesReadyRegression) {
+    VerdictRig r;
+    r.typed();
+    TestRejectRule rule;
+    rule.mode = TestRejectRule::Mode::TagEquals;
+    rule.tag = 9;
+    r.installRejectView(0x40000001, 7, rule);   // a view over the topic: its judge exists and activates before the lease spec
+    r.passes(60);
+    const VerdictSource* judge = r.vs->verdictSource(VerdictRig::kSrc, 0);
+    ASSERT_NE(judge, nullptr);
+    ASSERT_TRUE(judge->activated()) << "the judge is already active when the lease spec arrives";
+    r.createLeaseTopic();   // the WRITE_SPEC with the lease block, after the activation
+    bool ready = false;
+    for (int i = 0; i < 400 && !ready; ++i) {
+        r.pass();
+        ready = r.leaseReady();
+    }
+    EXPECT_TRUE(ready) << "the adopted lease index never became ready";
+}
+
+// Task 5a: a lease grant produced through the worker's real produce path (the ack sink knows the session's client version,
+// the cluster is at the leases level, acks carry View) is stamped with its offset and the TTL raised, then judged and applied.
+TEST(LeaseWriteHookWorkerRegression, GrantStampedRaisedAndJudgedRegression) {
+    Ready g;
+    VerdictRig& r = g.r;
+    WorkerOp level;
+    level.type = WorkerOp::Type::ClusterFeatureLevel; level.nextOffset = rune::replication::MetadataFeature::kLeases;
+    r.send(std::move(level));
+    r.enableAcks(rune::protocol::client::kClientVersionLeases);
+    r.passes(30);
+
+    // ttl 0 (raised to the topic's min, 1000) and ttl 5000 (kept); the client's own lease_version (7777) is overwritten.
+    const RawRec a{keyOf(1), leaseValue(1, 7777, "a1", 1, 0, 1, 0), 1};
+    const RawRec b{keyOf(2), leaseValue(2, 7777, "b2", 1, 0, 1, 5000), 1};
+    const int64_t c = r.produceBytes(VerdictRig::rawBatch({a, b}, 11, 0), rune::protocol::client::kAcksWireView, 11, 0);   // idempotent: an explicit-key intent needs it (checked writes 11.2)
+    const auto ack = r.ack(c);
+    ASSERT_TRUE(ack);
+    EXPECT_EQ(ack->code, 0);
+    EXPECT_TRUE(ack->hasVerdicts);
+    EXPECT_TRUE(ack->verdicts.empty()) << "the judge accepted both grants";
+    r.passes(30);
+    ASSERT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 2u);
+    const Cols c1 = colsOf(r, 1, kV1Columns), c2 = colsOf(r, 2, kV1Columns);
+    ASSERT_TRUE(c1.v[0].has_value());
+    ASSERT_TRUE(c2.v[0].has_value());
+    EXPECT_EQ(int64_t(*c1.v[0]), ack->baseOffset) << "lease_version is the record's offset";
+    EXPECT_EQ(int64_t(*c2.v[0]), ack->baseOffset + 1);
+    EXPECT_EQ(*c1.v[1], 1000u) << "ttl 0 raised to min_ttl";
+    EXPECT_EQ(*c2.v[1], 5000u);
+
+    // The same write from an older session is refused by the hook (a definite InvalidRequest), nothing stored.
+    const int64_t leo = r.leo();
+    r.enableAcks(17);
+    const int64_t c3 = r.produceBytes(VerdictRig::rawBatch({{keyOf(3), leaseValue(3, 0, "c3", 1, 0, 1, 5000), 1}}, 11, 2), rune::protocol::client::kAcksWireView, 11, 2);
+    const auto ack3 = r.ack(c3);
+    ASSERT_TRUE(ack3);
+    EXPECT_EQ(ack3->code, int16_t(rune::protocol::client::ErrorCode::InvalidRequest));
+    EXPECT_EQ(r.leo(), leo);
+    EXPECT_EQ(r.worker->hookRefusalsForTest(HookRefusal::LeaseClientVersion), 1u) << "refused by the lease client-version rule, not another one";
+}
