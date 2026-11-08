@@ -1828,6 +1828,8 @@ public:
     [[nodiscard]] uint64_t fdNeedAtBootForTest() const noexcept { return fdNeedAtBoot_; }
     /// Test-only (Task 16): the applier's effects phase ("Live" once the admin thread ran),
     /// read ON the admin thread.
+    /// CONTROL thread (onControlThreadForTest): how many kA2cCatalogSinkApplied frames this broker has drained.
+    [[nodiscard]] uint64_t sinkAppliedDrainedForTest() const noexcept { return sinkAppliedDrained_; }
     [[nodiscard]] std::string catalogApplierPhaseForTest() {
         return onAdminThreadForTest([this]() { return std::string{adminWorkerAgent_->worker().applier().phaseName()}; });
     }
@@ -2538,7 +2540,7 @@ private:
     //      PendingCreateBehindDrop{spec} (FIFO per name) and runs right after
     //      that name's rename succeeded: the reused name starts EMPTY.
     // -----------------------------------------------------------------------
-    void onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView = false);
+    void onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView = false, const CatalogTopicAppliedMsg* decoded = nullptr);   // decoded: the caller's decode of a sink frame
     void runCatalogCreate_(const TopicSpec& spec);
     int  serviceCreatesAwaitingSpec_();   // control thread: build a parked create once its spec reached every worker
     void postBootWriteSpecs_();           // startup thread: every booted typed topic's validators + write spec -> schemaFanout_
@@ -3032,6 +3034,7 @@ private:
     SchemaFanout                                 schemaFanout_;
     TopicDroppedFanout                           topicDroppedFanout_;   // R-M1: drop -> every worker (control thread)
     uint64_t                                     adminToControlRejects_ = 0;   // control thread only
+    uint64_t                                     sinkAppliedDrained_ = 0;      // control thread only: kA2cCatalogSinkApplied frames drained
     std::function<void(std::string_view)>        startupPhaseHookForTest_;
     HaltHandler                                  haltHandler_ = nullptr;
     void*                                        haltCtx_     = nullptr;

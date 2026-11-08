@@ -1596,7 +1596,10 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     if (lease) rune::protocol::encodeLeaseSpec(*lease, p);
 }
 
-[[nodiscard]] inline bool decodeCatalogTopicApplied(const uint8_t* buf, std::size_t len, CatalogTopicAppliedMsg& m) {
+/// `sink` is the frame TYPE: false = kA2cCatalogTopicApplied (feature bit 3, "lease view", is refused), true =
+/// kA2cCatalogSinkApplied (bit 2, "lease", is refused: a sink never carries a lease block).  Bit 2 with bit 1
+/// (autoIncrement) is refused on both.
+[[nodiscard]] inline bool decodeCatalogTopicApplied(const uint8_t* buf, std::size_t len, CatalogTopicAppliedMsg& m, bool sink) {
     using namespace admin_wire;
     std::size_t pos = 0;
     if (len < 4) return false;
@@ -1628,7 +1631,9 @@ inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_vi
     m.lease.reset();
     m.leaseView = false;
     if (pos != len) {   // the feature bytes; a frame without them is Fnv1a, no autoincrement
-        if (pos + kCatalogTopicAppliedFeatureBytes > len || (buf[pos] & 0xF0) != 0 || (buf[pos] & 0x0C) == 0x0C ||
+        const uint8_t forbidden = sink ? 0x04 : 0x08;   // a sink has no lease block; a topic is never a lease view
+        if (pos + kCatalogTopicAppliedFeatureBytes > len || (buf[pos] & 0xF0) != 0 || (buf[pos] & forbidden) != 0 ||
+            (buf[pos] & 0x06) == 0x06 ||
             buf[pos + 1] > static_cast<uint8_t>(rune::protocol::Partitioner::Modulo))
             return false;
         const bool hasLease = (buf[pos] & 4u) != 0;

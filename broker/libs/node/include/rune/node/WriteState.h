@@ -195,9 +195,13 @@ public:
     [[nodiscard]] bool hasFacts() const noexcept { return hasFacts_; }
 
     /// Cold.  Installs (or replaces) one schema version's validator and descriptor.
-    /// A lease topic installs nothing (false) when the descriptor breaks the system-column layout (leaseLayoutOk).
+    /// A lease topic installs nothing (false) when the descriptor breaks the system-column layout (leaseLayoutOk); the
+    /// version still counts as seen (maxVersion_ rises), so a record at it is answered Reject, never the retriable VersionAhead.
     bool installVersion(uint16_t version, rune::codec::Descriptor materialized) {
-        if (lease && !leaseLayoutOk(materialized)) return false;
+        if (lease && !leaseLayoutOk(materialized)) {
+            if (version > maxVersion_) maxVersion_ = version;
+            return false;
+        }
         if (versions_.size() <= version) versions_.resize(static_cast<std::size_t>(version) + 1);
         auto sv = std::make_unique<SpecVersion>(SpecVersion{rune::codec::Validator(materialized), std::move(materialized), kNoKeyOffset});
         setKeyOffset_(*sv);

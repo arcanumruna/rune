@@ -5221,14 +5221,16 @@ int BrokerNode::serviceAdminControl_(int64_t nowNs) {
             if (tid == kA2cCatalogTopicApplied) { onCatalogTopicApplied_(p, n); return; }
             if (tid == kA2cCatalogSinkApplied) {   // Task 12 (N5): a view sink — gated until its plan is on every worker
                 // A lease view sink has no plan: nothing to await (and it is never viewInstalled).
-                CatalogTopicAppliedMsg probe;
-                const bool leaseView = decodeCatalogTopicApplied(p, n, probe) && probe.leaseView;
+                ++sinkAppliedDrained_;
+                CatalogTopicAppliedMsg decoded;   // decoded once; onCatalogTopicApplied_ reuses it
+                const bool ok = decodeCatalogTopicApplied(p, n, decoded, /*sink*/true);
+                const bool leaseView = ok && decoded.leaseView;
                 if (gateway_ && n >= 4 && !leaseView) {
                     int32_t viewTopicId;
                     std::memcpy(&viewTopicId, p, 4);
                     gateway_->noteViewSinkAwaitingPlan(viewTopicId);
                 }
-                onCatalogTopicApplied_(p, n, /*isView*/true);
+                onCatalogTopicApplied_(p, n, /*isView*/true, ok ? &decoded : nullptr);
                 return;
             }
             if (tid == kA2cCatalogTopicDropped) {
@@ -5897,7 +5899,7 @@ TopicSpec topicSpecFromCatalog(const CatalogTopicAppliedMsg& m) {
     s.partitionKey           = c.partitionKey;
     s.partitioner            = m.keyFeatures.partitioner;
     s.autoIncrement          = m.keyFeatures.autoIncrement;
-    s.lease                  = m.lease;
+    s.leaseTopic             = m.lease.has_value();
     return s;
 }
 } // namespace
@@ -5926,13 +5928,14 @@ bool BrokerNode::catalogNameHeldByDrop_(uint32_t nsId, const std::string& name) 
     return false;
 }
 
-void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView) {
-    CatalogTopicAppliedMsg m;
-    if (!decodeCatalogTopicApplied(p, n, m)) {
+void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n, bool isView, const CatalogTopicAppliedMsg* decoded) {
+    CatalogTopicAppliedMsg local;
+    if (decoded == nullptr && !decodeCatalogTopicApplied(p, n, local, /*sink*/isView)) {
         if (adminToControlRejects_++ % 1024 == 0) [[unlikely]]
             spdlog::error("BrokerNode[{}]: malformed kA2cCatalogTopicApplied (len={}) skipped", config_.nodeId, n);
         return;
     }
+    const CatalogTopicAppliedMsg& m = decoded != nullptr ? *decoded : local;
     // Authentication Task 12 (spec §6): the gateway's ObjectIndex and every authenticated session's permission table
     // learn the object at the moment the catalog effect is applied here (idempotent), before it is built.
     if (gateway_) gateway_->onCatalogObjectApplied(m.nsId, m.topicId, m.name, isView);

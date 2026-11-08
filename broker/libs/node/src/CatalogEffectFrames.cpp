@@ -107,6 +107,14 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
                                                   const cat::Applied& a, std::size_t maxFrame) {
     switch (e.kind) {
     case cat::EventKind::CreateTopic:
+        if (const cat::TopicObject* t = after.topicByObjectId(e.objectId)) {
+            if (auto err = topicEffectFramesError(*t, maxFrame, t->schema ? t->schema->schemaVersion : uint16_t{1})) return err;
+            // A lease topic also posts its lease view's sink frame (the view is created with the topic).
+            if (a.leaseViewTopicId >= 0)
+                if (const cat::ViewObject* lv = after.viewByViewTopicId(a.leaseViewTopicId))
+                    return leaseViewEffectFramesError(*lv, after, maxFrame);
+        }
+        return std::nullopt;
     case cat::EventKind::CreateSchema:
     case cat::EventKind::AlterSchema:
     case cat::EventKind::SetCompatibility:
@@ -114,6 +122,11 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
         if (const cat::TopicObject* t = after.topicByObjectId(e.objectId)) return topicEffectFramesError(*t, maxFrame, t->schema ? t->schema->schemaVersion : uint16_t{1});
         return std::nullopt;
     case cat::EventKind::DropTopic:
+        if (a.leaseViewTopicId >= 0)   // a lease topic's drop also posts its lease view's TopicDropped
+            if (auto err = tooLarge("the lease view's TopicDropped effect", e.objectName + ".leases",
+                                    catalogTopicDroppedWireLen(e.objectName + ".leases"), maxFrame))
+                return err;
+        [[fallthrough]];
     case cat::EventKind::DropView:
         return tooLarge("the TopicDropped effect", e.objectName, catalogTopicDroppedWireLen(e.objectName), maxFrame);
     case cat::EventKind::CreateView:
@@ -123,8 +136,7 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
                                     catalogTopicDroppedWireLen(e.objectName), maxFrame))
                 return err;
         if (const cat::ViewObject* v = after.viewByObjectId(e.objectId))
-            return v->kind == cat::ViewKind::LeaseIndex ? leaseViewEffectFramesError(*v, after, maxFrame)
-                                                         : viewEffectFramesError(*v, after, maxFrame);
+            return viewEffectFramesError(*v, after, maxFrame);
         return std::nullopt;
     }
     case cat::EventKind::NamespaceCreated:      // namespace kinds post no effect frame (Checkpoint A F2)
@@ -134,7 +146,6 @@ std::optional<std::string> eventEffectFramesError(const cat::CatalogState& after
     case cat::EventKind::NamespaceDeleteStep:
         return std::nullopt;
     }
-    (void)a;
     return std::nullopt;
 }
 

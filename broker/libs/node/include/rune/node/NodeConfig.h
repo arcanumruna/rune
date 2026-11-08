@@ -164,8 +164,10 @@ struct TopicSpec {
     rune::protocol::Partitioner partitioner   = rune::protocol::Partitioner::Fnv1a;
     bool                        autoIncrement = false;
 
-    /// Lease topics: the topic's lease spec (set by the catalog sink effect, live and boot).  Nothing reads it yet.
-    std::optional<rune::protocol::LeaseSpec> lease;
+    /// Lease topics: true for a lease topic (set once by the catalog sink effect, live and boot; it never changes).  The
+    /// lease VALUES are deliberately not copied here: they live only in the worker write spec, which writeSpecChanged
+    /// keeps current, so the control thread never holds a stale copy.
+    bool leaseTopic = false;
 };
 
 struct PeerConfig {

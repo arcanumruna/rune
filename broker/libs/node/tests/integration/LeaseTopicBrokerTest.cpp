@@ -186,9 +186,11 @@ TEST(LeaseTopicBrokerRegression, LeaseViewIsAPlanLessSinkAcrossCreateRestartDrop
         EXPECT_FALSE(v.sinkAwaitingPlan) << "the gateway never awaits a plan for a lease view";
         EXPECT_FALSE(applierHalted(node));
 
-        // The lease view's own name is a view: GetTopicSchema of it answers (it is listed, resolvable), no lease on it.
+        // The lease view is a plan-less sink with no schema entry of its own: GetTopicSchema of its name answers
+        // UnknownTopic exactly (the topic's name answers; the view's does not), and carries no lease.
         const auto sv = w.schema(sid, "inst.leases");
         ASSERT_TRUE(sv.has_value());
+        EXPECT_EQ(sv->errorCode, kUnknownTopic);
         EXPECT_FALSE(sv->lease.has_value());
 
         // Produce one record with the four system columns zero-filled: recorded, no assertion (the lease hook is Task 5).
@@ -226,6 +228,9 @@ TEST(LeaseTopicBrokerRegression, LeaseViewIsAPlanLessSinkAcrossCreateRestartDrop
         ASSERT_TRUE(s->lease.has_value());
         EXPECT_EQ(*s->lease, validSpec());
         ASSERT_TRUE(eventually([&] { return controlView(node, topicId, "inst").sink == TopicState::ViewSink; }));
+        // A positive signal that the boot stash's SinkApplied frame (the lease view's) was drained on the control thread:
+        // only then is "not awaiting a plan" a statement about the drained frame and not about a frame not yet handled.
+        ASSERT_TRUE(eventually([&] { return node.onControlThreadForTest([&] { return node.sinkAppliedDrainedForTest(); }) >= 1; }));
         const ControlView v = controlView(node, topicId, "inst");
         EXPECT_EQ(v.sinkByName, std::optional<int32_t>(topicId + 1));
         EXPECT_FALSE(v.sinkAwaitingPlan);

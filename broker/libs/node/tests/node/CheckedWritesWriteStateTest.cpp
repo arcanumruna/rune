@@ -474,3 +474,24 @@ TEST(LeaseWriteSpecRegression, LayoutBreakRefusedRegression) {
     EXPECT_EQ(nolease.setFacts(plainFacts), 0u);
     EXPECT_NE(nolease.descriptorFor(1), nullptr);
 }
+
+TEST(LeaseWriteSpecRegression, RefusedVersionAnswersRejectNotVersionAheadRegression) {
+    TopicWriteSpecWire facts;
+    facts.topicId = 9; facts.legacyValidate = true; facts.lease = rune::protocol::LeaseSpec{};
+    auto bad = leaseDescriptor();
+    bad.fields[0].offset = 8;
+    TopicWriteSpec spec;
+    spec.setFacts(facts);
+    ASSERT_TRUE(spec.installVersion(1, leaseDescriptor()));
+    ASSERT_FALSE(spec.installVersion(2, bad));   // refused: the slot stays null
+    EXPECT_EQ(spec.descriptorFor(2), nullptr);
+    EXPECT_EQ(spec.maxVersion(), 2u);
+
+    const char value[8] = {0, 0, 2, 0, 0, 0, 0, 0};   // a record at version 2
+    rune::protocol::RecordSpan r;
+    r.value = std::string_view(value, sizeof value);
+    EXPECT_EQ(checkTypedRecord(spec, r, 5), TypedCheck::Reject) << "a refused version is final, not retriable";
+    const char ahead[8] = {0, 0, 3, 0, 0, 0, 0, 0};
+    r.value = std::string_view(ahead, sizeof ahead);
+    EXPECT_EQ(checkTypedRecord(spec, r, 5), TypedCheck::VersionAhead) << "a later version is still ahead";
+}

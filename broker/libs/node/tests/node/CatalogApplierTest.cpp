@@ -528,7 +528,7 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
     EXPECT_EQ(playersFilter.topicId, 0);
     EXPECT_EQ(playersFilter.version, 1);
     EXPECT_FALSE(playersFilter.blob.empty()) << "the evolving descriptor";
-    ASSERT_TRUE(decodeCatalogTopicApplied(frames[3].bytes.data(), frames[3].bytes.size(), players));
+    ASSERT_TRUE(decodeCatalogTopicApplied(frames[3].bytes.data(), frames[3].bytes.size(), players, false));
     EXPECT_EQ(players.topicId, 0);
     EXPECT_EQ(players.name, "players");
     EXPECT_EQ(players.partitions, 8);
@@ -542,7 +542,7 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
     EXPECT_EQ(cfg.entries[0], (CatalogConfigEntry{static_cast<uint8_t>(cat::ConfigKey::RetentionMs), 60'000}));
 
     CatalogTopicAppliedMsg sink;
-    ASSERT_TRUE(decodeCatalogTopicApplied(frames[32].bytes.data(), frames[32].bytes.size(), sink));
+    ASSERT_TRUE(decodeCatalogTopicApplied(frames[32].bytes.data(), frames[32].bytes.size(), sink, true));
     EXPECT_EQ(sink.topicId, 3);
     EXPECT_EQ(sink.name, "top_players");
     EXPECT_EQ(sink.partitions, 8) << "#143: the sink mirrors players' 8 partitions";
@@ -704,12 +704,12 @@ TEST(CatalogEffectWireTest, EveryMessageRoundTripsAndAMalformedFrameIsRefused) {
     std::vector<uint8_t> buf(catalogTopicAppliedWireLen("topic", c));
     writeCatalogTopicApplied(buf.data(), 7, "topic", 4, 2, 1, c);
     CatalogTopicAppliedMsg a;
-    ASSERT_TRUE(decodeCatalogTopicApplied(buf.data(), buf.size(), a));
+    ASSERT_TRUE(decodeCatalogTopicApplied(buf.data(), buf.size(), a, false));
     EXPECT_EQ(a.topicId, 7); EXPECT_EQ(a.name, "topic"); EXPECT_EQ(a.partitions, 4);
     EXPECT_EQ(a.replicationFactor, 2); EXPECT_EQ(a.persistence, 1); EXPECT_EQ(a.config, c);
-    EXPECT_FALSE(decodeCatalogTopicApplied(buf.data(), buf.size() - 1, a)) << "short";
+    EXPECT_FALSE(decodeCatalogTopicApplied(buf.data(), buf.size() - 1, a, false)) << "short";
     buf.push_back(0);
-    EXPECT_FALSE(decodeCatalogTopicApplied(buf.data(), buf.size(), a)) << "trailing bytes";
+    EXPECT_FALSE(decodeCatalogTopicApplied(buf.data(), buf.size(), a, false)) << "trailing bytes";
 
     std::vector<uint8_t> d(catalogTopicDroppedWireLen("gone"));
     writeCatalogTopicDropped(d.data(), 3, "gone");
@@ -1730,7 +1730,7 @@ TEST(CatalogTopicAppliedLeaseRoundTripRegression, LeaseTopicLeaseViewSinkAndNeit
     CatalogTopicAppliedMsg m;
     {   // a lease topic
         const auto f = encode(spec, false);
-        ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+        ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
         ASSERT_TRUE(m.lease.has_value());
         EXPECT_EQ(*m.lease, spec);
         EXPECT_FALSE(m.leaseView);
@@ -1740,45 +1740,60 @@ TEST(CatalogTopicAppliedLeaseRoundTripRegression, LeaseTopicLeaseViewSinkAndNeit
     }
     {   // a lease view sink
         const auto f = encode(std::nullopt, true);
-        ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+        ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m, /*sink*/true));
         EXPECT_FALSE(m.lease.has_value());
         EXPECT_TRUE(m.leaseView);
+        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, /*sink*/false)) << "R7: a TopicApplied frame refuses bit 3";
     }
     {   // neither
         const auto f = encode(std::nullopt, false);
-        ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+        ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
         EXPECT_FALSE(m.lease.has_value());
         EXPECT_FALSE(m.leaseView);
     }
     {   // a frame with no feature bytes at all (a pre-checked-writes broker): still accepted, no lease
         auto f = encode(std::nullopt, false);
         f.resize(f.size() - kCatalogTopicAppliedFeatureBytes);
-        ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+        ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
         EXPECT_FALSE(m.lease.has_value());
     }
     {   // bits 2 and 3 together
         auto f = encode(spec, true);
-        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
+        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, true));
+    }
+    {   // R7: a SinkApplied frame refuses bit 2 (a sink carries no lease block)
+        const auto f = encode(spec, false);
+        ASSERT_TRUE(decodeCatalogTopicApplied(f.data(), f.size(), m, /*sink*/false));
+        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, /*sink*/true));
+    }
+    {   // R7: bit 2 with bit 1 (autoIncrement) is refused on both frame types
+        auto kf2 = kf;
+        kf2.autoIncrement = true;
+        std::vector<uint8_t> f(catalogTopicAppliedWireLen("inst", c, true));
+        writeCatalogTopicApplied(f.data(), 4, "inst", 2, 0, 0, c, 3, kf2, spec, false);
+        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
+        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, true));
     }
     {   // bit 4
         auto f = encode(std::nullopt, false);
         f[f.size() - 2] |= 0x10;
-        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
     }
     {   // the lease block cut at every length 0..38, and one byte too long
         const auto full = encode(spec, false);
         for (std::size_t k = 0; k < rune::protocol::kLeaseSpecBytes; ++k) {
             const std::size_t len = full.size() - (rune::protocol::kLeaseSpecBytes - k);
-            EXPECT_FALSE(decodeCatalogTopicApplied(full.data(), len, m)) << "lease block cut to " << k << " bytes";
+            EXPECT_FALSE(decodeCatalogTopicApplied(full.data(), len, m, false)) << "lease block cut to " << k << " bytes";
         }
         auto longer = full;
         longer.push_back(0);
-        EXPECT_FALSE(decodeCatalogTopicApplied(longer.data(), longer.size(), m));
+        EXPECT_FALSE(decodeCatalogTopicApplied(longer.data(), longer.size(), m, false));
     }
     {   // bit 2 clear but 39 extra bytes
         auto f = encode(spec, false);
         f[f.size() - rune::protocol::kLeaseSpecBytes - 2] &= static_cast<uint8_t>(~4u);
-        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m));
+        EXPECT_FALSE(decodeCatalogTopicApplied(f.data(), f.size(), m, false));
     }
 }
 
@@ -1817,4 +1832,25 @@ TEST(LeaseEffectsRegression, LeaseKeysNeverReachTheCleanerRegression) {
     ASSERT_EQ(frames.size(), 1u);
     ASSERT_TRUE(decodeCatalogTopicConfig(frames[0].bytes.data(), frames[0].bytes.size(), m));
     EXPECT_EQ(m.count, 2u);
+}
+
+// Lease review R1: the leader's dry run sizes the lease view's frames too (live), not only the boot path.
+TEST(LeaseEffectsRegression, LiveFrameChecksCoverTheLeaseViewRegression) {
+    using namespace rune::node;
+    const auto events = rune::catalog::testing::goldenScriptV4Lease();
+    cat::CatalogState s;
+    ASSERT_TRUE(cat::apply(s, events.at(0), 0).has_value());   // plain
+    // CreateTopic with a lease: refused when its frames exceed a small maxFrame, accepted at the real one.
+    EXPECT_FALSE(catalogEventEffectsRefusal(s, events.at(1)).has_value());
+    const auto small = catalogEventEffectsRefusal(s, events.at(1), 40);
+    ASSERT_TRUE(small.has_value());
+    EXPECT_EQ(s.appliedOffset(), 0) << "a dry run";
+    for (int i = 1; i <= 6; ++i) ASSERT_TRUE(cat::apply(s, events.at(i), i).has_value()) << i;
+    // DropTopic of the lease topic also posts '<topic>.leases' TopicDropped: the frame one dropped-name longer decides.
+    const std::size_t exact = catalogTopicDroppedWireLen("inst");
+    ASSERT_EQ(events.at(7).kind, cat::EventKind::DropTopic);
+    const auto refused = catalogEventEffectsRefusal(s, events.at(7), exact);
+    ASSERT_TRUE(refused.has_value()) << "the lease view's dropped frame is 7 bytes longer than the topic's";
+    EXPECT_NE(refused->find("lease view"), std::string::npos) << *refused;
+    EXPECT_FALSE(catalogEventEffectsRefusal(s, events.at(7), catalogTopicDroppedWireLen("inst.leases")).has_value());
 }

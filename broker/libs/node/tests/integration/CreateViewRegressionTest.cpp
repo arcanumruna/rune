@@ -204,7 +204,7 @@ protected:
             const auto n = static_cast<std::size_t>(len);
             if (tid == kA2cCatalogTopicApplied || tid == kA2cCatalogSinkApplied) {   // Task 12: sinks have their own type
                 CatalogTopicAppliedMsg m;
-                ASSERT_TRUE(decodeCatalogTopicApplied(p, n, m));
+                ASSERT_TRUE(decodeCatalogTopicApplied(p, n, m, tid == kA2cCatalogSinkApplied));
                 appliedIds_.push_back(m.topicId);
                 if (m.config.cleanupPolicy == 1) {   // a view sink (the production sink: a compacted table)
                     lastSinkKeyField_      = m.config.partitionKey;
