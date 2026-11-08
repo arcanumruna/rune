@@ -169,6 +169,7 @@ private:
     /// P6-13: a rejected record of a key-0 batch burns its id; a KeyExists on one is a reused id (counted and logged).
     void   noteKeyZeroRejection_(const rune::view::Verdict& v, const rune::view::SourceRecord& rec) noexcept;
     void   apply_(Member& m, const rune::view::SourceRecord& rec) noexcept;
+    rune::view::SourceRecord dataRecord_(const rune::view::SourceRecord& rec, bool& skip) const noexcept;
     /// Retention may have trimmed the log below a member's cursor: an empty member starts at the log start, one with rows is
     /// discarded (BelowLogStart).  False when it was discarded.
     bool   clampToLogStart_(Member& m) {

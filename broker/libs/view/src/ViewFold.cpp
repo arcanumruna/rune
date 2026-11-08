@@ -283,7 +283,7 @@ FoldStats walkCommitted(const rune::storage::LogReadView& view, int64_t bound, i
         }
 
         r.forEachRecord([&](std::string_view key, std::string_view value,
-                             int64_t offset, int64_t /*timestamp*/) {
+                             int64_t offset, int64_t /*timestamp*/, uint8_t attributes) {
             if (stopped) {
                 return; // already hit the uncommitted boundary this call
             }
@@ -299,7 +299,10 @@ FoldStats walkCommitted(const rune::storage::LogReadView& view, int64_t bound, i
                 return;
             }
 
-            onRecord(key, value, offset, stats);
+            // Lease topics (spec 6.6): a Checkpoint is invisible, a Revoke/Expire folds as an empty value (a delete).
+            std::string_view v = value;
+            if (!leaseDataView(foldSkip.traits, attributes, v)) [[unlikely]] { ++stats.skippedControl; return; }
+            onRecord(key, v, offset, stats);
         });
 
         if (stopped) {

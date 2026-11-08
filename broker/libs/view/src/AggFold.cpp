@@ -734,12 +734,15 @@ FoldStats walkAggregate(const rune::storage::LogReadView& lv, int64_t bound, int
             continue;
         }
         r.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset,
-                            int64_t /*ts*/) {
+                            int64_t /*ts*/, uint8_t attributes) {
             if (stopped) return;
             if (offset >= bound) { stopped = true; return; }
             if (offset < from) return;         // already folded (resume mid-batch)
             if (isRejectedRecord(foldSkip, offset)) [[unlikely]] { ++stats.skippedRejected; return; }
-            onRecord(key, value, offset);
+            // Lease topics (spec 6.6): a Checkpoint is invisible, a Revoke/Expire folds as an empty value (a delete).
+            std::string_view v = value;
+            if (!leaseDataView(foldSkip.traits, attributes, v)) [[unlikely]] { ++stats.skippedControl; return; }
+            onRecord(key, v, offset);
         });
         if (stopped) break;
         pos += static_cast<size_t>(r.totalLength());

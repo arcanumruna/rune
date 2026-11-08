@@ -4,7 +4,9 @@
 // rune_transaction/AbortedTxnIndex.h.
 #pragma once
 #include <cstdint>
+#include <string_view>
 
+#include <rune/protocol/LeaseRecord.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/RejectedOffsetIndex.h>
 #include <rune/transaction/AbortedTxnIndex.h>
@@ -40,8 +42,19 @@ inline constexpr AbortedTxnFilter kNoAbortedTxns{};
 struct FoldSkip {
     AbortedTxnFilter                          aborted{};
     const rune::storage::RejectedOffsetIndex* rejected = nullptr;   // offsets the judge rejected: never applied
+    rune::protocol::record::TopicTraits       traits{};             // the source topic's traits (lease topics: spec 6.6)
 };
 inline constexpr FoldSkip kNoSkip{};
+
+/// Lease topics (spec 6.6): what a DATA fold (user projection, keyed projection, aggregate, verdict member other than the lease
+/// index) sees of a record.  False: a Checkpoint, invisible to data folds.  A Revoke or Expire carries the full row but is a
+/// tombstone, so `value` becomes empty and the fold's delete path runs.  Any other topic: true, `value` unchanged.
+[[nodiscard]] inline bool leaseDataView(rune::protocol::record::TopicTraits t, uint8_t attrs, std::string_view& value) noexcept {
+    if (!t.lease) [[likely]] return true;
+    if (rune::protocol::record::isLeaseControl(attrs, t)) return false;
+    if (rune::protocol::record::isTombstone(attrs, value.size(), t)) value = {};
+    return true;
+}
 
 [[nodiscard]] inline bool isAbortedBatch(const FoldSkip& skip, const rune::protocol::RecordBatchReader& r, int16_t attrs) noexcept {
     return skip.aborted.skips(r, attrs);

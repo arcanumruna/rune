@@ -340,12 +340,32 @@ rune::view::PrepareStatus VerdictSource::prepare_(Member& m, const rune::view::S
                              state_->spec->versionRefused(detail::le16(r.value.data() + 2));   // a refused version is a definite answer
         return prepareLeaseIndex(f, r, m.prospect, refused, state_ != nullptr && state_->spec != nullptr ? leaseInstallSeqOf(*state_->spec, r.value) : 0u);
     }
+    bool skip = false;
+    const rune::view::SourceRecord r = dataRecord_(rec, skip);
+    if (skip) {   // a Checkpoint: invisible to a data member
+        m.prospect.clear();
+        return rune::view::PrepareStatus::Ok;
+    }
     if (i.agg) {
         rune::view::AggregateFold f{i.plan, i.layout, i.agg->layout, i.vdc, i.table, i.agg->contributors, i.agg->groups, i.agg->blocksOrNull()};
-        return rune::view::prepareAggregate(f, rec, m.prospect);
+        return rune::view::prepareAggregate(f, r, m.prospect);
     }
     rune::view::ProjectionFold f{i.plan, i.layout, i.vdc, i.table, rune::view::viewKeyType(i.plan)};
-    return rune::view::prepareProjection(f, rec, m.prospect);
+    return rune::view::prepareProjection(f, r, m.prospect);
+}
+
+// What a data member (not the key / lease index) sees of `rec` (spec 6.6): on a lease topic a Checkpoint is skipped and a
+// Revoke / Expire becomes a tombstone (empty value, no writer).  One helper for prepare_, apply_ and the verdict, so they agree.
+rune::view::SourceRecord VerdictSource::dataRecord_(const rune::view::SourceRecord& rec, bool& skip) const noexcept {
+    rune::view::SourceRecord r = rec;
+    skip = false;
+    if (state_ == nullptr || state_->spec == nullptr || !state_->spec->lease) return r;
+    if (!rune::view::leaseDataView({.lease = true}, r.attributes, r.value)) {
+        skip = true;
+        return r;
+    }
+    if (r.value.empty()) r.writer = nullptr;
+    return r;
 }
 
 void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexcept {
@@ -363,12 +383,15 @@ void VerdictSource::apply_(Member& m, const rune::view::SourceRecord& rec) noexc
         if (applyLeaseRecord(f, rec, m.prospect, ev)) state_->leaseEvents.buf.push_back(ev);   // grows only past kLeaseFoldEventCap (judgeBatches_ counts it)
         return;
     }
+    bool skip = false;
+    const rune::view::SourceRecord r = dataRecord_(rec, skip);
+    if (skip) return;   // a Checkpoint applies nothing (prepare_ cleared the prospect)
     if (i.agg) {
         rune::view::AggregateFold f{i.plan, i.layout, i.agg->layout, i.vdc, i.table, i.agg->contributors, i.agg->groups, i.agg->blocksOrNull()};
-        rune::view::applyAggregate(f, rec, m.prospect);
+        rune::view::applyAggregate(f, r, m.prospect);
     } else {
         rune::view::ProjectionFold f{i.plan, i.layout, i.vdc, i.table, rune::view::viewKeyType(i.plan)};
-        rune::view::applyProjection(f, rec, m.prospect);
+        rune::view::applyProjection(f, r, m.prospect);
     }
     const rune::view::FoldStats& st = m.prospect.stats;
     i.counters.skippedMalformed += st.skippedMalformed;
@@ -407,7 +430,10 @@ Verdict VerdictSource::verdictOf_(const Member& m, const rune::view::SourceRecor
         const uint32_t maxKeys = state_ != nullptr && state_->spec != nullptr && state_->spec->lease ? state_->spec->lease->maxKeys : UINT32_MAX;
         return {judgeLease(st, rec.attributes, leaseRecordVersion(rec.value), leaseRecordRemaining(rec.value), i.table.size(), maxKeys), 0};
     }
-    if (m.kind != rune::view::VerdictViewKind::TestReject || rec.value.empty()) return {};   // tombstones are never rejected
+    if (m.kind != rune::view::VerdictViewKind::TestReject) return {};
+    bool skipped = false;
+    const rune::view::SourceRecord dr = dataRecord_(rec, skipped);
+    if (skipped || dr.value.empty()) return {};   // tombstones (a lease Revoke / Expire too) and lease checkpoints are never rejected
     const Verdict reject{static_cast<uint16_t>(rune::protocol::client::ErrorCode::ConstraintViolation), rune::view::constraintIdOf(m.objectId, 1)};
     switch (m.rule.mode) {
     case TestRejectRule::Mode::TagEquals: {
@@ -492,7 +518,8 @@ void VerdictSource::noteKeyZeroRejection_(const Verdict& v, const rune::view::So
 
 int VerdictSource::replay_(Member& m, const rune::storage::LogReadView& view, int64_t upTo, const rune::view::AbortedTxnFilter& aborted) {
     ViewInstance& inst = *m.inst;
-    const rune::view::FoldSkip skip{.aborted = aborted, .rejected = &state_->rejected};
+    const rune::view::FoldSkip skip{.aborted = aborted, .rejected = &state_->rejected,
+                                    .traits = {.lease = state_->spec != nullptr && state_->spec->lease}};
     int64_t cursor = inst.foldCursor;
     const int64_t bound = inst.maxRecordsPerPass > 0 ? std::min(upTo, cursor + inst.maxRecordsPerPass) : upTo;
     if (m.kind == rune::view::VerdictViewKind::KeyIndex) {

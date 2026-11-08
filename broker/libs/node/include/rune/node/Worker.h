@@ -7422,7 +7422,10 @@ private:
             // batches of the aborted ones by this partition's aborted index (the
             // read_committed fetch's own predicate) on every path — steady folds,
             // restart rebuilds, transient sources, capped passes.
-            const rune::view::FoldSkip skip{.aborted = rcAbortedFilter_(*rcState)};
+            // Lease topics (spec 6.6): the data folds read a Checkpoint as invisible and a Revoke/Expire as a delete.
+            const PartitionWriteState* const skipWs = writeOf_(replica);
+            const rune::view::FoldSkip skip{.aborted = rcAbortedFilter_(*rcState),
+                                            .traits = {.lease = skipWs != nullptr && skipWs->spec != nullptr && skipWs->spec->lease}};
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
             // N-C1: right after an election the HW floor can lag what the old leader had committed; a table is
             // Ready under this leadership only once HW has reached the leadership's start offset.
