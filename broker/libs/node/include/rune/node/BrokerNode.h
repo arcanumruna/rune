@@ -1548,8 +1548,9 @@ public:
     // {leaderId, term, isLeader} snapshot on LeaderObserver's ring whenever it
     // changes.  isLeader()/leaderId()/leadershipTermId()/awaitLeader()/
     // publishRole()/leaderClientEndpoint() DRAIN that ring: they must be called
-    // from the ONE observer thread: the thread that called start() (enforced —
-    // any other thread is refused: critical log, abort in debug builds).  Node-internal (control-thread) code uses
+    // from the ONE observer thread: the thread that called start() (or the thread
+    // bound by bindLeaderObserverForTest); any other thread is refused: critical
+    // log + abort in all builds.  Node-internal (control-thread) code uses
     // LeaderObserver::computeOnControl() instead — never these.
     // -----------------------------------------------------------------------
 
