@@ -297,8 +297,12 @@ public:
         std::erase_if(installs_, [&](const auto& i) { return i.first == viewTopic; });
     }
     /// A compiled view over the source set by useSource().
-    void installKeyedView(const rune::view::CompileResult& c) {
-        installs_.emplace_back(c.plan.viewTopicId, [=, this, src = *customSrc_] { vs->installView(c.plan, c.rowLayout, src, false); });
+    void installKeyedView(const rune::view::CompileResult& c, bool persisted = false) {
+        if (persisted && !agent) agent = std::make_unique<ViewSnapshotIoAgent>(channel, viewDir_.string(), /*fsyncMs=*/0, backupPolicy);
+        installs_.emplace_back(c.plan.viewTopicId, [=, this, src = *customSrc_] {
+            vs->installView(c.plan, c.rowLayout, src, persisted, persisted && recovering_);
+            if (persisted && recovering_) vs->markRecoveryForTest(c.plan.viewTopicId);   // as drainInstalls marks a restart install
+        });
         installs_.back().second();
     }
     /// The source topic's schema is `d` (its first field the key, of shape `key`) instead of {id, v, tag}.  A restart keeps it.

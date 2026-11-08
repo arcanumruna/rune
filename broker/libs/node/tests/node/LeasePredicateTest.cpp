@@ -142,6 +142,15 @@ void installAll(VerdictRig& r) {
     r.passes(30);
 }
 
+// The same three views, persisted (persistence 0): a restart recovers them from their checkpoints and rebuilds the tail.
+void installAllPersisted(VerdictRig& r) {
+    auto persisted = [](rv::ViewPlan v) { v.persistence = 0; return v; };
+    r.installKeyedView(compile(persisted(projPlan()), kProj), /*persisted=*/true);
+    r.installKeyedView(compile(persisted(byAddrPlan()), kByAddr), /*persisted=*/true);
+    r.installKeyedView(compile(persisted(cntPlan()), kCnt), /*persisted=*/true);
+    r.passes(30);
+}
+
 std::optional<std::vector<uint8_t>> rowOf(VerdictRig& r, int32_t view, const std::vector<uint8_t>& key) {
     const auto got = r.getViewRowK(view, key);
     if (got.code != rune::protocol::client::ViewRowResponse::kOk) return std::nullopt;
@@ -440,6 +449,59 @@ TEST(LeasePredicateWorkerRegression, RebuildFoldsLikeLiveRegression) {
     EXPECT_FALSE(snap(r, 3, "a3").cnt.has_value());
 }
 
+TEST(LeasePredicateWorkerRegression, PersistedRebuildFoldsLikeLiveRegression) {
+    Ready g;
+    VerdictRig& r = g.r;
+    installAllPersisted(r);
+    ASSERT_TRUE(g.send({grantRec(1, "a1"), grantRec(2, "a2"), grantRec(3, "a3")}));
+    r.passes(30);
+    // The checkpoint files are taken BEFORE the lease records: the restart recovers them and the rebuild folds the rest.
+    for (int i = 0; i < 40 && (r.agent->lastDurableOffset(kProj, 0) <= 0 || r.agent->lastDurableOffset(kByAddr, 0) <= 0 ||
+                               r.agent->lastDurableOffset(kCnt, 0) <= 0); ++i) r.passes(50);
+    ASSERT_GT(r.agent->lastDurableOffset(kProj, 0), 0);
+    ASSERT_GT(r.agent->lastDurableOffset(kByAddr, 0), 0);
+    ASSERT_GT(r.agent->lastDurableOffset(kCnt, 0), 0);
+    r.pauseAgent = true;   // the checkpoint files stay at the grants: the restart has the lease records left to rebuild
+    ASSERT_TRUE(g.send({checkpointRec(1, liveVersion(r, 1), "ck")}));   // a differing addr: a fold of it would show
+    ASSERT_TRUE(g.send({updateRec(2, liveVersion(r, 2), "b2")}));
+    ASSERT_TRUE(g.send({revokeRec(3, liveVersion(r, 3), "a3")}));
+    r.passes(30);
+    const std::pair<uint64_t, const char*> keys[] = {{1, "a1"}, {2, "a2"}, {2, "b2"}, {3, "a3"}};
+    std::vector<Snapshot> before;
+    for (const auto& [id, addr] : keys) before.push_back(snap(r, id, addr));
+    EXPECT_TRUE(before[0].proj.has_value());
+    EXPECT_FALSE(before[3].proj.has_value());
+    EXPECT_FALSE(before[3].byAddr.has_value());
+    EXPECT_FALSE(before[3].cnt.has_value());
+
+    const auto stored = storedRecords(r);
+    ASSERT_EQ(stored.size(), 6u);
+    for (const int32_t v : {kProj, kByAddr, kCnt})
+        ASSERT_LE(r.agent->lastDurableOffset(v, 0), stored[3].offset) << "vacuity guard: view " << v << " checkpoint is below the lease records";
+    // A view of a judged source rebuilds only up to what the judge knows: the judge re-judges the log first, then the views
+    // recover their checkpoints, so the restart rebuild (not the steady fold) folds the lease records.
+    r.restart(/*reinstall=*/false);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.reinstallAll();
+    r.pass();
+    for (const int32_t v : {kProj, kByAddr, kCnt}) {
+        const auto* inst = r.vs->instanceForTest(v, 0);
+        ASSERT_NE(inst, nullptr);
+        EXPECT_GT(inst->foldCursor, 0) << "view " << v << " recovered";
+    }
+    r.pauseAgent = false;
+    r.passes(60);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(60);
+    for (std::size_t i = 0; i < before.size(); ++i) {
+        const Snapshot after = snap(r, keys[i].first, keys[i].second);
+        EXPECT_TRUE(after == before[i]) << "id " << keys[i].first << " addr " << keys[i].second;
+    }
+    EXPECT_FALSE(snap(r, 3, "a3").proj.has_value());
+    EXPECT_FALSE(snap(r, 3, "a3").byAddr.has_value());
+    EXPECT_FALSE(snap(r, 3, "a3").cnt.has_value());
+}
+
 TEST(LeasePredicateWorkerRegression, VerdictMemberSeesLeaseTombstoneRegression) {
     Ready g;
     VerdictRig& r = g.r;
@@ -465,7 +527,13 @@ TEST(LeasePredicateWorkerRegression, VerdictMemberSeesLeaseTombstoneRegression) 
 
     const int64_t ver = liveVersion(r, 1);
     ASSERT_GE(ver, 0);
-    ASSERT_TRUE(g.send({checkpointRec(1, ver, "a1")}));
+    const auto rej0 = rowOf(r, 43, idKey(1));
+    ASSERT_TRUE(rej0.has_value()) << "vacuity guard: the member's table holds the grant";
+    ASSERT_TRUE(g.send({checkpointRec(1, ver, "ck")}));
+    r.passes(30);
+    const auto rej1 = rowOf(r, 43, idKey(1));
+    ASSERT_TRUE(rej1.has_value());
+    EXPECT_EQ(*rej1, *rej0) << "a checkpoint is invisible to a data member's table";
     ASSERT_TRUE(g.send({revokeRec(1, ver, "a1")}));
     r.passes(30);
     const auto all = storedRecords(r);
@@ -476,6 +544,15 @@ TEST(LeasePredicateWorkerRegression, VerdictMemberSeesLeaseTombstoneRegression) 
     EXPECT_EQ(all[2].attrs, kRevokeAttr);
     EXPECT_EQ(firstRejection(r), nullptr) << "a lease tombstone and a checkpoint are never rejected by a data member";
     EXPECT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 0u) << "the revoke took the lease index row";
+    EXPECT_FALSE(rowOf(r, 43, idKey(1)).has_value()) << "the revoke deleted the member's row";
+
+    r.restart();
+    r.passes(60);
+    ASSERT_TRUE(r.driveUntilJudged());
+    r.passes(60);
+    EXPECT_EQ(firstRejection(r), nullptr) << "the replay judged the checkpoint and revoke as lease records";
+    EXPECT_FALSE(rowOf(r, 43, idKey(1)).has_value()) << "the replay deleted the member's row";
+    EXPECT_EQ(r.vs->keyIndexSizeForTest(VerdictRig::kSrc, 0), 0u);
 }
 
 TEST(LeasePredicateWorkerRegression, NonLeaseTopicUnchangedRegression) {
@@ -497,4 +574,25 @@ TEST(LeasePredicateWorkerRegression, NonLeaseTopicUnchangedRegression) {
     ASSERT_TRUE(again.has_value()) << "a non-empty value upserts (intent bits need a key index on a plain topic)";
     EXPECT_NE(*again, *first);
     EXPECT_EQ(std::count(again->begin(), again->end(), uint8_t(30)) >= 1, true);
+
+    // Lease op bits on a plain topic are never read: both records are plain upserts (a typed value as produce() encodes it).
+    const auto plainRec = [](uint64_t id, int64_t v, uint8_t attrs) {
+        RawRec rr;
+        std::string k(8, '\0');
+        std::vector<uint8_t> val;
+        const auto le16 = [&](uint16_t x) { val.push_back(uint8_t(x)); val.push_back(uint8_t(x >> 8)); };
+        le16(18); le16(1);
+        for (int i = 0; i < 8; ++i) { k[std::size_t(i)] = char(uint8_t(id >> (8 * i))); val.push_back(uint8_t(id >> (8 * i))); }
+        for (int i = 0; i < 8; ++i) val.push_back(uint8_t(uint64_t(v) >> (8 * i)));
+        le16(0);
+        rr.key = k; rr.value = val; rr.attrs = attrs;
+        return rr;
+    };
+    r.demote();
+    r.replicate({VerdictRig::rawBatch({plainRec(2, 30, kRevokeAttr), plainRec(3, 40, kCheckpointAttr)})});
+    r.promote();
+    r.passes(30);
+    r.driveUntilFolded(kProj, r.leo());
+    EXPECT_TRUE(rowOf(r, kProj, idKey(2)).has_value()) << "a plain topic never reads lease op bits";
+    EXPECT_TRUE(rowOf(r, kProj, idKey(3)).has_value()) << "a plain topic never reads lease op bits";
 }

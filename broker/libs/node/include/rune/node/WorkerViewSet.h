@@ -118,6 +118,10 @@ public:
     // serve-guard), NOT lazily created Ready by the plain driveFolds path.
     int drainInstalls();
 
+    /// Test seam: what drainInstalls does for a frame with ViewPlanUpdateMsg.recovery set, after its installView (the view's
+    /// instances are materialized from their checkpoints and rebuilt by driveRebuild).
+    void markRecoveryForTest(int32_t viewTopicId) { recoveryViews_.insert(viewTopicId); }
+
     /// Test seams: throw away one instance's rows exactly as recovery does, and read where its checkpoint stands.
     bool beginDiscardForTest(int32_t viewTopicId, int32_t partition, ViewDiscardReason reason) {
         const auto it = views_.find(instKey(viewTopicId, partition));
